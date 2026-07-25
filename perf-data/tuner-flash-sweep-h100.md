@@ -148,20 +148,24 @@ that, and it is corrected here rather than left standing.
 
 ## Result 5 — `FA_GF` is a null at short ctx, and that is informative
 
-| `FA_GF` (sliding-layer GQA fusion) | ctx 1024 |
-|---|---|
-| 2 (shipped) | 4.604 (0.361) |
-| 4 | 4.604 (0.362) |
+| `FA_GF` (sliding-layer GQA fusion) | ctx 1024 | ctx 8192 |
+|---|---|---|
+| 2 (shipped) | 4.604 (0.361) | 4.811 (0.573) |
+| 4 | 4.604 (0.362) | 4.812 (0.573) |
 
-Identical to within a third of the rep spread — not "small", *nothing*. That is
-the expected shape: `FA_GF` governs the **sliding** layers, which are
-window-capped at 1024, so at ctx=1024 they already read their whole window and
-the grouping cannot change how many bytes move. It is the counterpart to
-`FA_GF_FULL`, which governs the 5 full layers and does move the number.
+Identical at **both** contexts — flash's own cost matches to 0.001 ms and 0.000
+ms. Not "small", *nothing*. That is the expected shape: `FA_GF` governs the
+**sliding** layers, which are window-capped at 1024, so they read the same
+window at ctx=8192 as at ctx=1024 and regrouping cannot change how many bytes
+move. It is the exact counterpart to `FA_GF_FULL`, which governs the 5 full
+layers and moves the number hard.
 
 Recorded because a null on the sliding-layer knob is the control that makes the
-full-layer results credible: the two knobs are structurally identical and only
-the one attached to the layers that grow with ctx has an effect.
+full-layer results credible. The two knobs are structurally identical — same
+fusion, different layer set — and only the one attached to the layers that grow
+with ctx has any effect, at either context. A sweep that found *everything*
+mattered would be measuring its own noise; this one finds the thing that cannot
+matter, doesn't.
 
 ## What this puts in `tunedb` — nothing new, and that is the result
 
