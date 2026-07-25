@@ -1296,3 +1296,17 @@ rule: flash is 7.8 % of the step at ctx=1024 and 23.7 % at 32768, so below ~8k t
 knobs and above it tune flash.
 
 The tuner is documented in `tuning/README-decode-tuner.md`.
+
+## Round 18 addendum — nsplit re-checked after the round-17 flash changes (held)
+
+Round 13 found the `NS_ABS` optimum moved (8 → 32) when warp-per-row landed, and the tuner's
+own framing is that an optimum can move whenever the body under it changes. Round 17 changed
+the flash body twice (`FA_QGLOB`, `FA_WPR_RB`), so it was re-swept rather than assumed:
+
+| `PLOW_NS_ABS` (occ-2, fp8, ctx1024) | 16 | 24 | **32** |
+|---|---|---|---|
+| TPOT | 4.592 | 4.583 | **4.560** |
+
+**The optimum held at 32.** Recorded because "we re-checked and nothing moved" is a result: it
+bounds how often the joint sweep actually has to be re-run, and the alternative — assuming it
+held — is how `GV_MOE_UN` and `NS_ABS` went stale in the first place.
