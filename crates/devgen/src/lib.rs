@@ -6071,6 +6071,11 @@ pub struct EmitArgs {
     pub rope_gen: bool,
 }
 
+/// Read-only verification hook for [`run_verified`], called with the finished
+/// [`packet::devbuild::Model`] immediately before the blob is written
+/// (dense-GQA path only for now). An `Err` ABORTS emission.
+pub type VerifyHook = Box<dyn Fn(&packet::devbuild::Model) -> Result<(), String>>;
+
 impl EmitArgs {
     /// Parse the legacy `gemma4`/`tinygemma` CLI: named flags anywhere, then
     /// positional `<model-dir> <max_ctx> <out.pkt> [n_cu]`. `PLOW_BLOCK` is the
@@ -6130,6 +6135,12 @@ impl EmitArgs {
 /// former `gemma4` binary's `main`, verbatim below the argument parsing — the
 /// same arch dispatch, the same env knobs, the same byte output.
 pub fn run(args: EmitArgs) {
+    run_verified(args, None)
+}
+
+/// [`run`] plus an optional pre-write verification gate (see [`VerifyHook`]).
+/// `run(args)` ≡ `run_verified(args, None)` — byte-identical emission.
+pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     let EmitArgs { dir, ctx, out, n_cu, tp, block_spec, embed_cubin, embed_hsaco, rope_gen } = args;
 
     // GLM-5.2 (GlmMoeDsa) — MLA + DSA + block-fp8 MoE — is a wholly separate emit path (glm_main).
@@ -6468,6 +6479,14 @@ pub fn run(args: EmitArgs) {
     }
     if !rope_gen {
         m.bake_gen();
+    }
+    // Read-only verification gate (EmitArgs::verify): runs against the exact
+    // programs about to be serialized; a rejection aborts before any bytes
+    // are written. `None` (the default) is a no-op — emitted bytes identical.
+    if let Some(v) = &verify {
+        if let Err(e) = v(&m) {
+            panic!("devblob verification rejected the emitted program: {e}");
+        }
     }
     let blob = if sections.is_empty() {
         m.to_blob()

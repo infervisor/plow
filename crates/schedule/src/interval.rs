@@ -40,10 +40,11 @@ impl IntervalSet {
             return after;
         }
         let mut t = after;
-        for &(s, e) in &self.res {
-            if e <= t {
-                continue; // already behind the candidate window
-            }
+        // Reservations are disjoint and start-sorted, so ends are monotone too:
+        // binary-search past everything already behind the candidate window
+        // instead of walking the whole timeline from cycle 0.
+        let first = self.res.partition_point(|&(_, e)| e <= after);
+        for &(s, e) in &self.res[first..] {
             if s >= t + dur {
                 break; // the gap [t, t+dur) fits before this reservation
             }
@@ -66,9 +67,28 @@ impl IntervalSet {
 }
 
 /// Weighted capacity reservations on one resource (bandwidth).
-#[derive(Clone, Debug, Default)]
+///
+/// Stored as a **stepwise aggregate-load profile**, not a reservation list:
+/// `levels[i] = (t, load)` means the summed load is `load` on
+/// `[t, levels[i+1].0)`; the final level extends to ∞ and is 0 once every
+/// reservation has ended. Always non-empty, anchored at `(0, 0.0)`.
+///
+/// The old flat `Vec<(start, end, w)>` made every `peak` query rescan and
+/// re-sort every reservation ever made — O(R log R) per probe with R growing
+/// per placed task, i.e. O(T²·log) over a whole schedule. The profile answers
+/// `peak` with a binary search plus a walk over only the pieces inside the
+/// window, and can answer "earliest feasible start" directly
+/// ([`BandwidthSet::next_feasible`]), which replaces the scheduler's blind
+/// probe ladders.
+#[derive(Clone, Debug)]
 pub struct BandwidthSet {
-    res: Vec<(Cycle, Cycle, f64)>, // [start, end), weight
+    levels: Vec<(Cycle, f64)>,
+}
+
+impl Default for BandwidthSet {
+    fn default() -> Self {
+        Self { levels: vec![(0, 0.0)] }
+    }
 }
 
 impl BandwidthSet {
@@ -76,35 +96,22 @@ impl BandwidthSet {
         Self::default()
     }
 
-    /// Peak concurrent weight over `[start, end)`. Event sweep: clamp every
-    /// overlapping reservation to the window, emit (+w at on, −w at off)
-    /// events, sort, and walk once accumulating — O(R log R) per call.
+    /// Index of the piece whose span contains `t`.
+    fn piece_at(&self, t: Cycle) -> usize {
+        // levels[0].0 == 0 and t >= 0, so the result is always >= 1.
+        self.levels.partition_point(|&(s, _)| s <= t) - 1
+    }
+
+    /// Peak concurrent weight over `[start, end)`. O(log N + pieces in window).
     pub fn peak(&self, start: Cycle, end: Cycle) -> f64 {
-        let mut events: Vec<(Cycle, f64)> = Vec::new();
-        for &(s, e, w) in &self.res {
-            if s < end && e > start {
-                events.push((s.max(start), w));
-                events.push((e.min(end), -w));
-            }
-        }
-        if events.is_empty() {
+        if start >= end {
             return 0.0;
         }
-        // At equal times, apply ends (−w) before starts (+w): intervals are
-        // half-open, so a hold ending at t does not overlap one starting at t.
-        events.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
-        let mut cur = 0.0f64;
         let mut peak = 0.0f64;
-        let mut i = 0;
-        while i < events.len() {
-            let t = events[i].0;
-            while i < events.len() && events[i].0 == t {
-                cur += events[i].1;
-                i += 1;
-            }
-            if t < end {
-                peak = peak.max(cur);
-            }
+        let mut i = self.piece_at(start);
+        while i < self.levels.len() && self.levels[i].0 < end {
+            peak = peak.max(self.levels[i].1);
+            i += 1;
         }
         peak
     }
@@ -116,8 +123,59 @@ impl BandwidthSet {
         self.peak(start, end) + w <= limit + 1e-9
     }
 
+    /// Earliest `t ≥ after` such that adding `w` over `[t, t+dur)` stays under
+    /// `limit`. The profile's tail level is 0 (every reservation ends), so a
+    /// feasible start always exists when `w ≤ limit` — callers pre-check the
+    /// `w > limit` model-mismatch case.
+    pub fn next_feasible(&self, after: Cycle, dur: Cycle, w: f64, limit: f64) -> Cycle {
+        let dur = dur.max(1);
+        let mut t = after;
+        let mut i = self.piece_at(t);
+        loop {
+            // Scan the pieces overlapping [t, t+dur) for the first violation.
+            let mut k = i;
+            let mut violation = None;
+            while k < self.levels.len() && self.levels[k].0 < t.saturating_add(dur) {
+                if self.levels[k].1 + w > limit + 1e-9 {
+                    violation = Some(k);
+                    break;
+                }
+                k += 1;
+            }
+            let Some(k) = violation else { return t };
+            if k + 1 >= self.levels.len() {
+                // Defensive: a violating final piece can only mean w > limit
+                // (tail load is 0); the caller handles that case before us.
+                return t;
+            }
+            // The window cannot start before the violating piece ends.
+            t = self.levels[k + 1].0;
+            i = k + 1;
+        }
+    }
+
+    /// Ensure a breakpoint exists at `t`; return its index.
+    fn ensure_breakpoint(&mut self, t: Cycle) -> usize {
+        match self.levels.binary_search_by_key(&t, |&(s, _)| s) {
+            Ok(i) => i,
+            Err(i) => {
+                // Split the containing piece; the new point inherits its load.
+                let level = self.levels[i - 1].1;
+                self.levels.insert(i, (t, level));
+                i
+            }
+        }
+    }
+
     pub fn reserve(&mut self, start: Cycle, end: Cycle, w: f64) {
-        self.res.push((start, end, w));
+        if start >= end {
+            return;
+        }
+        let i = self.ensure_breakpoint(start);
+        let j = self.ensure_breakpoint(end); // j > i: end > start
+        for lvl in &mut self.levels[i..j] {
+            lvl.1 += w;
+        }
     }
 }
 

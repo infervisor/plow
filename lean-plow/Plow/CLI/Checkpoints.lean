@@ -9,6 +9,7 @@ shape of the eventual API.
 import Lean.Data.Json
 import Plow.CLI.Schema
 import Plow.CLI.Payload
+import Plow.CLI.FastCheckD
 import Plow.Verify
 import Plow.Sram
 import Plow.Wire
@@ -120,16 +121,24 @@ def checkC (payload : Json) : Certificate :=
     checks reader/writer disjointness — together these give the **strict**
     `AddressMapSound` guarantee (via `verifyAddressMap_sound_strict`), not
     just the loose form. -/
-def checkD (payload : Json) : Certificate :=
+def checkD (payload : Json) : IO Certificate := do
   match Payload.parse payload with
-  | .error msg => reject "D" s!"payload parse error: {msg}"
+  | .error msg => return reject "D" s!"payload parse error: {msg}"
   | .ok d =>
-    if ¬ verifyAddressMap d.protocol d.entries then
-      reject "D" "verifyAddressMap rejected — some byte-overlapping pair is not counter-ordered"
-    else if ¬ readersWritersDisjointB d.entries then
-      reject "D" "reader/writer sets overlap — strict AddressMapSound not derivable"
-    else
-      ok "D" s!"verifyAddressMap accepted {d.entries.length} entries (strict)"
+    -- Execution goes through the scalable twin (Plow.CLI.FastCheckD): the
+    -- reference `verifyAddressMap` recursion is `tg.n` deep and overflows the
+    -- stack on real schedules (~590k tasks). The theorems continue to speak
+    -- about the reference definitions; see FastCheckD's header for the
+    -- equivalence argument and TCB note.
+    match ← FastCheckD.run d with
+    | .error msg => return reject "D" s!"ordering-graph check failed: {msg}"
+    | .ok (amOk, djOk) =>
+      if ¬ amOk then
+        return reject "D" "verifyAddressMap rejected — some byte-overlapping pair is not counter-ordered"
+      else if ¬ djOk then
+        return reject "D" "reader/writer sets overlap — strict AddressMapSound not derivable"
+      else
+        return ok "D" s!"verifyAddressMap accepted {d.entries.length} entries (strict)"
 
 /-! ## Checkpoint E: Wire-format round-trip (§5.10-E). -/
 
@@ -169,15 +178,19 @@ def checkE (payload : Json) : Certificate :=
 /-- Address-map allocation safety. Same underlying verifier + disjointness
     check as D — F is conceptually "post-emit" verification, but it's the
     same math (strict `AddressMapSound`). -/
-def checkF (payload : Json) : Certificate :=
+def checkF (payload : Json) : IO Certificate := do
   match Payload.parse payload with
-  | .error msg => reject "F" s!"payload parse error: {msg}"
+  | .error msg => return reject "F" s!"payload parse error: {msg}"
   | .ok d =>
-    if ¬ verifyAddressMap d.protocol d.entries then
-      reject "F" "allocation unsafe: two byte-overlapping entries have no counter or resource ordering"
-    else if ¬ readersWritersDisjointB d.entries then
-      reject "F" "allocation unsafe: reader/writer sets overlap — cannot derive strict safety"
-    else
-      ok "F" s!"allocation safe: {d.entries.length} entries checked, strict AddressMapSound"
+    -- Same scalable executable twin as checkD (see FastCheckD's header).
+    match ← FastCheckD.run d with
+    | .error msg => return reject "F" s!"ordering-graph check failed: {msg}"
+    | .ok (amOk, djOk) =>
+      if ¬ amOk then
+        return reject "F" "allocation unsafe: two byte-overlapping entries have no counter or resource ordering"
+      else if ¬ djOk then
+        return reject "F" "allocation unsafe: reader/writer sets overlap — cannot derive strict safety"
+      else
+        return ok "F" s!"allocation safe: {d.entries.length} entries checked, strict AddressMapSound"
 
 end Plow.CLI.Checkpoints

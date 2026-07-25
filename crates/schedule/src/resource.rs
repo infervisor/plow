@@ -196,6 +196,22 @@ impl ResourceState {
     pub fn link_ok(&self, start: Cycle, end: Cycle, w: f64, limit: f64) -> bool {
         self.link.capacity_ok(start, end, w, limit)
     }
+    /// Earliest `t ≥ after` where adding `w` over `[t, t+dur)` keeps the
+    /// unit's HBM profile under `limit`.
+    pub fn hbm_next_feasible(
+        &self,
+        unit: UnitId,
+        after: Cycle,
+        dur: Cycle,
+        w: f64,
+        limit: f64,
+    ) -> Cycle {
+        self.hbm[unit].next_feasible(after, dur, w, limit)
+    }
+    /// Interconnect counterpart of [`Self::hbm_next_feasible`].
+    pub fn link_next_feasible(&self, after: Cycle, dur: Cycle, w: f64, limit: f64) -> Cycle {
+        self.link.next_feasible(after, dur, w, limit)
+    }
     pub fn reserve_link(&mut self, start: Cycle, end: Cycle, w: f64) {
         self.link.reserve(start, end, w);
     }

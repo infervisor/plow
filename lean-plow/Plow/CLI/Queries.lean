@@ -28,18 +28,20 @@ structure QueryResultJ where
   deriving Inhabited
 
 def QueryResultJ.toJson (r : QueryResultJ) : Json :=
+  -- `Lean.toJson` must stay qualified in this body: the unqualified name
+  -- resolves to this very def (recursive self-reference), not the class method.
   let base := Json.mkObj [
-    ("ok", toJson r.ok),
-    ("query", toJson r.query),
+    ("ok", Lean.toJson r.ok),
+    ("query", Lean.toJson r.query),
     ("answer", r.answer)]
   let withCert := match r.certificate with
-    | some c => base.setObjVal! "certificate" (toJson c)
+    | some c => base.setObjVal! "certificate" (Lean.toJson c)
     | none => base
   let withErr := match r.error with
-    | some e => withCert.setObjVal! "error" (toJson e)
+    | some e => withCert.setObjVal! "error" (Lean.toJson e)
     | none => withCert
   match r.time_ms with
-  | some t => withErr.setObjVal! "time_ms" (toJson t)
+  | some t => withErr.setObjVal! "time_ms" (Lean.toJson t)
   | none => withErr
 
 def okResult (qt : String) (answer : Json) (cert : String) : QueryResultJ :=
@@ -91,6 +93,8 @@ def counterGranularity (payload : Json) : IO QueryResultJ := do
 
 private def longestPath (n : Nat) (edges : List (Nat × Nat)) (durations : List Nat) : Nat :=
   -- Simple O(V+E) via topological relaxation. We compute finish times.
+  -- (`Id.run do` because the body uses `let mut`/`while`/`for`.)
+  Id.run do
   let durArr := durations.toArray
   let mut finish := Array.mkArray n 0
   -- Iterate edges in a fixed-point loop (at most n iterations for a DAG).
@@ -119,7 +123,7 @@ private def longestPath (n : Nat) (edges : List (Nat × Nat)) (durations : List 
     let f := finish.getD t 0
     let d := durArr.getD t 0
     ms := Nat.max ms (f + d)
-  ms
+  return ms
 
 def lowerBound (payload : Json) : IO QueryResultJ := do
   let edges ← match payload.getObjValAs? (List (List Nat)) "edges" with

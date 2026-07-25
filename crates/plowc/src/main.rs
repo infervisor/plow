@@ -383,6 +383,207 @@ fn main() -> ExitCode {
     }
 }
 
+/// egglog fusion analysis for the devblob path (`--lean-verify` only).
+/// Informational: reports what the rewrite rules find on this checkpoint's
+/// graph, so devgen's hand-coded fusion choices can be compared against the
+/// explored space. Failures are warnings — analysis never blocks emission.
+fn report_devblob_egglog(dir: &std::path::Path) {
+    let json = match std::fs::read_to_string(dir.join("config.json")) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!(error = %e, "egglog analysis skipped: no readable config.json");
+            return;
+        }
+    };
+    let mut g = match frontend::build_from_config_json_at(&json, &frontend::ShapeBucket::default())
+    {
+        Ok(g) => g,
+        Err(e) => {
+            warn!(error = %e, "egglog analysis skipped: graph build failed");
+            return;
+        }
+    };
+    g.bind(&nn_graph::Bindings::new().set("B", 1).set("S", 512));
+    // Stats-only exploration (no extraction): the release profile is
+    // `panic = "abort"`, and egglog 2.0.0's extractor has an upstream panic
+    // (extract.rs:471, costless e-class — e.g. Qwen3/Gemma-MoE graphs) that
+    // would kill emission. `explore_stats` saturates and counts fused-op
+    // matches without ever extracting.
+    match rewrite::explore_stats(&g) {
+        Ok((ops, fused)) => {
+            let total: usize = fused.iter().map(|(_, c)| c).sum();
+            info!(
+                graph_ops = ops,
+                fusions_found = total,
+                by_op = ?fused,
+                "egglog fusion analysis (devblob path)"
+            );
+        }
+        Err(e) => warn!(error = %e, "egglog analysis failed"),
+    }
+}
+
+/// The devblob Lean gate: certify, per emitted program, that the
+/// global-queue stream order is TOPOLOGICAL over the counter edges — the
+/// invariant the persistent interpreter's deadlock-freedom argument rests
+/// on (and that `plowrt` re-checks structurally at load time).
+///
+/// Encoding into `plow_verify` checkpoint D: one task per GQ stream entry,
+/// waits/succs from the entry's counter gate lists, every task on ONE
+/// resource with `stream_idx` = GQ position. The resource-order clause then
+/// contributes the total issue order, so the ordering graph has a cycle iff
+/// some counter edge points BACKWARD in GQ order — exactly non-topology.
+/// The address map is empty: device-arena aliasing is NOT modeled here.
+#[cfg(feature = "lean-verify")]
+fn devblob_verify_hook(
+    do_verify: bool,
+    do_oracle: bool,
+    bw_bytes_per_cycle: u64,
+    clock_hz: u64,
+) -> Result<devgen::VerifyHook, Box<dyn std::error::Error>> {
+    use lean_verify::checkpoints::schedule as lv;
+    Ok(Box::new(move |m: &packet::devbuild::Model| {
+        if do_oracle {
+            devblob_oracle(m, bw_bytes_per_cycle, clock_hz)?;
+        }
+        if !do_verify {
+            return Ok(());
+        }
+        for (pi, p) in m.progs.iter().enumerate() {
+            let n = p.gq_stream.len();
+            let mut waits: Vec<Vec<u64>> = Vec::with_capacity(n);
+            let mut succs: Vec<Vec<u64>> = Vec::with_capacity(n);
+            let mut threshold = std::collections::BTreeMap::new();
+            for e in &p.gq_stream {
+                let (wo, wl) = (e.wait_ofs as usize, e.wait_len as usize);
+                waits.push(
+                    p.waits[wo..wo + wl]
+                        .iter()
+                        .map(|w| {
+                            threshold.insert(w.id.to_string(), w.threshold as u64);
+                            w.id as u64
+                        })
+                        .collect(),
+                );
+                let (so, sl) = (e.succ_ofs as usize, e.succ_len as usize);
+                succs.push(p.succs[so..so + sl].iter().map(|&c| c as u64).collect());
+            }
+            let req = lv::ScheduleRequest {
+                task_graph: lv::TaskGraphView { n, edges: Vec::new() },
+                protocol: lv::ProtocolView {
+                    waits,
+                    succs,
+                    threshold,
+                    resource: vec![0; n],
+                    stream_idx: (0..n as u64).collect(),
+                },
+                schedule_order: (0..n as u64).collect(),
+                address_map: Vec::new(),
+            };
+            let t = m.prog_t.get(pi).copied().unwrap_or(0);
+            let cert = lv::check_schedule(&req)
+                .map_err(|e| format!("program {pi} (T={t}): lean verifier failed: {e}"))?;
+            if !cert.ok {
+                return Err(format!(
+                    "program {pi} (T={t}): GQ order not topological over counter edges: {}",
+                    cert.reason.unwrap_or_default()
+                ));
+            }
+            info!(
+                program = pi,
+                t,
+                entries = n,
+                "lean ordering certificate: GQ order topological over counter edges"
+            );
+        }
+        Ok(())
+    }))
+}
+
+/// `--lean-oracle` on the devblob path: Lean-certified lower bound for one
+/// DECODE step of the emitted program. The oracle's `lower_bound` query gets
+/// the decode program's inst-level counter-edge graph (unit durations →
+/// critical path = program depth) and the bytes the decode program actually
+/// touches (every tensor referenced by a decode inst, `kv.*` excluded — the
+/// KV stream scales with context, the weight stream is the fixed floor).
+/// The binding constraint at batch 1 is HBM bandwidth: cycles ≥ bytes / bw.
+#[cfg(feature = "lean-verify")]
+fn devblob_oracle(
+    m: &packet::devbuild::Model,
+    bw_bytes_per_cycle: u64,
+    clock_hz: u64,
+) -> Result<(), String> {
+    use lean_verify::queries::lower_bound as lb;
+    let Some(p) = m.progs.last() else { return Ok(()) };
+    let pi = m.progs.len() - 1;
+    // Inst-level counter edges: producer succ counter ∈ consumer wait list.
+    let mut producers: std::collections::HashMap<u32, Vec<usize>> = Default::default();
+    for (i, inst) in p.insts.iter().enumerate() {
+        let (so, sl) = (inst.succ_ofs as usize, inst.succ_len as usize);
+        for &c in &p.succs[so..so + sl] {
+            producers.entry(c).or_default().push(i);
+        }
+    }
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    let mut touched: std::collections::BTreeSet<u32> = Default::default();
+    for (i, inst) in p.insts.iter().enumerate() {
+        let (wo, wl) = (inst.wait_ofs as usize, inst.wait_len as usize);
+        for w in &p.waits[wo..wo + wl] {
+            if let Some(ps) = producers.get(&w.id) {
+                for &a in ps {
+                    edges.push((a, i));
+                }
+            }
+        }
+        for &t in &inst.t {
+            if t != packet::dev::TENSOR_NONE {
+                touched.insert(t);
+            }
+        }
+    }
+    let bytes: u64 = touched
+        .iter()
+        .filter_map(|&t| m.tensors.get(t as usize))
+        .filter(|td| !td.name.starts_with("kv."))
+        .map(|td| td.bytes)
+        .sum();
+    let req = lb::LowerBoundRequest {
+        edges,
+        durations: vec![1; p.insts.len()],
+        total_hbm_bytes: bytes,
+        peak_bw_bytes_per_cycle: bw_bytes_per_cycle.max(1),
+        total_flops: 0,
+        peak_flops_per_cycle: 1,
+    };
+    let res = lb::query_lower_bound(&req).map_err(|e| format!("lean oracle failed: {e}"))?;
+    let us = res.lower_bound as f64 / (clock_hz as f64 / 1e6);
+    info!(
+        program = pi,
+        insts = p.insts.len(),
+        touched_bytes = bytes,
+        critical_path_depth = res.critical_path,
+        bw_bound_cycles = res.bw_bound,
+        lower_bound_cycles = res.lower_bound,
+        lower_bound_us = format!("{us:.1}"),
+        binding = ?res.binding_constraint,
+        certified = res.certificate.is_some(),
+        "[oracle] devblob decode-step lower bound (lean)"
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "lean-verify"))]
+fn devblob_verify_hook(
+    _do_verify: bool,
+    _do_oracle: bool,
+    _bw: u64,
+    _clock: u64,
+) -> Result<devgen::VerifyHook, Box<dyn std::error::Error>> {
+    Err("this plowc was built without the `lean-verify` feature; \
+         rebuild with `--features lean-verify` to use `--lean-verify`/`--lean-oracle` with `--emit devblob`"
+        .into())
+}
+
 /// `--emit devblob`: compile the checkpoint into a single PLOWDEV `model.pkt`
 /// via the `devgen` emitter and write a servable `weights.json` next to it, so
 /// the output directory is a complete `plowrt serve --assets <dir>` bundle.
@@ -449,17 +650,44 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         .clone()
         .or_else(|| std::env::var("PLOW_BLOCK").ok().filter(|s| !s.is_empty()));
 
-    devgen::run(devgen::EmitArgs {
-        dir: dir.clone(),
-        ctx: cli.max_ctx,
-        out: pkt.to_str().ok_or("non-UTF8 output path")?.to_string(),
-        n_cu,
-        tp,
-        block_spec,
-        embed_cubin: cli.embed_cubin.clone(),
-        embed_hsaco: cli.embed_hsaco.clone(),
-        rope_gen: !cli.no_rope_gen,
-    });
+    // `--lean-verify` / `--lean-oracle` on the devblob path (strictly
+    // additive — absent both flags, nothing below runs and emission is
+    // byte-identical):
+    //  * egglog fusion analysis of the same checkpoint's graph, reported;
+    //  * `--lean-verify`: a Lean ordering certificate for the EMITTED
+    //    programs — every program's global-queue order is checked
+    //    topological over its counter edges (plow_verify checkpoint D);
+    //  * `--lean-oracle`: a Lean-certified decode lower bound — critical
+    //    path + the weight-streaming bandwidth floor of the decode program.
+    let verify = if cli.lean_verify || cli.lean_oracle {
+        report_devblob_egglog(&dir);
+        let spec = hwspec::registry::lookup(&cli.gpu)
+            .ok_or_else(|| format!("unknown GPU {:?}", cli.gpu))?;
+        let bw_bytes_per_cycle =
+            (spec.mem.bandwidth.0 * 1e9 / spec.clock_boost.0 as f64) as u64;
+        Some(devblob_verify_hook(
+            cli.lean_verify,
+            cli.lean_oracle,
+            bw_bytes_per_cycle,
+            spec.clock_boost.0,
+        )?)
+    } else {
+        None
+    };
+    devgen::run_verified(
+        devgen::EmitArgs {
+            dir: dir.clone(),
+            ctx: cli.max_ctx,
+            out: pkt.to_str().ok_or("non-UTF8 output path")?.to_string(),
+            n_cu,
+            tp,
+            block_spec,
+            embed_cubin: cli.embed_cubin.clone(),
+            embed_hsaco: cli.embed_hsaco.clone(),
+            rope_gen: !cli.no_rope_gen,
+        },
+        verify,
+    );
 
     // Bare-blob mode (`--out foo.pkt`) stops here: no manifest, exactly the
     // legacy `gemma4` output. Bundle mode also writes a servable manifest.

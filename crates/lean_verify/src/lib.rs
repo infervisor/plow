@@ -139,13 +139,57 @@ fn invoke(request: &serde_json::Value) -> Result<String, VerifyError> {
 
 /// Send a verification request to `plow_verify` and parse the certificate.
 pub fn call(checkpoint: &str, payload: serde_json::Value) -> Result<Certificate, VerifyError> {
+    // Checkpoints D and F run the IDENTICAL Lean computation on the identical
+    // `ScheduleRequest` bundle (memory.rs: "callers hand the exact same
+    // bundle"); only the certificate's message text differs. Cache the
+    // verdict by payload hash so the second spawn (minutes of reachability
+    // work on a full-model bucket) is free. Scoped to the D/F handler pair —
+    // any other checkpoint always spawns.
+    let df_cache_key = if checkpoint == "D" || checkpoint == "F" {
+        use std::hash::{Hash, Hasher};
+        let bytes = serde_json::to_vec(&payload).map_err(VerifyError::SerializeRequest)?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        Some(h.finish())
+    } else {
+        None
+    };
+    static DF_CACHE: std::sync::Mutex<Option<(u64, bool, Option<String>)>> =
+        std::sync::Mutex::new(None);
+    if let Some(key) = df_cache_key {
+        if let Some((k, ok, reason)) = DF_CACHE.lock().unwrap().as_ref() {
+            if *k == key {
+                return Ok(Certificate {
+                    ok: *ok,
+                    checkpoint: checkpoint.to_string(),
+                    notes: Some("verdict cached from the identical D/F payload".into()),
+                    reason: reason.clone(),
+                });
+            }
+        }
+    }
     let request = serde_json::json!({
         "checkpoint": checkpoint,
         "payload": payload,
     });
+    // Debug aid: `PLOW_VERIFY_DUMP=<dir>` writes every request to a file so a
+    // subprocess failure ("EOF while parsing" = the Lean side died with empty
+    // stdout) can be replayed against `plow_verify` by hand.
+    if let Ok(dir) = std::env::var("PLOW_VERIFY_DUMP") {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = format!("{dir}/plow-verify-{n:03}-{checkpoint}.json");
+        if let Ok(bytes) = serde_json::to_vec(&request) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
     let stdout = invoke(&request)?;
     let cert: Certificate = serde_json::from_str(stdout.trim())
         .map_err(|e| VerifyError::DeserializeCertificate(e, stdout.clone()))?;
+    if let Some(key) = df_cache_key {
+        *DF_CACHE.lock().unwrap() = Some((key, cert.ok, cert.reason.clone()));
+    }
     Ok(cert)
 }
 

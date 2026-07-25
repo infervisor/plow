@@ -21,3 +21,6 @@ lean_lib «Plow» where
 @[default_target]
 lean_exe plow_verify where
   root := `Main
+
+lean_exe bench where
+  root := `Bench

@@ -467,10 +467,14 @@ fn choose_resource(
         TaskKind::Host => (0..machine.host_threads).map(ResourceId::Host).collect(),
     };
 
-    // Compute (resource, feasible_start) for each candidate.
+    // Compute (resource, feasible_start) for each candidate. All candidates
+    // share the task's unit (hence the same capacity limit), so the
+    // over-capacity model-mismatch warning is per-task: only the first
+    // candidate is allowed to print it.
     let mut scored: Vec<(ResourceId, Cycle)> = candidates
         .into_iter()
-        .map(|r| (r, feasible_start(machine, res, r, task, after)))
+        .enumerate()
+        .map(|(i, r)| (r, feasible_start(machine, res, r, task, after, i == 0)))
         .collect();
     scored.sort_by_key(|&(r, s)| (s, resource_key(r)));
 
@@ -506,12 +510,21 @@ fn resource_key(r: ResourceId) -> (u8, usize, usize) {
 
 /// Earliest start ≥ `after` where the exclusive hold fits and any capacity
 /// (HBM / interconnect) stays under limit.
+///
+/// Exact search: alternate between the exclusive timeline's next free gap and
+/// the capacity profile's next feasible window until both agree. Each
+/// non-final round strictly advances the candidate, and both structures have
+/// finitely many breakpoints with an empty tail, so the loop terminates at
+/// the true earliest feasible start. (This replaced a 64-fine + 32-exponential
+/// probe ladder that paid a full bandwidth rescan per probe and could skip
+/// over feasible windows entirely.)
 fn feasible_start(
     machine: &Machine,
     res: &ResourceState,
     r: ResourceId,
     task: &Task,
     after: Cycle,
+    warn: bool,
 ) -> Cycle {
     let dur = task.dur.max(1);
     let mut s = res.earliest_free(r, after, dur);
@@ -536,44 +549,30 @@ fn feasible_start(
     if w > limit + 1e-9 {
         // The task alone exceeds the capacity — no start is ever feasible
         // (duration/limit model mismatch). Place it at the earliest exclusive
-        // slot, but say so.
-        eprintln!(
-            "[schedule] warning: task '{}' needs {w:.2} B/cycle on {r:?} but the \
-             capacity limit is {limit:.2}; reserving over capacity at cycle {s}",
-            task.op
-        );
+        // slot, but say so (once per task, not once per candidate SM).
+        if warn {
+            eprintln!(
+                "[schedule] warning: task '{}' needs {w:.2} B/cycle on {r:?} but the \
+                 capacity limit is {limit:.2}; reserving over capacity at cycle {s}",
+                task.op
+            );
+        }
         return s;
     }
-    let cap_ok = |s: Cycle| match r {
-        ResourceId::Dma(u, _) | ResourceId::Sm(u, _) => res.hbm_ok(u, s, s + dur, w, limit),
-        ResourceId::Dpu(_) => res.link_ok(s, s + dur, w, limit),
-        _ => true,
-    };
-    // Fine probes: step to the next exclusive-free slot after each congested
-    // window.
-    for _ in 0..64 {
-        if cap_ok(s) {
+    loop {
+        let c = match r {
+            ResourceId::Dma(u, _) | ResourceId::Sm(u, _) => {
+                res.hbm_next_feasible(u, s, dur, w, limit)
+            }
+            ResourceId::Dpu(_) => res.link_next_feasible(s, dur, w, limit),
+            _ => s,
+        };
+        let e = res.earliest_free(r, c, dur);
+        if e == s {
             return s;
         }
-        s = res.earliest_free(r, s + dur, dur);
+        s = e;
     }
-    // Coarse probes: exponentially widening strides. Capacity reservations are
-    // finite, so past the last one the window is empty; 32 doublings put the
-    // bound at `dur << 32` cycles — beyond any real makespan horizon.
-    let mut stride = dur;
-    for _ in 0..32 {
-        s = res.earliest_free(r, s.saturating_add(stride), dur);
-        if cap_ok(s) {
-            return s;
-        }
-        stride = stride.saturating_mul(2);
-    }
-    eprintln!(
-        "[schedule] warning: no bandwidth-feasible start found for task '{}' on \
-         {r:?}; reserving over capacity at cycle {s}",
-        task.op
-    );
-    s
 }
 
 fn reserve(res: &mut ResourceState, r: ResourceId, task: &Task, s: Cycle) {

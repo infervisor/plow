@@ -83,3 +83,37 @@ pub fn rewrite_graph(g: &Graph) -> Result<(FusedGraph, RewriteStats), RewriteErr
     };
     Ok((fused, stats))
 }
+
+/// Saturate the fusion rules over `g` and report per-fused-op e-graph match
+/// counts WITHOUT extracting a term. For analysis-only callers (the devblob
+/// path's fusion report): extraction can trip an upstream egglog-2.0.0 panic
+/// (`extract.rs:471`, unwrap on a costless e-class — e.g. the Qwen3 and
+/// Gemma-MoE graphs), and the release profile's `panic = "abort"` turns that
+/// into process death. Saturation + `(print-size)` never enters that path.
+///
+/// Returns `(graph_ops, [(fused_op_name, e-graph count)])` — counts are
+/// discovered fusion *opportunities* in the saturated e-graph, not the
+/// extracted operator count.
+pub fn explore_stats(g: &Graph) -> Result<(usize, Vec<(String, usize)>), RewriteError> {
+    let (lets, _root) = lower::lower(g)?;
+    let program =
+        format!("{SCHEMA}\n{RULES}\n{lets}\n(run-schedule (saturate (run)))\n(print-size)\n");
+    let mut egraph = egglog::EGraph::default();
+    let msgs = egraph
+        .parse_and_run_program(None, &program)
+        .map_err(|e| RewriteError::Extract(extract::ExtractError::Egglog(e.to_string())))?;
+    let mut fused = Vec::new();
+    for m in &msgs {
+        for line in m.to_string().lines() {
+            if let Some((name, count)) = line.rsplit_once(':') {
+                let name = name.trim();
+                if let Ok(count) = count.trim().parse::<usize>() {
+                    if extract::is_fused(name) && count > 0 {
+                        fused.push((name.to_string(), count));
+                    }
+                }
+            }
+        }
+    }
+    Ok((g.nodes.len(), fused))
+}

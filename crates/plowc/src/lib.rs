@@ -569,7 +569,10 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
             stage = "planning", phase = phase_name(b.phase), batch = b.batch,
             seq = b.seq, "lowering bucket"
         );
-        let (plan, st) = build_plan(src, b, hf_synth.as_ref())?;
+        // Egg exploration only for the first bucket: the report keeps only the
+        // first bucket's stats (below), and the saturation result is otherwise
+        // unused — re-running it per bucket multiplied peak memory for nothing.
+        let (plan, st) = build_plan(src, b, hf_synth.as_ref(), fusion.is_none())?;
         trace!(stage = "planning", ops = plan.ops.len(), "bucket plan lowered");
         if let (None, Some(s)) = (&fusion, st) {
             fusion = Some(FusionReport {
@@ -2210,6 +2213,7 @@ fn build_plan(
     src: &Source,
     b: &ShapeBucket,
     hf_synth: Option<&hf_config::HfSynthesis>,
+    explore: bool,
 ) -> Result<(LayerPlan, Option<RewriteStats>), PlowcError> {
     match src {
         Source::Net(n) => Ok((n.build_plan(b), None)),
@@ -2231,11 +2235,22 @@ fn build_plan(
             );
             let mut g = frontend::build_from_pretrained(id, &frontend::ShapeBucket::default())?;
             g.bind(&nn_graph::Bindings::new().set("B", b.batch).set("S", b.seq));
-            info!(
-                stage = "egg-exploration", model = %id, nodes = g.nodes.len(),
-                "running egg rewrite exploration on nn_graph"
-            );
-            let (_fused, stats) = rewrite::rewrite_graph(&g)?;
+            // The fused graph is not consumed (the plan below is built from the
+            // source graph) and the caller keeps only the FIRST bucket's stats
+            // for the fusion report — so saturating the full unrolled model
+            // once per bucket was pure discarded work, and its e-graph is the
+            // compile's peak-memory driver. Explore only when asked (the first
+            // bucket); every later bucket skips straight to the plan.
+            let stats = if explore {
+                info!(
+                    stage = "egg-exploration", model = %id, nodes = g.nodes.len(),
+                    "running egg rewrite exploration on nn_graph"
+                );
+                let (_fused, stats) = rewrite::rewrite_graph(&g)?;
+                Some(stats)
+            } else {
+                None
+            };
             // Bake every block into one plan so tile-dep chaining spans block
             // boundaries — cross-block consumer tiles unblock per-tile instead
             // of waiting for the whole producer-block output tensor. Supports
@@ -2243,7 +2258,7 @@ fn build_plan(
             // dense-then-MoE) transparently — each block's ops keep their
             // own `block` index in the source graph.
             let plan = plan_from_all_blocks(&g)?;
-            Ok((plan, Some(stats)))
+            Ok((plan, stats))
         }
     }
 }

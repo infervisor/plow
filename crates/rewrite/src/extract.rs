@@ -6,8 +6,6 @@
 pub enum ExtractError {
     #[error("egglog error: {0}")]
     Egglog(String),
-    #[error("egglog produced no extraction output")]
-    NoOutput,
     #[error("could not parse extracted term: {0}")]
     Parse(String),
 }
@@ -54,7 +52,7 @@ fn is_leaf(op: &str) -> bool {
     op == "Input" || op == "Weight"
 }
 
-fn is_fused(op: &str) -> bool {
+pub(crate) fn is_fused(op: &str) -> bool {
     matches!(
         op,
         "FusedNormLinear"
@@ -77,164 +75,99 @@ fn is_fused(op: &str) -> bool {
     )
 }
 
-/// Build the full egglog program, run it, and parse the extracted term.
+/// Build the full egglog program, run it, and extract the fused graph.
 pub fn run(schema: &str, rules: &str, lets: &str, root: &str) -> Result<FusedGraph, ExtractError> {
-    let program = format!("{schema}\n{rules}\n{lets}\n(run 100)\n(extract {root})\n");
+    // Two deliberate choices, both load-bearing for memory:
+    //
+    // * `(run-schedule (saturate (run)))` instead of the old `(run 100)`: the
+    //   fusion ruleset is directed one-way rewrites (no birewrite, nothing
+    //   generative), so the e-graph reaches fixpoint after the first
+    //   iteration and saturate stops there.
+    // * NO `(extract …)` command. Its result comes back as a printed
+    //   s-expression, and printing un-shares the term DAG: every layer of a
+    //   residual-stream model references its hidden state twice, so the
+    //   printed tree is ~2^layers nodes even though the DAG is tiny. On the
+    //   48-layer Gemma-4-12B unroll that string OOM-killed the compile
+    //   (>150 GiB RSS) while the e-graph itself held only ~4k nodes.
+    //   Extraction goes through the TermDag API below, which is hash-consed
+    //   end to end.
+    let program = format!("{schema}\n{rules}\n{lets}\n(run-schedule (saturate (run)))\n");
 
     let mut egraph = egglog::EGraph::default();
-    let msgs = egraph
+    egraph
         .parse_and_run_program(None, &program)
         .map_err(|e| ExtractError::Egglog(e.to_string()))?;
 
-    // The `(extract …)` result is the last message that is an s-expression.
-    let term = msgs
-        .iter()
-        .rev()
-        .map(|m| m.to_string())
-        .find(|m| m.trim_start().starts_with('('))
-        .ok_or(ExtractError::NoOutput)?;
-
-    parse(term.trim())
+    let (sort, value) = egraph
+        .eval_expr(&egglog::prelude::exprs::var(root))
+        .map_err(|e| ExtractError::Egglog(e.to_string()))?;
+    let (termdag, tid, _cost) = egraph
+        .extract_value(&sort, value)
+        .map_err(|e| ExtractError::Egglog(e.to_string()))?;
+    term_to_graph(&termdag, tid)
 }
 
-// --- s-expression parsing into a hash-consed DAG ----------------------------
+// --- TermDag → hash-consed FusedGraph ---------------------------------------
 
-fn parse(s: &str) -> Result<FusedGraph, ExtractError> {
-    let toks = tokenize(s);
-    let mut p = Parser {
-        toks: &toks,
-        pos: 0,
-        g: FusedGraph::default(),
-        intern: std::collections::HashMap::new(),
-    };
-    let root = match p.parse_expr()? {
-        Arg::Node(i) => i,
-        other => {
-            return Err(ExtractError::Parse(format!(
-                "root is not a node: {other:?}"
-            )))
+fn term_to_graph(td: &egglog::TermDag, root: egglog::TermId) -> Result<FusedGraph, ExtractError> {
+    use egglog::{ast::Literal, Term};
+
+    let mut g = FusedGraph::default();
+    let mut intern: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut memo: std::collections::HashMap<egglog::TermId, Arg> = std::collections::HashMap::new();
+    // Iterative post-order: the unrolled model is a >1000-deep chain, too deep
+    // to recurse over safely.
+    let mut stack: Vec<(egglog::TermId, bool)> = vec![(root, false)];
+    while let Some((id, ready)) = stack.pop() {
+        if memo.contains_key(&id) {
+            continue;
         }
-    };
-    let mut g = p.g;
-    g.root = root;
-    Ok(g)
-}
-
-#[derive(Debug)]
-enum Tok {
-    Open,
-    Close,
-    Atom(String),
-    Str(String),
-}
-
-fn tokenize(s: &str) -> Vec<Tok> {
-    let mut out = Vec::new();
-    let mut chars = s.chars().peekable();
-    while let Some(&c) = chars.peek() {
-        match c {
-            '(' => {
-                out.push(Tok::Open);
-                chars.next();
-            }
-            ')' => {
-                out.push(Tok::Close);
-                chars.next();
-            }
-            '"' => {
-                chars.next();
-                let mut buf = String::new();
-                for d in chars.by_ref() {
-                    if d == '"' {
-                        break;
-                    }
-                    buf.push(d);
-                }
-                out.push(Tok::Str(buf));
-            }
-            c if c.is_whitespace() => {
-                chars.next();
-            }
-            _ => {
-                let mut buf = String::new();
-                while let Some(&d) = chars.peek() {
-                    if d == '(' || d == ')' || d == '"' || d.is_whitespace() {
-                        break;
-                    }
-                    buf.push(d);
-                    chars.next();
-                }
-                out.push(Tok::Atom(buf));
-            }
-        }
-    }
-    out
-}
-
-struct Parser<'a> {
-    toks: &'a [Tok],
-    pos: usize,
-    g: FusedGraph,
-    intern: std::collections::HashMap<String, usize>,
-}
-
-impl Parser<'_> {
-    fn parse_expr(&mut self) -> Result<Arg, ExtractError> {
-        match self.toks.get(self.pos) {
-            Some(Tok::Str(s)) => {
-                self.pos += 1;
-                Ok(Arg::Str(s.clone()))
-            }
-            Some(Tok::Atom(a)) => {
-                self.pos += 1;
-                Ok(atom_arg(a))
-            }
-            Some(Tok::Open) => {
-                self.pos += 1; // consume '('
-                let op = match self.toks.get(self.pos) {
-                    Some(Tok::Atom(a)) => a.clone(),
+        match td.get(id) {
+            Term::Lit(l) => {
+                let arg = match l {
+                    Literal::Int(n) => Arg::Int(*n),
+                    Literal::Float(f) => Arg::Float(f.to_string()),
+                    Literal::String(s) => Arg::Str(s.clone()),
                     other => {
                         return Err(ExtractError::Parse(format!(
-                            "expected constructor, got {other:?}"
+                            "unexpected literal in extracted term: {other:?}"
                         )))
                     }
                 };
-                self.pos += 1;
-                let mut args = Vec::new();
-                loop {
-                    match self.toks.get(self.pos) {
-                        Some(Tok::Close) => {
-                            self.pos += 1;
-                            break;
-                        }
-                        None => return Err(ExtractError::Parse("unexpected end of input".into())),
-                        _ => args.push(self.parse_expr()?),
-                    }
-                }
-                Ok(Arg::Node(self.intern(op, args)))
+                memo.insert(id, arg);
             }
-            Some(Tok::Close) | None => Err(ExtractError::Parse("unexpected token".into())),
+            Term::Var(v) => {
+                return Err(ExtractError::Parse(format!(
+                    "unexpected variable in extracted term: {v}"
+                )))
+            }
+            Term::App(op, children) => {
+                if !ready {
+                    stack.push((id, true));
+                    for &c in children.iter().rev() {
+                        if !memo.contains_key(&c) {
+                            stack.push((c, false));
+                        }
+                    }
+                    continue;
+                }
+                let args: Vec<Arg> = children.iter().map(|c| memo[c].clone()).collect();
+                let key = node_key(op, &args);
+                let i = *intern.entry(key).or_insert_with(|| {
+                    g.nodes.push(FNode { op: op.clone(), args });
+                    g.nodes.len() - 1
+                });
+                memo.insert(id, Arg::Node(i));
+            }
         }
     }
-
-    fn intern(&mut self, op: String, args: Vec<Arg>) -> usize {
-        let key = node_key(&op, &args);
-        if let Some(&i) = self.intern.get(&key) {
-            return i;
+    match memo[&root] {
+        Arg::Node(i) => {
+            g.root = i;
+            Ok(g)
         }
-        let i = self.g.nodes.len();
-        self.g.nodes.push(FNode { op, args });
-        self.intern.insert(key, i);
-        i
+        ref other => Err(ExtractError::Parse(format!("root is not a node: {other:?}"))),
     }
-}
-
-fn atom_arg(a: &str) -> Arg {
-    if let Ok(n) = a.parse::<i64>() {
-        return Arg::Int(n);
-    }
-    // anything else numeric-looking (has '.', 'e') is a float token.
-    Arg::Float(a.to_string())
 }
 
 fn node_key(op: &str, args: &[Arg]) -> String {
