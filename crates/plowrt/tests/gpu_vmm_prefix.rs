@@ -212,6 +212,10 @@ fn remap_after_release_cycle() {
         hd_slide: 0,
         window: 0,
         elem: 2,
+        // Sliding-layer element width. These cases have no sliding
+        // layers, so it is inert here; 2 matches `elem` as everywhere
+        // outside the mixed fp8-KV mode.
+        elem_slide: 2,
         max_ctx: 8192,
         batch: 4,
     };
@@ -246,6 +250,10 @@ fn attach_latency_vs_copy_baseline() {
         hd_slide: 0,
         window: 0,
         elem: 2,
+        // Sliding-layer element width. These cases have no sliding
+        // layers, so it is inert here; 2 matches `elem` as everywhere
+        // outside the mixed fp8-KV mode.
+        elem_slide: 2,
         max_ctx,
         batch: 2,
     };

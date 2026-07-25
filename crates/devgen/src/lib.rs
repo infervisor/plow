@@ -473,6 +473,25 @@ fn ckpt_names(dir: &Path, prefix: &str) -> HashSet<String> {
 /// (`kv.`), compiler-materialised tables (rope) and the fp8 twins (`fp8/`, which live
 /// in a sibling directory, not `dir`) are all out of scope by construction.
 fn validate_coverage(dir: &Path, prefix: &str, declared: &[String]) -> Result<(), String> {
+    // A directory with NO safetensors at all is not a coverage failure -- there is nothing to
+    // cross-check against. Emitting a blob from a bare config.json is legitimate (the structural
+    // golden tests do exactly that), and `shard_files` PANICS rather than returning empty, so
+    // reaching it here aborts a valid emit. Say so on stderr rather than skipping silently: a
+    // genuinely missing checkpoint is still visible, it just no longer kills the process from
+    // inside a gate whose whole purpose is comparing two sets, one of which does not exist.
+    let has_shards = std::fs::read_dir(dir).is_ok_and(|rd| {
+        rd.filter_map(Result::ok).any(|e| {
+            e.path().extension().and_then(|x| x.to_str()) == Some("safetensors")
+        })
+    });
+    if !has_shards {
+        eprintln!(
+            "devgen: {} has no .safetensors — skipping the checkpoint coverage gate \
+             (nothing to compare the plan against)",
+            dir.display()
+        );
+        return Ok(());
+    }
     let ckpt = ckpt_names(dir, prefix);
     // A weight is covered if the plan binds EITHER the bf16 tensor or its fp8 twin.
     // Under PLOW_FP8 the projections are declared as `fp8/<name>` (the twins live in a
