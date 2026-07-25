@@ -1310,3 +1310,13 @@ the flash body twice (`FA_QGLOB`, `FA_WPR_RB`), so it was re-swept rather than a
 **The optimum held at 32.** Recorded because "we re-checked and nothing moved" is a result: it
 bounds how often the joint sweep actually has to be re-run, and the alternative — assuming it
 held — is how `GV_MOE_UN` and `NS_ABS` went stale in the first place.
+
+## Round 18 addendum 2 — `FA_WPR_RB` is occupancy-specific (shipped default confirmed)
+
+`PLOW_NV_FA_WPR_RB=2` won at 2 blocks/SM (4.560 vs 4.598). At the **shipped** 1 block/SM it is
+a dead heat — fp8 ctx1024 **5.334 (RB=1) vs 5.335 (RB=2)**, median of 3, spread 0.006 — so the
+source default of 1 is right for the shipped object and the win is real only at occ-2.
+
+That makes **four** knobs whose optimum depends on occupancy (`GV_UNROLL`, `PLOW_NS_ABS`,
+`PLOW_NV_FP8_RB`, and now `FA_WPR_RB`), which is the case for the tuner owning them per cell
+rather than any of them being a single constant.
