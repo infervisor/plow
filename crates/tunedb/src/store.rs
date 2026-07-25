@@ -483,6 +483,8 @@ mod tests {
                 model: "gemma-4-26B-A4B-it".into(),
             },
             knobs: crate::decode::DecodeKnobs {
+                extra_defines: Default::default(),
+                extra_emit: Default::default(),
                 minblk: n_cu / 132,
                 n_cu,
                 gv_unroll: unroll,

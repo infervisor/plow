@@ -88,6 +88,10 @@ struct Row {
     gv_moe_un: u32,
     moe_down_sg: u32,
     ns_abs: u32,
+    #[serde(default)]
+    extra_defines: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    extra_emit: std::collections::BTreeMap<String, String>,
     /// TPOT of each `step_bench` invocation, milliseconds.
     samples_ms: Vec<f64>,
     registers: Option<u32>,
@@ -154,6 +158,11 @@ fn ingest(
                 gv_moe_un: r.gv_moe_un,
                 moe_down_sg: r.moe_down_sg,
                 ns_abs: r.ns_abs,
+                // Op families added after the first sweep (flash attention, the
+                // fp8 GEMV row-block) travel here, so a new family needs no
+                // schema change and older rows still load.
+                extra_defines: r.extra_defines.clone(),
+                extra_emit: r.extra_emit.clone(),
             },
             ctx: r.ctx,
             digests: Digests {

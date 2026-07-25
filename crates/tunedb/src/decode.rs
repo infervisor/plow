@@ -111,8 +111,43 @@ impl DecodeCell {
     }
 }
 
+/// Which toolchain's flag syntax rebuilds an object for a given hardware key.
+///
+/// The knob VALUES are portable; the way they are spelled on a command line is
+/// not. Deriving this from the hardware key rather than assuming nvcc is what
+/// keeps a second backend from silently inheriting `-D` flags it cannot use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// `nvcc -DNAME=VALUE`.
+    Nvidia,
+    /// AMD/HSA. No decode sweep has been run on it yet; `defines` refuses
+    /// rather than emitting nvcc syntax that would build the wrong object.
+    Hsa,
+}
+
+impl Backend {
+    /// `nvidia/sm_90a/h100-nvl` -> `Nvidia`. Unknown vendors are an error at the
+    /// call site, not a silent default.
+    pub fn from_hardware(hardware: &str) -> Option<Self> {
+        match hardware.split('/').next()? {
+            "nvidia" => Some(Backend::Nvidia),
+            "amd" | "hsa" => Some(Backend::Hsa),
+            _ => None,
+        }
+    }
+}
+
 /// One point in the decode knob grid — everything needed to rebuild it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The named fields are the knobs the first sweep covered. **New op families add
+/// themselves through [`extra_defines`](Self::extra_defines) /
+/// [`extra_emit`](Self::extra_emit) rather than by growing this struct** — the
+/// flash-attention family (`PLOW_NV_FA_WPR`, `FA_GF`, `FA_GF_FULL`, `FA_KUN`,
+/// `PLOW_NS_FULL_ABS`) and the fp8 GEMV row-block (`PLOW_NV_FP8_RB`) arrived
+/// after these fields were written, and a closed struct would have meant either
+/// a schema break or data that could not be recorded at all. Both maps are
+/// `serde(default)`, so records written before a family existed still load.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecodeKnobs {
     /// `PLOW_NV_FORCE_MINBLK` — blocks/SM the object is compiled for.
     pub minblk: u32,
@@ -128,6 +163,16 @@ pub struct DecodeKnobs {
     pub moe_down_sg: u32,
     /// `PLOW_NS_ABS` — flash decode split count, baked at packet emit.
     pub ns_abs: u32,
+    /// Additional compile-time knobs, `NAME -> VALUE`, rendered by the backend's
+    /// flag syntax. This is the extension point for a new op family.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_defines: BTreeMap<String, String>,
+    /// Additional packet-emit knobs, `NAME -> VALUE`, passed to `plowc` as env.
+    /// Kept separate from `extra_defines` for the same reason `emit_env` is kept
+    /// separate from `defines`: they land in different artifacts and drift apart
+    /// precisely when they are written down as one string.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_emit: BTreeMap<String, String>,
 }
 
 impl DecodeKnobs {
@@ -135,6 +180,17 @@ impl DecodeKnobs {
     /// in `scripts/build_sm90a_cubin.sh` (which reads them from
     /// `PLOW_EXTRA_DEFINES`).
     pub fn defines(&self) -> Vec<String> {
+        self.defines_for(Backend::Nvidia)
+            .expect("Nvidia flag syntax is always available")
+    }
+
+    /// Same, rendered in `backend`'s flag syntax. Returns `None` for a backend
+    /// whose decode sweep has not been built yet, so a caller cannot quietly
+    /// rebuild an AMD object with nvcc spellings.
+    pub fn defines_for(&self, backend: Backend) -> Option<Vec<String>> {
+        if backend != Backend::Nvidia {
+            return None;
+        }
         let mut v = vec![
             format!("-DPLOW_NV_FORCE_MINBLK={}", self.minblk),
             format!("-DGV_UNROLL={}", self.gv_unroll),
@@ -144,23 +200,30 @@ impl DecodeKnobs {
         if self.gv_unroll_glu != 0 {
             v.push(format!("-DGV_UNROLL_GLU={}", self.gv_unroll_glu));
         }
-        v
+        for (k, val) in &self.extra_defines {
+            v.push(format!("-D{k}={val}"));
+        }
+        Some(v)
     }
 
     /// The `plowc` invocation that emits the matching packet. Separate from
     /// [`defines`](Self::defines) because these two land in different artifacts
     /// and get out of sync exactly when they are written down as one string.
     pub fn emit_env(&self) -> Vec<String> {
-        vec![
+        let mut v = vec![
             "PLOW_UNISEG=1".into(),
             format!("PLOW_NS_ABS={}", self.ns_abs),
             format!("--n-cu {}", self.n_cu),
-        ]
+        ];
+        for (k, val) in &self.extra_emit {
+            v.push(format!("{k}={val}"));
+        }
+        v
     }
 
     /// Compact identity, matching the sweep script's `config` field.
     pub fn label(&self) -> String {
-        format!(
+        let mut s = format!(
             "mb{}_ncu{}_un{}_glu{}_mun{}_sg{}_ns{}",
             self.minblk,
             self.n_cu,
@@ -169,7 +232,15 @@ impl DecodeKnobs {
             self.gv_moe_un,
             self.moe_down_sg,
             self.ns_abs
-        )
+        );
+        /* Extras are appended in BTreeMap order, so a label is stable for a knob
+         * set regardless of the order the sweep discovered them. */
+        for (k, val) in self.extra_defines.iter().chain(self.extra_emit.iter()) {
+            s.push('_');
+            s.push_str(&k.rsplit('_').next().unwrap_or(k).to_ascii_lowercase());
+            s.push_str(val);
+        }
+        s
     }
 
     /// Whether the occupancy pair is self-consistent for a 132-SM part. An
@@ -294,6 +365,8 @@ mod tests {
 
     fn knobs(minblk: u32, n_cu: u32, unroll: u32, ns: u32) -> DecodeKnobs {
         DecodeKnobs {
+            extra_defines: Default::default(),
+            extra_emit: Default::default(),
             minblk,
             n_cu,
             gv_unroll: unroll,
@@ -438,4 +511,45 @@ mod tests {
         assert_eq!(serde_json::from_str::<DecodeMeasurement>(&text).unwrap(), m);
         assert!(text.contains("\"32k\""), "buckets serialise by their label");
     }
+    /// A new op family must be recordable and rebuildable WITHOUT growing
+    /// DecodeKnobs. This is the flash-attention family, which arrived after the
+    /// struct's named fields were written.
+    #[test]
+    fn a_new_op_family_rides_the_extra_maps() {
+        let mut k = knobs(2, 264, 4, 32);
+        k.extra_defines.insert("PLOW_NV_FA_WPR".into(), "1".into());
+        k.extra_defines.insert("PLOW_NV_FP8_RB".into(), "2".into());
+        k.extra_emit.insert("PLOW_NS_FULL_ABS".into(), "33".into());
+
+        let d = k.defines();
+        assert!(d.contains(&"-DPLOW_NV_FA_WPR=1".to_string()));
+        assert!(d.contains(&"-DPLOW_NV_FP8_RB=2".to_string()));
+        // packet-side knobs must NOT leak into the object's defines
+        assert!(!d.iter().any(|f| f.contains("NS_FULL_ABS")));
+        assert!(k.emit_env().contains(&"PLOW_NS_FULL_ABS=33".to_string()));
+        // and the label must distinguish it from the same knobs without extras
+        assert_ne!(k.label(), knobs(2, 264, 4, 32).label());
+    }
+
+    /// Records written before a family existed still deserialize.
+    #[test]
+    fn knobs_without_extras_still_load() {
+        let json = r#"{"minblk":2,"n_cu":264,"gv_unroll":4,"gv_unroll_glu":0,
+                       "gv_moe_un":2,"moe_down_sg":4,"ns_abs":32}"#;
+        let k: DecodeKnobs = serde_json::from_str(json).expect("legacy row loads");
+        assert!(k.extra_defines.is_empty() && k.extra_emit.is_empty());
+    }
+
+    /// The knob VALUES are portable; their spelling is not. A backend with no
+    /// decode sweep must refuse rather than inherit nvcc syntax.
+    #[test]
+    fn a_backend_without_a_sweep_refuses_to_render_flags() {
+        let k = knobs(2, 264, 4, 32);
+        assert!(k.defines_for(Backend::Nvidia).is_some());
+        assert!(k.defines_for(Backend::Hsa).is_none());
+        assert_eq!(Backend::from_hardware("nvidia/sm_90a/h100-nvl"), Some(Backend::Nvidia));
+        assert_eq!(Backend::from_hardware("amd/gfx950/mi355x"), Some(Backend::Hsa));
+        assert_eq!(Backend::from_hardware("acme/tpu"), None);
+    }
+
 }

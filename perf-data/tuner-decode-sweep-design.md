@@ -98,3 +98,34 @@ runs at 2968 GB/s (91 % of the measured 3269 GB/s ceiling) and the SASS hot loop
 A tuner recovers the few percent left in the knobs and stops the defaults from rotting as
 other arms change (which is exactly what happened to `GV_MOE_UN` this campaign). Closing the
 rest needs the structural work listed at the end of the perf-data card.
+
+---
+
+## Extensibility (implemented)
+
+Two axes the design has to survive, both now enforced by tests in `crates/tunedb/src/decode.rs`:
+
+**New op families must not require a schema change.** `DecodeKnobs` began as seven named
+fields, and that closed shape could not represent the knobs that arrived later — the
+flash-attention family (`PLOW_NV_FA_WPR`, `FA_GF`, `FA_GF_FULL`, `FA_KUN`, `PLOW_NS_FULL_ABS`)
+and the fp8 GEMV row-block (`PLOW_NV_FP8_RB`). The sweep script could vary them; the record
+could not store them. So knobs now also carry:
+
+- `extra_defines: BTreeMap<String,String>` — compile-time knobs, rendered as `-DNAME=VALUE`
+- `extra_emit: BTreeMap<String,String>` — packet-emit knobs, passed to `plowc` as env
+
+kept separate for the same reason `emit_env` is separate from `defines`: they land in different
+artifacts and drift apart exactly when written as one string. Both are `serde(default)`, so
+rows written before a family existed still load (`knobs_without_extras_still_load`), and a new
+family is recordable and rebuildable with no struct change
+(`a_new_op_family_rides_the_extra_maps`).
+
+**Hardware: knob values are portable, their spelling is not.** `defines()` emitted nvcc `-D`
+unconditionally, which a future AMD/HSA sweep would have silently inherited and used to build
+the wrong object. There is now a `Backend` derived from the hardware key
+(`nvidia/sm_90a/h100-nvl` → `Nvidia`, `amd/...` → `Hsa`, unknown → `None`), and
+`defines_for(backend)` **returns `None`** for a backend whose sweep has not been built rather
+than guessing (`a_backend_without_a_sweep_refuses_to_render_flags`). The record `cell` was
+already hardware-keyed; this closes the rendering half.
+
+Tests: 34 → **37**.
