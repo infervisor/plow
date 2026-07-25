@@ -1320,3 +1320,41 @@ source default of 1 is right for the shipped object and the win is real only at 
 That makes **four** knobs whose optimum depends on occupancy (`GV_UNROLL`, `PLOW_NS_ABS`,
 `PLOW_NV_FP8_RB`, and now `FA_WPR_RB`), which is the case for the tuner owning them per cell
 rather than any of them being a single constant.
+
+# Round 19 — the last two flash levers, both refuted; fp8 plateaus at 4.557 ms
+
+Two things the campaign's own pattern said to retry after round 17 changed the flash body twice.
+
+**nsplit, re-swept a third time — the optimum HELD.** It had moved 8 → 32 when warp-per-row
+landed, so it was re-checked rather than assumed: `NS_ABS` 32 → **4.557**, 48 → 4.709,
+64 → 4.692. Recorded because a null re-check bounds how often the joint sweep must be re-run.
+
+**Bounding the softmax reductions to live rows — refuted twice.** The two reductions sweep all
+`FA_DEC_TILE=256` entries while a work item at `nsplit=32` owns ~32 live rows, so 7 of every 8
+iterations reduce `NEG_INF` padding. Bounding them to `rmax_t` measures **4.580 vs 4.557** —
+worse, and worse by the same margin as the pre-round-17 attempt (5.806 vs 5.784). The padding
+reads are smem hits, and the bound makes the loop's trip count non-uniform across warps; that
+costs more than the wasted iterations. Kept behind `PLOW_NV_FA_REDBOUND=0`.
+
+## Where fp8 stops
+
+| | ms |
+|---|---|
+| plow fp8 ctx1024 (occ-2, best) | **4.557** |
+| — of which non-flash | 4.245 |
+| — of which flash | 0.307 |
+| **vLLM fp8** | **4.417** |
+| shortfall | **0.140 (3.2 %)** |
+
+The non-flash floor is *below* vLLM's total, so the entire remaining gap sits in flash. Flash is
+now 0.307 ms for ~231 MB — **752 GB/s against a 3269 GB/s ceiling** — and every knob that
+touches it has been swept: `WPR` (2.53× win, kept), `QGLOB` (−0.020, kept), `WPR_RB` (−0.028 at
+occ-2, kept), `KUN`, `GF`, `GF_FULL`, `NS_FULL_ABS`, `NS_ABS` ×3, `REDBOUND` ×2. What is left is
+per-work-item fixed cost — Q setup, three `__syncthreads` per tile, the partial write and its
+merge — which needs the op restructured, not tuned.
+
+Alongside it, two single-CTA ops that 263 blocks gate on: **router TOPK 0.217** and
+**COMBINE_NORM 0.246**. Both are latency-bound, both were measured to resist more threads
+(round 8, round 16), and together they are 0.463 ms — more than three times the shortfall. They
+are the campaign's clearest remaining target and they need to come **off the critical path**
+(overlap), which is a scheduling change in the emitter and interpreter.

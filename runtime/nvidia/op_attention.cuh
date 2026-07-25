@@ -77,6 +77,12 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #ifndef PLOW_NV_FA_WPR_RB
 #define PLOW_NV_FA_WPR_RB 1
 #endif
+/* Bound the two softmax reductions to the tile's LIVE rows. Entries past rmax_t are NEG_INF in
+ * both score bodies, so scanning them is pure waste -- and at nsplit=32 a work item owns ~32 of
+ * the 256 tile rows, so 7 of every 8 iterations reduce padding. 0 = sweep the whole tile. */
+#ifndef PLOW_NV_FA_REDBOUND
+#define PLOW_NV_FA_REDBOUND 0
+#endif
 /* Thread map for the V phase / O accumulator: 8 consecutive head-dims per thread, so both K
  * and V move 16 bytes per lane contiguously (one 128-bit global load), and the block's rows
  * are split across NG row-groups whose partial O is folded once at the end. */
@@ -648,7 +654,11 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
              * barriers, not 3*GF. (8 warps, GF <= 8.) */
             if (warp < GF) {
                 float mx = FA_NEG_INF;
+#if PLOW_NV_FA_REDBOUND
+                for (int i = lane; i < (int)rmax_t; i += 32)
+#else
                 for (int i = lane; i < FA_DEC_TILE; i += 32)
+#endif
                     mx = fmaxf(mx, Ssm[warp * FA_DEC_TILE + i]);
                 mx = warp_max32(mx);
                 if (lane == 0) hmax[warp] = mx;
@@ -677,7 +687,11 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 
             if (warp < GF) {
                 float sm = 0.0f;
+#if PLOW_NV_FA_REDBOUND
+                for (int i = lane; i < (int)rmax_t; i += 32) sm += Ssm[warp * FA_DEC_TILE + i];
+#else
                 for (int i = lane; i < FA_DEC_TILE; i += 32) sm += Ssm[warp * FA_DEC_TILE + i];
+#endif
                 sm = warp_sum32(sm);
                 if (lane == 0) hsum[warp] = sm;
             }
