@@ -1721,6 +1721,26 @@ static __device__ void d_moe_combine_resid_norm_gemma(
 
     /* Pass 1: combine (sum over slots), ss of the f32 combine. */
     float ss = 0.0f;
+#if PLOW_NV_GEMV_RB
+    /* float4 twin. This op runs on ONE CTA (`slice != 0` returns above) and pass 1 moves ~90 KB
+     * of the op's ~120 KB, so it dominates. The scalar form is why the tail fuse measured
+     * NEGATIVE (+0.18 ms) when it was first tried -- devgen's own comment says the fusion is
+     * "only worth revisiting as a register-cached vectorized body", which is this.
+     * `part` rows are H f32 apart and H % 8 == 0 by the emitter's contract, so the float4 reads
+     * are aligned. The ss grouping changes, hence its rounding; it was already a parallel
+     * reduction, and the arena values written are bit-identical. */
+    if ((H & 3u) == 0u) {
+        for (unsigned h = tid * 4u; h < H; h += nth * 4u) {
+            float4 acc4 = make_float4(0.f, 0.f, 0.f, 0.f);
+            for (unsigned slot = 0; slot < k; slot++) {
+                const float4 v = *(const float4*)(part + (size_t)slot * H + h);
+                acc4.x += v.x; acc4.y += v.y; acc4.z += v.z; acc4.w += v.w;
+            }
+            *(float4*)(arena + h) = acc4;
+            ss += acc4.x * acc4.x + acc4.y * acc4.y + acc4.z * acc4.z + acc4.w * acc4.w;
+        }
+    } else
+#endif
     for (unsigned h = tid; h < H; h += nth) {
         float acc = 0.0f;
         for (unsigned slot = 0; slot < k; slot++) acc += part[(size_t)slot * H + h];

@@ -1358,3 +1358,49 @@ Alongside it, two single-CTA ops that 263 blocks gate on: **router TOPK 0.217** 
 (round 8, round 16), and together they are 0.463 ms — more than three times the shortfall. They
 are the campaign's clearest remaining target and they need to come **off the critical path**
 (overlap), which is a scheduling change in the emitter and interpreter.
+
+# Round 20 — the tail fusion, re-tried properly and refuted with a corrected reason
+
+`PLOW_GEMMA_MOE_TAIL_FUSE` folds COMBINE_NORM and the following NormResidualNorm into one
+packet (opcode 72), removing a gate from every layer's tail. It measured **+0.18 ms** when
+first tried, and `devgen`'s comment records the diagnosis as its *scalar* body, "only worth
+revisiting as a register-cached vectorized body".
+
+Pass 1 of op72 (the ~90 KB of its ~120 KB) was vectorised to float4, exactly as COMBINE_NORM's
+was in round 8. Re-measured, medians of 3:
+
+| | fp8 occ-2 ctx1024 |
+|---|---|
+| no fuse | **4.584** |
+| tail fuse, op72 pass-1 vectorised | 4.768 (**+0.184**) |
+
+**The same margin as before — so the scalar body was not the cause.** The real reason is in
+`d_norm_residual_norm`: it has a **register-cached fast path** (`fits = feat <= RN_REG *
+PLOW_NV_THREADS`) that keeps the row in registers and never round-trips the arena. op72 forces
+all four of its passes through the f32 arena with two `__syncthreads` each. Fusing therefore
+trades a cheap register-resident op for an extra arena pass, and the gate it removes does not
+pay for that. devgen's comment asked for "register-cached **and** vectorised"; only the second
+half was done here, and doing the first is a rewrite of a four-pass op.
+
+**And it could not close the gap even if it worked.** The skeleton floor is 0.577 ms across 216
+packets ≈ 2.7 µs per gate, so removing one gate per layer is worth **~0.08 ms** — below the
+0.140 ms shortfall, before counting whatever the register-cached rewrite costs. Recorded so the
+next person does not spend the rewrite to find that out.
+
+Kept default-off. `PLOW_NV_GEMV_RB` now also carries op72's vectorised pass 1, which is inert
+unless the fusion is enabled.
+
+## Final position
+
+| | control | best measured | vLLM | gap |
+|---|---|---|---|---|
+| bf16 ctx1024 (occ-2) | 9.267 | **5.616** (1.65×) | 4.825 | 1.16× |
+| fp8 ctx1024 (occ-2) | 7.465 | **4.557** (1.64×) | **4.417** | **1.032×** |
+
+**vLLM is not beaten.** Every knob in the GEMV, MoE, flash and gate families has been swept,
+several of them two and three times as the bodies beneath them changed. The remaining 0.140 ms
+on fp8 sits in flash's per-work-item fixed cost and in two single-CTA ops (router TOPK 0.217,
+COMBINE_NORM 0.246) that 263 blocks gate on. Both resist more threads (rounds 8, 16) and the
+one available fusion that would take one of them off the critical path is bounded at ~0.08 ms
+by the gate floor. Closing it needs the decode program restructured so those ops overlap
+rather than serialise — an emitter/interpreter change, not a kernel knob.
