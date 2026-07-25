@@ -1404,3 +1404,57 @@ COMBINE_NORM 0.246) that 263 blocks gate on. Both resist more threads (rounds 8,
 one available fusion that would take one of them off the critical path is bounded at ~0.08 ms
 by the gate floor. Closing it needs the decode program restructured so those ops overlap
 rather than serialise — an emitter/interpreter change, not a kernel knob.
+
+# Round 21 — the scheduler/sync family, the last unswept knobs
+
+The gate floor is 0.577 ms, 13 % of the step, and the counter protocol itself had never been
+swept for DECODE — the PGQ campaign only compared these for prefill. fp8, occ-2, ctx1024:
+
+| config | ms |
+|---|---|
+| **shipped: `SCHED=1` (GQ), `PTXSYNC=1`** | **4.579** |
+| `PTXSYNC=3` (one loop-exit acquire) | 4.573 (wash, within noise) |
+| `PTXSYNC=2` | 4.796 |
+| `SCHED=0` (STATIC, each block walks its own stream) | **5.431** |
+| `SCHED=0 PTXSYNC=3` | 5.400 |
+
+The shipped pair is optimal. **Static scheduling is 0.85 ms worse** — the single global cursor
+is doing real work for decode, which independently corroborates the PGQ verdict's conclusion
+that "the single global queue is already right for this workload" (that was argued from
+partition experiments; this measures the alternative directly).
+
+## THE SEARCH IS EXHAUSTED
+
+Every knob family in the decode object has now been swept, most of them repeatedly as the
+bodies beneath them changed:
+
+| family | knobs | outcome |
+|---|---|---|
+| dense GEMV | `GV_UNROLL`, `GV_RB`, `GV_UNROLL_RB`, lane-split, x-staging | tuned; row-block/lane-split refuted in-context |
+| MoE | `GV_MOE_RB`, `GV_MOE_UN`, `GV_MOE_RB_DN`, `MOE_DOWN_SG`, lane-split, `fu` staging, all-block combine, wide router | tuned; 4 refuted |
+| fp8 | `PLOW_NV_FP8_RB`, f32-x staging | tuned; staging refuted (arena overrun) |
+| flash | `FA_WPR`, `FA_QGLOB`, `FA_WPR_RB`, `FA_KUN`, `FA_GF`, `FA_GF_FULL`, `REDBOUND` | tuned; 4 refuted |
+| packet | `NS_ABS` (×3), `NS_FULL_ABS`, `--n-cu` | tuned; ctx- and occupancy-dependent |
+| occupancy | `FORCE_MINBLK` 1/2/3 | occ-2 optimal; occ-3 spills |
+| fusion | `TAIL_FUSE` (×2), `FUSE_ARGMAX`, `ROUTER_FUSED` | all refuted |
+| **scheduler/sync** | **`SCHED`, `PTXSYNC`** | **shipped pair optimal** |
+
+## Final, and what beating vLLM would actually take
+
+| | control | best | vLLM | gap |
+|---|---|---|---|---|
+| bf16 ctx1024 (occ-2) | 9.267 | **5.616** | 4.825 | 1.16× |
+| fp8 ctx1024 (occ-2) | 7.465 | **4.557** | **4.417** | **1.032×** |
+
+**vLLM is not beaten, and no remaining knob can close it.** The 0.140 ms sits in:
+
+- **flash's per-work-item fixed cost** (0.307 ms total, 752 GB/s against a 3269 ceiling) — Q
+  setup, three `__syncthreads` per tile, the partial write and its merge;
+- **two single-CTA ops that 263 blocks gate on** — router TOPK 0.217, COMBINE_NORM 0.246 —
+  both measured to *resist* more threads, and the one fusion that would lift one off the
+  critical path is capped at ~0.08 ms by the gate floor.
+
+The change that closes it is structural: let independent ops overlap instead of serialising
+behind a grid-wide gate, so a single-CTA op's latency is hidden by a neighbouring GEMV rather
+than paid by all 264 blocks. That is an emitter + interpreter redesign — a different engine,
+not a different constant — and it is the one thing this campaign did not attempt.
