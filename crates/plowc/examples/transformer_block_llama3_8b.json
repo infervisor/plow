@@ -1,0 +1,15 @@
+{
+  "name": "transformer-block-llama3-8b",
+  "note": "Full decoder block (Llama-3-8B): hidden 4096, GQA 32 query / 8 KV heads, head_dim 128, SwiGLU FFN intermediate 14336. input_norm -> fused QKV (6144) -> attention -> o_proj -> post_attn_norm -> FFN up (14336) -> SiLU -> FFN down. SwiGLU gate*up elementwise is folded into the single up projection (linear-chain format).",
+  "hidden": 4096,
+  "ops": [
+    { "op": "norm" },
+    { "op": "gemm", "n": 6144, "k": 4096 },
+    { "op": "flash", "heads": 32, "head_dim": 128 },
+    { "op": "gemm", "n": 4096, "k": 4096 },
+    { "op": "norm" },
+    { "op": "gemm", "n": 14336, "k": 4096 },
+    { "op": "act" },
+    { "op": "gemm", "n": 4096, "k": 14336 }
+  ]
+}

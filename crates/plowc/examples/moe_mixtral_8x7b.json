@@ -1,0 +1,15 @@
+{
+  "name": "moe-mixtral-8x7b",
+  "note": "Sparse MoE FFN block (Mixtral 8x7B): hidden 4096, 8 experts, top_k 2, per-expert SwiGLU intermediate 14336. norm -> router (4096->8 expert logits) -> the two activated experts' SwiGLU FFNs (each up 4096->14336, SiLU, down 14336->4096). top_k=2 is modeled as two sequential expert FFN passes (the per-token matmul volume); real routing/gather/scatter and gate*up are not expressible in the linear-chain format.",
+  "hidden": 4096,
+  "ops": [
+    { "op": "norm" },
+    { "op": "gemm", "n": 8, "k": 4096 },
+    { "op": "gemm", "n": 14336, "k": 4096 },
+    { "op": "act" },
+    { "op": "gemm", "n": 4096, "k": 14336 },
+    { "op": "gemm", "n": 14336, "k": 4096 },
+    { "op": "act" },
+    { "op": "gemm", "n": 4096, "k": 14336 }
+  ]
+}

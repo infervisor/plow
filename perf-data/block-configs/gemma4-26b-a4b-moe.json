@@ -1,0 +1,48 @@
+{
+  "name": "gemma4-26b-a4b-moe",
+  "arch": "Gemma4ForCausalLM",
+  "layer_index": 0,
+  "note": "Gemma-4-26B-A4B-it MoE decoder block, geometry taken VERBATIM from /workspace/models/gemma-4-26B-A4B-it/config.json: hidden 2816, 30 layers, 16 Q / 8 KV heads, head_dim 256, global_head_dim 512, intermediate_size 2112, 128 experts, top_k 8, moe_intermediate_size 704, sliding_window 1024. Supersedes the 8-expert/top-2/hidden-2560 approximation in crates/plowc/examples/moe_gemma4_26b_a4b.json. Layer 0 is sliding_attention (window 1024) per config.layer_types, matching what `gemma4 --block 0` extracts.",
+  "config": {
+    "architectures": [
+      "Gemma4ForCausalLM"
+    ],
+    "hidden_size": 2816,
+    "num_hidden_layers": 30,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "head_dim": 256,
+    "global_head_dim": 512,
+    "intermediate_size": 2112,
+    "enable_moe_block": true,
+    "num_experts": 128,
+    "top_k_experts": 8,
+    "moe_intermediate_size": 704,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "rms_norm_eps": 1e-06,
+    "attention_bias": false,
+    "max_position_embeddings": 262144,
+    "sliding_window": 1024,
+    "layer_types": [
+      "sliding_attention"
+    ],
+    "rope_parameters": {
+      "full_attention": {
+        "rope_type": "default",
+        "rope_theta": 1000000.0,
+        "partial_rotary_factor": 1.0
+      },
+      "sliding_attention": {
+        "rope_type": "default",
+        "rope_theta": 10000.0,
+        "partial_rotary_factor": 1.0
+      }
+    },
+    "hidden_size_per_layer_input": 0,
+    "num_kv_shared_layers": 0,
+    "attention_k_eq_v": false,
+    "use_second_mlp_block": false,
+    "use_double_wide_mlp": false,
+    "attn_logit_softcapping": null
+  }
+}

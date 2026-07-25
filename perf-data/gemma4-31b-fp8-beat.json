@@ -1,0 +1,65 @@
+{
+  "campaign": "fp8-31b-beat",
+  "date": "2026-07-22",
+  "branch": "fp8-31b",
+  "model": "google/gemma-4-31B-it (dense, 60 layers, hidden 5376, inter 21504, hd 256/512)",
+  "box": "1x RTX PRO 6000 Blackwell 96 GB (sm_120, 188 SMs), CUDA 13.0",
+  "note": "Single-user, batch 1. plow measured with gemma4_sm120_chat (chunked prefill, no cudagraph); vLLM served TTFT/TPOT from perf-data/vllm_sm120_logs_31b (vLLM 0.25.1, cudagraphs on). plow-fp8 = w8a8 fp8 prefill (PX-2 mma.sync.m16n8k32) + weight-only fp8 decode, bf16 KV. vLLM fp8 = weight fp8 + bf16 KV (KVFP8=0), the fair fp8-vs-fp8 row.",
+  "build": {
+    "emitter": "PLOW_UNISEG=1 PLOW_FP8=1 PLOW_W8A8=1 gemma4 <dir> 132096 w8a8.pkt 188 (weights 29.9 GiB fp8)",
+    "harness": "cmake -DPLOW_CUDA=ON -DPLOW_NV_W8A8=ON  gemma4_sm120_chat",
+    "pf_cubin_w8a8": "interp_sm120_pf: REG 242, 0 spill (px2 12B was 240; +2 for 31B hd512 flash union)",
+    "fp8_twin": "quantize_fp8.py -> /workspace/models/gemma-4-31B-it/fp8/model.safetensors, 29.30 GB, 410 projections, per-row e4m3 (amax/448)"
+  },
+  "gates": {
+    "oracle_w8a8_31B_shapes": {
+      "gemm_w8a8_m64_n5376_k5376":   {"relL2": 4.223e-05, "tol": 5e-3, "pass": true},
+      "gemm_w8a8_m200_n5376_k21504": {"relL2": 7.314e-05, "tol": 5e-3, "pass": true},
+      "gemm_w8a8_m1_n300_k5376":     {"relL2": 0.0,       "tol": 5e-3, "pass": true},
+      "gemm_glu_w8a8_m64_n21504_k5376": {"relL2": 3.171e-05, "tol": 8e-3, "pass": true},
+      "quant_fp8_m64_k5376":  {"relL2": 0.0, "tol": 1e-3, "pass": true},
+      "quant_fp8_m200_k21504":{"relL2": 0.0, "tol": 1e-3, "pass": true},
+      "w8a8_vs_full_precision_relL2": "0.033-0.036 (inherent e4m3, matches px2 12B 0.036)",
+      "verdict": "PASS"
+    },
+    "twin_dequant_vs_bf16_relL2": "2.65% (q_proj[0], expected e4m3 band)",
+    "parity_coherent_prompt_ctx1024": {
+      "bf16_first_token": 506, "w8a8_first_token": 506,
+      "greedy_stream": "bit-identical bf16==w8a8 over 32 steps",
+      "device_host_argmax": "AGREE (both)",
+      "verdict": "PASS"
+    },
+    "parity_random_prompt_note": "uniform-random ids give an all-near-tie degenerate logit distribution (top-5 within 1.1 logits); bf16=240017 vs w8a8=537 there is the documented 'fp8 disagrees only at bf16 near-ties' budget, not a defect.",
+    "w8a8_path_trace_block0": {"op32_QUANT_FP8": 240, "op33_GEMM_FP8": 180, "op36_GEMM_GLU_FP8": 60,
+      "note": "QUANT_FP8 exists only under PLOW_NV_W8A8 -> its execution proves the true w8a8 mainloop, not the w8a16 dequant path."}
+  },
+  "prefill_ttft_ms": {
+    "1024":  {"plow_fp8_w8a8": 278.37, "plow_bf16_prior": 473.4,  "vllm_bf16": 222.36,  "vllm_fp8": 159.50},
+    "4096":  {"plow_fp8_w8a8": 896.50, "plow_bf16_prior": 1543.3, "vllm_bf16": 705.67,  "vllm_fp8": 510.16},
+    "16384": {"plow_fp8_w8a8": 3851.39,"plow_bf16_prior": 6169.8, "vllm_bf16": 3450.74, "vllm_fp8": 2709.35},
+    "32768": {"plow_fp8_w8a8": 9030.74,"plow_bf16_prior": 14126.9,"vllm_bf16": 10730.22,"vllm_fp8": 5490.77}
+  },
+  "prefill_ratios": {
+    "fp8_vs_plow_bf16": {"1024": 0.588, "4096": 0.581, "16384": 0.624, "32768": 0.639},
+    "fp8_vs_vllm_bf16": {"1024": 1.252, "4096": 1.270, "16384": 1.116, "32768": 0.842},
+    "fp8_vs_vllm_fp8":  {"1024": 1.745, "4096": 1.757, "16384": 1.421, "32768": 1.645}
+  },
+  "decode_tpot_ms": {
+    "1024":  {"plow_fp8_w8a8": 26.354, "vllm_bf16": 44.670, "vllm_fp8": 25.620, "sd_pct": 0.07},
+    "4096":  {"plow_fp8_w8a8": 26.474, "vllm_bf16": 45.200, "vllm_fp8": 26.160, "sd_pct": 0.07},
+    "16384": {"plow_fp8_w8a8": 27.421, "vllm_bf16": 46.930, "vllm_fp8": 27.800, "sd_pct": 0.11},
+    "32768": {"plow_fp8_w8a8": 28.966, "vllm_bf16": 49.140, "vllm_fp8": 29.860, "sd_pct": 0.07}
+  },
+  "decode_pct_vs": {
+    "vs_vllm_bf16": {"1024": -41.0, "4096": -41.4, "16384": -41.6, "32768": -41.1},
+    "vs_vllm_fp8":  {"1024":  2.9,  "4096":  1.2,  "16384": -1.4,  "32768": -3.0}
+  },
+  "verdict": {
+    "prefill_vs_vllm_bf16": "BEATS at 32k (0.84x); closes 2.1x bf16 gap to 1.12-1.27x at 1k-16k. Not a clean win <32k.",
+    "prefill_vs_vllm_fp8": "1.42-1.76x behind (honest negative): vLLM fp8 prefill is faster.",
+    "decode_vs_vllm_bf16": "beats by ~41% at every ctx.",
+    "decode_vs_vllm_fp8": "matches/beats: +2.9%/+1.2% at 1k/4k, -1.4%/-3.0% (faster) at 16k/32k -> the +3-6% fp8 decode gap CLOSED.",
+    "headline": "w8a8 fp8 prefill lands on 31B (-36..-42% vs plow bf16), beats vLLM bf16 TTFT at 32k and closes to ~1.1-1.3x below; decode now matches-or-beats vLLM fp8. plow-fp8 does NOT beat vLLM fp8 prefill."
+  },
+  "limits": "VRAM: a foreign process held 33 GiB throughout. bf16 31B (57 GiB wts + 22.6 GiB KV @ max_ctx=132096) needs ~82 GiB -> did not fit; bf16 parity used a T=2048 packet (small KV). fp8 (55 GiB @ full KV) fit with ~8 GiB headroom. GPU shared under a per-run flock."
+}

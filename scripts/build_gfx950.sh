@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Build the gfx950 (MI350X / CDNA4) persistent-interpreter code objects + the chat harness.
+#
+# Produces, into the output dir (default /tmp/rtb, or $1, or $PLOW_BUILD_DIR):
+#   interp_prefill.elf  plow_interp_gfx950        8 waves — GEMM + flash-prefill (class-8 segments)
+#   interp_decode.elf   plow_interp_dec_gfx950    8 waves — GEMV + flash-decode
+#   interp_flash.elf    plow_interp_flash_gfx950  4 waves / FA_DC=256 — the class-4 flash_prefill
+#                                                 SEGMENT only (segmented dispatch; plans/segmented-dispatch.md)
+#   test_kernels.elf    golden __device__ wrappers (share the SAME op_*.h the interpreter runs)
+#   chat                the closed-loop host harness (gemma4_chat.c)
+#
+# EVERY GUARD BELOW EXISTS BECAUSE A STALE ARTIFACT LIED — a test printed "CORRECT" against a binary
+# that had not compiled, or a fresh interpreter ran an old .pkt and the model spoke confident nonsense.
+#   - `set -euo pipefail`      : a failed hipcc STOPS the script, it does not leave the old .elf.
+#   - `rm -f` before compiling : a build that dies leaves NO artifact to run by mistake.
+#   - test_kernels is BUILT    : skipping it once made `t_attn` test a stale kernel (three false passes).
+#   - the register-cliff check : over budget => HSA_STATUS_ERROR_INVALID_ISA at runtime, caught here.
+#   - the freshness table      : printed every time, so a stale timestamp is visible at a glance.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+R="$REPO/runtime"
+OUT="${1:-${PLOW_BUILD_DIR:-/tmp/rtb}}"
+ARCH="${PLOW_HIP_ARCH:-gfx950}"
+BUN="${PLOW_BUNDLER:-/opt/rocm-7.0.2/lib/llvm/bin/clang-offload-bundler}"
+INC="-I$R/amd -I$R/common"
+mkdir -p "$OUT"; cd "$OUT"
+
+# Delete FIRST. A build that fails must leave nothing behind to run.
+rm -f i_prefill.co i_decode.co i_flash.co tk.co \
+      interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf \
+      i_prefill_gq.co i_decode_gq.co i_flash_gq.co \
+      interp_prefill_gq.elf interp_decode_gq.elf interp_flash_gq.elf \
+      i_decode_fp8.co i_decode_fp8_gq.co interp_decode_fp8.elf interp_decode_fp8_gq.elf \
+      i_decode_fp8kv.co i_decode_fp8kv_gq.co interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf
+
+genco() { # <extra-defs> <out.co>
+  hipcc --offload-arch="$ARCH" -O3 -w $1 --genco "$R/amd/interp.hip" -o "$2" $INC
+}
+unbundle() { # <in.co> <out.elf>
+  "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" --input="$1" --output="$2"
+}
+
+for B in 0 1; do
+  N=$([ "$B" -eq 0 ] && echo prefill || echo decode)
+  genco "-DPLOW_BUCKET_DECODE=$B" "i_$N.co"
+  unbundle "i_$N.co" "interp_$N.elf"
+done
+
+# SEGMENTED-DISPATCH flash object: prefill op set at 4 waves / FA_DC=256, compiling ONLY the class-4
+# flash_prefill segment (PLOW_BUCKET_FLASH). 1 wave/SIMD => 512-reg budget; the Q-hoist spills Q to
+# on-chip scratch by design (cheaper than the L2 re-read it replaces).
+genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1" i_flash.co
+unbundle i_flash.co interp_flash.elf
+
+# GLOBAL-QUEUE variant (Experiment E1). Same op set / tiles / wave count as the static prefill+decode
+# objects — ONLY the scheduling loop differs (one shared atomic cursor vs static per-CU streams), so an
+# A/B isolates scheduling. GLOBAL QUEUE IS THE DEFAULT scheduler (E1: decode win on both models, prefill
+# neutral on 31B) — build the _gq objects unless PLOW_NO_GQ=1 asks for a static-only build. PLOW_GQ_BATCH
+# stays 1 (raising it starves parallelism, measured 6-8x slower).
+BUILD_GQ=1; [ -n "${PLOW_NO_GQ:-}" ] && BUILD_GQ=0
+GQB="${PLOW_GQ_BATCH:-1}"
+# FP8 DECODE object (PLOW_FP8=1). A SEPARATE decode interpreter carrying the fp8 w8a16 GEMV arms
+# (GEMV_FP8 / GEMV_GLU_FP8) in place of the bf16 GEMV_GLU/QKV arms, so the register footprint stays
+# under the same 256/occ-2 cliff. Mirrors Gemma's OWN decode flags (FA_DEC_VPIPE default 0, no
+# PLOW_FLASH_HD128 — Gemma runs segmented flash), only adding PLOW_FP8=1. Built only when asked.
+BUILD_FP8=0; [ "${PLOW_FP8:-0}" = 1 ] && BUILD_FP8=1
+# FP8 KV-CACHE decode object (PLOW_FP8_KV=1). e4m3 K/V storage+read halves the decode KV stream.
+# The DECODE object swaps FLASH_DECODE for the fp8 flash + adds HeadNormRopeFp8, and keeps the fp8
+# GEMV weight arms (an fp8-KV pkt is also fp8-weight). No FA_DEC_VPIPE (a bf16-only V-prefetch).
+# Only the DECODE object is built here — the synthetic-KV decode sweep never runs prefill. Gemma's
+# real-prefill fp8kv path (a separate 4-wave flash object) is out of scope for the timing sweep.
+BUILD_FP8KV=0; [ "${PLOW_FP8_KV:-0}" = 1 ] && BUILD_FP8KV=1
+if [ "$BUILD_GQ" = 1 ]; then
+  for B in 0 1; do
+    N=$([ "$B" -eq 0 ] && echo prefill || echo decode)
+    genco "-DPLOW_BUCKET_DECODE=$B -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" "i_${N}_gq.co"
+    unbundle "i_${N}_gq.co" "interp_${N}_gq.elf"
+  done
+  # GQ flash object (Gemma's segmented 4-wave flash segment under the global queue).
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_flash_gq.co
+  unbundle i_flash_gq.co interp_flash_gq.elf
+fi
+
+# FP8 decode objects (static + GQ), each swapping the bf16 GEMV_GLU/QKV arms for the fp8 ones. Same
+# flags as Gemma's bf16 decode above, only adding PLOW_FP8=1. The bf16 objects are unaffected.
+if [ "$BUILD_FP8" = 1 ]; then
+  genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1" i_decode_fp8.co
+  unbundle i_decode_fp8.co interp_decode_fp8.elf
+  if [ "$BUILD_GQ" = 1 ]; then
+    genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_fp8_gq.co
+    unbundle i_decode_fp8_gq.co interp_decode_fp8_gq.elf
+  fi
+fi
+
+# FP8 KV-CACHE decode objects (static + GQ). Swap FLASH_DECODE for the fp8 flash + add HeadNormRopeFp8,
+# keeping the fp8 GEMV weight arms. bf16/fp8-weight objects above are unaffected.
+if [ "$BUILD_FP8KV" = 1 ]; then
+  genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_FP8_KV=1" i_decode_fp8kv.co
+  unbundle i_decode_fp8kv.co interp_decode_fp8kv.elf
+  if [ "$BUILD_GQ" = 1 ]; then
+    genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_FP8_KV=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_fp8kv_gq.co
+    unbundle i_decode_fp8kv_gq.co interp_decode_fp8kv_gq.elf
+  fi
+fi
+
+# Golden wrappers call the SAME __device__ functions the interpreter does, so rebuild them with it.
+hipcc --offload-arch="$ARCH" -O3 -w --genco "$R/amd/test_kernels.hip" -o tk.co $INC
+unbundle tk.co test_kernels.elf
+
+# HOST harness with the SYSTEM gcc in a CLEAN env. The nix shell's gcc bakes a RUNPATH to nix glibc
+# 2.42 via LD_RUN_PATH while the ELF interpreter stays the system 2.35 — the mismatch aborts with
+# "*** stack smashing detected ***", which reads as a buffer overflow and is not one.
+/usr/bin/env -i PATH=/usr/bin:/bin HOME="$HOME" /usr/bin/gcc -O2 -std=gnu11 -o chat \
+    "$R/tests/gemma4_chat.c" "$R/amd/hsa_backend.c" \
+    -I/opt/rocm/include -L/opt/rocm/lib -lhsa-runtime64 -lm
+readelf -d chat | grep -qi runpath && { echo "FAIL: RUNPATH leaked into the host binary"; exit 1; }
+
+# REGISTER CLIFF as a build error. The 8-wave interpreters must stay <= 256 (2 waves/SIMD); the
+# 4-wave flash object <= 512 (1 wave/SIMD), and ITS VGPR spill is INTENTIONAL (Q-hoist to scratch).
+check() { # <name> <defs> <max-total> <min-occ>
+  local U V A O S
+  U=$(hipcc --offload-arch="$ARCH" -O3 -w $2 --genco \
+        -Rpass-analysis=kernel-resource-usage "$R/amd/interp.hip" -o /dev/null $INC 2>&1)
+  V=$(echo "$U" | grep -oP 'VGPRs: \K\d+' | head -1)
+  A=$(echo "$U" | grep -oP 'AGPRs: \K\d+' | head -1)
+  O=$(echo "$U" | grep -oP 'Occupancy \[waves/SIMD\]: \K\d+' | head -1)
+  S=$(echo "$U" | grep -oP 'VGPRs Spill: \K\d+' | head -1)
+  printf "   %-8s VGPR=%-3s AGPR=%-3s total=%-3s occ=%s spill=%s\n" "$1" "$V" "$A" "$((V + A))" "$O" "$S"
+  if [ "$((V + A))" -gt "$3" ] || [ "$O" -lt "$4" ]; then
+    echo "BUILD FAILED: $1 over the register cliff (total $((V + A)) > $3, or occ $O < $4)." >&2
+    rm -f "interp_$1.elf"; exit 1
+  fi
+}
+check prefill "-DPLOW_BUCKET_DECODE=0" 256 2
+check decode  "-DPLOW_BUCKET_DECODE=1" 256 2
+check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1" 512 1
+# The GQ loop adds a shared cursor + claim broadcast; it must NOT push prefill past 256/occ-2. If it
+# does and no minimal-live-set fix recovers it, that is itself a recordable E1 finding (GQ incompatible
+# with occ-2 prefill). These run only when the GQ objects were built.
+GQ_ELFS=""
+if [ "$BUILD_GQ" = 1 ]; then
+  check prefill_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+  check decode_gq  "-DPLOW_BUCKET_DECODE=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+  check flash_gq   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 512 1
+  GQ_ELFS="interp_prefill_gq.elf interp_decode_gq.elf interp_flash_gq.elf"
+fi
+# The fp8 arms swap (not add) against the bf16 GEMV_GLU/QKV arms, so they must stay under the same
+# 256/occ-2 cliff. Checked only when the fp8 objects were built.
+FP8_ELFS=""
+if [ "$BUILD_FP8" = 1 ]; then
+  check decode_fp8 "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1" 256 2
+  FP8_ELFS="interp_decode_fp8.elf"
+  if [ "$BUILD_GQ" = 1 ]; then
+    check decode_fp8_gq "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    FP8_ELFS="interp_decode_fp8.elf interp_decode_fp8_gq.elf"
+  fi
+fi
+FP8KV_ELFS=""
+if [ "$BUILD_FP8KV" = 1 ]; then
+  check decode_fp8kv "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_FP8_KV=1" 256 2
+  FP8KV_ELFS="interp_decode_fp8kv.elf"
+  if [ "$BUILD_GQ" = 1 ]; then
+    check decode_fp8kv_gq "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_FP8_KV=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    FP8KV_ELFS="interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf"
+  fi
+fi
+
+# Freshness is the whole point of this script: print it, every time.
+ls -l --time-style=+%H:%M:%S \
+  interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf chat $GQ_ELFS $FP8_ELFS $FP8KV_ELFS \
+  | awk '{print "   ", $NF, $5"B", $6}'

@@ -1,0 +1,213 @@
+{
+  "engine": "vllm",
+  "run_mode": "docker-served (openai endpoint + `vllm bench serve`)",
+  "vllm_version": "0.25.1+rocm723",
+  "image": "vllm/vllm-openai-rocm:latest",
+  "date": "2026-07-17",
+  "gpu": "AMD gfx950 (MI350X-class), single GPU, HIP_VISIBLE_DEVICES pinned",
+  "model": "/models/gemma-4-31B-it",
+  "model_desc": "Gemma-4-31B-it (Gemma4ForConditionalGeneration)",
+  "dtype_compute": "bfloat16",
+  "tp": 1,
+  "batch": 1,
+  "concurrency": 1,
+  "num_prompts_per_point": 3,
+  "output_len": 128,
+  "max_model_len_served": 132096,
+  "max_num_batched_tokens": 8192,
+  "sanity": "coherent chat completion ('capital of France?' -> Paris) verified per config before timing",
+  "notes": [
+    "fp8 WORKS and is coherent on gfx950 with vLLM 0.25.1+rocm723 (contradicts the prior 0.11.2-image finding that fp8 crashed).",
+    "DECODE metric = tpot_ms (== itl_ms here). Lower is better.",
+    "ctx=1024 ttft_ms is warm-up-contaminated (first bench shape triggers HIP-graph capture); 4k+ TTFT is clean. Decode TPOT is unaffected."
+  ],
+  "schema": "each config.results row = {input_len, ttft_ms, prefill_tok_s, tpot_ms, itl_ms, decode_tok_s}",
+  "configs": [
+    {
+      "config": "bf16",
+      "config_desc": "bf16 (baseline, --dtype bfloat16)",
+      "results": [
+        {
+          "input_len": 1024,
+          "ttft_ms": 273.26,
+          "prefill_tok_s": 3747.3,
+          "tpot_ms": 13.72,
+          "itl_ms": 13.72,
+          "decode_tok_s": 72.89
+        },
+        {
+          "input_len": 4096,
+          "ttft_ms": 331.73,
+          "prefill_tok_s": 12347.4,
+          "tpot_ms": 14.59,
+          "itl_ms": 14.59,
+          "decode_tok_s": 68.54
+        },
+        {
+          "input_len": 8192,
+          "ttft_ms": 558.4,
+          "prefill_tok_s": 14670.5,
+          "tpot_ms": 15.85,
+          "itl_ms": 15.85,
+          "decode_tok_s": 63.09
+        },
+        {
+          "input_len": 16384,
+          "ttft_ms": 1337.53,
+          "prefill_tok_s": 12249.4,
+          "tpot_ms": 16.67,
+          "itl_ms": 16.67,
+          "decode_tok_s": 59.99
+        },
+        {
+          "input_len": 32768,
+          "ttft_ms": 3747.66,
+          "prefill_tok_s": 8743.6,
+          "tpot_ms": 19.45,
+          "itl_ms": 19.45,
+          "decode_tok_s": 51.41
+        },
+        {
+          "input_len": 65536,
+          "ttft_ms": 11826.23,
+          "prefill_tok_s": 5541.6,
+          "tpot_ms": 21.55,
+          "itl_ms": 21.67,
+          "decode_tok_s": 46.4
+        },
+        {
+          "input_len": 131072,
+          "ttft_ms": 41216.78,
+          "prefill_tok_s": 3180.1,
+          "tpot_ms": 25.71,
+          "itl_ms": 25.98,
+          "decode_tok_s": 38.9
+        }
+      ]
+    },
+    {
+      "config": "fp8",
+      "config_desc": "fp8 weight-only (--quantization fp8, dynamic e4m3 from bf16 ckpt)",
+      "results": [
+        {
+          "input_len": 1024,
+          "ttft_ms": 251.95,
+          "prefill_tok_s": 4064.3,
+          "tpot_ms": 11.12,
+          "itl_ms": 11.12,
+          "decode_tok_s": 89.93
+        },
+        {
+          "input_len": 4096,
+          "ttft_ms": 255.32,
+          "prefill_tok_s": 16042.6,
+          "tpot_ms": 12.16,
+          "itl_ms": 12.16,
+          "decode_tok_s": 82.24
+        },
+        {
+          "input_len": 8192,
+          "ttft_ms": 447.63,
+          "prefill_tok_s": 18300.8,
+          "tpot_ms": 13.35,
+          "itl_ms": 13.35,
+          "decode_tok_s": 74.91
+        },
+        {
+          "input_len": 16384,
+          "ttft_ms": 1142.14,
+          "prefill_tok_s": 14345.0,
+          "tpot_ms": 14.22,
+          "itl_ms": 14.22,
+          "decode_tok_s": 70.32
+        },
+        {
+          "input_len": 32768,
+          "ttft_ms": 3351.77,
+          "prefill_tok_s": 9776.3,
+          "tpot_ms": 16.93,
+          "itl_ms": 16.93,
+          "decode_tok_s": 59.07
+        },
+        {
+          "input_len": 65536,
+          "ttft_ms": 11015.58,
+          "prefill_tok_s": 5949.4,
+          "tpot_ms": 19.02,
+          "itl_ms": 19.12,
+          "decode_tok_s": 52.58
+        },
+        {
+          "input_len": 131072,
+          "ttft_ms": 39674.47,
+          "prefill_tok_s": 3303.7,
+          "tpot_ms": 23.14,
+          "itl_ms": 23.51,
+          "decode_tok_s": 43.22
+        }
+      ]
+    },
+    {
+      "config": "fp8kv",
+      "config_desc": "fp8 weights + fp8 KV (--quantization fp8 --kv-cache-dtype fp8)",
+      "results": [
+        {
+          "input_len": 1024,
+          "ttft_ms": 247.5,
+          "prefill_tok_s": 4137.4,
+          "tpot_ms": 11.03,
+          "itl_ms": 11.03,
+          "decode_tok_s": 90.66
+        },
+        {
+          "input_len": 4096,
+          "ttft_ms": 244.36,
+          "prefill_tok_s": 16762.2,
+          "tpot_ms": 11.98,
+          "itl_ms": 11.98,
+          "decode_tok_s": 83.47
+        },
+        {
+          "input_len": 8192,
+          "ttft_ms": 443.71,
+          "prefill_tok_s": 18462.5,
+          "tpot_ms": 13.12,
+          "itl_ms": 13.12,
+          "decode_tok_s": 76.22
+        },
+        {
+          "input_len": 16384,
+          "ttft_ms": 1189.99,
+          "prefill_tok_s": 13768.2,
+          "tpot_ms": 13.92,
+          "itl_ms": 13.92,
+          "decode_tok_s": 71.84
+        },
+        {
+          "input_len": 32768,
+          "ttft_ms": 3673.44,
+          "prefill_tok_s": 8920.2,
+          "tpot_ms": 16.51,
+          "itl_ms": 16.51,
+          "decode_tok_s": 60.57
+        },
+        {
+          "input_len": 65536,
+          "ttft_ms": 12520.6,
+          "prefill_tok_s": 5234.3,
+          "tpot_ms": 18.39,
+          "itl_ms": 18.49,
+          "decode_tok_s": 54.38
+        },
+        {
+          "input_len": 131072,
+          "ttft_ms": 45723.41,
+          "prefill_tok_s": 2866.6,
+          "tpot_ms": 22.18,
+          "itl_ms": 22.54,
+          "decode_tok_s": 45.09
+        }
+      ]
+    }
+  ]
+}

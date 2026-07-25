@@ -1,0 +1,40 @@
+{
+ "engine": "plow",
+ "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, single GPU (sm_120 / cc 12.0, 188 SMs)",
+ "cuda_toolkit_on_host": "13.0 (V13.0.88)",
+ "model": "/workspace/models/gemma-4-26B-A4B-it",
+ "dtype_compute": "bfloat16",
+ "tp": 1,
+ "batch": 1,
+ "metric_convention": "SERVED TTFT: admission -> first CONTENT SSE frame over the OpenAI /v1/chat/completions endpoint (tokenize + decomposed prefill-bucket chain + first decode token + mux/SSE hop). SERVED TPOT: mean SSE frame gap, first 16 steps discarded, finish frame excluded. Single user, greedy, batch 1 (the 26B MoE decode blob is B=1: flat expert kernels index one token row). Directly comparable to perf-data/gemma4-26b-a4b-vllm-sm120.json (bf16).",
+ "vllm_baseline_ref": "perf-data/gemma4-26b-a4b-vllm-sm120.json (bf16)",
+ "run_mode": "plowrt serve --assets /root/gpu-assets-26b/b1 --slo-ms 100000000 (features cuda,hf-tokenizer, commit a058492); pkt PLOW_UNISEG=1 PLOW_NS_FULL_ABS=48 gemma4 <26B> 132096 out.pkt 188 (committed P9 recipe; md5-identical re-emitted at HEAD); cubins rebuilt at HEAD with the P9 GF4 recipe (script flags + -DPLOW_NV_FA_GF_FULL=4): decode 219 regs, prefill _pf 240 regs, smem embedded (PLOW_NV_EMBED_SMEM). Engine load: 47.0 GiB weights + 5.6 GiB KV, 21.0 s warm. The serve engine resolves the fused 3-D expert tables by name (moe.ewt.{l}/moe.est.{l}, exec/gpu.rs port of orch::moe::build_fused_expert_table) \u2014 no sidecar needed.",
+ "campaigns": [
+  {
+   "campaign": "S6-26b",
+   "date": "2026-07-20",
+   "commit": "a058492",
+   "notes": "First measured served 26B rows (P9 bring-up smoke had word-approx ctx only). Gates: 'capital of France' -> 'The capital of France is **Paris**.', finish stop; served greedy == standalone build-gf4 harness PLOW_PREFILL=1 on the same pkt+ids 48/48 (two-phase capture-replay parity, see 31B). TPOT@4k 8.48 ms vs vLLM 7.90 = +7.4%; TPOT@32k 9.22 vs vLLM 9.57 = plow WINS -3.6% (matches the P9/T9 raw ladder: 26B wins 16k-128k). Raw prefill same-lease (cover-policy): 4137=451 ms, 32837=2626 ms -> served 32k TTFT +3.6% over raw (includes 32.8k-token tokenize). Server run with --slo-ms 1e8 (admission-shed workaround, see 12B S6-refresh notes).",
+   "results": [
+    {
+     "ctx": 4137,
+     "ttft_ms": 300,
+     "tpot_ms": 8.483,
+     "vllm_bf16_ttft_ms": 169.4,
+     "vllm_bf16_tpot_ms": 7.9,
+     "plow_vs_vllm_ttft": "1.8x slower",
+     "plow_vs_vllm_tpot": "+7.4%"
+    },
+    {
+     "ctx": 32837,
+     "ttft_ms": 2720,
+     "tpot_ms": 9.224,
+     "vllm_bf16_ttft_ms": 1543.51,
+     "vllm_bf16_tpot_ms": 9.57,
+     "plow_vs_vllm_ttft": "1.8x slower",
+     "plow_vs_vllm_tpot": "-3.6% (plow wins)"
+    }
+   ]
+  }
+ ]
+}

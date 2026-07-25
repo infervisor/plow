@@ -1,0 +1,11 @@
+{
+  "name": "attn-mha-llama2-7b",
+  "note": "QKV attention only, MHA (Llama-2-7B): hidden 4096, 32 query heads = 32 KV heads, head_dim 128. Fused QKV projection = (32+32+32)*128 = 12288; o_proj from 32*128 = 4096.",
+  "hidden": 4096,
+  "ops": [
+    { "op": "norm" },
+    { "op": "gemm", "n": 12288, "k": 4096 },
+    { "op": "flash", "heads": 32, "head_dim": 128 },
+    { "op": "gemm", "n": 4096, "k": 4096 }
+  ]
+}

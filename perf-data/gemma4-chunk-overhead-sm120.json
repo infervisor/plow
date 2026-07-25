@@ -1,0 +1,53 @@
+{
+  "campaign": "beat-chunk-overhead",
+  "date": "2026-07-23",
+  "gpu": "RTX PRO 6000 Blackwell (sm_120, 188 SMs, CUDA 13.0)",
+  "model": "gemma-4-26B-A4B-it fp8 (w8a8) mixed fp8-KV (PLOW_FP8_KV_FULL=1), ctx 132096",
+  "headline": "per-chunk host+launch+sync+gap overhead at 128k = 2.8 ms of 6271 ms (0.04%); the 44.5 ms fixed term no longer exists (current ladder TTFT ~= 2 + 49.0*C ms); remaining vLLM gap is linear kernel-compute slope",
+  "decomposition_128k_sync": {
+    "chunks": 16,
+    "wall_ms": 6271.36,
+    "kern_ms_total": 6268.58,
+    "kern_ms_per_chunk_min_max": [390.48, 392.41],
+    "host_patch_us_total": 231.1,
+    "inst_h2d_us_total": 649.6,
+    "ids_pos_kvlen_h2d_us_total": 837.2,
+    "memset_us_total": 535.7,
+    "launch_enqueue_us_total": 427.7,
+    "device_gap_ms_total": 2.559,
+    "readback_us": 49.3,
+    "nonkernel_wall_ms": 2.78
+  },
+  "single_chunk_kernels_ms": { "T2048": 116.81, "T4096": 197.92, "T8192": 390.20 },
+  "per_chunk_kernel_fixed_cost_ms": 5.6,
+  "fixed_term_fit": {
+    "old_prefit_pre_fp8mma_ms": 44.5,
+    "current_slope_ms_per_ktok": 49.0,
+    "current_constant_ms": 2.0
+  },
+  "ttft_ladder_ms": {
+    "ctx": [4096, 16384, 32768, 65536, 131072],
+    "sync_default": [198.0, 782.0, 1567.1, 3135.4, 6271.4],
+    "chunk_async": [198.1, 781.9, 1566.5, 3133.8, 6269.9],
+    "published_fp8mma": [196.9, 782.5, 1566.1, 3135.3, 6271.1],
+    "vllm_fp8kv": [134, 526, 939, 2646, 5133]
+  },
+  "chunk_async_arm": {
+    "flag": "PLOW_CHUNK_ASYNC=1",
+    "device_gap_ms_128k": 0.274,
+    "delta_ms_128k": -1.5,
+    "token_identity": "PASS (24/24 identical at 128k; first tokens + streams identical 4k..64k)"
+  },
+  "gpu_exec_stage1_audit": {
+    "reduces_prefill_chunk_overhead": false,
+    "multistep_reusable_as_template": true,
+    "notes": "stage-1 async submission is decode-tick only; run_one_prefill_chunk still sync-per-chunk; published TTFT ladders come from the harness which stage1 never touched"
+  },
+  "no_go": [
+    {"lever": "plowrt async chunk port", "ceiling_ms_128k": 2.8},
+    {"lever": "T=16384 bucket", "ceiling_ms_128k": 90, "cost": "MAX_CHUNK+KV_RING mirrored constants, ring+activation arena double, oracle re-run"},
+    {"lever": "patch-site reduction", "ceiling_ms_128k": 0.23},
+    {"lever": "lm_head skip on non-final chunks", "ceiling_ms_128k": 13.5, "cost": "kernel-side skip flag + oracle"}
+  ],
+  "prompts": "random token ids, seeds 42 (ladder), 43 (8k), 44 (2k)"
+}

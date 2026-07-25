@@ -1,0 +1,15 @@
+{
+  "name": "transformer-block-gemma4-31b",
+  "note": "Full decoder block (Gemma 4 31B IT dense multimodal, text side): hidden 4096, 16 query heads, 4 KV heads shared (attention_k_eq_v true), head_dim 256, GeGLU MLP intermediate 16384. Fused QKV = 16*256 (Q) + 4*256 (shared K/V) = 4096 + 1024 = 5120. o_proj: 16*256 -> 4096. GeGLU: fused up 2*16384 = 32768, act, down 16384 -> 4096.",
+  "hidden": 4096,
+  "ops": [
+    { "op": "norm" },
+    { "op": "gemm", "n": 5120, "k": 4096 },
+    { "op": "flash", "heads": 16, "head_dim": 256 },
+    { "op": "gemm", "n": 4096, "k": 4096 },
+    { "op": "norm" },
+    { "op": "gemm", "n": 32768, "k": 4096 },
+    { "op": "act" },
+    { "op": "gemm", "n": 4096, "k": 16384 }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "campaign": "WS-batched-gemv",
+  "date": "2026-07-21",
+  "branch": "worktree-agent-ab0b7e6b9c3528051",
+  "kernel_commit": "eafea6c",
+  "model": "gemma-4-12B",
+  "precision": "bf16",
+  "gpu": "RTX PRO 6000 Blackwell (sm_120, 188 SMs)",
+  "notes": "Weight-stationary wide GEMV rungs: gemv_*_rows<16>/<32> with per-MM shallow unroll so a B=16/32 decode step reads the 22 GiB of weights ONCE instead of ceil(B/8) times. Microbench = gemma4_sm120_chat steady-state decode, ctx~4k (3840 prompt + 128 gen, 16 warmup discarded). agg_tok_s = B/launch_ms; tpot_ms = per-slot ms/token.",
+  "ptxas_decode_megakernel": {
+    "symbol": "_Z12interp_sm12011PlowProgram",
+    "occupancy": "occ-1 (cooperative, grid==n_cu, 1 block/SM)",
+    "GV_MM_MAX_8":  {"registers": 212, "spill_store_B": 0,  "spill_load_B": 0},
+    "GV_MM_MAX_16": {"registers": 234, "spill_store_B": 0,  "spill_load_B": 0},
+    "GV_MM_MAX_32": {"registers": 255, "spill_store_B": 20, "spill_load_B": 40}
+  },
+  "microbench_decode": [
+    {"batch": 1,  "gv_mm_max": 8,  "weight_passes": 1, "agg_tok_s": 53.7,  "tpot_ms": 18.63},
+    {"batch": 2,  "gv_mm_max": 8,  "weight_passes": 1, "agg_tok_s": 102.0, "tpot_ms": 19.61},
+    {"batch": 4,  "gv_mm_max": 8,  "weight_passes": 1, "agg_tok_s": 185.5, "tpot_ms": 21.57},
+    {"batch": 8,  "gv_mm_max": 8,  "weight_passes": 1, "agg_tok_s": 325.5, "tpot_ms": 24.57},
+    {"batch": 16, "gv_mm_max": 16, "weight_passes": 1, "agg_tok_s": 475.1, "tpot_ms": 33.68},
+    {"batch": 32, "gv_mm_max": 32, "weight_passes": 1, "agg_tok_s": 506.6, "tpot_ms": 63.16},
+    {"batch": 16, "gv_mm_max": 8,  "weight_passes": 2, "agg_tok_s": 353.5, "tpot_ms": 45.27},
+    {"batch": 32, "gv_mm_max": 16, "weight_passes": 2, "agg_tok_s": 469.5, "tpot_ms": 68.15},
+    {"batch": 32, "gv_mm_max": 8,  "weight_passes": 4, "agg_tok_s": 386.0, "tpot_ms": 82.89},
+    {"batch": 1,  "gv_mm_max": 16, "weight_passes": 1, "agg_tok_s": 53.7,  "tpot_ms": 18.61},
+    {"batch": 1,  "gv_mm_max": 32, "weight_passes": 1, "agg_tok_s": 53.3,  "tpot_ms": 18.75}
+  ],
+  "serving_b16_mm16": {
+    "harness": "inference-benchmarker bad4f947, 4k/128, ConstantVUs 120s, default --slo-ms 250",
+    "blob": "B=16 ctx-8k + MM16 decode cubin",
+    "points": [
+      {"vu": 1, "agg_tok_s": 29.3, "ttft_p99_ms": 809,  "itl_p99_ms": 28.3, "failed": 0, "tok_per_req": 129, "slo_pass": true},
+      {"vu": 2, "agg_tok_s": 45.8, "ttft_p99_ms": 1515, "itl_p99_ms": 43.7, "failed": 0, "tok_per_req": 128, "slo_pass": true},
+      {"vu": 4, "agg_tok_s": 67.8, "ttft_p99_ms": 3222, "itl_p99_ms": 71.3, "failed": 0, "tok_per_req": 127, "slo_pass": false},
+      {"vu": 8, "agg_tok_s": 88.6, "ttft_p99_ms": 7030, "itl_p99_ms": 94.9, "failed": 0, "tok_per_req": 127, "slo_pass": false},
+      {"vu": 16, "note": "arrival-rate admission shed at default slo-ms (12 tok/req) — invalid capacity point"}
+    ],
+    "max_users_both_slos": 2,
+    "saturated_peak_tok_s_slo_relaxed": {"vu16": 101.8, "vu24": 101.7, "note": "clean 127 tok/req; ITL p99 ~139 ms = 4.1x pure-decode TPOT; prefill-bound plateau, barely above B=8's 97"}
+  },
+  "gates": {
+    "oracle_gemv_qkv_glu_M_le_32_vs_f32": "PASS (worst relL2 <= 1.7e-3)",
+    "compute_sanitizer_mm16_mm32_M_le_32": "0 errors",
+    "isolation_b16_b32_2distinct_prompts_48tok": "0 divergent slot-steps (no cross-bleed)",
+    "b1_byte_identical_across_MM_builds": "yes (TPOT 18.63/18.61/18.75 ms for MM8/16/32)",
+    "wide_rung_bit_identity_to_B1": "narrow rungs (B<=8) identical; wide rungs numerically equal (relL2 same) but shallower unroll can flip a near-tie argmax (b16 matched, b32 flipped one at tok 11)"
+  },
+  "verdict": "Batching scales at the decode kernel (475 tok/s at B=16, +34% one-pass vs two). Served throughput up 17-34% over the 2-pass B=16 blob, SLO-capacity 1->2 users. Does NOT beat B=8's 2 users or vLLM's 8 — prefill (TTFT/ITL-under-load) is the remaining binding constraint. Ship GV_MM_MAX=16."
+}

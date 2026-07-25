@@ -1,0 +1,31 @@
+{
+  "engine": "plow",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, single GPU (sm_120 / cc 12.0, 188 SMs)",
+  "cuda_toolkit_on_host": "13.0 (V13.0.88)",
+  "model_shapes": "Gemma-4-12B prefill: hd512 FULL causal (nh16/nkv1, 8 of 48 layers, O(ctx^2)); hd256 SLIDING window=1024 (nh16/nkv8, 40 of 48 layers, O(window)).",
+  "dtype_compute": "bfloat16",
+  "metric": "FLASH_PREFILL op-level ms/op (isolated kernel A/B, NOT end-to-end)",
+  "metric_convention": "Standalone microbenchmark runtime/nvidia/experiments/fa_pv_bench.cu: d_flash_prefill<HD,BQ,BKV> launched at grid=188 / 256 threads (the interpreter's launch geometry), nsplit=1 fused path, seq_q=8192 (max prefill bucket), seq_kv swept, q_pos0=seq_kv-seq_q (last-chunk tail). cudaEvent timing, warmup 2, averaged. Data zeroed (timing is shape-driven not content-driven). The SAME source compiled against the FFMA-serial P.V header vs the T4 register-resident mma.sync P.V header — the delta is the P.V lever alone. BOTH headers carry the sliding tile-skip FIX (below), so the A/B is correct-vs-correct.",
+  "baseline_commit": "18ea793 (T2 GEMM-prefill tiling; FLASH_PREFILL = mma QK^T (T1) + FFMA-serial P.V)",
+  "change": "T4: register-resident mma.sync m16n8k16 P.V with an HD-SPLIT warp partition. A = softmax probs P (staged bf16 into Ps, ldmatrix.x4); B = V (staged natural in Vs[kv][hd], ldmatrix.x2.trans — the exact operand layout QK's K^T load validates, no extra V transpose). O is the register-resident mma f32 accumulator; online-softmax rescale (corr = exp(m_old-m_new)) multiplies the accumulator fragment directly. HD split so each warp owns 16(query) x 128(hd) = 64 f32 acc/lane (WPV_M=BQ/16 query-warp-rows x WPV_N hd-warp-cols = all 8 warps). The QK / softmax / P.V phases own DIFFERENT warp grids, so the online (m,l,corr) state is smem-resident. Retires the FFMA lane-parallel o[RPW][DE] loop.",
+  "ptxas": "prefill _pf megakernel: 236 registers, 0 spill, occ-1 — UNCHANGED vs baseline (236). Decode object 150 / default Qwen object 155 — byte-identical (prefill code compiles out). Dynamic smem grew hd256 77.5->83.2 KiB, hd512 74.8->76.6 KiB (added Ps[BQ][BKV+PAD] bf16 + m/l/corr[BQ] f32); both < 99 KiB optin, occ-1 held.",
+  "correctness_gate": "GATE A (sm120_interp_op_test, worktree): flash-prefill vs f32 CPU ref PASSES across causal / sliding(window straddle) / hd256+512 / fused(ns=1)+split(ns>1)+merge / ragged / CHUNKED(seq_q<seq_kv,q_pos0>0), AND new SOFT-softmax cases (scale~1/sqrt(HD)) added by T4 that actually charge the bf16 P-operand rounding (the scale=1.0 cases are near-one-hot => bf16-P lossless => relL2 0; soft cases show the true P.V error). Full suite PASS; wave64 negctrl still FAILS. GATE B parity (fixed kernel, prefill vs decode-only greedy first token, worktree pkt PLOW_UNISEG=1): short100 8571==8571 AGREE (full 6-token seq identical); 32k prefill finite/sane, clean argmax (236743 @+23.5, 1.5-logit margin, device==host). ctx4k: prefill 155210 vs decode 236743 REORDER — the IDENTICAL top-5 candidate set {155210,236743,874,78602,133634} reshuffled within a ~0.9-logit band => a bf16-P tie-flip on a meaningless random-token prompt (the documented greedy-gate coarseness), NOT the sliding bug (now fixed, prefill's pick moved 133634->155210) and NOT a P.V error: the oracle proves the P.V relL2 is bf16-precision and BIT-IDENTICAL to the FFMA baseline on the correct (causal/soft) path.",
+  "campaigns": [
+    {
+      "campaign": "T4-mma-flash-pv",
+      "date": "2026-07-19",
+      "note": "correct-vs-correct A/B (both FFMA and mma headers carry the sliding tile-skip fix).",
+      "results": [
+        {"arm": "hd512 full causal", "seq_q": 8192, "seq_kv": 8192,   "ffma_ms": 67.794,   "mma_ms": 21.936,   "speedup": "3.09x", "delta_pct": -67.6},
+        {"arm": "hd512 full causal", "seq_q": 8192, "seq_kv": 32768,  "ffma_ms": 459.745,  "mma_ms": 147.223,  "speedup": "3.12x", "delta_pct": -68.0},
+        {"arm": "hd512 full causal", "seq_q": 8192, "seq_kv": 131072, "ffma_ms": 2339.535, "mma_ms": 1019.411, "speedup": "2.29x", "delta_pct": -56.4},
+        {"arm": "hd256 sliding win1024", "seq_q": 8192, "seq_kv": 8192,   "ffma_ms": 9.567,  "mma_ms": 2.512, "speedup": "3.81x", "delta_pct": -73.7},
+        {"arm": "hd256 sliding win1024", "seq_q": 8192, "seq_kv": 131072, "ffma_ms": 10.120, "mma_ms": 2.649, "speedup": "3.82x", "delta_pct": -73.8},
+        {"arm": "hd256 full causal (sanity)", "seq_q": 8192, "seq_kv": 8192,  "ffma_ms": 38.884,  "mma_ms": 9.125,  "speedup": "4.26x", "delta_pct": -76.5},
+        {"arm": "hd256 full causal (sanity)", "seq_q": 8192, "seq_kv": 32768, "ffma_ms": 264.146, "mma_ms": 92.642, "speedup": "2.85x", "delta_pct": -64.9}
+      ],
+      "reading": "The register-resident mma P.V removes the FFMA-serial O(ctx^2) tail: the hd512 full-attention arm (the 128k prefill driver) is 2.3-3.1x faster, and the hd256 sliding arm 3.8x. The win is largest where the FFMA P.V dominated (short/mid ctx, less HBM-bound), and holds 2.3x at the 128k tail where the kernel becomes KV-read bound."
+    }
+  ],
+  "sliding_tile_skip_fix": "SEPARATE pre-existing bug found + fixed in the same file: d_flash_prefill's per-tile sliding skip `if (window && (qabs_max-(kv0+BKV-1)) >= window) continue;` used qabs_max (the NEWEST query in the q-tile), dropping tiles the OLDER queries still attend at the window's trailing edge (~BQ positions). It corrupted EVERY sliding layer (40 of 48 in 12B) — hidden because the flash-prefill oracle REFERENCE was degenerate (masked entries left at -INFINITY poisoned Oref with inf, collapsing report() to a spurious relL2=0/maxabs=inf that PASSED any kernel, even the wave64 negctrl; T1/T2's reported 'relL2 0' was this artifact). Verified pre-existing: the baseline FFMA kernel fails the identical sliding cases with identical relL2 (0.4995/0.6459/0.3745) against the FIXED ref. Fix: drop the per-tile skip (eff_lo=oldest-query floor + the causal break are the correct bounds; per-row masking handles partial tiles) AND fix the oracle ref (masked->0). After both fixes: all flash-prefill oracle cases PASS at bf16-P precision (causal + sliding + soft-softmax, relL2 1.5-2.4e-3); the now-SENSITIVE wave64 negctrl flips every flash case to FAIL. Prefill _pf megakernel 234 regs (was 236), 0 spill, occ-1."
+}

@@ -1,0 +1,18 @@
+[package]
+name = "frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hub layer over nn-graph: resolve a HuggingFace model id and build its graph"
+
+[features]
+# `hub` pulls in hf-hub to resolve a model identifier to its config over the
+# network. Off by default so offline use needs no network stack. `thiserror` is
+# only used by the hub error type, so it rides along with the feature.
+default = []
+hub = ["dep:hf-hub", "dep:thiserror"]
+
+[dependencies]
+nn-graph.workspace = true
+thiserror = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }

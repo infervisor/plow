@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/frontend",
+    "crates/hwspec",
+    "crates/kernelcaps",
+    "crates/tunedb",
+    "crates/costmodel",
+    "crates/devgen",
+    "crates/rewrite",
+    "crates/schedule",
+    "crates/packet",
+    "crates/plowc",
+    "crates/lean_verify",
+    "crates/plow-asset",
+    "crates/plowrt",
+    "tools/bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+# plowrt is the latency-critical artifact (see CLAUDE.md: "every millisecond is
+# important even on host side"), so the release profile is tuned for it: whole-
+# program LTO across a single codegen unit lets the packet-decode → dispatch →
+# counter path inline end to end, and `panic = "abort"` drops the unwind tables
+# and landing pads from that path. Cargo ignores `panic` for test/bench
+# profiles, so `cargo test --release` still works.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[workspace.dependencies]
+nn-graph = { git = "https://github.com/infervisor/nn-graph.git", default-features = false, features = ["models"] }
+thiserror = "2"
+# Pure-Rust TLS: `default-features = false` drops hf-hub's `default-tls`
+# (native-tls → openssl-sys), and the `ureq` feature keeps the blocking
+# `api::sync` client on ureq's default rustls backend. No native library, so
+# every artifact that resolves a model over the network can still link statically.
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+egglog = "2"
+hwspec = { path = "crates/hwspec" }
+costmodel = { path = "crates/costmodel" }
+devgen = { path = "crates/devgen" }
+rewrite = { path = "crates/rewrite" }
+packet = { path = "crates/packet" }
+kernelcaps = { path = "crates/kernelcaps" }
+tunedb = { path = "crates/tunedb" }
+frontend = { path = "crates/frontend" }
+schedule = { path = "crates/schedule" }
+lean_verify = { path = "crates/lean_verify" }
+plow-asset = { path = "crates/plow-asset" }

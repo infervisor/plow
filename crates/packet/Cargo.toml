@@ -1,0 +1,8 @@
+[package]
+name = "packet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Infervisor runtime packet ABI: a compact, variable-length instruction stream (kernel opcode + per-op parameters + counter coordination) the persistent-kernel interpreter executes. No dependencies — shared with the C/CUDA runtime."
+
+[dependencies]

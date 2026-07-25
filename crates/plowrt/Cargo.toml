@@ -1,0 +1,80 @@
+[package]
+name = "plowrt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The plow host runtime: loads compiled assets, coordinates the persistent-kernel
+# executors through counter pools / packet queues / an OOB channel, and fronts it
+# all with an OpenAI-compatible API. See `docs/runtime/` and
+# `plans/design-the-runtime-in-whimsical-leaf.md`.
+
+[[bin]]
+name = "plowrt"
+path = "src/main.rs"
+
+[lib]
+name = "plowrt"
+path = "src/lib.rs"
+
+[dependencies]
+plow-asset = { workspace = true }
+packet = { workspace = true }
+hwspec = { workspace = true }
+costmodel = { workspace = true }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = { workspace = true }
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive"] }
+# Performance-first: lock-free structures + fast maps/vecs for hot paths, and a
+# fast mutex for cold paths only. The per-token / per-packet path allocates and
+# locks nothing — see `docs/runtime/00-overview.md` (performance model).
+crossbeam-utils = "0.8"
+parking_lot = "0.12"
+rustc-hash = "2"
+smallvec = { version = "1", features = ["union"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+axum = "0.7"
+# Direct hyper access is used to serve the same axum router over a Unix domain
+# socket alongside the TCP listener (axum 0.7's `serve` only takes TcpListener).
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service", "server-auto"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+
+# Optional: real tokenizer + checkpoint reader. Off by default so the skeleton
+# builds fast and offline; a byte-fallback tokenizer stands in when absent.
+tokenizers = { version = "0.20", optional = true }
+safetensors = { version = "0.4", optional = true }
+hf-hub = { workspace = true, optional = true }
+# Runtime `dlopen` of the driver libs (see `device::cuda`/`device::hsa`): the
+# static binary carries no link-time GPU dependency, and NVIDIA + AMD libs can be
+# loaded side-by-side in one process (distinct `cu*` / `hsa_*` symbol namespaces).
+libloading = { version = "0.8", optional = true }
+
+[features]
+default = []
+# Real Hugging Face tokenizer (loads a model's `tokenizer.json`). Enable this
+# alone for tokenization without pulling the checkpoint/download deps.
+hf-tokenizer = ["dep:tokenizers"]
+# Real HF tokenizer + safetensors weight loading + hub downloads.
+hub = ["hf-tokenizer", "dep:safetensors", "dep:hf-hub"]
+# CUDA driver-API backend. The driver lib is `dlopen`ed at runtime (no link-time
+# `-lcuda`), so the binary stays static except for libcuda. Pulls safetensors:
+# a GPU serve is meaningless without real checkpoint weights (`exec::gpu`) —
+# and pulls hf-tokenizer for the same reason: a real model served through the
+# byte-fallback tokenizer produces silent garbage (a `--features cuda`-only
+# build did exactly that, 2026-07-19; see serve() 's byte-fallback refusal).
+cuda = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
+# HSA driver-API backend (dlopen of libhsa-runtime64 — direct ROCr, no HIP).
+hsa = ["dep:libloading"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

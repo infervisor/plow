@@ -1,0 +1,40 @@
+{
+  "engine": "plow",
+  "experiment": "PX-5 (rtx-11): cudaGraph capture of the prefill chunk loop (short-ctx TTFT)",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, single GPU (sm_120a / cc 12.0, 188 SMs)",
+  "cuda_toolkit_on_host": "13.0 (V13.0.88)",
+  "date": "2026-07-21",
+  "branch": "px3-px5-cheap-checks",
+  "model": "/workspace/models/gemma-4-12B-it",
+  "dtype_compute": "bfloat16",
+  "tp": 1,
+  "batch": 1,
+  "verdict": "NO-GO — do NOT build. The maximum possible TTFT saving is < 0.03% of short-ctx TTFT, ~70-100x below the ~2% go threshold. Recorded by the go/no-go arithmetic below; graph capture/replay was NOT implemented.",
+  "go_no_go_arithmetic": {
+    "premise_check": "The plan hypothesised 'short ctx / many small chunks'. FALSE for plow's bucket ladder. The prefill chunk loop (gemma4_sm120_chat.cu) picks the SMALLEST bucket >= remaining tokens from [128,512,1024,2048,4096,8192] (MAX_CHUNK=8192). So ANY prompt <= 8192 tokens is a SINGLE prefill chunk = a SINGLE cooperative launch. 'Many small chunks' never occurs at short ctx; multi-launch only begins ABOVE 8192 tokens (LONG ctx), where TTFT is seconds and any per-launch tax is even more negligible. There is NO context regime where a chunk-loop graph is material.",
+    "measured_inputs": {
+      "chunks_at_short_ctx": "1 (512-tok prompt: one 512 bucket; 2048-tok prompt: one 2048 bucket) — confirmed from the harness run ('512 tokens in 415.9 ms', single PREFILL line)",
+      "per_token_host_prologue_us": "44 (measured on THIS box, gemma4_sm120_chat decode host-prologue breakdown: 0.044 ms/step = kv-row patch + 3 scalars + counter zero + launch; matches the plan's cited 53 us)",
+      "per_launch_host_enqueue_us": "3.08 (measured T9c, perf-data/gemma4-12b-t9c-segments-sm120.json: 299 us / 97 cooperative launches)",
+      "prefill_chunk_host_prologue_us_upper_bound": "~80 (the decode 44 us plus the full instruction-stream cudaMemcpy which a single prefill chunk uploads; still same order)",
+      "prefill_ms_ctx512": 415.87,
+      "prefill_ms_ctx2048": 1499.33
+    },
+    "ceiling_computation": {
+      "removable_by_graph": "The counter zeroing (cudaMemset) and kv-row patch (cudaMemcpy) become graph nodes and the cooperative launch becomes a graph node — a graph replay removes the HOST-SIDE issue cost of these per chunk, NOT the device compute. At 1 chunk that is at most ONE prefill host prologue (<= ~80 us).",
+      "max_saving_ctx512_pct": "80 us / 415870 us = 0.019%",
+      "max_saving_ctx2048_pct": "80 us / 1499330 us = 0.005%",
+      "threshold_pct": 2.0,
+      "margin": "the ceiling is ~70-400x below the go threshold at every short-ctx point"
+    }
+  },
+  "measurements": {
+    "harness": "gemma4_sm120_chat (rt-build, /root/gpu-assets), PLOW_PREFILL=1 PLOW_UNISEG=1, gemma4-12b-ctx4096-uniseg.pkt, checkpoint gemma-4-12B-it, prompts truncated from prompt_tpot.ids, n_gen=20 (to also emit the decode host/device breakdown).",
+    "rows": [
+      {"ctx": 512,  "chunks": 1, "prefill_ms": 415.87, "prefill_tok_s": 1231.1, "decode_host_prologue_ms": 0.044, "decode_launch_sync_ms": 18.072, "graph_ceiling_pct": 0.019},
+      {"ctx": 2048, "chunks": 1, "prefill_ms": 1499.33, "prefill_tok_s": 1365.9, "decode_host_prologue_ms": 0.043, "decode_launch_sync_ms": 18.191, "graph_ceiling_pct": 0.005}
+    ],
+    "note": "prefill_ms values are the rt-build first-cut prefill object (older than the T5 perf-data numbers); the ABSOLUTE ms differ from perf-data/gemma4-12b-plow-prefill-sm120.md but that is irrelevant to the ratio — TTFT is hundreds-to-thousands of ms and the removable host overhead is tens of us, so the ceiling is negligible for any prefill object. The decode breakdown (host 0.044 ms vs launch+sync 18.07 ms) independently shows host issue is 0.24% of even a single decode step; a prefill chunk's kernel is far larger, so its host fraction is smaller still."
+  },
+  "why_not_built": "cudaGraph capture/replay of the chunk sequence would add real complexity (per-chunk graph node param updates for the counter-zero memset and the kv-row-patch memcpy, plus re-capture when the bucket shape changes) for a saving bounded above at 0.02% of TTFT. This matches the plan's own note ('the per-token host prologue is already 53 us, so the ceiling here is small') and the T9c finding ('host enqueue tax 3.08 us/launch — negligible vs the ~514 ms GEMM-bound compute'). The prefill wall is GEMM/flash compute, not host launch overhead; PX-1 (batched prefill) and PX-2 (fp8 mainloop) attack that wall, PX-5 does not."
+}

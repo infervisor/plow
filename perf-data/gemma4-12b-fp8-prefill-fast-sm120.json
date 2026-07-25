@@ -1,0 +1,25 @@
+{
+  "experiment": "fp8-KV arm for the FAST (PIPE=1 cp.async) prefill flash — px4 hd512 FULL-attn",
+  "branch": "beat-fp8-prefill",
+  "verdict": "NO-GO",
+  "gate": "microbench: fp8 must be FASTER than bf16 at >= 32k, else STOP",
+  "device": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "sm_count": 188,
+  "hbm_ceiling_gbps": 1535,
+  "microbench": "runtime/tests/flashpre_fp8_bw_sm120.cu",
+  "kernel": "d_flash_prefill_px4<512,32,16,FP8KV>",
+  "config": "single q-tile (BQ=32) at pos seq_kv-32 (full causal KV), n_head=16, n_kv_head=2, nsplit=12 (~1 block/SM), unit dequant scales, best-of-50",
+  "implementation": "sub-option (i): raw e4m3 staged via the cp.async ring into uint8 smem tiles (row stride HD+16B), dequant to bf16 scratch after cp_wait, reuse ldmatrix/mma; K-scale post-multiplies the score tile per kv column; V-scale folds into the P fragment",
+  "note_12b_vs_26b": "the px4 hd512 FULL-attn arm is identical geometry for 12B and 26B (n_head/n_kv_head differ but the KERNEL and its compute-bound character do not); the microbench uses the 26B full-attn geometry as the representative worst case. The NO-GO is a property of the kernel, so it holds for BOTH models — no separate 12B run changes the verdict.",
+  "rows": [
+    {"ctx": 8192,   "bf16_ms": 0.1301, "fp8_ms": 0.1816, "speedup_bf16_over_fp8": 0.716, "bf16_gbps_issued": 2063.6, "fp8_gbps_issued": 739.2, "relL2_fp8_vs_bf16": 2.45e-2},
+    {"ctx": 16384,  "bf16_ms": 0.2390, "fp8_ms": 0.3419, "speedup_bf16_over_fp8": 0.699, "bf16_gbps_issued": 2246.5, "fp8_gbps_issued": 785.2, "relL2_fp8_vs_bf16": 2.42e-2},
+    {"ctx": 32768,  "bf16_ms": 0.4674, "fp8_ms": 0.6643, "speedup_bf16_over_fp8": 0.704, "bf16_gbps_issued": 2297.1, "fp8_gbps_issued": 808.2, "relL2_fp8_vs_bf16": 2.24e-2},
+    {"ctx": 65536,  "bf16_ms": 0.9028, "fp8_ms": 1.3249, "speedup_bf16_over_fp8": 0.681, "bf16_gbps_issued": 2378.8, "fp8_gbps_issued": 810.5, "relL2_fp8_vs_bf16": 2.50e-2},
+    {"ctx": 131072, "bf16_ms": 1.7671, "fp8_ms": 2.9240, "speedup_bf16_over_fp8": 0.604, "bf16_gbps_issued": 2430.5, "fp8_gbps_issued": 734.4, "relL2_fp8_vs_bf16": 2.28e-2}
+  ],
+  "root_cause": "bf16 issued-BW (2063..2430 GB/s) exceeds the 1535 GB/s HBM ceiling -> the KV read is L2-served, not HBM-bound. Halving KV bytes (fp8) therefore buys nothing; the fp8 arm only ADDS a per-tile dequant pass + 2 __syncthreads on the QK/P.V critical path (dequant->QK serialization). Matches the kernel's own committed px4/T5 ablation (op_attention.cuh:700): the hd512 prefill is softmax(36%)+QK(21%) COMPUTE-bound, per-tile time flat 8k->128k, NOT DRAM-bound.",
+  "consequence": "fp8-KV cannot make the FAST prefill flash faster than bf16, so it cannot approach vLLM fp8kv TTFT (12B@128k 8097ms) via this lever. Even option (ii) register-direct convert cannot win: the halved-HBM benefit is ~0 on a compute-bound kernel, so best case is parity, never faster.",
+  "vllm_fp8kv_target_128k_ms": 8097,
+  "gates_not_run": "hd256 arm, PIPE=1 _pf_fp8kv dispatch/build, and 12B/26B TTFT ladders were NOT executed — the plan's hard sequence STOPs at the microbench on NO-GO."
+}

@@ -1,0 +1,40 @@
+{
+ "engine": "plow",
+ "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, single GPU (sm_120 / cc 12.0, 188 SMs)",
+ "cuda_toolkit_on_host": "13.0 (V13.0.88)",
+ "model": "/workspace/models/gemma-4-31B-it",
+ "dtype_compute": "bfloat16",
+ "tp": 1,
+ "batch": 1,
+ "metric_convention": "SERVED TTFT: admission -> first CONTENT SSE frame over the OpenAI /v1/chat/completions endpoint (tokenize + decomposed prefill-bucket chain + first decode token + mux/SSE hop). SERVED TPOT: mean SSE frame gap, first 16 steps discarded, finish frame excluded. Single user, greedy, batch 1. Directly comparable to perf-data/gemma4-31b-vllm-sm120.json (bf16).",
+ "vllm_baseline_ref": "perf-data/gemma4-31b-vllm-sm120.json (bf16)",
+ "run_mode": "plowrt serve --assets /root/gpu-assets-31b/b1 --slo-ms 100000000 (features cuda,hf-tokenizer, commit a058492); pkt PLOW_UNISEG=1 gemma4 <31B> 132096 out.pkt 188 (ns47 grid-aligned full-layer nsplit is the emitter default for the 31B signature); cubins scripts/build_sm120_cubin.sh at HEAD (decode 212 regs GF2, prefill _pf 240 regs, smem_pf 81664). Engine load: 57.2 GiB weights + 22.6 GiB KV, 21.6 s warm.",
+ "campaigns": [
+  {
+   "campaign": "S6-31b",
+   "date": "2026-07-20",
+   "commit": "a058492",
+   "notes": "First served 31B. Gates: 'capital of France' -> 'The capital of France is Paris.', finish stop; served greedy == standalone gemma4_sm120_chat PLOW_PREFILL=1 on the same pkt+ids 48/48 (two-phase capture-replay parity \u2014 the 82.5 GiB harness cannot co-reside with the server, so served ids/stream are captured, the server exits, and the harness replays the identical prompt ids). TPOT@4k 46.36 ms vs vLLM 45.20 = +2.6% (matches the committed raw-decode gap +1.4-5.4%); TPOT@32k 48.78 vs vLLM 49.14 = plow WINS -0.7% (matches T9 ns47 32k win). Raw prefill same-lease (cover-policy): 4137=2691 ms, 32837=14045 ms -> served 32k TTFT +0.5% over raw; served 4k (1.65 s) beats raw cover via [4096,128] decomposition. Server run with --slo-ms 1e8 (admission-shed workaround, see 12B S6-refresh notes).",
+   "results": [
+    {
+     "ctx": 4137,
+     "ttft_ms": 1650,
+     "tpot_ms": 46.362,
+     "vllm_bf16_ttft_ms": 705.67,
+     "vllm_bf16_tpot_ms": 45.2,
+     "plow_vs_vllm_ttft": "2.3x slower",
+     "plow_vs_vllm_tpot": "+2.6%"
+    },
+    {
+     "ctx": 32837,
+     "ttft_ms": 14120,
+     "tpot_ms": 48.78,
+     "vllm_bf16_ttft_ms": 10730.22,
+     "vllm_bf16_tpot_ms": 49.14,
+     "plow_vs_vllm_ttft": "1.3x slower",
+     "plow_vs_vllm_tpot": "-0.7% (plow wins)"
+    }
+   ]
+  }
+ ]
+}

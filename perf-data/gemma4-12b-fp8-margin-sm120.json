@@ -1,0 +1,79 @@
+{
+  "campaign": "beat12b-fp8-margin",
+  "title": "Gemma-4-12B fp8 decode — plow vs vLLM margin, sm_120",
+  "date": "2026-07-23",
+  "branch": "beat12b-fp8-margin",
+  "gpu": "RTX PRO 6000 Blackwell Server Edition (sm_120, 188 SMs, 96 GB)",
+  "goal": ">=10% decode TPOT margin vs vLLM at every ctx 1k..128k, fp8 weight-only e4m3 (stretch 15%)",
+  "verdict": "MET at every rung: 12.4%..23.4% vs vLLM best config; stretch met at 4k..128k",
+  "plow_config": {
+    "build": "cmake -DPLOW_CUDA=ON -DPLOW_FP8_KV=ON -DCMAKE_CUDA_FLAGS=-DPLOW_FP8_FAST (megakernel 209 regs, GF=2)",
+    "packet": "PLOW_UNISEG=1 PLOW_FP8=1 PLOW_FP8_HEAD=1 PLOW_FP8_KV=1 gemma4 <model> 132096 pkt 188 (nsplit levers are the fp8-KV default: sliding ns16, full ns47)",
+    "harness": "gemma4_sm120_chat, vLLM seed-0 random ids p0, prefill buckets, 128 gen tok, warmup 16, n=112",
+    "fp8_twins": "/workspace/models/gemma-4-12B-it/fp8 + E5 head twin (quantize_fp8_head.py, 2-shard symlink dir)"
+  },
+  "vllm_baseline": "perf-data/gemma4-12b-vllm-sm120.md (trusted; vLLM 0.25.1, TRITON_ATTN, cudagraphs ON)",
+  "headline_tpot_ms": {
+    "columns": ["ctx", "plow_mean_ms", "plow_sd_ms", "base_ns24_ms", "vllm_fp8_ms", "vllm_fp8kv_ms", "margin_vs_fp8_pct", "margin_vs_fp8kv_pct", "margin_vs_best_pct"],
+    "rows": [
+      [1024, 10.918, 0.013, 11.219, 12.46, 12.82, -12.4, -14.8, -12.4],
+      [4096, 10.972, 0.013, 11.295, 12.97, 13.09, -15.4, -16.2, -15.4],
+      [16384, 11.209, 0.016, 11.761, 14.27, 13.95, -21.5, -19.7, -19.7],
+      [32768, 11.535, 0.013, 12.401, 15.98, 15.05, -27.8, -23.4, -23.4],
+      [65536, 12.198, 0.013, 13.625, 17.47, 15.78, -30.2, -22.7, -22.7],
+      [98304, 12.877, 0.013, 14.897, 18.91, 16.57, -31.9, -22.3, -22.3],
+      [131072, 13.691, 0.014, 16.16, 20.71, 17.3, -33.9, -20.9, -20.9]
+    ],
+    "note": "base_ns24_ms = identical build/flags with the pre-campaign nsplit default (ns=24); argmax device==host AGREE at every point in both configs"
+  },
+  "trace_block0_fp8kv": {
+    "ctx_1k": {"GemvFp8_pct": 54.1, "GemvGluFp8_pct": 38.1, "FlashDecodeFp8_pct": 7.5},
+    "ctx_128k": {"GemvFp8_pct": 44.4, "GemvGluFp8_pct": 30.5, "FlashDecodeFp8_pct": 24.8}
+  },
+  "levers": {
+    "full_layer_nsplit_align": {
+      "verdict": "GO (shipped emitter default, commit c8e84ee)",
+      "what": "kvh_full==1 signature: ns 24 (192 items ragged on 188 SMs) -> 47 (376 = exactly 2/block), gated on emit-time PLOW_FP8_KV",
+      "microbench_ms_per_layer_128k": {"ns24": 0.553, "ns23": 0.417, "ns47": 0.304},
+      "network_ms": {"128k": [16.163, 13.988], "1k": [11.219, 11.213]}
+    },
+    "windowed_layer_nsplit_cap": {
+      "verdict": "GO (shipped emitter default, commit 8dffecf)",
+      "what": "sliding layers (window 1024): ns min(ns, win/64)=16; fixed intercept cut, ctx-independent",
+      "sweep_1k_ms": {"ns8": 10.937, "ns12": 10.956, "ns16": 10.921, "ns23": 10.99, "ns24_old": 11.221, "ns47": 11.212},
+      "network_ms": {"1k": [11.221, 10.921], "128k": [13.978, 13.684]}
+    },
+    "gf_full_raise": {
+      "verdict": "MEASURED, not shipped (long-ctx recipe option)",
+      "rows_ms": {"GF2_ns47": {"regs": 209, "1k": 11.213, "128k": 13.988}, "GF4_ns94": {"regs": 219, "1k": 11.468, "128k": 13.502}, "GF8_ns94": {"regs": 234, "1k": 11.593, "128k": 13.255}},
+      "note": "register tax on the whole megakernel hurts the fixed intercept; family-assets GF4+ns48 combo is ragged on 12B — use 47/94"
+    },
+    "gemv_smem_x_staging": {
+      "verdict": "NO-GO (measured regression, reverted)",
+      "network_ms": {"1k": [11.213, 11.552], "128k": [13.988, 14.303]},
+      "note": "PLOW_NV_GEMV_ARENA_K=15360: staged body byte-identical outputs, op test ok, but staging syncs + L1-carveout loss beat saved global-x traffic"
+    },
+    "gemv_f32_direct_dequant": {
+      "verdict": "N/A — premise already satisfied",
+      "note": "dot8_fp8 (op_gemm.cuh:1648) already native cvt e4m3->half2->f32, no bf16 round-trip; the flash-arm round-trip was fixed by PLOW_FP8_FAST (beat26b), built into the ladder cubin"
+    },
+    "emit_time_weight_swizzle": {
+      "verdict": "REASONED SKIP",
+      "note": "GEMV weight reads fully coalesced (256B/warp-pass); network GEMV aggregate ~90% of fp8-byte ceiling; E4 shows fp8 cold-read ceiling binds, not dequant; upside <0.9ms vs layout-migration risk"
+    },
+    "e5_fp8_lm_head": {"verdict": "inherited GO (in shipped config)", "effect_ms_fixed": -0.64},
+    "fp8_kv_fast": {"verdict": "inherited GO (in shipped config)"}
+  },
+  "gates": {
+    "sm120_interp_op_test": "ok (ladder build GF2+PLOW_FP8_KV+PLOW_FP8_FAST)",
+    "default_build_identity": "flag-unset packets byte-identical (cmp bf16 + fp8-no-KV vs pre-change emitter); kernels untouched by shipped levers",
+    "argmax_agree": "device==host at all 7 points, both configs",
+    "near_tie_class": "step-0 logits BYTE-IDENTICAL ns24/ns47/GF8 at 1k & 4k (relL2=0); natural-prompt streams agree 18 tokens then flip (same class as rtx19-e3 fp8-KV drift ~21 tok); microbench merged-output maxdiff 0.0000 at every swept config",
+    "post_merge_gpu_exec_stage1": "plowc blob byte-identical; plowrt --features cuda,hf-tokenizer compiles; chat harness unaffected"
+  },
+  "artifacts": {
+    "microbench": "runtime/tests/flashdec_fp8_bw_12b.cu",
+    "head_twin_tool": "perf-data/harness/quantize_fp8_head.py",
+    "vllm_baseline": "perf-data/gemma4-12b-vllm-sm120.{md,json}"
+  }
+}

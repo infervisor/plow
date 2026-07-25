@@ -1,0 +1,26 @@
+[package]
+name = "schedule"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Scheduling half of the Infervisor JIT: resource-interval list scheduler over a tile graph onto a heterogeneous Soc (SMs, DMA engines, DPUs, host threads)"
+
+[dependencies]
+rewrite.workspace = true
+packet.workspace = true
+costmodel.workspace = true
+hwspec.workspace = true
+plow-asset.workspace = true
+thiserror.workspace = true
+# Bridge to the Lean verifier (JSON IPC). Optional — enabled via the
+# `lean-verify` feature so builds without Lean don't pull it in.
+lean_verify = { workspace = true, optional = true }
+
+[features]
+# Off by default. When on, the `schedule::lean_verify` module is compiled and
+# `crates/plowc` can call `plow_verify` per bucket. Turn on with
+# `cargo build --features lean-verify` (or workspace-wide equivalents).
+lean-verify = ["dep:lean_verify"]
+
+[dev-dependencies]
+nn-graph.workspace = true

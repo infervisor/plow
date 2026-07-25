@@ -1,0 +1,50 @@
+{
+  "engine": "plow",
+  "campaign": "P1-sm120-decode",
+  "run_mode": "standalone decode harness (runtime/tests/qwen3_sm120_chat.cu, model-agnostic), persistent cooperative megakernel interp_sm120.cu",
+  "version": "plow @ rtx 32cc434 (measured from a clean `git worktree` at commit 32cc434; the working tree's -dirty flag reflects only other agents' untracked files, not the measured code)",
+  "git_commit": "32cc434",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, single GPU (sm_120 / cc 12.0, 188 SMs)",
+  "driver_version": "580.82.07",
+  "cuda_toolkit": "13.0 (V13.0.88)",
+  "date": "2026-07-18",
+  "model": "/workspace/models/gemma-4-12B-it",
+  "model_desc": "google/gemma-4-12B-it (Gemma4UnifiedForConditionalGeneration, model_type gemma4_unified); 48 layers (8 full / 40 sliding), hidden 3840, heads 16, kv_heads 8 slide / 1 full, head_dim 256 slide / 512 full, window 1024, tied embeddings",
+  "model_revision": "12ace6d648d72bd41519e140f1185f34d38c7e3d",
+  "precision": "bf16",
+  "dtype_compute": "bfloat16",
+  "quantization": "none (bf16 weights, bf16 KV cache)",
+  "tp": 1,
+  "batch": 1,
+  "concurrency": 1,
+  "bit_exact": false,
+  "scheduler": "global-queue (PLOW_NV_SCHED=1, default since commit 18760a5); instruction order verified TOPOLOGICAL over 542 counters before every launch",
+  "build": {
+    "interp_object": "runtime/nvidia/interp_sm120.cu compiled -arch=sm_120a -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 (the documented Gemma build: instantiates d_headnorm_rope/d_flash_decode/d_flash_merge at head_dim 256 AND 512, GF=2, carries the NormResidual(16)/NormResidualNorm(23)/SoftCap(7) op bodies)",
+    "ptxas": "150 registers, 0 spill, 1 block/SM (sm_120a, CUDA 13.0) — matches commit 32cc434",
+    "harness": "runtime/tests/qwen3_sm120_chat.cu (model-agnostic; Gemma is tied so no lm_head tensor) linked against the Gemma interp object; grid=188",
+    "packet": "plowc gemma4 /workspace/models/gemma-4-12B-it 132096 gemma12b_132k.pkt 188 (one packet, max_ctx 132096 mirroring vLLM's max_model_len; full-layer KV ring=ctx with mask NONE, sliding ring capped at 16384 — flash-decode reads only the actual kvlen rows each step, so a single large-ctx packet is correct and perf-equivalent at every ctx point)"
+  },
+  "metric": "tpot_ms = mean 1-token decode step (ms/token), single sequence, batch 1",
+  "methodology": "repo decode convention (commit 18760a5): a prompt of `input_len` tokens is consumed through the DECODE program one token at a time to build the KV cache (no prefill kernels on sm_120 — O(n) launches, header-documented), then 128 tokens are decoded; the FIRST 16 are warmup (timed but discarded), the remaining 112 are the reported mean/median/sd. The timed window therefore spans ctx = input_len+16 .. input_len+127 (KV growing past input_len exactly as vLLM's output_len=128 decode does). Prompt token ids are pseudo-random (content is irrelevant to decode compute; the flash-decode reads the same kvlen rows regardless).",
+  "correctness_note": "Phase-0 (commit 32cc434) gated this decode path token-identical vs HF transformers greedy (64/64 on 4 prompts incl. >2k ctx). This run additionally checks per-point that the device ARGMAX equals a host scan of the same bf16 logits row (isolates the packed-key reduction): AGREE at every ctx point.",
+  "vllm_baseline": "gemma4-12b-vllm-sm120.json config 'bf16' (vLLM 0.25.1, TRITON_ATTN forced by Gemma4 heterogeneous head dims, cudagraphs ON, same box/model/revision, output_len 128) — the like-for-like bf16 decode comparison.",
+  "results": [
+    {"input_len": 1024,   "tpot_ms": 18.4807, "tpot_median_ms": 18.4806, "tpot_sd_ms": 0.0110, "tpot_sd_pct": 0.06, "n_timed": 112, "warmup": 16, "decode_tok_s": 54.11, "host_prologue_ms": 0.0439, "kernel_ms": 18.4367, "vllm_bf16_tpot_ms": 19.780, "delta_pct": -6.57},
+    {"input_len": 4096,   "tpot_ms": 18.5428, "tpot_median_ms": 18.5423, "tpot_sd_ms": 0.0100, "tpot_sd_pct": 0.05, "n_timed": 112, "warmup": 16, "decode_tok_s": 53.93, "host_prologue_ms": 0.0398, "kernel_ms": 18.5027, "vllm_bf16_tpot_ms": 20.250, "delta_pct": -8.43},
+    {"input_len": 16384,  "tpot_ms": 19.0656, "tpot_median_ms": 19.0658, "tpot_sd_ms": 0.0110, "tpot_sd_pct": 0.06, "n_timed": 112, "warmup": 16, "decode_tok_s": 52.45, "host_prologue_ms": 0.0421, "kernel_ms": 19.0233, "vllm_bf16_tpot_ms": 21.660, "delta_pct": -11.98},
+    {"input_len": 32768,  "tpot_ms": 19.7559, "tpot_median_ms": 19.7553, "tpot_sd_ms": 0.0127, "tpot_sd_pct": 0.06, "n_timed": 112, "warmup": 16, "decode_tok_s": 50.62, "host_prologue_ms": 0.0388, "kernel_ms": 19.7169, "vllm_bf16_tpot_ms": 23.350, "delta_pct": -15.39},
+    {"input_len": 65536,  "tpot_ms": 21.1156, "tpot_median_ms": 21.1151, "tpot_sd_ms": 0.0159, "tpot_sd_pct": 0.08, "n_timed": 112, "warmup": 16, "decode_tok_s": 47.36, "host_prologue_ms": 0.0444, "kernel_ms": 21.0710, "vllm_bf16_tpot_ms": 24.760, "delta_pct": -14.72},
+    {"input_len": 98304,  "tpot_ms": 22.5470, "tpot_median_ms": 22.5459, "tpot_sd_ms": 0.0173, "tpot_sd_pct": 0.08, "n_timed": 112, "warmup": 16, "decode_tok_s": 44.35, "host_prologue_ms": 0.0389, "kernel_ms": 22.5079, "vllm_bf16_tpot_ms": 26.510, "delta_pct": -14.95},
+    {"input_len": 131072, "tpot_ms": 23.9748, "tpot_median_ms": 23.9731, "tpot_sd_ms": 0.0155, "tpot_sd_pct": 0.06, "n_timed": 112, "warmup": 16, "decode_tok_s": 41.71, "host_prologue_ms": 0.0448, "kernel_ms": 23.9298, "vllm_bf16_tpot_ms": 28.260, "delta_pct": -15.16}
+  ],
+  "notes": [
+    "plow bf16 decode beats vLLM bf16 decode at every context: -6.6% at 1k widening to -15.2% at 128k. The gap widens with ctx because plow's flash-decode over the growing full-layer KV is more efficient than vLLM's TRITON_ATTN fallback (FlashAttention has no sm_120 head_dim 256/512 fast path; vLLM is forced to Triton).",
+    "SCALING SANITY (per task directive): TPOT growth with ctx is LINEAR in FULL-layer KV bytes only. Only the 8 full-attention layers (1 kv head, head_dim 512) grow their KV with ctx; the 40 sliding layers are ring-capped at 16384 rows (window 1024). Fitting tpot to ctx over the >=16384 points gives a slope of ~4.3e-5 ms per ctx-token, constant across every doubling (16384->32768: +0.690 ms; 32768->65536: +1.360 ms; 65536->131072: +2.859 ms — each increment scales with its ctx increment). No super-linear term => NO scaling bug; the sliding ring is doing its job.",
+    "Very low run-to-run noise: sd <= 0.08% of the mean at every point (112 timed steps, GQ scheduler). Reported tpot is the mean; median tracks it to <0.002 ms.",
+    "kernel_ms (launch+sync, the part vLLM's cudagraph replay also pays) is within 0.045 ms of tpot_ms at every point; host_prologue_ms (kv-row patch + 3 scalars + counter zero, ~0.04 ms/step) is plow-harness-specific overhead that a graph-captured serving path would not pay. Even counting the full host prologue, plow leads vLLM at every ctx.",
+    "NO failed points: all 7 contexts (1k..128k) completed at bf16 on the 96 GB card. KV cache 7.02 GiB + weights 22.2 GiB + activations 1.63 GiB ~= 31 GiB, huge headroom (matches rtx-06 footprint math).",
+    "Every GPU-touching command ran inside `gpulease p-sweep ...`; one lease per ctx point (released between points so the shared GPU cycled with concurrent b1/g5 agents). The build (interp object, plowc, packet) ran OFF-lease from a clean worktree at commit 32cc434.",
+    "Methodology note vs vLLM: vLLM tpot is measured with CUDA graphs ON via `vllm bench serve`; plow tpot here is a per-step launch+sync from a standalone harness (no graph capture, one-token-at-a-time prompt consumption because sm_120 has no prefill kernels yet — G5). The decode arithmetic and KV geometry are identical to what the serving path runs; this is a batch-1 single-user latency comparison, not throughput."
+  ]
+}

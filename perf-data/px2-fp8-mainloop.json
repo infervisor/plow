@@ -1,0 +1,37 @@
+{
+  "campaign": "PX-2-fp8-mainloop",
+  "date": "2026-07-21",
+  "branch": "px2-fp8-mainloop",
+  "kernel_commit": "288a714",
+  "model": "gemma-4-12B",
+  "precision": "w8a8 (e4m3 both operands, per-row act scale x per-col weight scale)",
+  "gpu": "RTX PRO 6000 Blackwell (sm_120, 188 SMs), driver cc 12.0, CUDA 13.0",
+  "notes": "PX-2 native full-tile fp8 mainloop for d_gemm_w8a8/d_gemm_glu_w8a8: fp8 K-tile deepened BK 32->64 (two m16n8k32 e4m3 mmas per K-tile => half the __syncthreads/cp.async cadence per K element, same smem bytes as bf16's 32-deep tile) + fp8-native CuTe Swizzle<3,4,3> (pgm_sw8) on the plain-uint32 fp8 frag reads, applied identically on cp.async store and read (pure address bijection => oracle bit-identical). Reuses T8's two-scale epilogue and the T3 cp.async ring unchanged; only tile shape/K-depth/swizzle changed. Measurement harness = gemma4_sm120_chat (chunked prefill, PLOW_PREFILL=1 PLOW_UNISEG=1), same w8a8 pkt run under the T8 vs PX-2 cubin; block-0 per-op body cycles via PLOW_NV_TRACE=1 (trace_reduce.py). bf16 leg is the same harness on a bf16 pkt. op33=GEMM_FP8, op36=GEMM_GLU_FP8, op32=QUANT_FP8.",
+  "correctness": {
+    "oracle": "sm120_interp_op_test w8a8 arm (dequant-f32 e4m3 ref, T8 convention): PX-2 BIT-IDENTICAL to T8 baseline. quant_fp8 relL2=0 (x2); gemm_w8a8 relL2 0..5.24e-5 (x4, incl lm_head a_row0); gemm_glu_w8a8 relL2 5.28e-5..9.61e-5 (x2). All PASS (gate 5e-3/8e-3). w8a8-vs-full-precision relL2 3.6% (inherent e4m3, unchanged).",
+    "prefill_parity": "first greedy token BIT-IDENTICAL across bf16 / T8-w8a8 / PX-2-w8a8 at 4k (236770) and 8k (236770). Within the established w8a8-vs-bf16 divergence budget."
+  },
+  "ptxas_prefill_megakernel": {
+    "symbol": "_Z15interp_sm120_pf11PlowProgram (PLOW_NV_W8A8=1)",
+    "occupancy": "occ-1 (cooperative, grid==n_cu, 1 block/SM), dynamic smem 81664 B (unchanged T8->PX-2)",
+    "T8_BK32":  {"registers": 238, "spill_store_B": 0, "spill_load_B": 0, "static_smem_B": 2320},
+    "PX2_BK64": {"registers": 240, "spill_store_B": 0, "spill_load_B": 0, "static_smem_B": 2320}
+  },
+  "gemm_body_cyc_block0_4k": {
+    "unit": "clock64 cyc, block-0 first prefill chunk (shape, not absolute — clock64 serializes)",
+    "GEMM_family":    {"bf16": 971210000, "t8_w8a8": 666980000, "px2_w8a8": 501660000, "px2_vs_bf16_pct": -48.3, "px2_vs_t8_pct": -24.8, "t8_vs_bf16_pct": -31.3},
+    "GEMM_op33":      {"bf16": 467132930, "t8_w8a8": 351842928, "px2_w8a8": 259715152, "px2_vs_bf16_pct": -44.4, "px2_vs_t8_pct": -26.2},
+    "GEMM_GLU_op36":  {"bf16": 504078041, "t8_w8a8": 315137366, "px2_w8a8": 241938537, "px2_vs_bf16_pct": -52.0, "px2_vs_t8_pct": -23.2},
+    "QUANT_op32":     {"t8_w8a8": 58748284, "px2_w8a8": 58425287, "note": "activation quant, unchanged"},
+    "FLASH_PREFILL":  {"bf16": 120569641, "t8_w8a8": 120450992, "px2_w8a8": 121875868, "note": "untouched"},
+    "total_body":     {"bf16": 1127130357, "t8_w8a8": 880007481, "px2_w8a8": 716028203, "px2_vs_bf16_pct": -36.5, "px2_vs_t8_pct": -18.6}
+  },
+  "e2e_prefill_ms": [
+    {"ctx": 4096, "bf16": 512.09, "t8_w8a8": 432.20, "px2_w8a8": 339.51, "px2_vs_bf16_pct": -33.7, "px2_vs_t8_pct": -21.4, "t8_vs_bf16_pct": -15.6, "first_token": 236770},
+    {"ctx": 8000, "bf16": 989.93, "t8_w8a8": 868.02, "px2_w8a8": 689.63, "px2_vs_bf16_pct": -30.3, "px2_vs_t8_pct": -20.6, "t8_vs_bf16_pct": -12.3, "first_token": 236770}
+  ],
+  "isolated_gemm_bench_negative": {
+    "note": "experiments/px2_gemm_bench.cu times the GEMM kernel STANDALONE (188 blocks, real gemma-12B projection shapes). There PX-2 is 3-10% SLOWER than T8 (w8a8/bf16 ratio 0.50-0.54 vs T8's 0.46-0.52); both already ~2x bf16. The standalone GEMM runs at higher occupancy so BK=32's extra syncs are hidden and BK=64's bigger cp.async stages hurt. The win is ONLY visible in the occ-1 megakernel (240 regs, 81 KiB smem, 1 block/SM) where the cp.async/sync cadence binds — exactly the 'bf16 cadence' PX-2 targets. Recorded so the in-context win is not mistaken for a standalone-kernel property.",
+    "swizzle_ab": "PX-2 with swizzle beats PX-2 without (w8a8/bf16 0.50-0.54 vs 0.54-0.58) in the same standalone bench — the fp8 Swizzle<3,4,3> does reduce the plain-read bank conflict."
+  }
+}

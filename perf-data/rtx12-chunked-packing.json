@@ -1,0 +1,1716 @@
+{
+  "cells": [
+    {
+      "label": "off-u4k-vu1",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        12,
+        232
+      ],
+      "packing": {
+        "launches": 217,
+        "R_histogram": {
+          "1": 217
+        },
+        "frac_R1": 1.0,
+        "frac_Rge2": 0.0,
+        "rows_by_R": {
+          "1": 124368
+        },
+        "total_packed_rows": 124368,
+        "mean_R": 1.0,
+        "max_R": 1,
+        "chunk_rows_stats": {
+          "n": 217,
+          "min": 43,
+          "max": 2048,
+          "median": 128,
+          "mean": 573.1,
+          "p10": 44,
+          "p90": 2048,
+          "frac_le512": 0.7142857142857143,
+          "frac_ge2048": 0.14285714285714285
+        }
+      },
+      "walltime": {
+        "prefill_ns": 18656131943,
+        "decode_ns": 65371740890,
+        "prefill_ticks": 25,
+        "decode_ticks": 3000,
+        "total_ticks": 3000,
+        "prefill_frac": 0.22202313725206235
+      },
+      "serving": {
+        "tok_s": 35.85952961351281,
+        "itl_p99_ms": 21.911,
+        "itl_p50_ms": 21.88,
+        "ttft_p99_ms": 811.573,
+        "ttft_p50_ms": 803.768,
+        "e2e_p99_ms": 3591.662,
+        "total_requests": 26,
+        "successful": 26,
+        "failed": 0,
+        "req_rate": 0.27897898562278073,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-03-42-09.json"
+      }
+    },
+    {
+      "label": "off-u4k-vu4",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        232,
+        534
+      ],
+      "packing": {
+        "launches": 299,
+        "R_histogram": {
+          "1": 267,
+          "2": 32
+        },
+        "frac_R1": 0.8929765886287625,
+        "frac_Rge2": 0.10702341137123746,
+        "rows_by_R": {
+          "1": 207194,
+          "2": 65536
+        },
+        "total_packed_rows": 272730,
+        "mean_R": 1.1070234113712374,
+        "max_R": 2,
+        "chunk_rows_stats": {
+          "n": 331,
+          "min": 2,
+          "max": 2048,
+          "median": 512,
+          "mean": 824.0,
+          "p10": 44,
+          "p90": 2048,
+          "frac_le512": 0.5438066465256798,
+          "frac_ge2048": 0.2054380664652568
+        }
+      },
+      "walltime": {
+        "prefill_ns": 37978703658,
+        "decode_ns": 66979486595,
+        "prefill_ticks": 193,
+        "decode_ticks": 3000,
+        "total_ticks": 3000,
+        "prefill_frac": 0.3618460223680778
+      },
+      "serving": {
+        "tok_s": 84.03862533527789,
+        "itl_p99_ms": 58.992,
+        "itl_p50_ms": 37.612,
+        "ttft_p99_ms": 2389.633,
+        "ttft_p50_ms": 987.664,
+        "e2e_p99_ms": 7717.626,
+        "total_requests": 60,
+        "successful": 60,
+        "failed": 0,
+        "req_rate": 0.6599028294878514,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-03-44-07.json"
+      }
+    },
+    {
+      "label": "off-u4k-vu8",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        534,
+        892
+      ],
+      "packing": {
+        "launches": 356,
+        "R_histogram": {
+          "1": 302,
+          "2": 54
+        },
+        "frac_R1": 0.848314606741573,
+        "frac_Rge2": 0.15168539325842698,
+        "rows_by_R": {
+          "1": 262448,
+          "2": 110592
+        },
+        "total_packed_rows": 373040,
+        "mean_R": 1.151685393258427,
+        "max_R": 2,
+        "chunk_rows_stats": {
+          "n": 410,
+          "min": 7,
+          "max": 2048,
+          "median": 772.0,
+          "mean": 909.9,
+          "p10": 91,
+          "p90": 2048,
+          "frac_le512": 0.4658536585365854,
+          "frac_ge2048": 0.22439024390243903
+        }
+      },
+      "walltime": {
+        "prefill_ns": 40671450211,
+        "decode_ns": 45971885708,
+        "prefill_ticks": 211,
+        "decode_ticks": 2000,
+        "total_ticks": 2000,
+        "prefill_frac": 0.46941233021108975
+      },
+      "serving": {
+        "tok_s": 112.47982400268685,
+        "itl_p99_ms": 73.841,
+        "itl_p50_ms": 57.035,
+        "ttft_p99_ms": 4644.978,
+        "ttft_p50_ms": 1106.071,
+        "e2e_p99_ms": 11836.679,
+        "total_requests": 81,
+        "successful": 81,
+        "failed": 0,
+        "req_rate": 0.8828358279280654,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-03-46-04.json"
+      }
+    },
+    {
+      "label": "off-u4k-vu16",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        892,
+        1279
+      ],
+      "packing": {
+        "launches": 384,
+        "R_histogram": {
+          "1": 323,
+          "2": 61
+        },
+        "frac_R1": 0.8411458333333334,
+        "frac_Rge2": 0.15885416666666666,
+        "rows_by_R": {
+          "1": 280202,
+          "2": 124928
+        },
+        "total_packed_rows": 405130,
+        "mean_R": 1.1588541666666667,
+        "max_R": 2,
+        "chunk_rows_stats": {
+          "n": 445,
+          "min": 2,
+          "max": 2048,
+          "median": 772,
+          "mean": 910.4,
+          "p10": 91,
+          "p90": 2048,
+          "frac_le512": 0.46741573033707867,
+          "frac_ge2048": 0.2202247191011236
+        }
+      },
+      "walltime": {
+        "prefill_ns": 94455499260,
+        "decode_ns": 71157307858,
+        "prefill_ticks": 535,
+        "decode_ticks": 3000,
+        "total_ticks": 3000,
+        "prefill_frac": 0.5703393409224684
+      },
+      "serving": {
+        "tok_s": 112.93857338889069,
+        "itl_p99_ms": 78.907,
+        "itl_p50_ms": 57.785,
+        "ttft_p99_ms": 12794.668,
+        "ttft_p50_ms": 9180.987,
+        "e2e_p99_ms": 20230.988,
+        "total_requests": 81,
+        "successful": 81,
+        "failed": 0,
+        "req_rate": 0.8872962603782877,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-03-48-10.json"
+      }
+    },
+    {
+      "label": "off-u4k-vu32",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        1279,
+        1722
+      ],
+      "packing": {
+        "launches": 441,
+        "R_histogram": {
+          "1": 373,
+          "2": 68
+        },
+        "frac_R1": 0.8458049886621315,
+        "frac_Rge2": 0.15419501133786848,
+        "rows_by_R": {
+          "1": 330033,
+          "2": 139264
+        },
+        "total_packed_rows": 469297,
+        "mean_R": 1.1541950113378685,
+        "max_R": 2,
+        "chunk_rows_stats": {
+          "n": 509,
+          "min": 5,
+          "max": 2048,
+          "median": 772,
+          "mean": 922.0,
+          "p10": 91,
+          "p90": 2048,
+          "frac_le512": 0.4715127701375246,
+          "frac_ge2048": 0.22789783889980353
+        }
+      },
+      "walltime": {
+        "prefill_ns": 54175202767,
+        "decode_ns": 46898291916,
+        "prefill_ticks": 297,
+        "decode_ticks": 2000,
+        "total_ticks": 2000,
+        "prefill_frac": 0.5359981163895777
+      },
+      "serving": {
+        "tok_s": 111.55886916052813,
+        "itl_p99_ms": 76.174,
+        "itl_p50_ms": 59.009,
+        "ttft_p99_ms": 29585.693,
+        "ttft_p50_ms": 26197.555,
+        "e2e_p99_ms": 37074.005,
+        "total_requests": 81,
+        "successful": 81,
+        "failed": 0,
+        "req_rate": 0.8762866953067086,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-03-50-32.json"
+      }
+    },
+    {
+      "label": "off-u512-vu1",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=512,min_tokens=512,max_tokens=512,variance=0",
+      "log_lines": [
+        1722,
+        1801
+      ],
+      "packing": {
+        "launches": 74,
+        "R_histogram": {
+          "1": 74
+        },
+        "frac_R1": 1.0,
+        "frac_Rge2": 0.0,
+        "rows_by_R": {
+          "1": 19376
+        },
+        "total_packed_rows": 19376,
+        "mean_R": 1.0,
+        "max_R": 1,
+        "chunk_rows_stats": {
+          "n": 74,
+          "min": 10,
+          "max": 512,
+          "median": 262.0,
+          "mean": 261.8,
+          "p10": 11,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 24527896037,
+        "decode_ns": 110168992802,
+        "prefill_ticks": 143,
+        "decode_ticks": 5000,
+        "total_ticks": 5000,
+        "prefill_frac": 0.18209697527845364
+      },
+      "serving": {
+        "tok_s": 43.55678640164788,
+        "itl_p99_ms": 21.963,
+        "itl_p50_ms": 21.826,
+        "ttft_p99_ms": 165.476,
+        "ttft_p50_ms": 163.252,
+        "e2e_p99_ms": 2938.499,
+        "total_requests": 31,
+        "successful": 31,
+        "failed": 0,
+        "req_rate": 0.34375264217186463,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-03-52-26.json"
+      }
+    },
+    {
+      "label": "off-u512-vu4",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=512,min_tokens=512,max_tokens=512,variance=0",
+      "log_lines": [
+        1801,
+        2005
+      ],
+      "packing": {
+        "launches": 200,
+        "R_histogram": {
+          "1": 172,
+          "2": 28
+        },
+        "frac_R1": 0.86,
+        "frac_Rge2": 0.14,
+        "rows_by_R": {
+          "1": 43226,
+          "2": 14848
+        },
+        "total_packed_rows": 58074,
+        "mean_R": 1.14,
+        "max_R": 2,
+        "chunk_rows_stats": {
+          "n": 228,
+          "min": 8,
+          "max": 524,
+          "median": 128.0,
+          "mean": 254.7,
+          "p10": 12,
+          "p90": 512,
+          "frac_le512": 0.9956140350877193,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 13269732771,
+        "decode_ns": 88470248269,
+        "prefill_ticks": 177,
+        "decode_ticks": 4000,
+        "total_ticks": 4000,
+        "prefill_frac": 0.13042790685977113
+      },
+      "serving": {
+        "tok_s": 140.51447610903227,
+        "itl_p99_ms": 32.855,
+        "itl_p50_ms": 25.69,
+        "ttft_p99_ms": 453.913,
+        "ttft_p50_ms": 238.472,
+        "e2e_p99_ms": 4491.972,
+        "total_requests": 102,
+        "successful": 102,
+        "failed": 0,
+        "req_rate": 1.1155414510524044,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-03-54-20.json"
+      }
+    },
+    {
+      "label": "off-u512-vu8",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=512,min_tokens=512,max_tokens=512,variance=0",
+      "log_lines": [
+        2005,
+        2297
+      ],
+      "packing": {
+        "launches": 288,
+        "R_histogram": {
+          "1": 221,
+          "2": 56,
+          "3": 10,
+          "4": 1
+        },
+        "frac_R1": 0.7673611111111112,
+        "frac_Rge2": 0.2326388888888889,
+        "rows_by_R": {
+          "1": 55811,
+          "2": 30208,
+          "3": 10240,
+          "4": 2048
+        },
+        "total_packed_rows": 98307,
+        "mean_R": 1.2743055555555556,
+        "max_R": 4,
+        "chunk_rows_stats": {
+          "n": 367,
+          "min": 6,
+          "max": 524,
+          "median": 378,
+          "mean": 267.9,
+          "p10": 12,
+          "p90": 512,
+          "frac_le512": 0.9564032697547684,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 23259618315,
+        "decode_ns": 90211173652,
+        "prefill_ticks": 299,
+        "decode_ticks": 4000,
+        "total_ticks": 4000,
+        "prefill_frac": 0.20498330814298404
+      },
+      "serving": {
+        "tok_s": 245.60895627887137,
+        "itl_p99_ms": 37.581,
+        "itl_p50_ms": 29.411,
+        "ttft_p99_ms": 657.918,
+        "ttft_p50_ms": 261.835,
+        "e2e_p99_ms": 5055.305,
+        "total_requests": 175,
+        "successful": 175,
+        "failed": 0,
+        "req_rate": 1.9438997489395546,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-03-56-15.json"
+      }
+    },
+    {
+      "label": "off-u512-vu16",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=512,min_tokens=512,max_tokens=512,variance=0",
+      "log_lines": [
+        2297,
+        2613
+      ],
+      "packing": {
+        "launches": 313,
+        "R_histogram": {
+          "1": 241,
+          "2": 63,
+          "3": 8,
+          "4": 1
+        },
+        "frac_R1": 0.7699680511182109,
+        "frac_Rge2": 0.23003194888178913,
+        "rows_by_R": {
+          "1": 61104,
+          "2": 33280,
+          "3": 8192,
+          "4": 2048
+        },
+        "total_packed_rows": 104624,
+        "mean_R": 1.2619808306709266,
+        "max_R": 4,
+        "chunk_rows_stats": {
+          "n": 395,
+          "min": 10,
+          "max": 524,
+          "median": 128,
+          "mean": 264.9,
+          "p10": 12,
+          "p90": 512,
+          "frac_le512": 0.9670886075949368,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 16488451612,
+        "decode_ns": 67545138280,
+        "prefill_ticks": 205,
+        "decode_ticks": 3000,
+        "total_ticks": 3000,
+        "prefill_frac": 0.19621262917829602
+      },
+      "serving": {
+        "tok_s": 249.83064056004292,
+        "itl_p99_ms": 36.548,
+        "itl_p50_ms": 29.434,
+        "ttft_p99_ms": 5080.765,
+        "ttft_p50_ms": 4148.207,
+        "e2e_p99_ms": 9344.042,
+        "total_requests": 179,
+        "successful": 179,
+        "failed": 0,
+        "req_rate": 1.9863938462331845,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-03-58-16.json"
+      }
+    },
+    {
+      "label": "off-u512-vu32",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=512,min_tokens=512,max_tokens=512,variance=0",
+      "log_lines": [
+        2613,
+        2942
+      ],
+      "packing": {
+        "launches": 324,
+        "R_histogram": {
+          "1": 246,
+          "2": 67,
+          "3": 10,
+          "4": 1
+        },
+        "frac_R1": 0.7592592592592593,
+        "frac_Rge2": 0.24074074074074073,
+        "rows_by_R": {
+          "1": 62253,
+          "2": 35840,
+          "3": 10240,
+          "4": 2048
+        },
+        "total_packed_rows": 110381,
+        "mean_R": 1.2777777777777777,
+        "max_R": 4,
+        "chunk_rows_stats": {
+          "n": 414,
+          "min": 9,
+          "max": 524,
+          "median": 262.0,
+          "mean": 266.6,
+          "p10": 12,
+          "p90": 512,
+          "frac_le512": 0.961352657004831,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 31772237650,
+        "decode_ns": 113125777494,
+        "prefill_ticks": 418,
+        "decode_ticks": 5000,
+        "total_ticks": 5000,
+        "prefill_frac": 0.21927310473110811
+      },
+      "serving": {
+        "tok_s": 244.67880652175813,
+        "itl_p99_ms": 37.992,
+        "itl_p50_ms": 29.828,
+        "ttft_p99_ms": 14679.461,
+        "ttft_p50_ms": 12107.395,
+        "e2e_p99_ms": 18798.096,
+        "total_requests": 174,
+        "successful": 174,
+        "failed": 0,
+        "req_rate": 1.9328148333765793,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-00-24.json"
+      }
+    },
+    {
+      "label": "c512q2048-u4k-vu1",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        12,
+        345
+      ],
+      "packing": {
+        "launches": 330,
+        "R_histogram": {
+          "1": 330
+        },
+        "frac_R1": 1.0,
+        "frac_Rge2": 0.0,
+        "rows_by_R": {
+          "1": 120356
+        },
+        "total_packed_rows": 120356,
+        "mean_R": 1.0,
+        "max_R": 1,
+        "chunk_rows_stats": {
+          "n": 330,
+          "min": 43,
+          "max": 512,
+          "median": 512.0,
+          "mean": 364.7,
+          "p10": 128,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 21056085496,
+        "decode_ns": 65380357811,
+        "prefill_ticks": 25,
+        "decode_ticks": 3000,
+        "total_ticks": 3000,
+        "prefill_frac": 0.24360194254192302
+      },
+      "serving": {
+        "tok_s": 34.888130824730204,
+        "itl_p99_ms": 21.904,
+        "itl_p50_ms": 21.871,
+        "ttft_p99_ms": 917.28,
+        "ttft_p50_ms": 906.518,
+        "e2e_p99_ms": 3698.48,
+        "total_requests": 25,
+        "successful": 25,
+        "failed": 0,
+        "req_rate": 0.27137625097021006,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-02-30.json"
+      }
+    },
+    {
+      "label": "c512q2048-u4k-vu4",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        345,
+        862
+      ],
+      "packing": {
+        "launches": 514,
+        "R_histogram": {
+          "1": 446,
+          "2": 50,
+          "3": 18
+        },
+        "frac_R1": 0.867704280155642,
+        "frac_Rge2": 0.13229571984435798,
+        "rows_by_R": {
+          "1": 170567,
+          "2": 39680,
+          "3": 26418
+        },
+        "total_packed_rows": 236665,
+        "mean_R": 1.1673151750972763,
+        "max_R": 3,
+        "chunk_rows_stats": {
+          "n": 600,
+          "min": 4,
+          "max": 512,
+          "median": 512.0,
+          "mean": 394.4,
+          "p10": 128,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 46564123346,
+        "decode_ns": 67101302873,
+        "prefill_ticks": 369,
+        "decode_ticks": 3000,
+        "total_ticks": 3000,
+        "prefill_frac": 0.4096595147260044
+      },
+      "serving": {
+        "tok_s": 71.53053123997199,
+        "itl_p99_ms": 66.224,
+        "itl_p50_ms": 42.246,
+        "ttft_p99_ms": 3327.444,
+        "ttft_p50_ms": 1384.45,
+        "e2e_p99_ms": 7846.923,
+        "total_requests": 51,
+        "successful": 51,
+        "failed": 0,
+        "req_rate": 0.5627980705397364,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-04-29.json"
+      }
+    },
+    {
+      "label": "c512q2048-u4k-vu8",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        862,
+        1319
+      ],
+      "packing": {
+        "launches": 455,
+        "R_histogram": {
+          "1": 311,
+          "2": 43,
+          "3": 43,
+          "4": 56,
+          "5": 2
+        },
+        "frac_R1": 0.6835164835164835,
+        "frac_Rge2": 0.31648351648351647,
+        "rows_by_R": {
+          "1": 119873,
+          "2": 36118,
+          "3": 63518,
+          "4": 113340,
+          "5": 4096
+        },
+        "total_packed_rows": 336945,
+        "mean_R": 1.6703296703296704,
+        "max_R": 5,
+        "chunk_rows_stats": {
+          "n": 760,
+          "min": 7,
+          "max": 512,
+          "median": 512.0,
+          "mean": 443.3,
+          "p10": 128,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 50676860892,
+        "decode_ns": 46265468728,
+        "prefill_ticks": 343,
+        "decode_ticks": 2000,
+        "total_ticks": 2000,
+        "prefill_frac": 0.5227526622337838
+      },
+      "serving": {
+        "tok_s": 101.14956208005397,
+        "itl_p99_ms": 81.794,
+        "itl_p50_ms": 56.49,
+        "ttft_p99_ms": 5706.391,
+        "ttft_p50_ms": 2540.303,
+        "e2e_p99_ms": 12153.366,
+        "total_requests": 72,
+        "successful": 72,
+        "failed": 0,
+        "req_rate": 0.7936757268705195,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-06-27.json"
+      }
+    },
+    {
+      "label": "c512q2048-u4k-vu16",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        1319,
+        1846
+      ],
+      "packing": {
+        "launches": 525,
+        "R_histogram": {
+          "1": 372,
+          "2": 44,
+          "3": 51,
+          "4": 56,
+          "5": 2
+        },
+        "frac_R1": 0.7085714285714285,
+        "frac_Rge2": 0.2914285714285714,
+        "rows_by_R": {
+          "1": 143444,
+          "2": 36854,
+          "3": 75241,
+          "4": 113340,
+          "5": 4096
+        },
+        "total_packed_rows": 372975,
+        "mean_R": 1.6133333333333333,
+        "max_R": 5,
+        "chunk_rows_stats": {
+          "n": 847,
+          "min": 8,
+          "max": 512,
+          "median": 512,
+          "mean": 440.3,
+          "p10": 128,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 60092685444,
+        "decode_ns": 46804285594,
+        "prefill_ticks": 395,
+        "decode_ticks": 2000,
+        "total_ticks": 2000,
+        "prefill_frac": 0.5621551748424949
+      },
+      "serving": {
+        "tok_s": 101.3689289119087,
+        "itl_p99_ms": 85.461,
+        "itl_p50_ms": 57.833,
+        "ttft_p99_ms": 14419.943,
+        "ttft_p50_ms": 11267.628,
+        "e2e_p99_ms": 21492.788,
+        "total_requests": 73,
+        "successful": 73,
+        "failed": 0,
+        "req_rate": 0.8006851125913585,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-08-35.json"
+      }
+    },
+    {
+      "label": "c512q2048-u4k-vu32",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        1846,
+        2527
+      ],
+      "packing": {
+        "launches": 678,
+        "R_histogram": {
+          "1": 502,
+          "2": 75,
+          "3": 43,
+          "4": 56,
+          "5": 2
+        },
+        "frac_R1": 0.7404129793510325,
+        "frac_Rge2": 0.25958702064896755,
+        "rows_by_R": {
+          "1": 193720,
+          "2": 62533,
+          "3": 63529,
+          "4": 113326,
+          "5": 4096
+        },
+        "total_packed_rows": 437204,
+        "mean_R": 1.4970501474926254,
+        "max_R": 5,
+        "chunk_rows_stats": {
+          "n": 1015,
+          "min": 6,
+          "max": 512,
+          "median": 512,
+          "mean": 430.7,
+          "p10": 128,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 105524722903,
+        "decode_ns": 71008258318,
+        "prefill_ticks": 832,
+        "decode_ticks": 3000,
+        "total_ticks": 3000,
+        "prefill_frac": 0.5977620848701047
+      },
+      "serving": {
+        "tok_s": 100.81168674280504,
+        "itl_p99_ms": 89.672,
+        "itl_p50_ms": 56.828,
+        "ttft_p99_ms": 32116.798,
+        "ttft_p50_ms": 29301.638,
+        "e2e_p99_ms": 39908.028,
+        "total_requests": 73,
+        "successful": 73,
+        "failed": 0,
+        "req_rate": 0.7930229668345654,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-11-03.json"
+      }
+    },
+    {
+      "label": "c512q2048-u512-vu1",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=512,min_tokens=512,max_tokens=512,variance=0",
+      "log_lines": [
+        2527,
+        2607
+      ],
+      "packing": {
+        "launches": 76,
+        "R_histogram": {
+          "1": 76
+        },
+        "frac_R1": 1.0,
+        "frac_Rge2": 0.0,
+        "rows_by_R": {
+          "1": 19903
+        },
+        "total_packed_rows": 19903,
+        "mean_R": 1.0,
+        "max_R": 1,
+        "chunk_rows_stats": {
+          "n": 76,
+          "min": 10,
+          "max": 512,
+          "median": 262.0,
+          "mean": 261.9,
+          "p10": 12,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 4467208351,
+        "decode_ns": 87021214795,
+        "prefill_ticks": 32,
+        "decode_ticks": 4000,
+        "total_ticks": 4000,
+        "prefill_frac": 0.04882812707211155
+      },
+      "serving": {
+        "tok_s": 43.48542691026975,
+        "itl_p99_ms": 21.853,
+        "itl_p50_ms": 21.82,
+        "ttft_p99_ms": 164.872,
+        "ttft_p50_ms": 163.593,
+        "e2e_p99_ms": 2939.557,
+        "total_requests": 32,
+        "successful": 32,
+        "failed": 0,
+        "req_rate": 0.35389971035824824,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-12-55.json"
+      }
+    },
+    {
+      "label": "c512q2048-u512-vu4",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=512,min_tokens=512,max_tokens=512,variance=0",
+      "log_lines": [
+        2607,
+        2780
+      ],
+      "packing": {
+        "launches": 169,
+        "R_histogram": {
+          "1": 137,
+          "2": 24,
+          "3": 8
+        },
+        "frac_R1": 0.8106508875739645,
+        "frac_Rge2": 0.1893491124260355,
+        "rows_by_R": {
+          "1": 33278,
+          "2": 17036,
+          "3": 4096
+        },
+        "total_packed_rows": 54410,
+        "mean_R": 1.2366863905325445,
+        "max_R": 3,
+        "chunk_rows_stats": {
+          "n": 209,
+          "min": 5,
+          "max": 512,
+          "median": 128,
+          "mean": 260.3,
+          "p10": 11,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 11927537205,
+        "decode_ns": 88364892527,
+        "prefill_ticks": 140,
+        "decode_ticks": 4000,
+        "total_ticks": 4000,
+        "prefill_frac": 0.11892759241024069
+      },
+      "serving": {
+        "tok_s": 132.63462737902344,
+        "itl_p99_ms": 34.106,
+        "itl_p50_ms": 27.196,
+        "ttft_p99_ms": 458.572,
+        "ttft_p50_ms": 269.843,
+        "e2e_p99_ms": 4595.366,
+        "total_requests": 95,
+        "successful": 95,
+        "failed": 0,
+        "req_rate": 1.0544175398332407,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-14-50.json"
+      }
+    },
+    {
+      "label": "c512q2048-u512-vu8",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=512,min_tokens=512,max_tokens=512,variance=0",
+      "log_lines": [
+        2780,
+        3025
+      ],
+      "packing": {
+        "launches": 242,
+        "R_histogram": {
+          "1": 193,
+          "2": 15,
+          "3": 21,
+          "4": 8,
+          "6": 5
+        },
+        "frac_R1": 0.7975206611570248,
+        "frac_Rge2": 0.2024793388429752,
+        "rows_by_R": {
+          "1": 49519,
+          "2": 2025,
+          "3": 17920,
+          "4": 13312,
+          "6": 5120
+        },
+        "total_packed_rows": 87896,
+        "mean_R": 1.43801652892562,
+        "max_R": 6,
+        "chunk_rows_stats": {
+          "n": 348,
+          "min": 9,
+          "max": 512,
+          "median": 128.0,
+          "mean": 252.6,
+          "p10": 12,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 15099488930,
+        "decode_ns": 67298119576,
+        "prefill_ticks": 179,
+        "decode_ticks": 3000,
+        "total_ticks": 3000,
+        "prefill_frac": 0.18325154338551575
+      },
+      "serving": {
+        "tok_s": 216.6162287592292,
+        "itl_p99_ms": 39.427,
+        "itl_p50_ms": 34.377,
+        "ttft_p99_ms": 739.718,
+        "ttft_p50_ms": 335.108,
+        "e2e_p99_ms": 5282.863,
+        "total_requests": 155,
+        "successful": 155,
+        "failed": 0,
+        "req_rate": 1.714085943316343,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-16-46.json"
+      }
+    },
+    {
+      "label": "c512q2048-u512-vu16",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=512,min_tokens=512,max_tokens=512,variance=0",
+      "log_lines": [
+        3025,
+        3244
+      ],
+      "packing": {
+        "launches": 215,
+        "R_histogram": {
+          "1": 132,
+          "2": 28,
+          "3": 41,
+          "4": 8,
+          "5": 1,
+          "6": 5
+        },
+        "frac_R1": 0.6139534883720931,
+        "frac_Rge2": 0.386046511627907,
+        "rows_by_R": {
+          "1": 32688,
+          "2": 14958,
+          "3": 30208,
+          "4": 14334,
+          "5": 1024,
+          "6": 5120
+        },
+        "total_packed_rows": 98332,
+        "mean_R": 1.758139534883721,
+        "max_R": 6,
+        "chunk_rows_stats": {
+          "n": 378,
+          "min": 9,
+          "max": 512,
+          "median": 128.0,
+          "mean": 260.1,
+          "p10": 12,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 22950648871,
+        "decode_ns": 90795952954,
+        "prefill_ticks": 261,
+        "decode_ticks": 4000,
+        "total_ticks": 4000,
+        "prefill_frac": 0.20176997380818237
+      },
+      "serving": {
+        "tok_s": 235.17114939087637,
+        "itl_p99_ms": 36.75,
+        "itl_p50_ms": 30.394,
+        "ttft_p99_ms": 5170.44,
+        "ttft_p50_ms": 4351.405,
+        "e2e_p99_ms": 9571.574,
+        "total_requests": 169,
+        "successful": 169,
+        "failed": 0,
+        "req_rate": 1.8400816818861108,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-18-45.json"
+      }
+    },
+    {
+      "label": "c512q2048-u512-vu32",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=512,min_tokens=512,max_tokens=512,variance=0",
+      "log_lines": [
+        3244,
+        3521
+      ],
+      "packing": {
+        "launches": 273,
+        "R_histogram": {
+          "1": 207,
+          "2": 29,
+          "3": 20,
+          "4": 11,
+          "5": 2,
+          "6": 4
+        },
+        "frac_R1": 0.7582417582417582,
+        "frac_Rge2": 0.24175824175824176,
+        "rows_by_R": {
+          "1": 50683,
+          "2": 19664,
+          "3": 12288,
+          "4": 16894,
+          "5": 1536,
+          "6": 4096
+        },
+        "total_packed_rows": 105161,
+        "mean_R": 1.4761904761904763,
+        "max_R": 6,
+        "chunk_rows_stats": {
+          "n": 403,
+          "min": 8,
+          "max": 512,
+          "median": 128,
+          "mean": 260.9,
+          "p10": 12,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 25092672334,
+        "decode_ns": 90790021462,
+        "prefill_ticks": 299,
+        "decode_ticks": 4000,
+        "total_ticks": 4000,
+        "prefill_frac": 0.2165351141920567
+      },
+      "serving": {
+        "tok_s": 230.4603502415111,
+        "itl_p99_ms": 39.488,
+        "itl_p50_ms": 30.903,
+        "ttft_p99_ms": 15259.786,
+        "ttft_p50_ms": 12388.566,
+        "e2e_p99_ms": 19461.968,
+        "total_requests": 165,
+        "successful": 165,
+        "failed": 0,
+        "req_rate": 1.825888686730497,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-20-58.json"
+      }
+    },
+    {
+      "label": "c1024q2048-u4k-vu1",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        12,
+        254
+      ],
+      "packing": {
+        "launches": 239,
+        "R_histogram": {
+          "1": 239
+        },
+        "frac_R1": 1.0,
+        "frac_Rge2": 0.0,
+        "rows_by_R": {
+          "1": 120295
+        },
+        "total_packed_rows": 120295,
+        "mean_R": 1.0,
+        "max_R": 1,
+        "chunk_rows_stats": {
+          "n": 239,
+          "min": 42,
+          "max": 1024,
+          "median": 512,
+          "mean": 503.3,
+          "p10": 44,
+          "p90": 1024,
+          "frac_le512": 0.6234309623430963,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 19916875760,
+        "decode_ns": 65341234778,
+        "prefill_ticks": 25,
+        "decode_ticks": 3000,
+        "total_ticks": 3000,
+        "prefill_frac": 0.23360681622334264
+      },
+      "serving": {
+        "tok_s": 35.32447208462192,
+        "itl_p99_ms": 21.923,
+        "itl_p50_ms": 21.865,
+        "ttft_p99_ms": 867.685,
+        "ttft_p50_ms": 860.578,
+        "e2e_p99_ms": 3646.228,
+        "total_requests": 25,
+        "successful": 25,
+        "failed": 0,
+        "req_rate": 0.2747703180197722,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-23-02.json"
+      }
+    },
+    {
+      "label": "c1024q2048-u4k-vu4",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        254,
+        682
+      ],
+      "packing": {
+        "launches": 425,
+        "R_histogram": {
+          "1": 393,
+          "2": 30,
+          "3": 2
+        },
+        "frac_R1": 0.9247058823529412,
+        "frac_Rge2": 0.07529411764705882,
+        "rows_by_R": {
+          "1": 200032,
+          "2": 40516,
+          "3": 4096
+        },
+        "total_packed_rows": 244644,
+        "mean_R": 1.08,
+        "max_R": 3,
+        "chunk_rows_stats": {
+          "n": 459,
+          "min": 4,
+          "max": 1024,
+          "median": 512,
+          "mean": 533.0,
+          "p10": 44,
+          "p90": 1024,
+          "frac_le512": 0.5860566448801743,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 47840881224,
+        "decode_ns": 67087250517,
+        "prefill_ticks": 330,
+        "decode_ticks": 3000,
+        "total_ticks": 3000,
+        "prefill_frac": 0.4162678057954806
+      },
+      "serving": {
+        "tok_s": 73.62624358262212,
+        "itl_p99_ms": 51.013,
+        "itl_p50_ms": 41.856,
+        "ttft_p99_ms": 2538.664,
+        "ttft_p50_ms": 1240.183,
+        "e2e_p99_ms": 8060.834,
+        "total_requests": 53,
+        "successful": 53,
+        "failed": 0,
+        "req_rate": 0.573177278184338,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-24-59.json"
+      }
+    },
+    {
+      "label": "c1024q2048-u4k-vu8",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        682,
+        1121
+      ],
+      "packing": {
+        "launches": 437,
+        "R_histogram": {
+          "1": 347,
+          "2": 84,
+          "3": 6
+        },
+        "frac_R1": 0.7940503432494279,
+        "frac_Rge2": 0.20594965675057209,
+        "rows_by_R": {
+          "1": 182074,
+          "2": 146598,
+          "3": 12288
+        },
+        "total_packed_rows": 340960,
+        "mean_R": 1.2196796338672768,
+        "max_R": 3,
+        "chunk_rows_stats": {
+          "n": 533,
+          "min": 23,
+          "max": 1024,
+          "median": 940,
+          "mean": 639.7,
+          "p10": 128,
+          "p90": 1024,
+          "frac_le512": 0.45590994371482174,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 54426426378,
+        "decode_ns": 46388632074,
+        "prefill_ticks": 338,
+        "decode_ticks": 2000,
+        "total_ticks": 2000,
+        "prefill_frac": 0.5398640561609501
+      },
+      "serving": {
+        "tok_s": 101.15356294199056,
+        "itl_p99_ms": 83.601,
+        "itl_p50_ms": 63.196,
+        "ttft_p99_ms": 4762.762,
+        "ttft_p50_ms": 1419.988,
+        "e2e_p99_ms": 11531.526,
+        "total_requests": 73,
+        "successful": 73,
+        "failed": 0,
+        "req_rate": 0.7937450386719672,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-26-57.json"
+      }
+    },
+    {
+      "label": "c1024q2048-u4k-vu16",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        1121,
+        1602
+      ],
+      "packing": {
+        "launches": 479,
+        "R_histogram": {
+          "1": 381,
+          "2": 92,
+          "3": 6
+        },
+        "frac_R1": 0.7954070981210856,
+        "frac_Rge2": 0.2045929018789144,
+        "rows_by_R": {
+          "1": 203060,
+          "2": 157691,
+          "3": 12288
+        },
+        "total_packed_rows": 373039,
+        "mean_R": 1.2171189979123174,
+        "max_R": 3,
+        "chunk_rows_stats": {
+          "n": 583,
+          "min": 23,
+          "max": 1024,
+          "median": 940,
+          "mean": 639.9,
+          "p10": 128,
+          "p90": 1024,
+          "frac_le512": 0.45797598627787306,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 61455651972,
+        "decode_ns": 46891882231,
+        "prefill_ticks": 392,
+        "decode_ticks": 2000,
+        "total_ticks": 2000,
+        "prefill_frac": 0.5672085887700652
+      },
+      "serving": {
+        "tok_s": 101.92234240356238,
+        "itl_p99_ms": 86.944,
+        "itl_p50_ms": 63.717,
+        "ttft_p99_ms": 13024.993,
+        "ttft_p50_ms": 10407.735,
+        "e2e_p99_ms": 20724.964,
+        "total_requests": 73,
+        "successful": 73,
+        "failed": 0,
+        "req_rate": 0.8012417613030426,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-29-03.json"
+      }
+    },
+    {
+      "label": "c1024q2048-u4k-vu32",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        1602,
+        2220
+      ],
+      "packing": {
+        "launches": 616,
+        "R_histogram": {
+          "1": 513,
+          "2": 97,
+          "3": 6
+        },
+        "frac_R1": 0.8327922077922078,
+        "frac_Rge2": 0.1672077922077922,
+        "rows_by_R": {
+          "1": 264489,
+          "2": 160426,
+          "3": 12288
+        },
+        "total_packed_rows": 437203,
+        "mean_R": 1.176948051948052,
+        "max_R": 3,
+        "chunk_rows_stats": {
+          "n": 725,
+          "min": 26,
+          "max": 1024,
+          "median": 512,
+          "mean": 603.0,
+          "p10": 128,
+          "p90": 1024,
+          "frac_le512": 0.5006896551724138,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 62239720402,
+        "decode_ns": 46909489843,
+        "prefill_ticks": 394,
+        "decode_ticks": 2000,
+        "total_ticks": 2000,
+        "prefill_frac": 0.5702260260270745
+      },
+      "serving": {
+        "tok_s": 101.44555899662595,
+        "itl_p99_ms": 92.884,
+        "itl_p50_ms": 63.822,
+        "ttft_p99_ms": 31510.199,
+        "ttft_p50_ms": 27616.5,
+        "e2e_p99_ms": 40324.43,
+        "total_requests": 73,
+        "successful": 73,
+        "failed": 0,
+        "req_rate": 0.7968929093676632,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-31-32.json"
+      }
+    },
+    {
+      "label": "c512q1024-u4k-vu1",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        12,
+        344
+      ],
+      "packing": {
+        "launches": 329,
+        "R_histogram": {
+          "1": 329
+        },
+        "frac_R1": 1.0,
+        "frac_Rge2": 0.0,
+        "rows_by_R": {
+          "1": 120294
+        },
+        "total_packed_rows": 120294,
+        "mean_R": 1.0,
+        "max_R": 1,
+        "chunk_rows_stats": {
+          "n": 329,
+          "min": 42,
+          "max": 512,
+          "median": 512,
+          "mean": 365.6,
+          "p10": 128,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 20990762835,
+        "decode_ns": 65398521225,
+        "prefill_ticks": 25,
+        "decode_ticks": 3000,
+        "total_ticks": 3000,
+        "prefill_frac": 0.24297877987299066
+      },
+      "serving": {
+        "tok_s": 34.85943959467071,
+        "itl_p99_ms": 21.918,
+        "itl_p50_ms": 21.893,
+        "ttft_p99_ms": 914.562,
+        "ttft_p50_ms": 907.309,
+        "e2e_p99_ms": 3695.588,
+        "total_requests": 25,
+        "successful": 25,
+        "failed": 0,
+        "req_rate": 0.2711530771209607,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-33-38.json"
+      }
+    },
+    {
+      "label": "c512q1024-u4k-vu4",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        344,
+        927
+      ],
+      "packing": {
+        "launches": 580,
+        "R_histogram": {
+          "1": 533,
+          "2": 45,
+          "3": 2
+        },
+        "frac_R1": 0.9189655172413793,
+        "frac_Rge2": 0.08103448275862069,
+        "rows_by_R": {
+          "1": 201452,
+          "2": 37191,
+          "3": 2048
+        },
+        "total_packed_rows": 240691,
+        "mean_R": 1.0844827586206895,
+        "max_R": 3,
+        "chunk_rows_stats": {
+          "n": 629,
+          "min": 2,
+          "max": 512,
+          "median": 512,
+          "mean": 382.7,
+          "p10": 128,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 46804135210,
+        "decode_ns": 67118550738,
+        "prefill_ticks": 417,
+        "decode_ticks": 3000,
+        "total_ticks": 3000,
+        "prefill_frac": 0.41084121938069246
+      },
+      "serving": {
+        "tok_s": 73.312577567686,
+        "itl_p99_ms": 50.088,
+        "itl_p50_ms": 42.94,
+        "ttft_p99_ms": 2986.71,
+        "ttft_p50_ms": 1284.114,
+        "e2e_p99_ms": 8472.053,
+        "total_requests": 52,
+        "successful": 52,
+        "failed": 0,
+        "req_rate": 0.571209774276247,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-35-37.json"
+      }
+    },
+    {
+      "label": "c512q1024-u4k-vu8",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        927,
+        1504
+      ],
+      "packing": {
+        "launches": 575,
+        "R_histogram": {
+          "1": 391,
+          "2": 178,
+          "3": 6
+        },
+        "frac_R1": 0.68,
+        "frac_Rge2": 0.32,
+        "rows_by_R": {
+          "1": 152774,
+          "2": 169991,
+          "3": 6144
+        },
+        "total_packed_rows": 328909,
+        "mean_R": 1.3304347826086957,
+        "max_R": 3,
+        "chunk_rows_stats": {
+          "n": 765,
+          "min": 23,
+          "max": 512,
+          "median": 512,
+          "mean": 429.9,
+          "p10": 128,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 55102637596,
+        "decode_ns": 46246456324,
+        "prefill_ticks": 459,
+        "decode_ticks": 2000,
+        "total_ticks": 2000,
+        "prefill_frac": 0.5436914674293518
+      },
+      "serving": {
+        "tok_s": 99.17028390231864,
+        "itl_p99_ms": 87.611,
+        "itl_p50_ms": 63.079,
+        "ttft_p99_ms": 5858.099,
+        "ttft_p50_ms": 1653.151,
+        "e2e_p99_ms": 13512.018,
+        "total_requests": 70,
+        "successful": 70,
+        "failed": 0,
+        "req_rate": 0.7771965823065724,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-37-35.json"
+      }
+    },
+    {
+      "label": "c512q1024-u4k-vu16",
+      "kind": "throughput",
+      "prompt_options": "num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0",
+      "log_lines": [
+        1504,
+        2155
+      ],
+      "packing": {
+        "launches": 649,
+        "R_histogram": {
+          "1": 455,
+          "2": 188,
+          "3": 6
+        },
+        "frac_R1": 0.7010785824345146,
+        "frac_Rge2": 0.29892141756548535,
+        "rows_by_R": {
+          "1": 176993,
+          "2": 177820,
+          "3": 6144
+        },
+        "total_packed_rows": 360957,
+        "mean_R": 1.308166409861325,
+        "max_R": 3,
+        "chunk_rows_stats": {
+          "n": 849,
+          "min": 23,
+          "max": 512,
+          "median": 512,
+          "mean": 425.2,
+          "p10": 128,
+          "p90": 512,
+          "frac_le512": 1.0,
+          "frac_ge2048": 0.0
+        }
+      },
+      "walltime": {
+        "prefill_ns": 62563744197,
+        "decode_ns": 46755456330,
+        "prefill_ticks": 515,
+        "decode_ticks": 2000,
+        "total_ticks": 2000,
+        "prefill_frac": 0.5723033455732949
+      },
+      "serving": {
+        "tok_s": 99.13999640105149,
+        "itl_p99_ms": 72.107,
+        "itl_p50_ms": 64.482,
+        "ttft_p99_ms": 15109.209,
+        "ttft_p50_ms": 10973.895,
+        "e2e_p99_ms": 23040.993,
+        "total_requests": 70,
+        "successful": 70,
+        "failed": 0,
+        "req_rate": 0.7724621269004458,
+        "result_file": "google_gemma-4-12B-it_2026-07-22-04-39-43.json"
+      }
+    }
+  ],
+  "note": "R = requests packed per batched-prefill launch; chunk_rows = per-request rows that launch; walltime split from cumulative PACKLOG WALL counters diffed over each cell's log-line bracket."
+}

@@ -1,0 +1,79 @@
+{
+  "engine": "plow",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, single GPU (sm_120 / cc 12.0, 188 SMs)",
+  "cuda_toolkit_on_host": "13.0 (V13.0.88)",
+  "model": "gemma-4-12B",
+  "model_dir": "/workspace/models/gemma-4-12B-it (fp8 twins /workspace/models/gemma-4-12B-it/fp8/, 10.91 GB e4m3 + f32 scales)",
+  "dtype_compute": "fp8 weight-only w8a16 (per-output-channel e4m3); attention + KV stay bf16; prefill GEMM stays bf16",
+  "tp": 1,
+  "batch": 1,
+  "metric": "tpot_ms",
+  "metric_convention": "decode TPOT ms/tok, greedy, 112 timed steps after 16 warmup (repo methodology). LOWER is better. Contexts are primed by feeding an n_prompt-length token stream through the DECODE program (one token/launch); the steady-state TPOT is a function of KV length, independent of the priming path.",
+  "harness": "qwen3_sm120_chat.cu (committed rtx HEAD) LINKED against the Gemma decode object libplow_interp_sm120_gemma.a (PLOW_NV_GEMMA=1 PLOW_NV_FA_GF=2, which carries the GEMV_FP8/GEMV_GLU_FP8 arms) \u2014 a link choice, no source edits. The CMake qwen3_sm120_chat target links the DEFAULT (Qwen, non-GEMMA) object, which lacks the fp8 Gemma arms and launch-faults on a Gemma fp8 packet; this is the same manual link the G7 landing used (scratchpad gemma_fp8_chat). Binary rebuilt from committed HEAD.",
+  "packet": "g12_fp8_128k.pkt: PLOW_FP8=1 PLOW_UNISEG=1 gemma4 builder, max_ctx=131072. bf16 model weights feed (unused) prefill buckets; fp8/ twins feed the decode GEMV_FP8.",
+  "baseline_note": "vllm_fp8 / vllm_bf16 columns from perf-data/gemma4-12b-vllm-sm120.json (0.25.1, TRITON_ATTN, CUDA graphs, same box); plow_bf16 from the Gemma-4-12B bf16 sm_120 decode sweep. These are REFERENCE columns, not re-transcribed into all-perf-data (only the plow_fp8 tpot_ms rows are).",
+  "correctness": "fp8 DECODE is faithful to bf16: on the France chat prompt the fp8 and bf16 greedy 24-token streams are BYTE-IDENTICAL, and identical between the pre-merge (T3) binary and the merged HEAD build (fp8 GEMV is decode-only, untouched by T3/T4). On the poem prompt fp8 tracks bf16 within a 2-token near-tie (bf16-vs-fp8 argmax coarseness) then converges. GEMV_FP8 oracle relL2 ~1.6e-3 vs dequantized-weight f32 (G7). NOTE: the scratchpad's minimal (library-free) chat tokenizer yields degenerate greedy loops on short prompts on BOTH bf16 and fp8, so coherence-vs-HF is not reproduced here; the fp8==bf16 equivalence is the parity result.",
+  "campaigns": [
+    {
+      "campaign": "G7-fp8-longctx",
+      "date": "2026-07-19",
+      "note": "Deferred G7 long-ctx points, now measured on the MERGED rtx HEAD (T3 a026a72 + T4 af4a953). 16k/32k/64k/128k primed via decode (the fast bf16 prefill could not prime the fp8 decode: no single committed harness does both prefill and fp8, and source edits were out of scope). TPOT is KV-length-dependent so the priming path does not affect the steady-state number.",
+      "results": [
+        {
+          "ctx": 1024,
+          "plow_fp8_tpot_ms": 11.25,
+          "vllm_fp8_tpot_ms": 12.46,
+          "plow_bf16_tpot_ms": 18.48,
+          "vllm_bf16_tpot_ms": 19.78,
+          "plow_fp8_over_vllm_fp8": 0.903,
+          "plow_fp8_over_plow_bf16": 0.609
+        },
+        {
+          "ctx": 4096,
+          "plow_fp8_tpot_ms": 11.38,
+          "vllm_fp8_tpot_ms": 12.97,
+          "plow_bf16_tpot_ms": 18.54,
+          "vllm_bf16_tpot_ms": 20.25,
+          "plow_fp8_over_vllm_fp8": 0.877,
+          "plow_fp8_over_plow_bf16": 0.614
+        },
+        {
+          "ctx": 16384,
+          "plow_fp8_tpot_ms": 12.16,
+          "vllm_fp8_tpot_ms": 14.27,
+          "plow_bf16_tpot_ms": 19.07,
+          "vllm_bf16_tpot_ms": 21.66,
+          "plow_fp8_over_vllm_fp8": 0.852,
+          "plow_fp8_over_plow_bf16": 0.638
+        },
+        {
+          "ctx": 32768,
+          "plow_fp8_tpot_ms": 12.87,
+          "vllm_fp8_tpot_ms": 15.98,
+          "plow_bf16_tpot_ms": 19.76,
+          "vllm_bf16_tpot_ms": 23.35,
+          "plow_fp8_over_vllm_fp8": 0.805,
+          "plow_fp8_over_plow_bf16": 0.651
+        },
+        {
+          "ctx": 65536,
+          "plow_fp8_tpot_ms": 14.21,
+          "vllm_fp8_tpot_ms": 17.47,
+          "plow_bf16_tpot_ms": 21.12,
+          "vllm_bf16_tpot_ms": 24.76,
+          "plow_fp8_over_vllm_fp8": 0.813,
+          "plow_fp8_over_plow_bf16": 0.673
+        },
+        {
+          "ctx": 131072,
+          "plow_fp8_tpot_ms": 17.04,
+          "vllm_fp8_tpot_ms": 20.71,
+          "plow_bf16_tpot_ms": 23.98,
+          "vllm_bf16_tpot_ms": 28.26,
+          "plow_fp8_over_vllm_fp8": 0.823,
+          "plow_fp8_over_plow_bf16": 0.711
+        }
+      ]
+    }
+  ]
+}

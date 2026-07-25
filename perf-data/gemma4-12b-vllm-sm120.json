@@ -1,0 +1,118 @@
+{
+  "engine": "vllm",
+  "campaign": "B1",
+  "run_mode": "native venv, served (openai endpoint + `vllm bench serve`, random dataset)",
+  "vllm_version": "0.25.1",
+  "torch_version": "2.11.0+cu130",
+  "torch_cuda": "13.0",
+  "driver_version": "580.82.07",
+  "cuda_toolkit_on_host": "13.0 (V13.0.88)",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, single GPU (sm_120 / cc 12.0, 188 SMs)",
+  "date": "2026-07-18",
+  "model": "/workspace/models/gemma-4-12B-it",
+  "model_desc": "google/gemma-4-12B-it (Gemma4UnifiedForConditionalGeneration, model_type gemma4_unified)",
+  "model_revision": "12ace6d648d72bd41519e140f1185f34d38c7e3d",
+  "dtype_compute": "bfloat16",
+  "attention_backend": "TRITON_ATTN (forced: Gemma4 has heterogeneous head dims head_dim=256/global_head_dim=512, FA4 unavailable) — same in all three configs",
+  "tp": 1,
+  "batch": 1,
+  "concurrency": 1,
+  "num_prompts_per_point": 3,
+  "output_len": 128,
+  "max_model_len_served": 132096,
+  "max_num_batched_tokens": 8192,
+  "gpu_memory_utilization": 0.9,
+  "cuda_graphs": "ON (not --enforce-eager); cudagraph_mode FULL_AND_PIECEWISE; 'Graph capturing finished ... took 0.62-0.65 GiB' in every config",
+  "sanity": "per-config chat gate ('What is the capital of France?' -> 'The capital of France is Paris.'); coherent in all three configs",
+  "schema": "each config.results row = {input_len, ttft_ms, prefill_tok_s, tpot_ms, itl_ms, decode_tok_s}",
+  "prefill_tok_s_convention": "DERIVED as input_len / (Mean_TTFT_ms/1000) by the harness. vLLM bench serve reports no standalone prefill throughput; TTFT includes prefill + the first decode token + scheduling, so this slightly UNDER-reports true prefill tok/s. Kept for consistency with the repo's other served vLLM files (same derivation).",
+  "notes": [
+    "Reproduced with the repo harness perf-data/bench_vllm_cuda.sh, run from a scratch copy with ONE line changed: the hardcoded CUDA-12.8 PATH (line 58) replaced by PATH=/workspace/venvs/vllm/bin:/usr/local/cuda/bin:$PATH (venv bin first so flashinfer's ninja JIT is found; this box has no cuda-12.8). No other harness change.",
+    "The RTX 5090 run of this model (gemma4-12b-vllm-cuda-5090.json) REQUIRED VLLM_USE_FLASHINFER_SAMPLER=0 because that host had CUDA 12.8 (< 12.9) and flashinfer could not emit compute_120f. This box has nvcc 13.0, so the flashinfer sampler JIT works and the workaround is NOT needed — vLLM serves out of the box on sm_120 here.",
+    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True set for all three configs (defensive against long-ctx fragmentation; 96 GB card has ample headroom regardless).",
+    "gpu-memory-utilization is CONSTANT at 0.90 across all three configs (unlike the 32 GB 5090 run which had to hand-tune bf16 to 0.92). On this 96 GB card bf16 weights (22.28 GiB ckpt) leave a 61.05 GiB / 1.67M-token KV pool at util 0.90 — 128k fits in every config, so this is a clean A/B.",
+    "DECODE metric = tpot_ms (== itl_ms at concurrency 1). Lower is better; this is the campaign target.",
+    "ctx=1024 ttft_ms carries first-shape warm-up (torch.compile specialization / cudagraph capture for the smallest bench shape); a chat warm-up request precedes the sweep but the 1024 point still sees some of it. Decode TPOT is unaffected. 4k+ TTFT is clean.",
+    "Every GPU-touching command ran inside `gpulease b1-12b ...`; one lease per config spanning serve -> sweep -> shutdown -> VRAM drain, exactly as the harness enforces. No server ever ran outside a lease.",
+    "NO OOM and NO failed points: all 3 configs x 7 contexts (1k..128k) completed."
+  ],
+  "configs": [
+    {
+      "config": "bf16",
+      "config_desc": "bf16 (--dtype bfloat16)",
+      "attention_backend": "TRITON_ATTN",
+      "gpu_memory_utilization": 0.9,
+      "weights_ckpt_gib": 22.28,
+      "available_kv_gib": 61.05,
+      "kv_cache_tokens": 1668482,
+      "max_concurrency_at_132k": 12.63,
+      "vram_used_mib": 93125,
+      "vram_total_mib": 97887,
+      "max_model_len_served": 132096,
+      "sanity_generated": "The capital of France is Paris.",
+      "results": [
+        {"input_len": 1024,   "ttft_ms": 117.46,   "prefill_tok_s": 8717.9,  "tpot_ms": 19.780, "itl_ms": 19.780, "decode_tok_s": 50.56},
+        {"input_len": 4096,   "ttft_ms": 323.48,   "prefill_tok_s": 12662.3, "tpot_ms": 20.250, "itl_ms": 20.250, "decode_tok_s": 49.38},
+        {"input_len": 16384,  "ttft_ms": 1502.26,  "prefill_tok_s": 10906.2, "tpot_ms": 21.660, "itl_ms": 21.660, "decode_tok_s": 46.17},
+        {"input_len": 32768,  "ttft_ms": 2815.15,  "prefill_tok_s": 11639.9, "tpot_ms": 23.350, "itl_ms": 23.470, "decode_tok_s": 42.83},
+        {"input_len": 65536,  "ttft_ms": 8469.73,  "prefill_tok_s": 7737.7,  "tpot_ms": 24.760, "itl_ms": 25.230, "decode_tok_s": 40.39},
+        {"input_len": 98304,  "ttft_ms": 12392.77, "prefill_tok_s": 7932.4,  "tpot_ms": 26.510, "itl_ms": 27.080, "decode_tok_s": 37.72},
+        {"input_len": 131072, "ttft_ms": 16271.32, "prefill_tok_s": 8055.4,  "tpot_ms": 28.260, "itl_ms": 28.940, "decode_tok_s": 35.39}
+      ],
+      "notes": [
+        "bf16 reaches full 128k on this 96 GB card (KV pool 1,668,482 tokens >> 132,096). On the 32 GB 5090 bf16 OOMed past 16k — the card, not the model, was the limit there."
+      ]
+    },
+    {
+      "config": "fp8",
+      "config_desc": "fp8 weight-only (--quantization fp8, dynamic e4m3 from the bf16 ckpt)",
+      "attention_backend": "TRITON_ATTN",
+      "gpu_memory_utilization": 0.9,
+      "available_kv_gib": 71.21,
+      "kv_cache_tokens": 1946180,
+      "max_concurrency_at_132k": 14.73,
+      "vram_used_mib": 93179,
+      "vram_total_mib": 97887,
+      "max_model_len_served": 132096,
+      "sanity_generated": "The capital of France is Paris.",
+      "results": [
+        {"input_len": 1024,   "ttft_ms": 94.61,    "prefill_tok_s": 10823.4, "tpot_ms": 12.460, "itl_ms": 12.490, "decode_tok_s": 80.26},
+        {"input_len": 4096,   "ttft_ms": 244.71,   "prefill_tok_s": 16738.2, "tpot_ms": 12.970, "itl_ms": 12.970, "decode_tok_s": 77.10},
+        {"input_len": 16384,  "ttft_ms": 1220.76,  "prefill_tok_s": 13421.1, "tpot_ms": 14.270, "itl_ms": 14.380, "decode_tok_s": 70.08},
+        {"input_len": 32768,  "ttft_ms": 2438.73,  "prefill_tok_s": 13436.5, "tpot_ms": 15.980, "itl_ms": 16.200, "decode_tok_s": 62.58},
+        {"input_len": 65536,  "ttft_ms": 7663.76,  "prefill_tok_s": 8551.4,  "tpot_ms": 17.470, "itl_ms": 17.990, "decode_tok_s": 57.24},
+        {"input_len": 98304,  "ttft_ms": 11645.18, "prefill_tok_s": 8441.6,  "tpot_ms": 18.910, "itl_ms": 19.850, "decode_tok_s": 52.88},
+        {"input_len": 131072, "ttft_ms": 15520.48, "prefill_tok_s": 8445.1,  "tpot_ms": 20.710, "itl_ms": 21.740, "decode_tok_s": 48.29}
+      ],
+      "notes": [
+        "fp8 weights free ~10 GiB vs bf16 (available KV 61.05 -> 71.21 GiB); decode TPOT -30% to -37% vs bf16 across the ladder."
+      ]
+    },
+    {
+      "config": "fp8kv",
+      "config_desc": "fp8 weights + fp8 KV cache (--quantization fp8 --kv-cache-dtype fp8)",
+      "attention_backend": "TRITON_ATTN",
+      "gpu_memory_utilization": 0.9,
+      "available_kv_gib": 71.21,
+      "kv_cache_tokens": 3892361,
+      "max_concurrency_at_132k": 29.47,
+      "vram_used_mib": 93179,
+      "vram_total_mib": 97887,
+      "max_model_len_served": 132096,
+      "sanity_generated": "The capital of France is Paris.",
+      "results": [
+        {"input_len": 1024,   "ttft_ms": 80.12,    "prefill_tok_s": 12780.8, "tpot_ms": 12.820, "itl_ms": 12.820, "decode_tok_s": 78.00},
+        {"input_len": 4096,   "ttft_ms": 196.38,   "prefill_tok_s": 20857.5, "tpot_ms": 13.090, "itl_ms": 13.090, "decode_tok_s": 76.39},
+        {"input_len": 16384,  "ttft_ms": 868.07,   "prefill_tok_s": 18874.1, "tpot_ms": 13.950, "itl_ms": 14.020, "decode_tok_s": 71.68},
+        {"input_len": 32768,  "ttft_ms": 1536.75,  "prefill_tok_s": 21322.9, "tpot_ms": 15.050, "itl_ms": 15.290, "decode_tok_s": 66.45},
+        {"input_len": 65536,  "ttft_ms": 4316.36,  "prefill_tok_s": 15183.2, "tpot_ms": 15.780, "itl_ms": 16.250, "decode_tok_s": 63.37},
+        {"input_len": 98304,  "ttft_ms": 6200.49,  "prefill_tok_s": 15854.2, "tpot_ms": 16.570, "itl_ms": 17.210, "decode_tok_s": 60.35},
+        {"input_len": 131072, "ttft_ms": 8097.43,  "prefill_tok_s": 16186.9, "tpot_ms": 17.300, "itl_ms": 18.260, "decode_tok_s": 57.80}
+      ],
+      "notes": [
+        "Same 71.21 GiB KV pool holds 3,892,361 tokens (exactly 2x fp8's 1,946,180) because fp8 KV halves bytes/token.",
+        "fp8kv's biggest win is long-ctx PREFILL/TTFT: at 128k TTFT is 8097 ms vs fp8's 15520 ms (-48%) and bf16's 16271 ms (-50%) — the fp8 KV path also speeds the attention over the growing cache. Decode TPOT is within ~1 ms of fp8 at short ctx and pulls ahead as ctx grows (128k: 17.30 vs 20.71 ms, -16% vs fp8)."
+      ]
+    }
+  ]
+}

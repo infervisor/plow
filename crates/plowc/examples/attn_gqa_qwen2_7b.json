@@ -1,0 +1,11 @@
+{
+  "name": "attn-gqa-qwen2.5-7b",
+  "note": "QKV attention only, GQA (Qwen2.5-7B): hidden 3584, 28 query heads, 4 KV heads, head_dim 128. Fused QKV projection = (28+4+4)*128 = 4608; o_proj from 28*128 = 3584. GQA shows up as the smaller KV slice of the projection vs MHA.",
+  "hidden": 3584,
+  "ops": [
+    { "op": "norm" },
+    { "op": "gemm", "n": 4608, "k": 3584 },
+    { "op": "flash", "heads": 28, "head_dim": 128 },
+    { "op": "gemm", "n": 3584, "k": 3584 }
+  ]
+}

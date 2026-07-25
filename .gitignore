@@ -1,0 +1,20 @@
+# Local-only plans / research scratchpad for coding agents
+plans/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+target/
+plow-out/
+build/.claude/worktrees/
+runtime/ubench/build/
+
+# Claude Code agent worktrees + session state (lives at .claude/, not build/.claude/)
+.claude/
+build/
+build-*/
+*.log
+__pycache__block-assets/
+__pycache__

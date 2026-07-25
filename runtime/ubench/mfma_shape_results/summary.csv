@@ -1,0 +1,10 @@
+kernel,mfma,tile,waves,chains_per_wave,acc_vgpr,MfmaUtil_q,MfmaUtil_gate,MfmaUtil_down,TFs_q,TFs_gate,TFs_down,source
+hipBLASLt_bf16,16x16x32,256x256/256x160,4(occ2),40,160,57.6,55.3,62.5,1619,718,766,library
+plow_gemm_c5,32x32x16,192x256,8(occ2),12,192,24.0,32.2,36.7,552,694,773,production
+plow_gemm_c0,32x32x16,256x256,8(occ2),16,256,22.8,21.5,22.7,NA,NA,NA,production
+m16_128x256_o2,16x16x32,128x256,8(occ2),16,64,23.5,26.1,19.7,543,603,472,microbench
+m16_192x256_o2,16x16x32,192x256,8(occ2),24,96,19.7,26.7,29.6,469,605,661,microbench
+m16_256x256_o2,16x16x32,256x256,8(occ2),32,128,25.3,26.4,23.0,620,615,549,microbench
+m16_256x160_w4_o2,16x16x32,256x160,4(occ1*),40,160,17.8,22.9,26.1,426,540,616,microbench
+m16_192x256_w4_o2,16x16x32,192x256,4(occ1*),48,192,16.8,21.9,25.1,NA,NA,NA,microbench
+m16_256x256_w4_o2,16x16x32,256x256,4(occ1*),64,256,22.8,22.4,20.3,NA,NA,NA,microbench

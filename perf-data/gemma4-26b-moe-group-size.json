@@ -1,0 +1,26 @@
+{
+  "campaign": "B-26b-batch",
+  "question": "Is a sorted register-weight-stationary MoE expert path worth shipping over channel-major-L2, at the batched-decode target B={4,8}?",
+  "method": "Monte-Carlo random top-k routing, k=8 distinct experts/token, E=128, 20000 trials/point; group = slots routed to same expert.",
+  "routing": {"experts": 128, "top_k": 8},
+  "distribution": [
+    {"B": 1,  "slots": 8,   "distinct_experts": 8.0,   "avg_group": 1.000, "max_group": 1,  "frac_slots_in_groups_ge2_pct": 0.0,  "hbm_read_save_ceiling_pct": 0.0},
+    {"B": 2,  "slots": 16,  "distinct_experts": 15.5,  "avg_group": 1.032, "max_group": 2,  "frac_slots_in_groups_ge2_pct": 6.2,  "hbm_read_save_ceiling_pct": 3.1},
+    {"B": 4,  "slots": 32,  "distinct_experts": 29.1,  "avg_group": 1.099, "max_group": 4,  "frac_slots_in_groups_ge2_pct": 17.6, "hbm_read_save_ceiling_pct": 9.0},
+    {"B": 8,  "slots": 64,  "distinct_experts": 51.6,  "avg_group": 1.239, "max_group": 6,  "frac_slots_in_groups_ge2_pct": 36.3, "hbm_read_save_ceiling_pct": 19.3},
+    {"B": 16, "slots": 128, "distinct_experts": 82.4,  "avg_group": 1.553, "max_group": 8,  "frac_slots_in_groups_ge2_pct": 62.0, "hbm_read_save_ceiling_pct": 35.6},
+    {"B": 32, "slots": 256, "distinct_experts": 111.8, "avg_group": 2.290, "max_group": 11, "frac_slots_in_groups_ge2_pct": 86.5, "hbm_read_save_ceiling_pct": 56.3}
+  ],
+  "verdict": {
+    "target_B_4_8": "sort NOT worth shipping",
+    "reason": "avg group 1.10/1.24 at B=4/8; HBM-read save ceiling 9%/19.3%, already captured by channel-major-L2 (co-routed slots adjacent -> reuse distance ~1 expert row << L2). Sort recovers only the L2-missed slice, at the cost of an align/sort packet on the decode critical path + MM-accumulator registers in an already register-bound (219 reg, 1 block/SM) megakernel — the exact op74 p9-batch implemented and measured-rejected.",
+    "crossover_B": 16,
+    "crossover_note": "grouping profitable (36-56% ceiling) at B>=16 IF register pressure solved (e.g. separate non-megakernel expert launch)."
+  },
+  "measured_tpot_scaling_context": {
+    "fp8_B1_to_B8_tpot_ratio": 2.27,
+    "bf16_B1_to_B8_tpot_ratio": 2.12,
+    "distinct_expert_traffic_B1_to_B8_ratio": 6.45,
+    "implication": "TPOT scales far below distinct-expert-traffic ratio -> expert-weight streaming is a minority of decode cost (shared q/k/v/o/lm_head GEMVs + fixed attention/router/sampling dominate); perfecting the <=19% expert-collision slice is a low-single-digit end-to-end lever at B<=8."
+  }
+}

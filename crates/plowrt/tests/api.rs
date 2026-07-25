@@ -1,0 +1,155 @@
+//! OpenAI API surface: `/v1/models`, non-streaming and streaming
+//! `/v1/chat/completions`, over the CPU backend.
+
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
+use plowrt::device::cpu::CpuBackend;
+use plowrt::device::Backend;
+use plowrt::exec::ExecutorSet;
+use plowrt::orch::Registry;
+use plowrt::serve::mux::{self, MuxConfig};
+use plowrt::serve::{app, AppState};
+use tower::ServiceExt;
+
+mod common;
+
+use std::sync::atomic::{AtomicU32, Ordering};
+static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn make_app() -> axum::Router {
+    // Unique dir per call — the tests run in parallel and must not share assets.
+    let n = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("plowrt_api_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    common::write_bundle(&dir, "api-model");
+
+    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new(4));
+    let execset = Arc::new(ExecutorSet::bringup(backend).unwrap());
+    let mut registry = Registry::new();
+    registry.load(&dir, None).unwrap();
+    let state = Arc::new(AppState::new(registry, execset));
+
+    // Match the production shape: install a bucket muxer per registered slug.
+    let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
+    for slug in slugs {
+        let bundle = state.registry.get(&slug).unwrap();
+        let m = mux::spawn(
+            slug.clone(),
+            bundle,
+            Arc::clone(&state),
+            MuxConfig::default(),
+        );
+        state.install_mux(slug, m);
+    }
+    app(state)
+}
+
+async fn body_string(resp: axum::response::Response) -> String {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn lists_models() {
+    let resp = make_app()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("api-model"));
+    assert!(body.contains("\"object\":\"list\""));
+}
+
+#[tokio::test]
+async fn non_stream_completion() {
+    let req_body = serde_json::json!({
+        "model": "api-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": false,
+        "max_tokens": 4
+    });
+    let resp = make_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("\"object\":\"chat.completion\""));
+    assert!(body.contains("api-model"));
+}
+
+#[tokio::test]
+async fn stream_completion_terminates() {
+    let req_body = serde_json::json!({
+        "model": "api-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true,
+        "max_tokens": 4
+    });
+    let resp = make_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("chat.completion.chunk"));
+    assert!(body.contains("[DONE]"));
+
+    let frames: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    let first_delta = &frames[0]["choices"][0]["delta"];
+    assert_eq!(first_delta["role"], "assistant");
+    assert!(first_delta.get("content").is_none());
+    let second_delta = &frames[1]["choices"][0]["delta"];
+    assert!(second_delta.get("role").is_none());
+    assert!(second_delta["content"].is_string());
+    let request_id = frames[0]["id"].as_str().unwrap();
+    assert!(frames.iter().all(|frame| frame["id"] == request_id));
+}
+
+#[tokio::test]
+async fn unknown_model_404() {
+    let req_body = serde_json::json!({
+        "model": "does-not-exist",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let resp = make_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

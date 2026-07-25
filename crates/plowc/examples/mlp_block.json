@@ -1,0 +1,14 @@
+{
+  "name": "mlp-block",
+  "hidden": 512,
+  "ops": [
+    { "op": "norm" },
+    { "op": "gemm", "n": 512, "k": 512 },
+    { "op": "flash", "heads": 8, "head_dim": 64 },
+    { "op": "gemm", "n": 512, "k": 512 },
+    { "op": "norm" },
+    { "op": "gemm", "n": 1024, "k": 512 },
+    { "op": "act" },
+    { "op": "gemm", "n": 512, "k": 1024 }
+  ]
+}

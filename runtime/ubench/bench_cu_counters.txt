@@ -1,0 +1,34 @@
+# rocprof counter input for single-CU MI350X kernel benchmarks.
+# Three passes required — gfx9 hardware has limited concurrent PMC slots.
+#
+# Usage:
+#   rocprof --counters bench_cu_counters_pass1.txt -o pass1.csv ./bench_cu_roofline --kernel all
+#   rocprof --counters bench_cu_counters_pass2.txt -o pass2.csv ./bench_cu_roofline --kernel all
+#   rocprof --counters bench_cu_counters_pass3.txt -o pass3.csv ./bench_cu_roofline --kernel all
+#
+# See run_bench_cu.sh for the orchestrated multi-pass flow.
+#
+# NOTE: This file is documentation only. The actual per-pass files are below.
+# rocprof requires one pmc: line per pass file.
+
+# --- Pass 1: ALU / MFMA utilization ---
+# SQ_INSTS_VALU      : scalar ALU instructions issued
+# SQ_INSTS_VMEM      : vector memory instructions issued
+# SQ_INSTS_LDS       : LDS instructions issued
+# SQ_INSTS_MFMA      : matrix (MFMA) instructions issued
+# SQ_WAVES           : total waves launched
+# SQ_BUSY_CYCLES     : cycles the SQ had at least one active wave
+
+# --- Pass 2: Memory subsystem (TCP = L1 vector cache, TCC = L2 cache) ---
+# TCP_TOTAL_READ     : total L1 cache-line read requests (64B each)
+# TCP_TOTAL_WRITE    : total L1 cache-line write requests (64B each)
+# TCC_HIT            : L2 cache hits
+# TCC_MISS           : L2 cache misses (went to HBM)
+# TCC_EA_RDREQ       : external (HBM) read requests from L2
+# TCC_EA_WRREQ       : external (HBM) write requests from L2
+
+# --- Pass 3: LDS bank conflicts + occupancy ---
+# SQ_LDS_BANK_CONFLICT : LDS bank conflict stall cycles
+# SQ_WAIT_INST_LDS     : cycles waiting on LDS results
+# SQ_ACTIVE_INST_VALU  : cycles with VALU instructions in flight
+# SQ_ACTIVE_INST_VMEM  : cycles with VMEM instructions in flight

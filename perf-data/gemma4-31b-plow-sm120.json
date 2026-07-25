@@ -1,0 +1,442 @@
+{
+ "engine": "plow",
+ "campaign": "T7-31b",
+ "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB (sm_120 / cc 12.0, 188 SMs)",
+ "driver_version": "580.82.07",
+ "cuda_toolkit": "13.0",
+ "date": "2026-07-19",
+ "model": "/workspace/models/gemma-4-31B-it",
+ "model_revision": "b9ea41a2887d8607f594846523f94c6cc75ac8a4",
+ "model_desc": "google/gemma-4-31B-it (Gemma4ForConditionalGeneration; 60 layers = 10 full / 50 sliding, hidden 5376, inter 21504, 32 Q heads, kv 16 slide / 4 full (full-layer GQA-8), head_dim 256 slide / 512 full, sliding_window 1024, final_logit_softcapping 30, tied embeddings, vocab 262144)",
+ "dtype_compute": "bfloat16",
+ "tp": 1,
+ "batch": 1,
+ "concurrency": 1,
+ "git_commit_measured": "fd3a790 (rtx, >=3be7888) \u2014 interpreter kernels byte-identical to HEAD; NO kernel change this campaign",
+ "build": "decode object plow_interp_sm120_gemma (-DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2, 174 regs, 0 spill, occ-1) + prefill object plow_interp_sm120_gemma_pf (+ -DPLOW_NV_PREFILL=1; T5 cp.async KV-stream flash-prefill + T4 mma P-V + T6 fp8 GEMM); harness runtime/tests/gemma4_sm120_chat.cu; global-queue scheduler (default).",
+ "shipped_change": "crates/plowc/src/bin/gemma4.rs \u2014 decode nsplit floored 12->16 for the 31B long-ctx shape ONLY (gate: gemv_family && ctx>8192 && kvh_full>=4 && kvh_slide!=kvh_full). 12B (kvh_full=1), Qwen/Llama (kvh_full==kvh_slide), and short-ctx pkts byte-identical. Verified: default emit now byte-identical to old PLOW_NS_ABS=16.",
+ "packet_recipe": "PLOW_UNISEG=1 gemma4 <dir> 132096 out.pkt 188 (bf16); fp8 adds PLOW_FP8=1. The P2 prefill-argmax OOB is already fixed in HEAD (nb_argmax keyed off decode&&t>1).",
+ "supersedes": "P2-31b (measured PRE-T5 at 7fe44b8). Prior tables kept in git log; deltas stated in the .md.",
+ "hypotheses": {
+  "H1_gemv_unroll": "REFUTED on sm_120. AMD gemv-autotune (46dccd6) does not transfer: decode object is already occ-1 (174 regs=1 block/SM), and it allocates for the union of all decode arms, so deepening GV_UNROLL 8->16 raised whole-kernel regs 174->204->240 (0 spill) yet regressed decode +0.9% at 1k/16k (starved flash-decode/norms). Kept UN=8, no kernel change.",
+  "H2_flash_nsplit": "WON, shipped. 188-SM CU-fill formula gives ns12 (1.0x flash fill) for the 32-head 31B; ns16 (1.36x oversubscribe) beats ns12 at EVERY ctx (bf16 -0.2%@1k .. -5.8%@128k; fp8 -8.6%@128k). ns24 over-splits (worse than ns16).",
+  "H3_fixed_intercept": "MEASURED. LSQ tpot=a+b*ctx: plow ns12 a=47.51 b=127.2ms/1k-ctx; plow ns16 a=47.40 b=99.2; vLLM a=45.38 b=81.1. ns16 cuts the KV slope -22% (near vLLM's 81) but not the intercept; plow's ~47.4ms fixed per-token cost vs vLLM 45.4 = +2.0ms 60-layer dispatch floor. Reported, not redesigned (per task)."
+ },
+ "verdict_decode_wins": "NO. bf16 decode still trails vLLM +3.2..8.9% (was +5.4..15.5%). ns16 roughly halves the long-ctx gap and is greedy-token-identical, but 31B does NOT win like the 12B; the residual is the fixed ~2.0ms 60-layer dispatch intercept plus a shared bf16-KV flash floor.",
+ "vllm_baseline_ref": "perf-data/gemma4-31b-vllm-sm120.json (B1, vLLM 0.25.1, TRITON_ATTN, cudagraphs ON)",
+ "parity": {
+  "bf16_ns16_vs_ns12": "byte-identical greedy tokens at 32k AND 128k -> ns16 is greedy-equivalent to the P2 default (ns12) which PASSED the HF set (p2 48/48, p3 31/31 incl. >1024-window-crossing, p1 reconverging near-tie). Parity INHERITED, PASS.",
+  "device_vs_host_argmax": "AGREE at every ctx (1k..128k), bf16 and fp8, ns16.",
+  "fp8_vs_bf16": "identical generated tokens at 16k/32k/64k/128k; 4k differs at 3/129 near-ties \u2014 matches the P2 fp8 agreement pattern. PASS.",
+  "oracle": "interp kernels byte-identical to HEAD (no kernel change); sm_120 interp-op oracle unaffected."
+ },
+ "memory_GiB": {
+  "bf16_128k": {
+   "weights": 57.18,
+   "kv": 22.58,
+   "act": 2.69,
+   "total": 82.45
+  },
+  "fp8_128k": {
+   "weights": 29.9,
+   "kv": 22.58,
+   "act": 2.69,
+   "total": 55.2
+  }
+ },
+ "campaigns": [
+  {
+   "campaign": "T7-31b-decode",
+   "precision": "bf16",
+   "metric": "tpot_ms",
+   "config": "SHIPPED nsplit=16 (default after the emitter change). methodology: prompt of length=ctx primed via PREFILL, then 128 decode tokens; discard 16 warmup, report over 112 timed steps.",
+   "results": [
+    {
+     "input_len": 1024,
+     "tpot_ms": 47.4884,
+     "tpot_median_ms": 47.4845,
+     "tpot_sd_ms": 0.0214,
+     "tpot_sd_pct": 0.045,
+     "n_timed": 112,
+     "warmup": 16,
+     "decode_tok_s": 21.06,
+     "kernel_ms": 47.4341,
+     "vllm_bf16_tpot_ms": 44.67,
+     "delta_pct": 6.31,
+     "prev_ns12_tpot_ms": 47.5764
+    },
+    {
+     "input_len": 4096,
+     "tpot_ms": 47.7887,
+     "tpot_median_ms": 47.7869,
+     "tpot_sd_ms": 0.0215,
+     "tpot_sd_pct": 0.045,
+     "n_timed": 112,
+     "warmup": 16,
+     "decode_tok_s": 20.93,
+     "kernel_ms": 47.7341,
+     "vllm_bf16_tpot_ms": 45.2,
+     "delta_pct": 5.73,
+     "prev_ns12_tpot_ms": 47.9473
+    },
+    {
+     "input_len": 16384,
+     "tpot_ms": 48.9816,
+     "tpot_median_ms": 48.9766,
+     "tpot_sd_ms": 0.0299,
+     "tpot_sd_pct": 0.061,
+     "n_timed": 112,
+     "warmup": 16,
+     "decode_tok_s": 20.42,
+     "kernel_ms": 48.9256,
+     "vllm_bf16_tpot_ms": 46.93,
+     "delta_pct": 4.37,
+     "prev_ns12_tpot_ms": 49.5772
+    },
+    {
+     "input_len": 32768,
+     "tpot_ms": 50.7268,
+     "tpot_median_ms": 50.7222,
+     "tpot_sd_ms": 0.0256,
+     "tpot_sd_pct": 0.05,
+     "n_timed": 112,
+     "warmup": 16,
+     "decode_tok_s": 19.71,
+     "kernel_ms": 50.6716,
+     "vllm_bf16_tpot_ms": 49.14,
+     "delta_pct": 3.23,
+     "prev_ns12_tpot_ms": 51.8366
+    },
+    {
+     "input_len": 65536,
+     "tpot_ms": 53.9455,
+     "tpot_median_ms": 53.9431,
+     "tpot_sd_ms": 0.0315,
+     "tpot_sd_pct": 0.058,
+     "n_timed": 112,
+     "warmup": 16,
+     "decode_tok_s": 18.54,
+     "kernel_ms": 53.8869,
+     "vllm_bf16_tpot_ms": 51.22,
+     "delta_pct": 5.32,
+     "prev_ns12_tpot_ms": 55.9305
+    },
+    {
+     "input_len": 131072,
+     "tpot_ms": 60.3743,
+     "tpot_median_ms": 60.3414,
+     "tpot_sd_ms": 0.0355,
+     "tpot_sd_pct": 0.059,
+     "n_timed": 112,
+     "warmup": 16,
+     "decode_tok_s": 16.56,
+     "kernel_ms": 60.3189,
+     "vllm_bf16_tpot_ms": 55.46,
+     "delta_pct": 8.86,
+     "prev_ns12_tpot_ms": 64.1094
+    }
+   ]
+  },
+  {
+   "campaign": "T7-31b-decode-nsplit-ablation",
+   "precision": "bf16",
+   "metric": "tpot_ms",
+   "note": "H2 A/B. ns12=old default, ns16=shipped, ns24=over-split. ns16 wins at every ctx; ns24 worse than ns16.",
+   "results": [
+    {
+     "input_len": 1024,
+     "ns12": 47.5764,
+     "ns16": 47.4884
+    },
+    {
+     "input_len": 4096,
+     "ns12": 47.9473,
+     "ns16": 47.7887
+    },
+    {
+     "input_len": 16384,
+     "ns12": 49.5772,
+     "ns16": 48.9816
+    },
+    {
+     "input_len": 32768,
+     "ns12": 51.8366,
+     "ns16": 50.7268,
+     "ns24": 51.1562
+    },
+    {
+     "input_len": 65536,
+     "ns12": 55.9305,
+     "ns16": 53.9455
+    },
+    {
+     "input_len": 131072,
+     "ns12": 64.1094,
+     "ns16": 60.3743,
+     "ns24": 61.5946
+    }
+   ]
+  },
+  {
+   "campaign": "T7-31b-decode-unroll-ablation",
+   "precision": "bf16",
+   "metric": "tpot_ms",
+   "note": "H1 REFUTED. Deeper decode GEMV unroll regresses on sm_120 (already occ-1). regs: UN8=174, UN16=204, UN16/GLU8=240 (all 0-spill).",
+   "results": [
+    {
+     "input_len": 1024,
+     "UN8": 47.5913,
+     "UN16": 48.0297,
+     "UN16_GLU8": 48.0365
+    },
+    {
+     "input_len": 16384,
+     "UN8": 49.5814,
+     "UN16": 50.0133,
+     "UN16_GLU8": 50.0389
+    }
+   ]
+  },
+  {
+   "campaign": "T7-31b-prefill-t5",
+   "precision": "bf16",
+   "metric": "prefill_ms",
+   "methodology": "chunked prefill of an N-token prompt (buckets to 8192), wall time from first launch to first generated token. nsplit-independent. vs vLLM served TTFT (includes 1st decode token). T5 cp.async KV-stream flash-prefill + T4 mma P-V kernels.",
+   "results": [
+    {
+     "ctx": 1024,
+     "prefill_ms": 473.41,
+     "prefill_tok_s": 2163.0,
+     "vllm_bf16_ttft_ms": 222.36,
+     "plow_vs_vllm": "2.13x slower",
+     "prev_p2_ms": 506.74
+    },
+    {
+     "ctx": 4096,
+     "prefill_ms": 1543.27,
+     "prefill_tok_s": 2654.1,
+     "vllm_bf16_ttft_ms": 705.67,
+     "plow_vs_vllm": "2.19x slower",
+     "prev_p2_ms": 1787.32
+    },
+    {
+     "ctx": 16384,
+     "prefill_ms": 6169.81,
+     "prefill_tok_s": 2655.5,
+     "vllm_bf16_ttft_ms": 3450.74,
+     "plow_vs_vllm": "1.79x slower",
+     "prev_p2_ms": 9125.06
+    },
+    {
+     "ctx": 32768,
+     "prefill_ms": 14126.87,
+     "prefill_tok_s": 2319.6,
+     "vllm_bf16_ttft_ms": 10730.22,
+     "plow_vs_vllm": "1.32x slower",
+     "prev_p2_ms": 34678.73
+    },
+    {
+     "ctx": 65536,
+     "prefill_ms": 35412.59,
+     "prefill_tok_s": 1850.6,
+     "vllm_bf16_ttft_ms": 31095.86,
+     "plow_vs_vllm": "1.14x slower",
+     "prev_p2_ms": 131046.78
+    },
+    {
+     "ctx": 131072,
+     "prefill_ms": 103726.01,
+     "prefill_tok_s": 1263.6,
+     "vllm_bf16_ttft_ms": 99564.73,
+     "plow_vs_vllm": "1.04x slower",
+     "prev_p2_ms": 493438.55
+    }
+   ]
+  },
+  {
+   "campaign": "T7-31b-fp8",
+   "precision": "fp8",
+   "metric": "tpot_ms",
+   "config": "SHIPPED nsplit=16. weight-only w8a16, per-output-channel e4m3 (amax/448); 410 projections (60 layers x 7). Twins model.safetensors 29.30 GB. DECODE GEMV_FP8/GEMV_GLU_FP8; prefill uses T6 fp8 GEMM (w8a16).",
+   "unblocked": "T6 slim fp8 pkt (3be7888) elides the dead bf16 prefill projections -> fp8 weights 29.9 GiB (was 84.5 with bf16 prefill twins), so the FULL ladder 1k->128k now fits (55.2 GiB at 128k). P2 was OOM-blocked above ~4.6k.",
+   "results": [
+    {
+     "input_len": 1024,
+     "tpot_ms": 27.4799,
+     "tpot_median_ms": 27.4803,
+     "tpot_sd_ms": 0.0154,
+     "tpot_sd_pct": 0.056,
+     "n_timed": 112,
+     "warmup": 16,
+     "decode_tok_s": 36.39,
+     "kernel_ms": 27.4374,
+     "vllm_fp8_tpot_ms": 25.62,
+     "delta_pct": 7.26,
+     "fp8_vs_bf16_x": 1.73
+    },
+    {
+     "input_len": 4096,
+     "tpot_ms": 27.7832,
+     "tpot_median_ms": 27.7813,
+     "tpot_sd_ms": 0.0166,
+     "tpot_sd_pct": 0.06,
+     "n_timed": 112,
+     "warmup": 16,
+     "decode_tok_s": 35.99,
+     "kernel_ms": 27.7399,
+     "vllm_fp8_tpot_ms": 26.16,
+     "delta_pct": 6.21,
+     "fp8_vs_bf16_x": 1.72
+    },
+    {
+     "input_len": 16384,
+     "tpot_ms": 29.0133,
+     "tpot_median_ms": 29.0136,
+     "tpot_sd_ms": 0.0167,
+     "tpot_sd_pct": 0.058,
+     "n_timed": 112,
+     "warmup": 16,
+     "decode_tok_s": 34.47,
+     "kernel_ms": 28.9667,
+     "vllm_fp8_tpot_ms": 27.8,
+     "delta_pct": 4.36,
+     "fp8_vs_bf16_x": 1.69
+    },
+    {
+     "input_len": 32768,
+     "tpot_ms": 30.7684,
+     "tpot_median_ms": 30.7682,
+     "tpot_sd_ms": 0.0184,
+     "tpot_sd_pct": 0.06,
+     "n_timed": 112,
+     "warmup": 16,
+     "decode_tok_s": 32.5,
+     "kernel_ms": 30.7197,
+     "vllm_fp8_tpot_ms": 29.86,
+     "delta_pct": 3.04,
+     "fp8_vs_bf16_x": 1.65
+    },
+    {
+     "input_len": 65536,
+     "tpot_ms": 33.9573,
+     "tpot_median_ms": 33.9553,
+     "tpot_sd_ms": 0.0238,
+     "tpot_sd_pct": 0.07,
+     "n_timed": 112,
+     "warmup": 16,
+     "decode_tok_s": 29.45,
+     "kernel_ms": 33.9115,
+     "vllm_fp8_tpot_ms": 31.99,
+     "delta_pct": 6.15,
+     "fp8_vs_bf16_x": 1.59
+    },
+    {
+     "input_len": 131072,
+     "tpot_ms": 40.3229,
+     "tpot_median_ms": 40.3167,
+     "tpot_sd_ms": 0.0367,
+     "tpot_sd_pct": 0.091,
+     "n_timed": 112,
+     "warmup": 16,
+     "decode_tok_s": 24.8,
+     "kernel_ms": 40.2733,
+     "vllm_fp8_tpot_ms": 36.13,
+     "delta_pct": 11.6,
+     "fp8_vs_bf16_x": 1.5
+    }
+   ]
+  },
+  {
+   "campaign": "P8-rnreg",
+   "date": "2026-07-19",
+   "change": "RN_REG 16->24 (5e9c368: feat=5376 norms on the vectorized fast path, op-level -50..-60%) + PLOW_NV_PTXSYNC=1 default (404c402, -0.6%); measured at HEAD with ns16 (ff4874d).",
+   "method": "gemma4_sm120_chat, 120 timed steps after 16 warmup, prefill-primed, gpulease p8-31b",
+   "results": [
+    {
+     "ctx": 1024,
+     "tpot_ms": 45.3,
+     "sd_ms": 0.021,
+     "vllm_bf16_tpot_ms": 44.67,
+     "delta_vs_vllm_pct": 1.4,
+     "prev_ns16_tpot_ms": 47.49
+    },
+    {
+     "ctx": 131072,
+     "tpot_ms": 58.453,
+     "sd_ms": 0.035,
+     "vllm_bf16_tpot_ms": 55.46,
+     "delta_vs_vllm_pct": 5.4,
+     "prev_ns16_tpot_ms": 60.37
+    }
+   ],
+   "notes": "bf16 decode. Flat ~-2.0 ms/step from the norm fast-path + PTX scoped sync; 31B decode gap now +1.4%@1k / +5.4%@128k (campaign start: +6.5%/+15.5%).",
+   "precision": "bf16"
+  },
+  {
+   "campaign": "T9b-31b-tune",
+   "date": "2026-07-20",
+   "change": "Grid-aligned full-layer flash-decode nsplit (gemma4.rs): full layers round the ns16 fill target up to a multiple of n_cu/gcd(n_grp,n_cu)=47 so n_grp*nsplit=752=4*188 balances exactly over 188 SMs; sliding layers keep ns16. Emitter-only, no kernel change. Byte-identical to PLOW_NS_FULL_ABS=47; 12B and short-ctx (<=8192) 31B packets byte-unchanged.",
+   "method": "gemma4_sm120_chat, 120 timed steps after 16 warmup, prefill-primed PLOW_UNISEG pkt, gpulease t9b-31b (shared GPU; base@128k 58.58 reproduces isolated P8 58.45 so the A/B delta is clean).",
+   "precision": "bf16",
+   "screening_128k": {
+    "ns16_base": 58.57,
+    "ns47_aligned": 56.6,
+    "ns24_misaligned": 59.59,
+    "note": "ns24 (384 items, ceil 3/block) SLOWER than base -> the lever is grid ALIGNMENT, not split count."
+   },
+   "trace_ref": "perf-data/gemma4-31b-t9b-trace.md (single-block per-op decode trace; FLASH_MERGE gate 658k cyc/op @128k localised the imbalance)",
+   "results": [
+    {
+     "ctx": 1000,
+     "base_ns16_full_ms": 45.885,
+     "ns47_full_ms": 46.088,
+     "delta_vs_base_pct": 0.44,
+     "vllm_bf16_ms": 44.67,
+     "ns47_vs_vllm_pct": 3.17
+    },
+    {
+     "ctx": 4096,
+     "base_ns16_full_ms": 46.179,
+     "ns47_full_ms": 46.227,
+     "delta_vs_base_pct": 0.1,
+     "vllm_bf16_ms": 45.2,
+     "ns47_vs_vllm_pct": 2.27
+    },
+    {
+     "ctx": 16384,
+     "base_ns16_full_ms": 47.355,
+     "ns47_full_ms": 47.147,
+     "delta_vs_base_pct": -0.44,
+     "vllm_bf16_ms": 46.93,
+     "ns47_vs_vllm_pct": 0.46
+    },
+    {
+     "ctx": 32768,
+     "base_ns16_full_ms": 49.075,
+     "ns47_full_ms": 48.59,
+     "delta_vs_base_pct": -0.99,
+     "vllm_bf16_ms": 49.14,
+     "ns47_vs_vllm_pct": -1.12
+    },
+    {
+     "ctx": 65536,
+     "base_ns16_full_ms": 52.254,
+     "ns47_full_ms": 51.243,
+     "delta_vs_base_pct": -1.93,
+     "vllm_bf16_ms": 51.22,
+     "ns47_vs_vllm_pct": 0.04
+    },
+    {
+     "ctx": 131072,
+     "base_ns16_full_ms": 58.576,
+     "ns47_full_ms": 56.588,
+     "delta_vs_base_pct": -3.39,
+     "vllm_bf16_ms": 55.46,
+     "ns47_vs_vllm_pct": 2.03
+    }
+   ],
+   "verdict": "Closes the long-ctx gap (128k +5.4%->+2.0%, 64k tie, 32k WIN -1.1%) at a small short-ctx cost (1k +0.4% vs base). Does NOT flip 31B to a win at EVERY ctx: decode GEMV bodies are HBM-bound and already = vLLM (trace), and the interpreter dispatch floor is 0.66 ms (skeleton). The full-layer flash imbalance was the fixable residual and this takes it.",
+   "parity": "greedy tokens ns47 == base at 32k and 128k (nsplit is an exact online-softmax reduction reorder); oracle inherited-green (emitter-only, no kernel change)."
+  }
+ ]
+}

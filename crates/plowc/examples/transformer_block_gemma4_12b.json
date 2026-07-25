@@ -1,0 +1,15 @@
+{
+  "name": "transformer-block-gemma4-12b",
+  "note": "Full decoder block (Gemma 4 12B IT dense multimodal, text side): hidden 3072, 12 query heads, 4 KV heads shared (attention_k_eq_v true, so K and V share one projection), head_dim 256, GeGLU MLP intermediate 12288. Fused QKV = 12*256 (Q) + 4*256 (shared K/V) = 3072 + 1024 = 4096. o_proj: 12*256 -> 3072. GeGLU: single fused up projection to 2*12288 = 24576, act, then down 12288 -> 3072. use_qk_norm produces two extra RMSNorms on q/k which the linear-chain format folds into the pre-QKV norm.",
+  "hidden": 3072,
+  "ops": [
+    { "op": "norm" },
+    { "op": "gemm", "n": 4096, "k": 3072 },
+    { "op": "flash", "heads": 12, "head_dim": 256 },
+    { "op": "gemm", "n": 3072, "k": 3072 },
+    { "op": "norm" },
+    { "op": "gemm", "n": 24576, "k": 3072 },
+    { "op": "act" },
+    { "op": "gemm", "n": 3072, "k": 12288 }
+  ]
+}

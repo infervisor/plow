@@ -1,0 +1,81 @@
+{
+ "engine": "plow",
+ "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, single GPU (sm_120 / cc 12.0, 188 SMs)",
+ "cuda_toolkit_on_host": "13.0",
+ "model": "/workspace/models/gemma-4-12B-it",
+ "dtype_compute": "bfloat16",
+ "tp": 1,
+ "batch": 1,
+ "metric": "prefill_ms",
+ "metric_convention": "PURE PREFILL wall time (harness PLOW_PREFILL_RESULT prefill_ms), EXCLUDING the first decode token. vLLM ttft_ms (comparison column) INCLUDES prefill+first-decode+scheduling.",
+ "vllm_baseline_ref": "perf-data/gemma4-12b-vllm-sm120.json (bf16 ttft_ms: 4k 323.48, 32k 2815.15, 128k 16271.32)",
+ "run_mode": "gemma4_sm120_chat: chunked PREFILL through the sm_120 persistent interpreter. T9c compares UNISEG (single cooperative launch, _pf object, PLOW_UNISEG=1 pkt) vs SEGMENTED (one launch per wave-class segment, _pfseg object, PLOW_NV_SEGMENTS=1, non-uniseg pkt). Deterministic pseudo-random valid-token prompts.",
+ "campaigns": [
+  {
+   "campaign": "T9c-segments",
+   "date": "2026-07-20",
+   "branch": "rtx-t9c",
+   "stage": "Stage 1 — segment parsing + sequential relaunch, SAME object",
+   "interp_objects": {
+    "uniseg": "plow_interp_sm120_gemma_pf (PLOW_NV_PREFILL=1 PLOW_NV_FA_GF=2): 240 regs, 0 spill, occ-1",
+    "segmented": "plow_interp_sm120_gemma_seg (+PLOW_NV_SEGMENTS=1): 240 regs, 0 spill, occ-1 — SAME profile, only cur_seg-bounded window differs",
+    "lean_gemm_stage2": "plow_interp_sm120_gemma_gemm (+PLOW_NV_SEG_GEMM=1): 128 regs, 232 B spill, occ-2 target, ~40 KiB GEMM-only arena. Built (CI register gate) but NOT yet driven — occ-2 needs 2*n_cu re-slicing."
+   },
+   "notes": "Correctness: the segmented run (97 cooperative launches / chunk) produces a BYTE-IDENTICAL token stream to uniseg (1 launch) — same first token 874, same PLOW_IDS, argmax device==host AGREE. On the SAME object the segments run identical math, so Stage 1 is EXPECTED to be neutral+tax; the +0.43% is the K-1 extra launch+sync tax. The occupancy WIN requires the Stage-2 occ-2 lean object, which is blocked on per-segment re-slicing (the emitter slices for n_cu=188; occ-2 fills 2*188=376 resident blocks). Host enqueue tax measured at 3.08 us/launch (299 us / 97 launches) — negligible vs the ~514 ms GEMM-bound compute.",
+   "results": [
+    {
+     "ctx": 4096,
+     "segments_per_chunk": 97,
+     "uniseg_prefill_ms": 512.28,
+     "uniseg_tok_s": 7995.6,
+     "segmented_prefill_ms": 514.53,
+     "segmented_tok_s": 7960.7,
+     "seg_tax_ms": 2.25,
+     "seg_tax_pct": 0.44,
+     "enq_us_per_launch": 3.08,
+     "first_token": 874,
+     "token_stream_parity": "identical (uniseg==segmented, argmax device==host)",
+     "vllm_bf16_ttft_ms": 323.48,
+     "plow_uniseg_vs_vllm": "1.58x slower"
+    }
+   ],
+   "pending": [
+    "RESOLVED in the T10-occ2-reslice campaign below: per-segment re-slicing implemented, occ-2 driven, 4k/32k/128k A/B run."
+   ]
+  },
+  {
+   "campaign": "T10-occ2-reslice",
+   "date": "2026-07-20",
+   "branch": "main",
+   "stage": "Stage 2/3 — per-segment 2*n_cu re-slicing + lean occ-2 _pfgemm object DRIVEN (the decision metric)",
+   "emitter_change": "PLOW_SEG_CLASS_SLICE=1: GEMM-class (wave-8) segments' machine-filling ops (cus.len()==n_cu) re-sliced to 2*n_cu blocks so both resident blocks/SM at occ-2 get GEMM work; flash-class (wave-4) segments keep n_cu. Wait thresholds follow automatically (derived from producer.cus.len()). Fine producers/consumers skipped (none survive in dense 12B prefill — select_granularity downgrades all attention fine edges to coarse). Unflagged emission byte-identical (cmp verified vs pre-change binary on a ctx-8192 pkt).",
+   "occ2_unblocked": "T9c's occ-2 premise assumed a ~40 KiB GEMM arena; the REAL arena is 60 KiB (PGM_STAGES=3 plain / GLU_STAGES=2, 128x128 tile). 2x60=120 KiB > the 100 KiB dynamic-smem cap => ptxas caps occupancy at 1 (SMEM-bound, NOT register-bound — 128 regs already passes). occ-2 reached only by shrinking the lean object's pipeline depth to 2/1 stages => arena 40 KiB => 2x=80 KiB < 100 KiB => runtime grid 376 (occ-2 x 188 SMs).",
+   "interp_objects": {
+    "uniseg": "plow_interp_sm120_gemma_pf: 240 regs, 0 spill, 60 KiB arena, occ-1, grid 188",
+    "pfseg": "plow_interp_sm120_gemma_seg (_pfseg): 240 regs, 0 spill, 60 KiB arena, occ-1, grid 188",
+    "pfgemm_occ2": "plow_interp_sm120_gemma_gemm (_pfgemm, +PLOW_NV_SEG_GEMM, PGM 2/1 stages): 128 regs, 248 B stack (616 spill st / 780 ld), 40 KiB arena, occ-2, grid 376"
+   },
+   "correctness": "argmax device==host AGREE and first gen token IDENTICAL to uniseg at all three ctx (token 236770 for the constant-1000 fill prompt). Parity gate MET (T5 standard: first-token agree + finite/sane; byte-identical NOT expected across the occupancy/slicing change, and the token stream held identical anyway).",
+   "accounting_4k_isolation": {
+    "uniseg_pf_grid188_ms": 513.22,
+    "plain_seg_pfseg_grid188_ms": 514.92,
+    "cslice_on_pfseg_grid188_ms": 557.85,
+    "cslice_on_pfgemm_occ2_grid376_ms": 744.92,
+    "note": "Decomposition: plain segmentation tax +0.3% (T9c); re-slicing to 2*n_cu blocks on the SAME good full-arena object adds +8.7% (557.85 vs 514.92 — 2x GQ cursor atomics + 2x counter bumps + 2x gate polls, each block runs 2 slices at grid188); switching to the lean occ-2 object adds a FURTHER +33.5% (744.92 vs 557.85 — the 2/1 pipeline halving + 248 B spill). occ-2's second resident block does NOT recover the halved pipeline depth: the GEMM at occ-1/3-stage is already latency-hidden."
+   },
+   "results": [
+    {"ctx": 4096, "vllm_bf16_ttft_ms": 323.48, "uniseg_prefill_ms": 513.22, "occ2_reslice_prefill_ms": 744.92, "occ2_vs_uniseg": "+45.1%", "uniseg_vs_vllm": "1.59x slower", "occ2_vs_vllm": "2.30x slower", "segments_per_chunk": 97},
+    {"ctx": 32768, "vllm_bf16_ttft_ms": 2815.15, "uniseg_prefill_ms": 5052.15, "occ2_reslice_prefill_ms": 7095.55, "occ2_vs_uniseg": "+40.4%", "uniseg_vs_vllm": "1.79x slower", "occ2_vs_vllm": "2.52x slower", "runseg_calls": 4, "launches": 388},
+    {"ctx": 131072, "vllm_bf16_ttft_ms": 16271.32, "uniseg_prefill_ms": 37289.46, "occ2_reslice_prefill_ms": 45589.20, "occ2_vs_uniseg": "+22.3%", "uniseg_vs_vllm": "2.29x slower", "occ2_vs_vllm": "2.80x slower", "runseg_calls": 16, "launches": 1552}
+   ],
+   "verdict": "NEGATIVE. occ-2 segmentation does NOT beat or approach vLLM prefill — it REGRESSES plow's own prefill by +22% (128k) to +45% (4k). The re-slicing tax (+9%) plus the arena/pipeline tradeoff (occ-2 is SMEM-bound, reachable only by halving the GEMM pipeline depth, which costs ~33%) together swamp the occupancy headroom. The gap SHRINKS with ctx (+45%/+40%/+22% at 4k/32k/128k) because the fixed re-slice overhead amortizes over the O(n^2)-growing GEMM compute — hinting the occ-2 thesis could approach break-even at very long ctx IF the pipeline-depth penalty were removed. That fair test needs an occ-2 object at FULL pipeline depth, reachable only by a smaller GEMM N-tile (BN 128->64, arena ~45 KiB) — a kernel-tiling change not attempted here. As implemented (stage-reduction, the low-risk lever), occ-2 is a clear loss.",
+   "plain_segmented_stage1_backfill": {
+    "note": "T9c pending 32k/128k plain-segmented (_pfseg, non-cslice, SAME object as uniseg) rows filled. Tax stays ~+0.3% across ctx (K-1 extra launch+sync, fixed) — confirms T9c Stage-1 is pure launch tax, no math change. argmax device==host AGREE at every ctx.",
+    "ctx_4096": {"uniseg_ms": 513.22, "plain_seg_ms": 514.92, "tax_pct": 0.33},
+    "ctx_32768": {"uniseg_ms": 5052.15, "plain_seg_ms": 5066.06, "tax_pct": 0.28},
+    "ctx_131072": {"uniseg_ms": 37289.46, "plain_seg_ms": 37383.13, "tax_pct": 0.25}
+   },
+   "oracle": "sm120_interp_op_test: ok (all bf16/fp8/w8a8 GEMM/GEMM_GLU/QUANT arms PASS)"
+  }
+ ]
+}

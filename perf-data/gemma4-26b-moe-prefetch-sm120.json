@@ -1,0 +1,49 @@
+{
+  "campaign": "beat-moe-prefetch",
+  "date": "2026-07-23",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120, 188 SMs, 128 MiB L2)",
+  "what": "GO/NO-GO microbench: router-hoist L2 prefetch of the 8 routed experts' gate_up weights during the dense-MLP window (26B-A4B MoE decode)",
+  "verdict": "NO-GO",
+  "geometry": {"H": 2816, "E": 128, "top_k": 8, "I_moe": 704, "nrow": 1, "grid": 188, "threads": 256},
+  "method": "runtime/tests/moe_prefetch_bw_sm120.cu; cudaEvent, 30 timed iters after 5 warm; 384MiB memset+read L2 flush per iter; routed expert set rotates through 8 disjoint sets per iter (defeats Blackwell L2 streaming-insertion retention of the previous iteration's experts); exact megakernel decode op bodies; prefetch.global.L2 (and ::evict_last), 128B lines, gate_up only, block-strided from pfb blocks which then join the dense sweep",
+  "prefetch_working_set_mib": {"bf16": 60.5, "fp8": 30.2},
+  "dense_window": {"bf16": {"mib": 100, "gbps": 1221}, "fp8": {"mib": 50, "gbps": 1068}},
+  "baselines_ms": {
+    "bf16": {"glu_cold": 0.0525, "glu_warm": 0.0164, "max_win": 0.0362, "down_cold": 0.0273, "moe_step": 0.0798, "dense_base": 0.0800, "glu_after_dense": 0.0473},
+    "fp8":  {"glu_cold": 0.0343, "glu_warm": 0.0160, "max_win": 0.0184, "down_cold": 0.0221, "moe_step": 0.0565, "dense_base": 0.0457, "glu_after_dense": 0.0285}
+  },
+  "idle_window_ceiling": {
+    "bf16": {"plain": {"pf_ms": 0.0204, "glu_after": 0.0345, "recovered_pct_of_max": 50}, "evict_last": {"pf_ms": 0.0207, "glu_after": 0.0344, "recovered_pct_of_max": 50}},
+    "fp8":  {"plain": {"pf_ms": 0.0134, "glu_after": 0.0239, "recovered_pct_of_max": 57}, "evict_last": {"pf_ms": 0.0140, "glu_after": 0.0233, "recovered_pct_of_max": 60}}
+  },
+  "fused_dense_prefetch_ms": {
+    "bf16": {
+      "plain_pfb4":    {"dense": 0.1562, "d_slow": 0.0762, "glu": 0.0207, "glu_gain": 0.0266, "net": -0.0496, "net_pct_of_step": -62.2},
+      "plain_pfb16":   {"dense": 0.1123, "d_slow": 0.0323, "glu": 0.0336, "glu_gain": 0.0137, "net": -0.0186, "net_pct_of_step": -23.3},
+      "plain_pfb64":   {"dense": 0.0973, "d_slow": 0.0173, "glu": 0.0405, "glu_gain": 0.0068, "net": -0.0105, "net_pct_of_step": -13.1},
+      "plain_pfb188":  {"dense": 0.1000, "d_slow": 0.0200, "glu": 0.0426, "glu_gain": 0.0047, "net": -0.0153, "net_pct_of_step": -19.2},
+      "evlast_pfb4":   {"dense": 0.1559, "d_slow": 0.0759, "glu": 0.0201, "glu_gain": 0.0273, "net": -0.0486, "net_pct_of_step": -60.9},
+      "evlast_pfb16":  {"dense": 0.1120, "d_slow": 0.0320, "glu": 0.0303, "glu_gain": 0.0170, "net": -0.0150, "net_pct_of_step": -18.8},
+      "evlast_pfb64":  {"dense": 0.0973, "d_slow": 0.0173, "glu": 0.0332, "glu_gain": 0.0141, "net": -0.0032, "net_pct_of_step": -4.1},
+      "evlast_pfb188": {"dense": 0.0998, "d_slow": 0.0199, "glu": 0.0339, "glu_gain": 0.0134, "net": -0.0064, "net_pct_of_step": -8.0}
+    },
+    "fp8": {
+      "plain_pfb4":    {"dense": 0.0865, "d_slow": 0.0408, "glu": 0.0160, "glu_gain": 0.0125, "net": -0.0282, "net_pct_of_step": -50.0},
+      "plain_pfb16":   {"dense": 0.0636, "d_slow": 0.0179, "glu": 0.0175, "glu_gain": 0.0109, "net": -0.0069, "net_pct_of_step": -12.3},
+      "plain_pfb64":   {"dense": 0.0572, "d_slow": 0.0115, "glu": 0.0180, "glu_gain": 0.0105, "net": -0.0010, "net_pct_of_step": -1.7},
+      "plain_pfb188":  {"dense": 0.0576, "d_slow": 0.0119, "glu": 0.0197, "glu_gain": 0.0088, "net": -0.0031, "net_pct_of_step": -5.5},
+      "evlast_pfb4":   {"dense": 0.0868, "d_slow": 0.0411, "glu": 0.0160, "glu_gain": 0.0125, "net": -0.0286, "net_pct_of_step": -50.6},
+      "evlast_pfb16":  {"dense": 0.0637, "d_slow": 0.0179, "glu": 0.0175, "glu_gain": 0.0109, "net": -0.0070, "net_pct_of_step": -12.4},
+      "evlast_pfb64":  {"dense": 0.0571, "d_slow": 0.0114, "glu": 0.0180, "glu_gain": 0.0105, "net": -0.0009, "net_pct_of_step": -1.7},
+      "evlast_pfb188": {"dense": 0.0577, "d_slow": 0.0119, "glu": 0.0198, "glu_gain": 0.0087, "net": -0.0033, "net_pct_of_step": -5.8}
+    }
+  },
+  "go_criterion": "net = glu_gain - dense_slowdown > ~1% of MoE step AND dense slowdown ~= noise",
+  "why_no_go": [
+    "window has no idle HBM bandwidth: dense GEMV streams at 1.1-1.2 TB/s, prefetch bytes come out of the same pipe, d_slow >= glu_gain in all 16 configs",
+    "prefetch decays before consumption: even with an idle window only 50-60% of the warm-vs-cold headroom is recovered (fire-and-forget drops under MSHR pressure; the following dense stream evicts more)",
+    "best config fp8 evict_last pfb=64: net -0.9us = -1.7% of MoE step; worst -62%; reproducible to +-0.5us"
+  ],
+  "consequences": "no MoeExpertPrefetch opcode, no emitter packet, no PLOW_MOE_PREFETCH flag; shipped kernels/blob untouched",
+  "sanity": {"glu_fp8_vs_bf16_relL2": 4.13e-2}
+}

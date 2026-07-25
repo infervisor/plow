@@ -1,0 +1,13 @@
+[package]
+name = "rewrite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rewriting half of the Infervisor JIT: nn-graph -> egglog equality saturation -> fused operator graph"
+
+[dependencies]
+nn-graph = { workspace = true }
+costmodel.workspace = true
+packet.workspace = true
+egglog.workspace = true
+thiserror.workspace = true

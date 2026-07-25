@@ -1,0 +1,30 @@
+# Pins huggingface/inference-benchmarker — the multi-user serving benchmark
+# harness (campaign B2) — to an exact git rev through the workspace Cargo.lock.
+#
+# The dependency is optional and behind the non-default `ib` feature on
+# purpose: the tool's dep tree pulls reqwest with default `native-tls`
+# (openssl-sys), and this workspace is deliberately pure-rustls (see the
+# workspace Cargo.toml note on hf-hub) with no openssl/pkg-config in the nix
+# dev shell. Cargo locks optional dependencies regardless of enabled features,
+# so the rev and its full transitive tree are version-locked in Cargo.lock
+# while `cargo build --workspace` never compiles (or links) any of it.
+#
+# The benchmark runs use the tool's own binary, built from the SAME rev by
+# `perf-data/bench_ib.sh` (cargo install --git … --rev … --root target/tools).
+# Keep the rev here and in that script in sync.
+
+[package]
+name = "bench-ib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+inference-benchmarker = { git = "https://github.com/huggingface/inference-benchmarker", rev = "bad4f947ef5f34ef264d2451439ab90cf7cbd65c", optional = true }
+
+[features]
+default = []
+ib = ["dep:inference-benchmarker"]

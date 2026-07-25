@@ -1,0 +1,65 @@
+; Tile-level hand-off collapse rules (design §2.5).
+;
+; A producer→consumer hand-off lowered as `(Load (Store producer u) u)` (a DRAM
+; round-trip on unit u) gains its alternative realizations as EQUAL e-class
+; members — non-destructively (`union`), so the round-trip stays available too.
+; A cost-recording extractor (in Rust, §2.6) then picks the cheapest default per
+; hand-off and carries the rest as a relaxable choice.
+;
+; `Comp` carries only the producer's label + unit (the collapse reasons about
+; hand-off edges; the full dataflow lives in the tile graph). dma-dedup needs no
+; rule: identical terms hash-cons to one e-node.
+
+(datatype Tile
+  (Comp String i64)    ; producer label, unit
+  (Store Tile i64)     ; value, unit
+  (Load Tile i64)      ; source, unit
+  (SramHandoff Tile)   ; same-SM resident hand-off       (MustColocate)
+  (DsmHandoff Tile)    ; cross-SM, same-GPC hand-off      (SameDomain)
+  (L2Handoff Tile)     ; same L2 partition hand-off       (SameL2Partition)
+  ; --- cross-unit (cross-node) hand-off realizations ---
+  (CrossStore Tile i64)         ; value written on producer unit ?a
+  (CrossLoad Tile i64 i64)      ; source, producer-unit ?a, consumer-unit ?b
+  (BarrierHandoff Tile i64 i64) ; unified address space — a fence, no copy
+  (P2PHandoff Tile i64 i64)     ; fast fabric (NVLink/Infinity), same node-domain
+  (RdmaHandoff Tile i64 i64))   ; DPU-routed (slow link / inter-node)
+
+; Units that have a distributed-shared-memory (GPC) domain.
+(relation DsmUnit (i64))
+; Units whose L2 is partitioned (per-GPC on H100, per-XCD on MI300).
+; See `plans/l2-partition-chiplet.md`.
+(relation L2Partitioned (i64))
+; The SoC shares one coherent address space (a cross-unit read is a barrier).
+(relation Unified ())
+; Ordered unit pair on the fast peer fabric within one node-domain (units
+; ≤ interconnect.domain_size apart). Beyond it, only RDMA fires.
+(relation FastLink (i64 i64))
+
+; same-SM SRAM hand-off — always an alternative to a same-unit round-trip
+; (the shared ?u on store and load makes this fire only when co-located).
+(rule ((= e (Load (Store ?x ?u) ?u)))
+      ((union e (SramHandoff ?x))))
+
+; DSM hand-off — an extra alternative only on units with a DSM domain.
+(rule ((= e (Load (Store ?x ?u) ?u)) (DsmUnit ?u))
+      ((union e (DsmHandoff ?x))))
+
+; L2-partition-resident hand-off — an extra alternative when the unit has a
+; partitioned L2. Fills the space between SramHandoff (fastest, serialized)
+; and the HBM round-trip (parallel, full DRAM cost).
+(rule ((= e (Load (Store ?x ?u) ?u)) (L2Partitioned ?u))
+      ((union e (L2Handoff ?x))))
+
+; --- cross-unit base term: a Load on consumer ?b of a Store on producer ?a ---
+
+; Unified memory ⇒ the consumer just fences; no data movement.
+(rule ((= e (CrossLoad (CrossStore ?x ?a) ?a ?b)) (Unified))
+      ((union e (BarrierHandoff ?x ?a ?b))))
+
+; Fast peer fabric within a node-domain ⇒ a direct P2P read.
+(rule ((= e (CrossLoad (CrossStore ?x ?a) ?a ?b)) (FastLink ?a ?b))
+      ((union e (P2PHandoff ?x ?a ?b))))
+
+; RDMA over a DPU is always available (the cross-node / slow-link fallback).
+(rule ((= e (CrossLoad (CrossStore ?x ?a) ?a ?b)))
+      ((union e (RdmaHandoff ?x ?a ?b))))

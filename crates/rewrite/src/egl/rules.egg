@@ -1,0 +1,119 @@
+; Stage-2 operator-fusion rewrites (design §2.3). Both are shape-preserving and
+; structural, so no shape conditions are needed yet.
+;
+; Every rewrite MUST be preceded by a `; rule: <name>` annotation. plowc parses
+; these names and submits them to Lean checkpoint A (`Plow.Rewrite.soundRules`),
+; so a rule without an annotation fails compilation with --lean-verify, and a
+; rule whose name has no Lean `rule_*` theorem fails checkpoint A.
+
+; === Cost annotations: fused nodes are always preferred over unfused forms ===
+; (Lower cost = preferred at extraction.)
+
+; === Norm→Linear fusions ===
+
+; rmsnorm-linear-fuse: fold a preceding RMSNorm into the Linear that consumes it
+; (fires on the QKV / gate / up / lm_head projections after a norm). Every weight
+; leaf is preserved in the fused target — no bias is dropped.
+; rule: rmsnorm-linear-fuse
+(rewrite (Linear (RmsNorm ?x ?w ?eps) ?wl ?out)
+         (FusedNormLinear ?x ?w ?wl ?eps ?out))
+
+; rule: rmsnorm-linearbias-fuse
+(rewrite (LinearBias (RmsNorm ?x ?w ?eps) ?wl ?bl ?out)
+         (FusedNormLinearBias ?x ?w ?wl ?bl ?eps ?out))
+
+; layernorm-linear-fuse: same for LayerNorm (fires in SigLIP, DiT). Keep the
+; LayerNorm bias ?b and the linear bias ?bl.
+; rule: layernorm-linear-fuse
+(rewrite (Linear (LayerNorm ?x ?w ?b ?eps) ?wl ?out)
+         (FusedLayerNormLinear ?x ?w ?b ?wl ?eps ?out))
+
+; rule: layernorm-linearbias-fuse
+(rewrite (LinearBias (LayerNorm ?x ?w ?b ?eps) ?wl ?bl ?out)
+         (FusedLayerNormLinearBias ?x ?w ?b ?wl ?bl ?eps ?out))
+
+; === Gated-MLP fusions ===
+
+; gated-MLP core: activation(gate) * up  ->  one SwiGLU/GeGLU op. The act kind
+; ?k rides along so silu (SwiGLU) and gelu_tanh (GeGLU) stay distinct e-nodes.
+; rule: gated-mlp-fuse
+(rewrite (Ew "mul" (Act ?k ?g) ?u)
+         (SwiGLU ?k ?g ?u))
+
+; === GroupNorm + Activation fusion (VAE resnet blocks) ===
+
+; GroupNorm immediately followed by an activation → fused kernel.
+; rule: groupnorm-act-fuse
+(rewrite (Act ?k (GroupNorm ?x ?w ?b ?g ?eps))
+         (FusedGroupNormAct ?x ?w ?b ?g ?eps ?k))
+
+; === AdaLN modulate fusion (DiT blocks) ===
+
+; Pattern: x * (1 + scale) + shift is emitted as: add(add(mul(x, scale), x), shift)
+; which is the modulate helper's lowered form.
+; rule: adaln-modulate-fuse
+(rewrite (Ew "add" (Ew "add" (Ew "mul" ?x ?scale) ?x) ?shift)
+         (FusedAdaLN ?x ?scale ?shift))
+
+; === Gated residual fusion (DiT blocks) ===
+
+; Pattern: x + gate * y (gate_residual helper).
+; rule: gated-residual-fuse
+(rewrite (Ew "add" ?x (Ew "mul" ?y ?gate))
+         (FusedGatedResidual ?x ?y ?gate))
+
+; === Norm→Rope fusions (Gemma3/4 qk_norm paths) ===
+
+; rmsnorm-rope-fuse: fold a preceding RMSNorm (qk_norm) into Rope.
+; Fires on q_norm→RoPE and k_norm→RoPE paths when use_qk_norm is enabled.
+; rule: rmsnorm-rope-fuse
+(rewrite (Rope (RmsNorm ?x ?w ?eps) ?dim ?theta)
+         (FusedNormRope ?x ?w ?eps ?dim ?theta))
+
+; rmsnorm-rope-scale-fuse: the Q path has an additional Scale after RoPE.
+; Fuses norm + rope + scale into one kernel (3→1), eliminating two round-trips.
+; rule: rmsnorm-rope-scale-fuse
+(rewrite (Scale (Rope (RmsNorm ?x ?w ?eps) ?dim ?theta) ?factor)
+         (FusedNormRopeScale ?x ?w ?eps ?dim ?theta ?factor))
+
+; === Residual-add + Norm fusions (every LLM block boundary) ===
+
+; residual-rmsnorm-fuse: RmsNorm consuming an add → single-pass kernel.
+; Fires at every sub-block boundary: add(residual, output) → norm for next block.
+; rule: residual-rmsnorm-fuse
+(rewrite (RmsNorm (Ew "add" ?a ?b) ?w ?eps)
+         (FusedResidualNorm ?a ?b ?w ?eps))
+
+; residual-layernorm-fuse: same for LayerNorm (DiT, SigLIP).
+; rule: residual-layernorm-fuse
+(rewrite (LayerNorm (Ew "add" ?a ?b) ?w ?bias ?eps)
+         (FusedResidualLayerNorm ?a ?b ?w ?bias ?eps))
+
+; === GroupNorm + Activation + Conv3d fusion (VAE resnet inner loop) ===
+
+; GroupNorm+Act already fused → fold in the Conv that immediately consumes it.
+; rule: groupnorm-act-conv3d-fuse
+(rewrite (Conv3d (FusedGroupNormAct ?x ?w ?b ?g ?eps ?k) ?cw ?s ?p)
+         (FusedGroupNormActConv3d ?x ?w ?b ?g ?eps ?k ?cw ?s ?p))
+
+; rule: groupnorm-act-conv3d-bias-fuse
+(rewrite (Conv3dBias (FusedGroupNormAct ?x ?w ?b ?g ?eps ?k) ?cw ?cb ?s ?p)
+         (FusedGroupNormActConv3dBias ?x ?w ?b ?g ?eps ?k ?cw ?cb ?s ?p))
+
+; === Linear + Activation fusion (non-gated MLP paths) ===
+
+; linear-act-fuse: fold an activation into the preceding linear.
+; Fires on SigLIP MLP, DiT per-stream MLP up-projections.
+; rule: linear-act-fuse
+(rewrite (Act ?k (Linear ?x ?w ?out))
+         (FusedLinearAct ?x ?w ?out ?k))
+
+; rule: linearbias-act-fuse
+(rewrite (Act ?k (LinearBias ?x ?w ?b ?out))
+         (FusedLinearBiasAct ?x ?w ?b ?out ?k))
+
+; === Embedding + Scale fusion (Gemma embedding normalizer) ===
+
+; rule: embedding-scale-fuse
+(rewrite (Scale (Embedding ?ids ?table) ?factor)
+         (FusedEmbeddingScale ?ids ?table ?factor))

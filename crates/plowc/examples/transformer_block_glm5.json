@@ -1,0 +1,20 @@
+{
+  "name": "transformer-block-glm5",
+  "note": "Full GLM-5.2 MoE decoder block: MLA attention (low-rank Q path: q_a 6144->2048, q_b 2048->64*256=16384, flash 64 heads head_dim 256, o_proj 16384->6144) + MoE FFN (router 6144->256, one representative routed expert SwiGLU gate+up 6144->2048 act down 2048->6144, shared expert same shape). Linear-chain approximation — same convention as moe_gemma4_26b_a4b.json.",
+  "hidden": 6144,
+  "ops": [
+    { "op": "norm" },
+    { "op": "gemm", "n": 2048, "k": 6144 },
+    { "op": "gemm", "n": 16384, "k": 2048 },
+    { "op": "flash", "heads": 64, "head_dim": 256 },
+    { "op": "gemm", "n": 6144, "k": 16384 },
+    { "op": "norm" },
+    { "op": "gemm", "n": 256, "k": 6144 },
+    { "op": "gemm", "n": 4096, "k": 6144 },
+    { "op": "act" },
+    { "op": "gemm", "n": 6144, "k": 2048 },
+    { "op": "gemm", "n": 4096, "k": 6144 },
+    { "op": "act" },
+    { "op": "gemm", "n": 6144, "k": 2048 }
+  ]
+}

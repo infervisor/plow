@@ -1,0 +1,58 @@
+{
+  "engine": "plow",
+  "experiment": "PX-3 (rtx-11): higher-occupancy prefill GEMM via a smaller N-tile (BN=64) that keeps the FULL 3-stage pipeline",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, single GPU (sm_120a / cc 12.0, 188 SMs)",
+  "cuda_toolkit_on_host": "13.0 (V13.0.88)",
+  "date": "2026-07-21",
+  "branch": "px3-px5-cheap-checks",
+  "model": "/workspace/models/gemma-4-12B-it",
+  "dtype_compute": "bfloat16",
+  "tp": 1,
+  "batch": 1,
+  "thesis": "T10 found occ-2 needs <=50 KiB arena but the BN=128 3-stage GEMM tile is 60 KiB (occ-1); T10 reached occ-2 only by HALVING the pipeline to 2/1 stages, which lost more than occupancy bought. PX-3: a BN=64 N-tile drops the arena to 45 KiB (plain) / 40 KiB (GLU) while KEEPING the tuned 3-stage plain / 2-stage GLU pipeline, so occ-2 is reachable WITHOUT halving the pipeline. Question (T2 found BN=128 wins at occ-1): does BN=64/occ-2 beat BN=128/occ-1 on the SM-saturated prefill GEMM?",
+  "change": "op_gemm.cuh: PGM_BN made -Doverridable (was a hard #define 128). interp_sm120.cu: the lean GEMM segment object (PLOW_NV_SEG_GEMM=1) gains a PLOW_NV_SEG_GEMM_BN64=1 variant that sets PGM_BN=64 and KEEPS PGM_STAGES=3/PGM_GLU_STAGES=2 (vs the default T10 lean object's BN=128 + halved 2/1). CMake wiring for an A/B object is NOT added — the e2e occ-2 win is blocked on the emitter 2*n_cu re-slice (see e2e_status), so the honest per-op measurement is via the standalone k_gemm bench (perf-data/gemm_occ_bench.cu), a dedicated GEMM kernel whose occupancy is set by the GEMM arena+regs ALONE, exactly like the lean object.",
+  "gates": {
+    "parity": "PASS — bit-level. perf-data/gemm_parity.cu (d_gemm 192x320x512, d_gemm_glu 192x320x512 GeGLU) vs an f32 CPU reference: BN=64 and BN=128 report IDENTICAL relL2 (gemm 2.979e-03, glu 3.782e-03). The N-tiling does not change any single output element's K-accumulation order, so BN=64 is element-for-element equal to BN=128 -> first-token agreement is guaranteed (stronger than the T5 first-token gate).",
+    "ptxas": {
+      "standalone_k_gemm_bn64": "55 regs, 0 spill",
+      "standalone_k_gemm_bn128": "94 regs, 0 spill",
+      "megakernel_pfgemm_bn64_full_3stage": "128 regs (launch_bounds(256,2) cap), 24 B stack, 28 B spill stores / 40 B spill loads (residual from the shared interpreter switch, NOT the GEMM body)",
+      "megakernel_pfgemm_bn128_halved_2stage_T10": "128 regs, 248 B stack, 620 B spill stores / 780 B spill loads",
+      "note": "PX-3's BN=64 full-pipeline object has ~20x LESS spill than T10's BN=128 halved-pipeline object, because BN=64 halves PGM_NFRAG (8->4) and the f32 accumulator (64->32 per thread)."
+    },
+    "occ2_verified": {
+      "method": "driver-API cuOccupancyMaxActiveBlocksPerMultiprocessor on the real _pfgemm cubins (perf-data/occ_probe.cu), and cudaOccupancyMaxActiveBlocksPerMultiprocessor on the standalone k_gemm.",
+      "megakernel_pfgemm_bn64_full": "128 regs, 45.0 KiB dynamic arena -> 2 blocks/SM",
+      "megakernel_pfgemm_bn128_halved_T10": "128 regs, 40.0 KiB dynamic arena -> 2 blocks/SM",
+      "standalone_k_gemm_bn64": "55 regs, 45.0 KiB arena -> 2 blocks/SM (occ_gemm=2, occ_glu=2)",
+      "standalone_k_gemm_bn128": "94 regs, 60.0 KiB arena -> 1 block/SM (occ_gemm=1, occ_glu=1)",
+      "verdict": "occ-2 VERIFIED for the BN=64 full-3-stage object: <=128 regs, 45 KiB <= 50 KiB, 2 blocks/SM. This is the pipeline depth T10 could NOT keep at occ-2."
+    }
+  },
+  "microbench": {
+    "harness": "perf-data/gemm_occ_bench.cu — standalone k_gemm / k_gemm_glu (d_gemm / d_gemm_glu), 256 threads, cudaEvent, warmup 8, 30 iters averaged. A block slices tiles by (blockIdx.x, gridDim.x), so grid=188 is 1 block/SM and grid=376 is 2 blocks/SM.",
+    "unit": "ms/op (one full projection GEMM at the 12B prefill shape, K=hidden)",
+    "configs": {
+      "bn128_occ1": "BN=128, grid=188 (the T2 occ-1 ship config)",
+      "bn64_occ1": "BN=64, grid=188 (isolates tile-shape from occupancy)",
+      "bn64_occ2": "BN=64, grid=376 (2 blocks/SM — the PX-3 occ-2 config)"
+    },
+    "rows": [
+      {"op":"q_proj",     "M":4096,"N":4096, "K":3840, "glu":0,"bn128_occ1_ms":0.7337,"bn64_occ1_ms":0.7685,"bn64_occ2_ms":0.7536,"bn64occ2_vs_bn128occ1_pct":2.7},
+      {"op":"o_proj",     "M":4096,"N":3840, "K":4096, "glu":0,"bn128_occ1_ms":0.7654,"bn64_occ1_ms":0.7722,"bn64_occ2_ms":0.7336,"bn64occ2_vs_bn128occ1_pct":-4.2},
+      {"op":"down_proj",  "M":4096,"N":3840, "K":15360,"glu":0,"bn128_occ1_ms":2.7292,"bn64_occ1_ms":2.8996,"bn64_occ2_ms":2.7864,"bn64occ2_vs_bn128occ1_pct":2.1},
+      {"op":"gateup_glu", "M":4096,"N":15360,"K":3840, "glu":1,"bn128_occ1_ms":5.0585,"bn64_occ1_ms":6.2241,"bn64_occ2_ms":4.5910,"bn64occ2_vs_bn128occ1_pct":-9.2},
+      {"op":"q_proj",     "M":8192,"N":4096, "K":3840, "glu":0,"bn128_occ1_ms":1.3268,"bn64_occ1_ms":1.5164,"bn64_occ2_ms":1.4818,"bn64occ2_vs_bn128occ1_pct":11.7},
+      {"op":"o_proj",     "M":8192,"N":3840, "K":4096, "glu":0,"bn128_occ1_ms":1.4109,"bn64_occ1_ms":1.4690,"bn64_occ2_ms":1.4246,"bn64occ2_vs_bn128occ1_pct":1.0},
+      {"op":"down_proj",  "M":8192,"N":3840, "K":15360,"glu":0,"bn128_occ1_ms":4.9908,"bn64_occ1_ms":5.4923,"bn64_occ2_ms":5.2859,"bn64occ2_vs_bn128occ1_pct":5.9},
+      {"op":"gateup_glu", "M":8192,"N":15360,"K":3840, "glu":1,"bn128_occ1_ms":8.9542,"bn64_occ1_ms":10.8063,"bn64_occ2_ms":8.4301,"bn64occ2_vs_bn128occ1_pct":-5.9}
+    ],
+    "per_layer_gemm_sum_ms": {
+      "note": "Sum of the four measured representative ops (q,o,down,gateup_glu). Real qkv is fused N=8192; q_proj is used as the projection representative, so this is a shape-weighted sketch, not the exact per-layer time.",
+      "M4096": {"bn128_occ1": 9.287, "bn64_occ2": 8.865, "delta_pct": -4.5},
+      "M8192": {"bn128_occ1": 16.683, "bn64_occ2": 16.623, "delta_pct": -0.4}
+    }
+  },
+  "e2e_status": "NOT MEASURED — blocked, honestly. The megakernel occ-2 A/B needs the emitter to re-slice the GEMM segments to 2*n_cu=376 blocks so BOTH resident blocks per SM get work; the emitter slices for n_cu=188 (the block body walks tiles by the packet's (slice,nblk), so at nblk=188 blocks 188..375 idle). This is the 'Stage-3 prerequisite' already flagged in runtime/CMakeLists.txt and perf-data/gemma4-12b-t9c-segments-sm120.json ('the occupancy WIN requires the Stage-2 occ-2 lean object, which is blocked on per-segment re-slicing'). Building that emitter path is NOT a cheap check, so per the time-box this arm stops at the per-op standalone A/B, which is the faithful isolated measurement of the same tile at the same occupancy the lean object would run.",
+  "verdict": "SMALL-WIN-OR-WASH, exactly as the plan predicted. occ-2 is genuinely reachable at BN=64 with the FULL 3-stage pipeline (the T10 wall is cleared: 45 KiB, 128 regs, 2 blocks/SM, ~20x less spill than T10's halved-pipeline object). But BN=64/occ-2 only BEATS BN=128/occ-1 on the compute-heaviest op, GEMM_GLU (gate/up, N=15360, two B-streams): -9.2% @ M=4096, -5.9% @ M=8192. The plain projections (q/o/down) are already saturated at occ-1 with the WIDER BN=128 tile (T2's activation-re-read win) and go wash-to-slightly-slower at BN=64/occ-2 (+1..+12%). Net per-layer GEMM: ~-4.5% @ 4k (GLU-driven), ~wash @ 8k. The occupancy the SM-saturated GEMM 'left on the table' is small and op-specific; a production win would emit BN=64/occ-2 for GEMM_GLU ONLY and keep BN=128/occ-1 for the plain projections — but that (and any e2e number) needs the Stage-3 emitter re-slice. As a cheap check: occupancy is NOT a free lever here, confirming T2's arithmetic-intensity finding. Lower priority than PX-1/PX-2 stands."
+}

@@ -1,0 +1,12 @@
+{
+  "name": "attn-mla-deepseek-v2",
+  "note": "QKV attention only, MLA (DeepSeek-V2): hidden 5120, 128 heads, q_lora_rank 1536, kv_lora_rank 512, qk head_dim 192 (128 nope + 64 rope), v_head_dim 128. Modeled as the distinctive two-stage low-rank query path (q_a 5120->1536, q_b 1536->128*192=24576) then attention and o_proj from 128*128=16384. The KV latent down/up projections are omitted because the linear-chain format cannot branch (q and KV both read hidden).",
+  "hidden": 5120,
+  "ops": [
+    { "op": "norm" },
+    { "op": "gemm", "n": 1536, "k": 5120 },
+    { "op": "gemm", "n": 24576, "k": 1536 },
+    { "op": "flash", "heads": 128, "head_dim": 128 },
+    { "op": "gemm", "n": 5120, "k": 16384 }
+  ]
+}

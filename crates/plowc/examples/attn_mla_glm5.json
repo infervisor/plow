@@ -1,0 +1,12 @@
+{
+  "name": "attn-mla-glm5",
+  "note": "MLA attention block (GLM-5.2 style): hidden 6144, 64 heads, q_lora_rank 2048, kv_lora_rank 512, qk_head_dim 256 (192 nope + 64 rope), v_head_dim 256. Models the low-rank query path (q_a 6144->2048, q_b 2048->64*256=16384) then attention and o_proj from 64*256=16384. KV latent path omitted (same linear-chain limitation as deepseek example).",
+  "hidden": 6144,
+  "ops": [
+    { "op": "norm" },
+    { "op": "gemm", "n": 2048, "k": 6144 },
+    { "op": "gemm", "n": 16384, "k": 2048 },
+    { "op": "flash", "heads": 64, "head_dim": 256 },
+    { "op": "gemm", "n": 6144, "k": 16384 }
+  ]
+}

@@ -1,0 +1,21 @@
+# hipBLASLt bf16 TN library MFMA opcode census (whole libhipblaslt BB_BB TN .co):
+  26170 v_mfma_f32_16x16x32_bf16
+     15 v_mfma_f32_32x32x16_bf16
+
+# Back-to-back independent-accumulator MFMA run (each MFMA writes a distinct 4-reg acc, no RAW on prev):
+	v_mfma_f32_16x16x32_bf16 a[0:3], v[32:35], v[16:19]
+	v_mfma_f32_16x16x32_bf16 a[4:7], v[32:35], v[20:23]
+	v_mfma_f32_16x16x32_bf16 a[8:11], v[32:35], v[24:27]
+	v_mfma_f32_16x16x32_bf16 a[12:15], v[32:35], v[28:31]
+	v_mfma_f32_16x16x32_bf16 a[16:19], v[36:39], v[16:19]
+	v_mfma_f32_16x16x32_bf16 a[20:23], v[36:39], v[20:23]
+	v_mfma_f32_16x16x32_bf16 a[24:27], v[36:39], v[24:27]
+	v_mfma_f32_16x16x32_bf16 a[28:31], v[36:39], v[28:31]
+	v_mfma_f32_16x16x32_bf16 a[32:35], v[40:43], v[16:19]
+	v_mfma_f32_16x16x32_bf16 a[36:39], v[40:43], v[20:23]
+	v_mfma_f32_16x16x32_bf16 a[40:43], v[40:43], v[24:27]
+	v_mfma_f32_16x16x32_bf16 a[44:47], v[40:43], v[28:31]
+	v_mfma_f32_16x16x32_bf16 a[48:51], v[44:47], v[16:19]
+	v_mfma_f32_16x16x32_bf16 a[52:55], v[44:47], v[20:23]
+	v_mfma_f32_16x16x32_bf16 a[56:59], v[44:47], v[24:27]
+	v_mfma_f32_16x16x32_bf16 a[60:63], v[44:47], v[28:31]

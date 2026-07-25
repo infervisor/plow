@@ -1,0 +1,14 @@
+[package]
+name = "lean_verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust client for the plow_verify Lean 4 CLI (per-instance verification against the universal lemmas in lean-plow/)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror.workspace = true
+
+[dev-dependencies]
+schedule = { workspace = true }

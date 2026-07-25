@@ -1,0 +1,22 @@
+{
+  "name": "gemma4-12b",
+  "arch": "Gemma4ForCausalLM",
+  "layer_index": 0,
+  "note": "Gemma-4-12B-it dense decoder block (text side)",
+  "config": {
+    "architectures": ["Gemma4ForCausalLM"],
+    "hidden_size": 3072, "num_hidden_layers": 1,
+    "num_attention_heads": 12, "num_key_value_heads": 4,
+    "head_dim": 256, "global_head_dim": 256,
+    "intermediate_size": 12288,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "rms_norm_eps": 1e-06, "attention_bias": false,
+    "max_position_embeddings": 131072, "sliding_window": 1024,
+    "layer_types": ["full_attention"],
+    "rope_parameters": {"full_attention":{"rope_type":"default","rope_theta":1000000.0,"partial_rotary_factor":1.0},"sliding_attention":{"rope_type":"default","rope_theta":10000.0,"partial_rotary_factor":1.0}},
+    "hidden_size_per_layer_input": 0, "num_kv_shared_layers": 0,
+    "attention_k_eq_v": false, "enable_moe_block": false,
+    "use_second_mlp_block": false, "use_double_wide_mlp": false,
+    "attn_logit_softcapping": null
+  }
+}

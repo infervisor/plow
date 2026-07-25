@@ -1,0 +1,4 @@
+c512q1024-u4k-vu1	12	344	throughput	num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0
+c512q1024-u4k-vu4	344	927	throughput	num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0
+c512q1024-u4k-vu8	927	1504	throughput	num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0
+c512q1024-u4k-vu16	1504	2155	throughput	num_tokens=4000,min_tokens=4000,max_tokens=4000,variance=0

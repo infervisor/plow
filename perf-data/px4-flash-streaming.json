@@ -1,0 +1,58 @@
+{
+  "engine": "plow",
+  "experiment": "PX-4 (rtx-11): streaming/restructured FlashAttention for the 128k full-layer prefill tail",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB, single GPU (sm_120a / cc 12.0, 188 SMs, L2 128 MiB, 1792 GB/s HBM)",
+  "cuda_toolkit_on_host": "13.0 (V13.0.88)",
+  "date": "2026-07-21",
+  "branch": "px4-flash-streaming",
+  "scope": "ONLY the 8 FULL hd512 causal layers (nh16 / nkv1, hd512, O(ctx^2)); the 40 sliding hd256 layers are window-capped and untouched (byte-identical).",
+  "dtype_compute": "bfloat16",
+  "change": "d_flash_prefill_px4<512,32,16> (op_attention.cuh, PLOW_NV_FA_PX4=1 default, hd512 arm only): (a) REGISTER softmax fused into the P.V mma A-fragment — each P.V warp computes P for its own 16 query rows in the mma m16n8k16 A layout via quad-shfl row reductions, m/l/corr live in registers, so the Ps smem buffer, its ldmatrix, and one __syncthreads are removed; (b) 8-warp QK — the HD-512 contraction splits into two hd halves (SsA hd0..255 / SsB hd256..511) summed at the softmax read, halving the dependent-mma-chain depth and putting the 4 QK-idle warps of the T5 grid to work; (c) optional TMA (cp.async.bulk + mbarrier per-row KV staging, PLOW_NV_FA_TMA=1) A/B'd vs cp.async.cg. hd256 sliding arm keeps the T5 path byte-identical.",
+  "baseline_note": "The rtx-11-px4-roofline.md 'measured mma 21.9/147.2/1019.4 ms' is the PIPE=0 (T4 synchronous-staging) path, NOT the shipping default. The shipping default is PIPE=1 (T5 cp.async KV-stream), measured here at 11.85/78.61/345.6 ms — already ~3x faster than the roofline baseline at 128k. Both are reported below; PX-4's honest A/B is vs T5 (the real ship point).",
+  "profiling_note": "ncu (dram__throughput etc.) is UNAVAILABLE in this container (ERR_NVGPUCTRPERM, RmProfilingAdminOnly=1). Achieved DRAM BW is derived analytically: bytes = FA-re-read floor 68.99 GB (= roofline 38.5 ms x 1792 GB/s at 128k) / measured time. A phase ablation harness (runtime/nvidia/experiments/px4_fa_ablate.cu) substitutes for ncu counters for the compute/latency attribution.",
+  "correctness_gate": {
+    "oracle": "sm120_interp_op_test full flash-prefill suite PASS in BOTH staging arms (cp.async and TMA) vs the T4-FIXED f32 CPU reference (masked->0, the sensitive oracle): 26 flash_pre cases (causal / sliding-window straddle / hd256+512 / fused ns=1 / split ns>1 + merge / ragged / chunked seq_q<seq_kv q_pos0>0 / soft-softmax) relL2 1.5e-3..2.4e-3, same bf16-P precision band as T5; whole suite ok; wave64 negctrl still FAILs.",
+    "token_identity": "gemma-4-12B, PLOW_PREFILL=1 vs PLOW_PREFILL=0 (decode-only reference). First-gen token AGREES at ctx 256/4k/32k/128k (all = 236770). PX4 prefill step-0 top-5 logits are BIT-IDENTICAL to the T5 baseline prefill (19.00000/18.25000/15.56250/14.81250/14.75000). device==host argmax AGREE."
+  },
+  "microbench": {
+    "harness": "runtime/nvidia/experiments/fa_pv_bench.cu, d_flash_prefill<512,32,16>, grid 188 / 256 threads, nsplit=1, seq_q=8192 tail chunk, q_pos0=seq_kv-seq_q, zeroed data, cudaEvent, warmup 2.",
+    "unit": "ms/op (one full-layer FLASH_PREFILL op)",
+    "rows": [
+      {"seq_kv": 8192,   "t4_pipe0_ms": 21.95,  "t5_ship_ms": 11.85, "px4_cpasync_ms": 9.08,   "px4_tma_ms": 20.73,  "px4_vs_t5_pct": -23.4, "px4_vs_t4_pct": -58.6},
+      {"seq_kv": 32768,  "t4_pipe0_ms": 147.29, "t5_ship_ms": 78.61, "px4_cpasync_ms": 59.68,  "px4_tma_ms": 138.68, "px4_vs_t5_pct": -24.1, "px4_vs_t4_pct": -59.5},
+      {"seq_kv": 131072, "t4_pipe0_ms": 1020.6, "t5_ship_ms": 345.6, "px4_cpasync_ms": 261.96, "px4_tma_ms": 610.59, "px4_vs_t5_pct": -24.2, "px4_vs_t4_pct": -74.3}
+    ]
+  },
+  "achieved_dram_bw_128k": {
+    "method": "derived (ncu unavailable): 68.99 GB / time; floor = 38.5 ms (FA re-read, KV>L2) / 1792 GB/s peak / compute floor 139.7 ms (per rtx-11-px4-roofline.md).",
+    "rows": [
+      {"variant": "T4 (roofline base)", "ms": 1020.6, "bw_gb_s": 67.6,  "pct_peak": 3.8,  "x_off_fa_floor": 26.5, "x_off_compute_floor": 7.31},
+      {"variant": "T5 (shipping)",      "ms": 345.6,  "bw_gb_s": 199.6, "pct_peak": 11.1, "x_off_fa_floor": 8.98,  "x_off_compute_floor": 2.47},
+      {"variant": "PX4",                "ms": 261.96, "bw_gb_s": 263.4, "pct_peak": 14.7, "x_off_fa_floor": 6.80,  "x_off_compute_floor": 1.87}
+    ]
+  },
+  "ablation_128k": {
+    "harness": "runtime/nvidia/experiments/px4_fa_ablate.cu (byte-faithful T5-shape kernel, per-phase compile-time null with all barriers/commits/waits kept). Substitutes for ncu.",
+    "full_ms": 329.99,
+    "phase_cost_ms": {"softmax": 118.0, "qk": 70.3, "staging_exposure_cp_async": 54.0, "pv": 18.8, "loop_barrier_floor": 10.3},
+    "phase_cost_pct": {"softmax": 36, "qk": 21, "staging_exposure": 16, "pv": 6, "floor": 3},
+    "reading": "cp.async-issue-skip removes only 16%, per-tile time is FLAT 8k->128k => the hd512 flash is NOT DRAM-bandwidth-bound (it is compute/latency-bound: softmax + QK dominate). This is why PX-4 attacked the compute geometry (register softmax + 8-warp QK), not just streaming, and why TMA (a pure streaming lever) is a NEGATIVE."
+  },
+  "e2e_prefill": {
+    "harness": "gemma4_sm120_chat, gemma-4-12B, PLOW_PREFILL=1, batch1, TP1, greedy, pkt gemma4-12b-ctx132096-b1. prefill_ms = pure prefill wall (KV build, excl. first decode). PX4 vs a same-session PLOW_NV_FA_PX4=0 (T5) control binary.",
+    "rows": [
+      {"ctx": 4096,   "baseline_t5_ms": 513.2,  "px4_ms": 505.9,  "delta_pct": -1.4,  "first_tok": 236770},
+      {"ctx": 32768,  "baseline_t5_ms": 5050.4, "px4_ms": 4677.1, "delta_pct": -7.4,  "first_tok": 236770},
+      {"ctx": 131072, "baseline_t5_ms": 37363.5,"px4_ms": 31511.3,"delta_pct": -15.7, "first_tok": 236770}
+    ],
+    "reading": "The e2e win grows with ctx (as the 8 full-layer O(ctx^2) flash share rises): -1.4%@4k -> -15.7%@128k, saving 5.85 s of a 37.4 s prefill at 128k. Only the 8 full layers changed; the 40 sliding layers and all GEMM are untouched, so the flash-op-level -24% dilutes to -15.7% e2e at 128k. Baseline 37363 ms reproduces the committed T5 e2e (37223 ms @131000)."
+  },
+  "ptxas": {
+    "px4_cpasync": "k_fa_pre<512,32,16> 96 regs / 0 spill (was ~210 in T5 — register softmax + no Ps buffer); prefill _pf megakernel 240 regs / 0 spill / occ-1; dynamic smem union unchanged at 79.75 KiB (hd256 sliding arm dominates; PX4 hd512 arena SHRINKS to 69.0 KiB).",
+    "px4_tma": "k_fa_pre<512,32,16> 126 regs / 0 spill."
+  },
+  "negatives": [
+    "TMA (cp.async.bulk + mbarrier) KV staging is ~2x SLOWER than cp.async.cg at every ctx (20.7/138.7/610.6 vs 9.08/59.68/261.96 ms). Root cause: sm_120 single-CTA TMA issues one bulk copy per contiguous row from ONE thread (no .tensor 2D tiling that would batch the 16 BKV rows), serializing 16 per-row descriptors while cp.async.cg spreads 16B lines across all 256 threads. Consistent with rtx-05/gemv_transport 'TMA refuted for small/1-D streams'. Kept behind PLOW_NV_FA_TMA=0 (opt-in) as a measured negative.",
+    "The roofline framed PX-4 partly as a KV-streaming/bandwidth problem. The ablation DISPROVES that for the hd512 flash: it is compute/latency-bound (cp.async-issue removal saves only 16%), so a pure streaming lever (TMA) cannot help — the win came from the compute-geometry restructure (register softmax + 8-warp QK)."
+  ]
+}

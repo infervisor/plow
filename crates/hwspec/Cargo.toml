@@ -1,0 +1,8 @@
+[package]
+name = "hwspec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Static per-GPU hardware capability descriptors (SMs, shared memory, bandwidth, DSM grouping, HBM) consumed by the scheduler cost model and parallelism planner"
+
+[dependencies]

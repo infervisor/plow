@@ -1,0 +1,76 @@
+[package]
+name = "plowc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "plow compiler driver: a model / network → packet streams for a hardware spec"
+default-run = "plowc"
+
+[[bin]]
+name = "plowc"
+path = "src/main.rs"
+
+[[bin]]
+name = "llama3"
+path = "src/bin/llama3.rs"
+
+# DEPRECATED: `tinygemma` is a self-contained Gemma-4-block fixture generator
+# for the C harness `runtime/tests/net_gemma_block_test.c`. The former `gemma4`
+# device-blob emitter has been removed — that emitter now lives in the `devgen`
+# crate and is driven by `plowc --emit devblob`. `tinygemma` stays behind
+# `--features legacy-gemma-bins` until its C consumer is migrated.
+[[bin]]
+name = "tinygemma"
+path = "src/bin/tinygemma.rs"
+required-features = ["legacy-gemma-bins"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nn-graph = { workspace = true }
+costmodel = { workspace = true }
+# Non-optional: the device-blob emitter (`devgen`, always linked for `--emit
+# devblob`) needs the kernel capability inventory for tile selection, and
+# `plowc tune` / the CompilerOracle use it too. Only the *measurement* database
+# (tunedb) is optional — see the `tuner` feature.
+kernelcaps = { workspace = true }
+tunedb = { workspace = true, optional = true }
+# Device-blob emitter (PLOWDEV): lets `plowc --emit devblob` produce a
+# GPU-servable program directly, and backs the deprecated `gemma4` bin.
+devgen = { workspace = true }
+hwspec = { workspace = true }
+rewrite = { workspace = true }
+packet = { workspace = true }
+schedule = { workspace = true }
+plow-asset = { workspace = true }
+# `hub` lets `--model <hf-id>` resolve a config over the network.
+frontend = { workspace = true, features = ["hub"] }
+# Optional: JSON-IPC bridge to the Lean verifier CLI. See the `lean-verify`
+# feature below — without it, `--lean-verify` on the CLI returns a build-time
+# error instead of spawning `plow_verify`.
+lean_verify = { workspace = true, optional = true }
+
+[dev-dependencies]
+plowrt = { path = "../plowrt" }
+packet = { workspace = true }
+costmodel = { workspace = true }
+
+[features]
+default = ["tuner"]
+# Qualified-measurement tuner (`plowc tune`, the tunedb-backed CompilerOracle).
+# On by default; build with `--no-default-features` for a standalone compiler
+# that uses the analytical cost model + capability inventory only — the output
+# is byte-identical to passing `--no-tuning`. (The capability inventory itself,
+# kernelcaps, is always compiled in; the emitter needs it.)
+tuner = ["dep:tunedb"]
+# DEPRECATED `tinygemma` fixture binary (the C net_gemma_block_test harness).
+# Off by default so a plain plowc build stands alone. The `gemma4` device-blob
+# emitter it used to sit beside is gone — use `plowc --emit devblob`.
+legacy-gemma-bins = []
+# Compile in the Lean verifier bridge. Adds ~3 crates to the dep graph
+# (serde already present); no runtime effect unless `--lean-verify` is passed.
+lean-verify = ["dep:lean_verify", "schedule/lean-verify"]

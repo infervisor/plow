@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "experiment": "gemma4-26b-a4b fp8 weights + fp8 (e4m3) KV cache decode (PLOW_FP8_KV) vs vLLM",
+  "model": "gemma-4-26B-A4B-it",
+  "gpu": "RTX PRO 6000 Blackwell (sm_120, 188 SM, CUDA 13.0)",
+  "date": "2026-07-22",
+  "commit_measured": "7fd19fb",
+  "commit_committed": "08896b4",
+  "numerically_equiv_note": "measured at 7fd19fb; trap-fix baseline 3bd8874 (fp8-KV fix inert for FP8KV=true path). main since advanced with perf-relevant interp changes NOT re-measured (4310a06 signaling fan-out, 08896b4 devinst64); absolute TPOT may differ ~0.1-0.2ms on current main (uniform, all plow configs). Verdict robust: mid-range win + ~1.8x long-ctx KV slope are structural.",
+  "method": {
+    "batch": 1,
+    "tp": 1,
+    "prefill": false,
+    "warmup_steps": 16,
+    "timed_steps": 120,
+    "prompts_per_context": 1,
+    "prompt_source": "vLLM RandomDataset seed 0 p0",
+    "harness": "gemma4_sm120_chat",
+    "scheduler": "GLOBAL QUEUE",
+    "packet": "PLOW_UNISEG=1 PLOW_NS_FULL_ABS=48 PLOW_FP8=1 PLOW_FP8_HEAD=1 PLOW_FP8_KV=1",
+    "binary_flags": "-DPLOW_NV_FA_GF_FULL=4 -DPLOW_NV_W8A8=ON -DPLOW_FP8_KV=ON"
+  },
+  "build_gate": {
+    "default_byte_identical": true,
+    "bf16_packet_md5": "04c807bd2d5c862e446406b7bc2bcdb8",
+    "bf16_packet_md5_matches_committed_b1": true,
+    "fp8kv_decode_regs": 222,
+    "fp8kv_decode_stack": 0,
+    "kv_cache_gib_fp8": 2.86,
+    "kv_cache_gib_bf16": 5.64,
+    "kv_reduction_pct": -49
+  },
+  "decode_tpot_ms": [
+    {
+      "ctx": 1024,
+      "plow_fp8kv": 6.126,
+      "plow_fp8head": 5.84,
+      "plow_bf16": 8.24,
+      "vllm_bf16": 7.61,
+      "vllm_fp8": 5.76,
+      "vllm_fp8kv": 5.92,
+      "fp8kv_vs_vllm_fp8kv": 0.21,
+      "win_vs_vllm_fp8kv": false
+    },
+    {
+      "ctx": 4096,
+      "plow_fp8kv": 6.149,
+      "plow_fp8head": 5.89,
+      "plow_bf16": 8.29,
+      "vllm_bf16": 7.9,
+      "vllm_fp8": 6.08,
+      "vllm_fp8kv": 6.19,
+      "fp8kv_vs_vllm_fp8kv": -0.04,
+      "win_vs_vllm_fp8kv": true
+    },
+    {
+      "ctx": 16384,
+      "plow_fp8kv": 6.437,
+      "plow_fp8head": 6.2,
+      "plow_bf16": 8.61,
+      "vllm_bf16": 8.64,
+      "vllm_fp8": 6.82,
+      "vllm_fp8kv": 6.62,
+      "fp8kv_vs_vllm_fp8kv": -0.18,
+      "win_vs_vllm_fp8kv": true
+    },
+    {
+      "ctx": 32768,
+      "plow_fp8kv": 6.702,
+      "plow_fp8head": 6.67,
+      "plow_bf16": 9.07,
+      "vllm_bf16": 9.57,
+      "vllm_fp8": 7.74,
+      "vllm_fp8kv": 7.28,
+      "fp8kv_vs_vllm_fp8kv": -0.58,
+      "win_vs_vllm_fp8kv": true
+    },
+    {
+      "ctx": 65536,
+      "plow_fp8kv": 7.442,
+      "plow_fp8head": 7.54,
+      "plow_bf16": 9.94,
+      "vllm_bf16": 10.33,
+      "vllm_fp8": 8.63,
+      "vllm_fp8kv": 7.52,
+      "fp8kv_vs_vllm_fp8kv": -0.08,
+      "win_vs_vllm_fp8kv": true
+    },
+    {
+      "ctx": 98304,
+      "plow_fp8kv": 8.118,
+      "plow_fp8head": 8.4,
+      "plow_bf16": 10.81,
+      "vllm_bf16": 11.34,
+      "vllm_fp8": 9.54,
+      "vllm_fp8kv": 7.94,
+      "fp8kv_vs_vllm_fp8kv": 0.18,
+      "win_vs_vllm_fp8kv": false
+    },
+    {
+      "ctx": 131072,
+      "plow_fp8kv": 8.791,
+      "plow_fp8head": 9.16,
+      "plow_bf16": 11.57,
+      "vllm_bf16": 12.34,
+      "vllm_fp8": 10.48,
+      "vllm_fp8kv": 8.46,
+      "fp8kv_vs_vllm_fp8kv": 0.33,
+      "win_vs_vllm_fp8kv": false
+    }
+  ],
+  "marginal_kv_ns_per_tok_32k_to_128k": {
+    "plow_fp8kv": 21.3,
+    "vllm_fp8kv": 12.0,
+    "ratio": 1.78
+  },
+  "verdict": {
+    "subgoal1_fp8kv": "PARTIAL: 26B fp8-KV trap fixed; beats vLLM fp8kv at 4k/16k/32k/64k; halves 96k/128k deficit (fp8+head +0.46/+0.70 -> fp8kv +0.18/+0.33) but does NOT beat vLLM fp8kv at 96k/128k. Cause: FlashDecodeFp8 hd512 read slope ~1.8x vLLM, not weights.",
+    "subgoal2_bf16_shortctx": "NO-GO: dense GEMV bodies at 60-84% BW ceiling (M=1 bound) + 21.6% interpreter gate-wait; no cheap lever.",
+    "subgoal3_fp8_1k": "NO-GO: E6 committed honest-negative (GEMVs BW-saturate all SMs, RoPE already overlapped); E7 fuse-argmax ~0-perf and gated !fp8_head."
+  },
+  "correctness": {
+    "oracle": "sm120_interp_op_test: ok (full suite incl. w8a8 GEMM relL2 0/5.9e-5)",
+    "realtext_parity": {
+      "prompt": "prompt_tpot.ids 3587 natural tokens (E3 real-text prompt)",
+      "first_token": "MATCH(236865)",
+      "identical_greedy_prefix": 20,
+      "step0_logit_relL2_pct": 4.96,
+      "top2": "identical",
+      "band": "vLLM-fp8kv-class (E3 2.7-5.9%); NOT bit-exact (e4m3 KV)"
+    },
+    "randomtoken_artifact": {
+      "step0_relL2_pct": 68.9,
+      "note": "degenerate-input artifact (E3 82% periodic class); not a valid signal"
+    },
+    "within_run_argmax": "device==host AGREE at all 7 ladder ctx"
+  }
+}

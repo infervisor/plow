@@ -1,0 +1,11 @@
+{
+  "name": "mlp-swiglu-llama3-8b",
+  "note": "FFN/MLP block only (Llama-3-8B SwiGLU): hidden 4096, intermediate 14336. norm -> up projection (4096->14336) -> SiLU -> down projection (14336->4096). The gate*up elementwise product is folded into the single up projection (linear-chain format).",
+  "hidden": 4096,
+  "ops": [
+    { "op": "norm" },
+    { "op": "gemm", "n": 14336, "k": 4096 },
+    { "op": "act" },
+    { "op": "gemm", "n": 4096, "k": 14336 }
+  ]
+}

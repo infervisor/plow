@@ -1,0 +1,230 @@
+{
+  "model": "GLM-5.2-FP8",
+  "model_arch": "GlmMoeDsaForCausalLM (glm_moe_dsa; DeepSeek-V3.2-DSA-class: MLA + sparse-attention indexer + fine-grained block-fp8 MoE, 78 layers, 256 experts top-8 + 1 shared, hidden 6144, 1M max ctx)",
+  "engine": "plow",
+  "version": "plow @ glm52-tuned a04b93a (converged final: router-split+topk+EP+grouped+UN+nsplit-fix+fused-fold+waterfall+coresident+GF)",
+  "gpu": "AMD gfx950 (MI350X-class, CDNA4), 8-GPU node; ROCR_VISIBLE_DEVICES pins shard GPUs (HSA binary; HIP_VISIBLE_DEVICES is ignored)",
+  "date": "2026-07-17",
+  "precision": "fp8",
+  "quantization": "fp8 block (e4m3, weight_block_size [128,128], dynamic acts) \u2014 experts + attn/dense projections block-fp8; norms/router/embed/lm_head + MLA-derived weights bf16",
+  "dtype": "bfloat16 (compute; MLA latent KV bf16)",
+  "batch": 1,
+  "concurrency": 1,
+  "bit_exact": false,
+  "metric": "tpot_ms (median 1-token decode step, ms/tok)",
+  "methodology": "per-ctx-sized pkt (max_ctx = ctx) so the ctx-adaptive nsplit + per-pkt GF (GF=2<=4k, GF=4 long) are realized at each point; median of 21 steps after 2 warmup. TP shards experts K/N-wise + all-reduce; EP binds whole experts per rank (256/deg), replicated attn.",
+  "tuning": "router-split (multi-CU score GEMV + 1-CU topk) + wave-parallel MoeRouterTopk + co-resident experts (GLM_MOE_CORESIDENT=1) + grouped block-fp8 experts + K-adaptive GEMV UN + per-rank ctx-scaled nsplit fill-fix + fused MlaMergeFold + block-fp8 buffer-waterfall + per-pkt MLA GF",
+  "pending": "DSA-gather indexer (long-ctx) + MoE co-residency floor still landing on glm-tilegraph \u2014 not in these numbers",
+  "results": [
+    {
+      "tp": 2,
+      "mode": "ep",
+      "ctx": null,
+      "tpot_ms": null,
+      "notes": "EP2: does not fit \u2014 expert weight ~362 GiB/rank exceeds the 288 GiB MI350X (OOM at expert-alloc L59)"
+    },
+    {
+      "tp": 4,
+      "mode": "ep",
+      "ctx": 1024,
+      "tpot_ms": 46.371,
+      "notes": "EP4"
+    },
+    {
+      "tp": 4,
+      "mode": "ep",
+      "ctx": 4096,
+      "tpot_ms": 46.838,
+      "notes": "EP4"
+    },
+    {
+      "tp": 4,
+      "mode": "ep",
+      "ctx": 8192,
+      "tpot_ms": 48.399,
+      "notes": "EP4"
+    },
+    {
+      "tp": 4,
+      "mode": "ep",
+      "ctx": 16384,
+      "tpot_ms": 49.776,
+      "notes": "EP4"
+    },
+    {
+      "tp": 4,
+      "mode": "ep",
+      "ctx": 32768,
+      "tpot_ms": 53.036,
+      "notes": "EP4"
+    },
+    {
+      "tp": 4,
+      "mode": "ep",
+      "ctx": 65536,
+      "tpot_ms": 53.353,
+      "notes": "EP4"
+    },
+    {
+      "tp": 4,
+      "mode": "ep",
+      "ctx": 131072,
+      "tpot_ms": 61.554,
+      "notes": "EP4"
+    },
+    {
+      "tp": 8,
+      "mode": "ep",
+      "ctx": 1024,
+      "tpot_ms": 46.251,
+      "notes": "EP8"
+    },
+    {
+      "tp": 8,
+      "mode": "ep",
+      "ctx": 4096,
+      "tpot_ms": 46.713,
+      "notes": "EP8"
+    },
+    {
+      "tp": 8,
+      "mode": "ep",
+      "ctx": 8192,
+      "tpot_ms": 46.123,
+      "notes": "EP8"
+    },
+    {
+      "tp": 8,
+      "mode": "ep",
+      "ctx": 16384,
+      "tpot_ms": 46.77,
+      "notes": "EP8"
+    },
+    {
+      "tp": 8,
+      "mode": "ep",
+      "ctx": 32768,
+      "tpot_ms": 52.214,
+      "notes": "EP8"
+    },
+    {
+      "tp": 8,
+      "mode": "ep",
+      "ctx": 65536,
+      "tpot_ms": 50.789,
+      "notes": "EP8"
+    },
+    {
+      "tp": 8,
+      "mode": "ep",
+      "ctx": 131072,
+      "tpot_ms": 55.515,
+      "notes": "EP8"
+    },
+    {
+      "tp": 2,
+      "mode": "tp",
+      "ctx": null,
+      "tpot_ms": null,
+      "notes": "TP2: does not fit \u2014 expert weight ~362 GiB/rank exceeds the 288 GiB MI350X (OOM at expert-alloc L59)"
+    },
+    {
+      "tp": 4,
+      "mode": "tp",
+      "ctx": 1024,
+      "tpot_ms": 41.149,
+      "notes": "TP4"
+    },
+    {
+      "tp": 4,
+      "mode": "tp",
+      "ctx": 4096,
+      "tpot_ms": 41.606,
+      "notes": "TP4"
+    },
+    {
+      "tp": 4,
+      "mode": "tp",
+      "ctx": 8192,
+      "tpot_ms": 43.313,
+      "notes": "TP4"
+    },
+    {
+      "tp": 4,
+      "mode": "tp",
+      "ctx": 16384,
+      "tpot_ms": 44.607,
+      "notes": "TP4"
+    },
+    {
+      "tp": 4,
+      "mode": "tp",
+      "ctx": 32768,
+      "tpot_ms": 47.998,
+      "notes": "TP4"
+    },
+    {
+      "tp": 4,
+      "mode": "tp",
+      "ctx": 65536,
+      "tpot_ms": 49.081,
+      "notes": "TP4"
+    },
+    {
+      "tp": 4,
+      "mode": "tp",
+      "ctx": 131072,
+      "tpot_ms": 57.349,
+      "notes": "TP4"
+    },
+    {
+      "tp": 8,
+      "mode": "tp",
+      "ctx": 1024,
+      "tpot_ms": 40.213,
+      "notes": "TP8"
+    },
+    {
+      "tp": 8,
+      "mode": "tp",
+      "ctx": 4096,
+      "tpot_ms": 41.007,
+      "notes": "TP8"
+    },
+    {
+      "tp": 8,
+      "mode": "tp",
+      "ctx": 8192,
+      "tpot_ms": 42.759,
+      "notes": "TP8"
+    },
+    {
+      "tp": 8,
+      "mode": "tp",
+      "ctx": 16384,
+      "tpot_ms": 43.792,
+      "notes": "TP8"
+    },
+    {
+      "tp": 8,
+      "mode": "tp",
+      "ctx": 32768,
+      "tpot_ms": 43.468,
+      "notes": "TP8"
+    },
+    {
+      "tp": 8,
+      "mode": "tp",
+      "ctx": 65536,
+      "tpot_ms": 51.892,
+      "notes": "TP8"
+    },
+    {
+      "tp": 8,
+      "mode": "tp",
+      "ctx": 131072,
+      "tpot_ms": 50.684,
+      "notes": "TP8"
+    }
+  ]
+}

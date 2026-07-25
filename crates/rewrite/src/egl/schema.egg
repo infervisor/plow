@@ -1,0 +1,79 @@
+; Operator-graph schema for the rewriting half (Stage-2 fusion slice).
+; Mirrors the nn-graph ops. Leaves carry the tensor name so extraction can map
+; back to weights/inputs. Attributes that fusion does not reason about (shapes,
+; attention config) ride along as opaque tokens. Fused targets have fewer
+; e-nodes than the forms they replace, so egglog's default (tree-size) cost
+; prefers them at extraction — explicit cost annotations reinforce this.
+
+(datatype Expr
+  (Input String)                       ; named graph input
+  (Weight String)                      ; named model weight
+
+  ; --- core ops (text decoders) ---
+  (Embedding Expr Expr)                ; ids, table
+  (Scale Expr f64)                     ; x, factor
+  (RmsNorm Expr Expr f64)              ; x, weight, eps
+  (LayerNorm Expr Expr Expr f64)       ; x, weight, bias, eps
+  (Linear Expr Expr i64)              ; x, weight, out_features
+  (LinearBias Expr Expr Expr i64)     ; x, weight, bias, out_features
+  (MatMul Expr Expr)                   ; a, b
+  (Reshape Expr String)               ; x, shape-token
+  (Transpose Expr String)             ; x, perm-token
+  (Rope Expr i64 f64)                 ; x, rotary_dim, theta
+  (Attention Expr Expr Expr String)   ; q, k, v, config-token (opaque attrs)
+  (Ew String Expr Expr)               ; kind, a, b
+  (Act String Expr)                   ; kind, x
+  (Softmax Expr i64)                  ; x, axis
+
+  ; --- sequence / shape manipulation ---
+  (Concat i64 Expr Expr)              ; axis, a, b (binary; n-ary chains)
+  (Slice Expr i64 String String)      ; x, axis, start-token, len-token (possibly symbolic)
+  (Broadcast Expr String)             ; x, shape-token
+  (Reduce String Expr i64)            ; kind, x, axis
+
+  ; --- spatial ops (vision / VAE) ---
+  (Conv2d Expr Expr String String)         ; x, weight, stride-tok, padding-tok
+  (Conv2dBias Expr Expr Expr String String) ; x, weight, bias, stride-tok, padding-tok
+  (Conv3d Expr Expr String String)         ; x, weight, stride-tok, padding-tok
+  (Conv3dBias Expr Expr Expr String String) ; x, weight, bias, stride-tok, padding-tok
+  (GroupNorm Expr Expr Expr i64 f64)   ; x, weight, bias, groups, eps
+
+  ; --- routing (MoE) ---
+  (MoeRouter Expr Expr i64 i64)       ; x, weight, num_experts, top_k
+
+  ; --- catch-all for ops not yet in the fusion vocabulary ---
+  ; Allows the full graph to lower without error; no rewrite targets Opaque.
+  (Opaque String Expr)                ; op_name, single-input passthrough
+
+  ; === fused targets ===
+  ; Norm→Linear fusions keep EVERY weight leaf (norm bias, linear bias) so the
+  ; fused kernel reproduces the math and the weight manifest stays complete.
+  (FusedNormLinear Expr Expr Expr f64 i64)             ; x, normw, linw, eps, out  (RMSNorm + biasless Linear)
+  (FusedNormLinearBias Expr Expr Expr Expr f64 i64)    ; x, normw, linw, linb, eps, out  (RMSNorm + biased Linear)
+  (FusedLayerNormLinear Expr Expr Expr Expr f64 i64)   ; x, normw, normb, linw, eps, out
+  (FusedLayerNormLinearBias Expr Expr Expr Expr Expr f64 i64) ; x, normw, normb, linw, linb, eps, out
+  (SwiGLU String Expr Expr)                   ; act kind, gate_proj_out, up_proj_out
+  (FusedGroupNormAct Expr Expr Expr i64 f64 String)  ; x, w, b, groups, eps, act
+  (FusedAdaLN Expr Expr Expr)                 ; x, scale, shift
+  (FusedGatedResidual Expr Expr Expr)         ; x, y, gate
+
+  ; Norm→Rope fusions (Gemma3/4 qk_norm: RmsNorm immediately before RoPE).
+  (FusedNormRope Expr Expr f64 i64 f64)       ; x, normw, eps, rotary_dim, theta
+  (FusedNormRopeScale Expr Expr f64 i64 f64 f64) ; x, normw, eps, rotary_dim, theta, scale_factor
+
+  ; Residual-add + Norm fusion (fires at every block boundary in LLMs).
+  (FusedResidualNorm Expr Expr Expr f64)             ; a, b, normw, eps  (add(a,b) then RMSNorm)
+  (FusedResidualLayerNorm Expr Expr Expr Expr f64)   ; a, b, normw, normb, eps
+
+  ; GroupNorm + Activation + Conv3d fusion (VAE resnet inner loop).
+  (FusedGroupNormActConv3d Expr Expr Expr i64 f64 String Expr String String)
+      ; x, gnW, gnB, groups, eps, act, convW, stride-tok, pad-tok
+  (FusedGroupNormActConv3dBias Expr Expr Expr i64 f64 String Expr Expr String String)
+      ; x, gnW, gnB, groups, eps, act, convW, convB, stride-tok, pad-tok
+
+  ; Linear + Activation fusion (non-gated MLP paths: SigLIP, DiT).
+  (FusedLinearAct Expr Expr i64 String)              ; x, weight, out, act_kind
+  (FusedLinearBiasAct Expr Expr Expr i64 String)     ; x, weight, bias, out, act_kind
+
+  ; Embedding + Scale fusion (Gemma embedding normalizer).
+  (FusedEmbeddingScale Expr Expr f64))              ; ids, table, factor
