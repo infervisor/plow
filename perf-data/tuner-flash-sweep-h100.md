@@ -24,6 +24,30 @@ name, so a knob family can be added without a naming scheme that can silently
 collide. An unnamed flash axis emits no `-D`, so a sweep that ignores the family
 builds byte-identical objects to one from before it existed.
 
+## Two rows were thrown away, and the harness now throws them away for me
+
+`FA_KUN=2` at ctx=8192 came back 4.845 / 5.101 / 4.973 and `FA_KUN=4` at
+ctx=1024 came back 4.602 / 5.190 / 4.600 — relative spreads of 0.051 and 0.128,
+where every surviving row in the grid sits at **0.001–0.004**. Nothing in the
+harness rejected them, and the first was about to be reported as a 0.16 ms
+`FA_KUN` regression — which would have been a *fabricated confirmation* of round
+6's real refutation of K pre-issue, the worst kind of wrong because it looks
+right.
+
+A configuration cannot make its own timing erratic on a quiet card; a neighbour
+can. So a wide rep spread is the same class of problem as a contended GPU and
+now gets the same treatment rather than a footnote:
+
+- the sweep records `rel_spread` = (max−min)/median per row and marks it
+  `stable: false` past `--max-spread` (default 0.01);
+- `tunedb-decode ingest` refuses to qualify an unstable row, naming the worst
+  spread, unless `--provisional` keeps it unselectable;
+- a row missing the field defaults to **unstable**, not to a pass.
+
+Both rows are dropped rather than averaged in, so `FA_KUN` is **unmeasured**
+here rather than measured-and-neutral. That is three gates now enforced in code
+instead of remembered: correctness unchecked, GPU uncontended, reps disagree.
+
 ## The contention caveat, unchanged
 
 No number here was taken on a verified-idle GPU: the box's ~52.5 GB foreign

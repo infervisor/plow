@@ -126,6 +126,12 @@ MEM_RUN=""                 # MiB; hard ceiling to attempt a run at all (default 
 WAIT_MAX=0                 # s to wait for MEM_IDLE before falling back to MEM_RUN; 0 = forever
 WAIT_S=60
 SETTLE_S=6                 # s to let our own VRAM drain between reps
+# Max (max-min)/median a row may show before it is called unstable. Reps on a
+# quiet card land inside 0.001-0.004 on this step; an order of magnitude past
+# that is a disturbed run, not a slow configuration. A configuration cannot make
+# its own timing erratic -- a neighbour can. Recorded on the row, and
+# `tunedb-decode ingest` refuses to qualify it.
+MAX_SPREAD=0.01
 LABEL_PREFIX=tds
 DRY=0
 
@@ -164,6 +170,7 @@ while [ $# -gt 0 ]; do
     --mem-run) MEM_RUN="$2"; shift 2;;
     --wait-max) WAIT_MAX="$2"; shift 2;;
     --settle) SETTLE_S="$2"; shift 2;;
+    --max-spread) MAX_SPREAD="$2"; shift 2;;
     --label) LABEL_PREFIX="$2"; shift 2;;
     --dry-run) DRY=1; shift;;
     -h|--help) usage 0;;
@@ -457,6 +464,14 @@ for occ in $OCC; do
         fi
         med="$(median "${samples[@]}")"
         list="$(printf '%s,' "${samples[@]}")"; list="[${list%,}]"
+        spread="$(printf '%s\n' "${samples[@]}" | sort -g \
+          | awk -v m="$med" 'NR==1{lo=$1} END{printf "%.6f", ($1-lo)/m}')"
+        if awk -v s="$spread" -v m="$MAX_SPREAD" 'BEGIN{exit !(s>m)}'; then
+          stable=false
+          echo "  !! rep spread ${spread} exceeds ${MAX_SPREAD} - row marked UNSTABLE" >&2
+        else
+          stable=true
+        fi
 
         # The ablated twin, same packet and ctx. TPOT(full) - TPOT(ablated) is
         # the op's real contribution AT THIS GRID, imbalance included, which is
@@ -485,12 +500,14 @@ for occ in $OCC; do
           "$ns" "$nsf" "${w:-null}" "${g:-null}" "${gf:-null}" "${k:-null}" >>"$RESULTS"
         printf '"samples_ms":%s,"median_ms":%s,"ablated_ms":%s,"op_cost_ms":%s,' \
           "$list" "$med" "$abl_med" "$abl_cost" >>"$RESULTS"
-        printf '"ablate_lo":%s,"ablate_hi":%s,"registers":%s,"toolchain":"%s","implementation":"%s",' \
-          "$ABLATE_LO" "$ABLATE_HI" "$regs" "$TOOLCHAIN" "$IMPL" >>"$RESULTS"
+        printf '"ablate_lo":%s,"ablate_hi":%s,"rel_spread":%s,"stable":%s,' \
+          "$ABLATE_LO" "$ABLATE_HI" "$spread" "$stable" >>"$RESULTS"
+        printf '"registers":%s,"toolchain":"%s","implementation":"%s",' \
+          "$regs" "$TOOLCHAIN" "$IMPL" >>"$RESULTS"
         if [ "$worst_vram" -le "$MEM_IDLE" ]; then unc=true; else unc=false; fi
         printf '"cubin_sha":"%s","pkt_sha":"%s","vram_before_mib":%s,"uncontended":%s,"campaign":"%s","ts":"%s"}\n' \
           "$csha" "$psha" "$worst_vram" "$unc" "$CAMPAIGN" "$(date -Is)" >>"$RESULTS"
-        echo "  -> median ${med} ms of ${#samples[@]} (${samples[*]})  abl=${abl_med} op_cost=${abl_cost}  vram=${worst_vram} unc=${unc}"
+        echo "  -> median ${med} ms of ${#samples[@]} (${samples[*]})  abl=${abl_med} op_cost=${abl_cost}  spread=${spread} stable=${stable} vram=${worst_vram} unc=${unc}"
       done
     done; done
   done; done; done; done; done; done; done; done

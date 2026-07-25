@@ -107,6 +107,12 @@ struct Row {
     /// Ablated-twin median and the op cost it implies, when the sweep built one.
     #[serde(default)]
     op_cost_ms: Option<f64>,
+    /// Whether the sweep's reps agreed. Absent in rows written before the check
+    /// existed, which default to unstable rather than to a pass.
+    #[serde(default)]
+    stable: bool,
+    #[serde(default)]
+    rel_spread: Option<f64>,
     /// TPOT of each `step_bench` invocation, milliseconds.
     samples_ms: Vec<f64>,
     registers: Option<u32>,
@@ -134,6 +140,8 @@ fn ingest(
     let mut skipped = 0usize;
     let mut contended = 0usize;
     let mut worst_vram = 0u64;
+    let mut unstable = 0usize;
+    let mut worst_spread = 0.0f64;
 
     for (n, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -144,6 +152,14 @@ fn ingest(
         if !r.uncontended {
             contended += 1;
             worst_vram = worst_vram.max(r.vram_before_mib.unwrap_or(0));
+        }
+        // Reps that disagree are not a measurement. A configuration cannot make
+        // its own timing erratic on a quiet card, so a wide spread means the run
+        // was disturbed -- the same class of problem as a contended GPU, and it
+        // gets the same treatment rather than a footnote.
+        if !r.stable {
+            unstable += 1;
+            worst_spread = worst_spread.max(r.rel_spread.unwrap_or(f64::INFINITY));
         }
         // Milliseconds in the harness, nanoseconds in the store: the store's
         // unit is fixed and converting at the boundary is the only place the
@@ -217,6 +233,17 @@ fn ingest(
         .into());
     }
 
+    if unstable > 0 && !provisional {
+        return Err(format!(
+            "{unstable} of these rows have reps that disagree (worst relative spread \
+             {worst_spread:.3}).\n  \
+             A configuration cannot make its own timing erratic on a quiet card; the run \
+             was disturbed.\n  \
+             Re-measure them, or ingest with --provisional to keep them unselectable."
+        )
+        .into());
+    }
+
     let store = TuneStore::new(db.clone());
     for (hw, records) in by_hw {
         let n = records.len();
@@ -239,6 +266,9 @@ fn ingest(
     }
     if contended > 0 {
         println!("{contended} row(s) could not verify an uncontended GPU — kept unselectable");
+    }
+    if unstable > 0 {
+        println!("{unstable} row(s) had reps that disagree — kept unselectable");
     }
     Ok(())
 }
