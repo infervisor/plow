@@ -1248,3 +1248,51 @@ actually back-to-back.
 
 fp8 is now **3.2 %** off vLLM. The remaining 0.135 ms would have to come out of flash's
 0.307 — the non-flash floor (4.245) is already below vLLM's total.
+
+# Round 18 — the tuner's own result: a flash optimum that moves with ctx
+
+The flash extension answered the design's open question. `NS_FULL_ABS` — the split count for the
+5 full-attention layers — is the first knob in either family whose **winner**, not just effect
+size, moves with context (occ-2, 26B fp8, ablated flash cost in parens):
+
+| `NS_FULL_ABS` | ctx 1024 | ctx 8192 |
+|---|---|---|
+| emitter default | **4.604** (0.361) | 4.811 (0.573) |
+| 33 | 4.605 (0.363) | 4.802 (0.557) |
+| 66 | 4.612 (0.343) | **4.715** (0.445) |
+
+Default wins at 1k; **66 wins at 8k by 0.096 ms (~2 % of the step)**. And 66 is the *principled*
+value at this occupancy — `n_cu/gcd(n_grp,n_cu)` = 264/4 — where `build_sm90a_cubin.sh`'s
+recorded 33 is the occ-1 figure. So the knob is coupled to occupancy **and** ctx, which is the
+joint-sweep claim demonstrated on a second family.
+
+The ablation supplies the mechanism, and it was a **prediction before it was a measurement**:
+
+| ctx | Δ flash (body) | Δ ablated (gate) | Δ TPOT |
+|---|---|---|---|
+| 1024 | −0.018 | +0.026 | +0.008 |
+| 8192 | **−0.128** | +0.032 | **−0.096** |
+
+Splitting trades flash-body time against gate/protocol time for the extra work items — which
+still gate and signal with the body compiled out, which is exactly why the twin sees them. The
+gate cost is near-constant while the body saving grows 7×, so splits pay only once the body term
+outruns a fixed protocol cost. That is a ctx condition, stated as a mechanism rather than a fit.
+
+Two further flash results, both from the twin rather than from TPOT:
+
+- **`FA_GF_FULL=8` is refuted hardest where it should have won** (+0.242 ms at 1k → +0.517 at
+  8k). Split into a **constant ~0.080 ms arena tax** — dynamic smem 16448 → 24640 B with
+  `occ_per_sm` still 2, so not occupancy; the arena is a **union sized by the largest claim**,
+  and that claim is flash's, so widening it bills every other op for space only flash uses — plus
+  a flash penalty growing +0.161 → +0.437.
+- **`FA_WPR=1` confirmed at 2.53×** (flash 0.914 → 0.361) with the ablated remainder *unchanged*
+  (4.253 vs 4.243), proving the knob moved only the arm it names.
+
+**And the cleanest measurement of the campaign:** the non-flash remainder is flat to **0.007 ms
+across a 32× context range** (4.243 / 4.238 / 4.236) while flash grows 3.6× (0.361 → 1.314).
+**100.7 % of the context growth is the flash arm** — the campaign's assertion turned into a
+measurement with the rest of the engine held as a control. It also gives the tuner a priority
+rule: flash is 7.8 % of the step at ctx=1024 and 23.7 % at 32768, so below ~8k tune the GEMM
+knobs and above it tune flash.
+
+The tuner is documented in `tuning/README-decode-tuner.md`.
