@@ -63,13 +63,39 @@ KSYM_PF=_Z15interp_sm90a_pf11PlowProgram
 # not by these dead arms — but it removes their contribution to size/stack. A gated-out opcode traps.
 GEMMA_GATE="-DPLOW_NV_MLA=0 -DPLOW_NV_MAMBA=0 -DPLOW_NV_DSA=0"
 
-# ROW-BLOCKED DECODE MoE GEMV (perf-data/gemma26b-h100-gemv-mlp.md). H100 at the megakernel's
-# 1 block/SM needs ~16 weight loads in flight per thread to reach its bandwidth; the fused
-# norm+GLU expert arm was issuing SCALAR 2 B loads and recomputing the normalized x per output
-# channel. Enabling this stages x once per CTA and gives each warp several weight streams:
-# 26B bf16 decode TPOT 9.433 -> 7.906 ms @ctx1024 (1.19x), fp8 7.471 -> 7.448, correctness
-# gate (gpu_lifecycle, both precisions) PASS. The flag defaults to 0 in the sources, so every
-# sm_120 object stays BYTE-IDENTICAL (verified by sha256 on both the decode and prefill cubins).
+# H100 DECODE ARM FIXES (perf-data/gemma26b-h100-gemv-mlp.md). Four independent defects, each
+# found by opcode ablation rather than inspection. Every flag defaults to 0 in the sources, so
+# every sm_120 object stays BYTE-IDENTICAL -- verified by sha256 on BOTH the decode and prefill
+# cubins against a clean `git archive HEAD` build, re-checked after each round.
+#
+#   PLOW_NV_GEMV_RB          the fused norm+GLU expert arm issued SCALAR 2 B loads and
+#                            recomputed the normalized x for each of 5632 output channels per
+#                            layer (837 GB/s where the bytes support ~2200). Stages x once per
+#                            CTA and gives each warp several weight streams. Also carries the
+#                            warp-parallel router top-k, which had been running a 128-expert
+#                            softmax + 1024 serial argmax iterations on THREAD 0 -- 1.026 ms,
+#                            13% of the token, now ~0.
+#   PLOW_MOE_DOWN_LANESPLIT  the MoE-down arms have a SHORT K (I_moe=704), so per-row cost
+#                            amortises over almost nothing. Splits the warp into 8-lane
+#                            sub-groups, one output row each: the rows-in-flight row-blocking
+#                            wanted, but with one accumulator per lane and NO wv[][] array, so
+#                            it costs no registers. Short-K only -- it loses on long-K arms.
+#   PLOW_NV_FA_WPR           flash gave each THREAD a whole KV row, so a warp instruction
+#                            scattered 32 requests D*2 bytes apart. Warp-per-row makes a D=256
+#                            row one coalesced 512 B load: flash 1.079 -> 0.686 ms (2.53x at
+#                            occ-2/fp8, with the non-flash remainder unchanged -- i.e. it moved
+#                            only the arm it names).
+#   PLOW_NV_FP8_RB=4         fp8 halves the weight bytes but not the x widening (~28
+#                            instructions per 8 bytes vs bf16's 24 per 16), leaving the fp8
+#                            dense GEMV compute-bound at 1046 GB/s. Row-blocking widens x once
+#                            per chunk and reuses it across RB rows.
+#
+# MEASURED at 1 block/SM, ctx=1024, medians, gpu_lifecycle PASS on both precisions:
+#   bf16 9.267 -> 6.196 ms (1.50x)   fp8 7.465 -> 5.330 ms (1.40x)
+# NOTE the 4 here is the occ-1 optimum; at 2 blocks/SM the register cap is 128 and FP8_RB=2
+# wins instead. That inversion is why these belong in the tuner (tuning/README-decode-tuner.md)
+# rather than as one hand-set constant -- GV_MOE_UN and PLOW_NS_ABS both went stale mid-campaign
+# exactly this way.
 GEMV_RB="-DPLOW_NV_GEMV_RB=1 -DPLOW_MOE_DOWN_LANESPLIT=1 -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FP8_RB=4"
 
 # TUNER HOOK. scripts/tune_decode_sweep.sh appends knob overrides here
