@@ -62,6 +62,21 @@ __device__ __forceinline__ float __fa_ex2(float x) {
 #ifndef PLOW_NV_FA_WPR
 #define PLOW_NV_FA_WPR 0
 #endif
+/* Skip staging Q into smem and read it from global instead (WPR path only). Q is GF*D bf16 --
+ * 1 KiB at GF=2,D=256 -- and L2-resident, while the staging costs a full __syncthreads on
+ * EVERY work item. At nsplit=32 an item owns only 32 of the 256 tile rows, so that fixed cost
+ * is a large share of it: flash runs at 640 GB/s where the occ-2 ceiling is 3269. 0 = stage. */
+#ifndef PLOW_NV_FA_QGLOB
+#define PLOW_NV_FA_QGLOB 0
+#endif
+/* Rows a warp carries CONCURRENTLY in the warp-per-row score phase. With nsplit=32 a work item
+ * owns ~32 of the 256 tile rows, so each of the 8 warps gets ~4 -- and processing them one at a
+ * time leaves ~1 load in flight, which is why flash measured 688 GB/s against a 3269 ceiling
+ * while the arm is latency-bound rather than bandwidth-bound. Batching them puts RB independent
+ * row loads in flight for one warp reduction each. 1 = the original sequential sweep. */
+#ifndef PLOW_NV_FA_WPR_RB
+#define PLOW_NV_FA_WPR_RB 1
+#endif
 /* Thread map for the V phase / O accumulator: 8 consecutive head-dims per thread, so both K
  * and V move 16 bytes per lane contiguously (one 128-bit global load), and the block's rows
  * are split across NG row-groups whose partial O is folded once at the end. */
@@ -422,9 +437,11 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
         }
 
         __syncthreads(); /* previous item's osm reads must finish before qsm is rewritten */
+#if !(PLOW_NV_FA_WPR && PLOW_NV_FA_QGLOB)
         for (unsigned i = tid; i < GF * D; i += PLOW_NV_THREADS)
             qsm[i] = Q[((size_t)b * n_head + h0 + i / D) * D + i % D];
         __syncthreads();
+#endif
 
         float m_st[GF], l_st[GF];
 #pragma unroll
@@ -465,30 +482,56 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 #pragma unroll
                 for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + i] = FA_NEG_INF;
             }
-            for (unsigned r = warp; r < rmax; r += PLOW_NV_WARPS) {
-                const unsigned kvr = kv0 + r;
-                float sr[GF];
+            constexpr int WRB = PLOW_NV_FA_WPR_RB;
+            for (unsigned rb = warp; rb < rmax; rb += PLOW_NV_WARPS * WRB) {
+                /* WRB rows, strided by the warp count so each warp's batch stays disjoint. */
+                bf16v8 k8[WRB][NC];
+                bool live[WRB];
 #pragma unroll
-                for (int g = 0; g < GF; g++) sr[g] = FA_NEG_INF;
-                if (kvr <= qpos && (!window || (qpos - kvr) < window)) {
+                for (int t = 0; t < WRB; t++) {
+                    const unsigned r = rb + (unsigned)t * PLOW_NV_WARPS;
+                    const unsigned kvr = kv0 + r;
+                    live[t] = (r < rmax) && (kvr <= qpos) &&
+                              (!window || (qpos - kvr) < window);
+                    /* `kvr & kv_mask` always lands on a real ring row, so the load is
+                     * in-bounds even for a masked or past-the-tile r; only the dot and the
+                     * store below are gated. Loading unconditionally keeps all WRB loads
+                     * issued back-to-back, which is the entire point of the batch. */
                     const __nv_bfloat16* krow = kbase + (size_t)(kvr & kv_mask) * D;
-                    float dt[GF];
 #pragma unroll
-                    for (int g = 0; g < GF; g++) dt[g] = 0.0f;
-#pragma unroll
-                    for (int c = 0; c < NC; c++) {
-                        const unsigned off = (unsigned)c * 256u + lane * 8u;
-                        const bf16v8 k8 = ld_glob8_cs(krow + off);
-#pragma unroll
-                        for (int g = 0; g < GF; g++)
-                            dt[g] = dot8(k8, ld_smem8(qsm + g * D + off), dt[g]);
-                    }
-#pragma unroll
-                    for (int g = 0; g < GF; g++) sr[g] = warp_sum32(dt[g]) * FA_SCALE(scale);
+                    for (int c = 0; c < NC; c++)
+                        k8[t][c] = ld_glob8_cs(krow + (unsigned)c * 256u + lane * 8u);
                 }
-                if (lane == 0) {
 #pragma unroll
-                    for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + r] = sr[g];
+                for (int t = 0; t < WRB; t++) {
+                    const unsigned r = rb + (unsigned)t * PLOW_NV_WARPS;
+                    float sr[GF];
+#pragma unroll
+                    for (int g = 0; g < GF; g++) sr[g] = FA_NEG_INF;
+                    if (live[t]) {
+                        float dt[GF];
+#pragma unroll
+                        for (int g = 0; g < GF; g++) dt[g] = 0.0f;
+#pragma unroll
+                        for (int c = 0; c < NC; c++) {
+                            const unsigned off = (unsigned)c * 256u + lane * 8u;
+#pragma unroll
+                            for (int g = 0; g < GF; g++)
+#if PLOW_NV_FA_QGLOB
+                                dt[g] = dot8(k8[t][c],
+                                             ld_glob8(Q + ((size_t)b * n_head + h0 + (unsigned)g) * D + off),
+                                             dt[g]);
+#else
+                                dt[g] = dot8(k8[t][c], ld_smem8(qsm + g * D + off), dt[g]);
+#endif
+                        }
+#pragma unroll
+                        for (int g = 0; g < GF; g++) sr[g] = warp_sum32(dt[g]) * FA_SCALE(scale);
+                    }
+                    if (lane == 0 && r < rmax) {
+#pragma unroll
+                        for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + r] = sr[g];
+                    }
                 }
             }
             __syncthreads();

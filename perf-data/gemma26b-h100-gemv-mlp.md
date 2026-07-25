@@ -1211,3 +1211,40 @@ pay: at n_exp=128 each thread would hold ≤1 element, so the 8 argmax passes wo
 `__syncthreads` (~1600 cycles) against the current warp form's ~570 ops. Making this op cheap
 needs it off the critical path (overlap), not more threads — the same conclusion round 8 reached
 for COMBINE_NORM.
+
+# Round 17 — two more flash fixed costs, found by working backwards from the target
+
+The ablation gives a sharp target rather than a vague one. At the fp8/occ-2 optimum the
+**non-flash remainder is 4.245 ms** against vLLM's **4.417** — so if flash were free plow would
+win by 4 %. Flash's budget to break even is **0.172 ms**; it was 0.361, moving ~231 MB at
+**640 GB/s** against a 3269 GB/s ceiling. That is not a bandwidth wall, it is fixed cost per
+work item — at `nsplit=32` an item owns only ~32 of the 256 tile rows.
+
+Two of those fixed costs removed:
+
+**`PLOW_NV_FA_QGLOB` — stop staging Q.** Q is `GF*D` bf16 (1 KiB) and L2-resident, but staging
+it costs a full `__syncthreads` on *every* work item — ~7680 of them per token at 256
+items/layer × 30 layers. Reading it from global instead: **4.608 → 4.588 ms**.
+
+**`PLOW_NV_FA_WPR_RB` — batch the warp's rows.** The warp-per-row sweep processed its ~4 rows
+one at a time, so ~1 load was in flight. Batching them issues WRB independent row loads
+back-to-back for one warp reduction each. The loads are unconditional because `kvr & kv_mask`
+always lands on a real ring row, so only the dot and the store are gated — keeping the batch
+actually back-to-back.
+
+| `PLOW_NV_FA_WPR_RB` | 1 | **2** | 4 |
+|---|---|---|---|
+| fp8 occ-2 ctx1024 | 4.598 | **4.560** | 4.665 |
+
+**Combined: 4.610 → 4.558 ms** (median of 5, spread 0.006). flash **0.361 → 0.307 ms**.
+`gpu_lifecycle` PASSES — `"Paris"` on both cycles.
+
+## Standing
+
+| | control | **best measured** | vLLM | gap |
+|---|---|---|---|---|
+| bf16 ctx1024 (occ-2) | 9.267 | **5.616** (1.65×) | 4.825 | 1.16× |
+| **fp8 ctx1024 (occ-2)** | 7.465 | **4.558** (1.64×) | **4.417** | **1.032×** |
+
+fp8 is now **3.2 %** off vLLM. The remaining 0.135 ms would have to come out of flash's
+0.307 — the non-flash floor (4.245) is already below vLLM's total.
