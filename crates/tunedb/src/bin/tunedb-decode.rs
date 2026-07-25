@@ -88,10 +88,25 @@ struct Row {
     gv_moe_un: u32,
     moe_down_sg: u32,
     ns_abs: u32,
+    // Flash family. Absent in rows written before it existed, and absent from a
+    // row that did not name the knob — both mean "not overridden".
+    #[serde(default)]
+    ns_full_abs: u32,
     #[serde(default)]
     extra_defines: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     extra_emit: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    fa_wpr: Option<u32>,
+    #[serde(default)]
+    fa_gf: Option<u32>,
+    #[serde(default)]
+    fa_gf_full: Option<u32>,
+    #[serde(default)]
+    fa_kun: Option<u32>,
+    /// Ablated-twin median and the op cost it implies, when the sweep built one.
+    #[serde(default)]
+    op_cost_ms: Option<f64>,
     /// TPOT of each `step_bench` invocation, milliseconds.
     samples_ms: Vec<f64>,
     registers: Option<u32>,
@@ -158,9 +173,13 @@ fn ingest(
                 gv_moe_un: r.gv_moe_un,
                 moe_down_sg: r.moe_down_sg,
                 ns_abs: r.ns_abs,
-                // Op families added after the first sweep (flash attention, the
-                // fp8 GEMV row-block) travel here, so a new family needs no
-                // schema change and older rows still load.
+                fa_wpr: r.fa_wpr,
+                fa_gf: r.fa_gf,
+                fa_gf_full: r.fa_gf_full,
+                fa_kun: r.fa_kun,
+                ns_full_abs: r.ns_full_abs,
+                // Families with no typed field yet ride these, so a new sweep
+                // needs no schema change and old rows still load.
                 extra_defines: r.extra_defines.clone(),
                 extra_emit: r.extra_emit.clone(),
             },

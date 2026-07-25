@@ -48,16 +48,24 @@ shipped default is correct and is now correct *for a measured reason*.
 
 ## Result 2 — the context growth is ENTIRELY the flash arm
 
-| ctx | TPOT | ablated | flash |
-|---|---|---|---|
-| 1024 | 4.604 | 4.243 | 0.361 |
-| 8192 | 4.811 | **4.238** | 0.573 |
+| ctx | TPOT | ablated (non-flash) | flash | flash share of step |
+|---|---|---|---|---|
+| 1024 | 4.604 | 4.243 | 0.361 | 7.8 % |
+| 8192 | 4.811 | **4.238** | 0.573 | 11.9 % |
+| 32768 | 5.550 | **4.236** | **1.314** | 23.7 % |
 
-TPOT grows **+0.207 ms**; flash's own cost grows **+0.212 ms**; the non-flash
-remainder is **flat to −0.005 ms**. The campaign asserted this ("the growth is
-entirely the 5 full-attention layers"); this measures it. It is also the
-concrete argument for why the flash knobs are the ones worth conditioning on
-ctx when the GEMM knobs were not.
+**The non-flash remainder is flat to within 0.007 ms across a 32× context
+range** — 4.243, 4.238, 4.236 — while flash grows 3.6×, 0.361 → 1.314 ms.
+Total TPOT grows +0.946 ms from 1k to 32k and flash's own cost grows +0.953 ms:
+**100.7 % of the context growth is the flash arm**, i.e. all of it, to within
+the measurement's own spread.
+
+The campaign asserted this ("the growth is entirely the 5 full-attention
+layers"); this measures it directly, at three contexts, with the rest of the
+engine held still as a control. It is also the whole argument for why the flash
+knobs are worth conditioning on ctx when the GEMM knobs were not: at ctx=1024
+flash is 7.8 % of the step and tuning it is nearly pointless, while at 32k it is
+23.7 % and it is the only thing worth tuning.
 
 ## Result 3 — `GF_FULL=8` loses, and a third of the loss is NOT flash
 
@@ -93,6 +101,45 @@ and left the wrong mechanism in the record. This is the same
 isolation-vs-in-context coupling the campaign has hit three times, seen from the
 other side: here the *in-context* number is inflated by a cost the op itself does
 not pay.
+
+## Result 4 — `NS_FULL_ABS` does almost nothing, and only where it can
+
+The packet-side split for the **full-attention layers only** — the 5 layers that
+read the whole context, where the other 25 are window-capped at 1024. This is
+the knob with the strongest prior reason to be ctx-dependent.
+
+| `NS_FULL_ABS` | ctx 1024 | ctx 8192 |
+|---|---|---|
+| default (emitter CU-fill) | 4.604 (0.361) | 4.811 (0.573) |
+| 33 | 4.605 (0.363) | 4.802 (**0.557**) |
+
+At **ctx=1024 it is exactly nothing** — +0.001 ms on a step whose reps span
+0.002 — which is what it should be: at 1024 tokens the full layers have almost
+nothing to split, so the knob has no work to divide. At **ctx=8192 it is a
+small win**, −0.009 ms on TPOT and −0.016 ms on flash's own cost, the latter
+about 4× the rep spread and therefore probably real but not worth shipping on
+its own.
+
+So the knob's *effect size* is ctx-dependent even though its optimum has not
+moved off the emitter default at either context measured. That is a weaker
+result than "the optimum moves", and it is stated as such: 33 is the aligned
+value for `n_cu=132` (`n_cu/gcd(n_grp,n_cu)`), and this sweep runs at
+`n_cu=264`, whose aligned value is 66.
+
+## What this puts in `tunedb` — nothing new, and that is the result
+
+The flash grid is a **3-rep screening pass**, and `Stats` refuses fewer than 5
+samples at construction, so none of these rows can become a record. That is the
+same screen-wide / confirm-narrow split the GEMM round used, and here it lands
+on a convenient answer: **every flash knob's winner is the value already
+shipped** — `FA_WPR=1`, `FA_GF_FULL=4`, `FA_GF=2`, `FA_KUN=1`. The winning
+configuration is therefore the one the store *already holds* at 5 reps from the
+GEMM round, `mb2_ncu264_un4_glu2_mun2_sg4_ns32` at 4.772 ms.
+
+So the flash family's contribution to the record is a confirmation, not a new
+selection. That is worth stating plainly rather than manufacturing a record to
+show for the work: the tuner's job includes reporting that the current defaults
+survive, and this family's defaults did.
 
 ## Reproduce
 

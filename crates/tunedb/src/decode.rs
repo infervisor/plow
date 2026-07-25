@@ -120,7 +120,7 @@ impl DecodeCell {
 pub enum Backend {
     /// `nvcc -DNAME=VALUE`.
     Nvidia,
-    /// AMD/HSA. No decode sweep has been run on it yet; `defines` refuses
+    /// AMD/HSA. No decode sweep has been run on it yet; `defines_for` refuses
     /// rather than emitting nvcc syntax that would build the wrong object.
     Hsa,
 }
@@ -138,15 +138,6 @@ impl Backend {
 }
 
 /// One point in the decode knob grid — everything needed to rebuild it.
-///
-/// The named fields are the knobs the first sweep covered. **New op families add
-/// themselves through [`extra_defines`](Self::extra_defines) /
-/// [`extra_emit`](Self::extra_emit) rather than by growing this struct** — the
-/// flash-attention family (`PLOW_NV_FA_WPR`, `FA_GF`, `FA_GF_FULL`, `FA_KUN`,
-/// `PLOW_NS_FULL_ABS`) and the fp8 GEMV row-block (`PLOW_NV_FP8_RB`) arrived
-/// after these fields were written, and a closed struct would have meant either
-/// a schema break or data that could not be recorded at all. Both maps are
-/// `serde(default)`, so records written before a family existed still load.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecodeKnobs {
     /// `PLOW_NV_FORCE_MINBLK` — blocks/SM the object is compiled for.
@@ -163,14 +154,40 @@ pub struct DecodeKnobs {
     pub moe_down_sg: u32,
     /// `PLOW_NS_ABS` — flash decode split count, baked at packet emit.
     pub ns_abs: u32,
-    /// Additional compile-time knobs, `NAME -> VALUE`, rendered by the backend's
-    /// flag syntax. This is the extension point for a new op family.
+    // ---- flash decode arm -------------------------------------------------
+    // `None` means "not overridden", i.e. whatever the build script passes.
+    // That is distinct from a value: the shipped recipe sets FA_WPR=1 while the
+    // source defaults it to 0, so recording 0 for "unset" would describe an
+    // object nobody built.
+    /// `PLOW_NV_FA_WPR` — warp-per-row score phase.
+    #[serde(default)]
+    pub fa_wpr: Option<u32>,
+    /// `PLOW_NV_FA_GF` — GQA fusion width on the sliding layers.
+    #[serde(default)]
+    pub fa_gf: Option<u32>,
+    /// `PLOW_NV_FA_GF_FULL` — GQA fusion width on the FULL-attention layers.
+    #[serde(default)]
+    pub fa_gf_full: Option<u32>,
+    /// `PLOW_NV_FA_KUN` — K-stream pre-issue depth.
+    #[serde(default)]
+    pub fa_kun: Option<u32>,
+    /// `PLOW_NS_FULL_ABS` — packet-side nsplit for the full-attention layers
+    /// only. 0 = the emitter's own value. Separate from `ns_abs` because those
+    /// 5 layers read the whole context while the sliding ones are window-capped,
+    /// which makes this the ctx-sensitive half of the split.
+    #[serde(default)]
+    pub ns_full_abs: u32,
+    // ---- open extension point --------------------------------------------
+    // The typed fields above are the families that have been swept. A family
+    // that has NOT been swept yet rides these maps instead of growing the
+    // struct, so adding one is not a schema break and old rows still load.
+    /// Extra compile-time knobs, `NAME -> VALUE`, in the backend's flag syntax.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_defines: BTreeMap<String, String>,
-    /// Additional packet-emit knobs, `NAME -> VALUE`, passed to `plowc` as env.
-    /// Kept separate from `extra_defines` for the same reason `emit_env` is kept
-    /// separate from `defines`: they land in different artifacts and drift apart
-    /// precisely when they are written down as one string.
+    /// Extra packet-emit knobs, `NAME -> VALUE`, passed to `plowc` as env. Kept
+    /// separate from `extra_defines` for the same reason `emit_env` is separate
+    /// from `defines`: they land in different artifacts and drift apart exactly
+    /// when they are written down as one string.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_emit: BTreeMap<String, String>,
 }
@@ -185,8 +202,8 @@ impl DecodeKnobs {
     }
 
     /// Same, rendered in `backend`'s flag syntax. Returns `None` for a backend
-    /// whose decode sweep has not been built yet, so a caller cannot quietly
-    /// rebuild an AMD object with nvcc spellings.
+    /// whose decode sweep has not been built, so a caller cannot quietly rebuild
+    /// an AMD object with nvcc spellings.
     pub fn defines_for(&self, backend: Backend) -> Option<Vec<String>> {
         if backend != Backend::Nvidia {
             return None;
@@ -200,6 +217,18 @@ impl DecodeKnobs {
         if self.gv_unroll_glu != 0 {
             v.push(format!("-DGV_UNROLL_GLU={}", self.gv_unroll_glu));
         }
+        if let Some(x) = self.fa_wpr {
+            v.push(format!("-DPLOW_NV_FA_WPR={x}"));
+        }
+        if let Some(x) = self.fa_gf {
+            v.push(format!("-DPLOW_NV_FA_GF={x}"));
+        }
+        if let Some(x) = self.fa_gf_full {
+            v.push(format!("-DPLOW_NV_FA_GF_FULL={x}"));
+        }
+        if let Some(x) = self.fa_kun {
+            v.push(format!("-DPLOW_NV_FA_KUN={x}"));
+        }
         for (k, val) in &self.extra_defines {
             v.push(format!("-D{k}={val}"));
         }
@@ -210,11 +239,14 @@ impl DecodeKnobs {
     /// [`defines`](Self::defines) because these two land in different artifacts
     /// and get out of sync exactly when they are written down as one string.
     pub fn emit_env(&self) -> Vec<String> {
-        let mut v = vec![
-            "PLOW_UNISEG=1".into(),
-            format!("PLOW_NS_ABS={}", self.ns_abs),
-            format!("--n-cu {}", self.n_cu),
-        ];
+        let mut v = vec!["PLOW_UNISEG=1".to_string()];
+        if self.ns_abs != 0 {
+            v.push(format!("PLOW_NS_ABS={}", self.ns_abs));
+        }
+        if self.ns_full_abs != 0 {
+            v.push(format!("PLOW_NS_FULL_ABS={}", self.ns_full_abs));
+        }
+        v.push(format!("--n-cu {}", self.n_cu));
         for (k, val) in &self.extra_emit {
             v.push(format!("{k}={val}"));
         }
@@ -223,24 +255,31 @@ impl DecodeKnobs {
 
     /// Compact identity, matching the sweep script's `config` field.
     pub fn label(&self) -> String {
-        let mut s = format!(
-            "mb{}_ncu{}_un{}_glu{}_mun{}_sg{}_ns{}",
+        let d = |x: Option<u32>| x.map(|v| v.to_string()).unwrap_or_else(|| "d".into());
+        let base = format!(
+            "mb{}_ncu{}_un{}_glu{}_mun{}_sg{}_ns{}_nsf{}_wpr{}_gf{}_gff{}_kun{}",
             self.minblk,
             self.n_cu,
             self.gv_unroll,
             self.gv_unroll_glu,
             self.gv_moe_un,
             self.moe_down_sg,
-            self.ns_abs
+            self.ns_abs,
+            self.ns_full_abs,
+            d(self.fa_wpr),
+            d(self.fa_gf),
+            d(self.fa_gf_full),
+            d(self.fa_kun),
         );
-        /* Extras are appended in BTreeMap order, so a label is stable for a knob
-         * set regardless of the order the sweep discovered them. */
+        /* Extras append in BTreeMap order so a label is stable for a knob set
+         * regardless of the order the sweep discovered them. */
+        let mut out = base;
         for (k, val) in self.extra_defines.iter().chain(self.extra_emit.iter()) {
-            s.push('_');
-            s.push_str(&k.rsplit('_').next().unwrap_or(k).to_ascii_lowercase());
-            s.push_str(val);
+            out.push('_');
+            out.push_str(&k.rsplit('_').next().unwrap_or(k).to_ascii_lowercase());
+            out.push_str(val);
         }
-        s
+        out
     }
 
     /// Whether the occupancy pair is self-consistent for a 132-SM part. An
@@ -374,6 +413,11 @@ mod tests {
             gv_moe_un: 2,
             moe_down_sg: 4,
             ns_abs: ns,
+            fa_wpr: None,
+            fa_gf: None,
+            fa_gf_full: None,
+            fa_kun: None,
+            ns_full_abs: 0,
         }
     }
 
@@ -420,11 +464,44 @@ mod tests {
         assert!(d.contains(&"-DGV_UNROLL=4".to_string()));
         assert!(d.contains(&"-DGV_UNROLL_GLU=2".to_string()));
         assert!(d.contains(&"-DPLOW_MOE_DOWN_SG=4u".to_string()));
-        assert_eq!(k.label(), "mb2_ncu264_un4_glu2_mun2_sg4_ns32");
+        assert_eq!(k.label(), "mb2_ncu264_un4_glu2_mun2_sg4_ns32_nsf0_wprd_gfd_gffd_kund");
 
         // 0 means "leave the source default alone" — emitting `-DGV_UNROLL_GLU=0`
         // would silently compile a different kernel than the one measured.
         assert!(!knobs(1, 132, 8, 16).defines().iter().any(|s| s.contains("GLU")));
+    }
+
+    /// A flash-tuned record must rebuild its own object too, or the second knob
+    /// family is recorded but not reproducible.
+    #[test]
+    fn flash_knobs_render_the_flags_and_the_emit_that_rebuild_them() {
+        let k = DecodeKnobs {
+            fa_wpr: Some(1),
+            fa_gf: Some(2),
+            fa_gf_full: Some(8),
+            fa_kun: Some(4),
+            ns_full_abs: 66,
+            ..knobs(2, 264, 4, 32)
+        };
+        let d = k.defines();
+        assert!(d.contains(&"-DPLOW_NV_FA_WPR=1".to_string()));
+        assert!(d.contains(&"-DPLOW_NV_FA_GF=2".to_string()));
+        assert!(d.contains(&"-DPLOW_NV_FA_GF_FULL=8".to_string()));
+        assert!(d.contains(&"-DPLOW_NV_FA_KUN=4".to_string()));
+        // NS_FULL_ABS is packet-side, not a define — mixing the two is how a
+        // record stops being reproducible.
+        assert!(!d.iter().any(|s| s.contains("NS_FULL")));
+        assert!(k.emit_env().contains(&"PLOW_NS_FULL_ABS=66".to_string()));
+
+        // None means "not overridden", which is NOT the same as a value: the
+        // shipped recipe sets FA_WPR=1 while the source defaults it to 0, so
+        // emitting a 0 here would describe an object nobody built.
+        let plain = knobs(1, 132, 8, 16);
+        assert!(!plain.defines().iter().any(|s| s.contains("FA_")));
+        assert!(!plain.emit_env().iter().any(|s| s.contains("NS_FULL")));
+
+        // Two objects differing only in a flash knob must not share a label.
+        assert_ne!(k.label(), DecodeKnobs { fa_gf_full: Some(4), ..k }.label());
     }
 
     /// The occupancy pair is one knob. A mismatched pair is not a slow
@@ -511,27 +588,22 @@ mod tests {
         assert_eq!(serde_json::from_str::<DecodeMeasurement>(&text).unwrap(), m);
         assert!(text.contains("\"32k\""), "buckets serialise by their label");
     }
-    /// A new op family must be recordable and rebuildable WITHOUT growing
-    /// DecodeKnobs. This is the flash-attention family, which arrived after the
-    /// struct's named fields were written.
+    /// A family with no typed field yet must still be recordable and
+    /// rebuildable — without growing the struct.
     #[test]
     fn a_new_op_family_rides_the_extra_maps() {
         let mut k = knobs(2, 264, 4, 32);
-        k.extra_defines.insert("PLOW_NV_FA_WPR".into(), "1".into());
-        k.extra_defines.insert("PLOW_NV_FP8_RB".into(), "2".into());
-        k.extra_emit.insert("PLOW_NS_FULL_ABS".into(), "33".into());
-
+        k.extra_defines.insert("PLOW_NV_FUTURE_OP".into(), "3".into());
+        k.extra_emit.insert("PLOW_FUTURE_EMIT".into(), "7".into());
         let d = k.defines();
-        assert!(d.contains(&"-DPLOW_NV_FA_WPR=1".to_string()));
-        assert!(d.contains(&"-DPLOW_NV_FP8_RB=2".to_string()));
+        assert!(d.contains(&"-DPLOW_NV_FUTURE_OP=3".to_string()));
         // packet-side knobs must NOT leak into the object's defines
-        assert!(!d.iter().any(|f| f.contains("NS_FULL_ABS")));
-        assert!(k.emit_env().contains(&"PLOW_NS_FULL_ABS=33".to_string()));
-        // and the label must distinguish it from the same knobs without extras
+        assert!(!d.iter().any(|f| f.contains("FUTURE_EMIT")));
+        assert!(k.emit_env().contains(&"PLOW_FUTURE_EMIT=7".to_string()));
         assert_ne!(k.label(), knobs(2, 264, 4, 32).label());
     }
 
-    /// Records written before a family existed still deserialize.
+    /// Rows written before a family existed still deserialize.
     #[test]
     fn knobs_without_extras_still_load() {
         let json = r#"{"minblk":2,"n_cu":264,"gv_unroll":4,"gv_unroll_glu":0,
@@ -540,8 +612,8 @@ mod tests {
         assert!(k.extra_defines.is_empty() && k.extra_emit.is_empty());
     }
 
-    /// The knob VALUES are portable; their spelling is not. A backend with no
-    /// decode sweep must refuse rather than inherit nvcc syntax.
+    /// Knob VALUES are portable; their spelling is not. A backend with no sweep
+    /// must refuse rather than inherit nvcc syntax and build the wrong object.
     #[test]
     fn a_backend_without_a_sweep_refuses_to_render_flags() {
         let k = knobs(2, 264, 4, 32);
