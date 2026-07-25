@@ -85,6 +85,24 @@ GV_UNROLL="8"
 GV_UNROLL_GLU="0"          # 0 = leave the source default (4)
 GV_MOE_UN="2"
 MOE_DOWN_SG="4"
+# ---- flash decode arm ----------------------------------------------------
+# 0 = leave the source default, EXCEPT where the source default and the shipped
+# value differ (FA_WPR ships 1, source defaults 0), which is why these are
+# explicit lists rather than a sentinel.
+FA_WPR=""                  # PLOW_NV_FA_WPR   {0,1}   warp-per-row score phase
+FA_GF=""                   # PLOW_NV_FA_GF    {2,4}   GQA fusion, sliding layers
+FA_GF_FULL=""              # PLOW_NV_FA_GF_FULL {4,8} GQA fusion, FULL-attention layers
+FA_KUN=""                  # PLOW_NV_FA_KUN   {1,2,4} K-stream pre-issue depth
+NS_FULL_ABS="0"            # packet; nsplit for the FULL layers only. 0 = emitter default.
+# Defines every object in this sweep carries. The knob axes are deltas on top;
+# a later -D wins, so this can also override a value the build script hardcodes.
+BASE_DEFINES=""
+# Opcode-body ablation mask. Non-zero builds a TWIN object per config with the
+# op compiled out, so each row carries TPOT(full), TPOT(ablated), and the
+# difference — that op's true wall-clock contribution at the shipped grid.
+# FLASH_DECODE is opcode 12 (1<<12 = 4096), FLASH_MERGE 13 (8192).
+ABLATE_LO=0
+ABLATE_HI=0
 CTXS="1024 8192 32768"
 # 3 for the screening grid — the campaign's own rule, and what the raw
 # perf-data artifact keeps. Note that `tunedb` will NOT accept a 3-rep row:
@@ -128,6 +146,14 @@ while [ $# -gt 0 ]; do
     --gv-unroll-glu) GV_UNROLL_GLU="$2"; shift 2;;
     --gv-moe-un) GV_MOE_UN="$2"; shift 2;;
     --moe-down-sg) MOE_DOWN_SG="$2"; shift 2;;
+    --fa-wpr) FA_WPR="$2"; shift 2;;
+    --fa-gf) FA_GF="$2"; shift 2;;
+    --fa-gf-full) FA_GF_FULL="$2"; shift 2;;
+    --fa-kun) FA_KUN="$2"; shift 2;;
+    --ns-full-abs) NS_FULL_ABS="$2"; shift 2;;
+    --base-defines) BASE_DEFINES="$2"; shift 2;;
+    --ablate-lo) ABLATE_LO="$2"; shift 2;;
+    --ablate-hi) ABLATE_HI="$2"; shift 2;;
     --ctx) CTXS="$2"; shift 2;;
     --reps) REPS="$2"; shift 2;;
     --steps) STEPS="$2"; shift 2;;
@@ -216,29 +242,47 @@ wait_for_idle() {
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
 # --------------------------------------------------------------- cubin build
-# Key: every OBJECT knob. Built once, reused by every packet and ctx that wants it.
-build_cubin() {  # $1 minblk  $2 unroll  $3 glu  $4 moe_un  $5 sg   -> echoes dir
-  local mb="$1" un="$2" glu="$3" mun="$4" sg="$5"
-  local key="mb${mb}_un${un}_glu${glu}_mun${mun}_sg${sg}"
+# Keyed by the SHA of the full define string, not by a hand-built name. Adding a
+# knob family (this is the second: GEMM, then flash) then costs nothing here and
+# cannot collide with an existing cache entry the way a name scheme silently can.
+defines_for() {  # gemm knobs then flash knobs -> echoes the -D string
+  local mb="$1" un="$2" glu="$3" mun="$4" sg="$5" wpr="$6" gf="$7" gff="$8" kun="$9"
+  local d="$BASE_DEFINES -DPLOW_NV_FORCE_MINBLK=$mb -DGV_UNROLL=$un -DGV_MOE_UN=$mun -DPLOW_MOE_DOWN_SG=${sg}u"
+  [ "$glu" = "0" ] || d="$d -DGV_UNROLL_GLU=$glu"
+  # Flash knobs are emitted only when asked for, so a sweep that does not name
+  # them builds byte-identical objects to one from before they existed.
+  [ -z "$wpr" ] || d="$d -DPLOW_NV_FA_WPR=$wpr"
+  [ -z "$gf"  ] || d="$d -DPLOW_NV_FA_GF=$gf"
+  [ -z "$gff" ] || d="$d -DPLOW_NV_FA_GF_FULL=$gff"
+  [ -z "$kun" ] || d="$d -DPLOW_NV_FA_KUN=$kun"
+  echo "$d"
+}
+
+# $1 defines, $2 "" | "abl"  -> echoes dir
+build_cubin() {
+  local defs="$1" kind="${2:-}"
+  local key; key="$(printf '%s|%s' "$defs" "$kind" | sha256sum | cut -c1-16)"
   local dir="$WORK/cubin/$key"
   if [ -f "$dir/interp_sm90a.cubin" ] && [ -f "$dir/interp_sm90a_pf.cubin" ]; then
     echo "$dir"; return 0
   fi
-  local defs="-DPLOW_NV_FORCE_MINBLK=$mb -DGV_UNROLL=$un -DGV_MOE_UN=$mun -DPLOW_MOE_DOWN_SG=${sg}u"
-  [ "$glu" = "0" ] || defs="$defs -DGV_UNROLL_GLU=$glu"
+  if [ "$kind" = "abl" ]; then
+    defs="$defs -DPLOW_NV_ABLATE_LO=${ABLATE_LO}ull -DPLOW_NV_ABLATE_HI=${ABLATE_HI}ull"
+  fi
   mkdir -p "$dir"
-  echo "  [build] $key  ($defs)" >&2
+  printf '%s\n' "$defs" > "$dir/defines"
+  echo "  [build] ${key} ${kind}  ($defs)" >&2
   if [ "$DRY" = "1" ]; then echo "$dir"; return 0; fi
   PLOW_ROOT="$ROOT" PLOW_EXTRA_DEFINES="$defs" \
     "$ROOT/scripts/build_sm90a_cubin.sh" "$dir/interp_sm90a.cubin" >"$WORK/log/build_$key.log" 2>&1 \
-    || { echo "FATAL: cubin build failed for $key — see $WORK/log/build_$key.log" >&2; exit 1; }
+    || { echo "FATAL: cubin build failed for $key - see $WORK/log/build_$key.log" >&2; exit 1; }
   registers_of "$dir/interp_sm90a.cubin" > "$dir/registers" || true
   echo "$dir"
 }
 
 # Registers of the decode megakernel. Recorded next to every timing because a
 # knob that buys ILP by raising pressure for every other arm is not obviously a
-# win — and because the campaign's "255 registers explains the regression"
+# win - and because the campaign's "255 registers explains the regression"
 # story was later retracted, so this is evidence to keep, not a verdict.
 registers_of() {
   env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin cuobjdump -res-usage "$1" 2>/dev/null \
@@ -249,20 +293,28 @@ registers_of() {
 # -------------------------------------------------------------- packet emit
 # Key: every PACKET knob. `--n-cu` and PLOW_NS_ABS are the only two the design
 # leaves on the packet; both already have ctx in scope at emit time.
-emit_packet() {  # $1 n_cu  $2 ns_abs  -> echoes dir
-  local ncu="$1" ns="$2"
-  local key="ncu${ncu}_ns${ns}"
+emit_packet() {  # $1 n_cu  $2 ns_abs  $3 ns_full_abs -> echoes dir
+  local ncu="$1" ns="$2" nsf="$3"
+  local key="ncu${ncu}_ns${ns}_nsf${nsf}"
   local dir="$WORK/pkt/$key"
   if [ -f "$dir/model.pkt" ]; then echo "$dir"; return 0; fi
   mkdir -p "$dir"
   echo "  [emit ] $key" >&2
   if [ "$DRY" = "1" ]; then echo "$dir"; return 0; fi
-  local nsenv=()
-  [ "$ns" = "0" ] || nsenv=(PLOW_NS_ABS="$ns")
-  env PLOW_UNISEG=1 "${nsenv[@]}" "$PLOWC" \
-      --hf-dir "$MODEL" --emit devblob --max-ctx "$MAXCTX" --n-cu "$ncu" --out "$dir" \
+  local env_kv=(PLOW_UNISEG=1)
+  [ "$DTYPE" = "fp8" ] && env_kv+=(PLOW_FP8=1)
+  [ "$ns" = "0" ] || env_kv+=(PLOW_NS_ABS="$ns")
+  # NS_FULL_ABS touches ONLY the 5 full-attention layers. Those are the layers
+  # that read the whole context while the 25 sliding ones are window-capped, so
+  # this is the ctx-sensitive half of the split and is keyed separately.
+  [ "$nsf" = "0" ] || env_kv+=(PLOW_NS_FULL_ABS="$nsf")
+  local dtflag=()
+  [ "$DTYPE" = "fp8" ] && dtflag=(--weight-dtype fp8)
+  env "${env_kv[@]}" "$PLOWC" \
+      --hf-dir "$CHECKPOINT" --emit devblob --max-ctx "$MAXCTX" --n-cu "$ncu" \
+      "${dtflag[@]}" --out "$dir" \
       >"$WORK/log/emit_$key.log" 2>&1 \
-    || { echo "FATAL: packet emit failed for $key — see $WORK/log/emit_$key.log" >&2; exit 1; }
+    || { echo "FATAL: packet emit failed for $key - see $WORK/log/emit_$key.log" >&2; exit 1; }
   echo "$dir"
 }
 
@@ -335,32 +387,59 @@ run_once() {  # $1 assets  $2 ctx  $3 label -> echoes "ms vram" | "vram"
 median() { printf '%s\n' "$@" | sort -g | awk '{a[NR]=$1} END{ if(NR==0) exit 1; print a[int((NR+1)/2)] }'; }
 
 # ---------------------------------------------------------------------- sweep
-total=0; done_n=0
-for occ in $OCC; do for ns in $NS_ABS; do for un in $GV_UNROLL; do for glu in $GV_UNROLL_GLU; do
-for mun in $GV_MOE_UN; do for sg in $MOE_DOWN_SG; do for ctx in $CTXS; do
-  total=$((total+1))
-done; done; done; done; done; done; done
-echo "grid points: $total"
+# An unset flash axis contributes a single empty value, which defines_for() then
+# omits entirely -- so naming no flash knob reproduces the pre-flash sweep byte
+# for byte rather than pinning the source defaults explicitly.
+list_or_blank() { if [ -z "$1" ]; then echo ""; else echo "$1"; fi; }
+WPRS="$(list_or_blank "$FA_WPR")"; GFS="$(list_or_blank "$FA_GF")"
+GFFS="$(list_or_blank "$FA_GF_FULL")"; KUNS="$(list_or_blank "$FA_KUN")"
 
+# `for x in $EMPTY` iterates zero times, which would drop the whole grid; a
+# single-element list holding the empty string is what "leave it alone" needs.
+[ -n "$WPRS" ] || WPRS='""'
+[ -n "$GFS" ]  || GFS='""'
+[ -n "$GFFS" ] || GFFS='""'
+[ -n "$KUNS" ] || KUNS='""'
+unquote() { [ "$1" = '""' ] && echo "" || echo "$1"; }
+
+total=0
+for occ in $OCC; do for ns in $NS_ABS; do for nsf in $NS_FULL_ABS; do
+for un in $GV_UNROLL; do for glu in $GV_UNROLL_GLU; do for mun in $GV_MOE_UN; do
+for sg in $MOE_DOWN_SG; do for w in $WPRS; do for g in $GFS; do for gf in $GFFS; do
+for k in $KUNS; do for ctx in $CTXS; do
+  total=$((total+1))
+done; done; done; done; done; done; done; done; done; done; done; done
+echo "grid points: $total"
+[ "$ABLATE_LO" != "0" ] || [ "$ABLATE_HI" != "0" ] && \
+  echo "ablation: LO=$ABLATE_LO HI=$ABLATE_HI (each point also runs an ablated twin)"
+
+done_n=0
 for occ in $OCC; do
   mb="${occ%%:*}"; ncu="${occ##*:}"
-  for un in $GV_UNROLL; do for glu in $GV_UNROLL_GLU; do for mun in $GV_MOE_UN; do for sg in $MOE_DOWN_SG; do
-    cdir="$(build_cubin "$mb" "$un" "$glu" "$mun" "$sg")"
-    # A pre-built object (see the grid warm-up in the header) may not carry the
-    # sidecar yet; derive it rather than emitting a null into the record.
+  for un in $GV_UNROLL; do for glu in $GV_UNROLL_GLU; do for mun in $GV_MOE_UN; do
+  for sg in $MOE_DOWN_SG; do
+  for wq in $WPRS; do for gq in $GFS; do for gfq in $GFFS; do for kq in $KUNS; do
+    w="$(unquote "$wq")"; g="$(unquote "$gq")"; gf="$(unquote "$gfq")"; k="$(unquote "$kq")"
+    defs="$(defines_for "$mb" "$un" "$glu" "$mun" "$sg" "$w" "$g" "$gf" "$k")"
+    cdir="$(build_cubin "$defs")"
     [ -s "$cdir/registers" ] || registers_of "$cdir/interp_sm90a.cubin" > "$cdir/registers"
     regs="$(tr -cd '0-9' < "$cdir/registers" 2>/dev/null || true)"
     [ -n "$regs" ] || regs=null
     csha="$(sha256sum "$cdir/interp_sm90a.cubin" 2>/dev/null | cut -c1-16 || true)"
-    for ns in $NS_ABS; do
-      pdir="$(emit_packet "$ncu" "$ns")"
+    abldir=""
+    if [ "$ABLATE_LO" != "0" ] || [ "$ABLATE_HI" != "0" ]; then
+      abldir="$(build_cubin "$defs" abl)"
+    fi
+    for ns in $NS_ABS; do for nsf in $NS_FULL_ABS; do
+      pdir="$(emit_packet "$ncu" "$ns" "$nsf")"
       psha="$(sha256sum "$pdir/model.pkt" 2>/dev/null | cut -c1-16 || true)"
-      cfg="mb${mb}_ncu${ncu}_un${un}_glu${glu}_mun${mun}_sg${sg}_ns${ns}"
+      cfg="mb${mb}_ncu${ncu}_un${un}_glu${glu}_mun${mun}_sg${sg}_ns${ns}_nsf${nsf}"
+      cfg="${cfg}_wpr${w:-d}_gf${g:-d}_gff${gf:-d}_kun${k:-d}"
       adir="$(assets_for "$cdir" "$pdir" "$cfg")"
       for ctx in $CTXS; do
         done_n=$((done_n+1))
         if grep -qF "\"config\":\"$cfg\",\"ctx\":$ctx," "$RESULTS" 2>/dev/null; then
-          echo "[$done_n/$total] $cfg ctx=$ctx — already recorded, skipping"
+          echo "[$done_n/$total] $cfg ctx=$ctx - already recorded, skipping"
           continue
         fi
         echo "[$done_n/$total] $cfg ctx=$ctx"
@@ -368,9 +447,7 @@ for occ in $OCC; do
         samples=(); worst_vram=0
         for r in $(seq 1 "$REPS"); do
           read -r ms pre <<<"$(run_once "$adir" "$ctx" "${LABEL_PREFIX}-${cfg}-c${ctx}-r${r}")"
-          # One field means "no sample, here is the VRAM"; two means "sample, VRAM".
           if [ -z "${pre:-}" ]; then pre="$ms"; ms=""; fi
-          # The row is only as trustworthy as its WORST rep, so keep the max.
           [ "${pre:-0}" -gt "$worst_vram" ] && worst_vram="${pre:-0}"
           [ -n "$ms" ] && samples+=("$ms")
         done
@@ -380,19 +457,43 @@ for occ in $OCC; do
         fi
         med="$(median "${samples[@]}")"
         list="$(printf '%s,' "${samples[@]}")"; list="[${list%,}]"
+
+        # The ablated twin, same packet and ctx. TPOT(full) - TPOT(ablated) is
+        # the op's real contribution AT THIS GRID, imbalance included, which is
+        # a far better signal than total TPOT for a sub-millisecond op.
+        abl_med=null; abl_cost=null
+        if [ -n "$abldir" ]; then
+          aadir="$(assets_for "$abldir" "$pdir" "${cfg}__abl")"
+          asamples=()
+          for r in $(seq 1 "$REPS"); do
+            read -r ams apre <<<"$(run_once "$aadir" "$ctx" "${LABEL_PREFIX}-${cfg}-c${ctx}-a${r}")"
+            if [ -z "${apre:-}" ]; then apre="$ams"; ams=""; fi
+            [ "${apre:-0}" -gt "$worst_vram" ] && worst_vram="${apre:-0}"
+            [ -n "$ams" ] && asamples+=("$ams")
+          done
+          if [ "${#asamples[@]}" -gt 0 ]; then
+            abl_med="$(median "${asamples[@]}")"
+            abl_cost="$(awk -v a="$med" -v b="$abl_med" 'BEGIN{printf "%.3f", a-b}')"
+          fi
+        fi
+
         printf '{"config":"%s","ctx":%s,"dtype":"%s","gpu":"%s","hardware":"%s","model":"%s",' \
           "$cfg" "$ctx" "$DTYPE" "$(json_escape "$GPU")" "$HARDWARE" "$MODEL_NAME" >>"$RESULTS"
-        printf '"minblk":%s,"n_cu":%s,"gv_unroll":%s,"gv_unroll_glu":%s,"gv_moe_un":%s,"moe_down_sg":%s,"ns_abs":%s,' \
-          "$mb" "$ncu" "$un" "$glu" "$mun" "$sg" "$ns" >>"$RESULTS"
-        printf '"samples_ms":%s,"median_ms":%s,"registers":%s,"toolchain":"%s","implementation":"%s",' \
-          "$list" "$med" "$regs" "$TOOLCHAIN" "$IMPL" >>"$RESULTS"
+        printf '"minblk":%s,"n_cu":%s,"gv_unroll":%s,"gv_unroll_glu":%s,"gv_moe_un":%s,"moe_down_sg":%s,' \
+          "$mb" "$ncu" "$un" "$glu" "$mun" "$sg" >>"$RESULTS"
+        printf '"ns_abs":%s,"ns_full_abs":%s,"fa_wpr":%s,"fa_gf":%s,"fa_gf_full":%s,"fa_kun":%s,' \
+          "$ns" "$nsf" "${w:-null}" "${g:-null}" "${gf:-null}" "${k:-null}" >>"$RESULTS"
+        printf '"samples_ms":%s,"median_ms":%s,"ablated_ms":%s,"op_cost_ms":%s,' \
+          "$list" "$med" "$abl_med" "$abl_cost" >>"$RESULTS"
+        printf '"ablate_lo":%s,"ablate_hi":%s,"registers":%s,"toolchain":"%s","implementation":"%s",' \
+          "$ABLATE_LO" "$ABLATE_HI" "$regs" "$TOOLCHAIN" "$IMPL" >>"$RESULTS"
         if [ "$worst_vram" -le "$MEM_IDLE" ]; then unc=true; else unc=false; fi
         printf '"cubin_sha":"%s","pkt_sha":"%s","vram_before_mib":%s,"uncontended":%s,"campaign":"%s","ts":"%s"}\n' \
           "$csha" "$psha" "$worst_vram" "$unc" "$CAMPAIGN" "$(date -Is)" >>"$RESULTS"
-        echo "  -> median ${med} ms of ${#samples[@]} (${samples[*]})  vram_before=${worst_vram} MiB uncontended=${unc}"
+        echo "  -> median ${med} ms of ${#samples[@]} (${samples[*]})  abl=${abl_med} op_cost=${abl_cost}  vram=${worst_vram} unc=${unc}"
       done
-    done
-  done; done; done; done
+    done; done
+  done; done; done; done; done; done; done; done
 done
 
 echo
