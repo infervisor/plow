@@ -102,29 +102,49 @@ isolation-vs-in-context coupling the campaign has hit three times, seen from the
 other side: here the *in-context* number is inflated by a cost the op itself does
 not pay.
 
-## Result 4 — `NS_FULL_ABS` does almost nothing, and only where it can
+## Result 4 — `NS_FULL_ABS`: an optimum that DOES move with ctx
 
 The packet-side split for the **full-attention layers only** — the 5 layers that
-read the whole context, where the other 25 are window-capped at 1024. This is
-the knob with the strongest prior reason to be ctx-dependent.
+read the whole context, where the other 25 are window-capped at 1024.
 
 | `NS_FULL_ABS` | ctx 1024 | ctx 8192 |
 |---|---|---|
-| default (emitter CU-fill) | 4.604 (0.361) | 4.811 (0.573) |
-| 33 | 4.605 (0.363) | 4.802 (**0.557**) |
+| default (emitter CU-fill) | **4.604** (0.361) | 4.811 (0.573) |
+| 33 | 4.605 (0.363) | 4.802 (0.557) |
+| 66 | 4.612 (0.343) | **4.715** (**0.445**) |
 
-At **ctx=1024 it is exactly nothing** — +0.001 ms on a step whose reps span
-0.002 — which is what it should be: at 1024 tokens the full layers have almost
-nothing to split, so the knob has no work to divide. At **ctx=8192 it is a
-small win**, −0.009 ms on TPOT and −0.016 ms on flash's own cost, the latter
-about 4× the rep spread and therefore probably real but not worth shipping on
-its own.
+**The optimum moves: the emitter default at ctx=1024, `66` at ctx=8192**, where
+it is worth **−0.096 ms, about 2 % of the step** — an order of magnitude more
+than `33`'s −0.009. This is the first knob in either family whose *winner*,
+not merely its effect size, changes with context.
 
-So the knob's *effect size* is ctx-dependent even though its optimum has not
-moved off the emitter default at either context measured. That is a weaker
-result than "the optimum moves", and it is stated as such: 33 is the aligned
-value for `n_cu=132` (`n_cu/gcd(n_grp,n_cu)`), and this sweep runs at
-`n_cu=264`, whose aligned value is 66.
+`66` is also the principled value at this occupancy: `n_cu/gcd(n_grp,n_cu)` =
+264/4 = 66, where the build script's recorded 33 is the `n_cu=132` figure. So
+the knob is coupled to occupancy **and** to ctx — the design doc's joint-sweep
+claim, now demonstrated on the flash family.
+
+### Why it moves — the ablation gives the mechanism
+
+Splitting the full layers trades two costs against each other, and only the
+ablated twin separates them:
+
+| ctx | Δ flash (body) | Δ ablated (gate/protocol) | Δ TPOT |
+|---|---|---|---|
+| 1024 | **−0.018** | **+0.026** | +0.008 |
+| 8192 | **−0.128** | **+0.032** | **−0.096** |
+
+More splits make flash's **body** cheaper but add **gate and signal** time for
+the extra work items — which still execute with flash's body compiled out, which
+is exactly why the twin can see them. **The gate cost is near-constant (+0.026 →
++0.032) while the body saving grows 7× (−0.018 → −0.128).** So splits pay only
+once the body term is large enough to outrun a fixed protocol cost, and that is
+a context condition.
+
+This was a *prediction* before it was a measurement: the ctx=1024 decomposition
+alone implied `66` should improve with context, and it did, by 0.104 ms of
+swing. An earlier revision of this card — written on the 1024 data — concluded
+"the effect size is ctx-dependent, the optimum is not". The 8192 point refutes
+that, and it is corrected here rather than left standing.
 
 ## What this puts in `tunedb` — nothing new, and that is the result
 
