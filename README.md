@@ -135,6 +135,40 @@ Useful knobs:
 - `PLOW_FUSE_ARGMAX=1` — fold greedy argmax into the lm_head GEMV epilogue
   (byte-identical, ~0 perf — the logit round-trip is ~0.1%; a correctness-neutral
   cleanup, kept as a flag).
+- `PLOW_FINE_FORCE=1` — keep per-slice (**fine**) counter gates instead of the
+  default whole-op (**coarse**) ones. The emitter declares a fine edge wherever a
+  consumer slice reads only part of a producer (headnorm→flash, flash→merge, MoE
+  down→GLU); by default `select_granularity` collapses every *homogeneous* region
+  back to coarse, because `lean-plow/Plow/CounterGranularity.lean:collapse` proves
+  fine buys nothing when per-slice work is uniform — and it isn't free (an extra
+  counter per producer slice, an extra atomic per producer, a wider wait list).
+  This lever keeps the fine edge iff it is genuinely *sparse* (some consumer slice
+  waits on strictly fewer than all producer slices) so it isolates the recoverable
+  straggler gates without paying the 256×256-atomic all-to-all cost. It exists to
+  **measure** the real-hardware straggler delta the uniform cost model can't see:
+  on dense Gemma it was a wash-to-loss (16.9 → 17.2 ms/token), which is why coarse
+  is the default. Lean-safe (a fine list only lowers a threshold / narrows a wait
+  set), and **unset = byte-identical** coarse. There is no all-to-all "everything
+  fine" mode — see `plans/fine-counter-deadlock-fix.md`.
+- `PLOW_NV_PLACE=1` — **L2-domain packet grouping** (compiler half of physical-SM
+  locality). Groups the device blob's global-queue stream into P per-L2-domain
+  windows: each op-slice's domain is `physical_cu / sms_per_partition` (XCD on
+  MI300/MI350, GPC on H100/B200, from `hwspec::GpuSpec::l2_partitioning`), so a
+  full op's slices spread evenly across all domains and slice `s` stays in one
+  domain across ops (consumer reads producer from the same L2 slice). It does NOT
+  touch `cus` (so it can't regress `Builder::split` disjointness) and prints a
+  static allocation report (`l2 placement: … packets/domain […] skew …%`). **Unset
+  = byte-identical**; no-op on unpartitioned GPUs (e.g. consumer Blackwell). This
+  is only the compiler tag — the locality is realized by the runtime half
+  (`-DPLOW_NV_PLACE_DISPATCH`, **experimental/unvalidated**), where each block
+  reads its physical SM id and pulls its domain's window. Must be built + measured
+  on a partitioned GPU (H100/B200/MI300/MI350). Guards: placement is **skipped**
+  (byte-identical, with a note) when `n_cu > partition_count·sms` — occupancy>1 or
+  a grid≠sm_count mismatch, where domains would exceed the runtime's and orphan
+  packets; and a placement blob carries a header flag (`PLOW_BLOB_F_L2DOM`, plus
+  SMs/partition + domain count in `reserved`) that a runtime **without**
+  `PLOW_NV_PLACE_DISPATCH` refuses at load (its `seg` is a domain, not a
+  wave-class). See `plans/devblob-locality-placement.md`.
 
 ### Enabling fp8 (a compile/emit-time decision, off by default)
 

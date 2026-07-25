@@ -56,6 +56,8 @@ fn emit_with(dir: &Path, ctx: u32, n_cu: u32, tp: u32, rope_gen: bool) -> Vec<u8
         embed_cubin: None,
         embed_hsaco: None,
         rope_gen,
+        l2_layout: None,
+        gpu: String::new(),
     });
     std::fs::read(&out).unwrap()
 }
@@ -197,5 +199,91 @@ fn qwen3_dense_blob_is_stable() {
         GOLDEN_FNV1A,
         "dense Qwen3 blob hash changed (len={})",
         blob.len()
+    );
+}
+
+/// Miniature Gemma-4 text config: dense, sliding+full layer mix, GQA, tied embeds,
+/// GeGLU, q/k/v norms. Exercises the Gemma-specific `emit_phase` branches. GQA=4
+/// (heads 8 / kv 2) is even, so the flash-decode GF=2 divides it.
+fn write_gemma_config(dir: &Path) {
+    let cfg = r#"{
+      "model_type": "gemma4_text",
+      "hidden_size": 512,
+      "intermediate_size": 1024,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 8,
+      "head_dim": 64,
+      "global_head_dim": 64,
+      "num_key_value_heads": 2,
+      "num_global_key_value_heads": 2,
+      "sliding_window": 512,
+      "rms_norm_eps": 1e-6,
+      "vocab_size": 4096,
+      "final_logit_softcapping": 0.0,
+      "tie_word_embeddings": true,
+      "layer_types": ["sliding_attention", "full_attention"],
+      "rope_parameters": {
+        "sliding_attention": { "rope_theta": 10000.0, "partial_rotary_factor": 1.0 },
+        "full_attention": { "rope_theta": 1000000.0, "partial_rotary_factor": 1.0 }
+      }
+    }"#;
+    std::fs::write(dir.join("config.json"), cfg).unwrap();
+}
+
+/// Miniature Llama-3 config: dense, all-global attention, SwiGLU, no q/k norm,
+/// untied lm_head. Exercises the Llama/Qwen `emit_phase` branches distinct from Gemma.
+fn write_llama_config(dir: &Path) {
+    let cfg = r#"{
+      "model_type": "llama",
+      "hidden_size": 512,
+      "intermediate_size": 1024,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 8,
+      "head_dim": 64,
+      "num_key_value_heads": 2,
+      "rms_norm_eps": 1e-5,
+      "vocab_size": 4096,
+      "rope_theta": 500000.0,
+      "rope_scaling": null,
+      "tie_word_embeddings": false
+    }"#;
+    std::fs::write(dir.join("config.json"), cfg).unwrap();
+}
+
+/// Byte-golden for the dense **Gemma** path — protects the Gemma `emit_phase`
+/// branches across the trait refactor (plans/devgen-trait-refactor.md). Bootstrap:
+/// the assert message prints the actual hash on first run; pin it here.
+#[test]
+fn gemma_dense_blob_is_stable() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("golden_gemma");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    write_gemma_config(&root);
+    let blob = emit(&root, 512, 128, 1);
+    const GEMMA_GOLDEN_FNV1A: u64 = 0xefe5_b0ec_5b7d_a84f;
+    assert_eq!(
+        fnv1a(&blob),
+        GEMMA_GOLDEN_FNV1A,
+        "gemma dense blob hash changed (len={}, actual={:#018x})",
+        blob.len(),
+        fnv1a(&blob)
+    );
+}
+
+/// Byte-golden for the dense **Llama** path.
+#[test]
+fn llama_dense_blob_is_stable() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("golden_llama");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    write_llama_config(&root);
+    let blob = emit(&root, 512, 128, 1);
+    const LLAMA_GOLDEN_FNV1A: u64 = 0xca67_12ad_d306_d875;
+    assert_eq!(
+        fnv1a(&blob),
+        LLAMA_GOLDEN_FNV1A,
+        "llama dense blob hash changed (len={}, actual={:#018x})",
+        blob.len(),
+        fnv1a(&blob)
     );
 }

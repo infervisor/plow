@@ -591,12 +591,33 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
     if let (Source::HfDir(dir), Some(synth), Some((_, plan))) =
         (src, hf_synth.as_ref(), plans.first())
     {
-        hf_config::validate_against_checkpoint(dir, plan, synth)
-            .map_err(PlowcError::InvalidDim)?;
-        info!(
-            stage = "checkpoint-validation", prefix = %synth.prefix,
-            "checkpoint weights match the lowered plan"
-        );
+        // Config-only checkpoint: with no safetensors there is nothing to
+        // cross-check the plan against (and the runtime cannot bind weights),
+        // but a structural compile — same use the devblob path already allows —
+        // is legitimate for comparing packets/counters. Skip the gate with a
+        // warning rather than erroring, matching `devgen::layer_scalars`.
+        let has_shards = std::fs::read_dir(dir).is_ok_and(|rd| {
+            rd.filter_map(Result::ok).any(|e| {
+                let p = e.path();
+                p.extension().and_then(|x| x.to_str()) == Some("safetensors")
+                    || p.to_string_lossy().ends_with(".partial.safetensors")
+            })
+        });
+        if has_shards {
+            hf_config::validate_against_checkpoint(dir, plan, synth)
+                .map_err(PlowcError::InvalidDim)?;
+            info!(
+                stage = "checkpoint-validation", prefix = %synth.prefix,
+                "checkpoint weights match the lowered plan"
+            );
+        } else {
+            warn!(
+                stage = "checkpoint-validation", prefix = %synth.prefix,
+                "no .safetensors in {} — skipping weight-coverage gate (structural \
+                 compile; weights are unbound and numerics are not representative)",
+                dir.display()
+            );
+        }
     }
     let lookup_plan = |b: &ShapeBucket| {
         plans

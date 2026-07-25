@@ -91,11 +91,32 @@ pub struct Builder {
     ops: Vec<Op>,
     tensors: Vec<TensorDecl>,
     gen: Vec<GenTensor>,
+    /// L2-domain-aware placement (`PLOW_NV_PLACE`): `(sms_per_partition,
+    /// partition_count)` of the target GPU (XCD on MI300/MI350, GPC on
+    /// H100/B200). `None` ⇒ off; the blob is byte-identical and `seg` keeps its
+    /// wave-class meaning. When set, [`Builder::finish`] repurposes the `seg`
+    /// field as a **locality domain** `0..P` and groups `gq_stream` by domain, so
+    /// a physical-SM-aware interp (a cluster/HW_ID cursor per domain) can pull
+    /// only its domain's packets. The `cus` sets are NOT touched — placement is
+    /// dynamic (cursor-claimed) at runtime, so it cannot regress disjoint
+    /// `Builder::split` placements. See `plans/devblob-locality-placement.md`.
+    place_l2: Option<(u32, u32)>,
 }
 
 impl Builder {
     pub fn new(n_cu: u32) -> Self {
-        Self { n_cu, ops: Vec::new(), tensors: Vec::new(), gen: Vec::new() }
+        Self { n_cu, ops: Vec::new(), tensors: Vec::new(), gen: Vec::new(), place_l2: None }
+    }
+
+    /// Enable L2-domain-aware placement: `(sms_per_partition, partition_count)`
+    /// from `hwspec::GpuSpec::l2_partitioning`. `None` (default) leaves the
+    /// wave-class `seg` and a byte-identical blob. [`Builder::finish`] skips
+    /// placement (byte-identical) if `n_cu > partition_count·sms` — occupancy>1
+    /// (`n_cu == 2·sm_count`) or a grid≠sm_count mismatch, where `cu/sms` would
+    /// exceed the runtime's `partition_count` domains and orphan packets. See
+    /// the field docs and `plans/devblob-locality-placement.md`.
+    pub fn set_l2_placement(&mut self, layout: Option<(u32, u32)>) {
+        self.place_l2 = layout;
     }
 
     /// Declare a tensor and get its handle.
@@ -337,6 +358,28 @@ impl Builder {
         let n_cu = self.n_cu as usize;
         let n_ops = self.ops.len();
 
+        // Effective L2-domain placement (PLOW_NV_PLACE), with the occupancy-1
+        // coverage guard: every slice's domain is `cu / sms`, which must be < P
+        // so it matches the runtime's `smid / sms` in [0, P). `n_cu > P·sms`
+        // means occupancy>1 (n_cu = 2·sm_count) or a grid≠sm_count mismatch —
+        // placement would emit domain windows the runtime never pulls (orphaned
+        // packets -> deadlock). Skip it and fall back byte-identical.
+        let l2_place: Option<(u32, u32)> = self.place_l2.and_then(|(sms, p)| {
+            if sms == 0 || p == 0 {
+                None
+            } else if self.n_cu > p * sms {
+                eprintln!(
+                    "  l2 placement SKIPPED: n_cu {} > {p} domains × {sms} SM = {} \
+                     (occupancy>1 or grid≠sm_count) — byte-identical",
+                    self.n_cu,
+                    p * sms
+                );
+                None
+            } else {
+                Some((sms, p))
+            }
+        });
+
         // Coarse or fine, decided from the dataflow — not from a flag. See the doc comment on
         // `select_granularity`, and the `collapse` theorem it implements.
         let (kept, downgraded) = self.select_granularity();
@@ -474,7 +517,16 @@ impl Builder {
             for (slice, &cu) in op.cus.iter().enumerate() {
                 let mut e =
                     StreamEnt { inst: idx as u32, slice: slice as u32, ..Default::default() };
-                e.seg = seg_of[idx];
+                // L2-domain placement (PLOW_NV_PLACE): `seg` is a PER-SLICE domain
+                // = physical CU / SMs-per-partition, so a full op's slices spread
+                // across every L2 domain (no skew) and slice `s` sits in the same
+                // domain across ops (consumer reads producer from one L2 slice).
+                // A physical-SM interp pulls its domain's gq window. Off ⇒ `seg`
+                // keeps its wave-class meaning (byte-identical).
+                e.seg = match l2_place {
+                    Some((sms, _)) => (cu / sms) as u16,
+                    None => seg_of[idx],
+                };
                 if fine {
                     e.flags = SE_FINE;
 
@@ -532,10 +584,26 @@ impl Builder {
             stream.extend_from_slice(s);
         }
 
+        // Under L2 placement, `seg` == domain is not monotonic in op-emit order,
+        // so group gq_stream by domain first. A STABLE sort preserves each
+        // domain's op-major (topological) order; cross-domain deps stay
+        // counter-gated. This yields contiguous per-domain [ofs[d], ofs[d+1))
+        // windows a physical-SM interp pulls with one cursor per domain.
+        if l2_place.is_some() {
+            gq_stream.sort_by_key(|e| e.seg);
+        }
+
         // Segment window bounds in gq_stream. gq_stream is op-major and seg_of[] is monotonic in
         // op-emit order, so each segment occupies a contiguous [ofs[s], ofs[s+1]) range — the
-        // interp bounds its cursor to this window under RUNSEG.
-        let n_seg = cur_seg as usize + 1;
+        // interp bounds its cursor to this window under RUNSEG. Under L2 placement `seg` ranges
+        // over the P L2 domains instead of the wave-class count.
+        // Under L2 placement, `seg` ranges over the P L2 domains (fixed by the
+        // hardware partition_count), NOT ceil(n_cu/sms) — so the window count
+        // always matches the runtime's `smid/sms` domain count.
+        let n_seg = match l2_place {
+            Some((_, p)) => p as usize,
+            None => cur_seg as usize + 1,
+        };
         let mut gq_seg_ofs = vec![0u32; n_seg + 1];
         {
             let mut s = 0usize;
@@ -546,6 +614,28 @@ impl Builder {
                 }
             }
             gq_seg_ofs[n_seg] = gq_stream.len() as u32;
+        }
+
+        // Static allocation report (PLOW_NV_PLACE): packets (op-slices) per L2
+        // domain window, and the skew a physical-SM interp would see across
+        // partitions. Emitted here so a build surfaces the balance without a GPU.
+        if l2_place.is_some() {
+            let per: Vec<u32> = (0..n_seg)
+                .map(|d| gq_seg_ofs[d + 1] - gq_seg_ofs[d])
+                .collect();
+            let (lo, hi) = (
+                per.iter().copied().min().unwrap_or(0),
+                per.iter().copied().max().unwrap_or(0),
+            );
+            let skew = if hi > 0 {
+                100.0 * (hi - lo) as f64 / hi as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "  l2 placement: {n_seg} domains, packets/domain {per:?}, skew {skew:.1}% \
+                 (max {hi} vs min {lo})"
+            );
         }
 
         Program {
@@ -560,6 +650,8 @@ impl Builder {
             tensors: self.tensors,
             gq_stream,
             gq_seg_ofs,
+            l2_sms: l2_place.map(|(s, _)| s).unwrap_or(0),
+            l2_domains: l2_place.map(|(_, p)| p).unwrap_or(0),
         }
     }
 }
@@ -578,6 +670,13 @@ pub struct Program {
     pub gq_stream: Vec<StreamEnt>,
     /// `[n_seg+1]` segment window bounds into `gq_stream`.
     pub gq_seg_ofs: Vec<u32>,
+    /// L2-domain placement (PLOW_NV_PLACE): SMs per partition, and the number of
+    /// L2 domains `gq_seg_ofs` is windowed by. `0` ⇒ not placed (`seg` is
+    /// wave-class). When non-zero, `gq_stream`'s `seg` is a domain and the blob
+    /// header carries [`PLOW_BLOB_F_L2DOM`]; a runtime without physical-SM
+    /// domain dispatch must refuse it. See `plans/devblob-locality-placement.md`.
+    pub l2_sms: u32,
+    pub l2_domains: u32,
 }
 
 // \x07/\x08 = the 64-byte DevInst64 wire format (was \x05/\x06 at 104 bytes).
@@ -667,7 +766,11 @@ pub struct BlobHeader {
     /// Packet-stream type flags — see [`PLOW_BLOB_F_GQ`]. Lets the runtime tell a global-queue-capable
     /// blob from a static-only one at the header, without sniffing the trailing section.
     pub flags: u32,
-    pub _pad: u32,
+    /// Target-GPU fingerprint ([`gpu_fingerprint`]) — the spec the blob was compiled for, so the
+    /// runtime can warn when loaded on a different GPU (only `n_cu` was cross-checked before). `0`
+    /// ⇒ unknown. Same byte offset as the former `_pad`, so the wire layout is unchanged. (Model
+    /// arch tag + HF id ride the `SECT_METADATA` `block.json` descriptor, not this fixed header.)
+    pub target: u32,
     pub init_bytes: u64,
     /// Reserved for future metadata. The header is fixed at 64 bytes (one cache line, 8-aligned) so new
     /// fields can be carved out of this block without moving the existing ones or the sections after it.
@@ -677,6 +780,28 @@ pub struct BlobHeader {
 /// [`BlobHeader::flags`] bit: the blob carries an op-major global-queue packet stream (the trailing
 /// `gq_stream`/`gq_seg_ofs` appendix), so `PLOW_GLOBAL_QUEUE=1` can run it. Absent ⇒ static-only.
 pub const PLOW_BLOB_F_GQ: u32 = 1;
+
+/// [`BlobHeader::flags`] bit: `gq_stream`'s `seg` is an **L2 domain** (PLOW_NV_PLACE),
+/// and `gq_seg_ofs` windows it by domain, not wave-class. A runtime WITHOUT
+/// physical-SM domain dispatch (`PLOW_NV_PLACE_DISPATCH`) must REFUSE such a blob —
+/// its wave-class segmentation would mis-dispatch `seg`. `reserved[1]` carries SMs
+/// per partition, `reserved[2]` the domain count, so the interp need not be told
+/// via a build define. See `plans/devblob-locality-placement.md`.
+pub const PLOW_BLOB_F_L2DOM: u32 = 2;
+
+/// Stable 32-bit fingerprint of a target GPU spec name (e.g. `"H100 SXM5"`), stamped into
+/// [`BlobHeader::target`] so the runtime can warn when a blob is loaded on a GPU it was not
+/// compiled for (tile sizes, KV layout, RoPE, and L2 domains are all target-specific — today
+/// only `n_cu` is cross-checked). `0` ⇒ unknown/unspecified (check skipped). FNV-1a; the
+/// runtime resolves its device to the same canonical spec name and compares.
+pub fn gpu_fingerprint(name: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in name.as_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
 
 /// Mirrors `PlowProgHeader`.
 #[repr(C)]
@@ -764,6 +889,9 @@ impl Program {
 /// The runtime binds tensors once, by name, and then just picks a program per step.
 pub struct Model {
     pub n_cu: u32,
+    /// Target-GPU fingerprint ([`gpu_fingerprint`]) written to [`BlobHeader::target`]. `0` ⇒
+    /// unknown/unspecified (the runtime skips the GPU-match warning).
+    pub target: u32,
     pub tensors: Vec<TensorDecl>,
     pub progs: Vec<Program>,
     /// Instruction indices in program 1 (decode) whose `i[3]` is the KV-cache write row.
@@ -831,6 +959,12 @@ impl Model {
             decls.push(BlobTensor { name, bytes: t.bytes, init_off });
         }
 
+        // L2-domain placement summary across programs (PLOW_NV_PLACE): all placed
+        // programs share the target's (sms, domains); mark the header + carry them.
+        let (l2_flag, l2_sms, l2_dom) = match self.progs.iter().find(|p| p.l2_domains > 0) {
+            Some(p) => (PLOW_BLOB_F_L2DOM, p.l2_sms, p.l2_domains),
+            None => (0, 0, 0),
+        };
         let hdr = BlobHeader {
             magic: *BLOB_MAGIC,
             n_cu: self.n_cu,
@@ -839,10 +973,13 @@ impl Model {
             n_kvrow: self.kv_row_insts.len() as u32,
             // Every program carries the op-major gq_stream appendix (emitted below), so mark the
             // stream global-queue-capable. The runtime reads this to allow PLOW_GLOBAL_QUEUE=1.
-            flags: PLOW_BLOB_F_GQ,
-            _pad: 0,
+            // + F_L2DOM when any program is L2-domain-placed (PLOW_NV_PLACE); the runtime must
+            // then use physical-SM domain dispatch or REFUSE the blob. reserved[1]=SMs/partition,
+            // reserved[2]=domain count, so the interp reads them instead of a build define.
+            flags: PLOW_BLOB_F_GQ | l2_flag,
+            target: self.target,
             init_bytes: init.len() as u64,
-            reserved: [0; 3],
+            reserved: [0, l2_sms as u64, l2_dom as u64],
         };
         let mut b = Vec::new();
         pod(&[hdr], &mut b);
@@ -945,6 +1082,11 @@ impl Model {
             decls.push(BlobTensor { name, bytes: t.bytes, init_off });
         }
 
+        // L2-domain placement summary (PLOW_NV_PLACE) — see to_blob().
+        let (l2_flag, l2_sms, l2_dom) = match self.progs.iter().find(|p| p.l2_domains > 0) {
+            Some(p) => (PLOW_BLOB_F_L2DOM, p.l2_sms, p.l2_domains),
+            None => (0, 0, 0),
+        };
         // Header placeholder — sect_dir_offset patched after we know the full layout.
         let hdr = BlobHeader {
             magic: if self.gen.is_empty() { *BLOB_MAGIC_V6 } else { *BLOB_MAGIC_V7 },
@@ -952,10 +1094,11 @@ impl Model {
             n_tensor: self.tensors.len() as u32,
             n_prog: self.progs.len() as u32,
             n_kvrow: self.kv_row_insts.len() as u32,
-            flags: PLOW_BLOB_F_GQ,
-            _pad: 0,
+            flags: PLOW_BLOB_F_GQ | l2_flag,
+            target: self.target,
             init_bytes: init.len() as u64,
-            reserved: [0; 3], // reserved[0] = sect_dir_offset, patched below
+            // reserved[0] = sect_dir_offset (patched below); [1]=SMs/partition, [2]=domain count.
+            reserved: [0, l2_sms as u64, l2_dom as u64],
         };
         let mut b = Vec::new();
         pod(&[hdr], &mut b);
@@ -1109,9 +1252,12 @@ mod v6_tests {
             tensors: Vec::new(),
             gq_stream: vec![se(0, 0), se(1, 0)],
             gq_seg_ofs: vec![0, 2],
+            l2_sms: 0,
+            l2_domains: 0,
         };
         Model {
             n_cu: 2,
+            target: 0,
             tensors: vec![TensorDecl { name: "buf".into(), bytes: 64, init: None }],
             progs: vec![prog()],
             kv_row_insts: vec![],
@@ -1202,6 +1348,8 @@ mod v6_tests {
             tensors: Vec::new(),
             gq_stream: (0..n_inst * 2).map(|i| se(i as u32 / 2, i as u32 % 2)).collect(),
             gq_seg_ofs: vec![0, n_inst as u32 * 2],
+            l2_sms: 0,
+            l2_domains: 0,
         };
 
         let bucket_ts: Vec<u32> = vec![128, 512, 1024, 4096, 1]; // last = decode
@@ -1215,6 +1363,7 @@ mod v6_tests {
 
         let m = Model {
             n_cu: 4,
+            target: 0,
             tensors: vec![
                 TensorDecl { name: "model.q".into(), bytes: 1024, init: None },
                 TensorDecl { name: "model.k".into(), bytes: 512, init: None },

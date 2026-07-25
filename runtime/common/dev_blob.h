@@ -64,7 +64,10 @@ typedef struct {
     uint32_t n_kvrow;
     /* Packet-stream type flags (PLOW_BLOB_F_*). Denotes global-queue vs static-only at the header. */
     uint32_t flags;
-    uint32_t _pad;
+    /* Target-GPU fingerprint (fnv1a of the spec name) the blob was compiled for; 0 = unknown.
+     * Lets the runtime warn when loaded on a different GPU (only n_cu was cross-checked before).
+     * Model arch tag + HF id ride the SECT_METADATA block.json descriptor. Was `_pad`. */
+    uint32_t target;
     uint64_t init_bytes;
     /* Reserved for future metadata. The header is fixed at 64 bytes (one cache line, 8-aligned) so new
      * fields can be carved from this block without moving existing fields or the sections after it. */

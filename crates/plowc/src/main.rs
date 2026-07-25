@@ -674,6 +674,18 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // `PLOW_NV_PLACE=1`: L2-domain-aware placement. Resolve SMs per L2 partition
+    // (XCD on MI300/MI350, GPC on H100/B200) from hwspec; `None` (flag unset or
+    // an unpartitioned GPU, e.g. consumer Blackwell) ⇒ byte-identical blob.
+    // The physical-SM dispatch that consumes this is a runtime/interp feature —
+    // see plans/devblob-locality-placement.md.
+    let l2_layout = if std::env::var("PLOW_NV_PLACE").ok().as_deref() == Some("1") {
+        hwspec::registry::lookup(&cli.gpu)
+            .and_then(|s| s.l2_partitioning.as_ref())
+            .map(|p| (p.sms_per_partition, p.partition_count))
+    } else {
+        None
+    };
     devgen::run_verified(
         devgen::EmitArgs {
             dir: dir.clone(),
@@ -685,6 +697,8 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             embed_cubin: cli.embed_cubin.clone(),
             embed_hsaco: cli.embed_hsaco.clone(),
             rope_gen: !cli.no_rope_gen,
+            l2_layout,
+            gpu: cli.gpu.clone(),
         },
         verify,
     );

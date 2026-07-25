@@ -1372,7 +1372,27 @@ __global__ __launch_bounds__(256, PLOW_NV_MINBLK) void PLOW_SYM(interp_sm120)(Pl
     /* ONE shared cursor over the op-major gq_stream. gq_seg_ofs is a 2-word {0, n_stream}
      * window (this program is a SINGLE segment — measured: every entry seg==0). */
     __shared__ unsigned gq_claim;
-#if PLOW_NV_SEGMENTS
+#if PLOW_NV_PLACE_DISPATCH
+    /* ===== EXPERIMENTAL / UNVALIDATED — physical-SM L2-domain dispatch =====
+     * plans/devblob-locality-placement.md. Consumes a compiler PLOW_NV_PLACE blob,
+     * whose gq_stream is grouped into P per-L2-domain windows (gq_seg_ofs). Each
+     * block reads its PHYSICAL SM id and pulls ONLY its L2 domain's window via that
+     * domain's cursor line, so a domain's packets run on the L2 slice that holds
+     * their data. This is what makes the compiler's locality real (vs blockIdx,
+     * which the HW scheduler maps arbitrarily to SMs).
+     *
+     * REQUIRES: -DPLOW_NV_L2_SMS=<SMs per L2 partition> (18 on H100, 32 on MI350).
+     * CAVEAT: smid/PLOW_NV_L2_SMS assumes contiguous per-GPC smid numbering — NOT
+     * guaranteed by CUDA. The robust form is a thread-block CLUSTER launch (sm_90+)
+     * with cluster-rank as the domain. MUST be built and measured on a partitioned
+     * GPU (H100/B200/MI300/MI350); default off => byte-identical SASS, never built. */
+    unsigned plow_smid;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(plow_smid));
+    const unsigned plow_dom = plow_smid / (PLOW_NV_L2_SMS);
+    uint32_t* const cursor = PLOW_CTR(prog.gq_cursor, plow_dom);
+    const unsigned gq_lo = prog.gq_seg_ofs[plow_dom];
+    const unsigned gq_hi = prog.gq_seg_ofs[plow_dom + 1];
+#elif PLOW_NV_SEGMENTS
     /* Segmented dispatch (AMD interp.hip:881-886): this launch owns ONE segment. Its cursor is a
      * per-segment line (own cache line via PLOW_CTR stride) so the host can enqueue every segment's
      * launch after a single zeroing; its window is the segment's contiguous [lo,hi) slice of the

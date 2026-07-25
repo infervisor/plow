@@ -1,0 +1,230 @@
+//! Model config parsing: the arch tag + `Cfg` (dense-GQA switches) and the
+//! `config.json` → `Cfg` parsers for Gemma / Llama / Qwen. Split out of `lib.rs`
+//! (module breakdown). GLM/Nemotron carry their own cfg in `mla.rs`.
+use std::path::Path;
+
+use packet::rope::RopeScale;
+use serde_json::Value;
+
+
+/// Which checkpoint architecture we are compiling (tensor naming, norm topology,
+/// activation, attention geometry, RoPE differ per arch).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Arch {
+    Gemma4,
+    Llama,
+    Qwen3,
+}
+
+
+pub(crate) struct Cfg {
+    pub(crate) arch: Arch,
+    pub(crate) hidden: u32,
+    pub(crate) inter: u32,
+    pub(crate) layers: u32,
+    pub(crate) heads: u32,
+    pub(crate) hd_slide: u32,
+    pub(crate) hd_full: u32,
+    pub(crate) kvh_slide: u32,
+    pub(crate) kvh_full: u32,
+    pub(crate) window: u32,
+    pub(crate) eps: f32,
+    pub(crate) vocab: u32,
+    pub(crate) softcap: f32,
+    pub(crate) is_full: Vec<bool>,
+    pub(crate) theta_slide: f64,
+    pub(crate) theta_full: f64,
+    pub(crate) rope_frac_full: f64,
+    pub(crate) rope_scale: RopeScale,
+    // Arch switches (Gemma values preserve the old behaviour exactly).
+    pub(crate) attn_scale: f32,   // Gemma 1.0 (q_norm absorbs it); Llama/Qwen 1/sqrt(head_dim)
+    pub(crate) emb_scale: f32,    // Gemma bf16_round(sqrt(hidden)); Llama/Qwen 1.0
+    pub(crate) mlp_act: u32,      // 0 = gelu_tanh (Gemma), 1 = silu (Llama/Qwen)
+    pub(crate) has_qk_norm: bool, // Gemma & Qwen true; Llama false
+    pub(crate) has_v_norm: bool,  // Gemma weightless v_norm; Llama/Qwen false
+    pub(crate) k_eq_v: bool,      // Gemma full layers share k_proj as V; Llama/Qwen false
+    pub(crate) tied: bool,        // reuse embed_tokens as lm_head (Gemma, Qwen); Llama has lm_head.weight
+    pub(crate) prefix: String,    // weight-name prefix: "model.language_model." or "model."
+    // Tensor-parallel degree (Megatron sharding). 1 = single-GPU (current path, byte-identical).
+    // >1 emits a DECODE-ONLY sharded blob (plans/tp-design.md §3): column-parallel q/k/v/gate/up/
+    // lm_head, row-parallel o_proj/down with an XReduce all-reduce after each, attention split by
+    // heads. All ranks run the ONE blob; tp-host binds each rank's 1/N weight slice and sets
+    // PlowProgram.rank/n_gpu/peer_scratch/xctr. Set from --tp in main() after cfg_from.
+    pub(crate) tp: u32,
+    // Gemma-4 26B-A4B sparse-MoE (`enable_moe_block`). Every layer is a HYBRID dense+MoE block:
+    // the dense MLP (inter) AND the top-`top_k`-of-`n_exp` softmax-routed experts (moe_inter),
+    // summed via the h1+h2 sandwich (plans/rtx-08-gemma4-moe-26b.md). Decode-only for now.
+    pub(crate) moe: bool,
+    pub(crate) n_exp: u32,     // 128 routed experts
+    pub(crate) top_k: u32,     // 8 experts/token
+    pub(crate) moe_inter: u32, // 704 per-expert intermediate
+}
+
+pub(crate) fn cfg_from(dir: &Path) -> Cfg {
+    let v: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).expect("config.json"))
+            .unwrap();
+    // Gemma-4 multimodal nests everything under `text_config` (prefix
+    // "model.language_model."); the text-only "-it-text" re-export is FLAT with
+    // model_type "gemma4_text" (prefix "model."). Same weights, two namings.
+    if v.get("text_config").is_some() {
+        return cfg_gemma(&v, false);
+    }
+    let mt = v["model_type"].as_str().unwrap_or("");
+    if mt == "gemma4_text" {
+        return cfg_gemma(&v, true);
+    }
+    let arch = match mt {
+        "qwen3" => Arch::Qwen3,
+        "llama" => Arch::Llama,
+        other => panic!("unsupported model_type {other:?}"),
+    };
+    cfg_llama_qwen(&v, arch)
+}
+
+/// The original Gemma-4 config parse, verbatim — do not regress it. `flat` selects
+/// the text-only re-export (fields at the root, "model." prefix) vs the multimodal
+/// checkpoint (fields under `text_config`, "model.language_model." prefix).
+fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
+    let t = if flat { v } else { &v["text_config"] };
+    let g = |k: &str| t[k].as_u64().unwrap() as u32;
+    let lt: Vec<bool> = t["layer_types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap() == "full_attention")
+        .collect();
+    let rp = &t["rope_parameters"];
+    Cfg {
+        arch: Arch::Gemma4,
+        hidden: g("hidden_size"),
+        inter: g("intermediate_size"),
+        layers: g("num_hidden_layers"),
+        heads: g("num_attention_heads"),
+        hd_slide: g("head_dim"),
+        hd_full: g("global_head_dim"),
+        kvh_slide: g("num_key_value_heads"),
+        // Nullable: the E-series ships `num_global_key_value_heads: null` and reuses the
+        // sliding count. `g()` would panic on the None; fall back the way
+        // hf_config::synth_gemma already does, so an unsupported checkpoint reaches the
+        // coverage gate and gets a diagnosis instead of an `Option::unwrap` backtrace.
+        kvh_full: t["num_global_key_value_heads"]
+            .as_u64()
+            .map(|x| x as u32)
+            .unwrap_or_else(|| g("num_key_value_heads")),
+        window: g("sliding_window"),
+        eps: t["rms_norm_eps"].as_f64().unwrap() as f32,
+        vocab: g("vocab_size"),
+        softcap: t["final_logit_softcapping"].as_f64().unwrap() as f32,
+        theta_slide: rp["sliding_attention"]["rope_theta"].as_f64().unwrap(),
+        theta_full: rp["full_attention"]["rope_theta"].as_f64().unwrap(),
+        rope_frac_full: rp["full_attention"]["partial_rotary_factor"]
+            .as_f64()
+            .unwrap(),
+        is_full: lt,
+        rope_scale: RopeScale::None,
+        attn_scale: 1.0,
+        emb_scale: bf16_round((g("hidden_size") as f32).sqrt()),
+        mlp_act: 0,
+        has_qk_norm: true,
+        has_v_norm: true,
+        k_eq_v: true,
+        tied: true,
+        prefix: if flat {
+            "model."
+        } else {
+            "model.language_model."
+        }
+        .to_string(),
+        tp: 1,
+        // 26B-A4B: enable_moe_block=true, num_experts=128, top_k_experts=8, moe_inter=704.
+        // 12B/31B: field absent -> dense-only (moe=false).
+        moe: t["enable_moe_block"].as_bool().unwrap_or(false),
+        n_exp: t["num_experts"].as_u64().unwrap_or(0) as u32,
+        top_k: t["top_k_experts"].as_u64().unwrap_or(0) as u32,
+        moe_inter: t["moe_intermediate_size"].as_u64().unwrap_or(0) as u32,
+    }
+}
+
+/// Llama-3.1 / Qwen3: flat config, all-global attention, simple pre-norm, SwiGLU.
+fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
+    let g = |k: &str| v[k].as_u64().unwrap() as u32;
+    let hidden = g("hidden_size");
+    let heads = g("num_attention_heads");
+    // Qwen carries head_dim explicitly (and it is NOT hidden/heads: 2560/32 != 128); Llama omits
+    // it, so it is hidden/heads = 128.
+    let hd = v["head_dim"]
+        .as_u64()
+        .map(|x| x as u32)
+        .unwrap_or(hidden / heads);
+    let layers = g("num_hidden_layers");
+    let theta = v["rope_theta"].as_f64().unwrap();
+    // llama3 rope scaling (Llama-3.1); Qwen has rope_scaling: null.
+    let rope_scale = match v.get("rope_scaling").and_then(|r| r.as_object()) {
+        Some(r) if r.get("rope_type").and_then(|x| x.as_str()) == Some("llama3") => {
+            RopeScale::Llama3 {
+                factor: r["factor"].as_f64().unwrap(),
+                low: r["low_freq_factor"].as_f64().unwrap(),
+                high: r["high_freq_factor"].as_f64().unwrap(),
+                orig: r["original_max_position_embeddings"].as_f64().unwrap(),
+            }
+        }
+        // A rope_type we do not implement must be a HARD FAILURE. Falling through
+        // to RopeScale::None here compiles silently-wrong rope tables, which
+        // produce fluent-but-wrong text with no crash and no numeric gate that
+        // catches it. Both gemma-4-12B and gemma-4-31B hit this arm.
+        Some(r) => {
+            let ty = r
+                .get("rope_type")
+                .and_then(|x| x.as_str())
+                .unwrap_or("<missing>");
+            panic!(
+                "unsupported rope_type {ty:?} in rope_scaling: this compiler implements \
+                 only \"llama3\". Compiling it as unscaled would emit wrong rope tables \
+                 and produce fluent-but-wrong output. Add a RopeScale arm for {ty:?}."
+            );
+        }
+        None => RopeScale::None,
+    };
+    Cfg {
+        arch,
+        hidden,
+        inter: g("intermediate_size"),
+        layers,
+        heads,
+        hd_slide: hd,
+        hd_full: hd,
+        kvh_slide: g("num_key_value_heads"),
+        kvh_full: g("num_key_value_heads"),
+        window: 0, // all-global: no sliding window
+        eps: v["rms_norm_eps"].as_f64().unwrap() as f32,
+        vocab: g("vocab_size"),
+        softcap: 0.0, // no final-logit softcapping
+        is_full: vec![true; layers as usize],
+        theta_slide: theta,
+        theta_full: theta,
+        rope_frac_full: 1.0, // full rotary
+        rope_scale,
+        attn_scale: 1.0 / (hd as f32).sqrt(),
+        emb_scale: 1.0, // no embedding scaling
+        mlp_act: 1,     // SwiGLU (silu)
+        has_qk_norm: arch == Arch::Qwen3,
+        has_v_norm: false,
+        k_eq_v: false,
+        tied: v["tie_word_embeddings"].as_bool().unwrap_or(false),
+        prefix: "model.".to_string(),
+        tp: 1,
+        moe: false, // Llama/Qwen3 dense here
+        n_exp: 0,
+        top_k: 0,
+        moe_inter: 0,
+    }
+}
+
+
+pub(crate) fn bf16_round(f: f32) -> f32 {
+    let u = f.to_bits();
+    let r = u.wrapping_add(0x7fff).wrapping_add((u >> 16) & 1);
+    f32::from_bits(r & 0xffff_0000)
+}
+

@@ -60,6 +60,12 @@ pub struct DevSection {
 pub struct DevBlob {
     pub n_cu: u32,
     pub flags: u32,
+    /// Target-GPU fingerprint the blob was compiled for (`gpu_fingerprint`; 0 =
+    /// unknown). A backend that resolves its device to the same canonical spec
+    /// name can warn on mismatch — the header stamp closes Gap 4 (only `n_cu`
+    /// was checked before). Model arch tag + HF id live in the SECT_METADATA
+    /// `block.json` descriptor.
+    pub target: u32,
     pub tensors: Vec<DevTensor>,
     pub init: Vec<u8>,
     /// Instruction indices in the decode program whose `i[3]` is the KV-cache
@@ -267,9 +273,35 @@ impl DevBlob {
             Vec::new()
         };
 
+        // PLOW_NV_PLACE guard: a blob whose gq `seg` is an L2 domain (F_L2DOM)
+        // will be MIS-dispatched by a wave-class / static interp (it reads `seg`
+        // as a wave-class segment). Refuse it unless this runtime opts into
+        // physical-SM domain dispatch. (reserved[1]/[2] carry SMs/partition and
+        // the domain count for that dispatch.) See devblob-locality-placement.md.
+        if hdr.flags & packet::devbuild::PLOW_BLOB_F_L2DOM != 0
+            && std::env::var("PLOW_NV_PLACE_DISPATCH").ok().as_deref() != Some("1")
+        {
+            return Err(RuntimeError::Device(
+                "devblob: blob uses L2-domain packet placement (PLOW_NV_PLACE) — its \
+                 global-queue `seg` is an L2 domain, not a wave-class, so a standard interp \
+                 would mis-dispatch it. Build the cubins with -DPLOW_NV_PLACE_DISPATCH and set \
+                 PLOW_NV_PLACE_DISPATCH=1, or recompile the model without PLOW_NV_PLACE."
+                    .to_string(),
+            ));
+        }
+
+        if hdr.target != 0 {
+            tracing::info!(
+                target_fp = format_args!("{:#010x}", hdr.target),
+                n_cu = hdr.n_cu,
+                "devblob: assets compiled for a specific GPU target — a backend that resolves \
+                 its device can cross-check this fingerprint (Gap 4)"
+            );
+        }
         Ok(DevBlob {
             n_cu: hdr.n_cu,
             flags: hdr.flags,
+            target: hdr.target,
             tensors,
             init,
             kvrow,

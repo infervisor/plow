@@ -637,6 +637,7 @@ fn main() {
 
     let m = Model {
         n_cu,
+        target: 0,
         tensors,
         progs,
         kv_row_insts: Vec::new(),
