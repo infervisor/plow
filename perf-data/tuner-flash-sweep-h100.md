@@ -146,6 +146,23 @@ swing. An earlier revision of this card — written on the 1024 data — conclud
 "the effect size is ctx-dependent, the optimum is not". The 8192 point refutes
 that, and it is corrected here rather than left standing.
 
+## Result 5 — `FA_GF` is a null at short ctx, and that is informative
+
+| `FA_GF` (sliding-layer GQA fusion) | ctx 1024 |
+|---|---|
+| 2 (shipped) | 4.604 (0.361) |
+| 4 | 4.604 (0.362) |
+
+Identical to within a third of the rep spread — not "small", *nothing*. That is
+the expected shape: `FA_GF` governs the **sliding** layers, which are
+window-capped at 1024, so at ctx=1024 they already read their whole window and
+the grouping cannot change how many bytes move. It is the counterpart to
+`FA_GF_FULL`, which governs the 5 full layers and does move the number.
+
+Recorded because a null on the sliding-layer knob is the control that makes the
+full-layer results credible: the two knobs are structurally identical and only
+the one attached to the layers that grow with ctx has an effect.
+
 ## What this puts in `tunedb` — nothing new, and that is the result
 
 The flash grid is a **3-rep screening pass**, and `Stats` refuses fewer than 5
