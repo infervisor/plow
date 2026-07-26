@@ -6,10 +6,11 @@ never publish, or the thing being measured and the thing doing the measuring
 stop being separable.
 
 This is **not** a replacement for `perf-data/`. That tree is the serving-level
-index — `all-perf-data.json` is keyed `(model, engine, precision, phase, tp,
-ctx)` and answers "is plow faster than vLLM on this model". It has no column for
-GPU, shape, tile, or kernel, and carries one hardware string per file. This tree
-is the level beneath it: which kernel, on which silicon, under which toolchain.
+record — its campaign files are keyed `(model, engine, precision, phase, tp,
+ctx)` and answer "is plow faster than vLLM on this model". They have no column
+for GPU, shape, tile, or kernel, and carry one hardware string per file. This
+tree is the level beneath it: which kernel, on which silicon, under which
+toolchain.
 
 ## Layout
 

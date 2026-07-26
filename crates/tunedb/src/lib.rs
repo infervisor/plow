@@ -1,12 +1,12 @@
 //! Calibrated measurement store for kernel selection.
 //!
 //! `perf-data/` already holds ~200 files of measurements, but they answer a
-//! different question: `all-perf-data.json` is a *serving-level* index keyed by
+//! different question: those campaign files are *serving-level*, keyed by
 //! `(model, engine, precision, phase, tp, ctx)`, with no column for GPU, shape,
-//! tile, or kernel, and one hardware string per file. It is the right shape for
-//! "is plow faster than vLLM on this model" and the wrong shape for "which
+//! tile, or kernel, and one hardware string per file. They are the right shape
+//! for "is plow faster than vLLM on this model" and the wrong shape for "which
 //! kernel should this GEMM use on this card". This crate is the level beneath
-//! it, and does not replace it.
+//! them, and does not replace them.
 //!
 //! What the store guarantees:
 //!

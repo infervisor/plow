@@ -270,7 +270,6 @@ vs an f32 CPU reference, with a negative-control build that must fail.
 
 ## Benchmarks
 
-Measured results live in `perf-data/` (one JSON + MD per campaign;
-`consolidate_perf.py` regenerates the flat index). Multi-user sweeps use
-HuggingFace `inference-benchmarker` via `perf-data/bench_ib.sh` against both
-plow and vLLM with identical profiles.
+Measured results live in `perf-data/` (one JSON + MD per campaign). Multi-user
+sweeps use HuggingFace `inference-benchmarker` via `perf-data/bench_ib.sh`
+against both plow and vLLM with identical profiles.
