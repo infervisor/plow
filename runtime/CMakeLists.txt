@@ -542,6 +542,168 @@ if(PLOW_SM120_CUBIN)
     add_custom_target(sm120_cubins ALL DEPENDS ${_cubin_outs})
 endif()
 
+# --- the SERVED gfx950 code objects (.hsaco) ----------------------------------
+#
+# The AMD mirror of the cubin section above, and it exists for the same reason.
+# `if(PLOW_ROCM)` below builds the LEGACY plugin (amd/{mfma,flash,row,golden}.hip
+# — dead code, see its own note); it does NOT build the production megakernel.
+# The objects the AMD path actually loads (runtime/tests/gemma4_chat.c dlopens
+# them through ROCr) were defined ONLY by scripts/build_gfx950.sh, so the AMD
+# side had exactly the second-independent-definition problem the NVIDIA side was
+# just consolidated out of. Both toolchains now emit their served artifacts from
+# one cmake build:
+#
+#   cmake -S runtime -B build -DPLOW_SM120_CUBIN=ON -DPLOW_GFX950_HSACO=ON
+#
+# Naming: the artifacts keep the `.elf` extension the script has always written,
+# because gemma4_chat.c opens them by literal filename (`interp_prefill.elf`,
+# `interp_decode_gq.elf`, ...). They are hsaco code objects; only the suffix is
+# historical.
+#
+# NOT ported from the script: the host `chat` harness (a gcc link, not a kernel
+# artifact) and the scripts/asm_audit.py instruction-selection pass, which wants
+# the whole object set at once. build_gfx950.sh remains the way to get those.
+option(PLOW_GFX950_HSACO "Emit the gfx950 .hsaco code objects the AMD path loads" OFF)
+# The variant axes. Unlike build_gfx950.sh (where each is an opt-in env var, so
+# the common case builds the bf16 pair only), these default ON: the point of the
+# cmake path is that ONE configure emits every object, so a packet cannot reach
+# for a variant the build quietly skipped.
+option(PLOW_HSACO_GQ "Also emit the global-queue (_gq) twins" ON)
+option(PLOW_HSACO_FP8 "Also emit the fp8 w8a16 decode + w8a8 prefill objects" ON)
+option(PLOW_HSACO_FP8KV "Also emit the fp8 e4m3 KV-cache decode object" ON)
+option(PLOW_HSACO_MXFP4 "Also emit the MX-FP4 (e2m1 + E8M0) decode object" ON)
+option(PLOW_HSACO_MLA "Also emit the MLA prefill object (Kimi/DeepSeek/GLM)" ON)
+
+set(PLOW_HSACO_ARCH "gfx950" CACHE STRING "offload arch for the served code objects")
+set(PLOW_HSACO_HIPCC "/opt/rocm/bin/hipcc" CACHE FILEPATH "hipcc used for the served code objects")
+# Discovered from the INSTALLED ROCm rather than pinned: this path was pinned to
+# 7.0.2 once and the build died on the first box that had 7.2.4.
+set(PLOW_HSACO_BUNDLER "/opt/rocm/lib/llvm/bin/clang-offload-bundler"
+    CACHE FILEPATH "clang-offload-bundler that unbundles the code object")
+set(PLOW_HSACO_DIR "${CMAKE_BINARY_DIR}/hsaco" CACHE PATH "output directory for the code objects")
+# Raising this starves parallelism (measured 6-8x slower); it is a knob, not a tuning target.
+set(PLOW_GQ_BATCH "1" CACHE STRING "global-queue claim batch")
+set(PLOW_HSACO_EXTRA_DEFINES "" CACHE STRING "extra raw hipcc flags appended to every code object")
+
+if(PLOW_GFX950_HSACO)
+    string(REPLACE " " ";" _hs_extra "${PLOW_HSACO_EXTRA_DEFINES}")
+    set(_hs_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/interp.hip")
+    set(_hs_tk_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/test_kernels.hip")
+    set(_hs_inc -I "${CMAKE_CURRENT_SOURCE_DIR}/amd" -I "${CMAKE_CURRENT_SOURCE_DIR}/common")
+    set(_hs_run "${CMAKE_CURRENT_SOURCE_DIR}/cmake/hipcc_hsaco.sh")
+    # The op bodies live entirely in headers, so without these a kernel edit
+    # leaves every .elf stale — the exact failure every guard in
+    # build_gfx950.sh was written to prevent.
+    file(GLOB _hs_hdrs "${CMAKE_CURRENT_SOURCE_DIR}/amd/*.h"
+                       "${CMAKE_CURRENT_SOURCE_DIR}/common/*.h")
+
+    # THE AXES. No row below spells out a define set; every row is axes only.
+    set(_hs_ax_none "")
+    set(_hs_ax_prefill -DPLOW_BUCKET_DECODE=0)
+    set(_hs_ax_decode -DPLOW_BUCKET_DECODE=1)
+    # 4 waves => 1 wave/SIMD => a 512-reg budget, and ITS spill is intentional
+    # (the Q-hoist spills Q to scratch, cheaper than the L2 re-read it replaces).
+    set(_hs_ax_flash -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4
+                     -DFA_DC=256 -DFA_DBUF=1)
+    set(_hs_ax_gq -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=${PLOW_GQ_BATCH})
+    set(_hs_ax_fp8 -DPLOW_FP8=1)
+    set(_hs_ax_fp8kv -DPLOW_FP8=1 -DPLOW_FP8_KV=1)
+    set(_hs_ax_mxfp4 -DPLOW_MXFP4=1)
+    set(_hs_ax_mla -DPLOW_MLA_PREFILL=1)
+
+    set(_hs_kpf "plow_interp_gfx950")
+    set(_hs_kdec "plow_interp_dec_gfx950")
+    set(_hs_kfl "plow_interp_flash_gfx950")
+
+    # THE TABLE: <stem> <kernel symbol> <axis-1> <axis-2> <max total regs> <min occ>.
+    # The 8-wave interpreters must stay <= 256 total (2 waves/SIMD); the 4-wave
+    # flash object <= 512 (1 wave/SIMD). Rows describe the STATIC object; the
+    # global-queue twin is generated from the same row below, because it differs
+    # only by the scheduling loop (that is what makes an A/B on it meaningful).
+    set(_hs_rows
+        "interp_prefill|${_hs_kpf}|_hs_ax_prefill|_hs_ax_none|256|2"
+        "interp_decode|${_hs_kdec}|_hs_ax_decode|_hs_ax_none|256|2"
+        "interp_flash|${_hs_kfl}|_hs_ax_flash|_hs_ax_none|512|1")
+    if(PLOW_HSACO_FP8)
+        # The fp8 arms SWAP for the bf16 GEMV/GEMM arms rather than adding to
+        # them, so both objects stay under the same 256/occ-2 cliff.
+        list(APPEND _hs_rows
+            "interp_decode_fp8|${_hs_kdec}|_hs_ax_decode|_hs_ax_fp8|256|2"
+            "interp_prefill_fp8|${_hs_kpf}|_hs_ax_prefill|_hs_ax_fp8|256|2")
+    endif()
+    if(PLOW_HSACO_FP8KV)
+        list(APPEND _hs_rows
+            "interp_decode_fp8kv|${_hs_kdec}|_hs_ax_decode|_hs_ax_fp8kv|256|2")
+    endif()
+    if(PLOW_HSACO_MXFP4)
+        list(APPEND _hs_rows
+            "interp_decode_mxfp4|${_hs_kdec}|_hs_ax_decode|_hs_ax_mxfp4|256|2")
+    endif()
+    if(PLOW_HSACO_MLA)
+        list(APPEND _hs_rows
+            "interp_prefill_mla|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla|256|2")
+    endif()
+
+    set(_hs_kinds static)
+    if(PLOW_HSACO_GQ)
+        list(APPEND _hs_kinds gq)
+    endif()
+
+    set(_hs_outs "")
+    foreach(_row ${_hs_rows})
+        string(REPLACE "|" ";" _f "${_row}")
+        list(GET _f 0 _stem)
+        list(GET _f 1 _sym)
+        list(GET _f 2 _a1)
+        list(GET _f 3 _a2)
+        list(GET _f 4 _maxreg)
+        list(GET _f 5 _minocc)
+        foreach(_kind ${_hs_kinds})
+            set(_sfx "")
+            set(_gq "")
+            if(_kind STREQUAL "gq")
+                # Both the filename and the kernel symbol take the suffix, and
+                # gemma4_chat.c resolves both by name.
+                set(_sfx "_gq")
+                set(_gq ${_hs_ax_gq})
+            endif()
+            set(_out "${PLOW_HSACO_DIR}/${_stem}${_sfx}.elf")
+            add_custom_command(OUTPUT "${_out}"
+                COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                        "${PLOW_HSACO_ARCH}" "${_out}" "${_sym}${_sfx}" ${_maxreg} ${_minocc}
+                        ${_hs_inc} ${${_a1}} ${${_a2}} ${_gq} ${_hs_extra} "${_hs_src}"
+                DEPENDS "${_hs_src}" "${_hs_run}" ${_hs_hdrs}
+                COMMENT "hipcc ${_stem}${_sfx}.elf"
+                VERBATIM)
+            list(APPEND _hs_outs "${_out}")
+        endforeach()
+    endforeach()
+
+    # Golden __device__ wrappers. They call the SAME op_*.h bodies the
+    # interpreter runs, so they are rebuilt WITH it — building the interpreter
+    # and not these is how `t_attn` once passed three times against a stale
+    # kernel. Not a table row: many entry points, no single symbol to gate, and
+    # no register cliff (nothing dispatches them from the interpreter).
+    set(_hs_tk_out "${PLOW_HSACO_DIR}/test_kernels.elf")
+    add_custom_command(OUTPUT "${_hs_tk_out}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${PLOW_HSACO_DIR}"
+        COMMAND "${CMAKE_COMMAND}" -E rm -f "${_hs_tk_out}" "${_hs_tk_out}.co"
+        COMMAND "${PLOW_HSACO_HIPCC}" --offload-arch=${PLOW_HSACO_ARCH} -O3 -w --genco
+                ${_hs_inc} "${_hs_tk_src}" -o "${_hs_tk_out}.co"
+        # No quotes around the paths: VERBATIM already quotes each argument, and
+        # a second pair ends up as literal characters in the filename.
+        COMMAND "${PLOW_HSACO_BUNDLER}" --unbundle --type=o
+                --targets=hipv4-amdgcn-amd-amdhsa--${PLOW_HSACO_ARCH}
+                --input=${_hs_tk_out}.co --output=${_hs_tk_out}
+        COMMAND "${CMAKE_COMMAND}" -E rm -f "${_hs_tk_out}.co"
+        DEPENDS "${_hs_tk_src}" ${_hs_hdrs}
+        COMMENT "hipcc test_kernels.elf"
+        VERBATIM)
+    list(APPEND _hs_outs "${_hs_tk_out}")
+
+    add_custom_target(gfx950_hsaco ALL DEPENDS ${_hs_outs})
+endif()
+
 if(PLOW_ROCM)
     enable_language(HIP)
     # The gfx950 device code is compiled to a RAW code object and loaded through

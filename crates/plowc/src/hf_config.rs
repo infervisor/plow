@@ -183,6 +183,9 @@ fn parse_weight_dtype(v: &Value) -> nn_graph::DType {
     if let Some(q) = v.get("quantization_config").and_then(|q| q.get("quant_method")).and_then(|m| m.as_str()) {
         match q {
             "fp8" => return nn_graph::DType::F8E4M3,
+            // OCP MX microscaling FP4 (e2m1 + one E8M0 scale per 32). Transformers
+            // spells the gpt-oss / MX-quantized checkpoints `quant_method: "mxfp4"`.
+            "mxfp4" | "fp4" => return nn_graph::DType::F4,
             _ => {}
         }
     }
@@ -1383,6 +1386,24 @@ mod tests {
         let qa = plan.ops.iter().find(|o| o.name == "q_a_proj_L0").unwrap();
         assert_eq!(qa.weight_dtype, nn_graph::DType::F8E4M3);
         // Norms stay BF16.
+        let norm = plan.ops.iter().find(|o| o.name == "norm_in_L0").unwrap();
+        assert_eq!(norm.weight_dtype, nn_graph::DType::BF16);
+    }
+
+    #[test]
+    fn test_mxfp4_weight_dtype_from_config() {
+        // MX-microscaling FP4 checkpoint: quantization_config.quant_method = "mxfp4".
+        let json = KIMI_K2_JSON.replace(
+            "\"torch_dtype\": \"bfloat16\"",
+            "\"torch_dtype\": \"bfloat16\", \"quantization_config\": {\"quant_method\": \"mxfp4\"}",
+        );
+        let s = synthesize_full(&json, "kimi-mxfp4".into()).unwrap();
+        assert_eq!(s.weight_dtype, nn_graph::DType::F4);
+        // GEMM ops carry the F4 weight dtype; norms stay BF16.
+        let bucket = ShapeBucket { batch: 1, seq: 64, phase: schedule::Phase::Decode };
+        let plan = build_full_model_plan(&bucket, &s);
+        let qa = plan.ops.iter().find(|o| o.name == "q_a_proj_L0").unwrap();
+        assert_eq!(qa.weight_dtype, nn_graph::DType::F4);
         let norm = plan.ops.iter().find(|o| o.name == "norm_in_L0").unwrap();
         assert_eq!(norm.weight_dtype, nn_graph::DType::BF16);
     }

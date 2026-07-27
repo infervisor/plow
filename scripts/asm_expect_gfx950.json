@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Instruction-selection contract for the gfx950 code objects, asserted by asm_audit.py",
+    "against the disassembly. These exist because the register-cliff check in build_gfx950.sh",
+    "catches only kernels that will not LAUNCH. The failure that actually costs throughput is a",
+    "kernel that launches, is numerically correct, and quietly runs on the wrong instruction --",
+    "the K16 fp8 MFMA instead of the wide-K one (measured 1x vs 2x bf16 on this GPU), or an fp4",
+    "operand widened to bf16 because a convert did not fold. With no AMD GPU on the dev box that",
+    "is invisible until benchmark day, which is exactly the day there is no time to fix it.",
+    "",
+    "Keys are object-name substrings; the LONGEST match wins, so interp_decode_fp8 does not also",
+    "inherit interp_decode's rules. Values are kernel-name substrings -> checks."
+  ],
+
+  "interp_prefill_fp8": {
+    "plow_exec": {
+      "require_min": { "v_mfma_f32_32x32x64_f8f6f4": 1 },
+      "cbsz": 0,
+      "blgp": 0,
+      "forbid": ["v_mfma_f32_32x32x16_fp8_fp8", "v_mfma_f32_16x16x32_fp8_fp8"]
+    }
+  },
+
+  "interp_decode_mxfp4": {
+    "plow_exec": {
+      "require_min": {
+        "v_cvt_scalef32_pk_bf16_fp4": 16,
+        "v_dot2c_f32_bf16": 16
+      },
+      "forbid": ["v_mfma"]
+    }
+  },
+
+  "interp_prefill": {
+    "plow_exec": { "require_min": { "v_mfma_f32_32x32x16_bf16": 1 } }
+  },
+
+  "test_kernels": {
+    "gemm_fp8_c0": {
+      "require_min": { "v_mfma_f32_32x32x64_f8f6f4": 1 },
+      "cbsz": 0,
+      "blgp": 0,
+      "forbid": ["v_mfma_f32_32x32x16_fp8_fp8", "v_mfma_f32_16x16x32_fp8_fp8"]
+    },
+    "d_gemv_mxfp4_k": {
+      "require_min": { "v_cvt_scalef32_pk_bf16_fp4": 16, "v_dot2c_f32_bf16": 16 },
+      "no_scratch": true
+    },
+    "d_gemm_t": { "require_min": { "v_mfma_f32_32x32x16_bf16": 1 } }
+  }
+}

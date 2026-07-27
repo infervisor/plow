@@ -1,32 +1,40 @@
-# Static binary + CUDA/HIP drivers
+# Static binary + GPU runtimes
 
 Goal: ship `plowrt` as a **static binary**, with the **only** dynamic
-dependencies being the minimal CUDA / HIP driver libraries — and have both
-vendors work in one process.
+dependencies being the minimal GPU runtime libraries — and have both vendors
+work in one process.
 
-## Why the drivers can't be link-time static
+The AMD side talks to **ROCr (HSA) directly, not HIP** (`src/device/hsa.rs`):
+HIP is a thin layer over the same calls and plow needs nothing it adds, so the
+runtime dependency is `libhsa-runtime64`, not `libamdhip64`.
 
-`libcuda.so` / `libamdhip64.so` are the vendor kernel-mode driver interfaces;
-they are shipped **only** as shared libraries and must match the installed
-driver. You cannot statically link them. The clean resolution — used here — is
-to **`dlopen` them at runtime** (`libloading`) instead of linking:
+## Why the runtimes can't be link-time static
 
-- no link-time `-lcuda` / `-lamdhip64`, so the build needs no CUDA/ROCm SDK and
-  the binary has zero GPU link dependencies (verified: the default binary links
-  only `libSystem`/`libc`);
-- the driver is loaded lazily, and a host without a driver simply falls back to
+`libcuda.so` / `libhsa-runtime64.so` are the vendor runtime interfaces; they are
+shipped **only** as shared libraries and must match the installed driver. You
+cannot statically link them. The clean resolution — used here — is to **`dlopen`
+them at runtime** (`libloading`) instead of linking:
+
+- no link-time `-lcuda` / `-lhsa-runtime64`, so the build needs no CUDA/ROCm SDK
+  and the binary has zero GPU link dependencies (verified: the default binary
+  links only `libSystem`/`libc`);
+- the runtime is loaded lazily, and a host without it simply falls back to
   another backend instead of failing to start;
-- see `src/device/cuda.rs` / `src/device/rocm.rs` — `new()` `dlopen`s the driver
-  and calls `cuInit` / `hipInit`; the rest of the driver surface resolves the
-  same way (signatures from `bindgen`).
+- see `src/device/cuda.rs` / `src/device/hsa.rs` — `new()` `dlopen`s the runtime
+  and calls `cuInit` / `hsa_init`; the rest of the surface resolves the same way.
 
-## Can CUDA and HIP be compiled together? Yes.
+## Can CUDA and ROCr be compiled together?
 
-Verified: `cargo build -p plowrt --features cuda,rocm` compiles both backends
-into one binary. At runtime a heterogeneous instance `dlopen`s **both**
-`libcuda` and `libamdhip64`; their symbol namespaces (`cu*` / `cuda*` vs `hip*`)
-don't collide, so one process can drive an NVIDIA GPU and an AMD GPU
-concurrently. (Use the **AMD** HIP runtime `libamdhip64`, not HIP-over-CUDA.)
+The design intends yes: their symbol namespaces (`cu*` / `cuda*` vs `hsa_*`)
+don't collide, so at runtime a heterogeneous instance can `dlopen` **both**
+`libcuda` and `libhsa-runtime64` and drive an NVIDIA GPU and an AMD GPU
+concurrently.
+
+**Caveat (as of this writing): `cargo build -p plowrt --features cuda,rocm` does
+not compile** — it fails with `E0603: function 'on' is private`, a pre-existing
+visibility bug in an unrelated module that is only reachable when both GPU
+features are on. Single-vendor builds (`--features cuda` or `--features rocm`)
+are unaffected. The heterogeneous build needs that bug fixed before it works.
 
 ## Build recipes
 
@@ -45,9 +53,9 @@ else statically linked; the only runtime `.so`s are the loader + libc + the
 
 ```sh
 RUSTFLAGS="-C target-feature=+crt-static" \
-  cargo build -p plowrt --release --features cuda,rocm \
+  cargo build -p plowrt --release --features cuda \   # or rocm; cuda,rocm together is currently broken (see above)
   --target x86_64-unknown-linux-gnu
-# links libc + ld-linux; libcuda / libamdhip64 are dlopen'd at runtime
+# links libc + ld-linux; libcuda / libhsa-runtime64 are dlopen'd at runtime
 ```
 
 ## Summary
@@ -55,7 +63,7 @@ RUSTFLAGS="-C target-feature=+crt-static" \
 | Build | Static? | Dynamic deps |
 |-------|---------|--------------|
 | CPU-only (musl) | fully static | none |
-| GPU (glibc, crt-static) | static except loader/libc | ld-linux, libc, dlopen'd libcuda/libamdhip64 |
+| GPU (glibc, crt-static) | static except loader/libc | ld-linux, libc, dlopen'd libcuda / libhsa-runtime64 |
 
 Both NVIDIA and AMD backends live in the same binary; whichever driver is present
 at runtime is loaded.

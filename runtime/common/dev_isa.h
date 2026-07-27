@@ -544,6 +544,36 @@ enum {
      *     i0=T i1=d_inner i2=n_head i3=head_dim i4=d_state i5=n_groups i6=d_conv i7=conv_dim  f0=eps. */
     PLOW_DOP_MAMBA2_SCAN = 90,
 
+    /* MXFP4 DECODE GEMV (w4a16) — OCP microscaling: e2m1 weights + one E8M0 scale per 32 K.
+     * Decode is weight-bandwidth-bound, so this is where fp4 pays: 4.25 effective bits/element
+     * (0.5 weight byte + 1 scale byte per 32) against fp8's 8, moving the roofline ~1.88x over
+     * PLOW_DOP_GEMV_FP8 and ~3.76x over bf16 PLOW_DOP_GEMV.
+     *
+     * The E8M0 scale is folded into the fp4->bf16 convert, which is EXACT here (an MX scale is a
+     * power of two by construction) — unlike PLOW_DOP_GEMV_FP8_BLK's arbitrary-f32 block scale,
+     * which must stay a separate multiply. So there is no dequant in the epilogue and no scale
+     * tensor read per output; see amd/amd_common.h fp4_to_bf16v8x4.
+     *
+     * Layout: W packed 2 fp4/byte, row stride K/2 bytes, low nibble = even k. S one E8M0 byte per
+     * 32-K block, row stride K/32 bytes. A lane's 16-byte load is exactly one 32-element block.
+     * t0=C(bf16) t1=x(bf16) t2=W(fp4) t3=S(e8m0)   i0=M i1=N i2=K. See op_gemm.h d_gemv_mxfp4. */
+    PLOW_DOP_GEMV_MXFP4 = 91,
+
+    /* MXFP4 DECODE fused gate|up GEMV+GLU (w4a16) — the mxfp4 twin of PLOW_DOP_GEMV_GLU_FP8. Gate
+     * and up are two fp4 weight matrices, each with its own E8M0 scale row; the scale folds into the
+     * fp4->bf16 convert (no epilogue dequant), and the SwiGLU fuses act(g)*u in one packet. Same
+     * w4a16 bandwidth win as PLOW_DOP_GEMV_MXFP4, applied to the dense/shared SwiGLU decode.
+     * t0=C(bf16) t1=x(bf16) t2=Wg(fp4) t5=Wu(fp4) t3=Sg(e8m0) t4=Su(e8m0)
+     * i0=M i1=N i2=K i5=act. See op_gemm.h d_gemv_glu_mxfp4. */
+    PLOW_DOP_GEMV_GLU_MXFP4 = 92,
+
+    /* MXFP4 (w4a16) PREFILL GEMM — bf16 activations x packed-2/byte fp4 weights with E8M0 scale
+     * rows (K/32 bytes/row). Reuses the bf16 wide-K MFMA; only the weight fetch dequants fp4->bf16
+     * with the MX scale folded exactly, so this is the fp4 weight-bandwidth win at M>1 without an
+     * activation-quant op. t0=C(bf16) t1=A(bf16) t2=W(fp4) t3=wscale(e8m0)  i0=M i1=N i2=K.
+     * See op_gemm.h d_gemm_mxfp4. */
+    PLOW_DOP_GEMM_MXFP4 = 93,
+
     PLOW_DOP__COUNT
 };
 

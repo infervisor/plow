@@ -36,7 +36,19 @@ fail() {
 
 mkdir -p "$(dirname "$OUT")"
 "${CLEAN[@]}" "$NVCC" "$@" -o "$OUT" || fail "nvcc failed for $OUT"
-"${CLEAN[@]}" "$CUOBJDUMP" -symbols "$OUT" | grep -q "$SYM" ||
+# Read the symbol table into a variable rather than piping it into `grep -q`.
+# `grep -q` exits at the FIRST match, which closes the pipe while cuobjdump is
+# still writing; cuobjdump then dies of SIGPIPE (141) and `set -o pipefail`
+# promotes that to a pipeline failure — so the gate reports "$SYM not found"
+# about an object whose symbol grep had just successfully matched.
+#
+# Whether it fires is pure scheduling luck: it needs the reader to exit between
+# two of the writer's write() calls. cuobjdump emits ~1 KB here, one write, so it
+# has never been seen on this side. The identical construct on the AMD side
+# (~5 KB, two writes) failed 4-5 of 17 objects per run under `-j16`, every one of
+# them with PIPESTATUS `141 0` — writer killed, grep exit 0, symbol present.
+SYMS="$("${CLEAN[@]}" "$CUOBJDUMP" -symbols "$OUT" || true)"
+grep -q "$SYM" <<<"$SYMS" ||
     fail "$SYM not found in $OUT — kernel name/signature changed; update exec::gpu's
        kernel-name constant (or set PLOW_NV_KERNEL / PLOW_NV_KERNEL_PF)."
 echo "built $OUT ($(stat -c%s "$OUT") B), kernel $SYM present"

@@ -22,7 +22,12 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 R="$REPO/runtime"
 OUT="${1:-${PLOW_BUILD_DIR:-/tmp/rtb}}"
 ARCH="${PLOW_HIP_ARCH:-gfx950}"
-BUN="${PLOW_BUNDLER:-/opt/rocm-7.0.2/lib/llvm/bin/clang-offload-bundler}"
+# Discover the bundler from the INSTALLED ROCm instead of pinning a version. This
+# was pinned to 7.0.2 and the path does not exist on a 7.2.4 box, so the build died
+# on the first machine that had the GPU. $PLOW_BUNDLER still overrides.
+BUN="${PLOW_BUNDLER:-$(ls -1 "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/clang-offload-bundler \
+        "${ROCM_PATH:-/opt/rocm}"/llvm/bin/clang-offload-bundler \
+        /opt/rocm-*/lib/llvm/bin/clang-offload-bundler 2>/dev/null | head -1)}"
 INC="-I$R/amd -I$R/common"
 mkdir -p "$OUT"; cd "$OUT"
 
@@ -71,6 +76,16 @@ BUILD_FP8=0; [ "${PLOW_FP8:-0}" = 1 ] && BUILD_FP8=1
 # Only the DECODE object is built here — the synthetic-KV decode sweep never runs prefill. Gemma's
 # real-prefill fp8kv path (a separate 4-wave flash object) is out of scope for the timing sweep.
 BUILD_FP8KV=0; [ "${PLOW_FP8_KV:-0}" = 1 ] && BUILD_FP8KV=1
+# MXFP4 DECODE object (PLOW_MXFP4=1). OCP microscaling e2m1 weights + one E8M0 scale per 32 K.
+# Its own flag rather than a mode of PLOW_FP8: they are alternative encodings of the same linear,
+# so no object wants both, and separating them keeps the fp8 object's register budget untouched.
+BUILD_MXFP4=0; [ "${PLOW_MXFP4:-0}" = 1 ] && BUILD_MXFP4=1
+# MLA PREFILL object (PLOW_MLA_PREFILL=1). Adds FLASH_MLA_PREFILL + FLASH_GATHER_PREFILL and the
+# latent epilogue (MLA_MERGE_FOLD / O_UV_FOLD) to the PREFILL bucket -- the arms whose absence
+# meant Kimi K2.7 / DeepSeek / GLM 5.2 could decode on gfx950 but could not prefill through their
+# own attention. Its own flag because the prefill bucket sits AT the 256/occ-2 cliff and a Gemma
+# prefill object must not pay for MLA it never runs.
+BUILD_MLA=0; [ "${PLOW_MLA_PREFILL:-0}" = 1 ] && BUILD_MLA=1
 if [ "$BUILD_GQ" = 1 ]; then
   for B in 0 1; do
     N=$([ "$B" -eq 0 ] && echo prefill || echo decode)
@@ -91,6 +106,14 @@ if [ "$BUILD_FP8" = 1 ]; then
     genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_fp8_gq.co
     unbundle i_decode_fp8_gq.co interp_decode_fp8_gq.elf
   fi
+  # w8a8 PREFILL object. The fp8 GEMM arms SWAP for the bf16 ones (an fp8 program emits no bf16
+  # GEMM), so this stays under the SAME 256/occ-2 cliff as the bf16 prefill — checked below.
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_FP8=1" i_prefill_fp8.co
+  unbundle i_prefill_fp8.co interp_prefill_fp8.elf
+  if [ "$BUILD_GQ" = 1 ]; then
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_prefill_fp8_gq.co
+    unbundle i_prefill_fp8_gq.co interp_prefill_fp8_gq.elf
+  fi
 fi
 
 # FP8 KV-CACHE decode objects (static + GQ). Swap FLASH_DECODE for the fp8 flash + add HeadNormRopeFp8,
@@ -101,6 +124,32 @@ if [ "$BUILD_FP8KV" = 1 ]; then
   if [ "$BUILD_GQ" = 1 ]; then
     genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_FP8_KV=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_fp8kv_gq.co
     unbundle i_decode_fp8kv_gq.co interp_decode_fp8kv_gq.elf
+  fi
+fi
+
+# MXFP4 decode objects (static + GQ).
+MXFP4_ELFS=""
+if [ "$BUILD_MXFP4" = 1 ]; then
+  genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_MXFP4=1" i_decode_mxfp4.co
+  unbundle i_decode_mxfp4.co interp_decode_mxfp4.elf
+  MXFP4_ELFS="interp_decode_mxfp4.elf"
+  if [ "$BUILD_GQ" = 1 ]; then
+    genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_mxfp4_gq.co
+    unbundle i_decode_mxfp4_gq.co interp_decode_mxfp4_gq.elf
+    MXFP4_ELFS="interp_decode_mxfp4.elf interp_decode_mxfp4_gq.elf"
+  fi
+fi
+
+# MLA prefill objects (static + GQ).
+MLA_ELFS=""
+if [ "$BUILD_MLA" = 1 ]; then
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1" i_prefill_mla.co
+  unbundle i_prefill_mla.co interp_prefill_mla.elf
+  MLA_ELFS="interp_prefill_mla.elf"
+  if [ "$BUILD_GQ" = 1 ]; then
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_prefill_mla_gq.co
+    unbundle i_prefill_mla_gq.co interp_prefill_mla_gq.elf
+    MLA_ELFS="interp_prefill_mla.elf interp_prefill_mla_gq.elf"
   fi
 fi
 
@@ -150,10 +199,12 @@ fi
 FP8_ELFS=""
 if [ "$BUILD_FP8" = 1 ]; then
   check decode_fp8 "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1" 256 2
-  FP8_ELFS="interp_decode_fp8.elf"
+  check prefill_fp8 "-DPLOW_BUCKET_DECODE=0 -DPLOW_FP8=1" 256 2
+  FP8_ELFS="interp_decode_fp8.elf interp_prefill_fp8.elf"
   if [ "$BUILD_GQ" = 1 ]; then
     check decode_fp8_gq "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
-    FP8_ELFS="interp_decode_fp8.elf interp_decode_fp8_gq.elf"
+    check prefill_fp8_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    FP8_ELFS="interp_decode_fp8.elf interp_decode_fp8_gq.elf interp_prefill_fp8.elf interp_prefill_fp8_gq.elf"
   fi
 fi
 FP8KV_ELFS=""
@@ -166,7 +217,28 @@ if [ "$BUILD_FP8KV" = 1 ]; then
   fi
 fi
 
+if [ "$BUILD_MXFP4" = 1 ]; then
+  check decode_mxfp4 "-DPLOW_BUCKET_DECODE=1 -DPLOW_MXFP4=1" 256 2
+  [ "$BUILD_GQ" = 1 ] && check decode_mxfp4_gq "-DPLOW_BUCKET_DECODE=1 -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+fi
+
+if [ "$BUILD_MLA" = 1 ]; then
+  check prefill_mla "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1" 256 2
+  [ "$BUILD_GQ" = 1 ] && check prefill_mla_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+fi
+
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS"
+
+# INSTRUCTION-SELECTION gate. The register check above catches a kernel that will not launch; it
+# does NOT catch one that launches, is correct, and is silently 4x slow because the backend picked
+# a narrow MFMA or widened an fp4 operand. With no GPU on the dev box that failure is otherwise
+# invisible, so assert on the disassembly. Skipped when no expectations file is present.
+EXPECT="$REPO/scripts/asm_expect_gfx950.json"
+if [ -f "$EXPECT" ] && command -v python3 >/dev/null; then
+  echo "   --- instruction-selection audit ---"
+  python3 "$REPO/scripts/asm_audit.py" --expect "$EXPECT" $ALL_ELFS | tail -20
+fi
+
 # Freshness is the whole point of this script: print it, every time.
-ls -l --time-style=+%H:%M:%S \
-  interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf chat $GQ_ELFS $FP8_ELFS $FP8KV_ELFS \
+ls -l --time-style=+%H:%M:%S $ALL_ELFS chat \
   | awk '{print "   ", $NF, $5"B", $6}'

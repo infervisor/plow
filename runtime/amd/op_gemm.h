@@ -225,13 +225,24 @@ __device__ __forceinline__ unsigned gm_remap(unsigned lin, unsigned n_tiles, uns
 #define GM_WGM 8   /* grouped-M: tile-rows per column-major group */
 #endif
 template <int BM, int BN, int BK, int WM, int WN, bool NORM, int SWZ = GM_SWZ, int WGM = GM_WGM,
-          bool PP = (GM_PP != 0), bool KEXACT = true, bool GLU = false>
+          bool PP = (GM_PP != 0), bool KEXACT = true, bool GLU = false, bool WFP4 = false>
 __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                          const bf16* __restrict__ B, const float* __restrict__ rms,
                          const bf16* __restrict__ gamma, unsigned M, unsigned N, unsigned K,
                          unsigned slice, unsigned nblk, bf16* lds,
-                         const bf16* __restrict__ B2 = nullptr, unsigned act = 0) {
+                         const bf16* __restrict__ B2 = nullptr, unsigned act = 0,
+                         const unsigned char* __restrict__ bscale = nullptr) {
     (void)B2;
+    (void)bscale;
+    /* WFP4 (w4a16 mxfp4 weights): B is a packed-2/byte fp4 tensor (row stride K/2 bytes) and
+     * `bscale` its E8M0 scale rows (K/32 bytes/row). The B-fetch below dequants fp4->bf16 with the
+     * MX scale folded EXACTLY (fp4_to_bf16v8), then stages bf16 into LDS — so the A-operand, LDS
+     * swizzle, bf16 MFMA and epilogue are byte-for-byte the bf16 path (if constexpr discards this
+     * branch entirely when WFP4=false). Activations stay bf16 (w4a16). Requires KEXACT and
+     * K % 32 == 0; prefill K (a multiple of 128) satisfies both. HARDWARE-VALIDATE the numerics
+     * against the golden d_gemm_mxfp4_k. */
+    static_assert(!WFP4 || KEXACT, "the w4a16 fp4 B-fetch requires KEXACT (K % BK == 0)");
+    static_assert(!WFP4 || !NORM, "fp4 weights + fused RMSNorm-A is not a combination plow emits");
     (void)act;
     constexpr int THREADS = WM * WN * PLOW_WAVE;
     /* COMPACT row stride (no +8 pad). global_load_lds writes the 64 lanes CONTIGUOUSLY from a
@@ -306,7 +317,10 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
      * register fetch+commit path, which writes the SAME swizzled layout. GLU stages a second
      * weight (Wu) into the B tile's high half, which the single-source DMA below does not express,
      * so it too stays on the fetch+commit path (its layout is still the swizzled one). */
-    constexpr bool DIRECT = !NORM && !GLU && KEXACT;
+    /* WFP4 dequants fp4->bf16 in registers, so it MUST use the fetch+commit path (the direct
+     * global_load_lds DMA streams raw weight bytes to LDS with no register round-trip to convert
+     * in). Adding !WFP4 leaves the bf16 predicate — and thus the bf16 codegen — untouched. */
+    constexpr bool DIRECT = !NORM && !GLU && KEXACT && !WFP4;
 
 #define GM_ASM(b) (lds + (b) * TILE)
 #define GM_BSM(b) (lds + (b) * TILE + BM * STRIDE)
@@ -391,7 +405,16 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
             r = n0 + (up ? br - BN / 2 : br);                                                  \
         }                                                                                      \
         const unsigned kk = (k0) + (e % BK);                                                 \
-        if constexpr (KEXACT) {                                                               \
+        if constexpr (WFP4) {                                                                 \
+            /* dequant-on-load: 8 fp4 (one u32) + one E8M0 scale -> 8 bf16. An 8-element load     \
+             * never crosses a 32-elem MX block (32 % 8 == 0), so one scale byte covers it. */    \
+            if (r < N) {                                                                      \
+                const unsigned* wp = reinterpret_cast<const unsigned*>(as_glob(bsrc));         \
+                const unsigned w32 = wp[((size_t)r * K + kk) >> 3];                            \
+                const unsigned char sc = as_glob(bscale)[(size_t)r * (K >> 5) + (kk >> 5)];    \
+                *(bf16v8*)&rb[it * 8] = fp4_to_bf16v8(w32, e8m0_to_f32(sc));                   \
+            } else _Pragma("unroll") for (int j = 0; j < 8; j++) rb[it * 8 + j] = 0;          \
+        } else if constexpr (KEXACT) {                                                        \
             if (r < N) *(bf16v8*)&rb[it * 8] = ld_glob8(as_glob(bsrc) + (size_t)r * K + kk);  \
             else _Pragma("unroll") for (int j = 0; j < 8; j++) rb[it * 8 + j] = 0;            \
         } else {                                                                              \
@@ -622,6 +645,21 @@ __device__ void d_gemm(bf16* C, const bf16* A, const bf16* B, unsigned M, unsign
                        unsigned slice, unsigned nblk, bf16* lds) {
     d_gemm_t<GM_BM, GM_BN, GM_BK, GM_WM, GM_WN, false>(C, A, B, nullptr, nullptr, M, N, K, slice,
                                                        nblk, lds);
+}
+
+/* MXFP4 (w4a16) PREFILL GEMM. A is bf16 activations, W is packed-2/byte fp4 weights (row stride
+ * K/2 bytes) with E8M0 scale rows `wscale` (K/32 bytes/row). Reuses the entire bf16 d_gemm_t —
+ * only the B-fetch dequants fp4->bf16 with the MX scale folded exactly (WFP4=true), so the LDS
+ * staging, wide-K bf16 MFMA and epilogue are identical to the bf16 prefill. This buys the fp4
+ * WEIGHT-BANDWIDTH win at M>1 without an activation-quant op; the native cbsz/blgp=4 f8f6f4 2x-
+ * compute path is a separate future kernel (op_gemm.h fp8 verdict: that path measured only PARITY
+ * anyway until the occ-1 deep-pipeline rewrite, so w4a16 is the correct first prefill GEMM). */
+__device__ void d_gemm_mxfp4(bf16* C, const bf16* A, const unsigned char* W,
+                             const unsigned char* wscale, unsigned M, unsigned N, unsigned K,
+                             unsigned slice, unsigned nblk, bf16* lds) {
+    d_gemm_t<GM_BM, GM_BN, GM_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true, false,
+             true>(C, A, (const bf16*)W, nullptr, nullptr, M, N, K, slice, nblk, lds, nullptr, 0,
+                   wscale);
 }
 
 /* Small tile, for shapes that cannot fill the machine at 256x256.
@@ -1447,6 +1485,122 @@ __device__ __forceinline__ void gemv_rows_fp8(bf16* __restrict__ C_, const bf16*
     }
 }
 
+/* MXFP4 DECODE GEMV (w4a16) — OCP microscaling e2m1 weights, one E8M0 scale per 32 K-elements,
+ * bf16 activation. Structurally the fp8 GEMV above with a 4-bit weight stream.
+ *
+ * WHY THIS IS THE FP4 SHAPE THAT PAYS. Decode is weight-bandwidth-bound, not MFMA-bound — the
+ * whole reason the fp8 GEMV exists. fp4 halves the weight stream again on top of fp8 (0.5 vs 1
+ * byte/elt, plus 1 scale byte per 32 = 4.25 bits/elt effective), so the roofline moves ~1.88x over
+ * fp8 and ~3.76x over bf16. The MFMA fp4 GEMM (cbsz/blgp=4) is the PREFILL shape and is a separate
+ * kernel; it buys nothing here because a GEMV never fills an MFMA.
+ *
+ * THE SCALE IS FREE (see fp4_to_bf16v8x4 in amd_common.h): an MX scale is E8M0, i.e. a power of two
+ * by construction, so it folds exactly into the cvt's scalef32 operand. Contrast the block-fp8 twin
+ * below, whose arbitrary-f32 weight_scale_inv forces a separate per-block multiply. mxfp4 dequant is
+ * therefore the SAME VALU cost as fp8 dequant, and the epilogue has no dequant at all.
+ *
+ * LAYOUT (matches the OCP MX spec and what quantisers emit):
+ *   W[n][k]  packed 2 fp4/byte, row stride K/2 bytes, low nibble = even k
+ *   S[n][j]  one E8M0 byte per 32-K block, row stride K/32 bytes, j = k/32
+ * One lane's b128 load is 16 bytes = 32 fp4 = exactly one block, so a lane reads exactly one scale
+ * byte per chunk and no scale ever straddles a fragment.
+ *
+ * Bounds: the weight buffer resource returns 0 past num_records (free OOB check, as the fp8 path),
+ * and fp4 zero decodes to 0.0, so an overshoot chunk contributes nothing. The scale byte is guarded
+ * explicitly — it is 1/16 the traffic of the weights and stays in L1/L2, so a predicated scalar
+ * load is not worth a buffer resource of its own. */
+template <int MM, bool XLDS, int UN = 3>
+__device__ __forceinline__ void gemv_rows_mxfp4(bf16* __restrict__ C_, const bf16* __restrict__ x_,
+                                                const unsigned char* __restrict__ W_,
+                                                const unsigned char* __restrict__ S_, unsigned M,
+                                                unsigned N, unsigned K, unsigned slice,
+                                                unsigned nblk, const bf16* lds) {
+    const unsigned lane = threadIdx.x & 63;
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned step = PLOW_WAVE * 32; /* one pass: 64 lanes x 32 fp4 = 2048 K */
+    const unsigned nchunk = (K + step - 1) / step;
+    const unsigned wbytes = K >> 1;   /* packed weight row stride */
+    const unsigned nsb = (K + 31) >> 5; /* scale bytes per row     */
+
+    auto* const C = as_glob(C_);
+    const auto* const x = as_glob(x_);
+    const auto* const W = as_glob(W_);
+    const auto* const S = as_glob(S_);
+
+    auto xv8 = [&](unsigned m, unsigned kk) -> bf16v8 {
+        const size_t xo = (size_t)m * K + kk;
+        if constexpr (XLDS)
+            return ld_lds8(lds + xo);
+        else
+            return ld_glob8(x + xo);
+    };
+
+    /* TWO OUTPUT COLUMNS PER WAVE-STEP, for the reason the fp8 twin documents: fp4 doubles the
+     * K-elements per load again, so nchunk halves again and the in-flight-load ceiling per column
+     * gets even tighter. Two independent rows keep 2*min(UN,nchunk) loads outstanding. */
+    const unsigned gv_per = (N + nblk - 1) / nblk;
+    const unsigned gv_n0 = slice * gv_per;
+    const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
+    for (unsigned n = gv_n0 + wave; n < gv_n1; n += PLOW_WAVES * 2) {
+        const bool has2 = (n + PLOW_WAVES) < gv_n1;
+        const unsigned n2 = has2 ? n + PLOW_WAVES : n;
+        const __amdgpu_buffer_rsrc_t wr = buf_rsrc_fp8(W + (size_t)n * wbytes, wbytes);
+        const __amdgpu_buffer_rsrc_t wr2 = buf_rsrc_fp8(W + (size_t)n2 * wbytes, wbytes);
+        const unsigned char* const sr = S + (size_t)n * nsb;
+        const unsigned char* const sr2 = S + (size_t)n2 * nsb;
+        float acc[MM], acc2[MM];
+#pragma unroll
+        for (int m = 0; m < MM; m++) { acc[m] = 0.0f; acc2[m] = 0.0f; }
+
+        for (unsigned c = 0; c < nchunk; c += UN) {
+            fp4v32 wv[UN], wv2[UN];
+            /* Both columns' weight loads issued before either is consumed: 2*UN in flight. */
+#pragma unroll
+            for (int u = 0; u < UN; u++)
+                wv[u] = __builtin_bit_cast(
+                    fp4v32, buf_ld_fp8(wr, ((c + (unsigned)u) * step + lane * 32) >> 1));
+#pragma unroll
+            for (int u = 0; u < UN; u++)
+                wv2[u] = __builtin_bit_cast(
+                    fp4v32, buf_ld_fp8(wr2, ((c + (unsigned)u) * step + lane * 32) >> 1));
+#pragma unroll
+            for (int u = 0; u < UN; u++) {
+                const unsigned k = (c + (unsigned)u) * step + lane * 32;
+                const unsigned kx = (k < K) ? k : 0u;
+                const unsigned sb = k >> 5; /* this lane's block index; one per fragment */
+                const float sc = (sb < nsb) ? e8m0_to_f32(sr[sb]) : 0.0f;
+                const float sc2 = (sb < nsb) ? e8m0_to_f32(sr2[sb]) : 0.0f;
+                bf16v8 w0, w1, w2, w3, y0, y1, y2, y3;
+                fp4_to_bf16v8x4(wv[u], sc, w0, w1, w2, w3);
+                fp4_to_bf16v8x4(wv2[u], sc2, y0, y1, y2, y3);
+#pragma unroll
+                for (int m = 0; m < MM; m++) {
+                    const bool live = ((unsigned)m < M);
+                    const bf16v8 x0 = xv8(live ? m : 0, kx);
+                    const bf16v8 x1 = xv8(live ? m : 0, kx + 8);
+                    const bf16v8 x2 = xv8(live ? m : 0, kx + 16);
+                    const bf16v8 x3 = xv8(live ? m : 0, kx + 24);
+                    acc[m] += live ? dot8(w3, x3, dot8(w2, x2, dot8(w1, x1, dot8(w0, x0, 0.0f))))
+                                   : 0.0f;
+                    acc2[m] += live ? dot8(y3, x3, dot8(y2, x2, dot8(y1, x1, dot8(y0, x0, 0.0f))))
+                                    : 0.0f;
+                }
+            }
+        }
+        /* No dequant here — unlike the fp8 twin's `* wscale[n]`, the MX scale is already folded
+         * into every converted element by fp4_to_bf16v8x4. */
+#pragma unroll
+        for (int m = 0; m < MM; m++) {
+            const float t = wave_sum(acc[m]);
+            const float t2 = wave_sum(acc2[m]);
+            if (lane == 0 && (unsigned)m < M) {
+                C[(size_t)m * N + n] = f2bf(t);
+                if (has2) C[(size_t)m * N + n2] = f2bf(t2);
+            }
+        }
+    }
+}
+
 /* BLOCK-SCALED FP8 GEMV — the DeepSeek/GLM block-fp8 quant scheme (weight_block_size [128,128]).
  * Unlike gemv_rows_fp8 (one per-CHANNEL scale wscale[n], factored out of the whole K-reduction in
  * the epilogue), the block scheme has a per-[128 out][128 K] scale grid `wscale[n/128][k/128]`
@@ -2160,6 +2314,138 @@ __device__ void d_gemv_fp8_blk(bf16* C, const bf16* x, const unsigned char* W, c
     else GEMV_FP8_BLK_DISP(3);                     /* K=6144: 6 chunks -> 2 clean groups of 3 */
 }
 #undef GEMV_FP8_BLK_DISP
+
+/* MXFP4 decode GEMV entry. Mirrors d_gemv_fp8: stage x in LDS when it fits, then pick UN so it
+ * DIVIDES the chunk count (a dead overshoot chunk still costs a full 16-convert dequant, so an UN
+ * that does not divide nchunk burns VALU for nothing).
+ *
+ * An mxfp4 chunk is 2048 K-elements — twice the fp8 chunk, four times the bf16 one — so nchunk is
+ * small on real shapes and the table is correspondingly short: K=4096 -> 2, K=8192 -> 4,
+ * K=16384 -> 8. UN=2 is the floor because two columns are already in flight per wave. */
+__device__ void d_gemv_mxfp4(bf16* C, const bf16* x, const unsigned char* W,
+                             const unsigned char* S, unsigned M, unsigned N, unsigned K,
+                             unsigned slice, unsigned nblk, bf16* lds) {
+    const bool lds_ok = (size_t)M * K <= GM_LDS_HALVES;
+    if (lds_ok) {
+        for (unsigned i = threadIdx.x; i < M * K; i += PLOW_THREADS) lds[i] = x[i];
+        __syncthreads();
+    }
+    const unsigned nchunk = (K + PLOW_WAVE * 32 - 1) / (PLOW_WAVE * 32);
+#define GEMV_MXFP4_DISP(UN)                                                                      \
+    do {                                                                                         \
+        if (lds_ok)                                                                              \
+            gemv_rows_mxfp4<PLOW_GEMV_MM, true, UN>(C, x, W, S, M, N, K, slice, nblk, lds);       \
+        else                                                                                     \
+            gemv_rows_mxfp4<PLOW_GEMV_MM, false, UN>(C, x, W, S, M, N, K, slice, nblk, lds);     \
+    } while (0)
+    if (nchunk >= 8u) GEMV_MXFP4_DISP(4);      /* K>=16384: 8 chunks -> 2 clean groups of 4 */
+    else if (nchunk >= 6u) GEMV_MXFP4_DISP(3); /* K=12288: 6 -> 2 groups of 3               */
+    else GEMV_MXFP4_DISP(2);                   /* K<=8192: 2 or 4 chunks                    */
+#undef GEMV_MXFP4_DISP
+}
+
+/* MXFP4 decode fused gate|up GEMV+GLU (w4a16) — the mxfp4 twin of d_gemv_glu_fp8, built on the SAME
+ * verified fp4 machinery as gemv_rows_mxfp4: packed-2/byte weight loads (offset >>1), one E8M0 scale
+ * byte per 32 K folded into fp4_to_bf16v8x4 — so there is NO per-channel epilogue dequant (contrast
+ * the fp8 twin's *gscale/*uscale, whose arbitrary-f32 scale must stay a separate multiply). Gate and
+ * up are two fp4 weight matrices Wg/Wu each with its own E8M0 scale row Sg/Su; the epilogue is
+ * act(g)*u. One wave owns one output column (like the fp8 twin), so 4 fp4->bf16 converts + 4 fdot2
+ * per fragment for each of gate and up. HARDWARE-VALIDATE numerics against golden d_gemv_glu_mxfp4_k
+ * (test_kernels.hip); the fp4 convert + fdot2 primitives are already device-validated by
+ * gemv_rows_mxfp4, so only the gate/up fusion + SwiGLU epilogue are new. */
+#ifndef GV_UNROLL_GLU_MXFP4
+#define GV_UNROLL_GLU_MXFP4 2
+#endif
+template <int MM, int UN = GV_UNROLL_GLU_MXFP4>
+__device__ __forceinline__ void gemv_glu_rows_mxfp4(
+    bf16* __restrict__ C_, const unsigned char* __restrict__ Wg_,
+    const unsigned char* __restrict__ Wu_, const unsigned char* __restrict__ Sg_,
+    const unsigned char* __restrict__ Su_, unsigned M, unsigned N, unsigned K, unsigned act,
+    unsigned slice, unsigned nblk, const bf16* lds) {
+    const unsigned lane = threadIdx.x & 63;
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned step = PLOW_WAVE * 32;   /* one pass: 64 lanes x 32 fp4 = 2048 K */
+    const unsigned nchunk = (K + step - 1) / step;
+    const unsigned wbytes = K >> 1;         /* packed weight row stride (2 fp4/byte) */
+    const unsigned nsb = (K + 31) >> 5;     /* E8M0 scale bytes per row              */
+
+    auto* const C = as_glob(C_);
+    const auto* const Wg = as_glob(Wg_);
+    const auto* const Wu = as_glob(Wu_);
+    const auto* const Sg = as_glob(Sg_);
+    const auto* const Su = as_glob(Su_);
+    auto xv8 = [&](unsigned m, unsigned kk) -> bf16v8 { return ld_lds8(lds + (size_t)m * K + kk); };
+
+    const unsigned per = (N + nblk - 1) / nblk;
+    const unsigned n0 = slice * per;
+    const unsigned n1 = (n0 + per < N) ? (n0 + per) : N;
+
+    for (unsigned n = n0 + wave; n < n1; n += PLOW_WAVES) {
+        const __amdgpu_buffer_rsrc_t rg = buf_rsrc_fp8(Wg + (size_t)n * wbytes, wbytes);
+        const __amdgpu_buffer_rsrc_t ru = buf_rsrc_fp8(Wu + (size_t)n * wbytes, wbytes);
+        const unsigned char* const sg = Sg + (size_t)n * nsb;
+        const unsigned char* const su = Su + (size_t)n * nsb;
+        float ag[MM], au[MM];
+#pragma unroll
+        for (int m = 0; m < MM; m++) { ag[m] = 0.0f; au[m] = 0.0f; }
+
+        for (unsigned c = 0; c < nchunk; c += UN) {
+            fp4v32 wg[UN], wu[UN];
+            /* Both gate and up weight loads issued before either is consumed: 2*UN in flight. */
+#pragma unroll
+            for (int u = 0; u < UN; u++)
+                wg[u] = __builtin_bit_cast(
+                    fp4v32, buf_ld_fp8(rg, ((c + (unsigned)u) * step + lane * 32) >> 1));
+#pragma unroll
+            for (int u = 0; u < UN; u++)
+                wu[u] = __builtin_bit_cast(
+                    fp4v32, buf_ld_fp8(ru, ((c + (unsigned)u) * step + lane * 32) >> 1));
+#pragma unroll
+            for (int u = 0; u < UN; u++) {
+                const unsigned k = (c + (unsigned)u) * step + lane * 32;
+                const unsigned kx = (k < K) ? k : 0u;
+                const unsigned sb = k >> 5; /* this lane's block index; one E8M0 scale per fragment */
+                const float scg = (sb < nsb) ? e8m0_to_f32(sg[sb]) : 0.0f;
+                const float scu = (sb < nsb) ? e8m0_to_f32(su[sb]) : 0.0f;
+                bf16v8 g0, g1, g2, g3, u0, u1, u2, u3;
+                fp4_to_bf16v8x4(wg[u], scg, g0, g1, g2, g3);
+                fp4_to_bf16v8x4(wu[u], scu, u0, u1, u2, u3);
+#pragma unroll
+                for (int m = 0; m < MM; m++) {
+                    const bool live = ((unsigned)m < M);
+                    const bf16v8 x0 = xv8(live ? m : 0, kx);
+                    const bf16v8 x1 = xv8(live ? m : 0, kx + 8);
+                    const bf16v8 x2 = xv8(live ? m : 0, kx + 16);
+                    const bf16v8 x3 = xv8(live ? m : 0, kx + 24);
+                    ag[m] += live ? dot8(g3, x3, dot8(g2, x2, dot8(g1, x1, dot8(g0, x0, 0.0f)))) : 0.0f;
+                    au[m] += live ? dot8(u3, x3, dot8(u2, x2, dot8(u1, x1, dot8(u0, x0, 0.0f)))) : 0.0f;
+                }
+            }
+        }
+        /* No per-channel dequant: the MX E8M0 scale is already folded into every converted element
+         * by fp4_to_bf16v8x4 (contrast d_gemv_glu_fp8's `* gscale[n]` / `* uscale[n]`). */
+#pragma unroll
+        for (int m = 0; m < MM; m++) {
+            const float g = wave_sum(ag[m]);
+            const float uu = wave_sum(au[m]);
+            if (lane == 0 && (unsigned)m < M) {
+                const float s = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+                C[(size_t)m * N + n] = f2bf(s * uu);
+            }
+        }
+    }
+}
+
+/* MXFP4 decode fused gate|up GEMV entry. Mirrors d_gemv_glu_fp8: stage x in LDS (PRECONDITION
+ * M*K <= GM_LDS_HALVES), then one wave per output column computes gate & up and fuses act(g)*u. */
+__device__ void d_gemv_glu_mxfp4(bf16* C, const bf16* x, const unsigned char* Wg,
+                                 const unsigned char* Wu, const unsigned char* Sg,
+                                 const unsigned char* Su, unsigned M, unsigned N, unsigned K,
+                                 unsigned act, unsigned slice, unsigned nblk, bf16* lds) {
+    for (unsigned i = threadIdx.x; i < M * K; i += PLOW_THREADS) lds[i] = x[i];
+    __syncthreads();
+    gemv_glu_rows_mxfp4<PLOW_GEMV_MM>(C, Wg, Wu, Sg, Su, M, N, K, act, slice, nblk, lds);
+}
 
 /* FP8 decode fused gate|up GEMV+GLU. PRECONDITION (as the bf16 twin): M*K <= GM_LDS_HALVES. */
 __device__ void d_gemv_glu_fp8(bf16* C, const bf16* x, const unsigned char* Wg,

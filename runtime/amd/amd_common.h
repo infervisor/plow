@@ -308,6 +308,77 @@ __device__ __forceinline__ void fp8_to_bf16v8(fp8v16 w, bf16v8& lo, bf16v8& hi) 
  * wave_dot_fp8_blk apply it per 128-K block); it cannot be folded into this cvt. */
 
 /* ---------------------------------------------------------------------------
+ * MXFP4 (OCP microscaling: e2m1 element + one shared E8M0 scale per 32) — weight decode.
+ *
+ * This is the case the fp8 block-scale comment above rules OUT for GLM/DeepSeek and IN for MX: an
+ * MX scale IS a power of two by construction (E8M0 is a bare 8-bit exponent), so folding it into
+ * the cvt's scalef32 operand is EXACT, not an approximation. The mantissa the hardware discards is
+ * a mantissa the format does not have. So mxfp4 dequant costs the same VALU as fp8 dequant and the
+ * scale is free — no separate multiply, no per-block FMA, nothing in the epilogue.
+ *
+ * THE ALIGNMENT THAT MAKES THIS CHEAP: a lane's b128 weight load is 16 bytes = 32 fp4 = EXACTLY one
+ * MX block. So one load consumes one scale byte, the scale never varies within a lane's fragment,
+ * and there is no cross-lane scale reshuffle (contrast gemv_rows_fp8_blk, which has to reason about
+ * 16-element partials landing inside a 128-K block). Pick any other fragment width and this
+ * property is lost. */
+typedef unsigned fp4v32 __attribute__((ext_vector_type(4))); /* 32 fp4 == 4 u32, 16 B, align 16 */
+
+/* E8M0 byte -> f32 2^(b-127). Bit-construct rather than exp2f: byte b placed in the f32 exponent
+ * field with a zero mantissa IS 2^(b-127), so this is one shift, no transcendental. b=0xFF is the
+ * MX NaN encoding; it is not special-cased here because the cvt consumes only the exponent and a
+ * NaN scale would poison the block anyway (quantisers do not emit it for weights). */
+__device__ __forceinline__ float e8m0_to_f32(unsigned char b) {
+    return __builtin_bit_cast(float, (unsigned)b << 23);
+}
+
+/* 32 fp4 + one E8M0 scale -> four bf16v8, in the SAME fdot2-ready lane order as fp8_to_bf16v8, so
+ * the GEMV reduction, `dot8` and the wave reduction are shared verbatim with the fp8 path.
+ * Each u32 holds 8 fp4 = 4 pairs; op_sel (the third operand, 0..3) picks the pair, so one word
+ * becomes 8 bf16 in 4 packed converts — 16 converts per 32-element fragment. */
+__device__ __forceinline__ void fp4_to_bf16v8x4(fp4v32 w, float scale, bf16v8& a, bf16v8& b,
+                                                bf16v8& c, bf16v8& d) {
+    typedef bf16_t bf16_2 __attribute__((ext_vector_type(2)));
+    union { bf16v8 v; unsigned u[4]; } o[4];
+    /* op_sel must be a literal (clang rejects a loop induction variable even under #pragma unroll,
+     * the check runs before unrolling), so the pair select is spelled out. */
+#define MXFP4_CVT(i)                                                                          \
+    o[i].u[0] = __builtin_bit_cast(                                                            \
+        unsigned, __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4((int)w[i], scale, 0));             \
+    o[i].u[1] = __builtin_bit_cast(                                                            \
+        unsigned, __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4((int)w[i], scale, 1));             \
+    o[i].u[2] = __builtin_bit_cast(                                                            \
+        unsigned, __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4((int)w[i], scale, 2));             \
+    o[i].u[3] = __builtin_bit_cast(                                                            \
+        unsigned, __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4((int)w[i], scale, 3));
+    MXFP4_CVT(0)
+    MXFP4_CVT(1)
+    MXFP4_CVT(2)
+    MXFP4_CVT(3)
+#undef MXFP4_CVT
+    a = o[0].v;
+    b = o[1].v;
+    c = o[2].v;
+    d = o[3].v;
+}
+
+/* One u32 (8 fp4) + one E8M0 scale -> bf16v8, the per-word slice of fp4_to_bf16v8x4. Used by the
+ * w4a16 prefill GEMM's dequant-on-load B-fetch, where the 8-half load granularity wants exactly 8
+ * bf16 at a time (an 8-element load never crosses a 32-element MX block, so one scale byte covers
+ * it). Same 4 packed op_sel converts, same fdot2-ready order — the scale fold stays EXACT. */
+__device__ __forceinline__ bf16v8 fp4_to_bf16v8(unsigned w, float scale) {
+    union { bf16v8 v; unsigned u[4]; } o;
+    o.u[0] = __builtin_bit_cast(unsigned,
+                                __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4((int)w, scale, 0));
+    o.u[1] = __builtin_bit_cast(unsigned,
+                                __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4((int)w, scale, 1));
+    o.u[2] = __builtin_bit_cast(unsigned,
+                                __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4((int)w, scale, 2));
+    o.u[3] = __builtin_bit_cast(unsigned,
+                                __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4((int)w, scale, 3));
+    return o.v;
+}
+
+/* ---------------------------------------------------------------------------
  * FP8 (OCP e4m3) KV-CACHE loads/stores — the decode flash-attention path.
  *
  * The KV cache is HBM-bound in decode (op_attention.h: "1.91 ms @ 2.0 TB/s"), so storing K/V as

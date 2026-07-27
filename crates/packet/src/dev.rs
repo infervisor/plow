@@ -571,6 +571,34 @@ pub enum DevOp {
     // conv_dim = d_inner + 2*n_groups*d_state. A[h] = -exp(A_log[h]); dt[t,h] = softplus(dt_raw+dt_bias);
     // dA = exp(dt*A). No time_step_limit clamp (assumption, see mamba_ref).
     Mamba2Scan = 90,
+
+    /// MXFP4 decode GEMV (w4a16): OCP microscaling e2m1 weights + one E8M0 scale per 32 K.
+    ///
+    /// Decode is weight-bandwidth-bound, so this is the shape where fp4 pays: 4.25 effective
+    /// bits/element (half a weight byte plus one scale byte per 32) against fp8's 8, moving the
+    /// roofline ~1.88x over [`DevOp::GemvFp8`] and ~3.76x over bf16 [`DevOp::Gemv`].
+    ///
+    /// The E8M0 scale folds into the fp4 -> bf16 convert and that fold is EXACT — an MX scale is a
+    /// power of two by construction, so the hardware's exponent-only `scalef32` operand loses
+    /// nothing. (Contrast [`DevOp::GemvFp8Blk`], whose arbitrary-f32 block scale must stay a
+    /// separate multiply.) There is therefore no dequant in the epilogue.
+    ///
+    /// Layout: `W` packed 2 fp4/byte, row stride `K/2` bytes, low nibble = even k; `S` one E8M0
+    /// byte per 32-K block, row stride `K/32` bytes. One lane's 16-byte load is exactly one block.
+    ///
+    /// `t0=C(bf16) t1=x(bf16) t2=W(fp4) t3=S(e8m0)   i0=M i1=N i2=K`
+    GemvMxfp4 = 91,
+
+    /// MXFP4 decode fused gate|up GEMV+GLU (w4a16) — the mxfp4 twin of [`DevOp::GemvGluFp8`].
+    /// Gate/up are two fp4 weight matrices with their own E8M0 scale rows; the SwiGLU fuses
+    /// `act(g)*u` in one packet. `t0=C t1=x t2=Wg(fp4) t5=Wu(fp4) t3=Sg(e8m0) t4=Su(e8m0)
+    /// i0=M i1=N i2=K i5=act`. See op_gemm.h `d_gemv_glu_mxfp4`.
+    GemvGluMxfp4 = 92,
+
+    /// MXFP4 (w4a16) prefill GEMM — bf16 activations × packed fp4 weights + E8M0 scale rows.
+    /// Reuses the bf16 wide-K MFMA; only the weight fetch dequants fp4→bf16 with the MX scale
+    /// folded. `t0=C t1=A(bf16) t2=W(fp4) t3=wscale(e8m0)  i0=M i1=N i2=K`. See `d_gemm_mxfp4`.
+    GemmMxfp4 = 93,
 }
 
 impl DevOp {
@@ -601,6 +629,7 @@ impl DevOp {
         DevOp::MoeCombineResidNormGemma, DevOp::MoeRouterGemmaPf, DevOp::MoeAlignGemmaPf, DevOp::MoeGroupGluGemmaPf,
         DevOp::MoeGroupDownGemmaPf, DevOp::MoeCombineNormGemmaPf, DevOp::GemvSz, DevOp::GemvGluSz,
         DevOp::GemvArgmax, DevOp::MoeGroupGluGemmaPfW8a8, DevOp::MoeGroupDownGemmaPfW8a8, DevOp::Mamba2Scan,
+        DevOp::GemvMxfp4, DevOp::GemvGluMxfp4, DevOp::GemmMxfp4,
     ];
 
     /// The `dev_isa.h` spelling of this opcode.
@@ -694,12 +723,15 @@ impl DevOp {
             DevOp::MoeGroupGluGemmaPfW8a8 => "PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF_W8A8",
             DevOp::MoeGroupDownGemmaPfW8a8 => "PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF_W8A8",
             DevOp::Mamba2Scan => "PLOW_DOP_MAMBA2_SCAN",
+            DevOp::GemvMxfp4 => "PLOW_DOP_GEMV_MXFP4",
+            DevOp::GemvGluMxfp4 => "PLOW_DOP_GEMV_GLU_MXFP4",
+            DevOp::GemmMxfp4 => "PLOW_DOP_GEMM_MXFP4",
         }
     }
 
     /// One past the highest opcode value — mirrors `PLOW_DOP__COUNT`. This is a
     /// dispatch-table bound, *not* the number of opcodes (the range has holes).
-    pub const COUNT: u16 = 91;
+    pub const COUNT: u16 = 94;
 }
 
 /// Sentinel expert id a router writes for an unused top-k slot; the expert body skips

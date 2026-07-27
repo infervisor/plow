@@ -55,6 +55,23 @@ impl CostParams {
                 block_size: weight_dt.block_size() as u64,
                 native_fp4: false,
             }
+        } else if weight_dt == DType::F4 {
+            // MX FP4: 32-element blocks, each 16 B packed e2m1 nibbles + 1 E8M0
+            // scale byte (17 B / 32 → nn-graph `F4.tile_bytes`). Model the block
+            // granularity so SRAM staging + HBM traffic account for the scale
+            // byte; keep `block_quant=false` and `native_fp4=true` so the emitter
+            // still selects VARIANT_FP4 (this is a native hardware path, not GGUF
+            // dequant). Amortize the per-element weight cost from `tile_bytes`.
+            let ref_count = 256u64; // whole number of 32-elem blocks, ≥ block_size
+            let weight_elem = weight_dt.tile_bytes(ref_count).div_ceil(ref_count).max(1);
+            CostParams {
+                activation_elem,
+                weight_elem,
+                mma_dtype,
+                block_quant: false,
+                block_size: weight_dt.block_size() as u64,
+                native_fp4: true,
+            }
         } else {
             CostParams {
                 activation_elem,
@@ -62,7 +79,7 @@ impl CostParams {
                 mma_dtype,
                 block_quant: false,
                 block_size: 1,
-                native_fp4: weight_dt == DType::F4,
+                native_fp4: false,
             }
         }
     }
@@ -214,9 +231,10 @@ mod tests {
     fn mx_fp4_native_path() {
         let p = CostParams::from_dtypes(DType::F4, DType::BF16);
         assert_eq!(p.activation_elem, 2);
-        assert_eq!(p.weight_elem, 1); // 0.5 bytes rounds up to 1
+        assert_eq!(p.weight_elem, 1); // 17 B / 32 elems ≈ 0.53, rounds up to 1
         assert_eq!(p.mma_dtype, MmaDtype::Bf16); // compute still in bf16
-        assert!(!p.block_quant); // NOT block-quant (native hardware path)
+        assert!(!p.block_quant); // NOT GGUF block-quant (native hardware path)
         assert!(p.native_fp4); // triggers VARIANT_FP4
+        assert_eq!(p.block_size, 32); // MX 32-elem block granularity (E8M0 scale)
     }
 }

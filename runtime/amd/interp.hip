@@ -347,6 +347,56 @@ __device__ __forceinline__ void exec_flash_mla_decode(CInst in, CTens T, unsigne
 #undef TEN
 }
 
+#if PLOW_MLA_PREFILL
+/* MLA PREFILL + GATHERED MLA PREFILL (ops 51 / 55). [DEEPSEEK-MLA]
+ *
+ * Its own flag, like PLOW_FP8: the prefill bucket already sits AT the 256/occ-2 cliff on the
+ * bf16 GEMM, and register allocation here is the worst case over every inlined arm. Only a
+ * Kimi/DeepSeek/GLM prefill object needs these, and a Gemma prefill object must not pay for
+ * them. Nothing about the existing objects changes when this is off.
+ *
+ * OPERANDS — identical to the decode twin except i4, which carries n_tok instead of nsplit.
+ * That reuse is deliberate rather than a spare slot: nsplit MUST be 1 for prefill (an early
+ * token's later splits are empty under a per-token causal bound, and an empty split emits
+ * l=0 for d_flash_merge to divide by), so the slot that meant "how many ways the KV range is
+ * split" now means "how many query tokens this packet carries" — in both cases the factor the
+ * work decomposition multiplies by.
+ *   t0=Opart t1=mlpart t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len t7=idx(gather only)
+ *   i0=n_batch i1=n_head i2=kv_stride i3=window i4=n_tok i5=kv_mask i6=top_k i7=gf
+ *   f0=scale */
+__device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsigned slice,
+                                                       unsigned nblk, float* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    const unsigned gf = in->i[7] ? in->i[7] : (unsigned)GLM_MLA_GF;
+    if (in->op == PLOW_DOP_FLASH_GATHER_PREFILL) {
+        if (gf == 2)
+            d_flash_gather_prefill<512, 64, 2>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), (const int*)TEN(7),
+                in->i[6], in->i[0], in->i[4], in->i[1], in->i[2], in->fj[0].f, in->i[5], slice,
+                nblk, lds);
+        else
+            d_flash_gather_prefill<512, 64, 4>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), (const int*)TEN(7),
+                in->i[6], in->i[0], in->i[4], in->i[1], in->i[2], in->fj[0].f, in->i[5], slice,
+                nblk, lds);
+    } else {
+        if (gf == 2)
+            d_flash_mla_prefill<512, 64, 2>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[4],
+                in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk, lds);
+        else
+            d_flash_mla_prefill<512, 64, 4>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[4],
+                in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk, lds);
+    }
+#undef TEN
+}
+#endif
+
 /* These are __forceinline__, NOT noinline.
  *
  * They were noinline for a while, to stop the interpreter's loop state from being
@@ -421,6 +471,84 @@ __device__ __forceinline__ void exec_gemv_glu_fp8(CInst in, CTens T, unsigned sl
                    in->i[0], in->i[1], in->i[2], in->i[5], slice, nblk, lds);
 #undef TEN
 }
+
+#if PLOW_BUCKET_PREFILL
+/* w8a8 PREFILL arms. d_gemm_fp8* have been in op_gemm.h since the fp8 GEMM landed, but no
+ * dispatch arm ever referenced them, so PLOW_DOP_GEMM_FP8 hit the default case and fp8
+ * prefill was unreachable on AMD — the 2x-rate wide-K MFMA path was written and unused.
+ *
+ * These SWAP for the bf16 GEMM arms (see the dispatch), they do not add to them. Register
+ * allocation in this kernel is the worst case over ALL inlined code, so carrying both the
+ * bf16 and fp8 256x256 GEMMs in one object costs the 256/occ-2 cliff. Same discipline the
+ * decode object already applies to its GEMV arms.
+ *
+ * t0=C(bf16) t1=A(fp8) t2=B(fp8) t3=a_scale(f32[M]) t4=w_scale(f32[N])  i0=M i1=N i2=K i4=a_row0 */
+__device__ __forceinline__ void exec_gemm_fp8(CInst in, CTens T, unsigned slice, unsigned nblk,
+                                              bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    /* i4 = a_row0 skips rows of A. A is 1 byte/elt here, so the stride is K bytes, not K*2 —
+     * the bf16 arm's `+ i4*i2` on a bf16* is the same element count, a different byte count. */
+    d_gemm_fp8((bf16*)TEN(0), (const unsigned char*)TEN(1) + (size_t)in->i[4] * in->i[2],
+               (const unsigned char*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
+               in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+#undef TEN
+}
+__device__ __forceinline__ void exec_gemm_med_fp8(CInst in, CTens T, unsigned slice, unsigned nblk,
+                                                  bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    d_gemm_med_fp8((bf16*)TEN(0), (const unsigned char*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                   (const unsigned char*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
+                   in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+#undef TEN
+}
+__device__ __forceinline__ void exec_gemm_small_fp8(CInst in, CTens T, unsigned slice,
+                                                    unsigned nblk, bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    d_gemm_small_fp8((bf16*)TEN(0), (const unsigned char*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                     (const unsigned char*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),
+                     in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+#undef TEN
+}
+#endif /* PLOW_BUCKET_PREFILL */
+#endif
+
+#if PLOW_MXFP4
+/* MXFP4 decode arm. Its own flag, not PLOW_FP8: mxfp4 and fp8 are alternative weight encodings for
+ * the same linear, so an object never wants both, and keeping the guards separate means the fp8
+ * decode object's register budget is untouched by this existing at all.
+ * t0=C t1=x t2=W(fp4) t3=S(e8m0)   i0=M i1=N i2=K */
+__device__ __forceinline__ void exec_gemv_mxfp4(CInst in, CTens T, unsigned slice, unsigned nblk,
+                                                bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    d_gemv_mxfp4((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
+                 (const unsigned char*)TEN(3), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+#undef TEN
+}
+
+/* MXFP4 decode fused gate|up GEMV+GLU. Mirrors exec_gemv_glu_fp8's slot layout, with E8M0 scale
+ * byte tensors in place of the fp8 float scales.
+ * t0=C t1=x t2=Wg(fp4) t5=Wu(fp4) t3=Sg(e8m0) t4=Su(e8m0)   i0=M i1=N i2=K i5=act */
+__device__ __forceinline__ void exec_gemv_glu_mxfp4(CInst in, CTens T, unsigned slice,
+                                                    unsigned nblk, bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    d_gemv_glu_mxfp4((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
+                     (const unsigned char*)TEN(5), (const unsigned char*)TEN(3),
+                     (const unsigned char*)TEN(4), in->i[0], in->i[1], in->i[2], in->i[5], slice,
+                     nblk, lds);
+#undef TEN
+}
+
+#if PLOW_BUCKET_PREFILL
+/* MXFP4 (w4a16) PREFILL GEMM arm. A bf16 activations, W packed fp4 + E8M0 scale rows.
+ * t0=C(bf16) t1=A(bf16) t2=W(fp4) t3=wscale(e8m0)   i0=M i1=N i2=K */
+__device__ __forceinline__ void exec_gemm_mxfp4(CInst in, CTens T, unsigned slice, unsigned nblk,
+                                                bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    d_gemm_mxfp4((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
+                 (const unsigned char*)TEN(3), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+#undef TEN
+}
+#endif /* PLOW_BUCKET_PREFILL */
 #endif
 
 __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* sm) {
@@ -552,6 +680,37 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
             d_argmax_fin((int*)TEN(0), (const unsigned long long*)TEN(1), in->i[0], slice);
             break;
 #if PLOW_BUCKET_PREFILL
+#if PLOW_FP8
+        /* w8a8 PREFILL object. The fp8 arms SWAP for the bf16 GEMM/GEMM_GLU arms rather than
+         * joining them: an fp8 prefill program emits no bf16 GEMM, and carrying both 256x256
+         * GEMMs would set this kernel's worst-case register allocation over the 256/occ-2
+         * cliff. QUANT_FP8 produces the per-row-quantized activation these consume, so it is
+         * only ever needed in the object that has them. */
+        case PLOW_DOP_QUANT_FP8:
+            /* t0=xq(fp8) t1=x(bf16) t2=a_scale(f32[M])   i0=M i1=K */
+            d_quant_fp8((unsigned char*)TEN(0), (const bf16*)TEN(1), (float*)TEN(2),
+                        in->i[0], in->i[1], slice, nblk);
+            break;
+        case PLOW_DOP_GEMM_FP8:
+            exec_gemm_fp8(in, T, slice, nblk, sm->gm);
+            break;
+        case PLOW_DOP_GEMM_MED_FP8:
+            exec_gemm_med_fp8(in, T, slice, nblk, sm->gm);
+            break;
+        case PLOW_DOP_GEMM_SMALL_FP8:
+            exec_gemm_small_fp8(in, T, slice, nblk, sm->gm);
+            break;
+#if PLOW_WAVES == 8
+        /* Twin of the bf16 GEMM_GLU arm below, and prefill-only for the same reason.
+         * t0=fu t1=A(fp8) t2=Wg t5=Wu t3=a_scale t4=g_scale t6=u_scale  i0=M i1=N i2=K i5=act */
+        case PLOW_DOP_GEMM_GLU_FP8:
+            d_gemm_glu_fp8((bf16*)TEN(0), (const unsigned char*)TEN(1),
+                           (const unsigned char*)TEN(2), (const unsigned char*)TEN(5),
+                           (const float*)TEN(3), (const float*)TEN(4), (const float*)TEN(6),
+                           in->i[0], in->i[1], in->i[2], in->i[5], slice, nblk, sm->gm);
+            break;
+#endif
+#else
         case PLOW_DOP_GEMM:
             /* ONE tile config, fixed at compile time — deliberately not a runtime
              * switch over the variants. The interpreter inlines every op, so its
@@ -583,6 +742,7 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
                        sm->gm);
             break;
 #endif
+#endif /* PLOW_FP8 (w8a8 prefill arms swap for the bf16 GEMM arms above) */
 #if PLOW_FP8_KV
         /* fp8-KV prefill object: only the fp8 flash is compiled, so the bf16 flash_prefill does
          * not weigh on the prefill register budget (SWAP, mirroring the fp8 GEMV arms). */
@@ -592,6 +752,25 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
 #else
         case PLOW_DOP_FLASH_PREFILL:
             exec_flash_prefill(in, T, slice, nblk, sm->fa);
+            break;
+#endif
+#if PLOW_MLA_PREFILL
+        /* MLA / gathered-MLA prefill — the arms whose absence meant Kimi K2.7, DeepSeek and
+         * GLM 5.2 could decode on gfx950 but had nothing to run a real prompt through. */
+        case PLOW_DOP_FLASH_MLA_PREFILL:
+        case PLOW_DOP_FLASH_GATHER_PREFILL:
+            exec_flash_mla_prefill(in, T, slice, nblk, sm->fmla);
+            break;
+        /* The latent epilogue has to be in the SAME object as the prefill that produces the
+         * partials, or the packet has no way to finish a token. Decode carries its own copy. */
+        case PLOW_DOP_MLA_MERGE_FOLD:
+            d_mla_merge_fold<512, 256>((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),
+                                       (const bf16*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[4],
+                                       slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_O_UV_FOLD:
+            d_o_uv_fold<512>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                             in->i[1], in->i[2], slice, nblk, sm->raw);
             break;
 #endif
         /* split-KV prefill ALWAYS needs the merge, so it lives in this bucket too */
@@ -623,7 +802,21 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
         case PLOW_DOP_GEMV_FP8_BLK:
             exec_gemv_fp8_blk(in, T, slice, nblk, sm->gm);
             break;
-#else
+#endif
+#if PLOW_MXFP4
+        case PLOW_DOP_GEMV_MXFP4:
+            exec_gemv_mxfp4(in, T, slice, nblk, sm->gm);
+            break;
+        case PLOW_DOP_GEMV_GLU_MXFP4:
+            exec_gemv_glu_mxfp4(in, T, slice, nblk, sm->gm);
+            break;
+#if PLOW_BUCKET_PREFILL
+        case PLOW_DOP_GEMM_MXFP4:
+            exec_gemm_mxfp4(in, T, slice, nblk, sm->gm);
+            break;
+#endif
+#endif
+#if !PLOW_FP8
         case PLOW_DOP_GEMV_GLU:
             d_gemv_glu((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                        (const bf16*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[5], slice, nblk,

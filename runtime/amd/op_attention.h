@@ -1196,6 +1196,29 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
  * routing_table). Everything else — the absorbed score, online softmax, split, merge — is
  * byte-identical; the selected set is assumed causal so no window/causal mask is applied. The
  * dense instantiation (GATHER=false) compiles to the exact original code (idx/top_k dead). */
+/* PREFILL (n_tok > 1) is the SAME kernel. Decode is the T=1 case of it, which is why this is one
+ * inner loop and not two: MLA's absorption trick already removes the per-head K/V reconstruction
+ * that makes a dense prefill kernel structurally different from its decode twin, and the causal
+ * mask prefill needs (`kv <= qpos`) is ALREADY in the dense `keep` predicate below — decode simply
+ * never exercises it, because its single query sits at the end of the context.
+ *
+ * So the generalisation is a query-token axis on the work decomposition plus a per-token `qpos`:
+ *
+ *   qpos = len - n_tok + t     query token t of this chunk is at absolute position len-n_tok+t
+ *
+ * At n_tok=1, t=0 this is `len - 1` and EVERY index below collapses to the original expression
+ * ((b*1 + 0)*n_head + h == b*n_head + h), so the decode instantiations are bit-identical to before
+ * the generalisation. That is the point: there is no second copy of this loop to drift.
+ *
+ * CAUSAL CLAMP. `hi` is clamped to qpos+1 so an early query token does not walk the whole context
+ * and mask it away — correctness comes from `keep`, but the clamp is what makes prefill O(T*ctx/2)
+ * instead of O(T*ctx). For decode qpos+1 == len >= hi, so the clamp is a no-op and costs nothing.
+ *
+ * NSPLIT MUST BE 1 FOR PREFILL. Splitting the KV range across `nsplit` partials is a decode trick
+ * for filling 256 CUs off a single query; prefill already has n_tok*n_grp work items and does not
+ * need it. Worse, it is unsafe here: with a per-token causal bound an early token's later splits
+ * are EMPTY (lo > qpos), and an empty split emits m=-inf, l=0 which d_flash_merge would divide by.
+ * The emitter passes nsplit=1; this is a precondition, not a preference. */
 template <int DK, int DR, int GF, bool GATHER = false>
 __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                    const bf16* __restrict__ Qabs, const bf16* __restrict__ Qrope,
@@ -1204,9 +1227,9 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
                                    unsigned n_head, unsigned kv_stride, unsigned window,
                                    float scale, unsigned nsplit, unsigned kv_mask, unsigned slice,
                                    unsigned nblk, float* lds, const int* __restrict__ idx = nullptr,
-                                   unsigned top_k = 0) {
+                                   unsigned top_k = 0, unsigned n_tok = 1) {
     const unsigned n_grp = n_head / GF;                 /* head-groups; latent re-read per group */
-    const unsigned n_work = n_batch * n_grp * nsplit;
+    const unsigned n_work = n_batch * n_tok * n_grp * nsplit;
     const unsigned tid = threadIdx.x;
     const unsigned wave = tid >> 6, lane = tid & 63;
 
@@ -1220,29 +1243,41 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
     for (unsigned w = slice; w < n_work; w += nblk) {
         const unsigned sp = w % nsplit;
         const unsigned hg = (w / nsplit) % n_grp;
-        const unsigned b = w / (nsplit * n_grp);
+        const unsigned t = (w / (nsplit * n_grp)) % n_tok; /* query token; always 0 at n_tok=1 */
+        const unsigned b = w / (nsplit * n_grp * n_tok);
         const unsigned h0 = hg * GF; /* the GF consecutive query heads this item carries */
 
         const unsigned len = (unsigned)kv_len[b];
-        const unsigned qpos = len - 1;
-        /* GATHER splits over the fixed top_k selected slots; dense splits over the KV window. */
-        const unsigned first = GATHER ? 0u : ((window && len > window) ? (len - window) : 0u);
-        const unsigned span = GATHER ? top_k : (len - first);
+        /* Query token t of this chunk sits at len-n_tok+t. Decode (n_tok=1) gives len-1. */
+        const unsigned qpos = len - n_tok + t;
+        /* The causal end for THIS query. Dense only: a gathered set is assumed causal already
+         * (the selector produced it), which is why GATHER applies no mask at all below. */
+        const unsigned cend = qpos + 1;
+        /* GATHER splits over the fixed top_k selected slots; dense splits over the KV window,
+         * which for prefill is the per-token window ending at qpos, not at len. */
+        const unsigned first = GATHER ? 0u : ((window && cend > window) ? (cend - window) : 0u);
+        const unsigned span = GATHER ? top_k : (cend - first);
         const unsigned per = (span + nsplit - 1) / nsplit;
         const unsigned lo = first + sp * per;
         const unsigned hi = GATHER ? (lo + per < top_k ? lo + per : top_k)
-                                   : (lo + per < len ? lo + per : len);
+                                   : (lo + per < cend ? lo + per : cend);
 
         /* ONE latent "head": the cache base is just this batch's latent block. */
         const auto* cbase = as_glob(Ckv) + (size_t)b * kv_stride * DK;
         const auto* rbase = as_glob(Krope) + (size_t)b * kv_stride * DR;
-        const int* ibase = GATHER ? idx + (size_t)b * top_k : nullptr; /* selected-index table */
+        /* Selected-index table. One row of top_k per QUERY, so prefill indexes it per (b,t) —
+         * a gathered prefill selects a different set for every query token. Collapses to
+         * `idx + b*top_k` at n_tok=1. */
+        const int* ibase = GATHER ? idx + ((size_t)b * n_tok + t) * top_k : nullptr;
 
-        /* Stage GF absorbed-query rows (DK) and GF rope-query rows (DR), once. */
+        /* Stage GF absorbed-query rows (DK) and GF rope-query rows (DR), once.
+         * Q is [b][t][head][D] — at n_tok=1 the token term vanishes and this is the original
+         * [b][head][D] expression. */
+        const size_t qrow = ((size_t)b * n_tok + t) * n_head;
         for (unsigned i = tid; i < GF * DK; i += PLOW_THREADS)
-            qsm[i] = Qabs[((size_t)b * n_head + h0 + i / DK) * DK + i % DK];
+            qsm[i] = Qabs[(qrow + h0 + i / DK) * DK + i % DK];
         for (unsigned i = tid; i < GF * DR; i += PLOW_THREADS)
-            qrsm[i] = Qrope[((size_t)b * n_head + h0 + i / DR) * DR + i % DR];
+            qrsm[i] = Qrope[(qrow + h0 + i / DR) * DR + i % DR];
         __syncthreads();
 
         float m_st[GF], l_st[GF];
@@ -1385,8 +1420,10 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
             for (int u = 0; u < 8; u++) osm[grp * DK + dbase + u] = oacc[g][u];
             __syncthreads();
 
-            const unsigned h = h0 + (unsigned)g;
-            float* op = Opart + ((size_t)(b * n_head + h) * nsplit + sp) * DK;
+            /* Partials are [b][t][head][split][DK] — again the original [b][head][split][DK]
+             * once n_tok=1. d_flash_merge<DK> and d_o_uv_fold then run per (b,t,head). */
+            const size_t oh = qrow + h0 + (unsigned)g;
+            float* op = Opart + (oh * nsplit + sp) * DK;
             for (unsigned d = tid; d < DK; d += PLOW_THREADS) {
                 float acc = 0.0f;
 #pragma unroll
@@ -1394,12 +1431,73 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
                 op[d] = acc;
             }
             if (tid == 0) {
-                float* ml = mlpart + ((size_t)(b * n_head + h) * nsplit + sp) * 2;
+                float* ml = mlpart + (oh * nsplit + sp) * 2;
                 ml[0] = m_st[g];
                 ml[1] = l_st[g];
             }
         }
     }
+}
+
+/* ============================================================================
+ * MLA PREFILL and GATHERED MLA PREFILL.                              [DEEPSEEK-MLA]
+ *
+ * PLOW_DOP_FLASH_MLA_PREFILL (51) and PLOW_DOP_FLASH_GATHER_PREFILL (55). Until these
+ * landed, Kimi K2.7 / DeepSeek V2-V3 / GLM 5.2 could DECODE on gfx950 but could not
+ * prefill through their own attention — the opcodes were in the ISA and absent from the
+ * AMD switch, so a real prompt had nothing to run. That was the largest functional gap on
+ * the AMD path, and it was not a dtype problem: bf16 MLA prefill was missing too.
+ *
+ * These are wrappers, not kernels. The whole prefill body is d_flash_mla_decode with
+ * n_tok > 1, for the reason its header explains: MLA's absorption removes the per-head K/V
+ * reconstruction that makes a DENSE prefill kernel structurally different from its decode
+ * twin, and the causal mask is already in that loop's `keep`. Writing a second inner loop
+ * here would buy nothing and would be a second thing to keep correct.
+ *
+ * SHAPES (both):
+ *   Qabs   [b][t][n_head][DK]   absorbed query  (W_uk folded in by the emitter)
+ *   Qrope  [b][t][n_head][DR]   rope query
+ *   Ckv    [b][ctx][DK]         latent cache, HEAD-SHARED
+ *   Krope  [b][ctx][DR]         shared rope key, HEAD-SHARED
+ *   Opart  [b][t][n_head][nsplit][DK] + mlpart [..][2]  -> d_flash_merge<DK> -> d_o_uv_fold
+ *   kv_len [b]                  total context INCLUDING this chunk, so query t is at
+ *                               kv_len[b] - n_tok + t
+ *
+ * nsplit MUST be 1 (see d_flash_mla_decode's header: a per-token causal bound makes an
+ * early token's later splits empty, and an empty split emits l=0 for d_flash_merge to
+ * divide by). Prefill has n_tok*n_grp work items and does not need the split anyway.
+ * ==========================================================================*/
+template <int DK, int DR, int GF>
+__device__ void d_flash_mla_prefill(float* __restrict__ Opart, float* __restrict__ mlpart,
+                                    const bf16* __restrict__ Qabs, const bf16* __restrict__ Qrope,
+                                    const bf16* __restrict__ Ckv, const bf16* __restrict__ Krope,
+                                    const int* __restrict__ kv_len, unsigned n_batch,
+                                    unsigned n_tok, unsigned n_head, unsigned kv_stride,
+                                    unsigned window, float scale, unsigned kv_mask, unsigned slice,
+                                    unsigned nblk, float* lds) {
+    d_flash_mla_decode<DK, DR, GF, false>(Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len, n_batch,
+                                          n_head, kv_stride, window, scale, /*nsplit*/ 1, kv_mask,
+                                          slice, nblk, lds, nullptr, 0, n_tok);
+}
+
+/* GATHERED prefill (GLM DSA / DeepSeek sparse attention). `idx` is one top_k row PER QUERY —
+ * [b][t][top_k] — because a sparse prefill selects a different set for every query token,
+ * which is exactly the axis the dense decode gather did not have. The selected set is assumed
+ * causal (the selector produced it), so no mask is applied, matching FLASH_GATHER_DECODE. */
+template <int DK, int DR, int GF>
+__device__ void d_flash_gather_prefill(float* __restrict__ Opart, float* __restrict__ mlpart,
+                                       const bf16* __restrict__ Qabs,
+                                       const bf16* __restrict__ Qrope,
+                                       const bf16* __restrict__ Ckv,
+                                       const bf16* __restrict__ Krope,
+                                       const int* __restrict__ kv_len,
+                                       const int* __restrict__ idx, unsigned top_k,
+                                       unsigned n_batch, unsigned n_tok, unsigned n_head,
+                                       unsigned kv_stride, float scale, unsigned kv_mask,
+                                       unsigned slice, unsigned nblk, float* lds) {
+    d_flash_mla_decode<DK, DR, GF, true>(Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len, n_batch,
+                                         n_head, kv_stride, /*window*/ 0, scale, /*nsplit*/ 1,
+                                         kv_mask, slice, nblk, lds, idx, top_k, n_tok);
 }
 
 /* ============================================================================

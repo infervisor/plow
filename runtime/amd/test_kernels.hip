@@ -164,6 +164,49 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
                      lds);                                                                  \
     }
 
+/* ACTIVATION QUANT — the w8a8 prefill's activation half, and the piece the GEMM_FP8_VARIANT
+ * kernels above cannot test: they take a ready-made ascale, so nothing exercised the per-row
+ * absmax/round path that produces it. (The GEMM itself is already covered by gemm_fp8_c0, whose
+ * 256/256/64 tile is the one the interpreter carries.) */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_quant_fp8_k(
+    unsigned char* xq, const bf16* x, float* ascale, unsigned M, unsigned K) {
+    d_quant_fp8(xq, x, ascale, M, K, blockIdx.x, gridDim.x);
+}
+
+/* MXFP4 (OCP microscaling e2m1 + one E8M0 scale per 32 K) decode GEMV, w4a16.
+ * W is packed 2 fp4/byte (row stride K/2 bytes, low nibble = even k); S is one E8M0 byte per
+ * 32-K block (row stride K/32). The scale is folded into the fp4->bf16 convert and that fold is
+ * EXACT because an MX scale is a power of two — so unlike gemv_fp8_blk there is no dequant
+ * argument and no epilogue multiply. The golden test's job is to confirm that on real silicon. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_gemv_mxfp4_k(
+    bf16* C, const bf16* x, const unsigned char* W, const unsigned char* S, unsigned M,
+    unsigned N, unsigned K) {
+    __shared__ bf16 lds[GM_LDS_HALVES];
+    d_gemv_mxfp4(C, x, W, S, M, N, K, blockIdx.x, gridDim.x, lds);
+}
+
+/* MXFP4 decode fused gate|up GEMV+GLU (w4a16). Gate/up are two fp4 matrices Wg/Wu each with its own
+ * E8M0 scale row Sg/Su; the SwiGLU epilogue fuses act(g)*u (act: 0=silu). Same packed layout and
+ * scale semantics as d_gemv_mxfp4_k (no epilogue dequant — the scale folds into the convert). The
+ * golden test confirms the gate/up fusion + SwiGLU epilogue on real silicon. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_gemv_glu_mxfp4_k(
+    bf16* C, const bf16* x, const unsigned char* Wg, const unsigned char* Wu,
+    const unsigned char* Sg, const unsigned char* Su, unsigned M, unsigned N, unsigned K,
+    unsigned act) {
+    __shared__ bf16 lds[GM_LDS_HALVES];
+    d_gemv_glu_mxfp4(C, x, Wg, Wu, Sg, Su, M, N, K, act, blockIdx.x, gridDim.x, lds);
+}
+
+/* MXFP4 (w4a16) prefill GEMM: bf16 activations A[M,K] x packed fp4 weights W[N,K/2] with E8M0 scale
+ * rows wscale[N,K/32]. Reuses the bf16 wide-K MFMA (only the weight fetch dequants). The golden
+ * confirms the dequant-on-load path and the folded-scale numerics on real silicon. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_gemm_mxfp4_k(
+    bf16* C, const bf16* A, const unsigned char* W, const unsigned char* wscale, unsigned M,
+    unsigned N, unsigned K) {
+    __shared__ bf16 lds[GM_LDS_HALVES];
+    d_gemm_mxfp4(C, A, W, wscale, M, N, K, blockIdx.x, gridDim.x, lds);
+}
+
 /* Block-fp8 (DeepSeek/GLM weight_block_size [128,128]) decode GEMV. wscale is the
  * ceil(N/128) x ceil(K/128) f32 dequant grid. One workgroup (nblk=1, slice=0). */
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemv_fp8_blk(
@@ -279,6 +322,39 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_f
     d_flash_mla_decode<512, 64, GLM_MLA_GF>(Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len, n_batch, n_head,
                                    kv_stride, window, scale, nsplit, PLOW_KV_MASK_NONE, blockIdx.x,
                                    gridDim.x, lds);
+}
+
+/* MLA PREFILL — n_tok queries, per-token causal bound. [DEEPSEEK-MLA]
+ * Emits the SAME (Opart,m,l) partials, now [b][t][head][1][DK] -> gemma_flash_merge_512 +
+ * mla_o_uv_fold_512 per (b,t,head). nsplit is fixed at 1 (see op_attention.h).
+ *
+ * ORACLE NOTE for hardware day: at n_tok=1 this must be BIT-IDENTICAL to
+ * mla_flash_decode_512 with nsplit=1 — same kernel, T=1. Run that equality first; it
+ * validates the whole generalisation against an already-validated kernel before any new
+ * reference is needed. Then check t<n_tok-1 rows against runtime/tests/mla_ref.rs with the
+ * context truncated to len-n_tok+t+1, which is what the causal bound makes them equal to. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_flash_prefill_512(
+    float* Opart, float* mlpart, const bf16* Qabs, const bf16* Qrope, const bf16* Ckv,
+    const bf16* Krope, const int* kv_len, unsigned n_batch, unsigned n_tok, unsigned n_head,
+    unsigned kv_stride, unsigned window, float scale) {
+    __shared__ float lds[FA_MLA_DEC_LDS_FLOATS(512, 64, GLM_MLA_GF)];
+    d_flash_mla_prefill<512, 64, GLM_MLA_GF>(Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len,
+                                             n_batch, n_tok, n_head, kv_stride, window, scale,
+                                             PLOW_KV_MASK_NONE, blockIdx.x, gridDim.x, lds);
+}
+
+/* GATHERED MLA prefill (GLM DSA / DeepSeek sparse). idx is [b][t][top_k] — one selected set
+ * PER QUERY, the axis the decode gather does not have. No mask: the selected set is causal by
+ * construction, matching FLASH_GATHER_DECODE. [DEEPSEEK-MLA] */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_gather_prefill_512(
+    float* Opart, float* mlpart, const bf16* Qabs, const bf16* Qrope, const bf16* Ckv,
+    const bf16* Krope, const int* kv_len, const int* idx, unsigned top_k, unsigned n_batch,
+    unsigned n_tok, unsigned n_head, unsigned kv_stride, float scale) {
+    __shared__ float lds[FA_MLA_DEC_LDS_FLOATS(512, 64, GLM_MLA_GF)];
+    d_flash_gather_prefill<512, 64, GLM_MLA_GF>(Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len,
+                                                idx, top_k, n_batch, n_tok, n_head, kv_stride,
+                                                scale, PLOW_KV_MASK_NONE, blockIdx.x, gridDim.x,
+                                                lds);
 }
 
 /* Head-packed MFMA MLA decode (all heads on the MFMA M-dim; latent read once). Emits the

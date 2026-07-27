@@ -10,7 +10,12 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 R="$REPO/runtime"
 OUT="${1:-${PLOW_BUILD_DIR:-/home/lava/models/dsa_bench}}"
 ARCH="${PLOW_HIP_ARCH:-gfx950}"
-BUN="${PLOW_BUNDLER:-/opt/rocm-7.0.2/lib/llvm/bin/clang-offload-bundler}"
+# Discover the bundler from the INSTALLED ROCm instead of pinning a version. This
+# was pinned to 7.0.2 and the path does not exist on a 7.2.4 box, so the build died
+# on the first machine that had the GPU. $PLOW_BUNDLER still overrides.
+BUN="${PLOW_BUNDLER:-$(ls -1 "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/clang-offload-bundler \
+        "${ROCM_PATH:-/opt/rocm}"/llvm/bin/clang-offload-bundler \
+        /opt/rocm-*/lib/llvm/bin/clang-offload-bundler 2>/dev/null | head -1)}"
 INC="-I$R/amd -I$R/common"
 mkdir -p "$OUT"; cd "$OUT"
 rm -f tk.co test_kernels.elf dsa_bench
