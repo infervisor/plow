@@ -5,6 +5,34 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 option(PLOW_CUDA "Build the CUDA (Hopper/Blackwell) kernel backend" OFF)
+# --- kernel-arm options shared by BOTH nvidia build paths ---------------------
+# Declared here, once, because two consumers read them: the STATIC LIBS the
+# tests link (under `if(PLOW_CUDA)` below) and the SERVED .cubin artifacts
+# (`if(PLOW_SM120_CUBIN)`, further down). They used to be declared only inside
+# the CUDA block while scripts/build_sm120_cubin.sh carried its own hand-written
+# copy of every define set — and the two drifted. See the cubin section's header
+# comment for what that cost.
+#
+# rtx-11 PX-2: PLOW_NV_W8A8 selects the true w8a8 fp8 mma.sync.m16n8k32 prefill
+# path (both operands e4m3 + per-row activation quant) on ALL gemma interp
+# objects, so a w8a8 pkt traces/runs consistently. OFF keeps the w8a16 dequant
+# path.
+option(PLOW_NV_W8A8 "Build the gemma interp objects with the true w8a8 fp8 mma path" OFF)
+# rtx-19 E3: fp8 (e4m3) KV cache. Compiles the HEADNORM_ROPE_FP8 /
+# FLASH_DECODE_FP8 arms into every gemma object so the shared dispatch is
+# consistent decode/prefill/seg. OFF => bf16 KV, byte-identical to HEAD.
+option(PLOW_FP8_KV "Build the gemma interp objects with the fp8 e4m3 KV-cache arms" OFF)
+# beat-fp8-mma: keep the fp8-KV prefill objects on the FAST PIPE=1 build — the
+# FLASH_PREFILL_FP8 op then runs an fp8-mma arm instead of the synchronous PIPE=0
+# staging path. OFF preserves the legacy all-layer fp8-KV PIPE=0 prefill.
+#
+# NO LONGER hd512-only. Until PX-23 the only fast arm was px4 (hd512 FULL layers),
+# so an ALL-LAYER e4m3 packet emitted hd256 FLASH_PREFILL_FP8, trapped, and the
+# whole packet fell to PIPE=0 at ~176 s of prefill per 127k request — the whole of
+# PX-20's measured 7.61x all-fp8 gap. d_flash_prefill_px23<256,64,32> covers hd256
+# now, so BOTH head dims run the fast path and the mixed-packet workaround
+# (PLOW_FP8_KV_FULL=1) is no longer required to avoid the trap.
+option(PLOW_FP8_KV_FASTPF "fp8-KV prefill via the PIPE=1 fp8-mma arms (hd256 px23 + hd512 px4)" OFF)
 option(PLOW_ROCM "Build the ROCm (MI300/MI350) kernel backend" OFF)
 
 # CDNA3 (MI300X/MI325X) and CDNA4 (MI350X/MI355X). Both are compiled into the
@@ -182,36 +210,58 @@ if(PLOW_CUDA)
     # prefill) are register/smem-hungry (217 regs, ~68 KiB smem) so they build SEPARATELY from the
     # 150-reg decode object rather than stacking (rtx-04 §3 / rtx-06 register warning). The prefill
     # object's exported symbols are suffixed `_pf` (PLOW_SYM), so both link into one harness.
-    # rtx-11 PX-2: -DPLOW_NV_W8A8=ON selects the true w8a8 fp8 mma.sync.m16n8k32 prefill path
-    # (both operands e4m3 + per-row activation quant) on ALL gemma interp objects, so a w8a8 pkt
-    # traces/runs consistently. OFF keeps the w8a16 dequant path. Applied to every gemma object so
-    # the shared PLOW_NV_W8A8 dispatch + d_quant_fp8 compile identically across decode/prefill/seg.
-    option(PLOW_NV_W8A8 "Build the gemma interp objects with the true w8a8 fp8 mma path" OFF)
+    # rtx-11 PX-2: -DPLOW_NV_W8A8=ON (declared at the top of this file, shared with the served
+    # cubins) selects the true w8a8 fp8 mma.sync.m16n8k32 prefill path (both operands e4m3 +
+    # per-row activation quant) on ALL gemma interp objects, so a w8a8 pkt traces/runs
+    # consistently. OFF keeps the w8a16 dequant path. Applied to every gemma object so the shared
+    # PLOW_NV_W8A8 dispatch + d_quant_fp8 compile identically across decode/prefill/seg.
     set(PLOW_NV_W8A8_DEFS "")
     if(PLOW_NV_W8A8)
         set(PLOW_NV_W8A8_DEFS PLOW_NV_W8A8=1)
     endif()
 
-    # fp8 (e4m3) KV cache (rtx-19 E3). Compiles the HEADNORM_ROPE_FP8 / FLASH_DECODE_FP8 arms into
-    # every gemma object so the shared dispatch is consistent decode/prefill/seg. OFF => bf16 KV,
+    # fp8 (e4m3) KV cache (rtx-19 E3; PLOW_FP8_KV is declared at the top of this file, shared with
+    # the served cubins). Compiles the HEADNORM_ROPE_FP8 / FLASH_DECODE_FP8 arms into every gemma
+    # object so the shared dispatch is consistent decode/prefill/seg. OFF => bf16 KV,
     # byte-identical to HEAD. Applied via ${PLOW_FP8_KV_DEFS} alongside the w8a8 defs.
-    option(PLOW_FP8_KV "Build the gemma interp objects with the fp8 e4m3 KV-cache arms" OFF)
     set(PLOW_FP8_KV_DEFS "")
     # The prefill-family objects (_pf/_seg/_gemm) additionally need PLOW_NV_FA_PIPE=0 when fp8-KV is
     # on: the FLASH_PREFILL_FP8 arm dequants at the smem stage (cp.async cannot convert fp8 inline),
     # so it only exists on the synchronous-staging (PIPE=0) build and traps under PIPE=1. Decode is
     # PIPE-agnostic. bf16-KV runs use the default (PIPE=1) harness, so this does not affect them.
     set(PLOW_FP8_KV_PF_DEFS "")
-    # beat-fp8-mma: PLOW_FP8_KV_FASTPF keeps the prefill objects on the FAST PIPE=1 build — the
-    # FLASH_PREFILL_FP8 op then runs the px4 fp8-mma arm (hd512 only; pair with mixed-KV packets,
-    # PLOW_FP8_KV_FULL=1). OFF preserves the legacy all-layer fp8-KV PIPE=0 prefill.
-    option(PLOW_FP8_KV_FASTPF "fp8-KV prefill via the PIPE=1 px4 fp8-mma arm (hd512-only packets)" OFF)
+    # beat-fp8-mma: PLOW_FP8_KV_FASTPF (declared at the top of this file, shared with the served
+    # cubins) keeps the prefill objects on the FAST PIPE=1 build — the FLASH_PREFILL_FP8 op then
+    # runs the px4 fp8-mma arm (hd512 only; pair with mixed-KV packets, PLOW_FP8_KV_FULL=1). OFF
+    # preserves the legacy all-layer fp8-KV PIPE=0 prefill.
+    # PX-8: the fp8-mma prefill arm with an e4m3 P.V at BKV=32 (perf-data/px8-flash-fp8-pv.md).
+    # Only meaningful ON TOP OF PLOW_FP8_KV_FASTPF, since it replaces that arm's P.V; it is an
+    # sm_120a-only opcode (the 8-bit transposing ldmatrix) and it changes numerics, so it is OFF
+    # by default and only the prefill-family objects ever see it.
+    option(PLOW_NV_FA_FP8PV "fp8-KV prefill P.V as mma.m16n8k32.e4m3 (needs PLOW_FP8_KV_FASTPF)" OFF)
     if(PLOW_FP8_KV)
         set(PLOW_FP8_KV_DEFS PLOW_FP8_KV=1)
         if(PLOW_FP8_KV_FASTPF)
             set(PLOW_FP8_KV_PF_DEFS PLOW_FP8_KV=1)
+            if(PLOW_NV_FA_FP8PV)
+                list(APPEND PLOW_FP8_KV_PF_DEFS PLOW_NV_FA_FP8PV=1)
+            endif()
         else()
             set(PLOW_FP8_KV_PF_DEFS PLOW_FP8_KV=1 PLOW_NV_FA_PIPE=0)
+            if(PLOW_NV_FA_FP8PV)
+                message(FATAL_ERROR "PLOW_NV_FA_FP8PV needs PLOW_FP8_KV_FASTPF=ON (it replaces "
+                                    "the px4 fp8-mma arm's P.V, and FASTPF=OFF has no such arm)")
+            endif()
+            # Not an error — all-layer fp8-KV packets REQUIRE this path — but it is the slow one
+            # and the cost is invisible at runtime, so say it at configure time. FASTPF cannot be
+            # defaulted ON: legality depends on the PACKET (emit-time PLOW_FP8_KV_FULL=1 keeps
+            # e4m3 to the hd512 layers), which this build cannot see. Measured: 13843 -> 10947 ms,
+            # -21% total prefill at 67k (perf-data/px8-flash-fp8-pv.md).
+            message(WARNING
+                "PLOW_FP8_KV=ON with PLOW_FP8_KV_FASTPF=OFF: the prefill objects fall back to "
+                "PLOW_NV_FA_PIPE=0, losing the cp.async flash pipeline for prefill (-21% at 67k). "
+                "If you emit MIXED fp8-KV packets (PLOW_FP8_KV_FULL=1), set PLOW_FP8_KV_FASTPF=ON. "
+                "Keep it OFF only for legacy all-layer fp8-KV packets, which trap under PIPE=1.")
         endif()
     endif()
 
@@ -262,6 +312,17 @@ if(PLOW_CUDA)
     option(PLOW_NV_TRACE_PF "Instrument the prefill (_pf) object with per-op cycle trace" OFF)
     if(PLOW_NV_TRACE_PF)
         target_compile_definitions(plow_interp_sm120_gemma_pf PRIVATE PLOW_NV_TRACE=1)
+    endif()
+    # PX-6 recommendation A: compile the M=1 GEMV arm into the PREFILL object so a blob emitted
+    # with PLOW_PF_GEMV_HEAD=1 can run lm_head on it instead of the tiled arm (which computes
+    # BM=128 rows to keep 1). Measured 1.991 -> 1.213 ms on the op; +2 registers (236 -> 238),
+    # 0 spill, occupancy unchanged. Only gemv_rows<1> is instantiated, NOT gemv_walk.
+    # With this ON the object carries BOTH arms, so a base-vs-swapped A/B is one binary and two
+    # blobs differing in exactly 5 bytes (the lm_head opcode, one per prefill bucket) — no
+    # register or codegen delta between the two arms of the comparison.
+    option(PLOW_NV_PF_GEMV_HEAD "PX-6 A: M=1 GEMV arm in the prefill object (lm_head)" OFF)
+    if(PLOW_NV_PF_GEMV_HEAD)
+        target_compile_definitions(plow_interp_sm120_gemma_pf PRIVATE PLOW_NV_PF_GEMV_HEAD=1)
     endif()
     set_target_properties(plow_interp_sm120_gemma_pf PROPERTIES
         CUDA_ARCHITECTURES "120a" CUDA_SEPARABLE_COMPILATION OFF POSITION_INDEPENDENT_CODE ON)
@@ -329,11 +390,169 @@ if(PLOW_CUDA)
         plow_interp_sm120_gemma_gemm plow_interp_sm120_gemma_gf8)
 endif()
 
+# --- the SERVED sm_120a cubins ------------------------------------------------
+#
+# `plowrt serve` does not load anything built above: the targets under
+# `if(PLOW_CUDA)` are STATIC LIBS for the C test harnesses. The artifacts serve
+# actually loads are .cubin files, and they were built by a SECOND, independent
+# definition of the same compile — scripts/build_sm120_cubin.sh, which wrote out
+# every object's define set longhand. The two drifted, and the drift was the bug:
+#
+#   * -DPLOW_NV_FA_GF_FULL=4 reached the PLAIN decode object but not its _fp8kv
+#     sibling — the object an fp8-KV asset actually loads — so the served object
+#     silently fell back to GF_FULL=2 and left a measured 1.48x on the floor;
+#   * the fp8-KV PREFILL object hardcoded -DPLOW_NV_FA_PIPE=0, so the
+#     PLOW_FP8_KV_FASTPF option could not reach it at all (a measured 5.4x on a
+#     127k prefill for anyone who rebuilt).
+#
+# Both are the same structural fault: four hand-written define sets, no way for a
+# flag to be checked against its sibling. Here every object's set is DERIVED from
+# ONE base plus two axes (prefill?, fp8-KV?), so a flag physically cannot reach
+# one object and miss the other. scripts/build_sm120_cubin.sh is now a thin
+# wrapper over this target and keeps its old CLI.
+#
+# NOT under enable_language(CUDA), deliberately. Under `nix develop`, CPATH
+# points nvcc's host pass at nix glibc headers that conflict with the CUDA math
+# headers; CMake's CUDA compiler detection fails the same way the compile does.
+# cmake/nvcc_cubin.sh runs nvcc under the same clean `env -i` the script always
+# used, so this configures with no CUDA language support at all. One maintained
+# definition of the build beats CMake purity.
+option(PLOW_SM120_CUBIN "Emit the sm_120a .cubin artifacts `plowrt serve` loads" OFF)
+option(PLOW_SM120_CUBIN_FP8KV "Also emit the _fp8kv cubin variants" OFF)
+
+# GQA fusion factor for the FULL-attention (hd512) flash-decode instantiation.
+# Measured: GF_FULL should equal `gqa` when the full layers have kv_heads == 1
+# (perf-data/px11-flash-decode.md) — Gemma-4 is gqa=8, and the historical 4 is
+# what the shipped assets were built at. This is ONE variable applied to every
+# decode-family object, which is what bug #2 above needed and did not have.
+set(PLOW_NV_FA_GF_FULL "4" CACHE STRING "full-attn (hd512) flash-decode GQA fusion: 1|2|4|8")
+set(PLOW_CUBIN_NVCC "/usr/local/cuda/bin/nvcc" CACHE FILEPATH "nvcc used for the served cubins")
+set(PLOW_CUBIN_ARCH "sm_120a" CACHE STRING "-arch for the served cubins")
+set(PLOW_CUBIN_DIR "${CMAKE_BINARY_DIR}/cubin" CACHE PATH "output directory for the served cubins")
+# Passed through verbatim after the derived set — the decode tuner's sweep knob
+# (scripts/tune_decode_sweep.sh, tuning/README-decode-tuner.md) and the escape
+# hatch for a one-off A/B. Semicolon- or space-separated `-D...` tokens.
+set(PLOW_EXTRA_DEFINES "" CACHE STRING "extra raw nvcc flags appended to every served cubin")
+# Phase D: a generated per-packet `plow_config.h` (devgen::manifest::config_header).
+# Set it and every object below compiles only the arms that packet dispatches to, and
+# stamps the packet's pairing hash so `plowrt` cannot pair it with a different packet.
+# UNSET (the default) => every arm compiles and the objects are byte-identical to what
+# they have always been. See the header block in nvidia/interp_sm120.cu.
+set(PLOW_CUBIN_CONFIG "" CACHE FILEPATH "generated plow_config.h to specialise the cubins for one packet")
+
+if(PLOW_SM120_CUBIN)
+    # An fp8-KV build without FASTPF puts the PREFILL objects on the synchronous
+    # PIPE=0 staging arm. That is correct, and it is slow: measured 175.90 s vs
+    # 32.39 s on a 127k prefill. Say so at configure time rather than let it be
+    # rediscovered as a benchmark regression.
+    if(PLOW_FP8_KV AND NOT PLOW_FP8_KV_FASTPF)
+        message(WARNING
+            "PLOW_FP8_KV=ON without PLOW_FP8_KV_FASTPF: the fp8-KV prefill object is built "
+            "PLOW_NV_FA_PIPE=0 (synchronous smem staging). Measured 5.4x slower on a 127k "
+            "prefill than the FASTPF PIPE=1 fp8-mma arms. Since PX-23 both head dims have a "
+            "fast arm (hd256 px23, hd512 px4/px8), so this no longer needs hd512-only packets "
+            "-- an ALL-LAYER e4m3 packet is served by the fast path end to end.")
+    endif()
+
+    string(REPLACE " " ";" _cubin_extra "${PLOW_EXTRA_DEFINES}")
+    set(_cubin_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/interp_sm120.cu")
+    set(_cubin_inc -I "${CMAKE_CURRENT_SOURCE_DIR}/common" -I "${CMAKE_CURRENT_SOURCE_DIR}/nvidia")
+    set(_cubin_run "${CMAKE_CURRENT_SOURCE_DIR}/cmake/nvcc_cubin.sh")
+
+    # THE ONE BASE. Every interp object below starts from exactly this.
+    set(_cubin_base -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_EMBED_SMEM=1)
+    if(PLOW_NV_W8A8)
+        list(APPEND _cubin_base -DPLOW_NV_W8A8=1)
+    endif()
+    # The generated header rides the BASE, so a specialised build cannot reach one
+    # object and miss its sibling — the same property the axes below give the flags.
+    if(PLOW_CUBIN_CONFIG)
+        get_filename_component(_cfg_dir "${PLOW_CUBIN_CONFIG}" DIRECTORY)
+        get_filename_component(_cfg_name "${PLOW_CUBIN_CONFIG}" NAME)
+        list(APPEND _cubin_base "-DPLOW_CONFIG=\"${_cfg_name}\"")
+        list(APPEND _cubin_inc -I "${_cfg_dir}")
+    endif()
+
+    # AXIS 1 — decode vs prefill. Decode carries the full-attn GF instantiation;
+    # prefill carries the tiled-GEMM + FLASH_PREFILL arms.
+    set(_ax_decode -DPLOW_NV_FA_GF_FULL=${PLOW_NV_FA_GF_FULL})
+    set(_ax_prefill -DPLOW_NV_PREFILL=1)
+    # AXIS 2 — bf16 KV vs fp8 (e4m3) KV. On the PREFILL side fp8-KV also fixes the
+    # staging arm, and it comes from the OPTION, never a literal: FLASH_PREFILL_FP8
+    # dequants at the smem stage (cp.async cannot convert fp8 inline), so PIPE=0 is
+    # the legacy all-layer arm and PIPE=1 is the px4 fp8-mma arm FASTPF selects.
+    set(_ax_fp8kv -DPLOW_FP8_KV=1)
+    if(PLOW_FP8_KV_FASTPF)
+        set(_ax_fp8kv_pf -DPLOW_FP8_KV=1 -DPLOW_NV_FA_PIPE=1)
+    else()
+        set(_ax_fp8kv_pf -DPLOW_FP8_KV=1 -DPLOW_NV_FA_PIPE=0)
+    endif()
+
+    set(_ksym_dec "_Z12interp_sm12011PlowProgram")
+    set(_ksym_pf "_Z15interp_sm120_pf11PlowProgram")
+
+    # THE TABLE: <stem> <kernel symbol> <axis-1 var> [<axis-2 var>]. Nothing below
+    # spells out a define set; every row is base + axes.
+    set(_cubin_rows
+        "interp_sm120|${_ksym_dec}|_ax_decode|"
+        "interp_sm120_pf|${_ksym_pf}|_ax_prefill|")
+    if(PLOW_SM120_CUBIN_FP8KV)
+        list(APPEND _cubin_rows
+            "interp_sm120_fp8kv|${_ksym_dec}|_ax_decode|_ax_fp8kv"
+            "interp_sm120_pf_fp8kv|${_ksym_pf}|_ax_prefill|_ax_fp8kv_pf")
+    endif()
+
+    set(_cubin_outs "")
+    foreach(_row ${_cubin_rows})
+        string(REPLACE "|" ";" _f "${_row}")
+        list(GET _f 0 _stem)
+        list(GET _f 1 _sym)
+        list(GET _f 2 _a1)
+        list(GET _f 3 _a2)
+        set(_defs ${_cubin_base} ${${_a1}})
+        if(_a2)
+            list(APPEND _defs ${${_a2}})
+        endif()
+        set(_out "${PLOW_CUBIN_DIR}/${_stem}.cubin")
+        add_custom_command(OUTPUT "${_out}"
+            COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_out}" "${_sym}" required
+                    -arch=${PLOW_CUBIN_ARCH} -O3 -cubin ${_cubin_inc}
+                    ${_defs} ${_cubin_extra} "${_cubin_src}"
+            DEPENDS "${_cubin_src}" "${_cubin_run}"
+            COMMENT "nvcc ${_stem}.cubin (${_defs})"
+            VERBATIM)
+        list(APPEND _cubin_outs "${_out}")
+    endforeach()
+
+    # The device stochastic sampler is NOT the megakernel and shares none of its
+    # defines, so it is not a row in the table above. A failure here is non-fatal:
+    # serving falls back to host sampling (hence `optional`).
+    set(_smp_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/sample_sm120.cu")
+    if(EXISTS "${_smp_src}")
+        set(_smp_out "${PLOW_CUBIN_DIR}/sample_sm120.cubin")
+        add_custom_command(OUTPUT "${_smp_out}"
+            COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_smp_out}" plow_sample optional
+                    -arch=${PLOW_CUBIN_ARCH} -O3 -cubin "${_smp_src}"
+            DEPENDS "${_smp_src}" "${_cubin_run}"
+            COMMENT "nvcc sample_sm120.cubin"
+            VERBATIM)
+        list(APPEND _cubin_outs "${_smp_out}")
+    endif()
+
+    add_custom_target(sm120_cubins ALL DEPENDS ${_cubin_outs})
+endif()
+
 if(PLOW_ROCM)
     enable_language(HIP)
     # The gfx950 device code is compiled to a RAW code object and loaded through
     # ROCr by amd/hsa_backend.c — it is not linked into this plugin. hipcc is used
-    # purely as a compiler here; see the plow_gfx950_code_object target below.
+    # purely as a compiler here.
+    #
+    # The AMD MEGAKERNEL (amd/interp.hip + amd/op_*.h -- the AMD production path)
+    # has NO CMake target. It is built only by scripts/build_gfx950.sh and
+    # build_gfx950_qwen.sh via `hipcc --genco` + `clang-offload-bundler --unbundle`,
+    # and loaded through ROCr by amd/hsa_backend.c. This comment used to point at a
+    # `plow_gfx950_code_object` target "below"; no such target exists in this file.
     #
     # NOTE (dead code): amd/{mfma,flash,row,golden}.hip and amd/register_mi300.hip
     # are the pre-existing CDNA3 golden/stub tier. mfma.hip is 14 empty TODO

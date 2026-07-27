@@ -81,6 +81,9 @@ pub async fn chat_completions(
     if let Some(p) = req.top_p {
         gen.params.top_p = p;
     }
+    if let Some(ignore) = req.ignore_eos {
+        gen.ignore_eos = ignore;
+    }
 
     // Route to the per-model muxer. Tokens stream back as `StreamChunk`s over
     // an mpsc — the muxer produces one per generated token, ending with `Done`.

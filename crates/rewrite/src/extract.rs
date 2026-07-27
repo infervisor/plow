@@ -75,6 +75,70 @@ pub(crate) fn is_fused(op: &str) -> bool {
     )
 }
 
+/// egglog's tree-additive cost, in **arbitrary precision** — the ONLY change
+/// from the default is that the accumulator cannot overflow.
+///
+/// # The bug this fixes
+///
+/// `TreeAdditiveCostModel` sums its children, and [`egglog::extract::Cost`] for
+/// every integer type combines with `saturating_add`
+/// (`egglog-2.0.0/src/extract.rs:70`). Tree cost is not DAG cost: a residual
+/// stream references its hidden state ~8× per layer (q/k/v read the normed
+/// hidden; the sandwich norm and the residual add each read the stream), so the
+/// *tree* unfolding of layer `L` costs ~8^L even though the DAG is linear in
+/// `L`. That crosses `u64::MAX` around **layer 21**.
+///
+/// Past that point every e-class on the residual chain is pinned at
+/// `u64::MAX`, so `new_cost < *e.get()` is never true again and Bellman-Ford's
+/// `topo_rnk` stops advancing in step with the costs. `save_best_parent_edge`
+/// then requires `target_topo_rnk > compute_topo_rnk_hyperedge(row)` to record
+/// a parent edge; that test fails for *every* e-node feeding some e-class, and
+/// reconstruction hits `parent_edge…get(&value).unwrap()` on `None`
+/// (`extract.rs:471`). With `panic = "abort"` in the release profile that is
+/// process death — which is why `explore_stats` exists as a saturate-only
+/// analysis path and why the devblob emitter never calls `rewrite_graph`.
+///
+/// Bisected against the real Gemma-4-12B text config: extraction succeeds at
+/// 1, 2, 3, 4, 6, 8, 12 and 16 layers and aborts at 24 and 48. It is a *scale*
+/// bug, not a graph-shape bug — and 48 layers is the model plow serves.
+///
+/// # Why `BigInt` and not a different cost function
+///
+/// Deliberately surgical. A cheaper-to-compute bounded cost (e.g. critical-path
+/// depth, `max` instead of `+`) also cannot overflow, but it *re-ranks the
+/// fusion space*: measured, it flips the `pre_feedforward_norm` site from
+/// `FusedResidualNorm` to two `FusedNormLinear`s, because depth cost cannot see
+/// that the latter recomputes the norm once per consumer. That is a design
+/// change to the rewrite's objective, not a bug fix, and it broke six
+/// `fuse_all_models` expectations. `BigInt` reproduces the default's extraction
+/// decisions *exactly* wherever the default did not overflow, so every existing
+/// test keeps passing and the only behavioural delta is that 24+ layer models
+/// now extract instead of aborting.
+///
+/// Exactness note: `schema.egg` declares no `:cost` on any constructor
+/// (verified — `grep -c :cost` is 0 across all three `egl/*.egg` files), so
+/// `TreeAdditiveCostModel::enode_cost`'s `func.decl.cost.unwrap_or(1)` is
+/// uniformly `1`. `Function::decl` is private in egglog 2.0.0, so a head weight
+/// of `1` here is not an approximation — it is the same number.
+///
+/// Cost: ~143 bits (3 limbs) at 48 layers over a ~4k-node e-graph. Immaterial.
+struct BigTreeAdditiveCost;
+
+impl egglog::extract::CostModel<num::BigInt> for BigTreeAdditiveCost {
+    fn fold(&self, _head: &str, children: &[num::BigInt], head_cost: num::BigInt) -> num::BigInt {
+        children.iter().fold(head_cost, |s, c| s + c)
+    }
+
+    fn enode_cost(
+        &self,
+        _egraph: &egglog::EGraph,
+        _func: &egglog::Function,
+        _row: &egglog::FunctionRow,
+    ) -> num::BigInt {
+        num::BigInt::from(1)
+    }
+}
+
 /// Build the full egglog program, run it, and extract the fused graph.
 pub fn run(schema: &str, rules: &str, lets: &str, root: &str) -> Result<FusedGraph, ExtractError> {
     // Two deliberate choices, both load-bearing for memory:
@@ -101,9 +165,19 @@ pub fn run(schema: &str, rules: &str, lets: &str, root: &str) -> Result<FusedGra
     let (sort, value) = egraph
         .eval_expr(&egglog::prelude::exprs::var(root))
         .map_err(|e| ExtractError::Egglog(e.to_string()))?;
-    let (termdag, tid, _cost) = egraph
-        .extract_value(&sort, value)
-        .map_err(|e| ExtractError::Egglog(e.to_string()))?;
+    // Extract under `BigTreeAdditiveCost` rather than egglog's default. Same
+    // cost function, arbitrary precision: see [`BigTreeAdditiveCost`] — the
+    // default saturates `u64` on any residual model past ~21 layers and then
+    // aborts the process during reconstruction.
+    let extractor = egglog::extract::Extractor::<num::BigInt>::compute_costs_from_rootsorts(
+        Some(vec![sort.clone()]),
+        &egraph,
+        BigTreeAdditiveCost,
+    );
+    let mut termdag = egglog::TermDag::default();
+    let (_cost, tid) = extractor
+        .extract_best_with_sort(&egraph, &mut termdag, value, sort)
+        .ok_or_else(|| ExtractError::Egglog("no extractable term for the graph root".into()))?;
     term_to_graph(&termdag, tid)
 }
 

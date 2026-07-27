@@ -70,14 +70,30 @@ mod packlog {
     static PREFILL_TICKS: AtomicU64 = AtomicU64::new(0);
     static DECODE_TICKS: AtomicU64 = AtomicU64::new(0);
     static TICKS: AtomicU64 = AtomicU64::new(0);
+    /// Decode-launch wall spent on ticks that ALSO ran a prefill chunk. This is
+    /// exactly the wall a fused prefill⊕decode launch could address (PX-17):
+    /// on a pure-decode tick there is no prefill launch to fold into.
+    static MIXED_DECODE_NS: AtomicU64 = AtomicU64::new(0);
+    static MIXED_TICKS: AtomicU64 = AtomicU64::new(0);
+    /// Σ decode rows over mixed ticks / over all decode ticks — the fused tile
+    /// would have to reserve `rows` of the prefill bucket.
+    static MIXED_ROWS: AtomicU64 = AtomicU64::new(0);
+    static DECODE_ROWS: AtomicU64 = AtomicU64::new(0);
 
     crate::env_flag!(pub fn on, "PLOW_PF_PACKLOG");
 
     /// Record one GPU tick's prefill-pass and decode-launch wall times (ns).
-    /// `did_prefill`/`did_decode` count how many ticks touched each phase.
-    /// Emits a cumulative summary every 1000 ticks; the bench slices the log
-    /// by line-count brackets to get per-cell deltas.
-    pub fn record(prefill_ns: u64, decode_ns: u64, did_prefill: bool, did_decode: bool) {
+    /// `did_prefill`/`did_decode` count how many ticks touched each phase, and
+    /// `rows` is the decode batch this tick fed. Emits a cumulative summary
+    /// every 250 ticks; the bench slices the log by line-count brackets to get
+    /// per-cell deltas.
+    pub fn record(
+        prefill_ns: u64,
+        decode_ns: u64,
+        did_prefill: bool,
+        did_decode: bool,
+        rows: usize,
+    ) {
         PREFILL_NS.fetch_add(prefill_ns, Ordering::Relaxed);
         DECODE_NS.fetch_add(decode_ns, Ordering::Relaxed);
         if did_prefill {
@@ -85,24 +101,42 @@ mod packlog {
         }
         if did_decode {
             DECODE_TICKS.fetch_add(1, Ordering::Relaxed);
+            DECODE_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+            if did_prefill {
+                MIXED_DECODE_NS.fetch_add(decode_ns, Ordering::Relaxed);
+                MIXED_TICKS.fetch_add(1, Ordering::Relaxed);
+                MIXED_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+            }
         }
         let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 1000 == 0 {
+        if n % 250 == 0 {
             emit();
         }
     }
 
     fn emit() {
         eprintln!(
-            "PACKLOG WALL prefill_ns={} decode_ns={} prefill_ticks={} decode_ticks={} ticks={}",
+            "PACKLOG WALL prefill_ns={} decode_ns={} prefill_ticks={} decode_ticks={} ticks={} \
+             mixed_decode_ns={} mixed_ticks={} mixed_rows={} decode_rows={}",
             PREFILL_NS.load(Ordering::Relaxed),
             DECODE_NS.load(Ordering::Relaxed),
             PREFILL_TICKS.load(Ordering::Relaxed),
             DECODE_TICKS.load(Ordering::Relaxed),
             TICKS.load(Ordering::Relaxed),
+            MIXED_DECODE_NS.load(Ordering::Relaxed),
+            MIXED_TICKS.load(Ordering::Relaxed),
+            MIXED_ROWS.load(Ordering::Relaxed),
+            DECODE_ROWS.load(Ordering::Relaxed),
         );
     }
 }
+
+/// Admission sheds only when the predicted wait exceeds this many ticks of the
+/// engine's observed service time (or the configured `slo_ms` floor, whichever
+/// is larger). 8 was chosen to clear the worst spurious shed observed — a B=32
+/// Gemma-4-12B blob at `predicted_wait_ms=329` against `service_ms≈58` (5.7
+/// ticks) — with margin, while still catching a genuinely wedged queue.
+const SLO_SERVICE_TICKS: f64 = 8.0;
 
 /// Dispatcher config. Cold-path — set once at startup from CLI flags.
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +146,9 @@ pub struct MuxConfig {
     /// draining, the hot path never sleeps.
     pub max_hold_ms: f64,
     /// SLO used by admission (predicted wait above this sheds the request).
+    /// Treated as a FLOOR: the effective SLO is
+    /// `max(slo_ms, SLO_SERVICE_TICKS * service_ms)` so it scales with the
+    /// decode batch instead of shedding every request on a wide blob.
     pub slo_ms: f64,
     /// Enable multi-step decode: produce `n` tokens per tick (SGLang overlap
     /// scheduling). Steps scale inversely with batch size — small batches are
@@ -496,14 +533,27 @@ pub fn spawn(
             // under the SLO). Proven on GPU: b16 8-way passes token-identity
             // with the shed off, sheds to 1 token/req with it on.
             let predicted_wait = predicted_wait_ms(live, capacity, load.service_ms.get());
-            match admit(util, predicted_wait, cfg.slo_ms, true) {
+            // A FLAT SLO cannot be right across decode batches. `service_ms` is
+            // one tick of real work and grows with B (measured Gemma-4-12B:
+            // 22 ms at B=8, 26 ms at B=16, 58 ms at B=32), so a constant 250 ms
+            // silently becomes "shed everything" as the blob gets wider — a
+            // B=32 blob 429'd every request at `predicted_wait_ms=329` with a
+            // single live stream, and `vllm bench` reports those 429s as
+            // SUCCESSFUL requests, which reads as a 2592 tok/s result. Floor the
+            // SLO at a few ticks of the service time the engine actually shows,
+            // so the knob keeps its meaning (a user waiting far longer than
+            // normal) instead of tracking the blob's width.
+            let slo = cfg.slo_ms.max(SLO_SERVICE_TICKS * load.service_ms.get());
+            match admit(util, predicted_wait, slo, true) {
                 Admit::Shed => {
                     Metrics::add(&metrics.admit_shed, live as u64);
                     tracing::warn!(
                         %slug,
                         live,
                         predicted_wait_ms = predicted_wait,
-                        slo_ms = cfg.slo_ms,
+                        slo_ms = slo,
+                        slo_ms_configured = cfg.slo_ms,
+                        service_ms = load.service_ms.get(),
                         util,
                         "admission shed: dropping every live slot (429 to each)"
                     );
@@ -852,6 +902,14 @@ fn run_one_tick(
             })
             .collect();
 
+        // PX-17: throughput mode — while any slot is mid-prefill, drop the decode
+        // feeds so the prefill chain runs uninterrupted and no decode launch pays
+        // its fixed cost at a partial batch. Every deferred row is picked up by a
+        // full-batch decode tick once prefill drains.
+        if pf_defer_decode() && did_prefill {
+            feeds.clear();
+        }
+
         let pack_t = packlog::on().then(Instant::now);
         if e.pf_batch_enabled() {
             // PX-1 cross-request batched prefill: pack every waiting request's
@@ -1031,7 +1089,13 @@ fn run_one_tick(
                 }
                 obs.host.slot_tokens = toks;
                 if let Some(dt) = dec_t {
-                    packlog::record(pack_prefill_ns, dt.elapsed().as_nanos() as u64, did_prefill, pack_had_feeds);
+                    packlog::record(
+                        pack_prefill_ns,
+                        dt.elapsed().as_nanos() as u64,
+                        did_prefill,
+                        pack_had_feeds,
+                        feeds.len(),
+                    );
                 }
                 return (slots, bufs, obs, tokens_this_tick, did_prefill);
             }
@@ -1120,6 +1184,7 @@ fn run_one_tick(
                 dt.elapsed().as_nanos() as u64,
                 did_prefill,
                 pack_had_feeds,
+                feeds.len(),
             );
         }
         return (slots, bufs, obs, tokens_this_tick, did_prefill);
@@ -1338,6 +1403,32 @@ fn pf_interleave_rows() -> usize {
         } else {
             rows
         }
+    })
+}
+
+/// PX-17 throughput mode: with `PLOW_PF_DEFER_DECODE=1`, a tick that still has
+/// ANY slot mid-prefill runs its prefill chain to completion and skips the
+/// decode launch entirely, so every decode tick later runs at the full batch.
+///
+/// This is the scheduler-only bound on what prefill⊕decode FUSION can win. A
+/// decode launch costs `a + b*B` — `a` (the 12 GiB weight re-read plus launch
+/// turnaround) is paid whatever `B` is. Interleaving spends `a` on ~992 ticks at
+/// an average `B` well under the engine batch; deferring spends it on the
+/// minimum number of full-batch ticks instead. Fusion attacks the same `a` from
+/// the other side (fold it into the prefill launch that is running anyway), so
+/// the two bound each other.
+///
+/// Costs streaming latency: no token leaves the server until every prompt is
+/// resident. Off by default — this is a measurement/throughput knob, not a
+/// serving default.
+#[cfg(feature = "cuda")]
+fn pf_defer_decode() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("PLOW_PF_DEFER_DECODE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
     })
 }
 
@@ -1692,10 +1783,11 @@ fn handle_produced_token(
 
     // Stop conditions: the model's eos set when known (GPU path), else the
     // reference path's newline-byte heuristic; and max_tokens.
-    let stop_token = match stop_ids {
-        Some(ids) => ids.contains(&token),
-        None => token % 256 == u32::from(b'\n'),
-    };
+    let stop_token = !slot.gen.ignore_eos
+        && match stop_ids {
+            Some(ids) => ids.contains(&token),
+            None => token % 256 == u32::from(b'\n'),
+        };
     let stop_max = slot.step >= slot.gen.max_tokens.max(1);
     if stop_token || stop_max {
         let reason = if stop_max && !stop_token {

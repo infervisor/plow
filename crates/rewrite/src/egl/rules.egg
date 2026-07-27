@@ -6,8 +6,16 @@
 ; so a rule without an annotation fails compilation with --lean-verify, and a
 ; rule whose name has no Lean `rule_*` theorem fails checkpoint A.
 
-; === Cost annotations: fused nodes are always preferred over unfused forms ===
-; (Lower cost = preferred at extraction.)
+; === Extraction cost ===
+; There are deliberately NO `:cost` annotations in this file or in schema.egg.
+; Extraction runs on egglog's tree-additive cost with a uniform head weight of
+; 1, so a fused target wins because it has strictly fewer e-nodes than the form
+; it replaces — no annotation is needed to express that.
+;
+; This section previously claimed to contain cost annotations and did not. If
+; you add one, note that `extract::BigTreeAdditiveCost` hardcodes the head
+; weight to 1: `egglog::Function::decl` is private in egglog 2.0.0, so a
+; `:cost` here would be silently IGNORED. Teach the Rust cost model first.
 
 ; === Norm→Linear fusions ===
 

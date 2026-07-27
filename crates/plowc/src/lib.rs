@@ -7,11 +7,21 @@
 //! driver that wires them and writes the artifacts:
 //!
 //! ```text
-//! build graph ─▶ rewrite (fuse) ─▶ plan_from_all_blocks ─┐
-//!   net config ─────────────────────────────────────────┤
-//!                                                        ▼
+//! build graph ─▶ plan_from_all_blocks ─┐
+//!   net config ─────────────────────────┤
+//!                                       ▼
 //!     assemble(soc) ─▶ compile_buckets ─▶ emit_program ─▶ *.pkt + weights.json
+//!
+//!            └▶ rewrite (fuse) ─▶ RewriteStats     [ANALYSIS ONLY — dropped]
 //! ```
+//!
+//! **`rewrite` is not in the emit path.** `plan_from_all_blocks` lowers the
+//! RAW `nn_graph::Graph`; the `FusedGraph` is computed for its statistics and
+//! discarded (see the call site below). `plan_from_fused` — the only bridge
+//! that consumes a fused term — has no production caller, and the devblob
+//! emitter (`devgen`) has no dependency on `rewrite` at all, so **no egglog
+//! rewrite reaches a GPU**. Measured coverage on Gemma-4-12B: 0 of 1156 ops
+//! and 0 of 24,226 GFLOP. See `perf-data/px18-egglog-wholemodel.md`.
 //!
 //! HuggingFace models bake **every** transformer block into one plan so
 //! `assemble` can chain fine-grained tile-dependencies across block boundaries

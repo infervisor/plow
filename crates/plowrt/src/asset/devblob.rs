@@ -483,9 +483,14 @@ mod tests {
             tensors: Vec::new(),
             gq_stream: vec![se(0, 0), se(0, 1), se(1, 0), se(1, 1)],
             gq_seg_ofs: vec![0, 4],
+            // Unplaced: `seg` is a wave-class, not an L2 domain (PLOW_NV_PLACE).
+            l2_sms: 0,
+            l2_domains: 0,
         };
         Model {
             n_cu: 2,
+            // Unspecified target GPU ⇒ the runtime skips the mismatch warning.
+            target: 0,
             tensors: vec![
                 TensorDecl {
                     name: "in.ids".into(),

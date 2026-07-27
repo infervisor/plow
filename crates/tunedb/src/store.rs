@@ -481,6 +481,7 @@ mod tests {
                 n_cu,
                 ctx_bucket: crate::decode::CtxBucket::of(ctx),
                 model: "gemma-4-26B-A4B-it".into(),
+                batch: 1,
             },
             knobs: crate::decode::DecodeKnobs {
                 extra_defines: Default::default(),
@@ -491,6 +492,7 @@ mod tests {
                 gv_unroll_glu: 0,
                 gv_moe_un: 2,
                 moe_down_sg: 4,
+                gv_mm_max: None,
                 ns_abs: 16,
                 fa_wpr: None,
                 fa_gf: None,

@@ -6,6 +6,7 @@
 //!   block_run <asset-dir> check [--in x.npy] [--out y.npy] [--ctx T]
 //!   block_run <asset-dir> bench --batch 1,2,4,8 --ctx 128,512,1024,4096
 //!                              [--iters 100] [--warmup 10] [--prefill-iters 10]
+//!                              [--pf-chunk N]
 //!
 //! `check` feeds a hidden-state into `act.x` (an .npy or a seeded synthetic),
 //! launches one prefill bucket, reads `act.x` back, and prints shape / min /
@@ -289,6 +290,23 @@ mod cuda {
         // Prefill is far more expensive per pass than a decode step, so it gets
         // its own (smaller) iteration count.
         let pf_iters: usize = flag("--prefill-iters").and_then(|s| s.parse().ok()).unwrap_or(10);
+        // Rows of `act.x` uploaded before a prefill pass.
+        //
+        // `act.x` is sized by the packet's LARGEST PREFILL BUCKET, not by
+        // max_ctx — on a 12B block that is 8192 rows — so uploading a full
+        // ctx=32768 hidden state is rejected outright and the block simply
+        // cannot be benched above the bucket. Capping the upload lets
+        // `prefill_slot` chunk the prompt as it always does, and the KV cache
+        // still grows to the full ctx, which is the only thing the decode-step
+        // timing depends on.
+        //
+        // What this costs: chunks past the first read whatever act.x already
+        // holds. That is not a new compromise — the header already says the
+        // isolated block has no upstream and its tokens are meaningless — and
+        // per-step kernel time stays data-independent, which is what makes the
+        // sweep metric valid. It is still a hard rule that NOTHING numeric may
+        // be read out of a run using this.
+        let pf_chunk: Option<usize> = flag("--pf-chunk").and_then(|s| s.parse().ok());
         let cap = e.batch();
 
         let mut rows = Vec::new();
@@ -305,7 +323,7 @@ mod cuda {
                 // Prefill each of `bsz` slots to a T-row context (seeded act.x so
                 // every run is comparable; numerics irrelevant to step time).
                 let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
-                let xin = synth(t, hidden);
+                let xin = synth(pf_chunk.map_or(t, |c| c.min(t)), hidden);
                 let mut last = vec![0u32; bsz];
                 let need = t + iters + warmup + 2;
 

@@ -23,6 +23,63 @@
  */
 #include "dev_isa.h"
 
+/* ---- OPTIONAL per-packet arm selection (plow_config.h) ---------------------------------
+ * -DPLOW_CONFIG='"plow_config.h"' includes a header devgen generated FROM THE EMITTED
+ * INSTRUCTION STREAM of one packet (crates/devgen/src/manifest.rs). It carries a presence
+ * macro per opcode plus the rule-derived shape constants (GV_MM_MAX, PLOW_NV_FA_GF_FULL),
+ * so an object can compile exactly the bodies its packet dispatches to instead of the worst
+ * case over every arm the megakernel knows.
+ *
+ * That matters because the interpreter INLINES every arm: its register and smem footprint is
+ * the maximum over what is compiled in, not over what runs. See the MEASURED PAYOFF table at
+ * the PLOW_NV_MLA/_MAMBA/_DSA defaults below for the per-arch numbers. The short version: on
+ * BOTH arches this buys cubin SIZE, smem and stack — it does NOT buy occupancy, and on sm_120a
+ * the register ceiling is not even monotone in what you delete.
+ *
+ * TWO RULES, and they are what make this safe to have on:
+ *  1. ABSENT the header, every PLOW_HAS_* below defaults to 1 — every arm compiles and the
+ *     object is byte-for-byte what it always was. Nothing about the default build changes.
+ *  2. The generated header #ifndef-guards every macro, so an explicit -D on the command line
+ *     still wins. The ~60 hand-maintained knobs remain usable as A/B controls; the header
+ *     only supplies values nothing else set.
+ *
+ * A specialised object is NO LONGER INTERCHANGEABLE — it holds one packet's arms — so it
+ * stamps PLOW_PACKET_HASH (below, next to plow_arena_bytes) and the loader refuses to run a
+ * packet whose hash differs. Without that check, specialisation would convert today's loud
+ * first-launch `default: __trap()` into a trap MID-SERVE on whichever bucket needs the arm
+ * that was dropped, which is strictly worse than the problem it solves. */
+#ifdef PLOW_CONFIG
+#include PLOW_CONFIG
+#endif
+#ifndef PLOW_PACKET_HASH
+/* 0 = a GENERAL object: built with every arm, pairs with any packet. */
+#define PLOW_PACKET_HASH 0ull
+#endif
+/* Defaults for the arms gated below. `1` = compile it, which is the pre-existing behaviour. */
+#ifndef PLOW_HAS_GEMV_FP8
+#define PLOW_HAS_GEMV_FP8 1
+#endif
+#ifndef PLOW_HAS_GEMV_GLU_FP8
+#define PLOW_HAS_GEMV_GLU_FP8 1
+#endif
+#ifndef PLOW_HAS_DENSE_GLU_FP8_BLK
+#define PLOW_HAS_DENSE_GLU_FP8_BLK 1
+#endif
+#ifndef PLOW_HAS_GEMV_FP8_BLK
+#define PLOW_HAS_GEMV_FP8_BLK 1
+#endif
+#ifndef PLOW_HAS_MOE_ROUTER_GEMMA
+#define PLOW_HAS_MOE_ROUTER_GEMMA 1
+#endif
+#ifndef PLOW_HAS_MOE_EXPERT_GLU_GEMMA
+#define PLOW_HAS_MOE_EXPERT_GLU_GEMMA 1
+#endif
+/* The Gemma decode MoE family is all-or-nothing per model: a dense checkpoint emits none of
+ * the router/expert/combine ops, a sparse one emits the whole family. Deriving the block gate
+ * from two members rather than adding a fourteenth macro keeps the header honest — every
+ * macro in it names a real opcode. */
+#define PLOW_HAS_MOE_GEMMA (PLOW_HAS_MOE_ROUTER_GEMMA || PLOW_HAS_MOE_EXPERT_GLU_GEMMA)
+
 /* T10 occ-2 arena trim. The lean GEMM segment object must fit 2 blocks/SM under the 100 KiB
  * dynamic-smem cap. The default GEMM arena is 60 KiB (PGM_STAGES=3 plain / GLU_STAGES=2), so 2x =
  * 120 KiB > 100 KiB and ptxas caps occupancy at 1 (SMEM-bound, NOT register-bound — the register
@@ -388,13 +445,34 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
  * serving objects it builds. A gated-out opcode falls through to `default: __trap()`, so a
  * mis-targeted packet fails loudly rather than silently emitting zeros.
  *
- * MEASURED PAYOFF (arm ablation, sm_90a): these do NOT relieve the PREFILL REG=255 ceiling — that
- * is owned by the LIVE Hopper wgmma GEMM arms (d_gemm_sm90 / d_gemm_w8a8_sm90 / d_gemm_glu_sm90),
- * each of which rounds to 255 in the megakernel regardless. What they buy is size and stack:
- *   DECODE: MLA is ~44% of the cubin (2.46 MB -> 1.42 MB) and owns the decode REG ceiling
- *           (208 -> 188, occupancy-neutral: both are 1 block/SM). DSA/MAMBA trim a little more.
- *   PREFILL: MAMBA owns the stack frame (1744 -> 688 B). MLA/DSA are not compiled into prefill
- *            (they sit behind `#if !PLOW_NV_PREFILL`), so their flags are no-ops there. */
+ * MEASURED PAYOFF. THE NUMBERS ARE PER-ARCH AND THEY DO NOT TRANSFER — quote the right row.
+ * Both tables are ptxas -v on the megakernel symbol alone, CUDA 13.0, -O3 -cubin.
+ *
+ * sm_90a (interp_sm90a.cu, base -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2; decode -DPLOW_NV_FA_GF_FULL=4).
+ * These do NOT relieve the PREFILL REG=255 ceiling — that is owned by the LIVE Hopper wgmma GEMM
+ * arms (d_gemm_sm90 / d_gemm_w8a8_sm90 / d_gemm_glu_sm90), each of which rounds to 255 regardless:
+ *   DECODE:  base 208 regs / 2192 B smem / 1024 B stack / 2,457,864 B cubin
+ *            MLA=0        188 regs        2192          1024        1,407,496  (-43% cubin)
+ *            all three=0  177 regs        1168             0        1,394,696
+ *   PREFILL: base 255 regs / 2320 B smem / 1744 B stack /   715,400 B cubin
+ *            all three=0  255 regs        2320           672          665,992
+ *
+ * sm_120a (this file, base -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_EMBED_SMEM=1):
+ *   DECODE:  base 241 regs / 2192 B smem / 1024 B stack / 2,804,312 B cubin
+ *            MLA=0        224 regs        2192          1024        1,873,376  (-33% cubin)
+ *            MAMBA=0      239 regs        2192             0        2,744,984
+ *            DSA=0        250 regs        1168          1024        2,777,944  <- REGS GET WORSE
+ *            all three=0  229 regs        1168             0        1,786,608  (-36% cubin)
+ *   PREFILL: base 238 regs / 2320 B smem / 1024 B stack /   720,120 B cubin
+ *            MLA=0 and DSA=0 are BIT-IDENTICAL to base — neither is compiled into prefill (both
+ *            sit behind `#if !PLOW_NV_PREFILL`), so their flags are genuinely no-ops there.
+ *            MAMBA=0      240 regs        2320             0          660,112  <- REGS GET WORSE
+ *
+ * READ THIS BEFORE CLAIMING A SPEEDUP. On sm_120a NONE of these changes occupancy: 229 regs is
+ * still 1 block/SM (occ 2 at 256 threads needs <=128 regs/thread), and register allocation is not
+ * monotone in what you delete — dropping DSA costs 9 regs on decode and dropping MAMBA costs 2 on
+ * prefill. The justification for gating is cubin size (module load time), smem headroom and the
+ * stack frame — not throughput. */
 #ifndef PLOW_NV_MLA
 #define PLOW_NV_MLA 1
 #endif
@@ -523,6 +601,24 @@ extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes) = PLOW_NV_ARENA_FLOATS
  * plowrt-gpu-exec-critical-path stage 2). Absent on older cubins → the engine
  * keeps the legacy per-token patch. */
 extern "C" __device__ unsigned PLOW_SYM(plow_dyn_kvrow) = 1;
+/* PAIRING STAMP (cuModuleGetGlobal, like plow_arena_bytes). Present ONLY on a SPECIALISED
+ * object — one built -DPLOW_CONFIG=... from a single packet's build.json, carrying just that
+ * packet's arms. Such an object is not interchangeable, so `plowrt` refuses to start when the
+ * packet beside it hashes differently, naming what differs.
+ *
+ * ABSENT on a general object, deliberately: every arm is compiled, so it pairs with any
+ * packet, and emitting a symbol whose value is always 0 would change the bytes of every cubin
+ * shipped today for no information. Absent symbol reads as "unconstrained" — the same
+ * convention plow_arena_bytes already uses for pre-metadata cubins.
+ *
+ * Two 32-bit halves: module_global_u32 is the reader the engine already has, and a u64 device
+ * global would need a second accessor for nothing. */
+#if PLOW_PACKET_HASH != 0ull
+extern "C" __device__ unsigned PLOW_SYM(plow_packet_hash_lo) =
+    (unsigned)(PLOW_PACKET_HASH & 0xFFFFFFFFull);
+extern "C" __device__ unsigned PLOW_SYM(plow_packet_hash_hi) =
+    (unsigned)((PLOW_PACKET_HASH >> 32) & 0xFFFFFFFFull);
+#endif
 #endif
 
 /* ---- the op dispatch -------------------------------------------------------------------
@@ -753,11 +849,28 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     case PLOW_DOP_FLASH_PREFILL_FP8:
 #if PLOW_NV_FA_PIPE
 #if PLOW_NV_FA_FP8MMA && PLOW_FP8_KV
-        /* beat-fp8-mma: the PIPE=1 fp8 prefill IS the px4 fp8-mma arm — hd512 FULL layers only
-         * (mixed fp8-KV packets, PLOW_FP8_KV_FULL=1, never emit hd256 fp8 prefill; a legacy
-         * all-layer fp8-KV packet on this object traps loudly rather than reading garbage). */
-        if (in->i[6] == 512)
+        /* beat-fp8-mma: the PIPE=1 fp8 prefill is the px4/px8 fp8-mma arm at hd512 (FULL layers)
+         * and the PX-23 arm at hd256 (SLIDING layers). Both are gated on the same
+         * PLOW_NV_FA_PIPE && PLOW_NV_FA_FP8MMA, so there is no build in which one exists without
+         * the other — an ALL-LAYER e4m3 packet (what vLLM ships by default) is now served by the
+         * fast path end to end instead of trapping into the PIPE=0 fallback. Before PX-23 the
+         * hd256 case trapped here, so such a packet could only run PIPE=0: 176 s of prefill per
+         * request, which is the whole of the measured 7.61x all-fp8 deficit (px20 §3). */
+        if (in->i[6] == 256)
+            d_flash_prefill_px23<256, 64, 32>(
+                (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
+                (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (__nv_bfloat16*)TEN(5),
+                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7], in->fj[1].u,
+                in->fj[2].u, in->fj[0].f, slice, nblk, arena, (const float*)TEN(6),
+                (const float*)TEN(7));
+        else if (in->i[6] == 512)
+            /* PX-8 (-DPLOW_NV_FA_FP8PV=1): same arm with an e4m3 P.V at BKV=32 — the V dequant
+             * pass is gone and both mmas are mma.m16n8k32.e4m3. Default 0 keeps px4. */
+#if PLOW_NV_FA_FP8PV
+            d_flash_prefill_px8<512, 32, 32, true>(
+#else
             d_flash_prefill_px4<512, 32, 16, true>(
+#endif
                 (float*)TEN(0), (float*)TEN(1), (const __nv_bfloat16*)TEN(2),
                 (const __nv_bfloat16*)TEN(3), (const __nv_bfloat16*)TEN(4), (__nv_bfloat16*)TEN(5),
                 in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->i[5], in->i[7], in->fj[1].u,
@@ -896,6 +1009,39 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
               in->i[0], in->i[1], slice, nblk);
         break;
 
+#if PLOW_NV_PREFILL && defined(PLOW_NV_PF_GEMV_HEAD) && PLOW_NV_PF_GEMV_HEAD
+    /* ---- PX-6 recommendation A: the M=1 GEMV arm, in the PREFILL object, for lm_head only ----
+     *
+     * Prefill emits lm_head at M=1 over the last prompt row (crates/devgen/src/lib.rs:2861 —
+     * `(lm_m, lm_row0) = (1, t-1)`) but dispatches it to the TILED arm, which computes BM=128
+     * rows to keep one. That is 1/128 = 0.78% row efficiency: predication suppresses the store
+     * and the gmem read, never the mma (op_gemm.cuh:929-957).
+     *
+     * Measured on a 170-SM RTX 5090, N=262144 K=3840: tiled 1.991 ms vs GEMV 1.213 ms, -39%.
+     * The GEMV arm moves the same 2.01 GB of tied-embedding weight at 1657 GB/s = 98% of this
+     * card's measured 1695.6 GB/s ceiling; the tiled arm manages 60%. The HBM floor is 1.19 ms,
+     * so 1.213 ms is essentially optimal and the win cannot exceed ~0.78 ms/launch.
+     *
+     * This is the ONE site where the PX-6 split theorem endorses swapping arms: the swap wins
+     * iff r_true > u, and r_true ~ r_raw * BM/min(M,BM) is 1.52 here (vs 0.063-0.085 at prefill
+     * M, where the same swap loses by 8-9x). See perf-data/px6-sm-quantization.md.
+     *
+     * ONLY the M=1 rung is instantiated: `gemv_rows<1>` directly, NOT `gemv_walk`, which would
+     * drag the {2,4,8} batched rungs into a prefill object already at 236/256 registers. M != 1
+     * traps rather than silently computing a partial result — the emitter only ever sets M=1
+     * here, so a trap means the packet is not the one this arm exists for.
+     *
+     * K % 8 is the gemv_rows contract (op_gemm.cuh:155-158); plowc enforces hidden % 8 == 0 at
+     * emit time, and this arm's K is always `hidden`. */
+    case PLOW_DOP_GEMV:
+        if (in->i[0] != 1u || in->i[3] != 0u || (in->i[2] & 7u) != 0u) { __trap(); break; }
+        gemv_rows<1>((__nv_bfloat16*)TEN(0),
+                     (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                     (const __nv_bfloat16*)TEN(2),
+                     1u, in->i[1], in->i[2], slice, nblk);
+        break;
+#endif /* PLOW_NV_PREFILL && PLOW_NV_PF_GEMV_HEAD */
+
 #if !PLOW_NV_PREFILL
     /* ---- GEMV family (DECODE object only; the prefill object uses the tiled GEMM arms above) ----
      * i4=a_row0 is a row offset applied to x in units of K (undocumented in dev.rs; 0 on
@@ -945,6 +1091,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
      * Weight is e4m3 (uint8), so TEN(2)/TEN(5) are cast to uint8*; the scale(s) are f32.
      * GEMV_FP8   t0=C t1=x t2=W(fp8) t5=w_scale(f32[N])  i0=M i1=N i2=K i4=a_row0.
      * GEMV_GLU_FP8 t0=fu t1=x t2=Wg(fp8) t5=Wu(fp8) t3=g_scale t4=u_scale  i0=M i1=N i2=K i5=act. */
+#if PLOW_HAS_GEMV_FP8
     case PLOW_DOP_GEMV_FP8:
         if (in->i[2] <= PLOW_NV_ARENA_FLOATS * 2u)
             d_gemv_fp8((__nv_bfloat16*)TEN(0),
@@ -957,30 +1104,37 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
                        (const uint8_t*)TEN(2), (const float*)TEN(5), in->i[0], in->i[1], in->i[2],
                        slice, nblk);
         break;
+#endif
 
+#if PLOW_HAS_GEMV_GLU_FP8
     case PLOW_DOP_GEMV_GLU_FP8:
         d_gemv_glu_fp8((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                        (const uint8_t*)TEN(2), (const uint8_t*)TEN(5), (const float*)TEN(3),
                        (const float*)TEN(4), in->i[0], in->i[1], in->i[2], in->i[5], slice, nblk,
                        (__nv_bfloat16*)arena);
         break;
+#endif
 
     /* ---- block-fp8 (128x128 block-scaled) DENSE FFN, GLM/Kimi/DeepSeek (P1.5) ----
      * op_moe.cuh d_dense_glu_fp8_blk / d_gemv_fp8_blk (warp-per-output, block-scale dot).
      * DENSE_GLU_FP8_BLK t0=fu t1=x t2=Wg t5=Wu t3=Sg t4=Su  i0=N(inter) i1=K(hidden) i5=act.
      * GEMV_FP8_BLK (dense DOWN) t0=C t1=fu t2=W t5=scale  i0=M i1=N(hidden) i2=K(inter) i4=x_row. */
+#if PLOW_HAS_DENSE_GLU_FP8_BLK
     case PLOW_DOP_DENSE_GLU_FP8_BLK:
         d_dense_glu_fp8_blk((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),
                             (const unsigned char*)TEN(2), (const unsigned char*)TEN(5),
                             (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1],
                             in->i[5], slice, nblk);
         break;
+#endif
+#if PLOW_HAS_GEMV_FP8_BLK
     case PLOW_DOP_GEMV_FP8_BLK:
         d_gemv_fp8_blk((__nv_bfloat16*)TEN(0),
                        (const __nv_bfloat16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                        (const unsigned char*)TEN(2), (const float*)TEN(5), in->i[1], in->i[2],
                        slice, nblk);
         break;
+#endif
 #endif
 
 #if PLOW_NV_SZ
@@ -1172,7 +1326,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif
         break;
 
-#if PLOW_NV_GEMMA && !PLOW_NV_PREFILL
+#if PLOW_NV_GEMMA && !PLOW_NV_PREFILL && PLOW_HAS_MOE_GEMMA
     /* ---- Gemma-4 26B-A4B bf16 sparse-MoE DECODE (plans/rtx-08-gemma4-moe-26b.md) ----
      * BATCH B>1 (PLOW_DECODE_BATCH): the decode MoE ops carry the batch row count in a
      * spare immediate. The compiler leaves it 0 at B=1 so the B=1 packet is byte-identical
@@ -1297,7 +1451,8 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
     /* Nemotron-3 Mamba-2 SSD mixer core (M4). UNVERIFIED on GPU — see op_mamba.cuh. Single-CU
      * correctness-first: reads/writes the carried conv_state (t6) + ssm_state (t7). Gated behind
      * PLOW_NV_MAMBA (default ON): a Gemma object never emits it, and it owns the prefill stack
-     * frame (1744 -> 688 B when gated out). */
+     * frame — sm_90a 1744 -> 672 B, sm_120a 1024 -> 0 B when gated out. It costs 2 regs on the
+     * sm_120a prefill object to gate it out (238 -> 240); see the payoff table at the default. */
 #if PLOW_NV_MAMBA
     case PLOW_DOP_MAMBA2_SCAN:
         d_mamba2_scan((__nv_bfloat16*)TEN(0), (const __nv_bfloat16*)TEN(1),

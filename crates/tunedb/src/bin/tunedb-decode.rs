@@ -9,8 +9,19 @@
 //!
 //!   tunedb-decode ingest --db tuning --results <sweep.jsonl> [--oracle NAME]
 //!                        [--correctness pass|unchecked] [--provisional]
-//!   tunedb-decode best   --db tuning --hardware nvidia/sm_90a/h100-nvl
-//!                        [--json <out>] [--all]
+//!   tunedb-decode best   --db tuning --hardware nvidia/sm_120a/rtx-5090
+//!                        [--model M] [--dtype fp8] [--n-cu N] [--batch B] [--ctx T]
+//!                        [--print defines|emit] [--json <out>] [--all]
+//!
+//! `best`'s cell filters and `--print` are what `tuning/README-decode-tuner.md`
+//! has always documented as the way a build consumes the store:
+//!
+//!   PLOW_EXTRA_DEFINES="$(tunedb-decode best ... --print defines)" \
+//!     scripts/build_sm120_cubin.sh out/interp_sm120.cubin
+//!
+//! `--print` refuses when the filter leaves more than one cell standing, since
+//! a flag string names ONE object and the union of two cells' winners is an
+//! object nobody measured.
 //!
 //! `ingest` refuses to publish a sweep whose reps are below
 //! `Stats::MIN_SAMPLES`, and `--provisional` is the honest way to keep such a
@@ -37,6 +48,10 @@ fn main() -> ExitCode {
 }
 
 type Err = Box<dyn std::error::Error>;
+
+fn one() -> u32 {
+    1
+}
 
 fn run() -> Result<(), Err> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -67,7 +82,27 @@ fn run() -> Result<(), Err> {
         }
         "best" => {
             let hw = opt("--hardware").ok_or("best needs --hardware <cell>")?;
-            best(&db, &hw, opt("--json").map(PathBuf::from), flag("--all"))
+            let num = |name: &str| -> Result<Option<u32>, Err> {
+                opt(name).map(|v| v.parse::<u32>()).transpose().map_err(|e| {
+                    format!("{name} takes a number: {e}").into()
+                })
+            };
+            let filter = CellFilter {
+                model: opt("--model"),
+                dtype: opt("--dtype"),
+                n_cu: num("--n-cu")?,
+                batch: num("--batch")?,
+                ctx_bucket: num("--ctx")?.map(CtxBucket::of),
+            };
+            let print = match opt("--print").as_deref() {
+                None => Print::Table,
+                Some("defines") => Print::Defines,
+                Some("emit") => Print::Emit,
+                Some(other) => {
+                    return Err(format!("--print takes defines|emit, not {other:?}").into())
+                }
+            };
+            best(&db, &hw, filter, print, opt("--json").map(PathBuf::from), flag("--all"))
         }
         _ => Err("usage: tunedb-decode <ingest|best> [options]".into()),
     }
@@ -88,6 +123,20 @@ struct Row {
     gv_moe_un: u32,
     moe_down_sg: u32,
     ns_abs: u32,
+    /// Decode slots the row was measured at.
+    ///
+    /// Defaults to 1, and that default is SAFE here in a way it would not be on
+    /// a stored record: until px15 the sweep script's only `step_bench`
+    /// invocation passed a literal `1` for the slot count, so a raw row without
+    /// the field is one the harness could not have measured at any other batch.
+    /// The value is recovered, not assumed. `DecodeCell.batch` has no default
+    /// for exactly the opposite reason.
+    #[serde(default = "one")]
+    batch: u32,
+    /// `GV_MM_MAX`. Absent means the sweep did not name it, i.e. the source
+    /// default (8) — which is NOT the same as the value 0.
+    #[serde(default)]
+    gv_mm_max: Option<u32>,
     // Flash family. Absent in rows written before it existed, and absent from a
     // row that did not name the knob — both mean "not overridden".
     #[serde(default)]
@@ -180,6 +229,7 @@ fn ingest(
                 n_cu: r.n_cu,
                 ctx_bucket: CtxBucket::of(r.ctx),
                 model: r.model,
+                batch: r.batch,
             },
             knobs: DecodeKnobs {
                 minblk: r.minblk,
@@ -188,6 +238,7 @@ fn ingest(
                 gv_unroll_glu: r.gv_unroll_glu,
                 gv_moe_un: r.gv_moe_un,
                 moe_down_sg: r.moe_down_sg,
+                gv_mm_max: r.gv_mm_max,
                 ns_abs: r.ns_abs,
                 fa_wpr: r.fa_wpr,
                 fa_gf: r.fa_gf,
@@ -273,7 +324,74 @@ fn ingest(
     Ok(())
 }
 
-fn best(db: &PathBuf, hw: &str, json: Option<PathBuf>, all: bool) -> Result<(), Err> {
+/// Which cells `best` should answer for. Every field is optional; a `None`
+/// leaves that axis unconstrained.
+///
+/// This exists because `tuning/README-decode-tuner.md` documents
+/// `best --model ... --dtype ... --n-cu ... --ctx ...` and the binary accepted
+/// none of them — the documented consumption path did not run. `--batch` joins
+/// them as the px15 axis.
+#[derive(Default)]
+struct CellFilter {
+    model: Option<String>,
+    dtype: Option<String>,
+    n_cu: Option<u32>,
+    batch: Option<u32>,
+    ctx_bucket: Option<CtxBucket>,
+}
+
+impl CellFilter {
+    fn matches(&self, c: &DecodeCell) -> bool {
+        self.model.as_ref().is_none_or(|m| *m == c.model)
+            && self.dtype.as_ref().is_none_or(|d| *d == c.dtype)
+            && self.n_cu.is_none_or(|n| n == c.n_cu)
+            && self.batch.is_none_or(|b| b == c.batch)
+            && self.ctx_bucket.is_none_or(|b| b == c.ctx_bucket)
+    }
+
+    /// How the filter reads back to a human, for the "nothing matched" message.
+    fn describe(&self) -> String {
+        let mut p = Vec::new();
+        if let Some(v) = &self.model {
+            p.push(format!("model={v}"));
+        }
+        if let Some(v) = &self.dtype {
+            p.push(format!("dtype={v}"));
+        }
+        if let Some(v) = self.n_cu {
+            p.push(format!("n_cu={v}"));
+        }
+        if let Some(v) = self.batch {
+            p.push(format!("batch={v}"));
+        }
+        if let Some(v) = self.ctx_bucket {
+            p.push(format!("ctx={}", v.label()));
+        }
+        if p.is_empty() { "(unfiltered)".into() } else { p.join(" ") }
+    }
+}
+
+/// What `best` writes to stdout.
+enum Print {
+    /// The human ranking table.
+    Table,
+    /// Just the `nvcc` flags, one line, for `PLOW_EXTRA_DEFINES="$(...)"`.
+    Defines,
+    /// Just the packet-emit knobs. Deliberately a SEPARATE mode rather than
+    /// more words on the same line: object flags and packet flags land in
+    /// different artifacts, and a cubin built for 2 blocks/SM against a
+    /// 132-block packet is not slower, it is a launch the engine refuses.
+    Emit,
+}
+
+fn best(
+    db: &PathBuf,
+    hw: &str,
+    filter: CellFilter,
+    print: Print,
+    json: Option<PathBuf>,
+    all: bool,
+) -> Result<(), Err> {
     let store = TuneStore::new(db.clone());
     let records = store.load_decode(hw)?;
     if records.is_empty() {
@@ -289,9 +407,39 @@ fn best(db: &PathBuf, hw: &str, json: Option<PathBuf>, all: bool) -> Result<(), 
         println!("{hw}: records exist but none are qualified (run without --provisional, or --all to see them)");
         return Ok(());
     }
+    let usable: Vec<DecodeMeasurement> =
+        usable.into_iter().filter(|r| filter.matches(&r.cell)).collect();
+    if usable.is_empty() {
+        println!("{hw}: no qualified records match {}", filter.describe());
+        return Ok(());
+    }
 
     let rankings = rank_by_cell(usable);
-    println!("{:<44} {:>9} {:>8} {:>5}  {}", "cell", "TPOT ms", "margin", "REG", "winning knobs");
+
+    // A flag string is consumed by a shell, so it must name exactly one object.
+    // Printing the union of two cells' defines would build a third object that
+    // was never measured — the failure mode this whole store exists to prevent.
+    if let Print::Defines | Print::Emit = print {
+        if rankings.len() != 1 {
+            return Err(format!(
+                "--print names ONE object but {} cells match {}.\n  \
+                 Narrow with --model/--dtype/--n-cu/--batch/--ctx; cells are:\n    {}",
+                rankings.len(),
+                filter.describe(),
+                rankings.iter().map(|c| c.cell.key()).collect::<Vec<_>>().join("\n    ")
+            )
+            .into());
+        }
+        let w = rankings[0].winner().expect("a ranking has a winner");
+        let out = match print {
+            Print::Defines => w.knobs.defines(),
+            _ => w.knobs.emit_env(),
+        };
+        println!("{}", out.join(" "));
+        return Ok(());
+    }
+
+    println!("{:<52} {:>9} {:>8} {:>5}  {}", "cell", "TPOT ms", "margin", "REG", "winning knobs");
     let mut rows = Vec::new();
     for c in &rankings {
         let w = c.winner().expect("a ranking has a winner");
@@ -300,7 +448,7 @@ fn best(db: &PathBuf, hw: &str, json: Option<PathBuf>, all: bool) -> Result<(), 
             .map(|m| format!("{m:+.3}"))
             .unwrap_or_else(|| "  n/a".into());
         println!(
-            "{:<44} {:>9.3} {:>8} {:>5}  {}{}",
+            "{:<52} {:>9.3} {:>8} {:>5}  {}{}",
             c.cell.key(),
             w.median_ms(),
             margin,
@@ -321,6 +469,7 @@ fn best(db: &PathBuf, hw: &str, json: Option<PathBuf>, all: bool) -> Result<(), 
             "model": c.cell.model,
             "dtype": c.cell.dtype,
             "n_cu": c.cell.n_cu,
+            "batch": c.cell.batch,
             "ctx_bucket": c.cell.ctx_bucket.label(),
             "winner": {
                 "knobs": w.knobs,

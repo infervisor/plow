@@ -58,6 +58,9 @@ fn emit_with(dir: &Path, ctx: u32, n_cu: u32, tp: u32, rope_gen: bool) -> Vec<u8
         rope_gen,
         l2_layout: None,
         gpu: String::new(),
+        // Empty arch ⇒ no build.json, so the golden blob's emission is
+        // byte-identical to what it was before the manifest existed.
+        arch: String::new(),
     });
     std::fs::read(&out).unwrap()
 }

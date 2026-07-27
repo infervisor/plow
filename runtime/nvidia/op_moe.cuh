@@ -2481,8 +2481,8 @@ static __device__ void d_moe_group_glu_gemma_pf_w8a8(
 
         auto stage = [&](int ks, int buf) {
             pgm_stage_a8_gather(As + buf * PGM_A8BUF8, xq8, row_token, tid, rowbase, ks * PGM_BK8, K);
-            pgm_stage_b8(Bg + buf * PGM_B8BUF8, Wg, tid, tn, ks * PGM_BK8, I_moe, K, (int)K);
-            pgm_stage_b8(Bu + buf * PGM_B8BUF8, Wu, tid, tn, ks * PGM_BK8, I_moe, K, (int)K);
+            pgm_stage_b8<PGM_BN>(Bg + buf * PGM_B8BUF8, Wg, tid, tn, ks * PGM_BK8, I_moe, K, (int)K);
+            pgm_stage_b8<PGM_BN>(Bu + buf * PGM_B8BUF8, Wu, tid, tn, ks * PGM_BK8, I_moe, K, (int)K);
         };
 #pragma unroll
         for (int s = 0; s < PGM_GLU_STAGES - 1; s++) { if (s < ksteps) stage(s, s); pgm_cp_commit(); }
@@ -2495,8 +2495,8 @@ static __device__ void d_moe_group_glu_gemma_pf_w8a8(
             for (int kf = 0; kf < PGM_BK8; kf += 32) {
                 unsigned af[PGM_MFRAG][4]; pgm_load_afrags_w8a8(af, As + cb * PGM_A8BUF8, wm, kf, lane);
                 unsigned bg[PGM_NFRAG][2], bu[PGM_NFRAG][2];
-                pgm_load_bfrags_w8a8(bg, Bg + cb * PGM_B8BUF8, wn, kf, lane);
-                pgm_load_bfrags_w8a8(bu, Bu + cb * PGM_B8BUF8, wn, kf, lane);
+                pgm_load_bfrags_w8a8<PGM_WN, PGM_NFRAG>(bg, Bg + cb * PGM_B8BUF8, wn, kf, lane);
+                pgm_load_bfrags_w8a8<PGM_WN, PGM_NFRAG>(bu, Bu + cb * PGM_B8BUF8, wn, kf, lane);
 #pragma unroll
                 for (int mi = 0; mi < PGM_MFRAG; mi++)
 #pragma unroll
@@ -2569,7 +2569,7 @@ static __device__ void d_moe_group_down_gemma_pf_w8a8(
 
         auto stage = [&](int ks, int buf) {
             pgm_stage_a8(As + buf * PGM_A8BUF8, fu8, tid, 0, ks * PGM_BK8, PGM_BM, K, rowbase);
-            pgm_stage_b8(Bs + buf * PGM_B8BUF8, Wd, tid, tn, ks * PGM_BK8, H, K, (int)K);
+            pgm_stage_b8<PGM_BN>(Bs + buf * PGM_B8BUF8, Wd, tid, tn, ks * PGM_BK8, H, K, (int)K);
         };
 #pragma unroll
         for (int s = 0; s < PGM_STAGES - 1; s++) { if (s < ksteps) stage(s, s); pgm_cp_commit(); }
@@ -2581,7 +2581,7 @@ static __device__ void d_moe_group_down_gemma_pf_w8a8(
 #pragma unroll
             for (int kf = 0; kf < PGM_BK8; kf += 32) {
                 unsigned af[PGM_MFRAG][4]; pgm_load_afrags_w8a8(af, As + cb * PGM_A8BUF8, wm, kf, lane);
-                unsigned bf[PGM_NFRAG][2]; pgm_load_bfrags_w8a8(bf, Bs + cb * PGM_B8BUF8, wn, kf, lane);
+                unsigned bf[PGM_NFRAG][2]; pgm_load_bfrags_w8a8<PGM_WN, PGM_NFRAG>(bf, Bs + cb * PGM_B8BUF8, wn, kf, lane);
 #pragma unroll
                 for (int mi = 0; mi < PGM_MFRAG; mi++)
 #pragma unroll

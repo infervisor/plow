@@ -9,12 +9,21 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     #[serde(default)]
     pub stream: bool,
-    #[serde(default)]
+    /// OpenAI renamed this field to `max_completion_tokens` for chat
+    /// completions and deprecated `max_tokens`; current clients (including
+    /// `vllm bench serve --backend openai-chat`) send only the new name.
+    /// Accept both, or the cap is silently ignored and generation runs to EOS.
+    #[serde(default, alias = "max_completion_tokens")]
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
+    /// vLLM extension: run to `max_tokens` instead of stopping at eos. Sent by
+    /// `vllm bench serve` for the synthetic datasets; ignoring it makes every
+    /// benchmark against plowrt under-report throughput. See `GenParams`.
+    #[serde(default)]
+    pub ignore_eos: Option<bool>,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
 }

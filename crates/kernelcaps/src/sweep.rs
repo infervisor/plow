@@ -199,7 +199,9 @@ static_assert(PGM_BK8 == 64, "the mainloop reads two k32 subgroups per K-tile");
         }
 
         let by = |n: &str| k.iter().find(|x| x.name == n).unwrap().sweepable;
-        assert_eq!(by("PGM_BM"), Sweepable::Fixed, "PGM_BM is a hard #define");
+        // PX-13 made PGM_BM overridable: it was a bare `#define` with no `#ifndef`,
+        // so `-DPGM_BM` had never reached any object. Sweepable now, by design.
+        assert_eq!(by("PGM_BM"), Sweepable::Overridable);
         assert_eq!(by("PGM_BK"), Sweepable::Fixed, "PGM_BK is a hard #define");
         assert_eq!(by("PGM_BN"), Sweepable::Overridable);
         assert_eq!(by("PGM_STAGES"), Sweepable::Overridable);
@@ -208,7 +210,7 @@ static_assert(PGM_BK8 == 64, "the mainloop reads two k32 subgroups per K-tile");
 
         let sweepable: Vec<&str> =
             k.iter().filter(|x| x.sweepable.can_sweep()).map(|x| x.name.as_str()).collect();
-        assert_eq!(sweepable, vec!["PGM_BN", "PGM_STAGES", "PGM_GLU_STAGES"]);
+        assert_eq!(sweepable, vec!["PGM_BM", "PGM_BN", "PGM_STAGES", "PGM_GLU_STAGES"]);
     }
 
     /// The GEMV knobs are the opposite case: the header says they exist "for
@@ -258,14 +260,32 @@ static_assert(PGM_BK8 == 64, "the mainloop reads two k32 subgroups per K-tile");
         assert_eq!(classify(&h, "PLOW_MOE_MFMA"), Sweepable::Overridable);
     }
 
+    /// Which axes of the NVIDIA dense GEMM tile a sweep can actually move.
+    ///
+    /// Split out of `amd_gemm_tile_is_sweepable_where_nvidia_is_not` so it stands
+    /// alone: these assertions used to sit behind a two-vendor `let-else`, so a
+    /// missing `runtime/amd/op_gemm.h` silently skipped NVIDIA coverage as well.
+    ///
+    /// M became a knob in PX-13. `PGM_BM` used to be a bare `#define`, so
+    /// `-DPGM_BM=...` was a macro redefinition rather than a retune and a tuner
+    /// that swept it would report results for a tile it never built. It is
+    /// `#ifndef`-guarded now, so M and N sweep and only K is pinned.
+    #[test]
+    fn nvidia_gemm_tile_sweeps_m_and_n_but_not_k() {
+        let Some(nv) = read("runtime/nvidia/op_gemm.cuh") else { return };
+        assert_eq!(classify(&nv, "PGM_BM"), Sweepable::Overridable); // PX-13
+        assert_eq!(classify(&nv, "PGM_BN"), Sweepable::Overridable);
+        assert_eq!(classify(&nv, "PGM_BK"), Sweepable::Fixed);
+    }
+
     /// The vendors differ on the axis a tuner most wants, and the difference is
     /// not cosmetic.
     ///
     /// AMD guards its GEMM tile, and the tree already exploits that:
-    /// `scripts/build_gfx950_qwen.sh:29` ships `-DGM_BM=192`. NVIDIA hard-defines
-    /// `PGM_BM`/`PGM_BK`, so the same sweep there is a macro redefinition rather
-    /// than a retune. A tuner that assumed the AMD story held on NVIDIA would
-    /// report results for a tile it never built.
+    /// `scripts/build_gfx950_qwen.sh:29` ships `-DGM_BM=192`. NVIDIA hard-defined
+    /// `PGM_BM` until PX-13 guarded it, so the same sweep there WAS a macro
+    /// redefinition rather than a retune. Both M axes sweep now; the K axis still
+    /// sweeps on neither.
     ///
     /// This test previously asserted `GM_BM` was Fixed, which was simply wrong.
     #[test]
@@ -281,8 +301,8 @@ static_assert(PGM_BK8 == 64, "the mainloop reads two k32 subgroups per K-tile");
         // scripts/build_gfx950_qwen.sh:29.
         assert_eq!(classify(&amd, "GM_BM"), Sweepable::Overridable);
         assert_eq!(classify(&amd, "GM_BN"), Sweepable::Overridable);
-        // NVIDIA guards neither: the M axis is not a knob there at all.
-        assert_eq!(classify(&nv, "PGM_BM"), Sweepable::Fixed);
+        // NVIDIA guards it too since PX-13.
+        assert_eq!(classify(&nv, "PGM_BM"), Sweepable::Overridable);
         assert_eq!(classify(&nv, "PGM_BN"), Sweepable::Overridable);
 
         // And the K axis is fixed on BOTH vendors -- GM_BK sits after the

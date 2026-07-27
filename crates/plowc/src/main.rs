@@ -85,9 +85,22 @@ struct Cli {
     ///   * `devblob` — a single PLOWDEV `model.pkt` the GPU runtime executes,
     ///     plus a servable `weights.json`. Replaces the deprecated `gemma4`
     ///     binary; the `PLOW_*` emit knobs (FP8, PLOW_BLOCK, PLOW_UNISEG, …)
-    ///     are honored exactly as before.
+    ///     are honored exactly as before;
+    ///   * `devblob+cubin` — as `devblob`, then BUILD the interpreter object
+    ///     from the manifest it just wrote. Opt-in, and only this form needs a
+    ///     CUDA toolkit: `devblob` alone still requires none, so the shipped
+    ///     binaries keep working against prebuilt assets.
     #[arg(long, value_enum, default_value_t = EmitKind::Packets)]
     emit: EmitKind,
+
+    /// devblob only: target ISA recorded in `build.json` (`sm_120a`, `sm_90a`,
+    /// `gfx950`, …), and the arch `--emit devblob+cubin` builds for.
+    ///
+    /// METADATA for the packet itself — it does not change a single emitted byte.
+    /// The manifest names opcodes, shapes and rules; mapping those to a
+    /// toolchain's flags is the backend's job (nvcc → .cubin, hipcc → .hsaco).
+    #[arg(long, default_value = "sm_120a")]
+    arch: String,
 
     /// devblob only: max context tokens the program is compiled for.
     #[arg(long, default_value_t = 131072)]
@@ -258,6 +271,16 @@ enum EmitKind {
     Packets,
     /// A single PLOWDEV device blob the GPU runtime executes.
     Devblob,
+    /// [`EmitKind::Devblob`] plus the interpreter object built from the
+    /// manifest's own `requires` + `recommends`.
+    ///
+    /// Deliberately opt-in. The README advertises that "no CUDA toolkit is
+    /// required at compile time … prebuilt binaries ship with assets", and that
+    /// stays true: `devblob` behaves exactly as before and never looks for a
+    /// toolchain. Only this variant does, and it says so clearly when one is
+    /// absent rather than failing somewhere inside cmake.
+    #[value(name = "devblob+cubin")]
+    DevblobCubin,
 }
 
 impl PhaseArg {
@@ -357,7 +380,7 @@ fn main() -> ExitCode {
         };
     }
 
-    if cli.emit == EmitKind::Devblob {
+    if matches!(cli.emit, EmitKind::Devblob | EmitKind::DevblobCubin) {
         info!(gpu = %cli.gpu, "devblob emit started");
         return match run_devblob(&cli) {
             Ok(out) => {
@@ -699,9 +722,18 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             rope_gen: !cli.no_rope_gen,
             l2_layout,
             gpu: cli.gpu.clone(),
+            arch: cli.arch.clone(),
         },
         verify,
     );
+
+    // `--emit devblob+cubin`: build the object the packet we just wrote needs.
+    // Runs AFTER emission, from the manifest that emission produced — never from
+    // the CLI's idea of what was emitted, which is the drift this whole change
+    // exists to remove.
+    if cli.emit == EmitKind::DevblobCubin {
+        build_cubin_from_manifest(&pkt, &cli.arch)?;
+    }
 
     // Bare-blob mode (`--out foo.pkt`) stops here: no manifest, exactly the
     // legacy `gemma4` output. Bundle mode also writes a servable manifest.
@@ -752,6 +784,152 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         "devblob written"
     );
     Ok(pkt)
+}
+
+/// `--emit devblob+cubin`: drive the Phase-A CMake target with the defines the
+/// manifest asked for.
+///
+/// The manifest is the ONLY input. `requires` is the correctness half (a missing
+/// arm is `default: __trap()` at first launch, which reads as a driver bug) and
+/// `recommends` is the performance half (`GV_MM_MAX`, `PLOW_NV_FA_GF_FULL` — both
+/// derived by rule from the packet's own shapes, both worth double-digit
+/// percentages when wrong).
+///
+/// The toolkit check is up front and by name. `plowc --emit devblob` must keep
+/// working on a machine with no CUDA at all — the README promises exactly that —
+/// so the failure here has to be a clear sentence, not a cmake backtrace.
+fn build_cubin_from_manifest(
+    pkt: &std::path::Path,
+    arch: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mpath = pkt.with_file_name("build.json");
+    let man: serde_json::Value = serde_json::from_slice(&std::fs::read(&mpath).map_err(|e| {
+        format!("--emit devblob+cubin: cannot read {}: {e}", mpath.display())
+    })?)?;
+
+    let nvcc = std::path::Path::new("/usr/local/cuda/bin/nvcc");
+    if !nvcc.exists() {
+        return Err(format!(
+            "--emit devblob+cubin needs a CUDA toolkit: {} not found. The packet and \
+             {} were written successfully — build the object separately (see \
+             runtime/CMakeLists.txt, -DPLOW_SM120_CUBIN=ON) or use --emit devblob, \
+             which needs no toolkit.",
+            nvcc.display(),
+            mpath.display()
+        )
+        .into());
+    }
+    if which_cmake().is_none() {
+        return Err(format!(
+            "--emit devblob+cubin needs `cmake` on PATH (the packet and {} were \
+             written successfully). --emit devblob needs no toolchain at all.",
+            mpath.display()
+        )
+        .into());
+    }
+
+    // The manifest is arch-agnostic on purpose; picking the backend is this
+    // function's job. Only nvcc/sm_1xx is wired — hipcc → .hsaco (runtime/amd/)
+    // is the same shape and is deliberately left for a follow-up.
+    let flags = man
+        .get("backends")
+        .and_then(|b| b.get("nvcc"))
+        .ok_or_else(|| format!("{}: no nvcc backend section", mpath.display()))?;
+    if !arch.starts_with("sm_") {
+        return Err(format!(
+            "--emit devblob+cubin: only the nvcc backend is wired; --arch {arch} would \
+             need the hipcc/.hsaco backend (runtime/amd/), which is not implemented."
+        )
+        .into());
+    }
+    let list = |k: &str| -> Vec<String> {
+        flags
+            .get(k)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    };
+    let (req, rec) = (list("requires"), list("recommends"));
+    info!(requires = ?req, recommends = ?rec, "building interpreter object from manifest");
+
+    // `requires` maps onto the CMake options; `recommends` are raw defines the
+    // table appends verbatim. PLOW_NV_FA_GF_FULL has its own cache variable (it
+    // must reach every decode-family object from one place — that was bug #2),
+    // so route it there rather than into the raw-append bucket.
+    let mut args: Vec<String> = vec!["-DPLOW_SM120_CUBIN=ON".into()];
+    if req.iter().any(|d| d.starts_with("PLOW_NV_W8A8")) {
+        args.push("-DPLOW_NV_W8A8=ON".into());
+    }
+    if req.iter().any(|d| d.starts_with("PLOW_FP8_KV")) {
+        args.push("-DPLOW_FP8_KV=ON".into());
+        args.push("-DPLOW_SM120_CUBIN_FP8KV=ON".into());
+    }
+    let mut extra = Vec::new();
+    for d in &rec {
+        match d.split_once('=') {
+            Some(("PLOW_NV_FA_GF_FULL", v)) => args.push(format!("-DPLOW_NV_FA_GF_FULL={v}")),
+            _ => extra.push(format!("-D{d}")),
+        }
+    }
+    if !extra.is_empty() {
+        args.push(format!("-DPLOW_EXTRA_DEFINES={}", extra.join(" ")));
+    }
+    args.push(format!("-DPLOW_CUBIN_ARCH={arch}"));
+
+    let out_dir = pkt.parent().map(PathBuf::from).unwrap_or_default();
+    let build_dir = out_dir.join(".cubin-build");
+    let runtime_dir = repo_runtime_dir()?;
+    args.push(format!("-DPLOW_CUBIN_DIR={}", out_dir.display()));
+
+    let status = std::process::Command::new("cmake")
+        .arg("-S").arg(&runtime_dir)
+        .arg("-B").arg(&build_dir)
+        .args(&args)
+        .status()?;
+    if !status.success() {
+        return Err(format!("cmake configure failed ({status})").into());
+    }
+    let status = std::process::Command::new("cmake")
+        .arg("--build").arg(&build_dir)
+        .arg("--target").arg("sm120_cubins")
+        .status()?;
+    if !status.success() {
+        return Err(format!("cmake build failed ({status})").into());
+    }
+    info!(out = %out_dir.display(), "interpreter object built");
+    Ok(())
+}
+
+fn which_cmake() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|d| d.join("cmake"))
+            .find(|c| c.is_file())
+    })
+}
+
+/// Locate `runtime/` — `PLOW_ROOT` if set (a worktree builds its OWN source),
+/// else walk up from the executable, else the current directory.
+fn repo_runtime_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Ok(r) = std::env::var("PLOW_ROOT") {
+        let d = PathBuf::from(r).join("runtime");
+        if d.join("CMakeLists.txt").exists() {
+            return Ok(d);
+        }
+    }
+    let mut cur = std::env::current_dir()?;
+    loop {
+        let d = cur.join("runtime");
+        if d.join("CMakeLists.txt").exists() {
+            return Ok(d);
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    Err("--emit devblob+cubin: cannot find runtime/CMakeLists.txt — set PLOW_ROOT \
+         to the repository root"
+        .into())
 }
 
 /// Create `link` → `target`, replacing any existing entry. Unix-only; the

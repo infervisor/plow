@@ -209,7 +209,25 @@ fn ckpt_names(dir: &Path, prefix: &str) -> HashSet<String> {
 /// Only `prefix*` names participate. Activations (`act.`), inputs (`in.`), KV rings
 /// (`kv.`), compiler-materialised tables (rope) and the fp8 twins (`fp8/`, which live
 /// in a sibling directory, not `dir`) are all out of scope by construction.
-pub(crate) fn validate_coverage(dir: &Path, prefix: &str, declared: &[String]) -> Result<(), String> {
+/// Layer index in a `...layers.<N>....` tensor name, if it has one.
+fn layer_of(name: &str) -> Option<usize> {
+    let rest = name.split_once(".layers.")?.1;
+    rest.split('.').next()?.parse().ok()
+}
+
+pub(crate) fn validate_coverage(
+    dir: &Path,
+    prefix: &str,
+    declared: &[String],
+    // `--block l..r`: the plan deliberately covers ONLY these layers, so every
+    // other layer's weights — and the global ones (embeddings, final norm,
+    // lm_head) — are legitimately uncovered. Without this the reverse check
+    // reads a block asset as "an architecture the emitter does not implement"
+    // and refuses to emit, which is what kept the single-block harness
+    // (`examples/block_run.rs`) unusable on any real checkpoint. The FORWARD
+    // check is untouched: a weight the block plan binds must still exist.
+    block: Option<std::ops::Range<usize>>,
+) -> Result<(), String> {
     // A directory with NO safetensors at all is not a coverage failure -- there is nothing to
     // cross-check against. Emitting a blob from a bare config.json is legitimate (the structural
     // golden tests do exactly that), and `shard_files` PANICS rather than returning empty, so
@@ -253,6 +271,11 @@ pub(crate) fn validate_coverage(dir: &Path, prefix: &str, declared: &[String]) -
         .iter()
         .map(|s| s.as_str())
         .filter(|n| !want.contains(*n) && !n.ends_with(".layer_scalar"))
+        // In block mode only the block's own layers are in scope.
+        .filter(|n| match &block {
+            None => true,
+            Some(r) => layer_of(n).is_some_and(|l| r.contains(&l)),
+        })
         .collect();
     if missing.is_empty() && uncovered.is_empty() {
         return Ok(());

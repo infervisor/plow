@@ -32,6 +32,14 @@ use crate::{Result, RuntimeError};
 pub struct GenParams {
     pub max_tokens: usize,
     pub params: SamplingParams,
+    /// Suppress the model's eos/stop set so generation runs to `max_tokens`.
+    /// vLLM's `ignore_eos`; `vllm bench serve` sets it for the synthetic
+    /// datasets so every request emits exactly `--random-output-len` tokens.
+    /// Without it a benchmark measures a mix of short and capped responses and
+    /// under-reports steady-state throughput (measured: 161 vs 512 tokens per
+    /// request on the same prompts, i.e. 3.2x the prefill churn per output
+    /// token). Default `false` — normal serving is unchanged.
+    pub ignore_eos: bool,
 }
 
 impl Default for GenParams {
@@ -39,6 +47,7 @@ impl Default for GenParams {
         GenParams {
             max_tokens: 4096,
             params: SamplingParams::default(),
+            ignore_eos: false,
         }
     }
 }

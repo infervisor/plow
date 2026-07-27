@@ -172,6 +172,11 @@ struct PrefillBucket {
     /// `FlashMerge` sites — neutered (`i[0] = 0`) in PX-1 batched mode, where
     /// the flash op runs the fused (`nsplit=1`, `t5=at`) epilogue per request.
     merge_sites: Vec<usize>,
+    /// This bucket runs the fp8-KV opcodes (`HeadNormRopeFp8`/`FlashPrefillFp8`).
+    /// PX-1 batched prefill is NOT available for them: the fp8 arm spends t6/t7
+    /// on the k/v dequant scales, not on the request table, so the batched patch
+    /// would overwrite a scale handle with a slot map.
+    fp8_kv: bool,
     /// Whether the one-time PX-1 batched-mode patch has been applied (t6 = the
     /// slot-map / request-table handles, t5 = fused output, merge neutered).
     batch_patched: bool,
@@ -626,6 +631,14 @@ impl GpuEngine {
         let kname = std::env::var("PLOW_NV_KERNEL").unwrap_or_else(|_| profile.decode_symbol.into());
         let f = be.get_function(&module, &kname)?;
 
+        // ---- packet/object pairing ----
+        // A SPECIALISED object carries only the arms one packet dispatches to, so
+        // it is not interchangeable and must not be paired with a different packet.
+        // Refusing here is the whole safety property of specialisation: without it,
+        // a missing arm turns today's loud `default: __trap()` at first launch into
+        // a trap MID-SERVE, on whichever bucket happens to need the dropped body.
+        Self::check_packet_pairing(&be, &module, assets_dir)?;
+
         // Dynamic-smem arena: the cubin knows its own compile-time arena
         // (`plow_arena_bytes`, embedded by interp_sm120.cu) — a GF_FULL=4
         // flash-decode object needs 16448 B where the GF=2 default is 12352 B,
@@ -1076,9 +1089,27 @@ impl GpuEngine {
                     );
                     (Some(f_pf), smem_pf, Some(module_pf), buckets)
                 }
+                // HARD ERROR, not a fallback. The cubin is PRESENT and failed to
+                // load — a broken deployment, not a configuration. Falling back
+                // to decode-only means consuming the prompt ONE TOKEN AT A TIME:
+                // measured >=707 s on a 127k prompt (PX-13) against ~32 s with
+                // the buckets, and the only symptom is that it is slow. The
+                // usual cause is an arena over the 101376 B opt-in cap
+                // (`PGM_STAGES=5`, `PGM_BN=256`), which is a build mistake the
+                // operator must see. A genuinely absent cubin still falls back,
+                // below — that path is documented and intentional.
                 Err(e) => {
-                    tracing::warn!(error = %e, "prefill disabled — decode-only prompt consumption");
-                    (None, SMEM_PF, None, Vec::new())
+                    return Err(RuntimeError::Device(format!(
+                        "prefill object {} failed to load: {e}\n\
+                         Refusing to start: falling back to decode-only prompt consumption \
+                         would prefill one token at a time (measured >=707 s vs ~32 s on a \
+                         127k prompt) with no symptom but slowness.\n\
+                         Common cause: the object's shared-memory arena exceeds this device's \
+                         opt-in cap — check `-Xptxas -v` against the 101376 B limit (e.g. \
+                         PGM_STAGES=5 or PGM_BN=256 overflow it). Remove the prefill cubin \
+                         to serve decode-only deliberately.",
+                        pf_cubin.display()
+                    )));
                 }
             }
         } else {
@@ -1101,11 +1132,20 @@ impl GpuEngine {
                     None
                 } else {
                     let fused = prefill.iter().find(|b| {
-                        !b.flash_sites.is_empty()
+                        // `!b.fp8_kv`: the fp8 flash arm reads t6/t7 as the k/v
+                        // scales, so the batched patch (t6 = request table) would
+                        // hand it garbage. The kernel has no fp8 mux arm either.
+                        !b.fp8_kv
+                            && !b.flash_sites.is_empty()
                             && b.flash_sites.iter().all(|&ix| {
                                 b.h_inst[ix].i[7] == 1 && b.h_inst[ix].t[5] != TENSOR_NONE16
                             })
                     });
+                    if fused.is_none() && prefill.iter().any(|b| b.fp8_kv) {
+                        tracing::warn!(
+                            "PLOW_PF_BATCH=1 ignored: fp8-KV packets have no batched prefill arm"
+                        );
+                    }
                     match fused {
                         Some(b) => {
                             let at_sites: Vec<(u32, u32)> = b
@@ -1247,6 +1287,83 @@ impl GpuEngine {
             vmm,
             pf_batch,
         })
+    }
+
+    /// Refuse a specialised interpreter object paired with a different packet.
+    ///
+    /// The object stamps `plow_packet_hash_{lo,hi}` (interp_sm120.cu, next to
+    /// `plow_arena_bytes`) ONLY when it was built from one packet's `build.json`
+    /// — a general object, with every arm compiled, carries no stamp and pairs
+    /// with anything, so every asset shipped today is unaffected.
+    ///
+    /// The expected value is read from `<assets>/build.json`, which `plowc`
+    /// writes beside `model.pkt` from the very programs it serialized. No hashing
+    /// happens here on purpose: recomputing it would be a second implementation of
+    /// the rule and could disagree with the first, which is exactly the class of
+    /// bug this check exists to end.
+    ///
+    /// FAILURE IS FATAL, not a warning. A stamped object is missing arms; running
+    /// it against the wrong packet does not degrade, it traps mid-serve.
+    fn check_packet_pairing(
+        be: &Arc<CudaBackend>,
+        module: &Module,
+        assets_dir: &Path,
+    ) -> Result<()> {
+        let (lo, hi) = (
+            be.module_global_u32(module, "plow_packet_hash_lo")?,
+            be.module_global_u32(module, "plow_packet_hash_hi")?,
+        );
+        let (Some(lo), Some(hi)) = (lo, hi) else {
+            // Unstamped ⇒ a general object. Nothing to check.
+            return Ok(());
+        };
+        let stamped = ((hi as u64) << 32) | lo as u64;
+
+        let mpath = assets_dir.join("build.json");
+        let manifest = std::fs::read(&mpath).map_err(|source| RuntimeError::Io {
+            path: mpath.clone(),
+            source,
+        })?;
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest).map_err(|e| {
+            RuntimeError::Device(format!("{}: not valid JSON: {e}", mpath.display()))
+        })?;
+        let want = manifest
+            .get("pairing")
+            .and_then(|p| p.get("hash"))
+            .and_then(|h| h.as_str())
+            .and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+            .ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "the interpreter object is SPECIALISED (packet hash \
+                     0x{stamped:016x}) but {} has no `pairing.hash` — it was written \
+                     by an older plowc. Rebuild the packet, or serve a general \
+                     interpreter object (one built without -DPLOW_CONFIG).",
+                    mpath.display()
+                ))
+            })?;
+        if want != stamped {
+            // Name what differs, not just that something does: the arm set and the
+            // rule-derived constants are the two things the hash covers.
+            let arms = manifest
+                .get("union")
+                .and_then(|u| u.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            return Err(RuntimeError::Device(format!(
+                "packet/interpreter MISMATCH: the loaded cubin was specialised for \
+                 packet 0x{stamped:016x}, but the packet in {} is 0x{want:016x} \
+                 ({arms} arms, tuning {}). A specialised object carries ONLY that \
+                 packet's op arms, so running this pair would trap mid-serve on the \
+                 first bucket needing a dropped arm. Rebuild the cubin from this \
+                 packet's build.json (plowc --emit devblob+cubin), or serve a \
+                 general object built without -DPLOW_CONFIG.",
+                assets_dir.display(),
+                manifest.get("tuning").map(|t| t.to_string()).unwrap_or_default(),
+            ))
+            .into());
+        }
+        tracing::info!(packet_hash = format!("0x{stamped:016x}"), "specialised interpreter paired");
+        Ok(())
     }
 
     /// Bring up VMM prefix sharing when `PLOW_VMM_PREFIX=1` and the model's
@@ -1423,14 +1540,29 @@ impl GpuEngine {
         batch: usize,
         vocab: usize,
     ) -> Result<Option<Sampler>> {
-        if std::env::var("PLOW_DEV_SAMPLE").as_deref() != Ok("1") {
+        // DEFAULT ON (`PLOW_DEV_SAMPLE=0` opts out). Host sampling costs a
+        // per-token round trip that dominates the step at batch: measured on
+        // Gemma-4-12B/RTX 5090 at B=16, 83.6 ms of host gap against a 41.0 ms
+        // kernel. Device sampling + `PLOW_MULTISTEP` together took that blob
+        // 102.74 -> 185.60 tok/s (1.74x). Every failure path below already
+        // degrades to host sampling, so defaulting on cannot break a bundle
+        // that lacks the cubin. See perf-data/gemma4-12b-sm120-serving.md.
+        let explicit = std::env::var("PLOW_DEV_SAMPLE").ok();
+        if explicit.as_deref() == Some("0") {
             return Ok(None);
         }
         let cubin = std::env::var("PLOW_NV_CUBIN_SAMPLE")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| assets_dir.join("sample_sm120.cubin"));
         if !cubin.is_file() {
-            tracing::warn!(cubin = %cubin.display(), "PLOW_DEV_SAMPLE=1 but no sampler cubin");
+            // Only a warning when the operator ASKED for it; on the default
+            // path a bundle without the cubin is an ordinary host-sampling
+            // deployment, not a misconfiguration.
+            if explicit.is_some() {
+                tracing::warn!(cubin = %cubin.display(), "PLOW_DEV_SAMPLE set but no sampler cubin");
+            } else {
+                tracing::debug!(cubin = %cubin.display(), "no sampler cubin — host sampling");
+            }
             return Ok(None);
         }
         let image = std::fs::read(&cubin)
@@ -1465,23 +1597,40 @@ impl GpuEngine {
         batch: usize,
         dyn_kvrow: bool,
     ) -> Result<Option<MultiStep>> {
-        let k: usize = match std::env::var("PLOW_MULTISTEP").ok().and_then(|v| v.parse().ok()) {
-            Some(k) if (2..=64).contains(&k) => k,
-            Some(_) => {
+        // DEFAULT ON at K=8 (`PLOW_MULTISTEP=0` or `=1` opts out). K=8 captures
+        // nearly all of the win — measured 179.18 tok/s vs 185.60 at K=32, i.e.
+        // the last 3.6% costs 4x the quantum. The quantum is also how far ahead
+        // of the client the device runs, so a small K keeps streaming delivery
+        // fine-grained and bounds work generated past a stop token; that is why
+        // the default is not the throughput-optimal 32.
+        const MULTISTEP_DEFAULT: usize = 8;
+        let raw = std::env::var("PLOW_MULTISTEP").ok();
+        let k: usize = match raw.as_deref().map(|v| v.parse::<usize>()) {
+            None => MULTISTEP_DEFAULT,
+            Some(Ok(0)) | Some(Ok(1)) => return Ok(None),
+            Some(Ok(k)) if (2..=64).contains(&k) => k,
+            _ => {
                 tracing::warn!("PLOW_MULTISTEP out of range [2,64] — multi-step off");
                 return Ok(None);
             }
-            None => return Ok(None),
         };
         if !dyn_kvrow {
-            tracing::warn!("PLOW_MULTISTEP ignored: decode cubin is not dynamic-kvrow (needs device pos)");
+            // Expected on a B=1 legacy cubin that host-patches the KV row, so
+            // this is only noteworthy when the operator asked for multi-step.
+            if raw.is_some() {
+                tracing::warn!("PLOW_MULTISTEP ignored: decode cubin is not dynamic-kvrow (needs device pos)");
+            }
             return Ok(None);
         }
         let cubin = std::env::var("PLOW_NV_CUBIN_SAMPLE")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| assets_dir.join("sample_sm120.cubin"));
         if !cubin.is_file() {
-            tracing::warn!(cubin = %cubin.display(), "PLOW_MULTISTEP set but no sampler cubin (has plow_advance)");
+            if raw.is_some() {
+                tracing::warn!(cubin = %cubin.display(), "PLOW_MULTISTEP set but no sampler cubin (has plow_advance)");
+            } else {
+                tracing::debug!(cubin = %cubin.display(), "no sampler cubin — multi-step off");
+            }
             return Ok(None);
         }
         let image = std::fs::read(&cubin)
@@ -2349,11 +2498,30 @@ impl GpuEngine {
                 lo = lo.min(ix);
                 hi = hi.max(ix);
             };
+            // fp8-KV packets emit the Fp8 TWINS of these opcodes. They carry the
+            // SAME operands at the same indices (rope: i[3]=out_row0,
+            // fj[1]=out_stride; flash: i[1]=seq_kv, i[4]=q_pos0 — see the
+            // HEADNORM_ROPE_FP8 / FLASH_PREFILL_FP8 arms in interp_sm120.cu), so
+            // they need the IDENTICAL per-chunk patch. Matching only the bf16
+            // opcodes left every fp8 chunk after the first writing its KV at
+            // row 0 and reading with q_pos0=0 — a silent wrong answer for any
+            // prompt long enough to need a second prefill launch (measured: a
+            // single-launch prompt is correct, 8192+2048 is not), and a prefill
+            // that also LOOKS 1.75x faster because the flash never grows past
+            // the first chunk's keys (PX-17 measured exactly that on main).
+            let mut fp8_kv = false;
             for (ix, inst) in g.insts.iter().enumerate() {
-                if inst.op == DevOp::HeadNormRope as u16 && inst.fj[1] != 0 {
+                if (inst.op == DevOp::HeadNormRope as u16
+                    || inst.op == DevOp::HeadNormRopeFp8 as u16)
+                    && inst.fj[1] != 0
+                {
+                    fp8_kv |= inst.op == DevOp::HeadNormRopeFp8 as u16;
                     rope.push(ix);
                     mark(ix);
-                } else if inst.op == DevOp::FlashPrefill as u16 {
+                } else if inst.op == DevOp::FlashPrefill as u16
+                    || inst.op == DevOp::FlashPrefillFp8 as u16
+                {
+                    fp8_kv |= inst.op == DevOp::FlashPrefillFp8 as u16;
                     flash.push(ix);
                     mark(ix);
                 } else if inst.op == DevOp::FlashMerge as u16 {
@@ -2380,6 +2548,7 @@ impl GpuEngine {
                 flash_sites: flash,
                 lmhead_sites: lmhead,
                 merge_sites: merge,
+                fp8_kv,
                 batch_patched: false,
                 d_ctr,
                 ctr_bytes,

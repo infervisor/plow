@@ -345,6 +345,34 @@ __device__ __forceinline__ void fa_ldmatrix_x2(unsigned (&r)[2], const void* sme
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r[0]), "=r"(r[1]) : "r"(s));
 }
+/* ---- PX-8: the 8-bit TRANSPOSING ldmatrix (sm_120a) ----------------------------------------
+ * mma.m16n8k32 needs both operands with the CONTRACTION dim contiguous per lane. For the P.V the
+ * contraction is kv, and V is staged natural Vs8[kv][hd] — so an fp8 P.V needs V transposed. This
+ * instruction does it in the load. Only compiled into the PX-8 arm (PLOW_NV_FA_FP8PV), which is
+ * sm_120a-only; ptxas rejects it on every other target, and -arch=sm_120a is NOT enough (it also
+ * emits a compute_120 PTX image) — build with -gencode arch=compute_120a,code=sm_120a.
+ *
+ * MEASURED fragment map (perf-data/px8_flash_fp8pv_bench.cu `layout`): lane L supplies the address
+ * of source row L (rows 0..15 = matrix 0, 16..31 = matrix 1) and receives, for source column n:
+ *   r[0] = T[n = L>>2    ][srcrow 4*(L&3) .. +3]  (matrix 0)
+ *   r[1] = T[n = (L>>2)+8][srcrow 4*(L&3) .. +3]  (matrix 0)
+ *   r[2], r[3] = the same two columns out of matrix 1
+ * The mma's B operand instead wants lane L to hold B[n=L>>2][k = 8*(L&3) .. +7], which differs by a
+ * QUAD PERMUTATION of k. FA_PX8_VROW absorbs that permutation into the smem ROW ORDER V is staged
+ * in — cp.async copies whole 16B lines, so only the destination row index changes and the whole
+ * transpose costs nothing. With it, {r0,r2} and {r1,r3} ARE the two B operands. */
+#ifndef PLOW_NV_FA_FP8PV
+#define PLOW_NV_FA_FP8PV 0
+#endif
+#if PLOW_NV_FA_FP8PV
+__device__ __forceinline__ void fa_ldmatrix_x2_trans_b8(unsigned (&r)[4], const void* smem) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+#endif
+/* kv row -> smem row for the V tile of the PX-8 arm (BKV=32). Bijection; see above. */
+#define FA_PX8_VROW(kv) ((((kv) & 4) ? 16 : 0) + 4 * ((kv) >> 3) + ((kv) & 3))
 __device__ __forceinline__ void fa_cp_async_cg16(void* smem, const void* gmem, int src_bytes) {
     unsigned s = (unsigned)__cvta_generic_to_shared(smem);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem),
@@ -1015,14 +1043,80 @@ __device__ void d_flash_merge(__nv_bfloat16* __restrict__ O, const float* __rest
     (4 + 2 * (BQ) * (BKV) +                                                                         \
      ((BQ) * ((HD) + FA_PRE_PAD) + (BKV) * ((HD) + FA_PRE_PAD) + 1) / 2 +                           \
      FA_PX4_KS_OR_Q8_FLOATS(HD, BQ, BKV) + FA_FP8_STAGE_FLOATS(HD, BKV))
+/* ---- PX-8: e4m3 P.V at BKV=32 (perf-data/px8-flash-fp8-pv.md) --------------------------------
+ * The px4 fp8mma arm runs QK as mma.m16n8k32.e4m3 but dequants V to fp16 for a m16n8k16 P.V, so
+ * the P.V costs 4x the tensor-core time of the QK for the same MACs. PX-8 makes it e4m3 too:
+ * BKV 16 -> 32 fills the k32, V stays RAW e4m3 in smem (the dequant pass is deleted outright) and
+ * the B operand comes out of fa_ldmatrix_x2_trans_b8 off a permuted-row V tile.
+ *
+ * NOT BQ=64. PX-7 Result 5 bundled BQ=64 into this change; it does not fit. oacc is
+ * BQ*HD/(WARPS*32) f32 per lane = 64 at BQ=32 and 128 at BQ=64 (PLOW_NV_THREADS is fixed at 256),
+ * measured +64 registers, which puts this arm past the 255 cap and spills accumulators that are
+ * live across the whole KV loop. BQ=64 at hd512 needs a 512-thread block.
+ *
+ * DEFAULT 0: sm_120a-only (8-bit ldmatrix) and it changes numerics (P is quantised to e4m3), so it
+ * is opt-in. -DPLOW_NV_FA_FP8PV=1 on an fp8 object with the fp8mma arm selects it. */
+#if PLOW_NV_FA_FP8PV && !(PLOW_NV_FA_FP8MMA && defined(PLOW_FP8_KV) && PLOW_NV_FA_PIPE)
+#error "PLOW_NV_FA_FP8PV needs the fp8mma arm: -DPLOW_FP8_KV=1 with PLOW_NV_FA_PIPE=1"
+#endif
+#define FA_PX8_ELIGIBLE(HD) (PLOW_NV_FA_FP8PV && (HD) == 512)
+/* mbar[2] (kept for layout stability) + SsA/SsB + Qs bf16 + qsc + ksc + vsc + Qs8 + Ks8 + Vs8.
+ * No bf16 Ks and no bf16 Vs at all — this arm never materialises a dequanted K or V. */
+#define FA_PX8_SMEM_FLOATS(HD, BQ, BKV)                                                             \
+    (4 + 2 * (BQ) * (BKV) + ((BQ) * ((HD) + FA_PRE_PAD) + 1) / 2 + (BQ) + 2 * (BKV) +                \
+     ((BQ) * ((HD) + FA_FP8_PAD8_K) + 3) / 4 + 2 * (((BKV) * ((HD) + FA_FP8_PAD8_K) + 3) / 4))
+
+/* ---- PX-23: the hd256 SLIDING-layer fp8 fast prefill arm ------------------------------------
+ * An ALL-LAYER e4m3 packet (what vLLM ships by default) emits hd256 FLASH_PREFILL_FP8, and until
+ * this arm existed the PIPE=1 fp8 object trapped on it — so the whole packet fell to the PIPE=0
+ * synchronous-staging path at 176 s of prefill per 127k request (PX-20 §4d) against 34.9 s for the
+ * same model at bf16. That one missing arm is the whole of PX-20's 7.61x conc-8 gap.
+ *
+ * It is a RETILE, not an instantiation of px4. Two reasons, both measured before any body was
+ * written (perf-data/px23-hd256-fp8-prefill.md):
+ *   (1) FA_PX4_SMEM_FLOATS(256,64,32) claims 104,464 B against a 101,376 B optin cap. The naive
+ *       retile does not fail at COMPILE time — it fails as a refused module load at serve time.
+ *   (2) px4's 8-warp QK grid splits HD in half (2 x 2 x 2) only because at BQ=32/BKV=16 the
+ *       query x kv tile is 4 warp-blocks and it needs 8. At BQ=64/BKV=32 that tile is 4 x 4, so
+ *       the hd split — and with it SsB and the SsA+SsB add at every softmax read — is dead weight.
+ *
+ * BQ=64 (not px4's 32) costs exactly what the shipped arm already pays: oacc is BQ*HD/THREADS f32
+ * per lane = 64 at BOTH hd512/BQ32 and hd256/BQ64. PX-8 Result 3's BQ=64 register wall (128
+ * f32/lane) was an hd512 property, not a BQ property. BQ=64 doubles arithmetic intensity per KV
+ * byte (2*BQ FLOP/B), which matters here in a way it did not for px4: the sliding layers re-read a
+ * whole `window` of KV per q-tile, so unlike PX-8's full-attention arm this one IS traffic-exposed.
+ * BKV=32 halves the tile count, hence half the barriers and half the loop floor (PX-8 Result 10
+ * puts loop+barrier at 18% and cp.async exposure at 24.5% of the hd512 fp8 arm).
+ *
+ * smem: px4 carries a bf16 Qs tile that is DEAD in the fp8mma arm — Q is staged bf16 only to be
+ * read straight back by the per-q-tile quant, after which nothing reads it. px23 drops it and
+ * quantizes Q out of REGISTERS straight from gmem. Layout: Ss | Vs | qsc | ksc | vsc | Qs8 | Ks8 |
+ * Vs8 = 60,416 B at (256,64,32) — 40% under the cap AND under the fp8 object's existing 89,104 B
+ * px4 claim, so PLOW_NV_PRE_A does not move and the shipped arena is unchanged.
+ *
+ * Qs8 is [BQ*HD] bytes in A-FRAGMENT order with NO row pad: it is a pure fragment array indexed
+ * ((qm*KSTEPS8 + kf) << 9) + lane*16, never a [row][col] tile. */
+#define FA_PX23_ELIGIBLE(HD)                                                                        \
+    (PLOW_NV_FA_PIPE && PLOW_NV_FA_PX4 && PLOW_NV_FA_FP8MMA && (HD) == 256)
+#define FA_PX23_SMEM_FLOATS(HD, BQ, BKV)                                                            \
+    ((BQ) * (BKV) + ((BKV) * ((HD) + FA_PRE_PAD) + 1) / 2 + (BQ) + 2 * (BKV) +                      \
+     ((BQ) * (HD) + 3) / 4 + FA_FP8_STAGE_FLOATS(HD, BKV))
 /* NOTE: the raw-e4m3 staging pair exists ONLY in the px4 (hd512 PIPE=1) arm. The generic arm
  * never stages e4m3 smem tiles — PIPE=0 dequants inline from gmem, and the PIPE=1 generic
  * kernel has no fp8 arm — so its arena must NOT carry FA_FP8_STAGE_FLOATS: with it, the
  * hd256 (BQ64/BKV32) claim crosses the 99 KiB opt-in cap and the cooperative prefill grid
  * collapses to 0 blocks (FATAL: prefill grid 0). */
+/* PX-8 runs the hd512 arm at BKV=32, so its claim is taken at (BQ, 2*BKV) and the arena is the max
+ * of the two (the object still carries px4 for the A/B). 94,096 B at BQ32/BKV32 vs px4's 89,104 —
+ * both are occ-1 and both fit the 101,376 B cap. */
+#define FA_PX8_CLAIM(HD, BQ, BKV)                                                                   \
+    (FA_PX8_ELIGIBLE(HD) ? FA_PX8_SMEM_FLOATS(HD, BQ, 2 * (BKV)) : 0)
 #define FA_PRE_SMEM_BASE(HD, BQ, BKV)                                                               \
-    (FA_PX4_ELIGIBLE(HD) ? FA_PX4_SMEM_FLOATS(HD, BQ, BKV)                                          \
-                         : ((BQ) * (BKV) + 3 * (BQ) + (FA_PRE_BF16(HD, BQ, BKV) + 1) / 2))
+    (FA_PX4_ELIGIBLE(HD)                                                                            \
+         ? (FA_PX8_CLAIM(HD, BQ, BKV) > FA_PX4_SMEM_FLOATS(HD, BQ, BKV)                             \
+                ? FA_PX8_CLAIM(HD, BQ, BKV)                                                         \
+                : FA_PX4_SMEM_FLOATS(HD, BQ, BKV))                                                  \
+         : ((BQ) * (BKV) + 3 * (BQ) + (FA_PRE_BF16(HD, BQ, BKV) + 1) / 2))
 /* ---- sm_90a FORK: the hd256 prefill arm runs on warpgroup MMA ------------------------------
  * op_attention_sm90.cuh replaces d_flash_prefill's per-tile math for the shapes it claims
  * (FA_SM90_WG_ELIGIBLE — today only <256,64,32>) with the oracle-validated wgmma flash prefill.
@@ -2002,6 +2096,763 @@ __device__ void d_flash_prefill_px4(float* __restrict__ Opart, float* __restrict
 #undef FA_PX4_WAIT_K
 #undef FA_PX4_WAIT_V
 }
+
+#if PLOW_NV_FA_FP8PV
+/* ---- PX-8: the px4 fp8mma arm with an e4m3 P.V at BKV=32 ------------------------------------
+ * Structurally d_flash_prefill_px4 (cp.async K/V ring, 8-warp hd-split QK into SsA/SsB, register
+ * softmax fused into the P.V A fragment, no Ps buffer). Three differences, and only three:
+ *
+ *  1. BKV 16 -> 32, so the P.V contraction fills one k32. The QK warp grid keeps its 2(hd half) x
+ *     2(query 16-rows) split and each warp now owns 16 kv columns (2 n8 sub-tiles) instead of 8.
+ *  2. The e4m3 -> fp16 V dequant pass is DELETED. V stays raw in Vs8 and the mma B operand comes
+ *     from fa_ldmatrix_x2_trans_b8 off a FA_PX8_VROW-permuted tile. There is no bf16/fp16 V tile
+ *     in this arm's smem at all.
+ *  3. P is quantised to e4m3. Since v_scale is per-kv-row it can no longer fold into V, and
+ *     P*v_scale (~1e-2) is below e4m3's smallest normal — so P is normalised by the tile's max
+ *     v_scale and the resulting unit change rides in the online-softmax `corr` multiply that is
+ *     already applied to the accumulator. The epilogue multiplies by the final units (gscale).
+ *     Nothing extra touches the 64 accumulator registers.
+ *
+ * Numerics: P carries ~2 decimal digits instead of fp16's ~3. l (the softmax denominator) is
+ * accumulated from the UNQUANTISED p, so the quantisation error is confined to the numerator and
+ * cannot compound through the rescale. See perf-data/px8-flash-fp8-pv.md. */
+template <int HD, int BQ, int BKV, bool FP8KV = false>
+__device__ void d_flash_prefill_px8(float* __restrict__ Opart, float* __restrict__ mlpart,
+                                    const __nv_bfloat16* __restrict__ Q,
+                                    const __nv_bfloat16* __restrict__ K,
+                                    const __nv_bfloat16* __restrict__ V,
+                                    __nv_bfloat16* __restrict__ O, unsigned seq_q, unsigned seq_kv,
+                                    unsigned n_head, unsigned n_kv_head, unsigned q_pos0,
+                                    unsigned window, unsigned nsplit, unsigned kv_stride,
+                                    unsigned kv_mask, float scale, unsigned slice, unsigned nblk,
+                                    float* lds, const float* __restrict__ k_scale = nullptr,
+                                    const float* __restrict__ v_scale = nullptr) {
+    static_assert(HD == 512 && BQ == 32 && BKV == 32, "px8 arm is the hd512 e4m3-P.V tiling");
+    static_assert((int)PLOW_NV_WARPS == 8, "px8 warp grids assume 8 warps");
+    static_assert(FP8KV, "px8 is an fp8-KV arm");
+    constexpr int PAD = FA_PRE_PAD, PAD8 = FA_FP8_PAD8_K;
+    constexpr int WPV_N = 4, HDW = HD / WPV_N, NJ_PV = HDW / 8; /* 128, 16 */
+    constexpr int KSTEPS8_H = HD / 2 / 32;                      /* 8 k32 steps per hd half */
+    constexpr int HCH8 = HD / 16;                               /* 16B cp.async lines per e4m3 row */
+    constexpr float PS = 256.0f;                                /* P headroom inside e4m3 */
+
+    float* SsA = lds + 4;
+    float* SsB = SsA + BQ * BKV;
+    __nv_bfloat16* Qs = (__nv_bfloat16*)(SsB + BQ * BKV);
+    float* qsc_s = (float*)(Qs + BQ * (HD + PAD));
+    float* ksc_s = qsc_s + BQ;
+    float* vsc_s = ksc_s + BKV;
+    unsigned char* Qs8 = (unsigned char*)(vsc_s + BKV);
+    unsigned char* Ks8 = Qs8 + BQ * (HD + PAD8);
+    unsigned char* Vs8 = Ks8 + BKV * (HD + PAD8);
+
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const unsigned gqa = n_head / n_kv_head;
+    const unsigned n_qt = (seq_q + BQ - 1) / BQ;
+    const unsigned n_work = n_qt * n_head * nsplit;
+    const float lscale = FA_SCALE(scale);
+    const int qk_kh = warp >> 2, qk_wm = (warp >> 1) & 1, qk_wn = warp & 1;
+    const int pv_wm = warp >> 2, pv_wn = warp & 3;
+    const int r0 = pv_wm * 16 + (lane >> 2); /* this lane's softmax rows: r0 and r0+8 */
+    const int kb0 = (lane & 3) * 8;          /* its 8 CONSECUTIVE kv columns (the k32 A fragment) */
+
+    for (unsigned w = slice; w < n_work; w += nblk) {
+        const unsigned sp = w % nsplit;
+        const unsigned h = (w / nsplit) % n_head;
+        const unsigned qt = w / (nsplit * n_head);
+        const unsigned q0 = qt * BQ;
+        const unsigned hkv = h / gqa;
+
+        const unsigned per = (seq_kv + nsplit - 1) / nsplit;
+        const unsigned lo = sp * per;
+        const unsigned hi = (lo + per < seq_kv) ? (lo + per) : seq_kv;
+
+        const __nv_bfloat16* Qh = Q + (size_t)q0 * n_head * HD + (size_t)h * HD;
+        const unsigned char* Kb8 = (const unsigned char*)K + (size_t)hkv * kv_stride * HD;
+        const unsigned char* Vb8 = (const unsigned char*)V + (size_t)hkv * kv_stride * HD;
+        const float* ksc = k_scale + (size_t)hkv * kv_stride;
+        const float* vsc = v_scale + (size_t)hkv * kv_stride;
+
+        __syncthreads(); /* previous item's reads done before restage */
+        for (int idx = tid; idx < BQ * HD; idx += (int)PLOW_NV_THREADS) {
+            int r = idx / HD, c = idx % HD;
+            __nv_bfloat16 v = __float2bfloat16(0.f);
+            if (q0 + r < seq_q) v = Qh[(size_t)r * n_head * HD + c];
+            Qs[r * (HD + PAD) + c] = v;
+        }
+        __syncthreads();
+        /* Q -> e4m3 once per q-tile, stored in mma A-fragment order (px4's layout, verbatim). */
+        {
+            const int qr = warp * (BQ / 8) + (lane >> 3);
+            const int le = lane & 7;
+            const int cb = le * (HD / 8);
+            float amax = 0.0f;
+            for (int e = 0; e < HD / 8; e++)
+                amax = fmaxf(amax, fabsf(__bfloat162float(Qs[qr * (HD + PAD) + cb + e])));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+            const float qinv = (amax > 0.0f) ? (PLOW_FP8_E4M3_MAX / amax) : 0.0f;
+            if (le == 0) qsc_s[qr] = amax * (1.0f / PLOW_FP8_E4M3_MAX);
+            const int qm = qr >> 4, r7 = qr & 7, hi8 = ((qr >> 3) & 1) * 8;
+            for (int g = 0; g < HD / 64; g++) {
+                const int c = cb + g * 8;
+                unsigned u0 = 0, u1 = 0;
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                    u0 |= (unsigned)quant_fp8(__bfloat162float(Qs[qr * (HD + PAD) + c + j]) * qinv)
+                          << (8 * j);
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                    u1 |= (unsigned)quant_fp8(
+                              __bfloat162float(Qs[qr * (HD + PAD) + c + 4 + j]) * qinv)
+                          << (8 * j);
+                const int kh = c >> 8, kf = (c & 255) >> 5, L = r7 * 4 + ((c >> 3) & 3);
+                *(uint2*)&Qs8[(((qm * 2 + kh) * 8 + kf) << 9) + L * 16 + hi8] = make_uint2(u0, u1);
+            }
+        }
+
+        float oacc[NJ_PV][4];
+#pragma unroll
+        for (int nj = 0; nj < NJ_PV; nj++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) oacc[nj][e] = 0.0f;
+        float m_reg[2] = {FA_NEG_INF, FA_NEG_INF}, l_reg[2] = {0.0f, 0.0f};
+        float gscale = 0.0f; /* the accumulator's units; see the P normaliser below */
+
+        const int qabs_max = (int)(q_pos0 + q0 + BQ - 1);
+        unsigned eff_lo = lo;
+        if (window) {
+            const long wfloor = (long)q_pos0 + q0 - (long)window + 1;
+            if (wfloor > (long)lo) eff_lo = ((unsigned)wfloor / BKV) * (unsigned)BKV;
+        }
+        long cap = (long)hi - 1;
+        if ((long)qabs_max < cap) cap = (long)qabs_max;
+        const int nt = (cap >= (long)eff_lo) ? (int)((cap - (long)eff_lo) / BKV) + 1 : 0;
+
+        auto stageK = [&](unsigned kv0) {
+            for (int L = tid; L < BKV * HCH8; L += (int)PLOW_NV_THREADS) {
+                int r = L / HCH8, c16 = (L % HCH8) * 16;
+                unsigned kv = kv0 + (unsigned)r;
+                bool in = (kv < hi);
+                const unsigned char* g = in ? Kb8 + (size_t)(kv & kv_mask) * HD + c16 : Kb8;
+                fa_cp_async_cg16(&Ks8[r * (HD + PAD8) + c16], g, in ? 16 : 0);
+            }
+            fa_cp_commit();
+        };
+        /* kv row r lands in smem row FA_PX8_VROW(r) — the free half of the fp8 P.V. */
+        auto stageV = [&](unsigned kv0) {
+            for (int L = tid; L < BKV * HCH8; L += (int)PLOW_NV_THREADS) {
+                int r = L / HCH8, c16 = (L % HCH8) * 16;
+                unsigned kv = kv0 + (unsigned)r;
+                bool in = (kv < hi);
+                const unsigned char* g = in ? Vb8 + (size_t)(kv & kv_mask) * HD + c16 : Vb8;
+                fa_cp_async_cg16(&Vs8[FA_PX8_VROW(r) * (HD + PAD8) + c16], g, in ? 16 : 0);
+            }
+            fa_cp_commit();
+        };
+
+        __syncthreads(); /* Qs8 published before the pipeline starts */
+        float sc_pf = 0.0f;
+        if (tid < 2 * BKV && nt > 0) {
+            const unsigned kvr = eff_lo + (unsigned)(tid & (BKV - 1));
+            if (kvr < hi) sc_pf = (tid < BKV) ? ksc[kvr & kv_mask] : vsc[kvr & kv_mask];
+        }
+        if (nt > 0) stageK(eff_lo);
+
+        for (int t = 0; t < nt; t++) {
+            const unsigned kv0 = eff_lo + (unsigned)t * BKV;
+            stageV(kv0);
+            if (tid < 2 * BKV) {
+                ((tid < BKV) ? ksc_s : vsc_s)[tid & (BKV - 1)] = sc_pf;
+                const unsigned kvn = kv0 + BKV + (unsigned)(tid & (BKV - 1));
+                sc_pf = 0.0f;
+                if (kvn < hi) sc_pf = (tid < BKV) ? ksc[kvn & kv_mask] : vsc[kvn & kv_mask];
+            }
+            fa_cp_wait<1>(); /* K[t] */
+            __syncthreads();
+
+            /* S = Q.K^T, e4m3 k32. Each warp: one hd half x 16 query rows x 16 kv (2 n8). */
+            {
+                float acc[2][4], accB[2][4];
+#pragma unroll
+                for (int j = 0; j < 2; j++)
+#pragma unroll
+                    for (int e = 0; e < 4; e++) { acc[j][e] = 0.f; accB[j][e] = 0.f; }
+                const int khoff = qk_kh * (HD / 2);
+                const int kbq = khoff + 8 * (lane & 3);
+                const uint4* QsAf = (const uint4*)&Qs8[(((qk_wm * 2 + qk_kh) * 8) << 9) + lane * 16];
+#pragma unroll
+                for (int kf = 0; kf < KSTEPS8_H; kf++) {
+                    const int kb = kbq + kf * 32;
+                    unsigned a8[4];
+                    const uint4 av = QsAf[kf * 32];
+                    a8[0] = av.x; a8[2] = av.y; a8[1] = av.z; a8[3] = av.w;
+#pragma unroll
+                    for (int j = 0; j < 2; j++) {
+                        const int nn = qk_wn * 16 + j * 8 + (lane >> 2);
+                        const uint2 bb = *(const uint2*)&Ks8[nn * (HD + PAD8) + kb];
+                        unsigned b8[2] = {bb.x, bb.y};
+                        if (kf & 1) fa_mma_fp8_k32(accB[j], a8, b8, accB[j]);
+                        else        fa_mma_fp8_k32(acc[j], a8, b8, acc[j]);
+                    }
+                }
+                float* Sdst = qk_kh ? SsB : SsA;
+                const int qlo = qk_wm * 16 + (lane / 4);
+                const float q0s = qsc_s[qlo], q1s = qsc_s[qlo + 8];
+#pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const int kc0 = qk_wn * 16 + j * 8 + (lane % 4) * 2;
+                    const float ks0 = ksc_s[kc0] * lscale, ks1 = ksc_s[kc0 + 1] * lscale;
+                    const float a0 = acc[j][0] + accB[j][0], a1 = acc[j][1] + accB[j][1];
+                    const float a2 = acc[j][2] + accB[j][2], a3 = acc[j][3] + accB[j][3];
+                    *(float2*)&Sdst[qlo * BKV + kc0] = make_float2(a0 * ks0 * q0s, a1 * ks1 * q0s);
+                    *(float2*)&Sdst[(qlo + 8) * BKV + kc0] =
+                        make_float2(a2 * ks0 * q1s, a3 * ks1 * q1s);
+                }
+            }
+            __syncthreads(); /* Ss published; Ks8 free for K[t+1] */
+            if (t + 1 < nt) stageK(kv0 + BKV);
+            else fa_cp_commit(); /* keep group counts symmetric for the V wait */
+
+            const unsigned rmax = (hi - kv0 < (unsigned)BKV) ? (hi - kv0) : (unsigned)BKV;
+            fa_cp_wait<1>(); /* V[t] */
+
+            /* Register softmax fused into the e4m3 P.V A fragment. */
+            unsigned af_pv[4];
+            {
+                float vmax = 0.0f;
+#pragma unroll
+                for (int i = 0; i < BKV; i += 4) {
+                    const float4 v4 = *(const float4*)&vsc_s[i];
+                    vmax = fmaxf(fmaxf(vmax, v4.x), fmaxf(fmaxf(v4.y, v4.z), v4.w));
+                }
+                const float vnorm = (vmax > 0.0f) ? (PS / vmax) : 0.0f;
+                float p[2][8];
+                float corr[2];
+#pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const int row = r0 + j * 8;
+                    const int qabs = (int)(q_pos0 + q0 + row);
+                    float s[8], mx = FA_NEG_INF;
+                    const float4 a0 = *(const float4*)&SsA[row * BKV + kb0];
+                    const float4 a1 = *(const float4*)&SsA[row * BKV + kb0 + 4];
+                    const float4 b0 = *(const float4*)&SsB[row * BKV + kb0];
+                    const float4 b1 = *(const float4*)&SsB[row * BKV + kb0 + 4];
+                    s[0] = a0.x + b0.x; s[1] = a0.y + b0.y; s[2] = a0.z + b0.z; s[3] = a0.w + b0.w;
+                    s[4] = a1.x + b1.x; s[5] = a1.y + b1.y; s[6] = a1.z + b1.z; s[7] = a1.w + b1.w;
+#pragma unroll
+                    for (int ci = 0; ci < 8; ci++) {
+                        const int col = kb0 + ci;
+                        const int kv = (int)kv0 + col;
+                        bool masked = ((unsigned)col >= rmax) || (kv > qabs);
+                        if (window) masked |= ((unsigned)(qabs - kv) >= window);
+                        if (masked) s[ci] = FA_NEG_INF;
+                        mx = fmaxf(mx, s[ci]);
+                    }
+                    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+                    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+                    const float m_new = fmaxf(m_reg[j], mx);
+                    corr[j] = (m_reg[j] == FA_NEG_INF) ? 0.0f : FA_EXP(m_reg[j] - m_new);
+                    float lsum = 0.0f;
+#pragma unroll
+                    for (int ci = 0; ci < 8; ci++) {
+                        p[j][ci] = (s[ci] == FA_NEG_INF || m_new == FA_NEG_INF)
+                                       ? 0.0f : FA_EXP(s[ci] - m_new);
+                        lsum += p[j][ci];
+                    }
+                    lsum += __shfl_xor_sync(0xffffffffu, lsum, 1);
+                    lsum += __shfl_xor_sync(0xffffffffu, lsum, 2);
+                    l_reg[j] = l_reg[j] * corr[j] + lsum; /* l uses the UNQUANTISED p */
+                    m_reg[j] = m_new;
+#pragma unroll
+                    for (int ci = 0; ci < 8; ci++) p[j][ci] *= vsc_s[kb0 + ci] * vnorm;
+                }
+                /* A fragment: a0=(r0,k0..3) a1=(r0+8,k0..3) a2=(r0,k4..7) a3=(r0+8,k4..7) */
+                unsigned u[4] = {0, 0, 0, 0};
+#pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    u[0] |= (unsigned)quant_fp8(p[0][b]) << (8 * b);
+                    u[1] |= (unsigned)quant_fp8(p[1][b]) << (8 * b);
+                    u[2] |= (unsigned)quant_fp8(p[0][4 + b]) << (8 * b);
+                    u[3] |= (unsigned)quant_fp8(p[1][4 + b]) << (8 * b);
+                }
+                af_pv[0] = u[0]; af_pv[1] = u[1]; af_pv[2] = u[2]; af_pv[3] = u[3];
+                /* The tile's P normaliser must NOT multiply the 64 mma outputs. Carry it in the
+                 * accumulator's UNITS instead: oacc == O/gscale, and the unit change folds into
+                 * the corr multiply that is applied anyway. */
+                const float sc_pv = (vmax > 0.0f) ? (vmax / PS) : 0.0f;
+                float cadj = 1.0f;
+                if (sc_pv > 0.0f) {
+                    cadj = (gscale > 0.0f) ? (gscale / sc_pv) : 0.0f;
+                    gscale = sc_pv;
+                }
+                const float c0 = corr[0] * cadj, c1 = corr[1] * cadj;
+#pragma unroll
+                for (int nj = 0; nj < NJ_PV; nj++) {
+                    oacc[nj][0] *= c0; oacc[nj][1] *= c0;
+                    oacc[nj][2] *= c1; oacc[nj][3] *= c1;
+                }
+            }
+            __syncthreads(); /* every thread's V[t] bytes visible to every P.V warp */
+
+            /* O += P.V, e4m3 k32, straight off the RAW permuted-row Vs8 tile. */
+#pragma unroll
+            for (int nj = 0; nj < NJ_PV; nj += 2) {
+                unsigned rb[4];
+                fa_ldmatrix_x2_trans_b8(rb, &Vs8[lane * (HD + PAD8) + pv_wn * HDW + nj * 8]);
+                unsigned b0[2] = {rb[0], rb[2]}, b1[2] = {rb[1], rb[3]};
+                fa_mma_fp8_k32(oacc[nj], af_pv, b0, oacc[nj]);
+                fa_mma_fp8_k32(oacc[nj + 1], af_pv, b1, oacc[nj + 1]);
+            }
+            __syncthreads(); /* P.V done reading Vs8 before V[t+1] restages it */
+        }
+
+#pragma unroll
+        for (int nj = 0; nj < NJ_PV; nj++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const unsigned qrow = (unsigned)(r0 + (e >> 1) * 8);
+                const unsigned qabs_row = q0 + qrow;
+                if (qabs_row >= seq_q) continue;
+                const int hd = pv_wn * HDW + nj * 8 + (lane & 3) * 2 + (e & 1);
+                if (nsplit > 1) {
+                    Opart[((size_t)(qabs_row * n_head + h) * nsplit + sp) * HD + hd] =
+                        oacc[nj][e] * gscale;
+                } else {
+                    const float lv = l_reg[e >> 1];
+                    const float inv = (lv > 0.0f) ? (gscale / lv) : 0.0f;
+                    O[(size_t)(qabs_row * n_head + h) * HD + hd] =
+                        __float2bfloat16(oacc[nj][e] * inv);
+                }
+            }
+        if (nsplit > 1 && pv_wn == 0 && (lane & 3) == 0) {
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const unsigned qabs_row = q0 + (unsigned)(r0 + j * 8);
+                if (qabs_row >= seq_q) continue;
+                float* ml = mlpart + ((size_t)(qabs_row * n_head + h) * nsplit + sp) * 2;
+                ml[0] = m_reg[j];
+                ml[1] = l_reg[j];
+            }
+        }
+    }
+}
+#endif /* PLOW_NV_FA_FP8PV */
+
+#if PLOW_NV_FA_FP8MMA && defined(PLOW_FP8_KV) && !PLOW_NV_FA_TMA
+/* ============================ PX-23: hd256 SLIDING-layer fp8 fast prefill ====================
+ * The arm PX-20 §5 named as the single most actionable finding in the campaign: an all-layer
+ * e4m3 packet emits hd256 FLASH_PREFILL_FP8, the PIPE=1 fp8 object trapped on it, and the whole
+ * packet fell to the PIPE=0 synchronous-staging path at 176 s of prefill per 127k request.
+ *
+ * Same contract as d_flash_prefill (FP8KV=true): e4m3 K/V cache + PER-ROW f32 dequant scales.
+ * Same numerics discipline as the px4 fp8mma arm, which is already validated against the PIPE=0
+ * reference: QK runs as mma.m16n8k32.e4m3 straight off a per-q-tile-quantized Q and the RAW Ks8
+ * tile (the Q row scale and the K column scale both factor out of the dot and post-multiply the
+ * score); V dequants e4m3 -> fp16 with its row scale FOLDED IN, so P stays unscaled in [0,1] and
+ * the P.V is the fp16 mma twin.
+ *
+ * Tiling rationale, smem budget and the warp-specialization decision: see FA_PX23_SMEM_FLOATS
+ * above and plans/hd256-fp8-prefill.md. In one line: BQ=64/BKV=32 with a 4x2 warp grid and NO hd
+ * split, because at hd256 the query x kv tile already fills 8 warps — which deletes px4's second
+ * score tile, and with it the naive retile's 104,464 B arena (over the 101,376 B cap). */
+template <int HD, int BQ, int BKV>
+__device__ void d_flash_prefill_px23(float* __restrict__ Opart, float* __restrict__ mlpart,
+                                     const __nv_bfloat16* __restrict__ Q,
+                                     const __nv_bfloat16* __restrict__ K,
+                                     const __nv_bfloat16* __restrict__ V,
+                                     __nv_bfloat16* __restrict__ O, unsigned seq_q, unsigned seq_kv,
+                                     unsigned n_head, unsigned n_kv_head, unsigned q_pos0,
+                                     unsigned window, unsigned nsplit, unsigned kv_stride,
+                                     unsigned kv_mask, float scale, unsigned slice, unsigned nblk,
+                                     float* lds, const float* __restrict__ k_scale,
+                                     const float* __restrict__ v_scale) {
+    static_assert(HD == 256 && BQ == 64 && BKV == 32, "px23 arm is the hd256 SLIDING-layer tiling");
+    static_assert((int)PLOW_NV_WARPS == 8 && (int)PLOW_NV_THREADS == 256,
+                  "px23 warp grids assume 8 warps / 256 threads");
+    /* The arm must never outgrow the arena the host allocated (PLOW_NV_PRE_A). A too-large claim
+     * does NOT fail at compile time otherwise — it fails as a refused module load at serve time. */
+    static_assert(FA_PX23_SMEM_FLOATS(HD, BQ, BKV) <= FA_PRE_SMEM_FLOATS(HD, BQ, BKV),
+                  "px23 smem claim exceeds the prefill arena");
+    constexpr int PAD = FA_PRE_PAD;      /* bf16/fp16 row pad, 8 elems */
+    constexpr int PAD8 = FA_FP8_PAD8_K;  /* e4m3 row pad, 32 bytes */
+    constexpr int KSTEPS8 = HD / 32;     /* 8 k32 QK steps (no hd split) */
+    constexpr int NJ_QK = BKV / 16;      /* 2 n8 QK sub-tiles per warp (WQK_N = 2) */
+    constexpr int WPV_N = 2;             /* hd warp cols */
+    constexpr int HDW = HD / WPV_N;      /* 128 */
+    constexpr int NJ_PV = HDW / 8;       /* 16 */
+    constexpr int KSTEPS_PV = BKV / 16;  /* 2 k16 P.V steps */
+    constexpr int HCH8 = HD / 16;        /* 16B cp.async lines per e4m3 row */
+    constexpr int QPL = HD / 8;          /* Q elems per lane in the quant pass (8 lanes/row) */
+
+    /* smem: Ss | Vs | qsc | ksc | vsc | Qs8 | Ks8 | Vs8  (== FA_PX23_SMEM_FLOATS).
+     * px4's bf16 Qs tile is GONE: it only ever fed the quant pass, which here reads gmem into
+     * registers instead. That is what brings hd256 under the cap. */
+    float* Ss = lds;                                      /* [BQ][BKV] f32 scores */
+    __half* Vs = (__half*)(Ss + BQ * BKV);                /* [BKV][HD+PAD] fp16, v_scale folded */
+    float* qsc_s = (float*)(Vs + BKV * (HD + PAD));       /* [BQ] per-query-row Q scale */
+    float* ksc_s = qsc_s + BQ;                            /* [BKV] this tile's K row scales */
+    float* vsc_s = ksc_s + BKV;                           /* [BKV] this tile's V row scales */
+    unsigned char* Qs8 = (unsigned char*)(vsc_s + BKV);   /* [BQ*HD] e4m3, A-FRAGMENT order */
+    unsigned char* Ks8 = Qs8 + BQ * HD;                   /* [BKV][HD+PAD8] raw e4m3 */
+    unsigned char* Vs8 = Ks8 + BKV * (HD + PAD8);
+
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    /* ONE warp map for both phases: warp owns query rows [wm*16, +16) throughout.
+     * QK  : wm = query warp row (4), wn = kv warp col (2, 16 kv cols each, NJ_QK n8 sub-tiles).
+     * P.V : wm = query warp row (4), wn = hd warp col (2, HDW=128 each). */
+    const int wm = warp >> 1, wn = warp & 1;
+    const int r0 = wm * 16 + (lane >> 2); /* this lane's P rows: r0 and r0+8 */
+    const int c0 = (lane & 3) * 2;        /* ... and P cols c0,c0+1,c0+8,c0+9 per k16 step */
+
+    const unsigned gqa = n_head / n_kv_head;
+    const unsigned n_qt = (seq_q + BQ - 1) / BQ;
+    const unsigned n_work = n_qt * n_head * nsplit;
+    const float lscale = FA_SCALE(scale);
+
+    for (unsigned w = slice; w < n_work; w += nblk) {
+        const unsigned sp = w % nsplit;
+        const unsigned h = (w / nsplit) % n_head;
+        const unsigned qt = w / (nsplit * n_head);
+        const unsigned q0 = qt * BQ;
+        const unsigned hkv = h / gqa;
+
+        const unsigned per = (seq_kv + nsplit - 1) / nsplit;
+        const unsigned lo = sp * per;
+        const unsigned hi = (lo + per < seq_kv) ? (lo + per) : seq_kv;
+
+        const __nv_bfloat16* Qh = Q + (size_t)q0 * n_head * HD + (size_t)h * HD;
+        const unsigned char* Kb8 = (const unsigned char*)K + (size_t)hkv * kv_stride * HD;
+        const unsigned char* Vb8 = (const unsigned char*)V + (size_t)hkv * kv_stride * HD;
+        const float* ksc = k_scale + (size_t)hkv * kv_stride;
+        const float* vsc = v_scale + (size_t)hkv * kv_stride;
+
+        __syncthreads(); /* previous item's Vs/Ss/Qs8 reads done before restage */
+
+        /* ---- Q -> e4m3, ONCE per q-tile, straight from gmem through REGISTERS ----------------
+         * 8 lanes per row, each owning QPL = HD/8 contiguous bf16 (one coalesced 512 B burst per
+         * 8 lanes); 8 warps x 4 rows = 32 rows per pass, BQ/32 passes. Per-row amax via 3 quad
+         * shfls -> qinv; the inverse scale lands in qsc_s and multiplies the score together with
+         * the K column scale (both factor out of the e4m3 dot exactly as the w8a8 GEMM scales do).
+         * Out-of-range rows: amax 0 => qinv 0 => stored bytes 0 and scale 0.
+         * No barrier is needed here at all — px4 needed one only because it round-tripped Q
+         * through a shared Qs tile that this arm does not have.
+         *
+         * Store is in A-FRAGMENT order: slot ((qm*KSTEPS8 + kf) << 9) + L*16 + hi8 holds the 8
+         * k-bytes lane L reads for its (row lo|hi, kf) m16n8k32 A operand, so the QK loop is ONE
+         * conflict-free LDS.128 per k32 step. */
+        {
+            const int le = lane & 7;
+            const int cb = le * QPL;
+#pragma unroll 1
+            for (int qr = warp * 4 + (lane >> 3); qr < BQ; qr += 32) {
+                __nv_bfloat16 qv[QPL];
+                const bool inq = (q0 + (unsigned)qr) < seq_q;
+                const __nv_bfloat16* src = Qh + (size_t)qr * n_head * HD + cb;
+                float amax = 0.0f;
+#pragma unroll
+                for (int e = 0; e < QPL; e += 8) {
+                    uint4 z = make_uint4(0u, 0u, 0u, 0u);
+                    if (inq) z = *(const uint4*)(src + e);
+                    *(uint4*)&qv[e] = z;
+                }
+#pragma unroll
+                for (int e = 0; e < QPL; e++) amax = fmaxf(amax, fabsf(__bfloat162float(qv[e])));
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+                const float qinv = (amax > 0.0f) ? (PLOW_FP8_E4M3_MAX / amax) : 0.0f;
+                if (le == 0) qsc_s[qr] = amax * (1.0f / PLOW_FP8_E4M3_MAX);
+                const int qm = qr >> 4, r7 = qr & 7, hi8 = ((qr >> 3) & 1) * 8;
+#pragma unroll
+                for (int g = 0; g < QPL / 8; g++) {
+                    unsigned u0 = 0, u1 = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        u0 |= (unsigned)quant_fp8(__bfloat162float(qv[g * 8 + j]) * qinv) << (8 * j);
+#pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        u1 |= (unsigned)quant_fp8(__bfloat162float(qv[g * 8 + 4 + j]) * qinv)
+                              << (8 * j);
+                    const int c = cb + g * 8;
+                    const int kf = c >> 5, L = r7 * 4 + ((c >> 3) & 3);
+                    *(uint2*)&Qs8[(((qm * KSTEPS8) + kf) << 9) + L * 16 + hi8] = make_uint2(u0, u1);
+                }
+            }
+        }
+
+        float oacc[NJ_PV][4];
+#pragma unroll
+        for (int nj = 0; nj < NJ_PV; nj++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) oacc[nj][e] = 0.0f;
+        /* Online-softmax state: REGISTER-resident, rows r0 (j=0) and r0+8 (j=1). Replicated
+         * across the WPV_N warps of a query row (identical arithmetic). */
+        float m_reg[2] = {FA_NEG_INF, FA_NEG_INF}, l_reg[2] = {0.0f, 0.0f};
+
+        const int qabs_max = (int)(q_pos0 + q0 + BQ - 1);
+        unsigned eff_lo = lo;
+        if (window) {
+            const long wfloor = (long)q_pos0 + q0 - (long)window + 1;
+            if (wfloor > (long)lo) eff_lo = ((unsigned)wfloor / BKV) * (unsigned)BKV;
+        }
+        long cap = (long)hi - 1;
+        if ((long)qabs_max < cap) cap = (long)qabs_max;
+        const int nt = (cap >= (long)eff_lo) ? (int)((cap - (long)eff_lo) / BKV) + 1 : 0;
+
+        /* Staging: BKV*HCH8 = 512 16B lines per tile over 256 threads = 2 lines each. Ownership
+         * is per-thread, which is what makes the V dequant below barrier-free. */
+        auto stageK = [&](unsigned kv0) {
+#pragma unroll
+            for (int L = tid; L < BKV * HCH8; L += (int)PLOW_NV_THREADS) {
+                const int r = L / HCH8, c16 = (L % HCH8) * 16;
+                const unsigned kv = kv0 + (unsigned)r;
+                const bool in = (kv < hi);
+                const unsigned char* g = in ? Kb8 + (size_t)(kv & kv_mask) * HD + c16 : Kb8;
+                fa_cp_async_cg16(&Ks8[r * (HD + PAD8) + c16], g, in ? 16 : 0);
+            }
+            fa_cp_commit();
+        };
+        auto stageV = [&](unsigned kv0) {
+#pragma unroll
+            for (int L = tid; L < BKV * HCH8; L += (int)PLOW_NV_THREADS) {
+                const int r = L / HCH8, c16 = (L % HCH8) * 16;
+                const unsigned kv = kv0 + (unsigned)r;
+                const bool in = (kv < hi);
+                const unsigned char* g = in ? Vb8 + (size_t)(kv & kv_mask) * HD + c16 : Vb8;
+                fa_cp_async_cg16(&Vs8[r * (HD + PAD8) + c16], g, in ? 16 : 0);
+            }
+            fa_cp_commit();
+        };
+
+        __syncthreads(); /* Qs8 published before the QK loop reads it */
+
+        /* Prefetch tile 0's K/V row scales into a register (threads 0..2*BKV-1). */
+        float sc_pf = 0.0f;
+        if (tid < 2 * BKV && nt > 0) {
+            const unsigned kvr = eff_lo + (unsigned)(tid & (BKV - 1));
+            if (kvr < hi) sc_pf = (tid < BKV) ? ksc[kvr & kv_mask] : vsc[kvr & kv_mask];
+        }
+        if (nt > 0) stageK(eff_lo); /* prologue: K[0] in flight */
+
+        for (int t = 0; t < nt; t++) {
+            const unsigned kv0 = eff_lo + (unsigned)t * BKV;
+            stageV(kv0); /* V[t] streams under QK[t] + softmax[t] */
+            /* Publish the PREFETCHED scales for tile t (STS only — the gmem load was issued a
+             * full tile ago), then issue tile t+1's loads. Out-of-range rows carry 0. */
+            if (tid < 2 * BKV) {
+                ((tid < BKV) ? ksc_s : vsc_s)[tid & (BKV - 1)] = sc_pf;
+                const unsigned kvn = kv0 + BKV + (unsigned)(tid & (BKV - 1));
+                sc_pf = 0.0f;
+                if (kvn < hi) sc_pf = (tid < BKV) ? ksc[kvn & kv_mask] : vsc[kvn & kv_mask];
+            }
+            fa_cp_wait<1>(); /* K[t] landed (V[t] is the one outstanding group) */
+            __syncthreads();
+
+            /* ---- S = Q.K^T : mma.m16n8k32.e4m3 off Qs8 (A-fragment order) and RAW Ks8 --------
+             * 4 independent accumulator chains (NJ_QK sub-tiles x kf parity) so the ~28cyc
+             * dependent-QMMA latency never stacks more than 2 deep over the 8 k32 steps. */
+            {
+                float acc[NJ_QK][4], accB[NJ_QK][4];
+#pragma unroll
+                for (int nj = 0; nj < NJ_QK; nj++)
+#pragma unroll
+                    for (int e = 0; e < 4; e++) { acc[nj][e] = 0.0f; accB[nj][e] = 0.0f; }
+                const int nn0 = wn * 16 + (lane >> 2);
+                const int kb0 = 8 * (lane & 3);
+                const uint4* QsAf = (const uint4*)&Qs8[((wm * KSTEPS8) << 9) + lane * 16];
+#pragma unroll
+                for (int kf = 0; kf < KSTEPS8; kf++) {
+                    const uint4 av = QsAf[kf * 32]; /* (kf<<9)/16 uint4 slots */
+                    unsigned a8[4];
+                    a8[0] = av.x; a8[2] = av.y;
+                    a8[1] = av.z; a8[3] = av.w;
+#pragma unroll
+                    for (int nj = 0; nj < NJ_QK; nj++) {
+                        const uint2 bb =
+                            *(const uint2*)&Ks8[(nn0 + nj * 8) * (HD + PAD8) + kb0 + kf * 32];
+                        unsigned b8[2] = {bb.x, bb.y};
+                        if (kf & 1) fa_mma_fp8_k32(accB[nj], a8, b8, accB[nj]);
+                        else fa_mma_fp8_k32(acc[nj], a8, b8, acc[nj]);
+                    }
+                }
+                /* C layout: acc[0],acc[1] = row (lane>>2), kv cols 2*(lane&3),+1; acc[2],acc[3]
+                 * = row +8. Adjacent kv cols -> two STS.64 per sub-tile. */
+                const int kc0 = wn * 16 + (lane & 3) * 2;
+                const int qlo = wm * 16 + (lane >> 2);
+                const float q0s = qsc_s[qlo], q1s = qsc_s[qlo + 8];
+#pragma unroll
+                for (int nj = 0; nj < NJ_QK; nj++) {
+                    const int kc = kc0 + nj * 8;
+                    const float ks0 = ksc_s[kc] * lscale, ks1 = ksc_s[kc + 1] * lscale;
+                    const float a0 = acc[nj][0] + accB[nj][0], a1 = acc[nj][1] + accB[nj][1],
+                                a2 = acc[nj][2] + accB[nj][2], a3 = acc[nj][3] + accB[nj][3];
+                    *(float2*)&Ss[qlo * BKV + kc] = make_float2(a0 * ks0 * q0s, a1 * ks1 * q0s);
+                    *(float2*)&Ss[(qlo + 8) * BKV + kc] =
+                        make_float2(a2 * ks0 * q1s, a3 * ks1 * q1s);
+                }
+            }
+            __syncthreads(); /* Ss published; Ks8 free for K[t+1] */
+
+            if (t + 1 < nt) stageK(kv0 + BKV);
+            else fa_cp_commit(); /* keep group counts symmetric for the V wait below */
+
+            const unsigned rmax = (hi - kv0 < (unsigned)BKV) ? (hi - kv0) : (unsigned)BKV;
+
+            /* ---- V[t] wait + OWN-BYTES dequant e4m3 -> fp16, v_scale FOLDED IN ----------------
+             * Each thread dequants exactly the lines it staged, so no visibility barrier is
+             * needed before it; the post-softmax __syncthreads publishes Vs to every P.V warp.
+             * |V*vsc| is the real activation magnitude (comfortably fp16), so P stays unscaled
+             * in [0,1] and the softmax path carries no per-element scale. */
+            fa_cp_wait<1>();
+            {
+#pragma unroll
+                for (int L = tid; L < BKV * HCH8; L += (int)PLOW_NV_THREADS) {
+                    const int r = L / HCH8, c16 = (L % HCH8) * 16;
+                    const __half2 vs2 = __float2half2_rn(vsc_s[r]);
+                    const uint4 raw = *(const uint4*)&Vs8[r * (HD + PAD8) + c16];
+                    __half2 h2;
+                    uint2 dlo, dhi;
+                    uint4 out0;
+#define FA_PX23_CVT8(dst, wrd)                                                                      \
+    {                                                                                               \
+        __half2_raw hr0 =                                                                           \
+            __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)((wrd) & 0xffffu), __NV_E4M3);         \
+        __half2_raw hr1 =                                                                           \
+            __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)((wrd) >> 16), __NV_E4M3);             \
+        h2 = __hmul2(*(__half2*)&hr0, vs2);                                                         \
+        (dst).x = *(unsigned*)&h2;                                                                  \
+        h2 = __hmul2(*(__half2*)&hr1, vs2);                                                         \
+        (dst).y = *(unsigned*)&h2;                                                                  \
+    }
+                    FA_PX23_CVT8(dlo, raw.x);
+                    FA_PX23_CVT8(dhi, raw.y);
+                    out0.x = dlo.x; out0.y = dlo.y; out0.z = dhi.x; out0.w = dhi.y;
+                    *(uint4*)&Vs[r * (HD + PAD) + c16] = out0;
+                    FA_PX23_CVT8(dlo, raw.z);
+                    FA_PX23_CVT8(dhi, raw.w);
+                    out0.x = dlo.x; out0.y = dlo.y; out0.z = dhi.x; out0.w = dhi.y;
+                    *(uint4*)&Vs[r * (HD + PAD) + c16 + 8] = out0;
+#undef FA_PX23_CVT8
+                }
+            }
+
+            /* ---- REGISTER softmax, fused into the P.V A-fragments ----------------------------
+             * BKV=32 is TWO k16 P.V steps, so each lane owns 8 P elements: cols
+             * {c0,c0+1,c0+8,c0+9} and the same +16. The row reduction is still two quad shfls
+             * (4 lanes x 8 elems = 32 cols = BKV) and P never touches smem. */
+            unsigned af_pv[KSTEPS_PV][4];
+            {
+                float p[2][4 * KSTEPS_PV];
+                float corr[2];
+#pragma unroll
+                for (int j = 0; j < 2; j++) {
+                    const int row = r0 + j * 8;
+                    const int qabs = (int)(q_pos0 + q0 + row);
+                    float s[4 * KSTEPS_PV], mx = FA_NEG_INF;
+#pragma unroll
+                    for (int ks = 0; ks < KSTEPS_PV; ks++) {
+                        const float2 v0 = *(const float2*)&Ss[row * BKV + ks * 16 + c0];
+                        const float2 v1 = *(const float2*)&Ss[row * BKV + ks * 16 + c0 + 8];
+                        s[ks * 4 + 0] = v0.x; s[ks * 4 + 1] = v0.y;
+                        s[ks * 4 + 2] = v1.x; s[ks * 4 + 3] = v1.y;
+                    }
+#pragma unroll
+                    for (int ci = 0; ci < 4 * KSTEPS_PV; ci++) {
+                        const int col = (ci >> 2) * 16 + c0 + (ci & 1) + ((ci >> 1) & 1) * 8;
+                        const int kv = (int)kv0 + col;
+                        bool masked = ((unsigned)col >= rmax) || (kv > qabs);
+                        if (window) masked |= ((unsigned)(qabs - kv) >= window);
+                        if (masked) s[ci] = FA_NEG_INF;
+                        mx = fmaxf(mx, s[ci]);
+                    }
+                    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+                    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+                    const float m_new = fmaxf(m_reg[j], mx);
+                    corr[j] = (m_reg[j] == FA_NEG_INF) ? 0.0f : FA_EXP(m_reg[j] - m_new);
+                    float lsum = 0.0f;
+#pragma unroll
+                    for (int ci = 0; ci < 4 * KSTEPS_PV; ci++) {
+                        p[j][ci] = (s[ci] == FA_NEG_INF || m_new == FA_NEG_INF)
+                                       ? 0.0f
+                                       : FA_EXP(s[ci] - m_new);
+                        lsum += p[j][ci];
+                    }
+                    lsum += __shfl_xor_sync(0xffffffffu, lsum, 1);
+                    lsum += __shfl_xor_sync(0xffffffffu, lsum, 2);
+                    l_reg[j] = l_reg[j] * corr[j] + lsum;
+                    m_reg[j] = m_new;
+                }
+                /* A fragment per k16 step: [0]=(r0,klo) [1]=(r0+8,klo) [2]=(r0,khi) [3]=(r0+8,khi). */
+#pragma unroll
+                for (int ks = 0; ks < KSTEPS_PV; ks++) {
+                    __half2 hh;
+                    hh = __floats2half2_rn(p[0][ks * 4 + 0], p[0][ks * 4 + 1]);
+                    af_pv[ks][0] = *(unsigned*)&hh;
+                    hh = __floats2half2_rn(p[1][ks * 4 + 0], p[1][ks * 4 + 1]);
+                    af_pv[ks][1] = *(unsigned*)&hh;
+                    hh = __floats2half2_rn(p[0][ks * 4 + 2], p[0][ks * 4 + 3]);
+                    af_pv[ks][2] = *(unsigned*)&hh;
+                    hh = __floats2half2_rn(p[1][ks * 4 + 2], p[1][ks * 4 + 3]);
+                    af_pv[ks][3] = *(unsigned*)&hh;
+                }
+#pragma unroll
+                for (int nj = 0; nj < NJ_PV; nj++) {
+                    oacc[nj][0] *= corr[0];
+                    oacc[nj][1] *= corr[0];
+                    oacc[nj][2] *= corr[1];
+                    oacc[nj][3] *= corr[1];
+                }
+            }
+
+            __syncthreads(); /* the own-bytes fp16 Vs is now visible to every P.V warp */
+
+            /* O += P.V, fp16 mma twin. ks outer / nj inner: all NJ_PV mmas of a step are
+             * independent, so the dependent chain is KSTEPS_PV deep, not NJ_PV*KSTEPS_PV. */
+#pragma unroll
+            for (int ks = 0; ks < KSTEPS_PV; ks++)
+#pragma unroll
+                for (int nj = 0; nj < NJ_PV; nj++) {
+                    unsigned bf[2];
+                    fa_ldmatrix_x2_trans(
+                        bf, &Vs[(ks * 16 + (lane % 16)) * (HD + PAD) + wn * HDW + nj * 8]);
+                    fa_mma_f16(oacc[nj], af_pv[ks], bf, oacc[nj]);
+                }
+            __syncthreads(); /* P.V done reading Vs before V[t+1] restages it */
+        }
+
+        /* Epilogue: m/l come straight from this lane's registers. */
+#pragma unroll
+        for (int nj = 0; nj < NJ_PV; nj++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const unsigned qrow = (unsigned)(r0 + (e >> 1) * 8);
+                const unsigned qabs_row = q0 + qrow;
+                if (qabs_row >= seq_q) continue;
+                const int hd = wn * HDW + nj * 8 + (lane & 3) * 2 + (e & 1);
+                if (nsplit > 1) {
+                    Opart[((size_t)(qabs_row * n_head + h) * nsplit + sp) * HD + hd] = oacc[nj][e];
+                } else {
+                    const float lv = l_reg[e >> 1];
+                    const float inv = (lv > 0.0f) ? (1.0f / lv) : 0.0f;
+                    O[(size_t)(qabs_row * n_head + h) * HD + hd] =
+                        __float2bfloat16(oacc[nj][e] * inv);
+                }
+            }
+        if (nsplit > 1 && wn == 0 && (lane & 3) == 0) {
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                const unsigned qabs_row = q0 + (unsigned)(r0 + j * 8);
+                if (qabs_row >= seq_q) continue;
+                float* ml = mlpart + ((size_t)(qabs_row * n_head + h) * nsplit + sp) * 2;
+                ml[0] = m_reg[j];
+                ml[1] = l_reg[j];
+            }
+        }
+    }
+}
+#endif /* PX-23 hd256 fp8 arm */
 
 /* PX-1 STAGE 2 (varlen): `req` (default nullptr = legacy single-request, byte-identical) is the
  * packed chunk's request table [R, {q0, qlen, slot, kvlen} per request]. In varlen mode ONE

@@ -52,8 +52,10 @@ mod block;
 use block::{parse_block, write_block_descriptor};
 mod config;
 use config::*;
+mod ladder;
 mod mla;
 use mla::{glm_main, glm_emit_block, kimi_emit_block, nemotron_emit_block, MlaArch};
+pub mod manifest;
 
 /// Flash-decode GQA fusion factor on FULL-attention layers. **This must equal the
 /// kernel constant** (`PLOW_NV_FA_GF` on sm_120, `PLOW_FA_GF_FULL` on AMD) or the
@@ -63,6 +65,39 @@ use mla::{glm_main, glm_emit_block, kimi_emit_block, nemotron_emit_block, MlaArc
 /// sm_120 build ships GF=4 (worth a measured 1.71x on flash-decode); GF=2 is a
 /// Gemma artifact. The binding invariant is `gqa_local % FA_GF_FULL == 0`.
 const FA_GF_FULL: u32 = 2;
+
+/// The GF the packet must be built for — `PLOW_FA_GF_FULL` if set, else the
+/// constant above.
+///
+/// WHY THIS EXISTS. `FA_GF_FULL` is documented as "must equal the kernel
+/// constant", and the two derive different things from it: the kernel decides
+/// how many query heads one flash work item carries, the compiler decides
+/// `nsplit` so that `n_grp * nsplit` fills the resident grid. Nothing enforced
+/// the equality, and nothing could: `PLOW_NV_FA_GF_FULL` is an nvcc `-D` on the
+/// object while this is a Rust constant in the emitter. They are already out of
+/// step on main — `scripts/build_sm120_cubin.sh` ships `-DPLOW_NV_FA_GF_FULL=4`
+/// against this `2`.
+///
+/// For a TUNER the consequence is worse than a wrong constant. Sweeping
+/// `-DPLOW_NV_FA_GF_FULL` alone re-splits the work in the kernel while the
+/// packet keeps sizing `nsplit` for GF=2, so every arm measures a
+/// compiler/kernel DISAGREEMENT rather than the knob — and the sweep would
+/// faithfully report the mismatch as the knob's effect. Measured on the
+/// Gemma-4-12B full block (layer 5, kv_heads 1) at B=1/ctx 130560 with the
+/// packet pinned at 2: GF 2 → 971.8 us, 4 → 689.3, 8 → 986.9, i.e. the widest
+/// fusion looked WORST while it was the one furthest from the packet's
+/// assumption.
+///
+/// So GF_FULL is a PAIR — object define plus packet env — in exactly the way
+/// `(PLOW_NV_FORCE_MINBLK, --n-cu)` already is, and `DecodeKnobs::emit_env`
+/// renders both halves together. Unset leaves every packet byte-identical.
+pub(crate) fn fa_gf_full() -> u32 {
+    std::env::var("PLOW_FA_GF_FULL")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|v| matches!(v, 1 | 2 | 4 | 8 | 16))
+        .unwrap_or(FA_GF_FULL)
+}
 
 /// Greatest common divisor (Euclid). Used to grid-align the full-layer flash-decode
 /// nsplit to the resident-block count (T9b).
@@ -439,7 +474,7 @@ fn declare(
     //
     // Only `ids`/`pos` and the KV cache legitimately span the context: the cache IS the context,
     // and ids/pos are i32 (a rounding error). Everything else holds the CURRENT chunk.
-    let rows = ctx.min(MAX_CHUNK);
+    let rows = ctx.min(max_chunk(c.window));
     // TP head split (plans/tp-design.md §3a): each rank owns heads/N q-heads and kvh/N kv-heads,
     // so every head-dimensioned activation and the KV cache shrink by N. Column/row-parallel
     // weights and the inter/vocab-dimensioned activations shrink by N too. tp==1 => /1, identical.
@@ -743,7 +778,7 @@ fn declare(
         // 2x on full layers only (a minority), the design's chosen tradeoff. Sliding layers (16 kv)
         // still split cleanly at tp=8. Requires kvh|tp OR tp|kvh; anything else fails loudly.
         let kvh_local = kvh_local(kvh, tp, l);
-        let (kvr, _) = kv_ring(full, ctx);
+        let (kvr, _) = kv_ring(full, ctx, c.window, max_chunk(c.window));
         let qd = (c.heads / tp) * hd; // column-parallel q output shard
         let kd = kvh_local * hd; // column-parallel k/v output shard (KV head-sharded/replicated)
                                  // fp8-KV: the cache is uint8 e4m3 (1 byte/elem, HALF the bf16 footprint) plus a per-row
@@ -992,10 +1027,75 @@ const GM_LDS_HALVES: u64 = 2 * (256 + 256) * (64 + 8);
 /// chunk bigger than this, and decode is one row. So it caps BOTH the bucket ladder (a program
 /// for T > MAX_CHUNK can never be invoked) and every ACTIVATION tensor (they hold the current
 /// chunk, not the context -- only the KV cache spans the context).
-const MAX_CHUNK: u32 = 8192;
+const MAX_CHUNK_MAX: u32 = 8192;
+
+/// Smallest chunk the window-derived default will pick (the bucket ladder's floor).
+const MAX_CHUNK_MIN: u32 = 128;
+
+/// Default prefill chunk **derived from the model**, not a constant.
+///
+/// The chunk sizes the sliding-layer KV ring (`ring = next_pow2(window + chunk - 1)`), so on a
+/// windowed model an oversized chunk inflates the ring for no benefit: Gemma-4 (window 1024)
+/// rang 16384 rows at the old flat 8192 default purely because of the chunk. Picking the chunk
+/// from the window puts the ring at `2 * next_pow2(window)` — the smallest it can be without
+/// violating the `ring >= window + chunk - 1` invariant.
+///
+/// MEASURED (Gemma-4-12B, window 1024, RTX 5090, fp8 weights+KV, B=8, ctx 8192):
+///
+/// | chunk | KV cache  | activations | 4096-tok-prompt prefill run |
+/// |-------|-----------|-------------|-----------------------------|
+/// | 8192  | 10.66 GiB | 1.84 GiB    | 16.13 s                     |
+/// | 1024  |  3.04 GiB | 0.30 GiB    | 16.45 s                     |
+///
+/// 3.5x less KV and 6x less activation for 2% on a deliberately prefill-dominated shape
+/// (4096 in / 32 out), which is the worst case since it is what pays the extra launches.
+///
+/// **`window == 0` (all-global, e.g. Llama-style) keeps [`MAX_CHUNK_MAX`].** `kv_ring` returns
+/// `(ctx, MASK_NONE)` for full-attention layers, so the chunk does not size their cache at all
+/// — lowering it there would buy no KV and only cost prefill launches. This is why the default
+/// is a function of the model rather than the flat 1024 that Gemma alone would suggest.
+fn default_chunk(window: u32) -> u32 {
+    if window == 0 {
+        MAX_CHUNK_MAX
+    } else {
+        window.next_power_of_two().clamp(MAX_CHUNK_MIN, MAX_CHUNK_MAX)
+    }
+}
+
+/// Largest prefill chunk for this compile. `PLOW_MAX_CHUNK` lowers it to buy back
+/// sliding-layer KV: the ring is sized `window + chunk - 1` (see [`kv_ring_rows`]), so on a
+/// model whose window is far below the chunk it is the CHUNK that sets the ring, not the
+/// model. Gemma-4 (window 1024) at the 8192 default rings 16384 rows = 320 KiB/token * 16384
+/// = 5.0 GiB/seq; chunk 1024 rings 2048 and costs 0.625 GiB/seq — 8x, for more prefill
+/// launches on long prompts.
+///
+/// Must be a power of two and no larger than [`MAX_CHUNK_MAX`] (the bucket ladder tops out
+/// there). Unset = [`default_chunk`] for this model's window; pass `PLOW_MAX_CHUNK=8192` to
+/// reproduce the blob this emitter produced before the default became window-derived.
+fn max_chunk(window: u32) -> u32 {
+    let v = std::env::var("PLOW_MAX_CHUNK")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or_else(|| default_chunk(window));
+    assert!(
+        v.is_power_of_two() && v <= MAX_CHUNK_MAX,
+        "PLOW_MAX_CHUNK {v} must be a power of two <= {MAX_CHUNK_MAX}"
+    );
+    v
+}
 
 /// SLIDING-WINDOW KV RING. Mirrors `PLOW_KV_RING` / `PLOW_KV_MASK_NONE` in `dev_isa.h`.
-const KV_RING: u32 = 16384;
+///
+/// Rows a sliding layer's ring needs for a `(window, chunk)` pair, from the dev_isa.h
+/// invariant `ring >= window + chunk - 1`, rounded up to a power of two (the kernels index
+/// `row & (ring-1)`). The kernel reads the mask per op out of the packet, so the ring size is
+/// DATA, not a kernel constant — shrinking it here needs no cubin rebuild.
+///
+/// `window 1024 + chunk 8192` -> 16384, the historical `KV_RING`, so the default is
+/// byte-identical. Every window <= 8193 lands on 16384 at the default chunk.
+fn kv_ring_rows(window: u32, chunk: u32) -> u32 {
+    (window + chunk - 1).next_power_of_two()
+}
 const KV_MASK_NONE: u32 = 0xFFFF_FFFF;
 
 /// How many rows a layer's KV cache actually needs, and the mask its row index is ANDed with.
@@ -1008,15 +1108,24 @@ const KV_MASK_NONE: u32 = 0xFFFF_FFFF;
 /// `[c0, c0+C)` and between them read `[c0-window+1, c0+C-1]`, and the chunk writes all C of its
 /// rows before flash reads any of them. See `PLOW_KV_RING` in dev_isa.h. It is a power of two so
 /// the kernels can AND rather than divide.
-fn kv_ring(full: bool, ctx: u32) -> (u32, u32) {
+fn kv_ring(full: bool, ctx: u32, window: u32, chunk: u32) -> (u32, u32) {
     if full {
         (ctx, KV_MASK_NONE)
     } else {
-        let r = ctx.min(KV_RING); // no point ringing a cache smaller than the ring
+        let r = ctx.min(kv_ring_rows(window, chunk)); // no point ringing a cache smaller than the ring
         // `row & (r-1)` is a modulo ONLY when r is a power of two. For a non-pow2 r the AND
         // aliases rows to WRONG (in-bounds) rows — silent corruption. All shipped ctx are
         // pow2; make the invariant loud (leak-audit finding #6).
         assert!(r.is_power_of_two(), "kv_ring size {r} (ctx {ctx}) must be a power of two");
+        // The wrap invariant binds ONLY when the ring is shorter than the context. At r == ctx
+        // no position is ever reused (`row & (ctx-1) == row` for row < ctx), so the cache is
+        // linear-equivalent and `window + chunk - 1` is vacuous — which is why a small-ctx
+        // build is safe despite r < window + chunk - 1.
+        assert!(
+            r == ctx || r >= window + chunk - 1,
+            "sliding ring {r} < window {window} + chunk {chunk} - 1 (ctx {ctx}): a chunk's rows \
+             would wrap onto their own history — a silent wrong answer, not a crash"
+        );
         (r, r - 1)
     }
 }
@@ -1373,7 +1482,7 @@ fn emit_phase(
     // declared row count in declare()), so the slot is IDENTICAL across every prefill bucket AND
     // the decode program — the host binds dg_tp at that one fixed offset for all of them. For
     // decode t==1 so xr_elems==hidden and the layout is a superset of the old decode path.
-    let rows_max = ctx.min(MAX_CHUNK);
+    let rows_max = ctx.min(max_chunk(c.window));
     let xr_elems = t * c.hidden;
     let slot_b = rows_max * c.hidden * BF16 as u32;
     let rows: Vec<u32> = (0..t.min(n_cu).max(1)).collect();
@@ -1583,13 +1692,13 @@ fn emit_phase(
         // (GQA 8). A single nsplit for both would leave the full layers on 4 of 256 CUs.
         // The sliding layers' cache is a RING; the full layers' is linear. `kvm` is 0xFFFFFFFF
         // for a full layer, so the AND in the kernels is a no-op there. See kv_rows().
-        let (kvr, kvm) = kv_ring(full, ctx);
+        let (kvr, kvm) = kv_ring(full, ctx, c.window, max_chunk(c.window));
         // GF is the flash-decode GQA fusion factor: query heads carried by ONE work item, and it is
         // the KERNEL constant PLOW_FA_GF(hd) = PLOW_FA_GF_FULL (default 2) — NOT 8. The compiler and
         // kernel must agree (dev_isa.h). GF=2 fuses sliding layers fully (GQA 2) and full layers
         // partially (GQA 8 -> reads each row 4x). Under tp=8 shared-kv-head replication a full layer
         // is GQA 4 locally, still a clean multiple of GF=2. The binding invariant is gqa_local % GF.
-        let gf = FA_GF_FULL; // MUST track the kernel's PLOW_NV_FA_GF / PLOW_FA_GF_FULL
+        let gf = fa_gf_full(); // MUST track the kernel's PLOW_NV_FA_GF_FULL; see fa_gf_full()
         assert_eq!(
             (heads / kvh) % gf,
             0,
@@ -1678,7 +1787,7 @@ fn emit_phase(
         //   PLOW_NS_FULL_ABS still overrides for sweeps.
         let ns = if gemv_family && full && ctx > 8192 && c.kvh_full >= 4 && c.kvh_slide != c.kvh_full
         {
-            let n_grp = (heads / FA_GF_FULL).max(1);
+            let n_grp = (heads / fa_gf_full()).max(1);
             let aligned = n_cu / gcd(n_grp, n_cu); // smallest grid-aligned nsplit step
             let cand = ns.div_ceil(aligned) * aligned; // round the ns16 target up to it
             if cand <= 64 {
@@ -1702,7 +1811,7 @@ fn emit_phase(
         // byte-identical. Same <=128 sanity cap idea as the 31B block; PLOW_NS_ABS/PLOW_NS_FULL_ABS
         // still override below.
         let ns = if gemv_family && full && ctx > 8192 && c.kvh_full == 1 && fp8_kv {
-            let n_grp = (heads / FA_GF_FULL).max(1);
+            let n_grp = (heads / fa_gf_full()).max(1);
             let aligned = n_cu / gcd(n_grp, n_cu);
             let cand = ns.div_ceil(aligned) * aligned;
             if cand <= 128 {
@@ -2850,7 +2959,19 @@ fn emit_phase(
     let head_w = if c.tied { n.emb } else { n.head };
     // lm_head is COLUMN(vocab)-parallel (plans/tp-design.md §3a/§8d): each rank produces its
     // vocab_l logit lanes. tp-host binds the rank's vocab slice of the (replicated) weight.
-    let lm_op = if gemv_family {
+    // PLOW_PF_GEMV_HEAD=1 (PX-6 recommendation A): prefill lm_head is M=1 (see `lm_m` below), but
+    // `pick_tile` hands it to the TILED arm, which computes BM=128 rows to keep one — 0.78% row
+    // efficiency. Measured 1.991 -> 1.213 ms (-39%) on the FFMA GEMV arm, which reaches 98% of the
+    // 5090's 1695.6 GB/s ceiling against the tiled arm's 60%. Decode already takes `DevOp::Gemv`
+    // via `gemv_family`; this only redirects the PREFILL emit, hence the `!decode` guard.
+    //
+    // REQUIRES the prefill cubin built with `-DPLOW_NV_PF_GEMV_HEAD=1` — `case PLOW_DOP_GEMV` is
+    // otherwise compiled out of that object (`#if !PLOW_NV_PREFILL`, interp_sm120.cu) and the
+    // packet hits `default: __trap()`. That is the loud failure, not a silent wrong answer.
+    // Unset = byte-identical. See perf-data/px6-sm-quantization.md.
+    let pf_gemv_head =
+        !decode && std::env::var("PLOW_PF_GEMV_HEAD").ok().as_deref() == Some("1");
+    let lm_op = if gemv_family || pf_gemv_head {
         DevOp::Gemv
     } else {
         pick_tile(1, vocab_l, c.hidden, n_cu)
@@ -3028,6 +3149,11 @@ pub struct EmitArgs {
     /// [`packet::devbuild::gpu_fingerprint`] so the runtime can warn on a GPU
     /// mismatch. Empty ⇒ unknown (check skipped). Set by plowc from `--gpu`.
     pub gpu: String,
+    /// Target ISA for the `build.json` manifest (`"sm_120a"`, `"gfx950"`, …).
+    /// METADATA ONLY: it changes nothing about the emitted blob — it is carried
+    /// so the manifest says which toolchain a backend should render flags for.
+    /// Empty ⇒ the manifest is not written (the legacy `gemma4` CLI).
+    pub arch: String,
 }
 
 /// Read-only verification hook for [`run_verified`], called with the finished
@@ -3098,6 +3224,7 @@ impl EmitArgs {
             rope_gen: true,
             l2_layout: None,
             gpu: String::new(),
+            arch: String::new(),
         }
     }
 }
@@ -3217,6 +3344,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         rope_gen,
         l2_layout,
         gpu,
+        arch,
     } = args;
 
     // GLM-5.2 (GlmMoeDsa) — MLA + DSA + block-fp8 MoE — is a wholly separate emit path (glm_main).
@@ -3299,7 +3427,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // above; everything else is dense). Byte-identical — the body moved verbatim.
     emit_dense_gqa(
         dir, ctx, out, n_cu, tp, block_spec, embed_cubin, embed_hsaco, rope_gen, l2_layout, gpu,
-        verify,
+        arch, verify,
     );
 }
 
@@ -3320,6 +3448,7 @@ fn emit_dense_gqa(
     rope_gen: bool,
     l2_layout: Option<(u32, u32)>,
     gpu: String,
+    arch: String,
     verify: Option<VerifyHook>,
 ) {
     // Empty --gpu ⇒ unknown target (0), not fnv("") — so the header stamp is 0
@@ -3378,18 +3507,50 @@ fn emit_dense_gqa(
     // op is Megatron-sharded in emit_phase (q/k/v/gate/up column-parallel, o/down row-parallel with
     // an XReduce all-reduce, flash head-split) exactly as decode is — the [T,hidden] all-reduce is
     // the only new regime. The full ladder is emitted at every tp; tp==1 stays byte-identical.
-    let buckets: Vec<u32> = [128u32, 512, 1024, 2048, 4096, 8192]
-        .into_iter()
-        .filter(|&x| x <= ctx.min(MAX_CHUNK))
-        .collect();
+    // PLOW_PF_LADDER=wave (PX-6): derive the rungs from this GPU's SM count instead of the
+    // power-of-two ladder below. Prefill GEMM cost is a STAIRCASE in tm = ceil(t/BM) -- flat
+    // between wave boundaries, so rows inside a tread are free and one row past a tread top
+    // costs a whole extra wave. The power-of-two rungs are unrelated to where the treads are:
+    // measured on a 170-SM 5090 with the real Gemma-4-12B op mix they give up 9.6% of prefill
+    // GEMM time on average over L=128..4096 (worst cells +41.9% at 640 rows, which must be
+    // served as 128+512, and +31.6% at 1280 -> 512+1024). The four tread-top rungs the model
+    // picks -- 1408, 2176, 640, 1792 -- take the mean loss to 1.4%, and not one is a power of
+    // two. See perf-data/px6-sm-quantization.md.
+    //
+    // Same rung COUNT as the shipped ladder, so blob size and compile time are unchanged; only
+    // the rung POSITIONS move. Unset = byte-identical.
+    //
+    // BM/BN = 128 is the sm_120 tile (PGM_BM/PGM_BN, runtime/nvidia/op_gemm.cuh:712-720). The
+    // AMD bodies tile differently, so the ladder is only derived on the NVIDIA path; gate it on
+    // the flag rather than guessing the target's tile from here.
+    const LADDER_BM: u32 = 128;
+    const LADDER_BN: u32 = 128;
+    let cap = ctx.min(max_chunk(c.window));
+    let shipped: Vec<u32> =
+        [128u32, 512, 1024, 2048, 4096, 8192].into_iter().filter(|&x| x <= cap).collect();
+    let buckets: Vec<u32> = if std::env::var("PLOW_PF_LADDER").ok().as_deref() == Some("wave") {
+        let ops = ladder::ladder_ops(&c, LADDER_BN);
+        let max_tm = cap.div_ceil(LADDER_BM).max(1);
+        let l: Vec<u32> = ladder::wave_ladder(n_cu, &ops, max_tm, shipped.len())
+            .into_iter()
+            .map(|tm| tm * LADDER_BM)
+            .filter(|&x| x <= cap)
+            .collect();
+        println!("prefill ladder (PLOW_PF_LADDER=wave, n_cu={n_cu}): {l:?}  [was {shipped:?}]");
+        l
+    } else {
+        shipped
+    };
     // The invariant that ties MAX_CHUNK to KV_RING (see dev_isa.h). Break it and a chunk's own
     // rows wrap onto their history: a silent wrong answer, not a crash.
+    let chunk = max_chunk(c.window);
+    let ring = kv_ring_rows(c.window, chunk);
     assert!(
-        KV_RING >= c.window + MAX_CHUNK - 1,
-        "KV ring {KV_RING} too small for window {} + chunk {MAX_CHUNK}",
+        ring >= c.window + chunk - 1,
+        "KV ring {ring} too small for window {} + chunk {chunk}",
         c.window
     );
-    let arows = ctx.min(MAX_CHUNK);
+    let arows = ctx.min(max_chunk(c.window));
     // opart/mlpart (the flash_prefill partials) are sized in declare() as arows*heads_sharded*ns_pre.
     // The flash writes t*heads_sharded*ns(t) row-splits for a bucket t, where emit_phase derives
     // ns(t) from the SHARDED head count (heads/tp) — so ns_pre must be the worst-case over buckets
@@ -3591,7 +3752,12 @@ fn emit_dense_gqa(
     // benchmarked by someone. PLOW_SKIP_COVERAGE=1 is the deliberate escape hatch for
     // partial/renamed checkpoints; it is loud because it re-arms the silent-wrong-model
     // failure mode this gate exists to prevent.
-    match validate_coverage(&dir, &c.prefix, &m.tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>()) {
+    match validate_coverage(
+        &dir,
+        &c.prefix,
+        &m.tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+        block_mode.then(|| block.clone()),
+    ) {
         Ok(()) => {}
         Err(e) if std::env::var("PLOW_SKIP_COVERAGE").ok().as_deref() == Some("1") => {
             eprintln!("*** PLOW_SKIP_COVERAGE=1 — EMITTING A MODEL KNOWN TO BE WRONG ***\n{e}");
@@ -3602,6 +3768,23 @@ fn emit_dense_gqa(
         }
     }
     std::fs::write(&out, blob).unwrap();
+
+    // BUILD MANIFEST (`build.json`, beside the .pkt). Derived from `m` — the exact
+    // programs just serialized — so it cannot describe a packet other than the one
+    // on disk. That is the whole point: the packet and the interpreter object were
+    // two independent sources of truth, and every failure in the rtx-2x campaign
+    // came out of the gap between them. See crates/devgen/src/manifest.rs.
+    // Skipped when `arch` is empty (the legacy `gemma4` CLI), so that path's output
+    // is unchanged.
+    if !arch.is_empty() {
+        let man = manifest::build(&m, &arch);
+        let mpath = std::path::Path::new(&out).with_file_name("build.json");
+        match serde_json::to_vec_pretty(&man).map(|b| std::fs::write(&mpath, b)) {
+            Ok(Ok(())) => eprintln!("  build manifest -> {}", mpath.display()),
+            Ok(Err(e)) => eprintln!("  WARN: build.json not written: {e}"),
+            Err(e) => eprintln!("  WARN: build.json not serialized: {e}"),
+        }
+    }
 
     let wb: u64 = m
         .tensors
@@ -3930,5 +4113,51 @@ mod pick_tile_tests {
             DevOp::Gemm,
             "T=128 must not pick the big tile"
         );
+    }
+}
+
+#[cfg(test)]
+mod chunk_default_tests {
+    use super::{default_chunk, kv_ring, kv_ring_rows, MAX_CHUNK_MAX};
+
+    /// An all-global model (`window == 0`) must keep the full chunk. `kv_ring`
+    /// returns `(ctx, MASK_NONE)` for full layers, so a smaller chunk buys no
+    /// KV there and only costs prefill launches — the Gemma-shaped default
+    /// must not leak onto Llama-shaped networks.
+    #[test]
+    fn all_global_models_keep_the_full_chunk() {
+        assert_eq!(default_chunk(0), MAX_CHUNK_MAX);
+        // and the chunk genuinely does not size a full layer's cache
+        let (rows_big, mask) = kv_ring(true, 8192, 0, MAX_CHUNK_MAX);
+        let (rows_small, _) = kv_ring(true, 8192, 0, 1024);
+        assert_eq!(rows_big, rows_small, "chunk must not change a full layer");
+        assert_eq!(mask, super::KV_MASK_NONE);
+    }
+
+    /// A windowed model derives the chunk from its own window, so the ring
+    /// lands at 2 x next_pow2(window) — the floor the invariant allows.
+    #[test]
+    fn windowed_models_derive_chunk_from_window() {
+        assert_eq!(default_chunk(1024), 1024); // Gemma-4
+        assert_eq!(default_chunk(4096), 4096);
+        assert_eq!(default_chunk(768), 1024); // rounded up to a power of two
+        // never below the bucket floor, never above the ladder top
+        assert_eq!(default_chunk(1), super::MAX_CHUNK_MIN);
+        assert_eq!(default_chunk(1 << 20), MAX_CHUNK_MAX);
+    }
+
+    /// The wrap invariant must hold for every window the default picks —
+    /// violating it aliases a chunk's rows onto its own history, which is a
+    /// silent wrong answer rather than a crash.
+    #[test]
+    fn derived_chunk_satisfies_the_wrap_invariant() {
+        for w in [128u32, 512, 768, 1024, 2048, 4096, 8192, 16384] {
+            let c = default_chunk(w);
+            let ring = kv_ring_rows(w, c);
+            assert!(
+                ring >= w + c - 1,
+                "window {w} chunk {c} ring {ring} violates ring >= window + chunk - 1"
+            );
+        }
     }
 }

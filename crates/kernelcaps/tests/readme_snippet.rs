@@ -20,7 +20,7 @@ fn the_documented_snippet_compiles_and_holds() {
         return;
     };
     assert_eq!(classify_macro(&h, "PGM_BN"), Sweepable::Overridable);
-    assert_eq!(classify_macro(&h, "PGM_BM"), Sweepable::Fixed);
+    assert_eq!(classify_macro(&h, "PGM_BM"), Sweepable::Overridable); // PX-13
 }
 
 /// The doc states the vendor asymmetry as a table a reader will plan against:
@@ -34,9 +34,11 @@ fn the_documented_sweep_axes_are_accurate() {
         return;
     };
 
-    // M: AMD yes, NVIDIA no.
+    // M: BOTH, since PX-13. `PGM_BM` was a bare `#define` with no `#ifndef`, so
+    // `-DPGM_BM` silently never reached any object; it is a real knob now, which
+    // ends the vendor asymmetry this table used to describe.
     assert_eq!(classify_macro(&amd, "GM_BM"), Sweepable::Overridable);
-    assert_eq!(classify_macro(&nv, "PGM_BM"), Sweepable::Fixed);
+    assert_eq!(classify_macro(&nv, "PGM_BM"), Sweepable::Overridable);
     // K: neither.
     assert_eq!(classify_macro(&amd, "GM_BK"), Sweepable::Fixed);
     assert_eq!(classify_macro(&nv, "PGM_BK"), Sweepable::Fixed);

@@ -79,9 +79,9 @@ impl CtxBucket {
 
 /// The cell a decode record answers for.
 ///
-/// `(gpu, dtype, occupancy, ctx bucket, model shape)` — the design's record key.
-/// Two records in different cells are not rivals and must never be ranked
-/// against each other.
+/// `(gpu, dtype, occupancy, ctx bucket, model shape, decode batch)` — the
+/// design's record key plus the axis px15 added. Two records in different cells
+/// are not rivals and must never be ranked against each other.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DecodeCell {
     /// Hardware key, as `HardwareFingerprint::tuning_path` renders it.
@@ -89,23 +89,43 @@ pub struct DecodeCell {
     /// Weight dtype the packet was emitted for: `bf16`, `fp8`.
     pub dtype: String,
     /// Resident grid width — the occupancy half of the `(FORCE_MINBLK, --n-cu)`
-    /// pair. 132 = 1 block/SM on this part, 264 = 2.
+    /// pair. 132 = 1 block/SM on an H100 NVL, 264 = 2; 170/340 on a 5090.
     pub n_cu: u32,
     pub ctx_bucket: CtxBucket,
     /// Model identity. A knob set tuned on a 26B MoE says nothing about a dense
     /// 12B, so the shape is in the key rather than in a comment.
     pub model: String,
+    /// Decode slots stepped together.
+    ///
+    /// NOT a nicety. `GV_MM_MAX` is the widest `gemv_*_rows<MM>` instantiated,
+    /// so a batch of B costs `ceil(B/GV_MM_MAX)` weight passes — the knob's
+    /// whole effect is a function of B, and `op_gemm.cuh`'s own ladder measures
+    /// the inversion: at B=8, `=8` gives 355 tok/s and `=16` gives 294; at
+    /// B=16 the order flips to 387 vs 520. A cell that cannot say which batch
+    /// it was measured at cannot express either half of that, and a campaign
+    /// asset shipped `=16` while serving B=8 for exactly this reason
+    /// (`perf-data/px10-batched-decode.md`: −19.4% at 131k, −33.8% at 1k).
+    ///
+    /// Deliberately has no `serde(default)`. A record with no batch is not a
+    /// record measured at batch 1, it is a record whose provenance was lost,
+    /// and defaulting would turn the second into the first silently. Rows
+    /// written before this field existed are migrated explicitly (see
+    /// `tuning/nvidia/sm_90a/h100-nvl/decode_measurement.jsonl`), where the
+    /// value is *recoverable*: the sweep script passed a literal `1` for
+    /// `step_bench`'s slot count and could not have measured anything else.
+    pub batch: u32,
 }
 
 impl DecodeCell {
     /// Stable one-line key, used to group records and to name report rows.
     pub fn key(&self) -> String {
         format!(
-            "{}|{}|{}|ncu{}|{}",
+            "{}|{}|{}|ncu{}|b{}|{}",
             self.hardware,
             self.model,
             self.dtype,
             self.n_cu,
+            self.batch,
             self.ctx_bucket.label()
         )
     }
@@ -150,6 +170,15 @@ pub struct DecodeKnobs {
     pub gv_unroll_glu: u32,
     /// `GV_MOE_UN` — MoE expert arm streams.
     pub gv_moe_un: u32,
+    /// `GV_MM_MAX` — widest batched GEMV rung instantiated. `None` = the source
+    /// default (8).
+    ///
+    /// The batch-dependent knob, and the reason `DecodeCell` carries `batch`.
+    /// It is `Option` for the same reason the flash knobs are: the value that
+    /// means "not overridden" is not 0, it is *absent*, and recording 0 would
+    /// describe a `gemv_walk` that instantiates no rung at all.
+    #[serde(default)]
+    pub gv_mm_max: Option<u32>,
     /// `PLOW_MOE_DOWN_SG` — MoE-down lane-split sub-groups.
     pub moe_down_sg: u32,
     /// `PLOW_NS_ABS` — flash decode split count, baked at packet emit.
@@ -166,6 +195,16 @@ pub struct DecodeKnobs {
     #[serde(default)]
     pub fa_gf: Option<u32>,
     /// `PLOW_NV_FA_GF_FULL` — GQA fusion width on the FULL-attention layers.
+    ///
+    /// A PAIR, like `(minblk, n_cu)`: the object define tells the kernel how
+    /// many query heads one flash work item carries, and `PLOW_FA_GF_FULL`
+    /// tells the packet compiler the same number so it can size `nsplit` to
+    /// fill the grid (`n_grp = heads / GF_FULL`). Set one without the other and
+    /// the run measures the DISAGREEMENT, not the knob — measured on the
+    /// Gemma-4-12B full block at ctx 130560 with the packet pinned at 2, the
+    /// widest fusion looked worst precisely because it was furthest from the
+    /// packet's assumption. So [`defines`](Self::defines) and
+    /// [`emit_env`](Self::emit_env) both render it.
     #[serde(default)]
     pub fa_gf_full: Option<u32>,
     /// `PLOW_NV_FA_KUN` — K-stream pre-issue depth.
@@ -217,6 +256,9 @@ impl DecodeKnobs {
         if self.gv_unroll_glu != 0 {
             v.push(format!("-DGV_UNROLL_GLU={}", self.gv_unroll_glu));
         }
+        if let Some(x) = self.gv_mm_max {
+            v.push(format!("-DGV_MM_MAX={x}"));
+        }
         if let Some(x) = self.fa_wpr {
             v.push(format!("-DPLOW_NV_FA_WPR={x}"));
         }
@@ -246,6 +288,13 @@ impl DecodeKnobs {
         if self.ns_full_abs != 0 {
             v.push(format!("PLOW_NS_FULL_ABS={}", self.ns_full_abs));
         }
+        // The packet half of the GF_FULL pair. Emitting it here rather than
+        // leaving it to the operator is the whole point: the object flag and
+        // this one are the same number seen from two sides, and they drift the
+        // moment a human has to remember both.
+        if let Some(x) = self.fa_gf_full {
+            v.push(format!("PLOW_FA_GF_FULL={x}"));
+        }
         v.push(format!("--n-cu {}", self.n_cu));
         for (k, val) in &self.extra_emit {
             v.push(format!("{k}={val}"));
@@ -257,13 +306,14 @@ impl DecodeKnobs {
     pub fn label(&self) -> String {
         let d = |x: Option<u32>| x.map(|v| v.to_string()).unwrap_or_else(|| "d".into());
         let base = format!(
-            "mb{}_ncu{}_un{}_glu{}_mun{}_sg{}_ns{}_nsf{}_wpr{}_gf{}_gff{}_kun{}",
+            "mb{}_ncu{}_un{}_glu{}_mun{}_sg{}_mm{}_ns{}_nsf{}_wpr{}_gf{}_gff{}_kun{}",
             self.minblk,
             self.n_cu,
             self.gv_unroll,
             self.gv_unroll_glu,
             self.gv_moe_un,
             self.moe_down_sg,
+            d(self.gv_mm_max),
             self.ns_abs,
             self.ns_full_abs,
             d(self.fa_wpr),
@@ -412,6 +462,7 @@ mod tests {
             gv_unroll_glu: 0,
             gv_moe_un: 2,
             moe_down_sg: 4,
+            gv_mm_max: None,
             ns_abs: ns,
             fa_wpr: None,
             fa_gf: None,
@@ -422,6 +473,10 @@ mod tests {
     }
 
     fn meas(n_cu: u32, ctx: u32, knobs: DecodeKnobs, ms: f64) -> DecodeMeasurement {
+        meas_b(n_cu, 1, ctx, knobs, ms)
+    }
+
+    fn meas_b(n_cu: u32, batch: u32, ctx: u32, knobs: DecodeKnobs, ms: f64) -> DecodeMeasurement {
         let ns = ms * 1.0e6;
         DecodeMeasurement {
             cell: DecodeCell {
@@ -430,6 +485,7 @@ mod tests {
                 n_cu,
                 ctx_bucket: CtxBucket::of(ctx),
                 model: "gemma-4-26B-A4B-it".into(),
+                batch,
             },
             knobs,
             ctx,
@@ -464,7 +520,7 @@ mod tests {
         assert!(d.contains(&"-DGV_UNROLL=4".to_string()));
         assert!(d.contains(&"-DGV_UNROLL_GLU=2".to_string()));
         assert!(d.contains(&"-DPLOW_MOE_DOWN_SG=4u".to_string()));
-        assert_eq!(k.label(), "mb2_ncu264_un4_glu2_mun2_sg4_ns32_nsf0_wprd_gfd_gffd_kund");
+        assert_eq!(k.label(), "mb2_ncu264_un4_glu2_mun2_sg4_mmd_ns32_nsf0_wprd_gfd_gffd_kund");
 
         // 0 means "leave the source default alone" — emitting `-DGV_UNROLL_GLU=0`
         // would silently compile a different kernel than the one measured.
@@ -492,6 +548,10 @@ mod tests {
         // record stops being reproducible.
         assert!(!d.iter().any(|s| s.contains("NS_FULL")));
         assert!(k.emit_env().contains(&"PLOW_NS_FULL_ABS=66".to_string()));
+        // GF_FULL is the one knob that renders on BOTH sides, because the
+        // kernel and the packet compiler each derive something from it and a
+        // mismatch measures neither value.
+        assert!(k.emit_env().contains(&"PLOW_FA_GF_FULL=8".to_string()));
 
         // None means "not overridden", which is NOT the same as a value: the
         // shipped recipe sets FA_WPR=1 while the source defaults it to 0, so
@@ -535,6 +595,66 @@ mod tests {
                 assert_eq!(r.cell.ctx_bucket, cell.cell.ctx_bucket);
             }
         }
+    }
+
+    /// The px15 axis. `GV_MM_MAX`'s optimum INVERTS with batch — `op_gemm.cuh`
+    /// measures 355 tok/s for `=8` and 294 for `=16` at B=8, then 387 vs 520 at
+    /// B=16 — so two batches must not be ranked against each other. Without
+    /// this the tuner would report one winner for a knob that provably has two,
+    /// which is how a campaign asset came to ship `=16` while serving B=8.
+    #[test]
+    fn cells_do_not_mix_batch() {
+        let mm = |x: u32| DecodeKnobs { gv_mm_max: Some(x), ..knobs(1, 132, 8, 16) };
+        let ranked = rank_by_cell(vec![
+            // B=8: the narrow rung wins (no spill tax, one extra weight pass).
+            meas_b(132, 8, 1024, mm(8), 22.53),
+            meas_b(132, 8, 1024, mm(16), 27.21),
+            // B=16: the order flips — the halved weight traffic now pays.
+            meas_b(132, 16, 1024, mm(8), 41.34),
+            meas_b(132, 16, 1024, mm(16), 30.80),
+        ]);
+        assert_eq!(ranked.len(), 2, "one cell per batch");
+        let by_batch: BTreeMap<u32, u32> = ranked
+            .iter()
+            .map(|c| (c.cell.batch, c.winner().unwrap().knobs.gv_mm_max.unwrap()))
+            .collect();
+        assert_eq!(by_batch[&8], 8);
+        assert_eq!(by_batch[&16], 16);
+        // Pooled into one cell the 16-winner would be invisible: B=8's absolute
+        // times are lower, so a batch-blind ranking answers "8" for every batch.
+        let pooled = rank_by_cell(vec![
+            meas_b(132, 1, 1024, mm(8), 22.53),
+            meas_b(132, 1, 1024, mm(16), 27.21),
+            meas_b(132, 1, 1024, mm(8), 41.34),
+            meas_b(132, 1, 1024, mm(16), 30.80),
+        ]);
+        assert_eq!(pooled.len(), 1);
+        assert_eq!(pooled[0].winner().unwrap().knobs.gv_mm_max, Some(8));
+    }
+
+    /// A stored record with no batch is not a batch-1 record, it is a record
+    /// whose provenance was lost. `DecodeCell.batch` therefore has no
+    /// `serde(default)`, so an un-migrated row fails loudly instead of being
+    /// re-labelled as something nobody measured.
+    #[test]
+    fn a_cell_without_a_batch_refuses_to_load() {
+        let no_batch = r#"{"hardware":"nvidia/sm_90a/h100-nvl","dtype":"fp8","n_cu":132,
+                           "ctx_bucket":"1k","model":"gemma-4-26B-A4B-it"}"#;
+        let e = serde_json::from_str::<DecodeCell>(no_batch).expect_err("must not load");
+        assert!(e.to_string().contains("batch"), "the error names the missing field: {e}");
+        let with_batch = r#"{"hardware":"nvidia/sm_90a/h100-nvl","dtype":"fp8","n_cu":132,
+                             "ctx_bucket":"1k","model":"gemma-4-26B-A4B-it","batch":1}"#;
+        assert_eq!(serde_json::from_str::<DecodeCell>(with_batch).unwrap().batch, 1);
+    }
+
+    /// `GV_MM_MAX` must rebuild its own object, and "unset" must emit no flag —
+    /// a `-DGV_MM_MAX=0` would instantiate no rung at all.
+    #[test]
+    fn the_batched_gemv_rung_renders_its_flag_and_absence_renders_nothing() {
+        let k = DecodeKnobs { gv_mm_max: Some(16), ..knobs(1, 132, 8, 16) };
+        assert!(k.defines().contains(&"-DGV_MM_MAX=16".to_string()));
+        assert!(!knobs(1, 132, 8, 16).defines().iter().any(|s| s.contains("GV_MM_MAX")));
+        assert_ne!(k.label(), knobs(1, 132, 8, 16).label());
     }
 
     #[test]

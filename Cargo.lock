@@ -2996,6 +2996,7 @@ dependencies = [
  "costmodel",
  "egglog",
  "nn-graph",
+ "num",
  "packet",
  "thiserror 2.0.18",
 ]

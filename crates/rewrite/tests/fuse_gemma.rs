@@ -172,3 +172,85 @@ fn gemma4_has_fewer_norm_linear_fusions_than_gemma3() {
         "expected gemma4 ({fnl4}) to have fewer FusedNormLinear than gemma3 ({fnl3})"
     );
 }
+
+/// The 48-layer unroll must EXTRACT, not abort.
+///
+/// egglog's default `TreeAdditiveCostModel` sums children and combines with
+/// `saturating_add`. A residual stream references its hidden state ~8× per
+/// layer, so the *tree* cost of layer `L` grows ~8^L and pins at `u64::MAX`
+/// around layer 21. Past that, Bellman-Ford's `topo_rnk` stops advancing with
+/// the costs, `save_best_parent_edge` records no parent edge for some e-class,
+/// and reconstruction unwraps `None` (`egglog-2.0.0/src/extract.rs:471`). With
+/// `panic = "abort"` in the release profile that is process death — which is
+/// exactly why the devblob path only ever calls `explore_stats` (saturate-only)
+/// and never `rewrite_graph`.
+///
+/// `extract::DepthCost` replaces the sum with a max, so cost is bounded by
+/// graph DEPTH and cannot saturate at any layer count. Bisected against the
+/// real Gemma-4-12B text config: before the fix, extraction succeeded at 1–16
+/// layers and aborted at 24 and 48; after it, all of them succeed.
+///
+/// 48 is the depth of the model plow actually serves. Dims are small because
+/// the bug is structural — it depends on residual DEPTH, not on tensor sizes.
+#[test]
+fn gemma4_48_layer_unroll_extracts_without_saturating_cost() {
+    let layers = (0..48)
+        .map(|i| {
+            if (i + 1) % 6 == 0 {
+                "\"full_attention\""
+            } else {
+                "\"sliding_attention\""
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cfg = format!(
+        r#"{{
+        "model_type": "gemma4_unified_text",
+        "vocab_size": 1000,
+        "hidden_size": 256,
+        "intermediate_size": 512,
+        "num_hidden_layers": 48,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+        "num_global_key_value_heads": 4,
+        "global_head_dim": 128,
+        "attention_k_eq_v": true,
+        "use_qk_norm": true,
+        "query_pre_attn_scalar": 128.0,
+        "sliding_window": 512,
+        "layer_types": [{layers}],
+        "rope_parameters": {{
+            "full_attention": {{"rope_theta": 1000000.0, "partial_rotary_factor": 0.5}},
+            "sliding_attention": {{"rope_theta": 10000.0}}
+        }}
+    }}"#
+    );
+
+    let g = build_from_config_json(&cfg).expect("build 48-layer gemma4");
+    let (fused, stats) = rewrite::rewrite_graph(&g).expect("48-layer extract must not abort");
+
+    // Fusion actually fired across the whole unroll, not just the first blocks.
+    assert!(
+        stats.fused > 200,
+        "expected >200 fused nodes over 48 layers, got {}",
+        stats.fused
+    );
+    assert!(
+        stats.ops_after < stats.ops_before,
+        "fusion did not reduce ops: {} -> {}",
+        stats.ops_before,
+        stats.ops_after
+    );
+
+    // Per-layer fusions are present at full multiplicity, so the tail of the
+    // unroll fused too — the failure mode this pins is depth-dependent.
+    let count = |op: &str| fused.nodes.iter().filter(|n| n.op == op).count();
+    assert_eq!(count("SwiGLU"), 48, "one gated-MLP fusion per layer");
+    assert_eq!(
+        count("FusedNormRope") + count("FusedNormRopeScale"),
+        96,
+        "q and k norm→rope fusions on every layer"
+    );
+}

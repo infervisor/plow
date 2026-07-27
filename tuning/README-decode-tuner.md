@@ -25,6 +25,13 @@ loses at 2 (the register cap is 128 there and deep unroll spills). `PLOW_NV_FP8_
 occ-1, 2 at occ-2. `PLOW_NS_ABS` 16 at occ-1, 32 at occ-2 — two clean U-shapes with different
 minima. A single `#define` cannot serve both.
 
+**…and they invert with BATCH.** `GV_MM_MAX` is the widest `gemv_*_rows<MM>` instantiated, so a
+batch of B costs `ceil(B/GV_MM_MAX)` weight passes. Measured end-to-end on the 5090
+(`perf-data/px15-tunedb-sm120.md`): at B=1 the two arms are 0.15 % apart, at B=8 `=8` beats `=16`
+by **34.8 %**. `batch` is therefore part of `DecodeCell`, and it is a **packet** axis — the decode
+batch is `PLOW_DECODE_BATCH` at emit time, not `plowc --batch` (prefill buckets) and not a
+`step_bench` argument, which only ever *clamps* to what the packet already has.
+
 ---
 
 ## 2. The one rule that shapes everything: score end-to-end
@@ -99,11 +106,28 @@ PLOW_EXTRA_DEFINES="$(tunedb-decode best ... --print defines)" \
   scripts/build_sm90a_cubin.sh out/interp_sm90a.cubin
 ```
 
-Packet-side knobs (`PLOW_NS_ABS`, `PLOW_NS_FULL_ABS`, `--n-cu`) come back from `--print emit`
-and go to `plowc`. **They are deliberately not the same list** — object flags and packet flags
-land in different artifacts and drift apart exactly when written down as one string. A cubin
-built for 2 blocks/SM against a 132-block packet is not slower, it is a launch the engine
+Packet-side knobs (`PLOW_NS_ABS`, `PLOW_NS_FULL_ABS`, `PLOW_FA_GF_FULL`, `--n-cu`) come back from
+`--print emit` and go to `plowc`. **They are deliberately not the same list** — object flags and
+packet flags land in different artifacts and drift apart exactly when written down as one string.
+A cubin built for 2 blocks/SM against a 132-block packet is not slower, it is a launch the engine
 refuses.
+
+`--print` refuses when the filter leaves more than one cell standing: a flag string names ONE
+object, and the union of two cells' winners is an object nobody measured. Narrow with
+`--model / --dtype / --n-cu / --batch / --ctx`.
+
+### Knobs that are PAIRS, and must be swept as one axis
+
+Three so far. Setting half of a pair does not measure the knob, it measures the disagreement:
+
+| pair | object half | packet half | what breaks |
+|---|---|---|---|
+| occupancy | `PLOW_NV_FORCE_MINBLK` | `--n-cu` | the engine refuses the launch (loud) |
+| full-layer GQA fusion | `PLOW_NV_FA_GF_FULL` | `PLOW_FA_GF_FULL` | the emitter sizes `nsplit` from `n_grp = heads/GF`; a mismatch silently mis-fills the grid |
+| decode batch | — | `PLOW_DECODE_BATCH` | `step_bench` clamps to the packet's batch **silently**, filing a B=1 timing under B=8 |
+
+`DecodeKnobs::defines()` and `emit_env()` render both halves of each, so a record cannot store
+one without the other.
 
 ### Provenance: why your rows may say `provisional`
 
@@ -130,6 +154,18 @@ Use `extra_defines` / `extra_emit` (`BTreeMap<String,String>`) instead of growin
 Both are `serde(default)`, so **older rows still load and there is no schema break**. This is
 the supported path; it exists because the flash family arrived after the struct was written and
 its data had nowhere to go.
+
+### Ranking on blocks, scoring on the model
+`scripts/tune_decode_block_sweep.sh` sweeps a knob on a single-layer block asset
+(`plowc --block N` + `examples/block_run`) in seconds instead of minutes. This is **not** the
+`gemv_lab` mistake §2 forbids: a block drives the REAL interpreter — same cubin, same dispatch,
+same counter protocol, same register footprint — and what made the standalone bench lie was that
+none of that was present. It still cannot give a magnitude, only an ordering, so the protocol is:
+rank wide on blocks → confirm the shortlist end-to-end → publish only the confirmed number.
+
+Measured agreement (px15, `GV_MM_MAX` at B=8): block −32.3 %, model −34.8 %, and an independent
+campaign −33.8 %. Record any case where the two disagree — that is `gemv_lab` reappearing and it
+is the most valuable thing a block sweep can tell you.
 
 ### A new GPU
 `DecodeCell.hardware` is already a `HardwareFingerprint::tuning_path` string

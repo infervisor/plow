@@ -709,7 +709,11 @@ static __device__ void d_gemv_qkv(__nv_bfloat16* __restrict__ Cq, __nv_bfloat16*
  * the old [k][n]+ldmatrix.x2.trans path by runtime/nvidia/experiments/t3_pipe_probe.cu (0/2048 reg
  * mismatches). Because the mma operands are identical bf16 values in identical lanes, the f32
  * accumulation is bit-exact vs T2: greedy tokens are unchanged. */
+/* PX-13: overridable so the prefill tile space can be swept. Default 128 is unchanged. BM must
+ * keep PGM_WM = BM/WARPS_M a multiple of 16 (one m-fragment). */
+#ifndef PGM_BM
 #define PGM_BM 128
+#endif
 /* PX-3: BN overridable so the lean occ-2 GEMM segment object can shrink the N-tile to 64. A
  * 64-wide N-tile drops the plain arena to 3*(ABUF+BBUF)=45 KiB (from 60 KiB at BN=128), which
  * fits 2 blocks/SM under the 100 KiB dynamic-smem cap WITHOUT halving the 3-stage pipeline (the
@@ -1308,10 +1312,31 @@ static __device__ void d_gemm_glu_fp8(__nv_bfloat16* __restrict__ C, const __nv_
 #define PGM_A8BUF8 (PGM_BM * PGM_BK8) /* e4m3 bytes per staged w8a8 A tile ([m][k], stride BK8) */
 #define PGM_B8BUF8 (PGM_BN * PGM_BK8) /* e4m3 bytes per staged w8a8 B tile ([n][k], stride BK8) */
 #define PGM_A8BUF (PGM_BM * PGM_BK)   /* (retained: legacy BK=32 A tile size, unused post-PX-2) */
+/* PX-13: the N-tile is PER-OPCODE for the w8a8 pair. PX-9 §5 swept PGM_BN globally and found it
+ * pulls in OPPOSITE directions on the two bodies: BN=64 is +9.6% on GEMM_GLU_FP8 and -10% on the
+ * plain projections. GEMM_GLU_FP8 holds TWO accumulator sets, so at BN=128 (NFRAG 8) it costs 128
+ * f32/thread and is register-limited to 1 block/SM; BN=64 (NFRAG 4) puts it at 64 f32/thread —
+ * the same as the plain body — at the price of re-reading A twice as often. The plain body has
+ * only one accumulator set, is not register-limited, and only loses the A reuse. So the GLU arm
+ * gets its own tile width.
+ *
+ * DEFAULT 128 — i.e. the knob is implemented but NOT taken, because PX-13 measured it end to end
+ * and it LOSES. Isolated it is worth +9.3% on gate|up at M=8192 and +6.1% at M=1024 (the largest
+ * prefill bucket the runtime actually launches), bit-exact, at unchanged occupancy. On the real
+ * 127k prefill it is 33.21 s vs 32.46 s — a reproducible 2.3% REGRESSION, 25x outside the +-0.03 s
+ * run-to-run band. The microbench and the runtime disagree in SIGN, so the microbench does not get
+ * to pick this constant. -DPGM_GLU_BN=64 re-enables the arm for anyone re-testing it. */
+#ifndef PGM_GLU_BN
+#define PGM_GLU_BN 128
+#endif
+#define PGM_GLU_WN (PGM_GLU_BN / PGM_WARPS_N)
+#define PGM_GLU_NFRAG (PGM_GLU_WN / 8)
+#define PGM_GLU_B8BUF8 (PGM_GLU_BN * PGM_BK8)
 #define PGM_ARENA_W8A8 (((PGM_STAGES * (PGM_A8BUF8 + PGM_B8BUF8)) + 1) / 2)          /* bf16 units */
-#define PGM_ARENA_GLU_W8A8 (((PGM_GLU_STAGES * (PGM_A8BUF8 + 2 * PGM_B8BUF8)) + 1) / 2)
+#define PGM_ARENA_GLU_W8A8 (((PGM_GLU_STAGES * (PGM_A8BUF8 + 2 * PGM_GLU_B8BUF8)) + 1) / 2)
 static_assert(PGM_ARENA_W8A8 <= PGM_ARENA_BF16, "w8a8 GEMM arena must fit the bf16 GEMM claim");
 static_assert(PGM_ARENA_GLU_W8A8 <= PGM_ARENA_BF16, "w8a8 GLU arena must fit the bf16 GEMM claim");
+static_assert(PGM_GLU_BN % (8 * PGM_WARPS_N) == 0, "GLU N-tile must give whole 8-wide n-fragments");
 static_assert(PGM_BK8 == 64, "PX-2 mainloop reads two k32 subgroups per K-tile");
 
 /* fp8 K-major swizzle: XOR the 16-byte-line slot (bits[4,7)) with the low row bits (bits[7,10)) —
@@ -1319,8 +1344,28 @@ static_assert(PGM_BK8 == 64, "PX-2 mainloop reads two k32 subgroups per K-tile")
  * BBits=3/SShift=3 spread 8 rows across 8 slots). off is a BYTE offset into the tile; the XOR flips
  * only bits 4-6, so it permutes whole 16-byte lines (cp.async store granularity) and leaves the
  * uint32 interior (bits 0-3) intact. Bijective ⇒ store and read agree ⇒ mma bytes unchanged. */
+/* PX-9 V2 SWIZZLE. Swizzle<3,4,3> assumes a 128-BYTE fast dimension, but a BK8=64 fp8 row is only
+ * 64 B, so SShift=3 reads bits[7,10) = row bits [1,4) and NEVER SEES row bit 0 — two adjacent rows
+ * get the SAME line permutation. Enumerated over the whole (row, lane) space that costs one bank
+ * conflict way that the tile does not have to pay:
+ *     read granularity   Swizzle<3,4,3> (shipped)   off ^ ((off>>2)&0x30) (V2)
+ *     4-byte  (LDS.32)         2-way                      2-way   (structural: only even words)
+ *     8-byte  (LDS.64)         2-way                      1-way   CONFLICT-FREE
+ * V2 XORs the 2-bit 16-byte-line slot (bits[4,6)) with the low 2 row bits (bits[6,8)), i.e. a
+ * Swizzle<2,4,2> matched to the ACTUAL 64-byte row. It permutes lines strictly WITHIN a row, so it
+ * is trivially bijective, it still moves only bits >= 4 (whole cp.async 16-byte lines), and it
+ * still satisfies sw8(off+4) == sw8(off)+4 so the LDS.64 fragment read stays legal.
+ * Store and read use the same map either way, so the mma bytes — and the result — are unchanged.
+ * -DPGM_SW8_V2=0 restores the shipped Swizzle<3,4,3>; -DPGM_SW8_OFF disables swizzling entirely. */
+#ifndef PGM_SW8_V2
+#define PGM_SW8_V2 1
+#endif
 #ifndef PGM_SW8_OFF
+#if PGM_SW8_V2
+__device__ __forceinline__ int pgm_sw8(int off) { return off ^ ((off >> 2) & 0x30); }
+#else
 __device__ __forceinline__ int pgm_sw8(int off) { return off ^ (((off >> 7) & 7) << 4); }
+#endif
 #else
 __device__ __forceinline__ int pgm_sw8(int off) { return off; }   /* A/B: swizzle disabled */
 #endif
@@ -1349,11 +1394,13 @@ __device__ __forceinline__ void pgm_stage_a8(uint8_t* Ad8, const uint8_t* __rest
     }
 }
 /* cp.async-stage a [BN][BK8] e4m3 tile of B (weight [n][k], row n = output n) into a swizzled [n][k]
- * fp8 tile (stride BK8). BK8=64 is 4 cp.async 16B lines per n-row. */
+ * fp8 tile (stride BK8). BK8=64 is 4 cp.async 16B lines per n-row. BN is a template parameter
+ * (PX-13) because the plain and GLU w8a8 bodies run different N-tile widths. */
+template <int BN>
 __device__ __forceinline__ void pgm_stage_b8(uint8_t* Bd8, const uint8_t* __restrict__ B, int tid,
                                              int tn, int kbase, unsigned n, unsigned k, int kend) {
     const int LCH = PGM_BK8 / 16;
-    for (int L = tid; L < PGM_BN * LCH; L += (int)PLOW_NV_THREADS) {
+    for (int L = tid; L < BN * LCH; L += (int)PLOW_NV_THREADS) {
         const int row = L / LCH, kk16 = (L % LCH) * 16;
         const int nn = tn + row, kk = kbase + kk16;
         const bool in = (nn < (int)n) && (kk + 16 <= kend);
@@ -1361,8 +1408,22 @@ __device__ __forceinline__ void pgm_stage_b8(uint8_t* Bd8, const uint8_t* __rest
         pgm_cp_async_cg16(&Bd8[pgm_sw8(row * PGM_BK8 + kk16)], g, in ? 16 : 0);
     }
 }
+/* PX-9: 8-BYTE FRAGMENT READS. The fp8 fragment map gives lane L byte offset 8*(L&3) inside its
+ * row, so a 4-byte read touches only EVEN 4-byte words — at most 16 of the 32 banks, i.e. a
+ * structural 2-way conflict that no XOR swizzle can remove (verified over the whole lane x row
+ * space; pgm_sw8 does lift 4-way -> 2-way, it just cannot reach 1-way). The pair (kb, kb+4) is
+ * always 8-byte aligned and never crosses a 16-byte line, so pgm_sw8 — which permutes whole
+ * 16-byte lines — satisfies sw8(off+4) == sw8(off)+4 there (checked exhaustively). Reading the
+ * pair as ONE uint2 therefore covers both word parities, is conflict-free, and halves both the
+ * LDS instruction count and the swizzle address arithmetic (which SASS showed dominating the
+ * mainloop: 96 LOP3 + 26 SHF + 23 IADD3 per 32 QMMA).
+ * SAME bytes into the SAME lanes -> the mma sees identical operands -> bit-identical accumulate.
+ * -DPGM_W8A8_LDS64=0 restores the pre-PX-9 scalar reads for A/B. */
+#ifndef PGM_W8A8_LDS64
+#define PGM_W8A8_LDS64 1
+#endif
 /* Read one warp's A m-fragments (4 u32 = 16 e4m3) for k-subgroup kf (0 or 32) from a landed swizzled
- * [m][k] fp8 tile (stride BK8). Each u32 read is a single 16-byte line, so pgm_sw8 is the store's inverse. */
+ * [m][k] fp8 tile (stride BK8). Each read is a single 16-byte line, so pgm_sw8 is the store's inverse. */
 __device__ __forceinline__ void pgm_load_afrags_w8a8(unsigned (&af)[PGM_MFRAG][4],
                                                      const uint8_t* Ad8, int wm, int kf, int lane) {
     const int kb = kf + 8 * (lane & 3);
@@ -1370,22 +1431,35 @@ __device__ __forceinline__ void pgm_load_afrags_w8a8(unsigned (&af)[PGM_MFRAG][4
     for (int mi = 0; mi < PGM_MFRAG; mi++) {
         const int rlo = wm * PGM_WM + mi * 16 + (lane >> 2);
         const int rhi = rlo + 8;
+#if PGM_W8A8_LDS64
+        const uint2 lo = *(const uint2*)(Ad8 + pgm_sw8(rlo * PGM_BK8 + kb));
+        const uint2 hi = *(const uint2*)(Ad8 + pgm_sw8(rhi * PGM_BK8 + kb));
+        af[mi][0] = lo.x; af[mi][2] = lo.y;
+        af[mi][1] = hi.x; af[mi][3] = hi.y;
+#else
         af[mi][0] = *(const unsigned*)(Ad8 + pgm_sw8(rlo * PGM_BK8 + kb));
         af[mi][2] = *(const unsigned*)(Ad8 + pgm_sw8(rlo * PGM_BK8 + kb + 4));
         af[mi][1] = *(const unsigned*)(Ad8 + pgm_sw8(rhi * PGM_BK8 + kb));
         af[mi][3] = *(const unsigned*)(Ad8 + pgm_sw8(rhi * PGM_BK8 + kb + 4));
+#endif
     }
 }
 /* Read one warp's B n-fragments (2 u32 = 8 e4m3) for k-subgroup kf (0 or 32) from a landed swizzled
- * [n][k] fp8 tile (stride BK8). */
-__device__ __forceinline__ void pgm_load_bfrags_w8a8(unsigned (&bf)[PGM_NFRAG][2],
+ * [n][k] fp8 tile (stride BK8). WN/NFRAG are template parameters (PX-13, per-opcode N-tile). */
+template <int WN, int NFRAG>
+__device__ __forceinline__ void pgm_load_bfrags_w8a8(unsigned (&bf)[NFRAG][2],
                                                      const uint8_t* Bd8, int wn, int kf, int lane) {
     const int kb = kf + 8 * (lane & 3);
 #pragma unroll
-    for (int nj = 0; nj < PGM_NFRAG; nj++) {
-        const int col = wn * PGM_WN + nj * 8 + (lane >> 2);
+    for (int nj = 0; nj < NFRAG; nj++) {
+        const int col = wn * WN + nj * 8 + (lane >> 2);
+#if PGM_W8A8_LDS64
+        const uint2 v = *(const uint2*)(Bd8 + pgm_sw8(col * PGM_BK8 + kb));
+        bf[nj][0] = v.x; bf[nj][1] = v.y;
+#else
         bf[nj][0] = *(const unsigned*)(Bd8 + pgm_sw8(col * PGM_BK8 + kb));
         bf[nj][1] = *(const unsigned*)(Bd8 + pgm_sw8(col * PGM_BK8 + kb + 4));
+#endif
     }
 }
 
@@ -1419,7 +1493,7 @@ static __device__ void d_gemm_w8a8(__nv_bfloat16* __restrict__ C, const uint8_t*
 
         auto stage = [&](int ks, int buf) {
             pgm_stage_a8(As + buf * PGM_A8BUF8, A, tid, tm, ks * PGM_BK8, m, k, (int)a_row0);
-            pgm_stage_b8(Bs + buf * PGM_B8BUF8, B, tid, tn, ks * PGM_BK8, n, k, (int)k);
+            pgm_stage_b8<PGM_BN>(Bs + buf * PGM_B8BUF8, B, tid, tn, ks * PGM_BK8, n, k, (int)k);
         };
 
 #pragma unroll
@@ -1440,7 +1514,7 @@ static __device__ void d_gemm_w8a8(__nv_bfloat16* __restrict__ C, const uint8_t*
                 unsigned af[PGM_MFRAG][4];
                 pgm_load_afrags_w8a8(af, As + cb * PGM_A8BUF8, wm, kf, lane);
                 unsigned bf[PGM_NFRAG][2];
-                pgm_load_bfrags_w8a8(bf, Bs + cb * PGM_B8BUF8, wn, kf, lane);
+                pgm_load_bfrags_w8a8<PGM_WN, PGM_NFRAG>(bf, Bs + cb * PGM_B8BUF8, wn, kf, lane);
 #pragma unroll
                 for (int mi = 0; mi < PGM_MFRAG; mi++)
 #pragma unroll
@@ -1480,29 +1554,29 @@ static __device__ void d_gemm_glu_w8a8(__nv_bfloat16* __restrict__ C, const uint
 #if PGM90_FORK_GLU
     d_gemm_glu_w8a8_sm90(C, A, Wg, Wu, ascale, sg, su, m, n, k, act, slice, nblk, arena);
 #else
-    uint8_t* As = (uint8_t*)arena;                          /* [GLU_STAGES][BM][BK8] e4m3 */
-    uint8_t* Bg = As + PGM_GLU_STAGES * PGM_A8BUF8;          /* [GLU_STAGES][BN][BK8] e4m3 */
-    uint8_t* Bu = Bg + PGM_GLU_STAGES * PGM_B8BUF8;          /* [GLU_STAGES][BN][BK8] e4m3 */
+    uint8_t* As = (uint8_t*)arena;                            /* [GLU_STAGES][BM][BK8] e4m3 */
+    uint8_t* Bg = As + PGM_GLU_STAGES * PGM_A8BUF8;            /* [GLU_STAGES][GLU_BN][BK8] e4m3 */
+    uint8_t* Bu = Bg + PGM_GLU_STAGES * PGM_GLU_B8BUF8;        /* [GLU_STAGES][GLU_BN][BK8] e4m3 */
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int wm = warp / PGM_WARPS_N, wn = warp % PGM_WARPS_N;
     const int tiles_m = (m + PGM_BM - 1) / PGM_BM;
-    const int tiles_n = (n + PGM_BN - 1) / PGM_BN;
+    const int tiles_n = (n + PGM_GLU_BN - 1) / PGM_GLU_BN;
     const int ntiles = tiles_m * tiles_n;
     const int ksteps = (k + PGM_BK8 - 1) / PGM_BK8;
 
     for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
         const int tm = (tile / tiles_n) * PGM_BM;
-        const int tn = (tile % tiles_n) * PGM_BN;
-        float accg[PGM_MFRAG][PGM_NFRAG][4], accu[PGM_MFRAG][PGM_NFRAG][4];
+        const int tn = (tile % tiles_n) * PGM_GLU_BN;
+        float accg[PGM_MFRAG][PGM_GLU_NFRAG][4], accu[PGM_MFRAG][PGM_GLU_NFRAG][4];
 #pragma unroll
         for (int i = 0; i < PGM_MFRAG; i++)
-            for (int j = 0; j < PGM_NFRAG; j++)
+            for (int j = 0; j < PGM_GLU_NFRAG; j++)
                 for (int e = 0; e < 4; e++) { accg[i][j][e] = 0.f; accu[i][j][e] = 0.f; }
 
         auto stage = [&](int ks, int buf) {
             pgm_stage_a8(As + buf * PGM_A8BUF8, A, tid, tm, ks * PGM_BK8, m, k, 0);
-            pgm_stage_b8(Bg + buf * PGM_B8BUF8, Wg, tid, tn, ks * PGM_BK8, n, k, (int)k);
-            pgm_stage_b8(Bu + buf * PGM_B8BUF8, Wu, tid, tn, ks * PGM_BK8, n, k, (int)k);
+            pgm_stage_b8<PGM_GLU_BN>(Bg + buf * PGM_GLU_B8BUF8, Wg, tid, tn, ks * PGM_BK8, n, k, (int)k);
+            pgm_stage_b8<PGM_GLU_BN>(Bu + buf * PGM_GLU_B8BUF8, Wu, tid, tn, ks * PGM_BK8, n, k, (int)k);
         };
 
 #pragma unroll
@@ -1522,13 +1596,13 @@ static __device__ void d_gemm_glu_w8a8(__nv_bfloat16* __restrict__ C, const uint
             for (int kf = 0; kf < PGM_BK8; kf += 32) {
                 unsigned af[PGM_MFRAG][4];
                 pgm_load_afrags_w8a8(af, As + cb * PGM_A8BUF8, wm, kf, lane);
-                unsigned bg[PGM_NFRAG][2], bu[PGM_NFRAG][2];
-                pgm_load_bfrags_w8a8(bg, Bg + cb * PGM_B8BUF8, wn, kf, lane);
-                pgm_load_bfrags_w8a8(bu, Bu + cb * PGM_B8BUF8, wn, kf, lane);
+                unsigned bg[PGM_GLU_NFRAG][2], bu[PGM_GLU_NFRAG][2];
+                pgm_load_bfrags_w8a8<PGM_GLU_WN, PGM_GLU_NFRAG>(bg, Bg + cb * PGM_GLU_B8BUF8, wn, kf, lane);
+                pgm_load_bfrags_w8a8<PGM_GLU_WN, PGM_GLU_NFRAG>(bu, Bu + cb * PGM_GLU_B8BUF8, wn, kf, lane);
 #pragma unroll
                 for (int mi = 0; mi < PGM_MFRAG; mi++)
 #pragma unroll
-                    for (int nj = 0; nj < PGM_NFRAG; nj++) {
+                    for (int nj = 0; nj < PGM_GLU_NFRAG; nj++) {
                         pgm_mma_fp8_k32(accg[mi][nj], af[mi], bg[nj], accg[mi][nj]);
                         pgm_mma_fp8_k32(accu[mi][nj], af[mi], bu[nj], accu[mi][nj]);
                     }
@@ -1538,9 +1612,9 @@ static __device__ void d_gemm_glu_w8a8(__nv_bfloat16* __restrict__ C, const uint
 #pragma unroll
         for (int mi = 0; mi < PGM_MFRAG; mi++)
 #pragma unroll
-            for (int nj = 0; nj < PGM_NFRAG; nj++) {
+            for (int nj = 0; nj < PGM_GLU_NFRAG; nj++) {
                 int gr = wm * PGM_WM + mi * 16 + (lane / 4);
-                int gc = wn * PGM_WN + nj * 8 + (lane % 4) * 2;
+                int gc = wn * PGM_GLU_WN + nj * 8 + (lane % 4) * 2;
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
                     int rr = tm + gr + (e / 2) * 8;

@@ -11,3 +11,8 @@ costmodel.workspace = true
 packet.workspace = true
 egglog.workspace = true
 thiserror.workspace = true
+# Arbitrary-precision extraction cost. egglog's tree-additive cost combines with
+# `saturating_add`, which pins at `u64::MAX` past ~21 residual layers and then
+# aborts during term reconstruction — see `extract::BigTreeAdditiveCost`.
+# Already in the lockfile via egglog itself, so this adds no new dependency.
+num = "0.4"

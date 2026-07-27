@@ -58,6 +58,37 @@ which is the whole argument for the check.
 | cell | what is calibrated | status |
 |---|---|---|
 | `nvidia/sm_90a/h100-nvl` | interpreter dispatch floor | measured, see below |
+| `nvidia/sm_120a/rtx-5090` | prefill GEMM tile (`prefill_tile_measurement.jsonl`) | measured, see below |
+
+### `nvidia/sm_120a/rtx-5090`
+
+`prefill_tile_measurement.jsonl` — the w8a8 prefill GEMM tile space of the shipped
+prefill object, on Gemma-4-12B-it fp8, scored on the **end-to-end** conc-1 127k
+prefill wall (`perf-data/px13-prefill-gemm.md`). Written by
+`perf-data/px13_emit_tuning.py` from `perf-data/px13_sweep_{build,e2e}.sh`.
+
+**Why a new record kind rather than `tunedb::KernelMeasurement`.** On NVIDIA the
+GEMM tile is a compile-time macro of the *interpreter object*, and `plowc tune`
+says so itself: all three dense-GEMM opcodes alias to one body, so "the real
+tuning axis here is which object is built, not which opcode is emitted". A
+`KernelMeasurement` is keyed by `op_case` + `kernel_id` and has no field that can
+distinguish `BN=128` from `BN=64` — the two are the *same* kernel id in *different*
+objects. Until that entity grows a build-identity column, a prefill-tile record
+cannot be expressed in it, and this cell is therefore **not** loadable by
+`TuneStore::load_kernels`. `plowc tune --status` will still report "no kernel
+measurements for this cell", correctly.
+
+Two things this cell exists to stop the next person rediscovering:
+
+1. **The microbench and the runtime disagree in sign.** `PGM_GLU_BN=64` is +6.1%
+   on the isolated `gate|up` GEMM at the M the runtime actually launches, bit-exact,
+   at unchanged occupancy — and **2.3% slower** end to end. A tile tuner scored on
+   the microbench ships a regression. Every row here carries its microbench number
+   as *data*, never as the ranking key.
+2. **Two arms in the space are undeployable, not slow.** `PGM_STAGES=5` and
+   `PGM_BN=256` put the GEMM arena over the 101376 B dynamic-smem opt-in; plowrt
+   then drops the packet's prefill buckets and consumes the prompt one decode step
+   at a time. PX-9 measured both in an isolated bench and called them "noise".
 
 ### `nvidia/sm_90a/h100-nvl`
 

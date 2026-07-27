@@ -23,10 +23,28 @@ pid_ns_ok() {
   return 1
 }
 
-foreign() {  # pids using the GPU that are not us or our children
+# 0 if $1 is this lease shell or ANY descendant of it. The leased command is
+# exec'd as a child, so comparing against $$ alone (what this used to do) made
+# every leased run report its own CUDA process as foreign — which forced RC to
+# 76 on success, so rc=76 carried no contention information at all.
+is_ours() {
+  local p="$1" i=0
+  while [ -n "$p" ] && [ "$p" != "0" ] && [ "$i" -lt 64 ]; do
+    [ "$p" = "$$" ] && return 0
+    p=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null)
+    i=$((i + 1))
+  done
+  return 1
+}
+
+foreign() {  # pids using the GPU that are not us or our descendants
   pid_ns_ok || return 0              # namespaced: cannot attribute, report nothing
   nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null |
-    awk -F, -v me="$$" '{gsub(/ /,"",$1); if ($1!=me) print $1" ("$2")"}'
+    while IFS=, read -r p mem; do
+      p=$(echo "$p" | tr -d ' ')
+      [ -z "$p" ] && continue
+      is_ours "$p" || echo "$p ($mem)"
+    done
 }
 
 if [ "$1" = "--audit" ]; then f=$(foreign); [ -n "$f" ] && { echo "FOREIGN GPU PROCS:"; echo "$f"; } || echo "GPU: no foreign compute procs"; exit 0; fi

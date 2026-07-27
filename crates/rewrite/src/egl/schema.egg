@@ -2,8 +2,17 @@
 ; Mirrors the nn-graph ops. Leaves carry the tensor name so extraction can map
 ; back to weights/inputs. Attributes that fusion does not reason about (shapes,
 ; attention config) ride along as opaque tokens. Fused targets have fewer
-; e-nodes than the forms they replace, so egglog's default (tree-size) cost
-; prefers them at extraction — explicit cost annotations reinforce this.
+; e-nodes than the forms they replace, so the tree-size cost prefers them at
+; extraction. There are NO explicit cost annotations — see the "Extraction
+; cost" note in rules.egg, which this comment used to contradict.
+;
+; LIMIT worth knowing before extending this schema: attention is modelled as
+; `(Attention Expr Expr Expr String)` with the whole attention config collapsed
+; into one opaque token. So no rule can branch on an attention attribute — most
+; concretely, Gemma-4's `attention_k_eq_v` (K and V share one projection) is
+; invisible here, while the devblob emitter already elides the v_proj weight,
+; its GEMM and its CUs. That is a structural limit on what this rule set can
+; contribute to that model, not a missing rule.
 
 (datatype Expr
   (Input String)                       ; named graph input
