@@ -32,19 +32,27 @@ flowchart TD
 ### Stream Header (20 bytes)
 
 ```
-┌──────────┬─────────┬────────────┬───────────────┬────────────┬──────────────┐
-│ magic(4) │ ver(2)  │ bucket(2)  │ plan_gen(4)   │ n_inst(4)  │ n_counter(4) │
-└──────────┴─────────┴────────────┴───────────────┴────────────┴──────────────┘
+┌──────────┬─────────┬────────────┬────────────┬──────────────┬─────────────┬──────────┐
+│ magic(4) │ ver(2)  │ bucket(2)  │ n_inst(4)  │ n_counter(4) │ plan_gen(2) │ flags(2) │
+└──────────┴─────────┴────────────┴────────────┴──────────────┴─────────────┴──────────┘
 ```
 
 | Field | Type | Value |
 |-------|------|-------|
-| `magic` | `[u8; 4]` | `b"PLOW"` |
-| `version` | `u16` | 5 (current) |
+| `magic` | `u32` | `0x494E5650` — `"INVP"`, so the bytes on disk read `50 56 4E 49` little-endian |
+| `version` | `u16` | 5 (current); `MIN_VERSION` 2 is still decodable |
 | `bucket_id` | `u16` | Shape bucket index |
-| `plan_gen` | `u32` | Generation counter for cache invalidation |
 | `n_inst` | `u32` | Number of instructions in stream |
 | `n_counter` | `u32` | Number of counters in table |
+| `plan_gen` | `u16` | Generation counter for cache invalidation |
+| `flags` | `u16` | Stream flags |
+
+> Corrected 2026-07-29. This table read `magic = b"PLOW"` and ordered the fields
+> `magic, ver, bucket, plan_gen(4), n_inst, n_counter`. Neither matched
+> `Program::to_bytes`/`decode` in `crates/packet/src/lib.rs`, which is the only
+> implementation and therefore the spec: the magic is `0x494E5650` and
+> `plan_gen` is a `u16` that comes *after* the two counts, beside `flags`.
+> Anything written against the old table would have failed at the magic check.
 
 ### Instruction Record
 

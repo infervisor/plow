@@ -93,10 +93,21 @@ pub enum DevOp {
     /// `t0=C t1=x t2=W t3=rms? t4=gamma?` · `i0=M i1=N i2=K i3=norm`.
     /// Decode path (`M <= 16`): bandwidth-bound, uses no MFMA.
     Gemv = 10,
-    /// `t0=O t1=Q t2=K t3=V` ·
-    /// `i0=n_q i1=n_kv i2=n_head i3=n_kv_head i4=q_pos0 i5=window i6=hd` · `f0=scale`.
+    /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=O_final` ·
+    /// `i0=n_q i1=n_kv i2=n_head i3=n_kv_head i4=q_pos0 i5=window i6=hd i7=nsplit` ·
+    /// `f0=scale j0=kv_stride j1=kv_mask`.
     /// `window = 0` is full causal. `hd` must be 256 or 512.
     /// For Gemma `scale = 1.0` — there is NO `1/sqrt(head_dim)`.
+    ///
+    /// This spec read `t0=O t1=Q t2=K t3=V` until 2026-07-29 and was STALE: it
+    /// predates the split-K epilogue that added `Opart`/`mlpart` and moved the
+    /// bf16 output to `t5`. Ground truth is `exec_flash_prefill`
+    /// (`runtime/amd/interp.hip:272`), which passes
+    /// `TEN(0), TEN(1), TEN(5), TEN(2), TEN(3), TEN(4)` into `d_flash_prefill`'s
+    /// `(Opart, mlpart, O_final, Q, K, V)` — and [`DevOp::FlashDecode`] below,
+    /// whose own spec was updated at the time and already agreed. Caught by
+    /// `crate::slots`' drift test; see that module for why the table is checked
+    /// against these comments rather than generated from them.
     FlashPrefill = 11,
     /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=kv_len(i32)` ·
     /// `i0=n_batch i1=n_head i2=n_kv_head i3=kv_stride i4=window i5=nsplit i6=hd` ·
@@ -940,6 +951,17 @@ impl DevOp {
         DevOp::AttnRes, DevOp::SituGlu, DevOp::MlaOutGate,
         DevOp::GemmFp8Blk,
     ];
+
+    /// Recover the opcode from its wire discriminant, or `None` for a value no
+    /// variant claims.
+    ///
+    /// A linear scan of [`Self::ALL`] rather than a match: `ALL` is already the
+    /// list `dev_abi.rs` proves exhaustive, so reusing it means a new variant
+    /// cannot be reachable here and missing from there. Callers are disassembly
+    /// and diagnostics, never the dispatch path.
+    pub fn from_u16(op: u16) -> Option<DevOp> {
+        Self::ALL.iter().copied().find(|o| *o as u16 == op)
+    }
 
     /// The `dev_isa.h` spelling of this opcode.
     ///

@@ -203,6 +203,46 @@ enum Cmd {
         #[arg(long)]
         chrome: Option<PathBuf>,
     },
+
+    /// Disassemble a compiled device blob: named operands, kernargs, counters.
+    ///
+    /// Static and offline — the blob is a file, and reading it needs no GPU, no
+    /// driver and no features. Until now the only true device-instruction dump
+    /// was the `.insts.txt` sidecar the C harness writes under
+    /// `PLOW_TRACE_RAW`, which needs hardware to produce.
+    ///
+    /// Operand names come from `packet::slots`; the raw slots are printed
+    /// alongside them, always, because a name is an interpretation and the bytes
+    /// are not.
+    Disasm {
+        /// `model.pkt`, or an asset directory containing one.
+        blob: PathBuf,
+        /// Restrict to one program: a prefill bucket `T`, or `1` for decode.
+        #[arg(long)]
+        program: Option<u32>,
+        /// Instruction window, `lo..hi`.
+        #[arg(long)]
+        range: Option<String>,
+        /// `text` (default), `json`, or `jsonl` (one program per line).
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Kernarg block and the dispatch configuration it implies.
+        #[arg(long, default_value_t = false)]
+        kernargs: bool,
+        /// Tensor table, classified WEIGHT / TABLE / RUNTIME.
+        #[arg(long, default_value_t = false)]
+        tensors: bool,
+        /// Counter analysis: `graphstat`'s aggregates plus per-counter detail.
+        #[arg(long, default_value_t = false)]
+        counters: bool,
+        /// Per-CU stream entries. LARGE — a GLM-5.2 prefill program has 377k of
+        /// them, ~45 MB of JSON. Off by default for that reason.
+        #[arg(long, default_value_t = false)]
+        stream: bool,
+        /// Structure only: skip every derived metric.
+        #[arg(long, default_value_t = false)]
+        no_analysis: bool,
+    },
 }
 
 #[tokio::main]
@@ -254,6 +294,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             log,
             chrome,
         } => simulate(assets, bucket, all_buckets, math, log, chrome),
+        Cmd::Disasm {
+            blob,
+            program,
+            range,
+            format,
+            kernargs,
+            tensors,
+            counters,
+            stream,
+            no_analysis,
+        } => disasm_cmd(
+            blob,
+            program,
+            range,
+            format,
+            plowrt::disasm::Sections { kernargs, tensors, counters, stream, no_analysis },
+        ),
         Cmd::Devices {
             tp,
             hidden,
@@ -943,6 +1000,163 @@ fn devices(
          compiled with plowc --num-gpus N>."
     );
     Ok(())
+}
+
+/// `plowrt disasm` — read a device blob and render it.
+///
+/// No device, no features, no driver. The heavy lifting is in
+/// `plowrt::disasm`; this is argument handling and output.
+fn disasm_cmd(
+    blob_path: PathBuf,
+    program: Option<u32>,
+    range: Option<String>,
+    format: String,
+    sections: plowrt::disasm::Sections,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plowrt::asset::devblob::DevBlob;
+
+    // Same convention as `graphstat`: a directory means the `model.pkt` in it.
+    let p = blob_path.as_path();
+    let file = if p.is_dir() { p.join("model.pkt") } else { p.to_path_buf() };
+    let buf = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+
+    // Both compiler outputs are called `.pkt`, so the format is decided by the
+    // magic rather than by the extension or a flag. A scheduled stream
+    // (`--emit packets`) has no programs, tensors or kernargs, so it takes a
+    // different renderer entirely — see `plowrt::disasm::sched`.
+    let magic: Option<&[u8; 8]> = buf.get(..8).and_then(|s| s.try_into().ok());
+    if !magic.is_some_and(packet::devbuild::is_blob_magic) {
+        let prog = packet::Program::decode(&buf)
+            .map_err(|e| format!("{}: not a PLOWDEV blob, and not a scheduled .pkt either: {e}", file.display()))?;
+        let rep = plowrt::disasm::sched::report(&prog, &file.display().to_string());
+        match format.as_str() {
+            "json" | "jsonl" => println!("{}", serde_json::to_string_pretty(&rep)?),
+            "text" => print!("{}", plowrt::disasm::sched::text(&rep)),
+            other => return Err(format!("--format wants text|json|jsonl, got `{other}`").into()),
+        }
+        return Ok(());
+    }
+
+    let blob = DevBlob::parse(&buf)?;
+
+    let range = match range.as_deref() {
+        None => None,
+        Some(s) => {
+            let (lo, hi) = s
+                .split_once("..")
+                .ok_or_else(|| format!("--range wants `lo..hi`, got `{s}`"))?;
+            Some((lo.trim().parse::<usize>()?, hi.trim().parse::<usize>()?))
+        }
+    };
+
+    let rep = plowrt::disasm::report(&blob, &file.display().to_string(), sections, program, range);
+
+    match format.as_str() {
+        "json" => println!("{}", serde_json::to_string_pretty(&rep)?),
+        // One PROGRAM per line, not one instruction: a record has to be
+        // self-describing to be worth streaming, and a bare instruction is not —
+        // it carries no `T`. A GLM prefill program is ~2k instructions, which is
+        // a comfortable line for `jq`.
+        "jsonl" => {
+            for prog in &rep.programs {
+                println!("{}", serde_json::to_string(prog)?);
+            }
+        }
+        "text" => print_disasm_text(&blob, &rep, program, range),
+        other => return Err(format!("--format wants text|json|jsonl, got `{other}`").into()),
+    }
+    Ok(())
+}
+
+fn print_disasm_text(
+    blob: &plowrt::asset::devblob::DevBlob,
+    rep: &plowrt::disasm::BlobReport<'_>,
+    program: Option<u32>,
+    range: Option<(usize, usize)>,
+) {
+    println!("blob      {}", rep.blob);
+    println!("n_cu      {}  target=0x{:08x}  flags=0x{:x}", rep.n_cu, rep.target, rep.flags);
+    println!("programs  {:?}", blob.progs.iter().map(|p| p.t).collect::<Vec<_>>());
+    if let Some(tp) = &rep.tp {
+        println!("tp        n_gpu={} hidden={} slot_bytes={}", tp.n_gpu, tp.hidden, tp.slot_bytes);
+    }
+
+    if let Some(ts) = &rep.tensors {
+        println!("\ntensors ({})", ts.len());
+        for t in ts {
+            println!(
+                "  {:>5}  {:<9} {:>14}  {}{}",
+                t.handle,
+                t.class,
+                t.bytes,
+                t.name,
+                if t.init { "  (init)" } else { "" }
+            );
+        }
+    }
+
+    let names: Vec<&str> = blob.tensors.iter().map(|t| t.name.as_str()).collect();
+    for (pr, prog) in rep.programs.iter().zip(blob.progs.iter().filter(|p| program.is_none_or(|t| p.t == t)))
+    {
+        println!("\n===== program T={}  {} insts, {} counters", pr.t, pr.n_inst, pr.n_counter);
+
+        if let Some(k) = &pr.kernargs {
+            println!("  kernargs ({} B)", k.size_bytes);
+            for (name, state) in &k.pointers {
+                println!("    {name:<14} {state}");
+            }
+            for (name, v) in &k.scalars {
+                println!("    {name:<14} {v}");
+            }
+            let d = &k.derived;
+            println!(
+                "    -> scheduler={} segmented={} n_seg={} l2_placed={} tp={} n_gpu={}",
+                d.scheduler, d.segmented, d.n_seg, d.l2_placed, d.tensor_parallel, d.n_gpu
+            );
+        }
+
+        if let Some(c) = &pr.counters {
+            let a = &c.aggregate;
+            println!(
+                "  counters: {} ({} dead)  edges {} -> {} tr ({} redundant)  \
+                 polls {} -> {} ({} removable)  bumps {}/{} live  critical path {}",
+                a.counters, a.dead, a.edges, a.edges_tr, a.redundant, a.polls, a.polls_tr,
+                a.polls_removable, a.bumps_live, a.bumps, a.critical_path
+            );
+            println!(
+                "  liveness: peak {} concurrent at #{}  p50={} p99={}",
+                c.liveness.max_concurrent, c.liveness.at_inst, c.liveness.p50, c.liveness.p99
+            );
+            for d in c.dead.iter().take(10) {
+                println!(
+                    "    DEAD counter {} produced by #{} {} — {} wasted bumps",
+                    d.id,
+                    d.producer.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                    d.producer_op.unwrap_or("?"),
+                    d.bump_cost
+                );
+            }
+            for e in c.redundant_edges.iter().take(10) {
+                println!(
+                    "    redundant {} -> {} via {:?}  saves {} polls{}",
+                    e.from,
+                    e.to,
+                    e.via,
+                    e.polls_saved,
+                    if e.co_placed { "  (co-placed: poll only, no overlap)" } else { "" }
+                );
+            }
+            if c.redundant_edges.len() > 10 {
+                println!("    ... {} more redundant edges", c.redundant_edges.len() - 10);
+            }
+        }
+
+        let (lo, hi) = range.unwrap_or((0, prog.insts.len()));
+        let (lo, hi) = (lo.min(prog.insts.len()), hi.min(prog.insts.len()));
+        for (k, w) in prog.insts[lo..hi].iter().enumerate() {
+            println!("{}", plowrt::disasm::text_inst(&packet::disasm::disasm(lo + k, w, &names)));
+        }
+    }
 }
 
 fn simulate(

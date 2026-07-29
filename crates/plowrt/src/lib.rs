@@ -20,8 +20,10 @@
 //! The design is documented per subsystem under `docs/runtime/` and in
 //! `plans/design-the-runtime-in-whimsical-leaf.md`.
 
+pub mod analysis;
 pub mod asset;
 pub mod device;
+pub mod disasm;
 pub mod exec;
 pub mod memory;
 pub mod obs;

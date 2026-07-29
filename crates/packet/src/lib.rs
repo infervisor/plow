@@ -31,9 +31,11 @@
 
 pub mod dev;
 pub mod devbuild;
+pub mod disasm;
 pub mod moe;
 pub mod names;
 pub mod rope;
+pub mod slots;
 
 use core::mem::size_of;
 
