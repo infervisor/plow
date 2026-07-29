@@ -57,12 +57,63 @@ use crate::serve::{
 };
 use crate::Result;
 
-// The `PLOW_PF_PACKLOG=1` accumulator that used to live here (a `mod packlog` of nine atomics
-// plus `on`/`record`/`emit`) has been REMOVED: nothing had called `record()` since the GPU tick
-// stopped invoking it, so it accumulated nothing and `emit()` would have printed nine zeros.
-// The flag itself is still live and still does what its name says — `exec/gpu.rs:3319` writes
-// the per-launch `PACKLOG R=... rows=... bucket=... chunks=[...]` line the RTX-12 packing bench
-// parses. That is the one the bench reads; this was a second, silent copy of the idea.
+// The `PLOW_PF_PACKLOG=1` tick accumulator. It is a DIFFERENT measurement from
+// `exec/gpu.rs:3319`, which writes the per-launch `PACKLOG R=... rows=... bucket=...
+// chunks=[...]` line the RTX-12 packing bench parses: that one prices a single prefill
+// launch, this one prices the WHOLE mux tick and splits it prefill-vs-decode, which is
+// what §DISAGG phase-0 needs to bound what disaggregation could recover.
+//
+// Both gated arms call it (`cuda` at the fused prefill+decode tick, `hsa` at the AMD tick,
+// which is either/or), so a build without either feature has no caller — that is the shape
+// that got it deleted once already. Keep the call sites and this module in the same commit.
+#[allow(dead_code)]
+mod packlog {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static PREFILL_NS: AtomicU64 = AtomicU64::new(0);
+    static DECODE_NS: AtomicU64 = AtomicU64::new(0);
+    static PREFILL_TICKS: AtomicU64 = AtomicU64::new(0);
+    static DECODE_TICKS: AtomicU64 = AtomicU64::new(0);
+    static DECODE_ROWS: AtomicU64 = AtomicU64::new(0);
+    static TICKS: AtomicU64 = AtomicU64::new(0);
+
+    crate::env_flag!(pub(crate) fn on, "PLOW_PF_PACKLOG");
+
+    /// Record one mux tick's prefill-pass and decode-launch wall times (ns).
+    /// `rows` is the decode batch width that tick, so the reader can turn
+    /// `decode_ns` into a per-row cost. Emits a cumulative summary every 1000
+    /// ticks; the bench slices the log by line-count brackets for per-cell deltas.
+    pub(crate) fn record(
+        prefill_ns: u64,
+        decode_ns: u64,
+        did_prefill: bool,
+        did_decode: bool,
+        rows: usize,
+    ) {
+        PREFILL_NS.fetch_add(prefill_ns, Ordering::Relaxed);
+        DECODE_NS.fetch_add(decode_ns, Ordering::Relaxed);
+        if did_prefill {
+            PREFILL_TICKS.fetch_add(1, Ordering::Relaxed);
+        }
+        if did_decode {
+            DECODE_TICKS.fetch_add(1, Ordering::Relaxed);
+            DECODE_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
+        }
+        let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 1000 == 0 {
+            eprintln!(
+                "PACKLOG WALL prefill_ns={} decode_ns={} prefill_ticks={} decode_ticks={} \
+                 decode_rows={} ticks={}",
+                PREFILL_NS.load(Ordering::Relaxed),
+                DECODE_NS.load(Ordering::Relaxed),
+                PREFILL_TICKS.load(Ordering::Relaxed),
+                DECODE_TICKS.load(Ordering::Relaxed),
+                DECODE_ROWS.load(Ordering::Relaxed),
+                n,
+            );
+        }
+    }
+}
 
 /// Admission sheds only when the predicted wait exceeds this many ticks of the
 /// engine's observed service time (or the configured `slo_ms` floor, whichever
