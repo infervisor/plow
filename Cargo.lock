@@ -763,6 +763,7 @@ dependencies = [
  "packet",
  "plow-asset",
  "serde_json",
+ "tunedb",
 ]
 
 [[package]]
@@ -1144,15 +1145,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "frontend"
-version = "0.1.0"
-dependencies = [
- "hf-hub",
- "nn-graph",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2179,8 +2171,8 @@ dependencies = [
 [[package]]
 name = "nn-graph"
 version = "0.1.0"
-source = "git+https://github.com/infervisor/nn-graph.git#10ac3436580a75d520192d7823aa50478fb1d381"
 dependencies = [
+ "hf-hub",
  "serde",
  "serde_json",
  "smallvec",
@@ -2546,7 +2538,6 @@ dependencies = [
  "clap",
  "costmodel",
  "devgen",
- "frontend",
  "hwspec",
  "kernelcaps",
  "lean_verify",
@@ -3946,6 +3937,7 @@ version = "0.1.0"
 dependencies = [
  "hwspec",
  "kernelcaps",
+ "packet",
  "serde",
  "serde_json",
 ]

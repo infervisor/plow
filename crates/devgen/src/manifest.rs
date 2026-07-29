@@ -79,19 +79,29 @@ impl Arm {
 /// Which shape field (if any) selects a template instantiation for this opcode.
 ///
 /// ONLY the flash family is templated on an instruction field today: `d_flash_*`
-/// is `<HD, GF>` and HD comes from `i[6]`. The GEMM tile variants are separate
-/// OPCODES (`Gemm`/`GemmMed`/`GemmSmall`), so the opcode already carries them and
-/// adding a second key would split one body into several phantom arms.
+/// is `<HD, GF>`. The GEMM tile variants are separate OPCODES
+/// (`Gemm`/`GemmMed`/`GemmSmall`), so the opcode already carries them and adding a
+/// second key would split one body into several phantom arms.
+///
+/// THE SLOT IS NOT UNIFORM ACROSS THE FAMILY, and reading the wrong one is silent: the
+/// arm comes out `Some(0)`, matches nothing the object declares, and the coverage check
+/// passes because it is comparing a constant against a constant.
+///
+///   * `FlashPrefill` / `FlashDecode` (and their fp8 twins) carry HD in `i[6]`
+///     (`runtime/amd/interp.hip`, `exec_flash_decode`: `const unsigned hd = in->i[6];`).
+///   * `FlashMerge` carries it in **`i[3]`** — kernel `runtime/amd/interp.hip:1119`/`:1315`
+///     (`if (in->i[3] == 128) d_flash_merge<128>(...)`), emitters
+///     `crates/devgen/src/lib.rs` (`d.i[3] = hd`) and `crates/devgen/src/mla.rs:4626`
+///     (`i.i[3] = c.attn_head_dim`). `i[6]` is never assigned on a `FlashMerge` packet.
 fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
-    let hd = matches!(
-        op,
+    let hd = match op {
+        DevOp::FlashMerge => Some(i[3]),
         DevOp::FlashPrefill
-            | DevOp::FlashPrefillFp8
-            | DevOp::FlashDecode
-            | DevOp::FlashDecodeFp8
-            | DevOp::FlashMerge
-    )
-    .then(|| i[6]);
+        | DevOp::FlashPrefillFp8
+        | DevOp::FlashDecode
+        | DevOp::FlashDecodeFp8 => Some(i[6]),
+        _ => None,
+    };
     Arm { op: op_name(op), hd }
 }
 
@@ -143,7 +153,7 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
 #[allow(clippy::type_complexity)]
 fn segment_arms(p: &Program) -> Vec<(Option<u32>, (BTreeSet<Arm>, usize))> {
     // `gq_seg_ofs` is `[n_seg+1]` bounds into `gq_stream`. `l2_domains != 0`
-    // repurposes `seg` as an L2 DOMAIN (PLOW_NV_PLACE), not a wave-class segment
+    // repurposes `seg` as an L2 DOMAIN (PLOW_L2_PLACE), not a wave-class segment
     // — partitioning by it there would be meaningless, so fall back to whole.
     let n_seg = p.gq_seg_ofs.len().saturating_sub(1);
     if p.l2_domains != 0 || n_seg <= 1 || p.gq_stream.is_empty() {
@@ -200,6 +210,23 @@ struct Shapes {
     /// Largest prefill bucket = the largest chunk the runtime can submit.
     max_chunk: u32,
     prefill_buckets: Vec<u32>,
+    /// MoE weight encodings present on the expert ops. A SET, not a scalar — if a packet ever
+    /// carried two, that is a mixed-precision run and the manifest is where it becomes visible
+    /// rather than a number nobody can explain. NOTE the slot differs by phase: `i[3]` on the
+    /// PREFILL grouped ops (85/86), `i[6]` on the DECODE expert ops (45/46/48/49), because those
+    /// four already used `i[3]` for `n_exp`. Reading the wrong slot here would report `n_exp` as an
+    /// encoding, so the two are collected separately and deliberately.
+    moe_enc: BTreeSet<u32>,
+    /// Any w4a16 MXFP4 projection opcode present (91/92/93).
+    mxfp4_proj: bool,
+    /// Opcode names present, for the encoding-aware corrections below. Kept as names because that
+    /// is what `features` keys on, and the two must not disagree.
+    ops_present: BTreeSet<String>,
+}
+
+/// Was this opcode emitted anywhere in the packet?
+fn union_has(s: &Shapes, name: &str) -> bool {
+    s.ops_present.contains(name)
 }
 
 fn shapes(m: &Model) -> Shapes {
@@ -212,6 +239,7 @@ fn shapes(m: &Model) -> Shapes {
         }
         for inst in &p.insts {
             let Some(op) = op_of(inst.op) else { continue };
+            s.ops_present.insert(op_name(op));
             match op {
                 // `i0=n_batch i1=n_head i2=n_kv_head … i6=hd`
                 DevOp::FlashDecode | DevOp::FlashDecodeFp8 => {
@@ -240,6 +268,36 @@ fn shapes(m: &Model) -> Shapes {
                         .entry(inst.i[6])
                         .or_insert(if op == DevOp::FlashPrefillFp8 { "e4m3" } else { "bf16" });
                 }
+                // The encoding slot is PHASE-DEPENDENT. Prefill grouped ops carry `n_exp` in i[2],
+                // so the encoding took i[3]; the decode expert ops predate the field and already use
+                // i[3] for `n_exp`, so theirs is i[6]. Reading i[3] on a decode op would report the
+                // expert COUNT as an encoding.
+                DevOp::MoeGroupGluPf | DevOp::MoeGroupDownPf => {
+                    s.moe_enc.insert(inst.i[3]);
+                }
+                DevOp::MoeExpertGluFp8Blk
+                | DevOp::MoeExpertDownFp8Blk
+                | DevOp::MoeGroupGluFp8Blk
+                | DevOp::MoeGroupDownFp8Blk => {
+                    s.moe_enc.insert(inst.i[6]);
+                }
+                // EVERY mxfp4 tile rung, not just the 256x256 one. This classifier decides
+                // `mxfp4_weights`, which decides which OBJECT the host loads
+                // (`scripts/gfx950_objects.py:150`). Before the prefill GEMM became
+                // tile-selected there was exactly one fp4 prefill opcode and listing it was
+                // the same as listing the family; now a packet whose only fp4 GEMM is
+                // `GemmSmallMxfp4` would be classified bf16, load `interp_prefill`, and hit
+                // that object's silent `default:` — an untouched output buffer read as a
+                // result. §4's shape, reached by ADDING an arm rather than by forgetting one.
+                DevOp::GemvMxfp4
+                | DevOp::GemvGluMxfp4
+                | DevOp::GemmMxfp4
+                | DevOp::GemmMedMxfp4
+                | DevOp::GemmSmallMxfp4
+                | DevOp::GemmWideMxfp4
+                | DevOp::GemmC5Mxfp4 => {
+                    s.mxfp4_proj = true;
+                }
                 _ => {}
             }
         }
@@ -248,15 +306,59 @@ fn shapes(m: &Model) -> Shapes {
     s
 }
 
+// Every opcode whose presence means "this packet needs an fp8 WEIGHT arm compiled in".
+//
+// ONE list, used by both the provisional classification and the encoding-field correction
+// below. They were two hand-maintained copies of the same six names, and the tile-inventory
+// campaign added `GemmWideFp8`/`GemmC5Fp8` — an fp8 packet whose only GEMM took one of the
+// new rungs would have been classified `fp8_weights: false` by BOTH copies, so the host
+// would load `interp_prefill` (no fp8 arm) and the GEMM would hit its silent `default:`.
+// That is the §4 shape reached by adding an arm; the single list is what makes the next
+// rung a one-line edit instead of two that can disagree.
+const FP8_WEIGHT_OPS: &[&str] = &[
+    "GemvFp8",
+    "GemvGluFp8",
+    "GemmFp8",
+    "GemmMedFp8",
+    "GemmSmallFp8",
+    "GemmWideFp8",
+    "GemmC5Fp8",
+    "GemmGluFp8",
+    "GemvFp8Blk",
+    "DenseGluFp8Blk",
+    // The DENSE PREFILL block-fp8 GEMM. It has to be here even though it is dispatched
+    // UNCONDITIONALLY in every prefill object (so no object choice actually turns on it), because
+    // this list also drives the `encoding_features` CORRECTION below: a packet whose only fp8
+    // weights are dense — block-fp8 linears with no block-fp8 MoE, so `moe_enc` never sees 1 —
+    // takes the branch that recomputes `fp8_weights` from THIS list alone. Omitted, such a manifest
+    // would record `weight_enc: "bf16"` while the stream is fp8: a manifest that says the opposite
+    // of what it contains. GLM's stacked blob is unaffected either way (its decode `GemvFp8Blk`
+    // already sets the flag), which is exactly why the omission would have been invisible.
+    "GemmFp8Blk",
+];
+
 /// Neutral capability facts. Presence of an ARM implies the feature — the env
 /// knob that produced it is not consulted.
 fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
     let has = |n: &str| union.iter().any(|a| a.op == n);
     let mut f = Map::new();
     f.insert("fp8_kv".into(), json!(has("FlashDecodeFp8") || has("HeadNormRopeFp8")));
+    // The `*Fp8Blk` family is fp8 WEIGHTS too — DeepSeek's [128,128] `weight_scale_inv` grid rather
+    // than a per-channel scale, but the object still needs an fp8 weight arm compiled. Omitting them
+    // reported `fp8_weights: false` for a block-fp8 Kimi/GLM/DeepSeek packet, which is the manifest
+    // saying the opposite of what the stream contains.
+    //
+    // NOTE this is only PROVISIONAL: once the MoE ops took a runtime encoding field, their OPCODE
+    // NAME stopped implying the encoding — `MoeExpertGluFp8Blk` carrying `i[6]=2` is an MXFP4 op
+    // with an fp8-era name. `encoding_features` corrects this from the encoding set. The two-step
+    // exists because that is exactly the drift this file was written to catch, in miniature: a name
+    // that used to be a fact became a label.
     f.insert(
         "fp8_weights".into(),
-        json!(has("GemvFp8") || has("GemvGluFp8") || has("GemmFp8") || has("GemmGluFp8")),
+        json!(
+            FP8_WEIGHT_OPS.iter().any(|k| has(k))
+                || union.iter().any(|a| a.op.ends_with("Fp8Blk"))
+        ),
     );
     // w8a8 is the per-row ACTIVATION quant: `QuantFp8` exists only on that path.
     f.insert("w8a8".into(), json!(has("QuantFp8")));
@@ -270,8 +372,102 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
         "tensor_parallel".into(),
         json!(union.iter().any(|a| a.op.starts_with('X'))),
     );
-    f.insert("prefill".into(), json!(has("FlashPrefill") || has("FlashPrefillFp8")));
+    // "prefill" = the packet carries a prefill program, which for the MLA family means the LATENT
+    // flash, not the dense one. Keying only on FlashPrefill reported `prefill: false` for a Kimi
+    // packet whose buckets are the whole reason the object needs PLOW_MLA_PREFILL=1.
+    f.insert(
+        "prefill".into(),
+        json!(
+            has("FlashPrefill")
+                || has("FlashPrefillFp8")
+                || has("FlashMlaPrefill")
+                || has("FlashGatherPrefill")
+        ),
+    );
+    // The FFN half of an MLA-family prefill is a SEPARATE object axis (PLOW_MOE_PREFILL): the
+    // grouped-expert GEMM is a second full MFMA body in a bucket already at the register cliff, so a
+    // Gemma or attention-only object must not compile it.
+    f.insert(
+        "moe_prefill".into(),
+        json!(union.iter().any(|a| a.op.ends_with("Pf")) || has("MoeAlignPf")),
+    );
     f
+}
+
+/// Encoding facts that live on an instruction FIELD rather than an opcode.
+///
+/// The MoE weight encoding is `i[3]` on ops 85/86 precisely so a precision change is not a re-emit —
+/// which means it is invisible to an opcode-keyed arm set, and an object built from the arm set
+/// alone would be missing the A4W4 body it needs. This is the same reason `Arm` carries `hd`.
+/// The FOUR PRECISION AXES, carried separately.
+///
+/// The existing booleans (`fp8_weights`, `fp8_kv`, `w8a8`, `a4w4`, …) each answer a yes/no about
+/// one arm, and a consumer that wants "what precision is this packet?" has to reconstruct the axes
+/// from them — which is a JUDGEMENT, made independently in every consumer, and therefore made
+/// differently. `scripts/gfx950_objects.py` carries exactly such a FEATURE→AXIS map by hand.
+///
+/// These four fields make it a lookup instead. Each is derived from the instruction stream like
+/// everything else here, and each names ONE axis:
+///
+///   * `weight_enc` — what the projection weights are stored as;
+///   * `act_enc`    — what the activations are fed to the matmuls as. This is the axis that had no
+///     flag and was decided by PHASE, which is how a w8a16 packet reached a w8a8-only object;
+///   * `kv_enc`     — the KV cache dtype, independent of the weight axis;
+///   * `expert_enc` — the MoE expert weights, which the MLA family carries as a runtime field and
+///     which therefore cannot be read off an opcode name at all.
+fn precision_axes(f: &mut Map<String, Value>, s: &Shapes, union: &BTreeSet<Arm>) -> Map<String, Value> {
+    let has = |n: &str| union.iter().any(|a| a.op == n);
+    let on = |k: &str| f.get(k).and_then(Value::as_bool).unwrap_or(false);
+
+    // WEIGHT. mxfp4 projections > fp8 (either flavour) > bf16.
+    let weight = if s.mxfp4_proj {
+        "mxfp4"
+    } else if on("fp8_weights") {
+        "fp8"
+    } else {
+        "bf16"
+    };
+    // ACTIVATION. `QuantFp8` exists only on the w8a8 path — it IS the activation quant, so its
+    // presence is the axis, not an inference from a flag. Everything else feeds bf16 activations,
+    // including w4a16 and w8a16: narrow weights, wide activations.
+    let act = if has("QuantFp8") { "fp8" } else { "bf16" };
+    // KV.
+    let kv = if on("fp8_kv") { "fp8" } else { "bf16" };
+    // EXPERTS. `moe_enc` is the runtime encoding field; absent means there are no expert ops.
+    let expert = match (s.moe_enc.len(), s.moe_enc.iter().next()) {
+        (0, _) => "none",
+        (1, Some(0)) => "bf16",
+        (1, Some(1)) => "fp8blk",
+        (1, Some(2)) => "mxfp4",
+        // More than one encoding on the expert ops IS the mixed case; name it rather than pick.
+        _ => "mixed",
+    };
+    let mut ax = Map::new();
+    ax.insert("weight_enc".into(), json!(weight));
+    ax.insert("act_enc".into(), json!(act));
+    ax.insert("kv_enc".into(), json!(kv));
+    ax.insert("expert_enc".into(), json!(expert));
+    ax
+}
+
+fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
+    f.insert("a4w4".into(), json!(s.moe_enc.contains(&2)));
+    // Correct `fp8_weights` for the encoding field. The `*Fp8Blk` opcodes are the carrier for BOTH
+    // block-fp8 and MXFP4 experts, so their presence alone says nothing; what decides it is the
+    // encoding those instructions actually carry. Ops that are unconditionally block-fp8 —
+    // `GemvFp8Blk` and `DenseGluFp8Blk` have no encoding field — still count on their own.
+    let expert_fp8 = s.moe_enc.contains(&1);
+    let hard_fp8 = |k: &str| union_has(s, k);
+    if f.get("fp8_weights").and_then(Value::as_bool).unwrap_or(false) && !expert_fp8 {
+        let real = FP8_WEIGHT_OPS.iter().any(|k| hard_fp8(k));
+        f.insert("fp8_weights".into(), json!(real));
+    }
+    // w4a16 MXFP4 on the plain [N,K] projections — a different question from the experts' A4W4,
+    // and both have to be true for a packet to be all-MXFP4.
+    f.insert("mxfp4_weights".into(), json!(s.mxfp4_proj));
+    // A packet is meant to be ALL of one encoding. Two on the grouped ops means a mixed run, which
+    // is a thing to see in the manifest rather than to discover in a benchmark number.
+    f.insert("moe_enc_mixed".into(), json!(s.moe_enc.len() > 1));
 }
 
 /// Performance constants derived by RULE from the shapes, never hardcoded. Both
@@ -330,6 +526,85 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>) -> Value {
     }
     if let Some(v) = t.get("gf_full").and_then(Value::as_u64) {
         rec.push(format!("PLOW_NV_FA_GF_FULL={v}"));
+    }
+    json!({ "requires": req, "recommends": rec })
+}
+
+/// Render the neutral facts into the gfx950 (`hipcc` → `.hsaco`) define set.
+///
+/// `backend_nvcc` was the only renderer, so an AMD build had to be derived by hand from the
+/// features — and `scripts/gfx950_objects.py` grew a FEATURE→AXIS map to do exactly that. This is
+/// that map, in the file that owns the facts.
+///
+/// TWO LISTS, and the split is the same one `backend_nvcc` makes: `requires` is CORRECTNESS —
+/// leave one out and an opcode has no arm. On AMD that is worse than on NVIDIA, because the
+/// dispatch `default:` does not `__trap()`, it writes NOTHING: the packet runs, the buffer keeps
+/// whatever was in it, and the failure surfaces as an accuracy bug. Three separate instances of
+/// exactly that shape were found in one week (`GEMM_SMALL` missing from the fp8 prefill object,
+/// the flash object chosen without following the KV axis, and the KV axis silently dragging the
+/// weight axis), which is why this belongs in the manifest rather than in a script.
+///
+/// NOT rendered here: which OBJECT to build. That is a function of the cmake table
+/// (`runtime/CMakeLists.txt`), which pairs define-sets with kernel symbols and register budgets,
+/// and restating it here is precisely the drift this file exists to prevent —
+/// `scripts/gfx950_objects.py` PARSES that table, which is the right relationship. This renders the
+/// defines a covering object must have been built with; matching them to a row is the script's job.
+fn backend_gfx950(
+    f: &Map<String, Value>,
+    s: &Shapes,
+    union: &BTreeSet<Arm>,
+    t_gf_full: Option<u64>,
+) -> Value {
+    let on = |k: &str| f.get(k).and_then(Value::as_bool).unwrap_or(false);
+    let has = |n: &str| union.iter().any(|a| a.op == n);
+
+    let mut req: Vec<String> = Vec::new();
+    // Phase. A packet with prefill buckets needs the prefill object; the decode object is always
+    // needed because every packet has a decode program.
+    if !s.prefill_buckets.is_empty() {
+        req.push("PLOW_BUCKET_DECODE=0".into());
+    }
+    // Weight/activation axis. Both fp8 profiles compile under PLOW_FP8; w8a8 additionally needs
+    // the activation-quant arm, and emitting w8a16 for this target is refused upstream anyway.
+    if on("fp8_weights") {
+        req.push("PLOW_FP8=1".into());
+    }
+    if on("w8a8") {
+        req.push("PLOW_W8A8=1".into());
+    }
+    if on("fp8_kv") {
+        req.push("PLOW_FP8_KV=1".into());
+    }
+    if on("mxfp4_weights") {
+        req.push("PLOW_MXFP4=1".into());
+    }
+    // MLA family. The attention prefill and the MoE prefill are SEPARATE axes: the grouped expert
+    // GEMM is a second full MFMA body in a bucket already at the register cliff, so an
+    // attention-only object must not carry it.
+    if has("FlashMlaPrefill") || has("FlashGatherPrefill") {
+        req.push("PLOW_MLA_PREFILL=1".into());
+    }
+    if on("moe_prefill") {
+        req.push("PLOW_MOE_PREFILL=1".into());
+    }
+    if on("a4w4") {
+        req.push("PLOW_MOE_PF_A4W4=1".into());
+    }
+    // A prefill lm_head emitted as GEMV needs `case PLOW_DOP_GEMV` in the prefill object. It is
+    // unconditional there today, so this is documentation of a dependency rather than a flag —
+    // recorded in `recommends` so a future object that compiles it out is caught by the pairing
+    // hash rather than by a silent no-op.
+    let mut rec: Vec<String> = Vec::new();
+    // FA_GF_FULL is a PAIRED value: the packet's nsplit is derived from it and the kernel decides
+    // how many query heads a work item carries from it, so the two MUST agree or they disagree
+    // about the same number. `backend_nvcc` renders the sm_120 spelling; without the AMD spelling
+    // here, setting the env var moved only the packet half and the gfx950 kernel kept its built-in
+    // default. Same value, both backends, so the pair cannot drift.
+    if let Some(v) = t_gf_full {
+        rec.push(format!("PLOW_FA_GF_FULL={v}"));
+    }
+    if !s.prefill_buckets.is_empty() && has("Gemv") {
+        rec.push("prefill object must dispatch PLOW_DOP_GEMV (lm_head at M=1)".into());
     }
     json!({ "requires": req, "recommends": rec })
 }
@@ -397,8 +672,8 @@ fn analysis(progs: &[ProgramArms]) -> Value {
 /// `arch` is the target triple-ish name (`"sm_120a"`), carried through so the
 /// backend that renders flags knows what it is rendering for; it is metadata,
 /// not something this module interprets.
-pub fn build(m: &Model, arch: &str) -> Value {
-    let mut v = build_inner(m, arch);
+pub fn build(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
+    let mut v = build_inner(m, arch, lean);
     // Stamped last: it is a hash OF the manifest's compiled-set fields, so it
     // cannot be one of them.
     let h = pairing_hash(&v);
@@ -413,11 +688,41 @@ pub fn build(m: &Model, arch: &str) -> Value {
     v
 }
 
-fn build_inner(m: &Model, arch: &str) -> Value {
+/// The `lean` block: WAS THIS BLOB VERIFIED, and if not, why not.
+///
+/// The gate is on by default and DEGRADES — no `plow_verify` on the machine
+/// means warn-and-skip, not a failed compile. That is the right behaviour and
+/// it creates the exact hazard this repo keeps getting caught by: a skipped
+/// gate and a passing gate look identical from the outside. `tuning.tier`
+/// already burned us this way (`portable` meant both "analytical model chosen"
+/// and "nothing was ever measured"), and the GLM prefill numbers taken on top
+/// of it were meaningless for weeks.
+///
+/// So a downstream consumer — a benchmark harness, a reviewer, a bisect — must
+/// be able to ask the ARTIFACT, not a build log it no longer has.
+///
+/// `verified: false` NEVER means "rejected": a rejection panics before the blob
+/// is written, so no manifest can describe a rejected program.
+fn lean_block(lean: &crate::LeanReport) -> Value {
+    json!({
+        "verified": lean.verified,
+        "oracle": lean.oracle,
+        "reason": lean.reason,
+        "note": "`verified` = a Lean ordering certificate (plow_verify checkpoint D) was \
+                 obtained for EVERY program in this blob; `oracle` = the Lean decode \
+                 lower-bound query ran. false means NOT CHECKED (see `reason`), never \
+                 `checked and rejected` — a rejection aborts emission, so a blob with a \
+                 rejected program never reaches disk and has no manifest.",
+    })
+}
+
+fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
     let progs = program_arms(m);
     let union: BTreeSet<Arm> = progs.iter().flat_map(|p| p.arms.iter().cloned()).collect();
     let s = shapes(m);
-    let f = features(&union);
+    let mut f = features(&union);
+    encoding_features(&mut f, &s);
+    let axes = precision_axes(&mut f, &s, &union);
     let t = tuning(&s);
 
     let opcodes: BTreeSet<&str> = union.iter().map(|a| a.op.as_str()).collect();
@@ -460,15 +765,25 @@ fn build_inner(m: &Model, arch: &str) -> Value {
             "kv_dtype": kv_dtype,
             "max_chunk": s.max_chunk,
             "prefill_buckets": s.prefill_buckets,
+            "moe_enc": s.moe_enc,
         },
         "features": f,
+        // The four precision axes, so "what precision is this packet?" is a lookup rather than a
+        // judgement reconstructed from the feature booleans by every consumer separately.
+        "precision": axes,
         "tuning": t,
+        // Sits beside `tuning` on purpose: both answer "how much do I trust this
+        // artifact?", and both have a value that means "not established".
+        "lean": lean_block(lean),
         "programs": programs,
         // What a specialised object must compile: the union over every program
         // and segment. Anything narrower and some bucket hits `default: __trap()`.
         "union": union.iter().map(Arm::key).collect::<Vec<_>>(),
         "analysis": analysis(&progs),
-        "backends": { "nvcc": backend_nvcc(&f, &t) },
+        "backends": {
+            "nvcc": backend_nvcc(&f, &t),
+            "gfx950": backend_gfx950(&f, &s, &union, t.get("gf_full").and_then(Value::as_u64)),
+        },
     })
 }
 
@@ -589,6 +904,12 @@ mod tests {
     use super::*;
     use packet::dev::DevInst;
     use packet::devbuild::Program;
+
+    /// Shadows [`super::build`]: most assertions here are about arms/shapes and
+    /// do not care about the lean block, which has its own tests below.
+    fn build(m: &Model, arch: &str) -> Value {
+        super::build(m, arch, &crate::LeanReport::skipped("test: gate not run"))
+    }
 
     fn inst(op: DevOp, i: [u32; 8]) -> DevInst {
         DevInst { op: op as u16, blocks: 1, i, ..Default::default() }
@@ -718,6 +1039,82 @@ mod tests {
         assert_ne!(pairing_hash(&a), pairing_hash(&b));
     }
 
+    /// The four axes must be readable WITHOUT reconstructing them from the feature booleans —
+    /// that reconstruction is a judgement, and it was being made separately in every consumer.
+    #[test]
+    fn precision_axes_are_a_lookup_not_a_judgement() {
+        let man = build(&model(), "gfx950");
+        let p = &man["precision"];
+        // The fixture is bf16 weights, bf16 activations, fp8 KV (FlashDecodeFp8), no experts.
+        assert_eq!(p["weight_enc"], "bf16");
+        assert_eq!(p["act_enc"], "bf16", "no QuantFp8 => wide activations");
+        assert_eq!(p["kv_enc"], "fp8", "the KV axis is INDEPENDENT of the weight axis");
+        assert_eq!(p["expert_enc"], "none");
+    }
+
+    /// The activation axis is `QuantFp8`'s presence — the op that IS the activation quant — and
+    /// not an inference from the weight flag. That distinction is the whole point: the axis had no
+    /// flag and was decided by phase, which is how a w8a16 packet reached a w8a8-only object.
+    #[test]
+    fn activation_axis_follows_quant_fp8_not_the_weight_flag() {
+        let w8a16 = prog(vec![inst(DevOp::GemmFp8, [0; 8])]);
+        let m = Model {
+            n_cu: 256, target: 0, tensors: vec![], progs: vec![w8a16],
+            kv_row_insts: vec![], prog_t: vec![128], gen: vec![],
+        };
+        let man = build(&m, "gfx950");
+        assert_eq!(man["precision"]["weight_enc"], "fp8");
+        assert_eq!(man["precision"]["act_enc"], "bf16", "fp8 weights, bf16 activations = w8a16");
+
+        let w8a8 = prog(vec![inst(DevOp::QuantFp8, [0; 8]), inst(DevOp::GemmFp8, [0; 8])]);
+        let m2 = Model {
+            n_cu: 256, target: 0, tensors: vec![], progs: vec![w8a8],
+            kv_row_insts: vec![], prog_t: vec![128], gen: vec![],
+        };
+        let man2 = build(&m2, "gfx950");
+        assert_eq!(man2["precision"]["act_enc"], "fp8");
+        assert_eq!(man2["features"]["w8a8"], true);
+    }
+
+    /// The gfx950 backend renders the defines a covering object must carry. On AMD a missing arm
+    /// does not trap — it writes nothing — so `requires` is the correctness half in a stronger
+    /// sense than on NVIDIA.
+    #[test]
+    fn gfx950_backend_renders_the_axis_defines() {
+        let man = build(&model(), "gfx950");
+        let req: Vec<&str> = man["backends"]["gfx950"]["requires"].as_array().unwrap()
+            .iter().filter_map(|v| v.as_str()).collect();
+        assert!(req.contains(&"PLOW_BUCKET_DECODE=0"), "the packet has a prefill bucket");
+        assert!(req.contains(&"PLOW_FP8_KV=1"));
+        assert!(!req.contains(&"PLOW_FP8=1"), "bf16 weights must not ask for the fp8 object");
+        assert!(!req.contains(&"PLOW_MLA_PREFILL=1"), "no MLA ops in this packet");
+        // nvcc is still rendered — adding a backend must not remove one.
+        assert!(man["backends"]["nvcc"]["requires"].is_array());
+    }
+
+    /// `arm_of` must read each flash op's head-dim from the slot that op ACTUALLY carries it in.
+    ///
+    /// `FlashMerge` uses `i[3]` (`runtime/amd/interp.hip:1119` / `:1315`), the rest use `i[6]`.
+    /// Reading `i[6]` for `FlashMerge` yields `Some(0)` on every real packet, so the whole
+    /// coverage check goes blind for `d_flash_merge<D>` — the exact template family a dispatch
+    /// bug has already been found in once. This is a constant-vs-constant comparison that always
+    /// passes, which is why it needs its own test rather than being caught downstream.
+    #[test]
+    fn arm_of_reads_the_head_dim_slot_each_flash_op_actually_uses() {
+        let mut i = [0u32; 8];
+        i[3] = 256; // FlashMerge's slot
+        i[6] = 128; // FlashPrefill / FlashDecode's slot
+        assert_eq!(arm_of(DevOp::FlashMerge, &i).hd, Some(256), "FlashMerge takes i[3]");
+        assert_eq!(arm_of(DevOp::FlashPrefill, &i).hd, Some(128));
+        assert_eq!(arm_of(DevOp::FlashDecode, &i).hd, Some(128));
+        assert_eq!(arm_of(DevOp::FlashDecodeFp8, &i).hd, Some(128));
+        assert_eq!(arm_of(DevOp::Gemv, &i).hd, None, "non-flash ops are not templated on a field");
+        // A real FlashMerge packet leaves i[6] at 0, so the old slot cannot distinguish arms.
+        let mut real = [0u32; 8];
+        real[3] = 512;
+        assert_eq!(arm_of(DevOp::FlashMerge, &real).hd, Some(512));
+    }
+
     /// The header gates arms on presence, and the guard lets an explicit -D win.
     #[test]
     fn header_has_presence_and_shape_macros() {
@@ -728,5 +1125,75 @@ mod tests {
         assert!(h.contains("#define GV_MM_MAX 8"));
         assert!(h.contains("#ifndef GV_MM_MAX"));
         assert!(h.contains("PLOW_PACKET_HASH"));
+    }
+
+    // ===== The `lean` block. =====================================================
+    //
+    // The gate is default-on and DEGRADES, so "it did not run" is now a normal,
+    // common outcome — which makes it indistinguishable from "it ran and passed"
+    // unless the artifact says which. `tuning.tier` already cost this project a
+    // long stretch of meaningless GLM prefill numbers by reporting `portable` for
+    // both "analytical model chosen" and "nothing was ever measured".
+
+    /// THE REGRESSION GUARD FOR CORRECTION 3. Binary absent ⇒ the field is
+    /// present, false, and CARRIES A REASON. A `reason` of `null` here would
+    /// mean a consumer sees `verified: false` with no way to tell a skip from
+    /// anything else.
+    #[test]
+    fn lean_block_is_false_with_a_reason_when_the_verifier_is_absent() {
+        let skipped = crate::LeanReport::skipped(
+            "no `plow_verify` binary (set PLOW_VERIFY_BIN, or `lake build` in lean-plow/)",
+        );
+        let man = super::build(&model(), "gfx950", &skipped);
+        let lean = man.get("lean").expect("build.json must carry a `lean` block");
+        assert_eq!(lean["verified"], json!(false));
+        assert_eq!(lean["oracle"], json!(false));
+        let reason = lean["reason"].as_str().expect("a skip must state its reason");
+        assert!(reason.contains("plow_verify"), "reason should name the binary: {reason}");
+    }
+
+    /// The other side of it: a real pass says so, and says it with no reason.
+    #[test]
+    fn lean_block_reports_a_clean_verification() {
+        let ok = crate::LeanReport { verified: true, oracle: true, reason: None };
+        let man = super::build(&model(), "gfx950", &ok);
+        assert_eq!(man["lean"]["verified"], json!(true));
+        assert_eq!(man["lean"]["oracle"], json!(true));
+        assert_eq!(man["lean"]["reason"], Value::Null);
+    }
+
+    /// The two subsystems are INDEPENDENT (Correction 1). Disabling the
+    /// certificate must not report the oracle as skipped, or the manifest
+    /// re-creates in data the CLI coupling the flags were fixed to avoid.
+    #[test]
+    fn oracle_and_verify_are_recorded_independently() {
+        let oracle_only = crate::LeanReport {
+            verified: false,
+            oracle: true,
+            reason: Some("ordering certificate disabled on the command line".into()),
+        };
+        let man = super::build(&model(), "gfx950", &oracle_only);
+        assert_eq!(man["lean"]["verified"], json!(false));
+        assert_eq!(man["lean"]["oracle"], json!(true));
+    }
+
+    /// VERIFICATION IS READ-ONLY AND MUST NOT MOVE THE PAIRING HASH.
+    ///
+    /// `pairing_hash` decides whether a packet and an interpreter object may be
+    /// loaded together. If the lean block fed it, running on a box with a Lean
+    /// build would produce a packet that refuses the object built on a box
+    /// without one — a verification gate breaking a pairing it has no business
+    /// touching. It is hashed over `union` + `tuning` only; this pins that.
+    #[test]
+    fn the_lean_block_does_not_change_the_pairing_hash() {
+        let m = model();
+        let a = super::build(&m, "gfx950", &crate::LeanReport::skipped("absent"));
+        let b = super::build(
+            &m,
+            "gfx950",
+            &crate::LeanReport { verified: true, oracle: true, reason: None },
+        );
+        assert_ne!(a["lean"], b["lean"], "the test would be vacuous otherwise");
+        assert_eq!(a["pairing"]["hash"], b["pairing"]["hash"]);
     }
 }

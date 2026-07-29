@@ -37,7 +37,9 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       i_prefill_gq.co i_decode_gq.co i_flash_gq.co \
       interp_prefill_gq.elf interp_decode_gq.elf interp_flash_gq.elf \
       i_decode_fp8.co i_decode_fp8_gq.co interp_decode_fp8.elf interp_decode_fp8_gq.elf \
-      i_decode_fp8kv.co i_decode_fp8kv_gq.co interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf
+      i_decode_fp8kv.co i_decode_fp8kv_gq.co interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf \
+      i_prefill_mla_moe.co i_prefill_mla_moe_gq.co \
+      interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf
 
 genco() { # <extra-defs> <out.co>
   hipcc --offload-arch="$ARCH" -O3 -w $1 --genco "$R/amd/interp.hip" -o "$2" $INC
@@ -46,9 +48,91 @@ unbundle() { # <in.co> <out.elf>
   "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" --input="$1" --output="$2"
 }
 
+# DECODE BATCH BUCKET -> PLOW_GEMV_MM. THIS ROUTE WAS MISSING, and it is why batched decode
+# produced exactly one non-zero logits row on AMD while devgen emitted a fully batch-aware
+# program (build.json decode_batch:4, gv_mm_max:4, prog 3 (T=4), 4x KV cache — all correct).
+#
+# The multi-row GEMV arms have always existed here: gemv_rows<MM>, gemv_glu_rows<MM>,
+# gemv_qkv_rows<MM> and the fp8/mxfp4/fp8_blk/dma variants all carry `float acc[MM]`, predicate
+# each row on `m < M`, and write C[m*N + n]. What did not exist was anything DEFINING
+# PLOW_GEMV_MM, so every AMD decode object compiled at op_gemm.h's default of 1 and wrote row 0
+# only — rows 1..B-1 stayed zero and every sequence but the first sampled token 0. §4's bug
+# shape exactly: the arm exists, is correct, is register-gated, and NOTHING ROUTES TO IT.
+#
+# The knob NAMES diverge across backends, which is how this hid in plain sight: the tuning
+# pipeline (crates/devgen/src/manifest.rs, crates/tunedb/src/decode.rs) emits `GV_MM_MAX`, which
+# is the NVIDIA op_gemm.cuh knob. AMD's is PLOW_GEMV_MM, and nothing anywhere set it.
+#
+# It is a COMPILE-TIME bucket on purpose. Do NOT replace this with a runtime LADDER like
+# NVIDIA's gemv_walk(). That WAS built here, measured, and REMOVED (op_gemm.h:2163): a runtime
+# `if (M<=1) ... else if (M<=2) ...` chain inlines every instantiation, so the allocator budgets
+# for the widest arm and the decode object went to arch 148 + agpr 128 = 276 registers — over
+# the 256 a wave may use at 2 waves/SIMD, and that single switch is what blocked the 8-wave
+# dispatch for every other op, GEMM included. One instantiation with a runtime M and an
+# `m < M` predicate serves every M <= MM, which is why the ladder buys nothing here.
+#
+# THE LADDER AND THE OUTER LOOP ARE NOT THE SAME THING, and 276 measured the ladder. A
+# SINGLE-RUNG walk over M > MM (`PLOW_GEMV_WALK`, op_gemm.h, default 0) inlines ONE body, so
+# no register union forms: measured +1 VGPR at MM=4 and +0 everywhere else, occ 2, AGPR 0,
+# spill unchanged. It is the WIDTH that costs, not the loop — MM=32/64 stay at 256/occ 2 but
+# spill 0.35-0.53 scratch ops per FMA INSIDE the weight-stream loop (MM=1 is 0.022), and
+# NVIDIA's shallow-unroll rescue does not port because this megakernel has 8 registers of
+# headroom where sm_120 has 43. Full table + verdict: plans/knob-contract.md §6g-WALK.
+#
+# next_pow2, clamped to PLOW_GEMV_MAXM (16). Register cost measured on ROCm 7.2.4 / gfx950:
+#   MM=1  248/occ2/spill 0     MM=2  248/occ2/spill 0 (free)     MM=4  252/occ2/spill 0
+#   MM=8  256/occ2/spill 19    <- at the cap AND spilling; the bucket stops paying here.
+# B=1 keeps MM=1, so it is byte- and register-identical to a pre-batch build.
+#
+# THE BUCKET IS NOW SELF-DECLARING. op_gemm.h emits `plow_gemv_mm_cap_$GVMM` into every object
+# it compiles, named for PLOW_GEMV_MM itself, and plowrt's `check_gemv_capacity` refuses to run
+# a packet whose widest GEMV asks for more rows than the object advertises. Nothing here has to
+# be kept in sync with it: the symbol IS the macro. But note the corollary for OLD trees — an
+# object built before that marker advertises nothing, and a batch>1 packet against it is refused
+# rather than silently served, so a tree serving B>1 must be rebuilt with this script once.
+# Verified on ROCm 7.2.4/gfx950, MM=1 decode object with and without the marker:
+# 248 vgpr / 0 agpr / 100 sgpr / 288 B private, IDENTICAL. It costs 4 bytes of .data.
+GVMM="${PLOW_DECODE_BATCH:-1}"
+case "$GVMM" in ''|*[!0-9]*) GVMM=1;; esac
+[ "$GVMM" -lt 1 ] && GVMM=1
+P2=1; while [ "$P2" -lt "$GVMM" ]; do P2=$((P2 * 2)); done
+[ "$P2" -gt 16 ] && P2=16
+GVMM="$P2"
+# THE BUCKET AND THE BATCH CAN NOW BE DECOUPLED, and that is the whole §6g-WALK experiment.
+#
+# Until now `PLOW_GEMV_MM` was DERIVED from `PLOW_DECODE_BATCH` with no way to override it, so
+# `min(t, gv_mm)` was identically `t` and the fusion-gate fix the walk study asked for would
+# have been a no-op. The two numbers answer different questions:
+#   PLOW_DECODE_BATCH  how many sequences the PROGRAM serves      (t, packet-side)
+#   PLOW_GEMV_MM       how many rows one GEMV pass handles        (MM, object-side)
+# With `PLOW_GEMV_WALK=1` the kernel loops `ceil(t/MM)` times, so MM < t is legal and is the
+# ONLY way to serve t=16 without the MM=16 spill (16 scratch ops/FMA, 5536 B/lane) AND without
+# losing `fuse_qkv`/`glu_fused` to the `t*hidden > GM_LDS_HALVES` gate.
+#
+# WITHOUT the walk, MM < t is SILENT CORRUPTION — rows MM..t-1 are never written. plowrt refuses
+# that pairing (`check_gemv_capacity` against `plow_gemv_mm_cap_<N>`), so the mistake is caught
+# at load rather than in the output, but do not make it on purpose.
+if [ -n "${PLOW_GEMV_MM:-}" ]; then
+  case "$PLOW_GEMV_MM" in ''|*[!0-9]*) echo "PLOW_GEMV_MM must be a number" >&2; exit 1;; esac
+  [ "$PLOW_GEMV_MM" -lt 1 ] || [ "$PLOW_GEMV_MM" -gt 16 ] && {
+    echo "PLOW_GEMV_MM must be 1..16 (PLOW_GEMV_MAXM)" >&2; exit 1; }
+  if [ "$PLOW_GEMV_MM" -lt "$GVMM" ] && [ "${PLOW_GEMV_WALK:-0}" != "1" ]; then
+    echo "REFUSING: PLOW_GEMV_MM=$PLOW_GEMV_MM < batch $GVMM with PLOW_GEMV_WALK unset." >&2
+    echo "  Without the walk, gemv_rows<MM> writes rows 0..MM-1 and leaves the rest STALE." >&2
+    exit 1
+  fi
+  GVMM="$PLOW_GEMV_MM"
+fi
+WALK="${PLOW_GEMV_WALK:-0}"
+# Every DECODE object AND its register check must carry the same bucket, or the cliff gate
+# validates an object that is not the one that ships.
+DEC="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM -DPLOW_GEMV_WALK=$WALK"
+echo "   decode GEMV batch bucket: PLOW_GEMV_MM=$GVMM walk=$WALK (PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH:-1})"
+
 for B in 0 1; do
   N=$([ "$B" -eq 0 ] && echo prefill || echo decode)
-  genco "-DPLOW_BUCKET_DECODE=$B" "i_$N.co"
+  D=$([ "$B" -eq 0 ] && echo "-DPLOW_BUCKET_DECODE=0" || echo "$DEC")
+  genco "$D" "i_$N.co"
   unbundle "i_$N.co" "interp_$N.elf"
 done
 
@@ -61,18 +145,24 @@ unbundle i_flash.co interp_flash.elf
 # GLOBAL-QUEUE variant (Experiment E1). Same op set / tiles / wave count as the static prefill+decode
 # objects — ONLY the scheduling loop differs (one shared atomic cursor vs static per-CU streams), so an
 # A/B isolates scheduling. GLOBAL QUEUE IS THE DEFAULT scheduler (E1: decode win on both models, prefill
-# neutral on 31B) — build the _gq objects unless PLOW_NO_GQ=1 asks for a static-only build. PLOW_GQ_BATCH
+# a MEASURED -8.4% prefill win on 31B too, 163 vs 178 ms at T=1024 — see interp.hip) — build the
+# _gq objects unless PLOW_NO_GQ=1 asks for a static-only build. PLOW_GQ_BATCH
 # stays 1 (raising it starves parallelism, measured 6-8x slower).
 BUILD_GQ=1; [ -n "${PLOW_NO_GQ:-}" ] && BUILD_GQ=0
 GQB="${PLOW_GQ_BATCH:-1}"
 # FP8 DECODE object (PLOW_FP8=1). A SEPARATE decode interpreter carrying the fp8 w8a16 GEMV arms
-# (GEMV_FP8 / GEMV_GLU_FP8) in place of the bf16 GEMV_GLU/QKV arms, so the register footprint stays
-# under the same 256/occ-2 cliff. Mirrors Gemma's OWN decode flags (FA_DEC_VPIPE default 0, no
+# (GEMV_FP8 / GEMV_GLU_FP8) IN ADDITION TO the bf16 GEMV_GLU/QKV arms — they used to replace them,
+# which dropped the one bf16 GEMM every fp8 PREFILL packet still emits (the lm_head) and produced
+# all-zero logits; see plans/amd-fp-precision.md §4. Additive is register-free on ROCm 7.2.4
+# (248/occ 2/spill 0 either way). Mirrors Gemma's OWN decode flags (FA_DEC_VPIPE default 0, no
 # PLOW_FLASH_HD128 — Gemma runs segmented flash), only adding PLOW_FP8=1. Built only when asked.
 BUILD_FP8=0; [ "${PLOW_FP8:-0}" = 1 ] && BUILD_FP8=1
 # FP8 KV-CACHE decode object (PLOW_FP8_KV=1). e4m3 K/V storage+read halves the decode KV stream.
 # The DECODE object swaps FLASH_DECODE for the fp8 flash + adds HeadNormRopeFp8, and keeps the fp8
-# GEMV weight arms (an fp8-KV pkt is also fp8-weight). No FA_DEC_VPIPE (a bf16-only V-prefetch).
+# GEMV weight arms. The KV axis stays a SWAP where the weight axis is additive: a packet's KV is
+# uniformly one encoding, and the 4-wave flash object is where the register budget is tight.
+# `-DPLOW_FP8=1` here is the WEIGHT axis, not implied by fp8-KV — the cmake table composes the two
+# separately now, so a bf16-weight/fp8-KV object is expressible. No FA_DEC_VPIPE (bf16-only).
 # Only the DECODE object is built here — the synthetic-KV decode sweep never runs prefill. Gemma's
 # real-prefill fp8kv path (a separate 4-wave flash object) is out of scope for the timing sweep.
 BUILD_FP8KV=0; [ "${PLOW_FP8_KV:-0}" = 1 ] && BUILD_FP8KV=1
@@ -86,12 +176,57 @@ BUILD_MXFP4=0; [ "${PLOW_MXFP4:-0}" = 1 ] && BUILD_MXFP4=1
 # own attention. Its own flag because the prefill bucket sits AT the 256/occ-2 cliff and a Gemma
 # prefill object must not pay for MLA it never runs.
 BUILD_MLA=0; [ "${PLOW_MLA_PREFILL:-0}" = 1 ] && BUILD_MLA=1
+# MoE PREFILL object (PLOW_MOE_PREFILL=1). Adds the grouped-expert prefill ops 83-87
+# (MOE_ROUTER_TOPK_PF / MOE_ALIGN_PF / MOE_GROUP_GLU_PF / MOE_GROUP_DOWN_PF / MOE_COMBINE_PF) —
+# the FFN half of an MLA-family prompt. THE FLAG EXISTED IN interp.hip AND NOTHING HERE EVER
+# DEFINED IT, so ops 83-87 were compiled into ZERO shipped objects: the same §4 shape as
+# PLOW_GEMV_MM and interp_prefill_mxfp4 above, an arm that is written, register-gated and
+# unreachable. An MLA prefill object with no MoE arm is attention-complete and FFN-incomplete
+# (the expert packets fall through to `default:` and write NOTHING), which is why this builds
+# the MLA+MoE COMBINATION and PLOW_MOE_PREFILL=1 turns the MLA arm on with it — exactly the
+# `interp_prefill_mla_moe` row of runtime/CMakeLists.txt, and what a GLM-5.2 / Kimi K2.7 /
+# DeepSeek whole-layer prefill object must be. Measured cost on ROCm 7.2.4 / gfx950: identical
+# to the bf16 prefill, 256 VGPR / 0 AGPR / occ 2 / spill 2 — the grouped GEMM costs occupancy
+# nothing, and its 81920 B double-buffered tile fits inside the interpreter's existing arena.
+BUILD_MOE=0; [ "${PLOW_MOE_PREFILL:-0}" = 1 ] && { BUILD_MOE=1; BUILD_MLA=1; }
+# L2-DOMAIN DISPATCH (PLOW_L2_PLACE=1). Makes a workgroup take its global-queue window from the
+# XCD it is PHYSICALLY running on (HW_REG_XCC_ID) instead of from the host's `cur_seg`, so all 8
+# domains drain concurrently in one launch and a consumer reads its producer out of the same XCD's
+# 4 MiB L2 instead of across the fabric. Pairs with a blob built by `plowc` under PLOW_L2_PLACE=1.
+#
+# Applied to the DECODE object in place rather than built as a fourth object, and both halves of
+# that matter:
+#   - IN PLACE, because a separate object would export the SAME `plow_interp_dec_gfx950_gq`
+#     symbol and the two could not co-load. Making it a build-recipe choice needs no runtime
+#     kernel selection at all.
+#   - DECODE ONLY, because a placed PREFILL packet does not exist to run: `seg` carries the wave
+#     class the host relaunches at, and `Builder::finish` declines placement for any program with
+#     more than one wave class. Decode has no FlashPrefill op, so every op is class 8, `seg` is
+#     uniformly 0, and there is nothing to overwrite. A prefill twin would be an arm with nothing
+#     routing to it — the §4 shape this tree keeps rediscovering.
+#
+# SAFE IN BOTH DIRECTIONS, so the pairing cannot silently corrupt: an L2 object given an UNPLACED
+# blob sees `prog.l2_domains == 0` and falls back to `cur_seg` (byte-identical behaviour), and a
+# placed blob given a NON-L2 runtime is refused at load by `devblob.rs`'s F_L2DOM guard.
+#
+# Measured cost on ROCm 7.2.4 / gfx950 (`scripts/l2_regcheck.sh`): 248 VGPR / 0 AGPR / occ 2 /
+# spill 0 — IDENTICAL to the plain GQ decode object. The XCC id lands in a scalar register, so
+# the hottest loop in the interpreter pays nothing for it.
+L2D=""
+if [ "${PLOW_L2_PLACE:-0}" = 1 ]; then
+  L2D="-DPLOW_L2_PLACE_DISPATCH"
+  echo "   PLOW_L2_PLACE=1: decode GQ object built with L2-domain dispatch (XCC_ID window select)"
+fi
 if [ "$BUILD_GQ" = 1 ]; then
   for B in 0 1; do
     N=$([ "$B" -eq 0 ] && echo prefill || echo decode)
-    genco "-DPLOW_BUCKET_DECODE=$B -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" "i_${N}_gq.co"
+    D=$([ "$B" -eq 0 ] && echo "-DPLOW_BUCKET_DECODE=0" || echo "$DEC $L2D")
+    genco "$D -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" "i_${N}_gq.co"
     unbundle "i_${N}_gq.co" "interp_${N}_gq.elf"
   done
+  # The L2 decode object is register-checked below with the same 256/occ-2 budget as the plain
+  # one — it is the SAME object with one extra scalar read, and if that ever costs occupancy the
+  # build must fail rather than ship a decode kernel at occ 1.
   # GQ flash object (Gemma's segmented 4-wave flash segment under the global queue).
   genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_flash_gq.co
   unbundle i_flash_gq.co interp_flash_gq.elf
@@ -100,10 +235,10 @@ fi
 # FP8 decode objects (static + GQ), each swapping the bf16 GEMV_GLU/QKV arms for the fp8 ones. Same
 # flags as Gemma's bf16 decode above, only adding PLOW_FP8=1. The bf16 objects are unaffected.
 if [ "$BUILD_FP8" = 1 ]; then
-  genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1" i_decode_fp8.co
+  genco "$DEC -DPLOW_FP8=1" i_decode_fp8.co
   unbundle i_decode_fp8.co interp_decode_fp8.elf
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_fp8_gq.co
+    genco "$DEC -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_fp8_gq.co
     unbundle i_decode_fp8_gq.co interp_decode_fp8_gq.elf
   fi
   # w8a8 PREFILL object. The fp8 GEMM arms SWAP for the bf16 ones (an fp8 program emits no bf16
@@ -119,24 +254,37 @@ fi
 # FP8 KV-CACHE decode objects (static + GQ). Swap FLASH_DECODE for the fp8 flash + add HeadNormRopeFp8,
 # keeping the fp8 GEMV weight arms. bf16/fp8-weight objects above are unaffected.
 if [ "$BUILD_FP8KV" = 1 ]; then
-  genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_FP8_KV=1" i_decode_fp8kv.co
+  genco "$DEC -DPLOW_FP8=1 -DPLOW_FP8_KV=1" i_decode_fp8kv.co
   unbundle i_decode_fp8kv.co interp_decode_fp8kv.elf
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_FP8_KV=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_fp8kv_gq.co
+    genco "$DEC -DPLOW_FP8=1 -DPLOW_FP8_KV=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_fp8kv_gq.co
     unbundle i_decode_fp8kv_gq.co interp_decode_fp8kv_gq.elf
   fi
 fi
 
-# MXFP4 decode objects (static + GQ).
+# MXFP4 objects (static + GQ), decode AND prefill.
+#
+# THE PREFILL OBJECT WAS NAMED AND NEVER BUILT. `scripts/gfx950_objects.py:161` routes an
+# mxfp4 packet's prefill bucket to `interp_prefill_mxfp4`, and nothing here produced it — so a
+# host following the object table asked for a file that did not exist. This is the same §4
+# shape as the arm it carries: `PLOW_DOP_GEMM_MXFP4` had already been written, register-gated,
+# and left unreachable once (interp.hip:854 records that), and building only the decode half
+# left it unreachable a second way. Measured: 256 VGPR / 0 AGPR / occ 2 / spill 2, i.e. the
+# bf16 prefill budget unchanged — the fp4 arms are additive (w4a16 mixes with bf16 by
+# construction) and they cost nothing.
 MXFP4_ELFS=""
 if [ "$BUILD_MXFP4" = 1 ]; then
-  genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_MXFP4=1" i_decode_mxfp4.co
+  genco "$DEC -DPLOW_MXFP4=1" i_decode_mxfp4.co
   unbundle i_decode_mxfp4.co interp_decode_mxfp4.elf
-  MXFP4_ELFS="interp_decode_mxfp4.elf"
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1" i_prefill_mxfp4.co
+  unbundle i_prefill_mxfp4.co interp_prefill_mxfp4.elf
+  MXFP4_ELFS="interp_decode_mxfp4.elf interp_prefill_mxfp4.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    genco "-DPLOW_BUCKET_DECODE=1 -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_mxfp4_gq.co
+    genco "$DEC -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_mxfp4_gq.co
     unbundle i_decode_mxfp4_gq.co interp_decode_mxfp4_gq.elf
-    MXFP4_ELFS="interp_decode_mxfp4.elf interp_decode_mxfp4_gq.elf"
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_prefill_mxfp4_gq.co
+    unbundle i_prefill_mxfp4_gq.co interp_prefill_mxfp4_gq.elf
+    MXFP4_ELFS="interp_decode_mxfp4.elf interp_decode_mxfp4_gq.elf interp_prefill_mxfp4.elf interp_prefill_mxfp4_gq.elf"
   fi
 fi
 
@@ -150,6 +298,19 @@ if [ "$BUILD_MLA" = 1 ]; then
     genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_prefill_mla_gq.co
     unbundle i_prefill_mla_gq.co interp_prefill_mla_gq.elf
     MLA_ELFS="interp_prefill_mla.elf interp_prefill_mla_gq.elf"
+  fi
+fi
+
+# MLA+MoE prefill objects (static + GQ) — the whole-layer prefill object.
+MOE_ELFS=""
+if [ "$BUILD_MOE" = 1 ]; then
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1" i_prefill_mla_moe.co
+  unbundle i_prefill_mla_moe.co interp_prefill_mla_moe.elf
+  MOE_ELFS="interp_prefill_mla_moe.elf"
+  if [ "$BUILD_GQ" = 1 ]; then
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_prefill_mla_moe_gq.co
+    unbundle i_prefill_mla_moe_gq.co interp_prefill_mla_moe_gq.elf
+    MOE_ELFS="interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf"
   fi
 fi
 
@@ -182,7 +343,7 @@ check() { # <name> <defs> <max-total> <min-occ>
   fi
 }
 check prefill "-DPLOW_BUCKET_DECODE=0" 256 2
-check decode  "-DPLOW_BUCKET_DECODE=1" 256 2
+check decode  "$DEC" 256 2
 check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1" 512 1
 # The GQ loop adds a shared cursor + claim broadcast; it must NOT push prefill past 256/occ-2. If it
 # does and no minimal-live-set fix recovers it, that is itself a recordable E1 finding (GQ incompatible
@@ -190,7 +351,7 @@ check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA
 GQ_ELFS=""
 if [ "$BUILD_GQ" = 1 ]; then
   check prefill_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
-  check decode_gq  "-DPLOW_BUCKET_DECODE=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+  check decode_gq  "$DEC $L2D -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
   check flash_gq   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 512 1
   GQ_ELFS="interp_prefill_gq.elf interp_decode_gq.elf interp_flash_gq.elf"
 fi
@@ -198,36 +359,61 @@ fi
 # 256/occ-2 cliff. Checked only when the fp8 objects were built.
 FP8_ELFS=""
 if [ "$BUILD_FP8" = 1 ]; then
-  check decode_fp8 "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1" 256 2
+  check decode_fp8 "$DEC -DPLOW_FP8=1" 256 2
   check prefill_fp8 "-DPLOW_BUCKET_DECODE=0 -DPLOW_FP8=1" 256 2
   FP8_ELFS="interp_decode_fp8.elf interp_prefill_fp8.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    check decode_fp8_gq "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    check decode_fp8_gq "$DEC -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
     check prefill_fp8_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_FP8=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
     FP8_ELFS="interp_decode_fp8.elf interp_decode_fp8_gq.elf interp_prefill_fp8.elf interp_prefill_fp8_gq.elf"
   fi
 fi
 FP8KV_ELFS=""
 if [ "$BUILD_FP8KV" = 1 ]; then
-  check decode_fp8kv "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_FP8_KV=1" 256 2
+  check decode_fp8kv "$DEC -DPLOW_FP8=1 -DPLOW_FP8_KV=1" 256 2
   FP8KV_ELFS="interp_decode_fp8kv.elf"
   if [ "$BUILD_GQ" = 1 ]; then
-    check decode_fp8kv_gq "-DPLOW_BUCKET_DECODE=1 -DPLOW_FP8=1 -DPLOW_FP8_KV=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    check decode_fp8kv_gq "$DEC -DPLOW_FP8=1 -DPLOW_FP8_KV=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
     FP8KV_ELFS="interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf"
   fi
 fi
 
 if [ "$BUILD_MXFP4" = 1 ]; then
-  check decode_mxfp4 "-DPLOW_BUCKET_DECODE=1 -DPLOW_MXFP4=1" 256 2
-  [ "$BUILD_GQ" = 1 ] && check decode_mxfp4_gq "-DPLOW_BUCKET_DECODE=1 -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+  # Conflict resolution: DECODE arms must use $DEC, which carries -DPLOW_GEMV_MM=$GVMM.
+  # Dropping it here would silently revert batched decode to one row for the mxfp4 object
+  # only — exactly the class of bug that made PLOW_GEMV_MM unreachable in the first place.
+  # The prefill_mxfp4 checks are new and are kept as written.
+  check decode_mxfp4 "$DEC -DPLOW_MXFP4=1" 256 2
+  # The prefill twin carries the fp4 GEMM at all five tile rungs. Its accumulators are the
+  # bf16 ones (w4a16 dequantizes in the B-fetch and issues a bf16 MFMA), and every rung is
+  # smaller than the 256x256 arm the object already had, so it must stay at the same cliff.
+  check prefill_mxfp4 "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1" 256 2
+  if [ "$BUILD_GQ" = 1 ]; then
+    check decode_mxfp4_gq "$DEC -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    check prefill_mxfp4_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MXFP4=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+  fi
 fi
 
 if [ "$BUILD_MLA" = 1 ]; then
   check prefill_mla "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1" 256 2
-  [ "$BUILD_GQ" = 1 ] && check prefill_mla_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+  # `if`, not `[ ... ] && check`: under `set -e` a false `[ ]` as the LAST command of this block
+  # is the block's status and kills the script right here — silently, after the objects are
+  # already built. Only reachable with PLOW_NO_GQ=1, which is exactly the rare path nobody runs.
+  if [ "$BUILD_GQ" = 1 ]; then
+    check prefill_mla_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+  fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS"
+# The MoE arms are a SECOND full MFMA body in a bucket that already sits at the 256/occ-2 cliff,
+# so the combination is checked, not assumed. Measured: unchanged at 256/0/occ 2/spill 2.
+if [ "$BUILD_MOE" = 1 ]; then
+  check prefill_mla_moe "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1" 256 2
+  if [ "$BUILD_GQ" = 1 ]; then
+    check prefill_mla_moe_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MLA_PREFILL=1 -DPLOW_MOE_PREFILL=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+  fi
+fi
+
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS"
 
 # INSTRUCTION-SELECTION gate. The register check above catches a kernel that will not launch; it
 # does NOT catch one that launches, is correct, and is silently 4x slow because the backend picked

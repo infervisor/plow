@@ -1,32 +1,104 @@
 #!/usr/bin/env bash
-# Serialize GPU access across concurrent agents on the single RTX 5090.
-#   gpulease <label> <command...>    run holding the exclusive lease
-#   gpulease --status                holder + queue + VRAM
-#   gpulease --audit                 list foreign GPU processes right now
+# Serialize GPU access across concurrent agents. Vendor-neutral: NVIDIA
+# (nvidia-smi) and AMD/ROCm (amd-smi). Multi-GPU boxes lease PER GPU.
+#   gpulease <label> <command...>          exclusive: lease EVERY GPU
+#   gpulease -n <k> <label> <command...>   lease k free GPUs, pin the child to them
+#   gpulease --status                      holders + VRAM
+#   gpulease --audit                       list foreign GPU processes right now
 # NOTE: the lease is ADVISORY (flock). It cannot stop a process that never calls
 # it. So we also AUDIT for foreign compute processes before/after and WARN loudly,
 # because a contended run silently invalidates every timing number.
-LOCK=/workspace/gpu/.lease
-LOG=/workspace/gpu/lease.log
+#
+# A -n<k> run exports CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES /
+# ROCR_VISIBLE_DEVICES to exactly the leased ids, so the child cannot touch a
+# card it does not hold. Audit is then scoped to the leased cards only.
+#
+# Env:
+#   GPU_LEASE_DIR      lock/log dir (default: /workspace/gpu, else /tmp/gpulease)
+#   GPU_LEASE_TIMEOUT  seconds to wait for the lease (default 1800)
+#   GPU_LEASE_NGPU     override detected GPU count
+
 TIMEOUT=${GPU_LEASE_TIMEOUT:-1800}
 
-# Can we even ATTRIBUTE a GPU pid? nvidia-smi reports HOST pids; inside a PID
+# ---- lease dir. The old hard-coded /workspace/gpu does not exist on every box
+# (and is not creatable as non-root), which made every call die in `exec 9>`.
+if [ -n "$GPU_LEASE_DIR" ]; then
+  LEASE_DIR="$GPU_LEASE_DIR"
+elif mkdir -p /workspace/gpu 2>/dev/null; then
+  LEASE_DIR=/workspace/gpu
+else
+  LEASE_DIR="${TMPDIR:-/tmp}/gpulease"
+fi
+mkdir -p "$LEASE_DIR" 2>/dev/null || { echo "gpulease: cannot create $LEASE_DIR" >&2; exit 1; }
+chmod 1777 "$LEASE_DIR" 2>/dev/null || true
+LOG="$LEASE_DIR/lease.log"
+
+# ---- vendor detect
+if command -v nvidia-smi >/dev/null 2>&1; then VENDOR=nvidia
+elif command -v amd-smi >/dev/null 2>&1; then VENDOR=amd
+else VENDOR=none
+fi
+
+ngpu() {
+  [ -n "$GPU_LEASE_NGPU" ] && { echo "$GPU_LEASE_NGPU"; return; }
+  case "$VENDOR" in
+    nvidia) nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l ;;
+    amd)    amd-smi process --json 2>/dev/null | grep -c '"gpu":' ;;
+    *)      echo 0 ;;
+  esac
+}
+NGPU=$(ngpu); [ "$NGPU" -ge 1 ] 2>/dev/null || NGPU=1
+
+# Can we even ATTRIBUTE a GPU pid? The SMI tools report HOST pids; inside a PID
 # namespace (container) none of them resolve in our /proc, so every process —
 # including our own child — looks "foreign" and the audit is pure noise. Detect
 # that once and degrade to lock-only rather than reporting false contention.
 # Returns 0 (attributable) only if at least one reported pid exists for us.
 pid_ns_ok() {
   local pids p
-  pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ')
+  pids=$(all_gpu_pids)
   [ -z "$pids" ] && return 0          # nothing on the GPU: nothing to misattribute
   for p in $pids; do [ -e "/proc/$p" ] && return 0; done
   return 1
 }
 
+# "<gpu_index> <pid> <mem>" per line, for every compute process on the box.
+gpu_procs() {
+  case "$VENDOR" in
+    nvidia)
+      # nvidia-smi cannot attribute a pid to an index in one query; the NVIDIA
+      # boxes this harness came from are single-GPU, so report index 0.
+      nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null |
+        while IFS=, read -r p mem; do
+          p=$(echo "$p" | tr -d ' '); [ -z "$p" ] && continue
+          echo "0 $p $(echo "$mem" | tr -d ' ')"
+        done ;;
+    amd)
+      amd-smi process --json 2>/dev/null | python3 -c '
+import json,sys
+try: data=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for e in data if isinstance(data,list) else []:
+    g=e.get("gpu")
+    for p in e.get("process_list") or []:
+        info=p.get("process_info") if isinstance(p,dict) else None
+        if not isinstance(info,dict):
+            continue                      # "No running processes detected"
+        pid=info.get("pid")
+        if pid is None: continue
+        mem=info.get("memory_usage") or {}
+        vram=mem.get("vram_mem") if isinstance(mem,dict) else None
+        print(g,pid,vram if vram is not None else "?")
+' 2>/dev/null ;;
+  esac
+}
+
+all_gpu_pids() { gpu_procs | awk '{print $2}' | sort -u; }
+
 # 0 if $1 is this lease shell or ANY descendant of it. The leased command is
 # exec'd as a child, so comparing against $$ alone (what this used to do) made
-# every leased run report its own CUDA process as foreign — which forced RC to
-# 76 on success, so rc=76 carried no contention information at all.
+# every leased run report its own compute process as foreign — which forced RC
+# to 76 on success, so rc=76 carried no contention information at all.
 is_ours() {
   local p="$1" i=0
   while [ -n "$p" ] && [ "$p" != "0" ] && [ "$i" -lt 64 ]; do
@@ -37,47 +109,150 @@ is_ours() {
   return 1
 }
 
-foreign() {  # pids using the GPU that are not us or our descendants
-  pid_ns_ok || return 0              # namespaced: cannot attribute, report nothing
-  nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null |
-    while IFS=, read -r p mem; do
-      p=$(echo "$p" | tr -d ' ')
-      [ -z "$p" ] && continue
-      is_ours "$p" || echo "$p ($mem)"
-    done
+# GPUs with a non-trivial VRAM allocation, as a space-separated id list.
+#
+# WHY THIS EXISTS: on this ROCm build `amd-smi process --json` reports the SAME
+# process list under EVERY gpu entry, so its per-GPU attribution is fiction. The
+# effect is that any agent's plowrt anywhere makes all 8 cards read as contended
+# and EVERY run returns rc=76 — which makes the "re-run on rc=76" rule
+# unfollowable, and (worse) trains people to ignore the one signal that protects
+# a measurement.
+#
+# Per-GPU VRAM, unlike per-GPU pid lists, IS reliable. A real compute tenant
+# holds memory; a card at ~0% cannot be hosting one. So we intersect the (untrusted)
+# pid attribution with the (trusted) memory signal, which removes the false
+# positives without weakening true detection.
+busy_gpus() {
+  case "$VENDOR" in
+    amd)
+      rocm-smi --showmemuse --json 2>/dev/null | python3 -c '
+import json,sys,re
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for k,v in (d.items() if isinstance(d,dict) else []):
+    m=re.match(r"card(\d+)",k)
+    if not m: continue
+    for kk,vv in (v.items() if isinstance(v,dict) else []):
+        if "VRAM%" in kk or "Memory Allocated" in kk:
+            try:
+                if float(vv) >= 1.0: print(m.group(1))
+            except (TypeError,ValueError): pass
+' 2>/dev/null | sort -u | tr '\n' ' ' ;;
+    *) echo "" ;;   # nvidia path attributes correctly; do not filter
+  esac
 }
 
-if [ "$1" = "--audit" ]; then f=$(foreign); [ -n "$f" ] && { echo "FOREIGN GPU PROCS:"; echo "$f"; } || echo "GPU: no foreign compute procs"; exit 0; fi
+# pids using the LEASED gpus that are not us or our descendants.
+# $1 (optional) = space-separated gpu ids to scope to; empty = all.
+foreign() {
+  pid_ns_ok || return 0              # namespaced: cannot attribute, report nothing
+  local scope="${1:-}"
+  local busy; busy="$(busy_gpus)"
+  gpu_procs | while read -r g p mem; do
+    [ -z "$p" ] && continue
+    if [ -n "$scope" ]; then
+      case " $scope " in *" $g "*) ;; *) continue ;; esac
+    fi
+    # Drop the report if this card holds no memory (see busy_gpus). Only applied
+    # when the VRAM probe actually returned something, so a probe failure
+    # degrades to the old, noisier-but-safe behaviour rather than to silence.
+    if [ "$VENDOR" = amd ] && [ -n "$busy" ]; then
+      case " $busy " in *" $g "*) ;; *) continue ;; esac
+    fi
+    # A container's workload is a child of containerd, NEVER of this shell, so
+    # is_ours() cannot recognise our own docker-launched run. Zero VRAM means
+    # it holds no memory and cannot perturb a timing, so it is not contention —
+    # this is exactly what a container being torn down looks like.
+    case "$mem" in *"'value': 0,"*|0|0B|"0 B"|"?") continue ;; esac
+    is_ours "$p" || echo "gpu$g:$p ($mem)"
+  done
+}
+
+if [ "$1" = "--audit" ]; then
+  f=$(foreign); [ -n "$f" ] && { echo "FOREIGN GPU PROCS:"; echo "$f"; } || echo "GPU: no foreign compute procs"
+  exit 0
+fi
 if [ "$1" = "--status" ]; then
-  if flock -n "$LOCK" true 2>/dev/null; then echo "GPU: free"; else echo "GPU: held"; fi
+  echo "vendor=$VENDOR gpus=$NGPU lease-dir=$LEASE_DIR"
+  for ((i = 0; i < NGPU; i++)); do
+    f="$LEASE_DIR/gpu.$i.lease"; touch "$f" 2>/dev/null
+    if flock -n "$f" true 2>/dev/null; then echo "  gpu$i: free"; else echo "  gpu$i: HELD"; fi
+  done
   echo "--- recent ---"; tail -20 "$LOG" 2>/dev/null
-  nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader
+  case "$VENDOR" in
+    nvidia) nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader ;;
+    amd)    rocm-smi --showmeminfo vram --csv 2>/dev/null | grep -i "^card" ;;
+  esac
   f=$(foreign); [ -n "$f" ] && { echo "--- foreign procs ---"; echo "$f"; }
   exit 0
 fi
 
-LABEL="${1:?usage: gpulease <label> <command...>}"; shift
-touch "$LOCK"; exec 9>"$LOCK"
+WANT=0
+if [ "$1" = "-n" ]; then WANT="${2:?-n needs a count}"; shift 2; fi
+LABEL="${1:?usage: gpulease [-n k] <label> <command...>}"; shift
+[ "$WANT" -eq 0 ] && WANT=$NGPU                       # default: the whole box
+[ "$WANT" -gt "$NGPU" ] && { echo "gpulease: asked $WANT gpus, box has $NGPU" >&2; exit 2; }
+
+# Acquire WANT free cards. Scan low->high, non-blocking; retry until TIMEOUT.
+# Each held card keeps an open fd (FD_BASE+) so the lock lives for the whole run
+# and is released by the kernel when this shell exits, even on kill.
+# FD_BASE is high on purpose: bash reserves low fds (10 in particular is already
+# taken under some harnesses, and flock on it fails), which silently cost us
+# gpu0 on every acquire.
+FD_BASE=200
+GOT=""; NGOT=0; FD=$FD_BASE
+release_all() {
+  local fd
+  for fd in $(seq $FD_BASE $((FD - 1))); do eval "exec $fd>&-" 2>/dev/null; done
+  GOT=""; NGOT=0; FD=$FD_BASE
+}
+try_acquire() {
+  local i f
+  for ((i = 0; i < NGPU; i++)); do
+    [ "$NGOT" -ge "$WANT" ] && break
+    f="$LEASE_DIR/gpu.$i.lease"; touch "$f" 2>/dev/null || continue
+    eval "exec $FD>\"$f\"" 2>/dev/null || continue
+    if flock -n "$FD" 2>/dev/null; then
+      GOT="${GOT:+$GOT }$i"; NGOT=$((NGOT + 1)); FD=$((FD + 1))
+    else
+      eval "exec $FD>&-" 2>/dev/null
+    fi
+  done
+  [ "$NGOT" -ge "$WANT" ]
+}
+
 S=$(date +%s)
-if ! flock -w "$TIMEOUT" 9; then
-  echo "[$(date -Is)] $LABEL TIMEOUT after ${TIMEOUT}s" | tee -a "$LOG" >&2; exit 75
-fi
+until try_acquire; do
+  release_all                                          # avoid deadlocking peers
+  if [ $(( $(date +%s) - S )) -ge "$TIMEOUT" ]; then
+    echo "[$(date -Is)] $LABEL TIMEOUT after ${TIMEOUT}s (wanted $WANT of $NGPU)" | tee -a "$LOG" >&2
+    exit 75
+  fi
+  sleep $(( (RANDOM % 3) + 2 ))                        # jitter: avoid lockstep retries
+done
 W=$(( $(date +%s) - S ))
 
-PRE=$(foreign)
+# Pin the child to exactly the cards we hold. A partial lease that still saw
+# every device would make the lease meaningless.
+if [ "$NGOT" -lt "$NGPU" ]; then
+  VIS=$(echo "$GOT" | tr ' ' ',')
+  export CUDA_VISIBLE_DEVICES="$VIS" HIP_VISIBLE_DEVICES="$VIS" ROCR_VISIBLE_DEVICES="$VIS"
+fi
+
+PRE=$(foreign "$GOT")
 if [ -n "$PRE" ]; then
   echo "[$(date -Is)] $LABEL WARN foreign-before: $(echo $PRE|tr '\n' ' ')" | tee -a "$LOG" >&2
   echo "*** GPU CONTENDED AT START — TIMINGS FROM THIS RUN ARE NOT TRUSTWORTHY ***" >&2
 fi
-echo "[$(date -Is)] $LABEL ACQUIRED (waited ${W}s) pid=$$" >> "$LOG"
+echo "[$(date -Is)] $LABEL ACQUIRED gpus=[$GOT] (waited ${W}s) pid=$$" >> "$LOG"
 
 "$@"; RC=$?
 
-POST=$(foreign)
+POST=$(foreign "$GOT")
 if [ -n "$POST" ]; then
   echo "[$(date -Is)] $LABEL WARN foreign-during: $(echo $POST|tr '\n' ' ')" | tee -a "$LOG" >&2
   echo "*** GPU WAS CONTENDED — RE-RUN THIS MEASUREMENT ***" >&2
   RC=$([ $RC -eq 0 ] && echo 76 || echo $RC)   # 76 = completed but contended
 fi
-echo "[$(date -Is)] $LABEL RELEASED rc=$RC held=$(( $(date +%s) - S - W ))s" >> "$LOG"
+echo "[$(date -Is)] $LABEL RELEASED gpus=[$GOT] rc=$RC held=$(( $(date +%s) - S - W ))s" >> "$LOG"
 exit $RC

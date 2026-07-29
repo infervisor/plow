@@ -51,7 +51,8 @@ static int load_blob(const char* path, Blob* b){
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     uint8_t* p=malloc((size_t)n); if(fread(p,1,(size_t)n,f)!=(size_t)n) return 1; fclose(f);
     memcpy(&b->h,p,sizeof(PlowBlobHeader));
-    if(memcmp(b->h.magic,PLOW_BLOB_MAGIC,8)){ printf("bad blob magic\n"); return 1; }
+    { const char* e = plow_blob_magic_error(b->h.magic);
+      if (e) { printf("%s\n", e); return 1; } }
     uint8_t* q=p+sizeof(PlowBlobHeader);
     b->tensors=(PlowTensorDecl*)q; q+=(size_t)b->h.n_tensor*sizeof(PlowTensorDecl);
     b->init=q; q+=b->h.init_bytes; b->kvrow=(uint32_t*)q; q+=(size_t)b->h.n_kvrow*4;
@@ -71,7 +72,10 @@ static int load_blob(const char* path, Blob* b){
  * name->shard hash index: st_find on a 116454-tensor / 79-shard model is called ~115k times per rank
  * (every expert's gate/up/down weight+scale). A linear header scan per lookup is O(tensors*lookups)
  * and never finishes; the index makes each lookup scan ONE shard's header instead of all 79. */
-#define MAX_SHARD 128
+/* 79 base shards + up to 78 append-only `model-idx-*` shards (the DSA indexer prep and the
+ * block-fp8 linear prep both add one per layer) already exceeds 128, and the overflow is SILENT:
+ * st_open just stops mmapping and the bind loop reports MISSING WEIGHT for the tail layers. */
+#define MAX_SHARD 256
 typedef struct { int n; uint8_t* base[MAX_SHARD]; char* hdr[MAX_SHARD]; size_t hdr_len[MAX_SHARD]; uint64_t data0[MAX_SHARD];
     uint32_t icap; const char** iname; uint32_t* inlen; int8_t* ishard; } Safet;
 static uint64_t st_hash(const char* s, int n){ uint64_t h=1469598103934665603ull; for(int i=0;i<n;i++){ h^=(uint8_t)s[i]; h*=1099511628211ull; } return h; }
@@ -169,7 +173,13 @@ static int parse_ctx(const char* s){ int v=atoi(s); const char* p=s; while(*p&&(
 static int glm_col(const char* n){
     return strstr(n,"derived.q_absorb")||strstr(n,"derived.q_rope")||strstr(n,"derived.v_absorb")
          ||strstr(n,"shared_experts.gate_proj")||strstr(n,"shared_experts.up_proj")
-         ||strstr(n,"mlp.gate_proj.")||strstr(n,"mlp.up_proj.");   /* dense gate/up weight + _scale_inv */
+         ||strstr(n,"mlp.gate_proj.")||strstr(n,"mlp.up_proj.")    /* dense gate/up weight + _scale_inv */
+         /* lm_head is VOCAB-column-parallel only when the packet asks for it — with GLM_SHARD_HEAD
+          * the declared size is vocab/tp*hidden and an XARGMAX_FIN folds the per-rank maxima;
+          * without it the packet declares the full table and it must stay REPLICATED. This says
+          * only HOW it would shard; the bind loop below gates the col branch on the declared size
+          * so a replicated packet still takes the replicated path. */
+         ||!strcmp(n,"lm_head.weight");
 }
 static int glm_row(const char* n){
     return strstr(n,"o_proj.weight")||strstr(n,"shared_experts.down_proj")||strstr(n,"mlp.down_proj.");
@@ -203,13 +213,19 @@ typedef struct {
 int main(int argc, char** argv){
     if(argc<3){ printf("usage: %s <model.pkt> <weight-dir> [prompt.ids] [--steps M] [--sweep list] [--tp N] [--gen G]\n",argv[0]); return 1; }
     const char* pkt=argv[1]; const char* wdir=argv[2]; const char* prompt_file=NULL;
-    const char* sweep_list=NULL; int steps=21, N=1, ngen=16, ep=0;
+    const char* sweep_list=NULL; int steps=21, N=1, ngen=16, ep=0, want_gen=0;
     for(int i=3;i<argc;i++){
         if(!strcmp(argv[i],"--steps")&&i+1<argc) steps=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--sweep")&&i+1<argc) sweep_list=argv[++i];
         else if(!strcmp(argv[i],"--tp")&&i+1<argc) N=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--ep")) ep=1;   /* EP: bind WHOLE experts per rank (256/N), NULL remote */
-        else if(!strcmp(argv[i],"--gen")&&i+1<argc) ngen=atoi(argv[++i]);
+        /* --gen WITH --sweep runs the token-identity generate in the SAME process, after the
+         * sweep. The 4-minute 183 GiB/rank weight load is the whole cost of a run, and an A/B
+         * that has to pay it twice per blob (once for the timing, once for the ids) prices an
+         * afternoon of lease time. Every STEP re-patches ids/pos/kvlen and the per-layer KV-row
+         * writers, so the generate starting at pos=0 overwrites whatever cache rows the sweep
+         * left behind before it reads them. */
+        else if(!strcmp(argv[i],"--gen")&&i+1<argc){ ngen=atoi(argv[++i]); want_gen=1; }
         else if(argv[i][0]!='-') prompt_file=argv[i];
     }
     setbuf(stdout,NULL);
@@ -281,7 +297,13 @@ int main(int argc, char** argv){
                 const uint8_t* src=st_find_ex(&S,td->name,&got,shp,&nd);
                 if(!src){ printf("dev%d: MISSING WEIGHT %s\n",r,td->name); return 1; }
                 D->dev[i]=plow_hsa_alloc(h,r,td->bytes); if(!D->dev[i]){ printf("dev%d: VRAM alloc failed %s\n",r,td->name); return 1; }
-                const int col=N>1&&glm_col(td->name), row=N>1&&glm_row(td->name);
+                /* The name predicate says HOW a tensor shards; the declared-vs-disk size says
+                 * WHETHER this packet sharded it. lm_head is the one tensor whose answer is a
+                 * packet property (GLM_SHARD_HEAD) rather than a fixed rule, so the col branch is
+                 * taken only when the packet actually declared a 1/N slice. A col/row tensor whose
+                 * size does not match still fails — as the replicated SIZE MISMATCH below. */
+                const int col=N>1&&glm_col(td->name)&&got==(uint64_t)td->bytes*(uint64_t)N;
+                const int row=N>1&&glm_row(td->name);
                 if(col){
                     /* contiguous output-row slice: full = td->bytes * N, offset = r*td->bytes */
                     if(got!=(uint64_t)td->bytes*N){ printf("dev%d: COL SHARD %s full %llu != %llu*%d\n",r,td->name,
@@ -417,14 +439,23 @@ int main(int argc, char** argv){
     size_t zc_bytes=(size_t)G0->h.n_counter*PLOW_CTR_STRIDE*4; if(zc_bytes<XCTR_BYTES) zc_bytes=XCTR_BYTES;
     uint32_t* zc=plow_hsa_alloc_host(h,zc_bytes); memset(zc,0,zc_bytes);
 
-    /* ---- TRACE (PLOW_TRACE_RAW=<prefix>): rank-0 per-(workgroup,packet) PlowTraceRec buffer.
-     * Only rank 0 is traced (the sharded per-rank fill is a rank-0 property; mirrors tp_decode.c).
+    /* ---- TRACE (PLOW_TRACE_RAW=<prefix>): per-(workgroup,packet) PlowTraceRec buffer.
+     * EVERY rank is traced when PLOW_TRACE_ALLRANKS=1, else rank 0 only (the historical form).
+     * All-rank tracing is what prices CROSS-RANK ARRIVAL SKEW: the 156 XReduce rendezvous hard-
+     * synchronise the ranks, so the work each rank does BETWEEN two consecutive collectives is
+     * comparable across ranks WITHOUT any cross-device clock sync — only durations inside one
+     * rank's own s_memrealtime domain are ever differenced.
      * A .insts.txt sidecar maps inst -> op + operand tensor names/bytes so the python pass can label
-     * each op and compute per-op HBM bytes. Per-ctx dumps land at <prefix>.tp<N>.ctx<C>.bin. */
+     * each op and compute per-op HBM bytes. Per-ctx dumps land at <prefix>[.rk<R>].tp<N>.ctx<C>.bin. */
     const char* trace_raw=getenv("PLOW_TRACE_RAW");
+    const int trace_all = getenv("PLOW_TRACE_ALLRANKS") && atoi(getenv("PLOW_TRACE_ALLRANKS"));
+    void* d_trace[MAX_DEV]; for(int r=0;r<MAX_DEV;r++) d_trace[r]=NULL;
     void* d_trace0=NULL;
     if(trace_raw){
         d_trace0=plow_hsa_alloc(h,0,(size_t)G0->h.n_stream*sizeof(PlowTraceRec));
+        d_trace[0]=d_trace0;
+        if(trace_all) for(int r=1;r<N;r++)
+            d_trace[r]=plow_hsa_alloc(h,r,(size_t)devs[r].g->h.n_stream*sizeof(PlowTraceRec));
         char fn[512]; snprintf(fn,sizeof(fn),"%s.insts.txt",trace_raw); FILE* sf=fopen(fn,"w");
         if(sf){ fprintf(sf,"# inst op blocks | t[k]=idx:name:bytes ... | i0 i1 i2 i3\n");
             for(uint32_t k=0;k<G0->h.n_inst;k++){ PlowDevInst* d=&G0->insts[k];
@@ -453,7 +484,7 @@ int main(int argc, char** argv){
             pr.waits=D->d_waits; pr.succs=D->d_succs; pr.counters=D->d_ctr; pr.tensors=(void* const*)D->d_tens; \
             if(N>1){ pr.rank=(uint32_t)D->id; pr.n_gpu=(uint32_t)N; pr.peer_scratch=(void* const*)D->d_peer_tbl; \
                      pr.xctr=(uint32_t*)((char*)D->peer+(size_t)2*D->slot_b); } \
-            if(D->id==0 && d_trace0) pr.trace=(PlowTraceRec*)d_trace0; \
+            if(D->id<MAX_DEV && d_trace[D->id]) pr.trace=(PlowTraceRec*)d_trace[D->id]; \
             if(plow_hsa_launch(h,r,&kern[r],NCU*PLOW_WG_THREADS,1,1,PLOW_WG_THREADS,1,1,0,&pr,sizeof(pr))){ printf("dev%d LAUNCH FAILED\n",r); return 1; } } \
         for(int r=0;r<N;r++) plow_hsa_wait(h,r); \
         { double _ms=(now()-_t0)*1e3; double* _mp=(msout); if(_mp)*_mp=_ms; } \
@@ -475,18 +506,23 @@ int main(int argc, char** argv){
             qsort(samp,(size_t)steps,sizeof(double),cmp_dbl);
             double med=samp[steps/2]; printf("  %-8d %12.3f %10.1f\n",ctx,med,1000.0/med); free(samp);
             if(trace_raw && d_trace0){
-                /* one traced step at this ctx, dump rank-0 PlowTraceRec[n_stream]. */
+                /* one traced step at this ctx, dump every traced rank's PlowTraceRec[n_stream]. */
                 double ms=0; STEP(42,ctx,ctx+1,tok,&ms);
-                uint32_t nrec=G0->h.n_stream;
-                PlowTraceRec* tr=plow_hsa_alloc_host(h,(size_t)nrec*sizeof(PlowTraceRec));
-                plow_hsa_copy_d2h(h,0,tr,d_trace0,(size_t)nrec*sizeof(PlowTraceRec));
-                char fn[512]; snprintf(fn,sizeof(fn),"%s.tp%d.ctx%d.bin",trace_raw,N,ctx);
-                FILE* tf=fopen(fn,"wb");
-                if(tf){ fwrite(tr,sizeof(PlowTraceRec),nrec,tf); fclose(tf);
-                    printf("    raw trace -> %s (%u recs, traced-ms=%.3f)\n",fn,nrec,ms); }
+                for(int r=0;r<N;r++){
+                    if(!d_trace[r]) continue;
+                    uint32_t nrec=devs[r].g->h.n_stream;
+                    PlowTraceRec* tr=plow_hsa_alloc_host(h,(size_t)nrec*sizeof(PlowTraceRec));
+                    plow_hsa_copy_d2h(h,r,tr,d_trace[r],(size_t)nrec*sizeof(PlowTraceRec));
+                    char fn[512];
+                    if(trace_all) snprintf(fn,sizeof(fn),"%s.rk%d.tp%d.ctx%d.bin",trace_raw,r,N,ctx);
+                    else          snprintf(fn,sizeof(fn),"%s.tp%d.ctx%d.bin",trace_raw,N,ctx);
+                    FILE* tf=fopen(fn,"wb");
+                    if(tf){ fwrite(tr,sizeof(PlowTraceRec),nrec,tf); fclose(tf);
+                        printf("    raw trace -> %s (%u recs, traced-ms=%.3f)\n",fn,nrec,ms); }
+                }
             }
         }
-        plow_hsa_shutdown(h); return 0;
+        if(!want_gen){ plow_hsa_shutdown(h); return 0; }
     }
 
     /* ---- generate from a prompt (or a default) ---- */
@@ -494,9 +530,17 @@ int main(int argc, char** argv){
     if(prompt_file){ FILE* pf=fopen(prompt_file,"rb"); if(pf){ np=(int)fread(prompt,4,64,pf); fclose(pf); } }
     if(np<=0){ int32_t d[]={100,264,6722,315,9822,374}; np=6; memcpy(prompt,d,sizeof(d)); printf("(no prompt file — using placeholder ids)\n"); }
     printf("\nprompt %d tokens; generating %d:\n  ids:",np,ngen);
-    int pos=0, tok=prompt[0];
+    int pos=0, tok=prompt[0], maxtok=0, disagree=0;
     for(int p=0;p<np;p++){ STEP(prompt[p],pos,pos+1,tok,NULL); pos++; }   /* prefill: last STEP's next id is 1st gen */
-    for(int gi=0;gi<ngen;gi++){ printf(" %d",tok); STEP(tok,pos,pos+1,tok,NULL); pos++; }
-    printf("\n(mechanics: %d decode steps ran, ids in [0,%u)) \n",np+ngen,VOCAB);
+    for(int gi=0;gi<ngen;gi++){ printf(" %d",tok); if(tok>maxtok) maxtok=tok;
+        STEP(tok,pos,pos+1,tok,NULL); pos++;
+        /* CROSS-RANK AGREEMENT. With a REPLICATED lm_head every rank argmaxes the full vocab and
+         * trivially agrees. With a VOCAB-SHARDED one they only agree if XARGMAX_FIN folded — and a
+         * fold that silently no-ops leaves each rank holding its own shard's winner, which the
+         * rank-0-only readback above cannot see. Costs one 4-byte D2H per rank per token. */
+        for(int r=1;r<N;r++){ int32_t t2; plow_hsa_copy_d2h(h,r,devs[r].h_ids,devs[r].dev[i_ids],4);
+            t2=*devs[r].h_ids; if(t2!=tok) disagree++; } }
+    printf("\n(mechanics: %d decode steps ran, ids in [0,%u), max id %d, cross-rank disagreements %d)\n",
+           np+ngen,VOCAB,maxtok,disagree);
     plow_hsa_shutdown(h); return 0;
 }

@@ -116,7 +116,13 @@ PLOW_SASSERT(sizeof(PlowProgHeader) == 24, "PlowProgHeader size");
  * output, wrong output, no error. That is why this is a magic bump and not a
  * new optional section. The C harnesses in runtime/tests/ do NOT implement it;
  * compile their blobs with `plowc --no-rope-gen`, which bakes the tables back
- * into the init section and keeps the container at v5/v6. */
+ * into the init section and keeps the container at v5/v6.
+ *
+ * That instruction is now ENFORCED rather than merely documented: the harnesses
+ * call `plow_blob_magic_error()` (below), which accepts v5 and v6 and rejects v7
+ * with a message that names `--no-rope-gen`. They previously accepted v5 ONLY
+ * and said "bad blob magic — recompile with plowc", which sent people back to
+ * the same command that produced the rejected blob. */
 #define PLOW_BLOB_MAGIC_V7 "PLOWDEV\x09"
 
 /* PlowGenTensor.kind */
@@ -159,6 +165,46 @@ typedef struct {
 } PlowSectionEntry;
 
 PLOW_SASSERT(sizeof(PlowSectionEntry) == 48, "PlowSectionEntry size");
+
+/* --- container-version check for the FLAT readers (runtime/tests/*.c) -------
+ *
+ * Returns NULL if `magic` is a container this reader can parse, else a message
+ * saying what to do about it. Every flat reader must go through this instead of
+ * `memcmp(magic, PLOW_BLOB_MAGIC, 8)`, which is what they all used to do.
+ *
+ * WHY v6 IS ACCEPTED. v6 is v5 plus a section directory APPENDED after the GQ01
+ * appendix, located through `reserved[0]`; the header and everything before the
+ * directory are byte-for-byte the v5 layout (`Builder::to_blob_v6`). So a reader
+ * that walks header -> decls -> init -> kvrow -> progs -> GQ01 and stops parses a
+ * v6 blob exactly correctly and simply ignores sections it has no use for. The
+ * old check rejected v6 for no reason: `--embed-hsaco` alone bumps the magic.
+ *
+ * WHY v7 IS STILL REFUSED. v7 adds PLOW_SECT_GEN_TENSORS: tensors carrying
+ * `init_off == PLOW_INIT_NONE` that the READER must materialise (the RoPE
+ * tables, ~403 MB at ctx=131072, a pure function of six scalars). A flat reader
+ * has no generator, would fall through to its zero-fill path, and would serve a
+ * model with cos=sin=0 — fluent output, wrong output, no error. That is the
+ * failure the v7 magic bump exists to convert into a load-time rejection, so
+ * accepting it here would defeat the whole point.
+ *
+ * THE MESSAGE NAMES THE FLAG. `plowc` emits v7 by DEFAULT, so every current blob
+ * trips this, and the old text ("bad blob magic — recompile with plowc") sent
+ * people to re-run the exact command that produced the rejected blob.
+ * `--no-rope-gen` bakes the tables back into the init section and is the reason
+ * that flag exists. */
+static inline const char *plow_blob_magic_error(const char magic[8])
+{
+    if (!memcmp(magic, PLOW_BLOB_MAGIC, 8)) return 0;    /* v5 flat */
+    if (!memcmp(magic, PLOW_BLOB_MAGIC_V6, 8)) return 0; /* v6: v5 + trailing sections */
+    if (!memcmp(magic, PLOW_BLOB_MAGIC_V7, 8))
+        return "blob is v7 (PLOWDEV\\x09): its RoPE tables are GENERATED, and this harness has no "
+               "generator — loading it would serve cos=sin=0 with no error.\n"
+               "  Recompile the blob with:  plowc ... --no-rope-gen\n"
+               "  That bakes the tables into the init section and keeps the container at v5/v6, "
+               "which this harness reads. (plowrt reads v7 directly and needs no flag.)";
+    return "bad blob magic: not a plow device blob, or a container older than v5. Recompile with "
+           "plowc --no-rope-gen.";
+}
 
 /* Find a section by kind in a v6 blob. Returns 1 if found (out_offset/out_size
  * populated), 0 otherwise. Caller checks magic[7] >= '\x06' before calling. */

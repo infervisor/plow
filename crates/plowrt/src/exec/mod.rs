@@ -4,7 +4,21 @@
 //! out-of-band channel, and brings the persistent kernels up once. The hot path
 //! (enqueue packet, poll counter) touches only lock-free structures here.
 
+/// The AMD/gfx950 serving engine — a port of the proven `gemma4_chat.c` driver,
+/// deliberately separate from the CUDA engine because the two differ in kind
+/// (segmented dispatch, three kernels, per-phase scheduler, static LDS).
+#[cfg(feature = "hsa")]
+pub mod amd;
+/// N [`amd::AmdEngine`] ranks stepped as one: the host half of the inline
+/// collective. Decode is launch-all-then-drain-all; prefill is per-segment,
+/// all-ranks, with a host barrier — see the module note for why the two differ.
+#[cfg(feature = "hsa")]
+pub mod amd_tp;
 pub mod counters;
+/// The device surface the interpreter engine drives, as a trait — the step
+/// that lets `gpu` stop being CUDA-only. Not gated on a vendor feature: it is
+/// the definition both backends implement.
+pub mod device_api;
 pub mod engine_thread;
 #[cfg(feature = "cuda")]
 pub mod gpu;
@@ -13,6 +27,9 @@ pub mod host;
 pub mod indirection;
 pub mod oob;
 pub mod queue;
+/// Multi-GPU (tensor-parallel) device group: peer buffers, cross-GPU counters,
+/// and the per-token launch discipline. See `plans/tp-design.md` §6–§7.
+pub mod tp;
 
 use std::sync::Arc;
 
@@ -42,8 +59,17 @@ impl ExecutorSet {
         };
         // A real backend loads the prebuilt module first; the CPU backend's
         // launch is a no-op (cooperative interpret drives it per iteration).
-        let module = backend.module_load(&[])?;
-        backend.launch_persistent(&module, cfg)?;
+        //
+        // AMD is neither: `exec::amd` owns its code objects. It loads the
+        // per-phase gfx950 objects from the assets' `hsaco` dir and dispatches
+        // them itself, so there is no generic prebuilt persistent kernel to
+        // bring up here — and asking for one hands `module_load` an EMPTY
+        // image, which is the `hsa_code_object_reader_create: 4097` that made
+        // `plowrt serve` unable to start on gfx950 at all.
+        if backend.vendor() != Some(hwspec::Vendor::Amd) {
+            let module = backend.module_load(&[])?;
+            backend.launch_persistent(&module, cfg)?;
+        }
         Ok(ExecutorSet { backend, targets })
     }
 

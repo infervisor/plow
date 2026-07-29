@@ -75,24 +75,22 @@ fn cfg_from(dir: &Path) -> Cfg {
 }
 
 /// Pick the GEMM tile for one shape.
+///
+/// DELEGATES to [`devgen::gfx950_prefill_tile`], which is the picker the
+/// emitters actually use. This function used to be a second implementation —
+/// three hardcoded rungs and a 17-line inline `rounds * work / intensity`
+/// heuristic — and it had drifted: the real ladder is FIVE rungs in each of
+/// three weight encodings (`devgen`'s `GFX950_RUNGS`), chosen against measured
+/// `tunedb` records with an analytical fallback, keyed by hardware fingerprint.
+/// So this binary reported a tile the build would not emit.
+///
+/// `kernelcaps::select` names this exact pair as the problem it exists to end
+/// ("two of those exist today … they disagree with each other"), and
+/// `docs/arch/10-implementation-status.md` still lists it as the highest
+/// outstanding item. `gfx950_prefill_tile` is `pub` precisely so a caller
+/// outside the emitters can ask what the build would emit.
 fn pick_tile(m: u32, n: u32, k: u32, n_cu: u32) -> DevOp {
-    const CANDS: [(DevOp, u32, u32); 3] = [
-        (DevOp::Gemm, 256, 256),
-        (DevOp::GemmMed, 128, 128),
-        (DevOp::GemmSmall, 64, 128),
-    ];
-    let mut best = (DevOp::Gemm, f64::INFINITY);
-    for (op, bm, bn) in CANDS {
-        let tiles = m.div_ceil(bm) * n.div_ceil(bn);
-        let rounds = tiles.div_ceil(n_cu) as f64;
-        let work_per_tile = bm as f64 * bn as f64 * k as f64;
-        let intensity = (bm as f64 * bn as f64) / (bm + bn) as f64;
-        let cost = rounds * work_per_tile / intensity;
-        if cost < best.1 {
-            best = (op, cost);
-        }
-    }
-    best.0
+    devgen::gfx950_prefill_tile(m, n, k, n_cu, kernelcaps::QuantScheme::None)
 }
 
 fn tiles(m: u32, n: u32) -> u32 {
@@ -275,7 +273,7 @@ fn emit_phase(
     let kd = c.kv_heads * c.head_dim;
     let kv_mask = 0xFFFF_FFFFu32; // full causal: no ring
 
-    let mut proj = |b: &mut Builder, out: u32, a: u32, w: u32, m: u32, nn: u32, k: u32,
+    let proj = |b: &mut Builder, out: u32, a: u32, w: u32, m: u32, nn: u32, k: u32,
                     gamma: u32, cus: Vec<u32>, deps: &[u32]|
      -> u32 {
         let fold = decode && gamma != TENSOR_NONE;

@@ -7,5 +7,16 @@ license.workspace = true
 [dependencies]
 hwspec.workspace = true
 kernelcaps.workspace = true
+# `gemm_op_case` and the ingest binaries name opcodes. `packet` sits below `kernelcaps`, which
+# is already here, so this adds no edge that was not there. It must NOT be `devgen`: `devgen`
+# depends on this crate to read measurements, so the key format lives here rather than the two
+# crates depending on each other.
+#
+# The GEMM ingest binary that used to live here is gone: `plowc tune ingest` replaces it, byte
+# for byte on the same samples, and lives beside the campaign that produces them. No shim was
+# left behind — a binary that prints a notice and re-execs is another silent indirection layer,
+# and this codebase has been bitten by that shape repeatedly. `tunedb-decode` and `tunedb-gemv`
+# stay: nothing has replaced them, so they are untouched rather than half-migrated.
+packet.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

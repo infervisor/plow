@@ -28,7 +28,15 @@ OPNAME = {
  43:"MoeCombine",44:"GemvFp8Blk",45:"MoeExpertGluFp8Blk",46:"MoeExpertDownFp8Blk",47:"DenseGluFp8Blk",
  48:"MoeGroupGluFp8Blk",49:"MoeGroupDownFp8Blk",50:"FlashMlaDecode",51:"FlashMlaPrefill",
  52:"OUvFold",53:"AttnSelect",54:"FlashGatherDecode",55:"FlashGatherPrefill",56:"MoeRouterTopk",
+ 57:"MlaMergeFold",58:"IndexScore",59:"IndexSelect",
 }
+# The MLA decode chain: the flash writes nsplit latent partials, the fused merge+fold reduces
+# them. They are the two halves of the nsplit trade — the flash drops ~1/nsplit while the merge
+# grows O(nsplit) — so `--chain` reports them SEPARATELY and then as a span, because the sum
+# alone hides which half moved. 13/27 are the pre-fusion FlashMerge/XFlashMerge, kept so an
+# older blob still resolves.
+CHAIN_FLASH = {12, 38, 50, 54}
+CHAIN_MERGE = {13, 27, 52, 57}
 PEAK_GBs = 8000.0  # MI350X HBM3e ~8 TB/s
 
 def parse_insts(path):
@@ -92,6 +100,12 @@ def main():
     ap.add_argument('--ghz', type=float, default=0.1)
     ap.add_argument('--dense', type=int, default=1)     # dense layer to profile
     ap.add_argument('--moe', type=int, default=-1)      # MoE layer to profile (-1 = first MoE found)
+    # --chain: the MLA decode chain ONLY, summed over ALL layers. The per-block tables above
+    # profile ONE dense + ONE MoE layer, which is the wrong shape for an nsplit sweep: nsplit
+    # moves every layer's flash and every layer's merge, so the quantity that has to be compared
+    # across arms is the per-token TOTAL, and a single layer's sample carries the ±19% straggler
+    # tail (§6a) undivided.
+    ap.add_argument('--chain', action='store_true')
     a = ap.parse_args()
     if a.ctx == 0 and 'ctx' in a.bin:
         try: a.ctx = int(a.bin.split('ctx')[1].split('.')[0])
@@ -120,6 +134,35 @@ def main():
 
     tick_us = 1000.0*a.ghz    # ticks per us
     def us(t): return t/tick_us
+
+    if a.chain:
+        # Per layer: the flash op(s) and the merge op(s), each as min(t_ready) -> p90(t_end)
+        # (the campaign method), and the CHAIN as min(flash t_arrive) -> p90(merge t_end).
+        # The chain is NOT flash+merge: it also carries the gate the merge waits on, which is
+        # exactly what §6b-i says a widening lever pays for — a max over more stragglers. So
+        # `gate` below is the residual, and it is reported because a sweep that only prints the
+        # sum cannot tell "the merge got slower" from "the merge waited longer".
+        lyr_of = {inst: inst_layer(insts[inst]) for inst in insts}
+        rows = []
+        for lyr in sorted({v for v in lyr_of.values() if v >= 0}):
+            fl = [i for i in insts if lyr_of[i] == lyr and insts[i]['op'] in CHAIN_FLASH and i in per]
+            mg = [i for i in insts if lyr_of[i] == lyr and insts[i]['op'] in CHAIN_MERGE and i in per]
+            if not fl or not mg: continue
+            f_t0 = min(min(per[i]['ready']) for i in fl); f_t1 = max(p90(per[i]['end']) for i in fl)
+            m_t0 = min(min(per[i]['ready']) for i in mg); m_t1 = max(p90(per[i]['end']) for i in mg)
+            c_t0 = min(min(per[i]['arrive']) for i in fl)
+            rows.append((lyr, f_t1-f_t0, m_t1-m_t0, m_t1-c_t0,
+                         sum(per[i]['slices'] for i in fl), sum(per[i]['slices'] for i in mg)))
+        if not rows:
+            print("# no MLA chain found in this trace"); return
+        fs = sum(r[1] for r in rows); ms_ = sum(r[2] for r in rows); cs = sum(r[3] for r in rows)
+        print(f"# MLA CHAIN  ctx={a.ctx} TP={a.tp}  {len(rows)} layers  ({n} recs)")
+        print(f"#   {'':<14}{'per-token ms':>13} {'per-layer us':>13}")
+        for tag, tot in (("flash-decode", fs), ("merge+fold", ms_),
+                         ("gate (chain-both)", cs-fs-ms_), ("CHAIN", cs)):
+            print(f"#   {tag:<14}{us(tot)/1000.0:>13.3f} {us(tot)/len(rows):>13.3f}")
+        print(f"#   workgroups: flash {rows[0][4]}  merge {rows[0][5]}  (per layer, from the trace)")
+        return
 
     print(f"# GLM-5.2 decode trace  |  ctx={a.ctx}  TP={a.tp}  |  {n} recs, "
           f"full-step span={span_ticks} ticks ({us(span_ticks):.1f} us @ {a.ghz}GHz)")

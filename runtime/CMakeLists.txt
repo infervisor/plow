@@ -573,6 +573,14 @@ option(PLOW_HSACO_FP8 "Also emit the fp8 w8a16 decode + w8a8 prefill objects" ON
 option(PLOW_HSACO_FP8KV "Also emit the fp8 e4m3 KV-cache decode object" ON)
 option(PLOW_HSACO_MXFP4 "Also emit the MX-FP4 (e2m1 + E8M0) decode object" ON)
 option(PLOW_HSACO_MLA "Also emit the MLA prefill object (Kimi/DeepSeek/GLM)" ON)
+# THE ONE AXIS THAT DEFAULTS OFF, and deliberately against the "one configure emits every
+# object" rule above. The K3/KDA arms are not a variant of a shipping model — no Gemma-4, Qwen or
+# GLM-5.2 packet dispatches a single one of them, and K3 itself is accepted but not yet emittable
+# (crates/plowc/src/hf_config.rs). Defaulting this ON would put seven unreachable arms in the
+# instruction stream of every object those models DO load, in a persistent megakernel where that
+# alone has already cost +32% decode once (runtime/amd/op_attention.h:1282). Turn it on to build
+# K3 objects; the loader refuses a K3 packet against an object built without it.
+option(PLOW_HSACO_K3 "Also emit the Kimi-K3 / KDA objects (decode + prefill)" OFF)
 
 set(PLOW_HSACO_ARCH "gfx950" CACHE STRING "offload arch for the served code objects")
 set(PLOW_HSACO_HIPCC "/opt/rocm/bin/hipcc" CACHE FILEPATH "hipcc used for the served code objects")
@@ -583,6 +591,13 @@ set(PLOW_HSACO_BUNDLER "/opt/rocm/lib/llvm/bin/clang-offload-bundler"
 set(PLOW_HSACO_DIR "${CMAKE_BINARY_DIR}/hsaco" CACHE PATH "output directory for the code objects")
 # Raising this starves parallelism (measured 6-8x slower); it is a knob, not a tuning target.
 set(PLOW_GQ_BATCH "1" CACHE STRING "global-queue claim batch")
+# DECODE BATCH BUCKET. Must match the PLOW_DECODE_BATCH devgen emitted the program with:
+# devgen sizes the decode program, the KV cache and the argmax for B sequences, and this
+# sizes the GEMV that has to produce B logits ROWS. Left unset the kernels compiled at
+# op_gemm.h's PLOW_GEMV_MM default of 1 and wrote row 0 only, so every sequence but the
+# first sampled token 0 off an all-zero logits row -- with a correct B-wide program around
+# it. See scripts/build_gfx950.sh for the full note.
+set(PLOW_DECODE_BATCH "1" CACHE STRING "decode batch bucket (-> PLOW_GEMV_MM)")
 set(PLOW_HSACO_EXTRA_DEFINES "" CACHE STRING "extra raw hipcc flags appended to every code object")
 
 if(PLOW_GFX950_HSACO)
@@ -600,16 +615,56 @@ if(PLOW_GFX950_HSACO)
     # THE AXES. No row below spells out a define set; every row is axes only.
     set(_hs_ax_none "")
     set(_hs_ax_prefill -DPLOW_BUCKET_DECODE=0)
-    set(_hs_ax_decode -DPLOW_BUCKET_DECODE=1)
+    # next_pow2(PLOW_DECODE_BATCH), clamped to PLOW_GEMV_MAXM (16). One instantiation with a
+    # runtime M and an `m < M` predicate serves every M <= MM, so the bucket is a ceiling, not
+    # an exact width. Do NOT make this a runtime ladder -- that was built, measured at 276
+    # registers, and removed (op_gemm.h:2163). Measured cost, ROCm 7.2.4/gfx950 decode object:
+    # MM=1 248/occ2/spill 0, MM=2 248/occ2/spill 0, MM=4 252/occ2/spill 0, MM=8 256/occ2/spill 19.
+    set(_hs_gvmm 1)
+    while(_hs_gvmm LESS PLOW_DECODE_BATCH AND _hs_gvmm LESS 16)
+        math(EXPR _hs_gvmm "${_hs_gvmm} * 2")
+    endwhile()
+    set(_hs_ax_decode -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=${_hs_gvmm})
     # 4 waves => 1 wave/SIMD => a 512-reg budget, and ITS spill is intentional
     # (the Q-hoist spills Q to scratch, cheaper than the L2 re-read it replaces).
     set(_hs_ax_flash -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4
                      -DFA_DC=256 -DFA_DBUF=1)
     set(_hs_ax_gq -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=${PLOW_GQ_BATCH})
-    set(_hs_ax_fp8 -DPLOW_FP8=1)
-    set(_hs_ax_fp8kv -DPLOW_FP8=1 -DPLOW_FP8_KV=1)
-    set(_hs_ax_mxfp4 -DPLOW_MXFP4=1)
+    # PRECISION AXES, ONE PER INDEPENDENT CHOICE. They were not independent: _hs_ax_fp8kv used
+    # to expand to `-DPLOW_FP8=1 -DPLOW_FP8_KV=1`, so the KV-encoding axis silently dragged the
+    # WEIGHT-encoding axis with it and a bf16-weight/fp8-KV packet — a combination the NVIDIA
+    # side has always been able to build (PLOW_FP8_KV is independent of PLOW_NV_W8A8 there) —
+    # had no gfx950 object at all. It would have been handed interp_decode_fp8kv, whose fp8
+    # arms REPLACED the bf16 GEMV_GLU/GEMV_QKV it needs. Now the axes compose instead.
+    set(_hs_ax_fp8 -DPLOW_FP8=1)          # WEIGHT encoding: fp8 e4m3 (prefill w8a8, decode w8a16)
+    set(_hs_ax_fp8kv -DPLOW_FP8_KV=1)     # KV encoding: fp8 e4m3 cache + per-row scales
+    set(_hs_ax_fp8_fp8kv ${_hs_ax_fp8} ${_hs_ax_fp8kv})   # both, the shipped fp8-KV profile
+    set(_hs_ax_mxfp4 -DPLOW_MXFP4=1)      # WEIGHT encoding: MXFP4 e2m1+E8M0 (w4a16 projections)
     set(_hs_ax_mla -DPLOW_MLA_PREFILL=1)
+    # Composed, not spelled out: an all-fp8 Kimi K2.7 / GLM-5.2 / DeepSeek prefill
+    # needs the MLA attention arms AND the w8a8 GEMM arms in the same object, and a
+    # showcase run must be all-fp8 or all-bf16 — never one bucket of each.
+    set(_hs_ax_mla_fp8 ${_hs_ax_mla} ${_hs_ax_fp8})
+    # The FFN half of an MLA-family prefill. An MLA prefill object with no MoE arm is
+    # attention-complete and FFN-incomplete — the expert packets fall through to `default:`
+    # and write nothing — so these are the rows that actually make a Kimi/GLM/DeepSeek
+    # prompt runnable. Measured: the grouped-expert GEMM costs occ NOTHING (see the rows).
+    set(_hs_ax_mla_moe ${_hs_ax_mla} -DPLOW_MOE_PREFILL=1)
+    set(_hs_ax_mla_moe_fp8 ${_hs_ax_mla_fp8} -DPLOW_MOE_PREFILL=1)
+    # A4W4: MXFP4 on BOTH operands through the matrix core, the encoding ATOM runs. Compile-time
+    # like every other precision axis -- a runtime encoding switch would make the register
+    # allocator budget for the worst body and then every body spills (interp.hip states the trap).
+    set(_hs_ax_mla_moe_a4w4 ${_hs_ax_mla_moe} -DPLOW_MOE_PF_A4W4=1)
+    # THE ALL-MXFP4 MLA PREFILL OBJECT. A Kimi/GLM/DeepSeek all-fp4 packet needs the MXFP4
+    # PROJECTIONS (GemmMxfp4, op 93 — gated by PLOW_MXFP4) and the A4W4 grouped EXPERTS (ops
+    # 85/86) in the SAME object; they were previously on separate rows, so no single object
+    # could run the packet even though every arm existed.
+    set(_hs_ax_mla_moe_a4w4_full ${_hs_ax_mla_moe_a4w4} -DPLOW_MXFP4=1)
+    # KIMI-K3 / KDA. One axis, both buckets: a K3 layer runs the same graph at T=1 and T>1, and an
+    # AttnRes present only in decode would make prefill and decode compute different models. The
+    # MLA prefill axis comes with it because K3's full-attention layers are MLA.
+    set(_hs_ax_k3 -DPLOW_K3=1)
+    set(_hs_ax_mla_k3 ${_hs_ax_mla} -DPLOW_K3=1)
 
     set(_hs_kpf "plow_interp_gfx950")
     set(_hs_kdec "plow_interp_dec_gfx950")
@@ -625,23 +680,97 @@ if(PLOW_GFX950_HSACO)
         "interp_decode|${_hs_kdec}|_hs_ax_decode|_hs_ax_none|256|2"
         "interp_flash|${_hs_kfl}|_hs_ax_flash|_hs_ax_none|512|1")
     if(PLOW_HSACO_FP8)
-        # The fp8 arms SWAP for the bf16 GEMV/GEMM arms rather than adding to
-        # them, so both objects stay under the same 256/occ-2 cliff.
+        # MIXED-PRECISION OBJECTS, and the names do not say so. `interp_*_fp8` carries the fp8
+        # arms IN ADDITION TO the bf16 ones, and the fp8 arms themselves are not one precision:
+        # the prefill GEMMs are w8a8 (both operands e4m3 + QUANT_FP8) while the decode GEMVs are
+        # w8a16 (bf16 activation, dequant on load). Both deliberate, neither visible in the stem.
+        #
+        # They used to SWAP for the bf16 arms. That dropped the one bf16 GEMM an fp8 prefill
+        # program still emits — the lm_head, `pick_tile(1, vocab, hidden)`, unquantized unless
+        # PLOW_FP8_HEAD=1 — so interp_prefill_fp8 had no `case PLOW_DOP_GEMM_SMALL`, the lm_head
+        # hit `default:`, and every fp8 run sampled token id 0 from all-zero logits. Additive
+        # costs NOTHING here: measured 2026-07-27 on ROCm 7.2.4, 256 VGPR / 0 AGPR / occ 2 /
+        # spill 20 with and without the bf16 arms (the swap's register argument was measured on
+        # 7.0.2/clang-20, where these objects landed at 262/occ-1).
         list(APPEND _hs_rows
             "interp_decode_fp8|${_hs_kdec}|_hs_ax_decode|_hs_ax_fp8|256|2"
             "interp_prefill_fp8|${_hs_kpf}|_hs_ax_prefill|_hs_ax_fp8|256|2")
     endif()
     if(PLOW_HSACO_FP8KV)
+        # BOTH buckets. Only the decode object was ever built, so an fp8-KV run had
+        # no prefill object at all: PLOW_DOP_FLASH_PREFILL_FP8 (39) is implemented
+        # for hd 256 AND 512 and compiled into ZERO of the shipped objects, and the
+        # fp8-weight prefill object (`_fp8`, PLOW_FP8 only) carries the BF16 flash.
+        # A packet must not be able to ask for an arm the build quietly skipped —
+        # that is the whole reason this table exists. Measured: 256 VGPR / occ 2.
+        # `_fp8_fp8kv`, not `_fp8kv`: these are the fp8-WEIGHT + fp8-KV objects, which is what
+        # every fp8-KV packet emitted today actually is. The stems keep their historical names
+        # because gemma4_chat.c and plowrt resolve them by literal filename.
         list(APPEND _hs_rows
-            "interp_decode_fp8kv|${_hs_kdec}|_hs_ax_decode|_hs_ax_fp8kv|256|2")
+            "interp_decode_fp8kv|${_hs_kdec}|_hs_ax_decode|_hs_ax_fp8_fp8kv|256|2"
+            "interp_prefill_fp8kv|${_hs_kpf}|_hs_ax_prefill|_hs_ax_fp8_fp8kv|256|2"
+            # ...and the class-4 twin. Gemma's flash prefill runs on the 4-wave object
+            # via segmented dispatch, so an fp8-KV prefill without this row had to run
+            # its hd512 flash on the 8-wave interpreter — correct, but without the
+            # 512-register budget the Q-hoist needs. Same cliff as the bf16 twin
+            # (measured 256+256 = 512 / occ 1 / spill 228, the intentional Q-hoist).
+            "interp_flash_fp8kv|${_hs_kfl}|_hs_ax_flash|_hs_ax_fp8kv|512|1")
     endif()
     if(PLOW_HSACO_MXFP4)
+        # Same asymmetry: PLOW_DOP_GEMM_MXFP4 (93) is the w4a16 PREFILL twin of the
+        # two decode mxfp4 arms and had no object to live in. (Its dispatch arm was
+        # also mis-nested into the decode branch — see interp.hip; fixed with this.)
+        # Measured after the fix: 256 VGPR / occ 2, same as the bf16 prefill.
         list(APPEND _hs_rows
-            "interp_decode_mxfp4|${_hs_kdec}|_hs_ax_decode|_hs_ax_mxfp4|256|2")
+            "interp_decode_mxfp4|${_hs_kdec}|_hs_ax_decode|_hs_ax_mxfp4|256|2"
+            "interp_prefill_mxfp4|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mxfp4|256|2")
     endif()
     if(PLOW_HSACO_MLA)
         list(APPEND _hs_rows
             "interp_prefill_mla|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla|256|2")
+        if(PLOW_HSACO_FP8)
+            # Kimi K2.7 / GLM-5.2 / DeepSeek ship fp8, so the bf16-GEMM MLA prefill
+            # object above cannot serve them without mixing dtypes across buckets.
+            # Measured: 256 VGPR / 0 AGPR / occ 2 — the MLA prefill arms and the w8a8
+            # GEMM arms coexist inside the cliff because the fp8 GEMMs SWAP for the
+            # bf16 ones rather than adding to them.
+            list(APPEND _hs_rows
+                "interp_prefill_mla_fp8|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla_fp8|256|2")
+        endif()
+        # ...and the same two objects WITH the grouped-expert FFN. Separate rows rather than
+        # folding PLOW_MOE_PREFILL into the rows above: the MLA-only objects are what agent B's
+        # emitter work is currently building against, and a dense-FFN MLA model (there are none
+        # today, but the axis is real) should not pay for the grouped GEMM.
+        # Measured, prefill_mla: 256 VGPR / 0 AGPR / occ 2, spill 1 -> 2 with the MoE arms.
+        # Measured, prefill_mla_fp8: 256 / 0 / occ 2, spill 20 -> 20 (unchanged).
+        # The grouped GEMM's 81920 B double-buffered tile fits INSIDE the interpreter's existing
+        # 147464 B arena, so it does not move the LDS high-water mark either.
+        list(APPEND _hs_rows
+            "interp_prefill_mla_moe|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla_moe|256|2")
+        if(PLOW_HSACO_FP8)
+            list(APPEND _hs_rows
+                "interp_prefill_mla_moe_fp8|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla_moe_fp8|256|2")
+        endif()
+        if(PLOW_HSACO_MXFP4)
+            # Measured: 256 VGPR / 0 AGPR / occ 2 / spill 2 -- IDENTICAL to the w8a16 twin, because
+            # the hardware applies both E8M0 scales and the software promotion accumulator the
+            # block-fp8 body needs disappears. A4W4 is CHEAPER in registers, not dearer.
+            list(APPEND _hs_rows
+                "interp_prefill_mla_moe_a4w4|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla_moe_a4w4|256|2"
+                # ...and the object an all-MXFP4 packet actually loads: projections AND experts.
+                "interp_prefill_mla_moe_a4w4_full|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla_moe_a4w4_full|256|2")
+        endif()
+    endif()
+    # KIMI-K3 / KDA objects. Both buckets, for the reason the axis note gives. The register
+    # budgets are the ordinary 256/occ-2 the other decode and prefill rows use: if the seven arms
+    # do not fit inside that, the in-build register-cliff gate says so at build time rather than
+    # HSA_STATUS_ERROR_INVALID_ISA at launch — which is the whole point of the gate, and the
+    # measurement this axis still owes (op_attention.h:1282 is why "it fits" is not the question;
+    # the object size and the decode ITL are).
+    if(PLOW_HSACO_K3)
+        list(APPEND _hs_rows
+            "interp_decode_k3|${_hs_kdec}|_hs_ax_decode|_hs_ax_k3|256|2"
+            "interp_prefill_k3|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla_k3|256|2")
     endif()
 
     set(_hs_kinds static)

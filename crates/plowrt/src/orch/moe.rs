@@ -59,6 +59,43 @@ pub fn unused_sentinel(experts: &Experts) -> u32 {
     experts.expert_unused_sentinel
 }
 
+/// The `[E][3]` pointer table for ONE **packed** MoE layer (GLM-5.2 / DeepSeek).
+///
+/// GLM's 256 routed experts are deliberately NOT declared packet tensors
+/// (`crates/devgen/src/mla.rs`: 75 layers x 256 x 6 handles for zero emit
+/// benefit) — the ops only ever index the table. So the host packs each layer's
+/// experts into ONE buffer and fills `mlp.expert_weight_table` /
+/// `mlp.expert_scale_table` with addresses INTO it. This is the address
+/// arithmetic for that, and it is the single source of truth the packer copies
+/// against: slot `k` of the buffer lives at `base + k*stride`, and the table
+/// entry for `(expert, proj)` is the address of the slot that was filled.
+///
+/// Same `[E][3] = {gate, up, down}` order as [`build_expert_table`] — what
+/// `op_moe.h` reads as `wtab[eid*3 + {0,1,2}]`.
+///
+/// `owned` is the half-open expert range THIS rank packed:
+/// * **TP** — every rank holds a `1/N` slice of every expert, so `0..n_exp`;
+/// * **EP** — every rank holds `n_exp/N` WHOLE experts, so a contiguous block.
+///
+/// An expert outside `owned` keeps a **zero** entry, which is not an omission
+/// but the interface: `d_moe_expert_glu` bails on `wtab[eid*3] == 0` and
+/// `d_moe_expert_down` zeroes that slot's partial, so a remote expert costs the
+/// rank nothing and the combine still sums a deterministic zero.
+pub fn packed_expert_table(
+    base: u64,
+    stride: u64,
+    n_exp: u32,
+    owned: std::ops::Range<u32>,
+) -> Vec<u64> {
+    let mut table = vec![0u64; n_exp as usize * 3];
+    for (slot, e) in owned.filter(|e| *e < n_exp).enumerate() {
+        for j in 0..3 {
+            table[e as usize * 3 + j] = base + (slot as u64 * 3 + j as u64) * stride;
+        }
+    }
+    table
+}
+
 /// Offset-based expert-table resolution for **FUSED 3-D expert tensors** (Gemma-4 26B-A4B,
 /// `plans/rtx-08-gemma4-moe-26b.md`). Unlike GLM/DeepSeek — where each expert is a separately
 /// named `{gate, up, down}` tensor resolved by [`build_expert_table`] — Gemma stores ONE
@@ -166,6 +203,33 @@ mod tests {
             _ => None,
         });
         assert_eq!(table, vec![7, 8]);
+    }
+
+    /// TP: every rank packs a slice of EVERY expert, so the table is dense and
+    /// walks the buffer in `[E][3]` order with no holes.
+    #[test]
+    fn packed_table_under_tp_is_dense() {
+        let t = packed_expert_table(0x1000, 0x10, 3, 0..3);
+        assert_eq!(
+            t,
+            vec![0x1000, 0x1010, 0x1020, 0x1030, 0x1040, 0x1050, 0x1060, 0x1070, 0x1080]
+        );
+    }
+
+    /// EP: a rank packs only its contiguous block of WHOLE experts. The block is
+    /// dense in the BUFFER (slot 0 is the first local expert) but sparse in the
+    /// TABLE, and every remote expert must read back as a null base — that zero
+    /// is what makes the kernel skip it instead of dereferencing a stale address.
+    #[test]
+    fn packed_table_under_ep_is_null_outside_the_local_block() {
+        // 4 experts, 2 ranks: rank 1 owns {2,3} and packs them at slots 0,1.
+        let t = packed_expert_table(0x2000, 0x100, 4, 2..4);
+        assert_eq!(t[..6], [0u64; 6], "remote experts stay NULL");
+        assert_eq!(
+            t[6..],
+            [0x2000, 0x2100, 0x2200, 0x2300, 0x2400, 0x2500],
+            "local experts pack from slot 0 of this rank's buffer"
+        );
     }
 
     /// Fused (Gemma-4) resolution: `[E][2] = {gate_up base + e·stride, down base + e·stride}`,

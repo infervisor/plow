@@ -432,6 +432,21 @@ int main(void) {
     run_gemv(h, &kgv8, cus, 8, I, H);
     run_gemv(h, &kgv, cus, 1, H, I); /* down_proj shape */
 
+    /* L2 SLICE-SPLIT MICROBENCH (PLOW_GEMV_SPLIT). `slice`/`nblk` are blockIdx/gridDim here, so a
+     * grid of S*CUs is EXACTLY what the compiler's re-slicing emits — the same d_gemv_t, the same
+     * GV_BLOCKED column ownership, and the same dynamic pickup (the hardware dispatcher hands the
+     * second round of blocks to whichever CU frees first, as the global queue's cursor does).
+     * What it cannot show is the per-packet claim cost or cross-packet overlap; charge those
+     * separately. Shapes are the real 31B decode GEMVs. */
+    printf("\nGEMV slice-split sweep (S x %u blocks; the L2 lever):\n", cus);
+    const unsigned shp[][2] = {{H, 8192}, {H, I}, {I, H}};
+    const char* shn[] = {"o_proj  ", "down    ", "gate/up "};
+    for (int s = 0; s < 3; s++)
+        for (unsigned mult = 1; mult <= 4; mult *= 2) {
+            printf("  %s S=%u ", shn[s], mult);
+            run_gemv(h, &kgv, cus * mult, 1, shp[s][0], shp[s][1]);
+        }
+
     printf("\n%s (%d failure%s)\n", fails ? "GEMM FAILED" : "GEMM FAMILY CORRECT", fails,
            fails == 1 ? "" : "s");
     plow_hsa_shutdown(h);

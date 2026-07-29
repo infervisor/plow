@@ -1,0 +1,43 @@
+[package]
+name = "nn-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Symbolic neural-network operator graph IR: build full graphs, infer shapes with batch/resolution params, and enumerate per-op weights"
+
+# VENDORED from github.com/infervisor/nn-graph @ 10ac343. The dependency was a
+# bare `git = ...` with no rev/tag/branch, so reproducibility rested entirely on
+# Cargo.lock pinning one sha — a force-push or GC upstream broke every clean
+# build. Upstream had 8 commits, one branch, no CI, no README and no second
+# consumer. It is now a normal workspace member: one `cargo build`, one review
+# surface, and changes land atomically with the plow code that depends on them.
+#
+# Dropped in the move (both had zero callers in the merged tree):
+#   * the `cli` feature + `nn-infer` binary — a ureq-based HF fetcher that
+#     existed only because hf-hub 0.3 mishandled relative redirects. plow is on
+#     hf-hub 0.4, which the `hub` feature below uses instead.
+#   * `src/gguf.rs` — a 380-line GGUF *file* parser nothing ever called.
+#     `DType::from_gguf_type` and the block-quant sizing it feeds stay; those
+#     are what `costmodel` actually uses.
+#
+# Absorbed in the move: the `frontend` crate, which was 12 lines of re-export
+# plus one hf-hub call. It existed only because `nn-graph` was external and the
+# hub layer had to live downstream of it; that constraint is gone. It is now the
+# `hub` feature (`src/hub.rs`).
+
+[features]
+# `models` bundles the network definitions (architecture builders + HF config
+# parsing). Off ⇒ a pure, serde-free operator-graph IR, which is all `costmodel`
+# needs (it uses `DType` and nothing else).
+default = ["models"]
+models = ["dep:serde", "dep:serde_json"]
+# `hub` resolves a model identifier to its config over the network. Off by
+# default so the offline path (every `--hf-dir` compile) links no TLS stack.
+hub = ["models", "dep:hf-hub"]
+
+[dependencies]
+smallvec = { version = "1", features = ["union"] }
+thiserror = { workspace = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+hf-hub = { workspace = true, optional = true }

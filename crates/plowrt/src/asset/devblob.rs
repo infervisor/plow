@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use packet::dev::{DevInst64, StreamEnt, Wait};
+use packet::dev::{DevInst64, DevOp, StreamEnt, Wait};
 use packet::rope::GenTensor;
 use packet::devbuild::{
     is_blob_magic, BlobHeader, BlobProgHeader, BlobSectionEntry, BlobTensor, BLOB_MAGIC_V7,
@@ -46,6 +46,53 @@ pub struct DevProg {
     pub gq_stream: Vec<StreamEnt>,
     /// `[n_seg+1]` segment window bounds into `gq_stream`.
     pub gq_seg_ofs: Vec<u32>,
+    /// L2-domain placement (`PLOW_L2_PLACE`): the number of L2 domains `gq_seg_ofs` is windowed
+    /// by, `0` when this program is not placed and the windows are wave-class segments.
+    ///
+    /// RECOVERED, not read: the blob header carries one `F_L2DOM` flag and one domain count for
+    /// the whole blob (`reserved[2]`), but placement is decided per PROGRAM — `Builder::finish`
+    /// declines it for a multi-wave-class program, so a blob can hold a placed decode program
+    /// beside an unplaced, segmented prefill one. A program is placed iff the blob says placement
+    /// happened and this program's window count equals the domain count.
+    ///
+    /// That test is exact rather than a heuristic, and the reason is a parity argument worth
+    /// stating: a wave-class window count is `2*layers + 1`, which is always ODD, while a domain
+    /// count is a hardware L2 partition count, which is a power of two and so always EVEN. The
+    /// two ranges cannot collide.
+    pub l2_domains: u32,
+}
+
+/// How a blob is sharded across GPUs, RECOVERED from the program rather than
+/// read from a header field — because there is no header field.
+///
+/// `plowc --num-gpus N` bakes the sharding into every collective it emits
+/// (`crates/devgen` `emit_xreduce`): `i[0]` = elements reduced, `i[1]` = the TP
+/// degree, `i[2]` = the partial slot's byte offset. So a `--tp 4` blob is
+/// self-describing and a `--tp 1` blob carries no collective at all, which is
+/// exactly the distinction a loader must make BEFORE it binds 60 GiB of
+/// weights.
+///
+/// Without this the failure is late and unreadable: a tp=4 blob declares every
+/// projection at 1/4 size, so a single-GPU loader that binds full tensors dies
+/// at the first `q_proj` with `SIZE MISMATCH ... blob says 5.5 MB, checkpoint
+/// has 22 MB` — a message that describes the symptom and names neither TP nor
+/// the flag that would fix it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DevTp {
+    /// TP degree the blob was compiled for (`XReduce.i[1]`). Always `> 1`:
+    /// a tp=1 blob emits no collective, so it has no [`DevTp`] at all.
+    pub n_gpu: u32,
+    /// Model hidden size (`XReduce.i[0]`, decode's `t·hidden` at `t == 1`).
+    /// Sizes the all-reduce message and hence the peer region.
+    pub hidden: u32,
+    /// Byte offset of partial slot B within the peer region — `max(i[2])` over
+    /// the program's collectives, since slot A carries `i[2] == 0`.
+    ///
+    /// `devgen` computes it as `rows_max·hidden·2` where `rows_max` is the
+    /// LARGEST prefill chunk, and bakes that same value into every bucket AND
+    /// the decode program. So decode's copy is authoritative for the whole
+    /// blob, which is why scanning one program is enough.
+    pub slot_bytes: u64,
 }
 
 /// A section embedded in a v6 blob (cubin, hsaco, weight map, etc.).
@@ -78,6 +125,9 @@ pub struct DevBlob {
     /// [`Self::init`] — the RoPE tables on a v7 blob. Empty on v5/v6, where the
     /// same bytes arrive via [`DevTensor::init`].
     pub gen: Vec<GenTensor>,
+    /// TP sharding recovered from the decode program's collectives, or `None`
+    /// for a single-GPU blob. See [`DevTp`].
+    pub tp: Option<DevTp>,
 }
 
 /// Copy `n` `T` records out of `buf` at `*off` (unaligned-safe — the blob's
@@ -105,6 +155,47 @@ fn take<T: Copy>(buf: &[u8], off: &mut usize, n: usize, what: &str) -> Result<Ve
     }
     *off = end;
     Ok(v)
+}
+
+/// Recover the TP sharding by scanning every program's collectives.
+///
+/// EVERY program is scanned, not just decode: a sharded prefill bucket is just
+/// as unloadable on one GPU as a sharded decode program, and a scan that missed
+/// it would send the caller straight back to the `SIZE MISMATCH` this exists to
+/// replace.
+///
+/// The three fields come from different places on purpose:
+///
+/// * `n_gpu` — `i[1]`, identical on every collective.
+/// * `hidden` — `i[0]` of a ONE-SHOT [`DevOp::XReduce`] only. Decode compiles at
+///   `t == 1`, so there `i[0] == hidden`; prefill's two-shot carries
+///   `t·hidden`, and reading hidden from it would be wrong by the chunk size.
+/// * `slot_bytes` — `max(i[2])`, because slot A carries 0 and slot B carries the
+///   offset. `devgen` derives it from the LARGEST prefill chunk and bakes the
+///   same value into every program, so the max over all of them is that one
+///   value and not a per-program quantity.
+fn recover_tp(progs: &[DevProg]) -> Option<DevTp> {
+    let (mut n_gpu, mut hidden, mut slot_bytes) = (0u32, 0u32, 0u64);
+    for p in progs {
+        for d in &p.insts {
+            let one_shot = d.op == DevOp::XReduce as u16;
+            if !one_shot && d.op != DevOp::XReduceTwoShot as u16 {
+                continue;
+            }
+            n_gpu = n_gpu.max(d.i[1]);
+            if one_shot {
+                hidden = hidden.max(d.i[0]);
+            }
+            slot_bytes = slot_bytes.max(d.i[2] as u64);
+        }
+    }
+    // A tp==1 blob emits no collective at all, so "no collective" and "not
+    // sharded" are the same fact and `None` says it once.
+    (n_gpu > 1).then_some(DevTp {
+        n_gpu,
+        hidden,
+        slot_bytes,
+    })
 }
 
 impl DevBlob {
@@ -167,6 +258,7 @@ impl DevBlob {
                 succs: take(buf, &mut off, ph.n_succ as usize, &what("succs"))?,
                 gq_stream: Vec::new(),
                 gq_seg_ofs: Vec::new(),
+                l2_domains: 0,
             });
         }
 
@@ -180,6 +272,15 @@ impl DevBlob {
                 let n_stream = progs[p].stream.len();
                 progs[p].gq_stream = take(buf, &mut off, n_stream, "gq_stream")?;
                 progs[p].gq_seg_ofs = take(buf, &mut off, n_seg + 1, "gq_seg_ofs")?;
+                // Which of these programs is L2-PLACED. See `DevProg::l2_domains` for why the
+                // window count identifies it exactly.
+                let l2_dom = hdr.reserved[2] as u32;
+                if hdr.flags & packet::devbuild::PLOW_BLOB_F_L2DOM != 0
+                    && l2_dom != 0
+                    && n_seg == l2_dom as usize
+                {
+                    progs[p].l2_domains = l2_dom;
+                }
             }
         }
 
@@ -211,6 +312,11 @@ impl DevBlob {
             let mut sects = Vec::with_capacity(n);
             for i in 0..n {
                 let base = ent_start + i * ent_size;
+                // SAFETY: `base + ent_size <= buf.len()` is enforced by the
+                // truncation check above, and `read_unaligned` is what makes a
+                // file-offset-derived pointer legal — a `BlobSectionEntry` in
+                // the directory is only byte-aligned. The type is `#[repr(C)]`
+                // POD, so every bit pattern is a valid value.
                 let ent = unsafe {
                     std::ptr::read_unaligned(buf[base..].as_ptr() as *const BlobSectionEntry)
                 };
@@ -273,19 +379,25 @@ impl DevBlob {
             Vec::new()
         };
 
-        // PLOW_NV_PLACE guard: a blob whose gq `seg` is an L2 domain (F_L2DOM)
+        // PLOW_L2_PLACE guard: a blob whose gq `seg` is an L2 domain (F_L2DOM)
         // will be MIS-dispatched by a wave-class / static interp (it reads `seg`
         // as a wave-class segment). Refuse it unless this runtime opts into
         // physical-SM domain dispatch. (reserved[1]/[2] carry SMs/partition and
-        // the domain count for that dispatch.) See devblob-locality-placement.md.
+        // the domain count for that dispatch.) See plans/l2-placement-generic.md.
+        //
+        // `PLOW_NV_PLACE_DISPATCH` stays accepted alongside the new spelling: the flag was
+        // renamed because an L2 domain is a GPC on NVIDIA and an XCD on AMD, and a run that
+        // opted in under the old name must not start failing to load.
+        let dispatch_on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
         if hdr.flags & packet::devbuild::PLOW_BLOB_F_L2DOM != 0
-            && std::env::var("PLOW_NV_PLACE_DISPATCH").ok().as_deref() != Some("1")
+            && !dispatch_on("PLOW_L2_PLACE_DISPATCH")
+            && !dispatch_on("PLOW_NV_PLACE_DISPATCH")
         {
             return Err(RuntimeError::Device(
-                "devblob: blob uses L2-domain packet placement (PLOW_NV_PLACE) — its \
+                "devblob: blob uses L2-domain packet placement (PLOW_L2_PLACE) — its \
                  global-queue `seg` is an L2 domain, not a wave-class, so a standard interp \
-                 would mis-dispatch it. Build the cubins with -DPLOW_NV_PLACE_DISPATCH and set \
-                 PLOW_NV_PLACE_DISPATCH=1, or recompile the model without PLOW_NV_PLACE."
+                 would mis-dispatch it. Build the cubins with -DPLOW_L2_PLACE_DISPATCH and set \
+                 PLOW_L2_PLACE_DISPATCH=1, or recompile the model without PLOW_L2_PLACE."
                     .to_string(),
             ));
         }
@@ -298,6 +410,16 @@ impl DevBlob {
                  its device can cross-check this fingerprint (Gap 4)"
             );
         }
+        let tp = recover_tp(&progs);
+        if let Some(t) = tp {
+            tracing::info!(
+                n_gpu = t.n_gpu,
+                hidden = t.hidden,
+                slot_bytes = t.slot_bytes,
+                "devblob: SHARDED blob — every projection is 1/n_gpu wide"
+            );
+        }
+
         Ok(DevBlob {
             n_cu: hdr.n_cu,
             flags: hdr.flags,
@@ -308,6 +430,7 @@ impl DevBlob {
             progs,
             sections,
             gen,
+            tp,
         })
     }
 
@@ -483,7 +606,7 @@ mod tests {
             tensors: Vec::new(),
             gq_stream: vec![se(0, 0), se(0, 1), se(1, 0), se(1, 1)],
             gq_seg_ofs: vec![0, 4],
-            // Unplaced: `seg` is a wave-class, not an L2 domain (PLOW_NV_PLACE).
+            // Unplaced: `seg` is a wave-class, not an L2 domain (PLOW_L2_PLACE).
             l2_sms: 0,
             l2_domains: 0,
         };
@@ -508,6 +631,78 @@ mod tests {
             prog_t: vec![128, 1],
             gen: Vec::new(),
         }
+    }
+
+    /// Give program `p` the two collectives `devgen` emits per layer at tp=N:
+    /// slot A (`i[2] == 0`) and slot B (`i[2] == slot_b`).
+    fn with_xreduce(m: &mut Model, p: usize, one_shot: bool, n_gpu: u32, elems: u32, slot_b: u32) {
+        let op = if one_shot {
+            DevOp::XReduce
+        } else {
+            DevOp::XReduceTwoShot
+        } as u16;
+        for slot in [0, slot_b] {
+            let mut d = DevInst {
+                op,
+                blocks: 1,
+                ..Default::default()
+            };
+            d.i[0] = elems;
+            d.i[1] = n_gpu;
+            d.i[2] = slot;
+            m.progs[p].insts.push(d);
+        }
+    }
+
+    /// A tp=1 blob emits no collective, so it must report `None` — not
+    /// `Some(n_gpu: 1)`. The single-GPU path keys off exactly this, and a blob
+    /// that claimed to be a 1-way shard would be refused by the load-time check.
+    #[test]
+    fn an_unsharded_blob_reports_no_tp() {
+        let b = DevBlob::parse(&tiny_model().to_blob()).unwrap();
+        assert_eq!(b.tp, None);
+    }
+
+    /// Decode's one-shot is where `hidden` comes from: at `t == 1`, `i[0]` IS
+    /// the hidden size. `slot_bytes` is `max(i[2])` because slot A carries 0.
+    #[test]
+    fn a_sharded_decode_blob_describes_itself() {
+        let mut m = tiny_model();
+        let dp = m.progs.len() - 1;
+        with_xreduce(&mut m, dp, true, 4, 5376, 5376 * 2);
+        let tp = DevBlob::parse(&m.to_blob()).unwrap().tp.expect("sharded");
+        assert_eq!(tp.n_gpu, 4);
+        assert_eq!(tp.hidden, 5376, "decode's i[0] at t==1 is hidden");
+        assert_eq!(tp.slot_bytes, 5376 * 2, "max(i[2]), since slot A is 0");
+    }
+
+    /// PREFILL's two-shot carries `i[0] = t·hidden`, so reading `hidden` from it
+    /// would be wrong by the chunk size — 1024x here. Only the one-shot may
+    /// supply it, and `slot_bytes` still comes from the max across BOTH.
+    #[test]
+    fn prefills_two_shot_never_supplies_hidden() {
+        let h = 5376u32;
+        let slot_b = 1024 * h * 2; // devgen: rows_max * hidden * 2
+        let mut m = tiny_model();
+        let dp = m.progs.len() - 1;
+        with_xreduce(&mut m, 0, false, 4, 1024 * h, slot_b); // prefill bucket
+        with_xreduce(&mut m, dp, true, 4, h, slot_b); // decode
+
+        let tp = DevBlob::parse(&m.to_blob()).unwrap().tp.expect("sharded");
+        assert_eq!(tp.n_gpu, 4);
+        assert_eq!(tp.hidden, h, "NOT 1024*h — two-shot's i[0] is t*hidden");
+        assert_eq!(
+            tp.slot_bytes, slot_b as u64,
+            "devgen bakes the SAME slot_b into every program"
+        );
+
+        // A prefill-only asset is just as unloadable on one GPU, so the scan
+        // must see it even with no decode collective to fall back on.
+        let mut pf = tiny_model();
+        with_xreduce(&mut pf, 0, false, 2, 1024 * h, slot_b);
+        let only = DevBlob::parse(&pf.to_blob()).unwrap().tp.expect("sharded");
+        assert_eq!((only.n_gpu, only.slot_bytes), (2, slot_b as u64));
+        assert_eq!(only.hidden, 0, "unrecoverable from two-shot alone, not guessed");
     }
 
     /// A v7 blob must be DISCOVERED, parsed, and its recipes materialised.

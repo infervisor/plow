@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::decode::{rank_by_cell, CellRanking, DecodeMeasurement};
 use crate::record::{Correctness, Digests, KernelMeasurement, RecordState};
@@ -70,6 +70,39 @@ impl TuneStore {
 
     fn kernel_path(&self, hardware: &str) -> PathBuf {
         self.root.join(hardware).join("kernel_measurement.jsonl")
+    }
+
+    /// Every hardware cell that has a `kernel_measurement.jsonl`, as `vendor/isa/sku`.
+    ///
+    /// Exists so an empty cell can be reported as a MISMATCH rather than a cold start: the cell is
+    /// a path (`amd/gfx950/mi350x`) while the caller usually holds a SKU (`MI355X`), and the two
+    /// need not spell the same. A reader that cannot see the neighbours has no way to tell "nothing
+    /// measured yet" from "measured under a different name", and those want opposite responses.
+    pub fn cells(&self) -> Result<Vec<String>, StoreError> {
+        fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<(), StoreError> {
+            let rd = match std::fs::read_dir(dir) {
+                Ok(rd) => rd,
+                Err(_) => return Ok(()),
+            };
+            for e in rd {
+                let e = e?;
+                if !e.file_type()?.is_dir() {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().into_owned();
+                let cell = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+                if e.path().join("kernel_measurement.jsonl").exists() {
+                    out.push(cell);
+                } else {
+                    walk(&e.path(), &cell, out)?;
+                }
+            }
+            Ok(())
+        }
+        let mut out = Vec::new();
+        walk(&self.root, "", &mut out)?;
+        out.sort();
+        Ok(out)
     }
 
     /// Every kernel measurement stored for one hardware cell.

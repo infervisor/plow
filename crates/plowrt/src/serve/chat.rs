@@ -7,7 +7,7 @@ use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{self, Stream};
 
 use crate::serve::openai::*;
 use crate::serve::stream::{self as stream_mod, FinishReason, StreamChunk};
@@ -51,24 +51,33 @@ pub async fn chat_completions(
         }
     }
 
+    // §TTFT: the clock the breakdown is measured against starts HERE, at the
+    // first line of the handler that has the request body — everything before
+    // it (accept, read, JSON decode) is axum's and shows up as UNACCOUNTED.
+    let t_arrive = std::time::Instant::now();
+    crate::obs::ttft::reset();
+
     // Models served by the GPU engine get their real chat template (the
     // tokenizer resolves the markers through `added_tokens`); the CPU
     // reference path keeps the simple role-prefix flatten — its logits are a
     // stand-in, so a template would be costume jewelry there.
-    let prompt = if state.has_gpu_engine(&req.model) {
-        gemma_chat_prompt(&req.messages)
-    } else {
-        let mut prompt = String::new();
-        for m in &req.messages {
-            if !prompt.is_empty() {
-                prompt.push_str("\n\n");
+    let prompt = crate::obs::ttft::timed(&crate::obs::ttft::TEMPLATE, || {
+        if state.has_gpu_engine(&req.model) {
+            let tok = state.registry.get(&req.model).ok();
+            gpu_chat_prompt(tok.as_deref(), &req.messages)
+        } else {
+            let mut prompt = String::new();
+            for m in &req.messages {
+                if !prompt.is_empty() {
+                    prompt.push_str("\n\n");
+                }
+                prompt.push_str(&m.role);
+                prompt.push_str(":\n");
+                prompt.push_str(&m.content.as_text());
             }
-            prompt.push_str(&m.role);
-            prompt.push_str(":\n");
-            prompt.push_str(&m.content.as_text());
+            prompt
         }
-        prompt
-    };
+    });
 
     // Build generation controls from the request.
     let mut gen = crate::serve::GenParams::default();
@@ -97,7 +106,10 @@ pub async fn chat_completions(
     };
     // Tokenize HERE, on the handler task — the dispatcher loop is the
     // serialized decode critical path and must never encode a long prompt.
-    let prompt_ids = bundle.tokenizer().encode(&prompt);
+    let prompt_ids = crate::obs::ttft::timed(&crate::obs::ttft::ENCODE, || {
+        bundle.tokenizer().encode(&prompt)
+    });
+    let n_prompt = prompt_ids.len();
     let (tx, rx) = stream_mod::channel();
     let job = crate::serve::mux::Job {
         prompt_ids,
@@ -116,10 +128,59 @@ pub async fn chat_completions(
     let request_id = request_id();
     if req.stream {
         let include_usage = req.stream_options.map(|o| o.include_usage).unwrap_or(false);
-        sse_response(request_id, req.model, rx, include_usage).into_response()
+        sse_response(request_id, req.model, rx, include_usage, t_arrive, n_prompt).into_response()
     } else {
         buffer_and_reply(request_id, req.model, rx).await
     }
+}
+
+/// Pick the chat template a GPU-served model wants.
+///
+/// Selected by PROBING the bundle's own tokenizer for the family's turn
+/// marker: a marker is ONE special id in its own vocab (it is in that
+/// checkpoint's `added_tokens`) and several ordinary pieces in anyone else's.
+/// So the assets decide, which is what kept this honest when GLM-5.2 became the
+/// second GPU-served family — before this, every GPU model got Gemma's markers,
+/// which another checkpoint's tokenizer spells out as literal text.
+///
+/// Unknown family → Gemma's format, the previous behavior.
+fn gpu_chat_prompt(bundle: Option<&crate::asset::ModelBundle>, messages: &[Message]) -> String {
+    let glm = bundle
+        .map(|b| {
+            let t = b.tokenizer();
+            !t.is_byte_fallback() && t.encode("<|assistant|>").len() == 1
+        })
+        .unwrap_or(false);
+    if glm {
+        glm_chat_prompt(messages)
+    } else {
+        gemma_chat_prompt(messages)
+    }
+}
+
+/// GLM-5.2's chat format (the checkpoint's `chat_template.jinja`; text-only,
+/// no tools, thinking DISABLED): the `[gMASK]<sop>` prefix, one
+/// `<|role|>content` block per message, then the generation prompt
+/// `<|assistant|><think></think>`.
+///
+/// Thinking disabled is deliberate and is the branch that also drops the
+/// template's `<|system|>Reasoning Effort: …` line — a served benchmark
+/// measures answer tokens, not a reasoning trace whose length nobody controls.
+fn glm_chat_prompt(messages: &[Message]) -> String {
+    let mut p = String::from("[gMASK]<sop>");
+    for m in messages {
+        let role = match m.role.as_str() {
+            "assistant" => "assistant",
+            "system" | "developer" => "system",
+            _ => "user",
+        };
+        p.push_str("<|");
+        p.push_str(role);
+        p.push_str("|>");
+        p.push_str(m.content.as_text().trim());
+    }
+    p.push_str("<|assistant|><think></think>");
+    p
 }
 
 /// The Gemma-4 canonical chat format (the checkpoint's
@@ -157,13 +218,19 @@ async fn buffer_and_reply(
     mut rx: stream_mod::ChunkReceiver,
 ) -> Response {
     let mut text = String::new();
-    let mut finish = "stop";
+    // `None` until a terminal chunk arrives. It must NOT default to "stop": the
+    // mux frees a slot on ANY `try_send` failure, and a bounded-channel `Full`
+    // (serve/stream.rs caps the stream at 32 chunks) drops the sender without
+    // sending `Done` or `Err`. Defaulting to "stop" turned that into a 200 with
+    // a fluent, truncated answer that claimed to be complete — invisible to a
+    // benchmark client, which counts it as a successful request.
+    let mut finish: Option<&str> = None;
     let mut usage = None;
     while let Some(chunk) = rx.recv().await {
         match chunk {
             StreamChunk::Token { text: delta, .. } => text.push_str(&delta),
             StreamChunk::Done { reason, usage: u, .. } => {
-                finish = reason.as_str();
+                finish = Some(reason.as_str());
                 usage = Some(u.into());
                 break;
             }
@@ -185,6 +252,25 @@ async fn buffer_and_reply(
             }
         }
     }
+    let Some(finish) = finish else {
+        // The channel closed with no terminal chunk. The generation was cut
+        // (mux slot freed on a send failure, or a dispatcher tick panic) and
+        // there is no honest completion to return — say so rather than ship the
+        // partial as a finished answer.
+        tracing::warn!(
+            %model,
+            partial_chars = text.len(),
+            "chat: stream ended with no terminal chunk — reporting as truncated"
+        );
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "generation stream ended without a finish reason (slot cut)",
+                "partial": text,
+            })),
+        )
+            .into_response();
+    };
     Json(ChatResponse {
         id: request_id.clone(),
         object: "chat.completion",
@@ -207,6 +293,19 @@ async fn buffer_and_reply(
 
 /// Streaming path: one SSE `chat.completion.chunk` frame per produced token,
 /// terminated by a final chunk carrying `finish_reason` and then `[DONE]`.
+///
+/// The `role: "assistant"` delta rides the FIRST token's chunk; it is NOT a
+/// leading frame of its own. That is a measurement fix, not a cosmetic one:
+/// `vllm bench serve`'s chat backend stamps TTFT on the first chunk carrying a
+/// `choices` array **whatever its content**
+/// (`vllm/benchmarks/backend_request_func.py`), so a role frame emitted at
+/// request-arrival time made plowrt report TTFT = one HTTP round trip. Measured
+/// on gfx950 with a 7013-token prompt: role frame at 7.1 ms, first real token at
+/// 1322 ms. It also poisoned TPOT and mean ITL, since the whole prefill then
+/// landed in the first inter-token gap. vLLM's own server sends nothing before
+/// its first token (measured TTFT 208 ms on a 1024-token prefill), so this is
+/// also what makes the two servers comparable under one client.
+///
 /// Empty-delta tokens (partial UTF-8) are still emitted so the client can
 /// keep an accurate token count if it wishes — the `delta.content` field is
 /// simply the empty string for those. With `stream_options.include_usage`
@@ -217,38 +316,23 @@ fn sse_response(
     model: String,
     rx: stream_mod::ChunkReceiver,
     include_usage: bool,
+    t_arrive: std::time::Instant,
+    n_prompt: usize,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let role_chunk = ChatChunk {
-        id: request_id.clone(),
-        object: "chat.completion.chunk",
-        model: model.clone(),
-        choices: vec![ChunkChoice {
-            index: 0,
-            delta: Delta {
-                role: Some("assistant"),
-                content: None,
-            },
-            finish_reason: None,
-        }],
-        usage: None,
-    };
-    let role_frame = stream::once(async move {
-        Ok::<_, std::convert::Infallible>(
-            Event::default().data(stream_mod::chunk_data(&role_chunk)),
-        )
-    });
-
     // State threaded through the unfold: the receiver, and the tail frames
     // (optional usage-only chunk, then [DONE]) drained one per poll.
     struct SseState {
         rx: stream_mod::ChunkReceiver,
         done: bool,
+        /// The `role` delta has not been sent yet — it rides the FIRST token.
+        role_pending: bool,
         pending: std::collections::VecDeque<Event>,
     }
     let body = stream::unfold(
         SseState {
             rx,
             done: false,
+            role_pending: true,
             pending: std::collections::VecDeque::new(),
         },
         move |mut st| {
@@ -262,9 +346,38 @@ fn sse_response(
                     st.done = st.pending.is_empty();
                     return Some((Ok(ev), st));
                 }
-                let chunk = st.rx.recv().await?;
+                let chunk = match st.rx.recv().await {
+                    Some(c) => c,
+                    None => {
+                        // No terminal chunk: the mux freed the slot on a
+                        // `try_send` failure (the bounded 32-chunk stream
+                        // filling counts, not just the client dropping) or a
+                        // tick panicked. The wire shape is left alone — the
+                        // stream ends without `[DONE]`, which is the only
+                        // signal SSE has — but it must not be SILENT
+                        // server-side, because a bench client scores this as a
+                        // successful request with fewer output tokens.
+                        tracing::warn!(
+                            %model,
+                            "chat: SSE stream ended with no terminal chunk (slot cut) \
+                             — no finish_reason, no [DONE]"
+                        );
+                        return None;
+                    }
+                };
                 let (frame, terminate) = match chunk {
                     StreamChunk::Token { text, .. } => {
+                        let role = st.role_pending.then(|| {
+                            st.role_pending = false;
+                            "assistant"
+                        });
+                        // §TTFT: this frame is the one `vllm bench serve` stamps.
+                        if role.is_some() {
+                            crate::obs::ttft::dump(
+                                t_arrive.elapsed().as_nanos() as u64,
+                                n_prompt,
+                            );
+                        }
                         let ch = ChatChunk {
                             id: request_id.clone(),
                             object: "chat.completion.chunk",
@@ -272,7 +385,7 @@ fn sse_response(
                             choices: vec![ChunkChoice {
                                 index: 0,
                                 delta: Delta {
-                                    role: None,
+                                    role,
                                     content: Some(text),
                                 },
                                 finish_reason: None,
@@ -344,7 +457,7 @@ fn sse_response(
         },
     );
 
-    Sse::new(role_frame.chain(body))
+    Sse::new(body)
 }
 
 #[cfg(test)]

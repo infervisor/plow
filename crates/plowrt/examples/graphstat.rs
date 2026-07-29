@@ -95,6 +95,39 @@ struct Stats {
     blocks: Vec<u32>,
 }
 
+/// Longest path through the op DAG, measured in PACKETS (unit weight per op).
+/// The emitted op order is topological (producer index < consumer index), so a
+/// single forward sweep suffices. Returns `(depth, spine)`.
+fn critical_path(n: usize, edges: &BTreeSet<(u32, u32)>) -> (u32, Vec<u32>) {
+    let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for &(a, b) in edges {
+        preds[b as usize].push(a);
+    }
+    let mut depth = vec![1u32; n];
+    let mut from = vec![u32::MAX; n];
+    for i in 0..n {
+        for &p in &preds[i] {
+            if depth[p as usize] + 1 > depth[i] {
+                depth[i] = depth[p as usize] + 1;
+                from[i] = p;
+            }
+        }
+    }
+    let end = (0..n).max_by_key(|&i| depth[i]).unwrap_or(0);
+    let mut spine = Vec::new();
+    let mut cur = end as u32;
+    loop {
+        spine.push(cur);
+        let p = from[cur as usize];
+        if p == u32::MAX {
+            break;
+        }
+        cur = p;
+    }
+    spine.reverse();
+    (depth[end], spine)
+}
+
 fn analyse(prog: &DevProg) -> Stats {
     let n_ops = prog.insts.len();
     let ents: &[packet::dev::StreamEnt] =
@@ -172,6 +205,152 @@ fn analyse(prog: &DevProg) -> Stats {
     }
 }
 
+/// Where each op actually RUNS: the set of CUs holding at least one of its
+/// slices, plus the first/last position of those slices inside that CU's own
+/// stream window.
+///
+/// The static interpreter walks a PER-CU stream — a workgroup executes every
+/// entry it owns, in order, gate or no gate. So `stream_ofs`/`stream_len` are
+/// not bookkeeping, they are the real execution order, and two packets in one
+/// CU's window are serialised by that fact alone.
+struct Placement {
+    /// `cus[op]` — CUs with at least one slice of `op`.
+    cus: Vec<BTreeSet<u32>>,
+    /// `(cu, op)` → first and last index of `op` within that CU's window.
+    span: HashMap<(u32, u32), (u32, u32)>,
+}
+
+fn placement(prog: &DevProg, n_ops: usize) -> Placement {
+    let mut cus: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); n_ops];
+    let mut span: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
+    for cu in 0..prog.stream_ofs.len() as u32 {
+        let ofs = prog.stream_ofs[cu as usize] as usize;
+        let len = prog.stream_len[cu as usize] as usize;
+        for (k, e) in prog.stream[ofs..ofs + len].iter().enumerate() {
+            let k = k as u32;
+            cus[e.inst as usize].insert(cu);
+            span.entry((cu, e.inst))
+                .and_modify(|(lo, hi)| {
+                    *lo = (*lo).min(k);
+                    *hi = (*hi).max(k);
+                })
+                .or_insert((k, k));
+        }
+    }
+    Placement { cus, span }
+}
+
+/// Is edge `a -> b` ALREADY enforced by placement, with no gate needed?
+///
+/// A coarse counter gate demands that EVERY slice of `a` has finished. Per-CU
+/// program order can only ever deliver that when every slice of `a` sits on the
+/// one CU that runs `b`, ahead of it. Hence all three conditions:
+///
+///   * `a` occupies exactly ONE CU — otherwise a consumer on CU `c` learns
+///     nothing about `a`'s slices on the other CUs;
+///   * `b` occupies that SAME single CU — a slice of `b` anywhere else is
+///     unordered with respect to `a`;
+///   * `a`'s last entry precedes `b`'s first entry in that CU's window.
+///
+/// When this holds, deleting the gate cannot create overlap, because there was
+/// no concurrency to unlock: the two packets are consecutive work items in one
+/// workgroup's serial stream. This is the shape `mla.rs` mass-produces by
+/// putting every 1-workgroup packet on CU 0.
+fn placement_implied(p: &Placement, a: u32, b: u32) -> bool {
+    if p.cus[a as usize].len() != 1 || p.cus[a as usize] != p.cus[b as usize] {
+        return false;
+    }
+    let cu = *p.cus[a as usize].iter().next().unwrap();
+    match (p.span.get(&(cu, a)), p.span.get(&(cu, b))) {
+        (Some(&(_, a_hi)), Some(&(b_lo, _))) => a_hi < b_lo,
+        _ => false,
+    }
+}
+
+/// `GRAPHSTAT_PLACE=1` — the edge census that decides whether an edge-REMOVAL
+/// pass is worth writing.
+///
+/// Three populations, and only the third could ever pay:
+///   1. every gate edge;
+///   2. the transitively redundant ones (implied by a path of length ≥ 2);
+///   3. the redundant ones whose endpoints are NOT co-placed.
+///
+/// Read the result with the ceiling in mind: deleting cache maintenance
+/// outright (`PLOW_GATE_NOINV` / `PLOW_GATE_RELAXSIG`, real data races, so a
+/// hard bound) prices ALL genuine local gating at 0.098 ms/CU = 0.34% of the
+/// token. Nothing found here can exceed that.
+fn place_census(prog: &DevProg, s: &Stats) {
+    let p = placement(prog, s.n_ops);
+    let redundant: Vec<(u32, u32)> = s.edges.difference(&s.edges_tr).copied().collect();
+
+    let all_implied = s.edges.iter().filter(|&&(a, b)| placement_implied(&p, a, b)).count();
+    let (mut red_coplaced, mut red_free) = (Vec::new(), Vec::new());
+    for &(a, b) in &redundant {
+        if placement_implied(&p, a, b) {
+            red_coplaced.push((a, b));
+        } else {
+            red_free.push((a, b));
+        }
+    }
+
+    // What removing an edge is actually WORTH: one poll per consumer slice.
+    // It cannot buy overlap — transitive redundancy means the surviving path
+    // already blocks the consumer for at least as long — so the poll is the
+    // entire prize.
+    let polls_of = |es: &[(u32, u32)]| -> u64 {
+        es.iter().map(|&(_, b)| s.blocks[b as usize] as u64).sum()
+    };
+
+    let implied: Vec<(u32, u32)> =
+        s.edges.iter().copied().filter(|&(a, b)| placement_implied(&p, a, b)).collect();
+    debug_assert_eq!(implied.len(), all_implied);
+
+    println!("  placement census (per-CU streams, {} CUs):", prog.stream_ofs.len());
+    println!("    edges                              {:>8}", s.edges.len());
+    println!("    transitively redundant             {:>8}", redundant.len());
+    println!("    ... AND co-placed (cannot pay)     {:>8}", red_coplaced.len());
+    println!("    ... AND NOT co-placed (could pay)  {:>8}", red_free.len());
+    println!("    polls removable, redundant total   {:>8} of {}",
+             polls_of(&redundant), s.polls);
+    println!("    polls removable, not-co-placed     {:>8} of {}",
+             polls_of(&red_free), s.polls);
+    // A SECOND, DISJOINT removable population, and the one that matches the
+    // narrative: edges that are NOT transitively redundant — the DAG genuinely
+    // needs the ordering — but that placement already delivers for free. These
+    // are the `mla.rs` CU-0 chains. Deleting one is only sound if the placement
+    // is also frozen, which is a much stronger contract than the DAG-side
+    // theorem, for a much smaller prize.
+    println!("    edges implied by PLACEMENT alone   {:>8}  ({:.1}% of edges), polls {}",
+             all_implied,
+             100.0 * all_implied as f64 / s.edges.len().max(1) as f64,
+             polls_of(&implied));
+    println!("    ... of which also redundant        {:>8}", red_coplaced.len());
+
+    let show = |label: &str, es: &[(u32, u32)]| {
+        if es.is_empty() {
+            return;
+        }
+        println!("    {label}:");
+        for &(a, b) in es.iter().take(40) {
+            println!(
+                "      {a:>4} {:<18} cu={:<4} -> {b:>4} {:<18} cu={}",
+                op_name(prog.insts[a as usize].op),
+                p.cus[a as usize].len(),
+                op_name(prog.insts[b as usize].op),
+                p.cus[b as usize].len()
+            );
+        }
+        if es.len() > 40 {
+            println!("      ... {} more", es.len() - 40);
+        }
+    };
+    show("redundant AND NOT co-placed", &red_free);
+    if std::env::var("GRAPHSTAT_PLACE_ALL").ok().as_deref() == Some("1") {
+        show("redundant AND co-placed", &red_coplaced);
+        show("implied by placement alone", &implied);
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().expect("usage: graphstat <asset-dir|model.pkt> [T]");
@@ -218,6 +397,32 @@ fn main() {
             s.bumps,
             s.bumps_live
         );
+        if std::env::var("GRAPHSTAT_PLACE").ok().as_deref() == Some("1") {
+            place_census(prog, &s);
+        }
+        if std::env::var("GRAPHSTAT_CP").ok().as_deref() == Some("1") {
+            let (d, spine) = critical_path(s.n_ops, &s.edges);
+            println!("  critical path: {d} of {} packets ({:.1}%)", s.n_ops,
+                     100.0 * d as f64 / s.n_ops as f64);
+            let mut census: HashMap<String, u32> = HashMap::new();
+            for &o in &spine {
+                *census.entry(op_name(prog.insts[o as usize].op)).or_insert(0) += 1;
+            }
+            let mut c: Vec<_> = census.into_iter().collect();
+            c.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            println!("  spine census:");
+            for (name, n) in &c {
+                println!("    {name:<20} {n:>4}");
+            }
+            println!("  spine (idx op blocks):");
+            for &o in &spine {
+                println!(
+                    "    {o:>3} {:<20} blocks={}",
+                    op_name(prog.insts[o as usize].op),
+                    s.blocks[o as usize]
+                );
+            }
+        }
         if verbose {
             let redundant: Vec<_> =
                 s.edges.difference(&s.edges_tr).copied().collect();

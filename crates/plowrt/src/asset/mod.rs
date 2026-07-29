@@ -17,10 +17,18 @@ use crate::text::tokenizer::{load_tokenizer, Tokenize};
 use crate::{Result, RuntimeError};
 
 mod bucket;
-#[cfg(feature = "cuda")]
+// Gated on either vendor, not on `cuda`: the AMD engine binds the same weights
+// by the same names. Note this pulls no new dependency — the reader mmaps the
+// shards and parses the safetensors header itself, so it needs only `memmap2`,
+// which is unconditional.
+#[cfg(any(feature = "cuda", feature = "hsa"))]
 pub(crate) mod checkpoint;
 pub mod cubin;
 pub mod devblob;
+/// Megatron weight sharding. Gated with `checkpoint` — it is the rule for which
+/// slice of a checkpoint tensor a rank binds, and useless without one.
+#[cfg(any(feature = "cuda", feature = "hsa"))]
+pub mod shard;
 pub use bucket::{Bucket, BucketKey};
 
 /// One compiled model: its manifest, every shape bucket (keyed by

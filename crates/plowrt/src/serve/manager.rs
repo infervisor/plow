@@ -69,11 +69,17 @@ impl BlobPlan {
 
     /// Classify one blob tensor into the plan. Free-standing so it is
     /// unit-testable without a real blob.
+    ///
+    /// The weight test is `packet::names::is_checkpoint_weight` — the same predicate the two
+    /// loaders bind on, so the plan cannot disagree with what is actually uploaded. It used to be
+    /// a local `starts_with("model.") || starts_with("fp8/")`, which under-counted an untied
+    /// `lm_head.weight` (declared at the top level) and would have counted a wrapper-prefixed
+    /// tower (Kimi-K3's `language_model.model.…`) as zero weight bytes.
     fn add(&mut self, name: &str, bytes: u64) {
-        if name.starts_with("model.") || name.starts_with("fp8/") {
-            self.weights_bytes += bytes;
-        } else if name.starts_with("kv.") {
+        if name.starts_with("kv.") {
             self.kv_bytes += bytes;
+        } else if packet::names::is_checkpoint_weight(name) {
+            self.weights_bytes += bytes;
         } else {
             self.other_bytes += bytes;
         }
@@ -424,7 +430,10 @@ impl ModelManager {
             "planner: load measured"
         );
 
-        state.install_gpu_engine(m.slug.clone(), engine);
+        state.install_gpu_engine(
+            m.slug.clone(),
+            crate::serve::engine::ServeEngine::Cuda(engine),
+        );
         let mux = mux::spawn(m.slug.clone(), bundle, Arc::clone(&state), self.mux_cfg);
         state.install_mux(m.slug.clone(), mux);
         Ok(())
@@ -472,6 +481,46 @@ mod tests {
         assert_eq!(p.kv_bytes, 60);
         assert_eq!(p.other_bytes, 28);
         assert_eq!(p.tensor_total(), 238);
+    }
+
+    /// The VRAM plan must count as WEIGHTS exactly what the loaders will demand of the
+    /// checkpoint, and the loaders' predicate is `packet::names::is_checkpoint_weight`. The two
+    /// cases this test exists for both used to land in `other_bytes` while the AMD loader
+    /// uploaded them as weights — an under-count on the residency path, and on the CUDA loader a
+    /// zero fill:
+    ///
+    ///  * `lm_head.weight`, which devgen declares at the top level for an untied head;
+    ///  * a wrapper-prefixed tower (Kimi-K3 spells all 497 052 of its language-tower tensors
+    ///    `language_model.model.…`, and none of them starts with `model.`).
+    ///
+    /// Asserted through the shared predicate rather than by re-spelling it, because a re-spelt
+    /// copy is precisely how the five sites diverged in the first place.
+    #[test]
+    fn the_plan_counts_the_same_weights_the_loaders_bind() {
+        let mut p = BlobPlan { weights_bytes: 0, kv_bytes: 0, other_bytes: 0 };
+        let weights = [
+            "lm_head.weight",
+            "language_model.model.layers.3.self_attn.kv_a_proj_with_mqa.weight",
+            "language_model.lm_head.weight",
+            "model.layers.0.mlp.down_proj.weight",
+            "fp8/model.layers.0.mlp.down_proj.weight_scale",
+        ];
+        for n in weights {
+            assert!(packet::names::is_checkpoint_weight(n), "{n} must bind from the checkpoint");
+            p.add(n, 10);
+        }
+        // Host-filled pointer tables live under the model prefix and are NOT weights — no
+        // checkpoint contains them, and counting them as weights is how the CUDA loader used to
+        // report `MISSING WEIGHT` for a GLM packet.
+        for n in ["model.layers.3.mlp.expert_weight_table", "moe.ewt.3"] {
+            assert!(!packet::names::is_checkpoint_weight(n), "{n}");
+            p.add(n, 7);
+        }
+        p.add("kv.3.krot", 5);
+        p.add("act.x", 3);
+        assert_eq!(p.weights_bytes, 10 * weights.len() as u64);
+        assert_eq!(p.kv_bytes, 5);
+        assert_eq!(p.other_bytes, 7 * 2 + 3);
     }
 
     #[test]

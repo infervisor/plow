@@ -75,6 +75,14 @@ pub const MI350X: GpuSpec = GpuSpec {
         kind: MemKind::Hbm3e,
         capacity: Bytes::gib(288),
         bandwidth: GBps(8000.0),
+        // 6200 GB/s MEASURED whole-GPU streaming read (`runtime/amd/op_gemm.h:38`), i.e. 77.5% of
+        // the 8000 GB/s datasheet peak above. The measured figure GOVERNS every reported floor:
+        // Gemma-4-31B bf16 streams 61.4 GB of weights per decode step, which is 9.90 ms at 6200
+        // and 7.68 ms at 8000 — and the isolated decode GEMV is measured at 95–103% of the 6200
+        // ceiling, so 6200 is where the hardware actually is, not a derate we chose. Reporting the
+        // 8000-based number claims 2.2 ms of headroom that does not exist.
+        // Inherited by MI355X below (`..MI350X`) — same die, same HBM.
+        bandwidth_measured: Some(GBps(6200.0)),
         bus_width_bits: 8192,
     },
     copy_engines: 4, // SDMA engines (approx.)

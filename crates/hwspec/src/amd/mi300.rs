@@ -60,6 +60,8 @@ pub const MI300X: GpuSpec = GpuSpec {
         kind: MemKind::Hbm3,
         capacity: Bytes::gib(192),
         bandwidth: GBps(5325.0),
+        // Not measured on this part; a reported bound falls back to the datasheet peak.
+        bandwidth_measured: None,
         bus_width_bits: 8192,
     },
     copy_engines: 4, // SDMA engines (approx.)
@@ -93,6 +95,8 @@ pub const MI325X: GpuSpec = GpuSpec {
         kind: MemKind::Hbm3e,
         capacity: Bytes::gib(256),
         bandwidth: GBps(6000.0),
+        // Not measured on this part; a reported bound falls back to the datasheet peak.
+        bandwidth_measured: None,
         bus_width_bits: 8192,
     },
     copy_engines: 4, // SDMA engines (approx.)

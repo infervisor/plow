@@ -16,12 +16,35 @@
 //! Same discipline as [`super::cuda`]: `libhsa-runtime64.so` is `dlopen`ed at
 //! runtime. A build with `--features hsa` runs on any box — if the driver is
 //! absent, probe fails gracefully and the CPU reference backend takes over.
+//!
+//! ## `unsafe` convention in this file
+//!
+//! Roughly 110 `unsafe` blocks here are one thing: **a call through a
+//! `dlsym`-resolved ROCr function pointer**. Their safety argument is identical
+//! and is made once, here, rather than restated per site:
+//!
+//! * every pointer is resolved once in [`Driver::load`] against the signature
+//!   transcribed from `hsa.h` / `hsa_ext_amd.h`, and a missing symbol fails the
+//!   load rather than yielding a null to call;
+//! * the handles passed (agent, queue, pool, signal, executable) are opaque
+//!   `u64`/pointer values the runtime itself produced and this backend owns for
+//!   its lifetime, and every out-parameter is a live local;
+//! * ROCr reports failure in the returned `hsa_status_t`, which each call site
+//!   checks — none of them rely on the call being infallible.
+//!
+//! A per-site `// SAFETY:` comment is therefore reserved for the blocks that do
+//! something OTHER than an FFI call — raw-pointer arithmetic into the AQL ring
+//! and the kernarg slab (`dispatch`), `write_bytes`/`write_unaligned` into
+//! device-visible memory, and the `Send`/`Sync` impls — because those carry an
+//! argument that is not shared with the rest of the file.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::device::{Backend, DeviceFree, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg, Module};
+use crate::device::{
+    Backend, DeviceFree, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg, Module, PeerMemory,
+};
 use crate::{Result, RuntimeError};
 
 // ─── HSA ABI constants ───────────────────────────────────────────────────────
@@ -36,7 +59,11 @@ const HSA_DEVICE_TYPE_GPU: u32 = 1;
 const HSA_AGENT_INFO_NAME: u32 = 0;
 const HSA_AGENT_INFO_DEVICE: u32 = 17;
 // AMD extension: CU count
-const HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: u32 = 0xA000;
+// hsa_amd_agent_info_t — CHIP_ID=0xA000, CACHELINE_SIZE=0xA001,
+// COMPUTE_UNIT_COUNT=0xA002. This was 0xA000, so `cu_count` held the PCI CHIP
+// ID: 30115 on gfx950 instead of 256. The engine sizes its cooperative grid
+// from `sm_count()`, so a persistent launch would have asked for 30115 blocks.
+const HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: u32 = 0xA002;
 
 // hsa_region_segment_t
 const HSA_REGION_SEGMENT_GROUP: u32 = 2;
@@ -51,6 +78,18 @@ const HSA_AMD_SEGMENT_GLOBAL: u32 = 0;
 // hsa_amd_memory_pool_info_t
 const HSA_AMD_MEMORY_POOL_INFO_SEGMENT: u32 = 0;
 const HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS: u32 = 1;
+/// Recommended physical-allocation granule for `hsa_amd_vmem_handle_create`
+/// (the ROCr analogue of `CU_MEM_ALLOC_GRANULARITY_RECOMMENDED`). The *required*
+/// granule is `..._RUNTIME_ALLOC_GRANULE = 6`; the recommended one is what
+/// keeps internal fragmentation down, so it is what [`VmmOps::granularity`]
+/// reports — same choice the CUDA path makes.
+const HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_REC_GRANULE: u32 = 18;
+
+// hsa_amd_memory_type_t — NONE = 0, PINNED = 1. Device-local physical backing.
+const HSA_AMD_MEMORY_TYPE_PINNED: u32 = 1;
+
+// hsa_access_permission_t
+const HSA_ACCESS_PERMISSION_RW: u32 = 3;
 
 // hsa_amd_memory_pool_global_flag_t
 const HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED: u32 = 1 << 1;
@@ -76,10 +115,18 @@ const HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS: u32 = 0;
 const HSA_FENCE_SCOPE_AGENT: u32 = 1;
 
 // hsa_signal_condition_t
-const HSA_SIGNAL_CONDITION_LT: u32 = 0;
+// hsa_signal_condition_t — values from hsa.h (EQ=0, NE=1, LT=2, GTE=3).
+// LT was 0 here, which is EQ: every completion wait therefore meant "block
+// until the signal equals 1", while a completion signal counts DOWN to 0. No
+// wait could ever be satisfied, so every copy through `upload`/`download`
+// hung forever. Nothing caught it because plowrt has no AMD engine yet, so
+// these paths had never run on hardware.
+const HSA_SIGNAL_CONDITION_LT: u32 = 2;
 
 // hsa_wait_state_t
-const HSA_WAIT_STATE_BLOCKED: u32 = 1;
+// hsa_wait_state_t — BLOCKED=0, ACTIVE=1. This was 1, i.e. the opposite of its
+// name: every wait busy-spun a core instead of yielding it.
+const HSA_WAIT_STATE_BLOCKED: u32 = 0;
 
 // hsa_profile_t
 const HSA_PROFILE_FULL: u32 = 1;
@@ -88,6 +135,7 @@ const HSA_PROFILE_FULL: u32 = 1;
 const HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT: u32 = 1;
 
 // hsa_executable_symbol_info_t
+const HSA_EXECUTABLE_SYMBOL_INFO_VARIABLE_ADDRESS: u32 = 21;
 const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT: u32 = 22;
 const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE: u32 = 11;
 const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE: u32 = 13;
@@ -113,7 +161,7 @@ struct HsaMemoryPool {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct HsaSignal {
+pub struct HsaSignal {
     handle: u64,
 }
 
@@ -121,6 +169,23 @@ struct HsaSignal {
 #[derive(Clone, Copy)]
 struct HsaRegion {
     handle: u64,
+}
+
+/// `hsa_amd_vmem_alloc_handle_t` — an opaque physical allocation, the ROCr
+/// counterpart of `CUmemGenericAllocationHandle`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HsaVmemHandle {
+    handle: u64,
+}
+
+/// `hsa_amd_memory_access_desc_t`. `{enum, hsa_agent_t}` — `repr(C)` pads the
+/// 4-byte enum to the agent's 8-byte alignment, matching the C layout.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HsaAmdMemoryAccessDesc {
+    permissions: u32,
+    agent_handle: HsaAgent,
 }
 
 #[repr(C)]
@@ -179,6 +244,23 @@ type AgentCb = unsafe extern "C" fn(HsaAgent, *mut c_void) -> HsaStatus;
 type PoolCb = unsafe extern "C" fn(HsaMemoryPool, *mut c_void) -> HsaStatus;
 type RegionCb = unsafe extern "C" fn(HsaRegion, *mut c_void) -> HsaStatus;
 
+/// ROCr's virtual-memory API (`hsa_amd_vmem_*`), resolved as a group because it
+/// is used as a group: it is what backs [`crate::memory::vmm::VmmOps`], and it
+/// arrived in ROCm 5.7. `None` on an older runtime — every other path still
+/// works, the VMM-backed KV pool just refuses to come up.
+struct VmemFns {
+    address_reserve_align:
+        unsafe extern "C" fn(*mut *mut c_void, usize, u64, u64, u64) -> HsaStatus,
+    address_free: unsafe extern "C" fn(*mut c_void, usize) -> HsaStatus,
+    handle_create:
+        unsafe extern "C" fn(HsaMemoryPool, usize, u32, u64, *mut HsaVmemHandle) -> HsaStatus,
+    handle_release: unsafe extern "C" fn(HsaVmemHandle) -> HsaStatus,
+    map: unsafe extern "C" fn(*mut c_void, usize, usize, HsaVmemHandle, u64) -> HsaStatus,
+    unmap: unsafe extern "C" fn(*mut c_void, usize) -> HsaStatus,
+    set_access:
+        unsafe extern "C" fn(*mut c_void, usize, *const HsaAmdMemoryAccessDesc, usize) -> HsaStatus,
+}
+
 macro_rules! hsa_fns {
     ($($name:ident : $sig:ty),* $(,)?) => {
         struct HsaDriver {
@@ -221,6 +303,9 @@ hsa_fns! {
     hsa_executable_destroy: unsafe extern "C" fn(HsaExecutable) -> HsaStatus,
     hsa_executable_get_symbol_by_name: unsafe extern "C" fn(HsaExecutable, *const u8, *const HsaAgent, *mut HsaExecutableSymbol) -> HsaStatus,
     hsa_executable_symbol_get_info: unsafe extern "C" fn(HsaExecutableSymbol, u32, *mut c_void) -> HsaStatus,
+    // Optional group — see `VmemFns`. Declared here so it lives in the same
+    // table; resolved by `open_vmem`, which tolerates absence.
+    vmem: Option<VmemFns>,
 }
 
 impl HsaDriver {
@@ -270,18 +355,56 @@ impl HsaDriver {
             hsa_executable_destroy: resolve!(lib, b"hsa_executable_destroy\0"),
             hsa_executable_get_symbol_by_name: resolve!(lib, b"hsa_executable_get_symbol_by_name\0"),
             hsa_executable_symbol_get_info: resolve!(lib, b"hsa_executable_symbol_get_info\0"),
+            vmem: Self::open_vmem(&lib),
             lib,
         };
         Ok(drv)
     }
+
+    /// Resolve the `hsa_amd_vmem_*` group, or `None` if any member is missing.
+    /// All-or-nothing on purpose: a half-resolved VMM surface would fail deep
+    /// inside the pool instead of at the one place that decides to use it.
+    fn open_vmem(lib: &libloading::Library) -> Option<VmemFns> {
+        macro_rules! sym {
+            ($name:expr) => {
+                *unsafe { lib.get($name) }.ok()?
+            };
+        }
+        Some(VmemFns {
+            address_reserve_align: sym!(b"hsa_amd_vmem_address_reserve_align\0"),
+            address_free: sym!(b"hsa_amd_vmem_address_free\0"),
+            handle_create: sym!(b"hsa_amd_vmem_handle_create\0"),
+            handle_release: sym!(b"hsa_amd_vmem_handle_release\0"),
+            map: sym!(b"hsa_amd_vmem_map\0"),
+            unmap: sym!(b"hsa_amd_vmem_unmap\0"),
+            set_access: sym!(b"hsa_amd_vmem_set_access\0"),
+        })
+    }
 }
 
 /// Internal resolved kernel metadata (mirrors `plow_hsa_kernel` in hsa_backend.h).
-struct HsaKernel {
+///
+/// `Copy` because [`crate::exec::device_api::EngineDevice::Function`] requires
+/// it: the engine copies a function handle out of `&mut self` before a launch
+/// so the launch does not hold a borrow of the struct that owns it. Four PODs,
+/// so this is free.
+#[derive(Clone, Copy)]
+pub struct HsaKernel {
     kernel_object: u64,
     kernarg_size: u32,
     group_segment_size: u32,
     private_segment_size: u32,
+}
+
+impl HsaKernel {
+    /// The object's whole kernarg segment: the explicit args PLUS the 256-byte
+    /// COv5 implicit tail. A caller that knows its own explicit args' size can
+    /// use this to reject an object built against a different `PlowProgram`,
+    /// which otherwise runs and faults — the implicit block lands at the
+    /// caller's `args_size`, not the object's.
+    pub fn kernarg_size(&self) -> u32 {
+        self.kernarg_size
+    }
 }
 
 // ─── Trampoline-based discovery ──────────────────────────────────────────────
@@ -398,6 +521,16 @@ pub struct HsaBackend {
     shared: Arc<SharedDriver>,
     pub device_ordinal: u8,
     agent: HsaAgent,
+    /// EVERY visible GPU agent, in ordinal order — not just this backend's.
+    ///
+    /// `hsa_amd_agents_allow_access` REPLACES a buffer's allowed-agent list, so
+    /// a peer buffer has to name all agents in ONE call; naming them one at a
+    /// time silently leaves only the last GPU mapped (the footgun
+    /// `plow_hsa_alloc_host` documents in `runtime/amd/hsa_backend.c`). Keeping
+    /// the whole table on every backend is what makes that single call possible
+    /// without a second enumeration pass, and it is what maps a peer *ordinal*
+    /// to the agent an SDMA copy must name.
+    agents: Vec<HsaAgent>,
     cpu_agent: HsaAgent,
     vram_pool: HsaMemoryPool,
     fine_pool: HsaMemoryPool,
@@ -412,6 +545,33 @@ pub struct HsaBackend {
     wave_width: u32,
     /// Monotonically increasing module ID.
     next_module_id: AtomicU64,
+    /// Reusable zero source + completion signal for [`PeerMemory::zero_peer`].
+    /// See `zero_peer` for why the per-token path cannot afford to build these
+    /// per call.
+    zero_stage: parking_lot::Mutex<Option<ZeroStage>>,
+    /// Did a peer allocation get the CPU agent onto its allow-list? See
+    /// [`PeerMemory::peer_host_writable`].
+    peer_host_writable: std::sync::atomic::AtomicBool,
+    /// Cached fill source for [`HsaBackend::memset_d8`]. HSA has no
+    /// queue-ordered fill, so a memset is a copy, and a copy needs a source.
+    fill_stage: parking_lot::Mutex<Option<FillStage>>,
+}
+
+/// Preallocated fill source: `len` bytes of fine-grained memory already set to
+/// `value`, reused until either changes.
+struct FillStage {
+    ptr: *mut c_void,
+    len: usize,
+    value: u8,
+}
+
+/// Preallocated zero source for counter resets: fine-grained (already
+/// agent-visible, so no `hsa_amd_memory_lock` per call) plus one signal reused
+/// across resets.
+struct ZeroStage {
+    ptr: *mut c_void,
+    len: usize,
+    sig: HsaSignal,
 }
 
 // SAFETY: all mutable state is either atomic or behind the AQL queue's own
@@ -459,6 +619,7 @@ impl HsaBackend {
             )));
         }
         let agent = acc.gpus[device_ordinal as usize];
+        let agents = acc.gpus.clone();
 
         // Query device name.
         let mut name_buf = [0u8; 64];
@@ -490,7 +651,31 @@ impl HsaBackend {
         let _ = unsafe {
             (drv.hsa_agent_iterate_regions)(agent, region_trampoline, &mut reg_acc as *mut _ as *mut c_void)
         };
-        let lds_bytes = reg_acc.lds_bytes;
+        // `hsa_agent_iterate_regions` does not enumerate a GROUP region on
+        // ROCm 7.2.4/gfx950 — regions are legacy, superseded by memory pools,
+        // and the group segment is not exposed as one. Measured live: the
+        // callback above never fires for SEGMENT_GROUP and `lds_bytes` stays 0,
+        // which would size the interpreter's LDS budget to nothing and make
+        // `set_max_dynamic_smem` reject every request.
+        //
+        // 64 KiB was wrong for gfx950 and would have rejected legitimate
+        // requests. MEASURED (`tests/hsa_engine.rs`): every production object —
+        // interp_prefill, interp_prefill_mla, interp_decode — declares
+        // **147,464 B (144 KiB)** of STATIC group segment, and dispatches and
+        // retires on this hardware at 512 threads. So a gfx950 workgroup may
+        // allocate at least 144 KiB, and the CU's 160 KiB is the real bound.
+        //
+        // (The 64 KiB figure is a CDNA3-era per-workgroup limit. It also got
+        // conflated with the CUDA engine's `SMEM_PF = 85,248 B`, which is a
+        // *dynamic* budget opted into with `cuFuncSetAttribute` and has no
+        // bearing here: the AMD interpreter's arena is `__shared__ plow_smem sm`,
+        // static, and every dispatch passes `dynamic_lds = 0`.)
+        const CDNA_WORKGROUP_LDS_MAX: u32 = 160 * 1024;
+        let lds_bytes = if reg_acc.lds_bytes > 0 {
+            reg_acc.lds_bytes
+        } else {
+            CDNA_WORKGROUP_LDS_MAX
+        };
 
         // Find coarse-grained VRAM pool on this GPU.
         let vram_pool = Self::find_pool(&drv, agent, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED)?;
@@ -568,6 +753,7 @@ impl HsaBackend {
             shared,
             device_ordinal,
             agent,
+            agents,
             cpu_agent,
             vram_pool,
             fine_pool,
@@ -580,6 +766,9 @@ impl HsaBackend {
             lds_bytes,
             wave_width,
             next_module_id: AtomicU64::new(1),
+            zero_stage: parking_lot::Mutex::new(None),
+            peer_host_writable: std::sync::atomic::AtomicBool::new(false),
+            fill_stage: parking_lot::Mutex::new(None),
         })
     }
 
@@ -609,6 +798,15 @@ impl HsaBackend {
 
 impl Drop for HsaBackend {
     fn drop(&mut self) {
+        if let Some(fs) = self.fill_stage.lock().take() {
+            unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(fs.ptr) };
+        }
+        if let Some(z) = self.zero_stage.lock().take() {
+            unsafe {
+                (self.shared.drv.hsa_amd_memory_pool_free)(z.ptr);
+                (self.shared.drv.hsa_signal_destroy)(z.sig);
+            }
+        }
         unsafe {
             if !self.karg_ring.is_null() {
                 (self.shared.drv.hsa_amd_memory_pool_free)(self.karg_ring as *mut c_void);
@@ -869,6 +1067,10 @@ impl Backend for HsaBackend {
         self.dispatch(&kernel, grid_x, 1, 1, wg_x, 1, 1, 0, std::ptr::null(), 0)
     }
 
+    fn peer(&self) -> Option<&dyn PeerMemory> {
+        Some(self)
+    }
+
     fn alloc_counter_region(&self, count: usize) -> Result<DeviceMem> {
         // Counter region lives in fine-grained system memory (host-visible AND
         // device-accessible) so both SM/CU atomics and host polls hit the same cells.
@@ -908,7 +1110,464 @@ impl Backend for HsaBackend {
     }
 }
 
+// ─── EngineDevice — the serving engine's device surface ─────────────────────
+
+impl crate::exec::device_api::PinnedBuf for HsaPinned {
+    fn as_slice(&self) -> &[u8] {
+        HsaPinned::as_slice(self)
+    }
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        HsaPinned::as_mut_slice(self)
+    }
+    fn len(&self) -> usize {
+        HsaPinned::len(self)
+    }
+}
+
+impl crate::exec::device_api::EngineDevice for HsaBackend {
+    type Stream = HsaStream;
+    type Event = HsaEvent;
+    type Pinned = HsaPinned;
+    type Function = HsaKernel;
+
+    fn device_name(&self) -> &str {
+        HsaBackend::device_name(self)
+    }
+
+    /// The agent name IS the ISA key on AMD: `hsa_agent_get_info(NAME)` returns
+    /// `gfx950`, which is exactly what selects a code object and its kernel
+    /// symbols (`plow_interp_gfx950`).
+    fn arch(&self) -> String {
+        self.device_name.clone()
+    }
+
+    fn sm_count(&self) -> u32 {
+        HsaBackend::sm_count(self)
+    }
+
+    fn alloc(&self, bytes: u64) -> Result<DeviceMem> {
+        Backend::alloc(self, 0, bytes)
+    }
+
+    fn upload(&self, dst: &DeviceMem, off: u64, src: &[u8]) -> Result<()> {
+        Backend::upload(self, dst, off, src)
+    }
+
+    fn download(&self, src: &DeviceMem, off: u64, dst: &mut [u8]) -> Result<()> {
+        Backend::download(self, src, off, dst)
+    }
+
+    fn memcpy_htod(&self, dptr: u64, src: &[u8]) -> Result<()> {
+        HsaBackend::memcpy_htod(self, dptr, src)
+    }
+
+    fn memcpy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
+        HsaBackend::memcpy_dtod(self, dst, src, bytes)
+    }
+
+    fn host_alloc_pinned(&self, bytes: usize) -> Result<HsaPinned> {
+        HsaBackend::host_alloc_pinned(self, bytes)
+    }
+
+    fn memset_d8(&self, dptr: u64, value: u8, n: usize) -> Result<()> {
+        HsaBackend::memset_d8(self, dptr, value, n)
+    }
+
+    fn memset_d8_async(&self, dptr: u64, value: u8, n: usize, _s: &HsaStream) -> Result<()> {
+        // Blocking, not queue-ordered — see the trait note. The AQL queue has
+        // no fill packet, so "async" here would be a lie the engine would then
+        // build a dependency on.
+        HsaBackend::memset_d8(self, dptr, value, n)
+    }
+
+    unsafe fn memcpy_htod_async(&self, dptr: u64, src: &[u8], s: &HsaStream) -> Result<()> {
+        unsafe { HsaBackend::memcpy_htod_async(self, dptr, src, s) }
+    }
+
+    unsafe fn memcpy_dtoh_async(&self, dst: &mut [u8], dptr: u64, s: &HsaStream) -> Result<()> {
+        unsafe { HsaBackend::memcpy_dtoh_async(self, dst, dptr, s) }
+    }
+
+    fn stream_create(&self) -> Result<HsaStream> {
+        HsaBackend::stream_create(self)
+    }
+
+    fn stream_synchronize(&self, s: &HsaStream) -> Result<()> {
+        HsaBackend::stream_synchronize(self, s)
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        HsaBackend::synchronize(self)
+    }
+
+    fn event_create(&self, timing: bool) -> Result<HsaEvent> {
+        HsaBackend::event_create(self, timing)
+    }
+
+    fn event_record(&self, e: &HsaEvent, s: &HsaStream) -> Result<()> {
+        HsaBackend::event_record(self, e, s)
+    }
+
+    fn event_synchronize(&self, e: &HsaEvent) -> Result<()> {
+        HsaBackend::event_synchronize(self, e)
+    }
+
+    fn event_elapsed_ms(&self, a: &HsaEvent, b: &HsaEvent) -> Result<f32> {
+        HsaBackend::event_elapsed_ms(self, a, b)
+    }
+
+    fn module_load(&self, image: &[u8]) -> Result<Module> {
+        Backend::module_load(self, image)
+    }
+
+    fn module_unload(&self, m: &Module) -> Result<()> {
+        HsaBackend::module_unload(self, m)
+    }
+
+    fn get_function(&self, m: &Module, name: &str) -> Result<HsaKernel> {
+        HsaBackend::get_function(self, m, name)
+    }
+
+    fn module_global_zero(&self, m: &Module, name: &str, n: usize) -> Result<bool> {
+        HsaBackend::module_global_zero(self, m, name, n)
+    }
+
+    fn module_global_u32(&self, m: &Module, name: &str) -> Result<Option<u32>> {
+        HsaBackend::module_global_u32(self, m, name)
+    }
+
+    fn module_global_bytes(
+        &self,
+        m: &Module,
+        name: &str,
+        max: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        HsaBackend::module_global_bytes(self, m, name, max, out)
+    }
+
+    fn set_max_dynamic_smem(&self, f: HsaKernel, bytes: u32) -> Result<()> {
+        HsaBackend::set_max_dynamic_smem(self, &f, bytes)
+    }
+
+    /// Always 1 — and that is a statement about the design, not a stub.
+    ///
+    /// The persistent interpreter IS one workgroup per CU: it is launched with
+    /// `grid == n_cu` and stays resident for the model's life. There is nothing
+    /// for a second co-resident block to be. What NVIDIA gets from
+    /// `cuOccupancyMaxActiveBlocksPerMultiprocessor` is not the number but the
+    /// GATE — `cuLaunchCooperativeKernel` refuses a grid that cannot be
+    /// co-resident, converting a counter deadlock into a launch error.
+    ///
+    /// HSA has no such refusal, so on this path co-residency is enforced at
+    /// BUILD time instead: the interpreter carries
+    /// `__launch_bounds__(PLOW_THREADS, PLOW_WAVES/4)` and
+    /// `amdgpu_waves_per_eu`, and without them the register allocator takes 128
+    /// AGPRs, arch+acc maxima sum past the limit, and the dispatch is rejected
+    /// with `HSA_STATUS_ERROR_INVALID_ISA`. So a register-overcommitted object
+    /// fails loudly at dispatch rather than deadlocking — a different mechanism
+    /// reaching the same guarantee. If a launch here ever returns INVALID_ISA,
+    /// look at the code object's register count, not at this function.
+    fn occupancy_blocks_per_sm(&self, _f: HsaKernel, _block: u32, _smem: usize) -> Result<u32> {
+        Ok(1)
+    }
+
+    fn launch_cooperative(
+        &self,
+        f: HsaKernel,
+        grid: u32,
+        block: u32,
+        smem_bytes: u32,
+        args: &[u8],
+        _stream: Option<&HsaStream>,
+    ) -> Result<()> {
+        // There is one AQL queue and every packet carries the barrier bit, so
+        // the queue IS the stream; `Some(stream)` and `None` are the same
+        // ordering here. Co-residency is not requested at dispatch (see
+        // `occupancy_blocks_per_sm`) — the object was built for it.
+        self.launch(f, grid, block, smem_bytes, args)
+    }
+
+    fn launch_kernel(
+        &self,
+        f: HsaKernel,
+        grid: u32,
+        block: u32,
+        smem_bytes: u32,
+        args: &[u8],
+        _stream: Option<&HsaStream>,
+    ) -> Result<()> {
+        self.launch(f, grid, block, smem_bytes, args)
+    }
+}
+
+// ─── Peer memory (multi-GPU) ────────────────────────────────────────────────
+
+impl PeerMemory for HsaBackend {
+    fn ordinal(&self) -> u8 {
+        self.device_ordinal
+    }
+
+    fn peer_agent_count(&self) -> u32 {
+        self.agents.len() as u32
+    }
+
+    /// Set by the first successful `alloc_peer` that got the CPU agent onto the
+    /// allow-list. Reads false before any peer allocation, which is the honest
+    /// answer: nothing is host-mapped yet.
+    fn peer_host_writable(&self) -> bool {
+        self.peer_host_writable.load(Ordering::Relaxed)
+    }
+
+    fn alloc_peer(&self, bytes: u64, peers: &[u8]) -> Result<DeviceMem> {
+        // Resolve the allow-list BEFORE allocating: a bad ordinal here would
+        // otherwise leak a VRAM allocation on the error path.
+        if !peers.contains(&self.device_ordinal) {
+            return Err(RuntimeError::Device(format!(
+                "peer allow-list {peers:?} omits the owner (dev {}) — coarse-grained \
+                 VRAM is not even self-accessible until the owner is on the list",
+                self.device_ordinal
+            )));
+        }
+        let mut allow: Vec<HsaAgent> = Vec::with_capacity(peers.len());
+        for &p in peers {
+            allow.push(*self.agents.get(p as usize).ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "peer ordinal {p} >= {} GPU agents",
+                    self.agents.len()
+                ))
+            })?);
+        }
+
+        // COARSE-grained VRAM, exactly as an ordinary weight/activation
+        // allocation: fine-grained would put the partials on the slow
+        // host-coherent path, and the whole point is that a peer store runs at
+        // the ~58 GB/s XGMI wire rate.
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_pool_allocate)(
+                self.vram_pool,
+                bytes as usize,
+                0,
+                &mut ptr,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!(
+                "peer alloc ({bytes} bytes on dev {}): {rc}",
+                self.device_ordinal
+            )));
+        }
+
+        // ONE call naming EVERY agent in the replica. This REPLACES the
+        // allowed-agent list, so a loop would leave only the last GPU mapped
+        // and every other rank would fault on first peer touch. Naming only
+        // the replica's agents is also what keeps two TP4 replicas on one node
+        // from being able to reach into each other's partials.
+        //
+        // The CPU agent is named FIRST, then dropped on failure. Its presence
+        // is what makes host stores into this region defined rather than a
+        // large-BAR accident, and those stores are the 50×-cheaper counter
+        // reset (0.32 µs vs 16.8 µs for 12 KiB, measured). A small-BAR box
+        // rejects it, so the GPU-only list is retried and
+        // `peer_host_writable()` stays false.
+        let mut with_cpu = allow.clone();
+        with_cpu.push(self.cpu_agent);
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_agents_allow_access)(
+                with_cpu.len() as u32,
+                with_cpu.as_ptr(),
+                std::ptr::null(),
+                ptr,
+            )
+        };
+        let rc = if rc == HSA_STATUS_SUCCESS {
+            self.peer_host_writable.store(true, Ordering::Relaxed);
+            rc
+        } else {
+            unsafe {
+                (self.shared.drv.hsa_amd_agents_allow_access)(
+                    allow.len() as u32,
+                    allow.as_ptr(),
+                    std::ptr::null(),
+                    ptr,
+                )
+            }
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_agents_allow_access({} agents, peer buffer): {rc}",
+                allow.len()
+            )));
+        }
+
+        let free = Arc::new(HsaFree {
+            shared: self.shared.clone(),
+        });
+        Ok(DeviceMem::owned(ptr as u64, bytes, free))
+    }
+
+    /// Zero device memory from a cached fine-grained source.
+    ///
+    /// The generic `upload` path pins the source pages with
+    /// `hsa_amd_memory_lock` and creates + destroys a completion signal on
+    /// EVERY call. That is fine at bring-up and far too expensive per token:
+    /// measured at TP=4 with 12 KiB of counters per rank, `upload` cost
+    /// **36.0 µs/token** — more than the ~29 µs that all 96 of the token's
+    /// inline all-reduces cost put together (0.302 µs each, measured). Reusing
+    /// a fine-grained (already agent-visible, unlockable) zero buffer and one
+    /// signal removes both per-call costs.
+    fn zero_peer(&self, dptr: u64, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut guard = self.zero_stage.lock();
+        if guard.as_ref().is_none_or(|s| (s.len as u64) < bytes) {
+            if let Some(old) = guard.take() {
+                unsafe {
+                    (self.shared.drv.hsa_amd_memory_pool_free)(old.ptr);
+                    (self.shared.drv.hsa_signal_destroy)(old.sig);
+                }
+            }
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            let rc = unsafe {
+                (self.shared.drv.hsa_amd_memory_pool_allocate)(
+                    self.fine_pool,
+                    bytes as usize,
+                    0,
+                    &mut ptr,
+                )
+            };
+            if rc != HSA_STATUS_SUCCESS {
+                return Err(RuntimeError::Device(format!("zero stage alloc: {rc}")));
+            }
+            let rc = unsafe {
+                (self.shared.drv.hsa_amd_agents_allow_access)(
+                    1,
+                    &self.agent,
+                    std::ptr::null(),
+                    ptr,
+                )
+            };
+            if rc != HSA_STATUS_SUCCESS {
+                unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
+                return Err(RuntimeError::Device(format!("zero stage access: {rc}")));
+            }
+            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, bytes as usize) };
+            let mut sig = HsaSignal { handle: 0 };
+            let rc =
+                unsafe { (self.shared.drv.hsa_signal_create)(0, 0, std::ptr::null(), &mut sig) };
+            if rc != HSA_STATUS_SUCCESS {
+                unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
+                return Err(RuntimeError::Device(format!("zero stage signal: {rc}")));
+            }
+            *guard = Some(ZeroStage {
+                ptr,
+                len: bytes as usize,
+                sig,
+            });
+        }
+        let stage = guard.as_ref().expect("just populated");
+
+        // Re-arm the reused signal. It counts DOWN to 0 on completion, so the
+        // wait below is LT 1 — the constant that was wrong (EQ) and hung every
+        // copy in this file until it was fixed.
+        unsafe { (self.shared.drv.hsa_signal_store_screlease)(stage.sig, 1) };
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_async_copy)(
+                dptr as *mut c_void,
+                self.agent,
+                stage.ptr as *const c_void,
+                self.cpu_agent,
+                bytes as usize,
+                0,
+                std::ptr::null(),
+                stage.sig,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!(
+                "zero_peer async_copy ({bytes} B on dev {}): {rc}",
+                self.device_ordinal
+            )));
+        }
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                stage.sig,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_BLOCKED,
+            );
+        }
+        Ok(())
+    }
+
+    fn copy_peer_blocking(&self, dst_ordinal: u8, dst: u64, src: u64, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let dst_agent = *self.agents.get(dst_ordinal as usize).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "peer ordinal {dst_ordinal} >= {} GPU agents",
+                self.agents.len()
+            ))
+        })?;
+
+        let mut sig = HsaSignal { handle: 0 };
+        let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!("hsa_signal_create (p2p): {rc}")));
+        }
+        // The two agents name the transfer's endpoints; the SDMA engine walks
+        // XGMI directly with no host bounce.
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_async_copy)(
+                dst as *mut c_void,
+                dst_agent,
+                src as *const c_void,
+                self.agent,
+                bytes as usize,
+                0,
+                std::ptr::null(),
+                sig,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_memory_async_copy (dev {} -> dev {dst_ordinal}): {rc}",
+                self.device_ordinal
+            )));
+        }
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                sig,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_BLOCKED,
+            );
+            (self.shared.drv.hsa_signal_destroy)(sig);
+        }
+        Ok(())
+    }
+}
+
 impl HsaBackend {
+    /// Number of GPU agents ROCr made visible to this process.
+    ///
+    /// This is the real device count, so multi-GPU bring-up enumerates instead
+    /// of probing ordinals until one fails. Note that the visible set is
+    /// selected by **`ROCR_VISIBLE_DEVICES`**, not `HIP_VISIBLE_DEVICES`:
+    /// plowrt talks to ROCr directly and never loads the HIP runtime, so the
+    /// HIP variable is ignored (measured — `HIP_VISIBLE_DEVICES=4,5,6,7` still
+    /// enumerated all 8 agents).
+    pub fn gpu_count(&self) -> u32 {
+        self.agents.len() as u32
+    }
+
     fn resolve_kernel(&self, exe: HsaExecutable, name: &str) -> Result<HsaKernel> {
         // The loader exposes kernels under "<name>.kd".
         let sym_name = format!("{}.kd\0", name);
@@ -955,6 +1614,25 @@ impl HsaBackend {
             );
         }
 
+        // THE INVARIANT `dispatch` ALREADY CLAIMED. Its SAFETY comment asserted that
+        // "`kernarg_size <= KARG_SLOT` is checked when the kernel is resolved" — and nothing
+        // checked it. `runtime/amd/hsa_backend.c:345` does; the Rust port dropped it.
+        //
+        // Without it the zero-fill and the COv5 implicit block are written for `kernarg_size`
+        // bytes into a `KARG_SLOT`-byte slot of a RING, so an oversized kernarg segment does not
+        // fault — it silently overwrites the next slot, whose dispatch may already be enqueued.
+        // The ring is synchronised against reuse of the SAME slot, not against a write that runs
+        // off the end of one, so the corruption lands in another kernel's arguments.
+        if kernarg_size as usize > KARG_SLOT {
+            return Err(RuntimeError::Device(format!(
+                "kernel kernarg segment is {kernarg_size} bytes, larger than the {KARG_SLOT}-byte \
+                 kernarg ring slot it has to fit in. Writing it would run past this slot and \
+                 corrupt the arguments of the next dispatch in the ring rather than faulting. \
+                 Raise KARG_SLOT (crates/plowrt/src/device/hsa.rs) to at least {kernarg_size} and \
+                 keep it in step with runtime/amd/hsa_backend.c."
+            )));
+        }
+
         Ok(HsaKernel {
             kernel_object,
             kernarg_size,
@@ -976,6 +1654,22 @@ impl HsaBackend {
         args: *const c_void,
         args_size: usize,
     ) -> Result<()> {
+        // ARGS MUST FIT THE SEGMENT. `runtime/amd/hsa_backend.c:368` checks this; the Rust port
+        // did not, and the arithmetic below is UNSIGNED: `kernarg_size - args_size` with
+        // `args_size` the larger underflows to ~2^64 and `write_bytes` runs off the ring.
+        //
+        // `launch` is `pub` and forwards an arbitrary `args.len()` straight through, so this is
+        // reachable from any caller that hands over a slice wider than the kernel declared —
+        // today's in-tree callers pass a 144-byte `DevProgram` against objects validated to
+        // report at least that, which is why it has never fired.
+        if args_size > kernel.kernarg_size as usize {
+            return Err(RuntimeError::Device(format!(
+                "dispatch args are {args_size} bytes but the kernel declares a \
+                 {}-byte kernarg segment. Copying them would overrun the kernarg ring slot; the \
+                 tail zero-fill length would underflow to a near-2^64 count.",
+                kernel.kernarg_size
+            )));
+        }
         let q = self.queue;
         let idx = unsafe { (self.shared.drv.hsa_queue_add_write_index_screlease)(q, 1) };
 
@@ -986,24 +1680,43 @@ impl HsaBackend {
         {}
 
         let slot = (idx & (size - 1)) as u32;
+        // SAFETY: `size` is the queue's power-of-two capacity, so `slot` is in
+        // `0..size` and the kernarg ring was allocated as `size * KARG_SLOT`
+        // bytes — the offset is in bounds by construction. The spin above
+        // guarantees the previous user of this slot has retired.
         let karg = unsafe { self.karg_ring.add(slot as usize * KARG_SLOT) };
 
         // Copy explicit args.
         if args_size > 0 && !args.is_null() {
+            // SAFETY: the caller's contract is that `args` points at
+            // `args_size` readable bytes; `kernarg_size <= KARG_SLOT` is checked
+            // in `resolve_kernel` and `args_size <= kernarg_size` at the top of
+            // this function — so both the copy and the zero-fill of the tail stay
+            // inside this slot and the fill length cannot underflow. The two
+            // ranges are disjoint (the fill starts at `args_size`), which is what
+            // `copy_nonoverlapping` requires.
             unsafe {
                 std::ptr::copy_nonoverlapping(args as *const u8, karg, args_size);
                 std::ptr::write_bytes(karg.add(args_size), 0, kernel.kernarg_size as usize - args_size);
             }
         } else {
+            // SAFETY: as above — `kernarg_size <= KARG_SLOT` bytes of this slot.
             unsafe { std::ptr::write_bytes(karg, 0, kernel.kernarg_size as usize); }
         }
 
         // Fill COv5 implicit block (blockDim, gridDim, remainders).
         let hoff = (args_size + 7) & !7;
         if (kernel.kernarg_size as usize) > hoff {
+            // SAFETY: guarded by `kernarg_size > hoff` immediately above, so
+            // the COv5 implicit block starts inside the slot.
             let hid = unsafe { karg.add(hoff) };
             let avail = kernel.kernarg_size as usize - hoff;
             let dims: u16 = if grid_z > 1 { 3 } else if grid_y > 1 { 2 } else { 1 };
+            // SAFETY (both macros): the `avail >= off + width` guard is the
+            // bounds check — a field is written only when the object's declared
+            // kernarg segment actually reaches it, which is why an object built
+            // without the implicit block is not corrupted here. `write_unaligned`
+            // because `hoff` is only 8-byte aligned and the u16 fields are not.
             macro_rules! put32 { ($off:expr, $val:expr) => {
                 if avail >= $off + 4 { unsafe { std::ptr::write_unaligned(hid.add($off) as *mut u32, $val); } }
             }}
@@ -1023,6 +1736,13 @@ impl HsaBackend {
         }
 
         // Write the AQL dispatch packet (everything except the header).
+        // SAFETY: `q` is the queue this backend created and holds for its
+        // lifetime; its `base_address` is a ring of `size` 64-byte AQL packets,
+        // and `slot < size`, so the packet is in bounds. `HsaDispatchPacket` is
+        // the `#[repr(C)]` transcription of `hsa_kernel_dispatch_packet_t` and
+        // the ring is 64-byte aligned, so the cast is well-aligned. The header
+        // is deliberately left for the release-store below: until it is
+        // written the packet processor will not read this slot.
         let pkt_base = unsafe { (*q).base_address as *mut u8 };
         let pkt = unsafe { pkt_base.add(slot as usize * 64) as *mut HsaDispatchPacket };
         unsafe {
@@ -1064,5 +1784,893 @@ impl HsaBackend {
         }
 
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Engine primitives — the surface `exec::gpu` needs beyond the `Backend` trait.
+//
+// `exec::gpu` was written against `CudaBackend` concrete types (streams, events,
+// pinned host memory). These are the HSA counterparts, named to line up 1:1 so
+// the engine can be made generic over both without the call sites moving.
+//
+// Three impedance mismatches are resolved here, and each one is a deliberate
+// choice rather than an oversight:
+//
+//   STREAMS. CUDA has N ordered streams per context; an HSA backend has ONE AQL
+//   queue, and every packet on it already carries the barrier bit (see
+//   `dispatch`), so the queue IS an ordered stream. `HsaStream` is therefore a
+//   handle onto that single queue, not a new one. The engine's own doc comment
+//   says it uses exactly one stream by design (decode and prefill share mutable
+//   run state), so this loses nothing it was using.
+//
+//   EVENTS. A CUDA event is a device-side timestamp recorded in stream order.
+//   HSA's equivalent is a completion signal, which answers "has it finished?"
+//   but not "when?" without per-queue profiling enabled. The engine uses events
+//   for two different jobs, and only one of them needs a clock:
+//     * gating pinned-buffer reuse in `UploadPipe` — pure ordering, and the
+//       signal does that exactly;
+//     * step timing — reported, not load-bearing.
+//   So `HsaEvent` carries a signal for ordering and a HOST timestamp taken when
+//   the signal resolves. Elapsed time is therefore host-side and includes wait
+//   wakeup latency. That is honest for reporting and wrong for microbenchmarks;
+//   `runtime/` has dedicated harnesses for the latter.
+//
+//   DYNAMIC LDS. CUDA needs an explicit opt-in above 48 KiB
+//   (`cuFuncSetAttribute`); HSA carries `group_segment_size` in the dispatch
+//   packet itself, so the opt-in has no counterpart and `set_max_dynamic_smem`
+//   is a checked no-op rather than a silent one.
+// ---------------------------------------------------------------------------
+
+/// Page-locked, device-visible host memory: the HSA counterpart of
+/// `CudaBackend::host_alloc_pinned`.
+///
+/// Allocated from the FINE-grained global pool rather than pinned with
+/// `hsa_amd_memory_lock`. Both are agent-accessible, but fine-grained pool
+/// memory is coherent without an explicit release fence, which is what the
+/// engine's staging slabs want: the host writes `ids/pos/kvlen` and the very
+/// next packet reads them.
+pub struct HsaPinned {
+    ptr: *mut u8,
+    len: usize,
+    shared: Arc<SharedDriver>,
+}
+
+// SAFETY: fine-grained pool memory is ordinary host-addressable memory; the
+// pool handle is process-global and freed through the retained driver.
+unsafe impl Send for HsaPinned {}
+unsafe impl Sync for HsaPinned {}
+
+impl HsaPinned {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` is a live allocation of `len` bytes owned by `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` excludes any other alias.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for HsaPinned {
+    fn drop(&mut self) {
+        unsafe {
+            (self.shared.drv.hsa_amd_memory_pool_free)(self.ptr as *mut c_void);
+        }
+    }
+}
+
+/// A handle onto the backend's single ordered AQL queue. See the module note:
+/// this does not create a queue, because there is only ever one to order
+/// against.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HsaStream;
+
+/// Completion signal + the host time at which it resolved. See the module note
+/// on why the timestamp is host-side.
+pub struct HsaEvent {
+    sig: HsaSignal,
+    /// Host time captured when this event's signal was observed complete.
+    /// `None` until the event has been waited on.
+    ///
+    /// A `Mutex`, not a `Cell`: `HsaEvent` carries `unsafe impl Sync` below, and `Cell<T>` is
+    /// `!Sync` precisely because `&Cell` handed to two threads is a data race. The justification
+    /// that used to sit on that impl — "only touched under `&mut`/owning access in the engine
+    /// thread model" — is a claim about today's CALLERS, and `Sync` is what allows `&HsaEvent` to
+    /// reach a second thread in the first place, so it could not be discharged that way. This is
+    /// a cold path (one lock per `event_record` / `event_elapsed_ms`, not per op), so the lock
+    /// costs nothing measurable and the type carries the guarantee instead of a comment.
+    at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Timing events carry a clock; sync-only events skip it (cheaper record,
+    /// matching the `event_create(timing: bool)` contract on the CUDA side).
+    timing: bool,
+    shared: Arc<SharedDriver>,
+}
+
+// SAFETY: the only field that is not already `Send + Sync` is `sig`, an opaque HSA signal
+// handle, and HSA documents signals as safe to store/wait on from any thread. The timestamp is a
+// `Mutex`, so it carries its own synchronisation rather than relying on a claim about callers.
+unsafe impl Send for HsaEvent {}
+unsafe impl Sync for HsaEvent {}
+
+impl HsaEvent {
+    /// The raw signal, for attaching to an async copy or dispatch.
+    pub fn signal(&self) -> HsaSignal {
+        self.sig
+    }
+}
+
+impl Drop for HsaEvent {
+    fn drop(&mut self) {
+        unsafe {
+            (self.shared.drv.hsa_signal_destroy)(self.sig);
+        }
+    }
+}
+
+impl HsaBackend {
+    /// Executor (CU) count — the AMD counterpart of `sm_count`.
+    pub fn sm_count(&self) -> u32 {
+        self.cu_count
+    }
+
+    /// Wavefront width (64 on CDNA). The engine sizes workgroups in waves.
+    pub fn wave_width(&self) -> u32 {
+        self.wave_width
+    }
+
+    /// Per-CU LDS budget in bytes.
+    pub fn lds_bytes(&self) -> u32 {
+        self.lds_bytes
+    }
+
+    /// The single ordered queue, as a stream handle.
+    pub fn stream_create(&self) -> Result<HsaStream> {
+        Ok(HsaStream)
+    }
+
+    /// Drain the queue. Every packet carries the barrier bit, so waiting for
+    /// the read index to catch the write index retires everything enqueued.
+    pub fn stream_synchronize(&self, _stream: &HsaStream) -> Result<()> {
+        self.synchronize()
+    }
+
+    /// Drain the queue (device-wide; there is one queue).
+    pub fn synchronize(&self) -> Result<()> {
+        let q = self.queue;
+        // The write index is the total number of packets ever enqueued; the
+        // read index is how many the packet processor has retired. Equality
+        // means the queue is drained. This spins rather than blocking on a
+        // signal because the engine calls it once per step, after work it just
+        // enqueued, so the expected wait is short and a signal round-trip
+        // would cost more than the spin.
+        loop {
+            let w = unsafe { (self.shared.drv.hsa_queue_add_write_index_screlease)(q, 0) };
+            let r = unsafe { (self.shared.drv.hsa_queue_load_read_index_scacquire)(q) };
+            if r >= w {
+                return Ok(());
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Create an event. `timing` selects whether the event carries a clock.
+    pub fn event_create(&self, timing: bool) -> Result<HsaEvent> {
+        let mut sig = HsaSignal { handle: 0 };
+        let rc =
+            unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!("hsa_signal_create (event): {rc}")));
+        }
+        Ok(HsaEvent {
+            sig,
+            at: std::sync::Mutex::new(None),
+            timing,
+            shared: self.shared.clone(),
+        })
+    }
+
+    /// Record `event` at the current queue tail.
+    ///
+    /// HSA has no "record a marker" packet — a signal is armed only by being
+    /// attached to a real packet as its completion signal. That matters less
+    /// than it looks here, because **this backend's copies are synchronous**:
+    /// `upload`/`download` each attach their own one-shot signal and wait on it
+    /// before returning, so everything the engine could have enqueued before a
+    /// record has already retired by the time `event_record` is called.
+    ///
+    /// So the event is stored ALREADY-SATISFIED (signal value 0) plus a host
+    /// timestamp. Arming it to 1 instead would deadlock: nothing would ever
+    /// decrement it, and `event_synchronize` would block forever on a signal
+    /// with no producer — measured, and the reason this is written down.
+    ///
+    /// When the async-copy path becomes genuinely asynchronous, this must
+    /// change to attach `event.sig` to the copy as its completion signal; the
+    /// wait in `event_synchronize` is already the correct shape for that.
+    pub fn event_record(&self, event: &HsaEvent, _stream: &HsaStream) -> Result<()> {
+        unsafe {
+            (self.shared.drv.hsa_signal_store_screlease)(event.sig, 0);
+        }
+        if event.timing {
+            *event.at.lock().unwrap() = Some(std::time::Instant::now());
+        }
+        Ok(())
+    }
+
+    /// Block until `event` resolves.
+    ///
+    /// Deliberately does NOT drain the AQL queue first. Every memory operation
+    /// this backend performs already waits on its own completion signal before
+    /// returning, so at an event there is nothing outstanding to drain — and
+    /// calling `synchronize()` here HUNG on gfx950/ROCm 7.2.4 (the read index
+    /// never caught the write index on a queue with no dispatched packets;
+    /// reproduced with a 60 s timeout on the event-only test). The drain
+    /// belongs where packets are actually dispatched, not on the event path.
+    ///
+    /// The timestamp is NOT re-stamped here: it belongs to the record point,
+    /// and overwriting it would fold the wait itself into the measurement.
+    pub fn event_synchronize(&self, event: &HsaEvent) -> Result<()> {
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                event.sig,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_BLOCKED,
+            );
+        }
+        Ok(())
+    }
+
+    /// Host-side elapsed time between two resolved timing events.
+    ///
+    /// Returns 0.0 rather than an error when either event has no stamp: the
+    /// engine reads this only to fill a reported metric, and a missing sample
+    /// must not fail a serving step.
+    pub fn event_elapsed_ms(&self, start: &HsaEvent, end: &HsaEvent) -> Result<f32> {
+        let (a0, b0) = (*start.at.lock().unwrap(), *end.at.lock().unwrap());
+        match (a0, b0) {
+            (Some(a), Some(b)) => Ok(b.saturating_duration_since(a).as_secs_f32() * 1e3),
+            _ => Ok(0.0),
+        }
+    }
+
+    /// Page-locked, device-visible host staging memory.
+    pub fn host_alloc_pinned(&self, bytes: usize) -> Result<HsaPinned> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_pool_allocate)(self.fine_pool, bytes, 0, &mut ptr)
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_memory_pool_allocate(fine, {bytes} bytes): {rc}"
+            )));
+        }
+        // The GPU agent must be allowed to read the staging slab; without this
+        // the copy engine faults on first touch.
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_agents_allow_access)(1, &self.agent, std::ptr::null(), ptr)
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_agents_allow_access (pinned): {rc}"
+            )));
+        }
+        Ok(HsaPinned {
+            ptr: ptr as *mut u8,
+            len: bytes,
+            shared: self.shared.clone(),
+        })
+    }
+
+    /// Blocking host→device copy to a raw device pointer.
+    pub fn memcpy_htod(&self, dptr: u64, src: &[u8]) -> Result<()> {
+        let dst = DeviceMem::view(dptr, src.len() as u64);
+        self.upload(&dst, 0, src)
+    }
+
+    /// Enqueue a host→device copy.
+    ///
+    /// # Safety
+    /// `src` must stay live and unmodified until the copy retires — the caller
+    /// gates that with an event, exactly as on the CUDA side.
+    pub unsafe fn memcpy_htod_async(
+        &self,
+        dptr: u64,
+        src: &[u8],
+        _stream: &HsaStream,
+    ) -> Result<()> {
+        // Fine-grained staging memory is already agent-visible, so the copy can
+        // be issued directly. Correctness does not depend on which engine runs
+        // it; ordering against the interpreter dispatch comes from the queue.
+        let dst = DeviceMem::view(dptr, src.len() as u64);
+        self.upload(&dst, 0, src)
+    }
+
+    /// Enqueue a device→host copy.
+    ///
+    /// # Safety
+    /// `dst` must stay live until the copy retires.
+    pub unsafe fn memcpy_dtoh_async(
+        &self,
+        dst: &mut [u8],
+        dptr: u64,
+        _stream: &HsaStream,
+    ) -> Result<()> {
+        let src = DeviceMem::view(dptr, dst.len() as u64);
+        self.download(&src, 0, dst)
+    }
+
+    /// Device→device copy within this agent.
+    pub fn memcpy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut sig = HsaSignal { handle: 0 };
+        let rc =
+            unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!("hsa_signal_create (dtod): {rc}")));
+        }
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_async_copy)(
+                dst as *mut c_void,
+                self.agent,
+                src as *const c_void,
+                self.agent,
+                bytes as usize,
+                0,
+                std::ptr::null(),
+                sig,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
+            return Err(RuntimeError::Device(format!("hsa_amd_memory_async_copy (dtod): {rc}")));
+        }
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                sig,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_BLOCKED,
+            );
+            (self.shared.drv.hsa_signal_destroy)(sig);
+        }
+        Ok(())
+    }
+
+    /// Zero `n` bytes of a named module global. Returns `false` when the symbol
+    /// is absent, matching the CUDA contract (an object without the global is
+    /// not an error — the engine probes for optional ones).
+    pub fn module_global_zero(&self, module: &Module, name: &str, n: usize) -> Result<bool> {
+        // `module_load` stores the frozen executable handle directly as the
+        // module id, so the handle round-trips without a side table.
+        let exe = HsaExecutable { handle: module.id };
+        let cname = std::ffi::CString::new(name)
+            .map_err(|_| RuntimeError::Device(format!("bad symbol name {name:?}")))?;
+        let mut sym = HsaExecutableSymbol { handle: 0 };
+        let rc = unsafe {
+            (self.shared.drv.hsa_executable_get_symbol_by_name)(
+                exe,
+                cname.as_ptr() as *const u8,
+                &self.agent,
+                &mut sym,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            return Ok(false);
+        }
+        let mut addr: u64 = 0;
+        let rc = unsafe {
+            (self.shared.drv.hsa_executable_symbol_get_info)(
+                sym,
+                HSA_EXECUTABLE_SYMBOL_INFO_VARIABLE_ADDRESS,
+                &mut addr as *mut _ as *mut c_void,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS || addr == 0 {
+            return Ok(false);
+        }
+        let zeros = vec![0u8; n];
+        self.memcpy_htod(addr, &zeros)?;
+        Ok(true)
+    }
+
+    /// Static group-segment (LDS) bytes the kernel was COMPILED to use.
+    ///
+    /// On AMD this is where the interpreter's arena actually lives: `interp.hip`
+    /// declares `__shared__ plow_smem sm` statically, so the size is baked into
+    /// the code object and every dispatch passes `dynamic_lds = 0`. It is NOT
+    /// the counterpart of the CUDA engine's `SMEM_PF`, which is a *dynamic*
+    /// budget opted into per-function with `cuFuncSetAttribute`.
+    pub fn kernel_lds_bytes(k: &HsaKernel) -> u32 {
+        k.group_segment_size
+    }
+
+    /// Device address of a named module global, or `None` when absent.
+    ///
+    /// Absence is a legitimate answer, not an error: the engine probes for
+    /// optional globals (`plow_arena_bytes`, `plow_packet_hash_lo`, the trace
+    /// buffers) that an unspecialised object simply does not carry.
+    fn global_addr(&self, module: &Module, name: &str) -> Result<Option<u64>> {
+        // `module_load` stores the frozen executable handle directly as the
+        // module id, so the handle round-trips without a side table.
+        let exe = HsaExecutable { handle: module.id };
+        let cname = std::ffi::CString::new(name)
+            .map_err(|_| RuntimeError::Device(format!("bad symbol name {name:?}")))?;
+        let mut sym = HsaExecutableSymbol { handle: 0 };
+        let rc = unsafe {
+            (self.shared.drv.hsa_executable_get_symbol_by_name)(
+                exe,
+                cname.as_ptr() as *const u8,
+                &self.agent,
+                &mut sym,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            return Ok(None);
+        }
+        let mut addr: u64 = 0;
+        let rc = unsafe {
+            (self.shared.drv.hsa_executable_symbol_get_info)(
+                sym,
+                HSA_EXECUTABLE_SYMBOL_INFO_VARIABLE_ADDRESS,
+                &mut addr as *mut _ as *mut c_void,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS || addr == 0 {
+            return Ok(None);
+        }
+        Ok(Some(addr))
+    }
+
+    /// Resolve a kernel by name from a loaded module.
+    pub fn get_function(&self, module: &Module, name: &str) -> Result<HsaKernel> {
+        self.resolve_kernel(HsaExecutable { handle: module.id }, name)
+    }
+
+    /// Destroy a loaded executable.
+    pub fn module_unload(&self, module: &Module) -> Result<()> {
+        let rc = unsafe {
+            (self.shared.drv.hsa_executable_destroy)(HsaExecutable { handle: module.id })
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!("hsa_executable_destroy: {rc}")));
+        }
+        Ok(())
+    }
+
+    /// Fill `n` bytes at `dptr` with `value`, through the copy engine.
+    ///
+    /// There is no queue-ordered HSA fill — `hsa_amd_memory_fill` is a host
+    /// operation on host-accessible memory, not a packet on the queue — so this
+    /// is an SDMA copy from a cached staging buffer, and it BLOCKS. The
+    /// staging buffer is grown and re-filled only when `value` or the size
+    /// changes, because the common case by far is `value == 0` at a fixed
+    /// counter-region size, once per token.
+    pub fn memset_d8(&self, dptr: u64, value: u8, n: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let mut guard = self.fill_stage.lock();
+        let need_new = match guard.as_ref() {
+            Some(s) => s.len < n || s.value != value,
+            None => true,
+        };
+        if need_new {
+            if let Some(old) = guard.take() {
+                unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(old.ptr) };
+            }
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            let rc = unsafe {
+                (self.shared.drv.hsa_amd_memory_pool_allocate)(self.fine_pool, n, 0, &mut ptr)
+            };
+            if rc != HSA_STATUS_SUCCESS {
+                return Err(RuntimeError::Device(format!("fill stage alloc({n}): {rc}")));
+            }
+            let rc = unsafe {
+                (self.shared.drv.hsa_amd_agents_allow_access)(
+                    1,
+                    &self.agent,
+                    std::ptr::null(),
+                    ptr,
+                )
+            };
+            if rc != HSA_STATUS_SUCCESS {
+                unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
+                return Err(RuntimeError::Device(format!("fill stage access: {rc}")));
+            }
+            unsafe { std::ptr::write_bytes(ptr as *mut u8, value, n) };
+            *guard = Some(FillStage { ptr, len: n, value });
+        }
+        let src = guard.as_ref().expect("just populated").ptr;
+        // SAFETY: `src` is `n` bytes of agent-visible fine-grained memory held
+        // alive by the lock guard for the duration of this blocking copy.
+        let slice = unsafe { std::slice::from_raw_parts(src as *const u8, n) };
+        self.memcpy_htod_pinned(dptr, slice)
+    }
+
+    /// H2D copy whose source is ALREADY agent-visible (a [`HsaPinned`] slab), so
+    /// it skips the `hsa_amd_memory_lock` that `upload` pays per call.
+    ///
+    /// Two separate reasons this exists, and both are measured:
+    ///
+    /// 1. `hsa_amd_memory_lock` is syscall-class. The AMD reference driver
+    ///    records that pinning per step "cost more than the whole forward pass",
+    ///    which is why its hot path uses `copy_h2d` over `alloc_host` memory and
+    ///    reserves `upload` for load time.
+    /// 2. Locking an already-device-accessible fine-grained POOL allocation is
+    ///    not merely wasteful, it is INVALID — `hsa_amd_memory_lock` returns
+    ///    HSA_STATUS_ERROR (4096). So `upload` cannot be used on a pinned slab
+    ///    at all; the engine's first decode step failed exactly here.
+    ///
+    /// # Safety contract (not `unsafe`, but a contract nonetheless)
+    /// `src` must live in memory the GPU agent may already read — a `HsaPinned`
+    /// slab, or the fine-grained pool. A stack or `Vec` source faults the GPU
+    /// with an opaque "memory access fault" that reads as a kernel bug.
+    pub fn memcpy_htod_pinned(&self, dptr: u64, src: &[u8]) -> Result<()> {
+        let mut sig = HsaSignal { handle: 0 };
+        let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!("hsa_signal_create (fill): {rc}")));
+        }
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_async_copy)(
+                dptr as *mut c_void,
+                self.agent,
+                src.as_ptr() as *const c_void,
+                self.cpu_agent,
+                src.len(),
+                0,
+                std::ptr::null(),
+                sig,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
+            return Err(RuntimeError::Device(format!("async_copy (fill): {rc}")));
+        }
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                sig,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_BLOCKED,
+            );
+            (self.shared.drv.hsa_signal_destroy)(sig);
+        }
+        Ok(())
+    }
+
+    /// D2H copy whose destination is already agent-visible (a [`HsaPinned`]
+    /// slab), so it skips the per-call `hsa_amd_memory_lock` that `download`
+    /// pays. The mirror of [`HsaBackend::memcpy_htod_pinned`], and it exists
+    /// for the same measured reason: the token readback happens once per decode
+    /// step, and pinning a stack array to move FOUR BYTES is the pathology the
+    /// reference driver records as costing "more than the whole forward pass".
+    pub fn memcpy_dtoh_pinned(&self, dst: &mut [u8], dptr: u64) -> Result<()> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let mut sig = HsaSignal { handle: 0 };
+        let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!("hsa_signal_create (d2h): {rc}")));
+        }
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_async_copy)(
+                dst.as_mut_ptr() as *mut c_void,
+                self.cpu_agent,
+                dptr as *const c_void,
+                self.agent,
+                dst.len(),
+                0,
+                std::ptr::null(),
+                sig,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
+            return Err(RuntimeError::Device(format!("async_copy (d2h pinned): {rc}")));
+        }
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                sig,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_BLOCKED,
+            );
+            (self.shared.drv.hsa_signal_destroy)(sig);
+        }
+        Ok(())
+    }
+
+    /// Read a `u32` module global.
+    pub fn module_global_u32(&self, module: &Module, name: &str) -> Result<Option<u32>> {
+        let Some(addr) = self.global_addr(module, name)? else {
+            return Ok(None);
+        };
+        let mut buf = [0u8; 4];
+        self.download(&DeviceMem::view(addr, 4), 0, &mut buf)?;
+        Ok(Some(u32::from_le_bytes(buf)))
+    }
+
+    /// Read up to `max` bytes of a named module global.
+    pub fn module_global_bytes(
+        &self,
+        module: &Module,
+        name: &str,
+        max: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        let Some(addr) = self.global_addr(module, name)? else {
+            return Ok(false);
+        };
+        out.resize(max, 0);
+        self.download(&DeviceMem::view(addr, max as u64), 0, out)?;
+        Ok(true)
+    }
+
+    /// Launch `f` over `grid` workgroups of `block` threads.
+    ///
+    /// `grid` is in WORKGROUPS, matching the CUDA engine's call sites; an AQL
+    /// dispatch counts threads, so it is multiplied here. Getting that
+    /// backwards launches 256 workgroups' worth of threads as one workgroup, or
+    /// 65536 workgroups — both of which the packet processor accepts.
+    pub fn launch(
+        &self,
+        f: HsaKernel,
+        grid: u32,
+        block: u32,
+        smem_bytes: u32,
+        args: &[u8],
+    ) -> Result<()> {
+        if grid == 0 || block == 0 {
+            return Err(RuntimeError::Device(format!(
+                "degenerate launch: grid={grid} block={block}"
+            )));
+        }
+        self.dispatch(
+            &f,
+            grid * block,
+            1,
+            1,
+            block as u16,
+            1,
+            1,
+            smem_bytes,
+            args.as_ptr() as *const c_void,
+            args.len(),
+        )
+    }
+
+    /// No-op with a range check. HSA carries `group_segment_size` in the
+    /// dispatch packet, so there is no per-function opt-in to set; the check
+    /// keeps an over-budget request from silently becoming a launch failure.
+    pub fn set_max_dynamic_smem(&self, _f: &HsaKernel, bytes: u32) -> Result<()> {
+        if bytes > self.lds_bytes {
+            return Err(RuntimeError::Device(format!(
+                "dynamic LDS request {bytes} B exceeds the {} B per-CU budget",
+                self.lds_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    /// The `hsa_amd_vmem_*` table, or a `Device` error naming what is missing.
+    fn vmem(&self) -> Result<&VmemFns> {
+        self.shared.drv.vmem.as_ref().ok_or_else(|| {
+            RuntimeError::Device(
+                "libhsa-runtime64 has no hsa_amd_vmem_* API (needs ROCm >= 5.7) — \
+                 the VMM-backed KV pool cannot come up"
+                    .into(),
+            )
+        })
+    }
+
+    /// Is the virtual-memory API available on this runtime? The engine asks
+    /// before building a [`crate::memory::vmm::VmmKv`].
+    pub fn has_vmm(&self) -> bool {
+        self.shared.drv.vmem.is_some()
+    }
+}
+
+// ─── VMM (hsa_amd_vmem_*) ───────────────────────────────────────────────────
+
+/// The VMM driver surface as `crate::memory::vmm` consumes it — the ROCr
+/// counterpart of the CUDA impl in [`super::cuda`]. The mapping is 1:1:
+///
+/// | `VmmOps`      | ROCr                                    | CUDA |
+/// |---------------|-----------------------------------------|------|
+/// | `granularity` | pool info `RUNTIME_ALLOC_REC_GRANULE`   | `cuMemGetAllocationGranularity` |
+/// | `reserve`     | `hsa_amd_vmem_address_reserve_align`    | `cuMemAddressReserve` |
+/// | `create`      | `hsa_amd_vmem_handle_create`            | `cuMemCreate` |
+/// | `map`         | `hsa_amd_vmem_map`                      | `cuMemMap` |
+/// | `set_access`  | `hsa_amd_vmem_set_access`               | `cuMemSetAccess` |
+///
+/// Two differences that matter to the caller:
+///
+/// * There is no context to bind — HSA is process-global, so every entry here
+///   is callable from the pool's pre-mapper thread as-is (the CUDA impl has to
+///   re-`bind()` per call).
+/// * `hsa_amd_vmem_handle_create` names the **memory pool**, not a device
+///   ordinal, so the physical block lands in this agent's coarse-grained VRAM
+///   by construction; the CUDA path encodes the same intent in
+///   `CUmemAllocationProp::location`.
+impl crate::memory::vmm::VmmOps for HsaBackend {
+    fn granularity(&self) -> Result<u64> {
+        let mut g: usize = 0;
+        // SAFETY: out-pointer sized for a `size_t` attribute.
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_pool_get_info)(
+                self.vram_pool,
+                HSA_AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_REC_GRANULE,
+                &mut g as *mut _ as *mut c_void,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS || g == 0 {
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_memory_pool_get_info(REC_GRANULE): rc={rc} granule={g}"
+            )));
+        }
+        Ok(g as u64)
+    }
+
+    fn reserve(&self, bytes: u64) -> Result<u64> {
+        let f = self.vmem()?;
+        // Align the reservation to the physical granule. The non-`_align` entry
+        // point only guarantees page alignment, and every `map` into this range
+        // is a granule-sized block at a granule-multiple offset — an unaligned
+        // base would turn each of those into an INVALID_ARGUMENT.
+        let align = crate::memory::vmm::VmmOps::granularity(self)?;
+        let mut va: *mut c_void = std::ptr::null_mut();
+        // SAFETY: out-pointer; no fixed address requested.
+        let rc = unsafe { (f.address_reserve_align)(&mut va, bytes as usize, 0, align, 0) };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_vmem_address_reserve_align({bytes} B, align {align}): {rc}"
+            )));
+        }
+        Ok(va as u64)
+    }
+
+    fn address_free(&self, va: u64, bytes: u64) {
+        let Ok(f) = self.vmem() else { return };
+        // SAFETY: va/bytes from a prior reserve, freed exactly once (pool
+        // contract). Infallible teardown path — log, don't propagate.
+        let rc = unsafe { (f.address_free)(va as *mut c_void, bytes as usize) };
+        if rc != HSA_STATUS_SUCCESS {
+            tracing::warn!(rc, va, bytes, "hsa_amd_vmem_address_free failed");
+        }
+    }
+
+    fn create(&self, bytes: u64) -> Result<u64> {
+        let f = self.vmem()?;
+        let mut h = HsaVmemHandle { handle: 0 };
+        // SAFETY: out-pointer; bytes is a granule multiple (pool contract).
+        let rc = unsafe {
+            (f.handle_create)(
+                self.vram_pool,
+                bytes as usize,
+                HSA_AMD_MEMORY_TYPE_PINNED,
+                0,
+                &mut h,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_vmem_handle_create({bytes} B): {rc}"
+            )));
+        }
+        Ok(h.handle)
+    }
+
+    fn release(&self, handle: u64) {
+        let Ok(f) = self.vmem() else { return };
+        // SAFETY: handle from create, released exactly once (pool refcount).
+        let rc = unsafe { (f.handle_release)(HsaVmemHandle { handle }) };
+        if rc != HSA_STATUS_SUCCESS {
+            tracing::warn!(rc, handle, "hsa_amd_vmem_handle_release failed");
+        }
+    }
+
+    fn map(&self, va: u64, bytes: u64, handle: u64) -> Result<()> {
+        let f = self.vmem()?;
+        // SAFETY: va range inside a reservation, handle live, in_offset 0 —
+        // multi-map of one handle into several ranges is what prefix sharing is.
+        let rc = unsafe {
+            (f.map)(
+                va as *mut c_void,
+                bytes as usize,
+                0,
+                HsaVmemHandle { handle },
+                0,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_vmem_map: {rc} (va={va:#x} bytes={bytes} handle={handle:#x})"
+            )));
+        }
+        Ok(())
+    }
+
+    fn unmap(&self, va: u64, bytes: u64) {
+        let Ok(f) = self.vmem() else { return };
+        // SAFETY: exactly the mapped range (pool contract).
+        let rc = unsafe { (f.unmap)(va as *mut c_void, bytes as usize) };
+        if rc != HSA_STATUS_SUCCESS {
+            tracing::warn!(rc, va, bytes, "hsa_amd_vmem_unmap failed");
+        }
+    }
+
+    fn set_access(&self, va: u64, bytes: u64) -> Result<()> {
+        let f = self.vmem()?;
+        let desc = HsaAmdMemoryAccessDesc {
+            permissions: HSA_ACCESS_PERMISSION_RW,
+            agent_handle: self.agent,
+        };
+        // SAFETY: range fully mapped (pool maps before granting access).
+        let rc = unsafe { (f.set_access)(va as *mut c_void, bytes as usize, &desc, 1) };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_vmem_set_access: {rc} (va={va:#x} bytes={bytes})"
+            )));
+        }
+        Ok(())
+    }
+
+    fn alloc(&self, bytes: u64) -> Result<u64> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        // SAFETY: out-pointer to a coarse-grained VRAM allocation. Ordinary
+        // pool memory, not VMM — snapshot buffers are never re-mapped.
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_pool_allocate)(
+                self.vram_pool,
+                bytes as usize,
+                0,
+                &mut ptr,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_memory_pool_allocate(vmm snapshot, {bytes} B): {rc}"
+            )));
+        }
+        Ok(ptr as u64)
+    }
+
+    fn free(&self, va: u64) {
+        // SAFETY: va from VmmOps::alloc, freed exactly once (pool contract).
+        let rc = unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(va as *mut c_void) };
+        if rc != HSA_STATUS_SUCCESS {
+            tracing::warn!(rc, va, "hsa_amd_memory_pool_free(vmm snapshot) failed");
+        }
+    }
+
+    fn copy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
+        self.memcpy_dtod(dst, src, bytes)
     }
 }

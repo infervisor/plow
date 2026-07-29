@@ -113,6 +113,9 @@ impl Machine {
                         spec.copy_engines
                     }
                     .max(1) as usize,
+                    // Datasheet peak: the scheduler uses this to compare placements,
+                    // where a constant derate cancels. A REPORTED absolute floor must
+                    // use `spec.mem.bandwidth_for_bound()` — see `plowc --lean-oracle`.
                     hbm_bytes_per_cycle: bytes_per_cycle(spec.mem.bandwidth.0, spec.clock_boost.0),
                 }
             })

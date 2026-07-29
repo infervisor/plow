@@ -29,9 +29,13 @@ This module computes the SAME booleans with scalable structures:
   pass, `O(V + E)` word-ops per pass — instead of one fuel-`n` list
   saturation per (reader, writer) pair. Each pass prunes to the ancestors
   of its targets first (`liveSet`).
-* `readersWritersDisjointB` quantifies over ALL entry pairs including
-  `a = b`, so it is equivalent to "the union of all reader sets and the
-  union of all writer sets are disjoint" — checked in `O(n)`.
+* `readersWritersDisjointB` quantifies over CO-LOCATED pairs only (distinct
+  names, bytes overlapping) — the same pairs `AddressMapSound` speaks about,
+  and the same set this module's address-map pass already walks. It used to
+  quantify over all pairs including `a = b`, which collapsed it to "the union
+  of all reader sets and the union of all writer sets are disjoint"; that is
+  strictly stronger than the theorem needs and rejected legitimate packets
+  (see `disjointFast`).
 
 The theorems in `Plow.Verify` continue to speak about the reference
 definitions; `checkD`/`checkF` call this module for execution. A formal
@@ -316,16 +320,51 @@ def meetKernel (needMeet : Array Bool) (entries : Array EntryView)
           meets := meets.set! idx (meets[idx]! &&& rows[r * w + wi]!)
   return meets
 
-/-- `readersWritersDisjointB`, equivalently: no task appears in any entry's
-    reader set AND any entry's writer set. -/
+/-- `readersWritersDisjointB`: for every CO-LOCATED pair (distinct names, bytes
+    overlapping), the readers of one and the writers of the other are disjoint.
+    Vacuously true when no two entries overlap.
+
+    # This was an O(n) global union check, and it produced false rejections
+    It used to read "no task appears in any entry's reader set AND any entry's
+    writer set" — the faithful twin of the *unguarded* `readersWritersDisjointB`
+    that Plow.Verify carried at the time. Both were far stronger than
+    `AddressMapSound` needs, and the gap is not academic: on Gemma-4-12B
+    `decode_b1_s1` the address map is `t7` at `[0, 6144)` and `kv_cache_L0` at
+    `[6144, 3151872)` — ADJACENT, never overlapping — yet tasks 33-44 read and
+    write the KV cache, so the global intersection was non-empty and checkpoint
+    D rejected a packet with nothing wrong with it.
+
+    The pair set here is exactly the one `verifyAddressMapFast` already walks
+    (distinct name, bytes overlapping), so this adds no asymptotic term the
+    checkpoint did not already pay — and on a real schedule that set is large
+    (~330k pairs, see the header). Membership goes through a task-indexed
+    scratch array cleared after each pair, so the cost is
+    `O(pairs × (|readers| + |writers|))` rather than the quadratic
+    `Array.contains` scan. -/
 def disjointFast (n : Nat) (entries : Array EntryView) : Bool := Id.run do
-  let mut isReader : Array Bool := Array.mkArray n false
-  let mut isWriter : Array Bool := Array.mkArray n false
-  for e in entries do
-    for r in e.readers do isReader := isReader.set! r true
-    for w in e.writers do isWriter := isWriter.set! w true
-  for t in [0:n] do
-    if isReader[t]! && isWriter[t]! then return false
+  let mut mark : Array Bool := Array.mkArray n false
+  for i in [0 : entries.size] do
+    let a := entries[i]!
+    for j in [i : entries.size] do
+      let b := entries[j]!
+      -- Same name ⇒ aliases of one buffer, which may share bytes by construction.
+      if a.name == b.name then continue
+      if !(a.offset < b.offset + b.size && b.offset < a.offset + a.size) then
+        continue
+      -- readers(a) ∩ writers(b)
+      for w in b.writers do mark := mark.set! w true
+      let mut bad := false
+      for r in a.readers do
+        if mark[r]! then bad := true
+      for w in b.writers do mark := mark.set! w false
+      if bad then return false
+      -- readers(b) ∩ writers(a)
+      for w in a.writers do mark := mark.set! w true
+      let mut bad2 := false
+      for r in b.readers do
+        if mark[r]! then bad2 := true
+      for w in a.writers do mark := mark.set! w false
+      if bad2 then return false
   return true
 
 /-- Allocate and fill the per-entry reader meets outside the caller's

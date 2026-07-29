@@ -154,6 +154,13 @@ struct Row {
     #[serde(default)]
     fa_kun: Option<u32>,
     /// Ablated-twin median and the op cost it implies, when the sweep built one.
+    ///
+    /// Part of the record SCHEMA, not of any decision this binary makes — no
+    /// code reads it. Kept (rather than dropped to silence the warning) because
+    /// the JSONL is append-only and permanent: a field removed from the struct
+    /// is a field silently ignored on every future read of every historical
+    /// row, which is how a store quietly loses a column it was recording.
+    #[allow(dead_code)]
     #[serde(default)]
     op_cost_ms: Option<f64>,
     /// Whether the sweep's reps agreed. Absent in rows written before the check

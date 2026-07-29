@@ -45,15 +45,7 @@ env_flag!(fn pf_cover_on, "PLOW_PF_COVER");
 /// fit within ±2.8%): **60.1 ms ≈ 537 rows**. The default rounds that to 512.
 /// `PLOW_PF_CHUNK_COST=0` recovers the old pure-minimum-padding behaviour.
 /// Read once — the per-chunk hot path must not hit the environment.
-fn pf_chunk_cost_rows() -> usize {
-    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ROWS.get_or_init(|| {
-        std::env::var("PLOW_PF_CHUNK_COST")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(512)
-    })
-}
+crate::env_usize!(fn pf_chunk_cost_rows, "PLOW_PF_CHUNK_COST", default 512);
 
 use crate::asset::cubin::{self, Role};
 use crate::asset::devblob::DevBlob;
@@ -358,7 +350,7 @@ use crate::asset::checkpoint::Checkpoint;
 struct PrefillBucket {
     /// Chunk size this bucket was compiled for.
     t: u32,
-    /// 128-byte kernarg (shares `tensors` + `gq_cursor` with the decode path).
+    /// `PlowProgram` kernarg (shares `tensors` + `gq_cursor` with the decode path).
     kernarg: DevProgram,
     /// Device instruction stream (patched per chunk over `[inst_lo..=inst_hi]`).
     d_inst: DeviceMem,
@@ -407,8 +399,12 @@ pub struct GpuEngine {
     /// so overlapping streams would race until every in-flight command owns
     /// separate run-state storage.
     stream: CudaStream,
-    /// Keeps the interpreter module alive (id registered in the backend).
-    _module: Module,
+    /// The interpreter module: its own lifetime anchor (unloaded in `Drop`)
+    /// AND the handle `trace_reset`/`trace_summary` read the device trace
+    /// globals through. NOT `_module` — the leading-underscore convention in
+    /// this file means "held for liveness only, never read", which is true of
+    /// [`Sampler::_module`] and [`MultiStep::_module`] and false of this one.
+    module: Module,
 
     /// The prefill object's kernel + smem, and the uploaded bucket programs.
     /// `None`/empty when no `_pf` cubin is present — the mux then falls back to
@@ -416,7 +412,9 @@ pub struct GpuEngine {
     f_pf: Option<KernelFn>,
     smem_pf: u32,
     prefill: Vec<PrefillBucket>,
-    _module_pf: Option<Module>,
+    /// Read in `Drop` (unloaded separately from [`Self::module`]), so not
+    /// underscore-prefixed either.
+    module_pf: Option<Module>,
 
     /// Device stochastic sampler (`PLOW_DEV_SAMPLE=1` + a sampler cubin;
     /// plan stage 4). `None` = the host path (full-logit D2H + CPU sampler),
@@ -454,7 +452,7 @@ pub struct GpuEngine {
     /// re-uploaded; their device pointers are baked into `kernarg`.
     _tables: Vec<DeviceMem>,
 
-    /// The 128-byte `PlowProgram` kernarg (built once; pointers never move).
+    /// The `PlowProgram` kernarg (built once; pointers never move).
     kernarg: DevProgram,
     /// Host copy of the decode instructions for the per-step kv-row patch.
     h_inst: Vec<DevInst64>,
@@ -926,7 +924,29 @@ impl GpuEngine {
                 if td.name.starts_with("kv.") {
                     kvb += td.bytes;
                 }
-                if td.name.starts_with("model.") || td.name.starts_with("fp8/") {
+                // Classified by EXCLUSION of the compiler's own namespaces, not by an
+                // allowlist of weight prefixes — see `packet::names`. The allowlist read
+                // `starts_with("model.") || starts_with("fp8/")`, which silently zeroed
+                // (a) every untied `lm_head.weight`, which devgen declares at the top
+                // level, and (b) the entire tower of any checkpoint under a wrapper
+                // prefix (Kimi-K3 is `language_model.model.…`; nothing in it starts with
+                // `model.`). Both produced fluent wrong output rather than an error.
+                if packet::names::is_host_filled_table(&td.name) {
+                    // GLM/DeepSeek expert POINTER tables. `bind_packed_experts` is the AMD
+                    // loader's, and this engine has no equivalent — the fused-MoE path
+                    // below only knows Gemma's `moe.ewt.`/`moe.est.`. Refuse by name: the
+                    // old code reached this tensor through the weight arm and reported
+                    // `MISSING WEIGHT`, which said the checkpoint was incomplete when in
+                    // fact no checkpoint has ever contained it.
+                    return Err(RuntimeError::Device(format!(
+                        "packet declares the host-filled expert pointer table `{}`, which \
+                         this engine cannot fill (no `bind_packed_experts` on the CUDA \
+                         path; only Gemma's fused `moe.ewt.`/`moe.est.` tables are wired). \
+                         Leaving it zeroed would route every token to expert 0.",
+                        td.name
+                    )));
+                }
+                if packet::names::is_checkpoint_weight(&td.name) {
                     let src = ckpt.tensor(&td.name).ok_or_else(|| {
                         RuntimeError::Device(format!("MISSING WEIGHT: {}", td.name))
                     })?;
@@ -1148,12 +1168,6 @@ impl GpuEngine {
             }
             Ok(mem)
         };
-        fn pod_bytes<T: Copy>(v: &[T]) -> &[u8] {
-            // SAFETY: #[repr(C)] POD mirrors, read as raw bytes for upload.
-            unsafe {
-                std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v))
-            }
-        }
         // Dynamic B=1 KV row (plan stage 2): when the cubin advertises
         // `plow_dyn_kvrow`, arm the pos[t]-derived KV row on every B=1
         // KV-write site ONCE (i[6] = 1) — the decode instruction stream is
@@ -1207,7 +1221,8 @@ impl GpuEngine {
             tensors: d_tens.base,
             trace: 0,
             cur_seg: 0,
-            _segpad: 0,
+            l2_domains: 0,
+            n_seg: 1,
             gq_stream: d_gq_stream.base,
             gq_seg_ofs: d_gq_seg.base,
             gq_cursor: d_gq_cursor.base,
@@ -1215,6 +1230,7 @@ impl GpuEngine {
             peer_scratch: 0,
             rank: 0,
             n_gpu: 1,
+            seg_ofs: 0,
         };
 
         // kv-row patch range: the contiguous [lo..hi] instruction window the
@@ -1269,7 +1285,7 @@ impl GpuEngine {
         }
 
         // Stop set from the checkpoint's generation_config (fallback config).
-        let stop_ids = read_eos_ids(checkpoint_dir);
+        let stop_ids = crate::asset::checkpoint::read_eos_ids(checkpoint_dir);
 
         // ---- prefill object + bucket programs (optional) ----
         // Load the `_pf` cubin and upload every non-decode (T!=1) program so a
@@ -1449,11 +1465,11 @@ impl GpuEngine {
             grid,
             smem,
             stream,
-            _module: module,
+            module,
             f_pf,
             smem_pf,
             prefill,
-            _module_pf: module_pf,
+            module_pf,
             sampler,
             multistep,
             h_inst: insts,
@@ -2632,13 +2648,6 @@ impl GpuEngine {
             }
             Ok(mem)
         };
-        fn pod_bytes<T: Copy>(v: &[T]) -> &[u8] {
-            // SAFETY: #[repr(C)] POD mirrors, read as raw bytes for upload.
-            unsafe {
-                std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v))
-            }
-        }
-
         let mut buckets = Vec::new();
         // Every program but the last (the decode program, t == B) is a
         // prefill bucket.
@@ -2681,7 +2690,8 @@ impl GpuEngine {
                 tensors: d_tens,
                 trace: 0,
                 cur_seg: 0,
-                _segpad: 0,
+                l2_domains: 0,
+                n_seg: 1,
                 gq_stream: d_gq_stream.base,
                 gq_seg_ofs: d_gq_seg.base,
                 gq_cursor: d_ctr.base + cursor_off as u64,
@@ -2689,6 +2699,7 @@ impl GpuEngine {
                 peer_scratch: 0,
                 rank: 0,
                 n_gpu: 1,
+                seg_ofs: 0,
             };
 
             // Precompute the per-chunk patch sites (harness inner loop): KV-write
@@ -3398,7 +3409,7 @@ impl GpuEngine {
     /// reports only launches after this call (drop prefill/warmup). No-op on
     /// a normal cubin.
     pub fn trace_reset(&self) -> Result<()> {
-        self.be.module_global_zero(&self._module, "g_tr_n", 4)?;
+        self.be.module_global_zero(&self.module, "g_tr_n", 4)?;
         Ok(())
     }
 
@@ -3414,7 +3425,7 @@ impl GpuEngine {
         let mut raw = Vec::new();
         if !self
             .be
-            .module_global_bytes(&self._module, "g_tr_n", 4, &mut raw)?
+            .module_global_bytes(&self.module, "g_tr_n", 4, &mut raw)?
         {
             return Ok(None);
         }
@@ -3426,7 +3437,7 @@ impl GpuEngine {
         let read_u32 = |name: &str, out: &mut Vec<u32>| -> Result<()> {
             let mut b = Vec::new();
             self.be
-                .module_global_bytes(&self._module, name, cap * 4, &mut b)?;
+                .module_global_bytes(&self.module, name, cap * 4, &mut b)?;
             *out = b
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes(c.try_into().expect("4B")))
@@ -3436,7 +3447,7 @@ impl GpuEngine {
         let read_u64 = |name: &str, out: &mut Vec<u64>| -> Result<()> {
             let mut b = Vec::new();
             self.be
-                .module_global_bytes(&self._module, name, cap * 8, &mut b)?;
+                .module_global_bytes(&self.module, name, cap * 8, &mut b)?;
             *out = b
                 .chunks_exact(8)
                 .map(|c| u64::from_le_bytes(c.try_into().expect("8B")))
@@ -3498,14 +3509,36 @@ impl GpuEngine {
     }
 }
 
+/// A slice of `#[repr(C)]` POD mirrors as the raw bytes an upload wants.
+///
+/// One definition, because this is the crate's only routine `unsafe` cast and
+/// two copies of it were two places to get the length expression wrong.
+/// `size_of_val` (not `len() * size_of::<T>()`) so padding is never dropped.
+///
+/// # Safety contract (not `unsafe`, but a contract nonetheless)
+/// `T` must be a `#[repr(C)]` POD with no padding the caller cares about and no
+/// pointers the device would dereference as host addresses. Every caller passes
+/// a devgen mirror type, which is exactly that.
+fn pod_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    // SAFETY: `T: Copy` `#[repr(C)]` mirrors read as raw bytes for an upload;
+    // the range is exactly the slice's own allocation (`size_of_val`), and the
+    // borrow keeps `v` alive for the returned lifetime.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
 /// Convert a raw byte buffer of bf16 values into an f32 slice in-place.
 /// `src` must be exactly `dst.len() * 2` bytes (one `u16` per `f32` output).
+///
 /// The inner loop is a trivial indexed pattern that auto-vectorises on x86-64
-/// (LLVM emits `vpmovzxwd` + `vpslld` + `vmovups` for AVX2).
+/// (LLVM emits `vpmovzxwd` + `vpslld` + `vmovups` for AVX2). **Measured
+/// 2026-07-28**: 12.30 µs at `vocab = 262144` — 128 GB/s of read+write traffic,
+/// i.e. memory-bound, and byte-for-byte the same time as the iterator/
+/// `bytemuck::cast_slice` form (12.27 µs). There is nothing left to vectorise
+/// here; do not "optimise" it again.
 #[inline]
 fn bf16_to_f32_slice(src: &[u8], dst: &mut [f32]) {
     assert_eq!(src.len(), dst.len() * 2);
-    // Safety: &[u8] of even length → &[u16] with half the count.
+    // SAFETY: &[u8] of even length → &[u16] with half the count.
     let halves: &[u16] =
         unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, dst.len()) };
     for i in 0..dst.len() {
@@ -3547,6 +3580,7 @@ fn devop_name(op: u32) -> String {
         38 => "FlashDecodeFp8",
         44 => "GemvFp8Blk",
         80 => "GemvArgmax",
+        107 => "GemmFp8Blk",
         _ => return op.to_string(),
     }
     .to_string()
@@ -3566,7 +3600,7 @@ impl Drop for GpuEngine {
         if let Err(e) = self.be.synchronize() {
             tracing::warn!(error = %e, "synchronize at engine unload");
         }
-        if let Some(m) = self._module_pf.take() {
+        if let Some(m) = self.module_pf.take() {
             if let Err(e) = self.be.module_unload(&m) {
                 tracing::warn!(error = %e, "unload prefill module");
             }
@@ -3581,36 +3615,10 @@ impl Drop for GpuEngine {
                 tracing::warn!(error = %e, "unload multistep module");
             }
         }
-        if let Err(e) = self.be.module_unload(&self._module) {
+        if let Err(e) = self.be.module_unload(&self.module) {
             tracing::warn!(error = %e, "unload decode module");
         }
     }
-}
-
-/// The checkpoint's stop-token set: `generation_config.json` `eos_token_id`
-/// (int or list), falling back to `config.json`, falling back to empty (the
-/// caller then stops on max_tokens only).
-fn read_eos_ids(dir: &Path) -> Vec<u32> {
-    for file in ["generation_config.json", "config.json"] {
-        let Ok(bytes) = std::fs::read(dir.join(file)) else { continue };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue };
-        match v.get("eos_token_id") {
-            Some(serde_json::Value::Number(n)) => {
-                if let Some(id) = n.as_u64() {
-                    return vec![id as u32];
-                }
-            }
-            Some(serde_json::Value::Array(a)) => {
-                let ids: Vec<u32> =
-                    a.iter().filter_map(|x| x.as_u64().map(|v| v as u32)).collect();
-                if !ids.is_empty() {
-                    return ids;
-                }
-            }
-            _ => {}
-        }
-    }
-    Vec::new()
 }
 
 #[cfg(test)]

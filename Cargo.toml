@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/frontend",
+    "crates/nn-graph",
     "crates/hwspec",
     "crates/kernelcaps",
     "crates/tunedb",
@@ -36,7 +36,9 @@ panic = "abort"
 strip = "symbols"
 
 [workspace.dependencies]
-nn-graph = { git = "https://github.com/infervisor/nn-graph.git", default-features = false, features = ["models"] }
+# Vendored into the workspace (was a bare `git = ...` with no rev — see
+# crates/nn-graph/Cargo.toml for why that had to go).
+nn-graph = { path = "crates/nn-graph", default-features = false, features = ["models"] }
 thiserror = "2"
 # Pure-Rust TLS: `default-features = false` drops hf-hub's `default-tls`
 # (native-tls → openssl-sys), and the `ureq` feature keeps the blocking
@@ -51,7 +53,6 @@ rewrite = { path = "crates/rewrite" }
 packet = { path = "crates/packet" }
 kernelcaps = { path = "crates/kernelcaps" }
 tunedb = { path = "crates/tunedb" }
-frontend = { path = "crates/frontend" }
 schedule = { path = "crates/schedule" }
 lean_verify = { path = "crates/lean_verify" }
 plow-asset = { path = "crates/plow-asset" }

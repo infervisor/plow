@@ -202,6 +202,17 @@ __device__ void d_layernorm_bias(bf16* __restrict__ out, const bf16* __restrict_
  *
  * Gemma has exactly two head dims, so the switch is closed -- the same argument the attention
  * ops already made for their O accumulator. */
+/* THE WORK ITEM IS A HEAD AND A HEAD IS ONE WAVE, and that caps the op's parallelism.
+ *
+ * `slice * PLOW_WAVES + wave_in_blk` packs 8 heads into every workgroup, so decode's 32 q heads
+ * land on ceil(32/8) = 4 CUs. Handing the same 32 waves to 32 workgroups instead was tried
+ * (n=6 interleaved, Gemma-4-31B bf16, ctx 1024): 18.057 -> 18.460 ms/token, a REGRESSION. Same
+ * wave count, 8x the L1s, and it still lost — the op is not limited by one CU's issue bandwidth,
+ * it is limited by the DEPENDENT round trip below, and the extra 28 workgroups per packet only
+ * bought 5040 more workgroup-packets of gate participation per token. `hd=256` is exactly one
+ * wave's 64 lanes x 4 elements and the lane->element map is what keeps each RoPE pair
+ * (i, i+hd/2) inside one lane, so a head cannot be split across waves without cross-lane
+ * traffic. Do not widen this without changing that map first. */
 /* INTERLEAVE (GPT-J / GLM-5.2 style, template flag, default OFF): rotate ADJACENT even/odd pairs
  * (x[2i], x[2i+1]) instead of the half-split (i, i+H2). GLM-5.2 MLA applies interleaved partial RoPE
  * to the 64-dim rope slice of q (per head) and the shared k_rope (rope_theta=8e6). With the lane-
@@ -210,6 +221,31 @@ __device__ void d_layernorm_bias(bf16* __restrict__ out, const bf16* __restrict_
  * — the only cross-lane traffic RoPE needs, and only on this branch. cos/sin use the SAME H2-per-
  * position table as the half-split path (freq index = element_index >> 1). Default false keeps every
  * existing (half-split) instantiation bit-identical. */
+/* THE DEPENDENT `pos` LOAD IS REAL AND IT COSTS NOTHING. MEASURED, so do not re-propose it.
+ *
+ * `p = pg[t] * H2` below is a load whose RESULT is the address of the cos/sin loads, so the
+ * compiler has no choice but to emit
+ *      global_load_dword v30, v[30:31], off   (pos[t])
+ *      s_waitcnt vmcnt(0)                     <- full drain
+ *      global_load_dword v36, v[34:35], off   (cos, addressed FROM the pos result)
+ * -- that is the actual gfx950 disassembly. Two serial round trips where one would do, 180 times
+ * per decode token, with nothing else ready behind the op. It looks like an obvious win.
+ *
+ * It was built: `pos_imm`, an extra instruction field carrying (position of row 0)+1 so that 0
+ * kept the tensor load, patched per step by the host at every headnorm site the way it already
+ * patches `out_row0` at the k/v ones. Token-identical. The ISA confirmed the load and its drain
+ * moved under a branch the fast path skips. Gemma-4-31B bf16, ctx 1024, gfx950, interleaved,
+ * paired per round, n=14:
+ *
+ *     median +0.003 ms/token, mean +0.066, sd 0.196  => the win is bounded above by ~0.04 ms
+ *
+ * A NULL, against the ~0.23 ms predicted from "two 1.3 us round trips x 180 packets". The premise
+ * is what is wrong: `pos` is FOUR BYTES read 180 times per token, so it is permanently L1/L2 hot
+ * and the "round trip" is a cache hit of order 100 ns, not 1.3 us -- and with 8 waves per
+ * workgroup even that is overlapped. Reverted.
+ *
+ * Widening the op was measured too and it REGRESSES; see the comment above the loop below. So
+ * `headnorm_rope`'s 0.385-0.80 ms/token is not recoverable by either route. */
 template <int HD, bool INTERLEAVE = false>
 __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__ x,
                                 const bf16* __restrict__ gamma,
@@ -217,7 +253,7 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
                                 const int* __restrict__ pos, unsigned ntok, unsigned nhead,
                                 float eps, unsigned out_row0, unsigned out_stride, unsigned kv_mask,
                                 unsigned skip_norm, unsigned slice,
-                                unsigned nblk) {
+                                unsigned nblk, unsigned n_batch_kv = 0) {
     constexpr unsigned hd = HD;
     const unsigned lane = threadIdx.x & 63;
     const unsigned wave_in_blk = threadIdx.x >> 6; /* PLOW_WAVES per workgroup */
@@ -244,9 +280,20 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
          * dev_isa.h. out_stride == 0 is the plain [ntok][nhead][hd] output (the q norm). */
         /* `& kv_mask` is the sliding-window RING (dev_isa.h). Full layers pass 0xFFFFFFFF, so
          * this is one v_and_b32 that does nothing — no branch, no runtime flag. */
-        const size_t obase = out_stride
-                                 ? ((size_t)hh * out_stride + ((out_row0 + t) & kv_mask)) * hd
-                                 : ((size_t)(out_row0 + t) * nhead + hh) * hd;
+        /* BATCH>1 decode (i6 = n_batch_kv, mirrors runtime/nvidia/op_norm.cuh): token t IS
+         * sequence t and writes into ITS OWN batch-major ring at ITS OWN position pos[t]:
+         *   obase = ((t*nhead + hh)*out_stride + (pos[t] & kv_mask)) * hd.
+         * Without this the batch index is consumed as a TIME offset (out_row0 + t) into a
+         * single shared ring, so sequences 1..B-1 write K/V over each other's rows — and a
+         * "sequence 0 matches B=1" check cannot see it, because sequence 0 is the one row the
+         * legacy formula gets right. n_batch_kv == 0 keeps the legacy path byte-identical, so
+         * every prefill packet and B=1 decode are unchanged. */
+        const size_t obase =
+            out_stride
+                ? (n_batch_kv != 0
+                       ? ((size_t)(t * nhead + hh) * out_stride + ((unsigned)pg[t] & kv_mask)) * hd
+                       : ((size_t)hh * out_stride + ((out_row0 + t) & kv_mask)) * hd)
+                : ((size_t)(out_row0 + t) * nhead + hh) * hd;
 
         /* PRODUCE: the head AND its weight, all E of each, issued before anything is waited
          * on. One round trip, not E of them. */
@@ -320,7 +367,7 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
                                     const int* __restrict__ pos, unsigned ntok, unsigned nhead,
                                     float eps, unsigned out_row0, unsigned out_stride,
                                     unsigned kv_mask, unsigned skip_norm, unsigned slice,
-                                    unsigned nblk) {
+                                    unsigned nblk, unsigned n_batch_kv = 0) {
     constexpr unsigned hd = HD;
     const unsigned lane = threadIdx.x & 63;
     const unsigned wave_in_blk = threadIdx.x >> 6;
@@ -338,7 +385,12 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
     for (unsigned w = slice * PLOW_WAVES + wave_in_blk; w < total; w += nblk * PLOW_WAVES) {
         const unsigned t = w / nhead, hh = w % nhead;
         const size_t ibase = ((size_t)t * nhead + hh) * hd;
-        const size_t row = (size_t)hh * out_stride + ((out_row0 + t) & kv_mask); /* KV row index */
+        /* KV row index. n_batch_kv != 0 = BATCH>1 decode: sequence t's own batch-major ring at
+         * its own pos[t] (see the bf16 twin above). The per-row `scale` array shares this row,
+         * so both follow the same formula. */
+        const size_t row = n_batch_kv != 0
+                               ? (size_t)(t * nhead + hh) * out_stride + ((unsigned)pg[t] & kv_mask)
+                               : (size_t)hh * out_stride + ((out_row0 + t) & kv_mask);
         const size_t obase = row * hd;
 
         float v[E], g[E];
@@ -569,6 +621,43 @@ __device__ void d_add_norm(bf16* __restrict__ out, bf16* resid, const bf16* a,
  *
  * `resid` aliases `a` in the caller (in-place residual), so neither is __restrict__: every read of a
  * is hoisted into registers before any store to resid. `b`/`out` are distinct. */
+/* ONE WORKGROUP, 120 TIMES PER TOKEN, AND SPLITTING IT ACROSS CUs DOES NOT PAY. MEASURED.
+ *
+ * This op's only parallel axis is ROWS and decode has one row, so it runs on a single CU while
+ * 255 idle and the ready queue behind it is zero — ~5.9 us x 120 = 0.71 ms/token, 4.1% of the
+ * token. It takes the `fits` path at hidden=5376 (RN_REG*PLOW_THREADS = 8192 >= 5376), issuing
+ * a, b, gb, gn in one burst and doing BOTH reductions in registers, so there is no scan to
+ * eliminate and nothing to fold into the producing GEMV: the cost is one CU moving 42 KB.
+ *
+ * The only thing that divides 42 KB is more CUs, and the only axis left is FEATURES. That was
+ * built and measured: three counter-gated phases (partial sum-of-squares of b -> combine +
+ * residual + partial sum-of-squares of resid -> combine + final norm) over rows x k workgroups,
+ * with an f32 partial buffer. Gemma-4-31B bf16, ctx 1024, gfx950, interleaved, paired per round,
+ * vs the single-packet op:
+ *
+ *     k=1 (three packets, ONE feature block -- bit-identical arithmetic, NO widening)  +1.28 ms
+ *     k=4                                                                             +1.11 ms
+ *     k=8                                                                             +1.42 ms
+ *
+ * Read the k=1 row first: it is the whole result. Two extra packets, with the arithmetic proven
+ * bit-identical (token-identical over 48 greedy steps), cost +1.28 ms/token -- ~5.3 us per added
+ * packet, nearly TWICE what the op costs in total. Widening then recovers at most ~0.17 ms of
+ * that and stops helping past k=4. There is no k at which this wins.
+ *
+ * Why the packets cost so much when knob-contract 7a priced a gate at <=0.64 us: 7a split ONE
+ * wide packet into three that run CONCURRENTLY on disjoint CU sets, so their gate waits and
+ * memory ramps overlap. These three are SERIAL — each waits on the last — and decode's DAG is
+ * already a 546-deep chain with nothing ready behind a narrow op. A gate is cheap when it
+ * separates concurrent work and expensive when it lengthens the critical path. Do not quote the
+ * 0.64 us figure for a serial split.
+ *
+ * A single-packet cross-workgroup reduction would avoid the extra gates, and it is not available:
+ * a workgroup would have to spin on a peer's partial, and under the global-queue scheduler the
+ * peer is free to be running some other ready packet. That is a deadlock, which is what the
+ * counter protocol exists to prevent.
+ *
+ * The row axis still works and needs nothing: at decode batch B this op is already B workgroups
+ * wide (crates/devgen/src/lib.rs, `rows`), so batched decode widens it for free. */
 __device__ void d_norm_residual_norm(bf16* __restrict__ out, bf16* resid, const bf16* a,
                                      const bf16* __restrict__ b, const bf16* __restrict__ gb,
                                      const bf16* __restrict__ gn, unsigned rows, unsigned feat,

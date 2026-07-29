@@ -31,7 +31,9 @@ serde_json = "1"
 thiserror = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-nn-graph = { workspace = true }
+# `hub` lets `--model <hf-id>` resolve a config over the network (was the
+# `frontend` crate, now nn-graph's `hub` module).
+nn-graph = { workspace = true, features = ["hub"] }
 costmodel = { workspace = true }
 # Non-optional: the device-blob emitter (`devgen`, always linked for `--emit
 # devblob`) needs the kernel capability inventory for tile selection, and
@@ -47,8 +49,6 @@ rewrite = { workspace = true }
 packet = { workspace = true }
 schedule = { workspace = true }
 plow-asset = { workspace = true }
-# `hub` lets `--model <hf-id>` resolve a config over the network.
-frontend = { workspace = true, features = ["hub"] }
 # Optional: JSON-IPC bridge to the Lean verifier CLI. See the `lean-verify`
 # feature below — without it, `--lean-verify` on the CLI returns a build-time
 # error instead of spawning `plow_verify`.
@@ -60,7 +60,13 @@ packet = { workspace = true }
 costmodel = { workspace = true }
 
 [features]
-default = ["tuner"]
+# `lean-verify` is in the DEFAULT set because the gates are on by default. Not
+# compiling the bridge would make `--no-lean-verify` the effective default with
+# no way to turn it back on, which is the silent-skip failure this whole change
+# exists to remove. It costs dep-graph weight only (serde + thiserror, both
+# already present); at RUNTIME nothing spawns unless a `plow_verify` binary is
+# actually found.
+default = ["tuner", "lean-verify"]
 # Qualified-measurement tuner (`plowc tune`, the tunedb-backed CompilerOracle).
 # On by default; build with `--no-default-features` for a standalone compiler
 # that uses the analytical cost model + capability inventory only — the output
@@ -71,6 +77,8 @@ tuner = ["dep:tunedb"]
 # Off by default so a plain plowc build stands alone. The `gemma4` device-blob
 # emitter it used to sit beside is gone — use `plowc --emit devblob`.
 legacy-gemma-bins = []
-# Compile in the Lean verifier bridge. Adds ~3 crates to the dep graph
-# (serde already present); no runtime effect unless `--lean-verify` is passed.
+# Compile in the Lean verifier bridge. ON BY DEFAULT (see `default` above).
+# Adds ~3 crates to the dep graph (serde already present); no runtime effect
+# unless a `plow_verify` binary is present — without one, the gates warn, skip,
+# and record `lean.verified: false` in `build.json`.
 lean-verify = ["dep:lean_verify", "schedule/lean-verify"]

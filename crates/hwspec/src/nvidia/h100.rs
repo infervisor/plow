@@ -64,6 +64,8 @@ pub const H100_SXM5: GpuSpec = GpuSpec {
         kind: MemKind::Hbm3,
         capacity: Bytes::gib(80),
         bandwidth: GBps(3352.0),
+        // Not measured on this part; a reported bound falls back to the datasheet peak.
+        bandwidth_measured: None,
         bus_width_bits: 5120,
     },
     copy_engines: 3,
@@ -92,6 +94,8 @@ pub const H200_SXM: GpuSpec = GpuSpec {
         kind: MemKind::Hbm3e,
         capacity: Bytes::gib(141),
         bandwidth: GBps(4800.0),
+        // Not measured on this part; a reported bound falls back to the datasheet peak.
+        bandwidth_measured: None,
         bus_width_bits: 6144,
     },
     copy_engines: 3,
@@ -119,6 +123,8 @@ pub const H100_PCIE: GpuSpec = GpuSpec {
         kind: MemKind::Hbm2e,
         capacity: Bytes::gib(80),
         bandwidth: GBps(2039.0),
+        // Not measured on this part; a reported bound falls back to the datasheet peak.
+        bandwidth_measured: None,
         bus_width_bits: 5120,
     },
     copy_engines: 3,
@@ -147,6 +153,8 @@ pub const H100_NVL: GpuSpec = GpuSpec {
         kind: MemKind::Hbm3e,
         capacity: Bytes::gib(94),
         bandwidth: GBps(3938.0),
+        // Not measured on this part; a reported bound falls back to the datasheet peak.
+        bandwidth_measured: None,
         bus_width_bits: 6144,
     },
     copy_engines: 3,

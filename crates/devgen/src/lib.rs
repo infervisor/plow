@@ -51,11 +51,72 @@ use checkpoint::{layer_scalars, validate_coverage};
 mod block;
 use block::{parse_block, write_block_descriptor};
 mod config;
+pub mod k3;
+pub mod kda;
 use config::*;
 mod ladder;
 mod mla;
 use mla::{glm_main, glm_emit_block, kimi_emit_block, nemotron_emit_block, MlaArch};
 pub mod manifest;
+pub mod tune_demand;
+
+// # THE `PLOW_*` FLAG AUDIT (target dependence)
+//
+// Four flags were found that are correct on sm_120 and silently WRONG on gfx950. Each was defined
+// when there was one backend; each fails silently rather than loudly on AMD, because AMD's
+// dispatch `default:` writes NOTHING while sm_120's is `__trap()`. This is the full sweep, so the
+// next person does not repeat it. Flags recorded as neutral are recorded ON PURPOSE.
+//
+// ## Target-dependent, now gated
+//
+// | flag | on sm_120 | on gfx950 before the gate | gate |
+// |------|-----------|---------------------------|------|
+// | `PLOW_FP8` (alone) | emits w8a16, which has a cubin | w8a16 into a w8a8-only arm → null `a_scale` fault | REFUSED (`check_fp8_a_scale_bound`) — ignoring would emit a WRONG packet |
+// | `PLOW_L2_PLACE` | L2 domains in `seg` | overwrites the wave-class tag on a MULTI-SEGMENT program → whole prefill on the flash object, zero logits | skipped per PROGRAM by `Builder::finish` when it has >1 wave class; single-class programs (decode) are placed |
+// | `PLOW_UNISEG` | collapses segments, spurious there | destroyed the wave-class split → zero logits, 8.7 ms "prefill" | ignored + warned (`Builder::deny_uniseg`) |
+// | `PLOW_PF_LADDER=wave` | rungs from the 128x128 sm_120 tile | AMD tiles differently → mis-tuned rungs (degrades, does not corrupt) | ignored quietly |
+//
+// REFUSE vs IGNORE is decided by one question: what does the caller get if the flag is dropped? A
+// correct packet ⇒ ignore, because that is what they wanted. A wrong packet ⇒ refuse, because
+// silently substituting a different computation is the failure mode being eliminated.
+//
+// ## Not a vendor gate — a PAIRED value, fixed by rendering both spellings
+//
+// `PLOW_FA_GF_FULL` must equal the kernel's constant of the same name. Setting it moved only the
+// packet half because `backend_nvcc` rendered the sm_120 spelling and nothing rendered the AMD
+// one; `backend_gfx950` now does. Gating would have been the wrong fix — the flag is meaningful on
+// both targets, it was the RENDERING that was one-sided.
+//
+// ## Covered by construction, not by a per-flag gate
+//
+// `PLOW_FUSE_ARGMAX` emits `GEMV_ARGMAX`, which has no AMD arm — a decode would have argmaxed an
+// untouched buffer and returned token 0 forever. So would the `PLOW_GEMMA_MOE_ROUTER_*` /
+// `PLOW_GEMMA_MOE_TAIL_FUSE` family, whose opcodes (61-77) are absent wholesale. Gating each is
+// whack-a-mole; `check_gfx950_opcode_coverage` checks the emitted STREAM against what the target
+// dispatches, so any flag that reaches for a missing arm is caught whatever its name.
+//
+// ## Verified vendor-NEUTRAL (do not re-audit)
+//
+// * opcode-changing, but every op has an AMD arm: `PLOW_NO_FUSE_QKV`, `PLOW_FP8_HEAD`,
+//   `PLOW_FP8_KV`, `PLOW_FP8_KV_FULL`, `PLOW_MXFP4`, `PLOW_MLA_PREFILL`, `PLOW_MOE_PREFILL`,
+//   `PLOW_GLM_DSA`, `PLOW_GLM_FUSE_A/_G/_B1`, `GLM_ROUTER_OLD` (GLM arm), `GLM_GROUP`;
+// * tuning constants carried in an existing instruction field, read identically by both
+//   interpreters: `PLOW_NS_MUL`, `PLOW_NS_ABS`, `PLOW_NS_FULL_ABS`, `PLOW_GLM_GF`, `PLOW_GLM_NS`,
+//   `PLOW_MAX_CHUNK`, `PLOW_DECODE_BATCH`. (`PLOW_NS_FULL_ABS`'s comment cites an sm_120 part —
+//   that records where it was MEASURED, not a target dependence.)
+// * structure, but geometry-driven rather than ISA-driven: `GLM_EP`, `GLM_MOE_CORESIDENT`,
+//   `PLOW_XR_CUS`, `PLOW_SEG_CLASS_SLICE`, `PLOW_FINE_FORCE`, `PLOW_NO_XREDUCE` (which is
+//   numerically wrong on BOTH targets and says so);
+// * compiler-side only, never in the packet: `PLOW_ROOT`, `PLOW_BLOCK`, `PLOW_SKIP_COVERAGE`,
+//   `GLM_FULL`, `GLM_LAYER`, `GLM_NLAYERS`.
+//
+// ## The inverse case, worth knowing
+//
+// `PLOW_DECODE_TILED` is AMD-only: it emits prefill opcodes into the decode bucket, and the sm_120
+// interpreter traps on every one of them. It is documented as such and needs no gate — a trap is
+// the loud failure. `PLOW_PF_GEMV_HEAD` is the other correctly-handled one: default-on where the
+// arm exists, opt-in where it does not.
+
 
 /// Flash-decode GQA fusion factor on FULL-attention layers. **This must equal the
 /// kernel constant** (`PLOW_NV_FA_GF` on sm_120, `PLOW_FA_GF_FULL` on AMD) or the
@@ -169,13 +230,16 @@ pub fn tile_cost(
     let dma = dma_cycles(spec, (bm * k + k * bn) * 2, false);
     let cost = rounds.saturating_mul(compute.max(dma));
 
-    // Larger tile first on a tie: rank by descending BM*BN.
-    let rank = match bm * bn {
-        a if a >= 65536 => 0, // 256x256
-        a if a >= 16384 => 1, // 128x128
-        _ => 2,               // 64x128 and narrower
-    };
-    cost.saturating_mul(4).saturating_add(rank)
+    // Larger tile first on a tie: rank by descending BM*BN. Continuous rather
+    // than the three hand-written brackets it replaces — those bracketed the
+    // three tiles that existed, so the two rungs added by the tile-inventory
+    // campaign (192x256 = 49152 and 128x256 = 32768) both fell in the SAME
+    // bracket as 256x256 and would have tied with it, then resolved by opcode
+    // NUMBER, which is exactly what the rank term exists to prevent. 65536 is
+    // the largest tile's BM*BN, so rank stays in 0..=7 and inside the x8
+    // headroom the cost is shifted by.
+    let rank = 7 - (7 * (bm * bn).min(65536) / 65536);
+    cost.saturating_mul(8).saturating_add(rank)
 }
 
 /// Pick the GEMM tile + inner-loop kernel for one `(M,N,K)` shape STATICALLY, from the gfx950
@@ -204,26 +268,334 @@ pub fn tile_cost(
 /// MFMA rate and to CU fill, pinned k/v to 256x256 and ran them on 64 CUs. It matches the
 /// measured T=4096 optima (256x256 best) and generalises: Gemma-31B's kv_proj is N=4096, already
 /// saturating, so it stays 256x256 — no regression.
-fn pick_tile(m: u32, n: u32, k: u32, n_cu: u32) -> DevOp {
+/// # Precision is an input, not a label
+///
+/// `quant` selects which rungs are even legal: `KernelSpec::accepts` compares it, so a
+/// `W8A8` signature matches the fp8 instantiations and a `Mxfp4` one the fp4 instantiations.
+/// Before this it was hard-wired to `QuantScheme::None`, the inventory registered bf16 tiles
+/// only, and the fp8 emit site recovered the encoding *after the fact* by mapping the bf16
+/// opcode `pick_tile` returned onto its fp8 twin — a three-arm `match` that had to be kept in
+/// sync by hand and that silently mapped anything it did not recognise to the 256x256 tile.
+/// That mapping is gone; the selector returns the opcode to emit.
+///
+/// It matters numerically and not only structurally: fp8 halves the operand bytes without
+/// halving the MFMA work, so `tile_cost`'s `max(compute, dma)` tips toward compute and the
+/// balance point between CU fill and arithmetic intensity moves. mxfp4 is w4a16 — quarter-byte
+/// weights, bf16 activations and a bf16 MFMA — so it moves further again, in the same
+/// direction, and it is the encoding whose single hard-coded tile produced the worst measured
+/// number in the campaign (Kimi `kv_a_proj`, ≈0.4% of peak).
+///
+/// # Measured, when a measurement exists
+///
+/// `NoMeasurements` used to be passed here verbatim, so the analytical model decided every
+/// tile on every shape and the `tunedb` the tuning architecture specifies was consulted by the
+/// generic `plowc` path only (`plowc/src/tuned.rs`) and never by the AMD emitters. It now
+/// reads the same store, for the gfx950 cell, keyed by the same `(m,n,k,quant)` op case a
+/// campaign files under. No records, wrong hardware, or digests that have moved since the
+/// interpreter was recompiled all degrade to the analytical model — that is what the store's
+/// staleness rules are for, and a stale record is more dangerous than none.
+fn pick_tile(m: u32, n: u32, k: u32, n_cu: u32, quant: kernelcaps::QuantScheme) -> DevOp {
+    select_gemm_over(gfx950_gemm_inventory(), m, n, k, n_cu, quant)
+}
+
+/// [`pick_tile`], public, so a caller outside the emitters can ask what this build would emit.
+///
+/// `plowc tune` reports a selection it re-derives with `NoMeasurements`, which is how it came
+/// to print a different tile than the build emits. Anything that wants to *report* the choice
+/// should ask the same function that *makes* it.
+pub fn gfx950_prefill_tile(
+    m: u32,
+    n: u32,
+    k: u32,
+    n_cu: u32,
+    quant: kernelcaps::QuantScheme,
+) -> DevOp {
+    pick_tile(m, n, k, n_cu, quant)
+}
+
+/// Whether a qualified measurement was found for this shape, and how many rungs it covers.
+///
+/// Reported rather than inferred: "the analytical model chose this" and "a measurement chose
+/// this" are different claims with different calibration tiers, and a build that silently
+/// degrades from the second to the first — because the interpreter was recompiled and every
+/// record went stale — looks identical from the outside otherwise.
+pub fn gfx950_measured_rungs(m: i64, n: i64, k: i64, quant: kernelcaps::QuantScheme) -> usize {
+    gfx950_gemm_measurements()
+        .by_case
+        .get(&tunedb::gemm_op_case(m, n, k, quant))
+        .map(|t| t.len())
+        .unwrap_or(0)
+}
+
+/// [`pick_tile`] against a caller-supplied inventory.
+///
+/// Factored out for the two callers that need a RESTRICTED candidate set: [`glu_fusion_wins`],
+/// which may only consider tiles the GLU epilogue is instantiated at, and the differential test
+/// that pins the three original rungs still ranking among themselves exactly as the
+/// pre-registry picker did. Both need the real ranking, not a copy of it — a second copy is how
+/// the two `pick_tile` implementations in `plowc/src/bin/` drifted apart.
+fn select_gemm_over(
+    inv: &kernelcaps::Inventory,
+    m: u32,
+    n: u32,
+    k: u32,
+    n_cu: u32,
+    quant: kernelcaps::QuantScheme,
+) -> DevOp {
     let spec = hwspec::registry::lookup("MI350X").expect("gfx950 spec in registry");
     let hw = kernelcaps::HardwareFingerprint::from_spec(spec).expect("gfx950 fingerprint");
-    let op = kernelcaps::OpSignature::gemm(kernelcaps::Phase::Prefill, m as i64, n as i64, k as i64);
+    let mut op =
+        kernelcaps::OpSignature::gemm(kernelcaps::Phase::Prefill, m as i64, n as i64, k as i64);
+    op.quant = quant;
 
     // The registry decides what is *executable*; the closure decides which of
     // those is fastest. Fusing both halves into one loop over a constant table
     // is what let this function name a tile the target does not implement
     // whenever it ran for a build that was not gfx950.
     let realization = kernelcaps::select_kernel(
-        gfx950_gemm_inventory(),
+        inv,
         &op,
         &hw,
         kernelcaps::ProfileId::PrefillDense,
-        &kernelcaps::NoMeasurements,
+        gfx950_gemm_measurements().for_shape(m as i64, n as i64, k as i64, quant),
         |kernel| tile_cost(spec, kernel, m as i64, n as i64, k as i64, n_cu),
     )
-    .expect("the gfx950 registry serves every prefill GEMM shape");
+    .unwrap_or_else(|e| {
+        panic!(
+            "{e}\nThe gfx950 prefill inventory carries no {quant:?} GEMM rung. Either the \
+             probe could not preprocess the object that holds them (interp_prefill_fp8 / \
+             interp_prefill_mxfp4 — `kernelcaps::targets::GFX950_QUANT_OBJECTS`), or the \
+             emitter is asking for an encoding this build does not dispatch. Emitting the \
+             bf16 tile instead would be silently wrong: it would read fp4 bytes as bf16."
+        )
+    });
 
     realization.kernel.0
+}
+
+/// Whether the prefill gate|up GEMM should take the FUSED [`DevOp::GemmGlu`] path.
+///
+/// # Why this is not just `pick_tile(..) == DevOp::Gemm`
+///
+/// It used to be, and that spelling stopped being correct the moment the inventory grew rungs
+/// the GLU epilogue is not instantiated at. `d_gemm_glu` exists at 256x256 only, so once
+/// `pick_tile` can answer `GemmWide` or `GemmC5` the old test goes false and gate|up silently
+/// falls back to the UNFUSED triple — three packets instead of one, and `gt`/`ut`
+/// (M x inter x 2 B each) materialised to HBM and read back. On Gemma-31B at M=2048 that is
+/// ~176 MB of traffic bought for a **+6%** tile (measured standalone: c5 1033 TF/s vs c0 974 on
+/// `2048x21504x5376`). A clear net loss, and it would have looked like an improvement in every
+/// per-tile number.
+///
+/// So the question this asks is the one the old spelling MEANT: among the tiles that can carry
+/// the epilogue, is the 256x256 one the winner — i.e. does the shape fill the machine at
+/// 256x256. Restricting the candidate set is what makes it mean that, and it keeps this
+/// decision byte-identical to before the new rungs existed.
+///
+/// **Named residual, not an oversight:** instantiating `d_gemm_glu` at 128x256 and 192x256
+/// would let gate|up have both. Both have BN=256, so `SN == 2` holds and the wave->column remap
+/// the epilogue needs is legal at either. It is left out here to keep this change surgical; the
+/// prize is the +6% above, on the largest GEMM in the model.
+fn glu_fusion_wins(m: u32, n: u32, k: u32, n_cu: u32) -> bool {
+    select_gemm_over(glu_era_inventory(), m, n, k, n_cu, kernelcaps::QuantScheme::None)
+        == DevOp::Gemm
+}
+
+/// The bf16 rungs that existed when the GLU epilogue was written.
+///
+/// The only set over which "the winner is 256x256" means "this shape fills the machine at
+/// 256x256" — which is the question [`glu_fusion_wins`] is really asking, and the question the
+/// pre-campaign `pick_tile(..) == DevOp::Gemm` happened to answer because those were the only
+/// tiles there were.
+fn glu_era_inventory() -> &'static kernelcaps::Inventory {
+    use std::sync::OnceLock;
+    const RUNGS: [DevOp; 3] = [DevOp::Gemm, DevOp::GemmMed, DevOp::GemmSmall];
+    static INV: OnceLock<kernelcaps::Inventory> = OnceLock::new();
+    INV.get_or_init(|| {
+        let src = gfx950_gemm_inventory();
+        kernelcaps::Inventory::probed(
+            src.build().clone(),
+            src.iter().filter(|s| RUNGS.contains(&s.id.0)).cloned(),
+        )
+    })
+}
+
+/// Qualified GEMM measurements for the gfx950 cell, loaded once.
+///
+/// Location comes from `PLOW_TUNEDB` (default `tuning/`, the tree
+/// `tuning/README.md` documents and where the sm_120a and sm_90a cells already
+/// live). A missing store is not an error: it is the cold-start case, and the
+/// analytical model is the declared fallback tier.
+struct GemmMeasurements {
+    /// `op_case -> (opcode -> median ns)`.
+    by_case: std::collections::HashMap<String, std::collections::HashMap<u16, f64>>,
+}
+
+/// The measured costs that apply to ONE shape. `select_kernel` asks per kernel,
+/// so the shape has to be bound before the trait object is handed over.
+struct ShapeCosts<'a>(Option<&'a std::collections::HashMap<u16, f64>>);
+
+impl kernelcaps::MeasuredCosts for ShapeCosts<'_> {
+    fn median_ns(&self, kernel: kernelcaps::KernelId) -> Option<f64> {
+        self.0?.get(&kernel.raw()).copied()
+    }
+}
+
+impl GemmMeasurements {
+    fn for_shape(
+        &self,
+        m: i64,
+        n: i64,
+        k: i64,
+        quant: kernelcaps::QuantScheme,
+    ) -> &dyn kernelcaps::MeasuredCosts {
+        // Leaked rather than returned by value so the borrow outlives the call
+        // without threading a lifetime through `pick_tile`; there is one per
+        // distinct shape in a compile, and a compile is a process.
+        let case = tunedb::gemm_op_case(m, n, k, quant);
+        let hit = self.by_case.get(&case);
+        // THE ONE PLACE the compiler asks the store about a dense GEMM, and therefore the one
+        // place its demand can be observed. `tune_demand` both prints the `PLOW_TUNE_DUMP=1`
+        // line (unchanged) and records the lookup as typed data for `plowc tune gemm
+        // --shapes auto`.
+        //
+        // The campaign's shape list in scripts/rebench_tune_gemm.sh was authored BY HAND, and
+        // that is how GLM-5.2 came to have exactly two measured shapes (M=128 N=256 K=6144,
+        // M=128 N=576 K=6144) while every M>=256 record in the store was a Gemma-31B or Qwen
+        // shape with K in {2560,4096,5376,8192,21504} — never GLM's K=6144. So GLM prefill above
+        // the smallest bucket selected tiles from the ANALYTICAL MODEL, and `tuned_tile_selection`
+        // still passed because SOME qualified record existed. Deriving the list from this call
+        // site instead of by hand is what stops that recurring.
+        tune_demand::record(m, n, k, quant, hit.is_some());
+        Box::leak(Box::new(ShapeCosts(hit)))
+    }
+}
+
+fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
+    use std::sync::OnceLock;
+    static M: OnceLock<GemmMeasurements> = OnceLock::new();
+    M.get_or_init(|| {
+        let mut by_case: std::collections::HashMap<
+            String,
+            std::collections::HashMap<u16, f64>,
+        > = Default::default();
+        // EMPTY means "no store", which is how `plowc --no-tuning` reaches here. Unset means
+        // "the default tree" — the two are deliberately different: a compile that never asked
+        // about tuning should still get the calibrated answer, and one that explicitly asked
+        // for the analytical model must get it.
+        let root = match std::env::var("PLOW_TUNEDB") {
+            Ok(s) if s.is_empty() => return GemmMeasurements { by_case },
+            Ok(s) => s,
+            Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tuning")
+                .to_string_lossy()
+                .into_owned(),
+        };
+        let store = tunedb::TuneStore::new(std::path::PathBuf::from(root));
+        // Digests come from the PROBED build, not from a constant: a tile edit
+        // in op_gemm.h changes the preprocessed digest, which is what makes the
+        // previous campaign's records stale instead of silently authoritative.
+        let want = tunedb::Digests {
+            implementation: gfx950_gemm_inventory().build().label(),
+            interpreter: gfx950_gemm_inventory().build().label(),
+            toolchain: gfx950_gemm_inventory().build().toolchain.clone(),
+            oracle: tunedb::GEMM_ORACLE.to_string(),
+        };
+        let Ok(records) = store.load_kernels(tunedb::GFX950_CELL) else {
+            return GemmMeasurements { by_case };
+        };
+        let mut stale = 0usize;
+        for r in records {
+            if !r.state.is_selectable() {
+                continue;
+            }
+            if !r.digests.stale_against(&want).is_empty() {
+                stale += 1;
+                continue;
+            }
+            let e = by_case.entry(r.op_case.clone()).or_default();
+            // Best-of, so a re-measured campaign does not depend on file order.
+            let cur = e.entry(r.kernel_id).or_insert(f64::INFINITY);
+            *cur = cur.min(r.stats.median_ns);
+        }
+        // TOTAL staleness must be LOUDER than partial staleness, not silent.
+        //
+        // This was gated on `!by_case.is_empty()`, so the one case that actually matters --
+        // EVERY record stale, nothing usable, silent fallback to the analytical model --
+        // printed nothing at all. "Fell back to analytical" and "was never measured" produce
+        // identical bytes, so silence reads as success. A wholly stale campaign is a
+        // re-measure request and has to say so.
+        if stale > 0 {
+            eprintln!(
+                "  tunedb {}: {stale} record(s) skipped as STALE against the probed build {}{}",
+                tunedb::GFX950_CELL,
+                want.interpreter,
+                if by_case.is_empty() {
+                    " -- NO usable records remain, so tile selection fell back to the \
+                     analytical model. Re-run the campaign or this compile is unmeasured."
+                } else {
+                    ""
+                }
+            );
+        }
+        GemmMeasurements { by_case }
+    })
+}
+
+/// Hand the GEMV op cases this build has qualified, non-stale measurements for down to
+/// [`packet::devbuild`], so its `PLOW_TUNE_DUMP` census can report HIT/MISS.
+///
+/// # Why the answer is pushed down instead of pulled up
+///
+/// The GEMV census hook lives in `packet::devbuild::Builder::emit_dep` — the one function
+/// every GEMV emit site in this crate, `mla.rs` and `kda.rs` funnels through — because the
+/// alternative is instrumenting thirty-odd call sites by hand, which is the same mistake as
+/// the hand-authored GEMM shape list one level down. `packet` has no dependencies by design
+/// (it is shared with the C/CUDA runtime), so it cannot read the store; this function is the
+/// seam.
+///
+/// The staleness rule is the GEMM one, for the GEMM reason: records are keyed by the
+/// PREPROCESSED interpreter digest, and a stale record is more dangerous than none because
+/// "fell back to the analytical model" and "was never measured" otherwise produce identical
+/// output. Here it is only a census label — a MISS costs nothing but a MISS mislabelled HIT
+/// would make an unmeasured campaign look complete, which is the exact failure being fixed.
+///
+/// Call once per emit. Idempotent: `packet` stores it in a `OnceLock`.
+pub fn install_gfx950_gemv_cases() {
+    let mut cases: std::collections::HashSet<String> = Default::default();
+    let root = match std::env::var("PLOW_TUNEDB") {
+        Ok(s) if s.is_empty() => {
+            packet::devbuild::set_tuned_gemv_cases(cases);
+            return;
+        }
+        Ok(s) => s,
+        Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tuning")
+            .to_string_lossy()
+            .into_owned(),
+    };
+    let want = tunedb::Digests {
+        implementation: gfx950_gemm_inventory().build().label(),
+        interpreter: gfx950_gemm_inventory().build().label(),
+        toolchain: gfx950_gemm_inventory().build().toolchain.clone(),
+        oracle: tunedb::GEMV_ORACLE.to_string(),
+    };
+    if let Ok(records) = tunedb::TuneStore::new(std::path::PathBuf::from(root))
+        .load_kernels(tunedb::GFX950_CELL)
+    {
+        for r in records {
+            // Every GEMV family, not just the plain one: `DevOp::gemv_case` puts the arm in
+            // the key (`gemv`/`gemvglu`/`gemvqkv`/`gemvblk`/`gemvargmax`) so the store cannot
+            // rank a fused op against an unfused one. `profile` is the field that separates
+            // this cell from the prefill-GEMM one inside the same file.
+            if r.profile == "decode_gemv"
+                && r.state.is_selectable()
+                && r.digests.stale_against(&want).is_empty()
+            {
+                cases.insert(r.op_case);
+            }
+        }
+    }
+    packet::devbuild::set_tuned_gemv_cases(cases);
 }
 
 /// The gfx950 dense-GEMM inventory, derived by probing the interpreter object.
@@ -255,29 +627,59 @@ fn gfx950_gemm_inventory() -> &'static kernelcaps::Inventory {
     })
 }
 
-/// Analytical fallback inventory for gfx950 — the three tile instantiations
-/// from `runtime/amd/op_gemm.h` (GM_BM/BN/BK, GM_MD_*, GM_SM_*). These are
-/// compile-time constants in the interpreter object and change only with an
-/// intentional ABI-breaking edit to op_gemm.h.
+/// Every gfx950 prefill GEMM rung, in each of the three weight encodings, exactly as a probe
+/// of `runtime/amd/op_gemm.h` would report it: `(bf16, fp8, mxfp4, BM, BN, BK)`.
+///
+/// ONE table, because there were two identical copies of the three-tile version — the
+/// analytical fallback and the test fixture — and a rung added to one and not the other gives
+/// a compiler that selects differently under test than in production. That is the same class
+/// of drift `kernelcaps` exists to prevent; it just happened to be inside this file.
+///
+/// These are compile-time constants in the interpreter object and change only with an
+/// intentional edit to `op_gemm.h`.
+const GFX950_RUNGS: [(DevOp, DevOp, DevOp, i64, i64, i64); 5] = [
+    (DevOp::Gemm, DevOp::GemmFp8, DevOp::GemmMxfp4, 256, 256, 64),
+    (DevOp::GemmMed, DevOp::GemmMedFp8, DevOp::GemmMedMxfp4, 128, 128, 64),
+    (DevOp::GemmSmall, DevOp::GemmSmallFp8, DevOp::GemmSmallMxfp4, 64, 128, 64),
+    (DevOp::GemmWide, DevOp::GemmWideFp8, DevOp::GemmWideMxfp4, 128, 256, 64),
+    (DevOp::GemmC5, DevOp::GemmC5Fp8, DevOp::GemmC5Mxfp4, 192, 256, 64),
+];
+
+/// [`GFX950_RUNGS`] as `KernelSpec`s, tagged with the encoding each serves.
+///
+/// The `mma_dtype` for mxfp4 is bf16 and not fp4: the fp4 prefill GEMM is w4a16 and dequantizes
+/// in the B-fetch, so the matrix instruction it issues is the ordinary bf16 MFMA. Mirrors
+/// `kernelcaps::targets::GFX950_QUANT_OBJECTS`, which is what the real probe uses.
+fn gfx950_rung_specs(build_label: &str) -> Vec<kernelcaps::KernelSpec> {
+    use kernelcaps::{KernelSpec, QuantScheme};
+    use hwspec::{IsaLevel, MmaDtype};
+    let mut out = Vec::with_capacity(GFX950_RUNGS.len() * 3);
+    for (bf16, fp8, mx, bm, bn, bk) in GFX950_RUNGS {
+        for (op, quant, mma) in [
+            (bf16, QuantScheme::None, MmaDtype::Bf16),
+            (fp8, QuantScheme::W8A8, MmaDtype::Fp8),
+            (mx, QuantScheme::Mxfp4, MmaDtype::Bf16),
+        ] {
+            let body = format!("gfx950:{}@{build_label}", op.c_name());
+            out.push(
+                KernelSpec::gemm_tile(op, IsaLevel::Gfx950, bm, bn, bk, &body)
+                    .with_quant(quant, mma),
+            );
+        }
+    }
+    out
+}
+
+/// Analytical fallback inventory for gfx950, used when the probe cannot run (no hipcc).
 fn gfx950_analytical_inventory() -> kernelcaps::Inventory {
-    use packet::dev::DevOp;
     let build = kernelcaps::BuildId::new(
         hwspec::IsaLevel::Gfx950,
         ["PLOW_BUCKET_DECODE=0".to_string()],
         "analytical-fallback",
         "analytical-fallback",
     );
-    kernelcaps::Inventory::probed(
-        build,
-        [
-            (DevOp::Gemm, 256, 256, 64, "gfx950:exec_gemm"),
-            (DevOp::GemmMed, 128, 128, 64, "gfx950:exec_gemm_med"),
-            (DevOp::GemmSmall, 64, 128, 64, "gfx950:exec_gemm_small"),
-        ]
-        .map(|(op, bm, bn, bk, body)| {
-            kernelcaps::KernelSpec::gemm_tile(op, hwspec::IsaLevel::Gfx950, bm, bn, bk, body)
-        }),
-    )
+    let specs = gfx950_rung_specs(&build.label());
+    kernelcaps::Inventory::probed(build, specs)
 }
 
 /// Test fixture standing in for a probe.
@@ -288,7 +690,6 @@ fn gfx950_analytical_inventory() -> kernelcaps::Inventory {
 /// the real probe is unavailable here.
 #[cfg(test)]
 fn gfx950_gemm_inventory() -> &'static kernelcaps::Inventory {
-    use packet::dev::DevOp;
     use std::sync::OnceLock;
     static INV: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     INV.get_or_init(|| {
@@ -298,19 +699,8 @@ fn gfx950_gemm_inventory() -> &'static kernelcaps::Inventory {
             "test-fixture",
             "test-fixture",
         );
-        // The three instantiations in runtime/amd/op_gemm.h, with the GM_* tile
-        // constants a probe would expand.
-        kernelcaps::Inventory::probed(
-            build,
-            [
-                (DevOp::Gemm, 256, 256, 64, "gfx950:exec_gemm"),
-                (DevOp::GemmMed, 128, 128, 64, "gfx950:exec_gemm_med"),
-                (DevOp::GemmSmall, 64, 128, 64, "gfx950:exec_gemm_small"),
-            ]
-            .map(|(op, bm, bn, bk, body)| {
-                kernelcaps::KernelSpec::gemm_tile(op, hwspec::IsaLevel::Gfx950, bm, bn, bk, body)
-            }),
-        )
+        let specs = gfx950_rung_specs(&build.label());
+        kernelcaps::Inventory::probed(build, specs)
     })
 }
 
@@ -435,7 +825,32 @@ struct LW {
     // FP8 DECODE weights (PLOW_FP8) + their per-output-channel f32 dequant scales. The bf16 wq..wd
     // above stay bound (from the bf16 checkpoint) and feed PREFILL's GEMM; these fp8 twins feed the
     // decode GEMV. TENSOR_NONE in bf16 mode. The fp8 weight/scale tensors are declared under an
-    // "fp8/" name prefix that the loader routes to the fp8 checkpoint (see gemma4_chat.c).
+    // ===== THE `fp8/` KEY CONTRACT (one spelling, no transformation) =====================
+    //
+    // A packet tensor named `fp8/<name>` is looked up in the fp8 twin checkpoint under the key
+    // `fp8/<name>` — VERBATIM, prefix included. The prefix is part of the key, not a routing
+    // marker to be stripped on the way in.
+    //
+    // It was ambiguous, and ambiguity here is not cosmetic: the emitter declared `fp8/<name>`,
+    // `quantize_fp8.py` wrote `fp8/<name>`, and a loader stripped the prefix and looked up
+    // `<name>` — so a freshly generated fp8 checkpoint could not load at all. A contract with two
+    // accepted spellings is a bug waiting to resurface, so it is stated here once and pinned by
+    // `fp8_key_tests` below.
+    //
+    // Verbatim rather than stripped, deliberately. Stripping is a TRANSFORMATION, and a
+    // transformation applied in one place and not another is exactly the failure above; with the
+    // key equal to the declared name there is nothing to apply. It also makes a twin file
+    // self-describing — every key says `fp8/`, so it cannot be mistaken for a bf16 checkpoint, and
+    // a bf16 name can never accidentally resolve against fp8 bytes.
+    //
+    // The ONE legitimate strip is in `checkpoint.rs`'s coverage gate, which maps a declared
+    // `fp8/<name>` back to `<name>` to answer a different question — "is the bf16 weight <name>
+    // covered by something?" — against the ORIGINAL checkpoint. That is a coverage mapping, not a
+    // key lookup, and it is commented as such there.
+    //
+    // The scale twin is `fp8/<name>_scale`: f32, one per OUTPUT CHANNEL (row of the [out,in]
+    // weight), and the dequant is `w8 * scale` — matching `quantize_fp8.py` (`scale = amax/448`,
+    // `w8 = round_e4m3(w/scale)`) and the device epilogue (`acc * a_scale[m] * w_scale[n]`).
     wq8: u32,
     wk8: u32,
     wv8: u32,
@@ -503,14 +918,18 @@ fn declare(
         (kvh_local(c.kvh_slide, tp, 0) * c.hd_slide).max(kvh_local(c.kvh_full, tp, 0) * c.hd_full);
     let hd_max = c.hd_slide.max(c.hd_full);
     let inter_sh = c.inter / tp;
-    // lm_head is REPLICATED under TP (Phase 2), not vocab-sharded. Two reasons the
-    // sharded path is deferred: (1) Gemma ties lm_head to embed_tokens, and the emitted
-    // lm_head Gemv reads `emb` from offset 0 with no per-rank vocab offset, so a vocab
-    // shard would make every rank argmax the SAME low-vocab slice (silently wrong);
-    // (2) XArgmaxFin (the cross-rank id-fold) is a stub. Replicating lm_head keeps the
-    // full-vocab argmax correct on every rank (they agree), costs no extra memory (emb
-    // is already fully resident for the embed lookup), and is one gemv/token — not the
-    // decode bottleneck. Sharded lm_head + XArgmaxFin is a Phase-3 item (§8d, §13).
+    // lm_head is REPLICATED under TP here, not vocab-sharded. ONE reason is left, and it is
+    // specific to THIS emitter: Gemma TIES lm_head to embed_tokens, and the emitted lm_head Gemv
+    // reads `emb` from offset 0 with no per-rank vocab offset, so a vocab shard would make every
+    // rank argmax the SAME low-vocab slice (silently wrong). Replicating keeps the full-vocab
+    // argmax correct on every rank (they agree), costs no extra memory (emb is already fully
+    // resident for the embed lookup), and is one gemv/token.
+    //
+    // The OTHER reason this comment used to give — "XArgmaxFin (the cross-rank id-fold) is a stub"
+    // — is no longer true: `d_xargmax_fin_mega` (runtime/amd/op_collective.h) is implemented and
+    // GLM-5.2's untied head takes the column-parallel arm under `GLM_SHARD_HEAD=1` for a measured
+    // -0.26 ms/token, bit-identical (perf-data/glm52-decode-emitter-abs.md §1). Sharding a TIED
+    // head additionally needs the per-rank vocab offset on the `emb` read.
     let vocab_sh = c.vocab;
     let ac = |b: &mut Builder, n: &str, sz: u64| b.tensor(&format!("act.{n}"), sz);
 
@@ -1014,12 +1433,93 @@ fn declare(
     t
 }
 
-const Q_TILE_ROWS: u32 = 8 * 32; // PLOW_WAVES * FA_BQ — keep in step with amd_common.h
+/// KV-SPLIT HEURISTIC denominator: how many query rows the emitter *charges* to one flash work
+/// item when sizing `nsplit`. NOT the kernel's tile height — see [`FLASH_Q_TILE_ROWS`], which is
+/// half this. Left at 256 deliberately: `nsplit` here and the `Opart`/`mlpart` capacity in
+/// `max_splits` are derived from the SAME number, so they cannot disagree with each other, and
+/// changing it repartitions every prefill program (a measurement, not a correctness fix).
+const Q_TILE_ROWS: u32 = 8 * 32;
+
+/// The q-tile height `d_flash_prefill` ACTUALLY uses: `PLOW_WAVES * FA_BQ`, with `PLOW_WAVES = 4`.
+///
+/// `FlashPrefill` is wave-class 4 (`Builder::wave_class` in `crates/packet/src/devbuild.rs`), so
+/// it executes in the object built with `-DPLOW_WG_WAVES=4` (`scripts/build_gfx950.sh`), and
+/// `runtime/amd/op_attention.h:49` says it in as many words — *"query rows per wave; 4 waves =>
+/// 128-row q-tile"*. `runtime/amd/op_attention.h:221` then tiles with `PLOW_WAVES * FA_BQ`.
+///
+/// This — not [`Q_TILE_ROWS`] — is the number [`flash_merge_map`] must use to decide which flash
+/// work item wrote a given query row. Charging 256 there attributes every row in `[128, 256)` of a
+/// tile to the wrong q-tile, which puts the wrong producer slices in the merge's [`Dep::Fine`]
+/// wait set: the merge is then gated on a flash workgroup that did not write its `(o, m, l)`
+/// partials and ungated on the one that did. That is a silent wrong token, not a crash.
+///
+/// It is INERT for every head count shipped today (8/16/32/64) because `heads * nsplit` divides
+/// `nblk_f`, so the producer indices alias mod `nblk_f` and the union comes out complete anyway —
+/// the map is byte-identical at 256 and 128 for those shapes. It is NOT inert for a head count
+/// that does not divide 256: at `heads = 40, t = 256` half the producer edges go missing.
+const FLASH_Q_TILE_ROWS: u32 = 4 * 32;
 
 /// LDS the GEMM arena holds, in halves. Mirrors `GM_LDS_HALVES` in `op_gemm.h`:
 /// `2*(GM_BM+GM_BN)*(GM_BK+8)` = `2*(256+256)*72`. A GEMV can stage its A-operand on-chip only
 /// if `M*K` fits here, which [`DevOp::GemvGlu`] requires (it re-reads x per output column).
 const GM_LDS_HALVES: u64 = 2 * (256 + 256) * (64 + 8);
+
+/// `PLOW_GEMV_MAXM` from `runtime/amd/op_gemm.h` — the widest row bucket the GEMV path has a
+/// compiled arm for. Mirrored, not read: it is a static assert over there
+/// (`PLOW_SASSERT(PLOW_GEMV_MM <= PLOW_GEMV_MAXM, ...)`) and a build-script clamp here.
+const GEMV_MAXM: u32 = 16;
+
+/// The compiled GEMV row bucket (`PLOW_GEMV_MM`) the decode object will be built at.
+///
+/// Mirrors `scripts/build_gfx950.sh`: `next_pow2(PLOW_DECODE_BATCH)`, clamped to
+/// [`GEMV_MAXM`], with an explicit `PLOW_GEMV_MM` override taking precedence. The override is
+/// what makes an object NARROWER than the program it serves expressible at all, and that
+/// combination is the whole subject of `plans/knob-contract.md` §6g-WALK.
+fn gemv_row_bucket(t: u32) -> u32 {
+    if let Some(v) = std::env::var("PLOW_GEMV_MM").ok().and_then(|s| s.parse::<u32>().ok()) {
+        return v.clamp(1, GEMV_MAXM);
+    }
+    let mut p = 1u32;
+    while p < t.max(1) {
+        p *= 2;
+    }
+    p.min(GEMV_MAXM)
+}
+
+/// Rows a fused decode GEMV stages in LDS at once — the quantity the fusion gate must bound.
+///
+/// # This is the §6g-WALK companion change, and without it the walk buys nothing
+///
+/// `gemv_qkv_rows` and `gemv_glu_rows` read `x` only through LDS — `op_gemm.h` says so
+/// outright ("x is ALWAYS staged in LDS here: plowc emits this op only when M*K fits
+/// GM_LDS_HALVES") — so the emitter must not choose the fused opcode unless the staged rows
+/// fit. It gated on `t * hidden`, and at `t = 16, hidden = 5376` that is `86016 > 73728`, so
+/// exactly 13 of 16 rows fit. That mis-gate is the third silent-corruption bug of the
+/// campaign (§6g-BATCH: slots 13/14/15 fluent-but-WRONG), and the fix at the time was to
+/// switch the fusion OFF at t=16 rather than to make it fit.
+///
+/// Switching it off is not free, and §6g-BATCH prices it: the B=16 device ceiling is
+/// **142.4 tok/s against B=8's 202.3** — a 30% REGRESSION at twice the batch. Two things
+/// cause it at once, `MM=16` spilling (16 scratch ops, 5536 B/lane) and the loss of BOTH
+/// `fuse_qkv` and `glu_fused`; the instruction stream differs in COMPOSITION between t=8 and
+/// t=16, not just in width.
+///
+/// `PLOW_GEMV_WALK` (`op_gemm.h`, default 0) moves the staging INSIDE the row loop, so the
+/// bound becomes `min(MM, M) * K` — **independent of M**. At `MM = 8`, `8 * 5376 = 43008`
+/// fits, and a t=16 program keeps both fusions. That is what this function expresses, and it
+/// is the falsifiable half of the walk's case: at MM=8 serving t=16, B=16 should recover from
+/// 142.4 toward 202.3. If it does not, the LDS/fusion explanation is wrong.
+///
+/// **Byte-identical when the walk is off, and byte-identical when it is on with no
+/// `PLOW_GEMV_MM` override**, because then `gemv_row_bucket(t) >= t` and the `min` is `t`.
+/// The gate only moves for the build that was built to move it.
+fn gemv_staged_rows(t: u32) -> u32 {
+    if std::env::var("PLOW_GEMV_WALK").ok().as_deref() == Some("1") {
+        t.min(gemv_row_bucket(t))
+    } else {
+        t
+    }
+}
 
 /// Largest prefill chunk. Mirrors `PLOW_MAX_CHUNK` in `dev_isa.h`.
 ///
@@ -1183,37 +1683,13 @@ fn headnorm_wg_of(nblk: u32, w: u32) -> u32 {
 
 const WAVES: u32 = 8; // PLOW_WAVES
 
-/// MoE GLU → Down dependency map: Down block `b` only needs the GLU blocks that produce
-/// the slots it reads. Without this, Down waits for ALL GLU blocks (coarse gate), wasting
-/// ~2.6M cycles per layer on the critical path.
-///
-/// Layout: GLU produces flat `[k * I_moe]` outputs distributed round-robin across `nblk`
-/// blocks (per_g = ceil(k*I_moe/nblk) per block). Down produces flat `[k * H]` outputs
-/// similarly (per_d = ceil(k*H/nblk)). Down block `b` handles flat indices
-/// `[b*per_d, (b+1)*per_d)`. For flat index `f`, `slot = f / H`. Down reads
-/// `fu[slot*I_moe..(slot+1)*I_moe]` — so it depends on GLU blocks covering that range.
-fn moe_down_fine_map(top_k: u32, i_moe: u32, hidden: u32, nblk: u32) -> Vec<Vec<u32>> {
-    let total_glu = top_k * i_moe;
-    let total_down = top_k * hidden;
-    let per_g = total_glu.div_ceil(nblk);
-    let per_d = total_down.div_ceil(nblk);
-    (0..nblk)
-        .map(|b| {
-            let f0 = b * per_d;
-            let f1 = ((b + 1) * per_d).min(total_down);
-            if f0 >= total_down {
-                return vec![];
-            }
-            let slot_lo = f0 / hidden;
-            let slot_hi = (f1 - 1) / hidden;
-            let glu_lo = slot_lo * i_moe;
-            let glu_hi = (slot_hi + 1) * i_moe;
-            let g_first = glu_lo / per_g;
-            let g_last = (glu_hi - 1) / per_g;
-            (g_first..=g_last.min(nblk - 1)).collect()
-        })
-        .collect()
-}
+// `moe_down_fine_map` lived here: a GLU→Down fine dependency map that would have let a Down
+// block wait only on the GLU blocks producing the slots it reads. It had no caller and had not
+// had one for some time — the emitters use `Dep::Coarse` throughout, on the argument recorded
+// in `devbuild.rs` (via `lean-plow/Plow/CounterGranularity.lean`'s `collapse`): where the work
+// is UNIFORM across each stage's slices, the fine schedule's makespan is provably identical to
+// the coarse one. Every MoE expert slice is identical, so the map bought nothing it could not
+// already prove. Removed rather than left compiling as documentation of an unused idea.
 
 /// The flash → merge edge is SPARSE, and today it is gated as if it were dense.
 ///
@@ -1228,8 +1704,18 @@ fn moe_down_fine_map(top_k: u32, i_moe: u32, hidden: u32, nblk: u32) -> Vec<Vec<
 /// 16.9 ms token: the gate opens on the slowest CU, and 256 CUs doing this work spread over
 /// 9.6-16.6 us.
 ///
-/// `rows_per_item` is how many query rows one flash work item covers: `Q_TILE_ROWS` in
-/// prefill (flash tiles the q axis) and 1 in decode (there is one query row).
+/// `rows_per_item` is how many query rows one flash work item covers: [`FLASH_Q_TILE_ROWS`] in
+/// prefill (flash tiles the q axis) and 1 in decode (there is one query row). It MUST be the
+/// kernel's tile height, not the `nsplit` heuristic's [`Q_TILE_ROWS`] — see the former's docs for
+/// what a mismatch costs.
+///
+/// D-SPLIT. `d_flash_merge` decomposes into `(b, h, d-chunk)` with
+/// `dsplit = ceil(nblk_m / n_bh)`, item `w = (b*n_head + h)*dsplit + dp`. `dsplit` is DERIVED
+/// from the workgroup count on both sides — here and in the kernel — precisely so the two cannot
+/// drift: widening the merge's CU list is the only input. At `nblk_m <= n_bh` this is `dsplit==1`
+/// and the map is identical to the pre-split one. The producer set of a merge item does not
+/// depend on `dp` (every D-chunk of a `(b,h)` reads the same `nsplit` flash slices), so widening
+/// adds no edges — it only spreads the same edges over more consumers.
 fn flash_merge_map(
     n_bh: u32,
     nsplit: u32,
@@ -1238,12 +1724,14 @@ fn flash_merge_map(
     nblk_f: u32,
     nblk_m: u32,
 ) -> Vec<Vec<u32>> {
+    let dsplit = nblk_m.div_ceil(n_bh.max(1)).max(1);
     (0..nblk_m)
         .map(|j| {
-            let mut s: Vec<u32> = (0..n_bh)
+            let mut s: Vec<u32> = (0..n_bh * dsplit)
                 .filter(|w| w % nblk_m == j) // the merge items THIS workgroup runs
                 .flat_map(|w| {
-                    let (b, h) = (w / n_head, w % n_head);
+                    let hb = w / dsplit; // the (b, h) this D-chunk belongs to
+                    let (b, h) = (hb / n_head, hb % n_head);
                     let qt = b / rows_per_item; // which flash q-tile covers this row
                     (0..nsplit).map(move |sp| ((qt * n_head + h) * nsplit + sp) % nblk_f)
                 })
@@ -1253,6 +1741,174 @@ fn flash_merge_map(
             s
         })
         .collect()
+}
+
+/// How many D-chunks each `(row, head)` merge item is split into.
+///
+/// **This was the L1 decode lever and it is MEASURED DEAD. Default 1; do not change it.**
+///
+/// The premise was sound on paper: `flash_merge` is 32 workgroups on a 256-CU machine at
+/// Gemma-31B decode (`n_bh = t*heads = 32`), holds the machine for 0.928 ms/token with a
+/// measured-EMPTY ready queue behind it, and is embarrassingly parallel over D — so `dsplit=8`
+/// takes it to 256 workgroups with no new reduction and no new gate, which an ideal-schedule
+/// simulation on the real DAG priced at **−0.805 ms/token**, the largest single decode lever.
+///
+/// Measured (MI355X, Gemma-4-31B bf16, ctx 1024, interleaved, same code object in every arm):
+/// **+0.555 ms/token at dsplit=8**, monotone in width (+0.243 at 2, +0.348 at 4), n=28 per arm
+/// over three independent sets, every arm token-identical. Wrong sign, and not marginally.
+/// `d_flash_merge` in `runtime/amd/op_attention.h` carries the numbers and the mechanism
+/// (widening an op widens its COARSE consumer's gate: o_proj then waits on a max over 256
+/// stragglers instead of 32).
+///
+/// The knob survives as the reproduction vehicle only. At 1 the emitted blob is byte-identical
+/// to the pre-change emitter's, so nothing ships differently.
+fn flash_merge_dsplit() -> u32 {
+    std::env::var("PLOW_FLASH_MERGE_DSPLIT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+#[cfg(test)]
+mod flash_merge_map_tests {
+    use super::*;
+
+    /// The kernel's work walk, re-implemented here. If `d_flash_merge`'s decomposition and this
+    /// map ever disagree the failure is a SILENT wrong token, so pin the contract in a test.
+    fn kernel_items(n_bh: u32, nblk_m: u32, j: u32) -> Vec<u32> {
+        let dsplit = nblk_m.div_ceil(n_bh.max(1)).max(1);
+        (j..n_bh * dsplit).step_by(nblk_m as usize).collect()
+    }
+
+    /// Every merge item is run by EXACTLY ONE workgroup, at any width — including widths that are
+    /// not a multiple of `n_bh` (there `n_work > nblk_m` and the walk wraps).
+    #[test]
+    fn every_d_chunk_is_covered_exactly_once() {
+        for nblk_m in [1u32, 8, 32, 64, 200, 256] {
+            let n_bh = 32;
+            let dsplit = nblk_m.div_ceil(n_bh).max(1);
+            let mut seen: Vec<u32> = (0..nblk_m).flat_map(|j| kernel_items(n_bh, nblk_m, j)).collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..n_bh * dsplit).collect::<Vec<_>>(), "nblk_m={nblk_m}");
+        }
+    }
+
+    /// `d_flash_prefill`'s OWN q-tile walk, re-implemented from `runtime/amd/op_attention.h:221`
+    /// and `:228-230`: `q_tiles = ceil(n_q / (PLOW_WAVES*FA_BQ))`, item
+    /// `w = (qt*n_head + h)*nsplit + sp`, run by workgroup `w % nblk_f`. The tile height is
+    /// `PLOW_WAVES*FA_BQ` and `FlashPrefill` runs 4-wave, so it is 128 — `FA_BQ`'s own comment at
+    /// `op_attention.h:49` spells that out.
+    ///
+    /// The `128` is written out here rather than taken from [`FLASH_Q_TILE_ROWS`] ON PURPOSE:
+    /// this is the KERNEL's number, transcribed from the kernel, and a test that read the
+    /// emitter's constant for both sides would be a tautology that passes at any value.
+    fn kernel_flash_producers(row: u32, h: u32, nsplit: u32, n_head: u32, nblk_f: u32) -> Vec<u32> {
+        const KERNEL_WAVES: u32 = 4; // scripts/build_gfx950.sh: the flash object is -DPLOW_WG_WAVES=4
+        const KERNEL_FA_BQ: u32 = 32; // runtime/amd/op_attention.h:49
+        let qt = row / (KERNEL_WAVES * KERNEL_FA_BQ);
+        (0..nsplit).map(|sp| ((qt * n_head + h) * nsplit + sp) % nblk_f).collect()
+    }
+
+    /// EVERY flash slice that wrote a merge item's partials must be in that item's wait set.
+    ///
+    /// This is the flash -> merge `Dep::Fine` edge, and prefill programs KEEP their fine edges
+    /// (`crates/packet/src/devbuild.rs`, the `PLOW_CHAIN_BYPASS` note: "the prefill programs carry
+    /// Fine edges and are left untouched"). A missing edge is not a hang and not a fault: the
+    /// merge reads `(o, m, l)` partials the flash has not written yet and folds garbage into
+    /// `n.at`. Fluent, wrong, and invisible.
+    ///
+    /// The head counts below are the point. At 8/16/32/64 the producer indices alias mod `nblk_f`
+    /// and a WRONG `rows_per_item` still yields a complete map, which is why this survived; at 40
+    /// (Qwen3-14B, Qwen2.5-14B, Llama-2-13B) and 28 (Qwen2-57B) it does not.
+    #[test]
+    fn merge_waits_on_the_slice_that_actually_wrote_the_row() {
+        let n_cu = 256u32;
+        for heads in [8u32, 16, 20, 24, 28, 32, 40, 48, 64] {
+            for t in [128u32, 192, 256, 384, 512, 768, 1024, 2048] {
+                let ns = n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1)).max(1);
+                if ns <= 1 {
+                    continue; // fused: flash normalizes in its epilogue, no FlashMerge op
+                }
+                let (n_bh, nblk_f) = (t * heads, n_cu);
+                let nblk_m = (n_bh * flash_merge_dsplit()).min(n_cu).max(1);
+                let map = flash_merge_map(n_bh, ns, FLASH_Q_TILE_ROWS, heads, nblk_f, nblk_m);
+                let dsplit = nblk_m.div_ceil(n_bh.max(1)).max(1);
+                for j in 0..nblk_m {
+                    for w in kernel_items(n_bh, nblk_m, j) {
+                        let hb = w / dsplit;
+                        let (row, h) = (hb / heads, hb % heads);
+                        for p in kernel_flash_producers(row, h, ns, heads, nblk_f) {
+                            assert!(
+                                map[j as usize].contains(&p),
+                                "heads={heads} t={t} ns={ns}: merge wg {j} folds row {row} \
+                                 head {h} but does not wait on flash slice {p} that wrote it"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The fix must be a NO-OP for every head count shipped today, so it needs no re-measurement:
+    /// at 8/16/32/64 the emitted wait sets are byte-identical either way.
+    #[test]
+    fn shipped_head_counts_are_unaffected_by_the_tile_correction() {
+        let n_cu = 256u32;
+        for heads in [8u32, 16, 32, 64] {
+            for t in [128u32, 256, 512, 1024, 2048] {
+                let ns = n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1)).max(1);
+                if ns <= 1 {
+                    continue;
+                }
+                let (n_bh, nblk_f) = (t * heads, n_cu);
+                let nblk_m = (n_bh * flash_merge_dsplit()).min(n_cu).max(1);
+                assert_eq!(
+                    flash_merge_map(n_bh, ns, Q_TILE_ROWS, heads, nblk_f, nblk_m),
+                    flash_merge_map(n_bh, ns, FLASH_Q_TILE_ROWS, heads, nblk_f, nblk_m),
+                    "heads={heads} t={t}: the correction changed a shipped program"
+                );
+            }
+        }
+    }
+
+    /// dsplit=1 must leave the map byte-identical: the widening is opt-in and the default path
+    /// has to stay the shipped one.
+    #[test]
+    fn dsplit_one_is_the_old_map() {
+        let (n_bh, ns, n_head, nblk_f) = (32, 8, 32, 256);
+        let map = flash_merge_map(n_bh, ns, 1, n_head, nblk_f, n_bh);
+        for (j, s) in map.iter().enumerate() {
+            let (b, h) = (j as u32 / n_head, j as u32 % n_head);
+            let mut want: Vec<u32> = (0..ns).map(|sp| ((b * n_head + h) * ns + sp) % nblk_f).collect();
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(s, &want, "wg {j}");
+        }
+    }
+
+    /// Widened: a merge workgroup must depend on exactly the flash slices of the `(b,h)` whose
+    /// D-chunks it runs — no more (that would re-widen the gate), no fewer (that is a race).
+    #[test]
+    fn dsplit_eight_gates_on_its_own_bh_only() {
+        let (n_bh, ns, n_head, nblk_f, nblk_m) = (32u32, 8u32, 32u32, 256u32, 256u32);
+        let map = flash_merge_map(n_bh, ns, 1, n_head, nblk_f, nblk_m);
+        assert_eq!(map.len(), nblk_m as usize);
+        let dsplit = nblk_m / n_bh;
+        for (j, s) in map.iter().enumerate() {
+            let items = kernel_items(n_bh, nblk_m, j as u32);
+            assert_eq!(items.len(), 1, "at 256 wgs each runs exactly one D-chunk");
+            let hb = items[0] / dsplit;
+            let (b, h) = (hb / n_head, hb % n_head);
+            let mut want: Vec<u32> = (0..ns).map(|sp| ((b * n_head + h) * ns + sp) % nblk_f).collect();
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(s, &want, "wg {j}");
+            // 8 of 256 producers, per the doc comment above — not a dense 256-wide gate.
+            assert_eq!(s.len(), ns as usize);
+        }
+    }
 }
 
 /// Emit the layer all-reduce for a row-parallel producer (o_proj/down), all-reduce #1/#2.
@@ -1274,6 +1930,33 @@ fn emit_xreduce(
     tp: u32,
     slot: u32,
 ) -> u32 {
+    // SIZE THE COLLECTIVE TO ITS ACTUAL WORK. `d_xreduce` gives each thread ONE element
+    // (`base = slice*512 + threadIdx.x`, `step = nblk*512`), so a reduction of `xr_elems`
+    // saturates at `ceil(xr_elems/512)` workgroups and every workgroup past that does
+    // literally nothing — while still polling the packet's SYSTEM-scope arrival counter and
+    // taking a SYSTEM-scope acquire (a full L1/L2 invalidate across all 8 XCDs).
+    //
+    // MEASURED, GLM-5.2 TP4 decode, ctx 1024, interleaved control: `xr_elems` = 6144 needs 12
+    // workgroups and the GLM emitter was handing it 256. 244 of 256 workgroups did zero
+    // arithmetic in each of the 156 collectives and burned 1.78 ms/CU/token doing it; a token
+    // paid 156 x 256 = 39,936 system-scope L2 invalidates to reduce 6144 elements.
+    // 28.964 -> 27.041 ms/token, -1.82 (-6.3%), token-identical over 24 generated ids, interleaved
+    // controls at 28.964 / 28.639. A flat PLOW_XR_CUS=32 -- the dense emitter's old default --
+    // gets only -1.54 on its own interleaved control, because 32 is itself 2.7x wider than this
+    // reduction can use. Sizing beats a constant.
+    // (perf-data/glm52-gate-stall-attribution.md)
+    //
+    // This is a pure NARROWING of whatever the caller already allowed, so it can only remove
+    // idle participants: `PLOW_XR_CUS` still caps, prefill's t*hidden still asks for the whole
+    // machine and still gets it, and the reduction is BIT-IDENTICAL either way — each element's
+    // sum runs over the same N peer slots in the same order, only the element->workgroup
+    // partition changes.
+    //
+    // `ceil(xr_elems/512)` is the saturation point of BOTH bodies: the one-shot grid-strides the
+    // full `n` by `nblk*PLOW_THREADS`, and the two-shot's all-gather does the same (its
+    // reduce-scatter phase saturates even earlier, at `n/nranks`), so this never over-narrows.
+    let need = (xr_elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
+    let xr_cus = &xr_cus[..need];
     if decode {
         let gate = *xgate;
         *xgate += 1;
@@ -1446,6 +2129,8 @@ fn emit_phase(
     fp8_kv_full: bool,
     block: std::ops::Range<usize>,
     block_mode: bool,
+    // Target is AMD (gfx950). Only the prefill lm_head arm reads it — see `pf_gemv_head`.
+    amd: bool,
 ) {
     // The two axes the old `decode` bool used to carry at once. Every former use site below is
     // now one or the other: `decode` for shape, `gemv_family` for kernel family. (Not `gemv` —
@@ -1467,11 +2152,23 @@ fn emit_phase(
                             // fewer redundant system-acquires and less cross-XCD invalidation, at no bandwidth cost (H=5376
                             // saturates on a handful of workgroups). Default keeps `all` (byte-identical to Phase-2); set
                             // PLOW_XR_CUS=k to cap it (measured lever for the TP=8 NUMA-crossing all-reduce). tp==1 unused.
+                            //
+                            // The default is 32, NOT n_cu. Measured on MI355X (Gemma-4 31B bf16, ctx 1024, TP4):
+                            //   blocks    16     32     64    128    256(=n_cu)
+                            //   us/coll  0.575  0.565  0.563  0.636  0.717
+                            // and end-to-end the win is LARGER than the microbench, because the collateral is the
+                            // L2 the surrounding GEMV wanted: 11.74 ms/token at 256 vs 10.93 at 32, a 6.9% token-level
+                            // win. At 256 blocks a token pays 120 collectives x 256 workgroups = 30,720 system-scope
+                            // L2 invalidates. H=5376 saturates on a handful of workgroups, so the extra 224 buy no
+                            // bandwidth and cost the cache.
+                            //
+                            // Bit-identical to the old default: each element's sum still runs over the same N peer
+                            // slots in the same order; only the element->workgroup partition changes.
     let xr_cus: Vec<u32> = {
         let k = std::env::var("PLOW_XR_CUS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(n_cu)
+            .unwrap_or(32)
             .clamp(1, n_cu);
         (0..k).collect()
     };
@@ -1492,6 +2189,14 @@ fn emit_phase(
     // pure gate overhead, and all 256 workgroups still have to be counted into the barrier.
     // One workgroup (512 threads x 8) covers it. Fewer participants, cheaper gate, less
     // counter contention.
+    //
+    // `rows` is the ONLY parallel axis these ops have, so at decode (t == 1) NormResidualNorm
+    // runs on ONE workgroup 120 times per token, 0.71 ms with 255 CUs idle. A feature axis was
+    // added to it and MEASURED, and it loses by a wide margin at every k -- the two extra
+    // counter-gated packets it needs cost more than the whole op. The numbers, the mechanism,
+    // and why knob-contract 7a's "a gate is <=0.64 us" does not apply to a SERIAL split are
+    // recorded above d_norm_residual_norm in runtime/amd/op_norm.h. Read that before widening
+    // this. At decode batch B the row axis already gives it B workgroups for free.
     let elem = |n: u32| -> Vec<u32> { (0..n.div_ceil(512 * 8).max(1).min(n_cu)).collect() };
     let ns = if gemv_family {
         n_cu.div_ceil(heads).max(1)
@@ -1568,13 +2273,17 @@ fn emit_phase(
         // kernel by PLOW_NV_W8A8. T6 w8a16 (default cubin): bf16 activation (t1=a), e4m3 weight (t2)
         // + per-channel dequant scale (t4). T8 w8a8 (PLOW_NV_W8A8 cubin, PLOW_W8A8 emit): BOTH
         // operands e4m3 — t1=xq (per-row-quantized activation), t3=a_scale, t2=w8, t4=w_scale — true
-        // mma.sync.m16n8k32. The opcode tracks whatever tile pick_tile would have chosen for bf16.
+        // mma.sync.m16n8k32.
+        //
+        // The tile now comes from `pick_tile` ASKED FOR fp8, rather than from mapping the bf16
+        // answer onto an fp8 twin afterwards. The old three-arm `match` was §4's bug shape in
+        // miniature: its `_` arm sent every unrecognised opcode to `GemmFp8` (256x256), so the
+        // two rungs added by the tile-inventory campaign would have silently collapsed to the
+        // largest tile on exactly the fp8 shapes they were added for. Asking the selector for
+        // the encoding also lets the answer DIFFER from bf16's, which is the point of making
+        // precision an input.
         if !gemv_family && fp8 {
-            let op = match pick_tile(m, nn, k, n_cu) {
-                DevOp::GemmMed => DevOp::GemmMedFp8,
-                DevOp::GemmSmall => DevOp::GemmSmallFp8,
-                _ => DevOp::GemmFp8,
-            };
+            let op = pick_tile(m, nn, k, n_cu, kernelcaps::QuantScheme::W8A8);
             return b.emit(op, cus, deps, |d| {
                 d.t[0] = out;
                 d.t[2] = w8;
@@ -1595,7 +2304,7 @@ fn emit_phase(
         let op = if gemv_family {
             DevOp::Gemv
         } else {
-            pick_tile(m, nn, k, n_cu)
+            pick_tile(m, nn, k, n_cu, kernelcaps::QuantScheme::None)
         };
         b.emit(op, cus, deps, |d| {
             d.t[0] = out;
@@ -1675,9 +2384,25 @@ fn emit_phase(
         // (q/k/v as three separate bf16 Gemv packets = +2 packets/layer, uneven CU fill). Tokens
         // are bit-identical (each output column is the same per-column dot). Off by default =>
         // byte-identical stream. Measures the marginal TPOT cost of a 2-gate/layer reduction.
+        // THE SAME LDS PRECONDITION `glu_fused` CHECKS. `gemv_qkv_rows` reads x
+        // only through `ld_lds8` — it has no global-read arm — and `op_gemm.h`
+        // says so: *"x is ALWAYS staged in LDS here: plowc emits this op only
+        // when M*K fits GM_LDS_HALVES."* That precondition was stated and never
+        // enforced for THIS op, only for `GemvGlu`.
+        //
+        // MEASURED, Gemma-4-31B (hidden 5376), PLOW_DECODE_BATCH=16: the arena
+        // holds 73728 halves, `M*K` is 16*5376 = 86016, and row `m` lives at
+        // `lds[m*K ..]` — so rows 0..12 fit and rows 13, 14, 15 run past the
+        // end. Sequences 13/14/15 decoded fluent-but-WRONG streams (correct
+        // first token from prefill, divergent from the second) while 0..12 were
+        // token-identical to a batch-1 run. §4's bug shape: a documented
+        // precondition with nothing checking it.
         let fuse_qkv = gemv_family
             && !keqv
             && !fp8
+            // `gemv_staged_rows`, not `t`: with `PLOW_GEMV_WALK` the staging moves inside the
+            // row loop and the bound stops depending on M. See §6g-WALK's companion change.
+            && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= GM_LDS_HALVES
             && std::env::var("PLOW_NO_FUSE_QKV").ok().as_deref() != Some("1");
 
         // GQA FUSION changes the decode split, and the two have to agree or the machine idles.
@@ -1986,6 +2711,13 @@ fn emit_phase(
 
         // headnorm+RoPE for q; and for k/v the store goes STRAIGHT INTO THE KV CACHE at
         // out_row0. In decode that row is the current position, which the runtime patches.
+        // The `8` is PLOW_WAVES and it is LOAD-BEARING: a headnorm work item is one HEAD, and a
+        // head is exactly one wave's 64 lanes x E elements — the layout that keeps each RoPE pair
+        // (i, i+hd/2) inside one lane. So `t*heads` waves is all the parallelism the op has, and
+        // spreading them one-per-workgroup instead of eight only adds workgroups to the gate.
+        // MEASURED (n=6 interleaved, Gemma-4-31B bf16, ctx 1024): 4 -> 32 workgroups is
+        // 18.057 -> 18.460 ms/token, a REGRESSION. Do not widen this without first changing the
+        // head->wave map, which cannot be done at hd=256 without breaking pair locality.
         let hn_cus: Vec<u32> = (0..((t * heads).div_ceil(8)).min(n_cu).max(1)).collect();
         let nhn = hn_cus.len() as u32;
 
@@ -2230,7 +2962,12 @@ fn emit_phase(
         let attn_dep = if fused {
             c_fa
         } else {
-            let mg_cus: Vec<u32> = (0..(t * heads).min(n_cu).max(1)).collect();
+            // L1: fold a D-chunk axis into the merge's work id so it can occupy more than
+            // `t*heads` (= 32 at Gemma-31B decode) of 256 CUs. `flash_merge_map` and
+            // `d_flash_merge` both RE-DERIVE dsplit from this length, so this is the single
+            // input. Default 1 => `(t*heads).min(n_cu)`, exactly as before.
+            let mg_cus: Vec<u32> =
+                (0..(t * heads * flash_merge_dsplit()).min(n_cu).max(1)).collect();
             let fill = |d: &mut DevInst| {
                 d.t[0] = n.at;
                 d.t[1] = n.opart;
@@ -2245,7 +2982,7 @@ fn emit_phase(
             let map = flash_merge_map(
                 t * heads,
                 ns,
-                if gemv_family { 1 } else { Q_TILE_ROWS },
+                if gemv_family { 1 } else { FLASH_Q_TILE_ROWS },
                 heads,
                 all.len() as u32,
                 mg_cus.len() as u32,
@@ -2392,8 +3129,11 @@ fn emit_phase(
         // gate-vs-up), so only when pick_tile would have chosen Gemm anyway.
         // gate/up are COLUMN-parallel (inter_l lanes on this rank); the GLU is elementwise on the
         // rank's own lanes, so no communication. `c_gl` is the dependency feeding down_proj.
-        let glu_fused = gemv_family && (t as u64 * c.hidden as u64) <= GM_LDS_HALVES;
-        let gemm_glu = !gemv_family && pick_tile(t, inter_l, c.hidden, n_cu) == DevOp::Gemm;
+        // Same bound, same reason as `fuse_qkv` above: `gemv_glu_rows` also reads x only
+        // through LDS, and with the walk on it stages `min(MM, M)` rows, not M.
+        let glu_fused =
+            gemv_family && (gemv_staged_rows(t) as u64 * c.hidden as u64) <= GM_LDS_HALVES;
+        let gemm_glu = !gemv_family && glu_fusion_wins(t, inter_l, c.hidden, n_cu);
         // w8a8: quant the (hidden-width) pre-FF norm output feeding gate/up. Reuses xqh/ash (q/k/v
         // already consumed them; the c_pf→o_proj→flash→qkv chain serializes the reuse). Inert
         // (returns c_pf) off the w8a8 path, so glu_fused/bf16 arms below keep their c_pf dep.
@@ -2618,7 +3358,7 @@ fn emit_phase(
             // Falls back to separate norm + GLU when fp8 (no fused fp8 variant yet).
             let glu_cus: Vec<u32> = (0..n_cu).collect();
             let down_cus: Vec<u32> = (0..n_cu).collect();
-            let glu_op = if fp8 {
+            let _glu_op = if fp8 {
                 DevOp::MoeExpertGluGemmaFp8
             } else {
                 DevOp::MoeExpertGluNormGemma
@@ -2969,12 +3709,24 @@ fn emit_phase(
     // otherwise compiled out of that object (`#if !PLOW_NV_PREFILL`, interp_sm120.cu) and the
     // packet hits `default: __trap()`. That is the loud failure, not a silent wrong answer.
     // Unset = byte-identical. See perf-data/px6-sm-quantization.md.
-    let pf_gemv_head =
-        !decode && std::env::var("PLOW_PF_GEMV_HEAD").ok().as_deref() == Some("1");
+    // DEFAULT ON for gfx950. The argument is the row efficiency above and it does not depend on
+    // dtype: at M=1 the narrowest tile still computes BM=64 rows to keep one, so 1.5% of the work
+    // is used. The AMD prefill object carries `case PLOW_DOP_GEMV` unconditionally, so the arm is
+    // simply there — unlike sm_120, where it is compiled out unless `-DPLOW_NV_PF_GEMV_HEAD=1` and
+    // a packet using it would `__trap()`. Hence: on by default where the arm exists, opt-in where
+    // it does not. `PLOW_PF_GEMV_HEAD` still forces it either way (=1 on, =0 off), so the sm_120
+    // A/B and the AMD escape hatch are both preserved, and an empty `--arch` (the golden tests)
+    // keeps the old emission byte for byte.
+    let pf_gemv_head = !decode
+        && match std::env::var("PLOW_PF_GEMV_HEAD").ok().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => amd,
+        };
     let lm_op = if gemv_family || pf_gemv_head {
         DevOp::Gemv
     } else {
-        pick_tile(1, vocab_l, c.hidden, n_cu)
+        pick_tile(1, vocab_l, c.hidden, n_cu, kernelcaps::QuantScheme::None)
     };
     // PREFILL takes only the LAST prompt row's logits (M=1, a_row0=t-1). DECODE takes ALL t rows,
     // one per sequence (M=t, a_row0=0) — batch>1 samples a token per sequence. Decode B=1 gives
@@ -3060,15 +3812,61 @@ fn emit_phase(
         d.i[1] = nb_argmax;
     });
     // lm_head is REPLICATED under TP (see declare() note): every rank computes the full-vocab
-    // argmax and thus the SAME global token id, so no cross-rank XArgmaxFin fold is needed. The
-    // sharded lm_head + XArgmaxFin id-fold is a Phase-3 item (§8d, §13); c_fin already wrote the
-    // correct global id into in.ids on every rank.
+    // argmax and thus the SAME global token id, so no cross-rank XArgmaxFin fold is needed here —
+    // c_fin already wrote the correct global id into in.ids on every rank. The fold itself exists
+    // now (`d_xargmax_fin_mega`, and `mla.rs`'s `GLM_SHARD_HEAD` arm uses it); what blocks this
+    // emitter is the TIED head's `emb` read, not the collective. See the declare() note.
     let _ = c_fin;
 }
 
 /// Blocks the argmax partial reduction is spread over. 64 x 512 threads covers a 262144-entry
 /// vocab in one strided pass per thread.
 const AMAX_BLOCKS: u32 = 64;
+
+/// L2 — FINER DECODE-GEMV SLICES. `PLOW_GEMV_SPLIT=S` emits `S * n_cu` slices for the
+/// machine-filling `Gemv` / `GemvGlu` / `GemvQkv` packets of the DECODE program instead of `n_cu`,
+/// so a workgroup that finishes early claims another slice off the global queue instead of waiting
+/// at the barrier. Decode only — see [`Builder::set_gemv_split`] for why prefill is excluded.
+///
+/// **DEFAULT 1, and it stays 1: S=2 is measured a LOSS.** The hypothesis was the straggler tail —
+/// Σ(max−mean) over the ≥128-slice decode instructions is 1.80 ms/token, ±19% on identical work,
+/// and that spread is random per-(CU, packet) rather than per-CU systematic, which is exactly the
+/// shape finer dynamic slicing removes. Ideal-schedule simulation on the real 676-packet DAG with
+/// the measured durations predicted 16.622 → 14.023 ms at S=2 against a 12.92 ms work bound.
+///
+/// It does not survive contact, and the reason is in the kernel, not the scheduler. `gemv_rows`
+/// hands column `n` of its slice to wave `n % PLOW_WAVES`, so a slice costs `ceil(per/8)`
+/// column-times with `per = ceil(N/nblk)` — halving `per` does NOT halve the slice, it rounds up
+/// against 8 waves, and the two rounds then cost MORE than the one they replaced. Gemma-4-31B
+/// o_proj (N=5376) goes 21 columns/slice → `ceil(21/8)=3` at S=1 versus 11 → `ceil(11/8)=2` ×2
+/// rounds at S=2, and N=5376 is not even divisible by 512 (23 of the 512 slices get no work).
+///
+/// MEASURED, MI355X, Gemma-4-31B bf16 real weights, 1024-token prompt, 64 greedy decode steps,
+/// interleaved arms under `perf-data/harness/gpulease -n 1`, contended (rc=76) runs discarded.
+/// Objects `build-amd/l2-hsaco2`, blobs `build-amd/l2-s{1,2,4}`, harness `gemma4_chat.c`:
+///
+/// | S | slices/gemv | wg-packets/token | decode ms/token (median, n) | spread | Δ |
+/// |---|---|---|---|---|---|
+/// | **1** (ships) | 256 | 79,947 | **17.0** (n=8) | 17.0–17.3 | — |
+/// | 2 | 512 | 139,083 | 19.8 (n=7) | 19.5–19.9 | **+2.8** |
+/// | 4 | 1024 | 257,355 | 24.7 (n=7) | 24.6–25.2 | +7.7 |
+///
+/// Prefill is untouched (162 ms at every S) because the split is scoped to the decode builder.
+///
+/// Isolated-kernel confirmation (same `d_gemv_t`, grid = S·256, `build-amd/l2-hsaco2/gemmtest`):
+/// o_proj 0.027 → 0.030 → 0.032 ms, down 0.046 → 0.048 → 0.052, gate/up 0.044 → 0.046 → 0.048.
+/// Every shape is monotonically worse, so the loss is in the op and not in the packet protocol.
+/// Charging the queue-claim cost back honestly: 59,136 extra workgroup-packets × 2.2 µs / 256 CUs
+/// = +0.51 ms/token at S=2, which is under a fifth of the observed +2.8 ms. The rest is the
+/// rounding above.
+///
+/// Tokens are BIT-IDENTICAL at S=1/2/4 (same md5 over 64 greedy tokens), as the output-stationary
+/// argument in [`Builder::set_gemv_split`] requires, so this is a clean performance null and not a
+/// correctness question. **Attacking the straggler tail needs the wave assignment inside
+/// `gemv_rows` to become dynamic too; splitting packets alone cannot pay for the rounding.**
+fn gemv_split() -> u32 {
+    std::env::var("PLOW_GEMV_SPLIT").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1)
+}
 
 /// E5 (rtx-19): PLOW_FUSE_ARGMAX fuses the greedy-argmax epilogue into the lm_head GEMV
 /// (`DevOp::GemvArgmax`), replacing the `SoftCap` + `Argmax` packets. Default off → byte-identical.
@@ -3138,13 +3936,12 @@ pub struct EmitArgs {
     /// instead of expanding them into the init section. On by default; the C
     /// harnesses under `runtime/tests/` need it off — see [`Model::bake_gen`].
     pub rope_gen: bool,
-    /// `PLOW_NV_PLACE`: `(sms_per_partition, partition_count)` of the target GPU
-    /// (from `hwspec::GpuSpec::l2_partitioning`). `Some` groups the device blob's
-    /// global-queue stream by L2 domain (via [`packet::devbuild::Builder`]'s
-    /// `seg`-as-domain), so a physical-SM-aware interp pulls its domain's
-    /// packets. `None` ⇒ byte-identical. Dense-GQA path only. See
-    /// `plans/devblob-locality-placement.md`.
-    pub l2_layout: Option<(u32, u32)>,
+    /// `PLOW_L2_PLACE` (née `PLOW_L2_PLACE`): the target's L2 partition geometry from
+    /// `hwspec::GpuSpec::l2_partitioning`, plus its workgroup->domain map. `Some` groups the
+    /// device blob's global-queue stream by L2 domain (via [`packet::devbuild::Builder`]'s
+    /// `seg`-as-domain), so a physical-SM-aware interp pulls its domain's packets. `None` ⇒
+    /// byte-identical. Dense-GQA path only. See `plans/l2-placement-generic.md`.
+    pub l2_layout: Option<packet::devbuild::L2Layout>,
     /// Target GPU spec name (e.g. `"H100 SXM5"`), stamped into the blob header as
     /// [`packet::devbuild::gpu_fingerprint`] so the runtime can warn on a GPU
     /// mismatch. Empty ⇒ unknown (check skipped). Set by plowc from `--gpu`.
@@ -3156,10 +3953,72 @@ pub struct EmitArgs {
     pub arch: String,
 }
 
+/// What the verification gate actually DID, recorded verbatim in `build.json`.
+///
+/// A SKIPPED GATE IS INDISTINGUISHABLE FROM A PASSING ONE unless the artifact
+/// says which happened. That is this repo's signature failure — `tuning.tier`
+/// reported `portable` both when the analytical model was chosen and when no
+/// measurement had ever been taken, and the resulting GLM prefill numbers were
+/// meaningless for a long time before anyone noticed. A warning line in a build
+/// log is not a defence: the log is gone by the time someone asks "was this
+/// blob verified?". The blob's own manifest has to answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LeanReport {
+    /// A Lean ordering certificate was obtained for EVERY program in the blob.
+    pub verified: bool,
+    /// The Lean lower-bound oracle ran and reported.
+    pub oracle: bool,
+    /// Why `verified`/`oracle` are false. `None` only when both are true.
+    ///
+    /// Never `Some` because verification FAILED — a rejection aborts emission,
+    /// so no blob with a rejected program is ever written and no manifest for
+    /// one can exist.
+    pub reason: Option<String>,
+}
+
+impl LeanReport {
+    /// The gate did not run, for `reason`.
+    pub fn skipped(reason: impl Into<String>) -> LeanReport {
+        LeanReport { verified: false, oracle: false, reason: Some(reason.into()) }
+    }
+}
+
 /// Read-only verification hook for [`run_verified`], called with the finished
 /// [`packet::devbuild::Model`] immediately before the blob is written
 /// (dense-GQA path only for now). An `Err` ABORTS emission.
-pub type VerifyHook = Box<dyn Fn(&packet::devbuild::Model) -> Result<(), String>>;
+///
+/// `Ok` carries a [`LeanReport`] rather than `()`: the hook is allowed to
+/// decline to run (no verifier binary on this machine) and the caller must be
+/// able to tell that apart from a clean pass. Reserve `Err` for a verifier that
+/// looked at the program and REJECTED it.
+pub type VerifyHook = Box<dyn Fn(&packet::devbuild::Model) -> Result<LeanReport, String>>;
+
+/// A hook that runs nothing and says so. Lets a caller keep the "always supply
+/// a hook" shape so the *reason* for skipping is authored where it is known,
+/// instead of the manifest having to guess from a `None`.
+pub fn skip_hook(reason: impl Into<String>) -> VerifyHook {
+    let r = reason.into();
+    Box::new(move |_| Ok(LeanReport::skipped(r.clone())))
+}
+
+/// Run the verification gate against the finished model, THE ONE WAY.
+///
+/// Every emit path calls this immediately before `std::fs::write` of the blob,
+/// so "verified" means the same thing on all of them and a new emitter cannot
+/// quietly acquire a different policy. `Err` is a rejection and is fatal; a
+/// missing verifier is the hook's problem and arrives as `Ok(skipped)`.
+pub(crate) fn apply_verify_gate(
+    m: &packet::devbuild::Model,
+    verify: Option<&VerifyHook>,
+) -> LeanReport {
+    match verify {
+        Some(v) => match v(m) {
+            Ok(r) => r,
+            Err(e) => panic!("devblob verification rejected the emitted program: {e}"),
+        },
+        None => LeanReport::skipped("no verification hook supplied by the caller"),
+    }
+}
 
 impl EmitArgs {
     /// Parse the legacy `gemma4`/`tinygemma` CLI: named flags anywhere, then
@@ -3258,6 +4117,8 @@ struct DenseGqaEmitter<'a> {
     fp8_kv_full: bool,
     block: std::ops::Range<usize>,
     block_mode: bool,
+    /// Target is AMD. Set from `--arch`/`--gpu` at construction; reaches only `pf_gemv_head`.
+    amd: bool,
 }
 
 impl<'a> DenseGqaEmitter<'a> {
@@ -3280,6 +4141,7 @@ impl<'a> DenseGqaEmitter<'a> {
         ns_pre: u32,
         dbatch: u32,
         moe_pf: bool,
+        amd: bool,
     ) -> (Self, Vec<packet::devbuild::TensorDecl>, Vec<GenTensor>) {
         let mut tb = Builder::new(n_cu);
         let tn = declare(
@@ -3299,6 +4161,7 @@ impl<'a> DenseGqaEmitter<'a> {
             fp8_kv_full,
             block,
             block_mode,
+            amd,
         };
         (e, tensors, gen)
     }
@@ -3310,14 +4173,14 @@ impl DevblobEmitter for DenseGqaEmitter<'_> {
         emit_phase(
             b, self.c, self.ls, &self.tn, t, self.ctx, Mode::Prefill, self.n_cu, &mut dummy,
             self.fp8, self.w8a8, self.fp8_kv, self.fp8_kv_full, self.block.clone(),
-            self.block_mode,
+            self.block_mode, self.amd,
         );
     }
     fn emit_decode(&self, b: &mut Builder, dbatch: u32, dmode: Mode, kv_rows: &mut Vec<u32>) {
         // Decode passes w8a8=false, exactly as the historical call site did.
         emit_phase(
             b, self.c, self.ls, &self.tn, dbatch, self.ctx, dmode, self.n_cu, kv_rows, self.fp8,
-            false, self.fp8_kv, self.fp8_kv_full, self.block.clone(), self.block_mode,
+            false, self.fp8_kv, self.fp8_kv_full, self.block.clone(), self.block_mode, self.amd,
         );
     }
 }
@@ -3347,6 +4210,13 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         arch,
     } = args;
 
+    // BEFORE any emitter runs: the GEMV census needs the store's answer in hand by the time
+    // the first `Builder::emit_dep` fires. Costs one store read on a `PLOW_TUNE_DUMP` run and
+    // one on every other run too — the same read `pick_tile` already does, and a compile is a
+    // process. Placed at the single entry point rather than per-emitter so no emit path can
+    // be added that skips it.
+    install_gfx950_gemv_cases();
+
     // GLM-5.2 (GlmMoeDsa) — MLA + DSA + block-fp8 MoE — is a wholly separate emit path (glm_main).
     // Dispatch on model_type before the dense-GQA cfg parse, which would panic on GLM's config.
     let model_type =
@@ -3358,10 +4228,42 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                     .map(str::to_string)
             })
             .unwrap_or_default();
-    // PLOW_NV_PLACE is wired only on the dense-GQA path below (b/bd builders). The
+    // PLOW_L2_PLACE is wired only on the dense-GQA path below (b/bd builders). The
     // GLM/Kimi/DeepSeek/Nemotron emitters have their own builders and never call
     // set_l2_placement, so the flag would silently no-op there — say so rather
-    // than let a user believe placement is active. See devblob-locality-placement.md.
+    // than let a user believe placement is active. See plans/l2-placement-generic.md.
+    //
+    // AMD IS NO LONGER REFUSED HERE, and the reason the refusal existed is worth keeping.
+    //
+    // `StreamEnt::seg` carries the wave class the AMD host relaunches each segment at: 4 waves for
+    // a `FlashPrefill` run, 8 for everything else. Placement REPURPOSES that field as an L2
+    // domain, which is fine on sm_120 — that interpreter runs one cooperative launch at a fixed
+    // block size and never reads a wave class — and catastrophic on a MULTI-SEGMENT gfx950
+    // program, where losing the tags collapses the whole prefill program into segment 0. The host
+    // then sees flash packets in that segment, dispatches the ENTIRE program on the 4-wave flash
+    // object, and that object's body is `if (op == FLASH_PREFILL…)` with no switch: every GEMM,
+    // every norm and the lm_head are silently dropped. Prefill "succeeds" in 8.7 ms instead of
+    // 72.1 and `act.logits` is all zeros. This cost three agents a long time to find, because the
+    // packet loads, runs, and differs from a correct one ONLY in this field.
+    //
+    // But the conflict is a property of the PROGRAM, not of the target. It exists exactly when a
+    // program has more than one wave class. Decode has no `FlashPrefill` op at all, so every
+    // `seg` is already 0 and there is nothing in the field to destroy — and decode is where the
+    // locality lever is (§7b: 66% of packets and 45.5% of the token on ≤32 effective workgroups).
+    // Refusing the whole target therefore gave up the case that matters to keep the case that
+    // breaks. `Builder::finish` now applies the real test — it is the only place that knows
+    // `cur_seg` — and skips placement per program, byte-identically, when the program is
+    // segmented. Prefill on AMD is still not placed; it just is not the flag's decision to make
+    // from the target name.
+    //
+    // The other half of the old reasoning — "the flag is explicitly NVIDIA-named, so using it
+    // here buys nothing" — is why the flag was renamed. An L2 domain is a GPC on NVIDIA and an
+    // XCD on AMD; `hwspec` describes both.
+    //
+    // Resolved once: three flags now depend on `amd`, and computing it per site is how the second
+    // and third of them ended up ungated.
+    let amd = target_is_amd(&arch, &gpu);
+    warn_uniseg_on_amd(amd);
     if l2_layout.is_some()
         && matches!(
             model_type.as_str(),
@@ -3370,17 +4272,40 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         )
     {
         eprintln!(
-            "  PLOW_NV_PLACE ignored: L2-domain placement is dense-GQA only, not wired for \
+            "  PLOW_L2_PLACE ignored: L2-domain placement is dense-GQA only, not wired for \
              model_type {model_type:?} (its emitter is a separate path)"
         );
+    }
+    // Kimi-K3 (`kimi_k3`): multimodal wrapper over a hybrid MLA+KDA `kimi_linear` text tower with
+    // a latent mxfp4 MoE. Claimed HERE, before anything else, for two reasons. (1) It nests its
+    // geometry under `text_config`, which `cfg_from` (crates/devgen/src/config.rs:70) treats as
+    // "Gemma-4 multimodal" unconditionally — that is why an unmodified plowc died on
+    // `config.rs:93` unwrapping Gemma's `layer_types`, an error naming the wrong field of the
+    // wrong architecture. (2) Its MLA keys have the SAME spelling as DeepSeek's, so the `kimi`
+    // arm below would parse it, mis-read the MoE (`n_routed_experts` is absent) and emit a blob
+    // for a model that is 69/93 linear attention. It would ALSO have defaulted the absent
+    // `rope_theta` to GLM's 8e6 — that half is now closed independently: `cfg_glm` reads the
+    // theta as an `Option` and `require_mla_rope` refuses a NoPE checkpoint, so the `kimi` arm
+    // is loud about this one too even without the claim above. `kimi_k3_emit` never returns: it
+    // validates everything the front end can and then reports what is not implemented.
+    if model_type == "kimi_k3" {
+        mla::kimi_k3_emit(&dir, ctx, tp, block_spec.as_deref());
     }
     if model_type == "glm_moe_dsa" {
         // GLM `--block` (M2, plans/block-asset-harness.md §5.3/§7): single-block
         // extraction on the separate GLM emitter. Absent => the unchanged glm_main
         // path (byte-identical).
+        // THE HOOK USED TO STOP HERE. `verify` was moved into `emit_dense_gqa` and
+        // these early returns dropped it, so `--lean-verify --emit devblob` on
+        // GLM-5.2 — the model this repo actually ships — verified nothing and said
+        // nothing. That is §4's recurring shape (an arm exists and nothing routes
+        // to it) applied to a safety gate, and it is exactly why the manifest now
+        // has to state whether the gate ran.
         match &block_spec {
-            Some(spec) => glm_emit_block(&dir, ctx, &out, n_cu, tp, spec, rope_gen),
-            None => glm_main(&dir, ctx, &out, n_cu, tp, rope_gen),
+            Some(spec) => {
+                glm_emit_block(&dir, ctx, &out, n_cu, tp, spec, rope_gen, &arch, verify.as_ref())
+            }
+            None => glm_main(&dir, ctx, &out, n_cu, tp, rope_gen, &arch, verify.as_ref()),
         }
         return;
     }
@@ -3392,13 +4317,15 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         model_type.as_str(),
         "kimi_k2" | "kimi" | "deepseek_v3" | "deepseek_v2"
     ) {
-        let arch = if model_type.starts_with("kimi") {
+        let mla_arch = if model_type.starts_with("kimi") {
             MlaArch::Kimi
         } else {
             MlaArch::DeepSeek
         };
         match &block_spec {
-            Some(spec) => kimi_emit_block(&dir, ctx, &out, n_cu, tp, spec, arch, rope_gen),
+            Some(spec) => kimi_emit_block(
+                &dir, ctx, &out, n_cu, tp, spec, mla_arch, rope_gen, &arch, verify.as_ref(),
+            ),
             None => panic!(
                 "{model_type}: M3 supports only single-block extraction on the device path — pass \
                  --block <l>[..<r>] (or PLOW_BLOCK). Full-model Kimi/DeepSeek device emit is a later \
@@ -3431,6 +4358,441 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     );
 }
 
+/// Is the emit target AMD? `--arch gfx*` or a `--gpu` the registry says is an AMD part.
+///
+/// Both signals, for the reason `check_fp8_a_scale_bound` documents: they can disagree, and the
+/// assets that motivated that gate were emitted `--arch sm_120a` for an MI350X. An empty `--arch`
+/// with an empty `--gpu` (the golden tests, the legacy CLI) answers false, so those emissions stay
+/// byte for byte what they were.
+fn target_is_amd(arch: &str, gpu: &str) -> bool {
+    arch.starts_with("gfx")
+        || hwspec::registry::lookup(gpu).is_some_and(|s| s.vendor == hwspec::Vendor::Amd)
+}
+
+/// The largest `top_k` the AMD MoE routers can select. Mirrors `PLOW_MOE_MAX_TOPK` in
+/// `runtime/amd/op_moe.h`, and `moe_topk_matches_the_amd_kernel` PARSES that `#define` and fails
+/// if the two drift — the same discipline `GFX950_DISPATCHED` applies to `interp.hip`.
+///
+/// This is the compile-time half of a two-part bound; `moe_bound_topk` in the kernel is the other.
+/// Both routers select into a `[PLOW_MOE_MAX_TOPK]` array, and `d_moe_router_topk`'s rank pass
+/// additionally writes `wl[rank]` into an LDS carve of exactly that many entries. Past the bound
+/// the kernel cannot produce the routing the packet asked for, and the failure is not a crash: the
+/// table slots above the bound are never written, every expert body loops to the packet's
+/// (unbounded) `top_k` operand, and the renormalisation denominator covers only the slots that
+/// were filled. Fluent output, wrong expert set, wrong gates.
+///
+/// So the emit refuses instead.
+///
+/// RAISED 8 -> 16 for Kimi-K3 (top-16 of 896), after measuring that the raise is free: the gfx950
+/// decode object reports the identical budget at 8 and 16 (SGPR 106, VGPR 248, occupancy 2, spill
+/// 80/0, LDS 147464), and the bound appears in no emitted instruction, so every existing packet is
+/// byte-identical. `runtime/amd/op_moe.h` carries the measurement and the caveat that k > 8 has
+/// not yet been executed on hardware.
+pub(crate) const MOE_MAX_TOPK: u32 = 16;
+
+/// Refuse to emit a MoE packet the AMD routers cannot execute.
+///
+/// Called from every `config.json` parse that produces a routed-expert count, so the refusal
+/// happens once, at the earliest point that knows the model's name — not at the emit site, where
+/// there are four of them and a fifth would be added without this check.
+pub(crate) fn require_moe_topk(top_k: u32, model: &str) {
+    assert!(
+        top_k <= MOE_MAX_TOPK,
+        "{model}: top_k = {top_k} exceeds PLOW_MOE_MAX_TOPK = {MOE_MAX_TOPK}, the width both AMD \
+         MoE routers select into (runtime/amd/op_moe.h). Emitting anyway would route to the top \
+         {MOE_MAX_TOPK} of {top_k} experts, renormalise the gates over that subset, and leave the \
+         remaining {} table slots unwritten for the expert bodies to read as uninitialised \
+         scratch — a model that is fluent and wrong, with nothing at runtime to say so. Raise \
+         PLOW_MOE_MAX_TOPK and devgen::MOE_MAX_TOPK together (a drift test enforces the pair) \
+         after re-checking the LDS carve at op_moe.h and the megakernel's register budget.",
+        top_k - MOE_MAX_TOPK
+    );
+}
+
+/// Refuse to emit an MLA packet whose positional encoding this compiler cannot determine.
+///
+/// Same discipline and same call site as [`require_moe_topk`]: run at the `config.json` parse,
+/// once, where the model's name is still in hand — not at the emit, where there are four
+/// `HeadNormRope` sites and a fifth would be added without the check.
+///
+/// # The three ways this went wrong silently
+///
+/// `cfg_glm` read the theta as `v["rope_theta"].as_f64().unwrap_or(8_000_000.0)`.
+///
+/// 1. **NoPE routed into the rope arm.** Kimi-K3 sets `mla_use_nope: true`; its modeling code has
+///    `self.rotary_emb = None` and `assert self.use_nope`, and its config carries no `rope_theta`
+///    anywhere. The default handed it GLM's 8e6 and rotated 64 dims the model uses as plain
+///    content dims. This is the recurring bug shape with the polarity flipped — a *correct* arm
+///    selected for a model that does not want it — and the output is fluent, not broken.
+/// 2. **The default was load-bearing for the SHIPPING model.** GLM-5.2's `config.json` has no
+///    top-level `rope_theta` either: transformers 5.x moved it to `rope_parameters.rope_theta`
+///    (= 8000000). So the emitter was not reading GLM's theta at all — it matched only because
+///    the literal in this tree happens to equal it. A retrain at a different theta reads exactly
+///    the same and is wrong.
+/// 3. **Scaling was ignored.** `rope_scaling` / a `rope_type` other than `"default"` (yarn,
+///    linear, llama3) changes the frequencies, and `declare_glm` builds its tables with
+///    `RopeScale::None`. An unhandled scheme is refused instead of being applied as `default`.
+///
+/// So: the theta must be FOUND, the NoPE flag must AGREE with whether one was found, and the
+/// scaling scheme must be one the tables actually implement. Anything else is a refusal.
+pub(crate) fn require_mla_rope(
+    theta: Option<f64>,
+    use_nope: bool,
+    rope_type: Option<&str>,
+    has_rope_scaling: bool,
+    model: &str,
+) {
+    match (use_nope, theta) {
+        (true, found) => panic!(
+            "{model}: `mla_use_nope` is set — this MLA carries NO positional encoding, and plow's \
+             MLA emit applies an interleaved partial RoPE unconditionally. Refusing rather than \
+             rotating the qk_rope dims the model treats as content: the result would be plausible \
+             logits from the wrong model, with nothing at runtime to say so. (config theta: {}.) \
+             Implementing NoPE is not just deleting the two HeadNormRope ops — the k-side one is \
+             also the only writer of the `kv.{{l}}.krot` cache row, AND the instruction the AMD \
+             loader and glm52_decode.c both SCAN for to patch that row's position each step. \
+             Dropping it leaves the rope half of every cached key uninitialised and quietly \
+             removes the layer from the KV-row-writer list (see `GlmCfg::rope_theta`).",
+            match found {
+                Some(t) => format!("{t} — present AND `mla_use_nope`, which contradict"),
+                None => "absent, consistent with NoPE".to_string(),
+            }
+        ),
+        (false, None) => panic!(
+            "{model}: no RoPE theta in config.json. Looked for `rope_theta` and \
+             `rope_parameters.rope_theta` (transformers 5.x spelling) and found neither, and \
+             `mla_use_nope` is not set, so this is not a NoPE model either. This used to default \
+             to 8000000 — GLM's value — which meant the emitter silently substituted one model's \
+             positional encoding for another's. Add the key, or set `mla_use_nope` if the model \
+             genuinely has none."
+        ),
+        (false, Some(t)) => {
+            assert!(
+                t.is_finite() && t > 1.0,
+                "{model}: rope_theta = {t} is not a usable base for cos(p / theta^(2i/d))"
+            );
+            // `declare_glm` materialises its tables with `RopeScale::None`. Any scheme that
+            // rescales the frequencies would be dropped here and nowhere else.
+            assert!(
+                !has_rope_scaling && matches!(rope_type, None | Some("default")),
+                "{model}: rope_type = {:?}, rope_scaling present = {has_rope_scaling}. The MLA \
+                 tables are built with RopeScale::None, so a scaled scheme (yarn / linear / \
+                 llama3) would be emitted as an UNSCALED RoPE at theta {t} — correct-looking \
+                 tables, wrong long-context behaviour. Wire the scheme into \
+                 `GenTensor::rope_pair` before accepting it.",
+                rope_type.unwrap_or("default")
+            );
+        }
+    }
+}
+
+/// The opcodes the gfx950 interpreter actually dispatches.
+///
+/// Kept as `PLOW_DOP_*` spellings so the drift test can compare them to `runtime/amd/interp.hip`
+/// directly, with no name mapping in between to get wrong.
+///
+/// WHY THIS EXISTS. AMD's dispatch `default:` is `/* PLOW_DOP_NOP */` — it writes NOTHING. An
+/// opcode with no arm therefore does not trap, it silently leaves the output buffer untouched, and
+/// the failure surfaces as an accuracy bug somewhere downstream. sm_120's default is `__trap()`,
+/// which is why the same class of mistake is loud there and silent here. Three separate instances
+/// landed in one week (a bf16 `GemmSmall` compiled out of the fp8 prefill object; the flash object
+/// chosen without following the KV axis; the KV axis dragging the weight axis), and a fourth was
+/// found latent: `PLOW_FUSE_ARGMAX` emits `GEMV_ARGMAX`, which has no AMD arm at all, so a decode
+/// would have argmaxed over an untouched buffer and returned token 0 forever.
+///
+/// Gating each flag as it is discovered is whack-a-mole. This is the general form: whatever the
+/// flags did, the STREAM is checked against what the target can run.
+const GFX950_DISPATCHED: &[&str] = &[
+    "PLOW_DOP_ADD_NORM",
+    "PLOW_DOP_ARGMAX",
+    "PLOW_DOP_ARGMAX_FIN",
+    "PLOW_DOP_ATTN_RES",
+    "PLOW_DOP_ATTN_SELECT",
+    "PLOW_DOP_DENSE_GLU_FP8_BLK",
+    "PLOW_DOP_EMBED",
+    "PLOW_DOP_FLASH_DECODE",
+    "PLOW_DOP_FLASH_DECODE_FP8",
+    "PLOW_DOP_FLASH_GATHER_DECODE",
+    "PLOW_DOP_FLASH_GATHER_PREFILL",
+    "PLOW_DOP_FLASH_MERGE",
+    "PLOW_DOP_FLASH_MLA_DECODE",
+    "PLOW_DOP_FLASH_MLA_PREFILL",
+    "PLOW_DOP_FLASH_PREFILL",
+    "PLOW_DOP_FLASH_PREFILL_FP8",
+    "PLOW_DOP_GEMM",
+    "PLOW_DOP_GEMM_C5",
+    "PLOW_DOP_GEMM_C5_FP8",
+    "PLOW_DOP_GEMM_C5_MXFP4",
+    "PLOW_DOP_GEMM_FP8",
+    "PLOW_DOP_GEMM_FP8_BLK",
+    "PLOW_DOP_GEMM_GLU",
+    "PLOW_DOP_GEMM_GLU_FP8",
+    "PLOW_DOP_GEMM_MED",
+    "PLOW_DOP_GEMM_MED_FP8",
+    "PLOW_DOP_GEMM_MED_MXFP4",
+    "PLOW_DOP_GEMM_MXFP4",
+    "PLOW_DOP_GEMM_SMALL",
+    "PLOW_DOP_GEMM_SMALL_FP8",
+    "PLOW_DOP_GEMM_SMALL_MXFP4",
+    "PLOW_DOP_GEMM_WIDE",
+    "PLOW_DOP_GEMM_WIDE_FP8",
+    "PLOW_DOP_GEMM_WIDE_MXFP4",
+    "PLOW_DOP_GEMV",
+    "PLOW_DOP_GEMV_FP8",
+    "PLOW_DOP_GEMV_FP8_BLK",
+    "PLOW_DOP_GEMV_GLU",
+    "PLOW_DOP_GEMV_GLU_FP8",
+    "PLOW_DOP_GEMV_GLU_MXFP4",
+    "PLOW_DOP_GEMV_MXFP4",
+    "PLOW_DOP_GEMV_QKV",
+    "PLOW_DOP_GLU",
+    "PLOW_DOP_HEADNORM_ROPE",
+    "PLOW_DOP_HEADNORM_ROPE_FP8",
+    "PLOW_DOP_INDEX_SCORE",
+    "PLOW_DOP_INDEX_SELECT",
+    "PLOW_DOP_KDA_CONV",
+    "PLOW_DOP_KDA_GATE",
+    "PLOW_DOP_KDA_GATED_NORM",
+    "PLOW_DOP_KDA_STATE_STEP",
+    "PLOW_DOP_LAYERNORM",
+    "PLOW_DOP_MLA_MERGE_FOLD",
+    "PLOW_DOP_MLA_OUT_GATE",
+    "PLOW_DOP_MOE_ALIGN_PF",
+    "PLOW_DOP_MOE_COMBINE",
+    "PLOW_DOP_MOE_COMBINE_PF",
+    "PLOW_DOP_MOE_EXPERT_DOWN",
+    "PLOW_DOP_MOE_EXPERT_DOWN_FP8_BLK",
+    "PLOW_DOP_MOE_EXPERT_GLU",
+    "PLOW_DOP_MOE_EXPERT_GLU_FP8_BLK",
+    "PLOW_DOP_MOE_GROUP_DOWN_FP8_BLK",
+    "PLOW_DOP_MOE_GROUP_DOWN_PF",
+    "PLOW_DOP_MOE_GROUP_GLU_FP8_BLK",
+    "PLOW_DOP_MOE_GROUP_GLU_PF",
+    "PLOW_DOP_MOE_ROUTER",
+    "PLOW_DOP_MOE_ROUTER_TOPK",
+    "PLOW_DOP_MOE_ROUTER_TOPK_PF",
+    "PLOW_DOP_NORM_RESIDUAL",
+    "PLOW_DOP_NORM_RESIDUAL_NORM",
+    "PLOW_DOP_O_UV_FOLD",
+    "PLOW_DOP_QUANT_FP8",
+    "PLOW_DOP_RESIDUAL",
+    "PLOW_DOP_RMSNORM",
+    "PLOW_DOP_ROWRMS",
+    "PLOW_DOP_SITU_GLU",
+    "PLOW_DOP_SOFTCAP",
+    "PLOW_DOP_XARGMAX_FIN",
+    "PLOW_DOP_XFLASHMERGE",
+    "PLOW_DOP_XREDUCE",
+    "PLOW_DOP_XREDUCE2",
+];
+
+/// Refuse a packet carrying an opcode the gfx950 interpreter has no arm for.
+///
+/// Coarse ON PURPOSE: "is there a `case` anywhere in interp.hip", not "is there one under the
+/// defines this packet's manifest asks for". The finer question needs the cmake table, which
+/// `scripts/gfx950_objects.py --cover` parses — restating that table here is the drift this file
+/// exists to prevent. The coarse check is what catches an opcode with NO implementation, which is
+/// the failure that produces silent zeros.
+///
+/// ONE DIRECTION ONLY, and that was a hole. This asks *emitted opcode ⇒ arm exists*. It cannot ask
+/// *arm exists ⇒ something emits it*, because it sees ONE packet built under ONE flag combination —
+/// an arm nothing routes to looks exactly like an arm this particular packet did not need. That is
+/// why `PLOW_MXFP4=1` on a dense model shipped a bf16 packet for as long as it did with every gate
+/// in this file green. The reverse direction is therefore a TEST over the sources, not a runtime
+/// check: see `gfx950_coverage_tests::every_dispatched_arm_has_an_emit_site` and
+/// `precision_knob_table_matches_the_emitters`.
+/// Refuse a group-limited-routing packet on a target whose interpreter routes flat.
+///
+/// GROUP-LIMITED ROUTING (DeepSeek `noaux_tc`, and Kimi-K3) partitions the experts into `n_group`
+/// contiguous groups, keeps the top `topk_group` of them by summed top-2 biased score, and runs
+/// the top-k only inside those. The rule is carried on the router instruction as `i[6] = n_group`
+/// and `i[7] = topk_group`, and `moe_group_mask` (`runtime/amd/op_moe.h:271`) implements it.
+///
+/// ONLY THE AMD INTERPRETER HAS IT. `runtime/nvidia/` and `runtime/cpu/` read neither operand —
+/// they route flat top-k over all experts. So the SAME packet computes a different model on a
+/// different backend, and nothing on either side says so: there is no missing opcode for
+/// `check_gfx950_opcode_coverage`'s cousin to catch, because the op exists everywhere and only
+/// its operands are ignored. The divergence surfaces as an accuracy gap between an AMD and an
+/// NVIDIA rank, or against the CPU golden reference used to validate the kernel — and it looks
+/// like a numerics bug rather than a missing feature, which is the expensive way to find it.
+///
+/// Refused rather than ignored, by the rule `warn_uniseg_on_amd` states: ignoring a flag is
+/// acceptable when the caller still gets the CORRECT packet, and here they would not.
+///
+/// Inert for every model shipping today — `n_group <= 1` (GLM-5.2, Gemma-4, Qwen) and
+/// `topk_group >= n_group` are both the identity, and pre-existing blobs carry `i[6] = 0`.
+fn check_group_routing_supported(m: &Model, amd: bool, arch: &str) {
+    if amd {
+        return;
+    }
+    let grouped = m
+        .progs
+        .iter()
+        .flat_map(|p| p.insts.iter())
+        .find(|i| {
+            (i.op == DevOp::MoeRouterTopk as u16 || i.op == DevOp::MoeRouterTopkPf as u16)
+                && i.i[6] > 1
+                && i.i[7] < i.i[6]
+        });
+    if let Some(i) = grouped {
+        panic!(
+            "group-limited MoE routing (n_group = {}, topk_group = {}) is not implemented for \
+             {arch}. Missing capability: `moe_group_limited_routing` outside gfx950 — \
+             `moe_group_mask` lives only in runtime/amd/op_moe.h, and the NVIDIA and CPU \
+             interpreters ignore i[6]/i[7] and route FLAT top-{} over all experts. That is a \
+             different expert set, so the same packet would compute a different model here than \
+             it does on AMD, with no fault and no diagnostic on either side. Emit this model for \
+             a gfx950 target, or implement the group mask in the target's router first.",
+            i.i[6], i.i[7], i.i[2]
+        );
+    }
+}
+
+fn check_gfx950_opcode_coverage(m: &Model, amd: bool) {
+    if !amd {
+        return;
+    }
+    let mut missing: Vec<&'static str> = Vec::new();
+    for p in &m.progs {
+        for inst in &p.insts {
+            let Some(op) = DevOp::ALL.iter().copied().find(|o| *o as u16 == inst.op) else {
+                continue;
+            };
+            let c = op.c_name();
+            if !GFX950_DISPATCHED.contains(&c) && !missing.contains(&c) {
+                missing.push(c);
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "this packet carries {} opcode(s) the gfx950 interpreter has no arm for: {missing:?}. \
+         Missing capability: `gfx950_opcode_arm`. AMD's dispatch default writes NOTHING rather than \
+         trapping, so such a packet would RUN and be silently wrong — an untouched output buffer \
+         read as a result. Either emit the arm on the AMD side or stop emitting the opcode (check \
+         which env flag selected it; several are sm_120-conditioned and ungated).",
+        missing.len()
+    );
+}
+
+/// Warn when `PLOW_UNISEG` is set for an AMD target, where it is ignored.
+///
+/// THE THIRD sm_120-conditioned flag found with no arch gate, and the one that did the most damage:
+/// the documented Gemma recipe passed it, so every asset built by following the documentation lost
+/// AMD's wave-class split and produced zero logits in an 8.7 ms "prefill". See
+/// [`packet::devbuild::Builder::deny_uniseg`] for the mechanism.
+///
+/// Ignored rather than refused, by the same rule as `PLOW_L2_PLACE`: ignoring it yields the CORRECT
+/// packet, so the thing being dropped is not load-bearing for the result. Contrast w8a16-on-gfx950,
+/// where ignoring the flag would have produced a WRONG packet and refusing was the only honest
+/// option. The test is always "what does the caller get if I drop this?", not "how important does
+/// the flag sound".
+fn warn_uniseg_on_amd(amd: bool) {
+    if amd && std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1") {
+        eprintln!(
+            "  PLOW_UNISEG ignored: it collapses every op into ONE segment, which is spurious on \
+             sm_120 but destroys the wave-class split an AMD host relaunches on — the whole prefill \
+             program would be dispatched on the 4-wave flash object, which silently drops every op \
+             that is not a flash. Emitting with wave-class segmentation instead."
+        );
+    }
+}
+
+/// Warn when `--arch` and `--gpu` name different vendors.
+///
+/// The manifest's whole job is to say what object a packet needs, and `arch` is what a backend
+/// renders flags for — so an sm_120a manifest emitted for an MI350X describes a build for the wrong
+/// TOOLCHAIN, not merely the wrong tuning. `build-amd/g31b-fp8` and `g31b-fp8kv` were both emitted
+/// that way and then run on gfx950; the mismatch is how an sm_120-only w8a16 profile ended up in an
+/// AMD build directory at all.
+///
+/// A warning rather than a refusal: emitting a manifest for a different target than the sizing GPU
+/// is legitimate when cross-compiling, and `--n-cu` can be given explicitly. But it must never
+/// happen SILENTLY, because the failure it produces — an object built with the wrong defines, or
+/// with no arm for an opcode at all — surfaces as a fault at first launch with nothing pointing
+/// back here.
+fn warn_arch_gpu_vendor_mismatch(arch: &str, gpu: &str) {
+    let Some(spec) = hwspec::registry::lookup(gpu) else { return };
+    let arch_amd = arch.starts_with("gfx");
+    let arch_nv = arch.starts_with("sm_");
+    let gpu_amd = spec.vendor == hwspec::Vendor::Amd;
+    if (arch_amd && !gpu_amd) || (arch_nv && gpu_amd) {
+        eprintln!(
+            "  WARNING: --arch {arch} and --gpu {gpu} name different vendors. build.json will \
+             describe an object for {arch}, but the packet is sized for {gpu} ({} CUs). If this is \
+             not a deliberate cross-compile then one of the two is wrong — this exact mismatch is \
+             how two w8a16 assets ended up in an AMD build directory and faulted on first launch.",
+            spec.sm_count
+        );
+    }
+}
+
+/// Refuse a packet whose fp8 prefill GEMMs have no activation scale, when the target is gfx950.
+///
+/// `PLOW_FP8=1` alone emits **w8a16**: a bf16 activation in `t[1]` and `t[3]` (a_scale) left
+/// `TENSOR_NONE`. That is a real profile — the sm_120 build has a w8a16 cubin for it. gfx950 does
+/// not: `d_gemm_fp8` is **w8a8** unconditionally, it casts `t[1]` to `unsigned char*` and its
+/// epilogue computes `acc * ascale[mm] * wscale[nn]` with NO null check
+/// (`runtime/amd/op_gemm.h`). So a w8a16 packet on gfx950 dereferences a null pointer on the first
+/// prefill GEMM — a GPU fault with no diagnostic, from a flag combination the README documented.
+///
+/// REFUSE rather than silently upgrade to w8a8. The two are not the same computation: w8a8
+/// quantizes the ACTIVATIONS as well, so auto-substituting would change the numerics of a run under
+/// a flag the caller set to mean something else, and any accuracy result from it would be
+/// attributed to the wrong profile. Every substitution this emitter makes on its own —
+/// `pick_tile`'s tile choice, say — is computation-preserving; this one would not be. The fix is
+/// one flag and the message names it.
+///
+/// Derived from the EMITTED STREAM rather than from the flags, for the reason `manifest.rs` states
+/// at length: an emitter flag says what was asked for, the stream says what the packet contains,
+/// and only the second is what the object has to run. It also means the gate cannot drift if the
+/// fp8 branching is ever restructured.
+fn check_fp8_a_scale_bound(m: &Model, arch: &str, gpu: &str) {
+    // WHICH TARGET, and why `arch` alone is not enough to ask.
+    //
+    // `--arch` records the ISA the manifest is written FOR; `--gpu` records the part the packet is
+    // sized for. They can disagree, and when they do the arch string is the less trustworthy of the
+    // two — the assets that motivated this gate are exactly that case: `build-amd/g31b-fp8kv` was
+    // emitted `--arch sm_120a` (where w8a16 is a real profile) with `n_cu = 256` (an MI350X), and
+    // then run on gfx950, where it faulted. An arch-only gate would have let it straight through.
+    //
+    // So: AMD if EITHER signal says AMD. A false positive costs an sm_120 user one flag and a clear
+    // message; a false negative is the null dereference this exists to stop.
+    let gpu_is_amd =
+        hwspec::registry::lookup(gpu).is_some_and(|s| s.vendor == hwspec::Vendor::Amd);
+    if !arch.starts_with("gfx") && !gpu_is_amd {
+        return;
+    }
+    // DERIVED FROM `GFX950_RUNGS`, not restated. A hand-written list of the fp8 opcodes is the
+    // one part of this gate that COULD drift, and it did: the tile-inventory campaign added the
+    // 128x256 (`GemmWideFp8`) and 192x256 (`GemmC5Fp8`) rungs to `GFX950_RUNGS` — so `pick_tile`
+    // began emitting them — while this closure still named only the original three. The gate went
+    // quiet on exactly the two shapes the rungs were added for. `manifest.rs`'s `FP8_WEIGHT_OPS`
+    // was updated in the same change and this was not, which is what made the omission invisible.
+    //
+    // `GFX950_RUNGS` is the table `pick_tile` selects from, so reading the fp8 column of it asks
+    // the same question the emitter answers. A sixth rung is now covered by construction.
+    let fp8_gemm = |op: u16| GFX950_RUNGS.iter().any(|(_, fp8, _, _, _, _)| *fp8 as u16 == op);
+    let bad = m
+        .progs
+        .iter()
+        .flat_map(|p| p.insts.iter())
+        .find(|i| fp8_gemm(i.op) && i.t[3] == TENSOR_NONE);
+    if let Some(i) = bad {
+        panic!(
+            "fp8 prefill GEMM (op {}) has no activation scale (t[3] = TENSOR_NONE) and the target \
+             is {arch}. Missing capability: `fp8_w8a16_prefill` on gfx950 — `d_gemm_fp8` there is \
+             w8a8 unconditionally: it reads t[1] as e4m3 bytes and its epilogue dereferences \
+             ascale[m] with no null check, so this packet would fault on its first prefill GEMM. \
+             PLOW_FP8=1 alone emits w8a16, which only the sm_120 objects implement. Use \
+             `PLOW_FP8=1 PLOW_W8A8=1` for fp8 on gfx950 (it emits QuantFp8 and binds t[3]), or \
+             build for an sm_120 target. NOT auto-upgraded: w8a8 quantizes activations too, so it \
+             is a different computation and would silently change what a run measures.",
+            i.op
+        );
+    }
+}
+
 /// Dense-GQA (Gemma / Llama / Qwen) full device-blob emit: parse config, size the
 /// bucket ladder, declare tensors + emit every program via [`DenseGqaEmitter`],
 /// then serialize + coverage-gate + write the blob. Split out of `run_verified` so
@@ -3446,7 +4808,7 @@ fn emit_dense_gqa(
     embed_cubin: Option<String>,
     embed_hsaco: Option<String>,
     rope_gen: bool,
-    l2_layout: Option<(u32, u32)>,
+    l2_layout: Option<packet::devbuild::L2Layout>,
     gpu: String,
     arch: String,
     verify: Option<VerifyHook>,
@@ -3454,6 +4816,11 @@ fn emit_dense_gqa(
     // Empty --gpu ⇒ unknown target (0), not fnv("") — so the header stamp is 0
     // and unspecified-GPU blobs stay byte-stable (e.g. the golden test).
     let target_fp = if gpu.is_empty() { 0 } else { packet::devbuild::gpu_fingerprint(&gpu) };
+    // Resolved ONCE, at the top, because several decisions below depend on it — the prefill bucket
+    // ladder, the lm_head arm, `deny_uniseg`, and the opcode-coverage gate. Recomputing it per site
+    // is how two of the three ungated sm_120 flags stayed ungated. Same predicate `run_verified`
+    // uses; this function is also reached directly, so it does not inherit that one.
+    let amd = target_is_amd(&arch, &gpu);
     let mut c = cfg_from(&dir);
     assert!(tp >= 1, "--tp must be >= 1");
     c.tp = tp;
@@ -3470,7 +4837,33 @@ fn emit_dense_gqa(
     // + existing bf16 mma, per-channel scale in the epilogue). Both phases consume the fp8 twins, so
     // the bf16 projection weights are elided in fp8 mode (see `wproj`). The bf16 pkt is byte-identical
     // when unset. See runtime/nvidia/op_gemm.cuh, runtime/amd/op_gemm.h and gemma4_chat.c.
-    let fp8 = std::env::var("PLOW_FP8").ok().as_deref() == Some("1");
+    // ===== THE FOUR PRECISION AXES =====================================================
+    //
+    // A packet's precision is FOUR independent choices — weight, activation, KV cache, experts —
+    // and the flags did not say so. `PLOW_FP8` alone meant "fp8 weights", but the ACTIVATION axis
+    // had no flag at all: it was decided by PHASE inside the weight axis (prefill w8a8, decode
+    // w8a16), which is why a w8a16 packet could reach gfx950 with no way for the caller to say
+    // otherwise, and why `check_fp8_a_scale_bound` has to exist. A distinction that cannot be
+    // EXPRESSED cannot be checked at the point of request; it can only be caught afterwards.
+    //
+    // So the axes get names. `PLOW_FP8` stays an alias for the weight axis — every existing script
+    // and every line of the README keeps working, and unset means unset:
+    //
+    //   weight      PLOW_W8A16=1 | PLOW_W8A8=1 | PLOW_W4A16=1   (alias: PLOW_FP8=1 -> w8a16)
+    //   activation  implied by the weight axis (w8a8 quantizes activations; the others do not)
+    //   kv          PLOW_KV_FP8=1                               (alias: PLOW_FP8_KV=1)
+    //   experts     PLOW_MOE_ENC=bf16|fp8blk|mxfp4              (MLA family; see mla::MoeEnc)
+    //
+    // The activation axis is deliberately NOT a separate flag: w8a8 is one profile, not a free
+    // cross-product with w8a16, and the kernels instantiate exactly those. Naming it separately
+    // would invent combinations no object implements — the opposite of the problem being fixed.
+    //
+    // The refusal gate stays regardless of naming. Names make the distinction expressible at the
+    // point of request; the gate is derived from the emitted STREAM, so it is the thing that cannot
+    // drift when the flags are restructured again.
+    let fp8 = std::env::var("PLOW_FP8").ok().as_deref() == Some("1")
+        || std::env::var("PLOW_W8A16").ok().as_deref() == Some("1")
+        || std::env::var("PLOW_W8A8").ok().as_deref() == Some("1");
     // T8 w8a8 (PLOW_W8A8=1, requires PLOW_FP8=1). PREFILL emits the true fp8 tensor-core path:
     // ONE per-row DevOp::QuantFp8 per activation site + GEMM_FP8/GEMM_GLU_FP8 re-pointed at the
     // fp8 activation (t1=xq) + a_scale (t3). The SAME opcodes serve T6 w8a16 (bf16 activation) —
@@ -3479,14 +4872,61 @@ fn emit_dense_gqa(
     // the same e4m3 twins + per-channel scales T6 declared. Unset => byte-identical emission.
     let w8a8 = std::env::var("PLOW_W8A8").ok().as_deref() == Some("1");
     assert!(
+        !(w8a8 && std::env::var("PLOW_W8A16").ok().as_deref() == Some("1")),
+        "PLOW_W8A8=1 and PLOW_W8A16=1 name two activation profiles on one weight axis; pick one"
+    );
+    assert!(
         !w8a8 || fp8,
         "PLOW_W8A8=1 requires PLOW_FP8=1 (the fp8 weight twins + scales)"
+    );
+    // WEIGHT AXIS, 4-bit (`PLOW_MXFP4=1`) — REFUSED here, not ignored.
+    //
+    // The flag is real and it works, on the OTHER family: `mla::mla_moe_enc_env` reads it and
+    // returns `MoeEnc::Mxfp4`, and `scripts/build_gfx950.sh` builds and ships
+    // `interp_{decode,prefill}_mxfp4[_gq].elf` when it is set. This emitter never read it. So
+    // `PLOW_MXFP4=1` on Gemma/Qwen/Llama emitted a packet BYTE-IDENTICAL to the bf16 one, with
+    // `build.json` reporting `mxfp4_weights: false` and not one `Gemv*Mxfp4` opcode in the stream —
+    // next to a build directory full of objects named `mxfp4`. §4's recurring shape exactly: the
+    // arm exists (`DevOp::GemvMxfp4`/`GemvGluMxfp4`/`GemmMxfp4`, 91/92/93, all three dispatched by
+    // the gfx950 interpreter and all three in `GFX950_DISPATCHED`), it is correct, it is
+    // register-gated — and on this path nothing routes to it.
+    //
+    // REFUSED rather than warned, by `warn_uniseg_on_amd`'s own test: "what does the caller get if
+    // I drop this?" Dropping `PLOW_UNISEG` yields the CORRECT packet, so it is ignored with a
+    // warning. Dropping `PLOW_MXFP4` yields a bf16 packet that the caller asked to be mxfp4, will
+    // benchmark, and will report as mxfp4 — the precision substitution the apples-to-apples rule
+    // exists to prevent, and the one failure mode this file's gates are all pointed at. That puts
+    // it with w8a16-on-gfx950 (`check_fp8_a_scale_bound`), not with UNISEG. It also removes a
+    // loudness asymmetry that was itself the defect: `PLOW_FP8=1` without `PLOW_W8A8` on gfx950
+    // panics with a four-line explanation, while the 4-bit axis said nothing at all.
+    //
+    // Missing capability: `dense_mxfp4_weights`. NOT implemented rather than not wanted, and the
+    // reason is measurement: mxfp4 projects only ~1.2x over w8a8 once the fixed per-packet overhead
+    // is held constant, not the 2x its 4-bit weight implies, because that overhead does not shrink
+    // with the weights. Building it would mean declaring e2m1 weight twins + one E8M0 scale per 32
+    // K-elements per projection (bias 127 — byte 0 is 2^-127, not neutral), pointing decode at ops
+    // 91/92 and prefill at 93, and adding the `mxfp4` object row to the manifest's `requires`.
+    assert!(
+        std::env::var("PLOW_MXFP4").ok().as_deref() != Some("1"),
+        "PLOW_MXFP4=1 is not implementable on the dense-GQA family (Gemma / Qwen / Llama): this \
+         emitter has no mxfp4 arm, so it would emit a packet byte-identical to bf16 while the \
+         objects, the filename and the manifest all said mxfp4. Missing capability: \
+         `dense_mxfp4_weights`. It IS implemented for the MLA/MoE family (GLM / Kimi / DeepSeek), \
+         which is what `scripts/build_gfx950.sh`'s mxfp4 objects are for. NOT silently downgraded \
+         to bf16: a bf16 asset labelled mxfp4 is the precision substitution that makes a \
+         measurement unfalsifiable. Use PLOW_FP8=1 PLOW_W8A8=1 for the narrowest weight profile \
+         this family has on gfx950, or unset PLOW_MXFP4 for bf16."
     );
     // FP8 KV-CACHE (PLOW_FP8_KV=1). Stores/reads K/V as e4m3 with a per-row f32 scale, halving the
     // decode KV stream (the HBM-bound part of flash-decode) and the KV footprint. Independent of the
     // fp8 WEIGHT path above so both can be A/B'd; the harness routes an fp8-KV pkt to the _fp8kv
     // interpreter objects (which carry the fp8 flash + HeadNormRopeFp8 arms).
-    let fp8_kv = std::env::var("PLOW_FP8_KV").ok().as_deref() == Some("1");
+    // KV axis. `PLOW_KV_FP8` is the axis-named spelling; `PLOW_FP8_KV` is the historical one and
+    // stays an alias. This axis is INDEPENDENT of the weight axis — bf16 weights with an fp8 KV
+    // cache is a real and useful profile (NVIDIA has always been able to build it), and the AMD
+    // object matrix conflated the two until recently.
+    let fp8_kv = std::env::var("PLOW_FP8_KV").ok().as_deref() == Some("1")
+        || std::env::var("PLOW_KV_FP8").ok().as_deref() == Some("1");
     // PLOW_FP8_KV_FULL=1: restrict the e4m3 cache to FULL-attention (hd512) layers — the shape
     // the beat-fp8-mma PIPE=1 fp8-mma prefill flash serves. Requires PLOW_FP8_KV=1.
     let fp8_kv_full = fp8_kv && std::env::var("PLOW_FP8_KV_FULL").ok().as_deref() == Some("1");
@@ -3528,7 +4968,14 @@ fn emit_dense_gqa(
     let cap = ctx.min(max_chunk(c.window));
     let shipped: Vec<u32> =
         [128u32, 512, 1024, 2048, 4096, 8192].into_iter().filter(|&x| x <= cap).collect();
-    let buckets: Vec<u32> = if std::env::var("PLOW_PF_LADDER").ok().as_deref() == Some("wave") {
+    // PLOW_PF_LADDER is sm_120-only, and its own comment above says why: the rungs are derived from
+    // the 128x128 sm_120 tile, and "the AMD bodies tile differently, so the ladder is only derived
+    // on the NVIDIA path; gate it on the flag rather than guessing the target's tile from here."
+    // The target is now known here, so gate on the TARGET instead of hoping nobody sets the flag.
+    // Unlike the other three this one only mis-TUNES the rungs — no opcode moves and nothing is
+    // dropped — so it is ignored quietly on AMD rather than warned about at every emit.
+    let ladder_wave = !amd && std::env::var("PLOW_PF_LADDER").ok().as_deref() == Some("wave");
+    let buckets: Vec<u32> = if ladder_wave {
         let ops = ladder::ladder_ops(&c, LADDER_BN);
         let max_tm = cap.div_ceil(LADDER_BM).max(1);
         let l: Vec<u32> = ladder::wave_ladder(n_cu, &ops, max_tm, shipped.len())
@@ -3605,7 +5052,7 @@ fn emit_dense_gqa(
     // `new` forwards to the same `declare`, `emit_*` to the same `emit_phase`.
     let (emitter, tensors, gen) = DenseGqaEmitter::new(
         &c, &ls, n_cu, ctx, fp8, w8a8, fp8_kv, fp8_kv_full, block.clone(), block_mode, ns_pre,
-        dbatch, moe_pf,
+        dbatch, moe_pf, amd,
     );
 
     let mut progs = Vec::new();
@@ -3616,14 +5063,21 @@ fn emit_dense_gqa(
         } // MoE without prefill: decode-only blob
         let mut b = Builder::new(n_cu);
         b.adopt_tensors(tensors.clone());
-        b.set_l2_placement(l2_layout); // PLOW_NV_PLACE: None ⇒ byte-identical
+        b.set_l2_placement(l2_layout); // PLOW_L2_PLACE: None ⇒ byte-identical
+        if amd {
+            b.deny_uniseg(); // PLOW_UNISEG collapses the wave-class split — see `warn_uniseg_amd`
+        }
         emitter.emit_prefill(&mut b, t);
         progs.push(b.finish());
         tlist.push(t);
     }
     let mut bd = Builder::new(n_cu);
     bd.adopt_tensors(tensors.clone());
-    bd.set_l2_placement(l2_layout); // PLOW_NV_PLACE: None ⇒ byte-identical
+    bd.set_l2_placement(l2_layout); // PLOW_L2_PLACE: None ⇒ byte-identical
+    if amd {
+        bd.deny_uniseg();
+    }
+    bd.set_gemv_split(gemv_split()); // PLOW_GEMV_SPLIT: 1 (default) ⇒ byte-identical
     let mut kv_rows = Vec::new();
     // `dbatch` is the SAME clamped(1,32) value used by declare() above — emission and
     // allocation must agree, so we reuse it here rather than re-reading the env (an unclamped
@@ -3738,11 +5192,13 @@ fn emit_dense_gqa(
     // Read-only verification gate (EmitArgs::verify): runs against the exact
     // programs about to be serialized; a rejection aborts before any bytes
     // are written. `None` (the default) is a no-op — emitted bytes identical.
-    if let Some(v) = &verify {
-        if let Err(e) = v(&m) {
-            panic!("devblob verification rejected the emitted program: {e}");
-        }
-    }
+    //
+    // THE PANIC IS FOR A REJECTION ONLY. The hook takes `&Model`, so it cannot
+    // change what gets serialized; and it is the hook's job — not this call
+    // site's — to downgrade "no usable verifier here" into an `Ok` carrying a
+    // skip reason. Anything that reaches this `Err` is the verifier saying the
+    // program is wrong, i.e. a real bug caught, and must be loud.
+    let lean = apply_verify_gate(&m, verify.as_ref());
     let blob = if sections.is_empty() {
         m.to_blob()
     } else {
@@ -3767,6 +5223,13 @@ fn emit_dense_gqa(
             std::process::exit(1);
         }
     }
+    // GATE: an fp8 GEMM whose a_scale operand is unbound is a NULL DEREFERENCE on gfx950. Checked
+    // against the emitted stream and BEFORE the blob is written, so the bad packet never exists.
+    check_fp8_a_scale_bound(&m, &arch, &gpu);
+    check_gfx950_opcode_coverage(&m, amd);
+    check_group_routing_supported(&m, amd, &arch);
+    warn_arch_gpu_vendor_mismatch(&arch, &gpu);
+
     std::fs::write(&out, blob).unwrap();
 
     // BUILD MANIFEST (`build.json`, beside the .pkt). Derived from `m` — the exact
@@ -3777,7 +5240,7 @@ fn emit_dense_gqa(
     // Skipped when `arch` is empty (the legacy `gemma4` CLI), so that path's output
     // is unchanged.
     if !arch.is_empty() {
-        let man = manifest::build(&m, &arch);
+        let man = manifest::build(&m, &arch, &lean);
         let mpath = std::path::Path::new(&out).with_file_name("build.json");
         match serde_json::to_vec_pretty(&man).map(|b| std::fs::write(&mpath, b)) {
             Ok(Ok(())) => eprintln!("  build manifest -> {}", mpath.display()),
@@ -3789,7 +5252,11 @@ fn emit_dense_gqa(
     let wb: u64 = m
         .tensors
         .iter()
-        .filter(|x| x.name.starts_with("model.") || x.name.starts_with("fp8/"))
+        // Same predicate the loaders bind on (`packet::names`), so the emitter's reported
+        // "weights N GiB" is exactly the byte count the runtime will demand of the checkpoint.
+        // Under the old prefix allowlist an untied `lm_head.weight` was reported as
+        // activations here AND zeroed by the CUDA loader — the report agreed with the bug.
+        .filter(|x| packet::names::is_checkpoint_weight(&x.name))
         .map(|x| x.bytes)
         .sum();
     let kb: u64 = m
@@ -3976,19 +5443,771 @@ mod mode_tests {
 }
 
 #[cfg(test)]
+mod gfx950_coverage_tests {
+    //! The AMD opcode-coverage gate, and the drift test that keeps its list honest.
+    use super::*;
+
+    /// `MOE_MAX_TOPK` must equal `PLOW_MOE_MAX_TOPK` — PARSED out of `op_moe.h`, not restated.
+    ///
+    /// The two halves of this bound live in different languages and different repos-worth of
+    /// build system, and only one of them refuses. If the Rust constant drifts HIGH the emit
+    /// happily produces a packet the kernel truncates silently; if it drifts LOW the emit refuses
+    /// a model that would have run. Neither shows up in any other test.
+    #[test]
+    fn moe_topk_matches_the_amd_kernel() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("runtime/amd/op_moe.h"));
+        let Some(path) = root.filter(|p| p.exists()) else {
+            eprintln!("op_moe.h not found — skipping (source checkout only)");
+            return;
+        };
+        let src = std::fs::read_to_string(&path).unwrap();
+        let def = src
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("#define PLOW_MOE_MAX_TOPK "))
+            .expect("op_moe.h has no `#define PLOW_MOE_MAX_TOPK`");
+        let got: u32 = def
+            .trim()
+            .trim_end_matches('u')
+            .parse()
+            .unwrap_or_else(|e| panic!("cannot parse PLOW_MOE_MAX_TOPK {def:?}: {e}"));
+        assert_eq!(
+            got, MOE_MAX_TOPK,
+            "devgen::MOE_MAX_TOPK ({MOE_MAX_TOPK}) disagrees with op_moe.h's \
+             PLOW_MOE_MAX_TOPK ({got}). Raise them together: the kernel bound is what the routers \
+             can select into, the Rust one is what refuses to emit past it."
+        );
+    }
+
+    /// The refusal must name the model AND the limit, and must not fire at or below the bound.
+    /// A gate that refuses everything is as useless as one that refuses nothing.
+    #[test]
+    fn moe_topk_refusal_is_a_threshold_and_names_the_model() {
+        for k in 1..=MOE_MAX_TOPK {
+            require_moe_topk(k, "in-bounds");
+        }
+        // Expressed against the constant, not a literal: this test must keep meaning the same
+        // thing the next time the bound moves.
+        let over = MOE_MAX_TOPK + 1;
+        let err = std::panic::catch_unwind(|| require_moe_topk(over, "kimi_k3")).unwrap_err();
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(msg.contains("kimi_k3"), "refusal must name the model: {msg}");
+        assert!(msg.contains("PLOW_MOE_MAX_TOPK"), "must name the limit: {msg}");
+        assert!(msg.contains("uninitialised"), "must say what goes wrong: {msg}");
+    }
+
+    /// The list must equal what `interp.hip` actually dispatches — PARSED, not restated. A
+    /// hand-maintained copy of a fact in another file is the drift `manifest.rs` was written to
+    /// stop; this is the same discipline `packet`'s `dev_abi` test applies to `dev_isa.h`.
+    ///
+    /// Two dispatch FORMS, and missing the second would produce false refusals: most opcodes are
+    /// `case PLOW_DOP_X:` in the switch, but the TP collectives are handled by `if (in->op == ...)`
+    /// before it. A `case`-only parse undercounts them — which `docs/amd/model-op-coverage.md`
+    /// warns about in its opening lines.
+    #[test]
+    fn dispatched_list_matches_the_amd_interpreter() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("runtime/amd/interp.hip"));
+        let Some(path) = root.filter(|p| p.exists()) else {
+            eprintln!("interp.hip not found — skipping (source checkout only)");
+            return;
+        };
+        let src = std::fs::read_to_string(&path).unwrap();
+        let mut found: Vec<String> = Vec::new();
+        for line in src.lines() {
+            let t = line.trim();
+            // `case PLOW_DOP_X:` — the switch arms.
+            if let Some(r) = t.strip_prefix("case PLOW_DOP_") {
+                let name: String =
+                    r.chars().take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_').collect();
+                found.push(format!("PLOW_DOP_{name}"));
+            }
+            // `in->op == PLOW_DOP_X` — the collectives, dispatched ahead of the switch.
+            let mut rest = t;
+            while let Some(i) = rest.find("op == PLOW_DOP_") {
+                let r = &rest[i + "op == PLOW_DOP_".len()..];
+                let name: String =
+                    r.chars().take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_').collect();
+                found.push(format!("PLOW_DOP_{name}"));
+                rest = &r[name.len()..];
+            }
+        }
+        found.sort();
+        found.dedup();
+        let mut want: Vec<String> = GFX950_DISPATCHED.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        let missing_here: Vec<&String> = found.iter().filter(|n| !want.contains(n)).collect();
+        let stale: Vec<&String> = want.iter().filter(|n| !found.contains(n)).collect();
+        assert!(
+            missing_here.is_empty() && stale.is_empty(),
+            "GFX950_DISPATCHED disagrees with interp.hip.\n  interp has, list lacks: {missing_here:?}\n  \
+             list has, interp lacks: {stale:?}\nAn over-long list lets a packet through that will \
+             silently write nothing; a short one refuses a packet that would have run."
+        );
+    }
+
+    /// The gate refuses an opcode with no AMD arm. `GemvArgmax` is the real instance: it has no
+    /// `case` in interp.hip, and `PLOW_FUSE_ARGMAX=1` emits it — a decode would have argmaxed over
+    /// an untouched buffer and returned token 0 every step, with no fault anywhere.
+    #[test]
+    #[should_panic(expected = "gfx950_opcode_arm")]
+    fn opcode_with_no_amd_arm_is_refused() {
+        assert!(
+            !GFX950_DISPATCHED.contains(&DevOp::GemvArgmax.c_name()),
+            "if AMD ever gains a GEMV_ARGMAX arm this test should be re-pointed, not deleted"
+        );
+        let i = packet::dev::DevInst {
+            op: DevOp::GemvArgmax as u16, blocks: 1, ..Default::default()
+        };
+        let p = packet::devbuild::Program {
+            n_cu: 4, n_counter: 0, insts: vec![i], stream: vec![], stream_ofs: vec![],
+            stream_len: vec![], waits: vec![], succs: vec![], tensors: vec![],
+            gq_stream: vec![], gq_seg_ofs: vec![], l2_sms: 0, l2_domains: 0,
+        };
+        let m = Model {
+            n_cu: 256, target: 0, tensors: vec![], progs: vec![p],
+            kv_row_insts: vec![], prog_t: vec![1], gen: vec![],
+        };
+        check_gfx950_opcode_coverage(&m, true);
+    }
+
+    /// …and lets an ordinary packet through, on both targets.
+    #[test]
+    fn covered_opcodes_pass_and_nvidia_is_never_checked() {
+        let p = packet::devbuild::Program {
+            n_cu: 4, n_counter: 0,
+            insts: vec![
+                packet::dev::DevInst { op: DevOp::Gemv as u16, blocks: 1, ..Default::default() },
+                packet::dev::DevInst { op: DevOp::XReduce as u16, blocks: 1, ..Default::default() },
+            ],
+            stream: vec![], stream_ofs: vec![], stream_len: vec![], waits: vec![], succs: vec![],
+            tensors: vec![], gq_stream: vec![], gq_seg_ofs: vec![], l2_sms: 0, l2_domains: 0,
+        };
+        let m = Model {
+            n_cu: 256, target: 0, tensors: vec![], progs: vec![p],
+            kv_row_insts: vec![], prog_t: vec![1], gen: vec![],
+        };
+        check_gfx950_opcode_coverage(&m, true);
+        // The Gemma-MoE family has no AMD arm at all; on an NVIDIA target that must not be checked.
+        let p2 = packet::devbuild::Program {
+            n_cu: 4, n_counter: 0,
+            insts: vec![packet::dev::DevInst {
+                op: DevOp::MoeRouterGemma as u16, blocks: 1, ..Default::default()
+            }],
+            stream: vec![], stream_ofs: vec![], stream_len: vec![], waits: vec![], succs: vec![],
+            tensors: vec![], gq_stream: vec![], gq_seg_ofs: vec![], l2_sms: 0, l2_domains: 0,
+        };
+        let m2 = Model {
+            n_cu: 170, target: 0, tensors: vec![], progs: vec![p2],
+            kv_row_insts: vec![], prog_t: vec![1], gen: vec![],
+        };
+        check_gfx950_opcode_coverage(&m2, false);
+    }
+
+    // ===== THE REVERSE DIRECTION ==================================================================
+    //
+    // Everything above asks "the packet carries opcode X — does gfx950 have an arm?". Neither of
+    // these does, and that asymmetry is the single most-repeated bug in this tree (~10 instances):
+    //
+    //     an arm exists, is correct, is register-gated, and NOTHING ROUTES TO IT.
+    //
+    // The runtime gate is structurally unable to see it. It inspects one emitted packet, built
+    // under one flag combination, so "no instruction selected this arm" and "this program did not
+    // need this arm" are the same observation. The reverse question is about the SOURCE — is there
+    // any reachable emit path at all — so it is asked here, against the source, exactly as
+    // `dispatched_list_matches_the_amd_interpreter` asks its question against `interp.hip`.
+    //
+    // Two checks, because "unreachable" has two shapes, and the expensive one is the second:
+    //   A. NO emit site anywhere. `every_dispatched_arm_has_an_emit_site`.
+    //   B. an emit site exists on ONE emitter family, and the flag that selects it is not read by
+    //      the others, so those silently emit the default precision. `PLOW_MXFP4` was this:
+    //      `DevOp::GemvMxfp4` is emitted (by `mla.rs`), so check A is green, and a dense model with
+    //      `PLOW_MXFP4=1` still produced a byte-identical-to-bf16 packet.
+    //      `precision_knob_table_matches_the_emitters`.
+
+    /// The emitter files. `manifest.rs` is EXCLUDED even though it names opcodes: it classifies a
+    /// finished stream (`DevOp::GemvMxfp4 => s.mxfp4_proj = true`), so counting it as an emit site
+    /// would let a reporter vouch for an arm no emitter reaches — the exact confusion this checks.
+    const EMITTER_SRC: &[&str] = &["lib.rs", "mla.rs", "block.rs", "ladder.rs", "kda.rs", "k3.rs"];
+
+    /// Arms gfx950 dispatches that NOTHING emits, each with why that is deliberate.
+    ///
+    /// An allowlist, not a suppression: the justification is required, and an arm that leaves this
+    /// list without gaining an emit site fails the test. Adding a row is the moment to ask §4's
+    /// question — "what selects this, and is that selector complete over precisions?"
+    const GFX950_UNEMITTED: &[(&str, &str)] = &[
+        ("PLOW_DOP_ATTN_SELECT",
+         "DeepSeek DSA on-device top-k KV selection. The DSA path that ships emits IndexScore(58) \
+          + IndexSelect(59) instead; ATTN_SELECT is the single-kernel alternative and is kept \
+          because the two are being compared. Not a precision arm — no silent-wrong risk."),
+        ("PLOW_DOP_O_UV_FOLD",
+         "SUPERSEDED by MlaMergeFold(60), which fuses FlashMerge<512> + O_UV_FOLD into one packet \
+          (mla.rs:1595 states the substitution). The arm stays for the unfused A/B."),
+        ("PLOW_DOP_ROWRMS",
+         "Precomputed row-RMS feeding GemmNorm's norm=1 mode (op_gemm.h:1086). Every emitter uses \
+          the fused norm path, which needs no separate RMS packet."),
+        ("PLOW_DOP_XFLASHMERGE",
+         "CONTEXT-PARALLEL cross-rank LSE merge (plans/tp-design.md §8c). TP shards attention by \
+          whole heads, so no rank holds a partial for another rank's head and there is nothing to \
+          merge. Emitted only once CP exists; blocked on S4."),
+    ];
+
+    /// CHECK A — every arm gfx950 dispatches is either emitted by some emitter, or allowlisted with
+    /// a reason.
+    ///
+    /// Deliberately coarse in the same way its forward twin is: "does any emitter file name this
+    /// `DevOp`", not "is that site reachable under the flags this build sets". A reachability
+    /// analysis would need the flag cross-product, and a wrong one would fail builds that work.
+    /// Naming is the cheap 90%: it catches an opcode added to `dev_isa.h` + `interp.hip` +
+    /// `GFX950_DISPATCHED` and then never wired, which is how five of the ~10 instances happened.
+    #[test]
+    fn every_dispatched_arm_has_an_emit_site() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut named: std::collections::BTreeSet<String> = Default::default();
+        for f in EMITTER_SRC {
+            let Ok(text) = std::fs::read_to_string(src_dir.join(f)) else { continue };
+            for line in text.lines() {
+                // Comments are not emit sites. Without this, the paragraph explaining WHY an arm is
+                // unwired would itself satisfy the check.
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                let mut rest = line;
+                while let Some(i) = rest.find("DevOp::") {
+                    let r = &rest[i + "DevOp::".len()..];
+                    let n: String = r.chars().take_while(char::is_ascii_alphanumeric).collect();
+                    if !n.is_empty() {
+                        named.insert(n.clone());
+                    }
+                    rest = &r[n.len()..];
+                }
+            }
+        }
+        assert!(
+            named.len() > 20,
+            "parsed only {} DevOp:: references from {EMITTER_SRC:?} — the parse broke, and a broken \
+             parse here reports every arm as unemitted",
+            named.len()
+        );
+        let allow: std::collections::BTreeMap<&str, &str> =
+            GFX950_UNEMITTED.iter().copied().collect();
+        let mut unemitted: Vec<&str> = Vec::new();
+        let mut stale: Vec<&str> = Vec::new();
+        for c in GFX950_DISPATCHED {
+            let op = DevOp::ALL.iter().copied().find(|o| o.c_name() == *c);
+            let emitted = op.is_some_and(|o| named.contains(&format!("{o:?}")));
+            match (emitted, allow.contains_key(c)) {
+                (false, false) => unemitted.push(c),
+                (true, true) => stale.push(c),
+                _ => {}
+            }
+        }
+        assert!(
+            unemitted.is_empty(),
+            "gfx950 dispatches {} arm(s) NO emitter routes to: {unemitted:?}.\nThis is the recurring \
+             shape: the arm exists, is correct, is register-gated, and nothing selects it — so it \
+             ships in the object, is paid for in the register budget, and never runs. The runtime \
+             coverage gate CANNOT see this (it only checks emitted opcode => arm exists).\nEither \
+             wire an emit path, or add the opcode to GFX950_UNEMITTED with the reason it is \
+             deliberately unrouted.",
+            unemitted.len()
+        );
+        assert!(
+            stale.is_empty(),
+            "GFX950_UNEMITTED claims {stale:?} is deliberately unrouted, but an emitter now names \
+             it. Drop the row — a stale allowlist entry re-hides the next real instance."
+        );
+    }
+
+    /// How each emitter family treats a precision knob. The states are exhaustive on purpose:
+    /// there is no "not applicable", because a knob a family neither honours nor refuses is
+    /// SILENTLY IGNORED, which is the defect.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Knob {
+        /// Read, and it selects a different arm here.
+        Wired,
+        /// Read, and refused with a message — the family has no arm for it.
+        Refused,
+        /// Not read at all. **This is the bug state.** A row may only be `Ignored` with a written
+        /// justification, and every justification here should be read as a debt.
+        Ignored(&'static str),
+    }
+
+    /// The precision axes × the two emitter families, and the file each family lives in.
+    ///
+    /// WHY A TABLE AND NOT A GREP. The failure is not "a knob is unread"; it is "a knob is unread
+    /// *by one family* while another family honours it, so the same env var means fp8 over here
+    /// and nothing at all over there". Only a per-family statement can express that, and writing
+    /// the statement down is what makes the asymmetry visible at review time instead of at
+    /// benchmark time.
+    ///
+    /// Scope is the PRECISION knobs specifically, because those are the ones whose silent
+    /// no-op yields an asset that runs, produces correct-looking output, and is wrong about what
+    /// it measured — §0's apples-to-apples rule.
+    ///
+    /// This used to add "shape/scheduling knobs (`PLOW_GEMV_MM`, `PLOW_GQ_BATCH`, …) fail visibly
+    /// or not at all". THAT WAS FALSE, and `PLOW_GEMV_MM` is the counterexample: it is a KERNEL
+    /// knob, so the failure was not in either emitter family this table covers — no AMD build
+    /// input defined it at all, every gfx950 decode object compiled at op_gemm.h's default of 1,
+    /// and a B=4 asset with a correct B-wide program, 4× KV cache and `gv_mm_max: 4` in its
+    /// build.json produced ONE non-zero logits row. Sequences 1..B-1 sampled token 0 forever.
+    /// That is silent, and it survived because the two backends NAME the knob differently
+    /// (`GV_MM_MAX` on NVIDIA, `PLOW_GEMV_MM` on AMD) so a grep for either one looked wired.
+    ///
+    /// The uncovered axis is therefore "devgen emits a program shaped by knob K, but the kernel
+    /// build for some backend never receives K". This table cannot see it — both emitter families
+    /// were correct here. Routed now in `scripts/build_gfx950.sh` and `runtime/CMakeLists.txt`.
+    ///
+    /// THE GUARD OVER KERNEL-BUILD INPUTS NOW EXISTS, for this knob. Routing it was necessary and
+    /// not sufficient: routing fixes the objects someone remembers to rebuild, and says nothing
+    /// about the pairing of a given packet with a given object directory. `PLOW_GEMV_MM` is now
+    /// EMITTED INTO the object as `plow_gemv_mm_cap_<N>` (`runtime/amd/op_gemm.h`, named for the
+    /// macro itself so it cannot disagree with what was compiled), and `check_gemv_capacity`
+    /// (`crates/plowrt/src/exec/amd.rs`) refuses at load when the packet's widest GEMV asks for
+    /// more rows than the object advertises — or when it advertises nothing at all. That is the
+    /// shape any future entry on this axis should take: make the kernel build input OBSERVABLE in
+    /// the object, then compare it against the packet where the two finally meet.
+    const PRECISION_KNOBS: &[(&str, Knob, Knob)] = &[
+        // knob            dense-GQA (lib.rs)                    MLA/MoE (mla.rs)
+        ("PLOW_FP8",       Knob::Wired,                          Knob::Wired),
+        ("PLOW_W8A16",     Knob::Wired,                          Knob::Wired),
+        ("PLOW_W8A8",      Knob::Wired,                          Knob::Refused),
+        ("PLOW_MXFP4",     Knob::Refused,                        Knob::Wired),
+        ("PLOW_FP8_KV",    Knob::Wired,                          Knob::Ignored(
+            "KNOWN HOLE, same shape as the PLOW_MXFP4 one this table was added for. The MLA family \
+             has no e4m3 arm for its compressed latent KV (no FlashMlaDecodeFp8), so PLOW_FP8_KV=1 \
+             on GLM/Kimi/DeepSeek is silently dropped and the asset is bf16-KV. Refusing it needs a \
+             gate on all four MLA entry points (glm_main, glm_emit_block, kimi_emit_block, \
+             nemotron_emit_block) and is deliberately out of scope of the change that added this \
+             table; recorded here so it is a tracked debt and not a fresh discovery.")),
+        ("PLOW_KV_FP8",    Knob::Wired,                          Knob::Ignored(
+            "Alias of PLOW_FP8_KV; same hole, same reason.")),
+    ];
+
+    /// CHECK B — the table above is true of the sources.
+    ///
+    /// Catches bug shape B directly: a precision knob wired on one family and unread on another.
+    /// Before `PLOW_MXFP4` was refused on the dense path, its dense column was `Ignored`, and the
+    /// only way to make this test pass was to WRITE DOWN that a dense `PLOW_MXFP4=1` build emits
+    /// bf16 — which nobody would have written down and left.
+    ///
+    /// The evidence is `env::var("KNOB")`, not a mention: a comment naming the flag is exactly what
+    /// the dense path had, and it is worth nothing at runtime.
+    #[test]
+    fn precision_knob_table_matches_the_emitters() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let read = |f: &str| std::fs::read_to_string(src_dir.join(f)).unwrap_or_default();
+        let dense = read("lib.rs");
+        let mla = read("mla.rs");
+        assert!(!dense.is_empty() && !mla.is_empty(), "emitter sources not readable");
+        for (knob, d, m) in PRECISION_KNOBS {
+            for (family, file, src, state) in [
+                ("dense-GQA", "lib.rs", &dense, d),
+                ("MLA/MoE", "mla.rs", &mla, m),
+            ] {
+                let reads = src.contains(&format!("env::var(\"{knob}\")"));
+                match state {
+                    Knob::Wired | Knob::Refused => assert!(
+                        reads,
+                        "PRECISION_KNOBS says the {family} emitter handles {knob} as {state:?}, but \
+                         {file} contains no `env::var(\"{knob}\")`. Either it never did and the \
+                         table is wrong, or a refactor dropped the read — in which case {knob}=1 is \
+                         now SILENTLY IGNORED on {family} and that build emits the default \
+                         precision under a flag that named another one."
+                    ),
+                    Knob::Ignored(why) => {
+                        assert!(
+                            !why.is_empty(),
+                            "{knob} is Ignored on {family} with no justification. An unread \
+                             precision knob is a silently-wrong asset; say why in the table."
+                        );
+                        assert!(
+                            !reads,
+                            "PRECISION_KNOBS says {knob} is IGNORED on {family}, but {file} now \
+                             reads it. Good — update the row to Wired or Refused so the next reader \
+                             is not told a fixed hole is still open."
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The instance this whole section exists for, pinned as behaviour rather than as a table row:
+    /// `PLOW_MXFP4=1` on a dense model must not hand back a bf16 packet.
+    ///
+    /// Emission reads process-global env, so the variable is restored on the way out whether or
+    /// not the assert fires — leaving it set would change every blob a later test in this binary
+    /// emits. (`tests/golden_blob.rs` runs in a separate process and takes its own `EMIT_LOCK`.)
+    #[test]
+    fn dense_mxfp4_is_refused_not_silently_bf16() {
+        let dir = std::env::temp_dir().join("devgen_dense_mxfp4_refusal");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"qwen3","hidden_size":512,"intermediate_size":1024,
+                "num_hidden_layers":2,"num_attention_heads":8,"head_dim":64,
+                "num_key_value_heads":2,"rms_norm_eps":1e-6,"vocab_size":4096,
+                "rope_theta":1000000.0,"rope_scaling":null,"tie_word_embeddings":true}"#,
+        )
+        .unwrap();
+        let out = dir.join("model.pkt");
+        let args = || EmitArgs {
+            dir: dir.clone(),
+            ctx: 256,
+            out: out.to_str().unwrap().to_string(),
+            n_cu: 256,
+            tp: 1,
+            block_spec: None,
+            embed_cubin: None,
+            embed_hsaco: None,
+            rope_gen: true,
+            l2_layout: None,
+            gpu: "MI355X".into(),
+            arch: "gfx950".into(),
+        };
+        std::env::set_var("PLOW_MXFP4", "1");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(args())));
+        std::env::remove_var("PLOW_MXFP4");
+        let e = r.expect_err(
+            "PLOW_MXFP4=1 emitted a dense packet instead of refusing. That packet is byte-identical \
+             to the bf16 one and will be benchmarked as mxfp4.",
+        );
+        let msg = e
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("dense_mxfp4_weights"),
+            "the refusal must name the missing capability so the message is actionable; got: {msg}"
+        );
+    }
+}
+
+/// `require_mla_rope`: the MLA positional-encoding contract, pinned.
+///
+/// Every case is stated as "this config JSON, therefore this outcome", with the expected theta
+/// read back OUT of the same JSON rather than written as a literal — so if the value moves the
+/// test moves with it instead of quietly asserting the old number.
+#[cfg(test)]
+mod mla_rope_tests {
+    use serde_json::{json, Value};
+
+    /// `cfg_glm`'s theta lookup and its refusal, extracted so both can be exercised without a
+    /// checkpoint on disk. MUST stay identical to the three lines in `mla::cfg_glm`.
+    fn resolve(v: &Value) -> Option<f64> {
+        let rp = &v["rope_parameters"];
+        let theta = v["rope_theta"].as_f64().or_else(|| rp["rope_theta"].as_f64());
+        super::require_mla_rope(
+            theta,
+            v["mla_use_nope"].as_bool().unwrap_or(false),
+            rp["rope_type"].as_str(),
+            v["rope_scaling"].as_object().is_some(),
+            v["model_type"].as_str().unwrap_or("<test>"),
+        );
+        theta
+    }
+
+    /// The SHIPPING model's spelling. GLM-5.2's `config.json` has NO top-level `rope_theta`; it
+    /// carries `rope_parameters: {rope_theta, rope_type}` (transformers 5.x moved the key). The
+    /// old `.unwrap_or(8_000_000.0)` therefore never read GLM's theta at all — it matched only
+    /// because the literal in `mla.rs` happened to equal it.
+    ///
+    /// Asserted against the value IN the fixture, so a fixture edit cannot leave this passing
+    /// while the parse reads nothing.
+    #[test]
+    fn the_theta_comes_from_rope_parameters_not_from_a_default() {
+        let v = json!({
+            "model_type": "glm_moe_dsa",
+            "rope_parameters": { "rope_theta": 8_000_000.0, "rope_type": "default" },
+        });
+        assert_eq!(resolve(&v), v["rope_parameters"]["rope_theta"].as_f64());
+        // A different theta under the same spelling must produce that theta, not GLM's. This is
+        // the property the default destroyed: every model read as 8e6, and all of them looked
+        // right as long as they were GLM.
+        let other = json!({
+            "model_type": "some_other_mla",
+            "rope_parameters": { "rope_theta": 123_457.0, "rope_type": "default" },
+        });
+        assert_eq!(resolve(&other), other["rope_parameters"]["rope_theta"].as_f64());
+        assert_ne!(resolve(&other), resolve(&v), "two configs must not resolve to one theta");
+    }
+
+    /// The flat spelling still works and takes precedence.
+    #[test]
+    fn the_top_level_spelling_is_still_read() {
+        let v = json!({ "model_type": "deepseek_v3", "rope_theta": 10_000.0 });
+        assert_eq!(resolve(&v), v["rope_theta"].as_f64());
+    }
+
+    /// Kimi-K3: `mla_use_nope: true`, no theta anywhere. VERIFIED against the checkpoint —
+    /// `config.json`'s only `rope`-ish key is `text_config.qk_rope_head_dim`, and
+    /// `modeling_kimi_linear.py` has `self.rotary_emb = None` / `assert self.use_nope`.
+    #[test]
+    #[should_panic(expected = "mla_use_nope")]
+    fn a_nope_model_is_refused_not_given_glms_theta() {
+        resolve(&json!({ "model_type": "kimi_k3", "mla_use_nope": true }));
+    }
+
+    /// The refusal names the consequence, not just the flag — a NoPE emit is not "delete the two
+    /// HeadNormRope ops", because the k-side one is the only writer of the krot cache row.
+    #[test]
+    fn the_nope_refusal_names_the_krot_cache() {
+        let msg = std::panic::catch_unwind(|| {
+            resolve(&json!({ "model_type": "kimi_k3", "mla_use_nope": true }))
+        })
+        .unwrap_err();
+        let msg = msg
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| msg.downcast_ref::<&str>().map(|s| s.to_string()).unwrap());
+        assert!(msg.contains("krot"), "refusal must name the dangling cache write; got: {msg}");
+    }
+
+    /// Contradiction: a theta AND `mla_use_nope`. One of the two is wrong and the compiler
+    /// cannot tell which, so it refuses instead of picking.
+    #[test]
+    #[should_panic(expected = "contradict")]
+    fn a_theta_alongside_use_nope_is_a_contradiction() {
+        resolve(&json!({
+            "model_type": "confused", "mla_use_nope": true, "rope_theta": 8_000_000.0,
+        }));
+    }
+
+    /// No theta, no NoPE flag: the compiler does not know the model's positional encoding.
+    /// This is the case the default silently answered with GLM's number.
+    #[test]
+    #[should_panic(expected = "no RoPE theta")]
+    fn an_absent_theta_is_a_refusal_not_eight_million() {
+        resolve(&json!({ "model_type": "mystery_mla" }));
+    }
+
+    /// `declare_glm` builds its tables with `RopeScale::None`, so a scaled scheme would be
+    /// emitted as an UNSCALED RoPE at the base theta — right-looking tables, wrong long context.
+    #[test]
+    #[should_panic(expected = "rope_type")]
+    fn a_scaled_rope_scheme_is_refused_rather_than_silently_unscaled() {
+        resolve(&json!({
+            "model_type": "yarned",
+            "rope_parameters": { "rope_theta": 500_000.0, "rope_type": "yarn" },
+        }));
+    }
+
+    /// The legacy `rope_scaling` object, same reason.
+    #[test]
+    #[should_panic(expected = "rope_scaling")]
+    fn a_legacy_rope_scaling_object_is_refused() {
+        resolve(&json!({
+            "model_type": "scaled",
+            "rope_theta": 500_000.0,
+            "rope_scaling": { "type": "linear", "factor": 4.0 },
+        }));
+    }
+}
+
+#[cfg(test)]
+mod fp8_key_tests {
+    //! The `fp8/` key contract, pinned. Three parties have to agree on one string: this emitter
+    //! declares the packet tensor name, `quantize_fp8.py` writes the safetensors key, and the
+    //! runtime looks it up. They did not — the emitter and the quantizer wrote `fp8/<name>` while a
+    //! loader stripped the prefix and looked up `<name>`, so a freshly generated fp8 checkpoint
+    //! could not load. These assertions are the emitter's half of the contract, stated as code so
+    //! the spelling cannot drift silently.
+    use super::*;
+
+    /// The canonical forms. `_scale` goes on the END, after the full weight name — `fp8/X.weight`
+    /// pairs with `fp8/X.weight_scale`, NOT `fp8/X_scale.weight`.
+    #[test]
+    fn fp8_twin_names_are_the_declared_name_verbatim() {
+        let w = format!("fp8/{}", "model.layers.3.self_attn.q_proj.weight");
+        let s = format!("{w}_scale");
+        assert_eq!(w, "fp8/model.layers.3.self_attn.q_proj.weight");
+        assert_eq!(s, "fp8/model.layers.3.self_attn.q_proj.weight_scale");
+        // The key is the packet name VERBATIM: no strip, no rewrite, nothing to apply twice.
+        assert_eq!(w.strip_prefix("fp8/"), Some("model.layers.3.self_attn.q_proj.weight"));
+        assert!(w.starts_with("fp8/"), "the prefix is part of the key, not a routing marker");
+    }
+
+    /// An `fp8/` twin is checkpoint-bound weight bytes, and every reader agrees on that because
+    /// there is now only one reader: `packet::names::is_checkpoint_weight`.
+    ///
+    /// This test used to spell the predicate out as
+    /// `starts_with("model.") || starts_with("fp8/")` and named `manager.rs` / `exec/gpu.rs` as
+    /// the two sites it mirrored. There were five sites, they disagreed, and the allowlist form
+    /// silently zeroed an untied `lm_head.weight` on CUDA and would have zeroed the whole
+    /// Kimi-K3 tower. Asserting against the shared predicate is the point — a re-spelt copy is
+    /// exactly how the five diverged.
+    #[test]
+    fn fp8_twins_are_weight_bytes_under_the_shared_predicate() {
+        use packet::names::is_checkpoint_weight as w;
+        assert!(w("fp8/model.layers.0.mlp.down_proj.weight"));
+        assert!(w("fp8/model.layers.0.mlp.down_proj.weight_scale"));
+        assert!(w("model.layers.0.mlp.down_proj.weight"));
+        assert!(w("lm_head.weight"), "untied head: declared at the top level, and a weight");
+        assert!(!w("act.x"), "activations are not weight bytes");
+        assert!(!w("in.pos"));
+    }
+
+    /// The scale is per OUTPUT CHANNEL — one f32 per row of the `[out, in]` weight — and the
+    /// dequant is a MULTIPLY. Both halves matter: `quantize_fp8.py` stores `amax/448` and the
+    /// device epilogue computes `acc * a_scale[m] * w_scale[n]`, so a reciprocal on either side
+    /// would be a silent 448²-ish error rather than a crash.
+    #[test]
+    fn fp8_scale_is_per_output_channel_and_multiplied() {
+        let (out, inp) = (4096u64, 2560u64);
+        assert_eq!(out * F32, 16384, "scale vector is [out] f32, not [out,in] and not [in]");
+        // Round-trip the convention the quantizer documents, at f32 precision.
+        let w: f32 = -0.37;
+        let amax: f32 = 0.37;
+        let scale = amax / 448.0;
+        let q = (w / scale).round().clamp(-448.0, 448.0);
+        assert!((q * scale - w).abs() < 1e-3, "dequant is w8 * scale");
+        let _ = inp;
+    }
+}
+
+#[cfg(test)]
+mod fp8_profile_tests {
+    //! The `PLOW_FP8=1` profile emits w8a16 — and gfx950 has no w8a16 prefill GEMM, only w8a8.
+    //! `d_gemm_fp8` there reads t[1] as e4m3 bytes and dereferences `ascale[m]` with no null check,
+    //! so a w8a16 packet faults on its first prefill GEMM with no diagnostic. These pin the gate
+    //! that refuses it, and pin that the profile which DOES work is left alone.
+    use super::*;
+    use packet::dev::DevInst;
+    use packet::devbuild::Program;
+
+    fn prog(insts: Vec<DevInst>) -> Program {
+        Program {
+            n_cu: 4, n_counter: 0, insts, stream: vec![], stream_ofs: vec![],
+            stream_len: vec![], waits: vec![], succs: vec![], tensors: vec![],
+            gq_stream: vec![], gq_seg_ofs: vec![], l2_sms: 0, l2_domains: 0,
+        }
+    }
+
+    /// `t[3]` is a_scale. `TENSOR_NONE` there is w8a16; a bound handle is w8a8.
+    fn model(a_scale: u32) -> Model {
+        let mut i = DevInst { op: DevOp::GemmFp8 as u16, blocks: 1, ..Default::default() };
+        i.t[3] = a_scale;
+        Model {
+            n_cu: 256, target: 0, tensors: vec![], progs: vec![prog(vec![i])],
+            kv_row_insts: vec![], prog_t: vec![128], gen: vec![],
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "fp8_w8a16_prefill")]
+    fn w8a16_fp8_prefill_is_refused_on_gfx950() {
+        check_fp8_a_scale_bound(&model(TENSOR_NONE), "gfx950", "");
+    }
+
+    /// w8a8 binds t[3], which is the profile that actually runs on gfx950.
+    #[test]
+    fn w8a8_fp8_prefill_passes_on_gfx950() {
+        check_fp8_a_scale_bound(&model(7), "gfx950", "");
+    }
+
+    /// sm_120 HAS a w8a16 cubin, so the same packet is valid there and must not be refused —
+    /// the gate is about one target's kernel, not about w8a16 being wrong.
+    #[test]
+    fn w8a16_fp8_prefill_is_fine_on_sm120() {
+        check_fp8_a_scale_bound(&model(TENSOR_NONE), "sm_120a", "RTX5090");
+    }
+
+    /// The trap-asset case: `--arch sm_120a` (where w8a16 is legitimate) with an AMD `--gpu`. An
+    /// arch-only gate would pass this, and `build-amd/g31b-fp8kv` is exactly it — emitted for
+    /// sm_120a, sized for 256 CUs, run on gfx950, faulted. Either signal saying AMD is enough.
+    #[test]
+    #[should_panic(expected = "fp8_w8a16_prefill")]
+    fn w8a16_is_refused_when_only_the_gpu_says_amd() {
+        check_fp8_a_scale_bound(&model(TENSOR_NONE), "sm_120a", "MI350X");
+    }
+
+    /// …and the target predicate behind it agrees with both signals independently.
+    #[test]
+    fn target_is_amd_reads_either_signal() {
+        assert!(target_is_amd("gfx950", ""));
+        assert!(target_is_amd("", "MI350X"));
+        assert!(target_is_amd("sm_120a", "MI350X"), "the gpu is enough on its own");
+        assert!(!target_is_amd("sm_120a", "RTX5090"));
+        assert!(!target_is_amd("", ""), "no target => unchanged emission (golden tests)");
+    }
+
+    /// EVERY fp8 rung is gated, not just the three the ladder started with.
+    ///
+    /// The regression this pins: the tile-inventory campaign grew `GFX950_RUNGS` from 3 rungs to
+    /// 5, so `pick_tile` could return `GemmWideFp8` (128x256) and `GemmC5Fp8` (192x256) — and the
+    /// gate's hand-written opcode list still named only `Gemm/GemmMed/GemmSmall`. A w8a16 packet
+    /// whose shape resolved to either new rung compiled clean and null-dereferenced `ascale[m]` on
+    /// device, which is precisely what this gate exists to stop.
+    ///
+    /// Written as a loop over the table rather than five literal cases on purpose: a sixth rung
+    /// is covered the moment it is added, with no second place to remember to update. That is the
+    /// same argument `GFX950_RUNGS`'s own doc comment makes for there being one table.
+    #[test]
+    fn every_fp8_rung_is_refused_when_a_scale_is_unbound() {
+        for (_, fp8, _, bm, bn, _) in GFX950_RUNGS {
+            let mut i = DevInst { op: fp8 as u16, blocks: 1, ..Default::default() };
+            i.t[3] = TENSOR_NONE;
+            let m = Model {
+                n_cu: 256, target: 0, tensors: vec![], progs: vec![prog(vec![i])],
+                kv_row_insts: vec![], prog_t: vec![128], gen: vec![],
+            };
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                check_fp8_a_scale_bound(&m, "gfx950", "")
+            }));
+            assert!(
+                caught.is_err(),
+                "the {bm}x{bn} fp8 rung ({fp8:?}) is emittable by pick_tile but not gated: a \
+                 w8a16 packet on that shape would reach d_gemm_fp8's epilogue and dereference a \
+                 null ascale on device"
+            );
+        }
+    }
+
+    /// A bf16 packet has no fp8 GEMM at all and must sail through on every target.
+    #[test]
+    fn bf16_packets_are_untouched() {
+        let i = DevInst { op: DevOp::Gemm as u16, blocks: 1, ..Default::default() };
+        let m = Model {
+            n_cu: 256, target: 0, tensors: vec![], progs: vec![prog(vec![i])],
+            kv_row_insts: vec![], prog_t: vec![128], gen: vec![],
+        };
+        check_fp8_a_scale_bound(&m, "gfx950", "");
+    }
+}
+
+#[cfg(test)]
 mod pick_tile_tests {
     //! The hwspec-driven picker is a STATIC, shape-agnostic choice — so it is testable
     //! offline, with no GPU. These lock in the tile chosen for every projection of the three
     //! supported architectures at the prefill chunk sizes that matter, proving the picker both
     //! fills the CUs on the underutilized shapes AND does not regress the ones that already
     //! saturate. `n_cu = 256` (MI350X).
-    use super::{gemm_lds_bytes, hwspec, pick_tile, DevOp, GFX950_TILES};
+    use super::{
+        gemm_lds_bytes, glu_era_inventory, hwspec, pick_tile, select_gemm_over, DevOp,
+        GFX950_TILES,
+    };
     use costmodel::cost::{dma_cycles, macs_cycles};
     use costmodel::MmaDtype;
+    use kernelcaps::QuantScheme;
 
     const N_CU: u32 = 256;
     fn pt(m: u32, n: u32, k: u32) -> DevOp {
-        pick_tile(m, n, k, N_CU)
+        pick_tile(m, n, k, N_CU, QuantScheme::None)
+    }
+    /// The picker restricted to the three rungs that existed before the tile-inventory
+    /// campaign — the set the legacy reference below ranks over.
+    fn pt_legacy_rungs(m: u32, n: u32, k: u32, n_cu: u32) -> DevOp {
+        select_gemm_over(glu_era_inventory(), m, n, k, n_cu, QuantScheme::None)
     }
 
     /// The picker exactly as it was before selection moved behind the capability
@@ -4021,25 +6240,30 @@ mod pick_tile_tests {
         best.0
     }
 
-    /// Routing selection through the registry must not change a single answer on
-    /// the hardware the old picker was written for. Swept rather than sampled:
-    /// tie-breaking was the real risk, since the old loop preferred the larger
-    /// tile by table order while opcode order would put `GemmSmall` (14) ahead of
-    /// `GemmMed` (15).
-    #[test]
-    fn registry_selection_matches_the_legacy_picker_everywhere() {
-        let ms = [1u32, 8, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384];
-        let ns = [128u32, 512, 1024, 2048, 2560, 4096, 5376, 8192, 9728, 14336, 16384, 21504];
-        let ks = [128u32, 512, 2560, 4096, 5376, 8192, 14336, 21504];
-        let cus = [1u32, 64, 128, 256, 304];
+    const MS: [u32; 12] = [1, 8, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384];
+    const NS: [u32; 12] =
+        [128, 512, 1024, 2048, 2560, 4096, 5376, 8192, 9728, 14336, 16384, 21504];
+    const KS: [u32; 8] = [128, 512, 2560, 4096, 5376, 8192, 14336, 21504];
+    const CUS: [u32; 5] = [1, 64, 128, 256, 304];
 
+    /// Routing selection through the registry must not change a single answer **among the three
+    /// rungs the old picker had**. Swept rather than sampled: tie-breaking was the real risk,
+    /// since the old loop preferred the larger tile by table order while opcode order would put
+    /// `GemmSmall` (14) ahead of `GemmMed` (15).
+    ///
+    /// Scoped to the legacy rungs deliberately. The campaign ADDED two tiles, so comparing the
+    /// full picker against a three-tile reference would assert the new rungs are never chosen —
+    /// the opposite of the intent. What must not drift is the *ranking rule*, and that is what
+    /// this pins.
+    #[test]
+    fn the_original_rungs_still_rank_exactly_as_the_legacy_picker_did() {
         let mut checked = 0usize;
-        for &m in &ms {
-            for &n in &ns {
-                for &k in &ks {
-                    for &n_cu in &cus {
+        for &m in &MS {
+            for &n in &NS {
+                for &k in &KS {
+                    for &n_cu in &CUS {
                         let want = pick_tile_legacy(m, n, k, n_cu);
-                        let got = pick_tile(m, n, k, n_cu);
+                        let got = pt_legacy_rungs(m, n, k, n_cu);
                         assert_eq!(
                             got, want,
                             "diverged at m={m} n={n} k={k} n_cu={n_cu}: \
@@ -4050,7 +6274,151 @@ mod pick_tile_tests {
                 }
             }
         }
-        assert_eq!(checked, ms.len() * ns.len() * ks.len() * cus.len());
+        assert_eq!(checked, MS.len() * NS.len() * KS.len() * CUS.len());
+    }
+
+    /// The added rungs must never be chosen where they cannot help, and the ranking must stay
+    /// TOTAL — no shape may resolve by opcode number.
+    ///
+    /// The second half is the real content. `tile_cost`'s tie-break used three hand-written
+    /// brackets over `BM*BN`, and 192x256 (49152) and 128x256 (32768) both landed in the same
+    /// bracket as 256x256 (65536), so on any shape where their wall-clock costs tied — which is
+    /// every shape small enough that all three take one round — the winner would have been
+    /// decided by `DevOp` number. `GemmC5` is 95 and `Gemm` is 8, so the *old* tile would have
+    /// won silently and the campaign would have measured nothing.
+    #[test]
+    fn every_shape_resolves_on_cost_rather_than_opcode_number() {
+        use super::{gfx950_gemm_inventory, tile_cost};
+        let spec = hwspec::registry::lookup("MI350X").unwrap();
+        for &m in &MS {
+            for &n in &NS {
+                for &k in &KS {
+                    for &n_cu in &CUS {
+                        let chosen = pick_tile(m, n, k, n_cu, QuantScheme::None);
+                        let costs: Vec<(DevOp, u64)> = gfx950_gemm_inventory()
+                            .iter()
+                            .filter(|s| s.quant == QuantScheme::None)
+                            .map(|s| {
+                                (s.id.0, tile_cost(spec, s, m as i64, n as i64, k as i64, n_cu))
+                            })
+                            .collect();
+                        let best = costs.iter().map(|c| c.1).min().unwrap();
+                        let ties: Vec<DevOp> =
+                            costs.iter().filter(|c| c.1 == best).map(|c| c.0).collect();
+                        assert_eq!(
+                            ties.len(),
+                            1,
+                            "m={m} n={n} k={k} n_cu={n_cu}: {ties:?} tie at cost {best}, so the \
+                             winner is decided by opcode number"
+                        );
+                        assert_eq!(chosen, ties[0], "m={m} n={n} k={k} n_cu={n_cu}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Precision changes the ANSWER, not just the opcode name.
+    ///
+    /// Two things are asserted, and the second is the one that was broken: every encoding must
+    /// select from its OWN rungs (a bf16 opcode emitted for an mxfp4 op would read packed fp4
+    /// bytes as bf16), and the fp8/fp4 answer must be free to differ from bf16's — the fp8 body
+    /// moves half the operand bytes for the same MFMA count, so `max(compute, dma)` tips.
+    #[test]
+    fn each_encoding_selects_from_its_own_rungs() {
+        for &m in &MS {
+            for &n in &NS {
+                for &k in &KS {
+                    for (quant, ok) in [
+                        (QuantScheme::None, &super::GFX950_RUNGS.map(|r| r.0)),
+                        (QuantScheme::W8A8, &super::GFX950_RUNGS.map(|r| r.1)),
+                        (QuantScheme::Mxfp4, &super::GFX950_RUNGS.map(|r| r.2)),
+                    ] {
+                        let got = pick_tile(m, n, k, N_CU, quant);
+                        assert!(
+                            ok.contains(&got),
+                            "{quant:?} at {m}x{n}x{k} selected {got:?}, which is not one of its \
+                             own rungs {ok:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The mxfp4 prefill GEMM is no longer pinned to 256x256 for every shape.
+    ///
+    /// This is the T3 regression guard. `mla.rs` used to emit `DevOp::GemmMxfp4` unconditionally,
+    /// so Kimi's `kv_a_proj` (M=128, N=576) ran as THREE 256x256 tiles on 256 CUs — measured at
+    /// ≈0.4% of peak, the worst number in the campaign.
+    /// WHICH SHAPES THE CAMPAIGN CHANGED, and which it deliberately did not.
+    ///
+    /// `legacy` is the three-rung analytical picker that shipped; `new` is the five-rung one.
+    /// Measurements do not apply here — the unit-test fixture inventory has build label
+    /// `test-fixture`, so every record in `tuning/` is correctly stale against it — so this
+    /// isolates what the RUNGS alone bought. The extra shapes measurement then corrects are
+    /// pinned in `tests/tuned_tile_selection.rs`.
+    ///
+    /// Measured TF/s (whole GPU, 1660 sustained bf16 peak, `runtime/ubench/gemm_tile_sweep.c`):
+    ///
+    /// | shape                     | legacy   | new     | TF/s legacy -> new    |
+    /// |---------------------------|----------|---------|-----------------------|
+    /// | g31b q_proj      M=1024   | 256x256  | 128x256 |  521.3 ->  915.0 1.76x|
+    /// | g31b kv global   M=4096   | 256x256  | 128x256 |  513.7 ->  921.7 1.79x|
+    /// | llama-8B k/v     M=8192   | 256x256  | 128x256 |  475.4 ->  832.4 1.75x|
+    /// | g31b o_proj      M=4096   | 256x256  | 192x256 |  792.1 -> 1194.3 1.51x|
+    /// | qwen o_proj      M=4096   | 256x256  | 192x256 |  583.5 ->  926.5 1.59x|
+    /// | g31b down_proj   M=2048   | 256x256  | 192x256 |  789.5 -> 1025.8 1.30x|
+    ///
+    /// And the six M=128 "utilisation disaster" shapes are UNCHANGED, on purpose: 64x128 was
+    /// already selected and is already the fastest of all twelve tiles compiled into the sweep.
+    /// Their deficit is CU fill (2-34 tiles on 256 CUs), which no tile can fix — see the report
+    /// and `plans/` for why split-K is the lever there.
+    #[test]
+    fn the_new_rungs_change_the_fill_limited_shapes_and_leave_the_rest() {
+        for (m, n, k, legacy, new, label) in [
+            // Unchanged: already on the narrowest rung, and it is already optimal.
+            (128u32, 128u32, 2816u32, DevOp::GemmSmall, DevOp::GemmSmall, "gemma26b router"),
+            (128, 256, 6144, DevOp::GemmSmall, DevOp::GemmSmall, "glm52 router"),
+            (128, 576, 6144, DevOp::GemmSmall, DevOp::GemmSmall, "glm52 kv_a_proj"),
+            (128, 576, 7168, DevOp::GemmSmall, DevOp::GemmSmall, "kimi kv_a_proj"),
+            (128, 512, 3840, DevOp::GemmSmall, DevOp::GemmSmall, "g12b k_proj global"),
+            (128, 2112, 2816, DevOp::GemmSmall, DevOp::GemmSmall, "g26b dense gate/up"),
+            (256, 8192, 5376, DevOp::GemmSmall, DevOp::GemmSmall, "g31b q M=256"),
+            (512, 8192, 5376, DevOp::GemmMed, DevOp::GemmMed, "g31b q M=512"),
+            // Changed: fill- or quantisation-limited at 256x256.
+            (1024, 8192, 5376, DevOp::Gemm, DevOp::GemmWide, "g31b q M=1024"),
+            (4096, 2048, 5376, DevOp::Gemm, DevOp::GemmWide, "g31b kv global M=4096"),
+            (8192, 1024, 4096, DevOp::Gemm, DevOp::GemmWide, "llama-8B k/v M=8192"),
+            (4096, 5376, 8192, DevOp::Gemm, DevOp::GemmC5, "g31b o M=4096"),
+            (4096, 2560, 4096, DevOp::Gemm, DevOp::GemmC5, "qwen o M=4096"),
+            (2048, 5376, 21504, DevOp::Gemm, DevOp::GemmC5, "g31b down M=2048"),
+        ] {
+            assert_eq!(pt_legacy_rungs(m, n, k, N_CU), legacy, "legacy: {label}");
+            assert_eq!(pt(m, n, k), new, "new: {label}");
+        }
+    }
+
+
+    #[test]
+    fn mxfp4_prefill_is_tile_selected_not_pinned() {
+        assert_eq!(
+            pick_tile(128, 576, 7168, N_CU, QuantScheme::Mxfp4),
+            DevOp::GemmSmallMxfp4,
+            "Kimi kv_a_proj: the narrow-M rung, not the 256x256 default"
+        );
+        assert_eq!(
+            pick_tile(128, 576, 6144, N_CU, QuantScheme::Mxfp4),
+            DevOp::GemmSmallMxfp4,
+            "GLM-5.2 kv_a_proj"
+        );
+        // ...and it still picks a large tile where a large tile is right, so this is selection
+        // rather than a blanket swap in the other direction.
+        assert_ne!(
+            pick_tile(8192, 8192, 5376, N_CU, QuantScheme::Mxfp4),
+            DevOp::GemmSmallMxfp4,
+            "a saturating shape must not get the narrow tile"
+        );
     }
 
     #[test]
@@ -4070,9 +6438,15 @@ mod pick_tile_tests {
 
     #[test]
     fn llama31_8b_prefill_8k_kv_already_half_full() {
-        // At M=8192 k/v already make 32x4 = 128 tiles (half fill) at 256x256; splitting to
-        // 128x128 would need 2 rounds for equal cost, so the higher-intensity 256x256 stays.
-        assert_eq!(pt(8192, 1024, 4096), DevOp::Gemm, "k/v at 8k");
+        // At M=8192 k/v make 32x4 = 128 tiles at 256x256 — HALF the machine. The old comment
+        // here concluded "splitting to 128x128 would need 2 rounds for equal cost, so the
+        // higher-intensity 256x256 stays", and that was true of the rungs available: both ways
+        // of doubling the tile count halved BOTH dimensions or halved BN, and neither paid.
+        //
+        // 128x256 is the rung that was missing. It halves BM only, so the tile count doubles to
+        // 64x4 = 256 — exactly full — while BN stays 256 and the A-operand reuse is untouched.
+        // This is the shape class the campaign was for.
+        assert_eq!(pt(8192, 1024, 4096), DevOp::GemmWide, "k/v at 8k");
     }
 
     #[test]
@@ -4085,21 +6459,34 @@ mod pick_tile_tests {
             "k_proj / v_proj (fill)"
         );
         assert_eq!(pt(4096, 9728, 2560), DevOp::Gemm, "gate/up");
-        assert_eq!(pt(4096, 2560, 9728), DevOp::Gemm, "down_proj");
+        // down_proj is N=2560, which is 10 tile-columns at BN=256 — so at 256x256 it is
+        // 16x10 = 160 tiles, 62.5% of the machine, and has been all along. 192x256 gives
+        // 22x10 = 220 (86%). MEASURED on the sibling o_proj shape (4096x2560x4096, whole GPU,
+        // runtime/ubench/gemm_tile_sweep.c): 256x256 587.7 TF/s vs 192x256 940.6 — **1.60x**,
+        // the largest single-shape win in the campaign.
+        assert_eq!(pt(4096, 2560, 9728), DevOp::GemmC5, "down_proj (fill: 62.5% -> 86%)");
     }
 
     #[test]
-    fn gemma31b_no_regression() {
-        // hidden 5376, inter 21504. Gemma's kv projections are WIDE (sliding N=4096, global
-        // N=2048), so they already saturate — the picker must keep 256x256 everywhere it did
-        // before. No Gemma projection is small enough to reselect.
-        assert_eq!(pt(4096, 8192, 5376), DevOp::Gemm, "q sliding");
+    fn gemma31b_tiles() {
+        // hidden 5376, inter 21504. The projections that genuinely saturate 256 CUs at 256x256
+        // keep it — the campaign must not drag them onto a smaller tile.
+        assert_eq!(pt(4096, 8192, 5376), DevOp::Gemm, "q sliding (32x32 = 1024 tiles)");
         assert_eq!(pt(4096, 16384, 5376), DevOp::Gemm, "q global");
-        assert_eq!(pt(4096, 4096, 5376), DevOp::Gemm, "kv sliding (N=4096)");
-        assert_eq!(pt(4096, 2048, 5376), DevOp::Gemm, "kv global (N=2048)");
-        assert_eq!(pt(4096, 5376, 8192), DevOp::Gemm, "o sliding");
+        assert_eq!(pt(4096, 4096, 5376), DevOp::Gemm, "kv sliding (N=4096, 16x16 = 256)");
         assert_eq!(pt(4096, 21504, 5376), DevOp::Gemm, "gate/up");
-        assert_eq!(pt(4096, 5376, 21504), DevOp::Gemm, "down");
+        // o_proj and down_proj are both N=5376 = 21 tile-columns at BN=256, so 256x256 gives
+        // 16x21 = 336 tiles = 2 rounds at 65.6% efficiency — the tile-count QUANTIZATION case
+        // rather than the under-fill case. 192x256 gives 22x21 = 462 = 2 rounds at 90.2%.
+        // MEASURED on this N at M=2048 (2048x5376x21504, whole GPU): 256x256 794.4 TF/s vs
+        // 192x256 1033.4 — **1.30x**.
+        assert_eq!(pt(4096, 5376, 8192), DevOp::GemmC5, "o sliding (quantization: 66% -> 90%)");
+        assert_eq!(pt(4096, 5376, 21504), DevOp::GemmC5, "down (same N, same quantization)");
+        // kv GLOBAL is N=2048 = 8 tile-columns at BN=256, so 16x8 = 128 tiles — HALF the
+        // machine, and the previous version of this test asserted that as "no regression"
+        // because there was no rung that could fix it. 128x256 makes it 32x8 = 256, exactly
+        // full, at the same BN and so the same A-reuse.
+        assert_eq!(pt(4096, 2048, 5376), DevOp::GemmWide, "kv global (fill: 50% -> 100%)");
     }
 
     #[test]

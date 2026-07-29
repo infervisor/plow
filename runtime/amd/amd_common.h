@@ -77,11 +77,35 @@ __device__ __forceinline__ bf16v8 ld_glob8_nt(const PLOW_GLOB bf16* p) {
     return __builtin_nontemporal_load((const PLOW_GLOB bf16v8*)(const PLOW_GLOB void*)p);
 }
 
+/* PLOW_ACT_NT: probe knob. Makes the 16-byte ACTIVATION stores non-temporal, to test whether
+ * the release RMW's buffer_wbl2 costs in proportion to DIRTY L2 LINES (then evicting activation
+ * writes early would make the writeback cheap) or is a fixed L2-walk latency (then it cannot).
+ * Numerically inert -- `nt` is an eviction-policy hint, not a coherence bit -- so output must
+ * stay byte-identical either way; only the timing is the answer.
+ *
+ * ANSWERED, AND IT IS A DEAD END. Gemma-4 31B decode, 64 tokens/run, 7 runs, median:
+ * 17.80 ms/token against 17.10 base -- 4% SLOWER, output byte-identical. So the writeback is
+ * NOT volume-proportional, which the arithmetic already said (a GEMV dirties ~43 KB, writable
+ * back in ~43 ns at HBM rate, against the ~0.8 us/packet the buffer_wbl2 actually costs), and
+ * evicting activations early is a straight loss because they ARE re-read -- the residual stream
+ * a norm writes is the very thing the next op loads. Do not re-try this. Kept as the knob that
+ * records the measurement. */
+#ifndef PLOW_ACT_NT
+#define PLOW_ACT_NT 0
+#endif
 __device__ __forceinline__ void st_glob8(bf16* p, bf16v8 v) {
+#if PLOW_ACT_NT
+    __builtin_nontemporal_store(v, (PLOW_GLOB bf16v8*)(PLOW_GLOB void*)p);
+#else
     *(PLOW_GLOB bf16v8*)(PLOW_GLOB void*)p = v;
+#endif
 }
 __device__ __forceinline__ void st_glob8(PLOW_GLOB bf16* p, bf16v8 v) {
+#if PLOW_ACT_NT
+    __builtin_nontemporal_store(v, (PLOW_GLOB bf16v8*)(PLOW_GLOB void*)p);
+#else
     *(PLOW_GLOB bf16v8*)(PLOW_GLOB void*)p = v;
+#endif
 }
 __device__ __forceinline__ bf16v8 bf16v8_zero(void) {
     bf16v8 z;
@@ -379,6 +403,105 @@ __device__ __forceinline__ bf16v8 fp4_to_bf16v8(unsigned w, float scale) {
 }
 
 /* ---------------------------------------------------------------------------
+ * A4W4 — BOTH OPERANDS MXFP4 THROUGH THE MATRIX CORE.  [MEASURED ON gfx950 2026-07-27]
+ *
+ * The mxfp4 path elsewhere in this file is w4a16: fp4 weights are dequantized to bf16 and fed
+ * to a bf16 MFMA. That wins weight BANDWIDTH and nothing else — the matrix core still runs at
+ * the bf16 rate and the activation still crosses at 16 bits. CDNA4 can take fp4 on BOTH
+ * operands with per-32-element E8M0 scales applied by the hardware, which is what
+ * v_mfma_scale_f32_32x32x64_f8f6f4 with cbsz=blgp=4 is for.
+ *
+ * EVERY CLAIM BELOW WAS MEASURED against a CPU reference on this GPU (/tmp/a4w4/probe.hip;
+ * the same checks are in runtime/tests/a4w4_gfx950_test.hip). None of it is from documentation.
+ *
+ *   OPERAND LAYOUT (cbsz=blgp=4, K=64 per instruction):
+ *       lane l supplies row = l % 32 and k = 32*(l/32) + [0..31]
+ *       = 32 fp4 = 16 bytes, packed 2/byte, in the LOW 4 DWORDS of the v8i32 operand.
+ *     The builtin's parameter type is v8i32 for every f8f6f4 format; for fp4 the upper 4
+ *     dwords are not read. Passing 16 bytes and leaving the rest zero is correct, and it is
+ *     why an fp4 fragment is a ds_read_b128 and not the fp8 path's ds_read_b256.
+ *
+ *   ACCUMULATOR LAYOUT is the SAME as the bf16 32x32 MFMA, so mfma_acc_m / mfma_acc_n and
+ *     every epilogue in this codebase carry over unchanged (verified: exact match).
+ *
+ *   THE E8M0 SCALE BYTE IS BIASED BY 127, AND 0 IS NOT NEUTRAL. Byte b means 2^(b-127) —
+ *     the same convention e8m0_to_f32() above already implements. NEUTRAL IS 127. Byte 0 is
+ *     2^-127, which flushes the whole product to ZERO (measured: rel err 1.0, output exactly
+ *     0.0). Per-block scales read from memory are applied EXACTLY (measured rel err 0.0).
+ *
+ *   THE TRAP THAT MAKES THAT DANGEROUS, and the reason d_gemm_fp8_t looks like it disagrees:
+ *     when the scale arguments are COMPILE-TIME CONSTANTS the backend selects the UNSCALED
+ *     v_mfma_f32_32x32x64_f8f6f4 and drops them, so d_gemm_fp8_t's literal 0s are harmless
+ *     there — it is running the unscaled instruction (verified in its disassembly: 34x
+ *     v_mfma_f32_32x32x64_f8f6f4, zero v_mfma_scale_*). Its comment calling byte 0 "the
+ *     NEUTRAL MX scale" is wrong about the ISA and right about that kernel's behaviour, which
+ *     is the worst possible combination to read while writing a new one. A RUNTIME scale
+ *     operand selects the scaled instruction and byte 0 then silently zeroes your output.
+ *     If you write an A4W4 kernel, assert the scaled mnemonic in scripts/asm_expect_gfx950.json
+ *     — that is exactly the "correct but silently wrong instruction" case the audit exists for.
+ *
+ * Arg order (9): (a, b, acc, cbsz, blgp, opsel_a, scale_a, opsel_b, scale_b). */
+typedef int mfma_f8f6f4_operand __attribute__((ext_vector_type(8)));
+
+/* Pack a lane's 16 fp4 bytes into the low half of the builtin's v8i32 operand. */
+__device__ __forceinline__ mfma_f8f6f4_operand fp4_frag(const void* p16) {
+    mfma_f8f6f4_operand o;
+    union { unsigned u[4]; } q;
+    __builtin_memcpy(&q, p16, 16);
+#pragma unroll
+    for (int i = 0; i < 4; i++) o[i] = (int)q.u[i];
+#pragma unroll
+    for (int i = 4; i < 8; i++) o[i] = 0;
+    return o;
+}
+/* E8M0 byte meaning 2^0. NOT zero — see the contract above. */
+#define PLOW_E8M0_ONE 127
+
+/* One A4W4 MFMA: 32x32 output, K=64, per-lane E8M0 scales for both operands. */
+__device__ __forceinline__ f32x16 mfma_a4w4(mfma_f8f6f4_operand a, mfma_f8f6f4_operand b,
+                                            f32x16 acc, int scale_a, int scale_b) {
+    return __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(a, b, acc, /*cbsz=fp4*/ 4,
+                                                           /*blgp=fp4*/ 4, 0, scale_a, 0, scale_b);
+}
+
+/* f32 -> one OCP e2m1 nibble (RNE, saturating at 6.0). The quantizer half of A4W4: the fused
+ * SwiGLU bridge writes the intermediate activation straight out in this format, so it never
+ * crosses HBM at 16 bits and never needs a second pass to quantize. */
+__device__ __forceinline__ unsigned quant_fp4(float v) {
+    const unsigned sign = (v < 0.0f) ? 8u : 0u;
+    float a = fabsf(v);
+    /* e2m1 codes: 0,0.5,1,1.5,2,3,4,6. Round-to-nearest on the 8-point ladder, TIES AWAY FROM
+     * ZERO — not round-to-nearest-even, which is what this comment used to claim. The cut points
+     * below are the exact midpoints and each uses `<`, so a value sitting on one rounds UP:
+     * 0.25 -> 0.5 (RNE: 0), 1.25 -> 1.5 (RNE: 1.0), 2.5 -> 3.0 (RNE: 2.0). Only exact ties
+     * differ, so real data almost never sees it — but a tie-heavy synthetic fixture will, and a
+     * host-side reference that implements true RNE would disagree with the device on exactly
+     * those elements. Stated rather than changed: the ladder is what the shipped objects were
+     * measured with, and flipping it would move numerics to fix a comment. */
+    unsigned n;
+    if (a < 0.25f) n = 0u;
+    else if (a < 0.75f) n = 1u;
+    else if (a < 1.25f) n = 2u;
+    else if (a < 1.75f) n = 3u;
+    else if (a < 2.5f) n = 4u;
+    else if (a < 3.5f) n = 5u;
+    else if (a < 5.0f) n = 6u;
+    else n = 7u;
+    return sign | n;
+}
+/* E8M0 exponent for a block whose max magnitude is `amax`, mapping it onto e2m1's 6.0 top code.
+ * Power-of-two only by construction, which is what makes the MX scale exact. */
+__device__ __forceinline__ unsigned char e8m0_for_amax(float amax) {
+    if (!(amax > 0.0f)) return (unsigned char)PLOW_E8M0_ONE;
+    int e;
+    frexpf(amax / 6.0f, &e); /* amax/6 in [0.5,1) * 2^e  => scale 2^e covers the block */
+    e += 127;
+    if (e < 1) e = 1;
+    if (e > 254) e = 254;
+    return (unsigned char)e;
+}
+
+/* ---------------------------------------------------------------------------
  * FP8 (OCP e4m3) KV-CACHE loads/stores — the decode flash-attention path.
  *
  * The KV cache is HBM-bound in decode (op_attention.h: "1.91 ms @ 2.0 TB/s"), so storing K/V as
@@ -501,6 +624,32 @@ __device__ __forceinline__ float half_wave_sum(float v) {
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, PLOW_WAVE);
     return v;
+}
+
+/* ONE spelling of the logistic for the whole K3 family. `situ`'s gate branch and the MLA OUTPUT
+ * GATE (`mla_use_output_gate`, op 106, op_k3.h) both need it, and they must not drift apart: the
+ * two are a factor of `beta*tanh(g/beta)` from each other, so an accidental substitution of one for
+ * the other is finite, correctly-shaped and wrong. The body is byte-identical to what
+ * `k3_situ_gate` inlined before this was named. */
+__device__ __forceinline__ float k3_sigmoid(float x) { return 1.0f / (1.0f + __expf(-x)); }
+
+/* Kimi-K3's `situ` activation, as a PAIR, because it transforms BOTH GLU branches:
+ *     out = beta*tanh(g/beta)*sigmoid(g)  *  linear_beta*tanh(u/linear_beta)
+ * (modeling_kimi_linear.py:75-85, `activation_situ_beta` 4.0, `activation_situ_linear_beta` 25.0).
+ *
+ * It lives HERE rather than in op_k3.h because two call sites need it — the dense/shared GLU
+ * (PLOW_DOP_SITU_GLU, op_k3.h) and the ROUTED EXPERT GLU (op_moe.h) — and op_moe.h must not
+ * depend on op_k3.h. Two copies of a transcendental expression is exactly how a model ends up
+ * computing subtly different activations in its dense and expert paths.
+ *
+ * It is a soft-clipped SiLU: as beta -> inf, `beta*tanh(g/beta) -> g` and the gate branch becomes
+ * silu. `lb <= 0` means "no up transform" (`linear_beta is None`), chosen as a comparison rather
+ * than a flag so a zeroed immediate degrades to the identity instead of clipping to zero. */
+__device__ __forceinline__ float k3_situ_gate(float g, float beta) {
+    return beta * tanhf(g / beta) * k3_sigmoid(g);
+}
+__device__ __forceinline__ float k3_situ_up(float u, float lb) {
+    return lb > 0.0f ? lb * tanhf(u / lb) : u;
 }
 
 /* Block reduction over the PLOW_WAVES waves of the workgroup. */

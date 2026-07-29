@@ -95,7 +95,7 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         .map(|x| x.as_str().unwrap() == "full_attention")
         .collect();
     let rp = &t["rope_parameters"];
-    Cfg {
+    let c = Cfg {
         arch: Arch::Gemma4,
         hidden: g("hidden_size"),
         inter: g("intermediate_size"),
@@ -143,7 +143,11 @@ fn cfg_gemma(v: &Value, flat: bool) -> Cfg {
         n_exp: t["num_experts"].as_u64().unwrap_or(0) as u32,
         top_k: t["top_k_experts"].as_u64().unwrap_or(0) as u32,
         moe_inter: t["moe_intermediate_size"].as_u64().unwrap_or(0) as u32,
+    };
+    if c.moe {
+        crate::require_moe_topk(c.top_k, "gemma4 (enable_moe_block)");
     }
+    c
 }
 
 /// Llama-3.1 / Qwen3: flat config, all-global attention, simple pre-norm, SwiGLU.

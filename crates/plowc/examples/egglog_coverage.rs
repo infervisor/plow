@@ -105,7 +105,7 @@ fn main() {
     let s: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1024);
 
     let json = std::fs::read_to_string(format!("{dir}/config.json")).expect("config.json");
-    let mut g = frontend::build_from_config_json_at(&json, &frontend::ShapeBucket::default())
+    let mut g = nn_graph::models::build_from_config_json_at(&json, &nn_graph::models::ShapeBucket::default())
         .expect("build graph");
     g.bind(&nn_graph::Bindings::new().set("B", b).set("S", s));
 

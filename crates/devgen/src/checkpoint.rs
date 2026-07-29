@@ -166,8 +166,8 @@ pub(crate) fn layer_scalars(dir: &Path, layers: u32, prefix: &str) -> Vec<f32> {
     out
 }
 
-/// Every `prefix*` tensor name the checkpoint actually ships.
-fn ckpt_names(dir: &Path, prefix: &str) -> HashSet<String> {
+/// Every tensor name the checkpoint actually ships, unfiltered.
+fn ckpt_names_all(dir: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
     for p in shard_files(dir) {
         use std::io::Read;
@@ -181,9 +181,35 @@ fn ckpt_names(dir: &Path, prefix: &str) -> HashSet<String> {
         let h: Value = serde_json::from_slice(&hbuf)
             .unwrap_or_else(|e| panic!("{}: bad safetensors header: {e}", p.display()));
         for k in h.as_object().expect("header object").keys() {
-            if k != "__metadata__" && k.starts_with(prefix) {
+            if k != "__metadata__" {
                 out.insert(k.clone());
             }
+        }
+    }
+    out
+}
+
+/// The namespaces this checkpoint puts its transformer layers under, DERIVED from the tensor
+/// names rather than assumed, with a count each.
+///
+/// `<something>.layers.<N>.<...>` is the one naming rule every architecture in this tree shares,
+/// so the text before the first `.layers.` *is* the weight prefix. Measured, on the checkpoints on
+/// this box:
+///
+/// | checkpoint | derived |
+/// |---|---|
+/// | GLM-5.2, Llama, Qwen3 | `model.` |
+/// | Gemma-4 multimodal | `model.language_model.` (+ a vision-tower namespace) |
+/// | Kimi-K3 | `language_model.model.` — and **nothing** under `model.` |
+///
+/// Returned as a map because a multimodal checkpoint legitimately has more than one (the vision
+/// tower has `.layers.` too). The caller does not need to pick the right one — it only needs to
+/// know whether the prefix it was *given* is among them.
+fn layer_namespaces(names: &HashSet<String>) -> std::collections::BTreeMap<String, usize> {
+    let mut out = std::collections::BTreeMap::new();
+    for n in names {
+        if let Some((head, _)) = n.split_once(".layers.") {
+            *out.entry(format!("{head}.layers.")).or_insert(0) += 1;
         }
     }
     out
@@ -247,11 +273,49 @@ pub(crate) fn validate_coverage(
         );
         return Ok(());
     }
-    let ckpt = ckpt_names(dir, prefix);
+    // THE PREFIX ITSELF IS CHECKED FIRST, because a wrong one turns this entire gate into a
+    // no-op rather than a failure: `ckpt` and `want` are both filtered by it, so a prefix that
+    // matches nothing compares the empty set against the empty set and returns Ok. That is the
+    // §4 shape one level up — the check exists, is correct, and nothing routes to it.
+    //
+    // Kimi-K3 is the live case: all 497 052 language-tower tensors are `language_model.model.…`
+    // and ZERO start with `model.`, so a plan declared under `model.` would pass this gate
+    // silently, allocate every weight, upload none, and decode from zeroed memory.
+    let all = ckpt_names_all(dir);
+    let ckpt: HashSet<String> = all.iter().filter(|k| k.starts_with(prefix)).cloned().collect();
+    if ckpt.is_empty() {
+        let ns = layer_namespaces(&all);
+        return Err(format!(
+            "weight prefix `{prefix}` matches NOTHING in {} ({} tensors).\n\
+             The coverage gate below compares declared-vs-shipped WITHIN the prefix, so an \
+             unmatched prefix makes it compare two empty sets and pass — every weight would then \
+             be allocated, never uploaded, and read as zeros at run time.\n\
+             This checkpoint's own layer namespaces, derived from its tensor names:\n    {}\n\
+             Fix the prefix the plan declares (devgen `Cfg::prefix` / `GlmCfg::prefix`, \
+             plowc `HfSynthesis::prefix`), not this gate.",
+            dir.display(),
+            all.len(),
+            if ns.is_empty() {
+                "(none — no tensor name contains `.layers.`)".to_string()
+            } else {
+                ns.iter()
+                    .map(|(p, n)| format!("{p}*  ({n} tensors)"))
+                    .collect::<Vec<_>>()
+                    .join("\n    ")
+            },
+        ));
+    }
     // A weight is covered if the plan binds EITHER the bf16 tensor or its fp8 twin.
     // Under PLOW_FP8 the projections are declared as `fp8/<name>` (the twins live in a
     // sibling dir, so they are not in `ckpt`) and the bf16 original is deliberately
     // superseded — counting it "uncovered" would fail every fp8 build.
+    //
+    // THIS STRIP IS A COVERAGE MAPPING, NOT A KEY LOOKUP. It answers "is the bf16 weight <name>
+    // covered by something the plan binds?", so it maps the twin's name back to the bf16 name it
+    // supersedes. It is NOT the fp8 checkpoint key rule: that key is `fp8/<name>` VERBATIM, prefix
+    // included, and nothing strips it on the way in (see the `fp8/` key contract in lib.rs). The
+    // distinction matters because a loader that copied this line is precisely how the two-spelling
+    // bug happened — a freshly quantized checkpoint could not load at all.
     let want: HashSet<&str> = declared
         .iter()
         .map(|s| s.strip_prefix("fp8/").unwrap_or(s.as_str()))
@@ -310,4 +374,62 @@ pub(crate) fn validate_coverage(
         );
     }
     Err(e)
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    fn names(v: &[&str]) -> HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The weight prefix is DERIVED from the checkpoint's own names, so a checkpoint that nests
+    /// its tower under a wrapper is describable without a per-model patch. Spellings are verbatim
+    /// from the three checkpoints on this box (Kimi-K3's from its
+    /// `model.safetensors.index.json`: 497 052 `language_model.…` entries, ZERO `model.…`).
+    #[test]
+    fn the_layer_namespace_is_derived_from_the_tensor_names() {
+        let glm = names(&[
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.q_a_proj.weight",
+            "model.layers.77.mlp.gate.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+        ]);
+        assert_eq!(layer_namespaces(&glm).keys().collect::<Vec<_>>(), vec!["model.layers."]);
+
+        let k3 = names(&[
+            "language_model.model.embed_tokens.weight",
+            "language_model.model.layers.3.self_attn.kv_a_proj_with_mqa.weight",
+            "language_model.lm_head.weight",
+            "vision_tower.encoder.blocks.0.wqkv.weight",
+            "mm_projector.proj.0.weight",
+        ]);
+        let k3ns = layer_namespaces(&k3);
+        assert_eq!(k3ns.keys().collect::<Vec<_>>(), vec!["language_model.model.layers."]);
+        // The point of the derivation: `model.` is NOT among them, and a plan declared under it
+        // would have matched nothing — which is what made the coverage gate below a no-op.
+        assert!(!k3ns.contains_key("model.layers."));
+
+        // A multimodal checkpoint legitimately has MORE THAN ONE, which is why the caller checks
+        // membership rather than taking a unique answer.
+        let gemma = names(&[
+            "model.language_model.layers.0.mlp.down_proj.weight",
+            "model.vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight",
+        ]);
+        assert_eq!(layer_namespaces(&gemma).len(), 2);
+    }
+
+    /// Counts come out with the namespaces, because the refusal quotes them: "`model.` matches
+    /// nothing; this checkpoint has `language_model.model.layers.*` (497 051 tensors)" is
+    /// actionable and "prefix mismatch" is not.
+    #[test]
+    fn the_namespaces_carry_their_tensor_counts() {
+        let n = names(&["a.layers.0.w", "a.layers.1.w", "b.layers.0.w", "no_layers_here.weight"]);
+        let ns = layer_namespaces(&n);
+        assert_eq!(ns.get("a.layers."), Some(&2));
+        assert_eq!(ns.get("b.layers."), Some(&1));
+        assert_eq!(ns.len(), 2, "a name without `.layers.` contributes no namespace");
+    }
 }

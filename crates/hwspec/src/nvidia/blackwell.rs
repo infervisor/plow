@@ -100,6 +100,8 @@ pub const B200: GpuSpec = GpuSpec {
         kind: MemKind::Hbm3e,
         capacity: Bytes::gib(192),
         bandwidth: GBps(8000.0),
+        // Not measured on this part; a reported bound falls back to the datasheet peak.
+        bandwidth_measured: None,
         bus_width_bits: 8192,
     },
     copy_engines: 3,
@@ -128,6 +130,8 @@ pub const RTX_5090: GpuSpec = GpuSpec {
         kind: MemKind::Gddr7,
         capacity: Bytes::gib(32),
         bandwidth: GBps(1792.0),
+        // Not measured on this part; a reported bound falls back to the datasheet peak.
+        bandwidth_measured: None,
         bus_width_bits: 512,
     },
     copy_engines: 2,
@@ -151,6 +155,8 @@ pub const RTX_6000_PRO: GpuSpec = GpuSpec {
         kind: MemKind::Gddr7,
         capacity: Bytes::gib(96),
         bandwidth: GBps(1792.0),
+        // Not measured on this part; a reported bound falls back to the datasheet peak.
+        bandwidth_measured: None,
         bus_width_bits: 512,
     },
     copy_engines: 2,

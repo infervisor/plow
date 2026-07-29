@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build the 2-GPU one-shot all-reduce microbench (validates op_collective.h's
-# d_xreduce_oneshot bit-exact + latency across two gfx950 GPUs over XGMI).
+# Build the N-RANK, BATCH-SWEPT one-shot all-reduce microbench (validates op_collective.h's
+# d_xreduce_oneshot bit-exact + latency across N gfx950 GPUs over XGMI).
 # Produces, into the output dir (default /tmp/tpar, or $1):
 #   tp_allreduce_kernels.elf   the gfx950 device kernels (fill + one-shot all-reduce)
 #   tp_allreduce_bench         the host harness (links hsa_backend.c + libhsa-runtime64)
@@ -31,4 +31,5 @@ readelf -d tp_allreduce_bench | grep -qi runpath && { echo "FAIL: RUNPATH leaked
 
 ls -l --time-style=+%H:%M:%S tp_allreduce_kernels.elf tp_allreduce_bench \
   | awk '{print "   ", $NF, $5"B", $6}'
-echo "run:  (cd $OUT && /usr/bin/env -i PATH=/usr/bin:/bin HOME=\$HOME LD_LIBRARY_PATH=/opt/rocm/lib ./tp_allreduce_bench 0 1)"
+echo "run:  (cd $OUT && /usr/bin/env -i PATH=/usr/bin:/bin HOME=\$HOME LD_LIBRARY_PATH=/opt/rocm/lib ./tp_allreduce_bench 1 2 3)"
+echo "      rank count = number of device ids; env TP_HIDDEN (default 7168, Kimi) TP_ITERS TP_ELF"

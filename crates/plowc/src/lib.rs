@@ -213,7 +213,7 @@ pub enum PlowcError {
     #[error("invalid dimension: {0}")]
     InvalidDim(String),
     #[error(transparent)]
-    Frontend(#[from] frontend::FrontendError),
+    Hub(#[from] nn_graph::hub::HubError),
     #[error(transparent)]
     Rewrite(#[from] rewrite::RewriteError),
     #[error(transparent)]
@@ -474,6 +474,18 @@ pub struct Report {
     /// leaving a reader to assume it was measured.
     pub tuning_tier: String,
     pub tuning_provenance: String,
+    /// Did the Lean ordering certificate actually cover EVERY bucket here?
+    ///
+    /// Same job as `tuning_tier` beside it, for the same reason. The gate is on
+    /// by default and degrades when there is no `plow_verify`, so "skipped" is
+    /// a normal outcome — and a skipped gate is indistinguishable from a passed
+    /// one unless the artifact records which. `false` never means "rejected": a
+    /// rejection fails the compile, so no bundle describing one exists.
+    #[serde(default)]
+    pub lean_verified: bool,
+    /// Why `lean_verified` reads the way it does, in words.
+    #[serde(default)]
+    pub lean_provenance: String,
     pub num_gpus: usize,
     pub parallel: Parallel,
     /// `true` iff one `(BN, BK)` is legal across every bucket — a flip moves no
@@ -501,6 +513,14 @@ pub struct Report {
     /// so the manifest keeps its historical shape.
     #[serde(skip)]
     pub assets: Option<Assets>,
+}
+
+/// Whether the Lean ordering certificate covered this whole compile, and why.
+/// Carried out of `emit_streams` (which is where the per-bucket verification
+/// happens) into [`Report`].
+struct LeanStatus {
+    verified: bool,
+    provenance: String,
 }
 
 fn phase_name(p: Phase) -> &'static str {
@@ -693,7 +713,7 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
 
     info!(stage = "emission", output = %opts.out.display(), "writing compiled artifacts");
     std::fs::create_dir_all(&opts.out)?;
-    let (buckets, footprints) = emit_streams(&compiled, &soc, &cfg, opts, src, &plans)?;
+    let (buckets, footprints, lean) = emit_streams(&compiled, &soc, &cfg, opts, src, &plans)?;
 
     // Static tensors: compile-time constants (RoPE freq tables, static
     // masks). Phase 4 emits the plumbing with an empty manifest — Phase 5
@@ -721,6 +741,8 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
     let mut report = Report {
         tuning_tier,
         tuning_provenance,
+        lean_verified: lean.verified,
+        lean_provenance: lean.provenance,
         network: src.name(),
         gpu: opts.gpu.clone(),
         num_gpus: opts.num_gpus,
@@ -1276,11 +1298,19 @@ fn emit_streams(
     opts: &Options,
     src: &Source,
     plans: &[(ShapeBucket, LayerPlan)],
-) -> Result<(Vec<BucketReport>, Vec<Footprint>), PlowcError> {
+) -> Result<(Vec<BucketReport>, Vec<Footprint>, LeanStatus), PlowcError> {
     let hbm_capacity = soc.unit(0).cm.spec.mem.capacity.0;
     let mut out = Vec::with_capacity(compiled.streams.len());
     let mut footprints: Vec<Footprint> = Vec::with_capacity(compiled.streams.len());
     let kv_layout = compiled.kv;
+    let mut lean = if opts.lean_verify {
+        LeanStatus { verified: true, provenance: "certified: every bucket".into() }
+    } else {
+        LeanStatus {
+            verified: false,
+            provenance: "not requested (Options::lean_verify = false)".into(),
+        }
+    };
     for bs in &compiled.streams {
         let phase = phase_name(bs.bucket.phase);
         let stem = format!("{phase}_b{}_s{}", bs.bucket.batch, bs.bucket.seq);
@@ -1567,7 +1597,7 @@ fn emit_streams(
         // is one function; Lean receives a JSON payload and returns a
         // certificate. See `plans/lean-formal-verification-analysis.md §5.10`.
         if opts.lean_verify {
-            run_lean_verify(
+            let certified = run_lean_verify(
                 &stem,
                 &bs.sched.tasks,
                 &effective_sched,
@@ -1579,6 +1609,15 @@ fn emit_streams(
                 opts,
                 &bytes,
             )?;
+            // ONE bucket left unverified makes the WHOLE bundle unverified. The
+            // report must not be able to say "verified" about a set of packets
+            // where any member was skipped.
+            if !certified {
+                lean.verified = false;
+                lean.provenance = format!(
+                    "requested, but skipped from bucket `{stem}` on: no runnable plow_verify"
+                );
+            }
         }
 
         // Simulate the *effective* schedule (post counter-elim / scope-narrow /
@@ -1647,7 +1686,7 @@ fn emit_streams(
         std::fs::write(opts.out.join("footprint.csv"), footprint_csv(&footprints))?;
     }
 
-    Ok((out, footprints))
+    Ok((out, footprints, lean))
 }
 
 fn footprint_csv(rows: &[Footprint]) -> String {
@@ -1713,13 +1752,15 @@ fn run_lean_verify(
     _scheduled: &schedule::Scheduled,
     _opts: &Options,
     _packet_bytes: &[u8],
-) -> Result<(), PlowcError> {
-    verify_A(bucket)?;
-    verify_B(bucket, graph, cons, sched)?;
-    verify_D(bucket, tasks, sched, amap, task_sets)?;
-    verify_E(bucket)?;
-    verify_F(bucket, tasks, sched, amap, task_sets)?;
-    Ok(())
+) -> Result<bool, PlowcError> {
+    // `false` from any checkpoint means "no runnable verifier", and it ends the
+    // attempt for this bucket: the remaining four would each pay another failed
+    // spawn and log another identical warning. `?` still propagates a REJECTION.
+    Ok(verify_A(bucket)?
+        && verify_B(bucket, graph, cons, sched)?
+        && verify_D(bucket, tasks, sched, amap, task_sets)?
+        && verify_E(bucket)?
+        && verify_F(bucket, tasks, sched, amap, task_sets)?)
 }
 
 #[cfg(feature = "lean-verify")]
@@ -1728,19 +1769,40 @@ fn dispatch_cert(
     checkpoint: &'static str,
     cert: Result<lean_verify::Certificate, lean_verify::VerifyError>,
     started: std::time::Instant,
-) -> Result<(), PlowcError> {
+) -> Result<bool, PlowcError> {
     let elapsed_ms = started.elapsed().as_millis();
-    let cert = cert.map_err(|source| {
-        tracing::error!("[lean-verify:{checkpoint}] {bucket}: spawn/marshal failure: {source}");
-        PlowcError::LeanVerifySpawn {
-            bucket: bucket.to_string(),
-            detail: source.to_string(),
+    let cert = match cert {
+        Ok(c) => c,
+        // DEGRADE ON AN UNUSABLE VERIFIER — this is the safety mechanism, and it
+        // has to live here because this is the first code that has actually
+        // tried to run the thing. A caller-side "does the binary exist?" probe
+        // cannot cover a binary that exists and does not run (wrong arch, no
+        // +x, or lean-plow's /nix/store ELF interpreter outside `nix develop`,
+        // which exits 127). Without this, such a binary turns EVERY compile on
+        // the packet path into a hard failure of a gate the user never asked
+        // for — the gates are on by default now.
+        //
+        // `Ok(false)` — skipped — is deliberately distinct from `Ok(true)`, and
+        // the caller propagates that into the report. A skipped gate that reads
+        // like a passed one is this codebase's signature bug.
+        Err(source) if source.is_binary_unusable() => {
+            tracing::warn!(
+                "[lean-verify:{checkpoint}] {bucket}: SKIPPED, no runnable plow_verify: {source}"
+            );
+            return Ok(false);
         }
-    })?;
+        Err(source) => {
+            tracing::error!("[lean-verify:{checkpoint}] {bucket}: spawn/marshal failure: {source}");
+            return Err(PlowcError::LeanVerifySpawn {
+                bucket: bucket.to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
     if cert.ok {
         let notes = cert.notes.as_deref().unwrap_or("(no notes)");
         debug!("[lean-verify:{checkpoint}] {bucket}: accepted in {elapsed_ms}ms — {notes}");
-        Ok(())
+        Ok(true)
     } else {
         let reason = cert
             .reason
@@ -1765,7 +1827,7 @@ fn dispatch_cert(
 /// name is outside this checkpoint's scope.)
 #[cfg(feature = "lean-verify")]
 #[allow(non_snake_case)]
-fn verify_A(bucket: &str) -> Result<(), PlowcError> {
+fn verify_A(bucket: &str) -> Result<bool, PlowcError> {
     use lean_verify::checkpoints::rewrite::{check_rewrite_rules, RewriteRulesRequest};
     let req = RewriteRulesRequest {
         rules: parse_rule_catalog(rewrite::rules_source())?,
@@ -1829,7 +1891,7 @@ fn verify_B(
     graph: &rewrite::TileGraph,
     cons: &rewrite::ConstraintSet,
     sched: &schedule::Schedule,
-) -> Result<(), PlowcError> {
+) -> Result<bool, PlowcError> {
     use lean_verify::checkpoints::tile_partition::{
         check_tile_partition, GemmShapeJ, TileCandidate, TilePartitionRequest, TileShapeJ,
     };
@@ -1889,7 +1951,7 @@ fn verify_D(
     sched: &schedule::Schedule,
     amap: &schedule::AddressMap,
     task_sets: &schedule::memory::TensorTaskSets,
-) -> Result<(), PlowcError> {
+) -> Result<bool, PlowcError> {
     let request =
         schedule::lean_verify::build_schedule_request(tasks, sched, amap, task_sets);
     debug!(
@@ -1916,7 +1978,7 @@ fn verify_D(
 /// and the concrete packet crate is a separate exercise.
 #[cfg(feature = "lean-verify")]
 #[allow(non_snake_case)]
-fn verify_E(bucket: &str) -> Result<(), PlowcError> {
+fn verify_E(bucket: &str) -> Result<bool, PlowcError> {
     use lean_verify::checkpoints::wire::{
         check_wire_roundtrip, encode_program, WireFrame, WireRequest,
     };
@@ -1946,7 +2008,7 @@ fn verify_F(
     sched: &schedule::Schedule,
     amap: &schedule::AddressMap,
     task_sets: &schedule::memory::TensorTaskSets,
-) -> Result<(), PlowcError> {
+) -> Result<bool, PlowcError> {
     let request =
         schedule::lean_verify::build_schedule_request(tasks, sched, amap, task_sets);
     let started = std::time::Instant::now();
@@ -2204,7 +2266,7 @@ fn run_lean_verify(
     _scheduled: &schedule::Scheduled,
     _opts: &Options,
     _packet_bytes: &[u8],
-) -> Result<(), PlowcError> {
+) -> Result<bool, PlowcError> {
     Err(PlowcError::LeanVerifyDisabled)
 }
 
@@ -2264,7 +2326,7 @@ fn build_plan(
                 stage = "nn-graph", model = %id, batch = b.batch, seq = b.seq,
                 "building nn_graph from pretrained model"
             );
-            let mut g = frontend::build_from_pretrained(id, &frontend::ShapeBucket::default())?;
+            let mut g = nn_graph::hub::build_from_pretrained(id, &nn_graph::models::ShapeBucket::default())?;
             g.bind(&nn_graph::Bindings::new().set("B", b.batch).set("S", b.seq));
             // The fused graph is not consumed (the plan below is built from the
             // source graph) and the caller keeps only the FIRST bucket's stats

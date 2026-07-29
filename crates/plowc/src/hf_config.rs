@@ -61,6 +61,28 @@ pub enum HfArch {
     DeepSeek,
     /// GLM 5.2 MoE-DSA: MLA + DeepSeekMoE + Dense-Sparse Attention indexer.
     Glm,
+    /// Kimi K3 (Moonshot, `kimi_k3` → nested `text_config` `kimi_linear`):
+    /// HYBRID attention — 24 MLA layers interleaved with 69 KDA (Kimi Delta
+    /// Attention, linear) layers — plus a latent MoE whose 896 routed experts
+    /// are mxfp4. Config is accepted here; emission refuses (see
+    /// [`build_full_model_plan`] and `devgen::mla::kimi_k3_emit`).
+    KimiK3,
+}
+
+/// Per-layer attention implementation. This is FIRST-CLASS per-layer data, not
+/// a count: Kimi-K3 mixes softmax MLA and linear KDA layers, and which layer is
+/// which decides the tensor names, the carried state and the kernel. Collapsing
+/// it to "24 full / 69 kda" loses the mapping and silently mis-binds weights.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AttnKind {
+    /// Full (unwindowed) softmax attention — MHA/GQA or MLA.
+    Full,
+    /// Sliding-window softmax attention (Gemma-4).
+    Sliding,
+    /// Kimi Delta Attention: a LINEAR attention with carried recurrent state,
+    /// short depthwise convs on q/k/v and a low-rank forget gate. Not softmax
+    /// attention and not expressible with any current plow DevOp.
+    Kda,
 }
 
 /// Resolved model description — every field verified present (or an
@@ -81,9 +103,13 @@ pub struct HfSynthesis {
     pub intermediate_size: i64,
     pub num_layers: u32,
     pub vocab_size: i64,
-    /// Per-layer attention kind: `true` = full attention. All-true for
-    /// Llama/Qwen (no sliding window).
+    /// Per-layer attention kind: `true` = full SOFTMAX attention. All-true for
+    /// Llama/Qwen (no sliding window). Derived from [`Self::attn_kind`] — a KDA
+    /// layer is `false` here because it is not softmax attention at all.
     pub is_full: Vec<bool>,
+    /// Per-layer attention implementation, one entry per layer. The single
+    /// source of truth; `is_full` is `attn_kind[l] == AttnKind::Full`.
+    pub attn_kind: Vec<AttnKind>,
     /// Gemma full layers share k_proj output as V (no v_proj tensor).
     pub k_eq_v: bool,
     /// lm_head tied to embed_tokens (reuse the embedding weight).
@@ -114,6 +140,15 @@ pub struct HfSynthesis {
     pub first_k_dense: u32,
     /// Number of shared experts (Kimi MoE; 0 for non-MoE or Gemma).
     pub n_shared_experts: i64,
+    /// LATENT-MoE width (`routed_expert_hidden_size`, Kimi-K3 = 3584): the
+    /// routed experts do NOT read the hidden state. The block projects
+    /// `hidden → moe_latent` once (`routed_expert_down_proj`), runs every routed
+    /// expert GEMM at `K = moe_latent`, and projects back with
+    /// `routed_expert_up_proj`. 0 = experts read the hidden state directly
+    /// (Gemma / DeepSeek / GLM). VERIFIED against the checkpoint: K3's
+    /// `experts.{e}.w1.weight_packed` is `[3072, 1792]` = `[moe_inter, 3584/2]`,
+    /// so `moe_latent`, NOT `moe_inter`, is the routed-expert GEMM's K.
+    pub moe_latent: i64,
     /// Weight dtype for GEMM projections. BF16 by default; F8E4M3 for FP8
     /// quantized checkpoints; F4 for MX microscaling. Norms/embed/activations
     /// always stay BF16 regardless of this setting.
@@ -139,6 +174,15 @@ pub fn synthesize_from_hf_dir(dir: &Path) -> Result<HfSynthesis, String> {
 pub fn synthesize_full(json: &str, name: String) -> Result<HfSynthesis, String> {
     let v: Value =
         serde_json::from_str(json).map_err(|e| format!("invalid config.json: {e}"))?;
+    // Dispatch on the OUTER model_type BEFORE the `text_config` short-circuit.
+    // A nested `text_config` used to mean "Gemma-4 multimodal" and nothing else;
+    // Kimi-K3 also nests, so the unconditional short-circuit sent it into
+    // synth_gemma and it died on `head_dim` — an error that names the wrong
+    // field for the wrong architecture. Every nested arch must be claimed here
+    // by name before the Gemma fallback.
+    if v["model_type"].as_str() == Some("kimi_k3") {
+        return synth_kimi_k3(&v, name);
+    }
     if v.get("text_config").is_some() {
         return synth_gemma(&v["text_config"], name, "model.language_model.");
     }
@@ -151,9 +195,9 @@ pub fn synthesize_full(json: &str, name: String) -> Result<HfSynthesis, String> 
         "glm_moe_dsa" | "glm4" => synth_mla_moe(&v, name, HfArch::Glm),
         other => Err(format!(
             "unsupported model_type {other:?}: --hf-dir implements gemma4 (nested \
-             text_config or gemma4_text), llama, qwen3, kimi, deepseek_v2/v3, and \
-             glm_moe_dsa. Compiling an unknown architecture from defaults would \
-             produce a silently-wrong model."
+             text_config or gemma4_text), llama, qwen3, kimi, kimi_k3, \
+             deepseek_v2/v3, and glm_moe_dsa. Compiling an unknown architecture \
+             from defaults would produce a silently-wrong model."
         )),
     }
 }
@@ -262,6 +306,7 @@ fn synth_gemma(t: &Value, name: String, prefix: &str) -> Result<HfSynthesis, Str
         intermediate_size: inter,
         num_layers: layers as u32,
         vocab_size: vocab,
+        attn_kind: attn_kind_from_full(&is_full),
         is_full,
         k_eq_v: t["attention_k_eq_v"].as_bool().unwrap_or(true),
         tied_embed: t["tie_word_embeddings"].as_bool().unwrap_or(true),
@@ -279,11 +324,20 @@ fn synth_gemma(t: &Value, name: String, prefix: &str) -> Result<HfSynthesis, Str
         v_head_dim: 0,
         first_k_dense: 0,
         n_shared_experts: 0,
+        moe_latent: 0,
         weight_dtype: parse_weight_dtype(t),
         net: NetConfig { name: String::new(), hidden: 0, ops: vec![] },
     };
     s.net = build_net_config(&s);
     Ok(s)
+}
+
+/// Softmax-only archs: `is_full` fully determines the per-layer kind.
+fn attn_kind_from_full(is_full: &[bool]) -> Vec<AttnKind> {
+    is_full
+        .iter()
+        .map(|&f| if f { AttnKind::Full } else { AttnKind::Sliding })
+        .collect()
 }
 
 fn synth_llama_qwen(v: &Value, name: String, mt: &str) -> Result<HfSynthesis, String> {
@@ -307,6 +361,7 @@ fn synth_llama_qwen(v: &Value, name: String, mt: &str) -> Result<HfSynthesis, St
         num_layers: layers as u32,
         vocab_size: req_i64(v, "vocab_size")?,
         is_full: vec![true; layers as usize],
+        attn_kind: vec![AttnKind::Full; layers as usize],
         k_eq_v: false,
         tied_embed: v["tie_word_embeddings"].as_bool().unwrap_or(false),
         prefix: "model.".to_string(),
@@ -323,6 +378,7 @@ fn synth_llama_qwen(v: &Value, name: String, mt: &str) -> Result<HfSynthesis, St
         v_head_dim: 0,
         first_k_dense: 0,
         n_shared_experts: 0,
+        moe_latent: 0,
         weight_dtype: parse_weight_dtype(v),
         net: NetConfig { name: String::new(), hidden: 0, ops: vec![] },
     };
@@ -372,6 +428,7 @@ fn synth_mla_moe(v: &Value, name: String, arch: HfArch) -> Result<HfSynthesis, S
         num_layers: layers as u32,
         vocab_size: vocab,
         is_full: vec![true; layers as usize],
+        attn_kind: vec![AttnKind::Full; layers as usize],
         k_eq_v: false,
         tied_embed: v["tie_word_embeddings"].as_bool().unwrap_or(false),
         prefix: "model.".to_string(),
@@ -388,11 +445,194 @@ fn synth_mla_moe(v: &Value, name: String, arch: HfArch) -> Result<HfSynthesis, S
         v_head_dim,
         first_k_dense,
         n_shared_experts,
+        moe_latent: 0,
         weight_dtype: parse_weight_dtype(v),
         net: NetConfig { name: String::new(), hidden: 0, ops: vec![] },
     };
     s.net = build_net_config(&s);
     Ok(s)
+}
+
+/// Kimi-K3 (`model_type: "kimi_k3"`). A MULTIMODAL wrapper whose `text_config`
+/// is a `kimi_linear` model: MLA on 24 layers, KDA (linear attention) on 69, a
+/// latent MoE with 896 mxfp4 routed experts + 2 bf16 shared experts.
+///
+/// TEXT ONLY is in scope. `vision_config` is refused by name rather than
+/// ignored — silently dropping a vision tower produces a model that loads, runs
+/// and is wrong on every image prompt.
+///
+/// Key names differ from DeepSeek/GLM and must NOT be reused blindly:
+/// `num_experts` (not `n_routed_experts`), `num_experts_per_token` (not
+/// `num_experts_per_tok`), `num_shared_experts` (not `n_shared_experts`).
+/// `req_i64` on the DeepSeek spelling would hard-error; a `unwrap_or(0)` would
+/// silently emit a dense model.
+///
+/// **`linear_attn_config` layer lists are 1-BASED.** `configuration_kimi_k3.py`
+/// `KimiLinearConfig::is_kda_layer` tests `(layer_idx + 1) in kda_layers`, and
+/// the checkpoint confirms it: `full_attn_layers` starts at 4 and the MLA
+/// tensors (`self_attn.q_a_proj`) live on 0-based layers 3, 7, 11, … So every
+/// entry is converted to 0-based HERE, once, and the rest of the compiler sees
+/// only 0-based indices.
+fn synth_kimi_k3(v: &Value, name: String) -> Result<HfSynthesis, String> {
+    if v.get("vision_config").map(|c| !c.is_null()).unwrap_or(false) {
+        return Err(
+            "kimi_k3 carries a vision_config (MoonViT tower + mm_projector) and plow \
+             implements the TEXT tower only. Compiling the text tower alone would load, \
+             run, and be silently wrong on every image prompt, so this is refused rather \
+             than ignored. Strip `vision_config` from config.json to compile the text \
+             tower explicitly."
+                .into(),
+        );
+    }
+    let t = v
+        .get("text_config")
+        .filter(|c| c.is_object())
+        .ok_or("kimi_k3 config.json has no `text_config` object")?;
+    let sub = t["model_type"].as_str().unwrap_or("<missing>");
+    if sub != "kimi_linear" {
+        return Err(format!(
+            "kimi_k3 text_config.model_type is {sub:?}, expected \"kimi_linear\" — the \
+             geometry below is only known to hold for kimi_linear"
+        ));
+    }
+
+    let hidden = req_i64(t, "hidden_size")?;
+    let heads = req_i64(t, "num_attention_heads")?;
+    let layers = req_i64(t, "num_hidden_layers")?;
+    let vocab = req_i64(t, "vocab_size")?;
+    let inter = req_i64(t, "intermediate_size")?;
+
+    // MLA geometry — same schema as DeepSeek/GLM, same spelling.
+    let q_lora_rank = req_i64(t, "q_lora_rank")?;
+    let kv_lora_rank = req_i64(t, "kv_lora_rank")?;
+    let qk_rope_head_dim = req_i64(t, "qk_rope_head_dim")?;
+    let qk_nope_head_dim = req_i64(t, "qk_nope_head_dim")?;
+    let v_head_dim = req_i64(t, "v_head_dim")?;
+
+    // MoE — Kimi spellings, all required (see the doc comment).
+    let n_exp = req_i64(t, "num_experts")?;
+    let top_k = req_i64(t, "num_experts_per_token")?;
+    let moe_inter = req_i64(t, "moe_intermediate_size")?;
+    let moe_latent = req_i64(t, "routed_expert_hidden_size")?;
+    let n_shared_experts = req_i64(t, "num_shared_experts")?;
+    let first_k_dense = req_i64(t, "first_k_dense_replace")? as u32;
+
+    let attn_kind = kimi_k3_attn_kinds(t, layers)?;
+    let is_full: Vec<bool> = attn_kind.iter().map(|&k| k == AttnKind::Full).collect();
+    let hd = qk_nope_head_dim + qk_rope_head_dim;
+
+    let mut s = HfSynthesis {
+        name,
+        arch: HfArch::KimiK3,
+        hidden_size: hidden,
+        num_attention_heads: heads,
+        kvh_slide: heads, // MLA: every head attends its own latent slice.
+        kvh_full: heads,
+        hd_slide: hd,
+        hd_full: hd,
+        intermediate_size: inter,
+        num_layers: layers as u32,
+        vocab_size: vocab,
+        is_full,
+        attn_kind,
+        k_eq_v: false,
+        tied_embed: t["tie_word_embeddings"].as_bool().unwrap_or(false),
+        // The multimodal wrapper nests the text tower: the checkpoint spells
+        // every text weight `language_model.model.layers.{L}.…`, NOT
+        // `model.layers.{L}.…`. Verified against the shard headers.
+        prefix: "language_model.model.".to_string(),
+        has_qk_norm: false,
+        has_v_norm: false,
+        moe: true,
+        n_exp,
+        top_k,
+        moe_inter,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        qk_nope_head_dim,
+        v_head_dim,
+        first_k_dense,
+        n_shared_experts,
+        moe_latent,
+        // `quantization_config` lives under text_config for kimi_k3, and its
+        // `format` is "mxfp4-pack-quantized" (compressed-tensors), which
+        // parse_weight_dtype's `quant_method` probe does not spell.
+        weight_dtype: parse_weight_dtype(t),
+        net: NetConfig { name: String::new(), hidden: 0, ops: vec![] },
+    };
+    s.net = build_net_config(&s);
+    Ok(s)
+}
+
+/// Resolve `linear_attn_config.{full_attn_layers,kda_layers}` into one
+/// per-layer [`AttnKind`] vector, 0-based.
+///
+/// Both lists are required and both are checked: the two must PARTITION
+/// `0..num_hidden_layers` exactly — no gap, no overlap, nothing out of range.
+/// Trusting one list and deriving the other by complement is the §4 bug shape:
+/// a typo'd or truncated list would then silently reclassify layers, and a KDA
+/// layer compiled as MLA binds tensors that do not exist (or, worse, ones that
+/// do and mean something else).
+fn kimi_k3_attn_kinds(t: &Value, layers: i64) -> Result<Vec<AttnKind>, String> {
+    let lac = t
+        .get("linear_attn_config")
+        .filter(|c| c.is_object())
+        .ok_or(
+            "kimi_k3 text_config has no `linear_attn_config` — without it there is no \
+             way to know which layers are MLA and which are KDA, and guessing the \
+             stride would bind the wrong tensors on 69 of 93 layers",
+        )?;
+    let list = |k: &str| -> Result<Vec<i64>, String> {
+        lac[k]
+            .as_array()
+            .ok_or_else(|| format!("linear_attn_config.{k} missing or not an array"))?
+            .iter()
+            .map(|x| {
+                x.as_i64()
+                    .ok_or_else(|| format!("linear_attn_config.{k} has a non-integer entry"))
+            })
+            .collect()
+    };
+    let full = list("full_attn_layers")?;
+    let kda = list("kda_layers")?;
+
+    let mut out: Vec<Option<AttnKind>> = vec![None; layers as usize];
+    for (src, kind) in [(&full, AttnKind::Full), (&kda, AttnKind::Kda)] {
+        for &one_based in src {
+            // 1-BASED in config (configuration_kimi_k3.py: `(layer_idx + 1) in
+            // kda_layers`). Convert once, here.
+            let l = one_based - 1;
+            if !(0..layers).contains(&l) {
+                return Err(format!(
+                    "linear_attn_config lists layer {one_based} (1-based, = {l} 0-based) \
+                     but num_hidden_layers is {layers}"
+                ));
+            }
+            if let Some(prev) = out[l as usize] {
+                return Err(format!(
+                    "linear_attn_config assigns 0-based layer {l} twice ({prev:?} and \
+                     {kind:?}); full_attn_layers and kda_layers must be disjoint"
+                ));
+            }
+            out[l as usize] = Some(kind);
+        }
+    }
+    let missing: Vec<usize> = out
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| k.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "linear_attn_config covers {} of {layers} layers; 0-based layers {:?}… are in \
+             neither full_attn_layers nor kda_layers",
+            layers as usize - missing.len(),
+            &missing[..missing.len().min(8)]
+        ));
+    }
+    Ok(out.into_iter().map(|k| k.unwrap()).collect())
 }
 
 /// Build a full-model [`LayerPlan`] with all N layers unrolled, using
@@ -408,6 +648,19 @@ fn synth_mla_moe(v: &Value, name: String, arch: HfArch) -> Result<HfSynthesis, S
 ///
 /// Plus: embed lookup (first), final norm + lm_head (last, tied or not).
 pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> LayerPlan {
+    // Kimi-K3 config is ACCEPTED (see synth_kimi_k3) but not emittable: the
+    // block below models a uniform softmax-attention layer with a hidden-space
+    // MoE, and K3 is neither on 69 of its 93 layers. Emitting it anyway would
+    // produce a plan whose GEMM shapes and weight names are wrong per layer —
+    // exactly the "loads and is fluent but wrong" failure this module exists to
+    // prevent. `devgen::mla::kimi_k3_emit` holds the full capability list.
+    assert_ne!(
+        synth.arch,
+        HfArch::KimiK3,
+        "kimi_k3 has no full-model plan: 69/93 layers are KDA (linear attention) and \
+         the MoE is latent + mxfp4. Run `plowc --hf-dir <k3> --emit devblob` for the \
+         itemised missing-capability report (devgen::mla::kimi_k3_emit)."
+    );
     let rows = bucket.rows();
     let seq = bucket.attn_seq();
     let h = synth.hidden_size;
@@ -1406,6 +1659,91 @@ mod tests {
         assert_eq!(qa.weight_dtype, nn_graph::DType::F4);
         let norm = plan.ops.iter().find(|o| o.name == "norm_in_L0").unwrap();
         assert_eq!(norm.weight_dtype, nn_graph::DType::BF16);
+    }
+
+    /// A faithful miniature of the Kimi-K3 config: multimodal wrapper, nested `kimi_linear`
+    /// text tower, Kimi MoE key spellings, 1-BASED hybrid layer lists (6 layers: MLA at 1-based
+    /// {3,6}, KDA at {1,2,4,5}).
+    fn kimi_k3_json() -> &'static str {
+        r#"{
+          "model_type": "kimi_k3",
+          "text_config": {
+            "model_type": "kimi_linear",
+            "hidden_size": 256, "num_attention_heads": 8, "num_hidden_layers": 6,
+            "vocab_size": 1000, "intermediate_size": 512,
+            "q_lora_rank": 64, "kv_lora_rank": 32, "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8, "v_head_dim": 16,
+            "num_experts": 32, "num_experts_per_token": 4, "num_shared_experts": 2,
+            "moe_intermediate_size": 96, "routed_expert_hidden_size": 128,
+            "first_k_dense_replace": 1,
+            "linear_attn_config": {
+              "full_attn_layers": [3, 6], "kda_layers": [1, 2, 4, 5]
+            }
+          }
+        }"#
+    }
+
+    /// `text_config` used to mean "Gemma-4 multimodal" unconditionally, so kimi_k3 was parsed as
+    /// Gemma and died on `head_dim` — the wrong field of the wrong architecture. It must now be
+    /// claimed by name.
+    #[test]
+    fn test_kimi_k3_is_not_parsed_as_gemma() {
+        let s = synthesize_full(kimi_k3_json(), "kimi-k3".into()).unwrap();
+        assert_eq!(s.arch, HfArch::KimiK3);
+        assert_eq!(s.prefix, "language_model.model.");
+        assert_eq!(s.num_layers, 6);
+        assert_eq!((s.q_lora_rank, s.kv_lora_rank), (64, 32));
+        // Kimi MoE spellings, not DeepSeek's.
+        assert_eq!((s.n_exp, s.top_k, s.n_shared_experts), (32, 4, 2));
+        // The routed experts run at the LATENT width, not moe_intermediate_size.
+        assert_eq!(s.moe_latent, 128);
+        assert_ne!(s.moe_latent, s.moe_inter);
+    }
+
+    /// The 1-based → 0-based conversion, and the fact that the map is data rather than a count.
+    #[test]
+    fn test_kimi_k3_layer_map_is_one_based() {
+        let s = synthesize_full(kimi_k3_json(), "kimi-k3".into()).unwrap();
+        use AttnKind::*;
+        assert_eq!(s.attn_kind, vec![Kda, Kda, Full, Kda, Kda, Full]);
+        // `is_full` stays truthful: a KDA layer is not softmax attention.
+        assert_eq!(s.is_full, vec![false, false, true, false, false, true]);
+    }
+
+    #[test]
+    fn test_kimi_k3_layer_list_must_partition() {
+        // 1-based layer 5 dropped → 0-based layer 4 unclassified. Deriving the complement would
+        // hide it.
+        let json = kimi_k3_json().replace("[1, 2, 4, 5]", "[1, 2, 4]");
+        let err = synthesize_full(&json, "x".into()).unwrap_err();
+        assert!(err.contains("neither"), "{err}");
+        // Overlap.
+        let json = kimi_k3_json().replace("[1, 2, 4, 5]", "[1, 2, 3, 4, 5]");
+        let err = synthesize_full(&json, "x".into()).unwrap_err();
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    /// Vision is refused BY NAME on this path (the packet path has no vision emit at all and no
+    /// report to fall back on).
+    #[test]
+    fn test_kimi_k3_vision_is_refused() {
+        let json = kimi_k3_json().replace(
+            r#""model_type": "kimi_k3","#,
+            r#""model_type": "kimi_k3", "vision_config": {"vt_hidden_size": 1024},"#,
+        );
+        let err = synthesize_full(&json, "x".into()).unwrap_err();
+        assert!(err.contains("vision_config"), "{err}");
+        assert!(err.contains("TEXT tower"), "{err}");
+    }
+
+    /// Config acceptance is NOT emission: the plan builder must refuse rather than produce a
+    /// uniform-softmax-attention plan for a 69/93-linear-attention model.
+    #[test]
+    #[should_panic(expected = "kimi_k3 has no full-model plan")]
+    fn test_kimi_k3_has_no_full_model_plan() {
+        let s = synthesize_full(kimi_k3_json(), "kimi-k3".into()).unwrap();
+        let bucket = ShapeBucket { batch: 1, seq: 128, phase: schedule::Phase::Decode };
+        let _ = build_full_model_plan(&bucket, &s);
     }
 
     #[test]

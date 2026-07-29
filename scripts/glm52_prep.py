@@ -121,6 +121,48 @@ def p_raw(idx, name):
 # ---------------------------------------------------------------- config
 from transformers import AutoConfig
 
+
+def load_cfg(path):
+    """AutoConfig, RECONCILED against the checkpoint's own config.json.
+
+    `GlmMoeDsaConfig` does not round-trip this checkpoint: it silently reports
+    `qk_rope_head_dim = 192` where config.json says **64**. That is not a cosmetic
+    disagreement — `prep_layer` slices `q_b[:, QN:, :]` (giving the true [NH, 64, QL])
+    and then reshapes to `NH*DR`, so a wrong DR turns into
+
+        ValueError: cannot reshape array of size 8388608 into shape (12288, 2048)
+
+    which is where the full-model prep died. Confirmed against the tensors, which are
+    the real authority (layer 3, GLM-5.2-FP8):
+
+        kv_a_proj_with_mqa [576, 6144]   = [DK + DR, H]        -> DK 512, DR  64
+        q_b_proj           [16384, 2048] = [NH*QKH, QL]        -> QKH 256 (192+64)
+        kv_b_proj          [28672, 512]  = [NH*(QN+VD), DK]    -> VD  256
+        o_proj             [6144, 16384] = [H, NH*VD]          -> VD  256
+
+    So json wins for `qk_rope_head_dim`; AutoConfig's `v_head_dim = 256` happens to be
+    right and json omits it, so that one is left alone. Any scalar present in json is
+    taken as ground truth — the file shipped with the weights describes the weights.
+    """
+    cfg = AutoConfig.from_pretrained(path)
+    cj = os.path.join(path, "config.json")
+    if not os.path.isfile(cj):
+        return cfg
+    raw = json.load(open(cj))
+    for k, v in raw.items():
+        # NUMERIC scalars only. Deliberately not strings: `dtype` is a torch.dtype on the
+        # config object and "bfloat16" in the json, so a blanket copy would replace a
+        # torch.dtype with a str and break every downstream `.to(cfg.dtype)`. The bug this
+        # function exists for is dimensional, and dimensions are ints.
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        cur = getattr(cfg, k, None)
+        if isinstance(cur, bool) or not isinstance(cur, (int, float)) or cur == v:
+            continue
+        print(f"  cfg: {k} {cur} -> {v} (config.json wins)")
+        setattr(cfg, k, v)
+    return cfg
+
 def add_indexer_tensors(idx, cfg, w, layer):
     """Queue the 7 DSA lightning-indexer tensors for a 'full' layer into writer `w` (used by both the
     full per-layer prep and the incremental indexer-only prep). wq_b/wk are block-fp8 -> copied
@@ -239,7 +281,7 @@ def main():
     pos = args.L - 1
 
     idx = _index_shards(args.model)
-    cfg = AutoConfig.from_pretrained(args.model)
+    cfg = load_cfg(args.model)
     os.makedirs(args.out, exist_ok=True)
     # config.json passthrough so the emitter's cfg_glm parses the same dims.
     with open(os.path.join(args.model, "config.json")) as f:

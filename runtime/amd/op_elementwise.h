@@ -167,27 +167,44 @@ __device__ __forceinline__ unsigned long long block_max_u64(unsigned long long v
     return part[0];
 }
 
-/* Per-block partial. `part` needs no zeroing: every block writes its own slot unconditionally. */
+/* Per-block partial. `part` needs no zeroing: every block writes its own slot unconditionally.
+ *
+ * BATCH>1 (mirrors runtime/nvidia/op_elementwise.cuh): logits are [n_batch][n] and each sequence
+ * gets its OWN argmax — one token per sequence, no cross-sequence bleed. `part` is
+ * [n_batch][nblk]; the packed index stays inside the sequence's own [0,n) vocab row.
+ * n_batch == 0/1 is byte-identical (part[slice]). Without this the batched decode dispatch
+ * sampled sequence 0 only and left every other sequence's `in.ids` slot untouched. */
 __device__ void d_argmax(unsigned long long* __restrict__ part, const bf16* __restrict__ x,
-                         unsigned n, unsigned slice, unsigned nblk, unsigned long long* lds) {
+                         unsigned n, unsigned n_batch, unsigned slice, unsigned nblk,
+                         unsigned long long* lds) {
     const auto* xg = as_glob(x);
-    unsigned long long best = 0;
-    for (unsigned i = slice * PLOW_THREADS + threadIdx.x; i < n; i += nblk * PLOW_THREADS) {
-        const unsigned long long p = amax_pack(xg[i], i);
-        best = p > best ? p : best;
+    const unsigned B = n_batch ? n_batch : 1u;
+    for (unsigned b = 0; b < B; b++) {
+        const auto* xb = xg + (size_t)b * n;
+        unsigned long long best = 0;
+        for (unsigned i = slice * PLOW_THREADS + threadIdx.x; i < n; i += nblk * PLOW_THREADS) {
+            const unsigned long long p = amax_pack(xb[i], i);
+            best = p > best ? p : best;
+        }
+        best = block_max_u64(best, lds);
+        if (threadIdx.x == 0) as_glob(part)[(size_t)b * nblk + slice] = best;
     }
-    best = block_max_u64(best, lds);
-    if (threadIdx.x == 0) as_glob(part)[slice] = best;
 }
 
-/* Fold the per-block partials and write the token id where the next step's EMBED will read it. */
+/* Fold the per-block partials and write each sequence's token id where the next step's EMBED
+ * reads it. BATCH>1: ids[b] gets sequence b's token; `part` is [n_batch][nparts].
+ * n_batch == 0/1 is byte-identical (ids[0] from part[0..nparts)). */
 __device__ void d_argmax_fin(int* __restrict__ ids, const unsigned long long* __restrict__ part,
-                             unsigned nparts, unsigned slice) {
+                             unsigned nparts, unsigned n_batch, unsigned slice) {
     if (slice != 0 || threadIdx.x != 0) return;
     const auto* pg = as_glob(part);
-    unsigned long long best = 0;
-    for (unsigned i = 0; i < nparts; i++) best = pg[i] > best ? pg[i] : best;
-    as_glob(ids)[0] = (int)~(unsigned)(best & 0xFFFFFFFFull);
+    const unsigned B = n_batch ? n_batch : 1u;
+    for (unsigned b = 0; b < B; b++) {
+        const auto* pb = pg + (size_t)b * nparts;
+        unsigned long long best = 0;
+        for (unsigned i = 0; i < nparts; i++) best = pb[i] > best ? pb[i] : best;
+        as_glob(ids)[b] = (int)~(unsigned)(best & 0xFFFFFFFFull);
+    }
 }
 
 #endif /* PLOW_OP_ELEMENTWISE_H */

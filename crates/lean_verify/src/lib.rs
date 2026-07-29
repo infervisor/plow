@@ -87,6 +87,66 @@ pub enum VerifyError {
     NotImplemented(&'static str),
 }
 
+impl VerifyError {
+    /// True when the failure means "there is no usable `plow_verify` on this
+    /// machine", as opposed to "the verifier looked at this program and said
+    /// no".
+    ///
+    /// THIS PREDICATE IS THE SAFETY MECHANISM for default-on verification, not
+    /// [`binary_available`]. A caller that runs the gate by default must
+    /// downgrade exactly this class to a warning and record the skip; every
+    /// other error, and every `ok == false` certificate, is a real finding and
+    /// must fail loudly.
+    ///
+    /// The three shapes it covers, all observed in this repo:
+    ///   * `BinaryNotFound` — `PLOW_VERIFY_BIN` points at a non-file.
+    ///   * `Spawn` — nothing at that path / no `+x` bit / wrong ELF class.
+    ///     `locate_binary` falls back to the bare name `plow_verify`, so a
+    ///     plain "not on PATH" arrives here and NOT as `BinaryNotFound`.
+    ///   * a deserialize failure with EMPTY stdout — the process started and
+    ///     produced nothing. `lean-plow`'s binary links a `/nix/store` ELF
+    ///     interpreter, so outside `nix develop` it dies with exit 127 before
+    ///     `main`; that is an unusable binary, not a protocol error. A genuine
+    ///     rejection always comes back as JSON, so a NON-empty stdout that
+    ///     fails to parse stays a hard error.
+    pub fn is_binary_unusable(&self) -> bool {
+        match self {
+            VerifyError::BinaryNotFound(_) | VerifyError::Spawn(_) => true,
+            VerifyError::DeserializeCertificate(_, out)
+            | VerifyError::DeserializeQueryResult(_, out) => out.trim().is_empty(),
+            _ => false,
+        }
+    }
+}
+
+/// Cheap probe: does something that looks like `plow_verify` exist here?
+///
+/// **THIS IS AN OPTIMISATION, NOT THE SAFETY MECHANISM.** `is_file()` (or a
+/// PATH hit) does not mean runnable: wrong architecture, no `+x` bit, missing
+/// Lean runtime shared objects, or the `/nix/store` ELF-interpreter trap above
+/// all pass this probe and then fail at spawn. The real net is the caller
+/// downgrading [`VerifyError::is_binary_unusable`] to a warning.
+///
+/// What this probe is FOR: letting a default-on caller skip the *preparation*
+/// work whose only consumer is the verifier — the egglog fusion report, and
+/// marshaling an entire GQ stream into a `ScheduleRequest` — instead of
+/// building it and throwing it away.
+///
+/// DO NOT "simplify" this by deleting the error downgrade and trusting the
+/// probe. A present-but-broken binary would then take every compile from
+/// "warn and skip" to "hard failure", which is precisely the regression this
+/// split exists to prevent.
+pub fn binary_available() -> bool {
+    let Ok(p) = locate_binary() else { return false };
+    if p.components().count() > 1 {
+        return p.is_file();
+    }
+    // Bare name: `locate_binary`'s PATH fallback. Resolve it the way `Command`
+    // would, so the probe answers the same question the spawn will ask.
+    let Ok(path) = std::env::var("PATH") else { return false };
+    std::env::split_paths(&path).any(|d| d.join(&p).is_file())
+}
+
 fn locate_binary() -> Result<PathBuf, VerifyError> {
     if let Ok(p) = std::env::var("PLOW_VERIFY_BIN") {
         let path = PathBuf::from(p);
@@ -232,5 +292,55 @@ pub fn require(checkpoint: &str, payload: serde_json::Value) -> Result<Certifica
         Err(VerifyError::Rejected(
             cert.reason.unwrap_or_else(|| "no reason".into()),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole point of [`VerifyError::is_binary_unusable`]: it must split
+    /// "there is no working verifier here" (degrade, warn, record the skip)
+    /// from "the verifier read this program and said no" (fail loudly).
+    ///
+    /// Wrong in the permissive direction and a REJECTION — a real bug caught —
+    /// becomes a warning nobody reads.
+    #[test]
+    fn only_unusable_binary_failures_are_downgradable() {
+        let io = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(VerifyError::BinaryNotFound("/nope".into()).is_binary_unusable());
+        assert!(VerifyError::Spawn(io()).is_binary_unusable());
+
+        // A rejection is a FINDING, never a skip.
+        assert!(!VerifyError::Rejected("cycle in ordering graph".into()).is_binary_unusable());
+        assert!(!VerifyError::QueryFailed("bad request".into()).is_binary_unusable());
+        assert!(!VerifyError::NotImplemented("C").is_binary_unusable());
+    }
+
+    /// The exit-127 trap: `lean-plow`'s binary links a `/nix/store` ELF
+    /// interpreter, so outside `nix develop` it dies before `main` and returns
+    /// EMPTY stdout. That is an unusable binary. Stdout with content that does
+    /// not parse is a protocol error and stays hard — a rejection always
+    /// arrives as JSON.
+    #[test]
+    fn empty_stdout_is_an_unusable_binary_but_garbage_stdout_is_not() {
+        let bad = || serde_json::from_str::<Certificate>("x").unwrap_err();
+        assert!(VerifyError::DeserializeCertificate(bad(), String::new()).is_binary_unusable());
+        assert!(VerifyError::DeserializeCertificate(bad(), "  \n".into()).is_binary_unusable());
+        assert!(!VerifyError::DeserializeCertificate(bad(), "{\"ok\":".into()).is_binary_unusable());
+    }
+
+    /// The probe is an OPTIMISATION and may be wrong optimistically (a
+    /// present-but-unrunnable binary passes it — that is what the downgrade
+    /// above is for). It must not be wrong the other way for the one case it
+    /// can answer exactly: an explicit `PLOW_VERIFY_BIN` that is not a file.
+    #[test]
+    fn an_explicit_binary_path_that_does_not_exist_fails_the_probe() {
+        // The only test in this crate touching this var; `locate_binary` reads
+        // it directly, so there is nothing to inject it through.
+        std::env::set_var("PLOW_VERIFY_BIN", "/nonexistent/plow_verify");
+        assert!(!binary_available());
+        assert!(matches!(locate_binary(), Err(VerifyError::BinaryNotFound(_))));
+        std::env::remove_var("PLOW_VERIFY_BIN");
     }
 }

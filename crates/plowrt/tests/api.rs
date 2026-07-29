@@ -124,9 +124,25 @@ async fn stream_completion_terminates() {
         .filter(|data| *data != "[DONE]")
         .map(|data| serde_json::from_str(data).unwrap())
         .collect();
+    // The `role` delta RIDES THE FIRST TOKEN — it is not a frame of its own.
+    //
+    // This assertion used to be the exact opposite (`content` absent from frame
+    // 0), which pinned a measurement artefact as if it were the API contract.
+    // `vllm bench serve` stamps TTFT on the first chunk carrying a `choices`
+    // array, whatever is in it (`backend_request_func.py`), so a role-only frame
+    // emitted at request arrival stamps TTFT at arrival. Measured on gfx950 with
+    // a 7013-token prompt: role frame at 7.1 ms, first real token at 1322 ms —
+    // a 188x understatement, and plow-specific, because vLLM sends nothing
+    // before its first token. Removed in 63f9957; this test is what stops it
+    // coming back.
     let first_delta = &frames[0]["choices"][0]["delta"];
     assert_eq!(first_delta["role"], "assistant");
-    assert!(first_delta.get("content").is_none());
+    assert!(
+        first_delta["content"].is_string(),
+        "the first streamed chunk must carry a REAL TOKEN, not just the role: a \
+         chunk with a `choices` array and no content still stamps the client's \
+         TTFT. Got {first_delta}"
+    );
     let second_delta = &frames[1]["choices"][0]["delta"];
     assert!(second_delta.get("role").is_none());
     assert!(second_delta["content"].is_string());

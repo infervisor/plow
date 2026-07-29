@@ -25,6 +25,75 @@ use core::mem::size_of;
 use crate::dev::{DevInst, DevOp, StreamEnt, Wait, SE_FINE, TENSOR_NONE};
 use crate::rope::GenTensor;
 
+/// The tuning-store key for one decode-GEMV shape.
+///
+/// Deliberately the same grammar as `tunedb::gemm_op_case` — `"<family>/<m>x<n>x<k>/<quant>"` —
+/// so the two families sort together in one `kernel_measurement.jsonl` and a reader can tell
+/// which phase a record belongs to from the key alone.
+///
+/// It lives in `packet` rather than in `tunedb` for the reason `tunedb`'s own `Cargo.toml`
+/// gives for the GEMM twin, applied one crate lower: the thing that PRODUCES these keys is
+/// [`Builder::emit_dep`], and `packet` has no dependencies by design. `tunedb` re-exports it,
+/// so there is still exactly one definition.
+pub fn gemv_op_case(family: &str, m: u32, n: u32, k: u32, quant: &str) -> String {
+    format!("{family}/{m}x{n}x{k}/{quant}")
+}
+
+/// Op cases the GEMV tuning store can answer for, installed once by the emitter.
+///
+/// `packet` cannot read the store (no dependencies, and `tunedb` sits above it), so the
+/// answer is pushed down instead of pulled up. Empty/unset means "no store" and every shape
+/// reports `MISS`, which is the honest cold-start reading and the one the GEMM path took for
+/// GLM-5.2 for the whole campaign before anyone looked.
+static TUNED_GEMV_CASES: std::sync::OnceLock<std::collections::HashSet<String>> =
+    std::sync::OnceLock::new();
+
+/// Install the set of GEMV op cases the store holds qualified, non-stale records for.
+///
+/// Idempotent by construction ([`std::sync::OnceLock`]); a second call is ignored, because a
+/// compile is a process and the store is read once.
+pub fn set_tuned_gemv_cases(cases: std::collections::HashSet<String>) {
+    let _ = TUNED_GEMV_CASES.set(cases);
+}
+
+/// `PLOW_TUNE_DUMP=1` -> one `TUNEDUMP_GEMV` line per emitted decode-GEMV op.
+///
+/// # This is the whole point, so it is stated here and not in a script
+///
+/// `scripts/rebench_tune_gemm.sh`'s shape list was hand-authored, and GLM-5.2 prefill was
+/// therefore 100% unmeasured for as long as the tuner existed — every lookup missed, while
+/// the differential test kept passing because SOME qualified record existed for SOME model.
+/// It was invisible from outside: the calibration tier still read "measured". `PLOW_TUNE_DUMP`
+/// on the GEMM path is what made it visible, and re-deriving the list from the dump is what
+/// stops it recurring.
+///
+/// The GEMV path had no dump at all, no store, and no selection function — so its campaign
+/// list would have had to be hand-authored from scratch, which is the same mistake with a
+/// clean sheet of paper. This hook is placed in [`Builder::emit_dep`], the one function every
+/// emitter in `devgen` funnels through, so the census is DERIVED: a GEMV emit site added
+/// tomorrow appears in it without anyone remembering to instrument it.
+///
+/// Line format, chosen so `sort -u` over the dump IS the campaign list:
+/// ```text
+/// TUNEDUMP_GEMV <m> <n> <k> <quant> <PLOW_DOP_...> <HIT|MISS>
+/// ```
+fn tune_dump_gemv(op: DevOp, inst: &DevInst) {
+    if std::env::var("PLOW_TUNE_DUMP").ok().as_deref() != Some("1") {
+        return;
+    }
+    let Some((fam, m, n, k, quant)) = op.gemv_case(&inst.i) else {
+        return;
+    };
+    let hit = TUNED_GEMV_CASES
+        .get()
+        .is_some_and(|s| s.contains(&gemv_op_case(fam, m, n, k, quant)));
+    eprintln!(
+        "TUNEDUMP_GEMV {m} {n} {k} {quant} {} {}",
+        op.c_name(),
+        if hit { "HIT" } else { "MISS" }
+    );
+}
+
 /// A tensor the program refers to by handle. The runtime allocates it and fills the
 /// device pointer table; the program only ever sees the handle.
 ///
@@ -77,6 +146,28 @@ impl Dep {
     }
 }
 
+/// Slice-level locality census — see [`Builder::locality_census_stats`].
+#[derive(Clone, Debug)]
+struct LocalityCensus {
+    ops: usize,
+    slices: u64,
+    domains: usize,
+    map_name: &'static str,
+    /// Slice-level producer→consumer pairs in the whole program.
+    pairs: u64,
+    /// Of those, the ones on an edge where the consumer slice reads EVERY producer slice.
+    all_to_all_pairs: u64,
+    /// Same-domain pairs under the emitted mapping (`L2Layout::domain_of`).
+    same_current: u64,
+    /// Same-domain pairs under a greedy predecessor-affinity pass under a balance cap.
+    same_greedy: u64,
+    /// Same-domain pairs if each consumer slice could pick its own best domain with producers
+    /// pinned and balance ignored — an unachievable upper bound, useful as a ceiling.
+    same_ceiling: u64,
+    moved_slices: u64,
+    moved_ops: u64,
+}
+
 /// One op, before flattening.
 struct Op {
     inst: DevInst,
@@ -86,37 +177,131 @@ struct Op {
     work: Vec<u32>, // per-slice cost, from the cost model. See `select_granularity`.
 }
 
+/// How the hardware maps a LOGICAL workgroup index to an L2 locality domain.
+///
+/// This is the single fact the whole placement feature rests on, and the two vendors do not
+/// agree — so it is carried as data rather than assumed. `interp`'s `cu` is `blockIdx.x`, a
+/// logical index; the domain a packet is placed in has to be the domain the hardware will
+/// actually run that workgroup on, or placement destroys locality instead of creating it while
+/// still emitting perfectly correct tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum L2Map {
+    /// Workgroup *n* -> domain `n / sms_per_partition`. NVIDIA: consecutive blocks fill a GPC
+    /// before moving to the next.
+    Block,
+    /// Workgroup *n* -> domain `n % partition_count`. AMD CDNA3/CDNA4: the hardware dispatcher
+    /// assigns workgroups to XCDs round-robin.
+    ///
+    /// **Measured on MI355X** (`runtime/tests/xcd_map_gfx950_test.hip`, `HW_REG_XCC_ID` per
+    /// workgroup): `n % 8` predicts the true XCC id for **100.0%** of workgroups across every
+    /// geometry probed — 256x512 at occupancy 1 (the interpreter's decode grid), 512 blocks at
+    /// occupancy 2, 64 blocks, 256 threads at occupancy 4 — and reproducibly across launches.
+    /// `n / 32` scores 12.5%, which is just the coincidence `n/32 == n%8`, not partial
+    /// correctness. At 256 blocks / occ 1 the 32 workgroups of each XCD sit on 32 DISTINCT
+    /// physical CUs, so a domain really is a 32-CU / 4 MiB-L2 group.
+    RoundRobin,
+}
+
+/// The L2 partition geometry a program is placed against, plus how workgroups reach it.
+///
+/// `sms` and `domains` come from `hwspec::GpuSpec::l2_partitioning` (XCD on MI300/MI350, GPC on
+/// H100/B200) — not from an env-supplied constant. `map` comes from the target vendor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct L2Layout {
+    /// SMs/CUs per L2 partition. Only the [`L2Map::Block`] formula divides by it; under
+    /// [`L2Map::RoundRobin`] it is carried for reporting and for the runtime's own checks.
+    pub sms: u32,
+    /// Number of L2 partitions — the domain count, and the number of `gq_seg_ofs` windows.
+    pub domains: u32,
+    pub map: L2Map,
+}
+
+impl L2Layout {
+    /// The locality domain of logical workgroup `cu`. Always in `0..domains`.
+    #[inline]
+    pub fn domain_of(&self, cu: u32) -> u32 {
+        match self.map {
+            L2Map::Block => cu / self.sms.max(1),
+            L2Map::RoundRobin => cu % self.domains.max(1),
+        }
+    }
+}
+
 pub struct Builder {
     n_cu: u32,
     ops: Vec<Op>,
     tensors: Vec<TensorDecl>,
     gen: Vec<GenTensor>,
-    /// L2-domain-aware placement (`PLOW_NV_PLACE`): `(sms_per_partition,
-    /// partition_count)` of the target GPU (XCD on MI300/MI350, GPC on
-    /// H100/B200). `None` ⇒ off; the blob is byte-identical and `seg` keeps its
-    /// wave-class meaning. When set, [`Builder::finish`] repurposes the `seg`
-    /// field as a **locality domain** `0..P` and groups `gq_stream` by domain, so
-    /// a physical-SM-aware interp (a cluster/HW_ID cursor per domain) can pull
-    /// only its domain's packets. The `cus` sets are NOT touched — placement is
-    /// dynamic (cursor-claimed) at runtime, so it cannot regress disjoint
-    /// `Builder::split` placements. See `plans/devblob-locality-placement.md`.
-    place_l2: Option<(u32, u32)>,
+    /// L2-domain-aware placement (`PLOW_L2_PLACE`). `None` ⇒ off; the blob is
+    /// byte-identical and `seg` keeps its wave-class meaning. When set,
+    /// [`Builder::finish`] repurposes the `seg` field as a **locality domain**
+    /// `0..P` and groups `gq_stream` by domain, so a physical-SM-aware interp
+    /// (a cluster/XCC_ID cursor per domain) can pull only its domain's packets.
+    /// The `cus` sets are NOT touched — placement is dynamic (cursor-claimed) at
+    /// runtime, so it cannot regress disjoint `Builder::split` placements.
+    /// See `plans/l2-placement-generic.md`.
+    place_l2: Option<L2Layout>,
+    /// The target cannot honour `PLOW_UNISEG` — set by an emitter that knows what it is building
+    /// for. See [`Builder::deny_uniseg`].
+    uniseg_denied: bool,
+    /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
+    /// byte-identical. See [`Builder::set_gemv_split`].
+    gemv_split: u32,
 }
 
 impl Builder {
     pub fn new(n_cu: u32) -> Self {
-        Self { n_cu, ops: Vec::new(), tensors: Vec::new(), gen: Vec::new(), place_l2: None }
+        Self {
+            n_cu,
+            ops: Vec::new(),
+            tensors: Vec::new(),
+            gen: Vec::new(),
+            place_l2: None,
+            uniseg_denied: false,
+            gemv_split: 1,
+        }
     }
 
-    /// Enable L2-domain-aware placement: `(sms_per_partition, partition_count)`
-    /// from `hwspec::GpuSpec::l2_partitioning`. `None` (default) leaves the
-    /// wave-class `seg` and a byte-identical blob. [`Builder::finish`] skips
-    /// placement (byte-identical) if `n_cu > partition_count·sms` — occupancy>1
-    /// (`n_cu == 2·sm_count`) or a grid≠sm_count mismatch, where `cu/sms` would
-    /// exceed the runtime's `partition_count` domains and orphan packets. See
-    /// the field docs and `plans/devblob-locality-placement.md`.
-    pub fn set_l2_placement(&mut self, layout: Option<(u32, u32)>) {
+    /// Enable L2-domain-aware placement from `hwspec::GpuSpec::l2_partitioning` plus the
+    /// target's workgroup->domain map. `None` (default) leaves the wave-class `seg` and a
+    /// byte-identical blob.
+    ///
+    /// [`Builder::finish`] may still decline: under [`L2Map::Block`] if `n_cu > domains·sms`
+    /// (occupancy>1 or a grid≠sm_count mismatch, where `cu/sms` would exceed the runtime's
+    /// domain count and orphan packets), and on any program with more than one wave class,
+    /// where `seg` is already carrying information placement would destroy. Both fall back
+    /// byte-identical. See the field docs and `plans/l2-placement-generic.md`.
+    pub fn set_l2_placement(&mut self, layout: Option<L2Layout>) {
         self.place_l2 = layout;
+    }
+
+    /// Refuse to honour `PLOW_UNISEG` for this program, whatever the environment says.
+    ///
+    /// `PLOW_UNISEG` collapses every op into one segment. That is harmless on sm_120 — its
+    /// interpreter runs the whole program in one cooperative launch at a fixed block size and never
+    /// reads a wave class — and DESTRUCTIVE on gfx950, where the host relaunches once per segment
+    /// and reads the class back from `seg`. With one segment, the segment contains flash packets,
+    /// the host dispatches the entire prefill program on the 4-wave flash object, and that object's
+    /// body is `if (op == FLASH_PREFILL…)` with no switch: every GEMM, norm and lm_head is silently
+    /// dropped and the logits come back zero.
+    ///
+    /// The POLICY lives with the caller because only the caller knows the target; this type just
+    /// honours it. Same split as [`Builder::set_l2_placement`], and for the same reason: a flag
+    /// whose meaning depends on the backend cannot be resolved in a backend-agnostic builder.
+    pub fn deny_uniseg(&mut self) {
+        self.uniseg_denied = true;
+    }
+
+    /// Slice the machine-filling `Gemv` / `GemvGlu` / `GemvQkv` packets into `s * n_cu` shares
+    /// instead of `n_cu`. 1 (default) ⇒ byte-identical.
+    ///
+    /// DECODE ONLY, and the caller decides — exactly as [`Builder::deny_uniseg`] does, because
+    /// only the caller knows which program it is emitting. A `Gemv` also appears in a PREFILL
+    /// bucket (the lm_head row), where it is one packet on a program whose other 895 are GEMMs,
+    /// and re-slicing it there is measured to cost 162 → 1222 ms of prefill at `s = 4`.
+    /// See `PLOW_GEMV_SPLIT` in `devgen` for the knob and the measurement.
+    pub fn set_gemv_split(&mut self, s: u32) {
+        self.gemv_split = s.clamp(1, 16);
     }
 
     /// Declare a tensor and get its handle.
@@ -203,6 +388,8 @@ impl Builder {
             j: [0; 2],
         };
         f(&mut inst);
+        // AFTER the closure: the immediates do not exist until it has run.
+        tune_dump_gemv(op, &inst);
         let counter = self.ops.len() as u32;
         // Uniform by default: an op that does not tell the builder its per-slice costs is
         // assumed balanced, which makes `select_granularity` fall back to coarse counters.
@@ -332,6 +519,179 @@ impl Builder {
         (kept, downgraded)
     }
 
+    /// Slice-level locality census (`PLOW_PLACE_REPORT=1`). Diagnostic; changes nothing.
+    ///
+    /// **The question a locality-aware placement pass has to answer before it is written.**
+    /// A same-domain placement can only pay where a consumer slice's producer set is SPARSE. If
+    /// a consumer slice reads EVERY producer slice — which is what a surviving `Dep::Coarse`
+    /// means, and what a reduction like a GEMV reading the whole activation vector *is* — then
+    /// its reads are spread across every domain by construction, and no assignment beats the
+    /// uniform `1/domains`. Concentrating the producer instead just moves the imbalance.
+    ///
+    /// Run after `select_granularity`, so the fine/coarse decisions are the final ones.
+    ///
+    /// Reported:
+    /// * the slice-pair census split by all-to-all vs sparse edges — **placement-independent**,
+    ///   so it bounds every possible pass, not just the one simulated here;
+    /// * same-domain pairs under the CURRENT mapping (`L2Layout::domain_of(cus[slice])`);
+    /// * same-domain pairs under a greedy predecessor-affinity pass — `passes.rs`'s
+    ///   `pred_locality_hint` rule (majority domain over already-placed predecessors), under the
+    ///   balance cap every dispatcher is subject to (`ceil(slices/domains)` per domain, because
+    ///   each XCD runs its own fixed share of the grid and an unbalanced pass idles hardware);
+    /// * how many slices and ops that pass MOVES.
+    fn locality_census(&self, l2: Option<L2Layout>) {
+        let c = self.locality_census_stats(l2);
+        let pairs = c.pairs;
+        let pct = |x: u64| if pairs == 0 { 0.0 } else { 100.0 * x as f64 / pairs as f64 };
+        eprintln!(
+            "  locality census ({} ops, {} slices, {} domains, map {}):",
+            c.ops, c.slices, c.domains, c.map_name
+        );
+        eprintln!(
+            "    slice-level producer->consumer pairs: {pairs}  \
+             ({:.1}% on ALL-TO-ALL edges, where 1/{} = {:.1}% is the ceiling for ANY placement)",
+            pct(c.all_to_all_pairs),
+            c.domains,
+            100.0 / c.domains as f64
+        );
+        eprintln!(
+            "    same-domain pairs: current {:.2}%  |  greedy pred-affinity {:.2}%  |  \
+             per-slice argmax ceiling {:.2}% (producers pinned as-is, balance ignored)",
+            pct(c.same_current),
+            pct(c.same_greedy),
+            pct(c.same_ceiling)
+        );
+        eprintln!(
+            "    greedy moves {}/{} slices in {}/{} ops",
+            c.moved_slices, c.slices, c.moved_ops, c.ops
+        );
+    }
+
+    /// The numbers behind [`Builder::locality_census`]. Split out so the invariant the census
+    /// exists to expose is a unit test rather than a line of stderr.
+    fn locality_census_stats(&self, l2: Option<L2Layout>) -> LocalityCensus {
+        let layout = l2.unwrap_or(L2Layout { sms: 32, domains: 8, map: L2Map::RoundRobin });
+        let dc = layout.domains.max(1) as usize;
+        let n = self.ops.len();
+
+        // Current per-slice domain — what `finish` writes into `StreamEnt::seg`.
+        let cur: Vec<Vec<usize>> = self
+            .ops
+            .iter()
+            .map(|o| o.cus.iter().map(|&c| layout.domain_of(c) as usize).collect())
+            .collect();
+
+        // Greedy predecessor-affinity, ops in emission order (which is topological).
+        let mut greedy: Vec<Vec<usize>> = Vec::with_capacity(n);
+        for op in &self.ops {
+            let ns = op.cus.len();
+            let cap = ns.div_ceil(dc);
+            let mut load = vec![0usize; dc];
+            let mut asg = vec![0usize; ns];
+            let mut pref: Vec<Vec<u32>> = Vec::with_capacity(ns);
+            for s in 0..ns {
+                let mut counts = vec![0u32; dc];
+                for dep in &op.deps {
+                    let p = dep.producer() as usize;
+                    match dep {
+                        Dep::Coarse(_) => {
+                            for &d in &greedy[p] {
+                                counts[d] += 1;
+                            }
+                        }
+                        Dep::Fine { map, .. } => {
+                            for &ps in &map[s] {
+                                counts[greedy[p][ps as usize]] += 1;
+                            }
+                        }
+                    }
+                }
+                pref.push(counts);
+            }
+            // Strongest preference first, so a slice that really wants one domain claims it
+            // before the cap fills with slices that were indifferent anyway.
+            let mut order: Vec<usize> = (0..ns).collect();
+            order.sort_by_key(|&s| {
+                let c = &pref[s];
+                let mx = c.iter().copied().max().unwrap_or(0) as u64;
+                let tot: u64 = c.iter().map(|&x| x as u64).sum();
+                (std::cmp::Reverse(mx * dc as u64 - tot.min(mx * dc as u64)), s)
+            });
+            for s in order {
+                let c = &pref[s];
+                let best = (0..dc)
+                    .filter(|&d| load[d] < cap)
+                    .max_by_key(|&d| (c[d], std::cmp::Reverse(d)))
+                    .unwrap_or(0);
+                asg[s] = best;
+                load[best] += 1;
+            }
+            greedy.push(asg);
+        }
+
+        let (mut pairs, mut a2a) = (0u64, 0u64);
+        let (mut same_cur, mut same_greedy, mut ceil_pairs) = (0u64, 0u64, 0u64);
+        let (mut moved_slices, mut moved_ops, mut slices) = (0u64, 0u64, 0u64);
+        for (i, op) in self.ops.iter().enumerate() {
+            slices += op.cus.len() as u64;
+            let mut op_moved = false;
+            for s in 0..op.cus.len() {
+                if greedy[i][s] != cur[i][s] {
+                    moved_slices += 1;
+                    op_moved = true;
+                }
+                // Best a consumer slice could do with its producers held where they are.
+                let mut by_dom = vec![0u64; dc];
+                for dep in &op.deps {
+                    let p = dep.producer() as usize;
+                    let pn = self.ops[p].cus.len();
+                    let sparse = match dep {
+                        Dep::Coarse(_) => false,
+                        Dep::Fine { map, .. } => map[s].len() < pn,
+                    };
+                    let plist: Vec<u32> = match dep {
+                        Dep::Coarse(_) => (0..pn as u32).collect(),
+                        Dep::Fine { map, .. } => map[s].clone(),
+                    };
+                    pairs += plist.len() as u64;
+                    if !sparse {
+                        a2a += plist.len() as u64;
+                    }
+                    for &ps in &plist {
+                        by_dom[cur[p][ps as usize]] += 1;
+                        if cur[p][ps as usize] == cur[i][s] {
+                            same_cur += 1;
+                        }
+                        if greedy[p][ps as usize] == greedy[i][s] {
+                            same_greedy += 1;
+                        }
+                    }
+                }
+                ceil_pairs += by_dom.iter().copied().max().unwrap_or(0);
+            }
+            if op_moved {
+                moved_ops += 1;
+            }
+        }
+
+        LocalityCensus {
+            ops: n,
+            slices,
+            domains: dc,
+            map_name: match layout.map {
+                L2Map::Block => "block",
+                L2Map::RoundRobin => "round-robin",
+            },
+            pairs,
+            all_to_all_pairs: a2a,
+            same_current: same_cur,
+            same_greedy,
+            same_ceiling: ceil_pairs,
+            moved_slices,
+            moved_ops,
+        }
+    }
+
     /// Flatten into the tables the interpreter walks.
     ///
     /// # Counter layout
@@ -358,25 +718,34 @@ impl Builder {
         let n_cu = self.n_cu as usize;
         let n_ops = self.ops.len();
 
-        // Effective L2-domain placement (PLOW_NV_PLACE), with the occupancy-1
-        // coverage guard: every slice's domain is `cu / sms`, which must be < P
-        // so it matches the runtime's `smid / sms` in [0, P). `n_cu > P·sms`
-        // means occupancy>1 (n_cu = 2·sm_count) or a grid≠sm_count mismatch —
-        // placement would emit domain windows the runtime never pulls (orphaned
-        // packets -> deadlock). Skip it and fall back byte-identical.
-        let l2_place: Option<(u32, u32)> = self.place_l2.and_then(|(sms, p)| {
-            if sms == 0 || p == 0 {
+        // Effective L2-domain placement (PLOW_L2_PLACE) — geometry half. The wave-class half
+        // needs `cur_seg` and is applied below, once segmentation is known.
+        //
+        // The COVERAGE GUARD is specific to `L2Map::Block`: there a slice's domain is `cu / sms`,
+        // which must be < P so it matches the runtime's `smid / sms` in [0, P). `n_cu > P·sms`
+        // means occupancy>1 (n_cu = 2·sm_count) or a grid≠sm_count mismatch — placement would
+        // emit domain windows the runtime never pulls (orphaned packets -> deadlock). Skip it and
+        // fall back byte-identical.
+        //
+        // `L2Map::RoundRobin` needs no such guard: `cu % P` is in [0, P) by construction, and the
+        // probe MEASURED round-robin still holding at occupancy 2 (512 blocks, 100.0%). Applying
+        // the block guard there would have silently disabled placement on exactly the occ-2
+        // configs it is safe for.
+        let mut l2_place: Option<L2Layout> = self.place_l2.and_then(|l| {
+            if l.sms == 0 || l.domains == 0 {
                 None
-            } else if self.n_cu > p * sms {
+            } else if l.map == L2Map::Block && self.n_cu > l.domains * l.sms {
                 eprintln!(
-                    "  l2 placement SKIPPED: n_cu {} > {p} domains × {sms} SM = {} \
-                     (occupancy>1 or grid≠sm_count) — byte-identical",
+                    "  l2 placement SKIPPED: n_cu {} > {} domains × {} SM = {} \
+                     (occupancy>1 or grid≠sm_count, block map) — byte-identical",
                     self.n_cu,
-                    p * sms
+                    l.domains,
+                    l.sms,
+                    l.domains * l.sms
                 );
                 None
             } else {
-                Some((sms, p))
+                Some(l)
             }
         });
 
@@ -387,6 +756,93 @@ impl Builder {
             eprintln!(
                 "  counter granularity: {kept} fine edges kept, {downgraded} downgraded to \
                  coarse (homogeneous region — see Plow/CounterGranularity.lean:collapse)"
+            );
+        }
+
+        // CHAIN-BYPASS — a MEASUREMENT INSTRUMENT, numerically WRONG, never shipped.
+        //
+        // knob-contract §7a-REFINED says a serial packet on the decode chain costs ~5.3 us in the
+        // ADDING direction; §7a-CHAIN measured the REMOVING direction with this knob at ~1.4 us.
+        // §6b-i requires pricing a scheduling change with a cheap build that touches only the
+        // schedule before building the real kernel.
+        //
+        // `PLOW_CHAIN_BYPASS=<op>[,<op>...]` (opcode numbers) splices the named ops OUT of the
+        // dependency chain: every consumer that waits on op O instead waits on O's own
+        // predecessors. The op is STILL EMITTED and still runs on the same workgroups, so
+        // packet count, workgroup-packet count, and total memory traffic are IDENTICAL — the
+        // ONLY delta is critical-path depth. That isolates chain length exactly the way §7a's
+        // PLOW_NO_FUSE_QKV isolated gate count.
+        //
+        // It is also the STRICT UPPER BOUND on any partial-completion / tile-granular signalling
+        // scheme on the same edge: bypass is the limit of "the consumer never waits at all".
+        //
+        // Consumers read the op's stale output, so tokens are garbage. That is intended: this
+        // measures scheduling, and wrong numerics are a valid instrument for scheduling.
+        if let Ok(spec) = std::env::var("PLOW_CHAIN_BYPASS") {
+            let want: Vec<u16> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            // Predecessor sets first, so a run of bypassed ops collapses transitively. Only
+            // all-coarse ops are liftable; the DECODE program is entirely coarse (graphstat:
+            // SE_FINE == 0), the prefill programs carry Fine edges and are left untouched —
+            // which is what we want, this prices decode only.
+            let mut lifted: Vec<Option<Vec<u32>>> = vec![None; n_ops];
+            for i in 0..n_ops {
+                if !want.contains(&self.ops[i].inst.op) {
+                    continue;
+                }
+                if self.ops[i].deps.iter().any(|d| !matches!(d, Dep::Coarse(_))) {
+                    continue;
+                }
+                let mut up: Vec<u32> = Vec::new();
+                for d in &self.ops[i].deps {
+                    let Dep::Coarse(c) = d else { unreachable!() };
+                    match &lifted[*c as usize] {
+                        Some(t) => up.extend(t.iter().copied()),
+                        None => up.push(*c),
+                    }
+                }
+                up.sort_unstable();
+                up.dedup();
+                lifted[i] = Some(up);
+            }
+            let mut spliced = 0usize;
+            for i in 0..n_ops {
+                if lifted[i].is_some() {
+                    continue; // the bypassed op keeps its own deps: it must still RUN correctly
+                }
+                let old = std::mem::take(&mut self.ops[i].deps);
+                let mut ds: Vec<Dep> = Vec::new();
+                let mut seen: Vec<u32> = Vec::new();
+                for d in old {
+                    // A Fine consumer edge is left intact: rewriting it to coarse would change
+                    // gate granularity, not just chain depth.
+                    let liftable = match d {
+                        Dep::Coarse(c) => lifted[c as usize].as_ref(),
+                        Dep::Fine { .. } => None,
+                    };
+                    match liftable {
+                        Some(up) => {
+                            spliced += 1;
+                            for &c in up {
+                                if !seen.contains(&c) {
+                                    seen.push(c);
+                                    ds.push(Dep::Coarse(c));
+                                }
+                            }
+                        }
+                        None => {
+                            if !seen.contains(&d.producer()) {
+                                seen.push(d.producer());
+                                ds.push(d);
+                            }
+                        }
+                    }
+                }
+                self.ops[i].deps = ds;
+            }
+            eprintln!(
+                "  CHAIN-BYPASS ops {want:?}: {spliced} consumer edges spliced past \
+                 {} bypassed ops — NUMERICALLY WRONG, measurement only",
+                lifted.iter().filter(|l| l.is_some()).count()
             );
         }
 
@@ -427,7 +883,10 @@ impl Builder {
         // runs EVERY op at a fixed 256-thread (8-warp) block and synchronises the whole program in
         // one cooperative launch under the counter protocol (exactly as the decode program does), so
         // the segment boundary is spurious there and would otherwise force a segmented relaunch path.
-        let uniseg = std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1");
+        // `deny_uniseg` wins over the environment: a target that cannot express one segment must
+        // not be given one because a variable said so. See that method for the failure it prevents.
+        let uniseg = !self.uniseg_denied
+            && std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1");
         let wave_class = |op: u16| -> u8 {
             if uniseg {
                 8
@@ -444,6 +903,54 @@ impl Builder {
                 cur_seg += 1;
             }
             seg_of[i] = cur_seg;
+        }
+
+        // L2 PLACEMENT vs WAVE-CLASS SEGMENTATION: they want the same 16-bit field, and
+        // segmentation wins exactly when it is carrying something SOMEONE READS.
+        //
+        // Two conditions, and both are needed:
+        //
+        // 1. `cur_seg > 0` — the program actually has more than one wave class. A decode program
+        //    has no `FlashPrefill` op, so every op is class 8, `cur_seg` never increments, and
+        //    `seg` is uniformly 0 with nothing in it to destroy.
+        // 2. `uniseg_denied` — the TARGET reads the class back out of `seg`. That is the same
+        //    fact `deny_uniseg` already records, and it is caller knowledge for the same reason:
+        //    only the caller knows the backend. An AMD host relaunches once per segment and reads
+        //    the class from `seg`; the sm_120 interpreter runs the whole program in ONE
+        //    cooperative launch at a fixed block size and never looks at it, which is why
+        //    segmentation is spurious there and placement over it has always been fine.
+        //
+        // Without (2) this would silently disable a shipped NVIDIA feature: an sm_120 prefill
+        // program is wave-class-segmented too, and it is placed today.
+        // Without (1) AMD decode could never be placed — and that is where the lever is (§7b:
+        // 66% of decode packets and 45.5% of the token run on ≤32 effective workgroups).
+        //
+        // What condition (1)+(2) stops: overwriting the classes collapses every op into segment
+        // 0, the host sees flash packets there, dispatches the ENTIRE program on the 4-wave flash
+        // object — whose body is `if (op == FLASH_PREFILL…)` with no switch — and every GEMM,
+        // norm and the lm_head is silently dropped. Prefill "succeeds" in 8.7 ms instead of 72.1
+        // with all-zero logits. This cost three agents a long time to find, because the packet
+        // loads, runs, and differs from a correct one ONLY in this field.
+        //
+        // SKIPPED, not refused: skipping produces the CORRECT packet, which is what the caller
+        // wants — unlike a wrong-precision flag, where ignoring would produce a wrong one.
+        if l2_place.is_some() && cur_seg > 0 && self.uniseg_denied {
+            eprintln!(
+                "  l2 placement SKIPPED: program has {} wave-class segments on a target that \
+                 relaunches per segment, and `seg` carries the class it relaunches at — \
+                 placement would overwrite it and dispatch every op on the flash object. \
+                 Emitting with wave-class segmentation instead.",
+                cur_seg + 1
+            );
+            l2_place = None;
+        }
+        let l2_place = l2_place;
+
+        // Locality census (`PLOW_PLACE_REPORT=1`). Diagnostic only — reads the op DAG, writes
+        // nothing. Answers the question a locality-aware placement pass has to answer FIRST:
+        // how much of this program's slice-level dataflow could same-domain placement capture?
+        if std::env::var("PLOW_PLACE_REPORT").ok().as_deref() == Some("1") {
+            self.locality_census(l2_place);
         }
 
         // SEGMENT-CLASS RE-SLICING (PLOW_SEG_CLASS_SLICE=1, T10). occ-2 makes 2 blocks/SM
@@ -486,6 +993,65 @@ impl Builder {
             }
         }
 
+        // FINER DECODE-GEMV SLICES ([`Builder::set_gemv_split`], the `PLOW_GEMV_SPLIT` knob).
+        // Emit S*n_cu slices for the three wide decode GEMVs instead of n_cu, so a workgroup that
+        // finishes early claims another slice off the global queue instead of waiting at the
+        // barrier. The RATIONALE and the MEASUREMENT live with the knob in `devgen`; this is the
+        // mechanism only.
+        //
+        // WHY THE THREE OPS AND ONLY THEM. `d_gemv`/`d_gemv_glu`/`d_gemv_qkv` are all GV_BLOCKED
+        // and OUTPUT-STATIONARY: slice s owns the contiguous column run [s*per, s*per+per),
+        // per = ceil(N/nblk), and reduces the whole of K inside one wave. Re-slicing therefore
+        // moves which workgroup computes a column and NOTHING else — the K accumulation order is
+        // unchanged, so the logits are BIT-IDENTICAL and the token stream is identical by
+        // construction, not by luck (verified: same md5 over 64 greedy tokens at S=1/2/4).
+        // Ops with a cross-slice epilogue must NOT be listed here: `GemvArgmax` writes one partial
+        // per slice and `ArgmaxFin` folds exactly `all.len()` of them (see devgen `nparts`), so
+        // re-slicing it would silently drop partials.
+        //
+        // Deadlock-freedom is preserved: the streams stay op-major topological and every wait
+        // threshold below is derived from `producer.cus.len()`, so the threshold tracks the new
+        // slice count in lock-step. Fine producers/consumers are skipped for the same reason as
+        // `PLOW_SEG_CLASS_SLICE` above (their per-slice map[] is built for the original count).
+        let gemv_split = self.gemv_split as usize;
+        if gemv_split > 1 {
+            let n_cu_sz = self.n_cu as usize;
+            let mut fine_prod = vec![false; self.ops.len()];
+            for op in &self.ops {
+                for d in &op.deps {
+                    if let Dep::Fine { producer, .. } = d {
+                        fine_prod[*producer as usize] = true;
+                    }
+                }
+            }
+            let wide_gemv = |op: u16| {
+                op == DevOp::Gemv as u16
+                    || op == DevOp::GemvGlu as u16
+                    || op == DevOp::GemvQkv as u16
+            };
+            let mut resliced = 0usize;
+            for i in 0..self.ops.len() {
+                let fills = self.ops[i].cus.len() == n_cu_sz;
+                let has_fine = self.ops[i].deps.iter().any(|d| matches!(d, Dep::Fine { .. }));
+                if wide_gemv(self.ops[i].inst.op) && fills && !has_fine && !fine_prod[i] {
+                    let orig = self.ops[i].cus.clone();
+                    let mut cus = Vec::with_capacity(orig.len() * gemv_split);
+                    for _ in 0..gemv_split {
+                        cus.extend_from_slice(&orig); // cu ids repeat; placement is cursor-claimed
+                    }
+                    self.ops[i].inst.blocks = cus.len() as u16;
+                    self.ops[i].work = vec![1u32; cus.len()];
+                    self.ops[i].cus = cus;
+                    resliced += 1;
+                }
+            }
+            eprintln!(
+                "  gemv split S={gemv_split}: {resliced} gemv/gemv_glu/gemv_qkv packets \
+                 resliced {n_cu_sz} -> {} slices",
+                n_cu_sz * gemv_split
+            );
+        }
+
         for (idx, op) in self.ops.iter().enumerate() {
             let mut inst = op.inst;
 
@@ -517,14 +1083,21 @@ impl Builder {
             for (slice, &cu) in op.cus.iter().enumerate() {
                 let mut e =
                     StreamEnt { inst: idx as u32, slice: slice as u32, ..Default::default() };
-                // L2-domain placement (PLOW_NV_PLACE): `seg` is a PER-SLICE domain
-                // = physical CU / SMs-per-partition, so a full op's slices spread
-                // across every L2 domain (no skew) and slice `s` sits in the same
-                // domain across ops (consumer reads producer from one L2 slice).
-                // A physical-SM interp pulls its domain's gq window. Off ⇒ `seg`
-                // keeps its wave-class meaning (byte-identical).
+                // L2-domain placement (PLOW_L2_PLACE): `seg` is a PER-SLICE domain, so a full
+                // op's slices spread across every L2 domain (no skew) and slice `s` sits in the
+                // same domain across ops (consumer reads producer from one L2 slice). A
+                // physical-SM interp pulls its domain's gq window. Off ⇒ `seg` keeps its
+                // wave-class meaning (byte-identical).
+                //
+                // `domain_of` — NOT an inline `cu / sms`. `cu` here is a LOGICAL workgroup index
+                // (`interp`'s `blockIdx.x`), and only NVIDIA fills a GPC with consecutive blocks.
+                // AMD dispatches workgroups to XCDs round-robin (MEASURED: `n % 8` is 100.0% of
+                // the true `HW_REG_XCC_ID` on MI355X, `n / 32` is 12.5%), so hard-coding the
+                // block formula here would hand every domain-0 packet to workgroups 0..31 that
+                // the hardware has scattered across all eight XCDs — destroying L2 locality
+                // instead of creating it, and emitting perfectly correct tokens while doing it.
                 e.seg = match l2_place {
-                    Some((sms, _)) => (cu / sms) as u16,
+                    Some(l) => l.domain_of(cu) as u16,
                     None => seg_of[idx],
                 };
                 if fine {
@@ -601,7 +1174,7 @@ impl Builder {
         // hardware partition_count), NOT ceil(n_cu/sms) — so the window count
         // always matches the runtime's `smid/sms` domain count.
         let n_seg = match l2_place {
-            Some((_, p)) => p as usize,
+            Some(l) => l.domains as usize,
             None => cur_seg as usize + 1,
         };
         let mut gq_seg_ofs = vec![0u32; n_seg + 1];
@@ -616,10 +1189,12 @@ impl Builder {
             gq_seg_ofs[n_seg] = gq_stream.len() as u32;
         }
 
-        // Static allocation report (PLOW_NV_PLACE): packets (op-slices) per L2
+        // Static allocation report (PLOW_L2_PLACE): packets (op-slices) per L2
         // domain window, and the skew a physical-SM interp would see across
         // partitions. Emitted here so a build surfaces the balance without a GPU.
-        if l2_place.is_some() {
+        // The MAP is printed too, because a placed blob is only as good as that
+        // formula matching the hardware, and it is not visible anywhere else.
+        if let Some(l) = l2_place {
             let per: Vec<u32> = (0..n_seg)
                 .map(|d| gq_seg_ofs[d + 1] - gq_seg_ofs[d])
                 .collect();
@@ -632,9 +1207,14 @@ impl Builder {
             } else {
                 0.0
             };
+            let map = match l.map {
+                L2Map::Block => "block (wg n -> dom n/sms)",
+                L2Map::RoundRobin => "round-robin (wg n -> dom n%domains)",
+            };
             eprintln!(
-                "  l2 placement: {n_seg} domains, packets/domain {per:?}, skew {skew:.1}% \
-                 (max {hi} vs min {lo})"
+                "  l2 placement: {n_seg} domains × {} SM, map {map}, packets/domain {per:?}, \
+                 skew {skew:.1}% (max {hi} vs min {lo})",
+                l.sms
             );
         }
 
@@ -650,10 +1230,93 @@ impl Builder {
             tensors: self.tensors,
             gq_stream,
             gq_seg_ofs,
-            l2_sms: l2_place.map(|(s, _)| s).unwrap_or(0),
-            l2_domains: l2_place.map(|(_, p)| p).unwrap_or(0),
+            l2_sms: l2_place.map(|l| l.sms).unwrap_or(0),
+            l2_domains: l2_place.map(|l| l.domains).unwrap_or(0),
         }
     }
+}
+
+/// Per-(CU, segment) window bounds into each CU's OWN stream slice — the static
+/// interpreter's analogue of [`Program::gq_seg_ofs`].
+///
+/// Returns `[n_cu][n_seg+1]` `u32` in row-major order: CU `cu`'s segment `s`
+/// occupies entries `[row[s], row[s+1])` of `stream[stream_ofs[cu] ..
+/// stream_ofs[cu]+stream_len[cu]]`, with `row = &out[cu*(n_seg+1)..]`. The
+/// indices are RELATIVE to that CU's slice, which is exactly how the interpreter
+/// indexes (`my = stream + stream_ofs[cu]`).
+///
+/// # Why this is well-defined
+///
+/// `Builder::finish` assigns `seg_of[i]` as a run-length encoding over ops that
+/// only ever INCREMENTS, and pushes each CU's entries in OP ORDER. So every CU's
+/// stream already holds its segments in contiguous, ascending runs, and a
+/// `[lo, hi)` window is as valid here as `gq_seg_ofs` is on the op-major stream.
+///
+/// # Why it is DERIVED from the entries rather than from the wave-class shape
+///
+/// Under L2-domain placement (`PLOW_NV_PLACE`) `seg` is `cu / sms` — a per-slice
+/// L2 domain, not a wave class — so every entry in one CU's stream carries the
+/// SAME `seg`. Windowing stays correct (one full run, empty windows elsewhere)
+/// only because this reads the entries. Deriving it from "one segment per
+/// wave-class run" would be wrong there, which is the standing bug shape
+/// (knob-contract §4: an arm that is correct for the shape it was written for
+/// and silently wrong for the other one).
+///
+/// Errors if any CU's stream is NOT non-decreasing in `seg` (which would mean
+/// the invariant above was broken upstream) or if an entry names a segment `>=
+/// n_seg`. Both are load-time refusals rather than a silently truncated run.
+pub fn static_seg_ofs(
+    stream: &[StreamEnt],
+    stream_ofs: &[u32],
+    stream_len: &[u32],
+    n_seg: u32,
+) -> Result<Vec<u32>, String> {
+    let n_cu = stream_ofs.len();
+    if stream_len.len() != n_cu {
+        return Err(format!(
+            "stream_ofs has {n_cu} entries but stream_len has {}",
+            stream_len.len()
+        ));
+    }
+    let row = n_seg as usize + 1;
+    let mut out = vec![0u32; n_cu * row];
+    for cu in 0..n_cu {
+        let (o, len) = (stream_ofs[cu] as usize, stream_len[cu] as usize);
+        let slice = stream
+            .get(o..o + len)
+            .ok_or_else(|| format!("cu {cu} stream slice [{o}, {}) is out of bounds", o + len))?;
+        let r = &mut out[cu * row..(cu + 1) * row];
+        // Walk the runs. `s` trails the current entry's segment; every segment
+        // the walk steps over gets an EMPTY window at the current index, which
+        // is what makes a CU that carries only one domain (L2 placement) or
+        // only some of the wave-class segments come out right.
+        let mut s = 0usize;
+        let mut prev = 0u16;
+        for (i, e) in slice.iter().enumerate() {
+            if (e.seg as u32) >= n_seg {
+                return Err(format!(
+                    "cu {cu} entry {i} names segment {} but the program has {n_seg}",
+                    e.seg
+                ));
+            }
+            if i > 0 && e.seg < prev {
+                return Err(format!(
+                    "cu {cu} stream is not monotonic in seg: entry {i} is seg {} after seg {prev} \
+                     — per-(cu,seg) windows require contiguous runs",
+                    e.seg
+                ));
+            }
+            prev = e.seg;
+            while e.seg as usize > s {
+                s += 1;
+                r[s] = i as u32;
+            }
+        }
+        // Every segment ABOVE the highest one this CU carries closes at the end
+        // of the slice, so its window is empty and the table still covers [0,len).
+        r[s + 1..=n_seg as usize].fill(len as u32);
+    }
+    Ok(out)
 }
 
 pub struct Program {
@@ -670,7 +1333,7 @@ pub struct Program {
     pub gq_stream: Vec<StreamEnt>,
     /// `[n_seg+1]` segment window bounds into `gq_stream`.
     pub gq_seg_ofs: Vec<u32>,
-    /// L2-domain placement (PLOW_NV_PLACE): SMs per partition, and the number of
+    /// L2-domain placement (PLOW_L2_PLACE): SMs per partition, and the number of
     /// L2 domains `gq_seg_ofs` is windowed by. `0` ⇒ not placed (`seg` is
     /// wave-class). When non-zero, `gq_stream`'s `seg` is a domain and the blob
     /// header carries [`PLOW_BLOB_F_L2DOM`]; a runtime without physical-SM
@@ -781,9 +1444,9 @@ pub struct BlobHeader {
 /// `gq_stream`/`gq_seg_ofs` appendix), so `PLOW_GLOBAL_QUEUE=1` can run it. Absent ⇒ static-only.
 pub const PLOW_BLOB_F_GQ: u32 = 1;
 
-/// [`BlobHeader::flags`] bit: `gq_stream`'s `seg` is an **L2 domain** (PLOW_NV_PLACE),
+/// [`BlobHeader::flags`] bit: `gq_stream`'s `seg` is an **L2 domain** (PLOW_L2_PLACE),
 /// and `gq_seg_ofs` windows it by domain, not wave-class. A runtime WITHOUT
-/// physical-SM domain dispatch (`PLOW_NV_PLACE_DISPATCH`) must REFUSE such a blob —
+/// physical-SM domain dispatch (`PLOW_L2_PLACE_DISPATCH`) must REFUSE such a blob —
 /// its wave-class segmentation would mis-dispatch `seg`. `reserved[1]` carries SMs
 /// per partition, `reserved[2]` the domain count, so the interp need not be told
 /// via a build define. See `plans/devblob-locality-placement.md`.
@@ -959,7 +1622,7 @@ impl Model {
             decls.push(BlobTensor { name, bytes: t.bytes, init_off });
         }
 
-        // L2-domain placement summary across programs (PLOW_NV_PLACE): all placed
+        // L2-domain placement summary across programs (PLOW_L2_PLACE): all placed
         // programs share the target's (sms, domains); mark the header + carry them.
         let (l2_flag, l2_sms, l2_dom) = match self.progs.iter().find(|p| p.l2_domains > 0) {
             Some(p) => (PLOW_BLOB_F_L2DOM, p.l2_sms, p.l2_domains),
@@ -973,7 +1636,7 @@ impl Model {
             n_kvrow: self.kv_row_insts.len() as u32,
             // Every program carries the op-major gq_stream appendix (emitted below), so mark the
             // stream global-queue-capable. The runtime reads this to allow PLOW_GLOBAL_QUEUE=1.
-            // + F_L2DOM when any program is L2-domain-placed (PLOW_NV_PLACE); the runtime must
+            // + F_L2DOM when any program is L2-domain-placed (PLOW_L2_PLACE); the runtime must
             // then use physical-SM domain dispatch or REFUSE the blob. reserved[1]=SMs/partition,
             // reserved[2]=domain count, so the interp reads them instead of a build define.
             flags: PLOW_BLOB_F_GQ | l2_flag,
@@ -1082,7 +1745,7 @@ impl Model {
             decls.push(BlobTensor { name, bytes: t.bytes, init_off });
         }
 
-        // L2-domain placement summary (PLOW_NV_PLACE) — see to_blob().
+        // L2-domain placement summary (PLOW_L2_PLACE) — see to_blob().
         let (l2_flag, l2_sms, l2_dom) = match self.progs.iter().find(|p| p.l2_domains > 0) {
             Some(p) => (PLOW_BLOB_F_L2DOM, p.l2_sms, p.l2_domains),
             None => (0, 0, 0),
@@ -1178,6 +1841,230 @@ impl Builder {
     }
 }
 
+/// L2-domain placement: the workgroup->domain formula, and when placement declines.
+///
+/// The formula is the entire feature. A wrong one still emits correct tokens — it just puts a
+/// domain's packets on workgroups the hardware runs somewhere else — so nothing downstream can
+/// catch it and it has to be pinned here.
+/// Why locality-aware placement has nothing to win on these programs, as a test rather than a
+/// paragraph. See `plans/l2-placement-generic.md` §7.
+#[cfg(test)]
+mod locality_census_tests {
+    use super::*;
+
+    const D: u32 = 8;
+    const LAYOUT: L2Layout = L2Layout { sms: 32, domains: D, map: L2Map::RoundRobin };
+
+    /// A chain of full-width ops joined by COARSE edges — the shape every dense decode and
+    /// prefill program collapses to, because `select_granularity` downgrades a homogeneous
+    /// region's fine edges (`CounterGranularity.collapse`) and a downgraded edge is all-to-all.
+    fn coarse_chain(n_cu: u32, len: usize) -> Builder {
+        let mut b = Builder::new(n_cu);
+        let all: Vec<u32> = (0..n_cu).collect();
+        let mut prev = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        for _ in 1..len {
+            prev = b.emit(DevOp::Nop, all.clone(), &[prev], |_| {});
+        }
+        b
+    }
+
+    /// **The result that kills the lever.** On an all-to-all edge a consumer slice reads every
+    /// producer slice, so its reads are spread over the producer's domains by construction: under
+    /// ANY assignment that keeps the producer balanced, exactly `1/domains` of the pairs are
+    /// same-domain. The emitted mapping already sits on that number, so a predecessor-affinity
+    /// pass has nothing to add — it can only move slices around, which is what it does.
+    #[test]
+    fn an_all_to_all_edge_pins_same_domain_locality_at_one_over_domains() {
+        let c = coarse_chain(256, 6).locality_census_stats(Some(LAYOUT));
+        assert_eq!(c.pairs, c.all_to_all_pairs, "coarse edges are all-to-all");
+        assert!(c.pairs > 0);
+        let want = c.pairs / D as u64;
+        assert_eq!(c.same_current, want, "emitted mapping = 1/{D} of pairs");
+        assert_eq!(c.same_greedy, want, "greedy pred-affinity = the same 1/{D}, exactly");
+        assert_eq!(c.same_ceiling, want, "even the balance-free per-slice argmax cannot beat it");
+    }
+
+    /// And it is not that the greedy pass is a no-op: it relocates most of the program and still
+    /// gains nothing. That is the diff worth reporting — large in placement, zero in locality.
+    #[test]
+    fn the_greedy_pass_moves_most_slices_and_buys_nothing() {
+        let c = coarse_chain(256, 6).locality_census_stats(Some(LAYOUT));
+        assert!(
+            c.moved_slices * 2 > c.slices,
+            "greedy moved {}/{} slices — expected a majority",
+            c.moved_slices,
+            c.slices
+        );
+        assert_eq!(c.same_greedy, c.same_current, "…and changed the locality by zero");
+    }
+
+    /// A SPARSE edge is the only place placement can pay: give each consumer slice exactly one
+    /// producer slice and the greedy pass reaches 100%, well past the `1/domains` floor. This is
+    /// the control that proves the census measures something real — without it the two tests
+    /// above would also pass on a census that always returned `1/domains`.
+    #[test]
+    fn a_sparse_edge_is_where_placement_can_actually_pay() {
+        let n_cu = 256u32;
+        let mut b = Builder::new(n_cu);
+        let all: Vec<u32> = (0..n_cu).collect();
+        let p = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        // Slice s reads producer slice s, and the work is non-uniform so `select_granularity`
+        // keeps the fine edge (`hetero_can_win`) instead of collapsing it.
+        let map: Vec<Vec<u32>> = (0..n_cu).map(|s| vec![s]).collect();
+        let work: Vec<u32> = (0..n_cu).map(|s| 1 + s).collect();
+        b.emit_dep_work(DevOp::Nop, all, vec![Dep::Fine { producer: p, map }], work, |_| {});
+        b.select_granularity();
+        let c = b.locality_census_stats(Some(LAYOUT));
+        assert_eq!(c.all_to_all_pairs, 0, "a 1:1 map is sparse");
+        assert_eq!(c.same_current, c.pairs, "slice s and slice s are the same workgroup index");
+        assert_eq!(c.same_greedy, c.pairs, "greedy holds it");
+    }
+}
+
+#[cfg(test)]
+mod l2_placement_tests {
+    use super::*;
+
+    /// One packet per op, each sliced across all `n_cu` workgroups. `reads_class` is the target
+    /// fact `deny_uniseg` records: true for a host that relaunches per segment and reads the wave
+    /// class out of `seg` (AMD), false for one cooperative launch that never looks (sm_120).
+    fn build(n_cu: u32, ops: &[DevOp], layout: Option<L2Layout>, reads_class: bool) -> Program {
+        let mut b = Builder::new(n_cu);
+        b.set_l2_placement(layout);
+        if reads_class {
+            b.deny_uniseg();
+        }
+        for &op in ops {
+            let all: Vec<u32> = (0..n_cu).collect();
+            b.emit(op, all, &[], |_| {});
+        }
+        b.finish()
+    }
+
+    /// The AMD shape: the host relaunches per segment, so `seg` is read.
+    fn placed(n_cu: u32, ops: &[DevOp], layout: Option<L2Layout>) -> Program {
+        build(n_cu, ops, layout, true)
+    }
+
+    /// AMD. MEASURED on MI355X (`runtime/tests/xcd_map_gfx950_test.hip`): the hardware
+    /// dispatcher assigns workgroup *n* to XCD `n % 8`, at 100.0% over every geometry probed.
+    /// So a packet destined for domain d must be given to the workgroups where `n % 8 == d`.
+    #[test]
+    fn round_robin_places_workgroup_n_on_domain_n_mod_domains() {
+        let l = L2Layout { sms: 32, domains: 8, map: L2Map::RoundRobin };
+        let p = placed(256, &[DevOp::Nop], Some(l));
+        assert_eq!(p.l2_domains, 8, "placement must be active");
+        for e in &p.stream {
+            assert_eq!(
+                e.seg as u32,
+                e.slice % 8,
+                "slice {} must sit in domain {} (n % 8), got {}",
+                e.slice,
+                e.slice % 8,
+                e.seg
+            );
+        }
+        // Every domain window is equally full — 8 domains × 32 of the 256 slices.
+        let per: Vec<u32> =
+            (0..8).map(|d| p.gq_seg_ofs[d + 1] - p.gq_seg_ofs[d]).collect();
+        assert_eq!(per, vec![32; 8], "round-robin over 256 slices must not skew");
+    }
+
+    /// NVIDIA. Consecutive blocks fill a GPC, so the block formula stands — and this test is
+    /// what stops the AMD fix from becoming a blanket rewrite of a shipped NVIDIA path.
+    #[test]
+    fn block_map_places_workgroup_n_on_domain_n_div_sms() {
+        let l = L2Layout { sms: 32, domains: 8, map: L2Map::Block };
+        let p = placed(256, &[DevOp::Nop], Some(l));
+        assert_eq!(p.l2_domains, 8);
+        for e in &p.stream {
+            assert_eq!(e.seg as u32, e.slice / 32, "block map is n / sms");
+        }
+    }
+
+    /// The two maps must actually DISAGREE on the interpreter's real grid. If they agreed,
+    /// carrying the map would be ceremony; they overlap on only 32 of 256 workgroups
+    /// (`n/32 == n%8`), which is the 12.5% the probe measured for the block formula.
+    #[test]
+    fn the_two_maps_disagree_on_the_real_decode_grid() {
+        let rr = L2Layout { sms: 32, domains: 8, map: L2Map::RoundRobin };
+        let bl = L2Layout { sms: 32, domains: 8, map: L2Map::Block };
+        let agree = (0..256u32).filter(|&n| rr.domain_of(n) == bl.domain_of(n)).count();
+        assert_eq!(agree, 32, "the maps must coincide on exactly 32 of 256 workgroups");
+    }
+
+    /// `n_cu > domains*sms` is occupancy>1. The block formula would then run off the end of the
+    /// domain count and orphan packets, so it declines. Round-robin is in range by construction,
+    /// and the probe MEASURED it still holding at occupancy 2 — so it must NOT decline, or
+    /// placement would be silently off on exactly the occ-2 configs it is safe for.
+    #[test]
+    fn occupancy_two_declines_block_but_not_round_robin() {
+        let bl = placed(512, &[DevOp::Nop], Some(L2Layout { sms: 32, domains: 8, map: L2Map::Block }));
+        assert_eq!(bl.l2_domains, 0, "block map must decline at occupancy 2");
+        let rr = placed(
+            512,
+            &[DevOp::Nop],
+            Some(L2Layout { sms: 32, domains: 8, map: L2Map::RoundRobin }),
+        );
+        assert_eq!(rr.l2_domains, 8, "round-robin is in range at occupancy 2 — measured");
+        for e in &rr.stream {
+            assert_eq!(e.seg as u32, e.slice % 8);
+        }
+    }
+
+    /// THE ZERO-LOGITS GUARD. A program with two wave classes is already using `seg` to tell the
+    /// AMD host which occupancy to relaunch at. Overwriting it collapses prefill into one
+    /// segment, the host dispatches every op on the 4-wave flash object, and every GEMM, norm
+    /// and the lm_head are dropped — 8.7 ms of "prefill" and all-zero logits.
+    #[test]
+    fn a_multi_wave_class_program_is_never_placed() {
+        let l = L2Layout { sms: 32, domains: 8, map: L2Map::RoundRobin };
+        let p = placed(256, &[DevOp::Nop, DevOp::FlashPrefill, DevOp::Nop], Some(l));
+        assert_eq!(p.l2_domains, 0, "a segmented program must fall back byte-identical");
+        // …and the wave classes survive intact: 3 segments, one per class run.
+        assert_eq!(p.gq_seg_ofs.len() - 1, 3, "wave-class segmentation must be preserved");
+        assert!(p.stream.iter().any(|e| e.seg == 1), "the flash run keeps its own segment");
+    }
+
+    /// The other half: a SINGLE-wave-class program (decode has no `FlashPrefill`) has nothing in
+    /// `seg` to destroy, so it is placed even on a target that reads the class. This is what
+    /// makes AMD decode placement possible at all, and it is why the gate is per-program rather
+    /// than per-target.
+    #[test]
+    fn a_single_wave_class_program_is_placed() {
+        let l = L2Layout { sms: 32, domains: 8, map: L2Map::RoundRobin };
+        let p = placed(256, &[DevOp::Nop, DevOp::Gemv, DevOp::Nop], Some(l));
+        assert_eq!(p.l2_domains, 8, "decode-shaped programs must be placed");
+        assert_eq!(p.l2_sms, 32);
+    }
+
+    /// …and the skip is conditioned on the TARGET reading the class, not merely on the program
+    /// having one. An sm_120 prefill program is wave-class-segmented too, but that interpreter
+    /// runs the whole program in one cooperative launch and never reads `seg` — so placement over
+    /// it is a shipped NVIDIA feature and must keep working. Without this condition the AMD fix
+    /// would have silently disabled it.
+    #[test]
+    fn a_segmented_program_is_still_placed_when_the_target_ignores_the_class() {
+        let l = L2Layout { sms: 32, domains: 8, map: L2Map::Block };
+        let p = build(256, &[DevOp::Nop, DevOp::FlashPrefill, DevOp::Nop], Some(l), false);
+        assert_eq!(p.l2_domains, 8, "sm_120 placement must survive the AMD gate");
+        assert_eq!(p.gq_seg_ofs.len() - 1, 8, "windows are the 8 L2 domains, not wave classes");
+    }
+
+    /// Off ⇒ byte-identical. The whole feature has to be a no-op when unset, or every existing
+    /// blob changes underneath the gates.
+    #[test]
+    fn placement_off_is_byte_identical() {
+        let ops = [DevOp::Nop, DevOp::FlashPrefill, DevOp::Gemv];
+        let a = placed(256, &ops, None);
+        let b = placed(256, &ops, Some(L2Layout { sms: 0, domains: 0, map: L2Map::Block }));
+        assert_eq!(a.stream, b.stream);
+        assert_eq!(a.gq_stream, b.gq_stream);
+        assert_eq!(a.gq_seg_ofs, b.gq_seg_ofs);
+        assert_eq!(b.l2_domains, 0);
+    }
+}
+
 #[cfg(test)]
 mod granularity_tests {
     use super::*;
@@ -1209,6 +2096,137 @@ mod granularity_tests {
     #[test]
     fn heterogeneous_work_keeps_fine_gates() {
         assert!(survives(vec![1, 40, 3, 9]), "imbalanced region must keep its fine gates");
+    }
+}
+
+#[cfg(test)]
+mod seg_window_tests {
+    use super::*;
+
+    /// The number of segments a program's stream spans, derived the way every
+    /// runtime derives it (`plowrt::exec::amd::derive_segments`,
+    /// `gemma4_chat.c`): `max(seg) + 1`. There is no blob field.
+    fn n_seg_of(p: &Program) -> u32 {
+        p.stream.iter().map(|e| e.seg as u32 + 1).max().unwrap_or(1)
+    }
+
+    /// A program whose ops alternate wave class, so `Builder::finish` cuts it
+    /// into several segments and every CU's stream carries several runs.
+    fn segmented_program() -> Program {
+        let mut b = Builder::new(8);
+        b.deny_uniseg(); // PLOW_UNISEG in the ambient env must not flatten the fixture
+        let all = b.all();
+        let mut prev: Vec<u32> = Vec::new();
+        // GEMM, flash, GEMM, flash, ... — the wave class flips every op, so
+        // seg_of increments on every boundary.
+        for i in 0..9u32 {
+            let op = if i % 2 == 1 { DevOp::FlashPrefill } else { DevOp::Nop };
+            // Vary the CU set so some CUs miss some ops entirely — that is the
+            // case where a per-CU window is NOT just the segment's global range.
+            let cus: Vec<u32> = match i % 3 {
+                0 => all.clone(),
+                1 => all.iter().copied().filter(|c| c % 2 == 0).collect(),
+                _ => vec![0, 1, 2],
+            };
+            prev = vec![b.emit(op, cus, &prev, |_| {})];
+        }
+        b.finish()
+    }
+
+    /// THE INVARIANT the windows rest on: `seg_of` is a run-length encoding that
+    /// only increments, and each CU's entries are pushed in op order — so every
+    /// CU's stream is non-decreasing in `seg`. Asserted against the builder's own
+    /// output, not against a literal, so a change to the segmentation rule breaks
+    /// it here rather than on hardware.
+    #[test]
+    fn per_cu_stream_is_monotonic_in_seg() {
+        let p = segmented_program();
+        assert!(n_seg_of(&p) > 1, "fixture must actually be segmented");
+        for cu in 0..p.n_cu as usize {
+            let (o, len) = (p.stream_ofs[cu] as usize, p.stream_len[cu] as usize);
+            let segs: Vec<u16> = p.stream[o..o + len].iter().map(|e| e.seg).collect();
+            assert!(
+                segs.windows(2).all(|w| w[0] <= w[1]),
+                "cu {cu} stream is not monotonic in seg: {segs:?}"
+            );
+        }
+    }
+
+    /// The windows must select EXACTLY the entries the old scan-and-filter loop
+    /// selected, for every (cu, seg) — that is the whole correctness claim.
+    #[test]
+    fn windows_select_exactly_what_the_filter_selected() {
+        let p = segmented_program();
+        let n_seg = n_seg_of(&p);
+        let ofs = static_seg_ofs(&p.stream, &p.stream_ofs, &p.stream_len, n_seg).unwrap();
+        let row = n_seg as usize + 1;
+        for cu in 0..p.n_cu as usize {
+            let (o, len) = (p.stream_ofs[cu] as usize, p.stream_len[cu] as usize);
+            let my = &p.stream[o..o + len];
+            let r = &ofs[cu * row..(cu + 1) * row];
+            assert_eq!(r[0], 0, "cu {cu} window table must start at 0");
+            assert_eq!(r[n_seg as usize], len as u32, "cu {cu} windows must cover the slice");
+            let mut covered = 0usize;
+            for s in 0..n_seg {
+                let (lo, hi) = (r[s as usize] as usize, r[s as usize + 1] as usize);
+                assert!(lo <= hi && hi <= len, "cu {cu} seg {s}: bad window [{lo},{hi}) of {len}");
+                covered += hi - lo;
+                // what the window yields
+                let win: Vec<u32> = (lo..hi).map(|i| my[i].inst).collect();
+                // what `if (e.seg != prog.cur_seg) continue;` yielded
+                let filt: Vec<u32> =
+                    my.iter().filter(|e| e.seg as u32 == s).map(|e| e.inst).collect();
+                assert_eq!(win, filt, "cu {cu} seg {s}: window != filtered scan");
+            }
+            assert_eq!(covered, len, "cu {cu}: windows must partition the slice");
+        }
+    }
+
+    /// Under L2-domain placement (`PLOW_L2_PLACE`) `seg` is the workgroup's DOMAIN, so one
+    /// CU's stream carries a SINGLE segment and every other window is empty.
+    /// Windowing must stay correct there — it just buys nothing. This is the arm
+    /// that a wave-class-shaped construction would get wrong.
+    ///
+    /// Run over BOTH maps. `L2Map::Block` (`cu / sms`) and `L2Map::RoundRobin` (`cu % domains`)
+    /// give the same one-full-window shape but permute WHICH window is the full one, so a
+    /// windowing bug that assumed the block formula would survive a block-only test. The
+    /// expectation comes from [`L2Layout::domain_of`] rather than a repeated formula, so the
+    /// two cannot drift.
+    #[test]
+    fn l2_placement_gives_one_full_window_and_the_rest_empty() {
+        for map in [L2Map::Block, L2Map::RoundRobin] {
+            let l = L2Layout { sms: 2, domains: 4, map };
+            let mut b = Builder::new(8);
+            b.set_l2_placement(Some(l));
+            let all = b.all();
+            let a = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+            b.emit(DevOp::FlashPrefill, all, &[a], |_| {});
+            let p = b.finish();
+            let n_seg = l.domains;
+            let ofs = static_seg_ofs(&p.stream, &p.stream_ofs, &p.stream_len, n_seg).unwrap();
+            let row = n_seg as usize + 1;
+            for cu in 0..p.n_cu as usize {
+                let len = p.stream_len[cu] as usize;
+                let r = &ofs[cu * row..(cu + 1) * row];
+                let mine = l.domain_of(cu as u32);
+                for s in 0..n_seg {
+                    let (lo, hi) = (r[s as usize], r[s as usize + 1]);
+                    let want = if s == mine { len as u32 } else { 0 };
+                    assert_eq!(hi - lo, want, "{map:?} cu {cu} seg {s}: expected {want} entries");
+                }
+            }
+        }
+    }
+
+    /// A stream whose segments are NOT contiguous must be REFUSED, not windowed
+    /// into a silently short run. This is the failure the runtime must see at
+    /// load time rather than as a model that speaks confident nonsense.
+    #[test]
+    fn non_monotonic_stream_is_refused() {
+        let e = |seg: u16| StreamEnt { seg, ..Default::default() };
+        let stream = vec![e(0), e(1), e(0)];
+        let err = static_seg_ofs(&stream, &[0], &[3], 2).unwrap_err();
+        assert!(err.contains("not monotonic"), "unexpected error: {err}");
     }
 }
 
@@ -1407,7 +2425,7 @@ mod v6_tests {
         let v5 = m.to_blob();
         // Programs data should be identical between v5 and v6 (same byte offsets
         // for tensors, init, programs)
-        let payload_start = 64usize; // after BlobHeader
+        let _payload_start = 64usize; // after BlobHeader
         let v5_gq_end = v5.len(); // v5 ends after GQ01
         // In v6, sections appear after the GQ01 appendix, then the directory
         assert!(blob.len() > v5_gq_end, "v6 is larger due to sections");

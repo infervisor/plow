@@ -1,6 +1,7 @@
 //! §K Profiling & telemetry — per-SM/per-task timing + aggregate metrics.
 
 pub mod trace;
+pub mod ttft;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

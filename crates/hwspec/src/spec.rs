@@ -213,7 +213,37 @@ pub struct MemorySpec {
     pub capacity: Bytes,
     /// Theoretical peak bandwidth (the cost model's HBM-bandwidth limit).
     pub bandwidth: GBps,
+    /// ACHIEVED streaming-read bandwidth, measured on this part — `None` when
+    /// nobody has measured it.
+    ///
+    /// Separate from [`Self::bandwidth`] because the two answer different
+    /// questions and only one of them is a datasheet quote. `bandwidth` is the
+    /// peak the part is SOLD as; a relative cost model (which tile is cheaper?)
+    /// wants that, because the factor cancels. Anything that reports an
+    /// ABSOLUTE floor — "this decode step cannot go below X µs" — must use the
+    /// measured figure, or it hands back headroom that does not exist.
+    ///
+    /// The instance that motivated the split: `plowc --lean-oracle` divided by
+    /// MI350X's 8000 GB/s datasheet number and reported a Gemma-4-31B decode
+    /// lower bound of 7719.3 µs, where the measured denominator gives 9.96 ms
+    /// — 22.5% optimistic, in the optimistic direction, on the one number whose
+    /// whole job is to be a bound.
+    pub bandwidth_measured: Option<GBps>,
     pub bus_width_bits: u32,
+}
+
+impl MemorySpec {
+    /// The denominator for an ABSOLUTE bandwidth bound: measured where we have
+    /// it, datasheet peak otherwise.
+    ///
+    /// Callers computing a lower bound / roofline they intend to REPORT must go
+    /// through this rather than reading `bandwidth` directly.
+    pub fn bandwidth_for_bound(&self) -> GBps {
+        match self.bandwidth_measured {
+            Some(b) => b,
+            None => self.bandwidth,
+        }
+    }
 }
 
 /// A complete static descriptor for one GPU model/SKU.

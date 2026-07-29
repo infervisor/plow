@@ -45,6 +45,8 @@ pub const RTX_4090: GpuSpec = GpuSpec {
         kind: MemKind::Gddr6x,
         capacity: Bytes::gib(24),
         bandwidth: GBps(1008.0),
+        // Not measured on this part; a reported bound falls back to the datasheet peak.
+        bandwidth_measured: None,
         bus_width_bits: 384,
     },
     copy_engines: 2,

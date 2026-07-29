@@ -347,8 +347,23 @@ enum {
      * ceil(K/128), row-major) folded into the K-reduction per 128-K block — NOT the per-channel
      * epilogue scale of the 30-39 fp8 ops. x stays bf16 (w8a16, the decode weight-stream path). */
     PLOW_DOP_GEMV_FP8_BLK = 44,          /* block-fp8 decode GEMV: t5=w_scale grid  (op_gemm.h)    */
-    PLOW_DOP_MOE_EXPERT_GLU_FP8_BLK = 45,/* block-fp8 expert gate/up: t3=wtab t4=stab (scale bases)*/
-    PLOW_DOP_MOE_EXPERT_DOWN_FP8_BLK = 46,/* block-fp8 expert down:   t3=wtab t4=stab             */
+    /* i[6] = WEIGHT ENCODING on ops 45/46/48/49: 0 bf16, 1 block-fp8 (default, and what 0-init
+     * packets get), 2 MXFP4. NOTE THE FIELD: it is i[6] here and i[3] on the PREFILL twins
+     * 85/86, because on THESE ops i[3] is already n_exp. Setting i[3] on 45/46/48/49 would be
+     * read as n_exp=2, every expert id >= 2 would hit the sentinel skip, and the layer would
+     * quietly produce zeros. The encodings differ in BOTH strides, which is why one field
+     * cannot be inferred: block-fp8 is 1 byte/element with a [N/128][K/128] f32 scale grid,
+     * MXFP4 is 2 elements/byte with a [N][K/32] E8M0 row. MXFP4 weights on disk ARE fp4+E8M0,
+     * so running the block-fp8 body against them reads packed nibbles as bf16 and emits noise
+     * -- this field is what makes an all-MXFP4 asset possible at all. */
+    /* i5=act: 0 gelu_tanh, 1 silu, 2 = Kimi-K3 `situ`. ONLY for 2 are f0/f1 read (situ_beta /
+     * situ_linear_beta). situ transforms the UP branch too, so the epilogue is A(g)*B(u) and goes
+     * through `moe_glu`; `moe_act` returns NaN for code 2 so an unconverted epilogue poisons its
+     * output rather than silently computing gelu_tanh(g)*u. f0/f1 were free on every GLU-family
+     * op, so no `i` slot moved and every pre-K3 packet is byte-identical.
+     * i6 = weight encoding (0 bf16, 1 block-fp8, 2 mxfp4). */
+    PLOW_DOP_MOE_EXPERT_GLU_FP8_BLK = 45,/* block-fp8/mxfp4 expert gate/up: t3=wtab t4=stab i6=enc*/
+    PLOW_DOP_MOE_EXPERT_DOWN_FP8_BLK = 46,/* block-fp8/mxfp4 expert down:   t3=wtab t4=stab i6=enc*/
     PLOW_DOP_DENSE_GLU_FP8_BLK = 47,     /* block-fp8 DENSE SwiGLU gate/up: t2=Wg t5=Wu t3=Sg t4=Su
                                           * i0=N(inter) i1=K(hidden) i5=act; dense DOWN reuses op 44 */
     /* GROUPED block-fp8 experts (op-count collapse for GLM M=1 decode). ONE packet loops ALL top-k
@@ -384,7 +399,14 @@ enum {
      * GEMV (op 6, all-CU), and this cheap 1-CU op does score-transform + group-limited top-k + norm +
      * scale over the <=256 precomputed logits. t0=table t1=logit(bf16[n_exp]) t3=bias(f32[n_exp] or 0);
      * i1=n_exp i2=k i3=flags; f0=route_scale. Byte-for-byte the selection logic of MOE_ROUTER (40),
-     * minus the GEMV — moves the 1141us single-CU score dot onto the machine-filling GEMV. */
+     * minus the GEMV — moves the 1141us single-CU score dot onto the machine-filling GEMV.
+     *
+     * i6=n_group i7=topk_group: DeepSeek-V3 / Kimi K2 GROUP-LIMITED routing (noaux_tc): score
+     * each contiguous group by the sum of its top-2 BIASED scores, keep the top topk_group
+     * groups, then top-k inside them. 0 or 1 means flat top-k, which is every GLM/Qwen/Mixtral
+     * packet and is bit-identical to the pre-group behaviour. This was CLAIMED by the old
+     * header and NOT IMPLEMENTED, which at 8 groups / top-4 silently selected a different
+     * expert set — fluent output, wrong model. */
     PLOW_DOP_MOE_ROUTER_TOPK = 56,
 
     /* FUSED MLA merge + W_uv fold (d_mla_merge_fold) — replaces FLASH_MERGE<512> + O_UV_FOLD on the
@@ -542,6 +564,74 @@ enum {
      *     t5=params(f32: A_log[n_head]|D[n_head]|dt_bias[n_head]|conv_b[conv_dim]|norm_w[d_inner])
      *     t6=conv_state(f32[d_conv-1,conv_dim] in/out) t7=ssm_state(f32[n_head,head_dim,d_state] in/out)
      *     i0=T i1=d_inner i2=n_head i3=head_dim i4=d_state i5=n_groups i6=d_conv i7=conv_dim  f0=eps. */
+    /* ===== MoE PREFILL (T>1) for the MLA family — Kimi K2.7 / GLM-5.2 / DeepSeek =====
+     * The AMD prefill bucket had NO MoE arm of any kind (ops 40-49/56 are all decode-only and
+     * all M=1 wave-per-output), so an MLA prefill was attention-complete and FFN-incomplete.
+     * These are the token-sorted grouped-expert path; see runtime/amd/op_moe.h for the tiling,
+     * the per-expert row padding, and why the block-fp8 scale is PROMOTED and not folded.
+     * Rows are padded to MPF_BM per expert, so the gathered arrays are sized
+     * MPF_MAX_ROWS(T,k,n_exp) = T*k + n_exp*(MPF_BM-1). */
+
+    /* T-token router tail: block-per-token loop of MOE_ROUTER_TOPK, bit-identical per token.
+     * The [T,n_exp] logit matrix is an ordinary GEMM (op 8), already in the prefill bucket.
+     * t0=table([T*k]) t1=logit([T,n_exp] bf16) t3=bias  i1=n_exp i2=k i3=flags i4=T
+     * i6=n_group i7=topk_group  f0=route_scale */
+    PLOW_DOP_MOE_ROUTER_TOPK_PF = 83,
+    /* ALIGN/SORT, ONE workgroup: histogram T*k slots by expert, MPF_BM-padded prefix, scatter.
+     * meta(i32): [0,n_exp) rowoff, [n_exp,2n_exp) cnt, [2n_exp,3n_exp+1) tile prefix.
+     * t0=meta t1=table t2=row_token(u32) t3=row_partidx(u32) t4=row_gate(f32)  i0=T i1=n_exp i2=k */
+    PLOW_DOP_MOE_ALIGN_PF = 84,
+    /* Grouped gate/up GEMM + GLU. A gathered from xn2 by row_token; B = the tile's expert's
+     * gate|up staged into one BN tile so the SN axis selects gate vs up.
+     * i3 = WEIGHT ENCODING: 0 bf16, 1 block-fp8 (w8a16), 2 MXFP4 (A4W4 — fp4 on BOTH operands
+     * through v_mfma_scale_f32_32x32x64_f8f6f4). A precision change is therefore a field change,
+     * not a re-emit; all three bodies live in one object and cost the same 256 VGPR / occ 2.
+     * Under enc=2 the SwiGLU + MXFP4 quantization + E8M0 scale write are the EPILOGUE of this
+     * op, writing fu already-fp4 in the sorted layout op 86 reads — so the intermediate never
+     * exists in bf16 and there is no separate bridge op or dispatch.
+     * t0=fu_g t1=xn2([T,H]) t2=wtab t3=stab t4=meta t5=row_token
+     * t6=row_partidx (enc=2, to skip pad rows) t7=fu_scale (enc=2, E8M0 rows WRITTEN)
+     * i0=I_moe(N) i1=H(K) i2=n_exp i3=enc i5=act */
+    PLOW_DOP_MOE_GROUP_GLU_PF = 85,
+    /* Grouped down GEMM + gate-scale + SCATTER to part[row_partidx][H]; pad rows dropped.
+     * t0=part([T*k,H] f32) t1=fu_g t2=wtab t3=stab t4=meta t5=fu_scale (enc=2) t6=row_partidx
+     * t7=row_gate   i0=H(N) i1=I_moe(K) i2=n_exp i3=enc (as op 85) */
+    PLOW_DOP_MOE_GROUP_DOWN_PF = 86,
+    /* T-token combine; at T=1 bit-identical to MOE_COMBINE (same expression, same slot order).
+     * t0=out t1=residual([T,H]) t2=shared|none t3=part([T*k,H] f32)  i0=H i1=k i2=T */
+    PLOW_DOP_MOE_COMBINE_PF = 87,
+
+    /* ===== KDA — Kimi Delta Attention, 69 of Kimi-K3's 93 layers. =====
+     * Spec: docs/kimi-k3-kda.md. Per head, per token:
+     *   S <- (I - beta k k^T) . diag(exp(g)) . S + beta k v^T ;   o = S^T q
+     * TWO composed mechanisms, do not conflate them: an UNTARGETED per-(head, key-channel) forget
+     * gate diag(exp(g)), and a TARGETED delta rule (I - beta k k^T) which — because the kernel L2
+     * normalizes k, so ||k|| = 1 — is exactly I minus beta times the projector onto k.
+     *
+     * The state is a DECLARED HBM TENSOR, [H,D,D] f32 = 6.00 MiB/layer/seq, CONSTANT in context
+     * length; a decode step is a read-modify-write over it. Four ops, every one with an arm below —
+     * op 90 (MAMBA2_SCAN) is the cautionary tale: monolithic, one CU, all 16 slots, and NO arm in
+     * amd/interp.hip, so on gfx950 it falls to the silent dispatch default: and computes nothing.
+     *
+     * Causal depthwise width-i2 conv + activation over concatenated q|k|v. t3 is the rolling input
+     * window [C,W] f32, current token at slot W-1 ([fla] convention), read AND written; activation
+     * applied AFTER the convolution. A 4-tap stencil, not a scan: fully parallel over (t, channel).
+     * t0=out([T,3*H*D] bf16) t1=x([T,3*H*D] bf16) t2=w([3*H*D,W] f32)
+     * t3=conv_state([3*H*D,W] f32, IN/OUT)   i0=T i1=conv_dim i2=W i3=act(1=silu) */
+    PLOW_DOP_KDA_CONV = 88,
+    /* Gate pre-pass, pure elementwise, factored out of BOTH the decode and prefill paths so it is
+     * independently testable. i3==1 (K3, gate_lower_bound=-5.0) selects the BOUNDED branch
+     *   g = f0 * sigmoid(exp(A_log[h]) * (g_raw + dt_bias[h,d]))
+     * so g is strictly in [f0,0) and the decay exp(g) in (e^f0,1) — the state can never be zeroed
+     * in one step and can never grow. i3==0 is the older unbounded -exp(A_log)*softplus(.). K3 is
+     * the FIRST checkpoint to ship the bounded gate; vLLM 0.23.0 and main have only the other one.
+     * A_log is indexed PER HEAD, dt_bias per h*D+d — different ranks. The checkpoint ships A_log as
+     * a [96] per-head vector ZERO-PADDED to [128]; the loader slices [:96]. beta is one scalar per
+     * head, not per channel.
+     * t0=g([T,H,D] f32) t1=beta([T,H] f32) t2=g_raw([T,H*D] bf16) t3=beta_raw([T,H] bf16)
+     * t4=A_log([H] f32) t5=dt_bias([H*D] f32)   i0=T i1=H i2=D i3=gate_mode   f0=lower_bound */
+    PLOW_DOP_KDA_GATE = 89,
+
     PLOW_DOP_MAMBA2_SCAN = 90,
 
     /* MXFP4 DECODE GEMV (w4a16) — OCP microscaling: e2m1 weights + one E8M0 scale per 32 K.
@@ -573,6 +663,146 @@ enum {
      * activation-quant op. t0=C(bf16) t1=A(bf16) t2=W(fp4) t3=wscale(e8m0)  i0=M i1=N i2=K.
      * See op_gemm.h d_gemm_mxfp4. */
     PLOW_DOP_GEMM_MXFP4 = 93,
+
+    /* THE TWO MISSING bf16 PREFILL RUNGS (tile-inventory campaign). Between GEMM's 256x256
+     * and GEMM_MED's 128x128 there was no tile that both fills 256 CUs and keeps BN=256's
+     * A-reuse, so every M>=1024 prefill shape paid 1.3-1.8x. Measured on the real
+     * projections (runtime/ubench/gemm_tile_sweep.c; the table is in op_gemm.h):
+     * WIDE owns M=1024-2048, C5 owns M>=4096 and every K-heavy shape.
+     * Same operands and packet fields as PLOW_DOP_GEMM. See op_gemm.h d_gemm_wide/d_gemm_c5. */
+    PLOW_DOP_GEMM_WIDE = 94, /* 128x256 */
+    PLOW_DOP_GEMM_C5 = 95,   /* 192x256 — the tile every earlier sweep calls "c5" */
+
+    /* MXFP4 (w4a16) PREFILL GEMM at the four non-default tiles. PLOW_DOP_GEMM_MXFP4 hard-coded
+     * 256x256 for EVERY shape with no selection at all, which is what put Kimi's mxfp4
+     * kv_a_proj (M=128, N=576 -> three tiles on 256 CUs) at ~0.4% of peak. Same operands and
+     * packet fields as PLOW_DOP_GEMM_MXFP4; they exist so the fp4 family goes through the same
+     * `pick_tile` as bf16. See op_gemm.h PLOW_GM_MXFP4_TILE. */
+    PLOW_DOP_GEMM_MED_MXFP4 = 96,   /* 128x128 */
+    PLOW_DOP_GEMM_SMALL_MXFP4 = 97, /* 64x128  */
+    PLOW_DOP_GEMM_WIDE_MXFP4 = 98,  /* 128x256 */
+    PLOW_DOP_GEMM_C5_MXFP4 = 99,    /* 192x256 */
+
+    /* w8a8 fp8 twins of the two added bf16 rungs. Same operands and packet fields as
+     * PLOW_DOP_GEMM_FP8. They exist so PRECISION can change the ANSWER and not just the label:
+     * with only three fp8 rungs against five bf16 ones, an fp8 program is forced onto a tile
+     * chosen for a different arithmetic intensity. See op_gemm.h d_gemm_wide_fp8/d_gemm_c5_fp8. */
+    PLOW_DOP_GEMM_WIDE_FP8 = 100, /* 128x256 fp8 tile */
+    PLOW_DOP_GEMM_C5_FP8 = 101,   /* 192x256 fp8 tile */
+
+    /* KDA gated delta-rule state update — READ-MODIFY-WRITE on the [H,D,D] f32 state t6.
+     * Per token, per head, per value column j, with S' = diag(exp(g)) S:
+     *   S'[k] = S[k]*exp(g[k])        decay FIRST — u is the error against the DECAYED state
+     *   u     = v[j] - sum_k S'[k]*k[k]
+     *   S[k]  = S'[k] + beta*u*k[k]
+     *   o[j]  = sum_k S[k]*q[k]       read the UPDATED state
+     *
+     * STATE IS V-FIRST, [h][v][k]. V==K==128, so the byte count is identical either way and a
+     * transposed state is garbage with exactly the right norm — no norm check catches it. V-first
+     * is also what makes the tiling free: a v-column is 512 CONTIGUOUS bytes and both reductions
+     * run over k for fixed v.
+     *
+     * Tiling: i3=BV value columns per workgroup => H*D/BV work items (768 at H=96,D=128,BV=16),
+     * so blocks=256 and 100% CU fill. NEVER parallelize over heads alone — 96 heads is 37.5% of
+     * 256 at TP1 and 9.4% at TP4, the MlaMergeFold occupancy defect reproduced exactly. One WAVE
+     * owns one column (D = 64 lanes x 2), so the state costs 2 f32/lane and both reductions are
+     * wave_sum; nothing crosses a wave.
+     *
+     * i4 bit0 = L2-normalize q and k in kernel, eps INSIDE the sqrt (x/sqrt(sum x^2 + 1e-6), NOT
+     * x/(norm+eps)); q is then scaled by f0 and k is NOT. ||k||=1 is load-bearing — it is what
+     * makes the delta term an exact projector. T>1 runs the same recurrence serially, which is
+     * exact at any T and is how prefill/decode agreement is expressed without a second algorithm.
+     * t0=o([T,H,D] bf16) t1=q t2=k t3=v ([T,H,D] bf16) t4=g([T,H,D] f32) t5=beta([T,H] f32)
+     * t6=state([H,D,D] f32, V-FIRST, IN/OUT)   i0=T i1=H i2=D i3=BV i4=flags   f0=scale */
+    PLOW_DOP_KDA_STATE_STEP = 102,
+    /* KDA output gate: y[h,d] = RMSNorm_D(o[h,:])[d] * sigmoid(g_raw[h,d]).
+     * FusedRMSNormGated(head_dim, eps, activation='sigmoid'). Three things are easy to get
+     * backwards, all producing plausible-but-wrong output: the norm is over D=128 INSIDE a head,
+     * not over H*D; its weight is a single [D] f32 vector SHARED by all H heads; and the sigmoid is
+     * on the RAW g_proj output with the gate multiplying AFTER the norm.
+     * Its own op rather than op 102's epilogue because the norm reduces over a whole head, whose D
+     * outputs are spread across D/BV workgroups there — folding it in needs a grid-wide barrier the
+     * interpreter does not provide. One wave per (token, head): T*H items, no cross-wave reduction.
+     * t0=y([T,H,D] bf16) t1=o([T,H,D] bf16) t2=norm_w([D] f32) t3=g_raw([T,H*D] bf16)
+     * i0=T i1=H i2=D   f0=eps */
+    PLOW_DOP_KDA_GATED_NORM = 103,
+
+    /* AttnRes — Kimi-K3's residual-attention block. REPLACES the plain residual add, twice per
+     * layer, in all 93 layers (`attn_res_block_size: 12`; AMD's day-0 post: "stores one block
+     * residual every 12 layers").
+     *
+     *   v      = cat(block_residual, prefix_sum)        [T, nb+1, H], nb <= 8
+     *   k      = v * rsqrt(mean(v^2) + eps)             per row, eps INSIDE the rsqrt
+     *   scores = sum_d k[d] * score_w[d]                score_w = norm.weight * proj.weight, FOLDED
+     *   out    = softmax(scores) @ v                    the mix is over the RAW rows v, not k
+     *
+     * `score_w` is constant and is folded at prep time into one [H] f32 — neither factor is needed
+     * separately. `nb = 0` degenerates to an exact copy (softmax over one element).
+     * One WORKGROUP per token, because both reductions span the full row and the softmax couples
+     * the rows: blocks = min(T, ncu). At T=1 that is 1 of 256 and it is a known perf gap, recorded
+     * in op_k3.h rather than hidden; §10 item 7 of perf-data/kimi-k3-kernel-gap.md requires this to
+     * stay ONE packet, which rules out splitting the reduction across blocks.
+     * t0=out([T,H] bf16) t1=prefix_sum([T,H] bf16) t2=block_residual([T,nb,H] bf16)
+     * t3=score_w([H] f32)   i0=T i1=H i2=nb   f0=eps */
+    PLOW_DOP_ATTN_RES = 104,
+    /* `situ` GLU — Kimi-K3's activation, on EVERY GLU in the model (dense L0, shared experts,
+     * routed experts). out = beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta).
+     *
+     * A DISTINCT OPCODE, not a third `act` code, because situ transforms the UP branch as well:
+     * the expression shape is `A(g) * B(u)`, where every existing GLU site in this tree is
+     * `act(g) * u` selected by a two-value ternary. A new act code alone would apply the gate
+     * transform and leave `up` un-clipped — a small error at |u| < 25 that grows with the tail,
+     * i.e. plausible output and the wrong model.
+     * `linear_beta <= 0` disables the up transform (what `linear_beta is None` means), so a zeroed
+     * immediate degrades to "no transform" rather than to "clip to zero".
+     * t0=out t1=gate t2=up (all [n] bf16)   i0=n   f0=beta f1=linear_beta */
+    PLOW_DOP_SITU_GLU = 105,
+    /* Kimi-K3 MLA OUTPUT GATE (`mla_use_output_gate`, 24 of 93 layers). Reference, verbatim
+     * (modeling_kimi_linear.py:470-473):
+     *
+     *     g           = self.g_proj(hidden_states).sigmoid()
+     *     attn_output = attn_output * g
+     *     attn_output = self.o_proj(attn_output)
+     *
+     * so `out = a * sigmoid(b)`, with `a` the attention output and `b` the RAW g_proj logits.
+     *
+     * THREE THINGS THAT LOOK LIKE DETAILS AND ARE NOT:
+     *  1. `b` is the g_proj output of the MLA sub-layer INPUT (the post-input_layernorm hidden),
+     *     NOT of the attention output. Feeding it `a` has the right shape and the wrong model.
+     *  2. It is `sigmoid(b)`, not `silu(b)` and not `b*sigmoid(b)`. This is why it is its own
+     *     opcode rather than a third `act` code on PLOW_DOP_GLU: `act=1` there is SiLU, and the
+     *     two differ by a factor of `b` — plausible output, wrong model. `situ` (op 105) already
+     *     had to make the same argument for the same reason.
+     *  3. Both operands are [n_head * v_head_dim] in HEAD-MAJOR order, which is exactly the layout
+     *     PLOW_DOP_MLA_MERGE_FOLD writes (`O + (b*n_head + h)*V`) and exactly what the reference's
+     *     `attn_output.reshape(batch, seq, -1)` produces. No permute is implied or performed.
+     *
+     * The gate is applied BEFORE o_proj. Folding it into MLA_MERGE_FOLD's epilogue was considered
+     * (that op is ~97% idle) and rejected: MLA_MERGE_FOLD is on GLM-5.2's critical path and this is
+     * a K3-only transform, so a separate streaming op keeps the two archs' packet bytes identical
+     * and keeps the gate SEPARATELY DIFFABLE from the fold in a stage-by-stage gate.
+     * t0=out t1=a (attn out) t2=b (g_proj logits) (all [n] bf16)   i0=n */
+    PLOW_DOP_MLA_OUT_GATE = 106,
+
+    /* DENSE PREFILL BLOCK-FP8 GEMM (w8a16). C[M,N] bf16 = A[M,K] bf16 . W[N,K] e4m3, with
+     * DeepSeek/GLM's weight_block_size [128,128] grid of ARBITRARY-f32 weight_scale_inv indexed
+     * S[(n>>7)*ceil(K/128) + (k>>7)] — the same convention ops 44/45/46/48/49 and 85/86 use.
+     *
+     * The T-row twin of PLOW_DOP_GEMV_FP8_BLK for a plain [N,K] weight, and the arm whose absence
+     * made GLM_LINEAR_FP8 decode-only: o_proj and the three shared_experts.* projections had no
+     * block-fp8 opcode at rows > 1, so a STACKED blob would have read fp8 bytes as bf16.
+     *
+     * NOT PLOW_DOP_GEMM_FP8 (33) — that is the w8a8 rung, one f32 per output CHANNEL plus a per-row
+     * activation scale, which cannot address a [128,128] grid. NOT ops 85/86 either: their real
+     * block-fp8 body is reachable only under the grouped-MoE contract.
+     *
+     * ONE TILE RUNG (128x128x64), by register arithmetic and not by shortcut: an arbitrary-f32
+     * block scale must be PROMOTED into a second f32 accumulator every 128 K rather than folded
+     * into the cvt, which DOUBLES a tile's accumulator cost — the 192x256 and 256x256 rungs would
+     * need 192 and 256 accumulator registers and cannot run 8 waves. See op_gemm.h d_gemm_fp8_blk.
+     * PREFILL BUCKET ONLY; decode's block-fp8 is ops 44/47.
+     * t0=C t1=A t2=W(e4m3) t3=weight_scale_inv(f32)   i0=M i1=N i2=K */
+    PLOW_DOP_GEMM_FP8_BLK = 107,
 
     PLOW_DOP__COUNT
 };
@@ -725,11 +955,24 @@ typedef struct {
     uint32_t*            counters;   /* zeroed by the host before each run */
     void* const*         tensors;    /* device pointer table */
     PlowTraceRec*        trace;      /* NULL disables tracing entirely       */
-    /* Segmented dispatch: the interpreter runs ONLY stream entries whose `seg == cur_seg`, so the
-     * host can relaunch it once per wave-class segment (see plans/segmented-dispatch.md). An
+    /* Segmented dispatch: the interpreter runs ONLY this segment's stream entries, so the host
+     * can relaunch it once per wave-class segment (see plans/segmented-dispatch.md). An
      * unsegmented program has n_seg==1 and every entry seg==0, so cur_seg==0 runs everything. */
     uint32_t             cur_seg;
-    uint32_t             _segpad;
+    /* L2-DOMAIN PLACEMENT (PLOW_L2_PLACE): number of L2 domains `gq_seg_ofs` is windowed by,
+     * 0 when the program is not placed. Under -DPLOW_L2_PLACE_DISPATCH the interpreter picks its
+     * window from the domain it is PHYSICALLY running on rather than from `cur_seg`, so all
+     * domains drain concurrently in ONE launch instead of one launch per wave-class segment. */
+    uint32_t             l2_domains;
+    /* Segments `seg_ofs` is built for; the row stride there is n_seg+1. Only read when
+     * `seg_ofs != NULL`. */
+    uint32_t             n_seg;
+    /* BOTH of the two fields above once shared the single spare `_segpad` u32 — they were added
+     * on independent branches and each claimed it. They are genuinely independent: `l2_domains`
+     * windows the GLOBAL QUEUE by physical L2 domain, `n_seg` describes the STATIC per-CU
+     * `seg_ofs` table by wave-class segment. Keeping both costs 8 bytes (4 for the field, 4 for
+     * the alignment pad before `gq_stream`) and every gfx950 code object must be rebuilt; the
+     * kernarg-size check in AmdEngine::load refuses a stale object by name rather than faulting. */
     /* Global-queue interpreter (Experiment E1, built only under PLOW_GLOBAL_QUEUE). The static
      * kernel never reads these; the host leaves them NULL unless PLOW_GLOBAL_QUEUE is selected. */
     const PlowStreamEnt* gq_stream;  /* op-major (topological) permutation of `stream`          */
@@ -748,6 +991,38 @@ typedef struct {
     void* const*         peer_scratch; /* [n_gpu] each rank's peer-mapped reduction region*/
     uint32_t             rank;         /* this GPU's TP rank                              */
     uint32_t             n_gpu;        /* TP degree (1 = single-GPU, fields unused)       */
+    /* ===== STATIC-path per-(CU, segment) stream windows. NULL => legacy full scan. =====
+     * `[n_cu][n_seg+1]` uint32, row-major: CU `cu`'s segment `s` occupies entries
+     * [row[s], row[s+1]) of its OWN stream slice, where row = seg_ofs + cu*(n_seg+1) and the
+     * indices are relative to stream_ofs[cu] — exactly how the interpreter already indexes.
+     *
+     * WHY. Without it a segment launch walked the WHOLE per-CU stream and skipped every entry
+     * whose seg != cur_seg — O(n_entries) to enter a segment, once per segment. Gemma-4-31B
+     * prefill is n_seg=121 over ~200k entries on 256 CUs (~780/CU), so a launch stepped over
+     * ~770 entries before reaching its own: ~99% of every scan was waste, and the skip is a
+     * serially dependent load-compare-branch chain, not a streaming read.
+     *
+     * MEASURED (gfx950, Gemma-4-31B bf16, 512-token prefill on the STATIC scheduler, 7
+     * interleaved pairs): 195.1 ms without the window, 179.5 ms with it — 15.6 ms, 8.0%, every
+     * ON sample below every OFF sample. Decode is one segment, so its window is [0,n) and it
+     * moves nothing. This only reaches a shipping run when the static scheduler is selected:
+     * plowrt defaults to the global queue, which has had gq_seg_ofs since it was written. What
+     * the window buys is O(1) segment entry on a scan that grows with model size and segment
+     * count; the static path simply never got the table.
+     *
+     * The windows are DERIVED from the entries at load time (packet::devbuild::static_seg_ofs),
+     * not baked into the blob — the blob format is UNCHANGED by this field. Two reasons: the
+     * blob has no n_seg field for the static path either (every runtime already derives it as
+     * max(seg)+1), and a baked table goes stale the moment anything rewrites stream[].seg —
+     * which PLOW_SEG_OFF does, and which is precisely how the GQ path's gq_seg_ofs was left
+     * pointing at a window that no longer described the stream. A host that does not build the
+     * table (every C harness in runtime/tests/ — they zero the struct) leaves this NULL and gets
+     * the original loop, so no harness needs to change.
+     *
+     * Appended AFTER n_gpu so every existing field keeps its offset; the ABI-lock test only
+     * sees the size grow, 128 -> 136 -> 144 (the second step is `l2_domains` landing beside
+     * `n_seg`). READ THE NOTE ON THAT ASSERT before growing it further. */
+    const uint32_t*      seg_ofs;
 } PlowProgram;
 
 /* Workgroup geometry of the persistent interpreter. The HOST needs this to size
@@ -886,7 +1161,14 @@ PLOW_SASSERT(sizeof(PlowDevInst) == 64, "PlowDevInst size");
 PLOW_SASSERT(__builtin_offsetof(PlowDevInst, t) == 16, "PlowDevInst.t must be 16-byte aligned");
 PLOW_SASSERT(sizeof(PlowStreamEnt) == 24, "PlowStreamEnt size");
 PLOW_SASSERT(sizeof(PlowTraceRec) == 40, "PlowTraceRec size");
-PLOW_SASSERT(sizeof(PlowProgram) == 128,
-             "PlowProgram size (9 ptr + cur_seg + pad + 3 gq ptr + xctr + peer_scratch + rank + n_gpu)");
+/* GROWING THIS STRUCT: every host must size its kernarg copy with sizeof, never a
+ * literal. `plowrt`'s `kernarg_bytes` had `128` baked in; appending `seg_ofs` made
+ * the launcher copy 128 of 136 bytes and then write the COv5 implicit block at the
+ * 8-byte-aligned tail — i.e. ON TOP of the new field — so the interpreter read a
+ * grid dimension as a device pointer and every static-scheduler prefill died with
+ * "Memory access fault ... Reason: Unknown". The C harnesses pass `sizeof(pr)` and
+ * were never affected. Bumping this assert is not enough; grep the hosts. */
+PLOW_SASSERT(sizeof(PlowProgram) == 144,
+             "PlowProgram size (9 ptr + cur_seg + l2_domains + n_seg + pad + 3 gq ptr + xctr + peer_scratch + rank + n_gpu + seg_ofs)");
 
 #endif /* PLOW_DEV_ISA_H */

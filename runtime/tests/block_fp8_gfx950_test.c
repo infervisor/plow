@@ -112,6 +112,95 @@ static void run(plow_hsa* h, plow_hsa_kernel* k, unsigned NCU, const char* label
     plow_hsa_free(h, dW); plow_hsa_free(h, dx); plow_hsa_free(h, dS); plow_hsa_free(h, dC);
 }
 
+/* Block-fp8 DENSE PREFILL GEMM (op 107, d_gemm_fp8_blk) vs the SAME f64 reference the decode GEMV
+ * above uses, plus a direct cross-kernel check against `gemv_fp8_blk` on identical weights.
+ *
+ * THE CROSS-KERNEL CHECK IS THE POINT, not a bonus. A block-fp8 GEMM with a wrong scale block reads
+ * as plausible-but-wrong output and never crashes, and the two kernels index the grid completely
+ * differently — the GEMV folds `wscale[(n>>7)*KB + (k>>7)]` into a per-lane chunk partial, the GEMM
+ * promotes a whole MFMA accumulator by `wscale[(n0>>7)*KB + (kt>>1)]` at a k-tile boundary. An f64
+ * reference proves each is right; agreeing with each other proves they read ONE convention, which
+ * is what the emitter relies on when it hands both phases the same `.weight_scale_inv` handle.
+ *
+ * The reference SAMPLES (m,n) pairs rather than computing all M*N: at M=512, N=6144, K=4096 the full
+ * product is 12.9 G f64 MACs on one core. Sampling is not a weaker test here — a tiling, swizzle or
+ * scale-index bug is systematic across the output, not concentrated in a few elements. */
+static void run_gemm_blk(plow_hsa* h, plow_hsa_kernel* kg, plow_hsa_kernel* kv, unsigned NCU,
+                         const char* label, unsigned M, unsigned N, unsigned K) {
+    const unsigned NB = (N + 127u) / 128u, KB = (K + 127u) / 128u;
+    const size_t nW = (size_t)N * K, nS = (size_t)NB * KB, nA = (size_t)M * K, nC = (size_t)M * N;
+
+    unsigned char* hW = plow_hsa_alloc_host(h, nW);
+    bf16* hA = plow_hsa_alloc_host(h, nA * 2);
+    float* hS = plow_hsa_alloc_host(h, nS * 4);
+    bf16* hC = plow_hsa_alloc_host(h, nC * 2);
+    bf16* hCv = plow_hsa_alloc_host(h, (size_t)N * 2);
+
+    /* Same conditioning as the GEMV above: exp field <= 7 (|v| < 2) so a K-long dot stays
+     * well-conditioned and a real layout bug shows as ~100% error rather than a few percent of
+     * legitimate f32-vs-f64 cancellation. The per-block scales carry the dynamic range. */
+    for (size_t i = 0; i < nW; i++) {
+        const unsigned e = rand() % 8, m = rand() % 8, s = rand() % 2;
+        hW[i] = (unsigned char)((s << 7) | (e << 3) | m);
+    }
+    for (size_t i = 0; i < nA; i++) hA[i] = f2bf(((float)(rand() % 17) - 8.0f) / 16.0f);
+    for (size_t i = 0; i < nS; i++) hS[i] = 0.005f + 0.02f * (rand() % 8) / 8.0f;
+
+    void* dW = plow_hsa_alloc(h, 0, nW);
+    void* dA = plow_hsa_alloc(h, 0, nA * 2);
+    void* dS = plow_hsa_alloc(h, 0, nS * 4);
+    void* dC = plow_hsa_alloc(h, 0, nC * 2);
+    void* dCv = plow_hsa_alloc(h, 0, (size_t)N * 2);
+    plow_hsa_copy_h2d(h, 0, dW, hW, nW);
+    plow_hsa_copy_h2d(h, 0, dA, hA, nA * 2);
+    plow_hsa_copy_h2d(h, 0, dS, hS, nS * 4);
+
+    struct __attribute__((packed)) {
+        void* c; const void* a; const void* w; const void* ws; unsigned m, n, kk;
+    } args = {dC, dA, dW, dS, M, N, K};
+    plow_hsa_launch(h, 0, kg, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0, &args,
+                    sizeof(args));
+    plow_hsa_wait(h, 0);
+    plow_hsa_copy_d2h(h, 0, hC, dC, nC * 2);
+
+    /* The decode GEMV on row 0 of the SAME A, W and scale grid. */
+    struct __attribute__((packed)) {
+        void* c; const void* x; const void* w; const void* ws; unsigned m, n, kk;
+    } vargs = {dCv, dA, dW, dS, 1u, N, K};
+    plow_hsa_launch(h, 0, kv, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0, &vargs,
+                    sizeof(vargs));
+    plow_hsa_wait(h, 0);
+    plow_hsa_copy_d2h(h, 0, hCv, dCv, (size_t)N * 2);
+
+    double worst = 0.0;
+    const int PROBES = 512;
+    for (int p = 0; p < PROBES; p++) {
+        const unsigned m = (unsigned)(rand() % (int)M), n = (unsigned)(rand() % (int)N);
+        double want = 0.0;
+        for (unsigned kk = 0; kk < K; kk++)
+            want += (double)bf2f(hA[(size_t)m * K + kk]) * e4m3_decode(hW[(size_t)n * K + kk]) *
+                    (double)hS[(size_t)(n >> 7) * KB + (kk >> 7)];
+        const double got = bf2f(hC[(size_t)m * N + n]);
+        const double rel = fabs(got - want) / (fabs(want) + 1e-2);
+        if (rel > worst) worst = rel;
+    }
+    /* Row 0 against the decode kernel, every column. Two f32 reduction orders, so this is a
+     * numeric-agreement bound, not bit-identity. */
+    double xworst = 0.0;
+    for (unsigned n = 0; n < N; n++) {
+        const double g = bf2f(hC[n]), v = bf2f(hCv[n]);
+        const double rel = fabs(g - v) / (fabs(v) + 1e-2);
+        if (rel > xworst) xworst = rel;
+    }
+    const int ok = worst < 3e-2 && xworst < 3e-2;
+    printf("  %-24s M=%5u N=%5u K=%5u  %s  ref %.4f  vs-gemv %.4f\n", label, M, N, K,
+           ok ? "PASS" : "FAIL", worst, xworst);
+    if (!ok) fails++;
+
+    plow_hsa_free(h, dW); plow_hsa_free(h, dA); plow_hsa_free(h, dS);
+    plow_hsa_free(h, dC); plow_hsa_free(h, dCv);
+}
+
 /* Block-fp8 MoE expert gate/up + down for ONE expert (slot 0), through the real table indirection.
  * fu = act(gate·x)*(up·x) ; part = gate_weight · (down·fu). Validates the fp8 expert decode path. */
 static void run_expert(plow_hsa* h, plow_hsa_kernel* kglu, plow_hsa_kernel* kdown, unsigned NCU,
@@ -354,6 +443,26 @@ int main(int argc, char** argv) {
     if (plow_hsa_get_kernel(h, 0, "dense_glu_fp8_blk_k", &kdglu) == 0)
         run_dense_glu(h, &kdglu, NCU, 12288, 6144);
     else { printf("  no dense-glu kernel\n"); fails++; }
+
+    /* Block-fp8 DENSE PREFILL GEMM (op 107) — the T-row arm GLM_LINEAR_FP8 was blocked on.
+     * These are exactly the four projections the knob re-declares, at both TP degrees the campaign
+     * runs, plus a ragged N to exercise the ceil() column tail. K is always a 64-multiple because
+     * the kernel is instantiated KEXACT and the emitter refuses anything else. */
+    plow_hsa_kernel kgblk;
+    if (plow_hsa_get_kernel(h, 0, "d_gemm_fp8_blk_k", &kgblk) == 0) {
+        printf("block-fp8 DENSE PREFILL GEMM (op 107) vs f64 ref AND vs the decode GEMV:\n");
+        /* TP4 (nh_l=16, v_head=256 -> o K=4096; imoe_l=512). M = the emitted bucket ladder. */
+        run_gemm_blk(h, &kgblk, &k, NCU, "o_proj TP4",        512, 6144, 4096);
+        run_gemm_blk(h, &kgblk, &k, NCU, "o_proj TP4 M=2048", 2048, 6144, 4096);
+        run_gemm_blk(h, &kgblk, &k, NCU, "shared gate TP4",    512,  512, 6144);
+        run_gemm_blk(h, &kgblk, &k, NCU, "shared down TP4",    512, 6144,  512);
+        /* TP8 (nh_l=8 -> o K=2048; imoe_l=256). */
+        run_gemm_blk(h, &kgblk, &k, NCU, "o_proj TP8",         512, 6144, 2048);
+        run_gemm_blk(h, &kgblk, &k, NCU, "shared gate TP8",    512,  256, 6144);
+        run_gemm_blk(h, &kgblk, &k, NCU, "shared down TP8",    512, 6144,  256);
+        /* Ragged M and N (K stays a 64-multiple): tile tails on both output axes at once. */
+        run_gemm_blk(h, &kgblk, &k, NCU, "ragged M,N tails",   100,  130,  256);
+    } else { printf("  no d_gemm_fp8_blk_k kernel\n"); fails++; }
 
     printf(fails ? "FAIL (%d)\n" : "ALL PASS\n", fails);
     return fails ? 1 : 0;

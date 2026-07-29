@@ -105,6 +105,43 @@ mod tests {
         );
     }
 
+    /// A REPORTED bandwidth bound must divide by the measured figure, never the datasheet peak.
+    ///
+    /// The `plowc --lean-oracle` decode floor divided 61.4 GB of Gemma-4-31B weights by MI350X's
+    /// 8000 GB/s datasheet number and printed 7719.3 µs. The measured denominator (6200 GB/s
+    /// whole-GPU streaming read, `runtime/amd/op_gemm.h:38`) gives 9.96 ms — the bound was 22.5%
+    /// OPTIMISTIC, which on a lower bound means reporting headroom that is not there. Isolated
+    /// decode GEMV measures at 95–103% of the 6200 ceiling, so 6200 is where the part is.
+    #[test]
+    fn measured_bandwidth_governs_a_reported_bound_on_mi350() {
+        for name in ["MI350X", "MI355X"] {
+            let s = lookup(name).unwrap();
+            assert_eq!(s.mem.bandwidth.0, 8000.0, "{name} datasheet peak");
+            assert_eq!(
+                s.mem.bandwidth_measured.map(|b| b.0),
+                Some(6200.0),
+                "{name}: MI355X inherits this from MI350X via `..MI350X`; if that broke, a bound \
+                 silently reverts to the datasheet number"
+            );
+            assert_eq!(s.mem.bandwidth_for_bound().0, 6200.0, "{name} bound denominator");
+            // The number the oracle actually prints, at this part's clock.
+            let floor_ms = 61.4e9 / (s.mem.bandwidth_for_bound().0 * 1e9) * 1e3;
+            assert!(
+                (9.8..10.0).contains(&floor_ms),
+                "{name}: Gemma-4-31B bf16 weight-stream floor is 9.90 ms, got {floor_ms:.2}"
+            );
+        }
+    }
+
+    /// Parts with no measurement fall back to the datasheet peak rather than to zero — a `None`
+    /// that divided as 0 would make every bound infinite.
+    #[test]
+    fn unmeasured_parts_fall_back_to_the_datasheet_peak() {
+        let h100 = lookup("H100 SXM5").unwrap();
+        assert!(h100.mem.bandwidth_measured.is_none());
+        assert_eq!(h100.mem.bandwidth_for_bound().0, h100.mem.bandwidth.0);
+    }
+
     #[test]
     fn h200_is_native_hopper() {
         let h200 = lookup("H200 SXM").unwrap();

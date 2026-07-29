@@ -216,16 +216,45 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemv_
     d_gemv_fp8_blk(C, x, W, wscale, M, N, K, blockIdx.x, gridDim.x, lds);
 }
 
-/* Block-fp8 MoE expert gate/up + down, one slot, driven through the real table indirection. */
+/* Block-fp8 DENSE PREFILL GEMM (w8a16) — op 107, the T-row twin of `gemv_fp8_blk` above.
+ * A[M,K] bf16 x W[N,K] e4m3 with the SAME ceil(N/128) x ceil(K/128) f32 `weight_scale_inv` grid,
+ * so a divergence between this golden and `gemv_fp8_blk` on the same weights IS a scale-convention
+ * bug — which is the one failure mode this kernel has that does not crash. LDS is the 128x128x64
+ * tile's own footprint, not the object-wide arena: the interpreter passes `sm->gm`, which is sized
+ * by the largest tile any packet may select, and this wrapper is the only place the real number is
+ * visible. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_gemm_fp8_blk_k(
+    bf16* C, const bf16* A, const unsigned char* W, const float* wscale, unsigned M, unsigned N,
+    unsigned K) {
+    __shared__ bf16 lds[GM_LDS_HALVES_T(GM_BLK_BM, GM_BLK_BN, GM_BLK_BK)];
+    d_gemm_fp8_blk(C, A, W, wscale, M, N, K, blockIdx.x, gridDim.x, lds);
+}
+
+/* Block-fp8 MoE expert gate/up + down, one slot, driven through the real table indirection.
+ *
+ * The trailing `enc` is the RUNTIME weight-encoding field the interpreter reads from the
+ * instruction (i[6] on the decode ops 45/46, i[3] on the prefill ops 85/86 — the slots differ
+ * because i[3] is already n_exp on decode). These wrappers did not pass it, so this whole file
+ * stopped compiling the moment the field landed and `test_kernels.elf` went STALE on disk —
+ * exactly the failure its own build rule warns about ("building the interpreter and not these
+ * is how t_attn once passed three times against a stale kernel"). Pinned to FP8BLK rather than
+ * defaulted in op_moe.h: a default would let the next caller silently omit it again, and these
+ * two entry points are the block-fp8 goldens by name. */
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_expert_glu_fp8_blk_k(
     bf16* fu, const bf16* x, const unsigned char* table, const unsigned long long* wtab,
     const unsigned long long* stab, unsigned I_moe, unsigned H, unsigned n_exp, unsigned act) {
-    d_moe_expert_glu_fp8_blk(fu, x, table, wtab, stab, 0, I_moe, H, n_exp, act, blockIdx.x, gridDim.x);
+    // K3's `situ` added `beta`/`lbeta` to this signature (the activation transforms the UP branch
+    // too, so it needs both). They are read ONLY when `act == PLOW_MOE_ACT_SITU`; this golden
+    // exercises the block-fp8 arm at the classic activations, so 0/0 is the correct pair and keeps
+    // the kernel bit-identical to what it tested before that parameter existed.
+    d_moe_expert_glu_fp8_blk(fu, x, table, wtab, stab, 0, I_moe, H, n_exp, act, blockIdx.x,
+                             gridDim.x, PLOW_MOE_ENC_FP8BLK, 0.0f, 0.0f);
 }
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_expert_down_fp8_blk_k(
     float* part, const bf16* fu, const unsigned char* table, const unsigned long long* wtab,
     const unsigned long long* stab, unsigned H, unsigned I_moe, unsigned n_exp) {
-    d_moe_expert_down_fp8_blk(part, fu, table, wtab, stab, 0, H, I_moe, n_exp, blockIdx.x, gridDim.x);
+    d_moe_expert_down_fp8_blk(part, fu, table, wtab, stab, 0, H, I_moe, n_exp, blockIdx.x,
+                              gridDim.x, PLOW_MOE_ENC_FP8BLK);
 }
 
 /* Block-fp8 DENSE MLP gate/up (fused SwiGLU) on named weights — GLM dense layers 0-2. Op 47. */
@@ -239,6 +268,119 @@ GEMV_VARIANT(gemma_gemv_bf16, 1) /* the default decode bucket */
 GEMV_VARIANT(gemma_gemv_m4, 4)
 GEMV_VARIANT(gemma_gemv_m8, 8)
 GEMV_VARIANT(gemma_gemv_m16, 16)
+
+/* ---------------------------------------------------------------------------------------
+ * THE DECODE-GEMV ROW CAMPAIGN (runtime/ubench/gemv_row_sweep.c, scripts/rebench_tune_gemv.sh).
+ *
+ * The GEMM tile campaign has measured every prefill shape since the tunedb existed. The GEMV
+ * path — which is ALL of decode; the decode program contains zero `Gemm` ops — has never had
+ * a shape campaign at all. Its row bucket is selected by CAPACITY (does the object's compiled
+ * MM cover the packet's M) and never by measurement, and `runtime/ubench/gemv_bw_gfx950.hip`
+ * is a bandwidth microbench, not a sweep over real shapes.
+ *
+ * WHAT THESE ARE FOR, precisely. Not per-op tile selection — there is none to make; MM is a
+ * macro of the object and the K-unroll is a runtime branch inside the kernel. They exist to
+ * produce the M CURVE at the shapes the compiler actually asks for, which is the only thing
+ * that can price the two OBJECT-level decisions: which `PLOW_GEMV_MM`, and whether the walk
+ * is on. `plans/knob-contract.md` §6g-BATCH has the endpoint of that curve as aggregate tok/s
+ * (57.9 / 106.5 / 141.7 / 202.3 / 142.4 at B=1/2/4/8/16, so B=8 is the peak and B=16 a 30%
+ * regression); this is the per-shape decomposition underneath it.
+ *
+ * EVERY VARIANT WALKS, and that is deliberate. The loop below IS `gemv_walk` written out at an
+ * explicit MM instead of at the `PLOW_GEMV_MM` macro, so one object can carry all five rungs.
+ * At M == MM it makes exactly one trip and is the non-walking form; at M > MM it is the arm
+ * §6g-WALK proposes. Both are therefore measurable from one build, which is the only way to
+ * put them in the same table — a separate object per rung would put them under separate build
+ * digests and they could never be compared as the same measurement.
+ *
+ * The staging is INSIDE the loop, so the LDS bound is `min(MM, M) * K` and not `M * K`. That
+ * is the whole correctness claim of the walk, and it is what lets MM=8 serve M=16 at
+ * K=5376 where `16 * 5376 = 86016 > GM_LDS_HALVES = 73728` would have overrun.
+ */
+#define GEMV_WALK_VARIANT(NAME, MM)                                                          \
+    extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(         \
+        bf16* C, const bf16* x, const bf16* W, const float* rms, const bf16* gamma,          \
+        unsigned M, unsigned N, unsigned K, unsigned norm) {                                 \
+        __shared__ bf16 lds[GM_LDS_HALVES];                                                  \
+        for (unsigned m0 = 0; m0 < M; m0 += (MM)) {                                          \
+            const unsigned rem = M - m0, M_ = rem < (MM) ? rem : (MM);                       \
+            d_gemv_t<MM>(C + (size_t)m0 * N, x + (size_t)m0 * K, W, rms, gamma, M_, N, K,    \
+                         (int)norm, 1e-6f, blockIdx.x, gridDim.x, lds);                      \
+            __syncthreads();                                                                 \
+        }                                                                                    \
+    }
+
+/* Fused gate|up + SwiGLU epilogue — the `glu_fused` arm the LDS gate turns off at t=16 today.
+ * Body mirrors `d_gemv_glu` exactly, with MM explicit; the K==4096 unroll switch is kept
+ * because it is a real shape specialisation (Llama/Qwen `nchunk` is exactly 8 there) and
+ * dropping it would measure a kernel the interpreter does not run. */
+#define GEMV_GLU_WALK_VARIANT(NAME, MM)                                                      \
+    extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(         \
+        bf16* C, const bf16* x, const bf16* Wg, const bf16* Wu, unsigned M, unsigned N,      \
+        unsigned K, unsigned act) {                                                          \
+        __shared__ bf16 lds[GM_LDS_HALVES];                                                  \
+        for (unsigned m0 = 0; m0 < M; m0 += (MM)) {                                          \
+            const unsigned rem = M - m0, M_ = rem < (MM) ? rem : (MM);                       \
+            const bf16* x_ = x + (size_t)m0 * K;                                             \
+            bf16* C_ = C + (size_t)m0 * N;                                                   \
+            for (unsigned i = threadIdx.x; i < M_ * K; i += PLOW_THREADS) lds[i] = x_[i];    \
+            __syncthreads();                                                                 \
+            if (K == 4096)                                                                   \
+                gemv_glu_rows<MM, PLOW_GLU_K4096_UN>(C_, Wg, Wu, M_, N, K, act, blockIdx.x,  \
+                                                     gridDim.x, lds);                        \
+            else                                                                             \
+                gemv_glu_rows<MM>(C_, Wg, Wu, M_, N, K, act, blockIdx.x, gridDim.x, lds);    \
+            __syncthreads();                                                                 \
+        }                                                                                    \
+    }
+
+/* Fused Q|K|V — the `fuse_qkv` arm, and the one whose UNENFORCED LDS precondition produced
+ * §6g-BATCH's third silent-corruption bug (slots 13/14/15 fluent-but-wrong at B=16, because
+ * `gemv_qkv_rows` has no global-read arm and exactly 13 of 16 rows fit the arena). */
+#define GEMV_QKV_WALK_VARIANT(NAME, MM)                                                      \
+    extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(         \
+        bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x, const bf16* Wq, const bf16* Wk,         \
+        const bf16* Wv, unsigned M, unsigned Nq, unsigned Nk, unsigned Nv, unsigned K) {     \
+        __shared__ bf16 lds[GM_LDS_HALVES];                                                  \
+        for (unsigned m0 = 0; m0 < M; m0 += (MM)) {                                          \
+            const unsigned rem = M - m0, M_ = rem < (MM) ? rem : (MM);                       \
+            const bf16* x_ = x + (size_t)m0 * K;                                             \
+            for (unsigned i = threadIdx.x; i < M_ * K; i += PLOW_THREADS) lds[i] = x_[i];    \
+            __syncthreads();                                                                 \
+            if (K == 2560)                                                                   \
+                gemv_qkv_rows<MM, 5>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,             \
+                                     Cv + (size_t)m0 * Nv, Wq, Wk, Wv, M_, Nq, Nk, Nv, K,    \
+                                     blockIdx.x, gridDim.x, lds);                            \
+            else if (K == 4096)                                                              \
+                gemv_qkv_rows<MM, 8>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,             \
+                                     Cv + (size_t)m0 * Nv, Wq, Wk, Wv, M_, Nq, Nk, Nv, K,    \
+                                     blockIdx.x, gridDim.x, lds);                            \
+            else                                                                             \
+                gemv_qkv_rows<MM, 6>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,             \
+                                     Cv + (size_t)m0 * Nv, Wq, Wk, Wv, M_, Nq, Nk, Nv, K,    \
+                                     blockIdx.x, gridDim.x, lds);                            \
+            __syncthreads();                                                                 \
+        }                                                                                    \
+    }
+
+/* The five rungs `PLOW_GEMV_MM` can take (`PLOW_GEMV_MAXM` caps at 16). `tunedb::gemv`'s
+ * `gemv_sample_bucket` parses the bucket back out of these names, so the `_m<N>` suffix is
+ * load-bearing, not decoration. */
+GEMV_WALK_VARIANT(gemv_m1, 1)
+GEMV_WALK_VARIANT(gemv_m2, 2)
+GEMV_WALK_VARIANT(gemv_m4, 4)
+GEMV_WALK_VARIANT(gemv_m8, 8)
+GEMV_WALK_VARIANT(gemv_m16, 16)
+GEMV_GLU_WALK_VARIANT(gemv_glu_m1, 1)
+GEMV_GLU_WALK_VARIANT(gemv_glu_m2, 2)
+GEMV_GLU_WALK_VARIANT(gemv_glu_m4, 4)
+GEMV_GLU_WALK_VARIANT(gemv_glu_m8, 8)
+GEMV_GLU_WALK_VARIANT(gemv_glu_m16, 16)
+GEMV_QKV_WALK_VARIANT(gemv_qkv_m1, 1)
+GEMV_QKV_WALK_VARIANT(gemv_qkv_m2, 2)
+GEMV_QKV_WALK_VARIANT(gemv_qkv_m4, 4)
+GEMV_QKV_WALK_VARIANT(gemv_qkv_m8, 8)
+GEMV_QKV_WALK_VARIANT(gemv_qkv_m16, 16)
 
 /* D=128 (Llama/Qwen) prefill. Exercises the BKV=64 two-subtile online-softmax path;
  * O_final=nullptr so the CPU-reference test drives the partial+merge path like the
@@ -388,11 +530,12 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_o
 
 /* Fused MLA merge+fold (kills the external d_flash_merge pass + Olat round-trip). Two VT points
  * to A/B the merge-redundancy vs fold-occupancy tradeoff: VT=256 = whole-V per WG (no redundancy,
- * fusion-only, nh_l WGs); VT=32 = 8 V-tiles/head (fills 8x more CUs). See d_mla_merge_fold. */
+ * fusion-only, nh_l WGs); VT=32 = 8 V-tiles/head (fills 8x more CUs). See d_mla_merge_fold.
+ * The arena is DK + PLOW_WAVES*VT floats: olds, then the fold's cross-wave l-slice scratch. */
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_merge_fold_512_v256(
     bf16* O, const float* Opart, const float* mlpart, const bf16* Wuv, unsigned n_batch,
     unsigned n_head, unsigned V, unsigned nsplit) {
-    __shared__ float olds[512];
+    __shared__ float olds[512 + PLOW_WAVES * 256];
     d_mla_merge_fold<512, 256>(O, Opart, mlpart, Wuv, n_batch, n_head, V, nsplit, blockIdx.x,
                                gridDim.x, olds);
 }
@@ -400,7 +543,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_m
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_merge_fold_512_v32(
     bf16* O, const float* Opart, const float* mlpart, const bf16* Wuv, unsigned n_batch,
     unsigned n_head, unsigned V, unsigned nsplit) {
-    __shared__ float olds[512];
+    __shared__ float olds[512 + PLOW_WAVES * 32];
     d_mla_merge_fold<512, 32>(O, Opart, mlpart, Wuv, n_batch, n_head, V, nsplit, blockIdx.x,
                               gridDim.x, olds);
 }
@@ -434,8 +577,10 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index
     __shared__ bf16 ktile[PLOW_WAVES * 32 * (128 + FA_PAD)]; /* TILE_N x padded DI      */
     __shared__ float wlds[32];                        /* per-head lightning weights    */
     (void)index_heads;
+    /* Standalone launch: the workgroup id IS the logical slice. The persistent interpreter passes
+     * `e.slice` instead — see the note at the `st = slice` loop in d_index_score_mfma. */
     d_index_score_mfma<128, 32>(Score, Qidx, Kidx, W, kv_len, n_batch, kv_stride, scale,
-                                gridDim.x, qlds, ktile, wlds);
+                                blockIdx.x, gridDim.x, qlds, ktile, wlds);
 }
 
 /* DSA top-k SELECT via radix threshold (G4) — ONE cooperative launch (gridDim==nCU, all WGs
@@ -443,10 +588,12 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index
  * idx. gHist + gCtl[3] must be zero on entry; the kernel leaves them clean. This BASELINE wrapper
  * pins the flat 7-pass / serial-scan / plain-barrier configuration (bench "sel" column). */
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index_select_coop(
-    int* idx, const float* Score, unsigned len, unsigned top_k, unsigned* gHist, unsigned* gCtl) {
+    int* idx, const float* Score, unsigned len, unsigned top_k, unsigned* gHist, unsigned* gCtl,
+    const int* kv_len) {
     __shared__ unsigned lh[SEL_NB]; /* 8-bit radix histogram (256 bins) */
     __shared__ unsigned red[2];
-    d_index_select_coop<false, false, false>(idx, Score, len, top_k, gHist, gCtl, gridDim.x, lh, red);
+    d_index_select_coop<false, false, false>(idx, Score, len, top_k, gHist, gCtl, blockIdx.x,
+                                             gridDim.x, lh, red, kv_len);
 }
 
 /* SHIPPED SELECT (bench "sel-a" column) — the configuration d_index_select_coop defaults to, which
@@ -455,10 +602,13 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index
  * passes run only to split a genuine score tie). Selection is EXACT (== CPU radix top-k, lowest-index
  * tie-break) — measured ~2.1-3.4x faster than the baseline above at 8k/32k/128k/256k. */
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index_select_coop_a(
-    int* idx, const float* Score, unsigned len, unsigned top_k, unsigned* gHist, unsigned* gCtl) {
+    int* idx, const float* Score, unsigned len, unsigned top_k, unsigned* gHist, unsigned* gCtl,
+    const int* kv_len) {
     __shared__ unsigned lh[SEL_NB];
     __shared__ unsigned red[4];
-    d_index_select_coop<true, true, true>(idx, Score, len, top_k, gHist, gCtl, gridDim.x, lh, red);
+    /* Standalone launch: workgroup id == logical slice. The interpreter passes `e.slice`. */
+    d_index_select_coop<true, true, true>(idx, Score, len, top_k, gHist, gCtl, blockIdx.x,
+                                          gridDim.x, lh, red, kv_len);
 }
 
 /* DSA selector (§3.2): on-device top-k KV selection -> idx table for the gather. Scores the

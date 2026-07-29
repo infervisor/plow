@@ -15,11 +15,11 @@
 
 use std::path::Path;
 
-use hwspec::IsaLevel;
+use hwspec::{IsaLevel, MmaDtype};
 use packet::dev::DevOp;
 
 use crate::probe::{probe, probe_macros, ProbeError, ProbeTarget};
-use crate::spec::{KernelSpec, ProfileId};
+use crate::spec::{KernelSpec, ProfileId, QuantScheme};
 use crate::Inventory;
 
 /// The recipe for one interpreter object.
@@ -133,12 +133,61 @@ pub fn prefill_recipe(isa: IsaLevel) -> Option<ObjectRecipe> {
     })
 }
 
-/// AMD's three GEMM tiles are separate instantiations, each with its own macro
-/// triple in `runtime/amd/op_gemm.h`.
-const GFX950_TILE_MACROS: [(DevOp, [&str; 3]); 3] = [
-    (DevOp::Gemm, ["GM_BM", "GM_BN", "GM_BK"]),
-    (DevOp::GemmMed, ["GM_MD_BM", "GM_MD_BN", "GM_MD_BK"]),
-    (DevOp::GemmSmall, ["GM_SM_BM", "GM_SM_BN", "GM_SM_BK"]),
+/// AMD's GEMM tiles are separate instantiations, each with its own macro triple
+/// in `runtime/amd/op_gemm.h`. Five rungs, in each of three encodings.
+const GFX950_TILE_MACROS: [[&str; 3]; 5] = [
+    ["GM_BM", "GM_BN", "GM_BK"],          // 256x256 — saturating M
+    ["GM_MD_BM", "GM_MD_BN", "GM_MD_BK"], // 128x128
+    ["GM_SM_BM", "GM_SM_BN", "GM_SM_BK"], // 64x128  — narrow M
+    ["GM_WD_BM", "GM_WD_BN", "GM_WD_BK"], // 128x256 — M=1024..2048
+    ["GM_C5_BM", "GM_C5_BN", "GM_C5_BK"], // 192x256 — M>=4096, K-heavy
+];
+
+/// The gfx950 prefill objects the inventory covers, and the opcode each rung
+/// carries in that object.
+///
+/// THREE OBJECTS, NOT ONE, and that is the point. `interp_prefill.elf`,
+/// `interp_prefill_fp8.elf` and `interp_prefill_mxfp4.elf` are separately
+/// compiled (`scripts/build_gfx950.sh`, `scripts/gfx950_objects.py`), and a
+/// probe of the bf16 one cannot see the fp8 or fp4 arms — so an inventory built
+/// from it alone offered the selector nothing but bf16 rungs no matter what
+/// precision it was asked about. `KernelSpec::accepts` compares `quant`, so the
+/// tag is what makes precision an input rather than a label.
+///
+/// `mma_dtype` for the mxfp4 row is **Bf16**: the fp4 prefill GEMM is w4a16 and
+/// dequantizes in the B-fetch, so the matrix instruction it issues is the
+/// ordinary bf16 MFMA. See `KernelSpec::with_quant`.
+const GFX950_QUANT_OBJECTS: [(QuantScheme, MmaDtype, &[&str], [DevOp; 5]); 3] = [
+    (
+        QuantScheme::None,
+        MmaDtype::Bf16,
+        &[],
+        [DevOp::Gemm, DevOp::GemmMed, DevOp::GemmSmall, DevOp::GemmWide, DevOp::GemmC5],
+    ),
+    (
+        QuantScheme::W8A8,
+        MmaDtype::Fp8,
+        &["PLOW_FP8=1"],
+        [
+            DevOp::GemmFp8,
+            DevOp::GemmMedFp8,
+            DevOp::GemmSmallFp8,
+            DevOp::GemmWideFp8,
+            DevOp::GemmC5Fp8,
+        ],
+    ),
+    (
+        QuantScheme::Mxfp4,
+        MmaDtype::Bf16,
+        &["PLOW_MXFP4=1"],
+        [
+            DevOp::GemmMxfp4,
+            DevOp::GemmMedMxfp4,
+            DevOp::GemmSmallMxfp4,
+            DevOp::GemmWideMxfp4,
+            DevOp::GemmC5Mxfp4,
+        ],
+    ),
 ];
 
 /// Derive the dense-GEMM inventory for one ISA by probing its prefill object.
@@ -174,16 +223,44 @@ pub fn dense_gemm_inventory(root: &Path, isa: IsaLevel) -> Result<Inventory, Pro
                 specs.push(KernelSpec::gemm_tile(op, isa, bm, bn, bk, &body));
             }
         }
-        // AMD: three separately compiled instantiations, three distinct bodies.
+        // AMD: separately compiled instantiations, one distinct body each, across
+        // the three prefill objects the build produces.
         None => {
-            for (op, names) in GFX950_TILE_MACROS {
-                if !obj.dispatches(op) {
-                    continue;
-                }
+            // The tile macros are the same header constants in every object, so
+            // expand them once against the base target rather than three times.
+            let mut tiles = Vec::with_capacity(GFX950_TILE_MACROS.len());
+            for names in GFX950_TILE_MACROS {
                 let vals = probe_macros(&target, "op_gemm.h", &names)?;
-                let (Some(bm), Some(bn), Some(bk)) = (vals[0], vals[1], vals[2]) else { continue };
-                let body = format!("{}:{}@{}", isa.arch_flag(), op.c_name(), obj.build().label());
-                specs.push(KernelSpec::gemm_tile(op, isa, bm, bn, bk, &body));
+                tiles.push((vals[0], vals[1], vals[2]));
+            }
+            for (quant, mma, extra, ops) in GFX950_QUANT_OBJECTS {
+                // A probe that cannot be taken must not become an assertion: a
+                // toolchain that preprocesses the bf16 object and fails on the
+                // fp8 one should yield an inventory WITHOUT fp8 rungs, so the
+                // selector refuses rather than emitting an opcode this build
+                // does not dispatch.
+                let (qobj, qtarget) = if extra.is_empty() {
+                    (obj.clone(), target.clone())
+                } else {
+                    let mut t = target.clone();
+                    t.defines.extend(extra.iter().map(|s| s.to_string()));
+                    match probe(&t, isa, toolchain_label(&recipe)) {
+                        Ok(o) => (o, t),
+                        Err(_) => continue,
+                    }
+                };
+                let _ = &qtarget;
+                for (op, tile) in ops.into_iter().zip(tiles.iter().copied()) {
+                    if !qobj.dispatches(op) {
+                        continue;
+                    }
+                    let (Some(bm), Some(bn), Some(bk)) = tile else { continue };
+                    let body =
+                        format!("{}:{}@{}", isa.arch_flag(), op.c_name(), qobj.build().label());
+                    specs.push(
+                        KernelSpec::gemm_tile(op, isa, bm, bn, bk, &body).with_quant(quant, mma),
+                    );
+                }
             }
         }
     }
@@ -315,22 +392,40 @@ mod tests {
         }
     }
 
-    /// AMD's per-opcode tile macros must exist, or the probe expands nothing and
+    /// AMD's per-rung tile macros must exist, or the probe expands nothing and
     /// the inventory silently loses its tiles. Checked by reading the header,
     /// so it holds on a machine with no ROCm.
     #[test]
     fn amd_tile_macros_exist_in_the_header() {
         let hdr = std::fs::read_to_string(root().join("runtime/amd/op_gemm.h"))
             .expect("runtime/amd/op_gemm.h");
-        for (op, names) in GFX950_TILE_MACROS {
+        for names in GFX950_TILE_MACROS {
             for n in names {
                 assert!(
                     hdr.contains(&format!("#define {n} ")),
-                    "{:?} names {n}, which op_gemm.h does not define",
-                    op
+                    "a rung names {n}, which op_gemm.h does not define"
                 );
             }
         }
+    }
+
+    /// Every rung must be paired with an opcode in each encoding, and no opcode may appear
+    /// twice. A duplicate would make two tiles share one `KernelId`, so the selector would
+    /// rank one of them and emit the other.
+    #[test]
+    fn every_rung_has_one_distinct_opcode_per_encoding() {
+        let mut seen: std::collections::BTreeSet<u16> = Default::default();
+        for (_, _, _, ops) in GFX950_QUANT_OBJECTS {
+            assert_eq!(
+                ops.len(),
+                GFX950_TILE_MACROS.len(),
+                "an encoding lists a different number of opcodes than there are rungs"
+            );
+            for op in ops {
+                assert!(seen.insert(op as u16), "{op:?} is listed under two encodings");
+            }
+        }
+        assert_eq!(seen.len(), GFX950_TILE_MACROS.len() * GFX950_QUANT_OBJECTS.len());
     }
 
     /// Probing needs the vendor toolchain. Without it the failure must name the

@@ -327,18 +327,53 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
             constexpr int KPT = BKV * D / PLOW_THREADS / 8;
             constexpr int VPT = BKV * FA_DC / PLOW_THREADS / 8;
             bf16v8 nk[KPT], nv[VPT];
+    /* FP8 KV IN THE PREFETCH PATH. This branch had none, and it is the only path the 4-wave
+     * flash object takes (it is the object built -DFA_DBUF=1). `ld_glob8` on a `const bf16*`
+     * reads 16 BYTES for 8 elements; the e4m3 cache is 1 byte per element, so the prefetch read
+     * two rows' worth per row, ran off the end of the cache, and never applied the row scale.
+     * That is the fp8-KV prefill memory fault: `d_flash_prefill<D,true>` compiles perfectly
+     * under FA_DBUF=1 and silently reads the wrong dtype.
+     *
+     * The #else (synchronous) branch below has always handled FP8KV, which is why the same
+     * packet runs clean on the 8-wave prefill object (FA_DBUF=0) and faults the moment
+     * segmented dispatch sends its class-4 segments to the object built for them. An arm that
+     * exists, is correct in one branch of a #if, and is silently absent from the other.
+     *
+     * Dequant is identical to the #else branch: fp8 -> bf16 times the per-row f32 scale, so
+     * Ksm/Vsm hold exactly the same bf16 the bf16 path would and the MFMA is unchanged. */
+    /* The bf16 expressions below are UNCHANGED, character for character, from before the FP8KV
+     * branch was added — `if constexpr (!FP8KV)` guards them rather than an `else` on a
+     * refactored address, because hoisting the row index (arithmetically identical) moved the
+     * bf16 flash object's spill 228 -> 214. That is a codegen change to a shipped object bought
+     * for nothing, in the one object whose spill is a deliberate, measured trade. */
+#define FA_DB_FP8(DST, PTR, SCALE, ELT)                                                          \
+    {                                                                                             \
+        const size_t row_ = (size_t)hkv * kv_stride + (kv & kv_mask);                             \
+        const bf16v8 dv_ = fp8v8_to_bf16v8(                                                       \
+            ld_glob_fp8v8((const unsigned char*)(PTR) + row_ * D + (ELT)));                       \
+        const float s_ = (SCALE)[row_];                                                           \
+        _Pragma("unroll") for (int j_ = 0; j_ < 8; j_++) (DST)[j_] = f2bf(bf2f(dv_[j_]) * s_);     \
+    }
 #define FA_DB_LOAD(KVB)                                                                          \
     _Pragma("unroll") for (int it = 0; it < KPT; it++) {                                         \
         const unsigned e = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                            \
         const unsigned kv = (KVB) + e / D;                                                       \
+        if constexpr (FP8KV) {                                                                    \
+            if (kv < n_kv) FA_DB_FP8(nk[it], K, k_scale, e % D) else nk[it] = bf16v8_zero();      \
+        } else {                                                                                  \
         nk[it] = (kv < n_kv) ? ld_glob8(as_glob(K) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + e % D) \
                              : bf16v8_zero();                                                     \
+        }                                                                                         \
     }                                                                                            \
     _Pragma("unroll") for (int it = 0; it < VPT; it++) {                                         \
         const unsigned e = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                            \
         const unsigned kv = (KVB) + e / FA_DC;                                                   \
+        if constexpr (FP8KV) {                                                                    \
+            if (kv < n_kv) FA_DB_FP8(nv[it], V, v_scale, d_off + e % FA_DC) else nv[it] = bf16v8_zero(); \
+        } else {                                                                                  \
         nv[it] = (kv < n_kv) ? ld_glob8(as_glob(V) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + d_off + e % FA_DC) \
                              : bf16v8_zero();                                                     \
+        }                                                                                         \
     }
             FA_DB_LOAD(my_lo); /* prime */
             for (unsigned kv0 = my_lo; kv0 < my_hi; kv0 += BKV) {
@@ -1095,23 +1130,62 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
 
 /* Combine the split partials: standard online-softmax merge.
  *
- * NOT split over the feature axis, and that is a MEASURED decision. The work unit is
- * (batch, head) -- 32 items in Gemma decode -- so the merge runs on 32 of 256 CUs, which looks
- * like the textbook "a reduction must not be narrower than its producer" bug. It was rewritten to
- * decompose into (batch, head, d-chunk) with the split axis folded across waves, taking n_work to
- * 128/256. That is CORRECT (golden suite green) and it made the merge itself faster (0.56 -> 0.46
- * ms) -- and it made the TOKEN slower (16.7 -> 16.9), twice, at every width swept.
+ * WORK DECOMPOSITION IS (batch, head, d-chunk), and the d-chunk axis is DERIVED FROM `nblk`, not
+ * passed in. `dsplit = ceil(nblk / (n_batch*n_head))`, so when the emitter hands this op exactly
+ * `n_batch*n_head` workgroups (or fewer) `dsplit == 1`, `dchunk == D`, and every index below
+ * collapses to the original `w = b*n_head + h` expression -- the same work, in the same order,
+ * to the same addresses. The axis only appears when the emitter asks for it by widening the CU
+ * list, which is what makes the widening a *compiler* knob (`PLOW_FLASH_MERGE_DSPLIT`) served by
+ * ONE kernel: there is no second copy of this loop to drift, and no arm to leave unrouted.
  *
- * Why: widening an op WIDENS ITS CONSUMER'S GATE. o_proj waits for the merge coarsely, so it now
- * waits for the slowest of 149 workgroups instead of the slowest of 32 -- a max over more samples
- * opens later. The merge's stall went 0.83 -> 1.38 ms and ate the 0.10 ms the op saved.
+ * Splitting D needs no new reduction and no new gate: a merge item folds the `nsplit` partials of
+ * its own (row, head) over its own D-chunk and touches nothing else. The (m,l) reduction is
+ * 2*nsplit floats and stays REPLICATED across the dsplit workgroups of a (row, head) -- it is
+ * already redundant across all 512 threads of one workgroup, so replicating it costs uniform,
+ * L2-resident loads and buys the absence of a cross-workgroup reduction.
  *
- * It also did not buy what it was for. Raising `nsplit` to fill the machine with flash work is
- * self-defeating regardless of the merge: Q staging and Opart traffic BOTH scale with nsplit
- * (n_head * nsplit * D), so flash_decode gets slower, not faster, as it is split more finely
- * (1.83 -> 3.08 ms at nsplit 16 -> 64). Split-KV's overhead is the ceiling, not the merge.
+ * WIDENING IS MEASURED DEAD. TWICE, BY TWO AGENTS, ON DIFFERENT IMPLEMENTATIONS. Do not
+ * re-propose it; re-read this instead.
  *
- * Do not "fix" this without re-measuring the token. */
+ * First kill: the same decomposition with the split folded across WAVES. The merge itself got
+ * faster (0.56 -> 0.46 ms) and the TOKEN got slower (16.7 -> 16.9), at every width swept.
+ *
+ * Second kill (2026-07-27, this code): folded across WORKGROUPS, which is the shape an ideal-
+ * schedule simulation on the real DAG predicted would be worth -0.805 ms/token -- the largest
+ * single decode lever on the board. Gemma-4-31B bf16, ctx 1024, MI355X, `plowrt amd-bench`,
+ * interleaved arms, SAME code object in every arm (only the blob's merge CU count differs):
+ *
+ *   dsplit  merge wgs   wg-packets/token   median ms/token
+ *      1        32          79,947            17.517   (n=28)
+ *      2        64          81,867            +0.243
+ *      4       128          85,707            +0.348
+ *      8       256          93,387            18.072   (n=28, +0.555)
+ *
+ * Monotone in WIDTH, three independent interleaved sets, and every arm token-identical. The
+ * predicted -0.805 came back as +0.555, so the simulation is wrong about this class of lever,
+ * not the kernel.
+ *
+ * Mechanism (and it is the first kill's, re-confirmed): widening an op WIDENS ITS CONSUMER'S
+ * GATE. o_proj depends on the merge COARSELY -- a GEMV workgroup reads all of `n.at`, so that
+ * edge is genuinely dense and cannot be made fine -- so it waits on a max over 256 stragglers
+ * instead of a max over 32, and a max over more samples opens later. Gates themselves are not
+ * the cost: +100 gates/token measured FASTER elsewhere, <=0.64 us/gate. Here the loss is
+ * ~9 us on each of 60 packets, an order of magnitude too big to be gate protocol. It is the
+ * straggler tail (+-19% on identical work, random per-(CU,packet)) sampled 8x more often.
+ *
+ * The corollary generalises: "this op is narrow, widen it" is NOT sound on this machine
+ * whenever the consumer's edge is dense. Price the consumer's gate, not the op.
+ *
+ * Also note raising `nsplit` to fill the machine with flash work is self-defeating regardless of
+ * the merge: Q staging and Opart traffic BOTH scale with nsplit (n_head * nsplit * D), so
+ * flash_decode gets slower as it is split more finely (1.83 -> 3.08 ms at nsplit 16 -> 64).
+ * Split-KV's overhead is the ceiling, not the merge.
+ *
+ * The axis is kept, defaulted to 1, purely as the reproduction vehicle, and it is free at that
+ * default: the emitted blob is BYTE-IDENTICAL to the pre-change emitter's, the objects' registers
+ * are unchanged (decode 248 VGPR / occ 2 / spill 0, flash 256+256 / occ 1 / spill 228 -- the
+ * intentional Q-hoist), and the token is unchanged within noise (pre-change 17.472 vs dsplit=1
+ * 17.275 median, n=9 interleaved, sd 0.35 / 0.62). Do not change the default. */
 template <int D>
 __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ Opart_,
                               const float* __restrict__ mlpart_, unsigned n_batch,
@@ -1122,9 +1196,17 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
     auto* const O = as_glob(O_);
     const auto* const Opart = as_glob(Opart_);
     const auto* const mlpart = as_glob(mlpart_);
-    const unsigned n_work = n_batch * n_head;
+    const unsigned n_bh = n_batch * n_head;
+    /* MUST match flash_merge_map() in crates/devgen/src/lib.rs. A mismatch is a silent wrong
+     * token, not an error: the fine dep would gate a workgroup on the wrong flash slices. */
+    const unsigned dsplit = (nblk + n_bh - 1) / n_bh;
+    const unsigned dchunk = ((unsigned)D + dsplit - 1) / dsplit;
+    const unsigned n_work = n_bh * dsplit;
     for (unsigned w = slice; w < n_work; w += nblk) {
-        const unsigned h = w % n_head, b = w / n_head;
+        const unsigned dp = w % dsplit, hb = w / dsplit;
+        const unsigned h = hb % n_head, b = hb / n_head;
+        const unsigned d0 = dp * dchunk;
+        const unsigned d1 = (d0 + dchunk < (unsigned)D) ? (d0 + dchunk) : (unsigned)D;
         const auto* ml = mlpart + (size_t)(b * n_head + h) * nsplit * 2;
 
         float gm = FA_NEG_INF;
@@ -1136,7 +1218,7 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
         }
         const float inv = (gl > 0.0f) ? (1.0f / gl) : 0.0f;
 
-        for (unsigned d = threadIdx.x; d < D; d += PLOW_THREADS) {
+        for (unsigned d = d0 + threadIdx.x; d < d1; d += PLOW_THREADS) {
             float acc = 0.0f;
             for (unsigned s = 0; s < nsplit; s++) {
                 if (ml[s * 2] == FA_NEG_INF) continue;
@@ -1188,6 +1270,44 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
  * ctx-adaptive nsplit (~4*GF at long ctx) so the machine stays full. */
 #ifndef GLM_MLA_GF
 #define GLM_MLA_GF 4
+#endif
+
+/* The LARGEST GF `exec_flash_mla_decode` instantiates. GLM_MLA_GF above is only the DEFAULT for a
+ * packet whose i[7] is 0; the per-packet i[7] selects 2, 4 or 8. The interpreter's LDS union must
+ * be sized for the MAX, not the default, because the arena reaches the kernel as a bare `float*`
+ * and a GF=8 body lays out GF*(FA_DEC_TILE + DK/2 + DR/2) floats into it — sizing that member at
+ * GF=4 would let the GF=8 arm write 12.8 KB past its own member. It does NOT change the object's
+ * LDS: the union is dominated by the GEMM arena (147456 B) and this is 42048 B at GF=8. */
+#define GLM_MLA_GF_MAX 8
+
+/* PLOW_GLM_GF8_ARM — compile the GF=8 flash-decode instantiation. DEFAULT 0, and that default
+ * is a MEASURED REGRESSION FIX, not caution.
+ *
+ * The arm landed in 9dc27bb validated on REGISTERS ALONE (+6 VGPR, 248 -> 254, occupancy 2 held,
+ * zero spill, LDS unmoved) and that pass concluded "GF=8 fits". It does fit. It is also a +32%
+ * DECODE REGRESSION, bisected on a BYTE-IDENTICAL model.pkt with only the device object varying
+ * (TP8, ctx 32768, median ITL):
+ *     pre-6153189   248 VGPR   i_decode.co 313,024   27.98 ms
+ *     c9b6bae       248 VGPR              313,024   27.98 ms
+ *     9dc27bb       254 VGPR              361,896   37.01 ms   <-- the arm
+ *     HEAD          254 VGPR              362,184   36.87 ms
+ *
+ * AND IT IS NOT THE ARM RUNNING. A HEAD packet with PLOW_GLM_GF=4 pinned still measures 36.12.
+ * It is the arm being PRESENT: a second `d_flash_mla_decode` instantiation grows the decode
+ * object 15.6% inside a PERSISTENT MEGAKERNEL, where every packet body shares one instruction
+ * stream. A register-only pass structurally cannot see this — registers are per-wave, object
+ * size is per-kernel. Record that as the general lesson: for this interpreter, "the arm fits in
+ * the register budget" is necessary and NOT sufficient; the object must be weighed too.
+ *
+ * The code is kept, not deleted, because GF=8 has still never been measured on its merits
+ * (its Phase B A/B never ran). To measure it, build with -DPLOW_GLM_GF8_ARM=1 and compare
+ * GF=4 vs GF=8 ON THE SAME OBJECT by varying PLOW_GLM_GF at emit — otherwise the comparison is
+ * confounded by exactly the object-size effect above.
+ *
+ * With the arm compiled out, an emitted GF=8 request falls to the `else` (GF=4), which is the
+ * pre-9dc27bb behaviour and the configuration every published number was measured in. */
+#ifndef PLOW_GLM_GF8_ARM
+#define PLOW_GLM_GF8_ARM 0
 #endif
 
 /* GATHER (sparse top-k / DSA compose, sparse-attn-design.md §3.5): when GATHER, the O(ctx)
@@ -1253,13 +1373,22 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
         /* The causal end for THIS query. Dense only: a gathered set is assumed causal already
          * (the selector produced it), which is why GATHER applies no mask at all below. */
         const unsigned cend = qpos + 1;
-        /* GATHER splits over the fixed top_k selected slots; dense splits over the KV window,
-         * which for prefill is the per-token window ending at qpos, not at len. */
+        /* GATHER splits over the SELECTED slots; dense splits over the KV window, which for prefill
+         * is the per-token window ending at qpos, not at len.
+         *
+         * `tk_live = min(top_k, len)` and not `top_k`: `i[6]` is the emit-time `index_topk` (2048),
+         * but only `min(top_k, kv_len)` slots of `idx[]` were ever produced — `d_index_select_coop`
+         * clamps to exactly the same expression off the same `kv_len` operand. Walking the full
+         * `top_k` on a short context read STALE index slots and, because GATHER applies no mask
+         * (`keep` is just `kv < hi`), gathered latent rows that had never been written. `top_k`
+         * itself still stripes `ibase` below: that is the table's ALLOCATION stride and does not
+         * shrink with the live length. */
+        const unsigned tk_live = GATHER ? (top_k < len ? top_k : len) : 0u;
         const unsigned first = GATHER ? 0u : ((window && cend > window) ? (cend - window) : 0u);
-        const unsigned span = GATHER ? top_k : (cend - first);
+        const unsigned span = GATHER ? tk_live : (cend - first);
         const unsigned per = (span + nsplit - 1) / nsplit;
         const unsigned lo = first + sp * per;
-        const unsigned hi = GATHER ? (lo + per < top_k ? lo + per : top_k)
+        const unsigned hi = GATHER ? (lo + per < tk_live ? lo + per : tk_live)
                                    : (lo + per < cend ? lo + per : cend);
 
         /* ONE latent "head": the cache base is just this batch's latent block. */
@@ -1893,7 +2022,7 @@ template <int DI, int HIc>
 __device__ void d_index_score_mfma(float* __restrict__ Score, const bf16* __restrict__ Qidx,
                                    const bf16* __restrict__ Kidx, const bf16* __restrict__ W,
                                    const int* __restrict__ kv_len, unsigned n_batch,
-                                   unsigned kv_stride, float scale, unsigned nblk,
+                                   unsigned kv_stride, float scale, unsigned slice, unsigned nblk,
                                    bf16* qlds /* HIc*QSTRIDE bf16 */, bf16* ktile /* TILE_N*KSTRIDE */,
                                    float* wlds /* HIc floats */) {
     static_assert(DI % 16 == 0, "DI must be a whole number of MFMA k-steps");
@@ -1927,7 +2056,16 @@ __device__ void d_index_score_mfma(float* __restrict__ Score, const bf16* __rest
             qf[ks] = __builtin_bit_cast(bf16x8, ld_lds8(&qlds[frow * QSTRIDE + d0]));
         }
         const unsigned nslab = (len + TILE_N - 1) / TILE_N;
-        for (unsigned st = blockIdx.x; st < nslab; st += nblk) {
+        /* `slice`, NOT `blockIdx.x`. Under the persistent interpreter the workgroup that runs a
+         * stream entry is NOT the entry's logical slice: the GLOBAL-QUEUE scheduler (the DEFAULT
+         * for the decode phase, `exec/amd.rs` `sched_decode`) hands an entry to whichever workgroup
+         * reaches the shared cursor first, and passes the logical index as `e.slice`. Striding on
+         * `blockIdx.x` therefore covered an ARBITRARY subset of the slabs — duplicating some and
+         * LEAVING OTHERS UNWRITTEN — while `dsa_gather_bench`, which launches this as a standalone
+         * kernel with `gridDim == nblk`, saw `blockIdx.x == slice` and reported EXACT. That is why
+         * the op-level oracle was clean and the end-to-end path was degenerate. Every other kernel
+         * in this tree already takes (slice, nblk); see the convention note at op_kda.h:30. */
+        for (unsigned st = slice; st < nslab; st += nblk) {
             const unsigned base = st * TILE_N;
             __syncthreads(); /* previous slab's MFMA readers done before we overwrite ktile */
             /* coalesced contiguous key load: [TILE_N][DI], zero-filled past len. */
@@ -2071,16 +2209,69 @@ __device__ __forceinline__ void dsa_grid_sync_t(unsigned* ctl, unsigned nwg) {
  * baseline, EXACT at every ctx incl. tie-stress): coherent-atomic grid barrier + PARALLEL histogram
  * read-back + the byte-aligned-key fewer-passes fast path. The interp calls this unqualified so it
  * inherits the fast path with no ABI change; the bench pins <false,false,false> for the baseline. */
+/* `kv_len` IS AN OPERAND, NOT AN OPTIMISATION — the whole DSA path was wrong without it.
+ *
+ * `len_max` is the packet's MAX ctx (`i[0]`, baked at emit time), but `d_index_score_mfma` writes
+ * `Score[pos]` only `if (pos < kv_len[b])` — the live cache occupancy. Scanning `len_max` therefore
+ * ranked `len_max - kv_len` floats THE SCORE KERNEL NEVER WROTE. DSA only arms above a 64k crossover,
+ * so on a real decode step that is tens of thousands of stale/uninitialised words against a few
+ * thousand real ones, and the indexer score is `sum_h w[h]*ReLU(q.k)*scale` with `w` UNSIGNED-free
+ * (weights_proj emits negatives), so genuine scores go negative and a 0.0 hole OUTRANKS them. The
+ * selector then handed the gather positions >= kv_len, the gather applies NO mask (the set is
+ * "assumed causal because the selector produced it"), and attention read latent rows that were never
+ * written. That is the recorded "degenerate output even on the decode-only bundle", and it is
+ * DETERMINISTIC, not a race.
+ *
+ * It is also why `top_k` has to be clamped here: with `kv_len < top_k` (any short prompt) there are
+ * not top_k rows in existence, and the old code padded the difference out of the uninitialised tail.
+ * `d_flash_mla_decode<...,GATHER=true>` derives the SAME `min(top_k, kv_len)` from the same operand,
+ * so the two agree by construction rather than by a matching pair of emit-time constants.
+ *
+ * `runtime/bench/dsa_gather_bench.c` could not see any of this: it uploads `kv_len = ctx` and passes
+ * `len = ctx`, so score-written and select-scanned lengths are equal by construction there. */
 template <bool ATOMIC_SYNC = true, bool PAR_SCAN = true, bool FAST = true>
 __device__ void d_index_select_coop(int* __restrict__ idx, const float* __restrict__ Score,
-                                    unsigned len, unsigned top_k, unsigned* __restrict__ gHist,
-                                    unsigned* __restrict__ gCtl, unsigned nwg,
-                                    unsigned* lh /* [SEL_NB] LDS */, unsigned* red /* [2] LDS */) {
+                                    unsigned len_max, unsigned top_k_max, unsigned* __restrict__ gHist,
+                                    unsigned* __restrict__ gCtl, unsigned slice, unsigned nwg,
+                                    unsigned* lh /* [SEL_NB] LDS */, unsigned* red /* [3] LDS */,
+                                    const int* __restrict__ kv_len = nullptr) {
     const auto* const Sc = as_glob(Score);
     int* const ib = as_glob(idx);
     unsigned* const Hg = as_glob(gHist);
     unsigned* const Cg = as_glob(gCtl);
-    const unsigned bid = blockIdx.x, tid = threadIdx.x;
+    /* Only the rows the score kernel actually wrote, and only as many as exist. */
+    const unsigned nkv = kv_len ? (unsigned)as_glob(kv_len)[0] : len_max;
+    const unsigned len = nkv < len_max ? nkv : len_max;
+    const unsigned top_k = top_k_max < len ? top_k_max : len;
+    /* `bid` IS THE LOGICAL SLICE, NOT `blockIdx.x`, AND THE DIFFERENCE IS THE WHOLE END-TO-END BUG.
+     *
+     * This kernel partitions the score array by `bid` in three places (the histogram pass, the
+     * histogram clear, and the final emit loop), so `bid` must enumerate `0..nwg-1` EXACTLY ONCE
+     * across the participating workgroups. Under the persistent interpreter that is `e.slice`, the
+     * index the compiler assigned the stream entry — NOT the workgroup id. The decode phase runs
+     * the GLOBAL-QUEUE scheduler by default (`sched_decode` in `crates/plowrt/src/exec/amd.rs`),
+     * where entries are claimed from one shared cursor, so the 32 select entries land on 32
+     * ARBITRARY workgroups. With `bid = blockIdx.x` the covered set was an arbitrary subset of
+     * [0, n_cu): at a short context (`len = 533`, `nwg = 32`) only `bid` 0 and 1 have any rows at
+     * all, so unless those two workgroup ids happened to claim a select entry the emit loop wrote
+     * NOTHING and `idx[]` stayed at its zero-filled bind value — every gathered row became latent
+     * row 0. That is the recorded "first token right (dense prefill), every token after it wrong".
+     *
+     * `dsa_gather_bench` cannot see it: a standalone launch has `blockIdx.x == slice` by
+     * construction, which is exactly why the op-level oracle reported EXACT at every ctx while the
+     * model was degenerate. Every other kernel here already takes (slice, nblk) — op_kda.h:30. */
+    const unsigned bid = slice, tid = threadIdx.x;
+    /* PLAIN store, deliberately, and MEASURED — do not "fix" this to atomicExch.
+     * The suspicion was that on 8-XCD gfx950 a plain store lands dirty in one XCD's L2 while the
+     * `atomicAdd(&Cg[2],1u)` below is performed at a coherent point, so the reset would be missed on
+     * every layer after the first. It is not. Disassembly of `index_select_coop_a` (ROCm 7.2.4,
+     * gfx950): the reset is `global_store_dword ... offset:8` and the emit-slot bump is
+     * `global_atomic_add ... offset:8 sc0` — `sc0` is the return-previous-value bit, NOT a scope bit,
+     * and NEITHER instruction carries `sc1`. Both therefore operate in the same (hardware-coherent)
+     * L2 domain. Confirmed end-to-end by dsa_gather_bench's tie-stress, which re-launches the
+     * selector over a DIFFERENT score array sharing one gCtl and still reports the set EXACT at
+     * ctx 8k/32k/128k/256k. The histogram reset below uses atomicExch to CLEAR CONCURRENTLY from
+     * every WG, which is a different requirement (no single owner), not a coherence one. */
     if (bid == 0 && tid == 0) Cg[2] = 0u; /* reset emit slot */
     /* clear all SEL_NPASS per-pass histograms cooperatively (idempotent), then barrier. */
     for (unsigned i = bid * PLOW_THREADS + tid; i < SEL_NPASS * SEL_NB; i += nwg * PLOW_THREADS)
@@ -2207,12 +2398,79 @@ __device__ void d_o_uv_fold(bf16* __restrict__ O_, const bf16* __restrict__ Olat
  * Correctness: the split reduction equals the sequential attention sum for any nsplit
  * (Plow.SplitK.split_k_two_way; online softmax is associative). olat is kept f32 in LDS (the
  * standalone path rounds it to bf16 before the fold) — strictly MORE accurate, within the
- * mla_test tolerance (rel_rms < 5e-3). */
-template <int DK, int VT>
+ * mla_test tolerance (rel_rms < 5e-3).
+ *
+ * ---------------------------------------------------------------------------------------------
+ * FOLD MAP: WAVE-COOPERATIVE OVER DK, VECTOR-WIDE OVER V. (rewritten 2026-07-28)
+ *
+ * The fold used to give ONE thread a whole output column: `for l in 0..DK: acc += olds[l] *
+ * wv[l*V+v]`. That is a DK-deep dependent chain with one strided global load per step and nothing
+ * to overlap it with — measured 217 ns/iteration, i.e. exactly one uncached HBM latency, 512 times.
+ * It also caps the op at n_head*V = 4096 live lanes on a 131 072-lane machine, and at V=256 <
+ * PLOW_THREADS half of every workgroup idled. Cost: 111 us/packet, 0.6% of the 6200 GB/s ceiling,
+ * 8.69 ms of a 34.7 ms GLM-5.2 token (perf-data/glm52-decode-attribution.md §0).
+ *
+ * The transform is the one `wave_dot_fp8_blk` (op_moe.h:237) calls "the ~1000x lever" and the one
+ * `gemv_rows` (op_gemm.h:1330) already runs at 83-106% of ceiling: make the reduction axis
+ * COOPERATIVE instead of one-thread-per-output. It is adapted rather than reused verbatim because
+ * W_uv is stored l-major ([DK][V], v contiguous), the transpose of a GEMV weight ([N][K], k
+ * contiguous) — so lanes must span V (to keep the loads coalesced) and the DK split has to go
+ * across thread SLICES, with a cross-wave fold instead of `wave_sum`:
+ *
+ *   NV = VT/VEC lane-slots cover the tile's VT columns, VEC contiguous bf16 each (one dwordx2 /
+ *                dwordx4 per lane; a whole tile row per NV lanes, fully coalesced).
+ *   LS = PLOW_THREADS/NV  l-slices split the DK reduction; slice r owns the CONTIGUOUS block
+ *                [r*BL, (r+1)*BL), BL = DK/LS.
+ *   UN independent loads are issued per group before any is consumed (the `gemv_rows` idiom —
+ *                this is what turns a latency chain into memory-level parallelism). Blocked slices
+ *                make those UN loads consecutive W_uv rows.
+ *   The LS partials fold in two steps: __shfl_xor over the l-slices that share a wave (free, and
+ *   because the slices are blocked it is a binary tree over ADJACENT l-blocks), then PLOW_WAVES
+ *   rows in LDS (`red`, PLOW_WAVES*VT floats behind olds) summed in increasing-l order.
+ *
+ * Every thread now does BL iterations of a VEC-wide FMA instead of DK of a scalar one, and all
+ * PLOW_THREADS are live for any VT >= VEC. VT can therefore be lowered to fill the chip (VT=32 =>
+ * 8 v-tiles => 128 workgroups at GLM tp4) without the per-workgroup collapse the old map suffered.
+ *
+ * NUMERICS — and BIT-IDENTITY IS NOT REACHABLE HERE, which is worth stating plainly. Reproducing
+ * the old l=0..DK-1 order exactly requires one thread per output column, i.e. n_head*V = 4096
+ * threads = 64 waves for the WHOLE op; at UN loads of 2 B each that is 8*UN KB in flight, against
+ * the ~3 MB Little's-law figure needed to saturate 6200 GB/s at HBM latency. Any fix that reaches
+ * the roofline must reassociate. What this map does instead is reassociate MINIMALLY: blocked
+ * partials combined pairwise is textbook pairwise summation, whose error bound is strictly better
+ * than the sequential sum it replaces. Measured against the shipped scalar body on identical
+ * inputs at the GLM tp4 shape (perf-data/glm52_kbench_fold.*): **2 of 4096 outputs differ, each by
+ * exactly 1 bf16 ulp** — the output is bf16, whose quantum (2^-9) is ~4000x the f32 reassociation
+ * error, so a differing element is a coin-flip at a rounding boundary and nothing else.
+ * The shapes that do not fit the map (VT not a multiple of VEC, NV > PLOW_WAVE, a ragged last tile,
+ * V not a multiple of VEC) keep the original scalar body verbatim. */
+#ifndef PLOW_MLA_FOLD_VEC
+#define PLOW_MLA_FOLD_VEC 4 /* bf16 per lane-load: 4 = dwordx2. NV=VT/VEC lanes cover a tile row. */
+#endif
+#ifndef PLOW_MLA_FOLD_UN
+#define PLOW_MLA_FOLD_UN 4 /* W_uv loads issued before any is consumed (the gemv_rows UN idiom) */
+#endif
+#ifndef PLOW_MLA_FOLD_VT
+#define PLOW_MLA_FOLD_VT 32 /* V-tile when the op is given more workgroups than n_batch*n_head */
+#endif
+/* -DPLOW_MLA_FOLD_MAP=0 forces the ORIGINAL scalar fold back on while keeping the dispatch fix.
+ * It exists for one open question and not as general flexibility: the new map is 7.7x faster and
+ * differs from the old one by 1 bf16 ulp on 2 of 4096 outputs, which is enough to move GLM's
+ * greedy trajectory off the recorded 24-token reference. Whoever owns that reference needs to be
+ * able to A/B the two without editing code. Delete this knob once the call is made. */
+#ifndef PLOW_MLA_FOLD_MAP
+#define PLOW_MLA_FOLD_MAP 1
+#endif
+template <int VEC>
+struct mla_fold_vec { /* clang lowers this to one global_load_dwordx{1,2,4} */
+    typedef bf16 v __attribute__((ext_vector_type(VEC)));
+};
+template <int DK, int VT, int VEC = PLOW_MLA_FOLD_VEC, int UNW = PLOW_MLA_FOLD_UN>
 __device__ void d_mla_merge_fold(bf16* __restrict__ O_, const float* __restrict__ Opart_,
                                  const float* __restrict__ mlpart_, const bf16* __restrict__ Wuv_,
                                  unsigned n_batch, unsigned n_head, unsigned V, unsigned nsplit,
-                                 unsigned slice, unsigned nblk, float* olds /* DK floats */) {
+                                 unsigned slice, unsigned nblk,
+                                 float* olds /* DK + PLOW_WAVES*VT floats */) {
     auto* const O = as_glob(O_);
     const auto* const Opart = as_glob(Opart_);
     const auto* const mlpart = as_glob(mlpart_);
@@ -2220,6 +2478,20 @@ __device__ void d_mla_merge_fold(bf16* __restrict__ O_, const float* __restrict_
     const unsigned tid = threadIdx.x;
     const unsigned vtiles = (V + VT - 1) / VT;
     const unsigned n_work = n_batch * n_head * vtiles;
+    /* fold map, all compile-time. NV <= PLOW_WAVE keeps the l-slice fold inside one wave + one LDS
+     * row per wave; BL % UN == 0 keeps the unrolled group exact, with no tail and no predication. */
+    constexpr int NV = VT / VEC;
+    constexpr int LS = NV > 0 ? (PLOW_THREADS / (NV > 0 ? NV : 1)) : 1;
+    constexpr int BL = (LS > 0 && LS <= DK) ? (DK / LS) : 0; /* l-block per slice */
+    constexpr int UN = (BL >= UNW) ? UNW : (BL > 0 ? BL : 1);
+    constexpr bool MAP = PLOW_MLA_FOLD_MAP && (VEC > 0) && (VT % VEC == 0) && (NV > 0) &&
+                         (NV <= PLOW_WAVE) && (PLOW_THREADS % NV == 0) && (LS <= DK) &&
+                         (DK % LS == 0) && (BL > 0) && (UN >= 1) && (BL % UN == 0);
+    typedef typename mla_fold_vec<VEC>::v wvec;
+    float* const red = olds + DK; /* PLOW_WAVES*VT floats: the cross-wave l-slice fold */
+    const unsigned wave = tid >> 6, lane = tid & (PLOW_WAVE - 1u);
+    const unsigned cg = MAP ? (tid % (unsigned)(NV > 0 ? NV : 1)) : 0u;
+    const unsigned rr = MAP ? (tid / (unsigned)(NV > 0 ? NV : 1)) : 0u;
     for (unsigned w = slice; w < n_work; w += nblk) {
         const unsigned vt = w % vtiles;
         const unsigned bh = w / vtiles;
@@ -2236,13 +2508,39 @@ __device__ void d_mla_merge_fold(bf16* __restrict__ O_, const float* __restrict_
         }
         const float inv = (gl > 0.0f) ? (1.0f / gl) : 0.0f;
 
-        /* merge the DK-wide latent into LDS (rescaled, normalized). */
+        /* Merge the DK-wide latent into LDS (rescaled, normalized). MS partial loads are issued
+         * before any is consumed, and the per-split weight is BRANCH-FREE (a dead split weighs 0).
+         * The old body carried `if (ml[s*2] == FA_NEG_INF) continue;` inside this loop, so every
+         * one of the nsplit accumulations was a data-dependent branch over a global load: the
+         * compiler could not batch them and the merge was a second latency chain behind the fold's.
+         * Measured (ns=16 vs ns=1, VT=64): the merge cost ~6 us of the packet, now ~1.5 us.
+         *
+         * BIT-IDENTICAL to the old merge, deliberately: same `s` order, and the dead splits it used
+         * to `continue` past now add `Opart*0`, which is exactly 0 because d_flash_mla_decode
+         * ALWAYS writes op[d] (a dead split leaves oacc at 0 and stores 0.0f — op_attention.h:1509),
+         * so no NaN can reach the select. `inv` stays OUT of the weight and is applied once at the
+         * end, as before. The merge feeds all V output columns, so keeping it exact costs nothing
+         * and removes it from the list of things that could have moved a token. */
+        constexpr int MS = 8;
         const auto* opb = Opart + (size_t)(b * n_head + h) * nsplit * DK;
         for (unsigned d = tid; d < DK; d += PLOW_THREADS) {
             float acc = 0.0f;
-            for (unsigned s = 0; s < nsplit; s++) {
-                if (ml[s * 2] == FA_NEG_INF) continue;
-                acc += opb[(size_t)s * DK + d] * FA_EXP(ml[s * 2] - gm);
+            unsigned s = 0;
+            for (; s + MS <= nsplit; s += MS) {
+                float pv[MS], wv[MS];
+#pragma unroll
+                for (int u = 0; u < MS; u++) pv[u] = opb[(size_t)(s + (unsigned)u) * DK + d];
+#pragma unroll
+                for (int u = 0; u < MS; u++) {
+                    const float m = ml[(s + (unsigned)u) * 2];
+                    wv[u] = (m == FA_NEG_INF) ? 0.0f : FA_EXP(m - gm);
+                }
+#pragma unroll
+                for (int u = 0; u < MS; u++) acc += pv[u] * wv[u];
+            }
+            for (; s < nsplit; s++) {
+                const float m = ml[s * 2];
+                acc += (m == FA_NEG_INF) ? 0.0f : (opb[(size_t)s * DK + d] * FA_EXP(m - gm));
             }
             olds[d] = acc * inv;
         }
@@ -2251,10 +2549,58 @@ __device__ void d_mla_merge_fold(bf16* __restrict__ O_, const float* __restrict_
         /* fold this workgroup's V-tile: o[v] = sum_l olat[l] * W_uv[h][l][v]. */
         const auto* wv = Wuv + (size_t)h * DK * V;
         const unsigned v0 = vt * VT, v1 = (v0 + VT < V) ? (v0 + VT) : V;
-        for (unsigned v = v0 + tid; v < v1; v += PLOW_THREADS) {
-            float acc = 0.0f;
-            for (unsigned l = 0; l < DK; l++) acc += olds[l] * bf2f(wv[(size_t)l * V + v]);
-            O[(size_t)(b * n_head + h) * V + v] = f2bf(acc);
+        auto* const orow = O + (size_t)(b * n_head + h) * V;
+        if (MAP && v1 - v0 == (unsigned)VT && (V % (unsigned)VEC) == 0u) {
+            const auto* const wcol = wv + v0 + cg * (unsigned)VEC;
+            float acc[VEC];
+#pragma unroll
+            for (int k = 0; k < VEC; k++) acc[k] = 0.0f;
+            /* UN loads in flight, then consume: the whole point of the rewrite. Slice rr owns the
+             * CONTIGUOUS l-block [rr*BL, (rr+1)*BL) rather than a strided share, so each partial is
+             * a run of the original sequential sum and the cross-slice fold is textbook pairwise
+             * summation — the reassociation with the SMALLEST departure from the old l=0..DK-1
+             * order, which is what the token oracle is sensitive to. It also makes the UN loads
+             * consecutive W_uv rows. */
+            for (unsigned i = 0; i < (unsigned)BL; i += (unsigned)UN) {
+                const unsigned l = rr * (unsigned)BL + i;
+                wvec wq[UN];
+                float sq[UN];
+#pragma unroll
+                for (int u = 0; u < UN; u++)
+                    wq[u] = *(const PLOW_GLOB wvec*)(const PLOW_GLOB void*)(
+                        wcol + (size_t)(l + (unsigned)u) * V);
+#pragma unroll
+                for (int u = 0; u < UN; u++) sq[u] = olds[l + (unsigned)u];
+#pragma unroll
+                for (int u = 0; u < UN; u++)
+#pragma unroll
+                    for (int k = 0; k < VEC; k++) acc[k] += sq[u] * bf2f(wq[u][k]);
+            }
+            /* fold the l-slices that share a wave (lanes cg, cg+NV, cg+2NV, ...), then the
+             * PLOW_WAVES survivors through LDS. */
+#pragma unroll
+            for (int k = 0; k < VEC; k++) {
+#pragma unroll
+                for (int off = NV; off < PLOW_WAVE; off <<= 1)
+                    acc[k] += __shfl_xor(acc[k], off, PLOW_WAVE);
+            }
+            if (lane < (unsigned)NV) {
+#pragma unroll
+                for (int k = 0; k < VEC; k++) red[wave * (unsigned)VT + cg * (unsigned)VEC + k] = acc[k];
+            }
+            __syncthreads();
+            for (unsigned t = tid; t < (unsigned)VT; t += PLOW_THREADS) {
+                float s = 0.0f;
+#pragma unroll
+                for (int q = 0; q < PLOW_WAVES; q++) s += red[(unsigned)q * (unsigned)VT + t];
+                orow[v0 + t] = f2bf(s);
+            }
+        } else {
+            for (unsigned v = v0 + tid; v < v1; v += PLOW_THREADS) {
+                float acc = 0.0f;
+                for (unsigned l = 0; l < DK; l++) acc += olds[l] * bf2f(wv[(size_t)l * V + v]);
+                orow[v] = f2bf(acc);
+            }
         }
         __syncthreads();
     }

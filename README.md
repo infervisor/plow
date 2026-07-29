@@ -7,8 +7,18 @@ into a **packet stream** and run it with a **persistent on-device interpreter**
 — one cooperative kernel launch that stays resident, with warp-granularity op
 bodies and zero per-op dispatch. The compiler (`plowc`) lowers a checkpoint
 into packets; the runtime (`plowrt`) loads them and serves an OpenAI-compatible
-API; an egglog rewrite stage (`crates/rewrite`) fuses the operator graph, with
-Lean checks (`lean-plow/`, `crates/lean_verify`) on the non-obvious rewrites.
+API; Lean checks (`lean-plow/`, `crates/lean_verify`) cover the non-obvious
+rewrites and the counter protocol.
+
+> **On `crates/rewrite` (egglog).** It runs, but it is **advisory: no rewrite it
+> finds reaches a GPU.** Both `plowc` paths discard their fused graph, and
+> `crates/devgen` — the emitter every shipped asset comes out of — has no
+> dependency on `rewrite` at all. On Gemma-4-31B the pass reports
+> `fusions_found=662` and applies **0** of them. The fusions that are actually in
+> a packet (`GemvQkv`, `GemvGlu`, `NormResidualNorm`) are hand-written in
+> `devgen`. This is not a regression to fix on the way to a win: measured on
+> gfx950, deleting 100 packets/token is worth ≤0.064 ms and the un-fused arm ran
+> *faster*. See `docs/arch/01-compiler-pipeline.md`.
 
 Supported today: Gemma-4 (12B / 31B dense, 26B-A4B MoE), Qwen3, Llama-3.1 —
 bf16 and fp8 (weight-only e4m3) — on NVIDIA consumer Blackwell (sm_120, e.g.
@@ -16,10 +26,15 @@ RTX 5090 / RTX PRO 6000 Blackwell) and AMD CDNA (gfx942/gfx950).
 
 ## Requirements
 
-- Rust via **nix**: `nix develop` in the repo root provides cargo/rustc,
-  cmake, gcc. (First run: install nix, enable flakes.)
+- Rust + Lean via **nix**: `nix develop` in the repo root provides cargo/rustc,
+  cmake, gcc, and elan. (First run: install nix, enable flakes.)
 - NVIDIA path: driver + **CUDA ≥ 12.9** (13.0 tested); `nvcc` on PATH.
   sm_120 GPU for the shipped interpreter objects.
+- AMD path: a **local ROCm ≥ 7.2.4** install (`/opt/rocm`), for `hipcc` and
+  `clang-offload-bundler`. Not from nix — the code objects are built by the
+  system ROCm toolchain. **7.0.2 is too old**: its clang-20 lands the fp8 and
+  MLA prefill objects at 262 regs / occupancy 1 and the build's register-cliff
+  gate rejects them. 7.2.4 (clang-22) lands them at 256 / occ-2.
 - A HuggingFace checkpoint directory (safetensors + config.json + tokenizer).
 
 ## Build
@@ -29,12 +44,25 @@ nix develop                               # toolchain shell
 cargo build --workspace --release         # compiler + runtime (CPU paths)
 cargo test  --workspace                   # full test suite
 
-# GPU server binary (CUDA driver backend, loaded via dlopen — no -lcuda):
-cargo build --release -p plowrt --features cuda,hf-tokenizer
+# GPU server binary. Both vendor backends are compiled in but neither is LINKED
+# — `cuda` dlopens libcuda.so.1, `hsa` dlopens libhsa-runtime64.so — so one
+# binary serves NVIDIA, AMD, and CPU-fallback hosts. The AMD feature is named
+# `hsa` (direct ROCr, no HIP), not `rocm`:
+cargo build --release -p plowrt --features cuda,hsa,hub
 
-# Interpreter cubins (decode + prefill objects, sm_120a):
+# Lean verifier (universal rewrite lemmas + the plow_verify CLI that
+# crates/lean_verify drives). elan installs the lean-toolchain pin on first use:
+(cd lean-plow && lake build)
+
+# Interpreter objects — NVIDIA cubins (sm_120a) and AMD code objects (gfx950):
 scripts/build_sm120_cubin.sh <out-dir>
+cmake -S runtime -B build-amd -DPLOW_GFX950_HSACO=ON && cmake --build build-amd -j
 ```
+
+Binaries built in the nix shell link the nix glibc loader. On a host where the
+nix store is only visible inside nix (e.g. `nix-portable`), run them through
+`nix develop --command ...` — outside it the kernel reports the missing ELF
+interpreter as a bare `No such file or directory` on a file that plainly exists.
 
 ## CUDA Backend Architecture
 
@@ -105,6 +133,61 @@ preserved — but performance is orders of magnitude slower (useful only for
 testing and development). The fallback is logged with a prominent warning
 banner that is impossible to miss in production.
 
+## AMD (ROCm) Backend
+
+Same shape as the CUDA path: `plowrt` is built with no link-time GPU dependency
+(`--features hsa` `dlopen`s `libhsa-runtime64.so` — direct ROCr, not HIP), and
+the persistent interpreter ships as prebuilt device code objects the runtime
+loads at startup.
+
+### Building the interpreter code objects
+
+cmake drives the compile; **`hipcc` comes from the local ROCm**, not from nix.
+One configure emits every object, so a packet cannot reach for a variant the
+build quietly skipped:
+
+```bash
+nix develop                               # for cmake — NOT for hipcc
+
+cmake -S runtime -B build-amd -DPLOW_GFX950_HSACO=ON -DPLOW_HSACO_ARCH=gfx950
+cmake --build build-amd -j
+```
+
+17 code objects land in `build-amd/hsaco/` — `interp_{prefill,decode,flash}.elf`,
+each with its global-queue `_gq` twin, plus the fp8 (w8a16 decode / w8a8 prefill),
+fp8-KV, MX-FP4, and MLA-prefill variants, and `test_kernels.elf` (the golden
+`__device__` wrappers, rebuilt with the interpreter because they share the same
+`op_*.h` bodies). They keep the `.elf` suffix because `gemma4_chat.c` opens them
+by literal filename; they are hsaco code objects.
+
+Variant axes, all default **ON** — `-DPLOW_HSACO_{GQ,FP8,FP8KV,MXFP4,MLA}=OFF` to
+drop one. Toolchain overrides: `PLOW_HSACO_HIPCC`, `PLOW_HSACO_BUNDLER`,
+`PLOW_HSACO_DIR`, `PLOW_HSACO_EXTRA_DEFINES`.
+
+Two gates run inside the build, so both failures are build errors rather than
+runtime ones:
+
+* **Register cliff** — an 8-wave interpreter over 256 total regs (VGPR+AGPR)
+  drops to 1 wave/SIMD and past the budget fails to launch at all with
+  `HSA_STATUS_ERROR_INVALID_ISA`. The 4-wave flash object is allowed 512/occ-1,
+  and *its* spill is intentional (the Q-hoist spills Q to scratch, cheaper than
+  the L2 re-read it replaces).
+* **Kernel symbol** — the entry points are resolved by name, so an object that
+  compiled fine but whose symbol moved is caught here.
+
+`scripts/build_gfx950.sh` remains the way to get the two things not ported to
+cmake: the host `chat` harness (a gcc link, not a kernel artifact) and the
+`scripts/asm_audit.py` instruction-selection pass, which wants the whole object
+set at once and asserts on the disassembly — the check that catches a kernel
+which launches, is correct, and is silently slow because the backend picked a
+narrow MFMA.
+
+### Runtime requirements (deploy)
+
+Only the **amdgpu kernel driver + ROCr** (`libhsa-runtime64.so`) need to be
+present. No HIP, no hipcc — the code objects are prebuilt artifacts shipped
+alongside the model assets.
+
 ## Compile a model (plowc)
 
 ```bash
@@ -114,9 +197,16 @@ banner that is impossible to miss in production.
 #   --n-cu     executor (SM) count of the target GPU
 #   --out      a .pkt path (bare blob) or a directory (full servable bundle:
 #              model.pkt + weights.json)
+# NVIDIA (sm_120). On gfx950 DROP PLOW_UNISEG — see the warning below the block.
 PLOW_UNISEG=1 cargo run --release -p plowc -- \
     --hf-dir /path/to/gemma-4-12B-it --emit devblob --max-ctx 131072 --n-cu 188 \
     --out model.pkt
+
+# AMD (gfx950): no PLOW_UNISEG, and target the GPU explicitly so --arch and
+# --gpu agree. Verify build.json shows 121 segments per prefill bucket.
+cargo run --release -p plowc -- \
+    --hf-dir /path/to/gemma-4-31B-it --emit devblob --arch gfx950 --gpu mi355x \
+    --max-ctx 131072 --out model.pkt
 ```
 
 > The standalone `gemma4`/`tinygemma` binaries that predated `--emit devblob`
@@ -145,6 +235,17 @@ physical weight byte *layout* is chosen offline by the emitter — the hook the 
 twins use today (and where a tensor-core-aware tile layout would live).
 
 Useful knobs:
+- ⚠️ **`PLOW_UNISEG=1` is NVIDIA-only. Do not pass it when targeting gfx950** —
+  every recipe on this page that sets it produces a *broken* AMD asset, and the
+  breakage is silent. It collapses every op into one segment, which is right on
+  sm_120 (that interpreter runs one cooperative launch and never reads a wave
+  class) and destroys AMD's wave-class split. With one segment, segment 0
+  contains the flash packets, the class-4 test matches, and the **entire prefill
+  program is dispatched on `interp_flash`** — whose body is
+  `if (op == FLASH_PREFILL…)` with no switch, so every GEMM, norm and lm_head is
+  silently dropped. Prefill "completes" in 8.7 ms instead of 72.1 and the logits
+  are all zero. A correct Gemma-4 31B emit has **121 segments per prefill
+  bucket** (`2·layers + 1`); check `build.json` if in doubt.
 - `PLOW_UNISEG=1` — single-segment programs (required for the prefill buckets
   on the sm_120 interpreter).
 - `PLOW_DECODE_BATCH=B` — emit a batched decode program (B ∈ 1..8) for
@@ -208,25 +309,50 @@ Useful knobs:
   is the default. Lean-safe (a fine list only lowers a threshold / narrows a wait
   set), and **unset = byte-identical** coarse. There is no all-to-all "everything
   fine" mode — see `plans/fine-counter-deadlock-fix.md`.
-- `PLOW_NV_PLACE=1` — **L2-domain packet grouping** (compiler half of physical-SM
-  locality). Groups the device blob's global-queue stream into P per-L2-domain
-  windows: each op-slice's domain is `physical_cu / sms_per_partition` (XCD on
-  MI300/MI350, GPC on H100/B200, from `hwspec::GpuSpec::l2_partitioning`), so a
-  full op's slices spread evenly across all domains and slice `s` stays in one
-  domain across ops (consumer reads producer from the same L2 slice). It does NOT
-  touch `cus` (so it can't regress `Builder::split` disjointness) and prints a
-  static allocation report (`l2 placement: … packets/domain […] skew …%`). **Unset
-  = byte-identical**; no-op on unpartitioned GPUs (e.g. consumer Blackwell). This
-  is only the compiler tag — the locality is realized by the runtime half
-  (`-DPLOW_NV_PLACE_DISPATCH`, **experimental/unvalidated**), where each block
-  reads its physical SM id and pulls its domain's window. Must be built + measured
-  on a partitioned GPU (H100/B200/MI300/MI350). Guards: placement is **skipped**
-  (byte-identical, with a note) when `n_cu > partition_count·sms` — occupancy>1 or
-  a grid≠sm_count mismatch, where domains would exceed the runtime's and orphan
-  packets; and a placement blob carries a header flag (`PLOW_BLOB_F_L2DOM`, plus
+- `PLOW_L2_PLACE=1` — **L2-domain packet grouping** (compiler half of physical-SM
+  locality). *Was `PLOW_NV_PLACE`, still accepted as a deprecated alias: an L2
+  domain is a GPC on NVIDIA and an XCD on AMD, and `hwspec` describes both, so the
+  NVIDIA-specific name was wrong about its own scope.* Groups the device blob's
+  global-queue stream into P per-L2-domain windows, so a full op's slices spread
+  evenly across all domains and slice `s` stays in one domain across ops (consumer
+  reads producer from the same L2 slice). It does NOT touch `cus` (so it can't
+  regress `Builder::split` disjointness) and prints a static allocation report
+  (`l2 placement: … map … packets/domain […] skew …%`). **Unset = byte-identical**;
+  no-op on unpartitioned GPUs (e.g. consumer Blackwell).
+
+  **The workgroup→domain map is vendor-specific and is MEASURED, not assumed.**
+  `interp`'s `cu` is `blockIdx.x`, a *logical* index. NVIDIA fills a GPC with
+  consecutive blocks (`n / sms_per_partition`); AMD's dispatcher assigns
+  workgroups to XCDs **round-robin** (`n % partition_count`) — measured at
+  **100.0%** against `HW_REG_XCC_ID` on MI355X over six geometries
+  (`runtime/tests/xcd_map_gfx950_test.hip`), where the block formula scores 12.5%.
+  Using the wrong one still emits correct tokens; it just destroys the locality it
+  claims to create, invisibly. `L2Map` in `packet::devbuild` carries this as data.
+
+  The locality is realized by the runtime half (`-DPLOW_L2_PLACE_DISPATCH`, or the
+  `PLOW_L2_PLACE=1` arm of `scripts/build_gfx950.sh`), where each workgroup takes
+  its window from the domain it is **physically** running on and all domains drain
+  concurrently in one launch. Costs nothing: 248 VGPR / occ 2 / 0 spill, identical
+  to the plain GQ decode object (`scripts/l2_regcheck.sh`).
+
+  Guards: placement is **skipped** (byte-identical, with a note) when the block map
+  would run off the end (`n_cu > partition_count·sms` — occupancy>1 or a
+  grid≠sm_count mismatch; round-robin needs no such guard and is measured to hold
+  at occupancy 2), and on any program with **more than one wave class on a target
+  that relaunches per segment** — there `seg` already carries the class the host
+  dispatches on, and overwriting it sends the whole prefill to the 4-wave flash
+  object and returns zero logits. So on gfx950 the **decode** program is placed and
+  prefill is not. A placement blob carries a header flag (`PLOW_BLOB_F_L2DOM`, plus
   SMs/partition + domain count in `reserved`) that a runtime **without**
-  `PLOW_NV_PLACE_DISPATCH` refuses at load (its `seg` is a domain, not a
-  wave-class). See `plans/devblob-locality-placement.md`.
+  `PLOW_L2_PLACE_DISPATCH` refuses at load. See `plans/l2-placement-generic.md`.
+
+  **Measured on Gemma-4-31B decode (MI355X, 3 interleaved folds, 64 steps): no
+  effect** — 16.57 vs 16.54 ms/token, with fold deltas of +2.7%, −3.1%, −0.2%.
+  Expected, and the arithmetic says so: decode streams **61.4 GB of weights per
+  token** with zero reuse, against ~7 MB of activations, so even perfect L2 capture
+  addresses ~0.01% of the traffic. The mechanism works (8 windows, 3.0% skew,
+  token-identical); the *lever* is not on this workload. See the plan for where it
+  is.
 
 ### Enabling fp8 (a compile/emit-time decision, off by default)
 
@@ -239,11 +365,95 @@ Full fp8 "beat-vLLM" profile:
 # 1. weight twins (per-row e4m3 + f32 scales under fp8/ next to the checkpoint)
 python perf-data/harness/quantize_fp8.py <hf-dir>          # + regenerate to include the head for E5
 # 2. emit the fp8 blob (fp8 twins auto-detected; add the E5 head + argmax fusion)
+# NVIDIA (sm_120):
 PLOW_UNISEG=1 PLOW_FP8_HEAD=1 PLOW_FUSE_ARGMAX=1 \
     cargo run --release -p plowc -- --hf-dir <hf-dir> --emit devblob --max-ctx <ctx> --n-cu 188 --out model.pkt
+# AMD (gfx950) — no PLOW_UNISEG, axis-named precision flags:
+PLOW_W8A8=1 PLOW_FP8_HEAD=1 PLOW_FUSE_ARGMAX=1 \
+    cargo run --release -p plowc -- --hf-dir <hf-dir> --emit devblob --arch gfx950 --gpu mi355x --max-ctx <ctx> --out model.pkt
 # 3. build the interp cubins with the fp8 kernel arms
 scripts/build_sm120_cubin.sh <out> -DPLOW_NV_W8A8=ON -DPLOW_FP8_KV=ON
 ```
+
+**On AMD (gfx950) the profile above is `PLOW_W8A8=1` (older spelling:
+`PLOW_FP8=1 PLOW_W8A8=1`), plus `PLOW_KV_FP8=1` for an fp8 KV cache — plain
+`PLOW_FP8=1` is refused at emit, deliberately.**
+
+The precision flags are named by **axis**: `PLOW_W8A16` / `PLOW_W8A8` /
+`PLOW_W4A16` for weights+activations, `PLOW_KV_FP8` for the KV cache, and
+`PLOW_MOE_ENC=` for the routed experts. `PLOW_FP8` and `PLOW_FP8_KV` remain as
+aliases. Setting two weight flags is refused. The axes are independent and
+compose: bf16 weights with an fp8 KV is a legal combination and has its own
+object — it did not, once, because the KV axis silently expanded to the weight
+axis too.
+
+**The spelling differs by model family, because the kernels do.** An axis name
+promises an encoding, so where a family cannot realize one it refuses rather
+than resolving to the nearest thing it has:
+
+| family | fp8 weights, bf16 acts | fp8 weights + fp8 acts | fp8 KV |
+|---|---|---|---|
+| dense (Gemma / Llama / Qwen) | `PLOW_W8A16=1` — **sm_120 only** | `PLOW_W8A8=1` — **the gfx950 recipe** | `PLOW_KV_FP8=1` |
+| MLA+MoE (Kimi / GLM / DeepSeek) | `PLOW_W8A16=1` — works on gfx950 | **not implementable, refuses** | `PLOW_KV_FP8=1` |
+
+The asymmetry is real, not an oversight. "fp8 weights, bf16 activations" is a
+per-*channel* fp8 GEMM on the dense path, which gfx950 has no arm for, and a
+*block*-fp8 GEMV on the MLA path, which it does. Same axis value, different
+kernels, different coverage. And the MLA family's expert ops (45/46/48/49) are
+w8a16 in **every** instantiation — the block-fp8 arms take fp8 weights and leave
+the activation bf16 — so `PLOW_W8A8` there would hand back w8a16 under a flag
+that named w8a8 precisely. It refuses instead, naming `moe_w8a8` and pointing at
+`PLOW_W8A16` (fp8 weights) or `PLOW_MXFP4` (A4W4, the one path in that family
+that narrows the activation too).
+
+For a checkpoint that is already quantized — GLM-5.2-FP8, say — **no precision
+flag is needed at all**: the encoding is read from `quantization_config`. Note
+the two traps there, both live in that config: the key is **`dtype`, not
+`torch_dtype`** (HF renamed it), and `dtype` reads `"bfloat16"` on an e4m3
+checkpoint anyway, because it describes the *compute* dtype while the storage
+dtype lives in `quantization_config`. The checkpoint wins over the flags — it is
+a fact, they are a request — and a contradiction is refused rather than silently
+granted or silently ignored.
+
+There is deliberately **no separate activation flag**. w8a8 is one *profile*,
+not a free cross-product with w8a16 — the kernels instantiate exactly those
+two — so a `PLOW_A8` would name combinations no object implements, which is the
+failure this naming exists to prevent. The activation encoding is *derived* and
+reported in the manifest as `precision.act_enc`, read off **`QuantFp8`'s
+presence** (the op that *is* the activation quant) rather than inferred from the
+weight flag. That inference is precisely what once let a w8a16 packet reach a
+w8a8-only object.
+
+**Keep `--arch` and `--gpu` in agreement** unless you are deliberately
+cross-compiling; a mismatch now warns. Two assets in this tree were emitted
+`--arch sm_120a` with `--n-cu 256` (an MI350X count) and then run on gfx950 —
+an arch/GPU disagreement is trusted toward the **GPU**, because `--arch` records
+intent while `--gpu` records what the packet was actually sized for. `PLOW_FP8=1` alone emits
+**w8a16**: it leaves the activation scale `t[3]` unbound because activations
+stay bf16. But the gfx950 `GEMM_FP8` arm is **w8a8** — its epilogue computes
+`acc * a_scale[m] * w_scale[n]` with no null check, and reads the A operand as
+packed bytes. Handed a w8a16 packet it would fault on the null scale, and
+misread A even if the scale were bound.
+
+plowc therefore refuses, naming the fix, rather than upgrading w8a16 → w8a8 on
+your behalf. Every other substitution the emitter makes is
+computation-preserving (picking a 128×128 tile over 256×256 computes the same
+matmul); this one is not, because w8a8 quantizes the *activations* too. Silently
+switching would change a run's numerics under a flag you set to mean something
+else, and any accuracy number would then be filed against the wrong profile. The
+check keys off the emitted stream — any fp8 GEMM with an unbound `a_scale` —
+not off the flags, so it cannot drift if the fp8 branching is restructured.
+sm_120 has a real w8a16 cubin and is unaffected.
+
+The fp8 weight twins are keyed **verbatim, including the `fp8/` prefix** — the
+key is the packet tensor name exactly, with no stripping on either side. The
+emitter declares `fp8/<name>`, `quantize_fp8.py` writes `fp8/<name>`, and the
+loader looks up `fp8/<name>`. Stripping is a transformation, and a
+transformation applied in one place but not another is exactly how this broke
+once already (a freshly generated twin file could not be loaded at all).
+`checkpoint.rs`'s coverage gate does map `fp8/<name>` → `<name>`, but only to
+ask "is the bf16 weight covered?" — that is a coverage question, not the key
+rule, and copying that line into a loader is what caused the mismatch.
 
 Measured (gemma-4-31B, single-user): fp8 **decode beats vLLM-fp8** (−41% vs vLLM
 bf16, parity-to-−3% vs vLLM fp8); fp8 **prefill** beats vLLM-bf16 at 32k and
@@ -437,7 +647,7 @@ measured *negative* and are kept only so nobody re-runs them.
 | `PLOW_NV_FORCE_MINBLK` | off | force a `__launch_bounds__` min-blocks-per-SM. |
 | `PLOW_NV_THREADS`, `PLOW_THREADS` | 256 | block size. Raising it is the precondition for BQ=64 flash tiling (px8 found BQ=64 is *register*-infeasible at 256). |
 | `PLOW_NV_EMBED_SMEM` | 0 | embed the object's smem requirement so `serve` reads it instead of guessing the GF=2 default (a GF_FULL=4 flash-decode then indexed past the arena). |
-| `PLOW_NV_PLACE_DISPATCH` | off | L2 placement dispatch. |
+| `PLOW_L2_PLACE_DISPATCH` | off | L2 placement dispatch (alias: `PLOW_NV_PLACE_DISPATCH`). Vendor-neutral — GPC on NVIDIA, XCD on AMD. |
 
 **Measurement-only — never ship a build with these.** All produce wrong logits
 by construction.

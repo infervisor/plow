@@ -57,7 +57,13 @@ struct SimResult {
     mean_wait: f64,
     p50: f64,
     p99: f64,
+    /// Reported by `simulate` for the record, not consumed by the caller: the
+    /// service distribution's mean and coefficient of variation are what make a
+    /// wait number interpretable (M/G/1 wait scales with `1 + cv^2`), so they
+    /// are computed where they are known rather than re-derived at the print.
+    #[allow(dead_code)]
     mean_service: f64,
+    #[allow(dead_code)]
     cv: f64,
     rho: f64,
 }

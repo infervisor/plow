@@ -57,79 +57,12 @@ use crate::serve::{
 };
 use crate::Result;
 
-/// PX-1 packing measurement (RTX-12 baseline). When `PLOW_PF_PACKLOG=1`, the
-/// GPU tick accumulates wall time spent in the batched-prefill pass vs the
-/// batched-decode launch and periodically emits a `PACKLOG WALL ...` stderr
-/// line, so the bench can report the prefill/decode wall-time split per cell.
-/// Off by default → the hot path pays only cached relaxed atomic loads.
-mod packlog {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static PREFILL_NS: AtomicU64 = AtomicU64::new(0);
-    static DECODE_NS: AtomicU64 = AtomicU64::new(0);
-    static PREFILL_TICKS: AtomicU64 = AtomicU64::new(0);
-    static DECODE_TICKS: AtomicU64 = AtomicU64::new(0);
-    static TICKS: AtomicU64 = AtomicU64::new(0);
-    /// Decode-launch wall spent on ticks that ALSO ran a prefill chunk. This is
-    /// exactly the wall a fused prefill⊕decode launch could address (PX-17):
-    /// on a pure-decode tick there is no prefill launch to fold into.
-    static MIXED_DECODE_NS: AtomicU64 = AtomicU64::new(0);
-    static MIXED_TICKS: AtomicU64 = AtomicU64::new(0);
-    /// Σ decode rows over mixed ticks / over all decode ticks — the fused tile
-    /// would have to reserve `rows` of the prefill bucket.
-    static MIXED_ROWS: AtomicU64 = AtomicU64::new(0);
-    static DECODE_ROWS: AtomicU64 = AtomicU64::new(0);
-
-    crate::env_flag!(pub fn on, "PLOW_PF_PACKLOG");
-
-    /// Record one GPU tick's prefill-pass and decode-launch wall times (ns).
-    /// `did_prefill`/`did_decode` count how many ticks touched each phase, and
-    /// `rows` is the decode batch this tick fed. Emits a cumulative summary
-    /// every 250 ticks; the bench slices the log by line-count brackets to get
-    /// per-cell deltas.
-    pub fn record(
-        prefill_ns: u64,
-        decode_ns: u64,
-        did_prefill: bool,
-        did_decode: bool,
-        rows: usize,
-    ) {
-        PREFILL_NS.fetch_add(prefill_ns, Ordering::Relaxed);
-        DECODE_NS.fetch_add(decode_ns, Ordering::Relaxed);
-        if did_prefill {
-            PREFILL_TICKS.fetch_add(1, Ordering::Relaxed);
-        }
-        if did_decode {
-            DECODE_TICKS.fetch_add(1, Ordering::Relaxed);
-            DECODE_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
-            if did_prefill {
-                MIXED_DECODE_NS.fetch_add(decode_ns, Ordering::Relaxed);
-                MIXED_TICKS.fetch_add(1, Ordering::Relaxed);
-                MIXED_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
-            }
-        }
-        let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 250 == 0 {
-            emit();
-        }
-    }
-
-    fn emit() {
-        eprintln!(
-            "PACKLOG WALL prefill_ns={} decode_ns={} prefill_ticks={} decode_ticks={} ticks={} \
-             mixed_decode_ns={} mixed_ticks={} mixed_rows={} decode_rows={}",
-            PREFILL_NS.load(Ordering::Relaxed),
-            DECODE_NS.load(Ordering::Relaxed),
-            PREFILL_TICKS.load(Ordering::Relaxed),
-            DECODE_TICKS.load(Ordering::Relaxed),
-            TICKS.load(Ordering::Relaxed),
-            MIXED_DECODE_NS.load(Ordering::Relaxed),
-            MIXED_TICKS.load(Ordering::Relaxed),
-            MIXED_ROWS.load(Ordering::Relaxed),
-            DECODE_ROWS.load(Ordering::Relaxed),
-        );
-    }
-}
+// The `PLOW_PF_PACKLOG=1` accumulator that used to live here (a `mod packlog` of nine atomics
+// plus `on`/`record`/`emit`) has been REMOVED: nothing had called `record()` since the GPU tick
+// stopped invoking it, so it accumulated nothing and `emit()` would have printed nine zeros.
+// The flag itself is still live and still does what its name says — `exec/gpu.rs:3319` writes
+// the per-launch `PACKLOG R=... rows=... bucket=... chunks=[...]` line the RTX-12 packing bench
+// parses. That is the one the bench reads; this was a second, silent copy of the idea.
 
 /// Admission sheds only when the predicted wait exceeds this many ticks of the
 /// engine's observed service time (or the configured `slo_ms` floor, whichever
@@ -243,6 +176,12 @@ struct Slot {
     /// KV arena handle held for this slot's lifetime. `None` when the bundle
     /// has no `KvPaging` (test bundles / models without attention).
     kv: Option<SlotHandle>,
+    /// When the request was handed to the dispatcher ([`Job::arrived`]). Read
+    /// only by the §TTFT breakdown (`PLOW_TTFT_LOG=1`), to charge the interval
+    /// between submit and the tick that actually prefills it — which today only
+    /// the gfx950 arm does.
+    #[cfg_attr(not(feature = "hsa"), allow(dead_code))]
+    arrived: Instant,
 }
 
 /// Buffers reused across ticks for one bucket. Reallocated only when the live
@@ -288,7 +227,7 @@ pub fn spawn(
     // GPU-engine bundles are bucketless: the ceiling is the engine's compiled
     // decode batch (PLOW_DECODE_BATCH), one slot per engine sequence slot —
     // mux slot i IS engine slot i.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     let capacity = state
         .gpu_engine(bundle.network())
         .map(|e| e.lock().batch())
@@ -361,9 +300,9 @@ pub fn spawn(
         let mut oob_events: Vec<OobMsg> = Vec::new();
         // GPU-engine models never run the CPU bucket walk — skip the ladder
         // scan + bufs machinery on the dispatcher critical path entirely.
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "hsa"))]
         let has_gpu = state.gpu_engine(bundle.network()).is_some();
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(any(feature = "cuda", feature = "hsa")))]
         let has_gpu = false;
         // Dedicated engine/submission thread for GPU models: every tick runs
         // on ONE persistent OS thread (CUDA context bound once, no
@@ -755,6 +694,7 @@ fn admit_into(
         prompt_ids: job.prompt_ids,
         out_ids: Vec::new(),
         gen: job.gen,
+        arrived: job.arrived,
         respond: job.respond,
         prefix_offset: 0,
         read_offset: 0,
@@ -863,9 +803,21 @@ fn run_one_tick(
     // table is sized to it at spawn, so mux slot i IS engine slot i). Per
     // tick: prefill each new arrival into its own KV slot (sequential), then
     // ONE batched decode launch advances every already-running slot.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
     if let Some(eng) = state.gpu_engine(bundle.network()) {
-        let mut e = eng.lock();
+        let mut guard = eng.lock();
+        // Per-backend tick bodies, because the two engines differ in kind: the
+        // sm_120 engine is slotted (B sequences, chunked prefill, prefix
+        // sharing, device sampling) and the gfx950 one is single-sequence.
+        //
+        // The CUDA arm's body is deliberately left at its original indentation
+        // and otherwise untouched — the only edits are `&mut e` -> `&mut *e`,
+        // now that `e` is a `&mut GpuEngine` rather than the lock guard. Keeping
+        // it un-reindented is what makes the diff prove the shipped path did not
+        // change; reflow it only in a commit that changes nothing else.
+        #[cfg(feature = "cuda")]
+        #[allow(irrefutable_let_patterns)]
+        if let crate::serve::engine::ServeEngine::Cuda(e) = &mut *guard {
         let stop = Arc::clone(e.stop_ids());
         let cap = e.batch();
 
@@ -918,7 +870,7 @@ fn run_one_tick(
             // prompt token through the batched decode step below — which both
             // writes its final KV row and produces its first token, batched
             // with every live decode stream.
-            gpu_prefill_batched_pass(&mut e, &mut slots, cap, &arena, feeds.is_empty());
+            gpu_prefill_batched_pass(&mut *e, &mut slots, cap, &arena, feeds.is_empty());
             for i in 0..slots.len().min(cap) {
                 let Some(s) = slots[i].as_ref() else { continue };
                 if s.step != 0 {
@@ -994,7 +946,7 @@ fn run_one_tick(
                 }
                 let slot_opt = &mut slots[i];
                 let res = gpu_prefill_advance(
-                    &mut e,
+                    &mut *e,
                     i,
                     slot_opt.as_mut().expect("checked Some"),
                     cap_rows,
@@ -1137,7 +1089,7 @@ fn run_one_tick(
                         let finished = if was_dev {
                             Ok(argmax_tok)
                         } else {
-                            gpu_finish_token(&mut e, i, slot, argmax_tok)
+                            gpu_finish_token(&mut *e, i, slot, argmax_tok)
                         };
                         match finished {
                             Ok(token) => {
@@ -1188,6 +1140,186 @@ fn run_one_tick(
             );
         }
         return (slots, bufs, obs, tokens_this_tick, did_prefill);
+        }
+
+        // gfx950: B independent sequence slots, one decode dispatch for all of
+        // them. Mux slot `i` IS engine slot `i`, so no owner map is needed —
+        // the engine's slot table and this one are the same indices.
+        //
+        // A tick is EITHER one prefill (the prefill program is single-sequence
+        // and holds the whole device, so at most one per tick, and on a
+        // decode-only packet like GLM-5.2's it is `n` decode dispatches) OR one
+        // batched decode step across every live slot. Prefill is not chunked
+        // and not interleaved — that is the deliberate difference from the CUDA
+        // engine, and it is what bounds TTFT under load by the longest prompt.
+        //
+        // Irrefutable in an hsa-only build (the enum then has one variant) and
+        // refutable alongside `cuda` — the same arm has to compile as both.
+        #[cfg(feature = "hsa")]
+        #[allow(irrefutable_let_patterns)]
+        if let crate::serve::engine::ServeEngine::Amd(e) = &mut *guard {
+            let stop = Arc::clone(e.stop_ids());
+            let b = e.batch();
+
+            // `capacity` is `batch()`, so this is only reachable on a mismatch;
+            // a loud rejection beats a hang.
+            for slot_opt in slots.iter_mut().skip(b) {
+                if let Some(taken) = slot_opt.take() {
+                    tracing::warn!("amd: slot past engine batch rejected");
+                    release_kv(&arena, taken.kv);
+                    let _ = taken.respond.try_send(StreamChunk::Err(
+                        crate::RuntimeError::Rejected(format!(
+                            "AMD engine serves {b} sequence slots"
+                        )),
+                    ));
+                }
+            }
+
+            // Client gone — don't spend a launch on a dead stream, and free its
+            // engine slot so the next arrival can have it.
+            for i in 0..b.min(slots.len()) {
+                if slots[i].as_ref().map(|s| s.respond.is_closed()).unwrap_or(false) {
+                    if let Some(taken) = slots[i].take() {
+                        release_kv(&arena, taken.kv);
+                    }
+                    e.release(i);
+                }
+            }
+
+            // The gfx950 engine samples on device and the host never sees the
+            // logit row, so there is no host resample to apply — every token is
+            // the device argmax. Say so ONCE rather than let a `temperature`
+            // the caller set be silently discarded: greedy output that claims to
+            // be sampled is the failure mode worth being loud about.
+            if slots
+                .iter()
+                .flatten()
+                .any(|s| s.gen.params.temperature > 0.0)
+            {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        "amd: temperature > 0 requested, but the gfx950 engine samples \
+                         greedily on device — serving the argmax. Penalties, top_p, \
+                         top_k and logit_bias are ignored on this backend."
+                    );
+                });
+            }
+
+            // ONE prefill per tick, lowest slot first. Everything else waits;
+            // the dispatcher loops straight back, so a second pending prompt is
+            // admitted on the next tick.
+            let pending = (0..b.min(slots.len()))
+                .find(|&i| slots[i].as_ref().map(|s| s.step == 0).unwrap_or(false));
+            if let Some(i) = pending {
+                // §DISAGG phase-0. The AMD tick is EITHER a prefill OR a decode
+                // (this arm returns before the decode launch below), so unlike
+                // the CUDA arm there is no fused launch and `mixed_decode_ns`
+                // is ZERO BY CONSTRUCTION. What disaggregation can recover here
+                // is therefore the WHOLE prefill tick, during which every live
+                // decode stream is stalled — so `prefill_ns / (prefill_ns +
+                // decode_ns)` is the ceiling, not the mixed ratio.
+                let pk_t = packlog::on().then(Instant::now);
+                let slot_ref = slots[i].as_ref().expect("found above");
+                let prompt = slot_ref.prompt_ids.clone();
+                // §TTFT: everything between `mux.submit` and this line — the
+                // dispatcher wake, the formation hold, admission, and the
+                // engine-thread handoff.
+                crate::obs::ttft::QUEUE.add(slot_ref.arrived.elapsed().as_nanos() as u64);
+                let t_pf = std::time::Instant::now();
+                let pf = e.prefill(i, &prompt);
+                crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
+                match pf {
+                    Ok(token) => {
+                        if let Some(s) = slots[i].as_mut() {
+                            s.pf_pos = s.prompt_ids.len();
+                        }
+                        tracing::debug!(token, slot = i, "amd: prefill token");
+                        let t_tok = std::time::Instant::now();
+                        handle_produced_token(
+                            &mut slots[i],
+                            &arena,
+                            bundle,
+                            token,
+                            1,
+                            &mut tokens_this_tick,
+                            Some(stop.as_slice()),
+                        );
+                        crate::obs::ttft::FIRST_TOK.add(t_tok.elapsed().as_nanos() as u64);
+                        if slots[i].is_none() {
+                            e.release(i);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(slot = i, error = %err, "amd: prefill failed");
+                        if let Some(taken) = slots[i].take() {
+                            release_kv(&arena, taken.kv);
+                            let _ = taken.respond.try_send(StreamChunk::Err(err));
+                        }
+                        e.release(i);
+                    }
+                }
+                if let Some(t) = pk_t {
+                    packlog::record(t.elapsed().as_nanos() as u64, 0, true, false, 0);
+                }
+                return (slots, bufs, obs, tokens_this_tick, true);
+            }
+
+            // Decode: every live slot feeds the token it last produced.
+            let feeds: Vec<(usize, u32)> = (0..b.min(slots.len()))
+                .filter_map(|i| {
+                    let s = slots[i].as_ref()?;
+                    Some((i, *s.out_ids.last()?))
+                })
+                .collect();
+            if feeds.is_empty() {
+                return (slots, bufs, obs, tokens_this_tick, false);
+            }
+            let pk_t = packlog::on().then(Instant::now);
+            let pk_rows = feeds.len();
+            match e.step_batch(&feeds) {
+                Ok(out) => {
+                    for (i, token) in out {
+                        tracing::debug!(token, slot = i, "amd: token");
+                        handle_produced_token(
+                            &mut slots[i],
+                            &arena,
+                            bundle,
+                            token,
+                            1,
+                            &mut tokens_this_tick,
+                            Some(stop.as_slice()),
+                        );
+                        if slots[i].is_none() {
+                            e.release(i);
+                        }
+                    }
+                }
+                Err(err) => {
+                    // The batched launch failed — every fed slot loses.
+                    tracing::warn!(error = %err, fed = feeds.len(), "amd: decode failed");
+                    let msg = err.to_string();
+                    for &(i, _) in &feeds {
+                        if let Some(taken) = slots[i].take() {
+                            release_kv(&arena, taken.kv);
+                            let _ = taken
+                                .respond
+                                .try_send(StreamChunk::Err(crate::RuntimeError::Msg(msg.clone())));
+                        }
+                        e.release(i);
+                    }
+                }
+            }
+            if let Some(t) = pk_t {
+                packlog::record(0, t.elapsed().as_nanos() as u64, false, true, pk_rows);
+            }
+            return (slots, bufs, obs, tokens_this_tick, false);
+        }
+
+        #[allow(unreachable_code)]
+        {
+            unreachable!("ServeEngine variant with no tick body")
+        }
     }
 
     // Owner map for the batched path: row `b` in the SAMPLE_BATCH tile is the
@@ -1390,21 +1522,7 @@ fn predicted_wait_ms(live: usize, capacity: usize, service_ms: f64) -> f64 {
 /// other slots are mid-decode. `PLOW_PF_INTERLEAVE` overrides (rows; `0` =
 /// whole prompt in one tick, the pre-interleave behavior). Read once.
 #[cfg(feature = "cuda")]
-fn pf_interleave_rows() -> usize {
-    use std::sync::OnceLock;
-    static ROWS: OnceLock<usize> = OnceLock::new();
-    *ROWS.get_or_init(|| {
-        let rows = std::env::var("PLOW_PF_INTERLEAVE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2048);
-        if rows == 0 {
-            usize::MAX
-        } else {
-            rows
-        }
-    })
-}
+crate::env_usize!(fn pf_interleave_rows, "PLOW_PF_INTERLEAVE", default 2048, zero = unbounded);
 
 /// PX-17 throughput mode: with `PLOW_PF_DEFER_DECODE=1`, a tick that still has
 /// ANY slot mid-prefill runs its prefill chain to completion and skips the
@@ -1440,22 +1558,9 @@ fn pf_defer_decode() -> bool {
 /// canary; packing is numerics-neutral, so C only changes which requests share
 /// a launch, never any request's tokens). Read once. Default `0` (off) — this
 /// is opt-in alongside `PLOW_PF_BATCH=1`, matching the rest of the PX-1 knobs.
+/// Unset and `0` both mean uncapped, so the default IS the zero sentinel.
 #[cfg(feature = "cuda")]
-fn pf_chunk_rows() -> usize {
-    use std::sync::OnceLock;
-    static ROWS: OnceLock<usize> = OnceLock::new();
-    *ROWS.get_or_init(|| {
-        let c = std::env::var("PLOW_PF_CHUNK")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
-        if c == 0 {
-            usize::MAX
-        } else {
-            c
-        }
-    })
-}
+crate::env_usize!(fn pf_chunk_rows, "PLOW_PF_CHUNK", default usize::MAX, zero = unbounded);
 
 /// PX-1: pack every mid-prefill slot's next chunk into shared batched-prefill
 /// launches. Per launch, each waiting request contributes up to its remaining
@@ -1766,7 +1871,15 @@ fn handle_produced_token(
         &mut slot.read_offset,
     );
 
-    // Client dropped → free the slot (implicit cancellation).
+    // `try_send` fails two ways and they are NOT the same event: `Closed` is
+    // the client dropping (implicit cancellation, the intended path) and `Full`
+    // is a consumer 32 tokens behind (`serve/stream.rs` bounds the channel at
+    // 32 — ~1.3 s at 40 ms/token, reachable on a slow SSE reader or TCP
+    // backpressure). Both free the slot WITHOUT a `Done` or an `Err`, so the
+    // receiver only sees the stream end. The receiving side must therefore
+    // never render a terminal-less stream as a clean stop — see
+    // `chat::buffer_and_reply` and `chat::sse_response`, which is where that is
+    // enforced.
     if slot
         .respond
         .try_send(StreamChunk::Token {

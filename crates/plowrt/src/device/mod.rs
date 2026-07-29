@@ -56,9 +56,19 @@ pub fn select(executors: u32) -> Arc<dyn Backend> {
     Arc::new(cpu::CpuBackend::new(executors))
 }
 
-/// Enumerate ALL visible devices and return a backend per device.
-/// Multi-GPU: returns one entry per GPU (TP/PP placement is per-device).
-/// Falls back to a single CPU backend if no accelerators are found.
+/// Enumerate ALL visible devices and return a backend per device, in ordinal
+/// order.
+///
+/// Multi-GPU bring-up (`plans/tp-design.md` §6a: `rank`, `n_gpu`) starts here:
+/// [`crate::exec::tp::TpGroup::split_replicas`] carves this list into the
+/// node's TP replicas, and a backend's position within its replica is its rank.
+/// Falls back to a single CPU backend if no accelerators are found; that
+/// fallback is a one-element vector, never a fake multi-device set, so
+/// [`crate::exec::tp`] fails the bring-up loudly instead of pretending to shard.
+///
+/// On AMD the visible set is chosen by **`ROCR_VISIBLE_DEVICES`**, not
+/// `HIP_VISIBLE_DEVICES`: plowrt dlopens ROCr directly and never loads the HIP
+/// runtime, so the HIP variable has no effect here.
 pub fn select_all(executors_per_device: u32) -> Vec<Arc<dyn Backend>> {
     let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
 
@@ -80,14 +90,26 @@ pub fn select_all(executors_per_device: u32) -> Vec<Arc<dyn Backend>> {
 
     #[cfg(feature = "hsa")]
     if backends.is_empty() {
-        if let Ok(b) = hsa::HsaBackend::new(0) {
-            backends.push(Arc::new(b));
-            for dev in 1..8u8 {
-                match hsa::HsaBackend::new(dev) {
-                    Ok(b) => backends.push(Arc::new(b)),
-                    Err(_) => break,
+        // Ordinal 0 answers how many agents there are, so the rest of the loop
+        // enumerates rather than probing-until-error. Probing hid two failures
+        // behind the same `break`: "that was the last device" and "device 3
+        // could not be initialised", and the latter would have silently
+        // produced a 3-rank group where 8 were asked for.
+        match hsa::HsaBackend::new(0) {
+            Ok(first) => {
+                let n = first.gpu_count();
+                backends.push(Arc::new(first));
+                for dev in 1..n as u8 {
+                    match hsa::HsaBackend::new(dev) {
+                        Ok(b) => backends.push(Arc::new(b)),
+                        Err(e) => {
+                            tracing::error!(%e, dev, n, "HSA agent enumerated but not usable");
+                            break;
+                        }
+                    }
                 }
             }
+            Err(e) => tracing::warn!(%e, "HSA probe failed"),
         }
     }
 
@@ -126,6 +148,90 @@ pub struct ExecutorTarget {
     pub shmem_bytes: u32,
     /// Bitmask of supported opcode families (bit = `Opcode::family`).
     pub opcode_mask: u32,
+}
+
+/// Peer-mapped device memory — the substrate the inline cross-GPU collectives
+/// ride on (`plans/tp-design.md` §7, `plans/tp-transport.md` §3).
+///
+/// The point of this trait is a buffer that a kernel on *any* GPU may load,
+/// store, and run a **system-scope atomic** on, so a collective is a gated
+/// packet inside the resident megakernel rather than a launched RCCL kernel
+/// with a host-stream sync. Re-measured on this node (gfx950 ×8, ROCm 7.2.4,
+/// `runtime/tests/tp_p2p_bench`): a peer store sustains 58.6 GB/s and the
+/// system-scope atomic handshake is ~0.06 µs one-way, against 13.95 µs for an
+/// 8 KB SDMA copy. At ~96 all-reduces per decode token those 13.95 µs would be
+/// 1.3 ms/token of pure sync — which is why [`copy_peer_blocking`] is labelled
+/// bulk-only and is not the decode path.
+///
+/// Keep the peer-mapped footprint minimal (§7c): only reduction partials, their
+/// result, and the cross-GPU counters cross the fabric. Weights, KV, and the
+/// replicated residual stream stay in local HBM so each rank streams its shard
+/// at the full local bandwidth that is the entire point of sharding.
+///
+/// [`copy_peer_blocking`]: PeerMemory::copy_peer_blocking
+pub trait PeerMemory: Send + Sync {
+    /// This device's ordinal within the visible set.
+    ///
+    /// NOT a TP rank: on a node running two TP4 replicas, replica 1's rank 0
+    /// has ordinal 4. Everything that names a *device* (an allow-list entry, a
+    /// copy destination) takes an ordinal; everything that indexes the
+    /// peer-pointer table takes a rank.
+    fn ordinal(&self) -> u8;
+
+    /// How many GPUs this backend can map a peer buffer across. The TP degree
+    /// may be smaller; it may never be larger.
+    fn peer_agent_count(&self) -> u32;
+
+    /// Allocate `bytes` of device memory on THIS device, mapped into exactly
+    /// the devices named by `peers` (device ordinals; must include this one).
+    ///
+    /// Every peer sees the same virtual address, so one `u64` per rank is the
+    /// whole peer-pointer table — no per-rank translation.
+    ///
+    /// The list is explicit rather than "all visible GPUs" because an 8-GPU
+    /// node runs **two independent TP4 replicas**, and a replica's partials
+    /// must not be addressable from the other's ranks. Mapping everything
+    /// everywhere would still compute correct tokens — the wrong rank simply
+    /// never reads the buffer — which is exactly why the isolation has to be
+    /// enforced at the mapping and not left to convention.
+    fn alloc_peer(&self, bytes: u64, peers: &[u8]) -> Result<DeviceMem>;
+
+    /// Zero `bytes` of this device's memory at `dptr`, through the copy engine.
+    ///
+    /// Exists as its own entry point because it is the ONLY host work left on
+    /// the per-token path (`XctrReset::Host`), so it must not pay the generic
+    /// upload path's per-call page-pin and signal churn. Backends are expected
+    /// to keep a preallocated zero source and reuse it.
+    ///
+    /// Even so this is a copy-engine submit + completion round-trip, whose floor
+    /// is ~8–17 µs regardless of size — see [`PeerMemory::peer_host_writable`]
+    /// for the 50× cheaper route where the platform allows it.
+    fn zero_peer(&self, dptr: u64, bytes: u64) -> Result<()>;
+
+    /// Whether a peer allocation from this backend is also mapped into the HOST
+    /// address space, so `dptr` can be dereferenced by the host directly.
+    ///
+    /// Measured on gfx950/ROCm 7.2.4: **true** (large BAR), and the difference
+    /// is not marginal — zeroing a 12 KiB counter region costs **0.32 µs** as
+    /// host stores against **16.8 µs** through [`PeerMemory::zero_peer`]'s copy
+    /// engine, with the device reading back the host's bytes correctly.
+    fn peer_host_writable(&self) -> bool {
+        false
+    }
+
+    /// Blocking device→device copy from this device into `dst_ordinal`'s memory.
+    ///
+    /// BULK/PREFILL and test path ONLY. This is the copy-engine route, whose
+    /// small-message floor is the submit+completion round-trip (13.95 µs
+    /// measured at 8 KB), not the wire. The decode collective must be the
+    /// in-kernel peer store gated by a system-scope atomic instead.
+    fn copy_peer_blocking(
+        &self,
+        dst_ordinal: u8,
+        dst: u64,
+        src: u64,
+        bytes: u64,
+    ) -> Result<()>;
 }
 
 /// Frees one device allocation. Implemented by GPU backends; every **owned**
@@ -260,6 +366,18 @@ pub trait Backend: Send + Sync {
 
     /// Launch the persistent kernel once (no-op / thread-spawn on CPU).
     fn launch_persistent(&self, module: &Module, cfg: LaunchCfg) -> Result<()>;
+
+    /// The peer-memory facility, when this backend has one.
+    ///
+    /// Borrowed rather than `Arc`-returned so [`Backend`] stays object-safe: the
+    /// runtime holds `Arc<dyn Backend>` and a multi-GPU group needs to ask each
+    /// member "can you be a TP rank?" without downcasting to a vendor type. A
+    /// `None` here is the honest answer for the CPU reference backend and for
+    /// any GPU backend that has not grown peer mapping yet — [`crate::exec::tp`]
+    /// refuses the bring-up rather than silently degrading to host staging.
+    fn peer(&self) -> Option<&dyn PeerMemory> {
+        None
+    }
 
     /// Allocate the counter region: host-pinned **device-mapped** memory whose
     /// [`DeviceMem::base`] is host-usable and whose device pointer is handed to

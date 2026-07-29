@@ -62,6 +62,17 @@ fn mi350x_opts(out: PathBuf) -> Options {
 /// CI bucket count: 2 phases × 1 batch × 2 seqs = 4 buckets per model.
 const EXPECTED_BUCKETS: usize = 2 * 1 * 2; // 4
 
+/// Is there a `plow_verify` here? cfg-split because the crate is only a
+/// dependency when the feature is on.
+#[cfg(feature = "lean-verify")]
+fn verifier_present() -> bool {
+    lean_verify::binary_available()
+}
+#[cfg(not(feature = "lean-verify"))]
+fn verifier_present() -> bool {
+    false
+}
+
 #[test]
 fn gemma_family_compiles_on_mi350x() {
     for (name, path) in gemma_examples() {
@@ -77,6 +88,27 @@ fn gemma_family_compiles_on_mi350x() {
         ));
         let report = compile(&Source::Net(net), &mi350x_opts(out.clone()))
             .unwrap_or_else(|e| panic!("{name}: compile failed: {e}"));
+
+        // THE COMPILE SURVIVED A MISSING VERIFIER — and said so.
+        //
+        // `lean-verify` is in plowc's default feature set now, so this compile
+        // asks for the gate on every one of its buckets. On a box with no
+        // `plow_verify` it must warn, skip, and finish; before the degrade
+        // landed this exact test died with "spawn failed: No such file or
+        // directory" on bucket `decode_b1_s1`.
+        //
+        // And the skip must be VISIBLE. A gate that quietly does nothing is
+        // worth less than no gate, because it reads as a pass.
+        if cfg!(feature = "lean-verify") && !verifier_present() {
+            assert!(
+                !report.lean_verified,
+                "{name}: no plow_verify on this box, yet the report claims verification"
+            );
+            assert!(
+                !report.lean_provenance.is_empty(),
+                "{name}: lean_verified=false with no provenance is the `tier: portable` bug again"
+            );
+        }
 
         // All buckets compiled.
         assert_eq!(

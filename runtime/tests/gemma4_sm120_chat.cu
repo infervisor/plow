@@ -153,10 +153,8 @@ static int load_blob(const char* path, Blob* b) {
     if (fread(p, 1, (size_t)n, f) != (size_t)n) return 1;
     fclose(f);
     memcpy(&b->h, p, sizeof(PlowBlobHeader));
-    if (memcmp(b->h.magic, PLOW_BLOB_MAGIC, 8)) {
-        printf("bad blob magic — recompile with plowc (format changed)\n");
-        return 1;
-    }
+    { const char* e = plow_blob_magic_error(b->h.magic);
+      if (e) { printf("%s\n", e); return 1; } }
     uint8_t* q = p + sizeof(PlowBlobHeader);
     b->tensors = (PlowTensorDecl*)q; q += (size_t)b->h.n_tensor * sizeof(PlowTensorDecl);
     b->init = q;                     q += b->h.init_bytes;

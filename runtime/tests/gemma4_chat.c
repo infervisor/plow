@@ -90,10 +90,8 @@ static int load_blob(const char* path, Blob* b) {
     if (fread(p, 1, (size_t)n, f) != (size_t)n) return 1;
     fclose(f);
     memcpy(&b->h, p, sizeof(PlowBlobHeader));
-    if (memcmp(b->h.magic, PLOW_BLOB_MAGIC, 8)) {
-        printf("bad blob magic — recompile with plowc (format changed)\n");
-        return 1;
-    }
+    { const char* e = plow_blob_magic_error(b->h.magic);
+      if (e) { printf("%s\n", e); return 1; } }
     uint8_t* q = p + sizeof(PlowBlobHeader);
     b->tensors = (PlowTensorDecl*)q; q += (size_t)b->h.n_tensor * sizeof(PlowTensorDecl);
     b->init = q;                     q += b->h.init_bytes;
@@ -301,12 +299,52 @@ int main(int argc, char** argv) {
         if (ns > 512) ns = 512;
         g->n_seg = ns;
         for (uint32_t s = 0; s < ns; s++) g->seg_class[s] = 8;
-        for (uint32_t j = 0; j < g->h.n_stream; j++)
-            if (g->insts[g->stream[j].inst].op == PLOW_DOP_FLASH_PREFILL && g->stream[j].seg < 512)
-                g->seg_class[g->stream[j].seg] = 4;
+        /* A segment is wave-class 4 iff EVERY op in it is a flash_prefill, in either precision.
+         *
+         * "iff it HOLDS a flash_prefill" is what this used to say, and it is a trapdoor. The
+         * 4-wave object is compiled PLOW_BUCKET_FLASH: its whole body is
+         * `if (op == FLASH_PREFILL{,_FP8}) ...` and there is no switch at all — every other
+         * opcode is silently dropped. So classifying a MIXED segment as 4 runs its GEMMs, norms
+         * and lm_head on an object that cannot dispatch them, and writes nothing.
+         *
+         * That is not hypothetical. A packet whose `seg` tags are all 0 (plowc emitted exactly
+         * that after a regression — measured on a 2026-07-27 build) puts the entire prefill
+         * program in segment 0 alongside its flash packets, so the whole program was classified
+         * 4 and ran on the flash-only object: prefill "completed" in 8.7 ms instead of 72.1 ms
+         * and act.logits was all zero, which reads as a numerics bug and is a dispatch bug.
+         * With `all` the same packet is correct (verified: logit 20.75, same token ids as a
+         * properly segmented build) — just unsegmented, i.e. slower, which is what an
+         * unsegmented packet should cost.
+         *
+         * Testing only the bf16 opcode was the earlier version of this same mistake: it left
+         * every fp8-KV packet's flash segments classified 8, so they ran on the 8-wave
+         * interpreter without the 512-register budget the D=512 Q-hoist is built for (its 228
+         * spills are the deliberate trade; the 8-wave object caps at 256).
+         *
+         * NOTE the MLA prefill ops (51/55) are deliberately NOT flash here — they run on the
+         * 8-wave prefill_mla object, and interp_flash dispatches only FLASH_PREFILL{,_FP8}. */
+        for (uint32_t s = 0; s < ns; s++) g->seg_class[s] = 0; /* 0 = "nothing seen yet" */
+        for (uint32_t j = 0; j < g->h.n_stream; j++) {
+            const uint16_t o = g->insts[g->stream[j].inst].op;
+            const uint16_t s = g->stream[j].seg;
+            if (s >= 512) continue;
+            const uint8_t want =
+                (o == PLOW_DOP_FLASH_PREFILL || o == PLOW_DOP_FLASH_PREFILL_FP8) ? 4 : 8;
+            /* 8 wins: one non-flash op in the segment forces the general interpreter. */
+            if (g->seg_class[s] == 0 || want == 8) g->seg_class[s] = want;
+        }
+        for (uint32_t s = 0; s < ns; s++)
+            if (g->seg_class[s] == 0) g->seg_class[s] = 8; /* empty segment: harmless either way */
         /* MEASUREMENT: PLOW_SEG_OFF collapses every entry into segment 0 -> ONE launch per chunk
          * (the pre-segmentation baseline: all ops on the 8-wave interp, in emit order — identical
-         * numerics). The A/B against the default gives the pure per-segment-transition cost. */
+         * numerics). The A/B against the default gives the pure per-segment-transition cost.
+         *
+         * IT REWRITES ONLY THE STATIC STREAM. The global queue does not read stream[].seg at all;
+         * it bounds each launch by gq_seg_ofs[cur_seg..cur_seg+1] over the op-major gq_stream,
+         * which this cannot rewrite (collapsing it would mean re-deriving the op-major order).
+         * So SEG_OFF + GQ ran ONE SEGMENT'S WORTH of packets and reported a time for it: measured
+         * 0.9 ms for a 164 ms prefill, i.e. it looked like a 180x speedup and had simply done
+         * almost nothing. It is refused below rather than silently truncating. */
         if (getenv("PLOW_SEG_OFF")) {
             for (uint32_t j = 0; j < g->h.n_stream; j++) g->stream[j].seg = 0;
             g->n_seg = 1;
@@ -356,6 +394,15 @@ int main(int argc, char** argv) {
     if (getenv("PLOW_STATIC_PREFILL")) gq_pre = 0;
     if (getenv("PLOW_STATIC_DECODE"))  gq_dec = 0;
     if ((gq_pre || gq_dec) && !(B.h.flags & PLOW_BLOB_F_GQ)) { gq_pre = gq_dec = 0; printf("pkt has no GQ stream -> static\n"); }
+    /* PLOW_SEG_OFF only collapses the STATIC stream (see above), so combining it with the global
+     * queue measures one segment and calls it a prefill. Refuse: a benchmark that quietly does
+     * less work is worse than one that does not run. PLOW_STATIC=1 is the supported pairing. */
+    if (getenv("PLOW_SEG_OFF") && (gq_pre || gq_dec)) {
+        printf("PLOW_SEG_OFF is a STATIC-scheduler measurement and cannot collapse the global\n"
+               "queue's gq_seg_ofs window — it would run one segment and report it as the whole\n"
+               "prefill. Re-run with PLOW_STATIC=1 (or PLOW_STATIC_PREFILL=1).\n");
+        return 1;
+    }
     if (gq_pre && access("interp_prefill_gq.elf", R_OK) != 0) { gq_pre = 0; printf("no prefill _gq object -> static prefill\n"); }
     if (gq_dec && access("interp_decode_gq.elf",  R_OK) != 0) { gq_dec = 0; printf("no decode _gq object -> static decode\n"); }
     printf("scheduler: prefill=%s decode=%s\n", gq_pre ? "GLOBAL QUEUE" : "static", gq_dec ? "GLOBAL QUEUE" : "static");
@@ -366,7 +413,7 @@ int main(int argc, char** argv) {
     for (uint32_t pi = 0; pi < B.h.n_prog && !is_fp8_pkt; pi++)
         for (uint32_t j = 0; j < B.prog[pi].h.n_inst; j++)
             if (B.prog[pi].insts[j].op == PLOW_DOP_GEMV_FP8) { is_fp8_pkt = 1; break; }
-    if (is_fp8_pkt) printf("fp8 decode: interp_decode_fp8%s.elf\n", gq_dec ? "_gq" : "");
+    if (is_fp8_pkt) printf("fp8 weights: interp_{prefill,decode}_fp8%s.elf\n", gq_dec ? "_gq" : "");
     /* FP8 KV-CACHE object: an fp8-KV pkt emits FLASH_DECODE_FP8 (K/V stored+read as e4m3). It needs
      * BOTH interpreter objects rebuilt with the fp8 flash + HeadNormRopeFp8 arms — the decode object
      * that reads the fp8 cache AND the prefill object that fills it. These _fp8kv objects supersede
@@ -377,8 +424,17 @@ int main(int argc, char** argv) {
         for (uint32_t j = 0; j < B.prog[pi].h.n_inst; j++)
             if (B.prog[pi].insts[j].op == PLOW_DOP_FLASH_DECODE_FP8) { is_fp8kv_pkt = 1; break; }
     if (is_fp8kv_pkt) printf("fp8 KV-cache: interp_{prefill,decode}_fp8kv%s.elf\n", gq_dec ? "_gq" : "");
+    /* THE PREFILL OBJECT MUST FOLLOW THE WEIGHT PRECISION TOO, not just the KV precision. This
+     * used to select only between fp8kv and bf16, so a w8a8 packet (fp8 weights, bf16 KV — the
+     * PLOW_FP8=1 profile) was handed interp_prefill.elf, which carries no GEMM_FP8 /
+     * GEMM_MED_FP8 / GEMM_SMALL_FP8 / GEMM_GLU_FP8 / QUANT_FP8 arms at all. Those opcodes would
+     * fall through the interpreter's switch to `default:` and write NOTHING — a silently zeroed
+     * prefill, the same failure mode as the unreachable-op-93 arm and the misclassified fp8
+     * flash segment. Verified in the objects: interp_prefill.elf has 0 v_mfma_f32_32x32x64_f8f6f4
+     * and interp_prefill_fp8.elf has them. */
     const char* elfs[2] = {
         is_fp8kv_pkt ? (gq_pre ? "interp_prefill_fp8kv_gq.elf" : "interp_prefill_fp8kv.elf")
+        : is_fp8_pkt ? (gq_pre ? "interp_prefill_fp8_gq.elf" : "interp_prefill_fp8.elf")
                      : (gq_pre ? "interp_prefill_gq.elf" : "interp_prefill.elf"),
         is_fp8kv_pkt ? (gq_dec ? "interp_decode_fp8kv_gq.elf" : "interp_decode_fp8kv.elf")
         : is_fp8_pkt ? (gq_dec ? "interp_decode_fp8_gq.elf" : "interp_decode_fp8.elf")
@@ -412,8 +468,19 @@ int main(int argc, char** argv) {
     { const char* e = getenv("PLOW_FLASH_THREADS"); if (e) g_flash_threads = (uint32_t)atoi(e); }
     /* Optional flash code object for segmented dispatch. If absent, the segment
      * loop runs every segment on the 8-wave interpreter (correct, just no flash speedup). */
+    /* THE FLASH OBJECT FOLLOWS THE KV PRECISION, exactly as the prefill/decode objects do. It
+     * did not: this always loaded the bf16 `interp_flash.elf`, whose only dispatch is
+     * `if (in->op == PLOW_DOP_FLASH_PREFILL)` — the fp8-KV twin is built with the FP8 arm
+     * SWAPPED IN, not added. So on an fp8-KV packet (which emits FLASH_PREFILL_FP8 and never
+     * the bf16 opcode) every class-4 segment fell through and wrote NOTHING: all attention
+     * output zero, silently. The cmake table has carried the `interp_flash_fp8kv` row and
+     * scripts/gfx950_objects.py has selected it since it landed; only this driver did not.
+     * (plowrt's Rust engine already selects it — exec/amd.rs object_name(Phase::Flash, ...).)
+     * Same shape as the class-4 wave-class bug: an arm that exists, is correct, and has
+     * nothing routing to it. */
     plow_hsa_kernel* k_flash_p = NULL;
-    { const char* felf = gq_pre ? "interp_flash_gq.elf" : "interp_flash.elf"; /* flash is a prefill segment */
+    { const char* felf = is_fp8kv_pkt ? (gq_pre ? "interp_flash_fp8kv_gq.elf" : "interp_flash_fp8kv.elf")
+                                      : (gq_pre ? "interp_flash_gq.elf" : "interp_flash.elf"); /* flash is a prefill segment */
       const char* fsym = gq_pre ? "plow_interp_flash_gfx950_gq" : "plow_interp_flash_gfx950";
       FILE* f = fopen(felf, "rb");
       if (f) {
@@ -422,9 +489,14 @@ int main(int argc, char** argv) {
           if (fread(co, 1, (size_t)n, f) == (size_t)n && !plow_hsa_load_code_object(h, 0, co, (size_t)n)
               && !plow_hsa_get_kernel(h, 0, fsym, &k_flash)) {
               k_flash_p = &k_flash;
-              printf("segmented dispatch: 4-wave flash code object loaded%s\n", gq_pre ? " (GQ)" : "");
+              printf("segmented dispatch: 4-wave flash code object loaded (%s)\n", felf);
           }
           fclose(f);
+      } else {
+          /* LOUD. An fp8-KV packet whose class-4 twin is missing runs its flash on the 8-wave
+           * interpreter — which for fp8-KV is correct but register-starved, and if the whole
+           * file is absent it is not obvious from the timings alone. */
+          printf("no %s -> flash segments run on the 8-wave interpreter\n", felf);
       } }
 
     printf("dev0: %s CUs=%u\n", gfx, cus);
@@ -460,9 +532,25 @@ int main(int argc, char** argv) {
         if (is_fp8 && !have_fp8) { printf("fp8 pkt needs PLOW_FP8_DIR (missing %s)\n", td->name); return 1; }
         if (!strncmp(td->name, "model.", 6) || !strncmp(td->name, "lm_head", 7) || is_fp8) {
             uint64_t got = 0;
+            /* THE TWO SIDES DISAGREE ON WHETHER THE "fp8/" PREFIX IS PART OF THE KEY, so accept
+             * both. The emitter declares the twin as `fp8/<name>`; this loader stripped the
+             * prefix before the lookup, while perf-data/harness/quantize_fp8.py writes the key
+             * WITH it ("keyed EXACTLY as the emitter declares the twins"). Neither convention is
+             * obviously canonical and picking one silently would just move the failure — so try
+             * the declared name first, then the stripped one, and report BOTH spellings if
+             * neither is present. A checkpoint keyed either way now loads.
+             *
+             * RESOLVED: the README now specifies the key VERBATIM INCLUDING the prefix on all
+             * three sides (emitter declaration, quantizer output, loader). The stripped-name
+             * fallback is kept only so a checkpoint generated before that ruling still loads;
+             * it can be deleted once none are left. The verbatim form is tried first, so the
+             * fallback never shadows a correct checkpoint. */
             const char* key = is_fp8 ? td->name + 4 : td->name;
-            const uint8_t* src = st_find(is_fp8 ? &Sf : &S, key, &got);
-            if (!src) { printf("MISSING WEIGHT: %s%s\n", is_fp8 ? "[fp8] " : "", key); return 1; }
+            const uint8_t* src = st_find(is_fp8 ? &Sf : &S, td->name, &got);
+            if (!src && is_fp8) src = st_find(&Sf, key, &got);
+            if (!src) { printf("MISSING WEIGHT: %s%s%s\n", is_fp8 ? "[fp8] " : "", td->name,
+                               is_fp8 ? " (tried both with and without the \"fp8/\" prefix)" : "");
+                        return 1; }
             if (got != td->bytes) { printf("SIZE MISMATCH %s (want %llu got %llu)\n", td->name,
                                            (unsigned long long)td->bytes, (unsigned long long)got); return 1; }
             for (uint64_t o = 0; o < td->bytes; o += STAGE) {
@@ -797,8 +885,16 @@ int main(int argc, char** argv) {
         int lm = -1;
         for (uint32_t i = 0; i < gp->h.n_inst; i++) {
             const uint16_t o = gp->insts[i].op;
+            /* Every matmul opcode that can carry the lm_head, in any precision. The bf16-only
+             * list made the search fail outright on a packet whose lm_head is quantized —
+             * "could not find the lm_head instruction" — which at least is loud, unlike the two
+             * bugs above. Kept complete so a new precision does not resurrect it. */
             const int is_matmul = (o == PLOW_DOP_GEMM || o == PLOW_DOP_GEMM_SMALL ||
-                                   o == PLOW_DOP_GEMM_MED || o == PLOW_DOP_GEMV);
+                                   o == PLOW_DOP_GEMM_MED || o == PLOW_DOP_GEMV ||
+                                   o == PLOW_DOP_GEMM_FP8 || o == PLOW_DOP_GEMM_MED_FP8 ||
+                                   o == PLOW_DOP_GEMM_SMALL_FP8 || o == PLOW_DOP_GEMV_FP8 ||
+                                   o == PLOW_DOP_GEMV_FP8_BLK || o == PLOW_DOP_GEMM_MXFP4 ||
+                                   o == PLOW_DOP_GEMV_MXFP4);
             if (is_matmul && gp->insts[i].t[0] == (uint32_t)t_logits) { lm = (int)i; break; }
         }
         if (lm < 0) { printf("could not find the lm_head instruction\n"); return 1; }
@@ -813,7 +909,12 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < gp->h.n_inst; i++) {
             if (tmp[i].op == PLOW_DOP_HEADNORM_ROPE && tmp[i].fj[1].u != 0)
                 tmp[i].i[3] = c0; /* j[0] != 0 is the head-major KV write; the q norm has 0 */
-            else if (tmp[i].op == PLOW_DOP_FLASH_PREFILL) {
+            /* BOTH precisions: an fp8-KV packet emits FLASH_PREFILL_FP8 and never the bf16 twin,
+             * so testing only the bf16 opcode left q_pos0 and n_kv at their baked-in bucket
+             * values on every fp8 chunk — chunk 2 onward would attend over the wrong KV extent
+             * and mask from the wrong absolute position. Silent, and only on fp8. */
+            else if (tmp[i].op == PLOW_DOP_FLASH_PREFILL ||
+                     tmp[i].op == PLOW_DOP_FLASH_PREFILL_FP8) {
                 tmp[i].i[4] = c0;        /* q_pos0 */
                 tmp[i].i[1] = c0 + clen; /* n_kv: everything written so far */
             }
@@ -1036,8 +1137,14 @@ int main(int argc, char** argv) {
                ngen / dsum);
         printf("  per token: host-setup %.1f ms | GPU %.1f ms | token readback %.1f ms\n",
                host_us / ngen / 1e3, gpu_us / ngen / 1e3, argmax_us / ngen / 1e3);
-        printf("  GPU: 57.2 GiB of weights in %.1f ms = %.2f TB/s (GEMV measured 4.3 TB/s)\n",
-               gpu_us / ngen / 1e3, 61.4e9 / (gpu_us / ngen / 1e6) / 1e12);
+        /* `wb`, the bytes actually BOUND, not a literal. This was hardcoded to bf16 Gemma-4 31B
+         * (57.2 GiB / 61.4e9), so every fp8 run divided the bf16 weight stream by the fp8 time
+         * and reported a bandwidth ~1.9x higher than the hardware delivered — a w8a8 31B decode
+         * printed "4.55 TB/s" against a 29.9 GiB stream that is really 2.27 TB/s. A benchmark
+         * that flatters exactly the configuration you are trying to evaluate is worse than none. */
+        printf("  GPU: %.1f GiB of weights in %.1f ms = %.2f TB/s (bf16 GEMV measured 4.3 TB/s)\n",
+               wb / 1073741824.0, gpu_us / ngen / 1e3,
+               (double)wb / (gpu_us / ngen / 1e6) / 1e12);
     }
     plow_hsa_shutdown(h);
     return 0;

@@ -60,6 +60,13 @@ fn occupancy(spec: &GpuSpec, working_set_bytes: u64) -> u64 {
 }
 
 /// HBM bytes one SM can move per cycle (whole-GPU bandwidth shared across SMs).
+///
+/// DATASHEET peak (`mem.bandwidth`) on purpose, NOT `bandwidth_for_bound()`. This
+/// feeds [`dma_cycles`], which `devgen::pick_tile` uses to RANK candidate tiles —
+/// a relative comparison in which a constant derate cancels exactly. Switching it
+/// to the measured figure would change no ranking and would change emitted bytes
+/// only by rounding. Anything that REPORTS an absolute floor must use
+/// `bandwidth_for_bound()` instead; see `plowc --lean-oracle`.
 fn sm_bytes_per_cycle(spec: &GpuSpec) -> f64 {
     let bw_bytes_per_s = spec.mem.bandwidth.0 * 1.0e9; // GB/s → B/s
     let clock_hz = spec.clock_boost.0 as f64;

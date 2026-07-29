@@ -232,12 +232,27 @@ struct Track {
 }
 
 /// Per-sequence-slot radix bookkeeping: the prompt's block hashes, the
-/// block-aligned token prefix they were computed from (radix verification
-/// compares tokens on every hash match — collision safety), and how many
-/// leading path nodes this sequence holds a reference on.
+/// block-aligned token prefix they were computed from, and how many leading
+/// path nodes this sequence holds a reference on.
+///
+/// # `tokens` IS WRITTEN AND NEVER READ — the collision check is not implemented
+///
+/// This doc comment used to assert that "radix verification compares tokens on
+/// every hash match — collision safety". It does not: `tokens` is populated at
+/// three sites (each a `to_vec()` of the aligned prefix) and there is no reader
+/// anywhere in the crate. So a `BlockHash` collision between two different
+/// prefixes would be accepted as a cache hit and the second sequence would
+/// attach to the first's KV blocks — fluent output from the wrong context, with
+/// nothing to say so.
+///
+/// The field is kept rather than deleted precisely so the gap stays visible and
+/// the data is already there when the comparison is written. Deleting it would
+/// remove three allocations and the last trace of a safety property the code
+/// claims to have.
 #[derive(Default)]
 struct SlotSeq {
     hashes: Vec<BlockHash>,
+    #[allow(dead_code)]
     tokens: Vec<u32>,
     held: usize,
 }

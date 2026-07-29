@@ -300,7 +300,11 @@ pub enum DevOp {
     /// `out = residual + shared + Σ_{j=0..k-1} part[j]`, **f32 accumulate in fixed slot
     /// order rounded to bf16** (independent of which expert finished first — the MoE
     /// bit-exactness obligation). `shared = TENSOR_NONE` for a 0-shared-expert config.
-    /// `t0=out t1=residual t2=shared? t3=part_base([k,H])` · `i0=H i1=k`.
+    /// **`t1` (residual) is OPTIONAL**, and Kimi-K3's Stable LatentMoE is why: its routed experts
+    /// run at `routed_expert_hidden_size` (3584), so their combine has no hidden-width residual to
+    /// add — the residual add happens after the up-projection back to 7168. Absent means "add
+    /// nothing"; it used to be an unconditional dereference of a null pointer.
+    /// `t0=out t1=residual? t2=shared? t3=part_base([k,H])` · `i0=H i1=k`.
     MoeCombine = 43,
 
     // ===== Block-fp8 (DeepSeek/GLM weight_block_size [128,128]) weight-stream ops. =====
@@ -317,7 +321,15 @@ pub enum DevOp {
     /// bases from `expert_weight_table[eid][0,1]` (fp8 rows); block-scale grid bases from a
     /// parallel `expert_scale_table[eid][0,1]` (`[I_moe/128][H/128]` f32 each). Sentinel skip.
     /// `t0=fu t1=x t2=routing_table t3=expert_weight_table t4=expert_scale_table` ·
-    /// `i0=slot i1=I_moe i2=H i3=n_exp i5=act`.
+    /// `i0=slot i1=I_moe i2=H i3=n_exp i5=act i6=enc` · `f0=situ_beta f1=situ_linear_beta`.
+    ///
+    /// `i5 = act`: 0 gelu_tanh, 1 silu, **2 = Kimi-K3 `situ`**, and only for 2 are `f0`/`f1` read
+    /// (`activation_situ_beta` / `activation_situ_linear_beta`). situ transforms the UP branch as
+    /// well as the gate, so the epilogue is `A(g)*B(u)` and not `act(g)*u`; the kernel routes it
+    /// through `moe_glu`, and `moe_act` returns **NaN** for code 2 so an unconverted epilogue
+    /// poisons its output instead of silently computing `gelu_tanh(g)*u`. `f0`/`f1` were free on
+    /// every GLU-family op, so this consumes no `i` slot and every pre-K3 packet is unchanged.
+    /// `i6 = weight encoding` (0 bf16, 1 block-fp8, 2 mxfp4).
     MoeExpertGluFp8Blk = 45,
     /// Block-fp8 expert down — the block-scale twin of [`DevOp::MoeExpertDown`]. `Wd` base from
     /// `expert_weight_table[eid][2]`, scale grid (`[H/128][I_moe/128]`) from
@@ -337,7 +349,8 @@ pub enum DevOp {
     /// `wave_dot_fp8_blk`, same slot layout); the win is per-op overhead (one counter edge + one
     /// interp dispatch instead of `k`). Sentinel/EP-non-local (null base) slots leave `fu` unwritten.
     /// `t0=fu[k,I_moe] t1=x t2=routing_table t3=expert_weight_table t4=expert_scale_table` ·
-    /// `i0=k i1=I_moe i2=H i3=n_exp i5=act`.
+    /// `i0=k i1=I_moe i2=H i3=n_exp i5=act i6=enc` · `f0=situ_beta f1=situ_linear_beta`, exactly
+    /// as [`DevOp::MoeExpertGluFp8Blk`].
     MoeGroupGluFp8Blk = 48,
     /// GROUPED block-fp8 expert down — ONE packet loops all `k` slots that
     /// [`DevOp::MoeExpertDownFp8Blk`] did one-per-packet. Bit-identical gate-scaled `part`; sentinel /
@@ -570,6 +583,99 @@ pub enum DevOp {
     //   i0=T i1=d_inner i2=n_head i3=head_dim i4=d_state i5=n_groups i6=d_conv i7=conv_dim   f0=eps.
     // conv_dim = d_inner + 2*n_groups*d_state. A[h] = -exp(A_log[h]); dt[t,h] = softplus(dt_raw+dt_bias);
     // dA = exp(dt*A). No time_step_limit clamp (assumption, see mamba_ref).
+    // ===== MoE PREFILL (T>1) for the MLA family — Kimi K2.7 / GLM-5.2 / DeepSeek. =====
+    // Mirrors `runtime/common/dev_isa.h` ops 83-87 (the AMD side landed first). The prefill bucket
+    // had NO MoE arm of any kind — ops 40-49/56 are all decode-only, M=1 wave-per-output — so an MLA
+    // prefill was attention-complete and FFN-incomplete, and the AMD dispatch `default:` writes
+    // nothing rather than trapping, which would have made that a silent accuracy bug. These are the
+    // token-sorted grouped-expert path: rows are padded to `MPF_BM=64` per expert, so the gathered
+    // arrays are sized `T*k + n_exp*(MPF_BM-1)`.
+    /// T-token router tail — a block-per-token loop of [`DevOp::MoeRouterTopk`], so it is
+    /// bit-identical PER TOKEN to the decode router by construction. The `[T,n_exp]` logit matrix is
+    /// an ordinary [`DevOp::Gemm`], already in the prefill bucket; only this tail was missing.
+    /// `t0=table[T*k] t1=logit(bf16[T,n_exp]) t3=bias` · `i1=n_exp i2=k i3=flags i4=T` · `f0=route_scale`.
+    MoeRouterTopkPf = 83,
+    /// ALIGN/SORT, ONE workgroup: histogram the `T*k` routing slots by expert, build an
+    /// `MPF_BM`-padded prefix, scatter each live slot into its expert's contiguous gathered-row
+    /// range. `meta` is `[3*n_exp+1]` i32 (rowoff | cnt | m-tile prefix).
+    /// `t0=meta(i32) t1=table t2=row_token(u32) t3=row_partidx(u32) t4=row_gate(f32)` ·
+    /// `i0=T i1=n_exp i2=k`.
+    MoeAlignPf = 84,
+    /// Grouped gate/up GEMM + GLU: A gathered from `xn2` by `row_token`, B is the tile's expert's
+    /// gate|up staged into one BN tile. `i3` selects the block-fp8 or bf16 weight arm.
+    /// `t0=fu_g t1=xn2[T,H] t2=expert_weight_table t3=expert_scale_table t4=meta t5=row_token` ·
+    /// `i0=I_moe i1=H i2=n_exp i3=fp8 i5=act`.
+    MoeGroupGluPf = 85,
+    /// Grouped down GEMM + gate-scale + SCATTER into `part[row_partidx][H]`; pad rows are dropped.
+    /// `t0=part(f32[T*k,H]) t1=fu_g t2=expert_weight_table t3=expert_scale_table t4=meta
+    /// t6=row_partidx t7=row_gate` · `i0=H i1=I_moe i2=n_exp i3=fp8`.
+    MoeGroupDownPf = 86,
+    /// T-token combine — same expression and same FIXED slot order as [`DevOp::MoeCombine`], so at
+    /// `T=1` it is bit-identical to it.
+    /// `t0=out t1=residual[T,H] t2=shared[T,H]|NONE t3=part(f32[T*k,H])` · `i0=H i1=k i2=T`.
+    MoeCombinePf = 87,
+
+    // ===== KDA — Kimi Delta Attention, 69 of Kimi-K3's 93 layers. =====
+    // Spec: `docs/kimi-k3-kda.md`. The recurrence, per head, per token, is
+    //   S <- (I - beta k k^T) . diag(exp(g)) . S + beta k v^T ;   o = S^T q
+    // i.e. two composed memory mechanisms: an UNTARGETED per-(head, key-channel) forget gate
+    // `diag(exp(g))`, and a TARGETED delta rule `(I - beta k k^T)` which — because the kernel L2
+    // normalizes `k`, so `||k|| = 1` — is exactly `I` minus `beta` times the orthogonal projector
+    // onto `k`. It erases the memory stored at key `k` and leaves everything orthogonal to `k`
+    // untouched. Conflating the two is the single easiest way to get this wrong.
+    //
+    // THE STATE IS A DECLARED HBM TENSOR, NOT REGISTERS. `[H,D,D]` f32 per sequence per layer,
+    // 6.00 MiB, constant in context length. A decode step is a read-modify-write tile op over it,
+    // exactly like a KV ring, and that is what makes the register budget a knob instead of a veto
+    // (`docs/kimi-k3-kda.md` §7.2).
+    //
+    // Four ops, not one. `Mamba2Scan = 90` is the cautionary tale, not the template: it is
+    // monolithic, emitted onto ONE CU, consumes all 16 operand slots, has NO `interp.hip` arm (so
+    // on AMD it hits the silent dispatch `default:` and computes nothing), and has never run on a
+    // GPU. Decomposed, no op here is at the slot ceiling, six projection GEMVs stay concurrent
+    // (`docs/kimi-k3-kda.md` §7.4 — `GLM_GROUP=1` measured +2.88 ms for a 38% op-count cut, so op
+    // count is not the objective function), and every one of the four dispatches on gfx950.
+    //
+    // The chunked prefill scan of §7.6 is deliberately ABSENT. `KdaStateStep` takes a serial-`T`
+    // loop, which is the reference `fused_recurrent` algorithm at any `T` and is exact; the
+    // chunked form is a matmul-bound rewrite of a path that then already works. An opcode declared
+    // before its kernel exists is how op 90 became dead code.
+    /// KDA causal depthwise short conv + SiLU over the concatenated `q|k|v` projections.
+    ///
+    /// Three independent width-`i2` depthwise convs over `H*D` channels each (`groups =
+    /// hidden_size`, `padding = W-1`, no bias), which is what gives KDA the local 4-token mixing a
+    /// pure linear-attention recurrence cannot express. `t3` is the rolling input window, `[C,W]`
+    /// f32, holding the last `W` inputs per channel with the CURRENT token at slot `W-1` (the
+    /// `[fla]` convention, `short_conv.py:232-235`); it is read AND written. Activation is applied
+    /// AFTER the convolution.
+    ///
+    /// The conv is a 4-tap stencil, not a scan, so it is fully parallel over `(t, channel)`; only
+    /// the window carry is sequential, and that is per channel and lives in registers.
+    ///
+    /// `t0=out([T,3*H*D] bf16, post-activation) t1=x([T,3*H*D] bf16, pre-conv)
+    /// t2=w([3*H*D,W] f32) t3=conv_state([3*H*D,W] f32, IN/OUT)` ·
+    /// `i0=T i1=conv_dim(3*H*D) i2=W i3=act(1=silu)`.
+    KdaConv = 88,
+    /// KDA gate pre-pass — pure elementwise, and factored out of both the decode and the prefill
+    /// paths so it is independently testable (`docs/kimi-k3-kda.md` §5.2).
+    ///
+    /// `i3 == 1` (K3, `gate_lower_bound = -5.0`) selects the BOUNDED branch
+    /// `g = f0 * sigmoid(exp(A_log[h]) * (g_raw + dt_bias[h,d]))`, so `g` is strictly in
+    /// `[f0, 0)` and the per-step decay `exp(g)` in `(e^f0, 1)` — the state can never be zeroed by
+    /// the gate in one step and can never grow. `i3 == 0` is the older unbounded branch
+    /// `-exp(A_log[h]) * softplus(g_raw + dt_bias[h,d])`. K3 is the first checkpoint to ship the
+    /// bounded gate; no Kimi-Linear-era implementation has it, and neither does vLLM 0.23.0 or
+    /// `main` (`docs/kimi-k3-kda.md` §3.4).
+    ///
+    /// `A_log` is indexed **per head** and `dt_bias` **per `h*D + d`** — they are different ranks,
+    /// and the checkpoint ships `A_log` as a `[96]` per-head vector ZERO-PADDED to `[128]`, so the
+    /// loader must slice `[:96]` (§3.2). `beta = sigmoid(beta_raw)` is one scalar per head, not
+    /// per channel.
+    ///
+    /// `t0=g([T,H,D] f32) t1=beta([T,H] f32) t2=g_raw([T,H*D] bf16) t3=beta_raw([T,H] bf16)
+    /// t4=A_log([H] f32) t5=dt_bias([H*D] f32)` · `i0=T i1=H i2=D i3=gate_mode` · `f0=lower_bound`.
+    KdaGate = 89,
+
     Mamba2Scan = 90,
 
     /// MXFP4 decode GEMV (w4a16): OCP microscaling e2m1 weights + one E8M0 scale per 32 K.
@@ -599,6 +705,200 @@ pub enum DevOp {
     /// Reuses the bf16 wide-K MFMA; only the weight fetch dequants fp4→bf16 with the MX scale
     /// folded. `t0=C t1=A(bf16) t2=W(fp4) t3=wscale(e8m0)  i0=M i1=N i2=K`. See `d_gemm_mxfp4`.
     GemmMxfp4 = 93,
+
+    /// As [`DevOp::Gemm`], 128×256 tile — the rung that owns the M=1024–2048 serving chunk.
+    ///
+    /// Added by the tile-inventory campaign. Between `Gemm` (256×256) and [`DevOp::GemmMed`]
+    /// (128×128) the inventory had nothing that both fills 256 CUs and keeps BN=256's A-reuse,
+    /// so every M≥1024 prefill shape paid 1.3–1.8×. Measured on Gemma-31B `q_proj` at M=1024:
+    /// 926 TF/s here against 684 (`GemmMed`) and 523 (`Gemm`) — and 926 is parity with the
+    /// Tensile assembly kernel measured on the same shape.
+    GemmWide = 94,
+    /// As [`DevOp::Gemm`], 192×256 tile — the rung that owns M≥4096 and every K-heavy shape.
+    ///
+    /// This is the tile every earlier sweep in the tree calls **c5** (`test_kernels.hip`, the
+    /// Qwen `-DGM_BM=192` prefill object, the Tensile A/B). It was plow's own measured-best
+    /// serving tile and was not selectable at all. Gemma-31B `down_proj` M=2048: 1033 TF/s
+    /// against `Gemm`'s 794.
+    GemmC5 = 95,
+
+    /// 128×128 mxfp4 tile — the medium-tile twin of [`DevOp::GemmMxfp4`].
+    ///
+    /// `GemmMxfp4` hard-coded 256×256 for *every* shape with no selection at all, which is what
+    /// put Kimi's mxfp4 `kv_a_proj` at ≈0.4% of peak. These four give the fp4 family the same
+    /// rungs, and therefore the same `pick_tile`, as bf16.
+    GemmMedMxfp4 = 96,
+    /// 64×128 mxfp4 tile — the small-tile twin of [`DevOp::GemmMxfp4`].
+    GemmSmallMxfp4 = 97,
+    /// 128×256 mxfp4 tile — the twin of [`DevOp::GemmWide`].
+    GemmWideMxfp4 = 98,
+    /// 192×256 mxfp4 tile — the twin of [`DevOp::GemmC5`].
+    GemmC5Mxfp4 = 99,
+
+    /// 128×256 fp8 tile — the w8a8 twin of [`DevOp::GemmWide`].
+    ///
+    /// fp8 halves the operand bytes without halving the MFMA work, so the tile that balances CU
+    /// fill against arithmetic intensity is not the one bf16 picks. With only three fp8 rungs
+    /// against five bf16 ones the selector could not express that, whatever it was told about
+    /// precision.
+    GemmWideFp8 = 100,
+    /// 192×256 fp8 tile — the w8a8 twin of [`DevOp::GemmC5`].
+    GemmC5Fp8 = 101,
+
+    /// KDA gated delta-rule state update — a READ-MODIFY-WRITE on the `[H,D,D]` f32 state `t6`.
+    ///
+    /// Per token, per head, per value column `j`, with `S' = diag(exp(g)) S`:
+    /// ```text
+    ///   S'[k] = S[k] * exp(g[k])          decay FIRST — u is the error against the DECAYED state
+    ///   u     = v[j] - sum_k S'[k]*k[k]   delta / prediction error
+    ///   S[k]  = S'[k] + beta*u*k[k]       rank-1 write
+    ///   o[j]  = sum_k S[k]*q[k]           read the UPDATED state
+    /// ```
+    ///
+    /// **STATE IS V-FIRST, `[h][v][k]`** (`transpose_state_layout=True` in K3's config, renamed
+    /// `state_v_first` upstream). Since `V == K == 128` the byte count is identical either way, so
+    /// transposing it produces garbage with exactly the right norm — the worst kind of wrong, and
+    /// no norm check will catch it. V-first is also what makes the tiling free: a `v`-column is 512
+    /// CONTIGUOUS bytes and both reductions run over `k` for fixed `v`.
+    ///
+    /// Tiling: `i3 = BV` value columns per workgroup, `D/BV` tiles per head, so `H*D/BV` work
+    /// items — 768 at `H=96, D=128, BV=16`, hence `blocks = 256` and 100% CU fill. **Never
+    /// parallelize over heads alone**: 96 heads is 37.5% of 256 at TP1 and 9.4% at TP4, which is
+    /// the `MlaMergeFold` occupancy defect reproduced exactly (`docs/kimi-k3-kda.md` §7.3).
+    /// One WAVE owns one column — `D = 64 lanes × 2` — so the state costs **2 f32/lane**, both
+    /// reductions are `wave_sum`, and nothing crosses a wave.
+    ///
+    /// `i4` bit0 = L2-normalize `q` and `k` in kernel, with `eps` INSIDE the sqrt
+    /// (`x / sqrt(sum x^2 + 1e-6)`, not `x / (norm + eps)`); `q` is then scaled by `f0` and `k` is
+    /// NOT. `||k|| = 1` is load-bearing — it is what makes the delta term an exact projector.
+    ///
+    /// `T > 1` runs the same recurrence serially. That is exact at any `T`, and it is how the
+    /// prefill/decode-agreement gate is expressed without a second algorithm.
+    ///
+    /// `t0=o([T,H,D] bf16) t1=q t2=k t3=v ([T,H,D] bf16) t4=g([T,H,D] f32) t5=beta([T,H] f32)
+    /// t6=state([H,D,D] f32, V-FIRST, IN/OUT)` · `i0=T i1=H i2=D i3=BV i4=flags` ·
+    /// `f0=scale(D^-0.5)`.
+    KdaStateStep = 102,
+    /// KDA output gate — `y[h,d] = RMSNorm_D(o[h,:])[d] * sigmoid(g_raw[h,d])`.
+    ///
+    /// `FusedRMSNormGated(head_dim, eps, activation='sigmoid')`. Three things are easy to get
+    /// backwards and all three produce plausible-but-wrong output: the norm is over `D = 128`
+    /// **inside a head**, not over `H*D`; its weight is a single `[D]` f32 vector SHARED by all
+    /// `H` heads; and the sigmoid is applied to the RAW `g_proj` output with the gate multiplying
+    /// **after** the norm.
+    ///
+    /// This is its own op rather than [`DevOp::KdaStateStep`]'s epilogue because the norm reduces
+    /// over a whole head, whose `D` outputs are spread across `D/BV` workgroups under that op's
+    /// slice map — folding it in would need a grid-wide barrier the interpreter does not provide.
+    /// One wave per `(token, head)` row: `T*H` items, no cross-wave reduction.
+    ///
+    /// `t0=y([T,H,D] bf16) t1=o([T,H,D] bf16) t2=norm_w([D] f32) t3=g_raw([T,H*D] bf16)` ·
+    /// `i0=T i1=H i2=D` · `f0=eps`.
+    KdaGatedNorm = 103,
+    /// **AttnRes** — Kimi-K3's residual-attention block. It REPLACES the plain residual add,
+    /// twice per layer, in all 93 layers (`attn_res_block_size: 12`; AMD's day-0 post:
+    /// *"stores one block residual every 12 layers"*).
+    ///
+    /// ```text
+    ///   v      = cat(block_residual, prefix_sum)      [T, nb+1, H],  nb <= 8
+    ///   k      = v * rsqrt(mean(v^2) + eps)           per row, eps INSIDE the rsqrt
+    ///   scores = sum_d k[d] * score_w[d]
+    ///   out    = softmax(scores) @ v                  the mix is over the RAW rows v, not k
+    /// ```
+    ///
+    /// Three things that look like details and are not:
+    /// - `score_w` is `norm.weight * proj.weight`, **constant**, and folds at prep time into one
+    ///   `[H]` f32. Neither factor is needed separately.
+    /// - The mix is over the **raw** rows. Mixing the normalized rows is a plausible misreading
+    ///   that gives the right shape and the wrong per-row magnitude.
+    /// - `variance = mean(x^2)`, RMSNorm's variance, not a mean-centred one.
+    ///
+    /// `nb = 0` degenerates to an exact copy (softmax over one element). The reference skips the
+    /// call in that case; the arm handles it so a caller cannot get a zero-filled output by
+    /// emitting it anyway.
+    ///
+    /// Slice map, honestly: **one workgroup per token**, `blocks = min(T, ncu)`, because both
+    /// reductions span the full 7168-wide row and the softmax couples the rows. At `T = 1` that
+    /// is 1 of 256 CUs. `perf-data/kimi-k3-kernel-gap.md` §10 item 7 requires this to stay ONE
+    /// packet ("three packets × 186 is 3.3 ms/token of pure protocol"), which rules out the
+    /// obvious fix of splitting the reduction across blocks and finishing it in a second packet.
+    ///
+    /// `t0=out([T,H] bf16) t1=prefix_sum([T,H] bf16) t2=block_residual([T,nb,H] bf16)
+    /// t3=score_w([H] f32)` · `i0=T i1=H i2=nb` · `f0=eps`.
+    AttnRes = 104,
+    /// **`situ` GLU** — Kimi-K3's activation, on EVERY GLU in the model (dense L0, shared
+    /// experts, routed experts).
+    ///
+    /// `out = beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta)`, with
+    /// `activation_situ_beta = 4.0` and `activation_situ_linear_beta = 25.0`.
+    ///
+    /// **A distinct opcode, not a third `act` code**, because situ transforms the UP branch as
+    /// well: the expression shape is `A(g) * B(u)`, where every existing GLU site in this tree is
+    /// `act(g) * u` selected by a two-value ternary (`op_elementwise.h:69` and seven more). A new
+    /// act code alone would apply the gate transform and leave `up` un-clipped — a small error at
+    /// `|u| < 25` that grows with the tail, i.e. plausible output and the wrong model.
+    ///
+    /// It is a soft-clipped SiLU: as `beta -> inf`, `beta*tanh(g/beta) -> g` and the gate branch
+    /// becomes `silu`. `linear_beta <= 0` disables the up transform (what `linear_beta is None`
+    /// means), so a zeroed immediate degrades to "no transform" rather than "clip to zero".
+    ///
+    /// `t0=out t1=gate t2=up` (all `[n]` bf16) · `i0=n` · `f0=beta f1=linear_beta`.
+    SituGlu = 105,
+    /// Kimi-K3 **MLA output gate** (`mla_use_output_gate: true`, 24 of 93 layers).
+    ///
+    /// `out = a * sigmoid(b)`, with `a` the attention output and `b` the RAW `g_proj` logits
+    /// (`modeling_kimi_linear.py:470-473`):
+    ///
+    /// ```text
+    /// g           = self.g_proj(hidden_states).sigmoid()
+    /// attn_output = attn_output * g          # BEFORE o_proj
+    /// ```
+    ///
+    /// Three things that look like details and are not:
+    ///
+    /// 1. `b` is `g_proj` of the MLA sub-layer **input** (the post-`input_layernorm` hidden), not
+    ///    of the attention output. Feeding it `a` has the right shape and the wrong model.
+    /// 2. It is `sigmoid(b)`, not `silu(b)`. This is why it is its own opcode rather than a third
+    ///    `act` code on [`DevOp::Glu`], where `act=1` is SiLU: the two differ by a factor of the
+    ///    logit, so the substitution is finite, correctly-shaped and wrong on every token.
+    /// 3. Both operands are `[n_head * v_head_dim]` **head-major**, which is exactly what
+    ///    [`DevOp::MlaMergeFold`] writes (`O + (b*n_head + h)*V`) and exactly what the reference's
+    ///    `attn_output.reshape(batch, seq, -1)` produces. No permute is implied.
+    ///
+    /// Not folded into [`DevOp::MlaMergeFold`]'s epilogue — which
+    /// `perf-data/kimi-k3-kernel-gap.md` §10 item 6 suggests and which would be nearly free —
+    /// because that op is GLM-5.2's too and is on its critical path. A separate streaming pass
+    /// keeps GLM's packet bytes and register table untouched, and keeps the fold and the gate
+    /// independently diffable in a stage-by-stage gate.
+    ///
+    /// `t0=out t1=a t2=b` (all `[n]` bf16) · `i0=n`.
+    MlaOutGate = 106,
+    /// **DENSE PREFILL block-fp8 GEMM** (w8a16) — `C[M,N] bf16 = A[M,K] bf16 · W[N,K] e4m3`, with
+    /// DeepSeek/GLM's `weight_block_size: [128,128]` grid of arbitrary-f32 `weight_scale_inv`.
+    ///
+    /// The T-row twin of [`DevOp::GemvFp8Blk`] for a plain `[N,K]` weight, and the arm whose
+    /// absence made `GLM_LINEAR_FP8` decode-only: `o_proj` and the three `shared_experts.*`
+    /// projections had no block-fp8 opcode to lower to at `rows > 1`, so a STACKED (prefill +
+    /// decode) blob would have read fp8 bytes as bf16 — `declare_glm_rows` refused rather than
+    /// emit one. Same scale convention as ops 44/45/46/48/49 and 85/86:
+    /// `S[(n >> 7) * ceil(K/128) + (k >> 7)]`, one convention across the whole family.
+    ///
+    /// NOT [`DevOp::GemmFp8`] (33): that is the **w8a8** rung — one f32 per output CHANNEL plus a
+    /// per-row activation scale from [`DevOp::QuantFp8`] — which can neither address a `[128,128]`
+    /// grid nor run without an fp8 A operand. NOT ops 85/86 either: those carry a genuine
+    /// block-fp8 prefill body but only under the grouped-MoE contract (expert weight/scale tables,
+    /// `MoeAlignPf` meta, gather/scatter row maps, f32 `part` output).
+    ///
+    /// ONE TILE RUNG (128x128x64), unlike the bf16/w8a8/mxfp4 five-rung families, and it is a
+    /// register fact rather than a shortcut: the block scale is arbitrary-f32, so it must be
+    /// PROMOTED into a second f32 accumulator every 128 K rather than folded into the fp8->bf16
+    /// convert, which doubles a tile's accumulator cost. The 192x256 and 256x256 rungs would need
+    /// 192 and 256 accumulator registers and cannot be built at 8 waves at all. See
+    /// `d_gemm_fp8_blk` in `runtime/amd/op_gemm.h` for the table. Emitted directly, not through
+    /// `pick_tile`.
+    ///
+    /// `t0=C t1=A t2=W(e4m3) t3=weight_scale_inv(f32)` · `i0=M i1=N i2=K`.
+    GemmFp8Blk = 107,
 }
 
 impl DevOp {
@@ -628,8 +928,17 @@ impl DevOp {
         DevOp::MoeRouterGemmaTopk, DevOp::MoeRouterGemmaScoreFast, DevOp::MoeCombineNormGemma, DevOp::MoeExpertGluNormGemma,
         DevOp::MoeCombineResidNormGemma, DevOp::MoeRouterGemmaPf, DevOp::MoeAlignGemmaPf, DevOp::MoeGroupGluGemmaPf,
         DevOp::MoeGroupDownGemmaPf, DevOp::MoeCombineNormGemmaPf, DevOp::GemvSz, DevOp::GemvGluSz,
-        DevOp::GemvArgmax, DevOp::MoeGroupGluGemmaPfW8a8, DevOp::MoeGroupDownGemmaPfW8a8, DevOp::Mamba2Scan,
+        DevOp::GemvArgmax, DevOp::MoeGroupGluGemmaPfW8a8, DevOp::MoeGroupDownGemmaPfW8a8,
+        DevOp::MoeRouterTopkPf, DevOp::MoeAlignPf, DevOp::MoeGroupGluPf, DevOp::MoeGroupDownPf,
+        DevOp::MoeCombinePf,
+        DevOp::KdaConv, DevOp::KdaGate, DevOp::Mamba2Scan,
         DevOp::GemvMxfp4, DevOp::GemvGluMxfp4, DevOp::GemmMxfp4,
+        DevOp::GemmWide, DevOp::GemmC5,
+        DevOp::GemmMedMxfp4, DevOp::GemmSmallMxfp4, DevOp::GemmWideMxfp4, DevOp::GemmC5Mxfp4,
+        DevOp::GemmWideFp8, DevOp::GemmC5Fp8,
+        DevOp::KdaStateStep, DevOp::KdaGatedNorm,
+        DevOp::AttnRes, DevOp::SituGlu, DevOp::MlaOutGate,
+        DevOp::GemmFp8Blk,
     ];
 
     /// The `dev_isa.h` spelling of this opcode.
@@ -722,16 +1031,100 @@ impl DevOp {
             DevOp::GemvArgmax => "PLOW_DOP_GEMV_ARGMAX",
             DevOp::MoeGroupGluGemmaPfW8a8 => "PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF_W8A8",
             DevOp::MoeGroupDownGemmaPfW8a8 => "PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF_W8A8",
+            DevOp::MoeRouterTopkPf => "PLOW_DOP_MOE_ROUTER_TOPK_PF",
+            DevOp::MoeAlignPf => "PLOW_DOP_MOE_ALIGN_PF",
+            DevOp::MoeGroupGluPf => "PLOW_DOP_MOE_GROUP_GLU_PF",
+            DevOp::MoeGroupDownPf => "PLOW_DOP_MOE_GROUP_DOWN_PF",
+            DevOp::MoeCombinePf => "PLOW_DOP_MOE_COMBINE_PF",
+            DevOp::KdaConv => "PLOW_DOP_KDA_CONV",
+            DevOp::KdaGate => "PLOW_DOP_KDA_GATE",
+            DevOp::KdaStateStep => "PLOW_DOP_KDA_STATE_STEP",
+            DevOp::KdaGatedNorm => "PLOW_DOP_KDA_GATED_NORM",
+            DevOp::AttnRes => "PLOW_DOP_ATTN_RES",
+            DevOp::SituGlu => "PLOW_DOP_SITU_GLU",
+            DevOp::MlaOutGate => "PLOW_DOP_MLA_OUT_GATE",
             DevOp::Mamba2Scan => "PLOW_DOP_MAMBA2_SCAN",
             DevOp::GemvMxfp4 => "PLOW_DOP_GEMV_MXFP4",
             DevOp::GemvGluMxfp4 => "PLOW_DOP_GEMV_GLU_MXFP4",
             DevOp::GemmMxfp4 => "PLOW_DOP_GEMM_MXFP4",
+            DevOp::GemmWide => "PLOW_DOP_GEMM_WIDE",
+            DevOp::GemmC5 => "PLOW_DOP_GEMM_C5",
+            DevOp::GemmMedMxfp4 => "PLOW_DOP_GEMM_MED_MXFP4",
+            DevOp::GemmSmallMxfp4 => "PLOW_DOP_GEMM_SMALL_MXFP4",
+            DevOp::GemmWideMxfp4 => "PLOW_DOP_GEMM_WIDE_MXFP4",
+            DevOp::GemmC5Mxfp4 => "PLOW_DOP_GEMM_C5_MXFP4",
+            DevOp::GemmWideFp8 => "PLOW_DOP_GEMM_WIDE_FP8",
+            DevOp::GemmC5Fp8 => "PLOW_DOP_GEMM_C5_FP8",
+            DevOp::GemmFp8Blk => "PLOW_DOP_GEMM_FP8_BLK",
         }
     }
 
     /// One past the highest opcode value — mirrors `PLOW_DOP__COUNT`. This is a
     /// dispatch-table bound, *not* the number of opcodes (the range has holes).
-    pub const COUNT: u16 = 94;
+    ///
+    /// 106 -> 107 when `MlaOutGate = 106` was added: C's `PLOW_DOP__COUNT` is an
+    /// auto-numbered enum terminator and moved on its own, this one did not. Nothing
+    /// indexes either constant today, so there was no runtime consequence — but the
+    /// drift went unseen for a different reason worth recording: `cargo test` stops at
+    /// the first failing SUITE, devgen's `tuned_tile_selection` fails ahead of packet,
+    /// and so `dev_opcodes` never ran. Use `--no-fail-fast` when checking ABI guards.
+    pub const COUNT: u16 = 108;
+
+    /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
+    ///
+    /// # Why this lives on the opcode and not in each emitter
+    ///
+    /// The GEMM tuner's shape list was AUTHORED BY HAND, and that is exactly how GLM-5.2's
+    /// prefill came to be 100% unmeasured while `tuned_tile_selection` kept passing — some
+    /// qualified record existed, just never for GLM's shapes. The fix there was
+    /// `PLOW_TUNE_DUMP`, which reads the demand back out of the compiler
+    /// (`crates/devgen/src/lib.rs`, `GemmMeasurements::for_shape`).
+    ///
+    /// The GEMV path has the same exposure and thirty-odd emit sites across `devgen`'s
+    /// `lib.rs` / `mla.rs` / `kda.rs`. Instrumenting those by hand would reproduce the
+    /// original mistake one level down: a site added later is a shape the census never sees.
+    /// So the hook goes at [`crate::devbuild::Builder::emit_dep`], the single choke point every
+    /// emitter funnels through, and the layout knowledge lives HERE — beside the doc comments
+    /// that define it — rather than being restated at the call site.
+    ///
+    /// Every `Gemv*` opcode carries `i0=M i1=N i2=K`. The one irregularity is
+    /// [`DevOp::GemvQkv`], whose `i1/i3/i4` are `Nq/Nk/Nv` for three concatenated weight
+    /// streams read against one staged `x`; the shape that governs its cost is their sum.
+    ///
+    /// `quant` is the encoding of the WEIGHT stream, spelled to match
+    /// `kernelcaps::QuantScheme`'s `Debug` so the op-case keys of the two families are
+    /// directly comparable. Note `GemvFp8Blk` reports `W8A8`: `QuantScheme` has no block-fp8
+    /// variant, and the block grid is a scale layout rather than a different operand width.
+    ///
+    /// # `family` is part of the key, and leaving it out gives WRONG ANSWERS
+    ///
+    /// It was left out in the first draft, and `tunedb-gemv best` immediately printed
+    /// nonsense: `TuneStore::best_for` ranks every `kernel_id` filed under one `op_case` and
+    /// returns the fastest, so a plain `Gemv` and a fused `GemvQkv` at the same `(M, N, K)`
+    /// were compared as if they were two implementations of one operation. They are not — the
+    /// fused arm reads THREE weight streams against one staged `x` and produces three outputs.
+    /// Whichever happened to be faster was reported as "the winner" for a shape the other one
+    /// is the only legal answer for.
+    ///
+    /// That is the GEMM cell's structure applied where it does not hold: there, five tiles are
+    /// genuinely interchangeable implementations of one GEMM. Here the arms are different ops.
+    /// The family therefore goes in the key, which leaves exactly one kernel per case — an
+    /// honest representation of a path that has no per-shape rung to select.
+    pub fn gemv_case(self, i: &[u32; 8]) -> Option<(&'static str, u32, u32, u32, &'static str)> {
+        let (fam, n, q) = match self {
+            DevOp::Gemv | DevOp::GemvSz => ("gemv", i[1], "None"),
+            DevOp::GemvArgmax => ("gemvargmax", i[1], "None"),
+            DevOp::GemvGlu | DevOp::GemvGluSz => ("gemvglu", i[1], "None"),
+            DevOp::GemvQkv => ("gemvqkv", i[1] + i[3] + i[4], "None"),
+            DevOp::GemvFp8 => ("gemv", i[1], "W8A8"),
+            DevOp::GemvFp8Blk => ("gemvblk", i[1], "W8A8"),
+            DevOp::GemvGluFp8 => ("gemvglu", i[1], "W8A8"),
+            DevOp::GemvMxfp4 => ("gemv", i[1], "Mxfp4"),
+            DevOp::GemvGluMxfp4 => ("gemvglu", i[1], "Mxfp4"),
+            _ => return None,
+        };
+        Some((fam, i[0], n, i[2], q))
+    }
 }
 
 /// Sentinel expert id a router writes for an unused top-k slot; the expert body skips
@@ -893,7 +1286,9 @@ pub struct StreamEnt {
     pub succ_len: u16,
     pub flags: u16,
     /* Which wave-class SEGMENT this entry belongs to. The host relaunches the interpreter once
-     * per segment with that segment's wave count; the interp skips entries whose seg != cur_seg.
+     * per segment with that segment's wave count; the interp runs only that segment's entries
+     * (bounded by [`DevProgram::seg_ofs`] when the host builds it, otherwise by skipping every
+     * entry whose seg != cur_seg).
      * 0 for a single-segment (unsegmented) program. Was `_pad`; same 16-bit slot. */
     pub seg: u16,
 }
@@ -918,9 +1313,22 @@ pub struct DevProgram {
     pub tensors: u64,
     /// `[total stream length]`, or 0 to disable tracing. Slot `stream_ofs[cu] + pc`.
     pub trace: u64,
-    /// Segmented dispatch: interp runs only entries with `seg == cur_seg`.
+    /// Segmented dispatch: interp runs only this segment's entries.
     pub cur_seg: u32,
-    pub _segpad: u32,
+    /// L2-domain placement (`PLOW_L2_PLACE`): the number of L2 domains `gq_seg_ofs` is windowed
+    /// by, `0` when the program is not placed. An interpreter built with
+    /// `-DPLOW_L2_PLACE_DISPATCH` picks its window from the domain it is PHYSICALLY running on
+    /// (`HW_REG_XCC_ID` on gfx9xx) rather than from `cur_seg`, so every domain drains
+    /// concurrently in ONE launch.
+    pub l2_domains: u32,
+    /// Segments [`Self::seg_ofs`] is built for; the row stride there is `n_seg + 1`.
+    /// Only read when `seg_ofs != 0`.
+    ///
+    /// This field and `l2_domains` both once occupied the single spare `_segpad` u32 — added on
+    /// independent branches, each claiming it. They are independent axes (`l2_domains` windows
+    /// the GLOBAL QUEUE by physical L2 domain; `n_seg` describes the STATIC per-CU `seg_ofs`
+    /// table by wave-class segment), so both are kept and the struct grew 136 -> 144.
+    pub n_seg: u32,
     /// Global-queue interpreter (Experiment E1). Op-major stream, segment bounds, shared cursor.
     pub gq_stream: u64,
     pub gq_seg_ofs: u64,
@@ -937,6 +1345,13 @@ pub struct DevProgram {
     pub rank: u32,
     /// TP degree (1 = single-GPU, cross-GPU fields unused).
     pub n_gpu: u32,
+    /// STATIC-path per-(CU, segment) stream windows: `[n_cu][n_seg+1]` u32,
+    /// row-major, indices relative to `stream_ofs[cu]`. `0` ⇒ the interpreter
+    /// falls back to scanning the whole per-CU stream and filtering on `seg`.
+    ///
+    /// Built by [`crate::devbuild::static_seg_ofs`] at load time, NOT carried in
+    /// the blob — see the field comment in `runtime/common/dev_isa.h` for why.
+    pub seg_ofs: u64,
 }
 
 /// One packet boundary, timestamped by the interpreter.
@@ -967,4 +1382,4 @@ const _: () = assert!(size_of::<Wait>() == 8);
 const _: () = assert!(size_of::<DevInst64>() == 64);
 const _: () = assert!(size_of::<StreamEnt>() == 24);
 const _: () = assert!(size_of::<TraceRec>() == 40);
-const _: () = assert!(size_of::<DevProgram>() == 128);
+const _: () = assert!(size_of::<DevProgram>() == 144);

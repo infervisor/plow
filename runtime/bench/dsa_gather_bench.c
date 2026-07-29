@@ -60,24 +60,33 @@ static void ref_score(const bf16* Qi,const bf16* Ki,const bf16* W,unsigned ctx,f
         sc[t]=s*SCALE_IDX; }
 }
 /* radix-ref: the SAME packed key + top-k as the kernel; returns a selected[ctx] bitmap. */
-static void ref_select(const float* sc,unsigned ctx,char* selected){
-    unsigned long long* key=malloc((size_t)ctx*8);
-    for(unsigned t=0;t<ctx;t++){ float x=sc[t]; unsigned sb; memcpy(&sb,&x,4);
+/* Top-k over the FIRST `len` scores only, selecting `k` of them. `len`/`k` are parameters (not the
+ * ctx/TOPK constants they used to be) because the short-context gate needs the reference to model
+ * what the device is now contractually required to do: rank only the rows INDEX_SCORE actually
+ * wrote (kv_len of them) and select min(top_k, kv_len). */
+static void ref_select_k(const float* sc,unsigned len,unsigned k,char* selected,unsigned selbytes){
+    memset(selected,0,selbytes);
+    if(len==0||k==0) return;
+    if(k>len) k=len;
+    unsigned long long* key=malloc((size_t)len*8);
+    for(unsigned t=0;t<len;t++){ float x=sc[t]; unsigned sb; memcpy(&sb,&x,4);
         sb=(sb&0x80000000u)?~sb:(sb|0x80000000u);
-        key[t]=((unsigned long long)sb<<20)|(unsigned long long)((ctx-1-t)&0xFFFFF); }
-    memset(selected,0,ctx);
+        key[t]=((unsigned long long)sb<<20)|(unsigned long long)((len-1-t)&0xFFFFF); }
     /* rank by count-greater (unique keys) — but O(n^2) is too slow at 128k; use nth_element via
-     * a copy+partial selection: find the TOPK-th largest key by a simple quickselect. */
-    unsigned long long* tmp=malloc((size_t)ctx*8); memcpy(tmp,key,(size_t)ctx*8);
-    /* quickselect for the (ctx-TOPK)-th smallest == TOPK-th largest threshold */
-    unsigned lo=0,hi=ctx-1,want=ctx-TOPK; unsigned long long thr=0;
+     * a copy+partial selection: find the k-th largest key by a simple quickselect. */
+    unsigned long long* tmp=malloc((size_t)len*8); memcpy(tmp,key,(size_t)len*8);
+    /* quickselect for the (len-k)-th smallest == k-th largest threshold */
+    unsigned lo=0,hi=len-1,want=len-k; unsigned long long thr=0;
     while(lo<hi){ unsigned long long p=tmp[(lo+hi)>>1]; unsigned i=lo,j=hi;
         while(i<=j){ while(tmp[i]<p)i++; while(tmp[j]>p)j--;
             if(i<=j){ unsigned long long t2=tmp[i];tmp[i]=tmp[j];tmp[j]=t2; i++; if(j)j--; else break; } }
         if(want<=j) hi=j; else if(want>=i) lo=i; else break; }
     thr=tmp[want];
-    for(unsigned t=0;t<ctx;t++) if(key[t]>=thr) selected[t]=1;
+    for(unsigned t=0;t<len;t++) if(key[t]>=thr) selected[t]=1;
     free(key); free(tmp);
+}
+static void ref_select(const float* sc,unsigned ctx,char* selected){
+    ref_select_k(sc,ctx,TOPK,selected,ctx);
 }
 /* absorbed-MLA over a given selected index list (mirrors the gather kernel reduction). */
 static void ref_mla(const bf16* Qa,const bf16* Qr,const bf16* Ckv,const bf16* Kr,const bf16* Wuv,
@@ -169,8 +178,9 @@ int main(int argc,char** argv){
         /* ---- kernarg structs (mirror the wrapper signatures) ---- */
         struct __attribute__((packed)){ void *sc,*qi,*ki,*w,*len; unsigned nb,ih,ks; float scale; } aSc=
             {dSc,dQi,dKi,dW,dLen,1,HI,ctx,SCALE_IDX};
-        struct __attribute__((packed)){ void *idx; const void *sc; unsigned len,tk; void *hist,*ctl; } aSel=
-            {dIdx,dSc,ctx,TOPK,dHist,dCtl};
+        struct __attribute__((packed)){ void *idx; const void *sc; unsigned len,tk; void *hist,*ctl;
+                                        const void *klen; } aSel=
+            {dIdx,dSc,ctx,TOPK,dHist,dCtl,dLen};
         struct __attribute__((packed)){ void *op,*ml; const void *qa,*qr,*ckv,*kr,*len,*idx;
             unsigned tk,nb,nh,ks; float scale; unsigned ns; } aGat=
             {dOp,dMl,dQa,dQr,dCkv,dKr,dLen,dIdx,TOPK,1,NH,ctx,SCALE_MLA,NSPLIT};
@@ -250,6 +260,61 @@ int main(int argc,char** argv){
         for(int j=0;j<TOPK;j++){ int t=hIdxT[j]; if(t<0||t>=(int)ctx){idx_okT=0;continue;} selDevT[t]=1; cntT++; }
         int tie_eqA=idx_okT&&(cntT==TOPK); if(tie_eqA) for(unsigned t=0;t<ctx;t++) if(selDevT[t]!=selRefT[t]){tie_eqA=0;break;}
         free(hScT); free(hIdxT); free(selRefT); free(selDevT);
+        /* ---- SHORT-CONTEXT GATE: kv_len < max_ctx, the ONLY state a real decode step is ever in.
+         *
+         * Everything above runs kv_len == ctx, which is why this harness passed for the entire life
+         * of the bug it is now pinned against. The emitter bakes `i[0] = max_ctx` into INDEX_SELECT
+         * but INDEX_SCORE writes `Score[pos]` only for `pos < kv_len`, so the selector used to rank
+         * `max_ctx - kv_len` words the score kernel never touched. DSA arms only above a 64k
+         * crossover, so in production that gap is essentially the whole array.
+         *
+         * Reproduced faithfully rather than simulated: POISON the full score buffer, then let the
+         * real score kernel overwrite only [0, LIVE) by uploading kv_len = LIVE. The tail that
+         * survives is exactly what production leaves there. The poison is +1e30 so a selector that
+         * still scans max_ctx MUST pick it and the failure is unambiguous, not probabilistic.
+         *
+         * Two regimes, both required:
+         *   LIVE_A > TOPK  — the ordinary long-prompt case; every index must land inside [0,LIVE).
+         *   LIVE_B < TOPK  — a short prompt, where fewer than top_k rows EXIST. The selector must
+         *                    emit exactly LIVE_B of them and the gather must walk exactly that many
+         *                    slots (`tk_live`), because slots [LIVE_B, TOPK) of idx[] were never
+         *                    written and the GATHER path applies no mask. */
+        {
+            const unsigned LIVES[2]={ctx/4>TOPK?ctx/4:TOPK+1, 777};
+            for(int li=0;li<2;li++){
+                const unsigned LIVE=LIVES[li];
+                if(LIVE>=ctx) continue;
+                const unsigned KEXP=TOPK<LIVE?TOPK:LIVE;   /* min(top_k, kv_len) */
+                float* hP=malloc((size_t)ctx*4);
+                for(unsigned t=0;t<ctx;t++) hP[t]=1e30f;    /* poison the whole buffer */
+                up(dSc,hP,(size_t)ctx*4);
+                int32_t kl=(int)LIVE; up(dLen,&kl,4);       /* score writes only [0,LIVE) */
+                L(kScM,aSc); plow_hsa_wait(H,0);
+                float* hS=malloc((size_t)ctx*4); plow_hsa_download(H,0,hS,dSc,(size_t)ctx*4);
+                LSA(aSel); plow_hsa_wait(H,0);
+                int* hI=malloc((size_t)TOPK*4); plow_hsa_download(H,0,hI,dIdx,(size_t)TOPK*4);
+                char* rS=malloc(ctx); ref_select_k(hS,LIVE,KEXP,rS,ctx);
+                char* dS=calloc(ctx,1); int ok=1,cnt=0,oob=0;
+                for(unsigned j=0;j<KEXP;j++){ int t=hI[j];
+                    if(t<0||(unsigned)t>=LIVE){oob++;ok=0;continue;} dS[t]=1; cnt++; }
+                if(ok&&cnt!=(int)KEXP) ok=0;
+                if(ok) for(unsigned t=0;t<ctx;t++) if(dS[t]!=rS[t]){ok=0;break;}
+                /* the gather must agree with a CPU MLA over exactly the KEXP live slots */
+                double grel=-1.0;
+                if(ok){ L(kGat,aGat); plow_hsa_wait(H,0); L(kMrg,aMrg); plow_hsa_wait(H,0);
+                    L(kFld,aFld); plow_hsa_wait(H,0);
+                    bf16* hOs=malloc((size_t)NH*VD*2); plow_hsa_download(H,0,hOs,dO,(size_t)NH*VD*2);
+                    bf16* rOs=malloc((size_t)NH*VD*2); ref_mla(hQa,hQr,hCkv,hKr,hWuv,hI,(int)KEXP,rOs);
+                    grel=relmax(hOs,rOs,NH*VD); free(hOs); free(rOs); }
+                printf("        kv_len=%-7u (max_ctx=%u, expect %u idx) sel %s%s gather %s\n",
+                       LIVE,ctx,KEXP, ok?"EXACT":"MISMATCH",
+                       oob?" [INDEX OUT OF RANGE — selector scanned past kv_len]":"",
+                       grel<0?"-":(grel<3e-2?"PASS":"FAIL"));
+                free(hP);free(hS);free(hI);free(rS);free(dS);
+            }
+            int32_t kb=(int)ctx; up(dLen,&kb,4); /* restore full length for anything after */
+        }
+
         /* restore real scores in dSc AND regenerate dIdx (the tie test clobbered both) so the gather
          * checks below run over the same real top-k set that hIdx holds. */
         L(kSc,aSc); plow_hsa_wait(H,0); LS(aSel); plow_hsa_wait(H,0);

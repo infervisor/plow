@@ -72,7 +72,13 @@ hub = ["hf-tokenizer", "dep:safetensors", "dep:hf-hub"]
 # build did exactly that, 2026-07-19; see serve() 's byte-fallback refusal).
 cuda = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 # HSA driver-API backend (dlopen of libhsa-runtime64 — direct ROCr, no HIP).
-hsa = ["dep:libloading"]
+# Pulls the same two extras as `cuda`, for the same two reasons: the AMD engine
+# (`exec::amd`) binds checkpoint weights by tensor name, which needs the
+# safetensors reader; and a real model served through the byte-fallback
+# tokenizer produces silent garbage rather than an error (measured on the CUDA
+# side, 2026-07-19). The features stay symmetric so an AMD serve cannot inherit
+# a failure mode the NVIDIA one was fixed for.
+hsa = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

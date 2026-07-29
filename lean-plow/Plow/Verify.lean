@@ -205,19 +205,41 @@ theorem verifyAddressMap_sound {tg : TaskGraph} (p : CounterProtocol tg)
     always picks a fresh producer task for the new buffer. We expose that as
     a separate decidable predicate and prove Loose ∧ Disjoint ⟹ Strict. -/
 
-/-- Bool check: for every entry pair, the reader set of one and the writer
-    set of the other are disjoint. When true, the loose form of `mayReclaim`
-    collapses to the strict form. -/
+/-- Bool check: for every **co-located** pair — distinct names, bytes
+    overlapping — the reader set of one and the writer set of the other are
+    disjoint. When true, the loose form of `mayReclaim` collapses to the strict
+    form on exactly the pairs `AddressMapSound` quantifies over.
+
+    # The guards are load-bearing, and their absence was a false rejection
+    This predicate used to quantify over ALL pairs with no guards, which
+    (taking `a = b`) made it equivalent to "the union of every reader set and
+    the union of every writer set are disjoint" — i.e. **no task anywhere may
+    both read and write any mapped buffer**. That is not a property real
+    schedules have, and it is not one `AddressMapSound` needs: a KV cache is
+    read and written by the same attention tasks, and an in-place residual
+    accumulate reads and writes one buffer by construction.
+
+    Measured on Gemma-4-12B `decode_b1_s1`, whose address map is two entries —
+    `t7` at bytes `[0, 6144)` (24 writers, no readers) and `kv_cache_L0` at
+    `[6144, 3151872)` (tasks 33-44 in BOTH sets). The two do not overlap, so
+    `AddressMapSound` has nothing to check and holds vacuously; the unguarded
+    predicate nevertheless found tasks 33-44 in the global reader ∩ writer
+    intersection and rejected the packet. The guards below are the same two
+    `AddressMapSound` itself carries, so the check now asks the question the
+    theorem actually needs answered. -/
 def readersWritersDisjointB {tg : TaskGraph} (entries : List (AddrEntry tg)) :
     Bool :=
   entries.all fun a => entries.all fun b =>
-    (a.readers.all fun r => decide (r ∉ b.writers))
-    && (b.readers.all fun r => decide (r ∉ a.writers))
+    decide (a.name = b.name)
+    || !bytesOverlapB a.offset a.size b.offset b.size
+    || ((a.readers.all fun r => decide (r ∉ b.writers))
+        && (b.readers.all fun r => decide (r ∉ a.writers)))
 
-/-- Prop-level statement of disjointness. -/
+/-- Prop-level statement of disjointness, on co-located pairs only. -/
 def ReadersWritersDisjoint {tg : TaskGraph}
     (entries : List (AddrEntry tg)) : Prop :=
-  ∀ a b, a ∈ entries → b ∈ entries →
+  ∀ a b, a ∈ entries → b ∈ entries → a.name ≠ b.name →
+    bytesOverlap a.offset a.size b.offset b.size →
     (∀ r ∈ a.readers, r ∉ b.writers) ∧
     (∀ r ∈ b.readers, r ∉ a.writers)
 
@@ -226,21 +248,26 @@ theorem readersWritersDisjointB_sound {tg : TaskGraph}
     (entries : List (AddrEntry tg))
     (h : readersWritersDisjointB entries = true) :
     ReadersWritersDisjoint entries := by
-  intro a b ha hb
-  have hab : (
-      (a.readers.all fun r => decide (r ∉ b.writers))
-      && (b.readers.all fun r => decide (r ∉ a.writers))
+  intro a b ha hb hne hov
+  -- Pull the per-pair clause out, then discharge the two guards exactly as
+  -- `verifyAddressMap_sound` does for the same pair shape.
+  have hpair : (
+      decide (a.name = b.name)
+      || !bytesOverlapB a.offset a.size b.offset b.size
+      || ((a.readers.all fun r => decide (r ∉ b.writers))
+          && (b.readers.all fun r => decide (r ∉ a.writers)))
     ) = true := by
     have h1 := (List.all_eq_true.mp h) a ha
     exact (List.all_eq_true.mp h1) b hb
-  rw [Bool.and_eq_true] at hab
-  refine ⟨?_, ?_⟩
-  · intro r hr
-    have := (List.all_eq_true.mp hab.1) r hr
-    simpa using this
-  · intro r hr
-    have := (List.all_eq_true.mp hab.2) r hr
-    simpa using this
+  have hname_false : decide (a.name = b.name) = false := by
+    simp [hne]
+  have hov_true : bytesOverlapB a.offset a.size b.offset b.size = true :=
+    (bytesOverlapB_iff a.offset a.size b.offset b.size).mpr hov
+  rw [hname_false, hov_true] at hpair
+  -- With both guards discharged the remaining disjunct is the conjunction, and
+  -- `simp` takes the two `List.all`s straight to their ∀ forms — which is the
+  -- goal.
+  simpa using hpair
 
 /-- **Loose ∧ Disjoint ⟹ Strict**: given the loose reclamation predicate
     and the reader/writer disjointness invariant, every occurrence of the
@@ -252,7 +279,10 @@ theorem addressMapSound_of_loose_and_disjoint {tg : TaskGraph}
     (h_disj : ReadersWritersDisjoint entries) :
     AddressMapSound p entries := by
   intro a b ha hb hne hov
-  have hd := h_disj a b ha hb
+  -- `h_disj` is now available exactly where the goal is: on a co-located pair.
+  -- That is all this proof ever used it for, which is why narrowing the
+  -- predicate costs nothing here and stops it rejecting in-place buffers.
+  have hd := h_disj a b ha hb hne hov
   rcases h_loose a b ha hb hne hov with hfwd | hbwd
   · refine Or.inl ?_
     intro r hr w hw

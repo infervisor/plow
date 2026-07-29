@@ -18,7 +18,7 @@
 //! needs the cooperative-launch path the standalone harnesses proved out
 //! (`runtime/tests/gemma4_sm120_chat.cu`): `cuModuleLoadData` on a prebuilt
 //! cubin, `cuOccupancyMaxActiveBlocksPerMultiprocessor` × SM count for the
-//! grid, `cuLaunchCooperativeKernel` with the 128-byte `PlowProgram` kernarg.
+//! grid, `cuLaunchCooperativeKernel` with the `PlowProgram` kernarg.
 //! Those live on [`CudaBackend`]'s inherent methods, consumed by
 //! `crate::exec::gpu`.
 //!

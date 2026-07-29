@@ -1,4 +1,16 @@
 //! `plowc` — compile a model or network into runtime packet streams for a GPU.
+//!
+//! **The egglog rewriting stage is analysis, not compilation.** Both of this
+//! binary's paths run it and both throw the result away: the plan path computes
+//! a `FusedGraph` for its statistics and lowers the RAW graph anyway (see the
+//! `plowc` crate docs), and the devblob path calls [`report_devblob_egglog`],
+//! which logs a fusion count and returns `()`. `devgen`, the devblob emitter,
+//! does not depend on `rewrite` at all. **No egglog rewrite has ever reached a
+//! GPU.** Every fusion in a shipped packet is hand-written in `devgen`.
+//!
+//! This is stated here, at the driver's front door, because the log line alone
+//! ("egglog fusion analysis … fusions_found=662") was read as a compiler pass
+//! reporting its work, and quoted as such.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -139,10 +151,41 @@ struct Cli {
     #[arg(long)]
     embed_hsaco: Option<String>,
 
-    /// Send each bucket's `(schedule, address_map)` to the Lean verifier
-    /// (`plow_verify` CLI). Rejection fails the compile. The binary is located
-    /// via `PLOW_VERIFY_BIN` or `lean-plow/.lake/build/bin/plow_verify`.
-    #[arg(long, default_value_t = false)]
+    /// Disable the Lean ORDERING CERTIFICATE (on by default). Affects only
+    /// verification — `--lean-oracle` is a separate switch and keeps running.
+    ///
+    /// On, each bucket's `(schedule, address_map)` goes to the `plow_verify`
+    /// CLI; a REJECTION fails the compile. No usable verifier on this machine
+    /// is a warning and a skip, recorded in `build.json` as
+    /// `lean.verified: false` with a reason. Binary located via
+    /// `PLOW_VERIFY_BIN` or `lean-plow/.lake/build/bin/plow_verify`.
+    ///
+    /// ONE SWITCH PER SUBSYSTEM, deliberately: an earlier design had both
+    /// `--lean-verify` and `--no-lean-verify` bound to two fields, which made
+    /// the positive flag a no-op and let the negative one silently disable the
+    /// oracle as well.
+    /// DEFAULT-ON IS BACKED OUT PENDING AN OPEN REJECTION. Turning it on made
+    /// `plowc` refuse to compile Gemma-4-12B at all:
+    ///
+    ///   gemma4-12b: compile failed: lean verifier rejected bucket `decode_b1_s1`:
+    ///   reader/writer sets overlap — strict AddressMapSound not derivable
+    ///
+    /// That is the gate WORKING — a `plow_verify` binary is present on the
+    /// gfx950 box, so the degrade path never ran and the verifier delivered a
+    /// real verdict. But it is unresolved: either Gemma-4-12B's decode program
+    /// genuinely aliases a reader and a writer (this codebase's signature defect
+    /// class — 14 found, every one fluent-but-wrong rather than crashing), or
+    /// `AddressMapSound` is too strict for a legitimate in-place op such as a
+    /// residual accumulate or KV-ring reuse.
+    ///
+    /// Until that is settled the flag ships OFF, because the alternative —
+    /// downgrading a genuine rejection to a warning — is exactly the
+    /// silently-skipped-gate failure the manifest `lean` block was added to
+    /// prevent. Opt in with `--lean-verify`; a rejection is still fatal there,
+    /// and everything else from that work (the manifest record, the degrade on
+    /// a missing binary, and the fix for the GLM/Kimi/DeepSeek early-returns
+    /// that were dropping the hook entirely) is unconditional and stays on.
+    #[arg(long = "lean-verify", action = clap::ArgAction::SetTrue)]
     lean_verify: bool,
 
     /// Drop counters already covered by resource-order (§8.1 counter
@@ -169,10 +212,20 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     sram_fit: bool,
 
-    /// Enable the Lean performance oracle. Queries `plow_verify` for
-    /// provably-optimal counter granularity, prefetch depth, and lower-bound
-    /// certificates. Falls back to Rust heuristics if the binary is unavailable.
-    #[arg(long, default_value_t = false)]
+    /// Disable the Lean PERFORMANCE ORACLE (on by default). Affects only the
+    /// oracle — the ordering certificate keeps running unless you also pass
+    /// `--no-lean-verify`.
+    ///
+    /// On, `plow_verify` is queried for provably-optimal counter granularity,
+    /// prefetch depth, and lower bounds; Rust heuristics take over when the
+    /// binary is unavailable. On the devblob path the decode lower bound comes
+    /// back WITHOUT a certificate (the log line reports `certified=false`) —
+    /// treat it as analytical.
+    /// OFF by default for the same reason as `--lean-verify` above: both share
+    /// the `plow_verify` binary, and shipping the oracle on while verification
+    /// is backed out would give a compile that consults the verifier but
+    /// ignores its verdict. Opt in with `--lean-oracle`.
+    #[arg(long = "lean-oracle", action = clap::ArgAction::SetTrue)]
     lean_oracle: bool,
 
     /// §P Emit a host-executor SAMPLE packet at the tail of every decode bucket
@@ -305,8 +358,28 @@ enum Cmd {
     Tune(TuneCli),
 }
 
+/// `plowc tune <action>`.
+///
+/// `--shape` / `--status` are the pre-subcommand spellings and still work, so nothing in flight
+/// breaks. New work should use the action word.
+///
+/// The actions that DERIVE a shape list (`shapes`, `status` with coverage, `gemm --shapes auto`)
+/// run a real emit, so they take the compile's own flags from the TOP-LEVEL command — before the
+/// word `tune`:
+///
+/// ```text
+/// plowc --hf-dir <ckpt> --max-ctx 4096 --n-cu 256 --num-gpus 4 tune gemm --obj <objdir>
+/// ```
+///
+/// That is deliberate. A shape list is only correct for one configuration — the prefill bucket
+/// ladder is part of the demand — so the configuration is stated in the same words the build
+/// states it, instead of being re-declared here where it could drift.
 #[derive(Args, Debug)]
 struct TuneCli {
+    /// inventory | select | status | shapes | gemm | ingest | best | regress
+    #[arg(value_name = "ACTION")]
+    action: Option<String>,
+
     /// GPU spec name or short alias (e.g. `rtx6000pro`, `h100`, `mi350`).
     #[arg(long, default_value = "H100 SXM5")]
     gpu: String,
@@ -327,9 +400,54 @@ struct TuneCli {
     #[arg(long, value_name = "M,N,K")]
     shape: Option<String>,
 
-    /// Report what the tuning database holds for this target.
+    /// Deprecated spelling of `tune status`.
     #[arg(long)]
     status: bool,
+
+    /// `gemm`: object directory holding a freshly built `test_kernels.elf`.
+    #[arg(long, value_name = "DIR")]
+    obj: Option<PathBuf>,
+
+    /// `gemm`/`ingest`: the raw-sample JSONL the C harness writes.
+    #[arg(long, value_name = "FILE")]
+    samples: Option<PathBuf>,
+
+    /// `gemm`: shape list. `auto` (the default) DERIVES it from the compiler's demand; a path
+    /// replays an `M N K [label]` list — the form that can drift, kept only so the bash
+    /// campaign's list can be replayed for a byte-comparable A/B.
+    #[arg(long, default_value = "auto", value_name = "auto|FILE")]
+    shapes: String,
+
+    /// `gemm`: wrap every GPU invocation in `perf-data/harness/gpulease -n 1`. Off by default,
+    /// matching the bash script, whose caller holds the lease.
+    #[arg(long)]
+    lease: bool,
+
+    /// `gemm`: measure but do NOT publish. Prints the command that would publish, and says so
+    /// loudly — an unpublished campaign changes nothing while looking like a success.
+    #[arg(long)]
+    no_ingest: bool,
+
+    /// `gemm`: derive the shapes and stop. Measures nothing, touches no GPU.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// `gemm`/`ingest`: campaign label recorded on every published record.
+    #[arg(long, default_value = "gemm-tile-inventory")]
+    campaign: String,
+
+    /// `gemm`/`ingest`: store as screening-only, NOT selectable.
+    #[arg(long)]
+    provisional: bool,
+
+    /// `best`: which weight encoding to report.
+    #[arg(long, default_value = "None", value_name = "None|W8A8|Mxfp4")]
+    quant: String,
+
+    /// `regress`: report op cases whose median moved by at least this fraction across build
+    /// digests. `gemm_c4` regressed ~0.30 and nothing reported it.
+    #[arg(long, default_value_t = 0.10, value_name = "FRACTION")]
+    threshold: f64,
 }
 
 fn main() -> ExitCode {
@@ -368,7 +486,7 @@ fn main() -> ExitCode {
 
     if let Some(Cmd::Tune(t)) = &cli.cmd {
         info!(gpu = %t.gpu, profile = %t.profile, "tuning command started");
-        return match run_tune(t) {
+        return match run_tune(t, &cli) {
             Ok(()) => {
                 info!("tuning command completed");
                 ExitCode::SUCCESS
@@ -406,10 +524,35 @@ fn main() -> ExitCode {
     }
 }
 
-/// egglog fusion analysis for the devblob path (`--lean-verify` only).
-/// Informational: reports what the rewrite rules find on this checkpoint's
-/// graph, so devgen's hand-coded fusion choices can be compared against the
-/// explored space. Failures are warnings — analysis never blocks emission.
+/// egglog fusion analysis for the devblob path (`--lean-verify`/`--lean-oracle`).
+///
+/// **ADVISORY ONLY — the result is discarded and NO fusion it finds reaches the
+/// emitted packet.** This is not a caveat about coverage; it is the whole
+/// relationship. `devgen` (the devblob emitter) has no `rewrite`/`egglog`
+/// dependency at all — check `crates/devgen/Cargo.toml` — so there is no path
+/// by which a fused term could be lowered here even in principle. The function
+/// builds a SECOND graph from the same `config.json`, saturates it, counts what
+/// matched, logs the count, and drops it on the floor. Every fusion in a plow
+/// packet (`GemvQkv` op 22, `GemvGlu` op 19, `NormResidualNorm`, …) is
+/// hand-written in `devgen`, chosen by hand, and owes nothing to this pass.
+///
+/// Measured on Gemma-4-31B: `graph_ops=1444, fusions_found=662`
+/// (`FusedNormLinear` 241, `FusedResidualNorm` 120, `FusedNormRope` 120,
+/// `SwiGLU` 60, …). Read that as "the rewrite rules would have found 662
+/// opportunities IF they were wired", not as work the compiler did.
+///
+/// Deliberately not wired up, and the reason is measurement rather than effort:
+/// deleting packets is worth **≤0.064 ms/token**. `PLOW_NO_FUSE_QKV=1` reverts
+/// the shipped fused QKV to three GEMVs — identical binary, identical 79,947
+/// workgroup-packets, +100 gates — and the split version measured *faster*
+/// (17.704 vs 18.070 ms/token, n=8). Replicated on sm_120
+/// (`perf-data/t11-packet-reduce.md`). So the value of routing these 662 through
+/// to emission is bounded near zero, and the honest thing is to say the stage is
+/// advisory rather than to leave a whole-model rewrite pass looking load-bearing.
+///
+/// Failures are warnings — analysis never blocks emission. Same standing as
+/// `plowc`'s plan path, which drops its `FusedGraph` for the same reason; see
+/// the `plowc` crate docs and `perf-data/px18-egglog-wholemodel.md`.
 fn report_devblob_egglog(dir: &std::path::Path) {
     let json = match std::fs::read_to_string(dir.join("config.json")) {
         Ok(j) => j,
@@ -418,7 +561,7 @@ fn report_devblob_egglog(dir: &std::path::Path) {
             return;
         }
     };
-    let mut g = match frontend::build_from_config_json_at(&json, &frontend::ShapeBucket::default())
+    let mut g = match nn_graph::models::build_from_config_json_at(&json, &nn_graph::models::ShapeBucket::default())
     {
         Ok(g) => g,
         Err(e) => {
@@ -435,11 +578,20 @@ fn report_devblob_egglog(dir: &std::path::Path) {
     match rewrite::explore_stats(&g) {
         Ok((ops, fused)) => {
             let total: usize = fused.iter().map(|(_, c)| c).sum();
+            // The `applied`/`reaches_gpu` fields are not decoration. Without them
+            // this line reads as a compiler pass reporting its work, and the
+            // number was quoted that way. `devgen` has no `rewrite` dependency:
+            // ALL of these are dropped.
             info!(
                 graph_ops = ops,
                 fusions_found = total,
+                applied = 0,
+                reaches_gpu = false,
                 by_op = ?fused,
-                "egglog fusion analysis (devblob path)"
+                "egglog fusion analysis (devblob path): ADVISORY ONLY — all {total} fusions are \
+                 discarded, none reach the emitted packet (devgen has no rewrite dependency). \
+                 devgen's fusions are hand-written; measured value of packet deletion is \
+                 <=0.064 ms/token."
             );
         }
         Err(e) => warn!(error = %e, "egglog analysis failed"),
@@ -457,6 +609,28 @@ fn report_devblob_egglog(dir: &std::path::Path) {
 /// contributes the total issue order, so the ordering graph has a cycle iff
 /// some counter edge points BACKWARD in GQ order — exactly non-topology.
 /// The address map is empty: device-arena aliasing is NOT modeled here.
+/// Why the Lean gates cannot even be ATTEMPTED here, or `None` if they can.
+///
+/// Purely an optimisation gate — see the contract on
+/// [`lean_verify::binary_available`]. It exists so a default-on compile skips
+/// `report_devblob_egglog` and the whole `ScheduleRequest` marshal when there is
+/// obviously no verifier, NOT so anyone can assume a `None` here means the
+/// verifier will work. The hook below still downgrades a spawn failure.
+fn lean_unavailable_reason() -> Option<&'static str> {
+    #[cfg(not(feature = "lean-verify"))]
+    {
+        return Some("plowc was built without the `lean-verify` cargo feature");
+    }
+    #[cfg(feature = "lean-verify")]
+    {
+        if lean_verify::binary_available() {
+            None
+        } else {
+            Some("no `plow_verify` binary (set PLOW_VERIFY_BIN, or `lake build` in lean-plow/)")
+        }
+    }
+}
+
 #[cfg(feature = "lean-verify")]
 fn devblob_verify_hook(
     do_verify: bool,
@@ -466,11 +640,27 @@ fn devblob_verify_hook(
 ) -> Result<devgen::VerifyHook, Box<dyn std::error::Error>> {
     use lean_verify::checkpoints::schedule as lv;
     Ok(Box::new(move |m: &packet::devbuild::Model| {
+        let mut rep = devgen::LeanReport::default();
         if do_oracle {
-            devblob_oracle(m, bw_bytes_per_cycle, clock_hz)?;
+            match devblob_oracle(m, bw_bytes_per_cycle, clock_hz) {
+                Ok(()) => rep.oracle = true,
+                // THIS DOWNGRADE IS THE SAFETY MECHANISM, not the `binary_available`
+                // probe above. The probe passes for a binary that is present but
+                // unrunnable — wrong arch, no +x, or lean-plow's /nix/store ELF
+                // interpreter outside `nix develop` (exit 127). Delete this and such
+                // a binary turns every compile into a panic.
+                Err(e) if e.is_binary_unusable() => {
+                    warn!(error = %e, "lean oracle skipped: verifier not runnable");
+                    rep.reason = Some(format!("oracle skipped: {e}"));
+                }
+                Err(e) => return Err(format!("lean oracle failed: {e}")),
+            }
         }
         if !do_verify {
-            return Ok(());
+            rep.reason.get_or_insert_with(|| {
+                "ordering certificate disabled on the command line (--no-lean-verify)".into()
+            });
+            return Ok(rep);
         }
         for (pi, p) in m.progs.iter().enumerate() {
             let n = p.gq_stream.len();
@@ -491,21 +681,69 @@ fn devblob_verify_hook(
                 let (so, sl) = (e.succ_ofs as usize, e.succ_len as usize);
                 succs.push(p.succs[so..so + sl].iter().map(|&c| c as u64).collect());
             }
+            // ONE CURSOR, OR ONE PER DOMAIN — the verifier has to be told which.
+            //
+            // Unplaced, the GQ is a single global cursor, so entry `i`'s issue predecessor is
+            // entry `i-1` and `resource = 0 / stream_idx = i` is exactly right.
+            //
+            // Under `PLOW_L2_PLACE` it is NOT. `Builder::finish` stable-sorts `gq_stream` by
+            // `seg` into `l2_domains` windows, and the runtime gives each domain its OWN cursor
+            // over its OWN window (`plans/l2-placement-generic.md` §3). Entry `i`'s issue
+            // predecessor is then the previous entry OF ITS DOMAIN. Handing the placed stream to
+            // the one-cursor model makes every counter edge that crosses from a later window
+            // back to an earlier one look like a backward edge, and checkpoint D reports the
+            // whole decode program cyclic — a FALSE deadlock. (Measured: Gemma-4-31B decode,
+            // "ordering graph has a cycle (160499 nodes unsorted)", where placement OFF on the
+            // identical program certifies clean.)
+            //
+            // With `resource = seg` the check gets sharper, not weaker: it now actually proves
+            // the per-window claim §3 only argued informally — each window is internally
+            // op-major, so 8 concurrent cursors cannot deadlock.
+            let placed = p.l2_domains > 0;
+            let (resource, stream_idx): (Vec<u64>, Vec<u64>) = if placed {
+                let mut res = Vec::with_capacity(n);
+                let mut idx = Vec::with_capacity(n);
+                let mut next = vec![0u64; p.l2_domains as usize + 1];
+                for e in &p.gq_stream {
+                    let d = (e.seg as usize).min(p.l2_domains as usize);
+                    res.push(d as u64);
+                    idx.push(next[d]);
+                    next[d] += 1;
+                }
+                (res, idx)
+            } else {
+                (vec![0; n], (0..n as u64).collect())
+            };
             let req = lv::ScheduleRequest {
                 task_graph: lv::TaskGraphView { n, edges: Vec::new() },
                 protocol: lv::ProtocolView {
                     waits,
                     succs,
                     threshold,
-                    resource: vec![0; n],
-                    stream_idx: (0..n as u64).collect(),
+                    resource,
+                    stream_idx,
                 },
                 schedule_order: (0..n as u64).collect(),
                 address_map: Vec::new(),
             };
             let t = m.prog_t.get(pi).copied().unwrap_or(0);
-            let cert = lv::check_schedule(&req)
-                .map_err(|e| format!("program {pi} (T={t}): lean verifier failed: {e}"))?;
+            let cert = match lv::check_schedule(&req) {
+                Ok(c) => c,
+                // Same downgrade as the oracle, and the reason it has to be HERE
+                // rather than at the probe: this is the first point that has
+                // actually tried to run the thing. Bail out of the whole loop —
+                // the remaining programs would each pay another failed spawn and
+                // print another identical warning.
+                Err(e) if e.is_binary_unusable() => {
+                    warn!(error = %e, "lean ordering certificate skipped: verifier not runnable");
+                    rep.verified = false;
+                    rep.reason = Some(format!("verifier not runnable: {e}"));
+                    return Ok(rep);
+                }
+                Err(e) => return Err(format!("program {pi} (T={t}): lean verifier failed: {e}")),
+            };
+            // A REJECTION IS A BUG CAUGHT. Never downgraded: `Err` from this hook
+            // aborts emission before any bytes are written.
             if !cert.ok {
                 return Err(format!(
                     "program {pi} (T={t}): GQ order not topological over counter edges: {}",
@@ -519,12 +757,23 @@ fn devblob_verify_hook(
                 "lean ordering certificate: GQ order topological over counter edges"
             );
         }
-        Ok(())
+        // Every program certified. `verified` claims exactly that and nothing more.
+        rep.verified = true;
+        Ok(rep)
     }))
 }
 
-/// `--lean-oracle` on the devblob path: Lean-certified lower bound for one
-/// DECODE step of the emitted program. The oracle's `lower_bound` query gets
+/// `--lean-oracle` on the devblob path: a lower bound for one DECODE step of
+/// the emitted program, computed by `plow_verify`'s `lower_bound` query.
+///
+/// NOT CERTIFIED on this path, and the log line says so. `LowerBoundResult`
+/// carries `certificate: Option<String>` with `#[serde(default)]`, and the
+/// Lean answer for this query returns no `certificate` field — so
+/// `certified = false` on every run today. The arithmetic is the oracle's; the
+/// proof object is not attached. Read the number as an analytical bound, and do
+/// not describe `--lean-oracle` output as "proven" until this reads true.
+///
+/// The oracle's `lower_bound` query gets
 /// the decode program's inst-level counter-edge graph (unit durations →
 /// critical path = program depth) and the bytes the decode program actually
 /// touches (every tensor referenced by a decode inst, `kv.*` excluded — the
@@ -535,7 +784,7 @@ fn devblob_oracle(
     m: &packet::devbuild::Model,
     bw_bytes_per_cycle: u64,
     clock_hz: u64,
-) -> Result<(), String> {
+) -> Result<(), lean_verify::VerifyError> {
     use lean_verify::queries::lower_bound as lb;
     let Some(p) = m.progs.last() else { return Ok(()) };
     let pi = m.progs.len() - 1;
@@ -578,7 +827,10 @@ fn devblob_oracle(
         total_flops: 0,
         peak_flops_per_cycle: 1,
     };
-    let res = lb::query_lower_bound(&req).map_err(|e| format!("lean oracle failed: {e}"))?;
+    // Error passed through UNWRAPPED so the caller can tell "no runnable
+    // verifier" (downgrade to a warning) from "the query itself failed"
+    // (a hard error). Stringifying here would erase that distinction.
+    let res = lb::query_lower_bound(&req)?;
     let us = res.lower_bound as f64 / (clock_hz as f64 / 1e6);
     info!(
         program = pi,
@@ -595,6 +847,11 @@ fn devblob_oracle(
     Ok(())
 }
 
+/// Unreachable in practice — `lean_unavailable_reason()` short-circuits to the
+/// skip hook in this build — but it must compile, and it must NOT be an error.
+/// The gates are on by default now: a plowc built without the feature has to
+/// emit the same blob it always did and SAY that nothing was checked, not
+/// refuse to compile the model.
 #[cfg(not(feature = "lean-verify"))]
 fn devblob_verify_hook(
     _do_verify: bool,
@@ -602,9 +859,9 @@ fn devblob_verify_hook(
     _bw: u64,
     _clock: u64,
 ) -> Result<devgen::VerifyHook, Box<dyn std::error::Error>> {
-    Err("this plowc was built without the `lean-verify` feature; \
-         rebuild with `--features lean-verify` to use `--lean-verify`/`--lean-oracle` with `--emit devblob`"
-        .into())
+    Ok(devgen::skip_hook(
+        "plowc was built without the `lean-verify` cargo feature",
+    ))
 }
 
 /// `--emit devblob`: compile the checkpoint into a single PLOWDEV `model.pkt`
@@ -673,42 +930,111 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         .clone()
         .or_else(|| std::env::var("PLOW_BLOCK").ok().filter(|s| !s.is_empty()));
 
-    // `--lean-verify` / `--lean-oracle` on the devblob path (strictly
-    // additive — absent both flags, nothing below runs and emission is
-    // byte-identical):
+    // The Lean gates on the devblob path. BOTH ARE ON BY DEFAULT (disable with
+    // `--no-lean-verify` / `--no-lean-oracle`, one switch each, no coupling).
+    //
+    // Still strictly additive to the OUTPUT: the hook takes `&Model`, so
+    // whatever happens here the emitted blob is byte-identical. What it can do
+    // is refuse — a rejection aborts before a single byte is written.
+    //
+    // Three outcomes, and `build.json` distinguishes all three:
+    //   * verified — a certificate for every program;
+    //   * skipped — no runnable `plow_verify`; warn, emit, record the reason;
+    //   * rejected — panic, nothing written.
     //  * egglog fusion analysis of the same checkpoint's graph, reported;
     //  * `--lean-verify`: a Lean ordering certificate for the EMITTED
     //    programs — every program's global-queue order is checked
     //    topological over its counter edges (plow_verify checkpoint D);
     //  * `--lean-oracle`: a Lean-certified decode lower bound — critical
     //    path + the weight-streaming bandwidth floor of the decode program.
-    let verify = if cli.lean_verify || cli.lean_oracle {
+    let verify = if !cli.lean_verify && !cli.lean_oracle {
+        Some(devgen::skip_hook(
+            "both gates disabled on the command line (--no-lean-verify --no-lean-oracle)",
+        ))
+    } else if let Some(why) = lean_unavailable_reason() {
+        // DEGRADE, DO NOT FAIL. Absent a verifier the compile proceeds and the
+        // blob is byte-identical — the hook is read-only, so it never had any
+        // say in the bytes. The warning is for the person watching; the
+        // `build.json` record below is for everyone who asks later.
+        warn!(
+            reason = why,
+            "lean gates skipped — this blob is NOT verified (build.json: lean.verified=false)"
+        );
+        Some(devgen::skip_hook(why))
+    } else {
         report_devblob_egglog(&dir);
         let spec = hwspec::registry::lookup(&cli.gpu)
             .ok_or_else(|| format!("unknown GPU {:?}", cli.gpu))?;
+        // MEASURED bandwidth, not the datasheet peak — `bandwidth_for_bound()`, not
+        // `mem.bandwidth`. On MI350X/MI355X those are 6200 GB/s (measured whole-GPU
+        // streaming read, runtime/amd/op_gemm.h:38) and 8000 GB/s (datasheet). This
+        // divides the weight stream, so the datasheet number made the bound 8000/6200
+        // = 1.29x too SMALL: Gemma-4-31B decode read 7719.3 µs where the measured
+        // denominator gives 9.96 ms. A lower bound that is 22.5% optimistic is worse
+        // than no lower bound — it reports headroom that does not exist, and the
+        // measured GEMV already runs at 95–103% of the 6200 ceiling.
         let bw_bytes_per_cycle =
-            (spec.mem.bandwidth.0 * 1e9 / spec.clock_boost.0 as f64) as u64;
+            (spec.mem.bandwidth_for_bound().0 * 1e9 / spec.clock_boost.0 as f64) as u64;
         Some(devblob_verify_hook(
             cli.lean_verify,
             cli.lean_oracle,
             bw_bytes_per_cycle,
             spec.clock_boost.0,
         )?)
-    } else {
-        None
     };
-    // `PLOW_NV_PLACE=1`: L2-domain-aware placement. Resolve SMs per L2 partition
-    // (XCD on MI300/MI350, GPC on H100/B200) from hwspec; `None` (flag unset or
-    // an unpartitioned GPU, e.g. consumer Blackwell) ⇒ byte-identical blob.
-    // The physical-SM dispatch that consumes this is a runtime/interp feature —
-    // see plans/devblob-locality-placement.md.
-    let l2_layout = if std::env::var("PLOW_NV_PLACE").ok().as_deref() == Some("1") {
+    // `PLOW_L2_PLACE=1`: L2-domain-aware placement. The whole layout — SMs per L2 partition and
+    // the partition count — is resolved from `hwspec` (XCD on MI300/MI350, GPC on H100/B200),
+    // not from an env-supplied constant; the flag only says whether to use it. `None` (flag
+    // unset, or an unpartitioned GPU such as consumer Blackwell) ⇒ byte-identical blob. The
+    // physical-SM dispatch that consumes this is a runtime/interp feature —
+    // see plans/l2-placement-generic.md.
+    //
+    // WAS `PLOW_NV_PLACE`, still accepted. The concept is vendor-neutral — an L2 domain is a GPC
+    // on NVIDIA and an XCD on AMD — and the NVIDIA-specific name was reading as "this is an
+    // NVIDIA feature" for something `hwspec` describes on both vendors. The old spelling stays
+    // live so in-flight scripts and recipes do not break.
+    let l2_on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
+    let l2_layout = if l2_on("PLOW_L2_PLACE") || l2_on("PLOW_NV_PLACE") {
         hwspec::registry::lookup(&cli.gpu)
             .and_then(|s| s.l2_partitioning.as_ref())
-            .map(|p| (p.sms_per_partition, p.partition_count))
+            // WHICH WORKGROUP LANDS ON WHICH DOMAIN IS VENDOR-SPECIFIC, and getting it from the
+            // vendor rather than assuming it is the point of this whole type. NVIDIA fills a GPC
+            // with consecutive blocks; AMD's dispatcher assigns workgroups to XCDs round-robin,
+            // MEASURED at 100.0% on MI355X (runtime/tests/xcd_map_gfx950_test.hip). Using the
+            // block formula on AMD would place packets on workgroups the hardware has scattered
+            // across all eight XCDs — correct tokens, inverted locality, invisible to any test.
+            .map(|p| packet::devbuild::L2Layout {
+                sms: p.sms_per_partition,
+                domains: p.partition_count,
+                map: match hwspec::registry::lookup(&cli.gpu).map(|s| s.vendor) {
+                    Some(hwspec::spec::Vendor::Amd) => packet::devbuild::L2Map::RoundRobin,
+                    _ => packet::devbuild::L2Map::Block,
+                },
+            })
     } else {
         None
     };
+    // `--no-tuning` / `--tuning-db` must reach the AMD emitters too, and they did not.
+    //
+    // Both flags fed only `plowc`'s generic `CompilerOracle` path, while `devgen::pick_tile` —
+    // the selector every gfx950 dense model actually goes through — read the store on its own.
+    // So `--no-tuning`, whose documented contract is "the compiled output is identical to the
+    // pre-tuner compiler", did not disable the one tuner that was choosing tiles. An escape
+    // hatch nobody can reach is worse than none: it is a documented promise that silently does
+    // not hold. Carried through the environment because that is how every other compiler-side
+    // knob in `devgen` is read (`PLOW_BLOCK`, `PLOW_FA_GF_FULL`, `PLOW_MXFP4`, …); an empty
+    // value means "no store", which is what `--no-tuning` asks for.
+    std::env::set_var(
+        "PLOW_TUNEDB",
+        if cli.no_tuning {
+            String::new()
+        } else {
+            cli.tuning_db
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "tuning".to_string())
+        },
+    );
     devgen::run_verified(
         devgen::EmitArgs {
             dir: dir.clone(),
@@ -960,21 +1286,98 @@ fn init_logging() {
 // Same pattern as `--lean-verify` without `lean-verify`: the CLI surface
 // stays stable, the un-featured build answers with an error at runtime.
 #[cfg(not(feature = "tuner"))]
-fn run_tune(_t: &TuneCli) -> Result<(), Box<dyn std::error::Error>> {
+fn run_tune(_t: &TuneCli, _cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     Err("this plowc was built without the `tuner` feature; \
          rebuild with `--features tuner` to use `plowc tune`"
         .into())
 }
 
 #[cfg(feature = "tuner")]
-fn run_tune(t: &TuneCli) -> Result<(), Box<dyn std::error::Error>> {
-    let action = if t.status {
-        TuneAction::Status
-    } else if let Some(s) = &t.shape {
-        let (m, n, k) = tune::parse_shape(s)?;
-        TuneAction::Select { m, n, k }
-    } else {
-        TuneAction::Inventory
+fn run_tune(t: &TuneCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // The compile whose demand is being observed, from the TOP-LEVEL flags — the same words the
+    // build states it in. `None` when no checkpoint was given, which is what makes the
+    // derive-based actions refuse rather than silently derive some default model's demand.
+    let emit_spec = |req: &str| -> Result<tune::demand::EmitSpec, Box<dyn std::error::Error>> {
+        let dir = cli.hf_dir.clone().ok_or_else(|| {
+            format!(
+                "{req} derives the compiler's demand by running a real emit, so it needs a \
+                 checkpoint: `plowc --hf-dir <ckpt> --max-ctx <c> --n-cu <n> --num-gpus <g> tune \
+                 …`. The flags go BEFORE the `tune` word because they are the compile's flags."
+            )
+        })?;
+        Ok(tune::demand::EmitSpec {
+            hf_dir: dir,
+            ctx: cli.max_ctx,
+            n_cu: if cli.n_cu > 0 {
+                cli.n_cu
+            } else {
+                hwspec::registry::lookup(&cli.gpu)
+                    .map(|s| s.sm_count)
+                    .ok_or_else(|| format!("unknown GPU {:?}; pass --n-cu explicitly", cli.gpu))?
+            },
+            tp: cli.num_gpus.max(1) as u32,
+            gpu: cli.gpu.clone(),
+            arch: cli.arch.clone(),
+            db: t.db.clone(),
+        })
+    };
+
+    // `--status` / `--shape` are the pre-subcommand spellings, kept live.
+    let word = t.action.clone().unwrap_or_else(|| {
+        if t.status {
+            "status".into()
+        } else if t.shape.is_some() {
+            "select".into()
+        } else {
+            "inventory".into()
+        }
+    });
+
+    let action = match word.as_str() {
+        "inventory" => TuneAction::Inventory,
+        "select" => {
+            let s = t.shape.as_ref().ok_or("`tune select` needs --shape M,N,K")?;
+            let (m, n, k) = tune::parse_shape(s)?;
+            TuneAction::Select { m, n, k }
+        }
+        // Coverage is optional here on purpose: the digest census and the total-staleness alarm
+        // are the part that outranks coverage, and they need no checkpoint at all.
+        "status" => TuneAction::Status {
+            coverage_from: cli.hf_dir.as_ref().map(|_| emit_spec("coverage")).transpose()?,
+        },
+        "regress" => TuneAction::Regress { threshold: t.threshold },
+        "shapes" => TuneAction::Shapes(emit_spec("`tune shapes`")?),
+        "best" => TuneAction::Best { quant: t.quant.clone() },
+        "ingest" => TuneAction::Ingest {
+            samples: t.samples.clone().ok_or("`tune ingest` needs --samples <sweep.jsonl>")?,
+            campaign: t.campaign.clone(),
+            provisional: t.provisional,
+        },
+        "gemm" => TuneAction::Gemm(Box::new(tune::gemm::Campaign {
+            obj: t.obj.clone().ok_or("`tune gemm` needs --obj <dir with test_kernels.elf>")?,
+            samples: t
+                .samples
+                .clone()
+                .ok_or("`tune gemm` needs --samples <out.jsonl> for the raw sample rows")?,
+            shapes: if t.shapes == "auto" {
+                tune::gemm::ShapeSource::Auto(emit_spec("`--shapes auto`")?)
+            } else {
+                tune::gemm::ShapeSource::File(PathBuf::from(&t.shapes))
+            },
+            lease: t.lease,
+            no_ingest: t.no_ingest,
+            db: t.db.clone(),
+            campaign: t.campaign.clone(),
+            provisional: t.provisional,
+            dry_run: t.dry_run,
+        })),
+        other => {
+            return Err(format!(
+                "unknown tune action {other:?}; expected one of: \
+                 inventory, select, status, regress, shapes, gemm, ingest, best"
+            )
+            .into())
+        }
     };
 
     tune::run(&TuneOptions {
@@ -1031,12 +1434,22 @@ fn run(cli: Cli) -> Result<Report, Box<dyn std::error::Error>> {
         phases: cli.phase.phases(),
         page_kib: cli.page_kib,
         out,
-        lean_verify: cli.lean_verify,
+        // PACKET PATH. `Options::lean_verify` is a LIBRARY opt-in and keeps its
+        // hard-fail contract (`PlowcError::LeanVerifyDisabled` / `LeanVerifySpawn`)
+        // — `tests/lean_verify_disabled.rs` pins that. The default-on + degrade
+        // policy therefore lives HERE, at the CLI, which is the layer that has a
+        // default to speak of.
+        //
+        // Note this path runs the verifier ONCE PER BUCKET (a `run_lean_verify`
+        // call per `{phase}_b{batch}_s{seq}` stem, checkpoints A/B/D/E/F each
+        // time), so a per-bucket spawn against a missing binary is exactly what
+        // resolving the flag once, up front, avoids.
+        lean_verify: cli.lean_verify && lean_unavailable_reason().is_none(),
         counter_elim: cli.counter_elim,
         scope_narrow: cli.scope_narrow,
         prefetch: cli.prefetch,
         sram_fit: cli.sram_fit,
-        lean_oracle: cli.lean_oracle,
+        lean_oracle: cli.lean_oracle && lean_unavailable_reason().is_none(),
         emit_sample: cli.emit_sample,
         emit_tokenize: cli.emit_tokenize,
         emit_trace: cli.emit_trace,
@@ -1177,5 +1590,103 @@ fn print_gpu_list() {
         } else {
             println!("  {:30} aliases: {}", spec.name, aliases.join(", "));
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(extra: &[&str]) -> Cli {
+        let mut argv = vec!["plowc", "--hf-dir", "/tmp/x", "--emit", "devblob"];
+        argv.extend_from_slice(extra);
+        Cli::try_parse_from(argv).expect("parse")
+    }
+
+    /// CORRECTION 1, HALF ONE. Both gates are ON with no flags. They used to be
+    /// `default_value_t = false` behind a non-default cargo feature, so they
+    /// shipped in nothing.
+    #[test]
+    fn both_lean_gates_default_off_pending_the_gemma_rejection() {
+        // Was `both_lean_gates_default_on`. Default-on was BACKED OUT because it
+        // made plowc refuse to compile Gemma-4-12B outright:
+        //   "lean verifier rejected bucket `decode_b1_s1`: reader/writer sets
+        //    overlap — strict AddressMapSound not derivable"
+        // That is the gate working (a plow_verify binary IS present on gfx950,
+        // so the degrade path never ran and a real verdict came back), but the
+        // verdict is unresolved. Shipping it on would block every Gemma compile;
+        // downgrading the rejection to a warning would be the silently-skipped
+        // gate this whole change exists to prevent. So: OFF, opt in explicitly,
+        // and a rejection stays fatal for whoever opts in.
+        let c = parse(&[]);
+        assert!(!c.lean_verify);
+        assert!(!c.lean_oracle);
+        // The opt-in still works and is still independent per subsystem.
+        assert!(parse(&["--lean-verify"]).lean_verify);
+        assert!(parse(&["--lean-oracle"]).lean_oracle);
+    }
+
+    /// CORRECTION 1, HALF TWO — THE TRAP THIS PINS SHUT.
+    ///
+    /// The supplied design paired `lean_verify: bool` (`default_value_t = true`)
+    /// with a SEPARATE `no_lean_verify` field, then computed
+    /// `do_oracle = lean_oracle && !no_lean_verify`. That made `--lean-verify`
+    /// incapable of changing anything and — undocumented — made
+    /// `--no-lean-verify` silently switch the ORACLE off too.
+    ///
+    /// One switch per subsystem, no coupling in either direction.
+    #[test]
+    fn disabling_one_gate_never_disables_the_other() {
+        // Same invariant, now expressed on the opt-IN spellings: enabling one
+        // subsystem must never enable or disable the other. The trap being
+        // pinned shut is unchanged — it is the COUPLING that must not exist,
+        // not the polarity.
+        let v = parse(&["--lean-verify"]);
+        assert!(v.lean_verify);
+        assert!(!v.lean_oracle, "--lean-verify must NOT enable the oracle");
+
+        let o = parse(&["--lean-oracle"]);
+        assert!(!o.lean_verify, "--lean-oracle must NOT enable verification");
+        assert!(o.lean_oracle);
+
+        let both = parse(&["--lean-verify", "--lean-oracle"]);
+        assert!(both.lean_verify);
+        assert!(both.lean_oracle);
+    }
+
+    /// Exactly ONE spelling per subsystem. A stale `--lean-verify` in a script
+    /// must fail loudly rather than parse into a field it cannot act on — that
+    /// ambiguity is precisely what Correction 1 removed.
+    #[test]
+    fn the_negative_spellings_are_gone() {
+        // Polarity flipped with the default, but the rule is the same one:
+        // exactly ONE spelling per subsystem, so a stale flag fails loudly
+        // instead of parsing into a field it cannot act on.
+        assert!(Cli::try_parse_from(["plowc", "--hf-dir", "/tmp/x", "--no-lean-verify"]).is_err());
+        assert!(Cli::try_parse_from(["plowc", "--hf-dir", "/tmp/x", "--no-lean-oracle"]).is_err());
+    }
+
+    /// A skip must always carry a reason. `lean.verified: false` with a null
+    /// reason is the `tuning.tier == "portable"` ambiguity all over again.
+    #[test]
+    fn an_absent_verifier_yields_a_skip_hook_that_states_why() {
+        std::env::set_var("PLOW_VERIFY_BIN", "/nonexistent/plow_verify");
+        let why = lean_unavailable_reason().expect("no verifier ⇒ a reason");
+        let empty = packet::devbuild::Model {
+            n_cu: 1,
+            target: 0,
+            tensors: vec![],
+            progs: vec![],
+            kv_row_insts: vec![],
+            prog_t: vec![],
+            gen: vec![],
+        };
+        let rep = devgen::skip_hook(why)(&empty)
+            .expect("a skip is Ok — degrade, never fail the compile");
+        assert!(!rep.verified);
+        assert!(!rep.oracle);
+        assert!(rep.reason.is_some_and(|r| !r.is_empty()));
+        std::env::remove_var("PLOW_VERIFY_BIN");
     }
 }

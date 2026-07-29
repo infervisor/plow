@@ -102,6 +102,7 @@ class Kernel:
         self.insn = Counter()     # every mnemonic, for `require_min`
         self.mfma = Counter()
         self.fmt = Counter()      # (cbsz, blgp) pairs seen on MFMAs
+        self.fmt_on = {}          # mnemonic -> Counter of its own (cbsz, blgp) pairs
         self.spill = 0
         self.total = 0
         # --- pipeline quality (see burst/stalled below) ---
@@ -184,8 +185,10 @@ def parse(text):
             # Unspecified modifiers default to 0 in the AMDGPU asm printer.
             cbsz = re.search(r"\bcbsz:(\d+)", code)
             blgp = re.search(r"\bblgp:(\d+)", code)
-            cur.fmt[(int(cbsz.group(1)) if cbsz else 0,
-                     int(blgp.group(1)) if blgp else 0)] += 1
+            pair = (int(cbsz.group(1)) if cbsz else 0,
+                    int(blgp.group(1)) if blgp else 0)
+            cur.fmt[pair] += 1
+            cur.fmt_on.setdefault(mn, Counter())[pair] += 1
     return [k for k in kernels if k.total]
 
 
@@ -243,6 +246,29 @@ def check(kernels, expect):
                         fails.append(
                             f"{k.name}: {rule} {sorted(bad)} present, "
                             f"expected all {want} ({FMT_NAME.get(want, want)})")
+                elif rule == "fmt_on":
+                    # PER-MNEMONIC operand format. The blanket cbsz/blgp rules above assert
+                    # over EVERY MFMA in the kernel, which is unusable in an object that
+                    # legitimately mixes families -- the A4W4 grouped MoE GEMM shares plow_exec
+                    # with the bf16 MLA attention arms, and a bf16 MFMA carries no cbsz at all
+                    # (so it reads as 0 and trips a `cbsz: 4` check). This scopes the assertion
+                    # to the instruction that is supposed to carry the format.
+                    for mnem, spec in want.items():
+                        seen = Counter()
+                        for m, c in k.fmt_on.items():
+                            if mnem in m:
+                                seen.update(c)
+                        if not seen:
+                            fails.append(f"{k.name}: no '{mnem}' to check format on")
+                            continue
+                        for key, idx in (("cbsz", 0), ("blgp", 1)):
+                            if key not in spec:
+                                continue
+                            bad = {f[idx] for f in seen if f[idx] != spec[key]}
+                            if bad:
+                                fails.append(
+                                    f"{k.name}: {mnem} {key} {sorted(bad)} present, expected "
+                                    f"all {spec[key]} ({FMT_NAME.get(spec[key], spec[key])})")
                 elif rule == "burst_min":
                     if k.burst < want:
                         fails.append(

@@ -1,6 +1,6 @@
 //! A small, plow-native network definition (the `--net <file.json>` front-end).
 //!
-//! HuggingFace models come in through `frontend` (the hub layer); this is the
+//! HuggingFace models come in through `nn_graph::hub`; this is the
 //! offline, hand-written alternative: a JSON list of ops the driver chains into
 //! a [`LayerPlan`]. Each op consumes the previous op's output plus its own
 //! weight, so authoring a network is just listing layers in order. The plan is

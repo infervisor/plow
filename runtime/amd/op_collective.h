@@ -19,6 +19,82 @@
 
 #include "amd_common.h" /* bf16, bf2f/f2bf, PLOW_THREADS */
 
+/* Ceiling instrument, off in every shipping object. See d_xreduce_mega. */
+#ifndef PLOW_XR_NOWAIT
+#define PLOW_XR_NOWAIT 0
+#endif
+/* PREFILL ceiling instrument, off in every shipping object. See d_xreduce_twoshot_mega.
+ * PLOW_XR_NOWAIT deletes BOTH of the two-shot's rendezvous waits; PLOW_XR_NOWAIT_RS
+ * deletes only the FIRST (gate_rs, "every rank published its partial"), which is the
+ * only one a producer-side tile watermark could ever replace — gate_ag is a barrier
+ * over slices that all nblk workgroups wrote collaboratively. Splitting them prices
+ * the addressable half separately from the whole. */
+#ifndef PLOW_XR_NOWAIT_RS
+#define PLOW_XR_NOWAIT_RS 0
+#endif
+/* THE ABSOLUTE PROTOCOL CEILING (-DPLOW_XR_NOSIG=1): deletes the WAIT *and* the
+ * SIGNALLING, keeping only the acquire and the reduce body. PLOW_XR_NOWAIT prices what
+ * a redesign could win by waiting less; it CANNOT see the cost of the announcement
+ * itself — and in the prefill two-shot the announcement is the dominant term by count:
+ * gate_ag needs `nranks*nblk` arrivals, so all 256 workgroups signal all 4 peers =
+ * 1024 remote system-scope RMWs per collective per rank, 156 times per launch.
+ * A tile/watermark scheme changes exactly that traffic (N remote RMWs -> C*N remote
+ * stores), so NOWAIT alone would price the wrong half and could report "no prize"
+ * for a protocol whose real cost is announcement. NOSIG bounds BOTH halves at once:
+ * nothing that still publishes and observes progress can beat it. Numerically wrong. */
+#ifndef PLOW_XR_NOSIG
+#define PLOW_XR_NOSIG 0
+#endif
+/* THE POSITIVE CONTROL FOR EVERY WRONG-BY-CONSTRUCTION ARM (-DPLOW_XR_SHUFFLE=1).
+ *
+ * NOWAIT/NOSIG are numerically wrong, and this model's MoE routing is DATA-DEPENDENT: a
+ * prefill whose activations are garbage from layer 0 routes tokens differently, so its
+ * grouped-expert ops may do a different amount of work and the launch can get faster for
+ * a reason that has NOTHING to do with the rendezvous. That confound is fatal to the
+ * measurement — it produces exactly the speedup a real protocol win would.
+ *
+ * This arm separates them. It keeps the ENTIRE protocol — both rendezvous, every signal,
+ * every acquire, the same workgroup count, the same number of loads and stores, the same
+ * slot — and only rotates the peer READ index by n/2. The output is garbage in the same
+ * way, so the routing artefact (if any) appears in full; the protocol cost is untouched.
+ *
+ *   SHUFFLE ~ base    => the routing artefact is negligible, and NOWAIT/NOSIG measure the protocol.
+ *   SHUFFLE ~ NOWAIT  => the "win" is the artefact, and the rendezvous ceiling is ~0.
+ *
+ * The rotation stays inside the same partial slot (indices are mod n), so it reads only
+ * memory the unmodified arm also reads. */
+#ifndef PLOW_XR_SHUFFLE
+#define PLOW_XR_SHUFFLE 0
+#endif
+
+#define PLOW_XR2_SKIP_RS (PLOW_XR_NOWAIT || PLOW_XR_NOWAIT_RS || PLOW_XR_NOSIG)
+#define PLOW_XR2_SKIP_AG (PLOW_XR_NOWAIT || PLOW_XR_NOSIG)
+/* Marginal cost of ONE MORE system-scope acquire fence on this exact path. See the
+ * instrument's own comment in d_xreduce_mega. 1 = shipping.
+ *
+ * This is the ONE quantity a chunked/watermark redesign is priced on: such a scheme takes
+ * C acquires per gate where the protocol takes 1, so it PAYS (C-1) of these to win at most
+ * a fraction of what PLOW_XR_NOWAIT deletes. None of the NOWAIT/NOSIG arms can see it —
+ * they all keep the acquire, deliberately — so it needs its own knob.
+ *
+ * NUMERICALLY CORRECT: an extra acquire fence cannot change a value, so every ACQ_N arm
+ * must reproduce the control's output exactly. That is the instrument's self-check.
+ * The relaxed poll between fences is what stops LLVM folding k adjacent identical fences
+ * into one; it compares against a value the counter cannot hold, so nothing else changes. */
+#ifndef PLOW_XR_ACQ_N
+#define PLOW_XR_ACQ_N 1
+#endif
+#if PLOW_XR_ACQ_N > 1
+#define PLOW_XR_EXTRA_ACQ(gw)                                        \
+    do {                                                             \
+        const uint32_t* _g = (gw);                                   \
+        for (int _a = 1; _a < (PLOW_XR_ACQ_N); _a++) {               \
+            if (xctr_poll(_g) == 0xFFFFFFFFu) bailed = 1;            \
+            xctr_acquire();                                          \
+        }                                                            \
+    } while (0)
+#endif
+
 /* ---- cross-GPU counter helpers (SYSTEM scope) ---------------------------------
  * Mirror interp.hip's agent-scope ctr_poll/ctr_acquire/ctr_signal, widened to
  * __HIP_MEMORY_SCOPE_SYSTEM. Same discipline (plans/tp-design.md §12):
@@ -62,7 +138,11 @@ __device__ __forceinline__ void d_xreduce(bf16* out, const void* const* peer_scr
         float acc = 0.0f;
         for (uint32_t r = 0; r < nranks; r++) {
             const bf16* part = (const bf16*)((const char*)peer_scratch[r] + slot_bytes);
+#if PLOW_XR_SHUFFLE
+            acc += bf2f(as_glob(part)[((e) + (n >> 1)) % n]);
+#else
             acc += bf2f(as_glob(part)[e]);
+#endif
         }
         as_glob(out)[e] = f2bf(acc);
     }
@@ -140,12 +220,28 @@ __device__ __forceinline__ void d_xreduce_mega(
 
     /* ONE workgroup announces this rank's arrival to every peer (else the threshold
      * would have to be nranks*nblk). */
+#if !PLOW_XR_NOSIG
     if (slice == 0 && threadIdx.x == 0) {
         for (uint32_t r = 0; r < nranks; r++) {
             uint32_t* base = (uint32_t*)((char*)peer_scratch[r] + xctr_byte_off);
             xctr_signal(PLOW_CTR(base, gate_id));
         }
     }
+#endif
+#if PLOW_XR_NOWAIT || PLOW_XR_NOSIG
+    /* CEILING INSTRUMENT ONLY (-DPLOW_XR_NOWAIT=1), never a shipping object. Skips the
+     * cross-rank rendezvous: this rank still signals every peer and still reduces all N
+     * peer slots, so the fabric traffic, the packet count, the gate graph and the workgroup
+     * count are all UNCHANGED — the only thing removed is WAITING FOR THE SLOWEST PEER.
+     * The result is numerically wrong (a peer's partial may be read before it is written),
+     * which is fine: this measures scheduling, and the token delta it produces is exactly
+     * the price of cross-rank arrival skew + the rendezvous protocol. Same discipline as
+     * PLOW_CHAIN_BYPASS (knob-contract §7a-CHAIN): implementation cost zero, ceiling real. */
+    if (threadIdx.x == 0) xctr_acquire();
+    __syncthreads();
+    d_xreduce(out, peer_scratch, slot_bytes, nranks, n, slice, nblk);
+    return;
+#endif
     if (threadIdx.x == 0) {
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_id);
         const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
@@ -158,11 +254,90 @@ __device__ __forceinline__ void d_xreduce_mega(
             __builtin_amdgcn_s_sleep(2);
         }
         if (!bailed) xctr_acquire();
+#if PLOW_XR_ACQ_N > 1
+        PLOW_XR_EXTRA_ACQ(lg); /* marginal-acquire instrument; see the knob's comment */
+#endif
     }
     __syncthreads();
     if (bailed) return;
 
     d_xreduce(out, peer_scratch, slot_bytes, nranks, n, slice, nblk);
+}
+
+/* ---- XARGMAX_FIN: the cross-rank fold for a VOCAB-COLUMN-PARALLEL lm_head ---------
+ * plans/tp-design.md §8d, and the reason `crates/plowrt/src/asset/shard.rs` records
+ * lm_head as REPLICATED: without this fold every rank must compute the full-vocab
+ * argmax to agree on the token, so all N stream the whole 1.9 GB head every step.
+ *
+ * Sharded, rank r owns logits [r*vocab_l, (r+1)*vocab_l) and its ARGMAX packets have
+ * already reduced that shard to `nparts` packed keys — `amax_pack`'s u64 with an
+ * order-preserving u32 image of the bf16 value in [63:32] and the COMPLEMENT of the
+ * index in [31:0], so the whole reduction is one unsigned max and ties break toward
+ * the lowest index. This op finishes the local fold, rebases the index into GLOBAL
+ * vocab space, publishes one u64 to every peer and takes the cross-rank max. The
+ * complement has to be re-formed around the rebase: ~(~i + off) != ~(i + off).
+ *
+ * The published value rides a dedicated xctr COUNTER ID rather than a peer_scratch
+ * partial slot. PLOW_CTR_STRIDE is 32 words (128 B) per counter, the host zeroes the
+ * whole xctr region every step, and the region sits at the same byte offset in every
+ * rank's peer_scratch — so a spare id is 8 peer-visible bytes that need no host
+ * binding and cannot alias a live all-reduce partial (the two-slot partial_A/partial_B
+ * parity only gives one collective of slack, which is not slack you want to spend on
+ * an op that runs after the whole FFN).
+ *
+ * `val_id` must NOT be the arrival gate's id: the gate is an atomic counter.
+ * Batch is capped at 16 by the 128-byte line; decode here is B=1.
+ *
+ * On deadline the rank keeps its LOCAL argmax rather than hanging the queue — the same
+ * bail discipline (and the same silent-wrongness) as d_xreduce_mega's. */
+#define PLOW_XAMAX_MAX_BATCH 16u
+__device__ __forceinline__ void d_xargmax_fin_mega(
+    int* ids, const unsigned long long* part, unsigned nparts, unsigned n_batch,
+    unsigned vocab_l, const void* const* peer_scratch, uint32_t nranks, uint32_t rank,
+    size_t xctr_byte_off, uint32_t gate_id, uint32_t val_id, uint64_t deadline_ticks,
+    uint32_t* status, unsigned slice) {
+    if (slice != 0 || threadIdx.x != 0) return;
+    const unsigned B = n_batch ? n_batch : 1u;
+    unsigned long long* myv = (unsigned long long*)PLOW_CTR(
+        (uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), val_id);
+    const unsigned long long* pg = as_glob(part);
+
+    /* local fold + rebase to global vocab index */
+    for (unsigned b = 0; b < B && b < PLOW_XAMAX_MAX_BATCH; b++) {
+        const unsigned long long* pb = pg + (size_t)b * nparts;
+        unsigned long long best = 0;
+        for (unsigned i = 0; i < nparts; i++) best = pb[i] > best ? pb[i] : best;
+        const unsigned gi = ~(unsigned)(best & 0xFFFFFFFFu) + rank * vocab_l;
+        myv[b] = (best & 0xFFFFFFFF00000000ull) | (unsigned long long)(unsigned)(~gi);
+    }
+
+    /* publish (the release on the signal RMW orders the stores above), then rendezvous */
+    for (uint32_t r = 0; r < nranks; r++)
+        xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_id));
+    uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_id);
+    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    int bailed = 0;
+    while (xctr_poll(lg) < nranks) {
+        if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+            if (status) *status = 0xDEAD0000u | rank;
+            bailed = 1;
+            break;
+        }
+        __builtin_amdgcn_s_sleep(2);
+    }
+    if (!bailed) xctr_acquire();
+
+    for (unsigned b = 0; b < B && b < PLOW_XAMAX_MAX_BATCH; b++) {
+        unsigned long long best = myv[b];
+        if (!bailed)
+            for (uint32_t r = 0; r < nranks; r++) {
+                const unsigned long long* pv = (const unsigned long long*)PLOW_CTR(
+                    (uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), val_id);
+                const unsigned long long v = as_glob(pv)[b];
+                best = v > best ? v : best;
+            }
+        as_glob(ids)[b] = (int)~(unsigned)(best & 0xFFFFFFFFull);
+    }
 }
 
 /* ---- TWO-SHOT all-reduce for the LARGE prefill [T,hidden] message ----------------
@@ -198,10 +373,13 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
      * take ONE system acquire (never inside the spin — it would inv the L2 every poll). */
     if (threadIdx.x == 0) bailed = 0;
     __syncthreads();
+#if !PLOW_XR_NOSIG
     if (slice == 0 && threadIdx.x == 0)
         for (uint32_t r = 0; r < nranks; r++)
             xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_rs));
+#endif
     if (threadIdx.x == 0) {
+#if !PLOW_XR2_SKIP_RS
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_rs);
         const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
         while (xctr_poll(lg) < nranks) {
@@ -211,7 +389,13 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
             }
             __builtin_amdgcn_s_sleep(2);
         }
+#endif
+        /* The acquire STAYS in the ceiling arm — the instrument prices the WAIT, not the
+         * fence. Same discipline as d_xreduce_mega's PLOW_XR_NOWAIT. */
         if (!bailed) xctr_acquire();
+#if PLOW_XR_ACQ_N > 1
+        PLOW_XR_EXTRA_ACQ(PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_rs));
+#endif
     }
     __syncthreads();
     if (bailed) return;
@@ -226,29 +410,61 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         float acc = 0.0f;
         for (uint32_t r = 0; r < nranks; r++) {
             const bf16* part = (const bf16*)((const char*)peer_scratch[r] + slot_bytes);
+#if PLOW_XR_SHUFFLE
+            acc += bf2f(as_glob(part)[((e) + (n >> 1)) % n]);
+#else
             acc += bf2f(as_glob(part)[e]);
+#endif
         }
         as_glob(my_part)[e] = f2bf(acc);
     }
     __syncthreads();
 
-    /* ---- RENDEZVOUS 2 (gate_ag): every rank's reduced slice is written + visible. ---- */
+    /* ---- RENDEZVOUS 2 (gate_ag): every rank's reduced slice is written + visible.
+     *
+     * EVERY WORKGROUP SIGNALS, and the threshold is nranks*nblk — NOT slice-0-signals
+     * with threshold nranks, which is what this was and it was a live cross-GPU race.
+     *
+     * The asymmetry with gate_rs is the whole point. gate_rs announces "my full partial
+     * is published", and that partial was written by the producing GEMV in an EARLIER
+     * packet, whose completion the interpreter's local counter gate already guarantees
+     * before ANY workgroup of this packet runs — so one workgroup may speak for the rank.
+     * gate_ag announces "my reduced slice is written", and PHASE 1 above writes that
+     * slice COLLABORATIVELY across all nblk workgroups (grid-stride, step nblk*THREADS).
+     * __syncthreads() is workgroup-wide, so workgroup 0 reaching it says nothing about
+     * workgroups 1..nblk-1. Letting it signal on their behalf let a peer's PHASE 2 read
+     * a slice that was still being reduced: ranks disagreed, non-deterministically, with
+     * every gate still reading its expected count — which is why the host-side xctr audit
+     * saw nothing wrong. It is also why DECODE was unaffected: the one-shot writes its
+     * result to LOCAL `out` that no peer ever reads, so it has no such ordering duty.
+     *
+     * Each workgroup's own system-scope RELEASE orders its own PHASE 1 stores, so the
+     * gate reaching nranks*nblk means every workgroup on every rank has both finished
+     * writing and released. */
     if (threadIdx.x == 0) bailed = 0;
     __syncthreads();
-    if (slice == 0 && threadIdx.x == 0)
+#if !PLOW_XR_NOSIG
+    if (threadIdx.x == 0)
         for (uint32_t r = 0; r < nranks; r++)
             xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_ag));
+#endif
     if (threadIdx.x == 0) {
+#if !PLOW_XR2_SKIP_AG
         uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_ag);
+        const uint32_t target = nranks * nblk;
         const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
-        while (xctr_poll(lg) < nranks) {
+        while (xctr_poll(lg) < target) {
             if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
                 if (status) *status = 0xDEAD0000u | rank;
                 bailed = 1; break;
             }
             __builtin_amdgcn_s_sleep(2);
         }
+#endif
         if (!bailed) xctr_acquire();
+#if PLOW_XR_ACQ_N > 1
+        PLOW_XR_EXTRA_ACQ(PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_ag));
+#endif
     }
     __syncthreads();
     if (bailed) return;
@@ -259,7 +475,11 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         const uint32_t lo = (uint32_t)(((uint64_t)n * s) / nranks);
         const uint32_t hi = (uint32_t)(((uint64_t)n * (s + 1)) / nranks);
         const bf16* src = (const bf16*)((const char*)peer_scratch[s] + slot_bytes);
+#if PLOW_XR_SHUFFLE
+        for (uint32_t e = lo + tid; e < hi; e += stride) as_glob(out)[e] = as_glob(src)[((e) + (n >> 1)) % n];
+#else
         for (uint32_t e = lo + tid; e < hi; e += stride) as_glob(out)[e] = as_glob(src)[e];
+#endif
     }
 }
 

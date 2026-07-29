@@ -2,6 +2,29 @@
 
 > The compiler is two distinct halves with a clean interface: the **rewriting half** (egglog) finds the best equivalent computation; the **scheduling half** maps it to hardware.
 
+> [!WARNING]
+> **The rewriting half described below is not in the shipping emit path.** This
+> document describes the pipeline as DESIGNED. As built:
+>
+> * `plowc`'s plan path lowers the **raw** `nn_graph::Graph` (`plan_from_all_blocks`).
+>   The `FusedGraph` is computed for statistics and discarded. `plan_from_fused` — the
+>   only bridge that consumes a fused term — has no production caller.
+> * `plowc --emit devblob` (the path every gfx950 asset is built with) calls
+>   `report_devblob_egglog`, which saturates a second graph, `info!`s the fusion count,
+>   and drops it. On Gemma-4-31B that is `graph_ops=1444, fusions_found=662`, **0 applied**.
+> * `crates/devgen/Cargo.toml` has **no `rewrite`/`egglog` dependency**, so no fused
+>   term can reach the emitter even in principle.
+>
+> **No egglog rewrite reaches a GPU.** Measured coverage on Gemma-4-12B: 0 of 1156 ops,
+> 0 of 24,226 GFLOP (`perf-data/px18-egglog-wholemodel.md`). Every fusion in a shipped
+> packet — `GemvQkv` (op 22), `GemvGlu` (op 19), `NormResidualNorm` — is hand-written in
+> `devgen`.
+>
+> Wiring it up is **not** a measured perf lever: A/B on gfx950 shows deleting 100
+> packets/token is worth ≤0.064 ms, and the +100-gate arm actually ran *faster*
+> (17.704 vs 18.070 ms/token, n=8). Sections 2–3 below therefore document intent and a
+> working library, not a stage that runs on the way to an asset.
+
 ---
 
 ## Pipeline Stages

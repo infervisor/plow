@@ -377,6 +377,25 @@ impl KernelSpec {
         }
     }
 
+    /// The same tiled body under a different weight/activation encoding.
+    ///
+    /// [`Self::accepts`] already compares `quant`, so this is the whole of what
+    /// "precision is a selector input" needs on the registry side: an fp8 op
+    /// signature stops matching the bf16 rungs and starts matching the fp8 ones.
+    /// Without it every `gemm_tile` was `QuantScheme::None`, so an fp8 or mxfp4
+    /// program was ranked against — and emitted — the bf16 tile table.
+    ///
+    /// `mma_dtype` is the dtype the **matrix instruction** takes, which is not
+    /// always the weight dtype: gfx950's mxfp4 prefill GEMM is w4a16, it
+    /// dequantizes fp4→bf16 in the B-fetch and issues an ordinary bf16 MFMA, so
+    /// it declares `Bf16` and not `Fp4`. Declaring `Fp4` there would make
+    /// [`Self::runs_on`] gate the kernel on an instruction it never issues.
+    pub fn with_quant(mut self, quant: QuantScheme, mma_dtype: MmaDtype) -> Self {
+        self.quant = quant;
+        self.mma_dtype = Some(mma_dtype);
+        self
+    }
+
     /// Whether this kernel can run on `hw` at all.
     ///
     /// ISA equality, not ordering: capability is not monotonic in release order

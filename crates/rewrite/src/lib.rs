@@ -15,8 +15,6 @@ pub mod collapse;
 pub mod explore;
 mod extract;
 pub mod footprint;
-pub mod glm;
-pub mod kimi;
 mod lower;
 pub mod tile;
 pub mod tilegraph;

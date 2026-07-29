@@ -6,6 +6,35 @@ quantitative claim here is either quoted from a measurement already recorded in
 this repo (attributed) or derived from disassembly (reproducible with
 `scripts/asm_audit.py`). Nothing is estimated.
 
+> ## ⚠ CORRECTION (2026-07-27, measured on MI355X). §1 below is HALF WRONG.
+>
+> This note says so itself: *"Written on a box with no AMD GPU."* It has now been tested on one,
+> and the "type error" claim in §1 holds for **decode** and fails for **prefill**.
+>
+> A hipBLASLt/Tensile assembly kernel was dispatched **directly from plow's own HSA backend** — no
+> HIP runtime, no `libhipblaslt` — and produced **bit-exact** output (0 of 33,554,432 elements
+> differ) at **1.2–1.7×** plow's best tile on real Gemma-4-31B prefill shapes.
+>
+> The premise that fails is "there is no host-side enqueue". **plow's prefill is already ~97
+> segmented AQL dispatches** across three co-loaded code objects (`run_segmented`,
+> `crates/plowrt/src/exec/amd.rs:1046`). An external object dispatched as its own segment is the
+> *existing mechanism*, not a violation of it — and `module_load` already creates a per-module
+> executable, so a 4th co-resident object needs **zero backend changes**.
+>
+> **§1 remains correct for decode**, and that distinction is the whole point: decode really is one
+> cooperative launch per token, ops really are inlined arms of a switch inside a workgroup, and
+> decode GEMV is already at 89% of the memory ceiling. There is nothing to win there and a verified
+> property (1 dispatch/token) to lose.
+>
+> Two further corrections from the same measurement: the **2×** figure quoted for hipBLASLt is
+> **1.2–1.7×** on real Gemma shapes (the 2× came from rocprof-depressed Qwen shapes with K=2560),
+> and the bigger lever turned out not to be the assembly at all — at M=128 *both* kernels sit at
+> 5–8% of peak. **The skinny/small-M deficit is a tile-inventory problem** (Tensile ships 336 macro
+> tiles; plow's selector has 3, and plow's own measured-best tile is not selectable).
+>
+> Full detail and the ranked candidate survey: `plans/knob-contract.md` §0-EXT-RESULT.
+> Working driver with the decoded ABI documented inline: `runtime/ubench/gemm_tensile_ext.c`.
+
 ## 1. The structural fact: none of them can be linked in
 
 AITER, Tensile, hipBLASLt and Composable Kernel are **launch-per-op** libraries.

@@ -101,7 +101,7 @@ def prep_full(model_dir, out_dir, layers=None):
     if layers is None:
         layers = list(range(N_LAYERS))
     idx = P._index_shards(model_dir)
-    cfg = AutoConfig.from_pretrained(model_dir)
+    cfg = P.load_cfg(model_dir)
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(model_dir, "config.json")) as f:
         cfgj = f.read()
@@ -167,7 +167,7 @@ def refresh_index(model_dir, out_dir):
     Safe to run concurrently with prep_full: it only writes the globals shard (if absent, to the same
     n+1 name prep_full will later resume-skip) and rewrites index.json (prep_full overwrites it with
     the complete map at the end). The globals shard uses the FULL total_shards (N_LAYERS+1) naming."""
-    cfg = AutoConfig.from_pretrained(out_dir)
+    cfg = P.load_cfg(out_dir)
     total_shards = N_LAYERS + 1
     gpath = os.path.join(out_dir, SHARD_FMT.format(total_shards, total_shards))
     ok, _ = _shard_ok(gpath)
@@ -230,7 +230,7 @@ def expected_names(cfg, layers=None):
 
 def verify(model_dir, out_dir, weight_map=None, cfg=None, layers=None):
     if cfg is None:
-        cfg = AutoConfig.from_pretrained(out_dir)
+        cfg = P.load_cfg(out_dir)
     if weight_map is None:
         with open(os.path.join(out_dir, "model.safetensors.index.json")) as f:
             weight_map = json.load(f)["weight_map"]

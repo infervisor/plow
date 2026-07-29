@@ -118,12 +118,26 @@ static void run_block(plow_hsa* h, plow_hsa_kernel* kern, unsigned NCU, struct W
       d->t[5]=TKROT; d->t[6]=TKLEN; d->i[0]=1; d->i[1]=NH; d->i[2]=L; d->i[4]=NSPLIT;
       d->i[5]=PLOW_KV_MASK_NONE; d->fj[0].f=SCALE; }
     addwait(i_fl,i_qa,NCU); addwait(i_fl,i_qr,NCU); addwait(i_fl,i_rnkv,1); addwait(i_fl,i_krd,NCU);
-    int i_mg=emitop(PLOW_DOP_FLASH_MERGE,NCU);
-    { PlowDevInst*d=&g_inst[i_mg]; d->t[0]=TOLAT; d->t[1]=TOP; d->t[2]=TML; d->i[0]=1; d->i[1]=NH; d->i[2]=NSPLIT; d->i[3]=512; }
-    addwait(i_mg,i_fl,NCU);
-    int i_uv=emitop(PLOW_DOP_O_UV_FOLD,NCU);
-    { PlowDevInst*d=&g_inst[i_uv]; d->t[0]=TOAT; d->t[1]=TOLAT; d->t[2]=TWUV; d->i[0]=1; d->i[1]=NH; d->i[2]=VD; }
-    addwait(i_uv,i_mg,NCU);
+    /* Latent epilogue. GLM_FUSED_FOLD=1 runs the SINGLE fused op (57, d_mla_merge_fold) that the
+     * real GLM decode packet emits; the default keeps the original FLASH_MERGE<512> + O_UV_FOLD
+     * pair this gate was written against. Both are checked, because this gate is the only numeric
+     * instrument on the epilogue — mla_test does not exercise d_mla_merge_fold at all — and
+     * `MLA attn_out` below is the stage directly downstream of it. Same operands either way:
+     * the fused op reads (Opart, mlpart, W_uv) and writes o[head][V] without the Olat round-trip. */
+    int i_uv;
+    if(getenv("GLM_FUSED_FOLD") && atoi(getenv("GLM_FUSED_FOLD"))){
+        i_uv=emitop(PLOW_DOP_MLA_MERGE_FOLD,NCU);
+        { PlowDevInst*d=&g_inst[i_uv]; d->t[0]=TOAT; d->t[1]=TOP; d->t[2]=TML; d->t[3]=TWUV;
+          d->i[0]=1; d->i[1]=NH; d->i[2]=VD; d->i[4]=NSPLIT; }
+        addwait(i_uv,i_fl,NCU);
+    } else {
+        int i_mg=emitop(PLOW_DOP_FLASH_MERGE,NCU);
+        { PlowDevInst*d=&g_inst[i_mg]; d->t[0]=TOLAT; d->t[1]=TOP; d->t[2]=TML; d->i[0]=1; d->i[1]=NH; d->i[2]=NSPLIT; d->i[3]=512; }
+        addwait(i_mg,i_fl,NCU);
+        i_uv=emitop(PLOW_DOP_O_UV_FOLD,NCU);
+        { PlowDevInst*d=&g_inst[i_uv]; d->t[0]=TOAT; d->t[1]=TOLAT; d->t[2]=TWUV; d->i[0]=1; d->i[1]=NH; d->i[2]=VD; }
+        addwait(i_uv,i_mg,NCU);
+    }
     GEMV(TATT,TOAT,TWO,H,NH*VD); int i_op=_last; addwait(i_op,i_uv,NCU);
     int i_rs=emitop(PLOW_DOP_RESIDUAL,1);
     { PlowDevInst*d=&g_inst[i_rs]; d->t[0]=TXMID; d->t[1]=TX; d->t[2]=TATT; d->i[0]=H; d->fj[0].f=1.0f; }
@@ -320,6 +334,9 @@ int main(int argc,char** argv){
     printf("\n=== HF oracle last-token router pick (fp32) ===\n  ");
     for(int j=0;j<TOPK;j++) printf("e%d(g=%.4f) ",P_sel[j],P_selg[j]); printf("\n");
     printf("  ref: expert_sum(f32) present, shared_out(bf16) present\n");
+    printf("  latent epilogue: %s\n", (getenv("GLM_FUSED_FOLD") && atoi(getenv("GLM_FUSED_FOLD")))
+                                          ? "FUSED MLA_MERGE_FOLD (op 57) — what the real packet emits"
+                                          : "FLASH_MERGE<512> + O_UV_FOLD (the separate pair)");
 
     int ok=1;
     for(int pass=0;pass<2;pass++){

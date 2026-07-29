@@ -25,7 +25,19 @@ echo "TP decode sweep — ctx list: $CTXS  (median of $STEPS)"
 for tp in $TPS; do
   echo "============================================================"
   echo "TP=$tp"
+  # ROCR_VISIBLE_DEVICES must be FORWARDED through `env -i`, not dropped.
+  #
+  # gpulease correctly exports it for the cards it leased, but `env -i` clears the
+  # environment, so tp_decode never saw it and mapped rank r -> HSA agent r. A job that
+  # leased [1 2 3 4] therefore ran on GPUs 0-3: off its own lease, on top of whatever else
+  # held those cards, and the timing silently invalid. This is what produced a 28.0 ms
+  # TP4 reading that re-ran at 11.74 once pinned correctly.
+  #
+  # Only ROCR_VISIBLE_DEVICES is forwarded. Deliberately NOT HIP_VISIBLE_DEVICES: setting
+  # both breaks hipcc ("no ROCm-capable device is detected"), and this is the ROCr/HSA
+  # path, so ROCR alone is both necessary and sufficient.
   sg render -c "cd $DIR && /usr/bin/env -i PATH=/usr/bin:/bin HOME=\$HOME \
+    ${ROCR_VISIBLE_DEVICES:+ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES} \
     LD_LIBRARY_PATH=/opt/rocm/lib ./tp_decode $PKT $MODEL --tp $tp \
     --sweep $CTXS --steps $STEPS" 2>&1 | sed -n '/SWEEP/,/^$/p'
 done

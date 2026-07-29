@@ -13,6 +13,15 @@ pub enum LowerError {
     NoOutput,
     #[error("tensor `{name}` (id {id}) is node-produced but its producer was not lowered")]
     UnmappedTensor { id: u32, name: String },
+    /// The op has no term in the egglog signature, so no rule can match it.
+    ///
+    /// Returned rather than lowered to an opaque placeholder: a term the
+    /// ruleset does not know would sit in the e-graph looking rewritable, and
+    /// any rule that matched its *inputs* could rewrite across it. Refusing to
+    /// lower the graph at all is the honest answer, and the caller
+    /// (`report_devblob_egglog`) is advisory and warn-only.
+    #[error("op `{op}` has no egglog term; the rewrite pass cannot represent this graph")]
+    Unsupported { op: &'static str },
 }
 
 /// Returns `(let-bindings, root_var)`.
@@ -187,9 +196,27 @@ fn term_for(
                 f64lit(*eps)
             )
         }
-        Op::MoeRouter { num_experts, top_k } => {
+        // Group-limited routing selects a DIFFERENT expert set than flat top-k,
+        // and the egglog term carries only `num_experts`/`top_k` — so a grouped
+        // router lowered through it would be indistinguishable from a flat one.
+        // Refused rather than approximated.
+        Op::MoeRouter {
+            num_experts,
+            top_k,
+            group: None,
+        } => {
             format!("(MoeRouter {} {} {} {})", e(0)?, e(1)?, num_experts, top_k)
         }
+        Op::MoeRouter { group: Some(_), .. } => {
+            return Err(LowerError::Unsupported {
+                op: "moe_router (group-limited)",
+            })
+        }
+        // Kimi-K3's ops. No egglog terms exist for them; see `LowerError::Unsupported`.
+        Op::Conv1dDepthwise { .. }
+        | Op::LinearAttention { .. }
+        | Op::SituGlu { .. }
+        | Op::BlockResidual { .. } => return Err(LowerError::Unsupported { op: op.name() }),
     })
 }
 
