@@ -55,6 +55,7 @@ fn pf_chunk_cost_rows() -> usize {
     })
 }
 
+use crate::asset::cubin::{self, Role};
 use crate::asset::devblob::DevBlob;
 use crate::device::cuda::{CudaBackend, CudaEvent, CudaStream, KernelFn, PinnedHost};
 use crate::device::{Backend, DeviceMem, Module};
@@ -89,6 +90,209 @@ fn interpreter_profile(cc: (u32, u32)) -> Option<InterpreterProfile> {
             embedded_decode: "interp_sm120",
         }),
         _ => None,
+    }
+}
+
+impl InterpreterProfile {
+    /// The file name this arch's build scripts write for `role`. Tried FIRST
+    /// when scanning the assets dir — and never trusted, because the image
+    /// itself says what it is (see [`resolve_interp_image`]).
+    fn file(&self, role: Role) -> &'static str {
+        match role {
+            Role::Decode => self.decode_file,
+            Role::Prefill => self.prefill_file,
+        }
+    }
+
+    /// The entry symbol this arch's objects are EXPECTED to carry. Only a
+    /// fallback for an image with no readable symbol table; the discovered
+    /// symbol wins.
+    fn symbol(&self, role: Role) -> &'static str {
+        match role {
+            Role::Decode => self.decode_symbol,
+            Role::Prefill => self.prefill_symbol,
+        }
+    }
+}
+
+/// `PLOW_NV_CUBIN{,_PF}` — force one image, bypassing discovery.
+fn env_image_var(role: Role) -> &'static str {
+    match role {
+        Role::Decode => "PLOW_NV_CUBIN",
+        Role::Prefill => "PLOW_NV_CUBIN_PF",
+    }
+}
+
+/// `PLOW_NV_KERNEL{,_PF}` — force the entry symbol looked up in that image.
+fn env_kernel_var(role: Role) -> &'static str {
+    match role {
+        Role::Decode => "PLOW_NV_KERNEL",
+        Role::Prefill => "PLOW_NV_KERNEL_PF",
+    }
+}
+
+/// A resolved interpreter object: its bytes, the entry symbol IT declares, and
+/// a human-readable provenance for the log line.
+struct InterpImage {
+    image: Vec<u8>,
+    entry: String,
+    source: String,
+}
+
+/// Nothing in an assets dir that an interpreter object could plausibly be is
+/// anywhere near this large; the cap keeps a stray checkpoint shard sharing the
+/// directory from being slurped into memory during discovery.
+const CUBIN_SCAN_MAX: u64 = 64 << 20;
+
+/// Read a candidate only if it is small enough and starts with ELF64 magic —
+/// the two cheap tests that keep discovery off `model.pkt` and the weights.
+fn read_cubin_candidate(path: &Path) -> Option<Vec<u8>> {
+    let md = std::fs::metadata(path).ok()?;
+    if !md.is_file() || md.len() > CUBIN_SCAN_MAX {
+        return None;
+    }
+    let image = std::fs::read(path).ok()?;
+    cubin::is_elf64_le(&image).then_some(image)
+}
+
+/// Find the interpreter object for `role` BY CONTENT.
+///
+/// A cubin names its own SM (`e_flags`) and its own entry points (`.symtab`),
+/// so the loader can select the right image out of a bundle instead of trusting
+/// file names — which are the one part of the artifact nothing validates. The
+/// decode/prefill pair is trivially swappable (`build_sm90a_cubin.sh` derives
+/// the prefill path from the decode one, so an argument without the `.cubin`
+/// suffix writes decode to `<x>` and prefill to `<x>_pf.cubin`), and the
+/// symptom of getting it wrong used to be
+/// `cuModuleGetFunction(_Z12interp_sm90a11PlowProgram): CUDA_ERROR_NOT_FOUND`
+/// with no indication of what the loaded image actually was.
+///
+/// Priority: `PLOW_NV_CUBIN{,_PF}` (forced — an override that does not match is
+/// an error, never a silent fallback) → embedded `SECT_CUBIN` sections → the
+/// assets dir, profile file name first. Candidates whose SM disagrees with the
+/// live device are rejected here, where the message can say so, rather than in
+/// the driver as `CUDA_ERROR_INVALID_IMAGE` or worse.
+///
+/// `Ok(None)` = no candidate anywhere carries this role. That is fatal for
+/// decode and a documented decode-only fallback for prefill, so the decision
+/// belongs to the caller.
+fn resolve_interp_image(
+    assets_dir: &Path,
+    blob: &DevBlob,
+    raw: &[u8],
+    profile: &InterpreterProfile,
+    want_sm: u32,
+    role: Role,
+) -> Result<Option<InterpImage>> {
+    // Accept an image iff it is a cubin for THIS device carrying THIS role.
+    // `None` from `inspect` means unparseable, not "no entry" — a hand-built
+    // object with a stripped symbol table still loads under the profile's
+    // expected symbol, which is what the pre-discovery loader always did.
+    let judge = |image: &[u8]| -> std::result::Result<String, String> {
+        let Some(info) = cubin::inspect(image) else {
+            return Err("not an ELF cubin".into());
+        };
+        if info.sm != want_sm {
+            return Err(format!("built for sm_{}, device is sm_{want_sm}", info.sm));
+        }
+        match info.interp_entry(role) {
+            Some(sym) => Ok(sym.to_string()),
+            None if info.entries.is_empty() => Ok(profile.symbol(role).to_string()),
+            None => Err(format!("no {} entry — has {}", role.as_str(), cubin::describe(image))),
+        }
+    };
+
+    // 1. Operator override: forced, and loud when wrong.
+    let var = env_image_var(role);
+    if let Ok(p) = std::env::var(var) {
+        let path = std::path::PathBuf::from(&p);
+        let image = std::fs::read(&path).map_err(|source| RuntimeError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let entry = judge(&image).map_err(|why| {
+            RuntimeError::Device(format!("{var}={p}: {why}"))
+        })?;
+        return Ok(Some(InterpImage { image, entry, source: format!("{var}={p}") }));
+    }
+
+    let mut rejected: Vec<String> = Vec::new();
+
+    // 2. Embedded sections. The section NAME is not load-bearing: `plowc
+    //    --embed-cubin` labels every image `interp_sm120` regardless of the arch
+    //    it just compiled, so only the content can decide.
+    for s in blob.sections.iter().filter(|s| s.kind == packet::devbuild::SECT_CUBIN) {
+        let Some(data) = raw.get(s.offset..s.offset + s.size) else {
+            continue;
+        };
+        match judge(data) {
+            Ok(entry) => {
+                return Ok(Some(InterpImage {
+                    image: data.to_vec(),
+                    entry,
+                    source: format!("embedded section '{}'", s.name),
+                }))
+            }
+            Err(why) => rejected.push(format!("embedded '{}': {why}", s.name)),
+        }
+    }
+
+    // 3. The assets dir — the profile's expected name first, then everything
+    //    else that looks like a cubin, so a misnamed bundle still serves.
+    let mut paths = vec![assets_dir.join(profile.file(role))];
+    if let Ok(rd) = std::fs::read_dir(assets_dir) {
+        let mut rest: Vec<std::path::PathBuf> =
+            rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p != &paths[0]).collect();
+        rest.sort();
+        paths.extend(rest);
+    }
+    for path in paths {
+        let Some(image) = read_cubin_candidate(&path) else {
+            continue;
+        };
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        match judge(&image) {
+            Ok(entry) => {
+                return Ok(Some(InterpImage { image, entry, source: name }))
+            }
+            Err(why) => rejected.push(format!("{name}: {why}")),
+        }
+    }
+
+    if !rejected.is_empty() {
+        tracing::debug!(
+            role = role.as_str(),
+            rejected = rejected.join("; "),
+            "no interpreter object matched"
+        );
+    }
+    Ok(None)
+}
+
+/// Every cubin-shaped file in the assets dir and what it really contains — the
+/// body of the "no object found" errors, so an operator sees the mismatch
+/// (wrong arch, swapped pair, stale bundle) instead of just a missing name.
+fn describe_candidates(assets_dir: &Path) -> String {
+    let Ok(rd) = std::fs::read_dir(assets_dir) else {
+        return "  (assets dir unreadable)".into();
+    };
+    let mut paths: Vec<std::path::PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    paths.sort();
+    let lines: Vec<String> = paths
+        .iter()
+        .filter_map(|p| {
+            let image = read_cubin_candidate(p)?;
+            Some(format!(
+                "  {} — {}",
+                p.file_name().unwrap_or_default().to_string_lossy(),
+                cubin::describe(&image)
+            ))
+        })
+        .collect();
+    if lines.is_empty() {
+        "  (no cubin in the assets dir)".into()
+    } else {
+        lines.join("\n")
     }
 }
 
@@ -604,31 +808,27 @@ impl GpuEngine {
 
 
         // ---- module ----
-        // Priority: explicit override → matching named embedded section → filesystem.
-        // Only SM120 accepts the legacy first-cubin fallback: no legacy Hopper blob exists,
-        // and feeding an embedded SM120 image to a Hopper device is an opaque driver error.
-        let embedded = blob
-            .section_data_named(&raw, packet::devbuild::SECT_CUBIN, profile.embedded_decode)
-            .or_else(|| {
-                (profile.tag == "sm120")
-                    .then(|| blob.section_data(&raw, packet::devbuild::SECT_CUBIN))
-                    .flatten()
-            });
-        let image = if let Ok(p) = std::env::var("PLOW_NV_CUBIN") {
-            let cubin_path = std::path::PathBuf::from(p);
-            std::fs::read(&cubin_path).map_err(|source| RuntimeError::Io {
-                path: cubin_path, source,
-            })?
-        } else if let Some(data) = embedded {
-            data.to_vec()
-        } else {
-            let cubin_path = assets_dir.join(profile.decode_file);
-            std::fs::read(&cubin_path).map_err(|source| RuntimeError::Io {
-                path: cubin_path, source,
-            })?
-        };
+        // Selected BY CONTENT: each candidate's own ELF says which SM it targets
+        // and which entry points it has, so a bundle whose decode/prefill files
+        // are misnamed still serves, and a wrong-arch image is refused here with
+        // a message instead of by the driver with an opaque code.
+        let want_sm = cc.0 * 10 + cc.1;
+        let dec = resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Decode)?
+            .ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "no sm_{want_sm} decode interpreter object for {} in {} — expected a cubin \
+                     carrying `{}` (embedded in the blob, or a file; {} is only the conventional \
+                     name, the symbol table decides). Candidates found:\n{}",
+                    be.device_name(),
+                    assets_dir.display(),
+                    profile.decode_symbol,
+                    profile.decode_file,
+                    describe_candidates(assets_dir),
+                ))
+            })?;
+        let image = dec.image;
         let module = be.module_load(&image)?;
-        let kname = std::env::var("PLOW_NV_KERNEL").unwrap_or_else(|_| profile.decode_symbol.into());
+        let kname = std::env::var(env_kernel_var(Role::Decode)).unwrap_or(dec.entry);
         let f = be.get_function(&module, &kname)?;
 
         // ---- packet/object pairing ----
@@ -670,6 +870,8 @@ impl GpuEngine {
         }
         tracing::info!(
             profile = profile.tag,
+            source = %dec.source,
+            kernel = %kname,
             grid,
             smem,
             occ_per_sm = occ,
@@ -1075,14 +1277,18 @@ impl GpuEngine {
         // instead of O(n) decode launches. Absent cubin, a segmented bucket, or
         // a missing GQ appendix disables prefill (mux falls back to decode-only
         // consumption) rather than failing the whole engine.
-        let pf_cubin = std::env::var("PLOW_NV_CUBIN_PF")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| assets_dir.join(profile.prefill_file));
-        let (f_pf, smem_pf, module_pf, prefill) = if pf_cubin.is_file() {
-            match Self::load_prefill(&be, &pf_cubin, &blob, d_tens.base, grid, profile.prefill_symbol) {
+        // Same content-addressed resolution as decode: the `_pf` object is
+        // identified by the prefill entry in its symbol table, so the pair being
+        // swapped on disk no longer costs the prefill path (it used to load the
+        // DECODE image here and fail on the missing `_pf` symbol).
+        let pf =
+            resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
+        let (f_pf, smem_pf, module_pf, prefill) = if let Some(pf) = pf {
+            let pf_src = pf.source.clone();
+            match Self::load_prefill(&be, pf, &blob, d_tens.base, grid) {
                 Ok((f_pf, smem_pf, module_pf, buckets)) => {
                     tracing::info!(
-                        pf_cubin = %pf_cubin.display(),
+                        pf_cubin = %pf_src,
                         buckets = buckets.len(),
                         smem_pf,
                         "prefill object loaded"
@@ -1108,14 +1314,14 @@ impl GpuEngine {
                          opt-in cap — check `-Xptxas -v` against the 101376 B limit (e.g. \
                          PGM_STAGES=5 or PGM_BN=256 overflow it). Remove the prefill cubin \
                          to serve decode-only deliberately.",
-                        pf_cubin.display()
+                        pf_src
                     )));
                 }
             }
         } else {
             tracing::info!(
-                pf_cubin = %pf_cubin.display(),
-                "no prefill cubin — decode-only prompt consumption"
+                expected = profile.prefill_file,
+                "no prefill object for sm_{want_sm} — decode-only prompt consumption"
             );
             (None, SMEM_PF, None, Vec::new())
         };
@@ -2385,16 +2591,13 @@ impl GpuEngine {
     /// missing.
     fn load_prefill(
         be: &Arc<CudaBackend>,
-        cubin: &Path,
+        pf: InterpImage,
         blob: &DevBlob,
         d_tens: u64,
         grid: u32,
-        default_kernel: &str,
     ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>)> {
-        let image = std::fs::read(cubin)
-            .map_err(|source| RuntimeError::Io { path: cubin.to_path_buf(), source })?;
-        let module = be.module_load(&image)?;
-        let kname = std::env::var("PLOW_NV_KERNEL_PF").unwrap_or_else(|_| default_kernel.into());
+        let module = be.module_load(&pf.image)?;
+        let kname = std::env::var(env_kernel_var(Role::Prefill)).unwrap_or(pf.entry);
         let f_pf = be.get_function(&module, &kname)?;
 
         // Same contract as decode: env override > the cubin's own

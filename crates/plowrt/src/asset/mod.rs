@@ -19,6 +19,7 @@ use crate::{Result, RuntimeError};
 mod bucket;
 #[cfg(feature = "cuda")]
 pub(crate) mod checkpoint;
+pub mod cubin;
 pub mod devblob;
 pub use bucket::{Bucket, BucketKey};
 

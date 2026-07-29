@@ -29,7 +29,7 @@
 //! public entry point re-binds the primary context** with `cuCtxSetCurrent` —
 //! a few tens of nanoseconds, nothing against a multi-millisecond token step.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -135,9 +135,9 @@ macro_rules! driver_api {
 
 driver_api! {
     cuInit: fn(u32) -> CUresult,
-    cuGetErrorName: fn(CUresult, *mut *const i8) -> CUresult,
+    cuGetErrorName: fn(CUresult, *mut *const c_char) -> CUresult,
     cuDeviceGet: fn(*mut CUdevice, i32) -> CUresult,
-    cuDeviceGetName: fn(*mut i8, i32, CUdevice) -> CUresult,
+    cuDeviceGetName: fn(*mut c_char, i32, CUdevice) -> CUresult,
     cuDeviceGetAttribute: fn(*mut i32, i32, CUdevice) -> CUresult,
     cuDevicePrimaryCtxRetain: fn(*mut CUcontext, CUdevice) -> CUresult,
     cuDevicePrimaryCtxRelease_v2: fn(CUdevice) -> CUresult,
@@ -145,8 +145,8 @@ driver_api! {
     cuCtxSynchronize: fn() -> CUresult,
     cuModuleLoadData: fn(*mut CUmodule, *const c_void) -> CUresult,
     cuModuleUnload: fn(CUmodule) -> CUresult,
-    cuModuleGetFunction: fn(*mut CUfunction, CUmodule, *const i8) -> CUresult,
-    cuModuleGetGlobal_v2: fn(*mut CUdeviceptr, *mut usize, CUmodule, *const i8) -> CUresult,
+    cuModuleGetFunction: fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult,
+    cuModuleGetGlobal_v2: fn(*mut CUdeviceptr, *mut usize, CUmodule, *const c_char) -> CUresult,
     cuFuncSetAttribute: fn(CUfunction, i32, i32) -> CUresult,
     cuOccupancyMaxActiveBlocksPerMultiprocessor:
         fn(*mut i32, CUfunction, i32, usize) -> CUresult,
@@ -391,7 +391,13 @@ impl CudaBackend {
             // this list), so without an explicit entry we silently fall through
             // to the older driver and fail at the first cuModuleLoadData.
             "/usr/local/cuda/compat/libcuda.so.1",
+            // Both multiarch homes: a Grace-Hopper / Grace-Blackwell host (sbsa)
+            // keeps the driver under `aarch64-linux-gnu`, and `/lib` is not
+            // always symlinked to `/usr/lib` there. Listing the x86_64 dir alone
+            // sent every nix-built binary on a GH200 to the CPU fallback.
             "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+            "/usr/lib/aarch64-linux-gnu/libcuda.so.1",
+            "/lib/aarch64-linux-gnu/libcuda.so.1",
             "/usr/local/nvidia/lib64/libcuda.so.1",
             "/usr/lib64/libcuda.so.1",
         ] {
@@ -424,7 +430,7 @@ impl CudaBackend {
             if rc == 0 {
                 return Ok(());
             }
-            let mut p: *const i8 = std::ptr::null();
+            let mut p: *const c_char = std::ptr::null();
             // SAFETY: driver call querying an error string.
             let name = unsafe {
                 if (api.cuGetErrorName)(rc, &mut p) == 0 && !p.is_null() {
@@ -450,7 +456,7 @@ impl CudaBackend {
             )?;
             check((api.cuCtxSetCurrent)(ctx), "cuCtxSetCurrent")?;
 
-            let mut buf = [0i8; 128];
+            let mut buf = [0 as c_char; 128];
             check((api.cuDeviceGetName)(buf.as_mut_ptr(), 128, dev), "cuDeviceGetName")?;
             let name = std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
 
@@ -500,7 +506,7 @@ impl CudaBackend {
         if rc == 0 {
             return Ok(());
         }
-        let mut p: *const i8 = std::ptr::null();
+        let mut p: *const c_char = std::ptr::null();
         // SAFETY: driver call querying an error string.
         let name = unsafe {
             if (self.api.cuGetErrorName)(rc, &mut p) == 0 && !p.is_null() {

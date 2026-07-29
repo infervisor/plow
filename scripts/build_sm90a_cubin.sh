@@ -42,6 +42,17 @@
 set -euo pipefail
 
 OUT="${1:?usage: build_sm90a_cubin.sh <out.cubin>}"
+# The prefill path is DERIVED from this one (`${OUT%.cubin}_pf.cubin`), so an
+# argument without the suffix writes decode to `<x>` and prefill to
+# `<x>_pf.cubin` — a pair that then gets copied into a bundle as
+# `interp_sm90a` + `interp_sm90a.cubin`, i.e. the prefill object sitting under
+# the decode object's name. Refuse the ambiguity at the source.
+case "$OUT" in
+  *.cubin) ;;
+  *) echo "FATAL: <out> must end in .cubin (the prefill object is written to" >&2
+     echo "       \${out%.cubin}_pf.cubin; '$OUT' would swap the pair)." >&2
+     exit 1 ;;
+esac
 # PLOW_ROOT lets a worktree build its OWN modified source instead of /root/plow.
 HERE="${PLOW_ROOT:-/root/plow}"
 SRC="$HERE/runtime/nvidia/interp_sm90a.cu"
