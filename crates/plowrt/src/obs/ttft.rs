@@ -31,7 +31,7 @@ pub struct Phase {
 }
 
 impl Phase {
-    const fn new(label: &'static str) -> Self {
+    pub const fn new(label: &'static str) -> Self {
         Phase { label, ns: AtomicU64::new(0), count: AtomicU64::new(0) }
     }
     #[inline]
@@ -44,11 +44,11 @@ impl Phase {
     pub fn tally(&self, n: u64) {
         self.count.fetch_add(n, Ordering::Relaxed);
     }
-    fn reset(&self) {
+    pub fn reset(&self) {
         self.ns.store(0, Ordering::Relaxed);
         self.count.store(0, Ordering::Relaxed);
     }
-    fn read(&self) -> (u64, u64) {
+    pub fn read(&self) -> (u64, u64) {
         (self.ns.load(Ordering::Relaxed), self.count.load(Ordering::Relaxed))
     }
 }

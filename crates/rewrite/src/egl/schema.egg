@@ -50,6 +50,25 @@
   ; --- routing (MoE) ---
   (MoeRouter Expr Expr i64 i64)       ; x, weight, num_experts, top_k
 
+  ; --- Kimi-K3 ---
+  ; The hybrid mixer's terms. Every weight leaf is named so the manifest stays
+  ; complete: these were previously REFUSED by `lower.rs` rather than lowered to
+  ; `Opaque`, because `Opaque` is a single-input passthrough and would have
+  ; dropped every weight but the first.
+  (Conv1dDepthwise Expr Expr i64)     ; x, weight, kernel  (KDA's short causal conv)
+  (SituGlu Expr Expr f64 f64)         ; gate, up, beta, linear_beta
+  ; q, k, v, gate, beta, kind-token, num_heads, head_dim. The recurrent state is
+  ; a runtime resource, not an edge — same convention as `Attention` and the KV
+  ; cache (see `nn_graph::Op::LinearAttention`).
+  (LinearAttention Expr Expr Expr Expr Expr String i64 i64)
+
+  ; K3's block residual. The snapshot stack is variable-length (0..max_snapshots),
+  ; so it rides as a cons chain — the `Concat` precedent above, for the same
+  ; reason: egglog constructors are fixed-arity and no leaf may be dropped.
+  (BlockResidual Expr Expr Expr i64)  ; prefix, snapshot-chain, score_weight, max_snapshots
+  (SnapCons Expr Expr)                ; snapshot, rest
+  (SnapNil)                           ; end of the snapshot chain
+
   ; --- catch-all for ops not yet in the fusion vocabulary ---
   ; Allows the full graph to lower without error; no rewrite targets Opaque.
   (Opaque String Expr)                ; op_name, single-input passthrough
@@ -85,4 +104,11 @@
   (FusedLinearBiasAct Expr Expr Expr i64 String)     ; x, weight, bias, out, act_kind
 
   ; Embedding + Scale fusion (Gemma embedding normalizer).
-  (FusedEmbeddingScale Expr Expr f64))              ; ids, table, factor
+  (FusedEmbeddingScale Expr Expr f64)              ; ids, table, factor
+
+  ; Kimi-K3 gate fusions. Both targets are opcodes that ALREADY EXIST and are
+  ; already numerically gated on real weights — `KdaGatedNorm = 103` and
+  ; `MlaOutGate = 106`. The unfused graph spells each as 3-5 e-nodes, so these
+  ; rules are what lets extraction reach a kernel the runtime can already run.
+  (FusedKdaGatedNorm Expr Expr f64 Expr Expr i64)  ; o, o_normw, eps, x, gatew, gate_out
+  (FusedMlaOutGate Expr Expr Expr i64))            ; attn, x, gatew, gate_out

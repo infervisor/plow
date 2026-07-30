@@ -333,7 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if tp > 1 {
                 amd_bench_tp(blob, hsaco, checkpoint, prompt, steps, ctx, tp, dump_logits)
             } else {
-                amd_bench(blob, hsaco, checkpoint, prompt, steps, ctx, batched)
+                amd_bench(blob, hsaco, checkpoint, prompt, steps, ctx, batched, dump_logits)
             }
         }
         #[cfg(not(feature = "hsa"))]
@@ -363,6 +363,7 @@ fn amd_bench(
     steps: u32,
     ctx: u32,
     batched: bool,
+    dump_logits: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::exec::amd::AmdEngine;
 
@@ -536,16 +537,49 @@ fn amd_bench(
         if ids.is_empty() {
             return Err("--prompt is empty".into());
         }
+        // The FULL vocab row, the same surface `amd_bench_tp` dumps and for the same
+        // reason: a greedy id alone cannot tell a 1e-3 wobble on a near-tie from a
+        // real arithmetic difference. Single-GPU had no dump at all, so a tp=1 run
+        // could not be compared to a tp=8 one as a VECTOR — which is the only way to
+        // ask whether TP's own geometry (K3's 12 local KDA heads at BV=8, against
+        // the 96-head BV=16 shape every block gate validates) changed the answer.
+        let dump = |e: &AmdEngine, tag: &str| -> Result<(), Box<dyn std::error::Error>> {
+            let Some(dir) = &dump_logits else { return Ok(()) };
+            std::fs::create_dir_all(dir)?;
+            let n = e.tensor_bytes("act.logits").ok_or("no act.logits")? as usize;
+            let mut buf = vec![0u8; n];
+            e.read_tensor("act.logits", &mut buf)?;
+            std::fs::write(dir.join(format!("logits_{tag}.bin")), &buf)?;
+            Ok(())
+        };
+
         // A multi-token prompt goes through PREFILL, which populates the KV for
         // [0, n) and leaves the first sampled token in in.ids. A single token
         // needs none: decode at position 0 writes KV row 0 and attends over
         // exactly [0,1), so nothing is read that was not written.
         let (first, mut pos) = if ids.len() > 1 {
             let t0 = std::time::Instant::now();
-            let tok = eng.prefill(&ids)?;
+            // A DECODE-ONLY packet has no bucket ladder to chunk a prompt over, and
+            // `plan_chunks` refuses one rather than guessing. `amd_bench_tp` has
+            // walked the prompt through the decode program a token at a time since
+            // GLM-5.2 (whose `glm_emit_full` emits exactly one program); the
+            // single-GPU path did not, so `K3_PREFILL=0` — the arm K3 did its whole
+            // bring-up on — simply could not run on one GPU. It is a real forward
+            // pass: step `p` writes KV row `p` and attends over `[0, p+1)`.
+            let tok = if eng.n_programs() == 1 {
+                let mut last = 0;
+                for (p, id) in ids.iter().enumerate() {
+                    eng.seed_ids(&[*id])?;
+                    last = eng.decode_step(p as u32, p as u32 + 1)?;
+                }
+                last
+            } else {
+                eng.prefill(&ids)?
+            };
+            dump(&eng, "prefill")?;
             let ms = t0.elapsed().as_secs_f64() * 1e3;
             println!(
-                "\nprefill: {} tokens in {ms:.1} ms ({:.0} tok/s)",
+                "\nprefill: {} tokens in {ms:.1} ms ({:.0} tok/s) -> {tok}",
                 ids.len(),
                 ids.len() as f64 / (ms / 1e3)
             );
@@ -561,10 +595,11 @@ fn amd_bench(
             out.push(first);
         }
         let t0 = std::time::Instant::now();
-        for _ in 0..steps {
+        for s in 0..steps {
             // in.ids is NOT re-seeded: the device wrote the previous step's
             // sampled token there itself, which is what this step embeds.
             out.push(eng.decode_step(pos, pos + 1)?);
+            dump(&eng, &format!("{s:03}"))?;
             pos += 1;
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
@@ -639,6 +674,10 @@ fn amd_bench_tp(
     }
     let t0 = std::time::Instant::now();
     let mut g = AmdTpGroup::load(backends, &blob, &hsaco, checkpoint.as_deref())?;
+    // This binary is the TP CORRECTNESS ORACLE: its claim is that every rank
+    // emitted an IDENTICAL stream, and a sampled check cannot support that
+    // sentence. Serving samples (`DEFAULT_AGREE_EVERY`); the oracle never does.
+    g.audit_cadence(1);
     println!(
         "loaded in {:.1} s: TP={} ranks, max_ctx={}",
         t0.elapsed().as_secs_f64(),
@@ -748,9 +787,20 @@ fn amd_bench_tp(
     let t = std::time::Instant::now();
     let mut disagreements = 0u32;
     for i in 0..steps {
+        // §DSTEP owns the whole step so `TOKEN` is a real total, not a sum of
+        // parts. `PLOW_DSTEP_LOG=1` prints the host/GPU split every
+        // `PLOW_DSTEP_EVERY` tokens; off, this is one `OnceLock` load.
+        let t_tok = plowrt::obs::dstep::on().then(std::time::Instant::now);
         let ids = g.decode_step(ctx + 1 + i, ctx + 2 + i)?;
-        if AmdTpGroup::agree(&ids).is_err() {
+        if plowrt::obs::dstep::timed(&plowrt::obs::dstep::AGREE, || {
+            AmdTpGroup::agree(&ids)
+        })
+        .is_err()
+        {
             disagreements += 1;
+        }
+        if let Some(t) = t_tok {
+            plowrt::obs::dstep::token(t.elapsed().as_nanos() as u64);
         }
     }
     let ms = t.elapsed().as_secs_f64() * 1e3 / steps as f64;
@@ -773,6 +823,15 @@ fn amd_bench_tp(
              NOT evidence the collectives ran (every rank computes the same nothing). \n\
              Pass --checkpoint for the real token-identity check."
         );
+    }
+    // PACKET TRACE. Dumped AFTER the timed loop, so the records are a
+    // steady-state step's and not the warmup's. Every rank traces (the buffer
+    // is allocated per engine off the same env var); rank 0's is the one that
+    // gets written, which is the same rank the token-agreement check reads.
+    if let Some(p) = std::env::var_os("PLOW_TRACE_RAW") {
+        let p = PathBuf::from(p);
+        g.rank(0).trace_write(&p)?;
+        println!("packet trace -> {}", p.display());
     }
     Ok(())
 }

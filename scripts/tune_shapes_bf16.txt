@@ -1,0 +1,62 @@
+# The 50-shape bf16 prefill-GEMM campaign, verbatim from scripts/rebench_tune_gemm.sh's SHAPES
+# block -- which is where its provenance is documented at length. Two halves:
+#
+#   * the leading 32 are GLM-5.2's DERIVED demand, read off `--shapes auto` at ctx 131072 on the
+#     full:512,2048,4096,8192 ladder. DERIVE THEM, DO NOT HAND-EDIT: re-run `--shapes auto` after
+#     any emitter or ladder change and re-sync. The list is a function of BOTH the ladder AND
+#     --max-ctx, and a subset is the bug that whole header is about.
+#   * the trailing 18 are the ORIGINAL hand-authored Gemma-26B/12B/31B, Qwen and Kimi set, kept
+#     verbatim so this campaign stays comparable to the one it replaces.
+#
+# These are the records `cargo test -p devgen --test tuned_tile_selection` reads, so this file is
+# the un-staling half of the campaign. No quant column: every line is bf16 (`None`).
+512 6144 512    glm52-kvb-up-M512
+2048 6144 512    glm52-kvb-up-M2048
+4096 6144 512    glm52-kvb-up-M4096
+8192 6144 512    glm52-kvb-up-M8192
+512 64 6144    glm52-krope-M512
+2048 64 6144    glm52-krope-M2048
+4096 64 6144    glm52-krope-M4096
+8192 64 6144    glm52-krope-M8192
+512 512 6144    glm52-kva-M512
+2048 512 6144    glm52-kva-M2048
+4096 512 6144    glm52-kva-M4096
+8192 512 6144    glm52-kva-M8192
+512 256 6144    glm52-router-M512
+2048 256 6144    glm52-router-M2048
+4096 256 6144    glm52-router-M4096
+8192 256 6144    glm52-router-M8192
+512 2048 6144    glm52-qa-M512
+2048 2048 6144    glm52-qa-M2048
+4096 2048 6144    glm52-qa-M4096
+8192 2048 6144    glm52-qa-M8192
+512 6144 4096    glm52-oproj-M512
+2048 6144 4096    glm52-oproj-M2048
+4096 6144 4096    glm52-oproj-M4096
+8192 6144 4096    glm52-oproj-M8192
+512 8192 2048    glm52-qb-M512
+2048 8192 2048    glm52-qb-M2048
+4096 8192 2048    glm52-qb-M4096
+8192 8192 2048    glm52-qb-M8192
+512 1024 2048    glm52-narrow-M512
+2048 1024 2048    glm52-narrow-M2048
+4096 1024 2048    glm52-narrow-M4096
+8192 1024 2048    glm52-narrow-M8192
+128 128 2816   gemma26b-router
+128 256 6144   glm52-router
+128 512 3840   gemma12b-k-global
+128 576 6144   glm52-kv-a-proj
+128 576 7168   kimi-kv-a-proj
+128 2112 2816  gemma26b-dense-gateup
+256 8192 5376  gemma31b-q-M256
+512 8192 5376  gemma31b-q-M512
+1024 8192 5376 gemma31b-q-M1024
+2048 8192 5376 gemma31b-q-M2048
+2048 21504 5376 gemma31b-gateup-M2048
+2048 5376 21504 gemma31b-down-M2048
+4096 2048 5376 gemma31b-o-M4096
+4096 2560 4096 qwen-o-M4096
+4096 5376 8192 gemma31b-down8k
+4096 9728 2560 qwen-gateup-M4096
+8192 1024 4096 qwen-kv-M8192
+8192 8192 5376 gemma31b-q-M8192

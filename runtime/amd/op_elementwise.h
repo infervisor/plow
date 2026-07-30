@@ -11,6 +11,26 @@
 
 #include "amd_common.h"
 
+/* THE FAST SPELLINGS WERE TRIED HERE AND DELIBERATELY NOT KEPT. DO NOT RE-DERIVE THEM.
+ *
+ * `fast_tanhf` for the gelu and `x * rcp(1 + __expf(-x))` for the silu (both in amd_common.h,
+ * both exhaustively swept in runtime/tests/situ_identity_gfx950_test.hip and correct to one bf16
+ * ulp) cut these from 38 and 26 VALU to 13 and 5, and they DO make `d_glu` faster — measured at
+ * K3's 18432 width, silu 0.0232 -> 0.0213 ms and gelu 0.0240 -> 0.0226 ms, about 7%. They are
+ * still not here, for two reasons that only appear once the numbers are put next to each other:
+ *
+ *   1. THE WIN IS ~0.001 ms PER LAYER. `d_glu` is a 6 B/element streaming pass already running
+ *      near its bandwidth roofline; 7% of it is not a number that survives contact with a MoE
+ *      layer that costs 10 ms.
+ *   2. THESE TWO ARE NOT LOCAL. `act_gate_only` inlines them into FIVE op_gemm.h epilogues
+ *      (:668, :1229, :1670, :2156, :3046), which are register-tight MFMA and GEMV kernels of
+ *      exactly the kind where this sweep measured an epilogue edit COSTING more than its VALU
+ *      saved: the same substitution applied to op_moe.h's `moe_act` made the A4W4 MoE prefill
+ *      0.18 ms SLOWER on an arm that never even executes it (see `moe_act`'s note in op_moe.h).
+ *      Proving those five neutral is a bench this tree does not have.
+ *
+ * And `act_silu` is GLM-5.2's dense-FFN SwiGLU, i.e. the shipping model's numerics, for a win
+ * that rounds to zero. Left exactly as it was. */
 __device__ __forceinline__ float act_gelu_tanh(float x) {
     /* gelu_pytorch_tanh: 0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3))) */
     const float c = 0.7978845608028654f * (x + 0.044715f * x * x * x);
@@ -18,29 +38,54 @@ __device__ __forceinline__ float act_gelu_tanh(float x) {
 }
 __device__ __forceinline__ float act_silu(float x) { return x / (1.0f + __expf(-x)); }
 
-/* out = (a + b) * scale.
+/* out = (a + b) * scale, or with `pre`: out = (pre + bf16(a + b)) * scale.
  *
  * `scale` exists to absorb Gemma's per-layer `layer_scalar`: HF applies
  * `hidden_states *= layer_scalar` to the whole residual stream at the end of the
  * block, which is exactly `(r + f) * layer_scalar` — so the SECOND residual add
- * folds it in for free. Pass 1.0f for the first add. */
+ * folds it in for free. Pass 1.0f for the first add.
+ *
+ * THE THREE-INPUT FORM (`pre != nullptr`), and why a chained pair of adds is worth an operand.
+ * Kimi-K3's MoE tail ends in two Residuals that ONLY each other read:
+ *
+ *     ffn = up_latent + shared_down          (the two FFN halves)
+ *     x   = prefix    + ffn                  (the block output)
+ *
+ * At decode both are `vec8_cus(7168)` = TWO workgroups (crates/devgen/src/k3.rs), so this is two
+ * serial 2-CU packets back to back on a chain with nothing ready behind either, 92 times per token
+ * — the same shape, and the same price, as the AttnRes/RMSNorm pair in op_k3.h. `pre` folds them:
+ * `a`/`b` are the inner pair and `pre` the outer residual, `ffn` is never written, and one packet
+ * and a full 7168-wide HBM round trip disappear.
+ *
+ * BIT-EXACT, and the `f2bf` in the middle is the whole reason: the inner sum is ROUNDED to bf16
+ * before the outer add, which is precisely the value the deleted packet stored and the surviving
+ * one re-read. The inner add takes NO scale — the K3 emitter asserts that it was 1.0f — so the
+ * packet's one `scale` slot still means what it meant. */
 __device__ void d_residual(bf16* __restrict__ out, const bf16* __restrict__ a,
                            const bf16* __restrict__ b, unsigned n, float scale,
-                           unsigned slice, unsigned nblk) {
+                           unsigned slice, unsigned nblk, const bf16* __restrict__ pre = nullptr) {
     const unsigned stride = nblk * PLOW_THREADS * 8;
     const auto* ag = as_glob(a);
     const auto* bg = as_glob(b);
+    const auto* pg = as_glob(pre);
     auto* og = as_glob(out);
     for (unsigned i = (slice * PLOW_THREADS + threadIdx.x) * 8; i < n; i += stride) {
         if (i + 8 <= n) {
             const bf16v8 va = ld_glob8(ag + i), vb = ld_glob8(bg + i);
+            /* Issued with a/b, not after them: three operands, ONE round trip. */
+            const bf16v8 vp = pre ? ld_glob8(pg + i) : bf16v8_zero();
             bf16v8 vo;
 #pragma unroll
-            for (int j = 0; j < 8; j++) vo[j] = f2bf((bf2f(va[j]) + bf2f(vb[j])) * scale);
+            for (int j = 0; j < 8; j++) {
+                const float s = bf2f(va[j]) + bf2f(vb[j]);
+                vo[j] = pre ? f2bf((bf2f(vp[j]) + bf2f(f2bf(s))) * scale) : f2bf(s * scale);
+            }
             st_glob8(og + i, vo);
         } else {
-            for (unsigned j = i; j < n; j++)
-                out[j] = f2bf((bf2f(a[j]) + bf2f(b[j])) * scale);
+            for (unsigned j = i; j < n; j++) {
+                const float s = bf2f(a[j]) + bf2f(b[j]);
+                st_act1(&out[j], pre ? f2bf((bf2f(pre[j]) + bf2f(f2bf(s))) * scale) : f2bf(s * scale));
+            }
         }
     }
 }
@@ -49,7 +94,27 @@ __device__ void d_residual(bf16* __restrict__ out, const bf16* __restrict__ a,
  *
  * Gemma is GeGLU (gelu_pytorch_tanh), NOT SwiGLU. `act` selects so the same op
  * serves Llama/Qwen-style silu gating. */
-enum { PLOW_ACT_GELU_TANH_ = 0, PLOW_ACT_SILU_ = 1 };
+enum { PLOW_ACT_GELU_TANH_ = 0, PLOW_ACT_SILU_ = 1, PLOW_ACT_SITU_ = 2 };
+
+/* The GATE-ONLY half of a GLU epilogue, for every fused path that computes
+ * `act(gate) * up` and therefore CANNOT express Kimi-K3's `situ`.
+ *
+ * Same argument as `moe_act`'s in op_moe.h, and the same answer. situ is
+ * `beta*tanh(g/beta)*sigmoid(g) * lbeta*tanh(u/lbeta)`: it transforms the UP
+ * branch as well as the gate, so the expression SHAPE is `A(g)*B(u)`, not
+ * `act(g)*u`. A gate-only path handed `act = 2` used to fall through this
+ * function's `else` and return gelu_tanh(g)*u — finite, correctly shaped, and
+ * the wrong model, with the error growing in the tail of `u`.
+ *
+ * There is no device trap and this interpreter's dispatch `default:` is a silent
+ * NOP, so a NaN is the loudest primitive available: it reaches the residual on
+ * the next op. Any epilogue that must actually SUPPORT situ takes the betas and
+ * calls a pair-form helper (`moe_glu`, `k3_situ_gate`/`k3_situ_up`) instead of
+ * this. Every caller here is one that does not. */
+__device__ __forceinline__ float act_gate_only(float g, unsigned act) {
+    if (act == PLOW_ACT_SITU_) return __builtin_nanf("");
+    return (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+}
 
 __device__ void d_glu(bf16* __restrict__ out, const bf16* __restrict__ gate,
                       const bf16* __restrict__ up, unsigned n, unsigned act,
@@ -65,15 +130,15 @@ __device__ void d_glu(bf16* __restrict__ out, const bf16* __restrict__ gate,
 #pragma unroll
             for (int j = 0; j < 8; j++) {
                 const float g = bf2f(vg[j]);
-                const float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+                const float a = act_gate_only(g, act);
                 vo[j] = f2bf(a * bf2f(vu[j]));
             }
             st_glob8(og + i, vo);
         } else {
             for (unsigned j = i; j < n; j++) {
                 const float g = bf2f(gate[j]);
-                const float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
-                out[j] = f2bf(a * bf2f(up[j]));
+                const float a = act_gate_only(g, act);
+                st_act1(&out[j], f2bf(a * bf2f(up[j])));
             }
         }
     }
@@ -95,7 +160,7 @@ __device__ void d_softcap(bf16* __restrict__ out, const bf16* __restrict__ x, un
             for (int j = 0; j < 8; j++) o[j] = f2bf(cap * tanhf(bf2f(v[j]) * inv));
             st_glob8(og + i, o);
         } else {
-            for (unsigned j = i; j < n; j++) out[j] = f2bf(cap * tanhf(bf2f(x[j]) * inv));
+            for (unsigned j = i; j < n; j++) st_act1(&out[j], f2bf(cap * tanhf(bf2f(x[j]) * inv)));
         }
     }
 }
@@ -122,7 +187,7 @@ __device__ void d_embed(bf16* __restrict__ out, const bf16* __restrict__ table,
             }
         } else {
             for (unsigned i = threadIdx.x; i < hidden; i += PLOW_THREADS)
-                out[dst + i] = f2bf(bf2f(table[src + i]) * scale);
+                st_act1(&out[dst + i], f2bf(bf2f(table[src + i]) * scale));
         }
     }
 }

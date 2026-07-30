@@ -173,7 +173,7 @@ except Exception: print("")' 2>/dev/null)
 COHERENT=1
 
 # One `vllm bench serve` point. $1=input_len $2=concurrency $3=num_prompts $4=tag
-# Emits: ctx,conc,ttft_ms,prefill_tok_s,tpot_ms,itl_ms,decode_tok_s,req_throughput,out_tok_s
+# Emits: ctx,conc,ttft_ms,prefill_tok_s,tpot_ms,itl_ms,itl_med_ms,itl_p99_ms,decode_tok_s,req_throughput,out_tok_s
 bench_point() {
   local L="$1" C="$2" N="$3" tag="$4"
   local log="$OUTDIR/${SLUG}_${QTAG}_tp${TP}_${tag}_in${L}_c${C}.log"
@@ -200,10 +200,19 @@ L=int(sys.argv[1]); C=int(sys.argv[2]); t=open(sys.argv[3]).read()
 def g(p):
     m=re.search(p+r"\D*([\d.]+)",t); return float(m.group(1)) if m else float('nan')
 ttft=g(r"Mean TTFT \(ms\):"); tpot=g(r"Mean TPOT \(ms\):"); itl=g(r"Mean ITL \(ms\):")
+# ITL median and P99 beside the mean. A mean ITL hides the stalls that decide
+# whether a stream reads as smooth: one 400 ms hitch in 128 tokens moves the
+# mean by 3 ms and the P99 by 400. The tail is the number to compare engines on.
+itl_med=g(r"Median ITL \(ms\):"); itl_p99=g(r"P99 ITL \(ms\):")
 rps=g(r"Request throughput \(req/s\):"); ots=g(r"Output token throughput \(tok/s\):")
+# `Successful requests` counts a REJECTED request as a success, so it cannot
+# gate a point alone: a 131072 input-len point against a max_ctx=131072 plow
+# blob had every prefill refused and still reported 4 successful requests at
+# 99.1 tok/s with ITL 0.00. `gen_toks` must equal num_prompts x OUTPUT_LEN.
+ok=g(r"Successful requests:"); gen=g(r"Total generated tokens:")
 pf = L/(ttft/1000.0) if ttft==ttft and ttft>0 else float('nan')
 dc = 1000.0/tpot if tpot==tpot and tpot>0 else float('nan')
-print(f"{L},{C},{ttft:.2f},{pf:.1f},{tpot:.3f},{itl:.3f},{dc:.2f},{rps:.3f},{ots:.1f}")
+print(f"{L},{C},{ttft:.2f},{pf:.1f},{tpot:.3f},{itl:.3f},{itl_med:.3f},{itl_p99:.3f},{dc:.2f},{rps:.3f},{ots:.1f},{ok:.0f},{gen:.0f}")
 PY
 }
 
@@ -240,7 +249,7 @@ sanity
 
 if [ "$SERVE_ONLY" = "1" ]; then echo ">>> SERVE_ONLY=1 — stopping after sanity."; exit 0; fi
 
-HDR="input_len,concurrency,ttft_ms,prefill_tok_s,tpot_ms,itl_ms,decode_tok_s,req_per_s,out_tok_s"
+HDR="input_len,concurrency,ttft_ms,prefill_tok_s,tpot_ms,itl_ms,itl_med_ms,itl_p99_ms,decode_tok_s,req_per_s,out_tok_s,ok_reqs,gen_toks"
 
 # A row of nan means `vllm bench serve` itself died (bad flag, tokenizer refusal,
 # OOM) and produced NO measurement. Silently writing that to the CSV and exiting

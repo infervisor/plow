@@ -501,6 +501,112 @@ def prep_layer(cfg, idx, w, l, experts_mode):
                           m_src + f"experts.{e}.{w_src}.weight_scale")
 
 
+# ---------------------------------------------------------------- derived sidecar + symlink farm
+#
+# THE NAME CONTRACT IS NOT NEGOTIABLE ANY MORE.  `prep_layer` above writes the names that were
+# PROPOSED in 2026-07 while no K3 emitter existed.  One exists now (crates/devgen/src/k3.rs) and it
+# disagrees in three independent ways, each of which is a fatal `MISSING WEIGHT` at load
+# (crates/plowrt/src/exec/amd.rs:2963 -- missing is an ERROR naming the tensor, never a zeroed
+# buffer, precisely so this surfaces as a stack trace and not as fluent wrong output):
+#
+#   prefix       `model.layers.{l}.`  ->  `language_model.model.layers.{l}.`   (k3.rs:1640)
+#   MoE ns       `mlp.`               ->  `block_sparse_moe.`                  (K3_MOE_NS, k3.rs)
+#   k_rope       `derived.k_rope`     ->  `derived.k_rope_down`                (k3.rs:1951)
+#   kv_a latent  `derived.kv_a_latent`->  `kv_a_proj_with_mqa` SLICED to [DK,H] (k3.rs:1950)
+#
+# WHAT ACTUALLY HAS TO BE WRITTEN, though, is far less than `prep_layer` writes.  Checked against
+# the snapshot index: `language_model.model.embed_tokens.weight`, `language_model.model.norm.weight`
+# and `language_model.lm_head.weight` already carry the emitter's exact spelling, as does every
+# per-layer norm, every KDA tensor, the whole `block_sparse_moe.` namespace and all 494,592 mxfp4
+# expert tensors.  The ONLY tensors the checkpoint cannot serve are the five per MLA layer below.
+# So the sidecar is ~4.5 GB against a 1.5 TB checkpoint, and everything else binds in place.
+#
+# HOW BOTH REACH ONE LOADER.  `Checkpoint::open` (crates/plowrt/src/asset/checkpoint.rs:40-85) takes
+# EVERY `*.safetensors` in ONE directory, non-recursively, and never reads an index file -- so a
+# directory of symlinks to the snapshot's 96 shards plus this sidecar is indistinguishable from a
+# real checkpoint, and `bind_packed_experts` (amd.rs:3044) reads the experts straight out of the
+# symlinked shards.  There is no overlay/search-path mechanism in the runtime, so the farm IS the
+# mechanism.  Precedent: scripts/glm52_prep_fp8_linear.py:95-123 does exactly this for GLM.
+#
+# THE ONE OVERRIDE, and why the filename matters.  `kv_a_proj_with_mqa.weight` EXISTS in the
+# snapshot, at [DK+DR, H] = [576, 7168], but the emitter declares [DK, H] = [512, 7168] and takes
+# the rope rows as a separate `derived.k_rope_down`.  The name does not match any Column/Row pattern
+# in `shard_of` (asset/shard.rs:59-183) so it is Replicated, and Replicated requires `full == want`
+# EXACTLY (shard.rs:310-318) -- 576 rows against a declared 512 is a fatal size error, not a silent
+# truncation.  The sidecar therefore rewrites it, and the rewrite only wins because
+# `Checkpoint::open` sorts paths (checkpoint.rs:48) and inserts in that order (`:78`), so the
+# LAST file to define a name wins.  `model-idx-derived-*.safetensors` sorts after
+# `model-000NN-of-000096.safetensors` because 'i' > '0' in ASCII.  That is implicit behaviour with
+# no test on it, so `build_farm` VERIFIES the resulting order rather than trusting the argument.
+
+# The five per-MLA-layer tensors, under the names crates/devgen/src/k3.rs actually declares.
+def derived_layer(cfg, idx, w, l):
+    """Write the MLA tensors the checkpoint cannot serve. Returns the names written."""
+    H, NH = cfg.hidden, cfg.heads
+    DK, DR, QN, VD, QL = cfg.kv_lora, cfg.qk_rope, cfg.qk_nope, cfg.v_head, cfg.q_lora
+    src = f"{TEXT}layers.{l}."
+    a_dst = f"{TEXT}layers.{l}.self_attn."
+
+    # Absorption, as prep_layer derives it. K3 applies NO RoPE (mla_use_nope=True, no rope_theta),
+    # so the DR decoupled dims are projected and never rotated and q_rope/k_rope stay RAW.
+    q_b = load(idx, src + "self_attn.q_b_proj.weight").reshape(NH, QN + DR, QL)
+    q_b_nope, q_b_rope = q_b[:, :QN, :], q_b[:, QN:, :]
+    kv_b = load(idx, src + "self_attn.kv_b_proj.weight").reshape(NH, QN + VD, DK)
+    k_nope_w, value_w = kv_b[:, :QN, :], kv_b[:, QN:, :]
+    Wqa = np.einsum("hpl,hpk->hlk", k_nope_w, q_b_nope)      # [NH, DK, QL]
+    Wuv = np.swapaxes(value_w, -1, -2)                        # [NH, DK, VD]
+    kv_a = load(idx, src + "self_attn.kv_a_proj_with_mqa.weight")
+
+    # FULL width, not per-rank: derived.q_absorb / q_rope / v_absorb are in `shard_of`'s COL list
+    # (asset/shard.rs:80-92) so the loader slices them per rank; and if the emitter ever declared
+    # them full instead, the `full == want => Replicated` demotion (shard.rs:304-307) carries it.
+    # Writing full is correct under both, writing per-rank is correct under neither.
+    names = []
+    for n, arr in (("derived.q_absorb.weight", Wqa.reshape(NH * DK, QL)),
+                   ("derived.q_rope.weight", np.ascontiguousarray(q_b_rope).reshape(NH * DR, QL)),
+                   ("derived.v_absorb.weight", Wuv.reshape(NH * DK, VD)),
+                   # The kv_a SPLIT: latent rows keep the checkpoint's own name at the emitter's
+                   # declared [DK,H] (this is the override), rope rows become k_rope_down [DR,H].
+                   ("kv_a_proj_with_mqa.weight", kv_a[:DK]),
+                   ("derived.k_rope_down.weight", kv_a[DK:DK + DR])):
+        w.add_bf16(a_dst + n, arr)
+        names.append(a_dst + n)
+    return names
+
+
+def _link(src, dst):
+    if os.path.islink(dst) or os.path.exists(dst):
+        os.remove(dst)
+    os.symlink(os.path.realpath(src), dst)
+
+
+def build_farm(model_dir, farm_dir, sidecar):
+    """Symlink the snapshot AND `sidecar` into `farm_dir`, then VERIFY the override order."""
+    os.makedirs(farm_dir, exist_ok=True)
+    linked = 0
+    for fn in sorted(os.listdir(model_dir)):
+        if not (fn.endswith(".safetensors") or fn in ("config.json", "tokenizer.json",
+                                                      "tokenizer_config.json", "generation_config.json")):
+            continue
+        _link(os.path.join(model_dir, fn), os.path.join(farm_dir, fn))
+        linked += 1
+    # The sidecar goes in LAST, and only if it is not already this very file.
+    dst = os.path.join(farm_dir, os.path.basename(sidecar))
+    if os.path.realpath(dst) != os.path.realpath(sidecar):
+        _link(sidecar, dst)
+    print(f"[farm] {linked} snapshot symlink(s) + sidecar -> {farm_dir}")
+
+    # THE CHECK THAT MATTERS. `Checkpoint::open` sorts and last-writer-wins, so the sidecar must
+    # sort strictly after every shard that defines a name it overrides. Assert it here rather than
+    # discover it as a 576-vs-512 size error 1.5 TB into a load.
+    names = [f for f in sorted(os.listdir(farm_dir)) if f.endswith(".safetensors")]
+    side = os.path.basename(sidecar)
+    if names[-1] != side:
+        sys.exit(f"[farm] REFUSING: {side} does not sort last among {len(names)} shards "
+                 f"(last is {names[-1]}). The kv_a override would lose to the snapshot.")
+    print(f"[farm] override order OK: {side} sorts last of {len(names)} shards")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True, help="HF snapshot dir (partial download is fine)")
@@ -510,10 +616,39 @@ def main():
     ap.add_argument("--globals", action="store_true", help="also write embed_tokens/norm/lm_head")
     ap.add_argument("--experts", choices=("inplace", "verbatim"), default="inplace",
                     help="inplace (default): do not copy the 1.5 TB of mxfp4 experts")
+    ap.add_argument("--derived", action="store_true",
+                    help="write ONLY the 5 per-MLA-layer tensors the checkpoint cannot serve, "
+                         "under crates/devgen/src/k3.rs's real names (serve path)")
+    ap.add_argument("--farm", default=None,
+                    help="with --derived: also build a symlink farm of the snapshot beside the "
+                         "sidecar, so one PLOW_CHECKPOINT dir serves both")
     args = ap.parse_args()
 
     idx, present, total = index_shards(args.model)
     cfg = Cfg(args.model)
+
+    if args.derived:
+        if not args.out:
+            sys.exit("--derived needs --out")
+        cfg.reconcile(idx)
+        mla = [l for l in range(cfg.layers) if cfg.attn[l] == "mla"]
+        want = [int(x) for x in args.layers.split(",")] if args.layers else mla
+        bad = [l for l in want if cfg.attn[l] != "mla"]
+        if bad:
+            sys.exit(f"layers {bad} are not MLA; only MLA layers have derived tensors")
+        os.makedirs(args.out, exist_ok=True)
+        w, written = STWriter(), []
+        for l in want:
+            written += derived_layer(cfg, idx, w, l)
+            print(f"[derived] layer {l} queued ({len(written)} tensors so far)")
+        out = os.path.join(args.out, "model-idx-derived-00001.safetensors")
+        nb = w.flush(out)
+        print(f"[derived] wrote {out} ({nb/1e9:.2f} GB), {len(written)} tensors "
+              f"over {len(want)}/{len(mla)} MLA layers")
+        if args.farm:
+            build_farm(args.model, args.farm, out)
+        return
+
     if args.layers is None or args.inspect:
         sys.exit(0 if inspect(cfg, idx, present, total) else 1)
 

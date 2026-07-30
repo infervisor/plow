@@ -33,6 +33,35 @@
 #
 #   $1  object dir holding the freshly built test_kernels.elf
 #   $2  output jsonl
+#
+# ---------------------------------------------------------------------------------------------
+# RE-RUN, VERBATIM. The K3 MXFP4 campaign was published against build `gfx950-3d15138c0b7b8e4e`
+# on rocm-smi device 5 (KFD node 9 = ROCR index 7 on this box — see the pinning note below).
+# The digest is over the PREPROCESSED translation unit, so it covers every `#include`: ANY edit
+# to `runtime/amd/op_gemm.h` (or anything it pulls in) re-stales every record here, and the
+# store will report them stale rather than serve them. When that happens, from the repo root:
+#
+#   # 1. rebuild the golden object (test_kernels.hip takes NO -DPLOW_GEMV_MM, so it compiles at
+#   #    op_gemm.h's default of 1 — which is the decode bucket the mxfp4 arms need)
+#   mkdir -p obj && cd obj
+#   hipcc --offload-arch=gfx950 -O3 -w --genco ../runtime/amd/test_kernels.hip -o tk.co \
+#         -I../runtime/amd -I../runtime/common
+#   /opt/rocm/lib/llvm/bin/clang-offload-bundler --unbundle --type=o \
+#         --targets=hipv4-amdgcn-amd-amdhsa--gfx950 --input=tk.co --output=test_kernels.elf
+#   cd ..
+#
+#   # 2. sweep (OUTSIDE nix, under the render group, pinned to ONE idle card)
+#   flock /tmp/gpulease/gpu.5.lease flock /tmp/gpulease/gpu.7.lease \
+#     sg render -c 'ROCR_VISIBLE_DEVICES=7 PLOW_GEMV_ONLY=k3- \
+#                   bash scripts/rebench_tune_gemv.sh "$PWD/obj" /tmp/k3_gemv.jsonl'
+#
+#   # 3. ingest (needs nix for cargo; must NOT run under the lease)
+#   nix develop -c cargo run --release -p tunedb --bin tunedb-gemv -- \
+#       ingest --db tuning --samples /tmp/k3_gemv.jsonl --campaign k3-mxfp4-decode-gemv
+#
+# Drop `PLOW_GEMV_ONLY` to sweep the GLM/Gemma rows too. `scripts/gemv_campaign_lease.sh` wraps
+# steps 2+3 under `gpulease -n 1`, but that helper takes the LOWEST free card, not a chosen one.
+# ---------------------------------------------------------------------------------------------
 set -euo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OBJ="${1:?object dir}"
@@ -78,6 +107,54 @@ SHAPES="
 262144 5376   gemma31b-lmhead
 "
 
+# KIMI-K3, TP8, DECODE (M=1). The MXFP4 campaign's shapes.
+#
+# K3 is a NATIVE MXFP4 checkpoint: its whole decode path runs `GemvMxfp4`/`GemvGluMxfp4`, and
+# until `tunedb::gemv::SYMBOLS` gained the quant axis those op cases could not even be spelled,
+# so nothing had ever been measured on them. The sweep now runs a w4a16 arm at every shape below
+# beside the bf16 one, from the SAME object and the same hW, so the pair differs in the ENCODING
+# and nothing else.
+#
+# GEOMETRY: hidden 7168, q_lora 1536, kv_lora 512, qk_rope 64, v_head 128, 96 heads,
+# KDA proj 96*128 = 12288, latent 3584, moe_inter 3072, dense inter 18432, vocab 163840. Under
+# TP8 the HEAD axis and the expert intermediate shard by 8 (nh_l = 12, local KDA proj 1536, local
+# moe_inter 384); the LATENT projections (q_lora, kv_lora, the 3584 routed-expert latent) do NOT
+# shard.
+#
+# Rows, in the order below: KDA q/k/v/g one stream (69 layers); the same unsharded, for the
+# sharding delta; f_a; f_b (K is the SHORT axis, the one shape here that is not HBM-bound);
+# b_proj; o_proj. Then MLA (24 layers): q_a, kv_a, kv_b off the 512 latent. Then MoE (92
+# layers): router, latent down, latent up, shared-expert glu and its down. Then the lm_head
+# tail, the widest single weight in the network.
+#
+# NOT DERIVED FROM `PLOW_TUNE_DUMP` — a stated exception, not a lapse. The census instrument
+# dumps what an emitter RESOLVES, and a K3 decode packet cannot be emitted on this branch yet.
+# These come from the checkpoint's own config, the only source that exists today. Re-derive from
+# the dump the moment K3 decode emits, and expect the four KDA projection rows to collapse into
+# ONE `gemvqkvg` case when it does (`DevOp::GemvQkvg`, four output streams in one packet).
+SHAPES="$SHAPES
+1536 7168     k3-kda-qkvg-one
+12288 7168    k3-kda-proj-unsharded
+128 7168      k3-kda-f-a
+1536 128      k3-kda-f-b
+96 7168       k3-kda-b-proj
+7168 1536     k3-kda-o-proj
+1536 512      k3-mla-kv-b
+512 7168      k3-mla-kv-a
+896 7168      k3-moe-router
+3584 7168     k3-moe-latent-down
+7168 3584     k3-moe-latent-up
+384 7168      k3-moe-shared-glu
+7168 384      k3-moe-shared-down
+163840 7168   k3-lmhead
+"
+
+# Run a SUBSET by label: `PLOW_GEMV_ONLY=k3-` sweeps only the K3 rows. The full list is ~28
+# shapes and the two widest (`k3-lmhead`, `gemma31b-lmhead`) each build a 1.17e9-element mxfp4
+# fixture on the host before the first launch, so an unfiltered run is a long one. The filter is
+# a plain `grep -E` over the LABEL, and an empty setting keeps every row.
+ONLY="${PLOW_GEMV_ONLY:-}"
+
 cd "$OBJ"
 [ -f test_kernels.elf ] || { echo "no test_kernels.elf in $OBJ" >&2; exit 1; }
 
@@ -88,9 +165,24 @@ cd "$OBJ"
 
 rm -f "$JSONL"
 export PLOW_GEMV_JSONL="$JSONL"
+
+# DEVICE PINNING IS `ROCR_VISIBLE_DEVICES`, AND ITS INDEX IS NOT rocm-smi's.
+#
+# This harness is a bare ROCr/HSA binary — it never links HIP — so `HIP_VISIBLE_DEVICES` does
+# NOTHING here and unsetting it (as this line did, alone) leaves the sweep on whatever ROCr calls
+# agent 0. On a shared 8-GPU box with other agents working, that is how a timing run lands on a
+# contended card and reports numbers nobody can use.
+#
+# ROCr enumerates GPU agents in KFD NODE order, while rocm-smi has its own device order, and on
+# this box the two disagree: `ROCR_VISIBLE_DEVICES=5` drives the card rocm-smi calls device 4
+# (node 7), and rocm-smi's device 5 (node 9) is ROCr index 7. VERIFY, do not assume — run the
+# sweep and watch which row in `rocm-smi` goes to 100%. Leaving ROCR_VISIBLE_DEVICES unset here
+# is deliberate: the caller (`scripts/gemv_campaign_lease.sh` via `gpulease -n 1`) exports it to
+# the leased card, and overriding it here would break the lease's guarantee.
 unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
 echo "$SHAPES" | while read -r N K LABEL; do
   [ -z "${N:-}" ] && continue
+  [ -n "$ONLY" ] && { echo "$LABEL" | grep -Eq "$ONLY" || continue; }
   echo "=== $LABEL  N=${N} K=${K}"
   ./gemv_row_sweep "$N" "$K" "$LABEL"
 done

@@ -3,7 +3,7 @@
 //! are `--block` extraction on this path; `run_verified` dispatches on model_type.
 use std::path::Path;
 
-use packet::dev::{DevOp, TENSOR_NONE, WG_THREADS, WG_WAVES};
+use packet::dev::{DevOp, TENSOR_NONE, TENSOR_NONE_I, WG_THREADS, WG_WAVES};
 use packet::devbuild::{Builder, Model};
 use packet::rope::{GenTensor, RopeScale};
 use serde_json::Value;
@@ -608,7 +608,7 @@ fn mxfp4_quant(enc: MoeEnc) -> kernelcaps::QuantScheme {
 
 /// MXFP4 block size: one E8M0 scale byte per 32 packed fp4 values (OCP microscaling). Mirrors the
 /// `>> 5` block index in `op_moe.h`'s A/C staging.
-const MX_BLOCK: u32 = 32;
+pub(crate) const MX_BLOCK: u32 = 32;
 
 /// `GLM_SHARD_HEAD=1` — vocab-column-parallel `lm_head`, and this rank's slice of the vocab.
 ///
@@ -851,7 +851,7 @@ fn glm_glu_halves(cus: &[u32]) -> (Vec<u32>, Vec<u32>) {
 /// `runtime/amd/op_moe.h`: the align op pads each expert's gathered-row range up to a whole tile, so
 /// the padded row bound is `T*k + n_exp*(MPF_BM-1)` and NOT `T*k`. Sizing the gathered arrays from
 /// `T*k` would be an out-of-bounds device write that is invisible at small expert counts.
-const MPF_BM: u32 = 64;
+pub(crate) const MPF_BM: u32 = 64;
 
 /// Router flags: bit0 sigmoid, bit1 norm_topk, bit2 apply e_score_correction_bias to SELECTION
 /// only (DeepSeek/GLM noaux_tc). Mirrors FLAGS in the B4 harness.
@@ -1815,7 +1815,7 @@ fn flash_mla_cus(
 /// `[n0, n1)`, is unchanged and the packet is bit-identical. Under `GV_BLOCKED=0` the interleaved
 /// map covers every column at any `nblk`, so the narrowing stays CORRECT there; it is simply not
 /// the shape it was derived for.
-fn blocked_gemv_cus(cus: &[u32], n: u32) -> Vec<u32> {
+pub(crate) fn blocked_gemv_cus(cus: &[u32], n: u32) -> Vec<u32> {
     let nblk = cus.len() as u32;
     if !wgfit() || nblk == 0 || n == 0 {
         return cus.to_vec();
@@ -1881,14 +1881,16 @@ fn emit_glm_mla(
     // env to "0" to emit the unfused baseline for a before/after measurement. A and G are byte-exact
     // (GemvQkv concatenates output columns — identical per-column dot/wave_sum/f2bf as the split
     // GEMVs); B1 is algebraically exact (AddNorm reduces over the un-rounded sum — see note below).
-    // MXFP4 has no GEMV_QKV twin — the fused op takes three bf16 weight operands and has nowhere to
-    // put three E8M0 scale rows. So the A and G fusions unfuse under it. That is a FUSION loss, not
-    // a precision one: the split GEMVs compute the same columns, which is exactly why fusion A was
-    // introduced as byte-exact in the first place. Cost is 3 extra packets/layer.
+    // MXFP4 now has its own GEMV_QKV twin (`DevOp::GemvQkvMxfp4`, op 110), so A and G fuse under it
+    // as well. The three E8M0 scale rows the fused bf16 op had nowhere to put ride i5/i6/i7 as
+    // TENSOR HANDLES — the demotion `DevOp::GemvQkvg` established, applied to the operand that is
+    // strictly safer to demote than the weight it belongs to (read-only, and a wrong one is off by
+    // a per-block power of two, i.e. visible in the first token). Byte-exact to the split
+    // `GemvMxfp4` calls for the same reason the bf16 pair is byte-exact to its split Gemvs.
     let mx = enc == MoeEnc::Mxfp4;
     let lin_fp8 = glm_linear_fp8(enc);
-    let fuse_a = !mx && std::env::var("PLOW_GLM_FUSE_A").ok().as_deref() != Some("0");
-    let fuse_g = !mx && std::env::var("PLOW_GLM_FUSE_G").ok().as_deref() != Some("0");
+    let fuse_a = std::env::var("PLOW_GLM_FUSE_A").ok().as_deref() != Some("0");
+    let fuse_g = std::env::var("PLOW_GLM_FUSE_G").ok().as_deref() != Some("0");
     // B1 defaults OFF (opt-in): AddNorm reduces over the un-rounded a+b sum, so unlike A/G it is NOT
     // byte-identical to the split Residual+RmsNorm — a reorder-level fp diff that flips one early
     // greedy argmax and cascades. Ship it only behind the HF-coherence gate; PLOW_GLM_FUSE_B1=1 opts in.
@@ -1915,7 +1917,8 @@ fn emit_glm_mla(
         // n = ql + dk + dr concatenated columns; `blocked_gemv_cus` drops the ceiling tail that
         // owns none of them (GLM TP4: 2624 over 256 => slices 239..255 are empty).
         let fa_cus = blocked_gemv_cus(&all, ql + dk + dr);
-        let c_fa = b.emit(DevOp::GemvQkv, fa_cus, &[c_rn1], |d| {
+        let fa_op = if mx { DevOp::GemvQkvMxfp4 } else { DevOp::GemvQkv };
+        let c_fa = b.emit(fa_op, fa_cus, &[c_rn1], |d| {
             d.t[0] = n.qlr;
             d.t[1] = n.xn;
             d.t[2] = w.qad; // q_a   -> Nq=ql
@@ -1928,6 +1931,13 @@ fn emit_glm_mla(
             d.i[2] = h;
             d.i[3] = dk;
             d.i[4] = dr;
+            // The tenth, eleventh and twelfth pointers. `t[8]` holds seven of them; the three
+            // E8M0 scale rows go in the three integer slots op 22 leaves empty, as handles.
+            if mx {
+                d.i[5] = w.qad_s;
+                d.i[6] = w.ckvd_s;
+                d.i[7] = w.krotd_s;
+            }
         });
         (c_fa, c_fa, c_fa)
     } else {
@@ -1952,7 +1962,8 @@ fn emit_glm_mla(
     //   selects the interleaved template; q is not cached (out_row0/stride 0).
     let (c_qa, c_qrr) = if fuse_g {
         let fg_cus = blocked_gemv_cus(&all, nh_l * dk + nh_l * dr);
-        let c_fg = b.emit(DevOp::GemvQkv, fg_cus, &[c_rnq], |d| {
+        let fg_op = if mx { DevOp::GemvQkvMxfp4 } else { DevOp::GemvQkv };
+        let c_fg = b.emit(fg_op, fg_cus, &[c_rnq], |d| {
             d.t[0] = n.qa;
             d.t[1] = n.qlat;
             d.t[2] = w.wqa; // q_nope   -> Nq=nh_l*dk
@@ -1965,6 +1976,14 @@ fn emit_glm_mla(
             d.i[2] = ql;
             d.i[3] = nh_l * dr;
             d.i[4] = 0;
+            // The TWO-STREAM form. `i7` must carry the sentinel and not be left 0: 0 is a legal
+            // handle, and the arm's absence check is what stops a packet missing a scale row from
+            // running a narrower sweep than it names.
+            if mx {
+                d.i[5] = w.wqa_s;
+                d.i[6] = w.wqr_s;
+                d.i[7] = TENSOR_NONE_I;
+            }
         });
         (c_fg, c_fg)
     } else {
@@ -2723,17 +2742,36 @@ fn emit_glm_block_prefill(
     // 16 shared expert gate|up — GemmGlu, the T-row twin of decode's GemvGlu (same operand slots,
     //    M in i[0]). Column-parallel: this rank's imoe_l lanes. Routing-independent, so it gates
     //    only on the post-attn norm and overlaps the whole router/align/expert chain.
-    // MXFP4 has no GemmGluMxfp4 — decode has a fused GLU arm (op 92), prefill does not. So the pair
-    // UNFUSES into two GemmMxfp4 plus a Glu (op 5), which is still all-MXFP4: precision and fusion
-    // are orthogonal, and this is the one place in the packet where the encoding costs an extra HBM
-    // round-trip of [T, imoe_l] rather than only a different weight fetch. A fused arm would remove
-    // it; nothing about correctness waits on that.
-    // BLOCK-FP8 (GLM_LINEAR_FP8) unfuses for the SAME reason as MXFP4 and by the same shape: there
-    // is no `GemmGluFp8Blk`, so gate and up are two `GemmFp8Blk` (107) against the checkpoint's own
-    // fp8 bytes + [128,128] weight_scale_inv, with an explicit `Glu`. Same operand slots, same
-    // `n.shfu_up`. This is the T-row arm the decode side has had as op 47 all along.
+    // MXFP4 now HAS a fused prefill arm (`DevOp::GemmGluMxfp4`, op 109), the T-row twin of decode's
+    // op 92, so the pair fuses whenever 256x256 is the winning fp4 rung for this shape — the same
+    // test the bf16 path applies, because the epilogue is instantiated at that tile only. When a
+    // narrower rung wins the pair still UNFUSES into two GemmMxfp4 plus a Glu (op 5): that is a
+    // tile decision, not a precision one, and `glu_fusion_wins_mxfp4` prices it (the unfused triple
+    // materialises gate AND up to HBM and reads both back — ~8 B per output element).
+    // BLOCK-FP8 (GLM_LINEAR_FP8) still unfuses ALWAYS, because there is no `GemmGluFp8Blk`: gate
+    // and up are two `GemmFp8Blk` (107) against the checkpoint's own fp8 bytes + [128,128]
+    // weight_scale_inv, with an explicit `Glu`. Same operand slots, same `n.shfu_up`. This is the
+    // T-row arm the decode side has had as op 47 all along. Its fused twin is NOT the same edit as
+    // the mxfp4 one: an arbitrary-f32 block scale must be PROMOTED into a second f32 accumulator
+    // every 128 K rather than folded into the convert, so a fused gate|up would need TWO promotion
+    // sets on top of two accumulators and cannot be built at 8 waves (see `d_gemm_fp8_blk`'s note
+    // on why that family has one tile rung at all). MXFP4 has no such cost — its E8M0 scale folds
+    // into the cvt exactly — which is why the fp4 arm falls out and the block-fp8 one does not.
     let lin_fp8 = glm_linear_fp8(enc);
-    let c_shglu = if enc == MoeEnc::Mxfp4 || lin_fp8 {
+    let c_shglu = if enc == MoeEnc::Mxfp4 && glu_fusion_wins_mxfp4(t, imoe_l, h, n_cu) {
+        b.emit(DevOp::GemmGluMxfp4, all.clone(), &[c_rn2], |d| {
+            d.t[0] = n.shfu;
+            d.t[1] = n.xn2;
+            d.t[2] = w.shg;
+            d.t[3] = w.shg_s;
+            d.t[4] = w.shu_s;
+            d.t[5] = w.shu;
+            d.i[0] = t;
+            d.i[1] = imoe_l;
+            d.i[2] = h;
+            d.i[5] = GLM_ACT_SILU;
+        })
+    } else if enc == MoeEnc::Mxfp4 || lin_fp8 {
         let (c_g, c_u) = if lin_fp8 {
             (
                 emit_pf_gemm_fp8_blk(b, &all, n.shfu, n.xn2, w.shg, w.shg_s, t, imoe_l, h, &[c_rn2]),
@@ -6104,6 +6142,387 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
 /// specific, accurate statement of what is not implemented rather than an `Option::unwrap` panic
 /// three crates deep (which is what `kimi_k3` produced before: `crates/devgen/src/config.rs:93`,
 /// because the `text_config` probe routed it into the Gemma-4 parser).
+/// Emit the full K3 decode blob. `K3_FULL=1` selects this; the default stays
+/// the capability report in [`kimi_k3_emit`], which is still the honest answer
+/// for anyone who has not read what is missing.
+///
+/// `K3_NLAYERS` truncates, and it is what makes iteration affordable — the same
+/// role `GLM_NLAYERS` plays. **0..3 is the minimum honest span**: 0/1/2 are KDA
+/// and 3 is the first MLA, so anything shorter does not exercise the hybrid at
+/// all. Truncation shrinks the tensor table, so a short model loads in seconds
+/// instead of paying the full-checkpoint load.
+///
+/// What this does NOT yet do, and what will therefore fail at LOAD rather than
+/// here: the host-side mxfp4 expert bind (`bind_packed_experts` knows
+/// `.weight` + `.weight_scale_inv`, K3 ships `weight_packed` + `weight_scale`)
+/// and the Mixtral `w1/w2/w3` expert-name template. Both fail loudly with a
+/// missing weight, which is the right failure — but they are why this is gated
+/// rather than default.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn k3_emit_full(
+    dir: &Path,
+    ctx: u32,
+    out: &str,
+    n_cu: u32,
+    tp: u32,
+    rope_gen: bool,
+    verify: Option<&crate::VerifyHook>,
+    l2_layout: Option<packet::devbuild::L2Layout>,
+) {
+    let c = cfg_kimi_k3(dir);
+    let pf = k3_prefill_buckets(ctx);
+    let mut m = k3_build_model(dir, ctx, n_cu, tp, &pf, l2_layout);
+    k3_ablate_bodies(&mut m);
+    // Leave the position tables as GENERATED tensors unless asked to bake them.
+    // The runtime materialises them at load (`exec/amd.rs` `g.generate()`), and
+    // `DevBlob::parse` refuses a gen tensor it cannot produce, so nothing is
+    // taken on trust. Baking is `--no-rope-gen`.
+    //
+    // It matters more here than anywhere else in the tree: K3 is NoPE, so its
+    // table is the IDENTITY — cos = 1, sin = 0. Baking writes
+    // `ctx * qk_rope * 2B * 2` bytes of ones and zeros into the blob, which at
+    // ctx 131072 is 33.5 MiB of constants, and it is the ONLY thing in a K3
+    // blob that grows with context.
+    if !rope_gen {
+        m.bake_gen();
+    }
+    let layers = k3_emit_layers(&c);
+    // COVERAGE GATE — and the reason it is here is a bug it would have caught on day one.
+    //
+    // `checkpoint::validate_coverage` is bidirectional and fatal, and its own header names
+    // Kimi-K3 as the case it was written for. It was reachable only from the dense path
+    // (`lib.rs`); THIS function went straight from `apply_verify_gate` to `fs::write`. So when
+    // the model-level `_apply_output_attn_res` was never emitted, its two weights
+    // (`output_attn_res_{norm,proj}`) sat in the checkpoint claimed by nothing, every per-layer
+    // golden test stayed green, all 8 ranks agreed, and the model decoded one constant token
+    // forever. A missing OP is invisible; the weight it fails to read is not.
+    //
+    // The gate is run on the DECLARED names before the blob is written, so a program that would
+    // drop a weight never reaches disk to be benchmarked by someone else.
+    //
+    // Truncation is passed through as `block`: under `K3_NLAYERS` the other layers' weights are
+    // legitimately uncovered, and without this every truncated emit would read as "an
+    // architecture this emitter does not implement".
+    let truncated = (layers.len() as u32) < c.layers;
+    match crate::checkpoint::validate_coverage(
+        dir,
+        K3_PREFIX,
+        &m.tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+        truncated.then(|| 0..layers.len()),
+        K3_INDIRECT,
+        K3_PAIRED,
+        K3_SYNTHESIZED,
+    ) {
+        Ok(()) => {}
+        Err(e) if std::env::var("PLOW_SKIP_COVERAGE").ok().as_deref() == Some("1") => {
+            eprintln!("*** PLOW_SKIP_COVERAGE=1 — EMITTING A MODEL KNOWN TO BE WRONG ***\n{e}");
+        }
+        Err(e) => {
+            eprintln!("kimi_k3: {e}");
+            std::process::exit(1);
+        }
+    }
+    // Gate BEFORE the bytes land: a rejected program must never exist on disk.
+    crate::apply_verify_gate(&m, verify);
+    std::fs::write(out, m.to_blob()).expect("write k3 devblob");
+    eprintln!(
+        "kimi_k3: emitted {} layers ({} KDA, {} MLA), tp={tp}, {} tensors, {} decode \
+         instructions -> {out}\n  prefill buckets {pf:?} ({} programs incl. decode), ctx={ctx}",
+        layers.len(),
+        layers.iter().filter(|&&l| matches!(c.attn[l as usize], K3Attn::Kda)).count(),
+        layers.iter().filter(|&&l| !matches!(c.attn[l as usize], K3Attn::Kda)).count(),
+        m.tensors.len(),
+        m.progs.last().map(|p| p.insts.len()).unwrap_or(0),
+        m.progs.len(),
+    );
+}
+
+/// The 0-based layer span a K3 emit covers. `K3_NLAYERS` truncates it, and BOTH program kinds are
+/// built from this one list, so a truncation cannot leave prefill and decode at different depths.
+/// Kimi-K3's coverage waivers — the only checkpoint tensors a correct K3 blob leaves undeclared.
+///
+/// Each names a mechanism that DOES read the bytes; see `validate_coverage`'s `indirect`
+/// contract. Adding an entry here is how a missing op gets hidden, so an addition needs the
+/// mechanism, not a plausible story about the weight being unused.
+/// Kimi-K3's checkpoint prefix. K3 nests its text tower under a multimodal wrapper, so of the
+/// checkpoint's 497,052 language-tower tensors ZERO start with `model.`.
+///
+/// Shared by the emitter and the coverage gate deliberately: `validate_coverage` filters BOTH
+/// sides by the prefix, so a prefix that matches nothing compares two empty sets and passes. A
+/// gate keyed on a second copy of this string would silently stop gating the moment the two
+/// drifted — which is the same class of failure the gate exists to catch.
+pub(crate) const K3_PREFIX: &str = "language_model.model.";
+
+/// Kimi-K3's coverage waivers — the only checkpoint tensors a correct K3 blob leaves undeclared.
+/// Names a K3 blob declares that the CHECKPOINT does not ship, because they are produced before
+/// the bind. The mirror of [`K3_INDIRECT`]; same rule — each entry names a producer.
+const K3_SYNTHESIZED: &[&str] = &[
+    // `fold_res_score` (plowrt exec/amd.rs:1912) computes this [H] f32 at load from the
+    // checkpoint's `_res_norm`/`_res_proj` pair. It is the twin of the `_res_{norm,proj}`
+    // waivers below: one mechanism, one weight consumed, one weight produced.
+    "_res_score.weight",
+    // Supplied by scripts/kimi_k3_prep.py's `--derived` sidecar, which `shard_files` above
+    // deliberately cannot see: it accepts only `model.safetensors` and `model-{i}-of-{n}`, and
+    // the sidecar is named `model-idx-derived-*.safetensors` precisely so the COMPILER ignores it
+    // while the RUNTIME (which globs every `*.safetensors`) picks it up. So devgen cannot check
+    // these here even though they are present on disk at serve time.
+    "derived.",
+];
+
+/// Conditional waivers — covered only if the consumer is emitted. See `validate_coverage`'s
+/// `paired` contract for why these are NOT flat entries in [`K3_INDIRECT`].
+///
+/// `fold_res_score` turns each `{stem}_res_norm.weight` + `{stem}_res_proj.weight` pair into one
+/// `{stem}_res_score.weight`. Three stems exist: `self_attention`, `mlp`, and the model-level
+/// `output_attn` — and it was the third whose op went missing. Keying on the produced name means
+/// dropping that op un-covers its two weights and fails the emit, which is the whole point.
+const K3_PAIRED: &[(&str, &str)] = &[
+    ("_res_norm.weight", "_res_score.weight"),
+    ("_res_proj.weight", "_res_score.weight"),
+];
+
+const K3_INDIRECT: &[&str] = &[
+    ".experts.",           // bind_packed_experts, by name pattern (494,592 tensors)
+    "q_b_proj.weight",     // absorbed host-side into derived.{q_absorb,q_rope}
+    "kv_b_proj.weight",    // absorbed host-side into derived.{q_absorb,v_absorb}
+];
+
+fn k3_emit_layers(c: &K3Cfg) -> Vec<u32> {
+    let nl = std::env::var("K3_NLAYERS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(c.layers)
+        .min(c.layers);
+    (0..nl).collect()
+}
+
+/// [`k3_emit_full`]'s model, with the prefill ladder as a PARAMETER rather than an environment
+/// read, and without the file I/O.
+///
+/// The seam is a parameter for the reason `emit_kda_mixer_ex`'s is: a test that flips an env var
+/// races every other test in the binary. It also lets the decode-identity gate build the SAME
+/// model twice, once with an empty ladder and once with a full one, and compare the decode
+/// program byte for byte — which is the only way to state "the ladder did not move decode" as a
+/// fact rather than a hope.
+/// BODY ABLATION, and it is a MEASUREMENT INSTRUMENT that produces WRONG TOKENS.
+///
+/// `PLOW_K3_ABLATE=<opcode>[,<opcode>...]` rewrites the named ops to `Nop` **after** the graph is
+/// built, so `stream`, `waits`, `succs`, the counter count and every packet's dispatch width are
+/// byte-for-byte what they were — the ONLY thing that goes away is the op's body. Subtracting the
+/// ablated run from the full one is therefore that op family's BODY time, the way
+/// `PLOW_CHAIN_BYPASS` isolates its CHAIN DEPTH. The two answer different questions and this tree
+/// had only the second one on AMD: `PLOW_NV_ABLATE_LO/HI` is NVIDIA-only
+/// (`scripts/tune_decode_sweep.sh:399`), which is why K3's per-layer cost had never been attributed.
+///
+/// Consumers read stale buffers, so tokens are garbage. That is intended and is the same standing
+/// as `PLOW_CHAIN_BYPASS`: wrong numerics are a valid instrument for scheduling and for cost.
+fn k3_ablate_bodies(m: &mut Model) {
+    let Ok(spec) = std::env::var("PLOW_K3_ABLATE") else { return };
+    let want: Vec<u16> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    if want.is_empty() {
+        return;
+    }
+    let mut hit = 0usize;
+    for p in m.progs.iter_mut() {
+        for i in p.insts.iter_mut() {
+            if want.contains(&i.op) {
+                i.op = packet::dev::DevOp::Nop as u16;
+                hit += 1;
+            }
+        }
+    }
+    eprintln!("  PLOW_K3_ABLATE: {hit} instruction(s) rewritten to Nop — TOKENS ARE GARBAGE, this is a cost instrument");
+}
+
+/// FlashMLA's decode `nsplit` for K3, and the reason it is not simply `glm_nsplit`.
+///
+/// The work-item count is `(nh_l / gf) * nsplit`, which at TP8 is `3 * nsplit` — so `nsplit = 4`
+/// dispatches **12** items and leaves 244 of 256 workgroups empty on all 24 MLA layers. Splitting
+/// the KV range further is the only way to fill the machine on this op.
+///
+/// It is NOT a free widening: `MlaMergeFold` reduces over the `nsplit` partials, so the merge grows
+/// as the flash shrinks and the net is a U-shape whose minimum `mla.rs`'s own `NS_CEIL_MEASURED`
+/// note records as UNSWEPT at TP8. `PLOW_K3_NS` is therefore the sweep handle and the default is
+/// the measured winner; do not change the default without re-running the sweep.
+fn k3_nsplit(ctx: u32) -> u32 {
+    if let Some(v) = std::env::var("PLOW_K3_NS").ok().and_then(|v| v.parse::<u32>().ok()) {
+        return v.max(1);
+    }
+    let _ = ctx;
+    // SWEPT on the real TP8 asset at ctx 8000, 32 steps, fp8 KV, everything else fixed:
+    //   ns  4 -> 42.226 ms/token   (flash dispatched on 12 of 256 workgroups)
+    //   ns 16 -> 39.700 ms/token   (48)
+    //   ns 32 -> 39.582 ms/token   (96)
+    // 16 and 32 are tied inside run-to-run spread, which is the U-shape this doc predicts: the
+    // flash keeps getting more parallel while `MlaMergeFold` reduces over more partials. 16 is the
+    // knee — same time as 32 for half the `o_part`/`ml_part` scratch.
+    16
+}
+
+fn k3_build_model(
+    dir: &Path,
+    ctx: u32,
+    n_cu: u32,
+    tp: u32,
+    pf: &[u32],
+    l2_layout: Option<packet::devbuild::L2Layout>,
+) -> Model {
+    use crate::k3::{K3MlaCfg, K3ModelCfg, K3MoeCfg};
+    let c = cfg_kimi_k3(dir);
+    let layers = k3_emit_layers(&c);
+
+    let mcfg = K3ModelCfg {
+        block: crate::k3::K3BlockCfg {
+            hidden: c.hidden,
+            eps: c.eps,
+            attn_res_block_size: c.attn_res_block,
+            situ_beta: c.situ_beta as f32,
+            situ_linear_beta: c.situ_linear_beta as f32,
+        },
+        kda: crate::kda::KdaCfg {
+            hidden: c.hidden,
+            heads: c.kda_heads,
+            head_dim: c.kda_head_dim,
+            conv_w: c.kda_conv,
+            gate_lower_bound: Some(c.kda_gate_lower_bound as f32),
+            eps: c.eps,
+            // BV must shrink with the local head count or the state step strands
+            // the chip: at tp8 (12 heads) a fixed 16 gives 96 of 256 items.
+            bv: if tp >= 8 { 8 } else { 16 },
+        },
+        mla: K3MlaCfg {
+            hidden: c.hidden,
+            heads: c.heads,
+            q_lora: c.q_lora,
+            kv_lora: c.kv_lora,
+            qk_rope: c.qk_rope,
+            v_head: c.v_head,
+            eps: c.eps,
+            scale: 1.0 / ((c.qk_nope + c.qk_rope) as f32).sqrt(),
+            n_split: k3_nsplit(ctx),
+            gf: 4,
+            fp8_kv: std::env::var("PLOW_FP8_KV").ok().as_deref() == Some("1")
+                || std::env::var("PLOW_KV_FP8").ok().as_deref() == Some("1"),
+        },
+        moe: K3MoeCfg {
+            hidden: c.hidden,
+            latent: c.moe_latent,
+            moe_inter: c.moe_inter,
+            shared_inter: c.shared_exp * c.moe_inter,
+            n_exp: c.n_exp,
+            top_k: c.top_k,
+            route_flags: u32::from(c.router_sigmoid) | (u32::from(c.renormalize) << 1),
+            route_scale: c.route_scale,
+            n_group: c.n_group,
+            topk_group: c.topk_group,
+            enc: MoeEnc::Mxfp4 as u32,
+            // The grouped ops passed the full TP8 K3 gate at 4K+16: 103.161 -> 62.893 ms/token,
+            // with all 17 dumped logit vectors byte-identical. Keep `0` as the reproducible
+            // baseline arm; every other spelling, including unset, ships the measured winner.
+            group_decode: std::env::var("K3_MOE_GROUP").ok().as_deref() != Some("0"),
+        },
+        vocab: c.vocab,
+        first_k_dense: c.first_k_dense,
+        dense_inter: c.dense_inter,
+        prefix: K3_PREFIX.into(),
+        tp,
+    };
+
+    // THE PROGRAM SET: one per prefill rung, then decode. `k3_emit_full` used to set
+    // `prog_t: vec![1]` — decode only — which means a prompt longer than one token has NOTHING to
+    // run and the runtime walks it through the decode program a token at a time
+    // (`AmdServe::prefill`'s `decode_only` arm, one dispatch per prompt token). That is the whole
+    // of TTFT, and with the host phase now measured at 3% of a decode token it is the largest
+    // remaining serving gap on this path.
+    //
+    // DECODE IS BUILT FIRST, and the order is load-bearing rather than tidy. Every program in a
+    // blob shares ONE tensor table; `Builder::set_tensor_dedup` lets a later builder adopt the
+    // previous table and get the SAME handle back for a name it re-declares, growing the byte
+    // count to the max. Building decode into an empty table means its handles are exactly what a
+    // decode-only emit produced, so every instruction of the decode program is byte-identical and
+    // the buckets can only APPEND (`k3_decode_program_is_unchanged_by_the_prefill_ladder` pins
+    // it). The `progs` vector is reordered to buckets-then-decode below, because that is the
+    // convention `Model::prog_t` and `manifest` read.
+    let mut tensors: Vec<packet::devbuild::TensorDecl> = Vec::new();
+    let mut gen = Vec::new();
+    let mut built: Vec<packet::devbuild::Program> = Vec::new();
+    let slot_rows = pf.iter().copied().max().unwrap_or(1);
+    for (i, &t) in std::iter::once(&1u32).chain(pf.iter()).enumerate() {
+        let mut b = Builder::new(n_cu);
+        b.set_tensor_dedup(true);
+        // PLOW_L2_PLACE: `None` => byte-identical. Until this line the flag reached the dense-GQA
+        // builders only, and `kimi_k3` is absent from the arch list that warns about being
+        // ignored (`lib.rs:4327`), so setting it on K3 was a silent no-op.
+        b.set_l2_placement(l2_layout);
+        b.adopt_tensors(tensors.clone());
+        crate::k3::emit_k3_model(
+            &mut b,
+            &mcfg,
+            &|l| matches!(c.attn[l as usize], K3Attn::Kda),
+            &layers,
+            ctx,
+            t,
+            slot_rows,
+            n_cu,
+        );
+        // Every builder re-declares the same NoPE recipes and, under dedup, gets the same handles,
+        // so any one of the lists is the whole set. Take the first — decode's — because it is the
+        // one a decode-only emit would also have produced.
+        if i == 0 {
+            gen = b.gen_tensors();
+        }
+        let prog = b.finish();
+        tensors = prog.tensors.clone();
+        built.push(prog);
+    }
+    // buckets ascending, decode LAST — the order `Model::prog_t` and `manifest.rs` both assume
+    // (`prog_t`'s last entry is the decode program; everything before it is a prefill bucket).
+    let decode = built.remove(0);
+    built.push(decode);
+    let prog_t: Vec<u32> = pf.iter().copied().chain(std::iter::once(1)).collect();
+
+    Model {
+        n_cu,
+        target: 0,
+        tensors,
+        progs: built,
+        kv_row_insts: Vec::new(),
+        prog_t,
+        gen,
+    }
+}
+
+/// The prefill rungs a K3 emit builds programs for.
+///
+/// `T` is a COMPILE-TIME constant of a packet, so the ladder is the only way a 20-token prompt and
+/// a 4096-token one can both avoid paying for the other's program. The rungs are GLM's — this
+/// family's prefill object is gfx950-only and there is no K3 measurement to place treads with, so
+/// re-deriving them here would be guessing.
+///
+/// ON BY DEFAULT, unlike `PLOW_MLA_PREFILL`. That knob is off because the GLM MLA prefill arm can
+/// be built at an ATTENTION-ONLY scope that never writes `act.logits` — a blob whose prefill
+/// programs cannot sample while `Engine::has_prefill()` is true. K3 has no such scope: every
+/// bucket here is a whole model, embed through argmax, so there is no half-built state to opt into.
+///
+///   * unset / `1` / `full` — the whole ladder, capped at `ctx`;
+///   * `0`                  — decode only, byte-identical to before this path existed;
+///   * `512,1024`           — those rungs only.
+///
+/// The list form is not cosmetic: every activation is declared for the WIDEST bucket, and
+/// `act.pf.moe.part` alone is `T * top_k * latent` f32 — **1.9 GiB at T = 8192** on the shipped
+/// geometry. A deployment that will only ever see 1k prompts should not pay for the 8192 rung.
+pub(crate) fn k3_prefill_buckets(ctx: u32) -> Vec<u32> {
+    match std::env::var("K3_PREFILL").ok().as_deref() {
+        Some("0") => Vec::new(),
+        None | Some("") | Some("1") | Some("full") => glm_prefill_buckets(ctx),
+        Some(list) => list
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .filter(|&x| x > 1 && x <= ctx)
+            .collect(),
+    }
+}
+
 pub(crate) fn kimi_k3_emit(dir: &Path, ctx: u32, tp: u32, block_spec: Option<&str>) -> ! {
     let c = cfg_kimi_k3(dir);
     let (hdrs, have, total) = k3_shard_headers(dir);
@@ -6393,6 +6812,142 @@ mod kimi_k3_tests {
         );
         assert_eq!((c.n_mla(), c.n_kda()), (2, 4));
         assert_eq!(c.attn.len(), c.layers as usize);
+    }
+
+
+    /// A checkpoint DIRECTORY holding the miniature config, for the two tests that drive
+    /// `k3_build_model` end to end. There is no K3 checkpoint on this machine — only weights are
+    /// missing, and `k3_build_model` never reads any.
+    fn k3_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("plow_k3_{name}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // head_dim 64, not the fixture's 32: `emit_kda_mixer` refuses a head_dim that is not a
+        // multiple of the 64-lane wave, and these two tests are the only ones here that EMIT.
+        let cfg = k3_json(&[("text_config/linear_attn_config/head_dim", "64")]);
+        std::fs::write(d.join("config.json"), cfg.to_string()).unwrap();
+        d
+    }
+
+    /// **THE DECODE PROGRAM IS UNCHANGED BY THE PREFILL LADDER — byte for byte.**
+    ///
+    /// This is the whole reason decode is built FIRST into an empty tensor table. Every program in
+    /// a blob shares one table, so a bucket that declared a handle ahead of decode would renumber
+    /// every `t[]` slot in the decode program: same graph, different bytes, and a regression no
+    /// op-census test would see. Building decode first means the buckets can only APPEND.
+    ///
+    /// It compares the SERIALIZED instruction stream, not an op count. `DevInst` carries the
+    /// tensor handles, the immediates and the counter wiring; two programs whose op sequences agree
+    /// can still differ in every one of those.
+    #[test]
+    fn the_prefill_ladder_leaves_the_decode_program_byte_identical() {
+        let d = k3_dir("ladder");
+        let bare = k3_build_model(&d, 4096, 256, 1, &[], None);
+        let laddered = k3_build_model(&d, 4096, 256, 1, &[128, 512, 1024], None);
+
+        assert_eq!(bare.prog_t, vec![1], "no ladder ⇒ decode only, as before this path existed");
+        assert_eq!(laddered.prog_t, vec![128, 512, 1024, 1], "buckets ascending, decode LAST");
+        assert_eq!(laddered.progs.len(), 4);
+
+        let a = bare.progs.last().unwrap();
+        let b = laddered.progs.last().unwrap();
+        assert_eq!(a.insts.len(), b.insts.len(), "decode op count moved");
+        for (i, (x, y)) in a.insts.iter().zip(b.insts.iter()).enumerate() {
+            assert_eq!(x.op, y.op, "decode inst {i}: opcode");
+            assert_eq!(x.t, y.t, "decode inst {i}: tensor handles renumbered");
+            assert_eq!(x.i, y.i, "decode inst {i}: immediates");
+            assert_eq!(x.f, y.f, "decode inst {i}: floats");
+            assert_eq!(x.blocks, y.blocks, "decode inst {i}: block count");
+        }
+        assert_eq!(a.stream, b.stream, "decode per-CU streams");
+        assert_eq!(a.waits, b.waits, "decode counter waits");
+        assert_eq!(a.succs, b.succs, "decode counter successors");
+
+        // The shared table is a SUPERSET whose common prefix is decode's own, in order — that is
+        // what makes the handles above stable. Sizes GROW (activations are declared for the widest
+        // bucket); names and order do not move.
+        for (i, td) in bare.tensors.iter().enumerate() {
+            assert_eq!(td.name, laddered.tensors[i].name, "tensor {i} moved");
+            assert!(laddered.tensors[i].bytes >= td.bytes, "tensor {} shrank", td.name);
+        }
+        assert!(laddered.tensors.len() > bare.tensors.len(), "buckets declare their own scratch");
+        // And the ladder actually widened the shared activations rather than merely appending.
+        let ring = |m: &Model| m.tensors.iter().find(|t| t.name == "kv.blkres").unwrap().bytes;
+        assert_eq!(ring(&laddered), 1024 * ring(&bare), "the ring is [T][nb_cap][hidden]");
+    }
+
+    /// Every program must address the same peer slot B. The host has one peer layout for the
+    /// whole blob and binds `act.dg_tp` at the blob-wide offset; a per-program `t*hidden*2`
+    /// immediate makes decode reduce unrelated memory whenever a prefill ladder is present.
+    #[test]
+    fn k3_tp_peer_slot_is_program_invariant() {
+        let d = k3_dir("tp_slot");
+        let m = k3_build_model(&d, 4096, 256, 2, &[128, 512], None);
+        let hidden = cfg_kimi_k3(&d).hidden;
+        let want = 512 * hidden * 2;
+        for (pi, p) in m.progs.iter().enumerate() {
+            let slots: std::collections::BTreeSet<u32> = p
+                .insts
+                .iter()
+                .filter(|i| {
+                    i.op == DevOp::XReduce as u16 || i.op == DevOp::XReduceTwoShot as u16
+                })
+                .map(|i| i.i[2])
+                .collect();
+            assert_eq!(
+                slots,
+                [0, want].into_iter().collect(),
+                "program {pi} (T={}) disagrees with the blob-wide peer layout",
+                m.prog_t[pi]
+            );
+        }
+    }
+
+    /// The ladder itself: rungs are capped at `ctx`, and `K3_PREFILL=0` is the identity.
+    ///
+    /// The cap is not cosmetic — a program for `T > ctx` can never be invoked, and every
+    /// activation in the blob is declared for the WIDEST bucket, so an uncapped ladder charges a
+    /// 4k-context deployment for an 8192-row program it cannot run.
+    #[test]
+    fn the_prefill_ladder_is_capped_at_the_context() {
+        assert_eq!(k3_prefill_buckets(131072), vec![128, 512, 1024, 2048, 4096, 8192]);
+        assert_eq!(k3_prefill_buckets(2048), vec![128, 512, 1024, 2048]);
+        assert_eq!(k3_prefill_buckets(64), Vec::<u32>::new(), "no rung fits — decode only");
+    }
+
+    /// Every bucket is a WHOLE MODEL: embed through argmax, with the grouped-MoE FFN.
+    ///
+    /// GLM's `PLOW_MLA_PREFILL=1` has an attention-only scope that stops at the post-attention
+    /// norm and never writes `act.logits` — and `Engine::has_prefill()` is still true, so the
+    /// runtime selects those programs and samples from a buffer nothing wrote. There is no such
+    /// scope here, and this is what says so.
+    #[test]
+    fn every_prefill_bucket_is_a_whole_model() {
+        let d = k3_dir("whole");
+        let m = k3_build_model(&d, 4096, 256, 1, &[128, 512], None);
+        let c = cfg_kimi_k3(&d);
+        for (pi, p) in m.progs.iter().enumerate() {
+            let t = m.prog_t[pi];
+            let n = |o: DevOp| p.insts.iter().filter(|i| i.op == o as u16).count();
+            assert_eq!(n(DevOp::Embed), 1, "prog {pi} (T={t}): no embed prologue");
+            assert_eq!(n(DevOp::ArgmaxFin), 1, "prog {pi} (T={t}): cannot sample");
+            // Two AttnRes mixes on every layer, on every program. An AttnRes present in one bucket
+            // and not another would make the two phases compute DIFFERENT MODELS.
+            // ...and ONE model-level mix (`_apply_output_attn_res`) on every program too — the
+            // site whose absence left `model.norm` reading only the post-snapshot partial sum.
+            assert_eq!(n(DevOp::AttnRes), 2 * c.layers as usize + 1, "prog {pi} (T={t})");
+            // The FFN half is present on both, in the spelling that phase has a kernel for.
+            let moe_layers = (c.layers - c.first_k_dense) as usize;
+            if t == 1 {
+                assert_eq!(n(DevOp::MoeRouterTopk), moe_layers);
+                assert_eq!(n(DevOp::MoeCombine), moe_layers);
+                assert_eq!(n(DevOp::MoeCombinePf), 0);
+            } else {
+                assert_eq!(n(DevOp::MoeRouterTopkPf), moe_layers);
+                assert_eq!(n(DevOp::MoeCombinePf), moe_layers);
+                assert_eq!(n(DevOp::MoeCombine), 0);
+            }
+        }
     }
 
     /// The map is FIRST-CLASS data, not a count: a config whose MLA layers sit at different

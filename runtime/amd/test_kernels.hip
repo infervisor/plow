@@ -105,6 +105,37 @@ GEMM_FP8_VARIANT(gemm_fp8_c3, 128, 128, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c4, 64, 128, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c5, 192, 256, 64) /* the Qwen prefill tile, vs bf16 c5 */
 
+/* MXFP4 (w4a16) GEMM variants — the five SELECTABLE rungs, one kernel each.
+ *
+ * These exist so `runtime/ubench/gemm_tile_sweep.c` can RANK the mxfp4 ladder. Until they did,
+ * `tunedb`'s `RUNGS` table mapped every rung to a `Gemm*Mxfp4` opcode and `plowc tune best
+ * --quant Mxfp4` had a column with nothing in it: the store held 3410 records and every single
+ * one was `quant = None`, because the only mxfp4 GEMM this file exported was `d_gemm_mxfp4_k`,
+ * the 256x256 GOLDEN, which measures one tile and cannot compare five.
+ *
+ * Textually the bf16 `GEMM_VARIANT` with `WFP4=true` and the fp4 operand pair — exactly what
+ * `op_gemm.h`'s `PLOW_GM_MXFP4_TILE` instantiates for the interpreter, so what is measured here
+ * is the body the interpreter runs, at the tile the sweep names. The template arguments are
+ * spelled out to their defaults up to `WFP4` because `WFP4` is the 11th and C++ has no
+ * designated template arguments.
+ *
+ * LDS is the bf16 arena, NOT the fp8 one: w4a16 dequants fp4->bf16 in the B-FETCH and stages
+ * bf16, so a tile occupies the same halves the bf16 rung does. */
+#define GEMM_MXFP4_VARIANT(NAME, BM, BN, BK)                                                 \
+    extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(         \
+        bf16* C, const bf16* A, const unsigned char* W, const unsigned char* wscale,         \
+        unsigned M, unsigned N, unsigned K) {                                                \
+        __shared__ bf16 lds[GM_LDS_HALVES_T(BM, BN, BK)];                                    \
+        d_gemm_t<BM, BN, BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true, false, \
+                 true>(C, A, (const bf16*)W, nullptr, nullptr, M, N, K, blockIdx.x,          \
+                       gridDim.x, lds, nullptr, 0, wscale);                                  \
+    }
+GEMM_MXFP4_VARIANT(gemm_mxfp4_c0, 256, 256, 64)
+GEMM_MXFP4_VARIANT(gemm_mxfp4_c2, 128, 256, 64)
+GEMM_MXFP4_VARIANT(gemm_mxfp4_c3, 128, 128, 64)
+GEMM_MXFP4_VARIANT(gemm_mxfp4_c4, 64, 128, 64)
+GEMM_MXFP4_VARIANT(gemm_mxfp4_c5, 192, 256, 64)
+
 /* NON-POWER-OF-2 macro tiles — the qwen-prefill-gemm sweep. The hypothesis was that a
  * smaller, ARCH-only accumulator (avoiding 256x256's 128 AGPRs and their v_accvgpr
  * bracketing) would raise efficiency. acc regs = (BM/64)*(BN/128)*16 : 192x256->96
@@ -257,11 +288,22 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_e
                               gridDim.x, PLOW_MOE_ENC_FP8BLK);
 }
 
-/* Block-fp8 DENSE MLP gate/up (fused SwiGLU) on named weights — GLM dense layers 0-2. Op 47. */
+/* Block-fp8 DENSE MLP gate/up (fused SwiGLU) on named weights — GLM dense layers 0-2. Op 47.
+ *
+ * The two trailing zeros are the K3 situ betas, which `d_dense_glu_fp8_blk` grew when the
+ * epilogue became `moe_glu(g, u, act, beta, lbeta)`. This golden did not grow with it and the
+ * file stopped compiling; the values are inert for every act but `PLOW_MOE_ACT_SITU`, where
+ * `moe_glu` returns `k3_situ_gate(g, beta) * k3_situ_up(u, lbeta)`. So this wrapper is a golden
+ * for the NON-situ epilogues only, and a situ arm here would need real betas threaded in as
+ * kernel arguments rather than these placeholders. */
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void dense_glu_fp8_blk_k(
     bf16* fu, const bf16* x, const unsigned char* Wg, const unsigned char* Wu, const float* Sg,
     const float* Su, unsigned N, unsigned K, unsigned act) {
-    d_dense_glu_fp8_blk(fu, x, Wg, Wu, Sg, Su, N, K, act, blockIdx.x, gridDim.x);
+    /* beta/lbeta are the GLU's clamp knobs; `0,0` is "unclamped", matching the golden
+     * `moe_expert_glu_fp8_blk_k` wrapper above. They arrived on `d_dense_glu_fp8_blk` with the
+     * MXFP4 MoE work and this wrapper was not moved with them, which left test_kernels.hip
+     * uncompilable — and with it the whole tile-sweep harness, which loads test_kernels.elf. */
+    d_dense_glu_fp8_blk(fu, x, Wg, Wu, Sg, Su, N, K, act, blockIdx.x, gridDim.x, 0.0f, 0.0f);
 }
 
 GEMV_VARIANT(gemma_gemv_bf16, 1) /* the default decode bucket */
@@ -336,7 +378,18 @@ GEMV_VARIANT(gemma_gemv_m16, 16)
 
 /* Fused Q|K|V — the `fuse_qkv` arm, and the one whose UNENFORCED LDS precondition produced
  * §6g-BATCH's third silent-corruption bug (slots 13/14/15 fluent-but-wrong at B=16, because
- * `gemv_qkv_rows` has no global-read arm and exactly 13 of 16 rows fit the arena). */
+ * `gemv_qkvg_rows` has no global-read arm and exactly 13 of 16 rows fit the arena).
+ *
+ * `Ng = 0` with Cg/Wg null is the 3-stream form of the 4-stream body, exactly as `d_gemv_qkv`
+ * forwards into it. Before this, these five variants still called `gemv_qkv_rows` — the name
+ * the body carried BEFORE `DevOp::GemvQkvg` merged it into `gemv_qkvg_rows` — so
+ * `test_kernels.hip` did not compile at all on that commit, and with it went the whole golden
+ * object: every `runtime/tests` golden and both ubench sweeps load `test_kernels.elf`.
+ *
+ * NOT MIRRORED HERE, deliberately: `d_gemv_qkv` now also takes a `K == 7168 -> UN=7` rung (the
+ * commit prices it at 13% of the fusion's win), which these branches do not have. Adding it
+ * would change what the bf16 q|k|v arm measures, so it is left as a stated divergence for the
+ * owner of that body rather than changed underneath a benchmark. */
 #define GEMV_QKV_WALK_VARIANT(NAME, MM)                                                      \
     extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(         \
         bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x, const bf16* Wq, const bf16* Wk,         \
@@ -347,18 +400,23 @@ GEMV_VARIANT(gemma_gemv_m16, 16)
             const bf16* x_ = x + (size_t)m0 * K;                                             \
             for (unsigned i = threadIdx.x; i < M_ * K; i += PLOW_THREADS) lds[i] = x_[i];    \
             __syncthreads();                                                                 \
+            /* `gemv_qkv_rows` became `gemv_qkvg_rows` when the fourth (gate) stream landed;   \
+             * op_gemm.h's own `d_gemv_qkv` is now a forwarder that passes `Cg/Wg = nullptr`   \
+             * and `Ng = 0`, and this golden wrapper takes the same route. It calls the        \
+             * `_rows` template rather than `d_gemv_qkv` because the walk fixes the unroll per  \
+             * K, which the entry point chooses for itself. */                                  \
             if (K == 2560)                                                                   \
-                gemv_qkv_rows<MM, 5>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,             \
-                                     Cv + (size_t)m0 * Nv, Wq, Wk, Wv, M_, Nq, Nk, Nv, K,    \
-                                     blockIdx.x, gridDim.x, lds);                            \
+                gemv_qkvg_rows<MM, 5>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,            \
+                                      Cv + (size_t)m0 * Nv, nullptr, Wq, Wk, Wv, nullptr,    \
+                                      M_, Nq, Nk, Nv, 0u, K, blockIdx.x, gridDim.x, lds);    \
             else if (K == 4096)                                                              \
-                gemv_qkv_rows<MM, 8>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,             \
-                                     Cv + (size_t)m0 * Nv, Wq, Wk, Wv, M_, Nq, Nk, Nv, K,    \
-                                     blockIdx.x, gridDim.x, lds);                            \
+                gemv_qkvg_rows<MM, 8>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,            \
+                                      Cv + (size_t)m0 * Nv, nullptr, Wq, Wk, Wv, nullptr,    \
+                                      M_, Nq, Nk, Nv, 0u, K, blockIdx.x, gridDim.x, lds);    \
             else                                                                             \
-                gemv_qkv_rows<MM, 6>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,             \
-                                     Cv + (size_t)m0 * Nv, Wq, Wk, Wv, M_, Nq, Nk, Nv, K,    \
-                                     blockIdx.x, gridDim.x, lds);                            \
+                gemv_qkvg_rows<MM, 6>(Cq + (size_t)m0 * Nq, Ck + (size_t)m0 * Nk,            \
+                                      Cv + (size_t)m0 * Nv, nullptr, Wq, Wk, Wv, nullptr,    \
+                                      M_, Nq, Nk, Nv, 0u, K, blockIdx.x, gridDim.x, lds);    \
             __syncthreads();                                                                 \
         }                                                                                    \
     }

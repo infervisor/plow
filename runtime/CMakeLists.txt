@@ -570,17 +570,44 @@ option(PLOW_GFX950_HSACO "Emit the gfx950 .hsaco code objects the AMD path loads
 # for a variant the build quietly skipped.
 option(PLOW_HSACO_GQ "Also emit the global-queue (_gq) twins" ON)
 option(PLOW_HSACO_FP8 "Also emit the fp8 w8a16 decode + w8a8 prefill objects" ON)
-option(PLOW_HSACO_FP8KV "Also emit the fp8 e4m3 KV-cache decode object" ON)
+# DECODE + PREFILL + the class-4 flash twin, not just decode — the description said "decode
+# object" long after the other two rows landed, which is the same doc-vs-table drift the block
+# below exists to prevent. What is still NOT composed here is MLA x fp8-KV: every MLA row pairs
+# with fp8(weight)/moe/a4w4/k3 and none with this axis, because there is no `FlashMlaPrefillFp8`
+# to put in one yet. `FlashMlaDecodeFp8` will need no row of its own — the MLA DECODE arm is
+# unconditional, so it already rides `interp_decode_fp8kv`.
+option(PLOW_HSACO_FP8KV "Also emit the fp8 e4m3 KV-cache objects (decode + prefill + flash)" ON)
 option(PLOW_HSACO_MXFP4 "Also emit the MX-FP4 (e2m1 + E8M0) decode object" ON)
 option(PLOW_HSACO_MLA "Also emit the MLA prefill object (Kimi/DeepSeek/GLM)" ON)
-# THE ONE AXIS THAT DEFAULTS OFF, and deliberately against the "one configure emits every
-# object" rule above. The K3/KDA arms are not a variant of a shipping model — no Gemma-4, Qwen or
-# GLM-5.2 packet dispatches a single one of them, and K3 itself is accepted but not yet emittable
-# (crates/plowc/src/hf_config.rs). Defaulting this ON would put seven unreachable arms in the
-# instruction stream of every object those models DO load, in a persistent megakernel where that
-# alone has already cost +32% decode once (runtime/amd/op_attention.h:1282). Turn it on to build
-# K3 objects; the loader refuses a K3 packet against an object built without it.
-option(PLOW_HSACO_K3 "Also emit the Kimi-K3 / KDA objects (decode + prefill)" OFF)
+# WAS THE ONE AXIS THAT DEFAULTED OFF. It now follows the "one configure emits every object" rule
+# with the rest, because the argument for the exception was WRONG — not out of date, wrong when it
+# was written. It read: "defaulting this ON would put seven unreachable arms in the instruction
+# stream of every object those models DO load", citing the +32% decode regression that the mere
+# PRESENCE of the GF=8 flash arm cost (runtime/amd/op_attention.h:1282).
+#
+# This option does not do that and never did. Every `PLOW_HSACO_*` here is `list(APPEND _hs_rows)`
+# — it adds OBJECTS, it does not add defines to the rows already in the list. `interp_decode` and
+# `interp_prefill` carry no `-DPLOW_K3` at any setting of this flag, so a Gemma-4, Qwen or GLM-5.2
+# object is BYTE-IDENTICAL either way. The op_attention precedent is about an arm entering a
+# SHARED object; the K3 arms only ever enter `interp_*_k3`, which only a K3 packet loads.
+#
+# THE MEASUREMENT THE ROWS BELOW SAY THIS AXIS OWED, taken on ROCm 7.2.4/clang-22, gfx950.
+# `interp_prefill_k3_moe*` are the rows this branch adds for the K3 MoE prefill:
+#
+#     object                        bytes    VGPR  occ  spill
+#     interp_decode                287,328    248   2     0
+#     interp_decode_k3             330,008    248   2     0     <- +14.9% size, +0 registers
+#     interp_prefill               216,752    256   2     2
+#     interp_prefill_mla           278,000    256   2     2
+#     interp_prefill_k3            320,168    256   2     2
+#     interp_prefill_k3_moe        385,032    256   2     2
+#     interp_prefill_k3_moe_a4w4   524,296    256   2     6
+#
+# The nine arms cost ZERO registers and zero occupancy — decode holds 248/256 at 0 spill with and
+# without them — so the register-cliff half of the question is settled. The size half is real
+# (+14.9% on decode) and is exactly why these stay SEPARATE OBJECTS rather than becoming defines
+# on the rows above. Cost of the default: ~31 s of build, doubled by the `_gq` twins, and ~3 MB.
+option(PLOW_HSACO_K3 "Also emit the Kimi-K3 / KDA objects (decode + prefill)" ON)
 
 set(PLOW_HSACO_ARCH "gfx950" CACHE STRING "offload arch for the served code objects")
 set(PLOW_HSACO_HIPCC "/opt/rocm/bin/hipcc" CACHE FILEPATH "hipcc used for the served code objects")
@@ -663,8 +690,39 @@ if(PLOW_GFX950_HSACO)
     # KIMI-K3 / KDA. One axis, both buckets: a K3 layer runs the same graph at T=1 and T>1, and an
     # AttnRes present only in decode would make prefill and decode compute different models. The
     # MLA prefill axis comes with it because K3's full-attention layers are MLA.
-    set(_hs_ax_k3 -DPLOW_K3=1)
+    # GV_UNROLL=14 on the K3 rows ONLY. The global default is 11 because that is `nchunk` for
+    # Gemma-31B's K=5376; K3's dominant decode GEMV is K=7168, whose nchunk is exactly 14, so 11
+    # issues two groups with 8 dead slots and starves the in-flight-work the op_gemm.h sweep names
+    # as the sub-ceiling cause. MEASURED on the real TP8 asset, ctx 8000, interleaved repeats:
+    # 39.543 ms/token at 11 vs 39.120 at 14 (-0.42 ms, -1.07%), within-arm spread 0.03 ms. SWEPT, so
+    # 14 is a measured optimum and not a guess from nchunk: UN 7 -> 39.334, 11 -> 39.543,
+    # 14 -> 39.135, 16 -> 39.256 ms/token. The minimum sits exactly at nchunk, which is what the
+    # in-flight-work explanation predicts, and every arm reads VGPR=248 / occ=2 / spill=0. Bit-exact
+    # (unroll changes only how many loads issue before they are consumed, never the accumulation
+    # order) and register-free: interp_decode_fp8kv_k3 stays VGPR=248 / occ=2 / spill=0, because
+    # REPLACING the unroll does not grow the register union the way adding a second arm does.
+    set(_hs_ax_k3 -DPLOW_K3=1 -DGV_UNROLL=14)
     set(_hs_ax_mla_k3 ${_hs_ax_mla} -DPLOW_K3=1)
+    # K3's optional compressed-latent KV uses the same model arms with the fp8-KV swap. These are
+    # separate objects: PLOW_FP8_KV removes the bf16 FlashMLA arm, so composing it into the plain
+    # K3 row would make bf16 packets silently miss their dispatch case.
+    set(_hs_ax_k3_fp8kv ${_hs_ax_k3} ${_hs_ax_fp8kv})
+    set(_hs_ax_mla_k3_fp8kv ${_hs_ax_mla_k3} ${_hs_ax_fp8kv})
+    # ...and the FFN half. A K3 prefill bucket runs the GROUPED expert chain (ops 83-87), not the
+    # per-slot decode ops: at T rows an expert's weights cross HBM once for every token that chose
+    # it. Without PLOW_MOE_PREFILL those five packets fall through the dispatch `default:` and
+    # write NOTHING, which on this interpreter is silent. So `interp_prefill_k3` above is an
+    # ATTENTION-ONLY object and a whole-layer K3 prompt needs one of these two.
+    set(_hs_ax_k3_moe ${_hs_ax_mla_k3} -DPLOW_MOE_PREFILL=1)
+    set(_hs_ax_k3_moe_fp8kv ${_hs_ax_mla_k3_fp8kv} -DPLOW_MOE_PREFILL=1)
+    # THE ROW A K3 PACKET ACTUALLY LOADS. K3 ships MXFP4 experts, and `enc = PLOW_MOE_ENC_MXFP4`
+    # on ops 85/86 selects the A4W4 body — which lives behind PLOW_MOE_PF_A4W4. Without it the arm
+    # takes `moe_pf_refuse` (loud, by design) rather than computing anything. PLOW_MXFP4 rides
+    # along for the same reason `_mla_moe_a4w4_full` carries it: an all-fp4 packet needs the fp4
+    # PROJECTIONS (op 93) in the same object as the fp4 experts, and they were on separate rows.
+    set(_hs_ax_k3_moe_a4w4 ${_hs_ax_k3_moe} -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1)
+    set(_hs_ax_k3_moe_a4w4_fp8kv
+        ${_hs_ax_k3_moe_fp8kv} -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1)
 
     set(_hs_kpf "plow_interp_gfx950")
     set(_hs_kdec "plow_interp_dec_gfx950")
@@ -762,15 +820,25 @@ if(PLOW_GFX950_HSACO)
         endif()
     endif()
     # KIMI-K3 / KDA objects. Both buckets, for the reason the axis note gives. The register
-    # budgets are the ordinary 256/occ-2 the other decode and prefill rows use: if the seven arms
-    # do not fit inside that, the in-build register-cliff gate says so at build time rather than
-    # HSA_STATUS_ERROR_INVALID_ISA at launch — which is the whole point of the gate, and the
-    # measurement this axis still owes (op_attention.h:1282 is why "it fits" is not the question;
-    # the object size and the decode ITL are).
+    # budgets are the ordinary 256/occ-2 the other decode and prefill rows use, and the arms fit
+    # inside them with room: the table at the option above records 248/occ-2/spill-0 for decode,
+    # IDENTICAL to the object without them. The gate stays because a gate that only fires on
+    # regression is doing its job — it turns HSA_STATUS_ERROR_INVALID_ISA at launch into a build
+    # error — and because op_attention.h:1282 is why "it fits" was never the whole question.
     if(PLOW_HSACO_K3)
         list(APPEND _hs_rows
             "interp_decode_k3|${_hs_kdec}|_hs_ax_decode|_hs_ax_k3|256|2"
-            "interp_prefill_k3|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla_k3|256|2")
+            "interp_prefill_k3|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla_k3|256|2"
+            "interp_prefill_k3_moe|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe|256|2"
+            "interp_prefill_k3_moe_a4w4|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_a4w4|256|2")
+        if(PLOW_HSACO_FP8KV)
+            # Variant precedes the model arm in object_name(): interp_*_fp8kv_k3{,_moe...}.
+            list(APPEND _hs_rows
+                "interp_decode_fp8kv_k3|${_hs_kdec}|_hs_ax_decode|_hs_ax_k3_fp8kv|256|2"
+                "interp_prefill_fp8kv_k3|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla_k3_fp8kv|256|2"
+                "interp_prefill_fp8kv_k3_moe|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_fp8kv|256|2"
+                "interp_prefill_fp8kv_k3_moe_a4w4|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_a4w4_fp8kv|256|2")
+        endif()
     endif()
 
     set(_hs_kinds static)

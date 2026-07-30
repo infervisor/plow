@@ -21,9 +21,54 @@
 //! the threshold is derived from the producer's CU set and never hand-written.
 
 use core::mem::size_of;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::dev::{DevInst, DevOp, StreamEnt, Wait, SE_FINE, TENSOR_NONE};
 use crate::rope::GenTensor;
+
+/// Edges that survive transitive reduction: drop A→C when a path A→…→C of
+/// length ≥ 2 exists. `edges` is `(producer, consumer)` over op indices.
+///
+/// Lives here rather than in `plowrt` because BOTH the emitter (which applies
+/// the reduction) and `plowrt disasm --counters` (which reports what it would
+/// save) must compute the same set — two implementations would drift, and the
+/// disassembler's numbers appear in committed `perf-data/` write-ups.
+///
+/// For a DAG the transitive reduction is unique and has the same transitive
+/// closure as the input, so removing every covered edge AT ONCE is safe even
+/// when a justifying path's own edges are also removed: each is in turn covered
+/// by a further path, and acyclicity makes the induction terminate.
+pub fn transitive_reduction(n: usize, edges: &BTreeSet<(u32, u32)>) -> BTreeSet<(u32, u32)> {
+    // Reachability by 2+ hops. The op DAG is emitted in topological order
+    // (producer index < consumer index), so a single reverse sweep suffices.
+    let mut succ: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+    for &(a, b) in edges {
+        succ[a as usize].insert(b);
+    }
+    // reach[a] = every node reachable from a (any distance ≥ 1).
+    let mut reach: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+    for a in (0..n).rev() {
+        let mut r: HashSet<u32> = HashSet::new();
+        for &b in &succ[a] {
+            r.insert(b);
+            for &c in &reach[b as usize] {
+                r.insert(c);
+            }
+        }
+        reach[a] = r;
+    }
+    let mut out = BTreeSet::new();
+    for &(a, b) in edges {
+        // Redundant iff some other direct successor of a reaches b.
+        let redundant = succ[a as usize]
+            .iter()
+            .any(|&m| m != b && reach[m as usize].contains(&b));
+        if !redundant {
+            out.insert((a, b));
+        }
+    }
+    out
+}
 
 /// The tuning-store key for one decode-GEMV shape.
 ///
@@ -247,6 +292,12 @@ pub struct Builder {
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
     /// byte-identical. See [`Builder::set_gemv_split`].
     gemv_split: u32,
+    /// Re-declaring a tensor name returns the existing handle instead of appending.
+    /// `false` (default) ⇒ byte-identical. See [`Builder::set_tensor_dedup`].
+    tensor_dedup: bool,
+    /// Coarse dep edges removed by the transitive reduction in [`Builder::finish`].
+    /// Reported so an emitter can log it; the reduction itself is unconditional.
+    tr_dropped: usize,
 }
 
 impl Builder {
@@ -259,6 +310,8 @@ impl Builder {
             place_l2: None,
             uniseg_denied: false,
             gemv_split: 1,
+            tensor_dedup: false,
+            tr_dropped: 0,
         }
     }
 
@@ -304,8 +357,42 @@ impl Builder {
         self.gemv_split = s.clamp(1, 16);
     }
 
-    /// Declare a tensor and get its handle.
+    /// Re-declaring a name returns the EXISTING handle and grows it to the larger byte count,
+    /// instead of appending a second entry under the same name.
+    ///
+    /// OFF by default, so every emitter in the tree stays byte-identical: with it off `tensor`
+    /// appends unconditionally, and a name collision is the caller's bug.
+    ///
+    /// # Why this is a mode and not the behaviour
+    ///
+    /// It exists for the STACKED emit — one tensor table, several programs (prefill buckets plus
+    /// decode), the shape [`Builder::adopt_tensors`] serves. GLM gets there by hoisting every
+    /// declaration into a `declare_glm_rows` that takes `max_rows`, so the emitters never declare
+    /// anything. Kimi-K3's emitters declare their own scratch inline, per layer, at names that are
+    /// identical across buckets and sizes that are not — and the two phases do not even declare the
+    /// same SET (a prefill bucket has the grouped-MoE row maps, decode has none). Adopting the
+    /// previous program's table and re-emitting then needs exactly this: same name ⇒ same handle,
+    /// bytes ⇒ the max over the programs that asked.
+    ///
+    /// Building DECODE FIRST under this mode is what keeps a decode program byte-identical to a
+    /// decode-only emit: it declares into an empty table, so its handles are its own, and every
+    /// later bucket can only APPEND. The alternative — emitting each program against its own table
+    /// and remapping handles afterwards — cannot be done safely here, because several ops in this
+    /// family carry demoted tensor handles in `i[]` slots (`GemvQkvg`'s `i6`, `KdaConv3`'s
+    /// `i4`/`i5`/`i6`/`i7`, `KdaStateStepG`'s `i5`) that no generic remap can see.
+    pub fn set_tensor_dedup(&mut self, on: bool) {
+        self.tensor_dedup = on;
+    }
+
+    /// Declare a tensor and get its handle. See [`Builder::set_tensor_dedup`] for the
+    /// re-declaration rule.
     pub fn tensor(&mut self, name: &str, bytes: u64) -> u32 {
+        if self.tensor_dedup {
+            if let Some(i) = self.tensors.iter().position(|t| t.name == name) {
+                self.tensors[i].bytes = self.tensors[i].bytes.max(bytes);
+                return i as u32;
+            }
+        }
         self.tensors.push(TensorDecl { name: name.to_string(), bytes, init: None });
         (self.tensors.len() - 1) as u32
     }
@@ -323,6 +410,18 @@ impl Builder {
     pub fn tensor_gen(&mut self, name: &str, bytes: u64, mut recipe: GenTensor) -> u32 {
         let h = self.tensor(name, bytes);
         recipe.tensor = h;
+        // Under `set_tensor_dedup` a re-declared name gives back the SAME handle, so a second
+        // recipe for it would be a duplicate the blob writer has to materialise twice. Keep the
+        // first — the two are equal by construction (same name, same recipe) or the caller has a
+        // bug the assert below names.
+        if let Some(old) = self.gen.iter().find(|g| g.tensor == h) {
+            assert_eq!(
+                old.byte_len(),
+                recipe.byte_len(),
+                "tensor_gen: `{name}` re-declared with a recipe of a different length"
+            );
+            return h;
+        }
         self.gen.push(recipe);
         h
     }
@@ -846,6 +945,76 @@ impl Builder {
             );
         }
 
+        // TRANSITIVE REDUCTION of the coarse counter DAG.
+        //
+        // A coarse dep A→C is redundant when a path A→…→C already exists through other coarse
+        // deps: the gate it installs orders nothing the path does not already order. Dropping it
+        // removes one wait entry from every one of C's slices, i.e. `blocks(C)` runtime polls per
+        // token. Measured on the 93-layer K3 decode blob: 3038 edges → 2969, and 454,942 polls →
+        // 401,950 (52,992 removed, 11.6%).
+        //
+        // SOUNDNESS, and why BOTH the dropped edge and every path edge must be Coarse:
+        //   * `Dep::Coarse` means "every workgroup of the producer has bumped", so a chain of
+        //     coarse edges A→B→C orders all-of-A before all-of-B before all-of-C — exactly the
+        //     constraint the dropped A→C asserted.
+        //   * `Dep::Fine` orders only the slices in its map, so it can neither be dropped this way
+        //     nor justify a path. Fine deps are skipped in both roles: they stay in `deps`, and
+        //     they are never inserted into `edges`. Ignoring them only COSTS reductions (an
+        //     ordering we decline to exploit); it can never license an unsafe one.
+        //
+        // This does not weaken `happensBefore`: the dropped edge is still ordered, transitively.
+        // It does mean a data edge need no longer be DIRECTLY counter-gated, which is why the
+        // Lean side needed a coverage statement in terms of `happensBefore` rather than
+        // `WellFormed.edgeCovered` — see `lean-plow/Plow/TransitiveReduction.lean`,
+        // `tr_preserves_coverage`.
+        {
+            let mut edges: BTreeSet<(u32, u32)> = BTreeSet::new();
+            for (i, op) in self.ops.iter().enumerate() {
+                for d in &op.deps {
+                    if let Dep::Coarse(c) = d {
+                        edges.insert((*c, i as u32));
+                    }
+                }
+            }
+            let keep = transitive_reduction(n_ops, &edges);
+            let dropped = edges.len() - keep.len();
+            // Two independent removals, and they were once conflated in the disassembler's
+            // `polls_removable`: the transitive reduction drops DISTINCT edges implied by a path
+            // (measured 69 edges, 17,664 polls on the K3 decode blob), while `seen` drops REPEATED
+            // waits on the SAME counter within one op's list (a further 35,328 polls, 7.8%). A
+            // duplicate is redundant by definition — the second wait on a counter is satisfied at
+            // exactly the moment the first is — and the edge set alone cannot see them, because it
+            // is a set.
+            let mut dup = 0usize;
+            for (i, op) in self.ops.iter_mut().enumerate() {
+                let mut seen: Vec<u32> = Vec::new();
+                let before = op.deps.len();
+                op.deps.retain(|d| match d {
+                    Dep::Coarse(c) => {
+                        if !keep.contains(&(*c, i as u32)) || seen.contains(c) {
+                            false
+                        } else {
+                            seen.push(*c);
+                            true
+                        }
+                    }
+                    Dep::Fine { .. } => true,
+                });
+                dup += before - op.deps.len();
+            }
+            self.tr_dropped = dropped;
+            if (dropped > 0 || dup > dropped) && std::env::var_os("PLOW_TR_QUIET").is_none() {
+                eprintln!(
+                    "  counter-graph reduction: {} of {} distinct coarse edges implied by a path, \
+                     {} duplicate waits; {} wait entries removed",
+                    dropped,
+                    edges.len(),
+                    dup - dropped,
+                    dup
+                );
+            }
+        }
+
         // Which ops does someone depend on FINELY? Those get per-slice counters.
         let mut fine_base = vec![u32::MAX; n_ops];
         let mut n_counter = n_ops as u32;
@@ -896,9 +1065,41 @@ impl Builder {
                 8
             }
         };
+        // PLOW_SEG_PER_OP: one SEGMENT per op, i.e. host-side AQL chaining instead of the
+        // persistent kernel's counter protocol. Measurement knob; see below for why it is not a
+        // default.
+        //
+        // The runtime ALREADY chains segments with the AQL barrier bit and no host round-trip
+        // (`exec/amd.rs`: "n_seg launches, ONE drain"), so this needs no new dispatch mechanism —
+        // only `seg_of[i] = i`. What it buys, measured in `runtime/bench/aql_launch_floor.c` at
+        // plow's exact shape (256 WG x 512 thr, 147.5 KB group segment): a fully ordered
+        // agent-coherent AQL dispatch is 1.458 us/packet against the 5.72 us the counter protocol
+        // spends, because the COMMAND PROCESSOR does the cache maintenance once per packet
+        // (0.25 us) instead of 256 workgroups each issuing a cache-wide op. The barrier bit itself
+        // is free (1.462 vs 1.458 with it cleared) — at 1 WG/CU a 256-workgroup packet cannot
+        // overlap its successor anyway.
+        //
+        // WHY THIS IS A KNOB AND NOT THE DEFAULT: it is unproven at TP>=4 and there is a recorded
+        // failure. `exec/amd_tp.rs` quotes `runtime/tests/tp_decode.c`: "Per-rank-all-segments let
+        // the ranks desync — a lagging rank made peers time out and bail, giving a WRONG, 100x-slow
+        // reduction at TP>=4." That is why PREFILL takes an all-rank host barrier per segment,
+        // which costs the round-trip (measured 6.538 us/packet) and would make 2459 segments a
+        // LOSS. Decode today is one dispatch per rank, and its ranks rendezvous device-side, so
+        // per-op segmentation is only viable if the 278 `XReduce` collectives resync the ranks
+        // often enough to bound the drift by themselves. That is an empirical question about drift,
+        // not a design one, and this knob is how it gets answered.
+        let seg_per_op = std::env::var("PLOW_SEG_PER_OP").ok().as_deref() == Some("1");
         let mut seg_of = vec![0u16; self.ops.len()];
         let mut cur_seg = 0u16;
         for i in 0..self.ops.len() {
+            if seg_per_op {
+                // `cur_seg` is not just a loop temporary — `n_seg` below is derived from it, so it
+                // must track the highest seg actually emitted or the gq window table is sized 1
+                // while entries carry seg up to n_ops-1.
+                cur_seg = u16::try_from(i).expect("PLOW_SEG_PER_OP: >65535 ops does not fit seg");
+                seg_of[i] = cur_seg;
+                continue;
+            }
             if i > 0 && wave_class(self.ops[i].inst.op) != wave_class(self.ops[i - 1].inst.op) {
                 cur_seg += 1;
             }

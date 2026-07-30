@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use devgen::tune_demand::Demand;
+use kernelcaps::QuantScheme;
 
 use super::demand::{self, EmitSpec};
 
@@ -113,7 +114,25 @@ pub fn run(root: &Path, c: &Campaign) -> Result<(), Err> {
             Some(false) => "MISS",
             None => "?   ",
         };
-        println!("  {mark} {:>6} x {:>6} x {:>6}  {}", s.m, s.n, s.k, s.label);
+        println!(
+            "  {mark} {:>6} x {:>6} x {:>6}  {:<8} {}",
+            s.m,
+            s.n,
+            s.k,
+            format!("{:?}", s.quant),
+            s.label
+        );
+    }
+    // The encoding census, printed because it is the one thing a reader cannot infer from the
+    // shape list: 3410 records existed and every one of them was bf16, and nothing said so.
+    {
+        let mut by_quant: std::collections::BTreeMap<String, usize> = Default::default();
+        for s in &shapes {
+            *by_quant.entry(format!("{:?}", s.quant)).or_default() += 1;
+        }
+        let census: Vec<String> =
+            by_quant.iter().map(|(q, n)| format!("{n} {q}")).collect();
+        println!("encodings   : {}", census.join(", "));
     }
     println!();
     if c.dry_run {
@@ -129,7 +148,7 @@ pub fn run(root: &Path, c: &Campaign) -> Result<(), Err> {
     let mut rows = 0usize;
     let mut contended = Vec::new();
     for s in &shapes {
-        println!("=== {}  {}x{}x{}", s.label, s.m, s.n, s.k);
+        println!("=== {}  {}x{}x{}  {:?}", s.label, s.m, s.n, s.k, s.quant);
         // Each shape measures into its own scratch file and is appended only on a clean exit, so
         // a contended run (gpulease rc=76) is DISCARDED rather than averaged in. The bash script
         // pointed the harness straight at the campaign file and had no way to take a row back.
@@ -185,6 +204,11 @@ struct Shape {
     n: i64,
     k: i64,
     label: String,
+    /// The weight encoding to measure this shape in. Carried from the demand rather than assumed,
+    /// because it is IN THE OP-CASE KEY (`tunedb::gemm_op_case`) — a campaign that dropped it
+    /// would file every mxfp4 timing under the bf16 case and serve a bf16 op an fp4 number.
+    /// Dropping it is exactly why the store held 3410 records and not one of them was mxfp4.
+    quant: QuantScheme,
     /// Whether the store already answers this shape. `None` for a hand-authored list: that list
     /// was never asked of the compiler, so nothing is known about whether it is demanded at all —
     /// which is the drift `--shapes auto` removes.
@@ -195,11 +219,18 @@ fn resolve(src: &ShapeSource) -> Result<Vec<Shape>, Err> {
     Ok(match src {
         ShapeSource::Auto(spec) => demand::derive(spec)?
             .into_iter()
-            .map(|d: Demand| Shape { m: d.m, n: d.n, k: d.k, label: d.label(), hit: Some(d.hit) })
+            .map(|d: Demand| Shape {
+                m: d.m,
+                n: d.n,
+                k: d.k,
+                label: d.label(),
+                quant: d.quant,
+                hit: Some(d.hit),
+            })
             .collect(),
         ShapeSource::File(p) => demand::parse_list(&std::fs::read_to_string(p)?)?
             .into_iter()
-            .map(|(m, n, k, label)| Shape { m, n, k, label, hit: None })
+            .map(|l| Shape { m: l.m, n: l.n, k: l.k, label: l.label, quant: l.quant, hit: None })
             .collect(),
     })
 }
@@ -341,12 +372,16 @@ fn measure(
     out: &Path,
     lease: bool,
 ) -> Result<(), Contention> {
+    // The quant is argv[5] and the harness sweeps a DIFFERENT tile table for it — five selectable
+    // mxfp4 rungs rather than the bf16 twelve. `{:?}` is the same spelling `tunedb::parse_quant`
+    // reads back out of the JSONL, so writer and reader share one vocabulary.
     let mut argv: Vec<String> = vec![
         harness.to_string_lossy().into_owned(),
         s.m.to_string(),
         s.n.to_string(),
         s.k.to_string(),
         s.label.clone(),
+        format!("{:?}", s.quant),
     ];
     // No `sg` wrapping here: it is impossible from inside `nix develop` (see `preflight`), and
     // by the time we reach this point the gid is present because preflight refused otherwise.
@@ -398,7 +433,8 @@ fn measure(
         // number, so it is discarded and re-run — never stored with a caveat.
         Some(76) => Err(Contention::Contended),
         other => Err(Contention::Failed(
-            format!("gemm_tile_sweep {}x{}x{} exited {other:?}", s.m, s.n, s.k).into(),
+            format!("gemm_tile_sweep {}x{}x{} {:?} exited {other:?}", s.m, s.n, s.k, s.quant)
+                .into(),
         )),
     }
 }
@@ -422,7 +458,21 @@ mod tests {
     fn labels_are_cosmetic() {
         let src = "512 6144 512 alpha\n512 6144 512 beta\n";
         let a = demand::parse_list(src).unwrap();
-        assert_eq!((a[0].0, a[0].1, a[0].2), (a[1].0, a[1].1, a[1].2));
-        assert_ne!(a[0].3, a[1].3);
+        assert_eq!((a[0].m, a[0].n, a[0].k), (a[1].m, a[1].n, a[1].k));
+        assert_ne!(a[0].label, a[1].label);
+    }
+
+    /// The QUANT is not cosmetic, and this is the counterpart to the test above: two campaign
+    /// lines that differ only in encoding must reach the harness as two different sweeps, and
+    /// be filed under two different op cases. Getting this wrong is invisible — the rows land
+    /// in the store and read as measurements.
+    #[test]
+    fn the_quant_is_not_cosmetic() {
+        let a = demand::parse_list("128 576 7168 kva None\n128 576 7168 kva Mxfp4\n").unwrap();
+        assert_ne!(a[0].quant, a[1].quant);
+        assert_ne!(
+            tunedb::gemm_op_case(a[0].m, a[0].n, a[0].k, a[0].quant),
+            tunedb::gemm_op_case(a[1].m, a[1].n, a[1].k, a[1].quant),
+        );
     }
 }

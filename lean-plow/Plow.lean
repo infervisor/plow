@@ -1,6 +1,7 @@
 -- Root module — re-exports the per-topic libraries.
 import Plow.Basic
 import Plow.Protocol
+import Plow.TransitiveReduction
 import Plow.Memory
 import Plow.KvPool
 import Plow.Verify

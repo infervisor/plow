@@ -93,18 +93,131 @@ __device__ __forceinline__ bf16v8 ld_glob8_nt(const PLOW_GLOB bf16* p) {
 #ifndef PLOW_ACT_NT
 #define PLOW_ACT_NT 0
 #endif
+
+/* PLOW_GATE_SC1: DEVICE-SCOPE ACTIVATION STORES, so the release fence can go away.
+ *
+ * `buffer_wbl2` exists because the producer's activation writes sit DIRTY in its XCD's L2 and a
+ * release fence is the only thing that pushes them device-wide. It is cache-wide, all 256
+ * workgroups issue one, and each XCD's L2 therefore performs the same writeback 32 times, which
+ * serialises: measured 13.20 us for one empty b=256 packet, against 5.55 with the writeback
+ * deleted (`PLOW_GATE_RELAXSIG`, an admitted data race).
+ *
+ * CDNA4 puts the scope on the ACCESS, not only on the fence. `SC[1:0]=2` (`sc1` in asm) is device
+ * scope: ISA Reference §9.1.10.2 Table 49/50 give it `Coherent Cache Bypass` in L2 on a multi-XCD
+ * agent, so an `sc1` store publishes PAST the non-coherent XCD L2 into the device-wide Infinity
+ * Cache and leaves no dirty line for a writeback to find. Then `s_waitcnt vmcnt(0)` before the
+ * counter bump is the whole ordering the producer needs, and the release — and its cache-wide
+ * writeback — is redundant.
+ *
+ * MEASURED (`runtime/bench/sc1_gate.hip`, 400-step chains, 256 WG, idle GPU): baseline 10.12 us
+ * per packet vs 3.84 with device-scope data and workgroup fences, per-workgroup signal 3.16 ->
+ * 0.08 us. The arm that matters is the CONTROL: identical workgroup fences with PLAIN data reads
+ * 104,333,312 of 104,595,456 words stale (99.75%), reproducing the 100% stale rate `interp.hip`
+ * records, while the `sc1` arm reads ZERO stale words. So the bits, not the harness.
+ *
+ * NOT the same knob as `PLOW_ACT_NT` above, which failed. `nt` is an EVICTION hint that kept the
+ * line dirty (so the writeback still had work) and threw away reuse of a residual the next op
+ * re-reads — 4% slower. `sc1` is a COHERENCE bit: the line is published, not evicted early, and
+ * the fence it retires is worth ~7.6 us/packet against ~0.8 for the volume it was blamed on.
+ *
+ * COVERAGE IS THE WHOLE CORRECTNESS ARGUMENT. Dropping the release is sound only if EVERY
+ * activation store is device-scope; one plain store leaves one dirty line and the race is back.
+ * `st_glob8` is the 16-byte path, `st_act1` the ragged scalar tail (K3 needs it: `b_proj` is N=12,
+ * so `12 % 8 = 4` and the tail runs). Both are below. A new activation store MUST use one of them.
+ *
+ * >>> AND AS WRITTEN THIS IS BROKEN UNDER TP. MEASURED, K3 93 layers TP8: <<<
+ *
+ *     RANKS DISAGREE: rank 0 sampled 2496, rank 1 sampled 10816
+ *     (all: [2496, 10816, 109376, 127296, 24256, 1856, 1216, 37056])
+ *     — a collective did not happen, or one rank bound the wrong shard
+ *
+ * `sc1` is DEVICE scope, and the TP partials are published by this very store path: op_collective.h
+ * records that "each rank's producing GEMV (o_proj/down) wrote its partial H-vector straight into
+ * its own peer_scratch slot, fused into the GEMV epilogue". A peer reads that over XGMI, which
+ * needs SYSTEM scope. `sc1` bypasses L2 into the local Infinity Cache, so `xctr_signal`'s
+ * system-scope release — which writes back L2 — has no dirty line left to push across XGMI. The
+ * partial never leaves the GPU, XReduce sums stale slots, and every rank samples a different token.
+ *
+ * Note what this means about the evidence: the single-GPU microbench (`runtime/bench/sc1_gate.hip`)
+ * measured ZERO stale words of 104,595,456 with a same-harness control at 99.75% stale, and it
+ * still did not predict this — the property that breaks is cross-DEVICE visibility, which no
+ * single-GPU harness can observe.
+ *
+ * COVERAGE IS BIGGER THAN THE HELPERS, and this is the third failure, MEASURED rather than
+ * guessed. After routing all 19 ragged scalar tails through `st_act1`/`st_act1_u8`, the decode
+ * object still contains 112 PLAIN global stores against 69 covered ones — 62% uncovered:
+ *
+ *     global_store_short   63     global_store_dword    27
+ *     global_store_dwordx2 20     global_store_dwordx4   2
+ *
+ *   (count it with: llvm-objdump -d --mcpu=gfx950 <obj> | grep -oE "global_store_[a-z0-9]+[^/]*"
+ *    then split on whether the line carries `sc`.)
+ *
+ * The biggest missed publisher is the one that matters most: the GEMV epilogue writes its output
+ * with PLAIN scalar stores (`C[(size_t)m * N + n] = f2bf(t)`, ~10 sites in op_gemm.h), and the
+ * GEMV is exactly what publishes the TP partials into `act.og_tp`/`act.dg_tp`. Also uncovered:
+ * the f32 flash partials, the MoE f32 `part` buffer, `d_headnorm_rope_fp8`'s `scale`, the KDA
+ * state and conv state.
+ *
+ * So this knob is not one helper away. It needs every global write in every decode op audited
+ * and typed. Until then it stays off, and a single-GPU harness will keep saying it is sound.
+ *
+ * THE FIX is also a distinction this code does not yet make: activation stores are two classes.
+ *   * LOCAL activations (residual stream, next op's input)  -> `sc1`      (aux 16), device scope
+ *   * PEER-VISIBLE activations (the GEMV epilogue's write into peer_scratch — `act.og_tp`,
+ *     `act.dg_tp`)                                          -> `sc0 sc1` (aux 17), system scope
+ * Both are expressible; what is missing is the store site knowing which tensor it targets.
+ */
+#ifndef PLOW_GATE_SC1
+#define PLOW_GATE_SC1 0
+#endif
+
+/* SYSTEM scope (`sc0 sc1`, SC[1:0]=3), not device (`sc1`, SC=2), and the TP failure above is
+ * why. A single scope for every activation store is the conservative choice: it is correct for
+ * the peer-visible ones, and the local ones pay for reach they do not need. Splitting them —
+ * local `sc1`, peer `sc0 sc1` — is the optimisation, and it needs the store site to know which
+ * tensor class it is writing, which this code cannot yet tell. Correct first. */
 __device__ __forceinline__ void st_glob8(bf16* p, bf16v8 v) {
-#if PLOW_ACT_NT
+#if PLOW_GATE_SC1
+    asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(p), "v"(v) : "memory");
+#elif PLOW_ACT_NT
     __builtin_nontemporal_store(v, (PLOW_GLOB bf16v8*)(PLOW_GLOB void*)p);
 #else
     *(PLOW_GLOB bf16v8*)(PLOW_GLOB void*)p = v;
 #endif
 }
 __device__ __forceinline__ void st_glob8(PLOW_GLOB bf16* p, bf16v8 v) {
-#if PLOW_ACT_NT
+#if PLOW_GATE_SC1
+    asm volatile("global_store_dwordx4 %0, %1, off sc0 sc1" ::"v"(p), "v"(v) : "memory");
+#elif PLOW_ACT_NT
     __builtin_nontemporal_store(v, (PLOW_GLOB bf16v8*)(PLOW_GLOB void*)p);
 #else
     *(PLOW_GLOB bf16v8*)(PLOW_GLOB void*)p = v;
+#endif
+}
+
+/* One activation half, device-scope under PLOW_GATE_SC1. This is the ragged tail every op writes
+ * when its width is not a multiple of 8; under the default it is exactly `*p = v` and the emitted
+ * code is unchanged. */
+__device__ __forceinline__ void st_act1(bf16* p, bf16 v) {
+#if PLOW_GATE_SC1
+    asm volatile("global_store_short %0, %1, off sc0 sc1" ::"v"(p), "v"(v) : "memory");
+#else
+    *p = v;
+#endif
+}
+
+/* The fp8 tail. `d_headnorm_rope_fp8` writes the KV cache one BYTE at a time when the head
+ * width is ragged; that store is an activation publish exactly like the bf16 ones, and leaving
+ * it plain is enough on its own to reinstate the race PLOW_GATE_SC1 exists to remove. */
+__device__ __forceinline__ void st_act1_u8(unsigned char* p, unsigned char v) {
+#if PLOW_GATE_SC1
+    /* `v` must be a 32-bit VGPR operand: an `unsigned char` has no `v` register class and the
+     * inline asm fails to allocate. `global_store_byte` stores the low byte of the VGPR. */
+    const unsigned w = v;
+    asm volatile("global_store_byte %0, %1, off sc0 sc1" ::"v"(p), "v"(w) : "memory");
+#else
+    *p = v;
 #endif
 }
 __device__ __forceinline__ bf16v8 bf16v8_zero(void) {
@@ -355,6 +468,29 @@ __device__ __forceinline__ float e8m0_to_f32(unsigned char b) {
     return __builtin_bit_cast(float, (unsigned)b << 23);
 }
 
+/* 1 / e8m0_to_f32(b) = 2^(127-b), which the MXFP4 quantizers want far more often than the scale
+ * itself. The reciprocal of a power of two is EXACT — but spelled `1.0f / e8m0_to_f32(b)` the
+ * backend has to emit the full IEEE division expansion (v_div_scale, v_rcp, three FMA refinement
+ * steps, v_div_fmas, v_div_fixup: thirteen VALU) for a value that is one exponent negation. The
+ * A4W4 MoE prefill paid that TWICE per MX block, once in the staging quantizer and once in the
+ * fused bridge.
+ *
+ * `v_rcp_f32` and not an exponent-field construction, because the ENDS matter and a bit twiddle
+ * gets them wrong: e8m0_to_f32(0) is +0.0 (not 2^-127 — the byte lands in the exponent field, so
+ * byte 0 has a zero exponent AND a zero mantissa), so the reciprocal there is +inf, and byte 255
+ * is +inf so its reciprocal is +0.0. v_rcp_f32 reproduces both, and it is EXACT on the interior
+ * because every input here is a power of two with a 1.0 mantissa. Bit-identical for all 256
+ * bytes; runtime/tests/fp4_quant_identity_gfx950_test.hip checks every one of them. */
+__device__ __forceinline__ float e8m0_inv_f32(unsigned char b) {
+    /* b = 254 is the one byte whose reciprocal (2^-127) is SUBNORMAL, and the transcendental unit
+     * flushes it while the division does not. Two instructions to keep the helper total over the
+     * whole byte domain rather than correct-where-we-happen-to-call-it: e8m0_for_amax cannot
+     * return 254 (it would need amax >= 6*2^127, past FLT_MAX), but nothing about this function
+     * says so, and the next caller will not know. */
+    const float r = __builtin_amdgcn_rcpf(e8m0_to_f32(b));
+    return b == 254u ? __builtin_bit_cast(float, 0x00400000u) : r;
+}
+
 /* 32 fp4 + one E8M0 scale -> four bf16v8, in the SAME fdot2-ready lane order as fp8_to_bf16v8, so
  * the GEMV reduction, `dot8` and the wave reduction are shared verbatim with the fp8 path.
  * Each u32 holds 8 fp4 = 4 pairs; op_sel (the third operand, 0..3) picks the pair, so one word
@@ -477,25 +613,71 @@ __device__ __forceinline__ unsigned quant_fp4(float v) {
      * differ, so real data almost never sees it — but a tie-heavy synthetic fixture will, and a
      * host-side reference that implements true RNE would disagree with the device on exactly
      * those elements. Stated rather than changed: the ladder is what the shipped objects were
-     * measured with, and flipping it would move numerics to fix a comment. */
-    unsigned n;
-    if (a < 0.25f) n = 0u;
-    else if (a < 0.75f) n = 1u;
-    else if (a < 1.25f) n = 2u;
-    else if (a < 1.75f) n = 3u;
-    else if (a < 2.5f) n = 4u;
-    else if (a < 3.5f) n = 5u;
-    else if (a < 5.0f) n = 6u;
-    else n = 7u;
+     * measured with, and flipping it would move numerics to fix a comment.
+     *
+     * COUNTED, NOT BRANCHED. As an if/else chain this compiled to a SEVEN-DEEP nest of
+     * `s_and_saveexec_b64` / `s_cbranch_execz` / `s_or_b64 exec` — and since a wavefront's 64
+     * lanes land on different rungs, every rung executes anyway, so the chain cost all seven
+     * comparisons PLUS ~21 exec-mask instructions per element. The A4W4 staging quantizer runs
+     * this 32 times per MX block and it was the single largest VALU term in the MoE prefill.
+     * The code is just "how many cut points is `a` not below".
+     *
+     * SEVEN FLOAT COMPARES AND NOT SOMETHING CLEVERER — MEASURED. Five of the seven rungs are an
+     * arithmetic progression in the INTEGER encoding (1.25, 1.75, 2.5, 3.5, 5.0 are 0x3FA00000 +
+     * k*0x400000), so their combined count can be had from one subtract, one arithmetic shift
+     * and a clamp instead of five comparisons: ten VALU per element rather than sixteen. It is
+     * SLOWER. `|x|` is a free source modifier on `v_cmp_*_f32` but not on the integer ops, so the
+     * bit form has to materialise the magnitude, and it replaces seven independent compares —
+     * which the scheduler interleaves with the `v_pk_mul_f32` scaling — with a serial
+     * subtract -> shift -> med3 -> add chain. Measured at K3's MoE prefill shape: 7.617 ms the
+     * way it is written below, 7.749 ms with the progression trick. Fewer instructions, less
+     * throughput. Do not re-derive it.
+     *
+     * `!(a < T)` and not `a >= T`: both are false for a NaN, on opposite sides. The if/else chain
+     * fell through EVERY rung for a NaN and returned 7, `!(a < T)` is true for NaN and reproduces
+     * that, `a >= T` would return 0 instead. runtime/tests/fp4_quant_identity_gfx950_test.hip
+     * walks all 2^32 inputs against the frozen chain — every NaN payload, both zeros, every
+     * subnormal — which is what makes any of this admissible. */
+    const unsigned n = (unsigned)!(a < 0.25f) + (unsigned)!(a < 0.75f) + (unsigned)!(a < 1.25f) +
+                       (unsigned)!(a < 1.75f) + (unsigned)!(a < 2.5f) + (unsigned)!(a < 3.5f) +
+                       (unsigned)!(a < 5.0f);
     return sign | n;
 }
 /* E8M0 exponent for a block whose max magnitude is `amax`, mapping it onto e2m1's 6.0 top code.
  * Power-of-two only by construction, which is what makes the MX scale exact. */
 __device__ __forceinline__ unsigned char e8m0_for_amax(float amax) {
     if (!(amax > 0.0f)) return (unsigned char)PLOW_E8M0_ONE;
-    int e;
-    frexpf(amax / 6.0f, &e); /* amax/6 in [0.5,1) * 2^e  => scale 2^e covers the block */
-    e += 127;
+    /* WHAT THIS USED TO BE: `frexpf(amax / 6.0f, &e)` — amax/6 in [0.5,1) * 2^e, so 2^e covers
+     * the block. Correct, and a full IEEE division (thirteen VALU) to extract ONE exponent.
+     *
+     * It is an integer question. Write a normal amax as 2^(E-127) * (1 + M/2^23) with E the
+     * biased exponent field and M the mantissa field. Then amax/6 = (1 + M/2^23)/6 * 2^(E-127),
+     * and (1 + M/2^23)/6 lands in [1/6, 1/3) — which straddles exactly ONE power of two, 1/4. So
+     * frexp's exponent is E-128 if the quotient is below 1/4 and E-127 if not, and the quotient
+     * is below 1/4 exactly when 1 + M/2^23 < 1.5, i.e. when M < 2^22. The +127 folds in and the
+     * whole thing is `E - 1 - (M < 2^22)`.
+     *
+     * The boundary is EXACT and needs no rounding argument: 1.5/6 = 0.25 with both operands
+     * powers-of-two-times-small-integers, so the division there is exact. The float one ulp below
+     * 1.5 divides to strictly below 0.25 after rounding, which is the case the sweep test pins.
+     *
+     * SUBNORMAL amax (E = 0) mostly falls out: the formula gives -1 or -2 and clamps to 1, and the
+     * old path clamped to 1 too (amax < 2^-126 => amax/6 < 2^-128 => e + 127 <= -1). TWO ENDS DO
+     * NOT FALL OUT, and both are short-circuited above rather than left to the arithmetic:
+     *
+     *   +inf          `v_frexp_exp_i32_f32` answers 0 for it, so the old path returned 0+127=127.
+     *   bits 1, 2, 3  the three smallest subnormals. amax/6 rounds to ZERO there (3*2^-149 / 6 is
+     *                 exactly half an ulp and goes to even), and frexpf(0) also reports 0, so the
+     *                 old path returned 127 rather than the clamped 1 the formula gives. Exactly
+     *                 three inputs in 2^32, found by the sweep and not by reading the code.
+     *
+     * Bit-identical for every one of the 2^32 float inputs — see
+     * runtime/tests/fp4_quant_identity_gfx950_test.hip, which is the only reason this is allowed
+     * to be clever. */
+    const unsigned bits = __builtin_bit_cast(unsigned, amax);
+    const unsigned E = bits >> 23; /* amax > 0 here, so the sign bit is clear */
+    if (E == 0xFFu || bits < 4u) return (unsigned char)PLOW_E8M0_ONE;
+    int e = (int)E - 1 - (int)((bits & 0x7FFFFFu) < 0x400000u);
     if (e < 1) e = 1;
     if (e > 254) e = 254;
     return (unsigned char)e;
@@ -516,29 +698,29 @@ __device__ __forceinline__ fp8v16 ld_glob_fp8v16(const unsigned char* p) {
 }
 
 /* 8 fp8 == 2 u32 == 8 B: the V phase reads only its 8 owned head-dims per lane, so it wants HALF
- * the b128 width — a b64 load, then the same cvt_pk_f32_fp8 truncation as fp8_to_bf16v8. */
+ * the b128 width. Decode each adjacent pair directly to packed bf16 with the same native
+ * instruction as fp8_to_bf16v8; the old fp8->f32->high-half path spent roughly three times the
+ * conversion VALU in the cache loop. */
 typedef unsigned fp8v8 __attribute__((ext_vector_type(2))); /* 8 fp8, 8 B, align 8 */
 __device__ __forceinline__ fp8v8 ld_glob_fp8v8(const unsigned char* p) {
     return *(const PLOW_GLOB fp8v8*)(const PLOW_GLOB void*)p;
 }
 __device__ __forceinline__ bf16v8 fp8v8_to_bf16v8(fp8v8 w) {
-    typedef float f32x2 __attribute__((ext_vector_type(2)));
-    auto trunc = [](float f) -> bf16 {
-        unsigned u;
-        __builtin_memcpy(&u, &f, 4);
-        return (bf16)(u >> 16); /* e4m3 -> f32 has zero low 16 mantissa bits, so this is EXACT */
-    };
-    bf16v8 d;
+    typedef bf16_t bf16_2 __attribute__((ext_vector_type(2)));
+    union {
+        bf16v8 v;
+        unsigned u[4];
+    } d;
 #pragma unroll
     for (int i = 0; i < 2; i++) {
-        const f32x2 a = __builtin_amdgcn_cvt_pk_f32_fp8(w[i], false); /* bytes 0,1 */
-        const f32x2 c = __builtin_amdgcn_cvt_pk_f32_fp8(w[i], true);  /* bytes 2,3 */
-        d[i * 4 + 0] = trunc(a[0]);
-        d[i * 4 + 1] = trunc(a[1]);
-        d[i * 4 + 2] = trunc(c[0]);
-        d[i * 4 + 3] = trunc(c[1]);
+        const bf16_2 a =
+            __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(w[i], 1.0f, false); /* bytes 0,1 */
+        const bf16_2 c =
+            __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(w[i], 1.0f, true); /* bytes 2,3 */
+        d.u[i * 2 + 0] = __builtin_bit_cast(unsigned, a);
+        d.u[i * 2 + 1] = __builtin_bit_cast(unsigned, c);
     }
-    return d;
+    return d.v;
 }
 
 /* f32 -> one e4m3 byte. gfx950 native: cvt_pk_fp8_f32 packs (a,b) into two bytes of `old`; we use
@@ -629,9 +811,53 @@ __device__ __forceinline__ float half_wave_sum(float v) {
 /* ONE spelling of the logistic for the whole K3 family. `situ`'s gate branch and the MLA OUTPUT
  * GATE (`mla_use_output_gate`, op 106, op_k3.h) both need it, and they must not drift apart: the
  * two are a factor of `beta*tanh(g/beta)` from each other, so an accidental substitution of one for
- * the other is finite, correctly-shaped and wrong. The body is byte-identical to what
- * `k3_situ_gate` inlined before this was named. */
-__device__ __forceinline__ float k3_sigmoid(float x) { return 1.0f / (1.0f + __expf(-x)); }
+ * the other is finite, correctly-shaped and wrong.
+ *
+ * `v_rcp_f32` AND NOT `1.0f /`. The logistic's denominator is never zero and never overflows —
+ * `1 + exp(-x)` is in [1, +inf) with a hard floor of exactly 1 — so none of the IEEE division
+ * expansion's scaling machinery can ever fire, and it is thirteen VALU (v_div_scale x2, v_rcp,
+ * three FMA refinements, v_div_fmas, v_div_fixup) to compute a reciprocal the transcendental
+ * unit answers in one. The same argument `e8m0_inv_f32` above makes, for the same reason.
+ *
+ * The refinement steps the division does and the rcp does not are worth ~1 ULP of f32, against
+ * an activation that is rounded to bf16 (8 mantissa bits, 2^-9 relative) before anything reads
+ * it. runtime/tests/situ_identity_gfx950_test.hip walks all 2^32 inputs and reports both the f32
+ * error and the count of inputs whose BF16 output moves; that count is what makes this
+ * admissible, and it is the file to re-run if this line is ever touched again. */
+__device__ __forceinline__ float k3_sigmoid(float x) {
+    return __builtin_amdgcn_rcpf(1.0f + __expf(-x));
+}
+
+/* tanh from the hardware exponential:  tanh(y) = 1 - 2/(e^(2y) + 1).
+ *
+ * WHAT IT REPLACES. `tanhf` is OCML's correctly-rounded tanh, and on gfx950 it compiles to ~30
+ * VALU plus a TWO-DEEP `s_and_saveexec_b64`/`s_cbranch_execz` nest — and a wavefront whose 64
+ * lanes straddle the range split executes both sides regardless, which is the same trap
+ * `quant_fp4`'s ladder was. This is five: v_mul, v_exp_f32, v_add, v_rcp_f32, v_fma.
+ *
+ * THE ENDS ARE THE FORMULA'S, NOT A CLAMP'S, and they come out right by themselves:
+ *   y >= +44   e^(2y) overflows to +inf, rcp(+inf) = +0, so tanh -> exactly +1.
+ *   y <= -44   e^(2y) flushes to +0, 0 + 1 == 1 exactly, rcp(1) = 1, so tanh -> exactly -1.
+ *   y = +-inf  the same two limits, reached exactly.
+ *   NaN        e^NaN = NaN and NaN propagates through add/rcp/fma, so NaN in, NaN out — which
+ *              is what `tanhf` does and what the `situ` epilogue needs, since op_moe.h's
+ *              `moe_act` uses a NaN as its deliberate poison for an unconverted caller.
+ * There is no `1 + e` overflow to guard: e is non-negative, so the sum only ever grows toward
+ * the +inf that already maps to the correct limit.
+ *
+ * WHERE IT IS WEAKEST, STATED PLAINLY: y -> 0. `1 - 2r` is a cancellation, so the ABSOLUTE error
+ * stays at ~half an f32 ulp of 1.0 (~6e-8) while the value itself goes to zero — the RELATIVE
+ * error therefore grows without bound as y -> 0. It is bounded absolute error on a quantity
+ * whose true magnitude is |y|, so it cannot perturb a sum by more than 6e-8 per term, and the
+ * exhaustive sweep in runtime/tests/situ_identity_gfx950_test.hip reports exactly which inputs
+ * move a BF16 result and by how much. A degree-5 odd polynomial on |y| < 0.09 would remove it
+ * for ~5 more VALU; the sweep says it is not needed, and that measurement is the reason it is
+ * absent rather than an oversight.
+ *
+ * NOT `(1-E)/(1+E)` with E = e^(-2y): same cancellation, one more VALU, no accuracy gained. */
+__device__ __forceinline__ float fast_tanhf(float y) {
+    return __builtin_fmaf(-2.0f, __builtin_amdgcn_rcpf(__expf(2.0f * y) + 1.0f), 1.0f);
+}
 
 /* Kimi-K3's `situ` activation, as a PAIR, because it transforms BOTH GLU branches:
  *     out = beta*tanh(g/beta)*sigmoid(g)  *  linear_beta*tanh(u/linear_beta)
@@ -644,12 +870,53 @@ __device__ __forceinline__ float k3_sigmoid(float x) { return 1.0f / (1.0f + __e
  *
  * It is a soft-clipped SiLU: as beta -> inf, `beta*tanh(g/beta) -> g` and the gate branch becomes
  * silu. `lb <= 0` means "no up transform" (`linear_beta is None`), chosen as a comparison rather
- * than a flag so a zeroed immediate degrades to the identity instead of clipping to zero. */
+ * than a flag so a zeroed immediate degrades to the identity instead of clipping to zero.
+ *
+ * THIS IS THE HOTTEST ARITHMETIC IN KIMI-K3. It runs on every element of every routed expert
+ * (top-16 of 896), both shared experts and the dense FFN, on 92 of 93 layers. Spelled the
+ * obvious way it was THREE full IEEE divisions (`g/beta`, `u/lb`, and the logistic's `1.0f/`),
+ * two `tanhf` and one exponential per output element: 109 VALU and a nine-instruction exec-mask
+ * nest, measured on gfx950. Two of the three divisions and both `tanhf` are gone; what is left
+ * is ~46 VALU and branchless, and the paragraph below is why the third division stayed.
+ *
+ * `g / beta` IS A PER-ELEMENT DIVISION AND IT STAYS ONE, WHICH IS NOT THE OBVIOUS ANSWER.
+ * `beta` and `lb` are packet immediates — uniform over the whole kernel — so the textbook move is
+ * `g * (2.0f/beta)`, hoisting one reciprocal out of the element loop and leaving a single v_mul
+ * per element. That version was written, measured, and REJECTED. On K3's MoE prefill geometry
+ * (T=1024, 896 experts, grid 512, gfx950):
+ *
+ *     op85 GLU+bridge          act=silu    act=situ
+ *     base                      7.603 ms    7.843 ms
+ *     + rcp logistic            7.603       7.792
+ *     + fast_tanhf, g/beta      7.604       7.740      <- what is written below
+ *     + hoisted 2.0f/beta       7.847       7.901      <- the "better" version
+ *     + hoisted rcp(beta)       7.833       7.862      (VGPR 165 -> 167)
+ *
+ * The hoist costs 0.24 ms and it costs it on the SILU ARM TOO — an arm that never evaluates
+ * situ at all. That is the tell: the penalty is not the arithmetic, it is that LICM lifts the
+ * reciprocal to the kernel prologue, where its result is a VGPR that stays live across all 28
+ * K-tiles of the MFMA main loop. `d_moe_group_pf_a4w4` runs at 165 VGPR and 2 waves/SIMD with no
+ * slack (see MPF4_LDS_BYTES's note), so two more loop-lifetime VGPRs cost more than the
+ * thirteen-VALU division saves in an epilogue the main loop already hides.
+ *
+ * THE ONE-SPELLING RULE IS WHY THIS IS NOT SPLIT IN TWO. The hoisted form IS faster for
+ * `d_situ_glu` (op 105, the dense/shared streaming pass): 0.0248 ms vs 0.0365 at K3's 18432
+ * width. Giving the streaming op its own hoisted variant would buy ~0.34 ms per forward pass at
+ * T=1024 — against the ~9.8 ms the form below buys on op85 over the same 92 layers — and the
+ * price would be that the dense FFN and the routed experts compute situ with two different
+ * roundings, which is exactly the drift this header exists to prevent. 3% more, for the one
+ * defect the file is written to make impossible. One spelling. If a future kernel really wants
+ * the hoist, the honest way to get it is to make the PACKET carry 2/beta: the value then arrives
+ * in an SGPR, costs no VGPR at all, and both call sites still share a single expression.
+ *
+ * The `lb > 0` test is on a UNIFORM value, so it is an `s_cmp`/`s_cbranch` over the whole
+ * wavefront — a scalar branch with no exec-mask cost — and not the per-lane divergence a
+ * per-element predicate would be. */
 __device__ __forceinline__ float k3_situ_gate(float g, float beta) {
-    return beta * tanhf(g / beta) * k3_sigmoid(g);
+    return beta * fast_tanhf(g / beta) * k3_sigmoid(g);
 }
 __device__ __forceinline__ float k3_situ_up(float u, float lb) {
-    return lb > 0.0f ? lb * tanhf(u / lb) : u;
+    return lb > 0.0f ? lb * fast_tanhf(u / lb) : u;
 }
 
 /* Block reduction over the PLOW_WAVES waves of the workgroup. */

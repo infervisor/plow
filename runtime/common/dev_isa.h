@@ -804,6 +804,134 @@ enum {
      * t0=C t1=A t2=W(e4m3) t3=weight_scale_inv(f32)   i0=M i1=N i2=K */
     PLOW_DOP_GEMM_FP8_BLK = 107,
 
+    /* t0=q_out t1=x t2=W_q t3=k_out t4=W_k t5=v_out t6=W_v t7=g_out
+     * i0=M i1=Nq i2=K i3=Nk i4=Nv i5=Ng i6=W_g(TENSOR HANDLE, not an integer)
+     * FUSED Q|K|V|G GEMV — op 22 with a fourth output stream, for Kimi-K3's KDA block, whose
+     * q/k/v/g projections all read the same pre-normed x[7168] and write four disjoint [12288]
+     * buffers. t[] is a strict SUPERSET of op 22's, so the two share one interpreter body
+     * (op 22 = this with Ng=0, W_g/g_out absent).
+     *
+     * WHY W_g LIVES IN i6. Nine pointers (4 out + 4 weight + x) do not fit t[8], and the wire
+     * instruction is a fixed 64 bytes. Of the nine, a WEIGHT is the safe one to demote: a wrong
+     * weight handle reads the wrong bytes and the output is visibly garbage, where a wrong OUTPUT
+     * handle would silently overwrite an unrelated tensor. It is a handle, resolved through the
+     * same T[] table as t[] — not a packed blob like Mamba2Scan's, and nothing about it is
+     * implicit. i5=Ng and i6=W_g are BOTH required: the arm refuses the packet if either is
+     * absent rather than falling back to a 3-stream sweep that would leave g_out untouched. */
+    PLOW_DOP_GEMV_QKVG = 108,
+
+    /* FP8 (e4m3) LATENT KV-CACHE ops for the MLA family (PLOW_FP8_KV).            [MLA-FP8-KV]
+     *
+     * The MLA twins of ops 38/39. The MLA cache is `ckv` (kv_lora, 512) + `krot` (qk_rope, 64) per
+     * layer and is SHARED by every query head, so it is both the largest KV in the fleet — 27.0
+     * KiB/token across Kimi-K3's 24 MLA layers, 3.38 GiB at 128k — and the one whose quantization
+     * error is common-mode across all heads. Until these ops existed DeepSeek, Kimi-K2.7, GLM-5.2
+     * and Kimi-K3 had NO fp8-KV path at all: `PLOW_FP8_KV=1` swapped the DENSE flash only.
+     *
+     * The cache `t4` is `uint8[b][ctx][512]` e4m3 with a PER-ROW f32 dequant scale, written by
+     * HEADNORM_ROPE_FP8 (37) at HD=512 with `cosb`/`sinb` absent — which is exactly an RMSNorm
+     * plus an fp8 store, i.e. the fp8 twin of the RMSNORM that writes the bf16 `ckv` row. Keeping
+     * the writer an op the runtime's kv-row-writer scan ALREADY matches (`exec/amd.rs`
+     * `kv_write_row_field` -> HeadNormRopeFp8 -> i[3]) is deliberate: a brand-new writer opcode
+     * would have dropped the layer out of that list with no count check.
+     *
+     * BOTH scales live in ONE `t7` array, because the dense MLA decode has exactly one free tensor
+     * slot (t7 is the gather `idx`, every other slot is live):
+     *     t7[            b*kv_stride + row] = ckv  row scale
+     *     t7[n_batch*kv_stride + b*kv_stride + row] = krot row scale   (i6 != 0 only)
+     * i6 (the gather `top_k` slot, dead in the dense op) selects whether `t5` is a bf16 rope cache
+     * (i6 == 0, the shipped form) or its own e4m3 cache (i6 != 0).
+     *
+     *   t0=Opart t1=mlpart t2=Qabs t3=Qrope t4=Ckv(fp8) t5=Krope t6=kv_len t7=kv_scale
+     *   i0=n_batch i1=n_head i2=kv_stride i3=window i4=nsplit(decode)/n_tok(prefill) i5=kv_mask
+     *   i6=krot_fp8 i7=gf   f0=scale
+     * See d_flash_mla_decode<...,FP8=true> in op_attention.h. */
+    PLOW_DOP_FLASH_MLA_DECODE_FP8 = 109,
+    PLOW_DOP_FLASH_MLA_PREFILL_FP8 = 110, /* same operands; i4 = n_tok (PLOW_MLA_PREFILL) */
+    /* KDA short conv over all three streams in ONE packet — op 88 merged along its CHANNEL axis.
+     *
+     * The three convs are independent, which is why they were three packets; at batch 1 that
+     * reasoning inverts, because a KDA decode layer is launch-bound and three packets of
+     * independent work cost three times one packet of the same work. This is the GEMV_QKVG
+     * direction, not the GLM_GROUP=1 one: each conv already spanned all 256 CUs at ceil(C/256)
+     * channels, and fused they span the same 256 CUs at ceil(3C/256). The op gets WIDER.
+     *
+     * TWELVE POINTERS, four per stream. Four are demoted into i[] — the v TAPS and all three CONV
+     * STATES — on GEMV_QKVG's rule: demote a weight or a state, never an output. All four are
+     * REQUIRED and the arm traps on any being absent, because the dispatch default: never traps
+     * and a partial sweep leaves a stream's output finite, fluent and wrong.
+     *
+     * t0=q_out t1=k_out t2=v_out t3=q_in t4=k_in t5=v_in t6=w_q t7=w_k ·
+     * i0=T i1=C(per stream, H*D) i2=W i3=act i4=w_v i5=cs_q i6=cs_k i7=cs_v */
+    PLOW_DOP_KDA_CONV3 = 111,
+    /* op 102 with op 89 folded into its LDS staging.
+     *
+     * The state step already stages this head's g into LDS and exponentiates it; op 89's entire
+     * output is that vector plus one scalar per head, both computable from operands the step can
+     * read directly. Separate, it buys a [T,H,D] f32 round trip through HBM and nothing else.
+     *
+     * BIT-IDENTICAL to op 89 followed by op 102, not merely equivalent — the deleted intermediate
+     * was f32 in HBM and an f32 store/load is exact.
+     *
+     * SLICE MAP UNCHANGED: blocks is still min(H*D/BV, n_cu), the item is still (head, tile of BV
+     * value columns), and the gate is evaluated where its consumer already is rather than looped
+     * over. dt_bias is demoted to i5 on the same rule as CONV3. i5 and t7 are REQUIRED and the
+     * arm traps on either — there is no slot naming a precomputed g, so this op cannot silently
+     * degrade to the unfused reading of the packet.
+     *
+     * t0=o t1=q t2=k t3=v t4=g_raw t5=beta_raw t6=state t7=A_log ·
+     * i0=T i1=H i2=D i3=BV i4=flags i5=dt_bias i6=gate_mode · f0=scale f1=lower_bound */
+    PLOW_DOP_KDA_STATE_STEP_G = 112,
+    /* MXFP4 (w4a16) PREFILL fused gate|up GEMM+GLU — the T-row twin of PLOW_DOP_GEMV_GLU_MXFP4 (92)
+     * and the fp4 twin of PLOW_DOP_GEMM_GLU (20). Gate and up are two packed-2/byte fp4 matrices,
+     * each with its OWN E8M0 scale rows (K/32 bytes/row); the SwiGLU fuses act(g)*u in the epilogue.
+     *
+     * Without it the shared-expert prefill unfuses into two PLOW_DOP_GEMM_MXFP4 plus a PLOW_DOP_GLU,
+     * which materialises gate and up ([M,N] bf16 each) to HBM and reads them both back — ~8 bytes
+     * per output element of avoidable traffic, plus two extra packets and their gates. It is the
+     * one place in an mxfp4 packet where the ENCODING costs HBM traffic rather than only a
+     * different weight fetch; precision and fusion are orthogonal and this closes the gap.
+     *
+     * 256x256 ONLY, like the bf16 twin: the epilogue's wave->column remap needs SN == 2. So devgen
+     * takes this arm only where 256x256 is the winning fp4 rung at (M, 2N, K) — the 2N because a GLU
+     * tile emits BN/2 columns — and keeps the unfused triple where a narrower rung wins. MEASURED at
+     * the K3 shared-expert shape: -38.8% .. -48.7% against the SAME tile unfused, and -20% .. -35%
+     * against the BEST unfused rung where the gate fires. The win is a whole WAVE of the 256 CUs
+     * (the fused arm does the pair's MFMA in one kernel instead of two), not the round trip.
+     * t0=fu t1=A(bf16) t2=Wg(fp4) t5=Wu(fp4) t3=Sg(e8m0) t4=Su(e8m0)  i0=M i1=N i2=K i5=act.
+     * Same slot map as op 92. See op_gemm.h d_gemm_glu_mxfp4. */
+    PLOW_DOP_GEMM_GLU_MXFP4 = 113,
+
+    /* t0=q_out t1=x t2=W_q(fp4) t3=k_out t4=W_k(fp4) t5=v_out t6=W_v(fp4)
+     * i0=M i1=Nq i2=K i3=Nk i4=Nv i5=S_q i6=S_k i7=S_v (all three TENSOR HANDLES, not integers)
+     * MXFP4 (w4a16) FUSED Q|K|V DECODE GEMV — the fp4 twin of PLOW_DOP_GEMV_QKV (22), for Kimi-K3's
+     * three MLA down-projections (q_a 1536, kv_a 512, k_rope 64), which all read the same pre-normed
+     * x[7168]. Their output columns concatenate into one N = Nq+Nk+Nv sweep, exactly as op 22's do.
+     *
+     * WHY THE SCALE ROWS LIVE IN i5/i6/i7. Three outputs + three fp4 weights + three E8M0 scale rows
+     * + x is TEN pointers; t[] holds eight and the wire instruction is a fixed 64 bytes. Op 108 set
+     * the rule for which operand is demoted: a WEIGHT, because a wrong weight handle reads the wrong
+     * bytes and the output is visibly garbage, where a wrong OUTPUT handle would silently overwrite
+     * an unrelated tensor. An MX scale row is that same kind of operand and strictly safer — it is
+     * read-only, it is half of the weight (fp4 nibbles mean nothing without their exponents), and a
+     * wrong one is off by a per-block power of two, which is visible in the first token. So t[0..6]
+     * is byte-for-byte op 22's and the three handles take the three integer slots op 22 leaves
+     * empty. No output is demoted.
+     *
+     * REJECTED: a packed pointer blob like PLOW_DOP_MAMBA2_SCAN's (dev.rs calls that form a symptom
+     * of over-fusion, and it adds an indirection to a launch-bound kernel); and requiring the three
+     * scale rows CONTIGUOUS so one base + stride addresses all three (they are three separate
+     * checkpoint tensors — q_a_proj, kv_a_proj, k_rope — so the arena would have to repack them, and
+     * a silent violation reads another tensor's exponents).
+     *
+     * Nv == 0 is the TWO-STREAM form (t5/t6/i7 all absent), which is what the q_nope|q_rope pair off
+     * the q-lora norm needs. Any other absence TRAPS: this interpreter's dispatch `default:` writes
+     * nothing, so a malformed packet quietly degrading to a narrower sweep would leave an output
+     * exactly as it found it — finite, fluent and wrong.
+     *
+     * ONE BODY with op 91, which is this with Nk = Nv = 0. See op_gemm.h d_gemv_qkv_mxfp4. */
+    PLOW_DOP_GEMV_QKV_MXFP4 = 114,
+
     PLOW_DOP__COUNT
 };
 

@@ -57,6 +57,31 @@
  * The same discipline is applied to everything new here: every one of rows M2 / G1 / Q3 / K1 has a
  * control next to it saying what a wrong version would have looked like.
  *
+ * ============================================================================================
+ * THE FIFTH THING, ADDED LATER: FP8 (e4m3) LATENT KV                             [MLA-FP8-KV]
+ * ============================================================================================
+ * `K3_MLA_FP8=0|1|2` re-runs the SAME 21 rows against the SAME reference with the latent cache
+ * in e4m3: 1 = `ckv` only, 2 = `ckv` and `krot`. Mode 0 is the bf16 gate, byte for byte.
+ *
+ * ONE HARNESS AND NOT A SECOND FILE, because the whole value of the fp8 measurement is that it
+ * is the same 21 rows against the same reference — a separate copy would drift and the
+ * comparison would stop meaning anything.
+ *
+ * The fp8 modes need an object built `-DPLOW_FP8_KV=1`
+ * (`PLOW_EXTRA_DEFS=-DPLOW_FP8_KV=1 scripts/build_k3_mla.sh <outdir>`), and the axis is a SWAP,
+ * so the pairing is not optional in either direction. Running mode 0 against the fp8 object
+ * prints "all packets executed on every slice: YES" and then scores rel 1.000e+00 at row M2 —
+ * an untouched `Opart` read as a result. That is what `plow_fp8_kv_1` / `check_kv_encoding`
+ * (`crates/plowrt/src/exec/amd.rs`) now refuse; this harness is deliberately below that layer
+ * and can still demonstrate it.
+ *
+ * WHAT THE FP8 MODES GATE, and what they do NOT. They gate that the KERNEL is correct: the
+ * write lands ON the e4m3 round-trip floor, the shared latent does not amplify (`amp` below is
+ * a hard condition), the krot write still lands at row QPOS and nowhere else. They do NOT
+ * assert fp8 is as accurate as bf16 — it is not, by ~25x at row M2, and the harness prints that
+ * as an explicit COST line rather than hiding it in a loosened tolerance. See
+ * plans/mla-fp8-kv.md for the full table.
+ *
  *   ./k3_mla_test [interp_decode.elf] [k3_mla_fixture.bin]
  */
 #define _GNU_SOURCE
@@ -78,6 +103,56 @@ static float b2f(bf16 b) {
     union { uint32_t u; float f; } c;
     c.u = (uint32_t)b << 16;
     return c.f;
+}
+
+static bf16 f2b(float f) {
+    union { uint32_t u; float f; } c;
+    c.f = f;
+    /* RNE to bf16, matching the device's f2bf. */
+    uint32_t r = (c.u + 0x7fffu + ((c.u >> 16) & 1u)) >> 16;
+    return (bf16)r;
+}
+
+/* ---- OCP e4m3 (`torch.float8_e4m3fn`), host side.                          [MLA-FP8-KV]
+ *
+ * The device writer is `quant_fp8` = gfx950's `cvt_pk_fp8_f32`, which is RNE + saturating in
+ * hardware. Rather than transliterate its bit twiddling (and get the subnormal or the tie wrong
+ * in a way that would silently show up as "fp8 KV costs more accuracy than it does"), this
+ * enumerates all 127 finite magnitudes and picks the NEAREST, ties to the even code. Codes are
+ * monotonic in magnitude, so nearest-value + tie-to-even-code IS round-to-nearest-even. 127
+ * comparisons per element is irrelevant at gate sizes and leaves nothing to get wrong. */
+static float e4m3_dec(uint8_t b) {
+    const uint32_t s = (b >> 7) & 1u, e = (b >> 3) & 0xfu, m = b & 7u;
+    float v;
+    if (e == 0) v = ldexpf((float)m, -9);                       /* subnormal, 2^-6 * m/8 */
+    else v = ldexpf(1.0f + (float)m * 0.125f, (int)e - 7);
+    return s ? -v : v;
+}
+static float g_e4m3[127];   /* magnitudes of codes 0..126; 0x7f is NaN in e4m3fn */
+static void e4m3_init(void) {
+    for (int c = 0; c < 127; c++) g_e4m3[c] = e4m3_dec((uint8_t)c);
+}
+static uint8_t f2e4m3(float f) {
+    const uint32_t sign = (f < 0.0f) ? 0x80u : 0u;
+    float a = fabsf(f);
+    if (!(a == a)) return (uint8_t)(sign | 0x7fu);              /* NaN */
+    if (a >= g_e4m3[126]) return (uint8_t)(sign | 126u);        /* saturate to 448 */
+    int best = 0;
+    double bd = fabs((double)a - g_e4m3[0]);
+    for (int c = 1; c < 127; c++) {
+        const double d = fabs((double)a - g_e4m3[c]);
+        if (d < bd || (d == bd && (c & 1) == 0)) { bd = d; best = c; }
+    }
+    return (uint8_t)(sign | (unsigned)best);
+}
+/* Quantize ONE cache row exactly as `d_headnorm_rope_fp8` would: amax over the whole row maps to
+ * e4m3's 448, the stored byte is round(v * 448/amax), and the row scale is amax/448. */
+static void quant_row_e4m3(const bf16* src, uint8_t* dst, float* scale, int n) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++) amax = fmaxf(amax, fabsf(b2f(src[i])));
+    const float qinv = (amax > 0.0f) ? (448.0f / amax) : 0.0f;
+    *scale = amax * (1.0f / 448.0f);
+    for (int i = 0; i < n; i++) dst[i] = f2e4m3(b2f(src[i]) * qinv);
 }
 
 static PlowDevInst g_inst[512];
@@ -287,6 +362,53 @@ int main(int argc, char** argv) {
      * so BOTH row-targeting mechanisms the runtime uses are covered. */
     int t_ckvrow = reg((char*)g_tens[t_ckv] + (size_t)QPOS * DK * 2);
 
+    /* ---- FP8 (e4m3) LATENT KV.                                             [MLA-FP8-KV]
+     *
+     *   K3_MLA_FP8=0  (default)  bf16 latent + bf16 krot — the shipped bf16-KV gate, unchanged.
+     *   K3_MLA_FP8=1             ckv e4m3, krot bf16     — the shipped fp8 form.
+     *   K3_MLA_FP8=2             ckv e4m3, krot e4m3     — the "is the last 11% of the saving
+     *                                                       worth it" arm.
+     *
+     * The HISTORY is quantized HERE, on the host, because that is what a real run would contain:
+     * every row 0..QPOS-1 was written by the fp8 writer at its own step. Quantizing only the row
+     * this layer writes would measure a 1-in-L error and call it the fp8 KV error.
+     *
+     * Mode 2 is why `krot`'s scale strip exists at `kv_scale[L..2L)`: the kernel reads the ckv
+     * scale at `kv_scale[b*kv_stride + row]` and the krot scale at
+     * `kv_scale[(n_batch+b)*kv_stride + row]`, so with n_batch=1, kv_stride=L the two strips are
+     * simply the two halves of one array — the only way to fit two scale arrays through the ONE
+     * free tensor slot the dense MLA decode has.
+     *
+     * The QPOS row keeps a POISON, as in bf16: byte 0x7e (=448) against a 1e30 row scale is
+     * 4.5e32, so "the layer forgot to write its own KV row" still explodes rather than drifting. */
+    e4m3_init();
+    const int FP8 = getenv("K3_MLA_FP8") ? atoi(getenv("K3_MLA_FP8")) : 0;
+    if (FP8 < 0 || FP8 > 2) { printf("K3_MLA_FP8 must be 0, 1 or 2\n"); return 1; }
+    uint8_t* q_ckv = malloc((size_t)L * DK);
+    uint8_t* q_krot = malloc((size_t)L * DR);
+    float* q_scale = calloc((size_t)L * 2, 4);
+    int t_ckv8 = -1, t_krot8 = -1, t_scale = -1, t_scale_kr = -1;
+    if (FP8) {
+        for (int r = 0; r < L - 1; r++) {
+            quant_row_e4m3(P_ckv_hist + (size_t)r * DK, q_ckv + (size_t)r * DK, &q_scale[r], DK);
+            quant_row_e4m3(P_krot_hist + (size_t)r * DR, q_krot + (size_t)r * DR,
+                           &q_scale[L + r], DR);
+        }
+        memset(q_ckv + (size_t)QPOS * DK, 0x7e, (size_t)DK);
+        memset(q_krot + (size_t)QPOS * DR, 0x7e, (size_t)DR);
+        q_scale[QPOS] = 1e30f;
+        q_scale[L + QPOS] = 1e30f;
+        t_ckv8 = DUP(q_ckv, (size_t)L * DK);
+        t_krot8 = DUP(q_krot, (size_t)L * DR);
+        t_scale = DUP(q_scale, (size_t)L * 2 * 4);
+        t_scale_kr = reg((char*)g_tens[t_scale] + (size_t)L * 4);
+        printf("              FP8 LATENT KV mode %d: ckv e4m3, krot %s;  cache %zu -> %zu B/token"
+               " (%.1f%% saved)\n", FP8, FP8 == 2 ? "e4m3" : "bf16",
+               (size_t)(DK + DR) * 2, (size_t)DK + 4 + (FP8 == 2 ? (size_t)DR + 4 : (size_t)DR * 2),
+               100.0 * (1.0 - (double)((size_t)DK + 4 + (FP8 == 2 ? (size_t)DR + 4 : (size_t)DR * 2))
+                                  / (double)((size_t)(DK + DR) * 2)));
+    }
+
     int32_t klen = L, pos = QPOS;
     int t_klen = DUP(&klen, 4), t_pos = DUP(&pos, 4);
 
@@ -360,6 +482,11 @@ int main(int argc, char** argv) {
     g_inst[i_ar1].t[0] = t_ha; g_inst[i_ar1].t[1] = t_prefix_in; g_inst[i_ar1].t[2] = t_blkres;
     g_inst[i_ar1].t[3] = t_asw;
     g_inst[i_ar1].i[0] = T; g_inst[i_ar1].i[1] = HID; g_inst[i_ar1].i[2] = NB;
+    /* i[4] IS THE RING CAPACITY. `d_attn_res` strides `[T][NBCAP][HID]` and refuses
+     * `NBCAP < NB`; unset it reads 0 and the arm poisons every stage from here down.
+     * Same omission as k3_block_gfx950_test.c and k3_moe_block_gfx950_test.c — the
+     * third hand-built transcription of this op to need the operand carried by hand. */
+    g_inst[i_ar1].i[4] = NB;
     g_inst[i_ar1].fj[0].f = EPS;
 
     /* A1 — input_layernorm. `t_x` is `hidden_states` as KimiMLAAttention.forward sees it, and it
@@ -390,16 +517,44 @@ int main(int argc, char** argv) {
     g_inst[i_qr].fj[2].u = KV_MASK_NONE;
     addwait(i_qr, i_qrr, ALL);
 
-    /* K0 — kv_a_layernorm, writing the LATENT cache row directly (pre-offset handle). */
-    int i_rnkv = RMSN(t_ckvrow, t_ckvraw, t_gkva, DK, i_ckvd, ALL);
+    /* K0 — kv_a_layernorm, writing the LATENT cache row directly (pre-offset handle).
+     *
+     * FP8: the SAME norm, storing e4m3 + a per-row scale. `HEADNORM_ROPE_FP8` at HD=512 with
+     * `cosb`/`sinb` absent and `skip_norm=0` IS an RMSNorm plus an fp8 store — bit-for-bit the
+     * same formula `d_rmsnorm` computes (`v * rsqrt(mean(v^2)+eps) * gamma`), reduced over one
+     * wave instead of a block. Reusing that op rather than inventing an `RmsNormFp8` is the
+     * point: `plowrt::exec::amd::kv_write_row_field` ALREADY maps `HeadNormRopeFp8` to `i[3]`,
+     * so the per-step row patch keeps finding this layer. A new opcode would have dropped it
+     * out of the writer list with no count check — the exact failure the k-side note below
+     * describes for deleting the krot write. */
+    int i_rnkv;
+    if (!FP8) {
+        i_rnkv = RMSN(t_ckvrow, t_ckvraw, t_gkva, DK, i_ckvd, ALL);
+    } else {
+        i_rnkv = emitop(PLOW_DOP_HEADNORM_ROPE_FP8, ALL);
+        g_inst[i_rnkv].t[0] = t_ckv8; g_inst[i_rnkv].t[1] = t_ckvraw; g_inst[i_rnkv].t[2] = t_gkva;
+        g_inst[i_rnkv].t[3] = PLOW_TENSOR_NONE; g_inst[i_rnkv].t[4] = PLOW_TENSOR_NONE;
+        g_inst[i_rnkv].t[5] = t_pos; g_inst[i_rnkv].t[6] = t_scale;
+        g_inst[i_rnkv].i[0] = T; g_inst[i_rnkv].i[1] = 1; g_inst[i_rnkv].i[2] = DK;
+        g_inst[i_rnkv].i[3] = (uint32_t)QPOS; g_inst[i_rnkv].i[4] = 0;  /* out_row0, DO normalize */
+        g_inst[i_rnkv].fj[0].f = EPS;
+        g_inst[i_rnkv].fj[1].u = 0;
+        g_inst[i_rnkv].fj[2].u = KV_MASK_NONE;
+        addwait(i_rnkv, i_ckvd, ALL);
+    }
 
     /* K1 — the k-side HeadNormRope. THE ONE THAT MUST NOT BE DELETED. It is the only writer of the
      * `kv.{l}.krot` row and it is the instruction the runtime SCANS FOR to patch `i[3]` each step;
      * here `i[3] = QPOS` is that patch, applied once. With the identity table it is a bit-exact
      * copy of `t_krr` into row QPOS — the WRITE kept, the ROTATION removed. */
-    int i_krd = emitop(PLOW_DOP_HEADNORM_ROPE, ALL);
-    g_inst[i_krd].t[0] = t_krot; g_inst[i_krd].t[1] = t_krr; g_inst[i_krd].t[2] = PLOW_TENSOR_NONE;
+    /* Mode 2 swaps this for HEADNORM_ROPE_FP8 at HD=64 — the SAME identity table, the same row,
+     * the same `i[3]` patch point, an e4m3 store. The bitwise NoPE check necessarily becomes a
+     * quantization-error check there; see the readback. */
+    int i_krd = emitop(FP8 == 2 ? PLOW_DOP_HEADNORM_ROPE_FP8 : PLOW_DOP_HEADNORM_ROPE, ALL);
+    g_inst[i_krd].t[0] = (FP8 == 2) ? t_krot8 : t_krot;
+    g_inst[i_krd].t[1] = t_krr; g_inst[i_krd].t[2] = PLOW_TENSOR_NONE;
     g_inst[i_krd].t[3] = t_cos; g_inst[i_krd].t[4] = t_sin; g_inst[i_krd].t[5] = t_pos;
+    if (FP8 == 2) g_inst[i_krd].t[6] = t_scale_kr;
     g_inst[i_krd].i[0] = T; g_inst[i_krd].i[1] = 1; g_inst[i_krd].i[2] = DR;
     g_inst[i_krd].i[3] = (uint32_t)QPOS; g_inst[i_krd].i[4] = 1;
     g_inst[i_krd].fj[0].f = EPS;
@@ -409,12 +564,16 @@ int main(int argc, char** argv) {
 
     /* M1 — FLASH_MLA_DECODE over the LATENT. One "kv head": every query head reads the same
      * 512-wide latent plus the shared 64-wide rope row. i[3]=window=0 (dense, full causal). */
-    int i_fl = emitop(PLOW_DOP_FLASH_MLA_DECODE, ALL);
+    int i_fl = emitop(FP8 ? PLOW_DOP_FLASH_MLA_DECODE_FP8 : PLOW_DOP_FLASH_MLA_DECODE, ALL);
     g_inst[i_fl].t[0] = t_opart; g_inst[i_fl].t[1] = t_mlpart;
     g_inst[i_fl].t[2] = t_qa; g_inst[i_fl].t[3] = t_qr;
-    g_inst[i_fl].t[4] = t_ckv; g_inst[i_fl].t[5] = t_krot; g_inst[i_fl].t[6] = t_klen;
+    g_inst[i_fl].t[4] = FP8 ? t_ckv8 : t_ckv;
+    g_inst[i_fl].t[5] = (FP8 == 2) ? t_krot8 : t_krot;
+    g_inst[i_fl].t[6] = t_klen;
+    if (FP8) g_inst[i_fl].t[7] = t_scale;
     g_inst[i_fl].i[0] = 1; g_inst[i_fl].i[1] = NH; g_inst[i_fl].i[2] = L;
     g_inst[i_fl].i[3] = 0; g_inst[i_fl].i[4] = NSPLIT; g_inst[i_fl].i[5] = KV_MASK_NONE;
+    g_inst[i_fl].i[6] = (FP8 == 2) ? 1u : 0u;   /* krot_fp8 */
     g_inst[i_fl].i[7] = GF;
     g_inst[i_fl].fj[0].f = SCALE;
     addwait(i_fl, i_qa, ALL); addwait(i_fl, i_qr, ALL);
@@ -454,6 +613,7 @@ int main(int argc, char** argv) {
     g_inst[i_ar2].t[0] = t_h2; g_inst[i_ar2].t[1] = t_prefix; g_inst[i_ar2].t[2] = t_blkres;
     g_inst[i_ar2].t[3] = t_msw;
     g_inst[i_ar2].i[0] = T; g_inst[i_ar2].i[1] = HID; g_inst[i_ar2].i[2] = NB;
+    g_inst[i_ar2].i[4] = NB; /* capacity, as at the attn-side site above */
     g_inst[i_ar2].fj[0].f = EPS;
     addwait(i_ar2, i_pfx, ALL);
 
@@ -589,8 +749,31 @@ int main(int argc, char** argv) {
     plow_hsa_download(h, 0, o_qrr, g_tens[t_qrr], (size_t)NH * DR * 2);
     plow_hsa_download(h, 0, o_qr, g_tens[t_qr], (size_t)NH * DR * 2);
     plow_hsa_download(h, 0, o_krr, g_tens[t_krr], (size_t)DR * 2);
+    /* FP8: read the BYTE cache + the scale strips back and DEQUANTIZE into the same bf16 buffers
+     * the bf16 path fills, so every row below is the same comparison against the same reference.
+     * The dequant is `byte * row_scale` rounded to bf16 — the value the kernel's dot sees, not a
+     * looser reconstruction. */
+    uint8_t* o_ckv8 = malloc((size_t)L * DK);
+    uint8_t* o_krot8 = malloc((size_t)L * DR);
+    float* o_scale = malloc((size_t)L * 2 * 4);
+    if (FP8) {
+        plow_hsa_download(h, 0, o_ckv8, g_tens[t_ckv8], (size_t)L * DK);
+        plow_hsa_download(h, 0, o_scale, g_tens[t_scale], (size_t)L * 2 * 4);
+        for (size_t r = 0; r < (size_t)L; r++)
+            for (int d = 0; d < DK; d++)
+                o_ckv[r * DK + d] = f2b(e4m3_dec(o_ckv8[r * DK + d]) * o_scale[r]);
+        if (FP8 == 2) {
+            plow_hsa_download(h, 0, o_krot8, g_tens[t_krot8], (size_t)L * DR);
+            for (size_t r = 0; r < (size_t)L; r++)
+                for (int d = 0; d < DR; d++)
+                    o_krot[r * DR + d] = f2b(e4m3_dec(o_krot8[r * DR + d]) * o_scale[L + r]);
+        } else {
+            plow_hsa_download(h, 0, o_krot, g_tens[t_krot], (size_t)L * DR * 2);
+        }
+    } else {
     plow_hsa_download(h, 0, o_ckv, g_tens[t_ckv], (size_t)L * DK * 2);
     plow_hsa_download(h, 0, o_krot, g_tens[t_krot], (size_t)L * DR * 2);
+    }
     plow_hsa_download(h, 0, o_oat, g_tens[t_oat], NHVD * 2);
     plow_hsa_download(h, 0, o_gl, g_tens[t_gl], NHVD * 2);
     plow_hsa_download(h, 0, o_oatg, g_tens[t_oatg], NHVD * 2);
@@ -627,8 +810,28 @@ int main(int argc, char** argv) {
      *       per-step `i[3]` patch depends on, and the reason the op must be KEPT rather than
      *       deleted (it is also the instruction the kv-row-writer scan looks for). ---- */
     int qbits = memcmp(o_qr, o_qrr, (size_t)NH * DR * 2) == 0;
-    int kbits = memcmp(o_krot + (size_t)QPOS * DR, o_krr, (size_t)DR * 2) == 0;
-    int hist_intact = memcmp(o_krot, P_krot_hist, (size_t)(L - 1) * DR * 2) == 0;
+    /* Mode 2 quantizes krot, so "bit-exact copy" is no longer the right claim about the CACHE —
+     * but it is still the right claim about the op, and the byte cache is where it survives: the
+     * write must land on row QPOS and nowhere else, and the dequantized row must differ from
+     * `krr` by the e4m3 grid and NOTHING more. Both are checked; neither is weakened to a
+     * tolerance that a rotation could hide under (a real RoPE moves the cache by 7.0e-1, three
+     * orders above e4m3's ~2e-2). */
+    int kbits, hist_intact;
+    double krot_q_err = 0.0;
+    if (FP8 == 2) {
+        uint8_t* want = malloc((size_t)DR);
+        float ws;
+        quant_row_e4m3(o_krr, want, &ws, DR);
+        kbits = memcmp(o_krot8 + (size_t)QPOS * DR, want, (size_t)DR) == 0;
+        hist_intact = memcmp(o_krot8, q_krot, (size_t)(L - 1) * DR) == 0
+                      && memcmp(o_scale + L, q_scale + L, (size_t)(L - 1) * 4) == 0;
+        double wq;
+        krot_q_err = relerr(o_krot + (size_t)QPOS * DR, o_krr, (size_t)DR, &wq);
+        free(want);
+    } else {
+        kbits = memcmp(o_krot + (size_t)QPOS * DR, o_krr, (size_t)DR * 2) == 0;
+        hist_intact = memcmp(o_krot, P_krot_hist, (size_t)(L - 1) * DR * 2) == 0;
+    }
     /* Would a non-identity table have been visible here? Only if the input is not already a RoPE
      * fixed point. Every-element-equal is the fixed point; assert we are not sitting on it. */
     int q_nonzero = 0;
@@ -636,7 +839,11 @@ int main(int argc, char** argv) {
     printf("\n  NoPE (identity cos=1/sin=0 table), checked BITWISE not to a tolerance\n");
     printf("    q_rope  HeadNormRope is a bit-exact copy : %s   (%d of %zu inputs nonzero)\n",
            qbits ? "YES" : "*** NO ***", q_nonzero, (size_t)NH * DR);
-    printf("    k_rope  HeadNormRope is a bit-exact copy : %s\n", kbits ? "YES" : "*** NO ***");
+    if (FP8 == 2)
+        printf("    k_rope  HeadNormRopeFp8 stores the exact e4m3 of krr : %s   (dequant rel %.3e)\n",
+               kbits ? "YES" : "*** NO ***", krot_q_err);
+    else
+        printf("    k_rope  HeadNormRope is a bit-exact copy : %s\n", kbits ? "YES" : "*** NO ***");
     printf("    it wrote kv.krot row %d and left rows 0..%d untouched : %s\n", QPOS, QPOS - 1,
            hist_intact ? "YES" : "*** NO ***");
     printf("    (the op is KEPT and NEUTRALIZED, not deleted: it is the ONLY writer of the krot\n"
@@ -806,18 +1013,99 @@ int main(int argc, char** argv) {
     printf("            (must be LARGE — a gate that evaluated to 1 would pass row G1 silently)\n");
 
     const double TOL = 1.5e-2, TOL_F32 = 2e-2, TOL_EXP = 6e-2;
+    /* ---- FP8 KV: the grid floor, stated as its own number.                  [MLA-FP8-KV]
+     *
+     * Rows K0/K1 STORE the cache, so under fp8 they measure e4m3's 3 mantissa bits and nothing
+     * else — ~2.6e-2 rms by construction (the quantization error of a value is uniform on
+     * ±step/2 with step between v/16 and v/8, so rms_err/rms_val ≈ 0.29/11). Holding them to the
+     * bf16 1.5e-2 would fail the gate for being fp8, which is not information. They get
+     * `TOL_KVQ`, and the ROUND-TRIP CONTROL below says what the floor actually is on this data,
+     * so the tolerance is anchored to a measurement rather than chosen to pass.
+     *
+     * Every row DOWNSTREAM of the cache keeps the bf16 TOL. That is the real question this gate
+     * asks about fp8 MLA: the latent is shared by all 96 query heads and consumed through
+     * `q_absorb` and `MlaMergeFold`, so a 2.6e-2 store error could arrive at M2 amplified,
+     * attenuated, or unchanged — and only the M2/M9 rows can say which. */
+    const double TOL_KVQ = FP8 ? 4e-2 : TOL;
+    /* The rows DOWNSTREAM of the cache under fp8. Not a claim that fp8 is as accurate as bf16 —
+     * the COST lines below say in numbers that it is not. This is the band in which the KERNEL is
+     * correct, so that `K3_MLA_FP8=1` is a usable regression gate for the new opcode rather than
+     * a test that always fails for being fp8. The falsifiable part is `amp` below. */
+    const double TOL_FP8_ATTN = FP8 ? 4e-2 : TOL;
+    double amp = 0.0;
+    int amp_ok = 1;
+    if (FP8) {
+        bf16* rt = malloc((size_t)DK * 2);
+        uint8_t* qb = malloc((size_t)DK);
+        float qs;
+        double wq;
+        quant_row_e4m3(R_ckvcur, qb, &qs, DK);
+        for (int d = 0; d < DK; d++) rt[d] = f2b(e4m3_dec(qb[d]) * qs);
+        const double floor_ckv = relerr(rt, R_ckvcur, (size_t)DK, &wq);
+        /* WOULD A FINER SCALE HELP? The per-row scale maps the row's amax onto 448, so every
+         * element that carries weight in an RMS metric sits in a NORMAL e4m3 binade and its error
+         * is the 3-bit mantissa, not the scale. Re-quantizing the same row with a per-128-element
+         * BLOCK scale answers that as a measurement instead of an argument: if the two floors are
+         * the same number, the error is e4m3's information content and no scale placement — per
+         * tensor, per row, per block — can move it. That is the fact that decides whether "make
+         * the scale finer" is a lever or a distraction. */
+        double bq_num = 0, bq_den = 0;
+        for (int b0 = 0; b0 < DK; b0 += 128) {
+            float bs;
+            quant_row_e4m3(R_ckvcur + b0, qb, &bs, 128);
+            for (int d = 0; d < 128; d++) {
+                const double got = (double)b2f(f2b(e4m3_dec(qb[d]) * bs));
+                const double want = (double)b2f(R_ckvcur[b0 + d]);
+                bq_num += (got - want) * (got - want);
+                bq_den += want * want;
+            }
+        }
+        const double floor_blk = sqrt(bq_num / DK) / (sqrt(bq_den / DK) + 1e-9);
+        const size_t bf16_b = (size_t)(DK + DR) * 2;
+        const size_t fp8_b = (size_t)DK + 4 + (FP8 == 2 ? (size_t)DR + 4 : (size_t)DR * 2);
+        amp = r_oat / floor_ckv;
+        amp_ok = amp < 1.3;
+        printf("\n  [fp8 kv] e4m3 ROUND-TRIP FLOOR on the reference ckv row : %10.3e  (worst %.3e)\n",
+               floor_ckv, wq);
+        printf("           row K0 cannot beat this — it is what a PERFECT fp8 writer would score.\n");
+        printf("  [fp8 kv] the same row at a PER-128-BLOCK scale          : %10.3e\n", floor_blk);
+        printf("           (a finer scale is NOT a lever: the error is e4m3's 3 mantissa bits, and\n"
+               "            every RMS-significant element is already in a normal binade)\n");
+        printf("  [fp8 kv] AMPLIFICATION  M2 / floor = %.3f : %s\n", amp,
+               amp_ok ? "the shared latent does NOT amplify"
+                      : "*** the shared latent AMPLIFIES — this is the MLA-specific risk ***");
+        printf("           (every one of the %d query heads reads the SAME perturbed latent row,\n"
+               "            through q_absorb and MlaMergeFold. This ratio is the falsifiable\n"
+               "            claim: at ~1 the attention output carries the cache error and no more.)\n",
+               NH);
+        printf("  [fp8 kv] COST vs bf16 KV: this run's M2 is %10.3e; the bf16-KV gate scores\n"
+               "           ~1e-3 to 2e-3 on the same row. fp8 latent KV is a REAL accuracy cost,\n"
+               "           not a free win — read it against the saving on the next line.\n", r_oat);
+        printf("  [fp8 kv] latent cache %zu -> %zu B per token per MLA layer  (%.1f%% saved)\n",
+               bf16_b, fp8_b, 100.0 * (1.0 - (double)fp8_b / (double)bf16_b));
+        printf("           Kimi-K3, 24 MLA layers, 128k ctx: %.2f -> %.2f GiB\n",
+               24.0 * bf16_b * 131072 / (1024.0 * 1024 * 1024),
+               24.0 * fp8_b * 131072 / (1024.0 * 1024 * 1024));
+        free(rt); free(qb);
+    }
     /* `order_ok` is NOT a gate condition; `tie_ok` is. See the routing-table note above: the MoE
      * combine sums the slots, so a permutation of the top-k table cannot change the model's
      * output — but a permutation the logit discrepancy CANNOT explain is a ranking bug and fails. */
-    int ok = exec_ok && route_ok && tie_ok && gate_max < TOL_F32 &&
+    int ok = exec_ok && route_ok && tie_ok && gate_max < (FP8 ? 6e-3 : TOL_F32) && amp_ok &&
              qbits && kbits && hist_intact && q_nonzero > 0 &&
              r_ha < TOL && r_x < TOL && r_qlat < TOL && r_qa < TOL && r_qr < TOL &&
-             r_ckv < TOL && r_krot < TOL && r_oat < TOL && r_gl < TOL && r_og < TOL &&
-             r_at < TOL && r_pf < TOL && r_h2 < TOL && r_h3 < TOL && r_lg < TOL &&
+             r_ckv < TOL_KVQ && r_krot < TOL_KVQ && r_oat < TOL_FP8_ATTN && r_gl < TOL &&
+             r_og < TOL_FP8_ATTN &&
+             r_at < TOL_FP8_ATTN && r_pf < TOL && r_h2 < TOL && r_h3 < TOL && r_lg < TOL &&
              r_xe < TOL && r_fu < TOL_EXP && r_pt < TOL_EXP && r_yl < TOL_EXP &&
              r_yn < TOL_EXP && r_yh < TOL_EXP && r_sh < TOL && r_out < TOL &&
              c_ha > 0.1 && c_h2 > 0.1 && c_gate > 0.1;
 
+    if (FP8)
+        printf("\n=> %s (FP8 LATENT KV mode %d — the accuracy COST above is a finding, not a "
+               "failure; this line only says the fp8 kernel is CORRECT)\n",
+               ok ? "K3 GATED MLA BLOCK OK" : "*** K3 GATED MLA BLOCK MISMATCH ***", FP8);
+    else
     printf("\n=> %s\n", ok ? "K3 GATED MLA BLOCK OK — absorbed MLA over a real KV cache, NoPE as a "
                              "bit-exact krot write, the sigmoid output gate, both AttnRes "
                              "applications and Stable LatentMoE match the reference on real "

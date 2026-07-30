@@ -132,16 +132,30 @@ pub fn coverage(shapes: &[Demand]) -> (usize, usize) {
 pub fn render(shapes: &[Demand]) -> String {
     let mut s = String::new();
     for d in shapes {
-        s.push_str(&format!("{} {} {}    {}\n", d.m, d.n, d.k, d.label()));
+        s.push_str(&format!("{} {} {}    {}    {:?}\n", d.m, d.n, d.k, d.label(), d.quant));
     }
     s
 }
 
-/// Parse a `--shapes <file>` list: `M N K [label]` per line, `#` comments, blanks ignored.
+/// One line of a `--shapes <file>` list.
+pub struct Listed {
+    pub m: i64,
+    pub n: i64,
+    pub k: i64,
+    pub label: String,
+    /// The weight encoding to measure. Absent means `None` (bf16) — which is what every
+    /// hand-authored list in the tree means, since bf16 was the only ladder that existed.
+    pub quant: kernelcaps::QuantScheme,
+}
+
+/// Parse a `--shapes <file>` list: `M N K [label [quant]]` per line, `#` comments, blanks ignored.
 ///
-/// The same grammar as the `SHAPES` heredoc in `scripts/rebench_tune_gemm.sh`, so that list can be
-/// fed to this command verbatim — which is what makes an A/B against the bash campaign possible.
-pub fn parse_list(text: &str) -> Result<Vec<(i64, i64, i64, String)>, String> {
+/// A superset of the `SHAPES` heredoc grammar in `scripts/rebench_tune_gemm.sh`, so that list can
+/// still be fed to this command verbatim — which is what makes an A/B against the bash campaign
+/// possible. The `quant` column is the addition: a shape list is only a campaign once it says
+/// which ENCODING each shape is to be measured in, and a file that omits it means bf16 because
+/// that is what every file in the tree predating mxfp4 meant.
+pub fn parse_list(text: &str) -> Result<Vec<Listed>, String> {
     let mut out = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or("").trim();
@@ -150,14 +164,27 @@ pub fn parse_list(text: &str) -> Result<Vec<(i64, i64, i64, String)>, String> {
         }
         let f: Vec<&str> = line.split_whitespace().collect();
         if f.len() < 3 {
-            return Err(format!("line {}: expected `M N K [label]`, got {raw:?}", i + 1));
+            return Err(format!("line {}: expected `M N K [label [quant]]`, got {raw:?}", i + 1));
         }
         let p = |s: &str| s.parse::<i64>().map_err(|e| format!("line {}: {s:?}: {e}", i + 1));
         let (m, n, k) = (p(f[0])?, p(f[1])?, p(f[2])?);
         if m <= 0 || n <= 0 || k <= 0 {
             return Err(format!("line {}: shape dimensions must be positive", i + 1));
         }
-        out.push((m, n, k, f.get(3).map(|s| s.to_string()).unwrap_or_else(|| "shape".into())));
+        let quant = match f.get(4) {
+            // Rejected, not defaulted. A typo'd encoding that silently measured bf16 would
+            // publish a bf16 timing under whatever key the typo resolved to.
+            Some(q) => tunedb::gemm::parse_quant(q)
+                .ok_or_else(|| format!("line {}: unknown quant {q:?}", i + 1))?,
+            None => kernelcaps::QuantScheme::None,
+        };
+        out.push(Listed {
+            m,
+            n,
+            k,
+            label: f.get(3).map(|s| s.to_string()).unwrap_or_else(|| "shape".into()),
+            quant,
+        });
     }
     Ok(out)
 }
@@ -204,8 +231,21 @@ mod tests {
 ";
         let got = parse_list(sample).unwrap();
         assert_eq!(got.len(), 3);
-        assert_eq!(got[0], (512, 6144, 512, "glm52-kvb-up-M512".to_string()));
-        assert_eq!(got[2].2, 5376);
+        assert_eq!((got[0].m, got[0].n, got[0].k), (512, 6144, 512));
+        assert_eq!(got[0].label, "glm52-kvb-up-M512");
+        assert_eq!(got[2].k, 5376);
+        // A list with no quant column is a bf16 list — every one in the tree predates mxfp4.
+        assert!(got.iter().all(|l| l.quant == QuantScheme::None));
+    }
+
+    /// The quant column is what makes a hand-authored list able to describe an mxfp4 campaign,
+    /// and an unknown value must fail rather than quietly measure bf16 under an mxfp4 key.
+    #[test]
+    fn the_quant_column_is_parsed_and_a_bad_one_is_rejected() {
+        let got = parse_list("128 576 7168 kimi-kva Mxfp4\n128 576 7168 kimi-kva None\n").unwrap();
+        assert_eq!(got[0].quant, QuantScheme::Mxfp4);
+        assert_eq!(got[1].quant, QuantScheme::None);
+        assert!(parse_list("128 576 7168 kimi-kva Mxfp5").is_err());
     }
 
     #[test]
@@ -222,12 +262,15 @@ mod tests {
     fn rendered_demand_parses_back_to_the_same_shapes() {
         let shapes = vec![
             Demand { m: 512, n: 6144, k: 512, quant: QuantScheme::None, hit: false },
-            Demand { m: 8192, n: 64, k: 6144, quant: QuantScheme::None, hit: true },
+            Demand { m: 8192, n: 64, k: 6144, quant: QuantScheme::Mxfp4, hit: true },
         ];
         let back = parse_list(&render(&shapes)).unwrap();
         assert_eq!(back.len(), 2);
-        assert_eq!((back[0].0, back[0].1, back[0].2), (512, 6144, 512));
-        assert_eq!((back[1].0, back[1].1, back[1].2), (8192, 64, 6144));
+        assert_eq!((back[0].m, back[0].n, back[0].k), (512, 6144, 512));
+        assert_eq!((back[1].m, back[1].n, back[1].k), (8192, 64, 6144));
+        // The quant survives the round trip, or a derived mxfp4 campaign replays as bf16.
+        assert_eq!(back[0].quant, QuantScheme::None);
+        assert_eq!(back[1].quant, QuantScheme::Mxfp4);
     }
 
     #[test]

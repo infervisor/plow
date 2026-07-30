@@ -114,7 +114,7 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
             const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
                 const float g = gamma ? bf2f(gamma[i]) : 1.0f;
-                out[obase + i] = f2bf(bf2f(x[base + i]) * inv * g);
+                st_act1(&out[obase + i], f2bf(bf2f(x[base + i]) * inv * g));
             }
         }
     }
@@ -170,7 +170,7 @@ __device__ void d_layernorm_bias(bf16* __restrict__ out, const bf16* __restrict_
         for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
             const float g = gamma ? bf2f(gg[i]) : 1.0f;
             const float b = beta ? bf2f(bg[i]) : 0.0f;
-            og[obase + i] = f2bf((bf2f(xg[base + i]) - mean) * inv * g + b);
+            st_act1(&og[obase + i], f2bf((bf2f(xg[base + i]) - mean) * inv * g + b));
         }
     }
 }
@@ -346,7 +346,7 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
             for (unsigned e = 0; e < E; e++) v[e] = r[e];
         }
 
-        for (unsigned e = 0; e < E; e++) og[obase + lane + e * 64] = f2bf(v[e]);
+        for (unsigned e = 0; e < E; e++) st_act1(&og[obase + lane + e * 64], f2bf(v[e]));
     }
 }
 
@@ -434,7 +434,7 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
         const float qinv = (amax > 0.0f) ? (PLOW_FP8_E4M3_MAX / amax) : 0.0f;
         if (lane == 0) scg[row] = amax * (1.0f / PLOW_FP8_E4M3_MAX);
 #pragma unroll
-        for (unsigned e = 0; e < E; e++) og[obase + lane + e * 64] = quant_fp8(v[e] * qinv);
+        for (unsigned e = 0; e < E; e++) st_act1_u8(&og[obase + lane + e * 64], quant_fp8(v[e] * qinv));
     }
 }
 
@@ -506,7 +506,7 @@ __device__ void d_norm_residual(bf16* __restrict__ out, const bf16* __restrict__
             const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
                 const float g = gamma ? bf2f(gamma[i]) : 1.0f;
-                out[base + i] = f2bf((bf2f(a[base + i]) + bf2f(b[base + i]) * inv * g) * scale);
+                st_act1(&out[base + i], f2bf((bf2f(a[base + i]) + bf2f(b[base + i]) * inv * g) * scale));
             }
         }
     }
@@ -595,7 +595,7 @@ __device__ void d_add_norm(bf16* __restrict__ out, bf16* resid, const bf16* a,
                 const float g = gamma ? bf2f(gamma[i]) : 1.0f;
                 const float f = bf2f(a[base + i]) + bf2f(b[base + i]);
                 resid[base + i] = f2bf(f);
-                out[base + i] = f2bf(f * inv * g);
+                st_act1(&out[base + i], f2bf(f * inv * g));
             }
         }
     }
@@ -749,7 +749,7 @@ __device__ void d_norm_residual_norm(bf16* __restrict__ out, bf16* resid, const 
             const float invr = rsqrtf(block_sum(ssr, part) / (float)feat + eps);
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
                 const float g = gn ? bf2f(gn[i]) : 1.0f;
-                out[base + i] = f2bf(bf2f(resid[base + i]) * invr * g);
+                st_act1(&out[base + i], f2bf(bf2f(resid[base + i]) * invr * g));
             }
         }
     }

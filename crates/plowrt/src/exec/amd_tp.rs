@@ -83,6 +83,82 @@
 //! [`AmdTpGroup::decode_step`] and [`AmdTpGroup::prefill`] are conveniences over
 //! those, for the bench.
 //!
+//! # The host/GPU overlap that is NOT worth building — measured, 2026-07-29
+//!
+//! [`AmdTpGroup::submit_decode`] and [`AmdTpGroup::complete_decode`] were split
+//! so a server could work between them. `serve::engine` now calls the pair
+//! rather than [`AmdTpGroup::decode_step`], so the split has a caller — but
+//! **nothing is placed between them, and that is the measured conclusion, not an
+//! omission.** `PLOW_DSTEP_LOG=1` prints the breakdown that says so
+//! ([`crate::obs::dstep`]). GLM-5.2, batch 1, warm, mean of 32-token windows —
+//! TP8 under `amd-bench` on an exclusive 8-GPU lease at ctx 4096, TP4 through
+//! the endpoint:
+//!
+//! ```text
+//!                                              TP8 µs/tok       %   TP4 µs/tok
+//! pre  seed_ids (H2D in.ids, x ranks)                  —        —         32.6
+//! pre  decode_prepare (kvrow patch + scalars)      249.7    1.10%        126.0
+//! pre  rearm_prog (local counters)                 210.3    0.93%        105.2
+//! pre  zero_xctr (cross-GPU gates, all ranks)       67.1    0.30%         35.5
+//! pre  enqueue (AQL launch x ranks)                  3.9    0.02%          2.0
+//! GPU  drain (all ranks)                         22156     97.05%      27500
+//! post audit_xctr (12 KiB D2H x ranks)              87.6    0.39%         48.7
+//! post read_sampled (4 B D2H x ranks)               59.3    0.26%         30.5
+//! post agree (cross-rank compare)                    0.03   0.00%          0.05
+//! post detok + stop + SSE send                        —        —           5.8
+//! HOST TOTAL (everything but the drain)            677      2.96%        385
+//! UNATTRIBUTED (mux tick, locks, scheduler)          0.94   0.00%          1.0
+//! ```
+//!
+//! `seed_ids` and the stream row are endpoint-only, hence blank under
+//! `amd-bench`. TP8 totalled **22.729 ms/token over 128 steps, all 8 ranks
+//! token-identical**.
+//!
+//! **The host phase is 3.0% of the token at TP8, 1.4% at TP4.** It is submission
+//! overhead, so it scales with RANK COUNT and not with model size — about 65 µs
+//! per rank plus ~70 µs fixed, which reproduces both columns. Perfect overlap of
+//! every microsecond of it would therefore buy 3%, and three further facts cut
+//! that ceiling to nothing, each stronger than "not worth it":
+//!
+//! 1. **Tick N+1's prepare cannot run during tick N. It is unsafe, not merely
+//!    unprofitable.** The obvious hoist — `patch_kvrow(pos)` and the `pos`/
+//!    `kvlen` staging do not depend on the sampled token, so run them early —
+//!    overlooks *where they write*. `patch_kvrow` memcpy's into `progs[dp].
+//!    d_inst`, the very instruction buffer the resident megakernel is executing
+//!    from; `pos` and `kvlen` are device tensors every RoPE and attention op
+//!    re-reads through the tick; and `rearm_prog` zeroes the local counters the
+//!    resident tick is still signalling — the same hazard §6d rules out for
+//!    `xctr`, restated one scope down. Hoisting any of the three corrupts the
+//!    tick in flight, silently. It needs double-buffered `d_inst`/`in.pos`/
+//!    `in.kvlen`/counters and a kernarg to select the copy — a devgen and ABI
+//!    change — to buy at most the 527 µs those three rows total at TP8: 2.3%.
+//! 2. **The window would be empty anyway.** With the `pre` rows excluded by (1),
+//!    the only host work left to overlap is the `post` block, and its
+//!    non-device-touching part — detokenise, stop check, SSE frame, channel
+//!    send — is **5.8 µs**. The "serving premium over `amd-bench`" is real but
+//!    it is inside the DRAIN, not around it: `UNATTRIBUTED`, which is the mux
+//!    tick, the engine lock and the scheduler, is **1.0 µs**.
+//! 3. **Deferring the stream to gain those 5.8 µs is net NEGATIVE.** Streaming
+//!    token N during tick N+1 means the stop token is seen one tick late, so
+//!    every request pays one extra full dispatch — ~27 ms — to save 5.8 µs per
+//!    token. That is a loss for any request shorter than ~4,600 tokens.
+//!
+//! The fourth candidate — making the cross-rank agreement a sampled audit
+//! instead of `N` readbacks per token — is built and argued at
+//! [`AmdTpGroup::complete_decode`], and ships DISABLED for the same reason
+//! quantified: it would save 7/8 of 59.3 µs, i.e. **0.23% at TP8**, against a
+//! run-to-run spread between 32-token windows of 22.57–23.10 ms, i.e. 2.3%. The
+//! effect is an order of magnitude below this path's own noise floor, so it
+//! cannot be confirmed by measurement even in principle, and it is paid for in
+//! acceptance-test coverage.
+//!
+//! None of this says the host phase is small in ABSOLUTE terms. 677 µs is fixed
+//! per token, so on a model that decodes in ~1.5 ms rather than ~23 the same
+//! work is nearly half the token and every conclusion above flips — including
+//! the sign on (3), since the extra dispatch a deferred stream costs shrinks
+//! with it. The instrument is checked in for exactly that day;
+//! `plans/tp-design.md` predicts 1.56 ms/token for a 12B at TP8.
+//!
 //! # Where the margin is expected to come from
 //!
 //! The inline collective measures **20.6x RCCL at TP4** (0.626 µs vs 12.92 µs),
@@ -102,6 +178,28 @@ use crate::exec::amd::{AmdEngine, ChunkStep, TpBind};
 use crate::exec::tp::{PeerLayout, TpGroup, XctrReset};
 use crate::{Result, RuntimeError};
 
+/// Tokens between full all-rank readbacks — see [`AmdTpGroup::complete_decode`]
+/// for why a cadence is sound at all.
+///
+/// # Why the default is 1, i.e. why this ships turned OFF
+///
+/// The cadence exists because `N-1` of the `N` readbacks are pure audit, so it
+/// looked like free host time. It was then MEASURED (`PLOW_DSTEP_LOG=1`,
+/// §DSTEP): on GLM-5.2 TP8, warm, batch 1, ctx 4096, ALL EIGHT readbacks cost
+/// **59.3 µs of a 22.7 ms token — 0.26%**, so the seven audit reads are 0.23%.
+/// Consecutive 32-token windows of that same run ranged 22.57–23.10 ms, a spread
+/// of 2.3%: the saving is an order of magnitude below the noise floor of the
+/// thing it would speed up, and so cannot be confirmed even in principle.
+///
+/// A change no measurement can see does not buy a weakening of what this
+/// module's own [`AmdTpGroup::agree`] doc calls "the acceptance test, not a
+/// debug aid". The mechanism is here, argued and tested; the default leaves
+/// behaviour exactly as it was. `PLOW_TP_AGREE_EVERY=16` turns it on for the
+/// regime where the arithmetic changes sign: the host phase is roughly FIXED per
+/// token (submission overhead, not work), so on a model that decodes in ~1.5 ms
+/// rather than ~23 the same microseconds are worth cadencing. Measure first.
+const DEFAULT_AGREE_EVERY: u32 = 1;
+
 /// N co-resident ranks of one sharded model.
 pub struct AmdTpGroup {
     /// Peer buffers, counter regions, and the launch discipline.
@@ -117,6 +215,14 @@ pub struct AmdTpGroup {
     /// SILENTLY wrong token, and one 12 KiB readback per rank is a cheap
     /// premium against that. `PLOW_TP_NO_AUDIT=1` turns it off for a timing run.
     audit: bool,
+    /// Read EVERY rank's sampled id, rather than just rank 0's, once every this
+    /// many decode tokens — see [`AmdTpGroup::audit_cadence`].
+    agree_every: u32,
+    /// Tokens since the last all-rank read. Starts at `agree_every` so the
+    /// FIRST token is always audited: a rank that bound the wrong shard is wrong
+    /// from token one, and a scheme that armed at the END of the first window
+    /// would serve `agree_every - 1` wrong tokens before looking.
+    agree_tick: u32,
 }
 
 impl AmdTpGroup {
@@ -210,30 +316,154 @@ impl AmdTpGroup {
         // faulting at the first token — an hour of weight loading later.
         group.verify_peer_visibility()?;
 
-        let mut ranks = Vec::with_capacity(backends.len());
+        // ONE checkpoint mapping for the whole group, not one per rank.
+        //
+        // Each rank used to `mmap` the shards itself, and the cost of that is
+        // not the mapping — it is the PAGE TABLES. A rank's own VMA starts with
+        // no PTEs, so every one of the ~44 M pages it reads is a minor fault
+        // even when the bytes are already in page cache, and that measured
+        // **44 s per rank** on a fully warm GLM-5.2 load: 70 % of a warm rank's
+        // 67 s. Sharing the mapping means rank 0 populates the PTEs and ranks
+        // 1..n find them already there.
+        //
+        // Sound because the mapping is READ-ONLY and the ranks only read it;
+        // `Checkpoint` holds `memmap2::Mmap`, which is `Sync` for exactly that
+        // reason.
+        //
+        // `PLOW_SHARE_CKPT=0` restores the per-rank mapping, so the difference
+        // can be measured on one binary instead of asserted.
+        let share = std::env::var("PLOW_SHARE_CKPT").ok().as_deref() != Some("0");
+        let shared_ckpt = match (share, checkpoint) {
+            (true, Some(dir)) => Some(std::sync::Arc::new(
+                crate::asset::checkpoint::Checkpoint::open(dir)?,
+            )),
+            _ => None,
+        };
+        // Every rank's binding, resolved before any of them loads, so the load
+        // itself borrows nothing from `group`.
+        let mut binds = Vec::with_capacity(backends.len());
         for (r, be) in backends.into_iter().enumerate() {
             let tr = group.rank(r as u32)?;
-            let bind = TpBind {
-                rank: r as u32,
-                n_gpu,
-                peer_table: tr.peer_scratch_table(),
-                xctr: tr.xctr(),
-                scratch_base: tr.scratch_base(),
-                slot_b: tp.slot_bytes,
-            };
-            tracing::info!(rank = r, ordinal = tr.ordinal(), "binding rank");
-            ranks.push(AmdEngine::load_rank(
-                be, blob_path, hsaco_dir, checkpoint, Some(bind),
-            )?);
+            binds.push((
+                be,
+                TpBind {
+                    rank: r as u32,
+                    n_gpu,
+                    peer_table: tr.peer_scratch_table(),
+                    xctr: tr.xctr(),
+                    scratch_base: tr.scratch_base(),
+                    slot_b: tp.slot_bytes,
+                },
+                tr.ordinal(),
+            ));
         }
 
+        // Ranks load CONCURRENTLY. They share nothing mutable: each has its own
+        // agent, its own queue, its own VRAM and its own staging ring, and the
+        // one thing they do share — the checkpoint mmap — is read-only. What
+        // they were sharing before was the wall clock, one rank at a time.
+        //
+        // `thread::scope`, not detached threads, because the closures borrow
+        // `blob_path`/`hsaco_dir`/`checkpoint`. Every handle is joined even
+        // after the first failure: a rank still loading owns HSA queues and
+        // in-flight SDMA copies, and returning out from under it is how you get
+        // a fault in a thread nobody is waiting on. The first error is what the
+        // caller sees; the group is dropped whole, so no rank survives
+        // half-loaded.
+        //
+        // `PLOW_TP_SERIAL_LOAD=1` restores the one-at-a-time loop.
+        let serial = std::env::var("PLOW_TP_SERIAL_LOAD").ok().as_deref() == Some("1");
+        let t_bind = std::time::Instant::now();
+        let ranks: Vec<AmdEngine> = if serial {
+            let mut v = Vec::with_capacity(binds.len());
+            for (be, bind, ordinal) in binds {
+                tracing::info!(rank = bind.rank, ordinal, "binding rank");
+                v.push(AmdEngine::load_rank(
+                    be,
+                    blob_path,
+                    hsaco_dir,
+                    checkpoint,
+                    Some(bind),
+                    shared_ckpt.clone(),
+                )?);
+            }
+            v
+        } else {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = binds
+                    .into_iter()
+                    .map(|(be, bind, ordinal)| {
+                        let shared = shared_ckpt.clone();
+                        tracing::info!(rank = bind.rank, ordinal, "binding rank");
+                        s.spawn(move || {
+                            AmdEngine::load_rank(
+                                be,
+                                blob_path,
+                                hsaco_dir,
+                                checkpoint,
+                                Some(bind),
+                                shared,
+                            )
+                        })
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(handles.len());
+                let mut first: Option<RuntimeError> = None;
+                for h in handles {
+                    match h.join() {
+                        Ok(Ok(e)) => out.push(e),
+                        Ok(Err(e)) => {
+                            if first.is_none() {
+                                first = Some(e);
+                            }
+                        }
+                        Err(_) => {
+                            if first.is_none() {
+                                first = Some(RuntimeError::Device(
+                                    "a rank's weight load panicked".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                match first {
+                    Some(e) => Err(e),
+                    None => Ok(out),
+                }
+            })?
+        };
+        tracing::info!(
+            n_gpu,
+            serial,
+            secs = format!("{:.1}", t_bind.elapsed().as_secs_f64()).as_str(),
+            "all ranks bound"
+        );
+
+        let agree_every = std::env::var("PLOW_TP_AGREE_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_AGREE_EVERY);
         Ok(AmdTpGroup {
             group,
             ranks,
             reset: XctrReset::Host,
             gate_expect,
             audit: std::env::var("PLOW_TP_NO_AUDIT").ok().as_deref() != Some("1"),
+            agree_every,
+            agree_tick: agree_every,
         })
+    }
+
+    /// Read every rank's sampled id once per `every` decode tokens; `1` is every
+    /// token. See [`AmdTpGroup::complete_decode`] for why a cadence is sound.
+    ///
+    /// A CORRECTNESS ORACLE must pass `1` — `amd-bench --tp N` does, because its
+    /// whole claim is "every rank emitted an identical stream" and a sampled
+    /// check cannot support that sentence.
+    pub fn audit_cadence(&mut self, every: u32) {
+        self.agree_every = every.max(1);
+        self.agree_tick = self.agree_every;
     }
 
     pub fn n_gpu(&self) -> usize {
@@ -289,21 +519,39 @@ impl AmdTpGroup {
     /// Doing (2) per rank as each is launched lets an early rank signal a late
     /// rank's counter and then have that rank's own zeroing wipe the signal.
     pub fn submit_decode(&mut self, pos: u32, kvlen: u32) -> Result<()> {
+        use crate::obs::dstep;
         let dp = self.ranks[0].decode_prog();
         for e in &mut self.ranks {
-            e.decode_prepare(pos, kvlen)?;
-            e.rearm_prog(dp)?;
+            dstep::timed(&dstep::PREPARE, || e.decode_prepare(pos, kvlen))?;
+            dstep::timed(&dstep::REARM, || e.rearm_prog(dp))?;
         }
         // `launch_token` owns zero-all-then-launch-all; the closure only says
         // what a launch IS.
+        //
+        // §DSTEP splits the two phases from OUTSIDE `launch_token` rather than
+        // by instrumenting it: the first call into the closure is by definition
+        // the first instruction after `zero_xctr` returned, so stamping it there
+        // dates the boundary exactly and leaves the ordering discipline in the
+        // one place that owns it.
         let ranks = &mut self.ranks;
         let mut i = 0usize;
+        let t0 = dstep::on().then(std::time::Instant::now);
+        let mut launched_at: Option<std::time::Instant> = None;
         self.group.launch_token(self.reset, |_| {
+            if let (Some(t0), None) = (t0, launched_at) {
+                let now = std::time::Instant::now();
+                dstep::XCTR.add((now - t0).as_nanos() as u64);
+                launched_at = Some(now);
+            }
             let e = &mut ranks[i];
             let k = e.decode_kernel();
             i += 1;
             e.enqueue(dp, k)
-        })
+        })?;
+        if let Some(z) = launched_at {
+            dstep::ENQUEUE.add(z.elapsed().as_nanos() as u64);
+        }
+        Ok(())
     }
 
     /// Wait for an in-flight [`AmdTpGroup::submit_decode`] and collect the ids.
@@ -311,15 +559,58 @@ impl AmdTpGroup {
     /// Drains every rank BEFORE auditing or reading anything: a readback from
     /// rank 0 while rank 3 is still running would race the collective that rank
     /// 0's own result depends on.
+    ///
+    /// # The returned vector is the ranks that were READ, not the ranks
+    ///
+    /// Every rank computes the same id — that is the invariant, and comparing
+    /// them is the check that catches "a collective did not happen, or one rank
+    /// bound the wrong shard". But the token only ever comes from rank 0, so on
+    /// a token where the check is not being made the other `N-1` readbacks are
+    /// pure audit and this returns a ONE-element vector. [`AmdTpGroup::agree`]
+    /// over one id is trivially satisfied, which is the honest reading: no
+    /// cross-rank claim was made this token.
+    ///
+    /// # Why sampling is sound, and what still runs every token
+    ///
+    /// The two failures split cleanly by lifetime:
+    ///
+    /// * **Structural** — a rank bound the wrong shard, or the packet carries no
+    ///   collective at all. This is a property of the LOAD, so it is wrong on
+    ///   every token from the first. Sampling finds it on token 0 (`agree_tick`
+    ///   starts armed) and cannot miss it.
+    /// * **Transient** — a collective hit its `PLOW_XCTR_DEADLINE_TICKS`
+    ///   deadline and returned without reducing, on this token only. Sampling
+    ///   *would* miss most of these — which is exactly why
+    ///   [`TpGroup::audit_xctr`] stays on EVERY token. It reads the arrival
+    ///   counters, so it sees a timed-out collective directly rather than
+    ///   inferring it from a token that happened to differ, and it is the
+    ///   stronger of the two checks for this case.
+    ///
+    /// So the cadence drops the check that is redundant against a permanent
+    /// fault and keeps the one that catches a momentary one. `PLOW_TP_NO_AUDIT=1`
+    /// removes the counter check as well, and then a timed-out collective is
+    /// silent again — as it was before either check existed.
     pub fn complete_decode(&mut self) -> Result<Vec<u32>> {
-        for e in &self.ranks {
-            e.drain()?;
-        }
+        use crate::obs::dstep;
+        dstep::timed(&dstep::DRAIN, || -> Result<()> {
+            for e in &self.ranks {
+                e.drain()?;
+            }
+            Ok(())
+        })?;
         if self.audit {
             let dp = self.ranks[0].decode_prog();
-            self.group.audit_xctr(&self.gate_expect[dp])?;
+            dstep::timed(&dstep::AUDIT, || self.group.audit_xctr(&self.gate_expect[dp]))?;
         }
-        self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
+        let all = self.agree_tick >= self.agree_every;
+        self.agree_tick = if all { 1 } else { self.agree_tick + 1 };
+        dstep::timed(&dstep::READ, || {
+            if all {
+                self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
+            } else {
+                Ok(vec![self.ranks[0].read_sampled()?])
+            }
+        })
     }
 
     /// Prefill `prompt` on every rank. Returns each rank's first sampled id.
@@ -583,6 +874,45 @@ mod tests {
         assert!(e.contains("rank 2"), "{e}");
         assert!(e.contains('9') && e.contains('7'), "{e}");
         assert!(AmdTpGroup::agree(&[]).is_err());
+    }
+
+    /// The all-rank readback ships on EVERY token: the cadence exists, but the
+    /// measurement that motivated it (30.5 µs of a 27.9 ms token, 0.11%) does
+    /// not justify sampling the acceptance test. A default of anything but 1 is
+    /// a behaviour change and has to be argued from a fresh §DSTEP breakdown.
+    #[test]
+    fn cross_rank_agreement_is_not_sampled_by_default() {
+        assert_eq!(DEFAULT_AGREE_EVERY, 1);
+    }
+
+    /// The cadence must fire on token ZERO. A rank that bound the wrong shard is
+    /// wrong from the first token, and a scheme that armed on the *last* token
+    /// of the first window would serve `every - 1` wrong tokens before looking.
+    /// That is the whole reason `agree_tick` starts at `agree_every` rather
+    /// than 0 — a detail with no other symptom, hence a test.
+    #[test]
+    fn the_cadence_is_armed_on_the_first_token() {
+        // The state machine `complete_decode` runs, in isolation: it reads
+        // every rank when `tick >= every`, then restarts the count at 1.
+        let step = |tick: &mut u32, every: u32| {
+            let all = *tick >= every;
+            *tick = if all { 1 } else { *tick + 1 };
+            all
+        };
+        let every = 4;
+        let mut tick = every; // as `load` and `audit_cadence` leave it
+        let fired: Vec<bool> = (0..9).map(|_| step(&mut tick, every)).collect();
+        assert_eq!(
+            fired,
+            [true, false, false, false, true, false, false, false, true],
+            "token 0 must be audited, then one in every {every}"
+        );
+
+        // `every == 1` is the oracle setting and must audit unconditionally —
+        // an off-by-one here would silently downgrade `amd-bench --tp N`, whose
+        // entire claim is that every rank emitted an identical stream.
+        let mut tick = 1u32;
+        assert!((0..8).all(|_| step(&mut tick, 1)), "every=1 must never skip");
     }
 
     /// The sharded-lm_head fold owns TWO xctr ids and they are allocated AFTER

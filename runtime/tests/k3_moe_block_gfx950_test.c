@@ -297,6 +297,11 @@ int main(int argc, char** argv) {
     g_inst[i_ar1].t[0] = t_ha; g_inst[i_ar1].t[1] = t_prefix_in; g_inst[i_ar1].t[2] = t_blkres;
     g_inst[i_ar1].t[3] = t_asw;
     g_inst[i_ar1].i[0] = T; g_inst[i_ar1].i[1] = HID; g_inst[i_ar1].i[2] = NB;
+    /* i[4] IS THE RING CAPACITY. `d_attn_res` strides `[T][NBCAP][HID]` and refuses
+     * `NBCAP < NB`; unset it reads 0 and the arm poisons, which is NaN from A0 down through
+     * every later stage. `t_blkres` is allocated `T * NB * HID`, so capacity IS NB here.
+     * Layer 1 is a non-snapshot layer (1 % 12 != 0), so no push and both mixes see NB rows. */
+    g_inst[i_ar1].i[4] = NB;
     g_inst[i_ar1].fj[0].f = EPS;
 
     int i_ln = RMSN(t_x, t_ha, t_lnw, HID, i_ar1, AR);
@@ -359,6 +364,7 @@ int main(int argc, char** argv) {
     g_inst[i_ar2].t[0] = t_h2; g_inst[i_ar2].t[1] = t_prefix; g_inst[i_ar2].t[2] = t_blkres;
     g_inst[i_ar2].t[3] = t_msw;
     g_inst[i_ar2].i[0] = T; g_inst[i_ar2].i[1] = HID; g_inst[i_ar2].i[2] = NB;
+    g_inst[i_ar2].i[4] = NB; /* capacity, as at A0 above */
     g_inst[i_ar2].fj[0].f = EPS;
     addwait(i_ar2, i_pfx, ALL);
 

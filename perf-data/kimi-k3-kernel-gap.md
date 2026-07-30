@@ -214,6 +214,56 @@ Decode weight stream per token, whole model, computed from the on-disk shapes
 
 Total weights (all 896 experts resident): **≈1.56 TB** → TP8/EP8 on one 8×MI355X node (2.3 TB) fits.
 
+> **CORRECTION 2026-07-30 — the per-rank column above assumes every row is sharded, and two rows
+> were not.** `routed_expert_down_proj` and `routed_expert_up_proj` were emitted REPLICATED, so
+> the 8.80 GB "latent down/up" row cost `2 × 4.727 = 9.454` GB per RANK rather than 1.10 —
+> **52 % of the decode bf16 `Gemv` stream**, measured off the blob rather than derived
+> (`plowrt disasm --program 1 --format json`, summing `N*K*2` over every `Gemv`):
+>
+> | bf16 `Gemv` weight bytes/rank/token | replicated `up` | column-parallel `up` |
+> |---|--:|--:|
+> | `routed_expert_up_proj` | 4.727 GB | **0.591 GB** |
+> | `routed_expert_down_proj` | 4.727 GB | 4.727 GB |
+> | `lm_head` (still replicated; `PLOW_K3_SHARD_HEAD=1` exists, off) | 2.349 GB | 2.349 GB |
+> | everything else | 6.355 GB | 6.355 GB |
+> | **total** | **18.157 GB** | **14.021 GB** |
+>
+> `up` is now column-parallel and its all-gather is folded into the shared expert's all-reduce, so
+> the shard adds no packet and no collective (`emit_k3_latent_moe`). `down` stays replicated: its
+> output feeds experts sharded on their INTERMEDIATE, so every rank needs the whole latent and any
+> shard of it needs a rendezvous of its own — ~0.74 ms/token of streaming against ≥5.3 µs × 92
+> layers of added packet, which is close to a wash. The remaining replicated 7.076 GB
+> (`down` + `lm_head`) is where the next 1.1 ms of floor lives.
+>
+> **The shard is BIT-NEUTRAL and it took a one-line kernel change to make it so.** Column-parallel
+> splits the OUTPUT, so every element of `yh` is still one dot product over the whole 3584-wide
+> latent — the values never change. What did change was the ROUNDING of the sum it is added to:
+> unfolded, the collective stored `f2bf(sum_r shd_r)` and a separate `Residual` re-read it, and
+> the folded gather kept that sum in f32. One bf16 ULP per element per layer, 92 layers, and the
+> 24-token gate answered ". The capital of X is Y. The capital of …" instead of the reference
+> continuation. `d_xreduce` now rounds before the gathered term is added and the two emits are
+> token-identical, all 8 ranks, on both the decode-only and the full asset.
+>
+> **MEASURED, gfx950 TP8, 200 steps, interleaved from ONE binary** (`PLOW_K3_SHARD_UP=0` emits the
+> control blob, so the two assets differ only in this one decision):
+>
+> | ctx | replicated (min of 6) | column-parallel (min of 6) | delta |
+> |---|--:|--:|--:|
+> | 8 000 | 33.846 | **33.405** | **-0.441 ms (-1.30 %)** |
+> | 16 000 | 34.668 | **34.238** | **-0.430 ms (-1.24 %)** |
+> | 32 000 | 36.052 | **35.736** | **-0.316 ms (-0.88 %)** |
+>
+> Weights UNBOUND for these: the schedule, the packet count, the workgroup counts and every buffer
+> SIZE are real — size is the whole of what this change touches — and dropping the ~100 s
+> checkpoint load per run is what buys 6 reps. Within-arm spread is 0.02–0.90 ms and the shard is
+> ahead in all 18 pairs.
+>
+> **The BOUND runs cannot resolve an effect this size, and it is worth writing down why.** Two
+> back-to-back bound runs re-read 195 GiB per rank and the SECOND of each pair is penalised by
+> 5–10 ms. Base-first said the shard was 6–9 ms SLOWER; shard-first said the opposite. The sign
+> follows the ORDER, not the blob. A bound A/B needs order-balancing (or one load per process)
+> before it can see a sub-1-ms change; first-in-pair runs land at 37.6–37.9 ms for both arms.
+
 **Three consequences that should govern the whole campaign:**
 
 * **~77 % of the stream (KDA + MLA + shared + latent + lm_head = 101 GB) runs on ops already at

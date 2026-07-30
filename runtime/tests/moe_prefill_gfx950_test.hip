@@ -68,8 +68,30 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES/4)
 void t_expert_glu_mx(bf16* fu, const bf16* x, const unsigned char* tab,
                      const unsigned long long* wtab, const unsigned long long* stab,
                      unsigned slot, unsigned I, unsigned H, unsigned n_exp, unsigned act) {
+    /* f0/f1 = the `situ` betas, read only at act == PLOW_MOE_ACT_SITU; this call site predates
+     * them and did not compile after they landed. */
     d_moe_expert_glu_fp8_blk(fu, x, tab, wtab, stab, slot, I, H, n_exp, act, blockIdx.x,
-                             gridDim.x, PLOW_MOE_ENC_MXFP4);
+                             gridDim.x, PLOW_MOE_ENC_MXFP4, 0.0f, 0.0f);
+}
+
+/* Ops 85/86 through their PUBLIC entry points, so the encoding arm-selection is what is tested
+ * rather than one body called directly. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES/4)
+void t_glu_pf_enc(bf16* fu, const unsigned long long* wtab, const unsigned long long* stab,
+                  const int* meta, const unsigned* row_partidx, unsigned I, unsigned H,
+                  unsigned n_exp, unsigned enc) {
+    __shared__ bf16 lds[MPF_LDS_HALVES];
+    d_moe_group_glu_pf(fu, nullptr, wtab, stab, meta, nullptr, I, H, n_exp, enc,
+                       PLOW_MOE_ACT_SILU, blockIdx.x, gridDim.x, 0.0f, 0.0f, lds, nullptr,
+                       row_partidx, nullptr);
+}
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES/4)
+void t_down_pf_enc(float* part, const unsigned long long* wtab, const unsigned long long* stab,
+                   const int* meta, const unsigned* row_partidx, unsigned H, unsigned I,
+                   unsigned n_exp, unsigned enc) {
+    __shared__ bf16 lds[MPF_LDS_HALVES];
+    d_moe_group_down_pf(part, nullptr, wtab, stab, meta, row_partidx, nullptr, H, I, n_exp, enc,
+                        blockIdx.x, gridDim.x, lds);
 }
 
 static int fails = 0;
@@ -250,6 +272,53 @@ int main(){
     }
     char lbl[96]; snprintf(lbl,sizeof lbl,"EXPERT_GLU op45 enc=MXFP4 vs CPU (worst rel %.2e)",worst);
     ck(lbl, worst<2e-2);
+  }
+
+  /* ---- OPS 85/86 REFUSE AN ENCODING THIS OBJECT HAS NO BODY FOR ----------------------------
+   * THIS TU IS THE SHIPPING PREFILL CONFIGURATION: PLOW_MOE_PREFILL=1 and NO PLOW_MOE_PF_A4W4,
+   * exactly what scripts/build_gfx950.sh:307 builds. The MXFP4 body is compile-time, so in this
+   * object enc=2 has no arm — and the selection used to be `if (fp8) fp8 else BF16`, which made
+   * "no arm" mean "read the fp4 weight bytes as bf16": two elements per byte read as one, the
+   * E8M0 row ignored, a 4x overrun of every expert tensor, and finite output.
+   *
+   * The check is deliberately for POISON and not for a number. The weight table here is all-NULL
+   * on purpose: the refusal must fire BEFORE any base pointer is dereferenced, so a null table
+   * both proves that and makes the old behaviour (which would have faulted or read address 0)
+   * distinguishable from the new one. */
+  {
+    const unsigned n_e=2, N=256, Kd=128, BM=MPF_BM;
+    const unsigned rows=2u*BM;                        /* one m-tile per expert */
+    std::vector<int> meta(3*n_e+1);
+    meta[0]=0; meta[1]=(int)BM;                       /* rowoff */
+    meta[n_e+0]=(int)BM; meta[n_e+1]=(int)BM;         /* cnt    */
+    meta[2*n_e+0]=0; meta[2*n_e+1]=1; meta[3*n_e]=2;  /* tilep, tilep[n_exp]=2 tiles */
+    std::vector<unsigned> rp(rows);
+    for(unsigned r=0;r<rows;r++) rp[r]=r;             /* every row live, identity scatter */
+    int* dmeta; unsigned* drp; bf16* dfu; float* dpart; unsigned long long *dw,*ds;
+    HC(hipMalloc(&dmeta,meta.size()*4)); HC(hipMemcpy(dmeta,meta.data(),meta.size()*4,hipMemcpyHostToDevice));
+    HC(hipMalloc(&drp,rows*4)); HC(hipMemcpy(drp,rp.data(),rows*4,hipMemcpyHostToDevice));
+    HC(hipMalloc(&dfu,(size_t)rows*N*2)); HC(hipMemset(dfu,0,(size_t)rows*N*2));
+    HC(hipMalloc(&dpart,(size_t)rows*Kd*4)); HC(hipMemset(dpart,0,(size_t)rows*Kd*4));
+    std::vector<unsigned long long> z(n_e*3,0ull);
+    HC(hipMalloc(&dw,z.size()*8)); HC(hipMemcpy(dw,z.data(),z.size()*8,hipMemcpyHostToDevice));
+    HC(hipMalloc(&ds,z.size()*8)); HC(hipMemcpy(ds,z.data(),z.size()*8,hipMemcpyHostToDevice));
+    hipLaunchKernelGGL(t_glu_pf_enc,dim3(64),dim3(PLOW_THREADS),0,0,dfu,dw,ds,dmeta,drp,N,Kd,n_e,
+                       PLOW_MOE_ENC_MXFP4);
+    hipLaunchKernelGGL(t_down_pf_enc,dim3(64),dim3(PLOW_THREADS),0,0,dpart,dw,ds,dmeta,drp,Kd,N,n_e,
+                       PLOW_MOE_ENC_MXFP4);
+    HC(hipDeviceSynchronize());
+    std::vector<unsigned short> fu((size_t)rows*N); std::vector<float> part((size_t)rows*Kd);
+    HC(hipMemcpy(fu.data(),dfu,fu.size()*2,hipMemcpyDeviceToHost));
+    HC(hipMemcpy(part.data(),dpart,part.size()*4,hipMemcpyDeviceToHost));
+    /* GLU fills the MIN-SAFE byte extent rows*(N/2) -- fu is fp4-sized under the encoding the
+     * packet believes in, so a bf16-sized fill would overrun it 4x. That is rows*N/4 bf16. */
+    size_t nan_g=0; const size_t ng_expect=(size_t)rows*N/4;
+    for(size_t i=0;i<ng_expect;i++) if(std::isnan(bf(fu[i]))) nan_g++;
+    size_t nan_d=0; for(size_t i=0;i<part.size();i++) if(std::isnan(part[i])) nan_d++;
+    char lbl[128];
+    snprintf(lbl,sizeof lbl,"ops 85/86 REFUSE enc=MXFP4 without PLOW_MOE_PF_A4W4 (%zu/%zu, %zu/%zu)",
+             nan_g,ng_expect,nan_d,part.size());
+    ck(lbl, nan_g==ng_expect && nan_d==part.size());
   }
 
   printf("\n%s (%d failure%s)\n", fails?"MOE PREFILL FAILED":"MOE PREFILL CORRECT", fails, fails==1?"":"s");

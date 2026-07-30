@@ -1339,7 +1339,35 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
  * need it. Worse, it is unsafe here: with a per-token causal bound an early token's later splits
  * are EMPTY (lo > qpos), and an empty split emits m=-inf, l=0 which d_flash_merge would divide by.
  * The emitter passes nsplit=1; this is a precondition, not a preference. */
-template <int DK, int DR, int GF, bool GATHER = false>
+/* FP8 (e4m3) LATENT KV, the MLA twin of `d_flash_decode`'s FP8KV.       [MLA-FP8-KV]
+ *
+ * At FP8 the `Ckv` pointer is a `uint8[b][ctx][DK]` e4m3 cache with a PER-ROW f32 dequant scale,
+ * and `Krope` is EITHER the untouched bf16 rope cache (`krot_fp8 == 0`, the shipped form) or its
+ * own e4m3 cache (`krot_fp8 != 0`). Both scales live in ONE `kv_scale` array because the dense
+ * MLA decode has exactly ONE free tensor slot (t7 is the gather `idx`, and every other slot is
+ * live):
+ *
+ *     kv_scale[               b*kv_stride + row ]   ckv  row scale
+ *     kv_scale[ n_batch*kv_stride + b*kv_stride + row ]   krot row scale   (krot_fp8 only)
+ *
+ * PER-ROW, not per-tensor, for the same reason `d_headnorm_rope_fp8` picked it: a KV row is
+ * written once at its own step and never revisited, so a row scale costs one f32 per 512 bytes
+ * and needs no second pass. Per-tensor would have to be chosen before the context exists.
+ *
+ * WHY THE TWO DOTS ARE ACCUMULATED SEPARATELY UNDER FP8. The bf16 path sums the ckv dot and the
+ * krot dot into ONE accumulator, because both operands are the same dtype and the score is
+ * `dot * scale`. Under fp8 the two halves carry DIFFERENT dequant scales, so the score is
+ * `(dot_ckv*s_ckv + dot_krot*s_krot) * scale` and one accumulator would be wrong. The bf16
+ * expressions below are therefore left character-for-character intact under `if constexpr
+ * (!FP8)` rather than refactored into a common shape — same discipline as `FA_DB_FP8` above,
+ * and for the same reason: the bf16 MLA decode is a shipped object at 254 of 256 VGPRs.
+ *
+ * THE ERROR IS SHARED, WHICH DENSE GQA's IS NOT. One latent row is read by EVERY query head of
+ * the layer (and, through `q_absorb` / `MlaMergeFold`, through two learned projections), so a
+ * quantization error here is common-mode across all `n_head` heads rather than confined to one.
+ * That is a reason to MEASURE this family separately from the dense one, not a reason it cannot
+ * work; the numbers are in perf-data/mla-fp8-kv.md. */
+template <int DK, int DR, int GF, bool GATHER = false, bool FP8 = false>
 __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                    const bf16* __restrict__ Qabs, const bf16* __restrict__ Qrope,
                                    const bf16* __restrict__ Ckv, const bf16* __restrict__ Krope,
@@ -1347,7 +1375,9 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
                                    unsigned n_head, unsigned kv_stride, unsigned window,
                                    float scale, unsigned nsplit, unsigned kv_mask, unsigned slice,
                                    unsigned nblk, float* lds, const int* __restrict__ idx = nullptr,
-                                   unsigned top_k = 0, unsigned n_tok = 1) {
+                                   unsigned top_k = 0, unsigned n_tok = 1,
+                                   const float* __restrict__ kv_scale = nullptr,
+                                   unsigned krot_fp8 = 0) {
     const unsigned n_grp = n_head / GF;                 /* head-groups; latent re-read per group */
     const unsigned n_work = n_batch * n_tok * n_grp * nsplit;
     const unsigned tid = threadIdx.x;
@@ -1394,6 +1424,13 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
         /* ONE latent "head": the cache base is just this batch's latent block. */
         const auto* cbase = as_glob(Ckv) + (size_t)b * kv_stride * DK;
         const auto* rbase = as_glob(Krope) + (size_t)b * kv_stride * DR;
+        /* FP8 twins of the same two bases, plus the two per-row scale strips. `cb8`/`rb8` are the
+         * SAME allocations viewed as e4m3 bytes (half the width per element); `rb8`/`rsc` are only
+         * dereferenced when `krot_fp8`. */
+        const unsigned char* cb8 = (const unsigned char*)Ckv + (size_t)b * kv_stride * DK;
+        const unsigned char* rb8 = (const unsigned char*)Krope + (size_t)b * kv_stride * DR;
+        const float* csc = FP8 ? kv_scale + (size_t)b * kv_stride : nullptr;
+        const float* rsc = FP8 ? kv_scale + (size_t)(n_batch + b) * kv_stride : nullptr;
         /* Selected-index table. One row of top_k per QUERY, so prefill indexes it per (b,t) —
          * a gathered prefill selects a different set for every query token. Collapses to
          * `idx + b*top_k` at n_tok=1. */
@@ -1435,6 +1472,50 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
 #pragma unroll
             for (int g = 0; g < GF; g++) s[g] = FA_NEG_INF;
             if (keep) {
+                if constexpr (FP8) {
+                    /* e4m3 latent: HALF the HBM bytes. 8-wide (b64) loads decoded to one bf16v8
+                     * per step, mirroring the bf16 loop's live-register footprint exactly — the
+                     * same reason `d_flash_decode`'s FP8KV arm does not use b128. The per-row
+                     * dequant multiplies the DOT once, never an element. */
+                    float dotc[GF], dotr[GF];
+#pragma unroll
+                    for (int g = 0; g < GF; g++) { dotc[g] = 0.0f; dotr[g] = 0.0f; }
+                    const unsigned char* crow = cb8 + (size_t)row * DK;
+#pragma unroll
+                    for (int d = 0; d < DK; d += 8) {
+                        const bf16v8 c8 = fp8v8_to_bf16v8(ld_glob_fp8v8(crow + d));
+#pragma unroll
+                        for (int g = 0; g < GF; g++)
+                            dotc[g] = dot8(c8, ld_lds8(qsm + g * DK + d), dotc[g]);
+                    }
+                    const float cs = csc[row];
+                    if (krot_fp8) {
+                        const unsigned char* rrow = rb8 + (size_t)row * DR;
+#pragma unroll
+                        for (int d = 0; d < DR; d += 8) {
+                            const bf16v8 r8 = fp8v8_to_bf16v8(ld_glob_fp8v8(rrow + d));
+#pragma unroll
+                            for (int g = 0; g < GF; g++)
+                                dotr[g] = dot8(r8, ld_lds8(qrsm + g * DR + d), dotr[g]);
+                        }
+                        const float rs = rsc[row];
+#pragma unroll
+                        for (int g = 0; g < GF; g++)
+                            s[g] = (dotc[g] * cs + dotr[g] * rs) * FA_SCALE(scale);
+                    } else {
+                        const auto* rrow = rbase + (size_t)row * DR;
+#pragma unroll
+                        for (int d = 0; d < DR; d += 8) {
+                            const bf16v8 r8 = ld_glob8(rrow + d);
+#pragma unroll
+                            for (int g = 0; g < GF; g++)
+                                dotr[g] = dot8(r8, ld_lds8(qrsm + g * DR + d), dotr[g]);
+                        }
+#pragma unroll
+                        for (int g = 0; g < GF; g++)
+                            s[g] = (dotc[g] * cs + dotr[g]) * FA_SCALE(scale);
+                    }
+                } else {
                 float dot[GF];
 #pragma unroll
                 for (int g = 0; g < GF; g++) dot[g] = 0.0f;
@@ -1456,6 +1537,7 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
                 }
 #pragma unroll
                 for (int g = 0; g < GF; g++) s[g] = dot[g] * FA_SCALE(scale);
+                }
             }
 #pragma unroll
             for (int g = 0; g < GF; g++) Ssm[g * FA_DEC_TILE + tid] = s[g];
@@ -1509,20 +1591,31 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
             /* PV: V IS the latent C_kv, DK wide.  Cooperative column read, one row per NG group. */
             constexpr int VU = FA_DEC_VU(GF);
             const unsigned rmax = (hi - kv0 < FA_DEC_TILE) ? (hi - kv0) : FA_DEC_TILE;
+            /* FP8: `vs[c]` is the row dequant, folded into the softmax weight `pw` — ONE multiply
+             * per (row, head-group) instead of one per element, and the f32 accumulation order is
+             * otherwise identical to bf16. The scale load is the SAME address for all NDT=64 lanes
+             * covering a row, so it is a broadcast off one cache line, not 64 requests. */
             unsigned r = grp;
             for (; r + (VU - 1) * NG < rmax; r += VU * NG) {
                 bf16v8 vv[VU];
+                float vsf[VU];
 #pragma unroll
                 for (int c = 0; c < VU; c++) {
                     const unsigned t = kv0 + r + (unsigned)c * NG;
                     const size_t vrow = GATHER ? (size_t)(unsigned)ibase[t] : (t & kv_mask);
-                    vv[c] = ld_glob8(cbase + vrow * DK + dbase);
+                    if constexpr (FP8) {
+                        vv[c] = fp8v8_to_bf16v8(ld_glob_fp8v8(cb8 + vrow * DK + dbase));
+                        vsf[c] = csc[vrow];
+                    } else {
+                        vv[c] = ld_glob8(cbase + vrow * DK + dbase);
+                    }
                 }
 #pragma unroll
                 for (int c = 0; c < VU; c++) {
 #pragma unroll
                     for (int g = 0; g < GF; g++) {
-                        const float pw = Ssm[g * FA_DEC_TILE + r + (unsigned)c * NG];
+                        float pw = Ssm[g * FA_DEC_TILE + r + (unsigned)c * NG];
+                        if constexpr (FP8) pw *= vsf[c];
 #pragma unroll
                         for (int u = 0; u < 8; u++) oacc[g][u] += pw * bf2f(vv[c][u]);
                     }
@@ -1530,10 +1623,18 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
             }
             for (; r < rmax; r += NG) {
                 const size_t vrow = GATHER ? (size_t)(unsigned)ibase[kv0 + r] : ((kv0 + r) & kv_mask);
-                const bf16v8 v = ld_glob8(cbase + vrow * DK + dbase);
+                bf16v8 v;
+                float vsf = 1.0f;
+                if constexpr (FP8) {
+                    v = fp8v8_to_bf16v8(ld_glob_fp8v8(cb8 + vrow * DK + dbase));
+                    vsf = csc[vrow];
+                } else {
+                    v = ld_glob8(cbase + vrow * DK + dbase);
+                }
 #pragma unroll
                 for (int g = 0; g < GF; g++) {
-                    const float pw = Ssm[g * FA_DEC_TILE + r];
+                    float pw = Ssm[g * FA_DEC_TILE + r];
+                    if constexpr (FP8) pw *= vsf;
 #pragma unroll
                     for (int u = 0; u < 8; u++) oacc[g][u] += pw * bf2f(v[u]);
                 }
@@ -1607,6 +1708,29 @@ __device__ void d_flash_mla_prefill(float* __restrict__ Opart, float* __restrict
     d_flash_mla_decode<DK, DR, GF, false>(Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len, n_batch,
                                           n_head, kv_stride, window, scale, /*nsplit*/ 1, kv_mask,
                                           slice, nblk, lds, nullptr, 0, n_tok);
+}
+
+/* FP8 (e4m3) latent-KV MLA PREFILL. Same wrapper, same body, `FP8=true`.       [MLA-FP8-KV]
+ *
+ * It "falls out" of the decode kernel for the reason the bf16 prefill did: absorption removes the
+ * per-head K/V reconstruction that would make a prefill loop structurally different, and the
+ * causal mask is already in `keep`. What it does NOT get for free is the WRITE side — a prefill
+ * chunk quantizes `clen` latent rows, one scale each, and `d_headnorm_rope_fp8` already does that
+ * per (token, head) with `ntok = clen`. */
+template <int DK, int DR, int GF>
+__device__ void d_flash_mla_prefill_fp8(float* __restrict__ Opart, float* __restrict__ mlpart,
+                                        const bf16* __restrict__ Qabs,
+                                        const bf16* __restrict__ Qrope,
+                                        const bf16* __restrict__ Ckv,
+                                        const bf16* __restrict__ Krope,
+                                        const int* __restrict__ kv_len, unsigned n_batch,
+                                        unsigned n_tok, unsigned n_head, unsigned kv_stride,
+                                        unsigned window, float scale, unsigned kv_mask,
+                                        unsigned slice, unsigned nblk, float* lds,
+                                        const float* __restrict__ kv_scale, unsigned krot_fp8) {
+    d_flash_mla_decode<DK, DR, GF, false, /*FP8=*/true>(
+        Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len, n_batch, n_head, kv_stride, window, scale,
+        /*nsplit*/ 1, kv_mask, slice, nblk, lds, nullptr, 0, n_tok, kv_scale, krot_fp8);
 }
 
 /* GATHERED prefill (GLM DSA / DeepSeek sparse attention). `idx` is one top_k row PER QUERY —

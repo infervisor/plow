@@ -44,6 +44,21 @@ pub const WG_THREADS: u32 = WG_WAVES * 64;
 
 pub const TENSOR_NONE: u32 = 0xFFFF_FFFF;
 
+/// Sentinel for an ABSENT tensor handle carried in a [`DevInst::i`] slot.
+///
+/// A handful of ops demote a pointer into `i[]` because ten operands do not fit
+/// eight `t` slots ([`DevOp::GemvQkvg`]'s `i6`, [`DevOp::GemvQkvMxfp4`]'s
+/// `i5`/`i6`/`i7`). `i[]` is `u32` on the WIRE and does not narrow the way `t[]`
+/// does, so [`TENSOR_NONE`] (`0xFFFF_FFFF`) would arrive as itself and never
+/// equal the device's `PLOW_TENSOR_NONE`. The i-slot sentinel is therefore the
+/// wire one, [`TENSOR_NONE16`], widened — the value `interp.hip` tests against.
+///
+/// It matters that this is not `0`: `0` is a legal tensor handle, so an emitter
+/// that simply left an optional i-slot unset would name tensor 0 rather than
+/// nothing, and the arm's absence check would pass on a packet that is missing
+/// an operand.
+pub const TENSOR_NONE_I: u32 = TENSOR_NONE16 as u32;
+
 /// uint32 slots between adjacent counters — one 128-byte cache line.
 ///
 /// A dense counter array puts 32 counters per line, so while 256 workgroups `fetch_add`
@@ -138,9 +153,13 @@ pub enum DevOp {
     /// straight into the tensor the NEXT step's [`DevOp::Embed`] reads — so a sampled token
     /// never leaves the GPU.
     ArgmaxFin = 18,
-    /// `t0=fu t1=x t2=W_gate t5=W_up` · `i0=M i1=N i2=K i5=act`, computing
+    /// `t0=fu t1=x t2=W_gate t5=W_up` · `i0=M i1=N i2=K i5=act` · `f0=situ_beta
+    /// f1=situ_linear_beta`, computing
     /// `fu = act(W_gate @ x) * (W_up @ x)` — gate and up in ONE GEMV, with the GLU applied in
     /// the **epilogue**, as every BLAS does it (cuBLASLt/CK/hipBLASLt).
+    ///
+    /// The two `f` slots carry Kimi-K3's `situ` betas and are read only at `act = 2`; every other
+    /// activation ignores them.
     ///
     /// Output-stationary: the workgroup that owns column `n` computes both halves of it and
     /// applies the GLU exactly once. Nothing is replicated. This deletes the [`DevOp::Glu`]
@@ -228,7 +247,18 @@ pub enum DevOp {
     /// slot and system-signalled every peer's `xctr`; this is the CONSUME half — waits
     /// on N partials (SE_XCTR gate) then sums the N peer slots into a local full
     /// H-vector, f32 accumulate rounded to bf16.
-    /// `t0=out` · `i0=H i1=n_gpu i2=slot(byte offset into peer_scratch)`.
+    ///
+    /// `i4`/`i5`/`i6` fold an ALL-GATHER into the same packet: a COLUMN-parallel producer
+    /// leaves rank r owning output columns `[r*gcols, (r+1)*gcols)` in a SECOND peer slot,
+    /// and the gathered vector is added to the reduced one. `gcols = 0` disables it and the
+    /// arm is byte-identical to the reduce-only one. K3's `routed_expert_up_proj` is the
+    /// only user: its column-parallel partial and the shared expert's row-parallel one are
+    /// summed anyway, so the gather costs one bf16 load per element on a rendezvous that
+    /// already happened — instead of its own packet and its own rendezvous. The reduction is
+    /// ROUNDED to bf16 before the gathered term is added, which is what makes the fold
+    /// bit-exact against the reduce-then-`Residual` pair it replaces.
+    /// `t0=out` · `i0=H i1=n_gpu i2=slot(byte offset into peer_scratch) i3=gate i4=gslot?
+    /// i5=gcols? i6=row_w?`.
     XReduce = 24,
     /// Reduce-scatter half of the symmetric all-reduce decomposition. Kept defined for
     /// CP / larger worlds; not emitted on the N<=8 decode path (one-shot `XReduce` wins).
@@ -834,8 +864,32 @@ pub enum DevOp {
     /// packet ("three packets × 186 is 3.3 ms/token of pure protocol"), which rules out the
     /// obvious fix of splitting the reduction across blocks and finishing it in a second packet.
     ///
-    /// `t0=out([T,H] bf16) t1=prefix_sum([T,H] bf16) t2=block_residual([T,nb,H] bf16)
-    /// t3=score_w([H] f32)` · `i0=T i1=H i2=nb` · `f0=eps`.
+    /// `t0=out([T,H] bf16) t1=prefix_sum([T,H] bf16) t2=block_residual([T,nb_cap,H] bf16)
+    /// t3=score_w([H] f32) t4=push_src? t5=gamma?` · `i0=T i1=H i2=nb i3=push_row i4=nb_cap` ·
+    /// `f0=eps`.
+    ///
+    /// `gamma` is the FUSED POST-NORM, `[H] bf16`, and it is what makes the slice map above
+    /// affordable. Every AttnRes in a K3 program is read by exactly one consumer and that consumer
+    /// is an RMSNorm over its own output — the attention-side mix feeds the mixer's pre-norm, the
+    /// MLP-side mix feeds `post_attention_layernorm`, 186 of 186 in the 93-layer decode blob. Both
+    /// packets are ONE workgroup, back to back, on a chain with nothing ready behind them. Present,
+    /// the mix is RMSNormed IN PLACE over `out` (`out = out * rsqrt(mean(out^2) + eps) * gamma`,
+    /// same `eps`) and the packet subsumes the RMSNORM. Bit-exact: the reduction runs over the
+    /// bf16-ROUNDED mix re-read from `out`, which is precisely what the separate packet re-read
+    /// from HBM. Absent, the raw mix is left in `out` and the arm is byte-identical to before.
+    ///
+    /// `nb` and `nb_cap` are **different numbers**. `nb` is the count of rows LIVE at this layer
+    /// (0 -> 8 with depth); `nb_cap` is the ring's allocated row count, constant for the program,
+    /// and it is what the ring strides by: `blkres[t][r]` is at `(t*nb_cap + r)*H`. At `T = 1` the
+    /// token index is 0, the stride never multiplies and the two are indistinguishable — which is
+    /// why the operand had to exist before prefill did. The arm poisons on `nb_cap < nb`.
+    ///
+    /// `push_src` is `[T,H] bf16` — the layer input a SNAPSHOT layer pushes onto ring row
+    /// `push_row` of EVERY token's slice before the mix. Absent on every non-snapshot layer. It is
+    /// safe at any `T`: the workgroups partition the tokens, the ring is per token, and the mix
+    /// reads rows `[0, nb)` while the push writes row `nb` — one past — so no workgroup reads
+    /// another's pushed row inside the packet, and the readers that follow are gated by the
+    /// counter DAG (`Dep::Coarse` waits on every producer slice).
     AttnRes = 104,
     /// **`situ` GLU** — Kimi-K3's activation, on EVERY GLU in the model (dense L0, shared
     /// experts, routed experts).
@@ -910,6 +964,227 @@ pub enum DevOp {
     ///
     /// `t0=C t1=A t2=W(e4m3) t3=weight_scale_inv(f32)` · `i0=M i1=N i2=K`.
     GemmFp8Blk = 107,
+    /// `t0=q_out t1=x t2=W_q t3=k_out t4=W_k t5=v_out t6=W_v t7=g_out` ·
+    /// `i0=M i1=Nq i2=K i3=Nk i4=Nv i5=Ng i6=W_g`, computing FOUR projections in ONE GEMV.
+    ///
+    /// [`DevOp::GemvQkv`] with a fourth output stream. Kimi-K3's KDA block projects the same
+    /// pre-normed `x[7168]` four ways — `q_proj`, `k_proj`, `v_proj` and the full-rank output gate
+    /// `g_proj`, each `[12288, 7168]` — so all four concatenate into one `N=Nq+Nk+Nv+Ng` sweep
+    /// exactly as three did. At 69 KDA layers that is **207 fewer packets per token**.
+    ///
+    /// # This is the OUTPUT-dimension merge, and the distinction is the whole point
+    ///
+    /// `plans/knob-contract.md` §6g-KNOBS measured `GLM_GROUP=1` removing 38% of the ops for
+    /// **+2.88 ms**: it collapsed work that ran on disjoint CU slices into a loop inside one
+    /// packet, which destroys concurrency. Op count is not the objective function. This merge is
+    /// the opposite shape — the per-CU column count RISES from `(Nq+Nk+Nv)/nblk` to
+    /// `(Nq+Nk+Nv+Ng)/nblk` (144 to 192 at K3's geometry over 256 CUs), so the op gets WIDER and
+    /// nothing that ran in parallel starts running in sequence. What is deleted is three counter
+    /// gates and three redundant LDS stagings of the same `x`, not parallelism.
+    ///
+    /// # `i6` is a TENSOR HANDLE
+    ///
+    /// Nine pointers (four outputs, four weights, `x`) do not fit [`DevInst`]'s eight `t` slots
+    /// and the wire instruction is a fixed 64 bytes. Of the nine, a WEIGHT is the safe one to
+    /// demote: a wrong weight handle reads the wrong bytes and the output is visibly garbage,
+    /// where a wrong OUTPUT handle would silently overwrite an unrelated tensor. It stays a
+    /// handle resolved through the same pointer table as `t[]` — not the packed multi-tensor blob
+    /// [`DevOp::Mamba2Scan`] uses, which is a symptom of over-fusion rather than a precedent.
+    ///
+    /// `i5=Ng` and `i6=W_g` are both REQUIRED. The AMD arm traps on either being absent rather
+    /// than degrading to a 3-stream sweep, because that fallback would leave `g_out` exactly as it
+    /// found it — finite, fluent and wrong, against a dispatch `default:` that never traps.
+    ///
+    /// `t[0..6]` is identical to [`DevOp::GemvQkv`]'s, so the two share ONE interpreter body
+    /// (op 22 is this with `Ng=0`); the register budget is therefore unchanged, which matters
+    /// because the decode object sits at 254 of 256 VGPRs. Decode-only, `M*K` must fit LDS.
+    GemvQkvg = 108,
+
+    // ===== FP8 (e4m3) LATENT KV for the MLA family (`PLOW_FP8_KV`). ====
+    // The MLA twins of [`DevOp::FlashDecodeFp8`] / [`DevOp::FlashPrefillFp8`], and the
+    // reason they had to exist: `PLOW_FP8_KV=1` swapped the DENSE flash only, so every
+    // model whose KV is a shared LATENT — DeepSeek, Kimi-K2.7, GLM-5.2, Kimi-K3 — had no
+    // fp8-KV path at all. That is also the family with the LARGEST KV: K3's `ckv`(512) +
+    // `krot`(64) over 24 MLA layers is 27.0 KiB/token, 3.38 GiB at 128k.
+    /// FP8-KV twin of [`DevOp::FlashMlaDecode`]. `t4` is the `uint8[b][ctx][512]` e4m3 latent
+    /// cache written by [`DevOp::HeadNormRopeFp8`] at `HD=512` with `cosb`/`sinb` absent (an
+    /// RMSNorm plus an fp8 store — the fp8 twin of the `RmsNorm` that writes the bf16 `ckv` row,
+    /// and an op the runtime's kv-row-writer scan already matches, so the layer cannot drop out
+    /// of the per-step row patch).
+    ///
+    /// BOTH per-row dequant scales share ONE tensor slot, because the dense MLA decode has
+    /// exactly one free one (`t7` is the gather `idx`; every other slot is live):
+    /// `kv_scale[b*kv_stride + row]` is the `ckv` scale and
+    /// `kv_scale[(n_batch+b)*kv_stride + row]` the `krot` scale, the second half present only
+    /// when `krot_fp8 != 0`. `krot_fp8` reuses `i6` (the gather `top_k` slot, dead here) and
+    /// selects whether `t5` is the untouched bf16 rope cache or its own e4m3 cache.
+    ///
+    /// Per-ROW scales, matching [`DevOp::HeadNormRopeFp8`]: a KV row is written once at its own
+    /// step and never revisited, so the scale costs one f32 per 512 stored bytes and needs no
+    /// second pass — where a per-tensor scale would have to be chosen before the context exists.
+    /// `t0=Opart(f32) t1=mlpart(f32) t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len(i32) t7=kv_scale` ·
+    /// `i0=n_batch i1=n_head i2=kv_stride i3=window i4=nsplit i5=kv_mask i6=krot_fp8 i7=gf` ·
+    /// `f0=scale`.
+    FlashMlaDecodeFp8 = 109,
+    /// FP8-KV twin of [`DevOp::FlashMlaPrefill`]. Same operands as [`DevOp::FlashMlaDecodeFp8`]
+    /// with `i4 = n_tok` instead of `nsplit` — the same slot reuse the bf16 MLA prefill makes,
+    /// and for the same reason (`nsplit` MUST be 1 for prefill). Built only under
+    /// `PLOW_MLA_PREFILL`.
+    /// `t0=Opart(f32) t1=mlpart(f32) t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len(i32) t7=kv_scale` ·
+    /// `i0=n_batch i1=n_head i2=kv_stride i3=window i4=n_tok i5=kv_mask i6=krot_fp8 i7=gf` ·
+    /// `f0=scale`.
+    FlashMlaPrefillFp8 = 110,
+    /// KDA short conv over all THREE streams in one packet — [`DevOp::KdaConv`] merged along the
+    /// CHANNEL axis, which is its output axis.
+    ///
+    /// The three convs are independent work over `C = H*D` channels each, and they were three
+    /// packets for that reason. At batch 1 that reasoning is inverted by measurement: a KDA decode
+    /// layer is launch/protocol bound, `runtime/tests/kda_fuse_bench_gfx950.c` puts a packet at
+    /// ~12 us against a chain whose entire arithmetic is a rounding error, and three packets of
+    /// independent work cost three times one packet of the same work. So they merge.
+    ///
+    /// This is the [`DevOp::GemvQkvg`] direction, NOT the `GLM_GROUP=1` one. Nothing that ran in
+    /// parallel starts running in sequence: each conv already spanned all 256 CUs with
+    /// `ceil(C/256)` channels apiece, and fused they span the same 256 CUs with `ceil(3C/256)`.
+    /// The op gets WIDER — 48 -> 144 channels per CU at TP1, 6 -> 18 at TP8 — which is what the
+    /// knob contract asks of a merge. The body is literally [`DevOp::KdaConv`]'s, called on a
+    /// per-stream sub-range, so the two are bit-identical by construction rather than by test.
+    ///
+    /// TWELVE POINTERS, four per stream, and `t[8]` holds eight. The four demoted into `i[]` are
+    /// the `v` TAPS and all three CONV STATES, chosen the way [`DevOp::GemvQkvg`] chose: a wrong
+    /// weight or state handle reads visibly wrong bytes, where a wrong OUTPUT handle silently
+    /// overwrites an unrelated tensor. All four are REQUIRED — the AMD arm traps on any being
+    /// absent rather than convolving a subset, because the dispatch `default:` never traps and a
+    /// partial sweep would leave a stream's `mix` finite, fluent and wrong.
+    ///
+    /// `t0=q_out t1=k_out t2=v_out t3=q_in t4=k_in t5=v_in t6=w_q t7=w_k` ·
+    /// `i0=T i1=C i2=W i3=act i4=w_v i5=cs_q i6=cs_k i7=cs_v`.
+    KdaConv3 = 111,
+    /// [`DevOp::KdaStateStep`] with [`DevOp::KdaGate`] folded into its LDS staging.
+    ///
+    /// The state step already stages this head's `g` into LDS once per (item, token) and
+    /// exponentiates it. `KdaGate`'s whole output is that vector plus one scalar per head, and
+    /// both are computable from operands the step can read directly, so the separate packet buys
+    /// a `[T,H,D]` f32 round trip through HBM and nothing else:
+    ///
+    /// ```text
+    ///   g[h,d] = f1 * sigmoid(exp(A_log[h]) * (g_raw[t,h,d] + dt_bias[h,d]))    i6 == 1
+    ///   g[h,d] = -exp(A_log[h]) * softplus(g_raw[t,h,d] + dt_bias[h,d])         i6 == 0
+    ///   beta[h] = sigmoid(beta_raw[t,h])
+    /// ```
+    ///
+    /// BIT-IDENTICAL to `KdaGate` followed by [`DevOp::KdaStateStep`], not merely equivalent: the
+    /// deleted intermediate was f32 in HBM and an f32 store/load is exact, so the same
+    /// expressions produce the same bits. That is what makes the fusion checkable against the
+    /// unfused path on the same fixture rather than only against a tolerance.
+    ///
+    /// SLICE MAP UNCHANGED, which is the constraint that matters. `blocks` is still
+    /// `min(H*D/BV, n_cu)` and the item is still `(head, tile of BV value columns)`; the gate is
+    /// evaluated where its consumer already is, not looped over. Its arithmetic is recomputed
+    /// `D/BV` times per head — `KdaGate` computed each element once — which is a few thousand
+    /// transcendentals against a packet that costs ~12 us, and it deletes 12 288 f32 of write plus
+    /// `D/BV` x that of read per layer.
+    ///
+    /// `dt_bias` is demoted to `i5` for the same reason `KdaConv3` demotes taps: nine pointers do
+    /// not fit eight slots and a wrong weight handle is visible where a wrong output handle is
+    /// not. `i5` and `t7` are REQUIRED and the arm traps on either being absent — without the
+    /// gate operands this op cannot fall back to reading a precomputed `g`, because it has no
+    /// slot naming one.
+    ///
+    /// `t0=o t1=q t2=k t3=v t4=g_raw t5=beta_raw t6=state t7=A_log` ·
+    /// `i0=T i1=H i2=D i3=BV i4=flags i5=dt_bias i6=gate_mode` · `f0=scale f1=lower_bound`.
+    KdaStateStepG = 112,
+    /// `t0=fu t1=A t2=Wg(fp4) t5=Wu(fp4) t3=Sg(e8m0) t4=Su(e8m0)` · `i0=M i1=N i2=K i5=act`,
+    /// computing `fu = act(Wg @ A) * (Wu @ A)` — the MXFP4 twin of [`DevOp::GemmGlu`] and the T-row
+    /// twin of [`DevOp::GemvGluMxfp4`].
+    ///
+    /// # The one place the encoding cost HBM traffic rather than a different weight fetch
+    ///
+    /// Without this arm the shared-expert prefill unfuses into two [`DevOp::GemmMxfp4`] plus a
+    /// [`DevOp::Glu`]: gate and up are each materialised to HBM as `[M, N]` bf16 and read back, ~8
+    /// bytes per output element of traffic that the fused epilogue never spends, plus two extra
+    /// packets and their counter gates. Everywhere else in an mxfp4 packet the encoding changes
+    /// only which bytes a weight fetch reads. Precision and fusion are orthogonal, and this closes
+    /// the gap on every MoE layer.
+    ///
+    /// # It is two existing template flags composed, not a third GEMM body
+    ///
+    /// `GLU` owns the EPILOGUE — the accumulator's `SN` axis selects gate vs up, so both halves of
+    /// an output element land in the same lane and no shuffle is needed — and `WFP4` owns the
+    /// B-FETCH, which dequants fp4→bf16 with the E8M0 scale folded exactly. The two are disjoint:
+    /// the dequant finishes before the tile reaches LDS and the epilogue never sees a weight. The
+    /// only addition is that the SCALE ROW must follow the gate/up select alongside the weight
+    /// pointer — a fused arm that switched the weight and kept the gate's scale row would read
+    /// `Wu`'s nibbles with `Wg`'s exponents, wrong by a per-block power of two.
+    ///
+    /// Same tile, same registers, same MFMA count as [`DevOp::GemmMxfp4`]: a workgroup emits `BN/2`
+    /// fused columns for the MFMA it used to spend on `BN` raw ones, which is the same arithmetic
+    /// because every output needs both halves anyway.
+    ///
+    /// 256×256 only, as its bf16 twin is (the epilogue needs `SN == 2`), and THAT is what bounds
+    /// the win rather than the fusion. Measured at the K3 shared-expert prefill shape over 15
+    /// `(T, N)` points: −38.8%…−48.7% against the SAME tile unfused, and −20%…−35% against the BEST
+    /// unfused rung where the emit gate fires. The mechanism is the wave count — the fused arm does
+    /// the pair's MFMA in ONE kernel over the same tile grid, so it saves a whole pass over the 256
+    /// CUs whenever its grid fits one; the round trip is the smaller term. Where the shape does not
+    /// fill the machine at 256×256 a 64×128 or 128×128 unfused pair wins by up to 35%, which is why
+    /// `glu_fusion_wins_mxfp4` is part of the arm and not a nicety.
+    GemmGluMxfp4 = 113,
+
+    /// `t0=q_out t1=x t2=W_q(fp4) t3=k_out t4=W_k(fp4) t5=v_out t6=W_v(fp4)` ·
+    /// `i0=M i1=Nq i2=K i3=Nk i4=Nv i5=S_q i6=S_k i7=S_v`, computing up to THREE mxfp4 projections
+    /// in ONE decode GEMV — the fp4 twin of [`DevOp::GemvQkv`].
+    ///
+    /// Kimi-K3's three MLA down-projections (`q_a` → 1536, `kv_a` → 512, `k_rope` → 64) all read
+    /// the same pre-normed `x[7168]`, so their output columns concatenate into one
+    /// `N = Nq+Nk+Nv` sweep exactly as the bf16 form's do.
+    ///
+    /// # Why this is worth three packets a layer
+    ///
+    /// A GEMV census measured every K3 decode GEMV except `lm_head` pinned at a ~0.032 ms LAUNCH
+    /// FLOOR, using under 3% of achievable bandwidth. At batch 1 these kernels are launch-bound,
+    /// not bandwidth-bound, so deleting packets is the whole win — and `k_rope` is the extreme
+    /// case: 64 columns over 256 workgroups gives `per = 1`, so 192 CUs own nothing at all.
+    ///
+    /// This is the OUTPUT-dimension merge, the same direction [`DevOp::GemvQkvg`] documents. The
+    /// per-CU column count RISES (6 / 2 / 1 across the three split sweeps → 9 fused, at K3's
+    /// geometry over 256 CUs), so the op gets WIDER and nothing that ran in parallel starts running
+    /// in sequence — the opposite of `plans/knob-contract.md` §6g-KNOBS' `GLM_GROUP=1`, which
+    /// removed 38% of the ops for **+2.88 ms** by collapsing disjoint-CU work into a loop.
+    ///
+    /// # `i5`/`i6`/`i7` are TENSOR HANDLES
+    ///
+    /// Three outputs, three fp4 weights, three E8M0 scale rows and `x` is TEN pointers against
+    /// [`DevInst`]'s eight `t` slots, and the wire instruction is a fixed 64 bytes.
+    /// [`DevOp::GemvQkvg`] set the rule for which operand is demoted: a WEIGHT, because a wrong
+    /// weight handle reads the wrong bytes and the output is visibly garbage, where a wrong OUTPUT
+    /// handle would silently overwrite an unrelated tensor. An MX scale row is that same kind of
+    /// operand and strictly SAFER — it is read-only, it is half of the weight (fp4 nibbles are
+    /// meaningless without their exponents), and a wrong one is off by a per-block power of two,
+    /// which is visible in the first token. So `t[0..6]` stays byte-for-byte [`DevOp::GemvQkv`]'s
+    /// and the three scale handles take the three integer slots op 22 leaves empty. No output is
+    /// demoted, and they are ordinary handles resolved through the same `T[]` table as `t[]`.
+    ///
+    /// Rejected: a packed pointer blob like [`DevOp::Mamba2Scan`]'s, which this file already calls
+    /// a symptom of over-fusion and which adds an indirection to a launch-bound kernel; and
+    /// requiring the three scale rows CONTIGUOUS so one base plus a stride addresses all three —
+    /// they are three separate checkpoint tensors, so the arena would have to repack them and a
+    /// silent violation reads another tensor's exponents.
+    ///
+    /// `Nv = 0` is the legal TWO-STREAM form (`t5`/`t6`/`i7` all absent), which is what the
+    /// `q_nope`|`q_rope` pair off the q-lora norm needs. Any other absence TRAPS on the AMD arm
+    /// rather than degrading to a narrower sweep, because that fallback would leave an output
+    /// exactly as it found it — finite, fluent and wrong, against a dispatch `default:` that never
+    /// traps.
+    ///
+    /// BYTE-EXACT to the split [`DevOp::GemvMxfp4`] calls it replaces, and structurally so: a
+    /// column's value depends only on its own weight row, its own scale row and the shared `x`,
+    /// accumulated over the same chunks in the same order. Concatenating the sweeps changes which
+    /// workgroup owns a column, never what that column computes. Verified elementwise on gfx950.
+    ///
+    /// ONE interpreter body with [`DevOp::GemvMxfp4`], which is this with `Nk = Nv = 0` — the same
+    /// register argument [`DevOp::GemvQkvg`] makes. Decode-only, `M*K` must fit LDS.
+    GemvQkvMxfp4 = 114,
 }
 
 impl DevOp {
@@ -949,7 +1224,10 @@ impl DevOp {
         DevOp::GemmWideFp8, DevOp::GemmC5Fp8,
         DevOp::KdaStateStep, DevOp::KdaGatedNorm,
         DevOp::AttnRes, DevOp::SituGlu, DevOp::MlaOutGate,
-        DevOp::GemmFp8Blk,
+        DevOp::GemmFp8Blk, DevOp::GemvQkvg,
+        DevOp::FlashMlaDecodeFp8, DevOp::FlashMlaPrefillFp8,
+        DevOp::KdaConv3, DevOp::KdaStateStepG,
+        DevOp::GemmGluMxfp4, DevOp::GemvQkvMxfp4,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -993,6 +1271,7 @@ impl DevOp {
             DevOp::GemvGlu => "PLOW_DOP_GEMV_GLU",
             DevOp::GemmGlu => "PLOW_DOP_GEMM_GLU",
             DevOp::GemvQkv => "PLOW_DOP_GEMV_QKV",
+            DevOp::GemvQkvg => "PLOW_DOP_GEMV_QKVG",
             DevOp::GemvFp8 => "PLOW_DOP_GEMV_FP8",
             DevOp::GemvGluFp8 => "PLOW_DOP_GEMV_GLU_FP8",
             DevOp::QuantFp8 => "PLOW_DOP_QUANT_FP8",
@@ -1068,6 +1347,8 @@ impl DevOp {
             DevOp::Mamba2Scan => "PLOW_DOP_MAMBA2_SCAN",
             DevOp::GemvMxfp4 => "PLOW_DOP_GEMV_MXFP4",
             DevOp::GemvGluMxfp4 => "PLOW_DOP_GEMV_GLU_MXFP4",
+            DevOp::GemmGluMxfp4 => "PLOW_DOP_GEMM_GLU_MXFP4",
+            DevOp::GemvQkvMxfp4 => "PLOW_DOP_GEMV_QKV_MXFP4",
             DevOp::GemmMxfp4 => "PLOW_DOP_GEMM_MXFP4",
             DevOp::GemmWide => "PLOW_DOP_GEMM_WIDE",
             DevOp::GemmC5 => "PLOW_DOP_GEMM_C5",
@@ -1078,6 +1359,10 @@ impl DevOp {
             DevOp::GemmWideFp8 => "PLOW_DOP_GEMM_WIDE_FP8",
             DevOp::GemmC5Fp8 => "PLOW_DOP_GEMM_C5_FP8",
             DevOp::GemmFp8Blk => "PLOW_DOP_GEMM_FP8_BLK",
+            DevOp::FlashMlaDecodeFp8 => "PLOW_DOP_FLASH_MLA_DECODE_FP8",
+            DevOp::FlashMlaPrefillFp8 => "PLOW_DOP_FLASH_MLA_PREFILL_FP8",
+            DevOp::KdaConv3 => "PLOW_DOP_KDA_CONV3",
+            DevOp::KdaStateStepG => "PLOW_DOP_KDA_STATE_STEP_G",
         }
     }
 
@@ -1090,7 +1375,23 @@ impl DevOp {
     /// drift went unseen for a different reason worth recording: `cargo test` stops at
     /// the first failing SUITE, devgen's `tuned_tile_selection` fails ahead of packet,
     /// and so `dev_opcodes` never ran. Use `--no-fail-fast` when checking ABI guards.
-    pub const COUNT: u16 = 108;
+    ///
+    /// 108 -> 109 when `GemvQkvg = 108` was added, and it hid the SAME way twice
+    /// over: `tuned_tile_selection` was red again (a stale tuning cell, not this),
+    /// and the runs that did pass were filtered to `--lib`, which excludes
+    /// `tests/dev_opcodes.rs` entirely. It surfaced only once the MXFP4 tile
+    /// campaign made that suite green. Two independent filters, one blind spot —
+    /// which is the argument for `--no-fail-fast` above, not against it.
+    ///
+    /// 109 -> 111 when `FlashMlaDecodeFp8 = 109` / `FlashMlaPrefillFp8 = 110` were
+    /// added. Two at once, and the constant is `highest + 1`, not `+ 1` per op.
+    /// 111 -> 113 for `KdaConv3 = 111` and `KdaStateStepG = 112`. These were authored as
+    /// 109/110 by an agent working in parallel with the one that added the fp8-KV pair, and BOTH
+    /// branches picked the same two free values — the collision surfaced only at merge, in
+    /// `dev_isa.h`. Renumbering the later pair was the resolution. Two variants, one
+    /// bump: this constant is one past the HIGHEST opcode, not a count, and adding a pair moves it
+    /// by two whether or not the range has holes.
+    pub const COUNT: u16 = 115;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
@@ -1109,9 +1410,11 @@ impl DevOp {
     /// emitter funnels through, and the layout knowledge lives HERE — beside the doc comments
     /// that define it — rather than being restated at the call site.
     ///
-    /// Every `Gemv*` opcode carries `i0=M i1=N i2=K`. The one irregularity is
-    /// [`DevOp::GemvQkv`], whose `i1/i3/i4` are `Nq/Nk/Nv` for three concatenated weight
-    /// streams read against one staged `x`; the shape that governs its cost is their sum.
+    /// Every `Gemv*` opcode carries `i0=M i1=N i2=K`. The one irregularity is the fused-QKV
+    /// pair: [`DevOp::GemvQkv`]'s `i1/i3/i4` are `Nq/Nk/Nv` and [`DevOp::GemvQkvg`] adds
+    /// `i5=Ng`, for three (resp. four) concatenated weight streams read against one staged `x`;
+    /// the shape that governs their cost is the sum. They are separate FAMILIES for the reason
+    /// below — a 3-stream and a 4-stream fusion at one `(M,N,K)` are different operations.
     ///
     /// `quant` is the encoding of the WEIGHT stream, spelled to match
     /// `kernelcaps::QuantScheme`'s `Debug` so the op-case keys of the two families are
@@ -1138,11 +1441,13 @@ impl DevOp {
             DevOp::GemvArgmax => ("gemvargmax", i[1], "None"),
             DevOp::GemvGlu | DevOp::GemvGluSz => ("gemvglu", i[1], "None"),
             DevOp::GemvQkv => ("gemvqkv", i[1] + i[3] + i[4], "None"),
+            DevOp::GemvQkvg => ("gemvqkvg", i[1] + i[3] + i[4] + i[5], "None"),
             DevOp::GemvFp8 => ("gemv", i[1], "W8A8"),
             DevOp::GemvFp8Blk => ("gemvblk", i[1], "W8A8"),
             DevOp::GemvGluFp8 => ("gemvglu", i[1], "W8A8"),
             DevOp::GemvMxfp4 => ("gemv", i[1], "Mxfp4"),
             DevOp::GemvGluMxfp4 => ("gemvglu", i[1], "Mxfp4"),
+            DevOp::GemvQkvMxfp4 => ("gemvqkv", i[1] + i[3] + i[4], "Mxfp4"),
             _ => return None,
         };
         Some((fam, i[0], n, i[2], q))

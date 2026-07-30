@@ -627,6 +627,72 @@ fn fuse_kimi() {
     );
 }
 
+// --- Kimi K3 (Moonshot): hybrid KDA/MLA + latent MoE ---
+//
+// K3 could not be lowered at all before the four K3 terms existed: `lower.rs`
+// REFUSED `Conv1dDepthwise`/`LinearAttention`/`SituGlu`/`BlockResidual` rather
+// than dropping them to `Opaque`, which is a single-input passthrough and would
+// have dropped every weight leaf but the first. So this test is first of all a
+// test that the graph lowers.
+
+const KIMI_K3: &str = r#"{
+    "model_type": "kimi_k3",
+    "text_config": {
+      "model_type": "kimi_linear",
+      "vocab_size": 1000, "hidden_size": 256, "intermediate_size": 512,
+      "num_hidden_layers": 4, "num_attention_heads": 4,
+      "q_lora_rank": 64, "kv_lora_rank": 32,
+      "qk_rope_head_dim": 16, "qk_nope_head_dim": 32, "v_head_dim": 32,
+      "num_experts": 8, "num_experts_per_token": 2, "num_shared_experts": 1,
+      "moe_intermediate_size": 128, "routed_expert_hidden_size": 192,
+      "first_k_dense_replace": 1,
+      "attn_res_block_size": 2,
+      "linear_attn_config": {
+        "num_heads": 4, "head_dim": 32, "short_conv_kernel_size": 4,
+        "full_attn_layers": [1, 3], "kda_layers": [2, 4]
+      }
+    }
+}"#;
+
+#[test]
+fn fuse_kimi_k3() {
+    let g = build_from_config_json(KIMI_K3).expect("build kimi_k3");
+    let (fused, stats) = rewrite::rewrite_graph(&g).expect("rewrite");
+
+    // The two K3 gate fusions. Both targets are opcodes that already exist and
+    // already pass a real-weight numeric gate (KdaGatedNorm = 103,
+    // MlaOutGate = 106), so reaching them costs no new kernel work.
+    assert!(
+        fused.contains("FusedKdaGatedNorm"),
+        "KDA gated-norm fusion did not fire in K3"
+    );
+    assert!(
+        fused.contains("FusedMlaOutGate"),
+        "MLA output-gate fusion did not fire in K3"
+    );
+    // The generic fusions must still fire on a hybrid graph.
+    assert!(
+        fused.contains("FusedNormLinear"),
+        "rmsnorm→linear fusion did not fire in K3"
+    );
+    assert!(
+        stats.ops_after < stats.ops_before,
+        "fusion did not reduce ops: {} -> {}",
+        stats.ops_before,
+        stats.ops_after
+    );
+
+    // Weight-manifest completeness — the reason `BlockResidual` lowers to a cons
+    // chain rather than a fixed-arity term. A dropped snapshot or score weight
+    // shows up here and nowhere else.
+    let fw = fused_weights(&fused);
+    let gw: BTreeSet<String> = graph_weights(&g)
+        .into_iter()
+        .filter(|w| !w.ends_with(".mlp.gate.weight"))
+        .collect();
+    assert_eq!(fw, gw, "fusion dropped or duplicated weight leaves in K3");
+}
+
 // --- Qwen3 / Qwen2.5: GQA + SwiGLU (dense) ---
 
 const QWEN3: &str = r#"{

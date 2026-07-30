@@ -400,6 +400,51 @@ fn glu_fusion_wins(m: u32, n: u32, k: u32, n_cu: u32) -> bool {
         == DevOp::Gemm
 }
 
+/// [`glu_fusion_wins`] for the MXFP4 (w4a16) family — asked at the shape the fused arm ACTUALLY
+/// runs, which is not the shape it is emitted for.
+///
+/// [`DevOp::GemmGluMxfp4`] exists at 256x256 only, for the reason its bf16 twin does: the
+/// epilogue's wave->column remap needs `SN == 2`, i.e. `BN = 256`. So the candidate set is the
+/// three fp4 rungs over which "the winner is 256x256" means "this shape fills the machine at
+/// 256x256" — the restriction [`glu_era_inventory`] documents, one encoding over.
+///
+/// # The width is `2n`, and that is the whole correction
+///
+/// Under `GLU` a tile emits `BN/2` output columns, not `BN` (`op_gemm.h`: `NB = GLU ? BN/2 : BN`,
+/// and `tn = ceil(N / NB)`). So the fused arm's tile grid at output width `n` is
+/// `ceil(m/256) x ceil(n/128)` — EXACTLY a plain 256x256 GEMM's grid at width `2n`, which is also
+/// exactly the two unfused GEMMs' grids added together. Asking the selector about `(m, n, k)`
+/// therefore asks about a machine fill the fused arm never has: it under-counts the tiles by 2x and
+/// refuses the fusion on shapes that do fill the machine.
+///
+/// That is not a theoretical correction. At Kimi-K3's TP8 shared-expert prefill (`n = 768`,
+/// `k = 7168`, `t = 8192`) the `(m, n, k)` spelling refuses, and the fused arm measures **-35.2%**
+/// against the best unfused rung; at `n = 1536, t = 4096` it refuses and the arm measures -34.7%.
+/// See `crates/devgen/tests/mxfp4_glu_fusion.rs` for the table.
+///
+/// **Named residual:** [`glu_fusion_wins`] has the same `NB = BN/2` property and asks at `n`. Left
+/// alone deliberately — correcting it would move bf16 emission for every Gemma/Llama/Qwen shape,
+/// which is a separate change with its own measurements to take.
+pub fn glu_fusion_wins_mxfp4(m: u32, n: u32, k: u32, n_cu: u32) -> bool {
+    select_gemm_over(glu_era_inventory_mxfp4(), m, 2 * n, k, n_cu, kernelcaps::QuantScheme::Mxfp4)
+        == DevOp::GemmMxfp4
+}
+
+/// The fp4 rungs [`glu_fusion_wins_mxfp4`] ranks — the three that mirror [`glu_era_inventory`]'s.
+fn glu_era_inventory_mxfp4() -> &'static kernelcaps::Inventory {
+    use std::sync::OnceLock;
+    const RUNGS: [DevOp; 3] =
+        [DevOp::GemmMxfp4, DevOp::GemmMedMxfp4, DevOp::GemmSmallMxfp4];
+    static INV: OnceLock<kernelcaps::Inventory> = OnceLock::new();
+    INV.get_or_init(|| {
+        let src = gfx950_gemm_inventory();
+        kernelcaps::Inventory::probed(
+            src.build().clone(),
+            src.iter().filter(|s| RUNGS.contains(&s.id.0)).cloned(),
+        )
+    })
+}
+
 /// The bf16 rungs that existed when the GLU epilogue was written.
 ///
 /// The only set over which "the winner is 256x256" means "this shape fills the machine at
@@ -644,6 +689,21 @@ const GFX950_RUNGS: [(DevOp, DevOp, DevOp, i64, i64, i64); 5] = [
     (DevOp::GemmWide, DevOp::GemmWideFp8, DevOp::GemmWideMxfp4, 128, 256, 64),
     (DevOp::GemmC5, DevOp::GemmC5Fp8, DevOp::GemmC5Mxfp4, 192, 256, 64),
 ];
+
+/// Every opcode [`pick_tile`] can answer with, in any encoding — the set a test asks "is this a
+/// tiled prefill GEMM?" about.
+///
+/// Derived from [`GFX950_RUNGS`] rather than hand-listed, because a hand-listed copy is exactly
+/// what went stale when the two 128x256/192x256 rungs landed: a gate naming only
+/// `Gemm`/`GemmMed`/`GemmSmall` silently stopped matching the shapes the selector had started
+/// choosing for. Add a rung to the table and every caller here follows.
+#[allow(dead_code)] // read by the emitter TESTS; production code names its rung directly
+pub(crate) fn gemm_family_ops() -> Vec<u16> {
+    GFX950_RUNGS
+        .iter()
+        .flat_map(|&(b, f, m, ..)| [b as u16, f as u16, m as u16])
+        .collect()
+}
 
 /// [`GFX950_RUNGS`] as `KernelSpec`s, tagged with the encoding each serves.
 ///
@@ -1930,6 +1990,36 @@ fn emit_xreduce(
     tp: u32,
     slot: u32,
 ) -> u32 {
+    emit_xreduce_gather(b, xgate, decode, xr_cus, &[dep], out, xr_elems, tp, slot, None)
+}
+
+/// [`emit_xreduce`], plus an ALL-GATHER of a column-parallel partial folded into the same
+/// packet: `out = sum_r reduced_r + concat_r gathered_r`.
+///
+/// `gather` is `(slot byte offset, per-rank column count, out row width)`. See
+/// [`packet::dev::DevOp::XReduce`] for why the two collectives are one packet — the two
+/// partials are ADDED, so the gather is one extra bf16 load per element on a rendezvous
+/// that already happened, rather than its own packet (~5.3 us) and its own rendezvous.
+///
+/// ALWAYS THE ONE-SHOT when a gather is present, on both phases. The two-shot's
+/// reduce-scatter owns a 1/N slice of the message and its all-gather phase reassembles it;
+/// there is no place in that decomposition for a SECOND, differently-shaped gather, and
+/// inventing one to save fabric on a prefill chunk is not worth a second reduction body.
+/// The cost is prefill-only and bounded by the one-shot's N× fabric on one collective per
+/// MoE layer.
+#[allow(clippy::too_many_arguments)]
+fn emit_xreduce_gather(
+    b: &mut Builder,
+    xgate: &mut u32,
+    decode: bool,
+    xr_cus: &[u32],
+    deps: &[u32],
+    out: u32,
+    xr_elems: u32,
+    tp: u32,
+    slot: u32,
+    gather: Option<(u32, u32, u32)>,
+) -> u32 {
     // SIZE THE COLLECTIVE TO ITS ACTUAL WORK. `d_xreduce` gives each thread ONE element
     // (`base = slice*512 + threadIdx.x`, `step = nblk*512`), so a reduction of `xr_elems`
     // saturates at `ceil(xr_elems/512)` workgroups and every workgroup past that does
@@ -1957,22 +2047,26 @@ fn emit_xreduce(
     // reduce-scatter phase saturates even earlier, at `n/nranks`), so this never over-narrows.
     let need = (xr_elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
     let xr_cus = &xr_cus[..need];
-    if decode {
+    if decode || gather.is_some() {
         let gate = *xgate;
         *xgate += 1;
-        b.emit(DevOp::XReduce, xr_cus.to_vec(), &[dep], |d| {
+        let (gslot, gcols, row_w) = gather.unwrap_or((0, 0, 0));
+        b.emit(DevOp::XReduce, xr_cus.to_vec(), deps, |d| {
             d.t[0] = out; // reduced [1,hidden] result (local)
             d.i[0] = xr_elems; // elements to reduce (decode: hidden)
             d.i[1] = tp; // n_gpu
             d.i[2] = slot; // partial slot byte offset (§7a)
             d.i[3] = gate; // xctr gate id (unique per collective)
+            d.i[4] = gslot; // folded all-gather: its partial slot byte offset
+            d.i[5] = gcols; // columns per rank (0 = no gather)
+            d.i[6] = row_w; // `out`'s full row width, for the [T, row_w] case
         })
     } else {
         let gate_rs = *xgate;
         *xgate += 1;
         let gate_ag = *xgate;
         *xgate += 1;
-        b.emit(DevOp::XReduceTwoShot, xr_cus.to_vec(), &[dep], |d| {
+        b.emit(DevOp::XReduceTwoShot, xr_cus.to_vec(), deps, |d| {
             d.t[0] = out; // reduced [t,hidden] result (local)
             d.i[0] = xr_elems; // elements to reduce (t*hidden)
             d.i[1] = tp; // n_gpu
@@ -4289,6 +4383,16 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // is loud about this one too even without the claim above. `kimi_k3_emit` never returns: it
     // validates everything the front end can and then reports what is not implemented.
     if model_type == "kimi_k3" {
+        // `K3_FULL=1` selects the real emit (`k3_emit_full`), mirroring GLM's
+        // `GLM_FULL`. The DEFAULT stays the capability report, because the
+        // host-side mxfp4 expert bind and the Mixtral `w1/w2/w3` name template
+        // are still missing — a blob emitted today fails at LOAD with a missing
+        // weight, which is loud and correct but is not what someone who has not
+        // read the report is expecting.
+        if std::env::var("K3_FULL").ok().as_deref() == Some("1") {
+            mla::k3_emit_full(&dir, ctx, &out, n_cu, tp, rope_gen, verify.as_ref(), l2_layout);
+            return;
+        }
         mla::kimi_k3_emit(&dir, ctx, tp, block_spec.as_deref());
     }
     if model_type == "glm_moe_dsa" {
@@ -4516,7 +4620,9 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_FLASH_GATHER_PREFILL",
     "PLOW_DOP_FLASH_MERGE",
     "PLOW_DOP_FLASH_MLA_DECODE",
+    "PLOW_DOP_FLASH_MLA_DECODE_FP8",
     "PLOW_DOP_FLASH_MLA_PREFILL",
+    "PLOW_DOP_FLASH_MLA_PREFILL_FP8",
     "PLOW_DOP_FLASH_PREFILL",
     "PLOW_DOP_FLASH_PREFILL_FP8",
     "PLOW_DOP_GEMM",
@@ -4527,6 +4633,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMM_FP8_BLK",
     "PLOW_DOP_GEMM_GLU",
     "PLOW_DOP_GEMM_GLU_FP8",
+    "PLOW_DOP_GEMM_GLU_MXFP4",
     "PLOW_DOP_GEMM_MED",
     "PLOW_DOP_GEMM_MED_FP8",
     "PLOW_DOP_GEMM_MED_MXFP4",
@@ -4545,15 +4652,19 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMV_GLU_MXFP4",
     "PLOW_DOP_GEMV_MXFP4",
     "PLOW_DOP_GEMV_QKV",
+    "PLOW_DOP_GEMV_QKVG",
+    "PLOW_DOP_GEMV_QKV_MXFP4",
     "PLOW_DOP_GLU",
     "PLOW_DOP_HEADNORM_ROPE",
     "PLOW_DOP_HEADNORM_ROPE_FP8",
     "PLOW_DOP_INDEX_SCORE",
     "PLOW_DOP_INDEX_SELECT",
     "PLOW_DOP_KDA_CONV",
+    "PLOW_DOP_KDA_CONV3",
     "PLOW_DOP_KDA_GATE",
     "PLOW_DOP_KDA_GATED_NORM",
     "PLOW_DOP_KDA_STATE_STEP",
+    "PLOW_DOP_KDA_STATE_STEP_G",
     "PLOW_DOP_LAYERNORM",
     "PLOW_DOP_MLA_MERGE_FOLD",
     "PLOW_DOP_MLA_OUT_GATE",
@@ -5213,6 +5324,12 @@ fn emit_dense_gqa(
         &c.prefix,
         &m.tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
         block_mode.then(|| block.clone()),
+        // The dense path declares every weight it reads; nothing reaches the device by a
+        // name-pattern bind, a load-time fold or a host-side absorption, and nothing it
+        // declares is synthesized before the bind, and no weight is conditionally covered.
+        &[],
+        &[],
+        &[],
     ) {
         Ok(()) => {}
         Err(e) if std::env::var("PLOW_SKIP_COVERAGE").ok().as_deref() == Some("1") => {
@@ -5781,15 +5898,11 @@ mod gfx950_coverage_tests {
         ("PLOW_W8A16",     Knob::Wired,                          Knob::Wired),
         ("PLOW_W8A8",      Knob::Wired,                          Knob::Refused),
         ("PLOW_MXFP4",     Knob::Refused,                        Knob::Wired),
-        ("PLOW_FP8_KV",    Knob::Wired,                          Knob::Ignored(
-            "KNOWN HOLE, same shape as the PLOW_MXFP4 one this table was added for. The MLA family \
-             has no e4m3 arm for its compressed latent KV (no FlashMlaDecodeFp8), so PLOW_FP8_KV=1 \
-             on GLM/Kimi/DeepSeek is silently dropped and the asset is bf16-KV. Refusing it needs a \
-             gate on all four MLA entry points (glm_main, glm_emit_block, kimi_emit_block, \
-             nemotron_emit_block) and is deliberately out of scope of the change that added this \
-             table; recorded here so it is a tracked debt and not a fresh discovery.")),
-        ("PLOW_KV_FP8",    Knob::Wired,                          Knob::Ignored(
-            "Alias of PLOW_FP8_KV; same hole, same reason.")),
+        // The K3 full-model path in mla.rs now emits the compressed-latent fp8 twins. Other MLA
+        // entry points still need the same wiring, but the family no longer silently ignores the
+        // knob universally; K3's structural tests pin the allocation and opcode swap.
+        ("PLOW_FP8_KV",    Knob::Wired,                          Knob::Wired),
+        ("PLOW_KV_FP8",    Knob::Wired,                          Knob::Wired),
     ];
 
     /// CHECK B — the table above is true of the sources.

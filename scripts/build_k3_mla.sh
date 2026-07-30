@@ -22,6 +22,11 @@ OUT="${1:-${PLOW_BUILD_DIR:-/home/lava/models/k3mla}}"
 ARCH="${PLOW_HIP_ARCH:-gfx950}"
 BUN="${PLOW_BUNDLER:-$(ls -1 "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/clang-offload-bundler 2>/dev/null | head -1)}"
 INC="-I$R/amd -I$R/common"
+# Extra -D flags for an AXIS A/B against the same source. The fp8-latent-KV gate is
+#   PLOW_EXTRA_DEFS=-DPLOW_FP8_KV=1 ./scripts/build_k3_mla.sh <outdir-fp8>
+# built into its OWN outdir, because PLOW_FP8_KV is a SWAP: that object has no bf16
+# FLASH_MLA_DECODE arm, so pointing the bf16 harness at it would hit the silent `default:`.
+EXTRA="${PLOW_EXTRA_DEFS:-}"
 mkdir -p "$OUT"
 cd "$OUT"
 # A failed build must leave NOTHING behind, or the next run silently tests a stale object.
@@ -29,8 +34,8 @@ rm -f i_decode.co interp_decode.elf k3_mla_test
 
 # DECODE bucket, one token. The MLA decode path (FLASH_MLA_DECODE + MLA_MERGE_FOLD) and the decode
 # MoE path both carry T=1; T>1 is the separate prefill graph, which this gate does not touch.
-echo "[1/2] device code object ($ARCH, decode bucket, PLOW_GEMV_MM=1, PLOW_MXFP4=1, PLOW_K3=1)"
-hipcc --offload-arch="$ARCH" -O3 -w -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=1 -DPLOW_MXFP4=1 -DPLOW_K3=1 \
+echo "[1/2] device code object ($ARCH, decode bucket, PLOW_GEMV_MM=1, PLOW_MXFP4=1, PLOW_K3=1 $EXTRA)"
+hipcc --offload-arch="$ARCH" -O3 -w -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=1 -DPLOW_MXFP4=1 -DPLOW_K3=1 $EXTRA \
       --genco "$R/amd/interp.hip" -o i_decode.co $INC
 "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
        --input=i_decode.co --output=interp_decode.elf

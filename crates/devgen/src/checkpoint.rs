@@ -253,6 +253,44 @@ pub(crate) fn validate_coverage(
     // (`examples/block_run.rs`) unusable on any real checkpoint. The FORWARD
     // check is untouched: a weight the block plan binds must still exist.
     block: Option<std::ops::Range<usize>>,
+    // Substrings marking a checkpoint tensor as legitimately consumed WITHOUT being declared.
+    //
+    // The reverse check's whole value is that an unclaimed weight is a missing op, so every entry
+    // here is a hole punched in it and must name a mechanism that actually reads the bytes —
+    // never "we do not use this". Kimi-K3 needs three, and each is a different mechanism:
+    //
+    //   `.experts.`        bound by NAME PATTERN, not as packet tensors (`bind_packed_experts`,
+    //                      plowrt exec/amd.rs:1621). 494,592 tensors; declaring them would put
+    //                      the whole 1.5 TB expert set in the blob's tensor table.
+    //   `_res_norm.weight` / `_res_proj.weight`
+    //                      FOLDED at load: plowrt's `fold_res_score` (exec/amd.rs:1912) derives
+    //                      the declared `*_res_score.weight` [H] f32 from the norm/proj pair,
+    //                      because `score_weight = norm.weight * proj.weight.squeeze(0)` and the
+    //                      model never uses either factor alone.
+    //   `q_b_proj` / `kv_b_proj`
+    //                      ABSORBED host-side into `derived.{q_absorb,q_rope,v_absorb}` by
+    //                      scripts/kimi_k3_prep.py. The raw factors are genuinely dead once
+    //                      absorbed — verified numerically equivalent to ~1e-6 relative.
+    //
+    // A waiver is a SUBSTRING and therefore blunt: `_res_proj.weight` waives the model-level
+    // `output_attn_res_proj.weight` too. That is intended here (same fold, same mechanism) but it
+    // is exactly how `output_attn_res` stayed invisible, so widen one only with the mechanism in
+    // hand.
+    indirect: &[&str],
+    // CONDITIONAL waivers: `(suffix, produced_suffix)`. A checkpoint tensor ending `suffix` is
+    // covered ONLY IF the plan declares the same name with `suffix` replaced by
+    // `produced_suffix` — i.e. only if the thing that consumes it is actually emitted.
+    //
+    // This exists because a flat substring waiver is what HID the original bug. K3's
+    // `output_attn_res_{norm,proj}` end in `_res_norm.weight`/`_res_proj.weight`, so any blanket
+    // waiver for the per-layer pairs silently covers the model-level pair too — and the model-level
+    // AttnRes being absent was precisely the defect. Keyed on the produced name, a dropped op
+    // stops declaring `…_res_score.weight`, its two factors go unclaimed, and the gate fires.
+    paired: &[(&str, &str)],
+    // The mirror of `indirect`: substrings marking a DECLARED name the checkpoint legitimately
+    // does not contain, because something produces it before the bind rather than shipping it.
+    // Same rule — each entry names a producer, never "it is fine that this is absent".
+    synthesized: &[&str],
 ) -> Result<(), String> {
     // A directory with NO safetensors at all is not a coverage failure -- there is nothing to
     // cross-check against. Emitting a blob from a bare config.json is legitimate (the structural
@@ -328,6 +366,8 @@ pub(crate) fn validate_coverage(
         .iter()
         .map(|s| s.as_str())
         .filter(|n| n.starts_with(prefix) && !ckpt.contains(*n))
+        // Produced before the bind — see `synthesized`'s contract above.
+        .filter(|n| !synthesized.iter().any(|w| n.contains(w)))
         .collect();
     // `layer_scalar` is read by `layer_scalars()` as a compile-time immediate and
     // folded into the residual epilogue, so it is legitimately never declared.
@@ -335,6 +375,15 @@ pub(crate) fn validate_coverage(
         .iter()
         .map(|s| s.as_str())
         .filter(|n| !want.contains(*n) && !n.ends_with(".layer_scalar"))
+        // Consumed indirectly — see `indirect`'s contract above.
+        .filter(|n| !indirect.iter().any(|w| n.contains(w)))
+        // Consumed only if its consumer was emitted — see `paired`'s contract above.
+        .filter(|n| {
+            !paired.iter().any(|(suf, produced)| {
+                n.strip_suffix(suf)
+                    .is_some_and(|stem| want.contains(format!("{stem}{produced}").as_str()))
+            })
+        })
         // In block mode only the block's own layers are in scope.
         .filter(|n| match &block {
             None => true,
@@ -374,6 +423,59 @@ pub(crate) fn validate_coverage(
         );
     }
     Err(e)
+}
+
+#[cfg(test)]
+mod paired_tests {
+    use super::*;
+
+    const K3_PAIRED: &[(&str, &str)] = &[
+        ("_res_norm.weight", "_res_score.weight"),
+        ("_res_proj.weight", "_res_score.weight"),
+    ];
+
+    /// The `paired` rule reproduced on the two names that mattered.
+    ///
+    /// This is the regression test for the Kimi-K3 bring-up bug: the model-level
+    /// `_apply_output_attn_res` was never emitted, so `output_attn_res_{norm,proj}` sat in the
+    /// checkpoint claimed by nothing and the model decoded one constant token forever. A FLAT
+    /// substring waiver for `_res_proj.weight` — the obvious way to write this — covers the
+    /// model-level pair as collateral and would have kept the bug invisible. Keyed on the
+    /// PRODUCED name it does not.
+    fn covered(ckpt: &str, declared: &[&str]) -> bool {
+        !K3_PAIRED.iter().any(|(suf, produced)| {
+            ckpt.strip_suffix(suf)
+                .is_some_and(|stem| declared.contains(&format!("{stem}{produced}").as_str()))
+        })
+    }
+
+    #[test]
+    fn the_output_mix_weights_are_covered_only_when_its_op_is_emitted() {
+        let norm = "language_model.model.output_attn_res_norm.weight";
+        let proj = "language_model.model.output_attn_res_proj.weight";
+        let emitted = ["language_model.model.output_attn_res_score.weight"];
+
+        // Op emitted -> its two factors are legitimately undeclared.
+        assert!(!covered(norm, &emitted), "norm should be waived when the mix is emitted");
+        assert!(!covered(proj, &emitted), "proj should be waived when the mix is emitted");
+
+        // Op DROPPED -> both go unclaimed and the gate must fail the emit. Note the per-layer
+        // score weights are still declared, which is exactly the state the real bug was in.
+        let per_layer = ["language_model.model.layers.0.self_attention_res_score.weight"];
+        assert!(covered(norm, &per_layer), "a dropped output mix must un-cover its norm");
+        assert!(covered(proj, &per_layer), "a dropped output mix must un-cover its proj");
+    }
+
+    /// The per-layer pairs keep working, and one layer's score does not cover another's.
+    #[test]
+    fn a_paired_waiver_does_not_leak_across_stems() {
+        let l0 = "language_model.model.layers.0.mlp_res_norm.weight";
+        assert!(!covered(l0, &["language_model.model.layers.0.mlp_res_score.weight"]));
+        // A DIFFERENT layer's score must not cover layer 0's weight.
+        assert!(covered(l0, &["language_model.model.layers.1.mlp_res_score.weight"]));
+        // Nor must a different stem on the same layer.
+        assert!(covered(l0, &["language_model.model.layers.0.self_attention_res_score.weight"]));
+    }
 }
 
 #[cfg(test)]

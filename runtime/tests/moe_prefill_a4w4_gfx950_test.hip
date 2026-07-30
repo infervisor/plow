@@ -39,11 +39,11 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
 void t_glu(unsigned char* fu, const bf16* xn2, const unsigned long long* wtab,
            const unsigned long long* stab, const int* meta, const unsigned* row_token,
            const unsigned* row_partidx, unsigned char* fu_scale, unsigned I, unsigned H,
-           unsigned n_exp, unsigned act) {
+           unsigned n_exp, unsigned act, float beta, float lbeta) {
     __shared__ unsigned char lds[MPF4_LDS_BYTES];
     d_moe_group_pf_a4w4<true>((void*)fu, (const void*)xn2, nullptr, wtab, stab, meta, row_token,
                               row_partidx, nullptr, fu_scale, I, H, n_exp, act, blockIdx.x,
-                              gridDim.x, (void*)lds);
+                              gridDim.x, beta, lbeta, (void*)lds);
 }
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
 void t_down(float* part, const unsigned char* fu, const unsigned char* fu_scale,
@@ -53,7 +53,7 @@ void t_down(float* part, const unsigned char* fu, const unsigned char* fu_scale,
     __shared__ unsigned char lds[MPF4_LDS_BYTES];
     d_moe_group_pf_a4w4<false>((void*)part, (const void*)fu, fu_scale, wtab, stab, meta, nullptr,
                                row_partidx, row_gate, nullptr, H, I, n_exp, 0, blockIdx.x,
-                               gridDim.x, (void*)lds);
+                               gridDim.x, 0.0f, 0.0f, (void*)lds);
 }
 
 static float fp4d(unsigned n){const float T[8]={0,.5f,1,1.5f,2,3,4,6};return (n&8)?-T[n&7]:T[n&7];}
@@ -103,7 +103,7 @@ int main(){
   }
   HC(hipMalloc(&dwt,wt.size()*8)); HC(hipMemcpy(dwt,wt.data(),wt.size()*8,hipMemcpyHostToDevice));
   HC(hipMalloc(&dst,st.size()*8)); HC(hipMemcpy(dst,st.data(),st.size()*8,hipMemcpyHostToDevice));
-  hipLaunchKernelGGL(t_glu,dim3(64),dim3(PLOW_THREADS),0,0,dfu,dx,dwt,dst,dmeta,drt,drp,dfs,I,H,n_exp,act);
+  hipLaunchKernelGGL(t_glu,dim3(64),dim3(PLOW_THREADS),0,0,dfu,dx,dwt,dst,dmeta,drt,drp,dfs,I,H,n_exp,act,0.0f,0.0f);
   HC(hipDeviceSynchronize());
   std::vector<unsigned char> fu((size_t)pad*I/2), fs((size_t)pad*I/32);
   HC(hipMemcpy(fu.data(),dfu,fu.size(),hipMemcpyDeviceToHost));

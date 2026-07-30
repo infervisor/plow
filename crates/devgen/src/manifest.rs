@@ -291,6 +291,8 @@ fn shapes(m: &Model) -> Shapes {
                 // result. §4's shape, reached by ADDING an arm rather than by forgetting one.
                 DevOp::GemvMxfp4
                 | DevOp::GemvGluMxfp4
+                | DevOp::GemvQkvMxfp4
+                | DevOp::GemmGluMxfp4
                 | DevOp::GemmMxfp4
                 | DevOp::GemmMedMxfp4
                 | DevOp::GemmSmallMxfp4
@@ -342,7 +344,20 @@ const FP8_WEIGHT_OPS: &[&str] = &[
 fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
     let has = |n: &str| union.iter().any(|a| a.op == n);
     let mut f = Map::new();
-    f.insert("fp8_kv".into(), json!(has("FlashDecodeFp8") || has("HeadNormRopeFp8")));
+    // `FlashMlaDecodeFp8` / `FlashMlaPrefillFp8` are here for the reader-only case. An MLA
+    // fp8-KV packet writes its latent with `HeadNormRopeFp8` and so already trips the clause
+    // above, but a packet that only READS a pre-quantized cache (a resumed session, a prefix
+    // shared between requests) has no writer in its stream, and the object it needs is exactly
+    // the same one.
+    f.insert(
+        "fp8_kv".into(),
+        json!(
+            has("FlashDecodeFp8")
+                || has("HeadNormRopeFp8")
+                || has("FlashMlaDecodeFp8")
+                || has("FlashMlaPrefillFp8")
+        ),
+    );
     // The `*Fp8Blk` family is fp8 WEIGHTS too — DeepSeek's [128,128] `weight_scale_inv` grid rather
     // than a per-channel scale, but the object still needs an fp8 weight arm compiled. Omitting them
     // reported `fp8_weights: false` for a block-fp8 Kimi/GLM/DeepSeek packet, which is the manifest
@@ -365,7 +380,13 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
     f.insert("moe".into(), json!(union.iter().any(|a| a.op.starts_with("Moe"))));
     f.insert(
         "mla".into(),
-        json!(has("FlashMlaDecode") || has("FlashMlaPrefill") || has("MlaMergeFold")),
+        json!(
+            has("FlashMlaDecode")
+                || has("FlashMlaPrefill")
+                || has("FlashMlaDecodeFp8")
+                || has("FlashMlaPrefillFp8")
+                || has("MlaMergeFold")
+        ),
     );
     f.insert("mamba".into(), json!(has("Mamba2Scan")));
     f.insert(
@@ -381,6 +402,7 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
             has("FlashPrefill")
                 || has("FlashPrefillFp8")
                 || has("FlashMlaPrefill")
+                || has("FlashMlaPrefillFp8")
                 || has("FlashGatherPrefill")
         ),
     );
@@ -581,7 +603,7 @@ fn backend_gfx950(
     // MLA family. The attention prefill and the MoE prefill are SEPARATE axes: the grouped expert
     // GEMM is a second full MFMA body in a bucket already at the register cliff, so an
     // attention-only object must not carry it.
-    if has("FlashMlaPrefill") || has("FlashGatherPrefill") {
+    if has("FlashMlaPrefill") || has("FlashMlaPrefillFp8") || has("FlashGatherPrefill") {
         req.push("PLOW_MLA_PREFILL=1".into());
     }
     if on("moe_prefill") {
@@ -589,6 +611,23 @@ fn backend_gfx950(
     }
     if on("a4w4") {
         req.push("PLOW_MOE_PF_A4W4=1".into());
+    }
+    // KIMI-K3's BLOCK ops. Not a prefill axis and not a precision one — a model axis, and the only
+    // arm flag here that both buckets need. Its absence is the most completely silent failure this
+    // list can describe: AttnRes replaces the residual ADD twice in every layer, `situ` is the
+    // activation on every GLU, and the KDA recurrence is 69 of 93 mixers. An object without
+    // PLOW_K3 skips all of it through the non-trapping `default:` and returns fluent output from
+    // a model that is missing most of itself.
+    if has("AttnRes")
+        || has("SituGlu")
+        || has("MlaOutGate")
+        || has("KdaStateStep")
+        || has("KdaStateStepG")
+        || has("KdaConv")
+        || has("KdaConv3")
+        || has("KdaGatedNorm")
+    {
+        req.push("PLOW_K3=1".into());
     }
     // A prefill lm_head emitted as GEMV needs `case PLOW_DOP_GEMV` in the prefill object. It is
     // unconditional there today, so this is documentation of a dependency rather than a flag —
@@ -1088,8 +1127,54 @@ mod tests {
         assert!(req.contains(&"PLOW_FP8_KV=1"));
         assert!(!req.contains(&"PLOW_FP8=1"), "bf16 weights must not ask for the fp8 object");
         assert!(!req.contains(&"PLOW_MLA_PREFILL=1"), "no MLA ops in this packet");
+        assert!(!req.contains(&"PLOW_K3=1"), "no K3 block ops in this packet either");
         // nvcc is still rendered — adding a backend must not remove one.
         assert!(man["backends"]["nvcc"]["requires"].is_array());
+    }
+
+    /// A packet carrying Kimi-K3's BLOCK ops must ask for `PLOW_K3=1`.
+    ///
+    /// It is a MODEL axis, not a prefill or precision one, and it is the arm flag whose absence is
+    /// most completely silent. `AttnRes` (104) replaces the residual ADD twice in every layer,
+    /// `SituGlu` (105) is the activation on every GLU, `MlaOutGate` (106) gates 24 of 93 layers and
+    /// the KDA recurrence (99-103) is the other 69 mixers. An object built without the flag has no
+    /// `case` for any of them, and this interpreter's dispatch `default:` does not trap — it writes
+    /// NOTHING. The packet runs, the buffers keep what they held, and a model missing most of
+    /// itself returns fluent output.
+    ///
+    /// ANY of the eight is enough, deliberately: they are one `#if` in `runtime/amd/interp.hip`, so
+    /// an object has all of them or none. A `K3_NLAYERS=3` truncation emits no MLA layer and
+    /// therefore no `MlaOutGate`; a decode-only blob emits no prefill op at all. Both still need
+    /// the flag.
+    #[test]
+    fn a_k3_packet_requires_the_k3_arms() {
+        let gfx = |ops: &[DevOp]| -> Vec<String> {
+            let p = prog(ops.iter().map(|&o| inst(o, [0; 8])).collect());
+            let m = Model {
+                n_cu: 256, target: 0, tensors: vec![], progs: vec![p],
+                kv_row_insts: vec![], prog_t: vec![1], gen: vec![],
+            };
+            build(&m, "gfx950")["backends"]["gfx950"]["requires"]
+                .as_array().unwrap().iter()
+                .filter_map(|v| v.as_str().map(str::to_string)).collect()
+        };
+        for op in [
+            DevOp::AttnRes,
+            DevOp::SituGlu,
+            DevOp::MlaOutGate,
+            DevOp::KdaStateStep,
+            DevOp::KdaStateStepG,
+            DevOp::KdaConv,
+            DevOp::KdaConv3,
+            DevOp::KdaGatedNorm,
+        ] {
+            assert!(
+                gfx(&[op]).iter().any(|r| r == "PLOW_K3=1"),
+                "{op:?} alone must still require the K3 object"
+            );
+        }
+        // And it does not leak onto a packet that has none of them.
+        assert!(!gfx(&[DevOp::Gemv, DevOp::RmsNorm]).iter().any(|r| r == "PLOW_K3=1"));
     }
 
     /// `arm_of` must read each flash op's head-dim from the slot that op ACTUALLY carries it in.

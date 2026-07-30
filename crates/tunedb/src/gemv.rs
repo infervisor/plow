@@ -67,6 +67,52 @@ pub fn gemv_case(op: DevOp, i: &[u32; 8]) -> Option<(&'static str, u32, u32, u32
     Some((fam, m, n, k, crate::gemm::parse_quant(q)?))
 }
 
+/// The decode-GEMV sweep symbols, and the opcode each one exercises.
+///
+/// This is the GEMV twin of [`crate::gemm`]'s `RUNGS`, and it carries the same axis: the GEMM
+/// table is a `(bf16, fp8, mxfp4)` triple per tile, and this one is a per-encoding ROW per
+/// family. The shape differs because the two paths differ — a GEMM rung is a tile that exists
+/// in all three encodings, while a GEMV family may have no quantized twin at all (`gemv_qkv`)
+/// or exist ONLY quantized (`gemv_blk`) — and an `Option` grid over a fixed triple would have
+/// to spell those holes as `None` anyway. Listing the reachable cells is the same fact stated
+/// without the holes.
+///
+/// The quant an entry belongs to is NOT restated here: [`DevOp::gemv_case`] already carries
+/// both the op-case family and the quant spelling for every GEMV opcode, and restating either
+/// would be a second speller that agrees only until one of them changes — the exact failure
+/// this module's header calls out. [`gemv_rung_opcode`] therefore ASKS `gemv_case` rather than
+/// matching on a column.
+///
+/// The map is explicit rather than derived from the symbol name for the same reason
+/// [`crate::gemm::gemm_rung_opcode`] is: a harness kernel that no interpreter arm dispatches
+/// is a legitimate measurement of a kernel body and NOT a selectable fact, and storing the two
+/// alike is how a plan comes to name a kernel that does not exist.
+const SYMBOLS: [(&str, DevOp); 9] = [
+    ("gemv", DevOp::Gemv),
+    ("gemv_fp8", DevOp::GemvFp8),
+    ("gemv_mxfp4", DevOp::GemvMxfp4),
+    ("gemv_blk", DevOp::GemvFp8Blk),
+    ("gemv_glu", DevOp::GemvGlu),
+    ("gemv_glu_fp8", DevOp::GemvGluFp8),
+    ("gemv_glu_mxfp4", DevOp::GemvGluMxfp4),
+    ("gemv_qkv", DevOp::GemvQkv),
+    ("gemv_qkvg", DevOp::GemvQkvg),
+];
+
+/// The opcode serving op-case family `family` under `quant`, or `None` when no arm does.
+///
+/// The GEMV twin of [`crate::gemm::gemm_rung_opcode`], and the reason `tune best --quant
+/// Mxfp4` resolves on this path as it does on the GEMM one. `None` is the right answer for
+/// `("gemvqkv", Mxfp4)` — the fused q|k|v arm has no quantized twin in the ISA — and reporting
+/// it as such is what stops a bf16 q|k|v timing being served for an mxfp4 op that does not
+/// exist.
+pub fn gemv_rung_opcode(family: &str, quant: QuantScheme) -> Option<DevOp> {
+    SYMBOLS.iter().find_map(|&(_, op)| {
+        let (fam, _, _, _, q) = op.gemv_case(&[1; 8])?;
+        (fam == family && crate::gemm::parse_quant(q) == Some(quant)).then_some(op)
+    })
+}
+
 /// The op-case family a sweep symbol belongs to (`gemv_glu_m8` -> `"gemvglu"`).
 ///
 /// Must agree with [`DevOp::gemv_case`]'s family, and `sweep_symbols_map_to_opcode_and_bucket`
@@ -79,21 +125,20 @@ pub fn gemv_sample_family(sym: &str) -> Option<&'static str> {
 
 /// The opcode a GEMV sample was taken on, from the symbol the sweep harness timed.
 ///
-/// The map is explicit rather than derived from the symbol name for the same reason
-/// [`crate::gemm::gemm_rung_opcode`] is: a harness kernel that no interpreter arm dispatches
-/// is a legitimate measurement of a kernel body and NOT a selectable fact, and storing the two
-/// alike is how a plan comes to name a kernel that does not exist. `gemv_m2` has no
-/// interpreter arm today (`scripts/build_gfx950.sh` rounds the bucket to a power of two, so
-/// MM=2 is reachable, but no shipped recipe builds it) — it is measured for the M curve and
-/// returns the same opcode, because the OPCODE is not what varies across the rungs; the
-/// object is.
+/// The stem is matched WHOLE against [`SYMBOLS`] after the `_m<bucket>` suffix is split off,
+/// not by prefix. Prefix matching is what the first version did, and it silently mapped
+/// `gemv_mxfp4_m1` onto [`DevOp::Gemv`] — the string starts with `gemv_m` — filing every mxfp4
+/// measurement under the bf16 op case, where `best_for` would rank a 4-bit timing as if it
+/// were the 16-bit kernel's. That is the precise shape of "the tuner publishes a record the
+/// compiler finds and must not trust".
+///
+/// `gemv_m2` has no interpreter arm today (`scripts/build_gfx950.sh` rounds the bucket to a
+/// power of two, so MM=2 is reachable, but no shipped recipe builds it) — it is measured for
+/// the M curve and returns the same opcode, because the OPCODE is not what varies across the
+/// rungs; the object is.
 pub fn gemv_sample_opcode(sym: &str) -> Option<DevOp> {
-    Some(match sym {
-        s if s.starts_with("gemv_m") => DevOp::Gemv,
-        s if s.starts_with("gemv_glu_m") => DevOp::GemvGlu,
-        s if s.starts_with("gemv_qkv_m") => DevOp::GemvQkv,
-        _ => return None,
-    })
+    let (stem, _) = sym.rsplit_once("_m")?;
+    SYMBOLS.iter().find(|(s, _)| *s == stem).map(|&(_, op)| op)
 }
 
 /// The compiled row bucket a sweep symbol was built at (`gemv_m8` -> 8).
@@ -104,7 +149,7 @@ pub fn gemv_sample_opcode(sym: &str) -> Option<DevOp> {
 /// is the whole point of the walk — and conflating them would make an `MM=8` object serving
 /// `M=16` indistinguishable from an `MM=16` object.
 pub fn gemv_sample_bucket(sym: &str) -> Option<u32> {
-    sym.rsplit_once('m')
+    sym.rsplit_once("_m")
         .and_then(|(_, n)| n.parse().ok())
         .filter(|n| *n >= 1 && *n <= 16)
 }
@@ -161,6 +206,34 @@ mod tests {
         );
     }
 
+    /// `GemvQkvg` extends that convention to a FOURTH stream, and must sum all four.
+    ///
+    /// K3's KDA projects one pre-normed x four ways (q, k, v and the full-rank output gate),
+    /// and 69 of its 93 layers now emit this op rather than four separate `Gemv`s. At the real
+    /// TP8 geometry every width is 1536, so summing three instead of four would file the op
+    /// under 4608 — three quarters of the bytes it actually moves, and a shape a DIFFERENT
+    /// packet legitimately occupies.
+    #[test]
+    fn qkvg_sums_its_four_output_widths() {
+        let mut i = [0u32; 8];
+        i[0] = 1; // M — decode
+        i[1] = 1536; // Nq  (12288 / TP8)
+        i[2] = 7168; // K   — K3 hidden
+        i[3] = 1536; // Nk
+        i[4] = 1536; // Nv
+        i[5] = 1536; // Ng  — the fourth stream op 22 does not have
+        assert_eq!(
+            DevOp::GemvQkvg.gemv_case(&i),
+            Some(("gemvqkvg", 1, 4 * 1536, 7168, "None"))
+        );
+        // The 3-stream and 4-stream fusions must not share a case: op 22 forwards into the
+        // same body with Ng = 0, so they are the same KERNEL but not the same WORK.
+        let three = DevOp::GemvQkv.gemv_case(&i).unwrap();
+        let four = DevOp::GemvQkvg.gemv_case(&i).unwrap();
+        assert_ne!(gemv_op_case(three.0, three.1, three.2, three.3, three.4),
+                   gemv_op_case(four.0, four.1, four.2, four.3, four.4));
+    }
+
     /// Every GEMV opcode the ISA declares must produce a case, and no non-GEMV may.
     ///
     /// Written against [`DevOp::ALL`] rather than a hand-listed set, so an opcode added to the
@@ -192,5 +265,105 @@ mod tests {
         assert_eq!(gemv_sample_family("gemv_m8"), Some("gemv"));
         assert_eq!(gemv_sample_family("gemv_glu_m8"), Some("gemvglu"));
         assert_eq!(gemv_sample_family("gemv_qkv_m8"), Some("gemvqkv"));
+    }
+
+    /// The quantized symbols resolve to the QUANTIZED opcodes, and the bf16 stem does not
+    /// swallow them.
+    ///
+    /// `gemv_mxfp4_m1` starts with `gemv_m`. Under the prefix match this map used to do, it
+    /// resolved to [`DevOp::Gemv`] and every mxfp4 sample was filed under the bf16 op case —
+    /// where `best_for` ranks records against each other, so a 4-bit timing would have been
+    /// returned as the winning implementation of the 16-bit op. Nothing else in the pipeline
+    /// could have caught it: the record is well-formed, the digests are live, and the gate is
+    /// green.
+    #[test]
+    fn quantized_symbols_do_not_collide_with_the_bf16_stem() {
+        assert_eq!(gemv_sample_opcode("gemv_mxfp4_m1"), Some(DevOp::GemvMxfp4));
+        assert_eq!(gemv_sample_opcode("gemv_glu_mxfp4_m1"), Some(DevOp::GemvGluMxfp4));
+        assert_eq!(gemv_sample_opcode("gemv_fp8_m8"), Some(DevOp::GemvFp8));
+        assert_eq!(gemv_sample_opcode("gemv_blk_m1"), Some(DevOp::GemvFp8Blk));
+        assert_eq!(gemv_sample_bucket("gemv_mxfp4_m1"), Some(1));
+        assert_eq!(gemv_sample_bucket("gemv_glu_mxfp4_m16"), Some(16));
+        // A stem that is not in the table is not a GEMV sample, however GEMV-ish it reads.
+        assert_eq!(gemv_sample_opcode("gemv_mxfp8_m1"), None);
+        assert_eq!(gemv_sample_opcode("gemv_qkv_mxfp4_m1"), None);
+    }
+
+    /// An mxfp4 GEMV and its bf16 twin must land in DIFFERENT op cases.
+    ///
+    /// The GEMV twin of `the_key_separates_precisions`, and the reason the quant axis had to
+    /// exist at all: these two kernels move 4 bits and 16 bits per weight for the same
+    /// `(M, N, K)`, so one timing served for the other is off by ~4x in the direction that
+    /// makes the slow choice look fast.
+    #[test]
+    fn the_key_separates_gemv_precisions() {
+        let k = |q| {
+            let op = gemv_rung_opcode("gemv", q).expect("gemv has this encoding");
+            let (fam, _, _, _, qs) = op.gemv_case(&[1; 8]).unwrap();
+            gemv_op_case(fam, 1, 12288, 7168, qs)
+        };
+        let bf16 = k(QuantScheme::None);
+        let mx = k(QuantScheme::Mxfp4);
+        assert_eq!(bf16, "gemv/1x12288x7168/None");
+        assert_eq!(mx, "gemv/1x12288x7168/Mxfp4");
+        assert_ne!(bf16, mx);
+        assert_ne!(bf16, k(QuantScheme::W8A8));
+    }
+
+    /// Every symbol resolves to a distinct opcode, and every opcode round-trips back to the
+    /// `(family, quant)` it is filed under.
+    ///
+    /// The GEMV twin of `rungs_map_to_distinct_opcodes`. The round-trip is the load-bearing
+    /// half: [`gemv_rung_opcode`] answers by ASKING [`DevOp::gemv_case`], so this pins that the
+    /// lookup a campaign writes with and the one the compiler reads with are one function.
+    #[test]
+    fn symbols_map_to_distinct_opcodes_and_round_trip() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (sym, op) in SYMBOLS {
+            assert!(seen.insert(op as u16), "{op:?} is reachable from two symbols");
+            let (fam, _, _, _, q) = op.gemv_case(&[1; 8]).expect("a GEMV opcode has a shape rule");
+            let quant = crate::gemm::parse_quant(q).expect("a spelling QuantScheme knows");
+            assert_eq!(gemv_rung_opcode(fam, quant), Some(op), "{sym} does not round-trip");
+        }
+        assert_eq!(seen.len(), SYMBOLS.len());
+        // The fused q|k|v arm has NO quantized twin in the ISA. Answering `None` is what stops
+        // a bf16 q|k|v timing being served for an mxfp4 op that cannot be emitted.
+        assert_eq!(gemv_rung_opcode("gemvqkv", QuantScheme::Mxfp4), None);
+        assert_eq!(gemv_rung_opcode("gemvqkv", QuantScheme::W8A8), None);
+        // And block-fp8 is its own family, not a column of the plain one.
+        assert_eq!(gemv_rung_opcode("gemvblk", QuantScheme::W8A8), Some(DevOp::GemvFp8Blk));
+        assert_eq!(gemv_rung_opcode("gemvblk", QuantScheme::None), None);
+    }
+
+    /// Every symbol in the table must be a kernel the sweep harness actually launches.
+    ///
+    /// The GEMV twin of `every_rung_is_compiled_into_the_sweep_harness`, and it reads
+    /// `gemv_row_sweep.c` rather than restating it: a symbol added here but never swept is a
+    /// case that can be looked up and never measured, which is the state this whole cell
+    /// exists to leave behind. `gemv_fp8` and `gemv_blk` are deliberately NOT asserted — they
+    /// are schema cells with no sweep arm yet, and the assertion below names them so the
+    /// omission is a stated residual rather than a silent hole.
+    #[test]
+    fn every_swept_symbol_is_driven_by_the_harness() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../runtime/ubench/gemv_row_sweep.c");
+        let src = std::fs::read_to_string(&p).expect("gemv_row_sweep.c");
+        for stem in ["gemv", "gemv_glu", "gemv_qkv", "gemv_mxfp4", "gemv_glu_mxfp4"] {
+            assert!(
+                src.contains(&format!("\"{stem}_m\"")),
+                "{stem}_m is not a base the sweep drives — the case cannot be measured"
+            );
+        }
+        // Named residuals: the schema knows these, the harness has no arm for them.
+        //
+        // `gemv_fp8` / `gemv_blk` need a per-channel and a `[N/128][K/128]` f32 scale grid
+        // respectively — a different ORACLE, not a different shape. `gemv_qkvg` needs a
+        // `GEMV_QKVG_WALK_VARIANT` golden that `test_kernels.hip` does not yet declare; the op
+        // itself is covered on hardware by `runtime/tests/gemv_qkvg_gfx950_test.hip`, which is
+        // a correctness golden and not a shape sweep. Each reads MISS in the census, which is
+        // the correct reading, and is why this asserts their absence rather than omitting them.
+        assert!(!src.contains("\"gemv_fp8_m\""), "gemv_fp8 gained an arm — assert it above");
+        assert!(!src.contains("\"gemv_blk_m\""), "gemv_blk gained an arm — assert it above");
+        assert!(!src.contains("\"gemv_qkvg_m\""), "gemv_qkvg gained an arm — assert it above");
     }
 }

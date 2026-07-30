@@ -6,10 +6,16 @@
  *     AttnRes -> attention -> AttnRes -> FFN,   NOT   residual + attn ; residual + mlp.
  *
  * It mmaps the fixture written by runtime/tests/k3_real_oracle.py (real layer-0 weights + a
- * per-stage fp32 reference), builds the twenty-packet block as a DevInst program, dispatches it on
- * the persistent gfx950 interpreter, and prints a per-stage residual table.
+ * per-stage fp32 reference), builds the block as a DevInst program, dispatches it on the persistent
+ * gfx950 interpreter, and prints a per-stage residual table.
  *
  *   ./k3_block_test [interp_decode.elf] [k3_fixture.bin]
+ *   PLOW_KDA_FUSE=0 ./k3_block_test ...      # the six-packet KDA chain instead of the three
+ *
+ * TWENTY packets, or twenty-two with `PLOW_KDA_FUSE=0`. The KDA chain has two spellings — see the
+ * P8/P9/P10 note below — and this gate scores BOTH against the same fixture, because "the fusion
+ * did not move the numbers" is a claim that only means something if the unfused numbers came out
+ * of the same binary on the same run.
  *
  * WHAT IT GATES THAT THE KDA GATE DID NOT, in order of how silently each fails:
  *
@@ -65,6 +71,17 @@ static int reg(void* p) { g_tens[g_nt] = p; return g_nt++; }
 static int emitop(uint16_t op, uint16_t blocks) {
     int i = g_nops++;
     g_inst[i].op = op; g_inst[i].blocks = blocks;
+    /* SLOT 0 IS A LEGAL TENSOR HANDLE, so an unset `t[k]` in a static (zeroed) g_inst names
+     * tensor 0 rather than "absent". The moe and mla gates have always done this; this one did
+     * not, and it stayed harmless only for as long as no op read a slot this file leaves unset.
+     *
+     * ATTN_RES then grew an OPTIONAL t4 (`push_src`, the snapshot the ring is seeded from), and
+     * this loop's absence turned it live: t4 read as tensor 0, so every AttnRes here requested a
+     * push. At T=1 that pushed the layer input onto ring row 0 — which this fixture aliases to
+     * `hidden` anyway, so it was a self-copy and the 19 rows still passed. At T>1 the arm poisons
+     * (a multi-workgroup push has no barrier), so S6-S10 came back NaN and read as a regression
+     * in op_k3.h. It was this line. */
+    for (int k = 0; k < 8; k++) g_inst[i].t[k] = PLOW_TENSOR_NONE;
     g_gate[i].succ_ofs = i; g_gate[i].succ_len = 1; g_succ[i] = i;
     return i;
 }
@@ -243,36 +260,87 @@ int main(int argc, char** argv) {
     int i_bb = GEMV(t_braw, t_x, t_wb, H, HID, i_ln);
     int i_fb = GEMV(t_fraw, t_fa, t_wfb, P, D, i_fa);
 
-    int i_conv[3], src[3] = { i_q, i_k, i_v };
-    for (int s = 0; s < 3; s++) {
-        i_conv[s] = emitop(PLOW_DOP_KDA_CONV, ALL);
-        g_inst[i_conv[s]].t[0] = t_mix[s]; g_inst[i_conv[s]].t[1] = t_raw[s];
-        g_inst[i_conv[s]].t[2] = t_cw[s]; g_inst[i_conv[s]].t[3] = t_cs[s];
-        g_inst[i_conv[s]].i[0] = T; g_inst[i_conv[s]].i[1] = P;
-        g_inst[i_conv[s]].i[2] = W; g_inst[i_conv[s]].i[3] = 1;
-        addwait(i_conv[s], src[s], ALL);
-    }
-
-    int i_gate = emitop(PLOW_DOP_KDA_GATE, ALL);
-    g_inst[i_gate].t[0] = t_gate; g_inst[i_gate].t[1] = t_beta;
-    g_inst[i_gate].t[2] = t_fraw; g_inst[i_gate].t[3] = t_braw;
-    g_inst[i_gate].t[4] = t_alog; g_inst[i_gate].t[5] = t_dtb;
-    g_inst[i_gate].i[0] = T; g_inst[i_gate].i[1] = H; g_inst[i_gate].i[2] = D;
-    g_inst[i_gate].i[3] = GMODE; g_inst[i_gate].fj[0].f = LB;
-    addwait(i_gate, i_fb, ALL);
-    addwait(i_gate, i_bb, ALL);
-
+    /* ---- P8/P9/P10: SIX packets or THREE. -----------------------------------------------
+     *
+     * `PLOW_KDA_FUSE=0` selects the decomposed spelling, mirroring `crates/devgen/src/kda.rs`'s
+     * `fuse_kda`. Both are scored against the SAME fixture in the SAME binary, which is what makes
+     * "the fusion did not move the numbers" a measurement rather than an assurance. The fused
+     * spelling is the default, because it is what the emitter emits.
+     *
+     * THE GATE PACKET SURVIVES IN FUSED MODE, as a PROBE. `KdaStateStepG` computes g and beta in
+     * registers and never writes them, so rows S2 would otherwise read an unwritten buffer. It is
+     * emitted after the step, gated on it, writing only `t_gate`/`t_beta` — nothing downstream
+     * reads them. That keeps all 19 rows comparable across the two spellings, and it is honest
+     * about what S2 then proves: S2 checks the STANDALONE gate against the oracle, and S3/state
+     * check the INLINE one, because the inline gate is the only thing the recurrence consumed. */
+    const int FUSE = !(getenv("PLOW_KDA_FUSE") && !strcmp(getenv("PLOW_KDA_FUSE"), "0"));
     unsigned items = (unsigned)(P / BV);
     uint16_t step_blocks = (uint16_t)(items < NCU ? items : NCU);
-    int i_step = emitop(PLOW_DOP_KDA_STATE_STEP, step_blocks);
-    g_inst[i_step].t[0] = t_o; g_inst[i_step].t[1] = t_mix[0];
-    g_inst[i_step].t[2] = t_mix[1]; g_inst[i_step].t[3] = t_mix[2];
-    g_inst[i_step].t[4] = t_gate; g_inst[i_step].t[5] = t_beta; g_inst[i_step].t[6] = t_state;
-    g_inst[i_step].i[0] = T; g_inst[i_step].i[1] = H; g_inst[i_step].i[2] = D;
-    g_inst[i_step].i[3] = BV; g_inst[i_step].i[4] = 1;
-    g_inst[i_step].fj[0].f = SCALE;
-    for (int s = 0; s < 3; s++) addwait(i_step, i_conv[s], ALL);
-    addwait(i_step, i_gate, ALL);
+    int i_conv[3], src[3] = { i_q, i_k, i_v }, i_step;
+    (void)i_conv;
+
+    if (FUSE) {
+        int i_c3 = emitop(PLOW_DOP_KDA_CONV3, ALL);
+        g_inst[i_c3].t[0] = t_mix[0]; g_inst[i_c3].t[1] = t_mix[1]; g_inst[i_c3].t[2] = t_mix[2];
+        g_inst[i_c3].t[3] = t_raw[0]; g_inst[i_c3].t[4] = t_raw[1]; g_inst[i_c3].t[5] = t_raw[2];
+        g_inst[i_c3].t[6] = t_cw[0];  g_inst[i_c3].t[7] = t_cw[1];
+        g_inst[i_c3].i[0] = T; g_inst[i_c3].i[1] = P; g_inst[i_c3].i[2] = W; g_inst[i_c3].i[3] = 1;
+        g_inst[i_c3].i[4] = (uint32_t)t_cw[2];
+        g_inst[i_c3].i[5] = (uint32_t)t_cs[0];
+        g_inst[i_c3].i[6] = (uint32_t)t_cs[1];
+        g_inst[i_c3].i[7] = (uint32_t)t_cs[2];
+        for (int s = 0; s < 3; s++) addwait(i_c3, src[s], ALL);
+
+        i_step = emitop(PLOW_DOP_KDA_STATE_STEP_G, step_blocks);
+        g_inst[i_step].t[0] = t_o; g_inst[i_step].t[1] = t_mix[0];
+        g_inst[i_step].t[2] = t_mix[1]; g_inst[i_step].t[3] = t_mix[2];
+        g_inst[i_step].t[4] = t_fraw; g_inst[i_step].t[5] = t_braw;
+        g_inst[i_step].t[6] = t_state; g_inst[i_step].t[7] = t_alog;
+        g_inst[i_step].i[0] = T; g_inst[i_step].i[1] = H; g_inst[i_step].i[2] = D;
+        g_inst[i_step].i[3] = BV; g_inst[i_step].i[4] = 1;
+        g_inst[i_step].i[5] = (uint32_t)t_dtb; g_inst[i_step].i[6] = GMODE;
+        g_inst[i_step].fj[0].f = SCALE; g_inst[i_step].fj[1].f = LB;
+        addwait(i_step, i_c3, ALL);
+        addwait(i_step, i_fb, ALL);
+        addwait(i_step, i_bb, ALL);
+
+        /* The S2 probe. Gated on the step so it cannot be mistaken for a producer of it. */
+        int i_probe = emitop(PLOW_DOP_KDA_GATE, ALL);
+        g_inst[i_probe].t[0] = t_gate; g_inst[i_probe].t[1] = t_beta;
+        g_inst[i_probe].t[2] = t_fraw; g_inst[i_probe].t[3] = t_braw;
+        g_inst[i_probe].t[4] = t_alog; g_inst[i_probe].t[5] = t_dtb;
+        g_inst[i_probe].i[0] = T; g_inst[i_probe].i[1] = H; g_inst[i_probe].i[2] = D;
+        g_inst[i_probe].i[3] = GMODE; g_inst[i_probe].fj[0].f = LB;
+        addwait(i_probe, i_step, step_blocks);
+    } else {
+        for (int s = 0; s < 3; s++) {
+            i_conv[s] = emitop(PLOW_DOP_KDA_CONV, ALL);
+            g_inst[i_conv[s]].t[0] = t_mix[s]; g_inst[i_conv[s]].t[1] = t_raw[s];
+            g_inst[i_conv[s]].t[2] = t_cw[s]; g_inst[i_conv[s]].t[3] = t_cs[s];
+            g_inst[i_conv[s]].i[0] = T; g_inst[i_conv[s]].i[1] = P;
+            g_inst[i_conv[s]].i[2] = W; g_inst[i_conv[s]].i[3] = 1;
+            addwait(i_conv[s], src[s], ALL);
+        }
+
+        int i_gate = emitop(PLOW_DOP_KDA_GATE, ALL);
+        g_inst[i_gate].t[0] = t_gate; g_inst[i_gate].t[1] = t_beta;
+        g_inst[i_gate].t[2] = t_fraw; g_inst[i_gate].t[3] = t_braw;
+        g_inst[i_gate].t[4] = t_alog; g_inst[i_gate].t[5] = t_dtb;
+        g_inst[i_gate].i[0] = T; g_inst[i_gate].i[1] = H; g_inst[i_gate].i[2] = D;
+        g_inst[i_gate].i[3] = GMODE; g_inst[i_gate].fj[0].f = LB;
+        addwait(i_gate, i_fb, ALL);
+        addwait(i_gate, i_bb, ALL);
+
+        i_step = emitop(PLOW_DOP_KDA_STATE_STEP, step_blocks);
+        g_inst[i_step].t[0] = t_o; g_inst[i_step].t[1] = t_mix[0];
+        g_inst[i_step].t[2] = t_mix[1]; g_inst[i_step].t[3] = t_mix[2];
+        g_inst[i_step].t[4] = t_gate; g_inst[i_step].t[5] = t_beta; g_inst[i_step].t[6] = t_state;
+        g_inst[i_step].i[0] = T; g_inst[i_step].i[1] = H; g_inst[i_step].i[2] = D;
+        g_inst[i_step].i[3] = BV; g_inst[i_step].i[4] = 1;
+        g_inst[i_step].fj[0].f = SCALE;
+        for (int s = 0; s < 3; s++) addwait(i_step, i_conv[s], ALL);
+        addwait(i_step, i_gate, ALL);
+    }
 
     int i_norm = emitop(PLOW_DOP_KDA_GATED_NORM, ALL);
     g_inst[i_norm].t[0] = t_y; g_inst[i_norm].t[1] = t_o;
@@ -294,6 +362,19 @@ int main(int argc, char** argv) {
     g_inst[i_ar].t[0] = t_h2; g_inst[i_ar].t[1] = t_attn; g_inst[i_ar].t[2] = t_blkres;
     g_inst[i_ar].t[3] = t_scorew;
     g_inst[i_ar].i[0] = T; g_inst[i_ar].i[1] = HID; g_inst[i_ar].i[2] = NB;
+    /* i[4] IS THE RING CAPACITY, AND OMITTING IT POISONS. `d_attn_res` strides the ring as
+     * `[T][NBCAP][HID]` and refuses `NBCAP < NB`, because striding a T > 1 ring by the LIVE
+     * count would give every layer a differently-strided view of one buffer — no fault, no
+     * NaN, a fluent wrong model. Unset, i[4] read 0 and the arm poisoned every run: S6-S10
+     * came back NaN on real weights while S0-S5 (the whole KDA mixer) passed at 4.5e-3.
+     *
+     * This file is an INDEPENDENT transcription of the graph the emitter builds, which is the
+     * point of it — and the cost is that a new operand has to be carried here by hand. That has
+     * now happened twice on this same op: the comment at the top of `emitop` records t4
+     * (`push_src`) going live because `t[]` was never zeroed, with the same NaN signature at
+     * the same stages. Capacity == NB here because `t_blkres` aliases `t_hidden`, one row per
+     * token, which is exactly the live count at this rung. */
+    g_inst[i_ar].i[4] = NB;
     g_inst[i_ar].fj[0].f = EPS;
     addwait(i_ar, i_o, ALL);
 
@@ -328,8 +409,11 @@ int main(int argc, char** argv) {
     addwait(i_res, i_ffo, ALL);
 
     const int n_ops = g_nops;
-    printf("program: %d packets, %d tensors\n", n_ops, g_nt);
-    printf("  KdaStateStep blocks=%u of %u CUs (%.1f%%), items=%u\n", step_blocks, NCU,
+    printf("program: %d packets, %d tensors   KDA chain: %s\n", n_ops, g_nt,
+           FUSE ? "FUSED (KdaConv3 + KdaStateStepG, 3 packets + an S2 probe)"
+                : "DECOMPOSED (3x KdaConv + KdaGate + KdaStateStep, 6 packets)");
+    printf("  %s blocks=%u of %u CUs (%.1f%%), items=%u\n",
+           FUSE ? "KdaStateStepG" : "KdaStateStep ", step_blocks, NCU,
            100.0 * step_blocks / NCU, items);
     printf("  AttnRes      blocks=%u of %u CUs (%.1f%%)  <- one workgroup per token, KNOWN gap\n",
            ar_blocks, NCU, 100.0 * ar_blocks / NCU);

@@ -413,8 +413,10 @@ struct TuneCli {
     samples: Option<PathBuf>,
 
     /// `gemm`: shape list. `auto` (the default) DERIVES it from the compiler's demand; a path
-    /// replays an `M N K [label]` list — the form that can drift, kept only so the bash
-    /// campaign's list can be replayed for a byte-comparable A/B.
+    /// replays an `M N K [label [quant]]` list — the form that can drift, kept for a
+    /// byte-comparable A/B against the bash campaign, and for the models `auto` cannot yet
+    /// reach (Kimi-K3 has no full-model emit, so its demand cannot be observed). `quant` is
+    /// `None`|`W8A8`|`Mxfp4` and defaults to `None`.
     #[arg(long, default_value = "auto", value_name = "auto|FILE")]
     shapes: String,
 

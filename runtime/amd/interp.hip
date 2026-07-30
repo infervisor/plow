@@ -71,6 +71,24 @@
 extern "C" __device__ unsigned plow_k3_arms_1 = 1;
 #endif
 
+/* The KV-ENCODING axis, made observable the same way and for a STRICTER reason.  [MLA-FP8-KV]
+ *
+ * PLOW_FP8_KV is a SWAP, not an addition (`op_attention.h`'s axis table says so, and the
+ * FLASH_DECODE / FLASH_MLA_DECODE arms below are `#if`/`#else`). So this axis is silent in BOTH
+ * directions, where PLOW_K3 is silent in only one:
+ *   - fp8 packet, bf16 object  -> no FLASH_*_FP8 arm      -> silent NOP
+ *   - bf16 packet, fp8 object  -> no bf16 FLASH_* arm     -> silent NOP
+ * MEASURED, not hypothesised: running the K3 MLA gate's bf16 packet against the fp8 object
+ * reports "all packets executed on every slice: YES" and scores rel 1.000e+00 at the attention
+ * output, i.e. a completely untouched Opart read as a result.
+ *
+ * The manifest pairs blob and object by SELECTING the right one (`fp8_kv -> PLOW_FP8_KV=1` in
+ * `crates/devgen/src/manifest.rs`); this is the half that REFUSES a wrong pair that got selected
+ * anyway. `crates/plowrt/src/exec/amd.rs` `check_kv_encoding` reads it out of `.symtab`. */
+#if PLOW_FP8_KV
+extern "C" __device__ unsigned plow_fp8_kv_1 = 1;
+#endif
+
 /* Cross-GPU collective spin deadline (s_memrealtime ticks). s_memrealtime is 1 GHz on
  * gfx950 (plans/tp-transport.md §1), so ~1e9 ticks ≈ 1 s: a fabric on which the
  * system-scope xctr atomic did NOT propagate bails with status 0xDEAD.... instead of
@@ -129,6 +147,7 @@ extern "C" __device__ unsigned plow_k3_arms_1 = 1;
  *                                     GEMV_FP8, GEMV_GLU_FP8 (w8a16)
  *   weight (fp4)    PLOW_MXFP4        GEMM_MXFP4 / GEMV*_MXFP4 (w4a16)     w4a16   / w4a16
  *   KV              PLOW_FP8_KV       *_FP8 flash + HEADNORM_ROPE_FP8      swap    / swap
+ *                                     dense GQA (38/39) AND MLA latent (109/110)
  *   experts         PLOW_MOE_PF_A4W4  A4W4 grouped GEMM (ops 85/86)        A4W4    / —
  *                   + the runtime ENC field (i[3] prefill / i[6] decode)
  *
@@ -152,7 +171,13 @@ extern "C" __device__ unsigned plow_k3_arms_1 = 1;
  * GEMM_SMALL in every fp8 prefill packet), while a packet's KV is uniformly one encoding, and
  * the 4-wave flash object is the one place the register budget is actually tight — adding the
  * bf16 flash arm to interp_flash_fp8kv moved its spill 228 -> 0, i.e. the allocator dropped the
- * intentional Q-hoist. Additive on the weight axes costs nothing (see the arms). */
+ * intentional Q-hoist. Additive on the weight axes costs nothing (see the arms).
+ *
+ * AND A SWAP IS SILENT IN BOTH DIRECTIONS, which is why `plow_fp8_kv_1` exists (above). An
+ * additive axis only has to refuse "packet needs the arm, object lacks it"; a swap ALSO has to
+ * refuse the reverse, because each object is missing an arm the other has. Measured on the K3
+ * MLA gate: a bf16 packet on the fp8 object reports every packet executed and scores rel
+ * 1.000e+00 at the attention output. */
 #ifndef PLOW_FP8
 #define PLOW_FP8 0
 #endif
@@ -552,7 +577,65 @@ __device__ __forceinline__ void exec_flash_mla_decode(CInst in, CTens T, unsigne
 #undef TEN
 }
 
+#if PLOW_FP8_KV
+/* FP8 (e4m3) LATENT MLA decode (op 109). [MLA-FP8-KV]
+ *
+ * The MLA twin of `exec_flash_decode_fp8`, and compiled ONLY into the fp8-KV object — the KV
+ * encoding is a SWAP axis, not an additive one (see the dispatch note below).
+ *
+ * DENSE ONLY, and that is a constraint rather than an omission: the gathered twin needs `t7` for
+ * its `idx` table and `t7` is where the scale array lives, so a gathered fp8 latent has nowhere to
+ * put the dequant. `PLOW_DOP_FLASH_GATHER_DECODE` therefore keeps its bf16 arm in BOTH objects
+ * (see the dispatch), so a DSA packet cannot land on a missing arm and silently no-op.
+ *
+ *   t0=Opart t1=mlpart t2=Qabs t3=Qrope t4=Ckv(fp8) t5=Krope t6=kv_len t7=kv_scale
+ *   i0=n_batch i1=n_head i2=kv_stride i3=window i4=nsplit i5=kv_mask i6=krot_fp8 i7=gf  f0=scale */
+__device__ __forceinline__ void exec_flash_mla_decode_fp8(CInst in, CTens T, unsigned slice,
+                                                          unsigned nblk, float* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    /* The scale array is not optional: without it every row dequants through a null pointer.
+     * Trap rather than read address 0 — this object has no silent-NOP budget left. */
+    if (TEN(7) == nullptr) __builtin_trap();
+    const unsigned gf = in->i[7] ? in->i[7] : (unsigned)GLM_MLA_GF;
+    if (gf == 2)
+        d_flash_mla_decode<512, 64, 2, /*GATHER=*/false, /*FP8=*/true>(
+            (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+            (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
+            in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0, 1,
+            (const float*)TEN(7), in->i[6]);
+    else
+        d_flash_mla_decode<512, 64, 4, /*GATHER=*/false, /*FP8=*/true>(
+            (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+            (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
+            in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0, 1,
+            (const float*)TEN(7), in->i[6]);
+#undef TEN
+}
+#endif
+
 #if PLOW_MLA_PREFILL
+#if PLOW_FP8_KV
+/* FP8 (e4m3) LATENT MLA PREFILL (op 110). Operands as the decode twin, `i4 = n_tok`. */
+__device__ __forceinline__ void exec_flash_mla_prefill_fp8(CInst in, CTens T, unsigned slice,
+                                                           unsigned nblk, float* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    if (TEN(7) == nullptr) __builtin_trap();
+    const unsigned gf = in->i[7] ? in->i[7] : (unsigned)GLM_MLA_GF;
+    if (gf == 2)
+        d_flash_mla_prefill_fp8<512, 64, 2>(
+            (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+            (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[4],
+            in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk, lds,
+            (const float*)TEN(7), in->i[6]);
+    else
+        d_flash_mla_prefill_fp8<512, 64, 4>(
+            (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+            (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[4],
+            in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk, lds,
+            (const float*)TEN(7), in->i[6]);
+#undef TEN
+}
+#endif
 /* MLA PREFILL + GATHERED MLA PREFILL (ops 51 / 55). [DEEPSEEK-MLA]
  *
  * Its own flag, like PLOW_FP8: the prefill bucket already sits AT the 256/occ-2 cliff on the
@@ -777,7 +860,50 @@ __device__ __forceinline__ void exec_gemv_glu_mxfp4(CInst in, CTens T, unsigned 
 #undef TEN
 }
 
+/* MXFP4 fused q|k|v DECODE GEMV — op 22's fp4 twin, and op 91's own body with Nk=Nv=0.
+ *
+ * The three E8M0 scale rows are TENSOR HANDLES in i5/i6/i7, because ten pointers do not fit t[8];
+ * dev_isa.h states why the demoted operands are scale rows and not outputs.
+ *
+ * NO SILENT FALLBACK. This interpreter's dispatch `default:` is a NOP, so the one thing that must
+ * not happen is a malformed packet quietly running a narrower sweep and leaving an output exactly
+ * as it found it. Nq/Nk and their operands are REQUIRED; Nv==0 is the legal two-stream form and
+ * then t5/t6/i7 must ALL be absent. Anything else traps. */
+__device__ __forceinline__ void exec_gemv_qkv_mxfp4(CInst in, CTens T, unsigned slice,
+                                                    unsigned nblk, bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+#define IEN(k) (in->i[k] == PLOW_TENSOR_NONE ? nullptr : T[in->i[k]])
+    const unsigned char* Sq = (const unsigned char*)IEN(5);
+    const unsigned char* Sk = (const unsigned char*)IEN(6);
+    const unsigned char* Sv = (const unsigned char*)IEN(7);
+    const bool q_ok = in->i[1] != 0u && TEN(0) && TEN(2) && Sq;
+    const bool k_ok = in->i[3] != 0u && TEN(3) && TEN(4) && Sk;
+    const bool v_on = TEN(5) || TEN(6) || Sv || in->i[4] != 0u;
+    const bool v_ok = v_on ? (in->i[4] != 0u && TEN(5) && TEN(6) && Sv) : true;
+    if (!q_ok || !k_ok || !v_ok) __builtin_trap();
+    d_gemv_qkv_mxfp4((bf16*)TEN(0), (bf16*)TEN(3), (bf16*)TEN(5), (const bf16*)TEN(1),
+                     (const unsigned char*)TEN(2), (const unsigned char*)TEN(4),
+                     (const unsigned char*)TEN(6), Sq, Sk, Sv, in->i[0], in->i[1], in->i[3],
+                     in->i[4], in->i[2], slice, nblk, lds);
+#undef IEN
+#undef TEN
+}
+
 #if PLOW_BUCKET_PREFILL
+/* MXFP4 (w4a16) PREFILL fused gate|up GEMM+GLU. Mirrors exec_gemm_mxfp4's operands with a second
+ * fp4 weight and its own E8M0 scale rows, in op 92's slot layout.
+ * t0=fu t1=A(bf16) t2=Wg(fp4) t5=Wu(fp4) t3=Sg(e8m0) t4=Su(e8m0)   i0=M i1=N i2=K i5=act */
+#if PLOW_WAVES == 8
+__device__ __forceinline__ void exec_gemm_glu_mxfp4(CInst in, CTens T, unsigned slice,
+                                                    unsigned nblk, bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    d_gemm_glu_mxfp4((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
+                     (const unsigned char*)TEN(5), (const unsigned char*)TEN(3),
+                     (const unsigned char*)TEN(4), in->i[0], in->i[1], in->i[2], in->i[5], slice,
+                     nblk, lds);
+#undef TEN
+}
+#endif
 /* MXFP4 (w4a16) PREFILL GEMM arm. A bf16 activations, W packed fp4 + E8M0 scale rows.
  * t0=C(bf16) t1=A(bf16) t2=W(fp4) t3=wscale(e8m0)   i0=M i1=N i2=K */
 __device__ __forceinline__ void exec_gemm_mxfp4(CInst in, CTens T, unsigned slice, unsigned nblk,
@@ -833,7 +959,39 @@ __device__ __forceinline__ void exec_gemm_fp8_blk(CInst in, CTens T, unsigned sl
 }
 #endif /* PLOW_BUCKET_PREFILL */
 
-__device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* sm) {
+/* RESTORE THE SCALAR PROMISE ACROSS THE CALL BOUNDARY.
+ *
+ * `PLOW_KONST` (address space 4) buys s_load only while the pointer VALUE is in SGPRs.
+ * plow_exec is a real call (see the note above -- it must stay one), and the AMDGPU ABI
+ * passes non-`inreg` arguments in VGPRs. So `in` arrives in v[0:1] and every field read
+ * reverts to exactly the vector chase the address-space annotation was added to remove:
+ *
+ *     v_mov_b32_e32     v150, v0                 <- `in` lands in VGPRs
+ *     global_load_dword v167, v[150:151], off    <- in->op
+ *     s_waitcnt vmcnt(0)                         <- full vector drain
+ *     v_cmp_lt_i16_e32  vcc, 44, v167            <- opcode dispatch on the VALU
+ *
+ * Measured in interp_decode_fp8kv_k3_gq.elf: plow_exec contains 0 `s_load` against 1418
+ * vector loads, 485 of them based on the instruction pointer, and 283 of those are followed
+ * within six instructions by `s_waitcnt vmcnt(0)` -- a drain that is NOT specific to the
+ * packet fields and takes every in-flight WEIGHT load down with it.
+ *
+ * readfirstlane says the thing the ABI threw away: these pointers are wave-uniform. They
+ * genuinely are -- `in` is `&insts[pc]` with pc uniform per workgroup, and `T` is the
+ * tensor table base. Same shape as `buf_rsrc_fp8_u` in amd_common.h, which does this for
+ * buffer descriptors. Costs 4 VALU at entry; the loads then issue as s_load on lgkmcnt,
+ * which does not interact with the vector memory stream at all. */
+template <class P>
+__device__ __forceinline__ P plow_scalar_ptr(P p) {
+    unsigned long long u = (unsigned long long)(size_t)p;
+    unsigned lo = __builtin_amdgcn_readfirstlane((unsigned)u);
+    unsigned hi = __builtin_amdgcn_readfirstlane((unsigned)(u >> 32));
+    return (P)(size_t)(((unsigned long long)hi << 32) | lo);
+}
+
+__device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_smem* sm) {
+    CInst in = plow_scalar_ptr(in_v);
+    CTens T = plow_scalar_ptr(T_v);
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     const unsigned nblk = in->blocks;
 #if defined(PLOW_BUCKET_FLASH)
@@ -911,7 +1069,16 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
 #if PLOW_FP8_KV
         /* FP8 KV write (k/v only; q still uses HEADNORM_ROPE above). t0=uint8 cache, t6=f32 scale. */
         case PLOW_DOP_HEADNORM_ROPE_FP8:
-            if (in->i[2] == 128)
+            /* HD=64 is the MLA `krot` row (qk_rope_head_dim), the ONLY width below 128 any KV
+             * cache uses. It exists so the ckv+krot fp8 variant is MEASURABLE; the shipped MLA
+             * fp8 form leaves krot bf16 and never reaches here. [MLA-FP8-KV] */
+            if (in->i[2] == 64)
+                d_headnorm_rope_fp8<64>((unsigned char*)TEN(0), (float*)TEN(6), (const bf16*)TEN(1),
+                                        (const bf16*)TEN(2), (const float*)TEN(3),
+                                        (const float*)TEN(4), (const int*)TEN(5), in->i[0],
+                                        in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4],
+                                        slice, nblk, in->i[6]);
+            else if (in->i[2] == 128)
                 d_headnorm_rope_fp8<128>((unsigned char*)TEN(0), (float*)TEN(6), (const bf16*)TEN(1),
                                          (const bf16*)TEN(2), (const float*)TEN(3),
                                          (const float*)TEN(4), (const int*)TEN(5), in->i[0],
@@ -936,9 +1103,11 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
                             (const bf16*)TEN(3), in->i[0], in->i[1], in->fj[0].f, in->fj[1].f, slice,
                             nblk, sm->part);
             break;
+        /* t3 = the OUTER residual of a fused chained pair: `out = (t3 + bf16(t1 + t2)) * f0`.
+         * PLOW_TENSOR_NONE is the plain two-input add, byte for byte. See d_residual's note. */
         case PLOW_DOP_RESIDUAL:
             d_residual((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
-                       in->fj[0].f, slice, nblk);
+                       in->fj[0].f, slice, nblk, (const bf16*)TEN(3));
             break;
         case PLOW_DOP_ADD_NORM:
             d_add_norm((bf16*)TEN(0), (bf16*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
@@ -997,15 +1166,55 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
                              (const bf16*)TEN(3), in->i[0], in->i[1], in->i[2], in->fj[0].f, slice,
                              nblk);
             break;
+        /* FUSED KDA — ops 88x3 -> 109 and 89+102 -> 110. Six packets per layer become three, 207
+         * per token over 69 KDA layers, against a measured ~12 us per packet.
+         *
+         * NO SILENT FALLBACK, in the shape this dispatch makes possible: `default:` is a NOP, so
+         * the failure to refuse is a packet that convolves two of three streams, or that runs the
+         * recurrence against an uninitialised gate, and leaves the rest finite and fluent. Both
+         * arms trap on any demoted operand being absent. */
+        case PLOW_DOP_KDA_CONV3: {
+            const float* wv = (in->i[4] == PLOW_TENSOR_NONE) ? nullptr : (const float*)T[in->i[4]];
+            float* cs[3];
+#pragma unroll
+            for (int s = 0; s < 3; s++)
+                cs[s] = (in->i[5 + s] == PLOW_TENSOR_NONE) ? nullptr : (float*)T[in->i[5 + s]];
+            if (wv == nullptr || cs[0] == nullptr || cs[1] == nullptr || cs[2] == nullptr ||
+                TEN(6) == nullptr || TEN(7) == nullptr || in->i[1] == 0u)
+                __builtin_trap();
+            d_kda_conv3((bf16*)TEN(0), (bf16*)TEN(1), (bf16*)TEN(2), (const bf16*)TEN(3),
+                        (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
+                        (const float*)TEN(7), wv, cs[0], cs[1], cs[2], in->i[0], in->i[1],
+                        in->i[2], in->i[3], slice, nblk);
+            break;
+        }
+        case PLOW_DOP_KDA_STATE_STEP_G: {
+            const float* dtb = (in->i[5] == PLOW_TENSOR_NONE) ? nullptr : (const float*)T[in->i[5]];
+            if (dtb == nullptr || TEN(7) == nullptr || TEN(4) == nullptr || TEN(5) == nullptr)
+                __builtin_trap();
+            d_kda_state_step_g((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                               (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
+                               (const float*)TEN(7), dtb, in->i[6], in->fj[1].f, (float*)TEN(6),
+                               in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
+                               slice, nblk, (float*)sm->raw);
+            break;
+        }
         /* Kimi-K3 BLOCK structure (op_k3.h). Both arms are in BOTH buckets: a K3 layer runs the
          * same graph at T=1 and T>1, and AttnRes in particular replaces the residual add on the
          * PREFILL path too — an AttnRes that exists only in the decode object would make prefill
          * and decode compute different models, which is the failure the KDA gate's
          * prefill/decode-agreement check exists to catch. */
+        /* i2 = nb (rows LIVE at this layer), i4 = the ring's row CAPACITY. They coincide at T = 1
+         * and only there; the arm poisons on i4 < i2 rather than striding a T-row ring by the
+         * live count. */
+        /* t5 = the FUSED post-norm's gamma, and PLOW_TENSOR_NONE means "leave the raw mix", which
+         * is the pre-fusion arm byte for byte. See d_attn_res' note: every AttnRes in a K3 program
+         * is read by exactly one RMSNORM over its own output, so the two narrow packets collapse. */
         case PLOW_DOP_ATTN_RES:
             d_attn_res((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
-                       (const float*)TEN(3), in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk,
-                       (float*)sm->raw);
+                       (const float*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[4], in->fj[0].f,
+                       slice, nblk, (float*)sm->raw, (const bf16*)TEN(4), in->i[3],
+                       (const bf16*)TEN(5));
             break;
         case PLOW_DOP_SITU_GLU:
             d_situ_glu((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
@@ -1170,6 +1379,16 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
         case PLOW_DOP_GEMM_MXFP4:
             exec_gemm_mxfp4(in, T, slice, nblk, sm->gm);
             break;
+#if PLOW_WAVES == 8
+        /* The fp4 twin of the bf16 GEMM_GLU arm below, prefill-only for the same reason (a full
+         * 256x256 MFMA GEMM has no business in the decode object) and PLOW_WAVES==8 for the same
+         * reason (the epilogue's wave->column remap needs SN == 2). It is `d_gemm_mxfp4`'s tile and
+         * accumulator with `d_gemm_glu`'s epilogue, so it adds no register class this bucket does
+         * not already carry. */
+        case PLOW_DOP_GEMM_GLU_MXFP4:
+            exec_gemm_glu_mxfp4(in, T, slice, nblk, sm->gm);
+            break;
+#endif
         /* ...and its four non-default tiles, so the fp4 family gets the SAME per-shape
          * selection the bf16 family has had since GEMM_MED/GEMM_SMALL landed. Without these
          * `pick_tile` had exactly one fp4 rung to choose from and every mxfp4 prefill GEMM
@@ -1224,8 +1443,8 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
                                (const unsigned long long*)TEN(2),
                                (const unsigned long long*)TEN(3), (const int*)TEN(4),
                                (const unsigned*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3],
-                               in->i[5], slice, nblk, sm->raw, nullptr, (const unsigned*)TEN(6),
-                               (unsigned char*)TEN(7));
+                               in->i[5], slice, nblk, in->fj[0].f, in->fj[1].f, sm->raw, nullptr,
+                               (const unsigned*)TEN(6), (unsigned char*)TEN(7));
             break;
         case PLOW_DOP_MOE_GROUP_DOWN_PF:
             d_moe_group_down_pf((float*)TEN(0), (const bf16*)TEN(1),
@@ -1243,10 +1462,21 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
 #if PLOW_MLA_PREFILL
         /* MLA / gathered-MLA prefill — the arms whose absence meant Kimi K2.7, DeepSeek and
          * GLM 5.2 could decode on gfx950 but had nothing to run a real prompt through. */
+#if PLOW_FP8_KV
+        /* Same swap as the decode bucket: the DENSE MLA prefill goes e4m3, the gathered one keeps
+         * its bf16 arm (its `t7` is `idx`, not a scale array). */
+        case PLOW_DOP_FLASH_MLA_PREFILL_FP8:
+            exec_flash_mla_prefill_fp8(in, T, slice, nblk, sm->fmla);
+            break;
+        case PLOW_DOP_FLASH_GATHER_PREFILL:
+            exec_flash_mla_prefill(in, T, slice, nblk, sm->fmla);
+            break;
+#else
         case PLOW_DOP_FLASH_MLA_PREFILL:
         case PLOW_DOP_FLASH_GATHER_PREFILL:
             exec_flash_mla_prefill(in, T, slice, nblk, sm->fmla);
             break;
+#endif
         /* The latent epilogue has to be in the SAME object as the prefill that produces the
          * partials, or the packet has no way to finish a token. Decode carries its own copy. */
         case PLOW_DOP_MLA_MERGE_FOLD:
@@ -1297,17 +1527,43 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
         case PLOW_DOP_GEMV_GLU_MXFP4:
             exec_gemv_glu_mxfp4(in, T, slice, nblk, sm->gm);
             break;
+        /* FUSED Q|K|V, fp4 — op 22's twin, sharing op 91's body (that one is this with Nk=Nv=0).
+         * The three E8M0 scale rows are handles in i5/i6/i7; the arm TRAPS on a malformed packet
+         * rather than running a narrower sweep, because `default:` here writes nothing. */
+        case PLOW_DOP_GEMV_QKV_MXFP4:
+            exec_gemv_qkv_mxfp4(in, T, slice, nblk, sm->gm);
+            break;
 #endif
         case PLOW_DOP_GEMV_GLU:
+            /* f[0]/f[1] carry the situ betas, exactly as PLOW_DOP_SITU_GLU does. They are 0 on
+             * every non-K3 packet, and act != 2 ignores them. */
             d_gemv_glu((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                        (const bf16*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[5], slice, nblk,
-                       sm->gm);
+                       sm->gm, in->fj[0].f, in->fj[1].f);
             break;
         case PLOW_DOP_GEMV_QKV:
             d_gemv_qkv((bf16*)TEN(0), (bf16*)TEN(3), (bf16*)TEN(5), (const bf16*)TEN(1),
                        (const bf16*)TEN(2), (const bf16*)TEN(4), (const bf16*)TEN(6), in->i[0],
                        in->i[1], in->i[3], in->i[4], in->i[2], slice, nblk, sm->gm);
             break;
+        /* FUSED Q|K|V|G — op 22 plus a fourth output stream (Kimi-K3 KDA q/k/v/g_proj).
+         *
+         * t7 = g_out, i5 = Ng, i6 = the W_g HANDLE (nine pointers do not fit t[8]; dev_isa.h
+         * states why the demoted one is a weight). Shares op 22's body: see op_gemm.h.
+         *
+         * NO SILENT FALLBACK. This interpreter's dispatch `default:` is a NOP, so the one thing
+         * that must not happen is a malformed 4-stream packet quietly running as a 3-stream sweep
+         * and leaving g_out exactly as it found it — finite, fluent, wrong. A packet that names
+         * this opcode without both halves of the fourth stream TRAPS. */
+        case PLOW_DOP_GEMV_QKVG: {
+            const bf16* Wg = (in->i[6] == PLOW_TENSOR_NONE) ? nullptr : (const bf16*)T[in->i[6]];
+            if (in->i[5] == 0u || Wg == nullptr || TEN(7) == nullptr) __builtin_trap();
+            d_gemv_qkvg((bf16*)TEN(0), (bf16*)TEN(3), (bf16*)TEN(5), (bf16*)TEN(7),
+                        (const bf16*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(4),
+                        (const bf16*)TEN(6), Wg, in->i[0], in->i[1], in->i[3], in->i[4], in->i[5],
+                        in->i[2], slice, nblk, sm->gm);
+            break;
+        }
 #if PLOW_FP8_KV
         /* fp8-KV decode object: SWAP in the fp8 flash so the bf16 flash_decode is not compiled and
          * the register budget stays flat against the 256/occ-2 cliff. */
@@ -1322,10 +1578,28 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
         /* ===== DeepSeek MLA (Multi-head Latent Attention) — the flash READ path.  [DEEPSEEK-MLA]
          * The latent flash (dense + gathered) emits latent-wide (O,m,l) folded by FLASH_MERGE<512>;
          * O_UV_FOLD folds the merged latent down to v_head_dim, the per-query epilogue. */
+#if PLOW_FP8_KV
+        /* fp8-KV object: the DENSE latent flash is SWAPPED for its e4m3 twin, exactly as
+         * FLASH_DECODE is above — the KV encoding axis is a swap, not an additive one.
+         *
+         * FLASH_GATHER_DECODE is NOT swapped and stays bf16 in this object. Its `t7` is the `idx`
+         * table and `t7` is where the fp8 dequant scales live, so a gathered fp8 latent has
+         * nowhere to put them; keeping the bf16 gather arm compiled means a DSA packet meets a
+         * REAL arm instead of the silent-NOP `default:`. The cost is that the bf16 instantiation
+         * is still in this object, so the swap buys no register headroom for MLA — it buys the
+         * halved KV, which is the point. */
+        case PLOW_DOP_FLASH_MLA_DECODE_FP8:
+            exec_flash_mla_decode_fp8(in, T, slice, nblk, sm->fmla);
+            break;
+        case PLOW_DOP_FLASH_GATHER_DECODE:
+            exec_flash_mla_decode(in, T, slice, nblk, sm->fmla);
+            break;
+#else
         case PLOW_DOP_FLASH_MLA_DECODE:
         case PLOW_DOP_FLASH_GATHER_DECODE:
             exec_flash_mla_decode(in, T, slice, nblk, sm->fmla);
             break;
+#endif
         case PLOW_DOP_O_UV_FOLD:
             d_o_uv_fold<512>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
                              in->i[1], in->i[2], slice, nblk, sm->raw);
@@ -1410,10 +1684,10 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
                               in->i[3], in->fj[0].f, slice, nblk, (float*)sm->raw, in->i[6],
                               in->i[7]);
             break;
-        case PLOW_DOP_MOE_EXPERT_GLU:
+        case PLOW_DOP_MOE_EXPERT_GLU: /* f0/f1 = situ betas, as on the block-fp8 twin */
             d_moe_expert_glu((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
                              (const unsigned long long*)TEN(3), in->i[0], in->i[1], in->i[2],
-                             in->i[3], in->i[5], slice, nblk);
+                             in->i[3], in->i[5], slice, nblk, in->fj[0].f, in->fj[1].f);
             break;
         case PLOW_DOP_MOE_EXPERT_DOWN:
             d_moe_expert_down((float*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
@@ -1461,10 +1735,12 @@ __device__ static void plow_exec(CInst in, unsigned slice, CTens T, plow_smem* s
          * partitioned the builds. Now that PLOW_FP8 is additive the partition is gone and so is the
          * duplicate: op 44 is a BLOCK-fp8 weight arm, a third weight encoding independent of the
          * per-channel fp8 the PLOW_FP8 axis names, so it belongs here unconditionally. */
-        case PLOW_DOP_DENSE_GLU_FP8_BLK: /* t2=Wg t5=Wu t3=Sg t4=Su; i0=N(inter) i1=K(hidden) i5=act */
+        case PLOW_DOP_DENSE_GLU_FP8_BLK: /* t2=Wg t5=Wu t3=Sg t4=Su; i0=N(inter) i1=K(hidden) i5=act
+                                          * f0/f1 = situ betas (K3's dense FFN + shared experts) */
             d_dense_glu_fp8_blk((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
                                 (const unsigned char*)TEN(5), (const float*)TEN(3),
-                                (const float*)TEN(4), in->i[0], in->i[1], in->i[5], slice, nblk);
+                                (const float*)TEN(4), in->i[0], in->i[1], in->i[5], slice, nblk,
+                                in->fj[0].f, in->fj[1].f);
             break;
         case PLOW_DOP_GEMV_FP8_BLK: /* dense DOWN: t2=W(fp8) t5=scale; i0=M i1=N i2=K i4=x_row */
             d_gemv_fp8_blk((bf16*)TEN(0), (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
@@ -1602,7 +1878,43 @@ __device__ __forceinline__ void ctr_acquire(void) {
  * (an acquire fence is cheaper than an acquire load, which emits buffer_inv on EVERY poll), but
  * on the signal side let each atomic carry its own release. Do not "fix" this. */
 __device__ __forceinline__ void ctr_signal(uint32_t* p) {
-#if PLOW_GATE_RELAXSIG
+#if PLOW_GATE_SC1
+    /* DEVICE-SCOPE PUBLISH, no cache-wide writeback. Unlike PLOW_GATE_RELAXSIG below this is not a
+     * race BY CONSTRUCTION rather than by luck: the activation stores are `sc1` (see
+     * `st_glob8`/`st_act1` in amd_common.h), so they bypass the non-coherent XCD L2 and are already
+     * device-visible; `vmcnt(0)` retires them; the relaxed RMW then publishes the count. There is no
+     * dirty line for a `buffer_wbl2` to find, so the release buys nothing but the 32-per-L2
+     * serialised writeback it costs.
+     *
+     * The wait side is UNCHANGED — `ctr_acquire` still takes the agent acquire and its
+     * `buffer_inv`. Dropping it additionally requires every activation LOAD to be `sc1`.
+     *
+     * THE LOAD SIDE IS REACHABLE, and an earlier note here said it was not. That note reasoned
+     * from inline asm, where a 128-bit `sc1` load needs `s_waitcnt vmcnt(0)` inside the asm block
+     * (the compiler cannot track an asm-defined VGPR) and would serialise the GEMV staging loop.
+     * True of asm, false of the load: `__builtin_amdgcn_raw_buffer_load_b128` takes the cache
+     * policy in its `aux` operand, and **bit 4 is `sc1`** —
+     *
+     *     aux=3  -> buffer_load_dwordx4 ... sc0 nt      (what `buf_ld8` emits today)
+     *     aux=16 -> buffer_load_dwordx4 ... sc1
+     *     aux=19 -> buffer_load_dwordx4 ... sc0 nt sc1
+     *
+     * verified by compiling each against gfx950. Full width, intrinsic, compiler-tracked
+     * waitcnts, so it pipelines identically to the plain load. (An earlier sweep of aux 0..7
+     * missed it and concluded `sc1` was unreachable this way: bit 0 is `sc0`, bit 1 is `nt`, bit 2
+     * really is ignored — the bit is 4, outside that range.)
+     *
+     * So the remaining work for the wait side is mechanical, not blocked: give the activation
+     * loads a descriptor and `aux |= 16`, then drop `buffer_inv` in `ctr_acquire`. Together the two
+     * halves are the superadditive -5.04 ms/token the UNSAFE knobs below measure as a ceiling.
+     *
+     * COVERAGE CAVEAT, and it is why this is not yet a shippable default: the ragged scalar tails
+     * in op_elementwise.h / op_k3.h / op_norm.h / op_moe.h still write activations with plain
+     * stores (see the `st_act1` note). They are <=7 halves against a ~14 KB row, so the TIMING here
+     * is representative, but soundness needs them converted first. */
+    __builtin_amdgcn_s_waitcnt(/*vmcnt(0)*/ 0x0f70);
+    __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#elif PLOW_GATE_RELAXSIG
     __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); /* UNSAFE: no wbl2 */
 #else
     __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
@@ -1840,12 +2152,16 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WAVES / 4, PLOW_WAVES / 4))) void PLOW_I
              * its partial into peer_scratch[rank]; d_xreduce_mega then cross-signals, waits
              * N arrivals (system xctr), and sums the N peer slots. Validated bit-exact +
              * ~0.29 us/collective by tp_allreduce_bench.
-             *   t0=out i0=H i1=n_gpu i2=slot_bytes i3=xctr gate id */
+             *   t0=out i0=H i1=n_gpu i2=slot_bytes i3=xctr gate id
+             *   i4=gather slot_bytes i5=gather cols/rank (0 = off) i6=out row width
+             * i4/i5/i6 fold an ALL-GATHER of a column-parallel partial into this reduce —
+             * K3's `routed_expert_up_proj`, see d_xreduce. Zero on every other collective,
+             * and the arm is then byte-identical to the pre-gather one. */
             const size_t xoff =
                 (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
             d_xreduce_mega((bf16*)tens[in->t[0]], prog.peer_scratch, prog.n_gpu, prog.rank,
                            in->i[0], in->i[2], xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS,
-                           nullptr, e.slice, in->blocks);
+                           nullptr, e.slice, in->blocks, in->i[4], in->i[5], in->i[6]);
         } else if (in->op == PLOW_DOP_XREDUCE2) {
             /* TWO-SHOT all-reduce for the LARGE prefill [T,hidden] partial (§4, bandwidth-
              * optimal): reduce-scatter this rank's owned 1/N slice from every peer, then
@@ -1874,6 +2190,30 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WAVES / 4, PLOW_WAVES / 4))) void PLOW_I
              * compiler's structural emit runs; the CP flash LSE-merge body lands with tp-host.
              * No-op keeps single-GPU decode bit-identical. */
         } else
+#endif
+#ifdef PLOW_ICACHE_INV_PROBE
+        /* MEASUREMENT INSTRUMENT, never on in a shipped build (guarded by a macro that nothing
+         * defines; with it undefined the preprocessed source — and therefore the tunedb build
+         * digest — is byte-identical).
+         *
+         * Question it answers: this interpreter is a persistent megakernel whose .text is 338 KB
+         * (`interp_decode_fp8kv_k3.elf`), and consecutive packets run DIFFERENT op bodies, so the
+         * instruction stream jumps across a large binary. How much of the runtime is the L1
+         * instruction cache missing on those jumps?
+         *
+         * `s_icache_inv` flushes the SQC instruction cache, so with this on EVERY packet's body is
+         * a GUARANTEED cold instruction fetch from L2 — the worst case a zero-hit-rate I-cache
+         * could produce. The delta (probe - baseline) is therefore an UPPER BOUND on everything
+         * instruction prefetch, body reordering or footprint shrinking could ever recover. It is
+         * an upper bound and not an estimate: the real run already hits in I-cache some of the
+         * time, and this also charges the cost of the s_icache_inv itself.
+         *
+         * gfx950 has no instruction-PREFETCH instruction to test the other direction with:
+         * `s_inst_prefetch` is GFX10/GFX11 only and `s_prefetch_inst` is GFX12 only (verified
+         * against the ROCm 7.2.4 assembler, /opt/rocm/llvm/bin/llvm-mc -mcpu=gfx950). Invalidation
+         * is the only I-cache lever the ISA gives this part, so bounding from above is the only
+         * experiment available. */
+        __asm__ __volatile__("s_icache_inv" ::: "memory");
 #endif
         plow_exec(in, e.slice, tens, &sm);
 

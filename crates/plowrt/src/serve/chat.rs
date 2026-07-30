@@ -94,6 +94,34 @@ pub async fn chat_completions(
         gen.ignore_eos = ignore;
     }
 
+    // NO VISION PATH EXISTS. `Content::as_text()` flattens a multipart message by
+    // keeping the `Text` parts and dropping everything else, so an `image_url`
+    // part is discarded and the model answers from the surrounding text alone —
+    // fluently, and about the wrong question. `Content::has_image` was written
+    // for exactly this check and had NO CALLERS, so the drop was silent.
+    //
+    // This is the same failure the compile-time refusals guard against
+    // (`nn-graph`'s kimi_k3 builder and `plowc`'s `synth_kimi_k3` both refuse a
+    // `vision_config` rather than build a text tower that is "silently wrong on
+    // every image prompt"). Those cover the COMPILER. Nothing covered the
+    // SERVER, so a text-tower build of any multimodal checkpoint — Kimi-K3,
+    // Gemma-4, Qwen-VL — would take an image request and quietly ignore it.
+    //
+    // Refused rather than errored later: the request never becomes a token, so
+    // it is not counted, not tokenized and not admitted.
+    if req.messages.iter().any(|m| m.content.has_image()) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": {
+                "message": "this build serves the TEXT tower only and has no vision stage; \
+                            an image part would be silently dropped, so the request is refused",
+                "type": "invalid_request_error",
+                "param": "messages[].content",
+            }})),
+        )
+            .into_response();
+    }
+
     // Route to the per-model muxer. Tokens stream back as `StreamChunk`s over
     // an mpsc — the muxer produces one per generated token, ending with `Done`.
     crate::obs::Metrics::inc(&state.metrics.requests);
@@ -145,17 +173,69 @@ pub async fn chat_completions(
 ///
 /// Unknown family → Gemma's format, the previous behavior.
 fn gpu_chat_prompt(bundle: Option<&crate::asset::ModelBundle>, messages: &[Message]) -> String {
-    let glm = bundle
-        .map(|b| {
-            let t = b.tokenizer();
-            !t.is_byte_fallback() && t.encode("<|assistant|>").len() == 1
-        })
-        .unwrap_or(false);
-    if glm {
+    let one = |m: &str| {
+        bundle
+            .map(|b| {
+                let t = b.tokenizer();
+                !t.is_byte_fallback() && t.encode(m).len() == 1
+            })
+            .unwrap_or(false)
+    };
+    // Probed BEFORE GLM's marker, not after: the two are disjoint in practice, but K3's
+    // `<|end_of_msg|>` is also its `eos_token_id` (163586, generation_config.json), which makes it
+    // the least ambiguous thing in the vocab to key on.
+    if one("<|end_of_msg|>") {
+        k3_chat_prompt(messages)
+    } else if one("<|assistant|>") {
         glm_chat_prompt(messages)
     } else {
         gemma_chat_prompt(messages)
     }
+}
+
+/// Kimi-K3's chat format — text-only, no tools, thinking DISABLED.
+///
+/// K3 ships NO `chat_template.jinja` and no `chat_template` in
+/// `tokenizer_config.json`; the format lives in Python, in
+/// `encoding_k3.py::build_chat_segments`, as an "XTML" segment structure. This
+/// is that function's own output for the text-only case, captured by running
+/// it against the real checkpoint rather than read off the source:
+///
+/// ```text
+/// <|open|>message role="user"<|sep|>Hello!<|close|>message<|sep|><|end_of_msg|>
+/// <|open|>message role="assistant"<|sep|><|open|>response<|sep|>
+/// ```
+///
+/// THINKING DISABLED is the same deliberate choice the GLM arm makes, and it
+/// changes the generation prompt rather than merely dropping a line: with
+/// thinking on, K3 opens `<|open|>think<|sep|>` and additionally prepends a
+/// `role="system" type="thinking-effort"` message explaining the effort knob.
+/// With it off the assistant turn opens the RESPONSE channel directly. A served
+/// benchmark measures answer tokens, not a reasoning trace whose length nobody
+/// controls — and the `think` channel would otherwise have to be parsed back
+/// out of the stream.
+///
+/// The four markers are single ids via `added_tokens` — `<|open|>` 163587,
+/// `<|close|>` 163588, `<|sep|>` 163589, `<|end_of_msg|>` 163586 — which is
+/// also what the probe above keys on. Note `<|open|>`/`<|close|>`/`<|sep|>`
+/// carry `"special": false` in the checkpoint's `added_tokens_decoder`; that
+/// affects `skip_special_tokens` on DECODE, not whether they encode as one id.
+fn k3_chat_prompt(messages: &[Message]) -> String {
+    let mut p = String::new();
+    for m in messages {
+        let role = match m.role.as_str() {
+            "assistant" => "assistant",
+            "system" | "developer" => "system",
+            _ => "user",
+        };
+        p.push_str("<|open|>message role=\"");
+        p.push_str(role);
+        p.push_str("\"<|sep|>");
+        p.push_str(m.content.as_text().trim());
+        p.push_str("<|close|>message<|sep|><|end_of_msg|>");
+    }
+    p.push_str("<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>");
+    p
 }
 
 /// GLM-5.2's chat format (the checkpoint's `chat_template.jinja`; text-only,
@@ -462,10 +542,46 @@ fn sse_response(
 
 #[cfg(test)]
 mod tests {
-    use super::request_id;
+    use super::{k3_chat_prompt, request_id, Message};
 
     #[test]
     fn request_ids_are_unique() {
         assert_ne!(request_id(), request_id());
+    }
+
+    fn msg(role: &str, text: &str) -> Message {
+        Message {
+            role: role.into(),
+            content: crate::serve::openai::Content::Text(text.into()),
+        }
+    }
+
+    /// Pinned against `encoding_k3.py::build_chat_segments` RUN on the real
+    /// moonshotai/Kimi-K3 snapshot with `thinking=False, add_generation_prompt=True`,
+    /// not against a reading of it. K3 ships no jinja template, so this string is
+    /// the only executable statement of the format we have.
+    #[test]
+    fn the_k3_prompt_is_what_encoding_k3_renders() {
+        assert_eq!(
+            k3_chat_prompt(&[msg("user", "Hello!")]),
+            "<|open|>message role=\"user\"<|sep|>Hello!<|close|>message<|sep|><|end_of_msg|>\
+             <|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>"
+        );
+    }
+
+    /// `developer` folds to `system` and `assistant` keeps its own role, so a
+    /// multi-turn conversation round-trips into the same segment shape.
+    #[test]
+    fn the_k3_prompt_maps_every_role() {
+        let p = k3_chat_prompt(&[
+            msg("developer", "Be terse."),
+            msg("user", "hi"),
+            msg("assistant", "hello"),
+            msg("user", "bye"),
+        ]);
+        assert!(p.starts_with("<|open|>message role=\"system\"<|sep|>Be terse.<|close|>"));
+        assert_eq!(p.matches("<|end_of_msg|>").count(), 4);
+        assert_eq!(p.matches("role=\"assistant\"").count(), 2); // one turn + the prompt
+        assert!(p.ends_with("<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>"));
     }
 }

@@ -27,7 +27,14 @@
  * is monolithic, emitted onto ONE CU, and has no arm in amd/interp.hip at all, so op 90 falls to
  * the silent dispatch default: on gfx950 and computes nothing.
  *
- * All four ops take (slice, nblk) where a standalone kernel would take (blockIdx.x, gridDim.x) —
+ * SIX ARMS, FOUR ALGORITHMS. Ops 109 and 110 are ops 88 and 102+89 re-sliced into fewer PACKETS,
+ * not re-derived: 109 calls 88's own `kda_conv_range` per stream, and 110 is 102's body with one
+ * `if constexpr`-shaped branch on where `g` comes from. That is deliberate — a KDA decode layer is
+ * launch bound (a packet costs ~12 us in this interpreter, measured; the whole six-op chain's
+ * arithmetic is a rounding error against that), so the fusion had to move packets without moving
+ * arithmetic. Two bodies computing the same thing is how the transposed-state class of bug gets in.
+ *
+ * All six ops take (slice, nblk) where a standalone kernel would take (blockIdx.x, gridDim.x) —
  * the interpreter is persistent, grid == CU count, and an op "spread over N workgroups" appears
  * once in the instruction stream and N times in the per-CU streams.
  */
@@ -53,11 +60,12 @@ __device__ __forceinline__ float kda_softplus(float x) {
 /* -------------------------------------------------------------------------------------------
  * op 88 — KDA short conv.
  *
- * Three independent causal depthwise convolutions of width W over H*D channels each (q, k and v,
- * concatenated into one `conv_dim = 3*H*D` axis), then an activation. `groups = hidden_size` makes
- * it depthwise, `padding = W-1` makes it causal, and there is no bias (the checkpoint ships no
- * *_conv1d.bias). This is what gives KDA local W-token mixing that a pure linear-attention
- * recurrence cannot express — it is 0.03% of the layer's MACs and it is not optional.
+ * ONE stream's causal depthwise convolution of width W over `conv_dim` channels, then an
+ * activation. KDA has three such streams (q, k, v); this arm takes one, and op 109 takes all three
+ * in one packet. `groups = hidden_size` makes it depthwise, `padding = W-1` makes it causal, and
+ * there is no bias (the checkpoint ships no *_conv1d.bias). This is what gives KDA local W-token
+ * mixing that a pure linear-attention recurrence cannot express — it is 0.03% of the layer's MACs
+ * and it is not optional.
  *
  * `state` is the rolling input window, [conv_dim, W] f32, holding the last W inputs per channel
  * with the CURRENT token at slot W-1:
@@ -78,15 +86,15 @@ __device__ __forceinline__ float kda_softplus(float x) {
  * per block — 144 of 512 lanes busy, which is a wave-level idle, not a CU-level one, and CU spread
  * is what the bandwidth wants.
  */
-__device__ void d_kda_conv(bf16* __restrict__ out, const bf16* __restrict__ x,
-                           const float* __restrict__ w, float* __restrict__ state, unsigned T,
-                           unsigned conv_dim, unsigned W, unsigned act, unsigned slice,
-                           unsigned nblk) {
-    const unsigned chunk = (conv_dim + nblk - 1) / nblk;
-    const unsigned c0 = slice * chunk;
-    unsigned c1 = c0 + chunk;
-    if (c1 > conv_dim) c1 = conv_dim;
-
+/* One stream's channels [c0, c1) of the conv, for THIS workgroup. Factored out so op 88 and op 109
+ * share ONE body: the fused arm calls this on a per-stream sub-range, so "the fused conv equals
+ * three separate convs" is true by construction and not by tolerance. `conv_dim` is the stream's
+ * own channel stride, which is what makes the split legal — nothing in the loop couples channels. */
+__device__ __forceinline__ void kda_conv_range(bf16* __restrict__ out, const bf16* __restrict__ x,
+                                               const float* __restrict__ w,
+                                               float* __restrict__ state, unsigned T,
+                                               unsigned conv_dim, unsigned W, unsigned act,
+                                               unsigned c0, unsigned c1) {
     for (unsigned c = c0 + threadIdx.x; c < c1; c += PLOW_THREADS) {
         /* The window and the taps. W is 4 for K3 and the loop bound is a runtime value, so this is
          * written as a small fixed array; PLOW_KDA_WMAX bounds the register cost. */
@@ -107,11 +115,80 @@ __device__ void d_kda_conv(bf16* __restrict__ out, const bf16* __restrict__ x,
 #pragma unroll
             for (unsigned j = 0; j < PLOW_KDA_WMAX; j++) y += win[j] * tap[j];
             /* activation AFTER the convolution (short_conv.py:55-72) */
-            out[(size_t)t * conv_dim + c] = f2bf(act == 1u ? act_silu(y) : y);
+            st_act1(&out[(size_t)t * conv_dim + c], f2bf(act == 1u ? act_silu(y) : y));
         }
 #pragma unroll
         for (unsigned j = 0; j < PLOW_KDA_WMAX; j++)
             if (j < Wc) state[(size_t)c * W + j] = win[j];
+    }
+}
+
+__device__ void d_kda_conv(bf16* __restrict__ out, const bf16* __restrict__ x,
+                           const float* __restrict__ w, float* __restrict__ state, unsigned T,
+                           unsigned conv_dim, unsigned W, unsigned act, unsigned slice,
+                           unsigned nblk) {
+    const unsigned chunk = (conv_dim + nblk - 1) / nblk;
+    const unsigned c0 = slice * chunk;
+    unsigned c1 = c0 + chunk;
+    if (c1 > conv_dim) c1 = conv_dim;
+    if (c0 < c1) kda_conv_range(out, x, w, state, T, conv_dim, W, act, c0, c1);
+}
+
+/* -------------------------------------------------------------------------------------------
+ * op 109 — the same conv over all THREE streams in one packet.
+ *
+ * WHY, given that op 88's own note argues three packets is three times the concurrency: because
+ * at batch 1 that is not what three packets buys. `runtime/tests/kda_fuse_bench_gfx950.c` measures
+ * a packet in this interpreter at ~12 us against a KDA chain whose entire arithmetic is a rounding
+ * error — 414 packets of the six-op chain cost 5.03 ms over 69 layers at TP8, and the cost is
+ * LINEAR in the packet count with a slope of 12.08 us and an intercept of 0.02 ms. Three
+ * independent packets therefore cost three times one packet holding the same work. The
+ * concurrency op 88 was protecting is real and is preserved here; what is deleted is two counter
+ * gates per layer, 138 per token.
+ *
+ * THE MERGE IS ALONG THE OUTPUT AXIS. The block still takes a CONTIGUOUS chunk, now of the 3*C
+ * concatenated channel axis, so per CU the channel count RISES (48 -> 144 at TP1, 6 -> 18 at TP8)
+ * on the same 256 CUs. Nothing that ran in parallel starts running in sequence. That is the
+ * `GemvQkvg` direction; `GLM_GROUP=1`, which collapsed disjoint CU slices into a loop for +2.88 ms,
+ * is the other one.
+ *
+ * A chunk of the 3*C axis crosses at most two stream boundaries, so this is a 3-iteration loop
+ * over intersections, each delegating to op 88's own body. The streams keep
+ * SEPARATE buffers — nothing here assumes q|k|v are contiguous in memory, which they are not:
+ * `GemvQkvg` writes three distinct handles.
+ */
+__device__ void d_kda_conv3(bf16* __restrict__ oq, bf16* __restrict__ ok, bf16* __restrict__ ov,
+                            const bf16* __restrict__ xq, const bf16* __restrict__ xk,
+                            const bf16* __restrict__ xv, const float* __restrict__ wq,
+                            const float* __restrict__ wk, const float* __restrict__ wv,
+                            float* __restrict__ sq, float* __restrict__ sk,
+                            float* __restrict__ sv, unsigned T, unsigned C, unsigned W,
+                            unsigned act, unsigned slice, unsigned nblk) {
+    const unsigned total = 3u * C;
+    const unsigned chunk = (total + nblk - 1) / nblk;
+    const unsigned g0 = slice * chunk;
+    unsigned g1 = g0 + chunk;
+    if (g1 > total) g1 = total;
+    if (g0 >= g1) return;
+    /* ROLLED, not unrolled. `kda_conv_range` is force-inlined and holds 2*PLOW_KDA_WMAX floats of
+     * window and taps, so unrolling puts three copies of that in the function; rolled there is ONE
+     * inline site and the pointer triples become selects. Measured on the K3 decode object it
+     * changes NOTHING — 254 VGPR / occ 2 / 4 spill either way — so this is a code-size choice, not
+     * a register one, and it is written down that way rather than claimed as a win. (The 4 spilled
+     * VGPRs are not this op's: adding EITHER new arm alone produces them, and `noinline` on both
+     * does not remove them. The K3=0 object is unchanged at 0.) */
+#pragma unroll 1
+    for (unsigned s = 0; s < 3u; s++) {
+        const unsigned lo = s * C;
+        const unsigned a = g0 > lo ? g0 - lo : 0u;         /* stream-local start */
+        const unsigned bb = g1 > lo ? g1 - lo : 0u;        /* stream-local end   */
+        const unsigned b = bb > C ? C : bb;
+        if (a >= b) continue;
+        bf16* o = s == 0 ? oq : (s == 1 ? ok : ov);
+        const bf16* x = s == 0 ? xq : (s == 1 ? xk : xv);
+        const float* w = s == 0 ? wq : (s == 1 ? wk : wv);
+        float* st = s == 0 ? sq : (s == 1 ? sk : sv);
+        kda_conv_range(o, x, w, st, T, C, W, act, a, b);
     }
 }
 
@@ -216,10 +293,19 @@ __device__ void d_kda_gate(float* __restrict__ g, float* __restrict__ beta,
 /* PL = D / PLOW_WAVE, the state elements a lane holds, as a COMPILE-TIME bound. It has to be:
  * `sc[]` is indexed in the inner loop, and a runtime-bounded local array lands in scratch, which
  * is exactly the spill this whole tiling exists to avoid. D=128 => PL=2. */
-template <unsigned PL>
+/* GATE folds op 89 in (op 110). It changes only how `l_g[d]` and `b` are OBTAINED — the slice map,
+ * the item map, the LDS layout and every line of the recurrence are shared, which is the point:
+ * there is one body, so the fused and unfused paths cannot drift. `g` was an f32 HBM round trip of
+ * exactly the expression computed inline here, and an f32 store/load is exact, so the two are
+ * BIT-identical rather than merely close. */
+template <unsigned PL, bool GATE>
 __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict__ q,
                                    const bf16* __restrict__ k, const bf16* __restrict__ v,
                                    const float* __restrict__ g, const float* __restrict__ beta,
+                                   const bf16* __restrict__ g_raw,
+                                   const bf16* __restrict__ beta_raw,
+                                   const float* __restrict__ a_log,
+                                   const float* __restrict__ dt_bias, unsigned gate_mode, float lb,
                                    float* __restrict__ state, unsigned T, unsigned H, unsigned D,
                                    unsigned BV, unsigned flags, float scale, unsigned slice,
                                    unsigned nblk, float* __restrict__ lds) {
@@ -238,6 +324,11 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
         const unsigned tile = it % ntile;
         float* st_h = state + (size_t)h * D * D;
 
+        /* dt_bias is [H,D] row-major and A_log is PER HEAD — different ranks, and swapping them is
+         * silent. Hoisted out of the token loop because neither depends on t. */
+        const size_t dtb = (size_t)h * D;
+        const float a_h = GATE ? __expf(a_log[h]) : 0.0f;
+
         for (unsigned t = 0; t < T; t++) {
             const size_t hd = (size_t)t * H * D + (size_t)h * D;
             /* Stage this head's q, k, g once per (item, token) and share across the waves. The L2
@@ -247,7 +338,16 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                 const float qv = bf2f(q[hd + d]), kv = bf2f(k[hd + d]);
                 l_q[d] = qv;
                 l_k[d] = kv;
-                l_g[d] = __expf(g[hd + d]);
+                float gv;
+                if (GATE) {
+                    /* op 89's body, verbatim, evaluated where its only consumer already is. */
+                    const float sgm = bf2f(g_raw[hd + d]) + dt_bias[dtb + d];
+                    gv = (gate_mode == PLOW_KDA_GATE_LOWER_BOUND) ? lb * kda_sigmoid(a_h * sgm)
+                                                                  : -a_h * kda_softplus(sgm);
+                } else {
+                    gv = g[hd + d];
+                }
+                l_g[d] = __expf(gv);
                 qs += qv * qv;
                 ks += kv * kv;
             }
@@ -266,7 +366,10 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
             }
             __syncthreads();
 
-            const float b = beta[(size_t)t * H + h];
+            /* beta is ONE SCALAR PER HEAD, not per channel. Making it per-channel produces finite
+             * plausible output, which is why op 89's note says so twice. */
+            const float b = GATE ? kda_sigmoid(bf2f(beta_raw[(size_t)t * H + h]))
+                                 : beta[(size_t)t * H + h];
             for (unsigned c = 0; c < cols_per_wave; c++) {
                 const unsigned j = tile * BV + wave * cols_per_wave + c; /* value column */
                 float* col = st_h + (size_t)j * D;                       /* V-FIRST: [v][k] */
@@ -304,22 +407,49 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
 /* D is a runtime immediate, so select the compile-time lane depth here. D=128 (K3) is the only
  * shape any KDA checkpoint uses; the other rungs exist so a wrong D refuses loudly instead of
  * running the D=128 template on the wrong stride. */
+#define PLOW_KDA_STEP_RUNGS(GATE_)                                                                \
+    if (D == 128)                                                                                 \
+        d_kda_state_step_t<2, GATE_>(o, q, k, v, g, beta, g_raw, beta_raw, a_log, dt_bias,        \
+                                     gate_mode, lb, state, T, H, D, BV, flags, scale, slice,      \
+                                     nblk, lds);                                                  \
+    else if (D == 64)                                                                             \
+        d_kda_state_step_t<1, GATE_>(o, q, k, v, g, beta, g_raw, beta_raw, a_log, dt_bias,        \
+                                     gate_mode, lb, state, T, H, D, BV, flags, scale, slice,      \
+                                     nblk, lds);                                                  \
+    else if (D == 256)                                                                            \
+        d_kda_state_step_t<4, GATE_>(o, q, k, v, g, beta, g_raw, beta_raw, a_log, dt_bias,        \
+                                     gate_mode, lb, state, T, H, D, BV, flags, scale, slice,      \
+                                     nblk, lds);
+
 __device__ void d_kda_state_step(bf16* __restrict__ o, const bf16* __restrict__ q,
                                  const bf16* __restrict__ k, const bf16* __restrict__ v,
                                  const float* __restrict__ g, const float* __restrict__ beta,
                                  float* __restrict__ state, unsigned T, unsigned H, unsigned D,
                                  unsigned BV, unsigned flags, float scale, unsigned slice,
                                  unsigned nblk, float* __restrict__ lds) {
-    if (D == 128)
-        d_kda_state_step_t<2>(o, q, k, v, g, beta, state, T, H, D, BV, flags, scale, slice, nblk,
-                              lds);
-    else if (D == 64)
-        d_kda_state_step_t<1>(o, q, k, v, g, beta, state, T, H, D, BV, flags, scale, slice, nblk,
-                              lds);
-    else if (D == 256)
-        d_kda_state_step_t<4>(o, q, k, v, g, beta, state, T, H, D, BV, flags, scale, slice, nblk,
-                              lds);
+    const bf16 *g_raw = nullptr, *beta_raw = nullptr;
+    const float *a_log = nullptr, *dt_bias = nullptr;
+    const unsigned gate_mode = 0;
+    const float lb = 0.0f;
+    PLOW_KDA_STEP_RUNGS(false)
 }
+
+/* op 110 — the same recurrence with op 89's gate inlined. Same rungs, same body, same slice map;
+ * `g`/`beta` are absent by construction rather than by a null check, because this op has no slot
+ * that could name them. */
+__device__ void d_kda_state_step_g(bf16* __restrict__ o, const bf16* __restrict__ q,
+                                   const bf16* __restrict__ k, const bf16* __restrict__ v,
+                                   const bf16* __restrict__ g_raw,
+                                   const bf16* __restrict__ beta_raw,
+                                   const float* __restrict__ a_log,
+                                   const float* __restrict__ dt_bias, unsigned gate_mode, float lb,
+                                   float* __restrict__ state, unsigned T, unsigned H, unsigned D,
+                                   unsigned BV, unsigned flags, float scale, unsigned slice,
+                                   unsigned nblk, float* __restrict__ lds) {
+    const float *g = nullptr, *beta = nullptr;
+    PLOW_KDA_STEP_RUNGS(true)
+}
+#undef PLOW_KDA_STEP_RUNGS
 
 /* -------------------------------------------------------------------------------------------
  * op 103 — KDA output gate. y[h,d] = RMSNorm_D(o[h,:])[d] * sigmoid(g_raw[h,d]).

@@ -1877,6 +1877,199 @@ impl Drop for HsaPinned {
     }
 }
 
+/// One staging slab and the signal that says whether its copy has retired.
+struct RingSlot {
+    buf: HsaPinned,
+    sig: HsaSignal,
+    /// Is a copy out of `buf` still in flight? Only a `true` slot may be waited
+    /// on — waiting on a signal no copy will ever decrement hangs forever.
+    busy: bool,
+}
+
+/// Pipelined host→device staging for the weight load: N pinned slabs, N
+/// reusable signals, N copies in flight.
+///
+/// # What this replaces, and why
+///
+/// [`HsaBackend::memcpy_htod_pinned`] is an ASYNCHRONOUS HSA call used
+/// synchronously — it issues `hsa_amd_memory_async_copy` and immediately blocks
+/// on the completion signal — and the loader wrapped it in
+/// `copy_from_slice` → `memcpy_htod_pinned` over ONE slab. So the SDMA engine
+/// idled while the CPU filled the slab, then the CPU idled while SDMA drained
+/// it, and a signal was created and destroyed on every chunk. Measured on a warm
+/// GLM-5.2 rank: 5.2 s of memcpy and 9.5 s of DMA wait, strictly serialised, for
+/// 168.79 GiB across 115 200 chunks.
+///
+/// Here the two overlap: filling slab `k+1` runs against the copy out of slab
+/// `k`, and the signals are created once and re-armed with a store rather than
+/// churned per chunk.
+///
+/// # Why the staging memcpy is still here at all
+///
+/// The obvious next step is to skip it: `hsa_amd_memory_lock` the checkpoint
+/// mmap range and `hsa_amd_memory_async_copy` straight out of page cache, so the
+/// CPU copy leaves the critical path instead of merely being hidden. It was
+/// implemented and measured on a warm TP4 GLM-5.2 load, and it lost twice over:
+///
+/// * **11x slower** — 294.9 s to bind against 26.3 s staged, with the upload
+///   phase going from 7.6 s to 278.6 s. At this granularity (~1.4 MiB per expert
+///   projection) pinning is a kernel page-walk that costs far more than the
+///   60 µs memcpy it replaces. The brief's warning that lock is "itself a kernel
+///   operation" is the whole story.
+/// * **WRONG** — the run decoded `[0, 0, 0, 0]` where every other configuration
+///   decodes `[2, 98546, 24, 12]`. Locking a read-only `MAP_SHARED` file range
+///   returned success and then did not deliver those bytes. Silent corruption,
+///   which is the one failure mode a weight loader must not have.
+///
+/// So it is not here, and this note is why nobody should spend a second
+/// afternoon on it without first fixing the correctness half.
+///
+/// # The correctness rule
+///
+/// A slab may not be refilled until its copy has retired — that is what `busy`
+/// and the wait at the top of [`HsaUploadRing::push`] enforce, and getting it
+/// wrong is silent: the DMA would read bytes belonging to a later chunk and the
+/// weight would be quietly wrong. [`HsaUploadRing::drain`] must be called before
+/// any of the uploaded memory is read, and `Drop` drains as a backstop so an
+/// error path cannot leave a copy running into a freed slab.
+pub struct HsaUploadRing {
+    slots: Vec<RingSlot>,
+    next: usize,
+    agent: HsaAgent,
+    cpu_agent: HsaAgent,
+    shared: Arc<SharedDriver>,
+}
+
+// SAFETY: the slabs are `HsaPinned` (already `Send`), and the signals are opaque
+// HSA handles that the runtime documents as usable from any thread. The ring
+// itself is `!Sync` by having no interior mutability — every method takes
+// `&mut self`.
+unsafe impl Send for HsaUploadRing {}
+
+impl HsaUploadRing {
+    fn new(be: &HsaBackend, slots: usize, bytes: usize) -> Result<HsaUploadRing> {
+        let mut ring = HsaUploadRing {
+            slots: Vec::with_capacity(slots.max(1)),
+            next: 0,
+            agent: be.agent,
+            cpu_agent: be.cpu_agent,
+            shared: Arc::clone(&be.shared),
+        };
+        for _ in 0..slots.max(1) {
+            let buf = be.host_alloc_pinned(bytes)?;
+            let mut sig = HsaSignal { handle: 0 };
+            // Initial value 0, not 1: a fresh slot is NOT busy, and `push`
+            // re-arms to 1 immediately before each copy.
+            let rc =
+                unsafe { (ring.shared.drv.hsa_signal_create)(0, 0, std::ptr::null(), &mut sig) };
+            if rc != HSA_STATUS_SUCCESS {
+                // `ring` drops here and destroys the signals already made.
+                return Err(RuntimeError::Device(format!(
+                    "hsa_signal_create (upload ring): {rc}"
+                )));
+            }
+            ring.slots.push(RingSlot { buf, sig, busy: false });
+        }
+        Ok(ring)
+    }
+
+    /// The staging slab size — the largest `src` a single [`HsaUploadRing::push`]
+    /// accepts, and therefore the chunk the caller must split by.
+    pub fn chunk(&self) -> usize {
+        self.slots[0].buf.len()
+    }
+
+    /// Stage `src` and SUBMIT its copy to `dptr`, returning without waiting.
+    ///
+    /// The bytes are safe the moment this returns because they live in the ring's
+    /// own slab, not in `src`. The copy is not complete, though — nothing may
+    /// read `dptr` until [`HsaUploadRing::drain`].
+    pub fn push(&mut self, dptr: u64, src: &[u8]) -> Result<()> {
+        if src.is_empty() {
+            return Ok(());
+        }
+        let n = self.slots.len();
+        let i = self.next % n;
+        if src.len() > self.slots[i].buf.len() {
+            return Err(RuntimeError::Device(format!(
+                "upload ring: {} B chunk into a {} B slab",
+                src.len(),
+                self.slots[i].buf.len()
+            )));
+        }
+        self.wait_slot(i);
+        let slot = &mut self.slots[i];
+        // Re-arm BEFORE the copy is submitted; the copy decrements to 0.
+        unsafe { (self.shared.drv.hsa_signal_store_screlease)(slot.sig, 1) };
+        slot.buf.as_mut_slice()[..src.len()].copy_from_slice(src);
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_async_copy)(
+                dptr as *mut c_void,
+                self.agent,
+                slot.buf.as_ptr() as *const c_void,
+                self.cpu_agent,
+                src.len(),
+                0,
+                std::ptr::null(),
+                slot.sig,
+            )
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            // Nothing was submitted, so the signal will never be decremented and
+            // the slot must NOT be marked busy — a later `drain` would hang on
+            // it. Drain what really is in flight, then report.
+            unsafe { (self.shared.drv.hsa_signal_store_screlease)(slot.sig, 0) };
+            self.drain()?;
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_memory_async_copy (upload ring): {rc}"
+            )));
+        }
+        self.slots[i].busy = true;
+        self.next += 1;
+        Ok(())
+    }
+
+    fn wait_slot(&mut self, i: usize) {
+        if !self.slots[i].busy {
+            return;
+        }
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                self.slots[i].sig,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_BLOCKED,
+            );
+        }
+        self.slots[i].busy = false;
+    }
+
+    /// Block until every submitted copy has retired.
+    ///
+    /// Mandatory before anything reads the uploaded bytes. A partially uploaded
+    /// weight is silent garbage — there is no fault and no wrong answer until
+    /// the model speaks.
+    pub fn drain(&mut self) -> Result<()> {
+        for i in 0..self.slots.len() {
+            self.wait_slot(i);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HsaUploadRing {
+    fn drop(&mut self) {
+        // A copy still reading a slab we are about to free is a use-after-free
+        // in the SDMA engine, so this drain is not tidiness — it is the reason
+        // an error path can unwind safely.
+        let _ = self.drain();
+        for s in &self.slots {
+            unsafe { (self.shared.drv.hsa_signal_destroy)(s.sig) };
+        }
+    }
+}
+
 /// A handle onto the backend's single ordered AQL queue. See the module note:
 /// this does not create a queue, because there is only ever one to order
 /// against.
@@ -2079,6 +2272,12 @@ impl HsaBackend {
             len: bytes,
             shared: self.shared.clone(),
         })
+    }
+
+    /// A ring of pinned staging slabs with reusable signals, for the weight
+    /// load. See [`HsaUploadRing`].
+    pub fn upload_ring(&self, slots: usize, bytes: usize) -> Result<HsaUploadRing> {
+        HsaUploadRing::new(self, slots, bytes)
     }
 
     /// Blocking host→device copy to a raw device pointer.

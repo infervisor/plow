@@ -128,10 +128,39 @@ __device__ __forceinline__ void xctr_signal(uint32_t* p) {
  *   slice, nblk  : the interpreter's work-share (this workgroup, of nblk)
  *
  * f32 accumulate, round to bf16 — the same reduction math as the CPU rdma.c oracle
- * and the transport tp_reduce_oneshot building block. */
+ * and the transport tp_reduce_oneshot building block.
+ *
+ * ---- THE FOLDED ALL-GATHER TERM (gcols != 0) -------------------------------------
+ *
+ *   gslot_bytes  : byte offset of a SECOND peer slot holding a COLUMN-PARALLEL partial
+ *   gcols        : that partial's per-rank column count (0 disables the whole term)
+ *   row_w        : the full row width of `out`, so a [T, row_w] result can be indexed
+ *
+ * A column-parallel producer leaves rank r owning output columns [r*gcols, (r+1)*gcols)
+ * and needs an ALL-GATHER, not an all-reduce. Kimi-K3's LatentMoE tail has one of each,
+ * added together, and they land in the same result:
+ *
+ *     out = sum_r shd_r            (row-parallel shared-expert down_proj -> slot_bytes)
+ *         + concat_r yh_r          (column-parallel routed_expert_up_proj -> gslot_bytes)
+ *
+ * Folding the gather into this loop is what lets `routed_expert_up_proj` be sharded at
+ * ALL: on its own the gather would need its own packet AND its own cross-rank
+ * rendezvous, and this tree measures an added serial decode packet at ~5.3 us
+ * (op_norm.h's d_norm_residual_norm note) — 92 MoE layers of that is 0.49 ms/token
+ * against the 0.65 ms the sharding saves. Here it is one extra bf16 load per element on
+ * a packet that already reads nranks of them, on the rendezvous that already happened.
+ *
+ * The owner rank and its LOCAL index are derived from the column, not from `e`: at
+ * prefill `out` is [T, row_w] and rank r's slot holds a COMPACT [T, gcols], so row m's
+ * columns live at m*gcols. At decode (T = 1, n = row_w) that degenerates to e/gcols.
+ *
+ * gcols == 0 leaves the loop byte-identical to the pre-existing one, which is what
+ * every non-K3 collective and every tp=1 build takes. */
 __device__ __forceinline__ void d_xreduce(bf16* out, const void* const* peer_scratch,
                                           uint32_t slot_bytes, uint32_t nranks, uint32_t n,
-                                          unsigned slice, unsigned nblk) {
+                                          unsigned slice, unsigned nblk,
+                                          uint32_t gslot_bytes = 0, uint32_t gcols = 0,
+                                          uint32_t row_w = 0) {
     const unsigned base = slice * PLOW_THREADS + threadIdx.x;
     const unsigned step = nblk * PLOW_THREADS;
     for (uint32_t e = base; e < n; e += step) {
@@ -143,6 +172,29 @@ __device__ __forceinline__ void d_xreduce(bf16* out, const void* const* peer_scr
 #else
             acc += bf2f(as_glob(part)[e]);
 #endif
+        }
+        if (gcols) {
+            /* ROUND THE REDUCTION TO BF16 FIRST, and this is not a detail — it is what makes
+             * the fold BIT-EXACT against the two-packet form it replaces.
+             *
+             * Unfolded, K3's tail was: this collective stored `f2bf(sum_r)` to `shd`, and a
+             * separate `d_residual` re-read it and computed `f2bf(yh + bf2f(shd))`. Keeping
+             * `sum_r` in f32 across the gather add would skip that intermediate rounding —
+             * a 1-bf16-ULP difference per element per layer, which is NOT nothing on this
+             * model: 92 MoE layers of it moves the logits by ~0.03 (the same order as the
+             * tp=1-vs-tp=8 residual `k3_tp_equivalence.sh` reports) and greedy decode then
+             * flips a token and diverges. Measured: the un-rounded form answered
+             * ". The capital of X is Y. The capital of ..." where the replicated emit answered
+             * ". The population is approximately 67 million people."
+             *
+             * With the round, `out[e]` is EXACTLY the value the deleted `d_residual` stored,
+             * so the shard is bit-neutral and the token stream is identical. */
+            acc = bf2f(f2bf(acc));
+            const uint32_t c = row_w ? (e % row_w) : e;
+            const uint32_t m = row_w ? (e / row_w) : 0u;
+            const uint32_t owner = c / gcols;
+            const bf16* g = (const bf16*)((const char*)peer_scratch[owner] + gslot_bytes);
+            acc += bf2f(as_glob(g)[m * gcols + (c - owner * gcols)]);
         }
         as_glob(out)[e] = f2bf(acc);
     }
@@ -213,7 +265,8 @@ __device__ __forceinline__ void d_xreduce_oneshot(
 __device__ __forceinline__ void d_xreduce_mega(
     bf16* out, const void* const* peer_scratch, uint32_t nranks, uint32_t rank,
     uint32_t n, uint32_t slot_bytes, size_t xctr_byte_off, uint32_t gate_id,
-    uint64_t deadline_ticks, uint32_t* status, unsigned slice, unsigned nblk) {
+    uint64_t deadline_ticks, uint32_t* status, unsigned slice, unsigned nblk,
+    uint32_t gslot_bytes = 0, uint32_t gcols = 0, uint32_t row_w = 0) {
     __shared__ int bailed;
     if (threadIdx.x == 0) bailed = 0;
     __syncthreads();
@@ -239,7 +292,7 @@ __device__ __forceinline__ void d_xreduce_mega(
      * PLOW_CHAIN_BYPASS (knob-contract §7a-CHAIN): implementation cost zero, ceiling real. */
     if (threadIdx.x == 0) xctr_acquire();
     __syncthreads();
-    d_xreduce(out, peer_scratch, slot_bytes, nranks, n, slice, nblk);
+    d_xreduce(out, peer_scratch, slot_bytes, nranks, n, slice, nblk, gslot_bytes, gcols, row_w);
     return;
 #endif
     if (threadIdx.x == 0) {
@@ -261,7 +314,7 @@ __device__ __forceinline__ void d_xreduce_mega(
     __syncthreads();
     if (bailed) return;
 
-    d_xreduce(out, peer_scratch, slot_bytes, nranks, n, slice, nblk);
+    d_xreduce(out, peer_scratch, slot_bytes, nranks, n, slice, nblk, gslot_bytes, gcols, row_w);
 }
 
 /* ---- XARGMAX_FIN: the cross-rank fold for a VOCAB-COLUMN-PARALLEL lm_head ---------

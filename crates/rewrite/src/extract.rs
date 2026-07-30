@@ -72,6 +72,8 @@ pub(crate) fn is_fused(op: &str) -> bool {
             | "FusedLinearAct"
             | "FusedLinearBiasAct"
             | "FusedEmbeddingScale"
+            | "FusedKdaGatedNorm"
+            | "FusedMlaOutGate"
     )
 }
 

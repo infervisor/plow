@@ -67,7 +67,7 @@ pick () { # <map> <key> <default>
   echo "$3"
 }
 
-echo "input_len,concurrency,ttft_ms,ttft_med,tpot_ms,tpot_med,itl_ms,itl_med,out_tok_s"
+echo "input_len,concurrency,ttft_ms,ttft_med,tpot_ms,tpot_med,itl_ms,itl_med,itl_p99,out_tok_s,ok_reqs,gen_toks"
 for L in $IN_LENS; do for C in $CONCS; do
   NP="$(pick "${NPROMPT_MAP:-}" "$L" "$NPROMPT")"
   NW="$(pick "${NWARM_MAP:-}" "$L" "")"
@@ -90,7 +90,15 @@ def g(pat):
 print(f"{L},{C},{g(r'Mean TTFT .ms.:'):.2f},{g(r'Median TTFT .ms.:'):.2f},"
       f"{g(r'Mean TPOT .ms.:'):.3f},{g(r'Median TPOT .ms.:'):.3f},"
       f"{g(r'Mean ITL .ms.:'):.3f},{g(r'Median ITL .ms.:'):.3f},"
-      f"{g(r'Output token throughput .tok/s.:'):.1f}")
+      # P99 ITL is the tail a stream is judged on, and the metric this arm is
+      # tabled against plow on. `gen_toks` must equal num_prompts x OUTLEN:
+      # `Successful requests` counts a REJECTED request as a success, so a point
+      # whose prompts all exceeded max_model_len still reports a full row (seen
+      # on plow at 131072 against a max_ctx=131072 blob: 99.1 tok/s, ITL 0.00).
+      f"{g(r'P99 ITL .ms.:'):.3f},"
+      f"{g(r'Output token throughput .tok/s.:'):.1f},"
+      f"{g(r'Successful requests:'):.0f},"
+      f"{g(r'Total generated tokens:'):.0f}")
 PY
 done; done
 

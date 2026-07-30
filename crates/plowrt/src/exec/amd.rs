@@ -109,8 +109,10 @@
 //! reference driver with no HTTP layer in the way, and that is exactly when a
 //! low-level vehicle earns its keep.
 
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use packet::dev::{DevInst64, DevOp, DevProgram};
 use packet::devbuild::static_seg_ofs;
@@ -138,16 +140,27 @@ fn kv_tensor_name(name: &str) -> Option<(u32, u32)> {
 /// u32 slots per counter (`PLOW_CTR_STRIDE`), i.e. one 128 B cache line.
 const CTR_STRIDE_U32: usize = 32;
 
+/// `sizeof(PlowTraceRec)` (`runtime/common/dev_isa.h`, static-asserted at 40).
+/// One record per (workgroup, packet), slotted at `stream_ofs[cu] + pc`.
+const TRACE_REC_BYTES: usize = 40;
+
 /// Wave-class 8 is `PLOW_WG_WAVES` = 8 waves of 64.
 const WG_THREADS_8: u32 = 8 * 64;
 /// The flash object is built 4-wave. Dispatching it at 512 threads is an
 /// `INVALID_ISA`, not a slowdown.
 const WG_THREADS_4: u32 = 4 * 64;
 
-/// The largest `seg` id the reference driver's `seg_class[512]` could hold.
-/// Kept as a hard bound so a corrupt stream cannot make the host allocate
-/// unboundedly off a `u16`.
-const MAX_SEG: u32 = 512;
+/// Sanity bound on `seg`, so a corrupt stream cannot make the host allocate
+/// unboundedly. Was 512 — the width of the reference driver's `seg_class[512]`.
+///
+/// Raised to the full `u16` range because `PLOW_SEG_PER_OP` (see
+/// `packet::devbuild::Builder::finish`) emits one segment per op to measure
+/// host-side AQL chaining against the counter protocol, and K3's decode program
+/// alone is 2459 ops. `seg` is a `u16` in `StreamEnt`, so 65536 is the real
+/// representable ceiling and anything under it is arbitrary; the allocations
+/// keyed off `n_seg` are `[n_cu][n_seg+1]` window bounds and `[n_seg]` wave
+/// classes, i.e. bounded and linear.
+const MAX_SEG: u32 = u16::MAX as u32 + 1;
 
 /// Which scheduler a phase runs: the global work queue or static per-CU
 /// streams. Bit-exact to each other — same op kernels, same tiles, same
@@ -231,7 +244,10 @@ impl Variant {
         let mut v = Variant::Bf16;
         for p in progs {
             for i in &p.insts {
-                if i.op == DevOp::FlashDecodeFp8 as u16 {
+                if i.op == DevOp::FlashDecodeFp8 as u16
+                    || i.op == DevOp::FlashMlaDecodeFp8 as u16
+                    || i.op == DevOp::FlashMlaPrefillFp8 as u16
+                {
                     return Variant::Fp8Kv;
                 }
                 if i.op == DevOp::GemvFp8 as u16 {
@@ -262,6 +278,36 @@ pub enum PrefillArm {
     /// needs both, and `scripts/build_gfx950.sh`'s `PLOW_MOE_PREFILL=1` always
     /// turns MLA on with it (there is no moe-without-mla object).
     MlaMoe,
+    /// **Kimi-K3.** The `PLOW_K3` arms — `AttnRes` (104), `SituGlu` (105),
+    /// `MlaOutGate` (106) and the KDA mixer (99-103) — which live in NEITHER of
+    /// the objects above. Supersedes both: `_hs_ax_mla_k3` composes
+    /// `PLOW_MLA_PREFILL` with `PLOW_K3`, because K3's full-attention layers are
+    /// MLA.
+    ///
+    /// It is a SEPARATE AXIS from precision and it has to be, for the reason
+    /// this enum exists at all: without it a K3 blob resolves to
+    /// `interp_prefill_mla_moe.elf`, which was compiled with no `PLOW_K3` and
+    /// therefore has no `case` for any of those five opcodes. This
+    /// interpreter's dispatch `default:` writes NOTHING, so every AttnRes mix,
+    /// every `situ` GLU and the entire KDA recurrence would be skipped in
+    /// silence and the model would produce fluent output from a graph missing
+    /// two thirds of its layers.
+    K3,
+    /// [`PrefillArm::K3`] plus the grouped-MoE prefill chain, at bf16 or
+    /// block-fp8 experts.
+    K3Moe,
+    /// [`PrefillArm::K3Moe`] with **MXFP4** experts, which need the A4W4 body.
+    ///
+    /// A SEPARATE ARM and not a detail of the one above, because the two are
+    /// different objects: ops 85/86 select their MXFP4 body on
+    /// `i[3] == PLOW_MOE_ENC_MXFP4`, and that body is compiled only under
+    /// `PLOW_MOE_PF_A4W4`. Reading the encoding out of the packet is the only
+    /// way to tell them apart — and collapsing them would be wrong in BOTH
+    /// directions: an mxfp4 packet on the plain object takes `moe_pf_refuse`
+    /// (loud, but a dead run), and a bf16-expert packet on the a4w4 object gets
+    /// arms it does not use in an object 140 KB larger. The encoding is a
+    /// packet field, so it is not a guess.
+    K3MoeA4w4,
 }
 
 impl PrefillArm {
@@ -270,6 +316,11 @@ impl PrefillArm {
             PrefillArm::None => "",
             PrefillArm::Mla => "_mla",
             PrefillArm::MlaMoe => "_mla_moe",
+            // `_k3` already implies the MLA prefill arms — see `_hs_ax_mla_k3`
+            // in runtime/CMakeLists.txt — so it does not stack with `_mla`.
+            PrefillArm::K3 => "_k3",
+            PrefillArm::K3Moe => "_k3_moe",
+            PrefillArm::K3MoeA4w4 => "_k3_moe_a4w4",
         }
     }
 
@@ -281,6 +332,8 @@ impl PrefillArm {
     pub fn detect(progs: &[DevProg]) -> PrefillArm {
         let mut mla = false;
         let mut moe = false;
+        let mut a4w4 = false;
+        let mut k3 = false;
         for p in progs {
             for i in &p.insts {
                 let op = i.op;
@@ -296,15 +349,49 @@ impl PrefillArm {
                     || op == DevOp::MoeCombinePf as u16
                 {
                     moe = true;
+                    // The two grouped GEMMs carry the WEIGHT ENCODING in `i[3]`
+                    // (`MoeEnc::PREFILL_SLOT`; `n_exp` is `i[2]` there, so `i[3]`
+                    // was free). `2` is `PLOW_MOE_ENC_MXFP4`, whose body lives
+                    // behind `PLOW_MOE_PF_A4W4` — a different object, not a
+                    // different immediate. The other three ops in the chain do
+                    // not carry it, so only these two are asked.
+                    if (op == DevOp::MoeGroupGluPf as u16
+                        || op == DevOp::MoeGroupDownPf as u16)
+                        && i.i[MOE_PF_ENC_SLOT] == MOE_ENC_MXFP4
+                    {
+                        a4w4 = true;
+                    }
+                } else if op == DevOp::AttnRes as u16
+                    || op == DevOp::SituGlu as u16
+                    || op == DevOp::MlaOutGate as u16
+                    || op == DevOp::KdaStateStep as u16
+                    || op == DevOp::KdaStateStepG as u16
+                    || op == DevOp::KdaConv as u16
+                    || op == DevOp::KdaConv3 as u16
+                    || op == DevOp::KdaGatedNorm as u16
+                {
+                    // Scanned on EVERY program, decode included. K3's block ops
+                    // are in BOTH buckets by construction (an AttnRes present
+                    // only in decode would make the two phases compute
+                    // different models), so a decode-only K3 blob still selects
+                    // the K3 objects — which is what makes `interp_decode_k3`
+                    // reachable at all.
+                    k3 = true;
                 }
             }
         }
-        if moe {
-            PrefillArm::MlaMoe
-        } else if mla {
-            PrefillArm::Mla
-        } else {
-            PrefillArm::None
+        match (k3, moe, a4w4, mla) {
+            (true, true, true, _) => PrefillArm::K3MoeA4w4,
+            (true, true, false, _) => PrefillArm::K3Moe,
+            (true, false, _, _) => PrefillArm::K3,
+            // The non-K3 families do NOT branch on the encoding here, and that is a
+            // known gap rather than a decision: `interp_prefill_mla_moe_a4w4{,_full}`
+            // are built and nothing selects them, so an mxfp4 GLM/Kimi-K2 packet takes
+            // `moe_pf_refuse` today. Loud, so it is not this axis's silent failure —
+            // but it is the same fix, one arm over.
+            (false, true, _, _) => PrefillArm::MlaMoe,
+            (false, false, _, true) => PrefillArm::Mla,
+            _ => PrefillArm::None,
         }
     }
 }
@@ -322,7 +409,20 @@ pub fn object_name(phase: Phase, variant: Variant, arm: PrefillArm, sched: Sched
     };
     // The mla/mla_moe objects are a PREFILL-only build (`interp_prefill_mla{,_moe}{,_gq}.elf`
     // — no decode or flash twin exists), so the axis only applies there.
-    let arm = if phase == Phase::Prefill { arm } else { PrefillArm::None };
+    //
+    // K3 IS THE EXCEPTION, and it is not a special case so much as the axis behaving as it should:
+    // `PLOW_K3` is a MODEL axis, not a prefill-kernel axis, and `interp_decode_k3.elf` does exist.
+    // A K3 decode packet handed the plain `interp_decode.elf` has no `case` for AttnRes, situ, the
+    // output gate or the KDA recurrence, and this interpreter's `default:` writes nothing.
+    let arm = match (phase, arm) {
+        (Phase::Prefill, a) => a,
+        (Phase::Decode, PrefillArm::K3 | PrefillArm::K3Moe | PrefillArm::K3MoeA4w4) => {
+            PrefillArm::K3
+        }
+        // There is no K3 flash object: K3 is NoPE MLA + KDA and emits no `FlashPrefill` at any
+        // head dim, so no packet can reach this phase with a K3 arm.
+        _ => PrefillArm::None,
+    };
     format!(
         "{}{}{}{}.elf",
         phase.object_stem(),
@@ -360,6 +460,19 @@ pub fn symbol_name(phase: Phase, sched: Sched, arch: &str) -> String {
 /// prefill does not run there — [`derive_segments`] marks a segment class 4 only
 /// for `FlashPrefill`/`FlashPrefillFp8` — so a flash object legitimately built
 /// without these arms must not be refused.
+/// The `i[]` slot the grouped MoE prefill ops (85/86) carry their WEIGHT ENCODING in.
+///
+/// Mirrors `devgen::mla::MoeEnc::PREFILL_SLOT`. It is NOT the decode ops' slot — those predate the
+/// field and already use `i[3]` for `n_exp`, so they carry it in `i[6]`. Mirrored rather than
+/// shared because `plowrt` does not depend on `devgen`; the two are pinned together by
+/// `prefill_arm_detect_selects_the_right_variant`, which builds packets with this literal.
+const MOE_PF_ENC_SLOT: usize = 3;
+
+/// `PLOW_MOE_ENC_MXFP4` (`runtime/amd/op_moe.h`) — the encoding whose grouped body is compiled
+/// only under `PLOW_MOE_PF_A4W4`, i.e. the one that selects a different OBJECT rather than a
+/// different branch.
+const MOE_ENC_MXFP4: u32 = 2;
+
 const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // `#if PLOW_MLA_PREFILL` in runtime/amd/interp.hip gates ops 51/55 (via
     // `exec_flash_mla_prefill` -> `d_flash_mla_decode`) AND the latent epilogue
@@ -377,6 +490,15 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
             "d_moe_group_down_pf",
             "d_moe_combine_pf",
         ],
+    ),
+    // `#if PLOW_K3` (runtime/amd/interp.hip) gates ops 99-106 in BOTH buckets — the KDA mixer,
+    // AttnRes, `situ` and the MLA output gate. It is the one arm flag that is not prefill-only,
+    // and the one whose absence is most completely silent: a K3 packet on an object without it
+    // skips every residual mix, every activation and the whole recurrence, and still produces
+    // finite, fluent output.
+    (
+        "PLOW_K3",
+        &["d_attn_res", "d_situ_glu", "d_mla_out_gate", "d_kda_state_step", "d_kda_conv"],
     ),
 ];
 
@@ -581,6 +703,7 @@ const GEMV_BUCKET_OPS: &[DevOp] = &[
     DevOp::GemvFp8Blk,
     DevOp::GemvMxfp4,
     DevOp::GemvGluMxfp4,
+    DevOp::GemvQkvMxfp4,
 ];
 
 /// The widest row count any GEMV-family instruction in `progs` asks for.
@@ -653,15 +776,19 @@ const K3_ARMS_SYM: &str = "plow_k3_arms_1";
 
 /// Every opcode that reaches an arm behind `PLOW_K3` in `runtime/amd/interp.hip`.
 ///
-/// The four KDA mixer ops and the three K3 block-structure ops, and nothing else. This is the
-/// Rust half of the contract whose C half is the `#if PLOW_K3` region around those seven `case`
-/// labels; `k3_arm_ops_match_the_interpreter` reads `interp.hip` and asserts the two agree, so a
-/// future eighth arm added inside the guard cannot go unlisted here.
+/// The KDA mixer ops — four decomposed plus the two FUSED ones the decode emitter actually uses —
+/// and the three K3 block-structure ops, and nothing else. This is the Rust half of the contract
+/// whose C half is the `#if PLOW_K3` region around those nine `case` labels;
+/// `k3_arm_ops_match_the_interpreter` reads `interp.hip` and asserts the two agree, so a future
+/// tenth arm added inside the guard cannot go unlisted here — which is exactly how `KdaConv3` and
+/// `KdaStateStepG` were forced onto this list rather than remembered onto it.
 const K3_ARM_OPS: &[DevOp] = &[
     DevOp::KdaConv,
     DevOp::KdaGate,
     DevOp::KdaStateStep,
     DevOp::KdaGatedNorm,
+    DevOp::KdaConv3,
+    DevOp::KdaStateStepG,
     DevOp::AttnRes,
     DevOp::SituGlu,
     DevOp::MlaOutGate,
@@ -705,6 +832,97 @@ fn check_k3_arms(syms: &[&str], path: &Path, need: Option<DevOp>) -> Result<()> 
          Kimi-K3 block.",
         op as u16,
         path.display()
+    )))
+}
+
+/// The marker `runtime/amd/interp.hip` emits when it was compiled with `PLOW_FP8_KV=1`.
+const FP8_KV_SYM: &str = "plow_fp8_kv_1";
+
+/// Every opcode that reaches an arm behind `#if PLOW_FP8_KV` — the fp8 half of the SWAP.
+const FP8_KV_OPS: &[DevOp] = &[
+    DevOp::HeadNormRopeFp8,
+    DevOp::FlashDecodeFp8,
+    DevOp::FlashPrefillFp8,
+    DevOp::FlashMlaDecodeFp8,
+    DevOp::FlashMlaPrefillFp8,
+];
+
+/// Every opcode that reaches an arm behind the `#else` — the bf16 half of the SWAP.
+///
+/// `HeadNormRope` is deliberately NOT here: it is unconditional in both objects (an fp8-KV
+/// packet still uses it for the QUERY norm, which is not cached). Listing it would refuse every
+/// fp8 packet ever emitted. The gathered MLA ops are not here either — `FlashGatherDecode` /
+/// `FlashGatherPrefill` keep their bf16 arm in BOTH objects, because their `t7` is the `idx`
+/// table and there is no slot left for a dequant scale.
+const BF16_KV_OPS: &[DevOp] = &[
+    DevOp::FlashDecode,
+    DevOp::FlashPrefill,
+    DevOp::FlashMlaDecode,
+    DevOp::FlashMlaPrefill,
+];
+
+/// The first opcode in `progs` that reaches an arm on `side`, or `None`.
+fn required_kv_op(progs: &[DevProg], side: &[DevOp]) -> Option<DevOp> {
+    progs
+        .iter()
+        .flat_map(|p| p.insts.iter())
+        .find_map(|i| side.iter().copied().find(|&o| o as u16 == i.op))
+}
+
+/// Refuse a code object whose KV ENCODING does not match the packet's — in EITHER direction.
+///
+/// WHY BOTH DIRECTIONS, where [`check_k3_arms`] needs only one. `PLOW_K3` is additive: an object
+/// with the arms serves a packet without them perfectly. `PLOW_FP8_KV` is a **swap** —
+/// `interp.hip` compiles `FLASH_DECODE_FP8` / `FLASH_MLA_DECODE_FP8` *instead of* their bf16
+/// twins, deliberately, so the register budget does not carry both. Each object is therefore
+/// missing an arm the other has, and AMD's dispatch `default:` writes NOTHING rather than
+/// trapping.
+///
+/// This is not hypothetical. Running the K3 MLA gate's **bf16** packet against the **fp8**
+/// object reports `all packets executed on every slice: YES` and then scores rel `1.000e+00` at
+/// the attention output — a completely untouched `Opart`, read as a result, with the packet
+/// graph reporting full success. The same shape as the four instances `GFX950_DISPATCHED` was
+/// introduced for, reached through a build axis instead of a missing case label.
+///
+/// The manifest (`crates/devgen/src/manifest.rs`, `fp8_kv -> PLOW_FP8_KV=1`) is the half that
+/// SELECTS the right object. This is the half that refuses a wrong pair that was selected
+/// anyway — a stale `-D` on a shell, a hand-copied `.hsaco`, an object directory shared between
+/// two axes. Checked against `.symtab` rather than against a build flag, for the reason the GEMV
+/// capacity marker states: the object answers for itself.
+///
+/// AN ABSENT MARKER MEANS BF16, and unlike [`K3_ARMS_SYM`] that is a deliberate choice rather
+/// than a tautology: `PLOW_FP8_KV` PREDATES this marker, so an `.hsaco` built with the axis
+/// before this commit advertises nothing and will be refused for an fp8 packet. That is a FALSE
+/// REFUSAL, and it is the right one — the alternative is to treat "no marker" as "might be
+/// either", which is exactly the silence this check exists to remove, and the refusal names the
+/// remedy (rebuild). The commit that added the marker also changed `interp.hip`, so every gfx950
+/// object has to be rebuilt for it anyway; there is no deployment in which a pre-marker object is
+/// still the right object.
+fn check_kv_encoding(
+    syms: &[&str],
+    path: &Path,
+    need_fp8: Option<DevOp>,
+    need_bf16: Option<DevOp>,
+) -> Result<()> {
+    let obj_fp8 = syms.contains(&FP8_KV_SYM);
+    let bad = if obj_fp8 { need_bf16 } else { need_fp8 };
+    let Some(op) = bad else {
+        return Ok(());
+    };
+    Err(RuntimeError::Device(format!(
+        "packet/object KV-ENCODING MISMATCH: this packet dispatches {op:?} (op {}), which is the \
+         {} half of the PLOW_FP8_KV swap, but {} was built {} (it {} `{FP8_KV_SYM}`). The axis is \
+         a SWAP — that object compiles the other half INSTEAD, not as well — and AMD's dispatch \
+         default writes NOTHING rather than trapping, so this op would leave its output untouched \
+         and the run would complete on stale memory (measured: rel 1.000e+00 at the attention \
+         output with every packet reporting success). Serve the blob against the object its \
+         `build.json` `requires` names, or rebuild this object {}.",
+        op as u16,
+        if obj_fp8 { "bf16" } else { "fp8" },
+        path.display(),
+        if obj_fp8 { "WITH -DPLOW_FP8_KV=1" } else { "WITHOUT -DPLOW_FP8_KV=1" },
+        if obj_fp8 { "advertises" } else { "does not advertise" },
+        if obj_fp8 { "without -DPLOW_FP8_KV=1" } else { "with -DPLOW_FP8_KV=1" },
     )))
 }
 
@@ -963,30 +1181,47 @@ fn bind_dense_ffn_tables(
     let mut filled = 0usize;
     for (i, td) in blob.tensors.iter().enumerate() {
         // `mlp.dense_weight_table` -> weights; `mlp.dense_scale_table` -> the
-        // [N/128][K/128] f32 `weight_scale_inv` grids.
-        let (pfx, suffix) = match td
+        // scale twins.
+        //
+        // TWO scale spellings, tried in this order, because the quantisations
+        // that reach this table spell theirs differently and a packet carries
+        // whichever its checkpoint had:
+        //
+        //   `.weight_scale_inv`  block-fp8, an f32 [N/128][K/128] grid (GLM-5.2)
+        //   `.weight_scale`      MX microscaling, one E8M0 byte per 32 elements
+        //
+        // `_inv` is probed FIRST and a block-fp8 packet therefore resolves on the
+        // first candidate, to exactly the name this loop used to build — that is
+        // what makes the GLM path byte-identical rather than merely equivalent.
+        // A packet with neither is still a hard error naming both.
+        let (pfx, suffixes): (&str, &[&str]) = match td
             .name
             .strip_suffix("dense_weight_table")
-            .map(|p| (p, ".weight"))
+            .map(|p| (p, &[".weight"][..]))
             .or_else(|| {
                 td.name
                     .strip_suffix("dense_scale_table")
-                    .map(|p| (p, ".weight_scale_inv"))
+                    .map(|p| (p, &[".weight_scale_inv", ".weight_scale"][..]))
             }) {
             Some(v) => v,
             None => continue,
         };
         let mut addrs = [0u64; 3];
         for (j, proj) in PROJ.iter().enumerate() {
-            let want = format!("{pfx}{proj}{suffix}");
-            let k = names.iter().position(|n| *n == want).ok_or_else(|| {
-                RuntimeError::Device(format!(
-                    "dense-FFN prefill table `{}` needs `{want}`, which the packet does not \
-                     declare. The table and the three projections are emitted together by \
-                     declare_glm_rows; a packet with one and not the other is malformed.",
-                    td.name
-                ))
-            })?;
+            let cands: Vec<String> =
+                suffixes.iter().map(|s| format!("{pfx}{proj}{s}")).collect();
+            let (want, k) = cands
+                .iter()
+                .find_map(|w| names.iter().position(|n| n == w).map(|k| (w, k)))
+                .ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "dense-FFN prefill table `{}` needs one of {cands:?}, none of which \
+                         the packet declares. The table and the three projections are emitted \
+                         together by declare_glm_rows; a packet with one and not the other is \
+                         malformed.",
+                        td.name
+                    ))
+                })?;
             // A zero base would be read by the kernel as the EP "not my expert"
             // sentinel and the tile would be silently skipped, so an unbound
             // weight must fail here rather than produce a layer that computes
@@ -1030,19 +1265,383 @@ fn bind_dense_ffn_tables(
 /// which layout to build, so a packet emitted `--ep` cannot be bound as if it
 /// were TP. It matters that this is not a host-side flag: the mismatch has no
 /// symptom other than wrong tokens.
+///
+/// The same instruction is found by OPCODE, not by the name of the tensor it
+/// writes — see the note at `GLU_ARMS`.
+///
+/// # The expert NAME is read off the checkpoint, for the same reason
+///
+/// Three checkpoints reach this function and none of them spells an expert the
+/// way the other two do (see [`ExpertNames`]). [`resolve_expert_names`] probes
+/// for the one that is there and [`check_expert_geometry`] then makes the
+/// weight and its scale agree with each other, so a checkpoint whose scale is
+/// the wrong SIZE fails by name rather than by producing wrong numbers of the
+/// right length.
 #[allow(clippy::too_many_arguments)]
+/// Where the weight-load wall clock actually goes.
+///
+/// There was NO load timing in this engine: it logged GiB and a tensor count and
+/// never a second, so every claim about load cost came from a runbook rather
+/// than from the runtime. The phases below are the four that can each be the
+/// whole cost depending on the machine and the page-cache state, and which one
+/// dominates decides which optimisation is worth anything:
+///
+/// * `fault` — first touch of the checkpoint mmap. Zero on a warm cache;
+///   NVMe-bound on a genuinely cold one, in which case nothing else matters.
+/// * `gather` — [`crate::asset::shard::slice_for`]. Free (a borrow) for a
+///   replicated or column shard, a full row-by-row copy for a row shard.
+/// * `memcpy` — page cache → pinned staging slab, on one core.
+/// * `dma` — `hsa_amd_memory_async_copy` submit + signal wait.
+///
+/// `Cell`, not atomics: one rank's load is one thread, and the counters are
+/// touched once per 64 MiB chunk, so this must not appear in any profile.
+#[derive(Default)]
+struct LoadProf {
+    fault_ns: Cell<u64>,
+    gather_ns: Cell<u64>,
+    memcpy_ns: Cell<u64>,
+    dma_ns: Cell<u64>,
+    alloc_ns: Cell<u64>,
+    memset_ns: Cell<u64>,
+    /// Chunks pushed through the staging slab — the signal round-trip count.
+    chunks: Cell<u64>,
+}
+
+impl LoadProf {
+    fn add(c: &Cell<u64>, t: Instant) {
+        c.set(c.get() + t.elapsed().as_nanos() as u64);
+    }
+
+    /// One `Instant::now()` reused as both "stop A" and "start B".
+    fn split(c: &Cell<u64>, t: Instant) -> Instant {
+        let now = Instant::now();
+        c.set(c.get() + now.duration_since(t).as_nanos() as u64);
+        now
+    }
+
+    fn ms(c: &Cell<u64>) -> f64 {
+        c.get() as f64 / 1e6
+    }
+
+    fn report(&self, what: &str, wall: std::time::Duration, bytes: u64) {
+        let gib = bytes as f64 / (1u64 << 30) as f64;
+        let s = wall.as_secs_f64();
+        tracing::info!(
+            phase = what,
+            wall_s = format!("{s:.2}").as_str(),
+            gib = format!("{gib:.2}").as_str(),
+            gib_s = format!("{:.2}", if s > 0.0 { gib / s } else { 0.0 }).as_str(),
+            fault_ms = format!("{:.0}", Self::ms(&self.fault_ns)).as_str(),
+            gather_ms = format!("{:.0}", Self::ms(&self.gather_ns)).as_str(),
+            memcpy_ms = format!("{:.0}", Self::ms(&self.memcpy_ns)).as_str(),
+            dma_ms = format!("{:.0}", Self::ms(&self.dma_ns)).as_str(),
+            alloc_ms = format!("{:.0}", Self::ms(&self.alloc_ns)).as_str(),
+            memset_ms = format!("{:.0}", Self::ms(&self.memset_ns)).as_str(),
+            chunks = self.chunks.get(),
+            "LOAD PHASES"
+        );
+    }
+}
+
+/// Is the mmap-fault phase being measured separately?
+///
+/// A page fault on an mmap'd checkpoint is charged to whoever touches the page
+/// FIRST, and here that is the `copy_from_slice` into the staging slab — so on a
+/// cold cache `memcpy` silently contains all of the NVMe time and the breakdown
+/// says nothing. Reading one byte per page first moves that cost onto its own
+/// counter. It is off by default because it is a second pass over the source
+/// (cheap when warm, but not free) and this is the load path, not a benchmark.
+fn profile_faults() -> bool {
+    std::env::var("PLOW_LOAD_PROFILE").ok().as_deref() == Some("1")
+}
+
+/// Touch one byte of every page so the fault cost lands on `fault_ns` rather
+/// than hiding inside the staging memcpy. Returns without reading anything the
+/// caller can observe; `read_volatile` is what stops LLVM deleting it.
+///
+/// Must be handed the bytes the rank will ACTUALLY read ([`touched`]), never the
+/// whole tensor. A column-parallel rank binds a contiguous 1/tp slice, so
+/// prefaulting the whole thing pulls four times the bytes off the drive and the
+/// profile then describes a load nobody runs — a mistake this made once, and one
+/// that flattered nothing: it inflated the very phase it was there to measure.
+fn prefault(src: &[u8], prof: &LoadProf) {
+    let t = Instant::now();
+    let mut acc = 0u8;
+    let mut i = 0usize;
+    while i < src.len() {
+        // SAFETY: `i < src.len()`, and a `u8` read is always aligned.
+        acc ^= unsafe { std::ptr::read_volatile(src.as_ptr().add(i)) };
+        i += 4096;
+    }
+    std::hint::black_box(acc);
+    LoadProf::add(&prof.fault_ns, t);
+}
+
+/// How many tensors ahead of the copy the prefetch pool runs. `0` disables it.
+///
+/// Sized in TENSORS because that is the unit the loops walk; an expert
+/// projection here is ~1.4 MiB, so the default leaves a few hundred MiB of reads
+/// outstanding — past the knee of the scaling table in
+/// [`crate::asset::checkpoint::Checkpoint::populate`], and small enough that the
+/// lookahead cannot evict what it just read.
+fn prefetch_depth() -> usize {
+    std::env::var("PLOW_PREFETCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256)
+}
+
+/// Prefetch threads per rank. The measured knee is ~16; below it the drive runs
+/// at latency rather than bandwidth.
+fn prefetch_threads() -> usize {
+    std::env::var("PLOW_PREFETCH_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16)
+}
+
+/// The bytes rank `rank` will actually TOUCH for `name`, as a queueable span.
+///
+/// Not the whole tensor: a column-parallel rank binds one contiguous 1/tp range
+/// and faulting all of it in would read four times what that rank needs. The
+/// range comes from [`crate::asset::shard::slice_for`] itself — the same
+/// function that will do the real bind — so it cannot drift from the real read.
+///
+/// The one case that must NOT go through `slice_for` is a row-parallel gather:
+/// it returns `Cow::Owned`, and doing the gather twice would cost more than the
+/// prefetch saves. A row gather is strided over every row, so the bytes it
+/// touches ARE the whole tensor, which is what this returns for it.
+fn touched<'a>(
+    ckpt: &'a crate::asset::checkpoint::Checkpoint,
+    name: &str,
+    want: u64,
+    rank: u32,
+    n_gpu: u32,
+) -> Option<&'a [u8]> {
+    let (src, shape) = ckpt.tensor_ex(name)?;
+    let strided = n_gpu > 1
+        && shape.len() == 2
+        && crate::asset::shard::shard_of(name) == crate::asset::shard::Shard::Row;
+    if strided {
+        return Some(src);
+    }
+    match crate::asset::shard::slice_for(name, src, shape, want, rank, n_gpu) {
+        Ok(std::borrow::Cow::Borrowed(s)) => Some(s),
+        // An `Owned` here would mean the row guard above missed a case; the
+        // gather has already happened, so fall back to the whole tensor rather
+        // than pretend the range is known.
+        _ => Some(src),
+    }
+}
+
+/// [`touched`], resolved into a span the prefetch pool can carry to a thread.
+fn weight_span(
+    ckpt: &crate::asset::checkpoint::Checkpoint,
+    name: &str,
+    want: u64,
+    rank: u32,
+    n_gpu: u32,
+) -> Option<crate::asset::checkpoint::Span> {
+    let (src, _) = ckpt.tensor_ex(name)?;
+    let span = touched(ckpt, name, want, rank, n_gpu)?;
+    let off = span.as_ptr() as usize - src.as_ptr() as usize;
+    ckpt.span(name, off, span.len())
+}
+
+/// How ONE routed expert is spelled in the checkpoint on disk.
+///
+/// Three spellings reach this loader and they disagree on all four axes:
+///
+/// | checkpoint | sub-namespace | projections | payload | scale |
+/// |---|---|---|---|---|
+/// | GLM-5.2 / DeepSeek block-fp8 | `…mlp.` | `gate_proj`/`up_proj`/`down_proj` | `.weight` | `.weight_scale_inv` |
+/// | Kimi-K2.7-Code MXFP4 | `…mlp.` | the same three | `.weight` | `.weight_scale` |
+/// | Kimi-K3 (compressed-tensors mxfp4) | `…block_sparse_moe.` | `w1`/`w3`/`w2` | `.weight_packed` | `.weight_scale` |
+///
+/// The middle row is the reason this is RESOLVED and not switched on a flag: a
+/// K2.7 checkpoint is the standard projection names with an E8M0 scale, so
+/// "mxfp4" and "Mixtral-spelled" are independent facts and no single boolean
+/// carries both. A flag that disagrees with the bytes is the failure this file
+/// keeps finding; the bytes are the only thing that cannot disagree with itself.
+///
+/// `proj` is in `expert_weight_table` slot order — gate, up, down — which is why
+/// the Mixtral row reads `w1`/`w3`/`w2` and not `w1`/`w2`/`w3`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpertNames {
+    /// Everything up to and including `experts.`; an expert index follows.
+    ns: String,
+    /// gate, up, down.
+    proj: [&'static str; 3],
+    /// `.weight` or `.weight_packed`.
+    payload: &'static str,
+    /// `.weight_scale_inv` (block-fp8 f32 grid) or `.weight_scale` (E8M0 row).
+    scale: &'static str,
+}
+
+impl ExpertNames {
+    fn weight_of(&self, e: u32, j: usize) -> String {
+        format!("{}{e}.{}{}", self.ns, self.proj[j], self.payload)
+    }
+
+    fn scale_of(&self, e: u32, j: usize) -> String {
+        format!("{}{e}.{}{}", self.ns, self.proj[j], self.scale)
+    }
+
+    /// Is the scale an MX microscaling row (one E8M0 byte per 32 elements along
+    /// K) rather than a block-fp8 `[N/128][K/128]` f32 grid?
+    fn microscaled(&self) -> bool {
+        self.scale == ".weight_scale"
+    }
+}
+
+/// Which spelling THIS checkpoint uses, decided by probing it.
+///
+/// `pfx` is what is left of the packet's `…expert_weight_table` after the suffix
+/// is stripped, and it is not always a checkpoint prefix: the GLM emitter
+/// declares the table under the model prefix (`model.layers.{l}.mlp.`), the K3
+/// emitter under its own `moe.` namespace (`moe.language_model.model.layers.{l}.`)
+/// because `packet::names` classifies compiler-owned tensors by that prefix. So
+/// `moe.` is stripped and the MoE sub-namespace is probed rather than assumed.
+///
+/// ORDER IS THE COMPATIBILITY GUARANTEE. The first candidate is `{pfx}experts.0.
+/// gate_proj.weight` + `.weight_scale_inv` — character for character the two
+/// names this function replaced hardcoded — so a block-fp8 packet resolves on
+/// probe one and every name built downstream is the name it was built before.
+fn resolve_expert_names(
+    ckpt: &crate::asset::checkpoint::Checkpoint,
+    pfx: &str,
+) -> Result<ExpertNames> {
+    const TEMPLATES: [([&str; 3], &str); 2] = [
+        (["gate_proj", "up_proj", "down_proj"], ".weight"),
+        (["w1", "w3", "w2"], ".weight_packed"),
+    ];
+    const SCALES: [&str; 2] = [".weight_scale_inv", ".weight_scale"];
+    let base = pfx.strip_prefix("moe.").unwrap_or(pfx);
+    let mut tried: Vec<String> = Vec::new();
+    for sub in ["", "mlp.", "block_sparse_moe."] {
+        for (proj, payload) in TEMPLATES {
+            let ns = format!("{base}{sub}experts.");
+            let probe = format!("{ns}0.{}{payload}", proj[0]);
+            if ckpt.tensor_ex(&probe).is_none() {
+                tried.push(probe);
+                continue;
+            }
+            // The payload is there, so this IS the layout — a missing scale is
+            // now a broken checkpoint and not a wrong guess, and saying so beats
+            // falling through to a spelling that cannot be right.
+            for scale in SCALES {
+                if ckpt.tensor_ex(&format!("{ns}0.{}{scale}", proj[0])).is_some() {
+                    return Ok(ExpertNames { ns, proj, payload, scale });
+                }
+            }
+            return Err(RuntimeError::Device(format!(
+                "MISSING EXPERT SCALE: `{probe}` is in the checkpoint but neither \
+                 `{ns}0.{}{}` nor `{ns}0.{}{}` is. A quantized expert without its scale \
+                 cannot be dequantized, and binding the payload alone would decode from \
+                 4-bit or 8-bit mantissas read as if they were already scaled.",
+                proj[0], SCALES[0], proj[0], SCALES[1]
+            )));
+        }
+    }
+    Err(RuntimeError::Device(format!(
+        "MISSING EXPERT WEIGHT: the packet declares `{pfx}expert_weight_table` but the \
+         checkpoint has no routed experts under any spelling this loader knows. Probed: \
+         {tried:?}"
+    )))
+}
+
+/// Fail unless expert 0's three scale twins are the right SIZE for the weights
+/// they scale.
+///
+/// Every expert in a layer is the same shape, and `slice_for` re-checks each one
+/// against the stride derived here — so this is the only place the WEIGHT and its
+/// SCALE are compared to each other at all. Getting it wrong is silent in the
+/// worst way: an E8M0 row and a block-fp8 grid can be the same number of bytes
+/// for some geometries, so a size that merely "looks plausible" is exactly the
+/// thing that must not be accepted.
+fn check_expert_geometry(
+    ckpt: &crate::asset::checkpoint::Checkpoint,
+    n: &ExpertNames,
+) -> Result<()> {
+    let miss = |name: &str| {
+        RuntimeError::Device(format!(
+            "MISSING EXPERT WEIGHT: {name} (expert 0 resolved to the `{}` + `{}` layout \
+             under `{}`, so every projection must be present in it)",
+            n.payload, n.scale, n.ns
+        ))
+    };
+    for j in 0..3 {
+        let (wn, sn) = (n.weight_of(0, j), n.scale_of(0, j));
+        let (w, ws) = ckpt.tensor_ex(&wn).ok_or_else(|| miss(&wn))?;
+        let (s, ss) = ckpt.tensor_ex(&sn).ok_or_else(|| miss(&sn))?;
+        let bad = |m: String| {
+            Err(RuntimeError::Device(format!(
+                "EXPERT SCALE GEOMETRY: `{sn}` {ss:?} ({} B) cannot be the scale of `{wn}` \
+                 {ws:?} ({} B): {m}",
+                s.len(),
+                w.len()
+            )))
+        };
+        if ws.len() != 2 || ss.len() != 2 {
+            return bad("both must be 2-D — a routed expert is a matrix and its scale is \
+                        a grid or a per-group row, never a vector"
+                .into());
+        }
+        let (wn0, wn1, sn0, sn1) = (ws[0], ws[1], ss[0], ss[1]);
+        if n.microscaled() {
+            // MX: payload is [N, K/2] (two fp4 per byte), scale is [N, K/32]
+            // (one E8M0 byte per group of 32 along K). Both are u8, so the byte
+            // count IS the element count.
+            if w.len() != wn0 * wn1 || s.len() != sn0 * sn1 {
+                return bad("an mxfp4 payload and its E8M0 scale are both u8, so each \
+                            must be exactly the product of its shape"
+                    .into());
+            }
+            if sn0 != wn0 {
+                return bad(format!("the output dim disagrees: {wn0} vs {sn0}"));
+            }
+            if wn1 * 2 != sn1 * 32 {
+                return bad(format!(
+                    "K disagrees: the payload packs {} elements per row, the scale covers {}",
+                    wn1 * 2,
+                    sn1 * 32
+                ));
+            }
+        } else {
+            // Block-fp8: payload is [N, K] e4m3 (1 B/element), scale is
+            // [ceil(N/128), ceil(K/128)] f32. Verified against
+            // zai-org/GLM-5.2-FP8: [2048, 6144] -> [16, 48].
+            const B: usize = 128;
+            if w.len() != wn0 * wn1 {
+                return bad("an fp8 e4m3 payload is 1 B/element, so it must be exactly \
+                            the product of its shape"
+                    .into());
+            }
+            let (gn, gk) = (wn0.div_ceil(B), wn1.div_ceil(B));
+            if (sn0, sn1) != (gn, gk) || s.len() != gn * gk * 4 {
+                return bad(format!(
+                    "a block-fp8 scale grid must be [{gn}, {gk}] f32 ({} B)",
+                    gn * gk * 4
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn bind_packed_experts(
     be: &HsaBackend,
     blob: &DevBlob,
     ckpt: &crate::asset::checkpoint::Checkpoint,
     devp: &[DeviceMem],
     names: &[String],
-    stage: &mut HsaPinned,
-    stage_bytes: usize,
+    ring: &mut crate::device::hsa::HsaUploadRing,
     rank: u32,
     n_gpu: u32,
+    prof: &LoadProf,
+    do_prefault: bool,
+    prefetch: Option<&crate::asset::checkpoint::Prefetcher>,
 ) -> Result<(Vec<DeviceMem>, u64)> {
-    const PROJ: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
     let layers: Vec<(usize, String)> = blob
         .tensors
         .iter()
@@ -1059,32 +1658,42 @@ fn bind_packed_experts(
     let t0 = std::time::Instant::now();
     // `I_moe` is not inferred: it is read off the very instruction that will
     // stream these weights. Every gate/up arm — per-slot bf16, per-slot
-    // block-fp8, and the grouped fp8 collapse — writes `act.fu`, reads the
-    // layer's `expert_weight_table` from `t[3]`, and carries `I_moe` in `i[1]`
-    // (`crates/devgen/src/mla.rs`). Matching on `t[0] == act.fu` is what
-    // separates it from the `down` arm, which shares `t[3]` and writes
-    // `act.part`.
-    let t_fu = names
-        .iter()
-        .position(|x| x == "act.fu")
-        .ok_or_else(|| {
-            RuntimeError::Device(
-                "packet declares expert tables but no `act.fu` — nothing says how \
-                 wide an expert this rank must bind"
-                    .into(),
-            )
-        })? as u16;
+    // block-fp8, and the grouped fp8 collapse — reads the layer's
+    // `expert_weight_table` from `t[3]` and carries `I_moe` in `i[1]`
+    // (`crates/packet/src/slots.rs`).
+    //
+    // The `down` arm shares `t[3]` and carries H there instead, so the two must
+    // be told apart. This USED to key on `t[0] == act.fu`, the tensor the gate/up
+    // arm writes — which worked only because every emitter before Kimi-K3 named
+    // that tensor exactly `act.fu`. K3's does not: its MoE activations are
+    // per-layer (`act.l1.moe.fu`), so the name lookup failed outright and no K3
+    // packet could bind an expert. The OPCODE is what actually distinguishes the
+    // two arms, it is the same fact devgen encoded when it chose the op, and it
+    // cannot be renamed. On every pre-K3 packet this selects the identical
+    // instruction: the ops below are exactly the ones that write `act.fu`.
+    const GLU_ARMS: [DevOp; 3] = [
+        DevOp::MoeExpertGlu,
+        DevOp::MoeExpertGluFp8Blk,
+        DevOp::MoeGroupGluFp8Blk,
+    ];
     let dec = blob.progs.last().expect("checked non-empty");
     let i_moe_of = |i_ewt: usize| -> Option<u64> {
         dec.insts
             .iter()
-            .find(|d| d.t[3] as usize == i_ewt && d.t[0] == t_fu)
+            .find(|d| {
+                d.t[3] as usize == i_ewt && GLU_ARMS.iter().any(|&o| o as u16 == d.op)
+            })
             .map(|d| d.i[1] as u64)
     };
 
     let mut bufs = Vec::with_capacity(layers.len() * 2);
     let mut i_moe = 0u64;
+    // Which spelling the checkpoint turned out to have, for the one log line
+    // that says so. A load that binds the wrong layout is silent by nature, so
+    // the resolved answer belongs in the record rather than in a debug session.
+    let mut layout = String::from("none");
     let mut wbytes = 0u64;
+    let depth = prefetch_depth();
     for (i_ewt, pfx) in &layers {
         let i_est = names
             .iter()
@@ -1108,11 +1717,20 @@ fn bind_packed_experts(
                  streams experts through it — nothing to pack against"
             ))
         })?;
+        // WHICH SPELLING, from the checkpoint, before anything is sized against
+        // it — then the weight/scale size agreement, once, for expert 0.
+        let en = resolve_expert_names(ckpt, pfx)?;
+        check_expert_geometry(ckpt, &en)?;
+        layout = format!("{}{{gate,up,down}}{}+{}", en.ns, en.payload, en.scale);
         // Geometry from expert 0; every expert in a layer is the same shape.
-        let probe = format!("{pfx}experts.0.gate_proj.weight");
+        let probe = en.weight_of(0, 0);
         let (w0, shape0) = ckpt.tensor_ex(&probe).ok_or_else(|| {
             RuntimeError::Device(format!("MISSING EXPERT WEIGHT: {probe}"))
         })?;
+        // `I_moe` is the gate projection's OUTPUT dim under every spelling —
+        // `[I_moe, K]` for `gate_proj.weight`, `[I_moe, latent/2]` for a packed
+        // `w1.weight_packed`. The packing halves K, never N, so this comparison
+        // against the packet's declared `I_moe` is unaffected by it.
         let i_moe_full = *shape0.first().unwrap_or(&0) as u64;
         let (owned, whole) = if i_moe == i_moe_full {
             // EP: this rank owns a contiguous block of WHOLE experts.
@@ -1137,7 +1755,7 @@ fn bind_packed_experts(
         let n_local = owned.len() as u64;
         // Slot strides: what ONE {expert, proj} occupies in the packed buffer.
         let w_stride = w0.len() as u64 / if whole { 1 } else { n_gpu as u64 };
-        let s_probe = format!("{pfx}experts.0.gate_proj.weight_scale_inv");
+        let s_probe = en.scale_of(0, 0);
         let s_stride = ckpt
             .tensor_ex(&s_probe)
             .ok_or_else(|| RuntimeError::Device(format!("MISSING EXPERT SCALE: {s_probe}")))?
@@ -1145,8 +1763,10 @@ fn bind_packed_experts(
             .len() as u64
             / if whole { 1 } else { n_gpu as u64 };
 
+        let t_alloc = Instant::now();
         let d_w = EngineDevice::alloc(be, (n_local * 3 * w_stride).max(1))?;
         let d_s = EngineDevice::alloc(be, (n_local * 3 * s_stride).max(1))?;
+        LoadProf::add(&prof.alloc_ns, t_alloc);
         let wtab = crate::orch::moe::packed_expert_table(
             d_w.base, w_stride, n_exp, owned.clone(),
         );
@@ -1154,60 +1774,83 @@ fn bind_packed_experts(
             d_s.base, s_stride, n_exp, owned.clone(),
         );
 
+        // The layer's reads, IN ORDER, before any of them happens.
+        //
+        // The loop used to build each name at the point of use, which is fine
+        // until you want to tell the kernel what is coming next: readahead has
+        // to be issued for tensor i+K while tensor i is still being copied, and
+        // that is not expressible over a name the loop has not formatted yet.
+        // Materialising the order costs ~3 k `String`s per layer — the same ones
+        // the old loop allocated, just a little earlier.
+        let (shard_rank, shard_n) = if whole { (0, 1) } else { (rank, n_gpu) };
+        let mut plan: Vec<(String, u64, u64)> = Vec::with_capacity(owned.len() * 6);
         for e in owned {
-            for (j, proj) in PROJ.iter().enumerate() {
+            for j in 0..3 {
                 let idx = e as usize * 3 + j;
-                for (name, dst, want) in [
-                    (format!("{pfx}experts.{e}.{proj}.weight"), wtab[idx], w_stride),
-                    (
-                        format!("{pfx}experts.{e}.{proj}.weight_scale_inv"),
-                        stab[idx],
-                        s_stride,
-                    ),
-                ] {
-                    let (src, shape) = ckpt.tensor_ex(&name).ok_or_else(|| {
-                        RuntimeError::Device(format!("MISSING EXPERT WEIGHT: {name}"))
-                    })?;
-                    // `tp = 1` is the EP/single-GPU case: bind the expert whole.
-                    // Otherwise the classifier sees `gate_proj.weight` /
-                    // `up_proj.weight` (contiguous output-row slice) and
-                    // `down_proj.weight` (strided input-column gather), and the
-                    // `_scale_inv` grids ride the same substring tests onto the
-                    // same axis — which is exactly the C reference's hand-rolled
-                    // `j < 2 ? offset : gather_row` split.
-                    let slice = crate::asset::shard::slice_for(
-                        &name,
-                        src,
-                        shape,
-                        want,
-                        if whole { 0 } else { rank },
-                        if whole { 1 } else { n_gpu },
-                    )?;
-                    // Through the PINNED slab, always. `memcpy_htod_pinned`
-                    // blocks and does not pin its source, so handing it a
-                    // `slice_for` gather buffer (an ordinary `Vec`) faults the
-                    // SDMA engine — the one trap the C reference calls out by
-                    // name.
-                    for (o, chunk) in slice.chunks(stage_bytes).enumerate() {
-                        stage.as_mut_slice()[..chunk.len()].copy_from_slice(chunk);
-                        be.memcpy_htod_pinned(
-                            dst + (o * stage_bytes) as u64,
-                            &stage.as_slice()[..chunk.len()],
-                        )?;
-                    }
-                    wbytes += want;
+                plan.push((en.weight_of(e, j), wtab[idx], w_stride));
+                plan.push((en.scale_of(e, j), stab[idx], s_stride));
+            }
+        }
+        let queue = |i: usize| {
+            if let (Some(pf), Some((n, _, w))) = (prefetch, plan.get(i)) {
+                if let Some(s) = weight_span(ckpt, n, *w, shard_rank, shard_n) {
+                    pf.push(s);
                 }
             }
+        };
+        for i in 0..depth.min(plan.len()) {
+            queue(i);
+        }
+        for (i, (name, dst, want)) in plan.iter().enumerate() {
+            queue(i + depth);
+            let (src, shape) = ckpt.tensor_ex(name).ok_or_else(|| {
+                RuntimeError::Device(format!("MISSING EXPERT WEIGHT: {name}"))
+            })?;
+            // `tp = 1` is the EP/single-GPU case: bind the expert whole.
+            // Otherwise the classifier sees the gate/up projection
+            // (`gate_proj.weight` or `.w1.weight`: a contiguous output-row
+            // slice) and the down projection (`down_proj.weight` or
+            // `.w2.weight`: a strided input-column gather), and BOTH scale
+            // spellings ride the same substring tests onto the same axis —
+            // which is exactly the C reference's hand-rolled
+            // `j < 2 ? offset : gather_row` split.
+            if do_prefault {
+                if let Some(s) = touched(ckpt, name, *want, shard_rank, shard_n) {
+                    prefault(s, prof);
+                }
+            }
+            let t = Instant::now();
+            let slice = crate::asset::shard::slice_for(
+                name, src, shape, *want, shard_rank, shard_n,
+            )?;
+            LoadProf::add(&prof.gather_ns, t);
+            // Through a PINNED slab, always. The copy does not pin its
+            // source, so handing it a `slice_for` gather buffer (an
+            // ordinary `Vec`) faults the SDMA engine — the one trap the
+            // C reference calls out by name.
+            let stage_bytes = ring.chunk();
+            for (o, chunk) in slice.chunks(stage_bytes).enumerate() {
+                let t = Instant::now();
+                ring.push(dst + (o * stage_bytes) as u64, chunk)?;
+                LoadProf::add(&prof.memcpy_ns, t);
+                prof.chunks.set(prof.chunks.get() + 1);
+            }
+            wbytes += want;
         }
         EngineDevice::upload(be, &devp[*i_ewt], 0, as_bytes(&wtab))?;
         EngineDevice::upload(be, &devp[i_est], 0, as_bytes(&stab))?;
         bufs.push(d_w);
         bufs.push(d_s);
     }
+    // No expert is bound until its copy has retired. The pointer tables above
+    // are uploaded through the blocking path and name a DIFFERENT address, so
+    // they are ordered by construction; the expert bytes are not.
+    ring.drain()?;
     tracing::info!(
         layers = layers.len(),
         gib = format!("{:.2}", wbytes as f64 / (1u64 << 30) as f64).as_str(),
         i_moe,
+        layout = layout.as_str(),
         secs = format!("{:.1}", t0.elapsed().as_secs_f64()).as_str(),
         "routed experts packed; expert pointer tables filled"
     );
@@ -1222,6 +1865,118 @@ fn bind_packed_experts(
 /// bytes than the whole stream and, more importantly, ONE h2d submission
 /// instead of `n_kvrow` of them. Submission overhead, not bytes, is what costs
 /// here.
+/// May this compiler-owned tensor skip the load-time zeroing?
+///
+/// The skip is a PERFORMANCE optimisation with a precondition, not a property
+/// of the `kv.` namespace: it is sound only where every element is WRITTEN
+/// BEFORE IT IS READ. An append-only KV cache satisfies that — attention reads
+/// only `[0, kvlen)` and each row is written on the step that admits it — which
+/// is why skipping it saves 11.5 GiB of memset on GLM and changes nothing.
+///
+/// Kimi-K3 put two things under `kv.` that do NOT satisfy it, and both were
+/// silently inheriting the skip:
+///
+/// * the KDA RECURRENT STATE (`kv.{l}.state`, `kv.{l}.conv_state.*`). The
+///   recurrence is `state = state * decay(gate) + beta * (v - state·k) ⊗ k`, so
+///   it READS `state` on the very first token of the very first sequence. From
+///   uninitialised HBM that is garbage folded into an accumulator over up to
+///   10^6 rank-1 updates, and it never washes out.
+/// * the ATTNRES SNAPSHOT RING (`kv.blkres`), which AttnRes mixes over from the
+///   first layer that has a snapshot.
+///
+/// Neither faults and neither reports a missing weight. They are `kv.`-named
+/// because `packet::names::is_checkpoint_weight` classifies by EXCLUSION, so
+/// the prefix is what stops the loader demanding them of the checkpoint — it
+/// was never a claim about their write-before-read discipline.
+fn kv_skips_zeroing(name: &str) -> bool {
+    name.starts_with("kv.") && !is_carried_state(name)
+}
+
+/// Kimi-K3's AttnRes score weight, folded from the TWO tensors the checkpoint
+/// actually ships. `None` when `name` is not one of them.
+///
+/// `runtime/amd/op_k3.h` states the relation as the reference implementation:
+///
+/// ```text
+/// score_weight = norm.weight.float() * proj.weight.squeeze(0).float()
+/// scores       = (k * score_weight).sum(-1)
+/// ```
+///
+/// so the emitter declares ONE f32 `[hidden]` per site while
+/// `models--moonshotai--Kimi-K3` ships two bf16 tensors — `*_res_norm.weight`
+/// `[7168]` and `*_res_proj.weight` `[1, 7168]` — 93 of each, at both the
+/// attention and the MLP site. Without this fold every one of those 186 handles
+/// resolves to MISSING WEIGHT and no real-weight K3 run can start.
+///
+/// The fold is exact, not an approximation, and it is worth saying why it is
+/// ALLOWED to be a plain elementwise product. The score is
+/// `proj · rmsnorm(x, norm)`, and RMS normalisation scales the whole row by the
+/// single scalar `1/rms(x)`. A scalar commutes out of the dot product, so
+/// `proj · (x/rms · norm) == (proj ⊙ norm) · (x/rms)` — the gain can be folded
+/// into the projection ahead of time and the kernel divides by the RMS itself.
+/// If the norm were anything per-element-nonlinear this would not hold.
+///
+/// f32 because the fold is a PRODUCT OF TWO bf16 VALUES: keeping the result in
+/// bf16 would round away most of what the multiply just computed, and the packet
+/// declares f32 for that reason. There is no TP axis here — `[hidden]` is
+/// replicated on every rank — so this runs identically at any `--num-gpus`.
+fn fold_res_score(
+    c: &crate::asset::checkpoint::Checkpoint,
+    name: &str,
+) -> Option<Result<Vec<u8>>> {
+    let stem = name.strip_suffix("_res_score.weight")?;
+    let bf16 = |n: &str| -> Option<Vec<f32>> {
+        let (raw, _) = c.tensor_ex(n)?;
+        Some(
+            raw.chunks_exact(2)
+                .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16))
+                .collect(),
+        )
+    };
+    let (nn, pn) = (format!("{stem}_res_norm.weight"), format!("{stem}_res_proj.weight"));
+    let (Some(g), Some(p)) = (bf16(&nn), bf16(&pn)) else {
+        // Name matched the pattern but the sources are absent: report the pair
+        // rather than the derived name, which is in no checkpoint by design.
+        return Some(Err(RuntimeError::Device(format!(
+            "MISSING WEIGHT: {name} is DERIVED and needs both `{nn}` and `{pn}`; \
+             at least one is not in the checkpoint"
+        ))));
+    };
+    if g.len() != p.len() {
+        return Some(Err(RuntimeError::Device(format!(
+            "{name}: norm is {} wide and proj is {} — they must agree",
+            g.len(),
+            p.len()
+        ))));
+    }
+    let mut out = Vec::with_capacity(g.len() * 4);
+    for (a, b) in g.iter().zip(&p) {
+        out.extend_from_slice(&(a * b).to_le_bytes());
+    }
+    Some(Ok(out))
+}
+
+/// A `kv.`-namespace tensor that CARRIES STATE ACROSS TOKENS rather than being
+/// appended to — the KDA recurrent state, its three conv windows, and the AttnRes
+/// snapshot ring.
+///
+/// Two callers, and separating them was the bug. [`kv_skips_zeroing`] asks whether
+/// LOAD may skip the memset; [`AmdEngine::begin_slot`] asks what a NEW SEQUENCE
+/// must clear. Those are the same set for the same reason — these tensors are read
+/// before they are written — but they were not the same code, and only the first
+/// existed. So the state was correctly zeroed once at model load and then never
+/// again: request 2 inherited request 1's recurrence and conv windows, and a
+/// linear-attention model conditioned on the previous conversation. Nothing faults
+/// and nothing reports a missing weight; the second answer is merely wrong, in a
+/// way that reads as fluent.
+///
+/// Substring, not suffix: `conv_state.q`/`.k`/`.v` are three tensors under one
+/// idea, and a future `kv.{l}.state.v` must not slip through a match written
+/// against today's exact spellings.
+fn is_carried_state(name: &str) -> bool {
+    name.starts_with("kv.") && (name.contains("state") || name.contains("blkres"))
+}
+
 pub fn kvrow_span(kvrow: &[u32]) -> Option<(usize, usize)> {
     let lo = *kvrow.iter().min()? as usize;
     let hi = *kvrow.iter().max()? as usize;
@@ -1304,7 +2059,7 @@ fn kv_write_row_field(op: u16, dst: Option<&String>) -> Option<usize> {
 /// silently wrong, and a positional bug is invisible to anything but a test that
 /// inspects the fields.
 ///
-/// THREE patch families, every one found BY IDENTITY rather than by position:
+/// FOUR patch families, every one found BY IDENTITY rather than by position:
 ///
 /// * a **KV-write site** ([`kv_write_row_field`]) → its row field = `c0`. This
 ///   covers dense GQA's k/v norm (`i[3]`), MLA's k_rope (`i[3]`) and MLA's latent
@@ -1318,6 +2073,34 @@ fn kv_write_row_field(op: u16, dst: Option<&String>) -> Option<usize> {
 ///   row index. The two tests are a UNION, and on Gemma they agree site for site.
 /// * `FlashPrefill`/`FlashPrefillFp8` → `i[4] = c0` (q_pos0) and
 ///   `i[1] = c0 + clen` (n_kv, everything written so far, not just this chunk).
+/// * every **KDA op** ([`KDA_ROW_COUNT_OPS`]) → `i[0] = clen`, the REAL row count.
+///
+/// # Why KDA needs a row count where attention needs only a bound
+///
+/// The flash family above leaves its row count alone and bounds the KV *reads* at
+/// `c0 + clen`: a padded row computes a garbage output that nothing ever reads,
+/// because the lm_head samples row `clen - 1`. That convention is safe for
+/// attention precisely because attention is STATELESS across the token axis —
+/// each row's output depends only on rows behind it, so a junk row poisons only
+/// itself.
+///
+/// KDA is not. Both of its arms CARRY STATE FORWARD along `t`, and the loop bound
+/// is the baked `T`:
+///
+/// * `op_kda.h` conv — `for (t = 0; t < T; t++)` rolls the window left and shifts
+///   `x[t]` into the newest tap. A zero pad row is not ignored; it is CONVOLVED,
+///   and it evicts a real tap from a `W`-wide window. After `T - clen` pad rows a
+///   `W = 4` window holds nothing but zeros.
+/// * `op_kda.h` recurrence — the same `for (t = 0; t < T; t++)`, and each step
+///   applies the decay `exp(a_log[h])` to the carried state. Pad rows contribute
+///   no `k^T v` outer product, but they DO decay: the state handed to decode has
+///   been multiplied by an extra `exp(a_log)^(T - clen)`.
+///
+/// So the state left after a chunk belongs to the padded BUCKET WIDTH rather than
+/// to the prompt. Nothing reads the pad rows' outputs, but the next chunk and the
+/// whole decode phase read the STATE, and it is wrong for every prompt that is not
+/// exactly a bucket multiple — i.e. almost all of them. Setting `i[0] = clen` is
+/// what makes a K3 prefill stop at the last real token.
 ///
 /// `FlashMlaPrefill`/`FlashGatherPrefill` are deliberately NOT here. Their query
 /// base is not an immediate: `d_flash_mla_decode` (the body both prefill wrappers
@@ -1334,6 +2117,23 @@ fn kv_write_row_field(op: u16, dst: Option<&String>) -> Option<usize> {
 /// a packet.) Note the two are INDEPENDENT axes: an fp8-*weight* packet keeps a
 /// bf16 KV and emits plain `FlashPrefill`, so this must key on the OPCODE and
 /// never on a precision flag.
+/// Every KDA opcode whose `i[0]` is the token-row count `T`.
+///
+/// All six, not just the two that carry state. The conv and the recurrence are the
+/// ones a pad row CORRUPTS, but `KdaGate` feeds the recurrence and `KdaGatedNorm`
+/// consumes its output, and leaving those two at the bucket width would have them
+/// read rows the shortened arms never wrote. Uniform `clen` keeps one row count
+/// across the whole mixer, which is also the only version of this that can be
+/// stated in one sentence.
+const KDA_ROW_COUNT_OPS: &[DevOp] = &[
+    DevOp::KdaConv,
+    DevOp::KdaConv3,
+    DevOp::KdaGate,
+    DevOp::KdaStateStep,
+    DevOp::KdaStateStepG,
+    DevOp::KdaGatedNorm,
+];
+
 fn rebase_chunk(insts: &mut [DevInst64], names: &[String], c0: u32, clen: u32) {
     for d in insts.iter_mut() {
         let op = d.op;
@@ -1347,6 +2147,8 @@ fn rebase_chunk(insts: &mut [DevInst64], names: &[String], c0: u32, clen: u32) {
         } else if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
             d.i[4] = c0;
             d.i[1] = c0 + clen;
+        } else if KDA_ROW_COUNT_OPS.iter().any(|&k| op == k as u16) {
+            d.i[0] = clen;
         }
     }
 }
@@ -1452,6 +2254,16 @@ pub struct AmdEngine {
     /// `expert_weight_table`/`expert_scale_table` — but they are owning handles,
     /// so dropping them would free the memory those tables point at.
     _expert_bufs: Vec<DeviceMem>,
+
+    /// Per-(workgroup, packet) `PlowTraceRec` buffer for the DECODE program,
+    /// allocated only when `PLOW_TRACE_RAW` is set. The interpreter treats a
+    /// null `trace` pointer as "tracing off" and then does not even read the
+    /// clock, so an untraced build pays nothing for this field being here.
+    ///
+    /// Decode only: it is the packet chain the protocol cost lives on, and a
+    /// prefill program's stream is an order of magnitude larger.
+    d_trace: Option<DeviceMem>,
+    trace_bytes: usize,
 
     k_prefill: HsaKernel,
     k_decode: HsaKernel,
@@ -1564,7 +2376,7 @@ impl AmdEngine {
         hsaco_dir: &Path,
         checkpoint: Option<&Path>,
     ) -> Result<Self> {
-        Self::load_rank(be, blob_path, hsaco_dir, checkpoint, None)
+        Self::load_rank(be, blob_path, hsaco_dir, checkpoint, None, None)
     }
 
     /// Bring up the VMM-backed KV pool, or `None` to keep the flat allocation.
@@ -1691,7 +2503,9 @@ impl AmdEngine {
         hsaco_dir: &Path,
         checkpoint: Option<&Path>,
         tp: Option<TpBind>,
+        shared_ckpt: Option<Arc<crate::asset::checkpoint::Checkpoint>>,
     ) -> Result<Self> {
+        let t_rank = Instant::now();
         let raw = std::fs::read(blob_path).map_err(|e| {
             RuntimeError::Device(format!("read {}: {e}", blob_path.display()))
         })?;
@@ -1829,6 +2643,13 @@ impl AmdEngine {
         // asked about the phase it actually serves rather than about the blob as a whole.
         let need_k3_decode = required_k3_op(&blob.progs[dec_ix..]);
         let need_k3_prefill = required_k3_op(&blob.progs[..dec_ix]);
+        // The KV-encoding SWAP, split per phase for the same reason: the decode object carries
+        // FLASH_*_DECODE and the prefill object FLASH_*_PREFILL, so asking each about the blob as
+        // a whole would refuse a decode object for a prefill opcode it never runs.
+        let need_fp8kv_decode = required_kv_op(&blob.progs[dec_ix..], FP8_KV_OPS);
+        let need_fp8kv_prefill = required_kv_op(&blob.progs[..dec_ix], FP8_KV_OPS);
+        let need_bf16kv_decode = required_kv_op(&blob.progs[dec_ix..], BF16_KV_OPS);
+        let need_bf16kv_prefill = required_kv_op(&blob.progs[..dec_ix], BF16_KV_OPS);
 
         // --- code objects ---------------------------------------------------
         // Resolve the symbol immediately after each load: the HSA backend
@@ -1857,12 +2678,23 @@ impl AmdEngine {
                         match prefill_arm {
                             PrefillArm::MlaMoe => "MLA+MoE prefill",
                             PrefillArm::Mla => "MLA prefill",
+                            PrefillArm::K3 => "Kimi-K3 block",
+                            PrefillArm::K3Moe => "Kimi-K3 block + grouped MoE prefill",
+                            PrefillArm::K3MoeA4w4 => "Kimi-K3 block + grouped A4W4 MoE prefill",
                             PrefillArm::None => unreachable!(),
                         },
                         hsaco_dir.display(),
                         match prefill_arm {
                             PrefillArm::MlaMoe => "PLOW_MOE_PREFILL=1",
                             PrefillArm::Mla => "PLOW_MLA_PREFILL=1",
+                            PrefillArm::K3 => "PLOW_K3=1 PLOW_MLA_PREFILL=1",
+                            PrefillArm::K3Moe => {
+                                "PLOW_K3=1 PLOW_MLA_PREFILL=1 PLOW_MOE_PREFILL=1"
+                            }
+                            PrefillArm::K3MoeA4w4 => {
+                                "PLOW_K3=1 PLOW_MLA_PREFILL=1 PLOW_MOE_PREFILL=1 \
+                                 PLOW_MOE_PF_A4W4=1 PLOW_MXFP4=1"
+                            }
                             PrefillArm::None => unreachable!(),
                         },
                     ))
@@ -1890,6 +2722,13 @@ impl AmdEngine {
                 Phase::Prefill | Phase::Flash => need_k3_prefill,
             };
             check_k3_arms(&syms, &path, need_k3)?;
+            // Whether this object's KV ENCODING matches the packet's. Both directions — the axis
+            // is a swap, so each object is missing an arm the other has.
+            let (need_fp8, need_bf16) = match phase {
+                Phase::Decode => (need_fp8kv_decode, need_bf16kv_decode),
+                Phase::Prefill | Phase::Flash => (need_fp8kv_prefill, need_bf16kv_prefill),
+            };
+            check_kv_encoding(&syms, &path, need_fp8, need_bf16)?;
             let m = EngineDevice::module_load(&*be, &image).map_err(|e| {
                 RuntimeError::Device(format!(
                     "{name}: {e} — a BUNDLED object gives exactly this; was it \
@@ -1950,9 +2789,15 @@ impl AmdEngine {
         // call — asking the kernel to lock tens of GiB of page-cache mappings.
         // Copying through a fixed pinned buffer keeps the locked set at 64 MiB.
         const STAGE: usize = 64 << 20;
-        let ckpt = match checkpoint {
-            Some(dir) => Some(crate::asset::checkpoint::Checkpoint::open(dir)?),
-            None => None,
+        // `Arc`, because the prefetch pool madvises these mappings from other
+        // threads and must be joined before they can be unmapped. Under TP the
+        // caller passes ONE checkpoint for the whole group — see `shared_ckpt`.
+        let ckpt = match (shared_ckpt, checkpoint) {
+            (Some(c), _) => Some(c),
+            (None, Some(dir)) => {
+                Some(Arc::new(crate::asset::checkpoint::Checkpoint::open(dir)?))
+            }
+            (None, None) => None,
         };
         // The fp8 weight TWINS live in their own checkpoint, not the bf16 one:
         // they are a separate quantisation artifact, and the packet names them
@@ -1963,7 +2808,15 @@ impl AmdEngine {
             Ok(d) => Some(crate::asset::checkpoint::Checkpoint::open(Path::new(&d))?),
             Err(_) => None,
         };
-        let mut stage = EngineDevice::host_alloc_pinned(&*be, STAGE)?;
+        // `PLOW_UPLOAD_SLOTS=1` is the pre-pipeline shape exactly: one slab, one
+        // copy, waited on before the next memcpy starts. Kept so the pipelining
+        // can be A/B'd on one binary rather than argued about.
+        let slots = std::env::var("PLOW_UPLOAD_SLOTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4usize)
+            .max(1);
+        let mut ring = be.upload_ring(slots, STAGE)?;
         // v7 blobs carry the RoPE tables as RECIPES, not bytes. Materialising
         // them is not optional: a reader that skips this leaves cos=sin=0 and
         // serves fluent-looking garbage with no error anywhere.
@@ -1974,6 +2827,44 @@ impl AmdEngine {
         // tensor gets an allocation or a view onto the pool's VA reservation.
         let vmm = Self::vmm_bringup(&be, &blob, checkpoint);
 
+        let prof = LoadProf::default();
+        let do_prefault = profile_faults();
+        let depth = prefetch_depth();
+        let prefetch = ckpt.as_ref().and_then(|c| {
+            crate::asset::checkpoint::Prefetcher::start(
+                Arc::clone(c),
+                prefetch_threads(),
+                depth,
+            )
+        });
+        // The pool runs `depth` WEIGHT tensors ahead of the copy, over the same
+        // list in the same order, so `pf` only ever moves forward and each
+        // tensor is queued exactly once. Skipping the non-weights keeps the
+        // depth denominated in reads rather than in table entries — most of this
+        // blob's tensors are scratch that touches no checkpoint at all.
+        let mut pf = 0usize;
+        let prefetch_ahead = |cur: &mut usize, budget: usize| {
+            let (Some(pool), Some(c)) = (prefetch.as_ref(), ckpt.as_ref()) else { return };
+            let mut n = 0;
+            while *cur < blob.tensors.len() && n < budget {
+                let td = &blob.tensors[*cur];
+                *cur += 1;
+                // `fp8/` weights live in the twin checkpoint, which is not the
+                // one the pool holds, and they are a rounding error next to the
+                // experts — so they are simply not prefetched.
+                if !packet::names::is_checkpoint_weight(&td.name)
+                    || td.name.starts_with("fp8/")
+                {
+                    continue;
+                }
+                if let Some(s) = weight_span(c, &td.name, td.bytes, rank, n_gpu) {
+                    pool.push(s);
+                }
+                n += 1;
+            }
+        };
+        prefetch_ahead(&mut pf, depth);
+        let t_tensors = Instant::now();
         let mut devp = Vec::with_capacity(blob.tensors.len());
         let mut names = Vec::with_capacity(blob.tensors.len());
         let (mut wbytes, mut nweights) = (0u64, 0usize);
@@ -1990,6 +2881,9 @@ impl AmdEngine {
             let peer_slot = match (tp, td.name.as_str()) {
                 (Some(t), "act.og_tp") => Some(t.scratch_base),
                 (Some(t), "act.dg_tp") => Some(t.scratch_base + t.slot_b),
+                // Slot 2, the GATHER slot: a column-parallel partial the reduce out of
+                // slot 0 folds in (`PARTIAL_SLOTS`). Only K3's LatentMoE declares it.
+                (Some(t), "act.ug_tp") => Some(t.scratch_base + 2 * t.slot_b),
                 _ => None,
             };
             if let Some(base) = peer_slot {
@@ -2011,15 +2905,25 @@ impl AmdEngine {
             });
             let mem = match vmm_va {
                 Some(va) => DeviceMem::view(va, td.bytes.max(1)),
-                None => EngineDevice::alloc(&*be, td.bytes.max(1))?,
+                None => {
+                    let t = Instant::now();
+                    let m = EngineDevice::alloc(&*be, td.bytes.max(1))?;
+                    LoadProf::add(&prof.alloc_ns, t);
+                    m
+                }
             };
-            let mut push = |src: &[u8]| -> Result<()> {
+            let prof = &prof;
+            let push = |ring: &mut crate::device::hsa::HsaUploadRing,
+                            src: &[u8]|
+             -> Result<()> {
                 for (o, chunk) in src.chunks(STAGE).enumerate() {
-                    stage.as_mut_slice()[..chunk.len()].copy_from_slice(chunk);
-                    be.memcpy_htod_pinned(
-                        mem.base + (o * STAGE) as u64,
-                        &stage.as_slice()[..chunk.len()],
-                    )?;
+                    let t = Instant::now();
+                    ring.push(mem.base + (o * STAGE) as u64, chunk)?;
+                    // Staging memcpy and DMA wait are no longer separable: the
+                    // point of the ring is that they overlap. One `stage_ns`
+                    // counter is the honest shape; `dma_ns` stays zero.
+                    LoadProf::add(&prof.memcpy_ns, t);
+                    prof.chunks.set(prof.chunks.get() + 1);
                 }
                 Ok(())
             };
@@ -2042,11 +2946,35 @@ impl AmdEngine {
             // decodes from zeroed weights without a word.
             let is_weight = packet::names::is_checkpoint_weight(&td.name);
             if is_weight {
+                prefetch_ahead(&mut pf, 1);
                 // `fp8/` routes to the twin checkpoint with the prefix
                 // stripped; everything else to the base one.
                 let is_fp8 = td.name.starts_with("fp8/");
-                let src_ckpt = if is_fp8 { fp8_ckpt.as_ref() } else { ckpt.as_ref() };
-                if let Some(c) = src_ckpt {
+                let src_ckpt =
+                    if is_fp8 { fp8_ckpt.as_ref() } else { ckpt.as_deref() };
+                // KIMI-K3's ATTNRES SCORE WEIGHT IS DERIVED, NOT STORED. Resolved
+                // before the ordinary lookup, which would otherwise report MISSING
+                // WEIGHT for 186 tensors on a 93-layer model.
+                //
+                // NOT a `continue`: the loop tail pushes `devp`/`names` for EVERY
+                // tensor, and skipping it would shift every later tensor's index
+                // against the table the packet was compiled with.
+                let folded = match src_ckpt {
+                    Some(c) => fold_res_score(c, &td.name).transpose()?,
+                    None => None,
+                };
+                if let Some(folded) = folded {
+                    if folded.len() as u64 != td.bytes {
+                        return Err(RuntimeError::Device(format!(
+                            "{}: folded score weight is {} B, blob declares {}",
+                            td.name,
+                            folded.len(),
+                            td.bytes
+                        )));
+                    }
+                    push(&mut ring, &folded)?;
+                    wbytes += td.bytes;
+                } else if let Some(c) = src_ckpt {
                     // BOTH spellings, because the twin checkpoints disagree
                     // with each other. `/home/lava/models/g31b-fp8w` KEEPS the
                     // `fp8/` prefix in its tensor names; the C reference strips
@@ -2071,10 +2999,17 @@ impl AmdEngine {
                     // is the rank's shard — classified by the CHECKPOINT name
                     // (`stripped`), so an fp8 twin shards exactly like its bf16
                     // counterpart instead of falling through as replicated.
+                    if do_prefault {
+                        if let Some(s) = touched(c, stripped, td.bytes, rank, n_gpu) {
+                            prefault(s, &prof);
+                        }
+                    }
+                    let t = Instant::now();
                     let slice = crate::asset::shard::slice_for(
                         stripped, src, shape, td.bytes, rank, n_gpu,
                     )?;
-                    push(&slice)?;
+                    LoadProf::add(&prof.gather_ns, t);
+                    push(&mut ring, &slice)?;
                     wbytes += td.bytes;
                     nweights += 1;
                 } else if td.name.starts_with("fp8/") {
@@ -2084,7 +3019,7 @@ impl AmdEngine {
                     )));
                 }
             } else if let Some(r) = &td.init {
-                push(&blob.init[r.clone()])?;
+                push(&mut ring, &blob.init[r.clone()])?;
             } else if let Some(g) = gen_by_tensor.get(&(i as u32)) {
                 let data = g.generate().ok_or_else(|| {
                     RuntimeError::Device(format!(
@@ -2100,8 +3035,8 @@ impl AmdEngine {
                         td.bytes
                     )));
                 }
-                push(&data)?;
-            } else if vmm_va.is_none() && !td.name.starts_with("kv.") {
+                push(&mut ring, &data)?;
+            } else if vmm_va.is_none() && !kv_skips_zeroing(&td.name) {
                 // A VMM window is (mostly) UNMAPPED VA — a memset would fault,
                 // not merely waste time. The `kv.` clause below is the older
                 // and independent reason to skip.
@@ -2111,21 +3046,32 @@ impl AmdEngine {
                 // 11.5 GiB of memset skipped on this model. Other scratch stays
                 // zeroed: cheap, and conservative where the argument is less
                 // obviously airtight.
+                let t = Instant::now();
                 EngineDevice::memset_d8(&*be, mem.base, 0, td.bytes as usize)?;
+                LoadProf::add(&prof.memset_ns, t);
             }
             devp.push(mem);
             names.push(td.name.clone());
         }
+        // EVERY named tensor is bound only once its copy has retired. The ring
+        // leaves copies in flight by design, so this is the line that makes
+        // "uploaded" mean uploaded.
+        ring.drain()?;
         // The MoE half of the bind, and it has to be here: it needs the tensor
-        // table (to find each layer's two pointer slots) and the pinned stage
+        // table (to find each layer's two pointer slots) and the staging ring
         // (which must outlive it — the C reference records that gathering a
         // row-parallel slice into a MALLOC'd buffer faults the SDMA engine,
-        // because the blocking copy does not pin its source).
+        // because the copy does not pin its source).
+        prof.report("named tensors", t_tensors.elapsed(), wbytes);
         let mut expert_bufs = Vec::new();
         if let Some(c) = ckpt.as_ref() {
+            let eprof = LoadProf::default();
+            let t_exp = Instant::now();
             let (bufs, bytes) = bind_packed_experts(
-                &be, &blob, c, &devp, &names, &mut stage, STAGE, rank, n_gpu,
+                &be, &blob, c, &devp, &names, &mut ring, rank, n_gpu, &eprof,
+                do_prefault, prefetch.as_ref(),
             )?;
+            eprof.report("packed experts", t_exp.elapsed(), bytes);
             expert_bufs = bufs;
             wbytes += bytes;
         }
@@ -2139,11 +3085,16 @@ impl AmdEngine {
                 "dense-FFN prefill pointer tables bound (grouped-arm 1-expert path)"
             );
         }
-        drop(stage);
+        drop(ring);
         if ckpt.is_some() {
+            let s = t_rank.elapsed().as_secs_f64();
+            let gib = wbytes as f64 / (1u64 << 30) as f64;
             tracing::info!(
-                gib = format!("{:.2}", wbytes as f64 / (1u64 << 30) as f64).as_str(),
+                rank,
+                gib = format!("{gib:.2}").as_str(),
                 tensors = nweights,
+                secs = format!("{s:.1}").as_str(),
+                gib_s = format!("{:.2}", if s > 0.0 { gib / s } else { 0.0 }).as_str(),
                 "checkpoint weights uploaded"
             );
         } else {
@@ -2239,6 +3190,18 @@ impl AmdEngine {
             });
         }
         let decode = progs.len() - 1;
+        // Packet trace (`PLOW_TRACE_RAW=<path>`). Zeroed once at allocation so
+        // an entry the run never reaches reads as a zero record rather than as
+        // whatever the allocator handed back; every executed slot is rewritten
+        // each step, so the buffer always holds the LAST step's timeline.
+        let (d_trace, trace_bytes) = if std::env::var_os("PLOW_TRACE_RAW").is_some() {
+            let bytes = blob.progs[decode].stream.len() * TRACE_REC_BYTES;
+            let m = EngineDevice::alloc(&*be, bytes.max(1) as u64)?;
+            EngineDevice::upload(&*be, &m, 0, &vec![0u8; bytes])?;
+            (Some(m), bytes)
+        } else {
+            (None, 0)
+        };
         // `in.kvlen` is [batch] i32. Cross-check against the decode program's
         // compiled `t`, which is `PLOW_DECODE_BATCH`: they must agree, and a
         // mismatch means the blob was assembled from parts.
@@ -2284,6 +3247,34 @@ impl AmdEngine {
 
         let mut kv_slot_stride: Vec<(usize, u64)> = Vec::new();
         if batch > 1 {
+            // A KDA recurrent state is compiler-owned per-sequence state, so it
+            // lives under `kv.` like the KV cache — but it is NOT shaped
+            // `[batch][...]`. It is one `[heads, head_dim, head_dim]` f32 block
+            // read-modify-written in place, with no token axis and no batch
+            // axis (`devgen::kda::declare_kda_state`). Dividing its bytes by
+            // `batch` below would hand slot 1 a pointer 1/batch of the way into
+            // slot 0's state: no fault, no missing weight, just every sequence
+            // corrupting every other one's recurrence.
+            //
+            // Sharing a recurrent state across slots needs a paged-state
+            // indirection (a slot table plus a pool), which does not exist —
+            // `docs/kimi-k3-kda.md` §"cache shape" spells out why block-level
+            // sharing at arbitrary offsets is impossible for KDA. Until it does,
+            // refuse: batch-1 K3 is correct and batched K3 is not expressible.
+            if let Some(t) = blob
+                .tensors
+                .iter()
+                .find(|t| t.name.starts_with("kv.") && t.name.contains("state"))
+            {
+                return Err(RuntimeError::Device(format!(
+                    "PLOW_DECODE_BATCH = {batch} with a recurrent-state tensor `{}` in the packet. \
+                     KDA state has no batch axis, so the per-slot stride below would alias every \
+                     sequence's state onto every other's. Batched decode over a recurrent state \
+                     needs a paged-state indirection (slot table + pool) that does not exist yet; \
+                     emit with batch 1, or add it first.",
+                    t.name
+                )));
+            }
             kv_slot_stride = blob
                 .tensors
                 .iter()
@@ -2370,6 +3361,8 @@ impl AmdEngine {
             d_tens,
             tensor_names: names,
             _expert_bufs: expert_bufs,
+            d_trace,
+            trace_bytes,
             k_prefill,
             k_decode,
             k_flash,
@@ -2498,6 +3491,28 @@ impl AmdEngine {
         EngineDevice::upload(&*self.be, &self.devp[i], 0, src)
     }
 
+    /// Dump the decode program's `PlowTraceRec[n_stream]` to `path`.
+    ///
+    /// A no-op unless `PLOW_TRACE_RAW` was set when the engine was built — the
+    /// buffer is not allocated otherwise. The records are the LAST launch's, so
+    /// call this after a steady-state step, never after the warmup.
+    ///
+    /// The file is the raw device buffer: `n_stream` 40-byte records, slot
+    /// `stream_ofs[cu] + pc`, each carrying `(cu, pc, inst, op, slice,
+    /// t_arrive, t_ready, t_end)` in `s_memrealtime` ticks (100 MHz). An entry
+    /// no workgroup reached is all-zero. `scripts/k3_trace_report.py` reads it.
+    pub fn trace_write(&self, path: &Path) -> Result<()> {
+        let Some(m) = &self.d_trace else {
+            return Err(RuntimeError::Device(
+                "trace buffer was not allocated — set PLOW_TRACE_RAW before loading".into(),
+            ));
+        };
+        let mut buf = vec![0u8; self.trace_bytes];
+        EngineDevice::download(&*self.be, m, 0, &mut buf)?;
+        std::fs::write(path, &buf)
+            .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))
+    }
+
     /// Read a named tensor back.
     pub fn read_tensor(&self, name: &str, dst: &mut [u8]) -> Result<()> {
         let i = self
@@ -2528,7 +3543,11 @@ impl AmdEngine {
             succs: g.d_succs.base,
             counters: g.d_ctr.base,
             tensors: self.d_tens.base,
-            trace: 0,
+            trace: if p == self.decode {
+                self.d_trace.as_ref().map_or(0, |m| m.base)
+            } else {
+                0
+            },
             cur_seg: seg,
             l2_domains: g.l2_domains,
             n_seg: g.seg_class.len() as u32,
@@ -2991,6 +4010,9 @@ impl AmdEngine {
                 self.max_ctx
             )));
         }
+        // The padded cover, not the prompt length, is what the kernels write —
+        // refuse before allocating rather than clamping and writing past it.
+        self.refuse_overlong_cover(prompt.len() as u32)?;
         // Back the rows this prefill writes, in whichever slot the KV base is
         // rebased onto. Here rather than in `prefill_slot` so the direct
         // single-sequence path (`amd-bench`, `AmdServe` at batch 1) is covered
@@ -3095,12 +4117,61 @@ impl AmdEngine {
     /// its bucket width and those pad rows write KV (nothing reads them —
     /// `n_kv` bounds every later read at `c0 + clen`), so the backing has to
     /// cover them or the pad write faults.
+    ///
+    /// NOT CLAMPED TO `max_ctx`, and it used to be. `.min(self.max_ctx)` made this
+    /// function contradict its own doc comment: the cover is exactly the count of
+    /// rows the kernels WILL write, so clamping it returns a number that is not
+    /// that, and the caller then backs fewer rows than the hardware touches. See
+    /// [`AmdEngine::refuse_overlong_cover`] for what the caller does about it.
     fn prefill_rows(&self, n_prompt: u32) -> u32 {
         let cover: u32 = self
             .plan_for(n_prompt)
             .map(|c| c.iter().sum())
             .unwrap_or(n_prompt);
-        cover.max(n_prompt).min(self.max_ctx as u32)
+        cover.max(n_prompt)
+    }
+
+    /// Refuse a prompt whose PADDED cover runs past the compiled context.
+    ///
+    /// `plan_chunks` covers a prompt with compiled bucket widths, so the last
+    /// chunk is rounded UP: at `max_ctx = 1500` a 1499-token prompt plans as
+    /// `1024 + 512 = 1536`. Every admission check upstream tests `n_prompt`
+    /// (`prefill` here, `EngineServe::prefill` at `>= max_ctx`), and 1499 passes
+    /// all of them — but the kernels execute the full bucket and write padded KV
+    /// rows through 1535, into a cache whose geometry is `max_ctx` rows.
+    ///
+    /// The old code hid this by clamping [`AmdEngine::prefill_rows`] to `max_ctx`,
+    /// which does not make the writes stop — it only stops the ROWS FROM BEING
+    /// BACKED. Under `PLOW_VMM_KV` that is a fault on unmapped VA; without VMM it
+    /// is a silent write past the end of the KV tensor into whatever the allocator
+    /// placed next. The second is the one worth refusing for: it corrupts a
+    /// neighbour and reports nothing.
+    ///
+    /// A refusal rather than a bigger allocation, because the allocation is not
+    /// this layer's to grow: `max_ctx` is read out of the compiled `in.pos` tensor
+    /// and `VmmPool::ensure_rows` clamps to `geo.max_ctx` independently, so both
+    /// the reservation and the mapping are sized by the PACKET. Making the padded
+    /// cover fit is an emitter-side decision (pad the KV geometry to the worst
+    /// bucket overshoot, or compile a terminal context-sized bucket); until it is
+    /// made, this is the boundary that says so instead of writing past it.
+    ///
+    /// The refused band is narrow — only prompts within one bucket-rounding of
+    /// `max_ctx` — and the message names all four numbers so the fix is obvious.
+    fn refuse_overlong_cover(&self, n_prompt: u32) -> Result<()> {
+        let cover = self.prefill_rows(n_prompt);
+        if cover as usize > self.max_ctx {
+            return Err(RuntimeError::Rejected(format!(
+                "prompt of {n_prompt} tokens plans as {:?} = {cover} padded rows, past max_ctx \
+                 {}. The kernels write every row of the last bucket, so this would write KV rows \
+                 [{}, {cover}) outside the cache. Shorten the prompt, or recompile with a \
+                 prefill bucket that lands on {} without overshooting.",
+                self.plan_for(n_prompt).unwrap_or_default(),
+                self.max_ctx,
+                self.max_ctx,
+                self.max_ctx,
+            )));
+        }
+        Ok(())
     }
 
     /// Map physical backing for `seq` out to `rows`. No-op without VMM.
@@ -3111,15 +4182,47 @@ impl AmdEngine {
         }
     }
 
-    /// Release slot `seq`'s physical backing and remap its row 0.
+    /// Release slot `seq`'s physical backing, remap its row 0, and CLEAR any
+    /// carried recurrent state.
     ///
     /// Called when a slot is handed to a NEW sequence: the outgoing sequence's
     /// blocks are what a growable pool exists to reclaim. Row 0 goes straight
     /// back because an idle row still writes KV at `pos = 0`.
+    ///
+    /// # The clear, and why the KV cache does not need one but KDA does
+    ///
+    /// An append-only KV cache carries nothing between sequences: `kvlen` returns
+    /// to 0, every row the new sequence reads is a row it wrote, and the stale
+    /// bytes underneath are unreachable. That is the whole argument behind
+    /// [`kv_skips_zeroing`], and it is why handing over a slot costs a pointer
+    /// remap and no memset.
+    ///
+    /// [`is_carried_state`] tensors break that argument: the KDA recurrence READS
+    /// `state` on its very first token, and the conv arms read a window that is
+    /// supposed to hold the `W - 1` tokens before the sequence began. With no
+    /// clear, "the tokens before this sequence began" were the previous REQUEST's
+    /// — so a second prompt started from the first one's accumulated state.
+    ///
+    /// NOT PER-SLOT, and this is the honest limit of the fix. `declare_kda_state`
+    /// names these `kv.{layer}.state`, with no sequence index: there is exactly one
+    /// recurrent state in the model, so two KDA sequences cannot be in flight at
+    /// once no matter what this function does. Clearing on handover makes SEQUENTIAL
+    /// requests correct, which is the case that exists today (`prefill_slot` rebases
+    /// to one slot and back). Concurrent KDA slots need per-sequence state tensors
+    /// from the emitter, and until they do, [`AmdEngine::check_slot`]'s caller is
+    /// the only thing keeping them apart.
     pub fn begin_slot(&mut self, seq: usize) -> Result<()> {
         if let Some(v) = &self.vmm {
             v.begin_seq(seq);
             v.ensure_rows(seq, 1)?;
+        }
+        for (i, name) in self.tensor_names.iter().enumerate() {
+            if is_carried_state(name) {
+                let m = &self.devp[i];
+                if m.base != 0 && m.len > 0 {
+                    EngineDevice::memset_d8(&*self.be, m.base, 0, m.len as usize)?;
+                }
+            }
         }
         Ok(())
     }
@@ -3386,6 +4489,51 @@ mod tests {
             object_name(Phase::Flash, Variant::Bf16, PrefillArm::MlaMoe, Sched::Static),
             "interp_flash.elf"
         );
+        // KIMI-K3 is the exception, and deliberately: `PLOW_K3` is a MODEL axis, not a
+        // prefill-kernel one, and `interp_decode_k3.elf` is a real row in
+        // `runtime/CMakeLists.txt`. A K3 decode packet handed the plain `interp_decode.elf` has no
+        // `case` for AttnRes (104), SituGlu (105), MlaOutGate (106) or the KDA mixer, and this
+        // interpreter's dispatch `default:` writes NOTHING.
+        assert_eq!(
+            object_name(Phase::Prefill, Variant::Bf16, PrefillArm::K3, Sched::Static),
+            "interp_prefill_k3.elf"
+        );
+        assert_eq!(
+            object_name(Phase::Prefill, Variant::Bf16, PrefillArm::K3Moe, Sched::Static),
+            "interp_prefill_k3_moe.elf"
+        );
+        assert_eq!(
+            object_name(Phase::Prefill, Variant::Bf16, PrefillArm::K3MoeA4w4, Sched::GlobalQueue),
+            "interp_prefill_k3_moe_a4w4_gq.elf"
+        );
+        // Decode collapses ALL THREE K3 arms onto one object: the grouped-MoE ops are
+        // prefill-only, so there is nothing for a `_k3_moe` decode object to contain that `_k3`
+        // does not, and no such row exists in runtime/CMakeLists.txt.
+        for a in [PrefillArm::K3, PrefillArm::K3Moe, PrefillArm::K3MoeA4w4] {
+            assert_eq!(
+                object_name(Phase::Decode, Variant::Bf16, a, Sched::Static),
+                "interp_decode_k3.elf"
+            );
+            // No K3 flash object, and no packet can ask for one: K3 is NoPE MLA + KDA and emits
+            // no `FlashPrefill` at any head dim.
+            assert_eq!(
+                object_name(Phase::Flash, Variant::Bf16, a, Sched::Static),
+                "interp_flash.elf"
+            );
+        }
+        assert_eq!(
+            object_name(Phase::Decode, Variant::Fp8Kv, PrefillArm::K3, Sched::GlobalQueue),
+            "interp_decode_fp8kv_k3_gq.elf"
+        );
+        assert_eq!(
+            object_name(
+                Phase::Prefill,
+                Variant::Fp8Kv,
+                PrefillArm::K3MoeA4w4,
+                Sched::GlobalQueue,
+            ),
+            "interp_prefill_fp8kv_k3_moe_a4w4_gq.elf"
+        );
     }
 
     /// Synthetic packets exercising `PrefillArm::detect` — the axis whose
@@ -3451,6 +4599,55 @@ mod tests {
             prog_with_ops(&[DevOp::Embed, DevOp::Gemv, DevOp::RmsNorm]),
         ];
         assert_eq!(PrefillArm::detect(&bucket_then_decode), PrefillArm::MlaMoe);
+
+        // KIMI-K3. The block ops SUPERSEDE both — `_hs_ax_mla_k3` composes PLOW_MLA_PREFILL with
+        // PLOW_K3, because K3's full-attention layers are MLA — and without this axis a K3 blob
+        // resolves to `interp_prefill_mla_moe.elf`, which has no `case` for any of them.
+        //
+        // The grouped GEMMs carry the expert ENCODING, and it selects an OBJECT: MXFP4 needs the
+        // A4W4 body, which is compiled only under `PLOW_MOE_PF_A4W4`. Wrong in both directions —
+        // an mxfp4 packet on the plain object takes `moe_pf_refuse`, a bf16 packet on the a4w4
+        // object gets 140 KB of arms it never runs — so the field is read, not assumed.
+        let k3_moe = |enc: u32| {
+            let grouped = |op: DevOp| {
+                let mut i = [0u32; 8];
+                i[MOE_PF_ENC_SLOT] = enc;
+                DevInst64 { op: op as u16, i, ..Default::default() }
+            };
+            let mut first = prog_with_ops(&[
+                DevOp::AttnRes,
+                DevOp::SituGlu,
+                DevOp::KdaStateStepG,
+                DevOp::FlashMlaPrefill,
+            ]);
+            first.insts.push(grouped(DevOp::MoeGroupGluPf));
+            first.insts.push(grouped(DevOp::MoeGroupDownPf));
+            vec![first, prog_with_ops(&[DevOp::AttnRes, DevOp::SituGlu, DevOp::Gemv])]
+        };
+        assert_eq!(PrefillArm::detect(&k3_moe(2)), PrefillArm::K3MoeA4w4, "PLOW_MOE_ENC_MXFP4");
+        assert_eq!(PrefillArm::detect(&k3_moe(0)), PrefillArm::K3Moe, "bf16 experts");
+        assert_eq!(PrefillArm::detect(&k3_moe(1)), PrefillArm::K3Moe, "block-fp8 experts");
+
+        // A DECODE-ONLY K3 blob still selects the K3 objects. This is what makes
+        // `interp_decode_k3` reachable at all, and it is not a corner: K3 emitted decode-only for
+        // its whole bring-up, and `K3_PREFILL=0` still does.
+        let k3_decode = vec![prog_with_ops(&[
+            DevOp::Embed,
+            DevOp::AttnRes,
+            DevOp::KdaConv3,
+            DevOp::MlaOutGate,
+            DevOp::Gemv,
+        ])];
+        assert_eq!(PrefillArm::detect(&k3_decode), PrefillArm::K3);
+
+        // The MLA-only K3 bucket (attention emitted, FFN still on the decode ops) is `K3`, not
+        // `K3MoeA4w4`: the grouped chain is what `PLOW_MOE_PREFILL` builds and it is absent here.
+        let k3_attn = vec![prog_with_ops(&[
+            DevOp::AttnRes,
+            DevOp::FlashMlaPrefill,
+            DevOp::MlaMergeFold,
+        ])];
+        assert_eq!(PrefillArm::detect(&k3_attn), PrefillArm::K3);
     }
 
     /// A prog carrying `ops`, each instruction asking for `m` GEMV rows.
@@ -3513,6 +4710,63 @@ mod tests {
         assert_eq!(required_k3_op(&plain), None);
         assert!(check_k3_arms(&bare, obj, required_k3_op(&plain)).is_ok());
         assert!(check_k3_arms(&with_k3, obj, required_k3_op(&plain)).is_ok());
+    }
+
+    /// The KV-encoding SWAP is refused in BOTH directions, which is what makes it different from
+    /// the K3 gate.
+    ///
+    /// The bf16 direction is the one that had no check at all and is not hypothetical: the K3 MLA
+    /// gate's bf16 packet run against the fp8 object reports "all packets executed on every
+    /// slice: YES" and scores rel 1.000e+00 at the attention output.
+    #[test]
+    fn a_kv_encoding_mismatch_is_refused_in_both_directions() {
+        let obj = Path::new("interp_decode.elf");
+        let bare = vec!["plow_gemv_mm_cap_1", "plow_interp_dec_gfx950"];
+        let with_fp8 = vec!["plow_gemv_mm_cap_1", "plow_interp_dec_gfx950", FP8_KV_SYM];
+
+        let check = |syms: &[&str], pkt: &[DevProg]| {
+            check_kv_encoding(
+                syms,
+                obj,
+                required_kv_op(pkt, FP8_KV_OPS),
+                required_kv_op(pkt, BF16_KV_OPS),
+            )
+        };
+
+        for &op in FP8_KV_OPS {
+            let pkt = vec![prog_gemv(&[op], 1)];
+            let e = check(&bare, &pkt)
+                .expect_err("an fp8-KV op against a bf16-KV object must be refused");
+            let msg = e.to_string();
+            assert!(msg.contains(&format!("{op:?}")), "must name the op: {msg}");
+            assert!(msg.contains(FP8_KV_SYM), "must name the marker: {msg}");
+            assert!(msg.contains("PLOW_FP8_KV"), "must name the flag: {msg}");
+            assert!(check(&with_fp8, &pkt).is_ok(), "{op:?} belongs on the fp8 object");
+        }
+        for &op in BF16_KV_OPS {
+            let pkt = vec![prog_gemv(&[op], 1)];
+            let e = check(&with_fp8, &pkt)
+                .expect_err("a bf16-KV op against an fp8-KV object must be refused");
+            let msg = e.to_string();
+            assert!(msg.contains(&format!("{op:?}")), "must name the op: {msg}");
+            assert!(check(&bare, &pkt).is_ok(), "{op:?} belongs on the bf16 object");
+        }
+
+        // The ops that are in BOTH objects must be refused by NEITHER. `HeadNormRope` is the one
+        // that matters: an fp8-KV packet still uses it for the QUERY norm, so listing it as bf16
+        // would refuse every fp8 packet ever emitted. The gathered MLA ops keep their bf16 arm in
+        // both objects for want of a free tensor slot.
+        for &op in &[
+            DevOp::HeadNormRope,
+            DevOp::FlashGatherDecode,
+            DevOp::FlashGatherPrefill,
+            DevOp::Gemv,
+            DevOp::MlaMergeFold,
+        ] {
+            let pkt = vec![prog_gemv(&[op], 1)];
+            assert!(check(&bare, &pkt).is_ok(), "{op:?} must not be refused on a bf16 object");
+            assert!(check(&with_fp8, &pkt).is_ok(), "{op:?} must not be refused on an fp8 object");
+        }
     }
 
     /// [`K3_ARM_OPS`] is exactly the set of `case` labels inside the `#if PLOW_K3` region of
@@ -3888,6 +5142,126 @@ mod tests {
         assert_eq!(insts[2].i[1], 1536, "n_kv is everything written so far");
     }
 
+    /// EVERY KDA OP'S ROW COUNT BECOMES `clen`, AND THE BUG IS WHAT THIS ASSERTS.
+    ///
+    /// The fixture is the shape that was actually broken: a 1500-token prompt on a
+    /// [1024, 512] ladder, whose last chunk is 476 real rows padded out to 512. The
+    /// pre-fix `rebase_chunk` had no KDA arm at all, so `i[0]` kept the compiler's
+    /// baked 512 and both stateful arms ran 36 pad rows past the prompt — the conv
+    /// rolling zeros through a 4-wide window (evicting every real tap) and the
+    /// recurrence applying 36 extra `exp(a_log)` decays to the state decode then
+    /// starts from.
+    ///
+    /// Asserted as `!= t` rather than only `== clen` so that a future change which
+    /// re-bakes `T` somewhere else still fails here: the property is "the KDA row
+    /// count is the REAL row count", not "this field happens to hold 476".
+    #[test]
+    fn rebase_chunk_shortens_every_kda_arm_to_the_real_row_count() {
+        let names: Vec<String> = ["kv.0.state", "act.q"].iter().map(|s| s.to_string()).collect();
+        const T: u32 = 512;
+        const CLEN: u32 = 476;
+        let kda = |op: DevOp| DevInst64 {
+            op: op as u16,
+            i: [T, 96, 128, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let mut insts: Vec<DevInst64> = KDA_ROW_COUNT_OPS.iter().map(|&o| kda(o)).collect();
+        // A non-KDA neighbour that must NOT be touched by the new arm.
+        insts.push(DevInst64 {
+            op: DevOp::RmsNorm as u16,
+            i: [T, 0, 0, 0, 0, 0, 0, 0],
+            ..Default::default()
+        });
+        rebase_chunk(&mut insts, &names, 1024, CLEN);
+
+        for (d, &op) in insts.iter().zip(KDA_ROW_COUNT_OPS) {
+            assert_eq!(d.i[0], CLEN, "{op:?} still runs the padded bucket width");
+            assert_ne!(d.i[0], T, "{op:?} kept the compiler's baked T");
+            // The rest of the immediates are live operands (heads, head_dim) and
+            // patching one of them is the positional bug this module keeps hitting.
+            assert_eq!((d.i[1], d.i[2]), (96, 128), "{op:?}: a live operand moved");
+        }
+        assert_eq!(insts.last().unwrap().i[0], T, "a non-KDA op was shortened");
+    }
+
+    /// THE ATTNRES SCORE WEIGHT IS DERIVED, AND THE FOLD IS CHECKED AGAINST THE
+    /// REAL CHECKPOINT RATHER THAN A FIXTURE.
+    ///
+    /// `models--moonshotai--Kimi-K3` ships `*_res_norm.weight` [7168] bf16 and
+    /// `*_res_proj.weight` [1, 7168] bf16, 93 of each at both the attention and the
+    /// MLP site; the packet declares one f32 [7168] per site. Without the fold all
+    /// 186 resolve to MISSING WEIGHT and no real-weight K3 run can start.
+    ///
+    /// Skipped when the checkpoint is not on this machine — the same convention
+    /// `prefill_object_without_mla_arms_is_refused` uses for its fixture.
+    #[test]
+    fn the_attn_res_score_weight_folds_from_the_pair_the_checkpoint_ships() {
+        let Some(dir) = k3_snapshot_dir() else { return };
+        let Ok(c) = crate::asset::checkpoint::Checkpoint::open(&dir) else { return };
+        const H: usize = 7168;
+        for site in ["self_attention", "mlp"] {
+            let base = format!("language_model.model.layers.1.{site}");
+            let out = fold_res_score(&c, &format!("{base}_res_score.weight"))
+                .expect("name matches the derived pattern")
+                .expect("both sources present in the checkpoint");
+            assert_eq!(out.len(), H * 4, "{site}: f32 [hidden]");
+
+            // Recompute element 0 and a middle element from the two sources, so
+            // this pins the RELATION and not merely the length.
+            let bf = |n: &str, i: usize| -> f32 {
+                let (raw, _) = c.tensor_ex(n).expect("source tensor");
+                let b = &raw[i * 2..i * 2 + 2];
+                f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)
+            };
+            for i in [0usize, H / 2, H - 1] {
+                let want = bf(&format!("{base}_res_norm.weight"), i)
+                    * bf(&format!("{base}_res_proj.weight"), i);
+                let got = f32::from_le_bytes(out[i * 4..i * 4 + 4].try_into().unwrap());
+                assert_eq!(got, want, "{site}[{i}] is not norm * proj");
+            }
+        }
+        // A name that is not a score weight must not be intercepted at all —
+        // otherwise every ordinary weight would take the derived path.
+        assert!(fold_res_score(&c, "language_model.lm_head.weight").is_none());
+    }
+
+    /// The K3 snapshot directory, or `None` on a machine without it.
+    fn k3_snapshot_dir() -> Option<std::path::PathBuf> {
+        let root = std::path::Path::new(
+            "/home/lava/.cache/huggingface/hub/models--moonshotai--Kimi-K3/snapshots",
+        );
+        std::fs::read_dir(root)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.join("model.safetensors.index.json").exists())
+    }
+
+    /// The two questions about a carried-state tensor must have ONE answer.
+    ///
+    /// `kv_skips_zeroing` (may LOAD skip the memset?) and `begin_slot` (what must a
+    /// NEW SEQUENCE clear?) are the same set for the same reason — these tensors are
+    /// read before they are written. They were two separate pieces of knowledge and
+    /// only the first existed, which is how the state came to be zeroed exactly once
+    /// per process and never again between requests.
+    #[test]
+    fn carried_state_is_never_skippable_and_the_kv_cache_always_is() {
+        for n in ["kv.0.state", "kv.12.conv_state.q", "kv.blkres", "kv.3.state.v"] {
+            assert!(is_carried_state(n), "{n} is carried state");
+            assert!(!kv_skips_zeroing(n), "{n} would keep stale bytes across a load");
+        }
+        // The append-only cache: skippable at load, and nothing for begin_slot to do.
+        for n in ["kv.0.k", "kv.31.v", "kv.7.latent"] {
+            assert!(!is_carried_state(n), "{n} is append-only, not carried");
+            assert!(kv_skips_zeroing(n), "{n} lost the 11.5 GiB memset skip");
+        }
+        // Outside the namespace entirely: neither question applies.
+        for n in ["act.x", "model.layers.0.mlp.down_proj.weight", "in.pos"] {
+            assert!(!is_carried_state(n));
+            assert!(!kv_skips_zeroing(n), "{n} is not a kv. tensor");
+        }
+    }
+
     /// The negative fixture is real: `/home/lava/models/glm52_objs` is a GLM-5.2
     /// object set whose prefill object was built WITHOUT `PLOW_MLA_PREFILL`, and
     /// pairing it with a GLM packet is exactly the silent-garbage run this check
@@ -3933,5 +5307,261 @@ mod tests {
         // that is almost certainly the default 1.
         assert!(check_gemv_capacity(&junk, Path::new("x.elf"), 1).is_ok());
         assert!(check_gemv_capacity(&junk, Path::new("x.elf"), 2).is_err());
+    }
+
+    /// The load-time zeroing skip is about WRITE-BEFORE-READ, not about the
+    /// `kv.` prefix. K3 names two read-modify-write things `kv.` so the loader
+    /// does not demand them of the checkpoint, and they must still be zeroed:
+    /// uninitialised HBM in a recurrence is garbage that never washes out, and
+    /// it neither faults nor reports a missing weight.
+    #[test]
+    fn only_append_only_kv_caches_skip_zeroing() {
+        // Append-only caches: written before read, so the skip is sound.
+        for n in ["kv.0.k", "kv.0.v", "kv.3.ckv", "kv.3.krot", "kv.7.kidx"] {
+            assert!(kv_skips_zeroing(n), "`{n}` is an append-only cache");
+        }
+        // Read-modify-write state, and the AttnRes snapshot ring.
+        for n in [
+            "kv.2.state",
+            "kv.2.conv_state.q",
+            "kv.2.conv_state.k",
+            "kv.2.conv_state.v",
+            "kv.blkres",
+        ] {
+            assert!(!kv_skips_zeroing(n), "`{n}` is READ before it is written");
+        }
+        // Everything outside the namespace was always zeroed and still is.
+        for n in ["act.x", "in.ids", "moe.expert_weight_table"] {
+            assert!(!kv_skips_zeroing(n));
+        }
+    }
+}
+
+/// The routed-expert NAME RESOLUTION, against synthetic checkpoints.
+///
+/// Three shipping spellings reach [`resolve_expert_names`], and the wrong answer
+/// is SILENT: picking the block-fp8 arm for an mxfp4 checkpoint reads an E8M0
+/// row as an f32 grid and gets a plausible count of plausible bytes. So each
+/// spelling is pinned as the bytes a checkpoint would actually have — the tensor
+/// names, the dtypes, and the shapes, all three taken from the real artifacts.
+#[cfg(test)]
+mod expert_name_tests {
+    use super::*;
+    use crate::asset::checkpoint::Checkpoint;
+
+    /// A one-shard safetensors directory holding `(name, dtype, shape)` with
+    /// zeroed data — the resolver reads names, dtypes and shapes, never payload.
+    struct Fake(std::path::PathBuf);
+
+    impl Fake {
+        fn new(tag: &str, tensors: &[(&str, &str, &[usize])]) -> Fake {
+            let dir = std::env::temp_dir()
+                .join(format!("plowrt-expert-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let width = |dt: &str| match dt {
+                "F32" => 4,
+                "U8" | "F8_E4M3" => 1,
+                other => panic!("test helper has no width for {other}"),
+            };
+            let (mut hdr, mut data, mut off) = (String::from("{"), Vec::new(), 0usize);
+            for (i, (n, dt, sh)) in tensors.iter().enumerate() {
+                let len = sh.iter().product::<usize>() * width(dt);
+                if i > 0 {
+                    hdr.push(',');
+                }
+                hdr.push_str(&format!(
+                    "{n:?}:{{\"dtype\":\"{dt}\",\"shape\":{sh:?},\"data_offsets\":[{off},{}]}}",
+                    off + len
+                ));
+                off += len;
+                data.resize(off, 0u8);
+            }
+            hdr.push('}');
+            let mut blob = (hdr.len() as u64).to_le_bytes().to_vec();
+            blob.extend_from_slice(hdr.as_bytes());
+            blob.extend_from_slice(&data);
+            std::fs::write(dir.join("model.safetensors"), blob).unwrap();
+            Fake(dir)
+        }
+
+        fn open(&self) -> Checkpoint {
+            Checkpoint::open(&self.0).unwrap()
+        }
+    }
+
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn refs<'a>(
+        t: &'a [(String, &'static str, Vec<usize>)],
+    ) -> Vec<(&'a str, &'a str, &'a [usize])> {
+        t.iter().map(|(n, d, s)| (n.as_str(), *d, s.as_slice())).collect()
+    }
+
+    /// GLM-5.2's layout, and the ONE case that must stay bit-for-bit what it
+    /// was: the first candidate probed is the pair of names this resolver
+    /// replaced hardcoded, so a block-fp8 checkpoint never reaches a second
+    /// lookup and every name built downstream is the name it was built before.
+    #[test]
+    fn block_fp8_resolves_to_exactly_the_names_it_always_did() {
+        // zai-org/GLM-5.2-FP8, scaled down: [N, K] fp8 + [N/128, K/128] f32.
+        let mut t: Vec<(String, &str, Vec<usize>)> = Vec::new();
+        for p in ["gate_proj", "up_proj", "down_proj"] {
+            t.push((
+                format!("model.layers.3.mlp.experts.0.{p}.weight"),
+                "F8_E4M3",
+                vec![256, 384],
+            ));
+            t.push((
+                format!("model.layers.3.mlp.experts.0.{p}.weight_scale_inv"),
+                "F32",
+                vec![2, 3],
+            ));
+        }
+        let f = Fake::new("blockfp8", &refs(&t));
+        let c = f.open();
+        let en = resolve_expert_names(&c, "model.layers.3.mlp.").unwrap();
+        assert_eq!(en.ns, "model.layers.3.mlp.experts.");
+        assert_eq!(en.proj, ["gate_proj", "up_proj", "down_proj"]);
+        assert_eq!(en.payload, ".weight");
+        assert_eq!(en.scale, ".weight_scale_inv");
+        assert!(!en.microscaled());
+        assert_eq!(en.weight_of(0, 0), "model.layers.3.mlp.experts.0.gate_proj.weight");
+        assert_eq!(
+            en.scale_of(0, 2),
+            "model.layers.3.mlp.experts.0.down_proj.weight_scale_inv"
+        );
+        check_expert_geometry(&c, &en).unwrap();
+    }
+
+    /// amd/Kimi-K2.7-Code-MXFP4: the STANDARD projection names with an E8M0
+    /// scale. This is why the layout cannot be one boolean — "mxfp4" and
+    /// "Mixtral-spelled" are independent facts, and this checkpoint has the
+    /// first without the second.
+    #[test]
+    fn mxfp4_under_the_standard_projection_names_resolves_on_the_scale_alone() {
+        let mut t: Vec<(String, &str, Vec<usize>)> = Vec::new();
+        for p in ["gate_proj", "up_proj", "down_proj"] {
+            // [N, K/2] packed + [N, K/32] E8M0, K = 96.
+            t.push((format!("m.layers.3.mlp.experts.0.{p}.weight"), "U8", vec![64, 48]));
+            t.push((
+                format!("m.layers.3.mlp.experts.0.{p}.weight_scale"),
+                "U8",
+                vec![64, 3],
+            ));
+        }
+        let f = Fake::new("mxstd", &refs(&t));
+        let c = f.open();
+        let en = resolve_expert_names(&c, "m.layers.3.mlp.").unwrap();
+        assert_eq!(en.proj, ["gate_proj", "up_proj", "down_proj"]);
+        assert_eq!(en.payload, ".weight");
+        assert_eq!(en.scale, ".weight_scale");
+        assert!(en.microscaled());
+        check_expert_geometry(&c, &en).unwrap();
+    }
+
+    /// Kimi-K3: `block_sparse_moe.experts.{e}.w1|w2|w3` + `weight_packed` /
+    /// `weight_scale`, reached from a table declared under the compiler's own
+    /// `moe.` namespace. Three things are discovered at once — the namespace,
+    /// the projection names, and the payload suffix — and the slot order is
+    /// gate, up, down, so `w3` must come back SECOND and `w2` LAST.
+    #[test]
+    fn mixtral_mxfp4_resolves_namespace_projections_and_payload_together() {
+        const P: &str = "language_model.model.layers.1.block_sparse_moe.experts.0.";
+        let t: Vec<(String, &str, Vec<usize>)> = vec![
+            (format!("{P}w1.weight_packed"), "U8", vec![64, 48]),
+            (format!("{P}w1.weight_scale"), "U8", vec![64, 3]),
+            (format!("{P}w3.weight_packed"), "U8", vec![64, 48]),
+            (format!("{P}w3.weight_scale"), "U8", vec![64, 3]),
+            (format!("{P}w2.weight_packed"), "U8", vec![96, 32]),
+            (format!("{P}w2.weight_scale"), "U8", vec![96, 2]),
+        ];
+        let f = Fake::new("k3", &refs(&t));
+        let c = f.open();
+        // The K3 emitter declares `moe.{lp}expert_weight_table` (devgen/k3.rs),
+        // so this is the prefix the loader is actually handed.
+        let en = resolve_expert_names(&c, "moe.language_model.model.layers.1.").unwrap();
+        assert_eq!(en.ns, P.trim_end_matches("0."));
+        assert_eq!(en.proj, ["w1", "w3", "w2"], "slot order is gate, up, DOWN");
+        assert_eq!(en.payload, ".weight_packed");
+        assert_eq!(en.scale, ".weight_scale");
+        assert_eq!(en.weight_of(0, 2), format!("{P}w2.weight_packed"));
+        check_expert_geometry(&c, &en).unwrap();
+    }
+
+    /// A scale that is the wrong size for its weight must be refused BY NAME.
+    /// Nothing downstream would notice: the bytes are all u8, the shape is
+    /// plausible, the packed buffer comes out the declared size, and every group
+    /// after the first is scaled by the wrong exponent.
+    #[test]
+    fn a_scale_that_covers_the_wrong_k_is_refused_and_named() {
+        const P: &str = "m.layers.0.mlp.experts.0.";
+        let t: Vec<(String, &str, Vec<usize>)> = vec![
+            (format!("{P}gate_proj.weight"), "U8", vec![64, 48]),
+            // 4 groups of 32 = 128 elements, but the payload packs 96.
+            (format!("{P}gate_proj.weight_scale"), "U8", vec![64, 4]),
+            (format!("{P}up_proj.weight"), "U8", vec![64, 48]),
+            (format!("{P}up_proj.weight_scale"), "U8", vec![64, 3]),
+            (format!("{P}down_proj.weight"), "U8", vec![48, 32]),
+            (format!("{P}down_proj.weight_scale"), "U8", vec![48, 2]),
+        ];
+        let f = Fake::new("badk", &refs(&t));
+        let c = f.open();
+        let en = resolve_expert_names(&c, "m.layers.0.mlp.").unwrap();
+        let e = check_expert_geometry(&c, &en).unwrap_err().to_string();
+        assert!(e.contains("gate_proj.weight_scale"), "{e}");
+        assert!(e.contains("K disagrees"), "{e}");
+    }
+
+    /// The same for a block-fp8 grid — the arm GLM-5.2 ships on, so it is pinned
+    /// that the check accepts the real geometry and rejects a near miss.
+    #[test]
+    fn a_block_fp8_grid_of_the_wrong_shape_is_refused() {
+        const P: &str = "m.layers.0.mlp.experts.0.";
+        for (tag, grid, ok) in [("good", vec![2usize, 3], true), ("bad", vec![3, 2], false)] {
+            let t: Vec<(String, &str, Vec<usize>)> = ["gate_proj", "up_proj", "down_proj"]
+                .iter()
+                .flat_map(|p| {
+                    [
+                        (format!("{P}{p}.weight"), "F8_E4M3", vec![256, 384]),
+                        (format!("{P}{p}.weight_scale_inv"), "F32", grid.clone()),
+                    ]
+                })
+                .collect();
+            let f = Fake::new(&format!("grid{tag}"), &refs(&t));
+            let c = f.open();
+            let en = resolve_expert_names(&c, "m.layers.0.mlp.").unwrap();
+            assert_eq!(check_expert_geometry(&c, &en).is_ok(), ok, "{tag}");
+        }
+    }
+
+    /// A payload with NO scale under either spelling is a broken checkpoint, not
+    /// a spelling this loader has yet to learn — say so, and name both.
+    #[test]
+    fn a_payload_without_any_scale_names_both_spellings() {
+        let t: Vec<(String, &str, Vec<usize>)> =
+            vec![("m.layers.0.mlp.experts.0.gate_proj.weight".into(), "U8", vec![64, 48])];
+        let f = Fake::new("noscale", &refs(&t));
+        let e = resolve_expert_names(&f.open(), "m.layers.0.mlp.").unwrap_err().to_string();
+        assert!(e.contains("MISSING EXPERT SCALE"), "{e}");
+        assert!(e.contains("weight_scale_inv") && e.contains("weight_scale"), "{e}");
+    }
+
+    /// No routed experts under ANY spelling fails loudly with what was probed.
+    /// A zero-filled expert buffer is read by the kernel as real weights, so the
+    /// alternative to this error is a model that loads and is nonsense.
+    #[test]
+    fn no_experts_at_all_reports_every_name_it_probed() {
+        let t: Vec<(String, &str, Vec<usize>)> =
+            vec![("m.layers.0.mlp.gate.weight".into(), "U8", vec![8, 8])];
+        let f = Fake::new("noexp", &refs(&t));
+        let e = resolve_expert_names(&f.open(), "m.layers.0.mlp.").unwrap_err().to_string();
+        assert!(e.contains("MISSING EXPERT WEIGHT"), "{e}");
+        assert!(e.contains("experts.0.gate_proj.weight"), "{e}");
+        assert!(e.contains("block_sparse_moe.experts.0.w1.weight_packed"), "{e}");
     }
 }

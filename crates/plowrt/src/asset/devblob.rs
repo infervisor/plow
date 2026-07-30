@@ -184,7 +184,18 @@ fn recover_tp(progs: &[DevProg]) -> Option<DevTp> {
             }
             n_gpu = n_gpu.max(d.i[1]);
             if one_shot {
-                hidden = hidden.max(d.i[0]);
+                // PER ROW, not per message. `i[0]` is `t * width`, and this used to read it
+                // as the width outright — correct only while the one-shot was DECODE's alone
+                // (`emit_xreduce` picked the two-shot for every t > 1) and t was therefore
+                // always 1. Kimi-K3's shared-expert reduce carries a folded all-gather, which
+                // the two-shot's decomposition cannot express, so it stays one-shot on BOTH
+                // phases — and the widest prefill bucket then reported `hidden` as
+                // `8192 * 7168`. Dividing by the program's own `t` is right for every case
+                // and needs no phase test: decode divides by 1.
+                //
+                // The max over the result is what picks `hidden` out of a model with narrower
+                // collectives — K3 also reduces the expert combine at its 3584-wide LATENT.
+                hidden = hidden.max(d.i[0] / p.t.max(1));
             }
             slot_bytes = slot_bytes.max(d.i[2] as u64);
         }
@@ -565,6 +576,50 @@ mod tests {
     use super::*;
     use packet::dev::DevInst;
     use packet::devbuild::{Model, Program, TensorDecl};
+
+    /// `hidden` is a ROW width, and a one-shot collective in a PREFILL program says
+    /// `t * hidden`. This used to read `i[0]` outright, which was right only while the
+    /// one-shot belonged to decode alone. Kimi-K3's shared-expert reduce carries a folded
+    /// all-gather the two-shot cannot express, so it is one-shot at every T — and the
+    /// 8192-row bucket then reported hidden = 58,720,256. The host divides `slot_bytes` by
+    /// `hidden * 2` to recover `max_tokens`, so a wrong width is a wrong peer layout with no
+    /// message: every rank's partial lands where no peer reads it.
+    #[test]
+    fn tp_hidden_is_recovered_per_row_from_any_phase() {
+        let xr = |width: u32, slot: u32| DevInst64 {
+            op: DevOp::XReduce as u16,
+            blocks: 1,
+            fj: [0; 3],
+            t: [0; 8],
+            i: [width, 8, slot, 0, 0, 0, 0, 0],
+        };
+        let prog = |t: u32, insts: Vec<DevInst64>| DevProg {
+            t,
+            n_counter: 0,
+            insts,
+            stream: Vec::new(),
+            stream_ofs: Vec::new(),
+            stream_len: Vec::new(),
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        };
+        // Decode reduces one row at hidden AND one at K3's narrower latent; the 8192-row
+        // prefill bucket reduces the same hidden width, 8192 rows at a time.
+        let hidden = 7168u32;
+        let progs = vec![
+            prog(1, vec![xr(hidden, 0), xr(3584, 117_440_512)]),
+            prog(8192, vec![xr(8192 * hidden, 0)]),
+        ];
+        let tp = recover_tp(&progs).expect("n_gpu > 1 must be recovered");
+        assert_eq!(tp.n_gpu, 8);
+        assert_eq!(tp.hidden, hidden, "the widest ROW, not the widest message");
+        assert_eq!(tp.slot_bytes, 117_440_512);
+        // And a blob with no collective at all is not a sharded blob.
+        assert!(recover_tp(&[prog(1, vec![])]).is_none());
+    }
 
     /// A tiny two-program model exercised through the REAL writer
     /// (`Model::to_blob`) — reader and writer cannot drift apart unnoticed.

@@ -146,7 +146,13 @@ mod amd_serve {
 
             let stop_ids = Arc::new(
                 checkpoint
-                    .map(crate::asset::checkpoint::read_eos_ids)
+                    .map(|d| {
+                        let mut ids = crate::asset::checkpoint::read_eos_ids(d);
+                        // A structured chat turn can close before the sequence eos; without this
+                        // the framing lands in the user's text. See `chat_stop_ids`.
+                        ids.extend(crate::asset::checkpoint::chat_stop_ids(d, &ids));
+                        ids
+                    })
                     .unwrap_or_default(),
             );
 
@@ -381,14 +387,24 @@ mod amd_serve {
         fn dispatch_all(&mut self, advance: &[usize]) -> Result<Vec<u32>> {
             if self.batch == 1 {
                 let pos = self.pos[0];
+                use crate::obs::dstep;
                 let t = match &mut self.ranks {
                     Ranks::One(e) => {
-                        e.seed_ids(&self.next_id)?;
+                        dstep::timed(&dstep::SEED, || e.seed_ids(&self.next_id))?;
                         e.decode_step(pos, pos + 1)?
                     }
+                    // The split pair, not `decode_step`, because this is the
+                    // server and the split exists for it. NOTHING sits between
+                    // the two calls, and that is measured rather than pending:
+                    // §DSTEP puts the whole host phase at 1.4% of the token and
+                    // the only part of it that is safe to move at all at 0.02%.
+                    // The argument, with the numbers, is in `exec::amd_tp`'s
+                    // module doc — read it before putting work here.
                     Ranks::Tp(g) => {
-                        g.seed_ids(&self.next_id)?;
-                        AmdTpGroup::agree(&g.decode_step(pos, pos + 1)?)?
+                        dstep::timed(&dstep::SEED, || g.seed_ids(&self.next_id))?;
+                        g.submit_decode(pos, pos + 1)?;
+                        let ids = g.complete_decode()?;
+                        dstep::timed(&dstep::AGREE, || AmdTpGroup::agree(&ids))?
                     }
                 };
                 for &s in advance {

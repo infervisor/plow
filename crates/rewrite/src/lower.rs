@@ -212,11 +212,57 @@ fn term_for(
                 op: "moe_router (group-limited)",
             })
         }
-        // Kimi-K3's ops. No egglog terms exist for them; see `LowerError::Unsupported`.
-        Op::Conv1dDepthwise { .. }
-        | Op::LinearAttention { .. }
-        | Op::SituGlu { .. }
-        | Op::BlockResidual { .. } => return Err(LowerError::Unsupported { op: op.name() }),
+        // --- Kimi-K3 ---
+        Op::Conv1dDepthwise { kernel } => {
+            format!("(Conv1dDepthwise {} {} {})", e(0)?, e(1)?, kernel)
+        }
+        Op::SituGlu { beta, linear_beta } => format!(
+            "(SituGlu {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            f64lit(*beta),
+            f64lit(*linear_beta)
+        ),
+        Op::LinearAttention {
+            kind,
+            num_heads,
+            head_dim,
+        } => {
+            // The recurrent state is a runtime resource, not an edge — the same
+            // convention `Op::Attention` uses for the KV cache. The kind rides as
+            // a token so a future second recurrence stays a distinct e-node.
+            let k = match kind {
+                nn_graph::op::LinearAttnKind::KimiDelta => "kimi_delta",
+            };
+            format!(
+                "(LinearAttention {} {} {} {} {} {} {} {})",
+                e(0)?,
+                e(1)?,
+                e(2)?,
+                e(3)?,
+                e(4)?,
+                quote(k),
+                num_heads,
+                head_dim
+            )
+        }
+        // Inputs are `[prefix, snapshot_0, .., snapshot_n, score_weight]`. The
+        // snapshot count varies per layer, so it lowers to a cons chain rather
+        // than a fixed-arity constructor — every snapshot stays a named leaf.
+        Op::BlockResidual { max_snapshots } => {
+            let last = inputs.len() - 1;
+            let mut chain = String::from("(SnapNil)");
+            for i in (1..last).rev() {
+                chain = format!("(SnapCons {} {})", expr_of(g, inputs[i], var)?, chain);
+            }
+            format!(
+                "(BlockResidual {} {} {} {})",
+                e(0)?,
+                chain,
+                expr_of(g, inputs[last], var)?,
+                max_snapshots
+            )
+        }
     })
 }
 

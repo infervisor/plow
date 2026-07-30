@@ -64,6 +64,10 @@ inductive Op
   | FusedGroupNormActConv3dBias (x w b cw cb : Op) (g eps : Nat) (kind : String)
       (stride pad : Nat)
   | FusedEmbeddingScale     (ids table : Op) (factor : Nat)
+  /-- Kimi-K3 KDA output half: `o_norm(o) * sigmoid(g_proj(x))`. -/
+  | FusedKdaGatedNorm       (o nw x gw : Op) (eps : Nat)
+  /-- Kimi-K3 MLA output gate: `attn * sigmoid(o_gate_proj(x))`. -/
+  | FusedMlaOutGate         (attn x gw : Op)
   deriving Repr, DecidableEq
 
 /-! ## Denotational lens — every fused op unfolds to its unfused composition. -/
@@ -107,6 +111,11 @@ def expand : Op → Op
         (expand cw) (expand cb) stride pad
   | Op.FusedEmbeddingScale ids table factor =>
       Op.Scale (Op.Embedding (expand ids) (expand table)) factor
+  | Op.FusedKdaGatedNorm o nw x gw eps =>
+      Op.Ew "mul" (Op.RmsNorm (expand o) (expand nw) eps)
+        (Op.Act "sigmoid" (Op.Linear (expand x) (expand gw)))
+  | Op.FusedMlaOutGate attn x gw =>
+      Op.Ew "mul" (expand attn) (Op.Act "sigmoid" (Op.Linear (expand x) (expand gw)))
   -- Base ops → structural recursion.
   | Op.RmsNorm x w eps => Op.RmsNorm (expand x) (expand w) eps
   | Op.LayerNorm x w b eps => Op.LayerNorm (expand x) (expand w) (expand b) eps
@@ -218,6 +227,18 @@ theorem rule_embedding_scale_fuse (ids table : Op) (factor : Nat) :
     expand (Op.FusedEmbeddingScale ids table factor) =
       Op.Scale (Op.Embedding (expand ids) (expand table)) factor := rfl
 
+/-- `kda-gated-norm-fuse` -/
+theorem rule_kda_gated_norm_fuse (o nw x gw : Op) (eps : Nat) :
+    expand (Op.FusedKdaGatedNorm o nw x gw eps) =
+      Op.Ew "mul" (Op.RmsNorm (expand o) (expand nw) eps)
+        (Op.Act "sigmoid" (Op.Linear (expand x) (expand gw))) := rfl
+
+/-- `mla-out-gate-fuse` -/
+theorem rule_mla_out_gate_fuse (attn x gw : Op) :
+    expand (Op.FusedMlaOutGate attn x gw) =
+      Op.Ew "mul" (expand attn)
+        (Op.Act "sigmoid" (Op.Linear (expand x) (expand gw))) := rfl
+
 /-! ## Rule registry — the closed enumeration the CLI accepts as sound. -/
 
 /-- The catalog of egglog rule names covered by the proofs above. Every rule
@@ -241,7 +262,9 @@ def soundRules : List String :=
    "rmsnorm-rope-scale-fuse",
    "groupnorm-act-conv3d-fuse",
    "groupnorm-act-conv3d-bias-fuse",
-   "embedding-scale-fuse"]
+   "embedding-scale-fuse",
+   "kda-gated-norm-fuse",
+   "mla-out-gate-fuse"]
 
 /-- Whether a rule name is in the sound-rules table. -/
 def isSoundRule (name : String) : Bool :=

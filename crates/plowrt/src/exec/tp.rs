@@ -137,9 +137,26 @@ pub struct PeerLayout {
     total: u64,
 }
 
-/// Partial slots per rank: the two all-reduces of a layer (o_proj, down). See
-/// [`PeerLayout`] for why the next layer may reuse them.
-pub const PARTIAL_SLOTS: u64 = 2;
+/// Partial slots per rank. Slots 0/1 are the two all-reduces every TP layer has
+/// (o_proj, down); see [`PeerLayout`] for why the next layer may reuse them.
+///
+/// SLOT 2 IS A GATHER SLOT, and it is why this is 3 and not 2. Kimi-K3's LatentMoE
+/// tail has a COLUMN-parallel producer (`routed_expert_up_proj`, rank r owning hidden
+/// columns `[r*H/N, (r+1)*H/N)`) whose result is ADDED to a row-parallel one (the
+/// shared expert's `down_proj`). `d_xreduce` folds the gather into the reduce, so the
+/// two need one packet and one rendezvous between them — but they need two slots,
+/// because the gathered partial is `H/N` wide per rank and the reduced one is `H`.
+///
+/// Reusing slot 0 or 1 instead is not available: the one-shot's gate says every peer
+/// ARRIVED, not that every peer finished READING, so a slot may only be overwritten
+/// after an intervening collective (`perf-data/kimi-k3-tp-peer-slots.md`). The up
+/// projection sits between the expert-combine reduce (slot 1) and the shared-expert
+/// reduce (slot 0) with no collective of its own to hide behind.
+///
+/// Cost is one more `max_tokens * hidden * 2` per rank — 58.7 MB at 4096 x 7168,
+/// against ~190 GiB of weights. Inert for every model that emits no `act.ug_tp`:
+/// the slot is simply never addressed.
+pub const PARTIAL_SLOTS: u64 = 3;
 
 impl PeerLayout {
     /// Cross-GPU counters a program needs: **one gate per one-shot `XReduce`
@@ -771,9 +788,13 @@ mod tests {
         // `devgen`'s emit_xreduce passes slot_b = h*2 for decode. If these ever
         // disagree, every rank's `down` partial lands where no peer reads it.
         assert_eq!(l.partial_off(1).unwrap(), 3840 * 2);
-        assert_eq!(l.xctr_off(), 2 * 3840 * 2);
+        // Slot 2 is the GATHER slot (`PARTIAL_SLOTS`). Gemma emits no `act.ug_tp`, so it
+        // is never addressed here — it is still LAID OUT, because the counter region's
+        // offset has to be the same in every rank's region and therefore in every model's.
+        assert_eq!(l.partial_off(2).unwrap(), 2 * 3840 * 2);
+        assert_eq!(l.xctr_off(), 3 * 3840 * 2);
         assert_eq!(l.xctr_bytes(), 96 * 128);
-        assert!(l.bytes() < 32 * 1024, "peer footprint {} B", l.bytes());
+        assert!(l.bytes() < 48 * 1024, "peer footprint {} B", l.bytes());
     }
 
     /// Prefill is the case that breaks a decode-shaped layout: the message is
@@ -786,8 +807,8 @@ mod tests {
         assert_eq!(l.n_xctr, 192, "two xctr gates per XReduceTwoShot");
         // devgen: slot_b = t*h*2.
         assert_eq!(l.partial_off(1).unwrap(), 2048 * h as u64 * 2);
-        assert_eq!(l.bytes(), 2 * 2048 * h as u64 * 2 + 192 * 128);
-        // ~57 MiB of peer VRAM: negligible next to weights, but three orders of
+        assert_eq!(l.bytes(), PARTIAL_SLOTS * 2048 * h as u64 * 2 + 192 * 128);
+        // ~84 MiB of peer VRAM: negligible next to weights, but three orders of
         // magnitude past the decode region — which is the whole reason
         // `max_tokens` is a parameter and not an assumption.
         assert!(l.bytes() > 50 << 20);

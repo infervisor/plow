@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # Re-run the gfx950 prefill-GEMM tile campaign (knob-contract step 1).
 #
+# SUPERSEDED TWICE. Use `scripts/rebench_tune_gemm_all.sh`, which is the whole campaign in ONE
+# command (rebuild objects -> measure -> ingest -> verify) and covers BOTH encodings. This file
+# measures bf16 ONLY, and mxfp4 is no longer an empty column in the store: `plowc tune best
+# --quant Mxfp4` answers for 85 Kimi-K3 op cases. Re-running only this one leaves them stale.
+#
+# The shape list below now also lives as data, in `scripts/tune_shapes_bf16.txt`, which is what
+# the new script feeds to `plowc tune gemm --shapes`. Keep the two in sync or delete this one.
+#
 # SUPERSEDED BY `plowc tune gemm`, which does this AND derives the shape list instead of carrying
 # it by hand, AND ingests (so "measured but never published" cannot happen by omission):
 #

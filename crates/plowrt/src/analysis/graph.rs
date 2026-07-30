@@ -14,39 +14,12 @@ use packet::dev::SE_FINE;
 
 use crate::asset::devblob::DevProg;
 
-/// Edges that survive transitive reduction: drop A→C when a path A→…→C of
-/// length ≥ 2 exists. `succ[a]` is the direct-successor set.
-pub fn transitive_reduction(n: usize, edges: &BTreeSet<(u32, u32)>) -> BTreeSet<(u32, u32)> {
-    // Reachability by 2+ hops. The op DAG is emitted in topological order
-    // (producer index < consumer index), so a single reverse sweep suffices.
-    let mut succ: Vec<HashSet<u32>> = vec![HashSet::new(); n];
-    for &(a, b) in edges {
-        succ[a as usize].insert(b);
-    }
-    // reach[a] = every node reachable from a (any distance ≥ 1).
-    let mut reach: Vec<HashSet<u32>> = vec![HashSet::new(); n];
-    for a in (0..n).rev() {
-        let mut r: HashSet<u32> = HashSet::new();
-        for &b in &succ[a] {
-            r.insert(b);
-            for &c in &reach[b as usize] {
-                r.insert(c);
-            }
-        }
-        reach[a] = r;
-    }
-    let mut out = BTreeSet::new();
-    for &(a, b) in edges {
-        // Redundant iff some other direct successor of a reaches b.
-        let redundant = succ[a as usize]
-            .iter()
-            .any(|&m| m != b && reach[m as usize].contains(&b));
-        if !redundant {
-            out.insert((a, b));
-        }
-    }
-    out
-}
+/// Transitive reduction now lives in `packet::devbuild` so the EMITTER (which
+/// applies it) and this analysis (which reports what it saves) cannot drift
+/// apart. Re-exported under the old name: `graphstat`'s printed numbers appear
+/// in committed `perf-data/` write-ups, and a rename that shifted one would be
+/// a silent falsification of those.
+pub use packet::devbuild::transitive_reduction;
 
 pub struct Stats {
     pub n_ops: usize,

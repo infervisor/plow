@@ -131,16 +131,24 @@ const DOC: &[S] = &[
     S { op: DevOp::AddNorm, t: &["out", "resid", "a", "b", "gamma?"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::Argmax, t: &["part", "x"], i: &["n"], f: &[], j: &[] },
     S { op: DevOp::ArgmaxFin, t: &["ids", "part"], i: &["blocks"], f: &[], j: &[] },
-    S { op: DevOp::GemvGlu, t: &["fu", "x", "W_gate", "", "", "W_up"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
+    S { op: DevOp::GemvGlu, t: &["fu", "x", "W_gate", "", "", "W_up"], i: &["M", "N", "K", "", "", "act"], f: &["situ_beta", "situ_linear_beta"], j: &[] },
     S { op: DevOp::GemmGlu, t: &["fu", "x", "W_gate", "", "", "W_up"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
     S { op: DevOp::GemvQkv, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v"], i: &["M", "Nq", "K", "Nk", "Nv"], f: &[], j: &[] },
+    // `i5=Ng` and `i6=W_g` are both REQUIRED, and `i6` is a TENSOR HANDLE, not a
+    // number: nine pointers (four outputs, four weights, `x`) do not fit the
+    // eight `t` slots of a fixed 64-byte instruction, so a WEIGHT was demoted —
+    // a wrong weight handle reads the wrong bytes and is visibly garbage, where
+    // a wrong OUTPUT handle would silently overwrite an unrelated tensor. The
+    // AMD arm traps on either being absent rather than degrading to a 3-stream
+    // sweep, which would leave `g_out` finite, fluent and wrong.
+    S { op: DevOp::GemvQkvg, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v", "g_out"], i: &["M", "Nq", "K", "Nk", "Nv", "Ng", "W_g"], f: &[], j: &[] },
     S { op: DevOp::GemvFp8, t: &["C", "x", "W", "", "", "w_scale"], i: &["M", "N", "K", "", "a_row0"], f: &[], j: &[] },
     S { op: DevOp::GemvGluFp8, t: &["fu", "x", "W_gate", "gate_scale", "up_scale", "W_up"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
     S { op: DevOp::QuantFp8, t: &["xq", "x", "a_scale"], i: &["M", "K"], f: &[], j: &[] },
     S { op: DevOp::GemmFp8, t: &["C", "A", "B", "a_scale", "w_scale"], i: &["M", "N", "K", "", "a_row0"], f: &[], j: &[] },
     S { op: DevOp::GemmGluFp8, t: &["fu", "A", "Wg", "a_scale", "g_scale", "Wu", "u_scale"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
     S { op: DevOp::NormResidualNorm, t: &["out", "resid", "a", "b", "gamma_b?", "gamma_n?"], i: &["rows", "feat"], f: &["eps", "scale"], j: &[] },
-    S { op: DevOp::XReduce, t: &["out"], i: &["H", "n_gpu", "slot"], f: &[], j: &[] },
+    S { op: DevOp::XReduce, t: &["out"], i: &["H", "n_gpu", "slot", "gate", "gslot?", "gcols?", "row_w?"], f: &[], j: &[] },
     S { op: DevOp::XArgmaxFin, t: &["ids", "local_part"], i: &["n_gpu", "", "slot"], f: &[], j: &[] },
     S { op: DevOp::XReduceTwoShot, t: &["out"], i: &["n", "n_gpu", "slot", "gate_rs", "gate_ag"], f: &[], j: &[] },
     S { op: DevOp::HeadNormRopeFp8, t: &["out", "", "", "", "", "", "scale"], i: &[], f: &[], j: &[] },
@@ -194,11 +202,24 @@ const DOC: &[S] = &[
     S { op: DevOp::GemvGluMxfp4, t: &["C", "x", "Wg", "Sg", "Su", "Wu"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
     S { op: DevOp::GemmMxfp4, t: &["C", "A", "W", "wscale"], i: &["M", "N", "K"], f: &[], j: &[] },
     S { op: DevOp::KdaStateStep, t: &[], i: &["T", "H", "D", "BV", "flags"], f: &["scale"], j: &[] },
+    // Four handles demoted to `i[]` (the `v` taps and all three conv states) — twelve pointers,
+    // eight `t` slots. Same choice as `GemvQkvg`: demote a WEIGHT or a state, never an output.
+    S { op: DevOp::KdaConv3, t: &["q_out", "k_out", "v_out", "q_in", "k_in", "v_in", "w_q", "w_k"], i: &["T", "C", "W", "act", "w_v", "cs_q", "cs_k", "cs_v"], f: &[], j: &[] },
+    // `KdaStateStep` with `KdaGate` inlined: `t4`/`t5` are the RAW projections, not the gate's
+    // f32 output, and `i5` is the `dt_bias` handle. There is no slot for a precomputed `g`, which
+    // is deliberate — this op cannot silently degrade to the unfused reading of the packet.
+    S { op: DevOp::KdaStateStepG, t: &["o", "q", "k", "v", "g_raw", "beta_raw", "state", "A_log"], i: &["T", "H", "D", "BV", "flags", "dt_bias", "gate_mode"], f: &["scale", "lower_bound"], j: &[] },
     S { op: DevOp::KdaGatedNorm, t: &["y", "o", "norm_w", "g_raw"], i: &["T", "H", "D"], f: &["eps"], j: &[] },
-    S { op: DevOp::AttnRes, t: &["out", "prefix_sum", "block_residual", "score_w"], i: &["T", "H", "nb"], f: &["eps"], j: &[] },
+    // `gamma?` is the FUSED post-norm: present, the mix is RMSNormed IN PLACE over `out` and the
+    // packet subsumes the RMSNORM that would otherwise follow it. See `crate::k3::fuse_attnres_norm`.
+    S { op: DevOp::AttnRes, t: &["out", "prefix_sum", "block_residual", "score_w", "push_src?", "gamma?"], i: &["T", "H", "nb", "push_row", "nb_cap"], f: &["eps"], j: &[] },
     S { op: DevOp::SituGlu, t: &["out", "gate", "up"], i: &[], f: &[], j: &[] },
     S { op: DevOp::MlaOutGate, t: &["out", "a", "b"], i: &[], f: &[], j: &[] },
     S { op: DevOp::GemmFp8Blk, t: &["C", "A", "W", "weight_scale_inv"], i: &["M", "N", "K"], f: &[], j: &[] },
+    S { op: DevOp::GemmGluMxfp4, t: &["fu", "A", "Wg", "Sg", "Su", "Wu"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
+    // i5/i6/i7 are TENSOR HANDLES, not integers — the three E8M0 scale rows, demoted out of `t`
+    // because ten pointers do not fit eight slots. See the variant's doc comment.
+    S { op: DevOp::GemvQkvMxfp4, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v"], i: &["M", "Nq", "K", "Nk", "Nv", "S_q", "S_k", "S_v"], f: &[], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as
@@ -230,6 +251,19 @@ const INHERIT: &[(DevOp, DevOp, S)] = &[
     (DevOp::FlashPrefillFp8, DevOp::FlashPrefill,
      S { op: DevOp::FlashPrefillFp8, t: &["", "", "", "K", "V", "", "k_scale", "v_scale"],
          i: &[], f: &[], j: &[] }),
+    // The MLA fp8-KV twins state their FULL spec rather than an override: the bf16 parents stop
+    // at `i5=kv_mask`, and these add `t7=kv_scale`, `i6=krot_fp8` and `i7=gf`. A partial override
+    // cannot express that, because the doc-drift test compares the doc against the OVERRIDE.
+    (DevOp::FlashMlaDecodeFp8, DevOp::FlashMlaDecode,
+     S { op: DevOp::FlashMlaDecodeFp8,
+         t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "kv_scale"],
+         i: &["n_batch", "n_head", "kv_stride", "window", "nsplit", "kv_mask", "krot_fp8", "gf"],
+         f: &["scale"], j: &[] }),
+    (DevOp::FlashMlaPrefillFp8, DevOp::FlashMlaDecode,
+     S { op: DevOp::FlashMlaPrefillFp8,
+         t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "kv_scale"],
+         i: &["n_batch", "n_head", "kv_stride", "window", "n_tok", "kv_mask", "krot_fp8", "gf"],
+         f: &["scale"], j: &[] }),
     // "Operands are identical to opcode 67."
     (DevOp::MoeRouterGemmaScoreFast, DevOp::MoeRouterGemmaScore, NONE),
     // "ABI mirrors [`DevOp::FlashMerge`] with `t1..` in peer_scratch + xctr gates."

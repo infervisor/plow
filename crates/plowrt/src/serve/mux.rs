@@ -385,6 +385,7 @@ pub fn spawn(
                             &mut load,
                             &mut last_arrival,
                             arena.as_ref(),
+                            &metrics,
                         );
                     }
                     MuxMsg::Drain(done) => {
@@ -427,6 +428,7 @@ pub fn spawn(
                                 &mut load,
                                 &mut last_arrival,
                                 arena.as_ref(),
+                                &metrics,
                             ),
                             Ok(Some(MuxMsg::Drain(done))) => {
                                 draining = true;
@@ -447,6 +449,7 @@ pub fn spawn(
                             &mut load,
                             &mut last_arrival,
                             arena.as_ref(),
+                            &metrics,
                         ),
                         Ok(MuxMsg::Drain(done)) => {
                             draining = true;
@@ -699,6 +702,7 @@ fn admit_into(
     load: &mut LoadEstimator,
     last_arrival: &mut Option<Instant>,
     arena: Option<&SharedKvState>,
+    metrics: &Metrics,
 ) {
     // Refresh λ from the inter-arrival gap.
     let now = job.arrived;
@@ -706,6 +710,14 @@ fn admit_into(
         let dt = now.duration_since(prev).as_secs_f64();
         if dt > 1e-6 {
             load.lambda.update(1.0 / dt);
+            // PUBLISH IT. `lambda_milli` existed and was exported as
+            // `plowrt_arrival_rate` with no writer anywhere, so it read a flat
+            // 0.000 next to a live `plowrt_utilization` — which scrapes as "no
+            // traffic", not as "not implemented". The estimate was already
+            // here; only the store was missing.
+            metrics
+                .lambda_milli
+                .store((load.lambda.get() * 1000.0) as u64, Ordering::Relaxed);
         }
     } else {
         load.lambda.update(1.0);
@@ -714,6 +726,11 @@ fn admit_into(
     let Some(idx) = slots.iter().position(|s| s.is_none()) else {
         // Capacity exhausted — reject fast rather than sitting on the request.
         tracing::warn!(capacity = slots.len(), "mux: no free slot — request rejected");
+        // Counted here and NOT in the admission-shed path above: both end as a
+        // 429, but shedding is the controller dropping live work because
+        // predicted wait passed the SLO, while this is arrival meeting a full
+        // slot table. Adding them together hides which pressure caused the 429.
+        Metrics::inc(&metrics.rejected);
         let _ = job
             .respond
             .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
@@ -1328,10 +1345,15 @@ fn run_one_tick(
             }
             let pk_t = packlog::on().then(Instant::now);
             let pk_rows = feeds.len();
+            // §DSTEP owns the whole tick from here, so `TOKEN` is a real total
+            // and not a sum of parts. One tick is one token on the TP path,
+            // which is the only shape `PLOW_DECODE_BATCH=1` admits.
+            let t_tick = crate::obs::dstep::on().then(Instant::now);
             match e.step_batch(&feeds) {
                 Ok(out) => {
                     for (i, token) in out {
                         tracing::debug!(token, slot = i, "amd: token");
+                        let t_stream = crate::obs::dstep::on().then(Instant::now);
                         handle_produced_token(
                             &mut slots[i],
                             &arena,
@@ -1341,6 +1363,9 @@ fn run_one_tick(
                             &mut tokens_this_tick,
                             Some(stop.as_slice()),
                         );
+                        if let Some(t) = t_stream {
+                            crate::obs::dstep::STREAM.add(t.elapsed().as_nanos() as u64);
+                        }
                         if slots[i].is_none() {
                             e.release(i);
                         }
@@ -1360,6 +1385,9 @@ fn run_one_tick(
                         e.release(i);
                     }
                 }
+            }
+            if let Some(t) = t_tick {
+                crate::obs::dstep::token(t.elapsed().as_nanos() as u64);
             }
             if let Some(t) = pk_t {
                 packlog::record(0, t.elapsed().as_nanos() as u64, false, true, pk_rows);
@@ -1931,27 +1959,34 @@ fn handle_produced_token(
     // never render a terminal-less stream as a clean stop — see
     // `chat::buffer_and_reply` and `chat::sse_response`, which is where that is
     // enforced.
-    if slot
-        .respond
-        .try_send(StreamChunk::Token {
-            id: token,
-            text: delta,
-        })
-        .is_err()
+    // Stop conditions: the model's eos set when known (GPU path), else the
+    // reference path's newline-byte heuristic; and max_tokens.
+    //
+    // COMPUTED BEFORE THE SEND, because a stop token's TEXT is framing and must not
+    // reach the caller. It used to be computed after, which was invisible while every
+    // stop id rendered as the empty string — `skip_special_tokens` drops a token flagged
+    // `special`. Kimi-K3's turn ends at `<|close|>`, which its own
+    // `added_tokens_decoder` flags `"special": false`, so it renders literally and the
+    // answer came back as `The capital of France is Paris.<|close|>`.
+    let stop_token = !slot.gen.ignore_eos
+        && match stop_ids {
+            Some(ids) => ids.contains(&token),
+            None => token % 256 == u32::from(b'\n'),
+        };
+    if !stop_token
+        && slot
+            .respond
+            .try_send(StreamChunk::Token {
+                id: token,
+                text: delta,
+            })
+            .is_err()
     {
         if let Some(taken) = slot_opt.take() {
             release_kv(arena, taken.kv);
         }
         return;
     }
-
-    // Stop conditions: the model's eos set when known (GPU path), else the
-    // reference path's newline-byte heuristic; and max_tokens.
-    let stop_token = !slot.gen.ignore_eos
-        && match stop_ids {
-            Some(ids) => ids.contains(&token),
-            None => token % 256 == u32::from(b'\n'),
-        };
     let stop_max = slot.step >= slot.gen.max_tokens.max(1);
     if stop_token || stop_max {
         let reason = if stop_max && !stop_token {
