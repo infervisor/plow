@@ -1377,27 +1377,26 @@ fn prefault(src: &[u8], prof: &LoadProf) {
     LoadProf::add(&prof.fault_ns, t);
 }
 
-/// How many tensors ahead of the copy the prefetch pool runs. `0` disables it.
-///
-/// Sized in TENSORS because that is the unit the loops walk; an expert
-/// projection here is ~1.4 MiB, so the default leaves a few hundred MiB of reads
-/// outstanding — past the knee of the scaling table in
-/// [`crate::asset::checkpoint::Checkpoint::populate`], and small enough that the
-/// lookahead cannot evict what it just read.
-fn prefetch_depth() -> usize {
-    std::env::var("PLOW_PREFETCH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(256)
-}
+use crate::asset::checkpoint::{prefetch_depth, prefetch_threads};
 
-/// Prefetch threads per rank. The measured knee is ~16; below it the drive runs
-/// at latency rather than bandwidth.
-fn prefetch_threads() -> usize {
-    std::env::var("PLOW_PREFETCH_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(16)
+/// Stride between tensors carved out of the weight slab. Mirrors `exec::gpu`.
+///
+/// The STRIDE, not a claim about the resulting addresses: a tensor lands at
+/// `slab.base + k*SLAB_ALIGN`, so its true alignment is whatever the pool gave
+/// the base. ROCr reports `RUNTIME_ALLOC_GRANULE` = 4 KiB and allocates on it,
+/// and for a request the size of a model's weights it hands back far more (the
+/// measured rounding is to 2 MiB). Either floor already clears what the kernels
+/// ask of a global address — `global_load_dwordx4` wants 16 B, the MFMA tile
+/// loads no more — so the stride is chosen for padding waste, a few MiB across a
+/// blob, and not to raise alignment.
+const SLAB_ALIGN: u64 = 4096;
+
+/// Bytes a tensor of `bytes` occupies in the slab, trailing pad included.
+///
+/// The sizing pass sums this and the carve advances by it, over the same list —
+/// they must agree exactly or the carve runs past the allocation.
+fn slab_pad(bytes: u64) -> u64 {
+    bytes.div_ceil(SLAB_ALIGN) * SLAB_ALIGN
 }
 
 /// The bytes rank `rank` will actually TOUCH for `name`, as a queueable span.
@@ -2249,6 +2248,43 @@ pub struct AmdEngine {
     /// Index of the decode program — always last (`n_prog - 1`).
     decode: usize,
     devp: Vec<DeviceMem>,
+    /// Owner of the one allocation the ordinarily-allocated tensors are carved
+    /// out of; `devp` then holds **views** into it. Unlike the CUDA side, this
+    /// wins on BOTH axes, measured on 8×MI355X loading Kimi-K3 TP8 (5408 carved
+    /// tensors per rank, 22.84 GiB of named weights):
+    ///
+    /// | | slab | per-tensor |
+    /// |---|---|---|
+    /// | peak VRAM per card | 204 579 MiB | 205 904 MiB |
+    /// | `alloc_ms`, named tensors | 96–266 | 6410–8802 |
+    /// | wall, named tensors | 6.0–6.7 s | 13.0–16.7 s |
+    ///
+    /// **Memory: 1325 MiB per card, 10.35 GiB across the eight.** ROCr reports a
+    /// 4 KiB granule and then ignores it — under 2 MiB it hands back the next
+    /// POWER OF TWO with a 32 KiB floor, at or above 2 MiB it rounds to a 2 MiB
+    /// multiple. A 1.4 MiB expert projection commits 2 MiB, 42.9% lost; a 12 KiB
+    /// norm vector commits 32 KiB. One allocation pays that rounding once.
+    ///
+    /// **Time: ~7–8.5 s of driver time per rank, halving this phase.** This one
+    /// contradicts the obvious microbenchmark, so do not re-derive it from one:
+    /// 737 uniform 30 MiB allocations on an IDLE card cost 8.8 ms total, which
+    /// says the call is nearly free and is why the first version of this comment
+    /// claimed the slab was memory-only. The real load is not that shape — 5408
+    /// unevenly sized tensors interleaved with 168 GiB of expert buffers, eight
+    /// ranks against one driver — and there the per-call cost is three orders of
+    /// magnitude worse. Measure this on the model, never in isolation.
+    ///
+    /// The packed-expert buffers are unaffected (`alloc_ms` ~1.5–2.1 s either
+    /// way): `bind_packed_experts` already carves all of a layer's experts out
+    /// of two allocations, which is this same trick applied earlier.
+    ///
+    /// Views never free, so this owner must outlive them; both live on this
+    /// struct, and a view's `Drop` is a no-op, so field order cannot matter.
+    ///
+    /// `None` when the single allocation was refused and the loader fell back to
+    /// per-tensor allocation — a fragmented card can decline one big block and
+    /// still satisfy many small ones.
+    _weight_slab: Option<DeviceMem>,
     d_tens: DeviceMem,
     tensor_names: Vec<String>,
     /// Per-MoE-layer PACKED expert buffers (weights, then block scales). Never
@@ -2866,10 +2902,75 @@ impl AmdEngine {
             }
         };
         prefetch_ahead(&mut pf, depth);
+
+        // ---- one allocation for every tensor that would otherwise get its own
+        //
+        // Both passes below must agree, tensor for tensor, on which tensors are
+        // carved and how much each consumes: the sizing pass decides how big the
+        // slab is and the upload loop walks the cursor through it, so a filter
+        // that disagreed in either direction would either overrun the end or
+        // silently overlap two tensors. They are kept in step by sharing these
+        // two closures rather than by two hand-copied conditions.
+        //
+        // The two arms that take a view instead of an allocation:
+        //   * TP peer slots — storage owned by the `TpRank` peer region, which
+        //     `XReduce` reads over XGMI. Carving these out of local VRAM would
+        //     have every rank reduce slots its peers never wrote.
+        //   * full-layer KV under VMM — the pool's VA reservation, mapped lazily
+        //     at the per-sequence frontier.
+        let is_peer_slot = |name: &str| {
+            matches!(
+                (tp.is_some(), name),
+                (true, "act.og_tp") | (true, "act.dg_tp") | (true, "act.ug_tp")
+            )
+        };
+        let is_vmm = |name: &str| {
+            vmm.as_ref()
+                .and_then(|v| {
+                    let (l, t) = kv_tensor_name(name)?;
+                    v.tensor_va(l, t)
+                })
+                .is_some()
+        };
+        // `.max(1)`, exactly as the per-tensor arm does — a zero-byte tensor
+        // still needs a distinct address, and a zero-length carve would hand the
+        // next tensor the same one.
+        let slab_need = |bytes: u64| bytes.max(1);
+        let slab_bytes: u64 = blob
+            .tensors
+            .iter()
+            .filter(|td| !is_peer_slot(&td.name) && !is_vmm(&td.name))
+            .map(|td| slab_pad(slab_need(td.bytes)))
+            .sum();
+        let t_slab = Instant::now();
+        let weight_slab = match slab_bytes {
+            _ if !crate::asset::checkpoint::weight_slab_enabled() => None,
+            0 => None,
+            n => match EngineDevice::alloc(&*be, n) {
+                Ok(m) => Some(m),
+                // Not fatal: the per-tensor arm below still works and is only
+                // slower and hungrier. Better a fat load than a refused one.
+                Err(e) => {
+                    tracing::warn!(
+                        bytes = n,
+                        error = %e,
+                        "single weight allocation refused — falling back to per-tensor alloc"
+                    );
+                    None
+                }
+            },
+        };
+        LoadProf::add(&prof.alloc_ns, t_slab);
+        let mut slab_off: u64 = 0;
+
         let t_tensors = Instant::now();
         let mut devp = Vec::with_capacity(blob.tensors.len());
         let mut names = Vec::with_capacity(blob.tensors.len());
         let (mut wbytes, mut nweights) = (0u64, 0usize);
+        // Tensors that took a view into storage someone else owns (peer region
+        // or VMM reservation) rather than a carve out of the slab — the exact
+        // set the sizing pass filtered out.
+        let mut n_view = 0usize;
         for (i, td) in blob.tensors.iter().enumerate() {
             // §7a: the two row-parallel partials live in the PEER region, not in
             // ordinary VRAM. `o_proj`/`down` write straight into them and the
@@ -2895,6 +2996,7 @@ impl AmdEngine {
                 );
                 devp.push(DeviceMem::view(base, td.bytes.max(1)));
                 names.push(td.name.clone());
+                n_view += 1;
                 continue;
             }
             // Full-layer KV under VMM: the base is the pool's VA reservation,
@@ -2905,9 +3007,20 @@ impl AmdEngine {
                 let (l, t) = kv_tensor_name(&td.name)?;
                 v.tensor_va(l, t)
             });
-            let mem = match vmm_va {
-                Some(va) => DeviceMem::view(va, td.bytes.max(1)),
-                None => {
+            let mem = match (vmm_va, &weight_slab) {
+                (Some(va), _) => {
+                    n_view += 1;
+                    DeviceMem::view(va, td.bytes.max(1))
+                }
+                // Carve from the one allocation, in blob order. The sizing pass
+                // walked this same list with the same filter and the same
+                // `slab_need`, so the cursor cannot run past the end.
+                (None, Some(slab)) => {
+                    let m = DeviceMem::view(slab.base + slab_off, slab_need(td.bytes));
+                    slab_off += slab_pad(slab_need(td.bytes));
+                    m
+                }
+                (None, None) => {
                     let t = Instant::now();
                     let m = EngineDevice::alloc(&*be, td.bytes.max(1))?;
                     LoadProf::add(&prof.alloc_ns, t);
@@ -3065,6 +3178,28 @@ impl AmdEngine {
         // row-parallel slice into a MALLOC'd buffer faults the SDMA engine,
         // because the copy does not pin its source).
         prof.report("named tensors", t_tensors.elapsed(), wbytes);
+        if weight_slab.is_some() {
+            // The sizing pass and the carve walked the same list with the same
+            // filter, so the cursor must land exactly on the total: short wastes
+            // the tail, long means two tensors were aliased onto the same bytes
+            // and the weights are quietly wrong. The loop above cannot exit
+            // early — an error returns from the function — so unlike `exec::gpu`
+            // this needs no "did it finish" guard.
+            debug_assert_eq!(
+                slab_off, slab_bytes,
+                "weight slab carve did not consume exactly the sized span"
+            );
+            // `carved` is what the pool would have been asked for per tensor;
+            // the rounding it no longer pays is invisible from here (ROCr never
+            // reports it), so the honest thing to log is the request, and the
+            // saving is read off `MEMORY_AVAIL` by whoever is measuring.
+            tracing::info!(
+                slab_mib = slab_bytes / (1 << 20),
+                carved = devp.len() - n_view,
+                views = n_view,
+                "weights carved from one allocation"
+            );
+        }
         let mut expert_bufs = Vec::new();
         if let Some(c) = ckpt.as_ref() {
             let eprof = LoadProf::default();
@@ -3373,6 +3508,7 @@ impl AmdEngine {
             progs,
             decode,
             devp,
+            _weight_slab: weight_slab,
             d_tens,
             tensor_names: names,
             _expert_bufs: expert_bufs,
@@ -5582,5 +5718,68 @@ mod expert_name_tests {
         assert!(e.contains("MISSING EXPERT WEIGHT"), "{e}");
         assert!(e.contains("experts.0.gate_proj.weight"), "{e}");
         assert!(e.contains("block_sparse_moe.experts.0.w1.weight_packed"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod slab_tests {
+    use super::*;
+
+    #[test]
+    fn pad_rounds_up_and_leaves_exact_multiples_alone() {
+        assert_eq!(slab_pad(0), 0);
+        assert_eq!(slab_pad(1), SLAB_ALIGN);
+        assert_eq!(slab_pad(SLAB_ALIGN - 1), SLAB_ALIGN);
+        assert_eq!(slab_pad(SLAB_ALIGN), SLAB_ALIGN);
+        assert_eq!(slab_pad(SLAB_ALIGN + 1), 2 * SLAB_ALIGN);
+    }
+
+    /// The property the carve depends on: sizing the allocation by summing
+    /// `slab_pad` and advancing a cursor by `slab_pad` over the same list must
+    /// agree, and no tensor may extend past the total. An overshoot would alias
+    /// two tensors onto the same bytes — silently wrong weights rather than a
+    /// crash, which is why the loader asserts it rather than trusting it.
+    #[test]
+    fn carve_cursor_lands_exactly_on_the_sized_total() {
+        // Sub-stride, exact-stride, stride+1, zero, and a real expert
+        // projection (1.4 MiB) — the size ROCr rounds worst.
+        let sizes = [
+            1u64,
+            SLAB_ALIGN - 1,
+            SLAB_ALIGN,
+            SLAB_ALIGN + 1,
+            0,
+            1_468_006,
+            1 << 20,
+        ];
+        let total: u64 = sizes.iter().copied().map(slab_pad).sum();
+
+        let mut off = 0u64;
+        for s in sizes {
+            assert!(off + s <= total, "tensor at {off} (+{s}) runs past {total}");
+            off += slab_pad(s);
+        }
+        assert_eq!(off, total, "cursor must consume exactly the sized span");
+    }
+
+    /// The loader carves `bytes.max(1)`, never `bytes`: a zero-byte tensor still
+    /// needs an address of its own, and a zero-length carve would hand the next
+    /// tensor the same one. This pins that the `.max(1)` is load-bearing.
+    #[test]
+    fn zero_byte_tensors_still_advance_the_cursor() {
+        let need = |b: u64| b.max(1);
+        let sizes = [0u64, 0, 0];
+        let total: u64 = sizes.iter().copied().map(|b| slab_pad(need(b))).sum();
+        assert_eq!(total, 3 * SLAB_ALIGN);
+
+        let mut off = 0u64;
+        let mut seen = Vec::new();
+        for s in sizes {
+            seen.push(off);
+            off += slab_pad(need(s));
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "every tensor must get a distinct address");
     }
 }

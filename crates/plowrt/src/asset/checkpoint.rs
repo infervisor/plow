@@ -195,6 +195,52 @@ pub(crate) struct Prefetcher {
     workers: Vec<std::thread::JoinHandle<()>>,
 }
 
+/// How many tensors ahead of the copy the prefetch pool runs. `0` disables it.
+///
+/// Sized in TENSORS because that is the unit the loops walk; an expert
+/// projection here is ~1.4 MiB, so the default leaves a few hundred MiB of reads
+/// outstanding — past the knee of the scaling table in
+/// [`Checkpoint::populate`], and small enough that the lookahead cannot evict
+/// what it just read.
+pub(crate) fn prefetch_depth() -> usize {
+    std::env::var("PLOW_PREFETCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256)
+}
+
+/// Prefetch threads per rank. The measured knee is ~16; below it the drive runs
+/// at latency rather than bandwidth.
+pub(crate) fn prefetch_threads() -> usize {
+    std::env::var("PLOW_PREFETCH_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16)
+}
+
+/// Carve the weights out of ONE device allocation instead of asking the driver
+/// per tensor. `PLOW_WEIGHT_SLAB=0` turns it off on both backends.
+///
+/// On by default because the per-tensor path wastes memory to allocator
+/// rounding — modestly on CUDA (322 MiB → 21 MiB on a 12B model), badly on ROCr,
+/// which rounds every request under 2 MiB up to the next POWER OF TWO (1325 MiB
+/// per card on Kimi-K3).
+///
+/// Whether it also saves TIME differs by backend, and neither answer generalises:
+/// on CUDA it does not (the driver charges by committed bytes, 1.97 s → 1.92 s),
+/// on ROCr it does, by ~7–8.5 s per rank. See `exec::gpu`'s and `exec::amd`'s
+/// `_weight_slab` for the measurements and for why the AMD one cannot be
+/// reproduced by a standalone allocation benchmark.
+///
+/// The off switch exists because one allocation is a strictly stronger demand on
+/// the card than many small ones: a fragmented or shared GPU can satisfy the
+/// second and refuse the first. The loader already falls back on its own when
+/// the allocation is refused outright, so this is for the case where it
+/// SUCCEEDS and is still the wrong thing — a co-tenant that needed the hole.
+pub(crate) fn weight_slab_enabled() -> bool {
+    std::env::var("PLOW_WEIGHT_SLAB").ok().as_deref() != Some("0")
+}
+
 impl Prefetcher {
     /// `threads = 0` disables prefetching and returns `None`, which every call
     /// site already handles — the loader then faults pages in itself, correctly
@@ -292,9 +338,13 @@ pub(crate) fn read_eos_ids(dir: &Path) -> Vec<u32> {
 /// `response<|sep|><|close|>message<|sep|>` and only then `<|end_of_msg|>` (163586), which is what
 /// `eos_token_id` names. Stopping only at eos returned
 ///
-///     The capital of France is Paris.<|close|>response<|sep|><|close|>message<|sep|>
+/// ```text
+/// The capital of France is Paris.<|close|>response<|sep|><|close|>message<|sep|>
+/// ```
 ///
 /// — a correct answer with four markers of channel bookkeeping stapled to it.
+/// (Fenced `text`, not indented: an indented block is a RUST block to rustdoc,
+/// which then tries to compile this sentence and fails the doctest run.)
 ///
 /// Keyed on the CHECKPOINT's own tokens rather than on a model name: the extra stop is added only
 /// when this checkpoint both declares `<|end_of_msg|>` as its eos AND ships a `<|close|>` token,

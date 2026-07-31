@@ -291,7 +291,11 @@ fn attach_latency_vs_copy_baseline() {
             let t0 = Instant::now();
             kv.ensure_rows(0, rows).unwrap();
             let owner_ms = t0.elapsed().as_secs_f64() * 1e3;
-            kv.publish(0, rows as usize, 4, |_| Ok(())).unwrap();
+            // The TOKENS, not a row count: `publish` hashes the block chain out
+            // of them, which is what `try_attach` below matches the borrower's
+            // prefix against. Passing a length here compiled while the parameter
+            // was a `usize` and stopped when it became `&[u32]` (8a38331).
+            kv.publish(0, &prompt, 4, |_| Ok(())).unwrap();
 
             let t0 = Instant::now();
             let at = kv.try_attach(1, &borrower).unwrap().expect("attach");

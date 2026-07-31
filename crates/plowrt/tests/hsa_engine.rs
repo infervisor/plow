@@ -179,6 +179,9 @@ fn the_production_interpreter_dispatches_and_retires() {
         trace: 0,
         cur_seg: 0,
         l2_domains: 0,
+        // Hierarchy off, as in both engines: nothing here sets `l2_domains`,
+        // and the two-level maintenance scratch is meaningless without it.
+        hier_base: 0,
         n_seg: 1,
         gq_stream: 0,
         gq_seg_ofs: 0,
@@ -302,6 +305,9 @@ fn gfx950_runs_the_prefill_arena_the_objects_actually_declare() {
         trace: 0,
         cur_seg: 0,
         l2_domains: 0,
+        // Hierarchy off, as in both engines: nothing here sets `l2_domains`,
+        // and the two-level maintenance scratch is meaningless without it.
+        hier_base: 0,
         n_seg: 1,
         gq_stream: 0,
         gq_seg_ofs: 0,

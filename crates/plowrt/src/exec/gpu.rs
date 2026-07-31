@@ -288,6 +288,28 @@ fn describe_candidates(assets_dir: &Path) -> String {
     }
 }
 
+/// Split the weight-upload wall time into alloc / stage+DMA / memset. Off by
+/// default — it is an `Instant` per tensor on a path that walks hundreds.
+crate::env_flag!(fn load_profile, "PLOW_LOAD_PROFILE");
+
+/// Stride between tensors carved out of the weight slab.
+///
+/// This is the STRIDE, not a claim about the resulting addresses: a tensor lands
+/// at `slab.base + k*SLAB_ALIGN`, so its true alignment is whatever `cuMemAlloc`
+/// gave the base — 256 B by contract, in practice the allocation granularity for
+/// a request this size. That floor already clears everything the kernels ask of a
+/// global address (TMA on sm_90a wants 128 B, `cp.async` 16 B), so the stride is
+/// chosen for padding waste — a few MiB across a blob — and not to raise it.
+const SLAB_ALIGN: u64 = 4096;
+
+/// Bytes a tensor of `bytes` occupies in the slab, trailing pad included.
+///
+/// The sizing pass sums this and the carve advances by it, over the same list —
+/// they must agree exactly or the carve runs past the allocation.
+fn slab_pad(bytes: u64) -> u64 {
+    bytes.div_ceil(SLAB_ALIGN) * SLAB_ALIGN
+}
+
 /// One block per executor, 8 worker warps — `dev_isa.h` workgroup geometry.
 const BLOCK: u32 = 256;
 /// Weight-upload staging chunk (pinned), as in the harness.
@@ -427,8 +449,40 @@ pub struct GpuEngine {
     /// K-token greedy quantum with one host sync.
     multistep: Option<MultiStep>,
 
-    /// Per-tensor device buffers, indexed by blob tensor handle.
+    /// Per-tensor device buffers, indexed by blob tensor handle. Ordinarily
+    /// **views** into `_weight_slab`, not owners — see it for why.
     devp: Vec<DeviceMem>,
+    /// Owner of the one allocation every non-VMM tensor is carved out of.
+    ///
+    /// The blob declares every tensor and its size before a byte moves, so the
+    /// whole layout is known up front and there is no reason to ask the driver
+    /// for it a tensor at a time.
+    ///
+    /// **This does not make the load faster, and it was kept anyway.** Per-tensor
+    /// allocation costs a flat ~2.0 s on a 12B load — 737 `cuMemAlloc`s, a third
+    /// of the total, identical cold or warm because it is driver time rather
+    /// than I/O (`PLOW_LOAD_PROFILE=1`) — and batching them into one 25 GiB
+    /// request costs 1.92 s, which is the same number. The driver charges by
+    /// COMMITTED BYTES, not by call count: 13.0 GiB/s at 12B and 13.4 GiB/s at
+    /// 31B, one rate across two sizes. Killing the term needs the commit
+    /// avoided rather than batched (VMM with lazy mapping, as `VmmKv` already
+    /// does for KV), and that is a different patch. See
+    /// `perf-data/coldstart-plow-vs-vllm-gh200.md` §4b, recorded so this is not
+    /// re-tried as a speed fix.
+    ///
+    /// What it does buy is MEMORY: per-allocation rounding waste on a 12B model
+    /// drops from 322 MiB to 21 MiB, which the co-residency planner spends
+    /// directly. The AMD loader carries the same carve for the same reason and a
+    /// much larger one — see `exec::amd`'s `_weight_slab`, where ROCr's
+    /// next-power-of-two rounding under 2 MiB makes the waste far worse.
+    ///
+    /// Views never free, so this owner must outlive them; both live here, and a
+    /// `View`'s Drop is a no-op, so field drop order cannot matter.
+    ///
+    /// `None` when the single allocation failed and the loader fell back to
+    /// per-tensor allocation (a fragmented card can refuse one big block and
+    /// still satisfy many small ones).
+    _weight_slab: Option<DeviceMem>,
     d_inst: DeviceMem,
     /// Owner of the decode counter+cursor allocation. `d_ctr` and the decode
     /// GQ cursor are aliased **views** into it (never freed by their own
@@ -884,7 +938,9 @@ impl GpuEngine {
 
         // ---- weights ----
         let t_weights = std::time::Instant::now();
-        let ckpt = Checkpoint::open(checkpoint_dir)?;
+        // `Arc`, because the prefetch pool madvises this mapping from other
+        // threads while this one copies out of it.
+        let ckpt = std::sync::Arc::new(Checkpoint::open(checkpoint_dir)?);
         tracing::info!(
             checkpoint = %checkpoint_dir.display(),
             "checkpoint opened, starting weight upload to GPU..."
@@ -895,25 +951,112 @@ impl GpuEngine {
         // this moves the whole checkpoint (tens of GiB).
         let mut pipe = UploadPipe::new(&be)?;
 
+        // The staging loop above overlaps the host copy with the DMA, but both
+        // still run on THIS thread — so a cold checkpoint pays its page faults
+        // serially, and one thread never gets past ~2.9 GiB/s no matter how fast
+        // the drive is (the scaling table on `Checkpoint::populate`). The pool
+        // faults the pages in ahead of the copy so the copy's own access is a
+        // hit; the AMD loader has done this since it was written and this path
+        // was simply never given it. Measured on this box, cold, on the 22.28 GiB
+        // gemma-4-12B shard: 7.17 s single-threaded vs 4.45 s with 32 threads.
+        let depth = crate::asset::checkpoint::prefetch_depth();
+        let prefetch = crate::asset::checkpoint::Prefetcher::start(
+            std::sync::Arc::clone(&ckpt),
+            crate::asset::checkpoint::prefetch_threads(),
+            depth,
+        );
+        // Runs `depth` WEIGHT tensors ahead of the copy over the same list in the
+        // same order, so the cursor only moves forward and each tensor is queued
+        // exactly once. Non-weights are skipped so the depth counts reads, not
+        // table entries — most of a blob's tensors are scratch that touches no
+        // checkpoint at all. TP1 here, so the touched bytes are the whole tensor.
+        let prefetch_ahead = |cur: &mut usize, budget: usize| {
+            let Some(pool) = prefetch.as_ref() else { return };
+            let mut n = 0;
+            while *cur < blob.tensors.len() && n < budget {
+                let td = &blob.tensors[*cur];
+                *cur += 1;
+                if !packet::names::is_checkpoint_weight(&td.name) {
+                    continue;
+                }
+                if let Some(s) = ckpt.span(&td.name, 0, td.bytes as usize) {
+                    pool.push(s);
+                }
+                n += 1;
+            }
+        };
+        let mut pf = 0usize;
+        prefetch_ahead(&mut pf, depth);
+
         let gen_by_tensor: std::collections::HashMap<u32, &packet::rope::GenTensor> =
             blob.gen.iter().map(|g| (g.tensor, g)).collect();
+
+        // Where a tensor's storage comes from, decided once so the sizing pass
+        // and the upload loop cannot disagree about it.
+        let vmm_va_of = |name: &str| -> Option<u64> {
+            let v = vmm.as_ref()?;
+            let (l, t) = kv_tensor_name(name)?;
+            v.kv.tensor_va(l, t)
+        };
+        let slab_bytes: u64 = blob
+            .tensors
+            .iter()
+            .filter(|td| vmm_va_of(&td.name).is_none())
+            .map(|td| slab_pad(td.bytes))
+            .sum();
+        let t_slab = load_profile().then(std::time::Instant::now);
+        let weight_slab = match slab_bytes {
+            _ if !crate::asset::checkpoint::weight_slab_enabled() => None,
+            0 => None,
+            n => match be.alloc(0, n) {
+                Ok(m) => Some(m),
+                // Not fatal: the per-tensor path below still works, it is just
+                // slower. Better a slow load than a refused one.
+                Err(e) => {
+                    tracing::warn!(
+                        bytes = n,
+                        error = %e,
+                        "single weight allocation refused — falling back to per-tensor alloc"
+                    );
+                    None
+                }
+            },
+        };
+        let ns_slab = t_slab.map(|t| t.elapsed().as_nanos()).unwrap_or(0);
+        let mut slab_off: u64 = 0;
+
         let mut devp: Vec<DeviceMem> = Vec::with_capacity(blob.tensors.len());
         let (mut t_ids, mut t_pos, mut t_kvlen, mut t_logits) = (None, None, None, None);
         let (mut wb, mut kvb, mut nw) = (0u64, 0u64, 0usize);
+        // `PLOW_LOAD_PROFILE=1` splits the upload wall time into alloc / stage+DMA
+        // / memset. Off by default: it is one Instant per tensor on a path that
+        // walks hundreds of them, and the answer only matters when tuning the
+        // loader. Reading it once here keeps the env lookup off the loop.
+        let load_prof = load_profile();
+        let (mut ns_alloc, mut ns_stage, mut ns_memset) = (0u128, 0u128, 0u128);
         let mut upload_all = || -> Result<()> {
             for (i, td) in blob.tensors.iter().enumerate() {
                 // Full-layer KV under VMM: the tensor base is the pool's VA
                 // reservation (a view — the pool owns unmap/release); no
                 // cudaMalloc and no memset (the VA is mapped lazily at the
                 // per-sequence frontier; KV is always written before read).
-                let vmm_va = vmm.as_ref().and_then(|v| {
-                    let (l, t) = kv_tensor_name(&td.name)?;
-                    v.kv.tensor_va(l, t)
-                });
-                let mem = match vmm_va {
-                    Some(va) => DeviceMem::view(va, td.bytes),
-                    None => be.alloc(0, td.bytes)?,
+                let vmm_va = vmm_va_of(&td.name);
+                let t_alloc = load_prof.then(std::time::Instant::now);
+                let mem = match (vmm_va, &weight_slab) {
+                    (Some(va), _) => DeviceMem::view(va, td.bytes),
+                    // Carve from the one allocation, in blob order — the sizing
+                    // pass walked the same list with the same filter, so the
+                    // cursor cannot run past the end.
+                    (None, Some(slab)) => {
+                        let m = DeviceMem::view(slab.base + slab_off, td.bytes);
+                        slab_off += slab_pad(td.bytes);
+                        m
+                    }
+                    (None, None) => be.alloc(0, td.bytes)?,
                 };
+                if let Some(t) = t_alloc {
+                    ns_alloc += t.elapsed().as_nanos();
+                }
                 match td.name.as_str() {
                     "in.ids" => t_ids = Some(i),
                     "in.pos" => t_pos = Some(i),
@@ -964,9 +1107,16 @@ impl GpuEngine {
                         mib = td.bytes / (1 << 20),
                         "uploading weight tensor"
                     );
+                    // One weight consumed, so let the pool queue one more and
+                    // stay `depth` ahead rather than draining to nothing.
+                    prefetch_ahead(&mut pf, 1);
                     // Double-buffered async H2D (overlaps host copy with DMA).
+                    let t_stage = load_prof.then(std::time::Instant::now);
                     for (o, chunk) in src.chunks(STAGE).enumerate() {
                         pipe.push(mem.base + (o * STAGE) as u64, chunk)?;
+                    }
+                    if let Some(t) = t_stage {
+                        ns_stage += t.elapsed().as_nanos();
                     }
                     wb += td.bytes;
                     nw += 1;
@@ -1009,7 +1159,11 @@ impl GpuEngine {
                     // rows' garbage is bounded out by kvlen — so skip its
                     // memset (10.5 GiB on a B=4 ctx-8k engine). Other scratch
                     // (act.*/in.*) stays zeroed (cheap, conservative).
+                    let t_ms = load_prof.then(std::time::Instant::now);
                     be.memset_d8(mem.base, 0, td.bytes as usize)?;
+                    if let Some(t) = t_ms {
+                        ns_memset += t.elapsed().as_nanos();
+                    }
                 }
                 devp.push(mem);
             }
@@ -1017,6 +1171,17 @@ impl GpuEngine {
         };
         let enqueued = upload_all();
         drop(upload_all); // release the &mut pipe borrow before finishing it
+        // The sizing pass and the carve walked the same list with the same
+        // filter, so on a completed pass the cursor must land exactly on the
+        // total: short wastes the tail, long means two tensors were aliased onto
+        // the same bytes and the weights are quietly wrong. Only meaningful when
+        // the loop ran to the end — an error exits it early by design.
+        if enqueued.is_ok() && weight_slab.is_some() {
+            debug_assert_eq!(
+                slab_off, slab_bytes,
+                "weight slab carve did not consume exactly the sized span"
+            );
+        }
         // Retire every enqueued async H2D, then release the pinned buffers
         // (2×64 MiB) + load stream before serving.
         let uploaded = enqueued.and_then(|()| pipe.finish());
@@ -1037,6 +1202,21 @@ impl GpuEngine {
             throughput_gib_s = format!("{throughput:.2}").as_str(),
             "checkpoint weights uploaded to GPU"
         );
+        if load_prof {
+            // `stage` is the staging memcpy PLUS the per-chunk event wait that
+            // gates pinned-buffer reuse, so it carries the pipeline's stalls;
+            // `finish` (the stream drain) is whatever DMA was still outstanding.
+            let ms = |ns: u128| format!("{:.0}", ns as f64 / 1e6);
+            tracing::info!(
+                slab_alloc_ms = ms(ns_slab).as_str(),
+                alloc_ms = ms(ns_alloc).as_str(),
+                stage_dma_ms = ms(ns_stage).as_str(),
+                memset_ms = ms(ns_memset).as_str(),
+                total_ms = ms(weight_elapsed.as_nanos()).as_str(),
+                n_alloc = devp.len(),
+                "weight upload breakdown"
+            );
+        }
         let (t_ids, t_pos, t_kvlen, t_logits) =
             match (t_ids, t_pos, t_kvlen, t_logits) {
                 (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
@@ -1222,6 +1402,9 @@ impl GpuEngine {
             trace: 0,
             cur_seg: 0,
             l2_domains: 0,
+            // Hierarchy off: this engine never sets `l2_domains`, and the
+            // two-level maintenance scratch is meaningless without it.
+            hier_base: 0,
             n_seg: 1,
             gq_stream: d_gq_stream.base,
             gq_seg_ofs: d_gq_seg.base,
@@ -1478,6 +1661,7 @@ impl GpuEngine {
             kvrow_hi: hi,
             ctr_bytes,
             devp,
+            _weight_slab: weight_slab,
             d_inst,
             _ctr_block: ctr_block,
             d_ctr,
@@ -2691,6 +2875,7 @@ impl GpuEngine {
                 trace: 0,
                 cur_seg: 0,
                 l2_domains: 0,
+                hier_base: 0,
                 n_seg: 1,
                 gq_stream: d_gq_stream.base,
                 gq_seg_ofs: d_gq_seg.base,
@@ -3618,6 +3803,47 @@ impl Drop for GpuEngine {
         if let Err(e) = self.be.module_unload(&self.module) {
             tracing::warn!(error = %e, "unload decode module");
         }
+    }
+}
+
+#[cfg(test)]
+mod slab_tests {
+    use super::*;
+
+    #[test]
+    fn pad_rounds_up_and_leaves_exact_multiples_alone() {
+        assert_eq!(slab_pad(0), 0);
+        assert_eq!(slab_pad(1), SLAB_ALIGN);
+        assert_eq!(slab_pad(SLAB_ALIGN - 1), SLAB_ALIGN);
+        assert_eq!(slab_pad(SLAB_ALIGN), SLAB_ALIGN);
+        assert_eq!(slab_pad(SLAB_ALIGN + 1), 2 * SLAB_ALIGN);
+    }
+
+    /// The property the carve actually depends on: summing `slab_pad` to size
+    /// the allocation and advancing a cursor by `slab_pad` over the same list
+    /// must agree, and no tensor may extend past the total. An overshoot here
+    /// would alias two tensors onto the same bytes — silently wrong weights
+    /// rather than a crash, which is why it is asserted rather than trusted.
+    #[test]
+    fn carve_cursor_lands_exactly_on_the_sized_total() {
+        // Deliberately mixed: sub-stride, exact-stride, stride+1, zero, large.
+        let sizes = [1u64, SLAB_ALIGN - 1, SLAB_ALIGN, SLAB_ALIGN + 1, 0, 1 << 20, (1 << 20) + 7];
+        let total: u64 = sizes.iter().copied().map(slab_pad).sum();
+
+        let mut off = 0u64;
+        for s in sizes {
+            assert!(off + s <= total, "tensor at {off} (+{s}) runs past {total}");
+            off += slab_pad(s);
+        }
+        assert_eq!(off, total, "cursor must consume exactly the sized span");
+    }
+
+    /// A blob of nothing but zero-byte tensors sizes to zero, which the loader
+    /// treats as "no slab" — the arm that must not divide by or allocate 0.
+    #[test]
+    fn all_empty_tensors_size_to_zero() {
+        let total: u64 = [0u64; 8].iter().copied().map(slab_pad).sum();
+        assert_eq!(total, 0);
     }
 }
 
