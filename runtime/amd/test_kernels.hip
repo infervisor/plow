@@ -543,6 +543,53 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_f
                                              PLOW_KV_MASK_NONE, blockIdx.x, gridDim.x, lds);
 }
 
+/* MLA PREFILL, TILED MFMA — the shipped path (PLOW_MLA_PF_MFMA). Same operands, same
+ * (Opart,m,l) partials, so the harness can run it against `mla_flash_prefill_512` on one
+ * fixture and diff. It is NOT bit-exact against that kernel and must not be checked as if
+ * it were: MFMA sums the DK contraction in a different order, so the gate is a relative
+ * tolerance. What IS exact is the fp8 association — see the kernel's header. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void mla_flash_prefill_mfma_512(float* Opart, float* mlpart, const bf16* Qabs,
+                                const bf16* Qrope, const bf16* Ckv, const bf16* Krope,
+                                const int* kv_len, unsigned n_batch, unsigned n_tok,
+                                unsigned n_head, unsigned kv_stride, unsigned window,
+                                float scale) {
+    __shared__ float lds[FA_MLA_PF_LDS_FLOATS(512, 64)];
+    d_flash_mla_prefill_mfma<512, 64, /*FP8=*/false>(
+        Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len, n_batch, n_tok, n_head, kv_stride,
+        window, scale, PLOW_KV_MASK_NONE, blockIdx.x, gridDim.x, lds, nullptr, 0);
+}
+
+/* FP8-LATENT MLA prefill, both bodies. This is op 110 — the arm Kimi-K3 actually dispatches
+ * — so it gets its own pair of entry points rather than riding on the bf16 check. `kv_scale`
+ * is the two-strip array d_flash_mla_decode documents: ckv row scales, then krot row scales.
+ * The tiled kernel does NOT dequantize into LDS, so the two bodies associate the scales
+ * differently by design and the harness compares them with a tolerance. [MLA-FP8-KV] */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void mla_flash_prefill_fp8_512(float* Opart, float* mlpart, const bf16* Qabs,
+                               const bf16* Qrope, const bf16* Ckv, const bf16* Krope,
+                               const int* kv_len, unsigned n_batch, unsigned n_tok,
+                               unsigned n_head, unsigned kv_stride, unsigned window,
+                               float scale, const float* kv_scale, unsigned krot_fp8) {
+    __shared__ float lds[FA_MLA_DEC_LDS_FLOATS(512, 64, GLM_MLA_GF)];
+    d_flash_mla_prefill_fp8<512, 64, GLM_MLA_GF>(Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len,
+                                                 n_batch, n_tok, n_head, kv_stride, window,
+                                                 scale, PLOW_KV_MASK_NONE, blockIdx.x,
+                                                 gridDim.x, lds, kv_scale, krot_fp8);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void mla_flash_prefill_mfma_fp8_512(float* Opart, float* mlpart, const bf16* Qabs,
+                                    const bf16* Qrope, const bf16* Ckv, const bf16* Krope,
+                                    const int* kv_len, unsigned n_batch, unsigned n_tok,
+                                    unsigned n_head, unsigned kv_stride, unsigned window,
+                                    float scale, const float* kv_scale, unsigned krot_fp8) {
+    __shared__ float lds[FA_MLA_PF_LDS_FLOATS(512, 64)];
+    d_flash_mla_prefill_mfma<512, 64, /*FP8=*/true>(
+        Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len, n_batch, n_tok, n_head, kv_stride,
+        window, scale, PLOW_KV_MASK_NONE, blockIdx.x, gridDim.x, lds, kv_scale, krot_fp8);
+}
+
 /* GATHERED MLA prefill (GLM DSA / DeepSeek sparse). idx is [b][t][top_k] — one selected set
  * PER QUERY, the axis the decode gather does not have. No mask: the selected set is causal by
  * construction, matching FLASH_GATHER_DECODE. [DEEPSEEK-MLA] */

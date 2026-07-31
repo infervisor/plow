@@ -262,10 +262,24 @@ pub struct KdaState {
 
 /// Declare the carried state for one KDA layer. `prefix` is a COMPILER-owned namespace
 /// (`kv.`-style), not a checkpoint one: these are runtime buffers, not weights.
-pub fn declare_kda_state(b: &mut Builder, c: &KdaCfg, prefix: &str) -> KdaState {
-    let cw = c.proj() as u64 * c.conv_w as u64 * 4;
+/// `slots` is how many INDEPENDENT SEQUENCES this program carries state for — 1 for every
+/// program that exists today, `B` for a batched decode program.
+///
+/// It is not the same thing as the program's `t`. A prefill program has `t` rows and ONE slot,
+/// because its rows are consecutive tokens of one sequence threading through one carried state.
+/// A batched decode program has `t == B` rows and `B` slots. Conflating the two is the failure
+/// `RowKind` exists to name (see `crate::k3::RowKind`), and it is silent: the wrong one still
+/// allocates, still runs, and still produces fluent text.
+///
+/// The cost is real and worth stating at the declaration: the state is **6.5625 MiB per
+/// (sequence, layer)** and CONSTANT in context, so 69 KDA layers are 0.44 GiB per slot. That is
+/// a hard cost at ADMISSION rather than one that grows — which is the architectural argument for
+/// KDA and also, once slots exist, the thing that bounds how many sequences fit.
+pub fn declare_kda_state(b: &mut Builder, c: &KdaCfg, prefix: &str, slots: u64) -> KdaState {
+    assert!(slots >= 1, "declare_kda_state: slots must be >= 1");
+    let cw = c.proj() as u64 * c.conv_w as u64 * 4 * slots;
     KdaState {
-        state: b.tensor(&format!("{prefix}state"), c.state_elems() * 4),
+        state: b.tensor(&format!("{prefix}state"), c.state_elems() * 4 * slots),
         conv_state: [
             b.tensor(&format!("{prefix}conv_state.q"), cw),
             b.tensor(&format!("{prefix}conv_state.k"), cw),
@@ -406,8 +420,13 @@ pub fn emit_kda_mixer(
     // `crate::k3::fuse_attnres_norm`), so this mixer must not norm it a second time.
     prenormed: bool,
     deps: &[u32],
+    // See `emit_kda_mixer_ex`'s parameter of the same name: `true` means the `t` rows are
+    // independent sequences (batched decode), each carrying its own state.
+    seq_rows: bool,
 ) -> (u32, u32) {
-    emit_kda_mixer_ex(b, c, w, st, act_prefix, t, hidden, attn_dst, n_cu, prenormed, deps, fuse_kda())
+    emit_kda_mixer_ex(
+        b, c, w, st, act_prefix, t, hidden, attn_dst, n_cu, prenormed, deps, fuse_kda(), seq_rows,
+    )
 }
 
 /// [`emit_kda_mixer`] with the P8-P10 fusion decided by the CALLER rather than by the environment.
@@ -430,6 +449,9 @@ fn emit_kda_mixer_ex(
     prenormed: bool,
     deps: &[u32],
     fuse: bool,
+    // Do this mixer's `t` rows carry one state between them, or one state EACH? `true` is a
+    // batched decode program (independent sequences); everything today is `false`.
+    seq_rows: bool,
 ) -> (u32, u32) {
     assert_eq!(c.head_dim % 64, 0, "KDA: head_dim must be a multiple of the 64-lane wave");
     assert_eq!(
@@ -577,6 +599,10 @@ fn emit_kda_mixer_ex(
             d.i[2] = c.conv_w;
             d.i[3] = 1; // silu, applied AFTER the convolution
             d.i[4] = w.conv_w[2];
+            // Per-row conv-window stride, in floats. NOT a flag and NOT in `i[]`: every integer
+            // slot on this op is an operand (`T C W act w_v cs_q cs_k cs_v`), and reading one of
+            // them as flags faulted the GPU. `fj[1].u` is untouched by this emitter.
+            d.j[0] = if seq_rows { p * c.conv_w } else { 0 };
             d.i[5] = st.conv_state[0];
             d.i[6] = st.conv_state[1];
             d.i[7] = st.conv_state[2];
@@ -598,7 +624,10 @@ fn emit_kda_mixer_ex(
             d.i[1] = nh;
             d.i[2] = hd;
             d.i[3] = c.bv;
-            d.i[4] = 1; // flags bit0: L2-normalize q and k in kernel, eps INSIDE the sqrt
+            // bit0: L2-normalize q and k in kernel, eps INSIDE the sqrt.
+            // bit1 (PLOW_KDA_F_SEQ_ROWS): the rows are INDEPENDENT SEQUENCES, so the recurrence
+            // strides its carried state per row instead of threading them all through one.
+            d.i[4] = 1 | if seq_rows { 2 } else { 0 };
             d.i[5] = w.dt_bias;
             d.i[6] = gate_mode;
             d.f[0] = scale;
@@ -651,7 +680,10 @@ fn emit_kda_mixer_ex(
             d.i[1] = nh;
             d.i[2] = hd;
             d.i[3] = c.bv;
-            d.i[4] = 1; // flags bit0: L2-normalize q and k in kernel, eps INSIDE the sqrt
+            // bit0: L2-normalize q and k in kernel, eps INSIDE the sqrt.
+            // bit1 (PLOW_KDA_F_SEQ_ROWS): the rows are INDEPENDENT SEQUENCES, so the recurrence
+            // strides its carried state per row instead of threading them all through one.
+            d.i[4] = 1 | if seq_rows { 2 } else { 0 };
             d.f[0] = scale;
         })
     };
@@ -697,7 +729,7 @@ pub fn emit_kda_layer(
     n_cu: u32,
     deps: &[u32],
 ) -> u32 {
-    let (c_o, attn) = emit_kda_mixer(b, c, w, st, act_prefix, t, hidden, None, n_cu, false, deps);
+    let (c_o, attn) = emit_kda_mixer(b, c, w, st, act_prefix, t, hidden, None, n_cu, false, deps, false);
     let all: Vec<u32> = (0..n_cu).collect();
     b.emit(DevOp::Residual, crate::k3::vec8_cus(&all, t * c.hidden), &[c_o], |d| {
         d.t[0] = next;
@@ -896,7 +928,7 @@ mod tests {
             let hidden = b.tensor("in.hidden", t as u64 * 7168 * 2);
             let next = b.tensor("act.next", t as u64 * 7168 * 2);
             let w = declare_kda_weights(&mut b, &c, "l.self_attn.", "l.");
-            let st = declare_kda_state(&mut b, &c, "kda.0.");
+            let st = declare_kda_state(&mut b, &c, "kda.0.", 1);
             let seed = b.emit(DevOp::Nop, all, &[], |_| {});
             emit_kda_layer(&mut b, &c, &w, &st, "act.pf.", t, hidden, next, 256, &[seed]);
             let p = b.finish();
@@ -928,7 +960,7 @@ mod tests {
         let hidden = b.tensor("in.hidden", 7168 * 2);
         let next = b.tensor("act.next", 7168 * 2);
         let w = declare_kda_weights(&mut b, &c, "language_model.model.layers.0.self_attn.", "language_model.model.layers.0.");
-        let st = declare_kda_state(&mut b, &c, "kda.0.");
+        let st = declare_kda_state(&mut b, &c, "kda.0.", 1);
         let seed = b.emit(DevOp::Nop, all, &[], |_| {});
         emit_kda_layer(&mut b, &c, &w, &st, "act.kda0.", 1, hidden, next, 256, &[seed]);
         let p = b.finish();
@@ -995,9 +1027,11 @@ mod tests {
             let all: Vec<u32> = (0..256).collect();
             let hidden = b.tensor("in.hidden", 7168 * 2);
             let w = declare_kda_weights(&mut b, &c, "p.", "l.");
-            let st = declare_kda_state(&mut b, &c, "kda.0.");
+            let st = declare_kda_state(&mut b, &c, "kda.0.", 1);
             let seed = b.emit(DevOp::Nop, all, &[], |_| {});
-            emit_kda_mixer_ex(&mut b, &c, &w, &st, "act.kda0.", 1, hidden, None, 256, false, &[seed], fuse);
+            emit_kda_mixer_ex(
+                &mut b, &c, &w, &st, "act.kda0.", 1, hidden, None, 256, false, &[seed], fuse, false,
+            );
             b.finish()
         };
         let k3_ops = [

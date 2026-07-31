@@ -1035,6 +1035,25 @@ typedef struct {
  * plans/tp-design.md §6a. Coarse xctr programs leave this clear and cost nothing. */
 #define PLOW_SE_XCTR 2u /* wait/succ counters are cross-GPU (xctr, system scope)   */
 
+/* HOW MANY SLICES OF THIS PACKET LANDED ON THIS ENTRY'S L2 DOMAIN — the count the two-level
+ * cache-maintenance rendezvous (PLOW_GATE_HIER, interp.hip) needs, packed into the spare high
+ * bits of `flags`.
+ *
+ * IT LIVES HERE BECAUSE IT IS ONLY KNOWABLE HERE. Under the plain global queue a workgroup claims
+ * whatever entry is next, so which slices of a packet run on which XCD is decided at RUN TIME and
+ * no per-XCD count exists — which is exactly what `plans/k3-decode-perf.md` records as the
+ * blocker on HIER2. Under PLOW_L2_PLACE the compiler assigns each slice a domain and stable-sorts
+ * `gq_stream` by it, so `nper` is a static emit-time constant, and the runtime's
+ * PLOW_L2_PLACE_DISPATCH gives domain `d`'s window only to XCD `d`'s workgroups (read from
+ * HW_REG_XCC_ID, so it holds by construction). Set only when both are on; zero otherwise, and
+ * zero means "no hierarchy, every workgroup does its own maintenance" — the original behaviour.
+ *
+ * `flags` is read ONLY through masks (`e.flags & PLOW_SE_XCTR`), never compared whole, so the
+ * high bits are free. 9 bits holds the 256-workgroup maximum; bit 15 stays spare. */
+#define PLOW_SE_NPER_SHIFT 4u
+#define PLOW_SE_NPER_MASK  0x1FF0u /* bits 4..12 */
+#define PLOW_SE_NPER(f) (((f) & PLOW_SE_NPER_MASK) >> PLOW_SE_NPER_SHIFT)
+
 typedef struct {
     uint32_t inst;
     uint32_t slice;
@@ -1101,6 +1120,28 @@ typedef struct {
      * `seg_ofs` table by wave-class segment. Keeping both costs 8 bytes (4 for the field, 4 for
      * the alignment pad before `gq_stream`) and every gfx950 code object must be rebuilt; the
      * kernarg-size check in AmdEngine::load refuses a stale object by name rather than faulting. */
+
+    /* Base COUNTER ID of the two-level maintenance scratch (PLOW_GATE_HIER). Three u32 per
+     * (packet, L2 domain), carved out of the tail of the ordinary `counters` region so the
+     * struct does not grow:
+     *
+     *     ldn[p][d] = hier_base + ((p * l2_domains) + d) * 3 + 0   publish arrivals
+     *     arr[p][d] =                                     + 1     observe election
+     *     opn[p][d] =                                     + 2     observe release
+     *
+     * IT FITS IN THE EXISTING ALIGNMENT PAD before `gq_stream`, so `sizeof(PlowProgram)` stays
+     * 144 and every field keeps its offset. That is deliberate: this struct is the kernarg block,
+     * and `AmdEngine::load`'s size check has already caught one appended field being copied
+     * short (128 of 136 bytes, with the COv5 implicit block landing on top of the new word and
+     * the interpreter reading a grid dimension as a device pointer). Growing it is not free;
+     * this field is, and it is why the hierarchy is addressed by counter ID rather than by a
+     * tenth pointer.
+     *
+     * ZERO means the hierarchy is off and every workgroup does its own cache maintenance —
+     * the original behaviour, bit-identical. The host sets it only when the program carries
+     * per-domain slice counts (PLOW_SE_NPER) AND the object was built with PLOW_GATE_HIER. */
+    uint32_t             hier_base;
+
     /* Global-queue interpreter (Experiment E1, built only under PLOW_GLOBAL_QUEUE). The static
      * kernel never reads these; the host leaves them NULL unless PLOW_GLOBAL_QUEUE is selected. */
     const PlowStreamEnt* gq_stream;  /* op-major (topological) permutation of `stream`          */

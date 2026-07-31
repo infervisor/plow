@@ -105,8 +105,21 @@ pub enum DevOp {
     /// As [`DevOp::Gemm`], with RMSNorm folded into the A-operand load.
     /// `t3=rms(f32) t4=gamma`.
     GemmNorm = 9,
-    /// `t0=C t1=x t2=W t3=rms? t4=gamma?` · `i0=M i1=N i2=K i3=norm`.
+    /// `t0=C t1=x t2=W t3=rms? t4=gamma?` · `i0=M i1=N i2=K i3=norm` · `f0=eps`.
     /// Decode path (`M <= 16`): bandwidth-bound, uses no MFMA.
+    ///
+    /// `norm`: 0 = none. 1 = scale the A-operand by a PRECOMPUTED per-row RMS in `t3`, which a
+    /// separate [`DevOp::RowRms`] packet produced. 2 = compute that scalar IN THE GEMV, from the
+    /// `x` it already stages in LDS, so the producing [`DevOp::RmsNorm`] packet is not emitted at
+    /// all — `t1` then names the norm's INPUT and `t4`/`f0` carry its gamma and eps.
+    ///
+    /// Mode 2 is emitted only by `k3::fuse_norm_gemv`, and only where the norm's output has no
+    /// consumer that is not one of these GEMVs: it recomputes the reduction once per CONSUMER
+    /// WORKGROUP, so it pays for itself through the deleted chain level and not otherwise. It is
+    /// bit-exact — it normalizes the staged copy in place, rounding to bf16 with `d_rmsnorm`'s
+    /// element map, so the k-loop reads the bytes the deleted packet would have written. It
+    /// requires the LDS-staged arm and `d_rmsnorm`'s register path; the kernel re-checks both and
+    /// demotes to `norm = 0` rather than reduce over an arena it never staged.
     Gemv = 10,
     /// `t0=Opart(f32) t1=mlpart(f32) t2=Q t3=K t4=V t5=O_final` ·
     /// `i0=n_q i1=n_kv i2=n_head i3=n_kv_head i4=q_pos0 i5=window i6=hd i7=nsplit` ·
@@ -1575,6 +1588,16 @@ pub const SE_FINE: u16 = 1;
 /// successor is a cross-GPU "partial ready" bump. See `plans/tp-design.md` §6a.
 pub const SE_XCTR: u16 = 2;
 
+/// Shift of the per-(packet, L2 domain) slice count packed into [`StreamEnt::flags`].
+///
+/// Mirrors `PLOW_SE_NPER_SHIFT` in `runtime/common/dev_isa.h`; read the note there for why the
+/// count is only knowable under `PLOW_L2_PLACE` and what the interpreter does with it. `flags` is
+/// only ever read through masks, never compared whole, so bits 4..12 are free and the ABI does
+/// not grow. Nine bits holds the 256-workgroup maximum; the emitter asserts rather than truncate.
+pub const SE_NPER_SHIFT: u16 = 4;
+/// Mask of the field at [`SE_NPER_SHIFT`] — bits 4..12.
+pub const SE_NPER_MASK: u16 = 0x1FF0;
+
 /// One entry in a CU's stream: run `inst`, taking share `slice` of its work.
 ///
 /// # Per-slice gates
@@ -1656,6 +1679,12 @@ pub struct DevProgram {
     /// the GLOBAL QUEUE by physical L2 domain; `n_seg` describes the STATIC per-CU `seg_ofs`
     /// table by wave-class segment), so both are kept and the struct grew 136 -> 144.
     pub n_seg: u32,
+    /// Base counter ID of the two-level maintenance scratch — three u32 per (packet, L2 domain),
+    /// carved out of the tail of the ordinary counter region. Mirrors `hier_base` in
+    /// `runtime/common/dev_isa.h`; the layout and the reason it lives in the existing alignment
+    /// pad (so `sizeof` stays 144 and no kernarg copy goes short) are documented there.
+    /// Zero disables the hierarchy and every workgroup does its own cache maintenance.
+    pub hier_base: u32,
     /// Global-queue interpreter (Experiment E1). Op-major stream, segment bounds, shared cursor.
     pub gq_stream: u64,
     pub gq_seg_ofs: u64,

@@ -232,9 +232,23 @@ typedef union __align__(16) {
     bf16  fa[FA_LDS_HALVES(512)];     /* flash K|V|P tiles          */
     float fd[FA_DEC_LDS_FLOATS(512, PLOW_FA_GF(512))]; /* flash decode; the op owns this size */
     float fmla[FA_MLA_DEC_LDS_FLOATS(512, 64, GLM_MLA_GF_MAX)]; /* MLA latent decode (DK=512,DR=64) */
+#if PLOW_MLA_PREFILL
+    /* MLA latent PREFILL tiles: Q|K staged plus the P transpose. Bigger than `fmla` (the
+     * query tile is hoisted here) and still under the GEMM arena that sets the union, so
+     * it costs no LDS. Its own member because the op owns the layout, not the decode's. */
+    float fmpf[FA_MLA_PF_LDS_FLOATS(512, 64)];
+#endif
     unsigned long long am[PLOW_WAVES];  /* argmax block reduction   */
     bf16  raw[PLOW_SMEM_HALVES];
 } plow_smem;
+
+#if PLOW_MLA_PREFILL
+/* `raw` is what the launcher sizes the dynamic arena from, so a member that outgrows it
+ * would read past the allocation rather than fail to compile. It fits today (128,512 B
+ * against the GEMM's 147,456) and this is what keeps that true if either side moves. */
+static_assert(sizeof(((plow_smem*)nullptr)->fmpf) <= sizeof(((plow_smem*)nullptr)->raw),
+              "MLA prefill LDS arena exceeds the interpreter's shared allocation");
+#endif
 
 /* ---------------------------------------------------------------------------
  * THE PACKET LIVES IN SCALAR REGISTERS.
@@ -620,6 +634,19 @@ __device__ __forceinline__ void exec_flash_mla_prefill_fp8(CInst in, CTens T, un
                                                            unsigned nblk, float* lds) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     if (TEN(7) == nullptr) __builtin_trap();
+#if PLOW_MLA_PF_MFMA
+    /* `gf` (i[7]) is a DECODE knob — how many query heads share one re-stream of the latent.
+     * The tiled kernel's reuse axis is the QUERY TILE, so it has no group factor to read and
+     * ignores the immediate; the scalar fallback below still honours it. */
+    if (mla_pf_tiled_fills(in->i[0], in->i[4], in->i[1], nblk)) {
+        d_flash_mla_prefill_mfma<512, 64, /*FP8=*/true>(
+            (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+            (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[4],
+            in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk, lds,
+            (const float*)TEN(7), in->i[6]);
+        return;
+    }
+#endif
     const unsigned gf = in->i[7] ? in->i[7] : (unsigned)GLM_MLA_GF;
     if (gf == 2)
         d_flash_mla_prefill_fp8<512, 64, 2>(
@@ -670,6 +697,18 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
                 in->i[6], in->i[0], in->i[4], in->i[1], in->i[2], in->fj[0].f, in->i[5], slice,
                 nblk, lds);
     } else {
+#if PLOW_MLA_PF_MFMA
+        /* Dense only. The gathered arm above keeps the scalar body: its top_k set is per
+         * QUERY, so a tile of query rows shares no KV range to stage. */
+        if (mla_pf_tiled_fills(in->i[0], in->i[4], in->i[1], nblk)) {
+            d_flash_mla_prefill_mfma<512, 64, /*FP8=*/false>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0],
+                in->i[4], in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk,
+                lds, nullptr, 0);
+            return;
+        }
+#endif
         if (gf == 2)
             d_flash_mla_prefill<512, 64, 2>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
@@ -740,6 +779,9 @@ __device__ __forceinline__ void exec_gemm_norm(CInst in, CTens T,
 __device__ __forceinline__ void exec_gemv(CInst in, CTens T,
                                                     unsigned slice, unsigned nblk, bf16* lds) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    /* No `part` here on purpose: `plow_smem` is a UNION, so `sm->part` and `sm->gm` are one
+     * buffer. The fused-norm arm (norm == 2) takes its reduction scratch from the TOP of the
+     * arena itself — handing it `sm->part` would write through the row it is reducing. */
     d_gemv((bf16*)TEN(0), (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2], (const bf16*)TEN(2),
            (const float*)TEN(3), (const bf16*)TEN(4), in->i[0], in->i[1], in->i[2],
            (int)in->i[3], in->fj[0].f, slice, nblk, lds);
@@ -1148,7 +1190,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if PLOW_K3
         case PLOW_DOP_KDA_CONV:
             d_kda_conv((bf16*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2), (float*)TEN(3),
-                       in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
+                       in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk,
+                       /* see the CONV3 note below: no free operand to select the path yet */
+                       (size_t)0);
             break;
         case PLOW_DOP_KDA_GATE:
             d_kda_gate((float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
@@ -1159,7 +1203,10 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             d_kda_state_step((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                              (const bf16*)TEN(3), (const float*)TEN(4), (const float*)TEN(5),
                              (float*)TEN(6), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
-                             in->fj[0].f, slice, nblk, (float*)sm->raw);
+                             in->fj[0].f, slice, nblk, (float*)sm->raw,
+                             (in->i[4] & PLOW_KDA_F_SEQ_ROWS)
+                                 ? (size_t)in->i[1] * in->i[2] * in->i[2]
+                                 : (size_t)0);
             break;
         case PLOW_DOP_KDA_GATED_NORM:
             d_kda_gated_norm((bf16*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
@@ -1185,7 +1232,23 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             d_kda_conv3((bf16*)TEN(0), (bf16*)TEN(1), (bf16*)TEN(2), (const bf16*)TEN(3),
                         (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
                         (const float*)TEN(7), wv, cs[0], cs[1], cs[2], in->i[0], in->i[1],
-                        in->i[2], in->i[3], slice, nblk);
+                        in->i[2], in->i[3], slice, nblk,
+                        /* PER-ROW CONV-WINDOW STRIDE, carried in `fj[1].u` (= j[0]).
+                         *
+                         * NOT `i[4]`. All eight integer slots are operands on this op — the
+                         * disassembly names them `T C W act w_v cs_q cs_k cs_v`, so `i[4]` is a
+                         * TENSOR INDEX (26/27), not a flags word. Reading it as flags MEASURED as
+                         * a GPU memory fault: 26 has bit 2 set, so the flag fired on every conv
+                         * packet and the window strided off the end of the state. `i[4]` IS the
+                         * flags word on KDA_STATE_STEP (`i4=1` = PLOW_KDA_F_QK_L2NORM), which is
+                         * what made that one safe and this one not — the two ops do not share an
+                         * operand map and assuming they do is the bug.
+                         *
+                         * `fj` is untouched by this op's emitter (it sets `i[0..7]` and no `f`/`j`),
+                         * so `j[0]` is free and zero in every blob emitted so far — which is the
+                         * shared window. The stride is carried DIRECTLY rather than as a flag, so
+                         * the kernel does not have to re-derive `C*W`. */
+                        (size_t)in->fj[1].u);
             break;
         }
         case PLOW_DOP_KDA_STATE_STEP_G: {
@@ -1196,7 +1259,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
                                (const float*)TEN(7), dtb, in->i[6], in->fj[1].f, (float*)TEN(6),
                                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
-                               slice, nblk, (float*)sm->raw);
+                               slice, nblk, (float*)sm->raw,
+                               /* per-row state stride: one state per row iff the rows are
+                                * independent sequences (batched decode), else 0. */
+                               (in->i[4] & PLOW_KDA_F_SEQ_ROWS)
+                                   ? (size_t)in->i[1] * in->i[2] * in->i[2]
+                                   : (size_t)0);
             break;
         }
         /* Kimi-K3 BLOCK structure (op_k3.h). Both arms are in BOTH buckets: a K3 layer runs the
@@ -1466,15 +1534,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         /* Same swap as the decode bucket: the DENSE MLA prefill goes e4m3, the gathered one keeps
          * its bf16 arm (its `t7` is `idx`, not a scale array). */
         case PLOW_DOP_FLASH_MLA_PREFILL_FP8:
-            exec_flash_mla_prefill_fp8(in, T, slice, nblk, sm->fmla);
+            exec_flash_mla_prefill_fp8(in, T, slice, nblk, sm->fmpf);
             break;
         case PLOW_DOP_FLASH_GATHER_PREFILL:
-            exec_flash_mla_prefill(in, T, slice, nblk, sm->fmla);
+            exec_flash_mla_prefill(in, T, slice, nblk, sm->fmpf);
             break;
 #else
         case PLOW_DOP_FLASH_MLA_PREFILL:
         case PLOW_DOP_FLASH_GATHER_PREFILL:
-            exec_flash_mla_prefill(in, T, slice, nblk, sm->fmla);
+            exec_flash_mla_prefill(in, T, slice, nblk, sm->fmpf);
             break;
 #endif
         /* The latent epilogue has to be in the SAME object as the prefill that produces the
@@ -1856,8 +1924,166 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #define PLOW_GATE_RELAXSIG 0
 #endif
 
+/* ---------------------------------------------------------------------------------------
+ * PLOW_GATE_HIER_CEIL — TWO-LEVEL CACHE MAINTENANCE, CEILING INSTRUMENT. NEVER SHIP.
+ *
+ * `runtime/bench/ctr_convergence.hip` measured where an empty b=256 packet's 13.2 us goes, and
+ * it is not the counter and not the atomic: the release RMW is a posted `global_atomic_add` at
+ * 0.07-0.14 us in EVERY arm. What costs is that all 256 workgroups issue `buffer_wbl2` and
+ * `buffer_inv`, which are PER-L2, so each XCD's L2 performs the SAME writeback and the SAME
+ * invalidate 32 times and they serialise. Re-measured under lease 2026-07-30:
+ *
+ *     BASELINE  1 counter, release signal + agent acquire      13.16 us
+ *     FAN=32    32 counters                                    10.20
+ *     FAN=256   one counter per workgroup, zero contention      8.95
+ *     NOACQ     drop buffer_inv                                 9.16
+ *     RELAXSIG  drop buffer_wbl2                                5.49
+ *     HIER2     per-XCD leader does the maintenance              3.46   <- this
+ *
+ * HIER2 does the maintenance ONCE PER XCD instead of once per workgroup. The gfx950 dispatcher
+ * is exactly round-robin over the 8 XCDs (`runtime/tests/xcd_map_gfx950_test.hip` measures
+ * 100.0%), so blocks 0..7 are one per XCD and `blockIdx.x < 8` elects one leader each.
+ *
+ * THIS KNOB IS THE UNSAFE HALF — the saving with the ORDERING SIMPLY OMITTED, which is what
+ * `LEADER_MAINT` is to `HIER2` in the microbench. A follower neither writes back nor
+ * invalidates, and nothing makes it wait for the leader that does, so a consumer can read a
+ * line the producer's XCD has not published. It exists to price the idea END TO END ON THE REAL
+ * MODEL before the two XCD-local rendezvous that make it sound are built, because those need a
+ * per-(packet, XCD) arrival count that the GLOBAL QUEUE does not have: a workgroup claims
+ * whatever entry is next, so which slices of a packet land on which XCD is decided at run time.
+ * Fleet (arXiv 2604.15379) resolves exactly this on MI350 by electing "the last worker per XCD"
+ * dynamically, which is the shape the sound version should take.
+ *
+ * Expect the ceiling to be SMALLER than the microbench's 3.8x: that bench is an empty packet in
+ * a tight chain with nothing to overlap, and the real per-packet gate is 2.255 us (traced), not
+ * 13.16. If this knob does not move the token, the sound version cannot either. */
+#ifndef PLOW_GATE_HIER_CEIL
+#define PLOW_GATE_HIER_CEIL 0
+#endif
+
+/* ---------------------------------------------------------------------------------------
+ * PLOW_GATE_HIER — the SOUND two-level cache maintenance. This is the shippable form of what
+ * PLOW_GATE_HIER_CEIL prices, and it differs from it in exactly one way: the ordering is real.
+ *
+ * The ceiling knob elects a leader and lets followers skip the maintenance with nothing making
+ * them wait for the leader that does it. This one adds the two XCD-local rendezvous that make
+ * that safe, using the per-(packet, domain) slice count the emitter packs into PLOW_SE_NPER:
+ *
+ *   publish   follower: __syncthreads() retires its stores into THIS XCD's L2, then bumps
+ *                       ldn[p][d] RELAXED — no writeback, the data is in the L2 the leader is
+ *                       about to write back.
+ *             leader:   the workgroup whose bump returns nper-1 issues ONE release RMW per
+ *                       successor, adding nper rather than 1. Its buffer_wbl2 writes back the
+ *                       whole L2 — which is exactly the followers' stores — and publishes. The
+ *                       global counter still reaches `blocks[p]`, so no consumer's threshold
+ *                       changes and the graph is untouched.
+ *   observe   leader:   the workgroup whose bump of arr[c][d] returns 0 polls the global
+ *                       counters, takes ONE agent acquire (buffer_inv sc1, L1+L2) for the whole
+ *                       XCD, then bumps opn[c][d] to release its followers.
+ *             follower: waits opn[c][d] and NEVER POLLS THE GLOBAL COUNTER AT ALL — less fabric
+ *                       traffic, not more — then invalidates only its own L1.
+ *
+ * WHY FOLLOWERS STILL INVALIDATE, and why the microbench's version would have been unsound.
+ * `ctr_convergence.hip`'s HIER2 arm reasons entirely about L2 ("this XCD's L2 has been fresh
+ * ever since") and lets followers do nothing. But L1 IS PER-CU, not per-XCD — the same fact
+ * `ctr_poll`'s comment already records as the reason a workgroup-scope acquire is a race even
+ * same-XCD. The leader's `buffer_inv sc1` invalidates the XCD's L2 and the LEADER's L1; a
+ * follower on another CU keeps its own stale lines. The microbench cannot see this because its
+ * body is empty and it reads no data. So followers issue `buffer_inv` with NO SC bits, which on
+ * CDNA4 leaves L2 alone (SC1 is what selects L2) and costs a per-CU L1 invalidate — cheap, and
+ * not the per-L2 serialising op the whole exercise exists to remove.
+ *
+ * REQUIRES PLOW_L2_PLACE_DISPATCH and an L2-placed blob. Without per-domain windows `nper` is
+ * meaningless (a workgroup claims whatever entry is next, so the count is a run-time property),
+ * and the emitter leaves the field zero — which this code reads as "no hierarchy". */
+#ifndef PLOW_GATE_HIER
+#define PLOW_GATE_HIER 0
+#endif
+#if PLOW_GATE_HIER && PLOW_GATE_HIER_CEIL
+#error "PLOW_GATE_HIER (sound) and PLOW_GATE_HIER_CEIL (the unsafe ceiling) are exclusive"
+#endif
+/* PRECONDITIONS, and they DEGRADE rather than fail the build.
+ *
+ * `PLOW_HSACO_EXTRA_DEFINES` is applied to EVERY object in the set — 49 of them, including the
+ * static-path and flash-class ones that are deliberately built without the global queue. An
+ * `#error` here is therefore not a guard, it is a build break for objects the knob was never
+ * meant to touch (measured: 16 of 49 built, then `my_seg` undeclared in the static path).
+ *
+ * Both preconditions are structural. `my_seg` — the domain a workgroup serves — exists only on
+ * the global-queue path, and the per-domain windows the whole scheme rests on are a global-queue
+ * construct; the static per-CU path has no domain of its own to be the leader of. And without
+ * L2-domain dispatch `nper` is a run-time property, not the emit-time constant this reads.
+ *
+ * So an object that cannot support the hierarchy compiles WITHOUT it and behaves exactly as
+ * before. That is safe rather than merely convenient: `hier_base` is only non-zero on an
+ * L2-placed blob, and an object built without the hierarchy simply never reads it. */
+#if PLOW_GATE_HIER && (!defined(PLOW_L2_PLACE_DISPATCH) || !PLOW_GLOBAL_QUEUE)
+#undef PLOW_GATE_HIER
+#define PLOW_GATE_HIER 0
+#endif
+
+/* The two knobs do not compose, and combined they are silently worse than either. The HIER_CEIL
+ * follower hand-rolls its relaxed RMW rather than calling `ctr_signal`, so under SC1 it would
+ * also skip the `s_waitcnt vmcnt(0)` that arm performs — 248 of 256 workgroups would bump their
+ * counter without retiring their stores at all. `perf-data/k3-hier2-ceiling.md` §2 says to drop
+ * SC1 anyway; this makes the combination a build error instead of a debugging session. */
+#if PLOW_GATE_HIER_CEIL && PLOW_GATE_SC1
+#error "PLOW_GATE_HIER_CEIL and PLOW_GATE_SC1 are mutually exclusive (see k3-hier2-ceiling.md §2)"
+#endif
+
+/* ELECT THE MAINTENANCE LEADER OFF HW_REG_XCC_ID, NOT blockIdx.x.
+ *
+ * This started as `blockIdx.x < 8u`, which is the round-robin map assumed rather than read, and
+ * this same file argues against exactly that 130 lines below (`PLOW_L2_PLACE_DISPATCH`: "Deriving
+ * it from blockIdx.x instead would make the whole feature silently depend on the round-robin map
+ * continuing to hold"). `ctr_convergence.hip` reads the register for its `xcd` too and uses the
+ * block index only for the ROLE.
+ *
+ * `blockIdx.x == xcc` is one candidate per XCD id and the candidate must actually BE on that XCD,
+ * so the hardware confirms the map instead of the map being assumed. Under the measured
+ * round-robin (`n % 8` is 100.0% of the true id on MI355X) block `x` is on XCD `x` and this elects
+ * exactly 8 leaders, one per XCD — identical to the old test, but now verified. If the map ever
+ * changes the count DEGRADES (an XCD may get no leader) rather than silently electing two on one
+ * XCD, which is the safe direction for an instrument whose failure mode is already understating
+ * cost. It also inherits the partitioned-mode guard: a CPX/NPS reported id above the domain count
+ * simply matches no block.
+ *
+ * The sound version does not use this at all — it elects dynamically off the per-(packet, XCD)
+ * arrival counter its rendezvous already needs, which is Fleet's "last worker per XCD".
+ *
+ * HOISTED TO KERNEL ENTRY, and that is not cosmetic. Read per call, `s_getreg` lands on the gate
+ * AND on every successor signal — twice per packet, 324,940 workgroup-packets on a K3 token — and
+ * it MEASURED 0.43 ms (l2hier 27.849 -> 28.271, ~1.3 ns/workgroup-packet, ~8 sd). The XCD a
+ * workgroup runs on cannot change while it is resident, so it is read once. */
+__device__ __forceinline__ bool ctr_maint_leader_init(void) {
+#if PLOW_GATE_HIER_CEIL
+    const unsigned xcc =
+        __builtin_amdgcn_s_getreg((20 /*HW_REG_XCC_ID*/) | (0 << 6) | ((32 - 1) << 11)) & 0xf;
+    return blockIdx.x == xcc;
+#else
+    return true;
+#endif
+}
+
 __device__ __forceinline__ uint32_t ctr_poll(const uint32_t* p) {
     return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+/* L1-ONLY invalidate, for a PLOW_GATE_HIER follower whose XCD leader has already done the L2.
+ *
+ * There is no HIP fence scope that emits this: workgroup-scope acquire emits NO cache
+ * maintenance at all (verified on the emitted ISA), and agent-scope emits `buffer_inv sc1`,
+ * which is the L1+L2 form and the very thing being amortised. On CDNA4 SC1 is what selects L2
+ * for BUFFER_INV, so the bare opcode is the L1 half. Verified to assemble distinctly on gfx950:
+ *
+ *     buffer_inv       E0A40000     <- this, L1 only
+ *     buffer_inv sc0   E0A44000
+ *     buffer_inv sc1   E0A48000     <- what ctr_acquire() emits
+ *
+ * The "memory" clobber is load-bearing: it stops the compiler hoisting the consumer's loads
+ * above the invalidate. */
+__device__ __forceinline__ void ctr_acquire_l1(void) {
+    asm volatile("buffer_inv" ::: "memory");
 }
 __device__ __forceinline__ void ctr_acquire(void) {
 #if PLOW_GATE_NOINV
@@ -1879,12 +2105,24 @@ __device__ __forceinline__ void ctr_acquire(void) {
  * on the signal side let each atomic carry its own release. Do not "fix" this. */
 __device__ __forceinline__ void ctr_signal(uint32_t* p) {
 #if PLOW_GATE_SC1
-    /* DEVICE-SCOPE PUBLISH, no cache-wide writeback. Unlike PLOW_GATE_RELAXSIG below this is not a
-     * race BY CONSTRUCTION rather than by luck: the activation stores are `sc1` (see
-     * `st_glob8`/`st_act1` in amd_common.h), so they bypass the non-coherent XCD L2 and are already
-     * device-visible; `vmcnt(0)` retires them; the relaxed RMW then publishes the count. There is no
-     * dirty line for a `buffer_wbl2` to find, so the release buys nothing but the 32-per-L2
-     * serialised writeback it costs.
+    /* >>> THE PARAGRAPH THAT WAS HERE CLAIMED THIS IS "not a race BY CONSTRUCTION". IT IS A RACE,
+     * >>> AND THE KNOB IS BOTH UNSOUND AND SLOWER. MEASURED. DO NOT SHIP IT.
+     *
+     * The design was: activation stores are `sc0 sc1` so they bypass the non-coherent XCD L2 and
+     * are already device-visible, `vmcnt(0)` retires them, and the relaxed RMW then publishes the
+     * count — leaving no dirty line for `buffer_wbl2` to find. Coverage was completed
+     * (`scripts/sc1_coverage.sh`, zero unscoped stores in all 48 objects) and the model STILL
+     * generates degenerate tokens; adding `PLOW_GATE_SC1_KEEPREL`, which changes nothing but
+     * keeping the release, is token-identical. Both scopes fail and the arm that keeps the
+     * release passes, so the defect is neither coverage nor store scope: `s_waitcnt vmcnt(0)`
+     * retires a store when it leaves the CU, NOT when it is visible at the scope the consumer
+     * reads from, so the relaxed bump can be observed before the data it publishes. Dropping the
+     * release needs a publish primitive that waits for VISIBILITY; this file has none.
+     *
+     * It is not a speedup either: the numerically-correct variant measured +0.67% on K3 TP8, and
+     * `PLOW_GATE_HIER_CEIL` — which keeps the release and amortises it per XCD instead — measured
+     * -14.5%. The two do not compose (see the #error above). Full record and the token streams:
+     * `runtime/amd/amd_common.h` and `perf-data/k3-hier2-ceiling.md` §2.
      *
      * The wait side is UNCHANGED — `ctr_acquire` still takes the agent acquire and its
      * `buffer_inv`. Dropping it additionally requires every activation LOAD to be `sc1`.
@@ -1908,12 +2146,23 @@ __device__ __forceinline__ void ctr_signal(uint32_t* p) {
      * loads a descriptor and `aux |= 16`, then drop `buffer_inv` in `ctr_acquire`. Together the two
      * halves are the superadditive -5.04 ms/token the UNSAFE knobs below measure as a ceiling.
      *
-     * COVERAGE CAVEAT, and it is why this is not yet a shippable default: the ragged scalar tails
-     * in op_elementwise.h / op_k3.h / op_norm.h / op_moe.h still write activations with plain
-     * stores (see the `st_act1` note). They are <=7 halves against a ~14 KB row, so the TIMING here
-     * is representative, but soundness needs them converted first. */
+     * The COVERAGE CAVEAT that was here — "the ragged scalar tails in op_elementwise.h /
+     * op_k3.h / op_norm.h / op_moe.h still write activations with plain stores" — is CLOSED.
+     * Every store site in every op is routed through `st_act`/`st_act1`/`st_glob8`, and
+     * `scripts/sc1_coverage.sh` fails the build on an unscoped one. Closing it is what proved
+     * the defect above is ordering rather than coverage. */
     __builtin_amdgcn_s_waitcnt(/*vmcnt(0)*/ 0x0f70);
+#if PLOW_GATE_SC1_KEEPREL
+    /* DIAGNOSTIC ARM. Scoped stores, but the counter bump KEEPS its release (and therefore its
+     * `buffer_wbl2`). This separates the two halves of PLOW_GATE_SC1 that the plain arm changes
+     * together: it isolates the COST of scoped activation stores from the BENEFIT of dropping
+     * the writeback. If this arm is numerically correct while the plain arm is not, the defect is
+     * the ORDERING (`vmcnt(0)` retires a store when it leaves the CU, not when it is visible at
+     * the scope the consumer reads from), not the store scope. Not a shipping mode either way. */
+    __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+#else
     __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#endif
 #elif PLOW_GATE_RELAXSIG
     __hip_atomic_fetch_add(p, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT); /* UNSAFE: no wbl2 */
 #else
@@ -1958,6 +2207,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WAVES / 4, PLOW_WAVES / 4))) void PLOW_I
     __shared__ plow_smem sm;
 
     const unsigned cu = blockIdx.x;
+    const bool maint_leader = ctr_maint_leader_init();
 #if PLOW_GLOBAL_QUEUE
     /* One shared cursor over the op-major gq_stream, bounded to this segment's window. base==0
      * because gq_stream is already the global array (no per-CU offset); the trace slot is base+ix. */
@@ -2096,6 +2346,29 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WAVES / 4, PLOW_WAVES / 4))) void PLOW_I
             ? (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank]
             : 0;
 
+#if PLOW_GATE_HIER
+        /* Two-level maintenance state for THIS entry. `h_n` is how many slices of this packet
+         * landed on this L2 domain (emit-time constant, see PLOW_SE_NPER); 0 or 1 means there is
+         * nobody to rendezvous with and the ordinary path runs unchanged. Cross-GPU entries are
+         * excluded: their counters are system-scope and per-XCD leadership says nothing about a
+         * fabric peer. */
+        const unsigned h_n = PLOW_SE_NPER(e.flags);
+        const bool h_on = (prog.hier_base != 0u) && (h_n > 1u) && !xctr;
+        const size_t h_b = h_on ? (size_t)prog.hier_base
+                                      + ((size_t)e.inst * prog.l2_domains + my_seg) * 3u
+                                : 0u;
+        __shared__ unsigned h_lead;
+        if (h_on) {
+            /* OBSERVE ELECTION: first arriver on this (packet, domain) takes the invalidate. */
+            if (threadIdx.x == 0)
+                h_lead = (__hip_atomic_fetch_add(PLOW_CTR(prog.counters, h_b + 1u), 1u,
+                                                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == 0u);
+            __syncthreads();
+        }
+#else
+        const bool h_on = false;
+#endif
+
         /* Gate. ONE THREAD PER COUNTER, polled CONCURRENTLY — not one lane walking the list.
          *
          * A serial walk costs wait_len x (cross-XCD latency), and that is not a small constant:
@@ -2110,6 +2383,12 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WAVES / 4, PLOW_WAVES / 4))) void PLOW_I
          * 512 loads" rule -- that rule is about 512 threads polling the SAME counter. Here each
          * thread polls a DIFFERENT one, which is parallelism, not contention. Threads beyond
          * wait_len do not poll at all. */
+        /* Under PLOW_GATE_HIER a FOLLOWER never polls the global counter at all — its XCD's
+         * leader does, and releases it through the XCD-local `opn`. That is less fabric traffic,
+         * not more: one cross-XCD poll per domain instead of one per workgroup. */
+#if PLOW_GATE_HIER
+        if (!h_on || h_lead)
+#endif
         for (unsigned w = threadIdx.x; w < wait_len; w += PLOW_THREADS) {
             const PlowWait pw = prog.waits[wait_ofs + w];
             /* The sleep constant does not matter. Swept 0 / 1 / 2 / 8, tight-then-backoff
@@ -2134,7 +2413,36 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WAVES / 4, PLOW_WAVES / 4))) void PLOW_I
          * the poll loop (which is where it lands if you just write `while (acquire_load(c) < n)`)
          * flushes the caches on EVERY iteration -- it costs time in the spin AND destroys the
          * cache for the work that follows. That single change was worth ~2x on decode (§8). */
-        if (threadIdx.x == 0 && wait_len) { if (xctr) xctr_acquire(); else ctr_acquire(); }
+        /* THE LEADER TEST APPLIES TO THE LOCAL ACQUIRE ONLY. `xctr_acquire` is the SYSTEM-scope
+         * acquire for data arriving over XGMI (op_collective.h), and there is no per-XCD leader
+         * story for the fabric — HIER2 is about per-L2 maintenance INSIDE one device, and
+         * ctr_convergence.hip's HIER2 arm has no cross-GPU component at all. Gating it here was a
+         * measurement bug, not a design: leaders are `blockIdx.x < 8` while K3's collectives are
+         * b=14 after `xrfit`, so the expected number of leaders on a collective is 14·8/256 =
+         * 0.44 — i.e. almost every cross-GPU acquire was being deleted, on a TP8 run, and the
+         * ceiling it produced was overstated by that deletion. */
+#if PLOW_GATE_HIER
+        if (h_on) {
+            if (threadIdx.x == 0) {
+                if (h_lead) {
+                    /* ONE buffer_inv sc1 for the whole XCD, then release the followers. The
+                     * RELEASE on the bump is what orders the invalidate before they observe it. */
+                    if (wait_len) ctr_acquire();
+                    __hip_atomic_fetch_add(PLOW_CTR(prog.counters, h_b + 2u), 1u,
+                                           __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+                } else {
+                    while (ctr_poll(PLOW_CTR(prog.counters, h_b + 2u)) < 1u)
+                        __builtin_amdgcn_s_sleep(8);
+                    /* L1 only — the leader already did this XCD's L2, but L1 is per-CU. */
+                    ctr_acquire_l1();
+                }
+            }
+        } else
+#endif
+        if (threadIdx.x == 0 && wait_len) {
+            if (xctr) xctr_acquire();
+            else if (maint_leader) ctr_acquire();
+        }
         __syncthreads(); /* the invalidate is visible to every thread before it reads */
 
         const uint64_t t_ready = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
@@ -2239,6 +2547,24 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WAVES / 4, PLOW_WAVES / 4))) void PLOW_I
          * Fine/tile programs can carry many independent successors; walking them on thread 0
          * serializes their cross-XCD latency for no ordering benefit. Every designated writer
          * performs the same release RMW as before. */
+#if PLOW_GATE_HIER
+        /* PUBLISH RENDEZVOUS. The __syncthreads() above has already retired this workgroup's
+         * stores into its XCD's L2 (s_waitcnt vmcnt(0)), so a RELAXED bump is enough to announce
+         * them — the data is in the L2 the leader is about to write back. The workgroup whose
+         * bump completes the domain issues ONE release RMW per successor, adding `h_n` instead of
+         * 1 so the global counter still reaches `blocks[p]` and no consumer's threshold moves. */
+        if (h_on) {
+            if (threadIdx.x == 0) {
+                const uint32_t was = __hip_atomic_fetch_add(PLOW_CTR(prog.counters, h_b), 1u,
+                                                            __ATOMIC_RELAXED,
+                                                            __HIP_MEMORY_SCOPE_AGENT);
+                if (was == h_n - 1u)
+                    for (unsigned s = 0; s < succ_len; s++)
+                        __hip_atomic_fetch_add(PLOW_CTR(prog.counters, prog.succs[succ_ofs + s]),
+                                               h_n, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+            }
+        } else
+#endif
         for (unsigned s = threadIdx.x; s < succ_len; s += PLOW_THREADS) {
             const uint32_t sid = prog.succs[succ_ofs + s];
             if (xctr) {
@@ -2249,8 +2575,13 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WAVES / 4, PLOW_WAVES / 4))) void PLOW_I
                     uint32_t* base = (uint32_t*)((char*)prog.peer_scratch[r] + xctr_off);
                     xctr_signal(PLOW_CTR(base, sid));
                 }
-            } else {
+            } else if (maint_leader) {
                 ctr_signal(PLOW_CTR(prog.counters, sid));
+            } else {
+                /* PLOW_GATE_HIER_CEIL follower: the count still has to reach the threshold or
+                 * every consumer deadlocks, but the writeback is the leader's job. Relaxed. */
+                __hip_atomic_fetch_add(PLOW_CTR(prog.counters, sid), 1u, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_AGENT);
             }
         }
 

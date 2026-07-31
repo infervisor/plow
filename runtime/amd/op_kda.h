@@ -46,7 +46,21 @@
 /* Gate activation modes, mirroring [fla]'s `safe_gate` switch (fla/ops/kda/gate.py:118-124). */
 enum { PLOW_KDA_GATE_SOFTPLUS = 0, PLOW_KDA_GATE_LOWER_BOUND = 1 };
 /* Flag bits for d_kda_state_step. */
-enum { PLOW_KDA_F_QK_L2NORM = 1u };
+enum {
+    PLOW_KDA_F_QK_L2NORM = 1u,
+    /* THE ROWS ARE INDEPENDENT SEQUENCES, not consecutive tokens of one.
+     *
+     * A KDA layer's `T` rows mean two different things and the recurrence cannot tell them apart
+     * from `T`: on a PREFILL program they are consecutive tokens of ONE sequence and must thread
+     * through ONE state; on a BATCHED DECODE program they are B independent sequences, each of
+     * which owns its own state. Sharing the state across the second kind runs sequence 1's token
+     * into sequence 0's and produces fluent, plausible, WRONG output — no crash, no NaN.
+     *
+     * So the distinction is carried explicitly. Clear (every program that exists today) makes the
+     * per-row state stride 0, the state pointer does not move, and the emitted code is unchanged.
+     * See perf-data/k3-batched-decode-design.md §1. */
+    PLOW_KDA_F_SEQ_ROWS = 2u,
+};
 
 __device__ __forceinline__ float kda_sigmoid(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
@@ -94,7 +108,42 @@ __device__ __forceinline__ void kda_conv_range(bf16* __restrict__ out, const bf1
                                                const float* __restrict__ w,
                                                float* __restrict__ state, unsigned T,
                                                unsigned conv_dim, unsigned W, unsigned act,
-                                               unsigned c0, unsigned c1) {
+                                               unsigned c0, unsigned c1, size_t bstride) {
+    /* INDEPENDENT-SEQUENCE PATH. `bstride != 0` means the T rows are B separate sequences
+     * (batched decode), so each row owns its own sliding window: load it, roll ONE token
+     * through, store it back. The shared path below is the opposite and is the one every
+     * program uses today — it loads the window once, rolls all T consecutive tokens of ONE
+     * sequence through it, and stores once, which is the whole point of a conv state.
+     *
+     * Kept as a separate loop rather than a stride inside the shared one because the LOAD and
+     * STORE move, not just the address: hoisting them out of the token loop is exactly what
+     * makes the shared path correct, and exactly what makes it wrong for independent rows. */
+    if (bstride) {
+        for (unsigned c = c0 + threadIdx.x; c < c1; c += PLOW_THREADS) {
+            enum { PLOW_KDA_WMAX_B = 8 };
+            const unsigned Wc = W < PLOW_KDA_WMAX_B ? W : PLOW_KDA_WMAX_B;
+            for (unsigned t = 0; t < T; t++) {
+                float* st = state + (size_t)t * bstride + (size_t)c * W;
+                float win[PLOW_KDA_WMAX_B], tap[PLOW_KDA_WMAX_B];
+#pragma unroll
+                for (unsigned j = 0; j < PLOW_KDA_WMAX_B; j++) {
+                    win[j] = j < Wc ? st[j] : 0.0f;
+                    tap[j] = j < Wc ? w[(size_t)c * W + j] : 0.0f;
+                }
+#pragma unroll
+                for (unsigned j = 0; j + 1 < PLOW_KDA_WMAX_B; j++) win[j] = win[j + 1];
+                win[Wc - 1] = bf2f(x[(size_t)t * conv_dim + c]);
+                float y = 0.0f;
+#pragma unroll
+                for (unsigned j = 0; j < PLOW_KDA_WMAX_B; j++) y += win[j] * tap[j];
+                st_act1(&out[(size_t)t * conv_dim + c], f2bf(act == 1u ? act_silu(y) : y));
+#pragma unroll
+                for (unsigned j = 0; j < PLOW_KDA_WMAX_B; j++)
+                    if (j < Wc) st[j] = win[j];
+            }
+        }
+        return;
+    }
     for (unsigned c = c0 + threadIdx.x; c < c1; c += PLOW_THREADS) {
         /* The window and the taps. W is 4 for K3 and the loop bound is a runtime value, so this is
          * written as a small fixed array; PLOW_KDA_WMAX bounds the register cost. */
@@ -126,12 +175,12 @@ __device__ __forceinline__ void kda_conv_range(bf16* __restrict__ out, const bf1
 __device__ void d_kda_conv(bf16* __restrict__ out, const bf16* __restrict__ x,
                            const float* __restrict__ w, float* __restrict__ state, unsigned T,
                            unsigned conv_dim, unsigned W, unsigned act, unsigned slice,
-                           unsigned nblk) {
+                           unsigned nblk, size_t bstride) {
     const unsigned chunk = (conv_dim + nblk - 1) / nblk;
     const unsigned c0 = slice * chunk;
     unsigned c1 = c0 + chunk;
     if (c1 > conv_dim) c1 = conv_dim;
-    if (c0 < c1) kda_conv_range(out, x, w, state, T, conv_dim, W, act, c0, c1);
+    if (c0 < c1) kda_conv_range(out, x, w, state, T, conv_dim, W, act, c0, c1, bstride);
 }
 
 /* -------------------------------------------------------------------------------------------
@@ -163,7 +212,7 @@ __device__ void d_kda_conv3(bf16* __restrict__ oq, bf16* __restrict__ ok, bf16* 
                             const float* __restrict__ wk, const float* __restrict__ wv,
                             float* __restrict__ sq, float* __restrict__ sk,
                             float* __restrict__ sv, unsigned T, unsigned C, unsigned W,
-                            unsigned act, unsigned slice, unsigned nblk) {
+                            unsigned act, unsigned slice, unsigned nblk, size_t bstride) {
     const unsigned total = 3u * C;
     const unsigned chunk = (total + nblk - 1) / nblk;
     const unsigned g0 = slice * chunk;
@@ -188,7 +237,7 @@ __device__ void d_kda_conv3(bf16* __restrict__ oq, bf16* __restrict__ ok, bf16* 
         const bf16* x = s == 0 ? xq : (s == 1 ? xk : xv);
         const float* w = s == 0 ? wq : (s == 1 ? wk : wv);
         float* st = s == 0 ? sq : (s == 1 ? sk : sv);
-        kda_conv_range(o, x, w, st, T, C, W, act, a, b);
+        kda_conv_range(o, x, w, st, T, C, W, act, a, b, bstride);
     }
 }
 
@@ -308,7 +357,7 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                                    const float* __restrict__ dt_bias, unsigned gate_mode, float lb,
                                    float* __restrict__ state, unsigned T, unsigned H, unsigned D,
                                    unsigned BV, unsigned flags, float scale, unsigned slice,
-                                   unsigned nblk, float* __restrict__ lds) {
+                                   unsigned nblk, float* __restrict__ lds, size_t bstride) {
     const unsigned lane = threadIdx.x & (PLOW_WAVE - 1);
     const unsigned wave = threadIdx.x >> 6;
     const unsigned ntile = D / BV; /* column tiles per head */
@@ -372,7 +421,14 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                                  : beta[(size_t)t * H + h];
             for (unsigned c = 0; c < cols_per_wave; c++) {
                 const unsigned j = tile * BV + wave * cols_per_wave + c; /* value column */
-                float* col = st_h + (size_t)j * D;                       /* V-FIRST: [v][k] */
+                /* PER-ROW STATE. `bstride` is 0 for a PREFILL program, where the T rows are
+                 * consecutive tokens of ONE sequence and the recurrence must thread them through
+                 * one state — the pointer then does not move and the emitted code is unchanged.
+                 * It is `H*D*D` for a BATCHED DECODE program, where the rows are B INDEPENDENT
+                 * sequences and sharing a state would run sequence 1's token into sequence 0's.
+                 * That distinction is invisible in `T` alone, which is why it is its own
+                 * parameter and not inferred (see perf-data/k3-batched-decode-design.md §1). */
+                float* col = st_h + (size_t)t * bstride + (size_t)j * D; /* V-FIRST: [v][k] */
 
                 /* decay, in registers: S' = exp(g) * S */
                 float sc[PL];
@@ -411,22 +467,22 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
     if (D == 128)                                                                                 \
         d_kda_state_step_t<2, GATE_>(o, q, k, v, g, beta, g_raw, beta_raw, a_log, dt_bias,        \
                                      gate_mode, lb, state, T, H, D, BV, flags, scale, slice,      \
-                                     nblk, lds);                                                  \
+                                     nblk, lds, bstride);                                                  \
     else if (D == 64)                                                                             \
         d_kda_state_step_t<1, GATE_>(o, q, k, v, g, beta, g_raw, beta_raw, a_log, dt_bias,        \
                                      gate_mode, lb, state, T, H, D, BV, flags, scale, slice,      \
-                                     nblk, lds);                                                  \
+                                     nblk, lds, bstride);                                                  \
     else if (D == 256)                                                                            \
         d_kda_state_step_t<4, GATE_>(o, q, k, v, g, beta, g_raw, beta_raw, a_log, dt_bias,        \
                                      gate_mode, lb, state, T, H, D, BV, flags, scale, slice,      \
-                                     nblk, lds);
+                                     nblk, lds, bstride);
 
 __device__ void d_kda_state_step(bf16* __restrict__ o, const bf16* __restrict__ q,
                                  const bf16* __restrict__ k, const bf16* __restrict__ v,
                                  const float* __restrict__ g, const float* __restrict__ beta,
                                  float* __restrict__ state, unsigned T, unsigned H, unsigned D,
                                  unsigned BV, unsigned flags, float scale, unsigned slice,
-                                 unsigned nblk, float* __restrict__ lds) {
+                                 unsigned nblk, float* __restrict__ lds, size_t bstride) {
     const bf16 *g_raw = nullptr, *beta_raw = nullptr;
     const float *a_log = nullptr, *dt_bias = nullptr;
     const unsigned gate_mode = 0;
@@ -445,7 +501,7 @@ __device__ void d_kda_state_step_g(bf16* __restrict__ o, const bf16* __restrict_
                                    const float* __restrict__ dt_bias, unsigned gate_mode, float lb,
                                    float* __restrict__ state, unsigned T, unsigned H, unsigned D,
                                    unsigned BV, unsigned flags, float scale, unsigned slice,
-                                   unsigned nblk, float* __restrict__ lds) {
+                                   unsigned nblk, float* __restrict__ lds, size_t bstride) {
     const float *g = nullptr, *beta = nullptr;
     PLOW_KDA_STEP_RUNGS(true)
 }

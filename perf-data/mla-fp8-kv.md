@@ -141,8 +141,13 @@ into every MLA blob. What routing would take is listed in `GFX950_UNEMITTED`'s e
 * **Throughput.** No ITL/decode-latency A/B was taken. The fp8 latent halves the decode KV stream,
   which is HBM-bound, so the expectation is the same ~2x roofline the dense fp8 KV gets — but that
   is an expectation, not a number, and nothing here measured it.
-* **The prefill twin.** `FlashMlaPrefillFp8` is compile-verified only. It is a six-line wrapper over
-  the decode body (as the bf16 MLA prefill is), and there is no MLA-prefill numeric gate to run it
-  through.
+* **The prefill twin.** `FlashMlaPrefillFp8` is no longer a six-line wrapper over the decode body and
+  is no longer ungated. It runs `d_flash_mla_prefill_mfma`, which tiles the query axis onto the MFMA
+  (2.25-2.79x over the wrapper at K3's TP8 shape), and `mla_gfx950_test.c` phase 3 checks it against
+  the scalar fp8 body on synthesized e4m3 — max rel err 3.3e-03 over n_head 12/64, ctx 512-2048,
+  n_tok 64-512. Phase 2 ties the tiling itself to the validated decode oracle in bf16 (7.2e-05).
+  The tiled kernel does NOT dequantize into LDS: e4m3 is exact in bf16, so the staged tile is raw and
+  the row scale is applied per kv column after the score MFMA and folded into P for the PV — the same
+  association the scalar body uses (`dotc * cs + dotr * rs`), and the reason the two agree at all.
 * **Gathered (DSA) MLA with an fp8 latent.** Not implementable through the current ABI: `t7` is the
   `idx` table and `t7` is where the scales live. The gathered arm stays bf16 in both objects.

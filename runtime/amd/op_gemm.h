@@ -666,7 +666,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                         const float g = acc[i][0][e];
                         const float u = acc[i][1][e];
                         const float sg = act_gate_only(g, act);
-                        Cg[(size_t)mm * N + nn] = f2bf(sg * u);
+                        st_act1(&Cg[(size_t)mm * N + nn], f2bf(sg * u));
                     }
             }
         } else {
@@ -679,7 +679,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
 #pragma unroll
                 for (int e = 0; e < 16; e++) {
                     const unsigned mm = m0 + wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e);
-                    if (mm < M) Cg[(size_t)mm * N + nn] = f2bf(acc[i][j][e]);
+                    if (mm < M) st_act1(&Cg[(size_t)mm * N + nn], f2bf(acc[i][j][e]));
                 }
             }
         }
@@ -1227,7 +1227,7 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
                         const float g = acc[i][0][e] * as * gs;
                         const float u = acc[i][1][e] * as * us;
                         const float sg = act_gate_only(g, act);
-                        Cg[(size_t)mm * N + nn] = f2bf(sg * u);
+                        st_act1(&Cg[(size_t)mm * N + nn], f2bf(sg * u));
                     }
             }
         } else {
@@ -1241,7 +1241,9 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
 #pragma unroll
                     for (int e = 0; e < 16; e++) {
                         const unsigned mm = m0 + wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e);
-                        if (mm < M) Cg[(size_t)mm * N + nn] = f2bf(acc[i][j][e] * ascale[mm] * ws);
+                        if (mm < M)
+                            st_act1(&Cg[(size_t)mm * N + nn],
+                                    f2bf(acc[i][j][e] * ascale[mm] * ws));
                     }
                 }
         }
@@ -1323,7 +1325,7 @@ __device__ void d_quant_fp8(unsigned char* __restrict__ xq_, const bf16* __restr
         for (int off = 32; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, PLOW_WAVE));
         const float as = fmaxf(amax * (1.0f / 448.0f), 1e-12f);
         const float inv = 1.0f / as;
-        if (lane == 0) ascale[m] = as;
+        if (lane == 0) st_act<float>(&ascale[m], as);
         /* Quantize two elements at a time into one packed fp8 pair (byte lo/hi), then store the
          * byte. cvt_pk_fp8_f32(a, b, old, sel): sel=false writes bytes[0,1], and we only keep
          * bytes[0,1]; a single-element tail uses b=0. */
@@ -1331,8 +1333,8 @@ __device__ void d_quant_fp8(unsigned char* __restrict__ xq_, const bf16* __restr
             const float a = bf2f(x[row + k]) * inv;
             const float b = (k + 1 < K) ? bf2f(x[row + k + 1]) * inv : 0.0f;
             const unsigned pk = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0u, false);
-            xq[row + k] = (unsigned char)(pk & 0xffu);
-            if (k + 1 < K) xq[row + k + 1] = (unsigned char)((pk >> 8) & 0xffu);
+            st_act1_u8(&xq[row + k], (unsigned char)(pk & 0xffu));
+            if (k + 1 < K) st_act1_u8(&xq[row + k + 1], (unsigned char)((pk >> 8) & 0xffu));
         }
     }
 }
@@ -1364,15 +1366,97 @@ __device__ void d_quant_fp8(unsigned char* __restrict__ xq_, const bf16* __restr
  * A fixed MM=16 would therefore make M=1 decode — the single most latency-
  * critical path in the whole model — 16x more expensive than it needs to be. */
 /* `norm`: 0 = none; 1 = apply a PRECOMPUTED row RMS from `rms` (a separate ROWRMS packet
- * produced it).
+ * produced it); 2 = compute the row RMS HERE, from the x this kernel already staged in LDS,
+ * and delete the RMSNORM packet and its gate outright.
  *
- * There WAS a mode 2 -- compute the row RMS here, from the x this kernel already stages in
- * LDS, deleting the RMSNORM packet and its gate outright. It is correct and it costs almost
- * nothing per GEMV. It was still a measured LOSS (22.4 -> 24.4 ms/token) and is gone: the
- * norm feeding attention has FIVE consumers (q, k, v off the input norm; gate, up off the
- * pre-FFN norm), so folding it in turns ONE shared reduction into FIVE redundant ones, each
- * on its own GEMV's critical path. The two gates saved do not pay for that. Fusion that
- * duplicates a reduction across N consumers costs (N-1) extra reductions -- check N first. */
+ * MODE 2 WAS REMOVED ONCE, FOR GEMMA, AND THE REASON WAS FAN-OUT -- not the mode itself.
+ * Measured 22.4 -> 24.4 ms/token there, because the norm feeding attention has FIVE
+ * consumers (q, k, v off the input norm; gate, up off the pre-FFN norm), so folding it in
+ * turns ONE shared reduction into FIVE redundant ones, each on its own GEMV's critical path.
+ * The two gates saved did not pay for that. THE LAW STANDS: fusion that duplicates a
+ * reduction across N consumers costs (N-1) extra reductions -- check N first.
+ *
+ * It is back because K3 answers that check differently, and the census is in
+ * `perf-data/k3-decode-counter-graph.md` plus the fan-out pass in `k3.rs fuse_norm_gemv`:
+ * 92 of K3's 116 decode RMSNORMs have fan-out ONE (`routed_expert_norm` -> the latent up
+ * projection), so mode 2 there costs ZERO extra reductions, not four. K3 also pays far more
+ * per packet than Gemma did: its decode graph is a 1831-level chain at mean width 1.41, so a
+ * deleted packet is a deleted CHAIN LEVEL at ~5.7 us, with nothing else ready to fill it.
+ * Measured: the 116 folds take the critical path 1831 -> 1715.
+ *
+ * THE SHAPE OF THE FUSION IS WHAT MAKES IT BIT-EXACT, and it is deliberately not mode 1's.
+ * Mode 1 multiplies `x * rms * gamma` inside the k-loop, in f32, per element -- that is a
+ * different number from what the deleted RMSNORM packet stored, which was `f2bf(x*inv*g)`,
+ * ROUNDED TO BF16 and re-read from HBM by the GEMV. So mode 2 does not touch the hot loop at
+ * all. It normalizes the STAGED COPY IN PLACE, rounding to bf16 exactly as `d_rmsnorm` does,
+ * and then runs the ORDINARY un-normed hot loop over it. The bytes the k-loop reads out of
+ * LDS are the same bytes the unfused pair wrote to and read from HBM, so the fused and
+ * unfused programs are bit-identical by construction rather than by measurement.
+ *
+ * `gemv_norm_lds` below replicates `d_rmsnorm`'s `fits` path element-for-element -- same
+ * PLOW_THREADS, same per-thread element map, same serial accumulation order, same
+ * `block_sum`, same `rsqrtf(ss/feat + eps)` -- because the reduction ORDER is what fixes the
+ * low bit of `inv`, and a "mathematically equivalent" reduction is not the same number.
+ *
+ * PRECONDITION: mode 2 requires the LDS-staged arm (`M*K <= GM_LDS_HALVES`) and the `fits`
+ * path's bound (`K <= RN_REG*PLOW_THREADS`, `K % 8 == 0`). The emitter guarantees both --
+ * `k3.rs fuse_norm_gemv` refuses otherwise -- and the arm re-checks and falls back to the
+ * un-normed path rather than reading an unstaged LDS arena. */
+
+/* Halves reserved at the TOP of the GEMM arena for the fused norm's cross-wave reduction,
+ * kept clear of the staged row. PLOW_WAVES floats = 2*PLOW_WAVES halves, rounded to 16 B. */
+#define GV_NORM_SCRATCH ((2u * PLOW_WAVES + 7u) & ~7u)
+
+/* Normalize the LDS-staged activation in place: lds[k] = f2bf(bf2f(lds[k]) * inv * gamma[k]).
+ * Structurally d_rmsnorm's `fits` path with the row read from LDS instead of HBM. */
+__device__ __forceinline__ void gemv_norm_lds(bf16* __restrict__ lds, const bf16* __restrict__ g_,
+                                              unsigned M, unsigned K, float eps, float* part) {
+    const auto* const gg = as_glob(g_);
+    for (unsigned m = 0; m < M; m++) {
+        const size_t base = (size_t)m * K;
+        /* PRODUCE: the row and its weight together, one round trip between them. */
+        bf16v8 v[RN_VEC], w[RN_VEC];
+#pragma unroll
+        for (int c = 0; c < RN_VEC; c++) {
+            const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+            v[c] = bf16v8_zero();
+            w[c] = bf16v8_zero();
+            if (i < K) {
+                v[c] = ld_lds8(lds + base + i);
+                if (gg) w[c] = ld_glob8(gg + i);
+            }
+        }
+        float ss = 0.0f;
+#pragma unroll
+        for (int c = 0; c < RN_VEC; c++)
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float f = bf2f(v[c][j]);
+                ss += f * f;
+            }
+        /* block_sum syncthreads on both sides, so the whole workgroup agrees on `inv` before
+         * anyone overwrites the staged row it was reduced from. */
+        const float inv = rsqrtf(block_sum(ss, part) / (float)K + eps);
+#pragma unroll
+        for (int c = 0; c < RN_VEC; c++) {
+            const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+            if (i < K) {
+                bf16v8 o;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float gv = gg ? bf2f(w[c][j]) : 1.0f;
+                    o[j] = f2bf(bf2f(v[c][j]) * inv * gv);
+                }
+                *(bf16v8*)(lds + base + i) = o;
+            }
+        }
+    }
+    /* The write-back is the LAST thing here, and block_sum's trailing __syncthreads happens
+     * BEFORE it — so the barrier the hot loop needs is this one, not that one. Without it a
+     * wave reads columns of the staged row that another wave has not renormalized yet: a
+     * partially-normed activation, which is finite, plausible and wrong. */
+    __syncthreads();
+}
 
 /* Memory-level parallelism. A single 16-byte load per lane per iteration leaves the
  * kernel LATENCY-bound, not bandwidth-bound: an HBM round trip is ~1 us and there is
@@ -1628,7 +1712,7 @@ __device__ __forceinline__ void gemv_rows(bf16* __restrict__ C_, const bf16* __r
 #pragma unroll
         for (int m = 0; m < MM; m++) {
             const float t = wave_sum(acc[m]);
-            if (lane == 0 && (unsigned)m < M) C[(size_t)m * N + n] = f2bf(t);
+            if (lane == 0 && (unsigned)m < M) st_act1(&C[(size_t)m * N + n], f2bf(t));
         }
     }
 }
@@ -1744,7 +1828,7 @@ __device__ __forceinline__ void gemv_rows_r(bf16* __restrict__ C_, const bf16* _
         for (int r = 0; r < R; r++) {
             const float t = wave_sum(acc[r][m]);
             if (lane == 0 && (unsigned)m < M)
-                C[(size_t)m * N + n + (unsigned)r * PLOW_WAVES] = f2bf(t);
+                st_act1(&C[(size_t)m * N + n + (unsigned)r * PLOW_WAVES], f2bf(t));
         }
 }
 
@@ -1872,7 +1956,7 @@ __device__ __forceinline__ void gemv_glu_rows(bf16* __restrict__ C_, const bf16*
             if (lane == 0 && (unsigned)m < M) {
                 const float o = (act == 2u) ? (k3_situ_gate(g, beta) * k3_situ_up(u, lbeta))
                                             : (act_gate_only(g, act) * u);
-                C[(size_t)m * N + n] = f2bf(o);
+                st_act1(&C[(size_t)m * N + n], f2bf(o));
             }
         }
     }
@@ -1947,7 +2031,7 @@ __device__ __forceinline__ void gemv_fp8_rows_1(bf16* __restrict__ C_, const bf1
 #pragma unroll
     for (int m = 0; m < MM; m++) {
         const float t = wave_sum(acc[m]) * wscale[n]; /* per-row dequant, once, in the epilogue */
-        if (lane == 0 && (unsigned)m < M) C[(size_t)m * N + n] = f2bf(t);
+        if (lane == 0 && (unsigned)m < M) st_act1(&C[(size_t)m * N + n], f2bf(t));
     }
 }
 template <int MM, bool XLDS, int UN = GV_UNROLL_FP8>
@@ -2034,8 +2118,8 @@ __device__ __forceinline__ void gemv_rows_fp8(bf16* __restrict__ C_, const bf16*
             const float t = wave_sum(acc[m]) * wscale[n]; /* per-row dequant, once, in the epilogue */
             const float t2 = wave_sum(acc2[m]) * wscale[n2];
             if (lane == 0 && (unsigned)m < M) {
-                C[(size_t)m * N + n] = f2bf(t);
-                C[(size_t)m * N + n2] = f2bf(t2);
+                st_act1(&C[(size_t)m * N + n], f2bf(t));
+                st_act1(&C[(size_t)m * N + n2], f2bf(t2));
             }
         }
     }
@@ -2187,7 +2271,7 @@ __device__ __forceinline__ void gemv_mx_rows_1(bf16* __restrict__ Cq_, bf16* __r
 #pragma unroll
     for (int m = 0; m < MM; m++) {
         const float t = wave_sum(acc[m]);
-        if (lane == 0 && (unsigned)m < M) Co[(size_t)m * Nout + col] = f2bf(t);
+        if (lane == 0 && (unsigned)m < M) st_act1(&Co[(size_t)m * Nout + col], f2bf(t));
     }
 }
 template <int MM, bool XLDS, int UN = 3>
@@ -2304,8 +2388,8 @@ __device__ __forceinline__ void gemv_rows_mxfp4(bf16* __restrict__ Cq_, bf16* __
             const float t = wave_sum(acc[m]);
             const float t2 = wave_sum(acc2[m]);
             if (lane == 0 && (unsigned)m < M) {
-                Co[(size_t)m * Nout + col] = f2bf(t);
-                Co2[(size_t)m * Nout2 + col2] = f2bf(t2);
+                st_act1(&Co[(size_t)m * Nout + col], f2bf(t));
+                st_act1(&Co2[(size_t)m * Nout2 + col2], f2bf(t2));
             }
         }
     }
@@ -2406,7 +2490,8 @@ __device__ __forceinline__ void gemv_blk_rows_r(bf16* __restrict__ C_, const bf1
 #pragma unroll
         for (int r = 0; r < R; r++) {
             const float t = wave_sum(acc[r][m]); /* block scales already folded in per chunk */
-            if (lane == 0 && (unsigned)m < M) C[(size_t)m * N + n + (unsigned)r * PLOW_WAVES] = f2bf(t);
+            if (lane == 0 && (unsigned)m < M)
+                st_act1(&C[(size_t)m * N + n + (unsigned)r * PLOW_WAVES], f2bf(t));
         }
 }
 template <int MM, bool XLDS, int UN = GV_UNROLL_FP8>
@@ -2526,7 +2611,7 @@ __device__ __forceinline__ void gemv_glu_rows_fp8(bf16* __restrict__ C_,
             const float u = wave_sum(au[m]) * uscale[n];
             if (lane == 0 && (unsigned)m < M) {
                 const float s = act_gate_only(g, act);
-                C[(size_t)m * N + n] = f2bf(s * u);
+                st_act1(&C[(size_t)m * N + n], f2bf(s * u));
             }
         }
     }
@@ -2654,7 +2739,7 @@ __device__ __forceinline__ void gemv_qkvg_rows(bf16* __restrict__ Cq_, bf16* __r
 #pragma unroll
         for (int m = 0; m < MM; m++) {
             const float t = wave_sum(acc[m]);
-            if (lane == 0 && (unsigned)m < M) Cout[(size_t)m * Nout + col] = f2bf(t);
+            if (lane == 0 && (unsigned)m < M) st_act1(&Cout[(size_t)m * Nout + col], f2bf(t));
         }
     }
 }
@@ -2831,7 +2916,7 @@ __device__ __forceinline__ void gemv_rows_dma(bf16* __restrict__ C_, const bf16*
 #pragma unroll
         for (int m = 0; m < MM; m++) {
             const float t = wave_sum(acc[m]);
-            if (lane == 0 && (unsigned)m < M) C[(size_t)m * N + n] = f2bf(t);
+            if (lane == 0 && (unsigned)m < M) st_act1(&C[(size_t)m * N + n], f2bf(t));
             acc[m] = 0.0f;
         }
     };
@@ -2916,7 +3001,24 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
                          const bf16* __restrict__ W, const float* __restrict__ rms,
                          const bf16* __restrict__ gamma, unsigned M, unsigned N, unsigned K,
                          int norm, float eps, unsigned slice, unsigned nblk, bf16* lds) {
-    (void)eps;
+    /* norm == 2 folds the producing RMSNORM in. It is legal ONLY on the staged arm and only
+     * for a row d_rmsnorm's `fits` path would have taken; the emitter enforces both, and this
+     * demotes rather than trusting it, because the failure mode otherwise is reducing over an
+     * LDS arena that was never filled — finite, plausible and wrong. */
+    const bool fold = (norm == 2) && ((size_t)M * K + GV_NORM_SCRATCH <= GM_LDS_HALVES) &&
+                      (K <= RN_REG * PLOW_THREADS) && ((K & 7u) == 0);
+    if (norm == 2 && !fold) norm = 0;
+    /* `part` MUST NOT be the caller's block_sum scratch here, and this is not defensive coding.
+     * `plow_smem` (interp.hip) is a UNION: `sm->part` and `sm->gm` are THE SAME ADDRESS, so the
+     * interpreter hands this function two aliases of one buffer. block_sum writes part[0..WAVES)
+     * = the first 16 halves of the arena — i.e. straight through the staged activation this fold
+     * is in the middle of reducing. Taking the scratch from the TOP of the arena instead, past
+     * the row, removes the alias outright. A standalone test cannot see this bug: its `lds` and
+     * `part` are separate __shared__ arrays, so it passes while the interpreter does not.
+     *
+     * The scratch is DERIVED from the arena rather than passed in, so no caller can hand this
+     * function an aliasing buffer by accident — which is exactly how the bug got in. */
+    float* const nscratch = (float*)(lds + (GM_LDS_HALVES - GV_NORM_SCRATCH));
     /* Stage the activation in LDS when it fits. x is re-read for every one of the N output
      * columns, and although it is tiny (11 KB at M=1) and therefore L2-resident, each
      * re-read still consumes a VECTOR-MEMORY issue slot -- the same pipe the weight stream
@@ -2927,7 +3029,11 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
     if ((size_t)M * K <= GM_LDS_HALVES) {
         stage_x_lds(lds, x, (size_t)M * K);
         __syncthreads();
-        if (norm)
+        /* Fold the RMSNORM into the staged copy, then fall through to the ORDINARY un-normed
+         * hot loop — the k-loop never learns this happened, so it keeps its register
+         * allocation and its unroll. `gemv_norm_lds` barriers on exit. */
+        if (fold) gemv_norm_lds(lds, gamma, M, K, eps, nscratch);
+        if (norm == 1)
             gemv_rows<MM, true, true, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
         else {
 #if GV_DMA
@@ -2952,7 +3058,9 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
 #endif
         }
     } else {
-        if (norm)
+        /* Unstaged: `fold` is false here by construction, so norm == 2 was already demoted to
+         * 0 above and this is mode 1 or nothing. */
+        if (norm == 1)
             gemv_rows<MM, false, true, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
         else
             gemv_rows<MM, false, false, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
@@ -3187,7 +3295,7 @@ __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
      * at any M — see the walk's note on GM_LDS_HALVES. */
     const bf16* x_ = x + (size_t)m0 * K;
     bf16* C_ = C + (size_t)m0 * N;
-    const float* rms_ = norm ? rms + m0 : rms;
+    const float* rms_ = (norm == 1) ? rms + m0 : rms;
 #if defined(PLOW_GEMV_PERK)
     if (K == 8192)        /* o_proj (31B): nchunk 16 -> all 16 in flight, one group */
         d_gemv_t<PLOW_GEMV_MM, GV_UN_K8192>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
@@ -3427,7 +3535,7 @@ __device__ __forceinline__ void gemv_glu_rows_mxfp4(
             const float uu = wave_sum(au[m]);
             if (lane == 0 && (unsigned)m < M) {
                 const float s = act_gate_only(g, act);
-                C[(size_t)m * N + n] = f2bf(s * uu);
+                st_act1(&C[(size_t)m * N + n], f2bf(s * uu));
             }
         }
     }

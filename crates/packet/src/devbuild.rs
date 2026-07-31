@@ -1367,6 +1367,41 @@ impl Builder {
             gq_stream.sort_by_key(|e| e.seg);
         }
 
+        // PER-(PACKET, DOMAIN) SLICE COUNT, for the two-level cache-maintenance rendezvous
+        // (PLOW_SE_NPER / PLOW_GATE_HIER). This is THE number that made HIER2 unbuildable under
+        // the plain global queue: there a workgroup claims whatever entry is next, so which
+        // slices of a packet run on which XCD is decided at run time. Under L2 placement the
+        // domain is assigned HERE, so the count is a static constant — and it is only meaningful
+        // once `gq_stream` has been sorted into its per-domain windows, which is why this sits
+        // after the sort and not beside the `e.seg` assignment that produces it.
+        //
+        // Packed into the spare high bits of `flags`, which is only ever read through masks, so
+        // the struct does not grow. A count of 1 is left as 0: a single-slice packet on a domain
+        // has no followers to rendezvous with, and the interpreter reads 0 as "no hierarchy".
+        if l2_place.is_some() {
+            let mut per: std::collections::HashMap<(u32, u16), u32> = std::collections::HashMap::new();
+            for e in &gq_stream {
+                *per.entry((e.inst, e.seg)).or_insert(0) += 1;
+            }
+            let mut over = 0usize;
+            for e in gq_stream.iter_mut() {
+                let n = *per.get(&(e.inst, e.seg)).unwrap_or(&0);
+                if n > 1 {
+                    // 9 bits. A domain cannot hold more than n_cu slices of one packet, and
+                    // n_cu > 511 would need a wider field rather than a silent truncation.
+                    if n > 511 {
+                        over += 1;
+                        continue;
+                    }
+                    e.flags |= (n as u16) << crate::dev::SE_NPER_SHIFT;
+                }
+            }
+            assert_eq!(
+                over, 0,
+                "PLOW_SE_NPER holds 9 bits; {over} (packet, domain) pairs exceed 511 slices"
+            );
+        }
+
         // Segment window bounds in gq_stream. gq_stream is op-major and seg_of[] is monotonic in
         // op-emit order, so each segment occupies a contiguous [ofs[s], ofs[s+1]) range — the
         // interp bounds its cursor to this window under RUNSEG. Under L2 placement `seg` ranges
@@ -1419,9 +1454,24 @@ impl Builder {
             );
         }
 
+        // TWO-LEVEL MAINTENANCE SCRATCH, appended to the counter region rather than given its own
+        // allocation and its own pointer. Three u32 per (packet, domain): publish arrivals,
+        // observe election, observe release. The region is already allocated, already zeroed by
+        // the host's per-token re-arm, and already reachable from the interpreter as a counter id
+        // — so extending it costs one `u32` in an existing alignment pad instead of a tenth
+        // kernarg pointer, which `AmdEngine::load`'s size check has caught going wrong before.
+        //
+        // Only when the program is L2-placed: without per-domain windows there is no `nper` to
+        // rendezvous on (see the PLOW_SE_NPER note), so the scratch would be dead weight.
+        let (hier_base, n_counter) = match l2_place {
+            Some(l) => (n_counter, n_counter + 3 * n_ops as u32 * l.domains),
+            None => (0, n_counter),
+        };
+
         Program {
             n_cu: self.n_cu,
             n_counter,
+            hier_base,
             insts,
             stream,
             stream_ofs,
@@ -1523,6 +1573,8 @@ pub fn static_seg_ofs(
 pub struct Program {
     pub n_cu: u32,
     pub n_counter: u32,
+    /// Base counter id of the two-level maintenance scratch; 0 = hierarchy off. See `DevProgram::hier_base`.
+    pub hier_base: u32,
     pub insts: Vec<DevInst>,
     pub stream: Vec<StreamEnt>,
     pub stream_ofs: Vec<u32>,
@@ -2462,6 +2514,7 @@ mod v6_tests {
         let prog = || Program {
             n_cu: 2,
             n_counter: 1,
+            hier_base: 0,
             insts: vec![inst(6), inst(18)],
             stream: vec![se(0, 0), se(1, 0)],
             stream_ofs: vec![0, 1],
@@ -2558,6 +2611,7 @@ mod v6_tests {
         let make_prog = |n_inst: usize| Program {
             n_cu: 4,
             n_counter: n_inst as u32,
+            hier_base: 0,
             insts: (0..n_inst).map(|i| inst(8 + i as u16)).collect(),
             stream: (0..n_inst * 2).map(|i| se(i as u32 / 2, i as u32 % 2)).collect(),
             stream_ofs: vec![0, n_inst as u32, n_inst as u32 * 2, n_inst as u32 * 2],

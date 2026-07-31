@@ -1529,6 +1529,18 @@ const GM_LDS_HALVES: u64 = 2 * (256 + 256) * (64 + 8);
 /// (`PLOW_SASSERT(PLOW_GEMV_MM <= PLOW_GEMV_MAXM, ...)`) and a build-script clamp here.
 const GEMV_MAXM: u32 = 16;
 
+/// `RN_REG` and `PLOW_THREADS` from `runtime/amd/amd_common.h`. Their product is the widest row
+/// `d_rmsnorm` reduces on its register (`fits`) path, and therefore the widest row the fused-norm
+/// GEMV ([`k3::fuse_norm_gemv`], `norm == 2`) may take: the fused arm is bit-exact only because it
+/// walks the row with the SAME per-thread element map, which exists only on that path.
+/// `GV_NORM_SCRATCH` from `op_gemm.h` — halves the fused-norm GEMV reserves at the TOP of the
+/// arena for its cross-wave reduction, kept off the staged row (`plow_smem` is a union, so the
+/// interpreter's `part` and `gm` are one buffer).
+pub(crate) const GV_NORM_SCRATCH: u64 = 16;
+
+pub(crate) const RN_REG: u32 = 16;
+pub(crate) const PLOW_THREADS: u32 = 512;
+
 /// The compiled GEMV row bucket (`PLOW_GEMV_MM`) the decode object will be built at.
 ///
 /// Mirrors `scripts/build_gfx950.sh`: `next_pow2(PLOW_DECODE_BATCH)`, clamped to
@@ -5684,6 +5696,7 @@ mod gfx950_coverage_tests {
             op: DevOp::GemvArgmax as u16, blocks: 1, ..Default::default()
         };
         let p = packet::devbuild::Program {
+            hier_base: 0,
             n_cu: 4, n_counter: 0, insts: vec![i], stream: vec![], stream_ofs: vec![],
             stream_len: vec![], waits: vec![], succs: vec![], tensors: vec![],
             gq_stream: vec![], gq_seg_ofs: vec![], l2_sms: 0, l2_domains: 0,
@@ -5699,6 +5712,7 @@ mod gfx950_coverage_tests {
     #[test]
     fn covered_opcodes_pass_and_nvidia_is_never_checked() {
         let p = packet::devbuild::Program {
+            hier_base: 0,
             n_cu: 4, n_counter: 0,
             insts: vec![
                 packet::dev::DevInst { op: DevOp::Gemv as u16, blocks: 1, ..Default::default() },
@@ -5714,6 +5728,7 @@ mod gfx950_coverage_tests {
         check_gfx950_opcode_coverage(&m, true);
         // The Gemma-MoE family has no AMD arm at all; on an NVIDIA target that must not be checked.
         let p2 = packet::devbuild::Program {
+            hier_base: 0,
             n_cu: 4, n_counter: 0,
             insts: vec![packet::dev::DevInst {
                 op: DevOp::MoeRouterGemma as u16, blocks: 1, ..Default::default()
@@ -6200,6 +6215,7 @@ mod fp8_profile_tests {
 
     fn prog(insts: Vec<DevInst>) -> Program {
         Program {
+            hier_base: 0,
             n_cu: 4, n_counter: 0, insts, stream: vec![], stream_ofs: vec![],
             stream_len: vec![], waits: vec![], succs: vec![], tensors: vec![],
             gq_stream: vec![], gq_seg_ofs: vec![], l2_sms: 0, l2_domains: 0,

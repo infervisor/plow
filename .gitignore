@@ -22,3 +22,15 @@ __pycache__
 # Isolated cargo target for `--features hsa` builds, so a concurrent agent
 # rebuilding the shared `target/` without that feature cannot break amd-bench.
 target-hsa/
+ba_agt/
+ba_ctl/
+ba_hier/
+ba_hier2/
+ba_keeprel/
+ba_l2/
+ba_l2hier/
+ba_main/
+ba_sc1/
+ba_sc1g/
+# every cmake hsaco build dir from the HIER2/SC1 campaign; objects, not source
+ba_*/

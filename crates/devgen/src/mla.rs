@@ -6455,8 +6455,7 @@ fn k3_build_model(
         // ignored (`lib.rs:4327`), so setting it on K3 was a silent no-op.
         b.set_l2_placement(l2_layout);
         b.adopt_tensors(tensors.clone());
-        crate::k3::emit_k3_model(
-            &mut b,
+        crate::k3::emit_k3_model(&mut b,
             &mcfg,
             &|l| matches!(c.attn[l as usize], K3Attn::Kda),
             &layers,
@@ -6464,6 +6463,7 @@ fn k3_build_model(
             t,
             slot_rows,
             n_cu,
+            crate::k3::RowKind::Tokens,
         );
         // Every builder re-declares the same NoPE recipes and, under dedup, gets the same handles,
         // so any one of the lists is the whole set. Take the first — decode's — because it is the

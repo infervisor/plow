@@ -135,3 +135,28 @@ against 1739 today.
 
 Note that (2) is worth more than it looks: shortening the chain scales the WHOLE protocol term,
 whereas (1) and (3) scale only parts of it.
+
+---
+
+## FOLLOW-UP: what (1) and (2) actually did
+
+(1) **is landed.** The emitter applies the transitive reduction — it reports `69 ... 207 wait
+entries removed` at emit time, and `disasm --counters` now finds 0 remaining redundant edges.
+
+(2) **is IMPLEMENTED for `RmsNorm` only, and is OFF by default pending a numerical issue**, and the numbers above oversold it in one specific way. See
+`perf-data/k3-narrow-gate-fusion.md`. In short:
+
+* **The chain-level claim held exactly.** Folding all 116 `RmsNorm` gates into their GEMV
+  consumers took the decode program 2459 -> 2343 packets, 2969 -> 2853 edges, and the critical
+  path **1831 -> 1715**. One deleted packet, one deleted edge, one deleted level, as claimed.
+* **The counter-traffic claim did NOT hold.** "19% of counter traffic" implies fusing recovers
+  that polling. It does not: polls fell 400,110 -> 399,994, i.e. **0.03%**, only the deleted
+  packets' own waits. Fusing a narrow gate into a wide consumer REDIRECTS its polls rather than
+  removing them — the consumer polled the `b=1` norm with 256 workgroups and now polls the norm's
+  producer with 256 workgroups. Poll traffic is a function of consumer width and edge count, and
+  this fusion changes neither. Argue for these fusions on chain depth alone.
+* **`AttnRes` is a LOSS and was not attempted.** Its fan-out is 3 or 4 (not 1), and its mix spans
+  `nb+1` rows of 7168 against a GEMV that stages one — 8.9 GB/token of extra reads to buy 1.07 ms.
+  The 187 levels in the paragraph above are not available at this price.
+* **`MoeRouterTopk` is fan=2, not fan=1.** The table above lists only `MoeGroupGluFp8Blk`;
+  `MoeGroupDownFp8Blk` reads `route_tab` too. Still open, still worth 92 levels.

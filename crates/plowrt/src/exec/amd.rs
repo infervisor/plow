@@ -2226,6 +2226,8 @@ struct AmdProg {
     /// program is dispatched in ONE launch with every domain draining concurrently — see
     /// [`AmdEngine::run`].
     l2_domains: u32,
+    /// Base counter id of the two-level maintenance scratch; 0 = off. See `DevProgram::hier_base`.
+    hier_base: u32,
 }
 
 struct AmdGq {
@@ -3187,6 +3189,19 @@ impl AmdEngine {
                 seg_class,
                 gq,
                 l2_domains: p.l2_domains,
+                // DERIVED, not carried in the blob. The emitter appends the two-level
+                // maintenance scratch to the tail of the counter region, three u32 per
+                // (packet, domain), so its base is implied by fields the header already has.
+                // That keeps `PlowProgHeader` at 24 bytes and the blob format unchanged.
+                //
+                // Zero unless the program is L2-placed: without per-domain windows there is no
+                // `nper`, the emitter allocates no scratch, and the interpreter reads 0 as
+                // "no hierarchy".
+                hier_base: if p.l2_domains != 0 {
+                    (p.n_counter).saturating_sub(3 * p.insts.len() as u32 * p.l2_domains)
+                } else {
+                    0
+                },
             });
         }
         let decode = progs.len() - 1;
@@ -3550,6 +3565,10 @@ impl AmdEngine {
             },
             cur_seg: seg,
             l2_domains: g.l2_domains,
+            // Two-level cache maintenance. Handed to the device only when the OBJECT was built
+            // for it; a stale object reads the field as ordinary padding, so an old cubin on a
+            // new blob is inert rather than wrong.
+            hier_base: g.hier_base,
             n_seg: g.seg_class.len() as u32,
             // Static-path segment windows. Set for every program: an unsegmented
             // one has a single window covering the whole stream, so the decode

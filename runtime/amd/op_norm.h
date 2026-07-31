@@ -22,17 +22,11 @@
 
 #include "amd_common.h"
 
-/* Elements one thread holds when the row fits in registers. 16 * 512 = 8192 covers every
- * RMSNorm in Gemma (hidden = 5376); wider rows fall back to the streaming path.
- *
- * Held as RN_VEC 16-BYTE VECTOR loads, not RN_REG scalar ones. A `const bf16*` is a generic,
- * align-2 pointer, so `x[base + i]` compiled to `flat_load_ushort` -- two bytes per
- * instruction, sixteen instructions per thread. That is ruinous precisely HERE: a decode norm
- * is a single row on a single CU with all 255 others stalled on its counter, so its cost is
- * pure issue-and-latency, and there is no other work to hide it behind. See as_glob() and
- * ld_glob8() in amd_common.h. */
-#define RN_REG 16
-#define RN_VEC (RN_REG / 8) /* 16 halves = 2 x bf16v8 */
+/* RN_REG / RN_VEC moved to amd_common.h: op_gemm.h's fused-norm GEMV (`norm == 2`,
+ * `gemv_norm_lds`) must reduce with the SAME per-thread element map as `d_rmsnorm` below to
+ * stay bit-exact, and it is included BEFORE this header. A constant two headers must agree on
+ * is one constant, not two — this pair being copied is exactly how a fused arm ends up
+ * "mathematically equivalent" and numerically different. */
 
 /* RMSNorm over `feat`. One workgroup per row, strided by nblk.
  *
@@ -136,7 +130,7 @@ __device__ void d_rowrms(float* __restrict__ rms, const bf16* __restrict__ x, un
             ss += v * v;
         }
         const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
-        if (threadIdx.x == 0) rms[row] = inv;
+        if (threadIdx.x == 0) st_act<float>(&rms[row], inv);
     }
 }
 
@@ -432,7 +426,7 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
         for (unsigned e = 0; e < E; e++) amax = fmaxf(amax, fabsf(v[e]));
         amax = wave_max(amax);
         const float qinv = (amax > 0.0f) ? (PLOW_FP8_E4M3_MAX / amax) : 0.0f;
-        if (lane == 0) scg[row] = amax * (1.0f / PLOW_FP8_E4M3_MAX);
+        if (lane == 0) st_act<float>(&scg[row], amax * (1.0f / PLOW_FP8_E4M3_MAX));
 #pragma unroll
         for (unsigned e = 0; e < E; e++) st_act1_u8(&og[obase + lane + e * 64], quant_fp8(v[e] * qinv));
     }

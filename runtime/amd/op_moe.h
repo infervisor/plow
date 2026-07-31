@@ -1247,7 +1247,7 @@ __device__ void d_dense_glu_fp8_blk(bf16* fu, const bf16* x, const unsigned char
         const unsigned nrow = (n >> 7) * KB;
         const float g = wave_dot_fp8_blk(x, Wg + (size_t)n * K, Sg + nrow, K, lane);
         const float u = wave_dot_fp8_blk(x, Wu + (size_t)n * K, Su + nrow, K, lane);
-        if (lane == 0) fg[n] = f2bf(moe_glu(g, u, act, beta, lbeta));
+        if (lane == 0) st_act1(&fg[n], f2bf(moe_glu(g, u, act, beta, lbeta)));
     }
 }
 
@@ -1769,8 +1769,8 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
                     for (int el = 0; el < 16; el++) {
                         const unsigned rr =
                             wm * (MPF_BM / MPF_WM) + i * MFMA_M + mfma_acc_m(lane, el);
-                        fu[(size_t)(rowbase + rr) * N + nn_lane] =
-                            f2bf(moe_glu(accf[i][0][el], accf[i][1][el], act, beta, lbeta));
+                        st_act1(&fu[(size_t)(rowbase + rr) * N + nn_lane],
+                                f2bf(moe_glu(accf[i][0][el], accf[i][1][el], act, beta, lbeta)));
                     }
             }
         } else {

@@ -220,15 +220,29 @@ int main(int argc, char** argv) {
      * Second pass over the same fixture bytes: the stream is a fixed layout, so
      * re-reading it from the top is cheaper than retaining every case.
      * ==================================================================== */
-    plow_hsa_kernel kpf, kgpf;
+    plow_hsa_kernel kpf, kgpf, kpfm;
     if (plow_hsa_get_kernel(H, 0, "mla_flash_prefill_512", &kpf) ||
-        plow_hsa_get_kernel(H, 0, "mla_gather_prefill_512", &kgpf)) {
+        plow_hsa_get_kernel(H, 0, "mla_gather_prefill_512", &kgpf) ||
+        plow_hsa_get_kernel(H, 0, "mla_flash_prefill_mfma_512", &kpfm)) {
         fprintf(stderr, "prefill sym: %s\n", plow_hsa_last_error());
         return 1;
     }
+    /* The TILED kernel (PLOW_MLA_PF_MFMA, the shipped path) is checked against the SAME
+     * decode oracle, and it is the reason this phase grew a tolerance. It cannot be
+     * memcmp'd: MFMA contracts DK in a different order, so the scores differ in the low
+     * bits, and through the online softmax's running max that moves every unnormalized
+     * partial. What IS comparable is the quantity the merge actually produces — Opart/l —
+     * because it is invariant to the max the two kernels chose. Reported relative to the
+     * row's own magnitude so a near-zero component cannot manufacture a large ratio. */
+#define MLA_PF_MFMA_TOL 2e-2f
     /* T=1 first (the base case: prefill MUST degenerate to the validated decode),
      * then T=4 (the causal bound actually doing work). */
-    static const unsigned TOKS[] = {1, 4};
+    /* 1 and 4 are the original base cases (prefill degenerating to decode, then a real
+     * causal bound). The rest exist for the TILED kernel and are chosen against its q-tile
+     * of FA_MLA_PF_BQ=64: 33 crosses an M-tile inside one q-tile, 64 is the exact tile,
+     * 65 is the first ragged second tile, and 130 is several tiles with a ragged tail —
+     * the sizes where a q-tile bound or a mask edge is wrong but a single tile hides it. */
+    static const unsigned TOKS[] = {1, 4, 33, 64, 65, 130};
     printf("\nMLA PREFILL (device prefill vs the validated device decode, bit-exact):\n");
     P = fixture + 8; /* past magic + n_cases */
     for (uint32_t ci = 0; ci < n_cases; ci++) {
@@ -314,11 +328,34 @@ int main(int argc, char** argv) {
                     fprintf(stderr, "gather prefill launch: %s\n", plow_hsa_last_error()); fails++;
                 }
             }
+            /* The tiled kernel, same operands, its own buffers. Dense only — the gathered
+             * arm keeps the scalar body because its top_k set is per query row. */
+            void *dOpM = NULL, *dMlM = NULL;
+            float *hOpM = NULL, *hMlM = NULL;
+            if (top_k == 0) {
+                dOpM = dev(nop_t * 4);
+                dMlM = dev(nml_t * 4);
+                struct __attribute__((packed)) {
+                    void *op, *ml; const void *qa, *qr, *ckv, *kr, *len;
+                    unsigned n_batch, n_tok, n_head, kv_stride, window; float scale;
+                } a = {dOpM, dMlM, dQa, dQr, dCkv, dKr, dLen, B, T, n_head, ctx, 0, scale};
+                if (plow_hsa_launch(H, 0, &kpfm, cus * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1,
+                                    1, 0, &a, sizeof(a)) != 0) {
+                    fprintf(stderr, "mfma prefill launch: %s\n", plow_hsa_last_error()); fails++;
+                }
+            }
             plow_hsa_wait(H, 0);
             float* hOp = plow_hsa_alloc_host(H, nop_t * 4);
             float* hMl = plow_hsa_alloc_host(H, nml_t * 4);
             plow_hsa_copy_d2h(H, 0, hOp, dOp, nop_t * 4);
             plow_hsa_copy_d2h(H, 0, hMl, dMl, nml_t * 4);
+            if (dOpM) {
+                hOpM = plow_hsa_alloc_host(H, nop_t * 4);
+                hMlM = plow_hsa_alloc_host(H, nml_t * 4);
+                plow_hsa_copy_d2h(H, 0, hOpM, dOpM, nop_t * 4);
+                plow_hsa_copy_d2h(H, 0, hMlM, dMlM, nml_t * 4);
+            }
+            float mfma_err = 0.0f;
 
             /* ORACLE: one decode launch per query row, at that row's causal context. */
             const size_t nop1 = (size_t)n_head * DK, nml1 = (size_t)n_head * 2;
@@ -357,6 +394,26 @@ int main(int argc, char** argv) {
                 if (memcmp(hOp + (size_t)t * nop1, hOp1, nop1 * 4)) bad++;
                 if (memcmp(hMl + (size_t)t * nml1, hMl1, nml1 * 4)) bad++;
                 checked++;
+                /* Tiled kernel vs the same oracle row, per head, on the NORMALIZED output. */
+                if (hOpM) {
+                    for (unsigned hh = 0; hh < n_head; hh++) {
+                        const float lr = hMl1[hh * 2 + 1];
+                        const float lm = hMlM[((size_t)t * n_head + hh) * 2 + 1];
+                        const float* orow = hOp1 + (size_t)hh * DK;
+                        const float* mrow = hOpM + ((size_t)t * n_head + hh) * DK;
+                        float mag = 0.0f, dif = 0.0f;
+                        for (unsigned d = 0; d < DK; d++) {
+                            const float rv = (lr > 0.0f) ? orow[d] / lr : 0.0f;
+                            const float mv = (lm > 0.0f) ? mrow[d] / lm : 0.0f;
+                            const float av = rv < 0 ? -rv : rv;
+                            const float dv = (rv - mv) < 0 ? (mv - rv) : (rv - mv);
+                            if (av > mag) mag = av;
+                            if (dv > dif) dif = dv;
+                        }
+                        const float e = (mag > 0.0f) ? dif / mag : dif;
+                        if (e > mfma_err) mfma_err = e;
+                    }
+                }
             }
             char label[96];
             snprintf(label, sizeof(label), "%s n_head=%u ctx=%u n_tok=%u%s",
@@ -364,12 +421,144 @@ int main(int argc, char** argv) {
             printf("  %-42s %s  (%u/%u rows bit-exact vs decode)\n", label, bad ? "FAIL" : "PASS",
                    checked * 2 - bad, checked * 2);
             if (bad) fails++;
+            if (hOpM) {
+                const int mbad = !(mfma_err <= MLA_PF_MFMA_TOL);
+                printf("  %-42s %s  (max rel err %.2e vs decode, tol %.0e)\n",
+                       "  \\_ tiled MFMA", mbad ? "FAIL" : "PASS", mfma_err,
+                       (double)MLA_PF_MFMA_TOL);
+                if (mbad) fails++;
+            }
 
             plow_hsa_free(H, dQa); plow_hsa_free(H, dQr); plow_hsa_free(H, dLen);
             plow_hsa_free(H, dOp); plow_hsa_free(H, dMl);
+            if (dOpM) { plow_hsa_free(H, dOpM); plow_hsa_free(H, dMlM); }
             plow_hsa_free(H, dOp1); plow_hsa_free(H, dMl1); plow_hsa_free(H, dLen1);
         }
         plow_hsa_free(H, dCkv); plow_hsa_free(H, dKr);
+    }
+
+    /* ====================================================================
+     * PHASE 3 — FP8-LATENT MLA PREFILL (op 110), which is the arm Kimi-K3 actually
+     * dispatches and the one phase 2 does not reach: the fixture is bf16 throughout.
+     *
+     * There is no CPU oracle for this and the bf16 trick does not transfer — the decode
+     * kernel is only an oracle for a body it shares, and the two fp8 bodies deliberately
+     * do NOT share one. So the claim here is the narrower, and correct, one: the tiled
+     * kernel agrees with the SHIPPED scalar fp8 kernel on the same bytes. Phase 2 is what
+     * ties the tiling itself to a real reference; this ties the fp8 handling to the
+     * implementation it replaces.
+     *
+     * Inputs are synthesized, not quantized from the fixture: both kernels read the same
+     * e4m3 bytes and the same scales, so what a "good" quantizer would have produced is
+     * irrelevant to whether they agree. Exponents are held to [4,10] to stay clear of
+     * e4m3's NaN encoding (exp=15, mantissa=7) and of subnormals.
+     *
+     * krot_fp8 = 0: K3 keeps the 64-wide rope cache in bf16 (op 110 carries i6=0), so
+     * that is the shipped form and the one gated here.
+     * ==================================================================== */
+    plow_hsa_kernel kpf8, kpfm8;
+    if (plow_hsa_get_kernel(H, 0, "mla_flash_prefill_fp8_512", &kpf8) ||
+        plow_hsa_get_kernel(H, 0, "mla_flash_prefill_mfma_fp8_512", &kpfm8)) {
+        fprintf(stderr, "fp8 prefill sym: %s\n", plow_hsa_last_error());
+        return 1;
+    }
+    printf("\nMLA PREFILL, FP8 LATENT (tiled vs the shipped scalar fp8 body):\n");
+    {
+        static const unsigned NH[] = {12, 12, 12, 64};
+        static const unsigned CX[] = {2048, 2048, 512, 1024};
+        static const unsigned TK[] = {130, 64, 512, 65};
+        uint32_t rs = 99991u;
+#define RND (rs = rs * 1664525u + 1013904223u)
+        for (unsigned c = 0; c < sizeof(NH) / sizeof(NH[0]); c++) {
+            const unsigned nh = NH[c], ctx = CX[c], T = TK[c], DK = 512, DR = 64;
+            const size_t nckv = (size_t)ctx * DK, nkr = (size_t)ctx * DR;
+            const size_t nqa = (size_t)T * nh * DK, nqr = (size_t)T * nh * DR;
+            const size_t nop = (size_t)T * nh * DK, nml = (size_t)T * nh * 2;
+
+            unsigned char* pC = plow_hsa_alloc_host(H, nckv);
+            for (size_t i = 0; i < nckv; i++) {
+                const uint32_t r = RND;
+                pC[i] = (unsigned char)(((r >> 31) << 7) | ((4u + ((r >> 8) % 7u)) << 3) |
+                                        ((r >> 16) & 7u));
+            }
+            bf16* pR = plow_hsa_alloc_host(H, nkr * 2);
+            bf16* pQa = plow_hsa_alloc_host(H, nqa * 2);
+            bf16* pQr = plow_hsa_alloc_host(H, nqr * 2);
+            for (size_t i = 0; i < nkr; i++)
+                pR[i] = (bf16)((((RND) >> 31) << 15) | 0x3d00u | ((RND >> 16) & 0x7fu));
+            for (size_t i = 0; i < nqa; i++)
+                pQa[i] = (bf16)((((RND) >> 31) << 15) | 0x3c00u | ((RND >> 16) & 0x7fu));
+            for (size_t i = 0; i < nqr; i++)
+                pQr[i] = (bf16)((((RND) >> 31) << 15) | 0x3c00u | ((RND >> 16) & 0x7fu));
+            /* Two strips of kv_stride each: ckv scales, then krot scales (unread at
+             * krot_fp8=0, still allocated because the kernel forms the pointer). */
+            float* pS = plow_hsa_alloc_host(H, (size_t)2 * ctx * 4);
+            for (size_t i = 0; i < (size_t)2 * ctx; i++)
+                pS[i] = 0.25f + (float)((RND >> 12) & 0xffu) / 256.0f;
+            int* pL = plow_hsa_alloc_host(H, 4); pL[0] = (int)ctx;
+
+            void* dC = dev(nckv); plow_hsa_copy_h2d(H, 0, dC, pC, nckv);
+            void* dR = dev(nkr * 2); plow_hsa_copy_h2d(H, 0, dR, pR, nkr * 2);
+            void* dQa = dev(nqa * 2); plow_hsa_copy_h2d(H, 0, dQa, pQa, nqa * 2);
+            void* dQr = dev(nqr * 2); plow_hsa_copy_h2d(H, 0, dQr, pQr, nqr * 2);
+            void* dS = dev((size_t)2 * ctx * 4);
+            plow_hsa_copy_h2d(H, 0, dS, pS, (size_t)2 * ctx * 4);
+            void* dL = dev(4); plow_hsa_copy_h2d(H, 0, dL, pL, 4);
+            void* dO1 = dev(nop * 4); void* dM1 = dev(nml * 4);
+            void* dO2 = dev(nop * 4); void* dM2 = dev(nml * 4);
+
+            struct __attribute__((packed)) {
+                void *op, *ml; const void *qa, *qr, *ckv, *kr, *len;
+                unsigned n_batch, n_tok, n_head, kv_stride, window; float scale;
+                const void* kvs; unsigned krot;
+            } a1 = {dO1, dM1, dQa, dQr, dC, dR, dL, 1, T, nh, ctx, 0, 0.0883883f, dS, 0},
+              a2 = {dO2, dM2, dQa, dQr, dC, dR, dL, 1, T, nh, ctx, 0, 0.0883883f, dS, 0};
+            if (plow_hsa_launch(H, 0, &kpf8, cus * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1,
+                                0, &a1, sizeof(a1)) != 0 ||
+                plow_hsa_launch(H, 0, &kpfm8, cus * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1,
+                                0, &a2, sizeof(a2)) != 0) {
+                fprintf(stderr, "fp8 launch: %s\n", plow_hsa_last_error()); fails++;
+            }
+            plow_hsa_wait(H, 0);
+            float* hO1 = plow_hsa_alloc_host(H, nop * 4);
+            float* hM1 = plow_hsa_alloc_host(H, nml * 4);
+            float* hO2 = plow_hsa_alloc_host(H, nop * 4);
+            float* hM2 = plow_hsa_alloc_host(H, nml * 4);
+            plow_hsa_copy_d2h(H, 0, hO1, dO1, nop * 4);
+            plow_hsa_copy_d2h(H, 0, hM1, dM1, nml * 4);
+            plow_hsa_copy_d2h(H, 0, hO2, dO2, nop * 4);
+            plow_hsa_copy_d2h(H, 0, hM2, dM2, nml * 4);
+
+            float err = 0.0f;
+            for (size_t row = 0; row < (size_t)T * nh; row++) {
+                const float l1 = hM1[row * 2 + 1], l2 = hM2[row * 2 + 1];
+                const float* o1 = hO1 + row * DK;
+                const float* o2 = hO2 + row * DK;
+                float mag = 0.0f, dif = 0.0f;
+                for (unsigned d = 0; d < DK; d++) {
+                    const float v1 = (l1 > 0.0f) ? o1[d] / l1 : 0.0f;
+                    const float v2 = (l2 > 0.0f) ? o2[d] / l2 : 0.0f;
+                    const float av = v1 < 0 ? -v1 : v1;
+                    const float dv = (v1 - v2) < 0 ? (v2 - v1) : (v1 - v2);
+                    if (av > mag) mag = av;
+                    if (dv > dif) dif = dv;
+                }
+                const float e = (mag > 0.0f) ? dif / mag : dif;
+                if (e > err) err = e;
+            }
+            char label[96];
+            snprintf(label, sizeof(label), "fp8    n_head=%u ctx=%u n_tok=%u", nh, ctx, T);
+            const int bad = !(err <= MLA_PF_MFMA_TOL);
+            printf("  %-42s %s  (max rel err %.2e, tol %.0e)\n", label, bad ? "FAIL" : "PASS",
+                   err, (double)MLA_PF_MFMA_TOL);
+            if (bad) fails++;
+
+            plow_hsa_free(H, dC); plow_hsa_free(H, dR); plow_hsa_free(H, dQa);
+            plow_hsa_free(H, dQr); plow_hsa_free(H, dS); plow_hsa_free(H, dL);
+            plow_hsa_free(H, dO1); plow_hsa_free(H, dM1);
+            plow_hsa_free(H, dO2); plow_hsa_free(H, dM2);
+        }
+#undef RND
     }
 
     printf("\n%s (%d failure%s)\n", fails ? "MLA FAILED" : "MLA CORRECT", fails,

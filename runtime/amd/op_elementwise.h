@@ -252,7 +252,7 @@ __device__ void d_argmax(unsigned long long* __restrict__ part, const bf16* __re
             best = p > best ? p : best;
         }
         best = block_max_u64(best, lds);
-        if (threadIdx.x == 0) as_glob(part)[(size_t)b * nblk + slice] = best;
+        if (threadIdx.x == 0) st_act<unsigned long long>(&as_glob(part)[(size_t)b * nblk + slice], best);
     }
 }
 
@@ -268,7 +268,7 @@ __device__ void d_argmax_fin(int* __restrict__ ids, const unsigned long long* __
         const auto* pb = pg + (size_t)b * nparts;
         unsigned long long best = 0;
         for (unsigned i = 0; i < nparts; i++) best = pb[i] > best ? pb[i] : best;
-        as_glob(ids)[b] = (int)~(unsigned)(best & 0xFFFFFFFFull);
+        st_act<int>(&as_glob(ids)[b], (int)~(unsigned)(best & 0xFFFFFFFFull));
     }
 }
 

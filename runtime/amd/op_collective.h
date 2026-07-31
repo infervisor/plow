@@ -196,7 +196,7 @@ __device__ __forceinline__ void d_xreduce(bf16* out, const void* const* peer_scr
             const bf16* g = (const bf16*)((const char*)peer_scratch[owner] + gslot_bytes);
             acc += bf2f(as_glob(g)[m * gcols + (c - owner * gcols)]);
         }
-        as_glob(out)[e] = f2bf(acc);
+        st_act1(&as_glob(out)[e], f2bf(acc));
     }
 }
 
@@ -389,7 +389,7 @@ __device__ __forceinline__ void d_xargmax_fin_mega(
                 const unsigned long long v = as_glob(pv)[b];
                 best = v > best ? v : best;
             }
-        as_glob(ids)[b] = (int)~(unsigned)(best & 0xFFFFFFFFull);
+        st_act<int>(&as_glob(ids)[b], (int)~(unsigned)(best & 0xFFFFFFFFull));
     }
 }
 
@@ -469,7 +469,7 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
             acc += bf2f(as_glob(part)[e]);
 #endif
         }
-        as_glob(my_part)[e] = f2bf(acc);
+        st_act1(&as_glob(my_part)[e], f2bf(acc));
     }
     __syncthreads();
 
@@ -529,9 +529,10 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         const uint32_t hi = (uint32_t)(((uint64_t)n * (s + 1)) / nranks);
         const bf16* src = (const bf16*)((const char*)peer_scratch[s] + slot_bytes);
 #if PLOW_XR_SHUFFLE
-        for (uint32_t e = lo + tid; e < hi; e += stride) as_glob(out)[e] = as_glob(src)[((e) + (n >> 1)) % n];
+        for (uint32_t e = lo + tid; e < hi; e += stride)
+            st_act1(&as_glob(out)[e], as_glob(src)[((e) + (n >> 1)) % n]);
 #else
-        for (uint32_t e = lo + tid; e < hi; e += stride) as_glob(out)[e] = as_glob(src)[e];
+        for (uint32_t e = lo + tid; e < hi; e += stride) st_act1(&as_glob(out)[e], as_glob(src)[e]);
 #endif
     }
 }

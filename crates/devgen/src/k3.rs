@@ -352,6 +352,150 @@ fn fuse_shared_glu(t: u32, hidden: u32) -> bool {
     crate::gemv_staged_rows(t) as u64 * hidden as u64 <= crate::GM_LDS_HALVES
 }
 
+/// May a `b=1` [`DevOp::RmsNorm`] be folded into the `b=256` [`DevOp::Gemv`] that reads it?
+///
+/// This is recommendation 2 of `perf-data/k3-decode-counter-graph.md`, taken for the ONE of its
+/// three named ops that survives the check `op_gemm.h` demands before any such fusion.
+///
+/// # The lever, and why a narrow gate in front of a wide consumer is worth more than it looks
+///
+/// A `b=1` packet bumps its counter once, but a `b=256` consumer polls that counter from all 256
+/// of its workgroups. The census over the 93-layer TP8 decode blob: 303 `AttnRes`/`RmsNorm`
+/// packets contribute 303 bumps and **151,598 polls** — 19% of all counter traffic from 12% of
+/// the packets. Worse, each is its own level of a dependency chain that is **1739 deep at mean
+/// width 1.41**, i.e. there is essentially nothing to overlap a narrow packet with. So deleting
+/// one deletes a packet, an edge and a CHAIN LEVEL together, at ~5.7 us of measured per-packet
+/// protocol cost.
+///
+/// # `op_gemm.h` already priced this fusion as a LOSS, and the difference is fan-out
+///
+/// Its `norm` mode 2 — compute the row RMS inside the GEMV from the `x` it already stages in LDS
+/// — was implemented, measured at **22.4 -> 24.4 ms/token on Gemma**, and deleted. The cause was
+/// not the arithmetic (which is nearly free) but N: Gemma's attention norm has FIVE consumers, so
+/// folding turned one shared reduction into five redundant ones. The rule it left behind is the
+/// gate this function implements: *fusion that duplicates a reduction across N consumers costs
+/// (N-1) extra reductions — check N first.*
+///
+/// K3 answers that check differently, and the answer was read off the emitted blob rather than
+/// assumed (`plowrt disasm --program 1 --counters`, full operand lists, NOT truncated — see
+/// [`fuse_block_resid`] for what truncating one costs):
+///
+/// ```text
+///   RmsNorm  116 packets   fan=1: 92   fan=2: 24      <- fusable, and 92 of them are FREE
+///   AttnRes  187 packets   fan=3: 161  fan=4: 24      <- REFUSED, see below
+///   MoeRouterTopk 92       fan=2: 92                  <- REFUSED, see below
+/// ```
+///
+/// The 92 `fan=1` sites are `routed_expert_norm` (`feat=3584`) feeding the latent up-projection:
+/// N=1, so the fusion costs ZERO extra reductions and is pure profit. The 24 `fan=2` sites are
+/// `q_a_layernorm` (`feat=1536`) feeding `q_absorb` and `q_rope`: one extra reduction each, over
+/// 1536 elements already resident in LDS, against a whole chain level.
+///
+/// # Why the other two ops in that recommendation are NOT taken here
+///
+/// * **`AttnRes` (187 levels, the biggest single prize) is a LOSS by arithmetic.** Its mix spans
+///   `nb+1` rows of 7168 (`nb` runs 0->8; mean 4.36, so mean 5.36 rows), and a fused consumer
+///   workgroup would have to re-read every one of them — a GEMV stages ONE row. Summed over the
+///   real fan-out that is 619 consumer workgroups per site x 5.36 x 7168 x 2 B = **47.6 MB per
+///   site, 8.9 GB per token**, against a token that already streams 57 GiB in 36 ms. It buys 187
+///   levels = 1.07 ms and spends several times that. It would also stage 126 KB of LDS per
+///   workgroup, which alone costs the occupancy the GEMV depends on.
+/// * **`MoeRouterTopk` needs a measurement this change does not make.** The census in that doc
+///   lists one consumer (`MoeGroupGluFp8Blk`); the blob has **two** — `MoeGroupDownFp8Blk` reads
+///   `route_tab` as well — so it is fan=2, and both consumers are `b=256`. Folding replicates a
+///   top-16-of-896 selection into 512 workgroups per site and puts it on the critical path of
+///   both. The re-read is cheap (896 f32 logits + bias), so this one is not obviously a loss, but
+///   it is not obviously a win either and it is a different kernel; it wants its own A/B.
+///
+/// # The trap that cost a day: `plow_smem` is a UNION
+///
+/// `interp.hip`'s shared memory overlaps `part` (block_sum's scratch) with `gm` (the GEMV arena) —
+/// ONE address. The first version of this fold took `part` from the caller, so its `block_sum`
+/// wrote through the first 16 halves of the row it was reducing. It did not fail loudly: the
+/// write-back repairs those halves from registers, so the corruption is partial and
+/// data-dependent, the token stream stayed IDENTICAL over 32 steps, and only the logits drifted
+/// ~1 ULP per layer — the exact scale `op_collective.h` prices at ~0.03 logits over 92 MoE layers.
+/// The standalone kernel test PASSED throughout, because it declared two separate `__shared__`
+/// arrays and therefore did not alias. See `perf-data/k3-narrow-gate-fusion.md` §4.
+///
+/// # STATUS: NOT BIT-EXACT END-TO-END. DEFAULT OFF. Do not turn this on without reading this.
+///
+/// The design below is bit-exact and the isolated hardware gate agrees — `norm = 2` reproduces
+/// the RMSNORM+GEMV pair to ZERO differing halves at every shape the emitter folds, including the
+/// tp8-sharded `N=896 K=3584 b=224` geometry (`runtime/tests/gemv_fusednorm_gfx950_test.hip`).
+///
+/// The WHOLE MODEL does not agree, and the cause is not yet found. At `--ctx 5` (decode over
+/// prefilled KV only), against a control that reproduces itself 33/33:
+///
+/// ```text
+///   q-only   (24 sites, K=1536)   33/33 logit files identical
+///   lat-only (92 sites, K=3584)   diverges from decode step 14
+///   both, part aliasing the row   diverges from step 24   (25/33)
+///   both, scratch at arena top    diverges from step  9   (10/33)
+/// ```
+///
+/// The token stream is IDENTICAL over 32 steps in every variant and the argmax agrees at the
+/// first differing step; the drift is ~1-2 bf16 ULP (median 0.047), which is the scale
+/// `op_collective.h` prices at ~0.03 logits over 92 MoE layers. So it is small, and it is still
+/// disqualifying: this tree's whole A/B discipline rests on an emit knob being a CONTROL.
+///
+/// What is known: `plow_smem` is a UNION, so the interpreter's `part` and `gm` are one buffer and
+/// the first version reduced through the row it was normalizing. Moving the scratch to the top of
+/// the arena removed that alias and made the divergence EARLIER, not gone — so the arena is
+/// contended by something else too (`d_gemv_t` mentions a prefetch ring living in it). The next
+/// step is to find what else writes that arena during a GEMV, not to try a third offset.
+///
+/// # Why it is bit-exact by construction, when the arena is not contended
+///
+/// The deleted packet stored `f2bf(x*inv*gamma)` to HBM and the GEMV re-read those bf16 values.
+/// So the fused arm does NOT multiply through the k-loop the way mode 1 does — it normalizes the
+/// LDS-staged copy IN PLACE, rounding to bf16, walking the row with `d_rmsnorm`'s exact
+/// per-thread element map and `block_sum`, and then runs the ordinary un-normed hot loop. The
+/// bytes the k-loop reads are the bytes the unfused pair wrote. See `gemv_norm_lds`.
+///
+/// # Preconditions, all of which the arm re-checks
+///
+/// DECODE ONLY (`t == 1`), for the reason every other gate in this file states: a prefill bucket
+/// picks a `Gemm*` opcode, which has no mode-2 arm, and this interpreter's dispatch `default:`
+/// WRITES NOTHING — a silent no-op, not a crash. The row must also fit the staged arm
+/// (`GM_LDS_HALVES`) and `d_rmsnorm`'s register path (`feat <= RN_REG*PLOW_THREADS`, `feat % 8`).
+///
+/// `PLOW_K3_FUSE_NGEMV=1` opts in (default OFF); `=lat` and `=q` enable ONE site each, which is
+/// how the table above was produced — a whole-model A/B that moves cannot say which rewrite
+/// moved it.
+/// Which fold site a [`fuse_norm_gemv`] call is asking about. The knob can name ONE of them, which
+/// is what makes an end-to-end divergence bisectable: `lat` and `q` are independent rewrites and a
+/// whole-model A/B that moves cannot say which one moved it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NormSite {
+    /// `routed_expert_norm` -> the latent up projection. 92 sites, fan-out 1.
+    Lat,
+    /// `q_a_layernorm` -> `q_absorb` and `q_rope`. 24 sites, fan-out 2.
+    Q,
+}
+
+pub(crate) fn fuse_norm_gemv(t: u32, feat: u32, site: NormSite) -> bool {
+    // DEFAULT OFF. Opt-in only, until the divergence in the header above is resolved — this
+    // emitter's job is to not ship a fluent wrong model, and an unexplained 1-ULP drift through
+    // 92 layers is exactly that risk. `=1` both sites, `=lat`/`=q` one site (for bisecting).
+    match std::env::var("PLOW_K3_FUSE_NGEMV").ok().as_deref() {
+        Some("1") => {}
+        Some("lat") if site == NormSite::Lat => {}
+        Some("q") if site == NormSite::Q => {}
+        _ => return false,
+    }
+    if t != 1 {
+        return false;
+    }
+    // Mirrors `d_gemv_t`'s `fold` test and `d_rmsnorm`'s `fits` test. Both are re-checked on the
+    // device; this is the half that must not emit the opcode in the first place.
+    // + GV_NORM_SCRATCH: the fold takes its cross-wave reduction scratch from the TOP of the
+    // arena, because `plow_smem` is a union and the interpreter's `part` aliases the staged row.
+    crate::gemv_staged_rows(t) as u64 * feat as u64 + crate::GV_NORM_SCRATCH <= crate::GM_LDS_HALVES
+        && feat <= crate::RN_REG * crate::PLOW_THREADS
+        && feat % 8 == 0
+}
+
 /// Is `routed_expert_up_proj` COLUMN-parallel? `PLOW_K3_SHARD_UP=0` restores the replicated
 /// emit from the SAME binary, which is what makes the A/B a control rather than a rebuild.
 ///
@@ -580,12 +724,43 @@ pub fn emit_k3_linear(
     n_cu: u32,
     deps: &[u32],
 ) -> u32 {
+    emit_k3_linear_norm(b, out, x, wt, t, n, k, n_cu, None, deps)
+}
+
+/// [`emit_k3_linear`] with the option of ABSORBING the [`DevOp::RmsNorm`] that produced `x`.
+///
+/// `fold = Some((gamma, eps))` sets `norm = 2`, which makes the GEMV normalize the activation it
+/// already stages in LDS and lets the caller skip emitting the RMSNORM packet entirely — one
+/// packet, one edge and one chain level, all three at once. `x` then names the norm's INPUT, not
+/// its output. See [`fuse_norm_gemv`] for when this is legal and why it is bit-exact.
+///
+/// `eps` rides in `f[0]`, which the GEMV already carries (`exec_gemv` passes `in->fj[0].f`) and
+/// which no un-normed emit sets — so this costs no operand slot.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_k3_linear_norm(
+    b: &mut Builder,
+    out: u32,
+    x: u32,
+    wt: u32,
+    t: u32,
+    n: u32,
+    k: u32,
+    n_cu: u32,
+    fold: Option<(u32, f32)>,
+    deps: &[u32],
+) -> u32 {
     let all: Vec<u32> = (0..n_cu).collect();
     let op = if t == 1 {
         DevOp::Gemv
     } else {
         crate::gfx950_prefill_tile(t, n, k, n_cu, kernelcaps::QuantScheme::None)
     };
+    // A tiled prefill rung has no mode-2 arm, and AMD's dispatch `default:` writes NOTHING. The
+    // caller's gate is `t == 1`; this is the assert that a future caller cannot get past it.
+    assert!(
+        fold.is_none() || op == DevOp::Gemv,
+        "fused-norm GEMV is decode-only: op {op:?} has no `norm == 2` arm and would silently no-op"
+    );
     // GV_BLOCKED owns output columns in contiguous runs, so a packet with fewer columns than
     // workgroups leaves the tail owning nothing: K3's `b_proj` is N=12 and `f_a_proj` N=128,
     // handed 256 workgroups each on all 69 KDA layers. The narrowing is a fixed point of the
@@ -600,6 +775,13 @@ pub fn emit_k3_linear(
         d.i[0] = t;
         d.i[1] = n;
         d.i[2] = k;
+        if let Some((gamma, eps)) = fold {
+            // t[3] is the PRECOMPUTED-rms operand of mode 1 and stays absent: mode 2 computes
+            // the scalar itself, which is the whole point.
+            d.t[4] = gamma;
+            d.i[3] = 2;
+            d.f[0] = eps;
+        }
     })
 }
 
@@ -841,6 +1023,9 @@ pub fn emit_k3_latent_moe(
     };
     let part = f32t(b, format!("{a}part"), tt * c.top_k as u64 * lat as u64);
     let ylat = bft(b, format!("{a}ylat"), tt * lat as u64);
+    // Declared even when [`fuse_norm_gemv`] folds the norm away and nothing writes it. Keeping the
+    // tensor table IDENTICAL across both arms is what makes `PLOW_K3_FUSE_NGEMV` an A/B control:
+    // the only difference between the two blobs is then the packet stream. It costs `lat` halves.
     let yn = bft(b, format!("{a}yn"), tt * lat as u64);
     // The up projection's output. Under TP it is COLUMN-parallel and lives in the peer
     // GATHER slot instead (`tp.ug`), and declaring an arena tensor nothing writes is the
@@ -1079,14 +1264,27 @@ pub fn emit_k3_latent_moe(
             b, &mut tp.xgate, t == 1, &tp.xr_cus, c_cmb, ylat, t * lat, tp.tp, tp.slot_b,
         );
     }
-    let c_ln = b.emit(DevOp::RmsNorm, norm_cus(&all, t), &[c_cmb], |d| {
-        d.t[0] = yn;
-        d.t[1] = ylat;
-        d.t[2] = w.latent_norm;
-        d.i[0] = t;
-        d.i[1] = lat;
-        d.f[0] = cb.eps;
-    });
+    // THE LATENT NORM FOLDS INTO THE UP-PROJECTION THAT READS IT — 92 packets, 92 chain levels.
+    //
+    // This is the `fan=1` half of [`fuse_norm_gemv`]: `yn` is read by the up projection below and
+    // by nothing else in the program, so folding costs ZERO redundant reductions (the trap that
+    // deleted `op_gemm.h`'s norm mode 2 for Gemma) and deletes a `b=1` packet standing in front
+    // of a `b=256` consumer — 256 polls, one edge, and a level of a 1739-deep chain.
+    let fold_ln = fuse_norm_gemv(t, lat, NormSite::Lat);
+    let c_ln = if fold_ln {
+        c_cmb
+    } else {
+        b.emit(DevOp::RmsNorm, norm_cus(&all, t), &[c_cmb], |d| {
+            d.t[0] = yn;
+            d.t[1] = ylat;
+            d.t[2] = w.latent_norm;
+            d.i[0] = t;
+            d.i[1] = lat;
+            d.f[0] = cb.eps;
+        })
+    };
+    // Folded, the GEMV reads the norm's INPUT and normalizes it on the way in.
+    let up_src = if fold_ln { ylat } else { yn };
     // THE UP PROJECTION IS COLUMN-PARALLEL, and it is the largest single weight in the
     // decode stream after the experts themselves.
     //
@@ -1118,7 +1316,18 @@ pub fn emit_k3_latent_moe(
     let hid_l = if shard_up { tp.local(hid) } else { hid };
     let up_n = if shard_up && !up_gather_only() { hid_l } else { hid };
     let up_dst = if shard_up { tp.ug } else { yh };
-    let c_up = gemv(b, up_dst, yn, w.up_latent, up_n, lat, c_ln);
+    let c_up = emit_k3_linear_norm(
+        b,
+        up_dst,
+        up_src,
+        w.up_latent,
+        t,
+        up_n,
+        lat,
+        n_cu,
+        fold_ln.then_some((w.latent_norm, cb.eps)),
+        &[c_ln],
+    );
 
     // Shared expert, off the PRE-down hidden. THREE packets on both phases, and the fused
     // gate|up GEMM is deliberately not taken even at T rows: every fused GLU epilogue in
@@ -1378,6 +1587,9 @@ pub fn emit_k3_mla_mixer(
     // (see [`fuse_attnres_norm`]), so this mixer must not norm it a second time.
     prenormed: bool,
     deps: &[u32],
+    // `true` when the `t` rows are INDEPENDENT SEQUENCES (batched decode) rather than
+    // consecutive tokens of one. Selects the DECODE flash arm at t > 1 and sets n_batch.
+    seq_rows: bool,
 ) -> (u32, u32) {
     let all: Vec<u32> = (0..n_cu).collect();
     let a = act_prefix;
@@ -1391,6 +1603,7 @@ pub fn emit_k3_mla_mixer(
     // no P0 packet.
     let x = if prenormed { hidden } else { bft(b, format!("{a}x"), tt * c.hidden as u64) };
     let qlr = bft(b, format!("{a}q_lora"), tt * ql as u64);
+    // Unwritten when the q-side norm folds; declared anyway, for the reason `{a}yn` is.
     let qlat = bft(b, format!("{a}q_lat"), tt * ql as u64);
     let qa = bft(b, format!("{a}q_absorbed"), tt * nh as u64 * dk as u64);
     let qrr = bft(b, format!("{a}q_rope_raw"), tt * nh as u64 * dr as u64);
@@ -1463,9 +1676,18 @@ pub fn emit_k3_mla_mixer(
             gemv(b, krr, x, w.k_rope_d, dr, c.hidden, &[c_ln]),
         )
     };
-    let c_rnq = rms(b, qlat, qlr, w.q_a_norm, ql, &[c_qad]);
-    let c_qa = gemv(b, qa, qlat, w.q_absorb, nh * dk, ql, &[c_rnq]);
-    let c_qrr = gemv(b, qrr, qlat, w.q_rope, nh * dr, ql, &[c_rnq]);
+    // `q_a_layernorm` folds into BOTH GEMVs that read it — the `fan=2` half of
+    // [`fuse_norm_gemv`]. Unlike the latent norm this one is not free: `q_absorb` and `q_rope`
+    // each redo the reduction, so it costs ONE extra reduction over `ql`=1536 elements that are
+    // already staged in LDS. That buys a `b=1` packet in front of two `b=256` consumers — 512
+    // polls and a level of the chain. Both consumers must fold or neither can: leaving one
+    // reading `qlat` would keep the RMSNORM alive and the fusion would buy nothing.
+    let fold_q = fuse_norm_gemv(t, ql, NormSite::Q);
+    let c_rnq = if fold_q { c_qad } else { rms(b, qlat, qlr, w.q_a_norm, ql, &[c_qad]) };
+    let q_src = if fold_q { qlr } else { qlat };
+    let qn = fold_q.then_some((w.q_a_norm, c.eps));
+    let c_qa = emit_k3_linear_norm(b, qa, q_src, w.q_absorb, t, nh * dk, ql, n_cu, qn, &[c_rnq]);
+    let c_qrr = emit_k3_linear_norm(b, qrr, q_src, w.q_rope, t, nh * dr, ql, n_cu, qn, &[c_rnq]);
 
     // q-side HeadNormRope: identity table, gamma absent, skip_norm — a bit-exact
     // copy. Emitted rather than skipped so it stays checkable.
@@ -1542,8 +1764,14 @@ pub fn emit_k3_mla_mixer(
     // rather than added: `i[4]` carries `nsplit` on the decode arm and `n_tok` on the prefill one.
     // Everything else is the same packet. `FlashGatherPrefill` is not an option here — K3 has no
     // sparse selector at all (`mla_use_nope`, dense full-causal attention on all 24 MLA layers).
+    // WHICH ARM `t > 1` MEANS IS NOT DECIDABLE FROM `t`. A prefill program has `t` consecutive
+    // tokens of ONE sequence and wants the PREFILL arm with `i[4] = n_tok`; a batched decode
+    // program has `t` INDEPENDENT sequences of one token each and wants the DECODE arm with
+    // `i[4] = n_split` and `n_batch = t`. Selecting on `t == 1` alone silently routes a batched
+    // decode to the prefill kernel, which would then read the `t` rows as one sequence's history.
+    let decode_arm = t == 1 || seq_rows;
     let c_fl = b.emit(
-        match (t == 1, c.fp8_kv) {
+        match (decode_arm, c.fp8_kv) {
             (true, false) => DevOp::FlashMlaDecode,
             (false, false) => DevOp::FlashMlaPrefill,
             (true, true) => DevOp::FlashMlaDecodeFp8,
@@ -1551,7 +1779,7 @@ pub fn emit_k3_mla_mixer(
         },
         // Decode's work-item count is `(nh/gf) * nsplit`; prefill's `i[4]` is `n_tok`, so the
         // count saturates the machine at every bucket and the narrowing is inert there.
-        if t == 1 { k3_flash_cus(&all, t, nh, c.gf, c.n_split) } else { all.clone() },
+        if decode_arm { k3_flash_cus(&all, t, nh, c.gf, c.n_split) } else { all.clone() },
         &[c_qa, c_qr, c_rnkv, c_krd],
         |d| {
             d.t[0] = opart;
@@ -1564,11 +1792,13 @@ pub fn emit_k3_mla_mixer(
             if c.fp8_kv {
                 d.t[7] = w.kv_scale;
             }
-            d.i[0] = 1;
+            // n_batch. One sequence unless the rows ARE sequences, in which case each owns its
+            // own KV region and the kernel strides them by this axis.
+            d.i[0] = if seq_rows { t } else { 1 };
             d.i[1] = nh;
             d.i[2] = ctx;
             d.i[3] = 0; // window: dense, full causal
-            d.i[4] = if t == 1 { c.n_split } else { t };
+            d.i[4] = if decode_arm { c.n_split } else { t };
             d.i[5] = crate::KV_MASK_NONE;
             d.i[6] = 0; // keep the 64-wide NoPE/rope cache in bf16
             d.i[7] = c.gf;
@@ -1803,6 +2033,10 @@ pub fn emit_k3_block(
     n_cu: u32,
     tp: &mut K3Tp,
     deps: &[u32],
+    // `true` when this block's `t` rows are INDEPENDENT SEQUENCES (batched decode) rather
+    // than consecutive tokens of one. Only the KDA mixer cares: its recurrence and its conv
+    // window carry state between rows, and sharing that across independent sequences is silent.
+    seq_rows: bool,
 ) -> u32 {
     let all: Vec<u32> = (0..n_cu).collect();
     let a = act_prefix;
@@ -1857,10 +2091,14 @@ pub fn emit_k3_block(
     let attn_dst = if tp.on() { Some(tp.og) } else { None };
     let (c_o, attn_partial) = match &w.mixer {
         K3Mixer::Kda { cfg, w: kw, st } => {
-            crate::kda::emit_kda_mixer(b, cfg, kw, st, a, t, h_a, attn_dst, n_cu, fuse_pre, &[dep])
+            crate::kda::emit_kda_mixer(
+                b, cfg, kw, st, a, t, h_a, attn_dst, n_cu, fuse_pre, &[dep], seq_rows,
+            )
         }
         K3Mixer::Mla { cfg, w: mw } => {
-            emit_k3_mla_mixer(b, cfg, mw, a, t, ctx, h_a, attn_dst, n_cu, fuse_pre, &[dep])
+            emit_k3_mla_mixer(
+                b, cfg, mw, a, t, ctx, h_a, attn_dst, n_cu, fuse_pre, &[dep], seq_rows,
+            )
         }
     };
     let (c_o, attn) = if tp.on() {
@@ -2007,6 +2245,31 @@ pub struct K3ModelCfg {
 /// concern in this emit — the ring rows are declared here and written by the
 /// block's own AttnRes reads — which is the piece a full emit must still make
 /// explicit per layer.
+/// How the `t` rows of a program relate to each other. **This is not cosmetic**: a KDA layer's
+/// recurrence threads its rows through a carried state, and the two answers need opposite
+/// behaviour from the same kernel.
+///
+/// * [`RowKind::Tokens`] — `t` CONSECUTIVE TOKENS OF ONE SEQUENCE (every program today, prefill
+///   and single-stream decode alike). The recurrence threads them through ONE state and the conv
+///   window is loaded once, rolled across all of them, and stored once. That sharing IS the
+///   carried state.
+/// * [`RowKind::Sequences`] — `t` INDEPENDENT SEQUENCES, one token each (batched decode). Each
+///   row owns its own state and its own conv window.
+///
+/// Sharing a state across the second kind runs sequence 1's token into sequence 0's and produces
+/// fluent, plausible, WRONG output — no crash, no NaN — which is why the distinction is a type
+/// and not a `bool` parameter that reads as `false` at the call site.
+///
+/// See `perf-data/k3-batched-decode-design.md`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowKind {
+    /// Consecutive tokens of one sequence.
+    Tokens,
+    /// Independent sequences, one token each.
+    Sequences,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn emit_k3_model(
     b: &mut Builder,
     c: &K3ModelCfg,
@@ -2016,7 +2279,19 @@ pub fn emit_k3_model(
     t: u32,
     slot_rows: u32,
     n_cu: u32,
+    rows: RowKind,
 ) {
+    // Plumbing only for now: every caller passes `Tokens`, which is what every program emitted so
+    // far is, and the two carriers this would set (PLOW_KDA_F_SEQ_ROWS on KDA_STATE_STEP, the
+    // per-row window stride in CONV3's j[0]) stay 0. Asserting it keeps a half-wired
+    // `Sequences` from emitting a program the state allocation cannot back.
+    // HOW MANY INDEPENDENT SEQUENCES this program carries KDA state for. NOT the same as `t`:
+    // a prefill program has `t` rows and ONE slot (its rows thread through one carried state);
+    // a batched decode program has `t == B` rows and `B` slots.
+    let slots: u64 = match rows {
+        RowKind::Tokens => 1,
+        RowKind::Sequences => t as u64,
+    };
     // SHARING IS EXPRESSED THROUGH THE BUILDER, not through the naming. Re-declaring a name now
     // returns the existing handle and grows it to the larger size, which is what makes the shared
     // prefill prefix below actually share one buffer instead of allocating 93 identically-named
@@ -2139,7 +2414,12 @@ pub fn emit_k3_model(
     // tensor dedup keeps the largest declaration — and every decode step past 8192 was refused.
     // Every sibling emitter already declares it at `ctx` (`lib.rs:1016`, `mla.rs:1087`, `:5175`).
     let pos = b.tensor("in.pos", ctx as u64 * 4);
-    let kvlen = b.tensor("in.kvlen", 4);
+    // ONE kvlen PER SLOT. The runtime derives the decode batch from this tensor's SIZE
+    // (`exec/amd.rs`: `batch = in.kvlen.bytes / 4`) and refuses a blob whose decode program's `t`
+    // disagrees, so this is not merely storage -- it is how the host is told how many independent
+    // sequences the program carries. `in.pos` needs no change: it is already `ctx * 4`, which has
+    // room for `slots` positions and is separately the tensor `max_ctx` is read from.
+    let kvlen = b.tensor("in.kvlen", 4 * slots);
 
     let mut dep = b.emit(DevOp::Embed, all.clone(), &[], |d| {
         d.t[0] = x;
@@ -2162,12 +2442,12 @@ pub fn emit_k3_model(
         let mixer = if is_kda(l) {
             kda_pair = Some((
                 crate::kda::declare_kda_weights(b, &kda_l, &format!("{lp}self_attn."), &lp),
-                crate::kda::declare_kda_state(b, &kda_l, &format!("kv.{l}.")),
+                crate::kda::declare_kda_state(b, &kda_l, &format!("kv.{l}."), slots),
             ));
             let (kw, ks) = kda_pair.as_ref().unwrap();
             K3Mixer::Kda { cfg: &kda_l, w: kw, st: ks }
         } else {
-            mla_w = Some(declare_k3_mla_weights(b, &mla_l, &lp, l, ctx, cos, sin, pos, kvlen));
+            mla_w = Some(declare_k3_mla_weights(b, &mla_l, &lp, l, ctx, cos, sin, pos, kvlen, slots));
             K3Mixer::Mla { cfg: &mla_l, w: mla_w.as_ref().unwrap() }
         };
         let mw;
@@ -2211,7 +2491,7 @@ pub fn emit_k3_model(
         };
         dep = emit_k3_block(
             b, cb, &c.moe, &w, &act_pfx(l), l, ctx, nxt, cur, blkres, nb_max, t, n_cu,
-            &mut tp, &[dep],
+            &mut tp, &[dep], rows == RowKind::Sequences,
         );
         cur = nxt;
     }
@@ -2334,6 +2614,9 @@ pub fn declare_k3_mla_weights(
     sin: u32,
     pos: u32,
     kvlen: u32,
+    // How many INDEPENDENT SEQUENCES this program's KV caches hold. 1 everywhere today; `B` for
+    // a batched decode program, where `d_flash_mla_decode` indexes them by its `n_batch` axis.
+    slots: u64,
 ) -> K3MlaWeights {
     let (h, nh) = (c.hidden as u64, c.heads as u64);
     let (dk, dr, vd, ql) = (c.kv_lora as u64, c.qk_rope as u64, c.v_head as u64, c.q_lora as u64);
@@ -2364,11 +2647,11 @@ pub fn declare_k3_mla_weights(
         // that write them.
         ckv: b.tensor(
             &format!("kv.{layer}.ckv"),
-            ctx as u64 * dk * if c.fp8_kv { 1 } else { 2 },
+            slots * ctx as u64 * dk * if c.fp8_kv { 1 } else { 2 },
         ),
-        krot: b.tensor(&format!("kv.{layer}.krot"), ctx as u64 * dr * 2),
+        krot: b.tensor(&format!("kv.{layer}.krot"), slots * ctx as u64 * dr * 2),
         kv_scale: if c.fp8_kv {
-            b.tensor(&format!("kv.{layer}.scale"), ctx as u64 * 4)
+            b.tensor(&format!("kv.{layer}.scale"), slots * ctx as u64 * 4)
         } else {
             packet::dev::TENSOR_NONE
         },
@@ -2516,7 +2799,7 @@ mod tests {
         let mut b = Builder::new(256);
         let p = "language_model.model.layers.1.";
         let kw = crate::kda::declare_kda_weights(&mut b, &ck, &format!("{p}self_attn."), p);
-        let ks = crate::kda::declare_kda_state(&mut b, &ck, "kv.1.");
+        let ks = crate::kda::declare_kda_state(&mut b, &ck, "kv.1.", 1);
         let mw = K3MoeWeights {
             router: b.tensor(&format!("{p}mlp.gate.weight"), 896 * 7168 * 2),
             router_bias: b.tensor(&format!("{p}mlp.gate.e_score_correction_bias"), 896 * 4),
@@ -2541,7 +2824,7 @@ mod tests {
         let out = b.tensor("act.xnext", 7168 * 2);
         let seed = b.emit(DevOp::Nop, vec![0], &[], |_| {});
         emit_k3_block(&mut b, &cb, &cm, &w, "act.l1.", 1, 4096, out, prefix_in, blkres, 8, 1, 256,
-                      &mut K3Tp::none(), &[seed]);
+                      &mut K3Tp::none(), &[seed], false);
         b.finish()
     }
 
@@ -2665,7 +2948,7 @@ mod tests {
     fn a_truncated_model_emits_embed_layers_and_tail() {
         let c = model_cfg();
         let mut b = Builder::new(256);
-        emit_k3_model(&mut b, &c, &|_| true, &[0, 1, 2], 4096, 1, 1, 256);
+        emit_k3_model(&mut b, &c, &|_| true, &[0, 1, 2], 4096, 1, 1, 256, RowKind::Tokens);
         let p = b.finish();
         let n = |o: DevOp| p.insts.iter().filter(|i| i.op == o as u16).count();
 
@@ -2710,7 +2993,7 @@ mod tests {
         let c = model_cfg();
         let count = |layers: &[u32]| {
             let mut b = Builder::new(256);
-            emit_k3_model(&mut b, &c, &|_| true, layers, 4096, 1, 1, 256);
+            emit_k3_model(&mut b, &c, &|_| true, layers, 4096, 1, 1, 256, RowKind::Tokens);
             b.finish().tensors.len()
         };
         assert!(count(&[0]) < count(&[0, 1]) && count(&[0, 1]) < count(&[0, 1, 2]));
@@ -2724,7 +3007,7 @@ mod tests {
     fn a_hybrid_span_emits_both_mixers() {
         let c = model_cfg();
         let mut b = Builder::new(256);
-        emit_k3_model(&mut b, &c, &|l| l != 3, &[0, 1, 2, 3], 4096, 1, 1, 256);
+        emit_k3_model(&mut b, &c, &|l| l != 3, &[0, 1, 2, 3], 4096, 1, 1, 256, RowKind::Tokens);
         let p = b.finish();
         let n = |o: DevOp| p.insts.iter().filter(|i| i.op == o as u16).count();
         // Three KDA recurrences and exactly one MLA attention.
@@ -2764,7 +3047,7 @@ mod tests {
 
         let layers: Vec<u32> = (0..93).collect();
         let mut b = Builder::new(256);
-        emit_k3_model(&mut b, &c, &|l| !mla.contains(&l), &layers, 4096, 1, 1, 256);
+        emit_k3_model(&mut b, &c, &|l| !mla.contains(&l), &layers, 4096, 1, 1, 256, RowKind::Tokens);
         let p = b.finish();
         let n = |o: DevOp| p.insts.iter().filter(|i| i.op == o as u16).count();
 
@@ -2804,7 +3087,7 @@ mod tests {
         mla.insert(92);
         let layers: Vec<u32> = (0..93).collect();
         let mut b = Builder::new(256);
-        emit_k3_model(&mut b, &c, &|l| !mla.contains(&l), &layers, 4096, 1, 1, 256);
+        emit_k3_model(&mut b, &c, &|l| !mla.contains(&l), &layers, 4096, 1, 1, 256, RowKind::Tokens);
         b.finish()
     }
 
@@ -2818,7 +3101,7 @@ mod tests {
         mla.insert(92);
         let layers: Vec<u32> = (0..93).collect();
         let mut b = Builder::new(256);
-        emit_k3_model(&mut b, &c, &|l| !mla.contains(&l), &layers, 4096, 1, 1, 256);
+        emit_k3_model(&mut b, &c, &|l| !mla.contains(&l), &layers, 4096, 1, 1, 256, RowKind::Tokens);
         let p = b.finish();
         let n = |o: DevOp| p.insts.iter().filter(|i| i.op == o as u16).count();
         assert_eq!(n(DevOp::FlashMlaDecode), 0);
@@ -3173,7 +3456,7 @@ mod tests {
         mla.insert(92);
         let layers: Vec<u32> = (0..93).collect();
         let mut b = Builder::new(256);
-        emit_k3_model(&mut b, &c, &|l| !mla.contains(&l), &layers, 4096, t, t, 256);
+        emit_k3_model(&mut b, &c, &|l| !mla.contains(&l), &layers, 4096, t, t, 256, RowKind::Tokens);
         b.finish()
     }
 
@@ -3225,6 +3508,30 @@ mod tests {
         assert_eq!(n(DevOp::ArgmaxFin), 1);
     }
 
+    /// The narrow-norm fusion is OFF in a default emit, and that is the shipped state.
+    ///
+    /// `fuse_norm_gemv` is bit-exact in isolation but NOT end-to-end yet (its doc carries the
+    /// table). Until that is resolved the default emit must carry all 116 RMSNORM packets and no
+    /// `norm = 2` GEMV — this test is what stops it being switched on by accident, which on this
+    /// interpreter would be a silent ~1-ULP-per-layer drift rather than a failure.
+    #[test]
+    fn the_narrow_norm_fusion_is_off_by_default() {
+        let p = build_full(8);
+        let fused = p.insts.iter().filter(|i| i.op == DevOp::Gemv as u16 && i.i[3] == 2).count();
+        assert_eq!(fused, 0, "PLOW_K3_FUSE_NGEMV must be opt-in: no norm=2 GEMV in a default emit");
+        // Every narrow norm still has its own packet. The exact per-width counts (92 at 3584,
+        // 24 at 1536) are a property of the 93-layer ASSET, not of this synthetic cfg, so they
+        // are recorded in `fuse_norm_gemv`'s doc and checked against a real emit, not here.
+        let norms = p.insts.iter().filter(|i| i.op == DevOp::RmsNorm as u16).count();
+        assert!(norms > 0, "the fold is off, so the RMSNORM packets must all still be emitted");
+        let widths: std::collections::BTreeSet<u32> =
+            p.insts.iter().filter(|i| i.op == DevOp::RmsNorm as u16).map(|i| i.i[1]).collect();
+        assert!(
+            widths.iter().all(|&w| w % 8 == 0),
+            "every fusable width must satisfy the arm's `feat % 8` precondition: {widths:?}"
+        );
+    }
+
     /// Every projection in a T-row program carries the REAL row count.
     ///
     /// `M` is the operand that silently truncates: `Gemv` at `M = 512` runs its compiled row
@@ -3262,7 +3569,7 @@ mod tests {
             c.tp = 1;
             let layers: Vec<u32> = (0..93).collect();
             let mut b = Builder::new(256);
-            emit_k3_model(&mut b, &c, &|_| true, &layers, 4096, t, t, 256);
+            emit_k3_model(&mut b, &c, &|_| true, &layers, 4096, t, t, 256, RowKind::Tokens);
             let p = b.finish();
             // ceil(92/12) = 8 live rows at the deepest layer.
             let cap = 8u32;
@@ -3543,7 +3850,7 @@ mod tests {
         let c = model_cfg();
         let build = |layers: &[u32], t: u32| {
             let mut b = Builder::new(256);
-            emit_k3_model(&mut b, &c, &|l| l != 3, layers, 4096, t, t, 256);
+            emit_k3_model(&mut b, &c, &|l| l != 3, layers, 4096, t, t, 256, RowKind::Tokens);
             b.finish()
         };
         for t in [1u32, 128] {

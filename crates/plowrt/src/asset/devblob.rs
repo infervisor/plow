@@ -652,6 +652,7 @@ mod tests {
         let prog = || Program {
             n_cu: 2,
             n_counter: 1,
+            hier_base: 0,
             insts: vec![inst(6, 0, 1, 0, 0), inst(18, 1, 0, 0, 0)],
             stream: vec![se(0, 0), se(1, 0), se(0, 1), se(1, 1)],
             stream_ofs: vec![0, 2],

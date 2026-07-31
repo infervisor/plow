@@ -143,34 +143,115 @@ __device__ __forceinline__ bf16v8 ld_glob8_nt(const PLOW_GLOB bf16* p) {
  * still did not predict this — the property that breaks is cross-DEVICE visibility, which no
  * single-GPU harness can observe.
  *
- * COVERAGE IS BIGGER THAN THE HELPERS, and this is the third failure, MEASURED rather than
- * guessed. After routing all 19 ragged scalar tails through `st_act1`/`st_act1_u8`, the decode
- * object still contains 112 PLAIN global stores against 69 covered ones — 62% uncovered:
+ * COVERAGE IS BIGGER THAN THE HELPERS, and it caused three failures in a row because it was
+ * reasoned about instead of counted. It is now COUNTED, and the count is a build gate:
+ * `scripts/sc1_coverage.sh` disassembles the object and fails if any `global_store_*` does not
+ * carry `sc0`/`sc1`. That is the whole correctness argument, mechanised — no store can be missed
+ * silently, and a new op that forgets a helper breaks the build rather than the model.
  *
- *     global_store_short   63     global_store_dword    27
- *     global_store_dwordx2 20     global_store_dwordx4   2
- *
- *   (count it with: llvm-objdump -d --mcpu=gfx950 <obj> | grep -oE "global_store_[a-z0-9]+[^/]*"
+ *   (count it by hand with: llvm-objdump -d --mcpu=gfx950 <obj> | grep -oE "global_store_[a-z0-9]+[^/]*"
  *    then split on whether the line carries `sc`.)
  *
- * The biggest missed publisher is the one that matters most: the GEMV epilogue writes its output
- * with PLAIN scalar stores (`C[(size_t)m * N + n] = f2bf(t)`, ~10 sites in op_gemm.h), and the
- * GEMV is exactly what publishes the TP partials into `act.og_tp`/`act.dg_tp`. Also uncovered:
- * the f32 flash partials, the MoE f32 `part` buffer, `d_headnorm_rope_fp8`'s `scale`, the KDA
- * state and conv state.
+ * The audit that gate forced, on the K3 decode object: 243 plain stores against 54 covered, from
+ * only 23 DISTINCT SOURCE LINES — 144 of them one GEMV epilogue line inlined repeatedly. The
+ * biggest missed publisher was the one that matters most: the GEMV epilogue
+ * (`C[(size_t)m * N + n] = f2bf(t)`), which is exactly what publishes the TP partials into
+ * `act.og_tp`/`act.dg_tp`. Also converted: the f32 flash partials and (m,l) statistics, the MoE
+ * GLU row, the argmax part/ids buffers, the DSA score and selection arrays, and every collective
+ * output. The ONE store deliberately left plain is the trace record (`interp.hip`), which is
+ * host-read after the kernel retires and crosses no gate; the gate script excludes it by name.
  *
- * So this knob is not one helper away. It needs every global write in every decode op audited
- * and typed. Until then it stays off, and a single-GPU harness will keep saying it is sound.
+ * >>> AND WITH COVERAGE COMPLETE, THE KNOB AS DESIGNED IS STILL WRONG. MEASURED. <<<
  *
- * THE FIX is also a distinction this code does not yet make: activation stores are two classes.
- *   * LOCAL activations (residual stream, next op's input)  -> `sc1`      (aux 16), device scope
+ * K3 93 layers TP8, real weights, `--prompt 1008,10484,318,15383,387`, against a control that
+ * produces the known-good continuation:
+ *
+ *     control                     [13, 646, 12259, 387, 14868, 220, 5807, 6017, ...]   coherent
+ *     PLOW_GATE_SC1               [13, 646, 1272, 220, 17, 17, 646, 13, 18, 220, ...]  DEGENERATE
+ *     + PLOW_ACT_SCOPE_AGENT      [418, 11, 276, 276, 276, 1356, 1356, 1356, ...]      DEGENERATE
+ *     + PLOW_GATE_SC1_KEEPREL     [13, 646, 12259, 387, 14868, 220, 5807, 6017, ...]   IDENTICAL
+ *
+ * Both scopes fail and the one that keeps the RELEASE passes, so the defect is NOT the store
+ * scope and NOT coverage — it is the ORDERING. `s_waitcnt vmcnt(0)` retires a store when it
+ * leaves the CU, not when it is visible at the scope the consumer reads from, so a relaxed
+ * counter bump can be observed before the data it is supposed to publish. The release RMW is
+ * doing work that `vmcnt(0)` does not replace. Dropping it needs a publish primitive that
+ * actually waits for visibility, and this file does not have one.
+ *
+ * What that leaves is the arm nobody had tried: scoped stores WITH the release kept
+ * (`PLOW_GATE_SC1_KEEPREL`). It is token-identical, and the reason it can still be a win is
+ * that an `sc0 sc1` store leaves no dirty line, so the `buffer_wbl2` the release still issues
+ * has almost nothing to write back. That is a cheaper fence, not a deleted one. Its timing is
+ * NOT recorded here: every A/B this campaign ran was contended by a concurrent agent holding
+ * all 8 GPUs, and a bare `flock /tmp/plow_gpu.lock` neither waits for nor warns about that —
+ * use `perf-data/harness/gpulease`, which does both. The one arm measured both ways
+ * contradicted itself by 12.6 ms (46.418 at position 2 vs 33.802 at position 1).
+ *
+ * SCOPE, AND WHY ONE AND NOT TWO. Activation stores are really two classes —
+ *   * LOCAL activations (residual stream, next op's input)  -> `sc1`      device scope
  *   * PEER-VISIBLE activations (the GEMV epilogue's write into peer_scratch — `act.og_tp`,
- *     `act.dg_tp`)                                          -> `sc0 sc1` (aux 17), system scope
- * Both are expressible; what is missing is the store site knowing which tensor it targets.
+ *     `act.dg_tp`)                                          -> `sc0 sc1` system scope
+ * and the second is what the TP failure above was: `sc1` alone bypasses L2 into the LOCAL
+ * Infinity Cache, so the partial never crosses XGMI. A store site cannot tell which class its
+ * destination is (it gets a bare `void*` out of the tensor table), so this code uses SYSTEM for
+ * every activation store: correct for both, and the local ones pay for reach they do not need.
+ * Splitting them is a measurable optimisation, not a correctness requirement, and it needs the
+ * emitter to mark peer-visible outputs in the instruction. Correct first.
  */
 #ifndef PLOW_GATE_SC1
 #define PLOW_GATE_SC1 0
 #endif
+
+/* The scope every activation store carries under PLOW_GATE_SC1. See the note above for why this
+ * is SYSTEM and not AGENT.
+ *
+ * PLOW_ACT_SCOPE_AGENT is a CEILING INSTRUMENT and MUST NOT SHIP. It narrows every activation
+ * store to AGENT (`sc1`, device scope), which is what a LOCAL activation actually needs and is
+ * cheaper than SYSTEM (`sc0 sc1`) because it publishes into the device-wide Infinity Cache
+ * instead of write-through past it. It is WRONG UNDER TP by exactly the mechanism the note
+ * above records: the GEMV epilogue's write into `peer_scratch` never crosses XGMI, so XReduce
+ * sums stale slots. Its only job is to PRICE the two-class split (local `sc1` / peer `sc0 sc1`)
+ * before anyone builds the emitter plumbing that split needs — if the agent-scope arm is not
+ * meaningfully faster than the system-scope one, the split is not worth building. */
+#ifndef PLOW_ACT_SCOPE_AGENT
+#define PLOW_ACT_SCOPE_AGENT 0
+#endif
+#if PLOW_ACT_SCOPE_AGENT
+#define PLOW_ACT_SCOPE __HIP_MEMORY_SCOPE_AGENT /* UNSAFE UNDER TP — measurement only */
+#else
+#define PLOW_ACT_SCOPE __HIP_MEMORY_SCOPE_SYSTEM
+#endif
+
+/* ONE SCALAR ACTIVATION ELEMENT, scoped under PLOW_GATE_SC1 and a plain store otherwise.
+ *
+ * `__hip_atomic_store` and NOT inline asm. A relaxed atomic store at system scope lowers to
+ * exactly `global_store_<width> v, v, s[..] sc0 sc1` — the SADDR form (scalar base + 32-bit
+ * vector offset), with compiler-tracked waitcnts and no `"memory"` clobber. The inline-asm form
+ * this replaces forced a full 64-bit address into a VGPR pair at every site and fenced the
+ * scheduler around it, which the GEMV epilogue pays 144 times.
+ *
+ * Verified lowering on gfx950 (ROCm 7.2.4), one probe kernel per width:
+ *     bf16/u16 -> global_store_short     ... sc0 sc1
+ *     f32/u32  -> global_store_dword     ... sc0 sc1
+ *     u64      -> global_store_dwordx2   ... sc0 sc1
+ *     u8       -> global_store_byte      ... sc0 sc1
+ * (AGENT scope gives the same instructions with `sc1` alone, if the split above is ever built.) */
+template <typename T>
+__device__ __forceinline__ void st_act(T* p, T v) {
+#if PLOW_GATE_SC1
+    __hip_atomic_store(p, v, __ATOMIC_RELAXED, PLOW_ACT_SCOPE);
+#else
+    *p = v;
+#endif
+}
+template <typename T>
+__device__ __forceinline__ void st_act(PLOW_GLOB T* p, T v) {
+#if PLOW_GATE_SC1
+    __hip_atomic_store(p, v, __ATOMIC_RELAXED, PLOW_ACT_SCOPE);
+#else
+    *p = v;
+#endif
+}
 
 /* SYSTEM scope (`sc0 sc1`, SC[1:0]=3), not device (`sc1`, SC=2), and the TP failure above is
  * why. A single scope for every activation store is the conservative choice: it is correct for
@@ -196,29 +277,15 @@ __device__ __forceinline__ void st_glob8(PLOW_GLOB bf16* p, bf16v8 v) {
 #endif
 }
 
-/* One activation half, device-scope under PLOW_GATE_SC1. This is the ragged tail every op writes
- * when its width is not a multiple of 8; under the default it is exactly `*p = v` and the emitted
- * code is unchanged. */
-__device__ __forceinline__ void st_act1(bf16* p, bf16 v) {
-#if PLOW_GATE_SC1
-    asm volatile("global_store_short %0, %1, off sc0 sc1" ::"v"(p), "v"(v) : "memory");
-#else
-    *p = v;
-#endif
-}
+/* One activation half. This is the ragged tail every op writes when its width is not a multiple
+ * of 8; under the default it is exactly `*p = v` and the emitted code is unchanged. */
+__device__ __forceinline__ void st_act1(bf16* p, bf16 v) { st_act<bf16>(p, v); }
 
 /* The fp8 tail. `d_headnorm_rope_fp8` writes the KV cache one BYTE at a time when the head
  * width is ragged; that store is an activation publish exactly like the bf16 ones, and leaving
  * it plain is enough on its own to reinstate the race PLOW_GATE_SC1 exists to remove. */
 __device__ __forceinline__ void st_act1_u8(unsigned char* p, unsigned char v) {
-#if PLOW_GATE_SC1
-    /* `v` must be a 32-bit VGPR operand: an `unsigned char` has no `v` register class and the
-     * inline asm fails to allocate. `global_store_byte` stores the low byte of the VGPR. */
-    const unsigned w = v;
-    asm volatile("global_store_byte %0, %1, off sc0 sc1" ::"v"(p), "v"(w) : "memory");
-#else
-    *p = v;
-#endif
+    st_act<unsigned char>(p, v);
 }
 __device__ __forceinline__ bf16v8 bf16v8_zero(void) {
     bf16v8 z;
@@ -786,6 +853,23 @@ __device__ __forceinline__ float wave_max(float v) {
 #define PLOW_WAVES PLOW_WG_WAVES               /* from dev_isa.h: host + device agree */
 #define PLOW_THREADS PLOW_WG_THREADS           /* 512: 8 waves, 2 per SIMD          */
 #define PLOW_WAVES_PER_EU (PLOW_WAVES / 4)     /* 4 SIMDs per CU */
+
+/* Elements one thread holds when a norm row fits in registers. 16 * 512 = 8192 covers every
+ * RMSNorm in Gemma (hidden = 5376) and both of K3's fusable decode norms (3584, 1536); wider
+ * rows fall back to the streaming path.
+ *
+ * Held as RN_VEC 16-BYTE VECTOR loads, not RN_REG scalar ones. A `const bf16*` is a generic,
+ * align-2 pointer, so `x[base + i]` compiled to `flat_load_ushort` -- two bytes per
+ * instruction, sixteen instructions per thread. That is ruinous precisely HERE: a decode norm
+ * is a single row on a single CU with all 255 others stalled on its counter, so its cost is
+ * pure issue-and-latency, and there is no other work to hide it behind. See as_glob() and
+ * ld_glob8() below.
+ *
+ * HERE rather than in op_norm.h because `d_rmsnorm` (op_norm.h) and the fused-norm GEMV
+ * (`gemv_norm_lds`, op_gemm.h, included FIRST) must walk the row with the identical
+ * per-thread element map or the fused arm is not bit-exact. One constant, one definition. */
+#define RN_REG 16
+#define RN_VEC (RN_REG / 8) /* 16 halves = 2 x bf16v8 */
 
 __device__ __forceinline__ float wave_sum(float v) {
 #pragma unroll

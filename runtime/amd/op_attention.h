@@ -683,7 +683,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                         unsigned u;
                         __builtin_memcpy(&u, &fv, 4);
                         u += 0x7fffu + ((u >> 16) & 1u);
-                        orow[t * MFMA_N] = (bf16)(u >> 16);
+                        st_act1(&orow[t * MFMA_N], (bf16)(u >> 16));
                     }
                 }
                 continue;
@@ -698,13 +698,14 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                 if (qi >= n_q) continue;
                 float* op = Opart + ((size_t)(qi * n_head + h) * nsplit + sp) * D;
 #pragma unroll
-                for (int t = 0; t < NDT; t++) op[d_off + t * MFMA_N + accn] = oacc[t][i];
+                for (int t = 0; t < NDT; t++)
+                    st_act<float>(&op[d_off + t * MFMA_N + accn], oacc[t][i]);
                 /* 32 lanes share this qi (they hold different d), so exactly one writes
                  * (m, l) -- and only once, not once per output chunk. */
                 if (ch == 0 && accn == 0) {
                     float* ml = mlpart + ((size_t)(qi * n_head + h) * nsplit + sp) * 2;
-                    ml[0] = m_st[i];
-                    ml[1] = l_st[i];
+                    st_act<float>(&ml[0], m_st[i]);
+                    st_act<float>(&ml[1], l_st[i]);
                 }
             }
         }
@@ -1117,12 +1118,12 @@ __device__ void d_flash_decode(float* __restrict__ Opart, float* __restrict__ ml
                 float acc = 0.0f;
 #pragma unroll
                 for (unsigned gg = 0; gg < NG; gg++) acc += osm[gg * D + d];
-                op[d] = acc;
+                st_act<float>(&op[d], acc);
             }
             if (tid == 0) {
                 float* ml = mlpart + ((size_t)(b * n_head + h) * nsplit + sp) * 2;
-                ml[0] = m_st[g];
-                ml[1] = l_st[g];
+                st_act<float>(&ml[0], m_st[g]);
+                st_act<float>(&ml[1], l_st[g]);
             }
         }
     }
@@ -1225,7 +1226,7 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
                 const float sc = FA_EXP(ml[s * 2] - gm);
                 acc += Opart[((size_t)(b * n_head + h) * nsplit + s) * D + d] * sc;
             }
-            O[((size_t)b * n_head + h) * D + d] = f2bf(acc * inv);
+            st_act1(&O[((size_t)b * n_head + h) * D + d], f2bf(acc * inv));
         }
     }
 }
@@ -1658,12 +1659,12 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
                 float acc = 0.0f;
 #pragma unroll
                 for (unsigned gg = 0; gg < NG; gg++) acc += osm[gg * DK + d];
-                op[d] = acc;
+                st_act<float>(&op[d], acc);
             }
             if (tid == 0) {
                 float* ml = mlpart + (oh * nsplit + sp) * 2;
-                ml[0] = m_st[g];
-                ml[1] = l_st[g];
+                st_act<float>(&ml[0], m_st[g]);
+                st_act<float>(&ml[1], l_st[g]);
             }
         }
     }
@@ -1731,6 +1732,412 @@ __device__ void d_flash_mla_prefill_fp8(float* __restrict__ Opart, float* __rest
     d_flash_mla_decode<DK, DR, GF, false, /*FP8=*/true>(
         Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len, n_batch, n_head, kv_stride, window, scale,
         /*nsplit*/ 1, kv_mask, slice, nblk, lds, nullptr, 0, n_tok, kv_scale, krot_fp8);
+}
+
+/* ============================================================================
+ * MLA PREFILL, TILED MFMA — the kernel a prefill actually wants.     [DEEPSEEK-MLA]
+ *
+ * The wrappers above run the DECODE body with n_tok > 1. That is exact, and it is the
+ * wrong shape: `d_flash_mla_decode`'s work item is ONE query token, so a T-token chunk
+ * re-streams the whole causal latent prefix T times and does every dot product on the
+ * VECTOR ALU. Both costs are structural, and both are what this kernel removes:
+ *
+ *   latent traffic  T * n_grp rows  ->  ceil(T/BQ) * n_head rows   (BQ query rows share
+ *                                       ONE staged LDS tile; at BQ=64, n_head_local=12,
+ *                                       GF=4 that is 16x less)
+ *   score+PV math   scalar v_fma    ->  32x32x16 bf16 MFMA
+ *
+ * WHY THIS IS NOT `d_flash_prefill<512>` WITH AN EXTRA TERM. Two departures, both
+ * forced by MLA's absorption:
+ *   1. K == V == the latent. `d_flash_prefill` stages K (full D) and V (one output
+ *      chunk) as SEPARATE LDS tiles and re-stages V per output chunk. Here they are the
+ *      same rows, so ONE tile serves both and the output chunking disappears with it.
+ *   2. The score carries a DR-wide rope addendum against a SEPARATE cache, so the QK
+ *      contraction is DK+DR while the PV contraction is DK. They are staged adjacent in
+ *      one padded row (`[latent | rope]`) so a k-step reads either without a branch.
+ *
+ * WAVE MAP. The D=512 output is what sets the register budget: a wave owning all 512
+ * output columns needs 16 f32x16 = 256 AccVGPRs and there is no room for it. So the
+ * PLOW_WAVES waves split as (M-tile x column-group): WPM waves share one 32-row query
+ * M-tile and divide DK between them, giving CPW = DK/WPM columns and NDT = CPW/32
+ * accumulators per wave. At WPM=4 that is 64 AccVGPRs — the same accumulator budget
+ * `d_flash_prefill` proved at D=512.
+ *
+ * The cost is that the WPM waves of an M-tile each recompute the same QK^T. That is not
+ * a regression: `d_flash_prefill` pays exactly the same 4x at D=512 through its NCH
+ * output chunks. The difference is where the redundancy lands — its chunks re-stage the
+ * cache from HBM, these waves re-read ONE staged tile from LDS.
+ *
+ * Q LIVES IN LDS, staged once per work item. `d_flash_prefill` re-reads Q fragments from
+ * global on every KV tile because it has no LDS to spare after K and V; folding V away
+ * frees exactly the room to hoist Q, and it must be hoisted here because WPM waves would
+ * otherwise issue the same global read WPM times per tile.
+ *
+ * FP8 LATENT: the cache is e4m3 with one f32 scale per row, and NOTHING is dequantized
+ * into LDS. e4m3 is exactly representable in bf16 (3 mantissa bits into 7), so the staged
+ * tile is the raw value and the scale is applied where it is free and exact:
+ *   - score: the latent and rope QK go to SEPARATE accumulators, and a lane's whole
+ *     accumulator column is one kv row, so `s_lat * cs + s_rope * rs` is one multiply per
+ *     lane — the same association the scalar kernel uses (`dotc * cs + dotr * rs`).
+ *   - PV: the scale varies along the CONTRACTION axis and cannot leave the sum, so it is
+ *     folded into P, which is rounded to bf16 anyway. l_st must NOT see it: cs belongs to
+ *     V's magnitude, not to the probability.
+ * Dequantizing into LDS instead (what the dense `d_flash_prefill` FP8KV arm does) would
+ * round scale*value into bf16 and lose precision this ordering keeps.
+ *
+ * CAUSAL LOAD BALANCE. Work is one (batch, q-tile, head); q-tile qt attends ~qt tiles, so
+ * a plain index makes the last block do NQ times the first block's work. `mla_pf_fold`
+ * pairs the ends (0, NQ-1, 1, NQ-2, ...) so the tiles any one block draws average out.
+ *
+ * NOT USED BY THE GATHERED PREFILL. `d_flash_gather_prefill` selects a DIFFERENT top_k
+ * set per query token, so a tile of query rows has no common KV range to stage — the
+ * tiling premise fails and op 55 stays on the scalar body below.
+ * ==========================================================================*/
+/* Route ops 51/110 at the tiled kernel. Default ON; 0 restores the decode-body wrappers,
+ * which is what the numeric gate diffs against — keep both reachable so "the tiled kernel
+ * agrees with the exact one" stays a runnable claim and not a historical note. */
+#ifndef PLOW_MLA_PF_MFMA
+#define PLOW_MLA_PF_MFMA 1
+#endif
+#ifndef PLOW_MLA_PF_WPM
+#define PLOW_MLA_PF_WPM 4
+#endif
+/* Waves sharing one 32-row query M-tile, and the M-tiles that leaves. Clamped so the
+ * 4-wave flash object (PLOW_WAVES=4) degrades to one M-tile instead of dividing to 0. */
+#define FA_MLA_PF_WPM ((PLOW_WAVES < PLOW_MLA_PF_WPM) ? PLOW_WAVES : PLOW_MLA_PF_WPM)
+#define FA_MLA_PF_NMT (PLOW_WAVES / FA_MLA_PF_WPM)
+#define FA_MLA_PF_BQ (FA_MLA_PF_NMT * 32)
+/* One padded row holds [latent DK | rope DR] so a k-step reads either side unbranched. */
+#define FA_MLA_PF_STRIDE(DK, DR) ((DK) + (DR) + FA_PAD)
+/* Qsm[BQ][STRIDE] + Ksm[BKV=32][STRIDE] + Psm[PLOW_WAVES][32][BKV], in floats (bf16 => /2). */
+#define FA_MLA_PF_LDS_FLOATS(DK, DR)                                                      \
+    (((FA_MLA_PF_BQ + 32) * FA_MLA_PF_STRIDE(DK, DR) + PLOW_WAVES * 32 * 32 + 1) / 2)
+
+/* Pair the causal ends: 0, NQ-1, 1, NQ-2, ... A bijection on [0,NQ) for either parity. */
+__device__ __forceinline__ unsigned mla_pf_fold(unsigned qt, unsigned nq) {
+    return (qt & 1u) ? (nq - 1u - (qt >> 1)) : (qt >> 1);
+}
+
+/* IS THE TILED KERNEL THE RIGHT ONE FOR THIS PACKET — a FILL question, and the reason the
+ * scalar body is still compiled in rather than deleted.
+ *
+ * The tiling buys arithmetic and traffic and SPENDS work items: it turns n_tok*n_grp items
+ * into ceil(n_tok/BQ)*n_head. On a full prefill chunk that is still thousands and the trade
+ * is enormously good. On a short chunk — the ragged tail `plan_chunks` leaves, or a short
+ * prompt that is one small chunk — it is not: at n_tok=128 and K3's TP8 n_head=12 the tiled
+ * kernel has 24 items for 256 CUs and 91% of the machine idles.
+ *
+ * Measured on gfx950, n_head=12, fp8 latent, ctx=32768 (tiled vs scalar), items = the
+ * tiled kernel's work-item count against nblk=256:
+ *     n_tok 8192  50.7 vs 141.6 ms   2.79x   (1536 items, full)
+ *     n_tok 1024   9.7 vs  19.9 ms   2.06x   ( 192, 75%)
+ *     n_tok  704   9.7 vs  15.0 ms   1.54x   ( 132, 52%)
+ *     n_tok  640   9.7 vs  13.4 ms   1.38x   ( 120, 47%)
+ *     n_tok  512   9.7 vs  10.1 ms   1.04x   (  96, 38%)  <- the crossover, measured
+ *     n_tok  128   9.7 vs   3.4 ms   0.35x   (  24,  9%)  <- the regression
+ * Full-fill tiled is ~120 TF/s against the scalar's ~43, so the tiled kernel is ahead
+ * exactly while its fill exceeds 43/120 = 0.36 — which is where the sweep turns over, to
+ * within one step. The rule is that ratio, 3/8, and it is expressed against nblk (the real
+ * grid) rather than a token count so it tracks a packet emitted for a different CU count.
+ *
+ * Taken from the FP8 arm deliberately: bf16 scalar is 3x slower again (13.7 TF/s, it moves
+ * twice the bytes), so bf16 crosses over much earlier and this threshold merely gives up a
+ * little there. Erring toward the shipped arm is the safe direction.
+ *
+ * The DEEPER fix is to stop spending items: split the KV range `nsplit` ways as
+ * `d_flash_prefill` does, which is what makes a short chunk fill the machine instead of
+ * choosing between two decompositions. That needs the emitter to size Opart for nsplit>1
+ * and to tell `MlaMergeFold`, so it is a packet change and not a kernel one. Until then
+ * this picks the better of the two and never the worse. */
+__device__ __forceinline__ bool mla_pf_tiled_fills(unsigned n_batch, unsigned n_tok,
+                                                   unsigned n_head, unsigned nblk) {
+    const unsigned n_qt = (n_tok + FA_MLA_PF_BQ - 1) / FA_MLA_PF_BQ;
+    return (unsigned long long)n_batch * n_qt * n_head * 8ull >= (unsigned long long)nblk * 3ull;
+}
+
+template <int DK, int DR, bool FP8 = false>
+__device__ void d_flash_mla_prefill_mfma(float* __restrict__ Opart,
+                                         float* __restrict__ mlpart,
+                                         const bf16* __restrict__ Qabs,
+                                         const bf16* __restrict__ Qrope,
+                                         const bf16* __restrict__ Ckv,
+                                         const bf16* __restrict__ Krope,
+                                         const int* __restrict__ kv_len, unsigned n_batch,
+                                         unsigned n_tok, unsigned n_head, unsigned kv_stride,
+                                         unsigned window, float scale, unsigned kv_mask,
+                                         unsigned slice, unsigned nblk, float* lds_,
+                                         const float* __restrict__ kv_scale,
+                                         unsigned krot_fp8) {
+    constexpr int BKV = 32;                       /* one MFMA N-tile of KV per pass */
+    constexpr int WPM = FA_MLA_PF_WPM;
+    constexpr int NMT = FA_MLA_PF_NMT;
+    constexpr int BQ = FA_MLA_PF_BQ;              /* query rows per workgroup       */
+    constexpr int STRIDE = FA_MLA_PF_STRIDE(DK, DR);
+    constexpr int NK_ABS = DK / MFMA_K;           /* QK k-steps over the latent     */
+    constexpr int NK_ROPE = DR / MFMA_K;          /* + rope k-steps (DR=64 => 4)    */
+    constexpr int CPW = DK / WPM;                 /* output cols this wave owns     */
+    constexpr int NDT = CPW / MFMA_N;             /* output d-tiles this wave       */
+    static_assert(DK % (WPM * MFMA_N) == 0, "DK must divide into WPM column-groups of 32");
+    static_assert(DR % MFMA_K == 0, "rope width must be a whole number of k-steps");
+
+    bf16* lds = (bf16*)lds_;
+    bf16* Qsm = lds;                              /* [BQ][STRIDE]  latent|rope query rows */
+    bf16* Ksm = Qsm + BQ * STRIDE;                /* [BKV][STRIDE] latent|rope cache tile */
+    bf16* Psm = Ksm + BKV * STRIDE;               /* [PLOW_WAVES][32][BKV] P transpose    */
+
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 63;
+    const unsigned wave = tid >> 6;
+    const unsigned frow = mfma_frag_row(lane);    /* l % 32: A-row and B-col alike */
+    const unsigned accn = mfma_acc_n(lane);       /* l % 32: this lane's kv column */
+    const unsigned m_tile = wave / WPM;           /* which 32-row query block      */
+    const unsigned cgrp = wave % WPM;             /* which output column-group     */
+    const unsigned ncol0 = cgrp * CPW;
+
+    const unsigned n_qt = (n_tok + BQ - 1) / BQ;
+    const unsigned n_work = n_batch * n_qt * n_head;
+
+    for (unsigned w = slice; w < n_work; w += nblk) {
+        const unsigned h = w % n_head;
+        const unsigned rest = w / n_head;
+        const unsigned qt = mla_pf_fold(rest % n_qt, n_qt);
+        const unsigned b = rest / n_qt;
+
+        const unsigned len = (unsigned)kv_len[b];
+        /* Chunk row 0 sits at len - n_tok, so chunk row qi is at q_pos0 + qi. */
+        const unsigned q_pos0 = len - n_tok;
+        const unsigned q_base = qt * BQ;          /* first chunk row of this q-tile */
+        const unsigned my_q0 = q_base + m_tile * 32;
+
+        /* KV bounds MUST be workgroup-uniform — the loop body has __syncthreads() and the
+         * M-tiles have different causal horizons. Bound by the LAST row of the whole tile
+         * and let the per-element mask do the exact work (same rule as d_flash_prefill). */
+        const unsigned q_tile_last = q_pos0 + q_base + BQ - 1;
+        const unsigned kv_end = (q_tile_last + 1 < len) ? (q_tile_last + 1) : len;
+        const unsigned q_tile_first = q_pos0 + q_base;
+        const unsigned win_lo =
+            (window && q_tile_first >= window) ? (q_tile_first - window + 1) : 0u;
+        const unsigned kv_lo = (win_lo / BKV) * BKV;
+
+        const auto* cbase = as_glob(Ckv) + (size_t)b * kv_stride * DK;
+        const auto* rbase = as_glob(Krope) + (size_t)b * kv_stride * DR;
+        const unsigned char* cb8 = (const unsigned char*)Ckv + (size_t)b * kv_stride * DK;
+        const unsigned char* rb8 = (const unsigned char*)Krope + (size_t)b * kv_stride * DR;
+        /* Two strips, latent then rope, exactly as the scalar kernel splits them. */
+        const float* csc = FP8 ? kv_scale + (size_t)b * kv_stride : nullptr;
+        const float* rsc = FP8 ? kv_scale + (size_t)(n_batch + b) * kv_stride : nullptr;
+
+        /* Q -> LDS, ONCE per work item: all WPM waves of an M-tile read these rows. */
+        __syncthreads();
+        for (unsigned e = tid * 8; e < (unsigned)(BQ * DK); e += PLOW_THREADS * 8) {
+            const unsigned r = e / DK, c = e % DK;
+            const unsigned qi = q_base + r;
+            bf16 t[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            /* ld_glob8, not a memcpy off the pointer: an ADDRESS-SPACE-qualified source
+             * makes __builtin_memcpy fall back to the host symbol and the device compile
+             * fails with no location. Load to a value first, copy from that. */
+            if (qi < n_tok) {
+                const bf16v8 v =
+                    ld_glob8(&Qabs[((((size_t)b * n_tok + qi) * n_head) + h) * DK + c]);
+                __builtin_memcpy(t, &v, 16);
+            }
+            __builtin_memcpy(&Qsm[r * STRIDE + c], t, 16);
+        }
+        for (unsigned e = tid * 8; e < (unsigned)(BQ * DR); e += PLOW_THREADS * 8) {
+            const unsigned r = e / DR, c = e % DR;
+            const unsigned qi = q_base + r;
+            bf16 t[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            if (qi < n_tok) {
+                const bf16v8 v =
+                    ld_glob8(&Qrope[((((size_t)b * n_tok + qi) * n_head) + h) * DR + c]);
+                __builtin_memcpy(t, &v, 16);
+            }
+            __builtin_memcpy(&Qsm[r * STRIDE + DK + c], t, 16);
+        }
+
+        f32x16 oacc[NDT];
+#pragma unroll
+        for (int t = 0; t < NDT; t++) oacc[t] = (f32x16)(0.0f);
+        float m_st[16], l_st[16];
+#pragma unroll
+        for (int i = 0; i < 16; i++) { m_st[i] = FA_NEG_INF; l_st[i] = 0.0f; }
+
+        for (unsigned kv0 = kv_lo; kv0 < kv_end; kv0 += BKV) {
+            /* Whole tile outside the sliding window — uniform, so every wave skips it. */
+            if (window && kv0 + BKV <= win_lo) continue;
+
+            __syncthreads();                       /* last tile's Ksm reads are done */
+            for (unsigned e = tid * 8; e < (unsigned)(BKV * DK); e += PLOW_THREADS * 8) {
+                const unsigned r = e / DK, c = e % DK;
+                const unsigned kv = kv0 + r;
+                bf16 t[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                if (kv < kv_end) {
+                    const size_t row = (size_t)(kv & kv_mask);
+                    if constexpr (FP8) {
+                        /* RAW e4m3 -> bf16, lossless. The row scale is applied after the
+                         * MFMA (score) or folded into P (PV) — never here. One 16-byte copy
+                         * of the whole octet: bf16v8 and bf16[8] are the same 16 bytes, and
+                         * element-wise `bf16_t -> bf16` is the one direction that does not
+                         * fold and asks the compiler for a host memcpy. */
+                        const bf16v8 dv = fp8v8_to_bf16v8(ld_glob_fp8v8(cb8 + row * DK + c));
+                        __builtin_memcpy(t, &dv, 16);
+                    } else {
+                        const bf16v8 dv = ld_glob8(cbase + row * DK + c);
+                        __builtin_memcpy(t, &dv, 16);
+                    }
+                }
+                __builtin_memcpy(&Ksm[r * STRIDE + c], t, 16);
+            }
+            for (unsigned e = tid * 8; e < (unsigned)(BKV * DR); e += PLOW_THREADS * 8) {
+                const unsigned r = e / DR, c = e % DR;
+                const unsigned kv = kv0 + r;
+                bf16 t[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                if (kv < kv_end) {
+                    const size_t row = (size_t)(kv & kv_mask);
+                    if constexpr (FP8) {
+                        if (krot_fp8) {
+                            const bf16v8 dv =
+                                fp8v8_to_bf16v8(ld_glob_fp8v8(rb8 + row * DR + c));
+                            __builtin_memcpy(t, &dv, 16);
+                        } else {
+                            const bf16v8 dv = ld_glob8(rbase + row * DR + c);
+                            __builtin_memcpy(t, &dv, 16);
+                        }
+                    } else {
+                        const bf16v8 dv = ld_glob8(rbase + row * DR + c);
+                        __builtin_memcpy(t, &dv, 16);
+                    }
+                }
+                __builtin_memcpy(&Ksm[r * STRIDE + DK + c], t, 16);
+            }
+            __syncthreads();                       /* Qsm (first pass) and Ksm visible */
+
+            /* S = Q_abs . C_kv (+ Q_rope . K_rope), kept in SEPARATE accumulators so the
+             * fp8 row scales can be applied per kv column below. A lane's whole 16-entry
+             * accumulator column is ONE kv row, which is what makes that one multiply. */
+            f32x16 s_lat = (f32x16)(0.0f);
+            f32x16 s_rope = (f32x16)(0.0f);
+#pragma unroll 1
+            for (int kk = 0; kk < NK_ABS; kk++) {
+                const unsigned d0 = mfma_frag_k(lane, kk * MFMA_K);
+                bf16x8 qf, kf;
+                bf16 tq[8], tk[8];
+                __builtin_memcpy(tq, &Qsm[(m_tile * 32 + frow) * STRIDE + d0], 16);
+                __builtin_memcpy(tk, &Ksm[frow * STRIDE + d0], 16);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    bf16_t a, c;
+                    __builtin_memcpy(&a, &tq[j], 2);
+                    __builtin_memcpy(&c, &tk[j], 2);
+                    qf[j] = a;
+                    kf[j] = c;
+                }
+                s_lat = __builtin_amdgcn_mfma_f32_32x32x16_bf16(qf, kf, s_lat, 0, 0, 0);
+            }
+#pragma unroll
+            for (int kk = 0; kk < NK_ROPE; kk++) {
+                const unsigned d0 = DK + mfma_frag_k(lane, kk * MFMA_K);
+                bf16x8 qf, kf;
+                bf16 tq[8], tk[8];
+                __builtin_memcpy(tq, &Qsm[(m_tile * 32 + frow) * STRIDE + d0], 16);
+                __builtin_memcpy(tk, &Ksm[frow * STRIDE + d0], 16);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    bf16_t a, c;
+                    __builtin_memcpy(&a, &tq[j], 2);
+                    __builtin_memcpy(&c, &tk[j], 2);
+                    qf[j] = a;
+                    kf[j] = c;
+                }
+                s_rope = __builtin_amdgcn_mfma_f32_32x32x16_bf16(qf, kf, s_rope, 0, 0, 0);
+            }
+
+            /* This lane's kv row, and its two dequant scales. */
+            const unsigned kg = kv0 + accn;
+            const bool kv_in = (kg < kv_end);
+            const size_t krow = (size_t)(kg & kv_mask);
+            const float cs = (FP8 && kv_in) ? csc[krow] : 1.0f;
+            const float rs = (FP8 && kv_in && krot_fp8) ? rsc[krow] : 1.0f;
+
+            /* Mask, then online softmax. A row of S lives entirely inside ONE half-wave,
+             * so the row reductions must stop at 32 lanes. */
+            float p[16];
+#pragma unroll
+            for (int i = 0; i < 16; i++) {
+                const unsigned qi = my_q0 + mfma_acc_m(lane, i);
+                const unsigned qg = q_pos0 + qi;
+                const bool valid = (qi < n_tok) && kv_in && (kg <= qg) &&
+                                   (!window || (qg - kg) < window);
+                const float sv = s_lat[i] * cs + s_rope[i] * rs;
+                p[i] = valid ? (sv * FA_SCALE(scale)) : FA_NEG_INF;
+            }
+#pragma unroll
+            for (int i = 0; i < 16; i++) {
+                const float rmax = half_wave_max(p[i]);
+                const float mnew = fmaxf(m_st[i], rmax);
+                const float corr = (m_st[i] == FA_NEG_INF) ? 0.0f : FA_EXP(m_st[i] - mnew);
+                const float pe = (mnew == FA_NEG_INF) ? 0.0f : FA_EXP(p[i] - mnew);
+                l_st[i] = l_st[i] * corr + half_wave_sum(pe);
+                m_st[i] = mnew;
+                p[i] = pe;
+#pragma unroll
+                for (int t = 0; t < NDT; t++) oacc[t][i] *= corr;
+            }
+
+            /* P -> LDS as the PV A-operand (m = query row, k = kv). The fp8 latent scale
+             * rides here: O = sum_kv (p * cs) * C_raw, while l_st above stays scale-free. */
+            bf16* myP = Psm + wave * 32 * BKV;
+            __syncthreads();
+#pragma unroll
+            for (int i = 0; i < 16; i++)
+                myP[mfma_acc_m(lane, i) * BKV + accn] = f2bf(FP8 ? (p[i] * cs) : p[i]);
+            __syncthreads();
+
+            /* O += P . V, V = this wave's latent column slice of the SAME staged tile. */
+#pragma unroll
+            for (int t = 0; t < NDT; t++) {
+#pragma unroll
+                for (int ks = 0; ks < BKV; ks += MFMA_K) {
+                    const unsigned kk = mfma_frag_k(lane, ks);
+                    bf16x8 pf, vf;
+                    bf16 tp[8];
+                    __builtin_memcpy(tp, &myP[frow * BKV + kk], 16);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        bf16_t v;
+                        __builtin_memcpy(&v, &tp[j], 2);
+                        pf[j] = v;
+                        bf16 vv = Ksm[(kk + j) * STRIDE + ncol0 + t * MFMA_N + accn];
+                        bf16_t vb;
+                        __builtin_memcpy(&vb, &vv, 2);
+                        vf[j] = vb;
+                    }
+                    oacc[t] = __builtin_amdgcn_mfma_f32_32x32x16_bf16(pf, vf, oacc[t], 0, 0, 0);
+                }
+            }
+        }
+
+        /* UNNORMALIZED latent-wide partials, the layout d_flash_merge<DK> + d_o_uv_fold
+         * already consume: [b][t][head][nsplit=1][DK]. */
+#pragma unroll
+        for (int i = 0; i < 16; i++) {
+            const unsigned qi = my_q0 + mfma_acc_m(lane, i);
+            if (qi >= n_tok) continue;
+            const size_t oh = ((size_t)b * n_tok + qi) * n_head + h;
+            float* op = Opart + oh * DK;
+#pragma unroll
+            for (int t = 0; t < NDT; t++)
+                st_act<float>(&op[ncol0 + t * MFMA_N + accn], oacc[t][i]);
+            /* Every cgrp computed the same softmax over the same range, so one wave and
+             * one lane per row owns (m, l). */
+            if (cgrp == 0 && accn == 0) {
+                float* ml = mlpart + oh * 2;
+                st_act<float>(&ml[0], m_st[i]);
+                st_act<float>(&ml[1], l_st[i]);
+            }
+        }
+        __syncthreads();                           /* Qsm reuse by the next work item */
+    }
 }
 
 /* GATHERED prefill (GLM DSA / DeepSeek sparse attention). `idx` is one top_k row PER QUERY —
@@ -1971,8 +2378,8 @@ __device__ void d_flash_mla_decode_mfma(float* __restrict__ Opart, float* __rest
                 if (qh >= n_head) continue;
                 if (accn == 0) { /* one lane per row writes */
                     float* ml = mlpart + ((size_t)(b * n_head + qh) * nsplit + sp) * 2;
-                    ml[0] = m_st[i];
-                    ml[1] = l_st[i];
+                    st_act<float>(&ml[0], m_st[i]);
+                    st_act<float>(&ml[1], l_st[i]);
                 }
             }
         }
@@ -2221,7 +2628,7 @@ __device__ void d_index_score_mfma(float* __restrict__ Score, const bf16* __rest
             part += __shfl_xor(part, 32, PLOW_WAVE); /* fold the two head-halves for this pos */
             if (lane < 32) {
                 const unsigned pos = base + krow0 + lane;
-                if (pos < len) Sc[(size_t)b * kv_stride + pos] = part * scale;
+                if (pos < len) st_act<float>(&Sc[(size_t)b * kv_stride + pos], part * scale);
             }
         }
     }
@@ -2396,7 +2803,7 @@ __device__ void d_index_select_coop(int* __restrict__ idx, const float* __restri
      * selector over a DIFFERENT score array sharing one gCtl and still reports the set EXACT at
      * ctx 8k/32k/128k/256k. The histogram reset below uses atomicExch to CLEAR CONCURRENTLY from
      * every WG, which is a different requirement (no single owner), not a coherence one. */
-    if (bid == 0 && tid == 0) Cg[2] = 0u; /* reset emit slot */
+    if (bid == 0 && tid == 0) st_act<unsigned>(&Cg[2], 0u); /* reset emit slot */
     /* clear all SEL_NPASS per-pass histograms cooperatively (idempotent), then barrier. */
     for (unsigned i = bid * PLOW_THREADS + tid; i < SEL_NPASS * SEL_NB; i += nwg * PLOW_THREADS)
         atomicExch(&Hg[i], 0u);
@@ -2470,7 +2877,7 @@ __device__ void d_index_select_coop(int* __restrict__ idx, const float* __restri
         const unsigned long long key = FAST ? dsa_pack_key_a(Sc[t], t, len) : dsa_pack_key(Sc[t], t, len);
         if (key >= prefix) {
             const unsigned slot = atomicAdd(&Cg[2], 1u);
-            if (slot < top_k) ib[slot] = (int)t;
+            if (slot < top_k) st_act<int>(&ib[slot], (int)t);
         }
     }
 }
@@ -2498,7 +2905,7 @@ __device__ void d_o_uv_fold(bf16* __restrict__ O_, const bf16* __restrict__ Olat
         for (unsigned v = tid; v < V; v += PLOW_THREADS) {
             float acc = 0.0f;
             for (unsigned l = 0; l < DK; l++) acc += bf2f(lds[l]) * bf2f(wv[(size_t)l * V + v]);
-            O[(size_t)(b * n_head + h) * V + v] = f2bf(acc);
+            st_act1(&O[(size_t)(b * n_head + h) * V + v], f2bf(acc));
         }
         __syncthreads();
     }
@@ -2717,13 +3124,13 @@ __device__ void d_mla_merge_fold(bf16* __restrict__ O_, const float* __restrict_
                 float s = 0.0f;
 #pragma unroll
                 for (int q = 0; q < PLOW_WAVES; q++) s += red[(unsigned)q * (unsigned)VT + t];
-                orow[v0 + t] = f2bf(s);
+                st_act1(&orow[v0 + t], f2bf(s));
             }
         } else {
             for (unsigned v = v0 + tid; v < v1; v += PLOW_THREADS) {
                 float acc = 0.0f;
                 for (unsigned l = 0; l < DK; l++) acc += olds[l] * bf2f(wv[(size_t)l * V + v]);
-                orow[v] = f2bf(acc);
+                st_act1(&orow[v], f2bf(acc));
             }
         }
         __syncthreads();

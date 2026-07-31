@@ -125,6 +125,12 @@ comes from the blob's network name, not a flag: query `/v1/models`, don't guess.
    `gen_toks == num_prompts * OUTLEN`, which the harness now emits.
 5. **`timeout N sg render -c "flock …"` kills the LOCK WAIT.** A queued run dies before it
    starts and reports as a blank row indistinguishable from a failure. Don't wrap the lock.
+6. **`--ctx N` decodes over KV NOBODY PREFILLED** (`plowrt/src/main.rs:391`), so at `--ctx 32000`
+   with a 5-token prompt every decode step attends over ~32k rows of uninitialised memory. Timing
+   is fine; **the step logits are not a function of the program alone**, so a CORRECTNESS A/B must
+   run at `--ctx <prompt length>` (`--ctx 5` for the gate prompt) where decode continues from the
+   rows the prefill actually wrote. Before reading any A/B, run the SAME blob twice and confirm it
+   reproduces itself — it does, 33/33 `--dump-logits` files — otherwise a divergence is unreadable.
 
 Warmup: arms emitted with different `--n-cu` were observed to sample warmup token 0 where
 `--n-cu 256` samples 220 — not a like-for-like computation. `scripts/geom_check.sh` gates it.
@@ -145,6 +151,7 @@ Warmup: arms emitted with different `--n-cu` were observed to sample warmup toke
 | `PLOW_K3_SHARD_UP` | **on** (`!= "0"`, needs tp>1) | column-parallel `routed_expert_up_proj`, gather folded into the shared reduce. −22.8% GEMV bytes |
 | `PLOW_K3_SHARD_HEAD=1` | off | column-parallel `lm_head` (`XArgmaxFin`). Gate passes; `k3_tp_equivalence.sh` CANNOT gate it — `--dump-logits` dumps `act.logits`, `vocab/tp` wide at tp=8, so its shape check fails by construction |
 | `PLOW_K3_FUSE_ARNORM` | **on** (`!= "0"`) | fuse the AttnRes norm |
+| `PLOW_K3_FUSE_NGEMV=1` | **off** | fold the `b=1` RMSNORM gates into the `b=256` GEMVs that read them (`routed_expert_norm` x92 fan=1, `q_a_layernorm` x24 fan=2). Removes all 116 RMSNORM packets; critical path 1831 -> 1715. **NOT BIT-EXACT END-TO-END YET** — bit-exact in the isolated hardware gate, diverges ~1 ULP through the full model. Do not enable for a real serve. `perf-data/k3-narrow-gate-fusion.md` |
 | `PLOW_SEG_PER_OP=1` | off | one AQL segment per op (host-side chaining). **BROKEN at TP8** — ranks desync, a collective hits its deadline and returns WITHOUT reducing |
 | `PLOW_FINE_FORCE=1` | off | keep genuinely-sparse `Dep::Fine` edges. **No-op on K3** — the K3 emitter creates zero fine deps |
 | `PLOW_UNISEG=1` | off | force one wave-class segment |
@@ -228,10 +235,46 @@ The dependency graph is nearly a chain: **critical path 1739 of 2459 packets, me
 3. **`lm_head` sharding** — machinery exists, gate passes, −14.7% GEMV bytes; needs an
    equivalence check that tolerates a `vocab/tp`-wide logits dump.
 4. **HIER2** — 3.46 us vs 13.20, blocked on the global queue having no per-packet leader.
-5. **Prefill**: `wave_class` names only ops 11/39 but K3 emits op 110
-   `FlashMlaPrefillFp8`, AND the class-4 object is rejected at load on every K3 run
-   (`compiled without PLOW_K3`) with a correct-but-silent fallback. K3 therefore runs ONE
-   launch in both phases. Prefill is 1291–1641 tok/s; a 32k prompt costs 24 s to first token.
+5. ~~**Prefill**: `wave_class` names only ops 11/39...~~ **RETRACTED — do not re-buy.**
+   Every fact in the old entry is true and the conclusion was wrong. `wave_class`
+   (`packet/src/devbuild.rs`) and `derive_segments` (`plowrt/src/exec/amd.rs`) do name only
+   ops 11/39, K3 does emit op 110, and the flash object IS rejected on every K3 run
+   (`object_name` forces `PrefillArm::None` for `Phase::Flash`, so `check_k3_arms` refuses
+   it and `k_flash` becomes `None`). None of it costs anything: `enqueue_segment` changes
+   only the kernel object and the block size — the grid is `n_cu` either way — and with no
+   flash object a class-4 segment already falls back to the 8-wave path. Adding op 110 to
+   `wave_class` alone is a no-op; adding it *and* building a K3 flash object is WORSE than
+   a no-op, because the `PLOW_BUCKET_FLASH` body is one `if (op == FLASH_PREFILL)` with no
+   switch and no default, so op 110 would silently do nothing while the interpreter still
+   signalled its successors — fluent, wrong output. At TP8 more segments also cost an
+   all-rank barrier each (`amd_tp.rs`). The 4-wave object exists for `d_flash_prefill`,
+   the dense MFMA kernel; K3's MLA prefill never calls it.
+
+   The real cost was the kernel. `d_flash_mla_prefill` was a wrapper over the DECODE body
+   with `n_tok > 1`, so its work item was ONE query token: the causal latent prefix was
+   re-streamed per token and every dot ran on the vector ALU. Prefill is not protocol-bound
+   the way decode is — the T=8192 program's critical path is 2109 packets, ~12 ms/chunk at
+   5.72 us, 0.2% of a 24 s TTFT. It is bodies.
+
+   **Fixed**: `d_flash_mla_prefill_mfma` (op_attention.h) tiles the QUERY axis and runs the
+   32x32x16 MFMA, staging the latent once per (q-tile, kv-tile) for all 64 query rows.
+   Measured on gfx950, one MLA layer, fp8 latent (op 110), n_head=12 (K3 at TP8):
+
+   | ctx | n_tok | scalar | tiled | |
+   |---|---|---|---|---|
+   | 8192 | 8192 | 20.5 ms | 9.1 ms | 2.25x |
+   | 32768 | 8192 | 141.6 ms | 50.7 ms | 2.79x |
+
+   The four 8192-row chunks of a 32k prompt go 324.7 ms -> 120.1 ms per layer, x24 MLA
+   layers = **7.8 s -> 2.9 s per rank**. bf16 (op 51) gains more, 7.2-8.4x, because the
+   scalar body it replaces is bandwidth-bound at twice the bytes.
+
+   NOT fixed, and the next thing to buy: below ~0.375 machine fill the tiling has fewer
+   work items than the scalar decomposition and LOSES (0.35x at n_tok=128, n_head=12).
+   `mla_pf_tiled_fills` picks the better body so this is never a regression, but a short
+   chunk still runs at the old speed. The fix is `nsplit` over the KV range, which is a
+   PACKET change: Opart must be sized for nsplit>1 and `MlaMergeFold` told. Only bites at
+   high TP — at TP1's n_head=96 the tiled kernel wins at every size measured (2.1-2.8x).
 
 ## 10. Republish the tuning DB before trusting any GEMM tile
 

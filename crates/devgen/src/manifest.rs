@@ -956,6 +956,7 @@ mod tests {
 
     fn prog(insts: Vec<DevInst>) -> Program {
         Program {
+            hier_base: 0,
             n_cu: 4, n_counter: 0, insts, stream: vec![], stream_ofs: vec![],
             stream_len: vec![], waits: vec![], succs: vec![], tensors: vec![],
             gq_stream: vec![], gq_seg_ofs: vec![], l2_sms: 0, l2_domains: 0,
