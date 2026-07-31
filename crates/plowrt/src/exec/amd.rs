@@ -78,6 +78,17 @@
 //! concurrency sweep through the muxer therefore needs a blob recompiled with a
 //! larger decode batch BEFORE any of the above is worth writing.
 //!
+//! **SUPERSEDED for K3.** The recompiled blob exists and batch > 1 ships: a
+//! sequence-rows decode program carries `t == B` independent sequences (per-slot
+//! KDA state, `PLOW_KDA_F_SEQ_ROWS`, `PLOW_GEMV_MM`), `serve` drives it through
+//! `decode_step_batched`, and `scripts/k3_batch_gate.sh` passes at B=4 on K3 at
+//! TP8. Measured 91.3 tok/s aggregate at B=16 against 34.5 at B=1. What the
+//! paragraph above still describes correctly is any blob compiled at `t == 1` —
+//! the refusal keyed on the carrier in `AmdEngine::load` is what tells them apart.
+//! What remains genuinely absent on this backend is chunked/interleaved prefill,
+//! VMM on TP, and prefix sharing; see
+//! `perf-data/k3-throughput-architecture-review.md`.
+//!
 //! # Measured: the concurrency axis (Gemma-4 31B, one MI355X, ctx 1024)
 //!
 //! | config | batch 1 | batch 8 | degradation | b8 aggregate |
@@ -1675,14 +1686,30 @@ fn bind_packed_experts(
         DevOp::MoeExpertGluFp8Blk,
         DevOp::MoeGroupGluFp8Blk,
     ];
+    // A BATCHED decode program routes its MoE through the GROUPED PREFILL chain, not the
+    // per-slot decode chain: at T rows the emitter picks `MoeGroupGluPf`, which sorts the
+    // (row, expert) pairs by expert so one expert's weights cross HBM once for every row that
+    // chose it. That is the correct chain for a batch — MoE has no cross-row state, and sharing
+    // the weight traffic across rows is the whole point of batching a memory-bound decode.
+    //
+    // Its operands sit in DIFFERENT SLOTS, which is the entire reason this needs its own arm:
+    // the table is `t[2]` and `I_moe` is `i[0]` (`crates/packet/src/slots.rs:196`), against
+    // `t[3]` / `i[1]` on the three arms above. Matching it with the same slot indices would
+    // find nothing, and the loader would report `expert_weight_table is declared but no decode
+    // instruction streams experts through it` on a program that streams them perfectly well.
     let dec = blob.progs.last().expect("checked non-empty");
     let i_moe_of = |i_ewt: usize| -> Option<u64> {
         dec.insts
             .iter()
-            .find(|d| {
-                d.t[3] as usize == i_ewt && GLU_ARMS.iter().any(|&o| o as u16 == d.op)
+            .find_map(|d| {
+                if d.t[3] as usize == i_ewt && GLU_ARMS.iter().any(|&o| o as u16 == d.op) {
+                    Some(d.i[1] as u64)
+                } else if d.t[2] as usize == i_ewt && d.op == DevOp::MoeGroupGluPf as u16 {
+                    Some(d.i[0] as u64)
+                } else {
+                    None
+                }
             })
-            .map(|d| d.i[1] as u64)
     };
 
     let mut bufs = Vec::with_capacity(layers.len() * 2);
@@ -2334,6 +2361,9 @@ pub struct AmdEngine {
     t_ids: Option<usize>,
     t_pos: Option<usize>,
     t_kvlen: Option<usize>,
+    /// `in.parked`, the per-row SKIP mask (non-zero = park). Present only on a sequence-rows
+    /// (batched-decode) blob; `None` means every row always participates.
+    t_active: Option<usize>,
     t_logits: Option<usize>,
     max_ctx: usize,
 
@@ -2360,6 +2390,13 @@ pub struct AmdEngine {
     kv_slot_stride: Vec<(usize, u64)>,
     /// Which sequence slot the KV pointers are currently rebased onto.
     kv_slot: usize,
+    /// `(tensor, per-slot bytes)` for the CARRIED recurrent state — KDA `state`
+    /// and `conv_state`, per-slot strided, `blkres` excluded for the reason
+    /// [`AmdEngine::begin_slot`] gives. This is what a prefix snapshot copies.
+    carried_slot: Vec<(usize, u64)>,
+    /// Per-slot snapshot of `carried_slot` taken at a prompt prefix boundary,
+    /// for [`AmdEngine::restore_carried`]. `None` until a slot arms one.
+    prefix_snap: Vec<Option<DeviceMem>>,
     /// VMM-backed FULL-attention KV, or `None` for the flat allocation.
     ///
     /// The tensor table still holds ONE base per `kv.{l}.{k,v}` and
@@ -3253,6 +3290,7 @@ impl AmdEngine {
         let t_ids = find("in.ids");
         let t_pos = find("in.pos");
         let t_kvlen = find("in.kvlen");
+        let t_active = find("in.parked");
         let t_logits = find("act.logits");
         // The context bound is carried by in.pos, not by any prefill bucket.
         let max_ctx = t_pos.map_or(0, |t| (blob.tensors[t].bytes / 4) as usize);
@@ -3395,6 +3433,29 @@ impl AmdEngine {
             )));
         }
 
+        // The CARRIED recurrent state, per slot. Unlike `kv_slot_stride` this is built at
+        // EVERY batch (a batch-1 slot has one region spanning the whole tensor), because the
+        // prefix snapshot below is not a batching feature.
+        //
+        // `blkres` is excluded for the same reason `begin_slot` excludes it: it is sized at the
+        // widest PREFILL bucket rather than at `batch`, so `bytes / batch` is not its stride —
+        // and it carries nothing across passes, so a snapshot has nothing to capture.
+        let carried_slot: Vec<(usize, u64)> = blob
+            .tensors
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| is_carried_state(&t.name) && !t.name.contains("blkres"))
+            .map(|(i, t)| (i, t.bytes / batch as u64))
+            .collect();
+
+        if !carried_slot.is_empty() {
+            tracing::info!(
+                tensors = carried_slot.len(),
+                per_slot_mib = carried_slot.iter().map(|&(_, n)| n).sum::<u64>() / (1024 * 1024),
+                "carried recurrent state (prefix-snapshot size per slot)"
+            );
+        }
+
         let mut kv_slot_stride: Vec<(usize, u64)> = Vec::new();
         if batch > 1 {
             // A KDA recurrent state is compiler-owned per-sequence state, so it
@@ -3406,30 +3467,63 @@ impl AmdEngine {
             // slot 0's state: no fault, no missing weight, just every sequence
             // corrupting every other one's recurrence.
             //
-            // Sharing a recurrent state across slots needs a paged-state
-            // indirection (a slot table plus a pool), which does not exist —
-            // `docs/kimi-k3-kda.md` §"cache shape" spells out why block-level
-            // sharing at arbitrary offsets is impossible for KDA. Until it does,
-            // refuse: batch-1 K3 is correct and batched K3 is not expressible.
-            if let Some(t) = blob
-                .tensors
-                .iter()
-                .find(|t| t.name.starts_with("kv.") && t.name.contains("state"))
-            {
+            // A blob emitted at `RowKind::Sequences` DOES have that axis
+            // (`declare_kda_state(.., slots)`), and the carrier that tells the
+            // kernel to use it is `PLOW_KDA_F_SEQ_ROWS` in the state step's
+            // flags word. So the question is not "is there a recurrent state"
+            // but "was this state emitted per-slot" — and only the blob can
+            // answer it.
+            //
+            // CHECK THE CARRIER, NOT THE ENV. `batch` is itself derived from
+            // `in.kvlen`, so it agrees with the emitter by construction and
+            // cannot discriminate. The flag cannot be faked into being: it is
+            // set only where the emitter also sized the state `slots` wide, so
+            // its absence at batch > 1 means the state is one block and the
+            // stride below would alias every sequence onto every other's — no
+            // fault, no missing weight, just fluent wrong output.
+            const KDA_F_SEQ_ROWS: u32 = 2;
+            let unbatched = blob.progs[decode].insts.iter().find(|d| {
+                d.op == DevOp::KdaStateStepG as u16 && d.i[4] & KDA_F_SEQ_ROWS == 0
+            });
+            if let (Some(t), Some(_)) = (
+                blob.tensors
+                    .iter()
+                    .find(|t| t.name.starts_with("kv.") && t.name.contains("state")),
+                unbatched,
+            ) {
                 return Err(RuntimeError::Device(format!(
-                    "PLOW_DECODE_BATCH = {batch} with a recurrent-state tensor `{}` in the packet. \
-                     KDA state has no batch axis, so the per-slot stride below would alias every \
-                     sequence's state onto every other's. Batched decode over a recurrent state \
-                     needs a paged-state indirection (slot table + pool) that does not exist yet; \
-                     emit with batch 1, or add it first.",
+                    "PLOW_DECODE_BATCH = {batch} with a recurrent-state tensor `{}` whose decode \
+                     program does NOT carry PLOW_KDA_F_SEQ_ROWS. The state is one block with no \
+                     slot axis, so the per-slot stride below would alias every sequence's state \
+                     onto every other's. Re-emit with PLOW_DECODE_BATCH = {batch} so the emitter \
+                     sizes the state per slot and sets the flag, or run at batch 1.",
                     t.name
                 )));
             }
+            // `kv.blkres` IS EXCLUDED, and leaving it in was an OUT-OF-BOUNDS GPU WRITE.
+            //
+            // It matches `kv.` but it is not a per-sequence cache. It is K3's snapshot ring,
+            // `[t][nb_cap][hidden]` (`devgen::k3`, "kv.blkres"), sized at the LARGEST `t` in the
+            // blob — which is the widest PREFILL bucket, not `batch`. Dividing its bytes by
+            // `batch` therefore invents a stride that has nothing to do with its layout, and
+            // rebasing slot `s` onto `s * bytes/batch` walks off the end:
+            //
+            //   T_max 8192, batch 16  ->  stride 512 rows;  slot 15 starts at row 7680,
+            //   and a 1024-row prefill chunk then writes to row 8704 of an 8192-row tensor.
+            //
+            // MEASURED: `Memory access fault by GPU node-7` serving the B=16 packet at
+            // concurrency 16 with 1038-token prompts (chunks [1024, 512]). It never fired at
+            // B=4 because the stride is 2048 there and slot 3 tops out at row 7168.
+            //
+            // Nothing is lost by not rebasing it: prefill and decode ALTERNATE rather than
+            // overlap, and layer 0 resets the ring at the head of every forward pass, so both
+            // phases can use rows `[0, t)` as scratch. It carries nothing between passes —
+            // which is the same property that lets `begin_slot` skip clearing it.
             kv_slot_stride = blob
                 .tensors
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| t.name.starts_with("kv."))
+                .filter(|(_, t)| t.name.starts_with("kv.") && !t.name.contains("blkres"))
                 .map(|(i, t)| (i, t.bytes / batch as u64))
                 .collect();
             tracing::info!(
@@ -3531,6 +3625,7 @@ impl AmdEngine {
             t_ids,
             t_pos,
             t_kvlen,
+            t_active,
             t_logits,
             max_ctx,
             weights_bound: ckpt.is_some(),
@@ -3538,6 +3633,8 @@ impl AmdEngine {
             tens_table: table,
             kv_slot_stride,
             kv_slot: 0,
+            carried_slot,
+            prefix_snap: (0..batch).map(|_| None).collect(),
             vmm,
             lm_detail: std::cell::RefCell::new(None),
             pf_stream: blob.progs.iter().map(|g| g.stream.clone()).collect(),
@@ -4358,33 +4455,220 @@ impl AmdEngine {
     /// clear, "the tokens before this sequence began" were the previous REQUEST's
     /// — so a second prompt started from the first one's accumulated state.
     ///
-    /// NOT PER-SLOT, and this is the honest limit of the fix. `declare_kda_state`
-    /// names these `kv.{layer}.state`, with no sequence index: there is exactly one
-    /// recurrent state in the model, so two KDA sequences cannot be in flight at
-    /// once no matter what this function does. Clearing on handover makes SEQUENTIAL
-    /// requests correct, which is the case that exists today (`prefill_slot` rebases
-    /// to one slot and back). Concurrent KDA slots need per-sequence state tensors
-    /// from the emitter, and until they do, [`AmdEngine::check_slot`]'s caller is
-    /// the only thing keeping them apart.
+    /// THE CLEAR IS WHOLE-TENSOR, AND AT `batch > 1` THAT IS NOW WRONG. This comment
+    /// used to say the state was not per-slot; it is, since `declare_kda_state` gained
+    /// `slots` and `k3.rs` passes `slots = t` for a sequence-rows program
+    /// (`crates/devgen/src/k3.rs`, `RowKind::Sequences`). So `kv.{layer}.state` and the
+    /// conv states hold B INDEPENDENT recurrences, and the `memset` below zeroes ALL of
+    /// them — admitting into slot 2 would wipe slots 0/1/3 mid-stream.
+    ///
+    /// That is latent rather than live only because this function used to be called ONLY on
+    /// the single-GPU path, and the shipped K3 config is TP8 — so on TP nothing cleared
+    /// carried state at all and every request after the first on a slot inherited the
+    /// previous one's recurrence across 69 of K3's 93 layers.
+    ///
+    /// # BOTH HALVES ARE FIXED HERE
+    ///
+    /// The clear is now PER SLOT, and [`AmdTpGroup::begin_slot`] calls it on every rank.
+    ///
+    /// The stride is `len / batch`, which is right because these tensors are SLOT-MAJOR by
+    /// construction: `declare_kda_state` sizes `state` as `state_elems * 4 * slots` and
+    /// `conv_state` as `proj * conv_w * 4 * slots`, and the kernels index them as
+    /// `st_h + t*bstride` with `bstride = H*D*D` (state) and `C*W` (conv) — the same
+    /// `[slot][...]` layout the memset now assumes. `slots` is `t` for a sequence-rows
+    /// program and 1 otherwise, so at `batch == 1` this is byte-identical to the old
+    /// whole-tensor clear.
+    ///
+    /// `kv.blkres` is EXCLUDED at `batch > 1`, and that is deliberate rather than an
+    /// oversight. It is `[T][nb_cap][hidden]` sized at `max(T_max, B)` rows — T_max being
+    /// the widest PREFILL bucket — so `len / batch` is NOT its row stride and a per-slot
+    /// memset would clear the wrong bytes. It also carries nothing across steps: layer 0
+    /// is a snapshot layer that resets the ring every forward pass, so each pass
+    /// re-establishes it. Clearing it was always belt-and-braces; skipping it at `batch > 1`
+    /// is strictly safer than clearing every live slot's rows.
     pub fn begin_slot(&mut self, seq: usize) -> Result<()> {
+        if seq >= self.batch {
+            return Err(RuntimeError::Device(format!(
+                "begin_slot {seq} past batch {}",
+                self.batch
+            )));
+        }
         if let Some(v) = &self.vmm {
             v.begin_seq(seq);
             v.ensure_rows(seq, 1)?;
         }
         for (i, name) in self.tensor_names.iter().enumerate() {
-            if is_carried_state(name) {
-                let m = &self.devp[i];
-                if m.base != 0 && m.len > 0 {
-                    EngineDevice::memset_d8(&*self.be, m.base, 0, m.len as usize)?;
-                }
+            if !is_carried_state(name) {
+                continue;
             }
+            let m = &self.devp[i];
+            if m.base == 0 || m.len == 0 {
+                continue;
+            }
+            if self.batch == 1 {
+                EngineDevice::memset_d8(&*self.be, m.base, 0, m.len as usize)?;
+                continue;
+            }
+            // See the doc above: only the slot-major carried tensors can be strided.
+            if name.contains("blkres") {
+                continue;
+            }
+            let b = self.batch as u64;
+            if m.len % b != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "carried-state tensor {name} is {} bytes, not divisible by batch {b} — \
+                     its slot stride is unknown, so clearing it would corrupt live slots",
+                    m.len
+                )));
+            }
+            let stride = m.len / b;
+            EngineDevice::memset_d8(
+                &*self.be,
+                m.base + stride * seq as u64,
+                0,
+                stride as usize,
+            )?;
         }
         Ok(())
+    }
+
+    /// Bytes one slot's carried recurrent state occupies — the size of a prefix snapshot.
+    pub fn carried_bytes(&self) -> u64 {
+        self.carried_slot.iter().map(|&(_, n)| n).sum()
+    }
+
+    /// Has slot `slot` got a prefix snapshot armed?
+    pub fn has_snapshot(&self, slot: usize) -> bool {
+        self.prefix_snap.get(slot).map(|s| s.is_some()).unwrap_or(false)
+    }
+
+    /// Capture slot `slot`'s carried recurrent state, so a later prompt sharing the prefix that
+    /// produced it can resume from here instead of re-prefilling those tokens.
+    ///
+    /// This is the half of prefix caching that a KV cache alone cannot provide. Reusing KV rows
+    /// `[0, P)` is positional and free — identical tokens at identical positions give identical
+    /// K/V. The KDA recurrence is not positional: resuming at `P` requires the STATE at `P`, and
+    /// there is no way to rewind it. So the state at `P` is copied out and copied back.
+    ///
+    /// The snapshot is exact rather than approximate because `rebase_chunk` sets every KDA op's
+    /// row count to `clen`, not to the padded bucket width — so a chunk with `clen == P` leaves
+    /// the recurrence at exactly `P` and the split point needs no bucket alignment.
+    pub fn snapshot_carried(&mut self, slot: usize) -> Result<()> {
+        if slot >= self.batch {
+            return Err(RuntimeError::Device(format!(
+                "snapshot_carried {slot} past batch {}",
+                self.batch
+            )));
+        }
+        let total = self.carried_bytes();
+        if total == 0 {
+            return Ok(());
+        }
+        if self.prefix_snap[slot].is_none() {
+            self.prefix_snap[slot] = Some(EngineDevice::alloc(&*self.be, total)?);
+        }
+        let dst_base = self.prefix_snap[slot].as_ref().expect("just allocated").base;
+        let mut off = 0u64;
+        let mut pairs = Vec::with_capacity(self.carried_slot.len());
+        for &(i, stride) in &self.carried_slot {
+            pairs.push((dst_base + off, self.devp[i].base + stride * slot as u64, stride));
+            off += stride;
+        }
+        // ONE completion wait for all 276 tensors. Per-copy `memcpy_dtod` blocks the host on its
+        // own signal, and at this count that synchronisation — not the 56 MiB — is the cost.
+        let t = std::time::Instant::now();
+        self.be.memcpy_dtod_batch(&pairs)?;
+        crate::obs::pfx::SNAP.add(t.elapsed().as_nanos() as u64);
+        Ok(())
+    }
+
+    /// Put slot `slot`'s carried state back to its snapshot. The inverse of
+    /// [`AmdEngine::snapshot_carried`]; a no-op refusal if nothing is armed.
+    pub fn restore_carried(&mut self, slot: usize) -> Result<()> {
+        if !self.has_snapshot(slot) {
+            return Err(RuntimeError::Device(format!(
+                "restore_carried: slot {slot} has no snapshot"
+            )));
+        }
+        let src_base = self.prefix_snap[slot].as_ref().expect("checked").base;
+        let mut off = 0u64;
+        let mut pairs = Vec::with_capacity(self.carried_slot.len());
+        for &(i, stride) in &self.carried_slot {
+            pairs.push((self.devp[i].base + stride * slot as u64, src_base + off, stride));
+            off += stride;
+        }
+        let t = std::time::Instant::now();
+        self.be.memcpy_dtod_batch(&pairs)?;
+        crate::obs::pfx::RESTORE.add(t.elapsed().as_nanos() as u64);
+        Ok(())
+    }
+
+    /// [`AmdEngine::chunk_steps`] starting at an arbitrary token offset.
+    ///
+    /// `from > 0` is a prefix-cache resume: the KV for `[0, from)` is already resident and this
+    /// covers `[from, n_prompt)`. Nothing about the chunk itself is special — an ordinary second
+    /// chunk is already in exactly this position, attending over KV it did not write.
+    pub fn chunk_steps_from(
+        &self,
+        chunks: &[u32],
+        from: u32,
+        n_prompt: u32,
+    ) -> Result<Vec<ChunkStep>> {
+        let mut out = Vec::with_capacity(chunks.len());
+        let mut c0 = from;
+        for &ch in chunks {
+            if c0 >= n_prompt {
+                break;
+            }
+            let prog = (0..self.decode)
+                .find(|&p| self.progs[p].t == ch)
+                .ok_or_else(|| {
+                    RuntimeError::Device(format!("no compiled bucket for chunk T={ch}"))
+                })?;
+            out.push(ChunkStep { prog, c0, clen: (n_prompt - c0).min(ch) });
+            c0 += ch;
+        }
+        Ok(out)
     }
 
     /// Pool counters (`blocks_live` is the HBM the KV cache actually holds).
     pub fn vmm_stats(&self) -> Option<crate::memory::vmm::VmmStats> {
         self.vmm.as_ref().map(|v| v.stats())
+    }
+
+    /// Stage the per-sequence `pos` and `kvlen` for a batched decode step.
+    ///
+    /// Factored out of [`Self::decode_step_batched`] because the TENSOR-PARALLEL path needs the
+    /// same staging without the launch: `AmdTpGroup::submit_decode` owns
+    /// zero-all-then-launch-all across ranks, so it must prepare every rank first and launch them
+    /// together. Duplicating this there is how the two would drift — and the failure would be a
+    /// rank feeding one sequence a stale position, which is silent.
+    ///
+    /// `patch_kvrow` runs only at `batch == 1`. Above it, `i[3]` is dead: `devgen` arms
+    /// `i[6] = n_batch_kv` on the decode `HeadNormRope` and the kernel takes BOTH the write row
+    /// and the RoPE angle from `pos[t]`, so the host must not patch a single write row it no
+    /// longer owns.
+    pub fn decode_prepare_batched(&mut self, pos: &[u32], kvlen: &[u32]) -> Result<()> {
+        let b = self.batch;
+        if b == 1 {
+            self.patch_kvrow(self.decode, pos[0])?;
+        }
+        {
+            let s = self.h_scalar.as_mut_slice();
+            for (i, p) in pos.iter().enumerate() {
+                s[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
+            }
+            for (i, k) in kvlen.iter().enumerate() {
+                s[(b + i) * 4..(b + i) * 4 + 4].copy_from_slice(&k.to_le_bytes());
+            }
+        }
+        let d_pos = self.devp[self.need(self.t_pos, "in.pos")?].base;
+        let d_kvlen = self.devp[self.need(self.t_kvlen, "in.kvlen")?].base;
+        self.be
+            .memcpy_htod_pinned(d_pos, &self.h_scalar.as_slice()[..b * 4])?;
+        self.be
+            .memcpy_htod_pinned(d_kvlen, &self.h_scalar.as_slice()[b * 4..b * 8])?;
+        Ok(())
     }
 
     /// One decode step for ALL `batch` sequences, returning each one's sampled
@@ -4440,31 +4724,11 @@ impl AmdEngine {
         }
 
         let dp = self.decode;
-        if b == 1 {
-            self.patch_kvrow(dp, pos[0])?;
-        }
-
-        {
-            let s = self.h_scalar.as_mut_slice();
-            for (i, p) in pos.iter().enumerate() {
-                s[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
-            }
-            for (i, k) in kvlen.iter().enumerate() {
-                s[(b + i) * 4..(b + i) * 4 + 4].copy_from_slice(&k.to_le_bytes());
-            }
-        }
-        let d_pos = self.devp[self.need(self.t_pos, "in.pos")?].base;
-        let d_kvlen = self.devp[self.need(self.t_kvlen, "in.kvlen")?].base;
-        self.be
-            .memcpy_htod_pinned(d_pos, &self.h_scalar.as_slice()[..b * 4])?;
-        self.be
-            .memcpy_htod_pinned(d_kvlen, &self.h_scalar.as_slice()[b * 4..b * 8])?;
+        self.decode_prepare_batched(pos, kvlen)?;
 
         self.run(dp, self.k_decode)?;
 
-        let src = self.devp[self.need(self.t_ids, "in.ids")?].base;
-        let slab = self.h_scalar.as_mut_slice();
-        self.be.memcpy_dtoh_pinned(&mut slab[..b * 4], src)?;
+        let ids = self.read_sampled_batched(b)?;
 
         // Hand the pre-mapper the new frontier so the next block is mapped
         // BEFORE a step needs it. Never blocks; `vmm_ensure` above is the
@@ -4474,6 +4738,18 @@ impl AmdEngine {
                 v.advise(i, p + 1);
             }
         }
+        Ok(ids)
+    }
+
+    /// The `b` tokens the DEVICE sampled into `in.ids`, one per sequence slot.
+    ///
+    /// The batched twin of [`AmdEngine::read_sampled`], and factored out of `decode_step_batched`
+    /// so the TP group can read per-slot ids too: `AmdTpGroup::complete_decode` returns one id per
+    /// RANK (it is an agreement check across shards), which at B>1 collapses B sequences to one.
+    pub fn read_sampled_batched(&mut self, b: usize) -> Result<Vec<u32>> {
+        let src = self.devp[self.need(self.t_ids, "in.ids")?].base;
+        let slab = self.h_scalar.as_mut_slice();
+        self.be.memcpy_dtoh_pinned(&mut slab[..b * 4], src)?;
         Ok(self.h_scalar.as_slice()[..b * 4]
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().expect("4")))
@@ -4500,6 +4776,32 @@ impl AmdEngine {
             }
         }
         let dst = self.devp[self.need(self.t_ids, "in.ids")?].base;
+        self.be
+            .memcpy_htod_pinned(dst, &self.h_scalar.as_slice()[..n * 4])
+    }
+
+    /// Publish the per-row participation mask for the next decode dispatch.
+    ///
+    /// `parked[s] != 0` parks row `s`: its KDA recurrence and conv window are left ALONE for that
+    /// dispatch. The sense is inverted deliberately — an all-zero (or never-written) mask means
+    /// every row participates, so a caller that does not know about the mask cannot break the
+    /// model by omitting it. `amd-bench` is exactly such a caller. Everything else about the row still runs — `t` is compiled, so the GEMVs and the
+    /// KV write happen regardless — and that is fine, because those are the parts an idle or
+    /// mid-prefill row can safely redo. The recurrence is the part it cannot.
+    ///
+    /// A blob without `in.parked` (anything not emitted at `RowKind::Sequences`) ignores this.
+    pub fn upload_parked(&mut self, parked: &[u32]) -> Result<()> {
+        let Some(t) = self.t_active else {
+            return Ok(());
+        };
+        let n = parked.len().min(self.batch);
+        {
+            let s = self.h_scalar.as_mut_slice();
+            for (i, a) in parked[..n].iter().enumerate() {
+                s[i * 4..i * 4 + 4].copy_from_slice(&a.to_le_bytes());
+            }
+        }
+        let dst = self.devp[t].base;
         self.be
             .memcpy_htod_pinned(dst, &self.h_scalar.as_slice()[..n * 4])
     }

@@ -1164,6 +1164,9 @@ impl crate::exec::device_api::EngineDevice for HsaBackend {
     fn memcpy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
         HsaBackend::memcpy_dtod(self, dst, src, bytes)
     }
+    fn memcpy_dtod_batch(&self, pairs: &[(u64, u64, u64)]) -> Result<()> {
+        HsaBackend::memcpy_dtod_batch(self, pairs)
+    }
 
     fn host_alloc_pinned(&self, bytes: usize) -> Result<HsaPinned> {
         HsaBackend::host_alloc_pinned(self, bytes)
@@ -2319,6 +2322,68 @@ impl HsaBackend {
     }
 
     /// Device→device copy within this agent.
+    /// N device-to-device copies against ONE completion signal.
+    ///
+    /// `hsa_amd_memory_async_copy` decrements its completion signal on finish, so a signal armed
+    /// at N and waited on once is a correct barrier for N copies — and it replaces N blocked
+    /// host waits with one. A prefix snapshot is 276 tensors per rank, where the per-copy
+    /// signal round trip, not the 56 MiB, is what costs.
+    pub fn memcpy_dtod_batch(&self, pairs: &[(u64, u64, u64)]) -> Result<()> {
+        let live: Vec<&(u64, u64, u64)> = pairs.iter().filter(|p| p.2 > 0).collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        let mut sig = HsaSignal { handle: 0 };
+        let rc = unsafe {
+            (self.shared.drv.hsa_signal_create)(live.len() as i64, 0, std::ptr::null(), &mut sig)
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            return Err(RuntimeError::Device(format!("hsa_signal_create (dtod batch): {rc}")));
+        }
+        for &&(dst, src, bytes) in &live {
+            let rc = unsafe {
+                (self.shared.drv.hsa_amd_memory_async_copy)(
+                    dst as *mut c_void,
+                    self.agent,
+                    src as *const c_void,
+                    self.agent,
+                    bytes as usize,
+                    0,
+                    std::ptr::null(),
+                    sig,
+                )
+            };
+            if rc != HSA_STATUS_SUCCESS {
+                // Copies already issued still hold references to `sig`; wait them out before
+                // destroying it or the runtime writes into freed memory.
+                unsafe {
+                    (self.shared.drv.hsa_signal_wait_scacquire)(
+                        sig,
+                        HSA_SIGNAL_CONDITION_LT,
+                        1,
+                        u64::MAX,
+                        HSA_WAIT_STATE_BLOCKED,
+                    );
+                    (self.shared.drv.hsa_signal_destroy)(sig);
+                }
+                return Err(RuntimeError::Device(format!(
+                    "hsa_amd_memory_async_copy (dtod batch): {rc}"
+                )));
+            }
+        }
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                sig,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_BLOCKED,
+            );
+            (self.shared.drv.hsa_signal_destroy)(sig);
+        }
+        Ok(())
+    }
+
     pub fn memcpy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
         if bytes == 0 {
             return Ok(());

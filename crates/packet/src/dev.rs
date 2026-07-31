@@ -83,7 +83,14 @@ pub enum DevOp {
     /// prologue and the normalized activation never round-trips through HBM.
     RowRms = 2,
     /// `t0=out t1=x t2=gamma? t3=cos? t4=sin? t5=pos(i32)` ·
-    /// `i0=ntok i1=nhead i2=hd i3=out_row0` · `f0=eps`.
+    /// `i0=ntok i1=nhead i2=hd i3=out_row0 i4=flags i6=n_batch_kv` · `f0=eps` ·
+    /// `j0=out_stride j1=kv_mask`.
+    ///
+    /// `n_batch_kv != 0` makes row `t` sequence `t`: it writes its OWN batch-major ring at its
+    /// OWN position, `((t*nhead + hh)*out_stride + pos[t]) * hd`. That is the only addressing a
+    /// batched decode can use — the legacy `out_row0 + t` form takes ONE host-patched position
+    /// per step and cannot express B sequences at B different positions. Zero keeps the legacy
+    /// path byte-identical, so prefill and B=1 decode are unchanged.
     /// `cos = TENSOR_NONE` skips RoPE. `out_row0` lets K/V land directly at a row
     /// offset of the KV cache, so the cache write is not a separate copy.
     HeadNormRope = 3,
@@ -159,10 +166,12 @@ pub enum DevOp {
     /// over the SUM, and BOTH the updated residual stream and its norm are written. Merges a
     /// RESIDUAL packet and an RMSNORM packet — two global gates, each a single-workgroup decode op.
     AddNorm = 21,
-    /// `t0=part(u64[blocks]) t1=x` · `i0=n`. Per-block partial of a greedy argmax, packed as
-    /// `(ordered_bf16_key << 32) | ~index` so a plain unsigned max does the whole reduction.
+    /// `t0=part(u64[blocks]) t1=x` · `i0=n i1=n_batch`. Per-block partial of a greedy argmax,
+    /// packed as `(ordered_bf16_key << 32) | ~index` so a plain unsigned max does the whole
+    /// reduction. `n_batch` rows: `x` is `[n_batch][n]` and `part` is `[n_batch][blocks]`;
+    /// 0 and 1 are byte-identical, which is why no emitter had to set it before batched decode.
     Argmax = 17,
-    /// `t0=ids(i32) t1=part` · `i0=blocks`. Folds the partials and writes the token id
+    /// `t0=ids(i32) t1=part` · `i0=blocks i1=n_batch`. Folds the partials and writes the token id
     /// straight into the tensor the NEXT step's [`DevOp::Embed`] reads — so a sampled token
     /// never leaves the GPU.
     ArgmaxFin = 18,
@@ -1071,7 +1080,7 @@ pub enum DevOp {
     /// partial sweep would leave a stream's `mix` finite, fluent and wrong.
     ///
     /// `t0=q_out t1=k_out t2=v_out t3=q_in t4=k_in t5=v_in t6=w_q t7=w_k` ·
-    /// `i0=T i1=C i2=W i3=act i4=w_v i5=cs_q i6=cs_k i7=cs_v`.
+    /// `i0=T i1=C i2=W i3=act i4=w_v i5=cs_q i6=cs_k i7=cs_v` · `j0=bstride j1=parked`.
     KdaConv3 = 111,
     /// [`DevOp::KdaStateStep`] with [`DevOp::KdaGate`] folded into its LDS staging.
     ///
@@ -1105,7 +1114,7 @@ pub enum DevOp {
     /// slot naming one.
     ///
     /// `t0=o t1=q t2=k t3=v t4=g_raw t5=beta_raw t6=state t7=A_log` ·
-    /// `i0=T i1=H i2=D i3=BV i4=flags i5=dt_bias i6=gate_mode` · `f0=scale f1=lower_bound`.
+    /// `i0=T i1=H i2=D i3=BV i4=flags i5=dt_bias i6=gate_mode i7=parked` · `f0=scale f1=lower_bound`.
     KdaStateStepG = 112,
     /// `t0=fu t1=A t2=Wg(fp4) t5=Wu(fp4) t3=Sg(e8m0) t4=Su(e8m0)` · `i0=M i1=N i2=K i5=act`,
     /// computing `fu = act(Wg @ A) * (Wu @ A)` — the MXFP4 twin of [`DevOp::GemmGlu`] and the T-row

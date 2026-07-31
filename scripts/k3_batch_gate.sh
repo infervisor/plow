@@ -16,16 +16,36 @@
 #      streams diverge, and because every slot ran the same prompt any difference at all is a
 #      bug rather than a legitimate difference.
 #
-#   B. DIFFERENT PROMPTS, RAGGED LENGTHS. B different prompts must each produce what that prompt
-#      produces ALONE at B=1. Catches per-slot position and kvlen handling, which check A cannot
-#      see because identical prompts share their positions. Lengths are deliberately unequal —
+#   B. DIFFERENT PROMPTS, RAGGED LENGTHS, COMPARED ACROSS TWO BATCH WIDTHS. The same B different
+#      prompts are run at width B and at a SECOND width, and slot s must agree between them.
+#      Catches per-slot position and kvlen handling, which check A cannot see because identical
+#      prompts share their positions. Lengths are deliberately unequal —
 #      `perf-data/batched-decode-amd-status.md:19-31` is the precedent, where exactly this shape
 #      (prompts of length 3/5/7/4) caught ragged-position bugs on the dense path.
+#
+#      IT COMPARES TWO BATCHED RUNS, NOT A BATCHED RUN AGAINST A SOLO ONE, and that is a
+#      correction rather than a convenience. A batched decode routes MoE through the GROUPED
+#      expert kernel and a B=1 decode through the per-slot one; they accumulate in different
+#      orders, and greedy decoding turns any tie-break into a different token a few steps later.
+#      Measured: B=1 continues "The population is approximately 67 million people", B=4/8/16 all
+#      continue "The capital of Germany is Berlin" — both fluent, both right, neither a defect.
+#      Token-identity across those two paths is a criterion no correct implementation can meet,
+#      so demanding it made the gate report FAIL on a working batch. Two batched widths DO share
+#      a kernel, so between them token-identity is exactly the right bar — and it still tests
+#      what check B is for, because the per-slot strides, positions and kvlens differ with width.
 #
 # Check B is the one that matters most and the one most likely to be skipped, because it needs a
 # B=1 reference run per prompt and is therefore B+1 model loads rather than one.
 #
-#   ./scripts/k3_batch_gate.sh <blob-dir> <hsaco-dir> <checkpoint> [B]
+#   ./scripts/k3_batch_gate.sh <blob-dir> <hsaco-dir> <checkpoint> [B] [alt-blob] [alt-hsaco]
+#
+# `alt-blob`/`alt-hsaco` are a build at a DIFFERENT batch width (both must move together — the
+# hsaco carries PLOW_DECODE_BATCH too, since it sizes PLOW_GEMV_MM). Check B is skipped, loudly,
+# without them.
+#
+# THE ALT BUILD MUST BE A DIFFERENT WIDTH, and reusing $BLOB for it compares the batch path
+# against ITSELF at the same width — which passes whenever the batch path is self-consistently
+# wrong.
 #
 #   STEPS  decode steps per arm (default 24)
 #   CTX    --ctx (default 5; see kimi-k3-README.md §5 — at ctx > prompt length the run decodes
@@ -33,6 +53,7 @@
 set -uo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BLOB="${1:?blob dir}"; HSACO="${2:?hsaco dir}"; CKPT="${3:?checkpoint}"; B="${4:-4}"
+ALT_BLOB="${5:-}"; ALT_HSACO="${6:-}"
 STEPS="${STEPS:-24}"; CTX="${CTX:-5}"
 BIN="${PLOWRT_BIN:-$WT/target/release/plowrt}"
 LEASE="$WT/perf-data/harness/gpulease"
@@ -44,12 +65,12 @@ P3="1008,10484,318,15383,387,13,646"   # 7
 P4="1008,10484,318,15383"              # 4
 PROMPTS=("$P1" "$P2" "$P3" "$P4")
 
-run() { # <label> <prompt-spec> <extra-args...>
-  local lbl="$1"; shift; local pr="$1"; shift
+run() { # <label> <blob-dir> <hsaco-dir> <prompt-spec> <extra-args...>
+  local lbl="$1"; shift; local bl="$1"; shift; local hs="$1"; shift; local pr="$1"; shift
   local log="/tmp/k3bg_$lbl.log"
   GPU_LEASE_TIMEOUT=7200 "$LEASE" -n 8 "k3bg-$lbl" sg render -c \
-    "PLOW_L2_PLACE_DISPATCH=1 nix develop $WT --command $BIN amd-bench --blob $BLOB/model.pkt \
-     --hsaco $HSACO --checkpoint $CKPT --tp 8 --steps $STEPS --ctx $CTX --prompt '$pr' $*" \
+    "PLOW_L2_PLACE_DISPATCH=1 nix develop $WT --command $BIN amd-bench --blob $bl/model.pkt \
+     --hsaco $hs --checkpoint $CKPT --tp 8 --steps $STEPS --ctx $CTX --prompt '$pr' $*" \
     > "$log" 2>&1
   # the generated id list, one line per sequence slot
   grep -oE "^  \[[0-9, ]+\]" "$log"
@@ -58,7 +79,7 @@ run() { # <label> <prompt-spec> <extra-args...>
 echo "=== CHECK A: $B copies of one prompt must give $B identical streams ==="
 same=""
 for _ in $(seq 1 "$B"); do same="${same:+$same;}$P1"; done
-mapfile -t A < <(run "identical" "$same" --batched)
+mapfile -t A < <(run "identical" "$BLOB" "$HSACO" "$same" --batched)
 if [ "${#A[@]}" -eq 0 ]; then
   echo "  NO STREAMS PARSED — see /tmp/k3bg_identical.log"
   grep -viE "^\[2m|dev shell|lean tool|amd gpu" /tmp/k3bg_identical.log | tail -4
@@ -74,26 +95,35 @@ else
 fi
 
 echo
-echo "=== CHECK B: $B different prompts must each match their B=1 solo run ==="
-declare -a SOLO
-for i in $(seq 0 $((B-1))); do
-  p="${PROMPTS[$((i % ${#PROMPTS[@]}))]}"
-  mapfile -t one < <(run "solo$i" "$p")
-  SOLO[$i]="${one[0]:-MISSING}"
-  echo "  solo[$i] len=$(($(tr -cd ',' <<<"$p" | wc -c)+1)) -> ${SOLO[$i]:0:60}..."
-done
-spec=""; for i in $(seq 0 $((B-1))); do spec="${spec:+$spec;}${PROMPTS[$((i % ${#PROMPTS[@]}))]}"; done
-mapfile -t BATCHED < <(run "ragged" "$spec" --batched)
-B_OK=0
-if [ "${#BATCHED[@]}" -ne "$B" ]; then
-  echo "  expected $B streams, got ${#BATCHED[@]}"; B_OK=1
+echo "=== CHECK B: $B ragged prompts must give the same streams at a second width ==="
+if [ -z "$ALT_BLOB" ] || [ -z "$ALT_HSACO" ]; then
+  # Silently reusing $BLOB here would compare the batch path against itself and print PASS.
+  echo "  NO ALT BUILD GIVEN (arguments 5 and 6). Check B needs a build at a DIFFERENT batch"
+  echo "  width; without one it would compare the batched blob to itself and pass vacuously."
+  echo ">>> CHECK B: NOT RUN"
+  B_OK=1
 else
-  for i in $(seq 0 $((B-1))); do
-    if [ "${BATCHED[$i]}" = "${SOLO[$i]}" ]; then echo "  slot $i: MATCHES solo"
-    else echo "  slot $i: DIFFERS from solo"; echo "     batched ${BATCHED[$i]:0:70}"; echo "     solo    ${SOLO[$i]:0:70}"; B_OK=1; fi
+spec=""; for i in $(seq 0 $((B-1))); do spec="${spec:+$spec;}${PROMPTS[$((i % ${#PROMPTS[@]}))]}"; done
+mapfile -t BATCHED < <(run "ragged" "$BLOB" "$HSACO" "$spec" --batched)
+# The alt build runs the SAME prompt list. Its width comes from its own blob, so it may produce
+# more or fewer streams; only the slots both runs have are comparable, and the prompts line up
+# because the list is positional.
+mapfile -t ALT < <(run "ragged_alt" "$ALT_BLOB" "$ALT_HSACO" "$spec" --batched)
+B_OK=0
+n=$(( ${#BATCHED[@]} < ${#ALT[@]} ? ${#BATCHED[@]} : ${#ALT[@]} ))
+if [ "${#BATCHED[@]}" -ne "$B" ]; then
+  echo "  expected $B streams from the primary build, got ${#BATCHED[@]}"; B_OK=1
+elif [ "$n" -lt 2 ]; then
+  echo "  alt build produced $n comparable streams — nothing to compare"; B_OK=1
+else
+  echo "  comparing $n slots ($B-wide vs ${#ALT[@]}-wide)"
+  for i in $(seq 0 $((n-1))); do
+    if [ "${BATCHED[$i]}" = "${ALT[$i]}" ]; then echo "  slot $i: MATCHES the other width"
+    else echo "  slot $i: DIFFERS across widths"; echo "     w=$B   ${BATCHED[$i]:0:70}"; echo "     w=${#ALT[@]} ${ALT[$i]:0:70}"; B_OK=1; fi
   done
 fi
-[ "$B_OK" -eq 0 ] && echo ">>> CHECK B: PASS" || echo ">>> CHECK B: FAIL — per-slot position/kvlen handling"
+fi
+[ "$B_OK" -eq 0 ] && echo ">>> CHECK B: PASS" || echo ">>> CHECK B: FAIL — per-slot position/kvlen handling differs with batch width"
 
 echo
 # A ONE-SLOT BATCH PROVES NOTHING, and saying otherwise is worse than saying nothing. Both checks

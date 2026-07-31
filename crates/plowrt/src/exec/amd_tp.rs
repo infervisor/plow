@@ -502,6 +502,38 @@ impl AmdTpGroup {
         self.complete_decode()
     }
 
+    /// One batched decode step across every rank: submit, drain, return the `pos.len()` sampled
+    /// ids.
+    ///
+    /// AGREEMENT IS CHECKED ON THE WHOLE B-VECTOR, not on slot 0. Every rank samples from its own
+    /// shard of the logits, so a broken all-reduce still yields fluent ids — agreement is the only
+    /// signal that distinguishes it from a working one. Checking slot 0 alone would test one of B
+    /// sequences and report green while the rest diverged, which is the same mistake
+    /// `amd_bench`'s B=16 batched arm made (it compared every slot against slot 0 rather than
+    /// against the first slot carrying its own prompt).
+    pub fn decode_step_batched(&mut self, pos: &[u32], kvlen: &[u32]) -> Result<Vec<u32>> {
+        self.submit_decode_batched(pos, kvlen)?;
+        for e in &self.ranks {
+            e.drain()?;
+        }
+        let b = pos.len();
+        let per_rank: Vec<Vec<u32>> = self
+            .ranks
+            .iter_mut()
+            .map(|e| e.read_sampled_batched(b))
+            .collect::<Result<_>>()?;
+        for (r, ids) in per_rank.iter().enumerate().skip(1) {
+            if ids != &per_rank[0] {
+                return Err(RuntimeError::Device(format!(
+                    "TP ranks disagree on a batched decode step: rank 0 sampled {:?}, rank {r} \
+                     sampled {ids:?} — the all-reduce is wrong",
+                    per_rank[0]
+                )));
+            }
+        }
+        Ok(per_rank.into_iter().next().expect(">=1 rank"))
+    }
+
     /// Dispatch one decode token on every rank and RETURN — no wait.
     ///
     /// The server-facing half. After this call N megakernels are resident and
@@ -518,11 +550,28 @@ impl AmdTpGroup {
     ///
     /// Doing (2) per rank as each is launched lets an early rank signal a late
     /// rank's counter and then have that rank's own zeroing wipe the signal.
+    /// Scalar convenience over [`Self::submit_decode_batched`] — one sequence, which is every
+    /// caller today.
     pub fn submit_decode(&mut self, pos: u32, kvlen: u32) -> Result<()> {
+        self.submit_decode_batched(&[pos], &[kvlen])
+    }
+
+    /// Submit one decode step for `B` sequences across every rank.
+    ///
+    /// EVERY RANK PREPARES BEFORE ANY RANK LAUNCHES, and that ordering is the reason this cannot
+    /// simply loop `decode_step_batched` per rank: `launch_token` owns zero-all-then-launch-all,
+    /// so a rank that launched while another was still staging its positions would read a
+    /// half-written `in.pos`. The staging itself is `decode_prepare_batched`, shared with the
+    /// single-GPU path so the two cannot drift — a rank feeding one sequence a stale position is
+    /// silent, not a crash.
+    ///
+    /// `pos` and `kvlen` are per-sequence and may be RAGGED; every rank gets the same vectors,
+    /// because TP replicates the residual and every rank runs all `B` sequences.
+    pub fn submit_decode_batched(&mut self, pos: &[u32], kvlen: &[u32]) -> Result<()> {
         use crate::obs::dstep;
         let dp = self.ranks[0].decode_prog();
         for e in &mut self.ranks {
-            dstep::timed(&dstep::PREPARE, || e.decode_prepare(pos, kvlen))?;
+            dstep::timed(&dstep::PREPARE, || e.decode_prepare_batched(pos, kvlen))?;
             dstep::timed(&dstep::REARM, || e.rearm_prog(dp))?;
         }
         // `launch_token` owns zero-all-then-launch-all; the closure only says
@@ -664,6 +713,176 @@ impl AmdTpGroup {
         let out = self.ranks.iter_mut().map(|e| e.read_sampled()).collect();
         crate::obs::ttft::PF_READ.add(t_read.elapsed().as_nanos() as u64);
         out
+    }
+
+    /// Prefill into sequence SLOT `slot` of a batched decode program.
+    ///
+    /// The single-GPU twin is `AmdEngine::prefill_slot`: rebase the KV pointer table onto the
+    /// slot, run the ordinary prefill, restore. The group version must rebase EVERY RANK BEFORE
+    /// THE PREFILL RUNS, because prefill is collective — a rank still pointing at slot 0 would
+    /// rendezvous with peers writing slot `s` and the reduce would mix two slots' partials.
+    ///
+    /// Restore is unconditional, on the failure path too: a half-prefilled slot is recoverable,
+    /// a pointer table left rebased is not — the next decode would funnel every sequence into
+    /// one slot's cache, and `decode_step_batched` refuses exactly that (`kv_slot != 0`).
+    /// Hand slot `slot` to a NEW sequence on every rank: clear its carried recurrent state.
+    ///
+    /// This existed only on the single-GPU path, which meant that under TP — the shipped K3
+    /// configuration — NOTHING cleared KDA state between requests, and every request after the
+    /// first on a slot began from its predecessor's accumulated recurrence across 69 of K3's 93
+    /// layers. `AmdEngine::begin_slot` documents why an append-only KV cache needs no clear and
+    /// a recurrence does.
+    ///
+    /// EVERY RANK, and the loop is not an optimisation detail: the recurrence is sharded by head,
+    /// so a rank that skipped the clear would carry stale state for its own heads only and the
+    /// ranks would disagree about the sequence from its very first token.
+    pub fn begin_slot(&mut self, slot: usize) -> Result<()> {
+        for e in &mut self.ranks {
+            e.begin_slot(slot)?;
+        }
+        Ok(())
+    }
+
+    pub fn prefill_slot(&mut self, slot: usize, prompt: &[u32]) -> Result<Vec<u32>> {
+        for e in &mut self.ranks {
+            e.kv_rebase(slot)?;
+        }
+        let r = self.prefill(prompt);
+        let mut restore = Ok(());
+        for e in &mut self.ranks {
+            if let Err(err) = e.kv_rebase(0) {
+                restore = Err(err);
+            }
+        }
+        restore?;
+        r
+    }
+
+    /// Snapshot / restore / probe the carried recurrent state on EVERY rank.
+    ///
+    /// The recurrence is sharded by head, so a snapshot is only meaningful if every rank takes
+    /// one at the same point in the token stream — a rank that skipped it would resume from a
+    /// state one prefix behind its peers and the group would disagree from the first token.
+    pub fn snapshot_carried(&mut self, slot: usize) -> Result<()> {
+        for e in &mut self.ranks {
+            e.snapshot_carried(slot)?;
+        }
+        Ok(())
+    }
+
+    pub fn restore_carried(&mut self, slot: usize) -> Result<()> {
+        for e in &mut self.ranks {
+            e.restore_carried(slot)?;
+        }
+        Ok(())
+    }
+
+    /// Publish the per-row parked mask on every rank. See `AmdEngine::upload_parked`.
+    pub fn upload_parked(&mut self, parked: &[u32]) -> Result<()> {
+        for e in &mut self.ranks {
+            e.upload_parked(parked)?;
+        }
+        Ok(())
+    }
+
+    pub fn has_snapshot(&self, slot: usize) -> bool {
+        self.ranks.iter().all(|e| e.has_snapshot(slot))
+    }
+
+    /// Point every rank's KV pointer table at sequence slot `slot`.
+    ///
+    /// Exposed for the CHUNK-AT-A-TIME server path: `prefill_slot` holds the rebase across a
+    /// whole prompt, but a scheduler that interleaves decode between chunks must hand the base
+    /// back to 0 in between, because `decode_step_batched` refuses a non-zero base.
+    pub fn kv_rebase_all(&mut self, slot: usize) -> Result<()> {
+        for e in &mut self.ranks {
+            e.kv_rebase(slot)?;
+        }
+        Ok(())
+    }
+
+    /// The chunk plan covering `[from, to)` — the cursor a chunked server steps through.
+    pub fn plan_span(&self, from: u32, to: u32) -> Result<Vec<ChunkStep>> {
+        if from >= to {
+            return Ok(Vec::new());
+        }
+        let chunks = self.ranks[0].plan_for(to - from)?;
+        self.ranks[0].chunk_steps_from(&chunks, from, to)
+    }
+
+    /// Every rank's sampled id after a prefill's final chunk.
+    pub fn read_sampled_all(&mut self) -> Result<Vec<u32>> {
+        self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
+    }
+
+    /// Run the prefill chunks covering `[from, to)` on every rank.
+    fn prefill_span(&mut self, prompt: &[u32], from: u32, to: u32) -> Result<()> {
+        if from >= to {
+            return Ok(());
+        }
+        let chunks = self.ranks[0].plan_for(to - from)?;
+        let steps = self.ranks[0].chunk_steps_from(&chunks, from, to)?;
+        for step in steps {
+            self.prefill_chunk(prompt, step)?;
+        }
+        Ok(())
+    }
+
+    /// Prefill into `slot`, reusing a cached prefix where one is armed.
+    ///
+    /// `resume > 0` means slot `slot` holds a snapshot taken at token `resume` AND its KV rows
+    /// `[0, resume)` are the same tokens at the same positions, so those tokens are skipped
+    /// entirely: restore the recurrence and prefill only `[resume, len)`.
+    ///
+    /// `arm > 0` on a MISS means "split the prefill at `arm` and snapshot there", which costs
+    /// nothing extra — the same tokens are prefilled either way — and arms the next request on
+    /// this slot. `arm` needs no bucket alignment: `rebase_chunk` runs every KDA op for `clen`
+    /// rows, not the padded bucket width, so a chunk ending at `arm` leaves the state at exactly
+    /// `arm`.
+    ///
+    /// KV rebase is held across the WHOLE sequence of spans and restored unconditionally, for the
+    /// same reason [`AmdTpGroup::prefill_slot`] holds it across one.
+    pub fn prefill_slot_cached(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        resume: u32,
+        arm: u32,
+    ) -> Result<Vec<u32>> {
+        for e in &mut self.ranks {
+            e.kv_rebase(slot)?;
+        }
+        let r = self.prefill_cached_inner(prompt, slot, resume, arm);
+        let mut restore = Ok(());
+        for e in &mut self.ranks {
+            if let Err(err) = e.kv_rebase(0) {
+                restore = Err(err);
+            }
+        }
+        restore?;
+        r
+    }
+
+    fn prefill_cached_inner(
+        &mut self,
+        prompt: &[u32],
+        slot: usize,
+        resume: u32,
+        arm: u32,
+    ) -> Result<Vec<u32>> {
+        let n = prompt.len() as u32;
+        let from = if resume > 0 {
+            self.restore_carried(slot)?;
+            resume
+        } else if arm > 0 {
+            self.prefill_span(prompt, 0, arm)?;
+            self.snapshot_carried(slot)?;
+            arm
+        } else {
+            0
+        };
+        self.prefill_span(prompt, from, n)?;
+        self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
     }
 
     /// The chunk plan for a prompt — a server chunks prefill itself, so it needs

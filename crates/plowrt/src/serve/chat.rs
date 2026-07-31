@@ -457,6 +457,7 @@ fn sse_response(
                                 t_arrive.elapsed().as_nanos() as u64,
                                 n_prompt,
                             );
+                            crate::obs::pfx::report();
                         }
                         let ch = ChatChunk {
                             id: request_id.clone(),

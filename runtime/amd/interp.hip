@@ -1206,7 +1206,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              in->fj[0].f, slice, nblk, (float*)sm->raw,
                              (in->i[4] & PLOW_KDA_F_SEQ_ROWS)
                                  ? (size_t)in->i[1] * in->i[2] * in->i[2]
-                                 : (size_t)0);
+                                 : (size_t)0,
+                             /* op 102 predates the per-row mask and carries no slot for it. */
+                             nullptr);
             break;
         case PLOW_DOP_KDA_GATED_NORM:
             d_kda_gated_norm((bf16*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
@@ -1248,7 +1250,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                          * so `j[0]` is free and zero in every blob emitted so far — which is the
                          * shared window. The stride is carried DIRECTLY rather than as a flag, so
                          * the kernel does not have to re-derive `C*W`. */
-                        (size_t)in->fj[1].u);
+                        (size_t)in->fj[1].u,
+                        /* PER-ROW PARKED MASK in `j[1]` (= `fj[2]`), the last free slot on this
+                         * op. Gated on `fj[1].u != 0` — the per-row stride — because that is
+                         * exactly the seq-rows condition the emitter sets both under, so a blob
+                         * emitted before the mask existed reads no mask. */
+                        in->fj[1].u ? (const unsigned*)T[in->fj[2].u] : nullptr);
             break;
         }
         case PLOW_DOP_KDA_STATE_STEP_G: {
@@ -1264,7 +1271,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                 * independent sequences (batched decode), else 0. */
                                (in->i[4] & PLOW_KDA_F_SEQ_ROWS)
                                    ? (size_t)in->i[1] * in->i[2] * in->i[2]
-                                   : (size_t)0);
+                                   : (size_t)0,
+                               /* PER-ROW PARKED MASK in `i[7]`, and read ONLY under the seq-rows
+                                * flag. 0 is a valid tensor index, so the flag — not a sentinel —
+                                * is what distinguishes "no mask" from "tensor 0"; that is also
+                                * what keeps a non-batched blob byte-identical, since the emitter
+                                * leaves i[7] at 0 there. */
+                               (in->i[4] & PLOW_KDA_F_SEQ_ROWS)
+                                   ? (const unsigned*)T[in->i[7]]
+                                   : nullptr);
             break;
         }
         /* Kimi-K3 BLOCK structure (op_k3.h). Both arms are in BOTH buckets: a K3 layer runs the
@@ -1483,48 +1498,6 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #else
         case PLOW_DOP_FLASH_PREFILL:
             exec_flash_prefill(in, T, slice, nblk, sm->fa);
-            break;
-#endif
-#if PLOW_MOE_PREFILL
-        /* MoE PREFILL (T>1) — the FFN half of an MLA-family prompt. Gated by its own flag, and
-         * not folded into PLOW_MLA_PREFILL, for the reason every other axis here has its own
-         * flag: this adds a second full MFMA GEMM body to a bucket that already sits at the
-         * 256/occ-2 cliff, and a Gemma or Qwen prefill object must not pay for it. Measured
-         * cost is reported in the build table. */
-        case PLOW_DOP_MOE_ROUTER_TOPK_PF:
-            d_moe_router_topk_pf((unsigned char*)TEN(0), (const bf16*)TEN(1),
-                                 (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr, in->i[1],
-                                 in->i[2], in->i[3], in->fj[0].f, in->i[4], slice, nblk,
-                                 (float*)sm->raw, in->i[6], in->i[7]);
-            break;
-        case PLOW_DOP_MOE_ALIGN_PF:
-            d_moe_align_pf((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
-                           (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2], slice,
-                           (unsigned*)sm->raw);
-            break;
-        /* i3 = weight encoding (0 bf16, 1 block-fp8, 2 MXFP4/A4W4) — a precision swap is a
-         * field change, not a re-emit. t6=row_partidx, t7=row_gate on DOWN; under A4W4 the GLU
-         * arm also takes t6 (so the fused bridge can skip pad rows) and t7 = the E8M0 scale
-         * rows it WRITES, since the bridge is its epilogue rather than a separate op. */
-        case PLOW_DOP_MOE_GROUP_GLU_PF:
-            d_moe_group_glu_pf((bf16*)TEN(0), (const bf16*)TEN(1),
-                               (const unsigned long long*)TEN(2),
-                               (const unsigned long long*)TEN(3), (const int*)TEN(4),
-                               (const unsigned*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3],
-                               in->i[5], slice, nblk, in->fj[0].f, in->fj[1].f, sm->raw, nullptr,
-                               (const unsigned*)TEN(6), (unsigned char*)TEN(7));
-            break;
-        case PLOW_DOP_MOE_GROUP_DOWN_PF:
-            d_moe_group_down_pf((float*)TEN(0), (const bf16*)TEN(1),
-                                (const unsigned long long*)TEN(2),
-                                (const unsigned long long*)TEN(3), (const int*)TEN(4),
-                                (const unsigned*)TEN(6), (const float*)TEN(7), in->i[0], in->i[1],
-                                in->i[2], in->i[3], slice, nblk, sm->raw,
-                                (const unsigned char*)TEN(5));
-            break;
-        case PLOW_DOP_MOE_COMBINE_PF:
-            d_moe_combine_pf((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
-                             (const float*)TEN(3), in->i[0], in->i[1], in->i[2], slice, nblk);
             break;
 #endif
 #if PLOW_MLA_PREFILL
@@ -1827,6 +1800,61 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                    in->i[0], in->i[1], in->i[2], slice, nblk);
             break;
 #endif /* bucket */
+        /* THE GROUPED EXPERT CHAIN IS AN FFN AXIS, NOT A BUCKET-PREFILL ONE — which is why it
+         * sits AFTER the PLOW_BUCKET_PREFILL block rather than inside it.
+         *
+         * A BATCHED DECODE runs these five packets too: at PLOW_DECODE_BATCH > 1 the decode
+         * program carries B independent sequences, and grouping by expert is what makes an
+         * expert's weights cross HBM once for every row that chose it — the memory-bound win of
+         * batching, and correct because MoE has no cross-row state. That object defines
+         * PLOW_MOE_PREFILL but NOT PLOW_BUCKET_PREFILL (it has no bucket ladder), so nesting
+         * these inside the bucket block left all 92 MoE layers falling through the dispatch
+         * `default:` and writing NOTHING — silently, since this interpreter does not trap.
+         *
+         * Every object that had these before defines both symbols, so hoisting them here is a
+         * no-op for all of them. */
+#if PLOW_MOE_PREFILL
+        /* MoE PREFILL (T>1) — the FFN half of an MLA-family prompt. Gated by its own flag, and
+         * not folded into PLOW_MLA_PREFILL, for the reason every other axis here has its own
+         * flag: this adds a second full MFMA GEMM body to a bucket that already sits at the
+         * 256/occ-2 cliff, and a Gemma or Qwen prefill object must not pay for it. Measured
+         * cost is reported in the build table. */
+        case PLOW_DOP_MOE_ROUTER_TOPK_PF:
+            d_moe_router_topk_pf((unsigned char*)TEN(0), (const bf16*)TEN(1),
+                                 (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr, in->i[1],
+                                 in->i[2], in->i[3], in->fj[0].f, in->i[4], slice, nblk,
+                                 (float*)sm->raw, in->i[6], in->i[7]);
+            break;
+        case PLOW_DOP_MOE_ALIGN_PF:
+            d_moe_align_pf((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
+                           (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2], slice,
+                           (unsigned*)sm->raw);
+            break;
+        /* i3 = weight encoding (0 bf16, 1 block-fp8, 2 MXFP4/A4W4) — a precision swap is a
+         * field change, not a re-emit. t6=row_partidx, t7=row_gate on DOWN; under A4W4 the GLU
+         * arm also takes t6 (so the fused bridge can skip pad rows) and t7 = the E8M0 scale
+         * rows it WRITES, since the bridge is its epilogue rather than a separate op. */
+        case PLOW_DOP_MOE_GROUP_GLU_PF:
+            d_moe_group_glu_pf((bf16*)TEN(0), (const bf16*)TEN(1),
+                               (const unsigned long long*)TEN(2),
+                               (const unsigned long long*)TEN(3), (const int*)TEN(4),
+                               (const unsigned*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[3],
+                               in->i[5], slice, nblk, in->fj[0].f, in->fj[1].f, sm->raw, nullptr,
+                               (const unsigned*)TEN(6), (unsigned char*)TEN(7));
+            break;
+        case PLOW_DOP_MOE_GROUP_DOWN_PF:
+            d_moe_group_down_pf((float*)TEN(0), (const bf16*)TEN(1),
+                                (const unsigned long long*)TEN(2),
+                                (const unsigned long long*)TEN(3), (const int*)TEN(4),
+                                (const unsigned*)TEN(6), (const float*)TEN(7), in->i[0], in->i[1],
+                                in->i[2], in->i[3], slice, nblk, sm->raw,
+                                (const unsigned char*)TEN(5));
+            break;
+        case PLOW_DOP_MOE_COMBINE_PF:
+            d_moe_combine_pf((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                             (const float*)TEN(3), in->i[0], in->i[1], in->i[2], slice, nblk);
+            break;
+#endif
         default: /* PLOW_DOP_NOP */
             break;
     }

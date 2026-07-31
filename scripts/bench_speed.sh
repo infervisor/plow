@@ -19,9 +19,10 @@
 #   $1 assets  $2 port  $3 model (or `auto`)  [$4 ready-timeout]
 #
 #   IN_LENS  prompt lengths in tokens, space separated (default "128 1024 4096")
-#   CONCS    concurrencies (default 1) — K3 decode is structurally batch-1 (the KDA recurrent
-#            state has no batch axis), so anything above 1 measures QUEUEING, not batching.
-#            The harness prints that warning itself rather than letting a reader assume otherwise.
+#   CONCS    concurrencies (default 1). Whether concurrency measures BATCHING or merely QUEUEING
+#            depends on the packet: a blob emitted at PLOW_DECODE_BATCH=B advances B sequences
+#            per dispatch, one emitted at 1 advances one and the rest wait. The harness reads the
+#            engine's batch off /v1/models rather than assuming either way.
 #   NPROMPT  requests per cell (default 8)
 #   OUTLEN   completion tokens (default 128)
 set -u
@@ -60,6 +61,13 @@ python3 - <<'PY'
 import json, os, statistics as st, threading, time, urllib.request, queue
 
 MODEL=os.environ["MODEL"]; PORT=os.environ["PORT"]
+# The packet's decode batch, so the harness can say whether concurrency batched or queued
+# instead of asserting one. Absent on an older server: report unknown rather than guess.
+try:
+    _m=json.loads(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/v1/models", timeout=10).read())
+    BATCH=int(next((d.get("batch") for d in _m.get("data",[]) if d.get("batch")), 0)) or 0
+except Exception:
+    BATCH=0
 IN_LENS=[int(x) for x in os.environ["IN_LENS"].split()]
 CONCS=[int(x) for x in os.environ["CONCS"].split()]
 NPROMPT=int(os.environ["NPROMPT"]); OUTLEN=int(os.environ["OUTLEN"])
@@ -120,6 +128,13 @@ for il in IN_LENS:
         print(f"{il:>7}{c:>6}{len(res):>4}{st.mean(ttfts) if ttfts else 0:>10.1f}"
               f"{st.median(ttfts) if ttfts else 0:>10.1f}{st.mean(tpots) if tpots else 0:>9.2f}"
               f"{p99:>9.2f}{ntok/wall:>11.1f}{len(res)/wall:>8.2f}")
-        if c > 1:
-            print(f"{'':>7}  ^ conc>1 on a batch-1 engine measures QUEUEING, not batching")
+        if c > 1 and BATCH == 0:
+            # /v1/models does not report the packet's decode batch, so this harness CANNOT say
+            # whether concurrency batched or queued. It used to assert batch-1 unconditionally,
+            # which was true when written and is now wrong for any PLOW_DECODE_BATCH>1 packet —
+            # a stale claim in the output is worse than no claim.
+            print(f"{'':>7}  ^ conc>1: batching vs queueing is UNKNOWN here — the server does not"
+                  f" report its decode batch. Check the packet's PLOW_DECODE_BATCH.")
+        elif c > BATCH > 1:
+            print(f"{'':>7}  ^ conc {c} exceeds the packet's batch {BATCH}; the excess queues")
 PY

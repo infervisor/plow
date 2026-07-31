@@ -331,7 +331,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dump_logits,
         } => {
             if tp > 1 {
-                amd_bench_tp(blob, hsaco, checkpoint, prompt, steps, ctx, tp, dump_logits)
+                amd_bench_tp(
+                    blob, hsaco, checkpoint, prompt, steps, ctx, tp, batched, dump_logits,
+                )
             } else {
                 amd_bench(blob, hsaco, checkpoint, prompt, steps, ctx, batched, dump_logits)
             }
@@ -664,6 +666,7 @@ fn amd_bench_tp(
     steps: u32,
     ctx: u32,
     tp: u32,
+    batched: bool,
     dump_logits: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::exec::amd_tp::AmdTpGroup;
@@ -701,6 +704,89 @@ fn amd_bench_tp(
         std::fs::write(dir.join(format!("logits_{tag}.bin")), &buf)?;
         Ok(())
     };
+
+    // BATCHED TP — the arm `scripts/k3_batch_gate.sh` drives. K3 is TP8-only, so without this
+    // the gate has nothing to run against and the two refusals could never be retired on
+    // evidence.
+    //
+    // Its output format is load-bearing: one `  [id, id, ...]` line PER SLOT, which is exactly
+    // the shape the scalar arm below prints for its single stream. The gate compares slot `s` of
+    // a batched run against a solo B=1 run of the same prompt, so the two must be printed
+    // identically or the comparison is between a chain and a formatting difference.
+    if batched {
+        let b = g.rank(0).batch();
+        let prompts: Vec<Vec<u32>> = match &prompt {
+            None => Vec::new(),
+            Some(p) => p
+                .split(';')
+                .map(|one| {
+                    one.split(',')
+                        .map(|s| s.trim().parse::<u32>())
+                        .collect::<std::result::Result<Vec<u32>, _>>()
+                })
+                .collect::<std::result::Result<_, _>>()?,
+        };
+        if prompts.is_empty() {
+            return Err("--batched on TP needs --prompt: without one every slot decodes over KV \
+                        nobody wrote, and agreement between slots is then a statement about VRAM \
+                        history rather than about batching"
+                .into());
+        }
+        println!("\nbatched TP decode: {b} sequences per dispatch, {} ranks", g.n_gpu());
+
+        let mut pos_v: Vec<u32> = vec![0; b];
+        let mut feed: Vec<u32> = vec![0; b];
+        for s in 0..b {
+            let ids = &prompts[s % prompts.len()];
+            // Prefill is single-sequence on every rank; `prefill_slot` rebases the whole group's
+            // KV pointer tables onto slot `s` for the duration and restores them after, so each
+            // slot's cache is genuinely populated by this run.
+            let tok = AmdTpGroup::agree(&g.prefill_slot(s, ids)?)?;
+            println!("  slot {s}: prefill {} tokens -> sampled {tok}", ids.len());
+            pos_v[s] = ids.len() as u32;
+            feed[s] = tok;
+        }
+
+        let mut chains: Vec<Vec<u32>> = vec![Vec::new(); b];
+        let t = std::time::Instant::now();
+        for _ in 0..steps {
+            // SEED EVERY ROW EXPLICITLY. Prefill is single-sequence and writes `in.ids[0]` only,
+            // so rows 1.. still hold whatever the last prefill left there; and after a step the
+            // device has written all B rows itself, but re-seeding from the host chain keeps the
+            // fed id and the recorded chain provably the same value.
+            g.seed_ids(&feed)?;
+            let kv: Vec<u32> = pos_v.iter().map(|x| x + 1).collect();
+            let out = g.decode_step_batched(&pos_v, &kv)?;
+            dump(&g, &format!("b{:03}", chains[0].len()))?;
+            for s in 0..b {
+                chains[s].push(out[s]);
+                feed[s] = out[s];
+                pos_v[s] += 1;
+            }
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3 / steps as f64;
+        for c in &chains {
+            println!("  {c:?}");
+        }
+        println!(
+            "  {steps} batched steps: {ms:.3} ms/step, {:.1} tok/s AGGREGATE over {b} \
+             sequences ({:.1} tok/s per stream), all {} ranks token-identical",
+            b as f64 * 1e3 / ms,
+            1e3 / ms,
+            g.n_gpu()
+        );
+        // PACKET TRACE, on this path too. `--batched` used to return before the write at the end
+        // of this function, so `PLOW_TRACE_RAW` silently produced nothing at B > 1 — which is
+        // precisely where the attribution is unknown (the B-sweep fits
+        // `43.6 + 8.25*B ms` and neither term is attributed). An instrument that is unavailable
+        // exactly where the question is is not an instrument.
+        if let Some(p) = std::env::var_os("PLOW_TRACE_RAW") {
+            let p = PathBuf::from(p);
+            g.rank(0).trace_write(&p)?;
+            println!("packet trace -> {}", p.display());
+        }
+        return Ok(());
+    }
 
     // A prompt makes this a real greedy decode from position 0. Without one,
     // decode starts mid-context over KV rows nobody wrote — the timing is

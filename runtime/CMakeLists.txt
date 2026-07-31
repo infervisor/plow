@@ -708,6 +708,27 @@ if(PLOW_GFX950_HSACO)
     # K3 row would make bf16 packets silently miss their dispatch case.
     set(_hs_ax_k3_fp8kv ${_hs_ax_k3} ${_hs_ax_fp8kv})
     set(_hs_ax_mla_k3_fp8kv ${_hs_ax_mla_k3} ${_hs_ax_fp8kv})
+    # A BATCHED DECODE OBJECT ALSO NEEDS THE GROUPED EXPERT ARMS. At PLOW_DECODE_BATCH > 1 the
+    # decode program carries B independent sequences, and devgen emits the SAME grouped chain a
+    # prefill bucket uses (ops 83-87) — correctly, because MoE has no cross-row state and grouping
+    # by expert is what makes an expert's weights cross HBM once for every row that chose it,
+    # which is the entire memory-bound win of batching.
+    #
+    # Those five packets are behind PLOW_MOE_PREFILL. Without it they fall through the dispatch
+    # `default:` and write NOTHING — silently, on all 92 MoE layers, leaving output that is finite
+    # and plausible and wrong. This is the same trap the comment below spells out for
+    # `interp_prefill_k3`, one object over.
+    #
+    # Gated on the batch so a B=1 object is byte-identical: at one row grouping buys nothing, and
+    # adding arms grows the register union (interp_decode_fp8kv_k3 is VGPR=248 / occ=2 / spill=0
+    # and that headroom is not spare).
+    set(_hs_ax_k3_dec ${_hs_ax_k3})
+    set(_hs_ax_k3_dec_fp8kv ${_hs_ax_k3_fp8kv})
+    if(PLOW_DECODE_BATCH GREATER 1)
+        set(_hs_ax_k3_dec ${_hs_ax_k3_dec} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1)
+        set(_hs_ax_k3_dec_fp8kv
+            ${_hs_ax_k3_dec_fp8kv} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1)
+    endif()
     # ...and the FFN half. A K3 prefill bucket runs the GROUPED expert chain (ops 83-87), not the
     # per-slot decode ops: at T rows an expert's weights cross HBM once for every token that chose
     # it. Without PLOW_MOE_PREFILL those five packets fall through the dispatch `default:` and
@@ -827,14 +848,14 @@ if(PLOW_GFX950_HSACO)
     # error — and because op_attention.h:1282 is why "it fits" was never the whole question.
     if(PLOW_HSACO_K3)
         list(APPEND _hs_rows
-            "interp_decode_k3|${_hs_kdec}|_hs_ax_decode|_hs_ax_k3|256|2"
+            "interp_decode_k3|${_hs_kdec}|_hs_ax_decode|_hs_ax_k3_dec|256|2"
             "interp_prefill_k3|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla_k3|256|2"
             "interp_prefill_k3_moe|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe|256|2"
             "interp_prefill_k3_moe_a4w4|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_a4w4|256|2")
         if(PLOW_HSACO_FP8KV)
             # Variant precedes the model arm in object_name(): interp_*_fp8kv_k3{,_moe...}.
             list(APPEND _hs_rows
-                "interp_decode_fp8kv_k3|${_hs_kdec}|_hs_ax_decode|_hs_ax_k3_fp8kv|256|2"
+                "interp_decode_fp8kv_k3|${_hs_kdec}|_hs_ax_decode|_hs_ax_k3_dec_fp8kv|256|2"
                 "interp_prefill_fp8kv_k3|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla_k3_fp8kv|256|2"
                 "interp_prefill_fp8kv_k3_moe|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_fp8kv|256|2"
                 "interp_prefill_fp8kv_k3_moe_a4w4|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_a4w4_fp8kv|256|2")

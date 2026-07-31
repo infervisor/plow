@@ -12,6 +12,7 @@
 #   N          questions (default 200; the full test split is 1319)
 #   SHOTS      few-shot exemplars (default 8 — the standard GSM8K setting)
 #   MAXTOK     generation cap per question (default 320)
+#   CONC       in-flight requests (default 1); >1 is what tests a BATCHED packet end to end
 #   TEMP       sampling temperature (default 0 — greedy, so the run is reproducible)
 #   GSM8K      path to a local `test.jsonl`; else it is fetched once to $CACHE
 #   CACHE      dataset cache dir (default /home/lava/models/gsm8k)
@@ -37,6 +38,7 @@ set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ASSETS="${1:?assets dir}"; PORT="${2:?port}"; MODEL="${3:?model slug}"; READY="${4:-1800}"
 N="${N:-200}"; SHOTS="${SHOTS:-8}"; MAXTOK="${MAXTOK:-320}"; TEMP="${TEMP:-0}"
+CONC="${CONC:-1}"
 CACHE="${CACHE:-/home/lava/models/gsm8k}"
 BIN="${PLOWRT_BIN:-$WT/target/release/plowrt}"
 
@@ -90,12 +92,13 @@ GATE=$(curl -s --max-time 300 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'C
 echo "$GATE" | grep -qi paris || { echo ">>> coherence gate FAIL — accuracy below would be meaningless"; echo "$GATE" | head -c 500; exit 1; }
 echo ">>> coherence gate: PASS"
 
-N="$N" SHOTS="$SHOTS" MAXTOK="$MAXTOK" TEMP="$TEMP" MODEL="$MODEL" PORT="$PORT" \
+N="$N" SHOTS="$SHOTS" MAXTOK="$MAXTOK" TEMP="$TEMP" MODEL="$MODEL" PORT="$PORT" CONC="$CONC" \
 DATA="$DATA" TRAIN="$TRAIN" python3 - <<'PY'
-import json, os, re, sys, time, urllib.request
+import json, threading, queue, os, re, sys, time, urllib.request
 
 N=int(os.environ["N"]); SHOTS=int(os.environ["SHOTS"]); MAXTOK=int(os.environ["MAXTOK"])
 TEMP=float(os.environ["TEMP"]); MODEL=os.environ["MODEL"]; PORT=os.environ["PORT"]
+CONC=int(os.environ.get("CONC","1"))
 URL=f"http://127.0.0.1:{PORT}/v1/chat/completions"
 
 def load(p):
@@ -122,29 +125,60 @@ for s in shots:
     preamble.append({"role": "user", "content": s["question"]})
     preamble.append({"role": "assistant", "content": s["answer"].replace("####", "The answer is")})
 
+# CONC IN-FLIGHT REQUESTS. At CONC=1 this is the original sequential harness, question for
+# question. Above 1 it is also the ONLY way this file tests a BATCHED packet: a sequential client
+# keeps ONE slot live and the other B-1 idle, so it would exercise the batched decode PROGRAM
+# without ever exercising batching. Accuracy must not move with CONC — if it does, sequences are
+# contaminating each other, which is what scripts/k3_batch_gate.sh guards at the token level and
+# what this catches end to end.
+#
+# Greedy (TEMP=0) keeps each answer independent of the others' timing, so only the ORDER of
+# completion varies with CONC, never a completion.
 ok = bad = err = 0
 t0 = time.time()
 lat = []
+lock = threading.Lock()
+work = queue.Queue()
 for i, q in enumerate(test):
-    msgs = preamble + [{"role": "user", "content": q["question"]}]
-    body = json.dumps({"model": MODEL, "messages": msgs,
-                       "max_tokens": MAXTOK, "temperature": TEMP}).encode()
-    req = urllib.request.Request(URL, body, {"Content-Type": "application/json"})
-    ts = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=900) as r:
-            out = json.load(r)["choices"][0]["message"]["content"]
-    except Exception as e:
-        err += 1; print(f"  [{i}] REQUEST ERROR {e}", flush=True); continue
-    lat.append(time.time() - ts)
-    got, want = final_number(out), gold(q["answer"])
-    try:
-        hit = got is not None and abs(float(got) - float(want)) < 1e-4
-    except ValueError:
-        hit = (got == want)
-    ok += hit; bad += (not hit)
-    if (i + 1) % 10 == 0 or i == 0:
-        print(f"  [{i+1}/{len(test)}] acc={ok/(ok+bad):.3f}  last: got={got} want={want}", flush=True)
+    work.put((i, q))
+
+def run_one():
+    global ok, bad, err
+    while True:
+        try:
+            i, q = work.get_nowait()
+        except queue.Empty:
+            return
+        msgs = preamble + [{"role": "user", "content": q["question"]}]
+        body = json.dumps({"model": MODEL, "messages": msgs,
+                           "max_tokens": MAXTOK, "temperature": TEMP}).encode()
+        req = urllib.request.Request(URL, body, {"Content-Type": "application/json"})
+        ts = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=1800) as r:
+                out = json.load(r)["choices"][0]["message"]["content"]
+        except Exception as e:
+            with lock:
+                err += 1
+                print(f"  [{i}] REQUEST ERROR {e}", flush=True)
+            continue
+        dt = time.time() - ts
+        got, want = final_number(out), gold(q["answer"])
+        try:
+            hit = got is not None and abs(float(got) - float(want)) < 1e-4
+        except ValueError:
+            hit = (got == want)
+        with lock:
+            lat.append(dt)
+            ok += hit; bad += (not hit)
+            done = ok + bad
+            if done % 10 == 0 or done == 1:
+                print(f"  [{done}/{len(test)}] acc={ok/done:.3f}  last: got={got} want={want}",
+                      flush=True)
+
+threads = [threading.Thread(target=run_one) for _ in range(CONC)]
+for t in threads: t.start()
+for t in threads: t.join()
 
 n = ok + bad
 print()

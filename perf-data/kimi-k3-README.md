@@ -283,3 +283,237 @@ ANY edit under `runtime/amd/*` moves the build digest and stales EVERY record at
 which is exactly what it reports when nothing was ever measured.
 `cargo test -p devgen --test tuned_tile_selection` is the signal (fails 2/4).
 `scripts/rebench_tune_gemm_all.sh` is the fix, and it needs a quiet GPU.
+
+---
+
+# 11. SERVING BRING-UP — batched decode, chunked prefill, interleave, prefix cache
+
+Everything in §0-§10 describes K3 as a **single-sequence decode engine** driven by `amd-bench`.
+This section is the serving path: what `plowrt serve` now does, how to turn each piece on, and what
+each one measured. Branch `k3-batched-decode`.
+
+## 11.0 The shape of it, in one table
+
+| capability | how it is turned on | default | what it bought (MEASURED) |
+|---|---|---|---|
+| **batched decode** | `PLOW_DECODE_BATCH=B` at EMIT (hsaco must match) | B=1 | 91.3 tok/s aggregate at B=16 vs 34.5 at B=1 |
+| **prefill + decode interleave** | on; `PLOW_PF_NO_INTERLEAVE=1` disables | on | TTFT median **3.0x** |
+| **chunked prefill** | on; `PLOW_PF_NO_CHUNK=1` disables | on | ITL p99 **-26%**, TTFT median 1.34x, throughput -4.9% |
+| **prefix cache** | `PLOW_PREFIX_CACHE=1` | off | 20% less wall at full hit; TTFT median 1.92x at 75% hit |
+| **per-row parked mask** | automatic on a batched blob | on | correctness: idle rows stop advancing their recurrence |
+
+Composed (chunked prefill + prefix cache), GSM8K B=4/CONC=4: **758 s -> 561 s, 26% less wall**, at
+195/200 = 0.9750 with zero request errors.
+
+## 11.1 Emitting a batched blob
+
+`PLOW_DECODE_BATCH=B` makes the DECODE program carry **B independent sequences**, which is a
+different thing from a prefill bucket's `t` rows — see `k3-batched-decode-design.md` §1 for why the
+distinction is the whole problem. B is capped at 16 (`PLOW_GEMV_MAXM`).
+
+```bash
+nix develop --command bash -c "K3_FULL=1 PLOW_FP8_KV=1 PLOW_MXFP4=1 PLOW_DECODE_BATCH=4 \
+  ./target/release/plowc --hf-dir /home/lava/models/k3_farm --emit devblob --arch gfx950 \
+  --gpu mi350 --num-gpus 8 --parallel tp --max-ctx 32768 --n-cu 256 --out /home/lava/models/k3_b4"
+```
+
+Expect `2942 decode instructions` and `2916 tensors` at B>1 (against 2459 / 5411 at B=1 — the
+decode program is a different program, not the same one with a bigger `t`).
+
+**THE HSACO MUST MATCH THE BLOB.** `PLOW_DECODE_BATCH` sizes `PLOW_GEMV_MM` in the kernels as well
+as `t` in the packet, so a B=4 blob on a B=1 object is a wrong-answer configuration, not a slow one:
+
+```bash
+cmake -S runtime -B ba_b4 -DPLOW_DECODE_BATCH=4 ...   # then
+nix develop --command env -u LD_LIBRARY_PATH cmake --build ba_b4 -j 16
+```
+
+`B=1 is byte-identical to the pre-batch blob` — md5 `7db2fbb34230050f0508a4e706523a98`. That
+invariant is checked at every step of this work and is the fastest way to tell whether an emitter
+change leaked into the shipped configuration.
+
+## 11.2 Serving
+
+```bash
+perf-data/harness/gpulease -n 8 serve sg render -c \
+  "PLOW_L2_PLACE_DISPATCH=1 nix develop --command ./target/release/plowrt serve \
+   --assets /home/lava/models/k3_b4 --port 8000"
+```
+
+`sg render -c` is load-bearing, not decoration: `/dev/kfd` is `root:render 0660`, and a shell
+without the `render` group gets `hsa_init failed: 4104` and **silently falls back to the CPU
+backend**. The harnesses' coherence gate is what catches it.
+
+## 11.3 What a serving tick does now
+
+The AMD tick used to be **prefill XOR decode** — it ran one whole prompt and `return`ed, so every
+live decode stream stalled for the duration of someone else's prefill. It now does both, in this
+order:
+
+1. **One prefill CHUNK** for the lowest pending slot (not the whole prompt).
+2. **One decode dispatch** advancing every live slot.
+
+Prefill runs first so the new slot's first token is already in `out_ids` when the decode's feed list
+is built, and it decodes in the same tick rather than waiting for the next one.
+
+Three invariants hold it together, and they are the interesting part:
+
+* **`prefill_slot` restores KV base 0 before returning**, and `decode_step_batched` refuses a
+  non-zero base. The decode cannot run rebased onto a slot.
+* **A mid-prefill slot is PARKED.** A decode dispatch advances all B rows because `t` is compiled,
+  which is harmless for an append-only KV cache and fatal for the KDA recurrence. `in.parked`
+  (non-zero = skip) is published as `!live[s]`, so a half-prefilled slot's recurrence does not move.
+  The sense is "parked" rather than "active" so that an all-zero or never-written mask means *every
+  row participates* — `amd-bench` never publishes one.
+* **A mid-prefill slot is fed `pos = frontier`**, the row its next chunk overwrites anyway, so the
+  dispatch's KV write cannot clobber the prefix already built.
+
+## 11.4 Chunked prefill
+
+A prompt is covered by the compiled bucket ladder `[128, 512, 1024, 2048, 4096, 8192]` via a
+cost-minimising DP that trades padding against launch count (`plan_chunks`). A 1038-token prompt
+plans as **2 chunks**, not 1 — check the server log, which prints
+`TP prefill plan tokens=1038 chunks=2`.
+
+The mux advances **one chunk per tick**. That is a TAIL-LATENCY feature and should be quoted as
+one: it buys a decode stream the right to wait for one chunk instead of a whole prompt, and pays
+for it in extra dispatches and less efficient tiles.
+
+| B=16, `IN_LENS=1024 CONCS=16 NPROMPT=64` | TTFT med | ITL p99 | out tok/s |
+|---|--:|--:|--:|
+| whole-prompt prefill | 2435.0 ms | 1530.3 | 41.1 |
+| chunked prefill | **1818.4 ms** | **1132.2** | 39.1 |
+
+Falls back to whole-prompt where there is no ladder to walk: single-GPU, `decode_only`, or a
+1-token prompt.
+
+## 11.5 Prefix cache
+
+`PLOW_PREFIX_CACHE=1`. Per slot, keep the last prompt plus a checkpoint of that slot's **carried
+recurrent state**; a later prompt agreeing over that span restores the recurrence and prefills only
+the suffix. The KV rows are already the slot's own.
+
+The design and the general problem — why prefix caching, paged attention and speculative decoding
+all assume positional state, and what changes when 69 of 93 layers keep a *folded* state instead —
+are written up separately in **`perf-data/k3-prefix-cache-design.md`**. Read that before changing
+anything here.
+
+Operationally: 56 MiB per slot per rank, allocated lazily on first arm (a workload with no shared
+prefixes never allocates), ~3.7 ms to snapshot or restore, about **1% of wall**
+(`PLOW_PFX_LOG=1`). Composes with chunking.
+
+## 11.6 Correctness gates for this path
+
+Run these before believing any serving number:
+
+```bash
+# 1. Semantic gate: does batching contaminate slots?
+./scripts/k3_batch_gate.sh /home/lava/models/k3_b4 <hsaco> /home/lava/models/k3_farm 4 \
+                           /home/lava/models/k3_b16 <hsaco16>
+#    check A: B copies of one prompt -> B identical streams
+#    check B: B ragged prompts -> same per-slot streams at a SECOND batch width
+#    NOTE it compares two BATCHED widths, never batched-vs-solo: a batched decode routes MoE
+#    through the GROUPED expert kernel and B=1 through the per-slot one, so they accumulate in
+#    different orders and greedy decoding turns any tie into a different token a few steps later.
+
+# 2. Accuracy gate: 8-shot GSM8K end to end
+N=200 CONC=4 ./scripts/bench_gsm8k.sh /home/lava/models/k3_b4 8000 auto 1800
+```
+
+Expect **~97-98%**. Anything materially below that is a per-sequence state bug, not sampling noise —
+which is exactly how the missing `begin_slot` on the TP path was found (81.0% -> 98.0% when fixed).
+
+## 11.7 Two failure modes that look like something else
+
+* **`cargo test --workspace` silently strips `--features hsa`.** The next GPU run then reports
+  `hsa=false` and the gate fails in a way indistinguishable from a correctness break. Always
+  `cargo build --release -p plowrt --features hsa` after a workspace test. Hit twice.
+* **A 500 from `serve` at B>1 kills every in-flight request at once**, because they share the decode
+  step. A burst of exactly B failures is ONE event. The known open one is a rare cross-rank
+  divergence in `d_xargmax_fin_mega` (~1 request in 200) — `k3-batched-decode-design.md` §9.
+
+---
+
+# 12. LONG CONTEXT — 250K tokens, measured end to end
+
+`--max-ctx 262144` at emit. **The whole model runs**: prefill, all 93 layers, decode, and a
+coherent answer that demonstrably read the prompt.
+
+## 12.1 What was measured
+
+| packet | prompt tokens | wall | prefill tok/s | output |
+|---|--:|--:|--:|---|
+| B=1, max_ctx 256K | **200,019** | 227.5 s | 879 | coherent, context-aware |
+| B=1, max_ctx 256K | **250,014** | 329.1 s | 760 | coherent, context-aware |
+| **B=4**, max_ctx 256K | **250,014** | 325.2 s | 769 | coherent, context-aware |
+
+The completion is the evidence that this is a real long-context run and not an allocation test.
+Fed ~1.2 MB of `"the quick brown fox jumps over the lazy dog"`, K3 answers:
+
+```
+I see you've shared the classic pangram "the quick brown fox jumps over the
+```
+
+It identified the content of a 250,000-token prompt. Driven through `plowrt serve`, so this is the
+serving path with chunked prefill, not a bench harness.
+
+## 12.2 Emitting and running it
+
+```bash
+nix develop --command bash -c "K3_FULL=1 PLOW_FP8_KV=1 PLOW_MXFP4=1 ./target/release/plowc \
+  --hf-dir /home/lava/models/k3_farm --emit devblob --arch gfx950 --gpu mi350 \
+  --num-gpus 8 --parallel tp --max-ctx 262144 --n-cu 256 --out /home/lava/models/k3_256k"
+```
+
+Nothing else changes. The bucket ladder is unaffected (`[128, 512, 1024, 2048, 4096, 8192]` at both
+32K and 256K), so a long prompt is simply more chunks of the same widths — a 250K prompt is ~31
+chunks of 8192.
+
+## 12.3 The memory arithmetic, and why K3 is a good long-context citizen
+
+DERIVED from the MEASURED 442 MB of MLA KV per sequence per rank at ctx 32000:
+
+| | MLA KV (24 layers) | KDA state (69 layers) | total / rank |
+|---|--:|--:|--:|
+| ctx 32K, B=1 | 0.45 GB | 0.44 GB | 0.89 GB |
+| ctx 256K, B=1 | 3.62 GB | **0.44 GB** | 4.06 GB |
+| ctx 256K, B=4 | 14.48 GB | **1.76 GB** | 16.24 GB |
+
+Against 191.2 GiB of weights on a 288 GB card, so **256K at B=4 uses ~207 of 288 GB and fits with
+room**.
+
+The interesting column is the middle one. **The KDA state does not grow with context at all** —
+69 of 93 layers cost a flat 0.44 GB per sequence whether the context is 5 tokens or 250,000. Only
+the 24 MLA layers scale. That is the architectural payoff of linear attention showing up exactly
+where it was supposed to: a dense 93-layer model at this context would pay the 3.62 GB figure
+almost four times over.
+
+It is also why the batch axis and the context axis trade so differently here: batch multiplies
+BOTH terms, context multiplies only one.
+
+## 12.4 Correctness
+
+The 256K blob is **token-identical to the 32K blob** on the same prompt at the same effective
+context — `1008,10484,318,15383,387` continues to
+`[13, 646, 12259, 387, 14868, 220, 5807, 6017, 1873, 13, 646, 7695, 5793, 387, 12516, 13]` under
+both, all 8 ranks agreeing. `max_ctx` changes tensor extents and `out_stride`, not arithmetic.
+
+## 12.5 THE COST, which is real and is NOT the context you use
+
+A bigger `max_ctx` costs decode throughput even when the context is empty:
+
+| max_ctx | ms/token at an effective ctx of 5 | tok/s |
+|---|--:|--:|
+| 32,768 | 33.522 | 29.8 |
+| **262,144** | **42.575** | **23.5** |
+
+**+27% per token for a context neither run used.** Same hsaco, same prompt, same everything except
+the compiled extent. The KV tensors are 8x larger and `out_stride` is `ctx`, so every KV write is
+spread across a much larger address range — a TLB and cache-locality cost, not an arithmetic one.
+
+**So do not emit at 256K by default.** Emit at the context you serve. If you need both, emit both
+blobs; they are 211 MB each and the emit takes 3.4 s.
+
+This is the largest un-chased item this section leaves behind: nothing here has tried to make the
+long-context blob's decode as fast as the short one's, and the 27% is a measurement rather than a
+diagnosis.

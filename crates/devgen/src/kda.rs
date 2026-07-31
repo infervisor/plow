@@ -132,7 +132,21 @@ impl KdaCfg {
     /// count. At TP8 (12 heads) a fixed `BV=16` gives 96 items and 37.5%; `BV=8` restores 192.
     /// `BV` is a loop bound, not a register constraint, which is why it is an immediate.
     pub fn state_step_blocks(&self, n_cu: u32) -> u32 {
-        let items = self.proj() / self.bv;
+        self.state_step_blocks_rows(n_cu, 1)
+    }
+
+    /// [`KdaCfg::state_step_blocks`] when the program's `rows` are INDEPENDENT SEQUENCES.
+    ///
+    /// The kernel folds that row axis into its work-item map (`bstride != 0` in
+    /// `d_kda_state_step_t`), because nothing in row `t`'s recurrence reads row `t-1`'s. So the
+    /// item count is `rows * H * ntile`, not `H * ntile`, and the packet has to be WIDE enough to
+    /// expose it — at TP8/BV=8 the un-scaled count is 192 of 256 CUs, and a B=16 decode was
+    /// running 16 rows serially inside those same 192 workgroups on 69 of 93 layers.
+    ///
+    /// `rows = 1` reproduces the old count exactly, so every prefill bucket and every B=1 decode
+    /// is byte-identical.
+    pub fn state_step_blocks_rows(&self, n_cu: u32, rows: u32) -> u32 {
+        let items = (self.proj() / self.bv).saturating_mul(rows.max(1));
         items.min(n_cu).max(1)
     }
 }
@@ -530,7 +544,7 @@ fn emit_kda_mixer_ex(
     // `Gemv` at t == 1, a tiled GEMM above it — see [`crate::k3::emit_k3_linear`]. The seam is
     // here rather than at the call sites because all eight projections take it.
     let gemv = |b: &mut Builder, out: u32, row: u32, wt: u32, n: u32, k: u32, dep: u32| {
-        crate::k3::emit_k3_linear(b, out, row, wt, t, n, k, n_cu, &[dep])
+        crate::k3::emit_k3_linear(b, out, row, wt, t, n, k, n_cu, seq_rows, &[dep])
     };
     // P1-P4 collapse into ONE packet along the OUTPUT axis. See [`fuse_qkvg`] for why that is the
     // safe direction and the LDS bound that decides it; P5/P6 stay separate because their weights
@@ -574,7 +588,9 @@ fn emit_kda_mixer_ex(
     // P8/P9/P10 — the K3-specific chain, SIX packets decomposed and THREE fused. `fuse_kda`
     // argues the direction; both spellings of the graph are emitted from here so the fusion stays
     // falsifiable against the same program.
-    let nb = c.state_step_blocks(n_cu);
+    // Rows are a parallel axis only when they are independent sequences; a prefill bucket's rows
+    // thread through one state and must stay serial, so it keeps the un-scaled count.
+    let nb = c.state_step_blocks_rows(n_cu, if seq_rows { t } else { 1 });
     let cus: Vec<u32> = (0..nb).collect();
     let gate_mode = u32::from(c.gate_lower_bound.is_some());
     let lower_bound = c.gate_lower_bound.unwrap_or(0.0);
@@ -585,6 +601,24 @@ fn emit_kda_mixer_ex(
         // P8 — ONE conv over the 3*H*D concatenated channel axis, still all 256 CUs, with the
         // per-CU channel count RISING 3x. The three streams keep separate buffers; the op takes
         // twelve pointers and four of them ride in `i[]`.
+        // PER-ROW PARKED MASK, `[t]` u32, NON-ZERO = skip this row's recurrence.
+        //
+        // The sense is "parked", not "active", and that is a safety property rather than a
+        // preference: an unwritten or zeroed tensor then means EVERY ROW PARTICIPATES, which is
+        // the pre-mask behaviour. With the opposite sense a caller that forgot to upload the
+        // mask -- `amd-bench` drives the engine directly and has no reason to know about it --
+        // would silently park every row and produce fluent garbage.
+        //
+        // Only a sequence-rows program has one: its `t` rows are INDEPENDENT sequences, and a
+        // decode dispatch advances every row whether or not the server has work for it. That is
+        // harmless for an append-only KV cache (an idle row rewrites a row nothing reads) and NOT
+        // harmless for the recurrence, which reads and writes `state[row]` unconditionally — so a
+        // slot in the middle of a chunked prefill would have its recurrence advanced by a garbage
+        // token the moment any other slot decoded. The mask is what lets the host freeze a row.
+        //
+        // Declared here rather than threaded through the signature: the builder dedups by name,
+        // so this returns the one `in.active` no matter how many layers ask for it.
+        let parked = if seq_rows { b.tensor("in.parked", 4 * t as u64) } else { 0 };
         let c_conv = b.emit(DevOp::KdaConv3, all.clone(), &[c_q, c_k, c_v], |d| {
             d.t[0] = mix[0];
             d.t[1] = mix[1];
@@ -606,6 +640,9 @@ fn emit_kda_mixer_ex(
             d.i[5] = st.conv_state[0];
             d.i[6] = st.conv_state[1];
             d.i[7] = st.conv_state[2];
+            // `j[1]` (= `fj[2]`), the last free slot on this op. Read only when `j[0] != 0`,
+            // which is exactly the seq-rows condition, so a non-batched blob is unchanged.
+            d.j[1] = parked;
         });
         // P9+P10 — the gate is computed inside the recurrence's LDS staging, where its only
         // consumer already is. `blocks` is the SAME `cus` the unfused step takes; that is the
@@ -630,6 +667,10 @@ fn emit_kda_mixer_ex(
             d.i[4] = 1 | if seq_rows { 2 } else { 0 };
             d.i[5] = w.dt_bias;
             d.i[6] = gate_mode;
+            // `i[7]`, the one free integer slot. Read only when the flags word carries
+            // PLOW_KDA_F_SEQ_ROWS, so leaving it 0 on a non-batched blob keeps that blob
+            // byte-identical (0 is a valid tensor index, hence the flag rather than a sentinel).
+            d.i[7] = parked;
             d.f[0] = scale;
             d.f[1] = lower_bound;
         })

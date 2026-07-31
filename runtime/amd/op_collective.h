@@ -339,7 +339,17 @@ __device__ __forceinline__ void d_xreduce_mega(
  * an op that runs after the whole FFN).
  *
  * `val_id` must NOT be the arrival gate's id: the gate is an atomic counter.
- * Batch is capped at 16 by the 128-byte line; decode here is B=1.
+ * Batch is capped at 16 by the 128-byte line: `n_batch` packed keys of 8 B each must fit one
+ * PLOW_CTR_STRIDE counter, so 16*8 = 128 B is exact. `PLOW_XAMAX_MAX_BATCH` and the emitter's
+ * matching assert (k3.rs, XArgmaxFin) are the two halves of that bound.
+ *
+ * KNOWN, UNRESOLVED (perf-data/k3-batched-decode-design.md §9): a GSM8K run at B=4 hit ONE
+ * cross-rank disagreement in ~1e4-1e5 steps where two ranks folded DIFFERENT winners that both
+ * lay in the same rank's vocab shard — i.e. a peer's read of a published `myv[b]` did not match
+ * what the publisher folded. Not a deadline bail (that would surface an id from the bailing
+ * rank's OWN shard). The host-side agreement check in `decode_step_batched` is what catches it.
+ * Passing a real pointer for `status` below, instead of the `nullptr` every call site uses, is
+ * the missing instrument.
  *
  * On deadline the rank keeps its LOCAL argmax rather than hanging the queue — the same
  * bail discipline (and the same silent-wrongness) as d_xreduce_mega's. */

@@ -98,6 +98,19 @@ pub trait EngineDevice: Send + Sync + 'static {
     fn download(&self, src: &DeviceMem, off: u64, dst: &mut [u8]) -> Result<()>;
     fn memcpy_htod(&self, dptr: u64, src: &[u8]) -> Result<()>;
     fn memcpy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()>;
+    /// Many device-to-device copies under ONE completion wait.
+    ///
+    /// `memcpy_dtod` is create-signal / copy / BLOCKED-wait / destroy per call, which is the
+    /// right shape for one copy and the wrong shape for hundreds: a prefix-state snapshot is 276
+    /// separate tensors, so the per-copy synchronisation dominates the bytes by orders of
+    /// magnitude. Backends that can issue N copies against a single signal should override this.
+    /// `pairs` is `(dst, src, bytes)`.
+    fn memcpy_dtod_batch(&self, pairs: &[(u64, u64, u64)]) -> Result<()> {
+        for &(dst, src, bytes) in pairs {
+            self.memcpy_dtod(dst, src, bytes)?;
+        }
+        Ok(())
+    }
     fn host_alloc_pinned(&self, bytes: usize) -> Result<Self::Pinned>;
 
     /// Fill `n` bytes at `dptr` with `value`.

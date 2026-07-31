@@ -722,9 +722,10 @@ pub fn emit_k3_linear(
     n: u32,
     k: u32,
     n_cu: u32,
+    seq_rows: bool,
     deps: &[u32],
 ) -> u32 {
-    emit_k3_linear_norm(b, out, x, wt, t, n, k, n_cu, None, deps)
+    emit_k3_linear_norm(b, out, x, wt, t, n, k, n_cu, seq_rows, None, deps)
 }
 
 /// [`emit_k3_linear`] with the option of ABSORBING the [`DevOp::RmsNorm`] that produced `x`.
@@ -746,11 +747,22 @@ pub fn emit_k3_linear_norm(
     n: u32,
     k: u32,
     n_cu: u32,
+    seq_rows: bool,
     fold: Option<(u32, f32)>,
     deps: &[u32],
 ) -> u32 {
     let all: Vec<u32> = (0..n_cu).collect();
-    let op = if t == 1 {
+    // A BATCHED DECODE TAKES THE GEMV ARM, and `t == 1` alone does not say so.
+    //
+    // `PLOW_GEMV_MM = next_pow2(PLOW_DECODE_BATCH)` clamped to 16 is exactly the compile-time row
+    // bucket that makes `Gemv` carry B rows — it exists FOR this case, which is also why the
+    // hsaco's PLOW_DECODE_BATCH must match the emit's. Falling through to a tiled prefill rung at
+    // `t = B` instead is wrong twice over: those opcodes are PREFILL arms, and a decode program
+    // runs on the DECODE object, where AMD's dispatch `default:` writes NOTHING rather than
+    // trapping. The packet then leaves its output holding whatever the arena held — the run
+    // completes, every row is finite and plausible, and every row is wrong.
+    let gemv_arm = t == 1 || seq_rows;
+    let op = if gemv_arm {
         DevOp::Gemv
     } else {
         crate::gfx950_prefill_tile(t, n, k, n_cu, kernelcaps::QuantScheme::None)
@@ -767,7 +779,7 @@ pub fn emit_k3_linear_norm(
     // kernel's own `per = ceil(n/nblk)` arithmetic, so every surviving workgroup's column range is
     // unchanged and the packet is bit-identical. Tiled prefill ops own TILES, not column runs, so
     // the rule applies to the GEMV arm only.
-    let blocks = if t == 1 { crate::mla::blocked_gemv_cus(&all, n) } else { all };
+    let blocks = if gemv_arm { crate::mla::blocked_gemv_cus(&all, n) } else { all };
     b.emit(op, blocks, deps, |d| {
         d.t[0] = out;
         d.t[1] = x;
@@ -984,6 +996,7 @@ pub fn emit_k3_latent_moe(
     out: u32,
     x: u32,
     t: u32,
+    seq_rows: bool,
     n_cu: u32,
     tp: &mut K3Tp,
     // `Some(p)` FOLDS the block-output residual into this block's own tail add, so `out` is the
@@ -1041,7 +1054,7 @@ pub fn emit_k3_latent_moe(
     let shd = bft(b, format!("{a}sh_down"), tt * hid as u64);
 
     let gemv = |b: &mut Builder, out: u32, row: u32, wt: u32, n: u32, k: u32, dep: u32| {
-        emit_k3_linear(b, out, row, wt, t, n, k, n_cu, &[dep])
+        emit_k3_linear(b, out, row, wt, t, n, k, n_cu, seq_rows, &[dep])
     };
 
     // Router — scores the HIDDEN state. `logit` is [T, n_exp] on both phases; only the top-k TAIL
@@ -1325,6 +1338,7 @@ pub fn emit_k3_latent_moe(
         up_n,
         lat,
         n_cu,
+        seq_rows,
         fold_ln.then_some((w.latent_norm, cb.eps)),
         &[c_ln],
     );
@@ -1405,7 +1419,7 @@ pub fn emit_k3_latent_moe(
     // slots are bound by literal name, `plowrt::exec::amd:2861-2862`) and a peer-region resize.
     let sh_dst = if tp.on() { tp.og } else { shd };
     let sh_deps: Vec<u32> = if tp.on() { vec![c_sa, c_cmb] } else { vec![c_sa] };
-    let mut c_sd = emit_k3_linear(b, sh_dst, sha, w.shared_down, t, hid, si_l, n_cu, &sh_deps);
+    let mut c_sd = emit_k3_linear(b, sh_dst, sha, w.shared_down, t, hid, si_l, n_cu, seq_rows, &sh_deps);
 
     // ONE COLLECTIVE FOR BOTH FFN HALVES, and the packet count is why it is one and not two.
     //
@@ -1614,7 +1628,14 @@ pub fn emit_k3_mla_mixer(
     // causal bound an early token's later splits cover nothing, and an empty split emits `l = 0`
     // for the merge to divide by (`d_flash_mla_prefill`'s header). Prefill already has
     // `n_tok * n_grp` work items and does not need the split to fill the machine.
-    let nsplit = if t == 1 { c.n_split } else { 1 };
+    //
+    // IT MUST TRACK `decode_arm` BELOW, not `t == 1`. A batched decode has `t > 1` and still takes
+    // the DECODE arm, which writes `n_split` splits per row — sizing these two buffers at
+    // `nsplit = 1` while the kernel writes `c.n_split` is a silent overrun, and it is silent
+    // twice over: the arena is contiguous, so the writes land in whatever tensor follows and the
+    // run completes with plausible garbage rather than faulting. This is the same
+    // "`t > 1` does not mean prefill" trap the arm selection below spells out, one buffer earlier.
+    let nsplit = if t == 1 || seq_rows { c.n_split } else { 1 };
     let opart = f32t(b, format!("{a}o_part"), tt * nh as u64 * dk as u64 * nsplit as u64);
     let mlpart = f32t(b, format!("{a}ml_part"), tt * nh as u64 * 2 * nsplit as u64);
     let oat = bft(b, format!("{a}o_attn"), tt * nhvd as u64);
@@ -1626,7 +1647,7 @@ pub fn emit_k3_mla_mixer(
     };
 
     let gemv = |b: &mut Builder, out: u32, row: u32, wt: u32, n: u32, k: u32, dep: &[u32]| {
-        emit_k3_linear(b, out, row, wt, t, n, k, n_cu, dep)
+        emit_k3_linear(b, out, row, wt, t, n, k, n_cu, seq_rows, dep)
     };
     let rms = |b: &mut Builder, out: u32, inp: u32, gw: u32, n: u32, dep: &[u32]| {
         b.emit(DevOp::RmsNorm, norm_cus(&all, t), dep, |d| {
@@ -1686,8 +1707,8 @@ pub fn emit_k3_mla_mixer(
     let c_rnq = if fold_q { c_qad } else { rms(b, qlat, qlr, w.q_a_norm, ql, &[c_qad]) };
     let q_src = if fold_q { qlr } else { qlat };
     let qn = fold_q.then_some((w.q_a_norm, c.eps));
-    let c_qa = emit_k3_linear_norm(b, qa, q_src, w.q_absorb, t, nh * dk, ql, n_cu, qn, &[c_rnq]);
-    let c_qrr = emit_k3_linear_norm(b, qrr, q_src, w.q_rope, t, nh * dr, ql, n_cu, qn, &[c_rnq]);
+    let c_qa = emit_k3_linear_norm(b, qa, q_src, w.q_absorb, t, nh * dk, ql, n_cu, seq_rows, qn, &[c_rnq]);
+    let c_qrr = emit_k3_linear_norm(b, qrr, q_src, w.q_rope, t, nh * dr, ql, n_cu, seq_rows, qn, &[c_rnq]);
 
     // q-side HeadNormRope: identity table, gamma absent, skip_norm — a bit-exact
     // copy. Emitted rather than skipped so it stays checkable.
@@ -1730,6 +1751,23 @@ pub fn emit_k3_mla_mixer(
             d.i[4] = 0; // apply RMSNorm before quantizing
             d.f[0] = c.eps;
             d.j[1] = crate::KV_MASK_NONE;
+            // BATCHED DECODE WRITES ITS OWN RING AT ITS OWN POSITION. `i[6]` is the kernel's
+            // `n_batch_kv` and `j[0]` its `out_stride` (op_norm.h): together they select
+            //     obase = ((t*nhead + hh)*out_stride + pos[t]) * hd
+            // instead of the legacy `(out_row0 + t)`. The legacy form CANNOT express a batch:
+            // `out_row0` is ONE operand the host patches with ONE position per step, so four
+            // sequences at four different positions have nowhere to go — rows 1..B-1 land on
+            // sequence 0's ring as if they were its next tokens, and sequence 0 itself is written
+            // at the step's patched row while flash reads `kv_len[0]-1`.
+            //
+            // At `nhead == 1` (the latent is one head) `out_stride = ctx` is ALSO what the
+            // legacy branch computes, so this is only reachable-path selection, not a layout
+            // change — and it is gated on `seq_rows` regardless, so every prefill packet and
+            // every B=1 decode is byte-identical.
+            if seq_rows {
+                d.i[6] = t;
+                d.j[0] = ctx;
+            }
         })
     } else {
         b.emit(DevOp::RmsNorm, norm_cus(&all, t), &[c_ckvd], |d| {
@@ -1758,6 +1796,11 @@ pub fn emit_k3_mla_mixer(
         d.i[4] = 1;
         d.f[0] = c.eps;
         d.j[1] = crate::KV_MASK_NONE;
+        // Same batch-major selection as the latent writer above; see its note.
+        if seq_rows {
+            d.i[6] = t;
+            d.j[0] = ctx;
+        }
     });
 
     // THE ONE OPCODE THAT DIFFERS BETWEEN THE PHASES, and the operand slot that is REINTERPRETED
@@ -1951,6 +1994,7 @@ pub fn emit_k3_dense_mlp(
     down_w: u32,
     inter: u32,
     t: u32,
+    seq_rows: bool,
     n_cu: u32,
     tp: &mut K3Tp,
     deps: &[u32],
@@ -1966,7 +2010,7 @@ pub fn emit_k3_dense_mlp(
     let act = b.tensor(&format!("{a}mlp_act"), sz);
     let _ = &all;
     let gemv = |b: &mut Builder, out: u32, row: u32, wt: u32, n: u32, k: u32, dep: &[u32]| {
-        emit_k3_linear(b, out, row, wt, t, n, k, n_cu, dep)
+        emit_k3_linear(b, out, row, wt, t, n, k, n_cu, seq_rows, dep)
     };
     let c_g = gemv(b, g, x, gate_w, inter, cb.hidden, deps);
     let c_u = gemv(b, u, x, up_w, inter, cb.hidden, deps);
@@ -2185,6 +2229,7 @@ pub fn emit_k3_block(
             ffn,
             h3,
             t,
+            seq_rows,
             n_cu,
             tp,
             fuse_bo.then_some(prefix),
@@ -2196,7 +2241,7 @@ pub fn emit_k3_block(
             down,
             inter,
         } => emit_k3_dense_mlp(
-            b, cb, a, ffn, h3, *gate, *up, *down, *inter, t, n_cu, tp, &[dep],
+            b, cb, a, ffn, h3, *gate, *up, *down, *inter, t, seq_rows, n_cu, tp, &[dep],
         ),
     };
     if fuse_bo {
@@ -2281,10 +2326,6 @@ pub fn emit_k3_model(
     n_cu: u32,
     rows: RowKind,
 ) {
-    // Plumbing only for now: every caller passes `Tokens`, which is what every program emitted so
-    // far is, and the two carriers this would set (PLOW_KDA_F_SEQ_ROWS on KDA_STATE_STEP, the
-    // per-row window stride in CONV3's j[0]) stay 0. Asserting it keeps a half-wired
-    // `Sequences` from emitting a program the state allocation cannot back.
     // HOW MANY INDEPENDENT SEQUENCES this program carries KDA state for. NOT the same as `t`:
     // a prefill program has `t` rows and ONE slot (its rows thread through one carried state);
     // a batched decode program has `t == B` rows and `B` slots.
@@ -2292,6 +2333,7 @@ pub fn emit_k3_model(
         RowKind::Tokens => 1,
         RowKind::Sequences => t as u64,
     };
+    let seq_rows = matches!(rows, RowKind::Sequences);
     // SHARING IS EXPRESSED THROUGH THE BUILDER, not through the naming. Re-declaring a name now
     // returns the existing handle and grows it to the larger size, which is what makes the shared
     // prefill prefix below actually share one buffer instead of allocating 93 identically-named
@@ -2348,8 +2390,13 @@ pub fn emit_k3_model(
     let x = b.tensor("act.x", t as u64 * hid as u64 * 2);
     let xnext = b.tensor("act.xnext", t as u64 * hid as u64 * 2);
     let xn = b.tensor("act.xn", t as u64 * hid as u64 * 2);
-    let logits = b.tensor("act.logits", vocab_l as u64 * 2);
-    let amax = b.tensor("act.amax", crate::AMAX_BLOCKS as u64 * 8);
+    // ROWS THE TAIL SAMPLES. A prefill bucket samples ONE row (the last real one) however wide
+    // the bucket is — a [T, vocab] logit matrix would cost a 163k-wide GEMM per prompt token to
+    // throw all but one row away. A batched DECODE samples ALL of them, because its rows are
+    // independent sequences and each one needs its own token.
+    let s_rows = if seq_rows { t } else { 1 };
+    let logits = b.tensor("act.logits", s_rows as u64 * vocab_l as u64 * 2);
+    let amax = b.tensor("act.amax", s_rows as u64 * crate::AMAX_BLOCKS as u64 * 8);
     // The block-residual ring: compiler-owned, per-sequence, `kv.`-prefixed so
     // the loader classifies it by exclusion rather than demanding it of the
     // checkpoint.
@@ -2561,15 +2608,20 @@ pub fn emit_k3_model(
         d.t[0] = logits;
         d.t[1] = xn;
         d.t[2] = head;
-        d.i[0] = 1;
+        d.i[0] = s_rows;
         d.i[1] = vocab_l;
         d.i[2] = hid;
-        d.i[4] = t - 1; // a_row0: the last real row.
+        // a_row0: the last real row on a prefill bucket, row 0 on a batched decode (which wants
+        // every row, so it starts at the first). The host re-patches this per prefill chunk.
+        d.i[4] = if seq_rows { 0 } else { t - 1 };
     });
     let c_am = b.emit(DevOp::Argmax, (0..crate::AMAX_BLOCKS).collect(), &[c_lm], |d| {
         d.t[0] = amax;
         d.t[1] = logits;
         d.i[0] = vocab_l;
+        // `d_argmax`'s n_batch, which it has always taken and no emitter has ever set:
+        // "i1 = n_batch (0/1 => single sequence, byte-identical)" (runtime/amd/interp.hip:1299).
+        d.i[1] = if seq_rows { t } else { 0 };
     });
     if k3_shard_head(c) {
         // XArgmaxFin SUBSUMES ArgmaxFin — it folds the AMAX_BLOCKS partials itself, rebases the
@@ -2582,7 +2634,16 @@ pub fn emit_k3_model(
             d.t[0] = ids;
             d.t[1] = amax;
             d.i[0] = crate::AMAX_BLOCKS;
-            d.i[1] = 1; // n_batch; the fold carries at most PLOW_XAMAX_MAX_BATCH = 16
+            // n_batch. The fold publishes one u64 per sequence into ONE 128-byte xctr counter
+            // line, so it carries at most PLOW_XAMAX_MAX_BATCH = 16 — asserted rather than left
+            // to silently leave ids[16..] holding the previous step's token.
+            const XAMAX_MAX_BATCH: u32 = 16;
+            assert!(
+                s_rows <= XAMAX_MAX_BATCH,
+                "XArgmaxFin carries at most {XAMAX_MAX_BATCH} sequences in one xctr counter line, \
+                 got {s_rows}"
+            );
+            d.i[1] = s_rows;
             d.i[2] = vocab_l;
             d.i[3] = gate;
             d.i[4] = gate + 1;
@@ -2592,6 +2653,7 @@ pub fn emit_k3_model(
             d.t[0] = ids;
             d.t[1] = amax;
             d.i[0] = crate::AMAX_BLOCKS;
+            d.i[1] = if seq_rows { t } else { 0 }; // n_batch, as on Argmax above
         });
     }
 }

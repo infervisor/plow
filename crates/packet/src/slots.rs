@@ -117,7 +117,7 @@ fn slot(raw: &'static str) -> Option<Slot> {
 const DOC: &[S] = &[
     S { op: DevOp::RmsNorm, t: &["out", "x", "gamma?"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::RowRms, t: &["rms", "x"], i: &["rows", "feat"], f: &["eps"], j: &[] },
-    S { op: DevOp::HeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos"], i: &["ntok", "nhead", "hd", "out_row0"], f: &["eps"], j: &[] },
+    S { op: DevOp::HeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos"], i: &["ntok", "nhead", "hd", "out_row0", "flags", "", "n_batch_kv"], f: &["eps"], j: &["out_stride", "kv_mask"] },
     S { op: DevOp::Residual, t: &["out", "a", "b"], i: &["n"], f: &["scale"], j: &[] },
     S { op: DevOp::Glu, t: &["out", "gate", "up"], i: &["n", "act"], f: &[], j: &[] },
     S { op: DevOp::Embed, t: &["out", "table", "ids"], i: &["ntok", "hidden"], f: &["scale"], j: &[] },
@@ -129,8 +129,8 @@ const DOC: &[S] = &[
     S { op: DevOp::FlashMerge, t: &["O", "Opart", "mlpart"], i: &["n_batch", "n_head", "nsplit", "hd"], f: &[], j: &[] },
     S { op: DevOp::NormResidual, t: &["out", "a", "b", "gamma?"], i: &["rows", "feat"], f: &["eps", "scale"], j: &[] },
     S { op: DevOp::AddNorm, t: &["out", "resid", "a", "b", "gamma?"], i: &["rows", "feat"], f: &["eps"], j: &[] },
-    S { op: DevOp::Argmax, t: &["part", "x"], i: &["n"], f: &[], j: &[] },
-    S { op: DevOp::ArgmaxFin, t: &["ids", "part"], i: &["blocks"], f: &[], j: &[] },
+    S { op: DevOp::Argmax, t: &["part", "x"], i: &["n", "n_batch"], f: &[], j: &[] },
+    S { op: DevOp::ArgmaxFin, t: &["ids", "part"], i: &["blocks", "n_batch"], f: &[], j: &[] },
     S { op: DevOp::GemvGlu, t: &["fu", "x", "W_gate", "", "", "W_up"], i: &["M", "N", "K", "", "", "act"], f: &["situ_beta", "situ_linear_beta"], j: &[] },
     S { op: DevOp::GemmGlu, t: &["fu", "x", "W_gate", "", "", "W_up"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
     S { op: DevOp::GemvQkv, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v"], i: &["M", "Nq", "K", "Nk", "Nv"], f: &[], j: &[] },
@@ -204,11 +204,11 @@ const DOC: &[S] = &[
     S { op: DevOp::KdaStateStep, t: &[], i: &["T", "H", "D", "BV", "flags"], f: &["scale"], j: &[] },
     // Four handles demoted to `i[]` (the `v` taps and all three conv states) — twelve pointers,
     // eight `t` slots. Same choice as `GemvQkvg`: demote a WEIGHT or a state, never an output.
-    S { op: DevOp::KdaConv3, t: &["q_out", "k_out", "v_out", "q_in", "k_in", "v_in", "w_q", "w_k"], i: &["T", "C", "W", "act", "w_v", "cs_q", "cs_k", "cs_v"], f: &[], j: &[] },
+    S { op: DevOp::KdaConv3, t: &["q_out", "k_out", "v_out", "q_in", "k_in", "v_in", "w_q", "w_k"], i: &["T", "C", "W", "act", "w_v", "cs_q", "cs_k", "cs_v"], f: &[], j: &["bstride", "parked"] },
     // `KdaStateStep` with `KdaGate` inlined: `t4`/`t5` are the RAW projections, not the gate's
     // f32 output, and `i5` is the `dt_bias` handle. There is no slot for a precomputed `g`, which
     // is deliberate — this op cannot silently degrade to the unfused reading of the packet.
-    S { op: DevOp::KdaStateStepG, t: &["o", "q", "k", "v", "g_raw", "beta_raw", "state", "A_log"], i: &["T", "H", "D", "BV", "flags", "dt_bias", "gate_mode"], f: &["scale", "lower_bound"], j: &[] },
+    S { op: DevOp::KdaStateStepG, t: &["o", "q", "k", "v", "g_raw", "beta_raw", "state", "A_log"], i: &["T", "H", "D", "BV", "flags", "dt_bias", "gate_mode", "parked"], f: &["scale", "lower_bound"], j: &[] },
     S { op: DevOp::KdaGatedNorm, t: &["y", "o", "norm_w", "g_raw"], i: &["T", "H", "D"], f: &["eps"], j: &[] },
     // `gamma?` is the FUSED post-norm: present, the mix is RMSNormed IN PLACE over `out` and the
     // packet subsumes the RMSNORM that would otherwise follow it. See `crate::k3::fuse_attnres_norm`.

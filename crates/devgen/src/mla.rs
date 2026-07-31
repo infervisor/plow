@@ -6447,7 +6447,20 @@ fn k3_build_model(
     let mut gen = Vec::new();
     let mut built: Vec<packet::devbuild::Program> = Vec::new();
     let slot_rows = pf.iter().copied().max().unwrap_or(1);
-    for (i, &t) in std::iter::once(&1u32).chain(pf.iter()).enumerate() {
+    // BATCHED DECODE. `PLOW_DECODE_BATCH=B` makes the DECODE program carry B INDEPENDENT
+    // SEQUENCES rather than one, which is a different thing from a prefill bucket's `t` rows and
+    // is why it is paired with `RowKind::Sequences` rather than just a larger `t`
+    // (perf-data/k3-batched-decode-design.md §1). B=1 is byte-identical to the pre-batch blob.
+    //
+    // Capped at PLOW_GEMV_MAXM=16: `AmdEngine::load` refuses above it because the gfx950 decode
+    // GEMV is a compile-time row bucket and sequences 16.. would get zero logits. The KDA state
+    // is the other bound — 0.44 GiB per slot, constant in context.
+    let dbatch: u32 = std::env::var("PLOW_DECODE_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .clamp(1, 16);
+    for (i, &t) in std::iter::once(&dbatch).chain(pf.iter()).enumerate() {
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
         // PLOW_L2_PLACE: `None` => byte-identical. Until this line the flag reached the dense-GQA
@@ -6463,7 +6476,21 @@ fn k3_build_model(
             t,
             slot_rows,
             n_cu,
-            crate::k3::RowKind::Tokens,
+            // The DECODE program (i == 0) carries independent sequences when batched; every
+            // prefill bucket is always consecutive tokens of one sequence.
+            //
+            // PLOW_K3_SEQ_ROWS FORCES the sequence-row carriers on at dbatch == 1. It is a
+            // BISECTION INSTRUMENT, not a serving knob: at one row every carrier is a no-op by
+            // construction (the only slot is slot 0, at offset 0 under either addressing), so a
+            // B=1 emit with it on MUST reproduce the known-good B=1 stream token for token. If it
+            // does not, the carrier that broke it is separable from batching itself — which is the
+            // one question a B>1 run cannot answer, because at B>1 there is no reference stream to
+            // compare against.
+            if i == 0 && (dbatch > 1 || std::env::var_os("PLOW_K3_SEQ_ROWS").is_some()) {
+                crate::k3::RowKind::Sequences
+            } else {
+                crate::k3::RowKind::Tokens
+            },
         );
         // Every builder re-declares the same NoPE recipes and, under dedup, gets the same handles,
         // so any one of the lists is the whole set. Take the first — decode's — because it is the
@@ -6479,7 +6506,12 @@ fn k3_build_model(
     // (`prog_t`'s last entry is the decode program; everything before it is a prefill bucket).
     let decode = built.remove(0);
     built.push(decode);
-    let prog_t: Vec<u32> = pf.iter().copied().chain(std::iter::once(1)).collect();
+    // The decode entry is `dbatch`, not 1: at PLOW_DECODE_BATCH = B the decode program is emitted
+    // at B rows (`RowKind::Sequences`), and `AmdEngine::load` cross-checks `prog_t.last()` against
+    // `in.kvlen`'s row count. Leaving 1 here made a B=4 blob refuse itself at load with
+    // "in.kvlen is 4 rows but the decode program is compiled for t=1" — a real mismatch between
+    // two records of the same fact, which is exactly what that check is for.
+    let prog_t: Vec<u32> = pf.iter().copied().chain(std::iter::once(dbatch)).collect();
 
     Model {
         n_cu,

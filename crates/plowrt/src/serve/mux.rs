@@ -1277,6 +1277,42 @@ fn run_one_tick(
             // ONE prefill per tick, lowest slot first. Everything else waits;
             // the dispatcher loops straight back, so a second pending prompt is
             // admitted on the next tick.
+            //
+            // PREFILL AND DECODE NOW SHARE THE TICK. This arm used to `return`,
+            // which made a tick EITHER a prefill OR a decode and meant every
+            // live decode stream stalled for the whole of someone else's
+            // prefill — measured 49.3 tok/s through `serve` at concurrency 16
+            // against 91.3 from the same packet under `amd-bench`, and TTFT
+            // 3.3 s because N arrivals serialise into N prefill-only ticks.
+            //
+            // Falling through instead costs nothing and needs no kernel change,
+            // and the ordering is what makes it sound:
+            //
+            //   * The prefill runs FIRST, so by the time `feeds` is built the
+            //     new slot's first token is already in `out_ids` and it decodes
+            //     in the same tick rather than waiting for the next one.
+            //   * `prefill_slot` rebases the KV table onto the slot and restores
+            //     base 0 before returning, and `decode_step_batched` refuses a
+            //     non-zero base — so the decode below cannot run rebased.
+            //   * The two programs share `in.ids`/`in.pos`/`in.kvlen` and the
+            //     `act.*` scratch, which is safe ONLY because they alternate
+            //     rather than overlap: each phase fully re-stages its own inputs
+            //     (`seed_ids` + `decode_prepare_batched` on one side,
+            //     `prefill_prepare` on the other) before it reads them.
+            //
+            // What this deliberately does NOT do is run a prefill CHUNK and a
+            // decode concurrently. A decode dispatch advances all B rows
+            // unconditionally, and while that is harmless for the append-only KV
+            // cache it would advance a mid-prefill slot's KDA recurrence with a
+            // garbage token. Interleaving at sub-prompt granularity therefore
+            // still needs the per-row active mask that `op_kda.h` does not have
+            // (`perf-data/k3-throughput-architecture-review.md` §3.1). Whole
+            // prompts are the granularity that is safe today, and for the common
+            // ~1k-token prompt the bucket ladder makes that ONE chunk anyway.
+            //
+            // `PLOW_PF_NO_INTERLEAVE=1` restores the old prefill-only tick.
+            let mut did_prefill = false;
+            let no_interleave = std::env::var("PLOW_PF_NO_INTERLEAVE").as_deref() == Ok("1");
             let pending = (0..b.min(slots.len()))
                 .find(|&i| slots[i].as_ref().map(|s| s.step == 0).unwrap_or(false));
             if let Some(i) = pending {
@@ -1295,10 +1331,14 @@ fn run_one_tick(
                 // engine-thread handoff.
                 crate::obs::ttft::QUEUE.add(slot_ref.arrived.elapsed().as_nanos() as u64);
                 let t_pf = std::time::Instant::now();
-                let pf = e.prefill(i, &prompt);
+                // ONE CHUNK, not the whole prompt. `Ok(None)` means this slot has more chunks to
+                // go; it stays `step == 0`, so the next tick finds it again and advances it —
+                // and in between, the decode below runs for every other slot.
+                let pf = e.prefill_chunked(i, &prompt);
                 crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
                 match pf {
-                    Ok(token) => {
+                    Ok(None) => {}
+                    Ok(Some(token)) => {
                         if let Some(s) = slots[i].as_mut() {
                             s.pf_pos = s.prompt_ids.len();
                         }
@@ -1330,7 +1370,10 @@ fn run_one_tick(
                 if let Some(t) = pk_t {
                     packlog::record(t.elapsed().as_nanos() as u64, 0, true, false, 0);
                 }
-                return (slots, bufs, obs, tokens_this_tick, true);
+                did_prefill = true;
+                if no_interleave {
+                    return (slots, bufs, obs, tokens_this_tick, true);
+                }
             }
 
             // Decode: every live slot feeds the token it last produced.
@@ -1341,7 +1384,7 @@ fn run_one_tick(
                 })
                 .collect();
             if feeds.is_empty() {
-                return (slots, bufs, obs, tokens_this_tick, false);
+                return (slots, bufs, obs, tokens_this_tick, did_prefill);
             }
             let pk_t = packlog::on().then(Instant::now);
             let pk_rows = feeds.len();
@@ -1392,7 +1435,7 @@ fn run_one_tick(
             if let Some(t) = pk_t {
                 packlog::record(0, t.elapsed().as_nanos() as u64, false, true, pk_rows);
             }
-            return (slots, bufs, obs, tokens_this_tick, false);
+            return (slots, bufs, obs, tokens_this_tick, did_prefill);
         }
 
         #[allow(unreachable_code)]
