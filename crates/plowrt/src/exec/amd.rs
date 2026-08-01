@@ -3383,7 +3383,19 @@ impl AmdEngine {
         // whatever the allocator handed back; every executed slot is rewritten
         // each step, so the buffer always holds the LAST step's timeline.
         let (d_trace, trace_bytes) = if std::env::var_os("PLOW_TRACE_RAW").is_some() {
-            let bytes = blob.progs[decode].stream.len() * TRACE_REC_BYTES;
+            // Sized for the WIDEST program, not the decode one. The pointer used to be handed
+            // only to `decode` (see the kernarg builder), so a prefill dispatch got a null trace
+            // and recorded nothing — prefill was untraceable BY CONSTRUCTION, which is why the
+            // first prefill trace ever taken came back with 0 packets. K3's prefill buckets carry
+            // 2942 stream entries against decode's 2459, so sizing by `decode` alone would have
+            // overflowed the buffer the moment the pointer was handed over.
+            let bytes = blob
+                .progs
+                .iter()
+                .map(|g| g.stream.len())
+                .max()
+                .unwrap_or(0)
+                * TRACE_REC_BYTES;
             let m = EngineDevice::alloc(&*be, bytes.max(1) as u64)?;
             EngineDevice::upload(&*be, &m, 0, &vec![0u8; bytes])?;
             (Some(m), bytes)
@@ -3791,11 +3803,11 @@ impl AmdEngine {
             succs: g.d_succs.base,
             counters: g.d_ctr.base,
             tensors: self.d_tens.base,
-            trace: if p == self.decode {
-                self.d_trace.as_ref().map_or(0, |m| m.base)
-            } else {
-                0
-            },
+            // EVERY program traces, not just decode. The buffer is sized for the widest one
+            // (see `d_trace`'s allocation), and each dispatch writes slot `base + ix` of its own
+            // stream, so a run that prefills and then decodes leaves DECODE records behind —
+            // which is why `amd-bench` dumps the prefill trace before the decode loop starts.
+            trace: self.d_trace.as_ref().map_or(0, |m| m.base),
             cur_seg: seg,
             l2_domains: g.l2_domains,
             // Two-level cache maintenance. Handed to the device only when the OBJECT was built

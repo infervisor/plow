@@ -657,6 +657,23 @@ fn amd_bench(
 /// samples fluent-looking ids from its own shard, so agreement is the only thing
 /// that distinguishes a working all-reduce from a plausible wrong one. It is
 /// therefore asserted on every step rather than at the end.
+/// Write the packet trace, if `PLOW_TRACE_RAW` asked for one.
+///
+/// A FUNCTION rather than three copies of the same `if let`, because every copy so far has been on
+/// a path some other exit bypassed. `--batched` returned before one; `--prompt` returned before the
+/// other. So the instrument was unavailable in exactly the two places the interesting questions
+/// live — batch > 1, and PREFILL — and both times it failed by producing NOTHING rather than by
+/// complaining. Call this before every exit of a bench that ran packets.
+#[cfg(feature = "hsa")]
+fn trace_dump(g: &plowrt::exec::amd_tp::AmdTpGroup) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(p) = std::env::var_os("PLOW_TRACE_RAW") {
+        let p = PathBuf::from(p);
+        g.rank(0).trace_write(&p)?;
+        println!("packet trace -> {}", p.display());
+    }
+    Ok(())
+}
+
 #[cfg(feature = "hsa")]
 fn amd_bench_tp(
     blob: PathBuf,
@@ -775,17 +792,7 @@ fn amd_bench_tp(
             1e3 / ms,
             g.n_gpu()
         );
-        // PACKET TRACE, on this path too. `--batched` used to return before the write at the end
-        // of this function, so `PLOW_TRACE_RAW` silently produced nothing at B > 1 — which is
-        // precisely where the attribution is unknown (the B-sweep fits
-        // `43.6 + 8.25*B ms` and neither term is attributed). An instrument that is unavailable
-        // exactly where the question is is not an instrument.
-        if let Some(p) = std::env::var_os("PLOW_TRACE_RAW") {
-            let p = PathBuf::from(p);
-            g.rank(0).trace_write(&p)?;
-            println!("packet trace -> {}", p.display());
-        }
-        return Ok(());
+        trace_dump(&g)?;
     }
 
     // A prompt makes this a real greedy decode from position 0. Without one,
@@ -831,6 +838,22 @@ fn amd_bench_tp(
                 g.n_gpu()
             );
             pos = ids.len() as u32;
+            // PREFILL TRACE, dumped HERE and not at the end.
+            //
+            // The trace buffer is indexed per (workgroup, packet), so every dispatch overwrites
+            // the same slots and only the LAST program run survives to the file. A run that
+            // prefills and then decodes therefore writes a DECODE trace no matter how big the
+            // prompt was -- which is why the first prefill trace ever taken turned out to be
+            // 2459 packets of GEMV, i.e. the decode program. Prefill has been untraceable.
+            //
+            // Written to `<PLOW_TRACE_RAW>.prefill` so both survive one run.
+            if let Some(t) = std::env::var_os("PLOW_TRACE_RAW") {
+                let mut pf = PathBuf::from(t).into_os_string();
+                pf.push(".prefill");
+                let pf = PathBuf::from(pf);
+                g.rank(0).trace_write(&pf)?;
+                println!("prefill packet trace -> {}", pf.display());
+            }
         } else {
             g.seed_ids(&ids)?;
             pos = 0;
@@ -856,6 +879,9 @@ fn amd_bench_tp(
         if !g.weights_bound() {
             println!("  (weights unbound — these ids are noise)");
         }
+        // This path had NO trace write at all, so `PLOW_TRACE_RAW` produced nothing for any
+        // run carrying a `--prompt` — i.e. every run that PREFILLS. Prefill was untraceable.
+        trace_dump(&g)?;
         return Ok(());
     }
 
@@ -914,11 +940,7 @@ fn amd_bench_tp(
     // steady-state step's and not the warmup's. Every rank traces (the buffer
     // is allocated per engine off the same env var); rank 0's is the one that
     // gets written, which is the same rank the token-agreement check reads.
-    if let Some(p) = std::env::var_os("PLOW_TRACE_RAW") {
-        let p = PathBuf::from(p);
-        g.rank(0).trace_write(&p)?;
-        println!("packet trace -> {}", p.display());
-    }
+    trace_dump(&g)?;
     Ok(())
 }
 
