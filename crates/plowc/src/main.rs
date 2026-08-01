@@ -356,6 +356,18 @@ enum Cmd {
     /// tuning records but must never write them, or a build could calibrate
     /// itself against its own output.
     Tune(TuneCli),
+
+    /// Serve an interactive dataflow visualization of the nn-graph in the browser.
+    ///
+    /// Builds the symbolic operator graph from a HuggingFace `config.json`
+    /// (via `--hf-dir`) or from a plow-native network JSON (via `--net`),
+    /// then serves a self-contained HTML viewer on a local port. The viewer
+    /// shows every tensor, shape, and op in a navigable DAG layout.
+    ///
+    /// ```text
+    /// plowc --hf-dir /path/to/kimi-k3 viz --port 8384
+    /// ```
+    Viz(VizCli),
 }
 
 /// `plowc tune <action>`.
@@ -452,6 +464,22 @@ struct TuneCli {
     threshold: f64,
 }
 
+/// `plowc viz` — serve or dump the nn-graph visualization.
+#[derive(Args, Debug)]
+struct VizCli {
+    /// Port to serve the viewer on (0 = write to file instead of serving).
+    #[arg(long, default_value_t = 8384)]
+    port: u16,
+
+    /// Output file path. When `--port 0`, write the self-contained HTML here.
+    #[arg(long, default_value = "graph.html")]
+    out: PathBuf,
+
+    /// Open the browser automatically after starting the server.
+    #[arg(long, default_value_t = true)]
+    open: bool,
+}
+
 fn main() -> ExitCode {
     init_logging();
     let cli = Cli::parse();
@@ -495,6 +523,16 @@ fn main() -> ExitCode {
             }
             Err(e) => {
                 error!(error = %e, "tuning command failed");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if let Some(Cmd::Viz(v)) = &cli.cmd {
+        return match run_viz(v, &cli) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                error!(error = %e, "viz failed");
                 ExitCode::FAILURE
             }
         };
@@ -1593,6 +1631,216 @@ fn print_gpu_list() {
             println!("  {:30} aliases: {}", spec.name, aliases.join(", "));
         }
     }
+}
+
+/// The kimi_k3 builder refuses a `vision_config` because a text-only *compile*
+/// would load, run, and be silently wrong on image prompts. A viz is a picture,
+/// not a runnable artifact, so that failure mode does not exist here: strip the
+/// key and draw the text tower, loudly. Scoped to kimi_k3 — gemma4 multimodal
+/// *dispatches* on `vision_config` and must keep seeing it.
+fn viz_strip_vision(json: &str) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return json.to_string();
+    };
+    if v.get("model_type").and_then(|m| m.as_str()) == Some("kimi_k3")
+        && v.get("vision_config").map(|c| !c.is_null()).unwrap_or(false)
+    {
+        warn!("kimi_k3 vision_config ignored for viz: drawing the TEXT tower only");
+        v.as_object_mut().map(|o| o.remove("vision_config"));
+        return v.to_string();
+    }
+    json.to_string()
+}
+
+/// Build a graph for viz from a single source string: a checkpoint directory
+/// (containing `config.json`), a config/net JSON file, or an HF model id.
+/// `batch`/`seq` bind the symbolic B/S so every inferred shape comes out
+/// concrete; absent, shapes stay symbolic.
+fn viz_build(
+    src: &str,
+    batch: Option<i64>,
+    seq: Option<i64>,
+) -> Result<(nn_graph::Graph, String), String> {
+    let p = std::path::Path::new(src);
+    let (json, title) = if p.is_dir() {
+        let json = std::fs::read_to_string(p.join("config.json"))
+            .map_err(|e| format!("cannot read config.json in {src:?}: {e}"))?;
+        (json, plowc::hf_config::dir_slug(p))
+    } else if p.is_file() {
+        let json = std::fs::read_to_string(p).map_err(|e| format!("cannot read {src:?}: {e}"))?;
+        let title = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "network".into());
+        (json, title)
+    } else {
+        info!(model = %src, "resolving model config from HuggingFace hub");
+        let json = nn_graph::hub::fetch_config(src)
+            .map_err(|e| format!("hub fetch failed for {src:?}: {e}"))?;
+        (json, src.rsplit('/').next().unwrap_or(src).to_string())
+    };
+
+    let json = viz_strip_vision(&json);
+    let mut g =
+        nn_graph::models::build_from_config_json_at(&json, &nn_graph::models::ShapeBucket::default())
+            .map_err(|e| format!("graph build failed for {src:?}: {e}"))?;
+
+    let mut b = nn_graph::Bindings::new();
+    if let Some(v) = batch {
+        b.insert("B", v);
+    }
+    if let Some(v) = seq {
+        b.insert("S", v);
+    }
+    g.bind(&b);
+    Ok((g, title))
+}
+
+/// Percent-decode a URL query value (enough for model ids and paths).
+fn urldecode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                let hex = |c: u8| (c as char).to_digit(16);
+                if let (Some(h), Some(l)) = (
+                    b.get(i + 1).copied().and_then(hex),
+                    b.get(i + 2).copied().and_then(hex),
+                ) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `plowc viz`: build the nn-graph from the given source and either serve
+/// or dump a self-contained HTML visualization.
+///
+/// Sources, in priority order: `--hf-dir`, `--model` (HF hub), `--net`.
+/// In serve mode the page's model form hits `GET /graph?model=…&batch=…&seq=…`
+/// and the server rebuilds — any model, any B/S binding, without restarting.
+fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let source = if let Some(ref dir) = cli.hf_dir {
+        dir.to_string_lossy().into_owned()
+    } else if let Some(ref model_id) = cli.model {
+        model_id.clone()
+    } else if let Some(ref net_path) = cli.net {
+        net_path.to_string_lossy().into_owned()
+    } else {
+        return Err(
+            "viz requires a model source: --hf-dir <path>, --model <hf-id>, or --net <file.json>"
+                .into(),
+        );
+    };
+
+    let (graph, title) = viz_build(&source, None, None)?;
+    info!(
+        title = %title,
+        tensors = graph.tensors.len(),
+        nodes = graph.nodes.len(),
+        blocks = graph.blocks.len(),
+        "graph built for visualization"
+    );
+
+    let html = nn_graph::viz::graph_to_html(&graph, &title, &source);
+
+    if v.port == 0 {
+        // File-dump mode
+        std::fs::write(&v.out, &html)?;
+        info!(path = %v.out.display(), "wrote graph visualization HTML");
+        return Ok(());
+    }
+
+    // Serve mode: tiny stdlib HTTP server
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let addr = format!("127.0.0.1:{}", v.port);
+    let listener = TcpListener::bind(&addr)
+        .map_err(|e| format!("cannot bind {addr}: {e}"))?;
+    let url = format!("http://{addr}");
+    info!(url = %url, "serving nn-graph visualizer (Ctrl-C to stop)");
+    eprintln!("\n  🌐 Graph viewer: {url}\n");
+
+    if v.open {
+        // Best-effort open in browser
+        #[cfg(target_os = "macos")]
+        { let _ = std::process::Command::new("open").arg(&url).spawn(); }
+        #[cfg(target_os = "linux")]
+        { let _ = std::process::Command::new("xdg-open").arg(&url).spawn(); }
+    }
+
+    let html_bytes = html.into_bytes();
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let path = req
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("/");
+
+        let (content_type, body): (&str, Vec<u8>) = if let Some(query) =
+            path.strip_prefix("/graph").and_then(|r| r.strip_prefix('?'))
+        {
+            // /graph?model=…&batch=…&seq=… → rebuild and return JSON.
+            let mut model = String::new();
+            let (mut batch, mut seq) = (None, None);
+            for kv in query.split('&') {
+                let mut it = kv.splitn(2, '=');
+                match (it.next(), it.next()) {
+                    (Some("model"), Some(val)) => model = urldecode(val),
+                    (Some("batch"), Some(val)) => batch = urldecode(val).parse().ok(),
+                    (Some("seq"), Some(val)) => seq = urldecode(val).parse().ok(),
+                    _ => {}
+                }
+            }
+            let src = if model.is_empty() { source.clone() } else { model };
+            let json = match viz_build(&src, batch, seq) {
+                Ok((g, t)) => {
+                    info!(source = %src, ?batch, ?seq, "rebuilt graph for viz request");
+                    serde_json::json!({ "title": t, "graph": nn_graph::viz::graph_to_value(&g) })
+                }
+                Err(e) => {
+                    error!(source = %src, error = %e, "viz rebuild failed");
+                    serde_json::json!({ "error": e })
+                }
+            };
+            ("application/json", json.to_string().into_bytes())
+        } else {
+            ("text/html; charset=utf-8", html_bytes.clone())
+        };
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.write_all(&body);
+        let _ = stream.flush();
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -73,7 +73,10 @@ pub struct KimiK3TextConfig {
     /// First `first_k_dense_replace` layers use a dense MLP.
     pub first_k_dense_replace: u32,
     /// DeepSeek `noaux_tc` group-limited routing. Absent ⇒ flat top-k.
-    #[serde(default)]
+    /// K3's own spelling is `num_expert_group` (default 1 in
+    /// `configuration_kimi_k3.py`) — the released checkpoint carries
+    /// `num_expert_group: 1, topk_group: 1`; `n_group` is the DeepSeek name.
+    #[serde(default, alias = "num_expert_group")]
     pub n_group: Option<u32>,
     #[serde(default)]
     pub topk_group: Option<u32>,

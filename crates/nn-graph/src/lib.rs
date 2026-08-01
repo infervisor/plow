@@ -49,6 +49,8 @@ pub mod infer;
 pub mod models;
 pub mod op;
 pub mod shape;
+#[cfg(feature = "models")]
+pub mod viz;
 
 pub use bind::Bindings;
 pub use builder::Nn;

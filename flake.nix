@@ -120,6 +120,7 @@
               # Lean 4 toolchain manager — installs the version pinned by
               # lean-plow/lean-toolchain on first `lake` invocation.
               pkgs.elan
+            ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
               # ROCr's own shared-library dependencies, from nix rather than
               # the system. `plowrt --features hsa` dlopens
               # /opt/rocm/lib/libhsa-runtime64.so, which needs libelf, libdrm,
@@ -127,7 +128,9 @@
               # LD_LIBRARY_PATH to satisfy them does NOT work: the nix-built
               # binary then resolves libc.so.6 to the system glibc 2.35 and
               # dies with `GLIBC_2.39 not found`. Supplying them from nix keeps
-              # exactly one glibc in the process.
+              # exactly one glibc in the process. Linux-only: elfutils, libdrm
+              # and numactl do not build on darwin, and the GPU path does not
+              # exist there anyway.
               pkgs.elfutils
               pkgs.libdrm
               pkgs.numactl
@@ -140,6 +143,7 @@
                 echo "lean toolchain: $(cat lean-plow/lean-toolchain)"
               fi
 
+            '' + pkgs.lib.optionalString pkgs.stdenv.isLinux ''
               # The AMD GPU path. ROCm itself stays SYSTEM-installed (the code
               # objects are built by the system hipcc); only its library search
               # path is wired up here. /opt/amdgpu carries libdrm_amdgpu, which

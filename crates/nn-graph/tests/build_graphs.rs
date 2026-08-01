@@ -905,6 +905,25 @@ fn kimi_k3_group_limited_routing_is_carried_to_the_router() {
         err.to_string().contains("topk_group"),
         "the refusal must name the missing half, got: {err}"
     );
+
+    // K3's own spelling. The released checkpoint says `num_expert_group`, not
+    // `n_group` — reading only the DeepSeek name made the real config look
+    // like half a pair and refuse to build.
+    let g = build_from_config_json(&k3_json(r#", "num_expert_group": 1, "topk_group": 1"#))
+        .expect("K3 with the num_expert_group spelling must build");
+    assert!(
+        g.count_ops(|o| matches!(
+            o,
+            nn_graph::Op::MoeRouter {
+                group: Some(nn_graph::MoeGroups {
+                    n_group: 1,
+                    topk_group: 1
+                }),
+                ..
+            }
+        )) > 0,
+        "num_expert_group must alias n_group and reach the router op"
+    );
 }
 
 /// The layer partition must cover every layer exactly once. A gap or an overlap
