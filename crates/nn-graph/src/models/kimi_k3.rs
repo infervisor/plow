@@ -28,11 +28,11 @@
 //! ONE expert FFN: the dispatch is data-dependent, and a graph with 896 expert
 //! subgraphs would describe a computation that never runs.
 
+use super::config::ConfigError;
 use super::config::{parse_dtype, K3Layer, KimiK3Config, KimiK3TextConfig};
 use crate::op::{ActKind, LinearAttnKind, MoeGroups};
 use crate::Nn;
 use crate::{DType, Dim, Graph, TensorId};
-use super::config::ConfigError;
 
 /// Build the K3 text tower.
 ///
@@ -122,7 +122,14 @@ pub fn build(cfg: &KimiK3Config) -> Result<Graph, ConfigError> {
 
         let normed = nn.rmsnorm(&format!("{p}.post_attention_layernorm"), h2, h, eps);
         let ffn = if layer < t.first_k_dense_replace {
-            situ_mlp(&mut nn, t, &format!("{p}.mlp"), normed, h, t.intermediate_size)
+            situ_mlp(
+                &mut nn,
+                t,
+                &format!("{p}.mlp"),
+                normed,
+                h,
+                t.intermediate_size,
+            )
         } else {
             latent_moe(&mut nn, t, &format!("{p}.mlp"), normed, h, groups)
         };
@@ -168,11 +175,22 @@ fn mla_attention(
             false,
         )
     } else {
-        nn.linear(&format!("{p}.self_attn.q_proj"), x, h, nh as i64 * qk_head, false)
+        nn.linear(
+            &format!("{p}.self_attn.q_proj"),
+            x,
+            h,
+            nh as i64 * qk_head,
+            false,
+        )
     };
     let q = nn.reshape(
         q,
-        [b.clone(), s.clone(), Dim::stat(nh as i64), Dim::stat(qk_head)],
+        [
+            b.clone(),
+            s.clone(),
+            Dim::stat(nh as i64),
+            Dim::stat(qk_head),
+        ],
     );
     let q_nope = nn.slice(q, -1, 0, qk_nope);
     let mut q_pe = nn.slice(q, -1, qk_nope, qk_rope);
@@ -214,7 +232,10 @@ fn mla_attention(
     let k_nope = nn.slice(kv, -1, 0, qk_nope);
     let value = nn.slice(kv, -1, qk_nope, v_head);
 
-    k_pe = nn.reshape(k_pe, [b.clone(), s.clone(), Dim::stat(1), Dim::stat(qk_rope)]);
+    k_pe = nn.reshape(
+        k_pe,
+        [b.clone(), s.clone(), Dim::stat(1), Dim::stat(qk_rope)],
+    );
     k_pe = nn.rope(k_pe, qk_rope as u32, cfg.rope_theta);
     k_pe = nn.broadcast(
         k_pe,
@@ -335,7 +356,14 @@ fn kda_attention(
 }
 
 /// Dense FFN with K3's `situ` GLU.
-fn situ_mlp(nn: &mut Nn, cfg: &KimiK3TextConfig, p: &str, x: TensorId, h: i64, inter: i64) -> TensorId {
+fn situ_mlp(
+    nn: &mut Nn,
+    cfg: &KimiK3TextConfig,
+    p: &str,
+    x: TensorId,
+    h: i64,
+    inter: i64,
+) -> TensorId {
     let gate = nn.linear(&format!("{p}.gate_proj"), x, h, inter, false);
     let up = nn.linear(&format!("{p}.up_proj"), x, h, inter, false);
     let hidden = nn.situ_glu(

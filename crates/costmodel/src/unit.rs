@@ -137,7 +137,11 @@ impl<'a> Soc<'a> {
         // MMA-N granularity, so `start` may exceed `g.n` by `< gran` — that tail is
         // padding the kernel masks (it never under-covers). Hence `start >= g.n`,
         // not `== g.n`.
-        debug_assert!(start >= g.n, "partition_n under-covered N: {start} < {}", g.n);
+        debug_assert!(
+            start >= g.n,
+            "partition_n under-covered N: {start} < {}",
+            g.n
+        );
         regions
     }
 }
@@ -145,7 +149,7 @@ impl<'a> Soc<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DEFAULT_PAGE_BYTES, SramPolicy};
+    use crate::{SramPolicy, DEFAULT_PAGE_BYTES};
 
     fn h100() -> &'static GpuSpec {
         hwspec::registry::lookup("H100 SXM5").unwrap()

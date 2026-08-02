@@ -601,8 +601,10 @@ fn report_devblob_egglog(dir: &std::path::Path) {
             return;
         }
     };
-    let mut g = match nn_graph::models::build_from_config_json_at(&json, &nn_graph::models::ShapeBucket::default())
-    {
+    let mut g = match nn_graph::models::build_from_config_json_at(
+        &json,
+        &nn_graph::models::ShapeBucket::default(),
+    ) {
         Ok(g) => g,
         Err(e) => {
             warn!(error = %e, "egglog analysis skipped: graph build failed");
@@ -755,7 +757,10 @@ fn devblob_verify_hook(
                 (vec![0; n], (0..n as u64).collect())
             };
             let req = lv::ScheduleRequest {
-                task_graph: lv::TaskGraphView { n, edges: Vec::new() },
+                task_graph: lv::TaskGraphView {
+                    n,
+                    edges: Vec::new(),
+                },
                 protocol: lv::ProtocolView {
                     waits,
                     succs,
@@ -826,7 +831,9 @@ fn devblob_oracle(
     clock_hz: u64,
 ) -> Result<(), lean_verify::VerifyError> {
     use lean_verify::queries::lower_bound as lb;
-    let Some(p) = m.progs.last() else { return Ok(()) };
+    let Some(p) = m.progs.last() else {
+        return Ok(());
+    };
     let pi = m.progs.len() - 1;
     // Inst-level counter edges: producer succ counter ∈ consumer wait list.
     let mut producers: std::collections::HashMap<u32, Vec<usize>> = Default::default();
@@ -1169,9 +1176,10 @@ fn build_cubin_from_manifest(
     arch: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mpath = pkt.with_file_name("build.json");
-    let man: serde_json::Value = serde_json::from_slice(&std::fs::read(&mpath).map_err(|e| {
-        format!("--emit devblob+cubin: cannot read {}: {e}", mpath.display())
-    })?)?;
+    let man: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&mpath)
+            .map_err(|e| format!("--emit devblob+cubin: cannot read {}: {e}", mpath.display()))?,
+    )?;
 
     let nvcc = std::path::Path::new("/usr/local/cuda/bin/nvcc");
     if !nvcc.exists() {
@@ -1212,7 +1220,11 @@ fn build_cubin_from_manifest(
         flags
             .get(k)
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let (req, rec) = (list("requires"), list("recommends"));
@@ -1248,16 +1260,20 @@ fn build_cubin_from_manifest(
     args.push(format!("-DPLOW_CUBIN_DIR={}", out_dir.display()));
 
     let status = std::process::Command::new("cmake")
-        .arg("-S").arg(&runtime_dir)
-        .arg("-B").arg(&build_dir)
+        .arg("-S")
+        .arg(&runtime_dir)
+        .arg("-B")
+        .arg(&build_dir)
         .args(&args)
         .status()?;
     if !status.success() {
         return Err(format!("cmake configure failed ({status})").into());
     }
     let status = std::process::Command::new("cmake")
-        .arg("--build").arg(&build_dir)
-        .arg("--target").arg("sm120_cubins")
+        .arg("--build")
+        .arg(&build_dir)
+        .arg("--target")
+        .arg("sm120_cubins")
         .status()?;
     if !status.success() {
         return Err(format!("cmake build failed ({status})").into());
@@ -1293,9 +1309,11 @@ fn repo_runtime_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
             break;
         }
     }
-    Err("--emit devblob+cubin: cannot find runtime/CMakeLists.txt — set PLOW_ROOT \
+    Err(
+        "--emit devblob+cubin: cannot find runtime/CMakeLists.txt — set PLOW_ROOT \
          to the repository root"
-        .into())
+            .into(),
+    )
 }
 
 /// Create `link` → `target`, replacing any existing entry. Unix-only; the
@@ -1314,8 +1332,7 @@ fn symlink_force(_target: &std::path::Path, _link: &std::path::Path) -> std::io:
 }
 
 fn init_logging() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("plowc=info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("plowc=info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -1376,25 +1393,42 @@ fn run_tune(t: &TuneCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let action = match word.as_str() {
         "inventory" => TuneAction::Inventory,
         "select" => {
-            let s = t.shape.as_ref().ok_or("`tune select` needs --shape M,N,K")?;
+            let s = t
+                .shape
+                .as_ref()
+                .ok_or("`tune select` needs --shape M,N,K")?;
             let (m, n, k) = tune::parse_shape(s)?;
             TuneAction::Select { m, n, k }
         }
         // Coverage is optional here on purpose: the digest census and the total-staleness alarm
         // are the part that outranks coverage, and they need no checkpoint at all.
         "status" => TuneAction::Status {
-            coverage_from: cli.hf_dir.as_ref().map(|_| emit_spec("coverage")).transpose()?,
+            coverage_from: cli
+                .hf_dir
+                .as_ref()
+                .map(|_| emit_spec("coverage"))
+                .transpose()?,
         },
-        "regress" => TuneAction::Regress { threshold: t.threshold },
+        "regress" => TuneAction::Regress {
+            threshold: t.threshold,
+        },
         "shapes" => TuneAction::Shapes(emit_spec("`tune shapes`")?),
-        "best" => TuneAction::Best { quant: t.quant.clone() },
+        "best" => TuneAction::Best {
+            quant: t.quant.clone(),
+        },
         "ingest" => TuneAction::Ingest {
-            samples: t.samples.clone().ok_or("`tune ingest` needs --samples <sweep.jsonl>")?,
+            samples: t
+                .samples
+                .clone()
+                .ok_or("`tune ingest` needs --samples <sweep.jsonl>")?,
             campaign: t.campaign.clone(),
             provisional: t.provisional,
         },
         "gemm" => TuneAction::Gemm(Box::new(tune::gemm::Campaign {
-            obj: t.obj.clone().ok_or("`tune gemm` needs --obj <dir with test_kernels.elf>")?,
+            obj: t
+                .obj
+                .clone()
+                .ok_or("`tune gemm` needs --obj <dir with test_kernels.elf>")?,
             samples: t
                 .samples
                 .clone()
@@ -1505,7 +1539,8 @@ fn run(cli: Cli) -> Result<Report, Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "unknown --weight-dtype {other:?}: expected auto, bf16, fp8, or f4"
-                ).into());
+                )
+                .into());
             }
         },
     };
@@ -1576,9 +1611,15 @@ fn print_report(r: &Report) {
         println!("hbm memory regions (peak across compiled buckets):");
         let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
         println!("  weights          {:>10.2} MB", mb(a.regions.weights));
-        println!("  kv-cache (peak)  {:>10.2} MB", mb(a.regions.kv_cache_peak));
+        println!(
+            "  kv-cache (peak)  {:>10.2} MB",
+            mb(a.regions.kv_cache_peak)
+        );
         println!("  scratch  (peak)  {:>10.2} MB", mb(a.regions.scratch_peak));
-        println!("  request-io (peak){:>10.2} MB", mb(a.regions.request_io_peak));
+        println!(
+            "  request-io (peak){:>10.2} MB",
+            mb(a.regions.request_io_peak)
+        );
         if a.regions.static_ > 0 {
             println!("  static           {:>10.2} MB", mb(a.regions.static_));
         }
@@ -1599,8 +1640,14 @@ fn print_report(r: &Report) {
         println!();
         println!("on-disk artifacts:");
         let kb = |b: u64| b as f64 / 1024.0;
-        println!("  packets total    {:>10.1} KB", kb(a.on_disk.packets_total));
-        println!("  map.json total   {:>10.1} KB", kb(a.on_disk.map_json_total));
+        println!(
+            "  packets total    {:>10.1} KB",
+            kb(a.on_disk.packets_total)
+        );
+        println!(
+            "  map.json total   {:>10.1} KB",
+            kb(a.on_disk.map_json_total)
+        );
         if a.on_disk.trace_json_total > 0 {
             println!(
                 "  trace.json total {:>10.1} KB",
@@ -1643,7 +1690,9 @@ fn viz_strip_vision(json: &str) -> String {
         return json.to_string();
     };
     if v.get("model_type").and_then(|m| m.as_str()) == Some("kimi_k3")
-        && v.get("vision_config").map(|c| !c.is_null()).unwrap_or(false)
+        && v.get("vision_config")
+            .map(|c| !c.is_null())
+            .unwrap_or(false)
     {
         warn!("kimi_k3 vision_config ignored for viz: drawing the TEXT tower only");
         v.as_object_mut().map(|o| o.remove("vision_config"));
@@ -1681,9 +1730,11 @@ fn viz_build(
     };
 
     let json = viz_strip_vision(&json);
-    let mut g =
-        nn_graph::models::build_from_config_json_at(&json, &nn_graph::models::ShapeBucket::default())
-            .map_err(|e| format!("graph build failed for {src:?}: {e}"))?;
+    let mut g = nn_graph::models::build_from_config_json_at(
+        &json,
+        &nn_graph::models::ShapeBucket::default(),
+    )
+    .map_err(|e| format!("graph build failed for {src:?}: {e}"))?;
 
     let mut b = nn_graph::Bindings::new();
     if let Some(v) = batch {
@@ -1772,8 +1823,7 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     use std::net::TcpListener;
 
     let addr = format!("127.0.0.1:{}", v.port);
-    let listener = TcpListener::bind(&addr)
-        .map_err(|e| format!("cannot bind {addr}: {e}"))?;
+    let listener = TcpListener::bind(&addr).map_err(|e| format!("cannot bind {addr}: {e}"))?;
     let url = format!("http://{addr}");
     info!(url = %url, "serving nn-graph visualizer (Ctrl-C to stop)");
     eprintln!("\n  🌐 Graph viewer: {url}\n");
@@ -1781,9 +1831,13 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     if v.open {
         // Best-effort open in browser
         #[cfg(target_os = "macos")]
-        { let _ = std::process::Command::new("open").arg(&url).spawn(); }
+        {
+            let _ = std::process::Command::new("open").arg(&url).spawn();
+        }
         #[cfg(target_os = "linux")]
-        { let _ = std::process::Command::new("xdg-open").arg(&url).spawn(); }
+        {
+            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        }
     }
 
     let html_bytes = html.into_bytes();
@@ -1801,8 +1855,9 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|l| l.split_whitespace().nth(1))
             .unwrap_or("/");
 
-        let (content_type, body): (&str, Vec<u8>) = if let Some(query) =
-            path.strip_prefix("/graph").and_then(|r| r.strip_prefix('?'))
+        let (content_type, body): (&str, Vec<u8>) = if let Some(query) = path
+            .strip_prefix("/graph")
+            .and_then(|r| r.strip_prefix('?'))
         {
             // /graph?model=…&batch=…&seq=… → rebuild and return JSON.
             let mut model = String::new();
@@ -1816,7 +1871,11 @@ fn run_viz(v: &VizCli, cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     _ => {}
                 }
             }
-            let src = if model.is_empty() { source.clone() } else { model };
+            let src = if model.is_empty() {
+                source.clone()
+            } else {
+                model
+            };
             let json = match viz_build(&src, batch, seq) {
                 Ok((g, t)) => {
                     info!(source = %src, ?batch, ?seq, "rebuilt graph for viz request");
@@ -1932,8 +1991,8 @@ mod cli_tests {
             prog_t: vec![],
             gen: vec![],
         };
-        let rep = devgen::skip_hook(why)(&empty)
-            .expect("a skip is Ok — degrade, never fail the compile");
+        let rep =
+            devgen::skip_hook(why)(&empty).expect("a skip is Ok — degrade, never fail the compile");
         assert!(!rep.verified);
         assert!(!rep.oracle);
         assert!(rep.reason.is_some_and(|r| !r.is_empty()));

@@ -20,11 +20,17 @@ impl std::fmt::Display for SampleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SampleError::TooFew { got, need } => {
-                write!(f, "{got} samples is below the {need} required for a robust statistic")
+                write!(
+                    f,
+                    "{got} samples is below the {need} required for a robust statistic"
+                )
             }
             SampleError::NotPositive => write!(f, "a sample was not a positive finite duration"),
             SampleError::Contended => {
-                write!(f, "the GPU was contended during measurement (gpulease rc=76)")
+                write!(
+                    f,
+                    "the GPU was contended during measurement (gpulease rc=76)"
+                )
             }
         }
     }
@@ -52,7 +58,10 @@ impl Stats {
 
     pub fn from_samples(mut ns: Vec<f64>) -> Result<Self, SampleError> {
         if ns.len() < Self::MIN_SAMPLES {
-            return Err(SampleError::TooFew { got: ns.len(), need: Self::MIN_SAMPLES });
+            return Err(SampleError::TooFew {
+                got: ns.len(),
+                need: Self::MIN_SAMPLES,
+            });
         }
         if ns.iter().any(|v| !v.is_finite() || *v <= 0.0) {
             return Err(SampleError::NotPositive);
@@ -137,7 +146,10 @@ mod tests {
     fn a_win_inside_the_noise_is_not_a_win() {
         let noisy_fast = Stats::from_samples(vec![90.0, 95.0, 99.0, 105.0, 130.0]).unwrap();
         let noisy_slow = Stats::from_samples(vec![91.0, 96.0, 100.0, 106.0, 131.0]).unwrap();
-        assert!(!noisy_fast.beats(&noisy_slow), "1 ns apart with ~30 ns jitter");
+        assert!(
+            !noisy_fast.beats(&noisy_slow),
+            "1 ns apart with ~30 ns jitter"
+        );
 
         let tight_fast = Stats::from_samples(vec![50.0, 50.0, 50.0, 51.0, 51.0]).unwrap();
         let tight_slow = Stats::from_samples(vec![99.0, 100.0, 100.0, 100.0, 101.0]).unwrap();

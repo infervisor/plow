@@ -215,7 +215,11 @@ pub fn slice_for<'a>(
     let full = src.len() as u64;
 
     // tp==1 binds everything whole, which is byte-identical to the pre-TP path.
-    let shard = if tp > 1 { shard_of(name) } else { Shard::Replicated };
+    let shard = if tp > 1 {
+        shard_of(name)
+    } else {
+        Shard::Replicated
+    };
 
     // A row-parallel SCALE is replicated. An fp8 per-output-channel scale is
     // `[out]` — 1-D — and row-parallel splits the INPUT axis, which such a
@@ -368,7 +372,9 @@ pub fn slice_for<'a>(
         Shard::Row => {
             let (out, in_full) = (shape[0] as u64, shape[1] as u64);
             if out == 0 || in_full == 0 {
-                return Err(bad(format!("row-parallel with a degenerate shape {shape:?}")));
+                return Err(bad(format!(
+                    "row-parallel with a degenerate shape {shape:?}"
+                )));
             }
             if in_full % tp as u64 != 0 {
                 return Err(bad(format!(
@@ -454,11 +460,19 @@ mod tests {
         let full: Vec<u8> = (0..64).map(|i| i as u8).collect();
         // Declared at 1/4: genuinely column-parallel, rank 2 gets the third quarter.
         let got = slice_for("gate_proj.weight", &full, &[8, 4], 16, 2, 4).unwrap();
-        assert_eq!(&*got, &full[32..48], "a declared 1/tp slice stopped sharding");
+        assert_eq!(
+            &*got,
+            &full[32..48],
+            "a declared 1/tp slice stopped sharding"
+        );
         // Row-parallel declared at 1/2 still gathers rather than binding whole.
         let g2 = slice_for("down_proj.weight", &full, &[8, 4], 32, 1, 2).unwrap();
         assert_eq!(g2.len(), 32);
-        assert_ne!(&*g2, &full[..32], "row-parallel returned a contiguous prefix");
+        assert_ne!(
+            &*g2,
+            &full[..32],
+            "row-parallel returned a contiguous prefix"
+        );
         // Neither whole nor a clean 1/tp: still an error, not a silent replicate.
         assert!(slice_for("gate_proj.weight", &full, &[8, 4], 20, 0, 4).is_err());
     }
@@ -540,8 +554,7 @@ mod tests {
         let want = 16; // 4 shards
         let mut seen = Vec::new();
         for rank in 0..4 {
-            let got =
-                slice_for("q_proj.weight", &full, &[8, 8], want, rank, 4).unwrap();
+            let got = slice_for("q_proj.weight", &full, &[8, 8], want, rank, 4).unwrap();
             assert_eq!(&*got, &full[rank as usize * 16..(rank as usize + 1) * 16]);
             seen.extend_from_slice(&got);
         }
@@ -587,7 +600,9 @@ mod tests {
         let r0 = slice_for("o_proj.weight", &full, &[3, 4], want, 0, 2).unwrap();
         let r1 = slice_for("down_proj.weight", &full, &[3, 4], want, 1, 2).unwrap();
         let u16s = |b: &[u8]| -> Vec<u16> {
-            b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+            b.chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
         };
         assert_eq!(u16s(&r0), vec![0, 1, 10, 11, 20, 21]);
         assert_eq!(u16s(&r1), vec![2, 3, 12, 13, 22, 23]);
@@ -646,7 +661,9 @@ mod tests {
         // 128 f32 stored, 96 live, head-major.
         let full: Vec<u8> = (0..128u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
         let f32s = |b: &[u8]| -> Vec<f32> {
-            b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+            b.chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
         };
 
         // tp = 1: the whole live prefix, and NOT the 32 pad entries.
@@ -740,13 +757,17 @@ mod glm_shard_tests {
             );
             for proj in ["gate_proj", "up_proj"] {
                 assert_eq!(
-                    shard_of(&format!("model.layers.3.mlp.shared_experts.{proj}.{suffix}")),
+                    shard_of(&format!(
+                        "model.layers.3.mlp.shared_experts.{proj}.{suffix}"
+                    )),
                     Shard::Column,
                     "the shared expert's {proj} is column-parallel; {suffix}"
                 );
             }
             assert_eq!(
-                shard_of(&format!("model.layers.3.mlp.shared_experts.down_proj.{suffix}")),
+                shard_of(&format!(
+                    "model.layers.3.mlp.shared_experts.down_proj.{suffix}"
+                )),
                 Shard::Row,
                 "the shared expert's down_proj is row-parallel; {suffix}"
             );
@@ -765,8 +786,14 @@ mod glm_shard_tests {
             shard_of("model.layers.3.mlp.experts.17.down_proj.weight"),
             Shard::Row
         );
-        assert_eq!(shard_of("model.layers.3.self_attn.o_proj.weight"), Shard::Row);
-        assert_eq!(shard_of("model.layers.3.mlp.gate.weight"), Shard::Replicated);
+        assert_eq!(
+            shard_of("model.layers.3.self_attn.o_proj.weight"),
+            Shard::Row
+        );
+        assert_eq!(
+            shard_of("model.layers.3.mlp.gate.weight"),
+            Shard::Replicated
+        );
     }
 
     /// K3's two latent-MoE projections shard on DIFFERENT rules, and both are pinned
@@ -827,7 +854,10 @@ mod glm_shard_tests {
             );
             seen.extend_from_slice(&got);
         }
-        assert_eq!(seen, full, "the eight shards must reassemble into the original");
+        assert_eq!(
+            seen, full,
+            "the eight shards must reassemble into the original"
+        );
         // And declared WHOLE it is still replicated — the tp=1 emit, unchanged.
         let whole = full.len() as u64;
         assert_eq!(
@@ -925,7 +955,10 @@ mod mxfp4_shard_tests {
     /// `w1` must not be dragged into the expert tables.
     #[test]
     fn the_mixtral_entries_do_not_capture_longer_identifiers() {
-        for n in ["model.layers.0.self_attn.qw1.weight", "model.layers.0.mlp.rw2.weight"] {
+        for n in [
+            "model.layers.0.self_attn.qw1.weight",
+            "model.layers.0.mlp.rw2.weight",
+        ] {
             assert_eq!(shard_of(n), Shard::Replicated, "{n}");
         }
     }
@@ -938,15 +971,28 @@ mod mxfp4_shard_tests {
     #[test]
     fn a_two_dimensional_e8m0_scale_row_is_gathered_not_replicated() {
         // [out=3, K/32=4] of E8M0, value = row*10 + group.
-        let full: Vec<u8> = (0..3u8).flat_map(|r| (0..4u8).map(move |g| r * 10 + g)).collect();
+        let full: Vec<u8> = (0..3u8)
+            .flat_map(|r| (0..4u8).map(move |g| r * 10 + g))
+            .collect();
         let name = format!("{K3}w2.weight_scale");
         let got = slice_for(&name, &full, &[3, 4], 6, 1, 2).unwrap();
-        assert_eq!(&*got, &[2, 3, 12, 13, 22, 23], "rank 1 owns the upper K groups");
+        assert_eq!(
+            &*got,
+            &[2, 3, 12, 13, 22, 23],
+            "rank 1 owns the upper K groups"
+        );
 
         // Same name, the per-channel fp8 shape: no input axis, so replicated.
         let ch: Vec<u8> = (0..12u8).collect();
-        let got = slice_for("model.layers.3.mlp.down_proj.weight_scale", &ch, &[3], 12, 1, 2)
-            .unwrap();
+        let got = slice_for(
+            "model.layers.3.mlp.down_proj.weight_scale",
+            &ch,
+            &[3],
+            12,
+            1,
+            2,
+        )
+        .unwrap();
         assert_eq!(&*got, &ch[..]);
     }
 
@@ -964,10 +1010,24 @@ mod mxfp4_shard_tests {
         let wn = format!("{K3}w2.weight_packed");
         let sn = format!("{K3}w2.weight_scale");
         for rank in 0..TP {
-            let gw = slice_for(&wn, &w, &[LAT, IMOE / 2], (w.len() / TP as usize) as u64, rank, TP)
-                .unwrap();
-            let gs = slice_for(&sn, &s, &[LAT, IMOE / 32], (s.len() / TP as usize) as u64, rank, TP)
-                .unwrap();
+            let gw = slice_for(
+                &wn,
+                &w,
+                &[LAT, IMOE / 2],
+                (w.len() / TP as usize) as u64,
+                rank,
+                TP,
+            )
+            .unwrap();
+            let gs = slice_for(
+                &sn,
+                &s,
+                &[LAT, IMOE / 32],
+                (s.len() / TP as usize) as u64,
+                rank,
+                TP,
+            )
+            .unwrap();
             // Row 0's first payload byte holds elements [rank*IMOE/TP ..], and its
             // first scale byte covers exactly that group.
             assert_eq!(gw[0], (rank as usize * IMOE / 2 / TP as usize) as u8);

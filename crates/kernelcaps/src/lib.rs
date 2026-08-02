@@ -42,8 +42,6 @@ pub mod targets;
 pub use build::{BuildId, Provenance};
 pub use hwspec::{CalibrationTier, HardwareFingerprint, IsaLevel};
 pub use probe::{probe, ProbeError, ProbeTarget, ProbedObject};
-pub use sweep::{classify as classify_macro, knobs, Knob, Sweepable};
-pub use targets::{dense_gemm_inventory, prefill_recipe, ObjectRecipe};
 pub use resource::{GateVerdict, ResourceEnvelope, ResourceGate};
 pub use select::{
     select_kernel, MeasuredCosts, NoMeasurements, Rationale, Realization, SelectError,
@@ -52,6 +50,8 @@ pub use spec::{
     Determinism, KernelId, KernelSpec, OpSignature, Phase, ProfileId, QuantScheme, SemanticOp,
     ShapeClass, ShapeSignature, TileConfig,
 };
+pub use sweep::{classify as classify_macro, knobs, Knob, Sweepable};
+pub use targets::{dense_gemm_inventory, prefill_recipe, ObjectRecipe};
 
 use std::collections::BTreeMap;
 
@@ -140,7 +140,10 @@ impl Inventory {
     pub fn alias_groups(&self) -> BTreeMap<&str, Vec<&KernelSpec>> {
         let mut by_hash: BTreeMap<&str, Vec<&KernelSpec>> = BTreeMap::new();
         for k in &self.specs {
-            by_hash.entry(k.implementation_hash.as_str()).or_default().push(k);
+            by_hash
+                .entry(k.implementation_hash.as_str())
+                .or_default()
+                .push(k);
         }
         by_hash.retain(|_, v| v.len() > 1);
         by_hash
@@ -190,18 +193,35 @@ mod tests {
     /// build must report them as aliases, not as three candidates.
     #[test]
     fn nvidia_gemm_tile_opcodes_are_reported_as_aliases() {
-        let reg = Inventory::probed(test_build(hwspec::IsaLevel::Sm90a), [
-            KernelSpec::gemm_tile(DevOp::Gemm, hwspec::IsaLevel::Sm90a, 128, 128, 32, "d_gemm@nv"),
-            KernelSpec::gemm_tile(DevOp::GemmMed, hwspec::IsaLevel::Sm90a, 128, 128, 32, "d_gemm@nv"),
-            KernelSpec::gemm_tile(
-                DevOp::GemmSmall,
-                hwspec::IsaLevel::Sm90a,
-                128,
-                128,
-                32,
-                "d_gemm@nv",
-            ),
-        ]);
+        let reg = Inventory::probed(
+            test_build(hwspec::IsaLevel::Sm90a),
+            [
+                KernelSpec::gemm_tile(
+                    DevOp::Gemm,
+                    hwspec::IsaLevel::Sm90a,
+                    128,
+                    128,
+                    32,
+                    "d_gemm@nv",
+                ),
+                KernelSpec::gemm_tile(
+                    DevOp::GemmMed,
+                    hwspec::IsaLevel::Sm90a,
+                    128,
+                    128,
+                    32,
+                    "d_gemm@nv",
+                ),
+                KernelSpec::gemm_tile(
+                    DevOp::GemmSmall,
+                    hwspec::IsaLevel::Sm90a,
+                    128,
+                    128,
+                    32,
+                    "d_gemm@nv",
+                ),
+            ],
+        );
 
         let groups = reg.alias_groups();
         assert_eq!(groups.len(), 1, "one shared body");
@@ -214,27 +234,40 @@ mod tests {
     /// so they must NOT be reported as aliases.
     #[test]
     fn amd_gemm_tile_opcodes_are_distinct_kernels() {
-        let reg = Inventory::probed(test_build(hwspec::IsaLevel::Sm90a), [
-            KernelSpec::gemm_tile(DevOp::Gemm, hwspec::IsaLevel::Gfx950, 256, 256, 64, "exec_gemm"),
-            KernelSpec::gemm_tile(
-                DevOp::GemmMed,
-                hwspec::IsaLevel::Gfx950,
-                128,
-                128,
-                64,
-                "exec_gemm_med",
-            ),
-            KernelSpec::gemm_tile(
-                DevOp::GemmSmall,
-                hwspec::IsaLevel::Gfx950,
-                64,
-                128,
-                64,
-                "exec_gemm_small",
-            ),
-        ]);
+        let reg = Inventory::probed(
+            test_build(hwspec::IsaLevel::Sm90a),
+            [
+                KernelSpec::gemm_tile(
+                    DevOp::Gemm,
+                    hwspec::IsaLevel::Gfx950,
+                    256,
+                    256,
+                    64,
+                    "exec_gemm",
+                ),
+                KernelSpec::gemm_tile(
+                    DevOp::GemmMed,
+                    hwspec::IsaLevel::Gfx950,
+                    128,
+                    128,
+                    64,
+                    "exec_gemm_med",
+                ),
+                KernelSpec::gemm_tile(
+                    DevOp::GemmSmall,
+                    hwspec::IsaLevel::Gfx950,
+                    64,
+                    128,
+                    64,
+                    "exec_gemm_small",
+                ),
+            ],
+        );
 
-        assert!(reg.alias_groups().is_empty(), "three distinct bodies, no aliasing");
+        assert!(
+            reg.alias_groups().is_empty(),
+            "three distinct bodies, no aliasing"
+        );
         assert!(!reg.are_aliases(KernelId(DevOp::Gemm), KernelId(DevOp::GemmMed)));
     }
 
@@ -243,20 +276,24 @@ mod tests {
     /// "compiler candidates == executable kernels" property hold.
     #[test]
     fn a_kernel_for_another_isa_is_never_a_candidate() {
-        let reg = Inventory::probed(test_build(hwspec::IsaLevel::Sm90a), [KernelSpec::gemm_tile(
-            DevOp::Gemm,
-            hwspec::IsaLevel::Gfx950,
-            256,
-            256,
-            64,
-            "exec_gemm",
-        )]);
+        let reg = Inventory::probed(
+            test_build(hwspec::IsaLevel::Sm90a),
+            [KernelSpec::gemm_tile(
+                DevOp::Gemm,
+                hwspec::IsaLevel::Gfx950,
+                256,
+                256,
+                64,
+                "exec_gemm",
+            )],
+        );
 
         assert!(reg
             .candidates(&gemm(4096, 4096, 4096), &h100(), ProfileId::PrefillDense)
             .is_empty());
         assert_eq!(
-            reg.candidates(&gemm(4096, 4096, 4096), &mi350(), ProfileId::PrefillDense).len(),
+            reg.candidates(&gemm(4096, 4096, 4096), &mi350(), ProfileId::PrefillDense)
+                .len(),
             1
         );
     }
@@ -266,15 +303,22 @@ mod tests {
     /// would emit an opcode the decode interpreter does not dispatch.
     #[test]
     fn profile_is_part_of_the_capability_filter() {
-        let reg = Inventory::probed(test_build(hwspec::IsaLevel::Sm90a), [KernelSpec::gemm_tile(
-            DevOp::Gemm,
-            hwspec::IsaLevel::Sm90a,
-            128,
-            128,
-            32,
-            "d_gemm@nv",
-        )]);
-        assert_eq!(reg.candidates(&gemm(4096, 4096, 4096), &h100(), ProfileId::PrefillDense).len(), 1);
+        let reg = Inventory::probed(
+            test_build(hwspec::IsaLevel::Sm90a),
+            [KernelSpec::gemm_tile(
+                DevOp::Gemm,
+                hwspec::IsaLevel::Sm90a,
+                128,
+                128,
+                32,
+                "d_gemm@nv",
+            )],
+        );
+        assert_eq!(
+            reg.candidates(&gemm(4096, 4096, 4096), &h100(), ProfileId::PrefillDense)
+                .len(),
+            1
+        );
         assert!(reg
             .candidates(&gemm(1, 4096, 4096), &h100(), ProfileId::DecodeDense)
             .is_empty());
@@ -303,7 +347,8 @@ mod tests {
             ..gemm(4096, 4096, 4096)
         };
         assert!(
-            reg.candidates(&op, &h100(), ProfileId::PrefillDense).is_empty(),
+            reg.candidates(&op, &h100(), ProfileId::PrefillDense)
+                .is_empty(),
             "an opcode with no dispatch arm must never be a candidate"
         );
     }

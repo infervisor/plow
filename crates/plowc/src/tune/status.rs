@@ -133,7 +133,10 @@ pub fn status(
     if current_selectable == 0 {
         println!("*** EVERY RECORD IN THIS CELL IS STALE. ***");
         println!();
-        println!("The store holds {} record(s) and the compiler can use NONE of them: selection", all.len());
+        println!(
+            "The store holds {} record(s) and the compiler can use NONE of them: selection",
+            all.len()
+        );
         println!("falls back to the analytical model for every shape and reports tier `portable`,");
         println!("while `tuned_tile_selection` keeps passing on whatever other cell has data.");
         println!();
@@ -145,9 +148,15 @@ pub fn status(
     }
 
     let (best, stale) = store.best_for(cell, want)?;
-    println!("selectable  : {} op cases against the probed build", best.len());
+    println!(
+        "selectable  : {} op cases against the probed build",
+        best.len()
+    );
     if !stale.is_empty() {
-        println!("stale       : {} record(s) exist but cannot be used", stale.len());
+        println!(
+            "stale       : {} record(s) exist but cannot be used",
+            stale.len()
+        );
     }
 
     // 3. COVERAGE, last.
@@ -160,7 +169,11 @@ pub fn status(
     println!();
     let shapes = demand::derive(spec)?;
     let (hit, miss) = demand::coverage(&shapes);
-    println!("demand      : {} distinct shapes from {}", shapes.len(), spec.hf_dir.display());
+    println!(
+        "demand      : {} distinct shapes from {}",
+        shapes.len(),
+        spec.hf_dir.display()
+    );
     println!("coverage    : {hit} HIT / {miss} MISS");
     if miss > 0 {
         println!("              the {miss} MISS shapes select from the ANALYTICAL MODEL. Close");
@@ -191,7 +204,10 @@ pub fn regress(db: &PathBuf, cell: &str, threshold: f64) -> Result<(), Err> {
         }
     }
     println!("cell        : {cell}");
-    println!("timeline    : {} build digest(s), oldest first (file order):", order.len());
+    println!(
+        "timeline    : {} build digest(s), oldest first (file order):",
+        order.len()
+    );
     for d in &order {
         println!("  {}", short(d));
     }
@@ -204,7 +220,10 @@ pub fn regress(db: &PathBuf, cell: &str, threshold: f64) -> Result<(), Err> {
 
     // (op_case, kernel) -> digest -> median
     let mut series: BTreeMap<(String, String), BTreeMap<String, f64>> = BTreeMap::new();
-    for r in all.iter().filter(|r| matches!(r.correctness, tunedb::Correctness::Pass)) {
+    for r in all
+        .iter()
+        .filter(|r| matches!(r.correctness, tunedb::Correctness::Pass))
+    {
         series
             .entry((r.op_case.clone(), r.kernel_name.clone()))
             .or_default()
@@ -216,7 +235,10 @@ pub fn regress(db: &PathBuf, cell: &str, threshold: f64) -> Result<(), Err> {
     // First-to-last drift per (op case, kernel).
     let mut drift: BTreeMap<(String, String), (f64, f64, f64, usize)> = BTreeMap::new();
     for ((case, kernel), by_digest) in &series {
-        let seen: Vec<&String> = order.iter().filter(|d| by_digest.contains_key(*d)).collect();
+        let seen: Vec<&String> = order
+            .iter()
+            .filter(|d| by_digest.contains_key(*d))
+            .collect();
         if seen.len() < 2 {
             continue;
         }
@@ -263,11 +285,17 @@ pub fn regress(db: &PathBuf, cell: &str, threshold: f64) -> Result<(), Err> {
         ));
     }
     if worst.is_empty() {
-        println!("no op case moved by {:.0}% or more across digests.", threshold * 100.0);
+        println!(
+            "no op case moved by {:.0}% or more across digests.",
+            threshold * 100.0
+        );
         return Ok(());
     }
     worst.sort_by(|a, b| b.0.partial_cmp(&a.0).expect("finite"));
-    println!("moved by >= {:.0}% between the first and last digest that measured it:", threshold * 100.0);
+    println!(
+        "moved by >= {:.0}% between the first and last digest that measured it:",
+        threshold * 100.0
+    );
     println!("(positive = SLOWER now)");
     for (_, line) in &worst {
         println!("{line}");

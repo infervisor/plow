@@ -22,13 +22,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
     let mut args = std::env::args().skip(1);
-    let assets = std::path::PathBuf::from(args.next().ok_or("usage: step_bench <assets> [slots] [ctx] [steps]")?);
+    let assets = std::path::PathBuf::from(
+        args.next()
+            .ok_or("usage: step_bench <assets> [slots] [ctx] [steps]")?,
+    );
     let want_slots: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(1);
     let ctx: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(4137);
     let steps: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(128);
@@ -64,7 +66,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             tok
         };
-        println!("slot {b}: prompt consumed in {:.3} s", t0.elapsed().as_secs_f64());
+        println!(
+            "slot {b}: prompt consumed in {:.3} s",
+            t0.elapsed().as_secs_f64()
+        );
     }
 
     // Warmup (repo convention: discard 16), then timed steps.

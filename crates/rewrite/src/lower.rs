@@ -75,7 +75,13 @@ fn term_for(
         }
         Op::Linear { out_features, bias } => {
             if *bias {
-                format!("(LinearBias {} {} {} {})", e(0)?, e(1)?, e(2)?, out_features)
+                format!(
+                    "(LinearBias {} {} {} {})",
+                    e(0)?,
+                    e(1)?,
+                    e(2)?,
+                    out_features
+                )
             } else {
                 format!("(Linear {} {} {})", e(0)?, e(1)?, out_features)
             }

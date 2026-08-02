@@ -247,8 +247,8 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info".into());
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let filter_str = format!("{filter}");
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
@@ -309,7 +309,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             program,
             range,
             format,
-            plowrt::disasm::Sections { kernargs, tensors, counters, stream, no_analysis },
+            plowrt::disasm::Sections {
+                kernargs,
+                tensors,
+                counters,
+                stream,
+                no_analysis,
+            },
         ),
         Cmd::Devices {
             tp,
@@ -332,10 +338,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             if tp > 1 {
                 amd_bench_tp(
-                    blob, hsaco, checkpoint, prompt, steps, ctx, tp, batched, dump_logits,
+                    blob,
+                    hsaco,
+                    checkpoint,
+                    prompt,
+                    steps,
+                    ctx,
+                    tp,
+                    batched,
+                    dump_logits,
                 )
             } else {
-                amd_bench(blob, hsaco, checkpoint, prompt, steps, ctx, batched, dump_logits)
+                amd_bench(
+                    blob,
+                    hsaco,
+                    checkpoint,
+                    prompt,
+                    steps,
+                    ctx,
+                    batched,
+                    dump_logits,
+                )
             }
         }
         #[cfg(not(feature = "hsa"))]
@@ -381,7 +404,11 @@ fn amd_bench(
         eng.schedulers(),
     );
     for p in 0..eng.n_programs() {
-        println!("  program {p}: T={} segments={}", eng.prog_t(p), eng.prog_segments(p));
+        println!(
+            "  program {p}: T={} segments={}",
+            eng.prog_t(p),
+            eng.prog_segments(p)
+        );
     }
 
     if batched {
@@ -469,8 +496,11 @@ fn amd_bench(
             }
         } else {
             for s in 0..b {
-                println!("  slot {s} chain ({} prompt tokens): {:?}",
-                    prompts[s % prompts.len()].len(), chains[s]);
+                println!(
+                    "  slot {s} chain ({} prompt tokens): {:?}",
+                    prompts[s % prompts.len()].len(),
+                    chains[s]
+                );
             }
             // Slots fed the SAME prompt must produce the SAME stream. This is
             // the check the old `--prompt` path could not make, because prefill
@@ -484,7 +514,8 @@ fn amd_bench(
             // right.
             let mut verdict = true;
             for s in 1..b {
-                let first = (0..s).find(|&r| prompts[r % prompts.len()] == prompts[s % prompts.len()]);
+                let first =
+                    (0..s).find(|&r| prompts[r % prompts.len()] == prompts[s % prompts.len()]);
                 if let Some(r) = first {
                     if chains[s] != chains[r] {
                         verdict = false;
@@ -494,11 +525,13 @@ fn amd_bench(
             }
             println!(
                 "  same-prompt slots agree: {}",
-                if verdict { "YES" } else { "NO  <-- per-sequence KV rows are wrong" }
+                if verdict {
+                    "YES"
+                } else {
+                    "NO  <-- per-sequence KV rows are wrong"
+                }
             );
-            println!(
-                "  cross-check each DIFFERENT prompt against a batch-1 run of the same ids"
-            );
+            println!("  cross-check each DIFFERENT prompt against a batch-1 run of the same ids");
         }
 
         let t0 = std::time::Instant::now();
@@ -546,7 +579,9 @@ fn amd_bench(
         // ask whether TP's own geometry (K3's 12 local KDA heads at BV=8, against
         // the 96-head BV=16 shape every block gate validates) changed the answer.
         let dump = |e: &AmdEngine, tag: &str| -> Result<(), Box<dyn std::error::Error>> {
-            let Some(dir) = &dump_logits else { return Ok(()) };
+            let Some(dir) = &dump_logits else {
+                return Ok(());
+            };
             std::fs::create_dir_all(dir)?;
             let n = e.tensor_bytes("act.logits").ok_or("no act.logits")? as usize;
             let mut buf = vec![0u8; n];
@@ -606,7 +641,10 @@ fn amd_bench(
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
         println!("  {out:?}");
-        println!("  {steps} decode steps: {ms:.3} ms/token ({:.1} tok/s)", 1e3 / ms);
+        println!(
+            "  {steps} decode steps: {ms:.3} ms/token ({:.1} tok/s)",
+            1e3 / ms
+        );
         if !eng.weights_bound() {
             println!("  (weights unbound — these ids are noise)");
         }
@@ -713,9 +751,14 @@ fn amd_bench_tp(
     // real arithmetic difference, and the whole prefill question is which of
     // those a token flip is.
     let dump = |g: &AmdTpGroup, tag: &str| -> Result<(), Box<dyn std::error::Error>> {
-        let Some(dir) = &dump_logits else { return Ok(()) };
+        let Some(dir) = &dump_logits else {
+            return Ok(());
+        };
         std::fs::create_dir_all(dir)?;
-        let n = g.rank(0).tensor_bytes("act.logits").ok_or("no act.logits")? as usize;
+        let n = g
+            .rank(0)
+            .tensor_bytes("act.logits")
+            .ok_or("no act.logits")? as usize;
         let mut buf = vec![0u8; n];
         g.rank(0).read_tensor("act.logits", &mut buf)?;
         std::fs::write(dir.join(format!("logits_{tag}.bin")), &buf)?;
@@ -744,12 +787,17 @@ fn amd_bench_tp(
                 .collect::<std::result::Result<_, _>>()?,
         };
         if prompts.is_empty() {
-            return Err("--batched on TP needs --prompt: without one every slot decodes over KV \
+            return Err(
+                "--batched on TP needs --prompt: without one every slot decodes over KV \
                         nobody wrote, and agreement between slots is then a statement about VRAM \
                         history rather than about batching"
-                .into());
+                    .into(),
+            );
         }
-        println!("\nbatched TP decode: {b} sequences per dispatch, {} ranks", g.n_gpu());
+        println!(
+            "\nbatched TP decode: {b} sequences per dispatch, {} ranks",
+            g.n_gpu()
+        );
 
         let mut pos_v: Vec<u32> = vec![0; b];
         let mut feed: Vec<u32> = vec![0; b];
@@ -904,10 +952,8 @@ fn amd_bench_tp(
         // `PLOW_DSTEP_EVERY` tokens; off, this is one `OnceLock` load.
         let t_tok = plowrt::obs::dstep::on().then(std::time::Instant::now);
         let ids = g.decode_step(ctx + 1 + i, ctx + 2 + i)?;
-        if plowrt::obs::dstep::timed(&plowrt::obs::dstep::AGREE, || {
-            AmdTpGroup::agree(&ids)
-        })
-        .is_err()
+        if plowrt::obs::dstep::timed(&plowrt::obs::dstep::AGREE, || AmdTpGroup::agree(&ids))
+            .is_err()
         {
             disagreements += 1;
         }
@@ -1018,7 +1064,10 @@ fn amd_block(
     // all-zero tensor is a store that never landed, or a counter gate that let
     // the consumer run before the producer wrote. Walking the chain says which
     // link went quiet.
-    println!("\n{:<16} {:>12} {:>10} {:>14}", "tensor", "non-zero", "%", "sum|x| (bf16)");
+    println!(
+        "\n{:<16} {:>12} {:>10} {:>14}",
+        "tensor", "non-zero", "%", "sum|x| (bf16)"
+    );
     for name in inspect.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let Some(bytes) = eng.tensor_bytes(name) else {
             println!("{name:<16} {:>12}", "(absent)");
@@ -1030,9 +1079,7 @@ fn amd_block(
         let nz = buf.chunks_exact(2).filter(|c| c != &[0u8, 0u8]).count();
         let sum: f64 = buf
             .chunks_exact(2)
-            .map(|c| {
-                f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16).abs() as f64
-            })
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16).abs() as f64)
             .sum();
         println!(
             "{name:<16} {nz:>12} {:>9.1}% {sum:>14.4}",
@@ -1044,7 +1091,10 @@ fn amd_block(
         }
     }
     if let Some(dir) = &dump {
-        println!("\nwrote raw tensors to {} — diff two precisions byte-wise", dir.display());
+        println!(
+            "\nwrote raw tensors to {} — diff two precisions byte-wise",
+            dir.display()
+        );
     }
     println!(
         "\nALL-ZERO on a tensor means a store that never landed or a gate that let\n\
@@ -1089,9 +1139,11 @@ fn devices(
         return Ok(());
     };
     if n as usize > all.len() {
-        return Err(format!("--tp {n} but only {} devices are visible \
+        return Err(format!(
+            "--tp {n} but only {} devices are visible \
              (AMD: the visible set is ROCR_VISIBLE_DEVICES, not HIP_VISIBLE_DEVICES)",
-            all.len())
+            all.len()
+        )
         .into());
     }
 
@@ -1108,7 +1160,11 @@ fn devices(
          {} ({n_xctr} xctr gates over {layers} layers), \
          peer footprint={} B/rank (partials {} B, xctr {} B at +{})",
         groups.len(),
-        if prefill { "PREFILL two-shot" } else { "DECODE one-shot" },
+        if prefill {
+            "PREFILL two-shot"
+        } else {
+            "DECODE one-shot"
+        },
         layout.bytes(),
         layout.xctr_off(),
         layout.xctr_bytes(),
@@ -1184,7 +1240,11 @@ fn disasm_cmd(
 
     // Same convention as `graphstat`: a directory means the `model.pkt` in it.
     let p = blob_path.as_path();
-    let file = if p.is_dir() { p.join("model.pkt") } else { p.to_path_buf() };
+    let file = if p.is_dir() {
+        p.join("model.pkt")
+    } else {
+        p.to_path_buf()
+    };
     let buf = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
 
     // Both compiler outputs are called `.pkt`, so the format is decided by the
@@ -1193,8 +1253,12 @@ fn disasm_cmd(
     // different renderer entirely — see `plowrt::disasm::sched`.
     let magic: Option<&[u8; 8]> = buf.get(..8).and_then(|s| s.try_into().ok());
     if !magic.is_some_and(packet::devbuild::is_blob_magic) {
-        let prog = packet::Program::decode(&buf)
-            .map_err(|e| format!("{}: not a PLOWDEV blob, and not a scheduled .pkt either: {e}", file.display()))?;
+        let prog = packet::Program::decode(&buf).map_err(|e| {
+            format!(
+                "{}: not a PLOWDEV blob, and not a scheduled .pkt either: {e}",
+                file.display()
+            )
+        })?;
         let rep = plowrt::disasm::sched::report(&prog, &file.display().to_string());
         match format.as_str() {
             "json" | "jsonl" => println!("{}", serde_json::to_string_pretty(&rep)?),
@@ -1242,10 +1306,19 @@ fn print_disasm_text(
     range: Option<(usize, usize)>,
 ) {
     println!("blob      {}", rep.blob);
-    println!("n_cu      {}  target=0x{:08x}  flags=0x{:x}", rep.n_cu, rep.target, rep.flags);
-    println!("programs  {:?}", blob.progs.iter().map(|p| p.t).collect::<Vec<_>>());
+    println!(
+        "n_cu      {}  target=0x{:08x}  flags=0x{:x}",
+        rep.n_cu, rep.target, rep.flags
+    );
+    println!(
+        "programs  {:?}",
+        blob.progs.iter().map(|p| p.t).collect::<Vec<_>>()
+    );
     if let Some(tp) = &rep.tp {
-        println!("tp        n_gpu={} hidden={} slot_bytes={}", tp.n_gpu, tp.hidden, tp.slot_bytes);
+        println!(
+            "tp        n_gpu={} hidden={} slot_bytes={}",
+            tp.n_gpu, tp.hidden, tp.slot_bytes
+        );
     }
 
     if let Some(ts) = &rep.tensors {
@@ -1263,9 +1336,15 @@ fn print_disasm_text(
     }
 
     let names: Vec<&str> = blob.tensors.iter().map(|t| t.name.as_str()).collect();
-    for (pr, prog) in rep.programs.iter().zip(blob.progs.iter().filter(|p| program.is_none_or(|t| p.t == t)))
-    {
-        println!("\n===== program T={}  {} insts, {} counters", pr.t, pr.n_inst, pr.n_counter);
+    for (pr, prog) in rep.programs.iter().zip(
+        blob.progs
+            .iter()
+            .filter(|p| program.is_none_or(|t| p.t == t)),
+    ) {
+        println!(
+            "\n===== program T={}  {} insts, {} counters",
+            pr.t, pr.n_inst, pr.n_counter
+        );
 
         if let Some(k) = &pr.kernargs {
             println!("  kernargs ({} B)", k.size_bytes);
@@ -1287,8 +1366,17 @@ fn print_disasm_text(
             println!(
                 "  counters: {} ({} dead)  edges {} -> {} tr ({} redundant)  \
                  polls {} -> {} ({} removable)  bumps {}/{} live  critical path {}",
-                a.counters, a.dead, a.edges, a.edges_tr, a.redundant, a.polls, a.polls_tr,
-                a.polls_removable, a.bumps_live, a.bumps, a.critical_path
+                a.counters,
+                a.dead,
+                a.edges,
+                a.edges_tr,
+                a.redundant,
+                a.polls,
+                a.polls_tr,
+                a.polls_removable,
+                a.bumps_live,
+                a.bumps,
+                a.critical_path
             );
             println!(
                 "  liveness: peak {} concurrent at #{}  p50={} p99={}",
@@ -1298,7 +1386,9 @@ fn print_disasm_text(
                 println!(
                     "    DEAD counter {} produced by #{} {} — {} wasted bumps",
                     d.id,
-                    d.producer.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                    d.producer
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "?".into()),
                     d.producer_op.unwrap_or("?"),
                     d.bump_cost
                 );
@@ -1310,18 +1400,28 @@ fn print_disasm_text(
                     e.to,
                     e.via,
                     e.polls_saved,
-                    if e.co_placed { "  (co-placed: poll only, no overlap)" } else { "" }
+                    if e.co_placed {
+                        "  (co-placed: poll only, no overlap)"
+                    } else {
+                        ""
+                    }
                 );
             }
             if c.redundant_edges.len() > 10 {
-                println!("    ... {} more redundant edges", c.redundant_edges.len() - 10);
+                println!(
+                    "    ... {} more redundant edges",
+                    c.redundant_edges.len() - 10
+                );
             }
         }
 
         let (lo, hi) = range.unwrap_or((0, prog.insts.len()));
         let (lo, hi) = (lo.min(prog.insts.len()), hi.min(prog.insts.len()));
         for (k, w) in prog.insts[lo..hi].iter().enumerate() {
-            println!("{}", plowrt::disasm::text_inst(&packet::disasm::disasm(lo + k, w, &names)));
+            println!(
+                "{}",
+                plowrt::disasm::text_inst(&packet::disasm::disasm(lo + k, w, &names))
+            );
         }
     }
 }

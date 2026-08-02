@@ -77,18 +77,27 @@ impl ResourceGate {
     /// The gate `runtime/nvidia/interp_sm120.cu:21` describes: zero spill and at
     /// least one resident block per SM. 255 is ptxas's own ceiling, so a kernel
     /// reporting it has saturated the allocator and is spilling by definition.
-    pub const NVIDIA: ResourceGate =
-        ResourceGate { max_registers: 255, require_zero_spill: true, min_occupancy: 1 };
+    pub const NVIDIA: ResourceGate = ResourceGate {
+        max_registers: 255,
+        require_zero_spill: true,
+        min_occupancy: 1,
+    };
 
     /// The gate `scripts/build_gfx950.sh:118` enforces for the prefill and
     /// decode objects: VGPR+AGPR within 256 and at least 2 waves/SIMD.
-    pub const AMD_INTERP: ResourceGate =
-        ResourceGate { max_registers: 256, require_zero_spill: false, min_occupancy: 2 };
+    pub const AMD_INTERP: ResourceGate = ResourceGate {
+        max_registers: 256,
+        require_zero_spill: false,
+        min_occupancy: 2,
+    };
 
     /// The relaxed AMD budget the flash object is allowed
     /// (`build_gfx950.sh` checks it at 512 registers / 1 wave).
-    pub const AMD_FLASH: ResourceGate =
-        ResourceGate { max_registers: 512, require_zero_spill: false, min_occupancy: 1 };
+    pub const AMD_FLASH: ResourceGate = ResourceGate {
+        max_registers: 512,
+        require_zero_spill: false,
+        min_occupancy: 1,
+    };
 
     pub fn for_isa(isa: IsaLevel) -> Self {
         match isa {
@@ -144,7 +153,12 @@ impl GateVerdict {
 /// ptxas reports every `__global__` in the translation unit, so the caller names
 /// the symbol it cares about — for an interpreter object that is the megakernel,
 /// and the surrounding helper kernels are noise.
-pub fn parse_ptxas(text: &str, symbol: &str, profile: ProfileId, isa: IsaLevel) -> Option<ResourceEnvelope> {
+pub fn parse_ptxas(
+    text: &str,
+    symbol: &str,
+    profile: ProfileId,
+    isa: IsaLevel,
+) -> Option<ResourceEnvelope> {
     let mut lines = text.lines();
     // Find the entry-function banner, then read the block that follows it.
     loop {
@@ -256,7 +270,11 @@ fn field_after(line: &str, head: &str, tail: &str) -> Option<u32> {
         let end = rest.find(tail)?;
         &rest[..end]
     };
-    let digits: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     if digits.is_empty() {
         return None;
     }
@@ -309,7 +327,10 @@ ptxas info    : Compile time = 51221.010 ms
         )
         .expect("decode envelope");
 
-        assert_eq!(env.registers, 208, "must not pick up the 40-register helper");
+        assert_eq!(
+            env.registers, 208,
+            "must not pick up the 40-register helper"
+        );
         assert_eq!(env.spill_stores, 0);
         assert_eq!(env.spill_loads, 0);
         assert_eq!(env.static_smem_bytes, 2192);
@@ -404,14 +425,25 @@ remark: interp.hip:872:0:     LDS Size [bytes/block]: 65536
 
     #[test]
     fn a_missing_symbol_yields_no_envelope() {
-        assert!(parse_ptxas(DECODE_SM90A, "_Z9not_there", ProfileId::DecodeDense, IsaLevel::Sm90a)
-            .is_none());
+        assert!(parse_ptxas(
+            DECODE_SM90A,
+            "_Z9not_there",
+            ProfileId::DecodeDense,
+            IsaLevel::Sm90a
+        )
+        .is_none());
     }
 
     #[test]
     fn amd_gate_applies_to_amd_isas_and_nvidia_gate_otherwise() {
-        assert_eq!(ResourceGate::for_isa(IsaLevel::Gfx950), ResourceGate::AMD_INTERP);
+        assert_eq!(
+            ResourceGate::for_isa(IsaLevel::Gfx950),
+            ResourceGate::AMD_INTERP
+        );
         assert_eq!(ResourceGate::for_isa(IsaLevel::Sm90a), ResourceGate::NVIDIA);
-        assert_eq!(ResourceGate::for_isa(IsaLevel::Sm120a), ResourceGate::NVIDIA);
+        assert_eq!(
+            ResourceGate::for_isa(IsaLevel::Sm120a),
+            ResourceGate::NVIDIA
+        );
     }
 }

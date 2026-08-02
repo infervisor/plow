@@ -89,7 +89,11 @@ impl ExecutorSet {
     /// Run one program to completion on the CPU reference backend, returning
     /// whether every instruction fired (i.e. no deadlock). On a real device this
     /// is instead "enqueue the packet stream and poll the milestone counter".
-    pub fn run_reference(&self, program: &Program, pool: &CounterPool) -> crate::device::cpu::InterpretStats {
+    pub fn run_reference(
+        &self,
+        program: &Program,
+        pool: &CounterPool,
+    ) -> crate::device::cpu::InterpretStats {
         pool.reset_all();
         crate::device::cpu::interpret(program, pool)
     }

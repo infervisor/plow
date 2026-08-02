@@ -2,7 +2,9 @@
 //! 1 GPU / 2×H100 / a heterogeneous SoC, schedule it, and assert the
 //! resource-feasibility invariants (design §4–§9).
 
-use costmodel::{hwspec, CostModel, DEFAULT_PAGE_BYTES, MemoryModel, Soc, SramPolicy, Unit, UnitKind};
+use costmodel::{
+    hwspec, CostModel, MemoryModel, Soc, SramPolicy, Unit, UnitKind, DEFAULT_PAGE_BYTES,
+};
 use nn_graph::{infer_shapes, ActKind, DType, Nn};
 use rewrite::{assemble, plan_from_block, LayerPlan};
 use schedule::{
@@ -416,7 +418,12 @@ fn host_thread_routing() {
         edges: vec![],
         ..Default::default()
     };
-    let (counters, wait, succ) = build_counters(&tg, &HashMap::new(), &Default::default(), schedule::ClusterMode::default());
+    let (counters, wait, succ) = build_counters(
+        &tg,
+        &HashMap::new(),
+        &Default::default(),
+        schedule::ClusterMode::default(),
+    );
     let s = list_schedule(
         &machine,
         &tg,

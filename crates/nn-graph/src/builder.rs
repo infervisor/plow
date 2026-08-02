@@ -139,11 +139,25 @@ impl Nn {
     }
 
     pub fn rope(&mut self, x: TensorId, dim: u32, theta: f32) -> TensorId {
-        self.emit(Op::Rope { dim, theta, interleave: false }, vec![x])
+        self.emit(
+            Op::Rope {
+                dim,
+                theta,
+                interleave: false,
+            },
+            vec![x],
+        )
     }
 
     pub fn rope_interleaved(&mut self, x: TensorId, dim: u32, theta: f32) -> TensorId {
-        self.emit(Op::Rope { dim, theta, interleave: true }, vec![x])
+        self.emit(
+            Op::Rope {
+                dim,
+                theta,
+                interleave: true,
+            },
+            vec![x],
+        )
     }
 
     pub fn matmul(&mut self, a: TensorId, b: TensorId) -> TensorId {
@@ -397,7 +411,13 @@ impl Nn {
     }
 
     /// Kimi-K3's `situ` GLU: `situ_a(gate) * softclip(up)`.
-    pub fn situ_glu(&mut self, gate: TensorId, up: TensorId, beta: f32, linear_beta: f32) -> TensorId {
+    pub fn situ_glu(
+        &mut self,
+        gate: TensorId,
+        up: TensorId,
+        beta: f32,
+        linear_beta: f32,
+    ) -> TensorId {
         self.emit(Op::SituGlu { beta, linear_beta }, vec![gate, up])
     }
 
@@ -411,10 +431,7 @@ impl Nn {
         hidden: i64,
         max_snapshots: u32,
     ) -> TensorId {
-        let w = self.param(
-            &format!("{name}.weight"),
-            [Dim::stat(1), Dim::stat(hidden)],
-        );
+        let w = self.param(&format!("{name}.weight"), [Dim::stat(1), Dim::stat(hidden)]);
         let mut ins = Vec::with_capacity(snapshots.len() + 2);
         ins.push(prefix);
         ins.extend_from_slice(snapshots);

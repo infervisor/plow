@@ -61,7 +61,9 @@ impl IsaLevel {
 
     pub fn vendor(self) -> Vendor {
         match self {
-            IsaLevel::Sm89 | IsaLevel::Sm90a | IsaLevel::Sm100a | IsaLevel::Sm120a => Vendor::Nvidia,
+            IsaLevel::Sm89 | IsaLevel::Sm90a | IsaLevel::Sm100a | IsaLevel::Sm120a => {
+                Vendor::Nvidia
+            }
             IsaLevel::Gfx942 | IsaLevel::Gfx950 => Vendor::Amd,
             // The CPU reference has no vendor in the GPU sense; it is reported as
             // NVIDIA only because `Vendor` has no third variant. Callers should
@@ -101,7 +103,12 @@ impl IsaLevel {
                 block_scale_mma: false,
                 mx_scale_cvt: false,
                 warp_lanes: 32,
-                mma_dtypes: &[MmaDtype::Fp16, MmaDtype::Bf16, MmaDtype::Fp8, MmaDtype::Int8],
+                mma_dtypes: &[
+                    MmaDtype::Fp16,
+                    MmaDtype::Bf16,
+                    MmaDtype::Fp8,
+                    MmaDtype::Int8,
+                ],
             },
             IsaLevel::Sm90a => IsaCaps {
                 mma_sync: true,
@@ -114,7 +121,12 @@ impl IsaLevel {
                 block_scale_mma: false,
                 mx_scale_cvt: false,
                 warp_lanes: 32,
-                mma_dtypes: &[MmaDtype::Fp16, MmaDtype::Bf16, MmaDtype::Fp8, MmaDtype::Int8],
+                mma_dtypes: &[
+                    MmaDtype::Fp16,
+                    MmaDtype::Bf16,
+                    MmaDtype::Fp8,
+                    MmaDtype::Int8,
+                ],
             },
             IsaLevel::Sm100a => IsaCaps {
                 mma_sync: true,
@@ -167,7 +179,12 @@ impl IsaLevel {
                 block_scale_mma: false,
                 mx_scale_cvt: false,
                 warp_lanes: 64,
-                mma_dtypes: &[MmaDtype::Fp16, MmaDtype::Bf16, MmaDtype::Fp8, MmaDtype::Int8],
+                mma_dtypes: &[
+                    MmaDtype::Fp16,
+                    MmaDtype::Bf16,
+                    MmaDtype::Fp8,
+                    MmaDtype::Int8,
+                ],
             },
             IsaLevel::Gfx950 => IsaCaps {
                 mma_sync: false,
@@ -328,7 +345,13 @@ impl HardwareFingerprint {
         let sku: String = self
             .sku
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
             .collect();
         let sku = sku.trim_matches('-').to_string();
         let mut folded = String::with_capacity(sku.len());
@@ -405,7 +428,10 @@ mod tests {
     fn blackwell_datacenter_and_consumer_are_different_isas() {
         let b200 = registry::lookup("B200").expect("B200");
         let rtx = registry::lookup("RTX 5090").expect("RTX 5090");
-        assert_eq!(b200.arch, rtx.arch, "precondition: Arch really does conflate them");
+        assert_eq!(
+            b200.arch, rtx.arch,
+            "precondition: Arch really does conflate them"
+        );
 
         let b200 = IsaLevel::from_spec(b200).unwrap();
         let rtx = IsaLevel::from_spec(rtx).unwrap();
@@ -499,7 +525,10 @@ mod tests {
             );
         }
         assert!(IsaLevel::Sm100a.caps().block_scale_mma);
-        assert!(!IsaLevel::Sm120a.caps().block_scale_mma, "ptxas rejects it on sm_120");
+        assert!(
+            !IsaLevel::Sm120a.caps().block_scale_mma,
+            "ptxas rejects it on sm_120"
+        );
         assert!(!IsaLevel::Sm90a.caps().block_scale_mma);
     }
 
@@ -535,8 +564,14 @@ mod tests {
         let mut cuda12 = base.clone();
         cuda12.toolchain = Some("cuda-12.4".into());
 
-        assert!(base.satisfies(&cuda13), "unrecorded toolchain answers a looser query");
-        assert!(!cuda13.satisfies(&cuda12), "two known, differing toolchains must not match");
+        assert!(
+            base.satisfies(&cuda13),
+            "unrecorded toolchain answers a looser query"
+        );
+        assert!(
+            !cuda13.satisfies(&cuda12),
+            "two known, differing toolchains must not match"
+        );
         assert!(cuda13.satisfies(&cuda13));
     }
 

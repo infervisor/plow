@@ -51,7 +51,13 @@ const NCU: u32 = 256;
 /// trip and PAY a tile that does not fill the machine.
 #[test]
 fn the_gate_never_fuses_where_a_narrow_rung_clearly_wins() {
-    for (t, n) in [(128u32, 1536u32), (128, 768), (512, 1536), (512, 768), (2048, 768)] {
+    for (t, n) in [
+        (128u32, 1536u32),
+        (128, 768),
+        (512, 1536),
+        (512, 768),
+        (2048, 768),
+    ] {
         assert!(
             !glu_fusion_wins_mxfp4(t, n, K, NCU),
             "T={t} N={n} K={K}: the gate fused, but the fused 256x256 arm measured slower than the \

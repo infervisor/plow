@@ -35,7 +35,8 @@ fn narrow_opts(out: PathBuf) -> Options {
         lean_oracle: false,
         emit_sample: false,
         emit_tokenize: false,
-        emit_trace: false,        kv: Default::default(),
+        emit_trace: false,
+        kv: Default::default(),
         weight_dtype_override: None,
     }
 }
@@ -68,8 +69,8 @@ fn run_all() {
         let net: NetConfig = serde_json::from_str(&json)
             .unwrap_or_else(|e| panic!("{}: parse failed: {e}", path.display()));
 
-        let out = std::env::temp_dir()
-            .join(format!("plowc-narrow-{}-{}", std::process::id(), net.name));
+        let out =
+            std::env::temp_dir().join(format!("plowc-narrow-{}-{}", std::process::id(), net.name));
         let report = compile(&Source::Net(net), &narrow_opts(out.clone()))
             .unwrap_or_else(|e| panic!("{}: compile failed: {e}", path.display()));
         assert!(!report.buckets.is_empty(), "{}: no buckets", path.display());

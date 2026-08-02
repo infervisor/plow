@@ -79,10 +79,7 @@ fn backends() -> &'static Vec<std::sync::Arc<dyn device::Backend>> {
 
 fn group() -> &'static TpGroup {
     static G: std::sync::OnceLock<TpGroup> = std::sync::OnceLock::new();
-    G.get_or_init(|| {
-        TpGroup::bringup(backends().clone(), decode_layout())
-            .expect("TP bring-up")
-    })
+    G.get_or_init(|| TpGroup::bringup(backends().clone(), decode_layout()).expect("TP bring-up"))
 }
 
 /// The deployment shape: the node split into independent replicas of half its
@@ -94,8 +91,7 @@ fn replicas() -> &'static Vec<TpGroup> {
     R.get_or_init(|| {
         let all = backends().clone();
         let tp = (all.len() / 2) as u32;
-        TpGroup::split_replicas(all, tp, decode_layout())
-            .expect("replica bring-up")
+        TpGroup::split_replicas(all, tp, decode_layout()).expect("replica bring-up")
     })
 }
 
@@ -357,7 +353,8 @@ fn zero_xctr_clears_every_rank_before_any_launch() {
     let dirty = vec![0xABu8; xbytes];
 
     for r in g.ranks() {
-        r.write_scratch(g.layout().xctr_off(), &dirty).expect("dirty");
+        r.write_scratch(g.layout().xctr_off(), &dirty)
+            .expect("dirty");
     }
 
     let mut launched: Vec<u32> = Vec::new();
@@ -407,14 +404,16 @@ fn host_direct_reset_clears_the_same_bytes() {
     let xbytes = g.layout().xctr_bytes() as usize;
     let dirty = vec![0xC3u8; xbytes];
     for r in g.ranks() {
-        r.write_scratch(g.layout().xctr_off(), &dirty).expect("dirty");
+        r.write_scratch(g.layout().xctr_off(), &dirty)
+            .expect("dirty");
     }
 
     g.zero_xctr_direct().expect("host-direct reset");
 
     for r in g.ranks() {
         let mut back = vec![0u8; xbytes];
-        r.read_scratch(g.layout().xctr_off(), &mut back).expect("read");
+        r.read_scratch(g.layout().xctr_off(), &mut back)
+            .expect("read");
         assert!(
             back.iter().all(|&b| b == 0),
             "rank {}'s counters survived the host-direct reset",
@@ -440,7 +439,8 @@ fn program_reset_leaves_the_counters_to_the_device() {
     let xbytes = g.layout().xctr_bytes() as usize;
     let dirty = vec![0x5Au8; xbytes];
     for r in g.ranks() {
-        r.write_scratch(g.layout().xctr_off(), &dirty).expect("dirty");
+        r.write_scratch(g.layout().xctr_off(), &dirty)
+            .expect("dirty");
     }
 
     let mut n = 0;
@@ -453,9 +453,11 @@ fn program_reset_leaves_the_counters_to_the_device() {
 
     for r in g.ranks() {
         let mut back = vec![0u8; xbytes];
-        r.read_scratch(g.layout().xctr_off(), &mut back).expect("read");
+        r.read_scratch(g.layout().xctr_off(), &mut back)
+            .expect("read");
         assert_eq!(
-            back, dirty,
+            back,
+            dirty,
             "rank {} had its counters cleared by the host under XctrReset::Program",
             r.rank()
         );

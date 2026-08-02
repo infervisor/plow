@@ -299,9 +299,8 @@ pub(crate) fn validate_coverage(
     // genuinely missing checkpoint is still visible, it just no longer kills the process from
     // inside a gate whose whole purpose is comparing two sets, one of which does not exist.
     let has_shards = std::fs::read_dir(dir).is_ok_and(|rd| {
-        rd.filter_map(Result::ok).any(|e| {
-            e.path().extension().and_then(|x| x.to_str()) == Some("safetensors")
-        })
+        rd.filter_map(Result::ok)
+            .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("safetensors"))
     });
     if !has_shards {
         eprintln!(
@@ -320,7 +319,11 @@ pub(crate) fn validate_coverage(
     // and ZERO start with `model.`, so a plan declared under `model.` would pass this gate
     // silently, allocate every weight, upload none, and decode from zeroed memory.
     let all = ckpt_names_all(dir);
-    let ckpt: HashSet<String> = all.iter().filter(|k| k.starts_with(prefix)).cloned().collect();
+    let ckpt: HashSet<String> = all
+        .iter()
+        .filter(|k| k.starts_with(prefix))
+        .cloned()
+        .collect();
     if ckpt.is_empty() {
         let ns = layer_namespaces(&all);
         return Err(format!(
@@ -396,13 +399,7 @@ pub(crate) fn validate_coverage(
     missing.sort_unstable();
     uncovered.sort_unstable();
 
-    let sample = |v: &[&str]| {
-        v.iter()
-            .take(8)
-            .copied()
-            .collect::<Vec<_>>()
-            .join("\n    ")
-    };
+    let sample = |v: &[&str]| v.iter().take(8).copied().collect::<Vec<_>>().join("\n    ");
     let mut e = String::from("checkpoint coverage failed:\n");
     if !missing.is_empty() {
         e.push_str(&format!(
@@ -456,25 +453,46 @@ mod paired_tests {
         let emitted = ["language_model.model.output_attn_res_score.weight"];
 
         // Op emitted -> its two factors are legitimately undeclared.
-        assert!(!covered(norm, &emitted), "norm should be waived when the mix is emitted");
-        assert!(!covered(proj, &emitted), "proj should be waived when the mix is emitted");
+        assert!(
+            !covered(norm, &emitted),
+            "norm should be waived when the mix is emitted"
+        );
+        assert!(
+            !covered(proj, &emitted),
+            "proj should be waived when the mix is emitted"
+        );
 
         // Op DROPPED -> both go unclaimed and the gate must fail the emit. Note the per-layer
         // score weights are still declared, which is exactly the state the real bug was in.
         let per_layer = ["language_model.model.layers.0.self_attention_res_score.weight"];
-        assert!(covered(norm, &per_layer), "a dropped output mix must un-cover its norm");
-        assert!(covered(proj, &per_layer), "a dropped output mix must un-cover its proj");
+        assert!(
+            covered(norm, &per_layer),
+            "a dropped output mix must un-cover its norm"
+        );
+        assert!(
+            covered(proj, &per_layer),
+            "a dropped output mix must un-cover its proj"
+        );
     }
 
     /// The per-layer pairs keep working, and one layer's score does not cover another's.
     #[test]
     fn a_paired_waiver_does_not_leak_across_stems() {
         let l0 = "language_model.model.layers.0.mlp_res_norm.weight";
-        assert!(!covered(l0, &["language_model.model.layers.0.mlp_res_score.weight"]));
+        assert!(!covered(
+            l0,
+            &["language_model.model.layers.0.mlp_res_score.weight"]
+        ));
         // A DIFFERENT layer's score must not cover layer 0's weight.
-        assert!(covered(l0, &["language_model.model.layers.1.mlp_res_score.weight"]));
+        assert!(covered(
+            l0,
+            &["language_model.model.layers.1.mlp_res_score.weight"]
+        ));
         // Nor must a different stem on the same layer.
-        assert!(covered(l0, &["language_model.model.layers.0.self_attention_res_score.weight"]));
+        assert!(covered(
+            l0,
+            &["language_model.model.layers.0.self_attention_res_score.weight"]
+        ));
     }
 }
 
@@ -499,7 +517,10 @@ mod prefix_tests {
             "model.norm.weight",
             "lm_head.weight",
         ]);
-        assert_eq!(layer_namespaces(&glm).keys().collect::<Vec<_>>(), vec!["model.layers."]);
+        assert_eq!(
+            layer_namespaces(&glm).keys().collect::<Vec<_>>(),
+            vec!["model.layers."]
+        );
 
         let k3 = names(&[
             "language_model.model.embed_tokens.weight",
@@ -509,7 +530,10 @@ mod prefix_tests {
             "mm_projector.proj.0.weight",
         ]);
         let k3ns = layer_namespaces(&k3);
-        assert_eq!(k3ns.keys().collect::<Vec<_>>(), vec!["language_model.model.layers."]);
+        assert_eq!(
+            k3ns.keys().collect::<Vec<_>>(),
+            vec!["language_model.model.layers."]
+        );
         // The point of the derivation: `model.` is NOT among them, and a plan declared under it
         // would have matched nothing — which is what made the coverage gate below a no-op.
         assert!(!k3ns.contains_key("model.layers."));
@@ -528,10 +552,19 @@ mod prefix_tests {
     /// actionable and "prefix mismatch" is not.
     #[test]
     fn the_namespaces_carry_their_tensor_counts() {
-        let n = names(&["a.layers.0.w", "a.layers.1.w", "b.layers.0.w", "no_layers_here.weight"]);
+        let n = names(&[
+            "a.layers.0.w",
+            "a.layers.1.w",
+            "b.layers.0.w",
+            "no_layers_here.weight",
+        ]);
         let ns = layer_namespaces(&n);
         assert_eq!(ns.get("a.layers."), Some(&2));
         assert_eq!(ns.get("b.layers."), Some(&1));
-        assert_eq!(ns.len(), 2, "a name without `.layers.` contributes no namespace");
+        assert_eq!(
+            ns.len(),
+            2,
+            "a name without `.layers.` contributes no namespace"
+        );
     }
 }

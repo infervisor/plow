@@ -42,7 +42,8 @@ fn opts(out: std::path::PathBuf) -> Options {
         lean_oracle: false,
         emit_sample: false,
         emit_tokenize: false,
-        emit_trace: false,        kv: Default::default(),
+        emit_trace: false,
+        kv: Default::default(),
         weight_dtype_override: None,
     }
 }
@@ -52,18 +53,14 @@ fn compile_and_simulate(net: NetConfig) -> Vec<(String, SimReport)> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "plowc-e2e-sim-{}-{}",
-        std::process::id(),
-        id
-    ));
+    let dir = std::env::temp_dir().join(format!("plowc-e2e-sim-{}-{}", std::process::id(), id));
     let report = compile(&Source::Net(net), &opts(dir.clone())).expect("compile succeeded");
 
     let mut sim_reports = Vec::new();
     for bucket in &report.buckets {
         let pkt_path = dir.join(&bucket.packet_file);
-        let bytes = std::fs::read(&pkt_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", bucket.packet_file));
+        let bytes =
+            std::fs::read(&pkt_path).unwrap_or_else(|e| panic!("read {}: {e}", bucket.packet_file));
         let program = packet::Program::decode(&bytes)
             .unwrap_or_else(|e| panic!("decode {}: {e}", bucket.packet_file));
 
@@ -97,23 +94,27 @@ fn llama3_8b_compiles_and_simulates_deadlock_free() {
             "{file}: unsatisfiable counters detected:\n{}",
             report.summary()
         );
-        assert!(
-            report.stats.makespan > 0,
-            "{file}: zero makespan",
-        );
+        assert!(report.stats.makespan > 0, "{file}: zero makespan",);
         assert_eq!(
             report.events.len(),
             report.stats.executed,
             "{file}: event count mismatch",
         );
         assert_eq!(
-            report.stats.executed, report.stats.total,
+            report.stats.executed,
+            report.stats.total,
             "{file}: not all packets fired ({} / {})\n{}",
-            report.stats.executed, report.stats.total, report.summary()
+            report.stats.executed,
+            report.stats.total,
+            report.summary()
         );
         // Every event must have a valid timing window.
         for e in &report.events {
-            assert!(e.t_end >= e.t_start, "{file}: event #{} has inverted timing", e.seq);
+            assert!(
+                e.t_end >= e.t_start,
+                "{file}: event #{} has inverted timing",
+                e.seq
+            );
         }
     }
 }
@@ -148,18 +149,32 @@ fn emit_sample_injects_gated_host_packet() {
             .iter()
             .find(|i| matches!(i.body, Body::Token { kind, .. } if kind == Opcode::TOKEN_SAMPLE_GREEDY))
             .expect("decode bucket contains a SAMPLE host packet");
-        assert!(matches!(sample.resource, ResourceKind::Host), "SAMPLE runs on Host");
+        assert!(
+            matches!(sample.resource, ResourceKind::Host),
+            "SAMPLE runs on Host"
+        );
         assert!(!sample.wait.is_empty(), "SAMPLE is counter-gated");
 
         // The gate is a real dependency: some compute packet increments it.
         let wc = sample.wait[0];
         let producers = prog.insts.iter().filter(|i| i.succ.contains(&wc)).count();
-        assert!(producers > 0, "SAMPLE's wait counter has {producers} producers");
+        assert!(
+            producers > 0,
+            "SAMPLE's wait counter has {producers} producers"
+        );
 
         // Simulate: completes, and a SAMPLE event fires after the producers.
         let sim = Simulator::new(MathMode::DryRun).run(&prog);
-        assert!(sim.stats.completed, "sample-tailed schedule deadlocked:\n{}", sim.summary());
-        let sample_ev = sim.events.iter().find(|e| e.name == "SAMPLE").expect("SAMPLE event");
+        assert!(
+            sim.stats.completed,
+            "sample-tailed schedule deadlocked:\n{}",
+            sim.summary()
+        );
+        let sample_ev = sim
+            .events
+            .iter()
+            .find(|e| e.name == "SAMPLE")
+            .expect("SAMPLE event");
         let last_producer_end = sim
             .events
             .iter()
@@ -167,7 +182,10 @@ fn emit_sample_injects_gated_host_packet() {
             .map(|e| e.t_end)
             .max()
             .unwrap_or(0);
-        assert!(sample_ev.t_start >= last_producer_end, "SAMPLE starts after its producers");
+        assert!(
+            sample_ev.t_start >= last_producer_end,
+            "SAMPLE starts after its producers"
+        );
     }
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -255,8 +273,7 @@ fn chrome_trace_from_real_network_is_well_formed() {
 
     for (file, report) in &results {
         let json = report.to_chrome_json();
-        let v: serde_json::Value =
-            serde_json::from_str(&json).expect("chrome JSON must parse");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("chrome JSON must parse");
         let events = v["traceEvents"]
             .as_array()
             .expect("traceEvents must be array");
@@ -308,7 +325,8 @@ fn llama3_full_runtime_load_and_execute() {
         lean_oracle: false,
         emit_sample: false,
         emit_tokenize: false,
-        emit_trace: false,        kv: Default::default(),
+        emit_trace: false,
+        kv: Default::default(),
         weight_dtype_override: None,
     };
     let report = compile(&Source::Net(net), &o).expect("compile");
@@ -327,7 +345,10 @@ fn llama3_full_runtime_load_and_execute() {
     assert!(registry.slugs().any(|s| s == "transformer-block-llama3-8b"));
 
     let state = AppState::new(registry, execset);
-    let gen = plowrt::serve::GenParams { max_tokens: 8, ..Default::default() };
+    let gen = plowrt::serve::GenParams {
+        max_tokens: 8,
+        ..Default::default()
+    };
     let (text, executed) = state
         .generate("transformer-block-llama3-8b", "hello world", &gen)
         .expect("generate must succeed — no deadlock");
@@ -366,7 +387,8 @@ fn mlp_block_full_runtime_load_and_execute() {
         lean_oracle: false,
         emit_sample: false,
         emit_tokenize: false,
-        emit_trace: false,        kv: Default::default(),
+        emit_trace: false,
+        kv: Default::default(),
         weight_dtype_override: None,
     };
     let report = compile(&Source::Net(net), &o).expect("compile");
@@ -379,7 +401,10 @@ fn mlp_block_full_runtime_load_and_execute() {
     registry.load(&dir, None).unwrap();
 
     let state = AppState::new(registry, execset);
-    let gen = plowrt::serve::GenParams { max_tokens: 8, ..Default::default() };
+    let gen = plowrt::serve::GenParams {
+        max_tokens: 8,
+        ..Default::default()
+    };
     let (_, executed) = state
         .generate("mlp-block", "test prompt", &gen)
         .expect("generate must not deadlock");
@@ -418,7 +443,8 @@ fn all_buckets_run_through_scheduler() {
         lean_oracle: false,
         emit_sample: false,
         emit_tokenize: false,
-        emit_trace: false,        kv: Default::default(),
+        emit_trace: false,
+        kv: Default::default(),
         weight_dtype_override: None,
     };
     compile(&Source::Net(net), &o).expect("compile");
@@ -463,23 +489,27 @@ fn glm5_transformer_block_compiles_and_simulates_deadlock_free() {
             "{file}: unsatisfiable counters detected:\n{}",
             report.summary()
         );
-        assert!(
-            report.stats.makespan > 0,
-            "{file}: zero makespan",
-        );
+        assert!(report.stats.makespan > 0, "{file}: zero makespan",);
         assert_eq!(
             report.events.len(),
             report.stats.executed,
             "{file}: event count mismatch",
         );
         assert_eq!(
-            report.stats.executed, report.stats.total,
+            report.stats.executed,
+            report.stats.total,
             "{file}: not all packets fired ({} / {})\n{}",
-            report.stats.executed, report.stats.total, report.summary()
+            report.stats.executed,
+            report.stats.total,
+            report.summary()
         );
         // Every event must have a valid timing window.
         for e in &report.events {
-            assert!(e.t_end >= e.t_start, "{file}: event #{} has inverted timing", e.seq);
+            assert!(
+                e.t_end >= e.t_start,
+                "{file}: event #{} has inverted timing",
+                e.seq
+            );
         }
     }
 }

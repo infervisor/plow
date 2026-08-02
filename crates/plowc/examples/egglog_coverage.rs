@@ -105,8 +105,11 @@ fn main() {
     let s: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1024);
 
     let json = std::fs::read_to_string(format!("{dir}/config.json")).expect("config.json");
-    let mut g = nn_graph::models::build_from_config_json_at(&json, &nn_graph::models::ShapeBucket::default())
-        .expect("build graph");
+    let mut g = nn_graph::models::build_from_config_json_at(
+        &json,
+        &nn_graph::models::ShapeBucket::default(),
+    )
+    .expect("build graph");
     g.bind(&nn_graph::Bindings::new().set("B", b).set("S", s));
 
     println!("== {dir}  (B={b}, S={s}) ==");
@@ -199,7 +202,8 @@ fn main() {
             println!("  OK: {} ops in plan", plan.ops.len());
             let mut h: BTreeMap<String, usize> = BTreeMap::new();
             for o in &plan.ops {
-                *h.entry(format!("{:?}", std::mem::discriminant(&o.kind))).or_default() += 1;
+                *h.entry(format!("{:?}", std::mem::discriminant(&o.kind)))
+                    .or_default() += 1;
             }
             println!("  distinct op kinds: {}", h.len());
         }

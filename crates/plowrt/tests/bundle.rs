@@ -90,8 +90,7 @@ fn write_bundle(dir: &std::path::Path) {
 
 #[test]
 fn load_and_generate() {
-    let dir =
-        std::env::temp_dir().join(format!("plowrt_bundle_{}_{}", std::process::id(), "t1"));
+    let dir = std::env::temp_dir().join(format!("plowrt_bundle_{}_{}", std::process::id(), "t1"));
     let _ = std::fs::remove_dir_all(&dir);
     write_bundle(&dir);
 

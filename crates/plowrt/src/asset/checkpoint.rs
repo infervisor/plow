@@ -38,12 +38,13 @@ impl Checkpoint {
         let mut shards = Vec::new();
         let mut index = FxHashMap::default();
         let mut paths: Vec<_> = std::fs::read_dir(dir)
-            .map_err(|source| RuntimeError::Io { path: dir.to_path_buf(), source })?
+            .map_err(|source| RuntimeError::Io {
+                path: dir.to_path_buf(),
+                source,
+            })?
             .flatten()
             .map(|e| e.path())
-            .filter(|p| {
-                p.is_file() && p.extension().map(|e| e == "safetensors").unwrap_or(false)
-            })
+            .filter(|p| p.is_file() && p.extension().map(|e| e == "safetensors").unwrap_or(false))
             .collect();
         paths.sort();
         if paths.is_empty() {
@@ -54,13 +55,17 @@ impl Checkpoint {
         }
         tracing::info!(shards = paths.len(), "found safetensors shards");
         for path in &paths {
-            let file = std::fs::File::open(path)
-                .map_err(|source| RuntimeError::Io { path: path.clone(), source })?;
+            let file = std::fs::File::open(path).map_err(|source| RuntimeError::Io {
+                path: path.clone(),
+                source,
+            })?;
             // SAFETY: read-only checkpoint mapping held for the engine lifetime.
-            let map = unsafe { memmap2::Mmap::map(&file) }
-                .map_err(|source| RuntimeError::Io { path: path.clone(), source })?;
-            let (header_len, meta) = safetensors::SafeTensors::read_metadata(&map)
-                .map_err(|e| {
+            let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|source| RuntimeError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let (header_len, meta) =
+                safetensors::SafeTensors::read_metadata(&map).map_err(|e| {
                     RuntimeError::Device(format!("safetensors {}: {e}", path.display()))
                 })?;
             let data_off = 8 + header_len;
@@ -124,7 +129,11 @@ impl Checkpoint {
         if hi <= lo || hi > map.len() {
             return None;
         }
-        Some(Span { shard: e.shard, off: lo, len: hi - lo })
+        Some(Span {
+            shard: e.shard,
+            off: lo,
+            len: hi - lo,
+        })
     }
 
     /// Fault `span` in — page cache AND this process's page tables — and block
@@ -167,7 +176,8 @@ impl Checkpoint {
     /// not reduce by one byte.
     pub fn populate(&self, span: Span) -> bool {
         let (map, _) = &self.shards[span.shard];
-        map.advise_range(memmap2::Advice::PopulateRead, span.off, span.len).is_ok()
+        map.advise_range(memmap2::Advice::PopulateRead, span.off, span.len)
+            .is_ok()
     }
 }
 
@@ -273,7 +283,10 @@ impl Prefetcher {
                 })
             })
             .collect();
-        Some(Prefetcher { tx: Some(tx), workers })
+        Some(Prefetcher {
+            tx: Some(tx),
+            workers,
+        })
     }
 
     /// Queue a span, blocking while the pool is `queue` jobs behind.
@@ -305,8 +318,12 @@ impl Drop for Prefetcher {
 /// its eos id as ordinary text and runs every request to `max_tokens`.
 pub(crate) fn read_eos_ids(dir: &Path) -> Vec<u32> {
     for file in ["generation_config.json", "config.json"] {
-        let Ok(bytes) = std::fs::read(dir.join(file)) else { continue };
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue };
+        let Ok(bytes) = std::fs::read(dir.join(file)) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
         match v.get("eos_token_id") {
             Some(serde_json::Value::Number(n)) => {
                 if let Some(id) = n.as_u64() {
@@ -314,8 +331,10 @@ pub(crate) fn read_eos_ids(dir: &Path) -> Vec<u32> {
                 }
             }
             Some(serde_json::Value::Array(a)) => {
-                let ids: Vec<u32> =
-                    a.iter().filter_map(|x| x.as_u64().map(|v| v as u32)).collect();
+                let ids: Vec<u32> = a
+                    .iter()
+                    .filter_map(|x| x.as_u64().map(|v| v as u32))
+                    .collect();
                 if !ids.is_empty() {
                     return ids;
                 }

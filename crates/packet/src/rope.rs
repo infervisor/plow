@@ -190,7 +190,9 @@ impl GenTensor {
             _ => RopeScale::None,
         };
         let (cos, sin) = match self.kind {
-            GEN_ROPE_COS | GEN_ROPE_SIN => rope_tables(self.ctx, self.hd, self.theta, self.frac, scale),
+            GEN_ROPE_COS | GEN_ROPE_SIN => {
+                rope_tables(self.ctx, self.hd, self.theta, self.frac, scale)
+            }
             GEN_ROPE_IDX_COS | GEN_ROPE_IDX_SIN => {
                 rope_tables_idx(self.ctx, self.aux, self.hd, self.theta)
             }

@@ -70,7 +70,10 @@ fn llama3_8b_bf16_config_to_plan() {
     // Rewrite fires SwiGLU fusions.
     let (_fused, stats) = rewrite::rewrite_graph(&g).expect("rewrite");
     assert!(stats.fused > 0, "SwiGLU fusion should fire");
-    assert!(stats.ops_after < stats.ops_before, "fusion reduces op count");
+    assert!(
+        stats.ops_after < stats.ops_before,
+        "fusion reduces op count"
+    );
 
     // Bridge produces a LayerPlan with ops.
     let plan = plan_from_all_blocks(&g).expect("bridge to plan");
@@ -96,7 +99,10 @@ fn kimi_bf16_config_to_plan() {
 
     let (_fused, stats) = rewrite::rewrite_graph(&g).expect("rewrite");
     assert!(stats.fused > 0, "SwiGLU fusion should fire in Kimi");
-    assert!(stats.ops_after < stats.ops_before, "fusion reduces ops in Kimi");
+    assert!(
+        stats.ops_after < stats.ops_before,
+        "fusion reduces ops in Kimi"
+    );
 
     // Bridge produces a LayerPlan — now works with MoeRouter handling.
     let plan = plan_from_all_blocks(&g).expect("bridge to plan");

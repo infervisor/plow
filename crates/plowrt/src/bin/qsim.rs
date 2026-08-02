@@ -92,8 +92,8 @@ fn simulate(svc: &Service, lambda_per_ms: f64, n: usize, seed: u64) -> SimResult
         }
     }
     let m = svc_samples.iter().sum::<f64>() / svc_samples.len() as f64;
-    let var = svc_samples.iter().map(|x| (x - m) * (x - m)).sum::<f64>()
-        / (svc_samples.len() - 1) as f64;
+    let var =
+        svc_samples.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (svc_samples.len() - 1) as f64;
     let mut sorted = waits.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     SimResult {
@@ -126,8 +126,7 @@ fn main() {
     assert!(trace.len() > 32, "trace too short: {}", trace.len());
 
     let mean = trace.iter().sum::<f64>() / trace.len() as f64;
-    let var =
-        trace.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (trace.len() - 1) as f64;
+    let var = trace.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (trace.len() - 1) as f64;
     let cv = var.sqrt() / mean;
     println!("MEASURED SERVICE TRACE  {path}");
     println!(
@@ -159,7 +158,13 @@ fn main() {
         worst_d = worst_d.max(err);
         println!(
             "  {:>5.2}  {:>10.4} {:>10.4} {:>10.4} {:>8.2}% | {:>9.4} {:>9.4}",
-            r.rho, r.mean_wait, d, m, 100.0 * err, r.p50, r.p99
+            r.rho,
+            r.mean_wait,
+            d,
+            m,
+            100.0 * err,
+            r.p50,
+            r.p99
         );
     }
 
@@ -179,7 +184,12 @@ fn main() {
         worst_ctrl = worst_ctrl.max(em);
         println!(
             "  {:>5.2}  {:>10.4} {:>10.4} {:>10.4} | {:>8.1}% {:>8.1}%",
-            r.rho, r.mean_wait, d, m, 100.0 * ed, 100.0 * em
+            r.rho,
+            r.mean_wait,
+            d,
+            m,
+            100.0 * ed,
+            100.0 * em
         );
     }
 
@@ -220,7 +230,12 @@ fn main() {
         let (mut lo, mut hi) = (0.01f64, 0.995f64);
         for _ in 0..18 {
             let mid = 0.5 * (lo + hi);
-            let r = simulate(&Service::Trace(&trace), mid / mean, NH, 0x1234_5678_9ABC_DEF1);
+            let r = simulate(
+                &Service::Trace(&trace),
+                mid / mean,
+                NH,
+                0x1234_5678_9ABC_DEF1,
+            );
             if r.p99 < budget {
                 lo = mid;
             } else {
@@ -258,13 +273,16 @@ fn main() {
         (16_384, 1, 7.9167),
         (32_768, 1, 9.5588),
     ];
-    let fitted = ServiceTable::fit(&measured, ModelCost::qwen3_4b(1.0, 0.0))
-        .expect("fit needs a ctx sweep");
+    let fitted =
+        ServiceTable::fit(&measured, ModelCost::qwen3_4b(1.0, 0.0)).expect("fit needs a ctx sweep");
     println!(
         "  fitted: effective bandwidth {:.1} GB/s, fixed overhead {:.3} ms/step",
         fitted.bandwidth_gbps, fitted.fixed_ms
     );
-    println!("  {:>7} {:>6} {:>12} {:>12} {:>9}", "ctx", "batch", "pred ms", "meas ms", "err");
+    println!(
+        "  {:>7} {:>6} {:>12} {:>12} {:>9}",
+        "ctx", "batch", "pred ms", "meas ms", "err"
+    );
     for &(ctx, b, meas) in &measured {
         let p = fitted.step_ms(ctx, b);
         println!(

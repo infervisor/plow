@@ -1,7 +1,7 @@
 //! Cost-driven hand-off collapse: the tile-egglog rules enumerate HBM / SRAM /
 //! DSM alternatives and the extractor picks a cost-driven default per hand-off.
 
-use costmodel::{hwspec, DEFAULT_PAGE_BYTES, GemmShape, RowShape, Soc, SramPolicy};
+use costmodel::{hwspec, GemmShape, RowShape, Soc, SramPolicy, DEFAULT_PAGE_BYTES};
 use rewrite::{assemble, collapse, GraphNode, HandoffKind, LayerPlan, LocalityReq, OpKind, OpSpec};
 
 fn h100() -> &'static hwspec::GpuSpec {
@@ -205,9 +205,12 @@ fn cross_unit_handoff_enumerates_barrier_p2p_rdma() {
         .relaxables
         .iter()
         .find(|r| {
-            r.alts
-                .iter()
-                .any(|&(k, _)| matches!(k, HandoffKind::Rdma | HandoffKind::P2p | HandoffKind::Barrier))
+            r.alts.iter().any(|&(k, _)| {
+                matches!(
+                    k,
+                    HandoffKind::Rdma | HandoffKind::P2p | HandoffKind::Barrier
+                )
+            })
         })
         .expect("a cross-unit relaxable");
     let kinds: Vec<HandoffKind> = xr.alts.iter().map(|&(k, _)| k).collect();
@@ -218,7 +221,10 @@ fn cross_unit_handoff_enumerates_barrier_p2p_rdma() {
     assert!(kinds.contains(&HandoffKind::P2p));
     // Default is the cheapest — Barrier under unified memory.
     assert_eq!(xr.default, HandoffKind::Barrier);
-    assert_eq!(c2.locality[&(xr.producer, xr.consumer)], LocalityReq::SameNode);
+    assert_eq!(
+        c2.locality[&(xr.producer, xr.consumer)],
+        LocalityReq::SameNode
+    );
 }
 
 #[test]

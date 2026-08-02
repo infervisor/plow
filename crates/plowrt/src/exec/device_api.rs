@@ -125,16 +125,14 @@ pub trait EngineDevice: Send + Sync + 'static {
     /// batch its zeroing rather than assume this is free — see
     /// `plans/tp-design.md`'s counter-reset numbers for what a copy-engine
     /// round-trip actually costs.
-    fn memset_d8_async(&self, dptr: u64, value: u8, n: usize, stream: &Self::Stream)
-        -> Result<()>;
+    fn memset_d8_async(&self, dptr: u64, value: u8, n: usize, stream: &Self::Stream) -> Result<()>;
 
     /// Enqueue a host→device copy on `stream`.
     ///
     /// # Safety
     /// `src` must stay live and unmodified until the copy retires; the caller
     /// gates that with an event.
-    unsafe fn memcpy_htod_async(&self, dptr: u64, src: &[u8], stream: &Self::Stream)
-        -> Result<()>;
+    unsafe fn memcpy_htod_async(&self, dptr: u64, src: &[u8], stream: &Self::Stream) -> Result<()>;
 
     /// Enqueue a device→host copy on `stream`.
     ///

@@ -33,8 +33,9 @@ pub mod trace;
 pub mod verify;
 
 pub use bucket::{
-    choose_buckets, choose_weight_tiling, choose_weight_tiling_tuned, compile_buckets, compile_buckets_tuned, BucketStream, Compiled, KvLayout, Phase,
-    Request, ShapeBucket, WeightLayout,
+    choose_buckets, choose_weight_tiling, choose_weight_tiling_tuned, compile_buckets,
+    compile_buckets_tuned, BucketStream, Compiled, KvLayout, Phase, Request, ShapeBucket,
+    WeightLayout,
 };
 pub use config::{ClusterMode, Config, DmaModel, Granularity};
 pub use emit::{emit_program, emit_program_with_meta, issue_order};
@@ -43,8 +44,8 @@ pub use expand::{
     PerChunkPlan, RowChunk, Task, TaskGraph, TaskId, TaskKind,
 };
 pub use interval::{BandwidthSet, Cycle, IntervalSet};
-pub use memory::{allocate as allocate_memory, AddrEntry, AddressMap, BufClass, BufReq, Segment};
 pub use machine::{LinkClass, Machine, SmId, UnitHw};
+pub use memory::{allocate as allocate_memory, AddrEntry, AddressMap, BufClass, BufReq, Segment};
 pub use oracle::{
     compute_lower_bound, compute_prefetch_depth, fill_bubbles, run_oracle, BubbleFillReport,
     LowerBound, OracleReport, PrefetchDepth,

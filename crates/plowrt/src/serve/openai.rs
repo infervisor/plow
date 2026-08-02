@@ -208,9 +208,17 @@ mod image_refusal_tests {
     #[test]
     fn an_image_part_is_detected_and_would_otherwise_be_dropped() {
         let c = Content::Parts(vec![
-            ContentPart::Text { text: "what is in this ".into() },
-            ContentPart::ImageUrl { image_url: ImageUrl { url: "data:image/png;base64,AAAA".into() } },
-            ContentPart::Text { text: "picture?".into() },
+            ContentPart::Text {
+                text: "what is in this ".into(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,AAAA".into(),
+                },
+            },
+            ContentPart::Text {
+                text: "picture?".into(),
+            },
         ]);
         assert!(c.has_image(), "an image part must be visible to the guard");
         // THE HAZARD, stated as an assertion: flattening silently discards it
@@ -221,7 +229,10 @@ mod image_refusal_tests {
     #[test]
     fn plain_text_is_never_refused() {
         assert!(!Content::Text("hello".into()).has_image());
-        assert!(!Content::Parts(vec![ContentPart::Text { text: "hello".into() }]).has_image());
+        assert!(!Content::Parts(vec![ContentPart::Text {
+            text: "hello".into()
+        }])
+        .has_image());
         // An empty multipart message is text-only, not an image.
         assert!(!Content::Parts(vec![]).has_image());
     }

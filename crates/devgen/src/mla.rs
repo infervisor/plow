@@ -8,25 +8,25 @@ use packet::devbuild::{Builder, Model};
 use packet::rope::{GenTensor, RopeScale};
 use serde_json::Value;
 
-use crate::block::{parse_block, write_block_descriptor};
 use super::*;
+use crate::block::{parse_block, write_block_descriptor};
 
 /// `plans/glm52-arch.md`. `H`/`NH`/`DK`(kv_lora)/`QL`(q_lora)/`QN`(qk_nope)/`DR`(qk_rope)/
 /// `VD`(v_head) name the MLA geometry the kernels carry as compile-time operands.
 #[derive(Clone)]
 pub(crate) struct GlmCfg {
-    layers: u32,        // 78 (layer 78 = MTP head, skipped)
-    hidden: u32,        // H 6144
-    heads: u32,         // NH 64
-    kv_lora: u32,       // DK 512 (latent cache width)
-    q_lora: u32,        // QL 2048
-    qk_nope: u32,       // QN 192 (absorbed into the latent)
-    qk_rope: u32,       // DR 64  (partial rope, interleaved)
-    v_head: u32,        // VD 256
-    vocab: u32,         // 154880
-    eps: f32,           // 1e-5
-    n_exp: u32,         // E 256 routed experts
-    top_k: u32,         // 8
+    layers: u32,  // 78 (layer 78 = MTP head, skipped)
+    hidden: u32,  // H 6144
+    heads: u32,   // NH 64
+    kv_lora: u32, // DK 512 (latent cache width)
+    q_lora: u32,  // QL 2048
+    qk_nope: u32, // QN 192 (absorbed into the latent)
+    qk_rope: u32, // DR 64  (partial rope, interleaved)
+    v_head: u32,  // VD 256
+    vocab: u32,   // 154880
+    eps: f32,     // 1e-5
+    n_exp: u32,   // E 256 routed experts
+    top_k: u32,   // 8
     // GROUP-LIMITED ROUTING (DeepSeek noaux_tc). Experts are partitioned into `n_group` contiguous
     // groups, each scored by the SUM OF ITS TOP-2 biased scores; the top `topk_group` groups are
     // kept and the top-k runs only inside them. `n_group <= 1` makes the rule the identity, which is
@@ -216,7 +216,9 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
     // `rope_parameters: {rope_theta: 8000000, rope_type: "default"}`. `mla_use_nope` (Kimi-K3)
     // means there is no theta to find and none may be invented. `require_mla_rope` decides.
     let rp = &v["rope_parameters"];
-    let rope_theta = v["rope_theta"].as_f64().or_else(|| rp["rope_theta"].as_f64());
+    let rope_theta = v["rope_theta"]
+        .as_f64()
+        .or_else(|| rp["rope_theta"].as_f64());
     crate::require_mla_rope(
         rope_theta,
         v["mla_use_nope"].as_bool().unwrap_or(false),
@@ -1095,7 +1097,10 @@ pub(crate) fn declare_glm_rows(
     let [cos_t, sin_t] = GenTensor::rope_pair(ctx, c.qk_rope, c.rope_theta(), 1.0, RopeScale::None);
     let cos = b.tensor_gen("in.cos", cos_t.byte_len(), cos_t);
     let sin = b.tensor_gen("in.sin", sin_t.byte_len(), sin_t);
-    let emb = b.tensor(&format!("{}embed_tokens.weight", c.prefix), (c.vocab * h) as u64 * BF16);
+    let emb = b.tensor(
+        &format!("{}embed_tokens.weight", c.prefix),
+        (c.vocab * h) as u64 * BF16,
+    );
     let fin = b.tensor(&format!("{}norm.weight", c.prefix), h as u64 * BF16);
     // lm_head. REPLICATED by default (`crates/plowrt/src/asset/shard.rs`'s module note): every rank
     // computes the full-vocab argmax so they agree on the token without a cross-rank fold, at the
@@ -1184,7 +1189,14 @@ pub(crate) fn declare_glm_rows(
             },
         )
     } else {
-        (TENSOR_NONE, TENSOR_NONE, TENSOR_NONE, TENSOR_NONE, TENSOR_NONE, TENSOR_NONE)
+        (
+            TENSOR_NONE,
+            TENSOR_NONE,
+            TENSOR_NONE,
+            TENSOR_NONE,
+            TENSOR_NONE,
+            TENSOR_NONE,
+        )
     };
     let xnext = ac(b, "xnext", rows * h as u64 * BF16);
     let logits = ac(b, "logits", glm_vocab_l(c) as u64 * BF16);
@@ -1285,7 +1297,10 @@ pub(crate) fn declare_glm_rows(
         };
         let mxs = |b: &mut Builder, s: &str, n: u64, k: u64| {
             if enc == MoeEnc::Mxfp4 {
-                b.tensor(&format!("{pfx}layers.{l}.{s}_scale"), n * k.div_ceil(MX_BLOCK as u64))
+                b.tensor(
+                    &format!("{pfx}layers.{l}.{s}_scale"),
+                    n * k.div_ceil(MX_BLOCK as u64),
+                )
             } else {
                 TENSOR_NONE
             }
@@ -1318,36 +1333,70 @@ pub(crate) fn declare_glm_rows(
         //   Replicated (norms, q_a_proj, kv_a_latent, k_rope, router, bias) keep full dims.
         lw.push(GlmLW {
             qad_s: mxs(b, "self_attn.q_a_proj.weight", ql as u64, h as u64),
-            wqa_s: mxs(b, "self_attn.derived.q_absorb.weight", (nh_l * dk) as u64, ql as u64),
-            wqr_s: mxs(b, "self_attn.derived.q_rope.weight", (nh_l * dr) as u64, ql as u64),
-            ckvd_s: mxs(b, "self_attn.derived.kv_a_latent.weight", dk as u64, h as u64),
+            wqa_s: mxs(
+                b,
+                "self_attn.derived.q_absorb.weight",
+                (nh_l * dk) as u64,
+                ql as u64,
+            ),
+            wqr_s: mxs(
+                b,
+                "self_attn.derived.q_rope.weight",
+                (nh_l * dr) as u64,
+                ql as u64,
+            ),
+            ckvd_s: mxs(
+                b,
+                "self_attn.derived.kv_a_latent.weight",
+                dk as u64,
+                h as u64,
+            ),
             krotd_s: mxs(b, "self_attn.derived.k_rope.weight", dr as u64, h as u64),
             wo_s: if lin_fp8 {
                 q8s(b, "self_attn.o_proj", h as u64, (nh_l * vd) as u64)
             } else {
                 mxs(b, "self_attn.o_proj.weight", h as u64, (nh_l * vd) as u64)
             },
-            wr_s: if dense { TENSOR_NONE } else { mxs(b, "mlp.gate.weight", e as u64, h as u64) },
+            wr_s: if dense {
+                TENSOR_NONE
+            } else {
+                mxs(b, "mlp.gate.weight", e as u64, h as u64)
+            },
             shg_s: if dense {
                 TENSOR_NONE
             } else if lin_fp8 {
                 q8s(b, "mlp.shared_experts.gate_proj", imoe_l as u64, h as u64)
             } else {
-                mxs(b, "mlp.shared_experts.gate_proj.weight", imoe_l as u64, h as u64)
+                mxs(
+                    b,
+                    "mlp.shared_experts.gate_proj.weight",
+                    imoe_l as u64,
+                    h as u64,
+                )
             },
             shu_s: if dense {
                 TENSOR_NONE
             } else if lin_fp8 {
                 q8s(b, "mlp.shared_experts.up_proj", imoe_l as u64, h as u64)
             } else {
-                mxs(b, "mlp.shared_experts.up_proj.weight", imoe_l as u64, h as u64)
+                mxs(
+                    b,
+                    "mlp.shared_experts.up_proj.weight",
+                    imoe_l as u64,
+                    h as u64,
+                )
             },
             shd_s: if dense {
                 TENSOR_NONE
             } else if lin_fp8 {
                 q8s(b, "mlp.shared_experts.down_proj", h as u64, imoe_l as u64)
             } else {
-                mxs(b, "mlp.shared_experts.down_proj.weight", h as u64, imoe_l as u64)
+                mxs(
+                    b,
+                    "mlp.shared_experts.down_proj.weight",
+                    h as u64,
+                    imoe_l as u64,
+                )
             },
             gin: t(b, "input_layernorm.weight", h as u64 * BF16),
             qad: tw(b, "self_attn.q_a_proj.weight", ql as u64, h as u64),
@@ -1364,7 +1413,12 @@ pub(crate) fn declare_glm_rows(
                 (nh_l * dr) as u64,
                 ql as u64,
             ),
-            ckvd: tw(b, "self_attn.derived.kv_a_latent.weight", dk as u64, h as u64),
+            ckvd: tw(
+                b,
+                "self_attn.derived.kv_a_latent.weight",
+                dk as u64,
+                h as u64,
+            ),
             gkva: t(b, "self_attn.kv_a_layernorm.weight", dk as u64 * BF16),
             krotd: tw(b, "self_attn.derived.k_rope.weight", dr as u64, h as u64),
             // W_uv stays bf16 under EVERY encoding: MLA_MERGE_FOLD / O_UV_FOLD take it as
@@ -1399,21 +1453,36 @@ pub(crate) fn declare_glm_rows(
             } else if lin_fp8 {
                 q8(b, "mlp.shared_experts.gate_proj", imoe_l as u64, h as u64)
             } else {
-                tw(b, "mlp.shared_experts.gate_proj.weight", imoe_l as u64, h as u64)
+                tw(
+                    b,
+                    "mlp.shared_experts.gate_proj.weight",
+                    imoe_l as u64,
+                    h as u64,
+                )
             },
             shu: if dense {
                 TENSOR_NONE
             } else if lin_fp8 {
                 q8(b, "mlp.shared_experts.up_proj", imoe_l as u64, h as u64)
             } else {
-                tw(b, "mlp.shared_experts.up_proj.weight", imoe_l as u64, h as u64)
+                tw(
+                    b,
+                    "mlp.shared_experts.up_proj.weight",
+                    imoe_l as u64,
+                    h as u64,
+                )
             },
             shd: if dense {
                 TENSOR_NONE
             } else if lin_fp8 {
                 q8(b, "mlp.shared_experts.down_proj", h as u64, imoe_l as u64)
             } else {
-                tw(b, "mlp.shared_experts.down_proj.weight", h as u64, imoe_l as u64)
+                tw(
+                    b,
+                    "mlp.shared_experts.down_proj.weight",
+                    h as u64,
+                    imoe_l as u64,
+                )
             },
             ewt: if dense {
                 TENSOR_NONE
@@ -1439,7 +1508,11 @@ pub(crate) fn declare_glm_rows(
             dgate_s: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => mxs(b, "mlp.gate_proj.weight", di_l as u64, h as u64),
-                    _ => t(b, "mlp.gate_proj.weight_scale_inv", (db_l * hb) as u64 * F32),
+                    _ => t(
+                        b,
+                        "mlp.gate_proj.weight_scale_inv",
+                        (db_l * hb) as u64 * F32,
+                    ),
                 }
             } else {
                 TENSOR_NONE
@@ -1471,7 +1544,11 @@ pub(crate) fn declare_glm_rows(
             ddown_s: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => mxs(b, "mlp.down_proj.weight", h as u64, di_l as u64),
-                    _ => t(b, "mlp.down_proj.weight_scale_inv", (hb * db_l) as u64 * F32),
+                    _ => t(
+                        b,
+                        "mlp.down_proj.weight_scale_inv",
+                        (hb * db_l) as u64 * F32,
+                    ),
                 }
             } else {
                 TENSOR_NONE
@@ -1621,7 +1698,10 @@ pub(crate) fn declare_glm_rows(
 /// to a max over k, and that has already cost more than it saved once (`flash_merge` 32->256,
 /// +0.555 ms). Measure before changing the default.
 fn spine_cus(n_cu: u32) -> Vec<u32> {
-    match std::env::var("GLM_SPINE_CUS").ok().and_then(|v| v.parse::<u32>().ok()) {
+    match std::env::var("GLM_SPINE_CUS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
         Some(k) if k > 1 => (0..k.min(n_cu)).collect(),
         _ => vec![0u32],
     }
@@ -1863,7 +1943,11 @@ fn emit_glm_mla(
                 k: u32,
                 deps: &[u32]|
      -> u32 {
-        let op = if enc == MoeEnc::Mxfp4 { DevOp::GemvMxfp4 } else { DevOp::Gemv };
+        let op = if enc == MoeEnc::Mxfp4 {
+            DevOp::GemvMxfp4
+        } else {
+            DevOp::Gemv
+        };
         b.emit(op, all.clone(), deps, |d| {
             d.t[0] = out;
             d.t[1] = x;
@@ -1917,7 +2001,11 @@ fn emit_glm_mla(
         // n = ql + dk + dr concatenated columns; `blocked_gemv_cus` drops the ceiling tail that
         // owns none of them (GLM TP4: 2624 over 256 => slices 239..255 are empty).
         let fa_cus = blocked_gemv_cus(&all, ql + dk + dr);
-        let fa_op = if mx { DevOp::GemvQkvMxfp4 } else { DevOp::GemvQkv };
+        let fa_op = if mx {
+            DevOp::GemvQkvMxfp4
+        } else {
+            DevOp::GemvQkv
+        };
         let c_fa = b.emit(fa_op, fa_cus, &[c_rn1], |d| {
             d.t[0] = n.qlr;
             d.t[1] = n.xn;
@@ -1962,7 +2050,11 @@ fn emit_glm_mla(
     //   selects the interleaved template; q is not cached (out_row0/stride 0).
     let (c_qa, c_qrr) = if fuse_g {
         let fg_cus = blocked_gemv_cus(&all, nh_l * dk + nh_l * dr);
-        let fg_op = if mx { DevOp::GemvQkvMxfp4 } else { DevOp::GemvQkv };
+        let fg_op = if mx {
+            DevOp::GemvQkvMxfp4
+        } else {
+            DevOp::GemvQkv
+        };
         let c_fg = b.emit(fg_op, fg_cus, &[c_rnq], |d| {
             d.t[0] = n.qa;
             d.t[1] = n.qlat;
@@ -2243,16 +2335,21 @@ fn emit_glm_mla(
     //    Sized to its own work items (`mla_fold_cus`): the fold grid-strides
     //    `n_batch * nh_l * ceil(vd/VT)` times, which is 128 at GLM TP4 — half the machine used to
     //    sit in this packet's gate doing nothing. n_batch is 1 for every decode packet here.
-    let c_uv = b.emit(DevOp::MlaMergeFold, mla_fold_cus(&all, nh_l, vd), &[c_fl], |d| {
-        d.t[0] = n.oat;
-        d.t[1] = n.opart;
-        d.t[2] = n.mlpart;
-        d.t[3] = w.wuv;
-        d.i[0] = 1;
-        d.i[1] = nh_l;
-        d.i[2] = vd;
-        d.i[4] = ns_attn;
-    });
+    let c_uv = b.emit(
+        DevOp::MlaMergeFold,
+        mla_fold_cus(&all, nh_l, vd),
+        &[c_fl],
+        |d| {
+            d.t[0] = n.oat;
+            d.t[1] = n.opart;
+            d.t[2] = n.mlpart;
+            d.t[3] = w.wuv;
+            d.i[0] = 1;
+            d.i[1] = nh_l;
+            d.i[2] = vd;
+            d.i[4] = ns_attn;
+        },
+    );
     // 12 o_proj (NH_l*VD -> H)  [row-parallel]: each rank sums its head-shard into a PARTIAL H-vector.
     //   Under TP the partial goes to the peer-mapped og_tp slot and an XReduce all-reduces the N
     //   partials into n.attn; at tp==1 o_proj writes n.attn directly (byte-identical).
@@ -2542,23 +2639,28 @@ fn emit_glm_mla_prefill(
     //   LAST token's selection. Dense MLA prefill is correct at every ctx (it is what the crossover
     //   compares against), just ctx-linear — so that is what is emitted until a per-query selector
     //   exists. See the report note; this is the one arm the parent task asked for that is blocked.
-    let c_fl = b.emit(DevOp::FlashMlaPrefill, all.clone(), &[c_qa, c_qr, c_rnkv, c_krd], |d| {
-        d.t[0] = n.opart;
-        d.t[1] = n.mlpart;
-        d.t[2] = n.qa;
-        d.t[3] = n.qr;
-        d.t[4] = n.ckv[slot];
-        d.t[5] = n.krot[slot];
-        d.t[6] = n.kvlen;
-        d.i[0] = 1; // n_batch (single sequence per prefill chunk)
-        d.i[1] = nh_l; // PER-RANK heads
-        d.i[2] = ctx; // kv_stride
-        d.i[3] = 0; // window: 0 = full causal (MLA has no sliding regime)
-        d.i[4] = t; // n_tok — the slot decode used for nsplit
-        d.i[5] = KV_MASK_NONE;
-        d.i[7] = glm_gf_prefill(ctx, nh_l);
-        d.f[0] = c.attn_scale;
-    });
+    let c_fl = b.emit(
+        DevOp::FlashMlaPrefill,
+        all.clone(),
+        &[c_qa, c_qr, c_rnkv, c_krd],
+        |d| {
+            d.t[0] = n.opart;
+            d.t[1] = n.mlpart;
+            d.t[2] = n.qa;
+            d.t[3] = n.qr;
+            d.t[4] = n.ckv[slot];
+            d.t[5] = n.krot[slot];
+            d.t[6] = n.kvlen;
+            d.i[0] = 1; // n_batch (single sequence per prefill chunk)
+            d.i[1] = nh_l; // PER-RANK heads
+            d.i[2] = ctx; // kv_stride
+            d.i[3] = 0; // window: 0 = full causal (MLA has no sliding regime)
+            d.i[4] = t; // n_tok — the slot decode used for nsplit
+            d.i[5] = KV_MASK_NONE;
+            d.i[7] = glm_gf_prefill(ctx, nh_l);
+            d.f[0] = c.attn_scale;
+        },
+    );
     // 10 FUSED MLA MERGE+FOLD, nsplit=1. The partials are [b][t][head][nsplit][DK] and the fold
     //    indexes them as (b*n_head + h) — so the token axis is folded into i[0]: n_batch := 1*t.
     //    That is the same identity the flash uses (`qrow = (b*n_tok + t)*n_head`), not a trick.
@@ -2569,16 +2671,21 @@ fn emit_glm_mla_prefill(
     //    `bh*8 > n_cu` for any t >= 16, so VT is 256, `need = bh >= 256` and the clamp hands the
     //    whole machine straight back. It is here so the invariant does not have to be rediscovered
     //    on this emitter the way `emit_xreduce`'s sizing had to be (knob-contract §7c).
-    let c_uv = b.emit(DevOp::MlaMergeFold, mla_fold_cus(&all, t * nh_l, vd), &[c_fl], |d| {
-        d.t[0] = n.oat;
-        d.t[1] = n.opart;
-        d.t[2] = n.mlpart;
-        d.t[3] = w.wuv;
-        d.i[0] = t;
-        d.i[1] = nh_l;
-        d.i[2] = vd;
-        d.i[4] = 1; // nsplit — forced to 1 by the prefill precondition above
-    });
+    let c_uv = b.emit(
+        DevOp::MlaMergeFold,
+        mla_fold_cus(&all, t * nh_l, vd),
+        &[c_fl],
+        |d| {
+            d.t[0] = n.oat;
+            d.t[1] = n.opart;
+            d.t[2] = n.mlpart;
+            d.t[3] = w.wuv;
+            d.i[0] = t;
+            d.i[1] = nh_l;
+            d.i[2] = vd;
+            d.i[4] = 1; // nsplit — forced to 1 by the prefill precondition above
+        },
+    );
     // 12 o_proj, row-parallel over this rank's head shard. Under TP the [T,hidden] partial goes
     //    through the TWO-SHOT all-reduce (reduce-scatter + all-gather), not decode's one-shot: the
     //    partial is bandwidth-bound at T rows, so the two-shot moves ~tp/2x less over the fabric
@@ -2774,7 +2881,18 @@ fn emit_glm_block_prefill(
     } else if enc == MoeEnc::Mxfp4 || lin_fp8 {
         let (c_g, c_u) = if lin_fp8 {
             (
-                emit_pf_gemm_fp8_blk(b, &all, n.shfu, n.xn2, w.shg, w.shg_s, t, imoe_l, h, &[c_rn2]),
+                emit_pf_gemm_fp8_blk(
+                    b,
+                    &all,
+                    n.shfu,
+                    n.xn2,
+                    w.shg,
+                    w.shg_s,
+                    t,
+                    imoe_l,
+                    h,
+                    &[c_rn2],
+                ),
                 emit_pf_gemm_fp8_blk(
                     b,
                     &all,
@@ -2815,7 +2933,18 @@ fn emit_glm_block_prefill(
     };
     // 17 shared expert down — row-parallel (imoe_l input): a PARTIAL [T,H] under TP.
     let c_shd = if lin_fp8 {
-        emit_pf_gemm_fp8_blk(b, &all, n.shared, n.shfu, w.shd, w.shd_s, t, h, imoe_l, &[c_shglu])
+        emit_pf_gemm_fp8_blk(
+            b,
+            &all,
+            n.shared,
+            n.shfu,
+            w.shd,
+            w.shd_s,
+            t,
+            h,
+            imoe_l,
+            &[c_shglu],
+        )
     } else {
         gemm(b, n.shared, n.shfu, w.shd, w.shd_s, h, imoe_l, &[c_shglu])
     };
@@ -3305,9 +3434,7 @@ pub(crate) fn glm_prefill_buckets_env(ctx: u32) -> (Vec<u32>, PrefillScope) {
         None | Some("") | Some("0") => (Vec::new(), PrefillScope::Attn),
         Some("1") => (glm_prefill_buckets(ctx), PrefillScope::Attn),
         Some("full") => (glm_prefill_buckets(ctx), PrefillScope::Full),
-        Some(s) if s.starts_with("full:") => {
-            (parse_list(&s["full:".len()..]), PrefillScope::Full)
-        }
+        Some(s) if s.starts_with("full:") => (parse_list(&s["full:".len()..]), PrefillScope::Full),
         Some(list) => (parse_list(list), PrefillScope::Attn),
     }
 }
@@ -3377,7 +3504,10 @@ pub(crate) fn emit_glm_block(
         .filter(|&s| s > 0 && s < n_cu)
         .unwrap_or(n_cu - tk * (n_cu / (tk + 1)));
     let routed_w = (n_cu - shared_w) / tk;
-    assert!(routed_w > 0, "GLM_SHARED_CUS={shared_w} leaves no CUs for the {tk} routed experts");
+    assert!(
+        routed_w > 0,
+        "GLM_SHARED_CUS={shared_w} leaves no CUs for the {tk} routed experts"
+    );
     let shared_cus: Vec<u32> = if cores >= 2 {
         ((n_cu - shared_w)..n_cu).collect()
     } else {
@@ -3429,7 +3559,11 @@ pub(crate) fn emit_glm_block(
             d.f[0] = c.route_scale;
         })
     } else {
-        let score_op = if enc == MoeEnc::Mxfp4 { DevOp::GemvMxfp4 } else { DevOp::Gemv };
+        let score_op = if enc == MoeEnc::Mxfp4 {
+            DevOp::GemvMxfp4
+        } else {
+            DevOp::Gemv
+        };
         let c_score = b.emit(score_op, router_cus.clone(), &[c_rn2], |d| {
             d.t[0] = n.rlogit;
             d.t[1] = n.xn2;
@@ -3511,7 +3645,11 @@ pub(crate) fn emit_glm_block(
             d.i[5] = GLM_ACT_SILU;
         })
     } else {
-        let shglu_op = if enc == MoeEnc::Mxfp4 { DevOp::GemvGluMxfp4 } else { DevOp::GemvGlu };
+        let shglu_op = if enc == MoeEnc::Mxfp4 {
+            DevOp::GemvGluMxfp4
+        } else {
+            DevOp::GemvGlu
+        };
         b.emit(shglu_op, shared_cus.clone(), &[c_rn2], |d| {
             d.t[0] = n.shfu;
             d.t[1] = n.xn2;
@@ -3540,7 +3678,11 @@ pub(crate) fn emit_glm_block(
             d.i[4] = 0;
         })
     } else {
-        let shd_op = if enc == MoeEnc::Mxfp4 { DevOp::GemvMxfp4 } else { DevOp::Gemv };
+        let shd_op = if enc == MoeEnc::Mxfp4 {
+            DevOp::GemvMxfp4
+        } else {
+            DevOp::Gemv
+        };
         b.emit(shd_op, shared_cus.clone(), &[c_shglu], |d| {
             d.t[0] = n.shared;
             d.t[1] = n.shfu;
@@ -3835,7 +3977,17 @@ pub(crate) fn emit_glm_dense_block(
 /// (k_rope HeadNormRope out_row0 via kv_row_insts; ckv RMSNORM output via a per-step pointer rebind).
 /// `use_fp8` selects the block-fp8 expert kernels (45/46) for the MoE layers.
 #[allow(clippy::too_many_arguments)]
-fn glm_emit_full(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, use_fp8: bool, rope_gen: bool, target: &str, verify: Option<&crate::VerifyHook>) {
+fn glm_emit_full(
+    dir: &Path,
+    ctx: u32,
+    out: &str,
+    n_cu: u32,
+    tp: u32,
+    use_fp8: bool,
+    rope_gen: bool,
+    target: &str,
+    verify: Option<&crate::VerifyHook>,
+) {
     let mut c = cfg_glm(dir);
     c.tp = tp;
     // GLM_NLAYERS truncates the model to the first N layers — a single-GPU smoke test of the decode
@@ -3899,11 +4051,33 @@ fn glm_emit_full(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, use_fp8: b
             let nxt = if cur == tn.x { tn.xnext } else { tn.x };
             let d = if c.is_dense(l) {
                 emit_glm_dense_block_prefill(
-                    &mut pb, &c, &tn, slot, ctx, t, enc, cur, nxt, &dep, &mut pxgate, &pxr,
+                    &mut pb,
+                    &c,
+                    &tn,
+                    slot,
+                    ctx,
+                    t,
+                    enc,
+                    cur,
+                    nxt,
+                    &dep,
+                    &mut pxgate,
+                    &pxr,
                 )
             } else {
                 emit_glm_block_prefill(
-                    &mut pb, &c, &tn, slot, ctx, t, enc, cur, nxt, &dep, &mut pxgate, &pxr,
+                    &mut pb,
+                    &c,
+                    &tn,
+                    slot,
+                    ctx,
+                    t,
+                    enc,
+                    cur,
+                    nxt,
+                    &dep,
+                    &mut pxgate,
+                    &pxr,
                 )
             };
             dep = vec![d];
@@ -4122,7 +4296,16 @@ fn emit_glm_tail(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn glm_main(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, rope_gen: bool, target: &str, verify: Option<&crate::VerifyHook>) {
+pub(crate) fn glm_main(
+    dir: &Path,
+    ctx: u32,
+    out: &str,
+    n_cu: u32,
+    tp: u32,
+    rope_gen: bool,
+    target: &str,
+    verify: Option<&crate::VerifyHook>,
+) {
     let enc = mla_moe_enc_env(dir);
     let use_fp8 = enc == MoeEnc::Fp8Blk;
     // Full 78-layer serving decode program (GLM_FULL=1) vs the single-layer validation gate (default).
@@ -4237,7 +4420,6 @@ pub(crate) fn glm_main(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, rope
     let _ = c.qk_head();
 }
 
-
 /// MLA+MoE emit flavor. The Model build (declare_glm + emit_glm_block/dense) is IDENTICAL across
 /// these — only the descriptor's arch tag, mixer `kind`, and whether the DSA indexer role/dims/
 /// carried indices apply differ. GLM-5.2 has the DSA lightning indexer; Kimi K2.7 / DeepSeek-V3 are
@@ -4270,7 +4452,18 @@ pub(crate) fn glm_build_block(
     arch: MlaArch,
 ) -> (Model, plow_asset::BlockDescriptor) {
     let enc = MoeEnc::from_flags(use_fp8, false);
-    glm_build_block_pf(c, ctx, n_cu, block, use_fp8, model, arch, &[], PrefillScope::Attn, enc)
+    glm_build_block_pf(
+        c,
+        ctx,
+        n_cu,
+        block,
+        use_fp8,
+        model,
+        arch,
+        &[],
+        PrefillScope::Attn,
+        enc,
+    )
 }
 
 /// As [`glm_build_block`], plus one PREFILL bucket program per entry of `pf` ahead of the decode
@@ -4330,7 +4523,14 @@ pub(crate) fn glm_build_block_pf(
 
     let mut tb = Builder::new(n_cu);
     // One tensor table serves every program, so it is sized for the widest bucket (1 = decode-only).
-    let tn = declare_glm_rows(&mut tb, c, ctx, &layers, pf.iter().copied().max().unwrap_or(1), enc);
+    let tn = declare_glm_rows(
+        &mut tb,
+        c,
+        ctx,
+        &layers,
+        pf.iter().copied().max().unwrap_or(1),
+        enc,
+    );
     let tensors = tb.tensors();
     let gen = tb.gen_tensors();
 
@@ -4344,7 +4544,19 @@ pub(crate) fn glm_build_block_pf(
         let mut pxgate = 0u32;
         match scope {
             PrefillScope::Attn => {
-                emit_glm_mla_prefill(&mut pb, c, &tn, 0, ctx, t, enc, tn.x, &[], &mut pxgate, &pall);
+                emit_glm_mla_prefill(
+                    &mut pb,
+                    c,
+                    &tn,
+                    0,
+                    ctx,
+                    t,
+                    enc,
+                    tn.x,
+                    &[],
+                    &mut pxgate,
+                    &pall,
+                );
             }
             PrefillScope::Full => {
                 // Same ping-pong chain the decode program uses: layer l+1 reads layer l's residual.
@@ -4355,11 +4567,33 @@ pub(crate) fn glm_build_block_pf(
                     let nxt = if cur == tn.x { tn.xnext } else { tn.x };
                     let d = if c.is_dense(l) {
                         emit_glm_dense_block_prefill(
-                            &mut pb, c, &tn, slot, ctx, t, enc, cur, nxt, &dep, &mut pxgate, &pall,
+                            &mut pb,
+                            c,
+                            &tn,
+                            slot,
+                            ctx,
+                            t,
+                            enc,
+                            cur,
+                            nxt,
+                            &dep,
+                            &mut pxgate,
+                            &pall,
                         )
                     } else {
                         emit_glm_block_prefill(
-                            &mut pb, c, &tn, slot, ctx, t, enc, cur, nxt, &dep, &mut pxgate, &pall,
+                            &mut pb,
+                            c,
+                            &tn,
+                            slot,
+                            ctx,
+                            t,
+                            enc,
+                            cur,
+                            nxt,
+                            &dep,
+                            &mut pxgate,
+                            &pall,
                         )
                     };
                     dep = vec![d];
@@ -4386,7 +4620,9 @@ pub(crate) fn glm_build_block_pf(
     for (slot, &l) in layers.iter().enumerate() {
         let nxt = if cur == tn.x { tn.xnext } else { tn.x };
         let d = if c.is_dense(l) {
-            emit_glm_dense_block(&mut b, c, &tn, slot, ctx, enc, cur, nxt, &dep, &mut xgate, &xr_cus)
+            emit_glm_dense_block(
+                &mut b, c, &tn, slot, ctx, enc, cur, nxt, &dep, &mut xgate, &xr_cus,
+            )
         } else {
             emit_glm_block(
                 &mut b, c, &tn, slot, ctx, enc, cur, nxt, &dep, &mut xgate, &xr_cus,
@@ -4475,7 +4711,13 @@ pub(crate) fn glm_build_block_pf(
             ..Default::default()
         },
         // DSA role only on GLM; plain-MLA archs have no indexer (dsa_role absent).
-        dsa_role: is_glm.then(|| if full { "indexer".into() } else { "reuse".into() }),
+        dsa_role: is_glm.then(|| {
+            if full {
+                "indexer".into()
+            } else {
+                "reuse".into()
+            }
+        }),
         inputs: vec![BlockTensor {
             name: "act.x".into(),
             shape: vec![Dim::Symbolic("T".into()), Dim::Fixed(hidden)],
@@ -4508,7 +4750,17 @@ pub(crate) fn glm_build_block_pf(
 /// has no prefill program).
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn glm_emit_block(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, spec: &str, rope_gen: bool, target: &str, verify: Option<&crate::VerifyHook>) {
+pub(crate) fn glm_emit_block(
+    dir: &Path,
+    ctx: u32,
+    out: &str,
+    n_cu: u32,
+    tp: u32,
+    spec: &str,
+    rope_gen: bool,
+    target: &str,
+    verify: Option<&crate::VerifyHook>,
+) {
     let mut c = cfg_glm(dir);
     c.tp = tp;
     // `--num-gpus N --parallel tp` reaches here as tp=N. The block emit is TP-parameterized end to
@@ -4518,8 +4770,11 @@ pub(crate) fn glm_emit_block(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32
     // was describing an earlier state of the emitter, not a limitation of it. Verified by
     // `mla_prefill_tp_shapes_scale_with_tp` / `mla_prefill_tp_emits_two_shot_allreduce`.
     // The RUNTIME cannot serve tp>1 yet (no cross-GPU collectives); this is compiler-side emission.
-    assert!(tp >= 1 && c.heads % tp == 0,
-        "tp={tp} must divide n_head={} (each rank owns a whole head shard)", c.heads);
+    assert!(
+        tp >= 1 && c.heads % tp == 0,
+        "tp={tp} must divide n_head={} (each rank owns a whole head shard)",
+        c.heads
+    );
     let enc = mla_moe_enc_env(dir);
     let use_fp8 = enc == MoeEnc::Fp8Blk;
     let block = parse_block(spec, c.layers as usize);
@@ -4528,8 +4783,18 @@ pub(crate) fn glm_emit_block(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| dir.to_string_lossy().into_owned());
     let (pf, scope) = glm_prefill_buckets_env(ctx);
-    let (mut m, desc) =
-        glm_build_block_pf(&c, ctx, n_cu, block.clone(), use_fp8, &model, MlaArch::Glm, &pf, scope, enc);
+    let (mut m, desc) = glm_build_block_pf(
+        &c,
+        ctx,
+        n_cu,
+        block.clone(),
+        use_fp8,
+        &model,
+        MlaArch::Glm,
+        &pf,
+        scope,
+        enc,
+    );
     let section = write_block_descriptor(out, &desc);
     if !rope_gen {
         m.bake_gen();
@@ -4621,13 +4886,27 @@ fn report_mla_prefill(m: &Model, pf: &[u32], scope: PrefillScope, enc: MoeEnc) {
 /// descriptor tag.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn kimi_emit_block(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, spec: &str, arch: MlaArch, rope_gen: bool, target: &str, verify: Option<&crate::VerifyHook>) {
+pub(crate) fn kimi_emit_block(
+    dir: &Path,
+    ctx: u32,
+    out: &str,
+    n_cu: u32,
+    tp: u32,
+    spec: &str,
+    arch: MlaArch,
+    rope_gen: bool,
+    target: &str,
+    verify: Option<&crate::VerifyHook>,
+) {
     let mut c = cfg_kimi(dir);
     c.tp = tp;
     // See the note in `glm_emit_block`: the shared MLA+MoE emit is TP-parameterized, so `--num-gpus
     // N` sharding is emission-complete on this path too. tp must divide the head count.
-    assert!(tp >= 1 && c.heads % tp == 0,
-        "tp={tp} must divide n_head={} (each rank owns a whole head shard)", c.heads);
+    assert!(
+        tp >= 1 && c.heads % tp == 0,
+        "tp={tp} must divide n_head={} (each rank owns a whole head shard)",
+        c.heads
+    );
     let enc = mla_moe_enc_env(dir);
     let use_fp8 = enc == MoeEnc::Fp8Blk;
     let block = parse_block(spec, c.layers as usize);
@@ -4636,8 +4915,18 @@ pub(crate) fn kimi_emit_block(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u3
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| dir.to_string_lossy().into_owned());
     let (pf, scope) = glm_prefill_buckets_env(ctx);
-    let (mut m, desc) =
-        glm_build_block_pf(&c, ctx, n_cu, block.clone(), use_fp8, &model, arch, &pf, scope, enc);
+    let (mut m, desc) = glm_build_block_pf(
+        &c,
+        ctx,
+        n_cu,
+        block.clone(),
+        use_fp8,
+        &model,
+        arch,
+        &pf,
+        scope,
+        enc,
+    );
     let section = write_block_descriptor(out, &desc);
     if !rope_gen {
         m.bake_gen();
@@ -5293,8 +5582,19 @@ pub(crate) fn nemotron_build_block(
 /// `--block` on the Nemotron-3 (nemotron_h) hybrid path (M4). Emits ONE block (layers `spec`) as a
 /// GPU-loadable PLOWDEV blob with a `SECT_METADATA` `block.json` descriptor + sibling file. Per-layer
 /// dispatch: the NEW Mamba-2 mixer op (mamba layers) or the reused GQA-attn / MoE emit.
-pub(crate) fn nemotron_emit_block(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, spec: &str, rope_gen: bool) {
-    assert_eq!(tp, 1, "Nemotron TP sharding is a later milestone; use --tp 1 for --block");
+pub(crate) fn nemotron_emit_block(
+    dir: &Path,
+    ctx: u32,
+    out: &str,
+    n_cu: u32,
+    tp: u32,
+    spec: &str,
+    rope_gen: bool,
+) {
+    assert_eq!(
+        tp, 1,
+        "Nemotron TP sharding is a later milestone; use --tp 1 for --block"
+    );
     let c = cfg_nemotron(dir);
     let block = parse_block(spec, c.layers);
     let model = dir
@@ -5468,7 +5768,8 @@ fn k3_cfg_from(v: &Value) -> K3Cfg {
     );
     let g = |k: &str| {
         t[k].as_u64()
-            .unwrap_or_else(|| panic!("kimi_k3: text_config missing required field {k:?}")) as u32
+            .unwrap_or_else(|| panic!("kimi_k3: text_config missing required field {k:?}"))
+            as u32
     };
     let gf = |k: &str| {
         t[k].as_f64()
@@ -5512,10 +5813,11 @@ fn k3_cfg_from(v: &Value) -> K3Cfg {
             .expect("kimi_k3: linear_attn_config.head_dim") as u32,
         kda_conv: lac["short_conv_kernel_size"]
             .as_u64()
-            .expect("kimi_k3: linear_attn_config.short_conv_kernel_size")
-            as u32,
+            .expect("kimi_k3: linear_attn_config.short_conv_kernel_size") as u32,
         kda_full_rank_gate: lac["use_full_rank_gate"].as_bool().unwrap_or(false),
-        kda_gate_lower_bound: lac["gate_lower_bound"].as_f64().unwrap_or(f64::NEG_INFINITY),
+        kda_gate_lower_bound: lac["gate_lower_bound"]
+            .as_f64()
+            .unwrap_or(f64::NEG_INFINITY),
         n_exp: g("num_experts"),
         top_k: g("num_experts_per_token"),
         shared_exp: g("num_shared_experts"),
@@ -5530,7 +5832,9 @@ fn k3_cfg_from(v: &Value) -> K3Cfg {
         n_group: g("num_expert_group"),
         topk_group: g("topk_group"),
         situ_beta: t["activation_situ_beta"].as_f64().unwrap_or(f64::NAN),
-        situ_linear_beta: t["activation_situ_linear_beta"].as_f64().unwrap_or(f64::NAN),
+        situ_linear_beta: t["activation_situ_linear_beta"]
+            .as_f64()
+            .unwrap_or(f64::NAN),
         hidden_act: act,
         attn_res_block: g("attn_res_block_size"),
         quant_format: q["format"].as_str().unwrap_or("<none>").to_string(),
@@ -5607,7 +5911,13 @@ fn k3_attn_map(t: &Value, layers: u32) -> Vec<K3Attn> {
 /// shards and a download in progress is the normal case, so this reads whatever has landed and
 /// reports the count. **A tensor's absence proves nothing** — every caller below must only ever
 /// use this to CONTRADICT the config, never to conclude something does not exist.
-fn k3_shard_headers(dir: &Path) -> (std::collections::BTreeMap<String, (String, Vec<i64>)>, u32, u32) {
+fn k3_shard_headers(
+    dir: &Path,
+) -> (
+    std::collections::BTreeMap<String, (String, Vec<i64>)>,
+    u32,
+    u32,
+) {
     use std::io::Read;
     let mut out = std::collections::BTreeMap::new();
     let (mut have, mut total) = (0u32, 0u32);
@@ -5629,7 +5939,9 @@ fn k3_shard_headers(dir: &Path) -> (std::collections::BTreeMap<String, (String, 
     }
     files.sort();
     for p in &files {
-        let Ok(mut f) = std::fs::File::open(p) else { continue };
+        let Ok(mut f) = std::fs::File::open(p) else {
+            continue;
+        };
         let mut len8 = [0u8; 8];
         if f.read_exact(&mut len8).is_err() {
             continue;
@@ -5642,7 +5954,9 @@ fn k3_shard_headers(dir: &Path) -> (std::collections::BTreeMap<String, (String, 
         if f.read_exact(&mut hbuf).is_err() {
             continue; // still downloading: header not fully written yet
         }
-        let Ok(hdr) = serde_json::from_slice::<Value>(&hbuf) else { continue };
+        let Ok(hdr) = serde_json::from_slice::<Value>(&hbuf) else {
+            continue;
+        };
         let Some(obj) = hdr.as_object() else { continue };
         have += 1;
         for (k, val) in obj {
@@ -5668,12 +5982,17 @@ fn k3_shard_headers(dir: &Path) -> (std::collections::BTreeMap<String, (String, 
 /// `qk_rope_head_dim=192` where the tensors said 64 and it cost a day. Returns one line per
 /// disagreement; an empty vector means every dim the checkpoint can speak to agrees with the config.
 /// Tensors that have not downloaded yet are simply not checked.
-fn k3_config_vs_tensors(c: &K3Cfg, h: &std::collections::BTreeMap<String, (String, Vec<i64>)>) -> Vec<String> {
+fn k3_config_vs_tensors(
+    c: &K3Cfg,
+    h: &std::collections::BTreeMap<String, (String, Vec<i64>)>,
+) -> Vec<String> {
     let mut errs = Vec::new();
     let mut check = |name: String, want: Vec<i64>| {
         if let Some((_, got)) = h.get(&name) {
             if *got != want {
-                errs.push(format!("{name}: config implies {want:?}, tensor is {got:?}"));
+                errs.push(format!(
+                    "{name}: config implies {want:?}, tensor is {got:?}"
+                ));
             }
         }
     };
@@ -5730,7 +6049,10 @@ fn k3_config_vs_tensors(c: &K3Cfg, h: &std::collections::BTreeMap<String, (Strin
             format!("{m}.routed_expert_up_proj.weight"),
             vec![hd, c.moe_latent as i64],
         );
-        check(format!("{m}.routed_expert_norm.weight"), vec![c.moe_latent as i64]);
+        check(
+            format!("{m}.routed_expert_norm.weight"),
+            vec![c.moe_latent as i64],
+        );
         let sh = (c.shared_exp * c.moe_inter) as i64;
         check(format!("{m}.shared_experts.gate_proj.weight"), vec![sh, hd]);
         check(format!("{m}.shared_experts.up_proj.weight"), vec![sh, hd]);
@@ -5742,17 +6064,32 @@ fn k3_config_vs_tensors(c: &K3Cfg, h: &std::collections::BTreeMap<String, (Strin
         let (li, lo) = (c.moe_latent as i64, c.moe_inter as i64);
         let grp = c.quant_group.max(1) as i64;
         for w13 in ["w1", "w3"] {
-            check(format!("{m}.experts.0.{w13}.weight_packed"), vec![lo, li / 2]);
-            check(format!("{m}.experts.0.{w13}.weight_scale"), vec![lo, li / grp]);
+            check(
+                format!("{m}.experts.0.{w13}.weight_packed"),
+                vec![lo, li / 2],
+            );
+            check(
+                format!("{m}.experts.0.{w13}.weight_scale"),
+                vec![lo, li / grp],
+            );
         }
         check(format!("{m}.experts.0.w2.weight_packed"), vec![li, lo / 2]);
         check(format!("{m}.experts.0.w2.weight_scale"), vec![li, lo / grp]);
     }
     if c.first_k_dense > 0 {
         let m = format!("{p}.0.mlp");
-        check(format!("{m}.gate_proj.weight"), vec![c.dense_inter as i64, hd]);
-        check(format!("{m}.up_proj.weight"), vec![c.dense_inter as i64, hd]);
-        check(format!("{m}.down_proj.weight"), vec![hd, c.dense_inter as i64]);
+        check(
+            format!("{m}.gate_proj.weight"),
+            vec![c.dense_inter as i64, hd],
+        );
+        check(
+            format!("{m}.up_proj.weight"),
+            vec![c.dense_inter as i64, hd],
+        );
+        check(
+            format!("{m}.down_proj.weight"),
+            vec![hd, c.dense_inter as i64],
+        );
     }
     errs
 }
@@ -5826,7 +6163,8 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
              dead and still has no AMD arm.",
         ),
     });
-    if c.hidden_act != "silu" && c.hidden_act != "gelu_pytorch_tanh" && c.hidden_act != "gelu_tanh" {
+    if c.hidden_act != "silu" && c.hidden_act != "gelu_pytorch_tanh" && c.hidden_act != "gelu_tanh"
+    {
         g.push(K3Gap {
             what: "`situ` activation",
             scope: "every FFN: dense layer 0, 2 shared experts, 896 routed experts, all 93 layers"
@@ -5931,8 +6269,17 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
                  by {}/{} = 2x, and the combine accumulator must run at latent rather than hidden \
                  width (the four decode `MoeCombine` `d.i[0] = h` sites and the two prefill \
                  combine sites, which perf-data/kimi-k3-kernel-gap.md §5e omits from its list).",
-                c.hidden, c.moe_latent, c.moe_latent, c.moe_latent, c.latent_norm,
-                c.hidden, c.moe_latent, c.moe_latent, c.moe_latent, c.hidden, c.moe_latent,
+                c.hidden,
+                c.moe_latent,
+                c.moe_latent,
+                c.moe_latent,
+                c.latent_norm,
+                c.hidden,
+                c.moe_latent,
+                c.moe_latent,
+                c.moe_latent,
+                c.hidden,
+                c.moe_latent,
             ),
             fix: "crates/devgen/src/mla.rs declare_glm (expert weight/scale sizing keyed on the \
                   latent width) and the MoE emit (down/norm/up around the expert loop). The GRAPH \
@@ -5983,7 +6330,8 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
                  `MlaMergeFold`'s epilogue: the fold is a REDUCTION over KV splits and the gate is \
                  a per-element multiply on its RESULT, so folding it in would have applied the \
                  sigmoid once per split.",
-                c.heads * c.v_head, c.hidden
+                c.heads * c.v_head,
+                c.hidden
             ),
             fix: "DONE — runtime/amd/op_k3.h (op 106) + crates/devgen/src/k3.rs \
                   emit_mla_out_gate. The CALL site is the model-level MLA emit, which does not \
@@ -6055,7 +6403,8 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
     g.push(K3Gap {
         what: "full-model emit for a hybrid MLA arch — THE ONE REMAINING BLOCKER",
         scope: "the whole blob".into(),
-        why: "EVERY OP K3 NEEDS NOW EXISTS AND PASSES A REAL-WEIGHT GATE (see CLOSED, above). What \
+        why:
+            "EVERY OP K3 NEEDS NOW EXISTS AND PASSES A REAL-WEIGHT GATE (see CLOSED, above). What \
               does not exist is anything that CALLS them together. Concretely, and this is the \
               honest state of the tree rather than a plan:\n\
               * `crates/devgen/src/k3.rs` and `crates/devgen/src/kda.rs` are reached by NOTHING \
@@ -6085,7 +6434,7 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
               have one until there is a loop to truncate. When it is written: layers 0..3 is the \
               minimum honest span, because 0/1/2 are KDA and 3 is the first MLA, so anything \
               shorter is not testing the hybrid at all."
-            .into(),
+                .into(),
         fix: "crates/devgen/src/lib.rs (dispatch: stop routing kimi_k3 unconditionally into \
               `kimi_k3_emit`), crates/plowc/src/hf_config.rs (the second refusal), and a new \
               `k3_main`/`k3_emit_full` in crates/devgen/src/mla.rs or a k3 module: a declare keyed \
@@ -6229,8 +6578,14 @@ pub(crate) fn k3_emit_full(
         "kimi_k3: emitted {} layers ({} KDA, {} MLA), tp={tp}, {} tensors, {} decode \
          instructions -> {out}\n  prefill buckets {pf:?} ({} programs incl. decode), ctx={ctx}",
         layers.len(),
-        layers.iter().filter(|&&l| matches!(c.attn[l as usize], K3Attn::Kda)).count(),
-        layers.iter().filter(|&&l| !matches!(c.attn[l as usize], K3Attn::Kda)).count(),
+        layers
+            .iter()
+            .filter(|&&l| matches!(c.attn[l as usize], K3Attn::Kda))
+            .count(),
+        layers
+            .iter()
+            .filter(|&&l| !matches!(c.attn[l as usize], K3Attn::Kda))
+            .count(),
         m.tensors.len(),
         m.progs.last().map(|p| p.insts.len()).unwrap_or(0),
         m.progs.len(),
@@ -6282,9 +6637,9 @@ const K3_PAIRED: &[(&str, &str)] = &[
 ];
 
 const K3_INDIRECT: &[&str] = &[
-    ".experts.",           // bind_packed_experts, by name pattern (494,592 tensors)
-    "q_b_proj.weight",     // absorbed host-side into derived.{q_absorb,q_rope}
-    "kv_b_proj.weight",    // absorbed host-side into derived.{q_absorb,v_absorb}
+    ".experts.",        // bind_packed_experts, by name pattern (494,592 tensors)
+    "q_b_proj.weight",  // absorbed host-side into derived.{q_absorb,q_rope}
+    "kv_b_proj.weight", // absorbed host-side into derived.{q_absorb,v_absorb}
 ];
 
 fn k3_emit_layers(c: &K3Cfg) -> Vec<u32> {
@@ -6317,8 +6672,13 @@ fn k3_emit_layers(c: &K3Cfg) -> Vec<u32> {
 /// Consumers read stale buffers, so tokens are garbage. That is intended and is the same standing
 /// as `PLOW_CHAIN_BYPASS`: wrong numerics are a valid instrument for scheduling and for cost.
 fn k3_ablate_bodies(m: &mut Model) {
-    let Ok(spec) = std::env::var("PLOW_K3_ABLATE") else { return };
-    let want: Vec<u16> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    let Ok(spec) = std::env::var("PLOW_K3_ABLATE") else {
+        return;
+    };
+    let want: Vec<u16> = spec
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
     if want.is_empty() {
         return;
     }
@@ -6345,7 +6705,10 @@ fn k3_ablate_bodies(m: &mut Model) {
 /// note records as UNSWEPT at TP8. `PLOW_K3_NS` is therefore the sweep handle and the default is
 /// the measured winner; do not change the default without re-running the sweep.
 fn k3_nsplit(ctx: u32) -> u32 {
-    if let Some(v) = std::env::var("PLOW_K3_NS").ok().and_then(|v| v.parse::<u32>().ok()) {
+    if let Some(v) = std::env::var("PLOW_K3_NS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
         return v.max(1);
     }
     let _ = ctx;
@@ -6468,7 +6831,8 @@ fn k3_build_model(
         // ignored (`lib.rs:4327`), so setting it on K3 was a silent no-op.
         b.set_l2_placement(l2_layout);
         b.adopt_tensors(tensors.clone());
-        crate::k3::emit_k3_model(&mut b,
+        crate::k3::emit_k3_model(
+            &mut b,
             &mcfg,
             &|l| matches!(c.attn[l as usize], K3Attn::Kda),
             &layers,
@@ -6598,7 +6962,11 @@ pub(crate) fn kimi_k3_emit(dir: &Path, ctx: u32, tp: u32, block_spec: Option<&st
         c.kda_heads,
         c.kda_head_dim,
         c.kda_conv,
-        if c.kda_full_rank_gate { "full-rank" } else { "low-rank" },
+        if c.kda_full_rank_gate {
+            "full-rank"
+        } else {
+            "low-rank"
+        },
         c.kda_gate_lower_bound
     );
     eprintln!(
@@ -6608,7 +6976,11 @@ pub(crate) fn kimi_k3_emit(dir: &Path, ctx: u32, tp: u32, block_spec: Option<&st
     );
     eprintln!(
         "  router      {} | renorm={} | scale {} | groups {}/{} | act {:?}",
-        if c.router_sigmoid { "sigmoid" } else { "softmax" },
+        if c.router_sigmoid {
+            "sigmoid"
+        } else {
+            "softmax"
+        },
         c.renormalize,
         c.route_scale,
         c.topk_group,
@@ -6846,7 +7218,6 @@ mod kimi_k3_tests {
         assert_eq!(c.attn.len(), c.layers as usize);
     }
 
-
     /// A checkpoint DIRECTORY holding the miniature config, for the two tests that drive
     /// `k3_build_model` end to end. There is no K3 checkpoint on this machine — only weights are
     /// missing, and `k3_build_model` never reads any.
@@ -6877,8 +7248,16 @@ mod kimi_k3_tests {
         let bare = k3_build_model(&d, 4096, 256, 1, &[], None);
         let laddered = k3_build_model(&d, 4096, 256, 1, &[128, 512, 1024], None);
 
-        assert_eq!(bare.prog_t, vec![1], "no ladder ⇒ decode only, as before this path existed");
-        assert_eq!(laddered.prog_t, vec![128, 512, 1024, 1], "buckets ascending, decode LAST");
+        assert_eq!(
+            bare.prog_t,
+            vec![1],
+            "no ladder ⇒ decode only, as before this path existed"
+        );
+        assert_eq!(
+            laddered.prog_t,
+            vec![128, 512, 1024, 1],
+            "buckets ascending, decode LAST"
+        );
         assert_eq!(laddered.progs.len(), 4);
 
         let a = bare.progs.last().unwrap();
@@ -6900,12 +7279,29 @@ mod kimi_k3_tests {
         // bucket); names and order do not move.
         for (i, td) in bare.tensors.iter().enumerate() {
             assert_eq!(td.name, laddered.tensors[i].name, "tensor {i} moved");
-            assert!(laddered.tensors[i].bytes >= td.bytes, "tensor {} shrank", td.name);
+            assert!(
+                laddered.tensors[i].bytes >= td.bytes,
+                "tensor {} shrank",
+                td.name
+            );
         }
-        assert!(laddered.tensors.len() > bare.tensors.len(), "buckets declare their own scratch");
+        assert!(
+            laddered.tensors.len() > bare.tensors.len(),
+            "buckets declare their own scratch"
+        );
         // And the ladder actually widened the shared activations rather than merely appending.
-        let ring = |m: &Model| m.tensors.iter().find(|t| t.name == "kv.blkres").unwrap().bytes;
-        assert_eq!(ring(&laddered), 1024 * ring(&bare), "the ring is [T][nb_cap][hidden]");
+        let ring = |m: &Model| {
+            m.tensors
+                .iter()
+                .find(|t| t.name == "kv.blkres")
+                .unwrap()
+                .bytes
+        };
+        assert_eq!(
+            ring(&laddered),
+            1024 * ring(&bare),
+            "the ring is [T][nb_cap][hidden]"
+        );
     }
 
     /// Every program must address the same peer slot B. The host has one peer layout for the
@@ -6921,9 +7317,7 @@ mod kimi_k3_tests {
             let slots: std::collections::BTreeSet<u32> = p
                 .insts
                 .iter()
-                .filter(|i| {
-                    i.op == DevOp::XReduce as u16 || i.op == DevOp::XReduceTwoShot as u16
-                })
+                .filter(|i| i.op == DevOp::XReduce as u16 || i.op == DevOp::XReduceTwoShot as u16)
                 .map(|i| i.i[2])
                 .collect();
             assert_eq!(
@@ -6942,9 +7336,16 @@ mod kimi_k3_tests {
     /// 4k-context deployment for an 8192-row program it cannot run.
     #[test]
     fn the_prefill_ladder_is_capped_at_the_context() {
-        assert_eq!(k3_prefill_buckets(131072), vec![128, 512, 1024, 2048, 4096, 8192]);
+        assert_eq!(
+            k3_prefill_buckets(131072),
+            vec![128, 512, 1024, 2048, 4096, 8192]
+        );
         assert_eq!(k3_prefill_buckets(2048), vec![128, 512, 1024, 2048]);
-        assert_eq!(k3_prefill_buckets(64), Vec::<u32>::new(), "no rung fits — decode only");
+        assert_eq!(
+            k3_prefill_buckets(64),
+            Vec::<u32>::new(),
+            "no rung fits — decode only"
+        );
     }
 
     /// Every bucket is a WHOLE MODEL: embed through argmax, with the grouped-MoE FFN.
@@ -6967,7 +7368,11 @@ mod kimi_k3_tests {
             // and not another would make the two phases compute DIFFERENT MODELS.
             // ...and ONE model-level mix (`_apply_output_attn_res`) on every program too — the
             // site whose absence left `model.norm` reading only the post-snapshot partial sum.
-            assert_eq!(n(DevOp::AttnRes), 2 * c.layers as usize + 1, "prog {pi} (T={t})");
+            assert_eq!(
+                n(DevOp::AttnRes),
+                2 * c.layers as usize + 1,
+                "prog {pi} (T={t})"
+            );
             // The FFN half is present on both, in the spelling that phase has a kernel for.
             let moe_layers = (c.layers - c.first_k_dense) as usize;
             if t == 1 {
@@ -7070,7 +7475,9 @@ mod kimi_k3_tests {
     #[test]
     fn vision_is_recorded_for_explicit_refusal() {
         let c = k3_cfg_from(&k3_json(&[]));
-        let v = c.vision.expect("vision_config must be recorded, not ignored");
+        let v = c
+            .vision
+            .expect("vision_config must be recorded, not ignored");
         assert_eq!((v.layers, v.hidden), (27, 1024));
         // A text-only re-export has none and must not be flagged.
         let text_only = k3_cfg_from(&k3_json(&[("vision_config", "<remove>")]));
@@ -7082,7 +7489,11 @@ mod kimi_k3_tests {
     #[test]
     fn every_gap_names_a_fix_site() {
         let gaps = k3_gaps(&k3_cfg_from(&k3_json(&[])));
-        assert!(gaps.len() >= 8, "expected the full ranked list, got {}", gaps.len());
+        assert!(
+            gaps.len() >= 8,
+            "expected the full ranked list, got {}",
+            gaps.len()
+        );
         for g in &gaps {
             assert!(
                 g.fix.contains(".rs") || g.fix.contains(".h"),
@@ -7145,7 +7556,10 @@ mod kimi_k3_tests {
             .into_iter()
             .find(|g| g.what.contains("NO positional"))
             .expect("a NoPE model must still produce an explicit entry");
-        assert!(nope.done.is_some(), "rung 3 proved the identity-table technique");
+        assert!(
+            nope.done.is_some(),
+            "rung 3 proved the identity-table technique"
+        );
         assert!(
             nope.fix.contains("require_mla_rope"),
             "the entry must say, in the fix text, that opening require_mla_rope is NOT the fix"
@@ -7233,7 +7647,10 @@ mod ckpt_quant_tests {
     /// about an existing workflow changes.
     #[test]
     fn unquantized_checkpoint_leaves_the_decision_to_the_flags() {
-        let d = cfg_dir("ckpt_plain", r#"{"model_type":"kimi_k2","dtype":"bfloat16"}"#);
+        let d = cfg_dir(
+            "ckpt_plain",
+            r#"{"model_type":"kimi_k2","dtype":"bfloat16"}"#,
+        );
         assert_eq!(mla_ckpt_enc(&d), None);
     }
 
@@ -7257,7 +7674,10 @@ mod ckpt_quant_tests {
     #[test]
     #[should_panic(expected = "ckpt_quant_awq")]
     fn an_unsupported_quantization_is_refused_rather_than_downgraded() {
-        let d = cfg_dir("ckpt_awq", r#"{"quantization_config":{"quant_method":"awq"}}"#);
+        let d = cfg_dir(
+            "ckpt_awq",
+            r#"{"quantization_config":{"quant_method":"awq"}}"#,
+        );
         mla_ckpt_enc(&d);
     }
 
@@ -7301,7 +7721,7 @@ mod glm_tests {
             eps: 1e-5,
             n_exp: 256,
             top_k: 8,
-            n_group: 1,   // GLM-5.2 does not group-limit (why the flat top-k matched its oracle)
+            n_group: 1, // GLM-5.2 does not group-limit (why the flat top-k matched its oracle)
             topk_group: 1,
             moe_inter: 2048,
             dense_inter: 12288,
@@ -7499,7 +7919,17 @@ mod glm_tests {
         b2.adopt_tensors(tensors);
         let mut xgate = 0u32;
         emit_glm_block(
-            &mut b2, &c, &tn, 0, ctx, MoeEnc::Fp8Blk, tn.x, tn.xnext, &[], &mut xgate, &[],
+            &mut b2,
+            &c,
+            &tn,
+            0,
+            ctx,
+            MoeEnc::Fp8Blk,
+            tn.x,
+            tn.xnext,
+            &[],
+            &mut xgate,
+            &[],
         );
         b2.finish()
             .insts
@@ -7540,15 +7970,25 @@ mod glm_tests {
         // do. Measured cost of that mismatch on GLM-5.2 TP4 (arm-absent object, per-layer chain):
         // 97.6 -> 83.7 us at ctx 8192 and 168.1 -> 135.9 us at 32768; end-to-end median ITL over
         // 78 layers 28.58 -> 27.45 ms and 34.81 -> 31.49 ms, token-identical.
-        assert_eq!(fl.i[7], 4, "long ctx bakes the GF the default object actually instantiates");
+        assert_eq!(
+            fl.i[7], 4,
+            "long ctx bakes the GF the default object actually instantiates"
+        );
         // nsplit is capped for GLM_MLA_GF=4: fill = ceil(256/(64/4)) = 16, below ctx/NS_PER = 128.
         assert_eq!(fl.i[4], 16, "nsplit");
         // ... so the work-item count is (64/4)*16 = 256, the whole chip, and `blocks` matches it.
-        assert_eq!(fl.blocks, 256, "GF=4 => (nh_l/4)*nsplit workgroups, chip-wide");
+        assert_eq!(
+            fl.blocks, 256,
+            "GF=4 => (nh_l/4)*nsplit workgroups, chip-wide"
+        );
 
         // Short ctx stays on the GF=2 arm, which has always existed and always been dispatched.
         let sh = glm_flash_pkt(1024, 1);
-        assert_eq!((sh.i[7], sh.blocks), (2, 256), "max_ctx <= 4096 keeps GF=2, chip-wide");
+        assert_eq!(
+            (sh.i[7], sh.blocks),
+            (2, 256),
+            "max_ctx <= 4096 keeps GF=2, chip-wide"
+        );
 
         // Every GF the emitter can bake MUST be one the interpreter instantiates. The set is
         // {2,4,8} and `exec_flash_mla_decode` dispatches exactly those three; anything else lands
@@ -7588,7 +8028,17 @@ mod glm_tests {
         b2.adopt_tensors(tensors.clone());
         let mut xgate = 0u32;
         emit_glm_block(
-            &mut b2, &c, &tn, 0, ctx, MoeEnc::Fp8Blk, tn.x, tn.xnext, &[], &mut xgate, &[],
+            &mut b2,
+            &c,
+            &tn,
+            0,
+            ctx,
+            MoeEnc::Fp8Blk,
+            tn.x,
+            tn.xnext,
+            &[],
+            &mut xgate,
+            &[],
         );
         let insts = b2.finish().insts;
         let kvlen = tensors
@@ -7606,7 +8056,10 @@ mod glm_tests {
              kernel writes nothing past kvlen",
             sel.i[0]
         );
-        assert_eq!(sel.i[0], ctx, "i[0] stays the max ctx (the scan upper bound)");
+        assert_eq!(
+            sel.i[0], ctx,
+            "i[0] stays the max ctx (the scan upper bound)"
+        );
         assert_eq!(sel.i[1], c.index_topk, "i[1] is the top_k ceiling");
 
         let sc = insts
@@ -7617,7 +8070,11 @@ mod glm_tests {
         assert_eq!(sc.i[3], c.index_dim, "i[3] = index_head_dim, per dev_isa.h");
         // ...and those are the ONLY values the kernel can execute, so the emitter must not be able
         // to produce anything else. `d_index_score_mfma` static_asserts HIc == 32.
-        assert_eq!((sc.i[1], sc.i[3]), (32, 128), "the geometry interp.hip hardcodes");
+        assert_eq!(
+            (sc.i[1], sc.i[3]),
+            (32, 128),
+            "the geometry interp.hip hardcodes"
+        );
     }
 
     #[test]
@@ -7751,11 +8208,18 @@ mod glm_tests {
         };
         let flat = decl("model.");
         let nested = decl("language_model.model.");
-        assert_eq!(flat.len(), nested.len(), "a prefix must not add or drop tensors");
+        assert_eq!(
+            flat.len(),
+            nested.len(),
+            "a prefix must not add or drop tensors"
+        );
 
         let (mut moved, mut fixed) = (0usize, 0usize);
         for ((fname, fbytes), (nname, nbytes)) in flat.iter().zip(nested.iter()) {
-            assert_eq!(fbytes, nbytes, "{fname}: a prefix must not change a byte size");
+            assert_eq!(
+                fbytes, nbytes,
+                "{fname}: a prefix must not change a byte size"
+            );
             match fname.strip_prefix("model.") {
                 // Anything the checkpoint names — weights AND the pointer tables declared beside
                 // them, which `bind_packed_experts` resolves by that same prefix.
@@ -7806,7 +8270,10 @@ mod glm_tests {
             let table = packet::names::is_host_filled_table(n);
             if table {
                 n_tables += 1;
-                assert!(!packet::names::is_checkpoint_weight(n), "{n}: host-filled, not a weight");
+                assert!(
+                    !packet::names::is_checkpoint_weight(n),
+                    "{n}: host-filled, not a weight"
+                );
                 continue;
             }
             if old {
@@ -7817,7 +8284,10 @@ mod glm_tests {
                 );
             }
         }
-        assert!(n_old >= 15 && n_tables > 0, "weights {n_old}, tables {n_tables}");
+        assert!(
+            n_old >= 15 && n_tables > 0,
+            "weights {n_old}, tables {n_tables}"
+        );
     }
 
     /// A multi-layer `--block 2..4` extraction is the per-layer blocks concatenated
@@ -7828,9 +8298,16 @@ mod glm_tests {
         let c = glm_ref_cfg();
         let mut want = emitted_dense_ops(); // layer 2 (dense)
         want.extend(ref_sequence(true)); // layer 3 (MoE)
-        assert_eq!(block_ops(&c, 512, 2..4), want, "2-layer block != dense++moe");
+        assert_eq!(
+            block_ops(&c, 512, 2..4),
+            want,
+            "2-layer block != dense++moe"
+        );
         let (_, desc) = glm_build_block(&c, 512, 256, 2..4, true, "glm-ref", MlaArch::Glm);
-        assert_eq!(desc.outputs[0].name, "act.x", "even layer count -> act.x out");
+        assert_eq!(
+            desc.outputs[0].name, "act.x",
+            "even layer count -> act.x out"
+        );
         assert_eq!(desc.layer, 2, "descriptor.layer = block start");
     }
 
@@ -7850,7 +8327,10 @@ mod glm_tests {
         assert_eq!(d.dims.shared_exp, Some(1));
         assert_eq!(d.dims.moe_inter, Some(2048));
         assert_eq!(d.dims.index_topk, Some(2048));
-        assert_eq!(d.outputs[0].name, "act.xnext", "odd layer count -> act.xnext");
+        assert_eq!(
+            d.outputs[0].name, "act.xnext",
+            "odd layer count -> act.xnext"
+        );
         assert_eq!(d.weights.prefix, "model.layers.3.");
         // Prefill is OPT-IN (`PLOW_MLA_PREFILL`), so the default block emit is still decode-only —
         // and must stay so, or every existing GLM asset gains buckets whose FFN half does not exist.
@@ -7903,7 +8383,9 @@ mod glm_tests {
             "indexer layer does not carry dsa_indices in"
         );
         assert!(
-            idx.carried_state[0].tensors.contains(&"kv.3.kidx".to_string()),
+            idx.carried_state[0]
+                .tensors
+                .contains(&"kv.3.kidx".to_string()),
             "indexer layer carries its kidx cache"
         );
     }
@@ -7922,15 +8404,31 @@ mod glm_tests {
             // The width IS the work-item count, so no workgroup is left without an item.
             let vt = mla_fold_vt(nh_l, got.len() as u32, 256);
             assert_eq!(vt, mla_fold_vt(nh_l, 256, 256), "VT branch must not move");
-            assert_eq!(nh_l * 256u32.div_ceil(vt), got.len() as u32, "sized to n_work");
+            assert_eq!(
+                nh_l * 256u32.div_ceil(vt),
+                got.len() as u32,
+                "sized to n_work"
+            );
         }
         // Kimi-K3, v_head 128: bh=16 would pick VT=32 at 256 wgs and VT=128 at the narrowed 64,
         // which reassociates the fold. The rule must REFUSE rather than narrow.
-        assert_eq!(mla_fold_cus(&all, 16, 128).len(), 256, "v=128 narrowing flips VT — refuse");
+        assert_eq!(
+            mla_fold_cus(&all, 16, 128).len(),
+            256,
+            "v=128 narrowing flips VT — refuse"
+        );
         // ... but a bh too large for VT=32 in the first place narrows safely.
-        assert_eq!(mla_fold_cus(&all, 96, 128).len(), 96, "v=128, VT=256 both sides");
+        assert_eq!(
+            mla_fold_cus(&all, 96, 128).len(),
+            96,
+            "v=128, VT=256 both sides"
+        );
         // Prefill (n_batch = t folded into bh) hands the whole machine back.
-        assert_eq!(mla_fold_cus(&all, 128 * 16, 256).len(), 256, "prefill bucket is inert");
+        assert_eq!(
+            mla_fold_cus(&all, 128 * 16, 256).len(),
+            256,
+            "prefill bucket is inert"
+        );
         // The flash-decode rule cancels EXACTLY at GF=4 — `glm_nsplit`'s fill cap uses the same
         // `GLM_MLA_GF`, so `(nh_l/4)*fill == n_cu` and the long-ctx blob is chip-wide. THIS IS THE
         // REGRESSION GUARD FOR THE HALF-WIDTH DEFECT: while `glm_gf` returned 8 against an object
@@ -7943,8 +8441,11 @@ mod glm_tests {
         // nsplit at 64 because the ladder behind the ceiling is a tp4 ladder. tp8's long-ctx flash
         // therefore runs 2*64 = 128 items on 256 CUs — HALF THE CHIP — and whether raising it pays
         // is an open, measurable question, not an assumption to bake in. See `glm_nsplit`.
-        for &(nh_l, ctx, want) in &[(16u32, 65536u32, 256usize), (32, 65536, 256), (8, 65536, 128)]
-        {
+        for &(nh_l, ctx, want) in &[
+            (16u32, 65536u32, 256usize),
+            (32, 65536, 256),
+            (8, 65536, 128),
+        ] {
             let got = flash_mla_cus(&all, 1, 1, nh_l, glm_gf(ctx, nh_l), glm_nsplit(ctx, nh_l));
             assert_eq!(got.len(), want, "nh_l={nh_l} ctx={ctx}: GF=4 work items");
         }
@@ -7971,13 +8472,25 @@ mod glm_tests {
         // i[7] is read LITERALLY by `flash_mla_cus`, so the value the emitter bakes MUST be the
         // one the interpreter instantiates — and with `PLOW_GLM_GF8_ARM=0` (the default) that set
         // is {2,4}. This pair is the invariant: the emitted GF and the dispatch width agree.
-        assert_eq!(glm_gf(65536, 16), 4, "long ctx bakes the GF the default object runs");
-        assert_eq!(flash_mla_cus(&all, 1, 1, 16, 4, 64).len(), 256, "GF=4 => nh_l/4 groups");
+        assert_eq!(
+            glm_gf(65536, 16),
+            4,
+            "long ctx bakes the GF the default object runs"
+        );
+        assert_eq!(
+            flash_mla_cus(&all, 1, 1, 16, 4, 64).len(),
+            256,
+            "GF=4 => nh_l/4 groups"
+        );
         // `n_grp = nh_l / GF` is integer: a GF larger than this rank's head shard makes the flash
         // do NOTHING. GLM-5.2 n_head=64 reaches nh_l=4 at tp16, so the clamp is live, not
         // hypothetical.
         assert_eq!(glm_gf(65536, 8), 4, "tp8 (nh_l=8): 4, the default arm");
-        assert_eq!(glm_gf(65536, 4), 4, "tp16 (nh_l=4) must clamp to 4, not divide to zero");
+        assert_eq!(
+            glm_gf(65536, 4),
+            4,
+            "tp16 (nh_l=4) must clamp to 4, not divide to zero"
+        );
         assert_eq!(glm_gf(65536, 2), 2, "nh_l=2 clamps all the way to 2");
         // `PLOW_GLM_GF=8` still reaches the arm — it is the only way to run its A/B — and it is
         // still clamped by divisibility. Asserted at the end of this test, where the env var is
@@ -7988,11 +8501,27 @@ mod glm_tests {
         // tree with a non-power-of-two head count (96), and it is the reference TP that breaks:
         //   tp8  -> nh_l=12: the old `g <= nh_l` rule took GF=8, n_grp=1, heads 8..11 DROPPED
         //   tp16 -> nh_l=6 : took GF=4, n_grp=1, heads 4..5 DROPPED
-        assert_eq!(glm_gf(65536, 12), 4, "K3 tp8 (nh_l=12): 8 does not divide 12, 4 does");
-        assert_eq!(glm_gf(65536, 6), 2, "K3 tp16 (nh_l=6): 4 does not divide 6, 2 does");
-        assert_eq!(glm_gf(65536, 24), 4, "K3 tp4 (nh_l=24): 4, the default arm (8 is pin-only)");
+        assert_eq!(
+            glm_gf(65536, 12),
+            4,
+            "K3 tp8 (nh_l=12): 8 does not divide 12, 4 does"
+        );
+        assert_eq!(
+            glm_gf(65536, 6),
+            2,
+            "K3 tp16 (nh_l=6): 4 does not divide 6, 2 does"
+        );
+        assert_eq!(
+            glm_gf(65536, 24),
+            4,
+            "K3 tp4 (nh_l=24): 4, the default arm (8 is pin-only)"
+        );
         assert_eq!(glm_gf_prefill(65536, 12), 4, "prefill twin: 12 % 4 == 0");
-        assert_eq!(glm_gf_prefill(65536, 6), 2, "prefill twin: 6 % 4 != 0, fall to 2");
+        assert_eq!(
+            glm_gf_prefill(65536, 6),
+            2,
+            "prefill twin: 6 % 4 != 0, fall to 2"
+        );
         // Every nh_l a shipping model produces is a power of two, and every power of two is
         // divisible by 8, 4 and 2 — so this change moves NO emitted packet for GLM-5.2, Kimi-K2.7
         // or DeepSeek-V3. Pin that, because "it is byte-identical" is the claim that makes this
@@ -8044,9 +8573,15 @@ mod glm_tests {
             let got = blocked_gemv_cus(&all, n);
             let per = n.div_ceil(256);
             let per_after = n.div_ceil(got.len() as u32);
-            assert_eq!(per_after, per, "n={n}: `per` moved, the column map is not preserved");
+            assert_eq!(
+                per_after, per,
+                "n={n}: `per` moved, the column map is not preserved"
+            );
             // every surviving workgroup owns at least one column ...
-            assert!((got.len() as u32 - 1) * per < n, "n={n}: kept an empty workgroup");
+            assert!(
+                (got.len() as u32 - 1) * per < n,
+                "n={n}: kept an empty workgroup"
+            );
             // ... and no column is dropped.
             assert!(got.len() as u32 * per >= n, "n={n}: dropped columns");
         }
@@ -8098,7 +8633,11 @@ mod glm_tests {
                 (1024u32, 16u32, "61.1 vs ns32's 65.8"),
                 (4096, 16, "66.6 vs ns32's 67.2 — still the floor's rung"),
                 (8192, 32, "73.3 vs ns16's 90.1 — the rung ctx/512 got WRONG"),
-                (16384, 64, "88.1 vs ns32's 103.7 — the other rung ctx/512 got wrong"),
+                (
+                    16384,
+                    64,
+                    "88.1 vs ns32's 103.7 — the other rung ctx/512 got wrong",
+                ),
                 (32768, 64, "135.9, and 128 regresses to 141.3"),
                 (65536, 64, "183.0, fill-capped anyway"),
             ] {
@@ -8194,7 +8733,10 @@ mod glm_tests {
             .cloned()
             .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
             .unwrap_or_default();
-        assert!(msg.contains("weight_scale_inv"), "name the missing handle; got: {msg}");
+        assert!(
+            msg.contains("weight_scale_inv"),
+            "name the missing handle; got: {msg}"
+        );
     }
 }
 
@@ -8359,7 +8901,10 @@ mod kimi_tests {
         assert_eq!(d.dims.index_topk, None);
         assert_eq!(d.layer, 1);
         assert_eq!(d.weights.prefix, "model.layers.1.");
-        assert_eq!(d.outputs[0].name, "act.xnext", "odd layer count -> act.xnext");
+        assert_eq!(
+            d.outputs[0].name, "act.xnext",
+            "odd layer count -> act.xnext"
+        );
         // Decode-only unless prefill buckets are asked for; `kimi_prefill_descriptor_lists_buckets`
         // covers the opted-in shape.
         assert!(
@@ -8430,7 +8975,10 @@ mod kimi_tests {
             "no dsa_indices carried"
         );
         assert!(
-            d.carried_state[0].tensors.iter().all(|t| !t.contains("kidx")),
+            d.carried_state[0]
+                .tensors
+                .iter()
+                .all(|t| !t.contains("kidx")),
             "no indexer kidx cache"
         );
     }
@@ -8481,7 +9029,18 @@ mod kimi_tests {
 
     /// Build one MLA block with prefill buckets and return (model, descriptor).
     fn pf_block(c: &GlmCfg, ctx: u32, pf: &[u32]) -> (Model, plow_asset::BlockDescriptor) {
-        glm_build_block_pf(c, ctx, 256, 1..2, true, "kimi-ref", MlaArch::Kimi, pf, PrefillScope::Attn, MoeEnc::Fp8Blk)
+        glm_build_block_pf(
+            c,
+            ctx,
+            256,
+            1..2,
+            true,
+            "kimi-ref",
+            MlaArch::Kimi,
+            pf,
+            PrefillScope::Attn,
+            MoeEnc::Fp8Blk,
+        )
     }
 
     fn find_op(p: &packet::devbuild::Program, op: DevOp) -> &packet::dev::DevInst {
@@ -8499,7 +9058,10 @@ mod kimi_tests {
         for n in [2usize, 3, 8, 32, 224, 256] {
             let cus: Vec<u32> = (0..n as u32).collect();
             let (g, u) = glm_glu_halves(&cus);
-            assert!(!g.is_empty() && !u.is_empty(), "n={n}: an empty CU set is not emittable");
+            assert!(
+                !g.is_empty() && !u.is_empty(),
+                "n={n}: an empty CU set is not emittable"
+            );
             assert!(g.iter().all(|c| !u.contains(c)), "n={n}: halves overlap");
             let mut all: Vec<u32> = g.iter().chain(u.iter()).copied().collect();
             all.sort_unstable();
@@ -8520,13 +9082,21 @@ mod kimi_tests {
         assert_eq!(m.progs.len(), 2, "one prefill bucket + decode");
         assert_eq!(m.prog_t, vec![128, 1]);
         let ops: Vec<u16> = m.progs[0].insts.iter().map(|d| d.op).collect();
-        assert_eq!(ops.len(), 15, "norm + 3 down GEMMs + norm + 2 q GEMMs + 2 rope + norm + \
-                                   flash + merge-fold + o_proj + residual + norm");
+        assert_eq!(
+            ops.len(),
+            15,
+            "norm + 3 down GEMMs + norm + 2 q GEMMs + 2 rope + norm + \
+                                   flash + merge-fold + o_proj + residual + norm"
+        );
         let tiled = [Gemm as u16, GemmMed as u16, GemmSmall as u16];
         // Positions 1,2,3 (q_a/kv_a/k_rope), 5,6 (q_absorb/q_rope) and 12 (o_proj) are the tiled
         // GEMMs that replace decode's GemvQkv fusions and its o_proj Gemv.
         for i in [1usize, 2, 3, 5, 6, 12] {
-            assert!(tiled.contains(&ops[i]), "op {i} = {:?} is not a tiled GEMM arm", ops[i]);
+            assert!(
+                tiled.contains(&ops[i]),
+                "op {i} = {:?} is not a tiled GEMM arm",
+                ops[i]
+            );
         }
         assert_eq!(
             [ops[0], ops[4], ops[7], ops[8], ops[9], ops[10], ops[11], ops[13], ops[14]],
@@ -8545,10 +9115,21 @@ mod kimi_tests {
         // No decode-family op may leak into a prefill bucket: those bodies are compiled into the
         // DECODE object, and the AMD dispatch default silently no-ops an opcode with no arm.
         for bad in [
-            Gemv, GemvQkv, GemvGlu, GemvFp8Blk, FlashMlaDecode, FlashGatherDecode, MoeRouterTopk,
-            MoeExpertGluFp8Blk, MoeCombine, DenseGluFp8Blk,
+            Gemv,
+            GemvQkv,
+            GemvGlu,
+            GemvFp8Blk,
+            FlashMlaDecode,
+            FlashGatherDecode,
+            MoeRouterTopk,
+            MoeExpertGluFp8Blk,
+            MoeCombine,
+            DenseGluFp8Blk,
         ] {
-            assert!(!ops.contains(&(bad as u16)), "{bad:?} leaked into the prefill bucket");
+            assert!(
+                !ops.contains(&(bad as u16)),
+                "{bad:?} leaked into the prefill bucket"
+            );
         }
     }
 
@@ -8563,15 +9144,28 @@ mod kimi_tests {
         let p = &m.progs[0];
         let fl = find_op(p, DevOp::FlashMlaPrefill);
         assert_eq!(fl.i[0], 1, "n_batch: one sequence per prefill chunk");
-        assert_eq!(fl.i[1], c.heads, "n_head = per-rank head count (tp=1 => all)");
+        assert_eq!(
+            fl.i[1], c.heads,
+            "n_head = per-rank head count (tp=1 => all)"
+        );
         assert_eq!(fl.i[2], 512, "kv_stride = ctx");
         assert_eq!(fl.i[3], 0, "window 0 = full causal");
-        assert_eq!(fl.i[4], 128, "i[4] carries n_tok on the prefill arm, not nsplit");
+        assert_eq!(
+            fl.i[4], 128,
+            "i[4] carries n_tok on the prefill arm, not nsplit"
+        );
         assert_eq!(fl.i[5], KV_MASK_NONE);
-        assert!(matches!(fl.i[7], 2 | 4), "GF must be an instantiated prefill body, got {}", fl.i[7]);
+        assert!(
+            matches!(fl.i[7], 2 | 4),
+            "GF must be an instantiated prefill body, got {}",
+            fl.i[7]
+        );
         assert_eq!(fl.t[6], c_kvlen(&m), "kv_len operand bound");
         let fold = find_op(p, DevOp::MlaMergeFold);
-        assert_eq!(fold.i[0], 128, "the token axis folds into n_batch: partials are (b*n_tok+t)");
+        assert_eq!(
+            fold.i[0], 128,
+            "the token axis folds into n_batch: partials are (b*n_tok+t)"
+        );
         assert_eq!(fold.i[1], c.heads);
         assert_eq!(fold.i[2], c.v_head);
         assert_eq!(fold.i[4], 1, "nsplit MUST be 1 on the prefill arm");
@@ -8579,7 +9173,10 @@ mod kimi_tests {
 
     /// `in.kvlen`'s handle, so the operand check above is against the real tensor, not an index.
     fn c_kvlen(m: &Model) -> u32 {
-        m.tensors.iter().position(|t| t.name == "in.kvlen").expect("in.kvlen declared") as u32
+        m.tensors
+            .iter()
+            .position(|t| t.name == "in.kvlen")
+            .expect("in.kvlen declared") as u32
     }
 
     /// EVERY head-dimensioned prefill field is the PER-RANK count nh_l = n_head/tp. Sizing any of
@@ -8593,19 +9190,33 @@ mod kimi_tests {
             let nh_l = c.heads / tp;
             let (m, _) = pf_block(&c, 512, &[128]);
             let p = &m.progs[0];
-            assert_eq!(find_op(p, DevOp::FlashMlaPrefill).i[1], nh_l, "tp={tp} flash n_head");
-            assert_eq!(find_op(p, DevOp::MlaMergeFold).i[1], nh_l, "tp={tp} fold n_head");
+            assert_eq!(
+                find_op(p, DevOp::FlashMlaPrefill).i[1],
+                nh_l,
+                "tp={tp} flash n_head"
+            );
+            assert_eq!(
+                find_op(p, DevOp::MlaMergeFold).i[1],
+                nh_l,
+                "tp={tp} fold n_head"
+            );
             // o_proj is row-parallel: K = this rank's nh_l*v_head lanes, N = full hidden.
             let o = p
                 .insts
                 .iter()
                 .rev()
-                .find(|d| matches!(d.op, x if x == DevOp::Gemm as u16
+                .find(|d| {
+                    matches!(d.op, x if x == DevOp::Gemm as u16
                                         || x == DevOp::GemmMed as u16
-                                        || x == DevOp::GemmSmall as u16))
+                                        || x == DevOp::GemmSmall as u16)
+                })
                 .expect("o_proj GEMM");
             assert_eq!(o.i[1], c.hidden, "tp={tp} o_proj N = full hidden");
-            assert_eq!(o.i[2], nh_l * c.v_head, "tp={tp} o_proj K = per-rank head lanes");
+            assert_eq!(
+                o.i[2],
+                nh_l * c.v_head,
+                "tp={tp} o_proj K = per-rank head lanes"
+            );
             // The q projections are column-parallel by head.
             let qa = &p.insts[5];
             assert_eq!(qa.i[1], nh_l * c.kv_lora, "tp={tp} q_absorb N");
@@ -8619,8 +9230,10 @@ mod kimi_tests {
     fn mla_prefill_tp_emits_two_shot_allreduce() {
         let (m1, _) = pf_block(&kimi_tp_cfg(1), 512, &[128]);
         assert!(
-            !m1.progs[0].insts.iter().any(|d| d.op == DevOp::XReduceTwoShot as u16
-                || d.op == DevOp::XReduce as u16),
+            !m1.progs[0]
+                .insts
+                .iter()
+                .any(|d| d.op == DevOp::XReduceTwoShot as u16 || d.op == DevOp::XReduce as u16),
             "tp=1 emits no collective"
         );
         for tp in [2u32, 4, 8] {
@@ -8648,12 +9261,22 @@ mod kimi_tests {
         let (m, _) = pf_block(&c, 512, &[128]);
         let dec = m.progs.last().unwrap();
         let glu = find_op(dec, DevOp::MoeExpertGluFp8Blk);
-        assert_eq!(glu.i[1], c.moe_inter, "EP: routed expert keeps the FULL moe_inter");
+        assert_eq!(
+            glu.i[1], c.moe_inter,
+            "EP: routed expert keeps the FULL moe_inter"
+        );
         // The SHARED expert stays TP-sharded — that is the floor EP deliberately does not touch.
         let sh = find_op(dec, DevOp::GemvGlu);
-        assert_eq!(sh.i[1], c.moe_inter / 4, "shared expert stays TP-sharded under EP");
+        assert_eq!(
+            sh.i[1],
+            c.moe_inter / 4,
+            "shared expert stays TP-sharded under EP"
+        );
         // And the attention half of the SAME asset is still per-rank sharded.
-        assert_eq!(find_op(&m.progs[0], DevOp::FlashMlaPrefill).i[1], c.heads / 4);
+        assert_eq!(
+            find_op(&m.progs[0], DevOp::FlashMlaPrefill).i[1],
+            c.heads / 4
+        );
 
         let mut c_tp = c.clone();
         c_tp.ep = false;
@@ -8671,15 +9294,26 @@ mod kimi_tests {
     fn mla_prefill_widens_the_shared_tensor_table() {
         let c = kimi_ref_cfg();
         let bytes = |m: &Model, n: &str| {
-            m.tensors.iter().find(|t| t.name == n).unwrap_or_else(|| panic!("{n}")).bytes
+            m.tensors
+                .iter()
+                .find(|t| t.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+                .bytes
         };
         let (dec_only, _) = pf_block(&c, 512, &[]);
         let (with_pf, _) = pf_block(&c, 512, &[128, 512]);
         let h = c.hidden as u64;
         assert_eq!(bytes(&dec_only, "act.x"), h * 2, "decode-only: one row");
-        assert_eq!(bytes(&with_pf, "act.x"), 512 * h * 2, "sized for the WIDEST bucket");
+        assert_eq!(
+            bytes(&with_pf, "act.x"),
+            512 * h * 2,
+            "sized for the WIDEST bucket"
+        );
         assert_eq!(bytes(&with_pf, "act.xn2"), 512 * h * 2);
-        assert_eq!(bytes(&with_pf, "act.oat"), 512 * (c.heads * c.v_head) as u64 * 2);
+        assert_eq!(
+            bytes(&with_pf, "act.oat"),
+            512 * (c.heads * c.v_head) as u64 * 2
+        );
         // The flash partials are [t][head][nsplit][DK] with nsplit=1 at prefill and ns at decode —
         // the MAX of the two, not their product.
         let ns = glm_nsplit(512, c.heads);
@@ -8688,10 +9322,20 @@ mod kimi_tests {
             (c.heads * 512.max(ns) * c.kv_lora) as u64 * 4
         );
         // The MoE partials are [T*k, H] f32 — the grouped prefill FFN scatters into them.
-        assert_eq!(bytes(&with_pf, "act.part"), 512 * (c.top_k * c.hidden) as u64 * 4);
-        assert_eq!(bytes(&dec_only, "act.part"), (c.top_k * c.hidden) as u64 * 4, "decode: one row");
+        assert_eq!(
+            bytes(&with_pf, "act.part"),
+            512 * (c.top_k * c.hidden) as u64 * 4
+        );
+        assert_eq!(
+            bytes(&dec_only, "act.part"),
+            (c.top_k * c.hidden) as u64 * 4,
+            "decode: one row"
+        );
         // The DECODE per-slot gate/up buffer stays one row — the grouped path uses moe_fug instead.
-        assert_eq!(bytes(&with_pf, "act.fu"), (c.top_k * c.moe_inter) as u64 * 2);
+        assert_eq!(
+            bytes(&with_pf, "act.fu"),
+            (c.top_k * c.moe_inter) as u64 * 2
+        );
     }
 
     /// The descriptor reports the buckets it actually emitted.
@@ -8720,20 +9364,52 @@ mod kimi_tests {
     #[should_panic(expected = "single-layer")]
     fn mla_prefill_refuses_a_multi_layer_block() {
         let c = kimi_ref_cfg();
-        glm_build_block_pf(&c, 512, 256, 0..2, true, "kimi-ref", MlaArch::Kimi, &[128], PrefillScope::Attn, MoeEnc::Fp8Blk);
+        glm_build_block_pf(
+            &c,
+            512,
+            256,
+            0..2,
+            true,
+            "kimi-ref",
+            MlaArch::Kimi,
+            &[128],
+            PrefillScope::Attn,
+            MoeEnc::Fp8Blk,
+        );
     }
 
     /// The attention-only scope emits the verified flash-prefill arm and stops there.
     #[test]
     fn mla_prefill_attn_scope_still_emits() {
         let (m, _) = pf_block(&kimi_ref_cfg(), 512, &[128]);
-        assert!(m.progs[0].insts.iter().any(|d| d.op == DevOp::FlashMlaPrefill as u16));
+        assert!(m.progs[0]
+            .insts
+            .iter()
+            .any(|d| d.op == DevOp::FlashMlaPrefill as u16));
     }
 
     // ===== WHOLE-LAYER prefill: MLA attention + token-sorted grouped MoE FFN (ops 83-87) ========
 
-    fn pf_full_enc(c: &GlmCfg, ctx: u32, pf: &[u32], block: std::ops::Range<usize>, enc: MoeEnc) -> Model {
-        glm_build_block_pf(c, ctx, 256, block, true, "kimi-ref", MlaArch::Kimi, pf, PrefillScope::Full, enc).0
+    fn pf_full_enc(
+        c: &GlmCfg,
+        ctx: u32,
+        pf: &[u32],
+        block: std::ops::Range<usize>,
+        enc: MoeEnc,
+    ) -> Model {
+        glm_build_block_pf(
+            c,
+            ctx,
+            256,
+            block,
+            true,
+            "kimi-ref",
+            MlaArch::Kimi,
+            pf,
+            PrefillScope::Full,
+            enc,
+        )
+        .0
     }
 
     fn pf_full(c: &GlmCfg, ctx: u32, pf: &[u32], block: std::ops::Range<usize>) -> Model {
@@ -8761,9 +9437,22 @@ mod kimi_tests {
                 MoeCombinePf as u16
             ]
         );
-        assert!(ops.contains(&(FlashMlaPrefill as u16)), "attention half still present");
-        for bad in [MoeExpertGluFp8Blk, MoeExpertDownFp8Blk, MoeCombine, MoeRouterTopk, GemvGlu, Gemv] {
-            assert!(!ops.contains(&(bad as u16)), "{bad:?} is a DECODE op; it must not appear");
+        assert!(
+            ops.contains(&(FlashMlaPrefill as u16)),
+            "attention half still present"
+        );
+        for bad in [
+            MoeExpertGluFp8Blk,
+            MoeExpertDownFp8Blk,
+            MoeCombine,
+            MoeRouterTopk,
+            GemvGlu,
+            Gemv,
+        ] {
+            assert!(
+                !ops.contains(&(bad as u16)),
+                "{bad:?} is a DECODE op; it must not appear"
+            );
         }
     }
 
@@ -8781,8 +9470,11 @@ mod kimi_tests {
         assert_eq!((al.i[0], al.i[1], al.i[2]), (256, 384, 8), "T, n_exp, k");
         assert_eq!(al.blocks, 1, "align is a single-workgroup global scan");
         let g = find_op(p, DevOp::MoeGroupGluPf);
-        assert_eq!((g.i[0], g.i[1], g.i[2], g.i[3]), (c.moe_inter, c.hidden, 384, 1),
-                   "I_moe (EP: whole), H, n_exp, fp8");
+        assert_eq!(
+            (g.i[0], g.i[1], g.i[2], g.i[3]),
+            (c.moe_inter, c.hidden, 384, 1),
+            "I_moe (EP: whole), H, n_exp, fp8"
+        );
         let dn = find_op(p, DevOp::MoeGroupDownPf);
         assert_eq!((dn.i[0], dn.i[1], dn.i[2]), (c.hidden, c.moe_inter, 384));
         let cb = find_op(p, DevOp::MoeCombinePf);
@@ -8802,7 +9494,11 @@ mod kimi_tests {
         assert_eq!(bytes("act.moe_rowtok"), pad * 4);
         assert_eq!(bytes("act.moe_rowpart"), pad * 4);
         assert_eq!(bytes("act.moe_rowgate"), pad * 4);
-        assert_eq!(bytes("act.moe_fug"), pad * c.moe_inter as u64 * 2, "EP: full moe_inter");
+        assert_eq!(
+            bytes("act.moe_fug"),
+            pad * c.moe_inter as u64 * 2,
+            "EP: full moe_inter"
+        );
         assert_eq!(bytes("act.moe_meta"), (3 * 384 + 1) as u64 * 4);
         // part is [T*k, H] f32 — no padding, the down op scatters by row_partidx.
         assert_eq!(bytes("act.part"), 256 * (8 * c.hidden) as u64 * 4);
@@ -8817,8 +9513,18 @@ mod kimi_tests {
         let m = pf_full(&c, 512, &[128], 1..3);
         let ops: Vec<u16> = m.progs[0].insts.iter().map(|d| d.op).collect();
         assert_eq!(ops.len(), 46, "two whole layers");
-        assert_eq!(ops.iter().filter(|&&o| o == DevOp::FlashMlaPrefill as u16).count(), 2);
-        assert_eq!(ops.iter().filter(|&&o| o == DevOp::MoeCombinePf as u16).count(), 2);
+        assert_eq!(
+            ops.iter()
+                .filter(|&&o| o == DevOp::FlashMlaPrefill as u16)
+                .count(),
+            2
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|&&o| o == DevOp::MoeCombinePf as u16)
+                .count(),
+            2
+        );
     }
 
     /// TP: the shared expert and the routed partials all-reduce through the TWO-SHOT collective at
@@ -8829,16 +9535,31 @@ mod kimi_tests {
         let c = kimi_k27_code_cfg(4);
         let m = pf_full(&c, 1024, &[256], 1..2);
         let p = &m.progs[0];
-        let xrs: Vec<_> = p.insts.iter().filter(|d| d.op == DevOp::XReduceTwoShot as u16).collect();
+        let xrs: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|d| d.op == DevOp::XReduceTwoShot as u16)
+            .collect();
         assert_eq!(xrs.len(), 2, "one for o_proj, one for the FFN combine");
         for x in &xrs {
             assert_eq!(x.i[0], 256 * c.hidden, "reduces t*hidden");
             assert_eq!(x.i[1], 4);
         }
-        assert_ne!(xrs[0].i[2], xrs[1].i[2], "the two partials occupy DIFFERENT peer slots");
-        assert_eq!(xrs[1].i[2], 256 * c.hidden * 2, "FFN partial sits past the o_proj partial");
+        assert_ne!(
+            xrs[0].i[2], xrs[1].i[2],
+            "the two partials occupy DIFFERENT peer slots"
+        );
+        assert_eq!(
+            xrs[1].i[2],
+            256 * c.hidden * 2,
+            "FFN partial sits past the o_proj partial"
+        );
         // The combine's residual is the ZERO buffer, not xmid — xmid is added after the all-reduce.
-        let zero = m.tensors.iter().position(|t| t.name == "act.zero_h").unwrap() as u32;
+        let zero = m
+            .tensors
+            .iter()
+            .position(|t| t.name == "act.zero_h")
+            .unwrap() as u32;
         assert_eq!(find_op(p, DevOp::MoeCombinePf).t[1], zero);
     }
 
@@ -8848,12 +9569,26 @@ mod kimi_tests {
     #[test]
     fn mla_full_prefill_declares_the_moe_prefill_axis() {
         let m = pf_full(&kimi_k27_code_cfg(4), 1024, &[256], 1..2);
-        let man = crate::manifest::build(&m, "gfx950", &crate::LeanReport::skipped("test: gate not run"));
+        let man = crate::manifest::build(
+            &m,
+            "gfx950",
+            &crate::LeanReport::skipped("test: gate not run"),
+        );
         assert_eq!(man["features"]["moe_prefill"], true);
         assert_eq!(man["features"]["prefill"], true);
-        let ops: Vec<&str> =
-            man["opcodes"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
-        for o in ["MoeRouterTopkPf", "MoeAlignPf", "MoeGroupGluPf", "MoeGroupDownPf", "MoeCombinePf"] {
+        let ops: Vec<&str> = man["opcodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for o in [
+            "MoeRouterTopkPf",
+            "MoeAlignPf",
+            "MoeGroupGluPf",
+            "MoeGroupDownPf",
+            "MoeCombinePf",
+        ] {
             assert!(ops.contains(&o), "{o} missing from the manifest");
         }
     }
@@ -8871,10 +9606,22 @@ mod kimi_tests {
         c.topk_group = 4;
         let m = pf_full(&c, 1024, &[256], 1..2);
         let pf = find_op(&m.progs[0], DevOp::MoeRouterTopkPf);
-        assert_eq!((pf.i[6], pf.i[7]), (8, 4), "prefill tail carries n_group/topk_group");
+        assert_eq!(
+            (pf.i[6], pf.i[7]),
+            (8, 4),
+            "prefill tail carries n_group/topk_group"
+        );
         let dec = find_op(m.progs.last().unwrap(), DevOp::MoeRouterTopk);
-        assert_eq!((dec.i[6], dec.i[7]), (8, 4), "decode tail carries the SAME pair");
-        assert_eq!((pf.i[1], pf.i[2]), (dec.i[1], dec.i[2]), "n_exp/k agree too");
+        assert_eq!(
+            (dec.i[6], dec.i[7]),
+            (8, 4),
+            "decode tail carries the SAME pair"
+        );
+        assert_eq!(
+            (pf.i[1], pf.i[2]),
+            (dec.i[1], dec.i[2]),
+            "n_exp/k agree too"
+        );
     }
 
     /// At `n_group <= 1` the rule is the identity, and the emitter must still say so explicitly —
@@ -8884,7 +9631,11 @@ mod kimi_tests {
         let c = kimi_ref_cfg(); // n_group = 1
         let (m, _) = pf_block(&c, 512, &[]);
         let dec = find_op(m.progs.last().unwrap(), DevOp::MoeRouterTopk);
-        assert_eq!((dec.i[6], dec.i[7]), (1, 1), "ungrouped => identity operands");
+        assert_eq!(
+            (dec.i[6], dec.i[7]),
+            (1, 1),
+            "ungrouped => identity operands"
+        );
     }
 
     // ===== A4W4 (MXFP4 on both operands) for the grouped expert path ===========================
@@ -8897,16 +9648,33 @@ mod kimi_tests {
         let c = kimi_k27_code_cfg(4);
         let m = pf_full_enc(&c, 1024, &[256], 1..2, MoeEnc::Mxfp4);
         let p = &m.progs[0];
-        let scale = m.tensors.iter().position(|t| t.name == "act.moe_fuscale").unwrap() as u32;
-        let rowpart = m.tensors.iter().position(|t| t.name == "act.moe_rowpart").unwrap() as u32;
+        let scale = m
+            .tensors
+            .iter()
+            .position(|t| t.name == "act.moe_fuscale")
+            .unwrap() as u32;
+        let rowpart = m
+            .tensors
+            .iter()
+            .position(|t| t.name == "act.moe_rowpart")
+            .unwrap() as u32;
         let g = find_op(p, DevOp::MoeGroupGluPf);
         assert_eq!(g.i[3], 2, "i[3]=2 selects the MXFP4 body");
-        assert_eq!(g.t[7], scale, "GLU writes the E8M0 rows (its epilogue IS the bridge)");
-        assert_eq!(g.t[6], rowpart, "GLU needs row_partidx so the bridge skips PAD rows");
+        assert_eq!(
+            g.t[7], scale,
+            "GLU writes the E8M0 rows (its epilogue IS the bridge)"
+        );
+        assert_eq!(
+            g.t[6], rowpart,
+            "GLU needs row_partidx so the bridge skips PAD rows"
+        );
         let d = find_op(p, DevOp::MoeGroupDownPf);
         assert_eq!(d.i[3], 2);
         assert_eq!(d.t[5], scale, "DOWN reads the same E8M0 rows back");
-        assert_eq!(d.t[1], g.t[0], "DOWN's A operand IS the bridge's fp4 output");
+        assert_eq!(
+            d.t[1], g.t[0],
+            "DOWN's A operand IS the bridge's fp4 output"
+        );
     }
 
     /// THE ENCODING SLOT IS NOT THE SAME ON BOTH PHASES, and this test exists because getting it
@@ -8930,17 +9698,32 @@ mod kimi_tests {
         // PREFILL: encoding in i[3], n_exp in i[2].
         for op in [DevOp::MoeGroupGluPf, DevOp::MoeGroupDownPf] {
             let x = find_op(pf, op);
-            assert_eq!(x.i[MoeEnc::PREFILL_SLOT], 2, "{op:?}: encoding is i[3] on prefill");
+            assert_eq!(
+                x.i[MoeEnc::PREFILL_SLOT],
+                2,
+                "{op:?}: encoding is i[3] on prefill"
+            );
             assert_eq!(x.i[2], c.n_exp, "{op:?}: n_exp stays in i[2]");
         }
         // DECODE: encoding in i[6], n_exp in i[3]. If these two ever swap, n_exp becomes 2.
         for op in [DevOp::MoeExpertGluFp8Blk, DevOp::MoeExpertDownFp8Blk] {
             let x = find_op(dec, op);
-            assert_eq!(x.i[MoeEnc::DECODE_SLOT], 2, "{op:?}: encoding is i[6] on decode");
-            assert_eq!(x.i[3], c.n_exp, "{op:?}: i[3] is n_exp — writing the encoding here kills it");
+            assert_eq!(
+                x.i[MoeEnc::DECODE_SLOT],
+                2,
+                "{op:?}: encoding is i[6] on decode"
+            );
+            assert_eq!(
+                x.i[3], c.n_exp,
+                "{op:?}: i[3] is n_exp — writing the encoding here kills it"
+            );
             assert_ne!(x.i[3], 2, "n_exp=2 is the silent-zeros signature");
         }
-        assert_ne!(MoeEnc::PREFILL_SLOT, MoeEnc::DECODE_SLOT, "the slots differ, deliberately");
+        assert_ne!(
+            MoeEnc::PREFILL_SLOT,
+            MoeEnc::DECODE_SLOT,
+            "the slots differ, deliberately"
+        );
     }
 
     /// The grouped decode pair (48/49) takes the encoding in the same slot as the per-slot pair.
@@ -8971,9 +9754,17 @@ mod kimi_tests {
     fn mla_encoding_is_a_field_on_the_expert_path() {
         let c = kimi_k27_code_cfg(4);
         let ops = |enc| -> Vec<u16> {
-            pf_full_enc(&c, 1024, &[256], 1..2, enc).progs[0].insts.iter().map(|d| d.op).collect()
+            pf_full_enc(&c, 1024, &[256], 1..2, enc).progs[0]
+                .insts
+                .iter()
+                .map(|d| d.op)
+                .collect()
         };
-        assert_eq!(ops(MoeEnc::Bf16), ops(MoeEnc::Fp8Blk), "bf16 vs block-fp8: same stream");
+        assert_eq!(
+            ops(MoeEnc::Bf16),
+            ops(MoeEnc::Fp8Blk),
+            "bf16 vs block-fp8: same stream"
+        );
         // Same expert opcodes under all three; only i[3] moves.
         for (enc, code) in [(MoeEnc::Bf16, 0), (MoeEnc::Fp8Blk, 1), (MoeEnc::Mxfp4, 2)] {
             let m = pf_full_enc(&c, 1024, &[256], 1..2, enc);
@@ -8986,7 +9777,11 @@ mod kimi_tests {
             } else {
                 DevOp::MoeExpertGluFp8Blk
             };
-            assert_eq!(find_op(m.progs.last().unwrap(), dop).i[6], code, "decode slot i[6]");
+            assert_eq!(
+                find_op(m.progs.last().unwrap(), dop).i[6],
+                code,
+                "decode slot i[6]"
+            );
         }
     }
 
@@ -9007,13 +9802,21 @@ mod kimi_tests {
         // would re-assert the very thing the T3 fix removed, namely that every fp4 prefill GEMM
         // takes the 256x256 tile whatever its shape. What must hold is that the ENCODING is
         // uniform, which is what the absence check below states.
-        const MXFP4_TILES: [DevOp; 5] =
-            [GemmMxfp4, GemmMedMxfp4, GemmSmallMxfp4, GemmWideMxfp4, GemmC5Mxfp4];
+        const MXFP4_TILES: [DevOp; 5] = [
+            GemmMxfp4,
+            GemmMedMxfp4,
+            GemmSmallMxfp4,
+            GemmWideMxfp4,
+            GemmC5Mxfp4,
+        ];
         assert!(
             MXFP4_TILES.iter().any(|t| pf.contains(&(*t as u16))),
             "no mxfp4 prefill GEMM at all; stream = {pf:?}"
         );
-        assert!(pf.contains(&(Glu as u16)), "no GemmGluMxfp4 => explicit Glu");
+        assert!(
+            pf.contains(&(Glu as u16)),
+            "no GemmGluMxfp4 => explicit Glu"
+        );
         // DECODE: projections are GemvMxfp4, the shared GLU IS fused (op 92 exists at decode).
         assert!(dec.contains(&(GemvMxfp4 as u16)));
         assert!(dec.contains(&(GemvGluMxfp4 as u16)));
@@ -9021,9 +9824,23 @@ mod kimi_tests {
         // Nothing may remain on a bf16 or block-fp8 matmul arm, in EITHER program.
         for (name, ops) in [("prefill", &pf), ("decode", &dec)] {
             for bad in [
-                Gemv, GemvGlu, GemvQkv, GemvFp8Blk, DenseGluFp8Blk, Gemm, GemmMed, GemmSmall,
-                GemmWide, GemmC5, GemmGlu, GemmFp8, GemmMedFp8, GemmSmallFp8, GemmWideFp8,
-                GemmC5Fp8, GemmGluFp8,
+                Gemv,
+                GemvGlu,
+                GemvQkv,
+                GemvFp8Blk,
+                DenseGluFp8Blk,
+                Gemm,
+                GemmMed,
+                GemmSmall,
+                GemmWide,
+                GemmC5,
+                GemmGlu,
+                GemmFp8,
+                GemmMedFp8,
+                GemmSmallFp8,
+                GemmWideFp8,
+                GemmC5Fp8,
+                GemmGluFp8,
             ] {
                 assert!(
                     !ops.contains(&(bad as u16)),
@@ -9032,7 +9849,10 @@ mod kimi_tests {
             }
         }
         // The expert path carries the encoding in its two phase-dependent slots.
-        assert_eq!(find_op(&m.progs[0], MoeGroupGluPf).i[MoeEnc::PREFILL_SLOT], 2);
+        assert_eq!(
+            find_op(&m.progs[0], MoeGroupGluPf).i[MoeEnc::PREFILL_SLOT],
+            2
+        );
         assert_eq!(
             find_op(m.progs.last().unwrap(), MoeExpertGluFp8Blk).i[MoeEnc::DECODE_SLOT],
             2
@@ -9052,14 +9872,26 @@ mod kimi_tests {
         let (n, k) = (c.hidden as u64, (c.heads / 4 * c.v_head) as u64);
         assert_eq!(bytes(&bf, nm), Some(n * k * 2), "bf16: 2 B/elt");
         assert_eq!(bytes(&mx, nm), Some(n * k / 2), "packed fp4: half a byte");
-        assert_eq!(bytes(&mx, &format!("{nm}_scale")), Some(n * k / MX_BLOCK as u64));
-        assert_eq!(bytes(&bf, &format!("{nm}_scale")), None, "no E8M0 rows off the MXFP4 arm");
+        assert_eq!(
+            bytes(&mx, &format!("{nm}_scale")),
+            Some(n * k / MX_BLOCK as u64)
+        );
+        assert_eq!(
+            bytes(&bf, &format!("{nm}_scale")),
+            None,
+            "no E8M0 rows off the MXFP4 arm"
+        );
         // Every MXFP4 projection op must carry a real scale handle in t3.
         for p in &mx.progs {
-            for i in p.insts.iter().filter(|d| {
-                d.op == DevOp::GemvMxfp4 as u16 || d.op == DevOp::GemmMxfp4 as u16
-            }) {
-                assert_ne!(i.t[3], TENSOR_NONE, "MXFP4 projection with an unbound E8M0 scale");
+            for i in p
+                .insts
+                .iter()
+                .filter(|d| d.op == DevOp::GemvMxfp4 as u16 || d.op == DevOp::GemmMxfp4 as u16)
+            {
+                assert_ne!(
+                    i.t[3], TENSOR_NONE,
+                    "MXFP4 projection with an unbound E8M0 scale"
+                );
             }
         }
     }
@@ -9075,7 +9907,11 @@ mod kimi_tests {
         let nm = "model.layers.1.self_attn.derived.v_absorb.weight";
         let w = mx.tensors.iter().find(|t| t.name == nm).unwrap();
         let (nh_l, dk, vd) = (c.heads / 4, c.kv_lora, c.v_head);
-        assert_eq!(w.bytes, (nh_l * dk * vd) as u64 * 2, "W_uv stays bf16 under MXFP4");
+        assert_eq!(
+            w.bytes,
+            (nh_l * dk * vd) as u64 * 2,
+            "W_uv stays bf16 under MXFP4"
+        );
         assert!(mx.tensors.iter().all(|t| t.name != format!("{nm}_scale")));
         assert!(mxfp4_bf16_exceptions().contains(&"MlaMergeFold/Wuv"));
         // How much of the model this is, at the REAL Kimi K2.7 geometry rather than the scaled
@@ -9097,14 +9933,29 @@ mod kimi_tests {
     #[test]
     fn mla_manifest_does_not_call_an_mxfp4_packet_fp8() {
         let c = kimi_k27_code_cfg(4);
-        let mx = crate::manifest::build(&pf_full_enc(&c, 1024, &[256], 1..2, MoeEnc::Mxfp4), "gfx950", &crate::LeanReport::skipped("test: gate not run"));
-        assert_eq!(mx["shapes"]["moe_enc"], serde_json::json!([2]), "ONE encoding");
+        let mx = crate::manifest::build(
+            &pf_full_enc(&c, 1024, &[256], 1..2, MoeEnc::Mxfp4),
+            "gfx950",
+            &crate::LeanReport::skipped("test: gate not run"),
+        );
+        assert_eq!(
+            mx["shapes"]["moe_enc"],
+            serde_json::json!([2]),
+            "ONE encoding"
+        );
         assert_eq!(mx["features"]["moe_enc_mixed"], false);
         assert_eq!(mx["features"]["a4w4"], true);
         assert_eq!(mx["features"]["mxfp4_weights"], true);
-        assert_eq!(mx["features"]["fp8_weights"], false, "no fp8 weight anywhere in this packet");
+        assert_eq!(
+            mx["features"]["fp8_weights"], false,
+            "no fp8 weight anywhere in this packet"
+        );
         // The block-fp8 packet is still reported as fp8 — the correction must not overreach.
-        let fp8 = crate::manifest::build(&pf_full_enc(&c, 1024, &[256], 1..2, MoeEnc::Fp8Blk), "gfx950", &crate::LeanReport::skipped("test: gate not run"));
+        let fp8 = crate::manifest::build(
+            &pf_full_enc(&c, 1024, &[256], 1..2, MoeEnc::Fp8Blk),
+            "gfx950",
+            &crate::LeanReport::skipped("test: gate not run"),
+        );
         assert_eq!(fp8["shapes"]["moe_enc"], serde_json::json!([1]));
         assert_eq!(fp8["features"]["fp8_weights"], true);
         assert_eq!(fp8["features"]["a4w4"], false);
@@ -9113,7 +9964,11 @@ mod kimi_tests {
     /// PLOW_MXFP4=1 and PLOW_FP8=1 together ask for two encodings in one packet.
     #[test]
     fn mla_two_encodings_at_once_is_refused() {
-        assert_eq!(MoeEnc::from_flags(true, true), MoeEnc::Mxfp4, "mxfp4 wins the enum");
+        assert_eq!(
+            MoeEnc::from_flags(true, true),
+            MoeEnc::Mxfp4,
+            "mxfp4 wins the enum"
+        );
         // The env-level guard is what actually refuses; exercised through the CLI.
     }
 
@@ -9126,10 +9981,24 @@ mod kimi_tests {
         let bytes = |m: &Model, n: &str| m.tensors.iter().find(|t| t.name == n).map(|t| t.bytes);
         let fp8 = pf_full_enc(&c, 1024, &[256], 1..2, MoeEnc::Fp8Blk);
         let mx = pf_full_enc(&c, 1024, &[256], 1..2, MoeEnc::Mxfp4);
-        assert_eq!(bytes(&fp8, "act.moe_fug"), Some(pad * c.moe_inter as u64 * 2));
-        assert_eq!(bytes(&mx, "act.moe_fug"), Some(pad * (c.moe_inter / 2) as u64), "packed fp4");
-        assert_eq!(bytes(&mx, "act.moe_fuscale"), Some(pad * (c.moe_inter / MX_BLOCK) as u64));
-        assert_eq!(bytes(&fp8, "act.moe_fuscale"), None, "no E8M0 rows on the block-fp8 arm");
+        assert_eq!(
+            bytes(&fp8, "act.moe_fug"),
+            Some(pad * c.moe_inter as u64 * 2)
+        );
+        assert_eq!(
+            bytes(&mx, "act.moe_fug"),
+            Some(pad * (c.moe_inter / 2) as u64),
+            "packed fp4"
+        );
+        assert_eq!(
+            bytes(&mx, "act.moe_fuscale"),
+            Some(pad * (c.moe_inter / MX_BLOCK) as u64)
+        );
+        assert_eq!(
+            bytes(&fp8, "act.moe_fuscale"),
+            None,
+            "no E8M0 rows on the block-fp8 arm"
+        );
     }
 
     /// bf16 and block-fp8 emission must be bit-identical to before the encoding field existed.
@@ -9139,11 +10008,21 @@ mod kimi_tests {
         let (m, _) = pf_block(&c, 512, &[128]);
         let dec = m.progs.last().unwrap();
         // The decode expert ops are untouched by the encoding work — they have no such field.
-        assert!(dec.insts.iter().any(|d| d.op == DevOp::MoeExpertGluFp8Blk as u16));
+        assert!(dec
+            .insts
+            .iter()
+            .any(|d| d.op == DevOp::MoeExpertGluFp8Blk as u16));
         assert_eq!(MoeEnc::from_flags(true, false), MoeEnc::Fp8Blk);
         assert_eq!(MoeEnc::from_flags(false, false), MoeEnc::Bf16);
         assert_eq!(MoeEnc::from_flags(false, true), MoeEnc::Mxfp4);
-        assert_eq!((MoeEnc::Bf16.code(), MoeEnc::Fp8Blk.code(), MoeEnc::Mxfp4.code()), (0, 1, 2));
+        assert_eq!(
+            (
+                MoeEnc::Bf16.code(),
+                MoeEnc::Fp8Blk.code(),
+                MoeEnc::Mxfp4.code()
+            ),
+            (0, 1, 2)
+        );
     }
 
     /// 384 experts is inside the grouped prefill's LDS bound; past it the align histogram and the
@@ -9205,8 +10084,14 @@ mod kimi_tests {
                 MoeEnc::Fp8Blk.code(),
                 "{name}: block-fp8 goes in the PREFILL encoding slot i[3], not decode's i[6]"
             );
-            assert_ne!(d.t[2], TENSOR_NONE, "{name}: dense weight-pointer table must be bound");
-            assert_ne!(d.t[3], TENSOR_NONE, "{name}: dense scale-pointer table must be bound");
+            assert_ne!(
+                d.t[2], TENSOR_NONE,
+                "{name}: dense weight-pointer table must be bound"
+            );
+            assert_ne!(
+                d.t[3], TENSOR_NONE,
+                "{name}: dense scale-pointer table must be bound"
+            );
         }
 
         // The combine takes no shared expert — a dense layer has none, and d_moe_combine_pf
@@ -9226,7 +10111,11 @@ mod kimi_tests {
     fn mla_full_prefill_dense_binds_dense_tables_not_expert_tables() {
         let c = kimi_ref_cfg();
         let m = pf_full(&c, 512, &[128], 0..1);
-        let names = m.tensors.iter().map(|t| t.name.as_str()).collect::<Vec<_>>();
+        let names = m
+            .tensors
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>();
         assert!(
             names.iter().any(|n| n.contains("mlp.dense_weight_table")),
             "dense prefill declares its own [3] u64 pointer table; got {names:?}"
@@ -9258,19 +10147,29 @@ mod kimi_tests {
         let mut c = kimi_ref_cfg();
         c.tp = 2; // TP is what puts XReduce in the program at all
         let m = glm_build_block_pf(
-            &c, 2048, 256, 0..2, true, "kimi-ref", MlaArch::Kimi, &[128, 512],
-            PrefillScope::Full, MoeEnc::Fp8Blk,
+            &c,
+            2048,
+            256,
+            0..2,
+            true,
+            "kimi-ref",
+            MlaArch::Kimi,
+            &[128, 512],
+            PrefillScope::Full,
+            MoeEnc::Fp8Blk,
         )
         .0;
-        assert!(m.progs.len() >= 3, "two buckets + decode; got {}", m.progs.len());
+        assert!(
+            m.progs.len() >= 3,
+            "two buckets + decode; got {}",
+            m.progs.len()
+        );
         let want = 512 * c.hidden * 2; // rows_max * hidden * 2, the widest bucket
         let mut slots: Vec<u32> = m
             .progs
             .iter()
             .flat_map(|p| p.insts.iter())
-            .filter(|d| {
-                d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceTwoShot as u16
-            })
+            .filter(|d| d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceTwoShot as u16)
             .map(|d| d.i[2])
             .collect();
         assert!(!slots.is_empty(), "tp=2 must emit collectives");
@@ -9289,7 +10188,10 @@ mod kimi_tests {
             .iter()
             .find(|t| t.name == "act.dg_tp")
             .expect("tp>1 declares act.dg_tp");
-        assert_eq!(dg.bytes, want as u64, "dg_tp is row-dimensioned, like og_tp");
+        assert_eq!(
+            dg.bytes, want as u64,
+            "dg_tp is row-dimensioned, like og_tp"
+        );
     }
 
     /// MXFP4 is the one encoding with no dense prefill arm: its grouped path is the A4W4
@@ -9300,7 +10202,15 @@ mod kimi_tests {
     fn mla_full_prefill_refuses_a_dense_mxfp4_layer() {
         let c = kimi_ref_cfg();
         glm_build_block_pf(
-            &c, 512, 256, 0..1, false, "glm-ref", MlaArch::Glm, &[128], PrefillScope::Full,
+            &c,
+            512,
+            256,
+            0..1,
+            false,
+            "glm-ref",
+            MlaArch::Glm,
+            &[128],
+            PrefillScope::Full,
             MoeEnc::Mxfp4,
         );
     }
@@ -9320,15 +10230,37 @@ mod kimi_tests {
         c.index_heads = 32;
         c.index_dim = 128;
         c.indexer_full = vec![false, true, false, false];
-        let (m, _) =
-            glm_build_block_pf(&c, 131072, 256, 1..2, true, "glm-ref", MlaArch::Glm, &[128], PrefillScope::Attn, MoeEnc::Fp8Blk);
+        let (m, _) = glm_build_block_pf(
+            &c,
+            131072,
+            256,
+            1..2,
+            true,
+            "glm-ref",
+            MlaArch::Glm,
+            &[128],
+            PrefillScope::Attn,
+            MoeEnc::Fp8Blk,
+        );
         let ops: Vec<u16> = m.progs[0].insts.iter().map(|d| d.op).collect();
-        assert!(ops.contains(&(DevOp::FlashMlaPrefill as u16)), "dense MLA prefill");
-        assert!(!ops.contains(&(DevOp::FlashGatherPrefill as u16)), "no per-query selector exists");
-        assert!(!ops.contains(&(DevOp::IndexScore as u16)), "the indexer is decode-shaped");
+        assert!(
+            ops.contains(&(DevOp::FlashMlaPrefill as u16)),
+            "dense MLA prefill"
+        );
+        assert!(
+            !ops.contains(&(DevOp::FlashGatherPrefill as u16)),
+            "no per-query selector exists"
+        );
+        assert!(
+            !ops.contains(&(DevOp::IndexScore as u16)),
+            "the indexer is decode-shaped"
+        );
         // The DECODE program of the same asset still gathers — the gate is armed, only prefill opts out.
         let dec: Vec<u16> = m.progs.last().unwrap().insts.iter().map(|d| d.op).collect();
-        assert!(dec.contains(&(DevOp::FlashGatherDecode as u16)), "decode still gathers at 128k");
+        assert!(
+            dec.contains(&(DevOp::FlashGatherDecode as u16)),
+            "decode still gathers at 128k"
+        );
     }
 
     /// The manifest must SEE the prefill buckets, since that is what tells an object builder it
@@ -9337,18 +10269,33 @@ mod kimi_tests {
     fn mla_prefill_shows_up_in_the_build_manifest() {
         let c = kimi_ref_cfg();
         let (m, _) = pf_block(&c, 512, &[128, 512]);
-        let man = crate::manifest::build(&m, "gfx950", &crate::LeanReport::skipped("test: gate not run"));
-        let ops: Vec<&str> = man["opcodes"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        let man = crate::manifest::build(
+            &m,
+            "gfx950",
+            &crate::LeanReport::skipped("test: gate not run"),
+        );
+        let ops: Vec<&str> = man["opcodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(ops.contains(&"FlashMlaPrefill"));
         assert!(ops.contains(&"MlaMergeFold"));
         assert_eq!(man["features"]["mla"], true);
         // `prefill` must be true for an MLA packet: its prefill flash is the LATENT one, and this
         // flag is what tells the object builder it needs PLOW_MLA_PREFILL=1.
         assert_eq!(man["features"]["prefill"], true);
-        assert_eq!(man["features"]["moe_prefill"], false, "attention-only scope");
+        assert_eq!(
+            man["features"]["moe_prefill"], false,
+            "attention-only scope"
+        );
         // block-fp8 experts ARE fp8 weights, [128,128] scale grid or not.
         assert_eq!(man["features"]["fp8_weights"], true);
-        assert_eq!(man["shapes"]["prefill_buckets"], serde_json::json!([128, 512]));
+        assert_eq!(
+            man["shapes"]["prefill_buckets"],
+            serde_json::json!([128, 512])
+        );
         let progs = man["programs"].as_array().unwrap();
         assert_eq!(progs[0]["kind"], "prefill");
         assert_eq!(progs[0]["bucket"], 128);
@@ -9381,12 +10328,23 @@ mod kimi_tests {
         assert_eq!(topk.i[1], 384, "router top-k must see all 384 experts");
         assert_eq!(topk.i[2], 8, "top_k = 8");
         // One (glu, down) pair per top_k slot — 8, not 2 and not 256.
-        let n_glu = dec.insts.iter().filter(|x| x.op == DevOp::MoeExpertGluFp8Blk as u16).count();
+        let n_glu = dec
+            .insts
+            .iter()
+            .filter(|x| x.op == DevOp::MoeExpertGluFp8Blk as u16)
+            .count();
         assert_eq!(n_glu, 8, "one expert packet per top_k slot");
-        for g in dec.insts.iter().filter(|x| x.op == DevOp::MoeExpertGluFp8Blk as u16) {
+        for g in dec
+            .insts
+            .iter()
+            .filter(|x| x.op == DevOp::MoeExpertGluFp8Blk as u16)
+        {
             assert_eq!(g.i[3], 384, "expert op carries n_exp=384 (table bound)");
             // EP at tp=4: 384/4 = 96 WHOLE experts per rank, so each keeps the FULL moe_inter.
-            assert_eq!(g.i[1], c.moe_inter, "EP: whole expert, full moe_inter — not the TP slice");
+            assert_eq!(
+                g.i[1], c.moe_inter,
+                "EP: whole expert, full moe_inter — not the TP slice"
+            );
         }
         assert_eq!(d.dims.n_exp, Some(384));
         assert_eq!(d.dims.top_k, Some(8));
@@ -9408,7 +10366,11 @@ mod kimi_tests {
             let p = &m.progs[i];
             assert_eq!(find_op(p, DevOp::FlashMlaPrefill).i[4], t, "n_tok = bucket");
             assert_eq!(find_op(p, DevOp::FlashMlaPrefill).i[1], 16, "nh_l = 64/4");
-            assert_eq!(find_op(p, DevOp::MlaMergeFold).i[0], t, "fold n_batch = tokens");
+            assert_eq!(
+                find_op(p, DevOp::MlaMergeFold).i[0],
+                t,
+                "fold n_batch = tokens"
+            );
             assert_eq!(find_op(p, DevOp::MlaMergeFold).i[4], 1, "nsplit = 1");
             assert_eq!(find_op(p, DevOp::XReduceTwoShot).i[1], 4, "tp=4 all-reduce");
         }
@@ -9425,7 +10387,6 @@ mod kimi_tests {
         assert_eq!(d.dsa_role, None);
     }
 }
-
 
 #[cfg(test)]
 mod nemotron_tests {
@@ -9449,7 +10410,10 @@ mod nemotron_tests {
     struct Lcg(u64);
     impl Lcg {
         fn f(&mut self, amp: f32) -> f32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u = ((self.0 >> 33) as f32) / ((1u64 << 31) as f32); // [0,1)
             (u * 2.0 - 1.0) * amp
         }
@@ -9563,7 +10527,10 @@ mod nemotron_tests {
     }
 
     fn max_abs(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
     }
 
     /// The NEW SSM math: the stateful recurrence (kernel/emit form) equals the independent
@@ -9571,7 +10538,13 @@ mod nemotron_tests {
     /// state term is exercised. Reports the max-abs error vs the golden.
     #[test]
     fn mamba2_scan_matches_independent_recurrence() {
-        let d = Dims { t: 6, n_head: 4, head_dim: 5, d_state: 3, n_groups: 2 };
+        let d = Dims {
+            t: 6,
+            n_head: 4,
+            head_dim: 5,
+            d_state: 3,
+            n_groups: 2,
+        };
         let di = d.d_inner();
         let gd = d.n_groups * d.d_state;
         let mut r = Lcg(0x1234_5678_9abc_def0);
@@ -9582,14 +10555,19 @@ mod nemotron_tests {
         let dt_eff: Vec<f32> = (0..d.t * d.n_head).map(|_| softplus(r.f(1.0))).collect();
         let a: Vec<f32> = (0..d.n_head).map(|_| -(r.f(0.5) + 0.7).exp()).collect();
         let dd: Vec<f32> = (0..d.n_head).map(|_| r.f(0.5)).collect();
-        let ssm_init: Vec<f32> = (0..d.n_head * d.head_dim * d.d_state).map(|_| r.f(0.3)).collect();
+        let ssm_init: Vec<f32> = (0..d.n_head * d.head_dim * d.d_state)
+            .map(|_| r.f(0.3))
+            .collect();
 
         let mut ssm = ssm_init.clone();
         let y_rec = scan_recurrence(&d, &x, &b, &cc, &dt_eff, &a, &dd, &mut ssm);
         let y_dual = scan_dual(&d, &x, &b, &cc, &dt_eff, &a, &dd, &ssm_init);
         let err = max_abs(&y_rec, &y_dual);
         eprintln!("mamba2 SSM scan: max-abs err (recurrence vs independent dual) = {err:e}");
-        assert!(err < 1e-4, "SSM scan diverges from independent golden: max-abs {err:e}");
+        assert!(
+            err < 1e-4,
+            "SSM scan diverges from independent golden: max-abs {err:e}"
+        );
     }
 
     /// Prefill/decode equivalence: running the scan as ONE T-step prefill leaves the same
@@ -9598,7 +10576,13 @@ mod nemotron_tests {
     /// state-carry contract the harness relies on (§6, §7).
     #[test]
     fn mamba2_decode_equals_prefill() {
-        let d = Dims { t: 5, n_head: 3, head_dim: 4, d_state: 3, n_groups: 1 };
+        let d = Dims {
+            t: 5,
+            n_head: 3,
+            head_dim: 4,
+            d_state: 3,
+            n_groups: 1,
+        };
         let di = d.d_inner();
         let gd = d.n_groups * d.d_state;
         let mut r = Lcg(0xdead_beef_cafe_1234);
@@ -9617,7 +10601,10 @@ mod nemotron_tests {
         let mut ssm_dec = vec![0.0f32; d.n_head * d.head_dim * d.d_state];
         let mut y_last = vec![0.0f32; di];
         for t in 0..d.t {
-            let d1 = Dims { t: 1, ..copy_dims(&d) };
+            let d1 = Dims {
+                t: 1,
+                ..copy_dims(&d)
+            };
             let xr = &x[t * di..(t + 1) * di];
             let br = &b[t * gd..(t + 1) * gd];
             let cr = &cc[t * gd..(t + 1) * gd];
@@ -9627,7 +10614,10 @@ mod nemotron_tests {
         let err_state = max_abs(&ssm_pf, &ssm_dec);
         let err_y = max_abs(&y_pf[(d.t - 1) * di..], &y_last);
         eprintln!("mamba2 prefill-vs-decode: ssm_state err={err_state:e} last-token err={err_y:e}");
-        assert!(err_state < 1e-5, "decode state != prefill state: {err_state:e}");
+        assert!(
+            err_state < 1e-5,
+            "decode state != prefill state: {err_state:e}"
+        );
         assert!(err_y < 1e-5, "decode last-token != prefill: {err_y:e}");
     }
 
@@ -9695,10 +10685,18 @@ mod nemotron_tests {
         let c = nemo_ref_cfg();
         assert_eq!(
             block_ops(&c, 1..2),
-            vec![RmsNorm, GemvQkv, HeadNormRope, FlashDecode, FlashMerge, Gemv, Residual]
-                .into_iter()
-                .map(|o| o as u16)
-                .collect::<Vec<_>>(),
+            vec![
+                RmsNorm,
+                GemvQkv,
+                HeadNormRope,
+                FlashDecode,
+                FlashMerge,
+                Gemv,
+                Residual
+            ]
+            .into_iter()
+            .map(|o| o as u16)
+            .collect::<Vec<_>>(),
             "gqa attention block sequence"
         );
     }
@@ -9748,7 +10746,10 @@ mod nemotron_tests {
         assert_eq!(d.carried_state[1].tensors, vec!["mamba.0.ssm_state"]);
         assert_eq!(d.weights.prefix, "backbone.layers.0.");
         assert!(d.programs.prefill_buckets.is_empty());
-        assert_eq!(d.outputs[0].name, "act.xnext", "one (odd) layer -> act.xnext");
+        assert_eq!(
+            d.outputs[0].name, "act.xnext",
+            "one (odd) layer -> act.xnext"
+        );
     }
 
     /// Attention block descriptor: kind ["gqa_attn"], GQA dims, kv carried state.
@@ -9798,7 +10799,10 @@ mod nemotron_tests {
         let (_, d) = nemotron_build_block(&c, 512, 256, 0..3, "Nemotron-3");
         assert_eq!(d.kind, vec!["mamba2", "gqa_attn", "moe_ffn"]);
         assert_eq!(d.layer, 0);
-        assert_eq!(d.outputs[0].name, "act.xnext", "3 layers (odd) -> act.xnext");
+        assert_eq!(
+            d.outputs[0].name, "act.xnext",
+            "3 layers (odd) -> act.xnext"
+        );
         // conv + ssm (mamba L0) + kv (attn L1); moe contributes none.
         let roles: Vec<&str> = d.carried_state.iter().map(|s| s.role.as_str()).collect();
         assert_eq!(roles, vec!["conv", "ssm", "kv"]);

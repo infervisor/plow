@@ -103,14 +103,22 @@ mod tests {
             "language_model.model.layers.3.self_attn.kv_a_proj_with_mqa.weight"
         ));
         assert!(is_checkpoint_weight("language_model.lm_head.weight"));
-        assert!(is_checkpoint_weight("vision_tower.encoder.blocks.0.wqkv.weight"));
+        assert!(is_checkpoint_weight(
+            "vision_tower.encoder.blocks.0.wqkv.weight"
+        ));
         // Untied head, as `devgen::declare` spells it (crates/devgen/src/lib.rs).
         assert!(is_checkpoint_weight("lm_head.weight"));
         // And everything that already worked keeps working.
         assert!(is_checkpoint_weight("model.layers.0.mlp.down_proj.weight"));
-        assert!(is_checkpoint_weight("model.language_model.layers.0.mlp.down_proj.weight"));
-        assert!(is_checkpoint_weight("fp8/model.layers.0.mlp.down_proj.weight"));
-        assert!(is_checkpoint_weight("fp8/model.layers.0.mlp.down_proj.weight_scale"));
+        assert!(is_checkpoint_weight(
+            "model.language_model.layers.0.mlp.down_proj.weight"
+        ));
+        assert!(is_checkpoint_weight(
+            "fp8/model.layers.0.mlp.down_proj.weight"
+        ));
+        assert!(is_checkpoint_weight(
+            "fp8/model.layers.0.mlp.down_proj.weight_scale"
+        ));
     }
 
     /// Compiler-owned namespaces are never looked up in a checkpoint. Asserted over
@@ -120,10 +128,21 @@ mod tests {
         for p in RUNTIME_PREFIXES {
             let n = format!("{p}whatever.0");
             assert!(is_runtime_tensor(&n), "{n}");
-            assert!(!is_checkpoint_weight(&n), "{n} must not be demanded of a checkpoint");
+            assert!(
+                !is_checkpoint_weight(&n),
+                "{n} must not be demanded of a checkpoint"
+            );
         }
         // The real spellings, so a prefix that stops matching them is caught too.
-        for n in ["act.x", "act.logits", "in.ids", "in.pos", "in.cos", "kv.3.krot", "moe.ewt.7"] {
+        for n in [
+            "act.x",
+            "act.logits",
+            "in.ids",
+            "in.pos",
+            "in.cos",
+            "kv.3.krot",
+            "moe.ewt.7",
+        ] {
             assert!(!is_checkpoint_weight(n), "{n}");
         }
     }
@@ -146,6 +165,8 @@ mod tests {
             }
         }
         // A real weight whose name merely CONTAINS "table" is unaffected.
-        assert!(is_checkpoint_weight("model.layers.3.mlp.experts.0.down_proj.weight"));
+        assert!(is_checkpoint_weight(
+            "model.layers.3.mlp.experts.0.down_proj.weight"
+        ));
     }
 }

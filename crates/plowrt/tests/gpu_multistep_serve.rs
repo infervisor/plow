@@ -16,15 +16,18 @@ use std::sync::Arc;
 use plowrt::device::cuda::CudaBackend;
 use plowrt::device::Backend;
 use plowrt::exec::ExecutorSet;
+use plowrt::orch::Registry;
 use plowrt::serve::manager::ModelManager;
 use plowrt::serve::mux::MuxConfig;
 use plowrt::serve::stream::{self, StreamChunk};
 use plowrt::serve::{AppState, GenParams};
-use plowrt::orch::Registry;
 
 async fn greedy_reply(state: &Arc<AppState>, slug: &str, prompt_ids: Vec<u32>) -> String {
     let mux = state.mux(slug).expect("mux");
-    let gen = GenParams { max_tokens: 24, ..GenParams::default() }; // temperature 0 = greedy
+    let gen = GenParams {
+        max_tokens: 24,
+        ..GenParams::default()
+    }; // temperature 0 = greedy
     let (tx, mut rx) = stream::channel();
     mux.submit(plowrt::serve::mux::Job {
         prompt_ids,
@@ -82,8 +85,16 @@ async fn multi_step_serve_greedy_paris() {
 
     let prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one word.<turn|>\n\
                   <|turn>model\n<|channel>thought\n<channel|>";
-    let ids = state.registry.get(&slug).expect("bundle").tokenizer().encode(prompt);
+    let ids = state
+        .registry
+        .get(&slug)
+        .expect("bundle")
+        .tokenizer()
+        .encode(prompt);
     let reply = greedy_reply(&state, &slug, ids).await;
     eprintln!("multi-step serve reply: {reply:?}");
-    assert!(reply.contains("Paris"), "expected Paris in multi-step serve reply {reply:?}");
+    assert!(
+        reply.contains("Paris"),
+        "expected Paris in multi-step serve reply {reply:?}"
+    );
 }

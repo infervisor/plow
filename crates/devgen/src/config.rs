@@ -6,7 +6,6 @@ use std::path::Path;
 use packet::rope::RopeScale;
 use serde_json::Value;
 
-
 /// Which checkpoint architecture we are compiling (tensor naming, norm topology,
 /// activation, attention geometry, RoPE differ per arch).
 #[derive(Clone, Copy, PartialEq)]
@@ -15,7 +14,6 @@ pub(crate) enum Arch {
     Llama,
     Qwen3,
 }
-
 
 pub(crate) struct Cfg {
     pub(crate) arch: Arch,
@@ -37,14 +35,14 @@ pub(crate) struct Cfg {
     pub(crate) rope_frac_full: f64,
     pub(crate) rope_scale: RopeScale,
     // Arch switches (Gemma values preserve the old behaviour exactly).
-    pub(crate) attn_scale: f32,   // Gemma 1.0 (q_norm absorbs it); Llama/Qwen 1/sqrt(head_dim)
-    pub(crate) emb_scale: f32,    // Gemma bf16_round(sqrt(hidden)); Llama/Qwen 1.0
-    pub(crate) mlp_act: u32,      // 0 = gelu_tanh (Gemma), 1 = silu (Llama/Qwen)
+    pub(crate) attn_scale: f32, // Gemma 1.0 (q_norm absorbs it); Llama/Qwen 1/sqrt(head_dim)
+    pub(crate) emb_scale: f32,  // Gemma bf16_round(sqrt(hidden)); Llama/Qwen 1.0
+    pub(crate) mlp_act: u32,    // 0 = gelu_tanh (Gemma), 1 = silu (Llama/Qwen)
     pub(crate) has_qk_norm: bool, // Gemma & Qwen true; Llama false
-    pub(crate) has_v_norm: bool,  // Gemma weightless v_norm; Llama/Qwen false
-    pub(crate) k_eq_v: bool,      // Gemma full layers share k_proj as V; Llama/Qwen false
-    pub(crate) tied: bool,        // reuse embed_tokens as lm_head (Gemma, Qwen); Llama has lm_head.weight
-    pub(crate) prefix: String,    // weight-name prefix: "model.language_model." or "model."
+    pub(crate) has_v_norm: bool, // Gemma weightless v_norm; Llama/Qwen false
+    pub(crate) k_eq_v: bool,    // Gemma full layers share k_proj as V; Llama/Qwen false
+    pub(crate) tied: bool, // reuse embed_tokens as lm_head (Gemma, Qwen); Llama has lm_head.weight
+    pub(crate) prefix: String, // weight-name prefix: "model.language_model." or "model."
     // Tensor-parallel degree (Megatron sharding). 1 = single-GPU (current path, byte-identical).
     // >1 emits a DECODE-ONLY sharded blob (plans/tp-design.md §3): column-parallel q/k/v/gate/up/
     // lm_head, row-parallel o_proj/down with an XReduce all-reduce after each, attention split by
@@ -225,10 +223,8 @@ fn cfg_llama_qwen(v: &Value, arch: Arch) -> Cfg {
     }
 }
 
-
 pub(crate) fn bf16_round(f: f32) -> f32 {
     let u = f.to_bits();
     let r = u.wrapping_add(0x7fff).wrapping_add((u >> 16) & 1);
     f32::from_bits(r & 0xffff_0000)
 }
-

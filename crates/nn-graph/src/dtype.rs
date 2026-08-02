@@ -34,7 +34,6 @@ pub enum DType {
     // --- GGUF block-quantized types ------------------------------------------
     // Each stores `block_size` logical elements in `block_bytes` bytes (data +
     // scales + optional min/zero interleaved). The kernel unpacks in SRAM.
-
     /// 4-bit quantization, block_size=32, 18 bytes/block (2 scale + 16 data).
     Q4_0,
     /// 4-bit with min, block_size=32, 20 bytes/block (2 scale + 2 min + 16 data).
@@ -104,8 +103,13 @@ impl DType {
             // k-quant super-blocks
             DType::Q2_K | DType::Q3_K | DType::Q4_K | DType::Q5_K | DType::Q6_K => 256,
             // Standard GGUF blocks
-            DType::Q4_0 | DType::Q4_1 | DType::Q5_0 | DType::Q5_1 | DType::Q8_0
-            | DType::Q8_1 | DType::IQ4_NL => 32,
+            DType::Q4_0
+            | DType::Q4_1
+            | DType::Q5_0
+            | DType::Q5_1
+            | DType::Q8_0
+            | DType::Q8_1
+            | DType::IQ4_NL => 32,
             // MX FP4: 32-element groups
             DType::F4 => 32,
             // Scalar types
@@ -319,7 +323,13 @@ mod tests {
 
     #[test]
     fn safetensors_roundtrip() {
-        for dt in [DType::F32, DType::F16, DType::BF16, DType::F8E4M3, DType::I32] {
+        for dt in [
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::F8E4M3,
+            DType::I32,
+        ] {
             let name = dt.safetensors_name().unwrap();
             assert_eq!(DType::from_safetensors_name(name), Some(dt));
         }

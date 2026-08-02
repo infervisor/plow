@@ -8,7 +8,7 @@
 //! 3. The lower bound is always ≤ achieved makespan.
 //! 4. Prefetch depth recommendations are in [1, max_depth].
 
-use costmodel::{hwspec, DEFAULT_PAGE_BYTES, Soc, SramPolicy};
+use costmodel::{hwspec, Soc, SramPolicy, DEFAULT_PAGE_BYTES};
 use nn_graph::{infer_shapes, ActKind, DType, Nn};
 use rewrite::{assemble, plan_from_block, LayerPlan};
 use schedule::{schedule, schedule_with_oracle, Config, OracleReport};
@@ -52,7 +52,14 @@ mod gemma31b {
 
 /// Build a Gemma-style decoder block (pre-norm, RoPE, GQA, SwiGLU).
 fn gemma_block(
-    h: i64, nh: i64, nkv: i64, hd: i64, qd: i64, kvd: i64, im: i64, t: i64,
+    h: i64,
+    nh: i64,
+    nkv: i64,
+    hd: i64,
+    qd: i64,
+    kvd: i64,
+    im: i64,
+    t: i64,
 ) -> LayerPlan {
     let mut nn = Nn::new(DType::BF16, DType::BF16);
     let x = nn.input("x", nn.shape([t.into(), h.into()]), DType::BF16);
@@ -69,7 +76,9 @@ fn gemma_block(
     let kn = nn.rmsnorm("k_norm", kh, hd, 1e-6);
     let qr = nn.rope(qn, hd as u32, 1e6);
     let kr = nn.rope(kn, hd as u32, 1e6);
-    let attn = nn.attention(qr, kr, vh, nh as u32, nkv as u32, hd as u32, true, None, None);
+    let attn = nn.attention(
+        qr, kr, vh, nh as u32, nkv as u32, hd as u32, true, None, None,
+    );
     let ao = nn.reshape(attn, [t.into(), qd.into()]);
     let o = nn.linear("o_proj", ao, qd, h, false);
     let r1 = nn.add(x, o);
@@ -145,14 +154,30 @@ fn validate_report(baseline_ms: u64, oracle_ms: u64, report: &OracleReport, mode
     eprintln!("    baseline makespan:  {baseline_ms} cycles");
     eprintln!("    oracle makespan:    {oracle_ms} cycles");
     eprintln!("    improvement:        {improvement_pct:.2}%");
-    eprintln!("    lower bound:        {} cycles", report.lower_bound.bound);
+    eprintln!(
+        "    lower bound:        {} cycles",
+        report.lower_bound.bound
+    );
     eprintln!("    binding constraint: {:?}", report.lower_bound.binding);
-    eprintln!("    optimality gap:     {:.2}%", report.optimality_gap * 100.0);
-    eprintln!("    bubbles filled:     {}", report.bubble_fill.bubbles_filled);
-    eprintln!("    cycles recovered:   {}", report.bubble_fill.cycles_recovered);
+    eprintln!(
+        "    optimality gap:     {:.2}%",
+        report.optimality_gap * 100.0
+    );
+    eprintln!(
+        "    bubbles filled:     {}",
+        report.bubble_fill.bubbles_filled
+    );
+    eprintln!(
+        "    cycles recovered:   {}",
+        report.bubble_fill.cycles_recovered
+    );
     eprintln!(
         "    prefetch depths:    {:?}",
-        report.prefetch_depths.iter().map(|p| p.depth).collect::<Vec<_>>()
+        report
+            .prefetch_depths
+            .iter()
+            .map(|p| p.depth)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -162,8 +187,14 @@ fn validate_report(baseline_ms: u64, oracle_ms: u64, report: &OracleReport, mode
 #[test]
 fn gemma_12b_decode_b1() {
     let plan = gemma_block(
-        gemma12b::H, gemma12b::NH, gemma12b::NKV, gemma12b::HD,
-        gemma12b::QD, gemma12b::KVD, gemma12b::IM, 1,
+        gemma12b::H,
+        gemma12b::NH,
+        gemma12b::NKV,
+        gemma12b::HD,
+        gemma12b::QD,
+        gemma12b::KVD,
+        gemma12b::IM,
+        1,
     );
     let (baseline, oracle, report) = compare(&plan);
     validate_report(baseline, oracle, &report, "gemma4-12b decode b1");
@@ -173,8 +204,14 @@ fn gemma_12b_decode_b1() {
 #[test]
 fn gemma_12b_prefill_512() {
     let plan = gemma_block(
-        gemma12b::H, gemma12b::NH, gemma12b::NKV, gemma12b::HD,
-        gemma12b::QD, gemma12b::KVD, gemma12b::IM, 512,
+        gemma12b::H,
+        gemma12b::NH,
+        gemma12b::NKV,
+        gemma12b::HD,
+        gemma12b::QD,
+        gemma12b::KVD,
+        gemma12b::IM,
+        512,
     );
     let (baseline, oracle, report) = compare(&plan);
     validate_report(baseline, oracle, &report, "gemma4-12b prefill s512");
@@ -184,8 +221,14 @@ fn gemma_12b_prefill_512() {
 #[test]
 fn gemma_12b_decode_b8() {
     let plan = gemma_block(
-        gemma12b::H, gemma12b::NH, gemma12b::NKV, gemma12b::HD,
-        gemma12b::QD, gemma12b::KVD, gemma12b::IM, 8,
+        gemma12b::H,
+        gemma12b::NH,
+        gemma12b::NKV,
+        gemma12b::HD,
+        gemma12b::QD,
+        gemma12b::KVD,
+        gemma12b::IM,
+        8,
     );
     let (baseline, oracle, report) = compare(&plan);
     validate_report(baseline, oracle, &report, "gemma4-12b decode b8");
@@ -195,8 +238,14 @@ fn gemma_12b_decode_b8() {
 #[test]
 fn gemma_27b_decode_b1() {
     let plan = gemma_block(
-        gemma27b::H, gemma27b::NH, gemma27b::NKV, gemma27b::HD,
-        gemma27b::QD, gemma27b::KVD, gemma27b::IM, 1,
+        gemma27b::H,
+        gemma27b::NH,
+        gemma27b::NKV,
+        gemma27b::HD,
+        gemma27b::QD,
+        gemma27b::KVD,
+        gemma27b::IM,
+        1,
     );
     let (baseline, oracle, report) = compare(&plan);
     validate_report(baseline, oracle, &report, "gemma4-27b decode b1");
@@ -206,8 +255,14 @@ fn gemma_27b_decode_b1() {
 #[test]
 fn gemma_27b_prefill_512() {
     let plan = gemma_block(
-        gemma27b::H, gemma27b::NH, gemma27b::NKV, gemma27b::HD,
-        gemma27b::QD, gemma27b::KVD, gemma27b::IM, 512,
+        gemma27b::H,
+        gemma27b::NH,
+        gemma27b::NKV,
+        gemma27b::HD,
+        gemma27b::QD,
+        gemma27b::KVD,
+        gemma27b::IM,
+        512,
     );
     let (baseline, oracle, report) = compare(&plan);
     validate_report(baseline, oracle, &report, "gemma4-27b prefill s512");
@@ -217,8 +272,14 @@ fn gemma_27b_prefill_512() {
 #[test]
 fn gemma_31b_decode_b1() {
     let plan = gemma_block(
-        gemma31b::H, gemma31b::NH, gemma31b::NKV, gemma31b::HD,
-        gemma31b::QD, gemma31b::KVD, gemma31b::IM, 1,
+        gemma31b::H,
+        gemma31b::NH,
+        gemma31b::NKV,
+        gemma31b::HD,
+        gemma31b::QD,
+        gemma31b::KVD,
+        gemma31b::IM,
+        1,
     );
     let (baseline, oracle, report) = compare(&plan);
     validate_report(baseline, oracle, &report, "gemma4-31b decode b1");
@@ -228,8 +289,14 @@ fn gemma_31b_decode_b1() {
 #[test]
 fn gemma_31b_prefill_512() {
     let plan = gemma_block(
-        gemma31b::H, gemma31b::NH, gemma31b::NKV, gemma31b::HD,
-        gemma31b::QD, gemma31b::KVD, gemma31b::IM, 512,
+        gemma31b::H,
+        gemma31b::NH,
+        gemma31b::NKV,
+        gemma31b::HD,
+        gemma31b::QD,
+        gemma31b::KVD,
+        gemma31b::IM,
+        512,
     );
     let (baseline, oracle, report) = compare(&plan);
     validate_report(baseline, oracle, &report, "gemma4-31b prefill s512");
@@ -239,8 +306,14 @@ fn gemma_31b_prefill_512() {
 #[test]
 fn gemma_12b_prefill_2048() {
     let plan = gemma_block(
-        gemma12b::H, gemma12b::NH, gemma12b::NKV, gemma12b::HD,
-        gemma12b::QD, gemma12b::KVD, gemma12b::IM, 2048,
+        gemma12b::H,
+        gemma12b::NH,
+        gemma12b::NKV,
+        gemma12b::HD,
+        gemma12b::QD,
+        gemma12b::KVD,
+        gemma12b::IM,
+        2048,
     );
     let (baseline, oracle, report) = compare(&plan);
     validate_report(baseline, oracle, &report, "gemma4-12b prefill s2048");
@@ -250,8 +323,14 @@ fn gemma_12b_prefill_2048() {
 #[test]
 fn gemma_12b_decode_b32() {
     let plan = gemma_block(
-        gemma12b::H, gemma12b::NH, gemma12b::NKV, gemma12b::HD,
-        gemma12b::QD, gemma12b::KVD, gemma12b::IM, 32,
+        gemma12b::H,
+        gemma12b::NH,
+        gemma12b::NKV,
+        gemma12b::HD,
+        gemma12b::QD,
+        gemma12b::KVD,
+        gemma12b::IM,
+        32,
     );
     let (baseline, oracle, report) = compare(&plan);
     validate_report(baseline, oracle, &report, "gemma4-12b decode b32");

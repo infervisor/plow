@@ -305,13 +305,7 @@ impl TpRank {
     /// sync. The decode collective publishes with in-kernel peer stores gated
     /// by system-scope atomics instead, which is why this exists for bring-up
     /// checks and not for the interpreter.
-    pub fn publish_to(
-        &self,
-        dst: &TpRank,
-        src_off: u64,
-        dst_off: u64,
-        bytes: u64,
-    ) -> Result<()> {
+    pub fn publish_to(&self, dst: &TpRank, src_off: u64, dst_off: u64, bytes: u64) -> Result<()> {
         let src = self.scratch_view(src_off, bytes)?;
         let dst_view = dst.scratch_view(dst_off, bytes)?;
         let peer = self.backend.peer().ok_or_else(|| {
@@ -493,10 +487,7 @@ impl TpGroup {
             });
         }
 
-        Ok(TpGroup {
-            ranks,
-            layout,
-        })
+        Ok(TpGroup { ranks, layout })
     }
 
     pub fn n_gpu(&self) -> u32 {
@@ -634,7 +625,9 @@ impl TpGroup {
         for src in 0..n {
             // A pattern keyed on the source rank: a mapping that silently
             // aliased two ranks' buffers would otherwise pass every compare.
-            let pattern: Vec<u8> = (0..bytes).map(|i| ((i * 31 + src * 7) % 251) as u8).collect();
+            let pattern: Vec<u8> = (0..bytes)
+                .map(|i| ((i * 31 + src * 7) % 251) as u8)
+                .collect();
             let src_rank = &self.ranks[src];
             src_rank.write_scratch(0, &pattern)?;
 
@@ -820,7 +813,10 @@ mod tests {
     /// rounding here would silently desynchronise from `devgen`'s raw `t·h·2`.
     #[test]
     fn unaligned_widths_are_rejected_not_rounded() {
-        assert!(PeerLayout::new(3, 1, 4).is_none(), "3*2 = 6 B is not line-aligned");
+        assert!(
+            PeerLayout::new(3, 1, 4).is_none(),
+            "3*2 = 6 B is not line-aligned"
+        );
         assert!(PeerLayout::new(0, 1, 4).is_none());
         assert!(PeerLayout::new(64, 1, 4).is_some(), "64*2 = 128 B is");
 

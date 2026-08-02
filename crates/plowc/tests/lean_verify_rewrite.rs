@@ -35,10 +35,7 @@ fn accepts_empty_rules_list() {
 #[ignore = "requires plow_verify binary"]
 fn rejects_unknown_rule() {
     let req = RewriteRulesRequest {
-        rules: vec![
-            "rmsnorm-linear-fuse".into(),
-            "my-fancy-new-rule".into(),
-        ],
+        rules: vec!["rmsnorm-linear-fuse".into(), "my-fancy-new-rule".into()],
     };
     let cert = check_rewrite_rules(&req).expect("verifier call");
     assert!(!cert.ok, "unknown rule accepted: {cert:?}");

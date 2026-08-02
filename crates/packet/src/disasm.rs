@@ -101,7 +101,9 @@ pub fn disasm<'a>(idx: usize, w: &DevInst64, names: &[&'a str]) -> Inst<'a> {
     // tensor handle. So an unused slot is indistinguishable from a reference to
     // tensor 0, and printing the difference would be inventing it. `raw` carries
     // all eight either way.
-    let known = slots.as_ref().is_some_and(|s| s.provenance != Provenance::Undocumented);
+    let known = slots
+        .as_ref()
+        .is_some_and(|s| s.provenance != Provenance::Undocumented);
 
     let mut tensors = Vec::new();
     for k in 0..8 {
@@ -114,7 +116,9 @@ pub fn disasm<'a>(idx: usize, w: &DevInst64, names: &[&'a str]) -> Inst<'a> {
             slot: k,
             name: spec.map(|s| s.name),
             handle: present.then_some(w.t[k]),
-            tensor: present.then(|| names.get(w.t[k] as usize).copied()).flatten(),
+            tensor: present
+                .then(|| names.get(w.t[k] as usize).copied())
+                .flatten(),
             optional: spec.map(|s| s.optional).unwrap_or(false),
         });
     }
@@ -125,13 +129,21 @@ pub fn disasm<'a>(idx: usize, w: &DevInst64, names: &[&'a str]) -> Inst<'a> {
         if known && name.is_none() {
             continue;
         }
-        ints.push(IntOperand { slot: k, name, value: w.i[k] });
+        ints.push(IntOperand {
+            slot: k,
+            name,
+            value: w.i[k],
+        });
     }
 
     let mut floats = Vec::new();
     let f0 = slots.as_ref().and_then(|s| s.f0);
     if f0.is_some() || !known {
-        floats.push(FloatOperand { slot: 0, name: f0, value: f32::from_bits(w.fj[0]) });
+        floats.push(FloatOperand {
+            slot: 0,
+            name: f0,
+            value: f32::from_bits(w.fj[0]),
+        });
     }
 
     // The overlay. `fj[1]` is `f1` or `j0` and never both (asserted in
@@ -143,14 +155,26 @@ pub fn disasm<'a>(idx: usize, w: &DevInst64, names: &[&'a str]) -> Inst<'a> {
     let j0 = slots.as_ref().and_then(|s| s.j0);
     if fj1_float {
         let name = slots.as_ref().and_then(|s| s.f1);
-        floats.push(FloatOperand { slot: 1, name, value: f32::from_bits(w.fj[1]) });
+        floats.push(FloatOperand {
+            slot: 1,
+            name,
+            value: f32::from_bits(w.fj[1]),
+        });
     } else if j0.is_some() || !known {
-        ints.push(IntOperand { slot: 8, name: j0, value: w.fj[1] });
+        ints.push(IntOperand {
+            slot: 8,
+            name: j0,
+            value: w.fj[1],
+        });
     }
 
     let j1 = slots.as_ref().and_then(|s| s.j1);
     if j1.is_some() || !known {
-        ints.push(IntOperand { slot: 9, name: j1, value: w.fj[2] });
+        ints.push(IntOperand {
+            slot: 9,
+            name: j1,
+            value: w.fj[2],
+        });
     }
 
     Inst {
@@ -161,8 +185,16 @@ pub fn disasm<'a>(idx: usize, w: &DevInst64, names: &[&'a str]) -> Inst<'a> {
         tensors,
         ints,
         floats,
-        provenance: slots.map(|s| s.provenance).unwrap_or(Provenance::Undocumented),
-        raw: Raw { op: w.op, blocks: w.blocks, t: w.t, i: w.i, fj: w.fj },
+        provenance: slots
+            .map(|s| s.provenance)
+            .unwrap_or(Provenance::Undocumented),
+        raw: Raw {
+            op: w.op,
+            blocks: w.blocks,
+            t: w.t,
+            i: w.i,
+            fj: w.fj,
+        },
     }
 }
 
@@ -195,7 +227,9 @@ pub fn op_name(op: DevOp) -> &'static str {
 /// unknown opcode has no static name, and inventing one ("Nop", "?") would hide
 /// exactly the case worth seeing.
 pub fn op_label(op: u16) -> String {
-    DevOp::from_u16(op).map(|o| op_name(o).to_string()).unwrap_or_else(|| format!("op{op}"))
+    DevOp::from_u16(op)
+        .map(|o| op_name(o).to_string())
+        .unwrap_or_else(|| format!("op{op}"))
 }
 
 /// Label for an int slot: `i0..i7`, then the two overlay words.
@@ -210,7 +244,10 @@ mod tests {
     use crate::dev::DevInst;
 
     fn inst(op: DevOp) -> DevInst {
-        DevInst { op: op as u16, ..Default::default() }
+        DevInst {
+            op: op as u16,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -246,7 +283,11 @@ mod tests {
         d.t = [1, 2, crate::dev::TENSOR_NONE, 0, 0, 0, 0, 0];
         let out = disasm(0, &d.pack(), &["a", "out", "x"]);
 
-        let gamma = out.tensors.iter().find(|o| o.name == Some("gamma")).unwrap();
+        let gamma = out
+            .tensors
+            .iter()
+            .find(|o| o.name == Some("gamma"))
+            .unwrap();
         assert_eq!(gamma.handle, None);
         assert!(gamma.optional);
         assert_eq!(gamma.tensor, None);
@@ -263,15 +304,22 @@ mod tests {
         let out = disasm(0, &d.pack(), &[]);
         let f: Vec<_> = out.floats.iter().map(|o| (o.name, o.value)).collect();
         assert_eq!(f, [(Some("eps"), 1e-5), (Some("scale"), 2.0)]);
-        assert!(out.ints.iter().all(|o| o.slot < 8), "no j operand on a float op");
+        assert!(
+            out.ints.iter().all(|o| o.slot < 8),
+            "no j operand on a float op"
+        );
 
         // FlashPrefill: fj[1] is j0 = kv_stride. Same bit pattern, different read.
         let mut d = inst(DevOp::FlashPrefill);
         d.f = [1.0, 0.0];
         d.j = [4096, 7];
         let out = disasm(0, &d.pack(), &[]);
-        let j: Vec<_> =
-            out.ints.iter().filter(|o| o.slot >= 8).map(|o| (o.name, o.value)).collect();
+        let j: Vec<_> = out
+            .ints
+            .iter()
+            .filter(|o| o.slot >= 8)
+            .map(|o| (o.name, o.value))
+            .collect();
         assert_eq!(j, [(Some("kv_stride"), 4096), (Some("kv_mask"), 7)]);
         assert_eq!(out.floats.len(), 1, "only f0 is a float here");
     }
@@ -282,7 +330,11 @@ mod tests {
         let mut d = inst(DevOp::Mamba2Scan);
         d.t = [9, 0, 0, 0, 0, 0, 0, 0];
         d.i = [42, 0, 0, 0, 0, 0, 0, 0];
-        let out = disasm(0, &d.pack(), &["a", "b", "c", "d", "e", "f", "g", "h", "i", "st.x"]);
+        let out = disasm(
+            0,
+            &d.pack(),
+            &["a", "b", "c", "d", "e", "f", "g", "h", "i", "st.x"],
+        );
 
         assert_eq!(out.provenance, Provenance::Undocumented);
         assert!(out.tensors.iter().all(|o| o.name.is_none()));
@@ -293,7 +345,13 @@ mod tests {
 
     #[test]
     fn unknown_opcode_is_reported_not_guessed() {
-        let w = DevInst64 { op: 60000, blocks: 1, fj: [0; 3], t: [TENSOR_NONE16; 8], i: [0; 8] };
+        let w = DevInst64 {
+            op: 60000,
+            blocks: 1,
+            fj: [0; 3],
+            t: [TENSOR_NONE16; 8],
+            i: [0; 8],
+        };
         let out = disasm(0, &w, &[]);
         assert_eq!(out.op, None);
         assert_eq!(out.op_name, None);

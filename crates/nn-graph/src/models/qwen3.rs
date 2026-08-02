@@ -108,8 +108,18 @@ fn attention(
     );
 
     // Qwen3 per-head qk-norm (RMSNorm over head_dim), then RoPE.
-    let q = nn.rmsnorm(&format!("{prefix}.self_attn.q_norm"), q, hd, cfg.rms_norm_eps);
-    let k = nn.rmsnorm(&format!("{prefix}.self_attn.k_norm"), k, hd, cfg.rms_norm_eps);
+    let q = nn.rmsnorm(
+        &format!("{prefix}.self_attn.q_norm"),
+        q,
+        hd,
+        cfg.rms_norm_eps,
+    );
+    let k = nn.rmsnorm(
+        &format!("{prefix}.self_attn.k_norm"),
+        k,
+        hd,
+        cfg.rms_norm_eps,
+    );
     let q = nn.rope(q, hd as u32, cfg.rope_theta);
     let k = nn.rope(k, hd as u32, cfg.rope_theta);
 

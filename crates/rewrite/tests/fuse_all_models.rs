@@ -555,9 +555,7 @@ fn fuse_glm() {
     let gw: BTreeSet<String> = graph_weights(&g)
         .into_iter()
         .filter(|w| {
-            !w.ends_with(".mlp.gate.weight")
-                && !w.contains("index_head")
-                && w != "lm_head.weight"
+            !w.ends_with(".mlp.gate.weight") && !w.contains("index_head") && w != "lm_head.weight"
         })
         .collect();
     assert_eq!(
@@ -621,10 +619,7 @@ fn fuse_kimi() {
         .into_iter()
         .filter(|w| !w.ends_with(".mlp.gate.weight"))
         .collect();
-    assert_eq!(
-        fw, gw,
-        "fusion dropped or duplicated weight leaves in Kimi"
-    );
+    assert_eq!(fw, gw, "fusion dropped or duplicated weight leaves in Kimi");
 }
 
 // --- Kimi K3 (Moonshot): hybrid KDA/MLA + latent MoE ---

@@ -98,8 +98,7 @@ fn load_serve_unload_reload_cycle() {
     let mut loaded = [0u64; 2];
     let mut after = [0u64; 2];
     for cycle in 0..2usize {
-        let mut e =
-            GpuEngine::load(Arc::clone(&be), &assets, &ckpt).expect("engine load");
+        let mut e = GpuEngine::load(Arc::clone(&be), &assets, &ckpt).expect("engine load");
         loaded[cycle] = used(&be);
         let reply = serve_paris(&mut e, &tok);
         eprintln!(

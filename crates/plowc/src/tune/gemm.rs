@@ -80,8 +80,8 @@ pub fn run(root: &Path, c: &Campaign) -> Result<(), Err> {
     // `--root .` is the default and the harness build runs with `current_dir(obj)`, so a relative
     // root resolves against the OBJECT directory and every source path misses. Canonicalise once,
     // here, rather than at each use.
-    let root = &std::fs::canonicalize(root)
-        .map_err(|e| format!("--root {}: {e}", root.display()))?;
+    let root =
+        &std::fs::canonicalize(root).map_err(|e| format!("--root {}: {e}", root.display()))?;
     // The digest first, in every subcommand, because digest churn is the dominant operational
     // fact: any edit to `runtime/amd/*.hip|h` or `runtime/common/dev_isa.h` moves the
     // preprocessed build digest and re-stales EVERY record. `probe_digest` exists so tooling can
@@ -95,8 +95,14 @@ pub fn run(root: &Path, c: &Campaign) -> Result<(), Err> {
     match &c.shapes {
         ShapeSource::Auto(_) => {
             let (hit, miss) = shapes_coverage(&shapes);
-            println!("shapes      : {} DERIVED from the compiler's demand", shapes.len());
-            println!("store cover : {hit} HIT / {miss} MISS against {}", c.db.display());
+            println!(
+                "shapes      : {} DERIVED from the compiler's demand",
+                shapes.len()
+            );
+            println!(
+                "store cover : {hit} HIT / {miss} MISS against {}",
+                c.db.display()
+            );
             if miss > 0 {
                 // The line nobody printed on 2026-07-29. `0 HIT / 32 MISS` was the whole bug.
                 println!("              the {miss} MISS shapes select from the ANALYTICAL MODEL");
@@ -104,7 +110,11 @@ pub fn run(root: &Path, c: &Campaign) -> Result<(), Err> {
             }
         }
         ShapeSource::File(p) => {
-            println!("shapes      : {} from {} (HAND-AUTHORED — it can drift from demand;", shapes.len(), p.display());
+            println!(
+                "shapes      : {} from {} (HAND-AUTHORED — it can drift from demand;",
+                shapes.len(),
+                p.display()
+            );
             println!("              `--shapes auto` is the form that cannot)");
         }
     }
@@ -130,8 +140,7 @@ pub fn run(root: &Path, c: &Campaign) -> Result<(), Err> {
         for s in &shapes {
             *by_quant.entry(format!("{:?}", s.quant)).or_default() += 1;
         }
-        let census: Vec<String> =
-            by_quant.iter().map(|(q, n)| format!("{n} {q}")).collect();
+        let census: Vec<String> = by_quant.iter().map(|(q, n)| format!("{n} {q}")).collect();
         println!("encodings   : {}", census.join(", "));
     }
     println!();
@@ -152,7 +161,9 @@ pub fn run(root: &Path, c: &Campaign) -> Result<(), Err> {
         // Each shape measures into its own scratch file and is appended only on a clean exit, so
         // a contended run (gpulease rc=76) is DISCARDED rather than averaged in. The bash script
         // pointed the harness straight at the campaign file and had no way to take a row back.
-        let scratch = c.samples.with_extension(format!("part.{}", std::process::id()));
+        let scratch = c
+            .samples
+            .with_extension(format!("part.{}", std::process::id()));
         let _ = std::fs::remove_file(&scratch);
         match measure(root, &harness, &c.obj, s, &scratch, c.lease) {
             Ok(()) => {
@@ -183,16 +194,21 @@ pub fn run(root: &Path, c: &Campaign) -> Result<(), Err> {
         println!();
         println!("--no-ingest: samples written, NOTHING PUBLISHED. The store is unchanged and");
         println!("             the compiler's answer has not moved. Publish with:");
-        println!("               plowc tune ingest --samples {}", c.samples.display());
+        println!(
+            "               plowc tune ingest --samples {}",
+            c.samples.display()
+        );
         return Ok(());
     }
     println!();
     let published = super::ingest::ingest(root, &c.db, &c.samples, &c.campaign, c.provisional)?;
     if published == 0 && !c.provisional {
-        return Err("the campaign measured rows but published NO qualified record. The store is \
+        return Err(
+            "the campaign measured rows but published NO qualified record. The store is \
                     unchanged, so the compiler's answer has not moved — check the rejected/stale \
                     lines above rather than treating this as a success."
-            .into());
+                .into(),
+        );
     }
     Ok(())
 }
@@ -230,7 +246,14 @@ fn resolve(src: &ShapeSource) -> Result<Vec<Shape>, Err> {
             .collect(),
         ShapeSource::File(p) => demand::parse_list(&std::fs::read_to_string(p)?)?
             .into_iter()
-            .map(|l| Shape { m: l.m, n: l.n, k: l.k, label: l.label, quant: l.quant, hit: None })
+            .map(|l| Shape {
+                m: l.m,
+                n: l.n,
+                k: l.k,
+                label: l.label,
+                quant: l.quant,
+                hit: None,
+            })
             .collect(),
     })
 }
@@ -309,8 +332,12 @@ fn preflight(root: &Path, c: &Campaign) -> Result<(), Err> {
 /// group being added has no process in it, which is exactly the trap `knob-contract` §0a records.
 /// So this reads the process's own supplementary groups, not the group database's membership.
 fn in_render_group() -> bool {
-    let Some(gid) = render_gid() else { return false };
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else { return false };
+    let Some(gid) = render_gid() else {
+        return false;
+    };
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
     status
         .lines()
         .find_map(|l| l.strip_prefix("Groups:"))
@@ -329,11 +356,15 @@ fn render_gid() -> Option<u32> {
 /// Whether the group DATABASE lists this user — which is what decides if `sg render` can succeed,
 /// and is a different question from whether the running process carries the gid.
 fn group_db_lists_render() -> bool {
-    let Ok(group) = std::fs::read_to_string("/etc/group") else { return false };
+    let Ok(group) = std::fs::read_to_string("/etc/group") else {
+        return false;
+    };
     let user = std::env::var("USER").unwrap_or_default();
     group.lines().any(|l| {
         l.starts_with("render:")
-            && l.rsplit(':').next().is_some_and(|m| m.split(',').any(|u| u == user))
+            && l.rsplit(':')
+                .next()
+                .is_some_and(|m| m.split(',').any(|u| u == user))
     })
 }
 
@@ -351,7 +382,12 @@ fn build_harness(root: &Path, obj: &Path) -> Result<PathBuf, Err> {
         .args(["-O2", "-std=gnu11", "-o", "gemm_tile_sweep"])
         .arg(root.join("runtime/ubench/gemm_tile_sweep.c"))
         .arg(root.join("runtime/amd/hsa_backend.c"))
-        .args(["-I/opt/rocm/include", "-L/opt/rocm/lib", "-lhsa-runtime64", "-lm"])
+        .args([
+            "-I/opt/rocm/include",
+            "-L/opt/rocm/lib",
+            "-lhsa-runtime64",
+            "-lm",
+        ])
         .status()?;
     if !st.success() {
         return Err(format!("building gemm_tile_sweep failed: {st}").into());
@@ -387,7 +423,9 @@ fn measure(
     // by the time we reach this point the gid is present because preflight refused otherwise.
     if lease {
         let mut wrapped = vec![
-            root.join("perf-data/harness/gpulease").to_string_lossy().into_owned(),
+            root.join("perf-data/harness/gpulease")
+                .to_string_lossy()
+                .into_owned(),
             "-n".into(),
             "1".into(),
             format!("tune-gemm-{}", s.label),
@@ -417,7 +455,12 @@ fn measure(
     if let Ok(v) = std::env::var("ROCR_VISIBLE_DEVICES") {
         cmd.env("ROCR_VISIBLE_DEVICES", v);
     }
-    for k in ["GPU_LEASE_DIR", "GPU_LEASE_TIMEOUT", "GPU_LEASE_NGPU", "TMPDIR"] {
+    for k in [
+        "GPU_LEASE_DIR",
+        "GPU_LEASE_TIMEOUT",
+        "GPU_LEASE_NGPU",
+        "TMPDIR",
+    ] {
         if let Ok(v) = std::env::var(k) {
             cmd.env(k, v);
         }
@@ -426,22 +469,30 @@ fn measure(
     // exports them alongside `ROCR_VISIBLE_DEVICES` to the same absolute id and they COMPOSE, so
     // a correctly leased card reports "no ROCm-capable device is detected". For a runtime,
     // `ROCR_VISIBLE_DEVICES` alone is correct.
-    let st = cmd.status().map_err(|e| Contention::Failed(Box::new(e) as Err))?;
+    let st = cmd
+        .status()
+        .map_err(|e| Contention::Failed(Box::new(e) as Err))?;
     match st.code() {
         Some(0) => Ok(()),
         // gpulease's "completed but contended". A contended run silently invalidates every
         // number, so it is discarded and re-run — never stored with a caveat.
         Some(76) => Err(Contention::Contended),
         other => Err(Contention::Failed(
-            format!("gemm_tile_sweep {}x{}x{} {:?} exited {other:?}", s.m, s.n, s.k, s.quant)
-                .into(),
+            format!(
+                "gemm_tile_sweep {}x{}x{} {:?} exited {other:?}",
+                s.m, s.n, s.k, s.quant
+            )
+            .into(),
         )),
     }
 }
 
 fn append(path: &Path, text: &str) -> Result<(), Err> {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     f.write_all(text.as_bytes())?;
     Ok(())
 }

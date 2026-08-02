@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use packet::{Body, Inst, Program, ResourceKind};
 
-use crate::device::{Backend, Backing, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg, Module};
+use crate::device::{
+    Backend, Backing, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg, Module,
+};
 use crate::exec::counters::CounterPool;
 use crate::{Result, RuntimeError};
 
@@ -148,9 +150,9 @@ impl Backend for CpuBackend {
                 unsafe { a.read(off, dst) };
                 Ok(())
             }
-            Backing::Owned { .. } | Backing::View => {
-                Err(RuntimeError::Device("download from device-owned mem".into()))
-            }
+            Backing::Owned { .. } | Backing::View => Err(RuntimeError::Device(
+                "download from device-owned mem".into(),
+            )),
         }
     }
 
@@ -216,12 +218,28 @@ fn ceil_div(a: u64, b: u64) -> u64 {
 /// plausible timeline. SEAM: swap in `costmodel` for fidelity.
 pub fn op_cost(body: &Body) -> u64 {
     let work = match body {
-        Body::Gemm { m, n, k, bm, bn, bk, .. } => {
+        Body::Gemm {
+            m,
+            n,
+            k,
+            bm,
+            bn,
+            bk,
+            ..
+        } => {
             ceil_div(*m as u64, *bm as u64)
                 * ceil_div(*n as u64, *bn as u64)
                 * ceil_div(*k as u64, *bk as u64)
         }
-        Body::Flash { seq_q, seq_kv, head_dim, bq, bkv, heads, .. } => {
+        Body::Flash {
+            seq_q,
+            seq_kv,
+            head_dim,
+            bq,
+            bkv,
+            heads,
+            ..
+        } => {
             ceil_div(*seq_q as u64, *bq as u64)
                 * ceil_div(*seq_kv as u64, *bkv as u64)
                 * (*head_dim as u64)
@@ -451,9 +469,7 @@ pub fn run_streams_reuse<O: StepObserver>(
             if *head < stream.len() {
                 let next_idx = stream[*head];
                 let next_inst = &program.insts[next_idx];
-                if next_inst.wait.is_empty()
-                    || next_inst.wait.iter().all(|&c| pool.satisfied(c))
-                {
+                if next_inst.wait.is_empty() || next_inst.wait.iter().all(|&c| pool.satisfied(c)) {
                     streams.ready.push(si);
                 } else {
                     for &c in &next_inst.wait {

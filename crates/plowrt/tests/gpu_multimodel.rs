@@ -56,7 +56,10 @@ fn build_state(be: &Arc<CudaBackend>) -> (Arc<AppState>, String, String) {
     let mut registry = Registry::new();
     let slug_a = registry.load(assets_a(), None).expect("load A");
     let slug_b = registry.load(assets_b(), None).expect("load B");
-    assert_ne!(slug_a, slug_b, "the two assets dirs must be different models");
+    assert_ne!(
+        slug_a, slug_b,
+        "the two assets dirs must be different models"
+    );
     let backend: Arc<dyn Backend> = Arc::clone(be) as Arc<dyn Backend>;
     let execset = Arc::new(ExecutorSet::bringup(backend).expect("execset"));
     (
@@ -74,7 +77,9 @@ async fn request(
     prompt_ids: Vec<u32>,
     max_tokens: usize,
 ) -> (Vec<u32>, String, f64) {
-    let mux = state.mux(slug).unwrap_or_else(|| panic!("no mux for {slug}"));
+    let mux = state
+        .mux(slug)
+        .unwrap_or_else(|| panic!("no mux for {slug}"));
     let mut gen = GenParams {
         max_tokens,
         ..GenParams::default()
@@ -112,7 +117,12 @@ async fn request(
 fn paris_ids(state: &Arc<AppState>, slug: &str) -> Vec<u32> {
     let prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one word.<turn|>\n\
                   <|turn>model\n<|channel>thought\n<channel|>";
-    state.registry.get(slug).expect("bundle").tokenizer().encode(prompt)
+    state
+        .registry
+        .get(slug)
+        .expect("bundle")
+        .tokenizer()
+        .encode(prompt)
 }
 
 /// A ~`n`-token priming prompt (real KV content; the values don't matter).
@@ -150,8 +160,18 @@ fn assert_vram_at_plan(be: &CudaBackend, mgr: &ModelManager, residents: &[&str],
         lo / MIB,
         hi / MIB
     );
-    assert!(u >= lo, "{what}: used {} MiB below resident weights {} MiB", u / MIB, lo / MIB);
-    assert!(u <= hi, "{what}: used {} MiB above plan {} MiB — leak", u / MIB, hi / MIB);
+    assert!(
+        u >= lo,
+        "{what}: used {} MiB below resident weights {} MiB",
+        u / MIB,
+        lo / MIB
+    );
+    assert!(
+        u <= hi,
+        "{what}: used {} MiB above plan {} MiB — leak",
+        u / MIB,
+        hi / MIB
+    );
 }
 
 /// Time one S1 switch: ensure_resident(target) (evict + load) then the Paris
@@ -235,19 +255,28 @@ async fn s1_switch_cycle_token_identity_and_timing() {
     state.install_manager(Arc::clone(&mgr));
     mgr.load_initial().await.expect("initial load");
     assert!(mgr.is_resident(&slug_a), "A resident at startup");
-    assert!(!mgr.is_resident(&slug_b), "B must not co-reside under the budget");
+    assert!(
+        !mgr.is_resident(&slug_b),
+        "B must not co-reside under the budget"
+    );
     assert_vram_at_plan(&be, &mgr, &[&slug_a], "A resident");
 
     // First run on A — the reference tokens for the identity gate.
     let (ids_a1, text_a1, _) = request(&state, &slug_a, paris_ids(&state, &slug_a), 24).await;
     eprintln!("[A run 1] {text_a1:?}");
-    assert!(text_a1.contains("Paris"), "A: expected Paris in {text_a1:?}");
+    assert!(
+        text_a1.contains("Paris"),
+        "A: expected Paris in {text_a1:?}"
+    );
 
     for &ctx in &[4096usize, 32768] {
         // Live KV at `ctx` on the outgoing model (A), then switch to B.
         let t0 = Instant::now();
         let (_, _, _) = request(&state, &slug_a, long_ids(&state, &slug_a, ctx), 4).await;
-        eprintln!("[prime] A at ctx {ctx}: {:.1} s", t0.elapsed().as_secs_f64());
+        eprintln!(
+            "[prime] A at ctx {ctx}: {:.1} s",
+            t0.elapsed().as_secs_f64()
+        );
         let (_, text_b) = timed_switch(&state, &mgr, &slug_b, &format!("A@{ctx}k-out")).await;
         assert!(text_b.contains("Paris"), "B: expected Paris in {text_b:?}");
         assert!(!mgr.is_resident(&slug_a), "A evicted");
@@ -256,11 +285,18 @@ async fn s1_switch_cycle_token_identity_and_timing() {
         // Live KV at `ctx` on the outgoing model (B), then switch back to A.
         let t0 = Instant::now();
         let (_, _, _) = request(&state, &slug_b, long_ids(&state, &slug_b, ctx), 4).await;
-        eprintln!("[prime] B at ctx {ctx}: {:.1} s", t0.elapsed().as_secs_f64());
-        let (ids_a2, text_a2) =
-            timed_switch(&state, &mgr, &slug_a, &format!("B@{ctx}k-out")).await;
+        eprintln!(
+            "[prime] B at ctx {ctx}: {:.1} s",
+            t0.elapsed().as_secs_f64()
+        );
+        let (ids_a2, text_a2) = timed_switch(&state, &mgr, &slug_a, &format!("B@{ctx}k-out")).await;
         assert!(!mgr.is_resident(&slug_b), "B evicted");
-        assert_vram_at_plan(&be, &mgr, &[&slug_a], &format!("A resident again (ctx {ctx})"));
+        assert_vram_at_plan(
+            &be,
+            &mgr,
+            &[&slug_a],
+            &format!("A resident again (ctx {ctx})"),
+        );
 
         // Token identity: A after reload == A's first run, byte for byte.
         assert_eq!(
@@ -331,7 +367,11 @@ async fn long_prefill_does_not_shed_decode_streams() {
         &dec.1.chars().take(40).collect::<String>(),
         lng.0.len()
     );
-    assert!(dec.0.len() >= 32, "decode stream cut short: {} tokens", dec.0.len());
+    assert!(
+        dec.0.len() >= 32,
+        "decode stream cut short: {} tokens",
+        dec.0.len()
+    );
     assert!(!lng.0.is_empty(), "long-prompt request produced no tokens");
 }
 

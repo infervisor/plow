@@ -132,7 +132,11 @@ fn device_sampler_matches_cpu_reference() {
         .arg(&src)
         .output()
         .expect("nvcc not found");
-    assert!(out.status.success(), "nvcc: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "nvcc: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let image = std::fs::read(&cubin).unwrap();
 
     let be = CudaBackend::new(0).expect("CUDA backend");
@@ -177,20 +181,49 @@ fn device_sampler_matches_cpu_reference() {
     be.upload(&d_rng, 0, bytemuck::cast_slice(&rng01)).unwrap();
 
     let cases = [
-        Case { t: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0 }, // greedy
-        Case { t: 0.8, top_k: 40, top_p: 1.0, min_p: 0.0 },
-        Case { t: 1.0, top_k: 0, top_p: 0.95, min_p: 0.0 },
-        Case { t: 0.7, top_k: 0, top_p: 1.0, min_p: 0.05 },
-        Case { t: 1.2, top_k: 100, top_p: 0.9, min_p: 0.02 },
+        Case {
+            t: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+        }, // greedy
+        Case {
+            t: 0.8,
+            top_k: 40,
+            top_p: 1.0,
+            min_p: 0.0,
+        },
+        Case {
+            t: 1.0,
+            top_k: 0,
+            top_p: 0.95,
+            min_p: 0.0,
+        },
+        Case {
+            t: 0.7,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.05,
+        },
+        Case {
+            t: 1.2,
+            top_k: 100,
+            top_p: 0.9,
+            min_p: 0.02,
+        },
     ];
 
     let mut ids = vec![0i32; B];
     let mut ids2 = vec![0i32; B];
     for (ci, c) in cases.iter().enumerate() {
-        be.upload(&d_temp, 0, bytemuck::cast_slice(&vec![c.t; B])).unwrap();
-        be.upload(&d_topk, 0, bytemuck::cast_slice(&vec![c.top_k; B])).unwrap();
-        be.upload(&d_topp, 0, bytemuck::cast_slice(&vec![c.top_p; B])).unwrap();
-        be.upload(&d_minp, 0, bytemuck::cast_slice(&vec![c.min_p; B])).unwrap();
+        be.upload(&d_temp, 0, bytemuck::cast_slice(&vec![c.t; B]))
+            .unwrap();
+        be.upload(&d_topk, 0, bytemuck::cast_slice(&vec![c.top_k; B]))
+            .unwrap();
+        be.upload(&d_topp, 0, bytemuck::cast_slice(&vec![c.top_p; B]))
+            .unwrap();
+        be.upload(&d_minp, 0, bytemuck::cast_slice(&vec![c.min_p; B]))
+            .unwrap();
 
         let launch = |ids: &mut [i32]| {
             // Kernel args live in named locals: kernelParams points at each,
@@ -212,9 +245,11 @@ fn device_sampler_matches_cpu_reference() {
                 &mut p_v as *mut u32 as *mut std::ffi::c_void,
                 &mut p_b as *mut u32 as *mut std::ffi::c_void,
             ];
-            be.launch_kernel(f, B as u32, 256, 0, &mut a, Some(&stream)).unwrap();
+            be.launch_kernel(f, B as u32, 256, 0, &mut a, Some(&stream))
+                .unwrap();
             be.stream_synchronize(&stream).unwrap();
-            be.download(&d_ids, 0, bytemuck::cast_slice_mut(ids)).unwrap();
+            be.download(&d_ids, 0, bytemuck::cast_slice_mut(ids))
+                .unwrap();
         };
         launch(&mut ids);
         launch(&mut ids2);
@@ -232,7 +267,10 @@ fn device_sampler_matches_cpu_reference() {
                     mism += 1;
                 }
             }
-            assert_eq!(mism, 0, "case {ci} greedy: {mism} disagreements (must be exact)");
+            assert_eq!(
+                mism, 0,
+                "case {ci} greedy: {mism} disagreements (must be exact)"
+            );
             eprintln!("case {ci} greedy: exact over {B} draws");
             continue;
         }
@@ -261,9 +299,15 @@ fn device_sampler_matches_cpu_reference() {
             "case {ci} t={} k={} p={} min_p={}: TVD(device,cpu)={tvd:.4}, {distinct} distinct tokens",
             c.t, c.top_k, c.top_p, c.min_p,
         );
-        assert!(tvd < 0.05, "case {ci}: device/cpu distributions differ (TVD {tvd:.4} >= 0.05)");
+        assert!(
+            tvd < 0.05,
+            "case {ci}: device/cpu distributions differ (TVD {tvd:.4} >= 0.05)"
+        );
         // Truncation actually happened (not sampling the whole vocab).
-        assert!(distinct < V / 2, "case {ci}: kept set implausibly large ({distinct})");
+        assert!(
+            distinct < V / 2,
+            "case {ci}: kept set implausibly large ({distinct})"
+        );
     }
     be.module_unload(&module).unwrap();
 }

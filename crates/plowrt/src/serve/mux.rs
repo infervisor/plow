@@ -358,8 +358,8 @@ pub fn spawn(
         // Dedicated engine/submission thread for GPU models: every tick runs
         // on ONE persistent OS thread (CUDA context bound once, no
         // blocking-pool dispatch). CPU-reference models keep spawn_blocking.
-        let engine_thread =
-            has_gpu.then(|| crate::exec::engine_thread::EngineThread::spawn(format!("plow-eng-{slug}")));
+        let engine_thread = has_gpu
+            .then(|| crate::exec::engine_thread::EngineThread::spawn(format!("plow-eng-{slug}")));
 
         loop {
             let live = slots.iter().filter(|s| s.is_some()).count();
@@ -553,11 +553,9 @@ pub fn spawn(
                     for s in slots.iter_mut() {
                         if let Some(slot) = s.take() {
                             release_kv(&arena, slot.kv);
-                            let _ =
-                                slot.respond
-                                    .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(
-                                        "arrival-rate admission shed".into(),
-                                    )));
+                            let _ = slot.respond.try_send(StreamChunk::Err(
+                                crate::RuntimeError::Rejected("arrival-rate admission shed".into()),
+                            ));
                         }
                     }
                     if let Some(b) = taken_bufs.take() {
@@ -631,7 +629,9 @@ pub fn spawn(
             // task stays hot for arrivals/cancellation either way.
             let joined = match &engine_thread {
                 Some(t) => t.run(tick).await,
-                None => tokio::task::spawn_blocking(tick).await.map_err(|e| e.to_string()),
+                None => tokio::task::spawn_blocking(tick)
+                    .await
+                    .map_err(|e| e.to_string()),
             };
 
             let ms = t_service_start.elapsed().as_millis() as f64;
@@ -725,7 +725,10 @@ fn admit_into(
 
     let Some(idx) = slots.iter().position(|s| s.is_none()) else {
         // Capacity exhausted — reject fast rather than sitting on the request.
-        tracing::warn!(capacity = slots.len(), "mux: no free slot — request rejected");
+        tracing::warn!(
+            capacity = slots.len(),
+            "mux: no free slot — request rejected"
+        );
         // Counted here and NOT in the admission-shed path above: both end as a
         // 429, but shedding is the controller dropping live work because
         // predicted wait passed the SLO, while this is arrival meeting a full
@@ -860,7 +863,13 @@ fn run_one_tick(
     arena: Option<SharedKvState>,
     kv_pages_range: std::ops::Range<usize>,
     steps: u32,
-) -> (Vec<Option<Slot>>, Option<BucketBufs>, RunObserver, usize, bool) {
+) -> (
+    Vec<Option<Slot>>,
+    Option<BucketBufs>,
+    RunObserver,
+    usize,
+    bool,
+) {
     let bucket = key.and_then(|k| bundle.bucket(k));
     let mut tokens_this_tick = 0usize;
 
@@ -886,216 +895,312 @@ fn run_one_tick(
         #[cfg(feature = "cuda")]
         #[allow(irrefutable_let_patterns)]
         if let crate::serve::engine::ServeEngine::Cuda(e) = &mut *guard {
-        let stop = Arc::clone(e.stop_ids());
-        let cap = e.batch();
+            let stop = Arc::clone(e.stop_ids());
+            let cap = e.batch();
 
-        // Slots past the engine batch cannot be served — only reachable on a
-        // capacity/engine mismatch, and better a loud 429 than a hang.
-        for slot_opt in slots.iter_mut().skip(cap) {
-            if let Some(taken) = slot_opt.take() {
-                tracing::warn!(cap, "gpu: slot past engine batch rejected");
-                release_kv(&arena, taken.kv);
-                let _ = taken
-                    .respond
-                    .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(format!(
-                        "GPU engine serves {cap} sequence slot(s)"
-                    ))));
+            // Slots past the engine batch cannot be served — only reachable on a
+            // capacity/engine mismatch, and better a loud 429 than a hang.
+            for slot_opt in slots.iter_mut().skip(cap) {
+                if let Some(taken) = slot_opt.take() {
+                    tracing::warn!(cap, "gpu: slot past engine batch rejected");
+                    release_kv(&arena, taken.kv);
+                    let _ =
+                        taken
+                            .respond
+                            .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(format!(
+                                "GPU engine serves {cap} sequence slot(s)"
+                            ))));
+                }
             }
-        }
 
-        // Whether this tick does any prefill work — reported to the dispatcher
-        // so prefill tick durations never enter the decode-service EWMA.
-        let did_prefill = slots
-            .iter()
-            .take(cap)
-            .any(|s| s.as_ref().map(|s| s.step == 0).unwrap_or(false));
+            // Whether this tick does any prefill work — reported to the dispatcher
+            // so prefill tick durations never enter the decode-service EWMA.
+            let did_prefill = slots
+                .iter()
+                .take(cap)
+                .any(|s| s.as_ref().map(|s| s.step == 0).unwrap_or(false));
 
-        // Decode feeds, gathered BEFORE the prefill pass so a slot prefilled
-        // this tick (which just produced its first token) doesn't also step.
-        let mut feeds: Vec<(usize, u32)> = slots
-            .iter()
-            .enumerate()
-            .take(cap)
-            .filter_map(|(i, s)| {
-                let s = s.as_ref()?;
-                (s.step > 0).then(|| (i, *s.out_ids.last().expect("step > 0 implies output")))
-            })
-            .collect();
+            // Decode feeds, gathered BEFORE the prefill pass so a slot prefilled
+            // this tick (which just produced its first token) doesn't also step.
+            let mut feeds: Vec<(usize, u32)> = slots
+                .iter()
+                .enumerate()
+                .take(cap)
+                .filter_map(|(i, s)| {
+                    let s = s.as_ref()?;
+                    (s.step > 0).then(|| (i, *s.out_ids.last().expect("step > 0 implies output")))
+                })
+                .collect();
 
-        // PX-17: throughput mode — while any slot is mid-prefill, drop the decode
-        // feeds so the prefill chain runs uninterrupted and no decode launch pays
-        // its fixed cost at a partial batch. Every deferred row is picked up by a
-        // full-batch decode tick once prefill drains.
-        if pf_defer_decode() && did_prefill {
-            feeds.clear();
-        }
+            // PX-17: throughput mode — while any slot is mid-prefill, drop the decode
+            // feeds so the prefill chain runs uninterrupted and no decode launch pays
+            // its fixed cost at a partial batch. Every deferred row is picked up by a
+            // full-batch decode tick once prefill drains.
+            if pf_defer_decode() && did_prefill {
+                feeds.clear();
+            }
 
-        let pack_t = packlog::on().then(Instant::now);
-        if e.pf_batch_enabled() {
-            // PX-1 cross-request batched prefill: pack every waiting request's
-            // next chunk (up to `n-1` prompt rows each) into shared launches
-            // under a token budget, then feed each finished request's LAST
-            // prompt token through the batched decode step below — which both
-            // writes its final KV row and produces its first token, batched
-            // with every live decode stream.
-            gpu_prefill_batched_pass(&mut *e, &mut slots, cap, &arena, feeds.is_empty());
-            for i in 0..slots.len().min(cap) {
-                let Some(s) = slots[i].as_ref() else { continue };
-                if s.step != 0 {
-                    continue;
-                }
-                let n = s.prompt_ids.len();
-                if n == 0 {
-                    if let Some(taken) = slots[i].take() {
-                        release_kv(&arena, taken.kv);
-                        let _ = taken.respond.try_send(StreamChunk::Err(
-                            crate::RuntimeError::Rejected("empty prompt".into()),
-                        ));
+            let pack_t = packlog::on().then(Instant::now);
+            if e.pf_batch_enabled() {
+                // PX-1 cross-request batched prefill: pack every waiting request's
+                // next chunk (up to `n-1` prompt rows each) into shared launches
+                // under a token budget, then feed each finished request's LAST
+                // prompt token through the batched decode step below — which both
+                // writes its final KV row and produces its first token, batched
+                // with every live decode stream.
+                gpu_prefill_batched_pass(&mut *e, &mut slots, cap, &arena, feeds.is_empty());
+                for i in 0..slots.len().min(cap) {
+                    let Some(s) = slots[i].as_ref() else { continue };
+                    if s.step != 0 {
+                        continue;
                     }
-                    continue;
-                }
-                if s.pf_pos + 1 != n {
-                    continue; // still mid-prefill
-                }
-                if s.respond.is_closed() {
-                    if let Some(taken) = slots[i].take() {
-                        release_kv(&arena, taken.kv);
-                    }
-                    continue;
-                }
-                // A 1-token prompt never enters the batched pass — its slot is
-                // ready at pf_pos 0 but still needs its sequence begun.
-                if n == 1 && s.pf_pos == 0 {
-                    if let Err(err) = e.begin_slot(i, n + s.gen.max_tokens.max(1)) {
+                    let n = s.prompt_ids.len();
+                    if n == 0 {
                         if let Some(taken) = slots[i].take() {
                             release_kv(&arena, taken.kv);
-                            let _ = taken.respond.try_send(StreamChunk::Err(err));
+                            let _ = taken.respond.try_send(StreamChunk::Err(
+                                crate::RuntimeError::Rejected("empty prompt".into()),
+                            ));
                         }
                         continue;
                     }
-                }
-                let last = *slots[i]
-                    .as_ref()
-                    .expect("checked Some")
-                    .prompt_ids
-                    .last()
-                    .expect("n >= 1");
-                feeds.push((i, last));
-            }
-        } else {
-            // Prefill pass — chunk-interleaved continuous batching. With live
-            // decoders, at most ONE capped prefill chunk runs per tick, so a
-            // mid-decode arrival stalls the running streams by one chunk (not one
-            // whole prompt); the decode launch below runs between chunks. With no
-            // decoders live, the chain runs to completion (fastest cold TTFT —
-            // the pre-interleave behavior).
-            let cap_rows = if feeds.is_empty() {
-                usize::MAX
-            } else {
-                pf_interleave_rows()
-            };
-            loop {
-                let Some(i) = (0..slots.len().min(cap))
-                    .find(|&i| slots[i].as_ref().map(|s| s.step == 0).unwrap_or(false))
-                else {
-                    break;
-                };
-                // Client gone mid-prefill (chunks span ticks now) — don't spend
-                // launches building KV for a dead stream.
-                if slots[i]
-                    .as_ref()
-                    .map(|s| s.respond.is_closed())
-                    .unwrap_or(false)
-                {
-                    if let Some(taken) = slots[i].take() {
-                        release_kv(&arena, taken.kv);
+                    if s.pf_pos + 1 != n {
+                        continue; // still mid-prefill
                     }
-                    continue;
-                }
-                let slot_opt = &mut slots[i];
-                let res = gpu_prefill_advance(
-                    &mut *e,
-                    i,
-                    slot_opt.as_mut().expect("checked Some"),
-                    cap_rows,
-                );
-                match res {
-                    Ok(Some(token)) => {
-                        tracing::debug!(token, slot = i, step = 0usize, "gpu: token");
-                        handle_produced_token(
-                            slot_opt,
-                            &arena,
-                            bundle,
-                            token,
-                            1,
-                            &mut tokens_this_tick,
-                            Some(stop.as_slice()),
-                        );
-                    }
-                    Ok(None) => {
-                        // Mid-prefill: the frontier advanced one chunk.
-                    }
-                    Err(err) => {
-                        tracing::warn!(slot = i, error = %err, "gpu: prefill failed");
-                        if let Some(taken) = slot_opt.take() {
+                    if s.respond.is_closed() {
+                        if let Some(taken) = slots[i].take() {
                             release_kv(&arena, taken.kv);
-                            let _ = taken.respond.try_send(StreamChunk::Err(err));
+                        }
+                        continue;
+                    }
+                    // A 1-token prompt never enters the batched pass — its slot is
+                    // ready at pf_pos 0 but still needs its sequence begun.
+                    if n == 1 && s.pf_pos == 0 {
+                        if let Err(err) = e.begin_slot(i, n + s.gen.max_tokens.max(1)) {
+                            if let Some(taken) = slots[i].take() {
+                                release_kv(&arena, taken.kv);
+                                let _ = taken.respond.try_send(StreamChunk::Err(err));
+                            }
+                            continue;
                         }
                     }
+                    let last = *slots[i]
+                        .as_ref()
+                        .expect("checked Some")
+                        .prompt_ids
+                        .last()
+                        .expect("n >= 1");
+                    feeds.push((i, last));
                 }
-                if !feeds.is_empty() {
-                    break; // bounded stall: decode now, next chunk next tick
+            } else {
+                // Prefill pass — chunk-interleaved continuous batching. With live
+                // decoders, at most ONE capped prefill chunk runs per tick, so a
+                // mid-decode arrival stalls the running streams by one chunk (not one
+                // whole prompt); the decode launch below runs between chunks. With no
+                // decoders live, the chain runs to completion (fastest cold TTFT —
+                // the pre-interleave behavior).
+                let cap_rows = if feeds.is_empty() {
+                    usize::MAX
+                } else {
+                    pf_interleave_rows()
+                };
+                loop {
+                    let Some(i) = (0..slots.len().min(cap))
+                        .find(|&i| slots[i].as_ref().map(|s| s.step == 0).unwrap_or(false))
+                    else {
+                        break;
+                    };
+                    // Client gone mid-prefill (chunks span ticks now) — don't spend
+                    // launches building KV for a dead stream.
+                    if slots[i]
+                        .as_ref()
+                        .map(|s| s.respond.is_closed())
+                        .unwrap_or(false)
+                    {
+                        if let Some(taken) = slots[i].take() {
+                            release_kv(&arena, taken.kv);
+                        }
+                        continue;
+                    }
+                    let slot_opt = &mut slots[i];
+                    let res = gpu_prefill_advance(
+                        &mut *e,
+                        i,
+                        slot_opt.as_mut().expect("checked Some"),
+                        cap_rows,
+                    );
+                    match res {
+                        Ok(Some(token)) => {
+                            tracing::debug!(token, slot = i, step = 0usize, "gpu: token");
+                            handle_produced_token(
+                                slot_opt,
+                                &arena,
+                                bundle,
+                                token,
+                                1,
+                                &mut tokens_this_tick,
+                                Some(stop.as_slice()),
+                            );
+                        }
+                        Ok(None) => {
+                            // Mid-prefill: the frontier advanced one chunk.
+                        }
+                        Err(err) => {
+                            tracing::warn!(slot = i, error = %err, "gpu: prefill failed");
+                            if let Some(taken) = slot_opt.take() {
+                                release_kv(&arena, taken.kv);
+                                let _ = taken.respond.try_send(StreamChunk::Err(err));
+                            }
+                        }
+                    }
+                    if !feeds.is_empty() {
+                        break; // bounded stall: decode now, next chunk next tick
+                    }
                 }
             }
-        }
 
-        let pack_prefill_ns = pack_t.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
-        let pack_had_feeds = !feeds.is_empty();
-        let dec_t = packlog::on().then(Instant::now);
+            let pack_prefill_ns = pack_t.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+            let pack_had_feeds = !feeds.is_empty();
+            let dec_t = packlog::on().then(Instant::now);
 
-        // One batched decode launch for every slot already past prefill. The
-        // token buffer round-trips through `obs.host.slot_tokens` so the
-        // per-tick hot path allocates nothing.
-        if !feeds.is_empty() {
-            let mut toks = std::mem::take(&mut obs.host.slot_tokens);
-            // Bounded device multi-step (plan stage 5): when enabled and EVERY
-            // fed row is greedy (temp==0; the device advance uses the argmax
-            // token), run a K-token quantum with one host sync and stream up to
-            // K tokens per row, stopping a row as soon as handle_produced_token
-            // frees it (mid-quantum EOS / max_tokens — the extra device tokens
-            // past the stop are discarded, bounded by K). Any stochastic row
-            // falls through to the per-token path below.
-            let use_multi = e.multistep_quantum().is_some()
-                && feeds.iter().all(|&(i, _)| {
-                    slots[i]
-                        .as_ref()
-                        .map(|s| s.gen.params.temperature <= 0.0)
-                        .unwrap_or(true)
-                });
-            if use_multi {
-                match e.multi_step(&feeds, &mut toks) {
-                    Ok(k) => {
-                        for (ri, &(i, _)) in feeds.iter().enumerate() {
-                            for s in 0..k {
-                                if slots[i].is_none() {
-                                    break; // row stopped earlier this quantum
+            // One batched decode launch for every slot already past prefill. The
+            // token buffer round-trips through `obs.host.slot_tokens` so the
+            // per-tick hot path allocates nothing.
+            if !feeds.is_empty() {
+                let mut toks = std::mem::take(&mut obs.host.slot_tokens);
+                // Bounded device multi-step (plan stage 5): when enabled and EVERY
+                // fed row is greedy (temp==0; the device advance uses the argmax
+                // token), run a K-token quantum with one host sync and stream up to
+                // K tokens per row, stopping a row as soon as handle_produced_token
+                // frees it (mid-quantum EOS / max_tokens — the extra device tokens
+                // past the stop are discarded, bounded by K). Any stochastic row
+                // falls through to the per-token path below.
+                let use_multi = e.multistep_quantum().is_some()
+                    && feeds.iter().all(|&(i, _)| {
+                        slots[i]
+                            .as_ref()
+                            .map(|s| s.gen.params.temperature <= 0.0)
+                            .unwrap_or(true)
+                    });
+                if use_multi {
+                    match e.multi_step(&feeds, &mut toks) {
+                        Ok(k) => {
+                            for (ri, &(i, _)) in feeds.iter().enumerate() {
+                                for s in 0..k {
+                                    if slots[i].is_none() {
+                                        break; // row stopped earlier this quantum
+                                    }
+                                    let token = toks[ri * k + s];
+                                    tracing::debug!(token, slot = i, "gpu: token (multi-step)");
+                                    handle_produced_token(
+                                        &mut slots[i],
+                                        &arena,
+                                        bundle,
+                                        token,
+                                        1,
+                                        &mut tokens_this_tick,
+                                        Some(stop.as_slice()),
+                                    );
                                 }
-                                let token = toks[ri * k + s];
-                                tracing::debug!(token, slot = i, "gpu: token (multi-step)");
-                                handle_produced_token(
-                                    &mut slots[i],
-                                    &arena,
-                                    bundle,
-                                    token,
-                                    1,
-                                    &mut tokens_this_tick,
-                                    Some(stop.as_slice()),
-                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, fed = feeds.len(), "gpu: multi-step failed");
+                            let msg = err.to_string();
+                            for &(i, _) in &feeds {
+                                if let Some(taken) = slots[i].take() {
+                                    release_kv(&arena, taken.kv);
+                                    let _ = taken.respond.try_send(StreamChunk::Err(
+                                        crate::RuntimeError::Msg(msg.clone()),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    obs.host.slot_tokens = toks;
+                    if let Some(dt) = dec_t {
+                        packlog::record(
+                            pack_prefill_ns,
+                            dt.elapsed().as_nanos() as u64,
+                            did_prefill,
+                            pack_had_feeds,
+                            feeds.len(),
+                        );
+                    }
+                    return (slots, bufs, obs, tokens_this_tick, did_prefill);
+                }
+                // Device sampling (plan stage 4): when the engine has a sampler,
+                // build a batch-wide spec array so eligible temperature>0 rows are
+                // sampled on-device (token lands in in.ids, no vocab-row D2H); a
+                // row is device-sampled iff temp>0 with no penalties/logit-bias
+                // (those still need the host path). `dev_sampled` marks which rows
+                // must NOT be host-resampled afterwards.
+                let dev_specs: Option<Vec<crate::exec::gpu::DevSample>> = if e.dev_sample_enabled()
+                {
+                    let cap = e.batch();
+                    let mut v = vec![crate::exec::gpu::DevSample::greedy(); cap];
+                    for &(i, _) in &feeds {
+                        if let Some(slot) = slots[i].as_ref() {
+                            if let Some(spec) = dev_sample_spec(slot) {
+                                v[i] = spec;
+                            }
+                        }
+                    }
+                    Some(v)
+                } else {
+                    None
+                };
+                let step_res = e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks);
+                match step_res {
+                    Ok(()) => {
+                        for (&(i, _), &argmax_tok) in feeds.iter().zip(toks.iter()) {
+                            let slot_opt = &mut slots[i];
+                            let Some(slot) = slot_opt.as_mut() else {
+                                continue;
+                            };
+                            // Device-sampled rows already hold their final token in
+                            // `argmax_tok` (the sampler wrote in.ids); skip the host
+                            // resample.
+                            let was_dev = dev_specs
+                                .as_ref()
+                                .map(|_| dev_sample_spec(slot).is_some())
+                                .unwrap_or(false);
+                            let finished = if was_dev {
+                                Ok(argmax_tok)
+                            } else {
+                                gpu_finish_token(&mut *e, i, slot, argmax_tok)
+                            };
+                            match finished {
+                                Ok(token) => {
+                                    tracing::debug!(
+                                        token,
+                                        slot = i,
+                                        step = slot.step,
+                                        "gpu: token"
+                                    );
+                                    handle_produced_token(
+                                        slot_opt,
+                                        &arena,
+                                        bundle,
+                                        token,
+                                        1,
+                                        &mut tokens_this_tick,
+                                        Some(stop.as_slice()),
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(slot = i, error = %err, "gpu: sample failed");
+                                    if let Some(taken) = slot_opt.take() {
+                                        release_kv(&arena, taken.kv);
+                                        let _ = taken.respond.try_send(StreamChunk::Err(err));
+                                    }
+                                }
                             }
                         }
                     }
                     Err(err) => {
-                        tracing::warn!(error = %err, fed = feeds.len(), "gpu: multi-step failed");
+                        // The batched launch failed — every fed slot loses.
+                        tracing::warn!(error = %err, fed = feeds.len(), "gpu: decode launch failed");
                         let msg = err.to_string();
                         for &(i, _) in &feeds {
                             if let Some(taken) = slots[i].take() {
@@ -1108,106 +1213,17 @@ fn run_one_tick(
                     }
                 }
                 obs.host.slot_tokens = toks;
-                if let Some(dt) = dec_t {
-                    packlog::record(
-                        pack_prefill_ns,
-                        dt.elapsed().as_nanos() as u64,
-                        did_prefill,
-                        pack_had_feeds,
-                        feeds.len(),
-                    );
-                }
-                return (slots, bufs, obs, tokens_this_tick, did_prefill);
             }
-            // Device sampling (plan stage 4): when the engine has a sampler,
-            // build a batch-wide spec array so eligible temperature>0 rows are
-            // sampled on-device (token lands in in.ids, no vocab-row D2H); a
-            // row is device-sampled iff temp>0 with no penalties/logit-bias
-            // (those still need the host path). `dev_sampled` marks which rows
-            // must NOT be host-resampled afterwards.
-            let dev_specs: Option<Vec<crate::exec::gpu::DevSample>> = if e.dev_sample_enabled() {
-                let cap = e.batch();
-                let mut v = vec![crate::exec::gpu::DevSample::greedy(); cap];
-                for &(i, _) in &feeds {
-                    if let Some(slot) = slots[i].as_ref() {
-                        if let Some(spec) = dev_sample_spec(slot) {
-                            v[i] = spec;
-                        }
-                    }
-                }
-                Some(v)
-            } else {
-                None
-            };
-            let step_res = e.step_slots_sampled(&feeds, dev_specs.as_deref(), &mut toks);
-            match step_res {
-                Ok(()) => {
-                    for (&(i, _), &argmax_tok) in feeds.iter().zip(toks.iter()) {
-                        let slot_opt = &mut slots[i];
-                        let Some(slot) = slot_opt.as_mut() else {
-                            continue;
-                        };
-                        // Device-sampled rows already hold their final token in
-                        // `argmax_tok` (the sampler wrote in.ids); skip the host
-                        // resample.
-                        let was_dev = dev_specs
-                            .as_ref()
-                            .map(|_| dev_sample_spec(slot).is_some())
-                            .unwrap_or(false);
-                        let finished = if was_dev {
-                            Ok(argmax_tok)
-                        } else {
-                            gpu_finish_token(&mut *e, i, slot, argmax_tok)
-                        };
-                        match finished {
-                            Ok(token) => {
-                                tracing::debug!(token, slot = i, step = slot.step, "gpu: token");
-                                handle_produced_token(
-                                    slot_opt,
-                                    &arena,
-                                    bundle,
-                                    token,
-                                    1,
-                                    &mut tokens_this_tick,
-                                    Some(stop.as_slice()),
-                                );
-                            }
-                            Err(err) => {
-                                tracing::warn!(slot = i, error = %err, "gpu: sample failed");
-                                if let Some(taken) = slot_opt.take() {
-                                    release_kv(&arena, taken.kv);
-                                    let _ = taken.respond.try_send(StreamChunk::Err(err));
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    // The batched launch failed — every fed slot loses.
-                    tracing::warn!(error = %err, fed = feeds.len(), "gpu: decode launch failed");
-                    let msg = err.to_string();
-                    for &(i, _) in &feeds {
-                        if let Some(taken) = slots[i].take() {
-                            release_kv(&arena, taken.kv);
-                            let _ = taken
-                                .respond
-                                .try_send(StreamChunk::Err(crate::RuntimeError::Msg(msg.clone())));
-                        }
-                    }
-                }
+            if let Some(dt) = dec_t {
+                packlog::record(
+                    pack_prefill_ns,
+                    dt.elapsed().as_nanos() as u64,
+                    did_prefill,
+                    pack_had_feeds,
+                    feeds.len(),
+                );
             }
-            obs.host.slot_tokens = toks;
-        }
-        if let Some(dt) = dec_t {
-            packlog::record(
-                pack_prefill_ns,
-                dt.elapsed().as_nanos() as u64,
-                did_prefill,
-                pack_had_feeds,
-                feeds.len(),
-            );
-        }
-        return (slots, bufs, obs, tokens_this_tick, did_prefill);
+            return (slots, bufs, obs, tokens_this_tick, did_prefill);
         }
 
         // gfx950: B independent sequence slots, one decode dispatch for all of
@@ -1235,18 +1251,23 @@ fn run_one_tick(
                 if let Some(taken) = slot_opt.take() {
                     tracing::warn!("amd: slot past engine batch rejected");
                     release_kv(&arena, taken.kv);
-                    let _ = taken.respond.try_send(StreamChunk::Err(
-                        crate::RuntimeError::Rejected(format!(
-                            "AMD engine serves {b} sequence slots"
-                        )),
-                    ));
+                    let _ =
+                        taken
+                            .respond
+                            .try_send(StreamChunk::Err(crate::RuntimeError::Rejected(format!(
+                                "AMD engine serves {b} sequence slots"
+                            ))));
                 }
             }
 
             // Client gone — don't spend a launch on a dead stream, and free its
             // engine slot so the next arrival can have it.
             for i in 0..b.min(slots.len()) {
-                if slots[i].as_ref().map(|s| s.respond.is_closed()).unwrap_or(false) {
+                if slots[i]
+                    .as_ref()
+                    .map(|s| s.respond.is_closed())
+                    .unwrap_or(false)
+                {
                     if let Some(taken) = slots[i].take() {
                         release_kv(&arena, taken.kv);
                     }
@@ -1524,9 +1545,9 @@ fn run_one_tick(
                         for &slot_idx in &owner_of_row {
                             if let Some(slot) = slots[slot_idx].take() {
                                 release_kv(&arena, slot.kv);
-                                let _ = slot
-                                    .respond
-                                    .try_send(StreamChunk::Err(crate::RuntimeError::Msg(msg.clone())));
+                                let _ = slot.respond.try_send(StreamChunk::Err(
+                                    crate::RuntimeError::Msg(msg.clone()),
+                                ));
                             }
                         }
                     }
@@ -1547,7 +1568,12 @@ fn run_one_tick(
         // Refresh indirection once per step for the live shape; slots that
         // finish mid-loop drop out but entries stay valid until next refresh.
         obs.clear_tick_traces();
-        refresh_indirection(&mut obs, live_kv_rows(&slots), &arena, kv_pages_range.clone());
+        refresh_indirection(
+            &mut obs,
+            live_kv_rows(&slots),
+            &arena,
+            kv_pages_range.clone(),
+        );
         for slot_opt in slots.iter_mut() {
             let Some(slot) = slot_opt.as_mut() else {
                 continue;
@@ -1555,39 +1581,38 @@ fn run_one_tick(
 
             obs.host.params = slot.gen.params.clone();
 
-            let token_res: Result<(u32, usize)> = if let (Some(bucket), Some(bufs)) =
-                (bucket, bufs.as_mut())
-            {
-                state.step_token(
-                    bucket,
-                    &bufs.pool,
-                    &mut bufs.streams,
-                    &mut obs,
-                    &slot.prompt_ids,
-                    &slot.out_ids,
-                    slot.step,
-                    bufs.vocab,
-                )
-            } else {
-                // No bucket in the bundle — direct-sample against reference
-                // logits. Matches the fallback in generate_with_bucket.
-                obs.host.tokens.clear();
-                obs.host.rng01 =
-                    crate::serve::seeded_unit(&slot.prompt_ids, &slot.out_ids, slot.step);
-                crate::serve::reference_logits(
-                    &slot.prompt_ids,
-                    &slot.out_ids,
-                    vocab,
-                    &mut obs.host.logits,
-                );
-                let tok = crate::text::sample::sample(
-                    &obs.host.logits,
-                    &obs.host.params,
-                    None,
-                    obs.host.rng01,
-                );
-                Ok((tok, 0))
-            };
+            let token_res: Result<(u32, usize)> =
+                if let (Some(bucket), Some(bufs)) = (bucket, bufs.as_mut()) {
+                    state.step_token(
+                        bucket,
+                        &bufs.pool,
+                        &mut bufs.streams,
+                        &mut obs,
+                        &slot.prompt_ids,
+                        &slot.out_ids,
+                        slot.step,
+                        bufs.vocab,
+                    )
+                } else {
+                    // No bucket in the bundle — direct-sample against reference
+                    // logits. Matches the fallback in generate_with_bucket.
+                    obs.host.tokens.clear();
+                    obs.host.rng01 =
+                        crate::serve::seeded_unit(&slot.prompt_ids, &slot.out_ids, slot.step);
+                    crate::serve::reference_logits(
+                        &slot.prompt_ids,
+                        &slot.out_ids,
+                        vocab,
+                        &mut obs.host.logits,
+                    );
+                    let tok = crate::text::sample::sample(
+                        &obs.host.logits,
+                        &obs.host.params,
+                        None,
+                        obs.host.rng01,
+                    );
+                    Ok((tok, 0))
+                };
 
             match token_res {
                 Ok((token, exec)) => {
@@ -1812,7 +1837,9 @@ fn gpu_prefill_batched_pass(
         // fires this tick; the rest continue next tick (with decoders live).
         let any_ready = slots.iter().take(cap).any(|s| {
             s.as_ref()
-                .map(|s| s.step == 0 && !s.prompt_ids.is_empty() && s.pf_pos + 1 == s.prompt_ids.len())
+                .map(|s| {
+                    s.step == 0 && !s.prompt_ids.is_empty() && s.pf_pos + 1 == s.prompt_ids.len()
+                })
                 .unwrap_or(false)
         });
         if any_ready {
@@ -1921,12 +1948,7 @@ fn gpu_finish_token(
         e.logits_row(row, &mut logits)?;
         crate::text::sample::apply_penalties(&mut logits, &slot.out_ids, &slot.gen.params);
         let rng = seeded_unit(&slot.prompt_ids, &slot.out_ids, slot.step);
-        let tok = crate::text::sample::sample(
-            &logits,
-            &slot.gen.params,
-            None,
-            rng,
-        );
+        let tok = crate::text::sample::sample(&logits, &slot.gen.params, None, rng);
         e.return_logits_buf(logits);
         return Ok(tok);
     }

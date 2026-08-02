@@ -76,10 +76,10 @@ fn verifier_present() -> bool {
 #[test]
 fn gemma_family_compiles_on_mi350x() {
     for (name, path) in gemma_examples() {
-        let json = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{name}: read failed: {e}"));
-        let net: NetConfig = serde_json::from_str(&json)
-            .unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
+        let json =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: read failed: {e}"));
+        let net: NetConfig =
+            serde_json::from_str(&json).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
 
         let out = std::env::temp_dir().join(format!(
             "plowc-gemma-mi350x-{}-{}",
@@ -130,11 +130,7 @@ fn gemma_family_compiles_on_mi350x() {
                 "{name}/{}: no instructions",
                 b.packet_file
             );
-            assert!(
-                b.makespan > 0,
-                "{name}/{}: zero makespan",
-                b.packet_file
-            );
+            assert!(b.makespan > 0, "{name}/{}: zero makespan", b.packet_file);
         }
 
         // Weight layout unification across buckets: expected for dense models,
@@ -149,10 +145,7 @@ fn gemma_family_compiles_on_mi350x() {
 
         // Assets file was produced.
         let assets = report.assets.as_ref().expect("assets summary");
-        assert!(
-            assets.regions.total_hbm_peak > 0,
-            "{name}: zero HBM peak"
-        );
+        assert!(assets.regions.total_hbm_peak > 0, "{name}: zero HBM peak");
         // MI350X has 288 GiB — ensure we don't exceed it.
         let hbm_288g: u64 = 288 * 1024 * 1024 * 1024;
         assert!(
@@ -173,10 +166,22 @@ fn gemma_family_compiles_on_mi350x() {
         );
 
         // Verify output directory has expected files.
-        assert!(out.join("weights.json").exists(), "{name}: missing weights.json");
-        assert!(out.join("assets.json").exists(), "{name}: missing assets.json");
-        assert!(out.join("footprint.json").exists(), "{name}: missing footprint.json");
-        assert!(out.join("footprint.csv").exists(), "{name}: missing footprint.csv");
+        assert!(
+            out.join("weights.json").exists(),
+            "{name}: missing weights.json"
+        );
+        assert!(
+            out.join("assets.json").exists(),
+            "{name}: missing assets.json"
+        );
+        assert!(
+            out.join("footprint.json").exists(),
+            "{name}: missing footprint.json"
+        );
+        assert!(
+            out.join("footprint.csv").exists(),
+            "{name}: missing footprint.csv"
+        );
 
         // Clean up.
         std::fs::remove_dir_all(&out).ok();
@@ -192,10 +197,7 @@ fn mi350x_prefill_uses_wide_tiles() {
     let net: NetConfig = serde_json::from_str(&json).expect("parse");
 
     // Single large prefill bucket to inspect tile choices.
-    let out = std::env::temp_dir().join(format!(
-        "plowc-tile-check-{}",
-        std::process::id()
-    ));
+    let out = std::env::temp_dir().join(format!("plowc-tile-check-{}", std::process::id()));
     let opts = Options {
         no_tuning: false,
         tuning_db: None,
@@ -231,10 +233,7 @@ fn mi350x_prefill_uses_wide_tiles() {
     // A BN=32 tiling of N=3072 would give 96 tiles per row; BN=64 gives 48.
     // With wide tiles the task count should be meaningfully lower than with
     // BN=32 (fewer, larger tiles).
-    assert!(
-        b.tasks > 0,
-        "zero tasks — tiling produced nothing"
-    );
+    assert!(b.tasks > 0, "zero tasks — tiling produced nothing");
 
     std::fs::remove_dir_all(&out).ok();
 }

@@ -32,7 +32,8 @@ fn opts(out: PathBuf) -> Options {
         lean_oracle: false,
         emit_sample: false,
         emit_tokenize: false,
-        emit_trace: false,        kv: Default::default(),
+        emit_trace: false,
+        kv: Default::default(),
         weight_dtype_override: None,
     }
 }
@@ -53,13 +54,23 @@ fn all_examples_compile_to_packets() {
         let net: NetConfig = serde_json::from_str(&json)
             .unwrap_or_else(|e| panic!("{}: parse failed: {e}", path.display()));
 
-        let out = std::env::temp_dir().join(format!("plowc-ex-{}-{}", std::process::id(), net.name));
+        let out =
+            std::env::temp_dir().join(format!("plowc-ex-{}-{}", std::process::id(), net.name));
         let report = compile(&Source::Net(net), &opts(out.clone()))
             .unwrap_or_else(|e| panic!("{}: compile failed: {e}", path.display()));
 
-        assert_eq!(report.buckets.len(), 1, "{}: expected one bucket", path.display());
+        assert_eq!(
+            report.buckets.len(),
+            1,
+            "{}: expected one bucket",
+            path.display()
+        );
         let b = &report.buckets[0];
-        assert!(b.packet_bytes > 0, "{}: empty packet stream", path.display());
+        assert!(
+            b.packet_bytes > 0,
+            "{}: empty packet stream",
+            path.display()
+        );
         assert!(b.instructions > 0, "{}: no instructions", path.display());
         assert!(b.makespan > 0, "{}: zero makespan estimate", path.display());
 

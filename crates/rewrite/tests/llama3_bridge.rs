@@ -81,7 +81,7 @@ fn llama3_8b_fusions_fire() {
 
 #[test]
 fn llama3_8b_bridge_preserves_weights_and_bf16() {
-    use costmodel::{hwspec, DEFAULT_PAGE_BYTES, Soc, SramPolicy};
+    use costmodel::{hwspec, Soc, SramPolicy, DEFAULT_PAGE_BYTES};
     use rewrite::assemble;
 
     let mut g = build_from_config_json(LLAMA3_8B).expect("build llama3 8b");

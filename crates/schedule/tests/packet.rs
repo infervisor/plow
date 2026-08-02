@@ -2,7 +2,7 @@
 //! `packet::Inst` (kernel opcode + only-needed parameters + counter windows),
 //! and the program round-trips through the compact wire format.
 
-use costmodel::{hwspec, DEFAULT_PAGE_BYTES, GemmShape, RowShape, Soc, SramPolicy};
+use costmodel::{hwspec, GemmShape, RowShape, Soc, SramPolicy, DEFAULT_PAGE_BYTES};
 use rewrite::{assemble, LayerPlan, OpKind, OpSpec};
 use schedule::packet::{Body, Opcode, Program};
 use schedule::{emit_program, schedule, Config};

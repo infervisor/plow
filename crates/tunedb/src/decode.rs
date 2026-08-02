@@ -432,7 +432,10 @@ pub fn rank_by_cell(records: Vec<DecodeMeasurement>) -> Vec<CellRanking> {
         .into_values()
         .map(|(cell, mut ranked)| {
             ranked.sort_by(|a, b| {
-                a.stats.median_ns.partial_cmp(&b.stats.median_ns).expect("finite medians")
+                a.stats
+                    .median_ns
+                    .partial_cmp(&b.stats.median_ns)
+                    .expect("finite medians")
             });
             CellRanking { cell, ranked }
         })
@@ -514,17 +517,26 @@ mod tests {
     /// from what the sweep compiled, every stored number is unreproducible.
     #[test]
     fn knobs_render_the_flags_that_rebuild_them() {
-        let k = DecodeKnobs { gv_unroll_glu: 2, ..knobs(2, 264, 4, 32) };
+        let k = DecodeKnobs {
+            gv_unroll_glu: 2,
+            ..knobs(2, 264, 4, 32)
+        };
         let d = k.defines();
         assert!(d.contains(&"-DPLOW_NV_FORCE_MINBLK=2".to_string()));
         assert!(d.contains(&"-DGV_UNROLL=4".to_string()));
         assert!(d.contains(&"-DGV_UNROLL_GLU=2".to_string()));
         assert!(d.contains(&"-DPLOW_MOE_DOWN_SG=4u".to_string()));
-        assert_eq!(k.label(), "mb2_ncu264_un4_glu2_mun2_sg4_mmd_ns32_nsf0_wprd_gfd_gffd_kund");
+        assert_eq!(
+            k.label(),
+            "mb2_ncu264_un4_glu2_mun2_sg4_mmd_ns32_nsf0_wprd_gfd_gffd_kund"
+        );
 
         // 0 means "leave the source default alone" — emitting `-DGV_UNROLL_GLU=0`
         // would silently compile a different kernel than the one measured.
-        assert!(!knobs(1, 132, 8, 16).defines().iter().any(|s| s.contains("GLU")));
+        assert!(!knobs(1, 132, 8, 16)
+            .defines()
+            .iter()
+            .any(|s| s.contains("GLU")));
     }
 
     /// A flash-tuned record must rebuild its own object too, or the second knob
@@ -561,7 +573,14 @@ mod tests {
         assert!(!plain.emit_env().iter().any(|s| s.contains("NS_FULL")));
 
         // Two objects differing only in a flash knob must not share a label.
-        assert_ne!(k.label(), DecodeKnobs { fa_gf_full: Some(4), ..k }.label());
+        assert_ne!(
+            k.label(),
+            DecodeKnobs {
+                fa_gf_full: Some(4),
+                ..k
+            }
+            .label()
+        );
     }
 
     /// The occupancy pair is one knob. A mismatched pair is not a slow
@@ -604,7 +623,10 @@ mod tests {
     /// which is how a campaign asset came to ship `=16` while serving B=8.
     #[test]
     fn cells_do_not_mix_batch() {
-        let mm = |x: u32| DecodeKnobs { gv_mm_max: Some(x), ..knobs(1, 132, 8, 16) };
+        let mm = |x: u32| DecodeKnobs {
+            gv_mm_max: Some(x),
+            ..knobs(1, 132, 8, 16)
+        };
         let ranked = rank_by_cell(vec![
             // B=8: the narrow rung wins (no spill tax, one extra weight pass).
             meas_b(132, 8, 1024, mm(8), 22.53),
@@ -641,19 +663,33 @@ mod tests {
         let no_batch = r#"{"hardware":"nvidia/sm_90a/h100-nvl","dtype":"fp8","n_cu":132,
                            "ctx_bucket":"1k","model":"gemma-4-26B-A4B-it"}"#;
         let e = serde_json::from_str::<DecodeCell>(no_batch).expect_err("must not load");
-        assert!(e.to_string().contains("batch"), "the error names the missing field: {e}");
+        assert!(
+            e.to_string().contains("batch"),
+            "the error names the missing field: {e}"
+        );
         let with_batch = r#"{"hardware":"nvidia/sm_90a/h100-nvl","dtype":"fp8","n_cu":132,
                              "ctx_bucket":"1k","model":"gemma-4-26B-A4B-it","batch":1}"#;
-        assert_eq!(serde_json::from_str::<DecodeCell>(with_batch).unwrap().batch, 1);
+        assert_eq!(
+            serde_json::from_str::<DecodeCell>(with_batch)
+                .unwrap()
+                .batch,
+            1
+        );
     }
 
     /// `GV_MM_MAX` must rebuild its own object, and "unset" must emit no flag —
     /// a `-DGV_MM_MAX=0` would instantiate no rung at all.
     #[test]
     fn the_batched_gemv_rung_renders_its_flag_and_absence_renders_nothing() {
-        let k = DecodeKnobs { gv_mm_max: Some(16), ..knobs(1, 132, 8, 16) };
+        let k = DecodeKnobs {
+            gv_mm_max: Some(16),
+            ..knobs(1, 132, 8, 16)
+        };
         assert!(k.defines().contains(&"-DGV_MM_MAX=16".to_string()));
-        assert!(!knobs(1, 132, 8, 16).defines().iter().any(|s| s.contains("GV_MM_MAX")));
+        assert!(!knobs(1, 132, 8, 16)
+            .defines()
+            .iter()
+            .any(|s| s.contains("GV_MM_MAX")));
         assert_ne!(k.label(), knobs(1, 132, 8, 16).label());
     }
 
@@ -688,7 +724,10 @@ mod tests {
         b.stats = Stats::from_samples(vec![5.9e6, 6.0e6, 6.05e6, 6.2e6, 6.4e6]).unwrap();
         let ranked = rank_by_cell(vec![a, b]);
         assert!(ranked[0].margin_ms().is_some());
-        assert!(!ranked[0].winner_is_decisive(), "0.01 ms apart with ~0.35 ms jitter");
+        assert!(
+            !ranked[0].winner_is_decisive(),
+            "0.01 ms apart with ~0.35 ms jitter"
+        );
     }
 
     /// Same gate as a kernel measurement: fast-but-unchecked never qualifies.
@@ -713,7 +752,8 @@ mod tests {
     #[test]
     fn a_new_op_family_rides_the_extra_maps() {
         let mut k = knobs(2, 264, 4, 32);
-        k.extra_defines.insert("PLOW_NV_FUTURE_OP".into(), "3".into());
+        k.extra_defines
+            .insert("PLOW_NV_FUTURE_OP".into(), "3".into());
         k.extra_emit.insert("PLOW_FUTURE_EMIT".into(), "7".into());
         let d = k.defines();
         assert!(d.contains(&"-DPLOW_NV_FUTURE_OP=3".to_string()));
@@ -739,9 +779,14 @@ mod tests {
         let k = knobs(2, 264, 4, 32);
         assert!(k.defines_for(Backend::Nvidia).is_some());
         assert!(k.defines_for(Backend::Hsa).is_none());
-        assert_eq!(Backend::from_hardware("nvidia/sm_90a/h100-nvl"), Some(Backend::Nvidia));
-        assert_eq!(Backend::from_hardware("amd/gfx950/mi355x"), Some(Backend::Hsa));
+        assert_eq!(
+            Backend::from_hardware("nvidia/sm_90a/h100-nvl"),
+            Some(Backend::Nvidia)
+        );
+        assert_eq!(
+            Backend::from_hardware("amd/gfx950/mi355x"),
+            Some(Backend::Hsa)
+        );
         assert_eq!(Backend::from_hardware("acme/tpu"), None);
     }
-
 }

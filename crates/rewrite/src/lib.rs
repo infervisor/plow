@@ -9,21 +9,21 @@
 //! interval-conflict constraints (design §8.5). `nn_graph` stays egglog-agnostic
 //! — the dependency lives only here.
 
-pub mod oracle;
 pub mod bridge;
 pub mod collapse;
 pub mod explore;
 mod extract;
 pub mod footprint;
 mod lower;
+pub mod oracle;
 pub mod tile;
 pub mod tilegraph;
 
 pub use bridge::{plan_from_all_blocks, plan_from_block, plan_from_fused, BridgeError};
 pub use collapse::{collapse, try_collapse, CollapseError};
 pub use explore::{
-    best_chunk_count, best_chunk_count_egglog, chunk_prefill_cycles, explore_tiles, ChunkCostIn,
-    Choice, GemmJob,
+    best_chunk_count, best_chunk_count_egglog, chunk_prefill_cycles, explore_tiles, Choice,
+    ChunkCostIn, GemmJob,
 };
 pub use extract::{Arg, FNode, FusedGraph};
 pub use footprint::{footprints, Footprint, OpIo, TensorSlice, TileDomain};
@@ -33,9 +33,9 @@ pub use tile::{lower_gemm, TileNode, TileSeq};
 /// [`tile::TileNode`].
 pub use tilegraph::TileNode as GraphNode;
 pub use tilegraph::{
-    assemble, consumer_thresholds, materialize_tile_deps, AxisCouple, Compute, ConstraintSet,
-    ConcatGroup, Handoff, HandoffKind, LayerPlan, LayoutSpec, LocalityReq, MatEdge, OpDesc, OpKind,
-    OpSpec, RelaxableHandoff, TileDep, TileDependency, TileGraph, LAYOUT_RANK,
+    assemble, consumer_thresholds, materialize_tile_deps, AxisCouple, Compute, ConcatGroup,
+    ConstraintSet, Handoff, HandoffKind, LayerPlan, LayoutSpec, LocalityReq, MatEdge, OpDesc,
+    OpKind, OpSpec, RelaxableHandoff, TileDep, TileDependency, TileGraph, LAYOUT_RANK,
 };
 
 use nn_graph::Graph;

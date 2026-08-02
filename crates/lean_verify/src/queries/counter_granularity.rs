@@ -55,9 +55,7 @@ pub fn query_counter_granularity(
 ) -> Result<CounterGranularityResult, VerifyError> {
     let payload = serde_json::to_value(req).map_err(VerifyError::SerializeRequest)?;
     let result: QueryResult = query("counter_granularity", payload)?;
-    let decisions: CounterGranularityResult =
-        serde_json::from_value(result.answer).map_err(|e| {
-            VerifyError::DeserializeQueryResult(e, "counter_granularity answer".into())
-        })?;
+    let decisions: CounterGranularityResult = serde_json::from_value(result.answer)
+        .map_err(|e| VerifyError::DeserializeQueryResult(e, "counter_granularity answer".into()))?;
     Ok(decisions)
 }

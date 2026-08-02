@@ -144,10 +144,7 @@ pub fn analyze_temporal_fit(
         }
         // Only handoffs that had a SramSameSm alternative are candidates for
         // temporal promotion.
-        let Some(&(_, sram_cost)) = r
-            .alts
-            .iter()
-            .find(|&&(k, _)| k == HandoffKind::SramSameSm)
+        let Some(&(_, sram_cost)) = r.alts.iter().find(|&&(k, _)| k == HandoffKind::SramSameSm)
         else {
             continue;
         };
@@ -429,16 +426,13 @@ mod tests {
         cons.placement.insert(20, 0);
         cons.sram_pages.insert(10, 25); // producer needs 25 pages
         cons.sram_pages.insert(20, 25); // consumer needs 25 pages
-        // sum = 50 > 40 (would have been demoted), max = 25 ≤ 40 (fits temporally)
+                                        // sum = 50 > 40 (would have been demoted), max = 25 ≤ 40 (fits temporally)
         cons.relaxables.push(RelaxableHandoff {
             producer: 10,
             consumer: 20,
             tensor: "T".into(),
             default: HandoffKind::Hbm,
-            alts: vec![
-                (HandoffKind::Hbm, 500),
-                (HandoffKind::SramSameSm, 20),
-            ],
+            alts: vec![(HandoffKind::Hbm, 500), (HandoffKind::SramSameSm, 20)],
         });
 
         let m = s.machine.clone();
@@ -487,10 +481,7 @@ mod tests {
             consumer: 20,
             tensor: "T".into(),
             default: HandoffKind::Hbm,
-            alts: vec![
-                (HandoffKind::Hbm, 500),
-                (HandoffKind::SramSameSm, 20),
-            ],
+            alts: vec![(HandoffKind::Hbm, 500), (HandoffKind::SramSameSm, 20)],
         });
 
         let rep = analyze_temporal_fit(&s, &cons, &m);
@@ -522,10 +513,7 @@ mod tests {
             consumer: 20,
             tensor: "T".into(),
             default: HandoffKind::Hbm,
-            alts: vec![
-                (HandoffKind::Hbm, 500),
-                (HandoffKind::SramSameSm, 20),
-            ],
+            alts: vec![(HandoffKind::Hbm, 500), (HandoffKind::SramSameSm, 20)],
         });
 
         let rep = analyze_temporal_fit(&s, &cons, &m);

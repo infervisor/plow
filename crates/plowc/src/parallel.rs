@@ -41,7 +41,12 @@ impl ModelSpec {
 /// device count available. Returns a config where `tp * pp * ep * dp == num_devices`.
 pub fn derive_parallel(model: &ModelSpec, gpu_mem_bytes: u64, num_devices: u32) -> ParallelConfig {
     if num_devices <= 1 {
-        return ParallelConfig { tp: 1, pp: 1, ep: 1, dp: 1 };
+        return ParallelConfig {
+            tp: 1,
+            pp: 1,
+            ep: 1,
+            dp: 1,
+        };
     }
 
     // Estimate activation + KV overhead for a generous context window (8k tokens).
@@ -178,14 +183,22 @@ mod tests {
         }
     }
 
-    const H100_MEM: u64 = 80 * (1u64 << 30);   // 80 GiB
-    const MI350_MEM: u64 = 288 * (1u64 << 30);  // 288 GiB
-    const B200_MEM: u64 = 192 * (1u64 << 30);   // 192 GiB
+    const H100_MEM: u64 = 80 * (1u64 << 30); // 80 GiB
+    const MI350_MEM: u64 = 288 * (1u64 << 30); // 288 GiB
+    const B200_MEM: u64 = 192 * (1u64 << 30); // 192 GiB
 
     #[test]
     fn gemma4_31b_on_1x_mi350_fits_tp1() {
         let cfg = derive_parallel(&gemma4_31b(), MI350_MEM, 1);
-        assert_eq!(cfg, ParallelConfig { tp: 1, pp: 1, ep: 1, dp: 1 });
+        assert_eq!(
+            cfg,
+            ParallelConfig {
+                tp: 1,
+                pp: 1,
+                ep: 1,
+                dp: 1
+            }
+        );
     }
 
     #[test]
@@ -217,13 +230,26 @@ mod tests {
     #[test]
     fn validate_bad_tp() {
         let model = gemma4_31b();
-        let bad = ParallelConfig { tp: 3, pp: 1, ep: 1, dp: 1 };
+        let bad = ParallelConfig {
+            tp: 3,
+            pp: 1,
+            ep: 1,
+            dp: 1,
+        };
         assert!(validate(&model, &bad, H100_MEM).is_err());
     }
 
     #[test]
     fn single_device_returns_trivial() {
         let cfg = derive_parallel(&gemma4_31b(), H100_MEM, 1);
-        assert_eq!(cfg, ParallelConfig { tp: 1, pp: 1, ep: 1, dp: 1 });
+        assert_eq!(
+            cfg,
+            ParallelConfig {
+                tp: 1,
+                pp: 1,
+                ep: 1,
+                dp: 1
+            }
+        );
     }
 }

@@ -89,7 +89,10 @@ macro_rules! env_usize {
         pub(crate) fn $name() -> usize {
             static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
             *V.get_or_init(|| {
-                match std::env::var($var).ok().and_then(|v| v.parse::<usize>().ok()) {
+                match std::env::var($var)
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                {
                     Some(0) => usize::MAX,
                     Some(n) => n,
                     None => $d,
@@ -101,7 +104,10 @@ macro_rules! env_usize {
         pub(crate) fn $name() -> usize {
             static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
             *V.get_or_init(|| {
-                std::env::var($var).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or($d)
+                std::env::var($var)
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or($d)
             })
         }
     };

@@ -40,10 +40,7 @@ pub struct EdgeGranularity {
 /// The Rust heuristic: use fine counters unless ALL consumer tiles have uniform
 /// work (same duration), in which case coarse counters suffice (the collapse
 /// theorem guarantees equivalent makespan).
-pub fn query_counter_granularity(
-    tg: &TaskGraph,
-    lean_oracle: bool,
-) -> Vec<EdgeGranularity> {
+pub fn query_counter_granularity(tg: &TaskGraph, lean_oracle: bool) -> Vec<EdgeGranularity> {
     // Group edges by (producer_node, consumer_node).
     let mut groups: HashMap<(usize, usize), Vec<(TaskId, TaskId)>> = HashMap::new();
     for &(a, b) in &tg.edges {
@@ -95,9 +92,7 @@ fn try_lean_counter_granularity(
     tg: &TaskGraph,
     groups: &HashMap<(usize, usize), Vec<(TaskId, TaskId)>>,
 ) -> Option<Vec<EdgeGranularity>> {
-    use lean_verify::queries::counter_granularity::{
-        CounterGranularityRequest, EdgeQuery,
-    };
+    use lean_verify::queries::counter_granularity::{CounterGranularityRequest, EdgeQuery};
 
     let mut edge_queries = Vec::new();
     let mut id_to_key: HashMap<u64, (usize, usize)> = HashMap::new();
@@ -292,10 +287,7 @@ fn compute_critical_path(tg: &TaskGraph) -> Cycle {
     }
 
     // Critical path = max(dist[u] + dur[u]) over all tasks.
-    (0..n)
-        .map(|u| dist[u] + tg.tasks[u].dur)
-        .max()
-        .unwrap_or(0)
+    (0..n).map(|u| dist[u] + tg.tasks[u].dur).max().unwrap_or(0)
 }
 
 #[cfg(feature = "lean-verify")]
@@ -307,7 +299,7 @@ fn try_lean_lower_bound(
     total_flops: u64,
     peak_flops_per_cycle: u64,
 ) -> Option<LowerBound> {
-    use lean_verify::queries::lower_bound::{LowerBoundRequest, BindingConstraint as LeanBC};
+    use lean_verify::queries::lower_bound::{BindingConstraint as LeanBC, LowerBoundRequest};
 
     let req = LowerBoundRequest {
         edges: tg.edges.clone(),
@@ -583,8 +575,7 @@ pub fn run_oracle(
         0.0
     };
 
-    let any_certified = lower_bound.certified
-        || prefetch_depths.iter().any(|p| p.certified);
+    let any_certified = lower_bound.certified || prefetch_depths.iter().any(|p| p.certified);
 
     let report = OracleReport {
         lower_bound,
@@ -642,7 +633,7 @@ mod tests {
             make_task(TaskKind::Compute, 5, 0),
         ];
         tg.edges = vec![(0, 2), (1, 2)]; // both feed task 2
-        // Path 0→2: 10+5=15, path 1→2: 100+5=105
+                                         // Path 0→2: 10+5=15, path 1→2: 100+5=105
         assert_eq!(compute_critical_path(&tg), 105);
     }
 
@@ -692,8 +683,8 @@ mod tests {
     fn prefetch_depth_ratio() {
         let mut tg = TaskGraph::default();
         tg.tasks = vec![
-            make_task(TaskKind::DmaIn, 30, 100),  // task 0
-            make_task(TaskKind::Compute, 10, 0),  // task 1
+            make_task(TaskKind::DmaIn, 30, 100), // task 0
+            make_task(TaskKind::Compute, 10, 0), // task 1
         ];
 
         // Build a minimal schedule with both tasks on unit 0.

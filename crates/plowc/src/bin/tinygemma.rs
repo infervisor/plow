@@ -71,7 +71,9 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(256);
-    let out = std::env::args().nth(2).unwrap_or_else(|| "tinygemma.pkt".into());
+    let out = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "tinygemma.pkt".into());
 
     let mut b = Builder::new(n_cu);
 
@@ -106,10 +108,19 @@ fn main() {
     let logits = b.tensor("logits", (T * VOCAB) as u64 * BF16);
 
     struct LW {
-        wq: u32, wk: u32, wv: u32, wo: u32,
-        wg: u32, wu: u32, wd: u32,
-        g_in: u32, g_pa: u32, g_pf: u32, g_po: u32,
-        qn: u32, kn: u32,
+        wq: u32,
+        wk: u32,
+        wv: u32,
+        wo: u32,
+        wg: u32,
+        wu: u32,
+        wd: u32,
+        g_in: u32,
+        g_pa: u32,
+        g_pf: u32,
+        g_po: u32,
+        qn: u32,
+        kn: u32,
     }
     let lw: Vec<LW> = (0..LAYERS)
         .map(|l| LW {
@@ -141,8 +152,11 @@ fn main() {
     // embed: x = emb[ids] * bf16(sqrt(H))
     let embed_scale = bf16_round((H as f32).sqrt());
     let mut dep = b.emit(DevOp::Embed, row_cus.clone(), &[], |d| {
-        d.t[0] = x; d.t[1] = emb; d.t[2] = ids;
-        d.i[0] = T; d.i[1] = H;
+        d.t[0] = x;
+        d.t[1] = emb;
+        d.t[2] = ids;
+        d.i[0] = T;
+        d.i[1] = H;
         d.f[0] = embed_scale;
     });
 
@@ -151,8 +165,12 @@ fn main() {
 
         // ---- attention ----
         let c_norm = b.emit(DevOp::RmsNorm, row_cus.clone(), &[dep], |d| {
-            d.t[0] = hn; d.t[1] = x; d.t[2] = w.g_in;
-            d.i[0] = T; d.i[1] = H; d.f[0] = EPS;
+            d.t[0] = hn;
+            d.t[1] = x;
+            d.t[2] = w.g_in;
+            d.i[0] = T;
+            d.i[1] = H;
+            d.f[0] = EPS;
         });
 
         // q, k, v are independent: give them disjoint CUs so they OVERLAP.
@@ -161,90 +179,176 @@ fn main() {
         let tv = tk;
         let (cq, ck, cv) = three_way(n_cu, tq, tk, tv);
         let c_q = b.emit(DevOp::Gemm, cq, &[c_norm], |d| {
-            d.t[0] = qg; d.t[1] = hn; d.t[2] = w.wq;
-            d.i[0] = T; d.i[1] = QDIM; d.i[2] = H;
+            d.t[0] = qg;
+            d.t[1] = hn;
+            d.t[2] = w.wq;
+            d.i[0] = T;
+            d.i[1] = QDIM;
+            d.i[2] = H;
         });
         let c_k = b.emit(DevOp::Gemm, ck, &[c_norm], |d| {
-            d.t[0] = kg; d.t[1] = hn; d.t[2] = w.wk;
-            d.i[0] = T; d.i[1] = KVDIM; d.i[2] = H;
+            d.t[0] = kg;
+            d.t[1] = hn;
+            d.t[2] = w.wk;
+            d.i[0] = T;
+            d.i[1] = KVDIM;
+            d.i[2] = H;
         });
         let c_v = b.emit(DevOp::Gemm, cv, &[c_norm], |d| {
-            d.t[0] = vg; d.t[1] = hn; d.t[2] = w.wv;
-            d.i[0] = T; d.i[1] = KVDIM; d.i[2] = H;
+            d.t[0] = vg;
+            d.t[1] = hn;
+            d.t[2] = w.wv;
+            d.i[0] = T;
+            d.i[1] = KVDIM;
+            d.i[2] = H;
         });
 
         // q_norm + RoPE, k_norm + RoPE, and v_norm (weightless, NO RoPE).
         let c_qn = b.emit(DevOp::HeadNormRope, all.clone(), &[c_q], |d| {
-            d.t[0] = q; d.t[1] = qg; d.t[2] = w.qn; d.t[3] = cos; d.t[4] = sin; d.t[5] = pos;
-            d.i[0] = T; d.i[1] = N_HEAD; d.i[2] = HD; d.i[3] = 0; d.f[0] = EPS;
+            d.t[0] = q;
+            d.t[1] = qg;
+            d.t[2] = w.qn;
+            d.t[3] = cos;
+            d.t[4] = sin;
+            d.t[5] = pos;
+            d.i[0] = T;
+            d.i[1] = N_HEAD;
+            d.i[2] = HD;
+            d.i[3] = 0;
+            d.f[0] = EPS;
         });
         let c_kn = b.emit(DevOp::HeadNormRope, all.clone(), &[c_k], |d| {
-            d.t[0] = k; d.t[1] = kg; d.t[2] = w.kn; d.t[3] = cos; d.t[4] = sin; d.t[5] = pos;
-            d.i[0] = T; d.i[1] = N_KV_HEAD; d.i[2] = HD; d.i[3] = 0; d.f[0] = EPS;
+            d.t[0] = k;
+            d.t[1] = kg;
+            d.t[2] = w.kn;
+            d.t[3] = cos;
+            d.t[4] = sin;
+            d.t[5] = pos;
+            d.i[0] = T;
+            d.i[1] = N_KV_HEAD;
+            d.i[2] = HD;
+            d.i[3] = 0;
+            d.f[0] = EPS;
         });
         // v_norm: gamma = NONE and cos = NONE. Leaving these set is the classic bug —
         // it applies RoPE to V and still produces fluent text.
         let c_vn = b.emit(DevOp::HeadNormRope, all.clone(), &[c_v], |d| {
-            d.t[0] = v; d.t[1] = vg; /* t2=gamma, t3=cos, t4=sin stay TENSOR_NONE */
+            d.t[0] = v;
+            d.t[1] = vg; /* t2=gamma, t3=cos, t4=sin stay TENSOR_NONE */
             d.t[5] = pos;
-            d.i[0] = T; d.i[1] = N_KV_HEAD; d.i[2] = HD; d.i[3] = 0; d.f[0] = EPS;
+            d.i[0] = T;
+            d.i[1] = N_KV_HEAD;
+            d.i[2] = HD;
+            d.i[3] = 0;
+            d.f[0] = EPS;
         });
 
         let c_fa = b.emit(DevOp::FlashPrefill, all.clone(), &[c_qn, c_kn, c_vn], |d| {
-            d.t[0] = opart; d.t[1] = mlpart; d.t[2] = q; d.t[3] = k; d.t[4] = v;
-            d.i[0] = T; d.i[1] = T; d.i[2] = N_HEAD; d.i[3] = N_KV_HEAD;
-            d.i[4] = 0; d.i[5] = WINDOW[l]; d.i[6] = HD; d.i[7] = NSPLIT;
+            d.t[0] = opart;
+            d.t[1] = mlpart;
+            d.t[2] = q;
+            d.t[3] = k;
+            d.t[4] = v;
+            d.i[0] = T;
+            d.i[1] = T;
+            d.i[2] = N_HEAD;
+            d.i[3] = N_KV_HEAD;
+            d.i[4] = 0;
+            d.i[5] = WINDOW[l];
+            d.i[6] = HD;
+            d.i[7] = NSPLIT;
             d.f[0] = 1.0; // Gemma: NO 1/sqrt(head_dim)
         });
         let c_mg = b.emit(DevOp::FlashMerge, all.clone(), &[c_fa], |d| {
-            d.t[0] = at; d.t[1] = opart; d.t[2] = mlpart;
-            d.i[0] = T; d.i[1] = N_HEAD; d.i[2] = NSPLIT; d.i[3] = HD;
+            d.t[0] = at;
+            d.t[1] = opart;
+            d.t[2] = mlpart;
+            d.i[0] = T;
+            d.i[1] = N_HEAD;
+            d.i[2] = NSPLIT;
+            d.i[3] = HD;
         });
 
         let c_o = b.emit(DevOp::Gemm, all.clone(), &[c_mg], |d| {
-            d.t[0] = og; d.t[1] = at; d.t[2] = w.wo;
-            d.i[0] = T; d.i[1] = H; d.i[2] = QDIM;
+            d.t[0] = og;
+            d.t[1] = at;
+            d.t[2] = w.wo;
+            d.i[0] = T;
+            d.i[1] = H;
+            d.i[2] = QDIM;
         });
         // sandwich: post-norm FIRST, then add the residual.
         let c_on = b.emit(DevOp::RmsNorm, row_cus.clone(), &[c_o], |d| {
-            d.t[0] = on; d.t[1] = og; d.t[2] = w.g_pa;
-            d.i[0] = T; d.i[1] = H; d.f[0] = EPS;
+            d.t[0] = on;
+            d.t[1] = og;
+            d.t[2] = w.g_pa;
+            d.i[0] = T;
+            d.i[1] = H;
+            d.f[0] = EPS;
         });
         let c_r1 = b.emit(DevOp::Residual, all.clone(), &[c_on], |d| {
-            d.t[0] = x; d.t[1] = x; d.t[2] = on;
-            d.i[0] = T * H; d.f[0] = 1.0; // first residual is unscaled
+            d.t[0] = x;
+            d.t[1] = x;
+            d.t[2] = on;
+            d.i[0] = T * H;
+            d.f[0] = 1.0; // first residual is unscaled
         });
 
         // ---- MLP ----
         let c_pf = b.emit(DevOp::RmsNorm, row_cus.clone(), &[c_r1], |d| {
-            d.t[0] = hn; d.t[1] = x; d.t[2] = w.g_pf;
-            d.i[0] = T; d.i[1] = H; d.f[0] = EPS;
+            d.t[0] = hn;
+            d.t[1] = x;
+            d.t[2] = w.g_pf;
+            d.i[0] = T;
+            d.i[1] = H;
+            d.f[0] = EPS;
         });
         // gate and up are independent — overlap them.
         let ti = gemm_tiles(T, I);
         let (cg, cu2) = two_way(n_cu, ti, ti);
         let c_g = b.emit(DevOp::Gemm, cg, &[c_pf], |d| {
-            d.t[0] = gt; d.t[1] = hn; d.t[2] = w.wg;
-            d.i[0] = T; d.i[1] = I; d.i[2] = H;
+            d.t[0] = gt;
+            d.t[1] = hn;
+            d.t[2] = w.wg;
+            d.i[0] = T;
+            d.i[1] = I;
+            d.i[2] = H;
         });
         let c_u = b.emit(DevOp::Gemm, cu2, &[c_pf], |d| {
-            d.t[0] = ut; d.t[1] = hn; d.t[2] = w.wu;
-            d.i[0] = T; d.i[1] = I; d.i[2] = H;
+            d.t[0] = ut;
+            d.t[1] = hn;
+            d.t[2] = w.wu;
+            d.i[0] = T;
+            d.i[1] = I;
+            d.i[2] = H;
         });
         let c_glu = b.emit(DevOp::Glu, all.clone(), &[c_g, c_u], |d| {
-            d.t[0] = fu; d.t[1] = gt; d.t[2] = ut;
-            d.i[0] = T * I; d.i[1] = 0; // 0 = gelu_tanh. Gemma is GeGLU, NOT SwiGLU.
+            d.t[0] = fu;
+            d.t[1] = gt;
+            d.t[2] = ut;
+            d.i[0] = T * I;
+            d.i[1] = 0; // 0 = gelu_tanh. Gemma is GeGLU, NOT SwiGLU.
         });
         let c_d = b.emit(DevOp::Gemm, all.clone(), &[c_glu], |d| {
-            d.t[0] = dg; d.t[1] = fu; d.t[2] = w.wd;
-            d.i[0] = T; d.i[1] = H; d.i[2] = I;
+            d.t[0] = dg;
+            d.t[1] = fu;
+            d.t[2] = w.wd;
+            d.i[0] = T;
+            d.i[1] = H;
+            d.i[2] = I;
         });
         let c_dn = b.emit(DevOp::RmsNorm, row_cus.clone(), &[c_d], |d| {
-            d.t[0] = dn; d.t[1] = dg; d.t[2] = w.g_po;
-            d.i[0] = T; d.i[1] = H; d.f[0] = EPS;
+            d.t[0] = dn;
+            d.t[1] = dg;
+            d.t[2] = w.g_po;
+            d.i[0] = T;
+            d.i[1] = H;
+            d.f[0] = EPS;
         });
         dep = b.emit(DevOp::Residual, all.clone(), &[c_dn], |d| {
-            d.t[0] = x; d.t[1] = x; d.t[2] = dn;
+            d.t[0] = x;
+            d.t[1] = x;
+            d.t[2] = dn;
             d.i[0] = T * H;
             d.f[0] = LAYER_SCALAR; // Gemma folds layer_scalar into the SECOND residual
         });
@@ -252,16 +356,26 @@ fn main() {
 
     // ---- head ----
     let c_fn = b.emit(DevOp::RmsNorm, row_cus.clone(), &[dep], |d| {
-        d.t[0] = hn; d.t[1] = x; d.t[2] = g_final;
-        d.i[0] = T; d.i[1] = H; d.f[0] = EPS;
+        d.t[0] = hn;
+        d.t[1] = x;
+        d.t[2] = g_final;
+        d.i[0] = T;
+        d.i[1] = H;
+        d.f[0] = EPS;
     });
     let c_lm = b.emit(DevOp::Gemm, all.clone(), &[c_fn], |d| {
-        d.t[0] = logits; d.t[1] = hn; d.t[2] = emb; // tied
-        d.i[0] = T; d.i[1] = VOCAB; d.i[2] = H;
+        d.t[0] = logits;
+        d.t[1] = hn;
+        d.t[2] = emb; // tied
+        d.i[0] = T;
+        d.i[1] = VOCAB;
+        d.i[2] = H;
     });
     b.emit(DevOp::SoftCap, all.clone(), &[c_lm], |d| {
-        d.t[0] = logits; d.t[1] = logits;
-        d.i[0] = T * VOCAB; d.f[0] = SOFTCAP;
+        d.t[0] = logits;
+        d.t[1] = logits;
+        d.i[0] = T * VOCAB;
+        d.f[0] = SOFTCAP;
     });
 
     let prog = b.finish();

@@ -65,13 +65,21 @@ pub mod status;
 #[derive(Debug, Clone)]
 pub enum TuneAction {
     Inventory,
-    Select { m: i64, n: i64, k: i64 },
+    Select {
+        m: i64,
+        n: i64,
+        k: i64,
+    },
     /// Is the store keyed to the object about to ship, and does it cover the
     /// compiler's demand — in that order. See [`status`].
-    Status { coverage_from: Option<demand::EmitSpec> },
+    Status {
+        coverage_from: Option<demand::EmitSpec>,
+    },
     /// Compare each op case's timing across build digests. The store is a
     /// regression detector; nothing was reading it as one.
-    Regress { threshold: f64 },
+    Regress {
+        threshold: f64,
+    },
     /// Derive the compiler's dense-GEMM demand and print it.
     Shapes(demand::EmitSpec),
     /// Measure a campaign over those shapes and publish it.
@@ -79,9 +87,15 @@ pub enum TuneAction {
     /// Publish an existing sample file. Addressable alone so a campaign whose
     /// samples exist but were never published can be repaired without
     /// re-measuring — see `ingest`'s module docs for why that has happened.
-    Ingest { samples: PathBuf, campaign: String, provisional: bool },
+    Ingest {
+        samples: PathBuf,
+        campaign: String,
+        provisional: bool,
+    },
     /// What the store would serve the compiler right now.
-    Best { quant: String },
+    Best {
+        quant: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +116,11 @@ pub fn run(opts: &TuneOptions) -> Result<(), Box<dyn std::error::Error>> {
     // the `--gpu` default (an H100) over an AMD campaign.
     match &opts.action {
         TuneAction::Gemm(c) => return gemm::run(&opts.root, c),
-        TuneAction::Ingest { samples, campaign, provisional } => {
+        TuneAction::Ingest {
+            samples,
+            campaign,
+            provisional,
+        } => {
             println!("cell        : {}", tunedb::GFX950_CELL);
             return ingest::ingest(&opts.root, &opts.db, samples, campaign, *provisional).map(drop);
         }
@@ -193,7 +211,11 @@ fn inventory(reg: &Inventory, hw: &HardwareFingerprint) {
             k.id.raw(),
             k.id.c_name(),
             tile,
-            if k.dispatched { "dispatched" } else { "NO DISPATCH ARM" }
+            if k.dispatched {
+                "dispatched"
+            } else {
+                "NO DISPATCH ARM"
+            }
         );
     }
 
@@ -235,7 +257,10 @@ fn select(
     k: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let op = OpSignature::gemm(Phase::Prefill, m, n, k);
-    println!("op          : dense matmul {m}x{n}x{k} ({:?})", op.shape.class());
+    println!(
+        "op          : dense matmul {m}x{n}x{k} ({:?})",
+        op.shape.class()
+    );
 
     // The SAME ranking the compiler uses. A tune command that reports a
     // different kernel than the build would emit is worse than no command: it
@@ -246,7 +271,11 @@ fn select(
         tile_cost(spec, kernel, m, n, k, n_units)
     })?;
 
-    println!("selected    : {} ({})", realization.kernel.c_name(), realization.kernel.raw());
+    println!(
+        "selected    : {} ({})",
+        realization.kernel.c_name(),
+        realization.kernel.raw()
+    );
     if let Some(t) = realization.tile {
         println!("tile        : {}x{}x{}", t.bm, t.bn, t.bk);
     }
@@ -281,7 +310,10 @@ fn shapes(spec: &demand::EmitSpec) -> Result<(), Box<dyn std::error::Error>> {
     let derived = demand::derive(spec)?;
     let (hit, miss) = demand::coverage(&derived);
     println!("demand      : {} distinct shapes", derived.len());
-    println!("coverage    : {hit} HIT / {miss} MISS against {}", spec.db.display());
+    println!(
+        "coverage    : {hit} HIT / {miss} MISS against {}",
+        spec.db.display()
+    );
     println!();
     print!("{}", demand::render(&derived));
     Ok(())

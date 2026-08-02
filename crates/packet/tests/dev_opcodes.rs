@@ -27,7 +27,10 @@ use std::process::Command;
 
 use packet::dev::DevOp;
 
-const ISA_H: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../runtime/common/dev_isa.h");
+const ISA_H: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../runtime/common/dev_isa.h"
+);
 const DEV_RS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/dev.rs");
 
 /// Compile a probe that prints every opcode the Rust side believes in, and read
@@ -54,7 +57,12 @@ fn c_opcode_values() -> Option<BTreeMap<String, u32>> {
     std::fs::write(&src, probe).ok()?;
 
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
-    let out = Command::new(&cc).arg(&src).arg("-o").arg(&bin).output().ok()?;
+    let out = Command::new(&cc)
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .ok()?;
     if !out.status.success() {
         // A missing PLOW_DOP_* name lands here. Surface it: it is the whole point.
         panic!(
@@ -104,8 +112,12 @@ fn c_declared_opcodes() -> Vec<(String, u32)> {
     let mut out = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        let Some(rest) = line.strip_prefix("PLOW_DOP_") else { continue };
-        let Some((name, val)) = rest.split_once('=') else { continue };
+        let Some(rest) = line.strip_prefix("PLOW_DOP_") else {
+            continue;
+        };
+        let Some((name, val)) = rest.split_once('=') else {
+            continue;
+        };
         if name.trim().starts_with('_') {
             continue; // PLOW_DOP__COUNT is a bound, not an opcode.
         }
@@ -128,7 +140,9 @@ fn rust_declared_variants() -> Vec<(String, u32)> {
         if line.starts_with("//") || line.starts_with("/*") {
             continue;
         }
-        let Some((name, val)) = line.split_once('=') else { continue };
+        let Some((name, val)) = line.split_once('=') else {
+            continue;
+        };
         let name = name.trim();
         if name.is_empty() || !name.chars().next().unwrap().is_ascii_uppercase() {
             continue;
@@ -199,8 +213,10 @@ fn rust_and_c_agree_on_every_opcode_value() {
 #[test]
 fn every_c_opcode_has_a_rust_variant() {
     let declared = c_declared_opcodes();
-    let known: BTreeMap<&str, u32> =
-        DevOp::ALL.iter().map(|op| (op.c_name(), *op as u32)).collect();
+    let known: BTreeMap<&str, u32> = DevOp::ALL
+        .iter()
+        .map(|op| (op.c_name(), *op as u32))
+        .collect();
 
     // Self-checking instead of a magic threshold: if the parser starts dropping
     // lines, the count diverges from `ALL` and this fires. A `> 50` guard here

@@ -775,7 +775,13 @@ impl VmmKv {
                 s.ops.free(va);
                 return Err(e);
             }
-            inner.published.insert(bkey, Snap { va, bytes: snap_bytes });
+            inner.published.insert(
+                bkey,
+                Snap {
+                    va,
+                    bytes: snap_bytes,
+                },
+            );
         }
 
         // Soft cap: shed cold cache until under budget (finding #9).
@@ -1155,7 +1161,11 @@ mod tests {
         let unmaps_before = ops.unmaps.load(Ordering::SeqCst);
         ops.fail_maps.store(3, Ordering::SeqCst); // 2 maps land, the 3rd fails
         assert!(p.try_attach(1, &pr).is_err());
-        assert_eq!(p.mapped_rows(1), 0, "failed attach must leave an empty window");
+        assert_eq!(
+            p.mapped_rows(1),
+            0,
+            "failed attach must leave an empty window"
+        );
         assert_eq!(
             p.stats().blocks_live,
             live - 2,
@@ -1201,7 +1211,10 @@ mod tests {
         let mut pr2 = prompt(24);
         pr2.push(999);
         p.ensure_rows(1, 1).unwrap();
-        let a = p.try_attach(1, &pr2).unwrap().expect("generated blocks attach");
+        let a = p
+            .try_attach(1, &pr2)
+            .unwrap()
+            .expect("generated blocks attach");
         assert_eq!(a.rows, 24);
     }
 
@@ -1316,14 +1329,21 @@ mod tests {
         p.publish(0, &pr, 32, |_| Ok(())).unwrap();
         // Owner sequence ends: windows unmapped, cache keeps the blocks.
         p.begin_seq(0);
-        assert_eq!(ops.releases.load(Ordering::SeqCst), 0, "cache must pin blocks");
+        assert_eq!(
+            ops.releases.load(Ordering::SeqCst),
+            0,
+            "cache must pin blocks"
+        );
         assert_eq!(p.stats().blocks_live, 4);
 
         // Driver OOM on the next creates → LRU eviction frees cached blocks,
         // then the create succeeds.
         ops.fail_creates.store(2, Ordering::SeqCst);
         p.ensure_rows(1, 8).unwrap();
-        assert!(ops.releases.load(Ordering::SeqCst) > 0, "eviction must free");
+        assert!(
+            ops.releases.load(Ordering::SeqCst) > 0,
+            "eviction must free"
+        );
         assert!(p.stats().nodes_evicted > 0);
         assert_eq!(p.mapped_rows(1), 8);
     }

@@ -68,7 +68,9 @@ pub enum ProfileId {
 impl ProfileId {
     pub fn phase(self) -> Phase {
         match self {
-            ProfileId::DecodeDense | ProfileId::DecodeMoe | ProfileId::DecodeLatent => Phase::Decode,
+            ProfileId::DecodeDense | ProfileId::DecodeMoe | ProfileId::DecodeLatent => {
+                Phase::Decode
+            }
             ProfileId::PrefillDense | ProfileId::PrefillMoe => Phase::Prefill,
             ProfileId::RecurrentMamba | ProfileId::PortableReference => Phase::Mixed,
         }
@@ -127,7 +129,10 @@ pub enum QuantScheme {
 impl QuantScheme {
     /// Whether this scheme carries a per-block shared exponent.
     pub fn is_block_scaled(self) -> bool {
-        matches!(self, QuantScheme::BlockFp8 | QuantScheme::Mxfp8 | QuantScheme::Mxfp4)
+        matches!(
+            self,
+            QuantScheme::BlockFp8 | QuantScheme::Mxfp8 | QuantScheme::Mxfp4
+        )
     }
 
     /// Whether this is an OCP MX format (32-element blocks, E8M0 scale).
@@ -338,7 +343,13 @@ pub struct TileConfig {
 
 impl TileConfig {
     pub fn new(bm: i64, bn: i64, bk: i64) -> Self {
-        TileConfig { bm, bn, bk, split_k: 1, stages: 1 }
+        TileConfig {
+            bm,
+            bn,
+            bk,
+            split_k: 1,
+            stages: 1,
+        }
     }
 }
 
@@ -463,7 +474,10 @@ mod tests {
     fn a_kernel_cannot_claim_an_instruction_the_target_lacks() {
         let mut k = KernelSpec::gemm_tile(DevOp::Gemm, IsaLevel::Sm90a, 128, 128, 32, "x");
         k.mma_dtype = Some(MmaDtype::Fp4);
-        assert!(!k.runs_on(&fp("H100 NVL")), "Hopper does not accelerate fp4");
+        assert!(
+            !k.runs_on(&fp("H100 NVL")),
+            "Hopper does not accelerate fp4"
+        );
 
         let mut k = KernelSpec::gemm_tile(DevOp::Gemm, IsaLevel::Sm120a, 128, 128, 32, "x");
         k.mma_dtype = Some(MmaDtype::Fp4);
@@ -563,12 +577,18 @@ mod tests {
             k.needs_block_scale_mma = true;
             k
         };
-        assert!(native(IsaLevel::Sm100a).runs_on(&fp("B200")), "tcgen05 has it");
+        assert!(
+            native(IsaLevel::Sm100a).runs_on(&fp("B200")),
+            "tcgen05 has it"
+        );
         assert!(
             !native(IsaLevel::Sm120a).runs_on(&fp("RTX 5090")),
             "ptxas rejects 'mma with block scale' on sm_120"
         );
-        assert!(!native(IsaLevel::Sm90a).runs_on(&fp("H100 NVL")), "Hopper has no block scale");
+        assert!(
+            !native(IsaLevel::Sm90a).runs_on(&fp("H100 NVL")),
+            "Hopper has no block scale"
+        );
     }
 
     /// The fallback the probe measured: dequant UE8M0 in software, feed plain
@@ -600,7 +620,10 @@ mod tests {
         let mut k = KernelSpec::gemm_tile(DevOp::Gemm, IsaLevel::Sm120a, 128, 128, 32, "mxfp4-sw");
         k.quant = QuantScheme::Mxfp4;
         k.mma_dtype = Some(MmaDtype::Fp4);
-        assert!(k.runs_on(&fp("RTX 5090")), "consumer Blackwell has fp4 mma.sync");
+        assert!(
+            k.runs_on(&fp("RTX 5090")),
+            "consumer Blackwell has fp4 mma.sync"
+        );
     }
 
     /// gfx950 is the strongest MXFP4 target in the registry, and the reason is
@@ -634,5 +657,4 @@ mod tests {
         b.needs_block_scale_mma = false;
         assert_ne!(a.implementation_hash, b.implementation_hash);
     }
-
 }

@@ -65,8 +65,7 @@ impl GrowablePool {
     /// overflow.
     #[inline]
     pub fn flat_index(&self, kv: u32, head: u32, seq: u32) -> u64 {
-        (kv as u64 * self.kv_heads as u64 + head as u64) * self.max_seqs as u64
-            + seq as u64
+        (kv as u64 * self.kv_heads as u64 + head as u64) * self.max_seqs as u64 + seq as u64
     }
 
     /// Byte offset of head-slot `(kv, head, seq)` — **byte-identical** to Lean
@@ -107,10 +106,7 @@ impl GrowablePool {
     /// Total bytes the pool spans: `kvFactor · kvHeads · maxSeqs · headSlotBytes`.
     #[inline]
     pub fn pool_bytes(&self) -> u64 {
-        self.kv_factor as u64
-            * self.kv_heads as u64
-            * self.max_seqs as u64
-            * self.head_slot_bytes
+        self.kv_factor as u64 * self.kv_heads as u64 * self.max_seqs as u64 * self.head_slot_bytes
     }
 }
 
@@ -177,8 +173,7 @@ mod tests {
         let p = pool();
         let all: Vec<(u32, u32, u32)> = (0..p.kv_factor)
             .flat_map(|kv| {
-                (0..p.kv_heads)
-                    .flat_map(move |h| (0..p.max_seqs).map(move |s| (kv, h, s)))
+                (0..p.kv_heads).flat_map(move |h| (0..p.max_seqs).map(move |s| (kv, h, s)))
             })
             .collect();
         for (i, &a) in all.iter().enumerate() {

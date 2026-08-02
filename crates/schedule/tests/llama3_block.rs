@@ -3,20 +3,20 @@
 //! invariants. This proves the full pipeline handles the exact shapes, GQA
 //! ratio, and BF16 dtype of the production model.
 
-use costmodel::{hwspec, DEFAULT_PAGE_BYTES, Soc, SramPolicy};
+use costmodel::{hwspec, Soc, SramPolicy, DEFAULT_PAGE_BYTES};
 use nn_graph::{infer_shapes, ActKind, DType, Nn};
 use rewrite::{assemble, plan_from_block, LayerPlan};
 use schedule::{schedule, Config};
 
 // Real LLaMA 3.1 8B dimensions.
 const H: i64 = 4096;
-const NH: i64 = 32;     // query heads
-const NKV: i64 = 8;     // KV heads (GQA 4:1)
-const HD: i64 = 128;    // head_dim
-const QD: i64 = NH * HD;   // 4096
+const NH: i64 = 32; // query heads
+const NKV: i64 = 8; // KV heads (GQA 4:1)
+const HD: i64 = 128; // head_dim
+const QD: i64 = NH * HD; // 4096
 const KVD: i64 = NKV * HD; // 1024
-const IM: i64 = 14336;  // SwiGLU intermediate
-// Sequence length for the compile bucket.
+const IM: i64 = 14336; // SwiGLU intermediate
+                       // Sequence length for the compile bucket.
 const T: i64 = 512;
 
 fn h100() -> &'static hwspec::GpuSpec {

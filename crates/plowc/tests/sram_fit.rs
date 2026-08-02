@@ -33,7 +33,8 @@ fn sram_fit_opts(out: PathBuf) -> Options {
         lean_oracle: false,
         emit_sample: false,
         emit_tokenize: false,
-        emit_trace: false,        kv: Default::default(),
+        emit_trace: false,
+        kv: Default::default(),
         weight_dtype_override: None,
     }
 }
@@ -54,8 +55,8 @@ fn every_example_compiles_with_sram_fit() {
         let net: NetConfig = serde_json::from_str(&json)
             .unwrap_or_else(|e| panic!("{}: parse failed: {e}", path.display()));
 
-        let out = std::env::temp_dir()
-            .join(format!("plowc-sramfit-{}-{}", std::process::id(), net.name));
+        let out =
+            std::env::temp_dir().join(format!("plowc-sramfit-{}-{}", std::process::id(), net.name));
         let report = compile(&Source::Net(net), &sram_fit_opts(out.clone()))
             .unwrap_or_else(|e| panic!("{}: compile failed: {e}", path.display()));
         assert!(!report.buckets.is_empty(), "{}: no buckets", path.display());

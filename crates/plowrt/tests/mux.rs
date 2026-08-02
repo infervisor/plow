@@ -38,7 +38,12 @@ fn make_app_with_batches(slug: &str, batches: &[i64]) -> axum::Router {
     let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
     for slug in slugs {
         let bundle = state.registry.get(&slug).unwrap();
-        let m = mux::spawn(slug.clone(), bundle, Arc::clone(&state), MuxConfig::default());
+        let m = mux::spawn(
+            slug.clone(),
+            bundle,
+            Arc::clone(&state),
+            MuxConfig::default(),
+        );
         state.install_mux(slug, m);
     }
     app(state)
@@ -116,7 +121,10 @@ async fn concurrent_requests_share_a_batch() {
         .find_map(|l| l.strip_prefix("plowrt_batch_count_total "))
         .and_then(|v| v.parse().ok())
         .expect("plowrt_batch_count_total present");
-    assert!(n_batches >= 1, "expected at least one tick, got {n_batches}");
+    assert!(
+        n_batches >= 1,
+        "expected at least one tick, got {n_batches}"
+    );
 }
 
 /// A single request still completes cleanly on a batched bundle (no accidental
@@ -124,10 +132,7 @@ async fn concurrent_requests_share_a_batch() {
 #[tokio::test]
 async fn single_request_on_batched_bundle() {
     let app = make_app_with_batches("mux-solo", &[1, 2, 4]);
-    let resp = app
-        .oneshot(chat_req("mux-solo", "hi"))
-        .await
-        .unwrap();
+    let resp = app.oneshot(chat_req("mux-solo", "hi")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_string(resp).await;
     assert!(body.contains("\"object\":\"chat.completion\""));
@@ -194,7 +199,12 @@ async fn sample_batch_bundle_uses_batched_path() {
     let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
     for slug in slugs {
         let bundle = state.registry.get(&slug).unwrap();
-        let m = mux::spawn(slug.clone(), bundle, Arc::clone(&state), MuxConfig::default());
+        let m = mux::spawn(
+            slug.clone(),
+            bundle,
+            Arc::clone(&state),
+            MuxConfig::default(),
+        );
         state.install_mux(slug, m);
     }
     let app = app(state);
@@ -414,5 +424,8 @@ async fn cancellation_frees_the_slot() {
             Err(_) => continue,
         }
     }
-    assert!(got_done, "second request never completed — first slot was leaked");
+    assert!(
+        got_done,
+        "second request never completed — first slot was leaked"
+    );
 }

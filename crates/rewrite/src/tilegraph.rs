@@ -85,7 +85,10 @@ impl LayoutSpec {
     }
     /// A zero-copy reshape: identical bytes to input 0, eligible for aliasing.
     pub fn reshape(bytes: u64) -> Self {
-        LayoutSpec { alias: true, ..Self::copy(bytes) }
+        LayoutSpec {
+            alias: true,
+            ..Self::copy(bytes)
+        }
     }
 }
 
@@ -454,7 +457,14 @@ pub fn assemble_tuned(
                         (op.inputs.clone(), op.output.clone())
                     };
                     slice_outs.push(output.clone());
-                    let choice = push_choice(gemm_cands(cm, r.shape, policy, weight_tiling, cost_params, oracle));
+                    let choice = push_choice(gemm_cands(
+                        cm,
+                        r.shape,
+                        policy,
+                        weight_tiling,
+                        cost_params,
+                        oracle,
+                    ));
                     tasks.push(Task {
                         op: op.name.clone(),
                         unit: r.unit,
@@ -600,7 +610,7 @@ pub fn assemble_tuned(
         for (idx, inp) in task.inputs.iter().enumerate() {
             if let Some(prods) = produced.get(inp) {
                 let prods = prods.clone(); // drop the borrow on `produced` before mutating g
-                // SRAM-resident only when every producer is on this unit.
+                                           // SRAM-resident only when every producer is on this unit.
                 let all_same = prods.iter().all(|&(_, _, u)| u == task.unit);
                 let dma_in = push(
                     &mut g,
@@ -820,8 +830,11 @@ fn gemm_cands(
 
     // Analytical candidates, pinned to the shared weight layout if one is set.
     let pin = |t: &TileShape| weight_tiling.is_none_or(|(bn, bk)| t.bn == bn && t.bk == bk);
-    let analytical: Vec<TileShape> =
-        cm.candidates_typed(g, policy, params).into_iter().filter(pin).collect();
+    let analytical: Vec<TileShape> = cm
+        .candidates_typed(g, policy, params)
+        .into_iter()
+        .filter(pin)
+        .collect();
 
     // The tiles to actually price. The oracle decides whether these come from
     // the analytical model or from the target's real kernel set.
@@ -860,7 +873,9 @@ fn gemm_cands(
 
     // Measurements replace the estimate for the whole set or none of it: ns and
     // cycles are different scales.
-    let measured = oracle.measured_gemm(&query, &tiles).filter(|m| m.len() == tiles.len());
+    let measured = oracle
+        .measured_gemm(&query, &tiles)
+        .filter(|m| m.len() == tiles.len());
 
     tiles
         .into_iter()
@@ -1058,8 +1073,8 @@ mod tests {
                 inputs: vec!["act".into(), "o.w".into()],
                 output: "out".into(),
                 kind: OpKind::Gemm(g),
-                    weight_dtype: nn_graph::DType::BF16,
-                    compute_dtype: nn_graph::DType::BF16,
+                weight_dtype: nn_graph::DType::BF16,
+                compute_dtype: nn_graph::DType::BF16,
             }],
         };
         let (graph, cons) = assemble(&soc, &layer, SramPolicy::Stream, None).unwrap();

@@ -113,7 +113,11 @@ pub fn simulate(tasks: &TaskGraph, sched: &Schedule) -> SimResult {
     let zero = vec![0u64; n];
     let (finish_dep, ideal, dep_acyclic) = longest_path(n, &dep_edges, &dur, &zero);
     let (_finish_ctr, makespan, ctr_acyclic) = longest_path(n, &counter_edges, &dur, &zero);
-    let floor: &[Cycle] = if sched.starts.len() == n { &sched.starts } else { &zero };
+    let floor: &[Cycle] = if sched.starts.len() == n {
+        &sched.starts
+    } else {
+        &zero
+    };
     let (_finish_costed, costed, _costed_acyclic) = longest_path(n, &dep_edges, &dur, floor);
 
     let mut busy: HashMap<ResourceId, Cycle> = HashMap::new();
@@ -212,7 +216,8 @@ mod tests {
     /// An acyclic chain produces the expected critical-path makespan.
     #[test]
     fn longest_path_acyclic_chain() {
-        let (_finish, makespan, acyclic) = longest_path(3, &[(0, 1), (1, 2)], &[2, 3, 4], &[0, 0, 0]);
+        let (_finish, makespan, acyclic) =
+            longest_path(3, &[(0, 1), (1, 2)], &[2, 3, 4], &[0, 0, 0]);
         assert!(acyclic);
         assert_eq!(makespan, 9);
     }

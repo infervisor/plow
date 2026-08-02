@@ -107,7 +107,10 @@ impl OpSlots {
 fn slot(raw: &'static str) -> Option<Slot> {
     match raw {
         "" => None,
-        s => Some(Slot { name: s.trim_end_matches('?'), optional: s.ends_with('?') }),
+        s => Some(Slot {
+            name: s.trim_end_matches('?'),
+            optional: s.ends_with('?'),
+        }),
     }
 }
 
@@ -270,7 +273,13 @@ const INHERIT: &[(DevOp, DevOp, S)] = &[
     (DevOp::XFlashMerge, DevOp::FlashMerge, NONE),
 ];
 
-const NONE: S = S { op: DevOp::Nop, t: &[], i: &[], f: &[], j: &[] };
+const NONE: S = S {
+    op: DevOp::Nop,
+    t: &[],
+    i: &[],
+    f: &[],
+    j: &[],
+};
 
 /// Defined so the ABI is stable, body not built — there is nothing to name.
 /// Keeping these explicit is what lets [`Provenance::Undocumented`] mean "an
@@ -325,12 +334,17 @@ pub fn slots_for(op: DevOp) -> OpSlots {
     if let Some((_, base, over)) = INHERIT.iter().find(|(o, _, _)| *o == op) {
         // One level only: every base in INHERIT is itself in DOC, asserted by
         // `inheritance_bases_are_documented`.
-        let mut out = find(*base).map(|s| expand(s, Provenance::Inherited(*base))).unwrap_or(
-            OpSlots {
-                t: [None; 8], i: [None; 8], f0: None, f1: None, j0: None, j1: None,
+        let mut out = find(*base)
+            .map(|s| expand(s, Provenance::Inherited(*base)))
+            .unwrap_or(OpSlots {
+                t: [None; 8],
+                i: [None; 8],
+                f0: None,
+                f1: None,
+                j0: None,
+                j1: None,
                 provenance: Provenance::Inherited(*base),
-            },
-        );
+            });
         let ov = expand(over, Provenance::Inherited(*base));
         for k in 0..8 {
             if ov.t[k].is_some() {
@@ -346,8 +360,20 @@ pub fn slots_for(op: DevOp) -> OpSlots {
         out.j1 = ov.j1.or(out.j1);
         return out;
     }
-    let provenance = if RESERVED.contains(&op) { Provenance::Reserved } else { Provenance::Undocumented };
-    OpSlots { t: [None; 8], i: [None; 8], f0: None, f1: None, j0: None, j1: None, provenance }
+    let provenance = if RESERVED.contains(&op) {
+        Provenance::Reserved
+    } else {
+        Provenance::Undocumented
+    };
+    OpSlots {
+        t: [None; 8],
+        i: [None; 8],
+        f0: None,
+        f1: None,
+        j0: None,
+        j1: None,
+        provenance,
+    }
 }
 
 #[cfg(test)]
@@ -424,8 +450,10 @@ mod tests {
     /// honest for that op.
     fn normalize(raw: &str) -> String {
         let optional = raw.ends_with('?') || raw.contains("|NONE");
-        let head: String =
-            raw.chars().take_while(|c| *c != '(' && *c != '[' && *c != '|').collect();
+        let head: String = raw
+            .chars()
+            .take_while(|c| *c != '(' && *c != '[' && *c != '|')
+            .collect();
         let head = head.trim_end_matches('?');
         if optional {
             format!("{head}?")
@@ -462,7 +490,9 @@ mod tests {
             .or_else(|| (0..groups.len()).find(|&n| ok[n]))?;
 
         let joined = |a: usize, b: usize| -> bool {
-            doc[groups[a].1 + 1..groups[b].0].chars().all(|c| c.is_whitespace() || c == '·')
+            doc[groups[a].1 + 1..groups[b].0]
+                .chars()
+                .all(|c| c.is_whitespace() || c == '·')
         };
         let (mut lo, mut hi) = (anchor, anchor);
         while hi + 1 < groups.len() && ok[hi + 1] && joined(hi, hi + 1) {
@@ -527,7 +557,11 @@ mod tests {
         let mut out = Spec::default();
         for k in 0..8 {
             out.t[k] = s.t[k].map(|x| {
-                if x.optional { format!("{}?", x.name) } else { x.name.to_string() }
+                if x.optional {
+                    format!("{}?", x.name)
+                } else {
+                    x.name.to_string()
+                }
             });
             out.i[k] = s.i[k].map(str::to_string);
         }
@@ -555,7 +589,12 @@ mod tests {
             let row = DOC
                 .iter()
                 .find(|s| format!("{:?}", s.op) == name)
-                .or_else(|| INHERIT.iter().find(|(o, _, _)| format!("{o:?}") == name).map(|(_, _, o)| o));
+                .or_else(|| {
+                    INHERIT
+                        .iter()
+                        .find(|(o, _, _)| format!("{o:?}") == name)
+                        .map(|(_, _, o)| o)
+                });
             let Some(row) = row else {
                 missing.push(name);
                 continue;
@@ -579,14 +618,20 @@ mod tests {
     /// reverse direction is checked too.
     #[test]
     fn every_table_row_has_a_documented_spec() {
-        let documented: Vec<String> =
-            variants().into_iter().filter(|(_, s)| s.is_some()).map(|(n, _)| n).collect();
+        let documented: Vec<String> = variants()
+            .into_iter()
+            .filter(|(_, s)| s.is_some())
+            .map(|(n, _)| n)
+            .collect();
         let orphans: Vec<String> = DOC
             .iter()
             .map(|s| format!("{:?}", s.op))
             .filter(|n| !documented.contains(n))
             .collect();
-        assert!(orphans.is_empty(), "table rows with no doc spec: {orphans:?}");
+        assert!(
+            orphans.is_empty(),
+            "table rows with no doc spec: {orphans:?}"
+        );
     }
 
     /// An inheriting op must not also have a `DOC` row: `slots_for` checks `DOC`

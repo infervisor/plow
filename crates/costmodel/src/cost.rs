@@ -220,7 +220,16 @@ pub fn gemm_cycles(
         + out_tiles * dma_cycles(spec, out_bytes, false);
 
     // Delta — pipeline overlap (else the core serializes compute + dma).
-    let mut base = overlap(spec, tile, elem_bytes, buffering, passes, compute, dma, operand_bytes);
+    let mut base = overlap(
+        spec,
+        tile,
+        elem_bytes,
+        buffering,
+        passes,
+        compute,
+        dma,
+        operand_bytes,
+    );
 
     // Delta — split-K reduction: sum the `split` partials per output tile (read
     // all partials + write the final). Paid only when actually splitting.
@@ -237,7 +246,11 @@ pub fn gemm_cycles(
     // Delta — decode dispatch floor. A single-token (M=1) GEMV is op-overhead
     // bound: its counter-gate rendezvous dwarfs its tile work, so removing an op
     // (fusion) is the real lever. Gated to M=1 ⇒ prefill ranking is unchanged.
-    let decode_floor = if g.m == 1 { decode_dispatch_cycles(spec) } else { 0 };
+    let decode_floor = if g.m == 1 {
+        decode_dispatch_cycles(spec)
+    } else {
+        0
+    };
 
     base + tail + LAUNCH_CYCLES + decode_floor
 }
@@ -304,15 +317,26 @@ mod tests {
         assert_eq!(floor, expect);
         // Sanity: within 1 % of 4.6 µs at this clock.
         let us = floor as f64 / spec.clock_boost.0 as f64 * 1.0e6;
-        assert!((us - DECODE_DISPATCH_FLOOR_US).abs() < 0.05, "floor = {us} µs");
+        assert!(
+            (us - DECODE_DISPATCH_FLOOR_US).abs() < 0.05,
+            "floor = {us} µs"
+        );
 
         // Gating: only M==1 pays the floor. M=1 and M=16 both fit one bm=16
         // row-block (div_ceil ⇒ identical tiles/steps/base work), so their cost
         // difference is EXACTLY one floor — proving the floor is added at M==1 and
         // NOT at M>1 (prefill ranking untouched).
         let tile = TileShape::new(16, 256, 128);
-        let m1 = GemmShape { m: 1, n: 4096, k: 4096 };
-        let m16 = GemmShape { m: 16, n: 4096, k: 4096 };
+        let m1 = GemmShape {
+            m: 1,
+            n: 4096,
+            k: 4096,
+        };
+        let m16 = GemmShape {
+            m: 16,
+            n: 4096,
+            k: 4096,
+        };
         let c1 = gemm_cycles(h100(), m1, tile, 2, 2, 1, MmaDtype::Bf16);
         let c16 = gemm_cycles(h100(), m16, tile, 2, 2, 1, MmaDtype::Bf16);
         assert_eq!(c1 - c16, decode_dispatch_cycles(h100()));
@@ -322,7 +346,9 @@ mod tests {
     fn dtype_throughput_ratios() {
         let macs = 1 << 20;
         // Hopper: fp8 is 2× bf16 (half the cycles); no fp4 path.
-        assert!(macs_cycles(h100(), macs, MmaDtype::Fp8) < macs_cycles(h100(), macs, MmaDtype::Bf16));
+        assert!(
+            macs_cycles(h100(), macs, MmaDtype::Fp8) < macs_cycles(h100(), macs, MmaDtype::Bf16)
+        );
         assert!(!h100().supports(MmaDtype::Fp4));
         // Blackwell datacenter: fp4 < fp8 < bf16, and fp4 is supported.
         assert!(b200().supports(MmaDtype::Fp4));
@@ -341,8 +367,16 @@ mod tests {
         let sm = h100().sm_count as i64;
         let tile = TileShape::new(64, 256, 64);
         // One BN column-block, BM rows ⇒ tiles_n = 1, tiles_m = rows/bm.
-        let one_wave = GemmShape { m: sm * tile.bm, n: tile.bn, k: tile.bk };
-        let over_wave = GemmShape { m: (sm + 1) * tile.bm, n: tile.bn, k: tile.bk };
+        let one_wave = GemmShape {
+            m: sm * tile.bm,
+            n: tile.bn,
+            k: tile.bk,
+        };
+        let over_wave = GemmShape {
+            m: (sm + 1) * tile.bm,
+            n: tile.bn,
+            k: tile.bk,
+        };
         let c1 = gemm_cycles(h100(), one_wave, tile, 2, 2, 1, MmaDtype::Bf16);
         let c2 = gemm_cycles(h100(), over_wave, tile, 2, 2, 1, MmaDtype::Bf16);
         assert!(c2 > c1, "one extra tile must spill into a second wave");
@@ -353,8 +387,8 @@ mod tests {
     #[test]
     fn overlap_pipelines_when_resident_else_serializes() {
         let (compute, dma) = (100u64, 1000u64); // DMA-bound
-        // High-occupancy, double-buffered, resident ⇒ DMA hidden behind compute
-        // (fill_bytes = 0 ⇒ no exposed fill), so cost = max(compute, dma).
+                                                // High-occupancy, double-buffered, resident ⇒ DMA hidden behind compute
+                                                // (fill_bytes = 0 ⇒ no exposed fill), so cost = max(compute, dma).
         let small = TileShape::new(64, 256, 64);
         assert_eq!(overlap(h100(), small, 2, 2, 1, compute, dma, 0), dma);
         // A tile that fills SRAM (occupancy 1) and streams (passes > 1) can hide

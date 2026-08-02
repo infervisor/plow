@@ -51,7 +51,11 @@ fn device_sampler_serve_integration() {
         .arg(&src)
         .output()
         .expect("nvcc");
-    assert!(out.status.success(), "nvcc: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "nvcc: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Enable device sampling for this engine.
     std::env::set_var("PLOW_DEV_SAMPLE", "1");
@@ -119,7 +123,10 @@ fn device_sampler_serve_integration() {
     };
     let s1 = run(&mut e, &prompt, max_new, Some(&stoch_specs));
     let s2 = run(&mut e, &prompt, max_new, Some(&stoch_specs));
-    assert_eq!(s1, s2, "stochastic device sampling not deterministic for fixed rng");
+    assert_eq!(
+        s1, s2,
+        "stochastic device sampling not deterministic for fixed rng"
+    );
 
     let vocab = e.vocab() as u32;
     assert!(s1.iter().all(|&t| t < vocab), "token out of vocab range");

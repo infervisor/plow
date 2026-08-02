@@ -37,12 +37,22 @@ fn glm_prefill_shape() {
         buckets.push((p.t, seg.len()));
     }
     // The decode program is the LAST one; prefill buckets precede it.
-    let bkt: Vec<u32> = buckets.iter().map(|&(t, _)| t).take(buckets.len().saturating_sub(1)).collect();
+    let bkt: Vec<u32> = buckets
+        .iter()
+        .map(|&(t, _)| t)
+        .take(buckets.len().saturating_sub(1))
+        .collect();
     let chunks = plowrt::exec::amd::plan_chunks(&bkt, n_prompt).expect("plan");
     let cover: u32 = chunks.iter().sum();
     let segs: usize = chunks
         .iter()
-        .map(|c| buckets.iter().find(|&&(t, _)| t == *c).map(|&(_, s)| s).unwrap_or(0))
+        .map(|c| {
+            buckets
+                .iter()
+                .find(|&&(t, _)| t == *c)
+                .map(|&(_, s)| s)
+                .unwrap_or(0)
+        })
         .sum();
     eprintln!(
         "\nprompt {n_prompt} -> chunks {chunks:?} = {cover} padded rows ({}% pad); \

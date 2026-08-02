@@ -9,8 +9,8 @@
 use costmodel::{Soc, SramPolicy, DEFAULT_PAGE_BYTES};
 use nn_graph::{infer_shapes, ActKind, DType, Nn};
 use rewrite::{
-    assemble, materialize_tile_deps, plan_from_all_blocks, plan_from_block, rewrite_graph,
-    Compute, GraphNode,
+    assemble, materialize_tile_deps, plan_from_all_blocks, plan_from_block, rewrite_graph, Compute,
+    GraphNode,
 };
 
 // Small Llama-like decoder dims — enough shape to force meaningful tile grids
@@ -47,7 +47,9 @@ fn stacked_decoder(n_blocks: u32) -> nn_graph::Graph {
         let vh = nn.reshape(v, [T.into(), NKV.into(), HD.into()]);
         let qr = nn.rope(qh, HD as u32, 1e6);
         let kr = nn.rope(kh, HD as u32, 1e6);
-        let attn = nn.attention(qr, kr, vh, NH as u32, NKV as u32, HD as u32, true, None, None);
+        let attn = nn.attention(
+            qr, kr, vh, NH as u32, NKV as u32, HD as u32, true, None, None,
+        );
         let ao = nn.reshape(attn, [T.into(), QD.into()]);
         let o = nn.linear(&format!("l{i}_o_proj"), ao, QD, H, false);
         let r1 = nn.add(x, o);
@@ -182,16 +184,35 @@ fn all_gemms_and_flashes_show_up_across_blocks() {
     let gemms = tg
         .nodes
         .iter()
-        .filter(|n| matches!(n, GraphNode::Compute { kind: Compute::Gemm(_), .. }))
+        .filter(|n| {
+            matches!(
+                n,
+                GraphNode::Compute {
+                    kind: Compute::Gemm(_),
+                    ..
+                }
+            )
+        })
         .count();
     let flashes = tg
         .nodes
         .iter()
-        .filter(|n| matches!(n, GraphNode::Compute { kind: Compute::Flash(_), .. }))
+        .filter(|n| {
+            matches!(
+                n,
+                GraphNode::Compute {
+                    kind: Compute::Flash(_),
+                    ..
+                }
+            )
+        })
         .count();
     // 2 blocks × (7 GEMMs + 1 flash) = 14 GEMMs, 2 flashes.
     assert_eq!(gemms, 14, "expected 14 GEMMs across 2 blocks");
-    assert_eq!(flashes, 2, "expected 2 flash-attention nodes across 2 blocks");
+    assert_eq!(
+        flashes, 2,
+        "expected 2 flash-attention nodes across 2 blocks"
+    );
 }
 
 fn block_suffix(op_name: &str) -> Option<u32> {

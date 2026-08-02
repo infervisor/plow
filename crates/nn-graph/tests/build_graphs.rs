@@ -339,7 +339,10 @@ fn gemma4_multimodal_dense() {
     // Vision encoder has 2 attention layers (non-causal).
     // Text decoder has 2 attention layers (causal).
     let attn_count = g.count_ops(|o| matches!(o, nn_graph::Op::Attention { .. }));
-    assert_eq!(attn_count, 4, "expected 4 attention ops (2 vision + 2 text)");
+    assert_eq!(
+        attn_count, 4,
+        "expected 4 attention ops (2 vision + 2 text)"
+    );
 
     // One conv2d for patch embedding.
     assert_eq!(g.count_ops(|o| matches!(o, nn_graph::Op::Conv2d { .. })), 1);
@@ -694,7 +697,15 @@ fn glm_moe_dsa() {
         4
     );
     // Interleaved RoPE: 2 per layer (q + k) = 8 total.
-    let rope_count = g.count_ops(|o| matches!(o, nn_graph::Op::Rope { interleave: true, .. }));
+    let rope_count = g.count_ops(|o| {
+        matches!(
+            o,
+            nn_graph::Op::Rope {
+                interleave: true,
+                ..
+            }
+        )
+    });
     assert_eq!(rope_count, 8);
 
     // Multi-token prediction: 2 outputs total (main + 1 MTP head).
@@ -939,7 +950,10 @@ fn kimi_k3_layer_partition_must_be_disjoint_and_complete() {
     );
 
     // Layer 2 (1-based) in both.
-    let dup = k3_json("").replace(r#""full_attn_layers": [1, 3]"#, r#""full_attn_layers": [1, 2, 3]"#);
+    let dup = k3_json("").replace(
+        r#""full_attn_layers": [1, 3]"#,
+        r#""full_attn_layers": [1, 2, 3]"#,
+    );
     let err = build_from_config_json(&dup).expect_err("a doubly-assigned layer must not build");
     assert!(
         err.to_string().contains("twice"),
@@ -977,8 +991,8 @@ fn kimi_k3_never_builds_as_k2() {
         r#"{"model_type": "kimi_linear", "hidden_size": 7168}"#,
         r#"{"architectures": ["KimiLinearForCausalLM"], "hidden_size": 7168}"#,
     ] {
-        let err = build_from_config_json(cfg)
-            .expect_err("a K3 config with no geometry must not build");
+        let err =
+            build_from_config_json(cfg).expect_err("a K3 config with no geometry must not build");
         let msg = err.to_string();
         // A serde "missing field" error — NOT a K2 graph, and not a default.
         assert!(

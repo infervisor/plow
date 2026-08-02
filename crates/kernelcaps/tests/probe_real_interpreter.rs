@@ -141,12 +141,19 @@ fn expands_the_objects_tile_macros() {
     // The sm_90a object runs the wgmma body d_gemm_sm90, whose tile is the
     // fixed PGM90_* triple in op_gemm_sm90.cuh (128x128x64), not the Ampere
     // PGM_* one. Probe the tile it actually executes.
-    let vals = probe_macros(&t, "op_gemm_sm90.cuh", &["PGM90_BM", "PGM90_BN", "PGM90_BK"])
-        .expect("expand tile macros");
+    let vals = probe_macros(
+        &t,
+        "op_gemm_sm90.cuh",
+        &["PGM90_BM", "PGM90_BN", "PGM90_BK"],
+    )
+    .expect("expand tile macros");
 
     for (name, v) in ["PGM90_BM", "PGM90_BN", "PGM90_BK"].iter().zip(&vals) {
         let v = v.unwrap_or_else(|| panic!("{name} did not expand to an integer"));
-        assert!(v > 0 && v <= 1024, "{name} = {v} is not a plausible tile dimension");
+        assert!(
+            v > 0 && v <= 1024,
+            "{name} = {v} is not a plausible tile dimension"
+        );
         assert!(v % 8 == 0, "{name} = {v} is not MMA-shaped");
     }
     eprintln!("probed tile: {:?}", vals);
@@ -177,7 +184,10 @@ fn probed_opcodes_are_all_known_to_the_abi() {
     let obj = probe(&t, IsaLevel::Sm90a, "cuda-13.0").expect("probe");
     let known: Vec<u16> = DevOp::ALL.iter().map(|o| *o as u16).collect();
     for op in &obj.opcodes {
-        assert!(known.contains(op), "probed opcode {op} has no DevOp variant");
+        assert!(
+            known.contains(op),
+            "probed opcode {op} has no DevOp variant"
+        );
     }
 }
 
@@ -186,7 +196,9 @@ fn probed_opcodes_are_all_known_to_the_abi() {
 /// nothing" and send selection down a fallback path.
 #[test]
 fn a_missing_source_is_an_error() {
-    let Some(mut t) = sm90a_target(&[]) else { return };
+    let Some(mut t) = sm90a_target(&[]) else {
+        return;
+    };
     t.source = "/nonexistent/interp.cu".into();
     assert!(probe(&t, IsaLevel::Sm90a, "cuda-13.0").is_err());
 }
@@ -212,7 +224,11 @@ fn derives_the_gemm_alias_group_from_the_object() {
     let text = t.preprocess().expect("preprocess");
     let arms = kernelcaps::probe::dispatch_arms(&text, "plow_exec").expect("arms");
 
-    assert!(arms.len() > 15, "a real interpreter has many arms, got {}", arms.len());
+    assert!(
+        arms.len() > 15,
+        "a real interpreter has many arms, got {}",
+        arms.len()
+    );
 
     let gemm = arms
         .iter()
@@ -235,7 +251,9 @@ fn derives_the_gemm_alias_group_from_the_object() {
 /// casts and macro noise instead of calls.
 #[test]
 fn every_derived_arm_names_a_callee() {
-    let Some(t) = sm90a_target(&["PLOW_NV_PREFILL=1"]) else { return };
+    let Some(t) = sm90a_target(&["PLOW_NV_PREFILL=1"]) else {
+        return;
+    };
     let text = t.preprocess().expect("preprocess");
     let arms = kernelcaps::probe::dispatch_arms(&text, "plow_exec").expect("arms");
 
@@ -266,7 +284,9 @@ fn every_derived_arm_names_a_callee() {
 /// would otherwise have to be told.
 #[test]
 fn recovers_shape_specializations_from_template_arguments() {
-    let Some(t) = sm90a_target(&["PLOW_NV_PREFILL=1"]) else { return };
+    let Some(t) = sm90a_target(&["PLOW_NV_PREFILL=1"]) else {
+        return;
+    };
     let text = t.preprocess().expect("preprocess");
     let arms = kernelcaps::probe::dispatch_arms(&text, "plow_exec").expect("arms");
 
@@ -295,20 +315,27 @@ fn recovers_shape_specializations_from_template_arguments() {
 
     let total: usize = arms.iter().map(|a| a.specializations.len()).sum();
     eprintln!("arms={} total specializations={}", arms.len(), total);
-    assert!(total >= 5, "the object specializes in several places, found {total}");
+    assert!(
+        total >= 5,
+        "the object specializes in several places, found {total}"
+    );
 }
 
 /// The arms must account for the same opcodes `dispatched_opcodes` reports, or
 /// the two views of one object disagree.
 #[test]
 fn arms_and_opcode_set_agree() {
-    let Some(t) = sm90a_target(&["PLOW_NV_PREFILL=1"]) else { return };
+    let Some(t) = sm90a_target(&["PLOW_NV_PREFILL=1"]) else {
+        return;
+    };
     let text = t.preprocess().expect("preprocess");
     let arms = kernelcaps::probe::dispatch_arms(&text, "plow_exec").expect("arms");
     let ops = dispatched_opcodes(&text, "plow_exec").expect("opcodes");
 
-    let from_arms: std::collections::BTreeSet<u16> =
-        arms.iter().flat_map(|a| a.opcodes.iter().copied()).collect();
+    let from_arms: std::collections::BTreeSet<u16> = arms
+        .iter()
+        .flat_map(|a| a.opcodes.iter().copied())
+        .collect();
 
     // Arms may miss an opcode whose segment has no call (a pure `break;` arm),
     // so arms are a subset; nothing may appear in arms that is not an opcode.
@@ -332,7 +359,9 @@ fn arms_and_opcode_set_agree() {
 /// had it all along, which is the point of deriving rather than tabulating.
 #[test]
 fn finds_alias_groups_that_were_not_known_in_advance() {
-    let Some(t) = sm90a_target(&["PLOW_NV_PREFILL=1", "PLOW_NV_W8A8=1"]) else { return };
+    let Some(t) = sm90a_target(&["PLOW_NV_PREFILL=1", "PLOW_NV_W8A8=1"]) else {
+        return;
+    };
     let text = t.preprocess().expect("preprocess");
     let arms = kernelcaps::probe::dispatch_arms(&text, "plow_exec").expect("arms");
 
@@ -341,7 +370,10 @@ fn finds_alias_groups_that_were_not_known_in_advance() {
     assert!(
         groups.len() >= 2,
         "expected at least the bf16 and fp8 GEMM triples, found {:?}",
-        groups.iter().map(|a| (&a.callee, &a.opcodes)).collect::<Vec<_>>()
+        groups
+            .iter()
+            .map(|a| (&a.callee, &a.opcodes))
+            .collect::<Vec<_>>()
     );
 
     let fp8 = arms

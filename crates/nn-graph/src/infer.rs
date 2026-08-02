@@ -352,9 +352,7 @@ impl Ctx<'_> {
             }
 
             Op::MoeRouter {
-                num_experts,
-                group,
-                ..
+                num_experts, group, ..
             } => {
                 self.expect_arity(inputs, 2)?;
                 let x = self.input_shape(inputs, 0)?;
@@ -484,7 +482,10 @@ impl Ctx<'_> {
                 // snapshot stack was pushed from the wrong place.
                 for i in 1..inputs.len() - 1 {
                     let s = self.input_shape(inputs, i)?;
-                    if s.rank() != prefix.rank() || s.dim(s.rank() - 1).provably_ne(prefix.dim(prefix.rank() - 1)) {
+                    if s.rank() != prefix.rank()
+                        || s.dim(s.rank() - 1)
+                            .provably_ne(prefix.dim(prefix.rank() - 1))
+                    {
                         return Err(self.err(format!(
                             "block_residual snapshot {i} has shape {s}, expected the prefix shape {prefix}"
                         )));

@@ -196,7 +196,11 @@ mod tests {
     #[test]
     fn defines_participate_in_identity() {
         let decode = id(&["PLOW_NV_GEMMA=1"], "cuda-13.0", "abc");
-        let prefill = id(&["PLOW_NV_GEMMA=1", "PLOW_NV_PREFILL=1"], "cuda-13.0", "abc");
+        let prefill = id(
+            &["PLOW_NV_GEMMA=1", "PLOW_NV_PREFILL=1"],
+            "cuda-13.0",
+            "abc",
+        );
         assert_ne!(decode, prefill);
         assert_ne!(decode.label(), prefill.label());
     }
@@ -229,7 +233,11 @@ mod tests {
     /// Differences must be actionable, not just "stale".
     #[test]
     fn differences_name_what_moved() {
-        let inv = id(&["PLOW_NV_GEMMA=1", "PLOW_NV_PREFILL=1"], "cuda-13.0", "abc");
+        let inv = id(
+            &["PLOW_NV_GEMMA=1", "PLOW_NV_PREFILL=1"],
+            "cuda-13.0",
+            "abc",
+        );
         let build = id(&["PLOW_NV_GEMMA=1"], "cuda-12.4", "def");
         let d = inv.differences(&build);
 

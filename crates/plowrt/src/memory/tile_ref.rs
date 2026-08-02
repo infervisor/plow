@@ -362,7 +362,10 @@ mod tests {
         untile_to_rowmajor("w", &tiled, n, k, &t, &mut back).unwrap();
         assert_ne!(back, src, "a flipped bit must break the round-trip");
         // and it must surface at exactly the element that was perturbed
-        assert_eq!(back[t.src_off(700, 1337, k)], src[t.src_off(700, 1337, k)] ^ 0x01);
+        assert_eq!(
+            back[t.src_off(700, 1337, k)],
+            src[t.src_off(700, 1337, k)] ^ 0x01
+        );
     }
 
     /// NEGATIVE CONTROL: tiling is NOT the identity at the real (128, 64).
@@ -412,9 +415,15 @@ mod tests {
         let mut dst = vec![0xAAu8; t.tiled_bytes(n, k)];
         tile_rowmajor("w", &src, n, k, &t, &mut dst).unwrap();
         // Element (129, 99) is the last real one; (129, 100) is padding.
-        assert_eq!(&dst[t.dst_off(129, 100, k)..t.dst_off(129, 100, k) + 2], &[0, 0]);
+        assert_eq!(
+            &dst[t.dst_off(129, 100, k)..t.dst_off(129, 100, k) + 2],
+            &[0, 0]
+        );
         // A whole padded row (n = 200 >= 130) is zero.
-        assert_eq!(&dst[t.dst_off(200, 0, k)..t.dst_off(200, 0, k) + 2], &[0, 0]);
+        assert_eq!(
+            &dst[t.dst_off(200, 0, k)..t.dst_off(200, 0, k) + 2],
+            &[0, 0]
+        );
     }
 
     /// A short / misnamed tensor hard-fails and NAMES the tensor.
@@ -424,11 +433,21 @@ mod tests {
         let (n, k) = (128usize, 64usize);
         let short = vec![0u8; t.logical_bytes(n, k) - 2];
         let mut dst = vec![0u8; t.tiled_bytes(n, k)];
-        let err =
-            tile_rowmajor("model.layers.0.self_attn.q_proj.weight", &short, n, k, &t, &mut dst)
-                .unwrap_err();
+        let err = tile_rowmajor(
+            "model.layers.0.self_attn.q_proj.weight",
+            &short,
+            n,
+            k,
+            &t,
+            &mut dst,
+        )
+        .unwrap_err();
         match &err {
-            TileError::ShortSource { tensor, expected, got } => {
+            TileError::ShortSource {
+                tensor,
+                expected,
+                got,
+            } => {
                 assert_eq!(tensor, "model.layers.0.self_attn.q_proj.weight");
                 assert_eq!(*expected, 16384);
                 assert_eq!(*got, 16382);
@@ -484,9 +503,7 @@ mod tests {
     #[test]
     #[cfg(feature = "hub")]
     fn real_qwen3_q_proj_tiles_bit_exactly() {
-        let path = std::path::Path::new(
-            "/root/models/Qwen3-4B/model-00001-of-00003.safetensors",
-        );
+        let path = std::path::Path::new("/root/models/Qwen3-4B/model-00001-of-00003.safetensors");
         if !path.exists() {
             eprintln!("SKIP: {} not staged", path.display());
             return;
@@ -512,7 +529,14 @@ mod tests {
         assert_ne!(&tiled[..], src, "tiled must differ from on-disk row-major");
 
         // Every element lands where the manifest formula says.
-        for &(i, j) in &[(0usize, 0usize), (0, 64), (1, 0), (127, 63), (128, 0), (4095, 2559)] {
+        for &(i, j) in &[
+            (0usize, 0usize),
+            (0, 64),
+            (1, 0),
+            (127, 63),
+            (128, 0),
+            (4095, 2559),
+        ] {
             let s = t.src_off(i, j, k);
             let d = t.dst_off(i, j, k);
             assert_eq!(&tiled[d..d + 2], &src[s..s + 2], "element ({i},{j})");

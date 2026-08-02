@@ -39,10 +39,30 @@ pub fn gemm_op_case(m: i64, n: i64, k: i64, quant: QuantScheme) -> String {
 /// tables are checked against each other by `rung_tables_agree_across_crates`.
 const RUNGS: [(&str, DevOp, DevOp, DevOp); 5] = [
     ("256x256x64", DevOp::Gemm, DevOp::GemmFp8, DevOp::GemmMxfp4),
-    ("128x128x64", DevOp::GemmMed, DevOp::GemmMedFp8, DevOp::GemmMedMxfp4),
-    ("64x128x64", DevOp::GemmSmall, DevOp::GemmSmallFp8, DevOp::GemmSmallMxfp4),
-    ("128x256x64", DevOp::GemmWide, DevOp::GemmWideFp8, DevOp::GemmWideMxfp4),
-    ("192x256x64", DevOp::GemmC5, DevOp::GemmC5Fp8, DevOp::GemmC5Mxfp4),
+    (
+        "128x128x64",
+        DevOp::GemmMed,
+        DevOp::GemmMedFp8,
+        DevOp::GemmMedMxfp4,
+    ),
+    (
+        "64x128x64",
+        DevOp::GemmSmall,
+        DevOp::GemmSmallFp8,
+        DevOp::GemmSmallMxfp4,
+    ),
+    (
+        "128x256x64",
+        DevOp::GemmWide,
+        DevOp::GemmWideFp8,
+        DevOp::GemmWideMxfp4,
+    ),
+    (
+        "192x256x64",
+        DevOp::GemmC5,
+        DevOp::GemmC5Fp8,
+        DevOp::GemmC5Mxfp4,
+    ),
 ];
 
 /// The opcode that carries `tile` under `quant`, or `None` when no dispatch arm does.
@@ -114,7 +134,8 @@ mod tests {
     /// measured, which is the state the whole campaign existed to leave behind.
     #[test]
     fn every_rung_is_compiled_into_the_sweep_harness() {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/amd/test_kernels.hip");
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../runtime/amd/test_kernels.hip");
         let src = std::fs::read_to_string(&p).expect("test_kernels.hip");
         for (tile, ..) in RUNGS {
             let dims: Vec<&str> = tile.split('x').collect();

@@ -102,7 +102,10 @@ fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
         | DevOp::FlashDecodeFp8 => Some(i[6]),
         _ => None,
     };
-    Arm { op: op_name(op), hd }
+    Arm {
+        op: op_name(op),
+        hd,
+    }
 }
 
 /// The arm set of one program, or of one SEGMENT of one program.
@@ -235,7 +238,8 @@ fn shapes(m: &Model) -> Shapes {
     for (pi, p) in m.progs.iter().enumerate() {
         let decode = pi == last;
         if !decode {
-            s.prefill_buckets.push(m.prog_t.get(pi).copied().unwrap_or(0));
+            s.prefill_buckets
+                .push(m.prog_t.get(pi).copied().unwrap_or(0));
         }
         for inst in &p.insts {
             let Some(op) = op_of(inst.op) else { continue };
@@ -248,7 +252,11 @@ fn shapes(m: &Model) -> Shapes {
                     s.kv_heads.insert(kvh);
                     s.kv_dtype.insert(
                         hd,
-                        if op == DevOp::FlashDecodeFp8 { "e4m3" } else { "bf16" },
+                        if op == DevOp::FlashDecodeFp8 {
+                            "e4m3"
+                        } else {
+                            "bf16"
+                        },
                     );
                     if decode {
                         s.decode_batch = s.decode_batch.max(nb);
@@ -266,7 +274,11 @@ fn shapes(m: &Model) -> Shapes {
                     s.kv_heads.insert(inst.i[3]);
                     s.kv_dtype
                         .entry(inst.i[6])
-                        .or_insert(if op == DevOp::FlashPrefillFp8 { "e4m3" } else { "bf16" });
+                        .or_insert(if op == DevOp::FlashPrefillFp8 {
+                            "e4m3"
+                        } else {
+                            "bf16"
+                        });
                 }
                 // The encoding slot is PHASE-DEPENDENT. Prefill grouped ops carry `n_exp` in i[2],
                 // so the encoding took i[3]; the decode expert ops predate the field and already use
@@ -371,13 +383,15 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
     f.insert(
         "fp8_weights".into(),
         json!(
-            FP8_WEIGHT_OPS.iter().any(|k| has(k))
-                || union.iter().any(|a| a.op.ends_with("Fp8Blk"))
+            FP8_WEIGHT_OPS.iter().any(|k| has(k)) || union.iter().any(|a| a.op.ends_with("Fp8Blk"))
         ),
     );
     // w8a8 is the per-row ACTIVATION quant: `QuantFp8` exists only on that path.
     f.insert("w8a8".into(), json!(has("QuantFp8")));
-    f.insert("moe".into(), json!(union.iter().any(|a| a.op.starts_with("Moe"))));
+    f.insert(
+        "moe".into(),
+        json!(union.iter().any(|a| a.op.starts_with("Moe"))),
+    );
     f.insert(
         "mla".into(),
         json!(
@@ -437,7 +451,11 @@ fn features(union: &BTreeSet<Arm>) -> Map<String, Value> {
 ///   * `kv_enc`     — the KV cache dtype, independent of the weight axis;
 ///   * `expert_enc` — the MoE expert weights, which the MLA family carries as a runtime field and
 ///     which therefore cannot be read off an opcode name at all.
-fn precision_axes(f: &mut Map<String, Value>, s: &Shapes, union: &BTreeSet<Arm>) -> Map<String, Value> {
+fn precision_axes(
+    f: &mut Map<String, Value>,
+    s: &Shapes,
+    union: &BTreeSet<Arm>,
+) -> Map<String, Value> {
     let has = |n: &str| union.iter().any(|a| a.op == n);
     let on = |k: &str| f.get(k).and_then(Value::as_bool).unwrap_or(false);
 
@@ -480,7 +498,11 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     // `GemvFp8Blk` and `DenseGluFp8Blk` have no encoding field — still count on their own.
     let expert_fp8 = s.moe_enc.contains(&1);
     let hard_fp8 = |k: &str| union_has(s, k);
-    if f.get("fp8_weights").and_then(Value::as_bool).unwrap_or(false) && !expert_fp8 {
+    if f.get("fp8_weights")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && !expert_fp8
+    {
         let real = FP8_WEIGHT_OPS.iter().any(|k| hard_fp8(k));
         f.insert("fp8_weights".into(), json!(real));
     }
@@ -773,7 +795,11 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
             // `bucket` for prefill (chunk rows), `batch` for decode — same field,
             // different meaning, so name it for what it is on each side.
             o.insert(
-                if p.kind == "prefill" { "bucket".into() } else { "batch".to_string() },
+                if p.kind == "prefill" {
+                    "bucket".into()
+                } else {
+                    "batch".to_string()
+                },
                 json!(p.t),
             );
             o.insert("segment".into(), json!(p.seg));
@@ -927,7 +953,9 @@ pub fn config_header(manifest: &Value) -> String {
     out.push_str("\n/* --- rule-derived shape constants --- */\n");
     if let Some(t) = manifest.get("tuning").and_then(Value::as_object) {
         if let Some(v) = t.get("gv_mm_max").and_then(Value::as_u64) {
-            out.push_str(&format!("#ifndef GV_MM_MAX\n#define GV_MM_MAX {v}\n#endif\n"));
+            out.push_str(&format!(
+                "#ifndef GV_MM_MAX\n#define GV_MM_MAX {v}\n#endif\n"
+            ));
         }
         if let Some(v) = t.get("gf_full").and_then(Value::as_u64) {
             out.push_str(&format!(
@@ -951,15 +979,30 @@ mod tests {
     }
 
     fn inst(op: DevOp, i: [u32; 8]) -> DevInst {
-        DevInst { op: op as u16, blocks: 1, i, ..Default::default() }
+        DevInst {
+            op: op as u16,
+            blocks: 1,
+            i,
+            ..Default::default()
+        }
     }
 
     fn prog(insts: Vec<DevInst>) -> Program {
         Program {
             hier_base: 0,
-            n_cu: 4, n_counter: 0, insts, stream: vec![], stream_ofs: vec![],
-            stream_len: vec![], waits: vec![], succs: vec![], tensors: vec![],
-            gq_stream: vec![], gq_seg_ofs: vec![], l2_sms: 0, l2_domains: 0,
+            n_cu: 4,
+            n_counter: 0,
+            insts,
+            stream: vec![],
+            stream_ofs: vec![],
+            stream_len: vec![],
+            waits: vec![],
+            succs: vec![],
+            tensors: vec![],
+            gq_stream: vec![],
+            gq_seg_ofs: vec![],
+            l2_sms: 0,
+            l2_domains: 0,
         }
     }
 
@@ -977,8 +1020,13 @@ mod tests {
             inst(DevOp::Gemv, [0; 8]),
         ]);
         Model {
-            n_cu: 170, target: 0, tensors: vec![], progs: vec![pf, dec],
-            kv_row_insts: vec![], prog_t: vec![1024, 8], gen: vec![],
+            n_cu: 170,
+            target: 0,
+            tensors: vec![],
+            progs: vec![pf, dec],
+            kv_row_insts: vec![],
+            prog_t: vec![1024, 8],
+            gen: vec![],
         }
     }
 
@@ -987,8 +1035,12 @@ mod tests {
     #[test]
     fn opcodes_come_from_the_stream() {
         let man = build(&model(), "sm_120a");
-        let ops: Vec<&str> = man["opcodes"].as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        let ops: Vec<&str> = man["opcodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(ops.contains(&"FlashDecodeFp8"));
         assert!(ops.contains(&"Gemv"));
         assert!(!ops.contains(&"FlashMlaDecode"));
@@ -999,8 +1051,12 @@ mod tests {
     #[test]
     fn flash_arms_split_by_head_dim() {
         let man = build(&model(), "sm_120a");
-        let union: Vec<&str> = man["union"].as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        let union: Vec<&str> = man["union"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(union.contains(&"FlashDecode/hd256"));
         assert!(union.contains(&"FlashDecodeFp8/hd512"));
     }
@@ -1031,8 +1087,13 @@ mod tests {
     fn gf_full_absent_when_kv_heads_gt_one() {
         let dec = prog(vec![inst(DevOp::FlashDecode, [8, 8, 2, 0, 0, 0, 512, 0])]);
         let m = Model {
-            n_cu: 170, target: 0, tensors: vec![], progs: vec![dec],
-            kv_row_insts: vec![], prog_t: vec![8], gen: vec![],
+            n_cu: 170,
+            target: 0,
+            tensors: vec![],
+            progs: vec![dec],
+            kv_row_insts: vec![],
+            prog_t: vec![8],
+            gen: vec![],
         };
         assert!(build(&m, "sm_120a")["tuning"].get("gf_full").is_none());
     }
@@ -1055,13 +1116,21 @@ mod tests {
     #[test]
     fn nvcc_backend_renders_required_flags() {
         let man = build(&model(), "sm_120a");
-        let req: Vec<&str> = man["backends"]["nvcc"]["requires"].as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        let req: Vec<&str> = man["backends"]["nvcc"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(req.contains(&"PLOW_FP8_KV=1"));
         assert!(req.contains(&"PLOW_NV_PREFILL=1"));
         assert!(!req.contains(&"PLOW_NV_W8A8=1"));
-        let rec: Vec<&str> = man["backends"]["nvcc"]["recommends"].as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+        let rec: Vec<&str> = man["backends"]["nvcc"]["recommends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(rec.contains(&"GV_MM_MAX=8"));
         assert!(rec.contains(&"PLOW_NV_FA_GF_FULL=8"));
     }
@@ -1088,7 +1157,10 @@ mod tests {
         // The fixture is bf16 weights, bf16 activations, fp8 KV (FlashDecodeFp8), no experts.
         assert_eq!(p["weight_enc"], "bf16");
         assert_eq!(p["act_enc"], "bf16", "no QuantFp8 => wide activations");
-        assert_eq!(p["kv_enc"], "fp8", "the KV axis is INDEPENDENT of the weight axis");
+        assert_eq!(
+            p["kv_enc"], "fp8",
+            "the KV axis is INDEPENDENT of the weight axis"
+        );
         assert_eq!(p["expert_enc"], "none");
     }
 
@@ -1099,17 +1171,33 @@ mod tests {
     fn activation_axis_follows_quant_fp8_not_the_weight_flag() {
         let w8a16 = prog(vec![inst(DevOp::GemmFp8, [0; 8])]);
         let m = Model {
-            n_cu: 256, target: 0, tensors: vec![], progs: vec![w8a16],
-            kv_row_insts: vec![], prog_t: vec![128], gen: vec![],
+            n_cu: 256,
+            target: 0,
+            tensors: vec![],
+            progs: vec![w8a16],
+            kv_row_insts: vec![],
+            prog_t: vec![128],
+            gen: vec![],
         };
         let man = build(&m, "gfx950");
         assert_eq!(man["precision"]["weight_enc"], "fp8");
-        assert_eq!(man["precision"]["act_enc"], "bf16", "fp8 weights, bf16 activations = w8a16");
+        assert_eq!(
+            man["precision"]["act_enc"], "bf16",
+            "fp8 weights, bf16 activations = w8a16"
+        );
 
-        let w8a8 = prog(vec![inst(DevOp::QuantFp8, [0; 8]), inst(DevOp::GemmFp8, [0; 8])]);
+        let w8a8 = prog(vec![
+            inst(DevOp::QuantFp8, [0; 8]),
+            inst(DevOp::GemmFp8, [0; 8]),
+        ]);
         let m2 = Model {
-            n_cu: 256, target: 0, tensors: vec![], progs: vec![w8a8],
-            kv_row_insts: vec![], prog_t: vec![128], gen: vec![],
+            n_cu: 256,
+            target: 0,
+            tensors: vec![],
+            progs: vec![w8a8],
+            kv_row_insts: vec![],
+            prog_t: vec![128],
+            gen: vec![],
         };
         let man2 = build(&m2, "gfx950");
         assert_eq!(man2["precision"]["act_enc"], "fp8");
@@ -1122,13 +1210,29 @@ mod tests {
     #[test]
     fn gfx950_backend_renders_the_axis_defines() {
         let man = build(&model(), "gfx950");
-        let req: Vec<&str> = man["backends"]["gfx950"]["requires"].as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
-        assert!(req.contains(&"PLOW_BUCKET_DECODE=0"), "the packet has a prefill bucket");
+        let req: Vec<&str> = man["backends"]["gfx950"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            req.contains(&"PLOW_BUCKET_DECODE=0"),
+            "the packet has a prefill bucket"
+        );
         assert!(req.contains(&"PLOW_FP8_KV=1"));
-        assert!(!req.contains(&"PLOW_FP8=1"), "bf16 weights must not ask for the fp8 object");
-        assert!(!req.contains(&"PLOW_MLA_PREFILL=1"), "no MLA ops in this packet");
-        assert!(!req.contains(&"PLOW_K3=1"), "no K3 block ops in this packet either");
+        assert!(
+            !req.contains(&"PLOW_FP8=1"),
+            "bf16 weights must not ask for the fp8 object"
+        );
+        assert!(
+            !req.contains(&"PLOW_MLA_PREFILL=1"),
+            "no MLA ops in this packet"
+        );
+        assert!(
+            !req.contains(&"PLOW_K3=1"),
+            "no K3 block ops in this packet either"
+        );
         // nvcc is still rendered — adding a backend must not remove one.
         assert!(man["backends"]["nvcc"]["requires"].is_array());
     }
@@ -1152,12 +1256,20 @@ mod tests {
         let gfx = |ops: &[DevOp]| -> Vec<String> {
             let p = prog(ops.iter().map(|&o| inst(o, [0; 8])).collect());
             let m = Model {
-                n_cu: 256, target: 0, tensors: vec![], progs: vec![p],
-                kv_row_insts: vec![], prog_t: vec![1], gen: vec![],
+                n_cu: 256,
+                target: 0,
+                tensors: vec![],
+                progs: vec![p],
+                kv_row_insts: vec![],
+                prog_t: vec![1],
+                gen: vec![],
             };
             build(&m, "gfx950")["backends"]["gfx950"]["requires"]
-                .as_array().unwrap().iter()
-                .filter_map(|v| v.as_str().map(str::to_string)).collect()
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
         };
         for op in [
             DevOp::AttnRes,
@@ -1175,7 +1287,9 @@ mod tests {
             );
         }
         // And it does not leak onto a packet that has none of them.
-        assert!(!gfx(&[DevOp::Gemv, DevOp::RmsNorm]).iter().any(|r| r == "PLOW_K3=1"));
+        assert!(!gfx(&[DevOp::Gemv, DevOp::RmsNorm])
+            .iter()
+            .any(|r| r == "PLOW_K3=1"));
     }
 
     /// `arm_of` must read each flash op's head-dim from the slot that op ACTUALLY carries it in.
@@ -1190,11 +1304,19 @@ mod tests {
         let mut i = [0u32; 8];
         i[3] = 256; // FlashMerge's slot
         i[6] = 128; // FlashPrefill / FlashDecode's slot
-        assert_eq!(arm_of(DevOp::FlashMerge, &i).hd, Some(256), "FlashMerge takes i[3]");
+        assert_eq!(
+            arm_of(DevOp::FlashMerge, &i).hd,
+            Some(256),
+            "FlashMerge takes i[3]"
+        );
         assert_eq!(arm_of(DevOp::FlashPrefill, &i).hd, Some(128));
         assert_eq!(arm_of(DevOp::FlashDecode, &i).hd, Some(128));
         assert_eq!(arm_of(DevOp::FlashDecodeFp8, &i).hd, Some(128));
-        assert_eq!(arm_of(DevOp::Gemv, &i).hd, None, "non-flash ops are not templated on a field");
+        assert_eq!(
+            arm_of(DevOp::Gemv, &i).hd,
+            None,
+            "non-flash ops are not templated on a field"
+        );
         // A real FlashMerge packet leaves i[6] at 0, so the old slot cannot distinguish arms.
         let mut real = [0u32; 8];
         real[3] = 512;
@@ -1231,17 +1353,28 @@ mod tests {
             "no `plow_verify` binary (set PLOW_VERIFY_BIN, or `lake build` in lean-plow/)",
         );
         let man = super::build(&model(), "gfx950", &skipped);
-        let lean = man.get("lean").expect("build.json must carry a `lean` block");
+        let lean = man
+            .get("lean")
+            .expect("build.json must carry a `lean` block");
         assert_eq!(lean["verified"], json!(false));
         assert_eq!(lean["oracle"], json!(false));
-        let reason = lean["reason"].as_str().expect("a skip must state its reason");
-        assert!(reason.contains("plow_verify"), "reason should name the binary: {reason}");
+        let reason = lean["reason"]
+            .as_str()
+            .expect("a skip must state its reason");
+        assert!(
+            reason.contains("plow_verify"),
+            "reason should name the binary: {reason}"
+        );
     }
 
     /// The other side of it: a real pass says so, and says it with no reason.
     #[test]
     fn lean_block_reports_a_clean_verification() {
-        let ok = crate::LeanReport { verified: true, oracle: true, reason: None };
+        let ok = crate::LeanReport {
+            verified: true,
+            oracle: true,
+            reason: None,
+        };
         let man = super::build(&model(), "gfx950", &ok);
         assert_eq!(man["lean"]["verified"], json!(true));
         assert_eq!(man["lean"]["oracle"], json!(true));
@@ -1277,7 +1410,11 @@ mod tests {
         let b = super::build(
             &m,
             "gfx950",
-            &crate::LeanReport { verified: true, oracle: true, reason: None },
+            &crate::LeanReport {
+                verified: true,
+                oracle: true,
+                reason: None,
+            },
         );
         assert_ne!(a["lean"], b["lean"], "the test would be vacuous otherwise");
         assert_eq!(a["pairing"]["hash"], b["pairing"]["hash"]);

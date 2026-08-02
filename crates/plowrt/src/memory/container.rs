@@ -254,7 +254,10 @@ impl Safetensors {
                         dir.display(),
                         many.len(),
                         many.iter()
-                            .map(|(t, p)| format!("-of-{t:05}{}", if *p { " .partial" } else { "" }))
+                            .map(|(t, p)| format!(
+                                "-of-{t:05}{}",
+                                if *p { " .partial" } else { "" }
+                            ))
                             .collect::<Vec<_>>()
                             .join(", "),
                     )));
@@ -331,13 +334,18 @@ impl Safetensors {
                     mmap.len()
                 ))
             })?;
-        let hdr: serde_json::Value = serde_json::from_slice(&mmap[8..data0 as usize])
-            .map_err(|source| RuntimeError::Json {
-                path: path.to_path_buf(),
-                source,
+        let hdr: serde_json::Value =
+            serde_json::from_slice(&mmap[8..data0 as usize]).map_err(|source| {
+                RuntimeError::Json {
+                    path: path.to_path_buf(),
+                    source,
+                }
             })?;
         let obj = hdr.as_object().ok_or_else(|| {
-            RuntimeError::Msg(format!("{}: safetensors header is not an object", path.display()))
+            RuntimeError::Msg(format!(
+                "{}: safetensors header is not an object",
+                path.display()
+            ))
         })?;
 
         for (name, v) in obj {
@@ -350,8 +358,8 @@ impl Safetensors {
             let dt_s = v["dtype"]
                 .as_str()
                 .ok_or_else(|| bad("header entry has no string 'dtype'".into()))?;
-            let dtype = DType::parse(dt_s)
-                .ok_or_else(|| bad(format!("unsupported dtype '{dt_s}'")))?;
+            let dtype =
+                DType::parse(dt_s).ok_or_else(|| bad(format!("unsupported dtype '{dt_s}'")))?;
             let shape: Vec<usize> = v["shape"]
                 .as_array()
                 .ok_or_else(|| bad("header entry has no array 'shape'".into()))?
@@ -364,8 +372,12 @@ impl Safetensors {
                 .filter(|a| a.len() == 2)
                 .ok_or_else(|| bad("header entry has no 2-element 'data_offsets'".into()))?;
             let (a, b) = (
-                off[0].as_u64().ok_or_else(|| bad("bad data_offsets[0]".into()))?,
-                off[1].as_u64().ok_or_else(|| bad("bad data_offsets[1]".into()))?,
+                off[0]
+                    .as_u64()
+                    .ok_or_else(|| bad("bad data_offsets[0]".into()))?,
+                off[1]
+                    .as_u64()
+                    .ok_or_else(|| bad("bad data_offsets[1]".into()))?,
             );
             if b < a {
                 return Err(bad(format!("inverted data_offsets [{a}, {b}]")));
@@ -501,7 +513,13 @@ mod tests {
     #[test]
     fn single_file_fallback_loads() {
         let d = tmpdir("single");
-        write_st(&d.join("model.safetensors"), "w", "BF16", &[2, 2], &[1u8; 8]);
+        write_st(
+            &d.join("model.safetensors"),
+            "w",
+            "BF16",
+            &[2, 2],
+            &[1u8; 8],
+        );
         let c = Safetensors::open_dir(&d).unwrap();
         assert_eq!(c.tensors().len(), 1);
         assert_eq!(c.get("w").unwrap().dtype, DType::Bf16);
@@ -512,10 +530,26 @@ mod tests {
     #[test]
     fn partial_shard_set_loads() {
         let d = tmpdir("partial");
-        write_st(&d.join("model-00001-of-00002.partial.safetensors"), "a", "F32", &[2], &[0u8; 8]);
-        write_st(&d.join("model-00002-of-00002.partial.safetensors"), "b", "F32", &[2], &[0u8; 8]);
+        write_st(
+            &d.join("model-00001-of-00002.partial.safetensors"),
+            "a",
+            "F32",
+            &[2],
+            &[0u8; 8],
+        );
+        write_st(
+            &d.join("model-00002-of-00002.partial.safetensors"),
+            "b",
+            "F32",
+            &[2],
+            &[0u8; 8],
+        );
         // Sidecar headers like the real 31B dir must be ignored.
-        std::fs::write(d.join("model-00001-of-00002.safetensors.header.json"), b"{}").unwrap();
+        std::fs::write(
+            d.join("model-00001-of-00002.safetensors.header.json"),
+            b"{}",
+        )
+        .unwrap();
         let c = Safetensors::open_dir(&d).unwrap();
         assert_eq!(c.tensors().len(), 2);
         assert_eq!(c.get("b").unwrap().shard, 1);
@@ -525,9 +559,18 @@ mod tests {
     #[test]
     fn missing_tensor_names_itself() {
         let d = tmpdir("missing");
-        write_st(&d.join("model.safetensors"), "w", "BF16", &[2, 2], &[1u8; 8]);
+        write_st(
+            &d.join("model.safetensors"),
+            "w",
+            "BF16",
+            &[2, 2],
+            &[1u8; 8],
+        );
         let c = Safetensors::open_dir(&d).unwrap();
-        let e = c.get("model.layers.0.mlp.up_proj.weight").unwrap_err().to_string();
+        let e = c
+            .get("model.layers.0.mlp.up_proj.weight")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("model.layers.0.mlp.up_proj.weight"), "{e}");
         std::fs::remove_dir_all(&d).unwrap();
     }
@@ -536,7 +579,13 @@ mod tests {
     fn short_tensor_hard_fails_with_name() {
         let d = tmpdir("short");
         // shape [2,2] BF16 needs 8 bytes; declare 6.
-        write_st(&d.join("model.safetensors"), "q_proj", "BF16", &[2, 2], &[0u8; 6]);
+        write_st(
+            &d.join("model.safetensors"),
+            "q_proj",
+            "BF16",
+            &[2, 2],
+            &[0u8; 6],
+        );
         let e = Safetensors::open_dir(&d).unwrap_err().to_string();
         assert!(e.contains("q_proj") && e.contains("short tensor"), "{e}");
         std::fs::remove_dir_all(&d).unwrap();
@@ -559,8 +608,20 @@ mod tests {
     #[test]
     fn incomplete_shard_set_names_the_hole() {
         let d = tmpdir("hole");
-        write_st(&d.join("model-00001-of-00003.safetensors"), "a", "F32", &[1], &[0u8; 4]);
-        write_st(&d.join("model-00003-of-00003.safetensors"), "c", "F32", &[1], &[0u8; 4]);
+        write_st(
+            &d.join("model-00001-of-00003.safetensors"),
+            "a",
+            "F32",
+            &[1],
+            &[0u8; 4],
+        );
+        write_st(
+            &d.join("model-00003-of-00003.safetensors"),
+            "c",
+            "F32",
+            &[1],
+            &[0u8; 4],
+        );
         let e = Safetensors::open_dir(&d).unwrap_err().to_string();
         assert!(e.contains("missing shard indices [2]"), "{e}");
         std::fs::remove_dir_all(&d).unwrap();
@@ -571,9 +632,27 @@ mod tests {
     #[test]
     fn ambiguous_shard_sets_hard_fail() {
         let d = tmpdir("ambig");
-        write_st(&d.join("model-00001-of-00001.safetensors"), "a", "F32", &[1], &[0u8; 4]);
-        write_st(&d.join("model-00001-of-00002.safetensors"), "b", "F32", &[1], &[0u8; 4]);
-        write_st(&d.join("model-00002-of-00002.safetensors"), "c", "F32", &[1], &[0u8; 4]);
+        write_st(
+            &d.join("model-00001-of-00001.safetensors"),
+            "a",
+            "F32",
+            &[1],
+            &[0u8; 4],
+        );
+        write_st(
+            &d.join("model-00001-of-00002.safetensors"),
+            "b",
+            "F32",
+            &[1],
+            &[0u8; 4],
+        );
+        write_st(
+            &d.join("model-00002-of-00002.safetensors"),
+            "c",
+            "F32",
+            &[1],
+            &[0u8; 4],
+        );
         let e = Safetensors::open_dir(&d).unwrap_err().to_string();
         assert!(e.contains("ambiguous checkpoint"), "{e}");
         std::fs::remove_dir_all(&d).unwrap();

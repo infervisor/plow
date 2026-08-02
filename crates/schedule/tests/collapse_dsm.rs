@@ -1,7 +1,7 @@
 //! The collapsed graph schedules feasibly, DSM domains are modeled, and the
 //! relax pass demotes a colocated hand-off that can't fit one SM.
 
-use costmodel::{hwspec, DEFAULT_PAGE_BYTES, GemmShape, RowShape, Soc, SramPolicy};
+use costmodel::{hwspec, GemmShape, RowShape, Soc, SramPolicy, DEFAULT_PAGE_BYTES};
 use rewrite::{
     assemble, collapse, ConstraintSet, GraphNode, HandoffKind, LayerPlan, LocalityReq, OpDesc,
     OpKind, OpSpec, RelaxableHandoff, TileGraph,

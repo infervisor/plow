@@ -309,7 +309,9 @@ async fn buffer_and_reply(
     while let Some(chunk) = rx.recv().await {
         match chunk {
             StreamChunk::Token { text: delta, .. } => text.push_str(&delta),
-            StreamChunk::Done { reason, usage: u, .. } => {
+            StreamChunk::Done {
+                reason, usage: u, ..
+            } => {
                 finish = Some(reason.as_str());
                 usage = Some(u.into());
                 break;
@@ -453,10 +455,7 @@ fn sse_response(
                         });
                         // §TTFT: this frame is the one `vllm bench serve` stamps.
                         if role.is_some() {
-                            crate::obs::ttft::dump(
-                                t_arrive.elapsed().as_nanos() as u64,
-                                n_prompt,
-                            );
+                            crate::obs::ttft::dump(t_arrive.elapsed().as_nanos() as u64, n_prompt);
                             crate::obs::pfx::report();
                         }
                         let ch = ChatChunk {

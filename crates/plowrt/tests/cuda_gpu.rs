@@ -88,7 +88,8 @@ fn vector_add_end_to_end() {
     be.synchronize().unwrap();
 
     let mut c = vec![0f32; N];
-    be.download(&d_c, 0, bytemuck::cast_slice_mut(&mut c)).unwrap();
+    be.download(&d_c, 0, bytemuck::cast_slice_mut(&mut c))
+        .unwrap();
     for i in 0..N {
         assert_eq!(c[i], (3 * i) as f32, "c[{i}]");
     }
@@ -115,7 +116,8 @@ fn vector_add_end_to_end() {
     be.event_record(&ev_start, &stream).unwrap();
     // SAFETY: `pin` and the device buffers outlive the stream synchronize.
     unsafe {
-        be.memcpy_htod_async(d_a.base, pin.as_slice(), &stream).unwrap();
+        be.memcpy_htod_async(d_a.base, pin.as_slice(), &stream)
+            .unwrap();
     }
     be.memset_d8_async(d_b.base, 0, N * 4, &stream).unwrap();
     let mut params = [
@@ -124,11 +126,19 @@ fn vector_add_end_to_end() {
         &mut pc as *mut _ as *mut std::ffi::c_void,
         &mut n as *mut _ as *mut std::ffi::c_void,
     ];
-    be.launch_cooperative(f, (N as u32).div_ceil(256), 256, 0, &mut params, Some(&stream))
-        .unwrap();
+    be.launch_cooperative(
+        f,
+        (N as u32).div_ceil(256),
+        256,
+        0,
+        &mut params,
+        Some(&stream),
+    )
+    .unwrap();
     // SAFETY: as above — the readback retires before the synchronize returns.
     unsafe {
-        be.memcpy_dtoh_async(pin.as_mut_slice(), d_c.base, &stream).unwrap();
+        be.memcpy_dtoh_async(pin.as_mut_slice(), d_c.base, &stream)
+            .unwrap();
     }
     be.event_record(&ev_end, &stream).unwrap();
     be.stream_synchronize(&stream).unwrap();
@@ -139,9 +149,15 @@ fn vector_add_end_to_end() {
         assert_eq!(v, (10 * i) as f32, "async c[{i}]");
     }
     // Events retired with the stream; the device-timeline delta is sane.
-    assert!(be.event_query(&ev_end).unwrap(), "event not retired after sync");
+    assert!(
+        be.event_query(&ev_end).unwrap(),
+        "event not retired after sync"
+    );
     be.event_synchronize(&ev_end).unwrap();
     let ms = be.event_elapsed_ms(&ev_start, &ev_end).unwrap();
-    assert!((0.0..10_000.0).contains(&ms), "elapsed {ms} ms out of range");
+    assert!(
+        (0.0..10_000.0).contains(&ms),
+        "elapsed {ms} ms out of range"
+    );
     eprintln!("async round-trip device time: {ms:.3} ms");
 }

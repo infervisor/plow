@@ -73,7 +73,10 @@ fn run() -> Result<(), Err> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let opt = |name: &str| -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
     let flag = |name: &str| args.iter().any(|a| a == name);
     let db = PathBuf::from(opt("--db").unwrap_or_else(|| "tuning".into()));
@@ -103,7 +106,9 @@ fn run() -> Result<(), Err> {
 /// selectable against an object nobody measured, which is worse than no record at all.
 fn digests(root: &std::path::Path) -> Result<Digests, Err> {
     let inv = kernelcaps::dense_gemm_inventory(root, hwspec::IsaLevel::Gfx950).map_err(|e| {
-        format!("cannot probe the gfx950 interpreter ({e}); ingest needs it to key records to a build")
+        format!(
+            "cannot probe the gfx950 interpreter ({e}); ingest needs it to key records to a build"
+        )
     })?;
     Ok(Digests {
         implementation: inv.build().label(),
@@ -193,20 +198,30 @@ fn ingest(db: &PathBuf, samples: &PathBuf, campaign: &str, provisional: bool) ->
     }
 
     let store = TuneStore::new(db.clone());
-    let (bad, good): (Vec<_>, Vec<_>) =
-        records.into_iter().partition(|r| !matches!(r.correctness, Correctness::Pass));
+    let (bad, good): (Vec<_>, Vec<_>) = records
+        .into_iter()
+        .partition(|r| !matches!(r.correctness, Correctness::Pass));
     if !bad.is_empty() {
         let n = store.record_rejected(CELL, bad, "gemv row-coverage/dot check failed")?;
-        println!("rejected    : {n} record(s) failed the oracle: {}", failed.join(", "));
+        println!(
+            "rejected    : {n} record(s) failed the oracle: {}",
+            failed.join(", ")
+        );
     }
     if provisional {
-        println!("provisional : {} record(s) stored, NOT selectable", good.len());
+        println!(
+            "provisional : {} record(s) stored, NOT selectable",
+            good.len()
+        );
         let n = store.record_rejected(CELL, good, "--provisional: screening pass only")?;
         println!("stored      : {n}");
         return Ok(());
     }
     let n = store.publish(CELL, good)?;
-    println!("published   : {n} qualified record(s) into {}/{CELL}", db.display());
+    println!(
+        "published   : {n} qualified record(s) into {}/{CELL}",
+        db.display()
+    );
     Ok(())
 }
 
@@ -227,8 +242,12 @@ fn best(db: &PathBuf) -> Result<(), Err> {
         if rec.profile != "decode_gemv" {
             continue;
         }
-        let Some((_fam, rest)) = case.split_once('/') else { continue };
-        let Some((dims, _)) = rest.split_once('/') else { continue };
+        let Some((_fam, rest)) = case.split_once('/') else {
+            continue;
+        };
+        let Some((dims, _)) = rest.split_once('/') else {
+            continue;
+        };
         let d: Vec<u32> = dims.split('x').filter_map(|s| s.parse().ok()).collect();
         if d.len() != 3 {
             continue;
@@ -240,7 +259,10 @@ fn best(db: &PathBuf) -> Result<(), Err> {
     if rows.is_empty() {
         println!("  (no selectable GEMV records for this build)");
     }
-    println!("  {:<10} {:<8} {:<22} {}", "N", "K", "op", "median ns / ns-per-row at M=1,2,4,8,16");
+    println!(
+        "  {:<10} {:<8} {:<22} {}",
+        "N", "K", "op", "median ns / ns-per-row at M=1,2,4,8,16"
+    );
     for ((n, k, op), by_m) in &rows {
         print!("  {n:<10} {k:<8} {op:<22}");
         for m in [1u32, 2, 4, 8, 16] {
@@ -252,7 +274,10 @@ fn best(db: &PathBuf) -> Result<(), Err> {
         println!();
     }
     if !stale.is_empty() {
-        println!("stale       : {} record(s) exist but are for a different build", stale.len());
+        println!(
+            "stale       : {} record(s) exist but are for a different build",
+            stale.len()
+        );
     }
     Ok(())
 }

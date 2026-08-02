@@ -71,13 +71,21 @@ pub enum SelectError {
     /// Nothing in this build can run the op. A hard error: the alternative is
     /// emitting an opcode the interpreter does not dispatch, which AMD silently
     /// no-ops.
-    NoCandidate { op: String, hardware: String, profile: String },
+    NoCandidate {
+        op: String,
+        hardware: String,
+        profile: String,
+    },
 }
 
 impl std::fmt::Display for SelectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SelectError::NoCandidate { op, hardware, profile } => write!(
+            SelectError::NoCandidate {
+                op,
+                hardware,
+                profile,
+            } => write!(
                 f,
                 "no kernel in the {profile} profile on {hardware} can run {op}; \
                  compiling one anyway would emit an opcode with no dispatch arm"
@@ -119,7 +127,10 @@ pub fn select_kernel(
     let candidates = reg.candidates(op, hw, profile);
     if candidates.is_empty() {
         return Err(SelectError::NoCandidate {
-            op: format!("{:?} {:?} {}x{}x{}", op.semantic, op.phase, op.shape.m, op.shape.n, op.shape.k),
+            op: format!(
+                "{:?} {:?} {}x{}x{}",
+                op.semantic, op.phase, op.shape.m, op.shape.n, op.shape.k
+            ),
             hardware: hw.tuning_path(),
             profile: profile.label().to_string(),
         });
@@ -129,15 +140,24 @@ pub fn select_kernel(
     // rank. Pick the lowest opcode as canonical so the choice is stable, and
     // record that the alternatives were names rather than kernels.
     let first_hash = candidates[0].implementation_hash.as_str();
-    if candidates.len() > 1 && candidates.iter().all(|k| k.implementation_hash == first_hash) {
+    if candidates.len() > 1
+        && candidates
+            .iter()
+            .all(|k| k.implementation_hash == first_hash)
+    {
         let mut ids: Vec<KernelId> = candidates.iter().map(|k| k.id).collect();
         ids.sort();
         let canonical = ids[0];
-        let tile = candidates.iter().find(|k| k.id == canonical).and_then(|k| k.tile);
+        let tile = candidates
+            .iter()
+            .find(|k| k.id == canonical)
+            .and_then(|k| k.tile);
         return Ok(Realization {
             kernel: canonical,
             tile,
-            rationale: Rationale::AliasCollapsed { members: candidates.len() },
+            rationale: Rationale::AliasCollapsed {
+                members: candidates.len(),
+            },
             fallbacks: ids.into_iter().skip(1).collect(),
         });
     }
@@ -173,8 +193,10 @@ pub fn select_kernel(
     }
 
     // Step 4. Cold start.
-    let mut scored: Vec<(KernelId, u64, Option<TileConfig>)> =
-        candidates.iter().map(|k| (k.id, analytical(k), k.tile)).collect();
+    let mut scored: Vec<(KernelId, u64, Option<TileConfig>)> = candidates
+        .iter()
+        .map(|k| (k.id, analytical(k), k.tile))
+        .collect();
     // Stable on ties: equal cost must not depend on registry insertion order,
     // or the same compile produces different bundles.
     scored.sort_by_key(|(id, cost, _)| (*cost, id.raw()));
@@ -208,41 +230,68 @@ mod tests {
     }
 
     fn amd_registry() -> Inventory {
-        Inventory::probed(crate::test_build(hwspec::IsaLevel::Gfx950), [
-            KernelSpec::gemm_tile(DevOp::Gemm, hwspec::IsaLevel::Gfx950, 256, 256, 64, "exec_gemm"),
-            KernelSpec::gemm_tile(
-                DevOp::GemmMed,
-                hwspec::IsaLevel::Gfx950,
-                128,
-                128,
-                64,
-                "exec_gemm_med",
-            ),
-            KernelSpec::gemm_tile(
-                DevOp::GemmSmall,
-                hwspec::IsaLevel::Gfx950,
-                64,
-                128,
-                64,
-                "exec_gemm_small",
-            ),
-        ])
+        Inventory::probed(
+            crate::test_build(hwspec::IsaLevel::Gfx950),
+            [
+                KernelSpec::gemm_tile(
+                    DevOp::Gemm,
+                    hwspec::IsaLevel::Gfx950,
+                    256,
+                    256,
+                    64,
+                    "exec_gemm",
+                ),
+                KernelSpec::gemm_tile(
+                    DevOp::GemmMed,
+                    hwspec::IsaLevel::Gfx950,
+                    128,
+                    128,
+                    64,
+                    "exec_gemm_med",
+                ),
+                KernelSpec::gemm_tile(
+                    DevOp::GemmSmall,
+                    hwspec::IsaLevel::Gfx950,
+                    64,
+                    128,
+                    64,
+                    "exec_gemm_small",
+                ),
+            ],
+        )
     }
 
     fn nvidia_registry() -> Inventory {
         // All three opcodes, one body -- what interp_sm120.cu actually does.
-        Inventory::probed(crate::test_build(hwspec::IsaLevel::Gfx950), [
-            KernelSpec::gemm_tile(DevOp::Gemm, hwspec::IsaLevel::Sm90a, 128, 128, 32, "d_gemm@nv"),
-            KernelSpec::gemm_tile(DevOp::GemmMed, hwspec::IsaLevel::Sm90a, 128, 128, 32, "d_gemm@nv"),
-            KernelSpec::gemm_tile(
-                DevOp::GemmSmall,
-                hwspec::IsaLevel::Sm90a,
-                128,
-                128,
-                32,
-                "d_gemm@nv",
-            ),
-        ])
+        Inventory::probed(
+            crate::test_build(hwspec::IsaLevel::Gfx950),
+            [
+                KernelSpec::gemm_tile(
+                    DevOp::Gemm,
+                    hwspec::IsaLevel::Sm90a,
+                    128,
+                    128,
+                    32,
+                    "d_gemm@nv",
+                ),
+                KernelSpec::gemm_tile(
+                    DevOp::GemmMed,
+                    hwspec::IsaLevel::Sm90a,
+                    128,
+                    128,
+                    32,
+                    "d_gemm@nv",
+                ),
+                KernelSpec::gemm_tile(
+                    DevOp::GemmSmall,
+                    hwspec::IsaLevel::Sm90a,
+                    128,
+                    128,
+                    32,
+                    "d_gemm@nv",
+                ),
+            ],
+        )
     }
 
     fn op() -> OpSignature {
@@ -265,7 +314,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(r.rationale, Rationale::AliasCollapsed { members: 3 });
-        assert_eq!(r.kernel, KernelId(DevOp::Gemm), "lowest opcode is canonical");
+        assert_eq!(
+            r.kernel,
+            KernelId(DevOp::Gemm),
+            "lowest opcode is canonical"
+        );
         assert_eq!(r.fallbacks.len(), 2);
     }
 
@@ -273,7 +326,13 @@ mod tests {
     /// consulted and a real choice is made.
     #[test]
     fn amd_tile_opcodes_are_ranked_for_real() {
-        let prefer_med = |k: &KernelSpec| if k.id == KernelId(DevOp::GemmMed) { 1 } else { 9 };
+        let prefer_med = |k: &KernelSpec| {
+            if k.id == KernelId(DevOp::GemmMed) {
+                1
+            } else {
+                9
+            }
+        };
         let r = select_kernel(
             &amd_registry(),
             &op(),
@@ -305,7 +364,13 @@ mod tests {
             &Table(t),
             // The analytical model insists on the big tile; the measurement
             // disagrees and must win.
-            |k| if k.id == KernelId(DevOp::Gemm) { 0 } else { 100 },
+            |k| {
+                if k.id == KernelId(DevOp::Gemm) {
+                    0
+                } else {
+                    100
+                }
+            },
         )
         .unwrap();
 
@@ -327,7 +392,13 @@ mod tests {
             &fp("MI350X"),
             ProfileId::PrefillDense,
             &Table(t),
-            |k| if k.id == KernelId(DevOp::Gemm) { 5 } else { 900 },
+            |k| {
+                if k.id == KernelId(DevOp::Gemm) {
+                    5
+                } else {
+                    900
+                }
+            },
         )
         .unwrap();
 
@@ -376,14 +447,17 @@ mod tests {
 
     #[test]
     fn a_single_legal_candidate_is_reported_as_such() {
-        let reg = Inventory::probed(crate::test_build(hwspec::IsaLevel::Gfx950), [KernelSpec::gemm_tile(
-            DevOp::Gemm,
-            hwspec::IsaLevel::Gfx950,
-            256,
-            256,
-            64,
-            "exec_gemm",
-        )]);
+        let reg = Inventory::probed(
+            crate::test_build(hwspec::IsaLevel::Gfx950),
+            [KernelSpec::gemm_tile(
+                DevOp::Gemm,
+                hwspec::IsaLevel::Gfx950,
+                256,
+                256,
+                64,
+                "exec_gemm",
+            )],
+        );
         let r = select_kernel(
             &reg,
             &op(),

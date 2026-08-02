@@ -318,9 +318,13 @@ impl HsaDriver {
 
         macro_rules! resolve {
             ($lib:expr, $name:expr) => {
-                *unsafe { $lib.get($name) }
-                    .map_err(|e| RuntimeError::Device(format!("resolve {}: {e}", std::str::from_utf8($name).unwrap_or("?"))))?
-            }
+                *unsafe { $lib.get($name) }.map_err(|e| {
+                    RuntimeError::Device(format!(
+                        "resolve {}: {e}",
+                        std::str::from_utf8($name).unwrap_or("?")
+                    ))
+                })?
+            };
         }
 
         let drv = HsaDriver {
@@ -330,7 +334,10 @@ impl HsaDriver {
             hsa_agent_get_info: resolve!(lib, b"hsa_agent_get_info\0"),
             hsa_agent_iterate_regions: resolve!(lib, b"hsa_agent_iterate_regions\0"),
             hsa_region_get_info: resolve!(lib, b"hsa_region_get_info\0"),
-            hsa_amd_agent_iterate_memory_pools: resolve!(lib, b"hsa_amd_agent_iterate_memory_pools\0"),
+            hsa_amd_agent_iterate_memory_pools: resolve!(
+                lib,
+                b"hsa_amd_agent_iterate_memory_pools\0"
+            ),
             hsa_amd_memory_pool_get_info: resolve!(lib, b"hsa_amd_memory_pool_get_info\0"),
             hsa_amd_memory_pool_allocate: resolve!(lib, b"hsa_amd_memory_pool_allocate\0"),
             hsa_amd_memory_pool_free: resolve!(lib, b"hsa_amd_memory_pool_free\0"),
@@ -340,20 +347,35 @@ impl HsaDriver {
             hsa_amd_memory_async_copy: resolve!(lib, b"hsa_amd_memory_async_copy\0"),
             hsa_queue_create: resolve!(lib, b"hsa_queue_create\0"),
             hsa_queue_destroy: resolve!(lib, b"hsa_queue_destroy\0"),
-            hsa_queue_add_write_index_screlease: resolve!(lib, b"hsa_queue_add_write_index_screlease\0"),
-            hsa_queue_load_read_index_scacquire: resolve!(lib, b"hsa_queue_load_read_index_scacquire\0"),
+            hsa_queue_add_write_index_screlease: resolve!(
+                lib,
+                b"hsa_queue_add_write_index_screlease\0"
+            ),
+            hsa_queue_load_read_index_scacquire: resolve!(
+                lib,
+                b"hsa_queue_load_read_index_scacquire\0"
+            ),
             hsa_signal_create: resolve!(lib, b"hsa_signal_create\0"),
             hsa_signal_destroy: resolve!(lib, b"hsa_signal_destroy\0"),
             hsa_signal_store_screlease: resolve!(lib, b"hsa_signal_store_screlease\0"),
             hsa_signal_wait_scacquire: resolve!(lib, b"hsa_signal_wait_scacquire\0"),
             hsa_signal_add_screlease: resolve!(lib, b"hsa_signal_add_screlease\0"),
-            hsa_code_object_reader_create_from_memory: resolve!(lib, b"hsa_code_object_reader_create_from_memory\0"),
+            hsa_code_object_reader_create_from_memory: resolve!(
+                lib,
+                b"hsa_code_object_reader_create_from_memory\0"
+            ),
             hsa_code_object_reader_destroy: resolve!(lib, b"hsa_code_object_reader_destroy\0"),
             hsa_executable_create_alt: resolve!(lib, b"hsa_executable_create_alt\0"),
-            hsa_executable_load_agent_code_object: resolve!(lib, b"hsa_executable_load_agent_code_object\0"),
+            hsa_executable_load_agent_code_object: resolve!(
+                lib,
+                b"hsa_executable_load_agent_code_object\0"
+            ),
             hsa_executable_freeze: resolve!(lib, b"hsa_executable_freeze\0"),
             hsa_executable_destroy: resolve!(lib, b"hsa_executable_destroy\0"),
-            hsa_executable_get_symbol_by_name: resolve!(lib, b"hsa_executable_get_symbol_by_name\0"),
+            hsa_executable_get_symbol_by_name: resolve!(
+                lib,
+                b"hsa_executable_get_symbol_by_name\0"
+            ),
             hsa_executable_symbol_get_info: resolve!(lib, b"hsa_executable_symbol_get_info\0"),
             vmem: Self::open_vmem(&lib),
             lib,
@@ -421,7 +443,11 @@ struct AgentAccum {
 unsafe extern "C" fn agent_trampoline(agent: HsaAgent, data: *mut c_void) -> HsaStatus {
     let acc = &mut *(data as *mut AgentAccum);
     let mut dtype: u32 = 0;
-    let rc = (acc.get_info)(agent, HSA_AGENT_INFO_DEVICE, &mut dtype as *mut u32 as *mut c_void);
+    let rc = (acc.get_info)(
+        agent,
+        HSA_AGENT_INFO_DEVICE,
+        &mut dtype as *mut u32 as *mut c_void,
+    );
     if rc != HSA_STATUS_SUCCESS {
         return HSA_STATUS_SUCCESS; // skip
     }
@@ -445,8 +471,11 @@ unsafe extern "C" fn pool_trampoline(pool: HsaMemoryPool, data: *mut c_void) -> 
         return HSA_STATUS_SUCCESS;
     }
     let mut seg: u32 = 0;
-    if (acc.get_pool_info)(pool, HSA_AMD_MEMORY_POOL_INFO_SEGMENT, &mut seg as *mut _ as *mut c_void)
-        != HSA_STATUS_SUCCESS
+    if (acc.get_pool_info)(
+        pool,
+        HSA_AMD_MEMORY_POOL_INFO_SEGMENT,
+        &mut seg as *mut _ as *mut c_void,
+    ) != HSA_STATUS_SUCCESS
     {
         return HSA_STATUS_SUCCESS;
     }
@@ -454,8 +483,11 @@ unsafe extern "C" fn pool_trampoline(pool: HsaMemoryPool, data: *mut c_void) -> 
         return HSA_STATUS_SUCCESS;
     }
     let mut flags: u32 = 0;
-    if (acc.get_pool_info)(pool, HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS, &mut flags as *mut _ as *mut c_void)
-        != HSA_STATUS_SUCCESS
+    if (acc.get_pool_info)(
+        pool,
+        HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS,
+        &mut flags as *mut _ as *mut c_void,
+    ) != HSA_STATUS_SUCCESS
     {
         return HSA_STATUS_SUCCESS;
     }
@@ -473,8 +505,11 @@ struct RegionAccum {
 unsafe extern "C" fn region_trampoline(region: HsaRegion, data: *mut c_void) -> HsaStatus {
     let acc = &mut *(data as *mut RegionAccum);
     let mut seg: u32 = 0;
-    if (acc.get_region_info)(region, HSA_REGION_INFO_SEGMENT, &mut seg as *mut _ as *mut c_void)
-        != HSA_STATUS_SUCCESS
+    if (acc.get_region_info)(
+        region,
+        HSA_REGION_INFO_SEGMENT,
+        &mut seg as *mut _ as *mut c_void,
+    ) != HSA_STATUS_SUCCESS
     {
         return HSA_STATUS_SUCCESS;
     }
@@ -482,8 +517,11 @@ unsafe extern "C" fn region_trampoline(region: HsaRegion, data: *mut c_void) -> 
         return HSA_STATUS_SUCCESS;
     }
     let mut sz: usize = 0;
-    if (acc.get_region_info)(region, HSA_REGION_INFO_SIZE, &mut sz as *mut _ as *mut c_void)
-        == HSA_STATUS_SUCCESS
+    if (acc.get_region_info)(
+        region,
+        HSA_REGION_INFO_SIZE,
+        &mut sz as *mut _ as *mut c_void,
+    ) == HSA_STATUS_SUCCESS
     {
         acc.lds_bytes = sz as u32;
     }
@@ -608,9 +646,9 @@ impl HsaBackend {
         if acc.gpus.is_empty() {
             return Err(RuntimeError::Device("no GPU agents found".into()));
         }
-        let cpu_agent = acc.cpu.ok_or_else(|| {
-            RuntimeError::Device("no CPU agent found".into())
-        })?;
+        let cpu_agent = acc
+            .cpu
+            .ok_or_else(|| RuntimeError::Device("no CPU agent found".into()))?;
         if (device_ordinal as usize) >= acc.gpus.len() {
             return Err(RuntimeError::Device(format!(
                 "device ordinal {} >= {} GPU agents",
@@ -624,7 +662,11 @@ impl HsaBackend {
         // Query device name.
         let mut name_buf = [0u8; 64];
         let rc = unsafe {
-            (drv.hsa_agent_get_info)(agent, HSA_AGENT_INFO_NAME, name_buf.as_mut_ptr() as *mut c_void)
+            (drv.hsa_agent_get_info)(
+                agent,
+                HSA_AGENT_INFO_NAME,
+                name_buf.as_mut_ptr() as *mut c_void,
+            )
         };
         let device_name = if rc == HSA_STATUS_SUCCESS {
             let end = name_buf.iter().position(|&b| b == 0).unwrap_or(64);
@@ -649,7 +691,11 @@ impl HsaBackend {
             lds_bytes: 0,
         };
         let _ = unsafe {
-            (drv.hsa_agent_iterate_regions)(agent, region_trampoline, &mut reg_acc as *mut _ as *mut c_void)
+            (drv.hsa_agent_iterate_regions)(
+                agent,
+                region_trampoline,
+                &mut reg_acc as *mut _ as *mut c_void,
+            )
         };
         // `hsa_agent_iterate_regions` does not enumerate a GROUP region on
         // ROCm 7.2.4/gfx950 — regions are legacy, superseded by memory pools,
@@ -678,11 +724,20 @@ impl HsaBackend {
         };
 
         // Find coarse-grained VRAM pool on this GPU.
-        let vram_pool = Self::find_pool(&drv, agent, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED)?;
+        let vram_pool =
+            Self::find_pool(&drv, agent, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED)?;
         // Find fine-grained system pool on CPU agent.
-        let fine_pool = Self::find_pool(&drv, cpu_agent, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED)?;
+        let fine_pool = Self::find_pool(
+            &drv,
+            cpu_agent,
+            HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED,
+        )?;
         // Find kernarg pool on CPU agent.
-        let kernarg_pool = Self::find_pool(&drv, cpu_agent, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT)?;
+        let kernarg_pool = Self::find_pool(
+            &drv,
+            cpu_agent,
+            HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT,
+        )?;
 
         // Create AQL queue.
         let mut queue: *mut HsaQueue = std::ptr::null_mut();
@@ -704,11 +759,11 @@ impl HsaBackend {
 
         // Create completion signal.
         let mut done_signal = HsaSignal { handle: 0 };
-        let rc = unsafe {
-            (drv.hsa_signal_create)(0, 0, std::ptr::null(), &mut done_signal)
-        };
+        let rc = unsafe { (drv.hsa_signal_create)(0, 0, std::ptr::null(), &mut done_signal) };
         if rc != HSA_STATUS_SUCCESS {
-            unsafe { (drv.hsa_queue_destroy)(queue); }
+            unsafe {
+                (drv.hsa_queue_destroy)(queue);
+            }
             return Err(RuntimeError::Device(format!("hsa_signal_create: {rc}")));
         }
 
@@ -726,9 +781,8 @@ impl HsaBackend {
             return Err(RuntimeError::Device(format!("kernarg ring alloc: {rc}")));
         }
         // Allow GPU agent access to the kernarg ring.
-        let rc = unsafe {
-            (drv.hsa_amd_agents_allow_access)(1, &agent, std::ptr::null(), karg_ring)
-        };
+        let rc =
+            unsafe { (drv.hsa_amd_agents_allow_access)(1, &agent, std::ptr::null(), karg_ring) };
         if rc != HSA_STATUS_SUCCESS {
             unsafe {
                 (drv.hsa_amd_memory_pool_free)(karg_ring);
@@ -741,9 +795,7 @@ impl HsaBackend {
         let shared = Arc::new(SharedDriver { drv });
 
         // CDNA (gfx8xx, gfx9xx) is wave64; RDNA (gfx10xx, gfx11xx) is wave32.
-        let wave_width = if device_name.starts_with("gfx9")
-            || device_name.starts_with("gfx8")
-        {
+        let wave_width = if device_name.starts_with("gfx9") || device_name.starts_with("gfx8") {
             64
         } else {
             32
@@ -779,7 +831,11 @@ impl HsaBackend {
             result: None,
         };
         let rc = unsafe {
-            (drv.hsa_amd_agent_iterate_memory_pools)(agent, pool_trampoline, &mut acc as *mut _ as *mut c_void)
+            (drv.hsa_amd_agent_iterate_memory_pools)(
+                agent,
+                pool_trampoline,
+                &mut acc as *mut _ as *mut c_void,
+            )
         };
         if rc != HSA_STATUS_SUCCESS {
             return Err(RuntimeError::Device(format!(
@@ -882,14 +938,20 @@ impl Backend for HsaBackend {
             )
         };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!("hsa_amd_memory_lock (upload): {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_memory_lock (upload): {rc}"
+            )));
         }
         // Async copy with a one-shot signal for synchronization.
         let mut sig = HsaSignal { handle: 0 };
         let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
         if rc != HSA_STATUS_SUCCESS {
-            unsafe { (self.shared.drv.hsa_amd_memory_unlock)(src.as_ptr() as *mut c_void); }
-            return Err(RuntimeError::Device(format!("hsa_signal_create (upload): {rc}")));
+            unsafe {
+                (self.shared.drv.hsa_amd_memory_unlock)(src.as_ptr() as *mut c_void);
+            }
+            return Err(RuntimeError::Device(format!(
+                "hsa_signal_create (upload): {rc}"
+            )));
         }
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_async_copy)(
@@ -908,7 +970,9 @@ impl Backend for HsaBackend {
                 (self.shared.drv.hsa_signal_destroy)(sig);
                 (self.shared.drv.hsa_amd_memory_unlock)(src.as_ptr() as *mut c_void);
             }
-            return Err(RuntimeError::Device(format!("hsa_amd_memory_async_copy (H2D): {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_memory_async_copy (H2D): {rc}"
+            )));
         }
         // Wait for completion.
         unsafe {
@@ -942,13 +1006,19 @@ impl Backend for HsaBackend {
             )
         };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!("hsa_amd_memory_lock (download): {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_memory_lock (download): {rc}"
+            )));
         }
         let mut sig = HsaSignal { handle: 0 };
         let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
         if rc != HSA_STATUS_SUCCESS {
-            unsafe { (self.shared.drv.hsa_amd_memory_unlock)(dst.as_mut_ptr() as *mut c_void); }
-            return Err(RuntimeError::Device(format!("hsa_signal_create (download): {rc}")));
+            unsafe {
+                (self.shared.drv.hsa_amd_memory_unlock)(dst.as_mut_ptr() as *mut c_void);
+            }
+            return Err(RuntimeError::Device(format!(
+                "hsa_signal_create (download): {rc}"
+            )));
         }
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_async_copy)(
@@ -967,7 +1037,9 @@ impl Backend for HsaBackend {
                 (self.shared.drv.hsa_signal_destroy)(sig);
                 (self.shared.drv.hsa_amd_memory_unlock)(dst.as_mut_ptr() as *mut c_void);
             }
-            return Err(RuntimeError::Device(format!("hsa_amd_memory_async_copy (D2H): {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_memory_async_copy (D2H): {rc}"
+            )));
         }
         unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
@@ -994,7 +1066,9 @@ impl Backend for HsaBackend {
             )
         };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!("hsa_code_object_reader_create: {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "hsa_code_object_reader_create: {rc}"
+            )));
         }
 
         // Create executable.
@@ -1008,8 +1082,12 @@ impl Backend for HsaBackend {
             )
         };
         if rc != HSA_STATUS_SUCCESS {
-            unsafe { (self.shared.drv.hsa_code_object_reader_destroy)(reader); }
-            return Err(RuntimeError::Device(format!("hsa_executable_create_alt: {rc}")));
+            unsafe {
+                (self.shared.drv.hsa_code_object_reader_destroy)(reader);
+            }
+            return Err(RuntimeError::Device(format!(
+                "hsa_executable_create_alt: {rc}"
+            )));
         }
 
         // Load the code object for this agent.
@@ -1042,7 +1120,9 @@ impl Backend for HsaBackend {
             return Err(RuntimeError::Device(format!("hsa_executable_freeze: {rc}")));
         }
 
-        unsafe { (self.shared.drv.hsa_code_object_reader_destroy)(reader); }
+        unsafe {
+            (self.shared.drv.hsa_code_object_reader_destroy)(reader);
+        }
 
         // Store the executable handle as the module ID. We pack it as a u64.
         // The executable handle IS a u64.
@@ -1095,7 +1175,9 @@ impl Backend for HsaBackend {
             (self.shared.drv.hsa_amd_agents_allow_access)(1, &self.agent, std::ptr::null(), ptr)
         };
         if rc != HSA_STATUS_SUCCESS {
-            unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr); }
+            unsafe {
+                (self.shared.drv.hsa_amd_memory_pool_free)(ptr);
+            }
             return Err(RuntimeError::Device(format!(
                 "counter region allow_access: {rc}"
             )));
@@ -1446,12 +1528,7 @@ impl PeerMemory for HsaBackend {
                 return Err(RuntimeError::Device(format!("zero stage alloc: {rc}")));
             }
             let rc = unsafe {
-                (self.shared.drv.hsa_amd_agents_allow_access)(
-                    1,
-                    &self.agent,
-                    std::ptr::null(),
-                    ptr,
-                )
+                (self.shared.drv.hsa_amd_agents_allow_access)(1, &self.agent, std::ptr::null(), ptr)
             };
             if rc != HSA_STATUS_SUCCESS {
                 unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
@@ -1521,7 +1598,9 @@ impl PeerMemory for HsaBackend {
         let mut sig = HsaSignal { handle: 0 };
         let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!("hsa_signal_create (p2p): {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "hsa_signal_create (p2p): {rc}"
+            )));
         }
         // The two agents name the transfer's endpoints; the SDMA engine walks
         // XGMI directly with no host bounce.
@@ -1700,11 +1779,17 @@ impl HsaBackend {
             // `copy_nonoverlapping` requires.
             unsafe {
                 std::ptr::copy_nonoverlapping(args as *const u8, karg, args_size);
-                std::ptr::write_bytes(karg.add(args_size), 0, kernel.kernarg_size as usize - args_size);
+                std::ptr::write_bytes(
+                    karg.add(args_size),
+                    0,
+                    kernel.kernarg_size as usize - args_size,
+                );
             }
         } else {
             // SAFETY: as above — `kernarg_size <= KARG_SLOT` bytes of this slot.
-            unsafe { std::ptr::write_bytes(karg, 0, kernel.kernarg_size as usize); }
+            unsafe {
+                std::ptr::write_bytes(karg, 0, kernel.kernarg_size as usize);
+            }
         }
 
         // Fill COv5 implicit block (blockDim, gridDim, remainders).
@@ -1714,18 +1799,36 @@ impl HsaBackend {
             // the COv5 implicit block starts inside the slot.
             let hid = unsafe { karg.add(hoff) };
             let avail = kernel.kernarg_size as usize - hoff;
-            let dims: u16 = if grid_z > 1 { 3 } else if grid_y > 1 { 2 } else { 1 };
+            let dims: u16 = if grid_z > 1 {
+                3
+            } else if grid_y > 1 {
+                2
+            } else {
+                1
+            };
             // SAFETY (both macros): the `avail >= off + width` guard is the
             // bounds check — a field is written only when the object's declared
             // kernarg segment actually reaches it, which is why an object built
             // without the implicit block is not corrupted here. `write_unaligned`
             // because `hoff` is only 8-byte aligned and the u16 fields are not.
-            macro_rules! put32 { ($off:expr, $val:expr) => {
-                if avail >= $off + 4 { unsafe { std::ptr::write_unaligned(hid.add($off) as *mut u32, $val); } }
-            }}
-            macro_rules! put16 { ($off:expr, $val:expr) => {
-                if avail >= $off + 2 { unsafe { std::ptr::write_unaligned(hid.add($off) as *mut u16, $val); } }
-            }}
+            macro_rules! put32 {
+                ($off:expr, $val:expr) => {
+                    if avail >= $off + 4 {
+                        unsafe {
+                            std::ptr::write_unaligned(hid.add($off) as *mut u32, $val);
+                        }
+                    }
+                };
+            }
+            macro_rules! put16 {
+                ($off:expr, $val:expr) => {
+                    if avail >= $off + 2 {
+                        unsafe {
+                            std::ptr::write_unaligned(hid.add($off) as *mut u16, $val);
+                        }
+                    }
+                };
+            }
             put32!(0, (grid_x as u32 + wg_x as u32 - 1) / wg_x as u32);
             put32!(4, (grid_y as u32 + wg_y as u32 - 1) / wg_y as u32);
             put32!(8, (grid_z as u32 + wg_z as u32 - 1) / wg_z as u32);
@@ -1765,10 +1868,18 @@ impl HsaBackend {
         }
 
         // Increment the counting signal (one per dispatch).
-        unsafe { (self.shared.drv.hsa_signal_add_screlease)(self.done_signal, 1); }
+        unsafe {
+            (self.shared.drv.hsa_signal_add_screlease)(self.done_signal, 1);
+        }
 
         // Publish the packet: one release store of header|setup.
-        let dims: u16 = if grid_z > 1 { 3 } else if grid_y > 1 { 2 } else { 1 };
+        let dims: u16 = if grid_z > 1 {
+            3
+        } else if grid_y > 1 {
+            2
+        } else {
+            1
+        };
         let header: u16 = (HSA_PACKET_TYPE_KERNEL_DISPATCH << HSA_PACKET_HEADER_TYPE) as u16
             | (1 << HSA_PACKET_HEADER_BARRIER) as u16
             | ((HSA_FENCE_SCOPE_AGENT << HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE) as u16)
@@ -1971,7 +2082,11 @@ impl HsaUploadRing {
                     "hsa_signal_create (upload ring): {rc}"
                 )));
             }
-            ring.slots.push(RingSlot { buf, sig, busy: false });
+            ring.slots.push(RingSlot {
+                buf,
+                sig,
+                busy: false,
+            });
         }
         Ok(ring)
     }
@@ -2170,10 +2285,11 @@ impl HsaBackend {
     /// Create an event. `timing` selects whether the event carries a clock.
     pub fn event_create(&self, timing: bool) -> Result<HsaEvent> {
         let mut sig = HsaSignal { handle: 0 };
-        let rc =
-            unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
+        let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!("hsa_signal_create (event): {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "hsa_signal_create (event): {rc}"
+            )));
         }
         Ok(HsaEvent {
             sig,
@@ -2338,7 +2454,9 @@ impl HsaBackend {
             (self.shared.drv.hsa_signal_create)(live.len() as i64, 0, std::ptr::null(), &mut sig)
         };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!("hsa_signal_create (dtod batch): {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "hsa_signal_create (dtod batch): {rc}"
+            )));
         }
         for &&(dst, src, bytes) in &live {
             let rc = unsafe {
@@ -2389,10 +2507,11 @@ impl HsaBackend {
             return Ok(());
         }
         let mut sig = HsaSignal { handle: 0 };
-        let rc =
-            unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
+        let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!("hsa_signal_create (dtod): {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "hsa_signal_create (dtod): {rc}"
+            )));
         }
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_async_copy)(
@@ -2408,7 +2527,9 @@ impl HsaBackend {
         };
         if rc != HSA_STATUS_SUCCESS {
             unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
-            return Err(RuntimeError::Device(format!("hsa_amd_memory_async_copy (dtod): {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "hsa_amd_memory_async_copy (dtod): {rc}"
+            )));
         }
         unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
@@ -2519,7 +2640,9 @@ impl HsaBackend {
             (self.shared.drv.hsa_executable_destroy)(HsaExecutable { handle: module.id })
         };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!("hsa_executable_destroy: {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "hsa_executable_destroy: {rc}"
+            )));
         }
         Ok(())
     }
@@ -2553,12 +2676,7 @@ impl HsaBackend {
                 return Err(RuntimeError::Device(format!("fill stage alloc({n}): {rc}")));
             }
             let rc = unsafe {
-                (self.shared.drv.hsa_amd_agents_allow_access)(
-                    1,
-                    &self.agent,
-                    std::ptr::null(),
-                    ptr,
-                )
+                (self.shared.drv.hsa_amd_agents_allow_access)(1, &self.agent, std::ptr::null(), ptr)
             };
             if rc != HSA_STATUS_SUCCESS {
                 unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
@@ -2596,7 +2714,9 @@ impl HsaBackend {
         let mut sig = HsaSignal { handle: 0 };
         let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!("hsa_signal_create (fill): {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "hsa_signal_create (fill): {rc}"
+            )));
         }
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_async_copy)(
@@ -2640,7 +2760,9 @@ impl HsaBackend {
         let mut sig = HsaSignal { handle: 0 };
         let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!("hsa_signal_create (d2h): {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "hsa_signal_create (d2h): {rc}"
+            )));
         }
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_async_copy)(
@@ -2656,7 +2778,9 @@ impl HsaBackend {
         };
         if rc != HSA_STATUS_SUCCESS {
             unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
-            return Err(RuntimeError::Device(format!("async_copy (d2h pinned): {rc}")));
+            return Err(RuntimeError::Device(format!(
+                "async_copy (d2h pinned): {rc}"
+            )));
         }
         unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(

@@ -62,7 +62,10 @@ pub fn classify(header_text: &str, name: &str) -> Sweepable {
     // `#ifndef NAME` anywhere before the definition makes it overridable.
     let guard = format!("#ifndef {name}");
     if let Some(g) = header_text.find(&guard) {
-        if let Some(d) = header_text.find(&define).or_else(|| header_text.find(&define_alt)) {
+        if let Some(d) = header_text
+            .find(&define)
+            .or_else(|| header_text.find(&define_alt))
+        {
             if g < d {
                 return Sweepable::Overridable;
             }
@@ -177,8 +180,14 @@ static_assert(PGM_BK8 == 64, "the mainloop reads two k32 subgroups per K-tile");
     /// hide a real axis or invent an impossible one.
     #[test]
     fn identifier_matching_is_not_substring_matching() {
-        assert!(mentions_ident("static_assert(PGM_BK8 == 64, \"x\");", "PGM_BK8"));
-        assert!(!mentions_ident("static_assert(PGM_BK8 == 64, \"x\");", "PGM_BK"));
+        assert!(mentions_ident(
+            "static_assert(PGM_BK8 == 64, \"x\");",
+            "PGM_BK8"
+        ));
+        assert!(!mentions_ident(
+            "static_assert(PGM_BK8 == 64, \"x\");",
+            "PGM_BK"
+        ));
     }
 
     /// The real NVIDIA GEMM header. This is the finding that motivated the
@@ -192,7 +201,14 @@ static_assert(PGM_BK8 == 64, "the mainloop reads two k32 subgroups per K-tile");
         let k = knobs(
             &h,
             "op_gemm.cuh",
-            &["PGM_BM", "PGM_BN", "PGM_BK", "PGM_BK8", "PGM_STAGES", "PGM_GLU_STAGES"],
+            &[
+                "PGM_BM",
+                "PGM_BN",
+                "PGM_BK",
+                "PGM_BK8",
+                "PGM_STAGES",
+                "PGM_GLU_STAGES",
+            ],
         );
         for knob in &k {
             eprintln!("{:<16} {:?}", knob.name, knob.sweepable);
@@ -206,19 +222,37 @@ static_assert(PGM_BK8 == 64, "the mainloop reads two k32 subgroups per K-tile");
         assert_eq!(by("PGM_BN"), Sweepable::Overridable);
         assert_eq!(by("PGM_STAGES"), Sweepable::Overridable);
         assert_eq!(by("PGM_GLU_STAGES"), Sweepable::Overridable);
-        assert_eq!(by("PGM_BK8"), Sweepable::Asserted, "static_assert pins it to 64");
+        assert_eq!(
+            by("PGM_BK8"),
+            Sweepable::Asserted,
+            "static_assert pins it to 64"
+        );
 
-        let sweepable: Vec<&str> =
-            k.iter().filter(|x| x.sweepable.can_sweep()).map(|x| x.name.as_str()).collect();
-        assert_eq!(sweepable, vec!["PGM_BM", "PGM_BN", "PGM_STAGES", "PGM_GLU_STAGES"]);
+        let sweepable: Vec<&str> = k
+            .iter()
+            .filter(|x| x.sweepable.can_sweep())
+            .map(|x| x.name.as_str())
+            .collect();
+        assert_eq!(
+            sweepable,
+            vec!["PGM_BM", "PGM_BN", "PGM_STAGES", "PGM_GLU_STAGES"]
+        );
     }
 
     /// The GEMV knobs are the opposite case: the header says they exist "for
     /// autotune", and they are all genuinely overridable.
     #[test]
     fn nvidia_gemv_knobs_are_sweepable() {
-        let Some(h) = read("runtime/nvidia/op_gemm.cuh") else { return };
-        for n in ["GV_UNROLL", "GV_UNROLL_GLU", "GV_MM_MAX", "GV_UN16", "GV_UN32"] {
+        let Some(h) = read("runtime/nvidia/op_gemm.cuh") else {
+            return;
+        };
+        for n in [
+            "GV_UNROLL",
+            "GV_UNROLL_GLU",
+            "GV_MM_MAX",
+            "GV_UN16",
+            "GV_UN32",
+        ] {
             assert_eq!(
                 classify(&h, n),
                 Sweepable::Overridable,
@@ -235,7 +269,9 @@ static_assert(PGM_BK8 == 64, "the mainloop reads two k32 subgroups per K-tile");
     /// the tuner must know these are the real knobs — and their real limits.
     #[test]
     fn hopper_wgmma_gemm_knobs() {
-        let Some(h) = read("runtime/nvidia/op_gemm_sm90.cuh") else { return };
+        let Some(h) = read("runtime/nvidia/op_gemm_sm90.cuh") else {
+            return;
+        };
         // The pipeline-depth knobs are #ifndef-guarded but bounded by arena
         // static_asserts (`:79-83`): raising them past what the smem arena holds
         // fails the build, so the classifier reports Asserted, not a free knob.
@@ -255,7 +291,9 @@ static_assert(PGM_BK8 == 64, "the mainloop reads two k32 subgroups per K-tile");
     /// AMD's MoE toggles are overridable.
     #[test]
     fn amd_moe_toggles_are_sweepable() {
-        let Some(h) = read("runtime/amd/op_moe.h") else { return };
+        let Some(h) = read("runtime/amd/op_moe.h") else {
+            return;
+        };
         assert_eq!(classify(&h, "PLOW_MOE_GROUP_FLAT"), Sweepable::Overridable);
         assert_eq!(classify(&h, "PLOW_MOE_MFMA"), Sweepable::Overridable);
     }
@@ -272,7 +310,9 @@ static_assert(PGM_BK8 == 64, "the mainloop reads two k32 subgroups per K-tile");
     /// `#ifndef`-guarded now, so M and N sweep and only K is pinned.
     #[test]
     fn nvidia_gemm_tile_sweeps_m_and_n_but_not_k() {
-        let Some(nv) = read("runtime/nvidia/op_gemm.cuh") else { return };
+        let Some(nv) = read("runtime/nvidia/op_gemm.cuh") else {
+            return;
+        };
         assert_eq!(classify(&nv, "PGM_BM"), Sweepable::Overridable); // PX-13
         assert_eq!(classify(&nv, "PGM_BN"), Sweepable::Overridable);
         assert_eq!(classify(&nv, "PGM_BK"), Sweepable::Fixed);

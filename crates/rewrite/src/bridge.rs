@@ -263,7 +263,11 @@ fn layout_spec(op: &Op, in_dims: &[i64], out: &[i64], elem: u64) -> LayoutSpec {
         }
         Op::Slice { axis, start, len } => {
             let rank = in_dims.len() as i64;
-            let ax = if *axis < 0 { *axis as i64 + rank } else { *axis as i64 };
+            let ax = if *axis < 0 {
+                *axis as i64 + rank
+            } else {
+                *axis as i64
+            };
             let (Some(start), Some(_len)) = (start.as_static(), len.as_static()) else {
                 return copy; // symbolic slice → fall back to a copy of `out_bytes`
             };
@@ -275,7 +279,11 @@ fn layout_spec(op: &Op, in_dims: &[i64], out: &[i64], elem: u64) -> LayoutSpec {
                 shape[d] = out[d] as u32;
                 in_stride[d] = in_str[d]; // strides of the full input; only the extent shrank
             }
-            mk(shape, in_stride, (start * in_str[ax as usize] as i64) as u32)
+            mk(
+                shape,
+                in_stride,
+                (start * in_str[ax as usize] as i64) as u32,
+            )
         }
         // Concat is multi-source; handled by `concat_spec` (kind 2), not here.
         _ => copy,
@@ -294,7 +302,11 @@ fn concat_spec(in0: &[i64], axis: i32, out: &[i64], elem: u64) -> LayoutSpec {
         return copy;
     }
     let rank = out.len() as i64;
-    let ax = if axis < 0 { axis as i64 + rank } else { axis as i64 };
+    let ax = if axis < 0 {
+        axis as i64 + rank
+    } else {
+        axis as i64
+    };
     if ax < 0 || ax as usize >= out.len() {
         return copy;
     }
@@ -376,10 +388,7 @@ fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
             })
         }
         // Pure layout / data movement → a strided descriptor (or a copy fallback).
-        Op::Reshape { .. }
-        | Op::Transpose { .. }
-        | Op::Broadcast { .. }
-        | Op::Slice { .. } => {
+        Op::Reshape { .. } | Op::Transpose { .. } | Op::Broadcast { .. } | Op::Slice { .. } => {
             let in0 = dims(0)?;
             OpKind::Layout(layout_spec(&node.op, &in0, &out, ELEM))
         }
@@ -778,9 +787,9 @@ fn fused_op_kind(fused: &FusedGraph, shapes: &[Vec<i64>], i: usize) -> Result<Op
         "FusedNormRope" | "FusedNormRopeScale" => row(2, true),
         "Ew" | "SwiGLU" | "FusedAdaLN" | "FusedGatedResidual" => row(na.len() as i64, false),
         // GroupNorm+Act+Conv3d: model as layout (conv-dominated, same cost as Conv3d).
-        "FusedGroupNormActConv3d" | "FusedGroupNormActConv3dBias" => {
-            OpKind::Layout(LayoutSpec::copy(out.iter().product::<i64>().max(0) as u64 * ELEM))
-        }
+        "FusedGroupNormActConv3d" | "FusedGroupNormActConv3dBias" => OpKind::Layout(
+            LayoutSpec::copy(out.iter().product::<i64>().max(0) as u64 * ELEM),
+        ),
         "Attention" => {
             // heads / head_dim come from the opaque config token the lowering
             // serialized (`heads=..;kv=..;hd=..;..`) — no shape guessing.
@@ -819,7 +828,9 @@ fn fused_op_kind(fused: &FusedGraph, shapes: &[Vec<i64>], i: usize) -> Result<Op
             // Fused-graph path: shapes are known but the structured op attributes
             // (perm/axis) live in tokens; keep a contiguous copy here and rely on
             // the structured `op_kind` path for real descriptors.
-            OpKind::Layout(LayoutSpec::copy(out.iter().product::<i64>().max(0) as u64 * ELEM))
+            OpKind::Layout(LayoutSpec::copy(
+                out.iter().product::<i64>().max(0) as u64 * ELEM,
+            ))
         }
         _ => {
             return Err(BridgeError::UnsupportedFused {
@@ -851,7 +862,9 @@ mod layout_tests {
     #[test]
     fn broadcast_size1_axis_gets_zero_stride() {
         // input (1,4) → out (3,4): axis 0 broadcasts (stride 0), axis 1 keeps stride 1.
-        let op = Op::Broadcast { shape: Shape::new([3i64.into(), 4i64.into()]) };
+        let op = Op::Broadcast {
+            shape: Shape::new([3i64.into(), 4i64.into()]),
+        };
         let s = layout_spec(&op, &[1, 4], &[3, 4], 1);
         assert_eq!(s.kind, 1);
         assert_eq!(&s.in_stride[..2], &[0, 1]);
@@ -861,7 +874,11 @@ mod layout_tests {
     #[test]
     fn slice_outer_axis_offsets_in_base() {
         // slice axis 0, start 2, len 3 of input (5,4): in_base = 2 * stride0(=4) = 8.
-        let op = Op::Slice { axis: 0, start: 2i64.into(), len: 3i64.into() };
+        let op = Op::Slice {
+            axis: 0,
+            start: 2i64.into(),
+            len: 3i64.into(),
+        };
         let s = layout_spec(&op, &[5, 4], &[3, 4], 1);
         assert_eq!(s.kind, 1);
         assert_eq!(s.in_base, 8);
@@ -871,7 +888,9 @@ mod layout_tests {
 
     #[test]
     fn reshape_is_a_contiguous_copy() {
-        let op = Op::Reshape { shape: Shape::new([6i64.into()]) };
+        let op = Op::Reshape {
+            shape: Shape::new([6i64.into()]),
+        };
         let s = layout_spec(&op, &[2, 3], &[6], 2);
         assert_eq!(s.kind, 0);
         assert_eq!(s.bytes, 6 * 2);
@@ -898,7 +917,9 @@ mod layout_tests {
 
     #[test]
     fn over_rank_falls_back_to_copy() {
-        let op = Op::Transpose { perm: vec![6, 5, 4, 3, 2, 1, 0] };
+        let op = Op::Transpose {
+            perm: vec![6, 5, 4, 3, 2, 1, 0],
+        };
         let s = layout_spec(&op, &[2, 2, 2, 2, 2, 2, 2], &[2, 2, 2, 2, 2, 2, 2], 1);
         assert_eq!(s.kind, 0, "rank > LAYOUT_RANK → copy fallback");
     }

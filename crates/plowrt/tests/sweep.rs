@@ -48,12 +48,8 @@ async fn run_sweep_point(
     concurrency: usize,
 ) -> f64 {
     let bundle = state.registry.get(slug).unwrap();
-    let mux = plowrt::serve::mux::spawn(
-        slug.into(),
-        bundle,
-        Arc::clone(state),
-        MuxConfig::default(),
-    );
+    let mux =
+        plowrt::serve::mux::spawn(slug.into(), bundle, Arc::clone(state), MuxConfig::default());
 
     let start = Instant::now();
     let mut handles = Vec::new();
@@ -63,8 +59,9 @@ async fn run_sweep_point(
         let handle = tokio::spawn(async move {
             let (tx, mut rx) = stream::channel();
             // Fake prompt: ctx_len bytes of varying content.
-            let prompt_ids: Vec<u32> =
-                (0..ctx_len).map(|j| ((i * 1000 + j) % 256) as u32).collect();
+            let prompt_ids: Vec<u32> = (0..ctx_len)
+                .map(|j| ((i * 1000 + j) % 256) as u32)
+                .collect();
             let job = Job {
                 prompt_ids,
                 gen: GenParams {

@@ -139,7 +139,11 @@ pub fn flash_cycles(
 
     // Delta — decode dispatch floor (single-query attention pays the same per-op
     // rendezvous as a decode GEMV). Gated to seq_q == 1 ⇒ prefill unaffected.
-    let decode_floor = if a.seq_q == 1 { cost::decode_dispatch_cycles(spec) } else { 0 };
+    let decode_floor = if a.seq_q == 1 {
+        cost::decode_dispatch_cycles(spec)
+    } else {
+        0
+    };
 
     base + tail + cost::LAUNCH_CYCLES + decode_floor
 }
@@ -205,7 +209,11 @@ pub fn row_cycles(spec: &GpuSpec, r: RowShape, elem_bytes: u64) -> Cycles {
     // Decode dispatch floor — a single-token (rows == 1) norm/residual/rope pays
     // the per-op rendezvous just like a decode GEMV, so fusing two decode row ops
     // (e.g. B1's Residual+RmsNorm → AddNorm) removes a floor. Gated to rows == 1.
-    let decode_floor = if r.rows == 1 { cost::decode_dispatch_cycles(spec) } else { 0 };
+    let decode_floor = if r.rows == 1 {
+        cost::decode_dispatch_cycles(spec)
+    } else {
+        0
+    };
     cost::dma_cycles(spec, bytes, false) + decode_floor
 }
 

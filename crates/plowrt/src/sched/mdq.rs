@@ -169,11 +169,7 @@ impl ServiceTable {
         if sxx <= f64::EPSILON {
             return None;
         }
-        let sxy: f64 = xs
-            .iter()
-            .zip(&ys)
-            .map(|(x, y)| (x - mx) * (y - my))
-            .sum();
+        let sxy: f64 = xs.iter().zip(&ys).map(|(x, y)| (x - mx) * (y - my)).sum();
         let slope = sxy / sxx; // ms per GB
         if slope <= 0.0 {
             return None;
@@ -484,7 +480,10 @@ mod tests {
                 }
                 // Invert: P(W > t) must equal 1 - q.
                 let tail = rho * (-(mu - lambda) * t).exp();
-                assert!((tail - (1.0 - q)).abs() < 1e-12, "rho={rho} q={q} tail={tail}");
+                assert!(
+                    (tail - (1.0 - q)).abs() < 1e-12,
+                    "rho={rho} q={q} tail={tail}"
+                );
             }
         }
         // Below the atom mass the quantile is exactly zero: at rho=0.3, 65% of

@@ -3,11 +3,19 @@
 use std::collections::BTreeMap;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: pktstat <file.pkt> [lo hi]");
-    let lo: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: pktstat <file.pkt> [lo hi]");
+    let lo: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let bytes = std::fs::read(&path).expect("read pkt");
     let prog = packet::Program::decode(&bytes).expect("decode");
-    let hi: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(prog.insts.len());
+    let hi: usize = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(prog.insts.len());
 
     let n = prog.insts.len();
     let total_wait: usize = prog.insts.iter().map(|i| i.wait.len()).sum();

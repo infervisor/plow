@@ -834,7 +834,10 @@ impl Body {
                 } else {
                     // v≤3: legacy 4-byte coord; surface as an empty copy descriptor.
                     let _r: LayoutBodyLegacy = try_pod(b, at).ok_or("truncated LAYOUT body")?;
-                    (Body::layout_copy(SLOT_NONE, 0), size_of::<LayoutBodyLegacy>())
+                    (
+                        Body::layout_copy(SLOT_NONE, 0),
+                        size_of::<LayoutBodyLegacy>(),
+                    )
                 }
             }
             Opcode::FAMILY_TOKEN => {
@@ -961,7 +964,14 @@ impl Program {
             let (opcode, resource, unit, index, wait_len, succ_len) = if version >= 3 {
                 let h: Header = try_pod(b, i).ok_or("truncated record header")?;
                 i += size_of::<Header>();
-                (h.opcode, h.resource, h.unit, h.index, h.wait_len as usize, h.succ_len as usize)
+                (
+                    h.opcode,
+                    h.resource,
+                    h.unit,
+                    h.index,
+                    h.wait_len as usize,
+                    h.succ_len as usize,
+                )
             } else {
                 // v2: 8-byte header with u8 wait/succ lengths
                 if i + HEADER_V2_SIZE > b.len() {
@@ -1005,7 +1015,12 @@ impl Program {
         // hot path, so a stale/corrupt id would be an OOB atomic write.
         let id_bound = counters.iter().map(|c| c.id as u64 + 1).max().unwrap_or(0);
         for inst in &insts {
-            if inst.wait.iter().chain(&inst.succ).any(|&id| id as u64 >= id_bound) {
+            if inst
+                .wait
+                .iter()
+                .chain(&inst.succ)
+                .any(|&id| id as u64 >= id_bound)
+            {
                 return Err("counter id out of range");
             }
         }
@@ -1086,7 +1101,9 @@ mod tests {
         let bytes = p.to_bytes();
         let p2 = Program::decode(&bytes).unwrap();
         match &p2.insts[0].body {
-            Body::Token { arg, kind, vocab, .. } => {
+            Body::Token {
+                arg, kind, vocab, ..
+            } => {
                 assert_eq!(*arg, 8);
                 assert_eq!(*kind, Opcode::TOKEN_SAMPLE_BATCH);
                 assert_eq!(*vocab, 4096);
@@ -1123,15 +1140,46 @@ mod tests {
         // Norm-prologue bf16 GEMM: identical variant byte on both backends, only
         // the backend nibble differs (generic 0x0321, CUDA 0x1321, ROCm 0x2321).
         assert_eq!(Opcode::VARIANT_NORM_BF16, 0x21);
-        assert_eq!(Opcode::new(0, Opcode::FAMILY_GEMM, Opcode::VARIANT_NORM_BF16).0, 0x0321);
-        assert_eq!(Opcode::new(1, Opcode::FAMILY_GEMM, Opcode::VARIANT_NORM_BF16).0, 0x1321);
-        assert_eq!(Opcode::new(2, Opcode::FAMILY_GEMM, Opcode::VARIANT_NORM_BF16).0, 0x2321);
+        assert_eq!(
+            Opcode::new(0, Opcode::FAMILY_GEMM, Opcode::VARIANT_NORM_BF16).0,
+            0x0321
+        );
+        assert_eq!(
+            Opcode::new(1, Opcode::FAMILY_GEMM, Opcode::VARIANT_NORM_BF16).0,
+            0x1321
+        );
+        assert_eq!(
+            Opcode::new(2, Opcode::FAMILY_GEMM, Opcode::VARIANT_NORM_BF16).0,
+            0x2321
+        );
 
         // A few more Gemma generic opcodes referenced in the plan.
-        assert_eq!(Opcode::new(0, Opcode::FAMILY_ROW, Opcode::VARIANT_ROW_NORMROPESCALE_BF16).0, 0x0541);
-        assert_eq!(Opcode::new(0, Opcode::FAMILY_ROW, Opcode::VARIANT_ROW_SWIGLU_BF16).0, 0x0507);
-        assert_eq!(Opcode::new(0, Opcode::FAMILY_LAYOUT, Opcode::VARIANT_LAYOUT_GATHER_SCALE_BF16).0, 0x0642);
-        assert_eq!(Opcode::new(0, Opcode::FAMILY_FLASH, Opcode::VARIANT_FLASH_DECODE_BF16).0, 0x0403);
+        assert_eq!(
+            Opcode::new(
+                0,
+                Opcode::FAMILY_ROW,
+                Opcode::VARIANT_ROW_NORMROPESCALE_BF16
+            )
+            .0,
+            0x0541
+        );
+        assert_eq!(
+            Opcode::new(0, Opcode::FAMILY_ROW, Opcode::VARIANT_ROW_SWIGLU_BF16).0,
+            0x0507
+        );
+        assert_eq!(
+            Opcode::new(
+                0,
+                Opcode::FAMILY_LAYOUT,
+                Opcode::VARIANT_LAYOUT_GATHER_SCALE_BF16
+            )
+            .0,
+            0x0642
+        );
+        assert_eq!(
+            Opcode::new(0, Opcode::FAMILY_FLASH, Opcode::VARIANT_FLASH_DECODE_BF16).0,
+            0x0403
+        );
     }
 
     #[test]
@@ -1139,12 +1187,18 @@ mod tests {
         // Reduce-shaped Row variants.
         assert!(Opcode::variant_is_reduce(Opcode::VARIANT_GOLDEN)); // 0x00
         assert!(Opcode::variant_is_reduce(Opcode::VARIANT_ROW_RMS_BF16)); // 0x04
-        // Pointwise / fused-shaped Row variants.
+                                                                          // Pointwise / fused-shaped Row variants.
         assert!(!Opcode::variant_is_reduce(0x01)); // pointwise golden
-        assert!(!Opcode::variant_is_reduce(Opcode::VARIANT_ROW_RESIDUAL_ADD_BF16));
+        assert!(!Opcode::variant_is_reduce(
+            Opcode::VARIANT_ROW_RESIDUAL_ADD_BF16
+        ));
         assert!(!Opcode::variant_is_reduce(Opcode::VARIANT_ROW_SWIGLU_BF16));
-        assert!(!Opcode::variant_is_reduce(Opcode::VARIANT_ROW_NORMROPE_BF16));
-        assert!(!Opcode::variant_is_reduce(Opcode::VARIANT_ROW_NORMROPESCALE_BF16));
+        assert!(!Opcode::variant_is_reduce(
+            Opcode::VARIANT_ROW_NORMROPE_BF16
+        ));
+        assert!(!Opcode::variant_is_reduce(
+            Opcode::VARIANT_ROW_NORMROPESCALE_BF16
+        ));
     }
 
     fn sample() -> Program {
@@ -1212,9 +1266,24 @@ mod tests {
             // Every wait/succ id above must appear here — decode rejects ids
             // outside the counter table (the runtime pool sizes from it).
             counters: vec![
-                Counter { id: 3, threshold: 4, scope: 1, _pad: [0; 3] },
-                Counter { id: 4, threshold: 1, scope: 1, _pad: [0; 3] },
-                Counter { id: 9, threshold: 1, scope: 2, _pad: [0; 3] },
+                Counter {
+                    id: 3,
+                    threshold: 4,
+                    scope: 1,
+                    _pad: [0; 3],
+                },
+                Counter {
+                    id: 4,
+                    threshold: 1,
+                    scope: 1,
+                    _pad: [0; 3],
+                },
+                Counter {
+                    id: 9,
+                    threshold: 1,
+                    scope: 2,
+                    _pad: [0; 3],
+                },
             ],
             bucket_id: 42,
             plan_gen: 7,

@@ -154,7 +154,10 @@ pub(crate) fn ladder_ops(c: &crate::config::Cfg, bn: u32) -> Vec<LadderOp> {
     let inter_l = (c.inter / tp).max(1);
 
     let mut ops = Vec::with_capacity(8);
-    for (count, hd, kvh) in [(slide, c.hd_slide, c.kvh_slide), (full, c.hd_full, c.kvh_full)] {
+    for (count, hd, kvh) in [
+        (slide, c.hd_slide, c.kvh_slide),
+        (full, c.hd_full, c.kvh_full),
+    ] {
         if count == 0 {
             continue;
         }
@@ -169,11 +172,26 @@ pub(crate) fn ladder_ops(c: &crate::config::Cfg, bn: u32) -> Vec<LadderOp> {
             count,
         });
         // o_proj: N = hidden, K = qd.
-        ops.push(LadderOp { tn: hidden_t, k: qd, glu: false, count });
+        ops.push(LadderOp {
+            tn: hidden_t,
+            k: qd,
+            glu: false,
+            count,
+        });
     }
     // gate|up fused, and down — identical in every layer.
-    ops.push(LadderOp { tn: inter_l.div_ceil(bn), k: c.hidden, glu: true, count: c.layers });
-    ops.push(LadderOp { tn: hidden_t, k: inter_l, glu: false, count: c.layers });
+    ops.push(LadderOp {
+        tn: inter_l.div_ceil(bn),
+        k: c.hidden,
+        glu: true,
+        count: c.layers,
+    });
+    ops.push(LadderOp {
+        tn: hidden_t,
+        k: inter_l,
+        glu: false,
+        count: c.layers,
+    });
     ops
 }
 
@@ -185,12 +203,42 @@ mod tests {
     /// 40 sliding layers (hd 256) + 8 full layers (hd 512), k_eq_v.
     pub(super) fn g4_12b() -> Vec<LadderOp> {
         vec![
-            LadderOp { tn: 32 + 16, k: 3840, glu: false, count: 40 }, // qkv sliding
-            LadderOp { tn: 30, k: 4096, glu: false, count: 40 },      // o sliding
-            LadderOp { tn: 64 + 32, k: 3840, glu: false, count: 8 },  // qkv full
-            LadderOp { tn: 30, k: 8192, glu: false, count: 8 },       // o full
-            LadderOp { tn: 120, k: 3840, glu: true, count: 48 },      // gate|up
-            LadderOp { tn: 30, k: 15360, glu: false, count: 48 },     // down
+            LadderOp {
+                tn: 32 + 16,
+                k: 3840,
+                glu: false,
+                count: 40,
+            }, // qkv sliding
+            LadderOp {
+                tn: 30,
+                k: 4096,
+                glu: false,
+                count: 40,
+            }, // o sliding
+            LadderOp {
+                tn: 64 + 32,
+                k: 3840,
+                glu: false,
+                count: 8,
+            }, // qkv full
+            LadderOp {
+                tn: 30,
+                k: 8192,
+                glu: false,
+                count: 8,
+            }, // o full
+            LadderOp {
+                tn: 120,
+                k: 3840,
+                glu: true,
+                count: 48,
+            }, // gate|up
+            LadderOp {
+                tn: 30,
+                k: 15360,
+                glu: false,
+                count: 48,
+            }, // down
         ]
     }
 
@@ -201,11 +249,17 @@ mod tests {
         // as 4 for those ops. The measured layer total at tm=4 and tm=5 differs only by the ops
         // that actually stepped -- it is never a smooth ramp.
         let c: Vec<u64> = (1..=8).map(|tm| launch_cost(170, &ops, tm)).collect();
-        assert!(c.windows(2).all(|w| w[1] >= w[0]), "cost must be monotone in tm");
+        assert!(
+            c.windows(2).all(|w| w[1] >= w[0]),
+            "cost must be monotone in tm"
+        );
         // tm=6 is the big cliff: tn=30 ops (down, o) step from 1 wave to 2.
         let step6 = c[5] - c[4];
         let step7 = c[6] - c[5];
-        assert!(step6 > step7 * 3, "tm=6 must be the dominant cliff, got {step6} vs {step7}");
+        assert!(
+            step6 > step7 * 3,
+            "tm=6 must be the dominant cliff, got {step6} vs {step7}"
+        );
     }
 
     #[test]
@@ -213,9 +267,15 @@ mod tests {
         let tops = tread_tops(170, &g4_12b(), 32);
         // 5 (=640 rows), 11 (=1408), 17 (=2176) are tread tops; 4 (=512) and 16 (=2048) are not.
         for tm in [5u32, 11, 17] {
-            assert!(tops.contains(&tm), "tm {tm} should be a tread top, got {tops:?}");
+            assert!(
+                tops.contains(&tm),
+                "tm {tm} should be a tread top, got {tops:?}"
+            );
         }
-        assert!(!tops.contains(&16), "tm 16 (2048 rows) is mid-tread, got {tops:?}");
+        assert!(
+            !tops.contains(&16),
+            "tm 16 (2048 rows) is mid-tread, got {tops:?}"
+        );
     }
 
     #[test]
@@ -228,8 +288,14 @@ mod tests {
         let s = total_cover(170, &ops, &shipped, 32) as f64;
         let w = total_cover(170, &ops, &wave, 32) as f64;
         let (sl, wl) = (100.0 * (s - best) / best, 100.0 * (w - best) / best);
-        assert!(w < s, "wave ladder {wave:?} ({wl:.2}%) must beat shipped ({sl:.2}%)");
-        assert!(wl < sl / 2.0, "expected >2x better, shipped {sl:.2}% vs wave {wl:.2}%");
+        assert!(
+            w < s,
+            "wave ladder {wave:?} ({wl:.2}%) must beat shipped ({sl:.2}%)"
+        );
+        assert!(
+            wl < sl / 2.0,
+            "expected >2x better, shipped {sl:.2}% vs wave {wl:.2}%"
+        );
     }
 
     #[test]
@@ -245,7 +311,10 @@ mod tests {
         for p in [1u32, 64, 132, 170, 188, 256] {
             let l = wave_ladder(p, &g4_12b(), 32, 6);
             assert_eq!(l[0], 1, "MIN_CHUNK rung missing for n_cu={p}: {l:?}");
-            assert!(l.windows(2).all(|w| w[0] < w[1]), "not sorted/unique: {l:?}");
+            assert!(
+                l.windows(2).all(|w| w[0] < w[1]),
+                "not sorted/unique: {l:?}"
+            );
         }
     }
 
@@ -262,11 +331,14 @@ mod tests {
 /// not an incidental one.
 #[cfg(test)]
 mod pinned {
-    use super::*;
     use super::tests::g4_12b;
+    use super::*;
 
     fn rows(p: u32, cap_tm: u32, budget: usize) -> Vec<u32> {
-        wave_ladder(p, &g4_12b(), cap_tm, budget).into_iter().map(|t| t * 128).collect()
+        wave_ladder(p, &g4_12b(), cap_tm, budget)
+            .into_iter()
+            .map(|t| t * 128)
+            .collect()
     }
     fn loss(p: u32, cap_tm: u32, ladder: &[u32]) -> f64 {
         let ops = g4_12b();
@@ -281,7 +353,11 @@ mod pinned {
     #[test]
     fn ladder_170sm_8192cap() {
         assert_eq!(rows(170, 64, 6), vec![128, 512, 1408, 2176, 2688, 8192]);
-        assert!((loss(170, 64, &SHIPPED) - 7.03).abs() < 0.05, "{}", loss(170, 64, &SHIPPED));
+        assert!(
+            (loss(170, 64, &SHIPPED) - 7.03).abs() < 0.05,
+            "{}",
+            loss(170, 64, &SHIPPED)
+        );
         assert!(loss(170, 64, &rows(170, 64, 6)) < 1.5);
     }
 
@@ -291,7 +367,11 @@ mod pinned {
         // The power-of-two ladder is WORSE on 188 SMs than on 170 -- and 188 is the card most
         // existing campaigns in perf-data/ used.
         assert!(loss(188, 64, &SHIPPED) > loss(170, 64, &SHIPPED));
-        assert!((loss(188, 64, &SHIPPED) - 11.41).abs() < 0.05, "{}", loss(188, 64, &SHIPPED));
+        assert!(
+            (loss(188, 64, &SHIPPED) - 11.41).abs() < 0.05,
+            "{}",
+            loss(188, 64, &SHIPPED)
+        );
         assert!(loss(188, 64, &rows(188, 64, 6)) < 1.5);
     }
 
@@ -301,7 +381,10 @@ mod pinned {
             if r == 128 || r == 512 || r == 8192 {
                 continue; // endpoints / MIN_CHUNK can coincide with the old ladder
             }
-            assert!(!r.is_power_of_two(), "rung {r} is a power of two -- treads are not");
+            assert!(
+                !r.is_power_of_two(),
+                "rung {r} is a power of two -- treads are not"
+            );
         }
     }
 }

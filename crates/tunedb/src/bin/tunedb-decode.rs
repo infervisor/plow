@@ -57,7 +57,10 @@ fn run() -> Result<(), Err> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let opt = |name: &str| -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
     let flag = |name: &str| args.iter().any(|a| a == name);
     let db = PathBuf::from(opt("--db").unwrap_or_else(|| "tuning".into()));
@@ -76,16 +79,25 @@ fn run() -> Result<(), Err> {
             let correctness = match opt("--correctness").as_deref() {
                 Some("pass") => Correctness::Pass,
                 Some("unchecked") | None => Correctness::Unchecked,
-                Some(other) => Correctness::Fail { detail: other.into() },
+                Some(other) => Correctness::Fail {
+                    detail: other.into(),
+                },
             };
-            ingest(&db, &PathBuf::from(results), &oracle, correctness, flag("--provisional"))
+            ingest(
+                &db,
+                &PathBuf::from(results),
+                &oracle,
+                correctness,
+                flag("--provisional"),
+            )
         }
         "best" => {
             let hw = opt("--hardware").ok_or("best needs --hardware <cell>")?;
             let num = |name: &str| -> Result<Option<u32>, Err> {
-                opt(name).map(|v| v.parse::<u32>()).transpose().map_err(|e| {
-                    format!("{name} takes a number: {e}").into()
-                })
+                opt(name)
+                    .map(|v| v.parse::<u32>())
+                    .transpose()
+                    .map_err(|e| format!("{name} takes a number: {e}").into())
             };
             let filter = CellFilter {
                 model: opt("--model"),
@@ -102,7 +114,14 @@ fn run() -> Result<(), Err> {
                     return Err(format!("--print takes defines|emit, not {other:?}").into())
                 }
             };
-            best(&db, &hw, filter, print, opt("--json").map(PathBuf::from), flag("--all"))
+            best(
+                &db,
+                &hw,
+                filter,
+                print,
+                opt("--json").map(PathBuf::from),
+                flag("--all"),
+            )
         }
         _ => Err("usage: tunedb-decode <ingest|best> [options]".into()),
     }
@@ -374,7 +393,11 @@ impl CellFilter {
         if let Some(v) = self.ctx_bucket {
             p.push(format!("ctx={}", v.label()));
         }
-        if p.is_empty() { "(unfiltered)".into() } else { p.join(" ") }
+        if p.is_empty() {
+            "(unfiltered)".into()
+        } else {
+            p.join(" ")
+        }
     }
 }
 
@@ -408,14 +431,19 @@ fn best(
     let usable: Vec<DecodeMeasurement> = if all {
         records
     } else {
-        records.into_iter().filter(|r| r.state.is_selectable()).collect()
+        records
+            .into_iter()
+            .filter(|r| r.state.is_selectable())
+            .collect()
     };
     if usable.is_empty() {
         println!("{hw}: records exist but none are qualified (run without --provisional, or --all to see them)");
         return Ok(());
     }
-    let usable: Vec<DecodeMeasurement> =
-        usable.into_iter().filter(|r| filter.matches(&r.cell)).collect();
+    let usable: Vec<DecodeMeasurement> = usable
+        .into_iter()
+        .filter(|r| filter.matches(&r.cell))
+        .collect();
     if usable.is_empty() {
         println!("{hw}: no qualified records match {}", filter.describe());
         return Ok(());
@@ -433,7 +461,11 @@ fn best(
                  Narrow with --model/--dtype/--n-cu/--batch/--ctx; cells are:\n    {}",
                 rankings.len(),
                 filter.describe(),
-                rankings.iter().map(|c| c.cell.key()).collect::<Vec<_>>().join("\n    ")
+                rankings
+                    .iter()
+                    .map(|c| c.cell.key())
+                    .collect::<Vec<_>>()
+                    .join("\n    ")
             )
             .into());
         }
@@ -446,7 +478,10 @@ fn best(
         return Ok(());
     }
 
-    println!("{:<52} {:>9} {:>8} {:>5}  {}", "cell", "TPOT ms", "margin", "REG", "winning knobs");
+    println!(
+        "{:<52} {:>9} {:>8} {:>5}  {}",
+        "cell", "TPOT ms", "margin", "REG", "winning knobs"
+    );
     let mut rows = Vec::new();
     for c in &rankings {
         let w = c.winner().expect("a ranking has a winner");
@@ -459,7 +494,9 @@ fn best(
             c.cell.key(),
             w.median_ms(),
             margin,
-            w.registers.map(|r| r.to_string()).unwrap_or_else(|| "-".into()),
+            w.registers
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "-".into()),
             w.knobs.label(),
             // "only candidate" and "won inside its own noise" are different
             // claims, and printing the same caveat for both would hide which

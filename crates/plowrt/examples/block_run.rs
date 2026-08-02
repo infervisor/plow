@@ -53,7 +53,12 @@ mod cuda {
             let mut f = std::fs::File::open(path)?;
             let mut magic = [0u8; 8];
             f.read_exact(&mut magic)?;
-            assert_eq!(&magic[..6], b"\x93NUMPY", "{}: not an npy file", path.display());
+            assert_eq!(
+                &magic[..6],
+                b"\x93NUMPY",
+                "{}: not an npy file",
+                path.display()
+            );
             let mut hl = [0u8; 2];
             f.read_exact(&mut hl)?;
             let hlen = u16::from_le_bytes(hl) as usize;
@@ -88,16 +93,19 @@ mod cuda {
             Ok((shape, out))
         }
 
-        pub fn write_f32(path: &std::path::Path, shape: &[usize], data: &[f32]) -> std::io::Result<()> {
+        pub fn write_f32(
+            path: &std::path::Path,
+            shape: &[usize],
+            data: &[f32],
+        ) -> std::io::Result<()> {
             let shape_str = if shape.len() == 1 {
                 format!("({},)", shape[0])
             } else {
                 let parts: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
                 format!("({})", parts.join(", "))
             };
-            let mut hdr = format!(
-                "{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}"
-            );
+            let mut hdr =
+                format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}");
             // Pad so that 10 (magic+len) + header is a multiple of 64, header
             // terminated by '\n'.
             let total = 10 + hdr.len() + 1;
@@ -140,12 +148,17 @@ mod cuda {
 
         let mut args = std::env::args().skip(1);
         let asset = PathBuf::from(
-            args.next().ok_or("usage: block_run <asset-dir> <check|bench> [flags]")?,
+            args.next()
+                .ok_or("usage: block_run <asset-dir> <check|bench> [flags]")?,
         );
-        let verb = args.next().ok_or("usage: block_run <asset-dir> <check|bench> [flags]")?;
+        let verb = args
+            .next()
+            .ok_or("usage: block_run <asset-dir> <check|bench> [flags]")?;
         let rest: Vec<String> = args.collect();
         let flag = |name: &str| -> Option<String> {
-            rest.iter().position(|a| a == name).and_then(|i| rest.get(i + 1).cloned())
+            rest.iter()
+                .position(|a| a == name)
+                .and_then(|i| rest.get(i + 1).cloned())
         };
 
         // block.json descriptor (hidden width, dims) — written next to the blob
@@ -204,13 +217,24 @@ mod cuda {
         let (t, xin) = if let Some(p) = flag("--in") {
             let (shape, data) = npy::read_f32(Path::new(&p))?;
             assert_eq!(shape.len(), 2, "--in must be [T, hidden]");
-            assert_eq!(shape[1], hidden, "--in hidden {} != block hidden {hidden}", shape[1]);
+            assert_eq!(
+                shape[1], hidden,
+                "--in hidden {} != block hidden {hidden}",
+                shape[1]
+            );
             (shape[0], data)
         } else {
             let t: usize = flag("--ctx").and_then(|s| s.parse().ok()).unwrap_or(128);
             (t, synth(t, hidden))
         };
-        println!("check: T={t} hidden={hidden} (input {})", if flag("--in").is_some() { "npy" } else { "synthetic" });
+        println!(
+            "check: T={t} hidden={hidden} (input {})",
+            if flag("--in").is_some() {
+                "npy"
+            } else {
+                "synthetic"
+            }
+        );
 
         // Two launch modes on ONE loaded engine:
         //  - prefill blocks (gemma dense): upload [T,hidden] act.x, launch one
@@ -225,7 +249,10 @@ mod cuda {
             let prompt: Vec<u32> = (0..t as u32).map(|i| 100 + (i % 1000)).collect();
             let t0 = Instant::now();
             e.prefill_slot(0, &prompt)?;
-            println!("  launched prefill(T={t}) in {:.3} ms", t0.elapsed().as_secs_f64() * 1e3);
+            println!(
+                "  launched prefill(T={t}) in {:.3} ms",
+                t0.elapsed().as_secs_f64() * 1e3
+            );
             t
         } else {
             // Decode processes one row; feed row 0 of the input.
@@ -235,13 +262,17 @@ mod cuda {
             let mut toks = Vec::new();
             let t0 = Instant::now();
             e.step_slots(&[(0, 100)], &mut toks)?;
-            println!("  launched decode(M=1) in {:.3} ms", t0.elapsed().as_secs_f64() * 1e3);
+            println!(
+                "  launched decode(M=1) in {:.3} ms",
+                t0.elapsed().as_secs_f64() * 1e3
+            );
             1
         };
 
         let out = e.download_activation(out_name)?;
         let out = &out[..t * hidden]; // trim pad rows past T
-        let (mut mn, mut mx, mut sum, mut nan, mut inf) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f64, 0usize, 0usize);
+        let (mut mn, mut mx, mut sum, mut nan, mut inf) =
+            (f32::INFINITY, f32::NEG_INFINITY, 0.0f64, 0usize, 0usize);
         for &v in out {
             if v.is_nan() {
                 nan += 1;
@@ -262,7 +293,14 @@ mod cuda {
              NaN={nan} Inf={inf}"
         );
         let ok = nan == 0 && inf == 0 && finite == out.len();
-        println!("  finiteness: {}", if ok { "PASS (all finite)" } else { "FAIL (non-finite present)" });
+        println!(
+            "  finiteness: {}",
+            if ok {
+                "PASS (all finite)"
+            } else {
+                "FAIL (non-finite present)"
+            }
+        );
 
         if let Some(p) = flag("--out") {
             npy::write_f32(Path::new(&p), &[t, hidden], out)?;
@@ -283,13 +321,19 @@ mod cuda {
         hidden: usize,
         flag: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let batches = flag("--batch").map(|s| parse_list(&s)).unwrap_or_else(|| vec![1, 2, 4, 8]);
-        let ctxs = flag("--ctx").map(|s| parse_list(&s)).unwrap_or_else(|| vec![128, 512, 1024, 4096]);
+        let batches = flag("--batch")
+            .map(|s| parse_list(&s))
+            .unwrap_or_else(|| vec![1, 2, 4, 8]);
+        let ctxs = flag("--ctx")
+            .map(|s| parse_list(&s))
+            .unwrap_or_else(|| vec![128, 512, 1024, 4096]);
         let iters: usize = flag("--iters").and_then(|s| s.parse().ok()).unwrap_or(100);
         let warmup: usize = flag("--warmup").and_then(|s| s.parse().ok()).unwrap_or(10);
         // Prefill is far more expensive per pass than a decode step, so it gets
         // its own (smaller) iteration count.
-        let pf_iters: usize = flag("--prefill-iters").and_then(|s| s.parse().ok()).unwrap_or(10);
+        let pf_iters: usize = flag("--prefill-iters")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
         // Rows of `act.x` uploaded before a prefill pass.
         //
         // `act.x` is sized by the packet's LARGEST PREFILL BUCKET, not by
@@ -395,7 +439,10 @@ mod cuda {
         let out_dir = PathBuf::from("/dev/shm/block-asset/bench");
         std::fs::create_dir_all(&out_dir)?;
         let out = out_dir.join("sweep.json");
-        std::fs::write(&out, serde_json::to_vec_pretty(&serde_json::json!({ "sweep": rows }))?)?;
+        std::fs::write(
+            &out,
+            serde_json::to_vec_pretty(&serde_json::json!({ "sweep": rows }))?,
+        )?;
         println!("wrote {}", out.display());
         if let Some(profile) = e.trace_summary()? {
             println!("{profile}");

@@ -37,9 +37,7 @@ fn gated() -> Option<PathBuf> {
         return None;
     }
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "plowrt=info".into()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "plowrt=info".into()))
         .try_init();
     let assets = PathBuf::from(
         std::env::var("PLOW_GPU_ASSETS").unwrap_or_else(|_| "/root/gpu-assets-b4/b4".into()),
@@ -123,7 +121,13 @@ fn shared_prefix_token_identity_and_dedup() {
         let (ta, _) = serve(&mut e, 0, &a, max_new);
         let (tb, dt) = serve(&mut e, 1, &b, max_new);
         let (tl, dtl) = serve(&mut e, 2, &long, max_new);
-        (ta, tb, tl, dt / (max_new - 1) as f64, dtl / (max_new - 1) as f64)
+        (
+            ta,
+            tb,
+            tl,
+            dt / (max_new - 1) as f64,
+            dtl / (max_new - 1) as f64,
+        )
     };
 
     // ---- VMM: A publishes, B and the long sequence attach ----
@@ -147,8 +151,14 @@ fn shared_prefix_token_identity_and_dedup() {
 
     // THE correctness bar: byte-exact prefix reads => identical greedy paths.
     assert_eq!(toks_a1, toks_a0, "VMM path changed sequence A's tokens");
-    assert_eq!(toks_b1, toks_b0, "shared-prefix B diverged from independent B");
-    assert_eq!(toks_l1, toks_l0, "long-ctx sharer diverged from independent");
+    assert_eq!(
+        toks_b1, toks_b0,
+        "shared-prefix B diverged from independent B"
+    );
+    assert_eq!(
+        toks_l1, toks_l0,
+        "long-ctx sharer diverged from independent"
+    );
 
     // The dedup ledger. Per track (full_layer × {K,V}) both A and B walk the
     // same block schedule (row-0 remap at begin, prefill blocks, one
@@ -222,7 +232,8 @@ fn remap_after_release_cycle() {
     let kv = VmmKv::new(ops, geo, 2 * MIB, 0).expect("pool");
     for cycle in 0..3 {
         for b in 0..4 {
-            kv.ensure_rows(b, 1).unwrap_or_else(|e| panic!("cycle {cycle} seq {b} row1: {e}"));
+            kv.ensure_rows(b, 1)
+                .unwrap_or_else(|e| panic!("cycle {cycle} seq {b} row1: {e}"));
         }
         kv.ensure_rows(0, 4096)
             .unwrap_or_else(|e| panic!("cycle {cycle} grow: {e}"));
@@ -272,7 +283,9 @@ fn attach_latency_vs_copy_baseline() {
         t0.elapsed().as_secs_f64() * 1e3
     };
 
-    eprintln!("prefix rows | block MiB | owner-build ms | ATTACH ms | detach(begin_seq) ms | D2D copy ms");
+    eprintln!(
+        "prefix rows | block MiB | owner-build ms | ATTACH ms | detach(begin_seq) ms | D2D copy ms"
+    );
     for &rows in &[4096u32, 32768, 131072] {
         let cp = copy_ms(rows as u64);
         for &blk_mib in &[2u64, 16, 64] {
@@ -327,7 +340,11 @@ fn vmm_leak_cycle() {
 
     std::env::set_var("PLOW_VMM_PREFIX", "1");
     std::env::set_var("PLOW_VMM_BLOCK_MIB", "2");
-    let prefix = long_ids(&tok, 4200, "In the beginning the packet machine decoded tokens. ");
+    let prefix = long_ids(
+        &tok,
+        4200,
+        "In the beginning the packet machine decoded tokens. ",
+    );
     for cycle in 0..2usize {
         let mut e = GpuEngine::load(Arc::clone(&be), &assets, &ckpt).expect("load");
         // Publish + attach so the pool's cache/snapshot paths are exercised.
@@ -335,7 +352,10 @@ fn vmm_leak_cycle() {
         let (t1, _) = serve(&mut e, 1, &prefix, 8);
         assert_eq!(t0, t1, "same prompt must decode identically across slots");
         let s = e.vmm_stats().unwrap();
-        assert!(s.blocks_shared_mapped > 0, "cycle {cycle}: no sharing happened");
+        assert!(
+            s.blocks_shared_mapped > 0,
+            "cycle {cycle}: no sharing happened"
+        );
         drop(e);
         let after = used(&be);
         eprintln!(

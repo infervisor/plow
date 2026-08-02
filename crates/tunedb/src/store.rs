@@ -25,7 +25,10 @@ pub enum StoreError {
     Io(std::io::Error),
     Json(serde_json::Error),
     /// A record was staged that cannot legally be promoted.
-    NotQualifiable { kernel: String, blockers: Vec<String> },
+    NotQualifiable {
+        kernel: String,
+        blockers: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -90,7 +93,11 @@ impl TuneStore {
                     continue;
                 }
                 let name = e.file_name().to_string_lossy().into_owned();
-                let cell = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+                let cell = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                };
                 if e.path().join("kernel_measurement.jsonl").exists() {
                     out.push(cell);
                 } else {
@@ -158,7 +165,9 @@ impl TuneStore {
         reason: &str,
     ) -> Result<usize, StoreError> {
         for r in &mut records {
-            r.state = RecordState::Rejected { reason: reason.to_string() };
+            r.state = RecordState::Rejected {
+                reason: reason.to_string(),
+            };
         }
         self.append_atomic(hardware, &records)?;
         Ok(records.len())
@@ -196,7 +205,10 @@ impl TuneStore {
         for r in &records {
             let blockers = r.qualification_blockers();
             if !blockers.is_empty() {
-                return Err(StoreError::NotQualifiable { kernel: r.knobs.label(), blockers });
+                return Err(StoreError::NotQualifiable {
+                    kernel: r.knobs.label(),
+                    blockers,
+                });
             }
         }
         for r in &mut records {
@@ -407,7 +419,9 @@ mod tests {
 
         let good = meas("case-b", 14, 50.0);
         let mut bad = meas("case-c", 15, 40.0);
-        bad.correctness = Correctness::Fail { detail: "nan".into() };
+        bad.correctness = Correctness::Fail {
+            detail: "nan".into(),
+        };
 
         let err = s.publish(HW, vec![good, bad]).unwrap_err();
         assert!(matches!(err, StoreError::NotQualifiable { .. }));
@@ -426,7 +440,11 @@ mod tests {
         s.publish(HW, vec![meas("case-a", 14, 60.0)]).unwrap();
 
         let all = s.load_kernels(HW).unwrap();
-        assert_eq!(all.len(), 2, "the superseded record is retained, not overwritten");
+        assert_eq!(
+            all.len(),
+            2,
+            "the superseded record is retained, not overwritten"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -434,7 +452,8 @@ mod tests {
     fn best_for_picks_the_fastest_qualified_record() {
         let dir = tmpdir("best");
         let s = TuneStore::new(&dir);
-        s.publish(HW, vec![meas("case-a", 8, 100.0), meas("case-a", 14, 60.0)]).unwrap();
+        s.publish(HW, vec![meas("case-a", 8, 100.0), meas("case-a", 14, 60.0)])
+            .unwrap();
 
         let (best, stale) = s.best_for(HW, &digests()).unwrap();
         assert!(stale.is_empty());
@@ -454,7 +473,10 @@ mod tests {
         want.toolchain = "cuda-12.4".into();
 
         let (best, stale) = s.best_for(HW, &want).unwrap();
-        assert!(best.is_empty(), "must not serve a record from another toolchain");
+        assert!(
+            best.is_empty(),
+            "must not serve a record from another toolchain"
+        );
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].changed, vec!["toolchain"]);
         let _ = fs::remove_dir_all(&dir);
@@ -465,7 +487,8 @@ mod tests {
     fn rejected_records_are_kept_but_not_served() {
         let dir = tmpdir("reject");
         let s = TuneStore::new(&dir);
-        s.record_rejected(HW, vec![meas("case-a", 8, 100.0)], "alias of PLOW_DOP_GEMM").unwrap();
+        s.record_rejected(HW, vec![meas("case-a", 8, 100.0)], "alias of PLOW_DOP_GEMM")
+            .unwrap();
 
         let all = s.load_kernels(HW).unwrap();
         assert_eq!(all.len(), 1);
@@ -483,13 +506,17 @@ mod tests {
     fn hardware_cells_do_not_share_a_file() {
         let dir = tmpdir("cells");
         let s = TuneStore::new(&dir);
-        s.publish("nvidia/sm_90a/h100-nvl", vec![meas("case-a", 8, 100.0)]).unwrap();
-        s.publish("amd/gfx950/mi350x", vec![meas("case-a", 8, 10.0)]).unwrap();
+        s.publish("nvidia/sm_90a/h100-nvl", vec![meas("case-a", 8, 100.0)])
+            .unwrap();
+        s.publish("amd/gfx950/mi350x", vec![meas("case-a", 8, 10.0)])
+            .unwrap();
 
         assert_eq!(s.load_kernels("nvidia/sm_90a/h100-nvl").unwrap().len(), 1);
         assert_eq!(s.load_kernels("amd/gfx950/mi350x").unwrap().len(), 1);
         assert_eq!(
-            s.load_kernels("nvidia/sm_90a/h100-nvl").unwrap()[0].stats.median_ns,
+            s.load_kernels("nvidia/sm_90a/h100-nvl").unwrap()[0]
+                .stats
+                .median_ns,
             100.0,
             "the AMD record must not leak into the NVIDIA cell"
         );
@@ -551,7 +578,8 @@ mod tests {
         let dir = tmpdir("decfile");
         let s = TuneStore::new(&dir);
         s.publish(HW, vec![meas("case-a", 8, 100.0)]).unwrap();
-        s.publish_decode(HW, vec![decode_meas(132, 1024, 8, 6.04, 5)]).unwrap();
+        s.publish_decode(HW, vec![decode_meas(132, 1024, 8, 6.04, 5)])
+            .unwrap();
 
         assert_eq!(s.load_kernels(HW).unwrap().len(), 1);
         assert_eq!(s.load_decode(HW).unwrap().len(), 1);
@@ -584,7 +612,8 @@ mod tests {
         assert!(matches!(err, StoreError::NotQualifiable { .. }));
         assert!(s.load_decode(HW).unwrap().is_empty(), "nothing landed");
 
-        s.record_decode_unqualified(HW, vec![m], RecordState::Provisional).unwrap();
+        s.record_decode_unqualified(HW, vec![m], RecordState::Provisional)
+            .unwrap();
         let held = s.load_decode(HW).unwrap();
         assert_eq!(held.len(), 1);
         assert!(!held[0].state.is_selectable());
@@ -632,7 +661,8 @@ mod tests {
     fn a_decode_record_from_another_object_is_stale_and_reportable() {
         let dir = tmpdir("decstale");
         let s = TuneStore::new(&dir);
-        s.publish_decode(HW, vec![decode_meas(132, 1024, 8, 6.04, 5)]).unwrap();
+        s.publish_decode(HW, vec![decode_meas(132, 1024, 8, 6.04, 5)])
+            .unwrap();
 
         let mut want = digests();
         want.interpreter = "some-other-cubin".into();

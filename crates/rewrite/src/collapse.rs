@@ -520,10 +520,19 @@ mod tests {
     // (F3): non-resident made expansion emit an ordinary HBM DMA.
     #[test]
     fn realize_residency_and_locality() {
-        assert_eq!(realize(HandoffKind::Hbm), (false, LocalityReq::NoConstraint));
-        assert_eq!(realize(HandoffKind::SramSameSm), (true, LocalityReq::MustColocate));
+        assert_eq!(
+            realize(HandoffKind::Hbm),
+            (false, LocalityReq::NoConstraint)
+        );
+        assert_eq!(
+            realize(HandoffKind::SramSameSm),
+            (true, LocalityReq::MustColocate)
+        );
         assert_eq!(realize(HandoffKind::Dsm), (true, LocalityReq::SameDomain));
         // The fix: resident (no round-trip) + partition-scoped, mirroring Dsm.
-        assert_eq!(realize(HandoffKind::L2Local), (true, LocalityReq::SameL2Partition));
+        assert_eq!(
+            realize(HandoffKind::L2Local),
+            (true, LocalityReq::SameL2Partition)
+        );
     }
 }

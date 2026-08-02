@@ -94,7 +94,10 @@ pub fn start_recording() {
 /// Stop recording and return what was collected, in lookup order (duplicates included — the
 /// caller decides whether repetition is signal).
 pub fn take() -> Vec<Demand> {
-    SINK.lock().expect("tune-demand sink").take().unwrap_or_default()
+    SINK.lock()
+        .expect("tune-demand sink")
+        .take()
+        .unwrap_or_default()
 }
 
 /// Record one lookup. Called from `GemmMeasurements::for_shape`, the single place the compiler
@@ -113,7 +116,13 @@ pub(crate) fn record(m: i64, n: i64, k: i64, quant: QuantScheme, hit: bool) {
         );
     }
     if let Some(v) = SINK.lock().expect("tune-demand sink").as_mut() {
-        v.push(Demand { m, n, k, quant, hit });
+        v.push(Demand {
+            m,
+            n,
+            k,
+            quant,
+            hit,
+        });
     }
 }
 
@@ -138,12 +147,21 @@ mod tests {
     fn recording_is_opt_in() {
         let _ = take();
         record(1, 2, 3, QuantScheme::None, false);
-        assert!(take().is_empty(), "a lookup outside a recording window is not kept");
+        assert!(
+            take().is_empty(),
+            "a lookup outside a recording window is not kept"
+        );
     }
 
     #[test]
     fn distinct_collapses_repeats_and_orders_deterministically() {
-        let mk = |m, n, k| Demand { m, n, k, quant: QuantScheme::None, hit: false };
+        let mk = |m, n, k| Demand {
+            m,
+            n,
+            k,
+            quant: QuantScheme::None,
+            hit: false,
+        };
         let out = distinct(vec![
             mk(8192, 64, 6144),
             mk(512, 64, 6144),
@@ -151,7 +169,11 @@ mod tests {
             mk(512, 6144, 512),
         ]);
         assert_eq!(out.len(), 3, "the repeated lookup collapses");
-        assert_eq!((out[0].m, out[0].n, out[0].k), (512, 6144, 512), "K ascending");
+        assert_eq!(
+            (out[0].m, out[0].n, out[0].k),
+            (512, 6144, 512),
+            "K ascending"
+        );
         assert_eq!((out[1].m, out[1].n, out[1].k), (512, 64, 6144));
         assert_eq!((out[2].m, out[2].n, out[2].k), (8192, 64, 6144));
     }
@@ -161,8 +183,20 @@ mod tests {
     #[test]
     fn quant_is_part_of_the_shape_identity() {
         let out = distinct(vec![
-            Demand { m: 512, n: 6144, k: 512, quant: QuantScheme::None, hit: false },
-            Demand { m: 512, n: 6144, k: 512, quant: QuantScheme::W8A8, hit: false },
+            Demand {
+                m: 512,
+                n: 6144,
+                k: 512,
+                quant: QuantScheme::None,
+                hit: false,
+            },
+            Demand {
+                m: 512,
+                n: 6144,
+                k: 512,
+                quant: QuantScheme::W8A8,
+                hit: false,
+            },
         ]);
         assert_eq!(out.len(), 2);
     }

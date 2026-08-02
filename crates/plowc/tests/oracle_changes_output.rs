@@ -12,8 +12,8 @@
 //! 2. a qualified measurement flips the winner between two buildable tiles.
 
 use costmodel::tile::{GemmShape, TileShape};
-use rewrite::oracle::{GemmQuery, KernelOracle, TileAdvice};
 use costmodel::{Soc, SramPolicy, DEFAULT_PAGE_BYTES};
+use rewrite::oracle::{GemmQuery, KernelOracle, TileAdvice};
 use rewrite::tilegraph::{assemble_tuned, Compute, OpSpec, TileNode};
 use rewrite::{LayerPlan, OpKind};
 
@@ -41,7 +41,11 @@ fn chosen_tile(oracle: &dyn KernelOracle) -> TileShape {
     let (g, _cons) =
         assemble_tuned(&soc, &plan, SramPolicy::Stream, None, oracle).expect("assemble");
     for node in &g.nodes {
-        if let TileNode::Compute { kind: Compute::Gemm(t), .. } = node {
+        if let TileNode::Compute {
+            kind: Compute::Gemm(t),
+            ..
+        } = node
+        {
             return *t;
         }
     }
@@ -92,29 +96,65 @@ fn a_buildable_inventory_changes_the_selected_tile() {
     let analytical = analytical_tile();
 
     // A deliberately odd but legal tile the analytical model does not pick.
-    let forced = TileShape { bm: 16, bn: 64, bk: 32, split_k: 1 };
-    assert_ne!(analytical, forced, "precondition: the forced tile is not the analytical one");
+    let forced = TileShape {
+        bm: 16,
+        bn: 64,
+        bk: 32,
+        split_k: 1,
+    };
+    assert_ne!(
+        analytical, forced,
+        "precondition: the forced tile is not the analytical one"
+    );
 
     let got = chosen_tile(&FixedTile(forced));
-    assert_eq!(got, forced, "the compiler must emit the tile the inventory carries");
-    assert_ne!(got, analytical, "and it must differ from the analytical choice");
+    assert_eq!(
+        got, forced,
+        "the compiler must emit the tile the inventory carries"
+    );
+    assert_ne!(
+        got, analytical,
+        "and it must differ from the analytical choice"
+    );
 }
 
 /// A qualified measurement flips the winner between two buildable tiles. The
 /// measurement makes `b` faster; without it, analytical cost would prefer `a`.
 #[test]
 fn a_measurement_changes_the_winner() {
-    let a = TileShape { bm: 64, bn: 64, bk: 32, split_k: 1 };
-    let b = TileShape { bm: 128, bn: 128, bk: 32, split_k: 1 };
+    let a = TileShape {
+        bm: 64,
+        bn: 64,
+        bk: 32,
+        split_k: 1,
+    };
+    let b = TileShape {
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        split_k: 1,
+    };
 
     // b wins on measurement (lower ns), regardless of analytical order.
-    let measured = MeasuredTwo { a, b, ns: (900, 100) };
+    let measured = MeasuredTwo {
+        a,
+        b,
+        ns: (900, 100),
+    };
     assert_eq!(chosen_tile(&measured), b, "the measured-fast tile must win");
 
     // Flip the measurement; the winner flips too. This proves the measurement
     // is what decided it, not some fixed tie-break.
-    let flipped = MeasuredTwo { a, b, ns: (100, 900) };
-    assert_eq!(chosen_tile(&flipped), a, "flipping the measurement flips the winner");
+    let flipped = MeasuredTwo {
+        a,
+        b,
+        ns: (100, 900),
+    };
+    assert_eq!(
+        chosen_tile(&flipped),
+        a,
+        "flipping the measurement flips the winner"
+    );
 }
 
 /// The plumbing is not inert: NoOracle and a Buildable oracle genuinely produce
@@ -122,6 +162,14 @@ fn a_measurement_changes_the_winner() {
 /// oracle on the floor.
 #[test]
 fn the_oracle_is_not_ignored() {
-    let forced = TileShape { bm: 16, bn: 64, bk: 32, split_k: 1 };
-    assert_ne!(chosen_tile(&rewrite::oracle::NoOracle), chosen_tile(&FixedTile(forced)));
+    let forced = TileShape {
+        bm: 16,
+        bn: 64,
+        bk: 32,
+        split_k: 1,
+    };
+    assert_ne!(
+        chosen_tile(&rewrite::oracle::NoOracle),
+        chosen_tile(&FixedTile(forced))
+    );
 }

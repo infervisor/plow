@@ -221,7 +221,12 @@ pub struct KdaWeights {
 /// into one f32 handle because it ran out of operand slots, and that packing is a symptom of
 /// over-fusion, not a constraint. Decomposed, no op here is at the slot ceiling and the
 /// `A_log[:96]` narrow happens in the ordinary loader against its own declared handle.
-pub fn declare_kda_weights(b: &mut Builder, c: &KdaCfg, prefix: &str, ln_prefix: &str) -> KdaWeights {
+pub fn declare_kda_weights(
+    b: &mut Builder,
+    c: &KdaCfg,
+    prefix: &str,
+    ln_prefix: &str,
+) -> KdaWeights {
     let bf = |b: &mut Builder, n: String, e: u64| b.tensor(&n, e * 2);
     let f32t = |b: &mut Builder, n: String, e: u64| b.tensor(&n, e * 4);
     let (h, hd, p, w) = (
@@ -439,7 +444,19 @@ pub fn emit_kda_mixer(
     seq_rows: bool,
 ) -> (u32, u32) {
     emit_kda_mixer_ex(
-        b, c, w, st, act_prefix, t, hidden, attn_dst, n_cu, prenormed, deps, fuse_kda(), seq_rows,
+        b,
+        c,
+        w,
+        st,
+        act_prefix,
+        t,
+        hidden,
+        attn_dst,
+        n_cu,
+        prenormed,
+        deps,
+        fuse_kda(),
+        seq_rows,
     )
 }
 
@@ -467,7 +484,11 @@ fn emit_kda_mixer_ex(
     // batched decode program (independent sequences); everything today is `false`.
     seq_rows: bool,
 ) -> (u32, u32) {
-    assert_eq!(c.head_dim % 64, 0, "KDA: head_dim must be a multiple of the 64-lane wave");
+    assert_eq!(
+        c.head_dim % 64,
+        0,
+        "KDA: head_dim must be a multiple of the 64-lane wave"
+    );
     assert_eq!(
         c.proj() % c.bv,
         0,
@@ -488,7 +509,11 @@ fn emit_kda_mixer_ex(
     // `prenormed`: the caller's AttnRes already wrote the NORMED activation into `hidden`, so
     // there is no second buffer and no P0 packet. A declared handle nothing writes is the
     // `Mamba2Scan` smell this file names below, so `x` is not allocated on that path either.
-    let x = if prenormed { hidden } else { bft(b, format!("{a}x"), tt * hiu) };
+    let x = if prenormed {
+        hidden
+    } else {
+        bft(b, format!("{a}x"), tt * hiu)
+    };
     let raw = [
         bft(b, format!("{a}q_raw"), tt * pu),
         bft(b, format!("{a}k_raw"), tt * pu),
@@ -509,7 +534,10 @@ fn emit_kda_mixer_ex(
     let (gate, beta) = if fuse {
         (u32::MAX, u32::MAX)
     } else {
-        (f32t(b, format!("{a}gate"), tt * pu), f32t(b, format!("{a}beta"), tt * nh as u64))
+        (
+            f32t(b, format!("{a}gate"), tt * pu),
+            f32t(b, format!("{a}beta"), tt * nh as u64),
+        )
     };
     let o = bft(b, format!("{a}o"), tt * pu);
     let y = bft(b, format!("{a}y"), tt * pu);
@@ -618,7 +646,11 @@ fn emit_kda_mixer_ex(
         //
         // Declared here rather than threaded through the signature: the builder dedups by name,
         // so this returns the one `in.active` no matter how many layers ask for it.
-        let parked = if seq_rows { b.tensor("in.parked", 4 * t as u64) } else { 0 };
+        let parked = if seq_rows {
+            b.tensor("in.parked", 4 * t as u64)
+        } else {
+            0
+        };
         let c_conv = b.emit(DevOp::KdaConv3, all.clone(), &[c_q, c_k, c_v], |d| {
             d.t[0] = mix[0];
             d.t[1] = mix[1];
@@ -709,24 +741,29 @@ fn emit_kda_mixer_ex(
 
         // P10 — the recurrence. `blocks` is checked against the CU count here rather than left to
         // whatever the work happens to produce, because head-parallelism alone is the pathology.
-        b.emit(DevOp::KdaStateStep, cus, &[c_conv[0], c_conv[1], c_conv[2], c_gate], |d| {
-            d.t[0] = o;
-            d.t[1] = mix[0];
-            d.t[2] = mix[1];
-            d.t[3] = mix[2];
-            d.t[4] = gate;
-            d.t[5] = beta;
-            d.t[6] = st.state;
-            d.i[0] = t;
-            d.i[1] = nh;
-            d.i[2] = hd;
-            d.i[3] = c.bv;
-            // bit0: L2-normalize q and k in kernel, eps INSIDE the sqrt.
-            // bit1 (PLOW_KDA_F_SEQ_ROWS): the rows are INDEPENDENT SEQUENCES, so the recurrence
-            // strides its carried state per row instead of threading them all through one.
-            d.i[4] = 1 | if seq_rows { 2 } else { 0 };
-            d.f[0] = scale;
-        })
+        b.emit(
+            DevOp::KdaStateStep,
+            cus,
+            &[c_conv[0], c_conv[1], c_conv[2], c_gate],
+            |d| {
+                d.t[0] = o;
+                d.t[1] = mix[0];
+                d.t[2] = mix[1];
+                d.t[3] = mix[2];
+                d.t[4] = gate;
+                d.t[5] = beta;
+                d.t[6] = st.state;
+                d.i[0] = t;
+                d.i[1] = nh;
+                d.i[2] = hd;
+                d.i[3] = c.bv;
+                // bit0: L2-normalize q and k in kernel, eps INSIDE the sqrt.
+                // bit1 (PLOW_KDA_F_SEQ_ROWS): the rows are INDEPENDENT SEQUENCES, so the recurrence
+                // strides its carried state per row instead of threading them all through one.
+                d.i[4] = 1 | if seq_rows { 2 } else { 0 };
+                d.f[0] = scale;
+            },
+        )
     };
 
     // P11 — output gate. Gated on P4 (whose GEMV has had the whole conv+gate+state chain to hide
@@ -770,15 +807,22 @@ pub fn emit_kda_layer(
     n_cu: u32,
     deps: &[u32],
 ) -> u32 {
-    let (c_o, attn) = emit_kda_mixer(b, c, w, st, act_prefix, t, hidden, None, n_cu, false, deps, false);
+    let (c_o, attn) = emit_kda_mixer(
+        b, c, w, st, act_prefix, t, hidden, None, n_cu, false, deps, false,
+    );
     let all: Vec<u32> = (0..n_cu).collect();
-    b.emit(DevOp::Residual, crate::k3::vec8_cus(&all, t * c.hidden), &[c_o], |d| {
-        d.t[0] = next;
-        d.t[1] = hidden;
-        d.t[2] = attn;
-        d.i[0] = t * c.hidden;
-        d.f[0] = 1.0;
-    })
+    b.emit(
+        DevOp::Residual,
+        crate::k3::vec8_cus(&all, t * c.hidden),
+        &[c_o],
+        |d| {
+            d.t[0] = next;
+            d.t[1] = hidden;
+            d.t[2] = attn;
+            d.i[0] = t * c.hidden;
+            d.f[0] = 1.0;
+        },
+    )
 }
 
 /// Bidirectional coverage for one KDA layer's checkpoint names.
@@ -829,8 +873,10 @@ pub fn kda_shard_class(suffix: &str) -> &'static str {
         | "v_conv1d.weight" | "A_log" | "dt_bias" => "column",
         "o_proj.weight" => "row",
         "f_a_proj.weight" | "o_norm.weight" => "replicated",
-        _ => panic!("KDA: unclassified tensor `{suffix}` — shard.rs defaults to REPLICATE, which \
-                     for KDA is not a crash, just wrong math on >1 GPU"),
+        _ => panic!(
+            "KDA: unclassified tensor `{suffix}` — shard.rs defaults to REPLICATE, which \
+                     for KDA is not a crash, just wrong math on >1 GPU"
+        ),
     }
 }
 
@@ -869,8 +915,9 @@ mod tests {
         assert!(!is_kda_layer_0based(&kda, 92));
         // The modulus rule agrees everywhere EXCEPT the last layer, which is exactly why it is a
         // silent bug rather than an obvious one.
-        let disagree: Vec<u32> =
-            (0..93).filter(|&l| (l % 4 == 3) == is_kda_layer_0based(&kda, l)).collect();
+        let disagree: Vec<u32> = (0..93)
+            .filter(|&l| (l % 4 == 3) == is_kda_layer_0based(&kda, l))
+            .collect();
         assert_eq!(disagree, vec![92]);
     }
 
@@ -880,13 +927,25 @@ mod tests {
         let c = k3();
         assert_eq!(c.proj(), 12288);
         assert_eq!(c.proj() / c.bv, 768, "work items");
-        assert_eq!(c.state_step_blocks(256), 256, "column-tiled: 100% of 256 CUs");
+        assert_eq!(
+            c.state_step_blocks(256),
+            256,
+            "column-tiled: 100% of 256 CUs"
+        );
         // One workgroup per head is the MlaMergeFold defect: 96/256 at TP1, 24/256 at TP4.
         assert_eq!(c.heads.min(256), 96);
         // TP8 with a FIXED BV does NOT hold 100% — the spec's table quietly assumes BV shrinks.
         let tp8 = KdaCfg { heads: 12, ..c };
-        assert_eq!(tp8.state_step_blocks(256), 96, "12*128/16 = 96 items, 37.5%");
-        assert_eq!(KdaCfg { bv: 8, ..tp8 }.state_step_blocks(256), 192, "BV=8 restores 192");
+        assert_eq!(
+            tp8.state_step_blocks(256),
+            96,
+            "12*128/16 = 96 items, 37.5%"
+        );
+        assert_eq!(
+            KdaCfg { bv: 8, ..tp8 }.state_step_blocks(256),
+            192,
+            "BV=8 restores 192"
+        );
     }
 
     /// The state is f32 and CONSTANT in context length. 6.00 MiB + 0.5625 MiB per layer per seq.
@@ -899,7 +958,11 @@ mod tests {
         assert_eq!(c.conv_state_elems() * 4, 589_824, "0.5625 MiB f32");
         let per_layer = (c.state_elems() + c.conv_state_elems()) * 4;
         assert_eq!(per_layer, 6_881_280, "6.5625 MiB per layer per sequence");
-        assert_eq!(per_layer * 69, 474_808_320, "452.8 MiB/seq — CONSTANT in context length");
+        assert_eq!(
+            per_layer * 69,
+            474_808_320,
+            "452.8 MiB/seq — CONSTANT in context length"
+        );
     }
 
     #[test]
@@ -926,7 +989,10 @@ mod tests {
     fn coverage_lists_all_fourteen_checkpoint_tensors() {
         let n = kda_checkpoint_names("language_model.model.layers.0.self_attn.");
         assert_eq!(n.len(), 14);
-        assert!(n.iter().all(|s| s.starts_with("language_model.")), "K3 has ZERO `model.` tensors");
+        assert!(
+            n.iter().all(|s| s.starts_with("language_model.")),
+            "K3 has ZERO `model.` tensors"
+        );
         assert!(n.contains(&"language_model.model.layers.0.self_attn.A_log".to_string()));
     }
 
@@ -949,7 +1015,10 @@ mod tests {
         assert!(crate::gemv_staged_rows(11) as u64 * 7168 > crate::GM_LDS_HALVES);
         // Every T above decode refuses, INCLUDING the ones the arena would have allowed.
         for t in [2u32, 8, 10, 11, 128, 8192] {
-            assert!(!fuse_qkvg(t, 7168), "T={t}: GemvQkvg exists only in the decode object");
+            assert!(
+                !fuse_qkvg(t, 7168),
+                "T={t}: GemvQkvg exists only in the decode object"
+            );
         }
     }
 
@@ -971,11 +1040,26 @@ mod tests {
             let w = declare_kda_weights(&mut b, &c, "l.self_attn.", "l.");
             let st = declare_kda_state(&mut b, &c, "kda.0.", 1);
             let seed = b.emit(DevOp::Nop, all, &[], |_| {});
-            emit_kda_layer(&mut b, &c, &w, &st, "act.pf.", t, hidden, next, 256, &[seed]);
+            emit_kda_layer(
+                &mut b,
+                &c,
+                &w,
+                &st,
+                "act.pf.",
+                t,
+                hidden,
+                next,
+                256,
+                &[seed],
+            );
             let p = b.finish();
             let n = |o: DevOp| p.insts.iter().filter(|i| i.op == o as u16).count();
             assert_eq!(n(DevOp::Gemv), 0, "T={t}: no decode GEMV survives");
-            assert_eq!(n(DevOp::GemvQkvg), 0, "T={t}: the 4-stream op is decode-only");
+            assert_eq!(
+                n(DevOp::GemvQkvg),
+                0,
+                "T={t}: the 4-stream op is decode-only"
+            );
             // EIGHT projections at T rows: q, k, v, g, f_a, beta, f_b, o_proj — all tiled GEMMs,
             // and every one of them carries the real row count.
             let gemm: Vec<_> = p
@@ -984,7 +1068,10 @@ mod tests {
                 .filter(|i| crate::gemm_family_ops().contains(&i.op))
                 .collect();
             assert_eq!(gemm.len(), 8, "T={t}: eight projections, none fused");
-            assert!(gemm.iter().all(|i| i.i[0] == t), "T={t}: M must be the row count");
+            assert!(
+                gemm.iter().all(|i| i.i[0] == t),
+                "T={t}: M must be the row count"
+            );
             // The mixer itself is unchanged — the serial-T recurrence is exact at any T.
             assert_eq!(n(DevOp::KdaConv3), 1);
             assert_eq!(n(DevOp::KdaStateStepG), 1);
@@ -1000,10 +1087,26 @@ mod tests {
         let all: Vec<u32> = (0..256).collect();
         let hidden = b.tensor("in.hidden", 7168 * 2);
         let next = b.tensor("act.next", 7168 * 2);
-        let w = declare_kda_weights(&mut b, &c, "language_model.model.layers.0.self_attn.", "language_model.model.layers.0.");
+        let w = declare_kda_weights(
+            &mut b,
+            &c,
+            "language_model.model.layers.0.self_attn.",
+            "language_model.model.layers.0.",
+        );
         let st = declare_kda_state(&mut b, &c, "kda.0.", 1);
         let seed = b.emit(DevOp::Nop, all, &[], |_| {});
-        emit_kda_layer(&mut b, &c, &w, &st, "act.kda0.", 1, hidden, next, 256, &[seed]);
+        emit_kda_layer(
+            &mut b,
+            &c,
+            &w,
+            &st,
+            "act.kda0.",
+            1,
+            hidden,
+            next,
+            256,
+            &[seed],
+        );
         let p = b.finish();
         let ops: Vec<u16> = p.insts.iter().map(|i| i.op).collect();
         // The DEFAULT spelling, whatever the environment says — `emit_kda_layer` reads the knob
@@ -1019,20 +1122,46 @@ mod tests {
             .iter()
             .find(|i| i.op == DevOp::GemvQkvg as u16)
             .expect("P1-P4 must fuse at t=1");
-        assert_eq!(f.blocks, 256, "the fused projection must stay chip-wide, not narrow");
-        assert_eq!([f.i[1], f.i[3], f.i[4], f.i[5]], [c.proj(); 4], "Nq/Nk/Nv/Ng");
+        assert_eq!(
+            f.blocks, 256,
+            "the fused projection must stay chip-wide, not narrow"
+        );
+        assert_eq!(
+            [f.i[1], f.i[3], f.i[4], f.i[5]],
+            [c.proj(); 4],
+            "Nq/Nk/Nv/Ng"
+        );
         assert_eq!(f.i[2], c.hidden, "K");
-        assert_eq!([f.t[2], f.t[4], f.t[6]], [w.q_proj, w.k_proj, w.v_proj], "W_q/W_k/W_v");
-        assert_eq!(f.i[6], w.g_proj, "the ninth pointer is the W_g HANDLE, not an integer");
-        assert_ne!(f.i[6], packet::dev::TENSOR_NONE, "the arm traps on an absent W_g");
+        assert_eq!(
+            [f.t[2], f.t[4], f.t[6]],
+            [w.q_proj, w.k_proj, w.v_proj],
+            "W_q/W_k/W_v"
+        );
+        assert_eq!(
+            f.i[6], w.g_proj,
+            "the ninth pointer is the W_g HANDLE, not an integer"
+        );
+        assert_ne!(
+            f.i[6],
+            packet::dev::TENSOR_NONE,
+            "the arm traps on an absent W_g"
+        );
         let chain: &[DevOp] = if fused {
             &[DevOp::KdaConv3, DevOp::KdaStateStepG, DevOp::KdaGatedNorm]
         } else {
-            &[DevOp::KdaConv, DevOp::KdaGate, DevOp::KdaStateStep, DevOp::KdaGatedNorm]
+            &[
+                DevOp::KdaConv,
+                DevOp::KdaGate,
+                DevOp::KdaStateStep,
+                DevOp::KdaGatedNorm,
+            ]
         };
         for op in chain {
-            assert!(ops.contains(&(*op as u16)), "{op:?} is not emitted — an opcode nothing \
-                    reaches is how Mamba2Scan became dead code");
+            assert!(
+                ops.contains(&(*op as u16)),
+                "{op:?} is not emitted — an opcode nothing \
+                    reaches is how Mamba2Scan became dead code"
+            );
         }
         // ...and NOTHING from the other spelling, or the layer would run the chain twice.
         let other: &[DevOp] = if fused {
@@ -1041,15 +1170,26 @@ mod tests {
             &[DevOp::KdaConv3, DevOp::KdaStateStepG]
         };
         for op in other {
-            assert!(!ops.contains(&(*op as u16)), "{op:?} escaped the other branch");
+            assert!(
+                !ops.contains(&(*op as u16)),
+                "{op:?} escaped the other branch"
+            );
         }
         // The state step must not be stranded on a handful of CUs — and the FUSED one must not
         // narrow it, which is the constraint a fusion is most likely to break silently.
-        let step_op = if fused { DevOp::KdaStateStepG } else { DevOp::KdaStateStep };
+        let step_op = if fused {
+            DevOp::KdaStateStepG
+        } else {
+            DevOp::KdaStateStep
+        };
         let step = p.insts.iter().find(|i| i.op == step_op as u16).unwrap();
         assert_eq!(step.blocks, 256, "column tiling, not head parallelism");
         // Every other KDA op spans the chip too.
-        for op in if fused { vec![DevOp::KdaConv3] } else { vec![DevOp::KdaConv, DevOp::KdaGate] } {
+        for op in if fused {
+            vec![DevOp::KdaConv3]
+        } else {
+            vec![DevOp::KdaConv, DevOp::KdaGate]
+        } {
             let i = p.insts.iter().find(|i| i.op == op as u16).unwrap();
             assert_eq!(i.blocks, 256, "{op:?}");
         }
@@ -1071,34 +1211,91 @@ mod tests {
             let st = declare_kda_state(&mut b, &c, "kda.0.", 1);
             let seed = b.emit(DevOp::Nop, all, &[], |_| {});
             emit_kda_mixer_ex(
-                &mut b, &c, &w, &st, "act.kda0.", 1, hidden, None, 256, false, &[seed], fuse, false,
+                &mut b,
+                &c,
+                &w,
+                &st,
+                "act.kda0.",
+                1,
+                hidden,
+                None,
+                256,
+                false,
+                &[seed],
+                fuse,
+                false,
             );
             b.finish()
         };
         let k3_ops = [
-            DevOp::KdaConv, DevOp::KdaGate, DevOp::KdaStateStep, DevOp::KdaGatedNorm,
-            DevOp::KdaConv3, DevOp::KdaStateStepG,
+            DevOp::KdaConv,
+            DevOp::KdaGate,
+            DevOp::KdaStateStep,
+            DevOp::KdaGatedNorm,
+            DevOp::KdaConv3,
+            DevOp::KdaStateStepG,
         ];
         let count = |p: &packet::devbuild::Program| {
-            p.insts.iter().filter(|i| k3_ops.iter().any(|o| *o as u16 == i.op)).count()
+            p.insts
+                .iter()
+                .filter(|i| k3_ops.iter().any(|o| *o as u16 == i.op))
+                .count()
         };
         let (un, fu) = (build(false), build(true));
-        assert_eq!(count(&un), 6, "three convs, a gate, the step, the gated norm");
+        assert_eq!(
+            count(&un),
+            6,
+            "three convs, a gate, the step, the gated norm"
+        );
         assert_eq!(count(&fu), 3, "one conv, the gated step, the gated norm");
 
         // PER-CU WORK. The conv's channel count per CU RISES 3x on the same 256 CUs; the state
         // step's item count per CU is IDENTICAL. Neither is a loop-axis collapse.
-        let one = un.insts.iter().find(|i| i.op == DevOp::KdaConv as u16).unwrap();
-        let three = fu.insts.iter().find(|i| i.op == DevOp::KdaConv3 as u16).unwrap();
-        assert_eq!(one.blocks, three.blocks, "the same 256 CUs, before and after");
+        let one = un
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaConv as u16)
+            .unwrap();
+        let three = fu
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaConv3 as u16)
+            .unwrap();
+        assert_eq!(
+            one.blocks, three.blocks,
+            "the same 256 CUs, before and after"
+        );
         let per_cu = |chans: u32, blocks: u16| chans.div_ceil(blocks as u32);
-        assert_eq!(per_cu(one.i[1], one.blocks), 48, "12288 channels over 256 CUs");
-        assert_eq!(per_cu(3 * three.i[1], three.blocks), 144, "36864 channels over 256 CUs");
+        assert_eq!(
+            per_cu(one.i[1], one.blocks),
+            48,
+            "12288 channels over 256 CUs"
+        );
+        assert_eq!(
+            per_cu(3 * three.i[1], three.blocks),
+            144,
+            "36864 channels over 256 CUs"
+        );
 
-        let s0 = un.insts.iter().find(|i| i.op == DevOp::KdaStateStep as u16).unwrap();
-        let s1 = fu.insts.iter().find(|i| i.op == DevOp::KdaStateStepG as u16).unwrap();
-        assert_eq!(s0.blocks, s1.blocks, "the fused step must not narrow the slice map");
-        assert_eq!([s1.i[1], s1.i[2], s1.i[3]], [s0.i[1], s0.i[2], s0.i[3]], "H, D and BV");
+        let s0 = un
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaStateStep as u16)
+            .unwrap();
+        let s1 = fu
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::KdaStateStepG as u16)
+            .unwrap();
+        assert_eq!(
+            s0.blocks, s1.blocks,
+            "the fused step must not narrow the slice map"
+        );
+        assert_eq!(
+            [s1.i[1], s1.i[2], s1.i[3]],
+            [s0.i[1], s0.i[2], s0.i[3]],
+            "H, D and BV"
+        );
         // The demoted handles are HANDLES and all four are present — the arm traps otherwise.
         for k in 4..8 {
             assert_ne!(three.i[k], packet::dev::TENSOR_NONE, "KdaConv3 i{k}");
@@ -1111,8 +1308,16 @@ mod tests {
     /// CUs. The fused step inherits `state_step_blocks`, so it inherits the shrink too.
     #[test]
     fn the_fused_step_tracks_bv_down_at_tp8() {
-        let tp8 = KdaCfg { heads: 12, bv: 8, ..k3() };
+        let tp8 = KdaCfg {
+            heads: 12,
+            bv: 8,
+            ..k3()
+        };
         assert_eq!(tp8.state_step_blocks(256), 192, "12*128/8 = 192 items");
-        assert_eq!(KdaCfg { bv: 16, ..tp8 }.state_step_blocks(256), 96, "a fixed BV strands it");
+        assert_eq!(
+            KdaCfg { bv: 16, ..tp8 }.state_step_blocks(256),
+            96,
+            "a fixed BV strands it"
+        );
     }
 }

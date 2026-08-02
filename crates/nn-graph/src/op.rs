@@ -56,7 +56,11 @@ pub enum Op {
     /// Shape-preserving. `dim` rotated may be < head_dim (partial RoPE).
     /// `interleave`: when true, pairs (x[0],x[1]), (x[2],x[3])... (GLM-style);
     /// when false, pairs (x[0],x[d/2]), (x[1],x[d/2+1])... (Llama-style).
-    Rope { dim: u32, theta: f32, interleave: bool },
+    Rope {
+        dim: u32,
+        theta: f32,
+        interleave: bool,
+    },
 
     /// Pointwise activation. Inputs `[x]`. Shape-preserving.
     Act(ActKind),

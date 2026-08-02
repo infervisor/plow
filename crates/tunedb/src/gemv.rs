@@ -162,7 +162,10 @@ mod tests {
     /// decode GEMV at the same `(m,n,k)` — different kernels moving different bytes.
     #[test]
     fn the_key_separates_gemv_from_gemm() {
-        assert_eq!(gemv_op_case("gemv", 1, 6144, 512, "None"), "gemv/1x6144x512/None");
+        assert_eq!(
+            gemv_op_case("gemv", 1, 6144, 512, "None"),
+            "gemv/1x6144x512/None"
+        );
         assert_ne!(
             gemv_op_case("gemv", 1, 6144, 512, "None"),
             crate::gemm::gemm_op_case(1, 6144, 512, QuantScheme::None)
@@ -230,8 +233,10 @@ mod tests {
         // same body with Ng = 0, so they are the same KERNEL but not the same WORK.
         let three = DevOp::GemvQkv.gemv_case(&i).unwrap();
         let four = DevOp::GemvQkvg.gemv_case(&i).unwrap();
-        assert_ne!(gemv_op_case(three.0, three.1, three.2, three.3, three.4),
-                   gemv_op_case(four.0, four.1, four.2, four.3, four.4));
+        assert_ne!(
+            gemv_op_case(three.0, three.1, three.2, three.3, three.4),
+            gemv_op_case(four.0, four.1, four.2, four.3, four.4)
+        );
     }
 
     /// Every GEMV opcode the ISA declares must produce a case, and no non-GEMV may.
@@ -279,7 +284,10 @@ mod tests {
     #[test]
     fn quantized_symbols_do_not_collide_with_the_bf16_stem() {
         assert_eq!(gemv_sample_opcode("gemv_mxfp4_m1"), Some(DevOp::GemvMxfp4));
-        assert_eq!(gemv_sample_opcode("gemv_glu_mxfp4_m1"), Some(DevOp::GemvGluMxfp4));
+        assert_eq!(
+            gemv_sample_opcode("gemv_glu_mxfp4_m1"),
+            Some(DevOp::GemvGluMxfp4)
+        );
         assert_eq!(gemv_sample_opcode("gemv_fp8_m8"), Some(DevOp::GemvFp8));
         assert_eq!(gemv_sample_opcode("gemv_blk_m1"), Some(DevOp::GemvFp8Blk));
         assert_eq!(gemv_sample_bucket("gemv_mxfp4_m1"), Some(1));
@@ -320,10 +328,19 @@ mod tests {
     fn symbols_map_to_distinct_opcodes_and_round_trip() {
         let mut seen = std::collections::BTreeSet::new();
         for (sym, op) in SYMBOLS {
-            assert!(seen.insert(op as u16), "{op:?} is reachable from two symbols");
-            let (fam, _, _, _, q) = op.gemv_case(&[1; 8]).expect("a GEMV opcode has a shape rule");
+            assert!(
+                seen.insert(op as u16),
+                "{op:?} is reachable from two symbols"
+            );
+            let (fam, _, _, _, q) = op
+                .gemv_case(&[1; 8])
+                .expect("a GEMV opcode has a shape rule");
             let quant = crate::gemm::parse_quant(q).expect("a spelling QuantScheme knows");
-            assert_eq!(gemv_rung_opcode(fam, quant), Some(op), "{sym} does not round-trip");
+            assert_eq!(
+                gemv_rung_opcode(fam, quant),
+                Some(op),
+                "{sym} does not round-trip"
+            );
         }
         assert_eq!(seen.len(), SYMBOLS.len());
         // The fused q|k|v arm has NO quantized twin in the ISA. Answering `None` is what stops
@@ -331,7 +348,10 @@ mod tests {
         assert_eq!(gemv_rung_opcode("gemvqkv", QuantScheme::Mxfp4), None);
         assert_eq!(gemv_rung_opcode("gemvqkv", QuantScheme::W8A8), None);
         // And block-fp8 is its own family, not a column of the plain one.
-        assert_eq!(gemv_rung_opcode("gemvblk", QuantScheme::W8A8), Some(DevOp::GemvFp8Blk));
+        assert_eq!(
+            gemv_rung_opcode("gemvblk", QuantScheme::W8A8),
+            Some(DevOp::GemvFp8Blk)
+        );
         assert_eq!(gemv_rung_opcode("gemvblk", QuantScheme::None), None);
     }
 
@@ -348,7 +368,13 @@ mod tests {
         let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../runtime/ubench/gemv_row_sweep.c");
         let src = std::fs::read_to_string(&p).expect("gemv_row_sweep.c");
-        for stem in ["gemv", "gemv_glu", "gemv_qkv", "gemv_mxfp4", "gemv_glu_mxfp4"] {
+        for stem in [
+            "gemv",
+            "gemv_glu",
+            "gemv_qkv",
+            "gemv_mxfp4",
+            "gemv_glu_mxfp4",
+        ] {
             assert!(
                 src.contains(&format!("\"{stem}_m\"")),
                 "{stem}_m is not a base the sweep drives — the case cannot be measured"
@@ -362,8 +388,17 @@ mod tests {
         // itself is covered on hardware by `runtime/tests/gemv_qkvg_gfx950_test.hip`, which is
         // a correctness golden and not a shape sweep. Each reads MISS in the census, which is
         // the correct reading, and is why this asserts their absence rather than omitting them.
-        assert!(!src.contains("\"gemv_fp8_m\""), "gemv_fp8 gained an arm — assert it above");
-        assert!(!src.contains("\"gemv_blk_m\""), "gemv_blk gained an arm — assert it above");
-        assert!(!src.contains("\"gemv_qkvg_m\""), "gemv_qkvg gained an arm — assert it above");
+        assert!(
+            !src.contains("\"gemv_fp8_m\""),
+            "gemv_fp8 gained an arm — assert it above"
+        );
+        assert!(
+            !src.contains("\"gemv_blk_m\""),
+            "gemv_blk gained an arm — assert it above"
+        );
+        assert!(
+            !src.contains("\"gemv_qkvg_m\""),
+            "gemv_qkvg gained an arm — assert it above"
+        );
     }
 }

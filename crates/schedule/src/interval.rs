@@ -87,7 +87,9 @@ pub struct BandwidthSet {
 
 impl Default for BandwidthSet {
     fn default() -> Self {
-        Self { levels: vec![(0, 0.0)] }
+        Self {
+            levels: vec![(0, 0.0)],
+        }
     }
 }
 

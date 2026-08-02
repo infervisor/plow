@@ -421,8 +421,7 @@ impl CudaBackend {
                 }
             }
         }
-        let lib = lib
-            .ok_or_else(|| RuntimeError::Device(format!("dlopen libcuda: {last_err}")))?;
+        let lib = lib.ok_or_else(|| RuntimeError::Device(format!("dlopen libcuda: {last_err}")))?;
         tracing::debug!("resolving CUDA driver API symbols...");
         let api = Api::resolve(lib)?;
 
@@ -448,7 +447,10 @@ impl CudaBackend {
         unsafe {
             check((api.cuInit)(0), "cuInit")?;
             let mut dev: CUdevice = 0;
-            check((api.cuDeviceGet)(&mut dev, device_ordinal as i32), "cuDeviceGet")?;
+            check(
+                (api.cuDeviceGet)(&mut dev, device_ordinal as i32),
+                "cuDeviceGet",
+            )?;
             let mut ctx: CUcontext = std::ptr::null_mut();
             check(
                 (api.cuDevicePrimaryCtxRetain)(&mut ctx, dev),
@@ -457,8 +459,13 @@ impl CudaBackend {
             check((api.cuCtxSetCurrent)(ctx), "cuCtxSetCurrent")?;
 
             let mut buf = [0 as c_char; 128];
-            check((api.cuDeviceGetName)(buf.as_mut_ptr(), 128, dev), "cuDeviceGetName")?;
-            let name = std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
+            check(
+                (api.cuDeviceGetName)(buf.as_mut_ptr(), 128, dev),
+                "cuDeviceGetName",
+            )?;
+            let name = std::ffi::CStr::from_ptr(buf.as_ptr())
+                .to_string_lossy()
+                .into_owned();
 
             let attr = |a: i32, what: &str| -> Result<i32> {
                 let mut v = 0i32;
@@ -572,7 +579,10 @@ impl CudaBackend {
     pub fn module_global_u32(&self, module: &Module, name: &str) -> Result<Option<u32>> {
         self.bind()?;
         let raw = *self.modules.lock().get(&module.id).ok_or_else(|| {
-            RuntimeError::Device(format!("module_global_u32: module {} not loaded", module.id))
+            RuntimeError::Device(format!(
+                "module_global_u32: module {} not loaded",
+                module.id
+            ))
         })?;
         let cname = std::ffi::CString::new(name)
             .map_err(|_| RuntimeError::Device("global name contains NUL".into()))?;
@@ -593,9 +603,7 @@ impl CudaBackend {
         let mut v = 0u32;
         // SAFETY: 4-byte device-to-host copy from the symbol's device address.
         self.check(
-            unsafe {
-                (self.api.cuMemcpyDtoH_v2)(&mut v as *mut u32 as *mut c_void, ptr, 4)
-            },
+            unsafe { (self.api.cuMemcpyDtoH_v2)(&mut v as *mut u32 as *mut c_void, ptr, 4) },
             &format!("cuMemcpyDtoH({name})"),
         )?;
         Ok(Some(v))
@@ -615,7 +623,10 @@ impl CudaBackend {
     ) -> Result<bool> {
         self.bind()?;
         let raw = *self.modules.lock().get(&module.id).ok_or_else(|| {
-            RuntimeError::Device(format!("module_global_bytes: module {} not loaded", module.id))
+            RuntimeError::Device(format!(
+                "module_global_bytes: module {} not loaded",
+                module.id
+            ))
         })?;
         let cname = std::ffi::CString::new(name)
             .map_err(|_| RuntimeError::Device("global name contains NUL".into()))?;
@@ -645,7 +656,10 @@ impl CudaBackend {
     pub fn module_global_zero(&self, module: &Module, name: &str, n: usize) -> Result<bool> {
         self.bind()?;
         let raw = *self.modules.lock().get(&module.id).ok_or_else(|| {
-            RuntimeError::Device(format!("module_global_zero: module {} not loaded", module.id))
+            RuntimeError::Device(format!(
+                "module_global_zero: module {} not loaded",
+                module.id
+            ))
         })?;
         let cname = std::ffi::CString::new(name)
             .map_err(|_| RuntimeError::Device("global name contains NUL".into()))?;
@@ -893,10 +907,17 @@ impl CudaBackend {
     /// (device-timeline instrumentation); `false` records cheaper (sync-only).
     pub fn event_create(&self, timing: bool) -> Result<CudaEvent> {
         self.bind()?;
-        let flags = if timing { EVENT_DEFAULT } else { EVENT_DISABLE_TIMING };
+        let flags = if timing {
+            EVENT_DEFAULT
+        } else {
+            EVENT_DISABLE_TIMING
+        };
         let mut e: CUevent = std::ptr::null_mut();
         // SAFETY: out-pointer to a driver event handle.
-        self.check(unsafe { (self.api.cuEventCreate)(&mut e, flags) }, "cuEventCreate")?;
+        self.check(
+            unsafe { (self.api.cuEventCreate)(&mut e, flags) },
+            "cuEventCreate",
+        )?;
         Ok(CudaEvent {
             raw: e as usize,
             keep: self.freer.clone(),

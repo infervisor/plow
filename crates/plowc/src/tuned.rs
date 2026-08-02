@@ -35,7 +35,11 @@ pub enum OracleEvidence {
     /// Capability filtering only — the inventory was probed, nothing measured.
     Capability { build: String, kernels: usize },
     /// Capability filtering plus measurements.
-    Measured { build: String, kernels: usize, records: usize },
+    Measured {
+        build: String,
+        kernels: usize,
+        records: usize,
+    },
 }
 
 impl OracleEvidence {
@@ -53,7 +57,11 @@ impl OracleEvidence {
             OracleEvidence::Capability { build, kernels } => {
                 format!("capability filter from probed build {build} ({kernels} kernels)")
             }
-            OracleEvidence::Measured { build, kernels, records } => format!(
+            OracleEvidence::Measured {
+                build,
+                kernels,
+                records,
+            } => format!(
                 "probed build {build} ({kernels} kernels), {records} qualified measurement(s)"
             ),
         }
@@ -123,7 +131,11 @@ impl CompilerOracle {
         }
 
         let evidence = if records > 0 {
-            OracleEvidence::Measured { build, kernels, records }
+            OracleEvidence::Measured {
+                build,
+                kernels,
+                records,
+            }
         } else {
             OracleEvidence::Capability { build, kernels }
         };
@@ -180,7 +192,16 @@ pub fn build_digests(build: &kernelcaps::BuildId) -> Digests {
 /// served for an fp8 op, pricing one kernel with a timing of another.
 pub fn case_key(q: &GemmQuery, t: TileShape) -> String {
     let g = q.shape;
-    format!("{},{},{},{},{},{},{}", g.m, g.n, g.k, q.variant(), t.bm, t.bn, t.bk)
+    format!(
+        "{},{},{},{},{},{},{}",
+        g.m,
+        g.n,
+        g.k,
+        q.variant(),
+        t.bm,
+        t.bn,
+        t.bk
+    )
 }
 
 /// Whether a probed kernel serves this query's operand format.
@@ -200,7 +221,12 @@ fn kernel_serves(k: &kernelcaps::KernelSpec, q: &GemmQuery) -> bool {
 }
 
 fn to_tileshape(t: kernelcaps::TileConfig) -> TileShape {
-    TileShape { bm: t.bm, bn: t.bn, bk: t.bk, split_k: t.split_k }
+    TileShape {
+        bm: t.bm,
+        bn: t.bn,
+        bk: t.bk,
+        split_k: t.split_k,
+    }
 }
 
 impl KernelOracle for CompilerOracle {
@@ -231,7 +257,10 @@ impl KernelOracle for CompilerOracle {
             return None;
         }
         // All or nothing: a partial set would mix nanoseconds with cycles.
-        tiles.iter().map(|t| self.measured.get(&case_key(q, *t)).copied()).collect()
+        tiles
+            .iter()
+            .map(|t| self.measured.get(&case_key(q, *t)).copied())
+            .collect()
     }
 
     fn note_pin_conflict(&self, q: &GemmQuery, buildable: &[TileShape]) {
@@ -244,7 +273,10 @@ impl KernelOracle for CompilerOracle {
                 .unwrap_or_else(|| "?".into());
             m.push(format!(
                 "{}x{}x{} {}: shared weight layout excludes the built tile {built}",
-                g.m, g.n, g.k, q.variant()
+                g.m,
+                g.n,
+                g.k,
+                q.variant()
             ));
         }
     }
@@ -294,20 +326,38 @@ mod tests {
     use rewrite::oracle::TileAdvice;
 
     fn shape() -> GemmShape {
-        GemmShape { m: 4096, n: 4096, k: 4096 }
+        GemmShape {
+            m: 4096,
+            n: 4096,
+            k: 4096,
+        }
     }
     fn tile(bm: i64, bn: i64, bk: i64) -> TileShape {
-        TileShape { bm, bn, bk, split_k: 1 }
+        TileShape {
+            bm,
+            bn,
+            bk,
+            split_k: 1,
+        }
     }
     fn bf16(s: GemmShape) -> GemmQuery {
         GemmQuery::bf16(s)
     }
     fn fp8(s: GemmShape) -> GemmQuery {
-        GemmQuery { weight_elem: 1, activation_elem: 2, ..GemmQuery::bf16(s) }
+        GemmQuery {
+            weight_elem: 1,
+            activation_elem: 2,
+            ..GemmQuery::bf16(s)
+        }
     }
 
     fn build() -> BuildId {
-        BuildId::new(IsaLevel::Sm90a, ["X=1".to_string()], "cuda-13.0", "srcdigest")
+        BuildId::new(
+            IsaLevel::Sm90a,
+            ["X=1".to_string()],
+            "cuda-13.0",
+            "srcdigest",
+        )
     }
 
     /// An oracle whose probed object carries one bf16 128x128x32 kernel.
@@ -317,10 +367,20 @@ mod tests {
             unverified: Default::default(),
             inventory: Some(Inventory::probed(
                 build(),
-                [KernelSpec::gemm_tile(DevOp::Gemm, IsaLevel::Sm90a, 128, 128, 32, "b")],
+                [KernelSpec::gemm_tile(
+                    DevOp::Gemm,
+                    IsaLevel::Sm90a,
+                    128,
+                    128,
+                    32,
+                    "b",
+                )],
             )),
             measured: Default::default(),
-            evidence: OracleEvidence::Capability { build: "b".into(), kernels: 1 },
+            evidence: OracleEvidence::Capability {
+                build: "b".into(),
+                kernels: 1,
+            },
         }
     }
 
@@ -363,9 +423,13 @@ mod tests {
     #[test]
     fn measurements_are_keyed_by_variant() {
         let mut o = with_bf16_inventory();
-        o.measured.insert(case_key(&bf16(shape()), tile(128, 128, 32)), 500);
+        o.measured
+            .insert(case_key(&bf16(shape()), tile(128, 128, 32)), 500);
 
-        assert_eq!(o.measured_gemm(&bf16(shape()), &[tile(128, 128, 32)]), Some(vec![500]));
+        assert_eq!(
+            o.measured_gemm(&bf16(shape()), &[tile(128, 128, 32)]),
+            Some(vec![500])
+        );
         assert_eq!(
             o.measured_gemm(&fp8(shape()), &[tile(128, 128, 32)]),
             None,
@@ -378,28 +442,48 @@ mod tests {
     #[test]
     fn partial_measurements_are_refused_wholesale() {
         let mut o = with_bf16_inventory();
-        o.measured.insert(case_key(&bf16(shape()), tile(128, 128, 32)), 500);
+        o.measured
+            .insert(case_key(&bf16(shape()), tile(128, 128, 32)), 500);
         let tiles = [tile(128, 128, 32), tile(256, 256, 64)];
-        assert_eq!(o.measured_gemm(&bf16(shape()), &tiles), None, "only one of two");
+        assert_eq!(
+            o.measured_gemm(&bf16(shape()), &tiles),
+            None,
+            "only one of two"
+        );
 
-        o.measured.insert(case_key(&bf16(shape()), tile(256, 256, 64)), 900);
-        assert_eq!(o.measured_gemm(&bf16(shape()), &tiles), Some(vec![500, 900]));
+        o.measured
+            .insert(case_key(&bf16(shape()), tile(256, 256, 64)), 900);
+        assert_eq!(
+            o.measured_gemm(&bf16(shape()), &tiles),
+            Some(vec![500, 900])
+        );
     }
 
     /// A measurement filed under a different shape must not be served.
     #[test]
     fn measurements_are_keyed_by_shape() {
         let mut o = with_bf16_inventory();
-        let other = GemmShape { m: 512, n: 512, k: 512 };
-        o.measured.insert(case_key(&bf16(other), tile(128, 128, 32)), 500);
+        let other = GemmShape {
+            m: 512,
+            n: 512,
+            k: 512,
+        };
+        o.measured
+            .insert(case_key(&bf16(other), tile(128, 128, 32)), 500);
         assert_eq!(o.measured_gemm(&bf16(shape()), &[tile(128, 128, 32)]), None);
     }
 
     /// The key the compiler looks up must be the key a campaign writes.
     #[test]
     fn case_key_carries_shape_and_variant() {
-        assert_eq!(case_key(&bf16(shape()), tile(128, 128, 32)), "4096,4096,4096,bf16,128,128,32");
-        assert_eq!(case_key(&fp8(shape()), tile(128, 128, 32)), "4096,4096,4096,fp8,128,128,32");
+        assert_eq!(
+            case_key(&bf16(shape()), tile(128, 128, 32)),
+            "4096,4096,4096,bf16,128,128,32"
+        );
+        assert_eq!(
+            case_key(&fp8(shape()), tile(128, 128, 32)),
+            "4096,4096,4096,fp8,128,128,32"
+        );
     }
 
     /// The digests the compiler queries with must be the digests a campaign
@@ -425,12 +509,21 @@ mod tests {
     fn tier_reflects_evidence() {
         assert_eq!(OracleEvidence::Disabled.tier(), "portable");
         assert_eq!(
-            OracleEvidence::Capability { build: "b".into(), kernels: 3 }.tier(),
+            OracleEvidence::Capability {
+                build: "b".into(),
+                kernels: 3
+            }
+            .tier(),
             "portable",
             "a capability filter is not a measurement"
         );
         assert_eq!(
-            OracleEvidence::Measured { build: "b".into(), kernels: 3, records: 2 }.tier(),
+            OracleEvidence::Measured {
+                build: "b".into(),
+                kernels: 3,
+                records: 2
+            }
+            .tier(),
             "sku-calibrated"
         );
     }

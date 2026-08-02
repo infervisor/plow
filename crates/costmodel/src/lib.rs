@@ -16,7 +16,7 @@ pub mod tile;
 pub mod unit;
 
 pub use cost::{handoff_costs, xunit_handoff_costs, Cycles, HandoffCosts, XunitHandoffCosts};
-pub use dtype_cost::{CostParams, to_mma_dtype};
+pub use dtype_cost::{to_mma_dtype, CostParams};
 pub use hwspec::MmaDtype;
 pub use mma::MmaShape;
 pub use optile::{AttnShape, FlashTile, RowShape, RowTile};
@@ -277,7 +277,15 @@ impl<'a> CostModel<'a> {
         let ws_bytes = params.working_set_bytes(tile, self.buffering);
         let ws_pages = self.sram.pages(ws_bytes);
         let passes = self.sram.loop_passes(ws_pages);
-        cost::gemm_cycles(self.spec, g, tile, params.activation_elem, self.buffering, passes, params.mma_dtype)
+        cost::gemm_cycles(
+            self.spec,
+            g,
+            tile,
+            params.activation_elem,
+            self.buffering,
+            passes,
+            params.mma_dtype,
+        )
     }
 
     /// Lowest-cost tile for `g` under `policy` with typed operands.
@@ -314,7 +322,9 @@ impl<'a> CostModel<'a> {
         // Re-filter: use the asymmetric working-set for SRAM fit check.
         if policy == SramPolicy::Filter {
             cands.retain(|t| {
-                let ws_pages = self.sram.pages(params.working_set_bytes(*t, self.buffering));
+                let ws_pages = self
+                    .sram
+                    .pages(params.working_set_bytes(*t, self.buffering));
                 ws_pages <= self.sram.pages_per_sm.max(1)
             });
         }
@@ -335,9 +345,10 @@ impl<'a> CostModel<'a> {
                 self.buffering,
                 self.split_k_max,
             );
-            if let Some(best) = all.into_iter().min_by_key(|t| {
-                params.working_set_bytes(*t, self.buffering)
-            }) {
+            if let Some(best) = all
+                .into_iter()
+                .min_by_key(|t| params.working_set_bytes(*t, self.buffering))
+            {
                 cands.push(best);
             }
         }
@@ -346,13 +357,16 @@ impl<'a> CostModel<'a> {
 
     /// Streaming passes for a tile with typed operands.
     pub fn passes_typed(&self, tile: TileShape, params: CostParams) -> u64 {
-        let ws_pages = self.sram.pages(params.working_set_bytes(tile, self.buffering));
+        let ws_pages = self
+            .sram
+            .pages(params.working_set_bytes(tile, self.buffering));
         self.sram.loop_passes(ws_pages)
     }
 
     /// SRAM page footprint of a tile's working set with typed operands.
     pub fn sram_pages_typed(&self, tile: TileShape, params: CostParams) -> u64 {
-        self.sram.pages(params.working_set_bytes(tile, self.buffering))
+        self.sram
+            .pages(params.working_set_bytes(tile, self.buffering))
     }
 }
 
@@ -553,10 +567,26 @@ mod tests {
     /// Representative GEMM shapes (prefill, decode, skinny-M, large square).
     fn gemm_shapes() -> Vec<GemmShape> {
         vec![
-            GemmShape { m: 4096, n: 4096, k: 4096 }, // large prefill
-            GemmShape { m: 1, n: 4096, k: 4096 },    // decode (single token)
-            GemmShape { m: 64, n: 4096, k: 4096 },   // small batch decode
-            GemmShape { m: 2048, n: 8192, k: 4096 },  // wide projection
+            GemmShape {
+                m: 4096,
+                n: 4096,
+                k: 4096,
+            }, // large prefill
+            GemmShape {
+                m: 1,
+                n: 4096,
+                k: 4096,
+            }, // decode (single token)
+            GemmShape {
+                m: 64,
+                n: 4096,
+                k: 4096,
+            }, // small batch decode
+            GemmShape {
+                m: 2048,
+                n: 8192,
+                k: 4096,
+            }, // wide projection
         ]
     }
 
@@ -577,9 +607,11 @@ mod tests {
                 let available = spec.sm.shared_mem.0.saturating_sub(reserve);
                 let expected_pages = available / page_bytes;
                 assert_eq!(
-                    cm.sram.pages_per_sm, expected_pages,
+                    cm.sram.pages_per_sm,
+                    expected_pages,
                     "pages_per_sm mismatch for {} @ {} KiB pages",
-                    spec.name, page_bytes / 1024
+                    spec.name,
+                    page_bytes / 1024
                 );
                 assert!(
                     cm.sram.pages_per_sm * page_bytes <= spec.sm.shared_mem.0,
@@ -597,7 +629,9 @@ mod tests {
                     assert!(
                         !filter_cands.is_empty(),
                         "{} @ {} KiB: Filter candidates empty for {:?}",
-                        spec.name, page_bytes / 1024, g,
+                        spec.name,
+                        page_bytes / 1024,
+                        g,
                     );
                     for t in &filter_cands {
                         let ws_pages = cm.sram_pages(*t);
@@ -617,12 +651,15 @@ mod tests {
                     assert!(
                         !stream_cands.is_empty(),
                         "{} @ {} KiB: Stream candidates empty for {:?}",
-                        spec.name, page_bytes / 1024, g,
+                        spec.name,
+                        page_bytes / 1024,
+                        g,
                     );
                     assert!(
                         stream_cands.len() >= filter_cands.len(),
                         "{}: Stream candidates fewer than Filter for {:?}",
-                        spec.name, g,
+                        spec.name,
+                        g,
                     );
 
                     // TMEM check (Blackwell datacenter only).
@@ -633,7 +670,10 @@ mod tests {
                             assert!(
                                 cols <= tmem_cols,
                                 "{}: tile {:?} needs {} TMEM cols > budget {}",
-                                spec.name, t, cols, tmem_cols,
+                                spec.name,
+                                t,
+                                cols,
+                                tmem_cols,
                             );
                         }
                     }
@@ -666,7 +706,11 @@ mod tests {
         for spec in all_specs() {
             let cm = CostModel::new(spec, DEFAULT_PAGE_BYTES);
             // N=100 is not divisible by any standard MMA-N (8, 16, 32, 64, 128, 256)
-            let g = GemmShape { m: 64, n: 100, k: 64 };
+            let g = GemmShape {
+                m: 64,
+                n: 100,
+                k: 64,
+            };
             let cands = cm.candidates(g, SramPolicy::Filter);
             assert!(
                 !cands.is_empty(),

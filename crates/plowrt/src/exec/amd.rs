@@ -366,8 +366,7 @@ impl PrefillArm {
                     // behind `PLOW_MOE_PF_A4W4` — a different object, not a
                     // different immediate. The other three ops in the chain do
                     // not carry it, so only these two are asked.
-                    if (op == DevOp::MoeGroupGluPf as u16
-                        || op == DevOp::MoeGroupDownPf as u16)
+                    if (op == DevOp::MoeGroupGluPf as u16 || op == DevOp::MoeGroupDownPf as u16)
                         && i.i[MOE_PF_ENC_SLOT] == MOE_ENC_MXFP4
                     {
                         a4w4 = true;
@@ -488,7 +487,10 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // `#if PLOW_MLA_PREFILL` in runtime/amd/interp.hip gates ops 51/55 (via
     // `exec_flash_mla_prefill` -> `d_flash_mla_decode`) AND the latent epilogue
     // ops 53/54, which is why the fold names count as proof of the same flag.
-    ("PLOW_MLA_PREFILL", &["d_flash_mla", "d_mla_merge_fold", "d_o_uv_fold"]),
+    (
+        "PLOW_MLA_PREFILL",
+        &["d_flash_mla", "d_mla_merge_fold", "d_o_uv_fold"],
+    ),
     // `#if PLOW_MOE_PREFILL` gates ops 83-87. The `_pf` suffix is what separates
     // them from the decode-side `d_moe_expert_*`/`d_moe_group_*_fp8_blk`, which a
     // decode object carries whether or not this flag was set.
@@ -509,7 +511,13 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // finite, fluent output.
     (
         "PLOW_K3",
-        &["d_attn_res", "d_situ_glu", "d_mla_out_gate", "d_kda_state_step", "d_kda_conv"],
+        &[
+            "d_attn_res",
+            "d_situ_glu",
+            "d_mla_out_gate",
+            "d_kda_state_step",
+            "d_kda_conv",
+        ],
     ),
 ];
 
@@ -526,13 +534,16 @@ fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
     let Ok(raw) = std::fs::read(&mpath) else {
         return Ok(None);
     };
-    let man: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| {
-        RuntimeError::Device(format!("{}: not valid JSON: {e}", mpath.display()))
-    })?;
+    let man: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|e| RuntimeError::Device(format!("{}: not valid JSON: {e}", mpath.display())))?;
     Ok(man
         .pointer("/backends/gfx950/requires")
         .and_then(|r| r.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()))
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        }))
 }
 
 /// Every symbol NAME in an ELF64 object's symbol tables.
@@ -545,13 +556,16 @@ fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
 fn elf_symbol_names(img: &[u8]) -> Vec<&str> {
     let mut out = Vec::new();
     let u16at = |o: usize| -> Option<usize> {
-        img.get(o..o + 2).map(|b| u16::from_le_bytes(b.try_into().expect("2")) as usize)
+        img.get(o..o + 2)
+            .map(|b| u16::from_le_bytes(b.try_into().expect("2")) as usize)
     };
     let u32at = |o: usize| -> Option<usize> {
-        img.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().expect("4")) as usize)
+        img.get(o..o + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().expect("4")) as usize)
     };
     let u64at = |o: usize| -> Option<usize> {
-        img.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().expect("8")) as usize)
+        img.get(o..o + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().expect("8")) as usize)
     };
     // ELFCLASS64 (e_ident[4] == 2) and ELFDATA2LSB (e_ident[5] == 1) only. An
     // AMDGPU code object is always both; anything else is not one.
@@ -584,11 +598,19 @@ fn elf_symbol_names(img: &[u8]) -> Vec<&str> {
             continue;
         }
         let Some(l) = hdr(link) else { continue };
-        let (Some(stroff), Some(strsz)) = (u64at(l + 24), u64at(l + 32)) else { continue };
-        let Some(strtab) = img.get(stroff..stroff.saturating_add(strsz)) else { continue };
+        let (Some(stroff), Some(strsz)) = (u64at(l + 24), u64at(l + 32)) else {
+            continue;
+        };
+        let Some(strtab) = img.get(stroff..stroff.saturating_add(strsz)) else {
+            continue;
+        };
         for k in 0..size / entsz {
-            let Some(nm) = u32at(off + k * entsz) else { break };
-            let Some(tail) = strtab.get(nm..) else { continue };
+            let Some(nm) = u32at(off + k * entsz) else {
+                break;
+            };
+            let Some(tail) = strtab.get(nm..) else {
+                continue;
+            };
             let end = tail.iter().position(|&c| c == 0).unwrap_or(tail.len());
             if end > 0 {
                 if let Ok(s) = std::str::from_utf8(&tail[..end]) {
@@ -931,9 +953,21 @@ fn check_kv_encoding(
         op as u16,
         if obj_fp8 { "bf16" } else { "fp8" },
         path.display(),
-        if obj_fp8 { "WITH -DPLOW_FP8_KV=1" } else { "WITHOUT -DPLOW_FP8_KV=1" },
-        if obj_fp8 { "advertises" } else { "does not advertise" },
-        if obj_fp8 { "without -DPLOW_FP8_KV=1" } else { "with -DPLOW_FP8_KV=1" },
+        if obj_fp8 {
+            "WITH -DPLOW_FP8_KV=1"
+        } else {
+            "WITHOUT -DPLOW_FP8_KV=1"
+        },
+        if obj_fp8 {
+            "advertises"
+        } else {
+            "does not advertise"
+        },
+        if obj_fp8 {
+            "without -DPLOW_FP8_KV=1"
+        } else {
+            "with -DPLOW_FP8_KV=1"
+        },
     )))
 }
 
@@ -1090,7 +1124,11 @@ const LAUNCH_ROWS: u32 = 416;
 /// Returned largest-first, which puts the ragged chunk LAST — the tail is where
 /// padding lands, and a padded row writes KV nothing reads.
 pub fn plan_chunks(buckets: &[u32], n_prompt: u32) -> Result<Vec<u32>> {
-    let mut bkt: Vec<u32> = buckets.iter().copied().filter(|&b| b > 0 && b <= MAX_CHUNK).collect();
+    let mut bkt: Vec<u32> = buckets
+        .iter()
+        .copied()
+        .filter(|&b| b > 0 && b <= MAX_CHUNK)
+        .collect();
     bkt.sort_unstable();
     bkt.dedup();
     if bkt.is_empty() {
@@ -1219,8 +1257,7 @@ fn bind_dense_ffn_tables(
         };
         let mut addrs = [0u64; 3];
         for (j, proj) in PROJ.iter().enumerate() {
-            let cands: Vec<String> =
-                suffixes.iter().map(|s| format!("{pfx}{proj}{s}")).collect();
+            let cands: Vec<String> = suffixes.iter().map(|s| format!("{pfx}{proj}{s}")).collect();
             let (want, k) = cands
                 .iter()
                 .find_map(|w| names.iter().position(|n| n == w).map(|k| (w, k)))
@@ -1540,8 +1577,16 @@ fn resolve_expert_names(
             // now a broken checkpoint and not a wrong guess, and saying so beats
             // falling through to a spelling that cannot be right.
             for scale in SCALES {
-                if ckpt.tensor_ex(&format!("{ns}0.{}{scale}", proj[0])).is_some() {
-                    return Ok(ExpertNames { ns, proj, payload, scale });
+                if ckpt
+                    .tensor_ex(&format!("{ns}0.{}{scale}", proj[0]))
+                    .is_some()
+                {
+                    return Ok(ExpertNames {
+                        ns,
+                        proj,
+                        payload,
+                        scale,
+                    });
                 }
             }
             return Err(RuntimeError::Device(format!(
@@ -1593,9 +1638,11 @@ fn check_expert_geometry(
             )))
         };
         if ws.len() != 2 || ss.len() != 2 {
-            return bad("both must be 2-D — a routed expert is a matrix and its scale is \
+            return bad(
+                "both must be 2-D — a routed expert is a matrix and its scale is \
                         a grid or a per-group row, never a vector"
-                .into());
+                    .into(),
+            );
         }
         let (wn0, wn1, sn0, sn1) = (ws[0], ws[1], ss[0], ss[1]);
         if n.microscaled() {
@@ -1699,17 +1746,15 @@ fn bind_packed_experts(
     // instruction streams experts through it` on a program that streams them perfectly well.
     let dec = blob.progs.last().expect("checked non-empty");
     let i_moe_of = |i_ewt: usize| -> Option<u64> {
-        dec.insts
-            .iter()
-            .find_map(|d| {
-                if d.t[3] as usize == i_ewt && GLU_ARMS.iter().any(|&o| o as u16 == d.op) {
-                    Some(d.i[1] as u64)
-                } else if d.t[2] as usize == i_ewt && d.op == DevOp::MoeGroupGluPf as u16 {
-                    Some(d.i[0] as u64)
-                } else {
-                    None
-                }
-            })
+        dec.insts.iter().find_map(|d| {
+            if d.t[3] as usize == i_ewt && GLU_ARMS.iter().any(|&o| o as u16 == d.op) {
+                Some(d.i[1] as u64)
+            } else if d.t[2] as usize == i_ewt && d.op == DevOp::MoeGroupGluPf as u16 {
+                Some(d.i[0] as u64)
+            } else {
+                None
+            }
+        })
     };
 
     let mut bufs = Vec::with_capacity(layers.len() * 2);
@@ -1750,9 +1795,9 @@ fn bind_packed_experts(
         layout = format!("{}{{gate,up,down}}{}+{}", en.ns, en.payload, en.scale);
         // Geometry from expert 0; every expert in a layer is the same shape.
         let probe = en.weight_of(0, 0);
-        let (w0, shape0) = ckpt.tensor_ex(&probe).ok_or_else(|| {
-            RuntimeError::Device(format!("MISSING EXPERT WEIGHT: {probe}"))
-        })?;
+        let (w0, shape0) = ckpt
+            .tensor_ex(&probe)
+            .ok_or_else(|| RuntimeError::Device(format!("MISSING EXPERT WEIGHT: {probe}")))?;
         // `I_moe` is the gate projection's OUTPUT dim under every spelling —
         // `[I_moe, K]` for `gate_proj.weight`, `[I_moe, latent/2]` for a packed
         // `w1.weight_packed`. The packing halves K, never N, so this comparison
@@ -1793,12 +1838,8 @@ fn bind_packed_experts(
         let d_w = EngineDevice::alloc(be, (n_local * 3 * w_stride).max(1))?;
         let d_s = EngineDevice::alloc(be, (n_local * 3 * s_stride).max(1))?;
         LoadProf::add(&prof.alloc_ns, t_alloc);
-        let wtab = crate::orch::moe::packed_expert_table(
-            d_w.base, w_stride, n_exp, owned.clone(),
-        );
-        let stab = crate::orch::moe::packed_expert_table(
-            d_s.base, s_stride, n_exp, owned.clone(),
-        );
+        let wtab = crate::orch::moe::packed_expert_table(d_w.base, w_stride, n_exp, owned.clone());
+        let stab = crate::orch::moe::packed_expert_table(d_s.base, s_stride, n_exp, owned.clone());
 
         // The layer's reads, IN ORDER, before any of them happens.
         //
@@ -1829,9 +1870,9 @@ fn bind_packed_experts(
         }
         for (i, (name, dst, want)) in plan.iter().enumerate() {
             queue(i + depth);
-            let (src, shape) = ckpt.tensor_ex(name).ok_or_else(|| {
-                RuntimeError::Device(format!("MISSING EXPERT WEIGHT: {name}"))
-            })?;
+            let (src, shape) = ckpt
+                .tensor_ex(name)
+                .ok_or_else(|| RuntimeError::Device(format!("MISSING EXPERT WEIGHT: {name}")))?;
             // `tp = 1` is the EP/single-GPU case: bind the expert whole.
             // Otherwise the classifier sees the gate/up projection
             // (`gate_proj.weight` or `.w1.weight`: a contiguous output-row
@@ -1846,9 +1887,8 @@ fn bind_packed_experts(
                 }
             }
             let t = Instant::now();
-            let slice = crate::asset::shard::slice_for(
-                name, src, shape, *want, shard_rank, shard_n,
-            )?;
+            let slice =
+                crate::asset::shard::slice_for(name, src, shape, *want, shard_rank, shard_n)?;
             LoadProf::add(&prof.gather_ns, t);
             // Through a PINNED slab, always. The copy does not pin its
             // source, so handing it a `slice_for` gather buffer (an
@@ -1946,10 +1986,7 @@ fn kv_skips_zeroing(name: &str) -> bool {
 /// bf16 would round away most of what the multiply just computed, and the packet
 /// declares f32 for that reason. There is no TP axis here — `[hidden]` is
 /// replicated on every rank — so this runs identically at any `--num-gpus`.
-fn fold_res_score(
-    c: &crate::asset::checkpoint::Checkpoint,
-    name: &str,
-) -> Option<Result<Vec<u8>>> {
+fn fold_res_score(c: &crate::asset::checkpoint::Checkpoint, name: &str) -> Option<Result<Vec<u8>>> {
     let stem = name.strip_suffix("_res_score.weight")?;
     let bf16 = |n: &str| -> Option<Vec<f32>> {
         let (raw, _) = c.tensor_ex(n)?;
@@ -1959,7 +1996,10 @@ fn fold_res_score(
                 .collect(),
         )
     };
-    let (nn, pn) = (format!("{stem}_res_norm.weight"), format!("{stem}_res_proj.weight"));
+    let (nn, pn) = (
+        format!("{stem}_res_norm.weight"),
+        format!("{stem}_res_proj.weight"),
+    );
     let (Some(g), Some(p)) = (bf16(&nn), bf16(&pn)) else {
         // Name matched the pattern but the sources are absent: report the pair
         // rather than the derived name, which is in no checkpoint by design.
@@ -2166,8 +2206,7 @@ fn rebase_chunk(insts: &mut [DevInst64], names: &[String], c0: u32, clen: u32) {
         if let Some(f) = kv_write_row_field(op, names.get(d.t[0] as usize)) {
             d.i[f] = c0;
         }
-        if (op == DevOp::HeadNormRope as u16 || op == DevOp::HeadNormRopeFp8 as u16)
-            && d.fj[1] != 0
+        if (op == DevOp::HeadNormRope as u16 || op == DevOp::HeadNormRopeFp8 as u16) && d.fj[1] != 0
         {
             d.i[3] = c0;
         } else if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
@@ -2481,7 +2520,11 @@ impl AmdEngine {
     /// bounded by `window`, not by context, so they have nothing to grow into,
     /// and fp8 scale tensors are 1/128th the size — both stay flat, which is
     /// also what the CUDA path does.
-    fn vmm_bringup(be: &Arc<HsaBackend>, blob: &DevBlob, checkpoint: Option<&Path>) -> Option<VmmKv> {
+    fn vmm_bringup(
+        be: &Arc<HsaBackend>,
+        blob: &DevBlob,
+        checkpoint: Option<&Path>,
+    ) -> Option<VmmKv> {
         if std::env::var("PLOW_VMM_KV").as_deref() != Ok("1") {
             return None;
         }
@@ -2581,9 +2624,8 @@ impl AmdEngine {
         shared_ckpt: Option<Arc<crate::asset::checkpoint::Checkpoint>>,
     ) -> Result<Self> {
         let t_rank = Instant::now();
-        let raw = std::fs::read(blob_path).map_err(|e| {
-            RuntimeError::Device(format!("read {}: {e}", blob_path.display()))
-        })?;
+        let raw = std::fs::read(blob_path)
+            .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
         let blob = DevBlob::parse(&raw)?;
         let arch = EngineDevice::arch(&*be);
         let n_cu_dev = EngineDevice::sm_count(&*be);
@@ -2673,7 +2715,11 @@ impl AmdEngine {
         let mut sched_prefill = Sched::GlobalQueue;
         let mut sched_decode = Sched::GlobalQueue;
         if let Ok(v) = std::env::var("PLOW_GLOBAL_QUEUE") {
-            let s = if v != "0" { Sched::GlobalQueue } else { Sched::Static };
+            let s = if v != "0" {
+                Sched::GlobalQueue
+            } else {
+                Sched::Static
+            };
             sched_prefill = s;
             sched_decode = s;
         }
@@ -2869,9 +2915,7 @@ impl AmdEngine {
         // caller passes ONE checkpoint for the whole group — see `shared_ckpt`.
         let ckpt = match (shared_ckpt, checkpoint) {
             (Some(c), _) => Some(c),
-            (None, Some(dir)) => {
-                Some(Arc::new(crate::asset::checkpoint::Checkpoint::open(dir)?))
-            }
+            (None, Some(dir)) => Some(Arc::new(crate::asset::checkpoint::Checkpoint::open(dir)?)),
             (None, None) => None,
         };
         // The fp8 weight TWINS live in their own checkpoint, not the bf16 one:
@@ -2906,11 +2950,7 @@ impl AmdEngine {
         let do_prefault = profile_faults();
         let depth = prefetch_depth();
         let prefetch = ckpt.as_ref().and_then(|c| {
-            crate::asset::checkpoint::Prefetcher::start(
-                Arc::clone(c),
-                prefetch_threads(),
-                depth,
-            )
+            crate::asset::checkpoint::Prefetcher::start(Arc::clone(c), prefetch_threads(), depth)
         });
         // The pool runs `depth` WEIGHT tensors ahead of the copy, over the same
         // list in the same order, so `pf` only ever moves forward and each
@@ -2919,7 +2959,9 @@ impl AmdEngine {
         // blob's tensors are scratch that touches no checkpoint at all.
         let mut pf = 0usize;
         let prefetch_ahead = |cur: &mut usize, budget: usize| {
-            let (Some(pool), Some(c)) = (prefetch.as_ref(), ckpt.as_ref()) else { return };
+            let (Some(pool), Some(c)) = (prefetch.as_ref(), ckpt.as_ref()) else {
+                return;
+            };
             let mut n = 0;
             while *cur < blob.tensors.len() && n < budget {
                 let td = &blob.tensors[*cur];
@@ -2927,9 +2969,7 @@ impl AmdEngine {
                 // `fp8/` weights live in the twin checkpoint, which is not the
                 // one the pool holds, and they are a rounding error next to the
                 // experts — so they are simply not prefetched.
-                if !packet::names::is_checkpoint_weight(&td.name)
-                    || td.name.starts_with("fp8/")
-                {
+                if !packet::names::is_checkpoint_weight(&td.name) || td.name.starts_with("fp8/") {
                     continue;
                 }
                 if let Some(s) = weight_span(c, &td.name, td.bytes, rank, n_gpu) {
@@ -3065,9 +3105,7 @@ impl AmdEngine {
                 }
             };
             let prof = &prof;
-            let push = |ring: &mut crate::device::hsa::HsaUploadRing,
-                            src: &[u8]|
-             -> Result<()> {
+            let push = |ring: &mut crate::device::hsa::HsaUploadRing, src: &[u8]| -> Result<()> {
                 for (o, chunk) in src.chunks(STAGE).enumerate() {
                     let t = Instant::now();
                     ring.push(mem.base + (o * STAGE) as u64, chunk)?;
@@ -3102,8 +3140,11 @@ impl AmdEngine {
                 // `fp8/` routes to the twin checkpoint with the prefix
                 // stripped; everything else to the base one.
                 let is_fp8 = td.name.starts_with("fp8/");
-                let src_ckpt =
-                    if is_fp8 { fp8_ckpt.as_ref() } else { ckpt.as_deref() };
+                let src_ckpt = if is_fp8 {
+                    fp8_ckpt.as_ref()
+                } else {
+                    ckpt.as_deref()
+                };
                 // KIMI-K3's ATTNRES SCORE WEIGHT IS DERIVED, NOT STORED. Resolved
                 // before the ordinary lookup, which would otherwise report MISSING
                 // WEIGHT for 186 tensors on a 93-layer model.
@@ -3242,8 +3283,17 @@ impl AmdEngine {
             let eprof = LoadProf::default();
             let t_exp = Instant::now();
             let (bufs, bytes) = bind_packed_experts(
-                &be, &blob, c, &devp, &names, &mut ring, rank, n_gpu, &eprof,
-                do_prefault, prefetch.as_ref(),
+                &be,
+                &blob,
+                c,
+                &devp,
+                &names,
+                &mut ring,
+                rank,
+                n_gpu,
+                &eprof,
+                do_prefault,
+                prefetch.as_ref(),
             )?;
             eprof.report("packed experts", t_exp.elapsed(), bytes);
             expert_bufs = bufs;
@@ -3389,13 +3439,8 @@ impl AmdEngine {
             // first prefill trace ever taken came back with 0 packets. K3's prefill buckets carry
             // 2942 stream entries against decode's 2459, so sizing by `decode` alone would have
             // overflowed the buffer the moment the pointer was handed over.
-            let bytes = blob
-                .progs
-                .iter()
-                .map(|g| g.stream.len())
-                .max()
-                .unwrap_or(0)
-                * TRACE_REC_BYTES;
+            let bytes =
+                blob.progs.iter().map(|g| g.stream.len()).max().unwrap_or(0) * TRACE_REC_BYTES;
             let m = EngineDevice::alloc(&*be, bytes.max(1) as u64)?;
             EngineDevice::upload(&*be, &m, 0, &vec![0u8; bytes])?;
             (Some(m), bytes)
@@ -3494,9 +3539,10 @@ impl AmdEngine {
             // stride below would alias every sequence onto every other's — no
             // fault, no missing weight, just fluent wrong output.
             const KDA_F_SEQ_ROWS: u32 = 2;
-            let unbatched = blob.progs[decode].insts.iter().find(|d| {
-                d.op == DevOp::KdaStateStepG as u16 && d.i[4] & KDA_F_SEQ_ROWS == 0
-            });
+            let unbatched = blob.progs[decode]
+                .insts
+                .iter()
+                .find(|d| d.op == DevOp::KdaStateStepG as u16 && d.i[4] & KDA_F_SEQ_ROWS == 0);
             if let (Some(t), Some(_)) = (
                 blob.tensors
                     .iter()
@@ -3567,16 +3613,20 @@ impl AmdEngine {
             &*be,
             (max_pf_inst * std::mem::size_of::<DevInst64>()).max(64),
         )?;
-        let pf_src: Vec<Vec<DevInst64>> =
-            blob.progs.iter().map(|g| g.insts.clone()).collect();
+        let pf_src: Vec<Vec<DevInst64>> = blob.progs.iter().map(|g| g.insts.clone()).collect();
         let max_ctr = progs
             .iter()
             .map(|p| p.n_counter as usize * CTR_STRIDE_U32 * 4)
             .max()
             .unwrap_or(4)
-            .max(progs.iter().filter_map(|p| p.gq.as_ref()).map(|g| {
-                g.n_seg.max(1) as usize * CTR_STRIDE_U32 * 4
-            }).max().unwrap_or(4));
+            .max(
+                progs
+                    .iter()
+                    .filter_map(|p| p.gq.as_ref())
+                    .map(|g| g.n_seg.max(1) as usize * CTR_STRIDE_U32 * 4)
+                    .max()
+                    .unwrap_or(4),
+            );
         let mut h_zero = EngineDevice::host_alloc_pinned(&*be, max_ctr.max(4))?;
         h_zero.as_mut_slice().fill(0);
 
@@ -3585,8 +3635,7 @@ impl AmdEngine {
         } else {
             (blob.kvrow.clone(), Vec::new())
         };
-        let kvrow_span =
-            kvrow_span(&kvrow.iter().chain(&kvrow_i2).copied().collect::<Vec<_>>());
+        let kvrow_span = kvrow_span(&kvrow.iter().chain(&kvrow_i2).copied().collect::<Vec<_>>());
 
         // EVERY slot's row 0 must be mapped before any batched decode runs.
         // At batch > 1 all B rows compute whether or not their slot is fed, and
@@ -3701,13 +3750,12 @@ impl AmdEngine {
         for (i, d) in insts.iter().enumerate() {
             let is_matmul = is_lm_head_matmul(d.op);
             if is_matmul && d.t[0] as usize == t_logits {
-                let ops = d
-                    .t
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, &h)| (h as usize) < self.tensor_names.len())
-                    .map(|(k, &h)| (k, self.tensor_names[h as usize].clone()))
-                    .collect();
+                let ops =
+                    d.t.iter()
+                        .enumerate()
+                        .filter(|(_, &h)| (h as usize) < self.tensor_names.len())
+                        .map(|(k, &h)| (k, self.tensor_names[h as usize].clone()))
+                        .collect();
                 // How many STREAM entries reference it, and in which segments.
                 // An instruction the compiler emitted but no stream entry
                 // schedules never runs, and its output tensor stays exactly as
@@ -4003,9 +4051,8 @@ impl AmdEngine {
             // SAFETY: the slab was allocated as `n_inst * size_of::<DevInst64>()`
             // and seeded from a `&[DevInst64]`, so it is exactly `n` live,
             // aligned, initialised records. `DevInst64` is `#[repr(C)]` POD.
-            let insts: &mut [DevInst64] = unsafe {
-                std::slice::from_raw_parts_mut(slab.as_mut_ptr() as *mut DevInst64, n)
-            };
+            let insts: &mut [DevInst64] =
+                unsafe { std::slice::from_raw_parts_mut(slab.as_mut_ptr() as *mut DevInst64, n) };
             for (sites, field) in [(&self.kvrow, 3usize), (&self.kvrow_i2, 2)] {
                 for &idx in sites {
                     let i = idx as usize;
@@ -4071,7 +4118,8 @@ impl AmdEngine {
         }
         let ptr_pos = self.devp[self.need(self.t_pos, "in.pos")?].base;
         let ptr_kvlen = self.devp[self.need(self.t_kvlen, "in.kvlen")?].base;
-        self.be.memcpy_htod_pinned(ptr_pos, &self.h_scalar.as_slice()[..4])?;
+        self.be
+            .memcpy_htod_pinned(ptr_pos, &self.h_scalar.as_slice()[..4])?;
         self.be
             .memcpy_htod_pinned(ptr_kvlen, &self.h_scalar.as_slice()[4..8])?;
         Ok(())
@@ -4134,7 +4182,10 @@ impl AmdEngine {
             // that inspects the packet statically (where all fp8 GEMMs carry
             // a_row0 == 0) and shows up only here.
             (Some(lm), _) if std::env::var("PLOW_LM_ROW0").as_deref() == Ok("1") => {
-                tracing::warn!(lm, "PLOW_LM_ROW0=1: a_row0 left at 0 — DIAGNOSTIC, wrong row");
+                tracing::warn!(
+                    lm,
+                    "PLOW_LM_ROW0=1: a_row0 left at 0 — DIAGNOSTIC, wrong row"
+                );
                 insts[lm].i[4] = 0;
             }
             (Some(lm), _) => insts[lm].i[4] = clen - 1,
@@ -4534,12 +4585,7 @@ impl AmdEngine {
                 )));
             }
             let stride = m.len / b;
-            EngineDevice::memset_d8(
-                &*self.be,
-                m.base + stride * seq as u64,
-                0,
-                stride as usize,
-            )?;
+            EngineDevice::memset_d8(&*self.be, m.base + stride * seq as u64, 0, stride as usize)?;
         }
         Ok(())
     }
@@ -4551,7 +4597,10 @@ impl AmdEngine {
 
     /// Has slot `slot` got a prefix snapshot armed?
     pub fn has_snapshot(&self, slot: usize) -> bool {
-        self.prefix_snap.get(slot).map(|s| s.is_some()).unwrap_or(false)
+        self.prefix_snap
+            .get(slot)
+            .map(|s| s.is_some())
+            .unwrap_or(false)
     }
 
     /// Capture slot `slot`'s carried recurrent state, so a later prompt sharing the prefix that
@@ -4579,11 +4628,18 @@ impl AmdEngine {
         if self.prefix_snap[slot].is_none() {
             self.prefix_snap[slot] = Some(EngineDevice::alloc(&*self.be, total)?);
         }
-        let dst_base = self.prefix_snap[slot].as_ref().expect("just allocated").base;
+        let dst_base = self.prefix_snap[slot]
+            .as_ref()
+            .expect("just allocated")
+            .base;
         let mut off = 0u64;
         let mut pairs = Vec::with_capacity(self.carried_slot.len());
         for &(i, stride) in &self.carried_slot {
-            pairs.push((dst_base + off, self.devp[i].base + stride * slot as u64, stride));
+            pairs.push((
+                dst_base + off,
+                self.devp[i].base + stride * slot as u64,
+                stride,
+            ));
             off += stride;
         }
         // ONE completion wait for all 276 tensors. Per-copy `memcpy_dtod` blocks the host on its
@@ -4606,7 +4662,11 @@ impl AmdEngine {
         let mut off = 0u64;
         let mut pairs = Vec::with_capacity(self.carried_slot.len());
         for &(i, stride) in &self.carried_slot {
-            pairs.push((self.devp[i].base + stride * slot as u64, src_base + off, stride));
+            pairs.push((
+                self.devp[i].base + stride * slot as u64,
+                src_base + off,
+                stride,
+            ));
             off += stride;
         }
         let t = std::time::Instant::now();
@@ -4637,7 +4697,11 @@ impl AmdEngine {
                 .ok_or_else(|| {
                     RuntimeError::Device(format!("no compiled bucket for chunk T={ch}"))
                 })?;
-            out.push(ChunkStep { prog, c0, clen: (n_prompt - c0).min(ch) });
+            out.push(ChunkStep {
+                prog,
+                c0,
+                clen: (n_prompt - c0).min(ch),
+            });
             c0 += ch;
         }
         Ok(out)
@@ -4905,15 +4969,30 @@ mod tests {
     #[test]
     fn object_names_match_the_shipped_set() {
         assert_eq!(
-            object_name(Phase::Prefill, Variant::Bf16, PrefillArm::None, Sched::GlobalQueue),
+            object_name(
+                Phase::Prefill,
+                Variant::Bf16,
+                PrefillArm::None,
+                Sched::GlobalQueue
+            ),
             "interp_prefill_gq.elf"
         );
         assert_eq!(
-            object_name(Phase::Decode, Variant::Bf16, PrefillArm::None, Sched::Static),
+            object_name(
+                Phase::Decode,
+                Variant::Bf16,
+                PrefillArm::None,
+                Sched::Static
+            ),
             "interp_decode.elf"
         );
         assert_eq!(
-            object_name(Phase::Decode, Variant::Fp8Kv, PrefillArm::None, Sched::GlobalQueue),
+            object_name(
+                Phase::Decode,
+                Variant::Fp8Kv,
+                PrefillArm::None,
+                Sched::GlobalQueue
+            ),
             "interp_decode_fp8kv_gq.elf"
         );
         assert_eq!(
@@ -4928,34 +5007,69 @@ mod tests {
             "interp_flash.elf"
         );
         assert_eq!(
-            object_name(Phase::Flash, Variant::Fp8Kv, PrefillArm::None, Sched::GlobalQueue),
+            object_name(
+                Phase::Flash,
+                Variant::Fp8Kv,
+                PrefillArm::None,
+                Sched::GlobalQueue
+            ),
             "interp_flash_fp8kv_gq.elf"
         );
         // The MLA/MoE-prefill axis is PREFILL-only — no decode or flash twin
         // exists (`scripts/build_gfx950.sh` never builds one) — so a non-None
         // arm on those phases must not leak into the filename.
         assert_eq!(
-            object_name(Phase::Prefill, Variant::Bf16, PrefillArm::Mla, Sched::GlobalQueue),
+            object_name(
+                Phase::Prefill,
+                Variant::Bf16,
+                PrefillArm::Mla,
+                Sched::GlobalQueue
+            ),
             "interp_prefill_mla_gq.elf"
         );
         assert_eq!(
-            object_name(Phase::Prefill, Variant::Bf16, PrefillArm::Mla, Sched::Static),
+            object_name(
+                Phase::Prefill,
+                Variant::Bf16,
+                PrefillArm::Mla,
+                Sched::Static
+            ),
             "interp_prefill_mla.elf"
         );
         assert_eq!(
-            object_name(Phase::Prefill, Variant::Bf16, PrefillArm::MlaMoe, Sched::GlobalQueue),
+            object_name(
+                Phase::Prefill,
+                Variant::Bf16,
+                PrefillArm::MlaMoe,
+                Sched::GlobalQueue
+            ),
             "interp_prefill_mla_moe_gq.elf"
         );
         assert_eq!(
-            object_name(Phase::Prefill, Variant::Bf16, PrefillArm::MlaMoe, Sched::Static),
+            object_name(
+                Phase::Prefill,
+                Variant::Bf16,
+                PrefillArm::MlaMoe,
+                Sched::Static
+            ),
             "interp_prefill_mla_moe.elf"
         );
         assert_eq!(
-            object_name(Phase::Decode, Variant::Bf16, PrefillArm::MlaMoe, Sched::Static),
+            object_name(
+                Phase::Decode,
+                Variant::Bf16,
+                PrefillArm::MlaMoe,
+                Sched::Static
+            ),
             "interp_decode.elf"
         );
         assert_eq!(
-            object_name(Phase::Flash, Variant::Bf16, PrefillArm::MlaMoe, Sched::Static),
+            object_name(
+                Phase::Flash,
+                Variant::Bf16,
+                PrefillArm::MlaMoe,
+                Sched::Static
+            ),
             "interp_flash.elf"
         );
         // KIMI-K3 is the exception, and deliberately: `PLOW_K3` is a MODEL axis, not a
@@ -4968,11 +5082,21 @@ mod tests {
             "interp_prefill_k3.elf"
         );
         assert_eq!(
-            object_name(Phase::Prefill, Variant::Bf16, PrefillArm::K3Moe, Sched::Static),
+            object_name(
+                Phase::Prefill,
+                Variant::Bf16,
+                PrefillArm::K3Moe,
+                Sched::Static
+            ),
             "interp_prefill_k3_moe.elf"
         );
         assert_eq!(
-            object_name(Phase::Prefill, Variant::Bf16, PrefillArm::K3MoeA4w4, Sched::GlobalQueue),
+            object_name(
+                Phase::Prefill,
+                Variant::Bf16,
+                PrefillArm::K3MoeA4w4,
+                Sched::GlobalQueue
+            ),
             "interp_prefill_k3_moe_a4w4_gq.elf"
         );
         // Decode collapses ALL THREE K3 arms onto one object: the grouped-MoE ops are
@@ -4991,7 +5115,12 @@ mod tests {
             );
         }
         assert_eq!(
-            object_name(Phase::Decode, Variant::Fp8Kv, PrefillArm::K3, Sched::GlobalQueue),
+            object_name(
+                Phase::Decode,
+                Variant::Fp8Kv,
+                PrefillArm::K3,
+                Sched::GlobalQueue
+            ),
             "interp_decode_fp8kv_k3_gq.elf"
         );
         assert_eq!(
@@ -5013,7 +5142,10 @@ mod tests {
         fn prog_with_ops(ops: &[DevOp]) -> DevProg {
             let insts = ops
                 .iter()
-                .map(|&op| DevInst64 { op: op as u16, ..Default::default() })
+                .map(|&op| DevInst64 {
+                    op: op as u16,
+                    ..Default::default()
+                })
                 .collect();
             DevProg {
                 t: 1,
@@ -5081,7 +5213,11 @@ mod tests {
             let grouped = |op: DevOp| {
                 let mut i = [0u32; 8];
                 i[MOE_PF_ENC_SLOT] = enc;
-                DevInst64 { op: op as u16, i, ..Default::default() }
+                DevInst64 {
+                    op: op as u16,
+                    i,
+                    ..Default::default()
+                }
             };
             let mut first = prog_with_ops(&[
                 DevOp::AttnRes,
@@ -5091,11 +5227,26 @@ mod tests {
             ]);
             first.insts.push(grouped(DevOp::MoeGroupGluPf));
             first.insts.push(grouped(DevOp::MoeGroupDownPf));
-            vec![first, prog_with_ops(&[DevOp::AttnRes, DevOp::SituGlu, DevOp::Gemv])]
+            vec![
+                first,
+                prog_with_ops(&[DevOp::AttnRes, DevOp::SituGlu, DevOp::Gemv]),
+            ]
         };
-        assert_eq!(PrefillArm::detect(&k3_moe(2)), PrefillArm::K3MoeA4w4, "PLOW_MOE_ENC_MXFP4");
-        assert_eq!(PrefillArm::detect(&k3_moe(0)), PrefillArm::K3Moe, "bf16 experts");
-        assert_eq!(PrefillArm::detect(&k3_moe(1)), PrefillArm::K3Moe, "block-fp8 experts");
+        assert_eq!(
+            PrefillArm::detect(&k3_moe(2)),
+            PrefillArm::K3MoeA4w4,
+            "PLOW_MOE_ENC_MXFP4"
+        );
+        assert_eq!(
+            PrefillArm::detect(&k3_moe(0)),
+            PrefillArm::K3Moe,
+            "bf16 experts"
+        );
+        assert_eq!(
+            PrefillArm::detect(&k3_moe(1)),
+            PrefillArm::K3Moe,
+            "block-fp8 experts"
+        );
 
         // A DECODE-ONLY K3 blob still selects the K3 objects. This is what makes
         // `interp_decode_k3` reachable at all, and it is not a corner: K3 emitted decode-only for
@@ -5126,7 +5277,11 @@ mod tests {
             .map(|&op| {
                 let mut i = [0u32; 8];
                 i[0] = m;
-                DevInst64 { op: op as u16, i, ..Default::default() }
+                DevInst64 {
+                    op: op as u16,
+                    i,
+                    ..Default::default()
+                }
             })
             .collect();
         DevProg {
@@ -5158,7 +5313,11 @@ mod tests {
 
         for &op in K3_ARM_OPS {
             let pkt = vec![prog_gemv(&[op], 1)];
-            assert_eq!(required_k3_op(&pkt), Some(op), "{op:?} must be recognised as a K3 arm");
+            assert_eq!(
+                required_k3_op(&pkt),
+                Some(op),
+                "{op:?} must be recognised as a K3 arm"
+            );
 
             let e = check_k3_arms(&bare, obj, required_k3_op(&pkt))
                 .expect_err("a K3 op against an object with no K3 arms must be refused");
@@ -5166,8 +5325,14 @@ mod tests {
             // The refusal has to name the op, the marker, and the remedy — the object is not on a
             // device yet, so this message is the only thing the operator gets.
             assert!(msg.contains(&format!("{op:?}")), "must name the op: {msg}");
-            assert!(msg.contains(K3_ARMS_SYM), "must name the missing marker: {msg}");
-            assert!(msg.contains("PLOW_K3"), "must name the flag to rebuild with: {msg}");
+            assert!(
+                msg.contains(K3_ARMS_SYM),
+                "must name the missing marker: {msg}"
+            );
+            assert!(
+                msg.contains("PLOW_K3"),
+                "must name the flag to rebuild with: {msg}"
+            );
 
             // The same packet against an object that advertises the arms is fine.
             assert!(check_k3_arms(&with_k3, obj, required_k3_op(&pkt)).is_ok());
@@ -5210,7 +5375,10 @@ mod tests {
             assert!(msg.contains(&format!("{op:?}")), "must name the op: {msg}");
             assert!(msg.contains(FP8_KV_SYM), "must name the marker: {msg}");
             assert!(msg.contains("PLOW_FP8_KV"), "must name the flag: {msg}");
-            assert!(check(&with_fp8, &pkt).is_ok(), "{op:?} belongs on the fp8 object");
+            assert!(
+                check(&with_fp8, &pkt).is_ok(),
+                "{op:?} belongs on the fp8 object"
+            );
         }
         for &op in BF16_KV_OPS {
             let pkt = vec![prog_gemv(&[op], 1)];
@@ -5218,7 +5386,10 @@ mod tests {
                 .expect_err("a bf16-KV op against an fp8-KV object must be refused");
             let msg = e.to_string();
             assert!(msg.contains(&format!("{op:?}")), "must name the op: {msg}");
-            assert!(check(&bare, &pkt).is_ok(), "{op:?} belongs on the bf16 object");
+            assert!(
+                check(&bare, &pkt).is_ok(),
+                "{op:?} belongs on the bf16 object"
+            );
         }
 
         // The ops that are in BOTH objects must be refused by NEITHER. `HeadNormRope` is the one
@@ -5233,8 +5404,14 @@ mod tests {
             DevOp::MlaMergeFold,
         ] {
             let pkt = vec![prog_gemv(&[op], 1)];
-            assert!(check(&bare, &pkt).is_ok(), "{op:?} must not be refused on a bf16 object");
-            assert!(check(&with_fp8, &pkt).is_ok(), "{op:?} must not be refused on an fp8 object");
+            assert!(
+                check(&bare, &pkt).is_ok(),
+                "{op:?} must not be refused on a bf16 object"
+            );
+            assert!(
+                check(&with_fp8, &pkt).is_ok(),
+                "{op:?} must not be refused on an fp8 object"
+            );
         }
     }
 
@@ -5285,8 +5462,7 @@ mod tests {
         }
         found.sort();
 
-        let mut want: Vec<String> =
-            K3_ARM_OPS.iter().map(|o| o.c_name().to_string()).collect();
+        let mut want: Vec<String> = K3_ARM_OPS.iter().map(|o| o.c_name().to_string()).collect();
         want.sort();
 
         assert_eq!(
@@ -5333,9 +5509,15 @@ mod tests {
             // remedy has to say so instead of naming an impossible bucket.
             if cap + 1 > GEMV_MAXM {
                 assert!(msg.contains("No object can serve this"), "{msg}");
-                assert!(msg.contains(&format!("PLOW_DECODE_BATCH <= {GEMV_MAXM}")), "{msg}");
+                assert!(
+                    msg.contains(&format!("PLOW_DECODE_BATCH <= {GEMV_MAXM}")),
+                    "{msg}"
+                );
             } else {
-                assert!(msg.contains(&format!("PLOW_DECODE_BATCH={}", cap + 1)), "{msg}");
+                assert!(
+                    msg.contains(&format!("PLOW_DECODE_BATCH={}", cap + 1)),
+                    "{msg}"
+                );
             }
         }
     }
@@ -5386,7 +5568,10 @@ mod tests {
 
         // The maximum is taken over EVERY program and every instruction, not
         // the first one found.
-        let progs = vec![prog_gemv(&[DevOp::Gemv], 1), prog_gemv(&[DevOp::GemvGlu], 8)];
+        let progs = vec![
+            prog_gemv(&[DevOp::Gemv], 1),
+            prog_gemv(&[DevOp::GemvGlu], 8),
+        ];
         assert_eq!(required_gemv_m(&progs), 8);
     }
 
@@ -5599,10 +5784,23 @@ mod tests {
         let names: Vec<String> = ["kv.0.k", "act.q"].iter().map(|s| s.to_string()).collect();
         let mut insts = vec![
             // k norm: `kv.*` AND j[0] = ring stride, both tests fire, one field.
-            DevInst64 { op: DevOp::HeadNormRopeFp8 as u16, t: [0; 8], fj: [0, 4096, 0], ..Default::default() },
+            DevInst64 {
+                op: DevOp::HeadNormRopeFp8 as u16,
+                t: [0; 8],
+                fj: [0, 4096, 0],
+                ..Default::default()
+            },
             // q norm: neither test fires.
-            DevInst64 { op: DevOp::HeadNormRope as u16, t: [1, 0, 0, 0, 0, 0, 0, 0], ..Default::default() },
-            DevInst64 { op: DevOp::FlashPrefillFp8 as u16, t: [1, 0, 0, 0, 0, 0, 0, 0], ..Default::default() },
+            DevInst64 {
+                op: DevOp::HeadNormRope as u16,
+                t: [1, 0, 0, 0, 0, 0, 0, 0],
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::FlashPrefillFp8 as u16,
+                t: [1, 0, 0, 0, 0, 0, 0, 0],
+                ..Default::default()
+            },
         ];
         rebase_chunk(&mut insts, &names, 1024, 512);
         assert_eq!(insts[0].i[3], 1024);
@@ -5626,7 +5824,10 @@ mod tests {
     /// count is the REAL row count", not "this field happens to hold 476".
     #[test]
     fn rebase_chunk_shortens_every_kda_arm_to_the_real_row_count() {
-        let names: Vec<String> = ["kv.0.state", "act.q"].iter().map(|s| s.to_string()).collect();
+        let names: Vec<String> = ["kv.0.state", "act.q"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         const T: u32 = 512;
         const CLEN: u32 = 476;
         let kda = |op: DevOp| DevInst64 {
@@ -5666,7 +5867,9 @@ mod tests {
     #[test]
     fn the_attn_res_score_weight_folds_from_the_pair_the_checkpoint_ships() {
         let Some(dir) = k3_snapshot_dir() else { return };
-        let Ok(c) = crate::asset::checkpoint::Checkpoint::open(&dir) else { return };
+        let Ok(c) = crate::asset::checkpoint::Checkpoint::open(&dir) else {
+            return;
+        };
         const H: usize = 7168;
         for site in ["self_attention", "mlp"] {
             let base = format!("language_model.model.layers.1.{site}");
@@ -5715,9 +5918,17 @@ mod tests {
     /// per process and never again between requests.
     #[test]
     fn carried_state_is_never_skippable_and_the_kv_cache_always_is() {
-        for n in ["kv.0.state", "kv.12.conv_state.q", "kv.blkres", "kv.3.state.v"] {
+        for n in [
+            "kv.0.state",
+            "kv.12.conv_state.q",
+            "kv.blkres",
+            "kv.3.state.v",
+        ] {
             assert!(is_carried_state(n), "{n} is carried state");
-            assert!(!kv_skips_zeroing(n), "{n} would keep stale bytes across a load");
+            assert!(
+                !kv_skips_zeroing(n),
+                "{n} would keep stale bytes across a load"
+            );
         }
         // The append-only cache: skippable at load, and nothing for begin_slot to do.
         for n in ["kv.0.k", "kv.31.v", "kv.7.latent"] {
@@ -5768,8 +5979,9 @@ mod tests {
         assert!(elf_symbol_names(b"\x7fELF\x02\x01").is_empty());
         assert!(elf_symbol_names(&[0xffu8; 4096]).is_empty());
         let junk = elf_symbol_names(&[0u8; 128]);
-        assert!(check_prefill_object(&junk, Path::new("x.elf"), &["PLOW_MLA_PREFILL=1".into()])
-            .is_ok());
+        assert!(
+            check_prefill_object(&junk, Path::new("x.elf"), &["PLOW_MLA_PREFILL=1".into()]).is_ok()
+        );
         // The GEMV capacity check reads the SAME empty list and reaches the
         // opposite conclusion, on purpose: an arm it cannot see may simply be
         // one this packet does not need, but a bucket it cannot see is a bucket
@@ -5824,8 +6036,8 @@ mod expert_name_tests {
 
     impl Fake {
         fn new(tag: &str, tensors: &[(&str, &str, &[usize])]) -> Fake {
-            let dir = std::env::temp_dir()
-                .join(format!("plowrt-expert-{tag}-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("plowrt-expert-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let width = |dt: &str| match dt {
@@ -5868,7 +6080,9 @@ mod expert_name_tests {
     fn refs<'a>(
         t: &'a [(String, &'static str, Vec<usize>)],
     ) -> Vec<(&'a str, &'a str, &'a [usize])> {
-        t.iter().map(|(n, d, s)| (n.as_str(), *d, s.as_slice())).collect()
+        t.iter()
+            .map(|(n, d, s)| (n.as_str(), *d, s.as_slice()))
+            .collect()
     }
 
     /// GLM-5.2's layout, and the ONE case that must stay bit-for-bit what it
@@ -5899,7 +6113,10 @@ mod expert_name_tests {
         assert_eq!(en.payload, ".weight");
         assert_eq!(en.scale, ".weight_scale_inv");
         assert!(!en.microscaled());
-        assert_eq!(en.weight_of(0, 0), "model.layers.3.mlp.experts.0.gate_proj.weight");
+        assert_eq!(
+            en.weight_of(0, 0),
+            "model.layers.3.mlp.experts.0.gate_proj.weight"
+        );
         assert_eq!(
             en.scale_of(0, 2),
             "model.layers.3.mlp.experts.0.down_proj.weight_scale_inv"
@@ -5916,7 +6133,11 @@ mod expert_name_tests {
         let mut t: Vec<(String, &str, Vec<usize>)> = Vec::new();
         for p in ["gate_proj", "up_proj", "down_proj"] {
             // [N, K/2] packed + [N, K/32] E8M0, K = 96.
-            t.push((format!("m.layers.3.mlp.experts.0.{p}.weight"), "U8", vec![64, 48]));
+            t.push((
+                format!("m.layers.3.mlp.experts.0.{p}.weight"),
+                "U8",
+                vec![64, 48],
+            ));
             t.push((
                 format!("m.layers.3.mlp.experts.0.{p}.weight_scale"),
                 "U8",
@@ -6012,12 +6233,20 @@ mod expert_name_tests {
     /// a spelling this loader has yet to learn — say so, and name both.
     #[test]
     fn a_payload_without_any_scale_names_both_spellings() {
-        let t: Vec<(String, &str, Vec<usize>)> =
-            vec![("m.layers.0.mlp.experts.0.gate_proj.weight".into(), "U8", vec![64, 48])];
+        let t: Vec<(String, &str, Vec<usize>)> = vec![(
+            "m.layers.0.mlp.experts.0.gate_proj.weight".into(),
+            "U8",
+            vec![64, 48],
+        )];
         let f = Fake::new("noscale", &refs(&t));
-        let e = resolve_expert_names(&f.open(), "m.layers.0.mlp.").unwrap_err().to_string();
+        let e = resolve_expert_names(&f.open(), "m.layers.0.mlp.")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("MISSING EXPERT SCALE"), "{e}");
-        assert!(e.contains("weight_scale_inv") && e.contains("weight_scale"), "{e}");
+        assert!(
+            e.contains("weight_scale_inv") && e.contains("weight_scale"),
+            "{e}"
+        );
     }
 
     /// No routed experts under ANY spelling fails loudly with what was probed.
@@ -6028,10 +6257,15 @@ mod expert_name_tests {
         let t: Vec<(String, &str, Vec<usize>)> =
             vec![("m.layers.0.mlp.gate.weight".into(), "U8", vec![8, 8])];
         let f = Fake::new("noexp", &refs(&t));
-        let e = resolve_expert_names(&f.open(), "m.layers.0.mlp.").unwrap_err().to_string();
+        let e = resolve_expert_names(&f.open(), "m.layers.0.mlp.")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("MISSING EXPERT WEIGHT"), "{e}");
         assert!(e.contains("experts.0.gate_proj.weight"), "{e}");
-        assert!(e.contains("block_sparse_moe.experts.0.w1.weight_packed"), "{e}");
+        assert!(
+            e.contains("block_sparse_moe.experts.0.w1.weight_packed"),
+            "{e}"
+        );
     }
 }
 

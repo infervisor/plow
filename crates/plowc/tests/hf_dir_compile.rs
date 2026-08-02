@@ -138,7 +138,11 @@ fn hf_dir_compiles_end_to_end() {
         .expect("hf-dir compile should succeed");
     assert_eq!(report.buckets.len(), 2, "decode + prefill buckets");
     for b in &report.buckets {
-        assert!(b.packet_bytes > 0, "bucket {} emitted no packets", b.packet_file);
+        assert!(
+            b.packet_bytes > 0,
+            "bucket {} emitted no packets",
+            b.packet_file
+        );
         assert!(out.join(&b.packet_file).exists());
     }
     assert!(out.join("weights.json").exists());

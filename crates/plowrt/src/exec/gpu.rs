@@ -190,7 +190,11 @@ fn resolve_interp_image(
         match info.interp_entry(role) {
             Some(sym) => Ok(sym.to_string()),
             None if info.entries.is_empty() => Ok(profile.symbol(role).to_string()),
-            None => Err(format!("no {} entry — has {}", role.as_str(), cubin::describe(image))),
+            None => Err(format!(
+                "no {} entry — has {}",
+                role.as_str(),
+                cubin::describe(image)
+            )),
         }
     };
 
@@ -202,10 +206,13 @@ fn resolve_interp_image(
             path: path.clone(),
             source,
         })?;
-        let entry = judge(&image).map_err(|why| {
-            RuntimeError::Device(format!("{var}={p}: {why}"))
-        })?;
-        return Ok(Some(InterpImage { image, entry, source: format!("{var}={p}") }));
+        let entry =
+            judge(&image).map_err(|why| RuntimeError::Device(format!("{var}={p}: {why}")))?;
+        return Ok(Some(InterpImage {
+            image,
+            entry,
+            source: format!("{var}={p}"),
+        }));
     }
 
     let mut rejected: Vec<String> = Vec::new();
@@ -213,7 +220,11 @@ fn resolve_interp_image(
     // 2. Embedded sections. The section NAME is not load-bearing: `plowc
     //    --embed-cubin` labels every image `interp_sm120` regardless of the arch
     //    it just compiled, so only the content can decide.
-    for s in blob.sections.iter().filter(|s| s.kind == packet::devbuild::SECT_CUBIN) {
+    for s in blob
+        .sections
+        .iter()
+        .filter(|s| s.kind == packet::devbuild::SECT_CUBIN)
+    {
         let Some(data) = raw.get(s.offset..s.offset + s.size) else {
             continue;
         };
@@ -233,8 +244,10 @@ fn resolve_interp_image(
     //    else that looks like a cubin, so a misnamed bundle still serves.
     let mut paths = vec![assets_dir.join(profile.file(role))];
     if let Ok(rd) = std::fs::read_dir(assets_dir) {
-        let mut rest: Vec<std::path::PathBuf> =
-            rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p != &paths[0]).collect();
+        let mut rest: Vec<std::path::PathBuf> = rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p != &paths[0])
+            .collect();
         rest.sort();
         paths.extend(rest);
     }
@@ -242,10 +255,18 @@ fn resolve_interp_image(
         let Some(image) = read_cubin_candidate(&path) else {
             continue;
         };
-        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         match judge(&image) {
             Ok(entry) => {
-                return Ok(Some(InterpImage { image, entry, source: name }))
+                return Ok(Some(InterpImage {
+                    image,
+                    entry,
+                    source: name,
+                }))
             }
             Err(why) => rejected.push(format!("{name}: {why}")),
         }
@@ -608,8 +629,11 @@ impl<'a> UploadPipe<'a> {
         // SAFETY: the pinned buffer stays alive (owned by self) until finish()
         // synchronizes the stream; dst is inside a live allocation (caller).
         unsafe {
-            self.be
-                .memcpy_htod_async(dst, &self.bufs[slot].as_slice()[..chunk.len()], &self.stream)?;
+            self.be.memcpy_htod_async(
+                dst,
+                &self.bufs[slot].as_slice()[..chunk.len()],
+                &self.stream,
+            )?;
         }
         self.be.event_record(&self.events[slot], &self.stream)?;
         self.primed[slot] = true;
@@ -774,7 +798,13 @@ pub struct DevSample {
 impl DevSample {
     /// Greedy row (device argmax == ARGMAX_FIN).
     pub fn greedy() -> Self {
-        DevSample { temp: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0, rng01: 0.0 }
+        DevSample {
+            temp: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            rng01: 0.0,
+        }
     }
 }
 
@@ -840,8 +870,10 @@ impl GpuEngine {
         let pkt = DevBlob::find_in_dir(assets_dir)?.ok_or_else(|| {
             RuntimeError::Device(format!("no PLOWDEV blob in {}", assets_dir.display()))
         })?;
-        let raw = std::fs::read(&pkt)
-            .map_err(|source| RuntimeError::Io { path: pkt.clone(), source })?;
+        let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
+            path: pkt.clone(),
+            source,
+        })?;
         let blob = DevBlob::parse(&raw)?;
         tracing::info!(
             blob = %pkt.display(),
@@ -854,10 +886,11 @@ impl GpuEngine {
         let profile = interpreter_profile(cc).ok_or_else(|| {
             RuntimeError::Device(format!(
                 "{} compute capability {}.{} has no persistent interpreter",
-                be.device_name(), cc.0, cc.1
+                be.device_name(),
+                cc.0,
+                cc.1
             ))
         })?;
-
 
         // ---- module ----
         // Selected BY CONTENT: each candidate's own ELF says which SM it targets
@@ -867,17 +900,17 @@ impl GpuEngine {
         let want_sm = cc.0 * 10 + cc.1;
         let dec = resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Decode)?
             .ok_or_else(|| {
-                RuntimeError::Device(format!(
-                    "no sm_{want_sm} decode interpreter object for {} in {} — expected a cubin \
+            RuntimeError::Device(format!(
+                "no sm_{want_sm} decode interpreter object for {} in {} — expected a cubin \
                      carrying `{}` (embedded in the blob, or a file; {} is only the conventional \
                      name, the symbol table decides). Candidates found:\n{}",
-                    be.device_name(),
-                    assets_dir.display(),
-                    profile.decode_symbol,
-                    profile.decode_file,
-                    describe_candidates(assets_dir),
-                ))
-            })?;
+                be.device_name(),
+                assets_dir.display(),
+                profile.decode_symbol,
+                profile.decode_file,
+                describe_candidates(assets_dir),
+            ))
+        })?;
         let image = dec.image;
         let module = be.module_load(&image)?;
         let kname = std::env::var(env_kernel_var(Role::Decode)).unwrap_or(dec.entry);
@@ -897,7 +930,10 @@ impl GpuEngine {
         // and launching short of the compiled claim is an illegal address on
         // the first flash op. Env override > cubin metadata > legacy default
         // (pre-metadata cubins are all GF=2 builds).
-        let smem: u32 = match std::env::var("PLOW_NV_SMEM").ok().and_then(|s| s.parse().ok()) {
+        let smem: u32 = match std::env::var("PLOW_NV_SMEM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
             Some(v) => v,
             None => be
                 .module_global_u32(&module, "plow_arena_bytes")?
@@ -971,7 +1007,9 @@ impl GpuEngine {
         // table entries — most of a blob's tensors are scratch that touches no
         // checkpoint at all. TP1 here, so the touched bytes are the whole tensor.
         let prefetch_ahead = |cur: &mut usize, budget: usize| {
-            let Some(pool) = prefetch.as_ref() else { return };
+            let Some(pool) = prefetch.as_ref() else {
+                return;
+            };
             let mut n = 0;
             while *cur < blob.tensors.len() && n < budget {
                 let td = &blob.tensors[*cur];
@@ -1171,11 +1209,11 @@ impl GpuEngine {
         };
         let enqueued = upload_all();
         drop(upload_all); // release the &mut pipe borrow before finishing it
-        // The sizing pass and the carve walked the same list with the same
-        // filter, so on a completed pass the cursor must land exactly on the
-        // total: short wastes the tail, long means two tensors were aliased onto
-        // the same bytes and the weights are quietly wrong. Only meaningful when
-        // the loop ran to the end — an error exits it early by design.
+                          // The sizing pass and the carve walked the same list with the same
+                          // filter, so on a completed pass the cursor must land exactly on the
+                          // total: short wastes the tail, long means two tensors were aliased onto
+                          // the same bytes and the weights are quietly wrong. Only meaningful when
+                          // the loop ran to the end — an error exits it early by design.
         if enqueued.is_ok() && weight_slab.is_some() {
             debug_assert_eq!(
                 slab_off, slab_bytes,
@@ -1217,15 +1255,14 @@ impl GpuEngine {
                 "weight upload breakdown"
             );
         }
-        let (t_ids, t_pos, t_kvlen, t_logits) =
-            match (t_ids, t_pos, t_kvlen, t_logits) {
-                (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-                _ => {
-                    return Err(RuntimeError::Device(
-                        "blob is missing in.ids/in.pos/in.kvlen/act.logits".into(),
-                    ))
-                }
-            };
+        let (t_ids, t_pos, t_kvlen, t_logits) = match (t_ids, t_pos, t_kvlen, t_logits) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+            _ => {
+                return Err(RuntimeError::Device(
+                    "blob is missing in.ids/in.pos/in.kvlen/act.logits".into(),
+                ))
+            }
+        };
 
         // ---- Gemma-4 26B-A4B fused-MoE expert pointer tables ----
         // Port of the chat harness's name-driven fill (gemma4_sm120_chat.cu §MoE):
@@ -1241,11 +1278,7 @@ impl GpuEngine {
                 continue;
             };
             let layer = layer.to_string();
-            let find = |suf: &str| {
-                blob.tensors
-                    .iter()
-                    .rposition(|t| t.name.ends_with(suf))
-            };
+            let find = |suf: &str| blob.tensors.iter().rposition(|t| t.name.ends_with(suf));
             let suf_gu = format!("layers.{layer}.experts.gate_up_proj");
             let suf_dn = format!("layers.{layer}.experts.down_proj");
             let (Some(gu), Some(dn)) = (find(&suf_gu), find(&suf_dn)) else {
@@ -1267,8 +1300,7 @@ impl GpuEngine {
                 let suf_gs = format!("layers.{layer}.experts.gate_up_proj_scale");
                 let suf_ds = format!("layers.{layer}.experts.down_proj_scale");
                 let est = blob.tensors.iter().position(|t| t.name == est_name);
-                let (Some(est), Some(gs), Some(ds)) = (est, find(&suf_gs), find(&suf_ds))
-                else {
+                let (Some(est), Some(gs), Some(ds)) = (est, find(&suf_gs), find(&suf_ds)) else {
                     return Err(RuntimeError::Device(format!(
                         "MoE fp8: layer {layer} missing expert scale tensor/table"
                     )));
@@ -1289,7 +1321,9 @@ impl GpuEngine {
         // the blob's handles (h_slot = len, h_req = len+1). Tiny (≤32 KiB), so
         // allocation is unconditional on the env flag only; the mode itself is
         // finalized after the prefill object loads (see below).
-        let pf_batch_env = std::env::var("PLOW_PF_BATCH").map(|v| v == "1").unwrap_or(false);
+        let pf_batch_env = std::env::var("PLOW_PF_BATCH")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let pf_max_t_blob = blob.progs[..blob.progs.len().saturating_sub(1)]
             .iter()
             .map(|g| g.t as usize)
@@ -1310,7 +1344,10 @@ impl GpuEngine {
             let h_slot = ptrs.len() as u32;
             // These runtime-appended handles are patched into u16 wire slots
             // (`DevInst64::t`), which the compiler's pack-time assert cannot see.
-            assert!(h_slot + 1 < TENSOR_NONE16 as u32, "tensor table overflows u16 handles");
+            assert!(
+                h_slot + 1 < TENSOR_NONE16 as u32,
+                "tensor table overflows u16 handles"
+            );
             ptrs.push(s.base);
             ptrs.push(r.base);
             (h_slot, h_slot + 1)
@@ -1480,8 +1517,7 @@ impl GpuEngine {
         // identified by the prefill entry in its symbol table, so the pair being
         // swapped on disk no longer costs the prefill path (it used to load the
         // DECODE image here and fail on the missing `_pf` symbol).
-        let pf =
-            resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
+        let pf = resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
         let (f_pf, smem_pf, module_pf, prefill) = if let Some(pf) = pf {
             let pf_src = pf.source.clone();
             match Self::load_prefill(&be, pf, &blob, d_tens.base, grid) {
@@ -1531,7 +1567,9 @@ impl GpuEngine {
         // at least one FUSED (ns==1, t5=at) bucket to harvest the per-layer
         // `n.at` handles from. Anything missing → warn + serialized prefill.
         let pf_batch: Option<PfBatch> = match (pf_bufs, pf_handles) {
-            (Some((d_slot, d_req)), Some((h_slot, h_req))) if f_pf.is_some() && !prefill.is_empty() => {
+            (Some((d_slot, d_req)), Some((h_slot, h_req)))
+                if f_pf.is_some() && !prefill.is_empty() =>
+            {
                 if vmm.is_some() {
                     tracing::warn!("PLOW_PF_BATCH=1 ignored: incompatible with PLOW_VMM_PREFIX=1");
                     None
@@ -1624,11 +1662,10 @@ impl GpuEngine {
         // ---- device stochastic sampler (PLOW_DEV_SAMPLE=1; plan stage 4) ----
         // Loads a `plow_sample` cubin and allocates its per-slot param + [B][V]
         // scratch buffers. Absent flag/cubin → host sampling (unchanged).
-        let sampler = Self::sampler_bringup(&be, assets_dir, batch, vocab)
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "device sampler disabled — host sampling");
-                None
-            });
+        let sampler = Self::sampler_bringup(&be, assets_dir, batch, vocab).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "device sampler disabled — host sampling");
+            None
+        });
         // Stage 5: bounded device multi-step. Requires the KV write row to come
         // from device `pos` (no per-step host patch — the thing multi-step
         // removes). True for B>1 (the kernel uses n_batch_kv from pos[b], and
@@ -1636,8 +1673,8 @@ impl GpuEngine {
         // dynamic-kvrow arm fired (the local `kvrow` was cleared above). A B==1
         // legacy cubin still host-patches i[3] each step, so multi-step is off.
         let dyn_kvrow = batch > 1 || kvrow.is_empty();
-        let multistep = Self::multistep_bringup(&be, assets_dir, batch, dyn_kvrow)
-            .unwrap_or_else(|e| {
+        let multistep =
+            Self::multistep_bringup(&be, assets_dir, batch, dyn_kvrow).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "multi-step disabled");
                 None
             });
@@ -1669,7 +1706,13 @@ impl GpuEngine {
             d_tens,
             d_tens_slots,
             _tables: vec![
-                d_stream, d_sofs, d_slen, d_waits, d_succs, d_gq_stream, d_gq_seg,
+                d_stream,
+                d_sofs,
+                d_slen,
+                d_waits,
+                d_succs,
+                d_gq_stream,
+                d_gq_seg,
             ],
             kernarg,
             t_ids,
@@ -1764,11 +1807,17 @@ impl GpuEngine {
                  packet's build.json (plowc --emit devblob+cubin), or serve a \
                  general object built without -DPLOW_CONFIG.",
                 assets_dir.display(),
-                manifest.get("tuning").map(|t| t.to_string()).unwrap_or_default(),
+                manifest
+                    .get("tuning")
+                    .map(|t| t.to_string())
+                    .unwrap_or_default(),
             ))
             .into());
         }
-        tracing::info!(packet_hash = format!("0x{stamped:016x}"), "specialised interpreter paired");
+        tracing::info!(
+            packet_hash = format!("0x{stamped:016x}"),
+            "specialised interpreter paired"
+        );
         Ok(())
     }
 
@@ -1804,7 +1853,10 @@ impl GpuEngine {
         // no scale tensors and 2 B/elem. Presence is the discriminator —
         // byte-size inference alone is ambiguous (2× ring vs 2× elem).
         let scales_of = |l: u32| -> Option<(usize, usize)> {
-            match (find(&format!("kv.{l}.k_scale")), find(&format!("kv.{l}.v_scale"))) {
+            match (
+                find(&format!("kv.{l}.k_scale")),
+                find(&format!("kv.{l}.v_scale")),
+            ) {
                 (Some(ik), Some(iv)) => Some((ik, iv)),
                 _ => None,
             }
@@ -1859,8 +1911,7 @@ impl GpuEngine {
         let mut slide_scale = Vec::new();
         let mut ring = 0u64;
         for &l in &geo.slide_layers {
-            let (Some(ik), Some(iv)) =
-                (find(&format!("kv.{l}.k")), find(&format!("kv.{l}.v")))
+            let (Some(ik), Some(iv)) = (find(&format!("kv.{l}.k")), find(&format!("kv.{l}.v")))
             else {
                 tracing::warn!(layer = l, "vmm off: missing sliding KV tensor");
                 return None;
@@ -1897,7 +1948,11 @@ impl GpuEngine {
         // Fixed snapshot region: ring rows, then (fp8 rings) their scale rows.
         let slide_rows = slide.len() as u64 * 2 * geo.kvh_slide as u64 * geo.window as u64;
         let snap_bytes = (slide_rows * hd_b
-            + if geo.elem_slide == 1 { slide_rows * 4 } else { 0 })
+            + if geo.elem_slide == 1 {
+                slide_rows * 4
+            } else {
+                0
+            })
         .max(4);
 
         let mib = |var: &str, default: u64| {
@@ -1971,11 +2026,12 @@ impl GpuEngine {
             }
             return Ok(None);
         }
-        let image = std::fs::read(&cubin)
-            .map_err(|source| RuntimeError::Io { path: cubin.clone(), source })?;
+        let image = std::fs::read(&cubin).map_err(|source| RuntimeError::Io {
+            path: cubin.clone(),
+            source,
+        })?;
         let module = be.module_load(&image)?;
-        let kname = std::env::var("PLOW_NV_KERNEL_SAMPLE")
-            .unwrap_or_else(|_| "plow_sample".into());
+        let kname = std::env::var("PLOW_NV_KERNEL_SAMPLE").unwrap_or_else(|_| "plow_sample".into());
         let f = be.get_function(&module, &kname)?;
         let params = be.host_alloc_pinned(5 * batch * 4)?;
         let d_params = be.alloc(0, (5 * batch * 4) as u64)?;
@@ -2024,7 +2080,9 @@ impl GpuEngine {
             // Expected on a B=1 legacy cubin that host-patches the KV row, so
             // this is only noteworthy when the operator asked for multi-step.
             if raw.is_some() {
-                tracing::warn!("PLOW_MULTISTEP ignored: decode cubin is not dynamic-kvrow (needs device pos)");
+                tracing::warn!(
+                    "PLOW_MULTISTEP ignored: decode cubin is not dynamic-kvrow (needs device pos)"
+                );
             }
             return Ok(None);
         }
@@ -2039,15 +2097,20 @@ impl GpuEngine {
             }
             return Ok(None);
         }
-        let image = std::fs::read(&cubin)
-            .map_err(|source| RuntimeError::Io { path: cubin.clone(), source })?;
+        let image = std::fs::read(&cubin).map_err(|source| RuntimeError::Io {
+            path: cubin.clone(),
+            source,
+        })?;
         let module = be.module_load(&image)?;
         let f_advance = be.get_function(&module, "plow_advance")?;
         let d_ring = be.alloc(0, (batch * k * 4) as u64)?;
         let ring_host = be.host_alloc_pinned(batch * k * 4)?;
         let d_fed = be.alloc(0, (batch * 4) as u64)?;
         let fed_host = be.host_alloc_pinned(batch * 4)?;
-        tracing::info!(quantum = k, "bounded device multi-step enabled (PLOW_MULTISTEP)");
+        tracing::info!(
+            quantum = k,
+            "bounded device multi-step enabled (PLOW_MULTISTEP)"
+        );
         Ok(Some(MultiStep {
             f_advance,
             _module: module,
@@ -2410,8 +2473,11 @@ impl GpuEngine {
             unsafe {
                 let bytes =
                     std::slice::from_raw_parts(self.h_inst[lo..].as_ptr() as *const u8, n * sz);
-                self.be
-                    .memcpy_htod_async(self.d_inst.base + (lo * sz) as u64, bytes, &self.stream)?;
+                self.be.memcpy_htod_async(
+                    self.d_inst.base + (lo * sz) as u64,
+                    bytes,
+                    &self.stream,
+                )?;
             }
         }
 
@@ -2432,10 +2498,16 @@ impl GpuEngine {
         // SAFETY: the pinned slab lives on `self` past the stream synchronize;
         // each section matches its [B]-sized i32 tensor.
         unsafe {
-            self.be
-                .memcpy_htod_async(self.devp[self.t_ids].base, self.stage.section(0), &self.stream)?;
-            self.be
-                .memcpy_htod_async(self.devp[self.t_pos].base, self.stage.section(1), &self.stream)?;
+            self.be.memcpy_htod_async(
+                self.devp[self.t_ids].base,
+                self.stage.section(0),
+                &self.stream,
+            )?;
+            self.be.memcpy_htod_async(
+                self.devp[self.t_pos].base,
+                self.stage.section(1),
+                &self.stream,
+            )?;
             self.be.memcpy_htod_async(
                 self.devp[self.t_kvlen].base,
                 self.stage.section(2),
@@ -2651,10 +2723,23 @@ impl GpuEngine {
         // their [B]-sized i32 tensors.
         unsafe {
             let ms = self.multistep.as_ref().expect("checked");
-            self.be.memcpy_htod_async(fed_base, ms.fed_host.as_slice(), &self.stream)?;
-            self.be.memcpy_htod_async(self.devp[self.t_ids].base, self.stage.section(0), &self.stream)?;
-            self.be.memcpy_htod_async(self.devp[self.t_pos].base, self.stage.section(1), &self.stream)?;
-            self.be.memcpy_htod_async(self.devp[self.t_kvlen].base, self.stage.section(2), &self.stream)?;
+            self.be
+                .memcpy_htod_async(fed_base, ms.fed_host.as_slice(), &self.stream)?;
+            self.be.memcpy_htod_async(
+                self.devp[self.t_ids].base,
+                self.stage.section(0),
+                &self.stream,
+            )?;
+            self.be.memcpy_htod_async(
+                self.devp[self.t_pos].base,
+                self.stage.section(1),
+                &self.stream,
+            )?;
+            self.be.memcpy_htod_async(
+                self.devp[self.t_kvlen].base,
+                self.stage.section(2),
+                &self.stream,
+            )?;
         }
 
         // Enqueue [memset → decode → advance] × K on the stream — no sync.
@@ -2692,7 +2777,8 @@ impl GpuEngine {
                 &mut a_k as *mut u32 as *mut std::ffi::c_void,
                 &mut a_b as *mut u32 as *mut std::ffi::c_void,
             ];
-            self.be.launch_kernel(f_adv, advance_grid, 256, 0, &mut a, Some(&self.stream))?;
+            self.be
+                .launch_kernel(f_adv, advance_grid, 256, 0, &mut a, Some(&self.stream))?;
         }
 
         // One D2H of the whole ring, then the single sync.
@@ -2700,7 +2786,8 @@ impl GpuEngine {
         unsafe {
             let ms = self.multistep.as_mut().expect("checked");
             let ring_slice = ms.ring_host.as_mut_slice();
-            self.be.memcpy_dtoh_async(ring_slice, ring_base, &self.stream)?;
+            self.be
+                .memcpy_dtoh_async(ring_slice, ring_base, &self.stream)?;
         }
         self.be.stream_synchronize(&self.stream)?;
 
@@ -2802,13 +2889,15 @@ impl GpuEngine {
 
         // Same contract as decode: env override > the cubin's own
         // `plow_arena_bytes_pf` metadata > legacy default.
-        let smem_pf: u32 =
-            match std::env::var("PLOW_NV_SMEM_PF").ok().and_then(|s| s.parse().ok()) {
-                Some(v) => v,
-                None => be
-                    .module_global_u32(&module, "plow_arena_bytes_pf")?
-                    .unwrap_or(SMEM_PF),
-            };
+        let smem_pf: u32 = match std::env::var("PLOW_NV_SMEM_PF")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            Some(v) => v,
+            None => be
+                .module_global_u32(&module, "plow_arena_bytes_pf")?
+                .unwrap_or(SMEM_PF),
+        };
         be.set_max_dynamic_smem(f_pf, smem_pf)?;
 
         // Same fatal grid gate as decode: the prefill kernel's occupancy must
@@ -2952,7 +3041,13 @@ impl GpuEngine {
                 d_ctr,
                 ctr_bytes,
                 _tables: vec![
-                    d_stream, d_sofs, d_slen, d_waits, d_succs, d_gq_stream, d_gq_seg,
+                    d_stream,
+                    d_sofs,
+                    d_slen,
+                    d_waits,
+                    d_succs,
+                    d_gq_stream,
+                    d_gq_seg,
                 ],
             });
         }
@@ -3191,8 +3286,7 @@ impl GpuEngine {
         // VMM: the bucket writes all tc rows (pad rows write garbage past
         // `real`) — map the chunk's full row span before launching.
         if let Some(v) = &self.vmm {
-            v.kv
-                .ensure_rows(b, ((c0 + tc) as u32).min(self.max_ctx as u32))?;
+            v.kv.ensure_rows(b, ((c0 + tc) as u32).min(self.max_ctx as u32))?;
         }
 
         // Patch this bucket's instruction stream for the chunk, then enqueue
@@ -3244,11 +3338,8 @@ impl GpuEngine {
                 bytemuck::cast_slice(&self.pf_pos[..tc]),
                 &self.stream,
             )?;
-            self.be.memcpy_htod_async(
-                self.devp[self.t_kvlen].base,
-                &kvlen_bytes,
-                &self.stream,
-            )?;
+            self.be
+                .memcpy_htod_async(self.devp[self.t_kvlen].base, &kvlen_bytes, &self.stream)?;
         }
 
         let (ctr_base, ctr_bytes, mut arg) = {
@@ -3259,7 +3350,8 @@ impl GpuEngine {
         // prebuilt tensor table (kv.* shifted to its ring); nothing uploads.
         arg.tensors = self.tens_slot_base(b);
         // One async fill re-arms the bucket's counters AND its tail GQ cursor.
-        self.be.memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
+        self.be
+            .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
 
         // All uploads/memsets are enqueued on the engine stream — the launch
         // follows them in stream order (no context sync needed).
@@ -3327,10 +3419,10 @@ impl GpuEngine {
         let lo = b.inst_lo;
         let cnt = b.inst_hi - lo + 1;
         // SAFETY: DevInst64 is a #[repr(C)] POD mirror; range within h_inst.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(b.h_inst[lo..].as_ptr() as *const u8, cnt * sz)
-        };
-        self.be.memcpy_htod(b.d_inst.base + (lo * sz) as u64, bytes)?;
+        let bytes =
+            unsafe { std::slice::from_raw_parts(b.h_inst[lo..].as_ptr() as *const u8, cnt * sz) };
+        self.be
+            .memcpy_htod(b.d_inst.base + (lo * sz) as u64, bytes)?;
         b.batch_patched = true;
         Ok(())
     }
@@ -3405,7 +3497,12 @@ impl GpuEngine {
         // Declared outside the staging closure so it outlives the closure and
         // stays valid until the stream_synchronize below — the closure enqueues
         // an async H2D of these bytes (memcpy_htod_async src-lifetime contract).
-        let kvlen_bytes = reqs.iter().map(|r| (r.c0 + r.len) as i32).max().unwrap_or(0).to_le_bytes();
+        let kvlen_bytes = reqs
+            .iter()
+            .map(|r| (r.c0 + r.len) as i32)
+            .max()
+            .unwrap_or(0)
+            .to_le_bytes();
         let staged = (|| -> Result<()> {
             self.pf_ids.resize(tc, 0);
             self.pf_pos.resize(tc, 0);
@@ -3479,7 +3576,8 @@ impl GpuEngine {
             (b.d_ctr.base, b.ctr_bytes, b.kernarg)
         };
         // One async fill re-arms the bucket's counters AND its tail GQ cursor.
-        self.be.memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
+        self.be
+            .memset_d8_async(ctr_base, 0, ctr_bytes, &self.stream)?;
 
         // All uploads/memsets are enqueued on the engine stream — the launch
         // follows them in stream order (no context sync needed).
@@ -3827,7 +3925,15 @@ mod slab_tests {
     #[test]
     fn carve_cursor_lands_exactly_on_the_sized_total() {
         // Deliberately mixed: sub-stride, exact-stride, stride+1, zero, large.
-        let sizes = [1u64, SLAB_ALIGN - 1, SLAB_ALIGN, SLAB_ALIGN + 1, 0, 1 << 20, (1 << 20) + 7];
+        let sizes = [
+            1u64,
+            SLAB_ALIGN - 1,
+            SLAB_ALIGN,
+            SLAB_ALIGN + 1,
+            0,
+            1 << 20,
+            (1 << 20) + 7,
+        ];
         let total: u64 = sizes.iter().copied().map(slab_pad).sum();
 
         let mut off = 0u64;

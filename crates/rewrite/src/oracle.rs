@@ -158,28 +158,52 @@ mod tests {
     use super::*;
 
     fn tile(bm: i64, bn: i64, bk: i64) -> TileShape {
-        TileShape { bm, bn, bk, split_k: 1 }
+        TileShape {
+            bm,
+            bn,
+            bk,
+            split_k: 1,
+        }
     }
     fn shape() -> GemmShape {
-        GemmShape { m: 4096, n: 4096, k: 4096 }
+        GemmShape {
+            m: 4096,
+            n: 4096,
+            k: 4096,
+        }
     }
 
     #[test]
     fn the_default_oracle_has_no_opinion() {
         let o = NoOracle;
-        assert_eq!(o.gemm_tiles(&GemmQuery::bf16(shape())), TileAdvice::Analytical);
-        assert!(o.measured_gemm(&GemmQuery::bf16(shape()), &[tile(128, 128, 32)]).is_none());
+        assert_eq!(
+            o.gemm_tiles(&GemmQuery::bf16(shape())),
+            TileAdvice::Analytical
+        );
+        assert!(o
+            .measured_gemm(&GemmQuery::bf16(shape()), &[tile(128, 128, 32)])
+            .is_none());
         assert_eq!(o.tier(), "portable");
     }
 
     #[test]
     fn variant_labels_track_the_emitter() {
         assert_eq!(GemmQuery::bf16(shape()).variant(), "bf16");
-        let fp8 = GemmQuery { activation_elem: 2, weight_elem: 1, ..GemmQuery::bf16(shape()) };
+        let fp8 = GemmQuery {
+            activation_elem: 2,
+            weight_elem: 1,
+            ..GemmQuery::bf16(shape())
+        };
         assert_eq!(fp8.variant(), "fp8");
-        let bq = GemmQuery { block_quant: true, ..GemmQuery::bf16(shape()) };
+        let bq = GemmQuery {
+            block_quant: true,
+            ..GemmQuery::bf16(shape())
+        };
         assert_eq!(bq.variant(), "w4a8");
-        let mx = GemmQuery { native_fp4: true, ..GemmQuery::bf16(shape()) };
+        let mx = GemmQuery {
+            native_fp4: true,
+            ..GemmQuery::bf16(shape())
+        };
         assert_eq!(mx.variant(), "fp4");
     }
 
@@ -188,7 +212,10 @@ mod tests {
     #[test]
     fn dtype_distinguishes_queries() {
         let bf16 = GemmQuery::bf16(shape());
-        let fp8 = GemmQuery { weight_elem: 1, ..bf16 };
+        let fp8 = GemmQuery {
+            weight_elem: 1,
+            ..bf16
+        };
         assert_ne!(bf16, fp8);
     }
 }

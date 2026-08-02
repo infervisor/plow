@@ -192,9 +192,7 @@ impl BufClass {
     pub fn default_access(self) -> Access {
         match self {
             BufClass::Persistent | BufClass::Static => Access::Read,
-            BufClass::Growable | BufClass::Scratch | BufClass::RequestIo => {
-                Access::ReadWrite
-            }
+            BufClass::Growable | BufClass::Scratch | BufClass::RequestIo => Access::ReadWrite,
         }
     }
 }

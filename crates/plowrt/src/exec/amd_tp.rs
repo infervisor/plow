@@ -255,9 +255,8 @@ impl AmdTpGroup {
         }
 
         // Parse the blob once, on the host, purely to size the peer region.
-        let raw = std::fs::read(blob_path).map_err(|e| {
-            RuntimeError::Device(format!("read {}: {e}", blob_path.display()))
-        })?;
+        let raw = std::fs::read(blob_path)
+            .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
         let blob = DevBlob::parse(&raw)?;
         let tp = blob.tp.ok_or_else(|| {
             RuntimeError::Device(format!(
@@ -302,13 +301,18 @@ impl AmdTpGroup {
             ))
         })?;
         tracing::info!(
-            n_gpu, hidden = tp.hidden, max_tokens, n_xctr,
+            n_gpu,
+            hidden = tp.hidden,
+            max_tokens,
+            n_xctr,
             peer_kib = layout.bytes() / 1024,
             "TP peer layout sized from the packet"
         );
 
-        let dyn_backends: Vec<Arc<dyn Backend>> =
-            backends.iter().map(|b| Arc::clone(b) as Arc<dyn Backend>).collect();
+        let dyn_backends: Vec<Arc<dyn Backend>> = backends
+            .iter()
+            .map(|b| Arc::clone(b) as Arc<dyn Backend>)
+            .collect();
         let group = TpGroup::bringup(dyn_backends, layout)?;
         // All N*(N-1) directed pairs, byte-exact, BEFORE any weight is bound.
         // `agents_allow_access` REPLACES a buffer's allow-list, so the classic
@@ -649,7 +653,9 @@ impl AmdTpGroup {
         })?;
         if self.audit {
             let dp = self.ranks[0].decode_prog();
-            dstep::timed(&dstep::AUDIT, || self.group.audit_xctr(&self.gate_expect[dp]))?;
+            dstep::timed(&dstep::AUDIT, || {
+                self.group.audit_xctr(&self.gate_expect[dp])
+            })?;
         }
         let all = self.agree_tick >= self.agree_every;
         self.agree_tick = if all { 1 } else { self.agree_tick + 1 };
@@ -699,11 +705,17 @@ impl AmdTpGroup {
         crate::obs::ttft::PF_PLAN.add(t_plan.elapsed().as_nanos() as u64);
         if crate::obs::ttft::on() {
             crate::obs::ttft::set_cover(
-                &self.ranks[0].plan_for(prompt.len() as u32).unwrap_or_default(),
+                &self.ranks[0]
+                    .plan_for(prompt.len() as u32)
+                    .unwrap_or_default(),
             );
         }
-        tracing::info!(tokens = prompt.len(), chunks = steps.len(), n_gpu = self.ranks.len(),
-                       "TP prefill plan");
+        tracing::info!(
+            tokens = prompt.len(),
+            chunks = steps.len(),
+            n_gpu = self.ranks.len(),
+            "TP prefill plan"
+        );
 
         for step in steps {
             self.prefill_chunk(prompt, step)?;
@@ -966,9 +978,9 @@ impl AmdTpGroup {
     /// ranks is what proves the all-reduces actually ran. A rank that skipped
     /// its collective still produces fluent-looking ids from its own shard.
     pub fn agree(ids: &[u32]) -> Result<u32> {
-        let first = *ids.first().ok_or_else(|| {
-            RuntimeError::Device("no ranks sampled anything".into())
-        })?;
+        let first = *ids
+            .first()
+            .ok_or_else(|| RuntimeError::Device("no ranks sampled anything".into()))?;
         if let Some(r) = ids.iter().position(|&x| x != first) {
             return Err(RuntimeError::Device(format!(
                 "RANKS DISAGREE: rank 0 sampled {first}, rank {r} sampled {} (all: \
@@ -1131,7 +1143,10 @@ mod tests {
         // an off-by-one here would silently downgrade `amd-bench --tp N`, whose
         // entire claim is that every rank emitted an identical stream.
         let mut tick = 1u32;
-        assert!((0..8).all(|_| step(&mut tick, 1)), "every=1 must never skip");
+        assert!(
+            (0..8).all(|_| step(&mut tick, 1)),
+            "every=1 must never skip"
+        );
     }
 
     /// The sharded-lm_head fold owns TWO xctr ids and they are allocated AFTER
@@ -1194,6 +1209,9 @@ mod tests {
         assert_eq!(e[0][0], Some(4)); // reduce-scatter rendezvous
         assert_eq!(e[0][1], Some(32)); // all-gather: n_gpu * blocks
         assert_eq!(e[0][2], Some(4)); // fold arrival gate
-        assert_eq!(e[0][3], None, "the fold's published u64 is data, not a count");
+        assert_eq!(
+            e[0][3], None,
+            "the fold's published u64 is data, not a count"
+        );
     }
 }

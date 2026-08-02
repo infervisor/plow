@@ -13,11 +13,11 @@ use std::mem::{offset_of, size_of};
 use std::process::Command;
 
 use packet::dev::{DevInst64, DevProgram, StreamEnt, TraceRec, Wait, CTR_STRIDE, TENSOR_NONE16};
-use packet::rope::GenTensor;
 use packet::devbuild::{
-    BlobHeader, BlobProgHeader, BlobSectionEntry, BlobTensor, BLOB_MAGIC, INIT_NONE, NAME_LEN,
-    SECT_NAME_LEN, BLOB_MAGIC_V7,
+    BlobHeader, BlobProgHeader, BlobSectionEntry, BlobTensor, BLOB_MAGIC, BLOB_MAGIC_V7, INIT_NONE,
+    NAME_LEN, SECT_NAME_LEN,
 };
+use packet::rope::GenTensor;
 
 /// Ask C for `sizeof`/`offsetof` of everything we mirror.
 fn c_layout() -> Option<Vec<(String, usize)>> {
@@ -26,7 +26,10 @@ fn c_layout() -> Option<Vec<(String, usize)>> {
     let src = dir.join("probe.c");
     let bin = dir.join("probe");
 
-    let hdr = concat!(env!("CARGO_MANIFEST_DIR"), "/../../runtime/common/dev_blob.h");
+    let hdr = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../runtime/common/dev_blob.h"
+    );
     if !std::path::Path::new(hdr).exists() {
         return None;
     }
@@ -104,7 +107,12 @@ int main(void) {{
     std::fs::write(&src, probe).ok()?;
 
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
-    let out = Command::new(cc).arg("-o").arg(&bin).arg(&src).output().ok()?;
+    let out = Command::new(cc)
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .output()
+        .ok()?;
     if !out.status.success() {
         panic!(
             "dev_isa.h failed to compile — its own _Static_asserts may have fired:\n{}",
@@ -140,40 +148,139 @@ fn rust_and_c_agree_on_the_device_isa() {
     };
 
     assert_eq!(size_of::<Wait>(), get("Wait.size"), "PlowWait size");
-    assert_eq!(size_of::<StreamEnt>(), get("StreamEnt.size"), "PlowStreamEnt size");
-    assert_eq!(size_of::<DevProgram>(), get("DevProgram.size"), "PlowProgram size");
-    assert_eq!(offset_of!(DevProgram, trace), get("DevProgram.trace"), "DevProgram.trace");
-    assert_eq!(size_of::<TraceRec>(), get("TraceRec.size"), "PlowTraceRec size");
+    assert_eq!(
+        size_of::<StreamEnt>(),
+        get("StreamEnt.size"),
+        "PlowStreamEnt size"
+    );
+    assert_eq!(
+        size_of::<DevProgram>(),
+        get("DevProgram.size"),
+        "PlowProgram size"
+    );
+    assert_eq!(
+        offset_of!(DevProgram, trace),
+        get("DevProgram.trace"),
+        "DevProgram.trace"
+    );
+    assert_eq!(
+        size_of::<TraceRec>(),
+        get("TraceRec.size"),
+        "PlowTraceRec size"
+    );
     assert_eq!(offset_of!(TraceRec, cu), get("TraceRec.cu"), "TraceRec.cu");
     assert_eq!(offset_of!(TraceRec, pc), get("TraceRec.pc"), "TraceRec.pc");
-    assert_eq!(offset_of!(TraceRec, inst), get("TraceRec.inst"), "TraceRec.inst");
+    assert_eq!(
+        offset_of!(TraceRec, inst),
+        get("TraceRec.inst"),
+        "TraceRec.inst"
+    );
     assert_eq!(offset_of!(TraceRec, op), get("TraceRec.op"), "TraceRec.op");
-    assert_eq!(offset_of!(TraceRec, slice), get("TraceRec.slice"), "TraceRec.slice");
-    assert_eq!(offset_of!(TraceRec, t_arrive), get("TraceRec.t_arrive"), "TraceRec.t_arrive");
-    assert_eq!(offset_of!(TraceRec, t_ready), get("TraceRec.t_ready"), "TraceRec.t_ready");
-    assert_eq!(offset_of!(TraceRec, t_end), get("TraceRec.t_end"), "TraceRec.t_end");
-    assert_eq!(CTR_STRIDE as usize, get("CTR_STRIDE"), "counter cache-line stride");
+    assert_eq!(
+        offset_of!(TraceRec, slice),
+        get("TraceRec.slice"),
+        "TraceRec.slice"
+    );
+    assert_eq!(
+        offset_of!(TraceRec, t_arrive),
+        get("TraceRec.t_arrive"),
+        "TraceRec.t_arrive"
+    );
+    assert_eq!(
+        offset_of!(TraceRec, t_ready),
+        get("TraceRec.t_ready"),
+        "TraceRec.t_ready"
+    );
+    assert_eq!(
+        offset_of!(TraceRec, t_end),
+        get("TraceRec.t_end"),
+        "TraceRec.t_end"
+    );
+    assert_eq!(
+        CTR_STRIDE as usize,
+        get("CTR_STRIDE"),
+        "counter cache-line stride"
+    );
 
     // The container format. Hand-duplicating it cost a segfault and a silent misparse that
     // ran a stale program against a fresh interpreter; the model just spoke nonsense.
-    assert_eq!(size_of::<BlobTensor>(), get("BlobTensor.size"), "PlowTensorDecl size");
-    assert_eq!(offset_of!(BlobTensor, name), get("BlobTensor.name"), "BlobTensor.name");
-    assert_eq!(offset_of!(BlobTensor, bytes), get("BlobTensor.bytes"), "BlobTensor.bytes");
-    assert_eq!(offset_of!(BlobTensor, init_off), get("BlobTensor.init_off"), "BlobTensor.init_off");
+    assert_eq!(
+        size_of::<BlobTensor>(),
+        get("BlobTensor.size"),
+        "PlowTensorDecl size"
+    );
+    assert_eq!(
+        offset_of!(BlobTensor, name),
+        get("BlobTensor.name"),
+        "BlobTensor.name"
+    );
+    assert_eq!(
+        offset_of!(BlobTensor, bytes),
+        get("BlobTensor.bytes"),
+        "BlobTensor.bytes"
+    );
+    assert_eq!(
+        offset_of!(BlobTensor, init_off),
+        get("BlobTensor.init_off"),
+        "BlobTensor.init_off"
+    );
     assert_eq!(NAME_LEN, get("NAME_LEN"), "PLOW_NAME_LEN");
-    assert_eq!(size_of::<BlobHeader>(), get("BlobHeader.size"), "PlowBlobHeader size");
-    assert_eq!(offset_of!(BlobHeader, n_cu), get("BlobHeader.n_cu"), "BlobHeader.n_cu");
-    assert_eq!(offset_of!(BlobHeader, n_tensor), get("BlobHeader.n_tensor"), "BlobHeader.n_tensor");
-    assert_eq!(offset_of!(BlobHeader, n_prog), get("BlobHeader.n_prog"), "BlobHeader.n_prog");
-    assert_eq!(offset_of!(BlobHeader, n_kvrow), get("BlobHeader.n_kvrow"), "BlobHeader.n_kvrow");
-    assert_eq!(offset_of!(BlobHeader, init_bytes), get("BlobHeader.init_bytes"), "BlobHeader.init_bytes");
-    assert_eq!(size_of::<BlobProgHeader>(), get("ProgHeader.size"), "PlowProgHeader size");
-    assert_eq!(offset_of!(BlobProgHeader, n_counter), get("ProgHeader.n_counter"), "ProgHeader.n_counter");
-    assert_eq!(offset_of!(BlobProgHeader, t), get("ProgHeader.t"), "ProgHeader.t");
+    assert_eq!(
+        size_of::<BlobHeader>(),
+        get("BlobHeader.size"),
+        "PlowBlobHeader size"
+    );
+    assert_eq!(
+        offset_of!(BlobHeader, n_cu),
+        get("BlobHeader.n_cu"),
+        "BlobHeader.n_cu"
+    );
+    assert_eq!(
+        offset_of!(BlobHeader, n_tensor),
+        get("BlobHeader.n_tensor"),
+        "BlobHeader.n_tensor"
+    );
+    assert_eq!(
+        offset_of!(BlobHeader, n_prog),
+        get("BlobHeader.n_prog"),
+        "BlobHeader.n_prog"
+    );
+    assert_eq!(
+        offset_of!(BlobHeader, n_kvrow),
+        get("BlobHeader.n_kvrow"),
+        "BlobHeader.n_kvrow"
+    );
+    assert_eq!(
+        offset_of!(BlobHeader, init_bytes),
+        get("BlobHeader.init_bytes"),
+        "BlobHeader.init_bytes"
+    );
+    assert_eq!(
+        size_of::<BlobProgHeader>(),
+        get("ProgHeader.size"),
+        "PlowProgHeader size"
+    );
+    assert_eq!(
+        offset_of!(BlobProgHeader, n_counter),
+        get("ProgHeader.n_counter"),
+        "ProgHeader.n_counter"
+    );
+    assert_eq!(
+        offset_of!(BlobProgHeader, t),
+        get("ProgHeader.t"),
+        "ProgHeader.t"
+    );
     // the magic must agree too, or the runtime silently accepts an old blob
-    assert_eq!(BLOB_MAGIC, b"PLOWDEV\x07", "blob magic (64-byte DevInst64 format)");
+    assert_eq!(
+        BLOB_MAGIC, b"PLOWDEV\x07",
+        "blob magic (64-byte DevInst64 format)"
+    );
     assert_eq!(INIT_NONE, u64::MAX);
-    assert_eq!(size_of::<DevInst64>(), get("DevInst.size"), "PlowDevInst size");
+    assert_eq!(
+        size_of::<DevInst64>(),
+        get("DevInst.size"),
+        "PlowDevInst size"
+    );
 
     // Sizes matching is not enough — a swapped pair of same-width fields keeps the
     // size and silently reinterprets the operands. Check every offset.
@@ -182,7 +289,11 @@ fn rust_and_c_agree_on_the_device_isa() {
     assert_eq!(offset_of!(DevInst64, t), get("DevInst.t"));
     assert_eq!(offset_of!(DevInst64, i), get("DevInst.i"));
     assert_eq!(offset_of!(DevInst64, fj), get("DevInst.fj"));
-    assert_eq!(TENSOR_NONE16 as usize, get("TENSOR_NONE"), "PLOW_TENSOR_NONE (u16 wire sentinel)");
+    assert_eq!(
+        TENSOR_NONE16 as usize,
+        get("TENSOR_NONE"),
+        "PLOW_TENSOR_NONE (u16 wire sentinel)"
+    );
     // StreamEnt gates are the only wire gates — a drifted offset deadlocks silently.
     assert_eq!(offset_of!(StreamEnt, wait_ofs), get("StreamEnt.wait_ofs"));
     assert_eq!(offset_of!(StreamEnt, succ_ofs), get("StreamEnt.succ_ofs"));
@@ -190,16 +301,40 @@ fn rust_and_c_agree_on_the_device_isa() {
     assert_eq!(offset_of!(StreamEnt, succ_len), get("StreamEnt.succ_len"));
 
     // v6 section directory entry
-    assert_eq!(size_of::<BlobSectionEntry>(), get("SectionEntry.size"), "PlowSectionEntry size");
-    assert_eq!(offset_of!(BlobSectionEntry, kind), get("SectionEntry.kind"), "SectionEntry.kind");
-    assert_eq!(offset_of!(BlobSectionEntry, offset), get("SectionEntry.offset"), "SectionEntry.offset");
-    assert_eq!(offset_of!(BlobSectionEntry, size), get("SectionEntry.size_f"), "SectionEntry.size");
-    assert_eq!(offset_of!(BlobSectionEntry, name), get("SectionEntry.name"), "SectionEntry.name");
+    assert_eq!(
+        size_of::<BlobSectionEntry>(),
+        get("SectionEntry.size"),
+        "PlowSectionEntry size"
+    );
+    assert_eq!(
+        offset_of!(BlobSectionEntry, kind),
+        get("SectionEntry.kind"),
+        "SectionEntry.kind"
+    );
+    assert_eq!(
+        offset_of!(BlobSectionEntry, offset),
+        get("SectionEntry.offset"),
+        "SectionEntry.offset"
+    );
+    assert_eq!(
+        offset_of!(BlobSectionEntry, size),
+        get("SectionEntry.size_f"),
+        "SectionEntry.size"
+    );
+    assert_eq!(
+        offset_of!(BlobSectionEntry, name),
+        get("SectionEntry.name"),
+        "SectionEntry.name"
+    );
     assert_eq!(SECT_NAME_LEN, get("SECT_NAME_LEN"), "PLOW_SECT_NAME_LEN");
 
     // v7 generated-tensor recipe. A drifted offset here means the runtime builds
     // a RoPE table from the wrong scalars — fluent, wrong output, no error.
-    assert_eq!(size_of::<GenTensor>(), get("GenTensor.size"), "PlowGenTensor size");
+    assert_eq!(
+        size_of::<GenTensor>(),
+        get("GenTensor.size"),
+        "PlowGenTensor size"
+    );
     assert_eq!(offset_of!(GenTensor, tensor), get("GenTensor.tensor"));
     assert_eq!(offset_of!(GenTensor, kind), get("GenTensor.kind"));
     assert_eq!(offset_of!(GenTensor, ctx), get("GenTensor.ctx"));
@@ -210,5 +345,8 @@ fn rust_and_c_agree_on_the_device_isa() {
     assert_eq!(offset_of!(GenTensor, frac), get("GenTensor.frac"));
     assert_eq!(offset_of!(GenTensor, factor), get("GenTensor.factor"));
     assert_eq!(offset_of!(GenTensor, orig), get("GenTensor.orig"));
-    assert_eq!(BLOB_MAGIC_V7, b"PLOWDEV\x09", "v7 blob magic (generated tensors)");
+    assert_eq!(
+        BLOB_MAGIC_V7, b"PLOWDEV\x09",
+        "v7 blob magic (generated tensors)"
+    );
 }

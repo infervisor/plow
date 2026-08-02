@@ -26,6 +26,9 @@ fn main() {
             gfx950_prefill_tile(m, n, k, 256, Bf16),
             gfx950_prefill_tile(m, n, k, 256, Mxfp4),
         );
-        assert!(rx > 0, "{label}: NO qualified mxfp4 record — the store is stale for this build");
+        assert!(
+            rx > 0,
+            "{label}: NO qualified mxfp4 record — the store is stale for this build"
+        );
     }
 }

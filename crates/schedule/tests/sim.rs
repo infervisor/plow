@@ -1,7 +1,7 @@
 //! The cycle simulator replays a schedule to a real makespan, stays consistent
 //! with the analytic estimate, and surfaces clustering overhead + utilization.
 
-use costmodel::{hwspec, DEFAULT_PAGE_BYTES, GemmShape, RowShape, Soc, SramPolicy};
+use costmodel::{hwspec, GemmShape, RowShape, Soc, SramPolicy, DEFAULT_PAGE_BYTES};
 use rewrite::{assemble, collapse, LayerPlan, OpKind, OpSpec};
 use schedule::{schedule, Config};
 

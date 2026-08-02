@@ -11,9 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use lean_verify::checkpoints::schedule::{
-    AddrEntry, ProtocolView, ScheduleRequest, TaskGraphView,
-};
+use lean_verify::checkpoints::schedule::{AddrEntry, ProtocolView, ScheduleRequest, TaskGraphView};
 use lean_verify::checkpoints::{check_address_map, check_schedule};
 
 /// A 4-task graph on 2 resources, with counter 0 gating task 0 → task 2 and
@@ -24,7 +22,10 @@ fn safe_request() -> ScheduleRequest {
     threshold.insert("0".to_string(), 1);
     threshold.insert("1".to_string(), 1);
     ScheduleRequest {
-        task_graph: TaskGraphView { n: 4, edges: vec![(0, 2), (1, 2)] },
+        task_graph: TaskGraphView {
+            n: 4,
+            edges: vec![(0, 2), (1, 2)],
+        },
         protocol: ProtocolView {
             waits: vec![vec![], vec![], vec![0, 1], vec![]],
             succs: vec![vec![0], vec![1], vec![], vec![]],
@@ -133,8 +134,16 @@ fn all_checkpoints_are_wired() {
     assert!(a.ok && a.checkpoint == "A");
     let b = check_tile_partition(&TilePartitionRequest { candidates: vec![] }).unwrap();
     assert!(b.ok && b.checkpoint == "B");
-    let c = check_sram_fit(&SramFitRequest { budget: 4, handoffs: vec![] }).unwrap();
+    let c = check_sram_fit(&SramFitRequest {
+        budget: 4,
+        handoffs: vec![],
+    })
+    .unwrap();
     assert!(c.ok && c.checkpoint == "C");
-    let e = check_wire_roundtrip(&WireRequest { raw: vec![], frames: vec![] }).unwrap();
+    let e = check_wire_roundtrip(&WireRequest {
+        raw: vec![],
+        frames: vec![],
+    })
+    .unwrap();
     assert!(e.ok && e.checkpoint == "E");
 }

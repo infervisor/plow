@@ -225,13 +225,7 @@ pub trait PeerMemory: Send + Sync {
     /// small-message floor is the submit+completion round-trip (13.95 µs
     /// measured at 8 KB), not the wire. The decode collective must be the
     /// in-kernel peer store gated by a system-scope atomic instead.
-    fn copy_peer_blocking(
-        &self,
-        dst_ordinal: u8,
-        dst: u64,
-        src: u64,
-        bytes: u64,
-    ) -> Result<()>;
+    fn copy_peer_blocking(&self, dst_ordinal: u8, dst: u64, src: u64, bytes: u64) -> Result<()>;
 }
 
 /// Frees one device allocation. Implemented by GPU backends; every **owned**
@@ -428,7 +422,11 @@ mod tests {
         assert_eq!(f.count.load(Ordering::SeqCst), 0, "views must not free");
 
         drop(owner);
-        assert_eq!(f.count.load(Ordering::SeqCst), 1, "owner frees exactly once");
+        assert_eq!(
+            f.count.load(Ordering::SeqCst),
+            1,
+            "owner frees exactly once"
+        );
         assert_eq!(f.last_base.load(Ordering::SeqCst), 0x1000);
     }
 }

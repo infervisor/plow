@@ -43,12 +43,11 @@ impl SafetensorsWeights {
             source,
         })?;
         // SAFETY: read-only checkpoint held for the process lifetime.
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|source| {
-            crate::RuntimeError::Io {
+        let mmap =
+            unsafe { memmap2::Mmap::map(&file) }.map_err(|source| crate::RuntimeError::Io {
                 path: path.to_path_buf(),
                 source,
-            }
-        })?;
+            })?;
         Ok(SafetensorsWeights { mmap })
     }
 }

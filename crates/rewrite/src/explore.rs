@@ -486,16 +486,32 @@ mod tests {
         for m in [2048, 8192, 16384] {
             mk(
                 "12B",
-                GemmShape { m, n: 15360, k: 3840 },
-                GemmShape { m, n: 3840, k: 15360 },
+                GemmShape {
+                    m,
+                    n: 15360,
+                    k: 3840,
+                },
+                GemmShape {
+                    m,
+                    n: 3840,
+                    k: 15360,
+                },
                 m,
             );
         }
         for m in [2048, 8192, 16384] {
             mk(
                 "31B",
-                GemmShape { m, n: 21504, k: 5376 },
-                GemmShape { m, n: 5376, k: 21504 },
+                GemmShape {
+                    m,
+                    n: 21504,
+                    k: 5376,
+                },
+                GemmShape {
+                    m,
+                    n: 5376,
+                    k: 21504,
+                },
                 m,
             );
         }

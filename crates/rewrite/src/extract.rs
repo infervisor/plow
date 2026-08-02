@@ -230,7 +230,10 @@ fn term_to_graph(td: &egglog::TermDag, root: egglog::TermId) -> Result<FusedGrap
                 let args: Vec<Arg> = children.iter().map(|c| memo[c].clone()).collect();
                 let key = node_key(op, &args);
                 let i = *intern.entry(key).or_insert_with(|| {
-                    g.nodes.push(FNode { op: op.clone(), args });
+                    g.nodes.push(FNode {
+                        op: op.clone(),
+                        args,
+                    });
                     g.nodes.len() - 1
                 });
                 memo.insert(id, Arg::Node(i));
@@ -242,7 +245,9 @@ fn term_to_graph(td: &egglog::TermDag, root: egglog::TermId) -> Result<FusedGrap
             g.root = i;
             Ok(g)
         }
-        ref other => Err(ExtractError::Parse(format!("root is not a node: {other:?}"))),
+        ref other => Err(ExtractError::Parse(format!(
+            "root is not a node: {other:?}"
+        ))),
     }
 }
 

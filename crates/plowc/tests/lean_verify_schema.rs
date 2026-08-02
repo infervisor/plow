@@ -12,10 +12,7 @@ use serde_json::json;
 /// offending field name.
 fn assert_parse_reject(payload: serde_json::Value, expect_substr: &str) {
     let cert = call("D", payload).expect("verifier call");
-    assert!(
-        !cert.ok,
-        "expected rejection but got ok cert: {cert:?}"
-    );
+    assert!(!cert.ok, "expected rejection but got ok cert: {cert:?}");
     let reason = cert.reason.expect("rejection carries a reason");
     assert!(
         reason.contains("parse error") && reason.contains(expect_substr),

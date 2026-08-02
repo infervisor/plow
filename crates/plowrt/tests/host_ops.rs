@@ -48,8 +48,18 @@ fn sample_program() -> Program {
             },
         ],
         counters: vec![
-            Counter { id: 0, threshold: 1, scope: 1, _pad: [0; 3] },
-            Counter { id: 1, threshold: 1, scope: 2, _pad: [0; 3] },
+            Counter {
+                id: 0,
+                threshold: 1,
+                scope: 1,
+                _pad: [0; 3],
+            },
+            Counter {
+                id: 1,
+                threshold: 1,
+                scope: 2,
+                _pad: [0; 3],
+            },
         ],
         bucket_id: 0,
         plan_gen: 0,
@@ -70,7 +80,10 @@ fn gated_sample_produces_argmax_token() {
 
     let stats = run_streams(&prog, &pool, &mut host);
 
-    assert!(stats.completed, "the whole schedule (incl. host packet) completes");
+    assert!(
+        stats.completed,
+        "the whole schedule (incl. host packet) completes"
+    );
     assert_eq!(host.ran, 1, "the SAMPLE host op ran exactly once");
     assert_eq!(host.tokens, vec![5], "greedy argmax token");
     // The sample packet bumped its successor, unblocking the consumer.
@@ -106,7 +119,12 @@ fn tokenize_packet_encodes_input_text() {
                 succ: vec![],
             },
         ],
-        counters: vec![Counter { id: 0, threshold: 1, scope: 2, _pad: [0; 3] }],
+        counters: vec![Counter {
+            id: 0,
+            threshold: 1,
+            scope: 2,
+            _pad: [0; 3],
+        }],
         bucket_id: 0,
         plan_gen: 0,
         flags: 0,
@@ -132,6 +150,9 @@ fn sample_waits_for_its_producer() {
     host.set_logits(vec![1.0, 2.0, 3.0]);
 
     let stats = run_streams(&prog, &pool, &mut host);
-    assert!(!stats.completed, "gated SAMPLE cannot fire without its producer");
+    assert!(
+        !stats.completed,
+        "gated SAMPLE cannot fire without its producer"
+    );
     assert_eq!(host.ran, 0, "SAMPLE did not run");
 }

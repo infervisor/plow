@@ -32,7 +32,8 @@ fn opts(out: std::path::PathBuf) -> Options {
         lean_oracle: false,
         emit_sample: false,
         emit_tokenize: false,
-        emit_trace: false,        kv: Default::default(),
+        emit_trace: false,
+        kv: Default::default(),
         weight_dtype_override: None,
     }
 }
@@ -83,15 +84,24 @@ fn rejects_degenerate_dimensions() {
     // Zero batch in a bucket — clean error, no panic.
     let mut o = opts(dir.clone());
     o.batches = vec![0];
-    assert!(compile(&Source::Net(net()), &o).is_err(), "batch=0 must be rejected");
+    assert!(
+        compile(&Source::Net(net()), &o).is_err(),
+        "batch=0 must be rejected"
+    );
 
     // hidden = 0 in the network config.
     let mut bad = net();
     bad.hidden = 0;
-    assert!(compile(&Source::Net(bad), &opts(dir.clone())).is_err(), "hidden=0 must be rejected");
+    assert!(
+        compile(&Source::Net(bad), &opts(dir.clone())).is_err(),
+        "hidden=0 must be rejected"
+    );
 
     // A GEMM with n = 0.
     let bad: NetConfig =
         serde_json::from_str(r#"{"name":"z","hidden":16,"ops":[{"op":"gemm","n":0}]}"#).unwrap();
-    assert!(compile(&Source::Net(bad), &opts(dir)).is_err(), "gemm n=0 must be rejected");
+    assert!(
+        compile(&Source::Net(bad), &opts(dir)).is_err(),
+        "gemm n=0 must be rejected"
+    );
 }

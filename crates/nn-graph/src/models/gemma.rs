@@ -151,13 +151,7 @@ fn attention(
 }
 
 /// GeGLU MLP: `down(act(gate(x)) * up(x))`.
-fn geglu_mlp(
-    nn: &mut Nn,
-    cfg: &GemmaConfig,
-    prefix: &str,
-    x: TensorId,
-    h: i64,
-) -> TensorId {
+fn geglu_mlp(nn: &mut Nn, cfg: &GemmaConfig, prefix: &str, x: TensorId, h: i64) -> TensorId {
     let inter = cfg.intermediate_size;
     let gate = nn.linear(&format!("{prefix}.mlp.gate_proj"), x, h, inter, false);
     let up = nn.linear(&format!("{prefix}.mlp.up_proj"), x, h, inter, false);

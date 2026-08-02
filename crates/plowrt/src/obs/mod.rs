@@ -159,7 +159,10 @@ mod tests {
             .filter(|l| !l.starts_with('#'))
             .filter_map(|l| l.split_whitespace().next())
             .collect();
-        assert!(exported.len() >= 10, "expected the full series set, got {exported:?}");
+        assert!(
+            exported.len() >= 10,
+            "expected the full series set, got {exported:?}"
+        );
 
         // Field name for each series: strip the prefix and the Prometheus
         // `_total` suffix, which the field does not carry.
@@ -172,8 +175,7 @@ mod tests {
                     let p = e.expect("entry").path();
                     if p.is_dir() {
                         stack.push(p);
-                    } else if p.extension().is_some_and(|x| x == "rs")
-                        && !p.ends_with("obs/mod.rs")
+                    } else if p.extension().is_some_and(|x| x == "rs") && !p.ends_with("obs/mod.rs")
                     {
                         acc.push_str(&std::fs::read_to_string(&p).unwrap_or_default());
                     }

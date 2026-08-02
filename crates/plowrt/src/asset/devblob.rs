@@ -11,11 +11,11 @@
 use std::path::{Path, PathBuf};
 
 use packet::dev::{DevInst64, DevOp, StreamEnt, Wait};
-use packet::rope::GenTensor;
 use packet::devbuild::{
     is_blob_magic, BlobHeader, BlobProgHeader, BlobSectionEntry, BlobTensor, BLOB_MAGIC_V7,
     INIT_NONE, NAME_LEN, SECT_GEN_TENSORS, SECT_MAGIC, SECT_NAME_LEN,
 };
+use packet::rope::GenTensor;
 
 use crate::{Result, RuntimeError};
 
@@ -149,9 +149,7 @@ fn take<T: Copy>(buf: &[u8], off: &mut usize, n: usize, what: &str) -> Result<Ve
     let mut v = Vec::with_capacity(n);
     for i in 0..n {
         // SAFETY: bounds checked above; T is a #[repr(C)] POD mirror.
-        v.push(unsafe {
-            std::ptr::read_unaligned(buf[*off + i * sz..].as_ptr() as *const T)
-        });
+        v.push(unsafe { std::ptr::read_unaligned(buf[*off + i * sz..].as_ptr() as *const T) });
     }
     *off = end;
     Ok(v)
@@ -255,8 +253,7 @@ impl DevBlob {
 
         let mut progs = Vec::with_capacity(hdr.n_prog as usize);
         for p in 0..hdr.n_prog {
-            let ph: BlobProgHeader =
-                take::<BlobProgHeader>(buf, &mut off, 1, "prog header")?[0];
+            let ph: BlobProgHeader = take::<BlobProgHeader>(buf, &mut off, 1, "prog header")?[0];
             let what = |s: &str| format!("prog {p} {s}");
             progs.push(DevProg {
                 t: ph.t,
@@ -310,9 +307,7 @@ impl DevBlob {
                     "devblob: bad section directory magic".into(),
                 ));
             }
-            let n = u32::from_le_bytes(
-                buf[dir_off + 4..dir_off + 8].try_into().unwrap(),
-            ) as usize;
+            let n = u32::from_le_bytes(buf[dir_off + 4..dir_off + 8].try_into().unwrap()) as usize;
             let ent_start = dir_off + 8;
             let ent_size = std::mem::size_of::<BlobSectionEntry>();
             if ent_start + n * ent_size > buf.len() {
@@ -331,7 +326,11 @@ impl DevBlob {
                 let ent = unsafe {
                     std::ptr::read_unaligned(buf[base..].as_ptr() as *const BlobSectionEntry)
                 };
-                let name_len = ent.name.iter().position(|&b| b == 0).unwrap_or(SECT_NAME_LEN);
+                let name_len = ent
+                    .name
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(SECT_NAME_LEN);
                 let name = String::from_utf8_lossy(&ent.name[..name_len]).into_owned();
                 sects.push(DevSection {
                     kind: ent.kind,
@@ -356,9 +355,7 @@ impl DevBlob {
                 .find(|s| s.kind == SECT_GEN_TENSORS)
                 .and_then(|s| buf.get(s.offset..s.offset + s.size))
                 .ok_or_else(|| {
-                    RuntimeError::Device(
-                        "devblob: v7 blob has no SECT_GEN_TENSORS section".into(),
-                    )
+                    RuntimeError::Device("devblob: v7 blob has no SECT_GEN_TENSORS section".into())
                 })?;
             let sz = std::mem::size_of::<GenTensor>();
             if raw.len() % sz != 0 {
@@ -448,12 +445,7 @@ impl DevBlob {
     /// Get the raw bytes of a section by kind, sliced from the original buffer.
     /// Returns `None` if the section is not present.
     /// Get a section by kind and architecture-specific name.
-    pub fn section_data_named<'a>(
-        &self,
-        buf: &'a [u8],
-        kind: u32,
-        name: &str,
-    ) -> Option<&'a [u8]> {
+    pub fn section_data_named<'a>(&self, buf: &'a [u8], kind: u32, name: &str) -> Option<&'a [u8]> {
         self.sections
             .iter()
             .find(|s| s.kind == kind && s.name == name)
@@ -624,19 +616,17 @@ mod tests {
     /// A tiny two-program model exercised through the REAL writer
     /// (`Model::to_blob`) — reader and writer cannot drift apart unnoticed.
     fn tiny_model() -> Model {
-        let inst = |op: u16, wait_len: u16, succ_len: u16, wait_ofs: u32, succ_ofs: u32| {
-            DevInst {
-                op,
-                blocks: 1,
-                wait_len,
-                succ_len,
-                wait_ofs,
-                succ_ofs,
-                t: [0; 8],
-                i: [7; 8],
-                f: [0.5; 2],
-                j: [0; 2],
-            }
+        let inst = |op: u16, wait_len: u16, succ_len: u16, wait_ofs: u32, succ_ofs: u32| DevInst {
+            op,
+            blocks: 1,
+            wait_len,
+            succ_len,
+            wait_ofs,
+            succ_ofs,
+            t: [0; 8],
+            i: [7; 8],
+            f: [0.5; 2],
+            j: [0; 2],
         };
         let se = |inst: u32, slice: u32| StreamEnt {
             inst,
@@ -657,7 +647,10 @@ mod tests {
             stream: vec![se(0, 0), se(1, 0), se(0, 1), se(1, 1)],
             stream_ofs: vec![0, 2],
             stream_len: vec![2, 2],
-            waits: vec![Wait { id: 0, threshold: 1 }],
+            waits: vec![Wait {
+                id: 0,
+                threshold: 1,
+            }],
             succs: vec![0],
             tensors: Vec::new(),
             gq_stream: vec![se(0, 0), se(0, 1), se(1, 0), se(1, 1)],
@@ -758,7 +751,10 @@ mod tests {
         with_xreduce(&mut pf, 0, false, 2, 1024 * h, slot_b);
         let only = DevBlob::parse(&pf.to_blob()).unwrap().tp.expect("sharded");
         assert_eq!((only.n_gpu, only.slot_bytes), (2, slot_b as u64));
-        assert_eq!(only.hidden, 0, "unrecoverable from two-shot alone, not guessed");
+        assert_eq!(
+            only.hidden, 0,
+            "unrecoverable from two-shot alone, not guessed"
+        );
     }
 
     /// A v7 blob must be DISCOVERED, parsed, and its recipes materialised.
@@ -791,7 +787,11 @@ mod tests {
             GenTensor { tensor: 3, ..sin },
         ];
         let image = m.to_blob();
-        assert_eq!(&image[..8], BLOB_MAGIC_V7, "a model with recipes must be v7");
+        assert_eq!(
+            &image[..8],
+            BLOB_MAGIC_V7,
+            "a model with recipes must be v7"
+        );
 
         // Discovery: written into an assets dir, `find_in_dir` must see it.
         let dir = std::env::temp_dir().join(format!("plow_v7_find_{}", std::process::id()));
@@ -810,10 +810,21 @@ mod tests {
         assert!(b.tensors[2].init.is_none() && b.tensors[3].init.is_none());
         // And they expand to exactly what the compiler would have baked.
         let (want_cos, want_sin) = rope_tables(ctx, hd, 10000.0, 1.0, RopeScale::None);
-        let by = |i: u32| b.gen.iter().find(|g| g.tensor == i).unwrap().generate().unwrap();
+        let by = |i: u32| {
+            b.gen
+                .iter()
+                .find(|g| g.tensor == i)
+                .unwrap()
+                .generate()
+                .unwrap()
+        };
         assert_eq!(by(2), want_cos);
         assert_eq!(by(3), want_sin);
-        assert_eq!(by(2).len() as u64, b.tensors[2].bytes, "decl size matches recipe");
+        assert_eq!(
+            by(2).len() as u64,
+            b.tensors[2].bytes,
+            "decl size matches recipe"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -837,7 +848,11 @@ mod tests {
         let dir_off = u64::from_le_bytes(image[40..48].try_into().unwrap()) as usize;
         let ent = dir_off + 8; // first section entry: SECT_GEN_TENSORS
         let off = u64::from_le_bytes(image[ent + 8..ent + 16].try_into().unwrap()) as usize;
-        assert_eq!(&image[off..off + 4], &2u32.to_le_bytes(), "recipe 0 targets tensor 2");
+        assert_eq!(
+            &image[off..off + 4],
+            &2u32.to_le_bytes(),
+            "recipe 0 targets tensor 2"
+        );
         image[off..off + 4].copy_from_slice(&99u32.to_le_bytes());
 
         let err = match DevBlob::parse(&image) {
@@ -856,7 +871,10 @@ mod tests {
         assert_eq!(b.tensors[0].name, "in.ids");
         assert!(b.tensors[0].init.is_none());
         assert_eq!(b.tensors[1].name, "rope.cos");
-        assert_eq!(&b.init[b.tensors[1].init.clone().unwrap()], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            &b.init[b.tensors[1].init.clone().unwrap()],
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
         assert_eq!(b.kvrow, vec![1]);
         assert_eq!(b.progs.len(), 2);
         assert_eq!(b.progs[0].t, 128);

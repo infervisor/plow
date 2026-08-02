@@ -188,7 +188,11 @@ pub struct KvOom {
 
 impl std::fmt::Display for KvOom {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "kv oom: needed {} seq-slot, have {}", self.needed, self.available)
+        write!(
+            f,
+            "kv oom: needed {} seq-slot, have {}",
+            self.needed, self.available
+        )
     }
 }
 impl std::error::Error for KvOom {}
@@ -230,10 +234,18 @@ impl KvArena {
     /// single-sequence grid from `block_bytes × initial_blocks` so a pool spans
     /// exactly the same reserved region the packed-block model did.
     pub fn new(paging: KvPaging, bases: &[u64]) -> Self {
-        let kv_factor = if paging.kv_factor > 0 { paging.kv_factor as u32 } else { 2 };
+        let kv_factor = if paging.kv_factor > 0 {
+            paging.kv_factor as u32
+        } else {
+            2
+        };
         let kv_heads = paging.kv_heads.max(0) as u32;
         let kh = kv_heads.max(1); // divisor guard for the legacy derivation
-        let max_seqs = if paging.max_seqs > 0 { paging.max_seqs as u32 } else { 1 };
+        let max_seqs = if paging.max_seqs > 0 {
+            paging.max_seqs as u32
+        } else {
+            1
+        };
         let pools = paging
             .per_layer
             .iter()
@@ -243,12 +255,23 @@ impl KvArena {
                 let head_slot_bytes = if paging.head_slot_bytes > 0 {
                     paging.head_slot_bytes
                 } else {
-                    let reserved =
-                        paging.block_bytes.saturating_mul(lp.initial_blocks.max(0) as u64);
+                    let reserved = paging
+                        .block_bytes
+                        .saturating_mul(lp.initial_blocks.max(0) as u64);
                     let cells = kv_factor as u64 * kh as u64 * max_seqs as u64;
-                    if cells == 0 { 0 } else { reserved / cells }
+                    if cells == 0 {
+                        0
+                    } else {
+                        reserved / cells
+                    }
                 };
-                GrowablePool { base, kv_factor, kv_heads, max_seqs, head_slot_bytes }
+                GrowablePool {
+                    base,
+                    kv_factor,
+                    kv_heads,
+                    max_seqs,
+                    head_slot_bytes,
+                }
             })
             .collect();
         KvArena {
@@ -271,7 +294,10 @@ impl KvArena {
     /// seq-slot is in use — the mux sheds the request.
     pub fn allocate_slot(&mut self, _seq_upper: i64) -> Result<SlotHandle, KvOom> {
         let Some(seq) = self.free_seqs.pop() else {
-            return Err(KvOom { needed: 1, available: 0 });
+            return Err(KvOom {
+                needed: 1,
+                available: 0,
+            });
         };
         let handle = SlotHandle(self.next_handle);
         self.next_handle += 1;

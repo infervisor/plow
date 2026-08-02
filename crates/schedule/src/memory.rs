@@ -140,7 +140,9 @@ impl AddressMap {
     /// The copy of `name` resident on `device` (for replicated tensors, the local
     /// replica a consumer on that device reads).
     pub fn get_on_device(&self, name: &str, device: u8) -> Option<&AddrEntry> {
-        self.entries.iter().find(|e| e.name == name && e.device == device)
+        self.entries
+            .iter()
+            .find(|e| e.name == name && e.device == device)
     }
 
     /// Every physical copy of `name` (one per device for a replicated tensor).
@@ -225,8 +227,7 @@ fn plan_scratch(reqs: &[BufReq], base: u64) -> (HashMap<usize, u64>, u64) {
         let (s, e) = reqs[i].live.unwrap_or((0, u64::MAX));
         let size = align_up(reqs[i].size, MEM_ALIGN);
         // Buffers whose interval overlaps [s, e) still occupy storage.
-        let mut active: Vec<&Placed> =
-            placed.iter().filter(|p| p.start < e && s < p.end).collect();
+        let mut active: Vec<&Placed> = placed.iter().filter(|p| p.start < e && s < p.end).collect();
         active.sort_by_key(|p| p.off);
         // Lowest offset (≥ base) with no overlap: walk active in offset order.
         let mut off = base;
@@ -240,7 +241,12 @@ fn plan_scratch(reqs: &[BufReq], base: u64) -> (HashMap<usize, u64>, u64) {
             off = align_up(p.off + p.size, MEM_ALIGN); // push above p
         }
         offsets.insert(i, off);
-        placed.push(Placed { off, size, start: s, end: e });
+        placed.push(Placed {
+            off,
+            size,
+            start: s,
+            end: e,
+        });
         peak = peak.max(off + size);
     }
     (offsets, peak)
@@ -294,10 +300,7 @@ fn place(reqs: &[BufReq]) -> (HashMap<usize, u64>, u64, u64) {
     (offsets, cursor, growable_base)
 }
 
-fn union_live(
-    a: Option<(Cycle, Cycle)>,
-    b: Option<(Cycle, Cycle)>,
-) -> Option<(Cycle, Cycle)> {
+fn union_live(a: Option<(Cycle, Cycle)>, b: Option<(Cycle, Cycle)>) -> Option<(Cycle, Cycle)> {
     match (a, b) {
         (Some((s1, e1)), Some((s2, e2))) => Some((s1.min(s2), e1.max(e2))),
         (x, None) | (None, x) => x,
@@ -319,7 +322,11 @@ pub fn allocate(reqs: &[BufReq]) -> AddressMap {
             } else {
                 r.replicas
                     .iter()
-                    .map(|&d| BufReq { device: d, replicas: Vec::new(), ..r.clone() })
+                    .map(|&d| BufReq {
+                        device: d,
+                        replicas: Vec::new(),
+                        ..r.clone()
+                    })
                     .collect()
             }
         })
@@ -340,7 +347,11 @@ pub fn allocate(reqs: &[BufReq]) -> AddressMap {
         let mut off = 0u64;
         for _ in 0..reqs.len() {
             let dev = reqs[cur].device;
-            match reqs[cur].alias_of.as_deref().and_then(|t| idx.get(&(t, dev))) {
+            match reqs[cur]
+                .alias_of
+                .as_deref()
+                .and_then(|t| idx.get(&(t, dev)))
+            {
                 Some(&n) if n != cur => {
                     off += reqs[cur].alias_off;
                     cur = n;
@@ -383,14 +394,21 @@ pub fn allocate(reqs: &[BufReq]) -> AddressMap {
     let mut global_base = 0u64;
     let mut growable_base = 0u64;
     for (k, &d) in devices.iter().enumerate() {
-        let sub_idx: Vec<usize> = (0..merged.len()).filter(|&i| merged[i].device == d).collect();
+        let sub_idx: Vec<usize> = (0..merged.len())
+            .filter(|&i| merged[i].device == d)
+            .collect();
         let sub: Vec<BufReq> = sub_idx.iter().map(|&i| merged[i].clone()).collect();
         let (local_off, size, gbase_local) = place(&sub);
         for (li, &mi) in sub_idx.iter().enumerate() {
             moff.insert(mi, global_base + local_off[&li]);
         }
         let seg_growable = global_base + gbase_local;
-        segments.push(Segment { device: d, global_base, size, growable_base: seg_growable });
+        segments.push(Segment {
+            device: d,
+            global_base,
+            size,
+            growable_base: seg_growable,
+        });
         if k == 0 {
             growable_base = seg_growable;
         }
@@ -424,7 +442,12 @@ pub fn allocate(reqs: &[BufReq]) -> AddressMap {
         })
         .collect();
 
-    AddressMap { entries, arena_bytes, growable_base, segments }
+    AddressMap {
+        entries,
+        arena_bytes,
+        growable_base,
+        segments,
+    }
 }
 
 /// Derive buffer requests from a scheduled task graph and place them.
@@ -450,8 +473,7 @@ pub fn plan_from_schedule(
 /// §6.2.5). Keyed by tensor name (matches `AddrEntry.name`). Callers who need
 /// to feed the Lean verifier build a `ScheduleRequest` from these plus the
 /// `AddressMap`.
-pub type TensorTaskSets =
-    HashMap<String, (Vec<crate::expand::TaskId>, Vec<crate::expand::TaskId>)>;
+pub type TensorTaskSets = HashMap<String, (Vec<crate::expand::TaskId>, Vec<crate::expand::TaskId>)>;
 
 /// Like `plan_from_schedule` but also returns the writer/reader task-id set
 /// for each tensor. Used by the Lean-verifier bridge; regular callers should
@@ -557,7 +579,11 @@ pub fn plan_from_schedule_with_task_sets(
         .map(|name| {
             let a = &acc[*name];
             let mut req = if a.has_writer {
-                let s = if a.first_write == Cycle::MAX { 0 } else { a.first_write };
+                let s = if a.first_write == Cycle::MAX {
+                    0
+                } else {
+                    a.first_write
+                };
                 let e = a.last_read.max(s + 1);
                 BufReq::new((*name).clone(), a.size, BufClass::Scratch).with_live(s, e)
             } else {
@@ -606,7 +632,11 @@ mod tests {
         assert_eq!(off(&m, "w0"), 0, "weights pack first");
         assert!(off(&m, "io") >= 1000);
         assert!(off(&m, "s0") > off(&m, "io"));
-        assert_eq!(off(&m, "kv"), m.growable_base, "growable starts the growable region");
+        assert_eq!(
+            off(&m, "kv"),
+            m.growable_base,
+            "growable starts the growable region"
+        );
         // growable reserves size + growth and is the top of the arena
         assert_eq!(m.get("kv").unwrap().reserved, 2048 + 8192);
         assert_eq!(m.arena_bytes, off(&m, "kv") + 2048 + 8192);
@@ -625,8 +655,16 @@ mod tests {
             BufReq::new("c", 4096, BufClass::Scratch).with_live(0, 20),
         ];
         let m = allocate(&reqs);
-        assert_eq!(off(&m, "a"), off(&m, "b"), "disjoint-in-time scratch reuses bytes");
-        assert_ne!(off(&m, "a"), off(&m, "c"), "time-overlapping scratch is distinct");
+        assert_eq!(
+            off(&m, "a"),
+            off(&m, "b"),
+            "disjoint-in-time scratch reuses bytes"
+        );
+        assert_ne!(
+            off(&m, "a"),
+            off(&m, "c"),
+            "time-overlapping scratch is distinct"
+        );
         assert_ne!(off(&m, "b"), off(&m, "c"));
         // peak arena holds only two 4 KiB buffers, not three.
         assert_eq!(m.arena_bytes, off(&m, "a") + 2 * 4096);
@@ -644,12 +682,25 @@ mod tests {
         for (i, x) in m.entries.iter().enumerate() {
             for y in &m.entries[i + 1..] {
                 let (lx, ly) = (
-                    reqs.iter().find(|r| r.name == x.name).unwrap().live.unwrap(),
-                    reqs.iter().find(|r| r.name == y.name).unwrap().live.unwrap(),
+                    reqs.iter()
+                        .find(|r| r.name == x.name)
+                        .unwrap()
+                        .live
+                        .unwrap(),
+                    reqs.iter()
+                        .find(|r| r.name == y.name)
+                        .unwrap()
+                        .live
+                        .unwrap(),
                 );
                 let time_overlap = lx.0 < ly.1 && ly.0 < lx.1;
                 if time_overlap {
-                    assert!(!overlaps(x, y), "{} and {} overlap in both time and bytes", x.name, y.name);
+                    assert!(
+                        !overlaps(x, y),
+                        "{} and {} overlap in both time and bytes",
+                        x.name,
+                        y.name
+                    );
                 }
             }
         }
@@ -682,11 +733,17 @@ mod tests {
         // `view` is a reshape of `src`: it shares src's offset and adds no bytes.
         let reqs = vec![
             BufReq::new("src", 4096, BufClass::Scratch).with_live(0, 10),
-            BufReq::new("view", 4096, BufClass::Scratch).with_live(10, 20).alias("src"),
+            BufReq::new("view", 4096, BufClass::Scratch)
+                .with_live(10, 20)
+                .alias("src"),
             BufReq::new("other", 4096, BufClass::Scratch).with_live(0, 25),
         ];
         let m = allocate(&reqs);
-        assert_eq!(off(&m, "view"), off(&m, "src"), "alias shares the target's offset");
+        assert_eq!(
+            off(&m, "view"),
+            off(&m, "src"),
+            "alias shares the target's offset"
+        );
         // src and other overlap 'view's extended liveness → distinct; arena holds
         // only two 4 KiB buffers (src/view shared, + other), not three.
         assert_ne!(off(&m, "src"), off(&m, "other"));
@@ -699,8 +756,12 @@ mod tests {
         // Realized by offset-aliasing — zero bytes moved.
         let reqs = vec![
             BufReq::new("a", 256, BufClass::Scratch).with_live(0, 10),
-            BufReq::new("b", 256, BufClass::Scratch).with_live(0, 10).alias_at("a", 256),
-            BufReq::new("out", 512, BufClass::Scratch).with_live(5, 20).alias_at("a", 0),
+            BufReq::new("b", 256, BufClass::Scratch)
+                .with_live(0, 10)
+                .alias_at("a", 256),
+            BufReq::new("out", 512, BufClass::Scratch)
+                .with_live(5, 20)
+                .alias_at("a", 0),
         ];
         let m = allocate(&reqs);
         let base = off(&m, "a");
@@ -724,7 +785,11 @@ mod tests {
         let seg1 = m.segments.iter().find(|s| s.device == 1).unwrap();
         // device 0 holds two 256B buffers ⇒ device 1's segment starts at 512.
         assert_eq!(seg1.global_base, 512);
-        assert_eq!(m.get("d1a").unwrap().offset, 512, "d1a lives in device 1's segment");
+        assert_eq!(
+            m.get("d1a").unwrap().offset,
+            512,
+            "d1a lives in device 1's segment"
+        );
         assert_eq!(m.get("d1a").unwrap().device, 1);
         assert_eq!(m.get("d0a").unwrap().device, 0);
         assert_eq!(m.arena_bytes, 512 + 256);
@@ -759,7 +824,11 @@ mod tests {
         let m = allocate(&reqs);
         assert_eq!(m.segments.len(), 1);
         assert_eq!(m.segments[0].global_base, 0);
-        assert_eq!(m.get("x").unwrap().offset, 0, "global == local for one device");
+        assert_eq!(
+            m.get("x").unwrap().offset,
+            0,
+            "global == local for one device"
+        );
     }
 
     #[test]
@@ -773,7 +842,10 @@ mod tests {
         let m = allocate(&reqs);
         assert_eq!(off(&m, "a"), off(&m, "b"));
         assert_eq!(off(&m, "b"), off(&m, "c"));
-        assert_eq!(m.arena_bytes, 256, "one buffer's worth of bytes for the whole chain");
+        assert_eq!(
+            m.arena_bytes, 256,
+            "one buffer's worth of bytes for the whole chain"
+        );
     }
 
     #[test]
@@ -826,8 +898,16 @@ mod tests {
 
         let m = plan_from_schedule(&tasks, &sched, &cons);
         let base = off(&m, "a");
-        assert_eq!(off(&m, "out"), base, "concat output starts at the group base");
-        assert_eq!(off(&m, "b"), base + 256, "second part placed right after the first");
+        assert_eq!(
+            off(&m, "out"),
+            base,
+            "concat output starts at the group base"
+        );
+        assert_eq!(
+            off(&m, "b"),
+            base + 256,
+            "second part placed right after the first"
+        );
     }
 
     #[test]
@@ -871,7 +951,11 @@ mod tests {
             makespan: 10,
         };
         let m = plan_from_schedule(&tasks, &sched, &rewrite::ConstraintSet::default());
-        assert_eq!(m.get("w").unwrap().class, BufClass::Persistent, "weight leaf is persistent");
+        assert_eq!(
+            m.get("w").unwrap().class,
+            BufClass::Persistent,
+            "weight leaf is persistent"
+        );
         let act = m.get("act").unwrap();
         assert_eq!(act.class, BufClass::Scratch, "produced tensor is scratch");
         // weight packed first (offset 0), activation lands after it.

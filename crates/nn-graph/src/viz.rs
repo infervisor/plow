@@ -116,7 +116,11 @@ fn op_detail(op: &Op) -> serde_json::Value {
         Op::MatMul => json!({}),
         Op::RmsNorm { eps } => json!({ "eps": eps }),
         Op::LayerNorm { eps } => json!({ "eps": eps }),
-        Op::Rope { dim, theta, interleave } => json!({
+        Op::Rope {
+            dim,
+            theta,
+            interleave,
+        } => json!({
             "dim": dim, "theta": theta, "interleave": interleave,
         }),
         Op::Act(kind) => json!({ "activation": format!("{kind:?}") }),
@@ -155,10 +159,18 @@ fn op_detail(op: &Op) -> serde_json::Value {
         Op::Slice { axis, start, len } => json!({
             "axis": axis, "start": format!("{start}"), "len": format!("{len}"),
         }),
-        Op::Reduce { kind, axis, keepdim } => json!({
+        Op::Reduce {
+            kind,
+            axis,
+            keepdim,
+        } => json!({
             "kind": format!("{kind:?}"), "axis": axis, "keepdim": keepdim,
         }),
-        Op::MoeRouter { num_experts, top_k, group } => json!({
+        Op::MoeRouter {
+            num_experts,
+            top_k,
+            group,
+        } => json!({
             "num_experts": num_experts,
             "top_k": top_k,
             "group": group.map(|g| serde_json::json!({
@@ -167,7 +179,11 @@ fn op_detail(op: &Op) -> serde_json::Value {
             })),
         }),
         Op::Conv1dDepthwise { kernel } => json!({ "kernel": kernel }),
-        Op::LinearAttention { kind, num_heads, head_dim } => json!({
+        Op::LinearAttention {
+            kind,
+            num_heads,
+            head_dim,
+        } => json!({
             "kind": format!("{kind:?}"),
             "num_heads": num_heads,
             "head_dim": head_dim,

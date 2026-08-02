@@ -131,10 +131,17 @@ impl StepObserver for HostExecutor {
     }
 
     fn on_fire(&mut self, _packet_index: usize, inst: &Inst, _t_start: u64, _t_end: u64) {
-        if let Body::Token { kind, arg, vocab, .. } = inst.body {
+        if let Body::Token {
+            kind, arg, vocab, ..
+        } = inst.body
+        {
             // For SAMPLE_BATCH `arg` is the batch width; for scalar SAMPLE the
             // batch is implicit 1 (arg is ignored).
-            let batch = if kind == Opcode::TOKEN_SAMPLE_BATCH { arg } else { 1 };
+            let batch = if kind == Opcode::TOKEN_SAMPLE_BATCH {
+                arg
+            } else {
+                1
+            };
             self.run_token(kind, batch, vocab);
         }
     }

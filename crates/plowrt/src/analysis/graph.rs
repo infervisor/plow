@@ -73,8 +73,11 @@ pub fn critical_path(n: usize, edges: &BTreeSet<(u32, u32)>) -> (u32, Vec<u32>) 
 
 pub fn analyse(prog: &DevProg) -> Stats {
     let n_ops = prog.insts.len();
-    let ents: &[packet::dev::StreamEnt] =
-        if prog.gq_stream.is_empty() { &prog.stream } else { &prog.gq_stream };
+    let ents: &[packet::dev::StreamEnt] = if prog.gq_stream.is_empty() {
+        &prog.stream
+    } else {
+        &prog.gq_stream
+    };
 
     let fine_ents = ents.iter().filter(|e| e.flags & SE_FINE != 0).count();
 
@@ -104,8 +107,9 @@ pub fn analyse(prog: &DevProg) -> Stats {
     let edges_tr = transitive_reduction(n_ops, &edges);
 
     // Counters nobody waits on: every slice still bumps them.
-    let dead_ctr: Vec<u32> =
-        (0..n_ops as u32).filter(|c| !waited_on.contains(c)).collect();
+    let dead_ctr: Vec<u32> = (0..n_ops as u32)
+        .filter(|c| !waited_on.contains(c))
+        .collect();
     let dead_set: HashSet<u32> = dead_ctr.iter().copied().collect();
 
     // Per-op slice counts, for the runtime arithmetic.
@@ -129,7 +133,13 @@ pub fn analyse(prog: &DevProg) -> Stats {
         })
         .sum();
     let bumps_live: u64 = (0..n_ops as u32)
-        .map(|o| if dead_set.contains(&o) { 0 } else { blocks[o as usize] as u64 })
+        .map(|o| {
+            if dead_set.contains(&o) {
+                0
+            } else {
+                blocks[o as usize] as u64
+            }
+        })
         .sum();
 
     Stats {
@@ -209,4 +219,3 @@ pub fn placement_implied(p: &Placement, a: u32, b: u32) -> bool {
         _ => false,
     }
 }
-

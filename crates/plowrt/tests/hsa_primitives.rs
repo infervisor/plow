@@ -110,7 +110,10 @@ fn device_to_device_copy_is_exact() {
 
     let mut back = vec![0u8; N];
     be.download(&b, 0, &mut back).expect("download");
-    assert_eq!(back, pattern, "dtod copy did not reproduce the source bytes");
+    assert_eq!(
+        back, pattern,
+        "dtod copy did not reproduce the source bytes"
+    );
 }
 
 #[test]

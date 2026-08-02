@@ -56,7 +56,7 @@ pub mod kda;
 use config::*;
 mod ladder;
 mod mla;
-use mla::{glm_main, glm_emit_block, kimi_emit_block, nemotron_emit_block, MlaArch};
+use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
 pub mod manifest;
 pub mod tune_demand;
 
@@ -116,7 +116,6 @@ pub mod tune_demand;
 // interpreter traps on every one of them. It is documented as such and needs no gate — a trap is
 // the loud failure. `PLOW_PF_GEMV_HEAD` is the other correctly-handled one: default-on where the
 // arm exists, opt-in where it does not.
-
 
 /// Flash-decode GQA fusion factor on FULL-attention layers. **This must equal the
 /// kernel constant** (`PLOW_NV_FA_GF` on sm_120, `PLOW_FA_GF_FULL` on AMD) or the
@@ -214,7 +213,9 @@ pub fn tile_cost(
 ) -> u64 {
     use costmodel::cost::{dma_cycles, macs_cycles};
 
-    let Some(tile) = kernel.tile else { return u64::MAX };
+    let Some(tile) = kernel.tile else {
+        return u64::MAX;
+    };
     let (bm, bn, bk) = (tile.bm as u64, tile.bn as u64, tile.bk as u64);
     let (m, n, k) = (m.max(1) as u64, n.max(1) as u64, k.max(1) as u64);
     let n_units = (n_units as u64).max(1);
@@ -396,8 +397,14 @@ fn select_gemm_over(
 /// the epilogue needs is legal at either. It is left out here to keep this change surgical; the
 /// prize is the +6% above, on the largest GEMM in the model.
 fn glu_fusion_wins(m: u32, n: u32, k: u32, n_cu: u32) -> bool {
-    select_gemm_over(glu_era_inventory(), m, n, k, n_cu, kernelcaps::QuantScheme::None)
-        == DevOp::Gemm
+    select_gemm_over(
+        glu_era_inventory(),
+        m,
+        n,
+        k,
+        n_cu,
+        kernelcaps::QuantScheme::None,
+    ) == DevOp::Gemm
 }
 
 /// [`glu_fusion_wins`] for the MXFP4 (w4a16) family — asked at the shape the fused arm ACTUALLY
@@ -426,15 +433,20 @@ fn glu_fusion_wins(m: u32, n: u32, k: u32, n_cu: u32) -> bool {
 /// alone deliberately — correcting it would move bf16 emission for every Gemma/Llama/Qwen shape,
 /// which is a separate change with its own measurements to take.
 pub fn glu_fusion_wins_mxfp4(m: u32, n: u32, k: u32, n_cu: u32) -> bool {
-    select_gemm_over(glu_era_inventory_mxfp4(), m, 2 * n, k, n_cu, kernelcaps::QuantScheme::Mxfp4)
-        == DevOp::GemmMxfp4
+    select_gemm_over(
+        glu_era_inventory_mxfp4(),
+        m,
+        2 * n,
+        k,
+        n_cu,
+        kernelcaps::QuantScheme::Mxfp4,
+    ) == DevOp::GemmMxfp4
 }
 
 /// The fp4 rungs [`glu_fusion_wins_mxfp4`] ranks — the three that mirror [`glu_era_inventory`]'s.
 fn glu_era_inventory_mxfp4() -> &'static kernelcaps::Inventory {
     use std::sync::OnceLock;
-    const RUNGS: [DevOp; 3] =
-        [DevOp::GemmMxfp4, DevOp::GemmMedMxfp4, DevOp::GemmSmallMxfp4];
+    const RUNGS: [DevOp; 3] = [DevOp::GemmMxfp4, DevOp::GemmMedMxfp4, DevOp::GemmSmallMxfp4];
     static INV: OnceLock<kernelcaps::Inventory> = OnceLock::new();
     INV.get_or_init(|| {
         let src = gfx950_gemm_inventory();
@@ -519,10 +531,8 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
     use std::sync::OnceLock;
     static M: OnceLock<GemmMeasurements> = OnceLock::new();
     M.get_or_init(|| {
-        let mut by_case: std::collections::HashMap<
-            String,
-            std::collections::HashMap<u16, f64>,
-        > = Default::default();
+        let mut by_case: std::collections::HashMap<String, std::collections::HashMap<u16, f64>> =
+            Default::default();
         // EMPTY means "no store", which is how `plowc --no-tuning` reaches here. Unset means
         // "the default tree" — the two are deliberately different: a compile that never asked
         // about tuning should still get the calibrated answer, and one that explicitly asked
@@ -624,8 +634,8 @@ pub fn install_gfx950_gemv_cases() {
         toolchain: gfx950_gemm_inventory().build().toolchain.clone(),
         oracle: tunedb::GEMV_ORACLE.to_string(),
     };
-    if let Ok(records) = tunedb::TuneStore::new(std::path::PathBuf::from(root))
-        .load_kernels(tunedb::GFX950_CELL)
+    if let Ok(records) =
+        tunedb::TuneStore::new(std::path::PathBuf::from(root)).load_kernels(tunedb::GFX950_CELL)
     {
         for r in records {
             // Every GEMV family, not just the plain one: `DevOp::gemv_case` puts the arm in
@@ -684,10 +694,38 @@ fn gfx950_gemm_inventory() -> &'static kernelcaps::Inventory {
 /// intentional edit to `op_gemm.h`.
 const GFX950_RUNGS: [(DevOp, DevOp, DevOp, i64, i64, i64); 5] = [
     (DevOp::Gemm, DevOp::GemmFp8, DevOp::GemmMxfp4, 256, 256, 64),
-    (DevOp::GemmMed, DevOp::GemmMedFp8, DevOp::GemmMedMxfp4, 128, 128, 64),
-    (DevOp::GemmSmall, DevOp::GemmSmallFp8, DevOp::GemmSmallMxfp4, 64, 128, 64),
-    (DevOp::GemmWide, DevOp::GemmWideFp8, DevOp::GemmWideMxfp4, 128, 256, 64),
-    (DevOp::GemmC5, DevOp::GemmC5Fp8, DevOp::GemmC5Mxfp4, 192, 256, 64),
+    (
+        DevOp::GemmMed,
+        DevOp::GemmMedFp8,
+        DevOp::GemmMedMxfp4,
+        128,
+        128,
+        64,
+    ),
+    (
+        DevOp::GemmSmall,
+        DevOp::GemmSmallFp8,
+        DevOp::GemmSmallMxfp4,
+        64,
+        128,
+        64,
+    ),
+    (
+        DevOp::GemmWide,
+        DevOp::GemmWideFp8,
+        DevOp::GemmWideMxfp4,
+        128,
+        256,
+        64,
+    ),
+    (
+        DevOp::GemmC5,
+        DevOp::GemmC5Fp8,
+        DevOp::GemmC5Mxfp4,
+        192,
+        256,
+        64,
+    ),
 ];
 
 /// Every opcode [`pick_tile`] can answer with, in any encoding — the set a test asks "is this a
@@ -711,8 +749,8 @@ pub(crate) fn gemm_family_ops() -> Vec<u16> {
 /// in the B-fetch, so the matrix instruction it issues is the ordinary bf16 MFMA. Mirrors
 /// `kernelcaps::targets::GFX950_QUANT_OBJECTS`, which is what the real probe uses.
 fn gfx950_rung_specs(build_label: &str) -> Vec<kernelcaps::KernelSpec> {
-    use kernelcaps::{KernelSpec, QuantScheme};
     use hwspec::{IsaLevel, MmaDtype};
+    use kernelcaps::{KernelSpec, QuantScheme};
     let mut out = Vec::with_capacity(GFX950_RUNGS.len() * 3);
     for (bf16, fp8, mx, bm, bn, bk) in GFX950_RUNGS {
         for (op, quant, mma) in [
@@ -967,10 +1005,30 @@ fn declare(
     // hidden (qkv/gate/up/lm_head), intermediate (down), and each head_dim (attn out) — must be
     // 8-aligned. Holds for all supported checkpoints; enforce it so an unaligned dim fails at
     // emit time instead of silently over-reading on device.
-    assert_eq!(c.hidden % 8, 0, "hidden {} must be a multiple of 8 (GEMV 8-wide load)", c.hidden);
-    assert_eq!(c.inter % 8, 0, "intermediate {} must be a multiple of 8 (GEMV 8-wide load)", c.inter);
-    assert_eq!(c.hd_slide % 8, 0, "head_dim {} must be a multiple of 8 (GEMV 8-wide load)", c.hd_slide);
-    assert_eq!(c.hd_full % 8, 0, "global_head_dim {} must be a multiple of 8 (GEMV 8-wide load)", c.hd_full);
+    assert_eq!(
+        c.hidden % 8,
+        0,
+        "hidden {} must be a multiple of 8 (GEMV 8-wide load)",
+        c.hidden
+    );
+    assert_eq!(
+        c.inter % 8,
+        0,
+        "intermediate {} must be a multiple of 8 (GEMV 8-wide load)",
+        c.inter
+    );
+    assert_eq!(
+        c.hd_slide % 8,
+        0,
+        "head_dim {} must be a multiple of 8 (GEMV 8-wide load)",
+        c.hd_slide
+    );
+    assert_eq!(
+        c.hd_full % 8,
+        0,
+        "global_head_dim {} must be a multiple of 8 (GEMV 8-wide load)",
+        c.hd_full
+    );
     let qd_max = (c.heads / tp) * c.hd_slide.max(c.hd_full);
     // kv activation shards use the per-rank LOCAL kv-head count (shared-kv-head replication clamps
     // it to 1 when tp>kvh, so kvh/tp would under-size to 0 at tp=8 on full layers — §3a/§13.2).
@@ -1270,12 +1328,18 @@ fn declare(
         // tensor is dbatch* that. dbatch==1 => byte-identical to the single-sequence cache.
         let db = dbatch as u64;
         t.kc.push(if in_block {
-            b.tensor(&format!("kv.{l}.k"), db * (kvr * kvh_local * hd) as u64 * kv_elt)
+            b.tensor(
+                &format!("kv.{l}.k"),
+                db * (kvr * kvh_local * hd) as u64 * kv_elt,
+            )
         } else {
             TENSOR_NONE
         });
         t.vc.push(if in_block {
-            b.tensor(&format!("kv.{l}.v"), db * (kvr * kvh_local * hd) as u64 * kv_elt)
+            b.tensor(
+                &format!("kv.{l}.v"),
+                db * (kvr * kvh_local * hd) as u64 * kv_elt,
+            )
         } else {
             TENSOR_NONE
         });
@@ -1548,7 +1612,10 @@ pub(crate) const PLOW_THREADS: u32 = 512;
 /// what makes an object NARROWER than the program it serves expressible at all, and that
 /// combination is the whole subject of `plans/knob-contract.md` §6g-WALK.
 fn gemv_row_bucket(t: u32) -> u32 {
-    if let Some(v) = std::env::var("PLOW_GEMV_MM").ok().and_then(|s| s.parse::<u32>().ok()) {
+    if let Some(v) = std::env::var("PLOW_GEMV_MM")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+    {
         return v.clamp(1, GEMV_MAXM);
     }
     let mut p = 1u32;
@@ -1630,7 +1697,9 @@ fn default_chunk(window: u32) -> u32 {
     if window == 0 {
         MAX_CHUNK_MAX
     } else {
-        window.next_power_of_two().clamp(MAX_CHUNK_MIN, MAX_CHUNK_MAX)
+        window
+            .next_power_of_two()
+            .clamp(MAX_CHUNK_MIN, MAX_CHUNK_MAX)
     }
 }
 
@@ -1685,10 +1754,13 @@ fn kv_ring(full: bool, ctx: u32, window: u32, chunk: u32) -> (u32, u32) {
         (ctx, KV_MASK_NONE)
     } else {
         let r = ctx.min(kv_ring_rows(window, chunk)); // no point ringing a cache smaller than the ring
-        // `row & (r-1)` is a modulo ONLY when r is a power of two. For a non-pow2 r the AND
-        // aliases rows to WRONG (in-bounds) rows — silent corruption. All shipped ctx are
-        // pow2; make the invariant loud (leak-audit finding #6).
-        assert!(r.is_power_of_two(), "kv_ring size {r} (ctx {ctx}) must be a power of two");
+                                                      // `row & (r-1)` is a modulo ONLY when r is a power of two. For a non-pow2 r the AND
+                                                      // aliases rows to WRONG (in-bounds) rows — silent corruption. All shipped ctx are
+                                                      // pow2; make the invariant loud (leak-audit finding #6).
+        assert!(
+            r.is_power_of_two(),
+            "kv_ring size {r} (ctx {ctx}) must be a power of two"
+        );
         // The wrap invariant binds ONLY when the ring is shorter than the context. At r == ctx
         // no position is ever reused (`row & (ctx-1) == row` for row < ctx), so the cache is
         // linear-equivalent and `window + chunk - 1` is vacuous — which is why a small-ctx
@@ -1860,9 +1932,15 @@ mod flash_merge_map_tests {
         for nblk_m in [1u32, 8, 32, 64, 200, 256] {
             let n_bh = 32;
             let dsplit = nblk_m.div_ceil(n_bh).max(1);
-            let mut seen: Vec<u32> = (0..nblk_m).flat_map(|j| kernel_items(n_bh, nblk_m, j)).collect();
+            let mut seen: Vec<u32> = (0..nblk_m)
+                .flat_map(|j| kernel_items(n_bh, nblk_m, j))
+                .collect();
             seen.sort_unstable();
-            assert_eq!(seen, (0..n_bh * dsplit).collect::<Vec<_>>(), "nblk_m={nblk_m}");
+            assert_eq!(
+                seen,
+                (0..n_bh * dsplit).collect::<Vec<_>>(),
+                "nblk_m={nblk_m}"
+            );
         }
     }
 
@@ -1879,7 +1957,9 @@ mod flash_merge_map_tests {
         const KERNEL_WAVES: u32 = 4; // scripts/build_gfx950.sh: the flash object is -DPLOW_WG_WAVES=4
         const KERNEL_FA_BQ: u32 = 32; // runtime/amd/op_attention.h:49
         let qt = row / (KERNEL_WAVES * KERNEL_FA_BQ);
-        (0..nsplit).map(|sp| ((qt * n_head + h) * nsplit + sp) % nblk_f).collect()
+        (0..nsplit)
+            .map(|sp| ((qt * n_head + h) * nsplit + sp) % nblk_f)
+            .collect()
     }
 
     /// EVERY flash slice that wrote a merge item's partials must be in that item's wait set.
@@ -1898,7 +1978,9 @@ mod flash_merge_map_tests {
         let n_cu = 256u32;
         for heads in [8u32, 16, 20, 24, 28, 32, 40, 48, 64] {
             for t in [128u32, 192, 256, 384, 512, 768, 1024, 2048] {
-                let ns = n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1)).max(1);
+                let ns = n_cu
+                    .div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
+                    .max(1);
                 if ns <= 1 {
                     continue; // fused: flash normalizes in its epilogue, no FlashMerge op
                 }
@@ -1930,7 +2012,9 @@ mod flash_merge_map_tests {
         let n_cu = 256u32;
         for heads in [8u32, 16, 32, 64] {
             for t in [128u32, 256, 512, 1024, 2048] {
-                let ns = n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1)).max(1);
+                let ns = n_cu
+                    .div_ceil((t.div_ceil(Q_TILE_ROWS) * heads).max(1))
+                    .max(1);
                 if ns <= 1 {
                     continue;
                 }
@@ -1953,7 +2037,9 @@ mod flash_merge_map_tests {
         let map = flash_merge_map(n_bh, ns, 1, n_head, nblk_f, n_bh);
         for (j, s) in map.iter().enumerate() {
             let (b, h) = (j as u32 / n_head, j as u32 % n_head);
-            let mut want: Vec<u32> = (0..ns).map(|sp| ((b * n_head + h) * ns + sp) % nblk_f).collect();
+            let mut want: Vec<u32> = (0..ns)
+                .map(|sp| ((b * n_head + h) * ns + sp) % nblk_f)
+                .collect();
             want.sort_unstable();
             want.dedup();
             assert_eq!(s, &want, "wg {j}");
@@ -1973,7 +2059,9 @@ mod flash_merge_map_tests {
             assert_eq!(items.len(), 1, "at 256 wgs each runs exactly one D-chunk");
             let hb = items[0] / dsplit;
             let (b, h) = (hb / n_head, hb % n_head);
-            let mut want: Vec<u32> = (0..ns).map(|sp| ((b * n_head + h) * ns + sp) % nblk_f).collect();
+            let mut want: Vec<u32> = (0..ns)
+                .map(|sp| ((b * n_head + h) * ns + sp) % nblk_f)
+                .collect();
             want.sort_unstable();
             want.dedup();
             assert_eq!(s, &want, "wg {j}");
@@ -2002,7 +2090,18 @@ fn emit_xreduce(
     tp: u32,
     slot: u32,
 ) -> u32 {
-    emit_xreduce_gather(b, xgate, decode, xr_cus, &[dep], out, xr_elems, tp, slot, None)
+    emit_xreduce_gather(
+        b,
+        xgate,
+        decode,
+        xr_cus,
+        &[dep],
+        out,
+        xr_elems,
+        tp,
+        slot,
+        None,
+    )
 }
 
 /// [`emit_xreduce`], plus an ALL-GATHER of a column-parallel partial folded into the same
@@ -2137,10 +2236,10 @@ fn gemma_moe_router_split_plan(n_cu: u32, n_exp: u32, nrow: u32) -> Option<(u32,
     }
     let max_useful = (nrow * n_exp).div_ceil(8).max(1).min(n_cu.max(1));
     let blocks = std::env::var("PLOW_GEMMA_MOE_ROUTER_BLOCKS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(max_useful)
-            .clamp(1, max_useful);
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(max_useful)
+        .clamp(1, max_useful);
     let op = if std::env::var("PLOW_GEMMA_MOE_ROUTER_EXACT").ok().as_deref() == Some("1") {
         DevOp::MoeRouterGemmaScore
     } else {
@@ -2175,22 +2274,17 @@ fn emit_gemma_moe_router(
             score, TENSOR_NONE,
             "split Gemma router requires f32 score scratch"
         );
-        let c_score = b.emit(
-            score_op,
-            (0..blocks).collect(),
-            &[dep],
-            |d| {
-                d.t[0] = score;
-                d.t[1] = resid;
-                d.t[2] = proj;
-                d.t[3] = scale;
-                d.i[0] = hidden;
-                d.i[1] = n_exp;
-                d.i[2] = nb;
-                d.f[0] = root;
-                d.f[1] = eps;
-            },
-        );
+        let c_score = b.emit(score_op, (0..blocks).collect(), &[dep], |d| {
+            d.t[0] = score;
+            d.t[1] = resid;
+            d.t[2] = proj;
+            d.t[3] = scale;
+            d.i[0] = hidden;
+            d.i[1] = n_exp;
+            d.i[2] = nb;
+            d.f[0] = root;
+            d.f[1] = eps;
+        });
         // top-k is serial per row; give it one CTA per row so B rows run concurrently.
         let topk_cus: Vec<u32> = (0..nrow.max(1)).collect();
         b.emit(DevOp::MoeRouterGemmaTopk, topk_cus, &[c_score], |d| {
@@ -2616,19 +2710,19 @@ fn emit_phase(
         //   signature as the ns.max(16) floor above, plus `full`, plus a <=64 sanity cap so a
         //   shape whose n_grp is coprime to n_cu (aligned would jump to n_cu) falls back.
         //   PLOW_NS_FULL_ABS still overrides for sweeps.
-        let ns = if gemv_family && full && ctx > 8192 && c.kvh_full >= 4 && c.kvh_slide != c.kvh_full
-        {
-            let n_grp = (heads / fa_gf_full()).max(1);
-            let aligned = n_cu / gcd(n_grp, n_cu); // smallest grid-aligned nsplit step
-            let cand = ns.div_ceil(aligned) * aligned; // round the ns16 target up to it
-            if cand <= 64 {
-                cand
+        let ns =
+            if gemv_family && full && ctx > 8192 && c.kvh_full >= 4 && c.kvh_slide != c.kvh_full {
+                let n_grp = (heads / fa_gf_full()).max(1);
+                let aligned = n_cu / gcd(n_grp, n_cu); // smallest grid-aligned nsplit step
+                let cand = ns.div_ceil(aligned) * aligned; // round the ns16 target up to it
+                if cand <= 64 {
+                    cand
+                } else {
+                    ns
+                }
             } else {
                 ns
-            }
-        } else {
-            ns
-        };
+            };
         // GRID-ALIGNED FULL-LAYER nsplit, 12B SINGLE-GLOBAL-KV-HEAD signature (beat12b-fp8-margin).
         // Gemma-4-12B full layers are kvh_full=1 (ONE kv head serves all 16 q heads): the CU-fill
         // formula gives ns=24 -> n_grp(8)*24 = 192 items on 188 SMs — RAGGED: 4 blocks run 2 items,
@@ -2705,7 +2799,11 @@ fn emit_phase(
             // The block's FIRST layer reads the uploaded `act.x` with no producer
             // (Embed was skipped), so its RmsNorm depends on `&[]`. Full model =>
             // block.start==0 and this only affects l==0, whose dep IS the Embed.
-            let nd: &[u32] = if block_mode && l == block.start { &[] } else { &[dep] };
+            let nd: &[u32] = if block_mode && l == block.start {
+                &[]
+            } else {
+                &[dep]
+            };
             b.emit(DevOp::RmsNorm, rows.clone(), nd, |d| {
                 d.t[0] = n.hn;
                 d.t[1] = n.x;
@@ -3442,36 +3540,162 @@ fn emit_phase(
                 "MoE decode batch is capped at 32 (per-CTA inv[] scratch, PLOW_MOE_MAXB)"
             );
             if decode {
-            // h1 = post_feedforward_layernorm_1(dense MLP output)
-            let c_h1 = b.emit(DevOp::RmsNorm, rows.clone(), &[c_d], |d| {
-                d.t[0] = n.moe_h1;
-                d.t[1] = n.dg;
-                d.t[2] = w.g_pf1;
-                d.i[0] = t;
-                d.i[1] = c.hidden;
-                d.f[0] = c.eps;
-            });
-            // router(residual): weightless-rms -> ·scale·root -> softmax -> top-k (lowest-id tie)
-            // -> norm_topk -> ·per_expert_scale -> routing_table[k]. The default remains the
-            // historical one-block opcode. The opt-in split scores eight experts per CTA, then a
-            // one-CTA tail performs the exact serial softmax/top-k/gate ordering.
-            let c_rt = c_rt_hoist.expect("router hoisted before dense MLP for moe");
-            let _ = root;
-            // Expert gate/up (fused) -> mfu[k,I]; expert down + gate scale -> part[k,H].
-            // GluNorm fusion (op 71): fuse the pre-feedforward-norm-2 INTO the expert GLU,
-            // eliminating a separate RmsNorm op + counter gate. Each CTA redundantly computes
-            // the RMS of the residual (5.6 KB @ H=2816, hot in L2 from the router read).
-            // Falls back to separate norm + GLU when fp8 (no fused fp8 variant yet).
-            let glu_cus: Vec<u32> = (0..n_cu).collect();
-            let down_cus: Vec<u32> = (0..n_cu).collect();
-            let _glu_op = if fp8 {
-                DevOp::MoeExpertGluGemmaFp8
+                // h1 = post_feedforward_layernorm_1(dense MLP output)
+                let c_h1 = b.emit(DevOp::RmsNorm, rows.clone(), &[c_d], |d| {
+                    d.t[0] = n.moe_h1;
+                    d.t[1] = n.dg;
+                    d.t[2] = w.g_pf1;
+                    d.i[0] = t;
+                    d.i[1] = c.hidden;
+                    d.f[0] = c.eps;
+                });
+                // router(residual): weightless-rms -> ·scale·root -> softmax -> top-k (lowest-id tie)
+                // -> norm_topk -> ·per_expert_scale -> routing_table[k]. The default remains the
+                // historical one-block opcode. The opt-in split scores eight experts per CTA, then a
+                // one-CTA tail performs the exact serial softmax/top-k/gate ordering.
+                let c_rt = c_rt_hoist.expect("router hoisted before dense MLP for moe");
+                let _ = root;
+                // Expert gate/up (fused) -> mfu[k,I]; expert down + gate scale -> part[k,H].
+                // GluNorm fusion (op 71): fuse the pre-feedforward-norm-2 INTO the expert GLU,
+                // eliminating a separate RmsNorm op + counter gate. Each CTA redundantly computes
+                // the RMS of the residual (5.6 KB @ H=2816, hot in L2 from the router read).
+                // Falls back to separate norm + GLU when fp8 (no fused fp8 variant yet).
+                let glu_cus: Vec<u32> = (0..n_cu).collect();
+                let down_cus: Vec<u32> = (0..n_cu).collect();
+                let _glu_op = if fp8 {
+                    DevOp::MoeExpertGluGemmaFp8
+                } else {
+                    DevOp::MoeExpertGluNormGemma
+                };
+                let c_glu = if fp8 {
+                    // fp8 path: separate norm + expert GLU (no fused fp8 norm variant)
+                    let c_xn2_local = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
+                        d.t[0] = n.moe_xn2;
+                        d.t[1] = n.x;
+                        d.t[2] = w.g_pre2;
+                        d.i[0] = t;
+                        d.i[1] = c.hidden;
+                        d.f[0] = c.eps;
+                    });
+                    b.emit(
+                        DevOp::MoeExpertGluGemmaFp8,
+                        glu_cus,
+                        &[c_rt, c_xn2_local],
+                        |d| {
+                            d.t[0] = n.moe_mfu;
+                            d.t[1] = n.moe_xn2;
+                            d.t[2] = n.moe_tab;
+                            d.t[3] = w.ewt;
+                            d.t[4] = w.est;
+                            d.i[0] = c.top_k;
+                            d.i[1] = c.moe_inter;
+                            d.i[2] = c.hidden;
+                            d.i[3] = c.n_exp;
+                            d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
+                        },
+                    )
+                } else {
+                    // bf16 path: fused norm + expert GLU (one fewer gate)
+                    b.emit(DevOp::MoeExpertGluNormGemma, glu_cus, &[c_rt, c_pf], |d| {
+                        d.t[0] = n.moe_mfu;
+                        d.t[1] = n.x;
+                        d.t[2] = n.moe_tab;
+                        d.t[3] = w.ewt;
+                        d.t[4] = w.g_pre2;
+                        d.i[0] = c.top_k;
+                        d.i[1] = c.moe_inter;
+                        d.i[2] = c.hidden;
+                        d.i[3] = c.n_exp;
+                        d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
+                        d.f[0] = c.eps;
+                    })
+                };
+                let down_op = if fp8 {
+                    DevOp::MoeExpertDownGemmaFp8
+                } else {
+                    DevOp::MoeExpertDownGemma
+                };
+                let c_dn = vec![b.emit(down_op, down_cus, &[c_glu], |d| {
+                    d.t[0] = n.moe_part;
+                    d.t[1] = n.moe_mfu;
+                    d.t[2] = n.moe_tab;
+                    d.t[3] = w.ewt;
+                    d.t[4] = w.est;
+                    d.i[0] = c.top_k;
+                    d.i[1] = c.hidden;
+                    d.i[2] = c.moe_inter;
+                    d.i[3] = c.n_exp;
+                    d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
+                })];
+                // fused combine + rmsnorm + residual: saves 2 counter gates per layer.
+                let mut comb_deps: Vec<u32> = c_dn;
+                comb_deps.push(c_h1);
+                // op72 MEASURED NEGATIVE in its scalar form (P9, 2026-07-20): +0.18 ms/token on
+                // BOTH bf16 (8.04→8.22) and fp8 (6.03→6.21) @40ctx — the 1-block 4-pass scalar
+                // body costs more than the packet boundary it removes, and its reduction order
+                // differs from the vectorized NormResidualNorm (last-ulp bf16 flips → token
+                // drift vs the pair). Oracle is bit-exact vs its own golden. Default OFF; only
+                // worth revisiting as a register-cached vectorized body that replicates NRN's
+                // summation order. Opt in: PLOW_GEMMA_MOE_TAIL_FUSE=1.
+                let tail_fuse =
+                    std::env::var("PLOW_GEMMA_MOE_TAIL_FUSE").ok().as_deref() == Some("1");
+                // op72 is a single-row 1-CTA body and is default-OFF (measured negative); it was not
+                // batched. Refuse the combination loudly rather than emit wrong rows 1..B.
+                assert!(
+                !(tail_fuse && t > 1),
+                "PLOW_GEMMA_MOE_TAIL_FUSE is B=1 only (op72 MoeCombineResidNormGemma is not batched)"
+            );
+                let c_comb = if gfuse && tail_fuse {
+                    // op72: fused combine + post_ffn norm + sandwich residual + NEXT input norm.
+                    // One 1-block packet replaces the (op70, NormResidualNorm) pair on the layer
+                    // tail — the chain next-QKV gates on loses a packet boundary. Bit-exact.
+                    let next_gin = if l + 1 < block.end {
+                        n.lw[l + 1].g_in
+                    } else {
+                        n.fin
+                    };
+                    let ct = b.emit(DevOp::MoeCombineResidNormGemma, vec![0], &comb_deps, |d| {
+                        d.t[0] = n.hn;
+                        d.t[1] = n.x;
+                        d.t[2] = n.moe_part;
+                        d.t[3] = n.moe_h1;
+                        d.t[4] = w.g_pf2;
+                        d.t[5] = w.g_po;
+                        d.t[6] = next_gin;
+                        d.i[0] = c.hidden;
+                        d.i[1] = c.top_k;
+                        d.f[0] = c.eps;
+                        d.f[1] = ls[l];
+                    });
+                    moe_fused_tail = Some(ct);
+                    ct
+                } else {
+                    // BATCH B>1: one CTA per row (the body is a per-row block loop).
+                    let comb_cus: Vec<u32> = (0..t).collect();
+                    b.emit(DevOp::MoeCombineNormGemma, comb_cus, &comb_deps, |d| {
+                        d.t[0] = n.moe_comb;
+                        d.t[1] = n.moe_part;
+                        d.t[2] = n.moe_h1;
+                        d.t[3] = w.g_pf2;
+                        d.i[0] = c.hidden;
+                        d.i[1] = c.top_k;
+                        d.i[2] = nb; // BATCH B (0 at B=1: byte-identical)
+                        d.f[0] = c.eps;
+                    })
+                };
+                (n.moe_comb, c_comb)
             } else {
-                DevOp::MoeExpertGluNormGemma
-            };
-            let c_glu = if fp8 {
-                // fp8 path: separate norm + expert GLU (no fused fp8 norm variant)
-                let c_xn2_local = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
+                // ===== GROUPED-MoE PREFILL (T rows; plans/p9-26b-prefill-moe.md) =====
+                // h1 = post_ffn_norm_1(dense), T rows. xn2 = pre_ffn_norm_2(residual), T rows.
+                let c_h1 = b.emit(DevOp::RmsNorm, rows.clone(), &[c_d], |d| {
+                    d.t[0] = n.moe_h1;
+                    d.t[1] = n.dg;
+                    d.t[2] = w.g_pf1;
+                    d.i[0] = t;
+                    d.i[1] = c.hidden;
+                    d.f[0] = c.eps;
+                });
+                let c_xn2 = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
                     d.t[0] = n.moe_xn2;
                     d.t[1] = n.x;
                     d.t[2] = w.g_pre2;
@@ -3479,231 +3703,135 @@ fn emit_phase(
                     d.i[1] = c.hidden;
                     d.f[0] = c.eps;
                 });
-                b.emit(DevOp::MoeExpertGluGemmaFp8, glu_cus, &[c_rt, c_xn2_local], |d| {
-                    d.t[0] = n.moe_mfu;
-                    d.t[1] = n.moe_xn2;
-                    d.t[2] = n.moe_tab;
-                    d.t[3] = w.ewt;
-                    d.t[4] = w.est;
-                    d.i[0] = c.top_k;
-                    d.i[1] = c.moe_inter;
-                    d.i[2] = c.hidden;
-                    d.i[3] = c.n_exp;
-                    d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
-                })
-            } else {
-                // bf16 path: fused norm + expert GLU (one fewer gate)
-                b.emit(DevOp::MoeExpertGluNormGemma, glu_cus, &[c_rt, c_pf], |d| {
-                    d.t[0] = n.moe_mfu;
+                // T-token router -> routing_table[T*k] (block-per-token, bit-identical to decode).
+                let c_rt = b.emit(DevOp::MoeRouterGemmaPf, all.clone(), &[c_pf], |d| {
+                    d.t[0] = n.moe_tab;
                     d.t[1] = n.x;
-                    d.t[2] = n.moe_tab;
-                    d.t[3] = w.ewt;
-                    d.t[4] = w.g_pre2;
-                    d.i[0] = c.top_k;
-                    d.i[1] = c.moe_inter;
-                    d.i[2] = c.hidden;
-                    d.i[3] = c.n_exp;
-                    d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
-                    d.f[0] = c.eps;
-                })
-            };
-            let down_op = if fp8 {
-                DevOp::MoeExpertDownGemmaFp8
-            } else {
-                DevOp::MoeExpertDownGemma
-            };
-            let c_dn = vec![b.emit(down_op, down_cus, &[c_glu], |d| {
-                d.t[0] = n.moe_part;
-                d.t[1] = n.moe_mfu;
-                d.t[2] = n.moe_tab;
-                d.t[3] = w.ewt;
-                d.t[4] = w.est;
-                d.i[0] = c.top_k;
-                d.i[1] = c.hidden;
-                d.i[2] = c.moe_inter;
-                d.i[3] = c.n_exp;
-                d.i[5] = nb; // BATCH B (0 at B=1: byte-identical)
-            })];
-            // fused combine + rmsnorm + residual: saves 2 counter gates per layer.
-            let mut comb_deps: Vec<u32> = c_dn;
-            comb_deps.push(c_h1);
-            // op72 MEASURED NEGATIVE in its scalar form (P9, 2026-07-20): +0.18 ms/token on
-            // BOTH bf16 (8.04→8.22) and fp8 (6.03→6.21) @40ctx — the 1-block 4-pass scalar
-            // body costs more than the packet boundary it removes, and its reduction order
-            // differs from the vectorized NormResidualNorm (last-ulp bf16 flips → token
-            // drift vs the pair). Oracle is bit-exact vs its own golden. Default OFF; only
-            // worth revisiting as a register-cached vectorized body that replicates NRN's
-            // summation order. Opt in: PLOW_GEMMA_MOE_TAIL_FUSE=1.
-            let tail_fuse = std::env::var("PLOW_GEMMA_MOE_TAIL_FUSE").ok().as_deref()
-                == Some("1");
-            // op72 is a single-row 1-CTA body and is default-OFF (measured negative); it was not
-            // batched. Refuse the combination loudly rather than emit wrong rows 1..B.
-            assert!(
-                !(tail_fuse && t > 1),
-                "PLOW_GEMMA_MOE_TAIL_FUSE is B=1 only (op72 MoeCombineResidNormGemma is not batched)"
-            );
-            let c_comb = if gfuse && tail_fuse {
-                // op72: fused combine + post_ffn norm + sandwich residual + NEXT input norm.
-                // One 1-block packet replaces the (op70, NormResidualNorm) pair on the layer
-                // tail — the chain next-QKV gates on loses a packet boundary. Bit-exact.
-                let next_gin = if l + 1 < block.end {
-                    n.lw[l + 1].g_in
+                    d.t[2] = w.rproj;
+                    d.t[3] = w.rscale;
+                    d.t[4] = w.rpes;
+                    d.i[0] = c.hidden;
+                    d.i[1] = c.n_exp;
+                    d.i[2] = c.top_k;
+                    d.i[3] = t;
+                    d.f[0] = root;
+                    d.f[1] = c.eps;
+                });
+                // align/sort (SINGLE block): histogram -> padded prefix -> scatter gather maps.
+                let c_align = b.emit(DevOp::MoeAlignGemmaPf, vec![0], &[c_rt], |d| {
+                    d.t[0] = n.moe_meta;
+                    d.t[1] = n.moe_tab;
+                    d.t[2] = n.moe_rowtok;
+                    d.t[3] = n.moe_rowpart;
+                    d.t[4] = n.moe_rowgate;
+                    d.i[0] = t;
+                    d.i[1] = c.n_exp;
+                    d.i[2] = c.top_k;
+                });
+                // grouped gate/up GEMM + GeGLU (gathered A, expert-selected B) -> fu_gathered.
+                // beat26b: w8a8 arm = native fp8 tensor-core GEMM (both operands e4m3). xn2 is quantized
+                // to e4m3 (xqh/ash, hidden width) once; the grouped GLU gathers e4m3 rows and dequants
+                // with a_scale[token]*w_scale[chan] in the epilogue. bf16 arm unchanged.
+                let c_dn = if w8a8 {
+                    // total_pad rows the align op touched for THIS bucket (matches align's write extent).
+                    let moe_total_pad = t * c.top_k + c.n_exp * 128;
+                    let c_xn2q = quant(b, n.xqh, n.ash, n.moe_xn2, c.hidden, c_xn2);
+                    let c_glu = b.emit(
+                        DevOp::MoeGroupGluGemmaPfW8a8,
+                        all.clone(),
+                        &[c_align, c_xn2q],
+                        |d| {
+                            d.t[0] = n.moe_fug;
+                            d.t[1] = n.xqh; // xn2 e4m3
+                            d.t[2] = w.ewt; // fp8 expert weights
+                            d.t[3] = n.moe_meta;
+                            d.t[4] = n.moe_rowtok;
+                            d.t[5] = n.ash; // per-token a_scale
+                            d.t[6] = w.est; // per-channel weight scales
+                            d.i[0] = c.moe_inter;
+                            d.i[1] = c.hidden;
+                            d.i[2] = c.n_exp;
+                            d.i[5] = c.mlp_act;
+                        },
+                    );
+                    // quant the gathered GLU output (total_pad rows, moe_inter width) for the down GEMM.
+                    let c_fuq = b.emit(DevOp::QuantFp8, all.clone(), &[c_glu], |d| {
+                        d.t[0] = n.moe_fuq;
+                        d.t[1] = n.moe_fug;
+                        d.t[2] = n.moe_fus;
+                        d.i[0] = moe_total_pad;
+                        d.i[1] = c.moe_inter;
+                    });
+                    b.emit(
+                        DevOp::MoeGroupDownGemmaPfW8a8,
+                        all.clone(),
+                        &[c_fuq, c_align],
+                        |d| {
+                            d.t[0] = n.moe_part;
+                            d.t[1] = n.moe_fuq; // fu e4m3
+                            d.t[2] = w.ewt;
+                            d.t[3] = n.moe_meta;
+                            d.t[4] = n.moe_rowpart;
+                            d.t[5] = n.moe_rowgate;
+                            d.t[6] = w.est;
+                            d.t[7] = n.moe_fus; // per-row fu scale
+                            d.i[0] = c.hidden;
+                            d.i[1] = c.moe_inter;
+                            d.i[2] = c.n_exp;
+                        },
+                    )
                 } else {
-                    n.fin
+                    let c_glu = b.emit(
+                        DevOp::MoeGroupGluGemmaPf,
+                        all.clone(),
+                        &[c_align, c_xn2],
+                        |d| {
+                            d.t[0] = n.moe_fug;
+                            d.t[1] = n.moe_xn2;
+                            d.t[2] = w.ewt;
+                            d.t[3] = n.moe_meta;
+                            d.t[4] = n.moe_rowtok;
+                            d.i[0] = c.moe_inter;
+                            d.i[1] = c.hidden;
+                            d.i[2] = c.n_exp;
+                            d.i[5] = c.mlp_act; // 0 GeGLU (Gemma)
+                        },
+                    );
+                    // grouped down GEMM + gate-scale + scatter -> part[T,k,H].
+                    b.emit(
+                        DevOp::MoeGroupDownGemmaPf,
+                        all.clone(),
+                        &[c_glu, c_align],
+                        |d| {
+                            d.t[0] = n.moe_part;
+                            d.t[1] = n.moe_fug;
+                            d.t[2] = w.ewt;
+                            d.t[3] = n.moe_meta;
+                            d.t[4] = n.moe_rowpart;
+                            d.t[5] = n.moe_rowgate;
+                            d.i[0] = c.hidden;
+                            d.i[1] = c.moe_inter;
+                            d.i[2] = c.n_exp;
+                        },
+                    )
                 };
-                let ct = b.emit(DevOp::MoeCombineResidNormGemma, vec![0], &comb_deps, |d| {
-                    d.t[0] = n.hn;
-                    d.t[1] = n.x;
-                    d.t[2] = n.moe_part;
-                    d.t[3] = n.moe_h1;
-                    d.t[4] = w.g_pf2;
-                    d.t[5] = w.g_po;
-                    d.t[6] = next_gin;
-                    d.i[0] = c.hidden;
-                    d.i[1] = c.top_k;
-                    d.f[0] = c.eps;
-                    d.f[1] = ls[l];
-                });
-                moe_fused_tail = Some(ct);
-                ct
-            } else {
-                // BATCH B>1: one CTA per row (the body is a per-row block loop).
-                let comb_cus: Vec<u32> = (0..t).collect();
-                b.emit(DevOp::MoeCombineNormGemma, comb_cus, &comb_deps, |d| {
-                    d.t[0] = n.moe_comb;
-                    d.t[1] = n.moe_part;
-                    d.t[2] = n.moe_h1;
-                    d.t[3] = w.g_pf2;
-                    d.i[0] = c.hidden;
-                    d.i[1] = c.top_k;
-                    d.i[2] = nb; // BATCH B (0 at B=1: byte-identical)
-                    d.f[0] = c.eps;
-                })
-            };
-            (n.moe_comb, c_comb)
-            } else {
-            // ===== GROUPED-MoE PREFILL (T rows; plans/p9-26b-prefill-moe.md) =====
-            // h1 = post_ffn_norm_1(dense), T rows. xn2 = pre_ffn_norm_2(residual), T rows.
-            let c_h1 = b.emit(DevOp::RmsNorm, rows.clone(), &[c_d], |d| {
-                d.t[0] = n.moe_h1;
-                d.t[1] = n.dg;
-                d.t[2] = w.g_pf1;
-                d.i[0] = t;
-                d.i[1] = c.hidden;
-                d.f[0] = c.eps;
-            });
-            let c_xn2 = b.emit(DevOp::RmsNorm, rows.clone(), &[c_pf], |d| {
-                d.t[0] = n.moe_xn2;
-                d.t[1] = n.x;
-                d.t[2] = w.g_pre2;
-                d.i[0] = t;
-                d.i[1] = c.hidden;
-                d.f[0] = c.eps;
-            });
-            // T-token router -> routing_table[T*k] (block-per-token, bit-identical to decode).
-            let c_rt = b.emit(DevOp::MoeRouterGemmaPf, all.clone(), &[c_pf], |d| {
-                d.t[0] = n.moe_tab;
-                d.t[1] = n.x;
-                d.t[2] = w.rproj;
-                d.t[3] = w.rscale;
-                d.t[4] = w.rpes;
-                d.i[0] = c.hidden;
-                d.i[1] = c.n_exp;
-                d.i[2] = c.top_k;
-                d.i[3] = t;
-                d.f[0] = root;
-                d.f[1] = c.eps;
-            });
-            // align/sort (SINGLE block): histogram -> padded prefix -> scatter gather maps.
-            let c_align = b.emit(DevOp::MoeAlignGemmaPf, vec![0], &[c_rt], |d| {
-                d.t[0] = n.moe_meta;
-                d.t[1] = n.moe_tab;
-                d.t[2] = n.moe_rowtok;
-                d.t[3] = n.moe_rowpart;
-                d.t[4] = n.moe_rowgate;
-                d.i[0] = t;
-                d.i[1] = c.n_exp;
-                d.i[2] = c.top_k;
-            });
-            // grouped gate/up GEMM + GeGLU (gathered A, expert-selected B) -> fu_gathered.
-            // beat26b: w8a8 arm = native fp8 tensor-core GEMM (both operands e4m3). xn2 is quantized
-            // to e4m3 (xqh/ash, hidden width) once; the grouped GLU gathers e4m3 rows and dequants
-            // with a_scale[token]*w_scale[chan] in the epilogue. bf16 arm unchanged.
-            let c_dn = if w8a8 {
-                // total_pad rows the align op touched for THIS bucket (matches align's write extent).
-                let moe_total_pad = t * c.top_k + c.n_exp * 128;
-                let c_xn2q = quant(b, n.xqh, n.ash, n.moe_xn2, c.hidden, c_xn2);
-                let c_glu = b.emit(DevOp::MoeGroupGluGemmaPfW8a8, all.clone(), &[c_align, c_xn2q], |d| {
-                    d.t[0] = n.moe_fug;
-                    d.t[1] = n.xqh;      // xn2 e4m3
-                    d.t[2] = w.ewt;      // fp8 expert weights
-                    d.t[3] = n.moe_meta;
-                    d.t[4] = n.moe_rowtok;
-                    d.t[5] = n.ash;      // per-token a_scale
-                    d.t[6] = w.est;      // per-channel weight scales
-                    d.i[0] = c.moe_inter;
-                    d.i[1] = c.hidden;
-                    d.i[2] = c.n_exp;
-                    d.i[5] = c.mlp_act;
-                });
-                // quant the gathered GLU output (total_pad rows, moe_inter width) for the down GEMM.
-                let c_fuq = b.emit(DevOp::QuantFp8, all.clone(), &[c_glu], |d| {
-                    d.t[0] = n.moe_fuq;
-                    d.t[1] = n.moe_fug;
-                    d.t[2] = n.moe_fus;
-                    d.i[0] = moe_total_pad;
-                    d.i[1] = c.moe_inter;
-                });
-                b.emit(DevOp::MoeGroupDownGemmaPfW8a8, all.clone(), &[c_fuq, c_align], |d| {
-                    d.t[0] = n.moe_part;
-                    d.t[1] = n.moe_fuq;  // fu e4m3
-                    d.t[2] = w.ewt;
-                    d.t[3] = n.moe_meta;
-                    d.t[4] = n.moe_rowpart;
-                    d.t[5] = n.moe_rowgate;
-                    d.t[6] = w.est;
-                    d.t[7] = n.moe_fus;  // per-row fu scale
-                    d.i[0] = c.hidden;
-                    d.i[1] = c.moe_inter;
-                    d.i[2] = c.n_exp;
-                })
-            } else {
-            let c_glu = b.emit(DevOp::MoeGroupGluGemmaPf, all.clone(), &[c_align, c_xn2], |d| {
-                d.t[0] = n.moe_fug;
-                d.t[1] = n.moe_xn2;
-                d.t[2] = w.ewt;
-                d.t[3] = n.moe_meta;
-                d.t[4] = n.moe_rowtok;
-                d.i[0] = c.moe_inter;
-                d.i[1] = c.hidden;
-                d.i[2] = c.n_exp;
-                d.i[5] = c.mlp_act; // 0 GeGLU (Gemma)
-            });
-            // grouped down GEMM + gate-scale + scatter -> part[T,k,H].
-            b.emit(DevOp::MoeGroupDownGemmaPf, all.clone(), &[c_glu, c_align], |d| {
-                d.t[0] = n.moe_part;
-                d.t[1] = n.moe_fug;
-                d.t[2] = w.ewt;
-                d.t[3] = n.moe_meta;
-                d.t[4] = n.moe_rowpart;
-                d.t[5] = n.moe_rowgate;
-                d.i[0] = c.hidden;
-                d.i[1] = c.moe_inter;
-                d.i[2] = c.n_exp;
-            })
-            };
-            // T-row combine + sandwich: out[t] = RMSNorm(Σ_slot part[t][slot], g_pf2) + h1[t].
-            let c_comb = b.emit(DevOp::MoeCombineNormGemmaPf, all.clone(), &[c_dn, c_h1], |d| {
-                d.t[0] = n.moe_comb;
-                d.t[1] = n.moe_part;
-                d.t[2] = n.moe_h1;
-                d.t[3] = w.g_pf2;
-                d.i[0] = c.hidden;
-                d.i[1] = c.top_k;
-                d.i[2] = t;
-                d.f[0] = c.eps;
-            });
-            (n.moe_comb, c_comb)
+                // T-row combine + sandwich: out[t] = RMSNorm(Σ_slot part[t][slot], g_pf2) + h1[t].
+                let c_comb = b.emit(
+                    DevOp::MoeCombineNormGemmaPf,
+                    all.clone(),
+                    &[c_dn, c_h1],
+                    |d| {
+                        d.t[0] = n.moe_comb;
+                        d.t[1] = n.moe_part;
+                        d.t[2] = n.moe_h1;
+                        d.t[3] = w.g_pf2;
+                        d.i[0] = c.hidden;
+                        d.i[1] = c.top_k;
+                        d.i[2] = t;
+                        d.f[0] = c.eps;
+                    },
+                );
+                (n.moe_comb, c_comb)
             }
         } else {
             (n.dg, c_d)
@@ -3971,7 +4099,10 @@ const AMAX_BLOCKS: u32 = 64;
 /// correctness question. **Attacking the straggler tail needs the wave assignment inside
 /// `gemv_rows` to become dynamic too; splitting packets alone cannot pay for the rounding.**
 fn gemv_split() -> u32 {
-    std::env::var("PLOW_GEMV_SPLIT").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1)
+    std::env::var("PLOW_GEMV_SPLIT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1)
 }
 
 /// E5 (rtx-19): PLOW_FUSE_ARGMAX fuses the greedy-argmax epilogue into the lm_head GEMV
@@ -4085,7 +4216,11 @@ pub struct LeanReport {
 impl LeanReport {
     /// The gate did not run, for `reason`.
     pub fn skipped(reason: impl Into<String>) -> LeanReport {
-        LeanReport { verified: false, oracle: false, reason: Some(reason.into()) }
+        LeanReport {
+            verified: false,
+            oracle: false,
+            reason: Some(reason.into()),
+        }
     }
 }
 
@@ -4251,7 +4386,17 @@ impl<'a> DenseGqaEmitter<'a> {
     ) -> (Self, Vec<packet::devbuild::TensorDecl>, Vec<GenTensor>) {
         let mut tb = Builder::new(n_cu);
         let tn = declare(
-            &mut tb, c, ctx, ns_pre, fp8, w8a8, fp8_kv, fp8_kv_full, dbatch, moe_pf, block.clone(),
+            &mut tb,
+            c,
+            ctx,
+            ns_pre,
+            fp8,
+            w8a8,
+            fp8_kv,
+            fp8_kv_full,
+            dbatch,
+            moe_pf,
+            block.clone(),
         );
         let tensors = tb.tensors();
         let gen = tb.gen_tensors();
@@ -4277,16 +4422,43 @@ impl DevblobEmitter for DenseGqaEmitter<'_> {
     fn emit_prefill(&self, b: &mut Builder, t: u32) {
         let mut dummy = Vec::new();
         emit_phase(
-            b, self.c, self.ls, &self.tn, t, self.ctx, Mode::Prefill, self.n_cu, &mut dummy,
-            self.fp8, self.w8a8, self.fp8_kv, self.fp8_kv_full, self.block.clone(),
-            self.block_mode, self.amd,
+            b,
+            self.c,
+            self.ls,
+            &self.tn,
+            t,
+            self.ctx,
+            Mode::Prefill,
+            self.n_cu,
+            &mut dummy,
+            self.fp8,
+            self.w8a8,
+            self.fp8_kv,
+            self.fp8_kv_full,
+            self.block.clone(),
+            self.block_mode,
+            self.amd,
         );
     }
     fn emit_decode(&self, b: &mut Builder, dbatch: u32, dmode: Mode, kv_rows: &mut Vec<u32>) {
         // Decode passes w8a8=false, exactly as the historical call site did.
         emit_phase(
-            b, self.c, self.ls, &self.tn, dbatch, self.ctx, dmode, self.n_cu, kv_rows, self.fp8,
-            false, self.fp8_kv, self.fp8_kv_full, self.block.clone(), self.block_mode, self.amd,
+            b,
+            self.c,
+            self.ls,
+            &self.tn,
+            dbatch,
+            self.ctx,
+            dmode,
+            self.n_cu,
+            kv_rows,
+            self.fp8,
+            false,
+            self.fp8_kv,
+            self.fp8_kv_full,
+            self.block.clone(),
+            self.block_mode,
+            self.amd,
         );
     }
 }
@@ -4373,8 +4545,14 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     if l2_layout.is_some()
         && matches!(
             model_type.as_str(),
-            "glm_moe_dsa" | "kimi_k2" | "kimi" | "deepseek_v3" | "deepseek_v2" | "nemotron_h"
-                | "nemotron3" | "nemotron"
+            "glm_moe_dsa"
+                | "kimi_k2"
+                | "kimi"
+                | "deepseek_v3"
+                | "deepseek_v2"
+                | "nemotron_h"
+                | "nemotron3"
+                | "nemotron"
         )
     {
         eprintln!(
@@ -4402,7 +4580,16 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         // weight, which is loud and correct but is not what someone who has not
         // read the report is expecting.
         if std::env::var("K3_FULL").ok().as_deref() == Some("1") {
-            mla::k3_emit_full(&dir, ctx, &out, n_cu, tp, rope_gen, verify.as_ref(), l2_layout);
+            mla::k3_emit_full(
+                &dir,
+                ctx,
+                &out,
+                n_cu,
+                tp,
+                rope_gen,
+                verify.as_ref(),
+                l2_layout,
+            );
             return;
         }
         mla::kimi_k3_emit(&dir, ctx, tp, block_spec.as_deref());
@@ -4418,9 +4605,17 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         // to it) applied to a safety gate, and it is exactly why the manifest now
         // has to state whether the gate ran.
         match &block_spec {
-            Some(spec) => {
-                glm_emit_block(&dir, ctx, &out, n_cu, tp, spec, rope_gen, &arch, verify.as_ref())
-            }
+            Some(spec) => glm_emit_block(
+                &dir,
+                ctx,
+                &out,
+                n_cu,
+                tp,
+                spec,
+                rope_gen,
+                &arch,
+                verify.as_ref(),
+            ),
             None => glm_main(&dir, ctx, &out, n_cu, tp, rope_gen, &arch, verify.as_ref()),
         }
         return;
@@ -4469,8 +4664,19 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // function, so run_verified is now pure dispatch (GLM/Kimi/Nemotron early-return
     // above; everything else is dense). Byte-identical — the body moved verbatim.
     emit_dense_gqa(
-        dir, ctx, out, n_cu, tp, block_spec, embed_cubin, embed_hsaco, rope_gen, l2_layout, gpu,
-        arch, verify,
+        dir,
+        ctx,
+        out,
+        n_cu,
+        tp,
+        block_spec,
+        embed_cubin,
+        embed_hsaco,
+        rope_gen,
+        l2_layout,
+        gpu,
+        arch,
+        verify,
     );
 }
 
@@ -4748,15 +4954,11 @@ fn check_group_routing_supported(m: &Model, amd: bool, arch: &str) {
     if amd {
         return;
     }
-    let grouped = m
-        .progs
-        .iter()
-        .flat_map(|p| p.insts.iter())
-        .find(|i| {
-            (i.op == DevOp::MoeRouterTopk as u16 || i.op == DevOp::MoeRouterTopkPf as u16)
-                && i.i[6] > 1
-                && i.i[7] < i.i[6]
-        });
+    let grouped = m.progs.iter().flat_map(|p| p.insts.iter()).find(|i| {
+        (i.op == DevOp::MoeRouterTopk as u16 || i.op == DevOp::MoeRouterTopkPf as u16)
+            && i.i[6] > 1
+            && i.i[7] < i.i[6]
+    });
     if let Some(i) = grouped {
         panic!(
             "group-limited MoE routing (n_group = {}, topk_group = {}) is not implemented for \
@@ -4835,7 +5037,9 @@ fn warn_uniseg_on_amd(amd: bool) {
 /// with no arm for an opcode at all — surfaces as a fault at first launch with nothing pointing
 /// back here.
 fn warn_arch_gpu_vendor_mismatch(arch: &str, gpu: &str) {
-    let Some(spec) = hwspec::registry::lookup(gpu) else { return };
+    let Some(spec) = hwspec::registry::lookup(gpu) else {
+        return;
+    };
     let arch_amd = arch.starts_with("gfx");
     let arch_nv = arch.starts_with("sm_");
     let gpu_amd = spec.vendor == hwspec::Vendor::Amd;
@@ -4881,8 +5085,7 @@ fn check_fp8_a_scale_bound(m: &Model, arch: &str, gpu: &str) {
     //
     // So: AMD if EITHER signal says AMD. A false positive costs an sm_120 user one flag and a clear
     // message; a false negative is the null dereference this exists to stop.
-    let gpu_is_amd =
-        hwspec::registry::lookup(gpu).is_some_and(|s| s.vendor == hwspec::Vendor::Amd);
+    let gpu_is_amd = hwspec::registry::lookup(gpu).is_some_and(|s| s.vendor == hwspec::Vendor::Amd);
     if !arch.starts_with("gfx") && !gpu_is_amd {
         return;
     }
@@ -4895,7 +5098,11 @@ fn check_fp8_a_scale_bound(m: &Model, arch: &str, gpu: &str) {
     //
     // `GFX950_RUNGS` is the table `pick_tile` selects from, so reading the fp8 column of it asks
     // the same question the emitter answers. A sixth rung is now covered by construction.
-    let fp8_gemm = |op: u16| GFX950_RUNGS.iter().any(|(_, fp8, _, _, _, _)| *fp8 as u16 == op);
+    let fp8_gemm = |op: u16| {
+        GFX950_RUNGS
+            .iter()
+            .any(|(_, fp8, _, _, _, _)| *fp8 as u16 == op)
+    };
     let bad = m
         .progs
         .iter()
@@ -4938,7 +5145,11 @@ fn emit_dense_gqa(
 ) {
     // Empty --gpu ⇒ unknown target (0), not fnv("") — so the header stamp is 0
     // and unspecified-GPU blobs stay byte-stable (e.g. the golden test).
-    let target_fp = if gpu.is_empty() { 0 } else { packet::devbuild::gpu_fingerprint(&gpu) };
+    let target_fp = if gpu.is_empty() {
+        0
+    } else {
+        packet::devbuild::gpu_fingerprint(&gpu)
+    };
     // Resolved ONCE, at the top, because several decisions below depend on it — the prefill bucket
     // ladder, the lm_head arm, `deny_uniseg`, and the opcode-coverage gate. Recomputing it per site
     // is how two of the three ungated sm_120 flags stayed ungated. Same predicate `run_verified`
@@ -5089,8 +5300,10 @@ fn emit_dense_gqa(
     const LADDER_BM: u32 = 128;
     const LADDER_BN: u32 = 128;
     let cap = ctx.min(max_chunk(c.window));
-    let shipped: Vec<u32> =
-        [128u32, 512, 1024, 2048, 4096, 8192].into_iter().filter(|&x| x <= cap).collect();
+    let shipped: Vec<u32> = [128u32, 512, 1024, 2048, 4096, 8192]
+        .into_iter()
+        .filter(|&x| x <= cap)
+        .collect();
     // PLOW_PF_LADDER is sm_120-only, and its own comment above says why: the rungs are derived from
     // the 128x128 sm_120 tile, and "the AMD bodies tile differently, so the ladder is only derived
     // on the NVIDIA path; gate it on the flag rather than guessing the target's tile from here."
@@ -5166,16 +5379,27 @@ fn emit_dense_gqa(
     // this flag). beat26b: fp8 grouped MoE prefill is now implemented for the w8a8 path (ops 81/82),
     // so it is enabled under PLOW_W8A8; plain fp8 (w8a16 dequant) grouped prefill is still not
     // implemented and stays decode-only.
-    let moe_pf = c.moe
-        && (!fp8 || w8a8)
-        && std::env::var("PLOW_MOE_PREFILL").ok().as_deref() != Some("0");
+    let moe_pf =
+        c.moe && (!fp8 || w8a8) && std::env::var("PLOW_MOE_PREFILL").ok().as_deref() != Some("0");
 
     // Phase 1 (plans/devgen-trait-refactor.md): the DenseGqaEmitter owns the dense
     // tensor declaration (declare) and the emit_phase call sites. Byte-identical —
     // `new` forwards to the same `declare`, `emit_*` to the same `emit_phase`.
     let (emitter, tensors, gen) = DenseGqaEmitter::new(
-        &c, &ls, n_cu, ctx, fp8, w8a8, fp8_kv, fp8_kv_full, block.clone(), block_mode, ns_pre,
-        dbatch, moe_pf, amd,
+        &c,
+        &ls,
+        n_cu,
+        ctx,
+        fp8,
+        w8a8,
+        fp8_kv,
+        fp8_kv_full,
+        block.clone(),
+        block_mode,
+        ns_pre,
+        dbatch,
+        moe_pf,
+        amd,
     );
 
     let mut progs = Vec::new();
@@ -5433,7 +5657,6 @@ fn emit_dense_gqa(
     );
 }
 
-
 fn split2(n: u32, a: u32, b: u32) -> (Vec<u32>, Vec<u32>) {
     let s = (((n as u64 * a as u64) / (a + b).max(1) as u64).max(1) as u32).min(n - 1);
     ((0..s).collect(), (s..n).collect())
@@ -5461,10 +5684,7 @@ mod gemma_router_emit_tests {
         router_program_b(split_plan, 1)
     }
 
-    fn router_program_b(
-        split_plan: Option<(u32, DevOp)>,
-        nrow: u32,
-    ) -> packet::devbuild::Program {
+    fn router_program_b(split_plan: Option<(u32, DevOp)>, nrow: u32) -> packet::devbuild::Program {
         let mut b = Builder::new(188);
         let dep = b.emit(DevOp::Nop, vec![0], &[], |_| {});
         let _ = emit_gemma_moe_router(
@@ -5625,9 +5845,18 @@ mod gfx950_coverage_tests {
             .downcast_ref::<String>()
             .map(String::as_str)
             .unwrap_or("");
-        assert!(msg.contains("kimi_k3"), "refusal must name the model: {msg}");
-        assert!(msg.contains("PLOW_MOE_MAX_TOPK"), "must name the limit: {msg}");
-        assert!(msg.contains("uninitialised"), "must say what goes wrong: {msg}");
+        assert!(
+            msg.contains("kimi_k3"),
+            "refusal must name the model: {msg}"
+        );
+        assert!(
+            msg.contains("PLOW_MOE_MAX_TOPK"),
+            "must name the limit: {msg}"
+        );
+        assert!(
+            msg.contains("uninitialised"),
+            "must say what goes wrong: {msg}"
+        );
     }
 
     /// The list must equal what `interp.hip` actually dispatches — PARSED, not restated. A
@@ -5654,16 +5883,20 @@ mod gfx950_coverage_tests {
             let t = line.trim();
             // `case PLOW_DOP_X:` — the switch arms.
             if let Some(r) = t.strip_prefix("case PLOW_DOP_") {
-                let name: String =
-                    r.chars().take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_').collect();
+                let name: String = r
+                    .chars()
+                    .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                    .collect();
                 found.push(format!("PLOW_DOP_{name}"));
             }
             // `in->op == PLOW_DOP_X` — the collectives, dispatched ahead of the switch.
             let mut rest = t;
             while let Some(i) = rest.find("op == PLOW_DOP_") {
                 let r = &rest[i + "op == PLOW_DOP_".len()..];
-                let name: String =
-                    r.chars().take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_').collect();
+                let name: String = r
+                    .chars()
+                    .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                    .collect();
                 found.push(format!("PLOW_DOP_{name}"));
                 rest = &r[name.len()..];
             }
@@ -5693,17 +5926,34 @@ mod gfx950_coverage_tests {
             "if AMD ever gains a GEMV_ARGMAX arm this test should be re-pointed, not deleted"
         );
         let i = packet::dev::DevInst {
-            op: DevOp::GemvArgmax as u16, blocks: 1, ..Default::default()
+            op: DevOp::GemvArgmax as u16,
+            blocks: 1,
+            ..Default::default()
         };
         let p = packet::devbuild::Program {
             hier_base: 0,
-            n_cu: 4, n_counter: 0, insts: vec![i], stream: vec![], stream_ofs: vec![],
-            stream_len: vec![], waits: vec![], succs: vec![], tensors: vec![],
-            gq_stream: vec![], gq_seg_ofs: vec![], l2_sms: 0, l2_domains: 0,
+            n_cu: 4,
+            n_counter: 0,
+            insts: vec![i],
+            stream: vec![],
+            stream_ofs: vec![],
+            stream_len: vec![],
+            waits: vec![],
+            succs: vec![],
+            tensors: vec![],
+            gq_stream: vec![],
+            gq_seg_ofs: vec![],
+            l2_sms: 0,
+            l2_domains: 0,
         };
         let m = Model {
-            n_cu: 256, target: 0, tensors: vec![], progs: vec![p],
-            kv_row_insts: vec![], prog_t: vec![1], gen: vec![],
+            n_cu: 256,
+            target: 0,
+            tensors: vec![],
+            progs: vec![p],
+            kv_row_insts: vec![],
+            prog_t: vec![1],
+            gen: vec![],
         };
         check_gfx950_opcode_coverage(&m, true);
     }
@@ -5713,32 +5963,70 @@ mod gfx950_coverage_tests {
     fn covered_opcodes_pass_and_nvidia_is_never_checked() {
         let p = packet::devbuild::Program {
             hier_base: 0,
-            n_cu: 4, n_counter: 0,
+            n_cu: 4,
+            n_counter: 0,
             insts: vec![
-                packet::dev::DevInst { op: DevOp::Gemv as u16, blocks: 1, ..Default::default() },
-                packet::dev::DevInst { op: DevOp::XReduce as u16, blocks: 1, ..Default::default() },
+                packet::dev::DevInst {
+                    op: DevOp::Gemv as u16,
+                    blocks: 1,
+                    ..Default::default()
+                },
+                packet::dev::DevInst {
+                    op: DevOp::XReduce as u16,
+                    blocks: 1,
+                    ..Default::default()
+                },
             ],
-            stream: vec![], stream_ofs: vec![], stream_len: vec![], waits: vec![], succs: vec![],
-            tensors: vec![], gq_stream: vec![], gq_seg_ofs: vec![], l2_sms: 0, l2_domains: 0,
+            stream: vec![],
+            stream_ofs: vec![],
+            stream_len: vec![],
+            waits: vec![],
+            succs: vec![],
+            tensors: vec![],
+            gq_stream: vec![],
+            gq_seg_ofs: vec![],
+            l2_sms: 0,
+            l2_domains: 0,
         };
         let m = Model {
-            n_cu: 256, target: 0, tensors: vec![], progs: vec![p],
-            kv_row_insts: vec![], prog_t: vec![1], gen: vec![],
+            n_cu: 256,
+            target: 0,
+            tensors: vec![],
+            progs: vec![p],
+            kv_row_insts: vec![],
+            prog_t: vec![1],
+            gen: vec![],
         };
         check_gfx950_opcode_coverage(&m, true);
         // The Gemma-MoE family has no AMD arm at all; on an NVIDIA target that must not be checked.
         let p2 = packet::devbuild::Program {
             hier_base: 0,
-            n_cu: 4, n_counter: 0,
+            n_cu: 4,
+            n_counter: 0,
             insts: vec![packet::dev::DevInst {
-                op: DevOp::MoeRouterGemma as u16, blocks: 1, ..Default::default()
+                op: DevOp::MoeRouterGemma as u16,
+                blocks: 1,
+                ..Default::default()
             }],
-            stream: vec![], stream_ofs: vec![], stream_len: vec![], waits: vec![], succs: vec![],
-            tensors: vec![], gq_stream: vec![], gq_seg_ofs: vec![], l2_sms: 0, l2_domains: 0,
+            stream: vec![],
+            stream_ofs: vec![],
+            stream_len: vec![],
+            waits: vec![],
+            succs: vec![],
+            tensors: vec![],
+            gq_stream: vec![],
+            gq_seg_ofs: vec![],
+            l2_sms: 0,
+            l2_domains: 0,
         };
         let m2 = Model {
-            n_cu: 170, target: 0, tensors: vec![], progs: vec![p2],
-            kv_row_insts: vec![], prog_t: vec![1], gen: vec![],
+            n_cu: 170,
+            target: 0,
+            tensors: vec![],
+            progs: vec![p2],
+            kv_row_insts: vec![],
+            prog_t: vec![1],
+            gen: vec![],
         };
         check_gfx950_opcode_coverage(&m2, false);
     }
@@ -5767,7 +6055,14 @@ mod gfx950_coverage_tests {
     /// The emitter files. `manifest.rs` is EXCLUDED even though it names opcodes: it classifies a
     /// finished stream (`DevOp::GemvMxfp4 => s.mxfp4_proj = true`), so counting it as an emit site
     /// would let a reporter vouch for an arm no emitter reaches — the exact confusion this checks.
-    const EMITTER_SRC: &[&str] = &["lib.rs", "mla.rs", "block.rs", "ladder.rs", "kda.rs", "k3.rs"];
+    const EMITTER_SRC: &[&str] = &[
+        "lib.rs",
+        "mla.rs",
+        "block.rs",
+        "ladder.rs",
+        "kda.rs",
+        "k3.rs",
+    ];
 
     /// Arms gfx950 dispatches that NOTHING emits, each with why that is deliberate.
     ///
@@ -5804,7 +6099,9 @@ mod gfx950_coverage_tests {
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut named: std::collections::BTreeSet<String> = Default::default();
         for f in EMITTER_SRC {
-            let Ok(text) = std::fs::read_to_string(src_dir.join(f)) else { continue };
+            let Ok(text) = std::fs::read_to_string(src_dir.join(f)) else {
+                continue;
+            };
             for line in text.lines() {
                 // Comments are not emit sites. Without this, the paragraph explaining WHY an arm is
                 // unwired would itself satisfy the check.
@@ -5909,15 +6206,15 @@ mod gfx950_coverage_tests {
     /// the object, then compare it against the packet where the two finally meet.
     const PRECISION_KNOBS: &[(&str, Knob, Knob)] = &[
         // knob            dense-GQA (lib.rs)                    MLA/MoE (mla.rs)
-        ("PLOW_FP8",       Knob::Wired,                          Knob::Wired),
-        ("PLOW_W8A16",     Knob::Wired,                          Knob::Wired),
-        ("PLOW_W8A8",      Knob::Wired,                          Knob::Refused),
-        ("PLOW_MXFP4",     Knob::Refused,                        Knob::Wired),
+        ("PLOW_FP8", Knob::Wired, Knob::Wired),
+        ("PLOW_W8A16", Knob::Wired, Knob::Wired),
+        ("PLOW_W8A8", Knob::Wired, Knob::Refused),
+        ("PLOW_MXFP4", Knob::Refused, Knob::Wired),
         // The K3 full-model path in mla.rs now emits the compressed-latent fp8 twins. Other MLA
         // entry points still need the same wiring, but the family no longer silently ignores the
         // knob universally; K3's structural tests pin the allocation and opcode swap.
-        ("PLOW_FP8_KV",    Knob::Wired,                          Knob::Wired),
-        ("PLOW_KV_FP8",    Knob::Wired,                          Knob::Wired),
+        ("PLOW_FP8_KV", Knob::Wired, Knob::Wired),
+        ("PLOW_KV_FP8", Knob::Wired, Knob::Wired),
     ];
 
     /// CHECK B — the table above is true of the sources.
@@ -5935,7 +6232,10 @@ mod gfx950_coverage_tests {
         let read = |f: &str| std::fs::read_to_string(src_dir.join(f)).unwrap_or_default();
         let dense = read("lib.rs");
         let mla = read("mla.rs");
-        assert!(!dense.is_empty() && !mla.is_empty(), "emitter sources not readable");
+        assert!(
+            !dense.is_empty() && !mla.is_empty(),
+            "emitter sources not readable"
+        );
         for (knob, d, m) in PRECISION_KNOBS {
             for (family, file, src, state) in [
                 ("dense-GQA", "lib.rs", &dense, d),
@@ -6034,7 +6334,9 @@ mod mla_rope_tests {
     /// checkpoint on disk. MUST stay identical to the three lines in `mla::cfg_glm`.
     fn resolve(v: &Value) -> Option<f64> {
         let rp = &v["rope_parameters"];
-        let theta = v["rope_theta"].as_f64().or_else(|| rp["rope_theta"].as_f64());
+        let theta = v["rope_theta"]
+            .as_f64()
+            .or_else(|| rp["rope_theta"].as_f64());
         super::require_mla_rope(
             theta,
             v["mla_use_nope"].as_bool().unwrap_or(false),
@@ -6066,8 +6368,15 @@ mod mla_rope_tests {
             "model_type": "some_other_mla",
             "rope_parameters": { "rope_theta": 123_457.0, "rope_type": "default" },
         });
-        assert_eq!(resolve(&other), other["rope_parameters"]["rope_theta"].as_f64());
-        assert_ne!(resolve(&other), resolve(&v), "two configs must not resolve to one theta");
+        assert_eq!(
+            resolve(&other),
+            other["rope_parameters"]["rope_theta"].as_f64()
+        );
+        assert_ne!(
+            resolve(&other),
+            resolve(&v),
+            "two configs must not resolve to one theta"
+        );
     }
 
     /// The flat spelling still works and takes precedence.
@@ -6098,7 +6407,10 @@ mod mla_rope_tests {
             .downcast_ref::<String>()
             .cloned()
             .unwrap_or_else(|| msg.downcast_ref::<&str>().map(|s| s.to_string()).unwrap());
-        assert!(msg.contains("krot"), "refusal must name the dangling cache write; got: {msg}");
+        assert!(
+            msg.contains("krot"),
+            "refusal must name the dangling cache write; got: {msg}"
+        );
     }
 
     /// Contradiction: a theta AND `mla_use_nope`. One of the two is wrong and the compiler
@@ -6161,8 +6473,14 @@ mod fp8_key_tests {
         assert_eq!(w, "fp8/model.layers.3.self_attn.q_proj.weight");
         assert_eq!(s, "fp8/model.layers.3.self_attn.q_proj.weight_scale");
         // The key is the packet name VERBATIM: no strip, no rewrite, nothing to apply twice.
-        assert_eq!(w.strip_prefix("fp8/"), Some("model.layers.3.self_attn.q_proj.weight"));
-        assert!(w.starts_with("fp8/"), "the prefix is part of the key, not a routing marker");
+        assert_eq!(
+            w.strip_prefix("fp8/"),
+            Some("model.layers.3.self_attn.q_proj.weight")
+        );
+        assert!(
+            w.starts_with("fp8/"),
+            "the prefix is part of the key, not a routing marker"
+        );
     }
 
     /// An `fp8/` twin is checkpoint-bound weight bytes, and every reader agrees on that because
@@ -6180,7 +6498,10 @@ mod fp8_key_tests {
         assert!(w("fp8/model.layers.0.mlp.down_proj.weight"));
         assert!(w("fp8/model.layers.0.mlp.down_proj.weight_scale"));
         assert!(w("model.layers.0.mlp.down_proj.weight"));
-        assert!(w("lm_head.weight"), "untied head: declared at the top level, and a weight");
+        assert!(
+            w("lm_head.weight"),
+            "untied head: declared at the top level, and a weight"
+        );
         assert!(!w("act.x"), "activations are not weight bytes");
         assert!(!w("in.pos"));
     }
@@ -6192,7 +6513,11 @@ mod fp8_key_tests {
     #[test]
     fn fp8_scale_is_per_output_channel_and_multiplied() {
         let (out, inp) = (4096u64, 2560u64);
-        assert_eq!(out * F32, 16384, "scale vector is [out] f32, not [out,in] and not [in]");
+        assert_eq!(
+            out * F32,
+            16384,
+            "scale vector is [out] f32, not [out,in] and not [in]"
+        );
         // Round-trip the convention the quantizer documents, at f32 precision.
         let w: f32 = -0.37;
         let amax: f32 = 0.37;
@@ -6216,19 +6541,38 @@ mod fp8_profile_tests {
     fn prog(insts: Vec<DevInst>) -> Program {
         Program {
             hier_base: 0,
-            n_cu: 4, n_counter: 0, insts, stream: vec![], stream_ofs: vec![],
-            stream_len: vec![], waits: vec![], succs: vec![], tensors: vec![],
-            gq_stream: vec![], gq_seg_ofs: vec![], l2_sms: 0, l2_domains: 0,
+            n_cu: 4,
+            n_counter: 0,
+            insts,
+            stream: vec![],
+            stream_ofs: vec![],
+            stream_len: vec![],
+            waits: vec![],
+            succs: vec![],
+            tensors: vec![],
+            gq_stream: vec![],
+            gq_seg_ofs: vec![],
+            l2_sms: 0,
+            l2_domains: 0,
         }
     }
 
     /// `t[3]` is a_scale. `TENSOR_NONE` there is w8a16; a bound handle is w8a8.
     fn model(a_scale: u32) -> Model {
-        let mut i = DevInst { op: DevOp::GemmFp8 as u16, blocks: 1, ..Default::default() };
+        let mut i = DevInst {
+            op: DevOp::GemmFp8 as u16,
+            blocks: 1,
+            ..Default::default()
+        };
         i.t[3] = a_scale;
         Model {
-            n_cu: 256, target: 0, tensors: vec![], progs: vec![prog(vec![i])],
-            kv_row_insts: vec![], prog_t: vec![128], gen: vec![],
+            n_cu: 256,
+            target: 0,
+            tensors: vec![],
+            progs: vec![prog(vec![i])],
+            kv_row_insts: vec![],
+            prog_t: vec![128],
+            gen: vec![],
         }
     }
 
@@ -6265,9 +6609,15 @@ mod fp8_profile_tests {
     fn target_is_amd_reads_either_signal() {
         assert!(target_is_amd("gfx950", ""));
         assert!(target_is_amd("", "MI350X"));
-        assert!(target_is_amd("sm_120a", "MI350X"), "the gpu is enough on its own");
+        assert!(
+            target_is_amd("sm_120a", "MI350X"),
+            "the gpu is enough on its own"
+        );
         assert!(!target_is_amd("sm_120a", "RTX5090"));
-        assert!(!target_is_amd("", ""), "no target => unchanged emission (golden tests)");
+        assert!(
+            !target_is_amd("", ""),
+            "no target => unchanged emission (golden tests)"
+        );
     }
 
     /// EVERY fp8 rung is gated, not just the three the ladder started with.
@@ -6284,11 +6634,20 @@ mod fp8_profile_tests {
     #[test]
     fn every_fp8_rung_is_refused_when_a_scale_is_unbound() {
         for (_, fp8, _, bm, bn, _) in GFX950_RUNGS {
-            let mut i = DevInst { op: fp8 as u16, blocks: 1, ..Default::default() };
+            let mut i = DevInst {
+                op: fp8 as u16,
+                blocks: 1,
+                ..Default::default()
+            };
             i.t[3] = TENSOR_NONE;
             let m = Model {
-                n_cu: 256, target: 0, tensors: vec![], progs: vec![prog(vec![i])],
-                kv_row_insts: vec![], prog_t: vec![128], gen: vec![],
+                n_cu: 256,
+                target: 0,
+                tensors: vec![],
+                progs: vec![prog(vec![i])],
+                kv_row_insts: vec![],
+                prog_t: vec![128],
+                gen: vec![],
             };
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 check_fp8_a_scale_bound(&m, "gfx950", "")
@@ -6305,10 +6664,19 @@ mod fp8_profile_tests {
     /// A bf16 packet has no fp8 GEMM at all and must sail through on every target.
     #[test]
     fn bf16_packets_are_untouched() {
-        let i = DevInst { op: DevOp::Gemm as u16, blocks: 1, ..Default::default() };
+        let i = DevInst {
+            op: DevOp::Gemm as u16,
+            blocks: 1,
+            ..Default::default()
+        };
         let m = Model {
-            n_cu: 256, target: 0, tensors: vec![], progs: vec![prog(vec![i])],
-            kv_row_insts: vec![], prog_t: vec![128], gen: vec![],
+            n_cu: 256,
+            target: 0,
+            tensors: vec![],
+            progs: vec![prog(vec![i])],
+            kv_row_insts: vec![],
+            prog_t: vec![128],
+            gen: vec![],
         };
         check_fp8_a_scale_bound(&m, "gfx950", "");
     }
@@ -6322,8 +6690,7 @@ mod pick_tile_tests {
     //! fills the CUs on the underutilized shapes AND does not regress the ones that already
     //! saturate. `n_cu = 256` (MI350X).
     use super::{
-        gemm_lds_bytes, glu_era_inventory, hwspec, pick_tile, select_gemm_over, DevOp,
-        GFX950_TILES,
+        gemm_lds_bytes, glu_era_inventory, hwspec, pick_tile, select_gemm_over, DevOp, GFX950_TILES,
     };
     use costmodel::cost::{dma_cycles, macs_cycles};
     use costmodel::MmaDtype;
@@ -6370,8 +6737,9 @@ mod pick_tile_tests {
     }
 
     const MS: [u32; 12] = [1, 8, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384];
-    const NS: [u32; 12] =
-        [128, 512, 1024, 2048, 2560, 4096, 5376, 8192, 9728, 14336, 16384, 21504];
+    const NS: [u32; 12] = [
+        128, 512, 1024, 2048, 2560, 4096, 5376, 8192, 9728, 14336, 16384, 21504,
+    ];
     const KS: [u32; 8] = [128, 512, 2560, 4096, 5376, 8192, 14336, 21504];
     const CUS: [u32; 5] = [1, 64, 128, 256, 304];
 
@@ -6428,7 +6796,10 @@ mod pick_tile_tests {
                             .iter()
                             .filter(|s| s.quant == QuantScheme::None)
                             .map(|s| {
-                                (s.id.0, tile_cost(spec, s, m as i64, n as i64, k as i64, n_cu))
+                                (
+                                    s.id.0,
+                                    tile_cost(spec, s, m as i64, n as i64, k as i64, n_cu),
+                                )
                             })
                             .collect();
                         let best = costs.iter().map(|c| c.1).min().unwrap();
@@ -6507,27 +6878,124 @@ mod pick_tile_tests {
     fn the_new_rungs_change_the_fill_limited_shapes_and_leave_the_rest() {
         for (m, n, k, legacy, new, label) in [
             // Unchanged: already on the narrowest rung, and it is already optimal.
-            (128u32, 128u32, 2816u32, DevOp::GemmSmall, DevOp::GemmSmall, "gemma26b router"),
-            (128, 256, 6144, DevOp::GemmSmall, DevOp::GemmSmall, "glm52 router"),
-            (128, 576, 6144, DevOp::GemmSmall, DevOp::GemmSmall, "glm52 kv_a_proj"),
-            (128, 576, 7168, DevOp::GemmSmall, DevOp::GemmSmall, "kimi kv_a_proj"),
-            (128, 512, 3840, DevOp::GemmSmall, DevOp::GemmSmall, "g12b k_proj global"),
-            (128, 2112, 2816, DevOp::GemmSmall, DevOp::GemmSmall, "g26b dense gate/up"),
-            (256, 8192, 5376, DevOp::GemmSmall, DevOp::GemmSmall, "g31b q M=256"),
-            (512, 8192, 5376, DevOp::GemmMed, DevOp::GemmMed, "g31b q M=512"),
+            (
+                128u32,
+                128u32,
+                2816u32,
+                DevOp::GemmSmall,
+                DevOp::GemmSmall,
+                "gemma26b router",
+            ),
+            (
+                128,
+                256,
+                6144,
+                DevOp::GemmSmall,
+                DevOp::GemmSmall,
+                "glm52 router",
+            ),
+            (
+                128,
+                576,
+                6144,
+                DevOp::GemmSmall,
+                DevOp::GemmSmall,
+                "glm52 kv_a_proj",
+            ),
+            (
+                128,
+                576,
+                7168,
+                DevOp::GemmSmall,
+                DevOp::GemmSmall,
+                "kimi kv_a_proj",
+            ),
+            (
+                128,
+                512,
+                3840,
+                DevOp::GemmSmall,
+                DevOp::GemmSmall,
+                "g12b k_proj global",
+            ),
+            (
+                128,
+                2112,
+                2816,
+                DevOp::GemmSmall,
+                DevOp::GemmSmall,
+                "g26b dense gate/up",
+            ),
+            (
+                256,
+                8192,
+                5376,
+                DevOp::GemmSmall,
+                DevOp::GemmSmall,
+                "g31b q M=256",
+            ),
+            (
+                512,
+                8192,
+                5376,
+                DevOp::GemmMed,
+                DevOp::GemmMed,
+                "g31b q M=512",
+            ),
             // Changed: fill- or quantisation-limited at 256x256.
-            (1024, 8192, 5376, DevOp::Gemm, DevOp::GemmWide, "g31b q M=1024"),
-            (4096, 2048, 5376, DevOp::Gemm, DevOp::GemmWide, "g31b kv global M=4096"),
-            (8192, 1024, 4096, DevOp::Gemm, DevOp::GemmWide, "llama-8B k/v M=8192"),
-            (4096, 5376, 8192, DevOp::Gemm, DevOp::GemmC5, "g31b o M=4096"),
-            (4096, 2560, 4096, DevOp::Gemm, DevOp::GemmC5, "qwen o M=4096"),
-            (2048, 5376, 21504, DevOp::Gemm, DevOp::GemmC5, "g31b down M=2048"),
+            (
+                1024,
+                8192,
+                5376,
+                DevOp::Gemm,
+                DevOp::GemmWide,
+                "g31b q M=1024",
+            ),
+            (
+                4096,
+                2048,
+                5376,
+                DevOp::Gemm,
+                DevOp::GemmWide,
+                "g31b kv global M=4096",
+            ),
+            (
+                8192,
+                1024,
+                4096,
+                DevOp::Gemm,
+                DevOp::GemmWide,
+                "llama-8B k/v M=8192",
+            ),
+            (
+                4096,
+                5376,
+                8192,
+                DevOp::Gemm,
+                DevOp::GemmC5,
+                "g31b o M=4096",
+            ),
+            (
+                4096,
+                2560,
+                4096,
+                DevOp::Gemm,
+                DevOp::GemmC5,
+                "qwen o M=4096",
+            ),
+            (
+                2048,
+                5376,
+                21504,
+                DevOp::Gemm,
+                DevOp::GemmC5,
+                "g31b down M=2048",
+            ),
         ] {
             assert_eq!(pt_legacy_rungs(m, n, k, N_CU), legacy, "legacy: {label}");
             assert_eq!(pt(m, n, k), new, "new: {label}");
         }
     }
-
 
     #[test]
     fn mxfp4_prefill_is_tile_selected_not_pinned() {
@@ -6593,29 +7061,53 @@ mod pick_tile_tests {
         // 22x10 = 220 (86%). MEASURED on the sibling o_proj shape (4096x2560x4096, whole GPU,
         // runtime/ubench/gemm_tile_sweep.c): 256x256 587.7 TF/s vs 192x256 940.6 — **1.60x**,
         // the largest single-shape win in the campaign.
-        assert_eq!(pt(4096, 2560, 9728), DevOp::GemmC5, "down_proj (fill: 62.5% -> 86%)");
+        assert_eq!(
+            pt(4096, 2560, 9728),
+            DevOp::GemmC5,
+            "down_proj (fill: 62.5% -> 86%)"
+        );
     }
 
     #[test]
     fn gemma31b_tiles() {
         // hidden 5376, inter 21504. The projections that genuinely saturate 256 CUs at 256x256
         // keep it — the campaign must not drag them onto a smaller tile.
-        assert_eq!(pt(4096, 8192, 5376), DevOp::Gemm, "q sliding (32x32 = 1024 tiles)");
+        assert_eq!(
+            pt(4096, 8192, 5376),
+            DevOp::Gemm,
+            "q sliding (32x32 = 1024 tiles)"
+        );
         assert_eq!(pt(4096, 16384, 5376), DevOp::Gemm, "q global");
-        assert_eq!(pt(4096, 4096, 5376), DevOp::Gemm, "kv sliding (N=4096, 16x16 = 256)");
+        assert_eq!(
+            pt(4096, 4096, 5376),
+            DevOp::Gemm,
+            "kv sliding (N=4096, 16x16 = 256)"
+        );
         assert_eq!(pt(4096, 21504, 5376), DevOp::Gemm, "gate/up");
         // o_proj and down_proj are both N=5376 = 21 tile-columns at BN=256, so 256x256 gives
         // 16x21 = 336 tiles = 2 rounds at 65.6% efficiency — the tile-count QUANTIZATION case
         // rather than the under-fill case. 192x256 gives 22x21 = 462 = 2 rounds at 90.2%.
         // MEASURED on this N at M=2048 (2048x5376x21504, whole GPU): 256x256 794.4 TF/s vs
         // 192x256 1033.4 — **1.30x**.
-        assert_eq!(pt(4096, 5376, 8192), DevOp::GemmC5, "o sliding (quantization: 66% -> 90%)");
-        assert_eq!(pt(4096, 5376, 21504), DevOp::GemmC5, "down (same N, same quantization)");
+        assert_eq!(
+            pt(4096, 5376, 8192),
+            DevOp::GemmC5,
+            "o sliding (quantization: 66% -> 90%)"
+        );
+        assert_eq!(
+            pt(4096, 5376, 21504),
+            DevOp::GemmC5,
+            "down (same N, same quantization)"
+        );
         // kv GLOBAL is N=2048 = 8 tile-columns at BN=256, so 16x8 = 128 tiles — HALF the
         // machine, and the previous version of this test asserted that as "no regression"
         // because there was no rung that could fix it. 128x256 makes it 32x8 = 256, exactly
         // full, at the same BN and so the same A-reuse.
-        assert_eq!(pt(4096, 2048, 5376), DevOp::GemmWide, "kv global (fill: 50% -> 100%)");
+        assert_eq!(
+            pt(4096, 2048, 5376),
+            DevOp::GemmWide,
+            "kv global (fill: 50% -> 100%)"
+        );
     }
 
     #[test]
@@ -6657,7 +7149,7 @@ mod chunk_default_tests {
         assert_eq!(default_chunk(1024), 1024); // Gemma-4
         assert_eq!(default_chunk(4096), 4096);
         assert_eq!(default_chunk(768), 1024); // rounded up to a power of two
-        // never below the bucket floor, never above the ladder top
+                                              // never below the bucket floor, never above the ladder top
         assert_eq!(default_chunk(1), super::MAX_CHUNK_MIN);
         assert_eq!(default_chunk(1 << 20), MAX_CHUNK_MAX);
     }

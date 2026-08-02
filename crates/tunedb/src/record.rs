@@ -247,15 +247,23 @@ mod tests {
     fn only_qualified_records_are_selectable() {
         assert!(RecordState::Qualified.is_selectable());
         assert!(!RecordState::Provisional.is_selectable());
-        assert!(!RecordState::Rejected { reason: "slow".into() }.is_selectable());
-        assert!(!RecordState::Stale { changed: vec!["toolchain".into()] }.is_selectable());
+        assert!(!RecordState::Rejected {
+            reason: "slow".into()
+        }
+        .is_selectable());
+        assert!(!RecordState::Stale {
+            changed: vec!["toolchain".into()]
+        }
+        .is_selectable());
     }
 
     /// A fast kernel that fails its oracle must never qualify. This is the
     /// check that keeps "fastest" from quietly meaning "wrong".
     #[test]
     fn an_incorrect_kernel_cannot_qualify() {
-        let m = measurement(Correctness::Fail { detail: "max abs err 0.3".into() });
+        let m = measurement(Correctness::Fail {
+            detail: "max abs err 0.3".into(),
+        });
         let blockers = m.qualification_blockers();
         assert_eq!(blockers.len(), 1);
         assert!(blockers[0].contains("correctness failed"));
@@ -263,12 +271,19 @@ mod tests {
 
     #[test]
     fn an_unchecked_kernel_cannot_qualify() {
-        assert_eq!(measurement(Correctness::Unchecked).qualification_blockers().len(), 1);
+        assert_eq!(
+            measurement(Correctness::Unchecked)
+                .qualification_blockers()
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn a_correct_well_sampled_kernel_has_no_blockers() {
-        assert!(measurement(Correctness::Pass).qualification_blockers().is_empty());
+        assert!(measurement(Correctness::Pass)
+            .qualification_blockers()
+            .is_empty());
     }
 
     /// Staleness names what moved, so an unrelated campaign is not discarded.
@@ -293,8 +308,13 @@ mod tests {
         let text = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<KernelMeasurement>(&text).unwrap(), m);
 
-        let rejected = RecordState::Rejected { reason: "alias of PLOW_DOP_GEMM".into() };
+        let rejected = RecordState::Rejected {
+            reason: "alias of PLOW_DOP_GEMM".into(),
+        };
         let text = serde_json::to_string(&rejected).unwrap();
-        assert_eq!(serde_json::from_str::<RecordState>(&text).unwrap(), rejected);
+        assert_eq!(
+            serde_json::from_str::<RecordState>(&text).unwrap(),
+            rejected
+        );
     }
 }

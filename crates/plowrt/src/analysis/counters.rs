@@ -85,8 +85,11 @@ pub struct Report {
 impl Report {
     pub fn of(prog: &DevProg, s: &Stats) -> Report {
         let n = s.n_ops;
-        let ents: &[packet::dev::StreamEnt] =
-            if prog.gq_stream.is_empty() { &prog.stream } else { &prog.gq_stream };
+        let ents: &[packet::dev::StreamEnt] = if prog.gq_stream.is_empty() {
+            &prog.stream
+        } else {
+            &prog.gq_stream
+        };
 
         // consumers[c] = ops that wait on counter c; threshold as recorded by
         // the waiters (identical across them by construction — a counter has one
@@ -106,8 +109,10 @@ impl Report {
 
         let mut counters: Vec<Counter> = (0..s.n_counter)
             .map(|id| {
-                let cons: Vec<u32> =
-                    consumers.get(&id).map(|c| c.iter().copied().collect()).unwrap_or_default();
+                let cons: Vec<u32> = consumers
+                    .get(&id)
+                    .map(|c| c.iter().copied().collect())
+                    .unwrap_or_default();
                 // Coarse counter ids ARE op indices; anything at or past
                 // `n_ops` is a fine per-slice counter with no single producer.
                 let producer = ((id as usize) < n).then_some(id);
@@ -252,5 +257,10 @@ fn liveness(n: usize, counters: &[Counter]) -> Liveness {
             profile[(profile.len() - 1) * p / 100]
         }
     };
-    Liveness { max_concurrent: max, at_inst: at, p50: pct(50), p99: pct(99) }
+    Liveness {
+        max_concurrent: max,
+        at_inst: at,
+        p50: pct(50),
+        p99: pct(99),
+    }
 }

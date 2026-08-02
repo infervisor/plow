@@ -536,7 +536,9 @@ mod tests {
         assert_eq!(c.evict_lru(), None, "live nodes must not be evictable");
         c.release(&[1, 2], 2);
         // Only the LEAF is evictable; the interior node would orphan it.
-        let v = c.evict_lru().expect("leaf should be evictable at zero refs");
+        let v = c
+            .evict_lru()
+            .expect("leaf should be evictable at zero refs");
         assert_eq!(v, (0, 1), "the leaf is block_idx 1 of seq 0");
         // Now the former interior node is a leaf and can go too.
         assert_eq!(c.evict_lru(), Some((0, 0)));
@@ -544,7 +546,11 @@ mod tests {
         // `Node::evicted` existed: the tombstone still looked like a zero-ref leaf,
         // so evict_lru returned (0, 0) a second time and the caller would have
         // double-freed that head-slot range.
-        assert_eq!(c.evict_lru(), None, "an evicted node must not be evicted again");
+        assert_eq!(
+            c.evict_lru(),
+            None,
+            "an evicted node must not be evicted again"
+        );
     }
 
     #[test]
@@ -586,7 +592,10 @@ mod tests {
         let mut bad_owner = good.clone();
         bad_owner[1].0 = 1;
         let ro = c.runs_for(&bad_owner);
-        assert_ne!(rg, ro, "a wrong owner_seq must change the resolved addresses");
+        assert_ne!(
+            rg, ro,
+            "a wrong owner_seq must change the resolved addresses"
+        );
         let pool = qwen3_pool();
         assert!(
             ro.iter()

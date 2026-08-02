@@ -58,7 +58,10 @@ fn rejects_producer_over_budget() {
     let cert = check_sram_fit(&req).expect("verifier call");
     assert!(!cert.ok, "over-budget producer accepted: {cert:?}");
     let reason = cert.reason.expect("rejection reason");
-    assert!(reason.contains("producer_pages"), "unexpected reason: {reason}");
+    assert!(
+        reason.contains("producer_pages"),
+        "unexpected reason: {reason}"
+    );
 }
 
 #[test]
@@ -73,13 +76,19 @@ fn rejects_consumer_over_budget() {
     let cert = check_sram_fit(&req).expect("verifier call");
     assert!(!cert.ok, "over-budget consumer accepted: {cert:?}");
     let reason = cert.reason.expect("rejection reason");
-    assert!(reason.contains("consumer_pages"), "unexpected reason: {reason}");
+    assert!(
+        reason.contains("consumer_pages"),
+        "unexpected reason: {reason}"
+    );
 }
 
 #[test]
 #[ignore = "requires plow_verify binary"]
 fn accepts_empty_handoff_list() {
-    let req = SramFitRequest { budget: 8, handoffs: vec![] };
+    let req = SramFitRequest {
+        budget: 8,
+        handoffs: vec![],
+    };
     let cert = check_sram_fit(&req).expect("verifier call");
     assert!(cert.ok, "empty list rejected: {cert:?}");
 }

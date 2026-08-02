@@ -59,7 +59,9 @@ fn parse_plowc_map_shape() {
     assert_eq!(m.entries.len(), 4);
     assert_eq!(m.get("kv_cache").unwrap().class, BufClass::Growable);
     assert_eq!(
-        m.on_device("layers.0.self_attn.q_proj.weight", 0).unwrap().class,
+        m.on_device("layers.0.self_attn.q_proj.weight", 0)
+            .unwrap()
+            .class,
         BufClass::Persistent
     );
     assert_eq!(m.local_offset(1, 2048), Some(0));
@@ -222,8 +224,14 @@ fn dense_block_dims_roundtrip() {
     assert_eq!(b.dims.n_exp, None);
     assert_eq!(b.dsa_role, None, "dense block has no DSA role");
     let s = serde_json::to_string(&b).unwrap();
-    assert!(!s.contains("n_exp"), "absent MLA/MoE keys must not serialize");
-    assert!(!s.contains("dsa_role"), "absent dsa_role must not serialize");
+    assert!(
+        !s.contains("n_exp"),
+        "absent MLA/MoE keys must not serialize"
+    );
+    assert!(
+        !s.contains("dsa_role"),
+        "absent dsa_role must not serialize"
+    );
     let b2: BlockDescriptor = serde_json::from_str(&s).unwrap();
     assert_eq!(b, b2);
 }
@@ -265,8 +273,14 @@ fn mamba2_block_descriptor_roundtrip() {
     assert_eq!(b.carried_state[1].role, "ssm");
     assert_eq!(b.carried_state[1].layout, "ssm_head_major");
     let s = serde_json::to_string(&b).unwrap();
-    assert!(!s.contains("kv_lora"), "absent attn keys must not serialize");
-    assert!(!s.contains("\"heads\""), "absent attn keys must not serialize");
+    assert!(
+        !s.contains("kv_lora"),
+        "absent attn keys must not serialize"
+    );
+    assert!(
+        !s.contains("\"heads\""),
+        "absent attn keys must not serialize"
+    );
     let b2: BlockDescriptor = serde_json::from_str(&s).unwrap();
     assert_eq!(b, b2);
 }

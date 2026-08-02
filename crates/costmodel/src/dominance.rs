@@ -68,12 +68,10 @@ impl CostModel<'_> {
 /// `a` Pareto-dominates `b`: at least as good in every metric, and strictly
 /// better in at least one.
 fn dominates(a: TileMetrics, b: TileMetrics) -> bool {
-    let a_le = a.passes <= b.passes
-        && a.sram_pages <= b.sram_pages
-        && a.output_tiles <= b.output_tiles;
-    let a_lt = a.passes < b.passes
-        || a.sram_pages < b.sram_pages
-        || a.output_tiles < b.output_tiles;
+    let a_le =
+        a.passes <= b.passes && a.sram_pages <= b.sram_pages && a.output_tiles <= b.output_tiles;
+    let a_lt =
+        a.passes < b.passes || a.sram_pages < b.sram_pages || a.output_tiles < b.output_tiles;
     a_le && a_lt
 }
 
@@ -115,7 +113,10 @@ mod tests {
     use hwspec::registry;
 
     fn cm() -> CostModel<'static> {
-        CostModel::new(registry::lookup("H100 SXM5").unwrap(), crate::DEFAULT_PAGE_BYTES)
+        CostModel::new(
+            registry::lookup("H100 SXM5").unwrap(),
+            crate::DEFAULT_PAGE_BYTES,
+        )
     }
 
     /// Dominance is transitive: dropping A because it's beaten by B, and B
@@ -123,9 +124,21 @@ mod tests {
     /// stop early.
     #[test]
     fn dominates_is_transitive_within_prune() {
-        let a = TileMetrics { passes: 4, sram_pages: 20, output_tiles: 200 };
-        let b = TileMetrics { passes: 2, sram_pages: 10, output_tiles: 100 };
-        let c = TileMetrics { passes: 1, sram_pages: 5, output_tiles: 50 };
+        let a = TileMetrics {
+            passes: 4,
+            sram_pages: 20,
+            output_tiles: 200,
+        };
+        let b = TileMetrics {
+            passes: 2,
+            sram_pages: 10,
+            output_tiles: 100,
+        };
+        let c = TileMetrics {
+            passes: 1,
+            sram_pages: 5,
+            output_tiles: 50,
+        };
         assert!(dominates(b, a));
         assert!(dominates(c, b));
         assert!(dominates(c, a));
@@ -134,7 +147,11 @@ mod tests {
     /// Tiles that are equal in every metric are kept (dominance is strict).
     #[test]
     fn duplicates_are_not_dropped() {
-        let m = TileMetrics { passes: 2, sram_pages: 10, output_tiles: 100 };
+        let m = TileMetrics {
+            passes: 2,
+            sram_pages: 10,
+            output_tiles: 100,
+        };
         assert!(!dominates(m, m));
     }
 
@@ -142,7 +159,11 @@ mod tests {
     #[test]
     fn prune_never_grows_the_set() {
         let cm = cm();
-        let g = GemmShape { m: 1024, n: 4096, k: 4096 };
+        let g = GemmShape {
+            m: 1024,
+            n: 4096,
+            k: 4096,
+        };
         let cands = cm.candidates(g, crate::SramPolicy::Stream);
         let (pruned, rep) = prune_dominated(&cands, g, &cm);
         assert!(pruned.len() <= cands.len());
@@ -155,9 +176,21 @@ mod tests {
     /// gets dropped. Uses metrics directly rather than a real CostModel.
     #[test]
     fn drops_strictly_dominated_tile() {
-        let good = TileMetrics { passes: 1, sram_pages: 5, output_tiles: 50 };
-        let bad = TileMetrics { passes: 2, sram_pages: 10, output_tiles: 100 };
-        let neutral = TileMetrics { passes: 3, sram_pages: 4, output_tiles: 60 };
+        let good = TileMetrics {
+            passes: 1,
+            sram_pages: 5,
+            output_tiles: 50,
+        };
+        let bad = TileMetrics {
+            passes: 2,
+            sram_pages: 10,
+            output_tiles: 100,
+        };
+        let neutral = TileMetrics {
+            passes: 3,
+            sram_pages: 4,
+            output_tiles: 60,
+        };
         assert!(dominates(good, bad));
         assert!(!dominates(good, neutral)); // neutral has fewer pages
         assert!(!dominates(neutral, good)); // good has fewer passes/tiles

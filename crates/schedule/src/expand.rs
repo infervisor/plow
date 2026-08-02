@@ -235,7 +235,8 @@ pub fn expand(
                 if resident {
                     continue; // SRAM hand-off: ordering comes from a cross-op edge
                 }
-                let in_elem = op_elem_for_input(&info.kind, i, info.activation_elem, info.weight_elem);
+                let in_elem =
+                    op_elem_for_input(&info.kind, i, info.activation_elem, info.weight_elem);
                 let bytes = if per_op {
                     op_in_bytes(&info.kind, i, in_elem)
                 } else {
@@ -653,9 +654,7 @@ pub fn expand_prefill_chunks(
                 // Static affinity: chunk c pins to its own SM set; the whole op
                 // chain for chunk c shares it → producer output stays in that L2
                 // slice for the consumer.
-                ChunkPlacementPolicy::StaticColocated => {
-                    ((c * n_cu) / k, ((c + 1) * n_cu) / k)
-                }
+                ChunkPlacementPolicy::StaticColocated => ((c * n_cu) / k, ((c + 1) * n_cu) / k),
                 // Global queue: every chunk may use the whole chip (work-steal).
                 ChunkPlacementPolicy::GlobalQueue => (0, n_cu),
             };

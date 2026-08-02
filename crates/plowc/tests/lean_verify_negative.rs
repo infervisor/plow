@@ -37,14 +37,18 @@ fn build_a_real_request() -> (ScheduleRequest, String) {
     use rewrite::assemble;
     use schedule::ShapeBucket;
 
-    let bucket = ShapeBucket { batch: 1, seq: 128, phase: schedule::Phase::Prefill };
+    let bucket = ShapeBucket {
+        batch: 1,
+        seq: 128,
+        phase: schedule::Phase::Prefill,
+    };
     let plan = net.build_plan(&bucket);
     let soc = Soc::single(
         costmodel::hwspec::registry::lookup("H100 SXM5").unwrap(),
         DEFAULT_PAGE_BYTES,
     );
-    let (tile_g, cons) = assemble(&soc, &plan, costmodel::SramPolicy::Stream, None)
-        .expect("assemble");
+    let (tile_g, cons) =
+        assemble(&soc, &plan, costmodel::SramPolicy::Stream, None).expect("assemble");
     let sched = schedule::schedule(&soc, &tile_g, &cons, &schedule::Config::default());
     let req = request_for_bucket(&sched.tasks, &sched.schedule, &cons);
 

@@ -261,7 +261,8 @@ pub fn choose_weight_tiling_tuned(
     if let rewrite::oracle::TileAdvice::Buildable(built) = oracle.gemm_tiles(&q) {
         let ok: std::collections::BTreeSet<(i64, i64)> =
             built.iter().map(|t| (t.bn, t.bk)).collect();
-        let restricted: Vec<(i64, i64)> = pairs.iter().copied().filter(|p| ok.contains(p)).collect();
+        let restricted: Vec<(i64, i64)> =
+            pairs.iter().copied().filter(|p| ok.contains(p)).collect();
         if !restricted.is_empty() {
             pairs = restricted;
         }

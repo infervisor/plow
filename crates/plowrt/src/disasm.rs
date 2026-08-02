@@ -314,8 +314,16 @@ fn kernargs(blob: &DevBlob, prog: &DevProg) -> KernargJson {
     let mark = |populated: bool| if populated { "populated" } else { "null" };
     let tp = blob.tp.is_some();
     // Always built by the host from blob content.
-    for k in ["insts", "stream", "stream_ofs", "stream_len", "waits", "succs", "counters", "tensors"]
-    {
+    for k in [
+        "insts",
+        "stream",
+        "stream_ofs",
+        "stream_len",
+        "waits",
+        "succs",
+        "counters",
+        "tensors",
+    ] {
         pointers.insert(k, mark(true));
     }
     pointers.insert("gq_stream", mark(!prog.gq_stream.is_empty()));
@@ -334,7 +342,10 @@ fn kernargs(blob: &DevBlob, prog: &DevProg) -> KernargJson {
     scalars.insert("rank", "runtime (host fills per rank)".into());
     scalars.insert(
         "n_gpu",
-        blob.tp.as_ref().map(|t| t.n_gpu.to_string()).unwrap_or_else(|| "1".into()),
+        blob.tp
+            .as_ref()
+            .map(|t| t.n_gpu.to_string())
+            .unwrap_or_else(|| "1".into()),
     );
 
     KernargJson {
@@ -342,7 +353,11 @@ fn kernargs(blob: &DevBlob, prog: &DevProg) -> KernargJson {
         pointers,
         scalars,
         derived: DerivedJson {
-            scheduler: if prog.gq_stream.is_empty() { "static" } else { "global-queue" },
+            scheduler: if prog.gq_stream.is_empty() {
+                "static"
+            } else {
+                "global-queue"
+            },
             segmented: n_seg > 1,
             n_seg,
             l2_placed: prog.l2_domains > 0,
@@ -389,8 +404,16 @@ fn counters_json(prog: &DevProg, s: &graph::Stats) -> CounterReportJson {
             bumps_live: s.bumps_live,
             critical_path: depth,
         },
-        per_counter: r.counters.iter().map(|c| counter_json(c, &prog.insts)).collect(),
-        dead: r.dead().into_iter().map(|c| counter_json(c, &prog.insts)).collect(),
+        per_counter: r
+            .counters
+            .iter()
+            .map(|c| counter_json(c, &prog.insts))
+            .collect(),
+        dead: r
+            .dead()
+            .into_iter()
+            .map(|c| counter_json(c, &prog.insts))
+            .collect(),
         redundant_edges: r
             .redundant
             .iter()
@@ -497,7 +520,9 @@ pub fn text_inst(d: &Inst<'_>) -> String {
     let mut s = format!(
         "#{:<5} {:<24} b={:<4}",
         d.idx,
-        d.op_name.map(str::to_string).unwrap_or_else(|| format!("op{}?", d.raw.op)),
+        d.op_name
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("op{}?", d.raw.op)),
         d.blocks
     );
     for o in &d.tensors {
@@ -512,7 +537,11 @@ pub fn text_inst(d: &Inst<'_>) -> String {
         s.push_str(" |");
     }
     for o in &d.ints {
-        s.push_str(&format!(" {}={}", o.name.unwrap_or(int_slot_label(o.slot)), o.value));
+        s.push_str(&format!(
+            " {}={}",
+            o.name.unwrap_or(int_slot_label(o.slot)),
+            o.value
+        ));
     }
     for o in &d.floats {
         s.push_str(&format!(" {}={}", o.name.unwrap_or("f"), o.value));
@@ -532,7 +561,10 @@ mod tests {
     /// no `model.` prefix.
     #[test]
     fn tensor_classes_use_the_shared_predicates() {
-        assert_eq!(class_of("model.layers.0.self_attn.q_a_proj.weight"), "WEIGHT");
+        assert_eq!(
+            class_of("model.layers.0.self_attn.q_a_proj.weight"),
+            "WEIGHT"
+        );
         assert_eq!(class_of("lm_head.weight"), "WEIGHT");
         assert_eq!(class_of("act.x"), "RUNTIME");
         assert_eq!(class_of("kv.0.ckv"), "RUNTIME");
@@ -656,37 +688,93 @@ pub mod sched {
     /// drift — the reason this backend needs none of `packet::slots`.
     fn body_json(b: &Body) -> Value {
         match b {
-            Body::Dma { load, bytes, slot, tensor, kind, access } => json!({
+            Body::Dma {
+                load,
+                bytes,
+                slot,
+                tensor,
+                kind,
+                access,
+            } => json!({
                 "load": load, "bytes": bytes, "slot": slot,
                 "tensor": tensor, "kind": kind, "access": access
             }),
-            Body::Rdma { bytes, src_unit, dst_unit } => {
+            Body::Rdma {
+                bytes,
+                src_unit,
+                dst_unit,
+            } => {
                 json!({ "bytes": bytes, "src_unit": src_unit, "dst_unit": dst_unit })
             }
-            Body::Gemm { coord, m, n, k, bm, bn, bk, out, tmem, variant } => json!({
+            Body::Gemm {
+                coord,
+                m,
+                n,
+                k,
+                bm,
+                bn,
+                bk,
+                out,
+                tmem,
+                variant,
+            } => json!({
                 "coord": coord, "m": m, "n": n, "k": k,
                 "tile": { "bm": bm, "bn": bn, "bk": bk },
                 "out": out, "tmem": tmem, "variant": variant
             }),
-            Body::Flash { coord, seq_q, seq_kv, head_dim, bq, bkv, heads, out, tmem, variant } => {
+            Body::Flash {
+                coord,
+                seq_q,
+                seq_kv,
+                head_dim,
+                bq,
+                bkv,
+                heads,
+                out,
+                tmem,
+                variant,
+            } => {
                 json!({
                     "coord": coord, "seq_q": seq_q, "seq_kv": seq_kv, "head_dim": head_dim,
                     "tile": { "bq": bq, "bkv": bkv }, "heads": heads,
                     "out": out, "tmem": tmem, "variant": variant
                 })
             }
-            Body::Row { reduce, coord, rows, feat, operands, br, out, variant } => json!({
+            Body::Row {
+                reduce,
+                coord,
+                rows,
+                feat,
+                operands,
+                br,
+                out,
+                variant,
+            } => json!({
                 "reduce": reduce, "coord": coord, "rows": rows, "feat": feat,
                 "operands": operands, "br": br, "out": out, "variant": variant
             }),
             Body::Layout {
-                kind, rank, elem_size, out, shape, in_stride, out_stride, in_base, out_base,
+                kind,
+                rank,
+                elem_size,
+                out,
+                shape,
+                in_stride,
+                out_stride,
+                in_base,
+                out_base,
             } => json!({
                 "kind": kind, "rank": rank, "elem_size": elem_size, "out": out,
                 "shape": shape, "in_stride": in_stride, "out_stride": out_stride,
                 "in_base": in_base, "out_base": out_base
             }),
-            Body::Token { in_slot, out_slot, kind, vocab, arg } => json!({
+            Body::Token {
+                in_slot,
+                out_slot,
+                kind,
+                vocab,
+                arg,
+            } => json!({
                 "in_slot": in_slot, "out_slot": out_slot,
                 "kind": kind, "vocab": vocab, "arg": arg
             }),
@@ -743,14 +831,7 @@ pub mod sched {
         for i in &r.insts {
             s.push_str(&format!(
                 "#{:<5} {:<14} {}{:<3} idx={:<5} {} wait{:?} -> succ{:?}\n",
-                i.idx,
-                i.opcode_name,
-                i.resource,
-                i.unit,
-                i.index,
-                i.body,
-                i.wait,
-                i.succ
+                i.idx, i.opcode_name, i.resource, i.unit, i.index, i.body, i.wait, i.succ
             ));
         }
         s
@@ -801,8 +882,18 @@ mod sched_tests {
                 },
             ],
             counters: vec![
-                Counter { id: 1, threshold: 4, scope: 0, _pad: [0; 3] },
-                Counter { id: 2, threshold: 8, scope: 2, _pad: [0; 3] },
+                Counter {
+                    id: 1,
+                    threshold: 4,
+                    scope: 0,
+                    _pad: [0; 3],
+                },
+                Counter {
+                    id: 2,
+                    threshold: 8,
+                    scope: 2,
+                    _pad: [0; 3],
+                },
             ],
             bucket_id: 5,
             plan_gen: 2,
@@ -845,10 +936,18 @@ mod sched_tests {
     #[test]
     fn variants_are_not_labelled_as_golden() {
         let mut p = prog();
-        let Body::Gemm { ref mut variant, .. } = p.insts[0].body else { unreachable!() };
+        let Body::Gemm {
+            ref mut variant, ..
+        } = p.insts[0].body
+        else {
+            unreachable!()
+        };
         *variant = packet::Opcode::VARIANT_BF16;
         let r = sched::report(&p, "t.pkt");
-        assert_eq!(r.insts[0].opcode_name, format!("GEMM/v{}", packet::Opcode::VARIANT_BF16));
+        assert_eq!(
+            r.insts[0].opcode_name,
+            format!("GEMM/v{}", packet::Opcode::VARIANT_BF16)
+        );
         assert_ne!(r.insts[0].opcode_name, "GEMM");
     }
 

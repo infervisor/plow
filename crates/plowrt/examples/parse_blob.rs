@@ -28,7 +28,9 @@ fn inst_digest(insts: &[packet::dev::DevInst64]) -> u64 {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: parse_blob <model.pkt>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: parse_blob <model.pkt>");
     let raw = std::fs::read(&path).expect("read blob");
     let blob = plowrt::asset::devblob::DevBlob::parse(&raw).expect("parse blob");
     println!("blob      {path} ({} bytes)", raw.len());

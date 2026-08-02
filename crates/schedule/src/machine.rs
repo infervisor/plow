@@ -331,7 +331,11 @@ mod tests {
             ..Config::default()
         };
         let m = Machine::from_soc(&soc, &cfg);
-        assert_eq!(m.unit(0).dma_engines, 5, "non-zero Config overrides the spec");
+        assert_eq!(
+            m.unit(0).dma_engines,
+            5,
+            "non-zero Config overrides the spec"
+        );
     }
 
     fn mi300x() -> &'static costmodel::hwspec::GpuSpec {

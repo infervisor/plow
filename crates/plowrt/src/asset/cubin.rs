@@ -64,7 +64,11 @@ fn interp_role(sym: &str) -> Option<Role> {
     }
     // `interp_sm120_pf` vs `interp_sm120` — the `_pf` object is the only one
     // carrying the tiled-GEMM / flash-prefill arms.
-    Some(if sym.contains("_pf") { Role::Prefill } else { Role::Decode })
+    Some(if sym.contains("_pf") {
+        Role::Prefill
+    } else {
+        Role::Decode
+    })
 }
 
 const EI_NIDENT: usize = 16;
@@ -78,7 +82,8 @@ fn u16_at(b: &[u8], o: usize) -> Option<u16> {
     b.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
 }
 fn u32_at(b: &[u8], o: usize) -> Option<u32> {
-    b.get(o..o + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    b.get(o..o + 4)
+        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 fn u64_at(b: &[u8], o: usize) -> Option<u64> {
     b.get(o..o + 8)
@@ -150,7 +155,10 @@ pub fn describe(image: &[u8]) -> String {
         None => format!("not an ELF cubin ({} B)", image.len()),
         Some(i) => {
             let role = |r: Role| i.interp_entry(r).map(|_| r.as_str());
-            let roles: Vec<&str> = [Role::Decode, Role::Prefill].into_iter().filter_map(role).collect();
+            let roles: Vec<&str> = [Role::Decode, Role::Prefill]
+                .into_iter()
+                .filter_map(role)
+                .collect();
             let what = if roles.is_empty() {
                 format!("no interpreter entry; {} global kernel(s)", i.entries.len())
             } else {
@@ -167,13 +175,28 @@ mod tests {
 
     #[test]
     fn classifies_interpreter_entries() {
-        assert_eq!(interp_role("_Z12interp_sm90a11PlowProgram"), Some(Role::Decode));
-        assert_eq!(interp_role("_Z15interp_sm90a_pf11PlowProgram"), Some(Role::Prefill));
-        assert_eq!(interp_role("_Z12interp_sm12011PlowProgram"), Some(Role::Decode));
-        assert_eq!(interp_role("_Z15interp_sm120_pf11PlowProgram"), Some(Role::Prefill));
+        assert_eq!(
+            interp_role("_Z12interp_sm90a11PlowProgram"),
+            Some(Role::Decode)
+        );
+        assert_eq!(
+            interp_role("_Z15interp_sm90a_pf11PlowProgram"),
+            Some(Role::Prefill)
+        );
+        assert_eq!(
+            interp_role("_Z12interp_sm12011PlowProgram"),
+            Some(Role::Decode)
+        );
+        assert_eq!(
+            interp_role("_Z15interp_sm120_pf11PlowProgram"),
+            Some(Role::Prefill)
+        );
         // Not the megakernel: the device sampler and the MoE block helpers.
         assert_eq!(interp_role("plow_sample"), None);
-        assert_eq!(interp_role("_Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16"), None);
+        assert_eq!(
+            interp_role("_Z25plow_moe_slot_glu_fp8_blkP13__nv_bfloat16"),
+            None
+        );
     }
 
     #[test]
@@ -183,7 +206,10 @@ mod tests {
             entries: vec!["_Z15interp_sm90a_pf11PlowProgram".into()],
         };
         assert_eq!(pf.interp_entry(Role::Decode), None);
-        assert_eq!(pf.interp_entry(Role::Prefill), Some("_Z15interp_sm90a_pf11PlowProgram"));
+        assert_eq!(
+            pf.interp_entry(Role::Prefill),
+            Some("_Z15interp_sm90a_pf11PlowProgram")
+        );
     }
 
     #[test]

@@ -103,17 +103,21 @@ pub fn derive(spec: &EmitSpec) -> Result<Vec<Demand>, Box<dyn std::error::Error>
             gpu: spec.gpu.clone(),
             arch: spec.arch.clone(),
         },
-        Some(devgen::skip_hook("plowc tune: deriving shape demand, not building an asset")),
+        Some(devgen::skip_hook(
+            "plowc tune: deriving shape demand, not building an asset",
+        )),
     );
     let log = tune_demand::take();
     cleanup(&scratch);
 
     if log.is_empty() {
-        return Err("the emit asked the tuning store about no dense GEMM at all. Either this \
+        return Err(
+            "the emit asked the tuning store about no dense GEMM at all. Either this \
                     model has no prefill GEMM on this path, or the emitter reached `pick_tile` \
                     through a route that does not consult the store — which is the failure this \
                     command exists to detect, so it is an error and not an empty campaign."
-            .into());
+                .into(),
+        );
     }
     Ok(tune_demand::distinct(log))
 }
@@ -132,7 +136,14 @@ pub fn coverage(shapes: &[Demand]) -> (usize, usize) {
 pub fn render(shapes: &[Demand]) -> String {
     let mut s = String::new();
     for d in shapes {
-        s.push_str(&format!("{} {} {}    {}    {:?}\n", d.m, d.n, d.k, d.label(), d.quant));
+        s.push_str(&format!(
+            "{} {} {}    {}    {:?}\n",
+            d.m,
+            d.n,
+            d.k,
+            d.label(),
+            d.quant
+        ));
     }
     s
 }
@@ -164,9 +175,15 @@ pub fn parse_list(text: &str) -> Result<Vec<Listed>, String> {
         }
         let f: Vec<&str> = line.split_whitespace().collect();
         if f.len() < 3 {
-            return Err(format!("line {}: expected `M N K [label [quant]]`, got {raw:?}", i + 1));
+            return Err(format!(
+                "line {}: expected `M N K [label [quant]]`, got {raw:?}",
+                i + 1
+            ));
         }
-        let p = |s: &str| s.parse::<i64>().map_err(|e| format!("line {}: {s:?}: {e}", i + 1));
+        let p = |s: &str| {
+            s.parse::<i64>()
+                .map_err(|e| format!("line {}: {s:?}: {e}", i + 1))
+        };
         let (m, n, k) = (p(f[0])?, p(f[1])?, p(f[2])?);
         if m <= 0 || n <= 0 || k <= 0 {
             return Err(format!("line {}: shape dimensions must be positive", i + 1));
@@ -182,7 +199,10 @@ pub fn parse_list(text: &str) -> Result<Vec<Listed>, String> {
             m,
             n,
             k,
-            label: f.get(3).map(|s| s.to_string()).unwrap_or_else(|| "shape".into()),
+            label: f
+                .get(3)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "shape".into()),
             quant,
         });
     }
@@ -261,8 +281,20 @@ mod tests {
     #[test]
     fn rendered_demand_parses_back_to_the_same_shapes() {
         let shapes = vec![
-            Demand { m: 512, n: 6144, k: 512, quant: QuantScheme::None, hit: false },
-            Demand { m: 8192, n: 64, k: 6144, quant: QuantScheme::Mxfp4, hit: true },
+            Demand {
+                m: 512,
+                n: 6144,
+                k: 512,
+                quant: QuantScheme::None,
+                hit: false,
+            },
+            Demand {
+                m: 8192,
+                n: 64,
+                k: 6144,
+                quant: QuantScheme::Mxfp4,
+                hit: true,
+            },
         ];
         let back = parse_list(&render(&shapes)).unwrap();
         assert_eq!(back.len(), 2);
@@ -276,7 +308,13 @@ mod tests {
     #[test]
     fn coverage_counts_the_number_that_was_invisible() {
         let shapes: Vec<Demand> = (0..32)
-            .map(|i| Demand { m: 512, n: i, k: 6144, quant: QuantScheme::None, hit: false })
+            .map(|i| Demand {
+                m: 512,
+                n: i,
+                k: 6144,
+                quant: QuantScheme::None,
+                hit: false,
+            })
             .collect();
         assert_eq!(coverage(&shapes), (0, 32));
     }

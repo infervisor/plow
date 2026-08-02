@@ -13,4 +13,4 @@ pub mod transport;
 pub use pipeline::{Pipeline, Stage};
 pub use registry::Registry;
 pub use router::route;
-pub use transport::{DeviceAddr, NullTransport, Transport, TransferDescriptor};
+pub use transport::{DeviceAddr, NullTransport, TransferDescriptor, Transport};

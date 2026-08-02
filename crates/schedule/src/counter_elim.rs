@@ -63,11 +63,19 @@ fn task_stream_pos(sched: &Schedule) -> HashMap<TaskId, (ResourceId, usize)> {
 
 /// Producers of each counter (tasks that increment it) and consumers (tasks
 /// that wait on it), scanned across every resource's packet list.
-fn producers_consumers(sched: &Schedule) -> (HashMap<usize, Vec<TaskId>>, HashMap<usize, Vec<TaskId>>) {
+fn producers_consumers(
+    sched: &Schedule,
+) -> (HashMap<usize, Vec<TaskId>>, HashMap<usize, Vec<TaskId>>) {
     let mut producers: HashMap<usize, Vec<TaskId>> = HashMap::new();
     let mut consumers: HashMap<usize, Vec<TaskId>> = HashMap::new();
     for stream in sched.packets.values() {
-        for Packet { task, wait, successors, .. } in stream {
+        for Packet {
+            task,
+            wait,
+            successors,
+            ..
+        } in stream
+        {
             for &c in successors {
                 producers.entry(c).or_default().push(*task);
             }
@@ -116,8 +124,7 @@ fn is_redundant(
     }
     // All producers + consumers pinned to one resource; every producer strictly
     // before every consumer in stream order ⇒ redundant.
-    resources.len() == 1
-        && max_p.zip(min_c).is_some_and(|(mp, mc)| mp < mc)
+    resources.len() == 1 && max_p.zip(min_c).is_some_and(|(mp, mc)| mp < mc)
 }
 
 /// Fallback when a task isn't in any stream — treat as its own resource so
@@ -187,10 +194,7 @@ mod tests {
         let res = ResourceId::Sm(0, 0);
         let sched = Schedule {
             streams: HashMap::from([(res, stream_of(&[(0, 0), (1, 10)]))]),
-            packets: HashMap::from([(
-                res,
-                vec![packet(0, &[], &[0]), packet(1, &[0], &[])],
-            )]),
+            packets: HashMap::from([(res, vec![packet(0, &[], &[0]), packet(1, &[0], &[])])]),
             counters: vec![Counter {
                 id: 0,
                 threshold: 1,
@@ -221,10 +225,7 @@ mod tests {
         let r0 = ResourceId::Sm(0, 0);
         let r1 = ResourceId::Dma(0, 0);
         let sched = Schedule {
-            streams: HashMap::from([
-                (r0, stream_of(&[(0, 0)])),
-                (r1, stream_of(&[(1, 10)])),
-            ]),
+            streams: HashMap::from([(r0, stream_of(&[(0, 0)])), (r1, stream_of(&[(1, 10)]))]),
             packets: HashMap::from([
                 (r0, vec![packet(0, &[], &[0])]),
                 (r1, vec![packet(1, &[0], &[])]),
@@ -262,10 +263,7 @@ mod tests {
         let res = ResourceId::Sm(0, 0);
         let sched = Schedule {
             streams: HashMap::from([(res, stream_of(&[(1, 0), (0, 10)]))]),
-            packets: HashMap::from([(
-                res,
-                vec![packet(1, &[0], &[]), packet(0, &[], &[0])],
-            )]),
+            packets: HashMap::from([(res, vec![packet(1, &[0], &[]), packet(0, &[], &[0])])]),
             counters: vec![Counter {
                 id: 0,
                 threshold: 1,
@@ -282,7 +280,10 @@ mod tests {
             makespan: 20,
         };
         let (_, rep) = eliminate_redundant_counters(&sched);
-        assert!(rep.eliminated.is_empty(), "counter is only proof of ordering");
+        assert!(
+            rep.eliminated.is_empty(),
+            "counter is only proof of ordering"
+        );
     }
 
     /// Multi-producer coarse-mode counter: all producers on one resource,
@@ -292,10 +293,7 @@ mod tests {
     fn drops_multi_producer_all_same_resource_ordered() {
         let res = ResourceId::Sm(0, 0);
         let sched = Schedule {
-            streams: HashMap::from([(
-                res,
-                stream_of(&[(0, 0), (1, 5), (2, 10), (3, 15)]),
-            )]),
+            streams: HashMap::from([(res, stream_of(&[(0, 0), (1, 5), (2, 10), (3, 15)]))]),
             packets: HashMap::from([(
                 res,
                 vec![
@@ -312,12 +310,7 @@ mod tests {
                 producer_node: 0,
                 consumer_node: 1,
             }],
-            placement: HashMap::from([
-                (0usize, res),
-                (1usize, res),
-                (2usize, res),
-                (3usize, res),
-            ]),
+            placement: HashMap::from([(0usize, res), (1usize, res), (2usize, res), (3usize, res)]),
             starts: vec![0, 5, 10, 15],
             sram_slots: HashMap::new(),
             spills: 0,

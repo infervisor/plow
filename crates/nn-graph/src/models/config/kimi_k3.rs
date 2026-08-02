@@ -204,9 +204,10 @@ impl KimiK3TextConfig {
     pub fn moe_groups(&self) -> Result<Option<crate::op::MoeGroups>, ConfigError> {
         match (self.n_group, self.topk_group) {
             (None, None) => Ok(None),
-            (Some(n_group), Some(topk_group)) => {
-                Ok(Some(crate::op::MoeGroups { n_group, topk_group }))
-            }
+            (Some(n_group), Some(topk_group)) => Ok(Some(crate::op::MoeGroups {
+                n_group,
+                topk_group,
+            })),
             (n, t) => Err(ConfigError::Unsupported(format!(
                 "kimi_k3: n_group = {n:?} and topk_group = {t:?} must be given together \
                  — group-limited routing selects a different expert set than flat \

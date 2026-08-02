@@ -393,13 +393,21 @@ impl Builder {
                 return i as u32;
             }
         }
-        self.tensors.push(TensorDecl { name: name.to_string(), bytes, init: None });
+        self.tensors.push(TensorDecl {
+            name: name.to_string(),
+            bytes,
+            init: None,
+        });
         (self.tensors.len() - 1) as u32
     }
 
     /// Declare a tensor whose contents the compiler already knows (e.g. RoPE tables).
     pub fn tensor_init(&mut self, name: &str, init: Vec<u8>) -> u32 {
-        self.tensors.push(TensorDecl { name: name.to_string(), bytes: init.len() as u64, init: Some(init) });
+        self.tensors.push(TensorDecl {
+            name: name.to_string(),
+            bytes: init.len() as u64,
+            init: Some(init),
+        });
         (self.tensors.len() - 1) as u32
     }
 
@@ -450,7 +458,13 @@ impl Builder {
 
     /// Emit an op onto `cus`, gated behind `deps`. Returns the counter it bumps,
     /// which is what a consumer passes back in as a dep.
-    pub fn emit(&mut self, op: DevOp, cus: Vec<u32>, deps: &[u32], f: impl FnOnce(&mut DevInst)) -> u32 {
+    pub fn emit(
+        &mut self,
+        op: DevOp,
+        cus: Vec<u32>,
+        deps: &[u32],
+        f: impl FnOnce(&mut DevInst),
+    ) -> u32 {
         let d: Vec<Dep> = deps.iter().map(|&c| Dep::Coarse(c)).collect();
         self.emit_dep(op, cus, d, f)
     }
@@ -493,7 +507,13 @@ impl Builder {
         // Uniform by default: an op that does not tell the builder its per-slice costs is
         // assumed balanced, which makes `select_granularity` fall back to coarse counters.
         let work = vec![1u32; cus.len()];
-        self.ops.push(Op { inst, cus, deps, counter, work });
+        self.ops.push(Op {
+            inst,
+            cus,
+            deps,
+            counter,
+            work,
+        });
         counter
     }
 
@@ -641,7 +661,13 @@ impl Builder {
     fn locality_census(&self, l2: Option<L2Layout>) {
         let c = self.locality_census_stats(l2);
         let pairs = c.pairs;
-        let pct = |x: u64| if pairs == 0 { 0.0 } else { 100.0 * x as f64 / pairs as f64 };
+        let pct = |x: u64| {
+            if pairs == 0 {
+                0.0
+            } else {
+                100.0 * x as f64 / pairs as f64
+            }
+        };
         eprintln!(
             "  locality census ({} ops, {} slices, {} domains, map {}):",
             c.ops, c.slices, c.domains, c.map_name
@@ -669,7 +695,11 @@ impl Builder {
     /// The numbers behind [`Builder::locality_census`]. Split out so the invariant the census
     /// exists to expose is a unit test rather than a line of stderr.
     fn locality_census_stats(&self, l2: Option<L2Layout>) -> LocalityCensus {
-        let layout = l2.unwrap_or(L2Layout { sms: 32, domains: 8, map: L2Map::RoundRobin });
+        let layout = l2.unwrap_or(L2Layout {
+            sms: 32,
+            domains: 8,
+            map: L2Map::RoundRobin,
+        });
         let dc = layout.domains.max(1) as usize;
         let n = self.ops.len();
 
@@ -677,7 +707,12 @@ impl Builder {
         let cur: Vec<Vec<usize>> = self
             .ops
             .iter()
-            .map(|o| o.cus.iter().map(|&c| layout.domain_of(c) as usize).collect())
+            .map(|o| {
+                o.cus
+                    .iter()
+                    .map(|&c| layout.domain_of(c) as usize)
+                    .collect()
+            })
             .collect();
 
         // Greedy predecessor-affinity, ops in emission order (which is topological).
@@ -714,7 +749,10 @@ impl Builder {
                 let c = &pref[s];
                 let mx = c.iter().copied().max().unwrap_or(0) as u64;
                 let tot: u64 = c.iter().map(|&x| x as u64).sum();
-                (std::cmp::Reverse(mx * dc as u64 - tot.min(mx * dc as u64)), s)
+                (
+                    std::cmp::Reverse(mx * dc as u64 - tot.min(mx * dc as u64)),
+                    s,
+                )
             });
             for s in order {
                 let c = &pref[s];
@@ -878,7 +916,10 @@ impl Builder {
         // Consumers read the op's stale output, so tokens are garbage. That is intended: this
         // measures scheduling, and wrong numerics are a valid instrument for scheduling.
         if let Ok(spec) = std::env::var("PLOW_CHAIN_BYPASS") {
-            let want: Vec<u16> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            let want: Vec<u16> = spec
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
             // Predecessor sets first, so a run of bypassed ops collapses transitively. Only
             // all-coarse ops are liftable; the DECODE program is entirely coarse (graphstat:
             // SE_FINE == 0), the prefill programs carry Fine edges and are left untouched —
@@ -888,7 +929,11 @@ impl Builder {
                 if !want.contains(&self.ops[i].inst.op) {
                     continue;
                 }
-                if self.ops[i].deps.iter().any(|d| !matches!(d, Dep::Coarse(_))) {
+                if self.ops[i]
+                    .deps
+                    .iter()
+                    .any(|d| !matches!(d, Dep::Coarse(_)))
+                {
                     continue;
                 }
                 let mut up: Vec<u32> = Vec::new();
@@ -1054,8 +1099,8 @@ impl Builder {
         // the segment boundary is spurious there and would otherwise force a segmented relaunch path.
         // `deny_uniseg` wins over the environment: a target that cannot express one segment must
         // not be given one because a variable said so. See that method for the failure it prevents.
-        let uniseg = !self.uniseg_denied
-            && std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1");
+        let uniseg =
+            !self.uniseg_denied && std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1");
         let wave_class = |op: u16| -> u8 {
             if uniseg {
                 8
@@ -1182,7 +1227,10 @@ impl Builder {
             for i in 0..self.ops.len() {
                 let gemm_class = wave_class(self.ops[i].inst.op) == 8;
                 let fills = self.ops[i].cus.len() == n_cu_sz;
-                let has_fine = self.ops[i].deps.iter().any(|d| matches!(d, Dep::Fine { .. }));
+                let has_fine = self.ops[i]
+                    .deps
+                    .iter()
+                    .any(|d| matches!(d, Dep::Fine { .. }));
                 if gemm_class && fills && !has_fine && !fine_prod[i] {
                     let orig = self.ops[i].cus.clone();
                     let mut cus = orig.clone();
@@ -1233,7 +1281,10 @@ impl Builder {
             let mut resliced = 0usize;
             for i in 0..self.ops.len() {
                 let fills = self.ops[i].cus.len() == n_cu_sz;
-                let has_fine = self.ops[i].deps.iter().any(|d| matches!(d, Dep::Fine { .. }));
+                let has_fine = self.ops[i]
+                    .deps
+                    .iter()
+                    .any(|d| matches!(d, Dep::Fine { .. }));
                 if wide_gemv(self.ops[i].inst.op) && fills && !has_fine && !fine_prod[i] {
                     let orig = self.ops[i].cus.clone();
                     let mut cus = Vec::with_capacity(orig.len() * gemv_split);
@@ -1266,7 +1317,10 @@ impl Builder {
                 // per-slice lists for this op — but we always are (see `fine` below), so a
                 // Fine dep contributes nothing to the instruction's list.
                 if let Dep::Coarse(c) = d {
-                    waits.push(Wait { id: *c, threshold: producer.cus.len() as u32 });
+                    waits.push(Wait {
+                        id: *c,
+                        threshold: producer.cus.len() as u32,
+                    });
                 }
             }
             inst.wait_len = (waits.len() as u32 - inst.wait_ofs) as u16;
@@ -1282,8 +1336,11 @@ impl Builder {
             // `slice` is the op-local index of this workgroup, NOT the CU id: the op's
             // kernel splits its work into `blocks` shares and this is which share.
             for (slice, &cu) in op.cus.iter().enumerate() {
-                let mut e =
-                    StreamEnt { inst: idx as u32, slice: slice as u32, ..Default::default() };
+                let mut e = StreamEnt {
+                    inst: idx as u32,
+                    slice: slice as u32,
+                    ..Default::default()
+                };
                 // L2-domain placement (PLOW_L2_PLACE): `seg` is a PER-SLICE domain, so a full
                 // op's slices spread across every L2 domain (no skew) and slice `s` sits in the
                 // same domain across ops (consumer reads producer from one L2 slice). A
@@ -1310,12 +1367,18 @@ impl Builder {
                             match d {
                                 Dep::Coarse(c) => {
                                     let p = &self.ops[*c as usize];
-                                    waits.push(Wait { id: *c, threshold: p.cus.len() as u32 });
+                                    waits.push(Wait {
+                                        id: *c,
+                                        threshold: p.cus.len() as u32,
+                                    });
                                 }
                                 Dep::Fine { producer, map } => {
                                     let base = fine_base[*producer as usize];
                                     for &ps in &map[slice] {
-                                        waits.push(Wait { id: base + ps, threshold: 1 });
+                                        waits.push(Wait {
+                                            id: base + ps,
+                                            threshold: 1,
+                                        });
                                     }
                                 }
                             }
@@ -1379,7 +1442,8 @@ impl Builder {
         // the struct does not grow. A count of 1 is left as 0: a single-slice packet on a domain
         // has no followers to rendezvous with, and the interpreter reads 0 as "no hierarchy".
         if l2_place.is_some() {
-            let mut per: std::collections::HashMap<(u32, u16), u32> = std::collections::HashMap::new();
+            let mut per: std::collections::HashMap<(u32, u16), u32> =
+                std::collections::HashMap::new();
             for e in &gq_stream {
                 *per.entry((e.inst, e.seg)).or_insert(0) += 1;
             }
@@ -1797,7 +1861,6 @@ impl Program {
     }
 }
 
-
 /// A whole model: several programs (prefill, decode) over ONE shared tensor table.
 ///
 /// They must share it. Prefill fills the KV cache and decode appends to it, so they have to
@@ -1872,7 +1935,11 @@ impl Model {
                 }
                 None => INIT_NONE,
             };
-            decls.push(BlobTensor { name, bytes: t.bytes, init_off });
+            decls.push(BlobTensor {
+                name,
+                bytes: t.bytes,
+                init_off,
+            });
         }
 
         // L2-domain placement summary across programs (PLOW_L2_PLACE): all placed
@@ -1903,14 +1970,17 @@ impl Model {
         b.extend_from_slice(&init);
         pod(&self.kv_row_insts, &mut b);
         for (i, p) in self.progs.iter().enumerate() {
-            pod(&[BlobProgHeader {
-                n_inst: p.insts.len() as u32,
-                n_stream: p.stream.len() as u32,
-                n_wait: p.waits.len() as u32,
-                n_succ: p.succs.len() as u32,
-                n_counter: p.n_counter,
-                t: self.prog_t[i],
-            }], &mut b);
+            pod(
+                &[BlobProgHeader {
+                    n_inst: p.insts.len() as u32,
+                    n_stream: p.stream.len() as u32,
+                    n_wait: p.waits.len() as u32,
+                    n_succ: p.succs.len() as u32,
+                    n_counter: p.n_counter,
+                    t: self.prog_t[i],
+                }],
+                &mut b,
+            );
             let packed: Vec<crate::dev::DevInst64> = p.insts.iter().map(DevInst::pack).collect();
             pod(&packed, &mut b);
             pod(&p.stream, &mut b);
@@ -1955,7 +2025,11 @@ impl Model {
         if !self.gen.is_empty() {
             let mut data = Vec::with_capacity(self.gen.len() * size_of::<GenTensor>());
             pod(&self.gen, &mut data);
-            all.push(SectionData { kind: SECT_GEN_TENSORS, name: "rope".into(), data });
+            all.push(SectionData {
+                kind: SECT_GEN_TENSORS,
+                name: "rope".into(),
+                data,
+            });
         }
         all.extend(sections.iter().map(|s| SectionData {
             kind: s.kind,
@@ -1995,7 +2069,11 @@ impl Model {
                 }
                 None => INIT_NONE,
             };
-            decls.push(BlobTensor { name, bytes: t.bytes, init_off });
+            decls.push(BlobTensor {
+                name,
+                bytes: t.bytes,
+                init_off,
+            });
         }
 
         // L2-domain placement summary (PLOW_L2_PLACE) — see to_blob().
@@ -2005,7 +2083,11 @@ impl Model {
         };
         // Header placeholder — sect_dir_offset patched after we know the full layout.
         let hdr = BlobHeader {
-            magic: if self.gen.is_empty() { *BLOB_MAGIC_V6 } else { *BLOB_MAGIC_V7 },
+            magic: if self.gen.is_empty() {
+                *BLOB_MAGIC_V6
+            } else {
+                *BLOB_MAGIC_V7
+            },
             n_cu: self.n_cu,
             n_tensor: self.tensors.len() as u32,
             n_prog: self.progs.len() as u32,
@@ -2023,14 +2105,17 @@ impl Model {
         pod(&self.kv_row_insts, &mut b);
 
         for (i, p) in self.progs.iter().enumerate() {
-            pod(&[BlobProgHeader {
-                n_inst: p.insts.len() as u32,
-                n_stream: p.stream.len() as u32,
-                n_wait: p.waits.len() as u32,
-                n_succ: p.succs.len() as u32,
-                n_counter: p.n_counter,
-                t: self.prog_t[i],
-            }], &mut b);
+            pod(
+                &[BlobProgHeader {
+                    n_inst: p.insts.len() as u32,
+                    n_stream: p.stream.len() as u32,
+                    n_wait: p.waits.len() as u32,
+                    n_succ: p.succs.len() as u32,
+                    n_counter: p.n_counter,
+                    t: self.prog_t[i],
+                }],
+                &mut b,
+            );
             let packed: Vec<crate::dev::DevInst64> = p.insts.iter().map(DevInst::pack).collect();
             pod(&packed, &mut b);
             pod(&p.stream, &mut b);
@@ -2077,8 +2162,7 @@ impl Model {
         // BlobHeader layout: magic(8) + n_cu(4) + n_tensor(4) + n_prog(4) + n_kvrow(4)
         //                    + flags(4) + _pad(4) + init_bytes(8) = 40 bytes before reserved[0].
         let reserved0_off = 40;
-        b[reserved0_off..reserved0_off + 8]
-            .copy_from_slice(&sect_dir_offset.to_le_bytes());
+        b[reserved0_off..reserved0_off + 8].copy_from_slice(&sect_dir_offset.to_le_bytes());
 
         b
     }
@@ -2106,7 +2190,11 @@ mod locality_census_tests {
     use super::*;
 
     const D: u32 = 8;
-    const LAYOUT: L2Layout = L2Layout { sms: 32, domains: D, map: L2Map::RoundRobin };
+    const LAYOUT: L2Layout = L2Layout {
+        sms: 32,
+        domains: D,
+        map: L2Map::RoundRobin,
+    };
 
     /// A chain of full-width ops joined by COARSE edges — the shape every dense decode and
     /// prefill program collapses to, because `select_granularity` downgrades a homogeneous
@@ -2133,8 +2221,14 @@ mod locality_census_tests {
         assert!(c.pairs > 0);
         let want = c.pairs / D as u64;
         assert_eq!(c.same_current, want, "emitted mapping = 1/{D} of pairs");
-        assert_eq!(c.same_greedy, want, "greedy pred-affinity = the same 1/{D}, exactly");
-        assert_eq!(c.same_ceiling, want, "even the balance-free per-slice argmax cannot beat it");
+        assert_eq!(
+            c.same_greedy, want,
+            "greedy pred-affinity = the same 1/{D}, exactly"
+        );
+        assert_eq!(
+            c.same_ceiling, want,
+            "even the balance-free per-slice argmax cannot beat it"
+        );
     }
 
     /// And it is not that the greedy pass is a no-op: it relocates most of the program and still
@@ -2148,7 +2242,10 @@ mod locality_census_tests {
             c.moved_slices,
             c.slices
         );
-        assert_eq!(c.same_greedy, c.same_current, "…and changed the locality by zero");
+        assert_eq!(
+            c.same_greedy, c.same_current,
+            "…and changed the locality by zero"
+        );
     }
 
     /// A SPARSE edge is the only place placement can pay: give each consumer slice exactly one
@@ -2165,11 +2262,20 @@ mod locality_census_tests {
         // keeps the fine edge (`hetero_can_win`) instead of collapsing it.
         let map: Vec<Vec<u32>> = (0..n_cu).map(|s| vec![s]).collect();
         let work: Vec<u32> = (0..n_cu).map(|s| 1 + s).collect();
-        b.emit_dep_work(DevOp::Nop, all, vec![Dep::Fine { producer: p, map }], work, |_| {});
+        b.emit_dep_work(
+            DevOp::Nop,
+            all,
+            vec![Dep::Fine { producer: p, map }],
+            work,
+            |_| {},
+        );
         b.select_granularity();
         let c = b.locality_census_stats(Some(LAYOUT));
         assert_eq!(c.all_to_all_pairs, 0, "a 1:1 map is sparse");
-        assert_eq!(c.same_current, c.pairs, "slice s and slice s are the same workgroup index");
+        assert_eq!(
+            c.same_current, c.pairs,
+            "slice s and slice s are the same workgroup index"
+        );
         assert_eq!(c.same_greedy, c.pairs, "greedy holds it");
     }
 }
@@ -2204,7 +2310,11 @@ mod l2_placement_tests {
     /// So a packet destined for domain d must be given to the workgroups where `n % 8 == d`.
     #[test]
     fn round_robin_places_workgroup_n_on_domain_n_mod_domains() {
-        let l = L2Layout { sms: 32, domains: 8, map: L2Map::RoundRobin };
+        let l = L2Layout {
+            sms: 32,
+            domains: 8,
+            map: L2Map::RoundRobin,
+        };
         let p = placed(256, &[DevOp::Nop], Some(l));
         assert_eq!(p.l2_domains, 8, "placement must be active");
         for e in &p.stream {
@@ -2218,16 +2328,25 @@ mod l2_placement_tests {
             );
         }
         // Every domain window is equally full — 8 domains × 32 of the 256 slices.
-        let per: Vec<u32> =
-            (0..8).map(|d| p.gq_seg_ofs[d + 1] - p.gq_seg_ofs[d]).collect();
-        assert_eq!(per, vec![32; 8], "round-robin over 256 slices must not skew");
+        let per: Vec<u32> = (0..8)
+            .map(|d| p.gq_seg_ofs[d + 1] - p.gq_seg_ofs[d])
+            .collect();
+        assert_eq!(
+            per,
+            vec![32; 8],
+            "round-robin over 256 slices must not skew"
+        );
     }
 
     /// NVIDIA. Consecutive blocks fill a GPC, so the block formula stands — and this test is
     /// what stops the AMD fix from becoming a blanket rewrite of a shipped NVIDIA path.
     #[test]
     fn block_map_places_workgroup_n_on_domain_n_div_sms() {
-        let l = L2Layout { sms: 32, domains: 8, map: L2Map::Block };
+        let l = L2Layout {
+            sms: 32,
+            domains: 8,
+            map: L2Map::Block,
+        };
         let p = placed(256, &[DevOp::Nop], Some(l));
         assert_eq!(p.l2_domains, 8);
         for e in &p.stream {
@@ -2240,10 +2359,23 @@ mod l2_placement_tests {
     /// (`n/32 == n%8`), which is the 12.5% the probe measured for the block formula.
     #[test]
     fn the_two_maps_disagree_on_the_real_decode_grid() {
-        let rr = L2Layout { sms: 32, domains: 8, map: L2Map::RoundRobin };
-        let bl = L2Layout { sms: 32, domains: 8, map: L2Map::Block };
-        let agree = (0..256u32).filter(|&n| rr.domain_of(n) == bl.domain_of(n)).count();
-        assert_eq!(agree, 32, "the maps must coincide on exactly 32 of 256 workgroups");
+        let rr = L2Layout {
+            sms: 32,
+            domains: 8,
+            map: L2Map::RoundRobin,
+        };
+        let bl = L2Layout {
+            sms: 32,
+            domains: 8,
+            map: L2Map::Block,
+        };
+        let agree = (0..256u32)
+            .filter(|&n| rr.domain_of(n) == bl.domain_of(n))
+            .count();
+        assert_eq!(
+            agree, 32,
+            "the maps must coincide on exactly 32 of 256 workgroups"
+        );
     }
 
     /// `n_cu > domains*sms` is occupancy>1. The block formula would then run off the end of the
@@ -2252,14 +2384,29 @@ mod l2_placement_tests {
     /// placement would be silently off on exactly the occ-2 configs it is safe for.
     #[test]
     fn occupancy_two_declines_block_but_not_round_robin() {
-        let bl = placed(512, &[DevOp::Nop], Some(L2Layout { sms: 32, domains: 8, map: L2Map::Block }));
+        let bl = placed(
+            512,
+            &[DevOp::Nop],
+            Some(L2Layout {
+                sms: 32,
+                domains: 8,
+                map: L2Map::Block,
+            }),
+        );
         assert_eq!(bl.l2_domains, 0, "block map must decline at occupancy 2");
         let rr = placed(
             512,
             &[DevOp::Nop],
-            Some(L2Layout { sms: 32, domains: 8, map: L2Map::RoundRobin }),
+            Some(L2Layout {
+                sms: 32,
+                domains: 8,
+                map: L2Map::RoundRobin,
+            }),
         );
-        assert_eq!(rr.l2_domains, 8, "round-robin is in range at occupancy 2 — measured");
+        assert_eq!(
+            rr.l2_domains, 8,
+            "round-robin is in range at occupancy 2 — measured"
+        );
         for e in &rr.stream {
             assert_eq!(e.seg as u32, e.slice % 8);
         }
@@ -2271,12 +2418,26 @@ mod l2_placement_tests {
     /// and the lm_head are dropped — 8.7 ms of "prefill" and all-zero logits.
     #[test]
     fn a_multi_wave_class_program_is_never_placed() {
-        let l = L2Layout { sms: 32, domains: 8, map: L2Map::RoundRobin };
+        let l = L2Layout {
+            sms: 32,
+            domains: 8,
+            map: L2Map::RoundRobin,
+        };
         let p = placed(256, &[DevOp::Nop, DevOp::FlashPrefill, DevOp::Nop], Some(l));
-        assert_eq!(p.l2_domains, 0, "a segmented program must fall back byte-identical");
+        assert_eq!(
+            p.l2_domains, 0,
+            "a segmented program must fall back byte-identical"
+        );
         // …and the wave classes survive intact: 3 segments, one per class run.
-        assert_eq!(p.gq_seg_ofs.len() - 1, 3, "wave-class segmentation must be preserved");
-        assert!(p.stream.iter().any(|e| e.seg == 1), "the flash run keeps its own segment");
+        assert_eq!(
+            p.gq_seg_ofs.len() - 1,
+            3,
+            "wave-class segmentation must be preserved"
+        );
+        assert!(
+            p.stream.iter().any(|e| e.seg == 1),
+            "the flash run keeps its own segment"
+        );
     }
 
     /// The other half: a SINGLE-wave-class program (decode has no `FlashPrefill`) has nothing in
@@ -2285,7 +2446,11 @@ mod l2_placement_tests {
     /// than per-target.
     #[test]
     fn a_single_wave_class_program_is_placed() {
-        let l = L2Layout { sms: 32, domains: 8, map: L2Map::RoundRobin };
+        let l = L2Layout {
+            sms: 32,
+            domains: 8,
+            map: L2Map::RoundRobin,
+        };
         let p = placed(256, &[DevOp::Nop, DevOp::Gemv, DevOp::Nop], Some(l));
         assert_eq!(p.l2_domains, 8, "decode-shaped programs must be placed");
         assert_eq!(p.l2_sms, 32);
@@ -2298,10 +2463,26 @@ mod l2_placement_tests {
     /// would have silently disabled it.
     #[test]
     fn a_segmented_program_is_still_placed_when_the_target_ignores_the_class() {
-        let l = L2Layout { sms: 32, domains: 8, map: L2Map::Block };
-        let p = build(256, &[DevOp::Nop, DevOp::FlashPrefill, DevOp::Nop], Some(l), false);
-        assert_eq!(p.l2_domains, 8, "sm_120 placement must survive the AMD gate");
-        assert_eq!(p.gq_seg_ofs.len() - 1, 8, "windows are the 8 L2 domains, not wave classes");
+        let l = L2Layout {
+            sms: 32,
+            domains: 8,
+            map: L2Map::Block,
+        };
+        let p = build(
+            256,
+            &[DevOp::Nop, DevOp::FlashPrefill, DevOp::Nop],
+            Some(l),
+            false,
+        );
+        assert_eq!(
+            p.l2_domains, 8,
+            "sm_120 placement must survive the AMD gate"
+        );
+        assert_eq!(
+            p.gq_seg_ofs.len() - 1,
+            8,
+            "windows are the 8 L2 domains, not wave classes"
+        );
     }
 
     /// Off ⇒ byte-identical. The whole feature has to be a no-op when unset, or every existing
@@ -2310,7 +2491,15 @@ mod l2_placement_tests {
     fn placement_off_is_byte_identical() {
         let ops = [DevOp::Nop, DevOp::FlashPrefill, DevOp::Gemv];
         let a = placed(256, &ops, None);
-        let b = placed(256, &ops, Some(L2Layout { sms: 0, domains: 0, map: L2Map::Block }));
+        let b = placed(
+            256,
+            &ops,
+            Some(L2Layout {
+                sms: 0,
+                domains: 0,
+                map: L2Map::Block,
+            }),
+        );
         assert_eq!(a.stream, b.stream);
         assert_eq!(a.gq_stream, b.gq_stream);
         assert_eq!(a.gq_seg_ofs, b.gq_seg_ofs);
@@ -2330,7 +2519,13 @@ mod granularity_tests {
         // consumer slice s waits only on producer slice s
         let map: Vec<Vec<u32>> = (0..work.len() as u32).map(|s| vec![s]).collect();
         let cus: Vec<u32> = (0..work.len() as u32).collect();
-        b.emit_dep_work(DevOp::Nop, cus, vec![Dep::Fine { producer: p, map }], work, |_| {});
+        b.emit_dep_work(
+            DevOp::Nop,
+            cus,
+            vec![Dep::Fine { producer: p, map }],
+            work,
+            |_| {},
+        );
         // n_counter > n_ops exactly when a fine producer got per-slice counters.
         b.finish().n_counter > 2
     }
@@ -2340,7 +2535,10 @@ mod granularity_tests {
     /// compiler must therefore NOT emit them — they cost counters and atomics for nothing.
     #[test]
     fn uniform_work_is_downgraded_to_coarse() {
-        assert!(!survives(vec![10, 10, 10, 10]), "uniform region must fall back to coarse");
+        assert!(
+            !survives(vec![10, 10, 10, 10]),
+            "uniform region must fall back to coarse"
+        );
     }
 
     /// MoE experts get different token counts by construction. Then a straggling producer can
@@ -2348,7 +2546,10 @@ mod granularity_tests {
     /// is exactly `hetero_can_win`. The compiler must keep the fine gates here.
     #[test]
     fn heterogeneous_work_keeps_fine_gates() {
-        assert!(survives(vec![1, 40, 3, 9]), "imbalanced region must keep its fine gates");
+        assert!(
+            survives(vec![1, 40, 3, 9]),
+            "imbalanced region must keep its fine gates"
+        );
     }
 }
 
@@ -2373,7 +2574,11 @@ mod seg_window_tests {
         // GEMM, flash, GEMM, flash, ... — the wave class flips every op, so
         // seg_of increments on every boundary.
         for i in 0..9u32 {
-            let op = if i % 2 == 1 { DevOp::FlashPrefill } else { DevOp::Nop };
+            let op = if i % 2 == 1 {
+                DevOp::FlashPrefill
+            } else {
+                DevOp::Nop
+            };
             // Vary the CU set so some CUs miss some ops entirely — that is the
             // case where a per-CU window is NOT just the segment's global range.
             let cus: Vec<u32> = match i % 3 {
@@ -2418,17 +2623,26 @@ mod seg_window_tests {
             let my = &p.stream[o..o + len];
             let r = &ofs[cu * row..(cu + 1) * row];
             assert_eq!(r[0], 0, "cu {cu} window table must start at 0");
-            assert_eq!(r[n_seg as usize], len as u32, "cu {cu} windows must cover the slice");
+            assert_eq!(
+                r[n_seg as usize], len as u32,
+                "cu {cu} windows must cover the slice"
+            );
             let mut covered = 0usize;
             for s in 0..n_seg {
                 let (lo, hi) = (r[s as usize] as usize, r[s as usize + 1] as usize);
-                assert!(lo <= hi && hi <= len, "cu {cu} seg {s}: bad window [{lo},{hi}) of {len}");
+                assert!(
+                    lo <= hi && hi <= len,
+                    "cu {cu} seg {s}: bad window [{lo},{hi}) of {len}"
+                );
                 covered += hi - lo;
                 // what the window yields
                 let win: Vec<u32> = (lo..hi).map(|i| my[i].inst).collect();
                 // what `if (e.seg != prog.cur_seg) continue;` yielded
-                let filt: Vec<u32> =
-                    my.iter().filter(|e| e.seg as u32 == s).map(|e| e.inst).collect();
+                let filt: Vec<u32> = my
+                    .iter()
+                    .filter(|e| e.seg as u32 == s)
+                    .map(|e| e.inst)
+                    .collect();
                 assert_eq!(win, filt, "cu {cu} seg {s}: window != filtered scan");
             }
             assert_eq!(covered, len, "cu {cu}: windows must partition the slice");
@@ -2448,7 +2662,11 @@ mod seg_window_tests {
     #[test]
     fn l2_placement_gives_one_full_window_and_the_rest_empty() {
         for map in [L2Map::Block, L2Map::RoundRobin] {
-            let l = L2Layout { sms: 2, domains: 4, map };
+            let l = L2Layout {
+                sms: 2,
+                domains: 4,
+                map,
+            };
             let mut b = Builder::new(8);
             b.set_l2_placement(Some(l));
             let all = b.all();
@@ -2465,7 +2683,11 @@ mod seg_window_tests {
                 for s in 0..n_seg {
                     let (lo, hi) = (r[s as usize], r[s as usize + 1]);
                     let want = if s == mine { len as u32 } else { 0 };
-                    assert_eq!(hi - lo, want, "{map:?} cu {cu} seg {s}: expected {want} entries");
+                    assert_eq!(
+                        hi - lo,
+                        want,
+                        "{map:?} cu {cu} seg {s}: expected {want} entries"
+                    );
                 }
             }
         }
@@ -2476,7 +2698,10 @@ mod seg_window_tests {
     /// load time rather than as a model that speaks confident nonsense.
     #[test]
     fn non_monotonic_stream_is_refused() {
-        let e = |seg: u16| StreamEnt { seg, ..Default::default() };
+        let e = |seg: u16| StreamEnt {
+            seg,
+            ..Default::default()
+        };
         let stream = vec![e(0), e(1), e(0)];
         let err = static_seg_ofs(&stream, &[0], &[3], 2).unwrap_err();
         assert!(err.contains("not monotonic"), "unexpected error: {err}");
@@ -2519,7 +2744,10 @@ mod v6_tests {
             stream: vec![se(0, 0), se(1, 0)],
             stream_ofs: vec![0, 1],
             stream_len: vec![1, 1],
-            waits: vec![Wait { id: 0, threshold: 1 }],
+            waits: vec![Wait {
+                id: 0,
+                threshold: 1,
+            }],
             succs: vec![0],
             tensors: Vec::new(),
             gq_stream: vec![se(0, 0), se(1, 0)],
@@ -2530,7 +2758,11 @@ mod v6_tests {
         Model {
             n_cu: 2,
             target: 0,
-            tensors: vec![TensorDecl { name: "buf".into(), bytes: 64, init: None }],
+            tensors: vec![TensorDecl {
+                name: "buf".into(),
+                bytes: 64,
+                init: None,
+            }],
             progs: vec![prog()],
             kv_row_insts: vec![],
             prog_t: vec![128],
@@ -2544,8 +2776,16 @@ mod v6_tests {
         let cubin_data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
         let meta_data = b"{\"model\":\"gemma4\"}".to_vec();
         let sections = vec![
-            SectionData { kind: SECT_CUBIN, name: "interp_sm120".into(), data: cubin_data.clone() },
-            SectionData { kind: SECT_METADATA, name: "meta".into(), data: meta_data.clone() },
+            SectionData {
+                kind: SECT_CUBIN,
+                name: "interp_sm120".into(),
+                data: cubin_data.clone(),
+            },
+            SectionData {
+                kind: SECT_METADATA,
+                name: "meta".into(),
+                data: meta_data.clone(),
+            },
         ];
         let blob = m.to_blob_v6(&sections);
 
@@ -2568,13 +2808,19 @@ mod v6_tests {
         };
         let e1: BlobSectionEntry = unsafe {
             core::ptr::read_unaligned(
-                blob[dir_off + 8 + ent_size..].as_ptr() as *const BlobSectionEntry,
+                blob[dir_off + 8 + ent_size..].as_ptr() as *const BlobSectionEntry
             )
         };
         assert_eq!(e0.kind, SECT_CUBIN);
         assert_eq!(e1.kind, SECT_METADATA);
-        assert_eq!(&blob[e0.offset as usize..e0.offset as usize + e0.size as usize], &cubin_data);
-        assert_eq!(&blob[e1.offset as usize..e1.offset as usize + e1.size as usize], &meta_data);
+        assert_eq!(
+            &blob[e0.offset as usize..e0.offset as usize + e0.size as usize],
+            &cubin_data
+        );
+        assert_eq!(
+            &blob[e1.offset as usize..e1.offset as usize + e1.size as usize],
+            &meta_data
+        );
     }
 
     #[test]
@@ -2602,24 +2848,48 @@ mod v6_tests {
     fn multi_bucket_v6_roundtrip() {
         // Simulate a real model: 4 prefill buckets (T=128,512,1024,4096) + decode (T=1).
         let inst = |op: u16| DevInst {
-            op, blocks: 2, wait_len: 0, succ_len: 1, wait_ofs: 0, succ_ofs: 0,
-            t: [0; 8], i: [0; 8], f: [0.0; 2], j: [0; 2],
+            op,
+            blocks: 2,
+            wait_len: 0,
+            succ_len: 1,
+            wait_ofs: 0,
+            succ_ofs: 0,
+            t: [0; 8],
+            i: [0; 8],
+            f: [0.0; 2],
+            j: [0; 2],
         };
         let se = |inst: u32, slice: u32| StreamEnt {
-            inst, slice, wait_ofs: 0, succ_ofs: 0, wait_len: 0, succ_len: 0, flags: 0, seg: 0,
+            inst,
+            slice,
+            wait_ofs: 0,
+            succ_ofs: 0,
+            wait_len: 0,
+            succ_len: 0,
+            flags: 0,
+            seg: 0,
         };
         let make_prog = |n_inst: usize| Program {
             n_cu: 4,
             n_counter: n_inst as u32,
             hier_base: 0,
             insts: (0..n_inst).map(|i| inst(8 + i as u16)).collect(),
-            stream: (0..n_inst * 2).map(|i| se(i as u32 / 2, i as u32 % 2)).collect(),
+            stream: (0..n_inst * 2)
+                .map(|i| se(i as u32 / 2, i as u32 % 2))
+                .collect(),
             stream_ofs: vec![0, n_inst as u32, n_inst as u32 * 2, n_inst as u32 * 2],
             stream_len: vec![n_inst as u32, n_inst as u32, 0, 0],
-            waits: (0..n_inst).map(|i| Wait { id: i as u32, threshold: 2 }).collect(),
+            waits: (0..n_inst)
+                .map(|i| Wait {
+                    id: i as u32,
+                    threshold: 2,
+                })
+                .collect(),
             succs: (0..n_inst).map(|i| i as u32).collect(),
             tensors: Vec::new(),
-            gq_stream: (0..n_inst * 2).map(|i| se(i as u32 / 2, i as u32 % 2)).collect(),
+            gq_stream: (0..n_inst * 2)
+                .map(|i| se(i as u32 / 2, i as u32 % 2))
+                .collect(),
             gq_seg_ofs: vec![0, n_inst as u32 * 2],
             l2_sms: 0,
             l2_domains: 0,
@@ -2638,10 +2908,26 @@ mod v6_tests {
             n_cu: 4,
             target: 0,
             tensors: vec![
-                TensorDecl { name: "model.q".into(), bytes: 1024, init: None },
-                TensorDecl { name: "model.k".into(), bytes: 512, init: None },
-                TensorDecl { name: "kv.cache".into(), bytes: 8192, init: None },
-                TensorDecl { name: "rope.cos".into(), bytes: 16, init: Some(vec![1; 16]) },
+                TensorDecl {
+                    name: "model.q".into(),
+                    bytes: 1024,
+                    init: None,
+                },
+                TensorDecl {
+                    name: "model.k".into(),
+                    bytes: 512,
+                    init: None,
+                },
+                TensorDecl {
+                    name: "kv.cache".into(),
+                    bytes: 8192,
+                    init: None,
+                },
+                TensorDecl {
+                    name: "rope.cos".into(),
+                    bytes: 16,
+                    init: Some(vec![1; 16]),
+                },
             ],
             progs,
             kv_row_insts: vec![2, 3],
@@ -2651,9 +2937,11 @@ mod v6_tests {
 
         // Pack as v6 with an embedded cubin
         let fake_cubin = vec![0xAA; 256];
-        let sections = vec![
-            SectionData { kind: SECT_CUBIN, name: "sm120".into(), data: fake_cubin.clone() },
-        ];
+        let sections = vec![SectionData {
+            kind: SECT_CUBIN,
+            name: "sm120".into(),
+            data: fake_cubin.clone(),
+        }];
         let blob = m.to_blob_v6(&sections);
 
         // Parse header
@@ -2674,7 +2962,10 @@ mod v6_tests {
         };
         assert_eq!(ent.kind, SECT_CUBIN);
         assert_eq!(ent.size, 256);
-        assert_eq!(&blob[ent.offset as usize..ent.offset as usize + 256], &fake_cubin);
+        assert_eq!(
+            &blob[ent.offset as usize..ent.offset as usize + 256],
+            &fake_cubin
+        );
 
         // Byte-equality with v5 payload (minus magic + reserved[0])
         let v5 = m.to_blob();
@@ -2682,7 +2973,7 @@ mod v6_tests {
         // for tensors, init, programs)
         let _payload_start = 64usize; // after BlobHeader
         let v5_gq_end = v5.len(); // v5 ends after GQ01
-        // In v6, sections appear after the GQ01 appendix, then the directory
+                                  // In v6, sections appear after the GQ01 appendix, then the directory
         assert!(blob.len() > v5_gq_end, "v6 is larger due to sections");
     }
 }

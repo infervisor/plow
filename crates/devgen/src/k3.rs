@@ -570,7 +570,11 @@ fn k3_shard_head(c: &K3ModelCfg) -> bool {
 
 /// This rank's lm_head vocab shard (`c.vocab` when replicated).
 fn k3_vocab_l(c: &K3ModelCfg) -> u32 {
-    if k3_shard_head(c) { c.vocab / c.tp } else { c.vocab }
+    if k3_shard_head(c) {
+        c.vocab / c.tp
+    } else {
+        c.vocab
+    }
 }
 
 /// The workgroups a `FlashMlaDecode`-family packet can actually use.
@@ -678,7 +682,11 @@ pub fn emit_attn_res(
         "AttnRes: ring capacity {nb_cap} cannot hold {nb} live rows{}; the ring strides by the \
          CAPACITY, so a short one aliases token slices onto each other — no fault, no NaN, a \
          fluent wrong model",
-        if push.is_some() { " plus the pushed one" } else { "" }
+        if push.is_some() {
+            " plus the pushed one"
+        } else {
+            ""
+        }
     );
     let blocks: Vec<u32> = (0..t.min(n_cu).max(1)).collect();
     b.emit(DevOp::AttnRes, blocks, deps, |d| {
@@ -779,7 +787,11 @@ pub fn emit_k3_linear_norm(
     // kernel's own `per = ceil(n/nblk)` arithmetic, so every surviving workgroup's column range is
     // unchanged and the packet is bit-identical. Tiled prefill ops own TILES, not column runs, so
     // the rule applies to the GEMV arm only.
-    let blocks = if gemv_arm { crate::mla::blocked_gemv_cus(&all, n) } else { all };
+    let blocks = if gemv_arm {
+        crate::mla::blocked_gemv_cus(&all, n)
+    } else {
+        all
+    };
     b.emit(op, blocks, deps, |d| {
         d.t[0] = out;
         d.t[1] = x;
@@ -1158,12 +1170,17 @@ pub fn emit_k3_latent_moe(
             }
             // Combine at LATENT width. `t[1]` (residual) and `t[2]` (shared) stay
             // TENSOR_NONE — see the doc comment.
-            b.emit(DevOp::MoeCombine, combine_cus(&all, t * lat), &c_down, |d| {
-                d.t[0] = cmb_dst;
-                d.t[3] = part;
-                d.i[0] = lat;
-                d.i[1] = c.top_k;
-            })
+            b.emit(
+                DevOp::MoeCombine,
+                combine_cus(&all, t * lat),
+                &c_down,
+                |d| {
+                    d.t[0] = cmb_dst;
+                    d.t[3] = part;
+                    d.i[0] = lat;
+                    d.i[1] = c.top_k;
+                },
+            )
         }
     } else {
         // The grouped arrays are sized on the MPF_BM-PADDED row bound: the align op rounds each
@@ -1181,10 +1198,17 @@ pub fn emit_k3_latent_moe(
         // and must be declared, or the fused bridge writes through a null handle.
         let fu_g = b.tensor(
             &format!("{a}moe_fug"),
-            if mx { pad_rows * (imoe / 2) as u64 } else { pad_rows * imoe as u64 * 2 },
+            if mx {
+                pad_rows * (imoe / 2) as u64
+            } else {
+                pad_rows * imoe as u64 * 2
+            },
         );
         let fu_scale = if mx {
-            b.tensor(&format!("{a}moe_fuscale"), pad_rows * (imoe / crate::mla::MX_BLOCK) as u64)
+            b.tensor(
+                &format!("{a}moe_fuscale"),
+                pad_rows * (imoe / crate::mla::MX_BLOCK) as u64,
+            )
         } else {
             packet::dev::TENSOR_NONE
         };
@@ -1274,7 +1298,15 @@ pub fn emit_k3_latent_moe(
     };
     if tp.on() {
         c_cmb = crate::emit_xreduce(
-            b, &mut tp.xgate, t == 1, &tp.xr_cus, c_cmb, ylat, t * lat, tp.tp, tp.slot_b,
+            b,
+            &mut tp.xgate,
+            t == 1,
+            &tp.xr_cus,
+            c_cmb,
+            ylat,
+            t * lat,
+            tp.tp,
+            tp.slot_b,
         );
     }
     // THE LATENT NORM FOLDS INTO THE UP-PROJECTION THAT READS IT — 92 packets, 92 chain levels.
@@ -1327,7 +1359,11 @@ pub fn emit_k3_latent_moe(
     // `hid_l` is the GATHER's per-rank column count; `up_n` is what the GEMV computes. They
     // differ only under `PLOW_K3_UP_GATHER_ONLY`, which keeps the weight whole on purpose.
     let hid_l = if shard_up { tp.local(hid) } else { hid };
-    let up_n = if shard_up && !up_gather_only() { hid_l } else { hid };
+    let up_n = if shard_up && !up_gather_only() {
+        hid_l
+    } else {
+        hid
+    };
     let up_dst = if shard_up { tp.ug } else { yh };
     let c_up = emit_k3_linear_norm(
         b,
@@ -1367,18 +1403,23 @@ pub fn emit_k3_latent_moe(
     // in flight, which is the starvation `op_gemm.h`'s own GEMV sweep names as the sub-ceiling cause.
     let fused_sh = fuse_shared_glu(t, c.hidden);
     let c_sa = if fused_sh {
-        b.emit(DevOp::GemvGlu, crate::mla::blocked_gemv_cus(&all, si_l), deps, |d| {
-            d.t[0] = sha;
-            d.t[1] = x;
-            d.t[2] = w.shared_gate;
-            d.t[5] = w.shared_up;
-            d.i[0] = t;
-            d.i[1] = si_l;
-            d.i[2] = hid;
-            d.i[5] = K3_MOE_ACT_SITU;
-            d.f[0] = cb.situ_beta;
-            d.f[1] = cb.situ_linear_beta;
-        })
+        b.emit(
+            DevOp::GemvGlu,
+            crate::mla::blocked_gemv_cus(&all, si_l),
+            deps,
+            |d| {
+                d.t[0] = sha;
+                d.t[1] = x;
+                d.t[2] = w.shared_gate;
+                d.t[5] = w.shared_up;
+                d.i[0] = t;
+                d.i[1] = si_l;
+                d.i[2] = hid;
+                d.i[5] = K3_MOE_ACT_SITU;
+                d.f[0] = cb.situ_beta;
+                d.f[1] = cb.situ_linear_beta;
+            },
+        )
     } else {
         let c_sg = gemv(b, shg, x, w.shared_gate, si_l, hid, deps[0]);
         let c_su = gemv(b, shu, x, w.shared_up, si_l, hid, deps[0]);
@@ -1418,8 +1459,23 @@ pub fn emit_k3_latent_moe(
     // chain; a third `act.*_tp` slot would buy it back, at the price of a host change (the peer
     // slots are bound by literal name, `plowrt::exec::amd:2861-2862`) and a peer-region resize.
     let sh_dst = if tp.on() { tp.og } else { shd };
-    let sh_deps: Vec<u32> = if tp.on() { vec![c_sa, c_cmb] } else { vec![c_sa] };
-    let mut c_sd = emit_k3_linear(b, sh_dst, sha, w.shared_down, t, hid, si_l, n_cu, seq_rows, &sh_deps);
+    let sh_deps: Vec<u32> = if tp.on() {
+        vec![c_sa, c_cmb]
+    } else {
+        vec![c_sa]
+    };
+    let mut c_sd = emit_k3_linear(
+        b,
+        sh_dst,
+        sha,
+        w.shared_down,
+        t,
+        hid,
+        si_l,
+        n_cu,
+        seq_rows,
+        &sh_deps,
+    );
 
     // ONE COLLECTIVE FOR BOTH FFN HALVES, and the packet count is why it is one and not two.
     //
@@ -1454,9 +1510,22 @@ pub fn emit_k3_latent_moe(
         // the collective lands in `shd`. Without it, the collective already IS the answer and
         // writes `out` directly — one packet fewer than the replicated emit, not one more.
         let ffn = if resid_in.is_some() { shd } else { out };
-        let gather = if up_nogather() { None } else { Some((tp.slot_c(), hid_l, hid)) };
+        let gather = if up_nogather() {
+            None
+        } else {
+            Some((tp.slot_c(), hid_l, hid))
+        };
         c_sd = crate::emit_xreduce_gather(
-            b, &mut tp.xgate, t == 1, &tp.xr_cus, &[c_sd, c_up], ffn, t * hid, tp.tp, 0, gather,
+            b,
+            &mut tp.xgate,
+            t == 1,
+            &tp.xr_cus,
+            &[c_sd, c_up],
+            ffn,
+            t * hid,
+            tp.tp,
+            0,
+            gather,
         );
         return match resid_in {
             Some(p) => b.emit(DevOp::Residual, vec8_cus(&all, t * hid), &[c_sd], |d| {
@@ -1475,20 +1544,33 @@ pub fn emit_k3_latent_moe(
     // finite, plausible and wrong. Reduce to whole, THEN add.
     if tp.on() {
         c_sd = crate::emit_xreduce(
-            b, &mut tp.xgate, t == 1, &tp.xr_cus, c_sd, shd, t * hid, tp.tp, 0,
+            b,
+            &mut tp.xgate,
+            t == 1,
+            &tp.xr_cus,
+            c_sd,
+            shd,
+            t * hid,
+            tp.tp,
+            0,
         );
     }
 
-    b.emit(DevOp::Residual, vec8_cus(&all, t * hid), &[c_up, c_sd], |d| {
-        d.t[0] = out;
-        d.t[1] = yh;
-        d.t[2] = shd;
-        // The OUTER residual, folded. `d_residual` rounds the inner sum to bf16 before adding it,
-        // which is exactly what the deleted `{a}ffn` store did, so this is bit-exact.
-        d.t[3] = resid_in.unwrap_or(packet::dev::TENSOR_NONE);
-        d.i[0] = t * hid;
-        d.f[0] = 1.0;
-    })
+    b.emit(
+        DevOp::Residual,
+        vec8_cus(&all, t * hid),
+        &[c_up, c_sd],
+        |d| {
+            d.t[0] = out;
+            d.t[1] = yh;
+            d.t[2] = shd;
+            // The OUTER residual, folded. `d_residual` rounds the inner sum to bf16 before adding it,
+            // which is exactly what the deleted `{a}ffn` store did, so this is bit-exact.
+            d.t[3] = resid_in.unwrap_or(packet::dev::TENSOR_NONE);
+            d.i[0] = t * hid;
+            d.f[0] = 1.0;
+        },
+    )
 }
 
 /// K3's MLA geometry. Shares K2's shape; the two departures are the OUTPUT GATE
@@ -1615,7 +1697,11 @@ pub fn emit_k3_mla_mixer(
 
     // `prenormed` makes the caller's AttnRes output the pre-normed `x` itself: no second buffer,
     // no P0 packet.
-    let x = if prenormed { hidden } else { bft(b, format!("{a}x"), tt * c.hidden as u64) };
+    let x = if prenormed {
+        hidden
+    } else {
+        bft(b, format!("{a}x"), tt * c.hidden as u64)
+    };
     let qlr = bft(b, format!("{a}q_lora"), tt * ql as u64);
     // Unwritten when the q-side norm folds; declared anyway, for the reason `{a}yn` is.
     let qlat = bft(b, format!("{a}q_lat"), tt * ql as u64);
@@ -1636,7 +1722,11 @@ pub fn emit_k3_mla_mixer(
     // run completes with plausible garbage rather than faulting. This is the same
     // "`t > 1` does not mean prefill" trap the arm selection below spells out, one buffer earlier.
     let nsplit = if t == 1 || seq_rows { c.n_split } else { 1 };
-    let opart = f32t(b, format!("{a}o_part"), tt * nh as u64 * dk as u64 * nsplit as u64);
+    let opart = f32t(
+        b,
+        format!("{a}o_part"),
+        tt * nh as u64 * dk as u64 * nsplit as u64,
+    );
     let mlpart = f32t(b, format!("{a}ml_part"), tt * nh as u64 * 2 * nsplit as u64);
     let oat = bft(b, format!("{a}o_attn"), tt * nhvd as u64);
     let gl = bft(b, format!("{a}o_gate_raw"), tt * nhvd as u64);
@@ -1663,7 +1753,11 @@ pub fn emit_k3_mla_mixer(
     // Pre-norm. `x` feeds the q down-proj, the kv down-proj, the k-rope
     // down-proj AND g_proj — four consumers, which is why the gate's dependency
     // is on this and not on the attention output.
-    let c_ln = if prenormed { deps[0] } else { rms(b, x, hidden, w.ln_w, c.hidden, deps) };
+    let c_ln = if prenormed {
+        deps[0]
+    } else {
+        rms(b, x, hidden, w.ln_w, c.hidden, deps)
+    };
 
     // FUSION A. Four down-projections read `x` at `K = hidden`; their columns concatenate into one
     // four-stream packet. `W_g` is the ninth pointer and rides in `i[6]` as a handle — `t[8]` is
@@ -1704,11 +1798,39 @@ pub fn emit_k3_mla_mixer(
     // polls and a level of the chain. Both consumers must fold or neither can: leaving one
     // reading `qlat` would keep the RMSNORM alive and the fusion would buy nothing.
     let fold_q = fuse_norm_gemv(t, ql, NormSite::Q);
-    let c_rnq = if fold_q { c_qad } else { rms(b, qlat, qlr, w.q_a_norm, ql, &[c_qad]) };
+    let c_rnq = if fold_q {
+        c_qad
+    } else {
+        rms(b, qlat, qlr, w.q_a_norm, ql, &[c_qad])
+    };
     let q_src = if fold_q { qlr } else { qlat };
     let qn = fold_q.then_some((w.q_a_norm, c.eps));
-    let c_qa = emit_k3_linear_norm(b, qa, q_src, w.q_absorb, t, nh * dk, ql, n_cu, seq_rows, qn, &[c_rnq]);
-    let c_qrr = emit_k3_linear_norm(b, qrr, q_src, w.q_rope, t, nh * dr, ql, n_cu, seq_rows, qn, &[c_rnq]);
+    let c_qa = emit_k3_linear_norm(
+        b,
+        qa,
+        q_src,
+        w.q_absorb,
+        t,
+        nh * dk,
+        ql,
+        n_cu,
+        seq_rows,
+        qn,
+        &[c_rnq],
+    );
+    let c_qrr = emit_k3_linear_norm(
+        b,
+        qrr,
+        q_src,
+        w.q_rope,
+        t,
+        nh * dr,
+        ql,
+        n_cu,
+        seq_rows,
+        qn,
+        &[c_rnq],
+    );
 
     // q-side HeadNormRope: identity table, gamma absent, skip_norm — a bit-exact
     // copy. Emitted rather than skipped so it stays checkable.
@@ -1822,7 +1944,11 @@ pub fn emit_k3_mla_mixer(
         },
         // Decode's work-item count is `(nh/gf) * nsplit`; prefill's `i[4]` is `n_tok`, so the
         // count saturates the machine at every bucket and the narrowing is inert there.
-        if decode_arm { k3_flash_cus(&all, t, nh, c.gf, c.n_split) } else { all.clone() },
+        if decode_arm {
+            k3_flash_cus(&all, t, nh, c.gf, c.n_split)
+        } else {
+            all.clone()
+        },
         &[c_qa, c_qr, c_rnkv, c_krd],
         |d| {
             d.t[0] = opart;
@@ -1920,7 +2046,15 @@ pub struct K3Tp {
 impl K3Tp {
     /// A TP1 context: no collectives, no peer slots.
     pub fn none() -> Self {
-        K3Tp { tp: 1, og: 0, dg: 0, ug: 0, slot_b: 0, xgate: 0, xr_cus: Vec::new() }
+        K3Tp {
+            tp: 1,
+            og: 0,
+            dg: 0,
+            ug: 0,
+            slot_b: 0,
+            xgate: 0,
+            xr_cus: Vec::new(),
+        }
     }
     pub fn on(&self) -> bool {
         self.tp > 1
@@ -2019,7 +2153,15 @@ pub fn emit_k3_dense_mlp(
     let c_d = gemv(b, dst, act, down_w, cb.hidden, inter, &[c_a]);
     if tp.on() {
         return crate::emit_xreduce(
-            b, &mut tp.xgate, t == 1, &tp.xr_cus, c_d, out, t * cb.hidden, tp.tp, tp.slot_b,
+            b,
+            &mut tp.xgate,
+            t == 1,
+            &tp.xr_cus,
+            c_d,
+            out,
+            t * cb.hidden,
+            tp.tp,
+            tp.slot_b,
         );
     }
     c_d
@@ -2134,22 +2276,48 @@ pub fn emit_k3_block(
     // partial slot and the all-reduce below produces the real attention output.
     let attn_dst = if tp.on() { Some(tp.og) } else { None };
     let (c_o, attn_partial) = match &w.mixer {
-        K3Mixer::Kda { cfg, w: kw, st } => {
-            crate::kda::emit_kda_mixer(
-                b, cfg, kw, st, a, t, h_a, attn_dst, n_cu, fuse_pre, &[dep], seq_rows,
-            )
-        }
-        K3Mixer::Mla { cfg, w: mw } => {
-            emit_k3_mla_mixer(
-                b, cfg, mw, a, t, ctx, h_a, attn_dst, n_cu, fuse_pre, &[dep], seq_rows,
-            )
-        }
+        K3Mixer::Kda { cfg, w: kw, st } => crate::kda::emit_kda_mixer(
+            b,
+            cfg,
+            kw,
+            st,
+            a,
+            t,
+            h_a,
+            attn_dst,
+            n_cu,
+            fuse_pre,
+            &[dep],
+            seq_rows,
+        ),
+        K3Mixer::Mla { cfg, w: mw } => emit_k3_mla_mixer(
+            b,
+            cfg,
+            mw,
+            a,
+            t,
+            ctx,
+            h_a,
+            attn_dst,
+            n_cu,
+            fuse_pre,
+            &[dep],
+            seq_rows,
+        ),
     };
     let (c_o, attn) = if tp.on() {
         let full = bft(b, format!("{a}attn_full"));
         (
             crate::emit_xreduce(
-                b, &mut tp.xgate, t == 1, &tp.xr_cus, c_o, full, t * hid, tp.tp, 0,
+                b,
+                &mut tp.xgate,
+                t == 1,
+                &tp.xr_cus,
+                c_o,
+                full,
+                t * hid,
+                tp.tp,
+                0,
             ),
             full,
         )
@@ -2218,7 +2386,11 @@ pub fn emit_k3_block(
     // The block-output residual, folded into the MoE tail's own add when there is one to fold into
     // (see [`fuse_block_resid`]). `out` then IS the layer output and `{a}ffn` never exists.
     let fuse_bo = fuse_block_resid() && matches!(w.ffn, K3Ffn::Latent(_));
-    let ffn = if fuse_bo { out } else { bft(b, format!("{a}ffn")) };
+    let ffn = if fuse_bo {
+        out
+    } else {
+        bft(b, format!("{a}ffn"))
+    };
     let c_ffn = match &w.ffn {
         K3Ffn::Latent(mw) => emit_k3_latent_moe(
             b,
@@ -2241,7 +2413,20 @@ pub fn emit_k3_block(
             down,
             inter,
         } => emit_k3_dense_mlp(
-            b, cb, a, ffn, h3, *gate, *up, *down, *inter, t, seq_rows, n_cu, tp, &[dep],
+            b,
+            cb,
+            a,
+            ffn,
+            h3,
+            *gate,
+            *up,
+            *down,
+            *inter,
+            t,
+            seq_rows,
+            n_cu,
+            tp,
+            &[dep],
         ),
     };
     if fuse_bo {
@@ -2369,11 +2554,20 @@ pub fn emit_k3_model(
     // block output), and every scratch buffer is written before it is read inside its own layer.
     // What stays per-layer is what must: the KDA recurrent state and the MLA `kv.{l}.*` cache rows,
     // which carry ACROSS layers and are `kv.`-prefixed, not `act.`-prefixed.
-    let act_pfx = |l: u32| if t == 1 { format!("act.l{l}.") } else { "act.pf.".to_string() };
+    let act_pfx = |l: u32| {
+        if t == 1 {
+            format!("act.l{l}.")
+        } else {
+            "act.pf.".to_string()
+        }
+    };
 
     // Globals.
     let ids = b.tensor("in.ids", t as u64 * 4);
-    let emb = b.tensor(&format!("{pfx}embed_tokens.weight"), c.vocab as u64 * hid as u64 * 2);
+    let emb = b.tensor(
+        &format!("{pfx}embed_tokens.weight"),
+        c.vocab as u64 * hid as u64 * 2,
+    );
     let fin = b.tensor(&format!("{pfx}norm.weight"), hid as u64 * 2);
     // lm_head SITS BESIDE `model.`, NOT INSIDE IT. The checkpoint has
     // `language_model.lm_head.weight` while every layer is under
@@ -2386,7 +2580,10 @@ pub fn emit_k3_model(
     // Declared size IS the sharding request: `asset::shard::slice_for` promotes lm_head to Column
     // purely from `want == full / tp`, so this one line is the whole host-side change.
     let vocab_l = k3_vocab_l(c);
-    let head = b.tensor(&format!("{tower}lm_head.weight"), vocab_l as u64 * hid as u64 * 2);
+    let head = b.tensor(
+        &format!("{tower}lm_head.weight"),
+        vocab_l as u64 * hid as u64 * 2,
+    );
     let x = b.tensor("act.x", t as u64 * hid as u64 * 2);
     let xnext = b.tensor("act.xnext", t as u64 * hid as u64 * 2);
     let xn = b.tensor("act.xn", t as u64 * hid as u64 * 2);
@@ -2492,10 +2689,19 @@ pub fn emit_k3_model(
                 crate::kda::declare_kda_state(b, &kda_l, &format!("kv.{l}."), slots),
             ));
             let (kw, ks) = kda_pair.as_ref().unwrap();
-            K3Mixer::Kda { cfg: &kda_l, w: kw, st: ks }
+            K3Mixer::Kda {
+                cfg: &kda_l,
+                w: kw,
+                st: ks,
+            }
         } else {
-            mla_w = Some(declare_k3_mla_weights(b, &mla_l, &lp, l, ctx, cos, sin, pos, kvlen, slots));
-            K3Mixer::Mla { cfg: &mla_l, w: mla_w.as_ref().unwrap() }
+            mla_w = Some(declare_k3_mla_weights(
+                b, &mla_l, &lp, l, ctx, cos, sin, pos, kvlen, slots,
+            ));
+            K3Mixer::Mla {
+                cfg: &mla_l,
+                w: mla_w.as_ref().unwrap(),
+            }
         };
         let mw;
         let ffn = if l < c.first_k_dense {
@@ -2532,13 +2738,33 @@ pub fn emit_k3_model(
         let w = K3LayerWeights {
             mixer,
             ffn,
-            post_ln: b.tensor(&format!("{lp}post_attention_layernorm.weight"), hid as u64 * 2),
-            sa_score_w: b.tensor(&format!("{lp}self_attention_res_score.weight"), hid as u64 * 4),
+            post_ln: b.tensor(
+                &format!("{lp}post_attention_layernorm.weight"),
+                hid as u64 * 2,
+            ),
+            sa_score_w: b.tensor(
+                &format!("{lp}self_attention_res_score.weight"),
+                hid as u64 * 4,
+            ),
             mlp_score_w: b.tensor(&format!("{lp}mlp_res_score.weight"), hid as u64 * 4),
         };
         dep = emit_k3_block(
-            b, cb, &c.moe, &w, &act_pfx(l), l, ctx, nxt, cur, blkres, nb_max, t, n_cu,
-            &mut tp, &[dep], rows == RowKind::Sequences,
+            b,
+            cb,
+            &c.moe,
+            &w,
+            &act_pfx(l),
+            l,
+            ctx,
+            nxt,
+            cur,
+            blkres,
+            nb_max,
+            t,
+            n_cu,
+            &mut tp,
+            &[dep],
+            rows == RowKind::Sequences,
         );
         cur = nxt;
     }
@@ -2571,8 +2797,15 @@ pub fn emit_k3_model(
     // so it absorbs it under the same knob ([`fuse_attnres_norm`]) and `xn` IS the normed row.
     let fuse_fin = fuse_attnres_norm() && nb_fin > 0;
     if nb_fin > 0 {
-        let ores = b.tensor(&format!("{pfx}output_attn_res_score.weight"), hid as u64 * 4);
-        let dst = if fuse_fin { xn } else { b.tensor("act.xres", t as u64 * hid as u64 * 2) };
+        let ores = b.tensor(
+            &format!("{pfx}output_attn_res_score.weight"),
+            hid as u64 * 4,
+        );
+        let dst = if fuse_fin {
+            xn
+        } else {
+            b.tensor("act.xres", t as u64 * hid as u64 * 2)
+        };
         dep = emit_attn_res(
             b,
             cb,
@@ -2615,14 +2848,19 @@ pub fn emit_k3_model(
         // every row, so it starts at the first). The host re-patches this per prefill chunk.
         d.i[4] = if seq_rows { 0 } else { t - 1 };
     });
-    let c_am = b.emit(DevOp::Argmax, (0..crate::AMAX_BLOCKS).collect(), &[c_lm], |d| {
-        d.t[0] = amax;
-        d.t[1] = logits;
-        d.i[0] = vocab_l;
-        // `d_argmax`'s n_batch, which it has always taken and no emitter has ever set:
-        // "i1 = n_batch (0/1 => single sequence, byte-identical)" (runtime/amd/interp.hip:1299).
-        d.i[1] = if seq_rows { t } else { 0 };
-    });
+    let c_am = b.emit(
+        DevOp::Argmax,
+        (0..crate::AMAX_BLOCKS).collect(),
+        &[c_lm],
+        |d| {
+            d.t[0] = amax;
+            d.t[1] = logits;
+            d.i[0] = vocab_l;
+            // `d_argmax`'s n_batch, which it has always taken and no emitter has ever set:
+            // "i1 = n_batch (0/1 => single sequence, byte-identical)" (runtime/amd/interp.hip:1299).
+            d.i[1] = if seq_rows { t } else { 0 };
+        },
+    );
     if k3_shard_head(c) {
         // XArgmaxFin SUBSUMES ArgmaxFin — it folds the AMAX_BLOCKS partials itself, rebases the
         // winning index by `rank * vocab_l` and takes the cross-rank max. Emitting both would fold
@@ -2681,17 +2919,37 @@ pub fn declare_k3_mla_weights(
     slots: u64,
 ) -> K3MlaWeights {
     let (h, nh) = (c.hidden as u64, c.heads as u64);
-    let (dk, dr, vd, ql) = (c.kv_lora as u64, c.qk_rope as u64, c.v_head as u64, c.q_lora as u64);
+    let (dk, dr, vd, ql) = (
+        c.kv_lora as u64,
+        c.qk_rope as u64,
+        c.v_head as u64,
+        c.q_lora as u64,
+    );
     K3MlaWeights {
         ln_w: b.tensor(&format!("{lp}input_layernorm.weight"), h * 2),
         q_a: b.tensor(&format!("{lp}self_attn.q_a_proj.weight"), ql * h * 2),
         q_a_norm: b.tensor(&format!("{lp}self_attn.q_a_layernorm.weight"), ql * 2),
-        q_absorb: b.tensor(&format!("{lp}self_attn.derived.q_absorb.weight"), nh * dk * ql * 2),
-        q_rope: b.tensor(&format!("{lp}self_attn.derived.q_rope.weight"), nh * dr * ql * 2),
-        kv_a: b.tensor(&format!("{lp}self_attn.kv_a_proj_with_mqa.weight"), dk * h * 2),
-        k_rope_d: b.tensor(&format!("{lp}self_attn.derived.k_rope_down.weight"), dr * h * 2),
+        q_absorb: b.tensor(
+            &format!("{lp}self_attn.derived.q_absorb.weight"),
+            nh * dk * ql * 2,
+        ),
+        q_rope: b.tensor(
+            &format!("{lp}self_attn.derived.q_rope.weight"),
+            nh * dr * ql * 2,
+        ),
+        kv_a: b.tensor(
+            &format!("{lp}self_attn.kv_a_proj_with_mqa.weight"),
+            dk * h * 2,
+        ),
+        k_rope_d: b.tensor(
+            &format!("{lp}self_attn.derived.k_rope_down.weight"),
+            dr * h * 2,
+        ),
         kv_a_norm: b.tensor(&format!("{lp}self_attn.kv_a_layernorm.weight"), dk * 2),
-        v_absorb: b.tensor(&format!("{lp}self_attn.derived.v_absorb.weight"), nh * dk * vd * 2),
+        v_absorb: b.tensor(
+            &format!("{lp}self_attn.derived.v_absorb.weight"),
+            nh * dk * vd * 2,
+        ),
         // THE CHECKPOINT CALLS THE MLA OUTPUT GATE `g_proj`, not `o_gate_proj` —
         // the same spelling the KDA layers use for their gate, which is consistent
         // once you notice both are "the gate on this mixer's output". Verified
@@ -2775,12 +3033,21 @@ pub fn declare_k3_moe_weights(b: &mut Builder, c: &K3MoeCfg, lp: &str, tp: u32) 
         // for why COLUMN is the only axis available and why the gather is free.
         up_latent: b.tensor(
             &n("routed_expert_up_proj.weight"),
-            if shard_up_proj(tp) && !up_gather_only() { tp_local(c.hidden) } else { c.hidden as u64 }
-                * lat
+            if shard_up_proj(tp) && !up_gather_only() {
+                tp_local(c.hidden)
+            } else {
+                c.hidden as u64
+            } * lat
                 * 2,
         ),
-        expert_w_table: b.tensor(&format!("moe.{lp}expert_weight_table"), c.n_exp as u64 * 3 * 8),
-        expert_s_table: b.tensor(&format!("moe.{lp}expert_scale_table"), c.n_exp as u64 * 3 * 8),
+        expert_w_table: b.tensor(
+            &format!("moe.{lp}expert_weight_table"),
+            c.n_exp as u64 * 3 * 8,
+        ),
+        expert_s_table: b.tensor(
+            &format!("moe.{lp}expert_scale_table"),
+            c.n_exp as u64 * 3 * 8,
+        ),
         // SHARDED, and this was the single largest line item in the decode stream. `shared_inter`
         // is `n_shared_experts * moe_inter` = 2 * 3072 = 6144, so the three matrices are
         // 3 * 6144 * 7168 * 2 B = 264 MB per layer. Declared at FULL width they were REPLICATED,
@@ -2865,17 +3132,36 @@ mod tests {
         let mw = K3MoeWeights {
             router: b.tensor(&format!("{p}mlp.gate.weight"), 896 * 7168 * 2),
             router_bias: b.tensor(&format!("{p}mlp.gate.e_score_correction_bias"), 896 * 4),
-            down_latent: b.tensor(&format!("{p}mlp.routed_expert_down_proj.weight"), 3584 * 7168 * 2),
+            down_latent: b.tensor(
+                &format!("{p}mlp.routed_expert_down_proj.weight"),
+                3584 * 7168 * 2,
+            ),
             latent_norm: b.tensor(&format!("{p}mlp.routed_expert_norm.weight"), 3584 * 4),
-            up_latent: b.tensor(&format!("{p}mlp.routed_expert_up_proj.weight"), 7168 * 3584 * 2),
+            up_latent: b.tensor(
+                &format!("{p}mlp.routed_expert_up_proj.weight"),
+                7168 * 3584 * 2,
+            ),
             expert_w_table: b.tensor("moe.expert_weight_table", 896 * 3 * 8),
             expert_s_table: b.tensor("moe.expert_scale_table", 896 * 3 * 8),
-            shared_gate: b.tensor(&format!("{p}mlp.shared_experts.gate_proj.weight"), 2048 * 7168 * 2),
-            shared_up: b.tensor(&format!("{p}mlp.shared_experts.up_proj.weight"), 2048 * 7168 * 2),
-            shared_down: b.tensor(&format!("{p}mlp.shared_experts.down_proj.weight"), 7168 * 2048 * 2),
+            shared_gate: b.tensor(
+                &format!("{p}mlp.shared_experts.gate_proj.weight"),
+                2048 * 7168 * 2,
+            ),
+            shared_up: b.tensor(
+                &format!("{p}mlp.shared_experts.up_proj.weight"),
+                2048 * 7168 * 2,
+            ),
+            shared_down: b.tensor(
+                &format!("{p}mlp.shared_experts.down_proj.weight"),
+                7168 * 2048 * 2,
+            ),
         };
         let w = K3LayerWeights {
-            mixer: K3Mixer::Kda { cfg: &ck, w: &kw, st: &ks },
+            mixer: K3Mixer::Kda {
+                cfg: &ck,
+                w: &kw,
+                st: &ks,
+            },
             ffn: K3Ffn::Latent(&mw),
             post_ln: b.tensor(&format!("{p}post_attention_layernorm.weight"), 7168 * 2),
             sa_score_w: b.tensor(&format!("{p}self_attention_res_score.weight"), 7168 * 4),
@@ -2885,8 +3171,24 @@ mod tests {
         let blkres = b.tensor("kv.blkres", 8 * 7168 * 2);
         let out = b.tensor("act.xnext", 7168 * 2);
         let seed = b.emit(DevOp::Nop, vec![0], &[], |_| {});
-        emit_k3_block(&mut b, &cb, &cm, &w, "act.l1.", 1, 4096, out, prefix_in, blkres, 8, 1, 256,
-                      &mut K3Tp::none(), &[seed], false);
+        emit_k3_block(
+            &mut b,
+            &cb,
+            &cm,
+            &w,
+            "act.l1.",
+            1,
+            4096,
+            out,
+            prefix_in,
+            blkres,
+            8,
+            1,
+            256,
+            &mut K3Tp::none(),
+            &[seed],
+            false,
+        );
         b.finish()
     }
 
@@ -2902,13 +3204,24 @@ mod tests {
         assert_eq!(n(DevOp::MoeExpertDownFp8Blk), 0);
         assert_eq!(n(DevOp::MoeGroupGluFp8Blk), 1);
         assert_eq!(n(DevOp::MoeGroupDownFp8Blk), 1);
-        let g = p.insts.iter().find(|i| i.op == DevOp::MoeGroupGluFp8Blk as u16).unwrap();
+        let g = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeGroupGluFp8Blk as u16)
+            .unwrap();
         assert_eq!(g.i[0], 16, "grouped packet loops every selected slot");
-        assert_eq!(g.i[1], 3072, "single-rank block keeps the full expert intermediate width");
+        assert_eq!(
+            g.i[1], 3072,
+            "single-rank block keeps the full expert intermediate width"
+        );
         assert_eq!(g.i[2], 3584, "experts consume the latent width");
         assert_eq!(g.i[5], K3_MOE_ACT_SITU);
         assert_eq!(g.i[6], K3_MOE_ENC_MXFP4);
-        let d = p.insts.iter().find(|i| i.op == DevOp::MoeGroupDownFp8Blk as u16).unwrap();
+        let d = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeGroupDownFp8Blk as u16)
+            .unwrap();
         assert_eq!(d.i[0], 16);
         assert_eq!(d.i[1], 3584);
         assert_eq!(d.i[2], 3072);
@@ -2923,21 +3236,40 @@ mod tests {
         // Two AttnRes with DIFFERENT folded weights — the single most K3-specific
         // thing about the block, and invisible at the block output.
         assert_eq!(n(DevOp::AttnRes), 2, "both AttnRes mixes must be emitted");
-        let ars: Vec<_> = p.insts.iter().filter(|i| i.op == DevOp::AttnRes as u16).collect();
-        assert_ne!(ars[0].t[3], ars[1].t[3], "the two mixes must use DIFFERENT score weights");
+        let ars: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::AttnRes as u16)
+            .collect();
+        assert_ne!(
+            ars[0].t[3], ars[1].t[3],
+            "the two mixes must use DIFFERENT score weights"
+        );
         // The KDA mixer, whole. THREE packets, not six: `kda::fuse_kda` merges the three convs
         // along the channel axis and folds the gate into the recurrence's LDS staging, which is
         // worth 207 packets per token against a measured ~12 us per packet.
         for o in [DevOp::KdaConv3, DevOp::KdaStateStepG, DevOp::KdaGatedNorm] {
             assert!(p.insts.iter().any(|i| i.op == o as u16), "{o:?} missing");
         }
-        assert_eq!(n(DevOp::KdaConv3), 1, "ONE conv packet over all three streams");
+        assert_eq!(
+            n(DevOp::KdaConv3),
+            1,
+            "ONE conv packet over all three streams"
+        );
         for o in [DevOp::KdaConv, DevOp::KdaGate, DevOp::KdaStateStep] {
-            assert_eq!(n(o), 0, "{o:?} is the unfused spelling and must not be emitted");
+            assert_eq!(
+                n(o),
+                0,
+                "{o:?} is the unfused spelling and must not be emitted"
+            );
         }
         // The LatentMoE: router, top_k expert pairs, one combine.
         assert_eq!(n(DevOp::MoeRouterTopk), 1);
-        assert_eq!(n(DevOp::MoeExpertGluFp8Blk), 16, "one gate/up per selected slot");
+        assert_eq!(
+            n(DevOp::MoeExpertGluFp8Blk),
+            16,
+            "one gate/up per selected slot"
+        );
         assert_eq!(n(DevOp::MoeExpertDownFp8Blk), 16);
         assert_eq!(n(DevOp::MoeCombine), 1);
         // ZERO standalone situ GLUs at decode: the shared expert's gate|up|situ is now ONE fused
@@ -2954,21 +3286,51 @@ mod tests {
         let p = build_layer1();
         // Every routed expert runs at the LATENT width, not at hidden. Sizing
         // them at hidden is a silent 2x error.
-        for i in p.insts.iter().filter(|i| i.op == DevOp::MoeExpertGluFp8Blk as u16) {
+        for i in p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::MoeExpertGluFp8Blk as u16)
+        {
             assert_eq!(i.i[2], 3584, "expert GLU K must be the latent width");
             assert_eq!(i.i[5], 2, "routed experts must carry the situ act code");
-            assert_eq!(i.i[6], 2, "mxfp4 encoding must ride i[6], not i[3] (= n_exp)");
+            assert_eq!(
+                i.i[6], 2,
+                "mxfp4 encoding must ride i[6], not i[3] (= n_exp)"
+            );
         }
-        for i in p.insts.iter().filter(|i| i.op == DevOp::MoeExpertDownFp8Blk as u16) {
+        for i in p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::MoeExpertDownFp8Blk as u16)
+        {
             assert_eq!(i.i[1], 3584, "expert DOWN N must be the latent width");
         }
         // The combine runs at latent width with NO residual and NO shared operand.
-        let cmb = p.insts.iter().find(|i| i.op == DevOp::MoeCombine as u16).unwrap();
-        assert_eq!(cmb.i[0], 3584, "combine must accumulate at the latent width");
-        assert_eq!(cmb.t[1], packet::dev::TENSOR_NONE, "no residual at latent width");
-        assert_eq!(cmb.t[2], packet::dev::TENSOR_NONE, "shared expert is added AFTER the up-proj");
+        let cmb = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeCombine as u16)
+            .unwrap();
+        assert_eq!(
+            cmb.i[0], 3584,
+            "combine must accumulate at the latent width"
+        );
+        assert_eq!(
+            cmb.t[1],
+            packet::dev::TENSOR_NONE,
+            "no residual at latent width"
+        );
+        assert_eq!(
+            cmb.t[2],
+            packet::dev::TENSOR_NONE,
+            "shared expert is added AFTER the up-proj"
+        );
         // The router scores the HIDDEN state.
-        let rl = p.insts.iter().find(|i| i.op == DevOp::MoeRouterTopk as u16).unwrap();
+        let rl = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeRouterTopk as u16)
+            .unwrap();
         assert_eq!(rl.i[1], 896);
         assert_eq!(rl.i[2], 16);
     }
@@ -2980,7 +3342,11 @@ mod tests {
     fn snapshot_layers_restart_the_prefix_instead_of_adding() {
         let p = build_layer1();
         // Layer 1 is NOT a snapshot layer: it adds.
-        let res = p.insts.iter().filter(|i| i.op == DevOp::Residual as u16).count();
+        let res = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::Residual as u16)
+            .count();
         assert!(res >= 2, "layer 1 needs the prefix add and the block out");
         assert_eq!(k3().blocks_at(0), 0, "layer 0 enters with an empty ring");
         assert!(k3().snapshots(0) && !k3().snapshots(1));
@@ -2989,10 +3355,28 @@ mod tests {
     fn model_cfg() -> K3ModelCfg {
         K3ModelCfg {
             block: k3(),
-            kda: crate::kda::KdaCfg { hidden: 7168, heads: 96, head_dim: 128, conv_w: 4,
-                gate_lower_bound: Some(-5.0), eps: 1e-5, bv: 16 },
-            mla: K3MlaCfg { hidden: 7168, heads: 96, q_lora: 1536, kv_lora: 512, qk_rope: 64,
-                v_head: 128, eps: 1e-5, scale: 0.0883883, n_split: 4, gf: 4, fp8_kv: false },
+            kda: crate::kda::KdaCfg {
+                hidden: 7168,
+                heads: 96,
+                head_dim: 128,
+                conv_w: 4,
+                gate_lower_bound: Some(-5.0),
+                eps: 1e-5,
+                bv: 16,
+            },
+            mla: K3MlaCfg {
+                hidden: 7168,
+                heads: 96,
+                q_lora: 1536,
+                kv_lora: 512,
+                qk_rope: 64,
+                v_head: 128,
+                eps: 1e-5,
+                scale: 0.0883883,
+                n_split: 4,
+                gf: 4,
+                fp8_kv: false,
+            },
             moe: k3_moe(),
             vocab: 163840,
             first_k_dense: 1,
@@ -3010,30 +3394,59 @@ mod tests {
     fn a_truncated_model_emits_embed_layers_and_tail() {
         let c = model_cfg();
         let mut b = Builder::new(256);
-        emit_k3_model(&mut b, &c, &|_| true, &[0, 1, 2], 4096, 1, 1, 256, RowKind::Tokens);
+        emit_k3_model(
+            &mut b,
+            &c,
+            &|_| true,
+            &[0, 1, 2],
+            4096,
+            1,
+            1,
+            256,
+            RowKind::Tokens,
+        );
         let p = b.finish();
         let n = |o: DevOp| p.insts.iter().filter(|i| i.op == o as u16).count();
 
         assert_eq!(n(DevOp::Embed), 1, "one embed prologue");
         assert_eq!(n(DevOp::KdaStateStepG), 3, "one recurrence per layer");
-        assert_eq!(n(DevOp::KdaConv3), 3, "ONE fused short conv per layer, not three");
+        assert_eq!(
+            n(DevOp::KdaConv3),
+            3,
+            "ONE fused short conv per layer, not three"
+        );
         // Layer 0 is dense, layers 1 and 2 are LatentMoE.
         assert_eq!(n(DevOp::MoeRouterTopk), 2, "only the two MoE layers route");
         assert_eq!(n(DevOp::MoeCombine), 2);
         // situ: 1 packet for layer 0's DENSE FFN only. The two MoE layers' shared experts are now
         // fused into `GemvGlu`, so they no longer emit a standalone situ packet.
         assert_eq!(n(DevOp::SituGlu), 1, "layer 0's dense FFN");
-        assert_eq!(n(DevOp::GemvGlu), 2, "one fused shared expert per MoE layer");
+        assert_eq!(
+            n(DevOp::GemvGlu),
+            2,
+            "one fused shared expert per MoE layer"
+        );
         // Two AttnRes per layer, including layer 0 — which enters with an EMPTY
         // ring but is a SNAPSHOT layer, so its attention-side packet exists to
         // carry the push (the mix itself is an exact copy at nb = 0), and its
         // MLP-side mix then runs at the POST-push count of 1.
         // ... plus the MODEL-LEVEL mix before the final norm, which is one per PROGRAM and not
         // per layer. `2 * layers + 1`.
-        assert_eq!(n(DevOp::AttnRes), 7, "two mixes per layer, push included, plus the output mix");
-        let ars: Vec<_> = p.insts.iter().filter(|i| i.op == DevOp::AttnRes as u16).collect();
+        assert_eq!(
+            n(DevOp::AttnRes),
+            7,
+            "two mixes per layer, push included, plus the output mix"
+        );
+        let ars: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::AttnRes as u16)
+            .collect();
         // Exactly one push across layers 0..2: only layer 0 snapshots at B = 12.
-        let pushes = ars.iter().filter(|i| i.t[4] != packet::dev::TENSOR_NONE).count();
+        let pushes = ars
+            .iter()
+            .filter(|i| i.t[4] != packet::dev::TENSOR_NONE)
+            .count();
         assert_eq!(pushes, 1, "only layer 0 snapshots in 0..2");
         // Layer 0: mix reads 0 rows, then the push lands on row 0.
         assert_eq!(ars[0].i[2], 0, "layer 0 mixes over an empty ring");
@@ -3043,8 +3456,16 @@ mod tests {
         // The tail.
         assert_eq!(n(DevOp::Argmax), 1);
         assert_eq!(n(DevOp::ArgmaxFin), 1);
-        let lm = p.insts.iter().filter(|i| i.op == DevOp::Gemv as u16).last().unwrap();
-        assert_eq!(lm.i[1], 163840, "the last GEMV is lm_head over the full vocab");
+        let lm = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::Gemv as u16)
+            .last()
+            .unwrap();
+        assert_eq!(
+            lm.i[1], 163840,
+            "the last GEMV is lm_head over the full vocab"
+        );
     }
 
     /// Truncation shrinks the TENSOR TABLE, which is the whole point of the
@@ -3055,7 +3476,17 @@ mod tests {
         let c = model_cfg();
         let count = |layers: &[u32]| {
             let mut b = Builder::new(256);
-            emit_k3_model(&mut b, &c, &|_| true, layers, 4096, 1, 1, 256, RowKind::Tokens);
+            emit_k3_model(
+                &mut b,
+                &c,
+                &|_| true,
+                layers,
+                4096,
+                1,
+                1,
+                256,
+                RowKind::Tokens,
+            );
             b.finish().tensors.len()
         };
         assert!(count(&[0]) < count(&[0, 1]) && count(&[0, 1]) < count(&[0, 1, 2]));
@@ -3069,7 +3500,17 @@ mod tests {
     fn a_hybrid_span_emits_both_mixers() {
         let c = model_cfg();
         let mut b = Builder::new(256);
-        emit_k3_model(&mut b, &c, &|l| l != 3, &[0, 1, 2, 3], 4096, 1, 1, 256, RowKind::Tokens);
+        emit_k3_model(
+            &mut b,
+            &c,
+            &|l| l != 3,
+            &[0, 1, 2, 3],
+            4096,
+            1,
+            1,
+            256,
+            RowKind::Tokens,
+        );
         let p = b.finish();
         let n = |o: DevOp| p.insts.iter().filter(|i| i.op == o as u16).count();
         // Three KDA recurrences and exactly one MLA attention.
@@ -3080,12 +3521,22 @@ mod tests {
         // BOTH HeadNormRope ops survive on the MLA layer. The k-side one is the
         // only writer of the krot cache row and the instruction the runtime
         // scans for; dropping it is garbage that grows with context.
-        assert_eq!(n(DevOp::HeadNormRope), 2, "NoPE keeps both rope ops, neutralized");
+        assert_eq!(
+            n(DevOp::HeadNormRope),
+            2,
+            "NoPE keeps both rope ops, neutralized"
+        );
         // The MLA layer binds q_a_proj, never q_proj.
         let names: Vec<&str> = p.tensors.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.iter().any(|n| n.contains("layers.3.self_attn.q_a_proj")));
-        assert!(!names.iter().any(|n| n.contains("layers.3.self_attn.q_proj")));
-        assert!(names.iter().any(|n| n.contains("layers.2.self_attn.q_proj")));
+        assert!(names
+            .iter()
+            .any(|n| n.contains("layers.3.self_attn.q_a_proj")));
+        assert!(!names
+            .iter()
+            .any(|n| n.contains("layers.3.self_attn.q_proj")));
+        assert!(names
+            .iter()
+            .any(|n| n.contains("layers.2.self_attn.q_proj")));
         // The MLA layer declares KV cache rows; KDA layers declare recurrent state.
         assert!(names.contains(&"kv.3.ckv") && names.contains(&"kv.3.krot"));
         assert!(names.iter().any(|n| *n == "kv.2.state"));
@@ -3109,14 +3560,28 @@ mod tests {
 
         let layers: Vec<u32> = (0..93).collect();
         let mut b = Builder::new(256);
-        emit_k3_model(&mut b, &c, &|l| !mla.contains(&l), &layers, 4096, 1, 1, 256, RowKind::Tokens);
+        emit_k3_model(
+            &mut b,
+            &c,
+            &|l| !mla.contains(&l),
+            &layers,
+            4096,
+            1,
+            1,
+            256,
+            RowKind::Tokens,
+        );
         let p = b.finish();
         let n = |o: DevOp| p.insts.iter().filter(|i| i.op == o as u16).count();
 
         assert_eq!(n(DevOp::KdaStateStepG), 69, "69 KDA layers");
         assert_eq!(n(DevOp::FlashMlaDecode), 24, "24 MLA layers");
         assert_eq!(n(DevOp::MlaOutGate), 24, "every MLA layer is gated");
-        assert_eq!(n(DevOp::HeadNormRope), 48, "both rope ops on every MLA layer");
+        assert_eq!(
+            n(DevOp::HeadNormRope),
+            48,
+            "both rope ops on every MLA layer"
+        );
         // 92 MoE layers (layer 0 is dense), each routing once and combining once.
         assert_eq!(n(DevOp::MoeRouterTopk), 92);
         assert_eq!(n(DevOp::MoeCombine), 92);
@@ -3137,7 +3602,9 @@ mod tests {
         // q_a_proj. A modulus rule would disagree here — that is the documented
         // off-by-one the config LIST exists to prevent.
         let names: Vec<&str> = p.tensors.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.iter().any(|n| n.contains("layers.92.self_attn.q_a_proj")));
+        assert!(names
+            .iter()
+            .any(|n| n.contains("layers.92.self_attn.q_a_proj")));
     }
 
     /// Build the full 93-layer hybrid at a given TP degree.
@@ -3149,7 +3616,17 @@ mod tests {
         mla.insert(92);
         let layers: Vec<u32> = (0..93).collect();
         let mut b = Builder::new(256);
-        emit_k3_model(&mut b, &c, &|l| !mla.contains(&l), &layers, 4096, 1, 1, 256, RowKind::Tokens);
+        emit_k3_model(
+            &mut b,
+            &c,
+            &|l| !mla.contains(&l),
+            &layers,
+            4096,
+            1,
+            1,
+            256,
+            RowKind::Tokens,
+        );
         b.finish()
     }
 
@@ -3163,19 +3640,49 @@ mod tests {
         mla.insert(92);
         let layers: Vec<u32> = (0..93).collect();
         let mut b = Builder::new(256);
-        emit_k3_model(&mut b, &c, &|l| !mla.contains(&l), &layers, 4096, 1, 1, 256, RowKind::Tokens);
+        emit_k3_model(
+            &mut b,
+            &c,
+            &|l| !mla.contains(&l),
+            &layers,
+            4096,
+            1,
+            1,
+            256,
+            RowKind::Tokens,
+        );
         let p = b.finish();
         let n = |o: DevOp| p.insts.iter().filter(|i| i.op == o as u16).count();
         assert_eq!(n(DevOp::FlashMlaDecode), 0);
         assert_eq!(n(DevOp::FlashMlaDecodeFp8), 24);
-        assert_eq!(n(DevOp::HeadNormRopeFp8), 24, "one latent-cache quantizer per MLA layer");
-        let flash = p.insts.iter().find(|i| i.op == DevOp::FlashMlaDecodeFp8 as u16).unwrap();
-        assert_ne!(flash.t[7], packet::dev::TENSOR_NONE, "flash needs the row-scale strip");
+        assert_eq!(
+            n(DevOp::HeadNormRopeFp8),
+            24,
+            "one latent-cache quantizer per MLA layer"
+        );
+        let flash = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::FlashMlaDecodeFp8 as u16)
+            .unwrap();
+        assert_ne!(
+            flash.t[7],
+            packet::dev::TENSOR_NONE,
+            "flash needs the row-scale strip"
+        );
         assert_eq!(flash.i[6], 0, "the 64-wide NoPE cache remains bf16");
         let bytes = |name: &str| p.tensors.iter().find(|t| t.name == name).unwrap().bytes;
-        assert_eq!(bytes("kv.3.ckv"), 4096 * 512, "latent cache is one e4m3 byte/value");
+        assert_eq!(
+            bytes("kv.3.ckv"),
+            4096 * 512,
+            "latent cache is one e4m3 byte/value"
+        );
         assert_eq!(bytes("kv.3.krot"), 4096 * 64 * 2, "NoPE cache remains bf16");
-        assert_eq!(bytes("kv.3.scale"), 4096 * 4, "one f32 scale per latent row");
+        assert_eq!(
+            bytes("kv.3.scale"),
+            4096 * 4,
+            "one f32 scale per latent row"
+        );
     }
 
     /// **THE FULL MODEL AT TP8.** Two all-reduces per layer, the same count GLM
@@ -3186,13 +3693,21 @@ mod tests {
     #[test]
     fn the_full_model_emits_at_tp8() {
         let p = build_full(8);
-        let xr: Vec<_> = p.insts.iter().filter(|i| i.op == DevOp::XReduce as u16).collect();
+        let xr: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::XReduce as u16)
+            .collect();
         // 93 attention (hidden) + 92 MoE-combine (latent) + 1 dense-FFN (hidden)
         // + 92 SHARED-EXPERT (hidden). The third per-MoE-layer reduce is what pays for sharding
         // `shared_experts.*`, whose replicated form streamed 24.3 GB/rank/token — 49% of the whole
         // decode weight stream. It reuses peer slot A rather than adding a name the host would have
         // to bind; see the emit site for the barrier argument that makes the reuse safe.
-        assert_eq!(xr.len(), 278, "three all-reduces per MoE layer, two per attention-only layer");
+        assert_eq!(
+            xr.len(),
+            278,
+            "three all-reduces per MoE layer, two per attention-only layer"
+        );
         for i in &xr {
             assert_eq!(i.i[1], 8, "every collective must carry the world size");
         }
@@ -3202,11 +3717,18 @@ mod tests {
         assert_eq!(gates.len(), xr.len(), "xctr gate ids must not collide");
         // The two reductions in a layer use DIFFERENT peer slots, or they alias.
         let slots: std::collections::BTreeSet<u32> = xr.iter().map(|i| i.i[2]).collect();
-        assert_eq!(slots.len(), 2, "attention and FFN partials need distinct slots");
+        assert_eq!(
+            slots.len(),
+            2,
+            "attention and FFN partials need distinct slots"
+        );
         // The attention reduce is hidden-wide; the MoE one is LATENT-wide.
         let widths: std::collections::BTreeSet<u32> = xr.iter().map(|i| i.i[0]).collect();
         assert!(widths.contains(&7168), "attention reduces at hidden width");
-        assert!(widths.contains(&3584), "the expert combine reduces at LATENT width");
+        assert!(
+            widths.contains(&3584),
+            "the expert combine reduces at LATENT width"
+        );
     }
 
     /// TP1 emits NO collective at all — the identity, so a TP1 blob is
@@ -3214,7 +3736,13 @@ mod tests {
     #[test]
     fn tp1_emits_no_collectives() {
         let p = build_full(1);
-        assert_eq!(p.insts.iter().filter(|i| i.op == DevOp::XReduce as u16).count(), 0);
+        assert_eq!(
+            p.insts
+                .iter()
+                .filter(|i| i.op == DevOp::XReduce as u16)
+                .count(),
+            0
+        );
     }
 
     /// TP shards the HEAD axis and the expert INTERMEDIATE, and leaves the
@@ -3248,13 +3776,27 @@ mod tests {
             "dense down must declare its row-parallel rank slice"
         );
         // Expert GLU N is the LOCAL intermediate: 3072/8.
-        let g = p.insts.iter().find(|i| i.op == DevOp::MoeExpertGluFp8Blk as u16).unwrap();
+        let g = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeExpertGluFp8Blk as u16)
+            .unwrap();
         assert_eq!(g.i[1], 384, "expert intermediate shards");
-        assert_eq!(g.i[2], 3584, "but the latent width does NOT — it is shared by every expert");
+        assert_eq!(
+            g.i[2], 3584,
+            "but the latent width does NOT — it is shared by every expert"
+        );
         // FlashMLA runs the local head count.
-        let f = p.insts.iter().find(|i| i.op == DevOp::FlashMlaDecode as u16).unwrap();
+        let f = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::FlashMlaDecode as u16)
+            .unwrap();
         assert_eq!(f.i[1], 12, "96 heads / tp8");
-        assert_eq!(f.i[7] , 4, "the group factor must divide nh_l = 12; 8 does not");
+        assert_eq!(
+            f.i[7], 4,
+            "the group factor must divide nh_l = 12; 8 does not"
+        );
     }
 
     /// A TP degree that does not divide the head count is REFUSED at emit.
@@ -3292,25 +3834,47 @@ mod tests {
         let up = p
             .tensors
             .iter()
-            .find(|t| t.name.ends_with("block_sparse_moe.routed_expert_up_proj.weight"))
+            .find(|t| {
+                t.name
+                    .ends_with("block_sparse_moe.routed_expert_up_proj.weight")
+            })
             .expect("no up projection declared");
-        assert_eq!(up.bytes, hid_l as u64 * lat as u64 * 2, "declared 1/tp of [hidden, latent]");
+        assert_eq!(
+            up.bytes,
+            hid_l as u64 * lat as u64 * 2,
+            "declared 1/tp of [hidden, latent]"
+        );
         // The DOWN projection stays whole — the experts each need the entire latent.
         let down = p
             .tensors
             .iter()
-            .find(|t| t.name.ends_with("block_sparse_moe.routed_expert_down_proj.weight"))
+            .find(|t| {
+                t.name
+                    .ends_with("block_sparse_moe.routed_expert_down_proj.weight")
+            })
             .unwrap();
-        assert_eq!(down.bytes, lat as u64 * hid as u64 * 2, "down stays replicated");
+        assert_eq!(
+            down.bytes,
+            lat as u64 * hid as u64 * 2,
+            "down stays replicated"
+        );
 
         // 2. The GEMV computes the local column count, over the FULL latent — which is
         //    what makes the shard bit-neutral.
-        let ug = p.tensors.iter().position(|t| t.name == "act.ug_tp").expect("no gather slot");
+        let ug = p
+            .tensors
+            .iter()
+            .position(|t| t.name == "act.ug_tp")
+            .expect("no gather slot");
         // The three slots are the same stride, which is the host's `PARTIAL_SLOTS` contract.
         let slot_b = p.tensors[ug].bytes as u32;
         assert_eq!(
             slot_b,
-            p.tensors.iter().find(|t| t.name == "act.og_tp").unwrap().bytes as u32,
+            p.tensors
+                .iter()
+                .find(|t| t.name == "act.og_tp")
+                .unwrap()
+                .bytes as u32,
             "the gather slot must be the same stride the host lays slots out at"
         );
         let up_gemv = p
@@ -3319,8 +3883,14 @@ mod tests {
             .find(|i| i.op == DevOp::Gemv as u16 && i.t[2] as usize == up_h(&p))
             .expect("no GEMV reads the up projection");
         assert_eq!(up_gemv.i[1], hid_l, "N is hidden/tp");
-        assert_eq!(up_gemv.i[2], lat, "K is the WHOLE latent: column-parallel splits the output");
-        assert_eq!(up_gemv.t[0] as usize, ug, "the partial must land in the peer gather slot");
+        assert_eq!(
+            up_gemv.i[2], lat,
+            "K is the WHOLE latent: column-parallel splits the output"
+        );
+        assert_eq!(
+            up_gemv.t[0] as usize, ug,
+            "the partial must land in the peer gather slot"
+        );
 
         // 3. Exactly one collective per MoE layer carries the gather, and it is the
         //    shared expert's reduce out of slot 0 — no packet was added for it.
@@ -3331,8 +3901,15 @@ mod tests {
             .collect();
         assert_eq!(gathering.len(), 92, "one per MoE layer");
         for g in &gathering {
-            assert_eq!(g.i[2], 0, "reduces slot 0 — the shared expert's row-parallel partial");
-            assert_eq!(g.i[4], 2 * slot_b, "gathers slot 2, at 2 x the host's slot stride");
+            assert_eq!(
+                g.i[2], 0,
+                "reduces slot 0 — the shared expert's row-parallel partial"
+            );
+            assert_eq!(
+                g.i[4],
+                2 * slot_b,
+                "gathers slot 2, at 2 x the host's slot stride"
+            );
             assert_eq!(g.i[5], hid_l, "columns per rank");
             assert_eq!(g.i[6], hid, "the full row width");
             assert_eq!(g.i[0], hid, "and it still writes the whole hidden vector");
@@ -3340,7 +3917,11 @@ mod tests {
         // THE COLLECTIVE COUNT IS UNCHANGED BY THE SHARD, which is the point: 93 attention
         // reduces, layer 0's dense down, and the combine + shared pair on each of the 92
         // MoE layers. The gather added none of them.
-        let xr = p.insts.iter().filter(|i| i.op == DevOp::XReduce as u16).count();
+        let xr = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::XReduce as u16)
+            .count();
         assert_eq!(xr, 93 + 1 + 92 * 2, "the shard must not add a collective");
     }
 
@@ -3348,7 +3929,10 @@ mod tests {
     fn up_h(p: &packet::devbuild::Program) -> usize {
         p.tensors
             .iter()
-            .position(|t| t.name.ends_with("block_sparse_moe.routed_expert_up_proj.weight"))
+            .position(|t| {
+                t.name
+                    .ends_with("block_sparse_moe.routed_expert_up_proj.weight")
+            })
             .unwrap()
     }
 
@@ -3384,7 +3968,21 @@ mod tests {
         let p = b.tensor("act.p", 7168 * 2);
         let r = b.tensor("act.r", 7168 * 2 * 17);
         let w = b.tensor("act.w", 7168 * 4);
-        emit_attn_res(&mut b, &c, o, p, r, w, 1, K3_ATTNRES_MAXB + 1, K3_ATTNRES_MAXB + 1, 256, None, None, &[]);
+        emit_attn_res(
+            &mut b,
+            &c,
+            o,
+            p,
+            r,
+            w,
+            1,
+            K3_ATTNRES_MAXB + 1,
+            K3_ATTNRES_MAXB + 1,
+            256,
+            None,
+            None,
+            &[],
+        );
     }
 
     /// Both new opcodes are reachable from an emitter, and AttnRes's honest occupancy is asserted
@@ -3401,7 +3999,21 @@ mod tests {
         let u = b.tensor("act.u", 33792 * 2);
         let a = b.tensor("act.a", 33792 * 2);
         let seed = b.emit(DevOp::Nop, (0..256).collect::<Vec<u32>>(), &[], |_| {});
-        let c_ar = emit_attn_res(&mut b, &c, out, prefix, blkres, sw, 1, 1, 1, 256, None, None, &[seed]);
+        let c_ar = emit_attn_res(
+            &mut b,
+            &c,
+            out,
+            prefix,
+            blkres,
+            sw,
+            1,
+            1,
+            1,
+            256,
+            None,
+            None,
+            &[seed],
+        );
         let c_su = emit_situ_glu(&mut b, &c, a, g, u, 33792, 256, &[c_ar]);
         emit_k3_block_out(&mut b, out, prefix, a, 7168, 256, &[c_su]);
         let p = b.finish();
@@ -3413,10 +4025,21 @@ mod tests {
                  code"
             );
         }
-        let ar = p.insts.iter().find(|i| i.op == DevOp::AttnRes as u16).unwrap();
-        assert_eq!(ar.blocks, 1, "one workgroup per token: 1 of 256 at T=1, a KNOWN perf gap");
+        let ar = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::AttnRes as u16)
+            .unwrap();
+        assert_eq!(
+            ar.blocks, 1,
+            "one workgroup per token: 1 of 256 at T=1, a KNOWN perf gap"
+        );
         assert_eq!(ar.i[2], 1, "nb");
-        let su = p.insts.iter().find(|i| i.op == DevOp::SituGlu as u16).unwrap();
+        let su = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::SituGlu as u16)
+            .unwrap();
         // NOT "the whole chip": `d_situ_glu` strides `(slice * PLOW_THREADS + tid) * 8`, so one
         // workgroup covers 512*8 = 4096 elements and 33792 of them need 9. The 247 extra slices
         // this used to pin arrived, took the acquire, found no elements and signalled — ~3 us of
@@ -3449,13 +4072,25 @@ mod tests {
         for i in 0..n {
             let c = f32::from_le_bytes(cos[i * 4..i * 4 + 4].try_into().unwrap());
             let s = f32::from_le_bytes(sin[i * 4..i * 4 + 4].try_into().unwrap());
-            assert_eq!(c.to_bits(), 1.0f32.to_bits(), "cos[{i}] must be exactly 1.0, got {c}");
-            assert_eq!(s.to_bits(), 0.0f32.to_bits(), "sin[{i}] must be exactly 0.0, got {s}");
+            assert_eq!(
+                c.to_bits(),
+                1.0f32.to_bits(),
+                "cos[{i}] must be exactly 1.0, got {c}"
+            );
+            assert_eq!(
+                s.to_bits(),
+                0.0f32.to_bits(),
+                "sin[{i}] must be exactly 0.0, got {s}"
+            );
         }
         // And it must NOT coincide with a real table — otherwise the test proves nothing about the
         // emit having actually selected the NoPE recipe.
         let [rc, _] = GenTensor::rope_pair(ctx, hd, 8_000_000.0, 1.0, RopeScale::None);
-        assert_ne!(rc.generate().unwrap(), cos, "the NoPE recipe produced GLM's rotating table");
+        assert_ne!(
+            rc.generate().unwrap(),
+            cos,
+            "the NoPE recipe produced GLM's rotating table"
+        );
     }
 
     /// `MlaOutGate` reaches a packet, with the right width and the right operand ORDER.
@@ -3476,11 +4111,17 @@ mod tests {
             .iter()
             .find(|i| i.op == DevOp::MlaOutGate as u16)
             .expect("MlaOutGate is not emitted — an opcode nothing reaches is how Mamba2Scan died");
-        assert_eq!(i.blocks, 3, "ceil(12288 / (PLOW_THREADS * 8)) — d_mla_out_gate is bf16v8 too");
+        assert_eq!(
+            i.blocks, 3,
+            "ceil(12288 / (PLOW_THREADS * 8)) — d_mla_out_gate is bf16v8 too"
+        );
         assert_eq!(i.i[0], 12288, "n_head * v_head_dim = 96 * 128");
         assert_eq!(i.t[0], out);
         assert_eq!(i.t[1], attn, "t1 is the UNGATED attention output");
-        assert_eq!(i.t[2], g, "t2 is the g_proj logits — the operand the sigmoid is applied to");
+        assert_eq!(
+            i.t[2], g,
+            "t2 is the g_proj logits — the operand the sigmoid is applied to"
+        );
     }
 
     /// At T > 1 AttnRes gets more workgroups, capped by the CU count.
@@ -3518,7 +4159,17 @@ mod tests {
         mla.insert(92);
         let layers: Vec<u32> = (0..93).collect();
         let mut b = Builder::new(256);
-        emit_k3_model(&mut b, &c, &|l| !mla.contains(&l), &layers, 4096, t, t, 256, RowKind::Tokens);
+        emit_k3_model(
+            &mut b,
+            &c,
+            &|l| !mla.contains(&l),
+            &layers,
+            4096,
+            t,
+            t,
+            256,
+            RowKind::Tokens,
+        );
         b.finish()
     }
 
@@ -3547,7 +4198,12 @@ mod tests {
             let want = usize::from(o == DevOp::Gemv); // the lm_head, and only it
             assert_eq!(n(o), want, "{o:?} must not appear in a T-row program");
         }
-        let lm = p.insts.iter().filter(|i| i.op == DevOp::Gemv as u16).last().unwrap();
+        let lm = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::Gemv as u16)
+            .last()
+            .unwrap();
         assert_eq!(lm.i[0], 1, "the surviving GEMV is the lm_head: one row");
         assert_eq!(lm.i[1], 163840, "over the full vocab");
         assert_eq!(lm.i[4], 511, "a_row0 = t-1, the last real row");
@@ -3560,12 +4216,24 @@ mod tests {
         // The MLA half.
         assert_eq!(n(DevOp::FlashMlaPrefill), 24);
         assert_eq!(n(DevOp::MlaMergeFold), 24);
-        assert_eq!(n(DevOp::MlaOutGate), 24, "the output gate is not a decode-only thing");
+        assert_eq!(
+            n(DevOp::MlaOutGate),
+            24,
+            "the output gate is not a decode-only thing"
+        );
         // The block structure is UNCHANGED — that is the point of AttnRes being in both buckets.
-        assert_eq!(n(DevOp::AttnRes), 187, "two mixes per layer plus the output mix, at T rows too");
+        assert_eq!(
+            n(DevOp::AttnRes),
+            187,
+            "two mixes per layer plus the output mix, at T rows too"
+        );
         assert_eq!(n(DevOp::KdaStateStepG), 69);
         assert_eq!(n(DevOp::KdaConv3), 69);
-        assert_eq!(n(DevOp::SituGlu), 93, "layer 0's dense FFN + one shared expert per MoE layer");
+        assert_eq!(
+            n(DevOp::SituGlu),
+            93,
+            "layer 0's dense FFN + one shared expert per MoE layer"
+        );
         assert_eq!(n(DevOp::Embed), 1);
         assert_eq!(n(DevOp::ArgmaxFin), 1);
     }
@@ -3579,15 +4247,33 @@ mod tests {
     #[test]
     fn the_narrow_norm_fusion_is_off_by_default() {
         let p = build_full(8);
-        let fused = p.insts.iter().filter(|i| i.op == DevOp::Gemv as u16 && i.i[3] == 2).count();
-        assert_eq!(fused, 0, "PLOW_K3_FUSE_NGEMV must be opt-in: no norm=2 GEMV in a default emit");
+        let fused = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::Gemv as u16 && i.i[3] == 2)
+            .count();
+        assert_eq!(
+            fused, 0,
+            "PLOW_K3_FUSE_NGEMV must be opt-in: no norm=2 GEMV in a default emit"
+        );
         // Every narrow norm still has its own packet. The exact per-width counts (92 at 3584,
         // 24 at 1536) are a property of the 93-layer ASSET, not of this synthetic cfg, so they
         // are recorded in `fuse_norm_gemv`'s doc and checked against a real emit, not here.
-        let norms = p.insts.iter().filter(|i| i.op == DevOp::RmsNorm as u16).count();
-        assert!(norms > 0, "the fold is off, so the RMSNORM packets must all still be emitted");
-        let widths: std::collections::BTreeSet<u32> =
-            p.insts.iter().filter(|i| i.op == DevOp::RmsNorm as u16).map(|i| i.i[1]).collect();
+        let norms = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::RmsNorm as u16)
+            .count();
+        assert!(
+            norms > 0,
+            "the fold is off, so the RMSNORM packets must all still be emitted"
+        );
+        let widths: std::collections::BTreeSet<u32> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::RmsNorm as u16)
+            .map(|i| i.i[1])
+            .collect();
         assert!(
             widths.iter().all(|&w| w % 8 == 0),
             "every fusable width must satisfy the arm's `feat % 8` precondition: {widths:?}"
@@ -3605,7 +4291,11 @@ mod tests {
         let p = build_full_t(1, t);
         let fam = crate::gemm_family_ops();
         let gemms: Vec<_> = p.insts.iter().filter(|i| fam.contains(&i.op)).collect();
-        assert!(gemms.len() > 500, "a 93-layer prefill program is mostly GEMMs, got {}", gemms.len());
+        assert!(
+            gemms.len() > 500,
+            "a 93-layer prefill program is mostly GEMMs, got {}",
+            gemms.len()
+        );
         for g in &gemms {
             assert_eq!(g.i[0], t, "a projection at M={} instead of {t}", g.i[0]);
         }
@@ -3631,7 +4321,17 @@ mod tests {
             c.tp = 1;
             let layers: Vec<u32> = (0..93).collect();
             let mut b = Builder::new(256);
-            emit_k3_model(&mut b, &c, &|_| true, &layers, 4096, t, t, 256, RowKind::Tokens);
+            emit_k3_model(
+                &mut b,
+                &c,
+                &|_| true,
+                &layers,
+                4096,
+                t,
+                t,
+                256,
+                RowKind::Tokens,
+            );
             let p = b.finish();
             // ceil(92/12) = 8 live rows at the deepest layer.
             let cap = 8u32;
@@ -3641,12 +4341,22 @@ mod tests {
                 t as u64 * cap as u64 * 7168 * 2,
                 "T={t}: the ring needs one private slice PER TOKEN"
             );
-            let ars: Vec<_> = p.insts.iter().filter(|i| i.op == DevOp::AttnRes as u16).collect();
+            let ars: Vec<_> = p
+                .insts
+                .iter()
+                .filter(|i| i.op == DevOp::AttnRes as u16)
+                .collect();
             assert_eq!(ars.len(), 187, "2 per layer + the model-level output mix");
             let live: std::collections::BTreeSet<u32> = ars.iter().map(|i| i.i[2]).collect();
-            assert!(live.len() > 1, "nb varies with depth — that is the whole hazard");
+            assert!(
+                live.len() > 1,
+                "nb varies with depth — that is the whole hazard"
+            );
             for i in &ars {
-                assert_eq!(i.i[4], cap, "T={t}: every mix must stride by the SAME capacity");
+                assert_eq!(
+                    i.i[4], cap,
+                    "T={t}: every mix must stride by the SAME capacity"
+                );
                 assert!(i.i[2] <= i.i[4], "live count past the capacity");
             }
         }
@@ -3665,11 +4375,21 @@ mod tests {
     fn the_snapshot_push_is_emitted_at_t_above_one() {
         for t in [1u32, 128, 4096] {
             let p = build_full_t(1, t);
-            let ars: Vec<_> = p.insts.iter().filter(|i| i.op == DevOp::AttnRes as u16).collect();
-            let pushes: Vec<_> =
-                ars.iter().filter(|i| i.t[4] != packet::dev::TENSOR_NONE).collect();
+            let ars: Vec<_> = p
+                .insts
+                .iter()
+                .filter(|i| i.op == DevOp::AttnRes as u16)
+                .collect();
+            let pushes: Vec<_> = ars
+                .iter()
+                .filter(|i| i.t[4] != packet::dev::TENSOR_NONE)
+                .collect();
             // Snapshots at layers 0, 12, 24, ..., 84 — eight of them, at every T.
-            assert_eq!(pushes.len(), 8, "T={t}: the snapshot schedule is not a function of T");
+            assert_eq!(
+                pushes.len(),
+                8,
+                "T={t}: the snapshot schedule is not a function of T"
+            );
             for i in &pushes {
                 assert_eq!(i.i[3], i.i[2], "the push lands ONE PAST the live count");
                 assert!(i.i[3] < i.i[4], "and inside the ring");
@@ -3679,7 +4399,11 @@ mod tests {
             // holding whatever it was allocated with, and every later mix would read that.
             assert_eq!(ars[0].i[2], 0, "T={t}: layer 0 mixes over an empty ring");
             assert_eq!(ars[0].i[3], 0, "and pushes onto row 0");
-            assert_ne!(ars[0].t[4], packet::dev::TENSOR_NONE, "layer 0's packet carries the push");
+            assert_ne!(
+                ars[0].t[4],
+                packet::dev::TENSOR_NONE,
+                "layer 0's packet carries the push"
+            );
             assert_eq!(ars[1].i[2], 1, "its MLP-side mix sees the pushed row");
         }
     }
@@ -3720,38 +4444,78 @@ mod tests {
     fn the_grouped_prefill_moe_runs_at_the_latent_width_with_situ() {
         let t = 512u32;
         let p = build_full_t(1, t);
-        let g = p.insts.iter().find(|i| i.op == DevOp::MoeGroupGluPf as u16).unwrap();
+        let g = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeGroupGluPf as u16)
+            .unwrap();
         assert_eq!(g.i[0], 3072, "N is the expert intermediate");
-        assert_eq!(g.i[1], 3584, "K is the LATENT, not the hidden — the A operand is `xe`");
+        assert_eq!(
+            g.i[1], 3584,
+            "K is the LATENT, not the hidden — the A operand is `xe`"
+        );
         assert_eq!(g.i[2], 896, "n_exp");
         assert_eq!(g.i[crate::mla::MoeEnc::PREFILL_SLOT], K3_MOE_ENC_MXFP4);
         assert_eq!(g.i[5], K3_MOE_ACT_SITU, "the routed GLU carries situ");
         assert_eq!(g.f[0], 4.0, "and the betas the PAIR-form epilogue reads");
         assert_eq!(g.f[1], 25.0);
         // A4W4 binds the pad-row map and the E8M0 rows the fused bridge WRITES.
-        assert_ne!(g.t[6], packet::dev::TENSOR_NONE, "row_partidx: pad rows must be skippable");
-        assert_ne!(g.t[7], packet::dev::TENSOR_NONE, "the bridge's E8M0 scale rows");
-        let d = p.insts.iter().find(|i| i.op == DevOp::MoeGroupDownPf as u16).unwrap();
+        assert_ne!(
+            g.t[6],
+            packet::dev::TENSOR_NONE,
+            "row_partidx: pad rows must be skippable"
+        );
+        assert_ne!(
+            g.t[7],
+            packet::dev::TENSOR_NONE,
+            "the bridge's E8M0 scale rows"
+        );
+        let d = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeGroupDownPf as u16)
+            .unwrap();
         assert_eq!(d.i[0], 3584, "DOWN's N is the latent");
         assert_eq!(d.i[1], 3072);
-        assert_eq!(d.t[5], g.t[7], "DOWN reads exactly the scale rows the bridge wrote");
+        assert_eq!(
+            d.t[5], g.t[7],
+            "DOWN reads exactly the scale rows the bridge wrote"
+        );
         // The combine is at LATENT width with NO residual and NO shared operand: there is nothing
         // 3584 wide to add, so both happen after the up-projection.
-        let cb = p.insts.iter().find(|i| i.op == DevOp::MoeCombinePf as u16).unwrap();
+        let cb = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeCombinePf as u16)
+            .unwrap();
         assert_eq!(cb.i[0], 3584);
         assert_eq!(cb.i[1], 16, "top_k");
         assert_eq!(cb.i[2], t, "the combine is over T tokens");
         assert_eq!(cb.t[1], packet::dev::TENSOR_NONE);
         assert_eq!(cb.t[2], packet::dev::TENSOR_NONE);
         // The router scores the HIDDEN state on both phases, and the prefill tail carries T.
-        let rt = p.insts.iter().find(|i| i.op == DevOp::MoeRouterTopkPf as u16).unwrap();
+        let rt = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeRouterTopkPf as u16)
+            .unwrap();
         assert_eq!(rt.i[1], 896);
         assert_eq!(rt.i[2], 16);
-        assert_eq!(rt.i[4], t, "the prefill tail is the decode kernel under a TOKEN LOOP");
-        assert_eq!(rt.i[6], 1, "group operands must match the decode tail or the two phases route");
+        assert_eq!(
+            rt.i[4], t,
+            "the prefill tail is the decode kernel under a TOKEN LOOP"
+        );
+        assert_eq!(
+            rt.i[6], 1,
+            "group operands must match the decode tail or the two phases route"
+        );
         assert_eq!(rt.i[7], 1, "the same token to DIFFERENT experts");
         // The align op is ONE workgroup and must be: the MPF_BM-padded row prefix is a global scan.
-        let al = p.insts.iter().find(|i| i.op == DevOp::MoeAlignPf as u16).unwrap();
+        let al = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeAlignPf as u16)
+            .unwrap();
         assert_eq!(al.blocks, 1);
         assert_eq!(al.i[0], t);
     }
@@ -3773,7 +4537,10 @@ mod tests {
         assert_eq!(bytes("act.pf.moe.moe_meta"), (3 * 896 + 1) * 4);
         // fp4 is HALF a byte per value, plus one E8M0 byte per 32.
         assert_eq!(bytes("act.pf.moe.moe_fug"), pad * (3072 / 2));
-        assert_eq!(bytes("act.pf.moe.moe_fuscale"), pad * (3072 / crate::mla::MX_BLOCK as u64));
+        assert_eq!(
+            bytes("act.pf.moe.moe_fuscale"),
+            pad * (3072 / crate::mla::MX_BLOCK as u64)
+        );
         // `part` is [T*k, latent] f32 — no padding; DOWN scatters by row_partidx.
         assert_eq!(bytes("act.pf.moe.part"), t * 16 * 3584 * 4);
         // The per-SLOT decode buffer must NOT be declared: nothing in a T-row program writes it.
@@ -3793,9 +4560,14 @@ mod tests {
         let p = build_full_t(1, 512);
         let names: Vec<&str> = p.tensors.iter().map(|t| t.name.as_str()).collect();
         // `act.l{digit}` — not `act.l`, which also matches the global `act.logits`.
-        let per_layer =
-            |n: &str| n.strip_prefix("act.l").is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()));
-        assert!(!names.iter().any(|n| per_layer(n)), "no per-layer prefill scratch");
+        let per_layer = |n: &str| {
+            n.strip_prefix("act.l")
+                .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+        };
+        assert!(
+            !names.iter().any(|n| per_layer(n)),
+            "no per-layer prefill scratch"
+        );
         assert!(names.contains(&"act.pf.h_a") && names.contains(&"act.pf.moe.part"));
         // State and cache stay per layer, or layer 5 would read layer 4's recurrence.
         assert!(names.contains(&"kv.0.state") && names.contains(&"kv.92.ckv"));
@@ -3830,11 +4602,23 @@ mod tests {
             .iter()
             .filter(|i| i.op == DevOp::XReduce as u16 || i.op == DevOp::XReduceTwoShot as u16)
             .collect();
-        assert_eq!(xr.len(), 278, "same count as decode: the shared-expert reduce is phase-agnostic");
-        let one: Vec<_> = xr.iter().filter(|i| i.op == DevOp::XReduce as u16).collect();
-        assert_eq!(one.len(), 92, "one gathering one-shot per MoE layer, and nothing else");
+        assert_eq!(
+            xr.len(),
+            278,
+            "same count as decode: the shared-expert reduce is phase-agnostic"
+        );
+        let one: Vec<_> = xr
+            .iter()
+            .filter(|i| i.op == DevOp::XReduce as u16)
+            .collect();
+        assert_eq!(
+            one.len(),
+            92,
+            "one gathering one-shot per MoE layer, and nothing else"
+        );
         assert!(
-            one.iter().all(|i| i.i[5] == 896 && i.i[6] == 7168 && i.i[4] != 0),
+            one.iter()
+                .all(|i| i.i[5] == 896 && i.i[6] == 7168 && i.i[4] != 0),
             "the one-shots are exactly the gathering ones: 7168/tp8 columns per rank"
         );
         assert!(
@@ -3847,15 +4631,32 @@ mod tests {
         let gates: std::collections::BTreeSet<u32> = xr.iter().map(|i| i.i[3]).collect();
         assert_eq!(gates.len(), xr.len(), "xctr gate ids must not collide");
         let widths: std::collections::BTreeSet<u32> = xr.iter().map(|i| i.i[0]).collect();
-        assert!(widths.contains(&(512 * 7168)), "attention reduces T rows at hidden width");
-        assert!(widths.contains(&(512 * 3584)), "the expert combine reduces at LATENT width");
+        assert!(
+            widths.contains(&(512 * 7168)),
+            "attention reduces T rows at hidden width"
+        );
+        assert!(
+            widths.contains(&(512 * 3584)),
+            "the expert combine reduces at LATENT width"
+        );
         // The head axis still shards, and the grouped experts still take the local intermediate.
-        let f = p.insts.iter().find(|i| i.op == DevOp::FlashMlaPrefill as u16).unwrap();
+        let f = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::FlashMlaPrefill as u16)
+            .unwrap();
         assert_eq!(f.i[1], 12, "96 heads / tp8");
         assert_eq!(f.i[4], 512, "i4 is n_tok on the prefill arm, NOT nsplit");
-        let g = p.insts.iter().find(|i| i.op == DevOp::MoeGroupGluPf as u16).unwrap();
+        let g = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeGroupGluPf as u16)
+            .unwrap();
         assert_eq!(g.i[0], 384, "3072 / tp8");
-        assert_eq!(g.i[1], 3584, "the latent does NOT shard — it is shared by every expert");
+        assert_eq!(
+            g.i[1], 3584,
+            "the latent does NOT shard — it is shared by every expert"
+        );
     }
 
     /// The MLA prefill arm forces `nsplit = 1`, and the merge-fold agrees with it.
@@ -3868,21 +4669,47 @@ mod tests {
     #[test]
     fn the_mla_prefill_arm_forces_one_split() {
         let d = build_full_t(1, 1);
-        let dec = d.insts.iter().find(|i| i.op == DevOp::FlashMlaDecode as u16).unwrap();
+        let dec = d
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::FlashMlaDecode as u16)
+            .unwrap();
         assert_eq!(dec.i[4], 4, "decode keeps its four splits");
-        let dfold = d.insts.iter().find(|i| i.op == DevOp::MlaMergeFold as u16).unwrap();
+        let dfold = d
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MlaMergeFold as u16)
+            .unwrap();
         assert_eq!(dfold.i[4], 4);
         assert_eq!(dfold.i[0], 1);
 
         let t = 512u32;
         let p = build_full_t(1, t);
-        let fl = p.insts.iter().find(|i| i.op == DevOp::FlashMlaPrefill as u16).unwrap();
+        let fl = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::FlashMlaPrefill as u16)
+            .unwrap();
         assert_eq!(fl.i[4], t, "i4 carries n_tok here");
-        let fold = p.insts.iter().find(|i| i.op == DevOp::MlaMergeFold as u16).unwrap();
-        assert_eq!(fold.i[4], 1, "nsplit MUST be 1 under a per-token causal bound");
-        assert_eq!(fold.i[0], t, "the token axis folds into n_batch: (b*n_tok + t)*n_head");
+        let fold = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MlaMergeFold as u16)
+            .unwrap();
+        assert_eq!(
+            fold.i[4], 1,
+            "nsplit MUST be 1 under a per-token causal bound"
+        );
+        assert_eq!(
+            fold.i[0], t,
+            "the token axis folds into n_batch: (b*n_tok + t)*n_head"
+        );
         // The partial buffer follows, or the fold reads four splits' worth of stride from one.
-        let opart = p.tensors.iter().find(|x| x.name == "act.pf.o_part").unwrap();
+        let opart = p
+            .tensors
+            .iter()
+            .find(|x| x.name == "act.pf.o_part")
+            .unwrap();
         assert_eq!(opart.bytes, t as u64 * 96 * 512 * 4);
     }
 
@@ -3901,7 +4728,11 @@ mod tests {
             let p = build_full_t(1, t);
             let mut seen = std::collections::BTreeSet::new();
             for td in &p.tensors {
-                assert!(seen.insert(td.name.clone()), "T={t}: `{}` declared twice", td.name);
+                assert!(
+                    seen.insert(td.name.clone()),
+                    "T={t}: `{}` declared twice",
+                    td.name
+                );
             }
         }
     }
@@ -3912,14 +4743,30 @@ mod tests {
         let c = model_cfg();
         let build = |layers: &[u32], t: u32| {
             let mut b = Builder::new(256);
-            emit_k3_model(&mut b, &c, &|l| l != 3, layers, 4096, t, t, 256, RowKind::Tokens);
+            emit_k3_model(
+                &mut b,
+                &c,
+                &|l| l != 3,
+                layers,
+                4096,
+                t,
+                t,
+                256,
+                RowKind::Tokens,
+            );
             b.finish()
         };
         for t in [1u32, 128] {
             let short = build(&[0, 1, 2, 3], t);
             let long = build(&(0..12).collect::<Vec<u32>>(), t);
-            assert!(short.tensors.len() < long.tensors.len(), "T={t}: truncation shrinks the table");
-            assert!(short.insts.len() < long.insts.len(), "T={t}: and the program");
+            assert!(
+                short.tensors.len() < long.tensors.len(),
+                "T={t}: truncation shrinks the table"
+            );
+            assert!(
+                short.insts.len() < long.insts.len(),
+                "T={t}: and the program"
+            );
             let n = |p: &packet::devbuild::Program, o: DevOp| {
                 p.insts.iter().filter(|i| i.op == o as u16).count()
             };
@@ -3928,8 +4775,16 @@ mod tests {
                 9,
                 "T={t}: two mixes on each of four layers, plus the output mix"
             );
-            let flash = if t == 1 { DevOp::FlashMlaDecode } else { DevOp::FlashMlaPrefill };
-            assert_eq!(n(&short, flash), 1, "T={t}: layer 3 is the only MLA layer in 0..3");
+            let flash = if t == 1 {
+                DevOp::FlashMlaDecode
+            } else {
+                DevOp::FlashMlaPrefill
+            };
+            assert_eq!(
+                n(&short, flash),
+                1,
+                "T={t}: layer 3 is the only MLA layer in 0..3"
+            );
             assert_eq!(n(&short, DevOp::KdaStateStepG), 3);
         }
     }
@@ -3949,8 +4804,16 @@ mod tests {
             return;
         }
         let p = build_full(8);
-        assert_eq!(p.n_counter as usize, p.insts.len(), "counter id == inst index");
-        let ug = p.tensors.iter().position(|t| t.name == "act.ug_tp").expect("no gather slot");
+        assert_eq!(
+            p.n_counter as usize,
+            p.insts.len(),
+            "counter id == inst index"
+        );
+        let ug = p
+            .tensors
+            .iter()
+            .position(|t| t.name == "act.ug_tp")
+            .expect("no gather slot");
         let up_ix: Vec<usize> = p
             .insts
             .iter()

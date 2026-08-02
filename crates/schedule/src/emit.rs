@@ -105,7 +105,15 @@ pub fn emit_program_with_meta(
     for t in order {
         let task = &tasks.tasks[t];
         let (resource, unit, index) = encode_resource(sched.placement[&t]);
-        let body = body_for(g, cons, task, slot(t), tmem(t), tensor_slot(t), tensor_kind(t));
+        let body = body_for(
+            g,
+            cons,
+            task,
+            slot(t),
+            tmem(t),
+            tensor_slot(t),
+            tensor_kind(t),
+        );
         insts.push(Inst {
             resource,
             unit,
@@ -157,7 +165,10 @@ pub fn issue_order(sched: &Schedule) -> Vec<TaskId> {
 /// widths are ample at current scales (≤256 units, ≤65 535 SMs/engines per unit);
 /// the debug asserts catch any future topology that would silently truncate.
 fn encode_resource(r: ResourceId) -> (ResourceKind, u8, u16) {
-    debug_assert!(resource_fits(r), "resource id {r:?} exceeds the packet ABI field widths");
+    debug_assert!(
+        resource_fits(r),
+        "resource id {r:?} exceeds the packet ABI field widths"
+    );
     match r {
         ResourceId::Sm(u, s) => (ResourceKind::Sm, u as u8, s as u16),
         ResourceId::Dma(u, e) => (ResourceKind::Dma, u as u8, e as u16),
@@ -259,7 +270,11 @@ fn body_for(
                     operands: s.operands.clamp(0, 255) as u8,
                     br: row_block(g, task.node),
                     out,
-                    variant: if s.reduce { Opcode::VARIANT_ROW_RMS_BF16 } else { Opcode::VARIANT_BF16 },
+                    variant: if s.reduce {
+                        Opcode::VARIANT_ROW_RMS_BF16
+                    } else {
+                        Opcode::VARIANT_BF16
+                    },
                 },
                 // Layout: a strided descriptor (transpose/broadcast/slice) when the
                 // bridge produced one, else a contiguous copy into `out`.
@@ -298,9 +313,9 @@ fn gemm_variant_for(cons: &ConstraintSet, node: usize) -> u8 {
     }
     // Standard (non-block-quant) dtype selection by element size.
     match (desc.weight_elem, desc.activation_elem) {
-        (2, 2) => Opcode::VARIANT_BF16,   // standard bf16×bf16
-        (1, 2) => Opcode::VARIANT_FP8,    // FP8 weights, bf16 activations
-        (1, 1) => Opcode::VARIANT_FP8,    // FP8×FP8
+        (2, 2) => Opcode::VARIANT_BF16, // standard bf16×bf16
+        (1, 2) => Opcode::VARIANT_FP8,  // FP8 weights, bf16 activations
+        (1, 1) => Opcode::VARIANT_FP8,  // FP8×FP8
         _ => Opcode::VARIANT_BF16,
     }
 }

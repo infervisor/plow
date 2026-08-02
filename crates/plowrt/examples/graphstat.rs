@@ -31,7 +31,6 @@ use plowrt::asset::devblob::{DevBlob, DevProg};
 // fall behind the enum.
 use packet::disasm::op_label as op_name;
 
-
 // `transitive_reduction`, `Stats`, `critical_path`, `analyse`, `Placement`,
 // `placement` and `placement_implied` moved to `plowrt::analysis::graph` so
 // that `plowrt disasm --counters` computes them from the same code. This
@@ -56,7 +55,11 @@ fn place_census(prog: &DevProg, s: &Stats) {
     let p = placement(prog, s.n_ops);
     let redundant: Vec<(u32, u32)> = s.edges.difference(&s.edges_tr).copied().collect();
 
-    let all_implied = s.edges.iter().filter(|&&(a, b)| placement_implied(&p, a, b)).count();
+    let all_implied = s
+        .edges
+        .iter()
+        .filter(|&&(a, b)| placement_implied(&p, a, b))
+        .count();
     let (mut red_coplaced, mut red_free) = (Vec::new(), Vec::new());
     for &(a, b) in &redundant {
         if placement_implied(&p, a, b) {
@@ -70,34 +73,63 @@ fn place_census(prog: &DevProg, s: &Stats) {
     // It cannot buy overlap — transitive redundancy means the surviving path
     // already blocks the consumer for at least as long — so the poll is the
     // entire prize.
-    let polls_of = |es: &[(u32, u32)]| -> u64 {
-        es.iter().map(|&(_, b)| s.blocks[b as usize] as u64).sum()
-    };
+    let polls_of =
+        |es: &[(u32, u32)]| -> u64 { es.iter().map(|&(_, b)| s.blocks[b as usize] as u64).sum() };
 
-    let implied: Vec<(u32, u32)> =
-        s.edges.iter().copied().filter(|&(a, b)| placement_implied(&p, a, b)).collect();
+    let implied: Vec<(u32, u32)> = s
+        .edges
+        .iter()
+        .copied()
+        .filter(|&(a, b)| placement_implied(&p, a, b))
+        .collect();
     debug_assert_eq!(implied.len(), all_implied);
 
-    println!("  placement census (per-CU streams, {} CUs):", prog.stream_ofs.len());
-    println!("    edges                              {:>8}", s.edges.len());
-    println!("    transitively redundant             {:>8}", redundant.len());
-    println!("    ... AND co-placed (cannot pay)     {:>8}", red_coplaced.len());
-    println!("    ... AND NOT co-placed (could pay)  {:>8}", red_free.len());
-    println!("    polls removable, redundant total   {:>8} of {}",
-             polls_of(&redundant), s.polls);
-    println!("    polls removable, not-co-placed     {:>8} of {}",
-             polls_of(&red_free), s.polls);
+    println!(
+        "  placement census (per-CU streams, {} CUs):",
+        prog.stream_ofs.len()
+    );
+    println!(
+        "    edges                              {:>8}",
+        s.edges.len()
+    );
+    println!(
+        "    transitively redundant             {:>8}",
+        redundant.len()
+    );
+    println!(
+        "    ... AND co-placed (cannot pay)     {:>8}",
+        red_coplaced.len()
+    );
+    println!(
+        "    ... AND NOT co-placed (could pay)  {:>8}",
+        red_free.len()
+    );
+    println!(
+        "    polls removable, redundant total   {:>8} of {}",
+        polls_of(&redundant),
+        s.polls
+    );
+    println!(
+        "    polls removable, not-co-placed     {:>8} of {}",
+        polls_of(&red_free),
+        s.polls
+    );
     // A SECOND, DISJOINT removable population, and the one that matches the
     // narrative: edges that are NOT transitively redundant — the DAG genuinely
     // needs the ordering — but that placement already delivers for free. These
     // are the `mla.rs` CU-0 chains. Deleting one is only sound if the placement
     // is also frozen, which is a much stronger contract than the DAG-side
     // theorem, for a much smaller prize.
-    println!("    edges implied by PLACEMENT alone   {:>8}  ({:.1}% of edges), polls {}",
-             all_implied,
-             100.0 * all_implied as f64 / s.edges.len().max(1) as f64,
-             polls_of(&implied));
-    println!("    ... of which also redundant        {:>8}", red_coplaced.len());
+    println!(
+        "    edges implied by PLACEMENT alone   {:>8}  ({:.1}% of edges), polls {}",
+        all_implied,
+        100.0 * all_implied as f64 / s.edges.len().max(1) as f64,
+        polls_of(&implied)
+    );
+    println!(
+        "    ... of which also redundant        {:>8}",
+        red_coplaced.len()
+    );
 
     let show = |label: &str, es: &[(u32, u32)]| {
         if es.is_empty() {
@@ -126,12 +158,18 @@ fn place_census(prog: &DevProg, s: &Stats) {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: graphstat <asset-dir|model.pkt> [T]");
+    let path = args
+        .next()
+        .expect("usage: graphstat <asset-dir|model.pkt> [T]");
     let want_t: Option<u32> = args.next().and_then(|s| s.parse().ok());
     let verbose = std::env::var("GRAPHSTAT_V").ok().as_deref() == Some("1");
 
     let p = std::path::Path::new(&path);
-    let file = if p.is_dir() { p.join("model.pkt") } else { p.to_path_buf() };
+    let file = if p.is_dir() {
+        p.join("model.pkt")
+    } else {
+        p.to_path_buf()
+    };
     let buf = std::fs::read(&file).expect("read blob");
     let blob = DevBlob::parse(&buf).expect("parse devblob");
 
@@ -144,8 +182,18 @@ fn main() {
     println!();
     println!(
         "{:>7} {:>5} {:>8} {:>7} {:>6} {:>6} {:>7} {:>5} {:>10} {:>10} {:>10} {:>10}",
-        "T", "ops", "counters", "SE_FINE", "edges", "tr", "deadctr", "ents", "polls", "polls_tr",
-        "bumps", "bumps_live"
+        "T",
+        "ops",
+        "counters",
+        "SE_FINE",
+        "edges",
+        "tr",
+        "deadctr",
+        "ents",
+        "polls",
+        "polls_tr",
+        "bumps",
+        "bumps_live"
     );
 
     for prog in &blob.progs {
@@ -175,11 +223,16 @@ fn main() {
         }
         if std::env::var("GRAPHSTAT_CP").ok().as_deref() == Some("1") {
             let (d, spine) = critical_path(s.n_ops, &s.edges);
-            println!("  critical path: {d} of {} packets ({:.1}%)", s.n_ops,
-                     100.0 * d as f64 / s.n_ops as f64);
+            println!(
+                "  critical path: {d} of {} packets ({:.1}%)",
+                s.n_ops,
+                100.0 * d as f64 / s.n_ops as f64
+            );
             let mut census: HashMap<String, u32> = HashMap::new();
             for &o in &spine {
-                *census.entry(op_name(prog.insts[o as usize].op)).or_insert(0) += 1;
+                *census
+                    .entry(op_name(prog.insts[o as usize].op))
+                    .or_insert(0) += 1;
             }
             let mut c: Vec<_> = census.into_iter().collect();
             c.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
@@ -197,8 +250,7 @@ fn main() {
             }
         }
         if verbose {
-            let redundant: Vec<_> =
-                s.edges.difference(&s.edges_tr).copied().collect();
+            let redundant: Vec<_> = s.edges.difference(&s.edges_tr).copied().collect();
             println!("  redundant edges ({}):", redundant.len());
             for (a, b) in &redundant {
                 println!(

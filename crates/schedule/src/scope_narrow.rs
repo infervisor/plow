@@ -51,11 +51,19 @@ fn sm_of(sched: &Schedule, task: TaskId) -> Option<(usize, usize)> {
 /// Walk `sched.packets` to build `counter_id → (producers, consumers)` — the
 /// same shape `counter_elim` uses; kept local so the two passes stay
 /// independent.
-fn producers_consumers(sched: &Schedule) -> (HashMap<usize, Vec<TaskId>>, HashMap<usize, Vec<TaskId>>) {
+fn producers_consumers(
+    sched: &Schedule,
+) -> (HashMap<usize, Vec<TaskId>>, HashMap<usize, Vec<TaskId>>) {
     let mut producers: HashMap<usize, Vec<TaskId>> = HashMap::new();
     let mut consumers: HashMap<usize, Vec<TaskId>> = HashMap::new();
     for stream in sched.packets.values() {
-        for Packet { task, wait, successors, .. } in stream {
+        for Packet {
+            task,
+            wait,
+            successors,
+            ..
+        } in stream
+        {
             for &c in successors {
                 producers.entry(c).or_default().push(*task);
             }
@@ -76,11 +84,7 @@ fn producers_consumers(sched: &Schedule) -> (HashMap<usize, Vec<TaskId>>, HashMa
 }
 
 /// True iff every producer and every consumer is placed on the *same* SM.
-fn all_on_one_sm(
-    producers: &[TaskId],
-    consumers: &[TaskId],
-    sched: &Schedule,
-) -> bool {
+fn all_on_one_sm(producers: &[TaskId], consumers: &[TaskId], sched: &Schedule) -> bool {
     if producers.is_empty() || consumers.is_empty() {
         return false;
     }
@@ -167,10 +171,7 @@ mod tests {
         let sm = ResourceId::Sm(0, 3);
         let sched = Schedule {
             streams: HashMap::from([(sm, stream_of(&[(0, 0), (1, 10)]))]),
-            packets: HashMap::from([(
-                sm,
-                vec![packet(0, &[], &[0]), packet(1, &[0], &[])],
-            )]),
+            packets: HashMap::from([(sm, vec![packet(0, &[], &[0]), packet(1, &[0], &[])])]),
             counters: vec![Counter {
                 id: 0,
                 threshold: 1,
@@ -198,10 +199,7 @@ mod tests {
         let sm0 = ResourceId::Sm(0, 0);
         let sm1 = ResourceId::Sm(0, 1);
         let sched = Schedule {
-            streams: HashMap::from([
-                (sm0, stream_of(&[(0, 0)])),
-                (sm1, stream_of(&[(1, 10)])),
-            ]),
+            streams: HashMap::from([(sm0, stream_of(&[(0, 0)])), (sm1, stream_of(&[(1, 10)]))]),
             packets: HashMap::from([
                 (sm0, vec![packet(0, &[], &[0])]),
                 (sm1, vec![packet(1, &[0], &[])]),
@@ -232,10 +230,7 @@ mod tests {
         let sm = ResourceId::Sm(0, 0);
         let dma = ResourceId::Dma(0, 0);
         let sched = Schedule {
-            streams: HashMap::from([
-                (sm, stream_of(&[(0, 0)])),
-                (dma, stream_of(&[(1, 10)])),
-            ]),
+            streams: HashMap::from([(sm, stream_of(&[(0, 0)])), (dma, stream_of(&[(1, 10)]))]),
             packets: HashMap::from([
                 (sm, vec![packet(0, &[], &[0])]),
                 (dma, vec![packet(1, &[0], &[])]),
@@ -265,15 +260,22 @@ mod tests {
         let sm = ResourceId::Sm(0, 3);
         let sched = Schedule {
             streams: HashMap::from([(sm, stream_of(&[(0, 0), (1, 5)]))]),
-            packets: HashMap::from([(
-                sm,
-                vec![packet(0, &[], &[0, 1]), packet(1, &[0, 1], &[])],
-            )]),
+            packets: HashMap::from([(sm, vec![packet(0, &[], &[0, 1]), packet(1, &[0, 1], &[])])]),
             counters: vec![
-                Counter { id: 0, threshold: 1, scope: Scope::IntraSm,
-                          producer_node: 0, consumer_node: 1 },
-                Counter { id: 1, threshold: 1, scope: Scope::CrossUnit,
-                          producer_node: 0, consumer_node: 1 },
+                Counter {
+                    id: 0,
+                    threshold: 1,
+                    scope: Scope::IntraSm,
+                    producer_node: 0,
+                    consumer_node: 1,
+                },
+                Counter {
+                    id: 1,
+                    threshold: 1,
+                    scope: Scope::CrossUnit,
+                    producer_node: 0,
+                    consumer_node: 1,
+                },
             ],
             placement: HashMap::from([(0usize, sm), (1usize, sm)]),
             starts: vec![0, 5],

@@ -166,14 +166,9 @@ mod amd_serve {
         /// binds a quarter of a weight it needed all of. Backend index IS rank,
         /// so under a `gpulease` the visible ordinals `0..n` are the leased
         /// cards.
-        pub fn load(
-            blob_path: &Path,
-            hsaco_dir: &Path,
-            checkpoint: Option<&Path>,
-        ) -> Result<Self> {
-            let raw = std::fs::read(blob_path).map_err(|e| {
-                RuntimeError::Device(format!("read {}: {e}", blob_path.display()))
-            })?;
+        pub fn load(blob_path: &Path, hsaco_dir: &Path, checkpoint: Option<&Path>) -> Result<Self> {
+            let raw = std::fs::read(blob_path)
+                .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
             let n_gpu = crate::asset::devblob::DevBlob::parse(&raw)?
                 .tp
                 .map(|t| t.n_gpu)
@@ -201,7 +196,9 @@ mod amd_serve {
                 for d in 0..n_gpu {
                     backends.push(Arc::new(crate::device::hsa::HsaBackend::new(d as u8)?));
                 }
-                Ranks::Tp(AmdTpGroup::load(backends, blob_path, hsaco_dir, checkpoint)?)
+                Ranks::Tp(AmdTpGroup::load(
+                    backends, blob_path, hsaco_dir, checkpoint,
+                )?)
             };
 
             let (n_programs, max_ctx, bound) = match &ranks {
@@ -349,7 +346,13 @@ mod amd_serve {
                         // prefill so the NEXT request on the slot can resume — it prefills the
                         // same tokens either way, so a miss costs only the snapshot copy.
                         if resume > 0 || arm > 0 {
-                            tracing::debug!(slot, resume, arm, n = prompt.len(), "amd: prefix cache");
+                            tracing::debug!(
+                                slot,
+                                resume,
+                                arm,
+                                n = prompt.len(),
+                                "amd: prefix cache"
+                            );
                         }
                         let ids = if resume > 0 || arm > 0 {
                             g.prefill_slot_cached(slot, prompt, resume, arm)?
@@ -646,7 +649,10 @@ mod amd_serve {
                 }
                 return Ok(vec![t]);
             }
-            let (mut p, mut k) = (Vec::with_capacity(self.batch), Vec::with_capacity(self.batch));
+            let (mut p, mut k) = (
+                Vec::with_capacity(self.batch),
+                Vec::with_capacity(self.batch),
+            );
             for s in 0..self.batch {
                 // A slot MID-CHUNKED-PREFILL is not live, but it must not be fed row 0 either:
                 // its rows [0, frontier) are real prefilled KV and a throwaway write at row 0
@@ -668,9 +674,7 @@ mod amd_serve {
             // a correctness improvement and less work.
             //
             // On a blob without `in.parked` this is a no-op, so a non-batched packet is unchanged.
-            let parked: Vec<u32> = (0..self.batch)
-                .map(|s| u32::from(!self.live[s]))
-                .collect();
+            let parked: Vec<u32> = (0..self.batch).map(|s| u32::from(!self.live[s])).collect();
             let out = match &mut self.ranks {
                 Ranks::One(e) => {
                     e.upload_parked(&parked)?;

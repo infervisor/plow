@@ -122,7 +122,9 @@ pub fn route(cfg: &RouterCfg, logits: &[f32]) -> Vec<RouteEntry> {
 
     // 2. k-pass masked argmax over packed keys (lowest-id tie-break).
     let mut keys: Vec<u64> = (0..n)
-        .map(|id| ((ordered_bits(score[id]) as u64) << 20) | ((n as u64 - 1 - id as u64) & 0xF_FFFF))
+        .map(|id| {
+            ((ordered_bits(score[id]) as u64) << 20) | ((n as u64 - 1 - id as u64) & 0xF_FFFF)
+        })
         .collect();
     let mut winners: Vec<usize> = Vec::with_capacity(k);
     for _ in 0..k {
@@ -153,7 +155,10 @@ pub fn route(cfg: &RouterCfg, logits: &[f32]) -> Vec<RouteEntry> {
     winners
         .into_iter()
         .zip(gates)
-        .map(|(id, g)| RouteEntry { expert_id: id as u32, gate: g })
+        .map(|(id, g)| RouteEntry {
+            expert_id: id as u32,
+            gate: g,
+        })
         .collect()
 }
 

@@ -81,7 +81,10 @@ mod tests {
         let t = EngineThread::spawn("test-engine".into());
         let first = t.run(|| std::thread::current().id()).await.unwrap();
         for i in 0..8 {
-            let id = t.run(move || (std::thread::current().id(), i)).await.unwrap();
+            let id = t
+                .run(move || (std::thread::current().id(), i))
+                .await
+                .unwrap();
             assert_eq!(id.0, first, "every tick runs on the same thread");
             assert_eq!(id.1, i);
         }

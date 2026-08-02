@@ -51,10 +51,34 @@ fn probe_available() -> bool {
 /// either would make this test fail on a re-measure for a reason that is not a regression; that
 /// is precisely the mistake `Stats::beats` exists to stop the store from making.
 const ANALYTICAL_LOSES: &[(u32, u32, u32, &[DevOp], &str)] = &[
-    (2048, 8192, 5376, &[DevOp::GemmWide], "Gemma-31B q_proj M=2048"),
-    (8192, 8192, 5376, &[DevOp::GemmC5], "Gemma-31B q_proj M=8192"),
-    (2048, 21504, 5376, &[DevOp::GemmC5], "Gemma-31B gate/up M=2048"),
-    (4096, 9728, 2560, &[DevOp::GemmWide, DevOp::GemmC5], "Qwen gate/up M=4096 (tie)"),
+    (
+        2048,
+        8192,
+        5376,
+        &[DevOp::GemmWide],
+        "Gemma-31B q_proj M=2048",
+    ),
+    (
+        8192,
+        8192,
+        5376,
+        &[DevOp::GemmC5],
+        "Gemma-31B q_proj M=8192",
+    ),
+    (
+        2048,
+        21504,
+        5376,
+        &[DevOp::GemmC5],
+        "Gemma-31B gate/up M=2048",
+    ),
+    (
+        4096,
+        9728,
+        2560,
+        &[DevOp::GemmWide, DevOp::GemmC5],
+        "Qwen gate/up M=4096 (tie)",
+    ),
 ];
 
 #[test]
@@ -138,8 +162,14 @@ fn an_unmeasured_shape_still_selects() {
     assert_eq!(gfx950_measured_rungs(333, 777, 1024, Bf16), 0);
     let got = gfx950_prefill_tile(333, 777, 1024, N_CU, Bf16);
     assert!(
-        [DevOp::Gemm, DevOp::GemmMed, DevOp::GemmSmall, DevOp::GemmWide, DevOp::GemmC5]
-            .contains(&got),
+        [
+            DevOp::Gemm,
+            DevOp::GemmMed,
+            DevOp::GemmSmall,
+            DevOp::GemmWide,
+            DevOp::GemmC5
+        ]
+        .contains(&got),
         "{got:?} is not a bf16 rung"
     );
 }

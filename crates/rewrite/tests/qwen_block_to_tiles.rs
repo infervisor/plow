@@ -7,7 +7,7 @@
 //! including the cross-op *tile* dependencies (RMSNorm → projection M-coupling)
 //! the scheduler consumes.
 
-use costmodel::{DEFAULT_PAGE_BYTES, Soc, SramPolicy};
+use costmodel::{Soc, SramPolicy, DEFAULT_PAGE_BYTES};
 use nn_graph::{infer_shapes, ActKind, DType, Nn};
 use rewrite::{
     assemble, consumer_thresholds, materialize_tile_deps, plan_from_block, plan_from_fused,

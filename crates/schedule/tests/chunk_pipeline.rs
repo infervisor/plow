@@ -71,7 +71,10 @@ fn static_colocated_placement_tiles_the_chip_disjointly() {
     // tile [0, n_cu) — chunk c pins to SM-set [c*n_cu/k, (c+1)*n_cu/k).
     let mut by_node: HashMap<usize, Vec<(u32, (u32, u32))>> = HashMap::new();
     for p in &plan.placement {
-        by_node.entry(p.node).or_default().push((p.chunk, p.cu_range));
+        by_node
+            .entry(p.node)
+            .or_default()
+            .push((p.chunk, p.cu_range));
     }
     for (_node, mut v) in by_node {
         v.sort();
@@ -100,10 +103,10 @@ fn global_queue_placement_uses_whole_chip() {
         4,
         ChunkPlacementPolicy::GlobalQueue,
     );
-    assert!(plan
-        .placement
-        .iter()
-        .all(|p| p.cu_range == (0, 132)), "GQ: every chunk may use the whole chip");
+    assert!(
+        plan.placement.iter().all(|p| p.cu_range == (0, 132)),
+        "GQ: every chunk may use the whole chip"
+    );
 }
 
 #[test]
@@ -115,7 +118,15 @@ fn chunk_edges_are_one_to_one_on_coupled_boundaries() {
         ..Config::default()
     };
     let machine = Machine::from_soc(&soc, &cfg);
-    let plan = expand_prefill_chunks(&soc, &machine, &g, &cons, 132, k, ChunkPlacementPolicy::default());
+    let plan = expand_prefill_chunks(
+        &soc,
+        &machine,
+        &g,
+        &cons,
+        132,
+        k,
+        ChunkPlacementPolicy::default(),
+    );
 
     assert!(!plan.chunk_edges.is_empty(), "a chunk pipeline must exist");
 
@@ -150,11 +161,17 @@ fn chunk_edges_are_one_to_one_on_coupled_boundaries() {
             }
         }
         for (&_c, &d) in &indeg {
-            assert_eq!(d, 1, "consumer chunk must have exactly one producer chunk (1:1)");
+            assert_eq!(
+                d, 1,
+                "consumer chunk must have exactly one producer chunk (1:1)"
+            );
         }
         checked += 1;
     }
-    assert!(checked > 0, "at least one coupled boundary was 1:1-verified");
+    assert!(
+        checked > 0,
+        "at least one coupled boundary was 1:1-verified"
+    );
 
     // No cross-op counter is a global barrier: on a matched coupled boundary the
     // threshold is 1, not k.
@@ -167,7 +184,10 @@ fn chunk_edges_are_one_to_one_on_coupled_boundaries() {
             }
         }
     }
-    assert!(fine_ones > 0, "the pipeline uses threshold-1 (fine) counters");
+    assert!(
+        fine_ones > 0,
+        "the pipeline uses threshold-1 (fine) counters"
+    );
 }
 
 #[test]
@@ -194,7 +214,10 @@ fn perop_pertile_expansion_unchanged() {
         .iter()
         .filter(|t| t.kind == TaskKind::Compute)
         .count();
-    assert_eq!(per_op_compute, n_compute_nodes, "PerOp: 1 compute task per node");
+    assert_eq!(
+        per_op_compute, n_compute_nodes,
+        "PerOp: 1 compute task per node"
+    );
 
     // PerTile: sum of every node's tile count.
     let expected_tiles: usize = cons.domains.values().map(|d| d.coords().len()).sum();
@@ -203,7 +226,10 @@ fn perop_pertile_expansion_unchanged() {
         .iter()
         .filter(|t| t.kind == TaskKind::Compute)
         .count();
-    assert_eq!(per_tile_compute, expected_tiles, "PerTile: 1 compute task per tile");
+    assert_eq!(
+        per_tile_compute, expected_tiles,
+        "PerTile: 1 compute task per tile"
+    );
 
     // PerChunk sits strictly between the two for a multi-tile op chain.
     let cfg4 = Config {

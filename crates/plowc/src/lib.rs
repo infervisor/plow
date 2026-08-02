@@ -43,13 +43,13 @@
 //!   rejection fails the compile with `PlowcError::LeanVerify`. Requires
 //!   `--features lean-verify`. See `plans/lean-formal-verification-analysis.md`.
 
+pub mod hf_config;
+pub mod net;
+pub mod parallel;
 #[cfg(feature = "tuner")]
 pub mod tune;
 #[cfg(feature = "tuner")]
 pub mod tuned;
-pub mod hf_config;
-pub mod net;
-pub mod parallel;
 
 use std::path::PathBuf;
 
@@ -198,7 +198,10 @@ pub struct KvConfig {
 
 impl Default for KvConfig {
     fn default() -> Self {
-        KvConfig { block_tokens: 256, initial_blocks: 0 }
+        KvConfig {
+            block_tokens: 256,
+            initial_blocks: 0,
+        }
     }
 }
 
@@ -591,19 +594,30 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
 
     // Pre-build every bucket's plan (fallible: model resolution / lowering may
     // fail). `compile_buckets` then pulls the prebuilt plan, infallibly.
-    info!(stage = "planning", buckets = buckets.len(), "lowering bucket plans");
+    info!(
+        stage = "planning",
+        buckets = buckets.len(),
+        "lowering bucket plans"
+    );
     let mut plans: Vec<(ShapeBucket, LayerPlan)> = Vec::with_capacity(buckets.len());
     let mut fusion: Option<FusionReport> = None;
     for b in &buckets {
         debug!(
-            stage = "planning", phase = phase_name(b.phase), batch = b.batch,
-            seq = b.seq, "lowering bucket"
+            stage = "planning",
+            phase = phase_name(b.phase),
+            batch = b.batch,
+            seq = b.seq,
+            "lowering bucket"
         );
         // Egg exploration only for the first bucket: the report keeps only the
         // first bucket's stats (below), and the saturation result is otherwise
         // unused — re-running it per bucket multiplied peak memory for nothing.
         let (plan, st) = build_plan(src, b, hf_synth.as_ref(), fusion.is_none())?;
-        trace!(stage = "planning", ops = plan.ops.len(), "bucket plan lowered");
+        trace!(
+            stage = "planning",
+            ops = plan.ops.len(),
+            "bucket plan lowered"
+        );
         if let (None, Some(s)) = (&fusion, st) {
             fusion = Some(FusionReport {
                 ops_before: s.ops_before,
@@ -613,7 +627,11 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
         }
         plans.push((*b, plan));
     }
-    info!(stage = "planning", plans = plans.len(), "bucket plans lowered");
+    info!(
+        stage = "planning",
+        plans = plans.len(),
+        "bucket plans lowered"
+    );
     // HfDir: hard-verify the (bucket-invariant) weight coverage of the plan
     // against the safetensors actually in the directory — both directions.
     // A silently-absent (or silently-uncovered) weight is the worst failure
@@ -657,7 +675,10 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
             .expect("every compiled bucket was prebuilt")
     };
 
-    let cfg = Config { lean_oracle: opts.lean_oracle, ..Config::default() };
+    let cfg = Config {
+        lean_oracle: opts.lean_oracle,
+        ..Config::default()
+    };
 
     // The kernel oracle: capability filter from the probed interpreter, plus
     // qualified measurements where they match this build. `--no-tuning` selects
@@ -688,10 +709,15 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
         }
         Box::new(rewrite::oracle::NoOracle)
     };
-    info!(stage = "scheduling", buckets = buckets.len(), "scheduling buckets");
+    info!(
+        stage = "scheduling",
+        buckets = buckets.len(),
+        "scheduling buckets"
+    );
     let mut compiled = compile_buckets_tuned(&soc, &cfg, &buckets, lookup_plan, oracle.as_ref());
     info!(
-        stage = "scheduling", streams = compiled.streams.len(),
+        stage = "scheduling",
+        streams = compiled.streams.len(),
         "buckets scheduled"
     );
 
@@ -707,7 +733,11 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
     // the SRAM residency real (packet emitter sees resident flags,
     // list_schedule sees the new colocation groups).
     if opts.sram_fit {
-        info!(stage = "optimization", pass = "sram-fit", "running post-schedule pass");
+        info!(
+            stage = "optimization",
+            pass = "sram-fit",
+            "running post-schedule pass"
+        );
         apply_sram_fit_phase2(&mut compiled, &soc, &cfg);
     }
 
@@ -767,7 +797,11 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
         opts.out.join("weights.json"),
         serde_json::to_string_pretty(&report)?,
     )?;
-    trace!(stage = "manifest", file = "weights.json", "artifact written");
+    trace!(
+        stage = "manifest",
+        file = "weights.json",
+        "artifact written"
+    );
 
     // Model+setting summary: peak HBM per region + on-disk asset sizes.
     // Written last so `on_disk.weights_json` reflects the file just above.
@@ -842,7 +876,10 @@ fn build_assets(
         .map(|b| b.packet_file.trim_end_matches(".pkt").to_string())
         .collect();
     let sum_size = |suffix: &str| -> u64 {
-        stems.iter().map(|s| file_size(&format!("{s}{suffix}"))).sum()
+        stems
+            .iter()
+            .map(|s| file_size(&format!("{s}{suffix}")))
+            .sum()
     };
 
     let packets_total = sum_size(".pkt");
@@ -1091,7 +1128,10 @@ fn build_blocks_schema(tasks: &schedule::TaskGraph) -> BlocksSchema {
             task_count: count,
         })
         .collect();
-    BlocksSchema { blocks, complete: untagged == 0 }
+    BlocksSchema {
+        blocks,
+        complete: untagged == 0,
+    }
 }
 
 /// Build the RequestIo schema for a bucket from the source network. For
@@ -1100,7 +1140,11 @@ fn build_blocks_schema(tasks: &schedule::TaskGraph) -> BlocksSchema {
 /// sources the schema is emitted with `complete: false` and a single
 /// opaque field per graph input/output — full semantic tagging (image vs
 /// text vs mask) awaits Graph.inputs/outputs plumbing.
-fn build_request_io_schema(src: &Source, bucket: &ShapeBucket, plan: &LayerPlan) -> RequestIoSchema {
+fn build_request_io_schema(
+    src: &Source,
+    bucket: &ShapeBucket,
+    plan: &LayerPlan,
+) -> RequestIoSchema {
     const ELEM_BYTES_ACT: u32 = 2; // bf16 / fp16 activations
     const ELEM_BYTES_I32: u32 = 4; // i32 for indices / positions
 
@@ -1127,13 +1171,19 @@ fn build_request_io_schema(src: &Source, bucket: &ShapeBucket, plan: &LayerPlan)
     match src {
         Source::Net(n) => {
             let hidden = n.hidden;
-            let final_output = plan.ops.last().map(|op| op.output.clone()).unwrap_or_default();
+            let final_output = plan
+                .ops
+                .last()
+                .map(|op| op.output.clone())
+                .unwrap_or_default();
             let mut feat = hidden;
             for op in &n.ops {
                 match op {
                     net::NetOp::Gemm { n: nn, .. } => feat = *nn,
                     net::NetOp::Norm { feat: f } => {
-                        if let Some(f) = f { feat = *f }
+                        if let Some(f) = f {
+                            feat = *f
+                        }
                     }
                     _ => {}
                 }
@@ -1153,7 +1203,10 @@ fn build_request_io_schema(src: &Source, bucket: &ShapeBucket, plan: &LayerPlan)
                 shape: vec![rows, feat],
                 elem_bytes: ELEM_BYTES_ACT,
             });
-            RequestIoSchema { fields, complete: true }
+            RequestIoSchema {
+                fields,
+                complete: true,
+            }
         }
         Source::Model(_) | Source::HfDir(_) => {
             // Plumbing gap: HF-model semantic tagging requires walking
@@ -1162,7 +1215,10 @@ fn build_request_io_schema(src: &Source, bucket: &ShapeBucket, plan: &LayerPlan)
             // yet — emit the common control buffers + `complete: false` so
             // the runtime falls back to address-map-only lookups for the
             // token/logit paths.
-            RequestIoSchema { fields: common, complete: false }
+            RequestIoSchema {
+                fields: common,
+                complete: false,
+            }
         }
     }
 }
@@ -1304,7 +1360,10 @@ fn emit_streams(
     let mut footprints: Vec<Footprint> = Vec::with_capacity(compiled.streams.len());
     let kv_layout = compiled.kv;
     let mut lean = if opts.lean_verify {
-        LeanStatus { verified: true, provenance: "certified: every bucket".into() }
+        LeanStatus {
+            verified: true,
+            provenance: "certified: every bucket".into(),
+        }
     } else {
         LeanStatus {
             verified: false,
@@ -1328,11 +1387,12 @@ fn emit_streams(
         let mut current: std::borrow::Cow<'_, schedule::Schedule> =
             std::borrow::Cow::Borrowed(&bs.sched.schedule);
         if opts.counter_elim {
-            let (reduced, rep) =
-                schedule::counter_elim::eliminate_redundant_counters(&current);
+            let (reduced, rep) = schedule::counter_elim::eliminate_redundant_counters(&current);
             info!(
                 "[counter-elim] {stem}: {} → {} counters ({:.1}% dropped)",
-                rep.before, rep.kept, rep.savings_pct(),
+                rep.before,
+                rep.kept,
+                rep.savings_pct(),
             );
             current = std::borrow::Cow::Owned(reduced);
         }
@@ -1371,11 +1431,8 @@ fn emit_streams(
         // schedule here rather than emit it silently. Diagnostic only — makespan
         // is unchanged (a bandwidth-accurate makespan needs the bandwidth-aware
         // simulator).
-        let hbm_audit = schedule::hbm_bandwidth_audit(
-            &bs.sched.tasks,
-            &effective_sched,
-            &bs.sched.machine,
-        );
+        let hbm_audit =
+            schedule::hbm_bandwidth_audit(&bs.sched.tasks, &effective_sched, &bs.sched.machine);
         for (unit, peak, cap) in hbm_audit.oversubscribed() {
             warn!(
                 "[hbm-audit] {stem}: unit {unit} peak HBM demand {peak:.2} B/cycle \
@@ -1396,10 +1453,17 @@ fn emit_streams(
                 rep.lower_bound.bound,
                 rep.optimality_gap * 100.0,
                 rep.lower_bound.binding,
-                if rep.any_certified { ", lean-certified" } else { "" },
+                if rep.any_certified {
+                    ", lean-certified"
+                } else {
+                    ""
+                },
                 rep.bubble_fill.cycles_recovered,
                 rep.bubble_fill.streams_modified,
-                rep.prefetch_depths.iter().map(|p| p.depth).collect::<Vec<_>>(),
+                rep.prefetch_depths
+                    .iter()
+                    .map(|p| p.depth)
+                    .collect::<Vec<_>>(),
             );
         }
 
@@ -1440,13 +1504,8 @@ fn emit_streams(
         // initial block count sized to cover this bucket's prefill; the
         // runtime allocates further blocks past `offset + reserved` as
         // sequences extend.
-        let kv_paging = inject_kv_growable_entry(
-            &mut amap,
-            kv_layout,
-            &bs.bucket,
-            &opts.kv,
-            &bs.sched.tasks,
-        );
+        let kv_paging =
+            inject_kv_growable_entry(&mut amap, kv_layout, &bs.bucket, &opts.kv, &bs.sched.tasks);
         // Attribute flash tasks to the injected KV entries so the Lean
         // checkpoints (D/F) verify them against real writer/reader sets —
         // a Growable entry with empty sets passes reclamation vacuously.
@@ -1561,10 +1620,7 @@ fn emit_streams(
         // `plans/kv-decode-and-static.md`.
         if let Some(dk) = build_decode_kv_schema(&bs.bucket, &bs.sched.tasks, kv_paging.as_ref()) {
             let dk_file = format!("{stem}.decode_kv.json");
-            std::fs::write(
-                opts.out.join(&dk_file),
-                serde_json::to_string_pretty(&dk)?,
-            )?;
+            std::fs::write(opts.out.join(&dk_file), serde_json::to_string_pretty(&dk)?)?;
         }
 
         // Blocks sidecar — per-transformer-block task ranges. Pipeline-
@@ -1808,7 +1864,9 @@ fn dispatch_cert(
             .reason
             .clone()
             .unwrap_or_else(|| "verifier returned ok=false with no reason".into());
-        tracing::error!("[lean-verify:{checkpoint}] {bucket}: REJECTED in {elapsed_ms}ms — {reason}");
+        tracing::error!(
+            "[lean-verify:{checkpoint}] {bucket}: REJECTED in {elapsed_ms}ms — {reason}"
+        );
         Err(PlowcError::LeanVerify {
             bucket: bucket.to_string(),
             reason,
@@ -1927,7 +1985,11 @@ fn verify_B(
             .max(1);
         candidates.push(TileCandidate {
             gemm: GemmShapeJ { m, n, k },
-            tile: TileShapeJ { bm: bmu, bn: bnu, bk: bku },
+            tile: TileShapeJ {
+                bm: bmu,
+                bn: bnu,
+                bk: bku,
+            },
             cost_bound,
         });
     }
@@ -1952,8 +2014,7 @@ fn verify_D(
     amap: &schedule::AddressMap,
     task_sets: &schedule::memory::TensorTaskSets,
 ) -> Result<bool, PlowcError> {
-    let request =
-        schedule::lean_verify::build_schedule_request(tasks, sched, amap, task_sets);
+    let request = schedule::lean_verify::build_schedule_request(tasks, sched, amap, task_sets);
     debug!(
         "[lean-verify:D] {bucket}: submitting — {n_tasks} tasks, {n_counters} counters, {n_entries} entries",
         n_tasks = request.task_graph.n,
@@ -1985,8 +2046,14 @@ fn verify_E(bucket: &str) -> Result<bool, PlowcError> {
     // Two synthetic frames spanning the byte range [0, 255] to exercise
     // the JSON u8-serialization boundaries.
     let frames = vec![
-        WireFrame { opcode: 0x1234, payload: vec![0, 1, 2, 253, 254, 255] },
-        WireFrame { opcode: 0xABCD, payload: (0..16).collect() },
+        WireFrame {
+            opcode: 0x1234,
+            payload: vec![0, 1, 2, 253, 254, 255],
+        },
+        WireFrame {
+            opcode: 0xABCD,
+            payload: (0..16).collect(),
+        },
     ];
     let raw = encode_program(&frames);
     let started = std::time::Instant::now();
@@ -2009,8 +2076,7 @@ fn verify_F(
     amap: &schedule::AddressMap,
     task_sets: &schedule::memory::TensorTaskSets,
 ) -> Result<bool, PlowcError> {
-    let request =
-        schedule::lean_verify::build_schedule_request(tasks, sched, amap, task_sets);
+    let request = schedule::lean_verify::build_schedule_request(tasks, sched, amap, task_sets);
     let started = std::time::Instant::now();
     dispatch_cert(
         bucket,
@@ -2047,11 +2113,7 @@ fn apply_sram_fit_phase2(
         let phase = phase_name(bs.bucket.phase);
         let stem = format!("{phase}_b{}_s{}", bs.bucket.batch, bs.bucket.seq);
 
-        let rep = schedule::sram_fit::analyze_temporal_fit(
-            &bs.sched,
-            &bs.cons,
-            &bs.sched.machine,
-        );
+        let rep = schedule::sram_fit::analyze_temporal_fit(&bs.sched, &bs.cons, &bs.sched.machine);
         if rep.candidates.is_empty() {
             debug!(
                 "[sram-fit] {stem}: 0 promotable of {} demoted — no reschedule",
@@ -2080,11 +2142,8 @@ fn apply_sram_fit_phase2(
             // incremental over its own output).
             let mut trial = accepted.clone();
             trial.push(cand.clone());
-            let (trial_g, trial_cons) = schedule::sram_fit::promote_temporal_fits(
-                &bs.graph,
-                &bs.cons,
-                &trial,
-            );
+            let (trial_g, trial_cons) =
+                schedule::sram_fit::promote_temporal_fits(&bs.graph, &bs.cons, &trial);
             reschedules += 1;
             let trial_sched = schedule::schedule(soc, &trial_g, &trial_cons, cfg);
             let trial_makespan = trial_sched.schedule.makespan;
@@ -2203,8 +2262,7 @@ fn inject_kv_growable_entry(
     let kv_factor: i64 = 2; // separate K and V
     let max_seqs: i64 = bucket.batch.max(1);
     let max_seq_positions = block_tokens.max(0) as u64 * per_layer_blocks.max(0) as u64;
-    let head_slot_bytes =
-        max_seq_positions * layout.head_dim.max(0) as u64 * KV_ELEM_BYTES;
+    let head_slot_bytes = max_seq_positions * layout.head_dim.max(0) as u64 * KV_ELEM_BYTES;
     let per_layer_reserved = (kv_factor.max(0) as u64)
         .saturating_mul(layout.kv_heads.max(0) as u64)
         .saturating_mul(max_seqs.max(0) as u64)
@@ -2326,7 +2384,10 @@ fn build_plan(
                 stage = "nn-graph", model = %id, batch = b.batch, seq = b.seq,
                 "building nn_graph from pretrained model"
             );
-            let mut g = nn_graph::hub::build_from_pretrained(id, &nn_graph::models::ShapeBucket::default())?;
+            let mut g = nn_graph::hub::build_from_pretrained(
+                id,
+                &nn_graph::models::ShapeBucket::default(),
+            )?;
             g.bind(&nn_graph::Bindings::new().set("B", b.batch).set("S", b.seq));
             // The fused graph is not consumed (the plan below is built from the
             // source graph) and the caller keeps only the FIRST bucket's stats

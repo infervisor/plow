@@ -5,9 +5,7 @@
 //! Ampere but with improved tensor-core throughput). No distributed shared
 //! memory (DSM is Hopper+).
 
-use crate::spec::{
-    Arch, GpuSpec, MatrixThroughput, MemKind, MemorySpec, SmSpec, Vendor,
-};
+use crate::spec::{Arch, GpuSpec, MatrixThroughput, MemKind, MemorySpec, SmSpec, Vendor};
 use crate::units::{Bytes, GBps, Hertz};
 
 /// Ada SM: 4th-gen tensor cores, mma.sync m16n8k16.

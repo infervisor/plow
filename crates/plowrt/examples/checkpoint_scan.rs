@@ -47,7 +47,10 @@ fn main() {
     }
     println!("tensors       {}", c.tensors().len());
     println!("dtypes        {dtypes:?}");
-    println!("total bytes   {total} ({:.2} GiB)", total as f64 / (1 << 30) as f64);
+    println!(
+        "total bytes   {total} ({:.2} GiB)",
+        total as f64 / (1 << 30) as f64
+    );
     println!(
         "largest       {:.1} MiB  {}  {:?}",
         largest.nbytes() as f64 / (1 << 20) as f64,

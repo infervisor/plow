@@ -12,9 +12,18 @@ use lean_verify::checkpoints::wire::{
 
 fn sample_frames() -> Vec<WireFrame> {
     vec![
-        WireFrame { opcode: 1, payload: vec![10, 20, 30] },
-        WireFrame { opcode: 42, payload: vec![] },
-        WireFrame { opcode: 0xABCD, payload: (0..8).collect() },
+        WireFrame {
+            opcode: 1,
+            payload: vec![10, 20, 30],
+        },
+        WireFrame {
+            opcode: 42,
+            payload: vec![],
+        },
+        WireFrame {
+            opcode: 0xABCD,
+            payload: (0..8).collect(),
+        },
     ]
 }
 
@@ -31,7 +40,10 @@ fn accepts_valid_round_trip() {
 #[test]
 #[ignore = "requires plow_verify binary"]
 fn accepts_empty_program() {
-    let req = WireRequest { raw: vec![], frames: vec![] };
+    let req = WireRequest {
+        raw: vec![],
+        frames: vec![],
+    };
     let cert = check_wire_roundtrip(&req).expect("verifier call");
     assert!(cert.ok, "empty round-trip rejected: {cert:?}");
 }
@@ -197,7 +209,10 @@ fn abstract_framing_shape_matches_packet_body_ordering() {
         })
         .collect();
     let abstract_raw = encode_program(&frames);
-    let req = WireRequest { raw: abstract_raw, frames };
+    let req = WireRequest {
+        raw: abstract_raw,
+        frames,
+    };
     let cert = check_wire_roundtrip(&req).expect("verifier call");
     assert!(cert.ok, "abstract framing round-trip rejected: {cert:?}");
 }

@@ -57,7 +57,9 @@ struct Row {
 /// against an object nobody measured, which is worse than no record at all.
 pub fn digests(root: &Path) -> Result<Digests, Err> {
     let inv = kernelcaps::dense_gemm_inventory(root, hwspec::IsaLevel::Gfx950).map_err(|e| {
-        format!("cannot probe the gfx950 interpreter ({e}); ingest needs it to key records to a build")
+        format!(
+            "cannot probe the gfx950 interpreter ({e}); ingest needs it to key records to a build"
+        )
     })?;
     Ok(Digests {
         implementation: inv.build().label(),
@@ -106,7 +108,9 @@ pub fn ingest(
         let correctness = if r.correct {
             Correctness::Pass
         } else {
-            Correctness::Fail { detail: format!("f64 dot spot-check mismatch on {}", r.sym) }
+            Correctness::Fail {
+                detail: format!("f64 dot spot-check mismatch on {}", r.sym),
+            }
         };
         if !r.correct {
             failed.push(format!("{op_case} {kernel_name}"));
@@ -137,20 +141,30 @@ pub fn ingest(
     let store = TuneStore::new(db.clone());
     // Correct-but-slow is publishable; incorrect is not, and the failure is STORED with its reason
     // so the next campaign does not re-measure the same broken tile.
-    let (bad, good): (Vec<_>, Vec<_>) =
-        records.into_iter().partition(|r| !matches!(r.correctness, Correctness::Pass));
+    let (bad, good): (Vec<_>, Vec<_>) = records
+        .into_iter()
+        .partition(|r| !matches!(r.correctness, Correctness::Pass));
     if !bad.is_empty() {
         let n = store.record_rejected(CELL, bad, "f64 dot spot-check mismatch")?;
-        println!("rejected    : {n} record(s) failed the oracle: {}", failed.join(", "));
+        println!(
+            "rejected    : {n} record(s) failed the oracle: {}",
+            failed.join(", ")
+        );
     }
     if provisional {
-        println!("provisional : {} record(s) stored, NOT selectable", good.len());
+        println!(
+            "provisional : {} record(s) stored, NOT selectable",
+            good.len()
+        );
         let n = store.record_rejected(CELL, good, "--provisional: screening pass only")?;
         println!("stored      : {n}");
         return Ok(0);
     }
     let n = store.publish(CELL, good)?;
-    println!("published   : {n} qualified record(s) into {}/{CELL}", db.display());
+    println!(
+        "published   : {n} qualified record(s) into {}/{CELL}",
+        db.display()
+    );
     Ok(n)
 }
 
@@ -180,7 +194,10 @@ pub fn best(root: &Path, db: &PathBuf, quant: &str) -> Result<(), Err> {
         println!("  (no selectable records for quant {quant})");
     }
     if !stale.is_empty() {
-        println!("stale       : {} record(s) exist but are for a different build", stale.len());
+        println!(
+            "stale       : {} record(s) exist but are for a different build",
+            stale.len()
+        );
     }
     Ok(())
 }

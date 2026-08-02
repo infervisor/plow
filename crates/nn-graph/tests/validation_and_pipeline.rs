@@ -32,7 +32,11 @@ fn reshape_allows_unprovable_and_equal_symbolic_counts() {
     let mut nn = Nn::new(DType::BF16, DType::BF16);
     let b = nn.sym("B");
     let s = nn.sym("S");
-    let x = nn.input("x", nn.shape([b.clone(), s.clone(), Dim::stat(64)]), DType::BF16);
+    let x = nn.input(
+        "x",
+        nn.shape([b.clone(), s.clone(), Dim::stat(64)]),
+        DType::BF16,
+    );
     // Equal canonical polynomials: [B, S, 64] -> [B*S, 64].
     let y = nn.reshape(x, [b.mul(&s), Dim::stat(64)]);
     // Unprovable: [B*S, 64] -> [4096, 64] (equal when B*S = 4096) — trusted.
@@ -57,8 +61,16 @@ fn slice_rejects_static_out_of_bounds() {
 fn concat_rejects_provably_mismatched_axes() {
     let mut nn = Nn::new(DType::BF16, DType::BF16);
     let b = nn.sym("B");
-    let a = nn.input("a", nn.shape([b.clone(), Dim::stat(8), Dim::stat(256)]), DType::BF16);
-    let c = nn.input("c", nn.shape([b.clone(), Dim::stat(4), Dim::stat(512)]), DType::BF16);
+    let a = nn.input(
+        "a",
+        nn.shape([b.clone(), Dim::stat(8), Dim::stat(256)]),
+        DType::BF16,
+    );
+    let c = nn.input(
+        "c",
+        nn.shape([b.clone(), Dim::stat(4), Dim::stat(512)]),
+        DType::BF16,
+    );
     // Concat on axis 1, but axis 2 differs (256 vs 512).
     let y = nn.concat(1, vec![a, c]);
     nn.mark_output(y);

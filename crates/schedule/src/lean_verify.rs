@@ -49,7 +49,12 @@ fn scan_wait_succ(sched: &Schedule, n: usize) -> (Vec<Vec<u64>>, Vec<Vec<u64>>) 
     let mut succs = vec![Vec::<u64>::new(); n];
     for stream in sched.packets.values() {
         for pkt in stream {
-            let Packet { task, wait, successors, .. } = pkt;
+            let Packet {
+                task,
+                wait,
+                successors,
+                ..
+            } = pkt;
             if *task < n {
                 waits[*task].extend(wait.iter().map(|&c| c as u64));
                 succs[*task].extend(successors.iter().map(|&c| c as u64));
@@ -126,8 +131,10 @@ pub fn build_schedule_request(
         .entries
         .iter()
         .map(|e| {
-            let (writers, readers) =
-                task_sets.get(&e.name).cloned().unwrap_or_else(|| (Vec::new(), Vec::new()));
+            let (writers, readers) = task_sets
+                .get(&e.name)
+                .cloned()
+                .unwrap_or_else(|| (Vec::new(), Vec::new()));
             LeanAddrEntry {
                 name: e.name.clone(),
                 offset: e.offset,

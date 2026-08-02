@@ -211,21 +211,23 @@ fn declare(b: &mut Builder, c: &Cfg, ctx: u32, ns_pre: u32) -> Tn {
             &format!("kv.{l}.v"),
             (ctx * c.kv_heads * c.head_dim) as u64 * BF16,
         ));
-        let w = |b: &mut Builder, s: &str, sz: u64| {
-            b.tensor(&format!("model.layers.{l}.{s}"), sz)
-        };
+        let w = |b: &mut Builder, s: &str, sz: u64| b.tensor(&format!("model.layers.{l}.{s}"), sz);
         t.lw.push(LW {
             wq: w(b, "self_attn.q_proj.weight", (qd * c.hidden) as u64 * BF16),
             wk: w(b, "self_attn.k_proj.weight", (kd * c.hidden) as u64 * BF16),
             wv: w(b, "self_attn.v_proj.weight", (kd * c.hidden) as u64 * BF16),
-            wo: w(
+            wo: w(b, "self_attn.o_proj.weight", (c.hidden * qd) as u64 * BF16),
+            wg: w(
                 b,
-                "self_attn.o_proj.weight",
-                (c.hidden * qd) as u64 * BF16,
+                "mlp.gate_proj.weight",
+                (c.inter * c.hidden) as u64 * BF16,
             ),
-            wg: w(b, "mlp.gate_proj.weight", (c.inter * c.hidden) as u64 * BF16),
             wu: w(b, "mlp.up_proj.weight", (c.inter * c.hidden) as u64 * BF16),
-            wd: w(b, "mlp.down_proj.weight", (c.hidden * c.inter) as u64 * BF16),
+            wd: w(
+                b,
+                "mlp.down_proj.weight",
+                (c.hidden * c.inter) as u64 * BF16,
+            ),
             g_in: w(b, "input_layernorm.weight", c.hidden as u64 * BF16),
             g_pa: w(b, "post_attention_layernorm.weight", c.hidden as u64 * BF16),
         });
@@ -239,22 +241,15 @@ const GM_LDS_HALVES: u64 = 2 * (256 + 256) * (64 + 8);
 const Q_TILE_ROWS: u32 = 8 * 32; // PLOW_WAVES * FA_BQ
 
 /// Emit one phase. `t == 1 && decode` is the decode step; otherwise a prefill bucket.
-fn emit_phase(
-    b: &mut Builder,
-    c: &Cfg,
-    n: &Tn,
-    t: u32,
-    ctx: u32,
-    decode: bool,
-    n_cu: u32,
-) {
+fn emit_phase(b: &mut Builder, c: &Cfg, n: &Tn, t: u32, ctx: u32, decode: bool, n_cu: u32) {
     let all = b.all();
     let rows: Vec<u32> = (0..t.min(n_cu).max(1)).collect();
     let elem = |ne: u32| -> Vec<u32> { (0..ne.div_ceil(512 * 8).max(1).min(n_cu)).collect() };
     let ns = if decode {
         n_cu.div_ceil(c.heads).max(1)
     } else {
-        n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * c.heads).max(1)).max(1)
+        n_cu.div_ceil((t.div_ceil(Q_TILE_ROWS) * c.heads).max(1))
+            .max(1)
     };
     let scale = 1.0 / (c.head_dim as f32).sqrt();
 
@@ -273,8 +268,16 @@ fn emit_phase(
     let kd = c.kv_heads * c.head_dim;
     let kv_mask = 0xFFFF_FFFFu32; // full causal: no ring
 
-    let proj = |b: &mut Builder, out: u32, a: u32, w: u32, m: u32, nn: u32, k: u32,
-                    gamma: u32, cus: Vec<u32>, deps: &[u32]|
+    let proj = |b: &mut Builder,
+                out: u32,
+                a: u32,
+                w: u32,
+                m: u32,
+                nn: u32,
+                k: u32,
+                gamma: u32,
+                cus: Vec<u32>,
+                deps: &[u32]|
      -> u32 {
         let fold = decode && gamma != TENSOR_NONE;
         let op = if decode {
@@ -391,29 +394,24 @@ fn emit_phase(
                 d.f[0] = scale;
             })
         } else {
-            b.emit(
-                DevOp::FlashPrefill,
-                all.clone(),
-                &[c_qr, c_kr, c_vr],
-                |d| {
-                    d.t[0] = n.opart;
-                    d.t[1] = n.mlpart;
-                    d.t[2] = n.q;
-                    d.t[3] = n.kc[l];
-                    d.t[4] = n.vc[l];
-                    d.i[0] = t;
-                    d.i[1] = t;
-                    d.i[2] = c.heads;
-                    d.i[3] = c.kv_heads;
-                    d.i[4] = 0;
-                    d.i[5] = 0; // window=0 → full causal
-                    d.i[6] = c.head_dim;
-                    d.i[7] = ns;
-                    d.f[0] = scale;
-                    d.j[0] = ctx;
-                    d.j[1] = kv_mask;
-                },
-            )
+            b.emit(DevOp::FlashPrefill, all.clone(), &[c_qr, c_kr, c_vr], |d| {
+                d.t[0] = n.opart;
+                d.t[1] = n.mlpart;
+                d.t[2] = n.q;
+                d.t[3] = n.kc[l];
+                d.t[4] = n.vc[l];
+                d.i[0] = t;
+                d.i[1] = t;
+                d.i[2] = c.heads;
+                d.i[3] = c.kv_heads;
+                d.i[4] = 0;
+                d.i[5] = 0; // window=0 → full causal
+                d.i[6] = c.head_dim;
+                d.i[7] = ns;
+                d.f[0] = scale;
+                d.j[0] = ctx;
+                d.j[1] = kv_mask;
+            })
         };
         let mg_cus: Vec<u32> = (0..(t * c.heads).min(n_cu).max(1)).collect();
         let c_mg = b.emit(DevOp::FlashMerge, mg_cus, &[c_fa], |d| {
@@ -515,8 +513,30 @@ fn emit_phase(
             } else {
                 split2(n_cu, tiles(t, c.inter), tiles(t, c.inter))
             };
-            let c_g = proj(b, n.gt, mlp_src, w.wg, t, c.inter, c.hidden, mlp_g, cg, &[c_pn]);
-            let c_u = proj(b, n.ut, mlp_src, w.wu, t, c.inter, c.hidden, mlp_g, cu, &[c_pn]);
+            let c_g = proj(
+                b,
+                n.gt,
+                mlp_src,
+                w.wg,
+                t,
+                c.inter,
+                c.hidden,
+                mlp_g,
+                cg,
+                &[c_pn],
+            );
+            let c_u = proj(
+                b,
+                n.ut,
+                mlp_src,
+                w.wu,
+                t,
+                c.inter,
+                c.hidden,
+                mlp_g,
+                cu,
+                &[c_pn],
+            );
             let c_gl = b.emit(DevOp::Glu, elem(t * c.inter), &[c_g, c_u], |d| {
                 d.t[0] = n.fu;
                 d.t[1] = n.gt;
@@ -596,10 +616,7 @@ fn main() {
     );
     let ctx: u32 = a.next().expect("max_ctx").parse().unwrap();
     let out = a.next().unwrap_or_else(|| "llama3.pkt".into());
-    let n_cu: u32 = a
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(256);
+    let n_cu: u32 = a.next().and_then(|s| s.parse().ok()).unwrap_or(256);
 
     let c = cfg_from(&dir);
 
@@ -668,10 +685,7 @@ fn main() {
         "llama3: {} layers  hidden={} inter={}  heads={} kv_heads={}  hd={}  vocab={}",
         c.layers, c.hidden, c.inter, c.heads, c.kv_heads, c.head_dim, c.vocab
     );
-    eprintln!(
-        "  max_ctx={}  prefill buckets {:?} + decode",
-        ctx, buckets
-    );
+    eprintln!("  max_ctx={}  prefill buckets {:?} + decode", ctx, buckets);
     for (i, p) in m.progs.iter().enumerate() {
         eprintln!(
             "    prog {} (T={:>4}): {:>5} packets, {:>7} workgroup-packets",

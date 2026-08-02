@@ -43,11 +43,18 @@ use crate::build::{BuildId, Provenance};
 #[derive(Debug)]
 pub enum ProbeError {
     /// The compiler could not be run at all.
-    CompilerMissing { program: String },
+    CompilerMissing {
+        program: String,
+    },
     /// The preprocessor ran and failed.
-    Preprocess { status: Option<i32>, stderr: String },
+    Preprocess {
+        status: Option<i32>,
+        stderr: String,
+    },
     /// The dispatch function was not found in the preprocessed output.
-    NoDispatchFn { name: String },
+    NoDispatchFn {
+        name: String,
+    },
     Io(std::io::Error),
 }
 
@@ -112,20 +119,29 @@ impl ProbeTarget {
             cmd.arg("-I").arg(i);
         }
         for d in &self.defines {
-            cmd.arg(if d.starts_with("-D") { d.clone() } else { format!("-D{d}") });
+            cmd.arg(if d.starts_with("-D") {
+                d.clone()
+            } else {
+                format!("-D{d}")
+            });
         }
         cmd.arg(&self.source);
 
         let out = match cmd.output() {
             Ok(o) => o,
             Err(_) => {
-                return Err(ProbeError::CompilerMissing { program: self.compiler.clone() })
+                return Err(ProbeError::CompilerMissing {
+                    program: self.compiler.clone(),
+                })
             }
         };
         if !out.status.success() {
             return Err(ProbeError::Preprocess {
                 status: out.status.code(),
-                stderr: String::from_utf8_lossy(&out.stderr).chars().take(4000).collect(),
+                stderr: String::from_utf8_lossy(&out.stderr)
+                    .chars()
+                    .take(4000)
+                    .collect(),
             });
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -139,7 +155,12 @@ impl ProbeTarget {
     /// tile edit there would keep the same build identity and silently reuse
     /// stale measurements.
     pub fn build_id_from(&self, isa: hwspec::IsaLevel, toolchain: &str, content: &str) -> BuildId {
-        BuildId::new(isa, self.defines.clone(), toolchain, crate::build::preprocessed_digest(content))
+        BuildId::new(
+            isa,
+            self.defines.clone(),
+            toolchain,
+            crate::build::preprocessed_digest(content),
+        )
     }
 }
 
@@ -149,14 +170,21 @@ impl ProbeTarget {
 /// unit: a preprocessed CUDA TU is megabytes of headers containing plenty of
 /// unrelated `case 8:` labels, and counting those would report arms that do not
 /// exist.
-pub fn dispatched_opcodes(preprocessed: &str, dispatch_fn: &str) -> Result<BTreeSet<u16>, ProbeError> {
-    let body = dispatch_body(preprocessed, dispatch_fn)
-        .ok_or_else(|| ProbeError::NoDispatchFn { name: dispatch_fn.to_string() })?;
+pub fn dispatched_opcodes(
+    preprocessed: &str,
+    dispatch_fn: &str,
+) -> Result<BTreeSet<u16>, ProbeError> {
+    let body =
+        dispatch_body(preprocessed, dispatch_fn).ok_or_else(|| ProbeError::NoDispatchFn {
+            name: dispatch_fn.to_string(),
+        })?;
 
     // Name -> value through the ABI itself, so a label the Rust side does not
     // know about is ignored rather than invented.
-    let by_name: BTreeMap<&str, u16> =
-        DevOp::ALL.iter().map(|op| (op.c_name(), *op as u16)).collect();
+    let by_name: BTreeMap<&str, u16> = DevOp::ALL
+        .iter()
+        .map(|op| (op.c_name(), *op as u16))
+        .collect();
 
     let mut found = BTreeSet::new();
     for name in case_opcode_names(body) {
@@ -180,8 +208,12 @@ fn dispatch_body<'a>(text: &'a str, fn_name: &str) -> Option<&'a str> {
     while let Some(rel) = text[from..].find(fn_name) {
         let at = from + rel;
         from = at + fn_name.len();
-        let Some(paren) = text[at..].find('(') else { continue };
-        let Some(open_rel) = text[at + paren..].find('{') else { continue };
+        let Some(paren) = text[at..].find('(') else {
+            continue;
+        };
+        let Some(open_rel) = text[at + paren..].find('{') else {
+            continue;
+        };
         let open = at + paren + open_rel;
         // A definition has only the parameter list between the name and the
         // brace; a call followed by an unrelated block can have anything.
@@ -257,8 +289,20 @@ pub struct DispatchArm {
 
 /// C keywords that can be followed by `(` but are not calls.
 const NOT_CALLS: &[&str] = &[
-    "if", "for", "while", "switch", "return", "sizeof", "do", "else", "case", "break",
-    "static_cast", "reinterpret_cast", "const_cast", "dynamic_cast",
+    "if",
+    "for",
+    "while",
+    "switch",
+    "return",
+    "sizeof",
+    "do",
+    "else",
+    "case",
+    "break",
+    "static_cast",
+    "reinterpret_cast",
+    "const_cast",
+    "dynamic_cast",
 ];
 
 /// Group the dispatch switch into arms.
@@ -267,11 +311,18 @@ const NOT_CALLS: &[&str] = &[
 /// d_gemm(...)` yields one arm with three opcodes, which is exactly the NVIDIA
 /// aliasing this crate exists to surface — and now it is read out of the object
 /// rather than known in advance.
-pub fn dispatch_arms(preprocessed: &str, dispatch_fn: &str) -> Result<Vec<DispatchArm>, ProbeError> {
-    let body = dispatch_body(preprocessed, dispatch_fn)
-        .ok_or_else(|| ProbeError::NoDispatchFn { name: dispatch_fn.to_string() })?;
-    let by_name: BTreeMap<&str, u16> =
-        DevOp::ALL.iter().map(|op| (op.c_name(), *op as u16)).collect();
+pub fn dispatch_arms(
+    preprocessed: &str,
+    dispatch_fn: &str,
+) -> Result<Vec<DispatchArm>, ProbeError> {
+    let body =
+        dispatch_body(preprocessed, dispatch_fn).ok_or_else(|| ProbeError::NoDispatchFn {
+            name: dispatch_fn.to_string(),
+        })?;
+    let by_name: BTreeMap<&str, u16> = DevOp::ALL
+        .iter()
+        .map(|op| (op.c_name(), *op as u16))
+        .collect();
 
     let mut arms: Vec<DispatchArm> = Vec::new();
     let mut pending: Vec<u16> = Vec::new();
@@ -479,10 +530,7 @@ pub fn probe_macros(
     std::fs::create_dir_all(&dir)?;
     let src = dir.join("macro_probe.cu");
     let marker = "PLOWPROBE_MARKER";
-    let body = format!(
-        "#include \"{header}\"\n{marker} {}\n",
-        names.join(" ")
-    );
+    let body = format!("#include \"{header}\"\n{marker} {}\n", names.join(" "));
     std::fs::write(&src, body)?;
 
     let mut t = target.clone();
@@ -560,7 +608,11 @@ pub fn probe(
     let build = target.build_id_from(isa, toolchain, &text);
     let opcodes = dispatched_opcodes(&text, &target.dispatch_fn)?;
     let arms = dispatch_arms(&text, &target.dispatch_fn)?;
-    Ok(ProbedObject { provenance: Provenance::Probed(build), opcodes, arms })
+    Ok(ProbedObject {
+        provenance: Provenance::Probed(build),
+        opcodes,
+        arms,
+    })
 }
 
 #[cfg(test)]
@@ -661,7 +713,10 @@ __device__ void plow_exec(int op) {
     fn an_opcode_mention_without_a_colon_is_not_an_arm() {
         let text = "__device__ void plow_exec(int op){ int x = PLOW_DOP_GEMM; switch(op){ case PLOW_DOP_NOP: break; } }";
         let ops = dispatched_opcodes(text, "plow_exec").unwrap();
-        assert!(!ops.contains(&(DevOp::Gemm as u16)), "a mention is not an arm");
+        assert!(
+            !ops.contains(&(DevOp::Gemm as u16)),
+            "a mention is not an arm"
+        );
         assert!(ops.contains(&(DevOp::Nop as u16)));
     }
 
@@ -675,6 +730,9 @@ __device__ void plow_exec(int op) {
             source: "/dev/null".into(),
             dispatch_fn: "plow_exec".into(),
         };
-        assert!(matches!(t.preprocess(), Err(ProbeError::CompilerMissing { .. })));
+        assert!(matches!(
+            t.preprocess(),
+            Err(ProbeError::CompilerMissing { .. })
+        ));
     }
 }

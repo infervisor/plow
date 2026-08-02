@@ -10,7 +10,10 @@ fn main() {
     match kernelcaps::dense_gemm_inventory(&root, hwspec::IsaLevel::Gfx950) {
         Ok(inv) => {
             let b = inv.build();
-            println!("gfx950 gemm build label (implementation == interpreter) = {}", b.label());
+            println!(
+                "gfx950 gemm build label (implementation == interpreter) = {}",
+                b.label()
+            );
             println!("toolchain = {}", b.toolchain);
             println!("defines   = {:?}", b.defines);
             println!("rungs     = {}", inv.iter().count());

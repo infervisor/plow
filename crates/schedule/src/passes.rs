@@ -445,7 +445,10 @@ fn choose_resource(
             let smc = machine.unit(u).sm_count.max(1);
             if colocated.contains(&task.node) {
                 // MustColocate: one SM, by coupled-row band.
-                vec![ResourceId::Sm(u, colocated_sm(task, smc, colo_pin.get(&task.node)))]
+                vec![ResourceId::Sm(
+                    u,
+                    colocated_sm(task, smc, colo_pin.get(&task.node)),
+                )]
             } else if let Some(&d) = domain_pin.get(&task.node) {
                 // SameDomain (DSM) or SameL2Partition — both pin to a locality
                 // domain (GPC on H100, XCD on MI300). Use the unified helper
@@ -711,13 +714,13 @@ pub fn build_counters(
 
     // Emit one counter: `producers` increment it, `consumers` wait on it.
     let emit = |counters: &mut Vec<Counter>,
-                    wait_of: &mut [Vec<usize>],
-                    succ_of: &mut [Vec<usize>],
-                    producers: &[TaskId],
-                    consumers: &[TaskId],
-                    pn: usize,
-                    cn: usize,
-                    scope: Scope| {
+                wait_of: &mut [Vec<usize>],
+                succ_of: &mut [Vec<usize>],
+                producers: &[TaskId],
+                consumers: &[TaskId],
+                pn: usize,
+                cn: usize,
+                scope: Scope| {
         let id = counters.len();
         counters.push(Counter {
             id,
@@ -753,8 +756,7 @@ pub fn build_counters(
                 // producer set ⇒ fine doesn't help; fall back to coarse to avoid
                 // counter explosion while still being correct (the scheduler
                 // awareness check handles the placement constraint).
-                let all_producers: HashSet<TaskId> =
-                    edges.iter().map(|&(a, _)| a).collect();
+                let all_producers: HashSet<TaskId> = edges.iter().map(|&(a, _)| a).collect();
                 let is_all_to_all = by_consumer.len() > 1
                     && by_consumer.values().all(|ps| {
                         let pset: HashSet<TaskId> = ps.iter().copied().collect();
@@ -765,12 +767,17 @@ pub fn build_counters(
                     // Coarse fallback for all-to-all boundaries.
                     let mut producers: Vec<TaskId> = all_producers.into_iter().collect();
                     producers.sort_unstable();
-                    let mut consumers: Vec<TaskId> =
-                        by_consumer.keys().copied().collect();
+                    let mut consumers: Vec<TaskId> = by_consumer.keys().copied().collect();
                     consumers.sort_unstable();
                     emit(
-                        &mut counters, &mut wait_of, &mut succ_of,
-                        &producers, &consumers, pn, cn, scope,
+                        &mut counters,
+                        &mut wait_of,
+                        &mut succ_of,
+                        &producers,
+                        &consumers,
+                        pn,
+                        cn,
+                        scope,
                     );
                 } else {
                     // Fine: one counter per consumer tile.
@@ -778,8 +785,14 @@ pub fn build_counters(
                         producers.sort_unstable();
                         producers.dedup();
                         emit(
-                            &mut counters, &mut wait_of, &mut succ_of,
-                            &producers, &[c], pn, cn, scope,
+                            &mut counters,
+                            &mut wait_of,
+                            &mut succ_of,
+                            &producers,
+                            &[c],
+                            pn,
+                            cn,
+                            scope,
                         );
                     }
                 }
@@ -792,8 +805,14 @@ pub fn build_counters(
                 consumers.sort_unstable();
                 consumers.dedup();
                 emit(
-                    &mut counters, &mut wait_of, &mut succ_of,
-                    &producers, &consumers, pn, cn, scope,
+                    &mut counters,
+                    &mut wait_of,
+                    &mut succ_of,
+                    &producers,
+                    &consumers,
+                    pn,
+                    cn,
+                    scope,
                 );
             }
         } else {
@@ -805,7 +824,16 @@ pub fn build_counters(
             for (p, mut consumers) in by_producer {
                 consumers.sort_unstable();
                 consumers.dedup();
-                emit(&mut counters, &mut wait_of, &mut succ_of, &[p], &consumers, pn, cn, scope);
+                emit(
+                    &mut counters,
+                    &mut wait_of,
+                    &mut succ_of,
+                    &[p],
+                    &consumers,
+                    pn,
+                    cn,
+                    scope,
+                );
             }
         }
     }
@@ -982,8 +1010,16 @@ mod audit_tests {
     #[test]
     fn coupled_tiles_with_differing_blocks_share_sm() {
         let smc = 8;
-        let prod = ColoPin { axis: 0, block: 128, band: 128 };
-        let cons = ColoPin { axis: 0, block: 64, band: 128 };
+        let prod = ColoPin {
+            axis: 0,
+            block: 128,
+            band: 128,
+        };
+        let cons = ColoPin {
+            axis: 0,
+            block: 64,
+            band: 128,
+        };
         // Producer tile 1 covers rows [128,256); consumers 2 and 3 cover
         // [128,192) and [192,256) — all in producer 1's band → SM 1.
         let p1 = colocated_sm(&at(TaskKind::Compute, vec![1]), smc, Some(&prod));
@@ -999,7 +1035,11 @@ mod audit_tests {
     #[test]
     fn flash_pins_on_axis_1_not_head() {
         let smc = 4;
-        let pin = ColoPin { axis: 1, block: 64, band: 64 };
+        let pin = ColoPin {
+            axis: 1,
+            block: 64,
+            band: 64,
+        };
         // Two tiles, different heads (coord[0]) but same q-band (coord[1]=2) →
         // same SM. Legacy coord[0] keying would give head0→0, head3→3.
         let a = colocated_sm(&at(TaskKind::Compute, vec![0, 2]), smc, Some(&pin));
@@ -1012,6 +1052,9 @@ mod audit_tests {
     #[test]
     fn no_pin_falls_back_to_coord0() {
         let smc = 4;
-        assert_eq!(colocated_sm(&at(TaskKind::Compute, vec![5, 9]), smc, None), 1);
+        assert_eq!(
+            colocated_sm(&at(TaskKind::Compute, vec![5, 9]), smc, None),
+            1
+        );
     }
 }

@@ -14,12 +14,54 @@ fn cm() -> CostModel<'static> {
 fn reports_pruning_savings_on_representative_gemms() {
     let cm = cm();
     let shapes = [
-        ("prefill-q",   GemmShape { m: 1024, n: 4096, k: 4096 }),
-        ("prefill-kv",  GemmShape { m: 1024, n: 1024, k: 4096 }),
-        ("mlp-up",      GemmShape { m: 1024, n: 14336, k: 4096 }),
-        ("mlp-down",    GemmShape { m: 1024, n: 4096, k: 14336 }),
-        ("decode-q",    GemmShape { m: 1, n: 4096, k: 4096 }),
-        ("decode-mlp",  GemmShape { m: 1, n: 14336, k: 4096 }),
+        (
+            "prefill-q",
+            GemmShape {
+                m: 1024,
+                n: 4096,
+                k: 4096,
+            },
+        ),
+        (
+            "prefill-kv",
+            GemmShape {
+                m: 1024,
+                n: 1024,
+                k: 4096,
+            },
+        ),
+        (
+            "mlp-up",
+            GemmShape {
+                m: 1024,
+                n: 14336,
+                k: 4096,
+            },
+        ),
+        (
+            "mlp-down",
+            GemmShape {
+                m: 1024,
+                n: 4096,
+                k: 14336,
+            },
+        ),
+        (
+            "decode-q",
+            GemmShape {
+                m: 1,
+                n: 4096,
+                k: 4096,
+            },
+        ),
+        (
+            "decode-mlp",
+            GemmShape {
+                m: 1,
+                n: 14336,
+                k: 4096,
+            },
+        ),
     ];
     for (name, g) in shapes {
         let cands = cm.candidates(g, SramPolicy::Stream);
@@ -27,7 +69,12 @@ fn reports_pruning_savings_on_representative_gemms() {
         assert!(pruned.len() <= cands.len());
         eprintln!(
             "[dominance] {name:<12} m={:>5} n={:>5} k={:>5} — {} → {} tiles ({:.1}% dropped)",
-            g.m, g.n, g.k, rep.before, rep.kept, rep.savings_pct(),
+            g.m,
+            g.n,
+            g.k,
+            rep.before,
+            rep.kept,
+            rep.savings_pct(),
         );
     }
 }

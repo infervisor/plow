@@ -56,7 +56,11 @@ fn hsaco_dir() -> std::path::PathBuf {
         .unwrap_or_else(|e| {
             panic!("build-amd/hsaco is missing ({e}) — run scripts/build_gfx950.sh")
         });
-    assert!(d.join("interp_decode.elf").exists(), "no interp_decode.elf in {}", d.display());
+    assert!(
+        d.join("interp_decode.elf").exists(),
+        "no interp_decode.elf in {}",
+        d.display()
+    );
     d
 }
 
@@ -195,7 +199,11 @@ fn the_production_interpreter_dispatches_and_retires() {
     // The kernarg block is the struct's bytes. `dev_isa.h` static-asserts
     // sizeof(PlowProgram) == 144 and `packet::dev_abi` pins the Rust mirror
     // against the C header, so this cast is checked elsewhere, not assumed.
-    assert_eq!(std::mem::size_of::<DevProgram>(), 144, "PlowProgram ABI drifted");
+    assert_eq!(
+        std::mem::size_of::<DevProgram>(),
+        144,
+        "PlowProgram ABI drifted"
+    );
     // SAFETY: `DevProgram` is `repr(C)` and POD (all u64/u32); reading it as
     // its own bytes is exactly what the kernarg memcpy does.
     let args: &[u8] = unsafe {
@@ -260,7 +268,10 @@ fn gfx950_runs_the_prefill_arena_the_objects_actually_declare() {
         let m = EngineDevice::module_load(be, &image).expect("module_load");
         let f = EngineDevice::get_function(be, &m, &format!("{base}_{arch}")).expect("symbol");
         let lds = HsaBackend::kernel_lds_bytes(&f);
-        eprintln!("{file}: static LDS = {lds} B ({:.1} KiB)", lds as f64 / 1024.0);
+        eprintln!(
+            "{file}: static LDS = {lds} B ({:.1} KiB)",
+            lds as f64 / 1024.0
+        );
         if worst.as_ref().is_none_or(|(_, w)| lds > *w) {
             worst = Some((file.to_string(), lds));
         }
@@ -278,7 +289,11 @@ fn gfx950_runs_the_prefill_arena_the_objects_actually_declare() {
     } else {
         "plow_interp"
     };
-    let threads: u32 = if file.starts_with("interp_flash") { 4 * 64 } else { 8 * 64 };
+    let threads: u32 = if file.starts_with("interp_flash") {
+        4 * 64
+    } else {
+        8 * 64
+    };
 
     let image = std::fs::read(dir.join(&file)).expect("read");
     let m = EngineDevice::module_load(be, &image).expect("module_load");

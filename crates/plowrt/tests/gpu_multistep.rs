@@ -42,7 +42,11 @@ fn multi_step_matches_single_step_greedy() {
         .arg(&src)
         .output()
         .expect("nvcc");
-    assert!(out.status.success(), "nvcc: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "nvcc: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     const K: usize = 8;
     std::env::set_var("PLOW_MULTISTEP", K.to_string());

@@ -38,7 +38,9 @@ fn small_block() -> LayerPlan {
     let qh = nn.reshape(q, [T.into(), NH.into(), HD.into()]);
     let kh = nn.reshape(k, [T.into(), NKV.into(), HD.into()]);
     let vh = nn.reshape(v, [T.into(), NKV.into(), HD.into()]);
-    let attn = nn.attention(qh, kh, vh, NH as u32, NKV as u32, HD as u32, true, None, None);
+    let attn = nn.attention(
+        qh, kh, vh, NH as u32, NKV as u32, HD as u32, true, None, None,
+    );
     let ao = nn.reshape(attn, [T.into(), QD.into()]);
     let o = nn.linear("o_proj", ao, QD, H, false);
     let r1 = nn.add(x, o);
@@ -145,7 +147,10 @@ fn prefetch_survives_counter_replay_verifier() {
         oracle_report: None,
     };
     let verified = hoisted.verify(&tile_g, &cons);
-    assert!(verified.is_ok(), "verify_schedule rejected hoisted schedule: {verified:?}");
+    assert!(
+        verified.is_ok(),
+        "verify_schedule rejected hoisted schedule: {verified:?}"
+    );
 }
 
 #[test]
@@ -160,8 +165,7 @@ fn prefetch_address_map_matches_pre_hoist() {
     let plan = small_block();
     let (_tg, cons) = assemble(&soc, &plan, SramPolicy::Stream, None).expect("assemble");
     let (hoisted_sched, _rep) = hoist_prefetches(&s.tasks, &s.schedule);
-    let (_map, task_sets) =
-        plan_from_schedule_with_task_sets(&s.tasks, &hoisted_sched, &cons);
+    let (_map, task_sets) = plan_from_schedule_with_task_sets(&s.tasks, &hoisted_sched, &cons);
     // Every tensor whose read/write set is nonempty should still be indexable.
     for (name, (writers, readers)) in &task_sets {
         assert!(

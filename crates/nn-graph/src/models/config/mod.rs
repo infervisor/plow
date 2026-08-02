@@ -130,9 +130,7 @@ impl ModelConfig {
             "deepseek" | "deepseek_v2" | "deepseek_v3" => {
                 Ok(ModelConfig::DeepSeek(serde_json::from_value(v)?))
             }
-            "glm_moe_dsa" | "glm" | "glm4" => {
-                Ok(ModelConfig::Glm(serde_json::from_value(v)?))
-            }
+            "glm_moe_dsa" | "glm" | "glm4" => Ok(ModelConfig::Glm(serde_json::from_value(v)?)),
             "siglip" | "siglip_vision_model" => {
                 let sub = sub_config(&v, "vision_config");
                 Ok(ModelConfig::Siglip(serde_json::from_value(sub)?))

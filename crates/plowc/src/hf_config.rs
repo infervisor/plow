@@ -172,8 +172,7 @@ pub fn synthesize_from_hf_dir(dir: &Path) -> Result<HfSynthesis, String> {
 /// "gemma4_text" is the flat text-only re-export (same weights, "model."
 /// prefix); "llama"/"qwen3" are the flat dense models. Anything else errors.
 pub fn synthesize_full(json: &str, name: String) -> Result<HfSynthesis, String> {
-    let v: Value =
-        serde_json::from_str(json).map_err(|e| format!("invalid config.json: {e}"))?;
+    let v: Value = serde_json::from_str(json).map_err(|e| format!("invalid config.json: {e}"))?;
     // Dispatch on the OUTER model_type BEFORE the `text_config` short-circuit.
     // A nested `text_config` used to mean "Gemma-4 multimodal" and nothing else;
     // Kimi-K3 also nests, so the unconditional short-circuit sent it into
@@ -224,7 +223,11 @@ fn req_i64(t: &Value, k: &str) -> Result<i64, String> {
 /// Returns BF16 by default; F8E4M3 for FP8 checkpoints; F4 for MX microscaling.
 fn parse_weight_dtype(v: &Value) -> nn_graph::DType {
     // Check explicit quantization config first (e.g. "quantization": "fp8")
-    if let Some(q) = v.get("quantization_config").and_then(|q| q.get("quant_method")).and_then(|m| m.as_str()) {
+    if let Some(q) = v
+        .get("quantization_config")
+        .and_then(|q| q.get("quant_method"))
+        .and_then(|m| m.as_str())
+    {
         match q {
             "fp8" => return nn_graph::DType::F8E4M3,
             // OCP MX microscaling FP4 (e2m1 + one E8M0 scale per 32). Transformers
@@ -252,15 +255,19 @@ fn synth_gemma(t: &Value, name: String, prefix: &str) -> Result<HfSynthesis, Str
     // means a genuinely uniform-geometry config, so fall back to head_dim.
     let hd_full = t["global_head_dim"].as_i64().unwrap_or(hd_slide);
     let kvh_slide = req_i64(t, "num_key_value_heads")?;
-    let kvh_full = t["num_global_key_value_heads"].as_i64().unwrap_or(kvh_slide);
+    let kvh_full = t["num_global_key_value_heads"]
+        .as_i64()
+        .unwrap_or(kvh_slide);
     let layers = req_i64(t, "num_hidden_layers")?;
     let vocab = req_i64(t, "vocab_size")?;
     let inter = req_i64(t, "intermediate_size")?;
     if t["use_double_wide_mlp"].as_bool() == Some(true) {
-        return Err("use_double_wide_mlp=true is not implemented: the gate/up/down \
+        return Err(
+            "use_double_wide_mlp=true is not implemented: the gate/up/down \
                     widths would all be wrong. Add the double-wide arm before \
                     compiling this checkpoint."
-            .into());
+                .into(),
+        );
     }
     // Per-layer attention kind. Required whenever the full/sliding geometry
     // differs — guessing the pattern would compile wrong Q/K widths.
@@ -273,9 +280,11 @@ fn synth_gemma(t: &Value, name: String, prefix: &str) -> Result<HfSynthesis, Str
             vec![true; layers as usize]
         }
         None => {
-            return Err("config.json missing layer_types but global/sliding geometry \
+            return Err(
+                "config.json missing layer_types but global/sliding geometry \
                         differs — cannot infer which layers are full attention"
-                .into())
+                    .into(),
+            )
         }
     };
     if is_full.len() != layers as usize {
@@ -326,7 +335,11 @@ fn synth_gemma(t: &Value, name: String, prefix: &str) -> Result<HfSynthesis, Str
         n_shared_experts: 0,
         moe_latent: 0,
         weight_dtype: parse_weight_dtype(t),
-        net: NetConfig { name: String::new(), hidden: 0, ops: vec![] },
+        net: NetConfig {
+            name: String::new(),
+            hidden: 0,
+            ops: vec![],
+        },
     };
     s.net = build_net_config(&s);
     Ok(s)
@@ -347,7 +360,11 @@ fn synth_llama_qwen(v: &Value, name: String, mt: &str) -> Result<HfSynthesis, St
     let hd = v["head_dim"].as_i64().unwrap_or(hidden / heads.max(1));
     let kvh = req_i64(v, "num_key_value_heads")?;
     let layers = req_i64(v, "num_hidden_layers")?;
-    let arch = if mt == "qwen3" { HfArch::Qwen3 } else { HfArch::Llama };
+    let arch = if mt == "qwen3" {
+        HfArch::Qwen3
+    } else {
+        HfArch::Llama
+    };
     let mut s = HfSynthesis {
         name,
         arch,
@@ -380,7 +397,11 @@ fn synth_llama_qwen(v: &Value, name: String, mt: &str) -> Result<HfSynthesis, St
         n_shared_experts: 0,
         moe_latent: 0,
         weight_dtype: parse_weight_dtype(v),
-        net: NetConfig { name: String::new(), hidden: 0, ops: vec![] },
+        net: NetConfig {
+            name: String::new(),
+            hidden: 0,
+            ops: vec![],
+        },
     };
     s.net = build_net_config(&s);
     Ok(s)
@@ -447,7 +468,11 @@ fn synth_mla_moe(v: &Value, name: String, arch: HfArch) -> Result<HfSynthesis, S
         n_shared_experts,
         moe_latent: 0,
         weight_dtype: parse_weight_dtype(v),
-        net: NetConfig { name: String::new(), hidden: 0, ops: vec![] },
+        net: NetConfig {
+            name: String::new(),
+            hidden: 0,
+            ops: vec![],
+        },
     };
     s.net = build_net_config(&s);
     Ok(s)
@@ -474,7 +499,10 @@ fn synth_mla_moe(v: &Value, name: String, arch: HfArch) -> Result<HfSynthesis, S
 /// entry is converted to 0-based HERE, once, and the rest of the compiler sees
 /// only 0-based indices.
 fn synth_kimi_k3(v: &Value, name: String) -> Result<HfSynthesis, String> {
-    if v.get("vision_config").map(|c| !c.is_null()).unwrap_or(false) {
+    if v.get("vision_config")
+        .map(|c| !c.is_null())
+        .unwrap_or(false)
+    {
         return Err(
             "kimi_k3 carries a vision_config (MoonViT tower + mm_projector) and plow \
              implements the TEXT tower only. Compiling the text tower alone would load, \
@@ -559,7 +587,11 @@ fn synth_kimi_k3(v: &Value, name: String) -> Result<HfSynthesis, String> {
         // `format` is "mxfp4-pack-quantized" (compressed-tensors), which
         // parse_weight_dtype's `quant_method` probe does not spell.
         weight_dtype: parse_weight_dtype(t),
-        net: NetConfig { name: String::new(), hidden: 0, ops: vec![] },
+        net: NetConfig {
+            name: String::new(),
+            hidden: 0,
+            ops: vec![],
+        },
     };
     s.net = build_net_config(&s);
     Ok(s)
@@ -713,7 +745,12 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
             emit!(
                 $name,
                 vec![$x, $w],
-                OpKind::Row(RowShape { rows, feat: $feat, operands: 2, reduce: true })
+                OpKind::Row(RowShape {
+                    rows,
+                    feat: $feat,
+                    operands: 2,
+                    reduce: true
+                })
             )
         };
     }
@@ -722,7 +759,12 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
             emit!(
                 $name,
                 vec![$a, $b],
-                OpKind::Row(RowShape { rows, feat: $feat, operands: 2, reduce: false })
+                OpKind::Row(RowShape {
+                    rows,
+                    feat: $feat,
+                    operands: 2,
+                    reduce: false
+                })
             )
         };
     }
@@ -733,14 +775,23 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
     let mut prev = emit!(
         "embed",
         vec!["ids".into(), embed_name.clone()],
-        OpKind::Row(RowShape { rows, feat: h, operands: 2, reduce: false })
+        OpKind::Row(RowShape {
+            rows,
+            feat: h,
+            operands: 2,
+            reduce: false
+        })
     );
 
     // --- N transformer blocks, each with its OWN geometry ---
     for l in 0..synth.num_layers {
         let full = synth.is_full[l as usize];
         let hd = if full { synth.hd_full } else { synth.hd_slide };
-        let kvh = if full { synth.kvh_full } else { synth.kvh_slide };
+        let kvh = if full {
+            synth.kvh_full
+        } else {
+            synth.kvh_slide
+        };
         let qw = heads * hd;
         let kw = kvh * hd;
         // Gemma full layers have NO v_proj: V is the raw k_proj output.
@@ -770,7 +821,11 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
             let qa = gemm!(
                 format!("q_a_proj_L{l}"),
                 vec![norm_out.clone(), format!("{lp}.self_attn.q_a_proj.weight")],
-                GemmShape { m: rows, n: qlr, k: h }
+                GemmShape {
+                    m: rows,
+                    n: qlr,
+                    k: h
+                }
             );
             let qa_n = norm!(
                 format!("q_a_norm_L{l}"),
@@ -781,7 +836,11 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
             let q_out = gemm!(
                 format!("q_b_proj_L{l}"),
                 vec![qa_n, format!("{lp}.self_attn.q_b_proj.weight")],
-                GemmShape { m: rows, n: heads * full_qk_hd, k: qlr }
+                GemmShape {
+                    m: rows,
+                    n: heads * full_qk_hd,
+                    k: qlr
+                }
             );
 
             // 3. MLA KV path: kv_a_proj_with_mqa (down) → kv_a_layernorm → kv_b_proj (up)
@@ -789,8 +848,15 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
             let kva_out = kvlr + rope_hd;
             let kva = gemm!(
                 format!("kv_a_proj_L{l}"),
-                vec![norm_out, format!("{lp}.self_attn.kv_a_proj_with_mqa.weight")],
-                GemmShape { m: rows, n: kva_out, k: h }
+                vec![
+                    norm_out,
+                    format!("{lp}.self_attn.kv_a_proj_with_mqa.weight")
+                ],
+                GemmShape {
+                    m: rows,
+                    n: kva_out,
+                    k: h
+                }
             );
             let kva_n = norm!(
                 format!("kv_a_norm_L{l}"),
@@ -803,25 +869,43 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
             let kv_out = gemm!(
                 format!("kv_b_proj_L{l}"),
                 vec![kva_n, format!("{lp}.self_attn.kv_b_proj.weight")],
-                GemmShape { m: rows, n: kvb_out, k: kvlr }
+                GemmShape {
+                    m: rows,
+                    n: kvb_out,
+                    k: kvlr
+                }
             );
 
             // 4. Flash attention (MLA absorbed: head_dim = full Q/K head width)
             prev = emit!(
                 format!("flash_L{l}"),
                 vec![q_out, kv_out.clone(), kv_out],
-                OpKind::Flash(AttnShape { heads, seq_q: seq, seq_kv: seq, head_dim: full_qk_hd })
+                OpKind::Flash(AttnShape {
+                    heads,
+                    seq_q: seq,
+                    seq_kv: seq,
+                    head_dim: full_qk_hd
+                })
             );
 
             // 5. O projection: heads*v_head_dim → H
             prev = gemm!(
                 format!("o_proj_L{l}"),
                 vec![prev.clone(), format!("{lp}.self_attn.o_proj.weight")],
-                GemmShape { m: rows, n: h, k: heads * vhd }
+                GemmShape {
+                    m: rows,
+                    n: h,
+                    k: heads * vhd
+                }
             );
 
             // 6. Residual add (attention output + layer input)
-            prev = ew2!(format!("resid_attn_L{l}"), prev.clone(), layer_in.clone(), h);
+            prev = ew2!(
+                format!("resid_attn_L{l}"),
+                prev.clone(),
+                layer_in.clone(),
+                h
+            );
 
             // 7. Post-attention layernorm
             prev = norm!(
@@ -839,18 +923,30 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
                 let gate_out = gemm!(
                     format!("gate_L{l}"),
                     vec![ff_in.clone(), format!("{lp}.mlp.gate_proj.weight")],
-                    GemmShape { m: rows, n: inter, k: h }
+                    GemmShape {
+                        m: rows,
+                        n: inter,
+                        k: h
+                    }
                 );
                 let up_out = gemm!(
                     format!("up_L{l}"),
                     vec![ff_in, format!("{lp}.mlp.up_proj.weight")],
-                    GemmShape { m: rows, n: inter, k: h }
+                    GemmShape {
+                        m: rows,
+                        n: inter,
+                        k: h
+                    }
                 );
                 prev = ew2!(format!("act_L{l}"), gate_out, up_out, inter);
                 prev = gemm!(
                     format!("down_L{l}"),
                     vec![prev.clone(), format!("{lp}.mlp.down_proj.weight")],
-                    GemmShape { m: rows, n: h, k: inter }
+                    GemmShape {
+                        m: rows,
+                        n: h,
+                        k: inter
+                    }
                 );
             } else {
                 // MoE: router + shared experts + routed experts
@@ -861,32 +957,59 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
                 let scores = gemm!(
                     format!("router_L{l}"),
                     vec![ff_in.clone(), format!("{lp}.mlp.gate.weight")],
-                    GemmShape { m: rows, n: e, k: h }
+                    GemmShape {
+                        m: rows,
+                        n: e,
+                        k: h
+                    }
                 );
                 // Router top-k selection (row-wise reduction)
                 let _gates = emit!(
                     format!("router_topk_L{l}"),
                     vec![scores, ff_in.clone()],
-                    OpKind::Row(RowShape { rows, feat: e, operands: 2, reduce: true })
+                    OpKind::Row(RowShape {
+                        rows,
+                        feat: e,
+                        operands: 2,
+                        reduce: true
+                    })
                 );
 
                 // Shared expert(s): standard SwiGLU at moe_intermediate_size
                 let sh_inter = synth.n_shared_experts * mi;
                 let sh_gate = gemm!(
                     format!("sh_gate_L{l}"),
-                    vec![ff_in.clone(), format!("{lp}.mlp.shared_experts.gate_proj.weight")],
-                    GemmShape { m: rows, n: sh_inter, k: h }
+                    vec![
+                        ff_in.clone(),
+                        format!("{lp}.mlp.shared_experts.gate_proj.weight")
+                    ],
+                    GemmShape {
+                        m: rows,
+                        n: sh_inter,
+                        k: h
+                    }
                 );
                 let sh_up = gemm!(
                     format!("sh_up_L{l}"),
-                    vec![ff_in.clone(), format!("{lp}.mlp.shared_experts.up_proj.weight")],
-                    GemmShape { m: rows, n: sh_inter, k: h }
+                    vec![
+                        ff_in.clone(),
+                        format!("{lp}.mlp.shared_experts.up_proj.weight")
+                    ],
+                    GemmShape {
+                        m: rows,
+                        n: sh_inter,
+                        k: h
+                    }
                 );
                 let sh_act = ew2!(format!("sh_act_L{l}"), sh_gate, sh_up, sh_inter);
                 let sh_down = gemm!(
                     format!("sh_down_L{l}"),
                     vec![sh_act, format!("{lp}.mlp.shared_experts.down_proj.weight")],
-                    GemmShape { m: rows, n: h, k: sh_inter }
+                    GemmShape {
+                        m: rows,
+                        n: h,
+                        k: sh_inter
+                    }
                 );
 
                 // Routed experts: fused grouped GEMMs (same pattern as Gemma MoE).
@@ -894,17 +1017,30 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
                 let gu = gemm!(
                     format!("moe_gate_up_L{l}"),
                     vec![ff_in.clone(), format!("{lp}.mlp.experts.gate_up_proj")],
-                    GemmShape { m: m_routed, n: e * 2 * mi, k: h }
+                    GemmShape {
+                        m: m_routed,
+                        n: e * 2 * mi,
+                        k: h
+                    }
                 );
                 let fu = emit!(
                     format!("moe_act_L{l}"),
                     vec![gu, sh_down.clone()],
-                    OpKind::Row(RowShape { rows, feat: tk * mi, operands: 2, reduce: false })
+                    OpKind::Row(RowShape {
+                        rows,
+                        feat: tk * mi,
+                        operands: 2,
+                        reduce: false
+                    })
                 );
                 let md = gemm!(
                     format!("moe_down_L{l}"),
                     vec![fu, format!("{lp}.mlp.experts.down_proj")],
-                    GemmShape { m: m_routed, n: e * h, k: mi }
+                    GemmShape {
+                        m: m_routed,
+                        n: e * h,
+                        k: mi
+                    }
                 );
 
                 // Combine: shared + routed experts
@@ -929,12 +1065,20 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
         let mut q_out = gemm!(
             format!("q_proj_L{l}"),
             vec![norm_out.clone(), format!("{lp}.self_attn.q_proj.weight")],
-            GemmShape { m: rows, n: qw, k: h }
+            GemmShape {
+                m: rows,
+                n: qw,
+                k: h
+            }
         );
         let mut k_out = gemm!(
             format!("k_proj_L{l}"),
             vec![norm_out.clone(), format!("{lp}.self_attn.k_proj.weight")],
-            GemmShape { m: rows, n: kw, k: h }
+            GemmShape {
+                m: rows,
+                n: kw,
+                k: h
+            }
         );
         let v_src = if keqv {
             k_out.clone()
@@ -942,7 +1086,11 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
             gemm!(
                 format!("v_proj_L{l}"),
                 vec![norm_out.clone(), format!("{lp}.self_attn.v_proj.weight")],
-                GemmShape { m: rows, n: kw, k: h }
+                GemmShape {
+                    m: rows,
+                    n: kw,
+                    k: h
+                }
             )
         };
 
@@ -966,7 +1114,12 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
             emit!(
                 format!("v_norm_L{l}"),
                 vec![v_src],
-                OpKind::Row(RowShape { rows, feat: kw, operands: 1, reduce: true })
+                OpKind::Row(RowShape {
+                    rows,
+                    feat: kw,
+                    operands: 1,
+                    reduce: true
+                })
             )
         } else {
             v_src
@@ -976,14 +1129,23 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
         prev = emit!(
             format!("flash_L{l}"),
             vec![q_out, k_out, v_out],
-            OpKind::Flash(AttnShape { heads, seq_q: seq, seq_kv: seq, head_dim: hd })
+            OpKind::Flash(AttnShape {
+                heads,
+                seq_q: seq,
+                seq_kv: seq,
+                head_dim: hd
+            })
         );
 
         // 5. O projection (input width = this layer's q width).
         prev = gemm!(
             format!("o_proj_L{l}"),
             vec![prev.clone(), format!("{lp}.self_attn.o_proj.weight")],
-            GemmShape { m: rows, n: h, k: qw }
+            GemmShape {
+                m: rows,
+                n: h,
+                k: qw
+            }
         );
 
         // 6. Sandwich: post-attention norm, THEN the residual add.
@@ -1007,18 +1169,30 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
         let gate_out = gemm!(
             format!("gate_L{l}"),
             vec![mlp_in.clone(), format!("{lp}.mlp.gate_proj.weight")],
-            GemmShape { m: rows, n: inter, k: h }
+            GemmShape {
+                m: rows,
+                n: inter,
+                k: h
+            }
         );
         let up_out = gemm!(
             format!("up_L{l}"),
             vec![mlp_in, format!("{lp}.mlp.up_proj.weight")],
-            GemmShape { m: rows, n: inter, k: h }
+            GemmShape {
+                m: rows,
+                n: inter,
+                k: h
+            }
         );
         prev = ew2!(format!("act_L{l}"), gate_out, up_out, inter);
         prev = gemm!(
             format!("down_L{l}"),
             vec![prev.clone(), format!("{lp}.mlp.down_proj.weight")],
-            GemmShape { m: rows, n: h, k: inter }
+            GemmShape {
+                m: rows,
+                n: h,
+                k: inter
+            }
         );
         prev = norm!(
             format!("norm_pff_L{l}"),
@@ -1051,7 +1225,11 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
             let scores = gemm!(
                 format!("router_L{l}"),
                 vec![x2.clone(), format!("{lp}.router.proj.weight")],
-                GemmShape { m: rows, n: e, k: h }
+                GemmShape {
+                    m: rows,
+                    n: e,
+                    k: h
+                }
             );
             // Router input scale [H] and per-expert score scale [E]: tiny
             // learned tensors folded into elementwise ops so the loader binds
@@ -1071,17 +1249,30 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
             let gu = gemm!(
                 format!("moe_gate_up_L{l}"),
                 vec![x2, format!("{lp}.experts.gate_up_proj")],
-                GemmShape { m: m_routed, n: e * 2 * mi, k: h }
+                GemmShape {
+                    m: m_routed,
+                    n: e * 2 * mi,
+                    k: h
+                }
             );
             let fu = emit!(
                 format!("moe_act_L{l}"),
                 vec![gu, gates],
-                OpKind::Row(RowShape { rows, feat: tk * mi, operands: 2, reduce: false })
+                OpKind::Row(RowShape {
+                    rows,
+                    feat: tk * mi,
+                    operands: 2,
+                    reduce: false
+                })
             );
             let md = gemm!(
                 format!("moe_down_L{l}"),
                 vec![fu, format!("{lp}.experts.down_proj")],
-                GemmShape { m: m_routed, n: e * h, k: mi }
+                GemmShape {
+                    m: m_routed,
+                    n: e * h,
+                    k: mi
+                }
             );
             let mn = norm!(
                 format!("norm_pff2_L{l}"),
@@ -1105,7 +1296,12 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
     }
 
     // --- Final norm ---
-    prev = norm!("final_norm", prev.clone(), format!("{prefix}norm.weight"), h);
+    prev = norm!(
+        "final_norm",
+        prev.clone(),
+        format!("{prefix}norm.weight"),
+        h
+    );
 
     // --- LM head (logits projection): tied models reuse embed_tokens. ---
     let lm_head_w = if synth.tied_embed {
@@ -1116,7 +1312,11 @@ pub fn build_full_model_plan(bucket: &ShapeBucket, synth: &HfSynthesis) -> Layer
     gemm!(
         "lm_head",
         vec![prev, lm_head_w],
-        GemmShape { m: rows, n: synth.vocab_size, k: h }
+        GemmShape {
+            m: rows,
+            n: synth.vocab_size,
+            k: h
+        }
     );
 
     LayerPlan { ops }
@@ -1200,9 +1400,7 @@ pub fn validate_against_checkpoint(
 /// Read the tensor name → shape map from every `*.safetensors` file directly
 /// in `dir` (like `bin/gemma4.rs::shard_files`, we enumerate what is actually
 /// there rather than trusting an index file).
-fn safetensor_shapes(
-    dir: &Path,
-) -> Result<std::collections::HashMap<String, Vec<i64>>, String> {
+fn safetensor_shapes(dir: &Path) -> Result<std::collections::HashMap<String, Vec<i64>>, String> {
     let mut out = std::collections::HashMap::new();
     let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
     let mut files: Vec<_> = rd
@@ -1263,16 +1461,39 @@ fn build_net_config(s: &HfSynthesis) -> NetConfig {
     // Fused QKV width: Q + K + V (K and V distinct on sliding layers).
     let qkv_n = q_width + 2 * kv_width;
     let ops = vec![
-        NetOp::Norm { feat: Some(s.hidden_size) },
-        NetOp::Gemm { n: qkv_n, k: Some(s.hidden_size) },
-        NetOp::Flash { heads: s.num_attention_heads, head_dim: s.hd_slide },
-        NetOp::Gemm { n: s.hidden_size, k: Some(q_width) },
-        NetOp::Norm { feat: Some(s.hidden_size) },
-        NetOp::Gemm { n: 2 * s.intermediate_size, k: Some(s.hidden_size) },
+        NetOp::Norm {
+            feat: Some(s.hidden_size),
+        },
+        NetOp::Gemm {
+            n: qkv_n,
+            k: Some(s.hidden_size),
+        },
+        NetOp::Flash {
+            heads: s.num_attention_heads,
+            head_dim: s.hd_slide,
+        },
+        NetOp::Gemm {
+            n: s.hidden_size,
+            k: Some(q_width),
+        },
+        NetOp::Norm {
+            feat: Some(s.hidden_size),
+        },
+        NetOp::Gemm {
+            n: 2 * s.intermediate_size,
+            k: Some(s.hidden_size),
+        },
         NetOp::Act,
-        NetOp::Gemm { n: s.hidden_size, k: Some(s.intermediate_size) },
+        NetOp::Gemm {
+            n: s.hidden_size,
+            k: Some(s.intermediate_size),
+        },
     ];
-    NetConfig { name: s.name.clone(), hidden: s.hidden_size, ops }
+    NetConfig {
+        name: s.name.clone(),
+        hidden: s.hidden_size,
+        ops,
+    }
 }
 
 #[cfg(test)]
@@ -1336,8 +1557,8 @@ mod tests {
         let err = synthesize_full(&json, "x".into()).unwrap_err();
         assert!(err.contains("vocab_size"), "{err}");
         // Unknown architecture → hard error.
-        let err = synthesize_full(r#"{"model_type":"phi3","hidden_size":1}"#, "x".into())
-            .unwrap_err();
+        let err =
+            synthesize_full(r#"{"model_type":"phi3","hidden_size":1}"#, "x".into()).unwrap_err();
         assert!(err.contains("unsupported model_type"), "{err}");
     }
 
@@ -1360,7 +1581,11 @@ mod tests {
         assert!(!s.tied_embed && !s.has_qk_norm && !s.has_v_norm && !s.k_eq_v);
         assert!(s.is_full.iter().all(|&f| f));
         // Untied → a real top-level lm_head.weight in the plan.
-        let bucket = ShapeBucket { batch: 1, seq: 512, phase: schedule::Phase::Decode };
+        let bucket = ShapeBucket {
+            batch: 1,
+            seq: 512,
+            phase: schedule::Phase::Decode,
+        };
         let plan = build_full_model_plan(&bucket, &s);
         let lm = plan.ops.last().unwrap();
         assert_eq!(lm.inputs[1], "lm_head.weight");
@@ -1369,7 +1594,11 @@ mod tests {
     #[test]
     fn test_full_model_gemma_geometry() {
         let s = synthesize_full(&gemma_json(""), "gemma-4-12b-it".into()).unwrap();
-        let bucket = ShapeBucket { batch: 1, seq: 512, phase: schedule::Phase::Prefill };
+        let bucket = ShapeBucket {
+            batch: 1,
+            seq: 512,
+            phase: schedule::Phase::Prefill,
+        };
         let plan = build_full_model_plan(&bucket, &s);
         let get = |name: &str| {
             plan.ops
@@ -1438,7 +1667,11 @@ mod tests {
         )
         .unwrap();
         assert!(s.moe);
-        let bucket = ShapeBucket { batch: 1, seq: 512, phase: schedule::Phase::Prefill };
+        let bucket = ShapeBucket {
+            batch: 1,
+            seq: 512,
+            phase: schedule::Phase::Prefill,
+        };
         let plan = build_full_model_plan(&bucket, &s);
         let lp = "model.language_model.layers.0.";
         for t in [
@@ -1458,7 +1691,11 @@ mod tests {
             );
         }
         // Fused expert GEMM covers the full E×2I×H weight bytes.
-        let gu = plan.ops.iter().find(|o| o.name == "moe_gate_up_L0").unwrap();
+        let gu = plan
+            .ops
+            .iter()
+            .find(|o| o.name == "moe_gate_up_L0")
+            .unwrap();
         match &gu.kind {
             OpKind::Gemm(g) => assert_eq!(g.n * g.k, 128 * 1408 * 3840),
             _ => panic!(),
@@ -1523,7 +1760,11 @@ mod tests {
     #[test]
     fn test_kimi_k2_full_model_plan_geometry() {
         let s = synthesize_full(KIMI_K2_JSON, "kimi-k2".into()).unwrap();
-        let bucket = ShapeBucket { batch: 1, seq: 128, phase: schedule::Phase::Prefill };
+        let bucket = ShapeBucket {
+            batch: 1,
+            seq: 128,
+            phase: schedule::Phase::Prefill,
+        };
         let plan = build_full_model_plan(&bucket, &s);
         let get = |name: &str| {
             plan.ops
@@ -1611,7 +1852,10 @@ mod tests {
     #[test]
     fn test_deepseek_v3_synthesis() {
         // Same config as Kimi, just different model_type.
-        let json = KIMI_K2_JSON.replace("\"model_type\": \"kimi\"", "\"model_type\": \"deepseek_v3\"");
+        let json = KIMI_K2_JSON.replace(
+            "\"model_type\": \"kimi\"",
+            "\"model_type\": \"deepseek_v3\"",
+        );
         let s = synthesize_full(&json, "deepseek-v3".into()).unwrap();
         assert_eq!(s.arch, HfArch::DeepSeek);
         assert_eq!(s.q_lora_rank, 64);
@@ -1619,7 +1863,11 @@ mod tests {
         assert!(s.moe);
         assert_eq!(s.first_k_dense, 2);
         // Block emission should work identically.
-        let bucket = ShapeBucket { batch: 1, seq: 128, phase: schedule::Phase::Decode };
+        let bucket = ShapeBucket {
+            batch: 1,
+            seq: 128,
+            phase: schedule::Phase::Decode,
+        };
         let plan = build_full_model_plan(&bucket, &s);
         assert!(plan.ops.iter().any(|o| o.name == "q_a_proj_L0"));
         assert!(plan.ops.iter().any(|o| o.name == "moe_gate_up_L3"));
@@ -1634,7 +1882,11 @@ mod tests {
         let s = synthesize_full(&json, "kimi-fp8".into()).unwrap();
         assert_eq!(s.weight_dtype, nn_graph::DType::F8E4M3);
         // GEMM ops should carry FP8 weight dtype.
-        let bucket = ShapeBucket { batch: 1, seq: 64, phase: schedule::Phase::Decode };
+        let bucket = ShapeBucket {
+            batch: 1,
+            seq: 64,
+            phase: schedule::Phase::Decode,
+        };
         let plan = build_full_model_plan(&bucket, &s);
         let qa = plan.ops.iter().find(|o| o.name == "q_a_proj_L0").unwrap();
         assert_eq!(qa.weight_dtype, nn_graph::DType::F8E4M3);
@@ -1653,7 +1905,11 @@ mod tests {
         let s = synthesize_full(&json, "kimi-mxfp4".into()).unwrap();
         assert_eq!(s.weight_dtype, nn_graph::DType::F4);
         // GEMM ops carry the F4 weight dtype; norms stay BF16.
-        let bucket = ShapeBucket { batch: 1, seq: 64, phase: schedule::Phase::Decode };
+        let bucket = ShapeBucket {
+            batch: 1,
+            seq: 64,
+            phase: schedule::Phase::Decode,
+        };
         let plan = build_full_model_plan(&bucket, &s);
         let qa = plan.ops.iter().find(|o| o.name == "q_a_proj_L0").unwrap();
         assert_eq!(qa.weight_dtype, nn_graph::DType::F4);
@@ -1742,7 +1998,11 @@ mod tests {
     #[should_panic(expected = "kimi_k3 has no full-model plan")]
     fn test_kimi_k3_has_no_full_model_plan() {
         let s = synthesize_full(kimi_k3_json(), "kimi-k3".into()).unwrap();
-        let bucket = ShapeBucket { batch: 1, seq: 128, phase: schedule::Phase::Decode };
+        let bucket = ShapeBucket {
+            batch: 1,
+            seq: 128,
+            phase: schedule::Phase::Decode,
+        };
         let _ = build_full_model_plan(&bucket, &s);
     }
 
@@ -1773,7 +2033,11 @@ mod tests {
         assert!(s.moe);
         assert_eq!(s.first_k_dense, 2);
         // Block emission works (MLA + MoE).
-        let bucket = ShapeBucket { batch: 1, seq: 128, phase: schedule::Phase::Decode };
+        let bucket = ShapeBucket {
+            batch: 1,
+            seq: 128,
+            phase: schedule::Phase::Decode,
+        };
         let plan = build_full_model_plan(&bucket, &s);
         assert!(plan.ops.iter().any(|o| o.name == "q_a_proj_L0"));
         assert!(plan.ops.iter().any(|o| o.name == "moe_gate_up_L3"));

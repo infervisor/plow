@@ -65,7 +65,11 @@ pub const ALIASES: &[(&str, &str)] = &[
 /// Returns `None` only if neither matches.
 pub fn lookup(name: &str) -> Option<&'static GpuSpec> {
     // 1. Direct canonical match.
-    if let Some(spec) = ALL.iter().copied().find(|s| s.name.eq_ignore_ascii_case(name)) {
+    if let Some(spec) = ALL
+        .iter()
+        .copied()
+        .find(|s| s.name.eq_ignore_ascii_case(name))
+    {
         return Some(spec);
     }
     // 2. Alias table → resolve to canonical, then look up.
@@ -123,7 +127,11 @@ mod tests {
                 "{name}: MI355X inherits this from MI350X via `..MI350X`; if that broke, a bound \
                  silently reverts to the datasheet number"
             );
-            assert_eq!(s.mem.bandwidth_for_bound().0, 6200.0, "{name} bound denominator");
+            assert_eq!(
+                s.mem.bandwidth_for_bound().0,
+                6200.0,
+                "{name} bound denominator"
+            );
             // The number the oracle actually prints, at this part's clock.
             let floor_ms = 61.4e9 / (s.mem.bandwidth_for_bound().0 * 1e9) * 1e3;
             assert!(
@@ -161,8 +169,7 @@ mod tests {
     fn short_aliases_resolve() {
         // Every alias in the table must resolve to a valid spec.
         for (alias, canonical) in super::ALIASES {
-            let spec = lookup(alias)
-                .unwrap_or_else(|| panic!("alias {:?} did not resolve", alias));
+            let spec = lookup(alias).unwrap_or_else(|| panic!("alias {:?} did not resolve", alias));
             assert_eq!(
                 spec.name.to_ascii_lowercase(),
                 canonical.to_ascii_lowercase(),
@@ -176,10 +183,7 @@ mod tests {
 
     #[test]
     fn aliases_are_case_insensitive() {
-        assert_eq!(
-            lookup("RTX6000PRO").unwrap().name,
-            "RTX 6000 Pro Blackwell"
-        );
+        assert_eq!(lookup("RTX6000PRO").unwrap().name, "RTX 6000 Pro Blackwell");
         assert_eq!(lookup("H100").unwrap().name, "H100 SXM5");
         assert_eq!(lookup("Mi350").unwrap().name, "MI350X");
     }

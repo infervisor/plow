@@ -47,10 +47,15 @@ fn rb(f: f32) -> f32 {
 struct Rng(u64);
 impl Rng {
     fn new(s: u64) -> Self {
-        Rng(s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407))
+        Rng(s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407))
     }
     fn next(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 33) as i32 % 2001 - 1000) as f32 / 4000.0 // +-0.25
     }
     fn fill_bf16(&mut self, n: usize) -> Vec<u16> {
@@ -90,14 +95,14 @@ fn rmsnorm(x: &[f32], gamma: &[u16], eps: f32) -> Vec<f32> {
 
 // ---- a whole MoE layer's seeded weights ----
 struct Layer {
-    wr: Vec<u16>,             // [n_exp, H]
-    gate: Vec<Vec<u16>>,      // [n_exp][I_moe, H]
-    up: Vec<Vec<u16>>,        // [n_exp][I_moe, H]
-    down: Vec<Vec<u16>>,      // [n_exp][H, I_moe]
-    sgate: Vec<u16>,          // shared [I_moe, H]
+    wr: Vec<u16>,        // [n_exp, H]
+    gate: Vec<Vec<u16>>, // [n_exp][I_moe, H]
+    up: Vec<Vec<u16>>,   // [n_exp][I_moe, H]
+    down: Vec<Vec<u16>>, // [n_exp][H, I_moe]
+    sgate: Vec<u16>,     // shared [I_moe, H]
     sup: Vec<u16>,
     sdown: Vec<u16>,
-    gnorm: Vec<u16>,          // pre-FFN norm gamma [H]
+    gnorm: Vec<u16>, // pre-FFN norm gamma [H]
 }
 fn seed_layer(seed: u64, cfg: &RouterCfg, h: usize, i_moe: usize) -> Layer {
     let e = cfg.n_exp as usize;
@@ -110,11 +115,27 @@ fn seed_layer(seed: u64, cfg: &RouterCfg, h: usize, i_moe: usize) -> Layer {
     let sup = r.fill_bf16(i_moe * h);
     let sdown = r.fill_bf16(h * i_moe);
     let gnorm: Vec<u16> = (0..h).map(|_| f2b(1.0 + r.next() * 0.1)).collect();
-    Layer { wr, gate, up, down, sgate, sup, sdown, gnorm }
+    Layer {
+        wr,
+        gate,
+        up,
+        down,
+        sgate,
+        sup,
+        sdown,
+        gnorm,
+    }
 }
 
 // ---- INDEPENDENT ORACLE: dense — compute ALL experts, mask to top-k, combine ----
-fn oracle_block(x: &[f32], lyr: &Layer, cfg: &RouterCfg, h: usize, i_moe: usize, eps: f32) -> Vec<f32> {
+fn oracle_block(
+    x: &[f32],
+    lyr: &Layer,
+    cfg: &RouterCfg,
+    h: usize,
+    i_moe: usize,
+    eps: f32,
+) -> Vec<f32> {
     let e = cfg.n_exp as usize;
     let k = cfg.k as usize;
     let xn = rmsnorm(x, &lyr.gnorm, eps);
@@ -123,9 +144,7 @@ fn oracle_block(x: &[f32], lyr: &Layer, cfg: &RouterCfg, h: usize, i_moe: usize,
     // independent selection: argsort by (score desc, id asc), take k
     let score: Vec<f32> = logits.iter().map(|&z| 1.0 / (1.0 + (-z).exp())).collect();
     let mut order: Vec<usize> = (0..e).collect();
-    order.sort_by(|&a, &b| {
-        score[b].partial_cmp(&score[a]).unwrap().then(a.cmp(&b))
-    });
+    order.sort_by(|&a, &b| score[b].partial_cmp(&score[a]).unwrap().then(a.cmp(&b)));
     let sel = &order[..k];
     let mut gates: Vec<f32> = sel.iter().map(|&id| score[id]).collect();
     if cfg.norm_topk {
@@ -161,7 +180,14 @@ struct DispatchRun {
 // Mirrors op_moe.h semantics: the router writes the table; each of the K expert slots reads
 // routing_table[slot], resolves the weight base by expert id (the two-level indirection), and
 // computes-or-skips, ALWAYS "signaling" (counted). Streams only the K chosen experts.
-fn dispatch_block(x: &[f32], lyr: &Layer, cfg: &RouterCfg, h: usize, i_moe: usize, eps: f32) -> DispatchRun {
+fn dispatch_block(
+    x: &[f32],
+    lyr: &Layer,
+    cfg: &RouterCfg,
+    h: usize,
+    i_moe: usize,
+    eps: f32,
+) -> DispatchRun {
     let k = cfg.k as usize;
     let xn = rmsnorm(x, &lyr.gnorm, eps);
     let logits = gemv(&xn, &lyr.wr, cfg.n_exp as usize, h);
@@ -199,13 +225,23 @@ fn dispatch_block(x: &[f32], lyr: &Layer, cfg: &RouterCfg, h: usize, i_moe: usiz
         })
         .collect();
 
-    DispatchRun { out, experts_computed, slots_signaled }
+    DispatchRun {
+        out,
+        experts_computed,
+        slots_signaled,
+    }
 }
 
 fn glm_scaled_cfg() -> RouterCfg {
     // GLM-5.2 RouterCfg, cardinality-scaled per plans/glm52-prototype-plan.md §2 (E=8, K=2;
     // scoring/norm/scale are the REAL GLM values — the correctness points, kept exact).
-    RouterCfg { n_exp: 8, k: 2, scoring: Scoring::Sigmoid, norm_topk: true, route_scale: 2.5 }
+    RouterCfg {
+        n_exp: 8,
+        k: 2,
+        scoring: Scoring::Sigmoid,
+        norm_topk: true,
+        route_scale: 2.5,
+    }
 }
 
 #[test]
@@ -224,7 +260,10 @@ fn router_topk_is_bit_exact_with_lowest_id_tiebreak() {
         order.sort_by(|&a, &b| score[b].partial_cmp(&score[a]).unwrap().then(a.cmp(&b)));
         let want: Vec<u32> = order[..cfg.k as usize].iter().map(|&i| i as u32).collect();
         let got_ids: Vec<u32> = got.iter().map(|e| e.expert_id).collect();
-        assert_eq!(got_ids, want, "seed {seed}: router selection diverged from argsort reference");
+        assert_eq!(
+            got_ids, want,
+            "seed {seed}: router selection diverged from argsort reference"
+        );
     }
 
     // Engineered EXACT ties: several experts share the identical logit bits → lowest id must win.
@@ -233,7 +272,11 @@ fn router_topk_is_bit_exact_with_lowest_id_tiebreak() {
     logits[2] = 2.0; // tie with expert 5 (bitwise identical)
     logits[7] = 2.0; // and expert 7
     let got: Vec<u32> = route(&cfg, &logits).iter().map(|e| e.expert_id).collect();
-    assert_eq!(got, vec![2, 5], "exact ties must resolve to the two LOWEST expert ids (2,5)");
+    assert_eq!(
+        got,
+        vec![2, 5],
+        "exact ties must resolve to the two LOWEST expert ids (2,5)"
+    );
 }
 
 #[test]
@@ -242,8 +285,9 @@ fn sparse_dispatch_bit_exact_vs_dense_oracle_over_n_blocks() {
     let (h, i_moe, eps) = (64usize, 32usize, 1e-6f32);
     let n_blocks = 4usize; // block 0 acts dense-equivalent numerically; all exercise dispatch
 
-    let layers: Vec<Layer> =
-        (0..n_blocks).map(|l| seed_layer(0xABCD ^ l as u64, &cfg, h, i_moe)).collect();
+    let layers: Vec<Layer> = (0..n_blocks)
+        .map(|l| seed_layer(0xABCD ^ l as u64, &cfg, h, i_moe))
+        .collect();
 
     // seed the residual stream (a synthetic "decode token" hidden state)
     let mut r = Rng::new(777);
@@ -261,10 +305,19 @@ fn sparse_dispatch_bit_exact_vs_dense_oracle_over_n_blocks() {
         // BIT-EXACT: identical bf16 bits of the residual stream after block l.
         let ob: Vec<u16> = o.iter().map(|&v| f2b(v)).collect();
         let db: Vec<u16> = d.out.iter().map(|&v| f2b(v)).collect();
-        assert_eq!(ob, db, "block {l}: dispatch residual stream != dense oracle (bit-exact)");
+        assert_eq!(
+            ob, db,
+            "block {l}: dispatch residual stream != dense oracle (bit-exact)"
+        );
         // skip-safety: every slot signaled; exactly K experts computed (dispatch gates, not masks).
-        assert_eq!(d.slots_signaled, cfg.k as usize, "block {l}: not all K slots signaled");
-        assert_eq!(d.experts_computed, cfg.k as usize, "block {l}: != K experts computed");
+        assert_eq!(
+            d.slots_signaled, cfg.k as usize,
+            "block {l}: not all K slots signaled"
+        );
+        assert_eq!(
+            d.experts_computed, cfg.k as usize,
+            "block {l}: != K experts computed"
+        );
         total_experts += d.experts_computed;
         total_slots += d.slots_signaled;
         xo = o;
@@ -304,39 +357,79 @@ fn emit_moe_ffn_produces_well_formed_static_stream() {
     let dep = b.emit(DevOp::Nop, b.all(), &[], |_| {}); // stands in for the pre-FFN norm
     let all = b.all();
     let combine = emit_moe_ffn(
-        &mut b, &cfg, &t, 64, 32, 1, dep, vec![0], all.clone(), all.clone(), None,
+        &mut b,
+        &cfg,
+        &t,
+        64,
+        32,
+        1,
+        dep,
+        vec![0],
+        all.clone(),
+        all.clone(),
+        None,
     );
     let prog = b.finish();
 
     let count = |op: DevOp| prog.insts.iter().filter(|i| i.op == op as u16).count();
     assert_eq!(count(DevOp::MoeRouter), 1, "exactly one router");
-    assert_eq!(count(DevOp::MoeExpertGlu), cfg.k as usize, "K expert-glu slots");
-    assert_eq!(count(DevOp::MoeExpertDown), cfg.k as usize, "K expert-down slots");
+    assert_eq!(
+        count(DevOp::MoeExpertGlu),
+        cfg.k as usize,
+        "K expert-glu slots"
+    );
+    assert_eq!(
+        count(DevOp::MoeExpertDown),
+        cfg.k as usize,
+        "K expert-down slots"
+    );
     assert_eq!(count(DevOp::MoeCombine), 1, "exactly one combine");
 
     // Each expert slot carries its own `slot` index in i[0], and n_exp/act are wired.
-    let glus: Vec<_> = prog.insts.iter().filter(|i| i.op == DevOp::MoeExpertGlu as u16).collect();
+    let glus: Vec<_> = prog
+        .insts
+        .iter()
+        .filter(|i| i.op == DevOp::MoeExpertGlu as u16)
+        .collect();
     let mut slots: Vec<u32> = glus.iter().map(|i| i.i[0]).collect();
     slots.sort();
-    assert_eq!(slots, (0..cfg.k).collect::<Vec<_>>(), "expert slots are 0..K");
+    assert_eq!(
+        slots,
+        (0..cfg.k).collect::<Vec<_>>(),
+        "expert slots are 0..K"
+    );
     for g in &glus {
         assert_eq!(g.i[3], cfg.n_exp, "n_exp wired for the sentinel test");
         assert_eq!(g.i[5], 1, "act = silu (SwiGLU)");
     }
 
     // The router carries the RouterCfg flags/scale the device decodes.
-    let r = prog.insts.iter().find(|i| i.op == DevOp::MoeRouter as u16).unwrap();
+    let r = prog
+        .insts
+        .iter()
+        .find(|i| i.op == DevOp::MoeRouter as u16)
+        .unwrap();
     assert_eq!(r.i[3], cfg.flags(), "router flags (sigmoid|norm_topk)");
     assert_eq!(r.f[0], cfg.route_scale, "route_scale");
 
     // combine is the returned counter and its wait list has K producers (the down slots).
-    assert_eq!(combine as usize, prog.insts.len() - 1, "combine is the last op emitted");
+    assert_eq!(
+        combine as usize,
+        prog.insts.len() - 1,
+        "combine is the last op emitted"
+    );
 }
 
 #[test]
 fn softmax_config_also_routes_bit_exact() {
     // Generality: Qwen/Mixtral-style softmax scoring, no norm, scale 1.0 — same machinery.
-    let cfg = RouterCfg { n_exp: 8, k: 2, scoring: Scoring::Softmax, norm_topk: false, route_scale: 1.0 };
+    let cfg = RouterCfg {
+        n_exp: 8,
+        k: 2,
+        scoring: Scoring::Softmax,
+        norm_topk: false,
+        route_scale: 1.0,
+    };
     let e = cfg.n_exp as usize;
     for seed in 0..1000u64 {
         let mut r = Rng::new(seed ^ 0x1234);

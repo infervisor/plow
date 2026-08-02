@@ -2,7 +2,7 @@
 //! bucket sharing a single weight + KV layout, verify a flip moves no
 //! weights/KV (unified `(BN,BK)`, only `BM` varies), and the cost-model chooser.
 
-use costmodel::{hwspec, DEFAULT_PAGE_BYTES, Soc};
+use costmodel::{hwspec, Soc, DEFAULT_PAGE_BYTES};
 use nn_graph::{infer_shapes, ActKind, DType, Nn};
 use rewrite::{plan_from_block, Compute, GraphNode, LayerPlan, TileGraph};
 use schedule::{

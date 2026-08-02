@@ -74,7 +74,11 @@ impl CounterPool {
     /// the model for host-pinned cross-device counters). `id` namespace is the
     /// dense `0..n` the compiler assigns.
     pub fn from_counters(counters: &[packet::Counter]) -> Self {
-        let n = counters.iter().map(|c| c.id as usize + 1).max().unwrap_or(0);
+        let n = counters
+            .iter()
+            .map(|c| c.id as usize + 1)
+            .max()
+            .unwrap_or(0);
         let mut cells: Vec<CachePadded<AtomicU64>> = Vec::with_capacity(n);
         cells.resize_with(n, || CachePadded::new(AtomicU64::new(0)));
         let boxed = cells.into_boxed_slice();
@@ -99,7 +103,11 @@ impl CounterPool {
     /// `dev` must be host-readable (pinned/mapped) and correctly aligned for
     /// `AtomicU64`, and outlive the pool.
     pub unsafe fn over_mapped(dev: DeviceMem, counters: &[packet::Counter]) -> Self {
-        let n = counters.iter().map(|c| c.id as usize + 1).max().unwrap_or(0);
+        let n = counters
+            .iter()
+            .map(|c| c.id as usize + 1)
+            .max()
+            .unwrap_or(0);
         debug_assert!(dev.len as usize >= n * CELL_STRIDE);
         let base = dev.base as *const AtomicU64;
         let (thresholds, scopes) = meta(counters, n);

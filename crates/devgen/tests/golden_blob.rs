@@ -9,7 +9,6 @@
 
 use std::path::Path;
 
-
 /// Serialises every test that EMITS.
 ///
 /// `nvidia_conditioned_flags_never_change_the_amd_segment_count` has to set `PLOW_UNISEG` to test
@@ -103,7 +102,11 @@ fn generated_tables_match_baked_tables() {
     let gen = emit_with(&root, 512, 128, 1, true);
 
     assert_eq!(&baked[..8], BLOB_MAGIC, "--no-rope-gen must stay v5");
-    assert_eq!(&gen[..8], BLOB_MAGIC_V7, "rope-gen must bump the magic to v7");
+    assert_eq!(
+        &gen[..8],
+        BLOB_MAGIC_V7,
+        "rope-gen must bump the magic to v7"
+    );
     assert!(
         gen.len() < baked.len(),
         "v7 blob ({}) should be smaller than baked ({})",
@@ -122,9 +125,7 @@ fn generated_tables_match_baked_tables() {
                 (
                     String::from_utf8(b[d..d + e].to_vec()).unwrap(),
                     u64::from_le_bytes(b[d + NAME_LEN..d + NAME_LEN + 8].try_into().unwrap()),
-                    u64::from_le_bytes(
-                        b[d + NAME_LEN + 8..d + NAME_LEN + 16].try_into().unwrap(),
-                    ),
+                    u64::from_le_bytes(b[d + NAME_LEN + 8..d + NAME_LEN + 16].try_into().unwrap()),
                 )
             })
             .collect()
@@ -137,7 +138,11 @@ fn generated_tables_match_baked_tables() {
 
     // The v7 recipe array, read through the section directory at reserved[0].
     let dir_off = u64::from_le_bytes(gen[40..48].try_into().unwrap()) as usize;
-    assert_eq!(&gen[dir_off..dir_off + 4], SECT_MAGIC, "section directory magic");
+    assert_eq!(
+        &gen[dir_off..dir_off + 4],
+        SECT_MAGIC,
+        "section directory magic"
+    );
     let n_sect = u32::from_le_bytes(gen[dir_off + 4..dir_off + 8].try_into().unwrap()) as usize;
     let ent_sz = std::mem::size_of::<BlobSectionEntry>();
     let recipes: Vec<GenTensor> = (0..n_sect)
@@ -264,7 +269,11 @@ fn the_verification_gate_does_not_change_a_single_emitted_byte() {
             // Guards against the test passing because the hook never ran.
             assert!(!m.progs.is_empty(), "the hook must see the real programs");
             seen.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(devgen::LeanReport { verified: true, oracle: true, reason: None })
+            Ok(devgen::LeanReport {
+                verified: true,
+                oracle: true,
+                reason: None,
+            })
         })),
     );
     assert!(
@@ -408,12 +417,20 @@ fn segment_count(blob_dir: &Path, bucket: u32) -> usize {
 /// `runtime/tests/xcd_map_gfx950_test.hip`), so the block formula would place a domain's packets
 /// on workgroups spread across all eight XCDs.
 fn amd_l2() -> packet::devbuild::L2Layout {
-    packet::devbuild::L2Layout { sms: 32, domains: 8, map: packet::devbuild::L2Map::RoundRobin }
+    packet::devbuild::L2Layout {
+        sms: 32,
+        domains: 8,
+        map: packet::devbuild::L2Map::RoundRobin,
+    }
 }
 
 /// The NVIDIA counterpart: consecutive blocks fill a GPC, so the domain is `n / sms`.
 fn nv_l2() -> packet::devbuild::L2Layout {
-    packet::devbuild::L2Layout { sms: 32, domains: 8, map: packet::devbuild::L2Map::Block }
+    packet::devbuild::L2Layout {
+        sms: 32,
+        domains: 8,
+        map: packet::devbuild::L2Map::Block,
+    }
 }
 
 fn emit_arch(dir: &Path, arch: &str, gpu: &str, l2: Option<packet::devbuild::L2Layout>) {
@@ -597,7 +614,10 @@ struct EnvScope(Vec<(String, Option<String>)>);
 
 impl EnvScope {
     fn set(kv: &[(&str, &str)]) -> Self {
-        let saved = kv.iter().map(|(k, _)| (k.to_string(), std::env::var(k).ok())).collect();
+        let saved = kv
+            .iter()
+            .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
+            .collect();
         for (k, v) in kv {
             std::env::set_var(k, v);
         }
@@ -634,9 +654,15 @@ fn w8a16_means_the_same_thing_to_both_emitter_families() {
         emit_arch(&dense, "sm_120a", "RTX5090", None);
     }
     let p = precision(&dense);
-    assert_eq!(p["weight_enc"], "fp8", "dense: W8A16 selects the fp8 weight axis");
+    assert_eq!(
+        p["weight_enc"], "fp8",
+        "dense: W8A16 selects the fp8 weight axis"
+    );
     assert_eq!(p["act_enc"], "bf16", "dense: W8A16 leaves activations wide");
-    assert_eq!(p["kv_enc"], "fp8", "dense: PLOW_KV_FP8 is a real alias for PLOW_FP8_KV");
+    assert_eq!(
+        p["kv_enc"], "fp8",
+        "dense: PLOW_KV_FP8 is a real alias for PLOW_FP8_KV"
+    );
 
     let mla = tempdir("axis_mla_w8a16");
     write_kimi_config(&mla);
@@ -645,9 +671,15 @@ fn w8a16_means_the_same_thing_to_both_emitter_families() {
         emit_block(&mla, "2");
     }
     let p = precision(&mla);
-    assert_eq!(p["weight_enc"], "fp8", "MLA: the same spelling selects the same axis value");
+    assert_eq!(
+        p["weight_enc"], "fp8",
+        "MLA: the same spelling selects the same axis value"
+    );
     assert_eq!(p["expert_enc"], "fp8blk");
-    assert_eq!(p["act_enc"], "bf16", "MLA block-fp8 experts are w8a16 — x stays bf16");
+    assert_eq!(
+        p["act_enc"], "bf16",
+        "MLA block-fp8 experts are w8a16 — x stays bf16"
+    );
 }
 
 /// `PLOW_W8A8` is implementable on the dense path and NOT on the MLA path, whose expert arms are
@@ -666,12 +698,18 @@ fn w8a8_is_emitted_where_it_exists_and_refused_where_it_does_not() {
     }
     let p = precision(&dense);
     assert_eq!(p["weight_enc"], "fp8");
-    assert_eq!(p["act_enc"], "fp8", "dense: W8A8 narrows the activation too — QuantFp8 is emitted");
+    assert_eq!(
+        p["act_enc"], "fp8",
+        "dense: W8A8 narrows the activation too — QuantFp8 is emitted"
+    );
 
     let mla = tempdir("axis_mla_w8a8");
     write_kimi_config(&mla);
     let _e = EnvScope::set(&[("PLOW_W8A8", "1")]);
     let refused =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| emit_block(&mla, "2"))).is_err();
-    assert!(refused, "MLA must refuse PLOW_W8A8 rather than silently emit w8a16");
+    assert!(
+        refused,
+        "MLA must refuse PLOW_W8A8 rather than silently emit w8a16"
+    );
 }

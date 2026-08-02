@@ -162,7 +162,13 @@ const GFX950_QUANT_OBJECTS: [(QuantScheme, MmaDtype, &[&str], [DevOp; 5]); 3] = 
         QuantScheme::None,
         MmaDtype::Bf16,
         &[],
-        [DevOp::Gemm, DevOp::GemmMed, DevOp::GemmSmall, DevOp::GemmWide, DevOp::GemmC5],
+        [
+            DevOp::Gemm,
+            DevOp::GemmMed,
+            DevOp::GemmSmall,
+            DevOp::GemmWide,
+            DevOp::GemmC5,
+        ],
     ),
     (
         QuantScheme::W8A8,
@@ -213,13 +219,19 @@ pub fn dense_gemm_inventory(root: &Path, isa: IsaLevel) -> Result<Inventory, Pro
             let tile = (vals[0], vals[1], vals[2]);
             // Hopper delegates d_gemm -> d_gemm_sm90 (op_gemm.cuh:512), so the
             // body that runs under sm_90a is the wgmma one; record it as such.
-            let body_fn = if isa == IsaLevel::Sm90a { "d_gemm_sm90" } else { "d_gemm" };
+            let body_fn = if isa == IsaLevel::Sm90a {
+                "d_gemm_sm90"
+            } else {
+                "d_gemm"
+            };
             let body = format!("{}:{}@{}", isa.arch_flag(), body_fn, obj.build().label());
             for op in gemm_ops {
                 if !obj.dispatches(op) {
                     continue;
                 }
-                let (Some(bm), Some(bn), Some(bk)) = tile else { continue };
+                let (Some(bm), Some(bn), Some(bk)) = tile else {
+                    continue;
+                };
                 specs.push(KernelSpec::gemm_tile(op, isa, bm, bn, bk, &body));
             }
         }
@@ -254,9 +266,15 @@ pub fn dense_gemm_inventory(root: &Path, isa: IsaLevel) -> Result<Inventory, Pro
                     if !qobj.dispatches(op) {
                         continue;
                     }
-                    let (Some(bm), Some(bn), Some(bk)) = tile else { continue };
-                    let body =
-                        format!("{}:{}@{}", isa.arch_flag(), op.c_name(), qobj.build().label());
+                    let (Some(bm), Some(bn), Some(bk)) = tile else {
+                        continue;
+                    };
+                    let body = format!(
+                        "{}:{}@{}",
+                        isa.arch_flag(),
+                        op.c_name(),
+                        qobj.build().label()
+                    );
                     specs.push(
                         KernelSpec::gemm_tile(op, isa, bm, bn, bk, &body).with_quant(quant, mma),
                     );
@@ -422,10 +440,16 @@ mod tests {
                 "an encoding lists a different number of opcodes than there are rungs"
             );
             for op in ops {
-                assert!(seen.insert(op as u16), "{op:?} is listed under two encodings");
+                assert!(
+                    seen.insert(op as u16),
+                    "{op:?} is listed under two encodings"
+                );
             }
         }
-        assert_eq!(seen.len(), GFX950_TILE_MACROS.len() * GFX950_QUANT_OBJECTS.len());
+        assert_eq!(
+            seen.len(),
+            GFX950_TILE_MACROS.len() * GFX950_QUANT_OBJECTS.len()
+        );
     }
 
     /// Probing needs the vendor toolchain. Without it the failure must name the

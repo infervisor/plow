@@ -83,8 +83,16 @@ pub fn build(cfg: &Gemma4MultimodalConfig) -> Graph {
         // --- attention block (pre-norm, post-norm, residual) ---
         let residual = x;
         let normed = nn.rmsnorm(&format!("{p}.input_layernorm"), x, h_text, eps);
-        let attn =
-            text_attention(&mut nn, text_cfg, &p, normed, &b, &s_combined, is_global, sliding);
+        let attn = text_attention(
+            &mut nn,
+            text_cfg,
+            &p,
+            normed,
+            &b,
+            &s_combined,
+            is_global,
+            sliding,
+        );
         let attn = nn.rmsnorm(&format!("{p}.post_attention_layernorm"), attn, h_text, eps);
         x = nn.add(residual, attn);
 

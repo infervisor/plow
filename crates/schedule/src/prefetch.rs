@@ -140,18 +140,15 @@ fn reorder_stream_dma_ins(
         .copied()
         .filter(|&t| tasks.tasks[t].kind != TaskKind::DmaIn)
         .collect();
-    let non_dma_pos: HashMap<TaskId, usize> = non_dma
-        .iter()
-        .enumerate()
-        .map(|(i, &t)| (t, i))
-        .collect();
+    let non_dma_pos: HashMap<TaskId, usize> =
+        non_dma.iter().enumerate().map(|(i, &t)| (t, i)).collect();
 
     // For each DMA-in, its "anchor" is the index into `non_dma` of its last
     // in-stream predecessor. `-1` == no anchor ⇒ goes at the front.
     #[derive(Clone, Copy)]
     struct Insertion {
         dma: TaskId,
-        anchor: i64,   // -1 for "before everything"
+        anchor: i64, // -1 for "before everything"
         original_idx: usize,
     }
     let mut inserts = Vec::new();
@@ -173,7 +170,11 @@ fn reorder_stream_dma_ins(
                 anchor = anchor.max(pos as i64);
             }
         }
-        inserts.push(Insertion { dma: t, anchor, original_idx: orig_idx });
+        inserts.push(Insertion {
+            dma: t,
+            anchor,
+            original_idx: orig_idx,
+        });
     }
 
     // Also account for DMA-in → DMA-in edges: a DMA-in that depends on another
@@ -181,8 +182,7 @@ fn reorder_stream_dma_ins(
     // preds (which have themselves been placed against the same non-DMA-in
     // grid). One relaxation sweep suffices because the DMA-in dep sub-graph
     // is acyclic (inherited from `TaskGraph`).
-    let mut anchor_of: HashMap<TaskId, i64> =
-        inserts.iter().map(|i| (i.dma, i.anchor)).collect();
+    let mut anchor_of: HashMap<TaskId, i64> = inserts.iter().map(|i| (i.dma, i.anchor)).collect();
     let mut changed = true;
     let mut iters = 0;
     while changed && iters < ids.len() + 1 {
@@ -235,8 +235,7 @@ fn reorder_stream_dma_ins(
     debug_assert_eq!(new_order.len(), ids.len(), "no task lost during reorder");
 
     // Compute stats.
-    let old_pos: HashMap<TaskId, usize> =
-        ids.iter().enumerate().map(|(i, &t)| (t, i)).collect();
+    let old_pos: HashMap<TaskId, usize> = ids.iter().enumerate().map(|(i, &t)| (t, i)).collect();
     let new_pos: HashMap<TaskId, usize> =
         new_order.iter().enumerate().map(|(i, &t)| (t, i)).collect();
     let mut hoisted = Vec::new();
@@ -312,8 +311,7 @@ fn recompute_starts(tasks: &TaskGraph, out: &mut Schedule) {
                 earliest = earliest.max(starts[p].saturating_add(tasks.tasks[p].dur));
             }
             if let Some(prev) = prev_on_stream.get(&t).copied().flatten() {
-                earliest = earliest
-                    .max(starts[prev].saturating_add(tasks.tasks[prev].dur));
+                earliest = earliest.max(starts[prev].saturating_add(tasks.tasks[prev].dur));
             }
             if earliest != starts[t] {
                 starts[t] = earliest;
@@ -370,7 +368,13 @@ mod tests {
         }
     }
 
-    fn packet(t: TaskId, start: Cycle, wait: &[usize], succs: &[usize], kind: PacketKind) -> Packet {
+    fn packet(
+        t: TaskId,
+        start: Cycle,
+        wait: &[usize],
+        succs: &[usize],
+        kind: PacketKind,
+    ) -> Packet {
         Packet {
             task: t,
             op: "x".into(),
@@ -387,16 +391,28 @@ mod tests {
     fn assert_streams_packets_starts_consistent(sched: &Schedule) {
         for (r, stream) in &sched.streams {
             let packets = sched.packets.get(r).expect("packets mirror streams");
-            assert_eq!(stream.len(), packets.len(),
-                "streams and packets differ in length for {:?}", r);
+            assert_eq!(
+                stream.len(),
+                packets.len(),
+                "streams and packets differ in length for {:?}",
+                r
+            );
             for (i, ((t, c), p)) in stream.iter().zip(packets.iter()).enumerate() {
-                assert_eq!(*t, p.task,
-                    "position {i} in {:?}: stream task {t} vs packet task {}", r, p.task);
-                assert_eq!(*c, p.start,
-                    "position {i} in {:?}: stream cycle {c} vs packet start {}", r, p.start);
-                assert_eq!(*c, sched.starts[*t],
+                assert_eq!(
+                    *t, p.task,
+                    "position {i} in {:?}: stream task {t} vs packet task {}",
+                    r, p.task
+                );
+                assert_eq!(
+                    *c, p.start,
+                    "position {i} in {:?}: stream cycle {c} vs packet start {}",
+                    r, p.start
+                );
+                assert_eq!(
+                    *c, sched.starts[*t],
                     "task {t} on {:?}: stream cycle {c} vs starts[{t}] {}",
-                    r, sched.starts[*t]);
+                    r, sched.starts[*t]
+                );
             }
         }
     }
@@ -406,9 +422,11 @@ mod tests {
     fn assert_data_deps_respected(tg: &TaskGraph, sched: &Schedule) {
         for &(a, b) in &tg.edges {
             let end_a = sched.starts[a] + tg.tasks[a].dur;
-            assert!(end_a <= sched.starts[b],
+            assert!(
+                end_a <= sched.starts[b],
                 "edge ({a}, {b}) violated: a ends at {end_a}, b starts at {}",
-                sched.starts[b]);
+                sched.starts[b]
+            );
         }
     }
 
@@ -420,23 +438,24 @@ mod tests {
         let mut tg = TaskGraph::default();
         tg.tasks = vec![
             task(0, TaskKind::Compute, 10),
-            task(1, TaskKind::Compute, 10),  // unrelated to dma_in
-            task(2, TaskKind::DmaIn,   10),
+            task(1, TaskKind::Compute, 10), // unrelated to dma_in
+            task(2, TaskKind::DmaIn, 10),
             task(3, TaskKind::Compute, 10),
         ];
         tg.edges = vec![(0, 2)]; // only dep: dma_in_2 needs compute_0's data
 
         let sm = ResourceId::Sm(0, 0);
         let sched = Schedule {
-            streams: HashMap::from([(sm, vec![
-                (0usize, 0), (1, 10), (2, 20), (3, 30),
-            ])]),
-            packets: HashMap::from([(sm, vec![
-                packet(0, 0,  &[], &[], PacketKind::Compute),
-                packet(1, 10, &[], &[], PacketKind::Compute),
-                packet(2, 20, &[], &[], PacketKind::TmaIn),
-                packet(3, 30, &[], &[], PacketKind::Compute),
-            ])]),
+            streams: HashMap::from([(sm, vec![(0usize, 0), (1, 10), (2, 20), (3, 30)])]),
+            packets: HashMap::from([(
+                sm,
+                vec![
+                    packet(0, 0, &[], &[], PacketKind::Compute),
+                    packet(1, 10, &[], &[], PacketKind::Compute),
+                    packet(2, 20, &[], &[], PacketKind::TmaIn),
+                    packet(3, 30, &[], &[], PacketKind::Compute),
+                ],
+            )]),
             counters: vec![],
             placement: HashMap::from([(0usize, sm), (1, sm), (2, sm), (3, sm)]),
             starts: vec![0, 10, 20, 30],
@@ -469,19 +488,20 @@ mod tests {
         tg.tasks = vec![
             task(0, TaskKind::Compute, 10),
             task(1, TaskKind::Compute, 10),
-            task(2, TaskKind::DmaIn,   10),
+            task(2, TaskKind::DmaIn, 10),
         ];
         // No edges — the DMA-in is fully independent.
         let sm = ResourceId::Sm(0, 0);
         let sched = Schedule {
-            streams: HashMap::from([(sm, vec![
-                (0usize, 0), (1, 10), (2, 20),
-            ])]),
-            packets: HashMap::from([(sm, vec![
-                packet(0, 0,  &[], &[], PacketKind::Compute),
-                packet(1, 10, &[], &[], PacketKind::Compute),
-                packet(2, 20, &[], &[], PacketKind::TmaIn),
-            ])]),
+            streams: HashMap::from([(sm, vec![(0usize, 0), (1, 10), (2, 20)])]),
+            packets: HashMap::from([(
+                sm,
+                vec![
+                    packet(0, 0, &[], &[], PacketKind::Compute),
+                    packet(1, 10, &[], &[], PacketKind::Compute),
+                    packet(2, 20, &[], &[], PacketKind::TmaIn),
+                ],
+            )]),
             counters: vec![],
             placement: HashMap::from([(0usize, sm), (1, sm), (2, sm)]),
             starts: vec![0, 10, 20],
@@ -506,20 +526,21 @@ mod tests {
         let mut tg = TaskGraph::default();
         tg.tasks = vec![
             task(0, TaskKind::Compute, 10),
-            task(1, TaskKind::DmaIn,   10),   // depends on compute_0, right after ⇒ optimal
+            task(1, TaskKind::DmaIn, 10), // depends on compute_0, right after ⇒ optimal
             task(2, TaskKind::Compute, 10),
         ];
         tg.edges = vec![(0, 1)];
         let sm = ResourceId::Sm(0, 0);
         let sched = Schedule {
-            streams: HashMap::from([(sm, vec![
-                (0usize, 0), (1, 10), (2, 20),
-            ])]),
-            packets: HashMap::from([(sm, vec![
-                packet(0, 0,  &[], &[], PacketKind::Compute),
-                packet(1, 10, &[], &[], PacketKind::TmaIn),
-                packet(2, 20, &[], &[], PacketKind::Compute),
-            ])]),
+            streams: HashMap::from([(sm, vec![(0usize, 0), (1, 10), (2, 20)])]),
+            packets: HashMap::from([(
+                sm,
+                vec![
+                    packet(0, 0, &[], &[], PacketKind::Compute),
+                    packet(1, 10, &[], &[], PacketKind::TmaIn),
+                    packet(2, 20, &[], &[], PacketKind::Compute),
+                ],
+            )]),
             counters: vec![],
             placement: HashMap::from([(0usize, sm), (1, sm), (2, sm)]),
             starts: vec![0, 10, 20],
@@ -544,23 +565,24 @@ mod tests {
     fn two_dma_ins_with_dep_preserve_relative_order() {
         let mut tg = TaskGraph::default();
         tg.tasks = vec![
-            task(0, TaskKind::Compute, 10),  // unrelated
-            task(1, TaskKind::DmaIn,   10),  // no deps
-            task(2, TaskKind::DmaIn,   10),  // depends on task 1
-            task(3, TaskKind::Compute, 10),  // consumes both, gates the end
+            task(0, TaskKind::Compute, 10), // unrelated
+            task(1, TaskKind::DmaIn, 10),   // no deps
+            task(2, TaskKind::DmaIn, 10),   // depends on task 1
+            task(3, TaskKind::Compute, 10), // consumes both, gates the end
         ];
         tg.edges = vec![(1, 2), (1, 3), (2, 3)];
         let sm = ResourceId::Sm(0, 0);
         let sched = Schedule {
-            streams: HashMap::from([(sm, vec![
-                (0usize, 0), (1, 10), (2, 20), (3, 30),
-            ])]),
-            packets: HashMap::from([(sm, vec![
-                packet(0, 0,  &[], &[], PacketKind::Compute),
-                packet(1, 10, &[], &[], PacketKind::TmaIn),
-                packet(2, 20, &[], &[], PacketKind::TmaIn),
-                packet(3, 30, &[], &[], PacketKind::Compute),
-            ])]),
+            streams: HashMap::from([(sm, vec![(0usize, 0), (1, 10), (2, 20), (3, 30)])]),
+            packets: HashMap::from([(
+                sm,
+                vec![
+                    packet(0, 0, &[], &[], PacketKind::Compute),
+                    packet(1, 10, &[], &[], PacketKind::TmaIn),
+                    packet(2, 20, &[], &[], PacketKind::TmaIn),
+                    packet(3, 30, &[], &[], PacketKind::Compute),
+                ],
+            )]),
             counters: vec![],
             placement: HashMap::from([(0usize, sm), (1, sm), (2, sm), (3, sm)]),
             starts: vec![0, 10, 20, 30],
@@ -576,8 +598,11 @@ mod tests {
         // Both DMA-ins hoisted to the front (no non-DMA-in preds); task 2's
         // dep on task 1 keeps them in that order.
         let order: Vec<TaskId> = out.streams[&sm].iter().map(|(t, _)| *t).collect();
-        assert!(order.starts_with(&[1, 2]),
-            "DMA-ins must land at front in dep order; got {:?}", order);
+        assert!(
+            order.starts_with(&[1, 2]),
+            "DMA-ins must land at front in dep order; got {:?}",
+            order
+        );
         assert!(rep.hoisted.contains(&1));
         assert!(rep.hoisted.contains(&2));
     }
@@ -589,8 +614,8 @@ mod tests {
         let mut tg = TaskGraph::default();
         tg.tasks = vec![
             task(0, TaskKind::Compute, 10),
-            task(1, TaskKind::Compute, 10),  // gates dma_in_2 via counter, but no data edge
-            task(2, TaskKind::DmaIn,   10),
+            task(1, TaskKind::Compute, 10), // gates dma_in_2 via counter, but no data edge
+            task(2, TaskKind::DmaIn, 10),
         ];
         tg.edges = vec![]; // no data edges — the counter is the only ordering
         let sm = ResourceId::Sm(0, 0);
@@ -602,14 +627,15 @@ mod tests {
             consumer_node: 2,
         };
         let sched = Schedule {
-            streams: HashMap::from([(sm, vec![
-                (0usize, 0), (1, 10), (2, 20),
-            ])]),
-            packets: HashMap::from([(sm, vec![
-                packet(0, 0,  &[],   &[],   PacketKind::Compute),
-                packet(1, 10, &[],   &[42], PacketKind::Compute),
-                packet(2, 20, &[42], &[],   PacketKind::TmaIn),
-            ])]),
+            streams: HashMap::from([(sm, vec![(0usize, 0), (1, 10), (2, 20)])]),
+            packets: HashMap::from([(
+                sm,
+                vec![
+                    packet(0, 0, &[], &[], PacketKind::Compute),
+                    packet(1, 10, &[], &[42], PacketKind::Compute),
+                    packet(2, 20, &[42], &[], PacketKind::TmaIn),
+                ],
+            )]),
             counters: vec![counter],
             placement: HashMap::from([(0usize, sm), (1, sm), (2, sm)]),
             starts: vec![0, 10, 20],

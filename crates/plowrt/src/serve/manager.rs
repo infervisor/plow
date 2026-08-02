@@ -89,11 +89,12 @@ impl BlobPlan {
     /// once (header + tensor decls; the init section ride-along is the cost of
     /// the shared parser — startup-only, never on the request path).
     pub fn from_dir(dir: &Path) -> Result<BlobPlan> {
-        let pkt = DevBlob::find_in_dir(dir)?.ok_or_else(|| {
-            RuntimeError::Device(format!("no PLOWDEV blob in {}", dir.display()))
+        let pkt = DevBlob::find_in_dir(dir)?
+            .ok_or_else(|| RuntimeError::Device(format!("no PLOWDEV blob in {}", dir.display())))?;
+        let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
+            path: pkt.clone(),
+            source,
         })?;
-        let raw = std::fs::read(&pkt)
-            .map_err(|source| RuntimeError::Io { path: pkt.clone(), source })?;
         let blob = DevBlob::parse(&raw)?;
         let mut plan = BlobPlan {
             weights_bytes: 0,
@@ -196,7 +197,12 @@ impl ModelManager {
                 total_gib = gib(plan.tensor_total()),
                 "planner: model registered"
             );
-            managed.push(Managed { slug, dir, ckpt, plan });
+            managed.push(Managed {
+                slug,
+                dir,
+                ckpt,
+                plan,
+            });
         }
         Ok(ModelManager {
             state: Arc::downgrade(state),
@@ -235,7 +241,9 @@ impl ModelManager {
     }
 
     fn touch(&self, slug: &str) {
-        self.last_use.lock().insert(slug.to_string(), Instant::now());
+        self.last_use
+            .lock()
+            .insert(slug.to_string(), Instant::now());
     }
 
     /// Effective free VRAM under the optional budget cap: with a budget B on a
@@ -309,7 +317,11 @@ impl ModelManager {
             self.touch(slug);
             return Ok(());
         }
-        let m = self.models.iter().find(|m| m.slug == slug).expect("managed");
+        let m = self
+            .models
+            .iter()
+            .find(|m| m.slug == slug)
+            .expect("managed");
         let need = self.required(slug).expect("managed") + RESERVE;
         let mut report = SwitchReport {
             target: slug.to_string(),
@@ -391,10 +403,7 @@ impl ModelManager {
     /// spawn its dispatcher. Calibrates the overhead cache on first load.
     async fn load_model(&self, m: &Managed) -> std::result::Result<(), EnsureError> {
         let state = self.state()?;
-        let bundle = state
-            .registry
-            .get(&m.slug)
-            .map_err(EnsureError::Load)?;
+        let bundle = state.registry.get(&m.slug).map_err(EnsureError::Load)?;
         if bundle.tokenizer().is_byte_fallback() {
             return Err(EnsureError::Load(RuntimeError::Msg(format!(
                 "{}: GPU engine requires a real tokenizer.json in {}",
@@ -406,12 +415,11 @@ impl ModelManager {
         let (free_before, _) = self.be.mem_info().map_err(EnsureError::Load)?;
         let be = Arc::clone(&self.be);
         let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
-        let engine = tokio::task::spawn_blocking(move || {
-            crate::exec::gpu::GpuEngine::load(be, &dir, &ckpt)
-        })
-        .await
-        .map_err(|e| EnsureError::Load(RuntimeError::Msg(format!("load task: {e}"))))?
-        .map_err(EnsureError::Load)?;
+        let engine =
+            tokio::task::spawn_blocking(move || crate::exec::gpu::GpuEngine::load(be, &dir, &ckpt))
+                .await
+                .map_err(|e| EnsureError::Load(RuntimeError::Msg(format!("load task: {e}"))))?
+                .map_err(EnsureError::Load)?;
         let (free_after, _) = self.be.mem_info().map_err(EnsureError::Load)?;
 
         // First-load calibration: measured footprint minus the planned tensor
@@ -497,7 +505,11 @@ mod tests {
     /// copy is precisely how the five sites diverged in the first place.
     #[test]
     fn the_plan_counts_the_same_weights_the_loaders_bind() {
-        let mut p = BlobPlan { weights_bytes: 0, kv_bytes: 0, other_bytes: 0 };
+        let mut p = BlobPlan {
+            weights_bytes: 0,
+            kv_bytes: 0,
+            other_bytes: 0,
+        };
         let weights = [
             "lm_head.weight",
             "language_model.model.layers.3.self_attn.kv_a_proj_with_mqa.weight",
@@ -506,7 +518,10 @@ mod tests {
             "fp8/model.layers.0.mlp.down_proj.weight_scale",
         ];
         for n in weights {
-            assert!(packet::names::is_checkpoint_weight(n), "{n} must bind from the checkpoint");
+            assert!(
+                packet::names::is_checkpoint_weight(n),
+                "{n} must bind from the checkpoint"
+            );
             p.add(n, 10);
         }
         // Host-filled pointer tables live under the model prefix and are NOT weights — no

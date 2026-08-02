@@ -54,12 +54,20 @@ impl SimEvent {
         let waits = if self.waits.is_empty() {
             "-".to_string()
         } else {
-            self.waits.iter().map(|c| format!("c{c}")).collect::<Vec<_>>().join(",")
+            self.waits
+                .iter()
+                .map(|c| format!("c{c}"))
+                .collect::<Vec<_>>()
+                .join(",")
         };
         let succs = if self.succs.is_empty() {
             "-".to_string()
         } else {
-            self.succs.iter().map(|c| format!("c{c}")).collect::<Vec<_>>().join(",")
+            self.succs
+                .iter()
+                .map(|c| format!("c{c}"))
+                .collect::<Vec<_>>()
+                .join(",")
         };
         format!(
             "#{:<5} {}{:<3} {:<10} {:<32} wait[{}] -> succ[{}] t={}..{}cyc",
@@ -228,15 +236,34 @@ impl Simulator {
 /// Opcode-family display name from the body variant.
 fn describe(body: &Body) -> (&'static str, String) {
     match body {
-        Body::Gemm { m, n, k, bm, bn, bk, .. } => (
-            "GEMM",
-            format!("m={m} n={n} k={k} tile={bm}x{bn}x{bk}"),
-        ),
-        Body::Flash { seq_q, seq_kv, head_dim, heads, bq, bkv, .. } => (
+        Body::Gemm {
+            m,
+            n,
+            k,
+            bm,
+            bn,
+            bk,
+            ..
+        } => ("GEMM", format!("m={m} n={n} k={k} tile={bm}x{bn}x{bk}")),
+        Body::Flash {
+            seq_q,
+            seq_kv,
+            head_dim,
+            heads,
+            bq,
+            bkv,
+            ..
+        } => (
             "FLASH",
             format!("sq={seq_q} skv={seq_kv} hd={head_dim} heads={heads} tile={bq}x{bkv}"),
         ),
-        Body::Row { reduce, rows, feat, br, .. } => (
+        Body::Row {
+            reduce,
+            rows,
+            feat,
+            br,
+            ..
+        } => (
             if *reduce { "ROW_REDUCE" } else { "ROW_PW" },
             format!("rows={rows} feat={feat} br={br}"),
         ),
@@ -248,15 +275,24 @@ fn describe(body: &Body) -> (&'static str, String) {
                 .collect();
             ("LAYOUT", format!("shape=[{}]", dims.join(",")))
         }
-        Body::Dma { load, bytes, slot, .. } => (
+        Body::Dma {
+            load, bytes, slot, ..
+        } => (
             if *load { "TMA_LOAD" } else { "TMA_STORE" },
             format!("bytes={bytes} slot={slot}"),
         ),
-        Body::Rdma { bytes, src_unit, dst_unit } => (
-            "RDMA",
-            format!("bytes={bytes} u{src_unit}->u{dst_unit}"),
-        ),
-        Body::Token { in_slot, out_slot, kind, vocab, .. } => {
+        Body::Rdma {
+            bytes,
+            src_unit,
+            dst_unit,
+        } => ("RDMA", format!("bytes={bytes} u{src_unit}->u{dst_unit}")),
+        Body::Token {
+            in_slot,
+            out_slot,
+            kind,
+            vocab,
+            ..
+        } => {
             let name = match *kind {
                 packet::Opcode::TOKEN_SAMPLE_GREEDY => "SAMPLE",
                 packet::Opcode::TOKEN_SAMPLE_STOCHASTIC => "SAMPLE_S",

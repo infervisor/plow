@@ -44,7 +44,8 @@ fn setting_lean_verify_without_feature_fails_with_disabled_error() {
         lean_oracle: false,
         emit_sample: false,
         emit_tokenize: false,
-        emit_trace: false,        kv: Default::default(),
+        emit_trace: false,
+        kv: Default::default(),
         weight_dtype_override: None,
     };
     match compile(&Source::Net(net), &opts) {

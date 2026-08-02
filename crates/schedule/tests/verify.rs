@@ -3,7 +3,7 @@
 //! real schedules (1 GPU / 2×H100 / B200) through the byte-level verifier, then
 //! tampers with the stream to prove each check actually bites.
 
-use costmodel::{hwspec, DEFAULT_PAGE_BYTES, Soc, SramPolicy};
+use costmodel::{hwspec, Soc, SramPolicy, DEFAULT_PAGE_BYTES};
 use nn_graph::{infer_shapes, ActKind, DType, Nn};
 use rewrite::{assemble, collapse, plan_from_block, LayerPlan};
 use schedule::{
@@ -82,7 +82,9 @@ fn collapsed_relaxed_stream_verifies() {
         let (g, cons) = collapse(&soc, &g, &cons);
         let (g, cons) = relax(&Machine::from_soc(&soc, &cfg), &g, &cons);
         let s = schedule(&soc, &g, &cons, &cfg);
-        let report = s.verify(&g, &cons).expect("collapsed+relaxed schedule must verify");
+        let report = s
+            .verify(&g, &cons)
+            .expect("collapsed+relaxed schedule must verify");
         assert_eq!(report.edges_checked, s.tasks.edges.len());
         assert!(report.rounds > 0);
     }
@@ -213,8 +215,8 @@ fn rejects_dropped_cross_resource_wait() {
 /// to exercise multi-tile scheduling without O(N²) edge explosion.
 #[test]
 fn realistic_shape_verifies_with_fine_counters() {
-    use rewrite::{LayerPlan, OpKind, OpSpec};
     use costmodel::{GemmShape, RowShape, SramPolicy};
+    use rewrite::{LayerPlan, OpKind, OpSpec};
 
     let soc = Soc::single(h100(), DEFAULT_PAGE_BYTES);
     let plan = LayerPlan {
@@ -223,7 +225,11 @@ fn realistic_shape_verifies_with_fine_counters() {
                 name: "gemm1".into(),
                 inputs: vec!["x".into(), "w1".into()],
                 output: "h".into(),
-                kind: OpKind::Gemm(GemmShape { m: 4096, n: 2048, k: 2048 }),
+                kind: OpKind::Gemm(GemmShape {
+                    m: 4096,
+                    n: 2048,
+                    k: 2048,
+                }),
                 weight_dtype: nn_graph::DType::BF16,
                 compute_dtype: nn_graph::DType::BF16,
             },
@@ -231,7 +237,12 @@ fn realistic_shape_verifies_with_fine_counters() {
                 name: "act".into(),
                 inputs: vec!["h".into()],
                 output: "a".into(),
-                kind: OpKind::Row(RowShape { rows: 4096, feat: 2048, operands: 1, reduce: false }),
+                kind: OpKind::Row(RowShape {
+                    rows: 4096,
+                    feat: 2048,
+                    operands: 1,
+                    reduce: false,
+                }),
                 weight_dtype: nn_graph::DType::BF16,
                 compute_dtype: nn_graph::DType::BF16,
             },
@@ -239,7 +250,11 @@ fn realistic_shape_verifies_with_fine_counters() {
                 name: "gemm2".into(),
                 inputs: vec!["a".into(), "w2".into()],
                 output: "y".into(),
-                kind: OpKind::Gemm(GemmShape { m: 4096, n: 2048, k: 2048 }),
+                kind: OpKind::Gemm(GemmShape {
+                    m: 4096,
+                    n: 2048,
+                    k: 2048,
+                }),
                 weight_dtype: nn_graph::DType::BF16,
                 compute_dtype: nn_graph::DType::BF16,
             },
@@ -252,7 +267,9 @@ fn realistic_shape_verifies_with_fine_counters() {
     };
     let (g, cons) = assemble(&soc, &plan, SramPolicy::Stream, None).unwrap();
     let s = schedule(&soc, &g, &cons, &cfg);
-    let report = s.verify(&g, &cons).expect("fine counters must verify at realistic tile counts");
+    let report = s
+        .verify(&g, &cons)
+        .expect("fine counters must verify at realistic tile counts");
     assert!(report.edges_checked > 0);
     assert!(report.rounds > 0);
     // With fine counters, max parallelism should be > 1 (tiles fire as soon as
@@ -273,8 +290,8 @@ fn realistic_shape_verifies_with_fine_counters() {
 /// counters and `Separate` DMA).
 #[test]
 fn fine_counters_pipeline_across_boundary() {
-    use rewrite::{LayerPlan, OpKind, OpSpec};
     use costmodel::{GemmShape, RowShape, SramPolicy};
+    use rewrite::{LayerPlan, OpKind, OpSpec};
 
     let soc = Soc::single(h100(), DEFAULT_PAGE_BYTES);
     let plan = LayerPlan {
@@ -283,7 +300,11 @@ fn fine_counters_pipeline_across_boundary() {
                 name: "gemm".into(),
                 inputs: vec!["x".into(), "w".into()],
                 output: "h".into(),
-                kind: OpKind::Gemm(GemmShape { m: 4096, n: 2048, k: 2048 }),
+                kind: OpKind::Gemm(GemmShape {
+                    m: 4096,
+                    n: 2048,
+                    k: 2048,
+                }),
                 weight_dtype: nn_graph::DType::BF16,
                 compute_dtype: nn_graph::DType::BF16,
             },
@@ -291,7 +312,12 @@ fn fine_counters_pipeline_across_boundary() {
                 name: "row".into(),
                 inputs: vec!["h".into()],
                 output: "y".into(),
-                kind: OpKind::Row(RowShape { rows: 4096, feat: 2048, operands: 1, reduce: false }),
+                kind: OpKind::Row(RowShape {
+                    rows: 4096,
+                    feat: 2048,
+                    operands: 1,
+                    reduce: false,
+                }),
                 weight_dtype: nn_graph::DType::BF16,
                 compute_dtype: nn_graph::DType::BF16,
             },
@@ -315,7 +341,9 @@ fn fine_counters_pipeline_across_boundary() {
         ..Config::default()
     };
     let s_coarse = schedule(&soc, &g, &cons, &cfg_coarse);
-    let r_coarse = s_coarse.verify(&g, &cons).expect("coarse must verify at this size");
+    let r_coarse = s_coarse
+        .verify(&g, &cons)
+        .expect("coarse must verify at this size");
 
     // Fine should have same or better parallelism (more max_ready or fewer rounds).
     assert!(

@@ -143,7 +143,9 @@ pub fn binary_available() -> bool {
     }
     // Bare name: `locate_binary`'s PATH fallback. Resolve it the way `Command`
     // would, so the probe answers the same question the spawn will ask.
-    let Ok(path) = std::env::var("PATH") else { return false };
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
     std::env::split_paths(&path).any(|d| d.join(&p).is_file())
 }
 
@@ -156,8 +158,8 @@ fn locate_binary() -> Result<PathBuf, VerifyError> {
         return Err(VerifyError::BinaryNotFound(path.display().to_string()));
     }
     // Try relative to crate — most useful in tests.
-    let candidate =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../lean-plow/.lake/build/bin/plow_verify");
+    let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../lean-plow/.lake/build/bin/plow_verify");
     if candidate.is_file() {
         return Ok(candidate);
     }
@@ -277,7 +279,9 @@ pub fn query(query_type: &str, payload: serde_json::Value) -> Result<QueryResult
         .map_err(|e| VerifyError::DeserializeQueryResult(e, stdout.clone()))?;
     if !result.ok {
         return Err(VerifyError::QueryFailed(
-            result.error.unwrap_or_else(|| "query returned ok=false with no error".into()),
+            result
+                .error
+                .unwrap_or_else(|| "query returned ok=false with no error".into()),
         ));
     }
     Ok(result)
@@ -327,7 +331,9 @@ mod tests {
         let bad = || serde_json::from_str::<Certificate>("x").unwrap_err();
         assert!(VerifyError::DeserializeCertificate(bad(), String::new()).is_binary_unusable());
         assert!(VerifyError::DeserializeCertificate(bad(), "  \n".into()).is_binary_unusable());
-        assert!(!VerifyError::DeserializeCertificate(bad(), "{\"ok\":".into()).is_binary_unusable());
+        assert!(
+            !VerifyError::DeserializeCertificate(bad(), "{\"ok\":".into()).is_binary_unusable()
+        );
     }
 
     /// The probe is an OPTIMISATION and may be wrong optimistically (a
@@ -340,7 +346,10 @@ mod tests {
         // it directly, so there is nothing to inject it through.
         std::env::set_var("PLOW_VERIFY_BIN", "/nonexistent/plow_verify");
         assert!(!binary_available());
-        assert!(matches!(locate_binary(), Err(VerifyError::BinaryNotFound(_))));
+        assert!(matches!(
+            locate_binary(),
+            Err(VerifyError::BinaryNotFound(_))
+        ));
         std::env::remove_var("PLOW_VERIFY_BIN");
     }
 }
