@@ -124,7 +124,7 @@ prefill" even after every decode correction in the campaign has landed.
 
 ## 5. Isolated-op cross-check (PX-11's bench, re-run on this GPU)
 
-`perf-data/px11_flash_decode_bench.cu`, FULL class, B=8, ctx 131072, fp8 KV — reproduces PX-11's
+`runtime/bench/nvidia/px11_flash_decode_bench.cu`, FULL class, B=8, ctx 131072, fp8 KV — reproduces PX-11's
 own cells to 2–4%, which is that document's stated noise band:
 
 | GF | nsplit | ms | vs deployed | note |

@@ -1,8 +1,8 @@
 # PX-13 — the prefill GEMM tile space, scored end to end. The microbench picks the wrong tile.
 
 RTX 5090 (sm_120a, **170 SMs**, 96 MiB L2, driver 580.159.03, CUDA 13.0) · 2026-07-26
-Gemma-4-12B-it, fp8 W8A8, the PX-12 §2b asset. Benches `perf-data/px9_gemm_body_bench.cu`
-(extended) and `perf-data/px13_tma_stage_bench.cu` (new). Every GPU run under
+Gemma-4-12B-it, fp8 W8A8, the PX-12 §2b asset. Benches `runtime/bench/nvidia/px9_gemm_body_bench.cu`
+(extended) and `runtime/bench/nvidia/px13_tma_stage_bench.cu` (new). Every GPU run under
 `perf-data/harness/gpulease`.
 
 Companion to PX-9 (`px9-gemm-body.md`) and PX-12 (`px12-consolidated-baseline.md`). Neither file
@@ -172,7 +172,7 @@ capabilities: mma_sync=true wgmma=false tcgen05=false tmem=false tma=false ...
 
 `IsaLevel::Sm120a.caps().tma == false` in `crates/hwspec/src/isa.rs`, asserted by a test. But the
 tree already ships a working `cp.async.bulk` arm for sm_120a (`PLOW_NV_FA_TMA`), and
-`perf-data/px13_tma_stage_bench.cu` — which issues
+`runtime/bench/nvidia/px13_tma_stage_bench.cu` — which issues
 `cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes` — **assembles for
 `compute_120a` and links against `cuTensorMapEncodeTiled`**. A prefill tuner that gated a TMA arm
 on `caps().tma` would never generate it on this board. Reported, not fixed: changing a capability
@@ -180,7 +180,7 @@ row changes kernel selection for every target and belongs behind its own regress
 
 ## Result 7 — TMA staging is 1.10x SLOWER than `cp.async.cg`. **PX-9's one live hypothesis is dead.**
 
-`perf-data/px13_tma_stage_bench.cu` stages the production `[128][64]` e4m3 A tile and B tile into
+`runtime/bench/nvidia/px13_tma_stage_bench.cu` stages the production `[128][64]` e4m3 A tile and B tile into
 the production 49152 B 3-deep ring, at the production 256 threads, three ways, with no mma in the
 way. 120 blocks, 60 K-tiles, `verify` mode asserts all three land **byte-identical** smem.
 

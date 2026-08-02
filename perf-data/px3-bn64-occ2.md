@@ -80,7 +80,7 @@ small-win, GLU-only), the emitter investment is **not** justified by this cheap 
 
 ## Artifacts
 
-- `perf-data/gemm_occ_bench.cu` — per-op timing bench (build `-DPGM_BN={64,128}`).
-- `perf-data/gemm_parity.cu` — parity vs f32 CPU ref.
-- `perf-data/occ_probe.cu` — driver-API occupancy on the real `_pfgemm` cubins.
+- `runtime/bench/nvidia/gemm_occ_bench.cu` — per-op timing bench (build `-DPGM_BN={64,128}`).
+- `runtime/bench/nvidia/gemm_parity.cu` — parity vs f32 CPU ref.
+- `runtime/bench/nvidia/occ_probe.cu` — driver-API occupancy on the real `_pfgemm` cubins.
 - `perf-data/px3_build*.sh` — clean-env nvcc build helpers (nix CPATH conflicts).

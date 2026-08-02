@@ -1,5 +1,9 @@
 # Plow μBench — Single CU/SM Kernel Profiler
 
+> **Scope**: This directory is STRICTLY for single-CU/SM micro-benchmarks
+> (`gridDim=1`). Multi-CU sweeps, library comparisons, and interpreter-level
+> benchmarks belong in [`../bench/`](../bench/README.md).
+
 A micro-benchmarker that exercises **each innermost device op** on a single
 Compute Unit (AMD) or Streaming Multiprocessor (NVIDIA), measures hardware
 counters via `rocprof` (or `ncu`), and reports a roofline analysis showing how
@@ -21,7 +25,7 @@ close each kernel is to the theoretical single-unit ceiling.
 ## Quick Start (AMD MI350X)
 
 ```bash
-cd runtime/bench
+cd runtime/ubench
 ./run_ubench_cu.sh                    # full 3-pass rocprof run
 ./run_ubench_cu.sh --timing-only      # fast: wall-clock timing only
 ./run_ubench_cu.sh --kernel d_gemm    # profile one kernel

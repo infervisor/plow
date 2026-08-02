@@ -15,7 +15,7 @@ MFMA shape. plow's prefill GEMM is at the achievable ceiling for a HIP-source me
 
 ## Step 1 — hipBLASLt IS util-bound, not clock-bound (measured)
 
-`scratchpad_bench/bench_lt_prof` (screens all algos, runs only the winner N× so the rocprof CSV is
+`runtime/bench/gemm/bench_lt_prof` (screens all algos, runs only the winner N× so the rocprof CSV is
 one clean kernel). M=4096, Qwen3-4B bf16 TN shapes, whole GPU. Un-profiled TF/s + rocprofv3
 `--pmc MfmaUtil MemUnitStalled` (values under rocprof are depressed but internally consistent — every
 row below shares identical profiler conditions):
@@ -105,4 +105,4 @@ library's register placement needs assembly-level control plow's persistent mega
   fp8-gemm already measured K64 *dropping* MfmaUtil.
 
 Artifacts: `gemm_mfma16_poc.hip`, `mfma_shape_results/summary.csv`,
-`mfma_shape_results/library_disasm.txt`, `scratchpad_bench/bench_lt_prof.cpp`.
+`mfma_shape_results/library_disasm.txt`, `runtime/bench/gemm/bench_lt_prof.cpp`.

@@ -1,6 +1,6 @@
 # PX-22 — warp specialization DOES pay on sm_120a: 1.14x on the w8a8 prefill GEMM body, bit-exact
 
-RTX 5090 (sm_120a, 170 SMs, 96 MiB L2) · 2026-07-26 · bench `perf-data/px22_ws_stage_bench.cu`,
+RTX 5090 (sm_120a, 170 SMs, 96 MiB L2) · 2026-07-26 · bench `runtime/bench/nvidia/px22_ws_stage_bench.cu`,
 build `perf-data/px22_build.sh`, run under `perf-data/harness/gpulease`.
 
 ## Question
@@ -231,7 +231,7 @@ result.
 | hash is discriminating, not vacuous | **PASS** — the zero-plane hash (`c13b395e6a1d0383`), the plain-GEMM hash (`6f9f6be9902baa9a`) and the GLU hash (`c727b42ba91121ea`) are all distinct, and the bench asserts an arm never equals the zero plane. Added **after** the bug below made the gate pass for the wrong reason. |
 | reproducibility, two separate leases | **PASS** — every cell within 0.3%; headline ratio 1.141x / 1.146x |
 | oracle / numeric parity vs the in-tree probe | **NOT RUN** — this bench is self-contained and proves arm-to-arm bit-identity, which is the property a body swap needs. It does not re-run `fp8_gemm_w8a8_probe.cu`; that gate belongs to the integration, not the microbench. |
-| **byte-identical shipped cubins when the feature is off** | **PASS, trivially** — `git diff HEAD -- runtime crates include scripts` is **empty**. No kernel or runtime source was touched; the only new files are `perf-data/px22_ws_stage_bench.cu` and `perf-data/px22_build.sh`. There is no feature to turn off yet. |
+| **byte-identical shipped cubins when the feature is off** | **PASS, trivially** — `git diff HEAD -- runtime crates include scripts` is **empty**. No kernel or runtime source was touched; the only new files are `runtime/bench/nvidia/px22_ws_stage_bench.cu` and `perf-data/px22_build.sh`. There is no feature to turn off yet. |
 | `cargo test --workspace` | **PASS** — exit 0, 0 failures |
 | `cargo build --release -p plowrt --features cuda,hf-tokenizer` | **PASS** — clean (warnings only, all pre-existing) |
 | no reading above the 518.5 TFLOP/s fp8 ceiling | **PASS** — asserted per row by the bench; the best arm is 349.5 (67.4%). The one arm that tripped it early was `stage_only`, which does zero FLOPs — its TFLOP/s column is now suppressed rather than printed against a meaningless denominator. |

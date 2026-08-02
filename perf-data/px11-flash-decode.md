@@ -1,7 +1,7 @@
 # PX-11 — the flash DECODE kernel is at ~93% of its own access map. The map and the GQA re-read are the levers, not the body.
 
 RTX 5090 (sm_120a, **170 SMs**, 96 MiB L2) · 2026-07-26
-bench `perf-data/px11_flash_decode_bench.cu` (calls the SHIPPED `d_flash_decode` directly — no
+bench `runtime/bench/nvidia/px11_flash_decode_bench.cu` (calls the SHIPPED `d_flash_decode` directly — no
 cubin, no megakernel dispatch, px8 arm-Bp style) · raw `perf-data/px11-flash-decode-raw.txt`
 build `perf-data/px11_build.sh` · runners `px11_run.sh` / `px11_knobs.sh` / `px11_run2.sh` /
 `px11_run3.sh` · SASS `px11_sass.sh` + `px11_sass.py` · ptxas `px11_regs.sh`

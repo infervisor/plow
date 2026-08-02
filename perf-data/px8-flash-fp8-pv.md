@@ -1,7 +1,7 @@
 # PX-8 — the fp8 P.V for the hd512 flash prefill: what actually blocks it, and what does not
 
 RTX 5090 (sm_120a, **170 SMs**, 96 MiB L2, 101,376 B dynamic-smem cap) · 2026-07-26
-bench `perf-data/px8_flash_fp8pv_bench.cu` · raw `perf-data/px8-flash-fp8-pv-raw.txt`
+bench `runtime/bench/nvidia/px8_flash_fp8pv_bench.cu` · raw `perf-data/px8-flash-fp8-pv-raw.txt`
 run under `perf-data/harness/gpulease`
 Follows PX-7 Result 4/5. `px7_w8a8_ceiling_bench.cu` untouched.
 
@@ -23,7 +23,7 @@ not contain the px4 fp8mma arm at all. Stating it up front so no table can be mi
 
 | what | how it was built / run |
 |---|---|
-| every timing and numerics row | **`perf-data/px8_flash_fp8pv_bench.cu`**, a standalone binary. It does **not** load a cubin and does **not** go through the megakernel dispatch. |
+| every timing and numerics row | **`runtime/bench/nvidia/px8_flash_fp8pv_bench.cu`**, a standalone binary. It does **not** load a cubin and does **not** go through the megakernel dispatch. |
 | the **px4 column** | `k_armA` calls **`d_flash_prefill_px4<512,32,16,true>` directly** — the real shipped source, no copy. |
 | the px4 arm's compile flags | `-gencode arch=compute_120a,code=sm_120a -DPLOW_FP8_KV=1`, with `PLOW_NV_FA_PIPE=1` and `PLOW_NV_FA_FP8MMA=1` at their defaults. **That is byte-for-byte the arm `PLOW_FP8_KV_FASTPF=ON` selects.** |
 | the **px8 column** | `k_armBp` calls **`d_flash_prefill_px8<512,32,32,true>` directly**, same flags plus `-DPLOW_NV_FA_FP8PV=1`. |

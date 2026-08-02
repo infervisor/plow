@@ -1,6 +1,6 @@
 # PX-9 — the w8a8 GEMM body is not the mainloop, it is the cp.async staging path
 
-RTX 5090 (sm_120a, **170 SMs**, 96 MiB L2) · 2026-07-26 · bench `perf-data/px9_gemm_body_bench.cu`
+RTX 5090 (sm_120a, **170 SMs**, 96 MiB L2) · 2026-07-26 · bench `runtime/bench/nvidia/px9_gemm_body_bench.cu`
 Run under `perf-data/harness/gpulease`. Companion to PX-7; `px7_w8a8_ceiling_bench.cu` and
 `px7-w8a8-ceiling.md` are campaign records and are **left untouched** — where PX-9 corrects a
 PX-7 number it says so here rather than editing the older file.

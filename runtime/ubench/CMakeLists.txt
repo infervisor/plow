@@ -1,4 +1,4 @@
-# runtime/bench/CMakeLists.txt — Plow μBench: single-CU/SM kernel profiler.
+# runtime/ubench/CMakeLists.txt — Plow μBench: single-CU/SM kernel profiler.
 #
 # Builds:
 #   - ubench_cu_gfx950.elf    : HIP code object (benchmarks #include production op_*.h)

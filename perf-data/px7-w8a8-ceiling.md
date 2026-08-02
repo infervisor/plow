@@ -1,6 +1,6 @@
 # PX-7 — what plow's fp8 prefill GEMM is actually worth, and why 2 blocks/SM will not save it
 
-RTX 5090 (sm_120a, **170 SMs**, 96 MiB L2) · 2026-07-26 · bench `perf-data/px7_w8a8_ceiling_bench.cu`
+RTX 5090 (sm_120a, **170 SMs**, 96 MiB L2) · 2026-07-26 · bench `runtime/bench/nvidia/px7_w8a8_ceiling_bench.cu`
 Run under `perf-data/harness/gpulease`. Companion to PX-6; `px6_wavequant_bench.cu` untouched.
 
 ## Question

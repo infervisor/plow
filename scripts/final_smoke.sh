@@ -22,6 +22,6 @@ for i in $(seq 1 600); do
   curl -sf --max-time 2 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1 && { echo "ready ${i}s"; break; }
   sleep 1
 done
-PORT=$PORT bash "$WT/scratchpad_bench/concur_check.sh"
+PORT=$PORT bash "$WT/scripts/concur_check.sh"
 echo "== engine log =="
 grep -E "batch=|KV slot" "$LOG" | tail -3

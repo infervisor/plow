@@ -43,7 +43,7 @@ which is exactly the full-arm-swap condition. **No partial split ever beats simp
 
 ## Change (surgical)
 
-`perf-data/px6_wavequant_bench.cu` — new. `perf-data/gemm_occ_bench.cu` untouched (it is a campaign record). No production kernel or emitter change.
+`runtime/bench/nvidia/px6_wavequant_bench.cu` — new. `runtime/bench/nvidia/gemm_occ_bench.cu` untouched (it is a campaign record). No production kernel or emitter change.
 
 Four things px3 could not see:
 
@@ -408,9 +408,9 @@ perf-data/harness/gpulease px6-e1a /tmp/zg0bw
 
 # the campaign harness
 nvcc -arch=sm_120a -O3 -I runtime/common -I runtime/nvidia \
-     perf-data/px6_wavequant_bench.cu -o /tmp/px6
+     runtime/bench/nvidia/px6_wavequant_bench.cu -o /tmp/px6
 nvcc -arch=sm_120a -O3 -I runtime/common -I runtime/nvidia -DPGM_BN=64 \
-     perf-data/px6_wavequant_bench.cu -o /tmp/px6_bn64
+     runtime/bench/nvidia/px6_wavequant_bench.cu -o /tmp/px6_bn64
 
 perf-data/harness/gpulease px6-cliff  /tmp/px6      cliff    # null control + cliff
 perf-data/harness/gpulease px6-stair  /tmp/px6      stair    # staircase

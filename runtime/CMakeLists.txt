@@ -955,6 +955,9 @@ endif()
 # --- micro-benchmarks (μBench) -----------------------------------------------
 add_subdirectory(ubench)
 
+# --- system-level benchmarks --------------------------------------------------
+add_subdirectory(bench)
+
 # --- install ------------------------------------------------------------------
 include(GNUInstallDirs)
 install(TARGETS plow_runtime ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})

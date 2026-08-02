@@ -2,7 +2,7 @@
 
 RTX 5090 (sm_120a, 170 SMs, **101,376 B dynamic-smem cap**) · 2026-07-26 ·
 kernel `runtime/nvidia/op_attention.cuh` `d_flash_prefill_px23`, dispatch `interp_sm120.cu`
-`PLOW_DOP_FLASH_PREFILL_FP8` · bench `perf-data/px23_hd256_fp8_bench.cu`, build
+`PLOW_DOP_FLASH_PREFILL_FP8` · bench `runtime/bench/nvidia/px23_hd256_fp8_bench.cu`, build
 `perf-data/px23_build.sh`, raw `perf-data/px23-hd256-fp8-prefill-raw.txt` ·
 **every GPU run under `perf-data/harness/gpulease`**.
 

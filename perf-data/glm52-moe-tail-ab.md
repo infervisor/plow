@@ -30,7 +30,7 @@ knob. §3.1.
 `GLM_LINEAR_FP8=1` is a **+0.39 ms regression** (`glm52-decode-emitter-abs.md` §2), and the culprit
 is **not** op 44 (`o_proj`, shared down) but op 47 (`DenseGluFp8Blk`, the shared gate/up).
 Isolated, GLM TP4 shape `(imoe_l=512, K=H=6144)`, 6200 GB/s denominator
-(`perf-data/glm52_gemvblk_bench.hip`):
+(`runtime/bench/amd/glm52_gemvblk_bench.hip`):
 
 | shared gate/up | us | % of ceiling |
 |---|--:|--:|

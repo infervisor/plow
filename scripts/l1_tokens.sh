@@ -14,7 +14,7 @@ STEPS="${STEPS:-32}"
 # A MEANINGFUL prompt, not random ids. A random-id prompt makes the model emit one
 # constant token forever, and a constant stream would compare equal even if the merge
 # were subtly wrong — the gate has to be able to fail.
-PROMPT=$(python3 "$W/scratchpad_bench/l1_prompt.py")
+PROMPT=$(python3 "$W/scripts/l1_prompt.py")
 
 one() { # <label> <blob-dir> <hsaco-dir>
   local log; log=$(mktemp)

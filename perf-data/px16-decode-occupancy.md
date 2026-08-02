@@ -1,7 +1,7 @@
 # PX-16 — occupancy 2 is NOT worth pursuing for DECODE. It measures **1.07×**, and the premise it rests on is wrong in both directions.
 
 RTX 5090 (sm_120a, **170 SMs**, 96 MiB L2) · 2026-07-26
-bench `perf-data/px16_occ_bench.cu` (calls the SHIPPED `d_flash_decode<512,GF,true>` directly,
+bench `runtime/bench/nvidia/px16_occ_bench.cu` (calls the SHIPPED `d_flash_decode<512,GF,true>` directly,
 px11 style) · build `px16_build.sh` · runner `px16_run.sh` · ptxas `px16_regs.sh` /
 `px16_minblk.sh` · raw `perf-data/px16-decode-occupancy-raw.txt`
 Every GPU run under `perf-data/harness/gpulease` (labels `px16`, `px16b`, `px16c`; rc=0).
