@@ -125,6 +125,9 @@ __device__ __forceinline__ unsigned moe_bound_topk(unsigned char* table, unsigne
 #ifndef PLOW_MOE_PF_A4W4
 #define PLOW_MOE_PF_A4W4 0
 #endif
+#if PLOW_MOE_PF_A4W4 && !PLOW_HAS_MX_MMA
+#error "PLOW_MOE_PF_A4W4 requires the CDNA4 scaled f8f6f4 matrix core (gfx950). CDNA3 has no fp4."
+#endif
 /* i[3] on ops 85/86 selects the WEIGHT ENCODING at runtime, so switching a model between
  * precisions is a field change in the packet and not a re-emit (the emitter's contract). The
  * A4W4 body is still gated by the COMPILE-TIME flag above -- see the measurement in the commit
@@ -1215,8 +1218,8 @@ __device__ void d_moe_group_glu_mfma(bf16* fu, const bf16* x, const unsigned cha
                 bfg = moe_scaled_fp8x8(Wg + (size_t)n * wstr + kk, sg);
                 bfu = moe_scaled_fp8x8(Wu + (size_t)n * wstr + kk, su);
             }
-            accg = __builtin_amdgcn_mfma_f32_16x16x32_bf16(af, bfg, accg, 0, 0, 0);
-            accu = __builtin_amdgcn_mfma_f32_16x16x32_bf16(af, bfu, accu, 0, 0, 0);
+            accg = plow_mfma_bf16_16x16(af, bfg, accg);
+            accu = plow_mfma_bf16_16x16(af, bfu, accu);
         }
         if (kgrp == 0) /* lanes 0..15 hold m=0 (e=0) for the 16 output channels */
             fu[(size_t)slot * I_moe + n0 + frow] =
@@ -1725,8 +1728,7 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
                 for (int i = 0; i < SM; i++)
 #pragma unroll
                     for (int j = 0; j < SN; j++)
-                        acc[i][j] = __builtin_amdgcn_mfma_f32_32x32x16_bf16(af[i], bfr[j],
-                                                                            acc[i][j], 0, 0, 0);
+                        acc[i][j] = plow_mfma_bf16_32x32(af[i], bfr[j], acc[i][j]);
                 __builtin_amdgcn_s_setprio(0);
             }
 
@@ -1939,6 +1941,7 @@ template <bool C, class A, class B> struct mpf4_sel { using type = A; };
 template <class A, class B> struct mpf4_sel<false, A, B> { using type = B; };
 #define MPF4_ACELL typename mpf4_sel<GLU, mpf4_a32, mpf4_b16>::type
 
+#if PLOW_HAS_MX_MMA /* the scaled f8f6f4 matrix core; CDNA3 has no fp4 path */
 /* GLU=true: gate/up (A = gathered+quantized xn2, B = the expert's mxfp4 gate|up, fused bridge
  *            epilogue writes fu_g as MXFP4 + E8M0 in the SORTED layout gemm2 wants).
  * GLU=false: down    (A = fu_g, already MXFP4, staged raw; scatter epilogue to part[]). */
@@ -2318,6 +2321,7 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
 #undef MPF4_COMMIT
 #undef MPF4_MFMA
 }
+#endif /* PLOW_HAS_MX_MMA */
 
 /* --- THE PREFILL ENCODING REFUSAL ---------------------------------------------------------
  * Ops 85/86 select their body from `i[3]`, but the MXFP4 body is COMPILE-TIME
@@ -2457,5 +2461,1175 @@ __device__ void d_moe_combine_pf(bf16* out, const bf16* residual, const bf16* sh
         st_act1(&out[i], f2bf(acc));
     }
 }
+
+/* ==========================================================================================
+ * GEMMA-4 26B-A4B MoE — the AMD twins of runtime/nvidia/op_moe.cuh's `_gemma` family.
+ *                                                                        [GEMMA4-MOE-AMD]
+ *
+ * WHY THIS IS A SEPARATE FAMILY AND NOT `d_moe_router` RENAMED. The Gemma-4 router is not the
+ * generic MoE router this file already has, and the four differences are all load-bearing:
+ *
+ *   1. a WEIGHTLESS RMS over the residual (no gamma) scales the router input,
+ *   2. a PER-CHANNEL `scale[H]` multiplies it, and
+ *   3. a `root` exponent (H^-0.5) folds in with it, so the router sees
+ *          h2[h] = resid[h] * rsqrt(mean(resid^2)+eps) * scale[h] * root,
+ *   4. and the gate is `softmax -> top-k -> norm_topk -> * per_expert_scale[winner]` — a
+ *      PER-EXPERT multiplier (`pes`), where the generic router has one scalar `route_scale`.
+ *
+ * `d_moe_router` has none of those: it takes x already normalised, has no scale/root/pes
+ * operands, and its `flags` select sigmoid-vs-softmax and norm_topk. Substituting it would
+ * compile, would produce plausible logits, and would route to a DIFFERENT EXPERT SET.
+ *
+ * The EXPERT weights are also laid out differently. Gemma fuses gate and up into ONE tensor per
+ * expert, `ewt[e*2+0]` -> [2*I_moe, H] with gate rows [0,I) and up rows [I,2I), and
+ * `ewt[e*2+1]` -> down [H, I_moe]. That is a TWO-slot expert table; the generic AMD path uses a
+ * THREE-slot one ({gate, up, down}). Two ULLs per expert, not three: an off-by-one here reads
+ * another expert's weights and is finite, fluent and wrong.
+ *
+ * BIT-PARITY WITH sm_120, AND WHERE IT STOPS. Every arithmetic expression below is the sm_120
+ * body's, in the same association, with two documented exceptions that are structural to a
+ * 64-lane machine:
+ *   - block reductions fold PLOW_WAVES wave partials where sm_120 folds (nth/32) warp partials,
+ *     so `invrms` and the combine's RMS differ in the last f32 ulp;
+ *   - the vectorised wave dots partition K over 64 lanes, not 32.
+ * The SELECTION (top-k) is bit-exact by construction: it runs on one thread over an f32 score
+ * array with the same packed-key/lowest-id rule, so the expert SET is reproducible.
+ *
+ * TWO FLAGS, for the reason every other axis here has one — this interpreter inlines every arm:
+ *   PLOW_MOE_GEMMA     ops 61-72  (decode; 65/66 additionally need PLOW_FP8)
+ *   PLOW_MOE_GEMMA_PF  ops 73-77 + 81/82 (prefill; the grouped-expert MFMA body)
+ * Both default 0, so every object built before this section is byte-identical.
+ * ========================================================================================== */
+#ifndef PLOW_MOE_GEMMA
+#define PLOW_MOE_GEMMA 0
+#endif
+#ifndef PLOW_MOE_GEMMA_PF
+#define PLOW_MOE_GEMMA_PF 0
+#endif
+
+#if PLOW_MOE_GEMMA || PLOW_MOE_GEMMA_PF
+
+/* Scratch carve for every Gemma body that needs BOTH a block reduction and a working array.
+ * `sm->part` cannot serve: `plow_smem` is a union, so it aliases the arena these ops reduce
+ * OVER (interp.hip:793 records the same trap for the fused-norm GEMV). 16 floats keeps the
+ * working area 16-byte aligned for the float4-ish accesses below. */
+#define GMOE_RED(a)   (a)
+#define GMOE_WORK(a)  ((a) + 16)
+
+/* gelu_pytorch_tanh, in the same fma form as sm120_common.cuh act_gelu_tanh and op_moe.cuh
+ * plow_moe_gelu_tanh. NOT `moe_act(x, 0)`: that one spells the polynomial differently
+ * (0.5*x*(1+tanh(k*(x + 0.044715 x^3)))) and Gemma's reference is this one. Same value, and
+ * they are written separately so neither drifts onto the other's caller. */
+__device__ __forceinline__ float gmoe_gelu_tanh(float x) {
+    const float c = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+    return 0.5f * x * (1.0f + tanhf(c));
+}
+
+/* K elements one 64-lane wave consumes per vector pass: 64 lanes x 8 bf16. */
+#define GMOE_STEP (PLOW_WAVE * 8u)
+/* Independent weight loads a wave keeps in flight. 4 is the depth op_gemm.h's fp8 GEMV settled
+ * on for CDNA3; the GLU arm holds TWO streams (gate and up) so it uses half. */
+#ifndef GMOE_UNROLL
+#define GMOE_UNROLL 4
+#endif
+/* GMOE_UNROLL_GLU = 4 WAS BUILT AND A/B'd, AND THE EFFECT IS NOT THERE. Doubling the depth (8
+ * weight loads in flight instead of 4, gate and up together) was the obvious lever on the GLU
+ * arm's 26-36% of HBM peak. Alternating the two objects six times inside one GPU lease, the
+ * numbers cluster into TWO STATES — op62 0.035/op63 0.024 ms, and op62 0.046/op63 0.039 —
+ * and BOTH objects land in both, with op63 (which the unroll does not touch at all) moving in
+ * lockstep. That is the box's clock/power state, not the kernel. This is exactly the trap the
+ * branch's own A/B notes record ("the variance is probably thermal carryover — the box is
+ * SHARED"), and it is why the op-63 sub-group split below is measured INTERLEAVED in one process
+ * instead. Depth 2 stands until something can measure a difference. */
+#ifndef GMOE_UNROLL_GLU
+#define GMOE_UNROLL_GLU 2
+#endif
+
+/* bf16 dot of one output row against one activation row, reduced across a 64-lane wave.
+ * 16-byte loads, GMOE_UNROLL in flight before any is consumed — the same shape as the dense
+ * decode GEMV. K need not be a GMOE_STEP multiple: the overshoot lanes load nothing and skip. */
+__device__ __forceinline__ float gmoe_wave_dot_bf16(const bf16* x, const bf16* w, unsigned K,
+                                                    unsigned lane) {
+    const unsigned nchunk = (K + GMOE_STEP - 1u) / GMOE_STEP;
+    float acc = 0.0f;
+    for (unsigned c = 0; c < nchunk; c += GMOE_UNROLL) {
+        bf16v8 wv[GMOE_UNROLL];
+        unsigned kk[GMOE_UNROLL];
+#pragma unroll
+        for (int u = 0; u < GMOE_UNROLL; u++) {
+            kk[u] = (c + (unsigned)u) * GMOE_STEP + lane * 8u;
+            wv[u] = (kk[u] < K) ? ld_glob8(as_glob(w) + kk[u]) : bf16v8_zero();
+        }
+#pragma unroll
+        for (int u = 0; u < GMOE_UNROLL; u++) {
+            if (kk[u] >= K) continue;
+            acc = dot8(wv[u], ld_glob8(as_glob(x) + kk[u]), acc);
+        }
+    }
+    return wave_sum(acc);
+}
+
+/* Per-output-channel e4m3 twin. The weight bytes are OCP e4m3 and `fp8v8_to_bf16v8` decodes
+ * them EXACTLY (3 mantissa bits into bf16's 7) — on CDNA3 through the software OCP path in
+ * amd_arch.h, never the hardware fnuz convert. The per-channel scale is the caller's epilogue. */
+__device__ __forceinline__ float gmoe_wave_dot_fp8(const bf16* x, const unsigned char* w,
+                                                   unsigned K, unsigned lane) {
+    const unsigned nchunk = (K + GMOE_STEP - 1u) / GMOE_STEP;
+    float acc = 0.0f;
+    for (unsigned c = 0; c < nchunk; c += GMOE_UNROLL) {
+        fp8v8 wq[GMOE_UNROLL];
+        unsigned kk[GMOE_UNROLL];
+#pragma unroll
+        for (int u = 0; u < GMOE_UNROLL; u++) {
+            kk[u] = (c + (unsigned)u) * GMOE_STEP + lane * 8u;
+            wq[u] = (kk[u] < K) ? ld_glob_fp8v8(w + kk[u]) : (fp8v8)(0u);
+        }
+#pragma unroll
+        for (int u = 0; u < GMOE_UNROLL; u++) {
+            if (kk[u] >= K) continue;
+            acc = dot8(fp8v8_to_bf16v8(wq[u]), ld_glob8(as_glob(x) + kk[u]), acc);
+        }
+    }
+    return wave_sum(acc);
+}
+
+/* Per-row weightless-RMS scalars for `nrow` rows, into `inv` (an LDS carve). Identical
+ * reduction shape to the single-row bodies below, so a batched row is bit-identical to its
+ * own B=1 result. */
+__device__ __forceinline__ void gmoe_row_rms(float* inv, float* red, const bf16* resid,
+                                             unsigned H, unsigned nrow, float eps) {
+    for (unsigned r = 0; r < nrow; r++) {
+        const bf16* rr = resid + (size_t)r * H;
+        float part = 0.0f;
+        for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+            const float v = bf2f(rr[h]);
+            part += v * v;
+        }
+        const float s = block_sum(part, red);
+        if (threadIdx.x == 0) inv[r] = rsqrtf(s / (float)H + eps);
+        __syncthreads();
+    }
+}
+
+/* The softmax -> top-k -> norm_topk -> per-expert-scale tail, on ONE thread, over an f32
+ * score array it owns. Shared by the fused router (op 61), the split TOPK tail (op 68) and the
+ * T-token prefill router (op 73) so the three cannot drift.
+ *
+ * `sc` is CONSUMED (turned into probabilities, then killed entry by entry). The routing-table
+ * slots are the win/gate scratch, exactly as op_moe.cuh does it. */
+__device__ __forceinline__ void gmoe_softmax_topk_tail(unsigned char* table, float* sc,
+                                                       const bf16* pes, unsigned n_exp,
+                                                       unsigned k) {
+    float m = -1e30f;
+    for (unsigned e = 0; e < n_exp; e++) m = fmaxf(m, sc[e]);
+    float s = 0.0f;
+    for (unsigned e = 0; e < n_exp; e++) { sc[e] = __expf(sc[e] - m); s += sc[e]; }
+    for (unsigned e = 0; e < n_exp; e++) sc[e] /= s; /* prob */
+
+    for (unsigned j = 0; j < k; j++) {
+        unsigned long long best = 0ull;
+        unsigned bid = 0;
+        for (unsigned e = 0; e < n_exp; e++) {
+            unsigned sb;
+            const float scv = sc[e];
+            __builtin_memcpy(&sb, &scv, 4);
+            sb = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u); /* monotone f32 -> u32 */
+            const unsigned long long key =
+                ((unsigned long long)sb << 20) | (unsigned long long)((n_exp - 1u - e) & 0xFFFFFu);
+            if (key > best) { best = key; bid = e; }
+        }
+        *(unsigned*)(table + (size_t)j * 8) = bid;
+        *(float*)(table + (size_t)j * 8 + 4) = sc[bid];
+        sc[bid] = -1e30f; /* kill so the next pass cannot re-pick it */
+    }
+    float gs = 0.0f;
+    for (unsigned j = 0; j < k; j++) gs += *(float*)(table + (size_t)j * 8 + 4);
+    for (unsigned j = 0; j < k; j++) {
+        const unsigned win = *(unsigned*)(table + (size_t)j * 8);
+        float gate = *(float*)(table + (size_t)j * 8 + 4);
+        if (gs != 0.0f) gate /= gs;      /* norm_topk — always on for Gemma */
+        gate *= bf2f(pes[win]);          /* PER-EXPERT scale, not a scalar route_scale */
+        *(float*)(table + (size_t)j * 8 + 4) = gate;
+    }
+}
+#endif /* PLOW_MOE_GEMMA || PLOW_MOE_GEMMA_PF */
+
+#if PLOW_MOE_GEMMA || PLOW_MOE_GEMMA_PF
+/* --- ONE ROW of the fused router (op 61 / op 73) ------------------------------------------
+ *   r     = weightless_rms(resid)
+ *   h2[h] = r[h] * scale[h] * root
+ *   sc[e] = sum_h h2[h] * proj[e][h]          (WAVE per expert; f32 tree)
+ *   table = softmax -> top-k(lowest-id tie) -> norm_topk -> * pes[winner]
+ * `arena` holds red[16] | h2[H] | sc[n_exp]. */
+__device__ void d_moe_router_gemma_row(unsigned char* table, const bf16* resid, const bf16* proj,
+                                       const bf16* scale, const bf16* pes, unsigned H,
+                                       unsigned n_exp, unsigned k, float root, float eps,
+                                       float* arena) {
+    float* red = GMOE_RED(arena);
+    float* h2 = GMOE_WORK(arena);
+    float* sc = h2 + H;
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+
+    float part = 0.0f;
+    for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+        const float v = bf2f(resid[h]);
+        part += v * v;
+    }
+    const float ss = block_sum(part, red);
+    const float invrms = rsqrtf(ss / (float)H + eps);
+
+    for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS)
+        h2[h] = bf2f(resid[h]) * invrms * bf2f(scale[h]) * root;
+    __syncthreads();
+
+    /* WAVE per expert: consecutive lanes read consecutive h (coalesced), and all PLOW_WAVES
+     * waves stay busy. The sm_120 decode body assigns one SCALAR THREAD per expert, whose
+     * global loads are strided by H and fully uncoalesced; its own prefill twin (op 73) already
+     * moved to warp-per-expert for exactly this reason, so this is the shape that survived. */
+    for (unsigned e = wave; e < n_exp; e += PLOW_WAVES) {
+        const bf16* pr = proj + (size_t)e * H;
+        float acc = 0.0f;
+        for (unsigned h = lane; h < H; h += PLOW_WAVE) acc = __builtin_fmaf(h2[h], bf2f(pr[h]), acc);
+        acc = wave_sum(acc);
+        if (lane == 0) sc[e] = acc;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) gmoe_softmax_topk_tail(table, sc, pes, n_exp, k);
+    __syncthreads(); /* arena is reused by the next row */
+}
+#endif
+
+#if PLOW_MOE_GEMMA
+/* --- op 61: PLOW_DOP_MOE_ROUTER_GEMMA -----------------------------------------------------
+ * Blocks stride the B batched rows; table/resid rows are [B][k]/[B][H]. */
+__device__ void d_moe_router_gemma(unsigned char* table, const bf16* resid, const bf16* proj,
+                                   const bf16* scale, const bf16* pes, unsigned H, unsigned n_exp,
+                                   unsigned k, float root, float eps, unsigned slice,
+                                   unsigned nblk, unsigned nrow, float* arena) {
+    const unsigned stride = nblk ? nblk : 1u;
+    for (unsigned row = slice; row < nrow; row += stride)
+        d_moe_router_gemma_row(table + (size_t)row * k * 8, resid + (size_t)row * H, proj, scale,
+                               pes, H, n_exp, k, root, eps, arena);
+}
+
+/* --- op 67: PLOW_DOP_MOE_ROUTER_GEMMA_SCORE (the EXACT scorer) ----------------------------
+ * One wave per (row, expert) pair. Lanes read adjacent residual/scale/projection elements, then
+ * LANE 0 consumes them through shuffles IN INCREASING HIDDEN-INDEX ORDER — so the fmaf chain is
+ * the legacy scalar dot's, element for element, while the loads stay coalesced. That ordered
+ * replay is the whole point of this opcode; op 69 is the fast twin that gives it up.
+ *
+ * The weightless-RMS scalar is intentionally recomputed by every block: it is 2*H bf16 bytes,
+ * L2-hot, and it avoids a third packet and a global-scratch gate. */
+__device__ void d_moe_router_gemma_score(float* score, const bf16* resid, const bf16* proj,
+                                         const bf16* scale, unsigned H, unsigned n_exp, float root,
+                                         float eps, unsigned slice, unsigned nblk, unsigned nrow,
+                                         float* arena) {
+    float* red = GMOE_RED(arena);
+    float* invs = GMOE_WORK(arena);
+    gmoe_row_rms(invs, red, resid, H, nrow, eps);
+
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned npair = nrow * n_exp;
+    for (unsigned idx = slice * PLOW_WAVES + wave; idx < npair; idx += nblk * PLOW_WAVES) {
+        const unsigned row = idx / n_exp;
+        const unsigned e = idx - row * n_exp;
+        const bf16* rr = resid + (size_t)row * H;
+        const bf16* pr = proj + (size_t)e * H;
+        const float invrms = invs[row];
+        float acc = 0.0f;
+        for (unsigned h0 = 0; h0 < H; h0 += PLOW_WAVE) {
+            const unsigned h = h0 + lane;
+            float term_h2 = 0.0f, term_w = 0.0f;
+            if (h < H) {
+                term_h2 = bf2f(rr[h]) * invrms * bf2f(scale[h]) * root;
+                term_w = bf2f(pr[h]);
+            }
+#pragma unroll 8
+            for (unsigned src = 0; src < PLOW_WAVE; src++) {
+                const float a = __shfl(term_h2, (int)src, PLOW_WAVE);
+                const float b = __shfl(term_w, (int)src, PLOW_WAVE);
+                if (lane == 0 && h0 + src < H) acc = __builtin_fmaf(a, b, acc);
+            }
+        }
+        if (lane == 0) score[(size_t)row * n_exp + e] = acc;
+    }
+}
+
+/* --- op 69: PLOW_DOP_MOE_ROUTER_GEMMA_SCORE_FAST -----------------------------------------
+ * Association-CHANGING twin of op 67: same block/expert mapping and the same RMS transform, but
+ * an ordinary strided lane dot plus a wave reduction replaces the ordered shuffle replay. Kept a
+ * DISTINCT opcode so a fast experiment can never silently change an exact packet. */
+__device__ void d_moe_router_gemma_score_fast(float* score, const bf16* resid, const bf16* proj,
+                                              const bf16* scale, unsigned H, unsigned n_exp,
+                                              float root, float eps, unsigned slice, unsigned nblk,
+                                              unsigned nrow, float* arena) {
+    float* red = GMOE_RED(arena);
+    float* invs = GMOE_WORK(arena);
+    gmoe_row_rms(invs, red, resid, H, nrow, eps);
+
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned npair = nrow * n_exp;
+    for (unsigned idx = slice * PLOW_WAVES + wave; idx < npair; idx += nblk * PLOW_WAVES) {
+        const unsigned row = idx / n_exp;
+        const unsigned e = idx - row * n_exp;
+        const bf16* rr = resid + (size_t)row * H;
+        const bf16* pr = proj + (size_t)e * H;
+        const float invrms = invs[row];
+        float acc = 0.0f;
+        for (unsigned h = lane; h < H; h += PLOW_WAVE)
+            acc = __builtin_fmaf(bf2f(rr[h]) * invrms * bf2f(scale[h]) * root, bf2f(pr[h]), acc);
+        acc = wave_sum(acc);
+        if (lane == 0) score[(size_t)row * n_exp + e] = acc;
+    }
+}
+
+/* --- op 68: PLOW_DOP_MOE_ROUTER_GEMMA_TOPK ------------------------------------------------
+ * The tail of the split router: one block per row (blocks stride B), the serial
+ * softmax/selection/norm/per-expert-scale order preserved verbatim. */
+__device__ void d_moe_router_gemma_topk(unsigned char* table, const float* score, const bf16* pes,
+                                        unsigned n_exp, unsigned k, unsigned slice, unsigned nblk,
+                                        unsigned nrow, float* arena) {
+    float* sc = GMOE_WORK(arena);
+    const unsigned stride = nblk ? nblk : 1u;
+    for (unsigned row = slice; row < nrow; row += stride) {
+        for (unsigned e = threadIdx.x; e < n_exp; e += PLOW_THREADS)
+            sc[e] = score[(size_t)row * n_exp + e];
+        __syncthreads();
+        if (threadIdx.x == 0)
+            gmoe_softmax_topk_tail(table + (size_t)row * k * 8, sc, pes, n_exp, k);
+        __syncthreads(); /* arena reused by the next row */
+    }
+}
+
+/* --- op 62: PLOW_DOP_MOE_EXPERT_GLU_GEMMA -------------------------------------------------
+ * fu[slot][n] = gelu_tanh(gate_e . x) * (up_e . x), FUSED gate_up weight: gate row n at
+ * ewt[e*2+0] + n*H, up row n at the SAME base + (I_moe+n)*H. One WAVE per (slot, channel).
+ * A skipped slot (sentinel id, or a null base under expert parallelism) writes nothing —
+ * the DOWN op zeroes its partial, so the combine still sums a deterministic zero.
+ * B>1: x is [B][H], table [B][k], fu [B][k][I_moe]; the sweep is over the B*k slots. */
+__device__ void d_moe_expert_glu_gemma(bf16* fu, const bf16* x, const unsigned char* table,
+                                       const unsigned long long* ewt, unsigned k, unsigned I_moe,
+                                       unsigned H, unsigned n_exp, unsigned slice, unsigned nblk,
+                                       unsigned nrow) {
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned nslot = nrow * k;
+    const unsigned total = nslot * I_moe;
+    const unsigned nchunk = (H + GMOE_STEP - 1u) / GMOE_STEP;
+
+    for (unsigned f = slice * PLOW_WAVES + wave; f < total; f += nblk * PLOW_WAVES) {
+        /* CHANNEL-MAJOR at B>1 so slots sharing an expert hit its weight rows in L2 instead of
+         * re-reading HBM; slot-major at B==1, which is what the single-row packet emits. */
+        unsigned slot, n;
+        if (nrow == 1u) { slot = f / I_moe; n = f - slot * I_moe; }
+        else            { n = f / nslot;    slot = f - n * nslot; }
+        const unsigned eid = moe_slot_expert(table, slot);
+        if (eid >= n_exp) continue;
+        const unsigned long long gub = ewt[(size_t)eid * 2 + 0];
+        if (gub == 0ull) continue;
+        const bf16* gu = (const bf16*)(size_t)gub;
+        const bf16* grow = gu + (size_t)n * H;
+        const bf16* urow = gu + (size_t)(I_moe + n) * H;
+        const bf16* xr = x + (size_t)(slot / k) * H;
+        float ag = 0.0f, au = 0.0f;
+        for (unsigned c = 0; c < nchunk; c += GMOE_UNROLL_GLU) {
+            bf16v8 gv[GMOE_UNROLL_GLU], uv[GMOE_UNROLL_GLU];
+            unsigned kk[GMOE_UNROLL_GLU];
+#pragma unroll
+            for (int i = 0; i < GMOE_UNROLL_GLU; i++) {
+                kk[i] = (c + (unsigned)i) * GMOE_STEP + lane * 8u;
+                gv[i] = (kk[i] < H) ? ld_glob8(as_glob(grow) + kk[i]) : bf16v8_zero();
+            }
+#pragma unroll
+            for (int i = 0; i < GMOE_UNROLL_GLU; i++)
+                uv[i] = (kk[i] < H) ? ld_glob8(as_glob(urow) + kk[i]) : bf16v8_zero();
+#pragma unroll
+            for (int i = 0; i < GMOE_UNROLL_GLU; i++) {
+                if (kk[i] >= H) continue;
+                const bf16v8 xv = ld_glob8(as_glob(xr) + kk[i]);
+                ag = dot8(gv[i], xv, ag);
+                au = dot8(uv[i], xv, au);
+            }
+        }
+        const float g = wave_sum(ag), u = wave_sum(au);
+        if (lane == 0) fu[(size_t)slot * I_moe + n] = f2bf(gmoe_gelu_tanh(g) * u);
+    }
+}
+
+/* --- op 71: PLOW_DOP_MOE_EXPERT_GLU_NORM_GEMMA --------------------------------------------
+ * op 62 with the pre-FFN RMSNorm FUSED IN: takes the RAW residual plus gamma and forms
+ * xn = resid * rsqrt(mean(resid^2)+eps) * gamma once per block, in the arena, instead of a
+ * separate RmsNorm packet and its counter gate. Staging xn is what makes the fusion free: the
+ * unfused sm_120 body recomputes it from global for EVERY output channel — 5632 channels x
+ * H=2816 of redundant reads per layer.
+ *
+ * xn IS STAGED AS f32, NOT bf16, AND THAT COSTS NOTHING ON CDNA3. The bf16 staging is what the
+ * H100 twin does (op_moe.cuh's PLOW_MOE_XN_BF16) and it was tried here first; it MEASURED an
+ * 8x relative error on the small-magnitude outputs, because gelu_tanh(g) is a cancellation for
+ * g < 0 — the whole output is act(g)*u, so a 2^-9 perturbation of every xn element lands
+ * amplified wherever act(g) is near zero. That is a real accuracy loss, not a tolerance
+ * question, and it is avoidable HERE: CDNA3 has no packed bf16 dot (amd_arch.h), so
+ * `plow_dot2_bf16` already widens both operands to f32 — feeding an f32 activation skips a
+ * widening rather than adding one. `gmoe_dot8_wx` below is that dot.
+ *
+ * The f32 row is 4 bytes/element, so a wide batch will not fit the arena; past GMOE_XN_MAX_F
+ * the body falls back to recomputing xn per output channel, which is the sm_120 default body's
+ * shape — slower, same numbers, and it is the path any nrow beyond the arena takes. */
+#ifndef GMOE_XN_MAX_F
+#define GMOE_XN_MAX_F 8192u
+#endif
+
+/* dot8 against an f32 activation. On CDNA3 this is CHEAPER than dot8: plow_dot2_bf16's gfx942
+ * arm bit-casts both bf16 operands up to f32 and issues two FMAs, so half that work is already
+ * done here. */
+__device__ __forceinline__ float gmoe_dot8_wx(bf16v8 w, const float* xs, float acc) {
+#pragma unroll
+    for (int j = 0; j < 8; j++) acc = __builtin_fmaf(bf2f(w[j]), xs[j], acc);
+    return acc;
+}
+
+__device__ void d_moe_expert_glu_norm_gemma(bf16* fu, const bf16* resid, const bf16* gamma,
+                                            const unsigned char* table,
+                                            const unsigned long long* ewt, unsigned k,
+                                            unsigned I_moe, unsigned H, unsigned n_exp, float eps,
+                                            unsigned slice, unsigned nblk, unsigned nrow,
+                                            bf16* arena) {
+    float* red = (float*)arena;
+    float* invs = (float*)arena + 16;
+    float* xn = invs + ((nrow + 3u) & ~3u);
+    const bool staged = (size_t)nrow * H <= GMOE_XN_MAX_F;
+    gmoe_row_rms(invs, red, resid, H, nrow, eps);
+    if (staged) {
+        for (unsigned i = threadIdx.x; i < nrow * H; i += PLOW_THREADS) {
+            const unsigned r = i / H, h = i - r * H;
+            xn[i] = bf2f(resid[i]) * invs[r] * bf2f(gamma[h]);
+        }
+    }
+    __syncthreads();
+
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned nslot = nrow * k;
+    const unsigned total = nslot * I_moe;
+    const unsigned nchunk = (H + GMOE_STEP - 1u) / GMOE_STEP;
+    for (unsigned f = slice * PLOW_WAVES + wave; f < total; f += nblk * PLOW_WAVES) {
+        unsigned slot, n;
+        if (nrow == 1u) { slot = f / I_moe; n = f - slot * I_moe; }
+        else            { n = f / nslot;    slot = f - n * nslot; }
+        const unsigned eid = moe_slot_expert(table, slot);
+        if (eid >= n_exp) continue;
+        const unsigned long long gub = ewt[(size_t)eid * 2 + 0];
+        if (gub == 0ull) continue;
+        const bf16* gu = (const bf16*)(size_t)gub;
+        const bf16* grow = gu + (size_t)n * H;
+        const bf16* urow = gu + (size_t)(I_moe + n) * H;
+        const unsigned row = slot / k;
+        float ag = 0.0f, au = 0.0f;
+        if (staged) {
+            const float* xr = xn + (size_t)row * H;
+            for (unsigned c = 0; c < nchunk; c += GMOE_UNROLL_GLU) {
+                bf16v8 gv[GMOE_UNROLL_GLU], uv[GMOE_UNROLL_GLU];
+                unsigned kk[GMOE_UNROLL_GLU];
+#pragma unroll
+                for (int i = 0; i < GMOE_UNROLL_GLU; i++) {
+                    kk[i] = (c + (unsigned)i) * GMOE_STEP + lane * 8u;
+                    gv[i] = (kk[i] < H) ? ld_glob8(as_glob(grow) + kk[i]) : bf16v8_zero();
+                }
+#pragma unroll
+                for (int i = 0; i < GMOE_UNROLL_GLU; i++)
+                    uv[i] = (kk[i] < H) ? ld_glob8(as_glob(urow) + kk[i]) : bf16v8_zero();
+#pragma unroll
+                for (int i = 0; i < GMOE_UNROLL_GLU; i++) {
+                    if (kk[i] >= H) continue;
+                    ag = gmoe_dot8_wx(gv[i], xr + kk[i], ag);
+                    au = gmoe_dot8_wx(uv[i], xr + kk[i], au);
+                }
+            }
+        } else {
+            const bf16* rr = resid + (size_t)row * H;
+            const float inv = invs[row];
+            for (unsigned h = lane; h < H; h += PLOW_WAVE) {
+                const float xv = bf2f(rr[h]) * inv * bf2f(gamma[h]);
+                ag = __builtin_fmaf(xv, bf2f(grow[h]), ag);
+                au = __builtin_fmaf(xv, bf2f(urow[h]), au);
+            }
+        }
+        const float g = wave_sum(ag), u = wave_sum(au);
+        if (lane == 0) fu[(size_t)slot * I_moe + n] = f2bf(gmoe_gelu_tanh(g) * u);
+    }
+}
+
+/* --- op 63: PLOW_DOP_MOE_EXPERT_DOWN_GEMMA ------------------------------------------------
+ * part[slot][h] = gate_slot * (down_e[h] . fu[slot]), f32, FIXED slot order so the combine is
+ * a deterministic sum. A skipped slot writes an explicit 0.0f — the interpreter's dispatch
+ * default writes nothing, so an unwritten partial is indistinguishable from a dead op.
+ *
+ * SUB-GROUP SPLIT, and the reason is a MEASUREMENT, not symmetry with the GLU arm. DOWN has a
+ * SHORT K: I_moe = 704 against a 64-lane wave's 512-element vector pass, so a whole-wave dot
+ * runs TWO chunks of which the second is 37% used, and the per-row overhead (expert lookup, a
+ * 6-step wave reduction) is amortised over almost nothing. Measured on MI300X at the real shape
+ * it was the WORST arm in the block: 663-994 GB/s where the GLU arm reaches 1400-1900.
+ *
+ * So split the wave into GMOE_DOWN_SG sub-groups, one output channel each: GMOE_DOWN_SG rows in
+ * flight per wave with ONE accumulator per lane (no wv[][] array at all), each lane getting a
+ * longer contiguous run, and a reduction that is log2(64/SG) steps instead of 6.
+ *
+ * SG = 8 (eight lanes per sub-group, 64 K-elements per sub-group pass) IS FORCED BY THE SHAPE.
+ * The obvious SG = 4 gives 16 lanes and a 128-element pass, and 704 % 128 = 64 — a partial pass
+ * on every row, which is what this is trying to remove. 704 = 11 * 64 divides exactly at SG = 8.
+ * The guard below falls back to the whole-wave dot on any K that does not divide, so a different
+ * model's I_moe is slower, never wrong.
+ *
+ * NUMERICALLY EQUIVALENT, NOT BIT-IDENTICAL: an 8-lane reduction tree sums the K partition in a
+ * different order than a 64-lane one. The CPU reference is a sequential f32 dot either way. */
+#ifndef GMOE_DOWN_SG
+#define GMOE_DOWN_SG 8u
+#endif
+#define GMOE_DOWN_SL (PLOW_WAVE / GMOE_DOWN_SG) /* lanes per sub-group */
+#define GMOE_DOWN_CH (GMOE_DOWN_SL * 8u)        /* K elements a sub-group covers per pass */
+
+/* The WHOLE-WAVE arm: one output channel per 64-lane wave. Kept as its own function, not folded
+ * into an `else`, because it is the A/B NEGATIVE CONTROL for the sub-group split above — a
+ * standalone wrapper drives it (test_kernels.hip) so the two can be timed INTERLEAVED in one
+ * process. On a shared box that is the only way the comparison means anything; the same
+ * discipline the branch's `a6df46a` A/B harness records. It is also the live path for any I_moe
+ * the split does not divide. */
+__device__ void d_moe_expert_down_gemma_wave(float* part, const bf16* fu,
+                                             const unsigned char* table,
+                                             const unsigned long long* ewt, unsigned k, unsigned H,
+                                             unsigned I_moe, unsigned n_exp, unsigned slice,
+                                             unsigned nblk, unsigned nrow) {
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned nslot = nrow * k;
+    const unsigned total = nslot * H;
+    for (unsigned f = slice * PLOW_WAVES + wave; f < total; f += nblk * PLOW_WAVES) {
+        unsigned slot, h;
+        if (nrow == 1u) { slot = f / H; h = f - slot * H; }
+        else            { h = f / nslot; slot = f - h * nslot; }
+        const unsigned eid = moe_slot_expert(table, slot);
+        float* pslot = part + (size_t)slot * H;
+        const unsigned long long db = (eid < n_exp) ? ewt[(size_t)eid * 2 + 1] : 0ull;
+        if (db == 0ull) {
+            if (lane == 0) pslot[h] = 0.0f; /* deterministic zero partial */
+            continue;
+        }
+        const bf16* Wd = (const bf16*)(size_t)db;
+        const float y = gmoe_wave_dot_bf16(fu + (size_t)slot * I_moe, Wd + (size_t)h * I_moe,
+                                           I_moe, lane);
+        if (lane == 0) pslot[h] = moe_slot_gate(table, slot) * y;
+    }
+}
+
+__device__ void d_moe_expert_down_gemma(float* part, const bf16* fu, const unsigned char* table,
+                                        const unsigned long long* ewt, unsigned k, unsigned H,
+                                        unsigned I_moe, unsigned n_exp, unsigned slice,
+                                        unsigned nblk, unsigned nrow) {
+    if ((I_moe % GMOE_DOWN_CH) != 0u) { /* a K the split does not divide: the whole-wave arm */
+        d_moe_expert_down_gemma_wave(part, fu, table, ewt, k, H, I_moe, n_exp, slice, nblk, nrow);
+        return;
+    }
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned nslot = nrow * k;
+    const unsigned total = nslot * H;
+    {
+        const unsigned sg = lane / GMOE_DOWN_SL, sl = lane % GMOE_DOWN_SL;
+        const unsigned nch = I_moe / GMOE_DOWN_CH;
+        for (unsigned fb = (slice * PLOW_WAVES + wave) * GMOE_DOWN_SG; fb < total;
+             fb += nblk * PLOW_WAVES * GMOE_DOWN_SG) {
+            const unsigned f = fb + sg;
+            bool valid = false, live = false;
+            float gate = 0.0f;
+            float* dst = nullptr;
+            const bf16* wr = nullptr;
+            const bf16* xr = nullptr;
+            if (f < total) {
+                valid = true;
+                unsigned slot, h;
+                if (nrow == 1u) { slot = f / H; h = f - slot * H; }
+                else            { h = f / nslot; slot = f - h * nslot; }
+                dst = part + (size_t)slot * H + h;
+                const unsigned eid = moe_slot_expert(table, slot);
+                const unsigned long long db = (eid < n_exp) ? ewt[(size_t)eid * 2 + 1] : 0ull;
+                if (db != 0ull) {
+                    live = true;
+                    gate = moe_slot_gate(table, slot);
+                    wr = (const bf16*)(size_t)db + (size_t)h * I_moe;
+                    xr = fu + (size_t)slot * I_moe;
+                }
+            }
+            float acc = 0.0f;
+            if (live) {
+                unsigned c = 0;
+                for (; c + 2u <= nch; c += 2u) { /* two passes pre-issued */
+                    const unsigned k0 = c * GMOE_DOWN_CH + sl * 8u;
+                    const unsigned k1 = (c + 1u) * GMOE_DOWN_CH + sl * 8u;
+                    const bf16v8 w0 = ld_glob8(as_glob(wr) + k0), w1 = ld_glob8(as_glob(wr) + k1);
+                    const bf16v8 x0 = ld_glob8(as_glob(xr) + k0), x1 = ld_glob8(as_glob(xr) + k1);
+                    acc = dot8(w0, x0, acc);
+                    acc = dot8(w1, x1, acc);
+                }
+                for (; c < nch; c++) {
+                    const unsigned k0 = c * GMOE_DOWN_CH + sl * 8u;
+                    acc = dot8(ld_glob8(as_glob(wr) + k0), ld_glob8(as_glob(xr) + k0), acc);
+                }
+            }
+#pragma unroll
+            for (int o = 1; o < (int)GMOE_DOWN_SL; o <<= 1) acc += __shfl_xor(acc, o, PLOW_WAVE);
+            if (sl == 0u && valid) *dst = live ? gate * acc : 0.0f;
+        }
+    }
+}
+
+/* --- op 64: PLOW_DOP_MOE_COMBINE_GEMMA ----------------------------------------------------
+ * moe[h] = sum_slot part[slot][h], f32 in fixed slot order, rounded to bf16. Gemma's own
+ * post-norms / residual / layer_scalar are ordinary norm+residual ops (or op 70/72 below). */
+__device__ void d_moe_combine_gemma(bf16* moe, const float* part, unsigned H, unsigned k,
+                                    unsigned slice, unsigned nblk) {
+    const unsigned gid = slice * PLOW_THREADS + threadIdx.x;
+    const unsigned stride = nblk * PLOW_THREADS;
+    for (unsigned h = gid; h < H; h += stride) {
+        float acc = 0.0f;
+        for (unsigned slot = 0; slot < k; slot++) acc += part[(size_t)slot * H + h];
+        st_act1(&moe[h], f2bf(acc));
+    }
+}
+
+/* --- op 70: PLOW_DOP_MOE_COMBINE_NORM_GEMMA -----------------------------------------------
+ *   sum[h] = Σ_slot part[slot][h]                                  (f32 combine)
+ *   out[h] = sum[h] * rsqrt(mean(sum^2)+eps) * gamma[h] + resid[h] (norm + residual)
+ * Replaces the three-op tail (combine -> RmsNorm -> Residual) and its two counter gates.
+ * ONE BLOCK PER ROW (blocks stride B), so each row is bit-identical to its own B=1 result. */
+__device__ void d_moe_combine_norm_gemma(bf16* out, const float* part, const bf16* resid,
+                                         const bf16* gamma, unsigned H, unsigned k, float eps,
+                                         unsigned slice, unsigned nblk, unsigned nrow,
+                                         float* arena) {
+    float* red = GMOE_RED(arena);
+    float* acc = GMOE_WORK(arena);
+    const unsigned stride = nblk ? nblk : 1u;
+    for (unsigned row = slice; row < nrow; row += stride) {
+        const float* pt = part + (size_t)row * k * H;
+        const bf16* res = resid + (size_t)row * H;
+        bf16* o = out + (size_t)row * H;
+        float ss = 0.0f;
+        for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+            float a = 0.0f;
+            for (unsigned slot = 0; slot < k; slot++) a += pt[(size_t)slot * H + h];
+            acc[h] = a;
+            ss += a * a;
+        }
+        const float t = block_sum(ss, red);
+        const float inv = rsqrtf(t / (float)H + eps);
+        for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS)
+            st_act1(&o[h], f2bf(acc[h] * inv * bf2f(gamma[h]) + bf2f(res[h])));
+        __syncthreads(); /* arena reused by the next row */
+    }
+}
+
+/* --- op 72: PLOW_DOP_MOE_COMBINE_RESID_NORM_GEMMA -----------------------------------------
+ * The whole MoE layer tail in ONE packet — (op 70 -> NormResidualNorm):
+ *   b  = h1 + RMSNorm(Σ_slot part, g_pf2)
+ *   x  = (x + RMSNorm(b, g_po)) * ls        (the running residual, ROUNDED to bf16)
+ *   hn = RMSNorm(x, gn)                      (the next sublayer's input)
+ * BIT-EXACT to the pair it replaces: b and the new residual are rounded to bf16 before the
+ * next reduction reads them, reproducing the two ops' HBM round trips without the traffic.
+ * ONE block. `arena` holds red[16] + one f32[H] staging row, overwritten pass to pass. */
+__device__ void d_moe_combine_resid_norm_gemma(bf16* hn, bf16* x, const float* part,
+                                               const bf16* h1, const bf16* g_pf2,
+                                               const bf16* g_po, const bf16* gn, unsigned H,
+                                               unsigned k, float eps, float ls, unsigned slice,
+                                               float* arena) {
+    if (slice != 0) return;
+    float* red = GMOE_RED(arena);
+    float* w = GMOE_WORK(arena);
+
+    float ss = 0.0f;
+    for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+        float a = 0.0f;
+        for (unsigned slot = 0; slot < k; slot++) a += part[(size_t)slot * H + h];
+        w[h] = a;
+        ss += a * a;
+    }
+    const float inv1 = rsqrtf(block_sum(ss, red) / (float)H + eps);
+
+    ss = 0.0f;
+    for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+        const bf16 bh = f2bf(w[h] * inv1 * bf2f(g_pf2[h]) + bf2f(h1[h]));
+        const float bf = bf2f(bh);
+        w[h] = bf;
+        ss += bf * bf;
+    }
+    __syncthreads();
+    const float inv2 = rsqrtf(block_sum(ss, red) / (float)H + eps);
+
+    ss = 0.0f;
+    for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+        const float rf = bf2f(f2bf((bf2f(x[h]) + w[h] * inv2 * bf2f(g_po[h])) * ls));
+        w[h] = rf;
+        ss += rf * rf;
+    }
+    __syncthreads();
+    const float inv3 = rsqrtf(block_sum(ss, red) / (float)H + eps);
+
+    for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+        const float rf = w[h];
+        st_act1(&x[h], f2bf(rf));
+        st_act1(&hn[h], f2bf(rf * inv3 * bf2f(gn[h])));
+    }
+}
+#endif /* PLOW_MOE_GEMMA */
+
+#if PLOW_MOE_GEMMA
+/* --- ops 65 / 66: PER-OUTPUT-CHANNEL e4m3 GEMMA EXPERTS -----------------------------------
+ * The offline quantizer stores one e4m3 row scale per output channel, so the scale factors OUT
+ * of the K reduction. `ewt` points at the fp8 gate_up / down rows and `est` at their f32 row
+ * scales ([2*I_moe] for gate_up, [H] for down), per expert. The fused gate_up layout, the
+ * gelu_tanh epilogue and the sentinel-skip rule are the bf16 bodies', unchanged.
+ *
+ * THE BYTES ARE OCP e4m3 AND CDNA3's CONVERTER IS NOT. Everything here goes through
+ * fp8v8_to_bf16v8, which on gfx942 takes amd_arch.h's software OCP path; calling
+ * __builtin_amdgcn_cvt_*_fp8 directly would halve every weight and turn every -0 into a NaN. */
+__device__ void d_moe_expert_glu_gemma_fp8(bf16* fu, const bf16* x, const unsigned char* table,
+                                           const unsigned long long* ewt,
+                                           const unsigned long long* est, unsigned k,
+                                           unsigned I_moe, unsigned H, unsigned n_exp,
+                                           unsigned slice, unsigned nblk, unsigned nrow) {
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned nslot = nrow * k;
+    const unsigned total = nslot * I_moe;
+    const unsigned nchunk = (H + GMOE_STEP - 1u) / GMOE_STEP;
+    for (unsigned f = slice * PLOW_WAVES + wave; f < total; f += nblk * PLOW_WAVES) {
+        unsigned slot, n;
+        if (nrow == 1u) { slot = f / I_moe; n = f - slot * I_moe; }
+        else            { n = f / nslot;    slot = f - n * nslot; }
+        const unsigned eid = moe_slot_expert(table, slot);
+        if (eid >= n_exp) continue;
+        const unsigned long long wb = ewt[(size_t)eid * 2 + 0];
+        const unsigned long long sb = est[(size_t)eid * 2 + 0];
+        if (wb == 0ull || sb == 0ull) continue;
+        const unsigned char* gw = (const unsigned char*)(size_t)wb;
+        const unsigned char* grow = gw + (size_t)n * H;
+        const unsigned char* urow = gw + (size_t)(I_moe + n) * H;
+        const float* sc = (const float*)(size_t)sb;
+        const bf16* xr = x + (size_t)(slot / k) * H;
+        float ag = 0.0f, au = 0.0f;
+        for (unsigned c = 0; c < nchunk; c += GMOE_UNROLL_GLU) {
+            fp8v8 gq[GMOE_UNROLL_GLU], uq[GMOE_UNROLL_GLU];
+            unsigned kk[GMOE_UNROLL_GLU];
+#pragma unroll
+            for (int i = 0; i < GMOE_UNROLL_GLU; i++) {
+                kk[i] = (c + (unsigned)i) * GMOE_STEP + lane * 8u;
+                gq[i] = (kk[i] < H) ? ld_glob_fp8v8(grow + kk[i]) : (fp8v8)(0u);
+                uq[i] = (kk[i] < H) ? ld_glob_fp8v8(urow + kk[i]) : (fp8v8)(0u);
+            }
+#pragma unroll
+            for (int i = 0; i < GMOE_UNROLL_GLU; i++) {
+                if (kk[i] >= H) continue;
+                const bf16v8 xv = ld_glob8(as_glob(xr) + kk[i]);
+                ag = dot8(fp8v8_to_bf16v8(gq[i]), xv, ag);
+                au = dot8(fp8v8_to_bf16v8(uq[i]), xv, au);
+            }
+        }
+        const float g = wave_sum(ag) * sc[n];
+        const float u = wave_sum(au) * sc[I_moe + n];
+        if (lane == 0) fu[(size_t)slot * I_moe + n] = f2bf(gmoe_gelu_tanh(g) * u);
+    }
+}
+
+__device__ void d_moe_expert_down_gemma_fp8(float* part, const bf16* fu,
+                                            const unsigned char* table,
+                                            const unsigned long long* ewt,
+                                            const unsigned long long* est, unsigned k, unsigned H,
+                                            unsigned I_moe, unsigned n_exp, unsigned slice,
+                                            unsigned nblk, unsigned nrow) {
+    const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
+    const unsigned nslot = nrow * k;
+    const unsigned total = nslot * H;
+    for (unsigned f = slice * PLOW_WAVES + wave; f < total; f += nblk * PLOW_WAVES) {
+        unsigned slot, h;
+        if (nrow == 1u) { slot = f / H; h = f - slot * H; }
+        else            { h = f / nslot; slot = f - h * nslot; }
+        const unsigned eid = moe_slot_expert(table, slot);
+        float* pslot = part + (size_t)slot * H;
+        const unsigned long long wb = (eid < n_exp) ? ewt[(size_t)eid * 2 + 1] : 0ull;
+        const unsigned long long sb = (eid < n_exp) ? est[(size_t)eid * 2 + 1] : 0ull;
+        if (wb == 0ull || sb == 0ull) {
+            if (lane == 0) pslot[h] = 0.0f;
+            continue;
+        }
+        const unsigned char* Wd = (const unsigned char*)(size_t)wb;
+        const float* sc = (const float*)(size_t)sb;
+        const float y = gmoe_wave_dot_fp8(fu + (size_t)slot * I_moe, Wd + (size_t)h * I_moe,
+                                          I_moe, lane) * sc[h];
+        if (lane == 0) pslot[h] = moe_slot_gate(table, slot) * y;
+    }
+}
+#endif /* PLOW_MOE_GEMMA (the fp8 expert BODIES; interp.hip gates the CASES on PLOW_FP8, which
+        * is the weight-encoding axis they belong to) */
+
+#if PLOW_MOE_GEMMA_PF
+/* ==========================================================================================
+ * GEMMA-4 grouped-MoE PREFILL (T > 1) — ops 73-77, 81/82.
+ *
+ * The align/sort op is EXACTLY d_moe_align_pf (see the op 74 wrapper below): same histogram,
+ * same MPF_BM-padded prefix, same meta layout, same (row_token, row_partidx, row_gate) scatter.
+ * Reusing it rather than copying it is what keeps the pad convention — and therefore the two
+ * grouped GEMMs' tile arithmetic — provably consistent with the rest of this file.
+ *
+ * The two grouped GEMMs are a Gemma-shaped twin of `d_moe_group_pf_t`, and the reason it is a
+ * twin rather than a fourth instantiation of that template is the WEIGHT TABLE: Gemma carries
+ * TWO ULLs per expert with gate and up FUSED into one [2I,H] tensor, where every other MoE in
+ * this file carries THREE with gate and up separate. That is a different indexing rule in the
+ * innermost staging macro, not a flag.
+ *
+ * ---- LDS, AND WHY CDNA3 SINGLE-BUFFERS ----
+ * The BM=64 x BN=256 x BK=64 tile is 40,960 B. Double-buffered that is 81,920 B, which fits
+ * CDNA4's 160 KiB workgroup and does NOT fit CDNA3's 64 KiB — the compiler enforces the cap
+ * ("local memory (81920) exceeds limit (65536)"), so this is a hard structural bound, not a
+ * tuning choice. GMPF_DBUF drops to one buffer on CDNA3, which is the same answer the dense
+ * GEMM reached on this branch (GM_DBUF=1): the global fetch still issues into REGISTERS at the
+ * top of the k-tile and lands behind the whole MFMA run, so only the LDS store is exposed, and
+ * one extra barrier per k-tile is the whole cost.
+ * ========================================================================================== */
+#if (2 * MPF_TILE * 2) <= PLOW_LDS_MAX_BYTES
+#define GMPF_DBUF 2
+#else
+#define GMPF_DBUF 1
+#endif
+#define GMPF_LDS_HALVES (GMPF_DBUF * MPF_TILE)
+
+/* --- op 73: PLOW_DOP_MOE_ROUTER_GEMMA_PF --------------------------------------------------
+ * Block-per-token loop of the exact decode router row. Bit-identical per token to decode by
+ * construction: it is the same function, with the table/resid rows advanced. */
+__device__ void d_moe_router_gemma_pf(unsigned char* table, const bf16* resid, const bf16* proj,
+                                      const bf16* scale, const bf16* pes, unsigned H,
+                                      unsigned n_exp, unsigned k, unsigned T, float root,
+                                      float eps, unsigned slice, unsigned nblk, float* arena) {
+    for (unsigned tok = slice; tok < T; tok += nblk)
+        d_moe_router_gemma_row(table + (size_t)tok * k * 8, resid + (size_t)tok * H, proj, scale,
+                               pes, H, n_exp, k, root, eps, arena);
+}
+
+/* --- op 77: PLOW_DOP_MOE_COMBINE_NORM_GEMMA_PF --------------------------------------------
+ * Block-per-token loop of op 70: out[t] = RMSNorm(Σ_slot part[t][slot], gamma) + h1[t]. */
+__device__ void d_moe_combine_norm_gemma_pf(bf16* out, const float* part, const bf16* h1,
+                                            const bf16* gamma, unsigned H, unsigned k, unsigned T,
+                                            float eps, unsigned slice, unsigned nblk,
+                                            float* arena) {
+    float* red = GMOE_RED(arena);
+    float* acc = GMOE_WORK(arena);
+    for (unsigned tok = slice; tok < T; tok += nblk) {
+        const float* pt = part + (size_t)tok * k * H;
+        const bf16* res = h1 + (size_t)tok * H;
+        bf16* o = out + (size_t)tok * H;
+        float ss = 0.0f;
+        for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS) {
+            float a = 0.0f;
+            for (unsigned slot = 0; slot < k; slot++) a += pt[(size_t)slot * H + h];
+            acc[h] = a;
+            ss += a * a;
+        }
+        const float t = block_sum(ss, red);
+        const float inv = rsqrtf(t / (float)H + eps);
+        for (unsigned h = threadIdx.x; h < H; h += PLOW_THREADS)
+            st_act1(&o[h], f2bf(acc[h] * inv * bf2f(gamma[h]) + bf2f(res[h])));
+        __syncthreads(); /* arena reused by the next token */
+    }
+}
+
+/* --- ops 75 / 76 (+ 81 / 82): THE GROUPED GEMMA EXPERT GEMM -------------------------------
+ * ONE body, four modes:
+ *
+ *   GLU=true   gate/up. A = xn2 rows GATHERED by row_token; B = the expert's FUSED gate_up
+ *              tensor, its gate half staged into the low BN/2 rows of the tile and its up half
+ *              into the high ones, so the SN axis selects gate-vs-up at the SAME output column
+ *              and the GeGLU epilogue needs no cross-lane shuffle. C = fu_g[row][I_moe], bf16.
+ *   GLU=false  down. A = fu_g, contiguous per expert segment; B = the expert's down tensor;
+ *              C = part[row_partidx[row]][H], f32, SCATTERED and multiplied by row_gate. Pad
+ *              rows (row_partidx == PLOW_EXPERT_UNUSED) are dropped.
+ *   W8A8=false bf16 A and B (ops 75/76).
+ *   W8A8=true  BOTH operands e4m3 with per-row (A) and per-output-channel (B) f32 scales
+ *              (ops 81/82). The bytes are decoded EXACTLY to bf16 on the way into LDS and the
+ *              bf16 matrix core runs them.
+ *
+ * WHY W8A8 DECODES TO bf16 INSTEAD OF USING THE fp8 MATRIX CORE, and it is not a shortcut.
+ * Every e4m3 value is exact in bf16 (3 mantissa bits into 7) and every e4m3 x e4m3 product is
+ * exact in f32, so decode-then-bf16-MFMA computes the SAME products as an fp8 MFMA and differs
+ * only in accumulation grouping. On CDNA3 it also costs nothing: the part's fp8 matrix core is
+ * K=16 and runs at the SAME MACs/cycle as its bf16 one (amd_arch.h), so the 2x an fp8 core buys
+ * on CDNA4 does not exist here — fp8 buys memory footprint, which this path keeps in full. And
+ * it side-steps the e4m3fnuz/OCP divergence in the matrix core entirely.
+ *
+ * `Ain` is bf16* when W8A8 is false and unsigned char* when it is true. `ascale` is the A-side
+ * per-row f32 scale (per TOKEN on the GLU arm, indexed by row_token; per GATHERED ROW on the
+ * DOWN arm) and is unread when W8A8 is false. */
+template <bool GLU, bool W8A8>
+__device__ void d_moe_group_gemma_pf_t(void* __restrict__ Cout, const void* __restrict__ Ain,
+                                       const float* __restrict__ ascale,
+                                       const unsigned long long* __restrict__ ewt,
+                                       const unsigned long long* __restrict__ est,
+                                       const int* __restrict__ meta,
+                                       const unsigned* __restrict__ row_token,
+                                       const unsigned* __restrict__ row_partidx,
+                                       const float* __restrict__ row_gate, unsigned N, unsigned K,
+                                       unsigned n_exp, unsigned act, unsigned slice, unsigned nblk,
+                                       bf16* lds) {
+    constexpr int SM = MPF_SM, SN = MPF_SN; /* 1, 2 */
+    constexpr int APT = MPF_BM * MPF_BK / PLOW_THREADS;
+    constexpr int BPT = MPF_BN * MPF_BK / PLOW_THREADS;
+    constexpr int APASS = APT / 8, BPASS = BPT / 8;
+    constexpr unsigned NB = GLU ? (MPF_BN / 2) : MPF_BN;
+    constexpr unsigned DB = GMPF_DBUF;
+
+    const unsigned lane = threadIdx.x & 63u;
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned wm = wave / MPF_WN, wn = wave % MPF_WN;
+    const unsigned frow = mfma_frag_row(lane);
+
+    const int* rowoff = meta;
+    const int* tilep = meta + 2 * (int)n_exp;
+    const unsigned total_tiles = (unsigned)tilep[n_exp];
+    const unsigned tn = (N + NB - 1u) / NB;
+    const unsigned n_tiles = total_tiles * tn;
+    const unsigned NT = (K + MPF_BK - 1u) / MPF_BK;
+
+    const bf16* A16 = (const bf16*)Ain;
+    const unsigned char* A8 = (const unsigned char*)Ain;
+
+#define GMPF_ASM(b) (lds + (b) * MPF_TILE)
+#define GMPF_BSM(b) (lds + (b) * MPF_TILE + MPF_BM * MPF_STRIDE)
+
+    for (unsigned lin = slice; lin < n_tiles; lin += nblk) {
+        const unsigned mt = lin / tn, nt = lin % tn;
+        const unsigned e = mpf_expert_of_tile(tilep, mt, n_exp);
+        const unsigned rowbase = (unsigned)rowoff[e] + (mt - (unsigned)tilep[e]) * MPF_BM;
+        const unsigned n0 = nt * NB;
+
+        /* TWO ULLs per expert (gate_up fused, down) — NOT three. */
+        const unsigned long long wb = ewt[(size_t)e * 2 + (GLU ? 0 : 1)];
+        if (wb == 0ull) continue; /* expert-parallel "not mine" sentinel; skip, do not fault */
+        const bf16* W16 = (const bf16*)(size_t)wb;
+        const unsigned char* W8 = (const unsigned char*)(size_t)wb;
+        /* `if constexpr`, not a ternary: `est` is nullptr on the bf16 arms and a ternary would
+         * still evaluate the subscript. */
+        const float* wsc = nullptr;
+        if constexpr (W8A8) wsc = (const float*)(size_t)est[(size_t)e * 2 + (GLU ? 0 : 1)];
+
+        f32x16 acc[SM][SN];
+#pragma unroll
+        for (int i = 0; i < SM; i++)
+#pragma unroll
+            for (int j = 0; j < SN; j++) acc[i][j] = (f32x16)(0.0f);
+
+        __align__(16) bf16 ra[APT], rb[BPT];
+
+/* A stage. GLU gathers row_token[rowbase+r] out of the [T,K] activation; DOWN reads the
+ * gathered intermediate contiguously from rowbase. A pad row (UNUSED) zero-fills, and zero
+ * contributes nothing to any live output. */
+#define GMPF_FETCH_A(k0)                                                                       \
+    _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                     \
+        const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                         \
+        const unsigned r = el / MPF_BK, kk = (k0) + (el % MPF_BK);                             \
+        unsigned src;                                                                          \
+        if constexpr (GLU) src = row_token[rowbase + r];                                       \
+        else src = rowbase + r;                                                                \
+        if (src != PLOW_EXPERT_UNUSED) {                                                       \
+            if constexpr (W8A8)                                                                \
+                *(bf16v8*)&ra[it * 8] = mpf_ld_w8(A8 + (size_t)src * K + kk);                  \
+            else                                                                               \
+                *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A16) + (size_t)src * K + kk);         \
+        } else                                                                                 \
+            _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] = 0;                  \
+    }
+
+/* B stage. Under GLU the tile's low half is the FUSED tensor's gate rows [0,I) and its high
+ * half the up rows [I,2I) AT THE SAME OUTPUT COLUMN — one base, an +N row offset, which is the
+ * whole difference from the three-pointer grouped GEMM above. */
+#define GMPF_FETCH_B(k0)                                                                       \
+    _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                     \
+        const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                         \
+        const unsigned br = el / MPF_BK, kk = (k0) + (el % MPF_BK);                            \
+        unsigned r = n0 + br, wrow = r;                                                        \
+        if constexpr (GLU) {                                                                   \
+            const bool up = (br >= MPF_BN / 2);                                                \
+            r = n0 + (up ? br - MPF_BN / 2 : br);                                              \
+            wrow = up ? r + N : r;                                                             \
+        }                                                                                      \
+        if (r < N) {                                                                           \
+            if constexpr (W8A8)                                                                \
+                *(bf16v8*)&rb[it * 8] = mpf_ld_w8(W8 + (size_t)wrow * K + kk);                 \
+            else                                                                               \
+                *(bf16v8*)&rb[it * 8] = ld_glob8(as_glob(W16) + (size_t)wrow * K + kk);        \
+        } else                                                                                 \
+            _Pragma("unroll") for (int j = 0; j < 8; j++) rb[it * 8 + j] = 0;                  \
+    }
+
+#define GMPF_COMMIT(buf)                                                                       \
+    _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                     \
+        const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                         \
+        __builtin_memcpy(&GMPF_ASM(buf)[(el / MPF_BK) * MPF_STRIDE +                           \
+                                        MPF_XORSWZ(el / MPF_BK, el % MPF_BK)],                 \
+                         &ra[it * 8], 16);                                                     \
+    }                                                                                          \
+    _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                     \
+        const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                         \
+        __builtin_memcpy(&GMPF_BSM(buf)[(el / MPF_BK) * MPF_STRIDE +                           \
+                                        MPF_XORSWZ(el / MPF_BK, el % MPF_BK)],                 \
+                         &rb[it * 8], 16);                                                     \
+    }
+
+        __syncthreads(); /* the previous tile's fragment readers must be done with the LDS */
+        GMPF_FETCH_A(0)
+        GMPF_FETCH_B(0)
+        GMPF_COMMIT(0)
+        __syncthreads();
+
+        unsigned buf = 0;
+        for (unsigned kt = 0; kt < NT; kt++) {
+            const unsigned kn = (kt + 1u) * MPF_BK;
+            /* Issue the next k-tile's global loads into REGISTERS before the MFMA run, in both
+             * buffering modes. At DB==1 that is what keeps single-buffering cheap: the load
+             * lands behind the MFMAs and only the LDS store is exposed. */
+            if (kn < K) { GMPF_FETCH_A(kn) GMPF_FETCH_B(kn) }
+
+#pragma unroll
+            for (int q = 0; q < MPF_BK / MFMA_K; q++) {
+                bf16x8 af[SM], bfr[SN];
+#pragma unroll
+                for (int i = 0; i < SM; i++) {
+                    const unsigned arow = wm * (MPF_BM / MPF_WM) + i * MFMA_M + frow;
+                    __builtin_memcpy(&af[i],
+                                     &GMPF_ASM(buf)[arow * MPF_STRIDE +
+                                                    MPF_XORSWZ(arow, mfma_frag_k(lane, q * MFMA_K))],
+                                     16);
+                }
+#pragma unroll
+                for (int j = 0; j < SN; j++) {
+                    const unsigned brow =
+                        (GLU ? j * (MPF_BN / 2) + wn * MFMA_N
+                             : wn * (MPF_BN / MPF_WN) + j * MFMA_N) + frow;
+                    __builtin_memcpy(&bfr[j],
+                                     &GMPF_BSM(buf)[brow * MPF_STRIDE +
+                                                    MPF_XORSWZ(brow, mfma_frag_k(lane, q * MFMA_K))],
+                                     16);
+                }
+                __builtin_amdgcn_s_setprio(1);
+#pragma unroll
+                for (int i = 0; i < SM; i++)
+#pragma unroll
+                    for (int j = 0; j < SN; j++)
+                        acc[i][j] = plow_mfma_bf16_32x32(af[i], bfr[j], acc[i][j]);
+                __builtin_amdgcn_s_setprio(0);
+            }
+
+            if (kn < K) {
+                if constexpr (DB == 1) __syncthreads(); /* every reader done with the one buffer */
+                const unsigned cb = (DB == 2) ? (buf ^ 1u) : 0u;
+                GMPF_COMMIT(cb)
+            }
+            __syncthreads();
+            if constexpr (DB == 2) buf ^= 1u;
+        }
+
+        /* ---- epilogue */
+        const unsigned nn_lane =
+            n0 + (GLU ? wn * MFMA_N : wn * (MPF_BN / MPF_WN)) + mfma_acc_n(lane);
+        if constexpr (GLU) {
+            /* acc[i][0] is gate and acc[i][1] is up FOR THE SAME ELEMENT, in the same lane. */
+            bf16* const fu = (bf16*)Cout;
+            if (nn_lane < N) {
+#pragma unroll
+                for (int i = 0; i < SM; i++)
+#pragma unroll
+                    for (int el = 0; el < 16; el++) {
+                        const unsigned rr = wm * (MPF_BM / MPF_WM) + i * MFMA_M + mfma_acc_m(lane, el);
+                        float g = acc[i][0][el], u = acc[i][1][el];
+                        if constexpr (W8A8) {
+                            const unsigned tok = row_token[rowbase + rr];
+                            if (tok == PLOW_EXPERT_UNUSED) {
+                                /* pad row: write 0, matching the bf16 arm's zero-filled A */
+                                st_act1(&fu[(size_t)(rowbase + rr) * N + nn_lane], f2bf(0.0f));
+                                continue;
+                            }
+                            const float as = ascale[tok];
+                            g *= as * wsc[nn_lane];
+                            u *= as * wsc[N + nn_lane];
+                        }
+                        const float a = (act == PLOW_MOE_ACT_SILU) ? (g / (1.0f + expf(-g)))
+                                                                   : gmoe_gelu_tanh(g);
+                        st_act1(&fu[(size_t)(rowbase + rr) * N + nn_lane], f2bf(a * u));
+                    }
+            }
+        } else {
+            float* const part = (float*)Cout;
+#pragma unroll
+            for (int i = 0; i < SM; i++)
+#pragma unroll
+                for (int j = 0; j < SN; j++) {
+                    const unsigned nn = n0 + wn * (MPF_BN / MPF_WN) + j * MFMA_N + mfma_acc_n(lane);
+                    if (nn >= N) continue;
+#pragma unroll
+                    for (int el = 0; el < 16; el++) {
+                        const unsigned rr = wm * (MPF_BM / MPF_WM) + i * MFMA_M + mfma_acc_m(lane, el);
+                        const unsigned pidx = row_partidx[rowbase + rr];
+                        if (pidx == PLOW_EXPERT_UNUSED) continue; /* pad row */
+                        float y = row_gate[rowbase + rr] * acc[i][j][el];
+                        if constexpr (W8A8) y *= ascale[rowbase + rr] * wsc[nn];
+                        part[(size_t)pidx * N + nn] = y;
+                    }
+                }
+        }
+        __syncthreads();
+    }
+#undef GMPF_FETCH_A
+#undef GMPF_FETCH_B
+#undef GMPF_COMMIT
+#undef GMPF_ASM
+#undef GMPF_BSM
+}
+
+/* --- op 75: PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF ----------------------------------------------- */
+__device__ void d_moe_group_glu_gemma_pf(bf16* fu, const bf16* xn2,
+                                         const unsigned long long* ewt, const int* meta,
+                                         const unsigned* row_token, unsigned I_moe, unsigned H,
+                                         unsigned n_exp, unsigned act, unsigned slice,
+                                         unsigned nblk, bf16* lds) {
+    d_moe_group_gemma_pf_t<true, false>(fu, xn2, nullptr, ewt, nullptr, meta, row_token, nullptr,
+                                        nullptr, I_moe, H, n_exp, act, slice, nblk, lds);
+}
+
+/* --- op 76: PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF ---------------------------------------------- */
+__device__ void d_moe_group_down_gemma_pf(float* part, const bf16* fu,
+                                          const unsigned long long* ewt, const int* meta,
+                                          const unsigned* row_partidx, const float* row_gate,
+                                          unsigned H, unsigned I_moe, unsigned n_exp,
+                                          unsigned slice, unsigned nblk, bf16* lds) {
+    d_moe_group_gemma_pf_t<false, false>(part, fu, nullptr, ewt, nullptr, meta, nullptr,
+                                         row_partidx, row_gate, H, I_moe, n_exp, 0, slice, nblk,
+                                         lds);
+}
+
+/* --- op 81: PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF_W8A8 ------------------------------------------ */
+__device__ void d_moe_group_glu_gemma_pf_w8a8(bf16* fu, const unsigned char* xq8,
+                                              const float* ascale,
+                                              const unsigned long long* ewt,
+                                              const unsigned long long* est, const int* meta,
+                                              const unsigned* row_token, unsigned I_moe,
+                                              unsigned H, unsigned n_exp, unsigned act,
+                                              unsigned slice, unsigned nblk, bf16* lds) {
+    d_moe_group_gemma_pf_t<true, true>(fu, xq8, ascale, ewt, est, meta, row_token, nullptr,
+                                       nullptr, I_moe, H, n_exp, act, slice, nblk, lds);
+}
+
+/* --- op 82: PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF_W8A8 ----------------------------------------- */
+__device__ void d_moe_group_down_gemma_pf_w8a8(float* part, const unsigned char* fu8,
+                                               const float* fscale,
+                                               const unsigned long long* ewt,
+                                               const unsigned long long* est, const int* meta,
+                                               const unsigned* row_partidx, const float* row_gate,
+                                               unsigned H, unsigned I_moe, unsigned n_exp,
+                                               unsigned slice, unsigned nblk, bf16* lds) {
+    d_moe_group_gemma_pf_t<false, true>(part, fu8, fscale, ewt, est, meta, nullptr, row_partidx,
+                                        row_gate, H, I_moe, n_exp, 0, slice, nblk, lds);
+}
+#endif /* PLOW_MOE_GEMMA_PF */
 
 #endif /* PLOW_OP_MOE_H */

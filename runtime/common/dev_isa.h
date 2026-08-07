@@ -254,7 +254,15 @@ enum {
      * FP8 DECODE GEMV (w8a16): fp8 e4m3 weight, bf16 activation. Twin of PLOW_DOP_GEMV, but the
      * weight row is uint8[K] (half the bytes -> ~2x the decode roofline) and carries a per-output-
      * channel f32 dequant scale applied ONCE in the epilogue.
-     * t0=C(bf16) t1=x(bf16) t2=W(fp8) t5=w_scale(f32[N])   i0=M i1=N i2=K i4=a_row0. See op_gemm.h. */
+     * t0=C(bf16) t1=x(bf16) t2=W(fp8) t5=w_scale(f32[N])   i0=M i1=N i2=K i4=a_row0. See op_gemm.h.
+     *
+     * i3 != 0 (AMD decode only) is the NRN FOLD: the packet computes the WHOLE NormResidualNorm
+     * (op 23) into its LDS staging instead of reading a pre-normed x — the end-of-layer sandwich
+     * packet disappears from the decode chain. t1 becomes `a` (the residual NRN1 wrote, in the
+     * PING-PONG twin buffer), t3=resid_out t4=b t6=gamma_b t7=gamma_n, f0=eps f1=layer_scale;
+     * i3 bit 0 = fold, bit 1 = this packet (ONE of the q/k/v trio) stores the residual. Bit-exact
+     * to op 23 followed by op 30 — see gemv_nrn_lds in op_gemm.h for the why and the race the
+     * ping-pong prevents. */
     PLOW_DOP_GEMV_FP8 = 30,
 
     /* FP8 DECODE GEMV+GLU (w8a16): fp8 gate|up in ONE pass, act(gate)*up in the epilogue. Twin of
@@ -931,6 +939,23 @@ enum {
      *
      * ONE BODY with op 91, which is this with Nk = Nv = 0. See op_gemm.h d_gemv_qkv_mxfp4. */
     PLOW_DOP_GEMV_QKV_MXFP4 = 114,
+
+    /* t0=q_out t1=x t2=W_q(fp8) t3=k_out t4=W_k(fp8) t5=v_out t6=W_v(fp8)
+     * i0=M i1=Nq i2=K i3=Nk i4=Nv i5=S_q i6=S_k i7=S_v (f32[N] scale TENSOR HANDLES, not integers)
+     * PER-CHANNEL-FP8 (w8a16) FUSED Q|K|V DECODE GEMV — op 22's fp8 twin and op 114's slot map with
+     * f32 dequant-scale rows in place of the E8M0 bytes. Gemma/Qwen/Llama fp8 decode emits q/k/v as
+     * three GEMV_FP8 packets on disjoint CU sets; concatenating their output columns into one
+     * N = Nq+Nk+Nv sweep deletes two counter gates per layer AND fills every CU uniformly instead
+     * of the byte-proportional split3. Same math, same bytes, byte-exact per column.
+     *
+     * The scale demotion rule is op 114's, verbatim: ten pointers do not fit t[8], a wrong OUTPUT
+     * handle would silently overwrite an unrelated tensor, and a wrong scale is off by a visible
+     * per-row factor. t[0..6] is byte-for-byte op 22's; the three handles take the integer slots
+     * op 22 leaves empty. Nv == 0 is the legal two-stream form (t5/t6/i7 all absent); any other
+     * absence TRAPS on the AMD arm rather than degrading to a narrower sweep.
+     *
+     * ONE BODY with op 30, which is this with Nk = Nv = 0. See op_gemm.h d_gemv_qkv_fp8. */
+    PLOW_DOP_GEMV_QKV_FP8 = 115,
 
     PLOW_DOP__COUNT
 };

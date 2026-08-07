@@ -87,6 +87,43 @@ int main(int argc, char** argv) {
         fprintf(stderr, "load: %s\n", plow_hsa_last_error()); return 1;
     }
 
+    /* THE OBJECT AND THIS BINARY MUST AGREE ON THE WORKGROUP WIDTH. See the comment on
+     * `plow_probe_wg_threads` in test_kernels.hip: an 8-wave object launched with 256
+     * threads is a LEGAL dispatch that leaves half of every per-wave LDS array unwritten,
+     * and d_flash_mla_decode's output fold sums them anyway. It reads as a kernel defect
+     * -- 1e24..1e35 outputs and `rms nan` -- and it was diagnosed as one for a while.
+     * Nothing else in this harness can detect it, so check before running anything. */
+    {
+        plow_hsa_kernel kp;
+        if (plow_hsa_get_kernel(H, 0, "plow_probe_wg_threads", &kp)) {
+            fprintf(stderr, "sym plow_probe_wg_threads: %s\n"
+                            "  (rebuild test_kernels.elf from this tree)\n",
+                    plow_hsa_last_error());
+            return 1;
+        }
+        void* dW = dev(4);
+        struct __attribute__((packed)) { void* out; } pa = {dW};
+        if (plow_hsa_launch(H, 0, &kp, 1, 1, 1, 1, 1, 1, 0, &pa, sizeof(pa)) != 0) {
+            fprintf(stderr, "probe launch: %s\n", plow_hsa_last_error()); return 1;
+        }
+        plow_hsa_wait(H, 0);
+        unsigned* hW = plow_hsa_alloc_host(H, 4);
+        plow_hsa_copy_d2h(H, 0, hW, dW, 4);
+        if (*hW != PLOW_WG_THREADS) {
+            fprintf(stderr,
+                    "FATAL: test_kernels.elf was built for %u threads/workgroup, this harness "
+                    "launches %u.\n"
+                    "  Rebuild BOTH with the same -DPLOW_WG_WAVES. A mismatch in this direction "
+                    "is a legal\n"
+                    "  dispatch, not a launch error, and it corrupts MLA output in a way that "
+                    "looks exactly\n"
+                    "  like a kernel bug (nsplit>1 cases at 1e24..1e35, rms nan).\n",
+                    *hW, (unsigned)PLOW_WG_THREADS);
+            return 1;
+        }
+        printf("workgroup width: %u threads (object and harness agree)\n", *hW);
+    }
+
     /* MLA_MFMA=1 exercises the head-packed MFMA decode instead of the scalar GF kernel. */
     const int use_mfma = getenv("MLA_MFMA") && atoi(getenv("MLA_MFMA"));
     const char* dsym = use_mfma ? "mla_flash_decode_mfma_512" : "mla_flash_decode_512";

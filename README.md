@@ -104,6 +104,36 @@ to launch with `HSA_STATUS_ERROR_INVALID_ISA`; the 4-wave flash object is allowe
 the `asm_audit.py` instruction-selection pass. Only the amdgpu kernel driver +
 ROCr (`libhsa-runtime64.so`) need be present to *deploy*.
 
+### AMD gfx942 (MI300X) — supported
+
+CDNA3 is a first-class served target: the full interpreter object set builds
+and serves on MI300X. It is a separate build script rather than an `$ARCH`
+knob because CDNA3 genuinely diverges (64 KiB LDS forces a single-buffered
+GEMM stage at 192×256; no CDNA4 MFMA/fp4 primitives — `runtime/amd/amd_arch.h`
+is the shim layer; the exported symbols carry the arch suffix):
+
+```bash
+# Objects (outside nix — hipcc needs the system glibc). occ4 is the batch-1 profile.
+PLOW_OCC4=1 PLOW_L2HIER=1 bash scripts/build_gfx942.sh build-amd/hsaco/gfx942
+
+# Model blob. On gfx942, PLOW_FP8=1 PLOW_W8A8=1 is the per-channel fp8 serving
+# mode (weights + activations); PLOW_FP8_HEAD=1 additionally quantizes the
+# lm_head (scripts/quantize_fp8_head.py builds the missing shard). L2-domain
+# packet placement is ON by default for gfx942.
+PLOW_FP8=1 PLOW_W8A8=1 PLOW_FP8_HEAD=1 PLOW_FUSE_HNR=1 \
+    cargo run --release -p plowc -- --hf-dir <hf-dir> --emit devblob \
+    --arch gfx942 --gpu MI300X --max-ctx <ctx> --out <assets>/model.pkt
+```
+
+Measured on one MI300X against vLLM 0.26 (Gemma-4-12B, bf16 vLLM vs fp8-served
+plow, same box, same bench client, interleaved rounds — the apples-to-apples
+protocol and the full tables live in `perf-data/plow-gfx942/`): plow's
+sliding-window decode is nearly context-flat, so it **wins from ~16k context
+up** (TPOT 11.31 vs 11.67 ms at 16k, 11.81 vs 14.10 at 32k, ~+20% at 64k) and
+trails at short context (10.95 vs 9.81 at 4k; ~tie at 8k). Prefill TTFT is the
+known weak side (1.5–3× behind, `perf-data` §18). MX-FP4 stays gfx950-only —
+CDNA3 has no fp4 hardware and `plowc` refuses it at emit.
+
 ## Compile a model (plowc)
 
 ```bash

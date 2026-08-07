@@ -345,11 +345,15 @@ static_assert(PGM_BK8 == 64, "the mainloop reads two k32 subgroups per K-tile");
         assert_eq!(classify(&nv, "PGM_BM"), Sweepable::Overridable);
         assert_eq!(classify(&nv, "PGM_BN"), Sweepable::Overridable);
 
-        // And the K axis is fixed on BOTH vendors -- GM_BK sits after the
-        // #endif that closes GM_BN's guard, so it is a bare #define. A K sweep
-        // is not available anywhere, which is worth knowing before designing
-        // one.
-        assert_eq!(classify(&amd, "GM_BK"), Sweepable::Fixed);
+        // The K axis USED to be fixed on both vendors, and on NVIDIA it still is -- PGM_BK sits
+        // after the #endif that closes PGM_BN's guard, so it is a bare #define and no K sweep is
+        // available there.
+        //
+        // AMD's GM_BK became overridable with the CDNA3 port, and for a reason worth stating: on
+        // a 64 KiB-LDS part the stage is 4*(BM+BN)*(BK+8) bytes, and BK is the ONLY axis that
+        // shrinks it without touching BN -- which the fused-GLU epilogue pins through its SN==2
+        // assert. So the K sweep exists on AMD now and does not on NVIDIA.
+        assert_eq!(classify(&amd, "GM_BK"), Sweepable::Overridable);
         assert_eq!(classify(&nv, "PGM_BK"), Sweepable::Fixed);
 
         assert_eq!(classify(&amd, "GV_UNROLL"), Sweepable::Overridable);

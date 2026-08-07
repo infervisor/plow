@@ -314,6 +314,55 @@ if [ "$BUILD_MOE" = 1 ]; then
   fi
 fi
 
+# GEMMA-4 26B-A4B MoE objects (PLOW_GEMMA_MOE=1).                            [GEMMA4-MOE-AMD]
+#
+# Nineteen opcodes (61-77, 81/82) that the sm_120 interpreter has dispatched since the 26B-A4B
+# bring-up and the AMD one had NO arm for — so the model could not run on AMD at all, and the way
+# it could not run was SILENT: this interpreter's dispatch `default:` writes nothing. Two flags,
+# because the two halves have different costs:
+#
+#   PLOW_MOE_GEMMA     ops 61-72, the DECODE family (router split, fused-gate_up experts,
+#                      combines). Wave-per-output GEMVs; measured FREE on gfx942 — the decode
+#                      object is 251 VGPR / occ 2 / 0 spill / 64520 B LDS with and without it.
+#   PLOW_MOE_GEMMA_PF  ops 73-77 + 81/82, the grouped-expert PREFILL. A second full MFMA body;
+#                      measured 256 VGPR / occ 2 / spill 2 / 64520 B, i.e. also free at the
+#                      cliff, but it is its own flag for the reason PLOW_MOE_PREFILL is: a model
+#                      that never prefills MoE should not carry the GEMM.
+#
+# The DECODE object gets both halves when a batched decode is asked for: at PLOW_DECODE_BATCH > 1
+# the decode program groups by expert exactly as prefill does (see the note above the arms in
+# interp.hip), so the grouped GEMM has to be there too.
+BUILD_GEMMA_MOE=0; [ "${PLOW_GEMMA_MOE:-0}" = 1 ] && BUILD_GEMMA_MOE=1
+GMOE_ELFS=""
+if [ "$BUILD_GEMMA_MOE" = 1 ]; then
+  # `if`, not `[ ... ] && GMD=...`: the file already records what that pattern costs under
+  # `set -e` when it lands last in a block.
+  GMD="-DPLOW_MOE_GEMMA=1"
+  if [ "$GVMM" -gt 1 ]; then GMD="$GMD -DPLOW_MOE_GEMMA_PF=1"; fi
+  genco "$DEC $GMD" i_decode_gmoe.co
+  unbundle i_decode_gmoe.co interp_decode_gmoe.elf
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MOE_GEMMA_PF=1" i_prefill_gmoe.co
+  unbundle i_prefill_gmoe.co interp_prefill_gmoe.elf
+  GMOE_ELFS="interp_decode_gmoe.elf interp_prefill_gmoe.elf"
+  if [ "$BUILD_GQ" = 1 ]; then
+    genco "$DEC $GMD -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_gmoe_gq.co
+    unbundle i_decode_gmoe_gq.co interp_decode_gmoe_gq.elf
+    genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_MOE_GEMMA_PF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_prefill_gmoe_gq.co
+    unbundle i_prefill_gmoe_gq.co interp_prefill_gmoe_gq.elf
+    GMOE_ELFS="$GMOE_ELFS interp_decode_gmoe_gq.elf interp_prefill_gmoe_gq.elf"
+  fi
+  # The marker symbols plowrt's `check_moe_gemma_arms` reads out of .symtab. Absence is what it
+  # refuses on, so a build that silently dropped the flag must fail HERE and not at first token.
+  for e in $GMOE_ELFS; do
+    case "$e" in
+      *decode*) want=plow_moe_gemma_arms_1;;
+      *)        want=plow_moe_gemma_pf_arms_1;;
+    esac
+    "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/llvm-nm "$e" | grep -q "$want" || {
+      echo "FAIL: $e does not advertise $want — the Gemma MoE arms were not compiled in"; exit 1; }
+  done
+fi
+
 # Golden wrappers call the SAME __device__ functions the interpreter does, so rebuild them with it.
 hipcc --offload-arch="$ARCH" -O3 -w --genco "$R/amd/test_kernels.hip" -o tk.co $INC
 unbundle tk.co test_kernels.elf
@@ -323,7 +372,7 @@ unbundle tk.co test_kernels.elf
 # "*** stack smashing detected ***", which reads as a buffer overflow and is not one.
 /usr/bin/env -i PATH=/usr/bin:/bin HOME="$HOME" /usr/bin/gcc -O2 -std=gnu11 -o chat \
     "$R/tests/gemma4_chat.c" "$R/amd/hsa_backend.c" \
-    -I/opt/rocm/include -L/opt/rocm/lib -lhsa-runtime64 -lm
+    -I"${ROCM_PATH:-/opt/rocm}"/include -L"${ROCM_PATH:-/opt/rocm}"/lib -lhsa-runtime64 -lm
 readelf -d chat | grep -qi runpath && { echo "FAIL: RUNPATH leaked into the host binary"; exit 1; }
 
 # REGISTER CLIFF as a build error. The 8-wave interpreters must stay <= 256 (2 waves/SIMD); the
@@ -413,7 +462,18 @@ if [ "$BUILD_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS"
+# Same argument for the Gemma-4 MoE halves: the decode family is wave-per-output GEMVs and the
+# prefill family is a second MFMA body, and both go into buckets already at the cliff.
+if [ "$BUILD_GEMMA_MOE" = 1 ]; then
+  check decode_gmoe "$DEC $GMD" 256 2
+  check prefill_gmoe "-DPLOW_BUCKET_DECODE=0 -DPLOW_MOE_GEMMA_PF=1" 256 2
+  if [ "$BUILD_GQ" = 1 ]; then
+    check decode_gmoe_gq "$DEC $GMD -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+    check prefill_gmoe_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_MOE_GEMMA_PF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+  fi
+fi
+
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # INSTRUCTION-SELECTION gate. The register check above catches a kernel that will not launch; it
 # does NOT catch one that launches, is correct, and is silently 4x slow because the backend picked

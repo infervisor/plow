@@ -61,6 +61,18 @@ impl ObjectRecipe {
 
 const NV_INCLUDES: &[&str] = &["runtime/common", "runtime/nvidia"];
 const AMD_INCLUDES: &[&str] = &["runtime/common", "runtime/amd"];
+/// ONLY the flags the build script passes; see the recipe below for why over-specifying is as
+/// wrong as under-specifying.
+const AMD_PREFILL_DEFINES_CDNA4: &[&str] = &["PLOW_BUCKET_DECODE=0"];
+/// CDNA3's shipping prefill geometry. The 64 KiB LDS makes double-buffering the tile ceiling, so
+/// the stage is single-buffered (`GM_DBUF=1`) and that buys 192x256 at eight waves, occupancy 2.
+const AMD_PREFILL_DEFINES_CDNA3: &[&str] = &[
+    "PLOW_BUCKET_DECODE=0",
+    "PLOW_WG_WAVES=8",
+    "GM_DBUF=1",
+    "GM_BM=192",
+    "GM_BN=256",
+];
 
 /// The prefill objects, per ISA. Flags mirror the build scripts.
 pub fn prefill_recipe(isa: IsaLevel) -> Option<ObjectRecipe> {
@@ -110,7 +122,13 @@ pub fn prefill_recipe(isa: IsaLevel) -> Option<ObjectRecipe> {
             tile_macros: Some(("op_gemm.cuh", ["PGM_BM", "PGM_BN", "PGM_BK"])),
         },
         // scripts/build_gfx950.sh, interp_prefill.elf.
-        IsaLevel::Gfx950 => ObjectRecipe {
+        //
+        // ONE ARM FOR EVERY CDNA LEVEL. This used to name Gfx950 alone, so Gfx942 fell through to
+        // `_ => return None` below and `dense_gemm_inventory` failed with "no interpreter recipe
+        // for gfx942" -- which dead-ended the whole capability probe, the tile selector and the
+        // tuning path for a part the kernels already run on. The recipe differs between the two
+        // only in the arch token and the tile/stage geometry the object is actually built with.
+        isa @ (IsaLevel::Gfx942 | IsaLevel::Gfx950) => ObjectRecipe {
             isa,
             profile: ProfileId::PrefillDense,
             source: "runtime/amd/interp.hip",
@@ -121,8 +139,19 @@ pub fn prefill_recipe(isa: IsaLevel) -> Option<ObjectRecipe> {
             // it here as well would collide with that definition. A recipe that
             // over-specifies is as wrong as one that under-specifies: it stops
             // describing the object the build actually produces.
-            defines: &["PLOW_BUCKET_DECODE=0"],
-            arch_flag: "--offload-arch=gfx950",
+            //
+            // CDNA3 does not build at CDNA4's geometry, and a recipe that says it does stops
+            // describing the object the build produces. A 64 KiB workgroup cannot hold a
+            // double-buffered stage wider than 64x128, so gfx942 ships single-buffered at
+            // 192x256 and eight waves -- see GM_DBUF in runtime/amd/op_gemm.h.
+            defines: match isa {
+                IsaLevel::Gfx942 => AMD_PREFILL_DEFINES_CDNA3,
+                _ => AMD_PREFILL_DEFINES_CDNA4,
+            },
+            arch_flag: match isa {
+                IsaLevel::Gfx942 => "--offload-arch=gfx942",
+                _ => "--offload-arch=gfx950",
+            },
             compiler: "hipcc",
             dispatch_fn: "plow_exec",
             // AMD's tiles are per-opcode compile-time instantiations rather than

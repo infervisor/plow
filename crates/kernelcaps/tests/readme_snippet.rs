@@ -39,7 +39,10 @@ fn the_documented_sweep_axes_are_accurate() {
     // ends the vendor asymmetry this table used to describe.
     assert_eq!(classify_macro(&amd, "GM_BM"), Sweepable::Overridable);
     assert_eq!(classify_macro(&nv, "PGM_BM"), Sweepable::Overridable);
-    // K: neither.
-    assert_eq!(classify_macro(&amd, "GM_BK"), Sweepable::Fixed);
+    // K: AMD only, since the CDNA3 port. On a 64 KiB-LDS part the stage is
+    // 4*(BM+BN)*(BK+8) bytes and BK is the only axis that shrinks it without
+    // touching BN, which the fused-GLU epilogue pins through its SN==2 assert.
+    // NVIDIA's PGM_BK is still a bare `#define` after the `#endif`.
+    assert_eq!(classify_macro(&amd, "GM_BK"), Sweepable::Overridable);
     assert_eq!(classify_macro(&nv, "PGM_BK"), Sweepable::Fixed);
 }

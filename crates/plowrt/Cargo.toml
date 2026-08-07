@@ -84,3 +84,14 @@ hsa = ["dep:libloading", "dep:safetensors", "hf-tokenizer"]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+# The upload-path microbenchmarks are CUDA-only (`#![cfg(feature = "cuda")]`);
+# without this gate a non-cuda `cargo test -p plowrt` fails on their empty
+# (main-less) expansions.
+[[example]]
+name = "h2d_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "reload_bench"
+required-features = ["cuda"]

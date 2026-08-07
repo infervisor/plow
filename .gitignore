@@ -34,3 +34,9 @@ ba_sc1/
 ba_sc1g/
 # every cmake hsaco build dir from the HIER2/SC1 campaign; objects, not source
 ba_*/
+gpucore.*.gpu
+
+# committed-by-accident artifacts (binaries/profiles live outside git)
+cuda-keyring_*.deb
+plow_profile.sqlite
+*.cubin

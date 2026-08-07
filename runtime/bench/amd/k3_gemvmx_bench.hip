@@ -346,13 +346,24 @@ __device__ __forceinline__ void gemv_rows_fp8_dual(bf16* __restrict__ C_, const 
         for (unsigned e = 0; e < nrep; e++)                                                         \
             FP8_ARMS(FN, C, x, W + (size_t)e * N * K, s, N, K, sm.xstage);                           \
     }
+/* op_gemm.h's gemv_rows_fp8 grew the three-stream q|k|v form (op 115); this bench sweeps the
+ * 1-stream shape, so bind Nk = Nv = 0 back to the FP8_ARMS arity. */
+template <int MM, bool XLDS, int UN>
+__device__ __forceinline__ void gemv_rows_fp8_1s(bf16* __restrict__ C, const bf16* __restrict__ x,
+                                                 const unsigned char* __restrict__ W,
+                                                 const float* __restrict__ s, unsigned M, unsigned N,
+                                                 unsigned K, unsigned slice, unsigned nblk,
+                                                 const bf16* lds) {
+    gemv_rows_fp8<MM, XLDS, UN>(C, nullptr, nullptr, x, W, nullptr, nullptr, s, nullptr, nullptr, M,
+                                N, 0u, 0u, K, slice, nblk, lds);
+}
 #if MX_ARM != 1 && MX_ARM != 3 && MX_ARM != 4 && MX_ARM != 5
 FP8_KERNEL(k_fp8_old, gemv_rows_fp8_dual)
 #endif
 #if MX_ARM == 4
 FP8_KERNEL(k_fp8_new, gemv_rows_fp8_dual) /* A/A control, as for mxfp4 */
 #elif MX_ARM != 0 && MX_ARM != 3 && MX_ARM != 5
-FP8_KERNEL(k_fp8_new, gemv_rows_fp8)
+FP8_KERNEL(k_fp8_new, gemv_rows_fp8_1s)
 #endif
 
 /* ---- ANALYSIS ARM (task 6): x from GLOBAL instead of LDS, mxfp4 only. NOT a production change —

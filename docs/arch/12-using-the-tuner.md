@@ -260,7 +260,7 @@ assert_eq!(classify_macro(&header, "PGM_BM"), Sweepable::Fixed);
 
 The current picture: the M axis is sweepable on AMD (`-DGM_BM=192` is shipped by
 `build_gfx950_qwen.sh`) and **not** on NVIDIA; the K axis is sweepable on
-neither. NVIDIA attention tiles are not macros at all — `BQ`/`BKV` are template
+**AMD only** (`GM_BK` became `#ifndef`-guarded with the CDNA3 port). NVIDIA attention tiles are not macros at all — `BQ`/`BKV` are template
 literals at five dispatch sites, so sweeping them means editing those sites.
 
 Two couplings to respect: `GV_MM_MAX` moves the register ceiling of *every* arm

@@ -1041,7 +1041,21 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // NVIDIA feature" for something `hwspec` describes on both vendors. The old spelling stays
     // live so in-flight scripts and recipes do not break.
     let l2_on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
-    let l2_layout = if l2_on("PLOW_L2_PLACE") || l2_on("PLOW_NV_PLACE") {
+    let l2_off = |k: &str| std::env::var(k).ok().as_deref() == Some("0");
+    // DEFAULT ON FOR gfx942. Per-XCD queues are the shipped MI300X decode path, not a tuning
+    // knob: windowing the global queue by L2 domain drains EIGHT queues concurrently instead of
+    // one, and it is what makes the two-level gate (PLOW_GATE_HIER) expressible. MEASURED on
+    // MI300X, Gemma-4-12B fp8 decode: placement -1.5%, hierarchy -16.0% on top -- the largest
+    // win on that arch by a wide margin. Opt out with PLOW_L2_PLACE=0.
+    //
+    // SCOPED TO gfx942 DELIBERATELY. A placed blob REQUIRES objects built with
+    // -DPLOW_L2_PLACE_DISPATCH (plowrt refuses the mismatch rather than mis-dispatching), and
+    // scripts/build_gfx942.sh now passes that by default while build_gfx950.sh does NOT. Turning
+    // this on for all AMD would therefore break every gfx950 asset pipeline until its objects
+    // were rebuilt -- and the gfx950 numbers have not been measured here. gfx950 keeps the
+    // explicit opt-in it has always had.
+    let l2_default = cli.arch == "gfx942" && !l2_off("PLOW_L2_PLACE");
+    let l2_layout = if l2_default || l2_on("PLOW_L2_PLACE") || l2_on("PLOW_NV_PLACE") {
         hwspec::registry::lookup(&cli.gpu)
             .and_then(|s| s.l2_partitioning.as_ref())
             // WHICH WORKGROUP LANDS ON WHICH DOMAIN IS VENDOR-SPECIFIC, and getting it from the

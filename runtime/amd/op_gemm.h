@@ -114,13 +114,33 @@
 /* Overridable at compile time so plowc can bucket the tile per shape without an ISA
  * change, and so a Qwen prefill object can be built with -DGM_BM=192 (see the sweep above).
  * Keep in sync with GFX950_TILES in crates/plowc/src/bin/gemma4.rs. */
+/* The DEFAULT rung -- what `d_gemm` (and therefore GemmGlu) instantiates. Its default is
+ * arch-conditional for the same reason the ladder below is: 256x256 at BK=64 is a 147,456 B
+ * double-buffered stage, 2.25x over CDNA3's 64 KiB, so gfx942 shipped it single-buffered and
+ * lost the ping-pong on the op that costs the most (GEMM_GLU is 24% of a Gemma-4 prefill
+ * chunk's body). 128x256 at BK=32 fits DOUBLE-buffered in 61,440 B. BN stays 256 because the
+ * fused-GLU epilogue's SN==2 assert pins it there at 8 waves.
+ *
+ * These were previously forced from the outside (`-DGM_BM=... -DGM_BN=...` in
+ * scripts/build_gfx942.sh). Defaulting them here means a CDNA3 build that forgets the flags
+ * still gets a tile that FITS, rather than one that fails the LDS limit at link time. Still
+ * overridable, which is what plowc's per-shape bucketing and every A/B sweep rely on. */
 #ifndef GM_BM
+#if PLOW_CDNA4
 #define GM_BM 256
+#else
+#define GM_BM 192
+#endif
 #endif
 #ifndef GM_BN
 #define GM_BN 256
 #endif
+/* Overridable like GM_BM/GM_BN, and for the same reason plus one more: on a 64 KiB-LDS part the
+ * stage is 4*(BM+BN)*(BK+8) bytes and BK is the only axis that shrinks it WITHOUT touching BN --
+ * which matters because the fused-GLU epilogue pins BN through the SN==2 assert below. */
+#ifndef GM_BK
 #define GM_BK 64
+#endif
 /* The wave grid follows PLOW_WAVES, and the ping-pong only EXISTS at 8 waves.
  *
  * The schedule needs (wave / 4) to be the group and (wave % 4) to be the SIMD, so
@@ -144,7 +164,108 @@
  * shifts each row by 16 B and breaks the conflict. (An XOR swizzle would save the
  * 16 KiB the padding costs, but we are not short of LDS, so it buys nothing.) */
 #define GM_STRIDE(BK) ((BK) + 8)
-#define GM_LDS_HALVES_T(BM, BN, BK) (2 * ((BM) + (BN)) * GM_STRIDE(BK))
+/* LDS BUFFERS FOR THE A|B STAGE. 2 = the double-buffered default: the next k-tile is committed
+ * into the idle buffer while the current one is still being read, so the commit hides entirely
+ * behind the MFMA clusters.
+ *
+ * 1 = single-buffered, and it exists because on a 64 KiB part double-buffering IS the tile
+ * ceiling. Measured on gfx942, where the fused-GLU epilogue pins BN to 64*GM_WN:
+ *
+ *   4 waves,  64x128  ->  55,296 B   fits
+ *   4 waves, 128x128  ->  73,736 B   over
+ *   8 waves,  64x256  ->  92,168 B   over
+ *   8 waves, 192x256  -> 129,032 B   over        <- the tile gfx950 actually runs
+ *
+ * so no tile bigger than 64x128 exists for CDNA3 while double-buffered, and 64x128 gives each
+ * wave SM*SN = 1*2 accumulator tiles against 192x256's 3*2. Halving the stage buys the tile
+ * back: 192x256 single-buffered is 64,512 B and fits.
+ *
+ * What it costs is ONE barrier per k-tile and the LDS write itself, which no longer overlaps the
+ * MFMA. What it does NOT cost is the global load: GM_FETCH still issues into registers at the
+ * top of the tile and lands behind the whole MFMA run, so only the LDS store is exposed. */
+/* DEFAULTED PER ARCH, not passed in by the build. gfx950's 160 KiB holds two buffers at the
+ * shipped 256x256/BK=64 tile; CDNA3's 64 KiB does not hold two at ANY tile the ladder uses
+ * (192x256/BK=64 double-buffered is 129,024 B), so it is single-stage. This used to be
+ * `-DGM_DBUF=1` in scripts/build_gfx942.sh, which meant a CDNA3 build that forgot the flag
+ * silently asked for a 129 KiB arena on a 64 KiB part. See the ladder note above GM_SM_BM for
+ * the measurement that says buying the second buffer back by halving BK does not pay. */
+#ifndef GM_DBUF
+#if PLOW_CDNA4
+#define GM_DBUF 2
+#else
+#define GM_DBUF 1
+#endif
+#endif
+/* PER-CLUSTER BARRIERS. The mainloop splits each staged k-tile into NSL MEM/MFMA cluster pairs
+ * and puts an s_barrier on BOTH sides of every MFMA burst. Those barriers are the ping-pong's
+ * ONLY mechanism: they are what keeps group 0 in a MEM cluster exactly while group 1 is in an
+ * MFMA cluster (see PPE below). The ping-pong needs two LDS buffers to trade, so at GM_DBUF=1
+ * it does not exist -- and then every one of those 2*NSL barriers per k-tile is doing NOTHING.
+ *
+ * With one buffer the stage is written once per k-tile and only READ inside the sl loop, so no
+ * wave can observe a partial write there. Correctness needs exactly two barriers per k-tile:
+ * one after the last read (every wave is done with the buffer) and one after the commit (the
+ * new tile is visible). At BK=64/SLICE=16 that is 2 instead of 9.
+ *
+ * The sched_barrier(0) fences go with them for the same reason: they exist to stop the compiler
+ * hoisting the global loads across a cluster boundary and dissolving the ping-pong. With no
+ * ping-pong to protect they only forbid the one thing that pays here -- overlapping cluster
+ * sl+1's ds_reads with cluster sl's MFMAs, which is the software pipeline the barriers were
+ * standing in the way of.
+ *
+ * Overridable so the two halves can be A/B'd independently; both default to "on iff the
+ * ping-pong is on", which leaves gfx950 (GM_DBUF=2) bit-identical. */
+#ifndef GM_CLBAR
+#define GM_CLBAR (GM_DBUF == 2)
+#endif
+#if GM_DBUF == 2 && !GM_CLBAR
+/* The double-buffered mainloop's only ordering between GM_COMMIT(buf^1) and the next tile's
+ * fragment reads IS the cluster barrier — without it the ping-pong is a data race. */
+#error "GM_DBUF=2 requires GM_CLBAR=1: no barrier orders the commit against the next tile's reads"
+#endif
+#ifndef GM_CLFENCE
+#define GM_CLFENCE (GM_DBUF == 2)
+#endif
+/* Local-register prefetch of the NEXT cluster's fragments. Only reachable when the per-cluster
+ * barriers are off (see PLR in the body); costs one extra bank of fragment registers. */
+#ifndef GM_PLR
+#define GM_PLR 1
+#endif
+/* ...and its fp8 twin, priced separately because an fp8 fragment is twice as wide. See PLR in
+ * d_gemm_fp8_t for the numbers that put this at 0. */
+#ifndef GM_PLR8
+#define GM_PLR8 0
+#endif
+#ifndef GM_PRIO
+#define GM_PRIO 1
+#endif
+/* Two-deep global prefetch (Tensile's PGR2), in a second bank of staging registers.
+ *
+ * MEASURED AND REJECTED on gfx942, and the reason is register pressure, not prefetch depth.
+ * The single-bank schedule gives every global load ONE k-tile of MFMA to land behind; doubling
+ * that to two costs (APT+BPT) more halves of staging registers, and at 8 waves / occupancy 2
+ * that is exactly the budget the fragment registers and the accumulator were already using:
+ *
+ *   tile      VGPR PGR1 -> PGR2      g31_gate_up M=4096, TF/s
+ *   256x128    186 -> 238             459 -> 379
+ *   128x256    176 -> 228             433 -> 372
+ *   128x128    112 -> 156             391 -> 304
+ *    64x128     78 -> 102             264 -> 219
+ *   320x128    168 -> 256 (19 spill)  455 -> 368
+ *
+ * Every rung regressed, monotonically with the register growth. The depth is not what the
+ * mainloop is short of -- see the GM_HACK_NOFETCH probe, which shows the global path costing
+ * ~25% even though the load already has a full k-tile of cover. Kept as a knob, defaulted OFF. */
+#ifndef GM_PGR2
+#define GM_PGR2 0
+#endif
+/* DIAGNOSTIC ONLY (never set in a shipping build): stage k-tile 0 on every iteration so every
+ * global load hits L1/L2. The result is numerically WRONG; it exists to price the global-load
+ * latency the mainloop is failing to cover, against the same schedule. */
+#ifndef GM_HACK_NOFETCH
+#define GM_HACK_NOFETCH 0
+#endif
+#define GM_LDS_HALVES_T(BM, BN, BK) (GM_DBUF * ((BM) + (BN)) * GM_STRIDE(BK))
 /* The interpreter allocates ONE LDS arena, so it must fit the largest config any
  * packet may select: 256x256x64 => 144 KiB of the 160 KiB available. */
 #define GM_LDS_HALVES GM_LDS_HALVES_T(GM_BM, GM_BN, GM_BK)
@@ -323,10 +444,24 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
     constexpr int APASS = APT / 8;       /* 16-byte passes                      */
     constexpr int BPASS = BPT / 8;
     constexpr int TILE = (BM + BN) * STRIDE;
+    constexpr bool DBUF = (GM_DBUF == 2); /* one stage buffer, or two */
+    constexpr bool CLBAR = (GM_CLBAR);    /* per-cluster barriers: the ping-pong's mechanism */
+    constexpr bool CLFENCE = (GM_CLFENCE);
+    /* PLR (local-register prefetch) rotates the fragment registers so cluster sl+1's ds_reads
+     * issue before cluster sl's MFMA burst. It is mutually exclusive with the per-cluster
+     * barriers -- a barrier between the read and its consumer is exactly what it exists to
+     * remove -- so it defaults OFF wherever the ping-pong is ON, leaving gfx950 untouched. */
+    constexpr bool PLR = (GM_PLR) && !CLBAR;
+    /* s_setprio(1) around the MFMA burst exists for the ping-pong: it stops the co-resident
+     * MEMORY wave stealing issue slots from the matrix pipe. With the ping-pong gone the two
+     * waves on a SIMD are not phase-locked, so raising priority for the whole burst can instead
+     * starve the partner's ds_read issue. Kept on by default (it is what gfx950 ships) and
+     * exposed so the CDNA3 schedule can be A/B'd against it. */
+    constexpr bool PRIO = (GM_PRIO) != 0;
 
     static_assert(APT % 8 == 0 && BPT % 8 == 0, "tile must stage in 16-byte units");
     static_assert(BM % (WM * MFMA_M) == 0 && BN % (WN * MFMA_N) == 0, "tile must fit the wave grid");
-    static_assert(NSL >= 2, "the ping-pong needs at least 2 MEM/MFMA cluster pairs");
+    static_assert(NSL >= 2 || !CLBAR, "the ping-pong needs at least 2 MEM/MFMA cluster pairs");
     static_assert(THREADS == PLOW_THREADS, "GEMM wave grid must match the interpreter's");
     /* THE GLU EPILOGUE RIDES THE EXISTING TILE -- no extra registers, no extra LDS, no extra
      * MFMA. The trick is the WAVE->COLUMN map. Normally `j` (the SN axis) selects a column
@@ -353,7 +488,32 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
     /* WFP4 dequants fp4->bf16 in registers, so it MUST use the fetch+commit path (the direct
      * global_load_lds DMA streams raw weight bytes to LDS with no register round-trip to convert
      * in). Adding !WFP4 leaves the bf16 predicate — and thus the bf16 codegen — untouched. */
-    constexpr bool DIRECT = !NORM && !GLU && KEXACT && !WFP4 && !WFP8BLK;
+    /* AND IT IS CDNA4-ONLY, WHICH IS NOT A DETAIL -- ON CDNA3 IT IS A PESSIMISATION.
+     *
+     * `cp_async16` has no CDNA3 hardware behind it: gfx942's global_load_lds tops out at 4 B/lane
+     * and a 4-byte issue lays the lanes down at lane*4, not the lane*16 stride every fragment read
+     * assumes, so amd_arch.h/amd_common.h lower the 16 B/lane call to a VGPR-STAGED COPY -- a
+     * global_load_dwordx4 with the matching ds_write_b128 fused to it. That is the same work
+     * GM_FETCH+GM_COMMIT do, with one difference that costs everything: the load and the LDS store
+     * are welded together, so the prefetch DISTANCE is zero.
+     *
+     * At GM_DBUF=1 that lands the whole staging sequence in the k-tile TAIL (there is no idle
+     * buffer to stream into early), immediately followed by cp_async_wait() -- i.e. a full HBM
+     * round trip exposed on EVERY k-tile, ~84 of them at K=5376, with no MFMA over it. The
+     * register path instead issues GM_FETCH(kn) at the TOP of the tile, where it has all NSL
+     * clusters of MFMA to land behind, and leaves only the ds_write in the tail.
+     *
+     * MEASURED (gfx942, GM_DBUF=1, g31_gate_up M=4096 x N=21504 x K=5376, bf16 TF/s, warm
+     * median-of-5): 192x256 431 -> 430 is not the story -- the tile ladder as a whole moves
+     * 369 -> 449 best-of, and the small tiles move most because their k-tiles are shortest:
+     * 64x128 231 -> 268, 128x128 317 -> 378, 128x256 359 -> 451.
+     * gfx950 is untouched: PLOW_CDNA4 is 1 there, the builtin is real, and DBUF=2 gives the DMA
+     * its idle buffer to stream into a cluster ahead. */
+    constexpr bool DIRECT = PLOW_CDNA4 && !NORM && !GLU && KEXACT && !WFP4 && !WFP8BLK;
+    /* Two-deep GLOBAL prefetch, the register-bank analogue of Tensile's PGR2. Only reachable on
+     * the single-buffered register-staging path -- with two LDS buffers the DMA already has the
+     * idle buffer to stream into, and DIRECT has no register bank to double. */
+    constexpr bool PGR2 = (GM_PGR2) && !DBUF && !DIRECT;
 
 #define GM_ASM(b) (lds + (b) * TILE)
 #define GM_BSM(b) (lds + (b) * TILE + BM * STRIDE)
@@ -405,15 +565,22 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
         (void)KB;
 
         /* Staging registers. Indices MUST be compile-time constants: a runtime
-         * index forces these arrays out of registers and into scratch (HBM). */
+         * index forces these arrays out of registers and into scratch (HBM).
+         *
+         * `ra2`/`rb2` are the SECOND global-prefetch bank (PGR2, below). Sized 1 element when
+         * PGR2 is off so the single-bank register allocation -- and gfx950's codegen -- are
+         * bit-identical to what they were. */
         __align__(16) bf16 ra[APT], rb[BPT];
+        __align__(16) bf16 ra2[PGR2 ? APT : 1], rb2[PGR2 ? BPT : 1];
+        (void)ra2;
+        (void)rb2;
 
 /* KEXACT (K % BK == 0) is the common case and plowc knows K per bucket, so the
  * ragged-K path below compiles away entirely for every Gemma shape. It must
  * exist though: the load is 8 halves wide, so a chunk starting at kk < K can
  * still run off the end of the row and pull in the NEXT row's values, which the
  * MFMA then silently accumulates. Checking only `kk < K` is NOT enough. */
-#define GM_FETCH(k0)                                                                         \
+#define GM_FETCH_TO(ra, rb, k0)                                                              \
     _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                    \
         const unsigned e = threadIdx.x * 8 + it * (THREADS * 8);                              \
         const unsigned r = m0 + e / BK;                                                       \
@@ -491,7 +658,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
         }                                                                                     \
     }
 
-#define GM_COMMIT(buf)                                                                       \
+#define GM_COMMIT_FROM(ra, rb, buf)                                                          \
     _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                    \
         const unsigned e = threadIdx.x * 8 + it * (THREADS * 8);                              \
         __builtin_memcpy(&GM_ASM(buf)[(e / BK) * STRIDE + GM_XORSWZ(e / BK, e % BK)],            \
@@ -502,6 +669,9 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
         __builtin_memcpy(&GM_BSM(buf)[(e / BK) * STRIDE + GM_XORSWZ(e / BK, e % BK)],            \
                          &rb[it * 8], 16);                                                    \
     }
+
+#define GM_FETCH(k0) GM_FETCH_TO(ra, rb, k0)
+#define GM_COMMIT(buf) GM_COMMIT_FROM(ra, rb, buf)
 
 /* DIRECT global->LDS staging: global_load_lds_dwordx4 (16 B/lane) streams HBM straight into LDS
  * with NO register round-trip -- no ra/rb, freeing those VGPRs. The 64 lanes of a wave land
@@ -529,7 +699,28 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                    &GM_BSM(buf)[(threadIdx.x & ~63u) * 8 + it * (THREADS * 8)]);              \
     }
 
-/* One cluster's worth of A/B fragments, LDS -> registers (ds_read_b128). */
+/* One cluster's worth of A/B fragments, LDS -> registers (ds_read_b128), into a NAMED pair of
+ * register banks. The banks are declared by the caller so the PLR rotation below can hold two
+ * clusters at once; GM_READ_FRAGS keeps the old declare-and-fill spelling for the CLBAR path. */
+#define GM_READ_INTO(af, bfr, buf, sl)                                                       \
+    _Pragma("unroll") for (int i = 0; i < SM; i++)                                            \
+        _Pragma("unroll") for (int q = 0; q < KS; q++) {                                      \
+            const unsigned arow = wm * (BM / WM) + i * MFMA_M + frow;                         \
+            __builtin_memcpy(                                                                  \
+                &af[i][q],                                                                     \
+                &GM_ASM(buf)[arow * STRIDE +                                                   \
+                             GM_XORSWZ(arow, mfma_frag_k(lane, (sl) * SLICE + q * MFMA_K))], 16); \
+        }                                                                                     \
+    _Pragma("unroll") for (int j = 0; j < SN; j++)                                            \
+        _Pragma("unroll") for (int q = 0; q < KS; q++) {                                      \
+            const unsigned brow =                                                              \
+                (GLU ? j * (BN / 2) + wn * MFMA_N : wn * (BN / WN) + j * MFMA_N) + frow;       \
+            __builtin_memcpy(                                                                  \
+                &bfr[j][q],                                                                    \
+                &GM_BSM(buf)[brow * STRIDE +                                                   \
+                             GM_XORSWZ(brow, mfma_frag_k(lane, (sl) * SLICE + q * MFMA_K))], 16); \
+        }
+
 #define GM_READ_FRAGS(buf, sl)                                                               \
     bf16x8 af[SM][KS], bfr[SN][KS];                                                           \
     _Pragma("unroll") for (int i = 0; i < SM; i++)                                            \
@@ -552,18 +743,26 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
 
 /* s_setprio(1) for the burst: the memory wave sharing this SIMD must not steal
  * issue slots from the matrix pipe. */
-#define GM_MFMA_BURST()                                                                      \
-    __builtin_amdgcn_s_setprio(1);                                                            \
+#define GM_MFMA_FROM(af, bfr)                                                                \
+    if constexpr (PRIO) __builtin_amdgcn_s_setprio(1);                                        \
     _Pragma("unroll") for (int q = 0; q < KS; q++)                                            \
         _Pragma("unroll") for (int i = 0; i < SM; i++)                                        \
             _Pragma("unroll") for (int j = 0; j < SN; j++) acc[i][j] =                        \
-                __builtin_amdgcn_mfma_f32_32x32x16_bf16(af[i][q], bfr[j][q], acc[i][j], 0, 0, \
-                                                        0);                                   \
-    __builtin_amdgcn_s_setprio(0);
+                plow_mfma_bf16_32x32(af[i][q], bfr[j][q], acc[i][j]);                         \
+    if constexpr (PRIO) __builtin_amdgcn_s_setprio(0);
+#define GM_MFMA_BURST() GM_MFMA_FROM(af, bfr)
 
 /* sched_barrier(0) lets NOTHING cross. Without these the compiler hoists the
- * global loads across the cluster boundaries and the ping-pong evaporates. */
-#define GM_FENCE() __builtin_amdgcn_sched_barrier(0)
+ * global loads across the cluster boundaries and the ping-pong evaporates.
+ * With no ping-pong (GM_DBUF=1) that hoisting is the WHOLE POINT -- see GM_CLFENCE. */
+#define GM_FENCE()                                                                           \
+    do {                                                                                      \
+        if constexpr (CLFENCE) __builtin_amdgcn_sched_barrier(0);                             \
+    } while (0)
+#define GM_CLUSTER_BARRIER()                                                                 \
+    do {                                                                                      \
+        if constexpr (CLBAR) __builtin_amdgcn_s_barrier();                                    \
+    } while (0)
 
         __syncthreads(); /* previous tile's readers must be done with the LDS */
         if constexpr (DIRECT) {
@@ -579,40 +778,84 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
 
         const unsigned NT = (K + BK - 1) / BK;
         unsigned buf = 0;
+        /* PGR2 PRIMES BANK 0 WITH K-TILE 1 HERE, one k-tile ahead of the loop.
+         * From then on iteration kt fetches tile kt+2 into the bank it is NOT about to commit,
+         * so every global load has a FULL k-tile plus the current one to land behind instead of
+         * just the current one. That distance is what the single-bank schedule cannot buy: its
+         * fetch is issued at cluster 0 of tile kt and waited on at the END of tile kt. */
+        if constexpr (PGR2) {
+            if (BK < K) GM_FETCH_TO(ra, rb, (unsigned)BK)
+        }
 
         /* THE PING-PONG PRIMITIVE. Group 1 eats one extra barrier here, which
          * offsets it by exactly one cluster for the rest of the kernel: from now on
          * group 0 is in a MEM cluster exactly when group 1 is in an MFMA cluster. */
-        if (PP && wm == 1) __builtin_amdgcn_s_barrier();
+        constexpr bool PPE = PP && DBUF; /* the ping-pong trades BUFFERS; one buffer, no trade */
+        if (PPE && wm == 1) __builtin_amdgcn_s_barrier();
 
 #pragma unroll 1
         for (unsigned kt = 0; kt < NT; kt++) {
             const unsigned kn = (kt + 1) * BK;
+            const unsigned kn2 = (kt + 2) * BK;
+            (void)kn2;
 
+/* The global traffic a cluster owes, identical under both schedules. */
+#define GM_CLUSTER_GLOBAL(sl)                                                                \
+    if constexpr (DIRECT) {                                                                   \
+        /* Issue the next tile's global->LDS DMA at the START of the MEM cluster so it lands   \
+         * behind NSL-1 clusters of MFMA; drain it at the LAST cluster, before the barrier, so \
+         * buf^1 is fully written when the next kt reads it. Single-buffered there is no idle  \
+         * buffer to land in, so it moves below. */                                            \
+        if (DBUF && (sl) == 0 && kn < K) { GM_DMA(buf ^ 1, kn); }                              \
+        if (DBUF && (sl) == NSL - 1 && kn < K) { cp_async_wait(); }                            \
+    } else {                                                                                  \
+        /* The global->REGISTER fetch stays at the top of the tile under both layouts: it      \
+         * touches no LDS, so it lands behind the whole MFMA run either way. Only the LDS       \
+         * commit has to wait for the reads when there is one buffer. */                        \
+        if constexpr (!PGR2) {                                                                 \
+            if ((sl) == 0 && kn < K) { GM_FETCH(GM_HACK_NOFETCH ? 0u : kn); }                  \
+            if (DBUF && (sl) == NSL - 1 && kn < K) { GM_COMMIT(buf ^ 1); }                      \
+        } else if ((sl) == 0 && kn2 < K) {                                                     \
+            /* bank kt&1 holds tile kt+1 and is committed at the tail; fetch into the other. */ \
+            if (kt & 1u) { GM_FETCH_TO(ra, rb, kn2) } else { GM_FETCH_TO(ra2, rb2, kn2) }       \
+        }                                                                                      \
+    }
+
+            if constexpr (!PLR) {
 #pragma unroll
-            for (int sl = 0; sl < NSL; sl++) {
-                /* ---- MEM cluster: LDS -> fragments, plus this tile's global traffic.
-                 * The prefetch is issued in the first cluster and committed in the
-                 * last, so the loads have NSL-1 clusters of MFMA to land behind. */
-                GM_FENCE();
-                GM_READ_FRAGS(buf, sl)
-                if constexpr (DIRECT) {
-                    /* Issue the next tile's global->LDS DMA at the START of the MEM cluster so it
-                     * lands behind NSL-1 clusters of MFMA; drain it at the LAST cluster, before the
-                     * barrier, so buf^1 is fully written when the next kt reads it. */
-                    if (sl == 0 && kn < K) { GM_DMA(buf ^ 1, kn); }
-                    if (sl == NSL - 1 && kn < K) { cp_async_wait(); }
-                } else {
-                    if (sl == 0 && kn < K) { GM_FETCH(kn); }
-                    if (sl == NSL - 1 && kn < K) { GM_COMMIT(buf ^ 1); }
-                }
-                GM_FENCE();
-                __builtin_amdgcn_s_barrier();
+                for (int sl = 0; sl < NSL; sl++) {
+                    /* ---- MEM cluster: LDS -> fragments, plus this tile's global traffic. */
+                    GM_FENCE();
+                    GM_READ_FRAGS(buf, sl)
+                    GM_CLUSTER_GLOBAL(sl)
+                    GM_FENCE();
+                    GM_CLUSTER_BARRIER();
 
-                /* ---- MFMA cluster */
-                GM_MFMA_BURST()
-                GM_FENCE();
-                __builtin_amdgcn_s_barrier();
+                    /* ---- MFMA cluster */
+                    GM_MFMA_BURST()
+                    GM_FENCE();
+                    GM_CLUSTER_BARRIER();
+                }
+            } else {
+                /* PLR: the ds_read for cluster sl+1 is ISSUED BEFORE cluster sl's MFMA burst, so
+                 * its ~120-cycle LDS latency and its 8-cycle-per-read issue occupancy sit under
+                 * SM*SN*KS matrix instructions instead of in front of them. Straight out of the
+                 * disassembly of the non-PLR loop, which reads:
+                 *
+                 *     ds_read_b128 x10 ; s_waitcnt lgkmcnt(0) ; v_mfma x24 ; ds_read_b128 x10 ;
+                 *     s_waitcnt lgkmcnt(0) ; v_mfma x24
+                 *
+                 * -- every read burst fully exposed. The rotation costs one extra bank of fragment
+                 * registers ((SM+SN)*KS*16 B/lane) and nothing else; the compiler sinks the
+                 * waitcnt to the first consumer on its own once the producer is a cluster early. */
+                bf16x8 afp[2][SM][KS], bfp[2][SN][KS];
+                GM_READ_INTO(afp[0], bfp[0], buf, 0)
+#pragma unroll
+                for (int sl = 0; sl < NSL; sl++) {
+                    if (sl + 1 < NSL) { GM_READ_INTO(afp[(sl + 1) & 1], bfp[(sl + 1) & 1], buf, sl + 1) }
+                    GM_CLUSTER_GLOBAL(sl)
+                    GM_MFMA_FROM(afp[sl & 1], bfp[sl & 1])
+                }
             }
             /* BLOCK-FP8 PROMOTION. A 128-element K scale block is exactly two BK=64 tiles, so the
              * boundary always falls here — between k-tiles, outside every MFMA burst and outside
@@ -631,7 +874,39 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                         }
                 }
             }
-            buf ^= 1;
+            if constexpr (!DBUF) {
+                /* Every wave has now read the whole tile, so the single buffer is free. This is
+                 * the barrier double-buffering does not pay, and the LDS store it does not
+                 * expose -- the price of the bigger tile.
+                 *
+                 * When the per-cluster barriers are OFF this is the only place the "everyone has
+                 * finished reading" edge exists, so the barrier below the reads is REQUIRED, not
+                 * an optimisation: without it a fast wave overwrites the stage while a slow one
+                 * is still issuing ds_read for the current k-tile. */
+                /* __syncthreads(), not a bare s_barrier: with the per-cluster fences gone these
+                 * two are the ONLY things ordering the ds_reads above against the ds_writes
+                 * below, so they have to carry the workgroup memory fence as well as the
+                 * hardware barrier. (Under CLBAR the cluster barriers already separated them and
+                 * the sched_barrier(0) fences pinned the schedule; that path is unchanged.) */
+                if (kn < K) {
+                    if constexpr (!CLBAR) __syncthreads();
+                    if constexpr (DIRECT) {
+                        GM_DMA(0, kn);
+                        cp_async_wait();
+                    } else if constexpr (PGR2) {
+                        if (kt & 1u) { GM_COMMIT_FROM(ra2, rb2, 0) } else { GM_COMMIT_FROM(ra, rb, 0) }
+                    } else {
+                        GM_COMMIT(0);
+                    }
+                    if constexpr (CLBAR) {
+                        GM_FENCE();
+                        __builtin_amdgcn_s_barrier();
+                    } else {
+                        __syncthreads();
+                    }
+                }
+            }
+            if constexpr (DBUF) buf ^= 1;
         }
         /* Hand the promoted result back to the shared epilogue below. */
         if constexpr (WFP8BLK) {
@@ -641,7 +916,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                 for (int j = 0; j < SN; j++) acc[i][j] = accf[i][j];
         }
         /* Rebalance: group 0 must execute as many barriers as group 1 did. */
-        if (PP && wm == 0) __builtin_amdgcn_s_barrier();
+        if (PPE && wm == 0) __builtin_amdgcn_s_barrier();
         __syncthreads();
 
         /* The store is already COALESCED -- lanes 0-31 hold consecutive columns, so each of
@@ -750,15 +1025,23 @@ __device__ void d_gemm(bf16* C, const bf16* A, const bf16* B, unsigned M, unsign
  * family with a different B-fetch, so it gets the same rungs and the same selector.
  * `PLOW_GM_MXFP4_TILE(NAME, BM, BN)` keeps the five bodies textually identical -- the
  * previous divergence was a copy of the default-tile call that nobody updated. */
-#define PLOW_GM_MXFP4_TILE(NAME, BM, BN)                                                       \
+/* BK IS A PARAMETER, not the global `GM_BK`, and that is a fix rather than a generalisation.
+ * The comment above promises these twins are the same tiles as their bf16 rungs; with `GM_BK`
+ * hardcoded they were the same BM/BN against the DEFAULT rung's BK. On gfx950 that is invisible
+ * because every rung is BK=64 == GM_BK. On CDNA3, where the rungs carry different BKs to fit a
+ * DOUBLE-BUFFERED stage in 64 KiB, it breaks the build outright:
+ *   d_gemm_t<192, 256, 32, ...>  static_assert(APT % 8 == 0) -- 192*32/512 = 12.
+ * Note these are instantiated UNCONDITIONALLY, not behind PLOW_MXFP4, so an arch that never
+ * serves mxfp4 still has to compile them. */
+#define PLOW_GM_MXFP4_TILE(NAME, BM, BN, BK)                                                   \
     __device__ void NAME(bf16* C, const bf16* A, const unsigned char* W,                       \
                          const unsigned char* wscale, unsigned M, unsigned N, unsigned K,      \
                          unsigned slice, unsigned nblk, bf16* lds) {                           \
-        d_gemm_t<BM, BN, GM_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true, false, \
+        d_gemm_t<BM, BN, BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM, (GM_PP != 0), true, false,   \
                  true>(C, A, (const bf16*)W, nullptr, nullptr, M, N, K, slice, nblk, lds,       \
                        nullptr, 0, wscale);                                                    \
     }
-PLOW_GM_MXFP4_TILE(d_gemm_mxfp4, GM_BM, GM_BN)
+PLOW_GM_MXFP4_TILE(d_gemm_mxfp4, GM_BM, GM_BN, GM_BK)
 
 /* Small tile, for shapes that cannot fill the machine at 256x256.
  *
@@ -782,6 +1065,28 @@ PLOW_GM_MXFP4_TILE(d_gemm_mxfp4, GM_BM, GM_BN)
  * So the big tile is 3x too SLOW for a real prefill and 2-3x too FAST to give up at long
  * context. There is no single right tile -- which is the whole reason the tile is a
  * compile-time bucket and plowc picks it per shape. */
+/* THE RUNG LADDER IS SHARED BY BOTH ARCHS, and CDNA3 runs it SINGLE-buffered (GM_DBUF=1,
+ * defaulted per-arch above). At DBUF=1 every rung below fits 64 KiB unchanged -- 27,648 /
+ * 36,864 / 55,296 / 64,512 B -- so there is nothing to re-cut.
+ *
+ * RESTORING THE PING-PONG ON CDNA3 WAS BUILT AND MEASURED, AND IT LOSES. The idea: BK is the
+ * only axis that shrinks the stage without touching BN (BN is pinned by the fused-GLU SN==2
+ * assert), so halve it to 32 and the second buffer fits -- 128x256 double-buffered is 61,440 B.
+ * That requires re-cutting the ladder, because at BK=32 the staging assert (APT/BPT % 8 == 0)
+ * demands BM % 128 == 0 and BN % 128 == 0, which 192 and 64 fail. Built it: MD 128x128 BK=32,
+ * WD 128x256 BK=32, C5 256x128 BK=32, default 128x256 BK=32, GM_DBUF=2. It compiles, it fits
+ * (61,448 B, 256 VGPR, spill 2) and it PASSES the golden GEMM oracle. Measured on the real
+ * Gemma-4-12B asset, 4096-token prefill, gfx942:
+ *
+ *     192x256  BK=64  DBUF=1   575.2 ms   <- shipped
+ *     128x256  BK=64  DBUF=1   585.9 ms   +1.9%
+ *     128x256  BK=32  DBUF=2   642.6 ms   +11.7%
+ *
+ * The ping-pong does not pay for the BK it costs. Halving BK doubles the k-tile count and its
+ * barriers, and drops NSL from 4 to 2 -- the ping-pong's minimum -- so there are half as many
+ * cluster pairs to trade while the register-staged global prefetch (GM_FETCH at the top of the
+ * tile) loses half the MFMA it had to land behind. On a 64 KiB part the long single-buffered
+ * k-tile is worth more than the overlap. Do not re-try this without a way to keep BK=64. */
 #define GM_SM_BM 64
 #define GM_SM_BN 128
 #define GM_SM_BK 64
@@ -859,10 +1164,10 @@ __device__ void d_gemm_c5(bf16* C, const bf16* A, const bf16* B, unsigned M, uns
 /* The mxfp4 (w4a16) twins of the four non-default rungs. Same tiles, same selector; only the
  * B-fetch differs (WFP4). Declared here rather than next to `d_gemm_mxfp4` because the tile
  * constants above are what they instantiate. */
-PLOW_GM_MXFP4_TILE(d_gemm_med_mxfp4, GM_MD_BM, GM_MD_BN)
-PLOW_GM_MXFP4_TILE(d_gemm_small_mxfp4, GM_SM_BM, GM_SM_BN)
-PLOW_GM_MXFP4_TILE(d_gemm_wide_mxfp4, GM_WD_BM, GM_WD_BN)
-PLOW_GM_MXFP4_TILE(d_gemm_c5_mxfp4, GM_C5_BM, GM_C5_BN)
+PLOW_GM_MXFP4_TILE(d_gemm_med_mxfp4, GM_MD_BM, GM_MD_BN, GM_MD_BK)
+PLOW_GM_MXFP4_TILE(d_gemm_small_mxfp4, GM_SM_BM, GM_SM_BN, GM_SM_BK)
+PLOW_GM_MXFP4_TILE(d_gemm_wide_mxfp4, GM_WD_BM, GM_WD_BN, GM_WD_BK)
+PLOW_GM_MXFP4_TILE(d_gemm_c5_mxfp4, GM_C5_BM, GM_C5_BN, GM_C5_BK)
 
 /* ---------------------------------------------------------------------------
  * DENSE PREFILL BLOCK-FP8 GEMM (w8a16) — `d_gemm_fp8_blk`, opcode GEMM_FP8_BLK.
@@ -909,9 +1214,33 @@ PLOW_GM_MXFP4_TILE(d_gemm_c5_mxfp4, GM_C5_BM, GM_C5_BN)
  * object never sees it — the GF=8 lesson (a register-neutral arm that was a +32% decode regression
  * purely by growing the decode object inside the persistent megakernel) applies to any new MFMA
  * body, and this one has no business in a decode program: decode's block-fp8 is op 44/47. */
+/* THE BLOCK-FP8 TILE IS ACCUMULATOR-BOUND, NOT LDS-BOUND. Do not size it from the LDS the way
+ * the bf16 tile is sized -- that reasoning is the trap.
+ *
+ * WFP8BLK carries a SECOND accumulator: `accf` promotes `acc` at every 128-K scale boundary, so
+ * the register cost is 2*SM*SN*16, twice the bf16 body's. Measured on gfx942 for
+ * d_gemm_fp8_blk_k, all at LDS that fits:
+ *
+ *   192x256   256 VGPR, 63 SPILL, occ 2      <- the bf16 tile, and it spills badly here
+ *   128x256   236 VGPR,  0 spill, occ 2
+ *   128x128   148 VGPR,  0 spill, occ 2      <- the default, and what gfx950 runs
+ *
+ * So this stays at 128x128 even on a build whose bf16 tile is 192x256. Overriding it to match
+ * the bf16 tile costs 63 spilled registers and, measured on the GLM block-fp8 prefill shapes,
+ * up to 2.97x throughput. 128x256 only pays back at M >= 2048.
+ *
+ * Still overridable, because a 64 KiB part may need to shrink it further for LDS reasons:
+ * 128x128x64 stages 73,728 B double-buffered, which a CDNA3 workgroup cannot hold, so a
+ * double-buffered gfx942 build wants 64x128x64 (55,296 B). Single-buffered it fits as-is. */
+#ifndef GM_BLK_BM
 #define GM_BLK_BM 128
+#endif
+#ifndef GM_BLK_BN
 #define GM_BLK_BN 128
+#endif
+#ifndef GM_BLK_BK
 #define GM_BLK_BK 64
+#endif
 __device__ void d_gemm_fp8_blk(bf16* C, const bf16* A, const unsigned char* W,
                                const float* wscale, unsigned M, unsigned N, unsigned K,
                                unsigned slice, unsigned nblk, bf16* lds) {
@@ -1054,14 +1383,25 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
     constexpr int APASS = APT / 8;         /* 8-byte (8-fp8) load/commit passes */
     constexpr int BPASS = BPT / 8;
     constexpr int TILE = (BM + BN) * STRIDE; /* bytes per LDS buffer */
+    constexpr bool DBUF = (GM_DBUF == 2);    /* must track the bf16 arena that sizes the LDS */
+    constexpr bool CLBAR = (GM_CLBAR);       /* see the bf16 body: dead barriers at GM_DBUF=1 */
+    constexpr bool CLFENCE = (GM_CLFENCE);
+    /* PLR pays in the bf16 body and does NOT pay here, and the reason is the fragment WIDTH: an
+     * fp8 K64 fragment is 32 B/lane (ds_read_b256, 8 VGPRs) against bf16's 16 B, so one extra
+     * bank costs (SM+SN)*8 registers instead of (SM+SN)*4. Measured on gfx942, g31_gate_up
+     * M=4096 / g31_q_proj M=128, fp8 TF/s: 192x256 560 -> 563 but 240 -> 256 VGPR with 14 spills,
+     * and 64x128 at M=128 172 -> 148. Off by default; the knob stays so it can be re-priced if
+     * the fp8 accumulator ever shrinks. */
+    constexpr bool PLR = (GM_PLR8) && !CLBAR; /* local-register fragment prefetch */
+    constexpr bool PRIO = (GM_PRIO) != 0;
 
     static_assert(APT % 8 == 0 && BPT % 8 == 0, "tile must stage in 8-byte (8-fp8) units");
     static_assert(BM % (WM * MFMA_M) == 0 && BN % (WN * MFMA_N) == 0, "tile must fit the wave grid");
-    static_assert(NSL >= 2, "the ping-pong needs at least 2 MEM/MFMA cluster pairs");
+    static_assert(NSL >= 2 || !CLBAR, "the ping-pong needs at least 2 MEM/MFMA cluster pairs");
     static_assert(THREADS == PLOW_THREADS, "GEMM wave grid must match the interpreter's");
     static_assert(!GLU || SN == 2, "the GLU epilogue uses the SN axis to select gate vs up");
     constexpr int NB = GLU ? BN / 2 : BN;
-    constexpr bool PP = (GM_PP != 0);
+    constexpr bool PP = (GM_PP != 0) && DBUF; /* the ping-pong trades BUFFERS */
 
     unsigned char* const lds8 = (unsigned char*)lds;
 #define GM8_ASM(b) (lds8 + (b) * TILE)
@@ -1129,20 +1469,38 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
         }                                                                                     \
     }
 
+/* CDNA3 ONLY: the matrix core reads e4m3FNUZ, in which 0x80 is a NaN rather than OCP's -0.
+ * Zeroing it here -- on the 8-byte group already sitting in registers, two SWAR words, before it
+ * ever reaches LDS -- is the whole cost of running plow's OCP bytes through it. Every other byte
+ * is exactly half its OCP value and PLOW_FP8_MMA_FIX puts that back in the epilogue.
+ * A weight that quantised to negative zero would otherwise NaN the entire output tile. */
+#if PLOW_CDNA4
+#define GM8_FIX8(p) ((void)0)
+#else
+#define GM8_FIX8(p)                                                                          \
+    do {                                                                                      \
+        unsigned w_[2];                                                                       \
+        __builtin_memcpy(w_, (p), 8);                                                         \
+        w_[0] = plow_fp8_mask_neg0(w_[0]);                                                    \
+        w_[1] = plow_fp8_mask_neg0(w_[1]);                                                    \
+        __builtin_memcpy((p), w_, 8);                                                         \
+    } while (0)
+#endif
 #define GM8_COMMIT(buf)                                                                      \
     _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                    \
         const unsigned e = threadIdx.x * 8 + it * (THREADS * 8);                              \
+        GM8_FIX8(&ra[it * 8]);                                                                \
         __builtin_memcpy(&GM8_ASM(buf)[(e / FBK) * STRIDE + GM8_XORSWZ(e / FBK, e % FBK)],       \
                          &ra[it * 8], 8);                                                     \
     }                                                                                         \
     _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                    \
         const unsigned e = threadIdx.x * 8 + it * (THREADS * 8);                              \
+        GM8_FIX8(&rb[it * 8]);                                                                \
         __builtin_memcpy(&GM8_BSM(buf)[(e / FBK) * STRIDE + GM8_XORSWZ(e / FBK, e % FBK)],       \
                          &rb[it * 8], 8);                                                     \
     }
 
-#define GM8_READ_FRAGS(buf, sl)                                                              \
-    fp8v32 af[SM][KS], bfr[SN][KS];                                                           \
+#define GM8_READ_INTO(af, bfr, buf, sl)                                                      \
     _Pragma("unroll") for (int i = 0; i < SM; i++)                                            \
         _Pragma("unroll") for (int q = 0; q < KS; q++) {                                      \
             const unsigned arow = wm * (BM / WM) + i * MFMA_M + frow;                         \
@@ -1159,6 +1517,10 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
                               GM8_XORSWZ(brow, frag_k64(lane, (sl) * SLICE + q * FMK))], 32);  \
         }
 
+#define GM8_READ_FRAGS(buf, sl)                                                              \
+    fp8v32 af[SM][KS], bfr[SN][KS];                                                           \
+    GM8_READ_INTO(af, bfr, buf, sl)
+
 /* cbsz=0 (A e4m3), blgp=0 (B e4m3), opsel=0, scale_a=0, scale_b=0.
  *
  * THE ZEROS ARE SAFE HERE FOR A REASON THAT DOES NOT GENERALISE, and this comment used to state
@@ -1171,16 +1533,23 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
  * v_mfma_scale_*). A RUNTIME scale operand selects the scaled form and byte 0 then silently
  * zeroes the output — use PLOW_E8M0_ONE, never 0. Per-row/per-channel dequant is applied in the
  * epilogue; the MX per-32-block scale is not used by this kernel at all. */
-#define GM8_MFMA_BURST()                                                                     \
-    __builtin_amdgcn_s_setprio(1);                                                            \
+#define GM8_MFMA_FROM(af, bfr)                                                               \
+    if constexpr (PRIO) __builtin_amdgcn_s_setprio(1);                                        \
     _Pragma("unroll") for (int q = 0; q < KS; q++)                                            \
         _Pragma("unroll") for (int i = 0; i < SM; i++)                                        \
             _Pragma("unroll") for (int j = 0; j < SN; j++) acc[i][j] =                        \
-                __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(af[i][q], bfr[j][q],          \
-                                                acc[i][j], 0, 0, 0, 0, 0, 0);                 \
-    __builtin_amdgcn_s_setprio(0);
+                plow_mfma_fp8_32x32(af[i][q], bfr[j][q], acc[i][j]);                          \
+    if constexpr (PRIO) __builtin_amdgcn_s_setprio(0);
+#define GM8_MFMA_BURST() GM8_MFMA_FROM(af, bfr)
 
-#define GM8_FENCE() __builtin_amdgcn_sched_barrier(0)
+#define GM8_FENCE()                                                                          \
+    do {                                                                                      \
+        if constexpr (CLFENCE) __builtin_amdgcn_sched_barrier(0);                             \
+    } while (0)
+#define GM8_CLUSTER_BARRIER()                                                                \
+    do {                                                                                      \
+        if constexpr (CLBAR) __builtin_amdgcn_s_barrier();                                    \
+    } while (0)
 
         __syncthreads();
         GM8_FETCH(0);
@@ -1194,20 +1563,51 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
 #pragma unroll 1
         for (unsigned kt = 0; kt < NT; kt++) {
             const unsigned kn = (kt + 1) * FBK;
+            if constexpr (!PLR) {
 #pragma unroll
-            for (int sl = 0; sl < NSL; sl++) {
-                GM8_FENCE();
-                GM8_READ_FRAGS(buf, sl)
-                if (sl == 0 && kn < K) { GM8_FETCH(kn); }
-                if (sl == NSL - 1 && kn < K) { GM8_COMMIT(buf ^ 1); }
-                GM8_FENCE();
-                __builtin_amdgcn_s_barrier();
+                for (int sl = 0; sl < NSL; sl++) {
+                    GM8_FENCE();
+                    GM8_READ_FRAGS(buf, sl)
+                    if (sl == 0 && kn < K) { GM8_FETCH(kn); }
+                    if (DBUF && sl == NSL - 1 && kn < K) { GM8_COMMIT(buf ^ 1); }
+                    GM8_FENCE();
+                    GM8_CLUSTER_BARRIER();
 
-                GM8_MFMA_BURST()
-                GM8_FENCE();
-                __builtin_amdgcn_s_barrier();
+                    GM8_MFMA_BURST()
+                    GM8_FENCE();
+                    GM8_CLUSTER_BARRIER();
+                }
+            } else {
+                /* Same rotation as the bf16 body: cluster sl+1's ds_read_b256 issues before
+                 * cluster sl's MFMA burst. A fragment here is 32 B/lane, so one bank is
+                 * (SM+SN)*KS*8 VGPRs -- twice the bf16 cost per fragment, which is why this is
+                 * priced separately and not assumed to carry over. */
+                fp8v32 afp[2][SM][KS], bfp[2][SN][KS];
+                GM8_READ_INTO(afp[0], bfp[0], buf, 0)
+#pragma unroll
+                for (int sl = 0; sl < NSL; sl++) {
+                    if (sl + 1 < NSL) { GM8_READ_INTO(afp[(sl + 1) & 1], bfp[(sl + 1) & 1], buf, sl + 1) }
+                    if (sl == 0 && kn < K) { GM8_FETCH(kn); }
+                    GM8_MFMA_FROM(afp[sl & 1], bfp[sl & 1])
+                }
             }
-            buf ^= 1;
+            if constexpr (!DBUF) {
+                /* One buffer: the commit waits until every wave has read the tile. Same trade as
+                 * the bf16 body -- and required here too, because this arena is sized by
+                 * GM_LDS_HALVES_T, so a two-buffer fp8 stage in a one-buffer allocation runs off
+                 * the end. That is exactly what it did: 4/4 fp8 GEMM shapes wrong at GM_DBUF=1. */
+                if (kn < K) {
+                    if constexpr (!CLBAR) __syncthreads(); /* every wave done reading the stage */
+                    GM8_COMMIT(0);
+                    if constexpr (CLBAR) {
+                        GM8_FENCE();
+                        __builtin_amdgcn_s_barrier();
+                    } else {
+                        __syncthreads();
+                    }
+                }
+            }
+            if constexpr (DBUF) buf ^= 1;
         }
         if (PP && wm == 0) __builtin_amdgcn_s_barrier();
         __syncthreads();
@@ -1216,7 +1616,8 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
         if constexpr (GLU) {
             const unsigned nn = n0 + wn * MFMA_N + mfma_acc_n(lane);
             if (nn < N) {
-                const float gs = wscale[nn], us = wscale2[nn];
+                const float gs = wscale[nn] * PLOW_FP8_MMA_FIX,
+                            us = wscale2[nn] * PLOW_FP8_MMA_FIX;
 #pragma unroll
                 for (int i = 0; i < SM; i++)
 #pragma unroll
@@ -1237,7 +1638,7 @@ __device__ void d_gemm_fp8_t(bf16* __restrict__ C, const unsigned char* __restri
                 for (int j = 0; j < SN; j++) {
                     const unsigned nn = n0 + wn * (BN / WN) + j * MFMA_N + mfma_acc_n(lane);
                     if (nn >= N) continue;
-                    const float ws = wscale[nn];
+                    const float ws = wscale[nn] * PLOW_FP8_MMA_FIX;
 #pragma unroll
                     for (int e = 0; e < 16; e++) {
                         const unsigned mm = m0 + wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e);
@@ -1332,7 +1733,13 @@ __device__ void d_quant_fp8(unsigned char* __restrict__ xq_, const bf16* __restr
         for (unsigned k = lane * 2; k < K; k += PLOW_WAVE * 2) {
             const float a = bf2f(x[row + k]) * inv;
             const float b = (k + 1 < K) ? bf2f(x[row + k + 1]) * inv : 0.0f;
+#if PLOW_CDNA4
             const unsigned pk = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0u, false);
+#else
+            /* CDNA3's packed encoder is e4m3FNUZ, a DIFFERENT format (amd_arch.h). */
+            const unsigned pk = (unsigned)plow_f32_to_fp8_ocp(a) |
+                                ((unsigned)plow_f32_to_fp8_ocp(b) << 8);
+#endif
             st_act1_u8(&xq[row + k], (unsigned char)(pk & 0xffu));
             if (k + 1 < K) st_act1_u8(&xq[row + k + 1], (unsigned char)((pk >> 8) & 0xffu));
         }
@@ -1629,6 +2036,76 @@ __device__ __forceinline__ void gemv_rows(bf16* __restrict__ C_, const bf16* __r
  * measurement), and PLOW_FINE's gemv->headnorm dependency map ASSUMES it. Building the kernel
  * with GV_BLOCKED=0 and a packet with PLOW_FINE=1 would emit dependencies that are silently
  * WRONG — the failure mode is a wrong answer, not an error. Keep them in step. */
+/* PROBE / CANDIDATE: ONE WAVE-UNIFORM DESCRIPTOR PER WORKGROUP, not one per ROW.
+ *
+ * The waterfall note above the row loop prices `buf_rsrc(W + n*K, K)` at ~13 extra
+ * instructions per 16-byte load: LLVM cannot prove the base wave-uniform, so it wraps every
+ * `buffer_load_dwordx4` in a readfirstlane rebuild loop. THE REASON IT CANNOT is that `n`
+ * descends from `threadIdx.x >> 6` -- uniform within a wave, divergent as far as the compiler
+ * is concerned.
+ *
+ * Under GV_BLOCKED the workgroup's rows are CONTIGUOUS in W -- `[gv_n0, gv_n1)` -- so one
+ * descriptor spans all of them, and `gv_n0 = slice * gv_per` descends only from kernel
+ * arguments. That base IS provably uniform, which is a different thing from readfirstlane'ing
+ * a divergent one (tried, and recorded above as having failed to remove the waterfall).
+ *
+ * The cost is that the per-row bounds check goes with it: `num_records` now covers the whole
+ * block, so a chunk past row `n`'s end reads into row `n+1` instead of returning zero. That
+ * overshoot is real (nchunk = ceil(K/512); at K=3840 chunk 7 runs 256 halves past the row), so
+ * the offset is steered out of bounds explicitly. One v_cndmask per load against ~13 waterfall
+ * instructions.
+ *
+ * MEASURED: EXACTLY NOTHING. Gemma-4-12B, ctx 4096, 48 steps, three interleaved triples,
+ * ms/token -- base 21.322 21.270 21.329 (mean 21.307) vs GV_URSRC=1 21.306 21.292 21.314
+ * (mean 21.304). Which CONFIRMS the waterfall note's own conclusion by a different route: at
+ * M=1 the issue pipe is ~23% busy, so removing instructions from it cannot buy time. Kept at 0
+ * -- the shipped per-row descriptor is simpler and measures the same. */
+#ifndef GV_URSRC
+#define GV_URSRC 0
+#endif
+/* Force every GEMV row descriptor into SGPRs (buf_rsrc_u) so the load clause is not wrapped in a
+ * per-load exec-mask waterfall. Orthogonal to GV_URSRC: that one changes WHICH descriptor, this
+ * one changes whether the compiler can keep it SCALAR.
+ *
+ * In a megakernel the compiler can never work this out for itself -- the op's operands are read
+ * out of the packet into VGPRs, so `W + n*K` is VGPR-resident however wave-invariant its value
+ * is, and LLVM wraps every buffer_load_dwordx4 in a readfirstlane rebuild loop that ends in a
+ * BACKWARD BRANCH. That branch is the real cost: it puts each load in its own basic block, so
+ * the UN loads the source issues "before touching any of them" are not a clause at all.
+ *
+ * Applied to ALL the GEMV bodies, not just gemv_rows. The shipped decode object carried the
+ * waterfall in d_gemv_fp8_blk, d_gemv_qkv and d_gemv_glu too -- and d_gemv_glu pays it TWICE per
+ * row, once for gate and once for up. GemvGlu + GemvQkv are 57% of the decode GEMV span, so
+ * patching only gemv_rows measured almost nothing (-0.45%) while patching all of them measures:
+ *
+ *   interp_decode_gq   v_readfirstlane_b32 1385 -> 967   s_cbranch_execnz 579 -> 461
+ *   Gemma-4-12B ctx 4096, 48 steps, three interleaved pairs, ms/token:
+ *     off 21.023 21.036 21.063   on 20.955 20.907 20.912     -0.55%, ranges DISJOINT
+ *
+ * Register-neutral (253 VGPR, 0 spill) and token-identical over the real 12B asset.
+ *
+ * CDNA3 only, for the same reason FA_FAST_RCP is: this changes codegen on a shipped, validated
+ * target and there is no gfx950 here to re-run its goldens on. The note above gemv_rows' loop
+ * records an earlier gfx950 attempt at this that "does nothing" -- worth re-measuring there. */
+#ifndef GV_USCALAR
+#define GV_USCALAR (!PLOW_CDNA4)
+#endif
+#if GV_USCALAR
+#define PLOW_GV_RSRC(p, n) buf_rsrc_u((p), (n))
+#else
+#define PLOW_GV_RSRC(p, n) buf_rsrc((p), (n))
+#endif
+/* PROBE ONLY, AND IT COMPUTES THE WRONG ANSWER. Replaces the per-row cross-lane reduction with
+ * a lane-local value to price `wave_sum` -- one 6-step DPP reduction per output row. Never
+ * ship it; it exists so "the per-row constant" can be split into its two halves.
+ *
+ * MEASURED: 21.273 vs 21.307 ms/token, i.e. deleting the ENTIRE cross-lane reduction -- and
+ * returning a wrong answer -- buys 0.16%. Together with GV_URSRC's zero, that retires "the
+ * per-row constant" as an explanation for the 1.5-1.7x against hipBLASLt: the descriptor
+ * rebuild costs nothing and the reduction costs 0.16%. The GEMV's time is in the LOADS. */
+#ifndef GV_HACK_NOSUM
+#define GV_HACK_NOSUM 0
+#endif
 #ifndef GV_BLOCKED
 #define GV_BLOCKED 1
 #endif
@@ -1637,6 +2114,12 @@ __device__ __forceinline__ void gemv_rows(bf16* __restrict__ C_, const bf16* __r
     const unsigned gv_n0 = slice * gv_per;
     const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
     (void)n_waves;
+#if GV_URSRC
+    /* Built ONCE, from a base that descends only from `slice` -- see GV_URSRC above. */
+    const unsigned blk_rows = (gv_n1 > gv_n0) ? (gv_n1 - gv_n0) : 0u;
+    const unsigned blk_halves = blk_rows * K;
+    const __amdgpu_buffer_rsrc_t wrb = buf_rsrc(W + (size_t)gv_n0 * K, blk_halves);
+#endif
     for (unsigned n = gv_n0 + wave; n < gv_n1; n += PLOW_WAVES) {
 #else
     for (unsigned n = slice * PLOW_WAVES + wave; n < N; n += n_waves) {
@@ -1676,7 +2159,11 @@ __device__ __forceinline__ void gemv_rows(bf16* __restrict__ C_, const bf16* __r
          * measured end to end. Do not re-buy it; `buf_rsrc_fp8_u` exists for the paths where the
          * arithmetic is different. What DOES pay on this body is in-flight WORK, not issue slots:
          * see gemv_rows_r. */
-        const __amdgpu_buffer_rsrc_t wr = buf_rsrc(W + (size_t)n * K, K);
+#if GV_URSRC
+        const unsigned row_off = (n - gv_n0) * K; /* halves, into the block descriptor */
+#else
+        const __amdgpu_buffer_rsrc_t wr = PLOW_GV_RSRC(W + (size_t)n * K, K);
+#endif
         float acc[MM];
 #pragma unroll
         for (int m = 0; m < MM; m++) acc[m] = 0.0f;
@@ -1685,8 +2172,16 @@ __device__ __forceinline__ void gemv_rows(bf16* __restrict__ C_, const bf16* __r
             bf16v8 wv[UN];
             /* Issue all UN loads before touching any of them. */
 #pragma unroll
-            for (int u = 0; u < UN; u++)
+            for (int u = 0; u < UN; u++) {
+#if GV_URSRC
+                const unsigned e = (c + (unsigned)u) * step + lane * 8;
+                /* Past THIS row the block descriptor would hand back row n+1, so steer the
+                 * offset beyond num_records and let the same hardware check return zero. */
+                wv[u] = buf_ld8(wrb, (e < K) ? ((row_off + e) * 2u) : (blk_halves * 2u));
+#else
                 wv[u] = buf_ld8(wr, ((c + (unsigned)u) * step + lane * 8) * 2u);
+#endif
+            }
 #pragma unroll
             for (int u = 0; u < UN; u++) {
                 const unsigned k = (c + (unsigned)u) * step + lane * 8;
@@ -1711,7 +2206,11 @@ __device__ __forceinline__ void gemv_rows(bf16* __restrict__ C_, const bf16* __r
         }
 #pragma unroll
         for (int m = 0; m < MM; m++) {
+#if GV_HACK_NOSUM
+            const float t = acc[m]; /* WRONG ANSWER BY CONSTRUCTION -- see GV_HACK_NOSUM */
+#else
             const float t = wave_sum(acc[m]);
+#endif
             if (lane == 0 && (unsigned)m < M) st_act1(&C[(size_t)m * N + n], f2bf(t));
         }
     }
@@ -1794,7 +2293,8 @@ __device__ __forceinline__ void gemv_rows_r(bf16* __restrict__ C_, const bf16* _
     };
     __amdgpu_buffer_rsrc_t wr[R];
 #pragma unroll
-    for (int r = 0; r < R; r++) wr[r] = buf_rsrc(W + (size_t)(n + (unsigned)r * PLOW_WAVES) * K, K);
+    for (int r = 0; r < R; r++)
+        wr[r] = PLOW_GV_RSRC(W + (size_t)(n + (unsigned)r * PLOW_WAVES) * K, K);
     float acc[R][MM];
 #pragma unroll
     for (int r = 0; r < R; r++)
@@ -1852,6 +2352,278 @@ __device__ __forceinline__ void gemv_rows_rs(bf16* __restrict__ C, const bf16* _
         gemv_rows_r<MM, XLDS, GV_UNROLL, 1>(C, x, W, M, N, K, n, lane, lds);
 }
 
+/* ------------- MFMA GEMV: THE MATRIX CORE INSTEAD OF THE EMULATED DOT ----------------------
+ *
+ * WHY. gfx950 has v_dot2c_f32_bf16 and multiplies a bf16 PAIR in one instruction; gfx942 has
+ * neither that nor a packed bf16 dot, so plow_dot2_bf16 falls back to widen+FMA and the decode
+ * GEMV pays 24 VALU ops per 16 bytes of weight. MEASURED cost of that emulation, by collapsing
+ * it to one op (GV_HACK_CHEAPDOT, wrong answer): -3.2% of the token. The matrix core is idle
+ * during all of it.
+ *
+ * THE MAPPING, and it is the whole trick: do NOT put 32 OUTPUT ROWS in the M dimension. That is
+ * the obvious GEMV-as-GEMM shape and it is wrong here -- it needs 32 rows per wave when these
+ * shapes supply 1.6 (N=3840 over 2432 resident waves), and it reads 32 rows at K*2 stride
+ * instead of one row contiguously. Instead put 32 K-CHUNKS OF ONE ROW in M:
+ *
+ *     A[m][j] = W[n][ s*512 + 16*m + j ]      m = lane%32, j = 8*(lane/32) + 0..7
+ *     B[j][n] = x[   s*512 + 16*n + j ]       n = lane%32  -- the SAME index as A
+ *     D[m][n] = sum_j A[m][j] * B[j][n]  =>  D[m][m] = sum_j W[n][16m+j] * x[16m+j]
+ *
+ * so the DIAGONAL of the accumulator holds 32 partial dot products, and chaining MFMAs across
+ * `s` accumulates them. Each step consumes 1024 CONTIGUOUS bytes of one row per wave -- byte for
+ * byte the access pattern the shipped kernel already has, so nothing about the memory side
+ * changes. Only the arithmetic moves: 2 mfma_32x32x8 (the CDNA3 halves of the K=16 wrapper)
+ * replace 24 VALU ops per lane.
+ *
+ * Matrix utilisation is 1/32, which does not matter: one mfma_f32_32x32x8bf16_1k retires 512 B
+ * of W in ~32 cycles, ~40 TB/s aggregate across 304 CUs, against an HBM budget of 5.3.
+ *
+ * THE DIAGONAL EXTRACT is an unrolled compare, not an indexed read. `acc[di]` with a runtime
+ * `di` forces the f32x16 accumulator out of registers into scratch -- the trap this file
+ * already documents for the fragment arrays. 16 v_cmp/cndmask per ROW is cheaper than that.
+ *
+ * MEASURED, AND IT LOSES BY 1.6%. Gemma-4-12B, ctx 4096, 48 steps, three interleaved pairs:
+ *
+ *     VALU  21.139 21.213 21.186        MFMA  21.492 21.521 21.554
+ *
+ * Ranges disjoint. It is CORRECT -- GEMM FAMILY CORRECT (0 failures) at worst rel 0.0037, the
+ * same as the VALU path, and token-identical on the real asset -- and it is faster STANDALONE
+ * (3152 GB/s vs ~2900 on the cache-resident decode-GEMV rung, which is exactly what a rung
+ * that fits in Infinity Cache measures: the arithmetic). In the model it is slower.
+ *
+ * WHY: the accumulator chain. Every step is `acc = mfma(a, b, acc)` into ONE f32x16, and on
+ * CDNA3 the K=16 wrapper is TWO chained mfma_32x32x8. At K=3840 a row is 7.5 steps = 15
+ * dependent MFMAs with nothing between them to hide ~32 cycles of latency each. The VALU path's
+ * 24 ops per 16 B are ugly but they are INDEPENDENT across the UN unroll, so they pipeline.
+ * The fix would be two accumulators over two rows -- 32 accumulator VGPRs against a decode
+ * object already at 253 of 256, which is the same register wall that killed hand-rolled
+ * software pipelining (see THE DMA ENGINE below).
+ *
+ * The arithmetic this arm can win back was bounded before it was written: GV_HACK_CHEAPDOT
+ * collapses the emulated dot to one op and buys 3.2%. That was the ceiling, and the dependent
+ * MFMA chain gives back more than it. Kept as a knob, defaulted OFF. */
+#ifndef GV_MFMA
+#define GV_MFMA 0
+#endif
+template <bool XLDS>
+__device__ __forceinline__ void gemv_rows_mfma(bf16* __restrict__ C_, const bf16* __restrict__ x_,
+                                               const bf16* __restrict__ W_, unsigned N, unsigned K,
+                                               unsigned slice, unsigned nblk, const bf16* lds) {
+    const unsigned lane = threadIdx.x & 63;
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned frow = lane % 32;        /* m of A, n of B and of the accumulator */
+    const unsigned koct = 8u * (lane / 32); /* which k-octet of the 16-wide block   */
+    constexpr unsigned KSTEP = 32 * MFMA_K; /* 512 k per MFMA = 1024 B per wave      */
+
+    const unsigned gv_per = (N + nblk - 1) / nblk;
+    const unsigned gv_n0 = slice * gv_per;
+    const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
+    const unsigned nstep = (K + KSTEP - 1) / KSTEP;
+
+    auto* const C = as_glob(C_);
+    const auto* const x = as_glob(x_);
+    const auto* const W = as_glob(W_);
+    auto xv8 = [&](unsigned kk) -> bf16v8 {
+        if constexpr (XLDS)
+            return ld_lds8(lds + kk);
+        else
+            return ld_glob8(x + kk);
+    };
+
+    for (unsigned n = gv_n0 + wave; n < gv_n1; n += PLOW_WAVES) {
+        const __amdgpu_buffer_rsrc_t wr = PLOW_GV_RSRC(W + (size_t)n * K, K);
+        f32x16 acc = (f32x16)(0.0f);
+        for (unsigned s = 0; s < nstep; s++) {
+            const unsigned kb = s * KSTEP + 16u * frow + koct;
+            /* W past the row returns zero from the descriptor and fetches nothing; clamp only
+             * the LDS index, so a zero weight never meets a NaN left in the arena. */
+            const unsigned kx = (kb < K) ? kb : 0u;
+            const bf16x8 a = __builtin_bit_cast(bf16x8, buf_ld8(wr, kb * 2u));
+            const bf16x8 b = __builtin_bit_cast(bf16x8, xv8(kx));
+            acc = plow_mfma_bf16_32x32(a, b, acc);
+        }
+        float d = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; i++)
+            if (mfma_acc_m(lane, (unsigned)i) == frow) d = acc[i];
+        const float t = wave_sum(d);
+        if (lane == 0) st_act1(&C[n], f2bf(t));
+    }
+}
+
+/* ------------- SPLIT-K: KS WAVES SHARE ONE OUTPUT ROW -----------------------------------
+ *
+ * THE DEFECT THIS FIXES, and it is the ROW axis running out, not the unroll.
+ *
+ * `gemv_rows` deals whole output rows to waves: `gv_per = ceil(N/nblk)` rows per workgroup,
+ * round-robined over PLOW_WAVES. At the wide shapes that is fine -- Gemma-4-12B's gate/up is
+ * N=15360, so gv_per=51 and a wave gets ~6.4 rows, ~51 KB of streaming. At the NARROW ones it
+ * collapses:
+ *
+ *     N=3840, nblk=304  ->  gv_per = 13 rows/WG  ->  waves 0-4 get 2 rows, waves 5-7 get 1
+ *     row K=4096 = 8 chunks = 8 KB  ->  16 KB per wave behind a 6-step cross-lane reduction
+ *                                       and a descriptor rebuild PER ROW
+ *
+ * Two costs at once: the per-row constant stops amortising, and 13 rows over 8 waves is a 2x
+ * ragged tail (efficiency 13/16 = 81%, against 51/56 = 91% at the wide shape). Splitting K
+ * turns one row into KS tasks, which both lengthens each wave's sequential stream and makes
+ * the tail finer.
+ *
+ * WHY K AND NOT N. plow already has an N-split (`GV_SLICE`, s x n_cu shares) and it measures
+ * monotonically WORSE -- 2939 / 2748 / 2315 GB/s at s = 1 / 2 / 4 on the standalone bench --
+ * which is what cutting an already-too-small row axis predicts. hipBLASLt/Tensile reaches
+ * 1760-3494 GB/s on these same shapes by splitting K for skinny GEMMs; this is that.
+ *
+ * THE REDUCTION IS WITHIN THE WORKGROUP, via LDS, so it needs no counter and no global
+ * traffic: waves `rs*KS .. rs*KS+KS-1` own row `rs`, each sums a CONTIGUOUS quarter/half of the
+ * row's chunks (contiguous, not strided, so each wave still walks one sequential stream), and
+ * ks==0 adds the KS partials and stores.
+ *
+ * THE ITERATION COUNT IS WORKGROUP-UNIFORM ON PURPOSE. `iters` is derived from
+ * (N, nblk, slice) only -- all wave-invariant -- so every wave reaches exactly the same number
+ * of __syncthreads(). A loop bounded by each wave's own row supply would let a wave with one
+ * fewer row exit early and hang the workgroup on the next barrier. Dead slots walk the loop
+ * with `live=false`, computing a discarded partial over row gv_n0 and skipping only the store.
+ */
+/* MEASURED AND REJECTED, DEFAULTED OFF. Kept as a knob and a body because the arm is correct
+ * and the negative result is worth more than the deleted code.
+ *
+ * Gemma-4-12B, ctx 4096, 48 steps, three INTERLEAVED pairs, ms/token:
+ *
+ *     GV_KS=1 (off)   21.274  21.302  21.266      GV_KS=2 (on)   21.599  21.542  21.558
+ *
+ * Ranges disjoint, +1.3%. AND IT IS MONOTONIC IN KS, which is the part that settles the whole
+ * idea. KS=8 puts the WHOLE WORKGROUP on one row -- 512 threads x 16 B = 8 KB CONTIGUOUS per
+ * step, against the shipped decomposition's 8 waves on 8 separate rows at 1 KB each. That is
+ * the larger-contiguous-access shape a skinny-GEMM library is assumed to want, and it is the
+ * WORST of the three: 21.832 21.863 21.832 vs 20.909 21.039 20.990, +4.1%, ranges disjoint by
+ * a wide margin. Contiguity is not what this kernel is short of; the barrier and the cross-wave
+ * reduction cost more than the access shape buys. An earlier shape that reduced per ROW rather than banking the
+ * partials -- 8 workgroup barriers per packet instead of 2 -- read +0.95%, i.e. cutting the
+ * barrier count fourfold made it slightly WORSE. So the barriers were not the cost, and the
+ * premise was wrong:
+ *
+ *   SPLIT-K DOES NOT LENGTHEN A WAVE'S SEQUENTIAL STREAM, IT SHORTENS IT. The wave moves the
+ *   same total bytes either way; splitting K just walks K/KS per row over KS times as many
+ *   row-iterations. What starves the narrow shapes is the PER-ROW CONSTANT (descriptor
+ *   rebuild, 6-step cross-lane reduction), and split-K pays that constant MORE often, not
+ *   less. It also does not fix the ragged tail it was aimed at: 13 rows over 4 slots is
+ *   13/16 utilisation, exactly what 13 rows over 8 slots already was.
+ *
+ * Split-K is the right transform when a kernel is short of PARALLELISM -- too few output rows
+ * to fill the machine. plow is not: N=3840 over 2432 resident waves is 1.58 rows per wave, so
+ * every wave already has work. hipBLASLt reaches for split-K on skinny GEMMs because it
+ * launches a grid sized to the shape; the persistent interpreter is already machine-filling.
+ *
+ * What remains unexplained is the 1.7x against hipBLASLt on the same shapes. It is NOT
+ * bandwidth-per-wave, NOT loads-in-flight (see GV_UNROLL / GV_RS_MAXNCH, both null), and NOT
+ * row parallelism. The per-row constant is the remaining candidate and it wants a body that
+ * amortises it across rows -- gemv_rows_r's R-column split is that shape, and it is measured
+ * null at nchunk >= 8. Next probe: the descriptor rebuild (buf_rsrc per row) and wave_sum. */
+#ifndef GV_KS
+#define GV_KS 1 /* K-splits per row. 1 disables the arm (it is then never instantiated). */
+#endif
+/* Rows-per-wave ceiling for taking the arm. Kept at 3 as the value the rejected experiment
+ * ran with. NOTE for anyone re-opening this: the standalone decode-GEMV rungs in
+ * test_kernels.hip are too noisy to set this threshold -- the same shape read 2708-3214 GB/s
+ * across runs, and a MAXRPW=5 build measured FASTER than a MAXRPW=6 one on every shape, which
+ * is impossible since 6 is a superset of 5. Set it from an interleaved end-to-end A/B only. */
+#ifndef GV_KS_MAXRPW
+#define GV_KS_MAXRPW 3
+#endif
+#ifndef GV_KS_UN
+#define GV_KS_UN 8
+#endif
+/* One float per (row-iteration, wave), in halves, padded to keep the arena 16-B aligned.
+ * `iters = ceil(gv_per/NW)` and the arm is only taken at `gv_per <= GV_KS_MAXRPW*PLOW_WAVES`,
+ * with `NW = PLOW_WAVES/KS`, so `iters <= GV_KS_MAXRPW*KS`. Banking every iteration is what
+ * lets the whole packet reduce behind ONE barrier instead of two per row. */
+#define GV_KS_ITERS_MAX ((unsigned)(GV_KS_MAXRPW) * (unsigned)(GV_KS))
+#define GV_KS_SCRATCH ((2u * PLOW_WAVES * GV_KS_ITERS_MAX + 15u) & ~15u)
+
+template <bool XLDS, int UN, int KS>
+__device__ __forceinline__ void gemv_rows_ksplit(bf16* __restrict__ C_,
+                                                 const bf16* __restrict__ x_,
+                                                 const bf16* __restrict__ W_, unsigned N,
+                                                 unsigned K, unsigned slice, unsigned nblk,
+                                                 const bf16* lds, float* part) {
+    const unsigned lane = threadIdx.x & 63;
+    const unsigned wave = threadIdx.x >> 6;
+    constexpr unsigned NW = PLOW_WAVES / KS; /* row slots per workgroup */
+    const unsigned rs = wave / (unsigned)KS; /* which row slot this wave serves */
+    const unsigned ks = wave % (unsigned)KS; /* which K-range within that row   */
+
+    const unsigned step = PLOW_WAVE * 8;
+    const unsigned nchunk = (K + step - 1) / step;
+    const unsigned per = (nchunk + (unsigned)KS - 1) / (unsigned)KS;
+    const unsigned c0 = ks * per;
+    const unsigned c1 = (c0 + per < nchunk) ? (c0 + per) : nchunk;
+
+    const unsigned gv_per = (N + nblk - 1) / nblk;
+    const unsigned gv_n0 = slice * gv_per;
+    const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
+    const unsigned rows = (gv_n1 > gv_n0) ? (gv_n1 - gv_n0) : 0u;
+    const unsigned iters = (rows + NW - 1) / NW; /* wave-invariant: see the note above */
+
+    auto* const C = as_glob(C_);
+    const auto* const x = as_glob(x_);
+    const auto* const W = as_glob(W_);
+    auto xv8 = [&](unsigned kk) -> bf16v8 {
+        if constexpr (XLDS)
+            return ld_lds8(lds + kk);
+        else
+            return ld_glob8(x + kk);
+    };
+
+    for (unsigned it = 0; it < iters; it++) {
+        const unsigned n = gv_n0 + rs + it * NW;
+        const bool live = (n < gv_n1);
+        const __amdgpu_buffer_rsrc_t wr = PLOW_GV_RSRC(W + (size_t)(live ? n : gv_n0) * K, K);
+        float acc = 0.0f;
+        for (unsigned c = c0; c < c1; c += UN) {
+            bf16v8 wv[UN];
+#pragma unroll
+            for (int u = 0; u < UN; u++) {
+                const unsigned ci = c + (unsigned)u;
+                /* Past THIS split's range the byte offset is pushed beyond `num_records`, so
+                 * the buffer load returns zero and FETCHES NOTHING. Without it the tail of one
+                 * split would read -- and add -- chunks that belong to the next split. The
+                 * same hardware bounds check is what lets the row loop have no scalar tail. */
+                wv[u] = buf_ld8(wr, (ci < c1) ? ((ci * step + lane * 8) * 2u) : (K * 2u));
+            }
+#pragma unroll
+            for (int u = 0; u < UN; u++) {
+                const unsigned k = (c + (unsigned)u) * step + lane * 8;
+                const unsigned kx = (k < K) ? k : 0u; /* keep a NaN out of 0*NaN */
+                acc = dot8(wv[u], xv8(kx), acc);
+            }
+        }
+        const float t = wave_sum(acc);
+        /* PARTIALS ARE BANKED, NOT REDUCED HERE. A reduce-per-row costs TWO workgroup barriers
+         * per row-iteration; at N=3840 that is 4 iterations x 2 = 8 barriers per packet and
+         * ~800 per token, and MEASURED that way split-K was a consistent +0.95% REGRESSION
+         * (21.464-21.513 vs 21.257-21.324 ms/token, ranges disjoint over 3 interleaved pairs).
+         * Banking every iteration's partial and reducing once costs TWO barriers per PACKET.
+         * `iters` is bounded by GV_KS_MAXRPW*KS, which is what sizes the scratch. */
+        if (lane == 0) part[it * PLOW_WAVES + wave] = t;
+    }
+    __syncthreads();
+    if (ks == 0 && lane == 0) {
+        for (unsigned it = 0; it < iters; it++) {
+            const unsigned n = gv_n0 + rs + it * NW;
+            if (n >= gv_n1) continue;
+            float s = 0.0f;
+#pragma unroll
+            for (int j = 0; j < KS; j++) s += part[it * PLOW_WAVES + rs * (unsigned)KS + (unsigned)j];
+            st_act1(&C[n], f2bf(s));
+        }
+    }
+    /* The next packet stages its activation over the low end of this arena and barriers after
+     * doing so -- but a LARGER M*K would reach into `part` while these reads are still in
+     * flight. One barrier on the way out, rather than a rule about who may follow a GEMV. */
+    __syncthreads();
+}
+
 
 /* GEMV WITH A FUSED GLU EPILOGUE -- gate and up in ONE pass, act(g)*u applied at the write.
  *
@@ -1883,6 +2655,20 @@ __device__ __forceinline__ void gemv_rows_rs(bf16* __restrict__ C, const bf16* _
  * Same law as the per-shape-unroll experiment: a dead buffer_load fetches nothing, and this GEMV
  * is bandwidth-bound, so instruction slots are not the binding resource. Keep the cheap one. */
 #ifndef GV_UNROLL_GLU
+/* MEASURED LIMIT, gfx942 8 waves: the FUSED gate|up GEMV holds TWO weight streams per row, so
+ * its register cost is double the plain GEMV's and the unroll cannot buy it back. Spill for
+ * gemv_glu_m{1,4,8,16} against UN:
+ *
+ *   UN=6   246/0   256/200   256/536   256/1284
+ *   UN=4   246/0   256/200   256/517   256/1167
+ *   UN=3   246/0   256/200   256/524   256/1153
+ *   UN=2   246/0   256/200   256/522   256/1151
+ *
+ * i.e. flat past UN=4 -- unlike the plain GEMV, where the same sweep was worth 9x. M=1 (the
+ * default decode bucket) is clean at 0 spill; M>=4 is not, and the fix is not an unroll but
+ * emitting gate|up as TWO GEMVs plus a Glu, which is what the block-fp8 path already does
+ * (see the WFP8BLK/GLU static_assert above). Left as-is: that is an emitter choice, not a
+ * kernel knob, and batch-1 decode does not reach it. */
 #define GV_UNROLL_GLU 6
 #endif
 
@@ -1910,8 +2696,9 @@ __device__ __forceinline__ void gemv_glu_rows(bf16* __restrict__ C_, const bf16*
     for (unsigned n = n0 + wave; n < n1; n += PLOW_WAVES) {
         /* One descriptor per weight row, per stream: num_records = K halves, so the overshoot
          * past the row end returns zero AND issues no memory request. No tail, no predication. */
-        const __amdgpu_buffer_rsrc_t rg = buf_rsrc(Wg + (size_t)n * K, K);
-        const __amdgpu_buffer_rsrc_t ru = buf_rsrc(Wu + (size_t)n * K, K);
+        /* TWO descriptors per row here, so d_gemv_glu pays the waterfall twice. */
+        const __amdgpu_buffer_rsrc_t rg = PLOW_GV_RSRC(Wg + (size_t)n * K, K);
+        const __amdgpu_buffer_rsrc_t ru = PLOW_GV_RSRC(Wu + (size_t)n * K, K);
         float ag[MM], au[MM];
 #pragma unroll
         for (int m = 0; m < MM; m++) { ag[m] = 0.0f; au[m] = 0.0f; }
@@ -1981,22 +2768,96 @@ __device__ __forceinline__ void gemv_glu_rows(bf16* __restrict__ C_, const bf16*
 #ifndef GV_UNROLL_FP8
 #define GV_UNROLL_FP8 3
 #endif
+/* ABLATION LADDER (probe only, 0 = shipped code, results are WRONG at every other level). The
+ * decode GEMV packet costs ~33 us before any bytes move, against a 5-10 us floor on the norm
+ * packets in the same trace. This strips one phase per level so the fixed term can be attributed
+ * instead of guessed: 1 = no wave_sum, 2 = no dequant/dot (loads still issued), 3 = no loads
+ * either. Each level is measured in perf-data/plow-gfx942/gemv-mlp-and-tensile.md. */
+#ifndef PLOW_GV_ABL
+#define PLOW_GV_ABL 0
+#endif
+/* PICK UN BY THE CHUNK COUNT, NOT BY K. The rule the comment above states -- UN must DIVIDE the
+ * row -- was implemented by hardcoding the K's of ONE model family (2560/4096/9728), so any model
+ * whose hidden size is not on that list silently runs dead chunks. Gemma-4 is exactly that case:
+ * K=3840 and K=4096 both give nchunk=4, and UN=3 issues c=0,3 => 6 chunk-steps for 4 real ones.
+ * The dead loads cost no MEMORY (the buffer bound returns zero) but pay a full convert + two dot8
+ * each, and MEASURED standalone at Gemma-4's shapes on this MI300X (fp8gemv probe, same loop, same
+ * grid) that is worth 28-37%:
+ *
+ *     K=3840 nchunk=4  q_proj 152wg   UN=3 10.65us   UN=4  7.94us   -25%
+ *     K=3840 nchunk=4  k/v     76wg   UN=3  9.96us   UN=4  7.25us   -27%
+ *     K=4096 nchunk=4  o_proj 304wg   UN=3  8.79us   UN=4  7.24us   -18%
+ *     K=15360 nchunk=15 down  304wg   UN=3 19.82us   UN=4 20.71us   UN=3 already right
+ *
+ * Selecting the divisor reproduces every choice the old hardcoded list made -- 2560 -> nchunk 3 ->
+ * 3, 9728 -> nchunk 10 -> 5, 15360 -> nchunk 15 -> 3 -- and additionally fixes 3840/4096/8192. It
+ * is arch-neutral: this is a dead-work bug, not a CDNA3 one, so gfx950 gets the same fix (its
+ * Llama K=4096 moves 3 -> 4, which is the "one free overshoot" that comment already flags). */
+__device__ __forceinline__ unsigned gv_un_fp8(unsigned nchunk) {
+#if PLOW_CDNA4
+    /* gfx950: constant, so the switches below fold and the object keeps its single pre-fix
+     * UN instantiation per op. The K-divisor rule was measured on gfx942 only, and the GF=8
+     * lesson in this file records object growth alone regressing gfx950 decode 32% — CDNA3
+     * only until someone with a gfx950 measures the rule there. */
+    (void)nchunk;
+    return GV_UNROLL_FP8;
+#endif
+#ifdef PLOW_GV_UN_BIG
+    /* PROBE: prefer the LARGEST divisor, not the first one found. The rule below tries 4 before
+     * 5, so nchunk=15 (down_proj, K=15360) takes UN=3 -- five sequential loop iterations with
+     * 2*3=6 loads in flight. UN=5 also divides 15 and gives three iterations with 10 in flight.
+     * `down` measures 1519 GB/s against gate|up's 1999 on the SAME kernel, and its distinguishing
+     * feature is exactly this: 1.6 columns per wave vs 6.3, so it has the least other work to
+     * hide a load behind and the most to gain from a deeper unroll. */
+    if (nchunk % 5 == 0) return 5;
+    if (nchunk % 4 == 0) return 4;
+    if (nchunk % 3 == 0) return 3;
+    if (nchunk % 2 == 0) return 2;
+    return GV_UNROLL_FP8;
+#endif
+#ifdef PLOW_GV_UN_LEGACY /* A/B escape hatch: the pre-fix constant, so the counterfactual object
+                          * can be built from THIS tree rather than differenced against an older
+                          * one. Reproduces the old path exactly for any K != 9728. */
+    (void)nchunk;
+    return GV_UNROLL_FP8;
+#endif
+    if (nchunk % 4 == 0) return 4;
+    if (nchunk % 3 == 0) return 3;
+    if (nchunk % 5 == 0) return 5;
+    if (nchunk % 2 == 0) return 2;
+    return GV_UNROLL_FP8;
+}
 /* ONE OUTPUT COLUMN, for the ODD TAIL of gemv_rows_fp8's pair loop — the per-channel-fp8 sibling of
  * `gemv_mx_rows_1`, deleting the same duplicate-and-discard defect for the same reason. See that
  * function for the mechanism, for why the PAIR path deliberately keeps its hand-written body rather
- * than becoming an R=2 instantiation, and for the measurement. */
+ * than becoming an R=2 instantiation, and for the measurement.
+ *
+ * THREE STREAMS, ONE BODY — the fp8 answer to `gemv_mx_rows_1`, for the same register-allocation
+ * reason: `PLOW_DOP_GEMV_FP8` reaches this with Nk = Nv = 0 and the k/v pointers null, so the
+ * stream-select is dead on that path and the 1-stream numerics are BIT-IDENTICAL to before. */
 template <int MM, bool XLDS, int UN>
-__device__ __forceinline__ void gemv_fp8_rows_1(bf16* __restrict__ C_, const bf16* __restrict__ x_,
-                                                const unsigned char* __restrict__ W_,
-                                                const float* __restrict__ wscale_, unsigned M,
-                                                unsigned N, unsigned K, unsigned n, unsigned lane,
-                                                const bf16* lds) {
+__device__ __forceinline__ void gemv_fp8_rows_1(bf16* __restrict__ Cq_, bf16* __restrict__ Ck_,
+                                                bf16* __restrict__ Cv_, const bf16* __restrict__ x_,
+                                                const unsigned char* __restrict__ Wq_,
+                                                const unsigned char* __restrict__ Wk_,
+                                                const unsigned char* __restrict__ Wv_,
+                                                const float* __restrict__ Sq_,
+                                                const float* __restrict__ Sk_,
+                                                const float* __restrict__ Sv_, unsigned M,
+                                                unsigned Nq, unsigned Nk, unsigned Nv, unsigned K,
+                                                unsigned n, unsigned lane, const bf16* lds) {
     const unsigned step = PLOW_WAVE * 16; /* one pass: 64 lanes x 16 fp8 */
     const unsigned nchunk = (K + step - 1) / step;
-    auto* const C = as_glob(C_);
+    auto* const Cq = as_glob(Cq_);
+    auto* const Ck = as_glob(Ck_);
+    auto* const Cv = as_glob(Cv_);
     const auto* const x = as_glob(x_);
-    const auto* const W = as_glob(W_);
-    const auto* const wscale = as_glob(wscale_);
+    const auto* const Wq = as_glob(Wq_);
+    const auto* const Wk = as_glob(Wk_);
+    const auto* const Wv = as_glob(Wv_);
+    const auto* const Sq = as_glob(Sq_);
+    const auto* const Sk = as_glob(Sk_);
+    const auto* const Sv = as_glob(Sv_);
     auto xv8 = [&](unsigned m, unsigned kk) -> bf16v8 {
         const size_t xo = (size_t)m * K + kk;
         if constexpr (XLDS)
@@ -2004,7 +2865,14 @@ __device__ __forceinline__ void gemv_fp8_rows_1(bf16* __restrict__ C_, const bf1
         else
             return ld_glob8(x + xo);
     };
-    const __amdgpu_buffer_rsrc_t wr = buf_rsrc_fp8(W + (size_t)n * K, K);
+    /* Which projection this concatenated column belongs to. Wave-uniform, therefore scalar. */
+    auto W = Wq;
+    auto Sc = Sq;
+    auto Co = Cq;
+    unsigned col = n, Nout = Nq;
+    if (n >= Nq + Nk) { W = Wv; Sc = Sv; Co = Cv; col = n - Nq - Nk; Nout = Nv; }
+    else if (n >= Nq) { W = Wk; Sc = Sk; Co = Ck; col = n - Nq;      Nout = Nk; }
+    const __amdgpu_buffer_rsrc_t wr = buf_rsrc_fp8(W + (size_t)col * K, K);
     float acc[MM];
 #pragma unroll
     for (int m = 0; m < MM; m++) acc[m] = 0.0f;
@@ -2030,25 +2898,44 @@ __device__ __forceinline__ void gemv_fp8_rows_1(bf16* __restrict__ C_, const bf1
     }
 #pragma unroll
     for (int m = 0; m < MM; m++) {
-        const float t = wave_sum(acc[m]) * wscale[n]; /* per-row dequant, once, in the epilogue */
-        if (lane == 0 && (unsigned)m < M) st_act1(&C[(size_t)m * N + n], f2bf(t));
+        const float t = wave_sum(acc[m]) * Sc[col]; /* per-row dequant, once, in the epilogue */
+        if (lane == 0 && (unsigned)m < M) st_act1(&Co[(size_t)m * Nout + col], f2bf(t));
     }
 }
+/* THREE STREAMS, ONE BODY — `PLOW_DOP_GEMV_QKV_FP8` (op 115) is this at Nk/Nv != 0, and
+ * `PLOW_DOP_GEMV_FP8` (op 30) is this with Nk = Nv = 0 and the k/v pointers null, on the register
+ * argument `gemv_rows_mxfp4` (op 91/114) makes: interp.hip inlines every arm into one kernel whose
+ * VGPR budget is the WORST CASE over all of them, so a second inlined fp8 sweep is what must not
+ * exist. With Nk = Nv = 0 the stream test is false for every column in range, the k/v arms are dead
+ * and the 1-stream numerics are BIT-IDENTICAL to before. The extra pointers are wave-uniform ->
+ * SGPRs, and `auto` keeps each selected pointer in address_space(1) (see gemv_rows' XLDS note). */
 template <int MM, bool XLDS, int UN = GV_UNROLL_FP8>
-__device__ __forceinline__ void gemv_rows_fp8(bf16* __restrict__ C_, const bf16* __restrict__ x_,
-                                              const unsigned char* __restrict__ W_,
-                                              const float* __restrict__ wscale_, unsigned M,
-                                              unsigned N, unsigned K, unsigned slice, unsigned nblk,
-                                              const bf16* lds) {
+__device__ __forceinline__ void gemv_rows_fp8(bf16* __restrict__ Cq_, bf16* __restrict__ Ck_,
+                                              bf16* __restrict__ Cv_, const bf16* __restrict__ x_,
+                                              const unsigned char* __restrict__ Wq_,
+                                              const unsigned char* __restrict__ Wk_,
+                                              const unsigned char* __restrict__ Wv_,
+                                              const float* __restrict__ Sq_,
+                                              const float* __restrict__ Sk_,
+                                              const float* __restrict__ Sv_, unsigned M,
+                                              unsigned Nq, unsigned Nk, unsigned Nv, unsigned K,
+                                              unsigned slice, unsigned nblk, const bf16* lds) {
     const unsigned lane = threadIdx.x & 63;
     const unsigned wave = threadIdx.x >> 6;
     const unsigned step = PLOW_WAVE * 16; /* one pass: 64 lanes x 16 fp8 */
     const unsigned nchunk = (K + step - 1) / step;
+    const unsigned N = Nq + Nk + Nv; /* the CONCATENATED column count */
 
-    auto* const C = as_glob(C_);
+    auto* const Cq = as_glob(Cq_);
+    auto* const Ck = as_glob(Ck_);
+    auto* const Cv = as_glob(Cv_);
     const auto* const x = as_glob(x_);
-    const auto* const W = as_glob(W_);
-    const auto* const wscale = as_glob(wscale_);
+    const auto* const Wq = as_glob(Wq_);
+    const auto* const Wk = as_glob(Wk_);
+    const auto* const Wv = as_glob(Wv_);
+    const auto* const Sq = as_glob(Sq_);
+    const auto* const Sk = as_glob(Sk_);
+    const auto* const Sv = as_glob(Sv_);
 
     auto xv8 = [&](unsigned m, unsigned kk) -> bf16v8 {
         const size_t xo = (size_t)m * K + kk;
@@ -2078,28 +2965,63 @@ __device__ __forceinline__ void gemv_rows_fp8(bf16* __restrict__ C_, const bf16*
     const unsigned gv_per = (N + nblk - 1) / nblk;
     const unsigned gv_n0 = slice * gv_per;
     const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
+#if PLOW_GV_ABL >= 4
+    /* ABLATION 4: return IMMEDIATELY. Level 3 still walks the column/chunk loop (address math,
+     * predicates, wave_sum, stores) with fake data, so it does NOT measure "an infinitely fast
+     * GEMV" -- it measures "a GEMV with free memory". This level retires the packet body
+     * entirely, so what remains is the interpreter's per-packet machinery plus the ops the fp8
+     * GEMV does not own. Wrong results by construction. */
+    return;
+#endif
     unsigned n = gv_n0 + wave;
     for (; n + PLOW_WAVES < gv_n1; n += PLOW_WAVES * 2) {
         const unsigned n2 = n + PLOW_WAVES;
+        /* Which projection each concatenated column belongs to. Wave-uniform, therefore scalar;
+         * the pair (n, n2) may straddle a stream boundary and each carries its own selection. */
+        auto W = Wq, W2 = Wq;
+        auto Sc = Sq, Sc2 = Sq;
+        auto Co = Cq, Co2 = Cq;
+        unsigned col = n, col2 = n2, Nout = Nq, Nout2 = Nq;
+        if (n >= Nq + Nk) { W = Wv; Sc = Sv; Co = Cv; col = n - Nq - Nk; Nout = Nv; }
+        else if (n >= Nq) { W = Wk; Sc = Sk; Co = Ck; col = n - Nq;      Nout = Nk; }
+        if (n2 >= Nq + Nk) { W2 = Wv; Sc2 = Sv; Co2 = Cv; col2 = n2 - Nq - Nk; Nout2 = Nv; }
+        else if (n2 >= Nq) { W2 = Wk; Sc2 = Sk; Co2 = Ck; col2 = n2 - Nq;      Nout2 = Nk; }
         /* num_records = K BYTES (fp8 is 1 byte): the overshoot past the row end returns zero and
          * issues no memory request — same free bounds check the bf16 GEMV relies on. */
-        const __amdgpu_buffer_rsrc_t wr = buf_rsrc_fp8(W + (size_t)n * K, K);
-        const __amdgpu_buffer_rsrc_t wr2 = buf_rsrc_fp8(W + (size_t)n2 * K, K);
+        const __amdgpu_buffer_rsrc_t wr = buf_rsrc_fp8(W + (size_t)col * K, K);
+        const __amdgpu_buffer_rsrc_t wr2 = buf_rsrc_fp8(W2 + (size_t)col2 * K, K);
         float acc[MM], acc2[MM];
 #pragma unroll
         for (int m = 0; m < MM; m++) { acc[m] = 0.0f; acc2[m] = 0.0f; }
 
         for (unsigned c = 0; c < nchunk; c += UN) {
             fp8v16 wv[UN], wv2[UN];
+#if PLOW_GV_ABL >= 3
+            /* ABLATION 3: delete the weight LOADS as well, leaving only the packet's control flow.
+             * Whatever time survives this is dispatch, gating and loop overhead. */
+#pragma unroll
+            for (int u = 0; u < UN; u++) { wv[u] = (fp8v16)(c + (unsigned)u); wv2[u] = wv[u]; }
+#else
             /* Both columns' loads issued before either is touched: 2*UN in flight per lane. */
 #pragma unroll
             for (int u = 0; u < UN; u++) wv[u] = buf_ld_fp8(wr, (c + (unsigned)u) * step + lane * 16);
 #pragma unroll
             for (int u = 0; u < UN; u++) wv2[u] = buf_ld_fp8(wr2, (c + (unsigned)u) * step + lane * 16);
+#endif
 #pragma unroll
             for (int u = 0; u < UN; u++) {
                 const unsigned k = (c + (unsigned)u) * step + lane * 16;
                 const unsigned kx = (k < K) ? k : 0u; /* keep a NaN out of 0*NaN; wv is 0 anyway */
+#if PLOW_GV_ABL >= 2
+                /* ABLATION 2: keep the LOADS live, delete the dequant and the dots. Prices the
+                 * whole VALU body against pure weight streaming. Wrong results by construction. */
+                (void)kx;
+#pragma unroll
+                for (int m = 0; m < MM; m++) {
+                    acc[m] += __builtin_bit_cast(float, wv[u][0]);
+                    acc2[m] += __builtin_bit_cast(float, wv2[u][0]);
+                }
+#else
                 bf16v8 wlo, whi, wlo2, whi2;
                 fp8_to_bf16v8(wv[u], wlo, whi);
                 fp8_to_bf16v8(wv2[u], wlo2, whi2);
@@ -2111,19 +3033,29 @@ __device__ __forceinline__ void gemv_rows_fp8(bf16* __restrict__ C_, const bf16*
                     acc[m] += live ? dot8(whi, xhi, dot8(wlo, xlo, 0.0f)) : 0.0f;
                     acc2[m] += live ? dot8(whi2, xhi, dot8(wlo2, xlo, 0.0f)) : 0.0f;
                 }
+#endif
             }
         }
 #pragma unroll
         for (int m = 0; m < MM; m++) {
-            const float t = wave_sum(acc[m]) * wscale[n]; /* per-row dequant, once, in the epilogue */
-            const float t2 = wave_sum(acc2[m]) * wscale[n2];
+            /* ABLATION 1: skip the 6-step cross-lane reduction, keep everything else. Prices the
+             * wave_sum chain, which runs once per column PAIR. Wrong results by construction. */
+#if PLOW_GV_ABL == 1
+            const float t = acc[m] * Sc[col];
+            const float t2 = acc2[m] * Sc2[col2];
+#else
+            const float t = wave_sum(acc[m]) * Sc[col]; /* per-row dequant, once, in the epilogue */
+            const float t2 = wave_sum(acc2[m]) * Sc2[col2];
+#endif
             if (lane == 0 && (unsigned)m < M) {
-                st_act1(&C[(size_t)m * N + n], f2bf(t));
-                st_act1(&C[(size_t)m * N + n2], f2bf(t2));
+                st_act1(&Co[(size_t)m * Nout + col], f2bf(t));
+                st_act1(&Co2[(size_t)m * Nout2 + col2], f2bf(t2));
             }
         }
     }
-    if (n < gv_n1) gemv_fp8_rows_1<MM, XLDS, UN>(C_, x_, W_, wscale_, M, N, K, n, lane, lds);
+    if (n < gv_n1)
+        gemv_fp8_rows_1<MM, XLDS, UN>(Cq_, Ck_, Cv_, x_, Wq_, Wk_, Wv_, Sq_, Sk_, Sv_, M, Nq, Nk,
+                                      Nv, K, n, lane, lds);
 }
 
 /* MXFP4 DECODE GEMV (w4a16) — OCP microscaling e2m1 weights, one E8M0 scale per 32 K-elements,
@@ -2714,7 +3646,7 @@ __device__ __forceinline__ void gemv_qkvg_rows(bf16* __restrict__ Cq_, bf16* __r
             col = n - Nq - Nk - Nv;
             Nout = Ng;
         }
-        const __amdgpu_buffer_rsrc_t wr = buf_rsrc(Wrow + (size_t)col * K, K);
+        const __amdgpu_buffer_rsrc_t wr = PLOW_GV_RSRC(Wrow + (size_t)col * K, K);
         float acc[MM];
 #pragma unroll
         for (int m = 0; m < MM; m++) acc[m] = 0.0f;
@@ -2996,7 +3928,51 @@ __device__ __forceinline__ void gemv_rows_dma(bf16* __restrict__ C_, const bf16*
  * bandwidth-bound op they fight, and MLP wins. A fill argument alone is not a reason to split.
  * ------------------------------------------------------------------------- */
 
-template <int MM, int UN = GV_UNROLL>
+/* THE UNROLL IS A REGISTER BUDGET, AND IT IS SHARED WITH THE M ROWS.
+ *
+ * GV_UNROLL is how many independent weight loads a wave puts in flight, and the comment above
+ * picks 11 from `nchunk` for the M=1 decode. But each of the MM activation rows also holds live
+ * vectors, so at MM>1 the same unroll asks for MM times the registers -- and on CDNA3 it asks
+ * for more still, because there is no v_dot2c_f32_bf16 and the software dot has to materialise
+ * f32 operands (amd_arch.h). Past the budget the allocator starts using AGPRs as spill relief,
+ * which is exactly what happened: the M=8 and M=16 buckets landed at 256 VGPR + 256 AGPR and
+ * every accumulate paid a v_accvgpr round trip.
+ *
+ * MEASURED on MI300X, 4-wave object, Gemma-4 31B shapes (ms, lower is better):
+ *
+ * SWEPT AT THE SHIPPING CONFIG -- 8 waves, single-buffered stage (ms, min of runs):
+ *
+ *            gate/up 21504x5376            down 5376x21504
+ *   UN     M=1    M=4    M=8   M=16      M=1    M=4    M=8   M=16
+ *   11    0.059  0.305  0.767  2.420    0.044  0.145  0.337  0.932
+ *    6    0.068  0.098  0.206  1.804    0.044  0.047  0.092  0.706
+ *    4    0.070  0.101  0.172  1.566    0.047  0.051  0.079  0.585
+ *    3    0.070  0.102  0.160  0.265    0.046  0.053  0.075  0.119
+ *    2    0.074  0.104  0.165  0.275    0.051  0.057  0.070  0.114
+ *
+ * The optimum FALLS with MM: 11 at M=1, 6 at M=4, 3 at M>=8. Taking it is 4.8x at M=8 and 9.1x
+ * at M=16 over the flat 11 on gate/up. The earlier 4-wave sweep put M=16 at 2; at 8 waves the
+ * allocator caps itself at 256 instead of reaching for AGPRs, and 3 wins -- which is why this
+ * table was re-measured rather than carried over.
+ *
+ * CDNA4 keeps the flat 11 -- it has the packed dot, its buckets never reached the AGPRs, and
+ * these numbers were not measured there. */
+#if PLOW_CDNA4
+#define GV_UNROLL_M4 GV_UNROLL
+#define GV_UNROLL_M8 GV_UNROLL
+#else
+#ifndef GV_UNROLL_M4
+#define GV_UNROLL_M4 6
+#endif
+#ifndef GV_UNROLL_M8
+#define GV_UNROLL_M8 3
+#endif
+#endif
+__device__ __host__ constexpr int gv_unroll_for(int mm) {
+    return mm >= 8 ? GV_UNROLL_M8 : (mm >= 4 ? GV_UNROLL_M4 : GV_UNROLL);
+}
+
+template <int MM, int UN = gv_unroll_for(MM)>
 __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
                          const bf16* __restrict__ W, const float* __restrict__ rms,
                          const bf16* __restrict__ gamma, unsigned M, unsigned N, unsigned K,
@@ -3048,6 +4024,37 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
              * unroll that starves the memory pipe — see gemv_rows_r. MM==1 only: the R-split
              * carries `acc[R][MM]`, and at a prefill bucket's MM=16 that doubles a 16-float
              * accumulator into the one kernel whose register union already sets the cliff. */
+            /* NARROW-N TAKES SPLIT-K, and it is tried FIRST because it addresses a different
+             * starvation from the R-split: the R-split fixes too few CHUNKS per row (short K),
+             * this one fixes too few ROWS per wave (small N). A shape can be neither, either,
+             * or -- as Gemma-4-12B's o_proj (N=3840, K=4096) is -- both.
+             *
+             * `M*K + GV_NORM_SCRATCH + GV_KS_SCRATCH <= GM_LDS_HALVES` because the partials sit
+             * BELOW the norm arm's reduction scratch at the top of the same arena. Below, not
+             * on top of it: when norm==2 the fold has already run and `nscratch` is dead by
+             * here, but a future arm that reads it after this point would be silently corrupted,
+             * and the two regions cost 40 halves together. */
+#if GV_MFMA
+            /* The matrix-core arm. MM==1 only: it accumulates into a 32x32 tile whose diagonal
+             * is one output row, so a batched decode would need MM of them. */
+            if constexpr (MM == 1) {
+                gemv_rows_mfma<true>(C, x, W, N, K, slice, nblk, lds);
+                return;
+            }
+#endif
+#if GV_KS > 1
+            if constexpr (MM == 1) {
+                const unsigned gvp = (N + nblk - 1) / nblk;
+                const unsigned rpw = (gvp + PLOW_WAVES - 1) / PLOW_WAVES;
+                if (rpw <= (unsigned)GV_KS_MAXRPW &&
+                    (size_t)M * K + GV_NORM_SCRATCH + GV_KS_SCRATCH <= GM_LDS_HALVES) {
+                    gemv_rows_ksplit<true, GV_KS_UN, GV_KS>(
+                        C, x, W, N, K, slice, nblk, lds,
+                        (float*)(lds + (GM_LDS_HALVES - GV_NORM_SCRATCH - GV_KS_SCRATCH)));
+                    return;
+                }
+            }
+#endif
             if constexpr (MM == 1 && GV_RS_R > 1) {
                 if ((K + PLOW_WAVE * 8 - 1) / (PLOW_WAVE * 8) >= (unsigned)GV_RS_MAXNCH)
                     gemv_rows<MM, true, false, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
@@ -3317,19 +4324,219 @@ __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
 __device__ void d_gemv_fp8(bf16* C, const bf16* x, const unsigned char* W, const float* wscale,
                            unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk,
                            bf16* lds) {
-    /* UN per K so it DIVIDES the fp8 chunk count (no dead converts): K=9728 down -> 10 chunks (UN=5,
-     * two clean groups); everything else (K=2560 -> 3, K=4096 -> 4) takes the default UN=3. */
+    /* UN per CHUNK COUNT so it DIVIDES the row (no dead converts) -- see gv_un_fp8. This picks the
+     * same UN the old per-K list did for the K's it knew (2560 -> 3, 9728 -> 5) and additionally
+     * covers the ones it did not (Gemma-4's 3840/15360, and 4096/8192). */
+    /* PROBE (PLOW_GV_NOLDS): take the EXISTING global-x arm instead of staging, to price the
+     * stage_x_lds + __syncthreads pair. Every GEMV packet pays it and the norm packets -- which
+     * floor at 5-10 us against GEMV's ~33 us -- do not, which made it the first suspect for the
+     * fixed per-packet cost. Correctness-safe: this arm already ships for M*K > GM_LDS_HALVES.
+     *
+     * MEASURED NULL, so the suspect is eliminated: Gemma-4-12B fp8+occ4, ctx 4096, 48 steps,
+     * three interleaved pairs -- staged 15.362/15.386/15.406 (mean 15.385) vs NOLDS
+     * 15.465/15.394/15.428 (mean 15.429), i.e. +0.29%, no better and if anything worse. Staging
+     * x and its barrier are NOT what the GEMV packet pays. Kept as a probe rather than deleted
+     * so the next reader does not re-run it. */
+#if PLOW_GV_ABL >= 5
+    /* ABLATION 5: retire the ENTIRE op, staging included. Level 4 returns from the row loop but
+     * d_gemv_fp8 has already run stage_x_lds + __syncthreads -- 30 KB of LDS fill at K=15360 --
+     * so level 4 is NOT a zero-cost GEMV either. */
+    return;
+#endif
+#ifdef PLOW_GV_NOLDS
+    const bool lds_ok = false;
+#else
+    const bool lds_ok = (size_t)M * K <= GM_LDS_HALVES;
+#endif
+    if (lds_ok)
+        stage_x_lds(lds, x, (size_t)M * K);
+    if (lds_ok) __syncthreads();
+#define PLOW_GV_FP8_ARM(UNV)                                                                       \
+    do {                                                                                           \
+        if (lds_ok)                                                                                \
+            gemv_rows_fp8<PLOW_GEMV_MM, true, UNV>(C, nullptr, nullptr, x, W, nullptr, nullptr,    \
+                                                   wscale, nullptr, nullptr, M, N, 0u, 0u, K,      \
+                                                   slice, nblk, lds);                              \
+        else                                                                                       \
+            gemv_rows_fp8<PLOW_GEMV_MM, false, UNV>(C, nullptr, nullptr, x, W, nullptr, nullptr,   \
+                                                    wscale, nullptr, nullptr, M, N, 0u, 0u, K,     \
+                                                    slice, nblk, lds);                             \
+    } while (0)
+    switch (gv_un_fp8((K + PLOW_WAVE * 16 - 1) / (PLOW_WAVE * 16))) {
+        case 4: PLOW_GV_FP8_ARM(4); break;
+        case 5: PLOW_GV_FP8_ARM(5); break;
+        case 2: PLOW_GV_FP8_ARM(2); break;
+        default: PLOW_GV_FP8_ARM(3); break;
+    }
+#undef PLOW_GV_FP8_ARM
+}
+
+/* NRN-FOLD STAGING — compute the WHOLE NormResidualNorm (op 23) into the GEMV's LDS arena, so the
+ * end-of-layer sandwich packet disappears from the decode chain.
+ *
+ * The Gemma decode chain is qkv -> hnr -> flash -> merge -> o -> NRN1 -> glu -> down -> NRN2 ->
+ * (next) qkv: nine serial counter gates per layer at ~10 us each, and the b=1 NRN packets are pure
+ * chain levels (one workgroup computing 3840 elements while 303 CUs wait on the counter). NRN1
+ * cannot fold into its consumer (GemvGluFp8 has two free t slots against four operands) — this is
+ * the "norm fusion capped by t[8]" item — but NRN2's consumers are the next layer's q/k/v
+ * GemvFp8s, which have exactly the four free slots (t3/t4/t6/t7, with t1 repurposed as the
+ * residual input since no normed x exists to read). Each of the three projections computes the
+ * NRN redundantly from operands it can load itself (~2 us of extra reduction per packet, off the
+ * weight-stream pipe) and ONE designated packet's slice 0 stores the residual.
+ *
+ * WHY THE RESIDUAL PING-PONGS (in -> out are DIFFERENT tensors, unlike op 23's in-place form):
+ * q, k and v run CONCURRENTLY on disjoint CU sets. If the q packet stored the new residual over
+ * act.x while a k workgroup was still loading act.x as its `a` input, k would compute the NRN of
+ * a half-updated row — finite, plausible, wrong. So NRN1 (still a packet) writes its residual to
+ * act.xr, this fold reads a = act.xr and stores resid_out = act.x, and the buffers alternate at
+ * every half-layer with the SAME assignment in every layer. The last layer keeps the unfused op
+ * 23 (its second norm is the model's FINAL norm, whose consumer is the lm_head, not a GEMV).
+ *
+ * BIT-EXACT BY CONSTRUCTION, same argument as `gemv_norm_lds`: this replicates
+ * `d_norm_residual_norm`'s `fits` arm element-for-element — same per-thread map, same serial
+ * accumulation order, same `block_sum`, same bf16 ROUNDING of the residual before the second
+ * reduction — and then the ordinary un-normed hot loop runs over LDS bytes identical to the HBM
+ * bytes the deleted packet would have written. The emitter refuses shapes the `fits` arm would
+ * not take; the wrapper traps rather than falling back, because there is no packet to fall back
+ * TO. */
+__device__ __forceinline__ void gemv_nrn_lds(bf16* __restrict__ lds, bf16* __restrict__ resid_,
+                                             const bf16* __restrict__ a_,
+                                             const bf16* __restrict__ b_,
+                                             const bf16* __restrict__ gb_,
+                                             const bf16* __restrict__ gn_, unsigned M, unsigned K,
+                                             float eps, float scale, bool store, float* part) {
+    const auto* const ag = as_glob(a_);
+    const auto* const bg = as_glob(b_);
+    const auto* const gbg = as_glob(gb_);
+    const auto* const gng = as_glob(gn_);
+    auto* const rg = as_glob(resid_);
+    for (unsigned m = 0; m < M; m++) {
+        const size_t base = (size_t)m * K;
+        /* PRODUCE: residual a, sublayer output b, and BOTH weights — all issued together. */
+        bf16v8 av[RN_VEC], bv[RN_VEC], wb[RN_VEC], wn[RN_VEC];
+#pragma unroll
+        for (int c = 0; c < RN_VEC; c++) {
+            const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+            av[c] = bf16v8_zero();
+            bv[c] = bf16v8_zero();
+            wb[c] = bf16v8_zero();
+            wn[c] = bf16v8_zero();
+            if (i < K) {
+                av[c] = ld_glob8(ag + base + i);
+                bv[c] = ld_glob8(bg + base + i);
+                if (gbg) wb[c] = ld_glob8(gbg + i);
+                if (gng) wn[c] = ld_glob8(gng + i);
+            }
+        }
+        float ssb = 0.0f;
+#pragma unroll
+        for (int c = 0; c < RN_VEC; c++)
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float f = bf2f(bv[c][j]);
+                ssb += f * f;
+            }
+        const float invb = rsqrtf(block_sum(ssb, part) / (float)K + eps);
+        /* resid = (a + norm(b)*gb) * scale, ROUNDED to bf16; the SECOND reduction runs over the
+         * rounded value, exactly reproducing op 23's bf16 store + reload. */
+        bf16v8 rv[RN_VEC];
+        float ssr = 0.0f;
+#pragma unroll
+        for (int c = 0; c < RN_VEC; c++) {
+            bf16v8 r;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float g = gbg ? bf2f(wb[c][j]) : 1.0f;
+                const float f = (bf2f(av[c][j]) + bf2f(bv[c][j]) * invb * g) * scale;
+                r[j] = f2bf(f);
+                const float rf = bf2f(r[j]);
+                ssr += rf * rf;
+            }
+            rv[c] = r;
+        }
+        const float invr = rsqrtf(block_sum(ssr, part) / (float)K + eps);
+#pragma unroll
+        for (int c = 0; c < RN_VEC; c++) {
+            const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+            if (i < K) {
+                bf16v8 no;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float g = gng ? bf2f(wn[c][j]) : 1.0f;
+                    no[j] = f2bf(bf2f(rv[c][j]) * invr * g);
+                }
+                *(bf16v8*)(lds + base + i) = no;
+                if (store) st_glob8(rg + base + i, rv[c]);
+            }
+        }
+    }
+    /* block_sum's trailing barrier ran BEFORE the LDS write-back; the barrier the hot loop
+     * needs is this one (see gemv_norm_lds). */
+    __syncthreads();
+}
+
+/* op 30 with the NRN fold: stage via gemv_nrn_lds instead of stage_x_lds, then run the ordinary
+ * staged hot loop — the k-loop never learns this happened. `store` marks the ONE packet of the
+ * q/k/v trio that owns the residual write; within it, slice 0 stores (all slices compute
+ * identical bytes, so this is a traffic choice, not a correctness one). */
+__device__ void d_gemv_fp8_nrn(bf16* C, bf16* resid_out, const bf16* a, const bf16* b,
+                               const bf16* gb, const bf16* gn, const unsigned char* W,
+                               const float* wscale, unsigned M, unsigned N, unsigned K, float eps,
+                               float scale, unsigned store, unsigned slice, unsigned nblk,
+                               bf16* lds) {
+    const bool ok = ((size_t)M * K + GV_NORM_SCRATCH <= GM_LDS_HALVES) &&
+                    (K <= RN_REG * PLOW_THREADS) && ((K & 7u) == 0);
+    if (!ok) __builtin_trap(); /* the emitter refuses these shapes; no packet exists to fall back to */
+    /* Scratch from the TOP of the arena, past the staged row — sm->part aliases sm->gm
+     * (see d_gemv_t's note); deriving it here removes the alias outright. */
+    float* const nscratch = (float*)(lds + (GM_LDS_HALVES - GV_NORM_SCRATCH));
+    gemv_nrn_lds(lds, resid_out, a, b, gb, gn, M, K, eps, scale, store != 0 && slice == 0,
+                 nscratch);
+#define PLOW_GV_NRN_ARM(UNV)                                                                       \
+    gemv_rows_fp8<PLOW_GEMV_MM, true, UNV>(C, nullptr, nullptr, nullptr, W, nullptr, nullptr,      \
+                                           wscale, nullptr, nullptr, M, N, 0u, 0u, K, slice, nblk, \
+                                           lds)
+    switch (gv_un_fp8((K + PLOW_WAVE * 16 - 1) / (PLOW_WAVE * 16))) {
+        case 4: PLOW_GV_NRN_ARM(4); break;
+        case 5: PLOW_GV_NRN_ARM(5); break;
+        case 2: PLOW_GV_NRN_ARM(2); break;
+        default: PLOW_GV_NRN_ARM(3); break;
+    }
+#undef PLOW_GV_NRN_ARM
+}
+
+/* FUSED Q|K|V fp8 DECODE GEMV — op 22's per-channel-fp8 twin, and op 30's own body with
+ * Nk = Nv = 0 (see gemv_rows_fp8's header note). The three f32[N] dequant-scale rows arrive as
+ * TENSOR HANDLES in i5/i6/i7 (dev_isa.h PLOW_DOP_GEMV_QKV_FP8: ten pointers do not fit t[8], and
+ * op 114 set the rule for which operand is demoted). Byte-exact to the three d_gemv_fp8 calls it
+ * replaces: a column's value depends only on its own weight row, its own scale and the shared x —
+ * concatenating the sweeps changes which workgroup owns a column, never what it computes. */
+__device__ void d_gemv_qkv_fp8(bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x,
+                               const unsigned char* Wq, const unsigned char* Wk,
+                               const unsigned char* Wv, const float* Sq, const float* Sk,
+                               const float* Sv, unsigned M, unsigned Nq, unsigned Nk, unsigned Nv,
+                               unsigned K, unsigned slice, unsigned nblk, bf16* lds) {
     const bool lds_ok = (size_t)M * K <= GM_LDS_HALVES;
     if (lds_ok)
         stage_x_lds(lds, x, (size_t)M * K);
     if (lds_ok) __syncthreads();
-    if (K == 9728) {
-        if (lds_ok) gemv_rows_fp8<PLOW_GEMV_MM, true, 5>(C, x, W, wscale, M, N, K, slice, nblk, lds);
-        else gemv_rows_fp8<PLOW_GEMV_MM, false, 5>(C, x, W, wscale, M, N, K, slice, nblk, lds);
-    } else {
-        if (lds_ok) gemv_rows_fp8<PLOW_GEMV_MM, true>(C, x, W, wscale, M, N, K, slice, nblk, lds);
-        else gemv_rows_fp8<PLOW_GEMV_MM, false>(C, x, W, wscale, M, N, K, slice, nblk, lds);
+#define PLOW_GV_QKV_FP8_ARM(UNV)                                                                   \
+    do {                                                                                           \
+        if (lds_ok)                                                                                \
+            gemv_rows_fp8<PLOW_GEMV_MM, true, UNV>(Cq, Ck, Cv, x, Wq, Wk, Wv, Sq, Sk, Sv, M, Nq,   \
+                                                   Nk, Nv, K, slice, nblk, lds);                   \
+        else                                                                                       \
+            gemv_rows_fp8<PLOW_GEMV_MM, false, UNV>(Cq, Ck, Cv, x, Wq, Wk, Wv, Sq, Sk, Sv, M, Nq,  \
+                                                    Nk, Nv, K, slice, nblk, lds);                  \
+    } while (0)
+    /* Same dead-chunk rule as d_gemv_fp8: all three streams share K, so one UN serves them all. */
+    switch (gv_un_fp8((K + PLOW_WAVE * 16 - 1) / (PLOW_WAVE * 16))) {
+        case 4: PLOW_GV_QKV_FP8_ARM(4); break;
+        case 5: PLOW_GV_QKV_FP8_ARM(5); break;
+        case 2: PLOW_GV_QKV_FP8_ARM(2); break;
+        default: PLOW_GV_QKV_FP8_ARM(3); break;
     }
+#undef PLOW_GV_QKV_FP8_ARM
 }
 
 /* BLOCK-scaled fp8 decode GEMV — DeepSeek/GLM weight_block_size [128,128]. wscale is the
@@ -3452,7 +4659,7 @@ __device__ void d_gemv_mxfp4(bf16* C, const bf16* x, const unsigned char* W,
 /* MXFP4 decode fused gate|up GEMV+GLU (w4a16) — the mxfp4 twin of d_gemv_glu_fp8, built on the SAME
  * verified fp4 machinery as gemv_rows_mxfp4: packed-2/byte weight loads (offset >>1), one E8M0 scale
  * byte per 32 K folded into fp4_to_bf16v8x4 — so there is NO per-channel epilogue dequant (contrast
- * the fp8 twin's *gscale/*uscale, whose arbitrary-f32 scale must stay a separate multiply). Gate and
+ * the fp8 twin's *gscale / *uscale, whose arbitrary-f32 scale must stay a separate multiply). Gate and
  * up are two fp4 weight matrices Wg/Wu each with its own E8M0 scale row Sg/Su; the epilogue is
  * act(g)*u. One wave owns one output column (like the fp8 twin), so 4 fp4->bf16 converts + 4 fdot2
  * per fragment for each of gate and up. HARDWARE-VALIDATE numerics against golden d_gemv_glu_mxfp4_k
@@ -3557,9 +4764,98 @@ __device__ void d_gemv_glu_fp8(bf16* C, const bf16* x, const unsigned char* Wg,
                               const unsigned char* Wu, const float* gscale, const float* uscale,
                               unsigned M, unsigned N, unsigned K, unsigned act, unsigned slice,
                               unsigned nblk, bf16* lds) {
+#if PLOW_GV_ABL >= 4
+    /* THE GLU ARM IS A SEPARATE FUNCTION, so PLOW_GV_ABL levels 1-3 (which patch gemv_rows_fp8)
+     * never touched it -- and it is the LARGEST op in the decode layer (57-59 us, 27% of it).
+     * Any "GEMV-free floor" measured without this line is not GEMV-free. */
+    return;
+#endif
     stage_x_lds(lds, x, (size_t)M * K);
     __syncthreads();
-    gemv_glu_rows_fp8<PLOW_GEMV_MM>(C, Wg, Wu, gscale, uscale, M, N, K, act, slice, nblk, lds);
+    /* Same dead-chunk rule as d_gemv_fp8, which this path did not have AT ALL -- it always ran
+     * GV_UNROLL_GLU_FP8=3, tuned for Qwen's K=2560. Gemma-4's gate|up is K=3840 (nchunk=4), and
+     * this is the single largest GEMV consumer in the decode trace (3.954 ms of a 14.87 ms token),
+     * so a 50% dead-convert rate here is the most expensive instance of the bug. */
+    /* PROBE (PLOW_GLU_UN): the GLU arm carries FOUR weight streams (gate|up x two columns), so UN
+     * loads in flight is 4*UN fp8v16 = 16*UN VGPRs of weights alone -- 64 at UN=4 against this
+     * object's 104-VGPR budget. The divisor rule is right about DEAD WORK but says nothing about
+     * register pressure, and this is the largest single op in the decode layer.
+     *
+     * MEASURED (MI300X, Gemma-4-12B fp8+bf16KV, cap blob, 3 reps, ms/token) -- the rule WINS and
+     * the register argument does not bite:
+     *
+     *     ctx     UN=4 (the rule)   UN=3        UN=2
+     *     4096    12.160            12.565      12.117
+     *     8192    12.231            12.620      12.216
+     *
+     * UN=3 is +3.3%: nchunk = 3840/1024 = 4 is not divisible by 3, so a third of the converts run
+     * on zeros -- an independent confirmation of gv_un_fp8 on the op that costs the most. UN=2
+     * also divides 4 and halves the weight registers, but its edge is -0.35%/-0.12%, at or below
+     * this box's 0.4% run-to-run drift. Left on the rule; probe kept so this is not re-run. */
+#ifdef PLOW_GLU_UN
+    switch (PLOW_GLU_UN) {
+#else
+    switch (gv_un_fp8((K + PLOW_WAVE * 16 - 1) / (PLOW_WAVE * 16))) {
+#endif
+        case 4:
+            gemv_glu_rows_fp8<PLOW_GEMV_MM, 4>(C, Wg, Wu, gscale, uscale, M, N, K, act, slice, nblk, lds);
+            break;
+        case 5:
+            gemv_glu_rows_fp8<PLOW_GEMV_MM, 5>(C, Wg, Wu, gscale, uscale, M, N, K, act, slice, nblk, lds);
+            break;
+        case 2:
+            gemv_glu_rows_fp8<PLOW_GEMV_MM, 2>(C, Wg, Wu, gscale, uscale, M, N, K, act, slice, nblk, lds);
+            break;
+        default:
+            gemv_glu_rows_fp8<PLOW_GEMV_MM, 3>(C, Wg, Wu, gscale, uscale, M, N, K, act, slice, nblk, lds);
+            break;
+    }
+}
+
+/* d_gemv_glu_fp8 WITH the NRN1 fold: the post-attention NormResidualNorm (op 23) computed into
+ * this GEMV's staging — see gemv_nrn_lds for the mechanism, the bit-exactness argument and the
+ * residual ping-pong. This op is ONE packet (no q/k/v trio), so slice 0 alone stores the residual
+ * and there is no sibling race. The five extra operands ride the wire as t1 (a, replacing the x
+ * that no longer exists) plus FOUR TENSOR HANDLES in i3/i4/i6/i7 (op 114's demotion — the "GLU
+ * fusion needs 9 slots" note predates that precedent), eps/scale in f0/f1, flag in fj[2].u.
+ *
+ * A SEPARATE FUNCTION, not a branch inside d_gemv_glu_fp8, and that is a MEASURED requirement:
+ * the branched form left resource stats untouched (104 VGPR / 0 spill / same scratch) and still
+ * cost +0.5 ms/token on blobs that never take the fold — the `if (nrn)` around the staging was
+ * enough to degrade the hot loop's schedule. Keeping the original function byte-for-byte and
+ * paying the duplicated dispatch here restores it. */
+__device__ void d_gemv_glu_fp8_nrn(bf16* C, bf16* resid_out, const bf16* a, const bf16* b,
+                                   const bf16* gb, const bf16* gn, const unsigned char* Wg,
+                                   const unsigned char* Wu, const float* gscale,
+                                   const float* uscale, unsigned M, unsigned N, unsigned K,
+                                   unsigned act, float eps, float scale, unsigned slice,
+                                   unsigned nblk, bf16* lds) {
+#if PLOW_GV_ABL >= 4
+    return;
+#endif
+    const bool ok = ((size_t)M * K + GV_NORM_SCRATCH <= GM_LDS_HALVES) &&
+                    (K <= RN_REG * PLOW_THREADS) && ((K & 7u) == 0);
+    if (!ok) __builtin_trap(); /* no packet exists to fall back to */
+    float* const nscratch = (float*)(lds + (GM_LDS_HALVES - GV_NORM_SCRATCH));
+    gemv_nrn_lds(lds, resid_out, a, b, gb, gn, M, K, eps, scale, slice == 0, nscratch);
+#ifdef PLOW_GLU_UN
+    switch (PLOW_GLU_UN) {
+#else
+    switch (gv_un_fp8((K + PLOW_WAVE * 16 - 1) / (PLOW_WAVE * 16))) {
+#endif
+        case 4:
+            gemv_glu_rows_fp8<PLOW_GEMV_MM, 4>(C, Wg, Wu, gscale, uscale, M, N, K, act, slice, nblk, lds);
+            break;
+        case 5:
+            gemv_glu_rows_fp8<PLOW_GEMV_MM, 5>(C, Wg, Wu, gscale, uscale, M, N, K, act, slice, nblk, lds);
+            break;
+        case 2:
+            gemv_glu_rows_fp8<PLOW_GEMV_MM, 2>(C, Wg, Wu, gscale, uscale, M, N, K, act, slice, nblk, lds);
+            break;
+        default:
+            gemv_glu_rows_fp8<PLOW_GEMV_MM, 3>(C, Wg, Wu, gscale, uscale, M, N, K, act, slice, nblk, lds);
+            break;
+    }
 }
 
 

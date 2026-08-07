@@ -67,6 +67,13 @@ const ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
 const ATTR_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 const ATTR_COOPERATIVE_LAUNCH: i32 = 95;
 const ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
+/// `CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES`: 1 only
+/// on hardware-coherent platforms (Grace-Hopper ATS), where the DMA engines
+/// read pageable host memory — an mmap'd checkpoint included — at full link
+/// speed with no staging. Deliberately NOT the weaker attribute 88
+/// (`PAGEABLE_MEMORY_ACCESS`), which HMM also sets on PCIe boxes where the
+/// same copy degrades to fault-driven migration.
+const ATTR_PAGEABLE_USES_HOST_PAGE_TABLES: i32 = 100;
 // CUfunction_attribute.
 const FUNC_ATTR_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 // cuMemHostAlloc flags.
@@ -353,11 +360,18 @@ pub struct CudaBackend {
     warp_size: u32,
     compute_capability: (u32, u32),
     smem_optin: u32,
+    /// Hardware-coherent pageable access (attr 100) — see
+    /// [`Backend::coherent_host_dma`].
+    coherent_host_dma: bool,
     /// Real loaded modules by placeholder-exclusive id (id 0 = "no module",
     /// handed out for an empty image so `ExecutorSet::bringup` works before
     /// any real cubin exists — the engine loads its module explicitly).
     modules: Mutex<FxHashMap<u64, usize>>,
     next_module: AtomicU64,
+    /// Physical slab chunks kept across loads (`PLOW_SLAB_KEEP=1`,
+    /// `VmmOps::pool_put`/`pool_take`). Device-local by construction (one
+    /// pool per backend, one backend per device); leftovers released in Drop.
+    slab_pool: Mutex<Vec<(u64, u64)>>,
 }
 
 // SAFETY: the driver API is thread-safe; the raw context/module handles are
@@ -478,6 +492,15 @@ impl CudaBackend {
             let cc_minor = attr(ATTR_COMPUTE_CAPABILITY_MINOR, "attr cc minor")? as u32;
             let compute_capability = (cc_major, cc_minor);
             let smem_optin = attr(ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, "attr smem")? as u32;
+            // Unknown attribute (older driver) reads as "no coherent access" —
+            // the staged upload path is always correct.
+            let coherent_host_dma = {
+                let mut v = 0i32;
+                // SAFETY: attribute query; failure leaves v = 0.
+                let rc =
+                    (api.cuDeviceGetAttribute)(&mut v, ATTR_PAGEABLE_USES_HOST_PAGE_TABLES, dev);
+                rc == 0 && v == 1
+            };
             let coop = attr(ATTR_COOPERATIVE_LAUNCH, "attr cooperative")?;
             if coop == 0 {
                 return Err(RuntimeError::Device(format!(
@@ -485,7 +508,15 @@ impl CudaBackend {
                 )));
             }
 
-            tracing::info!(%name, sm_count, smem_optin, cc_major, cc_minor, "CUDA device ready");
+            tracing::info!(
+                %name,
+                sm_count,
+                smem_optin,
+                cc_major,
+                cc_minor,
+                coherent_host_dma,
+                "CUDA device ready"
+            );
             let api = Arc::new(api);
             let freer = Arc::new(CudaFreer {
                 api: Arc::clone(&api),
@@ -502,8 +533,10 @@ impl CudaBackend {
                 warp_size,
                 compute_capability,
                 smem_optin,
+                coherent_host_dma,
                 modules: Mutex::new(FxHashMap::default()),
                 next_module: AtomicU64::new(1),
+                slab_pool: Mutex::new(Vec::new()),
             })
         }
     }
@@ -1222,6 +1255,14 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
     fn copy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
         self.memcpy_dtod(dst, src, bytes)
     }
+
+    fn pool_take(&self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut *self.slab_pool.lock())
+    }
+
+    fn pool_put(&self, mut chunks: Vec<(u64, u64)>) {
+        self.slab_pool.lock().append(&mut chunks);
+    }
 }
 
 impl Drop for CudaBackend {
@@ -1230,13 +1271,21 @@ impl Drop for CudaBackend {
     /// which may outlive the backend. Errors are logged, not propagated.
     fn drop(&mut self) {
         // SAFETY: handles from cuModuleLoadData; the map is drained so each
-        // is unloaded exactly once.
+        // is unloaded exactly once. Pooled slab chunks (PLOW_SLAB_KEEP) are
+        // released here — the pool's whole point is to outlive engines, so
+        // the backend is its terminal owner.
         unsafe {
             (self.api.cuCtxSetCurrent)(self.ctx as CUcontext);
             for (id, raw) in self.modules.lock().drain() {
                 let rc = (self.api.cuModuleUnload)(raw as CUmodule);
                 if rc != 0 {
                     tracing::warn!(id, rc, "cuModuleUnload at backend drop");
+                }
+            }
+            for (h, bytes) in self.slab_pool.lock().drain(..) {
+                let rc = (self.api.cuMemRelease)(h);
+                if rc != 0 {
+                    tracing::warn!(rc, handle = h, bytes, "cuMemRelease at backend drop");
                 }
             }
         }
@@ -1246,6 +1295,9 @@ impl Drop for CudaBackend {
 impl Backend for CudaBackend {
     fn class(&self) -> ExecutorClass {
         ExecutorClass::SmNv
+    }
+    fn coherent_host_dma(&self) -> bool {
+        self.coherent_host_dma
     }
     fn vendor(&self) -> Option<hwspec::Vendor> {
         Some(hwspec::Vendor::Nvidia)

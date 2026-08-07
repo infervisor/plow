@@ -309,8 +309,8 @@ fn describe_candidates(assets_dir: &Path) -> String {
     }
 }
 
-/// Split the weight-upload wall time into alloc / stage+DMA / memset. Off by
-/// default — it is an `Instant` per tensor on a path that walks hundreds.
+/// Model-load timeline (`PLOW_LOAD_PROFILE=1`). Off by default — Instant-per-chunk
+/// and stage spam are for profiling bring-up, not steady serve.
 crate::env_flag!(fn load_profile, "PLOW_LOAD_PROFILE");
 
 /// Stride between tensors carved out of the weight slab.
@@ -329,6 +329,27 @@ const SLAB_ALIGN: u64 = 4096;
 /// they must agree exactly or the carve runs past the allocation.
 fn slab_pad(bytes: u64) -> u64 {
     bytes.div_ceil(SLAB_ALIGN) * SLAB_ALIGN
+}
+
+/// The shared storage-source enum (`Vmm` is the CUDA default —
+/// `PLOW_WEIGHT_VMM=0` drops to `Flat`, `PLOW_WEIGHT_SLAB=0` to `PerTensor`;
+/// see the `_weight_slab` field doc for the measurements) and its commit
+/// chunk.
+use crate::memory::vmm::{WeightSlab, WEIGHT_SLAB_CHUNK};
+
+/// Block until a VMM-slab byte range ending at device address `dend` is
+/// committed (no-op for every other storage kind — VMM has no demand paging,
+/// so a DMA or memset below the mapper watermark must wait, not fault).
+/// Accumulates blocked time into `acc` (ms).
+fn slab_commit_wait(ws: &WeightSlab, dend: u64, acc: &mut f64) -> Result<()> {
+    if let WeightSlab::Vmm(s) = ws {
+        if dend > s.base() && dend - s.base() <= s.len() {
+            let t = std::time::Instant::now();
+            s.wait_mapped(dend - s.base())?;
+            *acc += t.elapsed().as_secs_f64() * 1e3;
+        }
+    }
+    Ok(())
 }
 
 /// One block per executor, 8 worker warps — `dev_isa.h` workgroup geometry.
@@ -473,37 +494,33 @@ pub struct GpuEngine {
     /// Per-tensor device buffers, indexed by blob tensor handle. Ordinarily
     /// **views** into `_weight_slab`, not owners — see it for why.
     devp: Vec<DeviceMem>,
-    /// Owner of the one allocation every non-VMM tensor is carved out of.
+    /// Owner of the one span every non-VMM-prefix tensor is carved out of.
     ///
     /// The blob declares every tensor and its size before a byte moves, so the
     /// whole layout is known up front and there is no reason to ask the driver
     /// for it a tensor at a time.
     ///
-    /// **This does not make the load faster, and it was kept anyway.** Per-tensor
-    /// allocation costs a flat ~2.0 s on a 12B load — 737 `cuMemAlloc`s, a third
-    /// of the total, identical cold or warm because it is driver time rather
-    /// than I/O (`PLOW_LOAD_PROFILE=1`) — and batching them into one 25 GiB
-    /// request costs 1.92 s, which is the same number. The driver charges by
-    /// COMMITTED BYTES, not by call count: 13.0 GiB/s at 12B and 13.4 GiB/s at
-    /// 31B, one rate across two sizes. Killing the term needs the commit
-    /// avoided rather than batched (VMM with lazy mapping, as `VmmKv` already
-    /// does for KV), and that is a different patch. See
-    /// `perf-data/coldstart-plow-vs-vllm-gh200.md` §4b, recorded so this is not
-    /// re-tried as a speed fix.
+    /// The slab always bought MEMORY: per-allocation rounding waste on a 12B
+    /// model drops from 322 MiB to 21 MiB, which the co-residency planner
+    /// spends directly (the AMD loader carries the same carve — see
+    /// `exec::amd`'s `_weight_slab`, where ROCr's next-power-of-two rounding
+    /// under 2 MiB makes the waste far worse).
     ///
-    /// What it does buy is MEMORY: per-allocation rounding waste on a 12B model
-    /// drops from 322 MiB to 21 MiB, which the co-residency planner spends
-    /// directly. The AMD loader carries the same carve for the same reason and a
-    /// much larger one — see `exec::amd`'s `_weight_slab`, where ROCr's
-    /// next-power-of-two rounding under 2 MiB makes the waste far worse.
+    /// What a flat `cuMemAlloc` slab could never buy was TIME: the driver
+    /// charges by COMMITTED BYTES, not call count — 737 per-tensor allocs cost
+    /// 1.97 s on a 12B load and one 25 GiB request costs 1.92 s, one ~13 GiB/s
+    /// commit rate across sizes (`perf-data/coldstart-plow-vs-vllm-gh200.md`
+    /// §4b). The [`WeightSlab::Vmm`] default kills the term the only way it
+    /// can be killed: the commit is not batched but taken OFF the critical
+    /// path — VA reserved in µs, pages committed by a background mapper
+    /// overlapped with the upload. Measured on GH200 (12B warm): the 1.74 s
+    /// upfront stall becomes 0.1 ms of watermark waits; total load 3.69 s →
+    /// 1.99 s.
     ///
     /// Views never free, so this owner must outlive them; both live here, and a
-    /// `View`'s Drop is a no-op, so field drop order cannot matter.
-    ///
-    /// `None` when the single allocation failed and the loader fell back to
-    /// per-tensor allocation (a fragmented card can refuse one big block and
-    /// still satisfy many small ones).
-    _weight_slab: Option<DeviceMem>,
+    /// `View`'s Drop is a no-op, so field drop order cannot matter. The Vmm
+    /// arm's Drop unmaps and releases its physical chunks.
+    _weight_slab: WeightSlab,
     d_inst: DeviceMem,
     /// Owner of the decode counter+cursor allocation. `d_ctr` and the decode
     /// GQ cursor are aliased **views** into it (never freed by their own
@@ -590,6 +607,380 @@ pub struct GpuEngine {
     pf_batch: Option<PfBatch>,
 }
 
+/// Full model-load wall timeline (`PLOW_LOAD_PROFILE=1`).
+///
+/// Exclusive phases are sequential Instant walls that should sum ≈ total
+/// `GpuEngine::load` elapsed. Overlay metrics (DMA events, prefetch wall/worker
+/// sum, upload sub-Instants) overlap those phases and are printed as annotations.
+struct LoadTiming {
+    t0: std::time::Instant,
+    // ---- exclusive wall phases ----
+    blob_ms: f64,
+    module_ms: f64,
+    vmm_ms: f64,
+    /// Weight-slab bringup: VMM reserve+mapper spawn (µs), or the flat
+    /// `cuMemAlloc` fallback (the §4b commit stall, when it is paid at all).
+    slab_ms: f64,
+    /// Upload time actually blocked on the VMM mapper watermark (overlay
+    /// inside upload_all; ≈0 when the mapper outruns the upload).
+    slab_wait_ms: f64,
+    /// Final wait for the slab tail (KV is never written at load) after
+    /// pipe.finish.
+    slab_join_ms: f64,
+    ckpt_open_ms: f64,
+    pipe_setup_ms: f64,
+    pipe_stream_ms: f64,
+    pipe_pinned_ms: f64,
+    pipe_events_ms: f64,
+    prefetch_spawn_ms: f64,
+    upload_all_ms: f64,
+    pipe_finish_ms: f64,
+    prefetch_join_ms: f64,
+    moe_ms: f64,
+    decode_tables_ms: f64,
+    prefill_ms: f64,
+    final_init_ms: f64,
+    // ---- checkpoint open sub ----
+    ckpt_scan_ms: f64,
+    ckpt_mmap_ms: f64,
+    ckpt_meta_ms: f64,
+    ckpt_index_ms: f64,
+    // ---- upload overlays (inside upload_all / finish) ----
+    host_memcpy_ms: f64,
+    host_memcpy_bytes: u64,
+    htod_enqueue_ms: f64,
+    dma_gpu_ms: f64,
+    dma_bytes: u64,
+    event_sync_ms: f64,
+    stream_sync_ms: f64,
+    memset_ms: f64,
+    n_tensors_uploaded: usize,
+    n_chunks: usize,
+    // ---- alloc aggregates ----
+    alloc_ms: f64,
+    alloc_count: usize,
+    alloc_bytes: u64,
+    /// Alloc Instant sum inside `upload_all` only (for upload_other residual).
+    alloc_upload_ms: f64,
+    // ---- prefetch overlays ----
+    prefetch_wall_ms: f64,
+    prefetch_worker_ms: f64,
+    prefetch_bytes: u64,
+    prefetch_workers: usize,
+    // ---- flame spans (name, t0_ms, t1_ms relative to load t0) ----
+    spans: Vec<(String, f64, f64)>,
+}
+
+impl LoadTiming {
+    fn new(t0: std::time::Instant) -> Self {
+        Self {
+            t0,
+            blob_ms: 0.0,
+            module_ms: 0.0,
+            vmm_ms: 0.0,
+            slab_ms: 0.0,
+            slab_wait_ms: 0.0,
+            slab_join_ms: 0.0,
+            ckpt_open_ms: 0.0,
+            pipe_setup_ms: 0.0,
+            pipe_stream_ms: 0.0,
+            pipe_pinned_ms: 0.0,
+            pipe_events_ms: 0.0,
+            prefetch_spawn_ms: 0.0,
+            upload_all_ms: 0.0,
+            pipe_finish_ms: 0.0,
+            prefetch_join_ms: 0.0,
+            moe_ms: 0.0,
+            decode_tables_ms: 0.0,
+            prefill_ms: 0.0,
+            final_init_ms: 0.0,
+            ckpt_scan_ms: 0.0,
+            ckpt_mmap_ms: 0.0,
+            ckpt_meta_ms: 0.0,
+            ckpt_index_ms: 0.0,
+            host_memcpy_ms: 0.0,
+            host_memcpy_bytes: 0,
+            htod_enqueue_ms: 0.0,
+            dma_gpu_ms: 0.0,
+            dma_bytes: 0,
+            event_sync_ms: 0.0,
+            stream_sync_ms: 0.0,
+            memset_ms: 0.0,
+            n_tensors_uploaded: 0,
+            n_chunks: 0,
+            alloc_ms: 0.0,
+            alloc_count: 0,
+            alloc_bytes: 0,
+            alloc_upload_ms: 0.0,
+            prefetch_wall_ms: 0.0,
+            prefetch_worker_ms: 0.0,
+            prefetch_bytes: 0,
+            prefetch_workers: 0,
+            spans: Vec::new(),
+        }
+    }
+
+    fn ms_since_t0(&self) -> f64 {
+        self.t0.elapsed().as_secs_f64() * 1e3
+    }
+
+    fn cum_ms(&self) -> f64 {
+        self.ms_since_t0()
+    }
+
+    fn epoch_ms(t: std::time::SystemTime) -> u128 {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    }
+
+    fn gib(bytes: u64) -> f64 {
+        bytes as f64 / (1u64 << 30) as f64
+    }
+
+    fn gib_s(bytes: u64, ms: f64) -> f64 {
+        if ms <= 0.0 {
+            0.0
+        } else {
+            Self::gib(bytes) / (ms / 1e3)
+        }
+    }
+
+    /// Run `f`; return `(result, elapsed_ms)`. Caller stores into an exclusive slot
+    /// and we record the flame span + stage log.
+    fn phase<R>(&mut self, name: &str, f: impl FnOnce() -> R) -> (R, f64) {
+        let sys0 = std::time::SystemTime::now();
+        let t0_ms = self.ms_since_t0();
+        let t = std::time::Instant::now();
+        let out = f();
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let t1_ms = self.ms_since_t0();
+        self.spans.push((name.to_string(), t0_ms, t1_ms));
+        self.log_stage(name, sys0, std::time::SystemTime::now(), ms);
+        (out, ms)
+    }
+
+    fn note_alloc(&mut self, bytes: u64, ms: f64, in_upload: bool) {
+        self.alloc_ms += ms;
+        self.alloc_count += 1;
+        self.alloc_bytes += bytes;
+        if in_upload {
+            self.alloc_upload_ms += ms;
+        }
+        tracing::debug!(
+            bytes,
+            elapsed_ms = format!("{ms:.3}").as_str(),
+            api = "cuMemAlloc_v2",
+            "load alloc"
+        );
+    }
+
+    fn log_stage(
+        &self,
+        name: &str,
+        start: std::time::SystemTime,
+        end: std::time::SystemTime,
+        elapsed_ms: f64,
+    ) {
+        tracing::info!(
+            stage = name,
+            start_ms = Self::epoch_ms(start),
+            end_ms = Self::epoch_ms(end),
+            elapsed_ms = format!("{elapsed_ms:.3}").as_str(),
+            cumulative_ms = format!("{:.3}", self.cum_ms()).as_str(),
+            "load stage"
+        );
+    }
+
+    fn log_stage_bytes(
+        &self,
+        name: &str,
+        start: std::time::SystemTime,
+        end: std::time::SystemTime,
+        elapsed_ms: f64,
+        bytes: u64,
+    ) {
+        tracing::info!(
+            stage = name,
+            start_ms = Self::epoch_ms(start),
+            end_ms = Self::epoch_ms(end),
+            elapsed_ms = format!("{elapsed_ms:.3}").as_str(),
+            bytes,
+            gib = format!("{:.2}", Self::gib(bytes)).as_str(),
+            gib_s = format!("{:.2}", Self::gib_s(bytes, elapsed_ms)).as_str(),
+            cumulative_ms = format!("{:.3}", self.cum_ms()).as_str(),
+            "load stage"
+        );
+    }
+
+    fn absorb_pipe_setup(&mut self, p: &PipeTiming) {
+        self.pipe_stream_ms = p.stream_ns as f64 / 1e6;
+        self.pipe_pinned_ms = p.pinned_ns as f64 / 1e6;
+        self.pipe_events_ms = p.events_ns as f64 / 1e6;
+    }
+
+    fn absorb_pipe_upload(&mut self, p: &PipeTiming) {
+        self.host_memcpy_ms = p.host_memcpy_ns as f64 / 1e6;
+        self.host_memcpy_bytes = p.bytes;
+        self.htod_enqueue_ms = p.htod_enq_ns as f64 / 1e6;
+        self.dma_gpu_ms = p.dma_ms;
+        self.dma_bytes = p.bytes;
+        self.event_sync_ms = p.event_sync_ns as f64 / 1e6;
+        self.stream_sync_ms = p.stream_sync_ns as f64 / 1e6;
+        if p.bytes > 0 && STAGE > 0 {
+            self.n_chunks = (p.bytes as usize).div_ceil(STAGE);
+        }
+    }
+
+    fn exclusive_sum_ms(&self) -> f64 {
+        self.blob_ms
+            + self.module_ms
+            + self.vmm_ms
+            + self.slab_ms
+            + self.slab_join_ms
+            + self.ckpt_open_ms
+            + self.pipe_setup_ms
+            + self.prefetch_spawn_ms
+            + self.upload_all_ms
+            + self.pipe_finish_ms
+            + self.prefetch_join_ms
+            + self.moe_ms
+            + self.decode_tables_ms
+            + self.prefill_ms
+            + self.final_init_ms
+    }
+
+    fn upload_other_ms(&self) -> f64 {
+        (self.upload_all_ms
+            - self.host_memcpy_ms
+            - self.htod_enqueue_ms
+            - self.event_sync_ms
+            - self.memset_ms
+            - self.alloc_upload_ms
+            - self.slab_wait_ms)
+            .max(0.0)
+    }
+
+    fn print_summary(&self, total_load_ms: f64) {
+        let excl = self.exclusive_sum_ms();
+        let other = (total_load_ms - excl).max(0.0);
+        let host_gib = Self::gib(self.host_memcpy_bytes);
+        let dma_gib = Self::gib(self.dma_bytes);
+        let pref_gib = Self::gib(self.prefetch_bytes);
+        let avg_chunk = if self.n_chunks > 0 {
+            self.host_memcpy_bytes as f64 / self.n_chunks as f64
+        } else {
+            0.0
+        };
+        tracing::info!(
+            "\n\
+================= MODEL LOAD BREAKDOWN =================\n\
+Blob find/read/parse         : {:>8.1} ms\n\
+Interpreter module           : {:>8.1} ms\n\
+VMM bringup                  : {:>8.1} ms\n\
+Weight slab bringup          : {:>8.1} ms\n\
+Checkpoint open              : {:>8.1} ms  (scan {:.1} + mmap {:.1} + meta {:.1} + index {:.1})\n\
+Upload pipe setup            : {:>8.1} ms  (stream {:.1} + pinned {:.1} + events {:.1})\n\
+Prefetch spawn               : {:>8.1} ms\n\
+upload_all (wall)            : {:>8.1} ms\n\
+    tensors uploaded         : {:>8}\n\
+    chunks / avg chunk       : {:>8} / {:.1} MiB\n\
+    RAM→Pinned memcpy        : {:>8.1} ms  ({:.2} GiB, {:.2} GiB/s)\n\
+    H2D enqueue (CPU)        : {:>8.1} ms\n\
+    event_synchronize        : {:>8.1} ms\n\
+    memset                   : {:>8.1} ms\n\
+    alloc (cuMemAlloc)       : {:>8.1} ms  ({} allocs, {:.2} GiB)\n\
+    slab commit wait         : {:>8.1} ms\n\
+    other (iter/lookup)      : {:>8.1} ms\n\
+    Pinned→GPU DMA (events)  : {:>8.1} ms  ({:.2} GiB, {:.2} GiB/s; overlay)\n\
+pipe.finish                  : {:>8.1} ms  (stream_sync {:.1})\n\
+Slab tail commit join        : {:>8.1} ms\n\
+Prefetch join                : {:>8.1} ms\n\
+    Disk→RAM wall (overlay)  : {:>8.1} ms  ({:.2} GiB, {:.2} GiB/s)\n\
+    worker time (overlay)    : {:>8.1} ms  ({} workers; parallel sum)\n\
+MoE tables                   : {:>8.1} ms\n\
+Decode tables                : {:>8.1} ms\n\
+Prefill load                 : {:>8.1} ms\n\
+Final init                   : {:>8.1} ms\n\
+--------------------------------------------------------\n\
+Exclusive sum                : {:>8.1} ms\n\
+Total GpuEngine::load()      : {:>8.1} ms\n\
+Other (residual)             : {:>8.1} ms\n\
+========================================================",
+            self.blob_ms,
+            self.module_ms,
+            self.vmm_ms,
+            self.slab_ms,
+            self.ckpt_open_ms,
+            self.ckpt_scan_ms,
+            self.ckpt_mmap_ms,
+            self.ckpt_meta_ms,
+            self.ckpt_index_ms,
+            self.pipe_setup_ms,
+            self.pipe_stream_ms,
+            self.pipe_pinned_ms,
+            self.pipe_events_ms,
+            self.prefetch_spawn_ms,
+            self.upload_all_ms,
+            self.n_tensors_uploaded,
+            self.n_chunks,
+            avg_chunk / (1 << 20) as f64,
+            self.host_memcpy_ms,
+            host_gib,
+            Self::gib_s(self.host_memcpy_bytes, self.host_memcpy_ms),
+            self.htod_enqueue_ms,
+            self.event_sync_ms,
+            self.memset_ms,
+            self.alloc_ms,
+            self.alloc_count,
+            Self::gib(self.alloc_bytes),
+            self.slab_wait_ms,
+            self.upload_other_ms(),
+            self.dma_gpu_ms,
+            dma_gib,
+            Self::gib_s(self.dma_bytes, self.dma_gpu_ms),
+            self.pipe_finish_ms,
+            self.stream_sync_ms,
+            self.slab_join_ms,
+            self.prefetch_join_ms,
+            self.prefetch_wall_ms,
+            pref_gib,
+            Self::gib_s(self.prefetch_bytes, self.prefetch_wall_ms),
+            self.prefetch_worker_ms,
+            self.prefetch_workers,
+            self.moe_ms,
+            self.decode_tables_ms,
+            self.prefill_ms,
+            self.final_init_ms,
+            excl,
+            total_load_ms,
+            other,
+        );
+    }
+
+    fn print_flame(&self, total_load_ms: f64) {
+        let mut lines = String::from("\n0 ms\n│\n");
+        for (name, t0, t1) in &self.spans {
+            lines.push_str(&format!("├── {name}  [{t0:.1} → {t1:.1} ms]\n"));
+        }
+        lines.push_str(&format!("└── load_finished\n{total_load_ms:.0} ms"));
+        tracing::info!("{lines}");
+    }
+}
+
+/// Per-pipe Instant / CUDA-event accumulators for the model-load breakdown.
+struct PipeTiming {
+    stream_ns: u128,
+    pinned_ns: u128,
+    events_ns: u128,
+    host_memcpy_ns: u128,
+    htod_enq_ns: u128,
+    event_sync_ns: u128,
+    stream_sync_ns: u128,
+    dma_ms: f64,
+    bytes: u64,
+}
+
 /// Double-buffered checkpoint-upload pipeline (plan stage 9). Two pinned
 /// staging buffers ping-pong on a dedicated stream so the host copy of chunk
 /// N+1 (safetensors mmap → pinned) overlaps the async H2D DMA of chunk N —
@@ -599,22 +990,119 @@ struct UploadPipe<'a> {
     be: &'a CudaBackend,
     stream: CudaStream,
     bufs: [PinnedHost; 2],
-    events: [CudaEvent; 2],
+    /// End-of-H2D markers (also gate buffer reuse). Timing-enabled when profiling.
+    ends: [CudaEvent; 2],
+    /// Start-of-H2D markers for `cuEventElapsedTime` (only when profiling).
+    starts: Option<[CudaEvent; 2]>,
     primed: [bool; 2],
     n: usize,
+    /// Direct mode: the device reads pageable memory coherently
+    /// ([`crate::device::Backend::coherent_host_dma`]) so long-lived sources
+    /// (checkpoint mmap, blob init) skip the staging memcpy entirely via
+    /// [`Self::push_direct`] — 332 GiB/s vs 13 GiB/s staged on GH200. Staged
+    /// [`Self::push`] stays available in this mode for short-lived sources
+    /// (generated tensors).
+    direct: bool,
+    /// A direct-mode DMA window is open (first push_direct recorded
+    /// `dwin.0`; finish() records `dwin.1` and folds the elapsed into the
+    /// dma_ms overlay).
+    direct_started: bool,
+    /// Direct-window timing events (profiling only) — the per-slot
+    /// `starts`/`ends` pairs are re-recorded by every staged push, so the
+    /// direct window needs its own markers.
+    dwin: Option<(CudaEvent, CudaEvent)>,
+    timing: Option<PipeTiming>,
 }
 
 impl<'a> UploadPipe<'a> {
-    fn new(be: &'a CudaBackend) -> Result<Self> {
+    fn new(be: &'a CudaBackend, profile: bool) -> Result<Self> {
+        let mut timing = profile.then(|| PipeTiming {
+            stream_ns: 0,
+            pinned_ns: 0,
+            events_ns: 0,
+            host_memcpy_ns: 0,
+            htod_enq_ns: 0,
+            event_sync_ns: 0,
+            stream_sync_ns: 0,
+            dma_ms: 0.0,
+            bytes: 0,
+        });
+        let t_stream = profile.then(std::time::Instant::now);
+        let stream = be.stream_create()?;
+        if let (Some(t), Some(tm)) = (t_stream, timing.as_mut()) {
+            tm.stream_ns = t.elapsed().as_nanos();
+        }
+        let t_pin = profile.then(std::time::Instant::now);
+        let bufs = [be.host_alloc_pinned(STAGE)?, be.host_alloc_pinned(STAGE)?];
+        if let (Some(t), Some(tm)) = (t_pin, timing.as_mut()) {
+            tm.pinned_ns = t.elapsed().as_nanos();
+        }
+        let t_ev = profile.then(std::time::Instant::now);
+        // Profiling needs timing-capable events for DMA elapsed; otherwise
+        // sync-only (cheaper) — used purely to gate buffer reuse.
+        let ends = [be.event_create(profile)?, be.event_create(profile)?];
+        let starts = if profile {
+            Some([be.event_create(true)?, be.event_create(true)?])
+        } else {
+            None
+        };
+        if let (Some(t), Some(tm)) = (t_ev, timing.as_mut()) {
+            tm.events_ns = t.elapsed().as_nanos();
+        }
+        let direct = be.coherent_host_dma() && crate::asset::checkpoint::upload_direct_enabled();
+        tracing::info!(direct, "upload pipe mode");
+        let dwin = if profile {
+            Some((be.event_create(true)?, be.event_create(true)?))
+        } else {
+            None
+        };
         Ok(UploadPipe {
-            stream: be.stream_create()?,
-            bufs: [be.host_alloc_pinned(STAGE)?, be.host_alloc_pinned(STAGE)?],
-            // Sync-only events (cheaper record) — used purely to gate buffer reuse.
-            events: [be.event_create(false)?, be.event_create(false)?],
+            stream,
+            bufs,
+            ends,
+            starts,
             primed: [false, false],
             n: 0,
+            direct,
+            direct_started: false,
+            dwin,
+            timing,
             be,
         })
+    }
+
+    fn is_direct(&self) -> bool {
+        self.direct
+    }
+
+    /// Direct-mode enqueue: async H2D straight from `src`, no staging memcpy.
+    /// Only meaningful when [`Self::is_direct`] — the caller falls back to
+    /// [`Self::push`] otherwise.
+    ///
+    /// # Safety
+    /// `src` must stay valid (unmoved, undropped) until [`Self::finish`]
+    /// returns — the loader only passes slices of the checkpoint mmap and the
+    /// blob, both of which outlive the pipe.
+    unsafe fn push_direct(&mut self, dst: u64, src: &[u8]) -> Result<()> {
+        if !self.direct_started {
+            self.direct_started = true;
+            if let Some((start, _)) = &self.dwin {
+                self.be.event_record(start, &self.stream)?;
+            }
+        }
+        let t_enq = self.timing.is_some().then(std::time::Instant::now);
+        // SAFETY: caller upholds the source-lifetime contract above; dst is
+        // inside a live (committed) allocation.
+        unsafe {
+            self.be.memcpy_htod_async(dst, src, &self.stream)?;
+        }
+        if let Some(tm) = self.timing.as_mut() {
+            if let Some(t) = t_enq {
+                tm.htod_enq_ns += t.elapsed().as_nanos();
+            }
+            tm.bytes += src.len() as u64;
+        }
+        Ok(())
     }
 
     /// Stage `chunk` (≤ STAGE) into the next free pinned buffer and enqueue its
@@ -623,11 +1111,32 @@ impl<'a> UploadPipe<'a> {
     fn push(&mut self, dst: u64, chunk: &[u8]) -> Result<()> {
         let slot = self.n & 1;
         if self.primed[slot] {
-            self.be.event_synchronize(&self.events[slot])?;
+            let t_wait = self.timing.is_some().then(std::time::Instant::now);
+            self.be.event_synchronize(&self.ends[slot])?;
+            if let Some(tm) = self.timing.as_mut() {
+                if let Some(t) = t_wait {
+                    tm.event_sync_ns += t.elapsed().as_nanos();
+                }
+                // Previous use of this slot has retired — fold its GPU DMA time.
+                if let Some(starts) = &self.starts {
+                    tm.dma_ms += self.be.event_elapsed_ms(&starts[slot], &self.ends[slot])? as f64;
+                }
+            }
         }
+        let t_copy = self.timing.is_some().then(std::time::Instant::now);
         self.bufs[slot].as_mut_slice()[..chunk.len()].copy_from_slice(chunk);
+        if let Some(tm) = self.timing.as_mut() {
+            if let Some(t) = t_copy {
+                tm.host_memcpy_ns += t.elapsed().as_nanos();
+            }
+            tm.bytes += chunk.len() as u64;
+        }
+        if let Some(starts) = &self.starts {
+            self.be.event_record(&starts[slot], &self.stream)?;
+        }
         // SAFETY: the pinned buffer stays alive (owned by self) until finish()
         // synchronizes the stream; dst is inside a live allocation (caller).
+        let t_enq = self.timing.is_some().then(std::time::Instant::now);
         unsafe {
             self.be.memcpy_htod_async(
                 dst,
@@ -635,15 +1144,51 @@ impl<'a> UploadPipe<'a> {
                 &self.stream,
             )?;
         }
-        self.be.event_record(&self.events[slot], &self.stream)?;
+        if let (Some(t), Some(tm)) = (t_enq, self.timing.as_mut()) {
+            tm.htod_enq_ns += t.elapsed().as_nanos();
+        }
+        self.be.event_record(&self.ends[slot], &self.stream)?;
         self.primed[slot] = true;
         self.n += 1;
         Ok(())
     }
 
-    /// Retire every enqueued upload (call before the pinned buffers drop).
-    fn finish(&self) -> Result<()> {
-        self.be.stream_synchronize(&self.stream)
+    /// Retire every enqueued upload (call before the pinned buffers drop —
+    /// and, in direct mode, before the borrowed sources go away).
+    fn finish(&mut self) -> Result<()> {
+        // Close the direct-mode DMA window at the stream tail.
+        if self.direct_started {
+            if let Some((_, end)) = &self.dwin {
+                self.be.event_record(end, &self.stream)?;
+            }
+        }
+        // Flush DMA elapsed for the last use of each primed slot.
+        if let Some(tm) = self.timing.as_mut() {
+            if let Some(starts) = &self.starts {
+                for slot in 0..2 {
+                    if !self.primed[slot] {
+                        continue;
+                    }
+                    self.be.event_synchronize(&self.ends[slot])?;
+                    tm.dma_ms += self.be.event_elapsed_ms(&starts[slot], &self.ends[slot])? as f64;
+                }
+            }
+        }
+        let t_sync = self.timing.is_some().then(std::time::Instant::now);
+        self.be.stream_synchronize(&self.stream)?;
+        if let (Some(t), Some(tm)) = (t_sync, self.timing.as_mut()) {
+            tm.stream_sync_ns = t.elapsed().as_nanos();
+        }
+        if self.direct_started {
+            if let (Some((start, end)), Some(tm)) = (&self.dwin, self.timing.as_mut()) {
+                tm.dma_ms += self.be.event_elapsed_ms(start, end)? as f64;
+            }
+        }
+        Ok(())
+    }
+
+    fn take_timing(&mut self) -> Option<PipeTiming> {
+        self.timing.take()
     }
 }
 
@@ -859,6 +1404,14 @@ impl GpuEngine {
     /// server startup, never on the request path.
     pub fn load(be: Arc<CudaBackend>, assets_dir: &Path, checkpoint_dir: &Path) -> Result<Self> {
         let t0 = std::time::Instant::now();
+        let load_prof = load_profile();
+        let mut load_tim = load_prof.then(|| LoadTiming::new(t0));
+        if load_prof {
+            tracing::info!(
+                start_ms = LoadTiming::epoch_ms(std::time::SystemTime::now()),
+                "load stage enter GpuEngine::load"
+            );
+        }
         tracing::info!(
             assets = %assets_dir.display(),
             checkpoint = %checkpoint_dir.display(),
@@ -867,14 +1420,26 @@ impl GpuEngine {
         );
 
         // ---- blob ----
-        let pkt = DevBlob::find_in_dir(assets_dir)?.ok_or_else(|| {
-            RuntimeError::Device(format!("no PLOWDEV blob in {}", assets_dir.display()))
-        })?;
-        let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
-            path: pkt.clone(),
-            source,
-        })?;
-        let blob = DevBlob::parse(&raw)?;
+        let (pkt, raw, blob) = {
+            let run = || -> Result<_> {
+                let pkt = DevBlob::find_in_dir(assets_dir)?.ok_or_else(|| {
+                    RuntimeError::Device(format!("no PLOWDEV blob in {}", assets_dir.display()))
+                })?;
+                let raw = std::fs::read(&pkt).map_err(|source| RuntimeError::Io {
+                    path: pkt.clone(),
+                    source,
+                })?;
+                let blob = DevBlob::parse(&raw)?;
+                Ok((pkt, raw, blob))
+            };
+            if let Some(tm) = load_tim.as_mut() {
+                let (r, ms) = tm.phase("blob_find_read_parse", run);
+                tm.blob_ms = ms;
+                r?
+            } else {
+                run()?
+            }
+        };
         tracing::info!(
             blob = %pkt.display(),
             tensors = blob.tensors.len(),
@@ -898,109 +1463,223 @@ impl GpuEngine {
         // are misnamed still serves, and a wrong-arch image is refused here with
         // a message instead of by the driver with an opaque code.
         let want_sm = cc.0 * 10 + cc.1;
-        let dec = resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Decode)?
-            .ok_or_else(|| {
-            RuntimeError::Device(format!(
-                "no sm_{want_sm} decode interpreter object for {} in {} — expected a cubin \
+        let (module, f, _kname, smem, grid, _dec_source, _image_len) = {
+            let run = || -> Result<_> {
+                let dec =
+                    resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Decode)?
+                        .ok_or_else(|| {
+                            RuntimeError::Device(format!(
+                        "no sm_{want_sm} decode interpreter object for {} in {} — expected a cubin \
                      carrying `{}` (embedded in the blob, or a file; {} is only the conventional \
                      name, the symbol table decides). Candidates found:\n{}",
-                be.device_name(),
-                assets_dir.display(),
-                profile.decode_symbol,
-                profile.decode_file,
-                describe_candidates(assets_dir),
-            ))
-        })?;
-        let image = dec.image;
-        let module = be.module_load(&image)?;
-        let kname = std::env::var(env_kernel_var(Role::Decode)).unwrap_or(dec.entry);
-        let f = be.get_function(&module, &kname)?;
-
-        // ---- packet/object pairing ----
-        // A SPECIALISED object carries only the arms one packet dispatches to, so
-        // it is not interchangeable and must not be paired with a different packet.
-        // Refusing here is the whole safety property of specialisation: without it,
-        // a missing arm turns today's loud `default: __trap()` at first launch into
-        // a trap MID-SERVE, on whichever bucket happens to need the dropped body.
-        Self::check_packet_pairing(&be, &module, assets_dir)?;
-
-        // Dynamic-smem arena: the cubin knows its own compile-time arena
-        // (`plow_arena_bytes`, embedded by interp_sm120.cu) — a GF_FULL=4
-        // flash-decode object needs 16448 B where the GF=2 default is 12352 B,
-        // and launching short of the compiled claim is an illegal address on
-        // the first flash op. Env override > cubin metadata > legacy default
-        // (pre-metadata cubins are all GF=2 builds).
-        let smem: u32 = match std::env::var("PLOW_NV_SMEM")
-            .ok()
-            .and_then(|s| s.parse().ok())
-        {
-            Some(v) => v,
-            None => be
-                .module_global_u32(&module, "plow_arena_bytes")?
-                .unwrap_or(12352),
-        };
-        if smem > 48 * 1024 {
-            be.set_max_dynamic_smem(f, smem)?;
-        }
-
-        // THE GRID MUST EQUAL n_cu (the harness's fatal gate): stream_ofs/len
-        // are [n_cu] arrays indexed by blockIdx.x. A mismatched grid reads off
-        // the tables or deadlocks the cooperative launch.
-        let occ = be.occupancy_blocks_per_sm(f, BLOCK, smem as usize)?;
-        let grid = occ * be.sm_count();
-        if grid != blob.n_cu {
-            return Err(RuntimeError::Device(format!(
-                "interpreter grid {grid} ({occ}/SM × {} SMs) != packet n_cu {} — recompile \
+                        be.device_name(),
+                        assets_dir.display(),
+                        profile.decode_symbol,
+                        profile.decode_file,
+                        describe_candidates(assets_dir),
+                    ))
+                        })?;
+                let image = dec.image;
+                let image_len = image.len();
+                let dec_source = dec.source.clone();
+                let module = be.module_load(&image)?;
+                let kname = std::env::var(env_kernel_var(Role::Decode)).unwrap_or(dec.entry);
+                let f = be.get_function(&module, &kname)?;
+                Self::check_packet_pairing(&be, &module, assets_dir)?;
+                let smem: u32 = match std::env::var("PLOW_NV_SMEM")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                {
+                    Some(v) => v,
+                    None => be
+                        .module_global_u32(&module, "plow_arena_bytes")?
+                        .unwrap_or(12352),
+                };
+                if smem > 48 * 1024 {
+                    be.set_max_dynamic_smem(f, smem)?;
+                }
+                let occ = be.occupancy_blocks_per_sm(f, BLOCK, smem as usize)?;
+                let grid = occ * be.sm_count();
+                if grid != blob.n_cu {
+                    return Err(RuntimeError::Device(format!(
+                        "interpreter grid {grid} ({occ}/SM × {} SMs) != packet n_cu {} — recompile \
                  the packet with n_cu={grid}",
-                be.sm_count(),
-                blob.n_cu
-            )));
-        }
-        tracing::info!(
-            profile = profile.tag,
-            source = %dec.source,
-            kernel = %kname,
-            grid,
-            smem,
-            occ_per_sm = occ,
-            cubin_bytes = image.len(),
-            "interpreter module loaded"
-        );
+                        be.sm_count(),
+                        blob.n_cu
+                    )));
+                }
+                Ok((module, f, kname, smem, grid, dec_source, image_len, occ))
+            };
+            if let Some(tm) = load_tim.as_mut() {
+                let (r, ms) = tm.phase("interp_module", run);
+                tm.module_ms = ms;
+                let (module, f, kname, smem, grid, dec_source, image_len, occ) = r?;
+                tracing::info!(
+                    profile = profile.tag,
+                    source = %dec_source,
+                    kernel = %kname,
+                    grid,
+                    smem,
+                    occ_per_sm = occ,
+                    cubin_bytes = image_len,
+                    "interpreter module loaded"
+                );
+                (module, f, kname, smem, grid, dec_source, image_len)
+            } else {
+                let (module, f, kname, smem, grid, dec_source, image_len, occ) = run()?;
+                tracing::info!(
+                    profile = profile.tag,
+                    source = %dec_source,
+                    kernel = %kname,
+                    grid,
+                    smem,
+                    occ_per_sm = occ,
+                    cubin_bytes = image_len,
+                    "interpreter module loaded"
+                );
+                (module, f, kname, smem, grid, dec_source, image_len)
+            }
+        };
 
         // ---- VMM prefix sharing (PLOW_VMM_PREFIX=1; default off) ----
-        // Full-layer kv.* tensors are then backed by VmmKv's VA reservations
-        // (per-sequence windows, shareable blocks) instead of cudaMalloc.
-        let vmm = Self::vmm_bringup(&be, &blob, checkpoint_dir);
+        let vmm = {
+            let run = || Self::vmm_bringup(&be, &blob, checkpoint_dir);
+            if let Some(tm) = load_tim.as_mut() {
+                let (v, ms) = tm.phase("vmm_bringup", run);
+                tm.vmm_ms = ms;
+                v
+            } else {
+                run()
+            }
+        };
+
+        // ---- weight slab ----
+        // Where a tensor's storage comes from, decided once so the sizing pass
+        // and the upload loop cannot disagree about it.
+        let vmm_va_of = |name: &str| -> Option<u64> {
+            let v = vmm.as_ref()?;
+            let (l, t) = kv_tensor_name(name)?;
+            v.kv.tensor_va(l, t)
+        };
+        let slab_bytes: u64 = blob
+            .tensors
+            .iter()
+            .filter(|td| vmm_va_of(&td.name).is_none())
+            .map(|td| slab_pad(td.bytes))
+            .sum();
+        // Brought up BEFORE the checkpoint opens: the VMM reserve returns in
+        // µs and its mapper then commits pages concurrently with the open,
+        // the prefetch spawn, and the upload itself.
+        let mk_slab = || -> WeightSlab {
+            if slab_bytes == 0 || !crate::asset::checkpoint::weight_slab_enabled() {
+                return WeightSlab::PerTensor;
+            }
+            if crate::asset::checkpoint::weight_vmm_enabled() {
+                match crate::memory::vmm::VmmSlab::new(
+                    Arc::clone(&be) as Arc<dyn crate::memory::vmm::VmmOps>,
+                    slab_bytes,
+                    WEIGHT_SLAB_CHUNK,
+                ) {
+                    Ok(s) => return WeightSlab::Vmm(s),
+                    Err(e) => tracing::warn!(
+                        bytes = slab_bytes,
+                        error = %e,
+                        "vmm weight slab refused — falling back to flat cuMemAlloc"
+                    ),
+                }
+            }
+            match be.alloc(0, slab_bytes) {
+                Ok(m) => WeightSlab::Flat(m),
+                Err(e) => {
+                    tracing::warn!(
+                        bytes = slab_bytes,
+                        error = %e,
+                        "single weight allocation refused — falling back to per-tensor alloc"
+                    );
+                    WeightSlab::PerTensor
+                }
+            }
+        };
+        let weight_slab = if let Some(tm) = load_tim.as_mut() {
+            let (s, ms) = tm.phase("weight_slab", mk_slab);
+            tm.slab_ms = ms;
+            if matches!(s, WeightSlab::Flat(_)) {
+                tm.note_alloc(slab_bytes, ms, false);
+            }
+            s
+        } else {
+            mk_slab()
+        };
 
         // ---- weights ----
         let t_weights = std::time::Instant::now();
-        // `Arc`, because the prefetch pool madvises this mapping from other
-        // threads while this one copies out of it.
-        let ckpt = std::sync::Arc::new(Checkpoint::open(checkpoint_dir)?);
+        let mut ckpt_sub = load_prof.then(crate::asset::checkpoint::CheckpointOpenTiming::default);
+        let ckpt = {
+            if let Some(tm) = load_tim.as_mut() {
+                let (c, ms) = tm.phase("Checkpoint::open", || {
+                    Checkpoint::open_with_timing(checkpoint_dir, ckpt_sub.as_mut())
+                        .map(std::sync::Arc::new)
+                });
+                tm.ckpt_open_ms = ms;
+                if let Some(sub) = ckpt_sub.as_ref() {
+                    tm.ckpt_scan_ms = sub.scan_ms;
+                    tm.ckpt_mmap_ms = sub.mmap_ms;
+                    tm.ckpt_meta_ms = sub.meta_ms;
+                    tm.ckpt_index_ms = sub.index_ms;
+                }
+                c?
+            } else {
+                Checkpoint::open(checkpoint_dir).map(std::sync::Arc::new)?
+            }
+        };
         tracing::info!(
             checkpoint = %checkpoint_dir.display(),
             "checkpoint opened, starting weight upload to GPU..."
         );
-        // Double-buffered pinned staging on a dedicated stream: the host copy
-        // of the next chunk overlaps the async H2D of the current one (plan
-        // stage 9). Pageable H2D runs at a fraction of pinned bandwidth and
-        // this moves the whole checkpoint (tens of GiB).
-        let mut pipe = UploadPipe::new(&be)?;
 
-        // The staging loop above overlaps the host copy with the DMA, but both
-        // still run on THIS thread — so a cold checkpoint pays its page faults
-        // serially, and one thread never gets past ~2.9 GiB/s no matter how fast
-        // the drive is (the scaling table on `Checkpoint::populate`). The pool
-        // faults the pages in ahead of the copy so the copy's own access is a
-        // hit; the AMD loader has done this since it was written and this path
-        // was simply never given it. Measured on this box, cold, on the 22.28 GiB
-        // gemma-4-12B shard: 7.17 s single-threaded vs 4.45 s with 32 threads.
+        let mut pipe = {
+            let run = || UploadPipe::new(&be, load_prof);
+            if let Some(tm) = load_tim.as_mut() {
+                let (p, ms) = tm.phase("UploadPipe::new", run);
+                tm.pipe_setup_ms = ms;
+                let p = p?;
+                if let Some(pt) = p.timing.as_ref() {
+                    tm.absorb_pipe_setup(pt);
+                }
+                p
+            } else {
+                run()?
+            }
+        };
+
         let depth = crate::asset::checkpoint::prefetch_depth();
-        let prefetch = crate::asset::checkpoint::Prefetcher::start(
-            std::sync::Arc::clone(&ckpt),
-            crate::asset::checkpoint::prefetch_threads(),
-            depth,
-        );
+        let pref_threads = crate::asset::checkpoint::prefetch_threads();
+        let prefetch_stats =
+            load_prof.then(|| std::sync::Arc::new(crate::asset::checkpoint::PrefetchStats::new()));
+        let t_pref_wall = std::time::Instant::now();
+        let sys_pref = std::time::SystemTime::now();
+        let prefetch = {
+            if let Some(tm) = load_tim.as_mut() {
+                let stats = prefetch_stats.clone();
+                let (p, ms) = tm.phase("Prefetcher::start", || {
+                    crate::asset::checkpoint::Prefetcher::start(
+                        std::sync::Arc::clone(&ckpt),
+                        pref_threads,
+                        depth,
+                        stats,
+                    )
+                });
+                tm.prefetch_spawn_ms = ms;
+                p
+            } else {
+                crate::asset::checkpoint::Prefetcher::start(
+                    std::sync::Arc::clone(&ckpt),
+                    pref_threads,
+                    depth,
+                    None,
+                )
+            }
+        };
         // Runs `depth` WEIGHT tensors ahead of the copy over the same list in the
         // same order, so the cursor only moves forward and each tensor is queued
         // exactly once. Non-weights are skipped so the depth counts reads, not
@@ -1029,71 +1708,38 @@ impl GpuEngine {
         let gen_by_tensor: std::collections::HashMap<u32, &packet::rope::GenTensor> =
             blob.gen.iter().map(|g| (g.tensor, g)).collect();
 
-        // Where a tensor's storage comes from, decided once so the sizing pass
-        // and the upload loop cannot disagree about it.
-        let vmm_va_of = |name: &str| -> Option<u64> {
-            let v = vmm.as_ref()?;
-            let (l, t) = kv_tensor_name(name)?;
-            v.kv.tensor_va(l, t)
-        };
-        let slab_bytes: u64 = blob
-            .tensors
-            .iter()
-            .filter(|td| vmm_va_of(&td.name).is_none())
-            .map(|td| slab_pad(td.bytes))
-            .sum();
-        let t_slab = load_profile().then(std::time::Instant::now);
-        let weight_slab = match slab_bytes {
-            _ if !crate::asset::checkpoint::weight_slab_enabled() => None,
-            0 => None,
-            n => match be.alloc(0, n) {
-                Ok(m) => Some(m),
-                // Not fatal: the per-tensor path below still works, it is just
-                // slower. Better a slow load than a refused one.
-                Err(e) => {
-                    tracing::warn!(
-                        bytes = n,
-                        error = %e,
-                        "single weight allocation refused — falling back to per-tensor alloc"
-                    );
-                    None
-                }
-            },
-        };
-        let ns_slab = t_slab.map(|t| t.elapsed().as_nanos()).unwrap_or(0);
+        // upload_all wall covers the tensor loop (exclusive phase).
+        let t_upload = std::time::Instant::now();
+        let sys_upload = std::time::SystemTime::now();
+        let upload_t0_ms = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
         let mut slab_off: u64 = 0;
+        let mut slab_wait_ms = 0f64;
 
         let mut devp: Vec<DeviceMem> = Vec::with_capacity(blob.tensors.len());
         let (mut t_ids, mut t_pos, mut t_kvlen, mut t_logits) = (None, None, None, None);
         let (mut wb, mut kvb, mut nw) = (0u64, 0u64, 0usize);
-        // `PLOW_LOAD_PROFILE=1` splits the upload wall time into alloc / stage+DMA
-        // / memset. Off by default: it is one Instant per tensor on a path that
-        // walks hundreds of them, and the answer only matters when tuning the
-        // loader. Reading it once here keeps the env lookup off the loop.
-        let load_prof = load_profile();
-        let (mut ns_alloc, mut ns_stage, mut ns_memset) = (0u128, 0u128, 0u128);
         let mut upload_all = || -> Result<()> {
             for (i, td) in blob.tensors.iter().enumerate() {
-                // Full-layer KV under VMM: the tensor base is the pool's VA
-                // reservation (a view — the pool owns unmap/release); no
-                // cudaMalloc and no memset (the VA is mapped lazily at the
-                // per-sequence frontier; KV is always written before read).
                 let vmm_va = vmm_va_of(&td.name);
-                let t_alloc = load_prof.then(std::time::Instant::now);
+                let t_alloc =
+                    (load_prof && vmm_va.is_none() && matches!(weight_slab, WeightSlab::PerTensor))
+                        .then(std::time::Instant::now);
                 let mem = match (vmm_va, &weight_slab) {
                     (Some(va), _) => DeviceMem::view(va, td.bytes),
-                    // Carve from the one allocation, in blob order — the sizing
-                    // pass walked the same list with the same filter, so the
-                    // cursor cannot run past the end.
-                    (None, Some(slab)) => {
+                    (None, WeightSlab::Vmm(slab)) => {
+                        let m = DeviceMem::view(slab.base() + slab_off, td.bytes);
+                        slab_off += slab_pad(td.bytes);
+                        m
+                    }
+                    (None, WeightSlab::Flat(slab)) => {
                         let m = DeviceMem::view(slab.base + slab_off, td.bytes);
                         slab_off += slab_pad(td.bytes);
                         m
                     }
-                    (None, None) => be.alloc(0, td.bytes)?,
+                    (None, WeightSlab::PerTensor) => be.alloc(0, td.bytes)?,
                 };
-                if let Some(t) = t_alloc {
-                    ns_alloc += t.elapsed().as_nanos();
+                if let (Some(t), Some(tm)) = (t_alloc, load_tim.as_mut()) {
+                    tm.note_alloc(td.bytes, t.elapsed().as_secs_f64() * 1e3, true);
                 }
                 match td.name.as_str() {
                     "in.ids" => t_ids = Some(i),
@@ -1105,20 +1751,7 @@ impl GpuEngine {
                 if td.name.starts_with("kv.") {
                     kvb += td.bytes;
                 }
-                // Classified by EXCLUSION of the compiler's own namespaces, not by an
-                // allowlist of weight prefixes — see `packet::names`. The allowlist read
-                // `starts_with("model.") || starts_with("fp8/")`, which silently zeroed
-                // (a) every untied `lm_head.weight`, which devgen declares at the top
-                // level, and (b) the entire tower of any checkpoint under a wrapper
-                // prefix (Kimi-K3 is `language_model.model.…`; nothing in it starts with
-                // `model.`). Both produced fluent wrong output rather than an error.
                 if packet::names::is_host_filled_table(&td.name) {
-                    // GLM/DeepSeek expert POINTER tables. `bind_packed_experts` is the AMD
-                    // loader's, and this engine has no equivalent — the fused-MoE path
-                    // below only knows Gemma's `moe.ewt.`/`moe.est.`. Refuse by name: the
-                    // old code reached this tensor through the weight arm and reported
-                    // `MISSING WEIGHT`, which said the checkpoint was incomplete when in
-                    // fact no checkpoint has ever contained it.
                     return Err(RuntimeError::Device(format!(
                         "packet declares the host-filled expert pointer table `{}`, which \
                          this engine cannot fill (no `bind_packed_experts` on the CUDA \
@@ -1145,28 +1778,41 @@ impl GpuEngine {
                         mib = td.bytes / (1 << 20),
                         "uploading weight tensor"
                     );
-                    // One weight consumed, so let the pool queue one more and
-                    // stay `depth` ahead rather than draining to nothing.
                     prefetch_ahead(&mut pf, 1);
-                    // Double-buffered async H2D (overlaps host copy with DMA).
-                    let t_stage = load_prof.then(std::time::Instant::now);
                     for (o, chunk) in src.chunks(STAGE).enumerate() {
-                        pipe.push(mem.base + (o * STAGE) as u64, chunk)?;
-                    }
-                    if let Some(t) = t_stage {
-                        ns_stage += t.elapsed().as_nanos();
+                        let dst = mem.base + (o * STAGE) as u64;
+                        slab_commit_wait(
+                            &weight_slab,
+                            dst + chunk.len() as u64,
+                            &mut slab_wait_ms,
+                        )?;
+                        if pipe.is_direct() {
+                            // SAFETY: `chunk` borrows the checkpoint mmap
+                            // (`ckpt`, whose Arc outlives pipe.finish()).
+                            unsafe { pipe.push_direct(dst, chunk)? }
+                        } else {
+                            pipe.push(dst, chunk)?;
+                        }
                     }
                     wb += td.bytes;
                     nw += 1;
                 } else if let Some(r) = &td.init {
                     for (o, chunk) in blob.init[r.clone()].chunks(STAGE).enumerate() {
-                        pipe.push(mem.base + (o * STAGE) as u64, chunk)?;
+                        let dst = mem.base + (o * STAGE) as u64;
+                        slab_commit_wait(
+                            &weight_slab,
+                            dst + chunk.len() as u64,
+                            &mut slab_wait_ms,
+                        )?;
+                        if pipe.is_direct() {
+                            // SAFETY: `chunk` borrows `blob.init`, which lives
+                            // past pipe.finish().
+                            unsafe { pipe.push_direct(dst, chunk)? }
+                        } else {
+                            pipe.push(dst, chunk)?;
+                        }
                     }
                 } else if let Some(g) = gen_by_tensor.get(&(i as u32)) {
-                    // v7: the RoPE tables ride as recipes, not bytes. Materialise
-                    // them here — same host-side f64 math the compiler ran, so the
-                    // device sees the bytes a v5 blob would have carried. Must come
-                    // before the memset arm below, which would leave cos=sin=0.
                     let data = g.generate().ok_or_else(|| {
                         RuntimeError::Device(format!(
                             "devblob: gen recipe for `{}` has unknown kind {}",
@@ -1182,25 +1828,24 @@ impl GpuEngine {
                         )));
                     }
                     for (o, chunk) in data.chunks(STAGE).enumerate() {
-                        pipe.push(mem.base + (o * STAGE) as u64, chunk)?;
+                        let dst = mem.base + (o * STAGE) as u64;
+                        slab_commit_wait(
+                            &weight_slab,
+                            dst + chunk.len() as u64,
+                            &mut slab_wait_ms,
+                        )?;
+                        pipe.push(dst, chunk)?;
                     }
                     tracing::debug!(
                         tensor = %td.name, bytes = td.bytes, kind = g.kind,
                         "materialised generated tensor"
                     );
                 } else if vmm_va.is_none() && !td.name.starts_with("kv.") {
-                    // VMM windows are (partially) unmapped VA — a memset would
-                    // fault. The cudaMalloc KV cache (plan stage 9: avoid
-                    // zeroing proven write-before-read) needs none either:
-                    // attention reads only [0, kvlen), every row of which was
-                    // written by prefill/decode before it is read, and idle
-                    // rows' garbage is bounded out by kvlen — so skip its
-                    // memset (10.5 GiB on a B=4 ctx-8k engine). Other scratch
-                    // (act.*/in.*) stays zeroed (cheap, conservative).
+                    slab_commit_wait(&weight_slab, mem.base + td.bytes, &mut slab_wait_ms)?;
                     let t_ms = load_prof.then(std::time::Instant::now);
                     be.memset_d8(mem.base, 0, td.bytes as usize)?;
-                    if let Some(t) = t_ms {
-                        ns_memset += t.elapsed().as_nanos();
+                    if let (Some(t), Some(tm)) = (t_ms, load_tim.as_mut()) {
+                        tm.memset_ms += t.elapsed().as_secs_f64() * 1e3;
                     }
                 }
                 devp.push(mem);
@@ -1208,23 +1853,108 @@ impl GpuEngine {
             Ok(())
         };
         let enqueued = upload_all();
-        drop(upload_all); // release the &mut pipe borrow before finishing it
-                          // The sizing pass and the carve walked the same list with the same
-                          // filter, so on a completed pass the cursor must land exactly on the
-                          // total: short wastes the tail, long means two tensors were aliased onto
-                          // the same bytes and the weights are quietly wrong. Only meaningful when
-                          // the loop ran to the end — an error exits it early by design.
-        if enqueued.is_ok() && weight_slab.is_some() {
+        drop(upload_all);
+        if enqueued.is_ok() && !matches!(weight_slab, WeightSlab::PerTensor) {
             debug_assert_eq!(
                 slab_off, slab_bytes,
                 "weight slab carve did not consume exactly the sized span"
             );
         }
-        // Retire every enqueued async H2D, then release the pinned buffers
-        // (2×64 MiB) + load stream before serving.
-        let uploaded = enqueued.and_then(|()| pipe.finish());
+        if let Some(tm) = load_tim.as_mut() {
+            tm.slab_wait_ms = slab_wait_ms;
+            let ms = t_upload.elapsed().as_secs_f64() * 1e3;
+            tm.upload_all_ms = ms;
+            tm.n_tensors_uploaded = nw;
+            tm.spans
+                .push(("upload_all".into(), upload_t0_ms, tm.ms_since_t0()));
+            tm.log_stage("upload_all", sys_upload, std::time::SystemTime::now(), ms);
+        }
+
+        let sys_fin = std::time::SystemTime::now();
+        let fin_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
+        let t_fin = std::time::Instant::now();
+        // finish() runs even when the enqueue loop failed: it synchronizes the
+        // pipe stream, and the error return below tears down the pinned
+        // buffers and (VMM slab) unmaps device ranges that any still-in-flight
+        // H2D would otherwise touch.
+        let finished = pipe.finish();
+        let uploaded = enqueued.and(finished);
+        if let Some(tm) = load_tim.as_mut() {
+            let finish_ms = t_fin.elapsed().as_secs_f64() * 1e3;
+            tm.pipe_finish_ms = finish_ms;
+            if let Some(pt) = pipe.take_timing() {
+                tm.absorb_pipe_upload(&pt);
+            }
+            tm.spans
+                .push(("pipe.finish".into(), fin_t0, tm.ms_since_t0()));
+            tm.log_stage(
+                "pipe.finish",
+                sys_fin,
+                std::time::SystemTime::now(),
+                finish_ms,
+            );
+        }
         drop(pipe);
         uploaded?;
+        // The slab tail (KV is never written at load) must be committed before
+        // the engine serves — VMM has no demand paging, and the first prefill
+        // writes KV rows. In practice the mapper (≈13 GiB/s) finished long
+        // before the upload (≈6 GiB/s) did, so this join is ≈0.
+        if let WeightSlab::Vmm(slab) = &weight_slab {
+            let t_join = std::time::Instant::now();
+            slab.wait_mapped(slab_bytes)?;
+            if let Some(tm) = load_tim.as_mut() {
+                tm.slab_join_ms = t_join.elapsed().as_secs_f64() * 1e3;
+            }
+        }
+
+        let had_prefetch = prefetch.is_some();
+        let join_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
+        let t_join = std::time::Instant::now();
+        drop(prefetch);
+        if let Some(tm) = load_tim.as_mut() {
+            let join_ms = t_join.elapsed().as_secs_f64() * 1e3;
+            tm.prefetch_join_ms = join_ms;
+            tm.spans
+                .push(("prefetch_join".into(), join_t0, tm.ms_since_t0()));
+            tm.log_stage(
+                "prefetch_join",
+                sys_pref,
+                std::time::SystemTime::now(),
+                join_ms,
+            );
+            if had_prefetch {
+                use std::sync::atomic::Ordering;
+                let wall_ms = t_pref_wall.elapsed().as_secs_f64() * 1e3;
+                let (ns, bytes) = prefetch_stats
+                    .as_ref()
+                    .map(|s| {
+                        (
+                            s.ns.load(Ordering::Relaxed),
+                            s.bytes.load(Ordering::Relaxed),
+                        )
+                    })
+                    .unwrap_or((0, 0));
+                tm.prefetch_wall_ms = wall_ms;
+                tm.prefetch_worker_ms = ns as f64 / 1e6;
+                tm.prefetch_bytes = bytes;
+                tm.prefetch_workers = pref_threads;
+                tm.log_stage_bytes(
+                    "Prefetcher populate (Disk→RAM wall)",
+                    sys_pref,
+                    std::time::SystemTime::now(),
+                    wall_ms,
+                    bytes,
+                );
+                tracing::info!(
+                    stage = "Prefetcher populate (parallel worker time)",
+                    elapsed_ms = format!("{:.3}", tm.prefetch_worker_ms).as_str(),
+                    workers = pref_threads,
+                    cumulative_ms = format!("{:.3}", tm.cum_ms()).as_str(),
+                    "load stage"
+                );
+            }
+        }
         let weight_elapsed = t_weights.elapsed();
         let weight_gib = wb as f64 / (1u64 << 30) as f64;
         let throughput = if weight_elapsed.as_secs_f64() > 0.0 {
@@ -1240,21 +1970,6 @@ impl GpuEngine {
             throughput_gib_s = format!("{throughput:.2}").as_str(),
             "checkpoint weights uploaded to GPU"
         );
-        if load_prof {
-            // `stage` is the staging memcpy PLUS the per-chunk event wait that
-            // gates pinned-buffer reuse, so it carries the pipeline's stalls;
-            // `finish` (the stream drain) is whatever DMA was still outstanding.
-            let ms = |ns: u128| format!("{:.0}", ns as f64 / 1e6);
-            tracing::info!(
-                slab_alloc_ms = ms(ns_slab).as_str(),
-                alloc_ms = ms(ns_alloc).as_str(),
-                stage_dma_ms = ms(ns_stage).as_str(),
-                memset_ms = ms(ns_memset).as_str(),
-                total_ms = ms(weight_elapsed.as_nanos()).as_str(),
-                n_alloc = devp.len(),
-                "weight upload breakdown"
-            );
-        }
         let (t_ids, t_pos, t_kvlen, t_logits) = match (t_ids, t_pos, t_kvlen, t_logits) {
             (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
             _ => {
@@ -1273,6 +1988,9 @@ impl GpuEngine {
         // `moe.est.{l}` with the per-row scale bases. Guarded on the `moe.ewt.`
         // prefix, so dense (12B/31B/Qwen) blobs are untouched. Suffix scans keep
         // the LAST match, mirroring the harness (an fp8 twin shadows a bf16 name).
+        let t_moe = std::time::Instant::now();
+        let moe_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
+        let sys_moe = std::time::SystemTime::now();
         for i in 0..blob.tensors.len() {
             let Some(layer) = blob.tensors[i].name.strip_prefix("moe.ewt.") else {
                 continue;
@@ -1315,12 +2033,22 @@ impl GpuEngine {
                 be.upload(&devp[est], 0, bytemuck::cast_slice(&stable))?;
             }
         }
+        if let Some(tm) = load_tim.as_mut() {
+            let ms = t_moe.elapsed().as_secs_f64() * 1e3;
+            tm.moe_ms = ms;
+            tm.spans
+                .push(("moe_tables".into(), moe_t0, tm.ms_since_t0()));
+            tm.log_stage("moe_tables", sys_moe, std::time::SystemTime::now(), ms);
+        }
 
         // ---- PX-1 batched-prefill buffers (PLOW_PF_BATCH=1) ----
         // Allocated BEFORE the tensor table so their pointers ride in it past
         // the blob's handles (h_slot = len, h_req = len+1). Tiny (≤32 KiB), so
         // allocation is unconditional on the env flag only; the mode itself is
         // finalized after the prefill object loads (see below).
+        let t_decode = std::time::Instant::now();
+        let decode_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
+        let sys_decode = std::time::SystemTime::now();
         let pf_batch_env = std::env::var("PLOW_PF_BATCH")
             .map(|v| v == "1")
             .unwrap_or(false);
@@ -1506,8 +2234,23 @@ impl GpuEngine {
 
         // Stop set from the checkpoint's generation_config (fallback config).
         let stop_ids = crate::asset::checkpoint::read_eos_ids(checkpoint_dir);
+        if let Some(tm) = load_tim.as_mut() {
+            let ms = t_decode.elapsed().as_secs_f64() * 1e3;
+            tm.decode_tables_ms = ms;
+            tm.spans
+                .push(("decode_tables".into(), decode_t0, tm.ms_since_t0()));
+            tm.log_stage(
+                "decode_tables",
+                sys_decode,
+                std::time::SystemTime::now(),
+                ms,
+            );
+        }
 
         // ---- prefill object + bucket programs (optional) ----
+        let t_pf = std::time::Instant::now();
+        let pf_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
+        let sys_pf = std::time::SystemTime::now();
         // Load the `_pf` cubin and upload every non-decode (T!=1) program so a
         // prompt is consumed in chunks by the tiled-GEMM/flash-prefill buckets
         // instead of O(n) decode launches. Absent cubin, a segmented bucket, or
@@ -1626,6 +2369,13 @@ impl GpuEngine {
             }
             _ => None,
         };
+        if let Some(tm) = load_tim.as_mut() {
+            let ms = t_pf.elapsed().as_secs_f64() * 1e3;
+            tm.prefill_ms = ms;
+            tm.spans
+                .push(("prefill_load".into(), pf_t0, tm.ms_since_t0()));
+            tm.log_stage("prefill_load", sys_pf, std::time::SystemTime::now(), ms);
+        }
 
         tracing::info!(
             pkt = %pkt.display(),
@@ -1647,6 +2397,10 @@ impl GpuEngine {
             interp = profile.tag,
             "GPU engine loaded (decode program)"
         );
+
+        let t_final = std::time::Instant::now();
+        let final_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
+        let sys_final = std::time::SystemTime::now();
 
         let pf_max_t = prefill.last().map_or(0, |b| b.t as usize);
 
@@ -1678,6 +2432,17 @@ impl GpuEngine {
                 tracing::warn!(error = %e, "multi-step disabled");
                 None
             });
+
+        if let Some(tm) = load_tim.as_mut() {
+            let ms = t_final.elapsed().as_secs_f64() * 1e3;
+            tm.final_init_ms = ms;
+            tm.spans
+                .push(("final_init".into(), final_t0, tm.ms_since_t0()));
+            tm.log_stage("final_init", sys_final, std::time::SystemTime::now(), ms);
+            let total = t0.elapsed().as_secs_f64() * 1e3;
+            tm.print_summary(total);
+            tm.print_flame(total);
+        }
 
         Ok(GpuEngine {
             be,

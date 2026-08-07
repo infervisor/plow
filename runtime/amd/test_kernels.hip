@@ -10,11 +10,59 @@
  * the only difference between a test launch and a packet.
  */
 #include "amd_common.h"
-#include "op_attention.h"
 #include "op_elementwise.h"
+#include "op_norm.h"
+
+/* PLOW_TK_SAFE_ONLY builds just the wrappers whose op bodies carry no CDNA4-only
+ * instruction and no LDS arena over 64 KiB -- i.e. the set a gfx942 (CDNA3) object can
+ * hold today. The GEMM / attention / MoE wrappers below stage 144 KiB and issue the
+ * wide-K bf16 MFMA, so they are gfx950-only until those two are ported. */
+#ifndef PLOW_TK_SAFE_ONLY
+#define PLOW_TK_SAFE_ONLY 0
+#endif
+
+/* The Gemma-4 MoE bodies are compiled into THIS file unconditionally, where the interpreter
+ * gates them behind PLOW_MOE_GEMMA / PLOW_MOE_GEMMA_PF. That asymmetry is deliberate: the
+ * interpreter's flags exist because it INLINES every arm into one kernel, so an arm it never
+ * dispatches still costs registers and object size. These wrappers are separate kernels on no
+ * serving path, so there is nothing to protect — and a golden that has to be asked for is a
+ * golden that stops being run. [GEMMA4-MOE-AMD] */
+#ifndef PLOW_MOE_GEMMA
+#define PLOW_MOE_GEMMA 1
+#endif
+#ifndef PLOW_MOE_GEMMA_PF
+#define PLOW_MOE_GEMMA_PF 1
+#endif
+
+#if !PLOW_TK_SAFE_ONLY
+#include "op_attention.h"
 #include "op_gemm.h"
 #include "op_moe.h"
-#include "op_norm.h"
+#endif
+
+/* THE OBJECT STATES ITS OWN WORKGROUP WIDTH, so a harness cannot disagree with it.
+ *
+ * Every wrapper here is `__launch_bounds__(PLOW_THREADS)` and every op body indexes off
+ * PLOW_WAVES. The host harnesses launch `PLOW_WG_THREADS` threads -- the SAME macro, but
+ * resolved when the HOST was compiled. Nothing forced the two compiles to agree, and
+ * scripts/build_mla.sh passes the wave count to neither, so a device object rebuilt at a
+ * different width than the host binary is a silent, plausible mistake.
+ *
+ * It is also a catastrophic one, and NOT a launch failure. Launching 256 threads at an
+ * 8-wave kernel is perfectly legal -- waves 4..7 simply never exist. In d_flash_mla_decode
+ * that leaves hmax[4..7], hsum[4..7] and osm[] row-groups 4..7 never written, and the
+ * output fold sums them anyway: `for (gg = 0; gg < NG; gg++) acc += osm[gg*DK + d]`.
+ * MEASURED, gfx942, 8-wave object under a 4-wave host: all 12 fixture cases fail, nsplit=1
+ * at max rel 0.92 and every nsplit>1 case at 1e24..1e35 against |O|max ~30, with `rms nan`.
+ * That signature was recorded in op_attention.h as an open kernel defect and cost a
+ * multi-round elimination -- arena, index maps, head fusion, FA_DEC_KL, races, the merge --
+ * before it was traced here. The opposite mismatch (256-thread object, 512-thread launch)
+ * is caught by hardware with INVALID_DISPATCH_PARAMETERS; this direction is silent.
+ *
+ * One 1-thread launch at startup closes it. Cheap enough to be unconditional. */
+extern "C" __global__ void plow_probe_wg_threads(unsigned* out) {
+    if (threadIdx.x == 0) *out = PLOW_THREADS;
+}
 
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_rmsnorm_bf16(
     bf16* out, const bf16* x, const bf16* gamma, unsigned rows, unsigned feat, float eps) {
@@ -68,6 +116,8 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
     d_softcap(out, x, n, cap, blockIdx.x, gridDim.x);
 }
 
+#if !PLOW_TK_SAFE_ONLY
+
 /* One SEPARATE kernel per tile config.
  *
  * This is not cosmetic. A runtime switch over the template instantiations makes
@@ -84,11 +134,26 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
     }
 
 
+/* A tile only exists in an object whose arch can hold its stage. On CDNA3 (64 KiB) that is the
+ * 64x128 rung alone; the wider rungs are a CDNA4-only ladder. Guarding beats duplicating the
+ * list -- the rungs stay in one place and each object gets the ones it can run. */
+#define GM_TILE_FITS(BM, BN, BK) (GM_LDS_HALVES_T(BM, BN, BK) * 2 <= PLOW_LDS_MAX_BYTES)
+
+#if GM_TILE_FITS(256, 256, 64)
 GEMM_VARIANT(gemm_c0, 256, 256, 64)
+#endif
+#if GM_TILE_FITS(256, 128, 64)
 GEMM_VARIANT(gemm_c1, 256, 128, 64)
+#endif
+#if GM_TILE_FITS(128, 256, 64)
 GEMM_VARIANT(gemm_c2, 128, 256, 64)
+#endif
+#if GM_TILE_FITS(128, 128, 64)
 GEMM_VARIANT(gemm_c3, 128, 128, 64)
+#endif
+#if GM_TILE_FITS(64, 128, 64)
 GEMM_VARIANT(gemm_c4, 64, 128, 64)  /* the small tile: for shapes that cannot fill 256 CUs */
+#endif
 
 /* FP8 (w8a8) GEMM variants — same tile family, fp8 operands, dequant epilogue. LDS is bytes, so
  * the tile fits in HALF the halves the bf16 arena reserves (rounded up to a whole bf16 count). */
@@ -100,10 +165,18 @@ GEMM_VARIANT(gemm_c4, 64, 128, 64)  /* the small tile: for shapes that cannot fi
         d_gemm_fp8_t<BM, BN, BK, GM_WM, GM_WN>(C, A, B, asc, wsc, M, N, K, blockIdx.x, \
                                     gridDim.x, lds);                                 \
     }
+#if GM_TILE_FITS(256, 256, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c0, 256, 256, 64)
+#endif
+#if GM_TILE_FITS(128, 128, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c3, 128, 128, 64)
+#endif
+#if GM_TILE_FITS(64, 128, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c4, 64, 128, 64)
+#endif
+#if GM_TILE_FITS(192, 256, 64)
 GEMM_FP8_VARIANT(gemm_fp8_c5, 192, 256, 64) /* the Qwen prefill tile, vs bf16 c5 */
+#endif
 
 /* MXFP4 (w4a16) GEMM variants — the five SELECTABLE rungs, one kernel each.
  *
@@ -130,21 +203,41 @@ GEMM_FP8_VARIANT(gemm_fp8_c5, 192, 256, 64) /* the Qwen prefill tile, vs bf16 c5
                  true>(C, A, (const bf16*)W, nullptr, nullptr, M, N, K, blockIdx.x,          \
                        gridDim.x, lds, nullptr, 0, wscale);                                  \
     }
+#if GM_TILE_FITS(256, 256, 64)
 GEMM_MXFP4_VARIANT(gemm_mxfp4_c0, 256, 256, 64)
+#endif
+#if GM_TILE_FITS(128, 256, 64)
 GEMM_MXFP4_VARIANT(gemm_mxfp4_c2, 128, 256, 64)
+#endif
+#if GM_TILE_FITS(128, 128, 64)
 GEMM_MXFP4_VARIANT(gemm_mxfp4_c3, 128, 128, 64)
+#endif
+#if GM_TILE_FITS(64, 128, 64)
 GEMM_MXFP4_VARIANT(gemm_mxfp4_c4, 64, 128, 64)
+#endif
+#if GM_TILE_FITS(192, 256, 64)
 GEMM_MXFP4_VARIANT(gemm_mxfp4_c5, 192, 256, 64)
+#endif
 
 /* NON-POWER-OF-2 macro tiles — the qwen-prefill-gemm sweep. The hypothesis was that a
  * smaller, ARCH-only accumulator (avoiding 256x256's 128 AGPRs and their v_accvgpr
  * bracketing) would raise efficiency. acc regs = (BM/64)*(BN/128)*16 : 192x256->96
  * 320x128->80 384x128->96 128x384->96 192x128->48; all measured 0 AGPR / occ 2 standalone. */
+#if GM_TILE_FITS(192, 256, 64)
 GEMM_VARIANT(gemm_c5, 192, 256, 64)
+#endif
+#if GM_TILE_FITS(320, 128, 64)
 GEMM_VARIANT(gemm_c6, 320, 128, 64)
+#endif
+#if GM_TILE_FITS(384, 128, 64)
 GEMM_VARIANT(gemm_c7, 384, 128, 64)
+#endif
+#if GM_TILE_FITS(128, 384, 64)
 GEMM_VARIANT(gemm_c8, 128, 384, 64)
+#endif
+#if GM_TILE_FITS(192, 128, 64)
 GEMM_VARIANT(gemm_c9, 192, 128, 64)
+#endif
 /* 192x384 / 256x384 were tried: both exceed the 160 KiB LDS limit AND fall to AGPR
  * (192x384: 220V+144A) — the double register+LDS cliff. Not viable.
  *
@@ -254,12 +347,14 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemv_
  * tile's own footprint, not the object-wide arena: the interpreter passes `sm->gm`, which is sized
  * by the largest tile any packet may select, and this wrapper is the only place the real number is
  * visible. */
+#if GM_TILE_FITS(GM_BLK_BM, GM_BLK_BN, GM_BLK_BK)
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_gemm_fp8_blk_k(
     bf16* C, const bf16* A, const unsigned char* W, const float* wscale, unsigned M, unsigned N,
     unsigned K) {
     __shared__ bf16 lds[GM_LDS_HALVES_T(GM_BLK_BM, GM_BLK_BN, GM_BLK_BK)];
     d_gemm_fp8_blk(C, A, W, wscale, M, N, K, blockIdx.x, gridDim.x, lds);
 }
+#endif
 
 /* Block-fp8 MoE expert gate/up + down, one slot, driven through the real table indirection.
  *
@@ -286,6 +381,200 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_e
     const unsigned long long* stab, unsigned H, unsigned I_moe, unsigned n_exp) {
     d_moe_expert_down_fp8_blk(part, fu, table, wtab, stab, 0, H, I_moe, n_exp, blockIdx.x,
                               gridDim.x, PLOW_MOE_ENC_FP8BLK);
+}
+
+/* ==========================================================================================
+ * GEMMA-4 26B-A4B MoE GOLDENS (ops 61-77, 81/82).                        [GEMMA4-MOE-AMD]
+ *
+ * One wrapper per opcode, each calling the SAME __device__ body the interpreter dispatches, so
+ * a passing test validates the megakernel's code and not a second copy of it. The CPU reference
+ * lives in runtime/tests/moe_gemma_gfx950_test.c and is written from runtime/nvidia/op_moe.cuh's
+ * semantics — NOT from these kernels, because a shared misreading passes silently.
+ *
+ * TKG_ARENA_F sizes the scratch every arena-taking body needs. 4096 floats covers Gemma's
+ * 16 (block-reduction carve) + H (2816) + n_exp (128) = 2960 with room to spare, and 16 KiB of
+ * LDS in a standalone kernel costs nothing at these occupancies. */
+#define TKG_ARENA_F 4096u
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_router_gemma_k(
+    unsigned char* table, const bf16* resid, const bf16* proj, const bf16* scale, const bf16* pes,
+    unsigned H, unsigned n_exp, unsigned k, unsigned nrow, float root, float eps) {
+    __shared__ __align__(16) float arena[TKG_ARENA_F];
+    d_moe_router_gemma(table, resid, proj, scale, pes, H, n_exp, k, root, eps, blockIdx.x,
+                       gridDim.x, nrow, arena);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_router_gemma_score_k(
+    float* score, const bf16* resid, const bf16* proj, const bf16* scale, unsigned H,
+    unsigned n_exp, unsigned nrow, float root, float eps) {
+    __shared__ __align__(16) float arena[TKG_ARENA_F];
+    d_moe_router_gemma_score(score, resid, proj, scale, H, n_exp, root, eps, blockIdx.x,
+                             gridDim.x, nrow, arena);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void moe_router_gemma_score_fast_k(float* score, const bf16* resid, const bf16* proj,
+                                   const bf16* scale, unsigned H, unsigned n_exp, unsigned nrow,
+                                   float root, float eps) {
+    __shared__ __align__(16) float arena[TKG_ARENA_F];
+    d_moe_router_gemma_score_fast(score, resid, proj, scale, H, n_exp, root, eps, blockIdx.x,
+                                  gridDim.x, nrow, arena);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_router_gemma_topk_k(
+    unsigned char* table, const float* score, const bf16* pes, unsigned n_exp, unsigned k,
+    unsigned nrow) {
+    __shared__ __align__(16) float arena[TKG_ARENA_F];
+    d_moe_router_gemma_topk(table, score, pes, n_exp, k, blockIdx.x, gridDim.x, nrow, arena);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_expert_glu_gemma_k(
+    bf16* fu, const bf16* x, const unsigned char* table, const unsigned long long* ewt,
+    unsigned k, unsigned I_moe, unsigned H, unsigned n_exp, unsigned nrow) {
+    d_moe_expert_glu_gemma(fu, x, table, ewt, k, I_moe, H, n_exp, blockIdx.x, gridDim.x, nrow);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_expert_down_gemma_k(
+    float* part, const bf16* fu, const unsigned char* table, const unsigned long long* ewt,
+    unsigned k, unsigned H, unsigned I_moe, unsigned n_exp, unsigned nrow) {
+    d_moe_expert_down_gemma(part, fu, table, ewt, k, H, I_moe, n_exp, blockIdx.x, gridDim.x, nrow);
+}
+
+/* The A/B NEGATIVE CONTROL for op 63's sub-group split: the whole-wave arm, driven directly so
+ * the two can be timed INTERLEAVED in one process. On a shared box a between-runs comparison of
+ * a 30-microsecond kernel is noise. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void moe_expert_down_gemma_wave_k(float* part, const bf16* fu, const unsigned char* table,
+                                  const unsigned long long* ewt, unsigned k, unsigned H,
+                                  unsigned I_moe, unsigned n_exp, unsigned nrow) {
+    d_moe_expert_down_gemma_wave(part, fu, table, ewt, k, H, I_moe, n_exp, blockIdx.x, gridDim.x,
+                                 nrow);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void moe_expert_glu_norm_gemma_k(bf16* fu, const bf16* resid, const bf16* gamma,
+                                 const unsigned char* table, const unsigned long long* ewt,
+                                 unsigned k, unsigned I_moe, unsigned H, unsigned n_exp,
+                                 unsigned nrow, float eps) {
+    /* __align__(16) is load-bearing: the body carves an f32 reduction scratch and an f32 xn
+     * row out of this, and a plain bf16[] is only 2-byte aligned. */
+    __shared__ __align__(16) bf16 arena[TKG_ARENA_F * 2u];
+    d_moe_expert_glu_norm_gemma(fu, resid, gamma, table, ewt, k, I_moe, H, n_exp, eps, blockIdx.x,
+                                gridDim.x, nrow, arena);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_combine_gemma_k(
+    bf16* moe, const float* part, unsigned H, unsigned k) {
+    d_moe_combine_gemma(moe, part, H, k, blockIdx.x, gridDim.x);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_combine_norm_gemma_k(
+    bf16* out, const float* part, const bf16* resid, const bf16* gamma, unsigned H, unsigned k,
+    unsigned nrow, float eps) {
+    __shared__ __align__(16) float arena[TKG_ARENA_F];
+    d_moe_combine_norm_gemma(out, part, resid, gamma, H, k, eps, blockIdx.x, gridDim.x, nrow,
+                             arena);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void moe_combine_resid_norm_gemma_k(bf16* hn, bf16* x, const float* part, const bf16* h1,
+                                    const bf16* g_pf2, const bf16* g_po, const bf16* gn,
+                                    unsigned H, unsigned k, float eps, float ls) {
+    __shared__ __align__(16) float arena[TKG_ARENA_F];
+    d_moe_combine_resid_norm_gemma(hn, x, part, h1, g_pf2, g_po, gn, H, k, eps, ls, blockIdx.x,
+                                   arena);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void moe_expert_glu_gemma_fp8_k(bf16* fu, const bf16* x, const unsigned char* table,
+                                const unsigned long long* ewt, const unsigned long long* est,
+                                unsigned k, unsigned I_moe, unsigned H, unsigned n_exp,
+                                unsigned nrow) {
+    d_moe_expert_glu_gemma_fp8(fu, x, table, ewt, est, k, I_moe, H, n_exp, blockIdx.x, gridDim.x,
+                               nrow);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void moe_expert_down_gemma_fp8_k(float* part, const bf16* fu, const unsigned char* table,
+                                 const unsigned long long* ewt, const unsigned long long* est,
+                                 unsigned k, unsigned H, unsigned I_moe, unsigned n_exp,
+                                 unsigned nrow) {
+    d_moe_expert_down_gemma_fp8(part, fu, table, ewt, est, k, H, I_moe, n_exp, blockIdx.x,
+                                gridDim.x, nrow);
+}
+
+/* ---- prefill ---- */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_router_gemma_pf_k(
+    unsigned char* table, const bf16* resid, const bf16* proj, const bf16* scale, const bf16* pes,
+    unsigned H, unsigned n_exp, unsigned k, unsigned T, float root, float eps) {
+    __shared__ __align__(16) float arena[TKG_ARENA_F];
+    d_moe_router_gemma_pf(table, resid, proj, scale, pes, H, n_exp, k, T, root, eps, blockIdx.x,
+                          gridDim.x, arena);
+}
+
+/* op 74 is d_moe_align_pf itself — the SAME body ops 83-87 use. The golden proves that reuse
+ * against the Gemma routing table rather than assuming it. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_align_gemma_pf_k(
+    int* meta, const unsigned char* table, unsigned* row_token, unsigned* row_partidx,
+    float* row_gate, unsigned T, unsigned n_exp, unsigned k) {
+    __shared__ unsigned lds[2u * 1024u + 4u]; /* cnt[n_exp] | cur[n_exp] | tot */
+    d_moe_align_pf(meta, table, row_token, row_partidx, row_gate, T, n_exp, k, blockIdx.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void moe_combine_norm_gemma_pf_k(bf16* out, const float* part, const bf16* h1, const bf16* gamma,
+                                 unsigned H, unsigned k, unsigned T, float eps) {
+    __shared__ __align__(16) float arena[TKG_ARENA_F];
+    d_moe_combine_norm_gemma_pf(out, part, h1, gamma, H, k, T, eps, blockIdx.x, gridDim.x, arena);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_group_glu_gemma_pf_k(
+    bf16* fu, const bf16* xn2, const unsigned long long* ewt, const int* meta,
+    const unsigned* row_token, unsigned I_moe, unsigned H, unsigned n_exp, unsigned act) {
+    __shared__ __align__(16) bf16 lds[GMPF_LDS_HALVES];
+    d_moe_group_glu_gemma_pf(fu, xn2, ewt, meta, row_token, I_moe, H, n_exp, act, blockIdx.x,
+                             gridDim.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void moe_group_down_gemma_pf_k(
+    float* part, const bf16* fu, const unsigned long long* ewt, const int* meta,
+    const unsigned* row_partidx, const float* row_gate, unsigned H, unsigned I_moe,
+    unsigned n_exp) {
+    __shared__ __align__(16) bf16 lds[GMPF_LDS_HALVES];
+    d_moe_group_down_gemma_pf(part, fu, ewt, meta, row_partidx, row_gate, H, I_moe, n_exp,
+                              blockIdx.x, gridDim.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void moe_group_glu_gemma_pf_w8a8_k(bf16* fu, const unsigned char* xq8, const float* ascale,
+                                   const unsigned long long* ewt, const unsigned long long* est,
+                                   const int* meta, const unsigned* row_token, unsigned I_moe,
+                                   unsigned H, unsigned n_exp, unsigned act) {
+    __shared__ __align__(16) bf16 lds[GMPF_LDS_HALVES];
+    d_moe_group_glu_gemma_pf_w8a8(fu, xq8, ascale, ewt, est, meta, row_token, I_moe, H, n_exp, act,
+                                  blockIdx.x, gridDim.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
+void moe_group_down_gemma_pf_w8a8_k(float* part, const unsigned char* fu8, const float* fscale,
+                                    const unsigned long long* ewt, const unsigned long long* est,
+                                    const int* meta, const unsigned* row_partidx,
+                                    const float* row_gate, unsigned H, unsigned I_moe,
+                                    unsigned n_exp) {
+    __shared__ __align__(16) bf16 lds[GMPF_LDS_HALVES];
+    d_moe_group_down_gemma_pf_w8a8(part, fu8, fscale, ewt, est, meta, row_partidx, row_gate, H,
+                                   I_moe, n_exp, blockIdx.x, gridDim.x, lds);
+}
+
+/* The OCP-e4m3 encoder, exposed so the host harness can produce the exact bytes the kernels
+ * decode. On CDNA3 this is amd_arch.h's SOFTWARE encoder — the hardware one emits e4m3fnuz,
+ * a different format — so quantising on the host with a hand-rolled routine and decoding on the
+ * device would compare two different numbers and call it an error. [GEMMA4-MOE-AMD] */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void quant_fp8_ocp_k(
+    unsigned char* q, const float* v, unsigned n) {
+    const unsigned gid = blockIdx.x * PLOW_THREADS + threadIdx.x;
+    const unsigned stride = gridDim.x * PLOW_THREADS;
+    for (unsigned i = gid; i < n; i += stride) q[i] = quant_fp8(v[i]);
 }
 
 /* Block-fp8 DENSE MLP gate/up (fused SwiGLU) on named weights — GLM dense layers 0-2. Op 47.
@@ -481,7 +770,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
                          gridDim.x, lds);
 }
 
-extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_flash_decode_256(
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, FA_DEC_WPEU) void gemma_flash_decode_256(
     float* Opart, float* mlpart, const bf16* Q, const bf16* K, const bf16* V, const int* kv_len,
     unsigned n_batch, unsigned n_head, unsigned n_kv_head, unsigned kv_stride, unsigned window,
     float scale, unsigned nsplit) {
@@ -490,7 +779,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
                         window, scale, nsplit, PLOW_KV_MASK_NONE, blockIdx.x, gridDim.x, lds);
 }
 
-extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma_flash_decode_512(
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, FA_DEC_WPEU) void gemma_flash_decode_512(
     float* Opart, float* mlpart, const bf16* Q, const bf16* K, const bf16* V, const int* kv_len,
     unsigned n_batch, unsigned n_head, unsigned n_kv_head, unsigned kv_stride, unsigned window,
     float scale, unsigned nsplit) {
@@ -514,7 +803,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
 /* DeepSeek MLA decode: latent KV (DK=512) + shared rope key (DR=64), GF=8 head fusion.
  * Reuses gemma_flash_merge_512 for the latent-wide LSE merge; mla_o_uv_fold_512 folds
  * the merged latent down to v_head_dim.  See op_attention.h d_flash_mla_decode. */
-extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_flash_decode_512(
+extern "C" __global__ __attribute__((flatten)) __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_flash_decode_512(
     float* Opart, float* mlpart, const bf16* Qabs, const bf16* Qrope, const bf16* Ckv,
     const bf16* Krope, const int* kv_len, unsigned n_batch, unsigned n_head, unsigned kv_stride,
     unsigned window, float scale, unsigned nsplit) {
@@ -548,6 +837,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_f
  * fixture and diff. It is NOT bit-exact against that kernel and must not be checked as if
  * it were: MFMA sums the DK contraction in a different order, so the gate is a relative
  * tolerance. What IS exact is the fp8 association — see the kernel's header. */
+#if FA_MLA_PF_LDS_FLOATS(512, 64) * 4 <= PLOW_LDS_MAX_BYTES
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
 void mla_flash_prefill_mfma_512(float* Opart, float* mlpart, const bf16* Qabs,
                                 const bf16* Qrope, const bf16* Ckv, const bf16* Krope,
@@ -559,6 +849,7 @@ void mla_flash_prefill_mfma_512(float* Opart, float* mlpart, const bf16* Qabs,
         Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len, n_batch, n_tok, n_head, kv_stride,
         window, scale, PLOW_KV_MASK_NONE, blockIdx.x, gridDim.x, lds, nullptr, 0);
 }
+#endif
 
 /* FP8-LATENT MLA prefill, both bodies. This is op 110 — the arm Kimi-K3 actually dispatches
  * — so it gets its own pair of entry points rather than riding on the bf16 check. `kv_scale`
@@ -578,6 +869,7 @@ void mla_flash_prefill_fp8_512(float* Opart, float* mlpart, const bf16* Qabs,
                                                  gridDim.x, lds, kv_scale, krot_fp8);
 }
 
+#if FA_MLA_PF_LDS_FLOATS(512, 64) * 4 <= PLOW_LDS_MAX_BYTES
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
 void mla_flash_prefill_mfma_fp8_512(float* Opart, float* mlpart, const bf16* Qabs,
                                     const bf16* Qrope, const bf16* Ckv, const bf16* Krope,
@@ -589,6 +881,7 @@ void mla_flash_prefill_mfma_fp8_512(float* Opart, float* mlpart, const bf16* Qab
         Opart, mlpart, Qabs, Qrope, Ckv, Krope, kv_len, n_batch, n_tok, n_head, kv_stride,
         window, scale, PLOW_KV_MASK_NONE, blockIdx.x, gridDim.x, lds, kv_scale, krot_fp8);
 }
+#endif
 
 /* GATHERED MLA prefill (GLM DSA / DeepSeek sparse). idx is [b][t][top_k] — one selected set
  * PER QUERY, the axis the decode gather does not have. No mask: the selected set is causal by
@@ -675,6 +968,8 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index
 /* DSA lightning-indexer score — WIDE-K MFMA (perf floor 1). Same signature as index_score_fast_128
  * (drop-in for the sibling's emit wiring); streams the key matrix contiguously through LDS and runs
  * the [HI x DI].[DI x ctx] score-dot as 32x32x16 bf16 MFMA subtiles. See d_index_score_mfma. */
+/* 32x136 q + 8x32x136 k tiles = 78,464 B; a CDNA3 workgroup cannot hold it. */
+#if 78464 <= PLOW_LDS_MAX_BYTES
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index_score_mfma_128(
     float* Score, const bf16* Qidx, const bf16* Kidx, const bf16* W, const int* kv_len,
     unsigned n_batch, unsigned index_heads /*must be 32*/, unsigned kv_stride, float scale) {
@@ -687,6 +982,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index
     d_index_score_mfma<128, 32>(Score, Qidx, Kidx, W, kv_len, n_batch, kv_stride, scale,
                                 blockIdx.x, gridDim.x, qlds, ktile, wlds);
 }
+#endif
 
 /* DSA top-k SELECT via radix threshold (G4) — ONE cooperative launch (gridDim==nCU, all WGs
  * co-resident) that grid-synchronises between radix passes. Reads f32 scores from HBM, writes top_k
@@ -729,7 +1025,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void attn_
 /* Sparse DSA compose (§3.5): gathered MLA decode — the SAME latent flash reading only the
  * top_k SELECTED latent rows via the idx table.  Composes over MLA; emits latent partials for
  * the same gemma_flash_merge_512 + mla_o_uv_fold_512 tail. */
-extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_gather_decode_512(
+extern "C" __global__ __attribute__((flatten)) __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_gather_decode_512(
     float* Opart, float* mlpart, const bf16* Qabs, const bf16* Qrope, const bf16* Ckv,
     const bf16* Krope, const int* kv_len, const int* idx, unsigned top_k, unsigned n_batch,
     unsigned n_head, unsigned kv_stride, float scale, unsigned nsplit) {
@@ -739,3 +1035,5 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void mla_g
                                                     nsplit, PLOW_KV_MASK_NONE, blockIdx.x,
                                                     gridDim.x, lds, idx, top_k);
 }
+
+#endif /* !PLOW_TK_SAFE_ONLY */

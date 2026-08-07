@@ -145,8 +145,10 @@ const DOC: &[S] = &[
     // AMD arm traps on either being absent rather than degrading to a 3-stream
     // sweep, which would leave `g_out` finite, fluent and wrong.
     S { op: DevOp::GemvQkvg, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v", "g_out"], i: &["M", "Nq", "K", "Nk", "Nv", "Ng", "W_g"], f: &[], j: &[] },
-    S { op: DevOp::GemvFp8, t: &["C", "x", "W", "", "", "w_scale"], i: &["M", "N", "K", "", "a_row0"], f: &[], j: &[] },
-    S { op: DevOp::GemvGluFp8, t: &["fu", "x", "W_gate", "gate_scale", "up_scale", "W_up"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
+    // i3 != 0 is the NRN fold (AMD decode): t1 becomes `a` (the residual in), t3/t4/t6/t7 carry
+    // resid_out/b/gamma_b/gamma_n, f0=eps f1=layer_scale. See gemv_nrn_lds in op_gemm.h.
+    S { op: DevOp::GemvFp8, t: &["C", "x", "W", "resid_out", "b", "w_scale", "gamma_b", "gamma_n"], i: &["M", "N", "K", "nrn", "a_row0"], f: &["eps", "scale"], j: &[] },
+    S { op: DevOp::GemvGluFp8, t: &["fu", "x", "W_gate", "gate_scale", "up_scale", "W_up"], i: &["M", "N", "K", "resid_out", "b", "act", "gamma_b", "gamma_n"], f: &["eps", "scale"], j: &["", "nrn"] },
     S { op: DevOp::QuantFp8, t: &["xq", "x", "a_scale"], i: &["M", "K"], f: &[], j: &[] },
     S { op: DevOp::GemmFp8, t: &["C", "A", "B", "a_scale", "w_scale"], i: &["M", "N", "K", "", "a_row0"], f: &[], j: &[] },
     S { op: DevOp::GemmGluFp8, t: &["fu", "A", "Wg", "a_scale", "g_scale", "Wu", "u_scale"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
@@ -223,6 +225,8 @@ const DOC: &[S] = &[
     // i5/i6/i7 are TENSOR HANDLES, not integers — the three E8M0 scale rows, demoted out of `t`
     // because ten pointers do not fit eight slots. See the variant's doc comment.
     S { op: DevOp::GemvQkvMxfp4, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v"], i: &["M", "Nq", "K", "Nk", "Nv", "S_q", "S_k", "S_v"], f: &[], j: &[] },
+    // Same demotion: i5/i6/i7 are the three f32[N] dequant-scale TENSOR HANDLES.
+    S { op: DevOp::GemvQkvFp8, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v"], i: &["M", "Nq", "K", "Nk", "Nv", "S_q", "S_k", "S_v"], f: &[], j: &[] },
 ];
 
 /// Ops that say "As [`DevOp::X`]" / "twin of [`DevOp::X`]" / "Same operands as

@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use tunedb::gemm::parse_quant;
 use tunedb::{
     gemm_op_case, gemm_rung_opcode, Correctness, Digests, KernelMeasurement, RecordState, Stats,
-    TuneStore, GEMM_ORACLE, GFX950_CELL as CELL,
+    TuneStore, GEMM_ORACLE,
 };
 
 type Err = Box<dyn std::error::Error>;
@@ -55,10 +55,14 @@ struct Row {
 ///
 /// Probing is REQUIRED, not best-effort: a record filed under a guessed build would be selectable
 /// against an object nobody measured, which is worse than no record at all.
-pub fn digests(root: &Path) -> Result<Digests, Err> {
-    let inv = kernelcaps::dense_gemm_inventory(root, hwspec::IsaLevel::Gfx950).map_err(|e| {
+pub fn digests(root: &Path, isa: hwspec::IsaLevel) -> Result<Digests, Err> {
+    // `isa` is a PARAMETER because the digest identifies the object the records describe. Probing
+    // Gfx950 unconditionally keyed every gfx942 measurement to a gfx950 build, which is exactly
+    // the "record filed under a guessed build" this function's own doc comment refuses.
+    let inv = kernelcaps::dense_gemm_inventory(root, isa).map_err(|e| {
+        let arch = isa.arch_flag();
         format!(
-            "cannot probe the gfx950 interpreter ({e}); ingest needs it to key records to a build"
+            "cannot probe the {arch} interpreter ({e}); ingest needs it to key records to a build"
         )
     })?;
     Ok(Digests {
@@ -77,10 +81,12 @@ pub fn ingest(
     samples: &Path,
     campaign: &str,
     provisional: bool,
+    isa: hwspec::IsaLevel,
+    cell: &str,
 ) -> Result<usize, Err> {
     let text = std::fs::read_to_string(samples)
         .map_err(|e| format!("cannot read samples {}: {e}", samples.display()))?;
-    let want = digests(root)?;
+    let want = digests(root, isa)?;
     println!("build digest: {}", want.interpreter);
     println!("toolchain   : {}", want.toolchain);
 
@@ -120,8 +126,15 @@ pub fn ingest(
             kernel_id,
             kernel_name,
             profile: "prefill_dense".into(),
-            hardware: CELL.into(),
-            sku: "MI355X".into(),
+            hardware: cell.to_string(),
+            // The cell is `vendor/isa/sku` (store.rs), so the sku IS the cell's last segment.
+            // The historical gfx950 cell keeps its recorded label (MI355X silicon measured
+            // into the mi350x cell) rather than silently relabeling old provenance.
+            sku: if cell == tunedb::GFX950_CELL {
+                "MI355X".into()
+            } else {
+                cell.rsplit('/').next().unwrap_or(cell).to_uppercase()
+            },
             digests: want.clone(),
             stats,
             correctness,
@@ -145,7 +158,7 @@ pub fn ingest(
         .into_iter()
         .partition(|r| !matches!(r.correctness, Correctness::Pass));
     if !bad.is_empty() {
-        let n = store.record_rejected(CELL, bad, "f64 dot spot-check mismatch")?;
+        let n = store.record_rejected(cell, bad, "f64 dot spot-check mismatch")?;
         println!(
             "rejected    : {n} record(s) failed the oracle: {}",
             failed.join(", ")
@@ -156,25 +169,31 @@ pub fn ingest(
             "provisional : {} record(s) stored, NOT selectable",
             good.len()
         );
-        let n = store.record_rejected(CELL, good, "--provisional: screening pass only")?;
+        let n = store.record_rejected(cell, good, "--provisional: screening pass only")?;
         println!("stored      : {n}");
         return Ok(0);
     }
-    let n = store.publish(CELL, good)?;
+    let n = store.publish(cell, good)?;
     println!(
-        "published   : {n} qualified record(s) into {}/{CELL}",
+        "published   : {n} qualified record(s) into {}/{cell}",
         db.display()
     );
     Ok(n)
 }
 
 /// What the store would serve the compiler right now, for the probed build.
-pub fn best(root: &Path, db: &PathBuf, quant: &str) -> Result<(), Err> {
+pub fn best(
+    root: &Path,
+    db: &PathBuf,
+    quant: &str,
+    isa: hwspec::IsaLevel,
+    cell: &str,
+) -> Result<(), Err> {
     let store = TuneStore::new(db.clone());
-    let want = digests(root)?;
-    let (best, stale) = store.best_for(CELL, &want)?;
+    let want = digests(root, isa)?;
+    let (best, stale) = store.best_for(cell, &want)?;
     let q = format!("/{quant}");
-    println!("cell        : {CELL}");
+    println!("cell        : {cell}");
     println!("build digest: {}", want.interpreter);
     let mut shown = 0;
     for (case, rec) in &best {

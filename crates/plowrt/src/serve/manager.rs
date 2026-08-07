@@ -95,7 +95,11 @@ impl BlobPlan {
             path: pkt.clone(),
             source,
         })?;
-        let blob = DevBlob::parse(&raw)?;
+        // METADATA ONLY -- this sums tensor bytes for the memory plan and never dispatches a
+        // packet, so L2-domain placement is irrelevant here. The real guard is in the engine,
+        // which checks the CODE OBJECT for `plow_l2_place_dispatch_1`. Using the strict parse
+        // made `serve` reject every placed blob before the engine ever saw it.
+        let blob = DevBlob::parse_l2(&raw, true)?;
         let mut plan = BlobPlan {
             weights_bytes: 0,
             kv_bytes: 0,

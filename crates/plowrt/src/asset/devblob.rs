@@ -210,7 +210,21 @@ fn recover_tp(progs: &[DevProg]) -> Option<DevTp> {
 impl DevBlob {
     /// Parse a blob image. Fails loudly on a bad magic or a truncated section,
     /// never mid-serve.
+    /// Parse a blob, refusing L2-domain placement unless the caller can honour it.
+    ///
+    /// `l2_dispatch_ok` says the CALLER will verify the code object actually carries the
+    /// dispatch axis (AMD does, via the `plow_l2_place_dispatch_1` marker at object-load time).
+    /// Backends that cannot check keep the old behaviour through [`DevBlob::parse`], which is
+    /// this with `false` -- placement is then refused unless the operator opts in by env.
+    pub fn parse_l2(buf: &[u8], l2_dispatch_ok: bool) -> Result<DevBlob> {
+        Self::parse_inner(buf, l2_dispatch_ok)
+    }
+
     pub fn parse(buf: &[u8]) -> Result<DevBlob> {
+        Self::parse_inner(buf, false)
+    }
+
+    fn parse_inner(buf: &[u8], l2_dispatch_ok: bool) -> Result<DevBlob> {
         let mut off = 0usize;
         let hdr: BlobHeader = take::<BlobHeader>(buf, &mut off, 1, "header")?[0];
         if !is_blob_magic(&hdr.magic) {
@@ -398,6 +412,7 @@ impl DevBlob {
         // opted in under the old name must not start failing to load.
         let dispatch_on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
         if hdr.flags & packet::devbuild::PLOW_BLOB_F_L2DOM != 0
+            && !l2_dispatch_ok
             && !dispatch_on("PLOW_L2_PLACE_DISPATCH")
             && !dispatch_on("PLOW_NV_PLACE_DISPATCH")
         {

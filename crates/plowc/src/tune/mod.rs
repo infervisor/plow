@@ -110,31 +110,46 @@ pub struct TuneOptions {
 }
 
 pub fn run(opts: &TuneOptions) -> Result<(), Box<dyn std::error::Error>> {
-    // The campaign actions are keyed to the gfx950 cell — that is where the GEMM harness, the
-    // rung→opcode table and the f64 correctness oracle all live — and they print the PROBED build
-    // digest themselves. Dispatched before the generic target header, which would otherwise print
-    // the `--gpu` default (an H100) over an AMD campaign.
+    let spec = hwspec::registry::lookup(&opts.gpu)
+        .ok_or_else(|| format!("unknown GPU {:?}; see hwspec::registry", opts.gpu))?;
+    let hw = HardwareFingerprint::from_spec(spec)
+        .ok_or_else(|| format!("{} has no ISA level mapping", spec.name))?;
+
+    // THE CELL AND THE ISA COME FROM `--gpu`, not from a constant. They used to be
+    // `tunedb::GFX950_CELL` and `IsaLevel::Gfx950` unconditionally, so a campaign run on an
+    // MI300X measured gfx942 kernels, keyed them to a gfx950 build digest, and PUBLISHED THEM
+    // INTO amd/gfx950/mi350x -- silently poisoning the MI350X cell with MI300X timings while
+    // leaving gfx942 with no cell at all. Observed: `plowc tune gemm --gpu mi300x` printed
+    // "gfx942 304 CUs" and then "published 96 qualified record(s) into tuning/amd/gfx950/mi350x".
+    let cell = hw.tuning_path();
+
+    // The campaign actions print the PROBED build digest themselves, so they are dispatched
+    // before the generic target header (which would otherwise print twice).
     match &opts.action {
-        TuneAction::Gemm(c) => return gemm::run(&opts.root, c),
+        TuneAction::Gemm(c) => return gemm::run(&opts.root, c, hw.isa, &cell),
         TuneAction::Ingest {
             samples,
             campaign,
             provisional,
         } => {
-            println!("cell        : {}", tunedb::GFX950_CELL);
-            return ingest::ingest(&opts.root, &opts.db, samples, campaign, *provisional).map(drop);
+            println!("cell        : {cell}");
+            return ingest::ingest(
+                &opts.root,
+                &opts.db,
+                samples,
+                campaign,
+                *provisional,
+                hw.isa,
+                &cell,
+            )
+            .map(drop);
         }
-        TuneAction::Best { quant } => return ingest::best(&opts.root, &opts.db, quant),
-        TuneAction::Regress { threshold } => {
-            return status::regress(&opts.db, tunedb::GFX950_CELL, *threshold)
+        TuneAction::Best { quant } => {
+            return ingest::best(&opts.root, &opts.db, quant, hw.isa, &cell)
         }
+        TuneAction::Regress { threshold } => return status::regress(&opts.db, &cell, *threshold),
         _ => {}
     }
-
-    let spec = hwspec::registry::lookup(&opts.gpu)
-        .ok_or_else(|| format!("unknown GPU {:?}; see hwspec::registry", opts.gpu))?;
-    let hw = HardwareFingerprint::from_spec(spec)
-        .ok_or_else(|| format!("{} has no ISA level mapping", spec.name))?;
 
     println!("target      : {} ({})", hw.sku, hw.isa.arch_flag());
     println!("fingerprint : {}", hw.tuning_path());

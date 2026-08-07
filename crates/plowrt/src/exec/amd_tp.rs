@@ -254,10 +254,12 @@ impl AmdTpGroup {
             )));
         }
 
-        // Parse the blob once, on the host, purely to size the peer region.
+        // Parse the blob once, on the host, purely to size the peer region. Metadata-only, so
+        // an L2-placed blob (the gfx942 default) is fine here — the per-object dispatch-symbol
+        // check in the engine is what actually guards L2 dispatch, same as the other read sites.
         let raw = std::fs::read(blob_path)
             .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
-        let blob = DevBlob::parse(&raw)?;
+        let blob = DevBlob::parse_l2(&raw, true)?;
         let tp = blob.tp.ok_or_else(|| {
             RuntimeError::Device(format!(
                 "this packet carries no collective, so it is compiled for a single GPU, \

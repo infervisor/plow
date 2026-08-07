@@ -331,6 +331,7 @@ fn shapes(m: &Model) -> Shapes {
 // rung a one-line edit instead of two that can disagree.
 const FP8_WEIGHT_OPS: &[&str] = &[
     "GemvFp8",
+    "GemvQkvFp8",
     "GemvGluFp8",
     "GemmFp8",
     "GemmMedFp8",
@@ -574,7 +575,34 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>) -> Value {
     json!({ "requires": req, "recommends": rec })
 }
 
-/// Render the neutral facts into the gfx950 (`hipcc` → `.hsaco`) define set.
+/// The `backends` block: one entry per backend that could serve this packet.
+///
+/// The AMD entry is keyed by the TARGET arch, not by the literal `gfx950`. A manifest that says
+/// `"arch": "gfx942"` beside a `"gfx950"` backend describes an object nobody should build: a
+/// consumer following the key compiles for the wrong ISA, and one following `arch` gets a define
+/// set tuned for 160 KiB of LDS it does not have. A non-AMD compile keeps the `gfx950` key so the
+/// manifest still answers "what would an AMD object need?" for the target this tree has always
+/// described, and the NV-side artifacts are unchanged.
+fn backends(
+    arch: &str,
+    f: &Map<String, Value>,
+    s: &Shapes,
+    union: &BTreeSet<Arm>,
+    t: &Map<String, Value>,
+) -> Value {
+    let amd_key = if arch.starts_with("gfx") {
+        arch
+    } else {
+        "gfx950"
+    };
+    let gf_full = t.get("gf_full").and_then(Value::as_u64);
+    json!({
+        "nvcc": backend_nvcc(f, t),
+        amd_key: backend_amd(amd_key, f, s, union, gf_full),
+    })
+}
+
+/// Render the neutral facts into the AMD (`hipcc` → `.hsaco`) define set for `arch`.
 ///
 /// `backend_nvcc` was the only renderer, so an AMD build had to be derived by hand from the
 /// features — and `scripts/gfx950_objects.py` grew a FEATURE→AXIS map to do exactly that. This is
@@ -593,7 +621,17 @@ fn backend_nvcc(f: &Map<String, Value>, t: &Map<String, Value>) -> Value {
 /// and restating it here is precisely the drift this file exists to prevent —
 /// `scripts/gfx950_objects.py` PARSES that table, which is the right relationship. This renders the
 /// defines a covering object must have been built with; matching them to a row is the script's job.
-fn backend_gfx950(
+///
+/// ARCH-KEYED, not gfx950-only. The two CDNA levels do not take the same define set: CDNA3 has
+/// 64 KiB of workgroup LDS against CDNA4's 160 KiB, so gfx950's default GEMM stage arena does not
+/// fit and the object silently gets a different tile. Those tile/stage defines therefore belong in
+/// `requires` on gfx942 for the same reason every other entry here does — leave them out and the
+/// build is wrong rather than merely slow. The authority for the set is
+/// `kernelcaps::targets::prefill_recipe`, which is what actually builds the object; this renders
+/// the same facts into the manifest so a consumer reading the artifact and a consumer running the
+/// recipe cannot disagree.
+fn backend_amd(
+    arch: &str,
     f: &Map<String, Value>,
     s: &Shapes,
     union: &BTreeSet<Arm>,
@@ -603,6 +641,14 @@ fn backend_gfx950(
     let has = |n: &str| union.iter().any(|a| a.op == n);
 
     let mut req: Vec<String> = Vec::new();
+    // CDNA3 LDS budget. `GM_DBUF=1` single-buffers the GEMM stage, which is what makes the
+    // 192x256 tile fit 64 KiB at eight waves; on CDNA4 the double-buffered default fits and is
+    // faster, so this is genuinely arch-conditional and not a tuning preference.
+    if arch == "gfx942" && !s.prefill_buckets.is_empty() {
+        for d in ["PLOW_WG_WAVES=8", "GM_DBUF=1", "GM_BM=192", "GM_BN=256"] {
+            req.push(d.into());
+        }
+    }
     // Phase. A packet with prefill buckets needs the prefill object; the decode object is always
     // needed because every packet has a decode program.
     if !s.prefill_buckets.is_empty() {
@@ -845,10 +891,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         // and segment. Anything narrower and some bucket hits `default: __trap()`.
         "union": union.iter().map(Arm::key).collect::<Vec<_>>(),
         "analysis": analysis(&progs),
-        "backends": {
-            "nvcc": backend_nvcc(&f, &t),
-            "gfx950": backend_gfx950(&f, &s, &union, t.get("gf_full").and_then(Value::as_u64)),
-        },
+        "backends": backends(arch, &f, &s, &union, &t),
     })
 }
 

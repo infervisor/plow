@@ -50,9 +50,15 @@ int main(void) {
         fprintf(stderr, "load: %s\n", plow_hsa_last_error()); return 1;
     }
 
+    /* The interpreter's symbol carries the ISA name, and the runtime resolves it from the LIVE
+     * agent name -- crates/plowrt/src/exec/amd.rs formats "{base}_{arch}" out of
+     * HSA_AGENT_INFO_NAME. Do the same here instead of hardcoding one arch, so this test runs
+     * against whatever part it is pointed at. */
+    char sym[96];
+    snprintf(sym, sizeof(sym), "plow_interp_%s", nm);
     plow_hsa_kernel k_interp;
-    if (plow_hsa_get_kernel(h, 0, "plow_interp_gfx950", &k_interp) != 0) {
-        fprintf(stderr, "symbol: %s\n", plow_hsa_last_error()); return 1;
+    if (plow_hsa_get_kernel(h, 0, sym, &k_interp) != 0) {
+        fprintf(stderr, "symbol %s: %s\n", sym, plow_hsa_last_error()); return 1;
     }
     printf("interpreter resolved (kernarg=%u B, LDS=%u B)\n\n",
            k_interp.kernarg_size, k_interp.group_segment_size);
@@ -100,6 +106,14 @@ int main(void) {
      * per workgroup by op i, so the consumer's threshold is NCU.              */
     PlowDevInst insts[4];
     memset(insts, 0, sizeof(insts));
+    /* ZERO IS A VALID TENSOR HANDLE. `memset` leaves every unused t[] slot at 0, which is
+     * T_OUT_EMB here -- so PLOW_DOP_RESIDUAL's OPTIONAL third operand (`pre`, t[3]) resolved to
+     * the embedding and the op computed (pre + a + b) * scale, adding the embedding twice.
+     * The absent-operand sentinel is PLOW_TENSOR_NONE (0xFFFF), not 0. Symptom was a chained
+     * result ~2x high with the counter protocol passing, i.e. it looked like a coherence bug
+     * and was an ABI one. */
+    for (unsigned i = 0; i < 4; i++)
+        for (unsigned j = 0; j < 8; j++) insts[i].t[j] = PLOW_TENSOR_NONE;
     PlowWait waits[3];
     uint32_t succs[3] = {0, 1, 2};
 

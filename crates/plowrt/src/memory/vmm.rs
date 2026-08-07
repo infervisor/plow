@@ -73,6 +73,24 @@ pub trait VmmOps: Send + Sync {
     fn alloc(&self, bytes: u64) -> Result<u64>;
     fn free(&self, va: u64);
     fn copy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()>;
+
+    /// Take every pooled physical chunk `(handle, bytes)` a previous
+    /// [`VmmSlab`] kept via [`Self::pool_put`]. Re-mapping a pooled chunk is
+    /// ~free (map+set_access, µs-class) where creating one pays the driver's
+    /// serial page-commit rate (~13 GiB/s measured) — the whole point of the
+    /// pool. Default: nothing pooled.
+    fn pool_take(&self) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
+
+    /// Keep physical chunks for a future slab, or dispose of them. The
+    /// default releases immediately (no pool) — safe everywhere; a backend
+    /// that pools MUST release leftovers when it is dropped.
+    fn pool_put(&self, chunks: Vec<(u64, u64)>) {
+        for (h, _) in chunks {
+            self.release(h);
+        }
+    }
 }
 
 /// KV geometry of the model the engine loaded, resolved from the checkpoint's
@@ -973,6 +991,232 @@ fn release_window(s: &Shared, inner: &mut Inner, seq: usize) {
     s.frontier[seq].store(0, Ordering::Release);
 }
 
+/// `PLOW_SLAB_KEEP=1` keeps a dropped [`VmmSlab`]'s PHYSICAL chunks in the
+/// backend pool ([`VmmOps::pool_put`]) instead of releasing them, so the next
+/// load re-maps them (µs-class) instead of re-paying the driver's serial
+/// ~13 GiB/s page commit — a same-box model reload or S1 switch drops from
+/// ~1.9 s to ~0.4 s.
+///
+/// **Opt-in, off by default, deliberately:** pooled chunks hold VRAM between
+/// loads, and the serve planner's free-VRAM arithmetic (`serve::manager`'s
+/// fit check, the lifecycle tests' return-to-baseline assert) does not credit
+/// the pool. Flip the default only together with planner awareness. Read
+/// per-drop (not cached) so an in-process flip is honored.
+fn slab_keep_enabled() -> bool {
+    std::env::var("PLOW_SLAB_KEEP").ok().as_deref() == Some("1")
+}
+
+/// Physical-commit chunk for [`VmmSlab`]-backed weight slabs. The CUDA driver
+/// commits at ~13 GiB/s (`perf-data/coldstart-plow-vs-vllm-gh200.md` §4b) so
+/// this is ~20 ms per chunk — small enough that the first carve's wait is
+/// invisible, large enough that a 60 GiB slab is a few hundred driver calls,
+/// not tens of thousands of granules.
+pub const WEIGHT_SLAB_CHUNK: u64 = 256 << 20;
+
+/// Where a loader's non-VMM-prefix tensors' storage comes from. Shared by the
+/// CUDA and AMD engines (see each engine's `_weight_slab` field for its
+/// measurements and default): the fallback chain is Vmm → Flat → PerTensor,
+/// each arm strictly less demanding on the driver than the one before.
+pub enum WeightSlab {
+    /// One VA reservation (µs) whose pages a background mapper commits
+    /// front-to-back, overlapped with the upload — the upfront page-commit
+    /// stall is off the critical path entirely.
+    Vmm(VmmSlab),
+    /// One flat device allocation, paying the driver's full upfront commit.
+    Flat(crate::device::DeviceMem),
+    /// Per-tensor allocation (`PLOW_WEIGHT_SLAB=0`, or the flat allocation
+    /// was refused — a fragmented card can satisfy many small blocks and not
+    /// one big one).
+    PerTensor,
+}
+
+/// A lazily-committed linear device slab: one VA reservation (µs — probe [6])
+/// whose physical backing a background thread creates and maps front-to-back,
+/// so a consumer writing the slab in address order overlaps the driver's page
+/// commit instead of paying it as one upfront `cuMemAlloc` stall.
+///
+/// Built for the weight loader: on GH200 the driver commits at ~13 GiB/s
+/// (`perf-data/coldstart-plow-vs-vllm-gh200.md` §4b) while the upload feeds
+/// the slab at ~6 GiB/s, so the mapper stays ahead of the writes after the
+/// first chunk and [`Self::wait_mapped`] almost never blocks.
+///
+/// The consumer contract is [`Self::wait_mapped`] before touching any range —
+/// VMM has no demand paging; an access below the watermark on an unmapped
+/// page is fatal, not slow. Teardown on Drop: join the mapper, unmap and
+/// release every chunk, free the reservation.
+pub struct VmmSlab {
+    ops: Arc<dyn VmmOps>,
+    va: u64,
+    /// Caller-visible slab size (what may be carved).
+    bytes: u64,
+    /// VA reservation span (`bytes` rounded up to the granularity).
+    reserved: u64,
+    shared: Arc<SlabShared>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+struct SlabShared {
+    m: Mutex<SlabState>,
+    cv: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct SlabState {
+    /// Bytes from the base that are mapped AND access-granted.
+    mapped: u64,
+    /// Physical handles in map order (`(handle, bytes)`), for teardown.
+    handles: Vec<(u64, u64)>,
+    /// First commit error; the mapper stops on it and waiters return it.
+    err: Option<String>,
+    /// Drop asked the mapper to quit early.
+    stop: bool,
+}
+
+impl VmmSlab {
+    /// Reserve `bytes` of VA and start committing physical chunks of
+    /// `chunk_hint` (rounded to the granularity) from the base upward.
+    pub fn new(ops: Arc<dyn VmmOps>, bytes: u64, chunk_hint: u64) -> Result<Self> {
+        let gran = ops.granularity()?;
+        let reserved = bytes.div_ceil(gran) * gran;
+        let chunk = chunk_hint.max(gran).div_ceil(gran) * gran;
+        let va = ops.reserve(reserved)?;
+        let shared = Arc::new(SlabShared {
+            m: Mutex::new(SlabState::default()),
+            cv: parking_lot::Condvar::new(),
+        });
+        // Pooled physical chunks from a previous slab's PLOW_SLAB_KEEP drop:
+        // re-mapping one skips the driver's serial page commit entirely, so a
+        // reload/S1 switch pays map+set_access (µs-class) instead of
+        // ~13 GiB/s of cuMemCreate. Drained unconditionally — a stale pool
+        // (flag flipped off between loads) is still valid physical memory and
+        // reusing it is strictly cheaper than re-creating.
+        let mut pooled = ops.pool_take();
+        let (t_ops, t_shared) = (Arc::clone(&ops), Arc::clone(&shared));
+        let join = std::thread::Builder::new()
+            .name("wslab-map".into())
+            .spawn(move || {
+                let mut off = 0u64;
+                while off < reserved {
+                    if t_shared.m.lock().stop {
+                        break;
+                    }
+                    let n = chunk.min(reserved - off);
+                    // Exact-size match only: every chunk but the tail is the
+                    // uniform `chunk` size, so cross-model reuse works and at
+                    // most one tail per generation misses.
+                    let reuse = pooled
+                        .iter()
+                        .position(|&(_, b)| b == n)
+                        .map(|i| pooled.swap_remove(i).0);
+                    let r = match reuse {
+                        Some(h) => Ok(h),
+                        None => t_ops.create(n),
+                    }
+                    .and_then(|h| {
+                        t_ops
+                            .map(va + off, n, h)
+                            .and_then(|()| t_ops.set_access(va + off, n))
+                            .inspect_err(|_| {
+                                // Map/access failed: the chunk is not (fully)
+                                // usable — unwind it so Drop's walk only sees
+                                // consistent (mapped, released-once) chunks.
+                                t_ops.unmap(va + off, n);
+                                t_ops.release(h);
+                            })
+                            .map(|()| h)
+                    });
+                    let mut st = t_shared.m.lock();
+                    match r {
+                        Ok(h) => {
+                            st.handles.push((h, n));
+                            off += n;
+                            st.mapped = off;
+                        }
+                        Err(e) => {
+                            st.err = Some(e.to_string());
+                            t_shared.cv.notify_all();
+                            break;
+                        }
+                    }
+                    t_shared.cv.notify_all();
+                }
+                // Whatever the pool held beyond this slab's needs goes back
+                // (or is released, per the backend's default) — never leaked.
+                if !pooled.is_empty() {
+                    t_ops.pool_put(pooled);
+                }
+            })
+            .map_err(|e| RuntimeError::Device(format!("vmm slab mapper thread: {e}")))?;
+        Ok(VmmSlab {
+            ops,
+            va,
+            bytes,
+            reserved,
+            shared,
+            join: Some(join),
+        })
+    }
+
+    /// Base device address of the slab.
+    pub fn base(&self) -> u64 {
+        self.va
+    }
+
+    /// Caller-visible slab length in bytes.
+    pub fn len(&self) -> u64 {
+        self.bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    /// Block until `[base, base+upto)` is mapped and device-accessible.
+    /// Propagates the mapper's commit error (OOM mid-slab is fatal to the
+    /// load — views were already carved, there is nothing to fall back to).
+    pub fn wait_mapped(&self, upto: u64) -> Result<()> {
+        debug_assert!(upto <= self.bytes, "wait past the slab end");
+        let mut st = self.shared.m.lock();
+        loop {
+            if st.mapped >= upto {
+                return Ok(());
+            }
+            if let Some(e) = &st.err {
+                return Err(RuntimeError::Device(format!("vmm slab commit: {e}")));
+            }
+            self.shared.cv.wait(&mut st);
+        }
+    }
+}
+
+impl Drop for VmmSlab {
+    fn drop(&mut self) {
+        self.shared.m.lock().stop = true;
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+        let mut st = self.shared.m.lock();
+        let mut off = 0u64;
+        for &(_, n) in &st.handles {
+            self.ops.unmap(self.va + off, n);
+            off += n;
+        }
+        let handles = std::mem::take(&mut st.handles);
+        if slab_keep_enabled() {
+            // PLOW_SLAB_KEEP=1: hand the physical chunks to the backend pool
+            // so the next load re-maps instead of re-committing. This holds
+            // VRAM between loads BY DESIGN — the planner does not credit it,
+            // so it is opt-in (see `slab_keep_enabled`).
+            self.ops.pool_put(handles);
+        } else {
+            for (h, _) in handles {
+                self.ops.release(h);
+            }
+        }
+        self.ops.address_free(self.va, self.reserved);
+    }
+}
+
 /// Chained per-block hashes of the prompt at sharing-block granularity
 /// (`floor(len / block_rows)` whole blocks; the tail never matches).
 pub fn hash_blocks(prompt: &[u32], block_rows: u32) -> Vec<BlockHash> {
@@ -1010,6 +1254,7 @@ mod tests {
         frees: AtomicU64,
         fail_creates: AtomicI64,
         fail_maps: AtomicI64,
+        pool: std::sync::Mutex<Vec<(u64, u64)>>,
     }
 
     impl VmmOps for MockVmm {
@@ -1057,6 +1302,12 @@ mod tests {
         }
         fn copy_dtod(&self, _dst: u64, _src: u64, _bytes: u64) -> Result<()> {
             Ok(())
+        }
+        fn pool_take(&self) -> Vec<(u64, u64)> {
+            std::mem::take(&mut *self.pool.lock().unwrap())
+        }
+        fn pool_put(&self, mut chunks: Vec<(u64, u64)>) {
+            self.pool.lock().unwrap().append(&mut chunks);
         }
     }
 
@@ -1371,6 +1622,62 @@ mod tests {
             ops.frees.load(Ordering::SeqCst),
             "snapshots leaked"
         );
+    }
+
+    /// The slab maps everything (granularity-rounded), the watermark wait
+    /// returns, and Drop releases exactly what was created.
+    #[test]
+    fn slab_maps_all_and_tears_down() {
+        let ops = Arc::new(MockVmm::default());
+        // gran 16: 100 B → reserved 112; chunk hint 30 → 32-B chunks
+        // (32, 32, 32, 16).
+        let slab = VmmSlab::new(ops.clone() as Arc<dyn VmmOps>, 100, 30).expect("slab");
+        slab.wait_mapped(100).expect("mapped");
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 4);
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 4);
+        drop(slab);
+        assert_eq!(ops.unmaps.load(Ordering::SeqCst), 4);
+        assert_eq!(ops.releases.load(Ordering::SeqCst), 4);
+    }
+
+    /// A commit failure mid-slab reaches the waiter as an error instead of a
+    /// hang, and Drop still balances create/release for the chunks that DID
+    /// commit.
+    #[test]
+    fn slab_commit_error_reaches_waiter() {
+        let ops = Arc::new(MockVmm::default());
+        ops.fail_creates.store(1, Ordering::SeqCst);
+        let slab = VmmSlab::new(ops.clone() as Arc<dyn VmmOps>, 64, 16).expect("slab");
+        assert!(slab.wait_mapped(64).is_err(), "commit error must propagate");
+        drop(slab);
+        assert_eq!(
+            ops.creates.load(Ordering::SeqCst),
+            ops.releases.load(Ordering::SeqCst),
+            "created chunks leaked"
+        );
+    }
+
+    /// Pooled chunks with matching sizes are re-mapped instead of created:
+    /// 100 B at chunk 32 needs (32, 32, 32, 16); a pool holding one 32 and
+    /// one 16 leaves exactly two creates. The pool is drained either way.
+    #[test]
+    fn slab_reuses_pooled_chunks() {
+        let ops = Arc::new(MockVmm::default());
+        ops.pool
+            .lock()
+            .unwrap()
+            .extend([(9001u64, 32u64), (9002, 16)]);
+        let slab = VmmSlab::new(ops.clone() as Arc<dyn VmmOps>, 100, 30).expect("slab");
+        slab.wait_mapped(100).expect("mapped");
+        assert_eq!(
+            ops.creates.load(Ordering::SeqCst),
+            2,
+            "two chunks missing from pool"
+        );
+        assert_eq!(ops.maps.load(Ordering::SeqCst), 4, "all four chunks mapped");
+        assert!(ops.pool.lock().unwrap().is_empty(), "pool drained");
+        drop(slab); // PLOW_SLAB_KEEP unset → all four released
+        assert_eq!(ops.releases.load(Ordering::SeqCst), 4);
     }
 
     #[test]

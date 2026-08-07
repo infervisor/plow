@@ -530,7 +530,16 @@ pub fn probe_macros(
     std::fs::create_dir_all(&dir)?;
     let src = dir.join("macro_probe.cu");
     let marker = "PLOWPROBE_MARKER";
-    let body = format!("#include \"{header}\"\n{marker} {}\n", names.join(" "));
+    // The extra `__HIP_DEVICE_COMPILE__` token identifies WHICH pass a marker line came from.
+    // `hipcc -E` with an offload arch preprocesses the TU twice — device pass (arch macros
+    // defined) and host pass (not) — and both emit the marker. Once a header's defaults
+    // diverge on the arch (op_gemm.h keys its CDNA3 tile/stage defaults on PLOW_CDNA4, i.e.
+    // __gfx950__), the passes DISAGREE, and taking the last line silently reported the HOST
+    // pass's CDNA3 tiles for a gfx950 probe — every gfx950 inventory rung shrank to 192x256.
+    let body = format!(
+        "#include \"{header}\"\n{marker} __HIP_DEVICE_COMPILE__ {}\n",
+        names.join(" ")
+    );
     std::fs::write(&src, body)?;
 
     let mut t = target.clone();
@@ -538,12 +547,19 @@ pub fn probe_macros(
     let text = t.preprocess()?;
     let _ = std::fs::remove_dir_all(&dir);
 
-    let line = text
+    let lines: Vec<&str> = text
         .lines()
-        .rev()
-        .find(|l| l.trim_start().starts_with(marker))
+        .filter(|l| l.trim_start().starts_with(marker))
+        .collect();
+    // Prefer the device pass (token expands to 1). Single-pass preprocesses (nvcc host-only)
+    // leave the token unexpanded or 0 on every line — fall back to the last, as before.
+    let line = lines
+        .iter()
+        .find(|l| l.split_whitespace().nth(1) == Some("1"))
+        .or(lines.last())
+        .copied()
         .unwrap_or("");
-    let toks: Vec<&str> = line.trim().split_whitespace().skip(1).collect();
+    let toks: Vec<&str> = line.trim().split_whitespace().skip(2).collect();
     Ok(names
         .iter()
         .enumerate()

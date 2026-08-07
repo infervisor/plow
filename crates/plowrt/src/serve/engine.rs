@@ -169,7 +169,11 @@ mod amd_serve {
         pub fn load(blob_path: &Path, hsaco_dir: &Path, checkpoint: Option<&Path>) -> Result<Self> {
             let raw = std::fs::read(blob_path)
                 .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
-            let n_gpu = crate::asset::devblob::DevBlob::parse(&raw)?
+            // METADATA ONLY -- this reads the TP fan-out to decide single-GPU vs TP group and
+            // then drops the blob; it never dispatches. The L2-placement guard belongs to the
+            // engine (which checks the code object for `plow_l2_place_dispatch_1`), so refusing
+            // here just blocked `serve` on every placed blob before the engine saw it.
+            let n_gpu = crate::asset::devblob::DevBlob::parse_l2(&raw, true)?
                 .tp
                 .map(|t| t.n_gpu)
                 .unwrap_or(1)

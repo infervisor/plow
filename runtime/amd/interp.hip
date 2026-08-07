@@ -89,6 +89,29 @@ extern "C" __device__ unsigned plow_k3_arms_1 = 1;
 extern "C" __device__ unsigned plow_fp8_kv_1 = 1;
 #endif
 
+/* The Gemma-4 MoE arms, made observable the same way and for the same reason. [GEMMA4-MOE-AMD]
+ *
+ * These are ADDITIVE axes (a Gemma packet needs the arm; nothing needs the arm ABSENT), so one
+ * direction of refusal is enough: a packet carrying opcodes 61-77 / 81-82 against an object
+ * built without them would fall to the dispatch `default:`, which on AMD WRITES NOTHING. That
+ * is indistinguishable from an op that ran and produced zeros — the exact failure mode
+ * `plow_k3_arms_1` exists to make impossible. The symbol exists iff the axis is on, in one
+ * preprocessor pass, so absence is unambiguous rather than "old". */
+#if PLOW_MOE_GEMMA
+extern "C" __device__ unsigned plow_moe_gemma_arms_1 = 1;
+#endif
+#if PLOW_MOE_GEMMA_PF
+extern "C" __device__ unsigned plow_moe_gemma_pf_arms_1 = 1;
+#endif
+/* Same contract as the arms markers above, for L2-DOMAIN DISPATCH. A blob compiled with
+ * PLOW_L2_PLACE repurposes the global-queue `seg` as an L2 domain rather than a wave class, so an
+ * object built WITHOUT this axis would mis-dispatch it silently -- correct-looking packets on the
+ * wrong domains. The runtime used to guard that with an env var the operator ASSERTED
+ * (PLOW_L2_PLACE_DISPATCH=1); this symbol lets it CHECK instead. Exists iff the axis is on. */
+#if PLOW_L2_PLACE_DISPATCH
+extern "C" __device__ unsigned plow_l2_place_dispatch_1 = 1;
+#endif
+
 /* Cross-GPU collective spin deadline (s_memrealtime ticks). s_memrealtime is 1 GHz on
  * gfx950 (plans/tp-transport.md §1), so ~1e9 ticks ≈ 1 s: a fabric on which the
  * system-scope xctr atomic did NOT propagate bails with status 0xDEAD.... instead of
@@ -208,10 +231,63 @@ extern "C" __device__ unsigned plow_fp8_kv_1 = 1;
 #ifndef PLOW_GQ_BATCH
 #define PLOW_GQ_BATCH 1
 #endif
+/* Hoist the instruction fetch above the gate poll (see the probe at the poll). Default OFF. */
+#ifndef PLOW_INST_PF
+#define PLOW_INST_PF 0
+#endif
 
+/* PLOW_DEC_ARENA_HALVES decouples the DECODE arena from the GEMM tile.
+ *
+ * The arena is normally the prefill GEMM stage, and that is what pins the decode object's LDS:
+ * the smallest tile the fused-GLU SN==2 assert allows at 8 waves is 128x256x32 = 30,720 B, just
+ * over the 32,768 B that would fit two workgroups per CU and well over the 16,384 B that would
+ * fit four. But the decode object DEAD-STRIPS the whole GEMM family -- interp_decode_gq.elf
+ * contains ZERO d_gemm* symbols -- so the tile only survives as a TEMPLATE INSTANTIATION whose
+ * static_asserts fire. Sizing the arena separately keeps those asserts satisfied (the tile
+ * constants are untouched) while giving the GEMV the LDS it actually needs.
+ *
+ * The staged-x arm is checked PER OP (`M*K <= GM_LDS_HALVES`), so a smaller arena does not break
+ * correctness anywhere -- a projection whose activation no longer fits simply reads x from
+ * global, which is the same fallback the unstaged arm has always been.
+ *
+ * NOT SAFE FOR BATCHED DECODE. At PLOW_DECODE_BATCH > 16 the decode program dispatches real
+ * GEMM ops (M exceeds PLOW_GEMV_MAXM), and those would address an arena sized for the GEMV.
+ * Guarded on PLOW_GEMV_MM below; a packet that violates it needs the same marker-symbol refusal
+ * `check_moe_gemma_arms` uses. */
+#if PLOW_BUCKET_DECODE && defined(PLOW_DEC_ARENA_HALVES)
+#if PLOW_GEMV_MM > 16
+#error "PLOW_DEC_ARENA_HALVES is unsafe at PLOW_GEMV_MM > 16: batched decode dispatches GEMM"
+#endif
+#if PLOW_DEC_ARENA_HALVES < GM_LDS_HALVES
+/* The staged-x arm and the NRN-fold scratch (GM_LDS_HALVES - GV_NORM_SCRATCH) both measure
+ * against the TILE constant, not this arena — an arena below it passes every per-op check and
+ * overflows the union. The knob's win is dropping the (BM+BN) GEMM stage, not going below the
+ * GEMV budget. */
+#error "PLOW_DEC_ARENA_HALVES below GM_LDS_HALVES: gemv staging checks would write past the arena"
+#endif
+#define PLOW_GM_ARENA (PLOW_DEC_ARENA_HALVES)
+#else
 #define PLOW_GM_ARENA GM_LDS_HALVES_T(GM_BM, GM_BN, GM_BK)
-#define PLOW_SMEM_HALVES                                                        \
+#endif
+#if PLOW_BUCKET_DECODE
+/* The decode bucket never runs flash PREFILL (its arm is not compiled), so its arena is the
+ * GEMM/GEMV staging tile alone. See the `fa` member below. */
+#define PLOW_SMEM_H0 PLOW_GM_ARENA
+#else
+#define PLOW_SMEM_H0                                                            \
     (PLOW_GM_ARENA > FA_LDS_HALVES(512) ? PLOW_GM_ARENA : FA_LDS_HALVES(512))
+#endif
+/* `raw` must cover the LARGEST member, not just the two biggest-on-gfx950 ones. On a 64 KiB
+ * part the GEMM arena shrinks below the MLA-prefill tiles and the old two-way max left `raw`
+ * smaller than `fmpf` -- which the static_assert below caught, but as a build failure rather
+ * than the size it should have been. No effect on gfx950, where the GEMM arena still wins. */
+#if PLOW_MLA_PREFILL
+#define PLOW_MLA_PF_HALVES (FA_MLA_PF_LDS_FLOATS(512, 64) * 2)
+#define PLOW_SMEM_HALVES                                                        \
+    (PLOW_SMEM_H0 > PLOW_MLA_PF_HALVES ? PLOW_SMEM_H0 : PLOW_MLA_PF_HALVES)
+#else
+#define PLOW_SMEM_HALVES PLOW_SMEM_H0
+#endif
 
 /* __align__(16) is LOAD-BEARING, and its absence cost the GEMM half its speed.
  *
@@ -229,9 +305,34 @@ extern "C" __device__ unsigned plow_fp8_kv_1 = 1;
 typedef union __align__(16) {
     float part[PLOW_WAVES];           /* block_sum scratch          */
     bf16  gm[PLOW_GM_ARENA];          /* GEMM A|B tiles, x2 buffers */
+#if !PLOW_BUCKET_DECODE
+    /* FLASH-PREFILL TILES, AND THEY ARE DEAD IN THE DECODE BUCKET. Verified on the shipped
+     * object: interp_decode_gq.elf contains ZERO d_flash_prefill symbols and three
+     * d_flash_decode ones -- the decode bucket already compiles the prefill arm out. Leaving the
+     * MEMBER in still sized the union at 58,368 B, which is what pinned the decode object to one
+     * workgroup per CU (2 waves/SIMD) no matter what else shrank. */
     bf16  fa[FA_LDS_HALVES(512)];     /* flash K|V|P tiles          */
+#endif
     float fd[FA_DEC_LDS_FLOATS(512, PLOW_FA_GF(512))]; /* flash decode; the op owns this size */
+/* PROBE GATE. `fmla` is the MLA latent-decode arena (GLM/DeepSeek/Kimi) and it sets the decode
+ * union at 42,064 B once the flash-prefill `fa` is gated out -- above the 32,768 B that would
+ * fit TWO workgroups per CU. A Gemma decode object never runs an MLA op. Gating it is NOT safe
+ * to ship as-is: plowrt has no MLA arm-check for decode the way it has `check_moe_gemma_arms`,
+ * so a GLM packet handed a Gemma-built object would silently skip its MLA ops. This exists to
+ * MEASURE whether crossing the occupancy threshold pays at all, before that check is built. */
+#ifndef PLOW_NO_MLA_DEC
+#define PLOW_NO_MLA_DEC 0
+#endif
+/* The op body is compiled either way (the switch is total); under the probe gate it is aimed at
+ * `raw`, which is at least as large. It never runs -- a Gemma decode packet emits no MLA op. */
+#if PLOW_NO_MLA_DEC
+#define PLOW_FMLA(sm) ((float*)(sm)->raw)
+#else
+#define PLOW_FMLA(sm) ((sm)->fmla)
+#endif
+#if !PLOW_NO_MLA_DEC
     float fmla[FA_MLA_DEC_LDS_FLOATS(512, 64, GLM_MLA_GF_MAX)]; /* MLA latent decode (DK=512,DR=64) */
+#endif
 #if PLOW_MLA_PREFILL
     /* MLA latent PREFILL tiles: Q|K staged plus the P transpose. Bigger than `fmla` (the
      * query tile is hoisted here) and still under the GEMM arena that sets the union, so
@@ -248,6 +349,15 @@ typedef union __align__(16) {
  * against the GEMM's 147,456) and this is what keeps that true if either side moves. */
 static_assert(sizeof(((plow_smem*)nullptr)->fmpf) <= sizeof(((plow_smem*)nullptr)->raw),
               "MLA prefill LDS arena exceeds the interpreter's shared allocation");
+#endif
+
+#if PLOW_MOE_GEMMA_PF
+/* Same guard, for the grouped Gemma expert GEMM: it stages its tiles into `raw` rather than
+ * declaring its own __shared__, so an arena smaller than the tile would read past the
+ * allocation instead of failing to compile. GMPF_DBUF already drops to ONE buffer on a 64 KiB
+ * part (op_moe.h); this is what keeps that true if either side moves. */
+static_assert(GMPF_LDS_HALVES * sizeof(bf16) <= sizeof(((plow_smem*)nullptr)->raw),
+              "Gemma grouped-MoE prefill LDS tile exceeds the interpreter's shared allocation");
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -398,6 +508,47 @@ __device__ __forceinline__ void exec_flash_prefill_fp8(CInst in, CTens T, unsign
 __device__ __forceinline__ void exec_flash_decode(CInst in, CTens T,
                                                   unsigned slice, unsigned nblk, float* lds) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+#define IEN(k) (in->i[k] == PLOW_TENSOR_NONE ? nullptr : T[in->i[k]])
+    /* i1 bit 16 is the NRF fold (HeadNormRope computed here — see d_flash_decode's NRF arm).
+     * The freed integer slots carry the fold's operands, so several fields arrive PACKED:
+     *   t2=qg(raw) t6=kg(raw) t7=vg(raw, =kg on k_eq_v) · i0=n_batch|window<<8 ·
+     *   i3=kv_stride|nsplit<<20 · i4=gamma_q i5=gamma_k (handles) · fj0=eps (scale is
+     *   emitter-asserted 1.0) · fj1.u=cos fj2.u=sin (handles) · i1 bit17=skip_norm.
+     * Absence TRAPS — a fold packet missing an operand would attend over garbage. */
+    if (in->i[1] & 0x10000u) {
+        const unsigned hd = in->i[6] & 0xFFFFu;
+        const bf16* kg = (const bf16*)TEN(6);
+        const bf16* vg = (const bf16*)TEN(7);
+        const bf16* gq = (const bf16*)IEN(4);
+        const bf16* gk = (const bf16*)IEN(5);
+        const float* cs = (const float*)(in->fj[1].u == PLOW_TENSOR_NONE ? nullptr : T[in->fj[1].u]);
+        const float* sn = (const float*)(in->fj[2].u == PLOW_TENSOR_NONE ? nullptr : T[in->fj[2].u]);
+        if (!TEN(2) || !kg || !vg || !cs || !sn) __builtin_trap();
+        const unsigned n_batch = in->i[0] & 0xFFu, window = in->i[0] >> 8;
+        const unsigned n_head = in->i[1] & 0xFFFFu, skip = (in->i[1] >> 17) & 1u;
+        const unsigned kv_stride = in->i[3] & 0xFFFFFu, nsplit = in->i[3] >> 20;
+        const float eps = in->fj[0].f;
+        /* [MERGE-FOLD] operands, packed into the bits the NRF layout leaves free (every whole
+         * slot is taken): i1[18..32) = the done-counter tensor handle (14 bits — the emitter
+         * asserts the handle fits), i6[16..32) = the bf16 attention-output handle. 0 = no fold
+         * (both are compiler-owned tensors, never handle 0). See d_flash_decode [MERGE-FOLD]. */
+        const unsigned mrg_h = in->i[1] >> 18, at_h = in->i[6] >> 16;
+        unsigned* mrgc = mrg_h ? (unsigned*)T[mrg_h] : nullptr;
+        bf16* o_fin = at_h ? (bf16*)T[at_h] : nullptr;
+        if (mrg_h && (!mrgc || !o_fin)) __builtin_trap();
+#define PLOW_FD_NRF(DD)                                                                            \
+    d_flash_decode<DD, PLOW_FA_GF(DD), false, true>(                                               \
+        (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),                  \
+        (const bf16*)TEN(4), (const int*)TEN(5), n_batch, n_head, in->i[2], kv_stride, window,     \
+        1.0f, nsplit, in->i[7], slice, nblk, lds, nullptr, nullptr, kg, vg, gq, gk, cs, sn, eps,   \
+        skip, mrgc, o_fin)
+        if (hd == 128) PLOW_FD_NRF(128);
+        else if (hd == 256) PLOW_FD_NRF(256);
+        else if (hd == 512) PLOW_FD_NRF(512);
+#undef PLOW_FD_NRF
+#undef IEN
+        return;
+    }
     const unsigned hd = in->i[6];
     if (hd == 128)
         d_flash_decode<128, PLOW_FA_GF(128)>((float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
@@ -788,10 +939,24 @@ __device__ __forceinline__ void exec_gemv(CInst in, CTens T,
 #undef TEN
 }
 #if PLOW_FP8
-/* t0=C t1=x t2=W(fp8) t5=w_scale(f32[N])   i0=M i1=N i2=K i4=a_row0 */
+/* t0=C t1=x t2=W(fp8) t5=w_scale(f32[N])   i0=M i1=N i2=K i4=a_row0
+ *
+ * i3 != 0 is the NRN FOLD (op 23 computed into this GEMV's staging — see gemv_nrn_lds):
+ *   t1=a(resid in) t3=resid_out t4=b t6=gamma_b t7=gamma_n · f0=eps f1=scale ·
+ *   i3 bit0 = fold, bit1 = this packet stores the residual (ONE of the q/k/v trio).
+ * Absence TRAPS: `default:` writes nothing, so a fold packet missing an operand would stage an
+ * un-normed row and decode fluent garbage — the exact failure the serve gate exists to catch. */
 __device__ __forceinline__ void exec_gemv_fp8(CInst in, CTens T, unsigned slice, unsigned nblk,
                                              bf16* lds) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    if (in->i[3] != 0u) {
+        if (!TEN(1) || !TEN(3) || !TEN(4) || !TEN(6) || !TEN(7)) __builtin_trap();
+        d_gemv_fp8_nrn((bf16*)TEN(0), (bf16*)TEN(3), (const bf16*)TEN(1), (const bf16*)TEN(4),
+                       (const bf16*)TEN(6), (const bf16*)TEN(7), (const unsigned char*)TEN(2),
+                       (const float*)TEN(5), in->i[0], in->i[1], in->i[2], in->fj[0].f,
+                       in->fj[1].f, in->i[3] & 2u, slice, nblk, lds);
+        return;
+    }
     d_gemv_fp8((bf16*)TEN(0), (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                (const unsigned char*)TEN(2), (const float*)TEN(5), in->i[0], in->i[1], in->i[2],
                slice, nblk, lds);
@@ -801,13 +966,58 @@ __device__ __forceinline__ void exec_gemv_fp8(CInst in, CTens T, unsigned slice,
  * `case PLOW_DOP_GEMV_FP8_BLK`; the two were kept apart by complementary #if PLOW_FP8 guards.
  * Op 44 is a BLOCK-fp8 arm — a weight encoding independent of the per-channel fp8 this flag
  * names — so the case is now unconditional and there is one body, not two.) */
-/* t0=fu t1=x t2=Wg(fp8) t5=Wu(fp8) t3=gate_scale t4=up_scale   i0=M i1=N i2=K i5=act */
+/* FUSED q|k|v fp8 DECODE GEMV — op 22's fp8 twin, and op 30's own body with Nk=Nv=0.
+ *
+ * The three f32 dequant-scale rows are TENSOR HANDLES in i5/i6/i7 (ten pointers do not fit t[8];
+ * dev_isa.h PLOW_DOP_GEMV_QKV_FP8 states why the demoted operands are scales and not outputs).
+ *
+ * NO SILENT FALLBACK, exactly as exec_gemv_qkv_mxfp4: this dispatch's `default:` is a NOP, so a
+ * malformed packet quietly running a narrower sweep would leave an output exactly as it found it
+ * — finite, fluent and wrong. Nq/Nk and their operands are REQUIRED; Nv==0 is the legal
+ * two-stream form and then t5/t6/i7 must ALL be absent. Anything else traps. */
+__device__ __forceinline__ void exec_gemv_qkv_fp8(CInst in, CTens T, unsigned slice, unsigned nblk,
+                                                  bf16* lds) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+#define IEN(k) (in->i[k] == PLOW_TENSOR_NONE ? nullptr : T[in->i[k]])
+    const float* Sq = (const float*)IEN(5);
+    const float* Sk = (const float*)IEN(6);
+    const float* Sv = (const float*)IEN(7);
+    const bool q_ok = in->i[1] != 0u && TEN(0) && TEN(2) && Sq;
+    const bool k_ok = in->i[3] != 0u && TEN(3) && TEN(4) && Sk;
+    const bool v_on = TEN(5) || TEN(6) || Sv || in->i[4] != 0u;
+    const bool v_ok = v_on ? (in->i[4] != 0u && TEN(5) && TEN(6) && Sv) : true;
+    if (!q_ok || !k_ok || !v_ok) __builtin_trap();
+    d_gemv_qkv_fp8((bf16*)TEN(0), (bf16*)TEN(3), (bf16*)TEN(5), (const bf16*)TEN(1),
+                   (const unsigned char*)TEN(2), (const unsigned char*)TEN(4),
+                   (const unsigned char*)TEN(6), Sq, Sk, Sv, in->i[0], in->i[1], in->i[3],
+                   in->i[4], in->i[2], slice, nblk, lds);
+#undef IEN
+#undef TEN
+}
+/* t0=fu t1=x t2=Wg(fp8) t5=Wu(fp8) t3=gate_scale t4=up_scale   i0=M i1=N i2=K i5=act
+ *
+ * fj[2].u != 0 is the NRN1 FOLD (the post-attention NormResidualNorm computed into this GEMV's
+ * staging): t1 becomes `a` (the residual), and i3/i4/i6/i7 carry the resid_out/b/gamma_b/gamma_n
+ * TENSOR HANDLES (op 114's demotion); f0=eps f1=layer_scale. Absence TRAPS — a fold packet
+ * missing an operand would stage an un-normed row and decode fluent garbage. */
 __device__ __forceinline__ void exec_gemv_glu_fp8(CInst in, CTens T, unsigned slice, unsigned nblk,
                                                  bf16* lds) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
-    d_gemv_glu_fp8((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
-                   (const unsigned char*)TEN(5), (const float*)TEN(3), (const float*)TEN(4),
-                   in->i[0], in->i[1], in->i[2], in->i[5], slice, nblk, lds);
+#define IEN(k) (in->i[k] == PLOW_TENSOR_NONE ? nullptr : T[in->i[k]])
+    const unsigned nrn = in->fj[2].u;
+    if (nrn != 0u) {
+        if (!TEN(1) || !IEN(3) || !IEN(4) || !IEN(6) || !IEN(7)) __builtin_trap();
+        d_gemv_glu_fp8_nrn((bf16*)TEN(0), (bf16*)IEN(3), (const bf16*)TEN(1), (const bf16*)IEN(4),
+                           (const bf16*)IEN(6), (const bf16*)IEN(7), (const unsigned char*)TEN(2),
+                           (const unsigned char*)TEN(5), (const float*)TEN(3),
+                           (const float*)TEN(4), in->i[0], in->i[1], in->i[2], in->i[5],
+                           in->fj[0].f, in->fj[1].f, slice, nblk, lds);
+    } else {
+        d_gemv_glu_fp8((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
+                       (const unsigned char*)TEN(5), (const float*)TEN(3), (const float*)TEN(4),
+                       in->i[0], in->i[1], in->i[2], in->i[5], slice, nblk, lds);
+    }
+#undef IEN
 #undef TEN
 }
 
@@ -1560,6 +1770,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         case PLOW_DOP_GEMV_GLU_FP8:
             exec_gemv_glu_fp8(in, T, slice, nblk, sm->gm);
             break;
+        /* FUSED Q|K|V, per-channel fp8 — op 22's twin, sharing op 30's body (that one is this with
+         * Nk=Nv=0). The three f32 scale rows are handles in i5/i6/i7; the arm TRAPS on a malformed
+         * packet rather than running a narrower sweep, because `default:` here writes nothing. */
+        case PLOW_DOP_GEMV_QKV_FP8:
+            exec_gemv_qkv_fp8(in, T, slice, nblk, sm->gm);
+            break;
 #endif
 #if PLOW_MXFP4
         case PLOW_DOP_GEMV_MXFP4:
@@ -1630,15 +1846,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * is still in this object, so the swap buys no register headroom for MLA — it buys the
          * halved KV, which is the point. */
         case PLOW_DOP_FLASH_MLA_DECODE_FP8:
-            exec_flash_mla_decode_fp8(in, T, slice, nblk, sm->fmla);
+            exec_flash_mla_decode_fp8(in, T, slice, nblk, PLOW_FMLA(sm));
             break;
         case PLOW_DOP_FLASH_GATHER_DECODE:
-            exec_flash_mla_decode(in, T, slice, nblk, sm->fmla);
+            exec_flash_mla_decode(in, T, slice, nblk, PLOW_FMLA(sm));
             break;
 #else
         case PLOW_DOP_FLASH_MLA_DECODE:
         case PLOW_DOP_FLASH_GATHER_DECODE:
-            exec_flash_mla_decode(in, T, slice, nblk, sm->fmla);
+            exec_flash_mla_decode(in, T, slice, nblk, PLOW_FMLA(sm));
             break;
 #endif
         case PLOW_DOP_O_UV_FOLD:
@@ -1768,6 +1984,114 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             d_moe_combine((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                           (const float*)TEN(3), in->i[0], in->i[1], slice, nblk);
             break;
+#if PLOW_MOE_GEMMA
+        /* ===== Gemma-4 26B-A4B sparse-MoE DECODE (ops 61-72). [GEMMA4-MOE-AMD] =====
+         *
+         * THESE ARE NOT THE GENERIC MoE ARMS ABOVE, and the difference is the ROUTER: Gemma's
+         * carries a weightless-RMS scalar, a per-channel `scale[H]`, a `root` exponent and a
+         * PER-EXPERT gate scale (`pes`), against `d_moe_router`'s pre-normalised x and single
+         * `route_scale`. Its expert table is TWO ULLs per expert with gate and up FUSED, not
+         * three with them separate. Routing a Gemma packet through the generic arms compiles and
+         * computes a different model — see the family header in op_moe.h.
+         *
+         * BATCH B > 1: the row count rides a spare immediate, 0 and 1 both meaning one row, so a
+         * B=1 packet is byte-identical to a pre-batch one. Every op's per-row body is the B=1
+         * body, so a batched row is bit-identical to its own single-row result. */
+#define PLOW_NROW(v) ((v) ? (v) : 1u)
+        /* t0=table t1=resid t2=proj t3=scale t4=pes; i0=H i1=n_exp i2=k i3=B; f0=root f1=eps */
+        case PLOW_DOP_MOE_ROUTER_GEMMA:
+            d_moe_router_gemma((unsigned char*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                               (const bf16*)TEN(3), (const bf16*)TEN(4), in->i[0], in->i[1],
+                               in->i[2], in->fj[0].f, in->fj[1].f, slice, nblk,
+                               PLOW_NROW(in->i[3]), (float*)sm->raw);
+            break;
+        /* t0=score(f32[B,E]) t1=resid t2=proj t3=scale; i0=H i1=n_exp i2=B; f0=root f1=eps */
+        case PLOW_DOP_MOE_ROUTER_GEMMA_SCORE:
+            d_moe_router_gemma_score((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                     (const bf16*)TEN(3), in->i[0], in->i[1], in->fj[0].f,
+                                     in->fj[1].f, slice, nblk, PLOW_NROW(in->i[2]),
+                                     (float*)sm->raw);
+            break;
+        case PLOW_DOP_MOE_ROUTER_GEMMA_SCORE_FAST:
+            d_moe_router_gemma_score_fast((float*)TEN(0), (const bf16*)TEN(1),
+                                          (const bf16*)TEN(2), (const bf16*)TEN(3), in->i[0],
+                                          in->i[1], in->fj[0].f, in->fj[1].f, slice, nblk,
+                                          PLOW_NROW(in->i[2]), (float*)sm->raw);
+            break;
+        /* t0=table t1=score t2=pes; i1=n_exp i2=k i3=B */
+        case PLOW_DOP_MOE_ROUTER_GEMMA_TOPK:
+            d_moe_router_gemma_topk((unsigned char*)TEN(0), (const float*)TEN(1),
+                                    (const bf16*)TEN(2), in->i[1], in->i[2], slice, nblk,
+                                    PLOW_NROW(in->i[3]), (float*)sm->raw);
+            break;
+        /* t0=fu t1=x t2=table t3=ewt; i0=k i1=I_moe i2=H i3=n_exp i4=slot_off i5=B.
+         * i4 shifts fu/table by whole SLOTS — the split-expert emission gives each packet its
+         * own slice of the k slots; it is 0 on the fused emission. */
+        case PLOW_DOP_MOE_EXPERT_GLU_GEMMA:
+            d_moe_expert_glu_gemma((bf16*)TEN(0) + (size_t)in->i[4] * in->i[1],
+                                   (const bf16*)TEN(1),
+                                   (const unsigned char*)TEN(2) + (size_t)in->i[4] * 8u,
+                                   (const unsigned long long*)TEN(3), in->i[0], in->i[1],
+                                   in->i[2], in->i[3], slice, nblk, PLOW_NROW(in->i[5]));
+            break;
+        /* t0=part t1=fu t2=table t3=ewt; i0=k i1=H i2=I_moe i3=n_exp i4=slot_off i5=B */
+        case PLOW_DOP_MOE_EXPERT_DOWN_GEMMA:
+            d_moe_expert_down_gemma((float*)TEN(0) + (size_t)in->i[4] * in->i[1],
+                                    (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                                    (const unsigned char*)TEN(2) + (size_t)in->i[4] * 8u,
+                                    (const unsigned long long*)TEN(3), in->i[0], in->i[1],
+                                    in->i[2], in->i[3], slice, nblk, PLOW_NROW(in->i[5]));
+            break;
+        /* t0=moe t1=part; i0=H i1=k */
+        case PLOW_DOP_MOE_COMBINE_GEMMA:
+            d_moe_combine_gemma((bf16*)TEN(0), (const float*)TEN(1), in->i[0], in->i[1], slice,
+                                nblk);
+            break;
+        /* t0=out t1=part t2=resid t3=gamma; i0=H i1=k i2=B; f0=eps */
+        case PLOW_DOP_MOE_COMBINE_NORM_GEMMA:
+            d_moe_combine_norm_gemma((bf16*)TEN(0), (const float*)TEN(1), (const bf16*)TEN(2),
+                                     (const bf16*)TEN(3), in->i[0], in->i[1], in->fj[0].f, slice,
+                                     nblk, PLOW_NROW(in->i[2]), (float*)sm->raw);
+            break;
+        /* t0=hn t1=x(in/out) t2=part t3=h1 t4=g_pf2 t5=g_po t6=gn; i0=H i1=k; f0=eps f1=ls */
+        case PLOW_DOP_MOE_COMBINE_RESID_NORM_GEMMA:
+            d_moe_combine_resid_norm_gemma((bf16*)TEN(0), (bf16*)TEN(1), (const float*)TEN(2),
+                                           (const bf16*)TEN(3), (const bf16*)TEN(4),
+                                           (const bf16*)TEN(5), (const bf16*)TEN(6), in->i[0],
+                                           in->i[1], in->fj[0].f, in->fj[1].f, slice,
+                                           (float*)sm->raw);
+            break;
+        /* t0=fu t1=resid t2=table t3=ewt t4=gamma; i0=k i1=I i2=H i3=n_exp i5=B; f0=eps */
+        case PLOW_DOP_MOE_EXPERT_GLU_NORM_GEMMA:
+            d_moe_expert_glu_norm_gemma((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(4),
+                                        (const unsigned char*)TEN(2),
+                                        (const unsigned long long*)TEN(3), in->i[0], in->i[1],
+                                        in->i[2], in->i[3], in->fj[0].f, slice, nblk,
+                                        PLOW_NROW(in->i[5]), sm->raw);
+            break;
+#if PLOW_FP8
+        /* Per-output-channel e4m3 experts. t4=est ({gate_up scales [2I], down scales [H]} per
+         * expert). PLOW_FP8 because that is the WEIGHT-encoding axis these belong to; the bf16
+         * arms above stay compiled in alongside them, additively, as everywhere else here. */
+        case PLOW_DOP_MOE_EXPERT_GLU_GEMMA_FP8:
+            d_moe_expert_glu_gemma_fp8((bf16*)TEN(0) + (size_t)in->i[4] * in->i[1],
+                                       (const bf16*)TEN(1),
+                                       (const unsigned char*)TEN(2) + (size_t)in->i[4] * 8u,
+                                       (const unsigned long long*)TEN(3),
+                                       (const unsigned long long*)TEN(4), in->i[0], in->i[1],
+                                       in->i[2], in->i[3], slice, nblk, PLOW_NROW(in->i[5]));
+            break;
+        case PLOW_DOP_MOE_EXPERT_DOWN_GEMMA_FP8:
+            d_moe_expert_down_gemma_fp8((float*)TEN(0) + (size_t)in->i[4] * in->i[1],
+                                        (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                                        (const unsigned char*)TEN(2) + (size_t)in->i[4] * 8u,
+                                        (const unsigned long long*)TEN(3),
+                                        (const unsigned long long*)TEN(4), in->i[0], in->i[1],
+                                        in->i[2], in->i[3], slice, nblk, PLOW_NROW(in->i[5]));
+            break;
+#endif /* PLOW_FP8 */
+#undef PLOW_NROW
+#endif /* PLOW_MOE_GEMMA */
         /* GLM dense layers (0-2): block-fp8 SwiGLU gate/up (op 47) + block-fp8 dense DOWN (op 44).
          * These live in the UNCONDITIONAL MoE region (like the expert ops 45/46) so the GLM decode
          * object dispatches them without the PLOW_FP8 object. There USED to be a second, identical
@@ -1855,6 +2179,76 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              (const float*)TEN(3), in->i[0], in->i[1], in->i[2], slice, nblk);
             break;
 #endif
+#if PLOW_MOE_GEMMA_PF
+        /* ===== Gemma-4 26B-A4B grouped-MoE PREFILL (ops 73-77, 81/82). [GEMMA4-MOE-AMD] =====
+         *
+         * OUTSIDE the bucket block, for the reason the PLOW_MOE_PREFILL family above is: a
+         * BATCHED DECODE runs the grouped chain too (grouping by expert is what makes an
+         * expert's weights cross HBM once per row that chose it), and that object defines the
+         * MoE axis without PLOW_BUCKET_PREFILL. Nesting these inside the bucket would leave
+         * every MoE layer falling through `default:` and writing NOTHING — silently.
+         *
+         * Its OWN flag, not PLOW_MOE_PREFILL's: this is a second full MFMA body, Gemma's fused
+         * gate_up table is a different indexing rule from the three-pointer one ops 85/86 use,
+         * and a Kimi/GLM prefill object must not carry a Gemma GEMM it can never reach. */
+        /* t0=table t1=resid([T,H]) t2=proj t3=scale t4=pes; i0=H i1=n_exp i2=k i3=T;
+         * f0=root f1=eps. Block-per-token loop of the decode router — bit-identical per token. */
+        case PLOW_DOP_MOE_ROUTER_GEMMA_PF:
+            d_moe_router_gemma_pf((unsigned char*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                  (const bf16*)TEN(3), (const bf16*)TEN(4), in->i[0], in->i[1],
+                                  in->i[2], in->i[3], in->fj[0].f, in->fj[1].f, slice, nblk,
+                                  (float*)sm->raw);
+            break;
+        /* t0=meta t1=table t2=row_token t3=row_partidx t4=row_gate; i0=T i1=n_exp i2=k.
+         *
+         * THE SAME BODY as op 84, deliberately. Histogram, MPF_BM-padded prefix, meta layout and
+         * (token, part-row, gate) scatter are identical between the two families — the Gemma
+         * routing table has the same 8-byte {u32 id, f32 gate} slot layout as every other one in
+         * this file. Sharing it is what keeps the pad convention, and therefore both grouped
+         * GEMMs' tile arithmetic, provably consistent instead of consistent by inspection. */
+        case PLOW_DOP_MOE_ALIGN_GEMMA_PF:
+            d_moe_align_pf((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
+                           (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2], slice,
+                           (unsigned*)sm->raw);
+            break;
+        /* t0=fu_g t1=xn2([T,H]) t2=ewt t3=meta t4=row_token; i0=I_moe(N) i1=H(K) i2=n_exp i5=act */
+        case PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF:
+            d_moe_group_glu_gemma_pf((bf16*)TEN(0), (const bf16*)TEN(1),
+                                     (const unsigned long long*)TEN(2), (const int*)TEN(3),
+                                     (const unsigned*)TEN(4), in->i[0], in->i[1], in->i[2],
+                                     in->i[5], slice, nblk, sm->raw);
+            break;
+        /* t0=part t1=fu_g t2=ewt t3=meta t4=row_partidx t5=row_gate; i0=H(N) i1=I_moe(K) i2=n_exp */
+        case PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF:
+            d_moe_group_down_gemma_pf((float*)TEN(0), (const bf16*)TEN(1),
+                                      (const unsigned long long*)TEN(2), (const int*)TEN(3),
+                                      (const unsigned*)TEN(4), (const float*)TEN(5), in->i[0],
+                                      in->i[1], in->i[2], slice, nblk, sm->raw);
+            break;
+        /* t0=out t1=part([T,k,H]) t2=h1 t3=gamma; i0=H i1=k i2=T; f0=eps */
+        case PLOW_DOP_MOE_COMBINE_NORM_GEMMA_PF:
+            d_moe_combine_norm_gemma_pf((bf16*)TEN(0), (const float*)TEN(1), (const bf16*)TEN(2),
+                                        (const bf16*)TEN(3), in->i[0], in->i[1], in->i[2],
+                                        in->fj[0].f, slice, nblk, (float*)sm->raw);
+            break;
+#if PLOW_FP8
+        /* w8a8 twins. GLU t5=ascale(f32[T]) t6=est; DOWN t6=est t7=fscale(f32[padded rows]). */
+        case PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF_W8A8:
+            d_moe_group_glu_gemma_pf_w8a8((bf16*)TEN(0), (const unsigned char*)TEN(1),
+                                          (const float*)TEN(5), (const unsigned long long*)TEN(2),
+                                          (const unsigned long long*)TEN(6), (const int*)TEN(3),
+                                          (const unsigned*)TEN(4), in->i[0], in->i[1], in->i[2],
+                                          in->i[5], slice, nblk, sm->raw);
+            break;
+        case PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF_W8A8:
+            d_moe_group_down_gemma_pf_w8a8((float*)TEN(0), (const unsigned char*)TEN(1),
+                                           (const float*)TEN(7), (const unsigned long long*)TEN(2),
+                                           (const unsigned long long*)TEN(6), (const int*)TEN(3),
+                                           (const unsigned*)TEN(4), (const float*)TEN(5), in->i[0],
+                                           in->i[1], in->i[2], slice, nblk, sm->raw);
+            break;
+#endif /* PLOW_FP8 */
+#endif /* PLOW_MOE_GEMMA_PF */
         default: /* PLOW_DOP_NOP */
             break;
     }
@@ -2045,10 +2439,36 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
  * So an object that cannot support the hierarchy compiles WITHOUT it and behaves exactly as
  * before. That is safe rather than merely convenient: `hier_base` is only non-zero on an
  * L2-placed blob, and an object built without the hierarchy simply never reads it. */
-#if PLOW_GATE_HIER && (!defined(PLOW_L2_PLACE_DISPATCH) || !PLOW_GLOBAL_QUEUE)
-#undef PLOW_GATE_HIER
-#define PLOW_GATE_HIER 0
-#endif
+/* DECOUPLED FROM L2 PLACEMENT, and the coupling was the bug.
+ *
+ * This used to read `#if PLOW_GATE_HIER && (!defined(PLOW_L2_PLACE_DISPATCH) || !PLOW_GLOBAL_QUEUE)`
+ * and silently `#undef` itself otherwise -- so the hierarchy could only exist on an L2-placed
+ * global-queue object, and asking for it anywhere else compiled it out with no diagnostic. That
+ * made it untestable on its own, and it hid that the two features are unrelated:
+ *
+ *   L2 PLACEMENT improves LOCALITY. Measured on Gemma-4-31B decode, MI355X: NO EFFECT, 16.57 vs
+ *   16.54 ms/token -- and the arithmetic says it cannot be otherwise, since decode streams
+ *   61.4 GB of weights per token against ~7 MB of activations, so perfect L2 capture addresses
+ *   ~0.01% of the traffic (docs/flags-reference.md).
+ *
+ *   THE HIERARCHY reduces INVALIDATE TRAFFIC, which is a different quantity entirely. An
+ *   agent-scope acquire lowers to `buffer_inv sc1` -- a full XCD-L2 invalidate -- on gfx942 and
+ *   gfx950 alike, and that instruction SERIALISES across concurrent issuers. Measured on MI300X:
+ *
+ *      1-16 workgroups invalidating     ~1.0 us
+ *      38                                2.6 us
+ *      76                                5.2 us
+ *      152                               9.9 us
+ *      304 (the real decode grid)       19.7 us
+ *
+ *   against 0.037 us for the bare `buffer_inv` (L1 only) a follower would run. Electing one
+ *   leader per XCD takes 304 issuers down to 8, i.e. 19.7 us -> ~1.05 us, an 18.8x cut in the
+ *   maintenance half of every gated packet boundary. On a 304-CU part that is worth MORE than on
+ *   MI355X's 256, not less.
+ *
+ * All the hierarchy ever needed was a domain index, and HW_REG_XCC_ID gives one on every path --
+ * the leader election below already reads it. So the precondition is now just `l2_domains != 0`,
+ * which the host sets, and the static per-CU path can carry it. */
 
 /* The two knobs do not compose, and combined they are silently worse than either. The HIER_CEIL
  * follower hand-rolls its relaxed RMW rather than calling `ctr_signal`, so under SC1 it would
@@ -2212,29 +2632,65 @@ __device__ __forceinline__ void ctr_signal(uint32_t* p) {
  * itself at 256 total and spills instead of reaching for AGPRs. */
 /* Distinct symbol per bucket: the runtime loads BOTH code objects into one HSA executable,
  * and two objects cannot export the same name. */
+/* The exported symbol carries the ISA NAME, because the loader builds it from the live HSA
+ * agent name -- crates/plowrt/src/exec/amd.rs:446 formats "{base}_{arch}{sched}" and
+ * device/hsa.rs:1222 supplies `arch` verbatim from HSA_AGENT_INFO_NAME. On an MI300X that is
+ * literally "gfx942", so an object exporting plow_interp_dec_gfx950 would load and then fail
+ * symbol resolution. The build passes -DPLOW_ARCH_SUFFIX=<arch>; the default keeps an
+ * unqualified build byte-identical to what it was. */
+#ifndef PLOW_ARCH_SUFFIX
+#define PLOW_ARCH_SUFFIX gfx950
+#endif
+#define PLOW_GQ_CAT2(a, b) a##b
+#define PLOW_GQ_CAT(a, b) PLOW_GQ_CAT2(a, b)
 #if PLOW_BUCKET_DECODE
-#define PLOW_INTERP_BASE plow_interp_dec_gfx950
+#define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_dec_, PLOW_ARCH_SUFFIX)
 #elif defined(PLOW_BUCKET_FLASH)
 /* Segmented-dispatch flash object: prefill op set, but built at 4 waves / FA_DC=256 so the flash
  * segments get the 512-register budget. Distinct symbol; one HSA executable holds all three. */
-#define PLOW_INTERP_BASE plow_interp_flash_gfx950
+#define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_flash_, PLOW_ARCH_SUFFIX)
 #else
-#define PLOW_INTERP_BASE plow_interp_gfx950
+#define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_, PLOW_ARCH_SUFFIX)
 #endif
 /* Global-queue objects export a distinct _gq symbol so the static and GQ kernels co-load. */
 #if PLOW_GLOBAL_QUEUE
-#define PLOW_GQ_CAT2(a, b) a##b
-#define PLOW_GQ_CAT(a, b) PLOW_GQ_CAT2(a, b)
 #define PLOW_INTERP_NAME PLOW_GQ_CAT(PLOW_INTERP_BASE, _gq)
 #else
 #define PLOW_INTERP_NAME PLOW_INTERP_BASE
 #endif
 
-extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
-__attribute__((amdgpu_waves_per_eu(PLOW_WAVES / 4, PLOW_WAVES / 4))) void PLOW_INTERP_NAME(PlowProgram prog) {
+/* PLOW_WPE overrides the requested waves/EU. The default (PLOW_WAVES/4 = 2 at 8 waves) is the
+ * 256-register budget every note in this tree is written against. It is also what pins the DECODE
+ * GEMV -- 75% of a token's wall time -- to 2 waves per SIMD, because the megakernel's register
+ * allocation is the UNION OF EVERY OP and the GEMV pays for arms it never runs. With only two
+ * waves on a SIMD there is nothing to cover an s_waitcnt when a wave has 1.6 output rows of work.
+ * Raising this forces the allocator under 128 VGPRs; it will spill, and whether the extra
+ * latency hiding outruns the spill is the measurement. */
+#ifndef PLOW_WPE
+#define PLOW_WPE (PLOW_WAVES / 4)
+#endif
+/* BOTH, and the launch_bounds is the one that binds. Setting only the attribute leaves
+ * __launch_bounds__(PLOW_THREADS, PLOW_WAVES/4) asking for 2 waves/EU, which PERMITS the
+ * allocator 256 registers -- and it spends them: 253, measured, whatever the LDS allows.
+ * Measured on the GEMV loop alone: the same code is 141 VGPR when occupancy 2 is permitted and
+ * 51 when it is not. The registers are not needed, they are merely allowed. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WPE)
+__attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(PlowProgram prog) {
     __shared__ plow_smem sm;
 
     const unsigned cu = blockIdx.x;
+    /* The XCD this workgroup is PHYSICALLY on. Read, not derived from blockIdx -- the round-robin
+     * map is measured (100.0% on both MI300X and MI355X) but reading the register means the
+     * hierarchy cannot silently depend on it continuing to hold. Available on every path.
+     *
+     * Behind the #if because s_getreg is NOT dead-code-eliminated when the hierarchy is off:
+     * leaving it unconditional put one extra instruction into every object, including gfx950's,
+     * and cost the byte-identity that makes "this change did not touch CDNA4" checkable rather
+     * than merely asserted. */
+#if PLOW_GATE_HIER
+    const unsigned plow_xcd =
+        __builtin_amdgcn_s_getreg((20 /*HW_REG_XCC_ID*/) | (0 << 6) | ((32 - 1) << 11)) & 0xf;
+#endif
     const bool maint_leader = ctr_maint_leader_init();
 #if PLOW_GLOBAL_QUEUE
     /* One shared cursor over the op-major gq_stream, bounded to this segment's window. base==0
@@ -2292,8 +2748,24 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WAVES / 4, PLOW_WAVES / 4))) void PLOW_I
      * original scan-and-filter loop, so a host that does not build the table is unaffected. */
     const uint32_t* const srow =
         prog.seg_ofs ? prog.seg_ofs + (size_t)cu * (size_t)(prog.n_seg + 1u) : nullptr;
-    const unsigned lo = srow ? srow[prog.cur_seg] : 0u;
-    const unsigned hi = srow ? srow[prog.cur_seg + 1u] : n;
+    /* L2-PLACED program on the STATIC path: `seg` is the L2 DOMAIN (see the GQ branch above),
+     * and every entry in THIS CU's stream carries domain_of(cu) — the emitter's fixed
+     * slice->CU assignment already IS the placement. Selecting the window with the host's
+     * `cur_seg` (a wave-class notion, 0 for decode) empties the stream of every CU whose
+     * domain != 0, their slices never run, and every other CU spins on their counters: the
+     * PLOW_STATIC_DECODE=1-on-placed-blob DEADLOCK. The window must be the CU's own domain.
+     * LOGICAL cu, not HW_REG_XCC_ID: the assignment was fixed at emit time from the logical
+     * index, so the filter must match what the emitter wrote (locality then rides the same
+     * measured round-robin map the emitter assumed). */
+    const unsigned st_seg =
+#if PLOW_L2_PLACE_DISPATCH
+        /* Behind the axis so an object built without it (gfx950) keeps byte-identical
+         * codegen — the host refuses placed blobs on those objects anyway. */
+        prog.l2_domains ? (cu % prog.l2_domains) :
+#endif
+        prog.cur_seg;
+    const unsigned lo = srow ? srow[st_seg] : 0u;
+    const unsigned hi = srow ? srow[st_seg + 1u] : n;
 #endif
 
     /* Everything the interpreter reads and never writes, in the constant address space. */
@@ -2345,7 +2817,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WAVES / 4, PLOW_WAVES / 4))) void PLOW_I
              * selects the segment: a skipped entry costs a branch and nothing else — no gate,
              * no exec, no signal — and it is executed by the segment launch that owns it.
              * Unsegmented programs set every seg==0 and launch with cur_seg==0. */
-            if (!srow && e.seg != prog.cur_seg) continue;
+            if (!srow && e.seg != st_seg) continue;
             const CInst in = insts + e.inst;
 #endif
 
@@ -2383,7 +2855,8 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WAVES / 4, PLOW_WAVES / 4))) void PLOW_I
         const unsigned h_n = PLOW_SE_NPER(e.flags);
         const bool h_on = (prog.hier_base != 0u) && (h_n > 1u) && !xctr;
         const size_t h_b = h_on ? (size_t)prog.hier_base
-                                      + ((size_t)e.inst * prog.l2_domains + my_seg) * 3u
+                                      + ((size_t)e.inst * prog.l2_domains
+                                         + (plow_xcd % prog.l2_domains)) * 3u
                                 : 0u;
         __shared__ unsigned h_lead;
         if (h_on) {
@@ -2414,6 +2887,23 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WAVES / 4, PLOW_WAVES / 4))) void PLOW_I
         /* Under PLOW_GATE_HIER a FOLLOWER never polls the global counter at all — its XCD's
          * leader does, and releases it through the XCD-local `opn`. That is less fabric traffic,
          * not more: one cross-XCD poll per domain instead of one per workgroup. */
+        /* PROBE (PLOW_INST_PF): pull the 64-byte PlowDevInst into SGPRs BEFORE the gate poll, so
+         * its scalar-cache miss overlaps the counter wait instead of following it. The gate
+         * metadata lives on the STREAM ENTRY (e.wait_*), so nothing here depends on the
+         * instruction -- the dependency is only that every `in->` read sits after the poll in
+         * program order. NOTE `insts` is address_space(4) (constant), i.e. s_load through the
+         * scalar cache, which LLVM already hoists aggressively -- so this may well be a no-op.
+         * Measured either way rather than assumed. MUST sit ABOVE the GATE_HIER leader guard:
+         * placed between the guard and the poll loop it HIJACKS the `if`, and every follower
+         * then polls the global counters unconditionally — the exact behavior the hierarchy
+         * exists to remove. */
+#if PLOW_INST_PF
+        {
+            const unsigned pf_ = (unsigned)in->op | ((unsigned)in->blocks << 16);
+            const unsigned pf2_ = in->i[0] ^ in->i[4];
+            asm volatile("" ::"s"(pf_), "s"(pf2_));
+        }
+#endif
 #if PLOW_GATE_HIER
         if (!h_on || h_lead)
 #endif

@@ -882,6 +882,15 @@ impl Backend for HsaBackend {
         ExecutorClass::CuAmd
     }
 
+    /// Explicitly the staged default: the gfx950 boxes this backend serves are
+    /// discrete cards whose SDMA reads host memory through pinned staging
+    /// (`HsaUploadRing`). An MI300A-class APU could answer `true` here once
+    /// the direct-from-mmap copy is measured on one — the loaders gate on
+    /// this method alone, so that is the only line to change.
+    fn coherent_host_dma(&self) -> bool {
+        false
+    }
+
     fn vendor(&self) -> Option<hwspec::Vendor> {
         Some(hwspec::Vendor::Amd)
     }

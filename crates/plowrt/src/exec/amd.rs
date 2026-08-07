@@ -132,7 +132,7 @@ use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::{HsaBackend, HsaKernel, HsaPinned};
 use crate::device::{DeviceMem, Module};
 use crate::exec::device_api::EngineDevice;
-use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps};
+use crate::memory::vmm::{VmmGeometry, VmmKv, VmmOps, WeightSlab};
 use crate::{Result, RuntimeError};
 
 /// `kv.{l}.k` / `kv.{l}.v` → `(layer, 0|1)`. Scales and every other `kv.*`
@@ -150,6 +150,31 @@ fn kv_tensor_name(name: &str) -> Option<(u32, u32)> {
 
 /// u32 slots per counter (`PLOW_CTR_STRIDE`), i.e. one 128 B cache line.
 const CTR_STRIDE_U32: usize = 32;
+
+/// DOUBLE-BUFFER the counter/cursor banks so the per-dispatch zeroing overlaps
+/// GPU execution instead of standing in front of it. `PLOW_CTR_DBUF=0` reverts
+/// to the single bank cleared synchronously before every launch.
+///
+/// The measured case for it, on this box (MI300X, Gemma-4-12B fp8, ctx 4096,
+/// `PLOW_DSTEP_LOG=1`): the synchronous `rearm` is **56 µs of the 11.69 ms
+/// token**, 0.48%, and it is 57% of the entire host phase (99 µs, 0.85%).
+/// It costs that much because the clear is two blocking
+/// `hsa_amd_memory_async_copy` round trips over `n_counter * 128 B`, and it
+/// sits between "host has staged this token" and "the GPU may start".
+///
+/// The alternative the review priced — a kernel prologue that self-clears —
+/// removes the same 56 µs from the host but ADDS ~2 µs to the GPU critical
+/// path and needs a kernel/ABI change. This needs neither: the copy still
+/// happens, it just happens while 304 CUs are busy, over the SDMA engine that
+/// the persistent megakernel does not contend for.
+fn ctr_dbuf() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("PLOW_CTR_DBUF")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
 
 /// `sizeof(PlowTraceRec)` (`runtime/common/dev_isa.h`, static-asserted at 40).
 /// One record per (workgroup, packet), slotted at `stream_ofs[cu] + pc`.
@@ -737,6 +762,7 @@ const GEMV_BUCKET_OPS: &[DevOp] = &[
     DevOp::GemvMxfp4,
     DevOp::GemvGluMxfp4,
     DevOp::GemvQkvMxfp4,
+    DevOp::GemvQkvFp8,
 ];
 
 /// The widest row count any GEMV-family instruction in `progs` asks for.
@@ -866,6 +892,88 @@ fn check_k3_arms(syms: &[&str], path: &Path, need: Option<DevOp>) -> Result<()> 
         op as u16,
         path.display()
     )))
+}
+
+/// The markers `runtime/amd/interp.hip` emits for the Gemma-4 MoE axes. [GEMMA4-MOE-AMD]
+///
+/// Two, not one, because the decode family (ops 61-72) and the grouped-prefill family (73-77,
+/// 81/82) are separate build flags: the prefill half is a second full MFMA body and a decode-only
+/// object must not carry it.
+const MOE_GEMMA_SYM: &str = "plow_moe_gemma_arms_1";
+/// Marker for L2-DOMAIN DISPATCH (-DPLOW_L2_PLACE_DISPATCH). A placed blob repurposes the
+/// global-queue `seg` as an L2 domain, so an object without this axis mis-dispatches it SILENTLY.
+/// Checked instead of the operator-asserted PLOW_L2_PLACE_DISPATCH env var.
+const L2_DISPATCH_SYM: &str = "plow_l2_place_dispatch_1";
+const MOE_GEMMA_PF_SYM: &str = "plow_moe_gemma_pf_arms_1";
+
+/// Every opcode behind `#if PLOW_MOE_GEMMA` in `runtime/amd/interp.hip`.
+const MOE_GEMMA_OPS: &[DevOp] = &[
+    DevOp::MoeRouterGemma,
+    DevOp::MoeRouterGemmaScore,
+    DevOp::MoeRouterGemmaScoreFast,
+    DevOp::MoeRouterGemmaTopk,
+    DevOp::MoeExpertGluGemma,
+    DevOp::MoeExpertGluNormGemma,
+    DevOp::MoeExpertDownGemma,
+    DevOp::MoeExpertGluGemmaFp8,
+    DevOp::MoeExpertDownGemmaFp8,
+    DevOp::MoeCombineGemma,
+    DevOp::MoeCombineNormGemma,
+    DevOp::MoeCombineResidNormGemma,
+];
+
+/// Every opcode behind `#if PLOW_MOE_GEMMA_PF`.
+const MOE_GEMMA_PF_OPS: &[DevOp] = &[
+    DevOp::MoeRouterGemmaPf,
+    DevOp::MoeAlignGemmaPf,
+    DevOp::MoeGroupGluGemmaPf,
+    DevOp::MoeGroupDownGemmaPf,
+    DevOp::MoeCombineNormGemmaPf,
+    DevOp::MoeGroupGluGemmaPfW8a8,
+    DevOp::MoeGroupDownGemmaPfW8a8,
+];
+
+fn first_op_in(progs: &[DevProg], set: &[DevOp]) -> Option<DevOp> {
+    progs
+        .iter()
+        .flat_map(|p| p.insts.iter())
+        .find_map(|i| set.iter().copied().find(|&o| o as u16 == i.op))
+}
+
+/// Refuse a code object with no Gemma-4 MoE arms against a packet that dispatches one.
+///
+/// SAME ARGUMENT AS `check_k3_arms`, and the same failure it prevents. These nineteen opcodes had
+/// no AMD arm at all until the port, so a Gemma-4 26B-A4B packet ran straight into the dispatch
+/// `default:` — which on AMD writes NOTHING rather than trapping. Every router, expert and combine
+/// would have left its buffer untouched and the model would have decoded fluently off whatever
+/// was in memory. Gating the arms behind a build axis re-opens exactly that hole unless the
+/// pairing is checked, so it is checked, against the ELF's `.symtab` rather than against a build
+/// flag: the object answers for itself and a stale `-D` cannot lie about it.
+fn check_moe_gemma_arms(
+    syms: &[&str],
+    path: &Path,
+    need_dec: Option<DevOp>,
+    need_pf: Option<DevOp>,
+) -> Result<()> {
+    for (need, sym, flag) in [
+        (need_dec, MOE_GEMMA_SYM, "PLOW_MOE_GEMMA"),
+        (need_pf, MOE_GEMMA_PF_SYM, "PLOW_MOE_GEMMA_PF"),
+    ] {
+        let Some(op) = need else { continue };
+        if syms.contains(&sym) {
+            continue;
+        }
+        return Err(RuntimeError::Device(format!(
+            "packet/object GEMMA-MoE MISMATCH: this packet dispatches {op:?} (op {}), but {} was \
+             compiled without {flag} (it does not advertise `{sym}`). AMD's dispatch default \
+             writes NOTHING rather than trapping, so this op would silently leave its output \
+             untouched and the run would complete on uninitialised memory instead of failing. \
+             Rebuild the object with -D{flag}=1.",
+            op as u16,
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// The marker `runtime/amd/interp.hip` emits when it was compiled with `PLOW_FP8_KV=1`.
@@ -2293,6 +2401,12 @@ struct AmdProg {
     l2_domains: u32,
     /// Base counter id of the two-level maintenance scratch; 0 = off. See `DevProgram::hier_base`.
     hier_base: u32,
+    /// Bytes in ONE counter bank — `n_counter * CTR_STRIDE_U32 * 4`, i.e. what
+    /// the old single-bank allocation was in total.
+    ctr_span: u64,
+    /// Which bank the NEXT dispatch of this program runs out of; 0 unless
+    /// [`ctr_dbuf`] is on. See [`AmdEngine::run`].
+    bank: Cell<u32>,
 }
 
 struct AmdGq {
@@ -2303,6 +2417,8 @@ struct AmdGq {
     /// shared cursor would be corrupted by the segment that ran first.
     d_cursor: DeviceMem,
     n_seg: u32,
+    /// Bytes in ONE cursor bank. The allocation holds `ctr_banks` of them.
+    cur_span: u64,
 }
 
 /// The AMD serving engine.
@@ -2347,10 +2463,13 @@ pub struct AmdEngine {
     /// Views never free, so this owner must outlive them; both live on this
     /// struct, and a view's `Drop` is a no-op, so field order cannot matter.
     ///
-    /// `None` when the single allocation was refused and the loader fell back to
-    /// per-tensor allocation — a fragmented card can decline one big block and
-    /// still satisfy many small ones.
-    _weight_slab: Option<DeviceMem>,
+    /// `PerTensor` when the single allocation was refused and the loader fell
+    /// back to per-tensor allocation — a fragmented card can decline one big
+    /// block and still satisfy many small ones. The `Vmm` arm (lazy commit
+    /// overlapped with the upload, as `exec::gpu`) is **opt-in** here
+    /// (`PLOW_WEIGHT_VMM=1`) until it is measured on AMD hardware — see
+    /// `asset::checkpoint::weight_vmm_amd_enabled`.
+    _weight_slab: WeightSlab,
     d_tens: DeviceMem,
     tensor_names: Vec<String>,
     /// Per-MoE-layer PACKED expert buffers (weights, then block scales). Never
@@ -2626,18 +2745,50 @@ impl AmdEngine {
         let t_rank = Instant::now();
         let raw = std::fs::read(blob_path)
             .map_err(|e| RuntimeError::Device(format!("read {}: {e}", blob_path.display())))?;
-        let blob = DevBlob::parse(&raw)?;
         let arch = EngineDevice::arch(&*be);
         let n_cu_dev = EngineDevice::sm_count(&*be);
+        // ACCEPT L2-DOMAIN PLACEMENT AND CHECK IT AT OBJECT LOAD, rather than making the operator
+        // assert it by env. scripts/build_gfx942.sh now ships -DPLOW_L2_PLACE_DISPATCH by default
+        // and plowc places gfx942 blobs by default, so the env gate had become a broken default:
+        // a stock build would emit a placed blob and then refuse to load it. The real guard is
+        // stronger than the env var ever was -- `plow_l2_place_dispatch_1` is checked against the
+        // OBJECT below, so a genuinely mismatched pairing is still refused, by inspection instead
+        // of by assertion. PLOW_L2_PLACE_DISPATCH=1 still works for anyone scripting it.
+        let blob = DevBlob::parse_l2(&raw, true)?;
+        // WHICH PHASE is L2-placed, not "is anything placed". `Builder::finish` skips placement
+        // per PROGRAM when that program is segmented, and AMD prefill always is -- so a normal
+        // gfx942 blob has a PLACED DECODE program and UNPLACED prefill ones. Requiring the
+        // dispatch axis on every object would then reject the stock build over its prefill
+        // objects, which correctly do not carry it (the axis is scoped to the decode rows because
+        // a set-wide define deadlocks -- see scripts/build_gfx942.sh). `t == 1` is the decode
+        // program; `t > 1` are the prefill buckets.
+        let decode_l2_placed = blob.progs.iter().any(|p| p.t == 1 && p.l2_domains > 0);
+        let prefill_l2_placed = blob.progs.iter().any(|p| p.t > 1 && p.l2_domains > 0);
 
         // The blob's n_cu is the grid the schedule was COMPILED for. A device
         // with a different CU count cannot run it: `stream_ofs`/`stream_len` are
         // [n_cu] and workgroup w reads slot w, so a smaller grid silently drops
         // every stream above it and a larger one reads past the table.
-        if blob.n_cu != n_cu_dev {
+        //
+        // PLOW_OVERSUB=1 (expert): accept an OVERSUBSCRIBED grid — blob.n_cu a
+        // multiple of the device's CU count — to co-locate several workgroups
+        // per CU so one workgroup's gate poll hides behind a sibling's body.
+        // The launch grid follows blob.n_cu, so this is only sound when the
+        // OBJECT's resource envelope actually fits that many co-resident
+        // workgroups (e.g. the occ4 profile at 2/CU: 104 VGPR, 30.7 KB LDS);
+        // the persistent kernel SPINS on counters, so a non-resident workgroup
+        // is not "slow", it is a DEADLOCK. No occupancy oracle is consulted
+        // here — that is why this is env-gated instead of a default. L2-domain
+        // placement must be OFF in the blob (the wg->domain map assumes
+        // grid == n_cu_dev).
+        let oversub_ok = blob.n_cu > n_cu_dev
+            && blob.n_cu % n_cu_dev == 0
+            && std::env::var("PLOW_OVERSUB").ok().as_deref() == Some("1");
+        if blob.n_cu != n_cu_dev && !oversub_ok {
             return Err(RuntimeError::Device(format!(
                 "blob compiled for n_cu={} but this device has {n_cu_dev} CUs — \
-                 recompile the packet with --n-cu {n_cu_dev}",
+                 recompile the packet with --n-cu {n_cu_dev} (or, for an oversubscribed \
+                 grid on a co-resident object, set PLOW_OVERSUB=1)",
                 blob.n_cu
             )));
         }
@@ -2764,6 +2915,11 @@ impl AmdEngine {
         // asked about the phase it actually serves rather than about the blob as a whole.
         let need_k3_decode = required_k3_op(&blob.progs[dec_ix..]);
         let need_k3_prefill = required_k3_op(&blob.progs[..dec_ix]);
+        // Gemma-4 MoE, both halves, per phase. Same silent-NOP argument as K3 above.
+        let need_gm_decode = first_op_in(&blob.progs[dec_ix..], MOE_GEMMA_OPS);
+        let need_gm_prefill = first_op_in(&blob.progs[..dec_ix], MOE_GEMMA_OPS);
+        let need_gmpf_decode = first_op_in(&blob.progs[dec_ix..], MOE_GEMMA_PF_OPS);
+        let need_gmpf_prefill = first_op_in(&blob.progs[..dec_ix], MOE_GEMMA_PF_OPS);
         // The KV-encoding SWAP, split per phase for the same reason: the decode object carries
         // FLASH_*_DECODE and the prefill object FLASH_*_PREFILL, so asking each about the blob as
         // a whole would refuse a decode object for a prefill opcode it never runs.
@@ -2843,6 +2999,29 @@ impl AmdEngine {
                 Phase::Prefill | Phase::Flash => need_k3_prefill,
             };
             check_k3_arms(&syms, &path, need_k3)?;
+            let (need_gm, need_gmpf) = match phase {
+                Phase::Decode => (need_gm_decode, need_gmpf_decode),
+                Phase::Prefill | Phase::Flash => (need_gm_prefill, need_gmpf_prefill),
+            };
+            check_moe_gemma_arms(&syms, &path, need_gm, need_gmpf)?;
+            // L2-PLACED BLOB vs OBJECT. This is the guard the PLOW_L2_PLACE_DISPATCH env var used
+            // to stand in for, moved to where it can be VERIFIED. A placed program's `seg` is an
+            // L2 domain, not a wave class, so an object built without the axis would run every
+            // packet on the wrong domain -- plausible output, inverted locality, no error.
+            let phase_l2_placed = match phase {
+                Phase::Decode => decode_l2_placed,
+                Phase::Prefill | Phase::Flash => prefill_l2_placed,
+            };
+            if phase_l2_placed && !syms.contains(&L2_DISPATCH_SYM) {
+                return Err(RuntimeError::Device(format!(
+                    "{}: blob uses L2-domain packet placement (PLOW_L2_PLACE) but this object was \
+                     built WITHOUT -DPLOW_L2_PLACE_DISPATCH — its `seg` would be read as a \
+                     wave class and every packet would land on the wrong domain. Rebuild the \
+                     objects (scripts/build_gfx942.sh passes it by default), or recompile the \
+                     model with PLOW_L2_PLACE=0.",
+                    path.display()
+                )));
+            }
             // Whether this object's KV ENCODING matches the packet's. Both directions — the axis
             // is a swap, so each object is missing an arm the other has.
             let (need_fp8, need_bf16) = match phase {
@@ -2950,7 +3129,12 @@ impl AmdEngine {
         let do_prefault = profile_faults();
         let depth = prefetch_depth();
         let prefetch = ckpt.as_ref().and_then(|c| {
-            crate::asset::checkpoint::Prefetcher::start(Arc::clone(c), prefetch_threads(), depth)
+            crate::asset::checkpoint::Prefetcher::start(
+                Arc::clone(c),
+                prefetch_threads(),
+                depth,
+                None,
+            )
         });
         // The pool runs `depth` WEIGHT tensors ahead of the copy, over the same
         // list in the same order, so `pf` only ever moves forward and each
@@ -3020,22 +3204,48 @@ impl AmdEngine {
             .map(|td| slab_pad(slab_need(td.bytes)))
             .sum();
         let t_slab = Instant::now();
-        let weight_slab = match slab_bytes {
-            _ if !crate::asset::checkpoint::weight_slab_enabled() => None,
-            0 => None,
-            n => match EngineDevice::alloc(&*be, n) {
-                Ok(m) => Some(m),
-                // Not fatal: the per-tensor arm below still works and is only
-                // slower and hungrier. Better a fat load than a refused one.
-                Err(e) => {
-                    tracing::warn!(
-                        bytes = n,
-                        error = %e,
-                        "single weight allocation refused — falling back to per-tensor alloc"
-                    );
-                    None
+        let weight_slab = if slab_bytes == 0 || !crate::asset::checkpoint::weight_slab_enabled() {
+            WeightSlab::PerTensor
+        } else {
+            // Opt-in (`PLOW_WEIGHT_VMM=1`): the lazy-commit slab is unmeasured
+            // on AMD hardware — see `weight_vmm_amd_enabled` for why the
+            // default differs from CUDA's. Every failure falls through to the
+            // flat allocation, which falls through to per-tensor.
+            let vmm_slab = if crate::asset::checkpoint::weight_vmm_amd_enabled() {
+                match crate::memory::vmm::VmmSlab::new(
+                    Arc::clone(&be) as Arc<dyn VmmOps>,
+                    slab_bytes,
+                    crate::memory::vmm::WEIGHT_SLAB_CHUNK,
+                ) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::warn!(
+                            bytes = slab_bytes,
+                            error = %e,
+                            "vmm weight slab refused — falling back to flat allocation"
+                        );
+                        None
+                    }
                 }
-            },
+            } else {
+                None
+            };
+            match vmm_slab {
+                Some(s) => WeightSlab::Vmm(s),
+                None => match EngineDevice::alloc(&*be, slab_bytes) {
+                    Ok(m) => WeightSlab::Flat(m),
+                    // Not fatal: the per-tensor arm below still works and is only
+                    // slower and hungrier. Better a fat load than a refused one.
+                    Err(e) => {
+                        tracing::warn!(
+                            bytes = slab_bytes,
+                            error = %e,
+                            "single weight allocation refused — falling back to per-tensor alloc"
+                        );
+                        WeightSlab::PerTensor
+                    }
+                },
+            }
         };
         LoadProf::add(&prof.alloc_ns, t_slab);
         let mut slab_off: u64 = 0;
@@ -3089,15 +3299,27 @@ impl AmdEngine {
                     n_view += 1;
                     DeviceMem::view(va, td.bytes.max(1))
                 }
+                // Carve from the VMM reservation, in blob order, waiting for
+                // the mapper to commit through this tensor's padded end BEFORE
+                // handing the view out — every write path (upload ring, shard
+                // gather, memset tail) starts after the carve, so this one
+                // wait point covers them all. The mapper outruns the upload,
+                // so the wait is ~0 after the first chunk.
+                (None, WeightSlab::Vmm(slab)) => {
+                    let m = DeviceMem::view(slab.base() + slab_off, slab_need(td.bytes));
+                    slab_off += slab_pad(slab_need(td.bytes));
+                    slab.wait_mapped(slab_off)?;
+                    m
+                }
                 // Carve from the one allocation, in blob order. The sizing pass
                 // walked this same list with the same filter and the same
                 // `slab_need`, so the cursor cannot run past the end.
-                (None, Some(slab)) => {
+                (None, WeightSlab::Flat(slab)) => {
                     let m = DeviceMem::view(slab.base + slab_off, slab_need(td.bytes));
                     slab_off += slab_pad(slab_need(td.bytes));
                     m
                 }
-                (None, None) => {
+                (None, WeightSlab::PerTensor) => {
                     let t = Instant::now();
                     let m = EngineDevice::alloc(&*be, td.bytes.max(1))?;
                     LoadProf::add(&prof.alloc_ns, t);
@@ -3250,13 +3472,23 @@ impl AmdEngine {
         // leaves copies in flight by design, so this is the line that makes
         // "uploaded" mean uploaded.
         ring.drain()?;
+        // Slab tail join: the carve-site waits covered every tensor that was
+        // carved, but writes AFTER this loop (`bind_packed_experts` fills the
+        // expert pointer tables in place) need the WHOLE span committed —
+        // VMM has no demand paging. ~0 in practice: the mapper finished while
+        // the upload ran.
+        if let WeightSlab::Vmm(slab) = &weight_slab {
+            let t = Instant::now();
+            slab.wait_mapped(slab_bytes)?;
+            LoadProf::add(&prof.alloc_ns, t);
+        }
         // The MoE half of the bind, and it has to be here: it needs the tensor
         // table (to find each layer's two pointer slots) and the staging ring
         // (which must outlive it — the C reference records that gathering a
         // row-parallel slice into a MALLOC'd buffer faults the SDMA engine,
         // because the copy does not pin its source).
         prof.report("named tensors", t_tensors.elapsed(), wbytes);
-        if weight_slab.is_some() {
+        if !matches!(weight_slab, WeightSlab::PerTensor) {
             // The sizing pass and the carve walked the same list with the same
             // filter, so the cursor must land exactly on the total: short wastes
             // the tail, long means two tensors were aliased onto the same bytes
@@ -3346,6 +3578,7 @@ impl AmdEngine {
         let max_ctx = t_pos.map_or(0, |t| (blob.tensors[t].bytes / 4) as usize);
 
         // --- per-program tables ---------------------------------------------
+        let ctr_banks: u64 = if ctr_dbuf() { 2 } else { 1 };
         let mut progs = Vec::with_capacity(blob.progs.len());
         for p in &blob.progs {
             let seg_class = derive_segments(p)?;
@@ -3364,10 +3597,27 @@ impl AmdEngine {
             let d_succs = up(as_bytes(&p.succs))?;
             // Counters are allocated, never uploaded — they are re-armed per
             // dispatch group.
-            let d_ctr = EngineDevice::alloc(
-                &*be,
-                (p.n_counter as usize * CTR_STRIDE_U32 * 4).max(1) as u64,
-            )?;
+            //
+            // TWO BANKS when `ctr_dbuf` is on, and then they ARE zeroed here:
+            // the double-buffered `run` clears the STALE bank after enqueueing,
+            // so the bank a dispatch actually reads was cleared one dispatch
+            // ago and the very first dispatch has no such predecessor. Without
+            // this memset it would run out of whatever the allocator handed
+            // back. (The single-bank path still clears synchronously in
+            // `rearm`, so its memset is redundant but harmless and costs one
+            // memset at load.)
+            let ctr_span = (p.n_counter as usize * CTR_STRIDE_U32 * 4).max(1) as u64;
+            let d_ctr = EngineDevice::alloc(&*be, ctr_span * ctr_banks)?;
+            EngineDevice::memset_d8(&*be, d_ctr.base, 0, (ctr_span * ctr_banks) as usize)?;
+            // The VRAM price of the second bank, per program, so it is a number
+            // in the log rather than an argument in a comment.
+            tracing::debug!(
+                prog = progs.len(),
+                n_counter = p.n_counter,
+                bank_kib = ctr_span / 1024,
+                banks = ctr_banks,
+                "counter banks"
+            );
             // Per-(CU, segment) windows. DERIVED from the stream we just
             // uploaded, so it cannot disagree with it — the standing failure of
             // a precomputed window table (`PLOW_SEG_OFF` rewrote `stream[].seg`
@@ -3388,14 +3638,19 @@ impl AmdEngine {
                 None
             } else {
                 let n_seg = p.gq_seg_ofs.len().saturating_sub(1) as u32;
+                // DOUBLE-BUFFERED TOO. The GQ cursor is re-armed in the same
+                // breath as the counters and is just as much a dispatch's live
+                // state, so banking one without the other would have dispatch
+                // N+1 resume from dispatch N's cursor.
+                let cur_span = (n_seg.max(1) as usize * CTR_STRIDE_U32 * 4) as u64;
+                let d_cursor = EngineDevice::alloc(&*be, cur_span * ctr_banks)?;
+                EngineDevice::memset_d8(&*be, d_cursor.base, 0, (cur_span * ctr_banks) as usize)?;
                 Some(AmdGq {
                     d_stream: up(as_bytes(&p.gq_stream))?,
                     d_seg_ofs: up(as_bytes(&p.gq_seg_ofs))?,
-                    d_cursor: EngineDevice::alloc(
-                        &*be,
-                        (n_seg.max(1) as usize * CTR_STRIDE_U32 * 4) as u64,
-                    )?,
+                    d_cursor,
                     n_seg,
+                    cur_span,
                 })
             };
             progs.push(AmdProg {
@@ -3425,6 +3680,8 @@ impl AmdEngine {
                 } else {
                     0
                 },
+                ctr_span,
+                bank: Cell::new(0),
             });
         }
         let decode = progs.len() - 1;
@@ -3655,6 +3912,15 @@ impl AmdEngine {
             vmm = vmm.is_some(),
             "AMD engine ready"
         );
+        // P3 (coalesce the two decode scalar H2Ds into one) is only legal when
+        // `in.kvlen` sits immediately after `in.pos` IN THE DEVICE LAYOUT, so
+        // log the two bases: the answer is a property of this blob's slab, not
+        // of the code.
+        tracing::debug!(
+            pos = t_pos.map(|t| format!("{:#x}+{}", devp[t].base, devp[t].len)),
+            kvlen = t_kvlen.map(|t| format!("{:#x}+{}", devp[t].base, devp[t].len)),
+            "decode scalar tensors"
+        );
 
         Ok(AmdEngine {
             be,
@@ -3849,7 +4115,9 @@ impl AmdEngine {
             stream_len: g.d_slen.base,
             waits: g.d_waits.base,
             succs: g.d_succs.base,
-            counters: g.d_ctr.base,
+            // BANKED. `bank` is 0 for the whole life of a single-buffered
+            // program, so this is the old expression there.
+            counters: g.d_ctr.base + g.bank.get() as u64 * g.ctr_span,
             tensors: self.d_tens.base,
             // EVERY program traces, not just decode. The buffer is sized for the widest one
             // (see `d_trace`'s allocation), and each dispatch writes slot `base + ix` of its own
@@ -3871,7 +4139,10 @@ impl AmdEngine {
             // static kernel never reads them, so one path serves both.
             gq_stream: g.gq.as_ref().map_or(0, |q| q.d_stream.base),
             gq_seg_ofs: g.gq.as_ref().map_or(0, |q| q.d_seg_ofs.base),
-            gq_cursor: g.gq.as_ref().map_or(0, |q| q.d_cursor.base),
+            gq_cursor: g
+                .gq
+                .as_ref()
+                .map_or(0, |q| q.d_cursor.base + g.bank.get() as u64 * q.cur_span),
             // Single-GPU leaves all four at zero, and `n_gpu == 0` is the
             // interpreter's "not a group" convention (`tp_decode.c:551` fills
             // them only when `n_gpu > 1`). The collective opcodes never appear
@@ -3889,16 +4160,29 @@ impl AmdEngine {
     /// an earlier launch, so zeroing between segments unsatisfies them and the
     /// next segment waits on a count that will never come again.
     fn rearm(&self, p: usize) -> Result<()> {
+        self.rearm_bank(p, self.progs[p].bank.get())
+    }
+
+    /// Zero ONE bank of program `p`'s counters and GQ cursor.
+    ///
+    /// Split out of [`AmdEngine::rearm`] for the double-buffered [`AmdEngine::run`],
+    /// which clears the bank the PREVIOUS dispatch dirtied rather than the one
+    /// the next dispatch will read.
+    fn rearm_bank(&self, p: usize, bank: u32) -> Result<()> {
         let g = &self.progs[p];
         let n = g.n_counter as usize * CTR_STRIDE_U32 * 4;
         if n > 0 {
-            self.be
-                .memcpy_htod_pinned(g.d_ctr.base, &self.h_zero.as_slice()[..n])?;
+            self.be.memcpy_htod_pinned(
+                g.d_ctr.base + bank as u64 * g.ctr_span,
+                &self.h_zero.as_slice()[..n],
+            )?;
         }
         if let Some(q) = &g.gq {
             let n = q.n_seg.max(1) as usize * CTR_STRIDE_U32 * 4;
-            self.be
-                .memcpy_htod_pinned(q.d_cursor.base, &self.h_zero.as_slice()[..n])?;
+            self.be.memcpy_htod_pinned(
+                q.d_cursor.base + bank as u64 * q.cur_span,
+                &self.h_zero.as_slice()[..n],
+            )?;
         }
         Ok(())
     }
@@ -4022,11 +4306,33 @@ impl AmdEngine {
     }
 
     /// Single-launch run — the decode path, which is not segmented.
+    /// # The re-arm is BEHIND the enqueue, not in front of it
+    ///
+    /// With [`ctr_dbuf`] on, the bank this dispatch reads was already zeroed —
+    /// by the PREVIOUS dispatch, while the GPU was busy. So the order is
+    /// enqueue, then clear the stale bank, then drain: the clear's two blocking
+    /// SDMA round trips (56 µs measured, §`ctr_dbuf`) overlap 11.6 ms of
+    /// megakernel instead of delaying its start. Flipping `bank` after the
+    /// enqueue is safe because `enqueue` memcpy'd its own kernarg slot, so the
+    /// launch already captured the address it will use.
+    ///
+    /// Correctness rests on one thing: the bank being cleared is not the one
+    /// the in-flight dispatch is reading. That holds because `run` drains
+    /// before it returns, so dispatch N-1 (which dirtied `stale`) has retired
+    /// before dispatch N is even staged.
     pub fn run(&mut self, p: usize, k: HsaKernel) -> Result<()> {
-        self.rearm(p)?;
+        use crate::obs::dstep;
+        if !ctr_dbuf() {
+            dstep::timed(&dstep::REARM, || self.rearm(p))?;
+        }
         let t0 = std::time::Instant::now();
-        self.enqueue(p, k)?;
-        self.drain()?;
+        dstep::timed(&dstep::ENQUEUE, || self.enqueue(p, k))?;
+        if ctr_dbuf() {
+            let cur = self.progs[p].bank.get();
+            dstep::timed(&dstep::REARM, || self.rearm_bank(p, 1 - cur))?;
+            self.progs[p].bank.set(1 - cur);
+        }
+        dstep::timed(&dstep::DRAIN, || self.drain())?;
         self.seg_drain_us += t0.elapsed().as_secs_f64() * 1e6;
         Ok(())
     }
@@ -4085,10 +4391,11 @@ impl AmdEngine {
     /// step's embed reads it; writing a host copy over it would feed the model
     /// last step's token twice.
     pub fn decode_step(&mut self, pos: u32, kvlen: u32) -> Result<u32> {
+        use crate::obs::dstep;
         self.vmm_ensure(self.kv_slot, pos + 1)?;
-        self.decode_prepare(pos, kvlen)?;
+        dstep::timed(&dstep::PREPARE, || self.decode_prepare(pos, kvlen))?;
         self.run(self.decode, self.k_decode)?;
-        let id = self.read_sampled()?;
+        let id = dstep::timed(&dstep::READ, || self.read_sampled())?;
         if let Some(v) = &self.vmm {
             v.advise(self.kv_slot, pos + 1);
         }
@@ -5344,6 +5651,126 @@ mod tests {
         assert_eq!(required_k3_op(&plain), None);
         assert!(check_k3_arms(&bare, obj, required_k3_op(&plain)).is_ok());
         assert!(check_k3_arms(&with_k3, obj, required_k3_op(&plain)).is_ok());
+    }
+
+    /// A packet dispatching a Gemma-4 MoE op against an object built without the matching axis is
+    /// REFUSED — the same argument as the K3 gate, and for a family that until the AMD port had
+    /// NO arm at all, so its silent-NOP failure was not hypothetical. [GEMMA4-MOE-AMD]
+    #[test]
+    fn a_gemma_moe_packet_against_an_object_without_the_arms_is_refused() {
+        let obj = Path::new("interp_decode.elf");
+        let bare = vec!["plow_gemv_mm_cap_1", "plow_interp_dec_gfx942"];
+        let with_dec = vec![
+            "plow_gemv_mm_cap_1",
+            "plow_interp_dec_gfx942",
+            MOE_GEMMA_SYM,
+        ];
+        let with_pf = vec!["plow_gemv_mm_cap_1", "plow_interp_gfx942", MOE_GEMMA_PF_SYM];
+
+        for (set, sym, flag, good) in [
+            (MOE_GEMMA_OPS, MOE_GEMMA_SYM, "PLOW_MOE_GEMMA", &with_dec),
+            (
+                MOE_GEMMA_PF_OPS,
+                MOE_GEMMA_PF_SYM,
+                "PLOW_MOE_GEMMA_PF",
+                &with_pf,
+            ),
+        ] {
+            for &op in set {
+                let pkt = vec![prog_gemv(&[op], 1)];
+                let need_dec = first_op_in(&pkt, MOE_GEMMA_OPS);
+                let need_pf = first_op_in(&pkt, MOE_GEMMA_PF_OPS);
+                assert!(
+                    need_dec == Some(op) || need_pf == Some(op),
+                    "{op:?} must be recognised as a Gemma MoE arm"
+                );
+                let e = check_moe_gemma_arms(&bare, obj, need_dec, need_pf)
+                    .expect_err("a Gemma MoE op against a bare object must be refused");
+                let msg = e.to_string();
+                assert!(msg.contains(&format!("{op:?}")), "must name the op: {msg}");
+                assert!(msg.contains(sym), "must name the missing marker: {msg}");
+                assert!(msg.contains(flag), "must name the flag: {msg}");
+                assert!(check_moe_gemma_arms(good, obj, need_dec, need_pf).is_ok());
+            }
+        }
+
+        // A packet with no Gemma MoE op is untouched — the gate must not refuse every other model.
+        let plain = vec![prog_gemv(&[DevOp::Gemv, DevOp::RmsNorm], 1)];
+        assert_eq!(first_op_in(&plain, MOE_GEMMA_OPS), None);
+        assert_eq!(first_op_in(&plain, MOE_GEMMA_PF_OPS), None);
+        assert!(check_moe_gemma_arms(&bare, obj, None, None).is_ok());
+    }
+
+    /// The two Gemma-MoE opcode lists must match the `#if PLOW_MOE_GEMMA` / `#if
+    /// PLOW_MOE_GEMMA_PF` regions of `interp.hip` — PARSED, not restated, for the reason
+    /// `k3_arm_ops_match_the_interpreter` gives: a twentieth arm added inside the guard and not
+    /// listed here would be dispatched by an object that does not advertise the axis, with no
+    /// refusal and no fault.
+    #[test]
+    fn gemma_moe_arm_ops_match_the_interpreter() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("runtime/amd/interp.hip"));
+        let Some(path) = path.filter(|p| p.exists()) else {
+            eprintln!("interp.hip not found — skipping (source checkout only)");
+            return;
+        };
+        let src = std::fs::read_to_string(&path).unwrap();
+        // Walk the guard nesting and collect `case PLOW_DOP_*` inside each Gemma region.
+        let mut dec: Vec<String> = Vec::new();
+        let mut pf: Vec<String> = Vec::new();
+        let mut stack: Vec<&'static str> = Vec::new();
+        let mut depth: Vec<bool> = Vec::new(); // is this #if one of ours?
+        for line in src.lines() {
+            let t = line.trim();
+            if t.starts_with("#if") {
+                let which = if t.contains("PLOW_MOE_GEMMA_PF") {
+                    Some("pf")
+                } else if t.contains("PLOW_MOE_GEMMA") {
+                    Some("dec")
+                } else {
+                    None
+                };
+                depth.push(which.is_some());
+                if let Some(w) = which {
+                    stack.push(w);
+                }
+                continue;
+            }
+            if t.starts_with("#endif") {
+                if depth.pop().unwrap_or(false) {
+                    stack.pop();
+                }
+                continue;
+            }
+            let Some(r) = t.strip_prefix("case PLOW_DOP_") else {
+                continue;
+            };
+            let name: String = r
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                .collect();
+            match stack.last() {
+                Some(&"dec") => dec.push(format!("PLOW_DOP_{name}")),
+                Some(&"pf") => pf.push(format!("PLOW_DOP_{name}")),
+                _ => {}
+            }
+        }
+        for (found, listed, what) in [
+            (&dec, MOE_GEMMA_OPS, "PLOW_MOE_GEMMA"),
+            (&pf, MOE_GEMMA_PF_OPS, "PLOW_MOE_GEMMA_PF"),
+        ] {
+            let mut want: Vec<String> = listed.iter().map(|o| o.c_name().to_string()).collect();
+            want.sort();
+            let mut got = found.clone();
+            got.sort();
+            got.dedup();
+            assert_eq!(
+                got, want,
+                "{what}: interp.hip's guarded `case` labels disagree with the Rust list"
+            );
+        }
     }
 
     /// The KV-encoding SWAP is refused in BOTH directions, which is what makes it different from

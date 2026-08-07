@@ -76,7 +76,7 @@ pub struct Campaign {
     pub dry_run: bool,
 }
 
-pub fn run(root: &Path, c: &Campaign) -> Result<(), Err> {
+pub fn run(root: &Path, c: &Campaign, isa: hwspec::IsaLevel, cell: &str) -> Result<(), Err> {
     // `--root .` is the default and the harness build runs with `current_dir(obj)`, so a relative
     // root resolves against the OBJECT directory and every source path misses. Canonicalise once,
     // here, rather than at each use.
@@ -86,7 +86,7 @@ pub fn run(root: &Path, c: &Campaign) -> Result<(), Err> {
     // fact: any edit to `runtime/amd/*.hip|h` or `runtime/common/dev_isa.h` moves the
     // preprocessed build digest and re-stales EVERY record. `probe_digest` exists so tooling can
     // ASK rather than guess; this is that call.
-    let want = super::ingest::digests(root)?;
+    let want = super::ingest::digests(root, isa)?;
     println!("build digest: {}", want.interpreter);
     println!("toolchain   : {}", want.toolchain);
     println!();
@@ -201,7 +201,15 @@ pub fn run(root: &Path, c: &Campaign) -> Result<(), Err> {
         return Ok(());
     }
     println!();
-    let published = super::ingest::ingest(root, &c.db, &c.samples, &c.campaign, c.provisional)?;
+    let published = super::ingest::ingest(
+        root,
+        &c.db,
+        &c.samples,
+        &c.campaign,
+        c.provisional,
+        isa,
+        cell,
+    )?;
     if published == 0 && !c.provisional {
         return Err(
             "the campaign measured rows but published NO qualified record. The store is \
@@ -374,20 +382,53 @@ fn group_db_lists_render() -> bool {
 /// `/opt/rocm` headers and `libhsa-runtime64`, and the nix dev shell's `CPATH`/`LIBRARY_PATH`
 /// shadow the system glibc that ROCm was built against. Same rule as `build_gfx950.sh`'s `chat`.
 fn build_harness(root: &Path, obj: &Path) -> Result<PathBuf, Err> {
+    // The sweep source MOVED to runtime/bench/gemm/ and this path did not follow it, so every
+    // campaign died in gcc with "No such file or directory" -- i.e. `plowc tune gemm` could not
+    // measure anything at all, which is exactly how a target ends up with no tuning cell and
+    // every compile silently falling back to the analytical model. Resolved by probing both
+    // locations rather than repinning to one: an older checkout still has it under ubench/.
+    const SWEEP_SRC: [&str; 2] = [
+        "runtime/bench/gemm/gemm_tile_sweep.c",
+        "runtime/ubench/gemm_tile_sweep.c",
+    ];
+    let src = SWEEP_SRC
+        .iter()
+        .map(|p| root.join(p))
+        .find(|p| p.exists())
+        .ok_or_else(|| -> Err {
+            format!(
+                "gemm_tile_sweep.c not found under {} (looked in {})",
+                root.display(),
+                SWEEP_SRC.join(", ")
+            )
+            .into()
+        })?;
     let st = Command::new("/usr/bin/gcc")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", std::env::var("HOME").unwrap_or_default())
         .current_dir(obj)
         .args(["-O2", "-std=gnu11", "-o", "gemm_tile_sweep"])
-        .arg(root.join("runtime/ubench/gemm_tile_sweep.c"))
+        .arg(&src)
         .arg(root.join("runtime/amd/hsa_backend.c"))
-        .args([
-            "-I/opt/rocm/include",
-            "-L/opt/rocm/lib",
-            "-lhsa-runtime64",
-            "-lm",
-        ])
+        // `-I<root>/runtime/bench` is what makes the sweep's own `#include "../amd/hsa_backend.h"`
+        // resolve from its NEW home: a quoted include falls back to the -I list after the source
+        // directory, and `<root>/runtime/bench/../amd` is `<root>/runtime/amd`. The alternative --
+        // editing the include -- would break the ubench/ fallback above, which needs the same
+        // spelling to mean a different directory.
+        .arg(format!("-I{}", root.join("runtime/bench").display()))
+        // ROCM_PATH-relative, not hardcoded /opt/rocm: an apt/versioned install has no
+        // /opt/rocm symlink and this build then dies on hsa/hsa.h — same treatment the
+        // build scripts' bundler/readelf discovery already got.
+        .arg(format!(
+            "-I{}/include",
+            std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into())
+        ))
+        .arg(format!(
+            "-L{}/lib",
+            std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into())
+        ))
+        .args(["-lhsa-runtime64", "-lm"])
         .status()?;
     if !st.success() {
         return Err(format!("building gemm_tile_sweep failed: {st}").into());

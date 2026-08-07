@@ -54,7 +54,7 @@ case "$OUT" in
      exit 1 ;;
 esac
 # PLOW_ROOT lets a worktree build its OWN modified source instead of /root/plow.
-HERE="${PLOW_ROOT:-/root/plow}"
+HERE="${PLOW_ROOT:-.}"
 SRC="$HERE/runtime/nvidia/interp_sm90a.cu"
 # PLOW_NVCC selects the toolchain. It MUST NOT be newer than what the installed
 # driver accepts, or the cubin loads with CUDA_ERROR_INVALID_IMAGE at runtime

@@ -217,15 +217,30 @@ pub enum DevOp {
     /// GEMV's register budget, NOT the doubled one of [`DevOp::GemvGlu`]. Legal only when
     /// `M*K` fits LDS; plowc emits it only in decode (`M=1`), where it always does.
     GemvQkv = 22,
-    /// `t0=C t1=x t2=W(fp8) t5=w_scale(f32[N])` · `i0=M i1=N i2=K i4=a_row0`. The fp8 (w8a16) twin
+    /// `t0=C t1=x t2=W(fp8) t3=resid_out t4=b t5=w_scale(f32[N]) t6=gamma_b t7=gamma_n` ·
+    /// `i0=M i1=N i2=K i3=nrn i4=a_row0` · `f0=eps f1=scale`. The fp8 (w8a16) twin
     /// of [`DevOp::Gemv`]: the weight row is `uint8[K]` OCP e4m3, so decode streams HALF the bytes
     /// (~2x the bandwidth-bound decode roofline). Each fp8 is converted to bf16 on load and the
     /// existing bf16 `fdot2` reduction is unchanged; the per-output-channel dequant `w_scale[n]` is
     /// applied ONCE in the epilogue on the wave sum, never per element. Decode-only.
+    ///
+    /// `i3 != 0` (AMD decode) is the NRN FOLD: [`DevOp::NormResidualNorm`] computed into this
+    /// GEMV's LDS staging — `t1` becomes `a` (the residual in), `t3`/`t4`/`t6`/`t7` carry
+    /// resid_out/b/gamma_b/gamma_n, `f0`=eps `f1`=layer_scale; bit 1 of `i3` marks the ONE packet
+    /// of the q/k/v trio that stores the residual. Bit-exact to op 23 followed by op 30 — see
+    /// `gemv_nrn_lds` in op_gemm.h for the mechanism and the ping-pong the concurrency forces.
     GemvFp8 = 30,
     /// `t0=fu t1=x t2=W_gate(fp8) t5=W_up(fp8) t3=gate_scale(f32[N]) t4=up_scale(f32[N])` ·
-    /// `i0=M i1=N i2=K i5=act`. The fp8 twin of [`DevOp::GemvGlu`]: gate|up in ONE pass with the
+    /// `i0=M i1=N i2=K i3=resid_out i4=b i5=act i6=gamma_b i7=gamma_n` · `f0=eps f1=scale` ·
+    /// `j1=nrn`. The fp8 twin of [`DevOp::GemvGlu`]: gate|up in ONE pass with the
     /// GLU applied in the epilogue, both weight streams fp8 e4m3 with their own per-channel scale.
+    ///
+    /// `j1 != 0` (AMD decode) is the NRN1 FOLD — the GemvGluFp8 sibling of op 30's `i3` fold:
+    /// [`DevOp::NormResidualNorm`] computed into this GEMV's LDS staging. `t1` becomes `a` (the
+    /// residual in), and because both free t slots already carry dequant scales, the four fold
+    /// operands ride the free INTEGER slots as TENSOR HANDLES: `i3`=resid_out `i4`=b
+    /// `i6`=gamma_b `i7`=gamma_n, with `f0`=eps `f1`=layer_scale (always 1.0 for NRN1).
+    /// Bit-exact to op 23 followed by op 31 — see `d_gemv_glu_fp8_nrn` in op_gemm.h.
     GemvGluFp8 = 31,
     /// `t0=xq(fp8) t1=x(bf16) t2=a_scale(f32[M])` · `i0=M i1=K`. Per-row (per-token) fp8 activation
     /// quant — the w8a8 prefill's activation half. `a_scale[m] = rowmax|x[m,:]|/448`, `xq[m,k] =
@@ -1207,6 +1222,26 @@ pub enum DevOp {
     /// ONE interpreter body with [`DevOp::GemvMxfp4`], which is this with `Nk = Nv = 0` — the same
     /// register argument [`DevOp::GemvQkvg`] makes. Decode-only, `M*K` must fit LDS.
     GemvQkvMxfp4 = 114,
+
+    /// `t0=q_out t1=x t2=W_q(fp8) t3=k_out t4=W_k(fp8) t5=v_out t6=W_v(fp8)` ·
+    /// `i0=M i1=Nq i2=K i3=Nk i4=Nv i5=S_q i6=S_k i7=S_v`, computing up to THREE per-channel-fp8
+    /// (w8a16) projections in ONE decode GEMV — the fp8 twin of [`DevOp::GemvQkv`], with
+    /// [`DevOp::GemvQkvMxfp4`]'s slot map: `t[0..6]` is byte-for-byte op 22's and the three
+    /// `f32[N]` dequant-scale rows are TENSOR HANDLES in the integer slots op 22 leaves empty
+    /// (same demotion rule, same [`TENSOR_NONE_I`] sentinel for the absent one).
+    ///
+    /// Gemma/Qwen/Llama fp8 decode previously ran q/k/v as three `GEMV_FP8` packets on
+    /// byte-proportional disjoint CU sets ("opcode 26 deferred"); concatenating their output
+    /// columns into one `N = Nq+Nk+Nv` sweep deletes two counter gates per layer and fills every
+    /// CU uniformly. BYTE-EXACT to the split calls: a column's value depends only on its own
+    /// weight row, its own scale and the shared `x`, accumulated over the same chunks in the same
+    /// order — concatenation changes which workgroup owns a column, never what it computes.
+    ///
+    /// `Nv = 0` is the legal TWO-STREAM form (`t5`/`t6`/`i7` all absent). Any other absence TRAPS
+    /// on the AMD arm rather than degrading to a narrower sweep. ONE interpreter body with
+    /// [`DevOp::GemvFp8`], which is this with `Nk = Nv = 0`. Decode-only; x staged in LDS when
+    /// `M*K` fits, exactly as `d_gemv_fp8`.
+    GemvQkvFp8 = 115,
 }
 
 impl DevOp {
@@ -1331,6 +1366,7 @@ impl DevOp {
         DevOp::KdaStateStepG,
         DevOp::GemmGluMxfp4,
         DevOp::GemvQkvMxfp4,
+        DevOp::GemvQkvFp8,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1466,6 +1502,7 @@ impl DevOp {
             DevOp::FlashMlaPrefillFp8 => "PLOW_DOP_FLASH_MLA_PREFILL_FP8",
             DevOp::KdaConv3 => "PLOW_DOP_KDA_CONV3",
             DevOp::KdaStateStepG => "PLOW_DOP_KDA_STATE_STEP_G",
+            DevOp::GemvQkvFp8 => "PLOW_DOP_GEMV_QKV_FP8",
         }
     }
 
@@ -1494,7 +1531,7 @@ impl DevOp {
     /// `dev_isa.h`. Renumbering the later pair was the resolution. Two variants, one
     /// bump: this constant is one past the HIGHEST opcode, not a count, and adding a pair moves it
     /// by two whether or not the range has holes.
-    pub const COUNT: u16 = 115;
+    pub const COUNT: u16 = 116;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
@@ -1551,6 +1588,7 @@ impl DevOp {
             DevOp::GemvMxfp4 => ("gemv", i[1], "Mxfp4"),
             DevOp::GemvGluMxfp4 => ("gemvglu", i[1], "Mxfp4"),
             DevOp::GemvQkvMxfp4 => ("gemvqkv", i[1] + i[3] + i[4], "Mxfp4"),
+            DevOp::GemvQkvFp8 => ("gemvqkv", i[1] + i[3] + i[4], "W8A8"),
             _ => return None,
         };
         Some((fam, i[0], n, i[2], q))

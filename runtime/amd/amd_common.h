@@ -18,6 +18,10 @@ typedef bf16_t bf16x8 __attribute__((ext_vector_type(8)));
 typedef float f32x4 __attribute__((ext_vector_type(4)));
 typedef float f32x16 __attribute__((ext_vector_type(16)));
 
+/* CDNA3/CDNA4 instruction divergence. Included here, right after the MFMA operand
+ * types it needs, so every primitive below can use the arch wrappers. */
+#include "amd_arch.h"
+
 /* ---------------------------------------------------------------------------
  * GLOBAL, AND SAY SO.
  *
@@ -321,11 +325,35 @@ __device__ __forceinline__ bf16v8 bf16v8_zero(void) {
 __device__ __forceinline__ void cp_async16(const PLOW_GLOB bf16* src,
                                            bf16* dst_lane_contiguous) {
 #ifdef __HIP_DEVICE_COMPILE__
+#if !PLOW_CDNA4
+    /* CDNA3's global_load_lds takes 1/2/4 bytes per lane; the 12/16-byte forms are a CDNA4
+     * addition (clang rejects 16 with "invalid size value"). Four 4-byte issues do NOT
+     * reconstruct this call: the LDS destination comes from M0 and the hardware lays lanes
+     * down contiguously at the ISSUE width, so 4-byte issues give a lane*4 layout, not the
+     * lane*16 one every fragment read below assumes.
+     *
+     * So the CDNA3 arm is a VGPR-staged copy instead. It costs registers where the CDNA4 path
+     * costs none -- which is exactly the tradeoff the header comment above says decode cannot
+     * afford at 8 waves. It is affordable in the 4-wave objects; the 8-wave decode object must
+     * be re-measured before this path is trusted there. */
+    const unsigned lane = __builtin_amdgcn_workitem_id_x() & 63u; /* wave64, PLOW_WAVE below */
+    *(bf16v8*)(dst_lane_contiguous + lane * 8) = *(const PLOW_GLOB bf16v8*)src;
+#elif defined(__clang_major__) && __clang_major__ >= 23
+/* clang-23 (ROCm 7.14) retyped the builtin's global operand to a NON-const addrspace(1)
+ * void*. The pre-23 spelling stops compiling against it — on EVERY arch, gfx950 included —
+ * with "cannot initialize a parameter of type '__device__ void *'". Kept version-gated so a
+ * ROCm 7.2.4 / clang-22 build still takes the exact call it takes today. */
+    __builtin_amdgcn_global_load_lds(
+        (PLOW_GLOB void*)(const PLOW_GLOB void*)src,
+        (__attribute__((address_space(3))) void*)dst_lane_contiguous,
+        16 /* bytes per lane */, 0 /* offset */, 0 /* aux */);
+#else
     __builtin_amdgcn_global_load_lds(
         (const PLOW_GLOB unsigned*)(const PLOW_GLOB void*)src,
         (__attribute__((address_space(3))) unsigned*)(__attribute__((address_space(3))) void*)
             dst_lane_contiguous,
         16 /* bytes per lane */, 0 /* offset */, 0 /* aux */);
+#endif
 #else
     (void)src;
     (void)dst_lane_contiguous;
@@ -410,6 +438,28 @@ __device__ __forceinline__ __amdgpu_buffer_rsrc_t buf_rsrc_fp8_u(const unsigned 
     const unsigned char* ub = (const unsigned char*)(size_t)(((unsigned long long)hi << 32) | lo);
     return __builtin_amdgcn_make_buffer_rsrc((void*)ub, (short)0, n_bytes, PLOW_BUF_RSRC3);
 }
+/* The bf16 twin of buf_rsrc_fp8_u, and the reason it is worth having is visible in the shipped
+ * decode object: EVERY buffer_load_dwordx4 in d_gemv_qkv / d_gemv_glu / d_gemv_fp8_blk carries
+ *
+ *     s_mov_b64 exec save / 4x v_readfirstlane_b32 / 2x v_cmp_eq_u64 / s_and_saveexec_b64
+ *     buffer_load_dwordx4 / s_xor_b64 exec / s_cbranch_execnz <BACKWARDS> / s_mov_b64 exec
+ *
+ * That is not merely ~13 extra instructions -- the backward branch puts each load in its OWN
+ * BASIC BLOCK, so the UN loads the source issues "before touching any of them" cannot be a
+ * clause at all. Whatever memory-level parallelism the unroll was written to create, the
+ * waterfall serialises.
+ *
+ * In a MEGAKERNEL the compiler can never prove the base uniform on its own: the op's operands
+ * are read out of the packet into VGPRs, so `W + n*K` is VGPR-resident by construction, however
+ * wave-invariant its VALUE is. readfirstlane is how you tell it. Valid here because `n` is the
+ * wave's own row index -- identical in all 64 lanes. */
+__device__ __forceinline__ __amdgpu_buffer_rsrc_t buf_rsrc_u(const bf16* base, unsigned n_halves) {
+    unsigned long long u = (unsigned long long)(size_t)base;
+    unsigned lo = __builtin_amdgcn_readfirstlane((unsigned)u);
+    unsigned hi = __builtin_amdgcn_readfirstlane((unsigned)(u >> 32));
+    const bf16* ub = (const bf16*)(size_t)(((unsigned long long)hi << 32) | lo);
+    return __builtin_amdgcn_make_buffer_rsrc((void*)ub, (short)0, n_halves * 2u, PLOW_BUF_RSRC3);
+}
 /* `aux` = 3 (glc|slc): streaming/non-temporal, exactly as the bf16 weight stream — zero reuse. */
 __device__ __forceinline__ fp8v16 buf_ld_fp8(__amdgpu_buffer_rsrc_t r, unsigned byte_off) {
     return __builtin_bit_cast(fp8v16,
@@ -449,7 +499,7 @@ union bf16v8_pairs {
 __device__ __forceinline__ float dot8(bf16v8 a, bf16v8 b, float acc) {
     bf16v8_pairs x{a}, y{b};
 #pragma unroll
-    for (int j = 0; j < 4; j++) acc = __builtin_amdgcn_fdot2_f32_bf16(x.p[j], y.p[j], acc, false);
+    for (int j = 0; j < 4; j++) acc = plow_dot2_bf16(x.p[j], y.p[j], acc);
     return acc;
 }
 
@@ -486,6 +536,7 @@ __device__ __forceinline__ bf16 f2bf(float f) {
  *
  * (The earlier note that this builtin "broadcasts one byte" was wrong — see the byte-order check
  * above; it is a drop-in for the two-step path.) */
+#if PLOW_HAS_MX_CVT /* CDNA4 MX block-scale convert; CDNA3 has no fp4 type and no scalef32 */
 __device__ __forceinline__ void fp8_to_bf16v8(fp8v16 w, bf16v8& lo, bf16v8& hi) {
     typedef bf16_t bf16_2 __attribute__((ext_vector_type(2)));
     union { bf16v8 v; unsigned u[4]; } ol, oh; /* pack pairs as u32 to avoid per-lane extraction */
@@ -501,6 +552,24 @@ __device__ __forceinline__ void fp8_to_bf16v8(fp8v16 w, bf16v8& lo, bf16v8& hi) 
     lo = ol.v;
     hi = oh.v;
 }
+#else
+/* CDNA3 arm: the two-step path this instruction replaced. v_cvt_pk_f32_fp8 exists on gfx942, so
+ * the decode is 8 packed converts to f32 plus a high-half pack -- more VALU than the CDNA4
+ * single-step, and BIT-IDENTICAL: fp8 e4m3 carries <=3 mantissa bits, so f32 holds it exactly and
+ * the bf16 narrowing is the same round. scale is 1.0 here for the same reason it is on CDNA4 --
+ * the block scale is folded in the epilogue, see the note below. */
+__device__ __forceinline__ void fp8_to_bf16v8(fp8v16 w, bf16v8& lo, bf16v8& hi) {
+    union { bf16v8 v; unsigned u[4]; } ol, oh;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        auto& o = (i < 2) ? ol : oh;
+        const int b = (i & 1) * 2;
+        plow_fp8x4_ocp_to_bf16((unsigned)w[i], o.u[b + 0], o.u[b + 1]);
+    }
+    lo = ol.v;
+    hi = oh.v;
+}
+#endif /* PLOW_HAS_MX_CVT */
 
 /* WHY scale=1.0 above and NOT the block scale: v_cvt_scalef32_pk_bf16_fp8's scalef32 operand is an
  * E8M0 (power-of-2) MICROSCALING scale — the hardware uses ONLY the f32 exponent (2^floor(log2 s))
@@ -562,6 +631,7 @@ __device__ __forceinline__ float e8m0_inv_f32(unsigned char b) {
  * the GEMV reduction, `dot8` and the wave reduction are shared verbatim with the fp8 path.
  * Each u32 holds 8 fp4 = 4 pairs; op_sel (the third operand, 0..3) picks the pair, so one word
  * becomes 8 bf16 in 4 packed converts — 16 converts per 32-element fragment. */
+#if PLOW_HAS_MX_CVT /* CDNA4 MX block-scale convert; CDNA3 has no fp4 type and no scalef32 */
 __device__ __forceinline__ void fp4_to_bf16v8x4(fp4v32 w, float scale, bf16v8& a, bf16v8& b,
                                                 bf16v8& c, bf16v8& d) {
     typedef bf16_t bf16_2 __attribute__((ext_vector_type(2)));
@@ -587,11 +657,28 @@ __device__ __forceinline__ void fp4_to_bf16v8x4(fp4v32 w, float scale, bf16v8& a
     c = o[2].v;
     d = o[3].v;
 }
+#else
+/* CDNA3 arm: no fp4 datatype at all, so the nibble decode is a VALU table (plow_fp4_to_f32) and
+ * the E8M0 scale is a plain multiply. Same op_sel ORDER as the CDNA4 instruction -- word j of the
+ * output holds nibbles 2j and 2j+1 of the input, low nibble first -- so the fdot2-ready lane
+ * order the GEMV reduction depends on is preserved. */
+__device__ __forceinline__ void fp4_to_bf16v8x4(fp4v32 w, float scale, bf16v8& a, bf16v8& b,
+                                                bf16v8& c, bf16v8& d) {
+    union { bf16v8 v; unsigned u[4]; } o[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) plow_fp4x8_to_bf16x8((unsigned)w[i], scale, o[i].u);
+    a = o[0].v;
+    b = o[1].v;
+    c = o[2].v;
+    d = o[3].v;
+}
+#endif /* PLOW_HAS_MX_CVT */
 
 /* One u32 (8 fp4) + one E8M0 scale -> bf16v8, the per-word slice of fp4_to_bf16v8x4. Used by the
  * w4a16 prefill GEMM's dequant-on-load B-fetch, where the 8-half load granularity wants exactly 8
  * bf16 at a time (an 8-element load never crosses a 32-element MX block, so one scale byte covers
  * it). Same 4 packed op_sel converts, same fdot2-ready order — the scale fold stays EXACT. */
+#if PLOW_HAS_MX_CVT /* CDNA4 MX block-scale convert; CDNA3 has no fp4 type and no scalef32 */
 __device__ __forceinline__ bf16v8 fp4_to_bf16v8(unsigned w, float scale) {
     union { bf16v8 v; unsigned u[4]; } o;
     o.u[0] = __builtin_bit_cast(unsigned,
@@ -604,6 +691,13 @@ __device__ __forceinline__ bf16v8 fp4_to_bf16v8(unsigned w, float scale) {
                                 __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4((int)w, scale, 3));
     return o.v;
 }
+#else
+__device__ __forceinline__ bf16v8 fp4_to_bf16v8(unsigned w, float scale) {
+    union { bf16v8 v; unsigned u[4]; } o;
+    plow_fp4x8_to_bf16x8(w, scale, o.u);
+    return o.v;
+}
+#endif /* PLOW_HAS_MX_CVT */
 
 /* ---------------------------------------------------------------------------
  * A4W4 — BOTH OPERANDS MXFP4 THROUGH THE MATRIX CORE.  [MEASURED ON gfx950 2026-07-27]
@@ -661,11 +755,13 @@ __device__ __forceinline__ mfma_f8f6f4_operand fp4_frag(const void* p16) {
 #define PLOW_E8M0_ONE 127
 
 /* One A4W4 MFMA: 32x32 output, K=64, per-lane E8M0 scales for both operands. */
+#if PLOW_HAS_MX_CVT /* CDNA4 MX block-scale convert; CDNA3 has no fp4 type and no scalef32 */
 __device__ __forceinline__ f32x16 mfma_a4w4(mfma_f8f6f4_operand a, mfma_f8f6f4_operand b,
                                             f32x16 acc, int scale_a, int scale_b) {
     return __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(a, b, acc, /*cbsz=fp4*/ 4,
                                                            /*blgp=fp4*/ 4, 0, scale_a, 0, scale_b);
 }
+#endif /* PLOW_HAS_MX_CVT */
 
 /* f32 -> one OCP e2m1 nibble (RNE, saturating at 6.0). The quantizer half of A4W4: the fused
  * SwiGLU bridge writes the intermediate activation straight out in this format, so it never
@@ -772,6 +868,7 @@ typedef unsigned fp8v8 __attribute__((ext_vector_type(2))); /* 8 fp8, 8 B, align
 __device__ __forceinline__ fp8v8 ld_glob_fp8v8(const unsigned char* p) {
     return *(const PLOW_GLOB fp8v8*)(const PLOW_GLOB void*)p;
 }
+#if PLOW_HAS_MX_CVT /* CDNA4 MX block-scale convert; CDNA3 has no fp4 type and no scalef32 */
 __device__ __forceinline__ bf16v8 fp8v8_to_bf16v8(fp8v8 w) {
     typedef bf16_t bf16_2 __attribute__((ext_vector_type(2)));
     union {
@@ -789,12 +886,30 @@ __device__ __forceinline__ bf16v8 fp8v8_to_bf16v8(fp8v8 w) {
     }
     return d.v;
 }
+#else
+/* CDNA3 arm: same two-step decode as fp8_to_bf16v8 above, and bit-identical for the same
+ * reason (fp8 e4m3 is exact in bf16). */
+__device__ __forceinline__ bf16v8 fp8v8_to_bf16v8(fp8v8 w) {
+    union {
+        bf16v8 v;
+        unsigned u[4];
+    } d;
+#pragma unroll
+    for (int i = 0; i < 2; i++) plow_fp8x4_ocp_to_bf16((unsigned)w[i], d.u[i * 2], d.u[i * 2 + 1]);
+    return d.v;
+}
+#endif /* PLOW_HAS_MX_CVT */
 
 /* f32 -> one e4m3 byte. gfx950 native: cvt_pk_fp8_f32 packs (a,b) into two bytes of `old`; we use
  * one and keep byte 0. RNE + saturation are in hardware. */
 __device__ __forceinline__ unsigned char quant_fp8(float v) {
+#if !PLOW_CDNA4
+    /* CDNA3's encoder emits e4m3FNUZ, a different format -- see amd_arch.h. */
+    return plow_f32_to_fp8_ocp(v);
+#else
     const unsigned packed = __builtin_amdgcn_cvt_pk_fp8_f32(v, 0.0f, 0, false);
     return (unsigned char)(packed & 0xffu);
+#endif
 }
 
 /* Reduce a MAX across the 64 lanes of a wave (the HeadNormRope per-row amax for the KV scale). */

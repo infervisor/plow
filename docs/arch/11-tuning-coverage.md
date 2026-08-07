@@ -98,7 +98,7 @@ Classified by `kernelcaps::sweep`, which reads the guard form.
 | `PGM90_FP8_PROMOTE` | NVIDIA Hopper | overridable — free 0/1 toggle for the two-level fp8 shadow accumulator |
 | `PGM90_BM`, `PGM90_BN`, `PGM90_BK`, `PGM90_BK8` | NVIDIA Hopper | **fixed** — pinned to the wgmma m64n128 / 128 B swizzle shape |
 | `GM_BM`, `GM_BN` | AMD | overridable — `build_gfx950_qwen.sh:29` ships `-DGM_BM=192` |
-| `GM_BK` | AMD | **fixed** (falls after the `#endif` closing `GM_BN`'s guard) |
+| `GM_BK` | AMD | **overridable** — `#ifndef`-guarded since the CDNA3 port; on a 64 KiB-LDS part it is the only axis that shrinks the stage without moving `GM_BN`, which fused GLU pins |
 | `GV_UNROLL*`, `GV_MM_MAX`, `GV_UN16/32` | both | overridable, documented "for autotune" |
 | `FA_DC`, `FA_DBUF`, `FA_BKV_D128` | AMD | overridable |
 | `PLOW_NV_FA_GF`, `..._GF_FULL` | NVIDIA | overridable, `#error`-checked to {1,2,4,8} |
@@ -107,7 +107,9 @@ Classified by `kernelcaps::sweep`, which reads the guard form.
 | `MAMBA_MAX_DSTATE` | NVIDIA | overridable, but a correctness bound not a tile |
 
 The M axis is sweepable on AMD and not on NVIDIA. The K axis is sweepable on
-neither. **NVIDIA attention tiles are not macros at all** — `BQ`/`BKV` are
+**AMD only** — it was sweepable on neither until the CDNA3 port made `GM_BK`
+`#ifndef`-guarded, because a 64 KiB workgroup cannot hold the stage at the
+CDNA4 tile and `BN` is pinned by the fused-GLU `SN == 2` assert. **NVIDIA attention tiles are not macros at all** — `BQ`/`BKV` are
 template literals at five dispatch sites (`d_flash_prefill_mux<256,64,32>`,
 `<512,32,16>`), so sweeping them means editing those call sites. The probe reads
 them out as `DispatchArm::specializations`.

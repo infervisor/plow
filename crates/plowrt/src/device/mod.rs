@@ -361,6 +361,23 @@ pub trait Backend: Send + Sync {
     /// Launch the persistent kernel once (no-op / thread-spawn on CPU).
     fn launch_persistent(&self, module: &Module, cfg: LaunchCfg) -> Result<()>;
 
+    /// Whether this device's DMA engines read **pageable** host memory
+    /// (an mmap'd checkpoint included) coherently at full link speed, with no
+    /// pinned staging and no fault-driven migration.
+    ///
+    /// This is the loaders' vendor-neutral gate for the direct upload path:
+    /// `true` means an async H2D copy may take its source straight from the
+    /// checkpoint mmap (measured on GH200: 332 GiB/s vs 13 GiB/s staged).
+    /// `false` — the safe default — routes through the pinned staging
+    /// pipeline, which is correct everywhere. CUDA answers from device
+    /// attribute 100 (`PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES`, ATS);
+    /// an AMD backend should answer `true` only for hardware-coherent parts
+    /// (MI300A-class APUs) once the equivalent path is measured there —
+    /// discrete cards behind PCIe/XGMI stay staged.
+    fn coherent_host_dma(&self) -> bool {
+        false
+    }
+
     /// The peer-memory facility, when this backend has one.
     ///
     /// Borrowed rather than `Arc`-returned so [`Backend`] stays object-safe: the

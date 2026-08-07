@@ -3,10 +3,33 @@
 
 use std::ops::Range;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustc_hash::FxHashMap;
 
 use crate::{Result, RuntimeError};
+
+/// Accumulated per-worker `Checkpoint::populate` time + bytes.
+///
+/// `ns` is the **sum of Instant durations across all prefetch threads** — a
+/// parallel worker-time total that can far exceed wall clock (N workers busy
+/// concurrently). It is **not** Disk→RAM latency.
+///
+/// Wall-clock Disk→RAM (start → Prefetcher Drop/join) is measured in
+/// `GpuEngine::load` and is what to use for benchmarking model-load latency.
+pub(crate) struct PrefetchStats {
+    pub ns: AtomicU64,
+    pub bytes: AtomicU64,
+}
+
+impl PrefetchStats {
+    pub fn new() -> Self {
+        Self {
+            ns: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        }
+    }
+}
 
 /// A safetensors checkpoint directory: every `*.safetensors` shard mmap'd,
 /// with one metadata parse per shard (name → shard/offset resolved up front,
@@ -31,12 +54,31 @@ struct Entry {
     shape: Vec<usize>,
 }
 
+/// Sub-timings for [`Checkpoint::open`] (`PLOW_LOAD_PROFILE`).
+#[derive(Default, Clone, Debug)]
+pub(crate) struct CheckpointOpenTiming {
+    pub scan_ms: f64,
+    pub mmap_ms: f64,
+    pub meta_ms: f64,
+    pub index_ms: f64,
+}
+
 impl Checkpoint {
     pub fn open(dir: &Path) -> Result<Checkpoint> {
+        Self::open_with_timing(dir, None)
+    }
+
+    /// Same as [`Self::open`], optionally filling per-phase Instant breakdowns.
+    pub fn open_with_timing(
+        dir: &Path,
+        mut timing: Option<&mut CheckpointOpenTiming>,
+    ) -> Result<Checkpoint> {
         let t0 = std::time::Instant::now();
         tracing::info!(dir = %dir.display(), "opening safetensors checkpoint...");
         let mut shards = Vec::new();
         let mut index = FxHashMap::default();
+
+        let t_scan = std::time::Instant::now();
         let mut paths: Vec<_> = std::fs::read_dir(dir)
             .map_err(|source| RuntimeError::Io {
                 path: dir.to_path_buf(),
@@ -47,6 +89,9 @@ impl Checkpoint {
             .filter(|p| p.is_file() && p.extension().map(|e| e == "safetensors").unwrap_or(false))
             .collect();
         paths.sort();
+        if let Some(t) = timing.as_mut() {
+            t.scan_ms = t_scan.elapsed().as_secs_f64() * 1e3;
+        }
         if paths.is_empty() {
             return Err(RuntimeError::Device(format!(
                 "no *.safetensors in {}",
@@ -55,6 +100,7 @@ impl Checkpoint {
         }
         tracing::info!(shards = paths.len(), "found safetensors shards");
         for path in &paths {
+            let t_mmap = std::time::Instant::now();
             let file = std::fs::File::open(path).map_err(|source| RuntimeError::Io {
                 path: path.clone(),
                 source,
@@ -64,10 +110,19 @@ impl Checkpoint {
                 path: path.clone(),
                 source,
             })?;
+            if let Some(t) = timing.as_mut() {
+                t.mmap_ms += t_mmap.elapsed().as_secs_f64() * 1e3;
+            }
+
+            let t_meta = std::time::Instant::now();
             let (header_len, meta) =
                 safetensors::SafeTensors::read_metadata(&map).map_err(|e| {
                     RuntimeError::Device(format!("safetensors {}: {e}", path.display()))
                 })?;
+            if let Some(t) = timing.as_mut() {
+                t.meta_ms += t_meta.elapsed().as_secs_f64() * 1e3;
+            }
+
             let data_off = 8 + header_len;
             let shard = shards.len();
             let tensors = meta.tensors();
@@ -78,6 +133,7 @@ impl Checkpoint {
                 mib = map.len() / (1 << 20),
                 "mapped checkpoint shard"
             );
+            let t_idx = std::time::Instant::now();
             index.reserve(tensors.len());
             for (name, info) in tensors {
                 index.insert(
@@ -88,6 +144,9 @@ impl Checkpoint {
                         shape: info.shape.clone(),
                     },
                 );
+            }
+            if let Some(t) = timing.as_mut() {
+                t.index_ms += t_idx.elapsed().as_secs_f64() * 1e3;
             }
             shards.push((map, data_off));
         }
@@ -251,14 +310,52 @@ pub(crate) fn weight_slab_enabled() -> bool {
     std::env::var("PLOW_WEIGHT_SLAB").ok().as_deref() != Some("0")
 }
 
+/// `PLOW_WEIGHT_VMM=0` drops the CUDA weight slab from VMM lazy commit back
+/// to one flat `cuMemAlloc`. Default ON: the VMM slab reserves VA in µs and
+/// commits pages on a background thread overlapped with the upload, which is
+/// what actually removes the §4b commit stall (`exec::gpu::_weight_slab`).
+/// The off switch exists for driver-regression triage, not tuning.
+#[cfg(feature = "cuda")]
+pub(crate) fn weight_vmm_enabled() -> bool {
+    std::env::var("PLOW_WEIGHT_VMM").ok().as_deref() != Some("0")
+}
+
+/// `PLOW_UPLOAD_DIRECT=0` forces the pinned-staging upload even on a device
+/// whose DMA engines read pageable memory coherently
+/// (`Backend::coherent_host_dma` — GH200 ATS). Default on: the direct copy
+/// takes its source straight from the checkpoint mmap at link speed
+/// (332 GiB/s measured vs 13 GiB/s staged). The off switch exists for
+/// driver-regression triage, not tuning.
+#[cfg(feature = "cuda")]
+pub(crate) fn upload_direct_enabled() -> bool {
+    std::env::var("PLOW_UPLOAD_DIRECT").ok().as_deref() != Some("0")
+}
+
+/// The AMD loader's gate for the same slab, with the opposite default:
+/// **opt-in** (`PLOW_WEIGHT_VMM=1`). ROCr's `hsa_amd_vmem_*` surface is
+/// resolved and drives VmmKv already, but the lazy-commit weight slab has not
+/// been measured on AMD hardware — and §4b's AMD numbers say the flat slab
+/// already saved 7–8.5 s/rank there, so the residual win is unknown. Flip the
+/// default only with a measurement on a gfx950 box.
+#[cfg(feature = "hsa")]
+pub(crate) fn weight_vmm_amd_enabled() -> bool {
+    std::env::var("PLOW_WEIGHT_VMM").ok().as_deref() == Some("1")
+}
+
 impl Prefetcher {
     /// `threads = 0` disables prefetching and returns `None`, which every call
     /// site already handles — the loader then faults pages in itself, correctly
     /// and slowly, exactly as it did before.
+    ///
+    /// `stats`: when `Some`, workers accumulate populate Instant durations into
+    /// `PrefetchStats::ns` (parallel sum across threads — not wall latency).
+    /// Wall-clock Disk→RAM is timed in `GpuEngine::load` around start→Drop/join.
+    /// Pass `None` when stats are not needed.
     pub fn start(
         ckpt: std::sync::Arc<Checkpoint>,
         threads: usize,
         queue: usize,
+        stats: Option<std::sync::Arc<PrefetchStats>>,
     ) -> Option<Prefetcher> {
         if threads == 0 {
             return None;
@@ -270,7 +367,11 @@ impl Prefetcher {
         let rx = std::sync::Arc::new(parking_lot::Mutex::new(rx));
         let workers = (0..threads)
             .map(|_| {
-                let (rx, ckpt) = (std::sync::Arc::clone(&rx), std::sync::Arc::clone(&ckpt));
+                let (rx, ckpt, stats) = (
+                    std::sync::Arc::clone(&rx),
+                    std::sync::Arc::clone(&ckpt),
+                    stats.clone(),
+                );
                 std::thread::spawn(move || {
                     loop {
                         let job = { rx.lock().recv() };
@@ -278,7 +379,16 @@ impl Prefetcher {
                         // A refused hint (no `MADV_POPULATE_READ` before 5.14)
                         // is not an error: the loader's own fault still gets the
                         // right bytes. Keep draining so the sender never blocks.
-                        ckpt.populate(span);
+                        if let Some(s) = &stats {
+                            // Per-call Instant: summed across workers → parallel
+                            // worker time, not wall-clock Disk→RAM latency.
+                            let t = std::time::Instant::now();
+                            ckpt.populate(span);
+                            s.ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            s.bytes.fetch_add(span.len as u64, Ordering::Relaxed);
+                        } else {
+                            ckpt.populate(span);
+                        }
                     }
                 })
             })

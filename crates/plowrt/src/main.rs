@@ -620,6 +620,11 @@ fn amd_bench(
                 ids.len(),
                 ids.len() as f64 / (ms / 1e3)
             );
+            // Before any decode step runs. The trace buffer is indexed per
+            // (workgroup, packet), so every dispatch overwrites the same slots and only
+            // the LAST program to run survives -- take the prefill picture here or it is
+            // overwritten by a 542-packet GEMV decode and reads as if prefill never ran.
+            trace_dump_1(&eng, ".prefill")?;
             (tok, ids.len() as u32)
         } else {
             eng.seed_ids(&ids)?;
@@ -648,6 +653,7 @@ fn amd_bench(
         if !eng.weights_bound() {
             println!("  (weights unbound — these ids are noise)");
         }
+        trace_dump_1(&eng, "")?;
         return Ok(());
     }
 
@@ -660,7 +666,15 @@ fn amd_bench(
     let t0 = std::time::Instant::now();
     let mut last = tok;
     for i in 0..steps {
+        // §DSTEP: the single-GPU decode path had no `token()` call at all, so
+        // `PLOW_DSTEP_LOG=1` produced NOTHING for the one arm that runs on this
+        // box. Same shape as the TP mux tick: stamp the whole step, and let the
+        // phases inside `decode_step` account for it.
+        let t = plowrt::obs::dstep::on().then(std::time::Instant::now);
         last = eng.decode_step(ctx + 1 + i, ctx + 2 + i)?;
+        if let Some(t) = t {
+            plowrt::obs::dstep::token(t.elapsed().as_nanos() as u64);
+        }
     }
     let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
     println!(
@@ -684,6 +698,12 @@ fn amd_bench(
              decode program ran at full size."
         );
     }
+    // The THIRD exit of this function, and the one a decode-only run takes. Patching only the
+    // two `--prompt` exits left `PLOW_TRACE_RAW` silent for exactly the run that produces a
+    // CLEAN decode trace -- a `--prompt` run overwrites only the first 542 of the buffer's 718
+    // packet slots, so the leftover prefill records poison the decode report (they read as a
+    // negative span and 200,000 us stragglers).
+    trace_dump_1(&eng, "")?;
     Ok(())
 }
 
@@ -702,6 +722,28 @@ fn amd_bench(
 /// other. So the instrument was unavailable in exactly the two places the interesting questions
 /// live — batch > 1, and PREFILL — and both times it failed by producing NOTHING rather than by
 /// complaining. Call this before every exit of a bench that ran packets.
+/// The single-GPU twin of [`trace_dump`].
+///
+/// `amd-bench` routes `--tp 1` to `amd_bench`, which had NO trace call on ANY exit -- so
+/// `PLOW_TRACE_RAW` silently produced nothing for every single-GPU run, which is most of them.
+/// That is precisely the failure mode [`trace_dump`]'s own comment was written about: the
+/// instrument was unavailable exactly where the questions are, and it failed by writing no file
+/// rather than by complaining.
+#[cfg(feature = "hsa")]
+fn trace_dump_1(
+    eng: &plowrt::exec::amd::AmdEngine,
+    suffix: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(p) = std::env::var_os("PLOW_TRACE_RAW") {
+        let mut p = PathBuf::from(p).into_os_string();
+        p.push(suffix);
+        let p = PathBuf::from(p);
+        eng.trace_write(&p)?;
+        println!("packet trace -> {}", p.display());
+    }
+    Ok(())
+}
+
 #[cfg(feature = "hsa")]
 fn trace_dump(g: &plowrt::exec::amd_tp::AmdTpGroup) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(p) = std::env::var_os("PLOW_TRACE_RAW") {
@@ -1268,7 +1310,9 @@ fn disasm_cmd(
         return Ok(());
     }
 
-    let blob = DevBlob::parse(&buf)?;
+    // `disasm` is STATIC INSPECTION -- no device, no dispatch -- so it must not refuse an
+    // L2-placed blob. It did, which is why reading one needed PLOW_L2_PLACE_DISPATCH=1 set.
+    let blob = DevBlob::parse_l2(&buf, true)?;
 
     let range = match range.as_deref() {
         None => None,

@@ -1151,6 +1151,38 @@ impl Builder {
             seg_of[i] = cur_seg;
         }
 
+        // PLOW_SEG_DUMP=1: report the segmentation this program actually got.
+        //
+        // The wave class is decided here, re-derived independently by the host (`exec/amd.rs`
+        // `derive_segments`), and never written to the build manifest — so "what occupancy does
+        // this model launch at?" was answerable only by reading two files and simulating the loop
+        // in one's head. It is also the field whose corruption produces the all-zero-logits
+        // failure described directly below, which is the strongest argument for being able to
+        // print it. Diagnostic only: no packet bytes depend on this.
+        if !seg_per_op && std::env::var("PLOW_SEG_DUMP").ok().as_deref() == Some("1") {
+            let mut counts: Vec<(u8, usize)> = Vec::new();
+            for i in 0..self.ops.len() {
+                let cls = wave_class(self.ops[i].inst.op);
+                match counts.last_mut() {
+                    Some((c, n)) if *c == cls && seg_of[i] == seg_of[i.saturating_sub(1)] => {
+                        *n += 1
+                    }
+                    _ => counts.push((cls, 1)),
+                }
+            }
+            let summary: Vec<String> = counts
+                .iter()
+                .enumerate()
+                .map(|(s, (cls, n))| format!("seg{s}={cls}w x{n}"))
+                .collect();
+            eprintln!(
+                "  wave-class segments: {} segment(s) over {} ops -- {}",
+                cur_seg as usize + 1,
+                self.ops.len(),
+                summary.join(", ")
+            );
+        }
+
         // L2 PLACEMENT vs WAVE-CLASS SEGMENTATION: they want the same 16-bit field, and
         // segmentation wins exactly when it is carrying something SOMEONE READS.
         //

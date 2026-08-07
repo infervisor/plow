@@ -1,0 +1,13 @@
+# vLLM 0.26.0+rocm723, MI300X GPU0, --max-model-len 67712 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.35, bf16 tp1
+# same-session interleaved vs plow g12b-64k-mergefix (branch 8d79a69 tree) on the SAME GPU, 2026-08-07
+# vllm: `vllm bench serve --dataset-name random --random-input-len L --random-output-len 128 --max-concurrency 1 --num-prompts 3`
+# plow: `plowrt amd-bench --steps 48 --ctx L` (serve-gated blob: temp-0 'Paris')
+ctx,round,vllm_tpot_ms,plow_ms_token
+16384,1,11.68,10.870
+16384,2,11.67,10.873
+32768,1,14.17,11.325
+32768,2,14.10,11.315
+65408,1,16.12,12.292
+# plow SERVED (openai-chat via plowrt serve, same client): ctx,ttft_ms,tpot_ms
+# 4096,644.25,10.95  8192,1284.69,11.08  16384,2807.05,11.31  32768,6749.97,11.81
+# vLLM cold TTFT same day: 16384,1858.63  32768,2205.59  65408,6819.49 (warm/prefix-cached: 109.30/186.41 @16k/32k)
