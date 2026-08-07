@@ -2712,7 +2712,10 @@ impl AmdEngine {
             b => b,
         };
         match VmmKv::new(Arc::clone(be) as Arc<dyn VmmOps>, geo, block_hint, 0) {
-            Ok(kv) => Some(kv),
+            Ok(mut kv) => {
+                kv.enable_block_pool(crate::memory::vmm::kv_pool_cap_from_env());
+                Some(kv)
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "vmm off: pool bringup failed");
                 None

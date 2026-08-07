@@ -10,7 +10,7 @@ use axum::Json;
 use futures::stream::{self, Stream};
 
 use crate::serve::openai::*;
-use crate::serve::stream::{self as stream_mod, FinishReason, StreamChunk};
+use crate::serve::stream::{self as stream_mod, StreamChunk};
 use crate::serve::{status_for, AppState};
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -363,10 +363,12 @@ async fn buffer_and_reply(
                 role: "assistant".into(),
                 content: Content::Text(text),
             },
-            finish_reason: match finish {
-                "length" => "length",
-                _ => "stop",
-            },
+            // Pass the reason through verbatim. This used to collapse
+            // everything but "length" into "stop", which was harmless with
+            // two variants — but "preempted" flattened to "stop" is a
+            // truncated answer claiming to be complete, the exact failure
+            // mode the `finish` comment above exists to prevent.
+            finish_reason: finish,
         }],
         usage,
     })
@@ -485,10 +487,7 @@ fn sse_response(
                                     role: None,
                                     content: None,
                                 },
-                                finish_reason: Some(match reason {
-                                    FinishReason::Length => "length",
-                                    FinishReason::Stop => "stop",
-                                }),
+                                finish_reason: Some(reason.as_str()),
                             }],
                             usage: None,
                         };

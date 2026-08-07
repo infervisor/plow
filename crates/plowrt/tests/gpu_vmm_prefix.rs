@@ -88,8 +88,12 @@ fn serve_measured(e: &mut GpuEngine, b: usize, ids: &[u32], max_new: usize) -> (
     r
 }
 
+/// Block acquisitions: fresh driver creates PLUS reuse-pool draws. The dedup
+/// ledger below counts how many blocks a sequence NEEDED; whether one came
+/// from `cuMemCreate` or the engine's block pool (`VmmKv::enable_block_pool`,
+/// on by default) is an optimization the ledger must be blind to.
 fn created(s: &plowrt::memory::vmm::VmmStats) -> u64 {
-    s.blocks_created
+    s.blocks_created + s.blocks_reused
 }
 
 #[test]

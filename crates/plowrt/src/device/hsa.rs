@@ -593,6 +593,11 @@ pub struct HsaBackend {
     /// Cached fill source for [`HsaBackend::memset_d8`]. HSA has no
     /// queue-ordered fill, so a memset is a copy, and a copy needs a source.
     fill_stage: parking_lot::Mutex<Option<FillStage>>,
+    /// Physical slab chunks kept across loads (`PLOW_SLAB_KEEP` /
+    /// `VmmOps::pool_put`/`pool_take`) — the ROCr counterpart of
+    /// `CudaBackend::slab_pool`. Device-local by construction (one backend per
+    /// agent, chunks created against this agent's `vram_pool`).
+    slab_pool: parking_lot::Mutex<Vec<(u64, u64)>>,
 }
 
 /// Preallocated fill source: `len` bytes of fine-grained memory already set to
@@ -821,6 +826,7 @@ impl HsaBackend {
             zero_stage: parking_lot::Mutex::new(None),
             peer_host_writable: std::sync::atomic::AtomicBool::new(false),
             fill_stage: parking_lot::Mutex::new(None),
+            slab_pool: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -854,6 +860,12 @@ impl HsaBackend {
 
 impl Drop for HsaBackend {
     fn drop(&mut self) {
+        // Pooled slab chunks (PLOW_SLAB_KEEP) are released here — the pool's
+        // whole point is to outlive engines, so the backend is its terminal
+        // owner (same contract as `CudaBackend::drop`).
+        for (h, _) in self.slab_pool.lock().drain(..) {
+            crate::memory::vmm::VmmOps::release(self, h);
+        }
         if let Some(fs) = self.fill_stage.lock().take() {
             unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(fs.ptr) };
         }
@@ -3069,5 +3081,39 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
 
     fn copy_dtod(&self, dst: u64, src: u64, bytes: u64) -> Result<()> {
         self.memcpy_dtod(dst, src, bytes)
+    }
+
+    fn pool_take(&self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut *self.slab_pool.lock())
+    }
+
+    fn pool_put(&self, mut chunks: Vec<(u64, u64)>) {
+        self.slab_pool.lock().append(&mut chunks);
+    }
+
+    fn pool_bytes(&self) -> u64 {
+        self.slab_pool.lock().iter().map(|&(_, b)| b).sum()
+    }
+
+    fn pool_trim(&self, keep_bytes: u64) -> u64 {
+        // Victims picked under the lock, released outside it (the release is
+        // a runtime call that can block).
+        let victims = {
+            let mut pool = self.slab_pool.lock();
+            let mut held: u64 = pool.iter().map(|&(_, b)| b).sum();
+            let mut victims = Vec::new();
+            while held > keep_bytes {
+                let Some((h, b)) = pool.pop() else { break };
+                held -= b;
+                victims.push((h, b));
+            }
+            victims
+        };
+        let mut released = 0u64;
+        for &(h, b) in &victims {
+            crate::memory::vmm::VmmOps::release(self, h);
+            released += b;
+        }
+        released
     }
 }

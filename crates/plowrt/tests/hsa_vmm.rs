@@ -39,14 +39,25 @@ fn gpu_enabled() -> bool {
 }
 
 /// One process-global backend — `hsa_init` is not re-entrant across backends
-/// (see the note in `hsa_primitives.rs`).
-fn backend() -> &'static HsaBackend {
-    static BE: std::sync::OnceLock<HsaBackend> = std::sync::OnceLock::new();
+/// (see the note in `hsa_primitives.rs`). Held in an `Arc` so the slab-pool
+/// test can hand the SAME instance to `VmmSlab::new` (a second backend is not
+/// an option).
+static BE: std::sync::OnceLock<std::sync::Arc<HsaBackend>> = std::sync::OnceLock::new();
+
+fn backend_init() -> &'static std::sync::Arc<HsaBackend> {
     BE.get_or_init(|| {
-        HsaBackend::new(0).unwrap_or_else(|e| {
+        std::sync::Arc::new(HsaBackend::new(0).unwrap_or_else(|e| {
             panic!("PLOW_GPU_TEST=1 but no HSA device: {e}");
-        })
+        }))
     })
+}
+
+fn backend_arc() -> std::sync::Arc<HsaBackend> {
+    std::sync::Arc::clone(backend_init())
+}
+
+fn backend() -> &'static HsaBackend {
+    &**backend_init()
 }
 
 /// Read `dst.len()` bytes back from a raw device VA. `DeviceMem` has no public
@@ -220,4 +231,75 @@ fn map_and_set_access_cost_per_block() {
         }
         VmmOps::address_free(be, va, span);
     }
+}
+
+/// The physical-chunk pool on ROCr (`pool_put`/`pool_bytes`/`pool_trim`/
+/// `pool_take` — the AMD side of `PLOW_SLAB_KEEP`), then the full reload
+/// shape: a kept `VmmSlab`'s chunks must feed the next slab's mapper instead
+/// of re-paying `hsa_amd_vmem_handle_create`.
+///
+/// Mutates `PLOW_SLAB_KEEP` — run with `--test-threads=1` as this file's
+/// header already requires.
+#[test]
+fn slab_chunk_pool_roundtrip_and_reuse() {
+    if !gpu_enabled() {
+        eprintln!("skipped: set PLOW_GPU_TEST=1 (needs an HSA GPU)");
+        return;
+    }
+    let be = backend();
+    let gran = VmmOps::granularity(be).expect("granularity");
+    let chunk = 4 * gran;
+
+    // Raw ledger: put two chunks, trim to one, take the survivor.
+    let h1 = VmmOps::create(be, chunk).expect("create h1");
+    let h2 = VmmOps::create(be, chunk).expect("create h2");
+    be.pool_put(vec![(h1, chunk), (h2, chunk)]);
+    assert_eq!(be.pool_bytes(), 2 * chunk);
+    assert_eq!(
+        be.pool_trim(chunk),
+        chunk,
+        "trim releases down to the bound"
+    );
+    assert_eq!(be.pool_bytes(), chunk);
+    let took = be.pool_take();
+    assert_eq!(took.len(), 1);
+    assert_eq!(be.pool_bytes(), 0, "take drains the pool");
+    for (h, _) in took {
+        VmmOps::release(be, h);
+    }
+
+    // Reload shape: slab 1 drops with PLOW_SLAB_KEEP=1 (chunks pool), slab 2
+    // of the same chunking re-maps them (pool drains at its bringup), and its
+    // drop with the flag off releases everything.
+    let bytes = 4 * chunk;
+    std::env::set_var("PLOW_SLAB_KEEP", "1");
+    let slab = plowrt::memory::vmm::VmmSlab::new(
+        backend_arc() as std::sync::Arc<dyn VmmOps>,
+        bytes,
+        chunk,
+    )
+    .expect("slab 1");
+    slab.wait_mapped(bytes).expect("slab 1 mapped");
+    drop(slab);
+    assert_eq!(be.pool_bytes(), bytes, "kept drop pooled every chunk");
+
+    let slab2 = plowrt::memory::vmm::VmmSlab::new(
+        backend_arc() as std::sync::Arc<dyn VmmOps>,
+        bytes,
+        chunk,
+    )
+    .expect("slab 2");
+    slab2.wait_mapped(bytes).expect("slab 2 mapped");
+    assert_eq!(
+        be.pool_bytes(),
+        0,
+        "slab 2's mapper drew every pooled chunk"
+    );
+    std::env::remove_var("PLOW_SLAB_KEEP");
+    drop(slab2);
+    assert_eq!(
+        be.pool_bytes(),
+        0,
+        "flag off: drop releases, nothing pooled"
+    );
 }

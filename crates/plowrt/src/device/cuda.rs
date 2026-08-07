@@ -1263,6 +1263,32 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
     fn pool_put(&self, mut chunks: Vec<(u64, u64)>) {
         self.slab_pool.lock().append(&mut chunks);
     }
+
+    fn pool_bytes(&self) -> u64 {
+        self.slab_pool.lock().iter().map(|&(_, b)| b).sum()
+    }
+
+    fn pool_trim(&self, keep_bytes: u64) -> u64 {
+        // Collect victims under the lock, release outside it — cuMemRelease
+        // re-binds the context and can take ms-class time per chunk.
+        let victims = {
+            let mut pool = self.slab_pool.lock();
+            let mut held: u64 = pool.iter().map(|&(_, b)| b).sum();
+            let mut victims = Vec::new();
+            while held > keep_bytes {
+                let Some((h, b)) = pool.pop() else { break };
+                held -= b;
+                victims.push((h, b));
+            }
+            victims
+        };
+        let mut released = 0u64;
+        for &(h, b) in &victims {
+            crate::memory::vmm::VmmOps::release(self, h);
+            released += b;
+        }
+        released
+    }
 }
 
 impl Drop for CudaBackend {

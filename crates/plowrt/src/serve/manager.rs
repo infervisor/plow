@@ -39,6 +39,7 @@ use rustc_hash::FxHashMap;
 
 use crate::asset::devblob::DevBlob;
 use crate::device::cuda::CudaBackend;
+use crate::memory::vmm::VmmOps;
 use crate::serve::mux::{self, MuxConfig};
 use crate::serve::AppState;
 use crate::{Result, RuntimeError};
@@ -65,6 +66,15 @@ impl BlobPlan {
     /// Sum of every device tensor the engine will allocate.
     pub fn tensor_total(&self) -> u64 {
         self.weights_bytes + self.kv_bytes + self.other_bytes
+    }
+
+    /// Bytes of this model's load the weight slab can satisfy from pooled
+    /// physical chunks (`VmmOps::pool_take`): the slab backs every non-VMM-KV
+    /// blob tensor, which is at least weights + other. (With the VMM prefix
+    /// cache off, KV rides the slab too — this then under-credits, which only
+    /// costs reuse, never correctness.)
+    pub fn slab_reusable(&self) -> u64 {
+        self.weights_bytes + self.other_bytes
     }
 
     /// Classify one blob tensor into the plan. Free-standing so it is
@@ -208,6 +218,16 @@ impl ModelManager {
                 plan,
             });
         }
+        if managed.len() > 1 {
+            // Multi-model serving: keep dropped weight slabs' physical chunks
+            // pooled so a switch re-maps them (µs-class) instead of re-paying
+            // the driver's serial page commit (~13 GiB/s). Safe to default on
+            // HERE because this planner credits the pool in its fit check
+            // (`pool_bytes`) and trims what a target cannot consume
+            // (`pool_trim`). `PLOW_SLAB_KEEP=0` force-disables.
+            crate::memory::vmm::set_slab_keep_default(true);
+            tracing::info!("planner: slab chunk pool enabled (multi-model)");
+        }
         Ok(ModelManager {
             state: Arc::downgrade(state),
             be,
@@ -306,8 +326,12 @@ impl ModelManager {
     /// Make `slug` resident, evicting LRU residents if the planner requires
     /// it. Fast no-lock path when already resident. Concurrent callers for a
     /// non-resident model serialize on the switch lock and coalesce on the
-    /// post-lock recheck.
-    pub async fn ensure_resident(&self, slug: &str) -> std::result::Result<(), EnsureError> {
+    /// post-lock recheck (a speculative preload in flight for `slug` counts —
+    /// the caller waits on the same lock and finds the model resident).
+    pub async fn ensure_resident(
+        self: &Arc<Self>,
+        slug: &str,
+    ) -> std::result::Result<(), EnsureError> {
         if !self.manages(slug) {
             return Err(EnsureError::Load(RuntimeError::UnknownModel(slug.into())));
         }
@@ -333,9 +357,27 @@ impl ModelManager {
         };
 
         // Evict LRU residents until the target fits (or nothing is left).
+        // Pooled slab chunks (an evicted model's kept physical memory) count
+        // toward the target: the incoming weight slab re-maps them instead of
+        // allocating fresh VRAM, so `free + pool` is the honest capacity.
+        // The trim comes FIRST, every iteration (each evict can grow the
+        // pool): chunks beyond what the target's slab can consume must be
+        // REAL free memory before the load — tables, VMM KV blocks and
+        // overhead all allocate fresh — and holding them uncredited squeezed
+        // a fitting switch into WontFit (a 30 GiB victim pool credited at a
+        // 24 GiB target's cap left 5.7 GiB dead).
+        let reusable_cap = m.plan.slab_reusable();
         loop {
+            let trimmed = VmmOps::pool_trim(&*self.be, reusable_cap);
+            if trimmed > 0 {
+                tracing::info!(
+                    trimmed_mib = trimmed >> 20,
+                    "planner: released pooled chunks the target cannot reuse"
+                );
+            }
             let free = self.free_vram().map_err(EnsureError::Load)?;
-            if free >= need {
+            let credit = VmmOps::pool_bytes(&*self.be);
+            if free + credit >= need {
                 break;
             }
             let victims: Vec<String> = self
@@ -348,10 +390,13 @@ impl ModelManager {
                 tracing::warn!(
                     %slug,
                     need_gib = gib(need),
-                    free_gib = gib(free),
+                    free_gib = gib(free + credit),
                     "planner: switch cannot fit — shedding"
                 );
-                return Err(EnsureError::WontFit { need, free });
+                return Err(EnsureError::WontFit {
+                    need,
+                    free: free + credit,
+                });
             };
             let (drain_ms, unload_ms) = self.evict(&victim).await?;
             report.evicted.push((victim, drain_ms, unload_ms));
@@ -371,17 +416,91 @@ impl ModelManager {
         );
         *self.last_switch.lock() = Some(report);
         self.touch(slug);
+        self.maybe_preload();
         Ok(())
+    }
+
+    /// After a switch: if spare VRAM fits the hottest non-resident model
+    /// WITHOUT evicting anyone, load it in the background. A later request
+    /// for it then finds it resident — or coalesces on the switch lock while
+    /// the preload finishes — instead of paying the full 2 s-class switch.
+    /// A no-op when nothing fits; `PLOW_PRELOAD=0` disables.
+    fn maybe_preload(self: &Arc<Self>) {
+        if std::env::var("PLOW_PRELOAD").ok().as_deref() == Some("0") {
+            return;
+        }
+        let mgr = Arc::clone(self);
+        tokio::spawn(async move {
+            // The switch lock makes residency and free-VRAM stable for the
+            // candidate pick, and lets a real request for the preloading
+            // model coalesce instead of double-loading. A request for a
+            // THIRD model queues behind the preload — the cost cap is one
+            // load, which that request was already going to pay.
+            let _g = mgr.switch.lock().await;
+            let Some(slug) = mgr.preload_candidate() else {
+                return;
+            };
+            let m = mgr
+                .models
+                .iter()
+                .find(|m| m.slug == slug)
+                .expect("candidate is managed");
+            VmmOps::pool_trim(&*mgr.be, m.plan.slab_reusable());
+            let t0 = Instant::now();
+            match mgr.load_model(m).await {
+                Ok(()) => {
+                    tracing::info!(%slug, load_ms = ms(t0), "planner: speculative preload complete")
+                }
+                Err(e) => tracing::warn!(%slug, error = %e, "planner: speculative preload failed"),
+            }
+        });
+    }
+
+    /// Hottest (most-recently-requested) non-resident model whose requirement
+    /// fits free VRAM plus usable pooled chunks — no eviction considered.
+    fn preload_candidate(&self) -> Option<String> {
+        let free = self.free_vram().ok()?;
+        let pool = VmmOps::pool_bytes(&*self.be);
+        let last_use = self.last_use.lock();
+        self.models
+            .iter()
+            .filter(|m| !self.is_resident(&m.slug))
+            .filter(|m| {
+                let credit = pool.min(m.plan.slab_reusable());
+                self.required(&m.slug).expect("managed") + RESERVE <= free + credit
+            })
+            .max_by_key(|m| last_use.get(&m.slug).copied())
+            .map(|m| m.slug.clone())
     }
 
     /// Tear one resident model down: remove the mux (new submits fail fast),
     /// drain in-flight generations, then drop the engine — VRAM returns to the
     /// driver (a36aa30/d058626 lifecycle). Returns `(drain_ms, unload_ms)`.
+    ///
+    /// The drain is graceful (every live slot runs to completion — unbounded,
+    /// O(max_tokens × service_ms)) unless `PLOW_DRAIN_TIMEOUT_MS` is set:
+    /// then generations get that long to finish before the remainder is
+    /// preempted (`ModelMux::preempt` — streams close with
+    /// `finish_reason: "preempted"` and the tokens produced so far), bounding
+    /// the switch's drain phase. `0` preempts immediately.
     async fn evict(&self, slug: &str) -> std::result::Result<(f64, f64), EnsureError> {
         let state = self.state()?;
         let t0 = Instant::now();
         if let Some(mux) = state.remove_mux(slug) {
-            mux.drain().await;
+            match drain_timeout_ms() {
+                None => mux.drain().await,
+                Some(ms) => {
+                    let deadline = std::time::Duration::from_millis(ms);
+                    if tokio::time::timeout(deadline, mux.drain()).await.is_err() {
+                        tracing::info!(
+                            %slug,
+                            timeout_ms = ms,
+                            "drain deadline passed — preempting live generations"
+                        );
+                        mux.preempt().await;
+                    }
+                }
+            }
         }
         let drain_ms = ms(t0);
 
@@ -417,6 +536,7 @@ impl ModelManager {
         }
 
         let (free_before, _) = self.be.mem_info().map_err(EnsureError::Load)?;
+        let pool_before = VmmOps::pool_bytes(&*self.be);
         let be = Arc::clone(&self.be);
         let (dir, ckpt) = (m.dir.clone(), m.ckpt.clone());
         let engine =
@@ -425,10 +545,14 @@ impl ModelManager {
                 .map_err(|e| EnsureError::Load(RuntimeError::Msg(format!("load task: {e}"))))?
                 .map_err(EnsureError::Load)?;
         let (free_after, _) = self.be.mem_info().map_err(EnsureError::Load)?;
+        let pool_after = VmmOps::pool_bytes(&*self.be);
 
         // First-load calibration: measured footprint minus the planned tensor
-        // bytes = module/table/allocator overhead for this assets dir.
-        let used = free_before.saturating_sub(free_after);
+        // bytes = module/table/allocator overhead for this assets dir. Pool
+        // chunks the slab consumed moved from the pool ledger into the engine
+        // without touching `free` — count both ledgers or reused chunks make
+        // the model look smaller than it is.
+        let used = (free_before + pool_before).saturating_sub(free_after + pool_after);
         let measured = used.saturating_sub(m.plan.tensor_total());
         self.overhead
             .lock()
@@ -450,6 +574,13 @@ impl ModelManager {
         state.install_mux(m.slug.clone(), mux);
         Ok(())
     }
+}
+
+/// `PLOW_DRAIN_TIMEOUT_MS`: how long an eviction lets in-flight generations
+/// finish before preempting them. Unset = graceful unbounded drain (the
+/// pre-existing behavior); read per-evict so an in-process flip is honored.
+fn drain_timeout_ms() -> Option<u64> {
+    std::env::var("PLOW_DRAIN_TIMEOUT_MS").ok()?.parse().ok()
 }
 
 /// Least-recently-used pick: the resident slug with the oldest (or absent)

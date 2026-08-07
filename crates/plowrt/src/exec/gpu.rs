@@ -2741,8 +2741,11 @@ impl GpuEngine {
             block_hint,
             cache_cap,
         ) {
-            Ok(kv) => Some(VmmServe {
-                kv,
+            Ok(mut kv) => Some(VmmServe {
+                kv: {
+                    kv.enable_block_pool(crate::memory::vmm::kv_pool_cap_from_env());
+                    kv
+                },
                 slide,
                 slide_scale,
                 full_scale,

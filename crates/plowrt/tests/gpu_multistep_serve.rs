@@ -73,14 +73,16 @@ async fn multi_step_serve_greedy_paris() {
     let execset = Arc::new(ExecutorSet::bringup(backend).expect("execset"));
     let state = Arc::new(AppState::with_trace(registry, execset, false));
 
-    let mgr = ModelManager::new(
-        Arc::clone(&be),
-        &state,
-        MuxConfig::default(),
-        vec![(slug.clone(), assets.clone(), assets.join("checkpoint"))],
-        None,
-    )
-    .expect("manager");
+    let mgr = Arc::new(
+        ModelManager::new(
+            Arc::clone(&be),
+            &state,
+            MuxConfig::default(),
+            vec![(slug.clone(), assets.clone(), assets.join("checkpoint"))],
+            None,
+        )
+        .expect("manager"),
+    );
     mgr.ensure_resident(&slug).await.expect("ensure_resident");
 
     let prompt = "<bos><|turn>user\nWhat is the capital of France? Answer in one word.<turn|>\n\

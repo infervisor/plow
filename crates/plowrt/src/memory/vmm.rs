@@ -91,6 +91,22 @@ pub trait VmmOps: Send + Sync {
             self.release(h);
         }
     }
+
+    /// Bytes currently held in the backend's physical-chunk pool. The serve
+    /// planner credits this against a switch target's requirement — pooled
+    /// chunks are VRAM the incoming slab re-maps instead of re-creating.
+    fn pool_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Release pooled chunks until at most `keep_bytes` remain; returns the
+    /// bytes actually released. The planner trims to what the incoming
+    /// model's slab can consume, so credited-but-unconsumable pool VRAM goes
+    /// back to the driver before the load needs it as free memory.
+    fn pool_trim(&self, keep_bytes: u64) -> u64 {
+        let _ = keep_bytes;
+        0
+    }
 }
 
 /// KV geometry of the model the engine loaded, resolved from the checkpoint's
@@ -229,6 +245,12 @@ pub struct VmmStats {
     /// Prompt rows served from the cache across all attaches (KV never
     /// recomputed) — the numerator of the fleet hit-rate.
     pub tokens_attached: u64,
+    /// Physical blocks currently parked in the reuse pool (unmapped, holding
+    /// VRAM). See [`VmmKv::enable_block_pool`].
+    pub blocks_pooled: u64,
+    /// Block requests served from the reuse pool instead of `create` — each
+    /// one a driver page-commit skipped on the request path.
+    pub blocks_reused: u64,
 }
 
 /// One physical sharing block: driver handle + mapping/cache refcount.
@@ -285,6 +307,9 @@ struct Inner {
     tracks: Vec<Track>,
     blocks: Vec<Block>,
     free_ids: Vec<u32>,
+    /// Zero-ref physical handles kept for reuse instead of released
+    /// ([`VmmKv::enable_block_pool`]); every entry is `block_bytes` long.
+    pooled: Vec<u64>,
     /// Whole blocks mapped per sequence (uniform across tracks/heads).
     seq_blocks: Vec<u32>,
     cache: PrefixCache,
@@ -309,6 +334,10 @@ struct Shared {
     head_span: u64,
     /// Cache soft cap in bytes (0 = only OOM-driven eviction).
     cache_cap: u64,
+    /// Max handles the reuse pool may hold (0 = pooling off, the default).
+    /// Set once by [`VmmKv::enable_block_pool`]; atomic only so `deref_block`
+    /// can read it without threading a config borrow through `Inner`.
+    pool_cap: AtomicU32,
     inner: Mutex<Inner>,
     /// Per-seq mapped-row frontier, readable lock-free on the decode path.
     frontier: Vec<AtomicU32>,
@@ -321,6 +350,11 @@ pub struct VmmKv {
     shared: Arc<Shared>,
     premap_tx: Option<std::sync::mpsc::Sender<(u32, u32)>>,
     premap_join: Option<std::thread::JoinHandle<()>>,
+    /// Pre-creator thread ([`Self::enable_block_pool`]): stop flag + join.
+    precreate: Option<(
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    )>,
 }
 
 impl VmmKv {
@@ -401,10 +435,12 @@ impl VmmKv {
             bph,
             head_span,
             cache_cap,
+            pool_cap: AtomicU32::new(0),
             inner: Mutex::new(Inner {
                 tracks,
                 blocks: Vec::new(),
                 free_ids: Vec::new(),
+                pooled: Vec::new(),
                 seq_blocks: vec![0; batch],
                 cache,
                 node_blocks: FxHashMap::default(),
@@ -455,7 +491,64 @@ impl VmmKv {
             shared,
             premap_tx: Some(tx),
             premap_join: Some(join),
+            precreate: None,
         })
+    }
+
+    /// Turn on physical-block reuse: zero-ref blocks park in a pool (up to
+    /// `cap_bytes`) instead of being released, and `ensure_rows` draws from
+    /// the pool before calling the driver — the request path pays map +
+    /// set_access (µs-class) instead of `cuMemCreate`'s serial page commit
+    /// (~13 GiB/s measured, 5-30 ms of TTFT for a fresh sequence's first
+    /// window). A background thread pre-creates roughly two window columns'
+    /// worth of blocks so even the FIRST request after load skips the commit.
+    ///
+    /// Opt-in (engines call this off `PLOW_KV_POOL_MIB`, default 512): pooled
+    /// blocks hold VRAM while idle, and the exact-driver-call-count unit tests
+    /// rely on the default-off behavior.
+    pub fn enable_block_pool(&mut self, cap_bytes: u64) {
+        use std::sync::atomic::AtomicBool;
+        let s = &self.shared;
+        let cap_blocks = (cap_bytes / s.block_bytes).min(u32::MAX as u64) as u32;
+        s.pool_cap.store(cap_blocks, Ordering::Relaxed);
+        if cap_blocks == 0 || self.precreate.is_some() {
+            return;
+        }
+        // Two window columns for a fresh sequence: what `ensure_rows` maps
+        // before decode settles into the premap thread's +2 lookahead.
+        let ntracks = s.inner.lock().tracks.len() as u32;
+        let target = (ntracks * s.geo.kvh_full * 2).min(cap_blocks) as usize;
+        if target == 0 {
+            return;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let (t_s, t_stop) = (Arc::clone(&self.shared), Arc::clone(&stop));
+        let join = std::thread::Builder::new()
+            .name("vmm-kv-pool".into())
+            .spawn(move || {
+                for _ in 0..target {
+                    if t_stop.load(Ordering::Acquire) || t_s.inner.lock().pooled.len() >= target {
+                        break;
+                    }
+                    // Create OUTSIDE the lock — this thread must never add
+                    // its commit latency to a concurrent request's
+                    // `ensure_rows`.
+                    match t_s.ops.create(t_s.block_bytes) {
+                        Ok(h) => {
+                            let mut inner = t_s.inner.lock();
+                            inner.pooled.push(h);
+                            inner.stats.blocks_pooled += 1;
+                            inner.stats.blocks_created += 1;
+                        }
+                        // Best-effort: a card too full to pre-create serves
+                        // demand through create_block's evict-on-OOM path.
+                        Err(_) => break,
+                    }
+                }
+            });
+        if let Ok(j) = join {
+            self.precreate = Some((stop, j));
+        }
     }
 
     /// VA base of the (layer, tensor) full-layer KV tensor — what the engine
@@ -582,12 +675,8 @@ impl VmmKv {
                         let slot = slot_index(s, seq, h, k);
                         if let Some(id) = inner.tracks[t].slots[slot].take() {
                             unmaps.push(slot_va(s, &inner.tracks[t], seq, h, k));
-                            let b = &mut inner.blocks[id as usize];
-                            b.refs -= 1;
-                            if b.refs == 0 {
-                                frees.push(b.handle);
-                                inner.stats.blocks_live -= 1;
-                                inner.free_ids.push(id);
+                            if let Some(h) = unref_block(s, &mut inner, id) {
+                                frees.push(h);
                             }
                         }
                     }
@@ -684,12 +773,8 @@ impl VmmKv {
                     for k in 0..s.bph {
                         let slot = slot_index(s, seq, h, k);
                         if let Some(id) = inner.tracks[t].slots[slot].take() {
-                            let blk = &mut inner.blocks[id as usize];
-                            blk.refs -= 1;
-                            if blk.refs == 0 {
-                                orphans.push(blk.handle);
-                                inner.stats.blocks_live -= 1;
-                                inner.free_ids.push(id);
+                            if let Some(h) = unref_block(s, &mut inner, id) {
+                                orphans.push(h);
                             }
                         }
                     }
@@ -853,6 +938,10 @@ impl Drop for VmmKv {
         if let Some(j) = self.premap_join.take() {
             let _ = j.join();
         }
+        if let Some((stop, j)) = self.precreate.take() {
+            stop.store(true, Ordering::Release);
+            let _ = j.join();
+        }
         let s = &self.shared;
         let mut inner = s.inner.lock();
         for seq in 0..s.geo.batch as usize {
@@ -866,6 +955,10 @@ impl Drop for VmmKv {
         for (_, snap) in std::mem::take(&mut inner.published) {
             s.ops.free(snap.va);
         }
+        for handle in std::mem::take(&mut inner.pooled) {
+            s.ops.release(handle);
+        }
+        inner.stats.blocks_pooled = 0;
         debug_assert_eq!(inner.stats.blocks_live, 0, "vmm blocks leaked at drop");
         let span = s.geo.batch as u64 * s.geo.kvh_full as u64 * s.head_span;
         for t in &inner.tracks {
@@ -915,31 +1008,48 @@ fn ensure_rows(s: &Shared, seq: usize, rows: u32) -> Result<()> {
     Ok(())
 }
 
-/// Create one physical block, evicting cache LRU on allocation failure
-/// (the OOM half of finding #9's auto-eviction).
+/// Create one physical block — reuse-pool first ([`VmmKv::enable_block_pool`]),
+/// then the driver, evicting cache LRU on allocation failure (the OOM half of
+/// finding #9's auto-eviction).
+///
+/// The pool check lives INSIDE the retry loop: an eviction's zero-ref blocks
+/// park in the pool rather than freeing VRAM, so after `evict_one` the next
+/// usable block is a pooled handle, not a driver create — checking the pool
+/// only on entry would spin `create`-fail/evict until the cache ran dry and
+/// then report a spurious OOM with reusable handles in hand.
 fn create_block(s: &Shared, inner: &mut Inner) -> Result<u32> {
     loop {
+        if let Some(handle) = inner.pooled.pop() {
+            inner.stats.blocks_pooled -= 1;
+            inner.stats.blocks_reused += 1;
+            inner.stats.blocks_live += 1;
+            return Ok(install_block(inner, Block { handle, refs: 1 }));
+        }
         match s.ops.create(s.block_bytes) {
             Ok(handle) => {
                 inner.stats.blocks_created += 1;
                 inner.stats.blocks_live += 1;
-                let block = Block { handle, refs: 1 };
-                return Ok(match inner.free_ids.pop() {
-                    Some(id) => {
-                        inner.blocks[id as usize] = block;
-                        id
-                    }
-                    None => {
-                        inner.blocks.push(block);
-                        (inner.blocks.len() - 1) as u32
-                    }
-                });
+                return Ok(install_block(inner, Block { handle, refs: 1 }));
             }
             Err(e) => {
                 if !evict_one(s, inner) {
                     return Err(RuntimeError::Oom(format!("vmm kv block: {e}")));
                 }
             }
+        }
+    }
+}
+
+/// Slot a block into the table, recycling a freed id when one exists.
+fn install_block(inner: &mut Inner, block: Block) -> u32 {
+    match inner.free_ids.pop() {
+        Some(id) => {
+            inner.blocks[id as usize] = block;
+            id
+        }
+        None => {
+            inner.blocks.push(block);
+            (inner.blocks.len() - 1) as u32
         }
     }
 }
@@ -964,12 +1074,29 @@ fn evict_one(s: &Shared, inner: &mut Inner) -> bool {
 }
 
 fn deref_block(s: &Shared, inner: &mut Inner, id: u32) {
+    if let Some(h) = unref_block(s, inner, id) {
+        s.ops.release(h);
+    }
+}
+
+/// Drop one reference; at zero, park the handle in the reuse pool (under the
+/// cap) or hand it back. A returned handle is the CALLER's to release — the
+/// attach path batches its releases outside the `inner` lock.
+fn unref_block(s: &Shared, inner: &mut Inner, id: u32) -> Option<u64> {
     let b = &mut inner.blocks[id as usize];
     b.refs -= 1;
-    if b.refs == 0 {
-        s.ops.release(b.handle);
-        inner.stats.blocks_live -= 1;
-        inner.free_ids.push(id);
+    if b.refs != 0 {
+        return None;
+    }
+    let handle = b.handle;
+    inner.stats.blocks_live -= 1;
+    inner.free_ids.push(id);
+    if inner.pooled.len() < s.pool_cap.load(Ordering::Relaxed) as usize {
+        inner.pooled.push(handle);
+        inner.stats.blocks_pooled += 1;
+        None
+    } else {
+        Some(handle)
     }
 }
 
@@ -997,13 +1124,40 @@ fn release_window(s: &Shared, inner: &mut Inner, seq: usize) {
 /// ~13 GiB/s page commit — a same-box model reload or S1 switch drops from
 /// ~1.9 s to ~0.4 s.
 ///
-/// **Opt-in, off by default, deliberately:** pooled chunks hold VRAM between
-/// loads, and the serve planner's free-VRAM arithmetic (`serve::manager`'s
-/// fit check, the lifecycle tests' return-to-baseline assert) does not credit
-/// the pool. Flip the default only together with planner awareness. Read
-/// per-drop (not cached) so an in-process flip is honored.
+/// **Off by default outside multi-model serving:** pooled chunks hold VRAM
+/// between loads, and only `serve::manager`'s planner credits the pool
+/// ([`VmmOps::pool_bytes`] in its fit check, [`VmmOps::pool_trim`] before a
+/// load). The manager flips the process default on when it manages more than
+/// one model ([`set_slab_keep_default`]); everything else — single-model
+/// serves, the lifecycle tests' return-to-baseline assert — keeps the
+/// release-on-drop behavior. `PLOW_SLAB_KEEP=1`/`0` force-overrides either
+/// way. Read per-drop (not cached) so an in-process flip is honored.
 fn slab_keep_enabled() -> bool {
-    std::env::var("PLOW_SLAB_KEEP").ok().as_deref() == Some("1")
+    match std::env::var("PLOW_SLAB_KEEP").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => SLAB_KEEP_DEFAULT.load(Ordering::Relaxed),
+    }
+}
+
+static SLAB_KEEP_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set the process-wide default for keeping dropped slabs' physical chunks
+/// (see [`slab_keep_enabled`]). Called by the serve manager when its planner
+/// is pool-aware; `PLOW_SLAB_KEEP` still overrides.
+pub fn set_slab_keep_default(on: bool) {
+    SLAB_KEEP_DEFAULT.store(on, Ordering::Relaxed);
+}
+
+/// `PLOW_KV_POOL_MIB` — cap (MiB) for the KV physical-block reuse pool the
+/// engines hand to [`VmmKv::enable_block_pool`]. Default 512; 0 disables
+/// pooling entirely (every zero-ref block released, pre-creator not spawned).
+pub fn kv_pool_cap_from_env() -> u64 {
+    std::env::var("PLOW_KV_POOL_MIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(512)
+        << 20
 }
 
 /// Physical-commit chunk for [`VmmSlab`]-backed weight slabs. The CUDA driver
@@ -1678,6 +1832,118 @@ mod tests {
         assert!(ops.pool.lock().unwrap().is_empty(), "pool drained");
         drop(slab); // PLOW_SLAB_KEEP unset → all four released
         assert_eq!(ops.releases.load(Ordering::SeqCst), 4);
+    }
+
+    /// Spin until the pre-creator has parked `want` blocks (it runs on its
+    /// own thread; the tests need a settled pool before asserting counters).
+    fn wait_pooled(p: &VmmKv, want: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while p.stats().blocks_pooled < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pre-creator never reached {want} pooled blocks"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// `enable_block_pool`: the pre-creator fills the pool off the request
+    /// path, `ensure_rows` draws from it instead of the driver, zero-ref
+    /// blocks park back in the pool, and Drop releases every parked handle.
+    #[test]
+    fn kv_block_pool_recycles_and_precreates() {
+        let ops = Arc::new(MockVmm::default());
+        // uniform_pool: 2 full layers × K/V = 4 tracks, 1 kv head, 64 B
+        // blocks → pre-create target = 4 × 1 × 2 = 8 blocks.
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_pool(8 * 64);
+        wait_pooled(&p, 8);
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 8);
+
+        // One window column (8 rows) = 4 blocks — all served from the pool.
+        p.ensure_rows(0, 8).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 8, "no driver create");
+        let st = p.stats();
+        assert_eq!(st.blocks_reused, 4);
+        assert_eq!(st.blocks_pooled, 4);
+        assert_eq!(st.blocks_live, 4);
+
+        // Window reset derefs to zero refs → blocks park, none released.
+        p.begin_seq(0);
+        p.ensure_rows(0, 8).unwrap();
+        assert_eq!(
+            ops.creates.load(Ordering::SeqCst),
+            8,
+            "recycled, not created"
+        );
+        p.begin_seq(0);
+        assert_eq!(p.stats().blocks_pooled, 8);
+        assert_eq!(ops.releases.load(Ordering::SeqCst), 0);
+
+        drop(p);
+        assert_eq!(
+            ops.releases.load(Ordering::SeqCst),
+            8,
+            "every parked handle released at drop"
+        );
+    }
+
+    /// The pool cap bounds parked VRAM: overflowing zero-ref blocks release
+    /// to the driver instead of parking.
+    #[test]
+    fn kv_block_pool_cap_bounds_parked_blocks() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        // Cap = 2 blocks; pre-create target = min(2, 8) = 2.
+        p.enable_block_pool(2 * 64);
+        wait_pooled(&p, 2);
+
+        // Full window: 4 columns × 4 tracks = 16 blocks (2 reused, 14 fresh).
+        p.ensure_rows(0, 32).unwrap();
+        assert_eq!(ops.creates.load(Ordering::SeqCst), 16);
+        assert_eq!(p.stats().blocks_reused, 2);
+
+        // All 16 hit zero refs: 2 park (cap), 14 release.
+        p.begin_seq(0);
+        let st = p.stats();
+        assert_eq!(st.blocks_pooled, 2);
+        assert_eq!(ops.releases.load(Ordering::SeqCst), 14);
+    }
+
+    /// The OOM path with pooling on: eviction's zero-ref blocks PARK in the
+    /// pool (they don't free VRAM), so `create_block`'s retry loop must draw
+    /// the pool on every iteration. Checking it only on entry spun
+    /// create-fail/evict until the cache ran dry and reported OOM with
+    /// reusable handles in hand.
+    #[test]
+    fn oom_eviction_feeds_the_pool_not_the_driver() {
+        let ops = Arc::new(MockVmm::default());
+        let mut p = uniform_pool(ops.clone());
+        p.enable_block_pool(2 * 64); // cap 2 blocks; pre-creates 2
+        wait_pooled(&p, 2);
+
+        // Two cache-published columns on seq 0 (8 blocks held by the radix
+        // cache after the window drops), then release the window.
+        let pr = prompt(17);
+        p.ensure_rows(0, 17).unwrap();
+        p.publish(0, &pr, 4, |_| Ok(())).unwrap();
+        p.begin_seq(0);
+
+        // Every driver create now fails. Growing seq 1 by one column (4
+        // blocks) must succeed anyway: 2 from the pool, then an eviction
+        // parks its zero-ref blocks and the loop reuses them.
+        ops.fail_creates.store(1 << 20, Ordering::SeqCst);
+        let created_before = ops.creates.load(Ordering::SeqCst);
+        p.ensure_rows(1, 8).unwrap();
+        assert_eq!(
+            ops.creates.load(Ordering::SeqCst),
+            created_before,
+            "no driver create can have succeeded"
+        );
+        assert!(
+            p.stats().blocks_reused >= 4,
+            "growth must have been served from pooled handles"
+        );
     }
 
     #[test]

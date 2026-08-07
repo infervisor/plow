@@ -56,6 +56,10 @@ pub struct TokenUsage {
 pub enum FinishReason {
     Stop,
     Length,
+    /// The serve manager reclaimed the engine mid-generation (S1 switch with
+    /// preemptive drain) — the stream carries everything generated so far and
+    /// the client should retry for the remainder.
+    Preempted,
 }
 
 impl FinishReason {
@@ -63,6 +67,7 @@ impl FinishReason {
         match self {
             FinishReason::Stop => "stop",
             FinishReason::Length => "length",
+            FinishReason::Preempted => "preempted",
         }
     }
 }

@@ -173,6 +173,10 @@ pub struct Job {
 #[derive(Clone)]
 pub struct ModelMux {
     tx: mpsc::UnboundedSender<MuxMsg>,
+    /// Preempt request flag, checked by the dispatcher at every loop top —
+    /// the ONLY signal that reaches it while a full slot table keeps it away
+    /// from the message channel (see [`ModelMux::preempt`]).
+    preempt: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Internal messages to the dispatcher: jobs or control signals.
@@ -196,6 +200,22 @@ impl ModelMux {
     /// completion. Returns when every in-flight slot has finished. Use before
     /// `Registry::unload` to avoid mid-generation errors.
     pub async fn drain(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.tx.send(MuxMsg::Drain(tx));
+        let _ = rx.await;
+    }
+
+    /// Preemptive drain: close EVERY live stream now — `Done` with
+    /// [`FinishReason::Preempted`] and the usage so far — and free the slots,
+    /// instead of letting generations run out. Bounds an S1 switch's drain
+    /// phase at ~one tick where a graceful [`Self::drain`] is O(max_tokens ×
+    /// service_ms) — a 2048-token slot at 40 ms/token is an 82 s wait.
+    /// Returns when the dispatcher has exited.
+    pub async fn preempt(&self) {
+        self.preempt.store(true, Ordering::Release);
+        // The Drain message wakes a dispatcher blocked on recv (idle path)
+        // and carries the completion signal; the flag is what the tick loop
+        // sees when a full slot table keeps it off the channel.
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self.tx.send(MuxMsg::Drain(tx));
         let _ = rx.await;
@@ -265,6 +285,8 @@ pub fn spawn(
     cfg: MuxConfig,
 ) -> ModelMux {
     let (tx, mut rx) = mpsc::unbounded_channel::<MuxMsg>();
+    let preempt_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let preempt_seen = Arc::clone(&preempt_flag);
     let metrics = Arc::clone(&state.metrics);
 
     // Slot capacity from the compiler-emitted ladder — the largest decode
@@ -362,6 +384,14 @@ pub fn spawn(
             .then(|| crate::exec::engine_thread::EngineThread::spawn(format!("plow-eng-{slug}")));
 
         loop {
+            // Preempt ([`ModelMux::preempt`]): kill every live slot NOW.
+            // Checked at every loop top because a full slot table never
+            // reaches the message channel between ticks — this flag is the
+            // one bounded-latency path in.
+            if preempt_seen.swap(false, Ordering::AcqRel) {
+                preempt_slots(&mut slots, &arena);
+                draining = true;
+            }
             let live = slots.iter().filter(|s| s.is_some()).count();
 
             // Drain completion: if draining and no in-flight slots remain,
@@ -369,6 +399,29 @@ pub fn spawn(
             if draining && live == 0 {
                 if let Some(done) = drain_done.take() {
                     let _ = done.send(());
+                }
+                // A preempt's completion oneshot rides a Drain message that
+                // may still be queued (the flag outran the channel) — answer
+                // every pending one before exiting. Queued JOBS get an
+                // explicit Err, not a silent drop: the preempt flag bypasses
+                // channel order, so unlike a message-initiated drain these
+                // jobs never had their chance to be dequeued and admitted,
+                // and a stream that ends with no terminal chunk is
+                // indistinguishable from a crash (the shed path at the
+                // admission gate sets the precedent).
+                while let Ok(msg) = rx.try_recv() {
+                    match msg {
+                        MuxMsg::Drain(done) => {
+                            let _ = done.send(());
+                        }
+                        MuxMsg::Job(job) => {
+                            let _ = job.respond.try_send(StreamChunk::Err(
+                                crate::RuntimeError::Rejected(
+                                    "model preempted for an S1 switch — retry".into(),
+                                ),
+                            ));
+                        }
+                    }
                 }
                 break;
             }
@@ -689,7 +742,10 @@ pub fn spawn(
         }
     });
 
-    ModelMux { tx }
+    ModelMux {
+        tx,
+        preempt: preempt_flag,
+    }
 }
 
 /// Place a job into the first idle slot, asking the arena for the KV
@@ -781,6 +837,29 @@ fn admit_into(
 fn release_kv(arena: &Option<SharedKvState>, handle: Option<SlotHandle>) {
     if let (Some(a), Some(h)) = (arena.as_ref(), handle) {
         a.lock().arena.release_slot(h);
+    }
+}
+
+/// Close every live slot with `FinishReason::Preempted` — the stream carries
+/// everything generated so far plus honest usage, and the slot frees exactly
+/// as it does when a client disconnects mid-generation (the sanctioned
+/// teardown path: take the slot, release its KV; the engine's sequence slot
+/// is reclaimed on the next admit).
+fn preempt_slots(slots: &mut [Option<Slot>], arena: &Option<SharedKvState>) {
+    for slot_opt in slots.iter_mut() {
+        let Some(slot) = slot_opt.take() else {
+            continue;
+        };
+        let _ = slot.respond.try_send(StreamChunk::Done {
+            executed: slot.executed,
+            reason: FinishReason::Preempted,
+            usage: crate::serve::stream::TokenUsage {
+                prompt_tokens: slot.prompt_ids.len(),
+                cached_tokens: slot.cached_tokens,
+                completion_tokens: slot.out_ids.len(),
+            },
+        });
+        release_kv(arena, slot.kv);
     }
 }
 
