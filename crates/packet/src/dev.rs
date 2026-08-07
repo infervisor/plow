@@ -75,8 +75,11 @@ pub const CTR_STRIDE: u32 = 32;
 #[repr(u16)]
 pub enum DevOp {
     Nop = 0,
-    /// `t0=out t1=x t2=gamma?` · `i0=rows i1=feat` · `f0=eps`.
+    /// `t0=out t1=x t2=gamma? t3=xq? t4=ascale?` · `i0=rows i1=feat` · `f0=eps`.
     /// `gamma = TENSOR_NONE` is the weightless RMSNorm (Gemma's `v_norm`).
+    /// `t3/t4` (T11, `PLOW_QNORM_FUSE=1`): fused w8a8 activation quant — the normed row is
+    /// also written as e4m3 `xq` with per-row `a_scale`, exactly the values a following
+    /// [`DevOp::QuantFp8`] would produce (token-identical; needs a t3/t4-aware cubin).
     RmsNorm = 1,
     /// `t0=rms(f32) t1=x` · `i0=rows i1=feat` · `f0=eps`.
     /// Row RMS scalars only, so [`DevOp::GemmNorm`] can apply the norm in its
@@ -242,9 +245,13 @@ pub enum DevOp {
     /// `i6`=gamma_b `i7`=gamma_n, with `f0`=eps `f1`=layer_scale (always 1.0 for NRN1).
     /// Bit-exact to op 23 followed by op 31 — see `d_gemv_glu_fp8_nrn` in op_gemm.h.
     GemvGluFp8 = 31,
-    /// `t0=xq(fp8) t1=x(bf16) t2=a_scale(f32[M])` · `i0=M i1=K`. Per-row (per-token) fp8 activation
-    /// quant — the w8a8 prefill's activation half. `a_scale[m] = rowmax|x[m,:]|/448`, `xq[m,k] =
-    /// round_e4m3(x[m,k]/a_scale[m])`. Emitted once per activation, reused by every fp8 GEMM.
+    /// `t0=xq(fp8) t1=x(bf16) t2=a_scale(f32[M]) t3=gate? t4=up?` · `i0=M i1=K i2=act`.
+    /// Per-row (per-token) fp8 activation quant — the w8a8 prefill's activation half.
+    /// `a_scale[m] = rowmax|x[m,:]|/448`, `xq[m,k] = round_e4m3(x[m,k]/a_scale[m])`.
+    /// Emitted once per activation, reused by every fp8 GEMM.
+    /// `t3/t4` (T11, `PLOW_QNORM_FUSE=1`): fused GLU producer — `x` becomes an OUTPUT,
+    /// the packet computes `fu = act(gate)*up` (bf16-rounded, exactly what [`DevOp::Glu`]
+    /// writes) then quantizes it; token-identical to the split form (needs a t3/t4-aware cubin).
     QuantFp8 = 32,
     /// `t0=C t1=A(fp8) t2=B(fp8) t3=a_scale(f32[M]) t4=w_scale(f32[N])` · `i0=M i1=N i2=K i4=a_row0`.
     /// The fp8 (w8a8) prefill twin of [`DevOp::Gemm`]: BOTH operands fp8 e4m3. NOTE the 2x-rate MFMA

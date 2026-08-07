@@ -272,23 +272,18 @@ pub(crate) struct Prefetcher {
 /// [`Checkpoint::populate`], and small enough that the lookahead cannot evict
 /// what it just read.
 pub(crate) fn prefetch_depth() -> usize {
-    std::env::var("PLOW_PREFETCH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(256)
+    crate::config::RuntimeConfig::get().prefetch
 }
 
 /// Prefetch threads per rank. The measured knee is ~16; below it the drive runs
 /// at latency rather than bandwidth.
 pub(crate) fn prefetch_threads() -> usize {
-    std::env::var("PLOW_PREFETCH_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(16)
+    crate::config::RuntimeConfig::get().prefetch_threads
 }
 
 /// Carve the weights out of ONE device allocation instead of asking the driver
-/// per tensor. `PLOW_WEIGHT_SLAB=0` turns it off on both backends.
+/// per tensor. `--rt-weight-slab false` / `PLOW_WEIGHT_SLAB=0` turns it off on
+/// both backends.
 ///
 /// On by default because the per-tensor path wastes memory to allocator
 /// rounding — modestly on CUDA (322 MiB → 21 MiB on a 12B model), badly on ROCr,
@@ -307,20 +302,22 @@ pub(crate) fn prefetch_threads() -> usize {
 /// the allocation is refused outright, so this is for the case where it
 /// SUCCEEDS and is still the wrong thing — a co-tenant that needed the hole.
 pub(crate) fn weight_slab_enabled() -> bool {
-    std::env::var("PLOW_WEIGHT_SLAB").ok().as_deref() != Some("0")
+    crate::config::RuntimeConfig::get().weight_slab
 }
 
-/// `PLOW_WEIGHT_VMM=0` drops the CUDA weight slab from VMM lazy commit back
-/// to one flat `cuMemAlloc`. Default ON: the VMM slab reserves VA in µs and
-/// commits pages on a background thread overlapped with the upload, which is
-/// what actually removes the §4b commit stall (`exec::gpu::_weight_slab`).
-/// The off switch exists for driver-regression triage, not tuning.
+/// `--nv-weight-vmm false` / `PLOW_WEIGHT_VMM=0` drops the CUDA weight slab
+/// from VMM lazy commit back to one flat `cuMemAlloc`. Default ON: the VMM
+/// slab reserves VA in µs and commits pages on a background thread overlapped
+/// with the upload, which is what actually removes the §4b commit stall
+/// (`exec::gpu::_weight_slab`). The off switch exists for driver-regression
+/// triage, not tuning.
 #[cfg(feature = "cuda")]
 pub(crate) fn weight_vmm_enabled() -> bool {
-    std::env::var("PLOW_WEIGHT_VMM").ok().as_deref() != Some("0")
+    crate::config::RuntimeConfig::get().nv.weight_vmm
 }
 
-/// `PLOW_UPLOAD_DIRECT=0` forces the pinned-staging upload even on a device
+/// `--nv-upload-direct false` / `PLOW_UPLOAD_DIRECT=0` forces the
+/// pinned-staging upload even on a device
 /// whose DMA engines read pageable memory coherently
 /// (`Backend::coherent_host_dma` — GH200 ATS). Default on: the direct copy
 /// takes its source straight from the checkpoint mmap at link speed
@@ -328,18 +325,19 @@ pub(crate) fn weight_vmm_enabled() -> bool {
 /// driver-regression triage, not tuning.
 #[cfg(feature = "cuda")]
 pub(crate) fn upload_direct_enabled() -> bool {
-    std::env::var("PLOW_UPLOAD_DIRECT").ok().as_deref() != Some("0")
+    crate::config::RuntimeConfig::get().nv.upload_direct
 }
 
 /// The AMD loader's gate for the same slab, with the opposite default:
-/// **opt-in** (`PLOW_WEIGHT_VMM=1`). ROCr's `hsa_amd_vmem_*` surface is
+/// **opt-in** (`--amd-weight-vmm` / `PLOW_WEIGHT_VMM=1`). ROCr's
+/// `hsa_amd_vmem_*` surface is
 /// resolved and drives VmmKv already, but the lazy-commit weight slab has not
 /// been measured on AMD hardware — and §4b's AMD numbers say the flat slab
 /// already saved 7–8.5 s/rank there, so the residual win is unknown. Flip the
 /// default only with a measurement on a gfx950 box.
 #[cfg(feature = "hsa")]
 pub(crate) fn weight_vmm_amd_enabled() -> bool {
-    std::env::var("PLOW_WEIGHT_VMM").ok().as_deref() == Some("1")
+    crate::config::RuntimeConfig::get().amd.weight_vmm
 }
 
 impl Prefetcher {

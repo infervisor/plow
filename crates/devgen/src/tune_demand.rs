@@ -105,7 +105,7 @@ pub fn take() -> Vec<Demand> {
 pub(crate) fn record(m: i64, n: i64, k: i64, quant: QuantScheme, hit: bool) {
     // Unchanged from the original inline `eprintln!`, deliberately: reports and scripts quote
     // these lines verbatim.
-    if std::env::var("PLOW_TUNE_DUMP").ok().as_deref() == Some("1") {
+    if crate::emit_config::active().tune_dump {
         eprintln!(
             "TUNEDUMP {} {} {} {:?} {}",
             m,

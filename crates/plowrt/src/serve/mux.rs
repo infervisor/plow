@@ -77,7 +77,11 @@ mod packlog {
     static DECODE_ROWS: AtomicU64 = AtomicU64::new(0);
     static TICKS: AtomicU64 = AtomicU64::new(0);
 
-    crate::env_flag!(pub(crate) fn on, "PLOW_PF_PACKLOG");
+    /// Whether pack-log is active (`--pf-packlog` / `PLOW_PF_PACKLOG=1`).
+    /// Reads from `RuntimeConfig::get()` — one atomic load, hot-path safe.
+    pub(crate) fn on() -> bool {
+        crate::config::RuntimeConfig::get().pf_packlog
+    }
 
     /// Record one mux tick's prefill-pass and decode-launch wall times (ns).
     /// `rows` is the decode batch width that tick, so the reader can turn
@@ -185,6 +189,62 @@ enum MuxMsg {
     /// Graceful drain: stop admitting new requests, finish in-flight slots,
     /// then signal completion through the oneshot.
     Drain(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Per-dispatcher engine health, driven by the device faults a tick surfaces.
+///
+/// Only [`crate::DeviceErrorInfo`] faults move this — the CPU reference path
+/// never produces one, so it can never misfire there — and only `Dead` gates
+/// anything: a fatal fault means the device context is poisoned for good, so
+/// the dispatcher fails its live slots once and rejects every later arrival
+/// up front (a fatal `DeviceFault`, mapping to 503) instead of dispatching
+/// into the dead context and flooding the log. `Degraded` counts consecutive
+/// non-fatal faulted ticks; a clean tick resets it.
+enum EngineHealth {
+    Healthy,
+    Degraded { consecutive_failures: u32 },
+    Dead(crate::DeviceErrorInfo),
+}
+
+/// Pure transition function (free-standing for tests): `Dead` is terminal,
+/// a fatal fault is `Dead`, a non-fatal fault bumps `Degraded`, and a clean
+/// tick resets to `Healthy`.
+fn advance_health(health: EngineHealth, fault: Option<crate::DeviceErrorInfo>) -> EngineHealth {
+    if let EngineHealth::Dead(_) = health {
+        return health;
+    }
+    match fault {
+        Some(f) if f.fatal => EngineHealth::Dead(f),
+        Some(_) => EngineHealth::Degraded {
+            consecutive_failures: match health {
+                EngineHealth::Degraded {
+                    consecutive_failures,
+                } => consecutive_failures + 1,
+                _ => 1,
+            },
+        },
+        None => EngineHealth::Healthy,
+    }
+}
+
+/// Record the first device fault a tick sees (per-slot errors keep flowing to
+/// their waiters; this is only the dispatcher's health signal).
+#[cfg(any(feature = "cuda", feature = "hsa"))]
+fn note_fault(tick_fault: &mut Option<crate::DeviceErrorInfo>, err: &crate::RuntimeError) {
+    if tick_fault.is_none() {
+        *tick_fault = err.device_fault().cloned();
+    }
+}
+
+/// Per-slot copy of a batch error for fan-out to every affected waiter: a
+/// typed device fault stays typed (its fatality drives the 503 mapping);
+/// anything else degrades to the stringified `Msg` as before.
+#[cfg(any(feature = "cuda", feature = "hsa"))]
+fn fanout_err(err: &crate::RuntimeError, msg: &str) -> crate::RuntimeError {
+    match err.device_fault() {
+        Some(info) => crate::RuntimeError::DeviceFault { info: info.clone() },
+        None => crate::RuntimeError::Msg(msg.to_string()),
+    }
 }
 
 impl ModelMux {
@@ -363,6 +423,9 @@ pub fn spawn(
         // the first tick (and after a tick panic) so the hot path never
         // allocates a placeholder observer.
         let mut obs: Option<RunObserver> = None;
+        // Engine health: Dead (fatal device fault) rejects every new arrival
+        // at admission; anything else changes nothing on the tick path.
+        let mut health = EngineHealth::Healthy;
         // Drain protocol state: once set, stop admitting new requests and
         // complete in-flight slots, then signal the oneshot.
         let mut draining = false;
@@ -439,6 +502,7 @@ pub fn spawn(
                             &mut last_arrival,
                             arena.as_ref(),
                             &metrics,
+                            &health,
                         );
                     }
                     MuxMsg::Drain(done) => {
@@ -482,6 +546,7 @@ pub fn spawn(
                                 &mut last_arrival,
                                 arena.as_ref(),
                                 &metrics,
+                                &health,
                             ),
                             Ok(Some(MuxMsg::Drain(done))) => {
                                 draining = true;
@@ -503,6 +568,7 @@ pub fn spawn(
                             &mut last_arrival,
                             arena.as_ref(),
                             &metrics,
+                            &health,
                         ),
                         Ok(MuxMsg::Drain(done)) => {
                             draining = true;
@@ -690,7 +756,14 @@ pub fn spawn(
             let ms = t_service_start.elapsed().as_millis() as f64;
 
             match joined {
-                Ok((returned_slots, returned_bufs, returned_obs, tokens_produced, did_prefill)) => {
+                Ok((
+                    returned_slots,
+                    returned_bufs,
+                    returned_obs,
+                    tokens_produced,
+                    did_prefill,
+                    tick_fault,
+                )) => {
                     // Decode-service EWMA: prefill ticks are excluded — see
                     // `service_sample`. Updating on them poisons the admission
                     // predictor and sheds live decode streams.
@@ -703,6 +776,32 @@ pub fn spawn(
                     }
                     obs = Some(returned_obs);
                     Metrics::add(&metrics.tokens, tokens_produced as u64);
+
+                    // Health transition. On the transition INTO Dead (once):
+                    // fail every remaining live slot with the fault — ticking
+                    // them against a poisoned context could only re-error —
+                    // and every later arrival is rejected at admission.
+                    let was_dead = matches!(health, EngineHealth::Dead(_));
+                    health = advance_health(health, tick_fault);
+                    if !was_dead {
+                        if let EngineHealth::Dead(f) = &health {
+                            tracing::error!(
+                                %slug,
+                                error_op = %f.operation,
+                                error_code = f.code,
+                                error_name = %f.name,
+                                "engine dead: fatal device fault — rejecting new requests"
+                            );
+                            for s in slots.iter_mut() {
+                                if let Some(slot) = s.take() {
+                                    release_kv(&arena, slot.kv);
+                                    let _ = slot.respond.try_send(StreamChunk::Err(
+                                        crate::RuntimeError::DeviceFault { info: f.clone() },
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::error!(%slug, error = %e, "mux tick task panicked");
@@ -759,7 +858,23 @@ fn admit_into(
     last_arrival: &mut Option<Instant>,
     arena: Option<&SharedKvState>,
     metrics: &Metrics,
+    health: &EngineHealth,
 ) {
+    // A dead engine cannot serve anyone — reject up front with the fault that
+    // killed it (fatal DeviceFault → 503), instead of admitting into a
+    // poisoned context. The poisoning itself was logged once; this stays at
+    // debug so a request flood doesn't become a log flood.
+    if let EngineHealth::Dead(info) = health {
+        tracing::debug!("mux: engine dead — request rejected");
+        Metrics::inc(&metrics.rejected);
+        let _ = job
+            .respond
+            .try_send(StreamChunk::Err(crate::RuntimeError::DeviceFault {
+                info: info.clone(),
+            }));
+        return;
+    }
+
     // Refresh λ from the inter-arrival gap.
     let now = job.arrived;
     if let Some(prev) = last_arrival.replace(now) {
@@ -948,9 +1063,14 @@ fn run_one_tick(
     RunObserver,
     usize,
     bool,
+    // First device fault seen this tick — the dispatcher's EngineHealth
+    // signal. Always `None` on the CPU reference path.
+    Option<crate::DeviceErrorInfo>,
 ) {
     let bucket = key.and_then(|k| bundle.bucket(k));
     let mut tokens_this_tick = 0usize;
+    #[cfg_attr(not(any(feature = "cuda", feature = "hsa")), allow(unused_mut))]
+    let mut tick_fault: Option<crate::DeviceErrorInfo> = None;
 
     // GPU path: when this model has an sm_120 engine, every token comes from
     // the persistent interpreter on the device — the CPU reference walk and
@@ -1027,7 +1147,13 @@ fn run_one_tick(
                 // prompt token through the batched decode step below — which both
                 // writes its final KV row and produces its first token, batched
                 // with every live decode stream.
-                gpu_prefill_batched_pass(&mut *e, &mut slots, cap, &arena, feeds.is_empty());
+                if let Some(f) =
+                    gpu_prefill_batched_pass(&mut *e, &mut slots, cap, &arena, feeds.is_empty())
+                {
+                    if tick_fault.is_none() {
+                        tick_fault = Some(f);
+                    }
+                }
                 for i in 0..slots.len().min(cap) {
                     let Some(s) = slots[i].as_ref() else { continue };
                     if s.step != 0 {
@@ -1056,6 +1182,7 @@ fn run_one_tick(
                     // ready at pf_pos 0 but still needs its sequence begun.
                     if n == 1 && s.pf_pos == 0 {
                         if let Err(err) = e.begin_slot(i, n + s.gen.max_tokens.max(1)) {
+                            note_fault(&mut tick_fault, &err);
                             if let Some(taken) = slots[i].take() {
                                 release_kv(&arena, taken.kv);
                                 let _ = taken.respond.try_send(StreamChunk::Err(err));
@@ -1102,15 +1229,31 @@ fn run_one_tick(
                         continue;
                     }
                     let slot_opt = &mut slots[i];
+                    // §TTFT (CUDA arm): queue = submit -> this tick; prefill = the chunk call.
+                    if crate::obs::ttft::on() {
+                        if let Some(sr) = slot_opt.as_ref() {
+                            if sr.pf_pos == 0 {
+                                crate::obs::ttft::QUEUE.add(sr.arrived.elapsed().as_nanos() as u64);
+                            }
+                        }
+                    }
+                    let t_pf = std::time::Instant::now();
                     let res = gpu_prefill_advance(
                         &mut *e,
                         i,
                         slot_opt.as_mut().expect("checked Some"),
                         cap_rows,
                     );
+                    crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
                     match res {
                         Ok(Some(token)) => {
                             tracing::debug!(token, slot = i, step = 0usize, "gpu: token");
+                            // Detok + channel send, timed like the AMD arm: the
+                            // old `add(0)` counted a sample with zero time, so
+                            // the CUDA TTFT dump reported a confident 0.000 ms
+                            // for this phase and rolled the real cost into
+                            // UNACCOUNTED. Gated like the QUEUE site above.
+                            let t_tok = crate::obs::ttft::on().then(std::time::Instant::now);
                             handle_produced_token(
                                 slot_opt,
                                 &arena,
@@ -1120,12 +1263,23 @@ fn run_one_tick(
                                 &mut tokens_this_tick,
                                 Some(stop.as_slice()),
                             );
+                            if let Some(t) = t_tok {
+                                crate::obs::ttft::FIRST_TOK.add(t.elapsed().as_nanos() as u64);
+                            }
                         }
                         Ok(None) => {
                             // Mid-prefill: the frontier advanced one chunk.
                         }
                         Err(err) => {
-                            tracing::warn!(slot = i, error = %err, "gpu: prefill failed");
+                            tracing::warn!(
+                                slot = i,
+                                error = %err,
+                                error_code = ?err.device_code(),
+                                fatal = err.is_fatal(),
+                                model = bundle.network(),
+                                "gpu: prefill failed"
+                            );
+                            note_fault(&mut tick_fault, &err);
                             if let Some(taken) = slot_opt.take() {
                                 release_kv(&arena, taken.kv);
                                 let _ = taken.respond.try_send(StreamChunk::Err(err));
@@ -1184,14 +1338,22 @@ fn run_one_tick(
                             }
                         }
                         Err(err) => {
-                            tracing::warn!(error = %err, fed = feeds.len(), "gpu: multi-step failed");
+                            tracing::warn!(
+                                error = %err,
+                                error_code = ?err.device_code(),
+                                fatal = err.is_fatal(),
+                                fed = feeds.len(),
+                                model = bundle.network(),
+                                "gpu: multi-step failed"
+                            );
+                            note_fault(&mut tick_fault, &err);
                             let msg = err.to_string();
                             for &(i, _) in &feeds {
                                 if let Some(taken) = slots[i].take() {
                                     release_kv(&arena, taken.kv);
-                                    let _ = taken.respond.try_send(StreamChunk::Err(
-                                        crate::RuntimeError::Msg(msg.clone()),
-                                    ));
+                                    let _ = taken
+                                        .respond
+                                        .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                                 }
                             }
                         }
@@ -1206,7 +1368,7 @@ fn run_one_tick(
                             feeds.len(),
                         );
                     }
-                    return (slots, bufs, obs, tokens_this_tick, did_prefill);
+                    return (slots, bufs, obs, tokens_this_tick, did_prefill, tick_fault);
                 }
                 // Device sampling (plan stage 4): when the engine has a sampler,
                 // build a batch-wide spec array so eligible temperature>0 rows are
@@ -1268,7 +1430,15 @@ fn run_one_tick(
                                     );
                                 }
                                 Err(err) => {
-                                    tracing::warn!(slot = i, error = %err, "gpu: sample failed");
+                                    tracing::warn!(
+                                        slot = i,
+                                        error = %err,
+                                        error_code = ?err.device_code(),
+                                        fatal = err.is_fatal(),
+                                        model = bundle.network(),
+                                        "gpu: sample failed"
+                                    );
+                                    note_fault(&mut tick_fault, &err);
                                     if let Some(taken) = slot_opt.take() {
                                         release_kv(&arena, taken.kv);
                                         let _ = taken.respond.try_send(StreamChunk::Err(err));
@@ -1279,14 +1449,22 @@ fn run_one_tick(
                     }
                     Err(err) => {
                         // The batched launch failed — every fed slot loses.
-                        tracing::warn!(error = %err, fed = feeds.len(), "gpu: decode launch failed");
+                        tracing::warn!(
+                            error = %err,
+                            error_code = ?err.device_code(),
+                            fatal = err.is_fatal(),
+                            fed = feeds.len(),
+                            model = bundle.network(),
+                            "gpu: decode launch failed"
+                        );
+                        note_fault(&mut tick_fault, &err);
                         let msg = err.to_string();
                         for &(i, _) in &feeds {
                             if let Some(taken) = slots[i].take() {
                                 release_kv(&arena, taken.kv);
-                                let _ = taken.respond.try_send(StreamChunk::Err(
-                                    crate::RuntimeError::Msg(msg.clone()),
-                                ));
+                                let _ = taken
+                                    .respond
+                                    .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                             }
                         }
                     }
@@ -1302,7 +1480,7 @@ fn run_one_tick(
                     feeds.len(),
                 );
             }
-            return (slots, bufs, obs, tokens_this_tick, did_prefill);
+            return (slots, bufs, obs, tokens_this_tick, did_prefill, tick_fault);
         }
 
         // gfx950: B independent sequence slots, one decode dispatch for all of
@@ -1410,9 +1588,10 @@ fn run_one_tick(
             // prompts are the granularity that is safe today, and for the common
             // ~1k-token prompt the bucket ladder makes that ONE chunk anyway.
             //
-            // `PLOW_PF_NO_INTERLEAVE=1` restores the old prefill-only tick.
+            // `--pf-no-interleave` / `PLOW_PF_NO_INTERLEAVE=1` restores the old
+            // prefill-only tick.
             let mut did_prefill = false;
-            let no_interleave = std::env::var("PLOW_PF_NO_INTERLEAVE").as_deref() == Ok("1");
+            let no_interleave = crate::config::RuntimeConfig::get().nv.pf_no_interleave;
             let pending = (0..b.min(slots.len()))
                 .find(|&i| slots[i].as_ref().map(|s| s.step == 0).unwrap_or(false));
             if let Some(i) = pending {
@@ -1459,7 +1638,15 @@ fn run_one_tick(
                         }
                     }
                     Err(err) => {
-                        tracing::warn!(slot = i, error = %err, "amd: prefill failed");
+                        tracing::warn!(
+                            slot = i,
+                            error = %err,
+                            error_code = ?err.device_code(),
+                            fatal = err.is_fatal(),
+                            model = bundle.network(),
+                            "amd: prefill failed"
+                        );
+                        note_fault(&mut tick_fault, &err);
                         if let Some(taken) = slots[i].take() {
                             release_kv(&arena, taken.kv);
                             let _ = taken.respond.try_send(StreamChunk::Err(err));
@@ -1472,7 +1659,7 @@ fn run_one_tick(
                 }
                 did_prefill = true;
                 if no_interleave {
-                    return (slots, bufs, obs, tokens_this_tick, true);
+                    return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
                 }
             }
 
@@ -1484,7 +1671,7 @@ fn run_one_tick(
                 })
                 .collect();
             if feeds.is_empty() {
-                return (slots, bufs, obs, tokens_this_tick, did_prefill);
+                return (slots, bufs, obs, tokens_this_tick, did_prefill, tick_fault);
             }
             let pk_t = packlog::on().then(Instant::now);
             let pk_rows = feeds.len();
@@ -1516,14 +1703,22 @@ fn run_one_tick(
                 }
                 Err(err) => {
                     // The batched launch failed — every fed slot loses.
-                    tracing::warn!(error = %err, fed = feeds.len(), "amd: decode failed");
+                    tracing::warn!(
+                        error = %err,
+                        error_code = ?err.device_code(),
+                        fatal = err.is_fatal(),
+                        fed = feeds.len(),
+                        model = bundle.network(),
+                        "amd: decode failed"
+                    );
+                    note_fault(&mut tick_fault, &err);
                     let msg = err.to_string();
                     for &(i, _) in &feeds {
                         if let Some(taken) = slots[i].take() {
                             release_kv(&arena, taken.kv);
                             let _ = taken
                                 .respond
-                                .try_send(StreamChunk::Err(crate::RuntimeError::Msg(msg.clone())));
+                                .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                         }
                         e.release(i);
                     }
@@ -1535,7 +1730,7 @@ fn run_one_tick(
             if let Some(t) = pk_t {
                 packlog::record(0, t.elapsed().as_nanos() as u64, false, true, pk_rows);
             }
-            return (slots, bufs, obs, tokens_this_tick, did_prefill);
+            return (slots, bufs, obs, tokens_this_tick, did_prefill, tick_fault);
         }
 
         #[allow(unreachable_code)]
@@ -1632,7 +1827,7 @@ fn run_one_tick(
                     }
                 }
             }
-            return (slots, bufs, obs, tokens_this_tick, false);
+            return (slots, bufs, obs, tokens_this_tick, false, tick_fault);
         }
     }
 
@@ -1716,7 +1911,7 @@ fn run_one_tick(
         }
     }
 
-    (slots, bufs, obs, tokens_this_tick, false)
+    (slots, bufs, obs, tokens_this_tick, false, tick_fault)
 }
 
 /// Whether a tick's wall time is a valid **decode** service sample. Prefill
@@ -1747,10 +1942,14 @@ fn predicted_wait_ms(live: usize, capacity: usize, service_ms: f64) -> f64 {
 /// The serve-layer interleave bound: max prefill-chunk rows per tick while
 /// other slots are mid-decode. `PLOW_PF_INTERLEAVE` overrides (rows; `0` =
 /// whole prompt in one tick, the pre-interleave behavior). Read once.
+/// Reads `RuntimeConfig::get().nv.pf_interleave_rows()`.
 #[cfg(feature = "cuda")]
-crate::env_usize!(fn pf_interleave_rows, "PLOW_PF_INTERLEAVE", default 2048, zero = unbounded);
+fn pf_interleave_rows() -> usize {
+    crate::config::RuntimeConfig::get().nv.pf_interleave_rows()
+}
 
-/// PX-17 throughput mode: with `PLOW_PF_DEFER_DECODE=1`, a tick that still has
+/// PX-17 throughput mode: with `--pf-defer-decode` /
+/// `PLOW_PF_DEFER_DECODE=1`, a tick that still has
 /// ANY slot mid-prefill runs its prefill chain to completion and skips the
 /// decode launch entirely, so every decode tick later runs at the full batch.
 ///
@@ -1767,13 +1966,7 @@ crate::env_usize!(fn pf_interleave_rows, "PLOW_PF_INTERLEAVE", default 2048, zer
 /// serving default.
 #[cfg(feature = "cuda")]
 fn pf_defer_decode() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("PLOW_PF_DEFER_DECODE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    crate::config::RuntimeConfig::get().nv.pf_defer_decode
 }
 
 /// RTX-12 chunked packing: per-REQUEST cap on the prefill rows one request may
@@ -1785,8 +1978,11 @@ fn pf_defer_decode() -> bool {
 /// a launch, never any request's tokens). Read once. Default `0` (off) — this
 /// is opt-in alongside `PLOW_PF_BATCH=1`, matching the rest of the PX-1 knobs.
 /// Unset and `0` both mean uncapped, so the default IS the zero sentinel.
+/// Reads `RuntimeConfig::get().nv.pf_chunk_rows()`.
 #[cfg(feature = "cuda")]
-crate::env_usize!(fn pf_chunk_rows, "PLOW_PF_CHUNK", default usize::MAX, zero = unbounded);
+fn pf_chunk_rows() -> usize {
+    crate::config::RuntimeConfig::get().nv.pf_chunk_rows()
+}
 
 /// PX-1: pack every mid-prefill slot's next chunk into shared batched-prefill
 /// launches. Per launch, each waiting request contributes up to its remaining
@@ -1806,12 +2002,13 @@ fn gpu_prefill_batched_pass(
     cap: usize,
     arena: &Option<SharedKvState>,
     cold: bool,
-) {
+) -> Option<crate::DeviceErrorInfo> {
     use crate::exec::gpu::PfBatchReq;
 
+    let mut tick_fault: Option<crate::DeviceErrorInfo> = None;
     let budget_max = e.pf_max_rows();
     if budget_max == 0 {
-        return;
+        return tick_fault;
     }
     let per_launch = if cold {
         budget_max
@@ -1835,7 +2032,7 @@ fn gpu_prefill_batched_pass(
             .map(|s| (s.prompt_ids.len().max(1) - 1).saturating_sub(s.pf_pos))
             .sum();
         if avail == 0 {
-            return;
+            return tick_fault;
         }
         let per_launch = e.pf_pack_budget(avail.min(per_launch)).min(per_launch);
         // Assemble one pack: (slot, c0, len) per waiting request, in slot order.
@@ -1861,7 +2058,14 @@ fn gpu_prefill_batched_pass(
             }
             if s.pf_pos == 0 {
                 if let Err(err) = e.begin_slot(i, n + s.gen.max_tokens.max(1)) {
-                    tracing::warn!(slot = i, error = %err, "gpu: pf-batch begin failed");
+                    tracing::warn!(
+                        slot = i,
+                        error = %err,
+                        error_code = ?err.device_code(),
+                        fatal = err.is_fatal(),
+                        "gpu: pf-batch begin failed"
+                    );
+                    note_fault(&mut tick_fault, &err);
                     if let Some(taken) = slots[i].take() {
                         release_kv(arena, taken.kv);
                         let _ = taken.respond.try_send(StreamChunk::Err(err));
@@ -1875,7 +2079,7 @@ fn gpu_prefill_batched_pass(
             budget -= take;
         }
         if pack.is_empty() {
-            return;
+            return tick_fault;
         }
         let reqs: Vec<PfBatchReq> = pack
             .iter()
@@ -1896,21 +2100,28 @@ fn gpu_prefill_batched_pass(
             }
             Err(err) => {
                 // The shared launch failed — every packed request loses.
-                tracing::warn!(error = %err, packed = pack.len(), "gpu: batched prefill failed");
+                tracing::warn!(
+                    error = %err,
+                    error_code = ?err.device_code(),
+                    fatal = err.is_fatal(),
+                    packed = pack.len(),
+                    "gpu: batched prefill failed"
+                );
+                note_fault(&mut tick_fault, &err);
                 let msg = err.to_string();
                 for &(i, _, _) in &pack {
                     if let Some(taken) = slots[i].take() {
                         release_kv(arena, taken.kv);
                         let _ = taken
                             .respond
-                            .try_send(StreamChunk::Err(crate::RuntimeError::Msg(msg.clone())));
+                            .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
                     }
                 }
-                return;
+                return tick_fault;
             }
         }
         if !cold {
-            return; // bounded stall: decode now, next pack next tick
+            return tick_fault; // bounded stall: decode now, next pack next tick
         }
         // Cold path: stop as soon as any request is ready so its first token
         // fires this tick; the rest continue next tick (with decoders live).
@@ -1922,7 +2133,7 @@ fn gpu_prefill_batched_pass(
                 .unwrap_or(false)
         });
         if any_ready {
-            return;
+            return tick_fault;
         }
     }
 }
@@ -2159,6 +2370,68 @@ mod tests {
     use crate::exec::indirection::slots as ind_slots;
     use crate::serve::RunObserver;
     use plow_asset::{KvLayerPaging, KvPaging};
+
+    fn fault(fatal: bool) -> crate::DeviceErrorInfo {
+        crate::DeviceErrorInfo {
+            operation: "cuStreamSynchronize".into(),
+            code: 719,
+            name: "CUDA_ERROR_LAUNCH_FAILED".into(),
+            fatal,
+        }
+    }
+
+    #[test]
+    fn health_degrades_on_nonfatal_and_recovers_on_success() {
+        let h = advance_health(EngineHealth::Healthy, Some(fault(false)));
+        assert!(matches!(
+            h,
+            EngineHealth::Degraded {
+                consecutive_failures: 1
+            }
+        ));
+        let h = advance_health(h, Some(fault(false)));
+        assert!(matches!(
+            h,
+            EngineHealth::Degraded {
+                consecutive_failures: 2
+            }
+        ));
+        let h = advance_health(h, None);
+        assert!(matches!(h, EngineHealth::Healthy));
+    }
+
+    #[test]
+    fn health_dies_on_fatal_and_stays_dead() {
+        let h = advance_health(EngineHealth::Healthy, Some(fault(true)));
+        assert!(matches!(h, EngineHealth::Dead(_)));
+        // Terminal: neither a clean tick nor a non-fatal fault revives it.
+        let h = advance_health(h, None);
+        assert!(matches!(h, EngineHealth::Dead(_)));
+        let h = advance_health(h, Some(fault(false)));
+        assert!(matches!(h, EngineHealth::Dead(_)));
+    }
+
+    #[test]
+    fn health_ignores_clean_ticks() {
+        assert!(matches!(
+            advance_health(EngineHealth::Healthy, None),
+            EngineHealth::Healthy
+        ));
+    }
+
+    /// A batch failure fans out to every fed slot — the typed fault must
+    /// survive the copy (a fatal fault maps to 503; a Msg would read as 500).
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    #[test]
+    fn fanout_preserves_the_typed_fault() {
+        let f = crate::RuntimeError::DeviceFault { info: fault(true) };
+        assert!(fanout_err(&f, "ignored").is_fatal());
+        let plain = crate::RuntimeError::Msg("boom".into());
+        assert!(matches!(
+            fanout_err(&plain, "boom"),
+            crate::RuntimeError::Msg(m) if m == "boom"
+        ));
+    }
 
     fn paging_2layers(max_seqs: i64) -> KvPaging {
         KvPaging {

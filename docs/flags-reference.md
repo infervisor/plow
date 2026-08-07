@@ -11,6 +11,74 @@ a fixed, validated configuration**; every flag is an A/B control with a
 correctness gate (token-identity or a bit-exact vs-f32 oracle). **Unset = shipped
 default**, and most flags are byte-identical when unset.
 
+---
+
+## Unified CLI args (new)
+
+Both `plowc` and `plowrt` now support structured **clap CLI args with
+environment-variable fallback**. Every knob formerly set via `PLOW_*` env can now
+be passed as a `--long-flag`, and the old env var still works transparently
+(clap's `env` attribute reads it). **CLI takes precedence over env** — with the
+exception below.
+
+> **Env wins for eight knobs.** `PLOW_MULTISTEP`, `PLOW_VMM_PREFIX`,
+> `PLOW_VMM_BLOCK_MIB`, `PLOW_DRAIN_TIMEOUT_MS`, `PLOW_SLAB_KEEP`,
+> `PLOW_KV_POOL_MIB`, `PLOW_DEV_SAMPLE` and `PLOW_NV_CUBIN_SAMPLE` are read
+> env-first, because tests and benches flip them mid-process — after the
+> config snapshot is cached, which a CLI-first read could not observe. For
+> these eight a systemd envfile beats the command line.
+
+```bash
+# These are equivalent:
+PLOW_PF_INTERLEAVE=4096 plowrt serve …
+plowrt serve --pf-interleave 4096 …
+
+# CLI overrides env:
+PLOW_PF_INTERLEAVE=2048 plowrt serve --pf-interleave 4096 …   # uses 4096
+```
+
+### Config structs
+
+| binary | struct | file | scope |
+|--------|--------|------|-------|
+| `plowc` | `EmitConfig` | `crates/devgen/src/emit_config.rs` | Emit-time knobs (60+ fields) |
+| `plowrt` | `RuntimeConfig` | `crates/plowrt/src/config.rs` | Shared runtime knobs |
+| `plowrt` | `NvidiaRuntimeConfig` | (nested in RuntimeConfig) | NVIDIA/sm_120 serving |
+| `plowrt` | `AmdRuntimeConfig` | (nested in RuntimeConfig) | AMD/gfx950 serving |
+
+### Hot-path access pattern
+
+Both structs use a **process-global `OnceLock`** initialized once after CLI
+parse, so deep call sites pay a single atomic load (identical cost to the old
+`env_flag!` macro):
+
+```rust
+// devgen (emit time)
+emit_config::active().k3_full
+
+// plowrt (runtime)
+RuntimeConfig::get().nv.pf_interleave_rows()
+RuntimeConfig::get().pf_packlog
+```
+
+Use `get()`, never `global()`: `global()` panics when the config was never
+installed, which is the normal state for every library embedder — GPU tests,
+examples and benches build engines directly and never run `main()`'s CLI
+parse. `get()` falls back to an env-only parse there.
+
+### Discovering all flags
+
+```bash
+plowc --help          # shows all emit-time flags with env fallback
+plowrt serve --help   # shows all runtime flags with env fallback
+```
+
+### Legacy compatibility
+
+All `PLOW_*` environment variables continue to work. The macros `env_flag!` and
+`env_usize!` remain in `plowrt/src/lib.rs` for any code that has not yet been
+migrated — they read once and cache in a `OnceLock`, identical semantics.
+
 **Why there are so many.** The interpreter is one persistent megakernel that
 inlines every op arm, so its **register and shared-memory footprint is the WORST
 CASE over everything compiled in**, and smem is the *union* over all ops in the
@@ -510,9 +578,39 @@ Harness-only (not the served cubins): `PLOW_SM120_SMS` (188) and
 | `PLOW_UPLOAD_SLOTS=N` | 4 | AMD upload-ring pipeline depth; `1` = pre-pipeline one-slab shape. |
 | `PLOW_SHARE_CKPT` | on | shared (vs per-rank) checkpoint mapping across TP ranks; `=0` restores per-rank. |
 | `PLOW_VRAM_BUDGET_MIB=M` | unset | cap the ModelManager VRAM budget (MiB). |
+| `PLOW_WEIGHT_VMM` | CUDA on, AMD off | VMM (reserve+map) weight slab; `=0` falls back to one flat allocation (`=1` opts AMD in). |
+| `PLOW_SLAB_KEEP` | multi-model on | park evicted models' 256 MiB slab chunks in a per-device pool for the next load; `=0` releases them (`=1` forces on for single-model). |
+| `PLOW_KV_POOL_MIB=N` | 512 | per-engine KV physical-block reuse pool cap (MiB); `0` disables pooling. |
+| `PLOW_DRAIN_TIMEOUT_MS=N` | unset (unbounded) | S1 switch drain deadline; past it the victim's live generations are preempted (`Preempted` finish, queued jobs 429). `0` preempts immediately. |
+| `PLOW_PRELOAD` | on | speculative next-model preload after an S1 switch; `=0` disables. |
 | `PLOW_TP_AGREE_EVERY=N` | 1 | TP cross-rank agreement interval. `PLOW_TP_NO_AUDIT=1` disables the redundant-rank audit (timing runs); `PLOW_TP_SERIAL_LOAD=1` restores one-at-a-time per-rank load. |
 | `PLOW_LOAD_PROFILE=1` | off | split upload wall time into alloc / stage+DMA profiling. |
 | `PLOW_STEP_TIME=1`, `PLOW_TTFT_LOG=1` | off | per-decode-step host-op timing / TTFT breakdown logging (diagnostics). |
+
+### Segmented prefill (sm_90a / GH200)
+
+The five-object prefill stack from the GH200 campaign
+(`perf-data/gemma12b-gh200-prefill-campaign.md`). The classing knobs are
+**serve-side mirrors of emit-side knobs and must match the blob** — `--pf-seg-pure`
+pairs with `plowc`'s `PLOW_SEG_PURE_GEMM`, `--pf-seg-fa512` with `PLOW_SEG_FA512`.
+A mismatch is a wrong-object launch, i.e. a device trap, not a slowdown.
+
+| flag (env) | default | effect |
+|---|---|---|
+| `--pf-seg-dir` (`PLOW_PF_SEG_DIR`) | unset | dir holding `interp_sm90a_pfseg/_pfgemm[/_pffa].cubin`. Unset = single-object prefill. Packets must be emitted **without** `PLOW_UNISEG`. |
+| `--pf-seg-pure` (`PLOW_PF_SEG_PURE`) | unset | segment classing: `1` = every plain tiled GEMM is GEMM-class, `fp8` = only TMA-mapped fp8 GEMMs (the ws-entry object's sole arm). |
+| `--pf-seg-fa512` (`PLOW_PF_SEG_FA512`) | unset | hd512 flash on the dedicated `_pffa` object: `1` = hd512 only, `all` = both head dims — `all` **requires** an object built `PLOW_BUILD_FA_HD256=1`; the loader refuses the mismatch rather than trapping. |
+| `--pf-seg-graph` (`PLOW_PF_SEG_GRAPH`) | off | submit each chunk's whole segment chain as ONE CUDA graph (T35). |
+| `--pf-seg-eqsmem` (`PLOW_PF_SEG_EQSMEM`) | off | launch every object with the same dynamic-smem request (avoids per-launch carveout reconfig). |
+| `--pf-seg-v2` (`PLOW_PF_SEG_V2`) | unset | classing v2 (`1`) / q8 variant (`q8`). |
+| `--pf-seg-time`, `--pf-seg-fatonly`, `--pf-seg-noncoop` | off | diagnostics: per-class event timing / every segment on the fat object / plain (non-cooperative) launches. |
+
+The canonical serving configuration measured in the campaign:
+
+```bash
+plowrt serve --assets <dir> \
+  --pf-seg-dir <cubins> --pf-seg-pure fp8 --pf-seg-fa512 all --pf-seg-graph
+```
 
 Loader/asset overrides: `PLOW_NV_CUBIN[_PF]`, `PLOW_NV_KERNEL[_PF]`, `PLOW_NV_SMEM`
 / `PLOW_NV_SMEM_PF` (override decode/prefill dynamic-smem arena bytes), `PLOW_HSACO`

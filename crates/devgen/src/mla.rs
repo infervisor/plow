@@ -137,7 +137,7 @@ impl GlmCfg {
         const CROSSOVER: u32 = 65536; // measured full-model TP4 dense/gather crossover (~69k, rounded)
         let on = self.has_dsa
             && ctx > CROSSOVER
-            && std::env::var("PLOW_GLM_DSA").ok().as_deref() != Some("0");
+            && emit_config::active().glm_dsa.as_deref() != Some("0");
         if on {
             // THE ONE GATE every DSA arming passes through, so the geometry check lives here rather
             // than at each of the four sites that consume `index_heads`/`index_dim`.
@@ -251,8 +251,8 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
         // A nested (multimodal) variant sets this from its own wrapper, and nothing else changes.
         prefix: "model.".to_string(),
         tp: 1,
-        ep: std::env::var("GLM_EP").ok().as_deref() == Some("1"),
-        group: std::env::var("GLM_GROUP").ok().as_deref() == Some("1"),
+        ep: emit_config::active().glm_ep,
+        group: emit_config::active().glm_group,
         index_heads: v["index_n_heads"].as_u64().unwrap_or(32) as u32,
         index_dim: v["index_head_dim"].as_u64().unwrap_or(128) as u32,
         index_topk: v["index_topk"].as_u64().unwrap_or(2048) as u32,
@@ -367,9 +367,14 @@ fn glm_gf(ctx: u32, nh_l: u32) -> u32 {
     // So: 4 is what the DEFAULT OBJECT can run at full width. `PLOW_GLM_GF=8` still pins 8, and it
     // is only meaningful against an object built with `-DPLOW_GLM_GF8_ARM=1`; measured there, GF=8
     // at matched work items is NOT a win (see `glm_nsplit`'s table).
-    let want = std::env::var("PLOW_GLM_GF")
+    // Read the pin from env directly (not from OnceLock) so that A/B measurement scripts
+    // can override mid-process. The EmitConfig field is the production path via CLI; this
+    // env read is the low-ceremony measurement path.
+    let pin = std::env::var("PLOW_GLM_GF")
         .ok()
-        .and_then(|v| v.parse::<u32>().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        .or(emit_config::active().glm_gf);
+    let want = pin
         .filter(|&v| v == 2 || v == 4 || v == 8)
         .unwrap_or(if ctx <= GLM_GF_CROSSOVER { 2 } else { 4 });
     // SAY SO WHEN GF=8 IS PINNED BY HAND. The default object is built with PLOW_GLM_GF8_ARM=0
@@ -521,9 +526,8 @@ pub(crate) fn glm_nsplit(ctx: u32, heads: u32) -> u32 {
         .min(fill)
         .min(kv_tiles)
         .max(1);
-    std::env::var("PLOW_GLM_NS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
+    emit_config::active()
+        .glm_ns
         .filter(|&v| v >= 1)
         .unwrap_or(ns)
 }
@@ -632,7 +636,7 @@ pub(crate) const MX_BLOCK: u32 = 32;
 /// `glm_col` and `plowrt`'s `asset::shard::slice_for` both key it on the DECLARED size, so a packet
 /// built without this knob still binds the full table.
 fn glm_shard_head(c: &GlmCfg) -> bool {
-    let on = c.tp > 1 && std::env::var("GLM_SHARD_HEAD").ok().as_deref() == Some("1");
+    let on = c.tp > 1 && emit_config::active().glm_shard_head;
     assert!(
         !on || c.vocab % c.tp == 0,
         "GLM_SHARD_HEAD needs vocab ({}) divisible by tp ({}) — one blob serves every rank, so a \
@@ -716,7 +720,7 @@ fn glm_vocab_l(c: &GlmCfg) -> u32 {
 /// Requires the weight dir published by `scripts/glm52_prep_fp8_linear.py` (`.weight_fp8` +
 /// `.weight_scale_inv`, additive; the bf16 `.weight` stays where it is).
 fn glm_linear_fp8(enc: MoeEnc) -> bool {
-    enc == MoeEnc::Fp8Blk && std::env::var("GLM_LINEAR_FP8").ok().as_deref() == Some("1")
+    enc == MoeEnc::Fp8Blk && emit_config::active().glm_linear_fp8
 }
 
 /// One DENSE prefill GEMM against CHECKPOINT block-fp8 weights — [`DevOp::GemmFp8Blk`] (107).
@@ -831,7 +835,7 @@ fn emit_pf_gemm_fp8_blk(
 /// This is the same unfusing `emit_glm_moe_prefill_block` already does on the MXFP4 arm (two
 /// matmuls + `Glu` because there is no `GemmGluMxfp4`) — same operand slots, same `n.shfu_up`.
 fn glm_shared_glu_split(enc: MoeEnc) -> bool {
-    glm_linear_fp8(enc) && std::env::var("GLM_SHARED_GLU_SPLIT").ok().as_deref() == Some("1")
+    glm_linear_fp8(enc) && emit_config::active().glm_shared_glu_split
 }
 
 /// The two DISJOINT CU halves the co-resident gate/up GEMVs run on.
@@ -1698,8 +1702,9 @@ pub(crate) fn declare_glm_rows(
 /// to a max over k, and that has already cost more than it saved once (`flash_merge` 32->256,
 /// +0.555 ms). Measure before changing the default.
 fn spine_cus(n_cu: u32) -> Vec<u32> {
-    match std::env::var("GLM_SPINE_CUS")
-        .ok()
+    match emit_config::active()
+        .glm_spine_cus
+        .as_deref()
         .and_then(|v| v.parse::<u32>().ok())
     {
         Some(k) if k > 1 => (0..k.min(n_cu)).collect(),
@@ -1773,6 +1778,8 @@ fn elem_cus(cus: &[u32], n: u32) -> Vec<u32> {
 /// work-item map the kernel already owns, so the emitted arithmetic is unchanged and the only
 /// thing that goes away is empty workgroups. Same shape as `PLOW_GLM_FUSE_A`, and the same reason
 /// it exists.
+///
+/// Default ON. `PLOW_GLM_WGFIT=0` disables the narrowing for the A/B control arm.
 fn wgfit() -> bool {
     std::env::var("PLOW_GLM_WGFIT").ok().as_deref() != Some("0")
 }
@@ -1973,12 +1980,12 @@ fn emit_glm_mla(
     // `GemvMxfp4` calls for the same reason the bf16 pair is byte-exact to its split Gemvs.
     let mx = enc == MoeEnc::Mxfp4;
     let lin_fp8 = glm_linear_fp8(enc);
-    let fuse_a = std::env::var("PLOW_GLM_FUSE_A").ok().as_deref() != Some("0");
-    let fuse_g = std::env::var("PLOW_GLM_FUSE_G").ok().as_deref() != Some("0");
+    let fuse_a = true; // Hardcoded ON (was PLOW_GLM_FUSE_A, never disabled)
+    let fuse_g = true; // Hardcoded ON (was PLOW_GLM_FUSE_G, never disabled)
     // B1 defaults OFF (opt-in): AddNorm reduces over the un-rounded a+b sum, so unlike A/G it is NOT
     // byte-identical to the split Residual+RmsNorm — a reorder-level fp diff that flips one early
     // greedy argmax and cascades. Ship it only behind the HF-coherence gate; PLOW_GLM_FUSE_B1=1 opts in.
-    let fuse_b1 = std::env::var("PLOW_GLM_FUSE_B1").ok().as_deref() == Some("1");
+    let fuse_b1 = emit_config::active().glm_fuse_b1;
 
     // --- MLA ---
     // 1 input_layernorm
@@ -2356,7 +2363,7 @@ fn emit_glm_mla(
     // PLOW_NO_XREDUCE (diagnostic): drop the 156 all-reduce collectives (o_proj writes n.attn
     // directly with only this rank's partial) — numerically WRONG but same graph minus the
     // cross-GPU rendezvous, to isolate the XReduce cost. Never set for a real decode.
-    let no_xr = tp > 1 && std::env::var("PLOW_NO_XREDUCE").ok().as_deref() == Some("1");
+    let no_xr = tp > 1 && emit_config::active().no_xreduce;
     // GLM_LINEAR_FP8: `o_proj` is a whole block-fp8 checkpoint tensor the prep dequantises. On the
     // fp8 arm it goes through GEMV_FP8_BLK (44) reading the checkpoint's own [128,128] grid from
     // t5 — the same opcode/slot the dense-FFN down projection already uses (`dense_down_op`).
@@ -2704,7 +2711,7 @@ fn emit_glm_mla_prefill(
             gemm(b, out, n.oat, w.wo, w.wo_s, h, nh_l * vd, deps)
         }
     };
-    let no_xr = tp > 1 && std::env::var("PLOW_NO_XREDUCE").ok().as_deref() == Some("1");
+    let no_xr = tp > 1 && emit_config::active().no_xreduce;
     let c_op = if tp > 1 && !no_xr {
         let c_p = oproj(b, n.og_tp, &[c_uv]);
         emit_xreduce(b, xgate, false, xr_cus, c_p, n.attn, t * h, tp, 0)
@@ -2997,7 +3004,7 @@ fn emit_glm_block_prefill(
     //    xmid (XReduce would sum it tp times): it writes the partial with a zero residual, the
     //    two-shot all-reduce folds the ranks, and a Residual then adds the real xmid. tp==1 keeps
     //    the fused xmid combine — the same structure the decode block uses, one phase up.
-    let no_xr = tp > 1 && std::env::var("PLOW_NO_XREDUCE").ok().as_deref() == Some("1");
+    let no_xr = tp > 1 && emit_config::active().no_xreduce;
     if tp > 1 && !no_xr {
         let c_cmb = b.emit(DevOp::MoeCombinePf, all.clone(), &[c_shd, c_d], |d| {
             d.t[0] = n.dg_tp;
@@ -3175,7 +3182,7 @@ fn emit_glm_dense_block_prefill(
     // Combine. Identical TP structure to the MoE prefill block: under TP the partial is combined
     // with a ZERO residual, two-shot all-reduced, and the real residual added after — folding xmid
     // in before the all-reduce would sum it tp times.
-    let no_xr = tp > 1 && std::env::var("PLOW_NO_XREDUCE").ok().as_deref() == Some("1");
+    let no_xr = tp > 1 && emit_config::active().no_xreduce;
     if tp > 1 && !no_xr {
         let c_cmb = b.emit(DevOp::MoeCombinePf, all.clone(), &[c_d], |d| {
             d.t[0] = n.dg_tp;
@@ -3315,17 +3322,18 @@ fn mla_moe_enc_env(dir: &Path) -> MoeEnc {
     // asked for — silently substituting a different computation under a flag that named one
     // precisely, which is the failure this renaming existed to remove. The activation-quantizing
     // option for this family is A4W4 (`PLOW_MXFP4`), where BOTH operands are 4-bit.
-    let w8a16 = std::env::var("PLOW_W8A16").ok().as_deref() == Some("1");
+    let cfg = emit_config::active();
+    let w8a16 = cfg.w8a16;
     assert!(
-        std::env::var("PLOW_W8A8").ok().as_deref() != Some("1"),
+        !cfg.w8a8,
         "PLOW_W8A8=1 is not implementable for the MLA+MoE family: its block-fp8 expert arms (ops \
          45/46/48/49) are w8a16 in every instantiation — fp8 weights, bf16 activations — so there \
          is nothing to quantize the activation with. Missing capability: `moe_w8a8`. Use \
          PLOW_W8A16=1 (or PLOW_FP8=1) for this family's fp8 profile, or PLOW_MXFP4=1 for A4W4, \
          which is the one path here that narrows the activation too."
     );
-    let use_fp8 = std::env::var("PLOW_FP8").ok().as_deref() == Some("1") || w8a16;
-    let mxfp4 = std::env::var("PLOW_MXFP4").ok().as_deref() == Some("1");
+    let use_fp8 = cfg.fp8 || w8a16;
+    let mxfp4 = cfg.mxfp4;
     assert!(
         !(mxfp4 && use_fp8),
         "PLOW_MXFP4=1 and PLOW_FP8=1 together would ask for two weight encodings in one packet. \
@@ -3430,7 +3438,7 @@ pub(crate) fn glm_prefill_buckets_env(ctx: u32) -> (Vec<u32>, PrefillScope) {
             .filter(|&x| x > 1 && x <= ctx)
             .collect()
     };
-    match std::env::var("PLOW_MLA_PREFILL").ok().as_deref() {
+    match emit_config::active().mla_prefill.as_deref() {
         None | Some("") | Some("0") => (Vec::new(), PrefillScope::Attn),
         Some("1") => (glm_prefill_buckets(ctx), PrefillScope::Attn),
         Some("full") => (glm_prefill_buckets(ctx), PrefillScope::Full),
@@ -3484,10 +3492,7 @@ pub(crate) fn emit_glm_block(
     // SHIP DEFAULT = 1 (co-resident experts): bit-exact, measured -17.4% on the MoE block (the M=1
     // experts collapse from serial-all-256 to tk concurrent 256/tk-CU segments). GLM_MOE_CORESIDENT=0
     // restores the serial baseline; =2 adds the proactive co-resident shared expert (marginal, opt-in).
-    let cores: u32 = std::env::var("GLM_MOE_CORESIDENT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+    let cores: u32 = emit_config::active().glm_moe_coresident.unwrap_or(1);
     // Under cores>=2 the shared expert gets its own slice (parts = tk+1, slot tk), concurrent with the
     // tk routed experts; else it stays on all-256 (serial, ahead of the experts in the stream).
     //
@@ -3498,9 +3503,8 @@ pub(crate) fn emit_glm_block(
     // (perf-data/glm52-kernel-review.md §4: GLU 24.72 -> 19.58 us, DOWN 25.94 -> 22.72 us at 32 CU).
     // The default below reproduces `split(tk+1, ·)` EXACTLY, so nothing moves unless asked.
     let n_cu = b.n_cu();
-    let shared_w: u32 = std::env::var("GLM_SHARED_CUS")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
+    let shared_w: u32 = emit_config::active()
+        .glm_shared_cus
         .filter(|&s| s > 0 && s < n_cu)
         .unwrap_or(n_cu - tk * (n_cu / (tk + 1)));
     let routed_w = (n_cu - shared_w) / tk;
@@ -3535,7 +3539,7 @@ pub(crate) fn emit_glm_block(
     // 65 — perf-data/glm52-decode-emitter-abs.md §3). Kept as the instrument that priced it. Do not
     // re-propose this as a lever.
     let router_cus: Vec<u32> =
-        if cores >= 2 && std::env::var("GLM_ROUTER_OFF_SHARED").ok().as_deref() == Some("1") {
+        if cores >= 2 && emit_config::active().glm_router_off_shared {
             (0..n_cu - shared_w).collect()
         } else {
             all.clone()
@@ -3546,7 +3550,7 @@ pub(crate) fn emit_glm_block(
     //   wave-cooperative GEMV (all.clone()) — was the single-CU scalar dot that measured 73% of the
     //   MoE layer — feeding a cheap 1-CU MoeRouterTopk tail (bit-exact selection). GLM_ROUTER_OLD=1
     //   emits the fused single-CU d_moe_router for the before/after A/B.
-    let c_router = if std::env::var("GLM_ROUTER_OLD").ok().as_deref() == Some("1") {
+    let c_router = if emit_config::active().glm_router_old {
         b.emit(DevOp::MoeRouter, one.clone(), &[c_rn2], |d| {
             d.t[0] = n.tab;
             d.t[1] = n.xn2;
@@ -3780,7 +3784,7 @@ pub(crate) fn emit_glm_block(
     let mut deps = Vec::with_capacity(1 + downs.len());
     deps.push(c_shd);
     deps.extend_from_slice(&downs);
-    let no_xr = tp > 1 && std::env::var("PLOW_NO_XREDUCE").ok().as_deref() == Some("1");
+    let no_xr = tp > 1 && emit_config::active().no_xreduce;
     if tp > 1 && !no_xr {
         let c_cmb = b.emit(DevOp::MoeCombine, elem_cus(&all, h), &deps, |d| {
             d.t[0] = n.dg_tp;
@@ -3891,7 +3895,7 @@ pub(crate) fn emit_glm_dense_block(
     // dense down (block-fp8 GEMV, op 44) — row-parallel (di_l input). Under TP writes a PARTIAL into
     //   the dg_tp peer slot, XReduce all-reduces into n.attn, then residual; at tp==1 writes n.shared
     //   and the residual reads it directly (byte-identical).
-    let no_xr = tp > 1 && std::env::var("PLOW_NO_XREDUCE").ok().as_deref() == Some("1");
+    let no_xr = tp > 1 && emit_config::active().no_xreduce;
     if tp > 1 && !no_xr {
         let c_down = b.emit(dense_down_op(enc), all.clone(), &[c_glu], |d| {
             d.t[0] = n.dg_tp;
@@ -3990,14 +3994,11 @@ fn glm_emit_full(
 ) {
     let mut c = cfg_glm(dir);
     c.tp = tp;
-    // GLM_NLAYERS truncates the model to the first N layers — a single-GPU smoke test of the decode
-    // LOOP mechanics (embed/chain/KV-row patch/argmax/multi-step) that fits without TP or all 78
-    // layers' weights. Default = full 0..77 (layer 78 = MTP, skipped).
-    let nl = std::env::var("GLM_NLAYERS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(c.layers)
-        .min(c.layers);
+    // --glm-layers cap truncates the model to the first N layers — a single-GPU smoke test of the
+    // decode LOOP mechanics (embed/chain/KV-row patch/argmax/multi-step) that fits without TP or
+    // all 78 layers' weights. Default = full 0..77 (layer 78 = MTP, skipped).
+    let (_full, cap, _single) = emit_config::active().glm_layer_cfg();
+    let nl = cap.unwrap_or(c.layers).min(c.layers);
     let layers: Vec<u32> = (0..nl).collect();
     let enc = MoeEnc::from_flags(use_fp8, false);
 
@@ -4108,9 +4109,7 @@ fn glm_emit_full(
     // by default; PLOW_XR_CUS caps it (the TP8 NUMA-crossing lever, plans/tp-design.md §8b).
     let mut xgate: u32 = 0;
     let xr_cus: Vec<u32> = {
-        let k = std::env::var("PLOW_XR_CUS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok());
+        let k = emit_config::active().xr_cus;
         match k {
             Some(k) if k > 0 && k < n_cu => (0..k).collect(),
             _ => all.clone(),
@@ -4309,7 +4308,8 @@ pub(crate) fn glm_main(
     let enc = mla_moe_enc_env(dir);
     let use_fp8 = enc == MoeEnc::Fp8Blk;
     // Full 78-layer serving decode program (GLM_FULL=1) vs the single-layer validation gate (default).
-    if std::env::var("GLM_FULL").ok().as_deref() == Some("1") {
+    let (glm_full, _glm_cap, glm_single) = emit_config::active().glm_layer_cfg();
+    if glm_full {
         glm_emit_full(dir, ctx, out, n_cu, tp, use_fp8, rope_gen, target, verify);
         return;
     }
@@ -4321,10 +4321,7 @@ pub(crate) fn glm_main(
     );
     // Which layer to emit for the single-layer vs-HF gate (default = first MoE layer, matching the
     // B4 oracle's layer 3).
-    let layer: u32 = std::env::var("GLM_LAYER")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(c.first_k_dense);
+    let layer: u32 = glm_single.unwrap_or(c.first_k_dense);
     let dense = c.is_dense(layer);
 
     let mut tb = Builder::new(n_cu);
@@ -6563,7 +6560,7 @@ pub(crate) fn k3_emit_full(
         K3_SYNTHESIZED,
     ) {
         Ok(()) => {}
-        Err(e) if std::env::var("PLOW_SKIP_COVERAGE").ok().as_deref() == Some("1") => {
+        Err(e) if emit_config::active().skip_coverage => {
             eprintln!("*** PLOW_SKIP_COVERAGE=1 — EMITTING A MODEL KNOWN TO BE WRONG ***\n{e}");
         }
         Err(e) => {
@@ -6643,11 +6640,12 @@ const K3_INDIRECT: &[&str] = &[
 ];
 
 fn k3_emit_layers(c: &K3Cfg) -> Vec<u32> {
-    let nl = std::env::var("K3_NLAYERS")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(c.layers)
-        .min(c.layers);
+    let (full, cap, _single) = emit_config::active().k3_layer_cfg();
+    let nl = if full {
+        cap.unwrap_or(c.layers).min(c.layers)
+    } else {
+        cap.unwrap_or(c.layers).min(c.layers)
+    };
     (0..nl).collect()
 }
 
@@ -6672,7 +6670,7 @@ fn k3_emit_layers(c: &K3Cfg) -> Vec<u32> {
 /// Consumers read stale buffers, so tokens are garbage. That is intended and is the same standing
 /// as `PLOW_CHAIN_BYPASS`: wrong numerics are a valid instrument for scheduling and for cost.
 fn k3_ablate_bodies(m: &mut Model) {
-    let Ok(spec) = std::env::var("PLOW_K3_ABLATE") else {
+    let Some(ref spec) = emit_config::active().k3_ablate else {
         return;
     };
     let want: Vec<u16> = spec
@@ -6705,10 +6703,7 @@ fn k3_ablate_bodies(m: &mut Model) {
 /// note records as UNSWEPT at TP8. `PLOW_K3_NS` is therefore the sweep handle and the default is
 /// the measured winner; do not change the default without re-running the sweep.
 fn k3_nsplit(ctx: u32) -> u32 {
-    if let Some(v) = std::env::var("PLOW_K3_NS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-    {
+    if let Some(v) = emit_config::active().k3_ns {
         return v.max(1);
     }
     let _ = ctx;
@@ -6764,8 +6759,7 @@ fn k3_build_model(
             scale: 1.0 / ((c.qk_nope + c.qk_rope) as f32).sqrt(),
             n_split: k3_nsplit(ctx),
             gf: 4,
-            fp8_kv: std::env::var("PLOW_FP8_KV").ok().as_deref() == Some("1")
-                || std::env::var("PLOW_KV_FP8").ok().as_deref() == Some("1"),
+            fp8_kv: emit_config::active().fp8_kv,
         },
         moe: K3MoeCfg {
             hidden: c.hidden,
@@ -6782,7 +6776,7 @@ fn k3_build_model(
             // The grouped ops passed the full TP8 K3 gate at 4K+16: 103.161 -> 62.893 ms/token,
             // with all 17 dumped logit vectors byte-identical. Keep `0` as the reproducible
             // baseline arm; every other spelling, including unset, ships the measured winner.
-            group_decode: std::env::var("K3_MOE_GROUP").ok().as_deref() != Some("0"),
+            group_decode: true, // Hardcoded ON (was K3_MOE_GROUP, never disabled)
         },
         vocab: c.vocab,
         first_k_dense: c.first_k_dense,
@@ -6818,11 +6812,7 @@ fn k3_build_model(
     // Capped at PLOW_GEMV_MAXM=16: `AmdEngine::load` refuses above it because the gfx950 decode
     // GEMV is a compile-time row bucket and sequences 16.. would get zero logits. The KDA state
     // is the other bound — 0.44 GiB per slot, constant in context.
-    let dbatch: u32 = std::env::var("PLOW_DECODE_BATCH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
-        .clamp(1, 16);
+    let dbatch: u32 = emit_config::active().decode_batch.clamp(1, 16);
     for (i, &t) in std::iter::once(&dbatch).chain(pf.iter()).enumerate() {
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
@@ -6850,7 +6840,7 @@ fn k3_build_model(
             // does not, the carrier that broke it is separable from batching itself — which is the
             // one question a B>1 run cannot answer, because at B>1 there is no reference stream to
             // compare against.
-            if i == 0 && (dbatch > 1 || std::env::var_os("PLOW_K3_SEQ_ROWS").is_some()) {
+            if i == 0 && (dbatch > 1 || emit_config::active().k3_seq_rows) {
                 crate::k3::RowKind::Sequences
             } else {
                 crate::k3::RowKind::Tokens
@@ -6908,7 +6898,7 @@ fn k3_build_model(
 /// `act.pf.moe.part` alone is `T * top_k * latent` f32 — **1.9 GiB at T = 8192** on the shipped
 /// geometry. A deployment that will only ever see 1k prompts should not pay for the 8192 rung.
 pub(crate) fn k3_prefill_buckets(ctx: u32) -> Vec<u32> {
-    match std::env::var("K3_PREFILL").ok().as_deref() {
+    match emit_config::active().k3_prefill.as_deref() {
         Some("0") => Vec::new(),
         None | Some("") | Some("1") | Some("full") => glm_prefill_buckets(ctx),
         Some(list) => list

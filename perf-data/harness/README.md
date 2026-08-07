@@ -20,3 +20,14 @@
   relL2 is mean 0.02644 / std 0.00034 (1.3% CV) with no structure by layer,
   projection, or position; best compile-time predictor is Spearman 0.103 *with
   the wrong sign*; random selection beat sorted at f=0.25 and f=0.50.
+
+## Model / GPU bring-up
+
+- **`BRINGUP.md`** — the bring-up runbook: gpulease discipline, the
+  token-identity gate, baseline rules, the attribution ladder
+  (PLOW_TTFT_LOG → PLOW_PF_SEG_TIME → PLOW_NV_TRACE → sudo ncu), the probe law
+  (standalone probes overstate — in-model only), roofline sanity, the canonical
+  sm_90a prefill config, and the refuted-ideas list. Distilled from the
+  GH200/Gemma-4-12B campaign (`perf-data/gemma12b-gh200-prefill-campaign.md`).
+- `bringup_gate.sh` / `bringup_bench.sh` / `bringup_showdown.sh` /
+  `bringup_ceiling.py` — the parameterized harness scripts BRINGUP.md drives.

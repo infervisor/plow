@@ -84,12 +84,19 @@ enum {
     /* t0=out t1=x                      i0=n                     f0=cap */
     PLOW_DOP_SOFTCAP = 7,
 
-    /* t0=C t1=A t2=B                   i0=M i1=N i2=K  i4=a_row0
+    /* t0=C t1=A t2=B                   i0=M i1=N i2=K  i4=a_row0  [i6=A-tmap i7=B-tmap]
      * C[M,N] = A[M,K] . B[N,K]^T. B is [out_features, in_features].
      *
      * i4 skips a_row0 rows of A. It exists so prefill's lm_head can be M=1 over the LAST
      * token instead of M=T over all of them: at T=4096 that is a 512 KB logit buffer and
-     * ~0 ms instead of 2.1 GB and ~19 ms of GEMM we would immediately throw away. */
+     * ~0 ms instead of 2.1 GB and ~19 ms of GEMM we would immediately throw away.
+     *
+     * i6/i7 (sm_90a TMA only, PLOW_NV_TMA_GEMM; also on _MED/_SMALL): tensor handles of
+     * host-encoded 128 B CUtensorMap blobs over the FULL A / B tensors (PLOW_GEN_TMAP
+     * gen-tensors, materialised by the loader after device addresses resolve). 0 = absent
+     * -> cp.async body. 0 deliberately deviates from the TENSOR_NONE_I=0xFFFF demoted-
+     * handle convention: pre-TMA packets zero-fill unused i[] words, and handle 0 (in.ids)
+     * can never be a tensormap, so 0 is the only value that is backward-compatible. */
     PLOW_DOP_GEMM = 8,
 
     /* t0=C t1=A t2=B t3=rms(f32) t4=gamma   i0=M i1=N i2=K

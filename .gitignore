@@ -39,4 +39,7 @@ gpucore.*.gpu
 # committed-by-accident artifacts (binaries/profiles live outside git)
 cuda-keyring_*.deb
 plow_profile.sqlite
+
+# GPU binary build outputs — never check in (bundles link them from build dirs)
 *.cubin
+*.hsaco

@@ -410,9 +410,12 @@ impl DevBlob {
         // `PLOW_NV_PLACE_DISPATCH` stays accepted alongside the new spelling: the flag was
         // renamed because an L2 domain is a GPC on NVIDIA and an XCD on AMD, and a run that
         // opted in under the old name must not start failing to load.
+        // `--l2-place-dispatch` counts too: declaring the flag and then reading
+        // only the environment makes it parse and do nothing.
         let dispatch_on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
         if hdr.flags & packet::devbuild::PLOW_BLOB_F_L2DOM != 0
             && !l2_dispatch_ok
+            && !crate::config::RuntimeConfig::get().nv.l2_place_dispatch
             && !dispatch_on("PLOW_L2_PLACE_DISPATCH")
             && !dispatch_on("PLOW_NV_PLACE_DISPATCH")
         {
@@ -529,9 +532,118 @@ impl DevProg {
     /// The coarse single-segment gate the sm_120 interpreter implements: every
     /// stream entry must be unsegmented (`seg == 0`) with no per-slice or
     /// cross-GPU counters. Mirrors the harness's fatal check.
+    /// Per-segment wave class of a wave-class segmented program: 8 = GEMM-class,
+    /// 4 = flash-class (contains a FlashPrefill op). Mirror of the AMD engine's
+    /// `derive_segments`, hoisted here so the CUDA engine (which builds without
+    /// the `hsa` module) can classify segments for the SegPf launcher.
+    pub fn seg_classes(&self) -> Result<Vec<u8>> {
+        let mut n_seg: u32 = 1;
+        for e in &self.stream {
+            n_seg = n_seg.max(e.seg as u32 + 1);
+        }
+        // T37: 2048 covers a 60-layer model's ~10 wave-class runs per layer with headroom
+        // (512 was sized for 48 layers and tripped on Gemma-4-31B's 603).
+        if n_seg > 2048 {
+            return Err(RuntimeError::Device(format!(
+                "program declares {n_seg} segments (max 2048) — corrupt stream?"
+            )));
+        }
+        // PLOW_PF_SEG_PURE=1: mirror of the emit-side PLOW_SEG_PURE_GEMM classing — a segment
+        // is GEMM-class (8) only if EVERY op in it is a GEMM-family op; anything else (norms,
+        // rope, quant, glu, flash) makes it flash-class (4). Required when the lean object is
+        // built PLOW_NV_GEMM_ONLY: its dispatch traps on any non-GEMM opcode, so a light-op
+        // segment classified 8 would land there. The two envs must be set together — this one
+        // at serve time, the emit one at plowc time.
+        // Must match the emit-side classing in devbuild.rs: "1" = every plain tiled GEMM,
+        // "fp8" = only TMA-mapped fp8 GEMMs (the ws-entry object's sole arm).
+        let rt = crate::config::RuntimeConfig::get();
+        let pure_mode = match rt.nv.pf_seg_pure.as_deref() {
+            Some("1") => 1u8,
+            Some("fp8") => 2u8,
+            _ => 0u8,
+        };
+        use packet::dev::DevOp;
+        // PLOW_PF_SEG_FA512=1 (T12): hd512 FlashPrefill segments class 2 — launched on the
+        // dedicated *_pffa object. Mirror of the emit-side PLOW_SEG_FA512.
+        let fa512_mode = match rt.nv.pf_seg_fa512.as_deref() {
+            Some("1") => 1u8,
+            Some("all") => 2u8,
+            _ => 0u8,
+        };
+        let v2_env = rt.nv.pf_seg_v2.as_deref();
+        let seg_v2 = v2_env == Some("1");
+        let seg_q8 = seg_v2 || v2_env == Some("q8");
+        const FP8_OPS: [DevOp; 3] = [DevOp::GemmFp8, DevOp::GemmMedFp8, DevOp::GemmSmallFp8];
+        const BF16_OPS: [DevOp; 3] = [DevOp::Gemm, DevOp::GemmSmall, DevOp::GemmMed];
+        let mut class = vec![8u8; n_seg as usize];
+        for e in &self.stream {
+            let inst = self.insts.get(e.inst as usize).ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "stream entry references instruction {} of {}",
+                    e.inst,
+                    self.insts.len()
+                ))
+            })?;
+            let op = inst.op;
+            let flash_op =
+                op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16;
+            if flash_op
+                && ((fa512_mode == 2 && (inst.i[6] == 256 || inst.i[6] == 512))
+                    || (fa512_mode == 1 && inst.i[6] == 512))
+            {
+                class[e.seg as usize] = 2;
+                continue;
+            }
+            // PLOW_PF_SEG_V2=1 (T16): mirror of the emit-side PLOW_SEG_V2 classing.
+            if seg_v2 {
+                if fa512_mode == 2
+                    && (op == DevOp::HeadNormRope as u16
+                        || op == DevOp::HeadNormRopeFp8 as u16
+                        || op == DevOp::FlashMerge as u16)
+                {
+                    class[e.seg as usize] = 2;
+                    continue;
+                }
+            }
+            if seg_q8 && pure_mode == 2 && op == DevOp::QuantFp8 as u16 {
+                // class stays 8 (the default) — fall through without forcing 4.
+                continue;
+            }
+            let flashy = match pure_mode {
+                1 => {
+                    // T37 mirror: maps required in mode 1 too (see devbuild.rs).
+                    !((FP8_OPS.iter().any(|g| *g as u16 == op)
+                        || BF16_OPS.iter().any(|g| *g as u16 == op))
+                        && inst.i[6] != 0
+                        && inst.i[7] != 0)
+                }
+                2 => {
+                    // T24 mirror: mapped bf16 GEMMs class 8 too (see devbuild.rs).
+                    !((FP8_OPS.iter().any(|g| *g as u16 == op)
+                        || BF16_OPS.iter().any(|g| *g as u16 == op))
+                        && inst.i[6] != 0
+                        && inst.i[7] != 0)
+                }
+                _ => {
+                    op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16
+                }
+            };
+            if flashy {
+                class[e.seg as usize] = 4;
+            }
+        }
+        Ok(class)
+    }
+
     pub fn check_coarse_single_segment(&self) -> Result<()> {
+        // An L2-PLACED program (l2_domains != 0) legitimately carries seg = L2 domain in
+        // [0, l2_domains); the placed interpreter partitions by per-domain gq windows and
+        // never reads seg as a wave-class. The parse-time PLOW_BLOB_F_L2DOM gate has already
+        // verified the runtime attested a placed cubin, so only out-of-range domains and the
+        // still-unimplemented fine/xctr flags are errors here.
+        let seg_lim = if self.l2_domains != 0 { self.l2_domains as u16 } else { 1 };
         for (j, e) in self.stream.iter().enumerate() {
-            if e.seg != 0 || (e.flags & (packet::dev::SE_FINE | packet::dev::SE_XCTR)) != 0 {
+            if e.seg >= seg_lim || (e.flags & (packet::dev::SE_FINE | packet::dev::SE_XCTR)) != 0 {
                 return Err(RuntimeError::Device(format!(
                     "devblob: prog T={} stream entry {j} is segmented/fine-gated; the sm_120 \
                      interpreter implements the coarse single-segment path only",

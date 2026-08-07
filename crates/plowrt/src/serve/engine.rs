@@ -251,11 +251,11 @@ mod amd_serve {
                 next_id: vec![0; batch],
                 decode_only: n_programs == 1,
                 max_ctx,
-                prefix_cache: std::env::var("PLOW_PREFIX_CACHE").as_deref() == Ok("1"),
+                prefix_cache: crate::config::RuntimeConfig::get().nv.prefix_cache,
                 cached_prompt: vec![Vec::new(); batch],
                 snap_at: vec![0; batch],
                 pf: (0..batch).map(|_| None).collect(),
-                chunk_prefill: std::env::var("PLOW_PF_NO_CHUNK").as_deref() != Ok("1"),
+                chunk_prefill: !crate::config::RuntimeConfig::get().nv.pf_no_chunk,
             })
         }
 

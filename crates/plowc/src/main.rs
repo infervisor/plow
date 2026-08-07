@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use devgen::emit_config::EmitConfig;
 #[cfg(feature = "tuner")]
 use plowc::tune::{self, TuneAction, TuneOptions};
 use plowc::{compile, net::NetConfig, Options, Parallel, Report, Source};
@@ -276,6 +277,11 @@ struct Cli {
     /// Default: "auto". Norms/embed/activations always remain BF16.
     #[arg(long, default_value = "auto")]
     weight_dtype: String,
+
+    /// Emit-time configuration knobs (precision, fusion, placement, etc.).
+    /// Each field also reads its `PLOW_*` env var as a fallback.
+    #[command(flatten)]
+    emit_cfg: EmitConfig,
 }
 
 /// Bucket presets control the batch×seq grid.
@@ -1110,6 +1116,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             l2_layout,
             gpu: cli.gpu.clone(),
             arch: cli.arch.clone(),
+            emit_cfg: Some(cli.emit_cfg.clone()),
         },
         verify,
     );

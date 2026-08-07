@@ -152,8 +152,9 @@ fn kv_tensor_name(name: &str) -> Option<(u32, u32)> {
 const CTR_STRIDE_U32: usize = 32;
 
 /// DOUBLE-BUFFER the counter/cursor banks so the per-dispatch zeroing overlaps
-/// GPU execution instead of standing in front of it. `PLOW_CTR_DBUF=0` reverts
-/// to the single bank cleared synchronously before every launch.
+/// GPU execution instead of standing in front of it. `--amd-ctr-dbuf false` /
+/// `PLOW_CTR_DBUF=0` reverts to the single bank cleared synchronously before
+/// every launch.
 ///
 /// The measured case for it, on this box (MI300X, Gemma-4-12B fp8, ctx 4096,
 /// `PLOW_DSTEP_LOG=1`): the synchronous `rearm` is **56 µs of the 11.69 ms
@@ -169,11 +170,7 @@ const CTR_STRIDE_U32: usize = 32;
 /// the persistent megakernel does not contend for.
 fn ctr_dbuf() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("PLOW_CTR_DBUF")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    *FLAG.get_or_init(|| crate::config::RuntimeConfig::get().amd.ctr_dbuf)
 }
 
 /// `sizeof(PlowTraceRec)` (`runtime/common/dev_isa.h`, static-asserted at 40).
@@ -1248,9 +1245,9 @@ pub fn plan_chunks(buckets: &[u32], n_prompt: u32) -> Result<Vec<u32>> {
         return Ok(Vec::new());
     }
     let quant = bkt[0];
-    let launch_rows = std::env::var("PLOW_LAUNCH_ROWS")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    let launch_rows = crate::config::RuntimeConfig::get()
+        .amd
+        .launch_rows
         .unwrap_or(LAUNCH_ROWS);
     let rows = n_prompt.div_ceil(quant) as usize;
 
@@ -1508,7 +1505,7 @@ impl LoadProf {
 /// counter. It is off by default because it is a second pass over the source
 /// (cheap when warm, but not free) and this is the load path, not a benchmark.
 fn profile_faults() -> bool {
-    std::env::var("PLOW_LOAD_PROFILE").ok().as_deref() == Some("1")
+    crate::config::RuntimeConfig::get().load_profile
 }
 
 /// Touch one byte of every page so the fault cost lands on `fault_ns` rather
@@ -2633,7 +2630,8 @@ impl AmdEngine {
     ///
     /// Every failure is a warn + `None` — the flat path is always correct, so a
     /// missing `config.json` or a geometry the blob does not match must not
-    /// stop the engine loading. Off by default (`PLOW_VMM_KV=1`).
+    /// stop the engine loading. Off by default (`--amd-vmm-kv` /
+    /// `PLOW_VMM_KV=1`).
     ///
     /// Only FULL-attention `kv.{l}.k`/`.v` are backed. Sliding-window rings are
     /// bounded by `window`, not by context, so they have nothing to grow into,
@@ -2644,7 +2642,7 @@ impl AmdEngine {
         blob: &DevBlob,
         checkpoint: Option<&Path>,
     ) -> Option<VmmKv> {
-        if std::env::var("PLOW_VMM_KV").as_deref() != Ok("1") {
+        if !crate::config::RuntimeConfig::get().amd.vmm_kv {
             return None;
         }
         if !be.has_vmm() {
@@ -2702,11 +2700,12 @@ impl AmdEngine {
         // granule itself instead of the 64 MiB-class block the CUDA feasibility
         // review settled on: the finest quantum the hardware can map costs
         // nothing extra here, and finer means less HBM held per slot.
-        let block_hint = std::env::var("PLOW_VMM_BLOCK_MIB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(|m| m << 20)
-            .unwrap_or(0);
+        // Env first (tests flip PLOW_VMM_BLOCK_MIB mid-process, after the
+        // config snapshot), then `--amd-vmm-block-mib`. 0 = query the device
+        // granularity (2 MiB measured on gfx950 — also the config default).
+        let cfg_mib = crate::config::RuntimeConfig::get().amd.vmm_block_mib as u64;
+        let block_hint =
+            crate::config::RuntimeConfig::env_parse_or::<u64>("PLOW_VMM_BLOCK_MIB", cfg_mib) << 20;
         let block_hint = match block_hint {
             0 => VmmOps::granularity(&**be).ok()?,
             b => b,
@@ -2773,7 +2772,8 @@ impl AmdEngine {
         // [n_cu] and workgroup w reads slot w, so a smaller grid silently drops
         // every stream above it and a larger one reads past the table.
         //
-        // PLOW_OVERSUB=1 (expert): accept an OVERSUBSCRIBED grid — blob.n_cu a
+        // `--amd-oversub` / PLOW_OVERSUB=1 (expert): accept an OVERSUBSCRIBED
+        // grid — blob.n_cu a
         // multiple of the device's CU count — to co-locate several workgroups
         // per CU so one workgroup's gate poll hides behind a sibling's body.
         // The launch grid follows blob.n_cu, so this is only sound when the
@@ -2786,7 +2786,7 @@ impl AmdEngine {
         // grid == n_cu_dev).
         let oversub_ok = blob.n_cu > n_cu_dev
             && blob.n_cu % n_cu_dev == 0
-            && std::env::var("PLOW_OVERSUB").ok().as_deref() == Some("1");
+            && crate::config::RuntimeConfig::get().amd.oversub;
         if blob.n_cu != n_cu_dev && !oversub_ok {
             return Err(RuntimeError::Device(format!(
                 "blob compiled for n_cu={} but this device has {n_cu_dev} CUs — \
@@ -2865,10 +2865,10 @@ impl AmdEngine {
         // 8.4% on 31B at T=1024). It is downgraded, never silently: no GQ
         // appendix in the blob, or no `_gq` object on disk, and this says so.
         let has_gq = blob.progs.iter().all(|p| !p.gq_stream.is_empty());
-        let env_flag = |k: &str| std::env::var(k).ok().is_some_and(|v| v != "0");
+        let rt = &crate::config::RuntimeConfig::get().amd;
         let mut sched_prefill = Sched::GlobalQueue;
         let mut sched_decode = Sched::GlobalQueue;
-        if let Ok(v) = std::env::var("PLOW_GLOBAL_QUEUE") {
+        if let Some(v) = rt.global_queue.as_deref() {
             let s = if v != "0" {
                 Sched::GlobalQueue
             } else {
@@ -2877,14 +2877,14 @@ impl AmdEngine {
             sched_prefill = s;
             sched_decode = s;
         }
-        if env_flag("PLOW_STATIC") {
+        if rt.static_both {
             sched_prefill = Sched::Static;
             sched_decode = Sched::Static;
         }
-        if env_flag("PLOW_STATIC_PREFILL") {
+        if rt.static_prefill {
             sched_prefill = Sched::Static;
         }
-        if env_flag("PLOW_STATIC_DECODE") {
+        if rt.static_decode {
             sched_decode = Sched::Static;
         }
         if !has_gq && (sched_prefill == Sched::GlobalQueue || sched_decode == Sched::GlobalQueue) {
@@ -3105,18 +3105,15 @@ impl AmdEngine {
         // with an `fp8/` prefix that is stripped before lookup. Without this an
         // fp8 packet fails at the first weight with "MISSING WEIGHT", which
         // reads as a broken packet rather than a missing directory.
-        let fp8_ckpt = match std::env::var("PLOW_FP8_DIR") {
-            Ok(d) => Some(crate::asset::checkpoint::Checkpoint::open(Path::new(&d))?),
-            Err(_) => None,
+        let fp8_ckpt = match crate::config::RuntimeConfig::get().amd.fp8_dir.as_deref() {
+            Some(d) => Some(crate::asset::checkpoint::Checkpoint::open(Path::new(d))?),
+            None => None,
         };
-        // `PLOW_UPLOAD_SLOTS=1` is the pre-pipeline shape exactly: one slab, one
-        // copy, waited on before the next memcpy starts. Kept so the pipelining
-        // can be A/B'd on one binary rather than argued about.
-        let slots = std::env::var("PLOW_UPLOAD_SLOTS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4usize)
-            .max(1);
+        // `--amd-upload-slots 1` / `PLOW_UPLOAD_SLOTS=1` is the pre-pipeline
+        // shape exactly: one slab, one copy, waited on before the next memcpy
+        // starts. Kept so the pipelining can be A/B'd on one binary rather
+        // than argued about.
+        let slots = (crate::config::RuntimeConfig::get().amd.upload_slots as usize).max(1);
         let mut ring = be.upload_ring(slots, STAGE)?;
         // v7 blobs carry the RoPE tables as RECIPES, not bytes. Materialising
         // them is not optional: a reader that skips this leaves cos=sin=0 and
@@ -3972,7 +3969,7 @@ impl AmdEngine {
             seg_enq_us: 0.0,
             seg_drain_us: 0.0,
             seg_launches: 0,
-            seg_window: std::env::var("PLOW_SEG_WINDOW").as_deref() != Ok("0"),
+            seg_window: crate::config::RuntimeConfig::get().amd.seg_window,
         })
     }
 
@@ -4298,7 +4295,18 @@ impl AmdEngine {
             self.enqueue_segment(p, seg)?;
         }
         let t1 = std::time::Instant::now();
-        self.drain()?;
+        if let Err(e) = self.drain() {
+            tracing::warn!(
+                error = %e,
+                error_code = ?e.device_code(),
+                fatal = e.is_fatal(),
+                program = p,
+                segments = n_seg,
+                grid = self.n_cu,
+                "segmented run failed at drain"
+            );
+            return Err(e);
+        }
         let t2 = std::time::Instant::now();
         self.seg_enq_us += (t1 - t0).as_secs_f64() * 1e6;
         self.seg_drain_us += (t2 - t1).as_secs_f64() * 1e6;
@@ -4329,13 +4337,37 @@ impl AmdEngine {
             dstep::timed(&dstep::REARM, || self.rearm(p))?;
         }
         let t0 = std::time::Instant::now();
-        dstep::timed(&dstep::ENQUEUE, || self.enqueue(p, k))?;
+        if let Err(e) = dstep::timed(&dstep::ENQUEUE, || self.enqueue(p, k)) {
+            tracing::warn!(
+                error = %e,
+                error_code = ?e.device_code(),
+                fatal = e.is_fatal(),
+                program = p,
+                grid = self.n_cu,
+                block = WG_THREADS_8,
+                "program dispatch failed at enqueue"
+            );
+            return Err(e);
+        }
         if ctr_dbuf() {
             let cur = self.progs[p].bank.get();
             dstep::timed(&dstep::REARM, || self.rearm_bank(p, 1 - cur))?;
             self.progs[p].bank.set(1 - cur);
         }
-        dstep::timed(&dstep::DRAIN, || self.drain())?;
+        // The drain is where an async kernel trap surfaces — capture the
+        // dispatch shape at the site before propagating.
+        if let Err(e) = dstep::timed(&dstep::DRAIN, || self.drain()) {
+            tracing::warn!(
+                error = %e,
+                error_code = ?e.device_code(),
+                fatal = e.is_fatal(),
+                program = p,
+                grid = self.n_cu,
+                block = WG_THREADS_8,
+                "program dispatch failed at drain"
+            );
+            return Err(e);
+        }
         self.seg_drain_us += t0.elapsed().as_secs_f64() * 1e6;
         Ok(())
     }
@@ -4484,14 +4516,15 @@ impl AmdEngine {
         // an error. A MODEL without one is, because the sampled logits would
         // then come from whatever row the compiler baked in.
         match (lm, self.t_logits) {
-            // DIAGNOSTIC: `PLOW_LM_ROW0=1` leaves a_row0 at 0 instead of the
+            // DIAGNOSTIC: `--amd-lm-row0` / `PLOW_LM_ROW0=1` leaves a_row0 at
+            // 0 instead of the
             // chunk's last real row. It samples the WRONG row, so it is not a
             // serving mode — it exists to answer one question. The lm_head is
             // the ONLY op whose a_row0 the host patches to a non-zero value at
             // runtime, so a bug in the a_row0 path is invisible to any check
             // that inspects the packet statically (where all fp8 GEMMs carry
             // a_row0 == 0) and shows up only here.
-            (Some(lm), _) if std::env::var("PLOW_LM_ROW0").as_deref() == Ok("1") => {
+            (Some(lm), _) if crate::config::RuntimeConfig::get().amd.lm_row0 => {
                 tracing::warn!(
                     lm,
                     "PLOW_LM_ROW0=1: a_row0 left at 0 — DIAGNOSTIC, wrong row"
@@ -5036,6 +5069,17 @@ impl AmdEngine {
     /// longer owns.
     pub fn decode_prepare_batched(&mut self, pos: &[u32], kvlen: &[u32]) -> Result<()> {
         let b = self.batch;
+        // The bound lives HERE, not only in `decode_step_batched`: the TP path
+        // (`amd_tp::submit_decode_batched`) calls this directly, so a guard one
+        // level up left tensor-parallel decode with no refusal at all — an
+        // over-long `pos` walked past the KV geometry. Every other decode entry
+        // (B=1 `decode_prepare`, batched, both CUDA paths) checks it.
+        if let Some(&p) = pos.iter().find(|&&p| p as usize >= self.max_ctx) {
+            return Err(RuntimeError::Device(format!(
+                "position {p} past max_ctx {}",
+                self.max_ctx
+            )));
+        }
         if b == 1 {
             self.patch_kvrow(self.decode, pos[0])?;
         }

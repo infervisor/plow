@@ -52,6 +52,20 @@ __device__ __forceinline__ float block_sum(float v, float* part) {
     return r;
 }
 
+/* Block-wide f32 max, same shape/barrier discipline as block_sum above. */
+__device__ __forceinline__ float block_max(float v, float* part) {
+    const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+    const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+    v = warp_max32(v);
+    if (lane == 0) part[warp] = v;
+    __syncthreads();
+    float r = part[0];
+#pragma unroll
+    for (unsigned w = 1; w < PLOW_NV_WARPS; w++) r = fmaxf(r, part[w]);
+    __syncthreads();
+    return r;
+}
+
 /* Activations. Must match runtime/amd/op_elementwise.h bit-for-bit in FORM (same fma order),
  * since the golden oracle is f32 and any reassociation shows up in the bf16 comparison. */
 __device__ __forceinline__ float act_gelu_tanh(float x) {

@@ -44,7 +44,7 @@ hyper-util = { version = "0.1", features = ["tokio", "service", "server-auto"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 
 # Optional: real tokenizer + checkpoint reader. Off by default so the skeleton
@@ -94,4 +94,8 @@ required-features = ["cuda"]
 
 [[example]]
 name = "reload_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "s1_switch_bench"
 required-features = ["cuda"]

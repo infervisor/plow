@@ -194,12 +194,16 @@ __device__ __forceinline__ float plow_moe_slot_gate(const unsigned char* table, 
     return *(const float*)(table + (size_t)slot * 8 + 4);
 }
 
+/* i5 act code -> activation, per dev_isa.h:374 — `0 gelu_tanh, 1 silu`, the same
+ * mapping runtime/amd/op_moe.h:141 uses. This file previously carried a private
+ * copy that had the two codes INVERTED (its comment claimed "0 = SiLU"), so every
+ * GLM/DeepSeek packet — which emits act=1 (devgen/src/mla.rs GLM_ACT_SILU) — got
+ * gelu_tanh, silently and fluently. Delegating to the shared helpers is what keeps
+ * one answer: they are the same two functions the other 19 NVIDIA call sites use.
+ * Code 2 (Kimi-K3 `situ`) never reaches here — it goes through `moe_glu`, which
+ * transforms the UP branch too. */
 __device__ __forceinline__ float plow_moe_act(float g, unsigned act) {
-    /* act 0 = SiLU (GLM/DeepSeek swiglu), 1 = GELU-tanh. Fast reciprocal: the IEEE `/`
-     * inlined a ~90-instr FCHK+slow-path division (cold for Gemma, pure code bloat). */
-    if (act == 0u) return g * __fdividef(1.0f, 1.0f + __expf(-g));
-    const float c = 0.7978845608028654f;
-    return 0.5f * g * (1.0f + tanhf(c * (g + 0.044715f * g * g * g)));
+    return act == (unsigned)PLOW_ACT_SILU_ ? act_silu(g) : act_gelu_tanh(g);
 }
 
 /* ================= DENSE (non-routed) block-fp8 FFN, decode megakernel ops ============
@@ -512,10 +516,12 @@ __device__ __forceinline__ void plow_moe_row_rms(float* __restrict__ inv, float*
     }
 }
 
-/* gelu_pytorch_tanh, bit-for-bit with sm120_common.cuh act_gelu_tanh (same fma form). */
+/* gelu_pytorch_tanh for the gelu-only Gemma-MoE arms. Delegates rather than
+ * restating the polynomial: the copy was already claimed "bit-for-bit with
+ * sm120_common.cuh act_gelu_tanh", and a claim of bit-identity that a future
+ * edit can quietly break is exactly how the act-code inversion above survived. */
 __device__ __forceinline__ float plow_moe_gelu_tanh(float x) {
-    const float c = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-    return 0.5f * x * (1.0f + tanhf(c));
+    return act_gelu_tanh(x);
 }
 
 /* bf16 dot of one output row across a 32-lane warp (all-reduce), x/w both bf16[K].

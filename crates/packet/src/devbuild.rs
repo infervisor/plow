@@ -289,6 +289,8 @@ pub struct Builder {
     /// The target cannot honour `PLOW_UNISEG` — set by an emitter that knows what it is building
     /// for. See [`Builder::deny_uniseg`].
     uniseg_denied: bool,
+    /// See [`Builder::force_uniseg`].
+    uniseg_forced: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
     /// byte-identical. See [`Builder::set_gemv_split`].
     gemv_split: u32,
@@ -309,6 +311,7 @@ impl Builder {
             gen: Vec::new(),
             place_l2: None,
             uniseg_denied: false,
+            uniseg_forced: false,
             gemv_split: 1,
             tensor_dedup: false,
             tr_dropped: 0,
@@ -343,6 +346,14 @@ impl Builder {
     /// whose meaning depends on the backend cannot be resolved in a backend-agnostic builder.
     pub fn deny_uniseg(&mut self) {
         self.uniseg_denied = true;
+    }
+
+    /// T18: force this program to ONE segment regardless of `PLOW_UNISEG`. Set by devgen on
+    /// SMALL prefill buckets (`PLOW_UNISEG_MAX_T`): a tail chunk of ~50 tokens pays ~480
+    /// segment launches (~40 ms measured) for ~5 ms of work — one launch on the full fat
+    /// object wins outright. No-op if `deny_uniseg` was called (the AMD target reads `seg`).
+    pub fn force_uniseg(&mut self) {
+        self.uniseg_forced = true;
     }
 
     /// Slice the machine-filling `Gemv` / `GemvGlu` / `GemvQkv` packets into `s * n_cu` shares
@@ -1099,13 +1110,104 @@ impl Builder {
         // the segment boundary is spurious there and would otherwise force a segmented relaunch path.
         // `deny_uniseg` wins over the environment: a target that cannot express one segment must
         // not be given one because a variable said so. See that method for the failure it prevents.
-        let uniseg =
-            !self.uniseg_denied && std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1");
-        let wave_class = |op: u16| -> u8 {
+        let uniseg = !self.uniseg_denied
+            && (self.uniseg_forced
+                || std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1"));
+        // PLOW_SEG_PURE_GEMM=1 (T11): class-8 segments carry ONLY GEMM-family ops; every light
+        // op (norms, rope, quant, embed, softcap) joins the flash class. The point: the sm_90a
+        // segmented launcher runs class-8 segments on the lean `_pfgemm` object, and a pure-GEMM
+        // segment lets that object be compiled with the non-GEMM arms stripped
+        // (PLOW_NV_GEMM_ONLY), which is what gives ptxas a probe-shaped TU. More segment
+        // boundaries is the cost; only a prefill program pays it (gated on the program actually
+        // containing a flash op, so decode — which has no class-4 op and runs single-launch —
+        // emits byte-identical packets with the knob set).
+        // "1" = every plain tiled GEMM is class-8 (pairs with PLOW_NV_GEMM_ONLY);
+        // "fp8" = ONLY TMA-mapped fp8 GEMMs are class-8 (pairs with the ws-entry object,
+        // whose sole arm is the warp-specialized w8a8 body — a bf16 or mapless packet
+        // landing there would __trap()).
+        let pure_env = std::env::var("PLOW_SEG_PURE_GEMM").ok();
+        let pure_mode = match pure_env.as_deref() {
+            Some("1") => 1u8,
+            Some("fp8") => 2u8,
+            _ => 0u8,
+        };
+        let pure_gemm = !uniseg
+            && pure_mode != 0
+            && self.ops.iter().any(|o| {
+                o.inst.op == DevOp::FlashPrefill as u16 || o.inst.op == DevOp::FlashPrefillFp8 as u16
+            });
+        // PLOW_SEG_FA512=1 (T12): hd512 (full-attention) FlashPrefill packets get their OWN
+        // class (2) so the host can launch them on the dedicated *_pffa flash object. hd is
+        // carried in inst.i[6]. Requires the serve-side mirror PLOW_PF_SEG_FA512=1.
+        // "1" = hd512 only; "all" = every FlashPrefill (needs the PLOW_NV_FA_ONLY_HD256 object).
+        let fa512_env = std::env::var("PLOW_SEG_FA512").ok();
+        let fa512_mode = match fa512_env.as_deref() {
+            Some("1") if !uniseg => 1u8,
+            Some("all") if !uniseg => 2u8,
+            _ => 0u8,
+        };
+        // PLOW_SEG_V2=1 (T16, needs fa512=all + pure=fp8): rope and flash-merge join the FA
+        // class (the *_pffa object carries their arms under PLOW_NV_FA_ROPE), and QuantFp8
+        // joins the GEMM class (the uni256 object carries the quant arm) — the per-layer
+        // [rope, flash, merge] and [gate/up, gluquant, down] chains become ONE launch each.
+        // "1" = full v2 (rope/merge->FA + quant->GEMM; refuted on the 256-thread objects);
+        // "q8" (T36) = quant->GEMM only — the ws384 object carries a consumer-warpgroup
+        // quant arm, so the [gate/up, glu-quant, down] chain becomes one class-8 run.
+        let v2_env = std::env::var("PLOW_SEG_V2").ok();
+        let seg_v2 = v2_env.as_deref() == Some("1");
+        let seg_q8 = seg_v2 || v2_env.as_deref() == Some("q8");
+        let wave_class = |i: usize| -> u8 {
+            let op = self.ops[i].inst.op;
             if uniseg {
                 8
             } else if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
-                4
+                // T37: the *_pffa object instantiates hd 256/512 only — other head dims
+                // (Qwen/Llama hd128) stay on the fat object rather than trapping there.
+                let hd = self.ops[i].inst.i[6];
+                if (fa512_mode == 2 && (hd == 256 || hd == 512))
+                    || (fa512_mode == 1 && hd == 512)
+                {
+                    2
+                } else {
+                    4
+                }
+            } else if seg_v2
+                && pure_gemm // pure_gemm implies a prefill program — decode stays unsegmented
+                && fa512_mode == 2
+                && (op == DevOp::HeadNormRope as u16
+                    || op == DevOp::HeadNormRopeFp8 as u16
+                    || op == DevOp::FlashMerge as u16)
+            {
+                2
+            } else if seg_q8 && pure_gemm && op == DevOp::QuantFp8 as u16 {
+                8
+            } else if pure_gemm {
+                // Plain tiled GEMMs only. GemmGlu*/GemmNorm stay flash-class: the GEMM_ONLY
+                // object strips their arms (fused-epilogue bodies would pollute its register
+                // allocation), so they must run on the fat object. Pure-GEMM packets are
+                // emitted UNFUSED (PLOW_NO_GLU_FUSE=1) so in practice none are emitted.
+                const FP8_OPS: [DevOp; 3] =
+                    [DevOp::GemmFp8, DevOp::GemmMedFp8, DevOp::GemmSmallFp8];
+                const BF16_OPS: [DevOp; 3] = [DevOp::Gemm, DevOp::GemmSmall, DevOp::GemmMed];
+                let fp8 = FP8_OPS.iter().any(|g| *g as u16 == op);
+                let bf16 = BF16_OPS.iter().any(|g| *g as u16 == op);
+                let mapped = self.ops[i].inst.i[6] != 0 && self.ops[i].inst.i[7] != 0;
+                // T37 GENERALITY: BOTH modes require the TMA maps — the ws384/uni256 lean
+                // objects trap on a mapless class-8 packet, and another model/emitter may
+                // legitimately skip a mint. Unmapped GEMMs go to the fat object's cp.async
+                // fallback instead (correct, just slower).
+                let claimed = match pure_mode {
+                    // T24: mapped bf16 GEMMs (lm_head) also class 8 — the uni256 lean object
+                    // carries both precisions' n256 bodies, and the fat 128-reg object runs
+                    // the bf16 tile spilled (measured 4.45 ms on the lm_head segment).
+                    2 => (fp8 || bf16) && mapped,
+                    _ => (fp8 || bf16) && mapped,
+                };
+                if claimed {
+                    8
+                } else {
+                    4
+                }
             } else {
                 8
             }
@@ -1133,6 +1235,10 @@ impl Builder {
         // per-op segmentation is only viable if the 278 `XReduce` collectives resync the ranks
         // often enough to bound the drift by themselves. That is an empirical question about drift,
         // not a design one, and this knob is how it gets answered.
+        // Materialized so later passes (SEG_CLASS_SLICE mutates self.ops) can read it.
+        let op_class: Vec<u8> = (0..self.ops.len()).map(wave_class).collect();
+        drop(wave_class);
+        let wave_class = |i: usize| -> u8 { op_class[i] };
         let seg_per_op = std::env::var("PLOW_SEG_PER_OP").ok().as_deref() == Some("1");
         let mut seg_of = vec![0u16; self.ops.len()];
         let mut cur_seg = 0u16;
@@ -1145,7 +1251,7 @@ impl Builder {
                 seg_of[i] = cur_seg;
                 continue;
             }
-            if i > 0 && wave_class(self.ops[i].inst.op) != wave_class(self.ops[i - 1].inst.op) {
+            if i > 0 && wave_class(i) != wave_class(i - 1) {
                 cur_seg += 1;
             }
             seg_of[i] = cur_seg;
@@ -1162,7 +1268,7 @@ impl Builder {
         if !seg_per_op && std::env::var("PLOW_SEG_DUMP").ok().as_deref() == Some("1") {
             let mut counts: Vec<(u8, usize)> = Vec::new();
             for i in 0..self.ops.len() {
-                let cls = wave_class(self.ops[i].inst.op);
+                let cls = wave_class(i); // signature changed to index-based (T24/T37 classing)
                 match counts.last_mut() {
                     Some((c, n)) if *c == cls && seg_of[i] == seg_of[i.saturating_sub(1)] => {
                         *n += 1
@@ -1243,8 +1349,22 @@ impl Builder {
         // are skipped: their per-slice map[] is built for the ORIGINAL slice count, so doubling
         // would desync the map (this only occurs in heterogeneous MoE regions; a dense prefill
         // has none after select_granularity downgrades). Unflagged ⇒ no-op ⇒ byte-identical.
-        let seg_class_slice =
-            !uniseg && std::env::var("PLOW_SEG_CLASS_SLICE").ok().as_deref() == Some("1");
+        // "1" = classic (double filling class-8 GEMM ops, for the occ-2 ws object);
+        // "light" (T25) = double ONLY class-4 light ops — the uni256 GEMM object is occ-1
+        // (grid 132), and 264 slices there make every block run the full TMA-ring
+        // prologue/drain TWICE per op (measured ~30% in-model loss vs the standalone probe).
+        let slice_env = std::env::var("PLOW_SEG_CLASS_SLICE").ok();
+        let slice_mode = match slice_env.as_deref() {
+            Some("1") => 1u8,
+            Some("light") => 2u8,
+            _ => 0u8,
+        };
+        let seg_class_slice = !uniseg && slice_mode != 0;
+        // PLOW_SEG_SLICE_ALL=1 (T14): also double the machine-filling FLASH-class (light) ops
+        // — the FATLITE object runs them at occ-2, so both resident blocks need slices.
+        // Class-2 (dedicated flash) ops keep n_cu: the FA object is occ-1.
+        let seg_slice_all = seg_class_slice
+            && std::env::var("PLOW_SEG_SLICE_ALL").ok().as_deref() == Some("1");
         if seg_class_slice {
             let n_cu_sz = self.n_cu as usize;
             // Ops that some other op depends on FINELY — skip these (map[] would desync).
@@ -1257,7 +1377,8 @@ impl Builder {
                 }
             }
             for i in 0..self.ops.len() {
-                let gemm_class = wave_class(self.ops[i].inst.op) == 8;
+                let gemm_class = (slice_mode == 1 && wave_class(i) == 8)
+                    || (seg_slice_all && wave_class(i) == 4);
                 let fills = self.ops[i].cus.len() == n_cu_sz;
                 let has_fine = self.ops[i]
                     .deps
@@ -1928,6 +2049,17 @@ impl Model {
     /// recipe and would reject a v7 magic outright.
     pub fn bake_gen(&mut self) {
         for g in std::mem::take(&mut self.gen) {
+            // A tensormap recipe CANNOT be baked: its bytes are a function of the target's
+            // device address, which only exists at bind time. Baking the zero placeholder
+            // would serve TMA a garbage descriptor with no error — fail at build instead.
+            assert!(
+                g.kind != crate::rope::GEN_TMAP_BF16
+                    && g.kind != crate::rope::GEN_TMAP_E4M3
+                    && g.kind != crate::rope::GEN_TMAP_KV_PAIR,
+                "gen tensor {}: tensormap recipes cannot be baked into init (--no-rope-gen is \
+                 incompatible with TMA packets)",
+                g.tensor
+            );
             let data = g
                 .generate()
                 .unwrap_or_else(|| panic!("gen tensor {}: unknown kind {}", g.tensor, g.kind));

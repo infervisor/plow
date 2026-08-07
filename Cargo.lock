@@ -757,12 +757,14 @@ dependencies = [
 name = "devgen"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "costmodel",
  "hwspec",
  "kernelcaps",
  "packet",
  "plow-asset",
  "serde_json",
+ "tracing",
  "tunedb",
 ]
 

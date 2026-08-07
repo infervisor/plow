@@ -342,9 +342,7 @@ pub fn declare_kda_state(b: &mut Builder, c: &KdaCfg, prefix: &str, slots: u64) 
 /// `PLOW_KDA_FUSE_QKVG=0` emits P1-P4 as four plain [`DevOp::Gemv`] packets instead. It exists so
 /// the fusion stays falsifiable against the same program, not as a shape guard.
 fn fuse_qkvg(t: u32, hidden: u32) -> bool {
-    if std::env::var("PLOW_KDA_FUSE_QKVG").ok().as_deref() == Some("0") {
-        return false;
-    }
+    // Hardcoded ON (was `PLOW_KDA_FUSE_QKVG`, never disabled in production).
     // DECODE ONLY, and now stated as `t == 1` rather than left to the LDS bound to imply.
     //
     // The bound alone declines above ~10 rows at `hidden = 7168` (`10 * 7168 = 71680 <= 73728`,
@@ -401,8 +399,9 @@ fn fuse_qkvg(t: u32, hidden: u32) -> bool {
 /// `PLOW_KDA_FUSE=0` emits the six-packet chain instead, so the fusion stays falsifiable against
 /// the same program — the same escape [`fuse_qkvg`] carries, and the reason
 /// `runtime/tests/k3_block_gfx950_test.c` can score both spellings against one fixture.
+/// Always fuse KDA chain (hardcoded — was `PLOW_KDA_FUSE`, never disabled).
 fn fuse_kda() -> bool {
-    std::env::var("PLOW_KDA_FUSE").ok().as_deref() != Some("0")
+    true
 }
 
 /// Emit one KDA MIXER for `t` tokens: P0-P12, pre-norm through `o_proj`.

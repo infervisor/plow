@@ -118,7 +118,7 @@ fn slot(raw: &'static str) -> Option<Slot> {
 /// comments and checked against them by `table_matches_doc_comments`.
 #[rustfmt::skip]
 const DOC: &[S] = &[
-    S { op: DevOp::RmsNorm, t: &["out", "x", "gamma?"], i: &["rows", "feat"], f: &["eps"], j: &[] },
+    S { op: DevOp::RmsNorm, t: &["out", "x", "gamma?", "xq?", "ascale?"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::RowRms, t: &["rms", "x"], i: &["rows", "feat"], f: &["eps"], j: &[] },
     S { op: DevOp::HeadNormRope, t: &["out", "x", "gamma?", "cos?", "sin?", "pos"], i: &["ntok", "nhead", "hd", "out_row0", "flags", "", "n_batch_kv"], f: &["eps"], j: &["out_stride", "kv_mask"] },
     S { op: DevOp::Residual, t: &["out", "a", "b"], i: &["n"], f: &["scale"], j: &[] },
@@ -149,7 +149,7 @@ const DOC: &[S] = &[
     // resid_out/b/gamma_b/gamma_n, f0=eps f1=layer_scale. See gemv_nrn_lds in op_gemm.h.
     S { op: DevOp::GemvFp8, t: &["C", "x", "W", "resid_out", "b", "w_scale", "gamma_b", "gamma_n"], i: &["M", "N", "K", "nrn", "a_row0"], f: &["eps", "scale"], j: &[] },
     S { op: DevOp::GemvGluFp8, t: &["fu", "x", "W_gate", "gate_scale", "up_scale", "W_up"], i: &["M", "N", "K", "resid_out", "b", "act", "gamma_b", "gamma_n"], f: &["eps", "scale"], j: &["", "nrn"] },
-    S { op: DevOp::QuantFp8, t: &["xq", "x", "a_scale"], i: &["M", "K"], f: &[], j: &[] },
+    S { op: DevOp::QuantFp8, t: &["xq", "x", "a_scale", "gate?", "up?"], i: &["M", "K", "act"], f: &[], j: &[] },
     S { op: DevOp::GemmFp8, t: &["C", "A", "B", "a_scale", "w_scale"], i: &["M", "N", "K", "", "a_row0"], f: &[], j: &[] },
     S { op: DevOp::GemmGluFp8, t: &["fu", "A", "Wg", "a_scale", "g_scale", "Wu", "u_scale"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
     S { op: DevOp::NormResidualNorm, t: &["out", "resid", "a", "b", "gamma_b?", "gamma_n?"], i: &["rows", "feat"], f: &["eps", "scale"], j: &[] },

@@ -116,6 +116,159 @@ GEMV_RB="-DPLOW_NV_GEMV_RB=1 -DPLOW_MOE_DOWN_LANESPLIT=1 -DPLOW_NV_FA_WPR=1 -DPL
 # sm_120 build, which uses a different translation unit anyway — is unchanged.
 EXTRA="${PLOW_EXTRA_DEFINES:-}"
 
+# PLOW_BUILD_TMA_GEMM=1: opt-in TMA + warp-specialized prefill GEMM (op_gemm_sm90.cuh,
+# port of tma_ws_gemm_bf16.cu's ws_tma winner). Prefill object only — decode never
+# dispatches the tiled GEMM. Requires packets emitted with tensormap gen-tensors
+# (devgen PLOW_TMA_GEMM=1); without them every GEMM falls back to the cp.async body,
+# so the flag alone is inert. OFF by default until it passes numeric gates on
+# real Hopper hardware (the interp_sm90a.cu header's standing rule for wgmma paths).
+PF_EXTRA=""
+if [ "${PLOW_BUILD_TMA_GEMM:-0}" = "1" ]; then
+  PF_EXTRA="-DPLOW_NV_TMA_GEMM=1"
+fi
+
+# PLOW_BUILD_W8A8=1: opt-in TRUE-fp8 (w8a8 QGMMA) prefill GEMM arms. On sm_90a the
+# default fp8 prefill is w8a16 dequant into an EMULATED mma.sync.e4m3 (12x F2FP +
+# 2x HMMA — zero fp8 tensor-core benefit; measured 1.6-1.7x SLOWER than bf16 prefill
+# on GH200). PLOW_NV_W8A8 swaps the GEMM_*_FP8 opcodes to d_gemm_w8a8_sm90 (QGMMA,
+# measured 1.7-1.9x FASTER than bf16 wgmma) + QUANT_FP8. PGM90_FP8_PROMOTE=1 rides
+# along: fp8 wgmma does not accumulate in true f32 and the error grows with K
+# (1.14e-3 @K=3840 eats ~70% of the 1.6e-3 budget); DeepGEMM two-level promotion
+# every 128 k-elems cuts it ~10.9x (tma_ws_gemm_fp8.cu correctness table).
+# Packets must be emitted with PLOW_W8A8=1 (QuantFp8 + the w8a8 t[] layout) —
+# the opcodes change MEANING, so cubin and packet must pair.
+# PLOW_BUILD_GEMV_HEAD=1 (T23/PX-6): compile the M=1 lm_head GEMV arm into the prefill
+# objects; pair with packets emitted PLOW_PF_GEMV_HEAD=1 (else byte-identical).
+if [ "${PLOW_BUILD_GEMV_HEAD:-0}" = "1" ]; then
+  PF_EXTRA="$PF_EXTRA -DPLOW_NV_PF_GEMV_HEAD=1"
+fi
+
+if [ "${PLOW_BUILD_W8A8:-0}" = "1" ]; then
+  # PLOW_W8A8_PROMOTE=0 opts out of two-level accumulation (A/B knob; accuracy drops
+  # 1.04e-4 -> 1.14e-3 relL2 at K=3840, still under the 1.6e-3 oracle budget).
+  PF_EXTRA="$PF_EXTRA -DPLOW_NV_W8A8=1 -DPGM90_FP8_PROMOTE=${PLOW_W8A8_PROMOTE:-1}"
+fi
+
+# PLOW_BUILD_SEG=1: ALSO build the segmented-prefill object pair (T9c/T10 design,
+# first wired on Hopper by the gh200 prefill campaign):
+#   <out>_pfseg.cubin   — the FAT segmented object (every prefill arm, occ-1); runs the
+#                         flash/norm wave-class segments. Symbol *_pfseg.
+#   <out>_pfgemm.cubin  — the LEAN GEMM segment object (PLOW_NV_SEG_GEMM=1: flash arms
+#                         compiled OUT, launch_bounds(256,2) => 128 regs, TMA ring NS=2 so
+#                         2 blocks/SM fit); runs the GEMM wave-class segments. *_pfgemm.
+# plowrt launches the segments of one prefill program in order, alternating modules;
+# packets must be emitted WITHOUT PLOW_UNISEG (and want PLOW_SEG_CLASS_SLICE=1 +
+# PLOW_NO_GLU_FUSE=1 so GEMM segments slice to 2*n_cu and stay 64-acc).
+if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
+  OUT_PFSEG="${OUT%.cubin}_pfseg.cubin"
+  OUT_PFGEMM="${OUT%.cubin}_pfgemm.cubin"
+  # PLOW_BUILD_FATLITE=1 (T14): build the fat object FATLITE — flash-prefill arms stripped,
+  # 128-reg cap, occ-2. Requires PLOW_SEG_FA512=all packets (flash never classes to fat)
+  # and wants PLOW_SEG_SLICE_ALL=1 so light filling ops slice to 2*n_cu.
+  FATLITE_GATE=""
+  if [ "${PLOW_BUILD_FATLITE:-0}" = "1" ]; then
+    # STAGES=3 shrinks the TMA-GEMM arena claim to the occ-2 budget (99376 B), same as the
+    # lean object — at the default 4 stages the claim alone (132160 B) pins occupancy to 1.
+    FATLITE_GATE="-DPLOW_NV_FATLITE=1 -DPGM90_TMA_STAGES=3"
+  fi
+  env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+    "$NVCC" -arch=sm_90a -O3 -cubin \
+    -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+    -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 $FATLITE_GATE \
+    -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
+    -o "$OUT_PFSEG" "$SRC"
+  env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+    cuobjdump -symbols "$OUT_PFSEG" | grep -q "_pfseg" || { echo "FATAL: _pfseg symbol missing" >&2; exit 1; }
+  echo "built $OUT_PFSEG ($(stat -c%s "$OUT_PFSEG") B)"
+  # PLOW_BUILD_GEMM_ONLY=1 (T11): build the lean object PURE — every non-GEMM arm
+  # stripped (PLOW_NV_GEMM_ONLY=1) so ptxas gives the wgmma bodies probe-grade register
+  # allocation. Pair with packets emitted PLOW_SEG_PURE_GEMM=1 PLOW_NO_GLU_FUSE=1 and
+  # serve-time PLOW_PF_SEG_PURE=1, or a light-op segment lands on this object and traps.
+  GEMM_ONLY_GATE=""
+  if [ "${PLOW_BUILD_GEMM_ONLY:-0}" = "1" ]; then
+    GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1"
+  elif [ "${PLOW_BUILD_SEG_NOGLU:-0}" = "1" ]; then
+    # Middle rung: classic segmentation, fused-GLU arms stripped (dead under
+    # PLOW_NO_GLU_FUSE packets) so the 128-reg lean object compiles spill-free.
+    GEMM_ONLY_GATE="-DPLOW_NV_SEG_NOGLU=1"
+  fi
+  # PLOW_BUILD_SEG_WS=1: dispatch the warp-specialized setmaxnreg twin in the lean
+  # object (PLOW_NV_SEG_WS — deadlocked in the wide TU; re-tested per TU shape).
+  if [ "${PLOW_BUILD_SEG_WS:-0}" = "1" ]; then
+    GEMM_ONLY_GATE="$GEMM_ONLY_GATE -DPLOW_NV_SEG_WS=1"
+  fi
+  # PLOW_BUILD_SEG_WS_ENTRY=1: ws twin with the ONCE-per-launch register split (needs a
+  # pure-GEMM packet stream; see PLOW_NV_SEG_WS_ENTRY in op_gemm_sm90.cuh).
+  if [ "${PLOW_BUILD_SEG_WS_ENTRY:-0}" = "1" ]; then
+    GEMM_ONLY_GATE="$GEMM_ONLY_GATE -DPLOW_NV_SEG_WS=1 -DPLOW_NV_SEG_WS_ENTRY=1"
+  fi
+  # PLOW_BUILD_WS_BN256=1 (T13): BM64/BN256 m64n256k32 mainloop in the ws-entry object.
+  if [ "${PLOW_BUILD_WS_BN256:-0}" = "1" ]; then
+    GEMM_ONLY_GATE="$GEMM_ONLY_GATE -DPGM90_WS_BN256=1"
+  fi
+  # PLOW_BUILD_GEMM_UNI256=1 (T15): the lean object as the UNIFORM m128n256 occ-1 body
+  # (both warpgroups math, 255-reg budget, deep TMA ring). Mutually exclusive with the
+  # ws-entry knobs — it overrides them.
+  if [ "${PLOW_BUILD_GEMM_UNI256:-0}" = "1" ]; then
+    GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPGM90_UNI_BN256=1"
+  fi
+  # PLOW_BUILD_GEMM_OCC1=1 (T20): the bf16 lean object — arm-stripped, occ-1, 255-reg
+  # budget (no 128-reg cap; the uniform bf16 TMA body spills there). For bf16 bundles.
+  if [ "${PLOW_BUILD_GEMM_OCC1:-0}" = "1" ]; then
+    GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPLOW_NV_SEG_OCC1=1"
+  fi
+  # PLOW_BUILD_GEMM_WS384=1 (T31): the lean object at 384 threads — dedicated TMA producer
+  # warpgroup + two 224-reg m64n256 consumers (the cuBLAS shape). Loader reads the
+  # plow_block_pfgemm global and launches accordingly.
+  if [ "${PLOW_BUILD_GEMM_WS384:-0}" = "1" ]; then
+    GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPGM90_UNI_BN256=1 -DPLOW_NV_SEG_WS384=1"
+  fi
+  env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+    "$NVCC" -arch=sm_90a -O3 -cubin \
+    -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+    -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1 -DPGM90_TMA_STAGES=3 \
+    -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 $GEMM_ONLY_GATE \
+    -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
+    -o "$OUT_PFGEMM" "$SRC"
+  env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+    cuobjdump -symbols "$OUT_PFGEMM" | grep -q "_pfgemm" || { echo "FATAL: _pfgemm symbol missing" >&2; exit 1; }
+  echo "built $OUT_PFGEMM ($(stat -c%s "$OUT_PFGEMM") B)"
+
+  # PLOW_BUILD_FA512=1 (T12): ALSO build the dedicated hd512 flash object <out>_pffa.cubin
+  # (PLOW_NV_FA_ONLY=1: only the FLASH arms; hd256 compiled out — hd512 segments, class 2,
+  # launch here). PLOW_BUILD_FA_WG=1 selects the <512,64,16> wgmma arm (re-test of the
+  # in-megakernel refutation in a stripped TU); default px4 <512,32,16>.
+  if [ "${PLOW_BUILD_FA512:-0}" = "1" ]; then
+    OUT_PFFA="${OUT%.cubin}_pffa.cubin"
+    FA_WG=""
+    if [ "${PLOW_BUILD_FA_WG:-0}" = "1" ]; then
+      FA_WG="-DPLOW_NV_FA512_WG=1"
+    fi
+    # PLOW_BUILD_FA_HD256=1: FA object also carries the hd256 sliding arm (class 'all').
+    if [ "${PLOW_BUILD_FA_HD256:-0}" = "1" ]; then
+      FA_WG="$FA_WG -DPLOW_NV_FA_ONLY_HD256=1"
+    fi
+    # PLOW_BUILD_FA_WGITEM=1 (T30): warpgroup-per-work-item hd256 flash (forces BKV=32).
+    if [ "${PLOW_BUILD_FA_WGITEM:-0}" = "1" ]; then
+      FA_WG="$FA_WG -DPLOW_NV_FA_WGITEM=1"
+    fi
+    # PLOW_BUILD_FA_ROPE=1 (T16): rope arm in the FA object (classing v2).
+    if [ "${PLOW_BUILD_FA_ROPE:-0}" = "1" ]; then
+      FA_WG="$FA_WG -DPLOW_NV_FA_ROPE=1"
+    fi
+    env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+      "$NVCC" -arch=sm_90a -O3 -cubin \
+      -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
+      -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_FA_ONLY=1 $FA_WG \
+      -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 \
+      -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
+      -o "$OUT_PFFA" "$SRC"
+    env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+      cuobjdump -symbols "$OUT_PFFA" | grep -q "_pffa" || { echo "FATAL: _pffa symbol missing" >&2; exit 1; }
+    echo "built $OUT_PFFA ($(stat -c%s "$OUT_PFFA") B)"
+  fi
+fi
+
 env -i PATH="$CUDA_BIN":/usr/bin:/bin \
   "$NVCC" -arch=sm_90a -O3 -cubin \
   -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
@@ -133,7 +286,7 @@ echo "built $OUT ($(stat -c%s "$OUT") B), kernel $KSYM present"
 env -i PATH="$CUDA_BIN":/usr/bin:/bin \
   "$NVCC" -arch=sm_90a -O3 -cubin \
   -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
-  -DPLOW_NV_PREFILL=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA \
+  -DPLOW_NV_PREFILL=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
   -o "$OUT_PF" "$SRC"
 
 if ! env -i PATH="$CUDA_BIN":/usr/bin:/bin \

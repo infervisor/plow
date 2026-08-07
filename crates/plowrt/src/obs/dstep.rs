@@ -44,19 +44,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use crate::obs::ttft::Phase;
 
-crate::env_flag!(pub fn on, "PLOW_DSTEP_LOG");
+/// Whether decode-step logging is active (`--dstep-log` / `PLOW_DSTEP_LOG=1`).
+/// Reads from [`RuntimeConfig::get`](crate::config::RuntimeConfig::get).
+pub fn on() -> bool {
+    crate::config::RuntimeConfig::get().dstep_log
+}
 
-/// Tokens per dump. `PLOW_DSTEP_EVERY`, default 64 — enough to average out a
-/// scheduler hiccup, short enough to see a run drift.
+/// Tokens per dump (`--rt-dstep-every` / `PLOW_DSTEP_EVERY`), default 64.
 fn every() -> u64 {
-    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("PLOW_DSTEP_EVERY")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(64)
-    })
+    crate::config::RuntimeConfig::get()
+        .dstep_every
+        .map(|n| n as u64)
+        .filter(|&n| n > 0)
+        .unwrap_or(64)
 }
 
 // --- before the dispatch -----------------------------------------------------

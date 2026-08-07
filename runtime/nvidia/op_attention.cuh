@@ -2873,8 +2873,26 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                                 unsigned seq_q, unsigned seq_kv, unsigned n_head, unsigned n_kv_head,
                                 unsigned q_pos0, unsigned window, unsigned nsplit,
                                 unsigned kv_stride, unsigned kv_mask, float scale, unsigned slice,
-                                unsigned nblk, float* lds, const int* __restrict__ req = nullptr) {
-    if constexpr (FA_PX4_ELIGIBLE(HD)) {
+                                unsigned nblk, float* lds, const int* __restrict__ req = nullptr,
+                                const void* __restrict__ mapkv = nullptr) {
+#if defined(PLOW_NV_HOPPER)
+    /* sm_90a FORK first: when the wgmma arm claims the shape (always for <256,64,32>; for
+     * <512,64,16> under PLOW_NV_FA512_WG) it beats the px4 mma.sync arm below. */
+    if constexpr (FA_SM90_WG_ELIGIBLE(HD, BQ, BKV)) {
+        d_flash_prefill_sm90<HD, BQ, BKV>(Opart, mlpart, Q, K, V, O, seq_q, seq_kv, n_head,
+                                          n_kv_head, q_pos0, window, nsplit, kv_stride, kv_mask,
+                                          scale, slice, nblk, lds, req, mapkv);
+        return;
+    }
+#endif
+    /* px4 must not even INSTANTIATE when the wgmma arm claims the shape: its static_assert
+     * pins BQ==32, and the <512,64,16> flagged shape reaches here as compiled-but-dead code. */
+#if defined(PLOW_NV_HOPPER)
+    constexpr bool fa_px4_takes = FA_PX4_ELIGIBLE(HD) && !FA_SM90_WG_ELIGIBLE(HD, BQ, BKV);
+#else
+    constexpr bool fa_px4_takes = FA_PX4_ELIGIBLE(HD);
+#endif
+    if constexpr (fa_px4_takes) {
         /* MERGE (px4 + PX-1 stage-2): the restructured hd512 kernel has NO req/varlen awareness,
          * so route only the legacy single-request path (req==nullptr) through it. Batched varlen
          * (req!=nullptr) falls through to the block-diagonal body below on ALL HD to preserve
@@ -2887,16 +2905,22 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
             return;
         }
     }
-#if defined(PLOW_NV_HOPPER)
-    /* sm_90a FORK: warpgroup-MMA prefill (op_attention_sm90.cuh). Same signature, same work-item
-     * enumeration (varlen `req` included), same numerics contract — only the per-tile math and
-     * the smem layout differ. Shapes it does not claim fall through to the mma.sync body below. */
+#if defined(PLOW_NV_HOPPER) && 0
+    /* (folded into the branch above) */
     if constexpr (FA_SM90_WG_ELIGIBLE(HD, BQ, BKV)) {
         d_flash_prefill_sm90<HD, BQ, BKV>(Opart, mlpart, Q, K, V, O, seq_q, seq_kv, n_head,
                                           n_kv_head, q_pos0, window, nsplit, kv_stride, kv_mask,
-                                          scale, slice, nblk, lds, req);
+                                          scale, slice, nblk, lds, req, mapkv);
         return;
     }
+#endif
+    /* T21: the shared mma.sync body must not INSTANTIATE for wgmma-claimed shapes —
+     * <256,64,64>'s BKV breaks its lane-per-kv softmax static_assert. The asserts below are
+     * template-dependent, so the discarded branch stays uninstantiated. */
+#if defined(PLOW_NV_HOPPER)
+    if constexpr (!FA_SM90_WG_ELIGIBLE(HD, BQ, BKV)) {
+#else
+    if constexpr (true) {
 #endif
     static_assert(HD % 32 == 0, "HD must be a multiple of the warp width");
     static_assert(HD % 16 == 0 && BQ % 16 == 0 && BKV % 16 == 0, "mma m16n8k16 tiling");
@@ -3204,6 +3228,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
             }
         }
     }
+    }
 }
 #endif /* PLOW_NV_FA_PIPE */
 
@@ -3231,7 +3256,7 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
                                     unsigned n_head, unsigned n_kv_head, unsigned q_pos0,
                                     unsigned window, unsigned nsplit, unsigned kv_stride,
                                     unsigned kv_mask, float scale, unsigned slice, unsigned nblk,
-                                    float* lds) {
+                                    float* lds, const void* __restrict__ mapkv = nullptr) {
     if (req && O == nullptr) __trap(); /* batched mode requires the fused (t5=O) epilogue */
     /* MERGE (px4 + PX-1 stage-2) routing. The fused varlen body handles the sliding (hd256) layers
      * in ONE block-diagonal pass — the PX-1 stage-2 win (1.30-2.57x at R=2..8). The hd512 FULL
@@ -3244,7 +3269,7 @@ __device__ void d_flash_prefill_mux(const int* __restrict__ req, float* __restri
     if constexpr (!USE_SERIAL) {
         d_flash_prefill<HD, BQ, BKV>(Opart, mlpart, Q, K, V, O, seq_q, seq_kv, n_head, n_kv_head,
                                      q_pos0, window, nsplit, kv_stride, kv_mask, scale, slice, nblk,
-                                     lds, req);
+                                     lds, req, mapkv);
     } else {
         const int R = req ? req[0] : 1;
         for (int r = 0; r < R; r++) {

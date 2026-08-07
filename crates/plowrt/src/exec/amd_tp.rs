@@ -336,9 +336,10 @@ impl AmdTpGroup {
         // `Checkpoint` holds `memmap2::Mmap`, which is `Sync` for exactly that
         // reason.
         //
-        // `PLOW_SHARE_CKPT=0` restores the per-rank mapping, so the difference
-        // can be measured on one binary instead of asserted.
-        let share = std::env::var("PLOW_SHARE_CKPT").ok().as_deref() != Some("0");
+        // `--amd-share-ckpt false` / `PLOW_SHARE_CKPT=0` restores the per-rank
+        // mapping, so the difference can be measured on one binary instead of
+        // asserted.
+        let share = crate::config::RuntimeConfig::get().amd.share_ckpt;
         let shared_ckpt = match (share, checkpoint) {
             (true, Some(dir)) => Some(std::sync::Arc::new(
                 crate::asset::checkpoint::Checkpoint::open(dir)?,
@@ -377,8 +378,9 @@ impl AmdTpGroup {
         // caller sees; the group is dropped whole, so no rank survives
         // half-loaded.
         //
-        // `PLOW_TP_SERIAL_LOAD=1` restores the one-at-a-time loop.
-        let serial = std::env::var("PLOW_TP_SERIAL_LOAD").ok().as_deref() == Some("1");
+        // `--amd-tp-serial-load` / `PLOW_TP_SERIAL_LOAD=1` restores the
+        // one-at-a-time loop.
+        let serial = crate::config::RuntimeConfig::get().amd.tp_serial_load;
         let t_bind = std::time::Instant::now();
         let ranks: Vec<AmdEngine> = if serial {
             let mut v = Vec::with_capacity(binds.len());
@@ -445,17 +447,16 @@ impl AmdTpGroup {
             "all ranks bound"
         );
 
-        let agree_every = std::env::var("PLOW_TP_AGREE_EVERY")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_AGREE_EVERY);
+        let agree_every = match crate::config::RuntimeConfig::get().amd.tp_agree_every {
+            0 => DEFAULT_AGREE_EVERY,
+            n => n,
+        };
         Ok(AmdTpGroup {
             group,
             ranks,
             reset: XctrReset::Host,
             gate_expect,
-            audit: std::env::var("PLOW_TP_NO_AUDIT").ok().as_deref() != Some("1"),
+            audit: !crate::config::RuntimeConfig::get().amd.tp_no_audit,
             agree_every,
             agree_tick: agree_every,
         })

@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use crate::device::{Backend, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg, Module};
-use crate::{Result, RuntimeError};
+use crate::{DeviceErrorInfo, Result, RuntimeError};
 
 // Driver ABI types (bindgen-equivalent, transcribed from cuda.h).
 type CUresult = i32;
@@ -51,6 +51,31 @@ type CUevent = *mut c_void;
 
 /// `CUDA_ERROR_NOT_READY` — the query result meaning "still running".
 const ERROR_NOT_READY: CUresult = 600;
+
+/// Does this `CUresult` permanently poison the context? These are the codes
+/// the driver documents as leaving the context unusable (a trapped kernel, a
+/// dead context, uncorrectable ECC) — after one, every further call on the
+/// context fails and only process/context teardown recovers. Deliberately NOT
+/// here: 2 `OUT_OF_MEMORY` and 701 `LAUNCH_OUT_OF_RESOURCES` (transient,
+/// retryable) and 720 `COOPERATIVE_LAUNCH_TOO_LARGE` (a launch-shape
+/// rejection, nothing ran).
+fn is_cuda_fatal(rc: CUresult) -> bool {
+    matches!(
+        rc,
+        4        // CUDA_ERROR_DEINITIALIZED — driver shutting down under us
+        | 214    // CUDA_ERROR_ECC_UNCORRECTABLE
+        | 700    // CUDA_ERROR_ILLEGAL_ADDRESS
+        | 702    // CUDA_ERROR_LAUNCH_TIMEOUT
+        | 709    // CUDA_ERROR_CONTEXT_IS_DESTROYED
+        | 710    // CUDA_ERROR_ASSERT — device-side assert fired
+        | 714    // CUDA_ERROR_HARDWARE_STACK_ERROR
+        | 715    // CUDA_ERROR_ILLEGAL_INSTRUCTION
+        | 716    // CUDA_ERROR_MISALIGNED_ADDRESS
+        | 717    // CUDA_ERROR_INVALID_ADDRESS_SPACE
+        | 718    // CUDA_ERROR_INVALID_PC
+        | 719 // CUDA_ERROR_LAUNCH_FAILED
+    )
+}
 /// `CU_STREAM_NON_BLOCKING`: the engine stream never implicitly synchronizes
 /// with the legacy default stream (module loads, weight uploads) — every
 /// cross-stream ordering the engine needs is a host-side stream synchronize.
@@ -198,7 +223,73 @@ driver_api! {
     cuEventQuery: fn(CUevent) -> CUresult,
     cuEventSynchronize: fn(CUevent) -> CUresult,
     cuEventElapsedTime: fn(*mut f32, CUevent, CUevent) -> CUresult,
+    // T35: CUDA graphs — batch the ~480 per-chunk segment launches into ONE submit.
+    // All present since CUDA 10; kernel nodes take the same CUDA_KERNEL_NODE_PARAMS
+    // as cuLaunchKernel.
+    cuGraphCreate: fn(*mut CUgraph, u32) -> CUresult,
+    cuGraphAddKernelNode_v2: fn(*mut CUgraphNode, CUgraph, *const CUgraphNode, usize, *const CudaKernelNodeParams) -> CUresult,
+    cuGraphInstantiateWithFlags: fn(*mut CUgraphExec, CUgraph, u64) -> CUresult,
+    cuGraphLaunch: fn(CUgraphExec, CUstream) -> CUresult,
+    cuGraphDestroy: fn(CUgraph) -> CUresult,
+    cuGraphExecDestroy: fn(CUgraphExec) -> CUresult,
 }
+
+type CUgraph = *mut c_void;
+type CUgraphNode = *mut c_void;
+type CUgraphExec = *mut c_void;
+
+/// The driver's name for `rc` (`cuGetErrorName`), or `"CUresult {rc}"` when
+/// the driver doesn't know the code.
+fn cu_error_name(api: &Api, rc: CUresult) -> String {
+    let mut p: *const c_char = std::ptr::null();
+    // SAFETY: driver call querying an error string.
+    unsafe {
+        if (api.cuGetErrorName)(rc, &mut p) == 0 && !p.is_null() {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        } else {
+            format!("CUresult {rc}")
+        }
+    }
+}
+
+/// Build the typed fault for a failed driver call (no poisoning — that is
+/// [`CudaBackend::check`]'s job, and bring-up in `new()` has no backend yet).
+fn cu_fault(api: &Api, rc: CUresult, what: &str) -> RuntimeError {
+    RuntimeError::DeviceFault {
+        info: DeviceErrorInfo {
+            operation: what.to_string(),
+            code: rc,
+            name: cu_error_name(api, rc),
+            fatal: is_cuda_fatal(rc),
+        },
+    }
+}
+
+/// `CUDA_KERNEL_NODE_PARAMS_v2` (cuda.h). `kern` + grid/block dims + smem + params;
+/// `extra`/`kernel_ctx`/`func` layout per the v2 struct.
+#[repr(C)]
+pub struct CudaKernelNodeParams {
+    func: *mut c_void,
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+    block_x: u32,
+    block_y: u32,
+    block_z: u32,
+    shared_mem_bytes: u32,
+    kernel_params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+    kern: *mut c_void,
+    ctx: *mut c_void,
+}
+
+/// An instantiated segment-chain graph (T35). Freed on drop.
+pub struct GraphExec {
+    exec: CUgraphExec,
+    api: *const c_void, // not used for drop safety; freed via CudaBackend::graph_destroy
+}
+unsafe impl Send for GraphExec {}
+unsafe impl Sync for GraphExec {}
 
 /// A loaded-kernel handle (a `CUfunction`, valid for the module's lifetime).
 #[derive(Clone, Copy)]
@@ -213,6 +304,10 @@ struct CudaFreer {
     api: Arc<Api>,
     ctx: usize,
     dev: CUdevice,
+    /// The backend's poison latch, shared so late frees on a dead context
+    /// (which all fail with the same sticky status) report at debug, not one
+    /// warn per allocation — a poisoned engine teardown frees hundreds.
+    poisoned: Arc<std::sync::OnceLock<DeviceErrorInfo>>,
 }
 
 // SAFETY: as CudaBackend — driver calls are thread-safe, handles are
@@ -229,7 +324,11 @@ impl crate::device::DeviceFree for CudaFreer {
             (self.api.cuMemFree_v2)(base)
         };
         if rc != 0 {
-            tracing::warn!(rc, base, len, "cuMemFree failed");
+            if self.poisoned.get().is_some() {
+                tracing::debug!(rc, base, len, "cuMemFree failed (context poisoned)");
+            } else {
+                tracing::warn!(rc, base, len, "cuMemFree failed");
+            }
         }
     }
 }
@@ -239,7 +338,11 @@ impl Drop for CudaFreer {
         // SAFETY: pairs the single cuDevicePrimaryCtxRetain in `new()`.
         let rc = unsafe { (self.api.cuDevicePrimaryCtxRelease_v2)(self.dev) };
         if rc != 0 {
-            tracing::warn!(rc, "cuDevicePrimaryCtxRelease");
+            if self.poisoned.get().is_some() {
+                tracing::debug!(rc, "cuDevicePrimaryCtxRelease (context poisoned)");
+            } else {
+                tracing::warn!(rc, "cuDevicePrimaryCtxRelease");
+            }
         }
     }
 }
@@ -266,7 +369,11 @@ impl Drop for CudaStream {
             (self.keep.api.cuStreamDestroy_v2)(self.raw as CUstream)
         };
         if rc != 0 {
-            tracing::warn!(rc, "cuStreamDestroy failed");
+            if self.keep.poisoned.get().is_some() {
+                tracing::debug!(rc, "cuStreamDestroy failed (context poisoned)");
+            } else {
+                tracing::warn!(rc, "cuStreamDestroy failed");
+            }
         }
     }
 }
@@ -291,7 +398,11 @@ impl Drop for CudaEvent {
             (self.keep.api.cuEventDestroy_v2)(self.raw as CUevent)
         };
         if rc != 0 {
-            tracing::warn!(rc, "cuEventDestroy failed");
+            if self.keep.poisoned.get().is_some() {
+                tracing::debug!(rc, "cuEventDestroy failed (context poisoned)");
+            } else {
+                tracing::warn!(rc, "cuEventDestroy failed");
+            }
         }
     }
 }
@@ -343,13 +454,41 @@ impl Drop for PinnedHost {
             (self.keep.api.cuMemFreeHost)(self.ptr as *mut c_void)
         };
         if rc != 0 {
-            tracing::warn!(rc, len = self.len, "cuMemFreeHost failed");
+            if self.keep.poisoned.get().is_some() {
+                tracing::debug!(
+                    rc,
+                    len = self.len,
+                    "cuMemFreeHost failed (context poisoned)"
+                );
+            } else {
+                tracing::warn!(rc, len = self.len, "cuMemFreeHost failed");
+            }
         }
     }
 }
 
+/// `cuTensorMapEncodeTiled` (CUDA 12.0+): out map (128 B, 128-aligned), dtype, rank,
+/// globalAddress, globalDim[rank], globalStrides[rank-1] (bytes), boxDim[rank],
+/// elementStrides[rank], interleave, swizzle, l2Promotion, oobFill.
+type TmapEncodeFn = unsafe extern "C" fn(
+    *mut c_void,
+    u32,
+    u32,
+    *mut c_void,
+    *const u64,
+    *const u64,
+    *const u32,
+    *const u32,
+    u32,
+    u32,
+    u32,
+    u32,
+) -> CUresult;
+
 pub struct CudaBackend {
     api: Arc<Api>,
+    /// See the resolve site in [`CudaBackend::open`] — `None` on pre-12.0 drivers.
+    tmap_encode: Option<TmapEncodeFn>,
     /// Primary context, retained once; re-bound per call (threads vary).
     ctx: usize,
     /// Handed to every owned `DeviceMem`; its Drop releases the primary ctx.
@@ -372,6 +511,14 @@ pub struct CudaBackend {
     /// `VmmOps::pool_put`/`pool_take`). Device-local by construction (one
     /// pool per backend, one backend per device); leftovers released in Drop.
     slab_pool: Mutex<Vec<(u64, u64)>>,
+    /// Set once, on the first fatal driver status ([`is_cuda_fatal`]): the
+    /// fault that killed the context. When set, [`Self::bind`] short-circuits
+    /// with a clone BEFORE touching the driver, so a poisoned context stops
+    /// generating one driver error (and one log line) per queued dispatch.
+    /// Teardown paths (Drop impls, `DeviceFree`) bypass `bind` and still
+    /// attempt their driver calls — shared with `CudaFreer` so those sites
+    /// can downgrade their expected failures to debug.
+    poisoned: Arc<std::sync::OnceLock<DeviceErrorInfo>>,
 }
 
 // SAFETY: the driver API is thread-safe; the raw context/module handles are
@@ -387,9 +534,9 @@ impl CudaBackend {
         // SONAME first, then the dev symlink, then the usual absolute homes —
         // a nix-glibc binary's dlopen does not consult the host ld cache, so
         // the bare SONAME alone misses a perfectly present driver.
-        // `PLOW_LIBCUDA` overrides everything.
+        // `--libcuda` / `PLOW_LIBCUDA` overrides everything.
         let mut candidates: Vec<String> = Vec::new();
-        if let Ok(p) = std::env::var("PLOW_LIBCUDA") {
+        if let Some(p) = crate::config::RuntimeConfig::get().nv.libcuda.clone() {
             tracing::debug!(path = %p, "PLOW_LIBCUDA override set");
             candidates.push(p);
         }
@@ -437,22 +584,23 @@ impl CudaBackend {
         }
         let lib = lib.ok_or_else(|| RuntimeError::Device(format!("dlopen libcuda: {last_err}")))?;
         tracing::debug!("resolving CUDA driver API symbols...");
+        // Resolved OPTIONALLY, outside driver_api!: cuTensorMapEncodeTiled is CUDA 12.0+,
+        // and an eager resolve would make plowrt refuse to open ANY device on an older
+        // driver. Absent symbol => `encode_tmap_bf16` errors, everything else unaffected.
+        // SAFETY: signature transcribed from cuda.h (asserted working by
+        // runtime/nvidia/experiments/tma_ws_gemm_bf16.cu on this driver line).
+        let tmap_encode: Option<TmapEncodeFn> = unsafe {
+            lib.get::<TmapEncodeFn>(b"cuTensorMapEncodeTiled\0")
+                .ok()
+                .map(|s| *s)
+        };
         let api = Api::resolve(lib)?;
 
         let check = |rc: CUresult, what: &str| -> Result<()> {
             if rc == 0 {
                 return Ok(());
             }
-            let mut p: *const c_char = std::ptr::null();
-            // SAFETY: driver call querying an error string.
-            let name = unsafe {
-                if (api.cuGetErrorName)(rc, &mut p) == 0 && !p.is_null() {
-                    std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
-                } else {
-                    format!("CUresult {rc}")
-                }
-            };
-            Err(RuntimeError::Device(format!("{what}: {name}")))
+            Err(cu_fault(&api, rc, what))
         };
 
         // SAFETY below: signatures match the CUDA driver ABI (transcribed
@@ -518,13 +666,16 @@ impl CudaBackend {
                 "CUDA device ready"
             );
             let api = Arc::new(api);
+            let poisoned = Arc::new(std::sync::OnceLock::new());
             let freer = Arc::new(CudaFreer {
                 api: Arc::clone(&api),
                 ctx: ctx as usize,
                 dev,
+                poisoned: Arc::clone(&poisoned),
             });
             Ok(CudaBackend {
                 api,
+                tmap_encode,
                 ctx: ctx as usize,
                 freer,
                 device_ordinal,
@@ -537,30 +688,165 @@ impl CudaBackend {
                 modules: Mutex::new(FxHashMap::default()),
                 next_module: AtomicU64::new(1),
                 slab_pool: Mutex::new(Vec::new()),
+                poisoned,
             })
         }
     }
 
-    /// Map a nonzero CUresult to a typed error, resolving the driver's name.
+    /// Encode the `tma_ws_gemm_bf16.cu` tensor-map recipe over a device tensor: rank-2
+    /// `[rows][k]` bf16 K-major, box `{64, box_rows}`, 128 B swizzle, L2 128 B promotion,
+    /// OOB zero-fill. Returns the 128 descriptor bytes for the loader to upload into the
+    /// map tensor's buffer (`GEN_TMAP_BF16`). Errors on drivers older than CUDA 12.0.
+    pub fn encode_tmap_bf16(&self, base: u64, rows: u32, k: u32, box_rows: u32) -> Result<[u8; 128]> {
+        self.encode_tmap(base, rows, k, box_rows, false)
+    }
+
+    /// e4m3 twin: same 128 B swizzle, dtype UINT8, inner box 128 elems (= 128 B).
+    pub fn encode_tmap_e4m3(&self, base: u64, rows: u32, k: u32, box_rows: u32) -> Result<[u8; 128]> {
+        self.encode_tmap(base, rows, k, box_rows, true)
+    }
+
+    /// Rank-3 bf16 map over a `[n_kv_head][ring_rows][hd]` KV cache tensor: globalDim
+    /// {hd, ring_rows, n_kv_head}, box {64, box_rows, 1}, 128 B swizzle — the flash-prefill
+    /// TMA stager's recipe (`GEN_TMAP_KV_PAIR`, one such map per K and per V).
+    pub fn encode_tmap_kv3(
+        &self,
+        base: u64,
+        ring_rows: u32,
+        hd: u32,
+        n_kv_head: u32,
+        box_rows: u32,
+    ) -> Result<[u8; 128]> {
+        let f = self.tmap_encode.ok_or_else(|| {
+            RuntimeError::Device(
+                "cuTensorMapEncodeTiled unresolved (driver < CUDA 12.0) but this packet \
+                 carries GEN_TMAP tensors"
+                    .into(),
+            )
+        })?;
+        assert!(hd % 64 == 0 && hd > 0, "GEN_TMAP_KV_PAIR needs hd%64==0, got {hd}");
+        #[repr(C, align(128))]
+        struct Buf([u8; 128]);
+        let mut m = Buf([0u8; 128]);
+        let gd = [hd as u64, ring_rows as u64, n_kv_head as u64];
+        let gs = [hd as u64 * 2, ring_rows as u64 * hd as u64 * 2];
+        let bd = [64u32, box_rows, 1u32];
+        let es = [1u32, 1u32, 1u32];
+        self.check(
+            unsafe { (self.api.cuCtxSetCurrent)(self.ctx as CUcontext) },
+            "cuCtxSetCurrent",
+        )?;
+        // SAFETY: as encode_tmap; rank 3.
+        let rc = unsafe {
+            f(
+                &mut m as *mut Buf as *mut c_void,
+                9,
+                3,
+                base as *mut c_void,
+                gd.as_ptr(),
+                gs.as_ptr(),
+                bd.as_ptr(),
+                es.as_ptr(),
+                0,
+                3,
+                2,
+                0,
+            )
+        };
+        self.check(rc, "cuTensorMapEncodeTiled(kv3)")?;
+        Ok(m.0)
+    }
+
+    fn encode_tmap(&self, base: u64, rows: u32, k: u32, box_rows: u32, e4m3: bool) -> Result<[u8; 128]> {
+        let f = self.tmap_encode.ok_or_else(|| {
+            RuntimeError::Device(
+                "cuTensorMapEncodeTiled unresolved (driver < CUDA 12.0) but this packet \
+                 carries GEN_TMAP tensors"
+                    .into(),
+            )
+        })?;
+        // globalStrides entries must be 16-byte multiples; devgen only mints maps for
+        // K%16B==0 (the kernel traps otherwise), so this is a build bug, not input.
+        assert!(k > 0 && (k as u64 * if e4m3 { 1 } else { 2 }) % 16 == 0, "GEN_TMAP K misaligned: {k}");
+        #[repr(C, align(128))]
+        struct Buf([u8; 128]);
+        let mut m = Buf([0u8; 128]);
+        let gd = [k as u64, rows as u64];
+        let gs = [k as u64 * if e4m3 { 1 } else { 2 }];
+        let bd = [if e4m3 { 128u32 } else { 64u32 }, box_rows];
+        let es = [1u32, 1u32];
+        self.check(
+            unsafe { (self.api.cuCtxSetCurrent)(self.ctx as CUcontext) },
+            "cuCtxSetCurrent",
+        )?;
+        // Constants transcribed from cuda.h, byte-for-byte the probe's make_map():
+        // BFLOAT16=9 / UINT8=0, rank=2, INTERLEAVE_NONE=0, SWIZZLE_128B=3,
+        // L2_PROMOTION_L2_128B=2, OOB_FILL_NONE=0.
+        // SAFETY: driver call; buffers outlive it; out is 128 B and 128-aligned.
+        let rc = unsafe {
+            f(
+                &mut m as *mut Buf as *mut c_void,
+                if e4m3 { 0 } else { 9 },
+                2,
+                base as *mut c_void,
+                gd.as_ptr(),
+                gs.as_ptr(),
+                bd.as_ptr(),
+                es.as_ptr(),
+                0,
+                3,
+                2,
+                0,
+            )
+        };
+        self.check(rc, "cuTensorMapEncodeTiled")?;
+        Ok(m.0)
+    }
+
+    /// Map a nonzero CUresult to a typed error, resolving the driver's name
+    /// and classifying it ([`is_cuda_fatal`]). A fatal status poisons the
+    /// backend: `bind` then refuses further work up front.
     fn check(&self, rc: CUresult, what: &str) -> Result<()> {
         if rc == 0 {
             return Ok(());
         }
-        let mut p: *const c_char = std::ptr::null();
-        // SAFETY: driver call querying an error string.
-        let name = unsafe {
-            if (self.api.cuGetErrorName)(rc, &mut p) == 0 && !p.is_null() {
-                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
-            } else {
-                format!("CUresult {rc}")
+        let err = cu_fault(&self.api, rc, what);
+        if let Some(info) = err.device_fault() {
+            if info.fatal {
+                self.mark_poisoned(info);
             }
-        };
-        Err(RuntimeError::Device(format!("{what}: {name}")))
+        }
+        Err(err)
+    }
+
+    /// Has a fatal driver status permanently poisoned this context?
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.get().is_some()
+    }
+
+    /// Record the fault that killed the context. Logs `error!` exactly once —
+    /// every later dispatch is short-circuited by `bind`, not re-logged.
+    fn mark_poisoned(&self, info: &DeviceErrorInfo) {
+        if self.poisoned.set(info.clone()).is_ok() {
+            tracing::error!(
+                error_op = %info.operation,
+                error_code = info.code,
+                error_name = %info.name,
+                device = self.device_ordinal,
+                "CUDA context poisoned — rejecting further work on this device"
+            );
+        }
     }
 
     /// Re-bind the primary context on the calling thread (see module docs).
     /// Elides the driver call when this thread already has `self.ctx` bound.
+    /// On a poisoned context this short-circuits with the recorded fault
+    /// BEFORE calling the driver — every public entry point crosses here, so
+    /// this is what stops a dead context from flooding the log.
     fn bind(&self) -> Result<()> {
+        if let Some(info) = self.poisoned.get() {
+            return Err(RuntimeError::DeviceFault { info: info.clone() });
+        }
         thread_local! {
             static LAST_CTX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         }
@@ -825,6 +1111,77 @@ impl CudaBackend {
             },
             "cuLaunchKernel",
         )
+    }
+
+    /// T35: build + instantiate a serial kernel-node chain (each node depends on its
+    /// predecessor). `params_blobs[i]` is the by-value kernarg for node i (copied out by
+    /// the driver during node creation). One `graph_launch` then replaces N submits.
+    pub fn graph_build_chain(
+        &self,
+        nodes: &[(KernelFn, u32, u32, u32)],
+        params_blobs: &mut [*mut c_void],
+    ) -> Result<GraphExec> {
+        self.bind()?;
+        let mut graph: CUgraph = std::ptr::null_mut();
+        self.check(unsafe { (self.api.cuGraphCreate)(&mut graph, 0) }, "cuGraphCreate")?;
+        let mut prev: CUgraphNode = std::ptr::null_mut();
+        for (i, &(f, grid, block, smem)) in nodes.iter().enumerate() {
+            let mut kp = [params_blobs[i]];
+            let np = CudaKernelNodeParams {
+                func: f.0 as *mut c_void,
+                grid_x: grid,
+                grid_y: 1,
+                grid_z: 1,
+                block_x: block,
+                block_y: 1,
+                block_z: 1,
+                shared_mem_bytes: smem,
+                kernel_params: kp.as_mut_ptr(),
+                extra: std::ptr::null_mut(),
+                kern: std::ptr::null_mut(),
+                ctx: std::ptr::null_mut(),
+            };
+            let deps = [prev];
+            let ndeps = if prev.is_null() { 0 } else { 1 };
+            let mut node: CUgraphNode = std::ptr::null_mut();
+            let r = unsafe {
+                (self.api.cuGraphAddKernelNode_v2)(
+                    &mut node,
+                    graph,
+                    if ndeps == 0 { std::ptr::null() } else { deps.as_ptr() },
+                    ndeps,
+                    &np,
+                )
+            };
+            if r != 0 {
+                unsafe { (self.api.cuGraphDestroy)(graph) };
+                self.check(r, "cuGraphAddKernelNode_v2")?;
+            }
+            prev = node;
+        }
+        let mut exec: CUgraphExec = std::ptr::null_mut();
+        let r = unsafe { (self.api.cuGraphInstantiateWithFlags)(&mut exec, graph, 0) };
+        unsafe { (self.api.cuGraphDestroy)(graph) };
+        self.check(r, "cuGraphInstantiateWithFlags")?;
+        Ok(GraphExec {
+            exec,
+            api: std::ptr::null(),
+        })
+    }
+
+    pub fn graph_launch(&self, g: &GraphExec, stream: &CudaStream) -> Result<()> {
+        self.bind()?;
+        self.check(
+            unsafe { (self.api.cuGraphLaunch)(g.exec, stream.raw as CUstream) },
+            "cuGraphLaunch",
+        )
+    }
+
+    pub fn graph_destroy(&self, g: GraphExec) {
+        unsafe {
+            let _ = (self.api.cuGraphExecDestroy)(g.exec);
+        }
+        std::mem::forget(g);
     }
 
     /// Block until every queued launch/copy on the context has retired.
@@ -1163,7 +1520,11 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
             (self.api.cuMemAddressFree)(va, bytes as usize)
         };
         if rc != 0 {
-            tracing::warn!(rc, va, bytes, "cuMemAddressFree failed");
+            if self.is_poisoned() {
+                tracing::debug!(rc, va, bytes, "cuMemAddressFree failed (context poisoned)");
+            } else {
+                tracing::warn!(rc, va, bytes, "cuMemAddressFree failed");
+            }
         }
     }
 
@@ -1186,7 +1547,11 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
             (self.api.cuMemRelease)(handle)
         };
         if rc != 0 {
-            tracing::warn!(rc, handle, "cuMemRelease failed");
+            if self.is_poisoned() {
+                tracing::debug!(rc, handle, "cuMemRelease failed (context poisoned)");
+            } else {
+                tracing::warn!(rc, handle, "cuMemRelease failed");
+            }
         }
     }
 
@@ -1210,7 +1575,11 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
             (self.api.cuMemUnmap)(va, bytes as usize)
         };
         if rc != 0 {
-            tracing::warn!(rc, va, bytes, "cuMemUnmap failed");
+            if self.is_poisoned() {
+                tracing::debug!(rc, va, bytes, "cuMemUnmap failed (context poisoned)");
+            } else {
+                tracing::warn!(rc, va, bytes, "cuMemUnmap failed");
+            }
         }
     }
 
@@ -1248,7 +1617,11 @@ impl crate::memory::vmm::VmmOps for CudaBackend {
             (self.api.cuMemFree_v2)(va)
         };
         if rc != 0 {
-            tracing::warn!(rc, va, "cuMemFree(vmm snapshot) failed");
+            if self.is_poisoned() {
+                tracing::debug!(rc, va, "cuMemFree(vmm snapshot) failed (context poisoned)");
+            } else {
+                tracing::warn!(rc, va, "cuMemFree(vmm snapshot) failed");
+            }
         }
     }
 
@@ -1300,18 +1673,31 @@ impl Drop for CudaBackend {
         // is unloaded exactly once. Pooled slab chunks (PLOW_SLAB_KEEP) are
         // released here — the pool's whole point is to outlive engines, so
         // the backend is its terminal owner.
+        let poisoned = self.is_poisoned();
         unsafe {
             (self.api.cuCtxSetCurrent)(self.ctx as CUcontext);
             for (id, raw) in self.modules.lock().drain() {
                 let rc = (self.api.cuModuleUnload)(raw as CUmodule);
                 if rc != 0 {
-                    tracing::warn!(id, rc, "cuModuleUnload at backend drop");
+                    if poisoned {
+                        tracing::debug!(
+                            id,
+                            rc,
+                            "cuModuleUnload at backend drop (context poisoned)"
+                        );
+                    } else {
+                        tracing::warn!(id, rc, "cuModuleUnload at backend drop");
+                    }
                 }
             }
             for (h, bytes) in self.slab_pool.lock().drain(..) {
                 let rc = (self.api.cuMemRelease)(h);
                 if rc != 0 {
-                    tracing::warn!(rc, handle = h, bytes, "cuMemRelease at backend drop");
+                    if poisoned {
+                        tracing::debug!(rc, handle = h, bytes, "cuMemRelease at backend drop");
+                    } else {
+                        tracing::warn!(rc, handle = h, bytes, "cuMemRelease at backend drop");
+                    }
                 }
             }
         }
@@ -1401,5 +1787,22 @@ impl Backend for CudaBackend {
         Err(RuntimeError::Device(
             "launch_persistent: use launch_cooperative for real modules".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cuda_fatal;
+
+    #[test]
+    fn fatal_classification_matches_the_driver_contract() {
+        // Context-poisoning statuses.
+        for rc in [4, 214, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719] {
+            assert!(is_cuda_fatal(rc), "CUresult {rc} must be fatal");
+        }
+        // Transient / rejection statuses that must NOT kill the engine.
+        for rc in [2, 701, 720, 600, 1, 100] {
+            assert!(!is_cuda_fatal(rc), "CUresult {rc} must not be fatal");
+        }
     }
 }

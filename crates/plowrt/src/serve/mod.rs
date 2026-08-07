@@ -58,11 +58,47 @@ impl Default for GenParams {
 
 #[cfg(test)]
 mod tests {
-    use super::GenParams;
+    use super::{status_for, GenParams};
+    use crate::{DeviceErrorInfo, RuntimeError};
+    use axum::http::StatusCode;
 
     #[test]
     fn generation_default_allows_long_responses() {
         assert_eq!(GenParams::default().max_tokens, 4096);
+    }
+
+    fn fault(fatal: bool) -> RuntimeError {
+        RuntimeError::DeviceFault {
+            info: DeviceErrorInfo {
+                operation: "cuStreamSynchronize".into(),
+                code: 719,
+                name: "CUDA_ERROR_LAUNCH_FAILED".into(),
+                fatal,
+            },
+        }
+    }
+
+    #[test]
+    fn status_maps_fatal_fault_to_503_and_transient_to_500() {
+        assert_eq!(status_for(&fault(true)), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status_for(&fault(false)), StatusCode::INTERNAL_SERVER_ERROR);
+        // Existing mappings preserved.
+        assert_eq!(
+            status_for(&RuntimeError::UnknownModel("x".into())),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status_for(&RuntimeError::Rejected("shed".into())),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            status_for(&RuntimeError::Oom("kv".into())),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            status_for(&RuntimeError::Device("validation".into())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
 
@@ -590,12 +626,15 @@ async fn metrics_handler(
     out
 }
 
-/// Map a runtime error to an HTTP status.
+/// Map a runtime error to an HTTP status. A fatal device fault means the
+/// device context is dead — 503 (retry another instance), not a 500 that
+/// reads as a plowrt bug; a non-fatal fault stays a 500.
 pub(crate) fn status_for(err: &RuntimeError) -> axum::http::StatusCode {
     use axum::http::StatusCode;
     match err {
         RuntimeError::UnknownModel(_) => StatusCode::NOT_FOUND,
         RuntimeError::Rejected(_) | RuntimeError::Oom(_) => StatusCode::TOO_MANY_REQUESTS,
+        RuntimeError::DeviceFault { info } if info.fatal => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

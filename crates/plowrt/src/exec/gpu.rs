@@ -21,31 +21,23 @@ use std::sync::Arc;
 
 use packet::dev::{DevInst64, DevOp, DevProgram, CTR_STRIDE, TENSOR_NONE16};
 
-use crate::env_flag;
+use crate::config::RuntimeConfig;
 
-/// PX-1 packing measurement (RTX-12 baseline). `PLOW_PF_PACKLOG=1` emits one
-/// compact stderr line per batched-prefill launch: request count R, total
-/// packed rows, covering bucket size, and the per-request chunk-row list. The
-/// flag is read once and cached, so when unset the hot path pays only a relaxed
-/// atomic load. Post-processed into R-per-launch histograms by the bench.
-env_flag!(fn pf_packlog_on, "PLOW_PF_PACKLOG");
+/// PX-1 packing measurement. Reads `RuntimeConfig::get().pf_packlog`.
+fn pf_packlog_on() -> bool {
+    RuntimeConfig::get().pf_packlog
+}
 
-/// `PLOW_PF_COVER=1` restores the covering bucket-pick policy (see
-/// [`GpuEngine::pick_prefill_bucket`]). Read once — the per-chunk hot path
-/// must not hit the environment.
-env_flag!(fn pf_cover_on, "PLOW_PF_COVER");
+/// Covering bucket-pick policy. Reads `RuntimeConfig::get().nv.pf_cover`.
+fn pf_cover_on() -> bool {
+    RuntimeConfig::get().nv.pf_cover
+}
 
-/// Fixed cost of ONE prefill launch, expressed in padded-row equivalents —
-/// the currency [`GpuEngine::pick_prefill_bucket`] minimizes. A launch is not
-/// free: it re-streams every layer's weights from HBM and pays grid/counter
-/// setup, so its cost is independent of how many real rows it carries.
-///
-/// Measured on sm_120 / gemma-4-12B by regressing TTFT over a prompt-length
-/// sweep that straddles the 8192 rung (`ttft_ms = 0.112·rows + 60.1·chunks`,
-/// fit within ±2.8%): **60.1 ms ≈ 537 rows**. The default rounds that to 512.
-/// `PLOW_PF_CHUNK_COST=0` recovers the old pure-minimum-padding behaviour.
-/// Read once — the per-chunk hot path must not hit the environment.
-crate::env_usize!(fn pf_chunk_cost_rows, "PLOW_PF_CHUNK_COST", default 512);
+/// Fixed cost of ONE prefill launch, in padded-row equivalents.
+/// Reads `RuntimeConfig::get().nv.pf_chunk_cost`.
+fn pf_chunk_cost_rows() -> usize {
+    RuntimeConfig::get().nv.pf_chunk_cost
+}
 
 use crate::asset::cubin::{self, Role};
 use crate::asset::devblob::DevBlob;
@@ -198,9 +190,18 @@ fn resolve_interp_image(
         }
     };
 
-    // 1. Operator override: forced, and loud when wrong.
+    // 1. Operator override: forced, and loud when wrong. The CLI flag is read
+    // as well as the env var — declaring `--nv-cubin` and then consulting only
+    // the environment makes the flag parse and do nothing.
     let var = env_image_var(role);
-    if let Ok(p) = std::env::var(var) {
+    let cfg_image = {
+        let nv = &crate::config::RuntimeConfig::get().nv;
+        match role {
+            Role::Decode => nv.cubin.clone(),
+            Role::Prefill => nv.cubin_pf.clone(),
+        }
+    };
+    if let Some(p) = std::env::var(var).ok().or(cfg_image) {
         let path = std::path::PathBuf::from(&p);
         let image = std::fs::read(&path).map_err(|source| RuntimeError::Io {
             path: path.clone(),
@@ -309,9 +310,10 @@ fn describe_candidates(assets_dir: &Path) -> String {
     }
 }
 
-/// Model-load timeline (`PLOW_LOAD_PROFILE=1`). Off by default — Instant-per-chunk
-/// and stage spam are for profiling bring-up, not steady serve.
-crate::env_flag!(fn load_profile, "PLOW_LOAD_PROFILE");
+/// Model-load timeline. Reads `RuntimeConfig::get().load_profile`.
+fn load_profile() -> bool {
+    RuntimeConfig::get().load_profile
+}
 
 /// Stride between tensors carved out of the weight slab.
 ///
@@ -411,9 +413,34 @@ use crate::asset::checkpoint::Checkpoint;
 /// object. Its instruction stream is host-patched per chunk (KV write row,
 /// flash `seq_kv`/`q_pos0`, lm_head `a_row0`) then the covering range is
 /// re-uploaded — the port of the harness's chunked-prefill inner loop.
+/// Segmented-prefill object pair (T9c, first wired on Hopper): flash-class (wave-class-4)
+/// segments launch on the fat `_pfseg` object (every arm, occ-1); GEMM-class segments on
+/// the lean `_pfgemm` object (flash arms compiled out, 128 regs, occ-2). Segments of one
+/// chunk launch SEQUENTIALLY on the engine stream — dependencies only point backward, so
+/// stream order replaces cross-segment gating; counters are re-armed once per chunk.
+struct SegPf {
+    f_flash: KernelFn,
+    smem_flash: u32,
+    grid_flash: u32,
+    f_gemm: KernelFn,
+    smem_gemm: u32,
+    grid_gemm: u32,
+    /// T31: the GEMM object's launch block size (`plow_block_pfgemm` global; 256 = legacy).
+    block_gemm: u32,
+    /// T12: dedicated hd512 flash object (`interp_sm90a_pffa.cubin` in the pair dir,
+    /// optional). Class-2 segments (PLOW_PF_SEG_FA512) launch here.
+    fa512: Option<(KernelFn, u32, u32)>,
+    _m_flash: Module,
+    _m_gemm: Module,
+    _m_fa512: Option<Module>,
+}
+
 struct PrefillBucket {
     /// Chunk size this bucket was compiled for.
     t: u32,
+    /// Per-segment wave class (8 = GEMM-class, 4 = flash-class) when the program is
+    /// wave-class segmented AND the SegPf pair is loaded; empty = single launch.
+    seg_class: Vec<u8>,
     /// `PlowProgram` kernarg (shares `tensors` + `gq_cursor` with the decode path).
     kernarg: DevProgram,
     /// Device instruction stream (patched per chunk over `[inst_lo..=inst_hi]`).
@@ -474,6 +501,11 @@ pub struct GpuEngine {
     /// `None`/empty when no `_pf` cubin is present — the mux then falls back to
     /// decode-only prompt consumption.
     f_pf: Option<KernelFn>,
+    /// Segmented-prefill object pair (PLOW_PF_SEG_DIR); None = single-object prefill.
+    seg_pf: Option<SegPf>,
+    /// T35 (PLOW_PF_SEG_GRAPH=1): cached instantiated segment-chain graphs, keyed by
+    /// (bucket, slot-tensor-base) — one cuGraphLaunch replaces ~480 kernel submits.
+    seg_graphs: std::collections::HashMap<(usize, u64), crate::device::cuda::GraphExec>,
     smem_pf: u32,
     prefill: Vec<PrefillBucket>,
     /// Read in `Drop` (unloaded separately from [`Self::module`]), so not
@@ -553,6 +585,9 @@ pub struct GpuEngine {
     kvrow_lo: usize,
     kvrow_hi: usize,
     ctr_bytes: usize,
+    /// Bytes of GQ cursor lines at the counter slab's tail — one PLOW_CTR line
+    /// per gq segment (P lines for an L2-placed blob, 1 otherwise).
+    cursor_bytes: usize,
 
     t_ids: usize,
     t_pos: usize,
@@ -1483,13 +1518,13 @@ impl GpuEngine {
                 let image_len = image.len();
                 let dec_source = dec.source.clone();
                 let module = be.module_load(&image)?;
-                let kname = std::env::var(env_kernel_var(Role::Decode)).unwrap_or(dec.entry);
+                let kname = std::env::var(env_kernel_var(Role::Decode))
+                    .ok()
+                    .or_else(|| crate::config::RuntimeConfig::get().nv.kernel.clone())
+                    .unwrap_or(dec.entry);
                 let f = be.get_function(&module, &kname)?;
                 Self::check_packet_pairing(&be, &module, assets_dir)?;
-                let smem: u32 = match std::env::var("PLOW_NV_SMEM")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                {
+                let smem: u32 = match crate::config::RuntimeConfig::get().nv.smem {
                     Some(v) => v,
                     None => be
                         .module_global_u32(&module, "plow_arena_bytes")?
@@ -2041,17 +2076,15 @@ impl GpuEngine {
             tm.log_stage("moe_tables", sys_moe, std::time::SystemTime::now(), ms);
         }
 
-        // ---- PX-1 batched-prefill buffers (PLOW_PF_BATCH=1) ----
+        // ---- PX-1 batched-prefill buffers (`--pf-batch` / PLOW_PF_BATCH=1) ----
         // Allocated BEFORE the tensor table so their pointers ride in it past
         // the blob's handles (h_slot = len, h_req = len+1). Tiny (≤32 KiB), so
-        // allocation is unconditional on the env flag only; the mode itself is
+        // allocation is unconditional on the flag only; the mode itself is
         // finalized after the prefill object loads (see below).
         let t_decode = std::time::Instant::now();
         let decode_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
         let sys_decode = std::time::SystemTime::now();
-        let pf_batch_env = std::env::var("PLOW_PF_BATCH")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let pf_batch_env = crate::config::RuntimeConfig::get().nv.pf_batch;
         let pf_max_t_blob = blob.progs[..blob.progs.len().saturating_sub(1)]
             .iter()
             .map(|g| g.t as usize)
@@ -2066,6 +2099,57 @@ impl GpuEngine {
         } else {
             None
         };
+
+        // ---- GEN_TMAP_BF16 re-encode (sm_90a TMA prefill GEMM) ----
+        // The upload loop staged these tensors' 128-byte ZERO placeholders (a tensormap
+        // is a function of the TARGET's device address, unknowable before the carve).
+        // devp is complete here, so encode the real descriptor over the target and
+        // overwrite the placeholder in place — before d_tens is built, so the handle
+        // the packet carries in i[6]/i[7] resolves to finished bytes. A TMA-bearing
+        // packet on a driver that cannot encode fails HERE, loudly, not on first prefill.
+        for g in blob.gen.iter().filter(|g| {
+            g.kind == packet::rope::GEN_TMAP_BF16
+                || g.kind == packet::rope::GEN_TMAP_E4M3
+                || g.kind == packet::rope::GEN_TMAP_KV_PAIR
+        }) {
+            let (map, tgt) = (g.tensor as usize, g.aux as usize);
+            if tgt >= devp.len() || map >= devp.len() {
+                return Err(RuntimeError::Device(format!(
+                    "GEN_TMAP tensor {} targets out-of-range handle {}",
+                    g.tensor, g.aux
+                )));
+            }
+            // TMA reads the descriptor by device address; SLAB_ALIGN carving makes this
+            // unbreakable today — assert so a future carve change fails loud.
+            assert!(devp[map].base % 128 == 0, "tensormap tensor not 128 B aligned");
+            if g.kind == packet::rope::GEN_TMAP_KV_PAIR {
+                // K's rank-3 map at +0, V's at +128; V handle rides in `scale`, kv heads in
+                // `frac` (see GEN_TMAP_KV_PAIR). Box rows = the wgmma arm's BKV = 32.
+                let vtgt = g.scale as usize;
+                if vtgt >= devp.len() {
+                    return Err(RuntimeError::Device(format!(
+                        "GEN_TMAP_KV_PAIR tensor {} V-handle {} out of range",
+                        g.tensor, g.scale
+                    )));
+                }
+                let nkv = g.frac as u32;
+                let kb = be.encode_tmap_kv3(devp[tgt].base, g.ctx, g.hd, nkv, 32)?;
+                let vb = be.encode_tmap_kv3(devp[vtgt].base, g.ctx, g.hd, nkv, 32)?;
+                be.upload(&devp[map], 0, &kb)?;
+                be.upload(&devp[map], 128, &vb)?;
+                continue;
+            }
+            let bytes = if g.kind == packet::rope::GEN_TMAP_E4M3 {
+                be.encode_tmap_e4m3(devp[tgt].base, g.ctx, g.hd, g.scale)?
+            } else {
+                be.encode_tmap_bf16(devp[tgt].base, g.ctx, g.hd, g.scale)?
+            };
+            be.upload(&devp[map], 0, &bytes)?;
+            tracing::debug!(
+                map = %blob.tensors[map].name, target = %blob.tensors[tgt].name,
+                rows = g.ctx, k = g.hd, box_rows = g.scale, "encoded tensormap"
+            );
+        }
 
         let mut ptrs: Vec<u64> = devp.iter().map(|m| m.base).collect();
         let pf_handles = pf_bufs.as_ref().map(|(s, r)| {
@@ -2097,7 +2181,10 @@ impl GpuEngine {
             )));
         }
         g.check_coarse_single_segment()?;
-        if g.gq_stream.is_empty() || g.gq_seg_ofs.len() != 2 {
+        // Single segment normally; an L2-PLACED program (l2_domains != 0) carries one
+        // window per domain and the placed interpreter picks its window by physical SM.
+        let want_seg = if g.l2_domains != 0 { g.l2_domains as usize + 1 } else { 2 };
+        if g.gq_stream.is_empty() || g.gq_seg_ofs.len() != want_seg {
             return Err(RuntimeError::Device(format!(
                 "decode program has no single-segment GQ appendix (n_seg bounds: {:?}) — \
                  recompile the packet with a GQ-capable plowc",
@@ -2145,7 +2232,10 @@ impl GpuEngine {
         // re-zeroed before every launch), so they share one allocation: the
         // cursor sits at the counter block's tail and ONE memset re-arms both.
         let ctr_bytes = g.n_counter as usize * CTR_STRIDE as usize * 4;
-        let cursor_bytes = CTR_STRIDE as usize * 4;
+        // One cursor line per GQ segment (see the prefill-bucket twin of this note):
+        // an L2-placed blob's interpreter fetch-adds PLOW_CTR(gq_cursor, domain).
+        let cursor_bytes =
+            g.gq_seg_ofs.len().saturating_sub(1).max(1) * CTR_STRIDE as usize * 4;
         let ctr_block = be.alloc(0, (ctr_bytes.max(4) + cursor_bytes) as u64)?;
         // Two aliased views of the one owned block; `ctr_block` is stored in
         // the engine so the storage outlives both.
@@ -2261,17 +2351,18 @@ impl GpuEngine {
         // swapped on disk no longer costs the prefill path (it used to load the
         // DECODE image here and fail on the missing `_pf` symbol).
         let pf = resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
-        let (f_pf, smem_pf, module_pf, prefill) = if let Some(pf) = pf {
+        let (f_pf, smem_pf, module_pf, prefill, seg_pf) = if let Some(pf) = pf {
             let pf_src = pf.source.clone();
             match Self::load_prefill(&be, pf, &blob, d_tens.base, grid) {
-                Ok((f_pf, smem_pf, module_pf, buckets)) => {
+                Ok((f_pf, smem_pf, module_pf, buckets, seg_pf)) => {
                     tracing::info!(
                         pf_cubin = %pf_src,
                         buckets = buckets.len(),
                         smem_pf,
+                        segmented = seg_pf.is_some(),
                         "prefill object loaded"
                     );
-                    (Some(f_pf), smem_pf, Some(module_pf), buckets)
+                    (Some(f_pf), smem_pf, Some(module_pf), buckets, seg_pf)
                 }
                 // HARD ERROR, not a fallback. The cubin is PRESENT and failed to
                 // load — a broken deployment, not a configuration. Falling back
@@ -2301,7 +2392,7 @@ impl GpuEngine {
                 expected = profile.prefill_file,
                 "no prefill object for sm_{want_sm} — decode-only prompt consumption"
             );
-            (None, SMEM_PF, None, Vec::new())
+            (None, SMEM_PF, None, Vec::new(), None)
         };
 
         // ---- PX-1 batched-prefill mode (finalized once the prefill object is up) ----
@@ -2405,12 +2496,13 @@ impl GpuEngine {
         let pf_max_t = prefill.last().map_or(0, |b| b.t as usize);
 
         // The engine's ordered device queue + pinned per-step staging + the
-        // env-gated CUDA-event timing (plan stage 1: async submission path).
+        // flag-gated (`--step-time` / PLOW_STEP_TIME=1) CUDA-event timing
+        // (plan stage 1: async submission path).
         let stream = be.stream_create()?;
         let stage = StepStage::new(&be, batch)?;
-        let timing = match std::env::var("PLOW_STEP_TIME").ok().filter(|v| v == "1") {
-            Some(_) => Some(StepTiming::new(&be)?),
-            None => None,
+        let timing = match crate::config::RuntimeConfig::get().nv.step_time {
+            true => Some(StepTiming::new(&be)?),
+            false => None,
         };
 
         // ---- device stochastic sampler (PLOW_DEV_SAMPLE=1; plan stage 4) ----
@@ -2452,6 +2544,8 @@ impl GpuEngine {
             stream,
             module,
             f_pf,
+            seg_pf,
+            seg_graphs: std::collections::HashMap::new(),
             smem_pf,
             prefill,
             module_pf,
@@ -2462,6 +2556,7 @@ impl GpuEngine {
             kvrow_lo: lo,
             kvrow_hi: hi,
             ctr_bytes,
+            cursor_bytes,
             devp,
             _weight_slab: weight_slab,
             d_inst,
@@ -2586,16 +2681,22 @@ impl GpuEngine {
         Ok(())
     }
 
-    /// Bring up VMM prefix sharing when `PLOW_VMM_PREFIX=1` and the model's
-    /// KV geometry (from the checkpoint's `config.json`) validates against
-    /// the blob's declared tensor sizes. Any mismatch logs and falls back to
-    /// the cudaMalloc path — never fails the load.
+    /// Bring up VMM prefix sharing when `--vmm-prefix` / `PLOW_VMM_PREFIX=1`
+    /// and the model's KV geometry (from the checkpoint's `config.json`)
+    /// validates against the blob's declared tensor sizes. Any mismatch logs
+    /// and falls back to the cudaMalloc path — never fails the load.
     fn vmm_bringup(
         be: &Arc<CudaBackend>,
         blob: &DevBlob,
         checkpoint_dir: &Path,
     ) -> Option<VmmServe> {
-        if std::env::var("PLOW_VMM_PREFIX").as_deref() != Ok("1") {
+        // Env first (tests flip PLOW_VMM_PREFIX mid-process, after the config
+        // snapshot), then the config.
+        let on = crate::config::RuntimeConfig::env_bool_or(
+            "PLOW_VMM_PREFIX",
+            crate::config::RuntimeConfig::get().nv.vmm_prefix,
+        );
+        if !on {
             return None;
         }
         let batch = blob.decode_prog().ok()?.t;
@@ -2720,12 +2821,14 @@ impl GpuEngine {
             })
         .max(4);
 
-        let mib = |var: &str, default: u64| {
+        // Env first (tests flip PLOW_VMM_BLOCK_MIB mid-process), then the
+        // config (`--vmm-block-mib` / `--vmm-cache-mib`).
+        let mib = |var: &str, cfg_mib: u64| {
             std::env::var(var)
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
-                .map(|m| m << 20)
-                .unwrap_or(default)
+                .unwrap_or(cfg_mib)
+                << 20
         };
         // Default sharing block = the driver granularity (2 MiB measured):
         // the finest match unit VMM can map, e.g. 4096 tokens at hd256 bf16 —
@@ -2733,8 +2836,9 @@ impl GpuEngine {
         // hit. Attach cost stays sane because set_access is coalesced over
         // contiguous granule runs (one call per span, not per block). The
         // 128k-dedup campaign can still raise it via PLOW_VMM_BLOCK_MIB=64.
-        let block_hint = mib("PLOW_VMM_BLOCK_MIB", 2 << 20);
-        let cache_cap = mib("PLOW_VMM_CACHE_MIB", 0);
+        let rt = crate::config::RuntimeConfig::get();
+        let block_hint = mib("PLOW_VMM_BLOCK_MIB", rt.nv.vmm_block_mib as u64);
+        let cache_cap = mib("PLOW_VMM_CACHE_MIB", rt.nv.vmm_cache_mib as u64);
         match crate::memory::vmm::VmmKv::new(
             Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
             geo,
@@ -2759,8 +2863,9 @@ impl GpuEngine {
         }
     }
 
-    /// Bring up the device sampler when `PLOW_DEV_SAMPLE=1` and a `plow_sample`
-    /// cubin is found (`PLOW_NV_CUBIN_SAMPLE`, else `<assets>/sample_sm120.cubin`).
+    /// Bring up the device sampler when `--dev-sample 1` / `PLOW_DEV_SAMPLE=1`
+    /// and a `plow_sample` cubin is found (`--nv-cubin-sample` /
+    /// `PLOW_NV_CUBIN_SAMPLE`, else `<assets>/sample_sm120.cubin`).
     /// Any missing piece returns `Ok(None)` (host sampling). The `[B][V]` f32
     /// scratch is the only sizeable allocation (~1 MiB per slot per 256k vocab).
     fn sampler_bringup(
@@ -2776,13 +2881,22 @@ impl GpuEngine {
         // 102.74 -> 185.60 tok/s (1.74x). Every failure path below already
         // degrades to host sampling, so defaulting on cannot break a bundle
         // that lacks the cubin. See perf-data/gemma4-12b-sm120-serving.md.
-        let explicit = std::env::var("PLOW_DEV_SAMPLE").ok();
+        // Env first (tests flip PLOW_DEV_SAMPLE / PLOW_NV_CUBIN_SAMPLE
+        // mid-process, after the config snapshot), then the config.
+        let rt = crate::config::RuntimeConfig::get();
+        let explicit = crate::config::RuntimeConfig::env_str_or(
+            "PLOW_DEV_SAMPLE",
+            rt.nv.dev_sample.clone(),
+        );
         if explicit.as_deref() == Some("0") {
             return Ok(None);
         }
-        let cubin = std::env::var("PLOW_NV_CUBIN_SAMPLE")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| assets_dir.join("sample_sm120.cubin"));
+        let cubin = crate::config::RuntimeConfig::env_str_or(
+            "PLOW_NV_CUBIN_SAMPLE",
+            rt.nv.cubin_sample.clone(),
+        )
+        .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| assets_dir.join("sample_sm120.cubin"));
         if !cubin.is_file() {
             // Only a warning when the operator ASKED for it; on the default
             // path a bundle without the cubin is an ordinary host-sampling
@@ -2799,7 +2913,11 @@ impl GpuEngine {
             source,
         })?;
         let module = be.module_load(&image)?;
-        let kname = std::env::var("PLOW_NV_KERNEL_SAMPLE").unwrap_or_else(|_| "plow_sample".into());
+        let kname = rt
+            .nv
+            .kernel_sample
+            .clone()
+            .unwrap_or_else(|| "plow_sample".into());
         let f = be.get_function(&module, &kname)?;
         let params = be.host_alloc_pinned(5 * batch * 4)?;
         let d_params = be.alloc(0, (5 * batch * 4) as u64)?;
@@ -2815,7 +2933,8 @@ impl GpuEngine {
         }))
     }
 
-    /// Bring up bounded device multi-step (`PLOW_MULTISTEP=K`, K in [2,64];
+    /// Bring up bounded device multi-step (`--multistep K` /
+    /// `PLOW_MULTISTEP=K`, K in [2,64];
     /// plan stage 5). Loads the `plow_advance` kernel from the sampler cubin
     /// and allocates the `[batch][K]` token ring + `[batch]` active-flag
     /// buffers. `Ok(None)` when the flag is unset, K is out of range, the
@@ -2833,12 +2952,17 @@ impl GpuEngine {
         // of the client the device runs, so a small K keeps streaming delivery
         // fine-grained and bounds work generated past a stop token; that is why
         // the default is not the throughput-optimal 32.
-        const MULTISTEP_DEFAULT: usize = 8;
-        let raw = std::env::var("PLOW_MULTISTEP").ok();
-        let k: usize = match raw.as_deref().map(|v| v.parse::<usize>()) {
-            None => MULTISTEP_DEFAULT,
-            Some(Ok(0)) | Some(Ok(1)) => return Ok(None),
-            Some(Ok(k)) if (2..=64).contains(&k) => k,
+        //
+        // Env first (tests flip PLOW_MULTISTEP mid-process, after the config
+        // snapshot), then `--multistep` (config default 8).
+        let raw = crate::config::RuntimeConfig::env_str_or("PLOW_MULTISTEP", None);
+        let k: usize = match raw
+            .as_deref()
+            .map(|v| v.parse::<usize>())
+            .unwrap_or(Ok(crate::config::RuntimeConfig::get().nv.multistep as usize))
+        {
+            Ok(0) | Ok(1) => return Ok(None),
+            Ok(k) if (2..=64).contains(&k) => k,
             _ => {
                 tracing::warn!("PLOW_MULTISTEP out of range [2,64] — multi-step off");
                 return Ok(None);
@@ -2854,9 +2978,12 @@ impl GpuEngine {
             }
             return Ok(None);
         }
-        let cubin = std::env::var("PLOW_NV_CUBIN_SAMPLE")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| assets_dir.join("sample_sm120.cubin"));
+        let cubin = crate::config::RuntimeConfig::env_str_or(
+            "PLOW_NV_CUBIN_SAMPLE",
+            crate::config::RuntimeConfig::get().nv.cubin_sample.clone(),
+        )
+        .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| assets_dir.join("sample_sm120.cubin"));
         if !cubin.is_file() {
             if raw.is_some() {
                 tracing::warn!(cubin = %cubin.display(), "PLOW_MULTISTEP set but no sampler cubin (has plow_advance)");
@@ -3287,7 +3414,7 @@ impl GpuEngine {
         self.be.memset_d8_async(
             self.d_ctr.base,
             0,
-            self.ctr_bytes.max(4) + CTR_STRIDE as usize * 4,
+            self.ctr_bytes.max(4) + self.cursor_bytes,
             &self.stream,
         )?;
         if let Some(t) = &self.timing {
@@ -3382,7 +3509,22 @@ impl GpuEngine {
         let t_submit = timed.then(now);
 
         // The step's single sync point (the whole queue retires in order).
-        self.be.stream_synchronize(&self.stream)?;
+        // A failure here is where an async kernel trap surfaces — capture the
+        // launch shape at the site before propagating.
+        if let Err(e) = self.be.stream_synchronize(&self.stream) {
+            tracing::warn!(
+                error = %e,
+                error_code = ?e.device_code(),
+                fatal = e.is_fatal(),
+                fed = feeds.len(),
+                batch = bsz,
+                grid = self.grid,
+                block = BLOCK,
+                smem = self.smem,
+                "decode step: stream sync failed"
+            );
+            return Err(e);
+        }
         let t_sync = timed.then(now);
 
         toks.reserve(feeds.len());
@@ -3516,7 +3658,7 @@ impl GpuEngine {
             self.be.memset_d8_async(
                 self.d_ctr.base,
                 0,
-                self.ctr_bytes.max(4) + CTR_STRIDE as usize * 4,
+                self.ctr_bytes.max(4) + self.cursor_bytes,
                 &self.stream,
             )?;
             let mut arg = self.kernarg;
@@ -3557,7 +3699,20 @@ impl GpuEngine {
             self.be
                 .memcpy_dtoh_async(ring_slice, ring_base, &self.stream)?;
         }
-        self.be.stream_synchronize(&self.stream)?;
+        if let Err(e) = self.be.stream_synchronize(&self.stream) {
+            tracing::warn!(
+                error = %e,
+                error_code = ?e.device_code(),
+                fatal = e.is_fatal(),
+                fed = feeds.len(),
+                quantum = k,
+                grid = self.grid,
+                block = BLOCK,
+                smem = self.smem,
+                "multi-step: stream sync failed"
+            );
+            return Err(e);
+        }
 
         // Extract each fed row's K tokens (row-major) and advance host pos.
         {
@@ -3650,23 +3805,147 @@ impl GpuEngine {
         blob: &DevBlob,
         d_tens: u64,
         grid: u32,
-    ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>)> {
+    ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>)> {
         let module = be.module_load(&pf.image)?;
-        let kname = std::env::var(env_kernel_var(Role::Prefill)).unwrap_or(pf.entry);
+        let kname = std::env::var(env_kernel_var(Role::Prefill))
+            .ok()
+            .or_else(|| crate::config::RuntimeConfig::get().nv.kernel_pf.clone())
+            .unwrap_or(pf.entry);
         let f_pf = be.get_function(&module, &kname)?;
 
-        // Same contract as decode: env override > the cubin's own
-        // `plow_arena_bytes_pf` metadata > legacy default.
-        let smem_pf: u32 = match std::env::var("PLOW_NV_SMEM_PF")
-            .ok()
-            .and_then(|s| s.parse().ok())
-        {
+        // Same contract as decode: `--nv-smem-pf` / PLOW_NV_SMEM_PF override >
+        // the cubin's own `plow_arena_bytes_pf` metadata > legacy default.
+        let smem_pf: u32 = match crate::config::RuntimeConfig::get().nv.smem_pf {
             Some(v) => v,
             None => be
                 .module_global_u32(&module, "plow_arena_bytes_pf")?
                 .unwrap_or(SMEM_PF),
         };
         be.set_max_dynamic_smem(f_pf, smem_pf)?;
+
+        // Segmented-prefill pair (T9c). `--pf-seg-dir` / PLOW_PF_SEG_DIR names a directory
+        // holding interp_sm90a_pfseg.cubin + interp_sm90a_pfgemm.cubin
+        // (scripts/build_sm90a_cubin.sh PLOW_BUILD_SEG=1); packets must be emitted WITHOUT
+        // PLOW_UNISEG. Next step: promote to the asset manifest once the A/B settles.
+        let seg_pf = match crate::config::RuntimeConfig::get().nv.pf_seg_dir.clone() {
+            Some(dir) if !dir.is_empty() => {
+                let load = |file: &str, sym: &str, arena: &str| -> Result<(Module, KernelFn, u32, u32)> {
+                    let img = std::fs::read(std::path::Path::new(&dir).join(file)).map_err(|e| {
+                        RuntimeError::Device(format!("PLOW_PF_SEG_DIR: read {file}: {e}"))
+                    })?;
+                    let m = be.module_load(&img)?;
+                    let f = be.get_function(&m, sym)?;
+                    let sm = be.module_global_u32(&m, arena)?.unwrap_or(smem_pf);
+                    be.set_max_dynamic_smem(f, sm)?;
+                    let occ = be.occupancy_blocks_per_sm(f, BLOCK, sm as usize)?;
+                    Ok((m, f, sm, occ * be.sm_count()))
+                };
+                let (m1, f1, s1, g1) = load(
+                    "interp_sm90a_pfseg.cubin",
+                    "_Z18interp_sm90a_pfseg11PlowProgram",
+                    "plow_arena_bytes_pfseg",
+                )?;
+                let (m2, f2, s2, _g2unused) = load(
+                    "interp_sm90a_pfgemm.cubin",
+                    "_Z19interp_sm90a_pfgemm11PlowProgram",
+                    "plow_arena_bytes_pfgemm",
+                )?;
+                // T31: the GEMM object may declare its own launch block size (384-thread ws).
+                let blk2 = be
+                    .module_global_u32(&m2, "plow_block_pfgemm")?
+                    .unwrap_or(BLOCK);
+                let g2 = be.occupancy_blocks_per_sm(f2, blk2, s2 as usize)? * be.sm_count();
+                // Optional third object (T12): dedicated hd512 flash. Only loaded when the
+                // file exists — the classing env (PLOW_PF_SEG_FA512) decides whether class-2
+                // segments are emitted at all.
+                let fa = if std::path::Path::new(&dir).join("interp_sm90a_pffa.cubin").exists() {
+                    let (m3, f3, s3, g3) = load(
+                        "interp_sm90a_pffa.cubin",
+                        "_Z17interp_sm90a_pffa11PlowProgram",
+                        "plow_arena_bytes_pffa",
+                    )?;
+                    // PLOW_PF_SEG_FA512=all classes hd256 FlashPrefill onto this object too,
+                    // but its hd256 arm exists only when built PLOW_BUILD_FA_HD256=1 —
+                    // without it the dispatch hits a bare __trap(): LAUNCH_FAILED, poisoned
+                    // context, dead engine, every request 503. Refuse the mismatch here, the
+                    // way a missing object is already refused. Absent symbol = older cubin,
+                    // unconstrained (same convention as plow_arena_bytes).
+                    if crate::config::RuntimeConfig::get().nv.pf_seg_fa512.as_deref()
+                        == Some("all")
+                        && be.module_global_u32(&m3, "plow_fa_hd256_pffa")? == Some(0)
+                    {
+                        return Err(RuntimeError::Device(
+                            "PLOW_PF_SEG_FA512=all classes hd256 flash onto \
+                             interp_sm90a_pffa.cubin, but that object was built without its \
+                             hd256 arm (PLOW_BUILD_FA_HD256=1) — it would trap on the first \
+                             hd256 segment. Rebuild the object or set PLOW_PF_SEG_FA512=1."
+                                .into(),
+                        ));
+                    }
+                    Some((m3, f3, s3, g3))
+                } else {
+                    None
+                };
+                tracing::info!(
+                    grid_flash = g1, grid_gemm = g2, smem_flash = s1, smem_gemm = s2,
+                    block_gemm = blk2, fa512 = fa.is_some(),
+                    "segmented prefill pair loaded"
+                );
+                let (m_fa, fa512) = match fa {
+                    Some((m3, f3, s3, g3)) => (Some(m3), Some((f3, s3, g3))),
+                    None => (None, None),
+                };
+                let mut sp = SegPf {
+                    f_flash: f1,
+                    smem_flash: s1,
+                    grid_flash: g1,
+                    f_gemm: f2,
+                    smem_gemm: s2,
+                    grid_gemm: g2,
+                    block_gemm: blk2,
+                    fa512,
+                    _m_flash: m1,
+                    _m_gemm: m2,
+                    _m_fa512: m_fa,
+                };
+                // PLOW_PF_SEG_EQSMEM=1 (T18): launch every object with the SAME dynamic-smem
+                // request (the max of the three). Alternating smem sizes between back-to-back
+                // launches forces an SM shared-memory carveout reconfig each time — measured
+                // ~150-300us per transition at ~480 segments/chunk. A uniform request makes
+                // every launch reuse the standing carveout. Occupancy re-derives from the max
+                // (the fat object drops to occ-1 — measured neutral on its latency-bound rows).
+                if crate::config::RuntimeConfig::get().nv.pf_seg_eqsmem {
+                    let mut mx = sp.smem_flash.max(sp.smem_gemm);
+                    if let Some((_, s3, _)) = sp.fa512 {
+                        mx = mx.max(s3);
+                    }
+                    // Occupancy is per (function, BLOCK SIZE): the ws384 GEMM object
+                    // launches at `block_gemm`, so re-querying it at BLOCK over-reports
+                    // its grid (384-thread blocks cap at 5/SM vs 8/SM at 256) and the
+                    // cooperative launch then fails — or, non-cooperative, spins on
+                    // counters owned by blocks that were never resident.
+                    let requery = |f: KernelFn, block: u32| -> Result<u32> {
+                        be.set_max_dynamic_smem(f, mx)?;
+                        Ok(be.occupancy_blocks_per_sm(f, block, mx as usize)? * be.sm_count())
+                    };
+                    sp.grid_flash = requery(sp.f_flash, BLOCK)?;
+                    sp.smem_flash = mx;
+                    sp.grid_gemm = requery(sp.f_gemm, sp.block_gemm)?;
+                    sp.smem_gemm = mx;
+                    if let Some((f3, _, _)) = sp.fa512 {
+                        let g3 = requery(f3, BLOCK)?;
+                        sp.fa512 = Some((f3, mx, g3));
+                    }
+                    tracing::info!(
+                        smem = mx, grid_flash = sp.grid_flash, grid_gemm = sp.grid_gemm,
+                        "seg pair smem equalized"
+                    );
+                }
+                Some(sp)
+            }
+            _ => None,
+        };
+        let seg_mode = seg_pf.is_some();
 
         // Same fatal grid gate as decode: the prefill kernel's occupancy must
         // yield exactly n_cu blocks or the cooperative launch reads off the
@@ -3693,8 +3972,23 @@ impl GpuEngine {
         // Every program but the last (the decode program, t == B) is a
         // prefill bucket.
         for g in &blob.progs[..blob.progs.len().saturating_sub(1)] {
-            g.check_coarse_single_segment()?;
-            if g.gq_stream.is_empty() || g.gq_seg_ofs.len() != 2 {
+            // Wave-class segmented programs are legal exactly when the SegPf pair is
+            // loaded: segments launch per class in order. Otherwise the coarse
+            // single-segment contract holds as before.
+            let seg_class = if seg_mode {
+                g.seg_classes()?
+            } else {
+                g.check_coarse_single_segment()?;
+                Vec::new()
+            };
+            let want_seg = if g.l2_domains != 0 {
+                g.l2_domains as usize + 1
+            } else if seg_mode {
+                seg_class.len().max(1) + 1
+            } else {
+                2
+            };
+            if g.gq_stream.is_empty() || g.gq_seg_ofs.len() != want_seg {
                 return Err(RuntimeError::Device(format!(
                     "prefill bucket T={} has no single-segment GQ appendix (n_seg bounds: {:?}) — \
                      recompile with `PLOW_UNISEG=1 plowc` (GQ-capable, single segment)",
@@ -3715,9 +4009,14 @@ impl GpuEngine {
             // the bucket's own GQ cursor sits at its counter block's tail, so
             // ONE fill re-arms both and no cursor is shared with the decode
             // program or other buckets. `ctr_bytes` is the full reset size.
+            // ONE CURSOR LINE PER GQ SEGMENT: an L2-placed blob (PLOW_NV_PLACE)
+            // carries P per-domain windows in gq_seg_ofs, and the placed
+            // interpreter fetch-adds PLOW_CTR(gq_cursor, domain) — sizing for a
+            // single line would put domains 1..P-1 past the allocation.
             let ctr_only = g.n_counter as usize * CTR_STRIDE as usize * 4;
             let cursor_off = ctr_only.max(4);
-            let ctr_bytes = cursor_off + CTR_STRIDE as usize * 4;
+            let cursor_lines = g.gq_seg_ofs.len().saturating_sub(1).max(1);
+            let ctr_bytes = cursor_off + cursor_lines * CTR_STRIDE as usize * 4;
             let d_ctr = be.alloc(0, ctr_bytes as u64)?;
 
             let kernarg = DevProgram {
@@ -3733,7 +4032,7 @@ impl GpuEngine {
                 cur_seg: 0,
                 l2_domains: 0,
                 hier_base: 0,
-                n_seg: 1,
+                n_seg: seg_class.len().max(1) as u32,
                 gq_stream: d_gq_stream.base,
                 gq_seg_ofs: d_gq_seg.base,
                 gq_cursor: d_ctr.base + cursor_off as u64,
@@ -3795,6 +4094,7 @@ impl GpuEngine {
 
             buckets.push(PrefillBucket {
                 t: g.t,
+                seg_class: seg_class.clone(),
                 kernarg,
                 d_inst,
                 h_inst: g.insts.clone(),
@@ -3825,7 +4125,7 @@ impl GpuEngine {
             ));
         }
         buckets.sort_by_key(|b| b.t);
-        Ok((f_pf, smem_pf, module, buckets))
+        Ok((f_pf, smem_pf, module, buckets, seg_pf))
     }
 
     /// Consume the whole prompt for slot `b` through the prefill bucket chain
@@ -4123,16 +4423,205 @@ impl GpuEngine {
 
         // All uploads/memsets are enqueued on the engine stream — the launch
         // follows them in stream order (no context sync needed).
-        let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
-        self.be.launch_cooperative(
-            f_pf,
-            self.grid,
-            BLOCK,
-            self.smem_pf,
-            &mut params,
-            Some(&self.stream),
-        )?;
-        self.be.stream_synchronize(&self.stream)?;
+        // SEGMENTED MODE (SegPf): one launch per wave-class segment, in blob order,
+        // alternating the fat (flash) and lean occ-2 (GEMM) objects. Sequential stream
+        // launches make cross-segment gates trivially satisfied (dependencies only point
+        // backward); counters were re-armed ONCE above and persist across the segments.
+        // cuLaunchCooperativeKernel snapshots the param buffer at enqueue, so mutating
+        // `arg.cur_seg` between launches is sound.
+        let seg_class = self.prefill[bi].seg_class.clone();
+        // len 1 = a force_uniseg small bucket: ONE launch on the full fat _pf object beats
+        // ~480 segment launches (T18) — take the single-launch path below.
+        if seg_class.len() > 1 && self.seg_pf.is_some() {
+            let sp = self.seg_pf.as_ref().expect("checked");
+            // T35 (PLOW_PF_SEG_GRAPH=1): submit the whole per-chunk segment chain as ONE
+            // CUDA graph. Per-node kernargs (cur_seg baked per node) are copied at build;
+            // everything else in `arg` is constant per (bucket, slot tensor table), which
+            // keys the cache. Falls through to the loop under the timing/fatonly diags.
+            let rt = crate::config::RuntimeConfig::get();
+            let seg_time_probe = rt.nv.pf_seg_time;
+            let fat_only_probe = rt.nv.pf_seg_fatonly;
+            if !seg_time_probe && !fat_only_probe && rt.nv.pf_seg_graph {
+                let key = (bi, arg.tensors as u64);
+                if !self.seg_graphs.contains_key(&key) {
+                    let mut blobs: Vec<DevProgram> = (0..seg_class.len())
+                        .map(|i| {
+                            let mut a2 = arg;
+                            a2.cur_seg = i as u32;
+                            a2
+                        })
+                        .collect();
+                    let nodes: Vec<(KernelFn, u32, u32, u32)> = seg_class
+                        .iter()
+                        .map(|&cls| {
+                            Ok(match cls {
+                                4 => (sp.f_flash, sp.grid_flash, BLOCK, sp.smem_flash),
+                                2 => {
+                                    let (f3, s3, g3) = sp.fa512.ok_or_else(|| {
+                                        RuntimeError::Device(
+                                            "class-2 segment without the pffa object".into(),
+                                        )
+                                    })?;
+                                    (f3, g3, BLOCK, s3)
+                                }
+                                _ => (sp.f_gemm, sp.grid_gemm, sp.block_gemm, sp.smem_gemm),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let mut ptrs: Vec<*mut std::ffi::c_void> = blobs
+                        .iter_mut()
+                        .map(|bb| bb as *mut DevProgram as *mut std::ffi::c_void)
+                        .collect();
+                    let g = self.be.graph_build_chain(&nodes, &mut ptrs)?;
+                    self.seg_graphs.insert(key, g);
+                    tracing::info!(nodes = seg_class.len(), bucket = bi, "seg graph built");
+                }
+                self.be
+                    .graph_launch(self.seg_graphs.get(&key).expect("just built"), &self.stream)?;
+                if let Err(e) = self.be.stream_synchronize(&self.stream) {
+                    tracing::warn!(
+                        error = %e,
+                        error_code = ?e.device_code(),
+                        fatal = e.is_fatal(),
+                        slot = b,
+                        bucket = bi,
+                        bucket_t = tc,
+                        chunk_start = c0,
+                        prompt_len = n,
+                        "prefill chunk (seg graph): stream sync failed"
+                    );
+                    return Err(e);
+                }
+                if rt.nv.pf_trace_log {
+                    if let Ok(Some(sdump)) = self.trace_summary_pf() {
+                        tracing::info!("prefill {sdump}");
+                    }
+                }
+                return Ok(real);
+            }
+            // PLOW_PF_SEG_TIME=1: per-CLASS wall attribution via one event pair per segment
+            // (diagnostic; events cost ~us each — never on by default).
+            let seg_time = seg_time_probe;
+            // Both diagnostics are resolved ONCE per chunk, not per segment: a
+            // `std::env::var` inside the ~480-iteration launch loop takes the
+            // process-global env lock and allocates a String every time.
+            // PLOW_PF_SEG_FATONLY=1: every segment on the fat object, isolating
+            // the launch-serialization cost from the occ-2 effect.
+            let fat_only = fat_only_probe;
+            // PLOW_PF_SEG_NONCOOP=1 (T14b): plain cuLaunchKernel per segment. The
+            // cooperative wrapper's only guarantee — co-residency — already holds: the
+            // grid equals the module's queried resident capacity and the stream is
+            // otherwise idle, so all blocks schedule together. Diagnostic-grade knob to
+            // price the cooperative-launch overhead (241 fat launches/chunk).
+            let noncoop = rt.nv.pf_seg_noncoop;
+            let mut evs: Vec<(u8, CudaEvent, CudaEvent)> = Vec::new();
+            for (seg, &cls) in seg_class.iter().enumerate() {
+                arg.cur_seg = seg as u32;
+                let (f, gr, sm, blk) = if fat_only || cls == 4 {
+                    (sp.f_flash, sp.grid_flash, sp.smem_flash, BLOCK)
+                } else if cls == 2 {
+                    // T12: hd512 flash segments on the dedicated *_pffa object.
+                    let (f3, s3, g3) = sp.fa512.ok_or_else(|| {
+                        RuntimeError::Device(
+                            "class-2 (hd512 flash) segment but no interp_sm90a_pffa.cubin in \
+                             PLOW_PF_SEG_DIR — unset PLOW_PF_SEG_FA512 or add the object"
+                                .into(),
+                        )
+                    })?;
+                    (f3, g3, s3, BLOCK)
+                } else {
+                    (sp.f_gemm, sp.grid_gemm, sp.smem_gemm, sp.block_gemm)
+                };
+                let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+                let go = |params: &mut [*mut std::ffi::c_void]| -> Result<()> {
+                    if noncoop {
+                        self.be.launch_kernel(f, gr, blk, sm, params, Some(&self.stream))
+                    } else {
+                        self.be
+                            .launch_cooperative(f, gr, blk, sm, params, Some(&self.stream))
+                    }
+                };
+                if seg_time {
+                    let e0 = self.be.event_create(true)?;
+                    let e1 = self.be.event_create(true)?;
+                    self.be.event_record(&e0, &self.stream)?;
+                    go(&mut params)?;
+                    self.be.event_record(&e1, &self.stream)?;
+                    evs.push((cls, e0, e1));
+                } else {
+                    go(&mut params)?;
+                }
+            }
+            if seg_time {
+                self.be.stream_synchronize(&self.stream)?;
+                let mut by_class = [0f64; 3]; // [gemm(8), flash-fat(4), fa512(2)]
+                let mut n_by = [0u32; 3];
+                for (cls, e0, e1) in &evs {
+                    let ix = match cls {
+                        8 => 0,
+                        4 => 1,
+                        _ => 2,
+                    };
+                    by_class[ix] += self.be.event_elapsed_ms(e0, e1)? as f64;
+                    n_by[ix] += 1;
+                }
+                tracing::info!(
+                    gemm_ms = format!("{:.1}", by_class[0]).as_str(),
+                    fat_ms = format!("{:.1}", by_class[1]).as_str(),
+                    fa_ms = format!("{:.1}", by_class[2]).as_str(),
+                    n_gemm = n_by[0], n_fat = n_by[1], n_fa = n_by[2],
+                    "seg-class wall time (chunk)"
+                );
+                // Top-10 slowest segments, to attribute inside a class.
+                let mut per: Vec<(usize, u8, f32)> = Vec::with_capacity(evs.len());
+                for (i, (cls, e0, e1)) in evs.iter().enumerate() {
+                    per.push((i, *cls, self.be.event_elapsed_ms(e0, e1)?));
+                }
+                per.sort_by(|a, b| b.2.total_cmp(&a.2));
+                let top: Vec<String> = per
+                    .iter()
+                    .take(10)
+                    .map(|(i, c, ms)| format!("seg{i}(c{c})={ms:.2}ms"))
+                    .collect();
+                tracing::info!(top = top.join(" ").as_str(), "slowest segments");
+            }
+        } else {
+            let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+            self.be.launch_cooperative(
+                f_pf,
+                self.grid,
+                BLOCK,
+                self.smem_pf,
+                &mut params,
+                Some(&self.stream),
+            )?;
+        }
+        if let Err(e) = self.be.stream_synchronize(&self.stream) {
+            tracing::warn!(
+                error = %e,
+                error_code = ?e.device_code(),
+                fatal = e.is_fatal(),
+                slot = b,
+                bucket = bi,
+                bucket_t = tc,
+                chunk_start = c0,
+                prompt_len = n,
+                grid = self.grid,
+                block = BLOCK,
+                smem = self.smem_pf,
+                "prefill chunk: stream sync failed"
+            );
+            return Err(e);
+        }
+
+        // Per-op attribution hook: with a `-DPLOW_NV_TRACE=1` prefill cubin and
+        // `--pf-trace-log` / PLOW_PF_TRACE_LOG=1, dump block 0's gate/body/signal
+        // per opcode after each chunk.
+        if crate::config::RuntimeConfig::get().nv.pf_trace_log {
+            if let Ok(Some(s)) = self.trace_summary_pf() {
+                tracing::info!("prefill {s}");
+            }
+        }
 
         Ok(real)
     }
@@ -4256,6 +4745,19 @@ impl GpuEngine {
                     "pf-batch: pack of {total} rows exceeds the largest bucket"
                 ))
             })?;
+        // The batched path single-launches the plain `_pf` object, whose gq window
+        // is segment 0 only. A wave-class-segmented bucket (SegPf loaded) would run
+        // its first segment and silently skip every op after it — stale KV, garbage
+        // logits, launch reports success. Refuse instead: the two features are
+        // mutually exclusive until the batched path learns the segment chain.
+        if !self.prefill[bi].seg_class.is_empty() {
+            return Err(RuntimeError::Rejected(
+                "PLOW_PF_BATCH with a wave-class-segmented prefill program \
+                 (PLOW_PF_SEG_DIR): the batched path launches segment 0 only — \
+                 unset one of the two"
+                    .into(),
+            ));
+        }
         self.ensure_batch_patch(bi)?;
         let tc = self.prefill[bi].t as usize;
 
@@ -4358,7 +4860,21 @@ impl GpuEngine {
             &mut params,
             Some(&self.stream),
         )?;
-        self.be.stream_synchronize(&self.stream)?;
+        if let Err(e) = self.be.stream_synchronize(&self.stream) {
+            tracing::warn!(
+                error = %e,
+                error_code = ?e.device_code(),
+                fatal = e.is_fatal(),
+                requests = reqs.len(),
+                bucket = bi,
+                rows = total,
+                grid = self.grid,
+                block = BLOCK,
+                smem = self.smem_pf,
+                "batched prefill: stream sync failed"
+            );
+            return Err(e);
+        }
 
         tracing::debug!(
             requests = reqs.len(),
@@ -4464,6 +4980,27 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// [`Self::trace_summary`] against the PREFILL module (`-DPLOW_NV_TRACE=1`
+    /// on the `_pf` build): block-0 per-packet gate/body/signal by opcode.
+    /// `Ok(None)` when there is no prefill module or it carries no trace.
+    pub fn trace_summary_pf(&self) -> Result<Option<String>> {
+        // Segmented mode: the bundle's _pf module never launches — the trace lives in the
+        // SegPf pair's FAT module (the lean ws role loop is not instrumented).
+        if let Some(sp) = &self.seg_pf {
+            let mut s = self.trace_summary_of(&sp._m_flash)?.unwrap_or_default();
+            // The FA object runs the same instrumented loop — append its block-0 profile.
+            if let Some(m3) = &sp._m_fa512 {
+                if let Some(fa) = self.trace_summary_of(m3)? {
+                    s.push_str("\n  [FA object] ");
+                    s.push_str(&fa);
+                }
+            }
+            return Ok(Some(s));
+        }
+        let Some(m) = &self.module_pf else { return Ok(None) };
+        self.trace_summary_of(m)
+    }
+
     /// Stage-7 profiling (plan §Instrumentation): if the decode cubin was
     /// built `-DPLOW_NV_TRACE=1`, read back block 0's per-packet gate/body/
     /// signal cycle attribution (device globals `g_tr_*`) and aggregate it by
@@ -4473,10 +5010,14 @@ impl GpuEngine {
     /// the absolute total (clock64 in the recording thread over-reports). See
     /// the trace header in interp_sm120.cu.
     pub fn trace_summary(&self) -> Result<Option<String>> {
+        self.trace_summary_of(&self.module)
+    }
+
+    fn trace_summary_of(&self, module: &Module) -> Result<Option<String>> {
         let mut raw = Vec::new();
         if !self
             .be
-            .module_global_bytes(&self.module, "g_tr_n", 4, &mut raw)?
+            .module_global_bytes(module, "g_tr_n", 4, &mut raw)?
         {
             return Ok(None);
         }
@@ -4488,7 +5029,7 @@ impl GpuEngine {
         let read_u32 = |name: &str, out: &mut Vec<u32>| -> Result<()> {
             let mut b = Vec::new();
             self.be
-                .module_global_bytes(&self.module, name, cap * 4, &mut b)?;
+                .module_global_bytes(module, name, cap * 4, &mut b)?;
             *out = b
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes(c.try_into().expect("4B")))
@@ -4498,7 +5039,7 @@ impl GpuEngine {
         let read_u64 = |name: &str, out: &mut Vec<u64>| -> Result<()> {
             let mut b = Vec::new();
             self.be
-                .module_global_bytes(&self.module, name, cap * 8, &mut b)?;
+                .module_global_bytes(module, name, cap * 8, &mut b)?;
             *out = b
                 .chunks_exact(8)
                 .map(|c| u64::from_le_bytes(c.try_into().expect("8B")))
@@ -4645,29 +5186,61 @@ impl Drop for GpuEngine {
     /// nothing — `_ctr_block` owns that storage. Errors are logged: Drop has
     /// no error channel, and a failed unload only pins module storage.
     fn drop(&mut self) {
+        // On a poisoned context these calls are EXPECTED to fail (bind
+        // short-circuits) — that is old news, logged once at the poisoning
+        // site, so the per-call reports drop to debug.
+        let poisoned = self.be.is_poisoned();
+        let report = |e: &crate::RuntimeError, what: &str| {
+            if poisoned {
+                tracing::debug!(error = %e, "{what} (context poisoned)");
+            } else {
+                tracing::warn!(error = %e, "{what}");
+            }
+        };
         // Every public step/prefill path synchronizes before returning, but a
         // failed launch may leave work queued — never free under a running
         // cooperative kernel.
         if let Err(e) = self.be.synchronize() {
-            tracing::warn!(error = %e, "synchronize at engine unload");
+            report(&e, "synchronize at engine unload");
         }
         if let Some(m) = self.module_pf.take() {
             if let Err(e) = self.be.module_unload(&m) {
-                tracing::warn!(error = %e, "unload prefill module");
+                report(&e, "unload prefill module");
             }
         }
         if let Some(s) = self.sampler.take() {
             if let Err(e) = self.be.module_unload(&s._module) {
-                tracing::warn!(error = %e, "unload sampler module");
+                report(&e, "unload sampler module");
             }
         }
         if let Some(m) = self.multistep.take() {
             if let Err(e) = self.be.module_unload(&m._module) {
-                tracing::warn!(error = %e, "unload multistep module");
+                report(&e, "unload multistep module");
+            }
+        }
+        // T35 segment-chain graphs and the SegPf pair's own modules. Engines
+        // share one backend whose primary-context retain outlives them, so the
+        // backend-drop drain never runs during a serving session — without
+        // these, every S1 model swap pins three cubins and leaks one
+        // instantiated graph per (bucket, slot) until process exit.
+        for (_, g) in self.seg_graphs.drain() {
+            self.be.graph_destroy(g);
+        }
+        if let Some(sp) = self.seg_pf.take() {
+            if let Err(e) = self.be.module_unload(&sp._m_flash) {
+                report(&e, "unload seg flash module");
+            }
+            if let Err(e) = self.be.module_unload(&sp._m_gemm) {
+                report(&e, "unload seg gemm module");
+            }
+            if let Some(m) = sp._m_fa512 {
+                if let Err(e) = self.be.module_unload(&m) {
+                    report(&e, "unload seg fa512 module");
+                }
             }
         }
         if let Err(e) = self.be.module_unload(&self.module) {
-            tracing::warn!(error = %e, "unload decode module");
+            report(&e, "unload decode module");
         }
     }
 }

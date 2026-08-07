@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn every_swept_symbol_is_driven_by_the_harness() {
         let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../runtime/ubench/gemv_row_sweep.c");
+            .join("../../runtime/bench/gemm/gemv_row_sweep.c");
         let src = std::fs::read_to_string(&p).expect("gemv_row_sweep.c");
         for stem in [
             "gemv",

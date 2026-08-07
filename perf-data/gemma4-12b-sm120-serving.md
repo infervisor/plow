@@ -198,7 +198,7 @@ same bundle before the flips served 102.74 tok/s and 429'd every request.
 
 **Tuner impact is small.** The two axes the decode tuner sweeps gave 4.3% and
 2% (~6% together). The large wins were structural defaults, not tuning. Fix
-defaults first, tune last. See `docs/llm-bringup-harness.md`.
+defaults first, tune last. See `perf-data/harness/BRINGUP.md`.
 
 ## VRAM budget (why B=16 needs fp8 KV)
 

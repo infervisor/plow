@@ -1032,6 +1032,11 @@ fn create_block(s: &Shared, inner: &mut Inner) -> Result<u32> {
                 return Ok(install_block(inner, Block { handle, refs: 1 }));
             }
             Err(e) => {
+                // A fatal fault (poisoned context) is not memory pressure —
+                // evicting the cache cannot help and would spin it dry.
+                if e.is_fatal() {
+                    return Err(e);
+                }
                 if !evict_one(s, inner) {
                     return Err(RuntimeError::Oom(format!("vmm kv block: {e}")));
                 }
@@ -1131,12 +1136,16 @@ fn release_window(s: &Shared, inner: &mut Inner, seq: usize) {
 /// one model ([`set_slab_keep_default`]); everything else — single-model
 /// serves, the lifecycle tests' return-to-baseline assert — keeps the
 /// release-on-drop behavior. `PLOW_SLAB_KEEP=1`/`0` force-overrides either
-/// way. Read per-drop (not cached) so an in-process flip is honored.
+/// way. The env is read per-drop — BEFORE the cached config — because the
+/// lifecycle tests flip it mid-process; `--rt-slab-keep` lands via the config
+/// fallback (opt-in only, so the manager's default still decides when unset).
 fn slab_keep_enabled() -> bool {
-    match std::env::var("PLOW_SLAB_KEEP").ok().as_deref() {
-        Some("1") => true,
-        Some("0") => false,
-        _ => SLAB_KEEP_DEFAULT.load(Ordering::Relaxed),
+    match crate::config::RuntimeConfig::env_bool("PLOW_SLAB_KEEP") {
+        Some(v) => v,
+        None => {
+            crate::config::RuntimeConfig::get().slab_keep
+                || SLAB_KEEP_DEFAULT.load(Ordering::Relaxed)
+        }
     }
 }
 
@@ -1149,15 +1158,14 @@ pub fn set_slab_keep_default(on: bool) {
     SLAB_KEEP_DEFAULT.store(on, Ordering::Relaxed);
 }
 
-/// `PLOW_KV_POOL_MIB` — cap (MiB) for the KV physical-block reuse pool the
-/// engines hand to [`VmmKv::enable_block_pool`]. Default 512; 0 disables
-/// pooling entirely (every zero-ref block released, pre-creator not spawned).
+/// `--kv-pool-mib` / `PLOW_KV_POOL_MIB` — cap (MiB) for the KV physical-block
+/// reuse pool the engines hand to [`VmmKv::enable_block_pool`]. Default 512;
+/// 0 disables pooling entirely (every zero-ref block released, pre-creator
+/// not spawned). Env read first so a mid-process flip in tests still lands;
+/// engine load is cold path.
 pub fn kv_pool_cap_from_env() -> u64 {
-    std::env::var("PLOW_KV_POOL_MIB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(512)
-        << 20
+    let cfg = crate::config::RuntimeConfig::get().kv_pool_mib;
+    crate::config::RuntimeConfig::env_parse_or::<u64>("PLOW_KV_POOL_MIB", cfg) << 20
 }
 
 /// Physical-commit chunk for [`VmmSlab`]-backed weight slabs. The CUDA driver

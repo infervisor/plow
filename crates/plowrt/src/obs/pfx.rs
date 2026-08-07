@@ -12,7 +12,11 @@ use std::sync::atomic::Ordering;
 
 pub use super::ttft::Phase;
 
-crate::env_flag!(pub fn on, "PLOW_PFX_LOG");
+/// Whether prefix-cache timing is active (`--pfx-log` / `PLOW_PFX_LOG=1`).
+/// Reads from [`RuntimeConfig::get`](crate::config::RuntimeConfig::get).
+pub fn on() -> bool {
+    crate::config::RuntimeConfig::get().pfx_log
+}
 
 pub static SNAP: Phase = Phase::new("prefix snapshot (dtod, per rank)");
 pub static RESTORE: Phase = Phase::new("prefix restore  (dtod, per rank)");

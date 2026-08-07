@@ -119,9 +119,9 @@ const K3_ELEM_PER_THREAD: u32 = 8;
 
 /// `PLOW_K3_WGFIT=0` restores the un-narrowed `(0..n_cu)` widths, so the control arm of an A/B
 /// comes out of the SAME `plowc` binary as the narrowed one. Same shape and same reason as GLM's
-/// [`crate::mla`] `PLOW_GLM_WGFIT`.
+/// Workgroup-fit: always enabled (hardcoded — was `PLOW_K3_WGFIT`, never disabled).
 pub(crate) fn k3_wgfit() -> bool {
-    std::env::var("PLOW_K3_WGFIT").ok().as_deref() != Some("0")
+    true
 }
 
 /// The workgroups a **row-partitioned norm** can actually use.
@@ -235,7 +235,7 @@ pub(crate) fn k3_rope_cus(cus: &[u32], start: usize, ntok: u32, nhead: u32) -> V
 /// emitting it would silently produce no q, kv, k_rope or gate at all. The LDS bound is kept because
 /// it is a real constraint, but `t == 1` is what makes the op safe.
 fn fuse_mla_a(t: u32, hidden: u32) -> bool {
-    if std::env::var("PLOW_K3_FUSE_A").ok().as_deref() != Some("1") {
+    if !crate::emit_config::active().k3_fuse_a {
         return false;
     }
     if t != 1 {
@@ -278,8 +278,9 @@ fn fuse_mla_a(t: u32, hidden: u32) -> bool {
 ///
 /// `PLOW_K3_FUSE_ARNORM=0` restores the two-packet form from the SAME binary, which is what makes
 /// the A/B a control rather than a rebuild.
+/// Always fuse attnres+norm (hardcoded — was `PLOW_K3_FUSE_ARNORM`, never disabled).
 pub(crate) fn fuse_attnres_norm() -> bool {
-    std::env::var("PLOW_K3_FUSE_ARNORM").ok().as_deref() != Some("0")
+    true
 }
 
 /// May the LatentMoE tail's residual add absorb the BLOCK-OUTPUT residual that follows it?
@@ -330,8 +331,9 @@ pub(crate) fn fuse_attnres_norm() -> bool {
 ///
 /// If someone retries it: the mix must write `prefix` as well as consuming it, or the block-output
 /// residual must take `prefix_in` and `attn` as separate addends.
+/// Always fuse block-residual (hardcoded — was `PLOW_K3_FUSE_BRESID`, never disabled).
 pub(crate) fn fuse_block_resid() -> bool {
-    std::env::var("PLOW_K3_FUSE_BRESID").ok().as_deref() != Some("0")
+    true
 }
 
 /// May the shared expert's `gate`, `up` and `SituGlu` collapse into one [`DevOp::GemvGlu`]?
@@ -343,9 +345,7 @@ pub(crate) fn fuse_block_resid() -> bool {
 ///
 /// `PLOW_K3_FUSE_SHGLU=0` restores the three-packet form from the same binary.
 fn fuse_shared_glu(t: u32, hidden: u32) -> bool {
-    if std::env::var("PLOW_K3_FUSE_SHGLU").ok().as_deref() == Some("0") {
-        return false;
-    }
+    // Hardcoded ON (was `PLOW_K3_FUSE_SHGLU`, never disabled in production).
     if t != 1 {
         return false;
     }
@@ -478,7 +478,7 @@ pub(crate) fn fuse_norm_gemv(t: u32, feat: u32, site: NormSite) -> bool {
     // DEFAULT OFF. Opt-in only, until the divergence in the header above is resolved — this
     // emitter's job is to not ship a fluent wrong model, and an unexplained 1-ULP drift through
     // 92 layers is exactly that risk. `=1` both sites, `=lat`/`=q` one site (for bisecting).
-    match std::env::var("PLOW_K3_FUSE_NGEMV").ok().as_deref() {
+    match crate::emit_config::active().k3_fuse_ngemv.as_deref() {
         Some("1") => {}
         Some("lat") if site == NormSite::Lat => {}
         Some("q") if site == NormSite::Q => {}
@@ -503,8 +503,9 @@ pub(crate) fn fuse_norm_gemv(t: u32, feat: u32, site: NormSite) -> bool {
 /// [`emit_k3_latent_moe`] sizes the GEMV and the gather — so it is one function and not two
 /// reads of the environment. A disagreement is not a crash: a full declaration with a sliced
 /// GEMV computes an eighth of the FFN and adds it to seven zeros.
+/// Always shard the up-projection under TP (hardcoded — was `PLOW_K3_SHARD_UP`, never disabled).
 pub(crate) fn shard_up_proj(tp: u32) -> bool {
-    tp > 1 && std::env::var("PLOW_K3_SHARD_UP").ok().as_deref() != Some("0")
+    tp > 1
 }
 
 /// BISECTION INSTRUMENTS for the column-parallel up projection. Neither is a serving mode.
@@ -532,10 +533,10 @@ pub(crate) fn shard_up_proj(tp: u32) -> bool {
 ///
 /// Neither knob is a serving mode. They exist because the alternative was guessing.
 fn up_nogather() -> bool {
-    std::env::var("PLOW_K3_UP_NOGATHER").ok().as_deref() == Some("1")
+    crate::emit_config::active().k3_up_nogather
 }
 fn up_gather_only() -> bool {
-    std::env::var("PLOW_K3_UP_GATHER_ONLY").ok().as_deref() == Some("1")
+    crate::emit_config::active().k3_up_gather_only
 }
 
 /// `PLOW_K3_SHARD_HEAD=1` — vocab-column-parallel `lm_head`, and this rank's slice of the vocab.
@@ -558,7 +559,7 @@ fn up_gather_only() -> bool {
 ///
 /// OFF by default until it has been measured on a real K3 load, the same standing GLM's arm had.
 fn k3_shard_head(c: &K3ModelCfg) -> bool {
-    let on = c.tp > 1 && std::env::var("PLOW_K3_SHARD_HEAD").ok().as_deref() == Some("1");
+    let on = c.tp > 1 && crate::emit_config::active().k3_shard_head;
     assert!(
         !on || c.vocab % c.tp == 0,
         "PLOW_K3_SHARD_HEAD needs vocab ({}) divisible by tp ({})",

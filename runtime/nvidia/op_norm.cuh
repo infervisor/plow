@@ -15,6 +15,7 @@
  */
 #pragma once
 #include "sm120_common.cuh"
+#include <cuda_fp8.h> /* __nv_fp8_e4m3 — the T11 fused activation quant */
 
 /* Elements one thread holds when the row fits in registers, as 16-byte vector loads.
  * RN_REG * 256 threads = 6144 covers every decode hidden the family uses: Qwen3 2560,
@@ -27,6 +28,11 @@
 #endif
 #define RN_VEC (RN_REG / 8)
 
+/* T17 warp-per-row cut-in (see the note on d_rmsnorm). Above the widest decode batch the
+ * emitter mints (`PLOW_DECODE_BATCH` 1..8, clamped to 16), below any prefill chunk — so the
+ * new reduction order applies to prefill only and batched decode stays byte-identical. */
+#define PLOW_NV_T17_MIN_ROWS 32u
+
 /* RMSNorm over `feat`. One block per row, strided by nblk.
  *
  * PRODUCER-THEN-CONSUMER is preserved from the AMD original and is not cosmetic: a decode
@@ -34,11 +40,84 @@
  * cost is pure load latency. Both x and gamma are issued before either is waited on — one
  * round trip, not two.
  *
- * i2=out_row0 offsets the OUTPUT row only (input stays at `base`); 0 on every Qwen path. */
+ * i2=out_row0 offsets the OUTPUT row only (input stays at `base`); 0 on every Qwen path.
+ *
+ * T17 WARP-PER-ROW (rows >= PLOW_NV_T17_MIN_ROWS && feat%8==0, i.e. every prefill chunk): the
+ * block-per-row body is LATENCY bound, not bandwidth bound — 15+ sequential rows per block,
+ * each paying two block_sum barriers (measured: the fat class runs ~16x under the HBM
+ * roofline). Eight rows in flight per block, warp reductions, zero barriers. The f32
+ * accumulation order changes (lane-strided vs thread-strided), so outputs can differ in the
+ * last bf16 ulp from the legacy body — DECODE keeps the legacy path and stays byte-identical.
+ *
+ * That last guarantee is why the threshold is NOT PLOW_NV_WARPS: `rows` is packet i[0], which
+ * decode sets to its batch width (`dbatch`), so a gate at 8 silently moved batched decode onto
+ * the new reduction order at the shipped PLOW_DECODE_BATCH=8. The threshold sits above the
+ * widest decode batch the emitter will mint (documented 1..8, clamped to 16) and far below any
+ * prefill chunk (smallest bucket T is hundreds of rows), so it partitions the two phases
+ * exactly.
+ *
+ * T11 w8a8 QUANT FUSION (t3=xq e4m3, t4=ascale f32[rows]; both null on legacy packets):
+ * the row is already normed in registers, so the per-row fp8 activation quant that would
+ * otherwise re-read it from HBM (a whole extra packet + gate) rides here. The quantized
+ * value is computed FROM THE bf16-ROUNDED output — exactly the value d_quant_fp8 would have
+ * read back — so fused and unfused paths are token-identical, not merely close. */
 static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ x,
                           const __nv_bfloat16* __restrict__ gamma, unsigned rows, unsigned feat,
                           float eps, unsigned out_row0, unsigned slice, unsigned nblk,
-                          float* part) {
+                          float* part, uint8_t* __restrict__ xq = nullptr,
+                          float* __restrict__ ascale = nullptr) {
+    if (rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
+        /* T17 warp-per-row (see header comment). Row set of this block is unchanged:
+         * {slice + k*nblk}; warp w takes k ≡ w (mod WARPS). */
+        const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+        const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+        for (unsigned k = warp;; k += PLOW_NV_WARPS) {
+            const unsigned row = slice + k * nblk;
+            if (row >= rows) break;
+            const size_t base = (size_t)row * feat;
+            const size_t obase = (size_t)(out_row0 + row) * feat;
+            float ss = 0.0f;
+            for (unsigned i = lane * 8u; i < feat; i += 256u) {
+                const bf16v8 v = ld_glob8(x + base + i);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float f = __bfloat162float(v.x[j]);
+                    ss += f * f;
+                }
+            }
+            const float inv =
+                rsqrtf(warp_sum32(ss) * __fdividef(1.0f, (float)feat) + eps);
+            float am = 0.0f;
+            for (unsigned i = lane * 8u; i < feat; i += 256u) {
+                const bf16v8 v = ld_glob8(x + base + i);
+                const bf16v8 w = gamma ? ld_glob8(gamma + i) : bf16v8_zero();
+                bf16v8 o;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float g = gamma ? __bfloat162float(w.x[j]) : 1.0f;
+                    o.x[j] = __float2bfloat16(__bfloat162float(v.x[j]) * inv * g);
+                    if (xq) am = fmaxf(am, fabsf(__bfloat162float(o.x[j])));
+                }
+                st_glob8(out + obase + i, o);
+            }
+            if (xq) {
+                const float as = fmaxf(warp_max32(am) * (1.0f / 448.0f), 1e-12f);
+                const float qinv = 1.0f / as;
+                if (lane == 0) ascale[out_row0 + row] = as;
+                for (unsigned i = lane * 8u; i < feat; i += 256u) {
+                    const bf16v8 o = ld_glob8(out + obase + i);
+                    uint8_t q8[8];
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        __nv_fp8_e4m3 q(__bfloat162float(o.x[j]) * qinv);
+                        q8[j] = *(const uint8_t*)&q;
+                    }
+                    *(uint2*)(xq + obase + i) = *(const uint2*)q8;
+                }
+            }
+        }
+        return;
+    }
     const bool fits = (feat <= RN_REG * PLOW_NV_THREADS) && ((feat & 7u) == 0);
     for (unsigned row = slice; row < rows; row += nblk) {
         const size_t base = (size_t)row * feat;
@@ -64,17 +143,51 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
                     ss += f * f;
                 }
             const float inv = rsqrtf(block_sum(ss, part) * __fdividef(1.0f, (float)feat) + eps);
+            if (!xq) {
 #pragma unroll
-            for (int c = 0; c < RN_VEC; c++) {
-                const unsigned i = (threadIdx.x + (unsigned)c * PLOW_NV_THREADS) * 8;
-                if (i < feat) {
-                    bf16v8 o;
+                for (int c = 0; c < RN_VEC; c++) {
+                    const unsigned i = (threadIdx.x + (unsigned)c * PLOW_NV_THREADS) * 8;
+                    if (i < feat) {
+                        bf16v8 o;
 #pragma unroll
-                    for (int j = 0; j < 8; j++) {
-                        const float g = gamma ? __bfloat162float(w[c].x[j]) : 1.0f;
-                        o.x[j] = __float2bfloat16(__bfloat162float(v[c].x[j]) * inv * g);
+                        for (int j = 0; j < 8; j++) {
+                            const float g = gamma ? __bfloat162float(w[c].x[j]) : 1.0f;
+                            o.x[j] = __float2bfloat16(__bfloat162float(v[c].x[j]) * inv * g);
+                        }
+                        st_glob8(out + obase + i, o);
                     }
-                    st_glob8(out + obase + i, o);
+                }
+            } else {
+                bf16v8 o[RN_VEC];
+                float am = 0.0f;
+#pragma unroll
+                for (int c = 0; c < RN_VEC; c++) {
+                    const unsigned i = (threadIdx.x + (unsigned)c * PLOW_NV_THREADS) * 8;
+                    if (i < feat) {
+#pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            const float g = gamma ? __bfloat162float(w[c].x[j]) : 1.0f;
+                            o[c].x[j] = __float2bfloat16(__bfloat162float(v[c].x[j]) * inv * g);
+                            am = fmaxf(am, fabsf(__bfloat162float(o[c].x[j])));
+                        }
+                        st_glob8(out + obase + i, o[c]);
+                    }
+                }
+                const float as = fmaxf(block_max(am, part) * (1.0f / 448.0f), 1e-12f);
+                const float qinv = 1.0f / as;
+                if (threadIdx.x == 0) ascale[out_row0 + row] = as;
+#pragma unroll
+                for (int c = 0; c < RN_VEC; c++) {
+                    const unsigned i = (threadIdx.x + (unsigned)c * PLOW_NV_THREADS) * 8;
+                    if (i < feat) {
+                        uint8_t q8[8];
+#pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            __nv_fp8_e4m3 q(__bfloat162float(o[c].x[j]) * qinv);
+                            q8[j] = *(const uint8_t*)&q;
+                        }
+                        *(uint2*)(xq + obase + i) = *(const uint2*)q8;
+                    }
                 }
             }
         } else {
@@ -84,9 +197,21 @@ static __device__ void d_rmsnorm(__nv_bfloat16* __restrict__ out, const __nv_bfl
                 ss += v * v;
             }
             const float inv = rsqrtf(block_sum(ss, part) * __fdividef(1.0f, (float)feat) + eps);
+            float am = 0.0f;
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
                 const float g = gamma ? __bfloat162float(gamma[i]) : 1.0f;
-                out[obase + i] = __float2bfloat16(__bfloat162float(x[base + i]) * inv * g);
+                const __nv_bfloat16 ob = __float2bfloat16(__bfloat162float(x[base + i]) * inv * g);
+                out[obase + i] = ob;
+                if (xq) am = fmaxf(am, fabsf(__bfloat162float(ob)));
+            }
+            if (xq) {
+                const float as = fmaxf(block_max(am, part) * (1.0f / 448.0f), 1e-12f);
+                const float qinv = 1.0f / as;
+                if (threadIdx.x == 0) ascale[out_row0 + row] = as;
+                for (unsigned i = threadIdx.x; i < feat; i += PLOW_NV_THREADS) {
+                    __nv_fp8_e4m3 q(__bfloat162float(out[obase + i]) * qinv);
+                    xq[obase + i] = *(const uint8_t*)&q;
+                }
             }
         }
     }
@@ -208,6 +333,41 @@ static __device__ void d_norm_residual(__nv_bfloat16* __restrict__ out, const __
                                 const __nv_bfloat16* __restrict__ gamma, unsigned rows,
                                 unsigned feat, float eps, float scale, unsigned slice,
                                 unsigned nblk, float* part) {
+    if (rows >= PLOW_NV_T17_MIN_ROWS && (feat & 7u) == 0) {
+        /* T17 warp-per-row — see d_rmsnorm. */
+        const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
+        const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
+        for (unsigned k = warp;; k += PLOW_NV_WARPS) {
+            const unsigned row = slice + k * nblk;
+            if (row >= rows) break;
+            const size_t base = (size_t)row * feat;
+            float ss = 0.0f;
+            for (unsigned i = lane * 8u; i < feat; i += 256u) {
+                const bf16v8 v = ld_glob8(b + base + i);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float f = __bfloat162float(v.x[j]);
+                    ss += f * f;
+                }
+            }
+            const float inv =
+                rsqrtf(warp_sum32(ss) * __fdividef(1.0f, (float)feat) + eps);
+            for (unsigned i = lane * 8u; i < feat; i += 256u) {
+                const bf16v8 v = ld_glob8(b + base + i);
+                const bf16v8 av = ld_glob8(a + base + i);
+                const bf16v8 w = gamma ? ld_glob8(gamma + i) : bf16v8_zero();
+                bf16v8 o;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const float g = gamma ? __bfloat162float(w.x[j]) : 1.0f;
+                    o.x[j] = __float2bfloat16(
+                        (__bfloat162float(av.x[j]) + __bfloat162float(v.x[j]) * inv * g) * scale);
+                }
+                st_glob8(out + base + i, o);
+            }
+        }
+        return;
+    }
     const bool fits = (feat <= RN_REG * PLOW_NV_THREADS) && ((feat & 7u) == 0);
     for (unsigned row = slice; row < rows; row += nblk) {
         const size_t base = (size_t)row * feat;

@@ -28,7 +28,9 @@
 //! requests for the same target coalesce); if eviction cannot make the target
 //! fit, the request is shed with [`EnsureError::WontFit`] (503 + Retry-After
 //! at the HTTP layer). A switch waits for the victim's in-flight generations
-//! to complete (mux drain) — S1 does not preempt.
+//! to complete (mux drain); with `PLOW_DRAIN_TIMEOUT_MS` set, a drain past
+//! the deadline preempts the victim's live generations instead
+//! (`FinishReason::Preempted`, queued jobs rejected with a retryable 429).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
@@ -426,7 +428,7 @@ impl ModelManager {
     /// the preload finishes — instead of paying the full 2 s-class switch.
     /// A no-op when nothing fits; `PLOW_PRELOAD=0` disables.
     fn maybe_preload(self: &Arc<Self>) {
-        if std::env::var("PLOW_PRELOAD").ok().as_deref() == Some("0") {
+        if !crate::config::RuntimeConfig::get().preload {
             return;
         }
         let mgr = Arc::clone(self);
@@ -576,11 +578,18 @@ impl ModelManager {
     }
 }
 
-/// `PLOW_DRAIN_TIMEOUT_MS`: how long an eviction lets in-flight generations
-/// finish before preempting them. Unset = graceful unbounded drain (the
-/// pre-existing behavior); read per-evict so an in-process flip is honored.
+/// `--drain-timeout-ms` / `PLOW_DRAIN_TIMEOUT_MS`: how long an eviction lets
+/// in-flight generations finish before preempting them. Unset = graceful
+/// unbounded drain (the pre-existing behavior). The env is read per-evict —
+/// BEFORE the cached config — because the preempt drill (`s1_switch_bench`
+/// phase 5) flips it mid-process; eviction is seconds-scale, so the extra
+/// env read costs nothing.
 fn drain_timeout_ms() -> Option<u64> {
-    std::env::var("PLOW_DRAIN_TIMEOUT_MS").ok()?.parse().ok()
+    let cfg = crate::config::RuntimeConfig::get().drain_timeout_ms;
+    match crate::config::RuntimeConfig::env_str_or("PLOW_DRAIN_TIMEOUT_MS", None) {
+        Some(v) => v.parse().ok(),
+        None => cfg,
+    }
 }
 
 /// Least-recently-used pick: the resident slug with the oldest (or absent)

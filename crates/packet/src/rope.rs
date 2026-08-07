@@ -127,6 +127,27 @@ pub const GEN_ROPE_SIN: u32 = 1;
 pub const GEN_ROPE_IDX_COS: u32 = 2;
 /// [`GenTensor::kind`]: DSA interleaved-indexer sine, from [`rope_tables_idx`].
 pub const GEN_ROPE_IDX_SIN: u32 = 3;
+/// [`GenTensor::kind`]: a 128-byte CUtensorMap over another tensor (sm_90a TMA prefill
+/// GEMM, `PLOW_NV_TMA_GEMM`). bf16, rank-2 K-major, 128B swizzle, box {64, `scale`} —
+/// the exact `tma_ws_gemm_bf16.cu` recipe. Field reuse: `ctx` = rows (globalDim[1]),
+/// `hd` = K elements (globalDim[0]), `aux` = TARGET tensor handle, `scale` = box rows.
+///
+/// Unlike the RoPE kinds this is NOT a pure host function of scalars: the blob carries a
+/// zero placeholder ([`GenTensor::generate`]) and the ENGINE re-encodes it in place once
+/// the target's device address exists (`exec/gpu.rs`, after the upload loop). An engine
+/// that only runs `generate()` (AMD) serves zeros — harmless, nothing dispatches TMA there.
+pub const GEN_TMAP_BF16: u32 = 4;
+/// [`GenTensor::kind`]: as [`GEN_TMAP_BF16`] but over an e4m3 (u8) K-major tensor —
+/// box {128, `scale`} so the inner box stays one 128-byte swizzle atom. Same placeholder
+/// contract; the engine encodes with `CU_TENSOR_MAP_DATA_TYPE_UINT8`.
+pub const GEN_TMAP_E4M3: u32 = 5;
+/// [`GenTensor::kind`]: a 256-byte K/V tensor-map PAIR for the flash-prefill TMA stager
+/// (K's rank-3 map at +0, V's at +128 — FLASH_PREFILL has ONE spare t[] slot, so the pair
+/// rides in one buffer). Each map: bf16, rank-3 {hd, ring_rows, n_kv_head}, 128B swizzle,
+/// box {64, BKV=32, 1}. Field reuse: `ctx` = ring rows, `hd` = head_dim, `aux` = K tensor
+/// handle, `scale` = V tensor handle, `frac` = n_kv_head (f64 carrying a small integer).
+/// Same zero-placeholder contract as the other TMAP kinds.
+pub const GEN_TMAP_KV_PAIR: u32 = 6;
 
 /// [`GenTensor::scale`]: no inv_freq rescaling (Gemma / Qwen / GLM).
 pub const ROPE_SCALE_NONE: u32 = 0;
@@ -168,10 +189,15 @@ pub struct GenTensor {
 const _: () = assert!(size_of::<GenTensor>() == 72);
 
 impl GenTensor {
-    /// Byte size of the table this recipe produces — `ctx` rows of `hd/2` f32.
+    /// Byte size of the table this recipe produces — `ctx` rows of `hd/2` f32 for the
+    /// RoPE kinds, a fixed 128-byte descriptor for [`GEN_TMAP_BF16`].
     /// Lets a caller declare the tensor without expanding it.
     pub fn byte_len(&self) -> u64 {
-        self.ctx as u64 * (self.hd as u64 / 2) * 4
+        match self.kind {
+            GEN_TMAP_BF16 | GEN_TMAP_E4M3 => 128,
+            GEN_TMAP_KV_PAIR => 256,
+            _ => self.ctx as u64 * (self.hd as u64 / 2) * 4,
+        }
     }
 
     /// Materialise this recipe's bytes. The result is bit-identical to what the
@@ -180,6 +206,15 @@ impl GenTensor {
     /// Returns `None` for an unknown `kind` — a blob from a newer compiler, which
     /// the caller must reject loudly rather than serve with a zeroed table.
     pub fn generate(&self) -> Option<Vec<u8>> {
+        // Placeholder, not the descriptor: encoding needs the target's DEVICE address
+        // (cuTensorMapEncodeTiled is host-driver work at bind time). The CUDA engine
+        // overwrites these bytes after the upload loop; see GEN_TMAP_BF16's doc.
+        if self.kind == GEN_TMAP_BF16 || self.kind == GEN_TMAP_E4M3 {
+            return Some(vec![0u8; 128]);
+        }
+        if self.kind == GEN_TMAP_KV_PAIR {
+            return Some(vec![0u8; 256]);
+        }
         let scale = match self.scale {
             ROPE_SCALE_LLAMA3 => RopeScale::Llama3 {
                 factor: self.factor,
@@ -237,6 +272,53 @@ impl GenTensor {
                 ..base
             },
         ]
+    }
+
+    /// The recipe for a [`GEN_TMAP_E4M3`] descriptor over `target`, a `[rows][k]` e4m3
+    /// K-major tensor.
+    pub fn tmap_e4m3(target: u32, rows: u32, k: u32, box_rows: u32) -> GenTensor {
+        GenTensor {
+            kind: GEN_TMAP_E4M3,
+            ..Self::tmap_bf16(target, rows, k, box_rows)
+        }
+    }
+
+    /// The recipe for a [`GEN_TMAP_KV_PAIR`]: rank-3 maps over the K and V cache tensors
+    /// (`[n_kv_head][ring_rows][hd]` bf16 each).
+    pub fn tmap_kv_pair(k_target: u32, v_target: u32, ring_rows: u32, hd: u32, n_kv_head: u32) -> GenTensor {
+        GenTensor {
+            tensor: 0,
+            kind: GEN_TMAP_KV_PAIR,
+            ctx: ring_rows,
+            hd,
+            aux: k_target,
+            scale: v_target,
+            theta: 0.0,
+            frac: n_kv_head as f64,
+            factor: 0.0,
+            low: 0.0,
+            high: 0.0,
+            orig: 0.0,
+        }
+    }
+
+    /// The recipe for a [`GEN_TMAP_BF16`] descriptor over `target`, a `[rows][k]` bf16
+    /// K-major tensor. `tensor` is left 0 — `Builder::tensor_gen` fills the real handle.
+    pub fn tmap_bf16(target: u32, rows: u32, k: u32, box_rows: u32) -> GenTensor {
+        GenTensor {
+            tensor: 0,
+            kind: GEN_TMAP_BF16,
+            ctx: rows,
+            hd: k,
+            aux: target,
+            scale: box_rows,
+            theta: 0.0,
+            frac: 0.0,
+            factor: 0.0,
+            low: 0.0,
+            high: 0.0,
+            orig: 0.0,
+        }
     }
 
     /// The `(cos, sin)` recipe pair for a [`rope_tables_idx`] table.
@@ -330,5 +412,16 @@ mod tests {
             ..Default::default()
         };
         assert!(g.generate().is_none());
+    }
+
+    #[test]
+    fn tmap_recipe_is_a_128_byte_placeholder() {
+        let g = GenTensor::tmap_bf16(7, 512, 3840, 128);
+        assert_eq!(g.byte_len(), 128);
+        assert_eq!((g.aux, g.ctx, g.hd, g.scale), (7, 512, 3840, 128));
+        // The placeholder must parse-pass everywhere (devblob.rs rejects None) but be
+        // all-zero: the ENGINE overwrites it at bind time, and a zero descriptor fed to
+        // TMA would fault rather than compute — never silently serve.
+        assert_eq!(g.generate().unwrap(), vec![0u8; 128]);
     }
 }

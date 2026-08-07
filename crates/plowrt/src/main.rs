@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
+use plowrt::config::RuntimeConfig;
 use plowrt::device::{self, Backend};
 use plowrt::exec::ExecutorSet;
 use plowrt::orch::Registry;
@@ -25,6 +26,11 @@ use plowrt::serve::{app, AppState};
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+
+    /// Runtime configuration knobs (memory, scheduling, backend-specific).
+    /// Each field also reads its `PLOW_*` env var as a fallback.
+    #[command(flatten)]
+    rt_cfg: RuntimeConfig,
 }
 
 #[derive(Subcommand)]
@@ -262,6 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let cli = Cli::parse();
+    RuntimeConfig::init(cli.rt_cfg);
     match cli.cmd {
         Cmd::Serve {
             assets,
@@ -1626,10 +1633,10 @@ async fn serve(
     // VRAM footprint from the blob header, loads the registration-order
     // subset that fits (co-residency), and switches the rest on demand
     // (evict-LRU + load) from the request path. Checkpoint dir is
-    // `<assets>/checkpoint` (PLOW_CHECKPOINT overrides); the initial loads
-    // are the slow part of startup (a 12B checkpoint is ~22 GiB of H2D),
-    // done before the listeners open. `PLOW_VRAM_BUDGET_MIB` caps the
-    // planner's view of the card (A/B, tests).
+    // `<assets>/checkpoint` (`--rt-checkpoint` / PLOW_CHECKPOINT overrides);
+    // the initial loads are the slow part of startup (a 12B checkpoint is
+    // ~22 GiB of H2D), done before the listeners open. `--vram-budget-mib` /
+    // `PLOW_VRAM_BUDGET_MIB` caps the planner's view of the card (A/B, tests).
     #[cfg(feature = "cuda")]
     let mut managed_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
     #[cfg(feature = "cuda")]
@@ -1641,19 +1648,18 @@ async fn serve(
             if plowrt::asset::devblob::DevBlob::find_in_dir(&bundle.dir)?.is_none() {
                 continue;
             }
-            let ckpt = std::env::var("PLOW_CHECKPOINT")
+            let ckpt = RuntimeConfig::get()
+                .checkpoint
+                .clone()
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| bundle.dir.join("checkpoint"));
+                .unwrap_or_else(|| bundle.dir.join("checkpoint"));
             managed_slugs.insert(slug.clone());
             models.push((slug, bundle.dir.clone(), ckpt));
         }
         // Keep CLI registration order (registry iteration is hash-order).
         models.sort_by_key(|(_, dir, _)| assets.iter().position(|a| a == dir));
         if !models.is_empty() {
-            let budget = std::env::var("PLOW_VRAM_BUDGET_MIB")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|mib| mib << 20);
+            let budget = RuntimeConfig::get().nv.vram_budget_mib.map(|mib| mib << 20);
             let mgr = Arc::new(plowrt::serve::manager::ModelManager::new(
                 Arc::clone(cuda),
                 &state,
@@ -1675,7 +1681,8 @@ async fn serve(
     //
     // A bundle qualifies exactly as on the CUDA side: its assets dir carries a
     // PLOWDEV blob. It additionally needs the gfx950 code objects, whose dir is
-    // `PLOW_HSACO` or `<assets>/hsaco`; the TP degree is read off the packet.
+    // `--hsaco` / `PLOW_HSACO` or `<assets>/hsaco`; the TP degree is read off
+    // the packet.
     #[cfg(feature = "hsa")]
     if vendor == Some(hwspec::Vendor::Amd) {
         let slugs: Vec<String> = state.registry.slugs().map(str::to_string).collect();
@@ -1695,12 +1702,17 @@ async fn serve(
                 )
                 .into());
             }
-            let hsaco = std::env::var("PLOW_HSACO")
+            let hsaco = RuntimeConfig::get()
+                .amd
+                .hsaco
+                .clone()
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| bundle.dir.join("hsaco"));
-            let ckpt = std::env::var("PLOW_CHECKPOINT")
+                .unwrap_or_else(|| bundle.dir.join("hsaco"));
+            let ckpt = RuntimeConfig::get()
+                .checkpoint
+                .clone()
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| bundle.dir.join("checkpoint"));
+                .unwrap_or_else(|| bundle.dir.join("checkpoint"));
             tracing::info!(
                 %slug, blob = %blob.display(), hsaco = %hsaco.display(),
                 checkpoint = %ckpt.display(), "loading AMD engine"

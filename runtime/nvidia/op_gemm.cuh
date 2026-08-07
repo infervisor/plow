@@ -1638,25 +1638,77 @@ static __device__ void d_gemm_glu_w8a8(__nv_bfloat16* __restrict__ C, const uint
  * sliced across nblk blocks; a block takes PLOW_NV_WARPS rows at a time. bf16 in, e4m3 out, f32 scale.
  * The device round-to-nearest e4m3 is the SAME rounding the offline quantizer uses, so the oracle's
  * dequantized-f32 reference sees identical activation values (isolates the mma from the quant error). */
-static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, const __nv_bfloat16* __restrict__ x,
+/* T11 GLU FUSION (t3=gate, t4=up, i2=act; both null on legacy packets): when `gate` is set,
+ * `x` is an OUTPUT — the warp computes fu = act(gate)*up inline (bf16-rounded, exactly what
+ * the separate Glu packet would have written), stores it, and quantizes from the rounded
+ * value, deleting the Glu packet + its gate + the full inter-width fu re-read per layer. */
+static __device__ void d_quant_fp8(uint8_t* __restrict__ xq, __nv_bfloat16* __restrict__ x,
                             float* __restrict__ ascale, unsigned M, unsigned K, unsigned slice,
-                            unsigned nblk) {
+                            unsigned nblk, const __nv_bfloat16* __restrict__ gate = nullptr,
+                            const __nv_bfloat16* __restrict__ up = nullptr, unsigned act = 0) {
     const unsigned lane = threadIdx.x & PLOW_NV_LANE_MASK;
     const unsigned warp = threadIdx.x >> PLOW_NV_WARP_SHIFT;
     const unsigned per = (M + nblk - 1) / nblk;
     const unsigned m0 = slice * per;
     const unsigned m1 = (m0 + per < M) ? (m0 + per) : M;
+    const bool v8 = (K & 7u) == 0; /* every emitted K (hidden/q_dim/inter) is 8-aligned */
     for (unsigned mm = m0 + warp; mm < m1; mm += PLOW_NV_WARPS) {
         const size_t row = (size_t)mm * K;
         float amax = 0.0f;
-        for (unsigned kk = lane; kk < K; kk += 32u) amax = fmaxf(amax, fabsf(__bfloat162float(x[row + kk])));
+        if (gate) {
+            if (v8) {
+                for (unsigned kk = lane * 8u; kk < K; kk += 256u) {
+                    const bf16v8 vg = ld_glob8(gate + row + kk), vu = ld_glob8(up + row + kk);
+                    bf16v8 vo;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const float g = __bfloat162float(vg.x[j]);
+                        const float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+                        vo.x[j] = __float2bfloat16(a * __bfloat162float(vu.x[j]));
+                        amax = fmaxf(amax, fabsf(__bfloat162float(vo.x[j])));
+                    }
+                    st_glob8(x + row + kk, vo);
+                }
+            } else {
+                for (unsigned kk = lane; kk < K; kk += 32u) {
+                    const float g = __bfloat162float(gate[row + kk]);
+                    const float a = (act == PLOW_ACT_SILU_) ? act_silu(g) : act_gelu_tanh(g);
+                    const __nv_bfloat16 fb = __float2bfloat16(a * __bfloat162float(up[row + kk]));
+                    x[row + kk] = fb;
+                    amax = fmaxf(amax, fabsf(__bfloat162float(fb)));
+                }
+            }
+        } else if (v8) {
+            for (unsigned kk = lane * 8u; kk < K; kk += 256u) {
+                const bf16v8 v = ld_glob8(x + row + kk);
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                    amax = fmaxf(amax, fabsf(__bfloat162float(v.x[j])));
+            }
+        } else {
+            for (unsigned kk = lane; kk < K; kk += 32u)
+                amax = fmaxf(amax, fabsf(__bfloat162float(x[row + kk])));
+        }
         amax = warp_max32(amax);
         const float as = fmaxf(amax * (1.0f / 448.0f), 1e-12f);
         const float inv = 1.0f / as;
         if (lane == 0) ascale[mm] = as;
-        for (unsigned kk = lane; kk < K; kk += 32u) {
-            __nv_fp8_e4m3 q(__bfloat162float(x[row + kk]) * inv);
-            xq[row + kk] = *(const uint8_t*)&q;
+        if (v8) {
+            for (unsigned kk = lane * 8u; kk < K; kk += 256u) {
+                const bf16v8 v = ld_glob8(x + row + kk);
+                uint8_t q8[8];
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    __nv_fp8_e4m3 q(__bfloat162float(v.x[j]) * inv);
+                    q8[j] = *(const uint8_t*)&q;
+                }
+                *(uint2*)(xq + row + kk) = *(const uint2*)q8;
+            }
+        } else {
+            for (unsigned kk = lane; kk < K; kk += 32u) {
+                __nv_fp8_e4m3 q(__bfloat162float(x[row + kk]) * inv);
+                xq[row + kk] = *(const uint8_t*)&q;
+            }
         }
     }
 }

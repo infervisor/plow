@@ -22,6 +22,7 @@
 
 pub mod analysis;
 pub mod asset;
+pub mod config;
 pub mod device;
 pub mod disasm;
 pub mod exec;
@@ -34,7 +35,7 @@ pub mod sim;
 pub mod text;
 
 mod error;
-pub use error::{Result, RuntimeError};
+pub use error::{DeviceErrorInfo, Result, RuntimeError};
 
 /// Declare a cached environment-variable boolean flag. The first call reads
 /// `std::env::var(VAR)` and caches the result in a `OnceLock`; subsequent calls
@@ -44,6 +45,7 @@ pub use error::{Result, RuntimeError};
 /// env_flag!(fn my_flag, "PLOW_MY_FLAG");
 /// if my_flag() { … }
 /// ```
+#[allow(unused_macros)]
 macro_rules! env_flag {
     // Explicit visibility: env_flag!(pub fn x, ..) / env_flag!(pub(crate) fn x, ..).
     (pub $(($vis:tt))? fn $name:ident, $var:expr) => {
@@ -65,6 +67,7 @@ macro_rules! env_flag {
         }
     };
 }
+#[allow(unused_imports)]
 pub(crate) use env_flag;
 
 /// Declare a cached environment-variable `usize` knob — the numeric sibling of

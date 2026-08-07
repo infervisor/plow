@@ -45,11 +45,92 @@ use std::sync::Arc;
 use crate::device::{
     Backend, DeviceFree, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg, Module, PeerMemory,
 };
-use crate::{Result, RuntimeError};
+use crate::{DeviceErrorInfo, Result, RuntimeError};
 
 // ─── HSA ABI constants ───────────────────────────────────────────────────────
 
 const HSA_STATUS_SUCCESS: i32 = 0;
+
+/// The `hsa_status_t` name for `rc` (hsa.h / hsa_ext_amd.h). A static table
+/// rather than `hsa_status_string`: fault construction must work even when the
+/// runtime itself is wedged, and the enum values are stable ABI.
+fn hsa_status_name(rc: i32) -> &'static str {
+    match rc {
+        0x0 => "HSA_STATUS_SUCCESS",
+        0x1 => "HSA_STATUS_INFO_BREAK",
+        0x1000 => "HSA_STATUS_ERROR",
+        0x1001 => "HSA_STATUS_ERROR_INVALID_ARGUMENT",
+        0x1002 => "HSA_STATUS_ERROR_INVALID_QUEUE_CREATION",
+        0x1003 => "HSA_STATUS_ERROR_INVALID_ALLOCATION",
+        0x1004 => "HSA_STATUS_ERROR_INVALID_AGENT",
+        0x1005 => "HSA_STATUS_ERROR_INVALID_REGION",
+        0x1006 => "HSA_STATUS_ERROR_INVALID_SIGNAL",
+        0x1007 => "HSA_STATUS_ERROR_INVALID_QUEUE",
+        0x1008 => "HSA_STATUS_ERROR_OUT_OF_RESOURCES",
+        0x1009 => "HSA_STATUS_ERROR_INVALID_PACKET_FORMAT",
+        0x100A => "HSA_STATUS_ERROR_RESOURCE_FREE",
+        0x100B => "HSA_STATUS_ERROR_NOT_INITIALIZED",
+        0x100C => "HSA_STATUS_ERROR_REFCOUNT_OVERFLOW",
+        0x100D => "HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS",
+        0x100E => "HSA_STATUS_ERROR_INVALID_INDEX",
+        0x100F => "HSA_STATUS_ERROR_INVALID_ISA",
+        0x1010 => "HSA_STATUS_ERROR_INVALID_CODE_OBJECT",
+        0x1011 => "HSA_STATUS_ERROR_INVALID_EXECUTABLE",
+        0x1012 => "HSA_STATUS_ERROR_FROZEN_EXECUTABLE",
+        0x1013 => "HSA_STATUS_ERROR_INVALID_SYMBOL_NAME",
+        0x1014 => "HSA_STATUS_ERROR_VARIABLE_ALREADY_DEFINED",
+        0x1015 => "HSA_STATUS_ERROR_VARIABLE_UNDEFINED",
+        0x1016 => "HSA_STATUS_ERROR_EXCEPTION",
+        0x1017 => "HSA_STATUS_ERROR_INVALID_ISA_NAME",
+        0x1018 => "HSA_STATUS_ERROR_INVALID_CODE_SYMBOL",
+        0x1019 => "HSA_STATUS_ERROR_INVALID_EXECUTABLE_SYMBOL",
+        0x101A => "HSA_STATUS_ERROR_INVALID_FILE",
+        0x101B => "HSA_STATUS_ERROR_INVALID_CODE_OBJECT_READER",
+        0x101C => "HSA_STATUS_ERROR_INVALID_CACHE",
+        0x101D => "HSA_STATUS_ERROR_INVALID_WAVEFRONT",
+        0x101E => "HSA_STATUS_ERROR_INVALID_SIGNAL_GROUP",
+        0x101F => "HSA_STATUS_ERROR_INVALID_RUNTIME_STATE",
+        0x1020 => "HSA_STATUS_ERROR_FATAL",
+        // AMD extension (hsa_ext_amd.h).
+        40 => "HSA_STATUS_ERROR_INVALID_MEMORY_POOL",
+        41 => "HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION",
+        42 => "HSA_STATUS_ERROR_ILLEGAL_INSTRUCTION",
+        43 => "HSA_STATUS_ERROR_MEMORY_FAULT",
+        44 => "HSA_STATUS_CU_MASK_REDUCED",
+        45 => "HSA_STATUS_ERROR_OUT_OF_REGISTERS",
+        _ => "HSA_STATUS_UNKNOWN",
+    }
+}
+
+/// Does this `hsa_status_t` mean the agent/queue is permanently poisoned?
+/// The AMD-extension trap statuses (a kernel faulted — the queue is dead) plus
+/// the core EXCEPTION/FATAL pair. Deliberately NOT here: OUT_OF_RESOURCES
+/// (0x1008, transient alloc failure — the CUDA-OOM analogue) and every
+/// INVALID_* argument/handle status (a bad call, not a dead device).
+fn is_hsa_fatal(rc: i32) -> bool {
+    matches!(
+        rc,
+        41       // MEMORY_APERTURE_VIOLATION
+        | 42     // ILLEGAL_INSTRUCTION
+        | 43     // MEMORY_FAULT
+        | 0x1016 // EXCEPTION — a trapped kernel
+        | 0x1020 // FATAL
+    )
+}
+
+/// Build the typed fault for a failed ROCr call. Free-standing for bring-up
+/// sites (`new()`, `find_pool`, the upload ring) that have no backend yet;
+/// [`HsaBackend::fault`] wraps it with poison marking.
+fn hsa_fault(rc: i32, what: &str) -> RuntimeError {
+    RuntimeError::DeviceFault {
+        info: DeviceErrorInfo {
+            operation: what.to_string(),
+            code: rc,
+            name: hsa_status_name(rc).to_string(),
+            fatal: is_hsa_fatal(rc),
+        },
+    }
+}
 
 // hsa_device_type_t
 const HSA_DEVICE_TYPE_CPU: u32 = 0;
@@ -598,6 +679,14 @@ pub struct HsaBackend {
     /// `CudaBackend::slab_pool`. Device-local by construction (one backend per
     /// agent, chunks created against this agent's `vram_pool`).
     slab_pool: parking_lot::Mutex<Vec<(u64, u64)>>,
+    /// Set once, on the first fatal ROCr status ([`is_hsa_fatal`]): the fault
+    /// that killed the agent/queue. When set, [`HsaBackend::guard`]
+    /// short-circuits every driver-touching entry point with a clone BEFORE
+    /// touching the runtime — the CUDA `bind()` gate's counterpart, and here
+    /// it also keeps [`HsaBackend::synchronize`]'s spin loop from hanging on
+    /// a queue that will never advance. Teardown paths (Drop impls,
+    /// `DeviceFree`) don't guard and still attempt their calls.
+    poisoned: std::sync::OnceLock<DeviceErrorInfo>,
 }
 
 /// Preallocated fill source: `len` bytes of fine-grained memory already set to
@@ -633,7 +722,7 @@ impl HsaBackend {
         // hsa_init
         let rc = unsafe { (drv.hsa_init)() };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!("hsa_init failed: {rc}")));
+            return Err(hsa_fault(rc, "hsa_init"));
         }
 
         // Discover agents.
@@ -646,7 +735,7 @@ impl HsaBackend {
             (drv.hsa_iterate_agents)(agent_trampoline, &mut acc as *mut _ as *mut c_void)
         };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!("hsa_iterate_agents: {rc}")));
+            return Err(hsa_fault(rc, "hsa_iterate_agents"));
         }
         if acc.gpus.is_empty() {
             return Err(RuntimeError::Device("no GPU agents found".into()));
@@ -759,7 +848,7 @@ impl HsaBackend {
             )
         };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!("hsa_queue_create: {rc}")));
+            return Err(hsa_fault(rc, "hsa_queue_create"));
         }
 
         // Create completion signal.
@@ -769,7 +858,7 @@ impl HsaBackend {
             unsafe {
                 (drv.hsa_queue_destroy)(queue);
             }
-            return Err(RuntimeError::Device(format!("hsa_signal_create: {rc}")));
+            return Err(hsa_fault(rc, "hsa_signal_create"));
         }
 
         // Allocate kernarg ring.
@@ -783,7 +872,7 @@ impl HsaBackend {
                 (drv.hsa_signal_destroy)(done_signal);
                 (drv.hsa_queue_destroy)(queue);
             }
-            return Err(RuntimeError::Device(format!("kernarg ring alloc: {rc}")));
+            return Err(hsa_fault(rc, "kernarg ring alloc"));
         }
         // Allow GPU agent access to the kernarg ring.
         let rc =
@@ -794,7 +883,7 @@ impl HsaBackend {
                 (drv.hsa_signal_destroy)(done_signal);
                 (drv.hsa_queue_destroy)(queue);
             }
-            return Err(RuntimeError::Device(format!("kernarg allow_access: {rc}")));
+            return Err(hsa_fault(rc, "kernarg allow_access"));
         }
 
         let shared = Arc::new(SharedDriver { drv });
@@ -827,7 +916,59 @@ impl HsaBackend {
             peer_host_writable: std::sync::atomic::AtomicBool::new(false),
             fill_stage: parking_lot::Mutex::new(None),
             slab_pool: parking_lot::Mutex::new(Vec::new()),
+            poisoned: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Map a non-success `hsa_status_t` to a typed error, classifying it
+    /// ([`is_hsa_fatal`]) and poisoning the backend on a fatal status — the
+    /// ROCr counterpart of `CudaBackend::check`.
+    fn check(&self, rc: i32, what: &str) -> Result<()> {
+        if rc == HSA_STATUS_SUCCESS {
+            return Ok(());
+        }
+        Err(self.fault(rc, what))
+    }
+
+    /// [`HsaBackend::check`]'s error-building half, for sites that must run
+    /// cleanup between the failing call and the `return Err`.
+    fn fault(&self, rc: i32, what: &str) -> RuntimeError {
+        let err = hsa_fault(rc, what);
+        if let Some(info) = err.device_fault() {
+            if info.fatal {
+                self.mark_poisoned(info);
+            }
+        }
+        err
+    }
+
+    /// Has a fatal ROCr status permanently poisoned this agent?
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.get().is_some()
+    }
+
+    /// Record the fault that killed the agent. Logs `error!` exactly once —
+    /// every later entry point is short-circuited by `guard`, not re-logged.
+    fn mark_poisoned(&self, info: &DeviceErrorInfo) {
+        if self.poisoned.set(info.clone()).is_ok() {
+            tracing::error!(
+                error_op = %info.operation,
+                error_code = info.code,
+                error_name = %info.name,
+                device = self.device_ordinal,
+                "HSA agent poisoned — rejecting further work on this device"
+            );
+        }
+    }
+
+    /// Short-circuit with the recorded fault when the backend is poisoned —
+    /// called at the top of every driver-touching entry point, BEFORE any
+    /// runtime call (the counterpart of the CUDA `bind()` gate).
+    fn guard(&self) -> Result<()> {
+        match self.poisoned.get() {
+            Some(info) => Err(RuntimeError::DeviceFault { info: info.clone() }),
+            None => Ok(()),
+        }
     }
 
     fn find_pool(drv: &HsaDriver, agent: HsaAgent, want_flag: u32) -> Result<HsaMemoryPool> {
@@ -844,9 +985,7 @@ impl HsaBackend {
             )
         };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_agent_iterate_memory_pools: {rc}"
-            )));
+            return Err(hsa_fault(rc, "hsa_amd_agent_iterate_memory_pools"));
         }
         acc.result.ok_or_else(|| {
             RuntimeError::Device(format!("no memory pool with flag 0x{:x}", want_flag))
@@ -921,6 +1060,7 @@ impl Backend for HsaBackend {
     }
 
     fn alloc(&self, _device: u8, bytes: u64) -> Result<DeviceMem> {
+        self.guard()?;
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_pool_allocate)(
@@ -930,12 +1070,7 @@ impl Backend for HsaBackend {
                 &mut ptr,
             )
         };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_memory_pool_allocate({} bytes): {rc}",
-                bytes
-            )));
-        }
+        self.check(rc, &format!("hsa_amd_memory_pool_allocate({bytes} bytes)"))?;
         let free = Arc::new(HsaFree {
             shared: self.shared.clone(),
         });
@@ -946,6 +1081,7 @@ impl Backend for HsaBackend {
         if src.is_empty() {
             return Ok(());
         }
+        self.guard()?;
         let dst_ptr = (dst.base + off) as *mut c_void;
         // Pin the source host pages so the SDMA engine can read them.
         let mut pinned: *mut c_void = std::ptr::null_mut();
@@ -958,11 +1094,7 @@ impl Backend for HsaBackend {
                 &mut pinned,
             )
         };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_memory_lock (upload): {rc}"
-            )));
-        }
+        self.check(rc, "hsa_amd_memory_lock (upload)")?;
         // Async copy with a one-shot signal for synchronization.
         let mut sig = HsaSignal { handle: 0 };
         let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
@@ -970,9 +1102,7 @@ impl Backend for HsaBackend {
             unsafe {
                 (self.shared.drv.hsa_amd_memory_unlock)(src.as_ptr() as *mut c_void);
             }
-            return Err(RuntimeError::Device(format!(
-                "hsa_signal_create (upload): {rc}"
-            )));
+            return Err(self.fault(rc, "hsa_signal_create (upload)"));
         }
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_async_copy)(
@@ -991,9 +1121,7 @@ impl Backend for HsaBackend {
                 (self.shared.drv.hsa_signal_destroy)(sig);
                 (self.shared.drv.hsa_amd_memory_unlock)(src.as_ptr() as *mut c_void);
             }
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_memory_async_copy (H2D): {rc}"
-            )));
+            return Err(self.fault(rc, "hsa_amd_memory_async_copy (H2D)"));
         }
         // Wait for completion.
         unsafe {
@@ -1014,6 +1142,7 @@ impl Backend for HsaBackend {
         if dst.is_empty() {
             return Ok(());
         }
+        self.guard()?;
         let src_ptr = (src.base + off) as *const c_void;
         // Pin the destination host pages.
         let mut pinned: *mut c_void = std::ptr::null_mut();
@@ -1026,20 +1155,14 @@ impl Backend for HsaBackend {
                 &mut pinned,
             )
         };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_memory_lock (download): {rc}"
-            )));
-        }
+        self.check(rc, "hsa_amd_memory_lock (download)")?;
         let mut sig = HsaSignal { handle: 0 };
         let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
         if rc != HSA_STATUS_SUCCESS {
             unsafe {
                 (self.shared.drv.hsa_amd_memory_unlock)(dst.as_mut_ptr() as *mut c_void);
             }
-            return Err(RuntimeError::Device(format!(
-                "hsa_signal_create (download): {rc}"
-            )));
+            return Err(self.fault(rc, "hsa_signal_create (download)"));
         }
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_async_copy)(
@@ -1058,9 +1181,7 @@ impl Backend for HsaBackend {
                 (self.shared.drv.hsa_signal_destroy)(sig);
                 (self.shared.drv.hsa_amd_memory_unlock)(dst.as_mut_ptr() as *mut c_void);
             }
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_memory_async_copy (D2H): {rc}"
-            )));
+            return Err(self.fault(rc, "hsa_amd_memory_async_copy (D2H)"));
         }
         unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
@@ -1077,6 +1198,7 @@ impl Backend for HsaBackend {
     }
 
     fn module_load(&self, image: &[u8]) -> Result<Module> {
+        self.guard()?;
         // Create a code-object reader from the in-memory ELF.
         let mut reader = HsaCodeObjectReader { handle: 0 };
         let rc = unsafe {
@@ -1086,11 +1208,7 @@ impl Backend for HsaBackend {
                 &mut reader,
             )
         };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_code_object_reader_create: {rc}"
-            )));
-        }
+        self.check(rc, "hsa_code_object_reader_create")?;
 
         // Create executable.
         let mut exe = HsaExecutable { handle: 0 };
@@ -1106,9 +1224,7 @@ impl Backend for HsaBackend {
             unsafe {
                 (self.shared.drv.hsa_code_object_reader_destroy)(reader);
             }
-            return Err(RuntimeError::Device(format!(
-                "hsa_executable_create_alt: {rc}"
-            )));
+            return Err(self.fault(rc, "hsa_executable_create_alt"));
         }
 
         // Load the code object for this agent.
@@ -1126,9 +1242,10 @@ impl Backend for HsaBackend {
                 (self.shared.drv.hsa_executable_destroy)(exe);
                 (self.shared.drv.hsa_code_object_reader_destroy)(reader);
             }
-            return Err(RuntimeError::Device(format!(
-                "hsa_executable_load_agent_code_object: {rc} (raw ELF expected — did you unbundle?)"
-            )));
+            return Err(self.fault(
+                rc,
+                "hsa_executable_load_agent_code_object (raw ELF expected — did you unbundle?)",
+            ));
         }
 
         // Freeze.
@@ -1138,7 +1255,7 @@ impl Backend for HsaBackend {
                 (self.shared.drv.hsa_executable_destroy)(exe);
                 (self.shared.drv.hsa_code_object_reader_destroy)(reader);
             }
-            return Err(RuntimeError::Device(format!("hsa_executable_freeze: {rc}")));
+            return Err(self.fault(rc, "hsa_executable_freeze"));
         }
 
         unsafe {
@@ -1173,6 +1290,7 @@ impl Backend for HsaBackend {
     }
 
     fn alloc_counter_region(&self, count: usize) -> Result<DeviceMem> {
+        self.guard()?;
         // Counter region lives in fine-grained system memory (host-visible AND
         // device-accessible) so both SM/CU atomics and host polls hit the same cells.
         let bytes = (count * crate::exec::counters::CELL_STRIDE) as u64;
@@ -1186,10 +1304,10 @@ impl Backend for HsaBackend {
             )
         };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "counter region alloc (fine-grained, {} bytes): {rc}",
-                bytes
-            )));
+            return Err(self.fault(
+                rc,
+                &format!("counter region alloc (fine-grained, {bytes} bytes)"),
+            ));
         }
         // Allow GPU agent access.
         let rc = unsafe {
@@ -1199,9 +1317,7 @@ impl Backend for HsaBackend {
             unsafe {
                 (self.shared.drv.hsa_amd_memory_pool_free)(ptr);
             }
-            return Err(RuntimeError::Device(format!(
-                "counter region allow_access: {rc}"
-            )));
+            return Err(self.fault(rc, "counter region allow_access"));
         }
         // Fine-grained system memory: the host pointer IS the device pointer
         // (unified address space on MI300+). Return as an owned DeviceMem so
@@ -1426,6 +1542,7 @@ impl PeerMemory for HsaBackend {
     }
 
     fn alloc_peer(&self, bytes: u64, peers: &[u8]) -> Result<DeviceMem> {
+        self.guard()?;
         // Resolve the allow-list BEFORE allocating: a bad ordinal here would
         // otherwise leak a VRAM allocation on the error path.
         if !peers.contains(&self.device_ordinal) {
@@ -1459,10 +1576,10 @@ impl PeerMemory for HsaBackend {
             )
         };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "peer alloc ({bytes} bytes on dev {}): {rc}",
-                self.device_ordinal
-            )));
+            return Err(self.fault(
+                rc,
+                &format!("peer alloc ({bytes} bytes on dev {})", self.device_ordinal),
+            ));
         }
 
         // ONE call naming EVERY agent in the replica. This REPLACES the
@@ -1502,10 +1619,13 @@ impl PeerMemory for HsaBackend {
         };
         if rc != HSA_STATUS_SUCCESS {
             unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_agents_allow_access({} agents, peer buffer): {rc}",
-                allow.len()
-            )));
+            return Err(self.fault(
+                rc,
+                &format!(
+                    "hsa_amd_agents_allow_access({} agents, peer buffer)",
+                    allow.len()
+                ),
+            ));
         }
 
         let free = Arc::new(HsaFree {
@@ -1528,6 +1648,7 @@ impl PeerMemory for HsaBackend {
         if bytes == 0 {
             return Ok(());
         }
+        self.guard()?;
         let mut guard = self.zero_stage.lock();
         if guard.as_ref().is_none_or(|s| (s.len as u64) < bytes) {
             if let Some(old) = guard.take() {
@@ -1546,14 +1667,14 @@ impl PeerMemory for HsaBackend {
                 )
             };
             if rc != HSA_STATUS_SUCCESS {
-                return Err(RuntimeError::Device(format!("zero stage alloc: {rc}")));
+                return Err(self.fault(rc, "zero stage alloc"));
             }
             let rc = unsafe {
                 (self.shared.drv.hsa_amd_agents_allow_access)(1, &self.agent, std::ptr::null(), ptr)
             };
             if rc != HSA_STATUS_SUCCESS {
                 unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
-                return Err(RuntimeError::Device(format!("zero stage access: {rc}")));
+                return Err(self.fault(rc, "zero stage access"));
             }
             unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, bytes as usize) };
             let mut sig = HsaSignal { handle: 0 };
@@ -1561,7 +1682,7 @@ impl PeerMemory for HsaBackend {
                 unsafe { (self.shared.drv.hsa_signal_create)(0, 0, std::ptr::null(), &mut sig) };
             if rc != HSA_STATUS_SUCCESS {
                 unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
-                return Err(RuntimeError::Device(format!("zero stage signal: {rc}")));
+                return Err(self.fault(rc, "zero stage signal"));
             }
             *guard = Some(ZeroStage {
                 ptr,
@@ -1588,10 +1709,13 @@ impl PeerMemory for HsaBackend {
             )
         };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "zero_peer async_copy ({bytes} B on dev {}): {rc}",
-                self.device_ordinal
-            )));
+            return Err(self.fault(
+                rc,
+                &format!(
+                    "zero_peer async_copy ({bytes} B on dev {})",
+                    self.device_ordinal
+                ),
+            ));
         }
         unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
@@ -1609,6 +1733,7 @@ impl PeerMemory for HsaBackend {
         if bytes == 0 {
             return Ok(());
         }
+        self.guard()?;
         let dst_agent = *self.agents.get(dst_ordinal as usize).ok_or_else(|| {
             RuntimeError::Device(format!(
                 "peer ordinal {dst_ordinal} >= {} GPU agents",
@@ -1618,11 +1743,7 @@ impl PeerMemory for HsaBackend {
 
         let mut sig = HsaSignal { handle: 0 };
         let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_signal_create (p2p): {rc}"
-            )));
-        }
+        self.check(rc, "hsa_signal_create (p2p)")?;
         // The two agents name the transfer's endpoints; the SDMA engine walks
         // XGMI directly with no host bounce.
         let rc = unsafe {
@@ -1639,10 +1760,13 @@ impl PeerMemory for HsaBackend {
         };
         if rc != HSA_STATUS_SUCCESS {
             unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_memory_async_copy (dev {} -> dev {dst_ordinal}): {rc}",
-                self.device_ordinal
-            )));
+            return Err(self.fault(
+                rc,
+                &format!(
+                    "hsa_amd_memory_async_copy (dev {} -> dev {dst_ordinal})",
+                    self.device_ordinal
+                ),
+            ));
         }
         unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
@@ -1684,9 +1808,7 @@ impl HsaBackend {
             )
         };
         if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_executable_get_symbol_by_name('{name}'): {rc}"
-            )));
+            return Err(self.fault(rc, &format!("hsa_executable_get_symbol_by_name('{name}')")));
         }
 
         let mut kernel_object: u64 = 0;
@@ -1773,6 +1895,7 @@ impl HsaBackend {
                 kernel.kernarg_size
             )));
         }
+        self.guard()?;
         let q = self.queue;
         let idx = unsafe { (self.shared.drv.hsa_queue_add_write_index_screlease)(q, 1) };
 
@@ -2099,9 +2222,7 @@ impl HsaUploadRing {
                 unsafe { (ring.shared.drv.hsa_signal_create)(0, 0, std::ptr::null(), &mut sig) };
             if rc != HSA_STATUS_SUCCESS {
                 // `ring` drops here and destroys the signals already made.
-                return Err(RuntimeError::Device(format!(
-                    "hsa_signal_create (upload ring): {rc}"
-                )));
+                return Err(hsa_fault(rc, "hsa_signal_create (upload ring)"));
             }
             ring.slots.push(RingSlot {
                 buf,
@@ -2159,9 +2280,7 @@ impl HsaUploadRing {
             // it. Drain what really is in flight, then report.
             unsafe { (self.shared.drv.hsa_signal_store_screlease)(slot.sig, 0) };
             self.drain()?;
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_memory_async_copy (upload ring): {rc}"
-            )));
+            return Err(hsa_fault(rc, "hsa_amd_memory_async_copy (upload ring)"));
         }
         self.slots[i].busy = true;
         self.next += 1;
@@ -2286,6 +2405,9 @@ impl HsaBackend {
 
     /// Drain the queue (device-wide; there is one queue).
     pub fn synchronize(&self) -> Result<()> {
+        // A poisoned queue never advances its read index — without this gate
+        // the spin below would hang forever instead of erroring.
+        self.guard()?;
         let q = self.queue;
         // The write index is the total number of packets ever enqueued; the
         // read index is how many the packet processor has retired. Equality
@@ -2307,11 +2429,7 @@ impl HsaBackend {
     pub fn event_create(&self, timing: bool) -> Result<HsaEvent> {
         let mut sig = HsaSignal { handle: 0 };
         let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_signal_create (event): {rc}"
-            )));
-        }
+        self.check(rc, "hsa_signal_create (event)")?;
         Ok(HsaEvent {
             sig,
             at: std::sync::Mutex::new(None),
@@ -2387,15 +2505,15 @@ impl HsaBackend {
 
     /// Page-locked, device-visible host staging memory.
     pub fn host_alloc_pinned(&self, bytes: usize) -> Result<HsaPinned> {
+        self.guard()?;
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_pool_allocate)(self.fine_pool, bytes, 0, &mut ptr)
         };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_memory_pool_allocate(fine, {bytes} bytes): {rc}"
-            )));
-        }
+        self.check(
+            rc,
+            &format!("hsa_amd_memory_pool_allocate(fine, {bytes} bytes)"),
+        )?;
         // The GPU agent must be allowed to read the staging slab; without this
         // the copy engine faults on first touch.
         let rc = unsafe {
@@ -2403,9 +2521,7 @@ impl HsaBackend {
         };
         if rc != HSA_STATUS_SUCCESS {
             unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_agents_allow_access (pinned): {rc}"
-            )));
+            return Err(self.fault(rc, "hsa_amd_agents_allow_access (pinned)"));
         }
         Ok(HsaPinned {
             ptr: ptr as *mut u8,
@@ -2470,15 +2586,12 @@ impl HsaBackend {
         if live.is_empty() {
             return Ok(());
         }
+        self.guard()?;
         let mut sig = HsaSignal { handle: 0 };
         let rc = unsafe {
             (self.shared.drv.hsa_signal_create)(live.len() as i64, 0, std::ptr::null(), &mut sig)
         };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_signal_create (dtod batch): {rc}"
-            )));
-        }
+        self.check(rc, "hsa_signal_create (dtod batch)")?;
         for &&(dst, src, bytes) in &live {
             let rc = unsafe {
                 (self.shared.drv.hsa_amd_memory_async_copy)(
@@ -2505,9 +2618,7 @@ impl HsaBackend {
                     );
                     (self.shared.drv.hsa_signal_destroy)(sig);
                 }
-                return Err(RuntimeError::Device(format!(
-                    "hsa_amd_memory_async_copy (dtod batch): {rc}"
-                )));
+                return Err(self.fault(rc, "hsa_amd_memory_async_copy (dtod batch)"));
             }
         }
         unsafe {
@@ -2527,13 +2638,10 @@ impl HsaBackend {
         if bytes == 0 {
             return Ok(());
         }
+        self.guard()?;
         let mut sig = HsaSignal { handle: 0 };
         let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_signal_create (dtod): {rc}"
-            )));
-        }
+        self.check(rc, "hsa_signal_create (dtod)")?;
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_async_copy)(
                 dst as *mut c_void,
@@ -2548,9 +2656,7 @@ impl HsaBackend {
         };
         if rc != HSA_STATUS_SUCCESS {
             unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_memory_async_copy (dtod): {rc}"
-            )));
+            return Err(self.fault(rc, "hsa_amd_memory_async_copy (dtod)"));
         }
         unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
@@ -2660,12 +2766,7 @@ impl HsaBackend {
         let rc = unsafe {
             (self.shared.drv.hsa_executable_destroy)(HsaExecutable { handle: module.id })
         };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_executable_destroy: {rc}"
-            )));
-        }
-        Ok(())
+        self.check(rc, "hsa_executable_destroy")
     }
 
     /// Fill `n` bytes at `dptr` with `value`, through the copy engine.
@@ -2680,6 +2781,7 @@ impl HsaBackend {
         if n == 0 {
             return Ok(());
         }
+        self.guard()?;
         let mut guard = self.fill_stage.lock();
         let need_new = match guard.as_ref() {
             Some(s) => s.len < n || s.value != value,
@@ -2694,14 +2796,14 @@ impl HsaBackend {
                 (self.shared.drv.hsa_amd_memory_pool_allocate)(self.fine_pool, n, 0, &mut ptr)
             };
             if rc != HSA_STATUS_SUCCESS {
-                return Err(RuntimeError::Device(format!("fill stage alloc({n}): {rc}")));
+                return Err(self.fault(rc, &format!("fill stage alloc({n})")));
             }
             let rc = unsafe {
                 (self.shared.drv.hsa_amd_agents_allow_access)(1, &self.agent, std::ptr::null(), ptr)
             };
             if rc != HSA_STATUS_SUCCESS {
                 unsafe { (self.shared.drv.hsa_amd_memory_pool_free)(ptr) };
-                return Err(RuntimeError::Device(format!("fill stage access: {rc}")));
+                return Err(self.fault(rc, "fill stage access"));
             }
             unsafe { std::ptr::write_bytes(ptr as *mut u8, value, n) };
             *guard = Some(FillStage { ptr, len: n, value });
@@ -2732,13 +2834,10 @@ impl HsaBackend {
     /// slab, or the fine-grained pool. A stack or `Vec` source faults the GPU
     /// with an opaque "memory access fault" that reads as a kernel bug.
     pub fn memcpy_htod_pinned(&self, dptr: u64, src: &[u8]) -> Result<()> {
+        self.guard()?;
         let mut sig = HsaSignal { handle: 0 };
         let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_signal_create (fill): {rc}"
-            )));
-        }
+        self.check(rc, "hsa_signal_create (fill)")?;
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_async_copy)(
                 dptr as *mut c_void,
@@ -2753,7 +2852,7 @@ impl HsaBackend {
         };
         if rc != HSA_STATUS_SUCCESS {
             unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
-            return Err(RuntimeError::Device(format!("async_copy (fill): {rc}")));
+            return Err(self.fault(rc, "async_copy (fill)"));
         }
         unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
@@ -2778,13 +2877,10 @@ impl HsaBackend {
         if dst.is_empty() {
             return Ok(());
         }
+        self.guard()?;
         let mut sig = HsaSignal { handle: 0 };
         let rc = unsafe { (self.shared.drv.hsa_signal_create)(1, 0, std::ptr::null(), &mut sig) };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_signal_create (d2h): {rc}"
-            )));
-        }
+        self.check(rc, "hsa_signal_create (d2h)")?;
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_async_copy)(
                 dst.as_mut_ptr() as *mut c_void,
@@ -2799,9 +2895,7 @@ impl HsaBackend {
         };
         if rc != HSA_STATUS_SUCCESS {
             unsafe { (self.shared.drv.hsa_signal_destroy)(sig) };
-            return Err(RuntimeError::Device(format!(
-                "async_copy (d2h pinned): {rc}"
-            )));
+            return Err(self.fault(rc, "async_copy (d2h pinned)"));
         }
         unsafe {
             (self.shared.drv.hsa_signal_wait_scacquire)(
@@ -2939,15 +3033,17 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
                 &mut g as *mut _ as *mut c_void,
             )
         };
-        if rc != HSA_STATUS_SUCCESS || g == 0 {
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_memory_pool_get_info(REC_GRANULE): rc={rc} granule={g}"
-            )));
+        self.check(rc, "hsa_amd_memory_pool_get_info(REC_GRANULE)")?;
+        if g == 0 {
+            return Err(RuntimeError::Device(
+                "hsa_amd_memory_pool_get_info(REC_GRANULE): granule=0".into(),
+            ));
         }
         Ok(g as u64)
     }
 
     fn reserve(&self, bytes: u64) -> Result<u64> {
+        self.guard()?;
         let f = self.vmem()?;
         // Align the reservation to the physical granule. The non-`_align` entry
         // point only guarantees page alignment, and every `map` into this range
@@ -2957,11 +3053,10 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
         let mut va: *mut c_void = std::ptr::null_mut();
         // SAFETY: out-pointer; no fixed address requested.
         let rc = unsafe { (f.address_reserve_align)(&mut va, bytes as usize, 0, align, 0) };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_vmem_address_reserve_align({bytes} B, align {align}): {rc}"
-            )));
-        }
+        self.check(
+            rc,
+            &format!("hsa_amd_vmem_address_reserve_align({bytes} B, align {align})"),
+        )?;
         Ok(va as u64)
     }
 
@@ -2976,6 +3071,7 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
     }
 
     fn create(&self, bytes: u64) -> Result<u64> {
+        self.guard()?;
         let f = self.vmem()?;
         let mut h = HsaVmemHandle { handle: 0 };
         // SAFETY: out-pointer; bytes is a granule multiple (pool contract).
@@ -2988,11 +3084,7 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
                 &mut h,
             )
         };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_vmem_handle_create({bytes} B): {rc}"
-            )));
-        }
+        self.check(rc, &format!("hsa_amd_vmem_handle_create({bytes} B)"))?;
         Ok(h.handle)
     }
 
@@ -3006,6 +3098,7 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
     }
 
     fn map(&self, va: u64, bytes: u64, handle: u64) -> Result<()> {
+        self.guard()?;
         let f = self.vmem()?;
         // SAFETY: va range inside a reservation, handle live, in_offset 0 —
         // multi-map of one handle into several ranges is what prefix sharing is.
@@ -3018,12 +3111,10 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
                 0,
             )
         };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_vmem_map: {rc} (va={va:#x} bytes={bytes} handle={handle:#x})"
-            )));
-        }
-        Ok(())
+        self.check(
+            rc,
+            &format!("hsa_amd_vmem_map (va={va:#x} bytes={bytes} handle={handle:#x})"),
+        )
     }
 
     fn unmap(&self, va: u64, bytes: u64) {
@@ -3036,6 +3127,7 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
     }
 
     fn set_access(&self, va: u64, bytes: u64) -> Result<()> {
+        self.guard()?;
         let f = self.vmem()?;
         let desc = HsaAmdMemoryAccessDesc {
             permissions: HSA_ACCESS_PERMISSION_RW,
@@ -3043,15 +3135,14 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
         };
         // SAFETY: range fully mapped (pool maps before granting access).
         let rc = unsafe { (f.set_access)(va as *mut c_void, bytes as usize, &desc, 1) };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_vmem_set_access: {rc} (va={va:#x} bytes={bytes})"
-            )));
-        }
-        Ok(())
+        self.check(
+            rc,
+            &format!("hsa_amd_vmem_set_access (va={va:#x} bytes={bytes})"),
+        )
     }
 
     fn alloc(&self, bytes: u64) -> Result<u64> {
+        self.guard()?;
         let mut ptr: *mut c_void = std::ptr::null_mut();
         // SAFETY: out-pointer to a coarse-grained VRAM allocation. Ordinary
         // pool memory, not VMM — snapshot buffers are never re-mapped.
@@ -3063,11 +3154,10 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
                 &mut ptr,
             )
         };
-        if rc != HSA_STATUS_SUCCESS {
-            return Err(RuntimeError::Device(format!(
-                "hsa_amd_memory_pool_allocate(vmm snapshot, {bytes} B): {rc}"
-            )));
-        }
+        self.check(
+            rc,
+            &format!("hsa_amd_memory_pool_allocate(vmm snapshot, {bytes} B)"),
+        )?;
         Ok(ptr as u64)
     }
 
@@ -3115,5 +3205,29 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
             released += b;
         }
         released
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hsa_status_name, is_hsa_fatal};
+
+    #[test]
+    fn fatal_classification_matches_the_rocr_contract() {
+        // Trap statuses that kill the queue/agent.
+        for rc in [41, 42, 43, 0x1016, 0x1020] {
+            assert!(is_hsa_fatal(rc), "hsa_status {rc:#x} must be fatal");
+        }
+        // Transient / bad-call statuses that must NOT kill the engine.
+        for rc in [0x1008, 0x1001, 0x1007, 0x100F, 40, 45] {
+            assert!(!is_hsa_fatal(rc), "hsa_status {rc:#x} must not be fatal");
+        }
+    }
+
+    #[test]
+    fn status_names_resolve() {
+        assert_eq!(hsa_status_name(43), "HSA_STATUS_ERROR_MEMORY_FAULT");
+        assert_eq!(hsa_status_name(0x1008), "HSA_STATUS_ERROR_OUT_OF_RESOURCES");
+        assert_eq!(hsa_status_name(-1), "HSA_STATUS_UNKNOWN");
     }
 }

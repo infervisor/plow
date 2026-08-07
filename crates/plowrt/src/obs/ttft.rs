@@ -19,7 +19,12 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-crate::env_flag!(pub fn on, "PLOW_TTFT_LOG");
+/// Whether TTFT logging is active (`--ttft-log` / `PLOW_TTFT_LOG=1`).
+/// Reads from [`RuntimeConfig::get`](crate::config::RuntimeConfig::get) —
+/// the CLI-parsed global, else its cached env-only snapshot (tests).
+pub fn on() -> bool {
+    crate::config::RuntimeConfig::get().ttft_log
+}
 
 /// One accumulator. `&'static str` label so the dump is self-describing and the
 /// call sites read as prose.
