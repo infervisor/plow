@@ -7234,6 +7234,11 @@ mod kimi_k3_tests {
     /// can still differ in every one of those.
     #[test]
     fn the_prefill_ladder_leaves_the_decode_program_byte_identical() {
+        // This is the test the PLOW_GLM_WGFIT race actually broke: the emitted
+        // block counts depend on the narrowing, so it must not run while a
+        // sibling holds the knob (observed: "decode inst 77: block count
+        // left: 256, right: 32", ~1 full-suite run in 7).
+        let _env = crate::test_env::env_guard();
         let d = k3_dir("ladder");
         let bare = k3_build_model(&d, 4096, 256, 1, &[], None);
         let laddered = k3_build_model(&d, 4096, 256, 1, &[128, 512, 1024], None);
@@ -8385,6 +8390,9 @@ mod glm_tests {
     /// fold map and therefore different arithmetic (`exec_mla_merge_fold`, op_attention.h).
     #[test]
     fn mla_fold_is_sized_to_its_work_items_and_never_flips_vt() {
+        // Sets PLOW_GLM_GF / PLOW_GLM_WGFIT below, which `glm_gf`/`wgfit` read
+        // live — hold the lock so no sibling test emits under them.
+        let _env = crate::test_env::env_guard();
         let all: Vec<u32> = (0..256u32).collect();
         // GLM-5.2, v_head 256: bh*ceil(256/32) = bh*8, and bh*8 <= nblk keeps VT at 32.
         for &(nh_l, want) in &[(16u32, 128usize), (8, 64), (4, 32), (32, 256)] {
@@ -8529,15 +8537,18 @@ mod glm_tests {
             }
         }
         // The pin is clamped too: a sweep must not be able to emit all-zero attention.
-        std::env::set_var("PLOW_GLM_GF", "8");
-        assert_eq!(glm_gf(1024, 16), 8, "the pin overrides the crossover");
-        assert_eq!(glm_gf(1024, 4), 4, "the pin is still clamped by nh_l");
-        std::env::remove_var("PLOW_GLM_GF");
-        // The knob restores the control arm exactly.
-        std::env::set_var("PLOW_GLM_WGFIT", "0");
-        assert_eq!(mla_fold_cus(&all, 16, 256).len(), 256);
-        assert_eq!(blocked_gemv_cus(&all, 2624).len(), 256);
-        std::env::remove_var("PLOW_GLM_WGFIT");
+        {
+            let _p = crate::test_env::EnvScope::set(&[("PLOW_GLM_GF", "8")]);
+            assert_eq!(glm_gf(1024, 16), 8, "the pin overrides the crossover");
+            assert_eq!(glm_gf(1024, 4), 4, "the pin is still clamped by nh_l");
+        }
+        // The knob restores the control arm exactly. Scoped, so a failing
+        // assert restores the knob on unwind instead of leaking it.
+        {
+            let _p = crate::test_env::EnvScope::set(&[("PLOW_GLM_WGFIT", "0")]);
+            assert_eq!(mla_fold_cus(&all, 16, 256).len(), 256);
+            assert_eq!(blocked_gemv_cus(&all, 2624).len(), 256);
+        }
     }
 
     /// An ODD head shard cannot be expressed by ANY instantiated GF, and the emit must say so.
@@ -8550,6 +8561,9 @@ mod glm_tests {
     #[test]
     #[should_panic(expected = "does not divide this rank's head shard")]
     fn an_odd_head_shard_is_refused_rather_than_silently_truncated() {
+        // Reads PLOW_GLM_GF live: a sibling test's pin decides which branch
+        // this reaches, so the refusal it asserts must not be a race.
+        let _env = crate::test_env::env_guard();
         glm_gf(65536, 3);
     }
 
@@ -8558,6 +8572,9 @@ mod glm_tests {
     /// surviving workgroup's column run is byte-for-byte the one it had before.
     #[test]
     fn blocked_gemv_drops_only_the_empty_ceiling_tail() {
+        // `blocked_gemv_cus` early-returns the un-narrowed list under
+        // PLOW_GLM_WGFIT=0, which a sibling test sets.
+        let _env = crate::test_env::env_guard();
         let all: Vec<u32> = (0..256u32).collect();
         for &n in &[1u32, 63, 255, 256, 257, 512, 2624, 6144, 9216, 154880] {
             let got = blocked_gemv_cus(&all, n);

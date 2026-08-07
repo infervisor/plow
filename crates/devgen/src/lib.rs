@@ -57,6 +57,8 @@ pub mod kda;
 use config::*;
 mod ladder;
 mod mla;
+#[cfg(test)]
+mod test_env;
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
 pub mod manifest;
 pub mod tune_demand;

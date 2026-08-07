@@ -314,11 +314,24 @@ if [ "${PLOW_BUILD_FP8KV:-0}" = "1" ]; then
   echo "built $OUT_KV ($(stat -c%s "$OUT_KV") B), kernel $KSYM present"
   # fp8 prefill dequants at the smem stage, so it needs the PIPE=0 synchronous-staging arm
   # (cp.async cannot convert fp8 inline). -DPLOW_NV_FA_PIPE=0 selects it; decode is PIPE-agnostic.
+  #
+  # PLOW_FP8_KV_FASTPF=1 opts back into the pipelined arm, matching the CMake
+  # path (runtime/CMakeLists.txt, which measures the PIPE=0 arm at 5.4x on a
+  # 127k context). Without an override here this script could only ever build
+  # the slow arm, while CMake could build both.
+  #
+  # $PF_EXTRA belongs here as much as on the other four prefill objects: it
+  # carries -DPLOW_NV_TMA_GEMM / -DPLOW_NV_W8A8, so omitting it made
+  # PLOW_BUILD_TMA_GEMM=1 a silent no-op on exactly this object.
+  FA_PIPE_KV="-DPLOW_NV_FA_PIPE=0"
+  if [ "${PLOW_FP8_KV_FASTPF:-0}" = "1" ]; then
+    FA_PIPE_KV="-DPLOW_NV_FA_PIPE=1"
+  fi
   env -i PATH="$CUDA_BIN":/usr/bin:/bin \
     "$NVCC" -arch=sm_90a -O3 -cubin \
     -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
-    -DPLOW_NV_PREFILL=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_EMBED_SMEM=1 -DPLOW_FP8_KV=1 $GEMMA_GATE $GEMV_RB $EXTRA \
-    -DPLOW_NV_FA_PIPE=0 \
+    -DPLOW_NV_PREFILL=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_EMBED_SMEM=1 -DPLOW_FP8_KV=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
+    $FA_PIPE_KV \
     -o "$OUT_PF_KV" "$SRC"
   env -i PATH="$CUDA_BIN":/usr/bin:/bin \
     cuobjdump -symbols "$OUT_PF_KV" | grep -q "$KSYM_PF" || { echo "FATAL: $KSYM_PF missing in $OUT_PF_KV" >&2; exit 1; }

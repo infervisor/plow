@@ -23,9 +23,15 @@
 //! Needs a real gfx9xx GPU + ROCr, gated like the other device tests:
 //!
 //!   PLOW_GPU_TEST=1 cargo test -p plowrt --features hsa --test hsa_vmm \
-//!       -- --nocapture --test-threads=1
+//!       -- --nocapture
+//!
+//! `slab_chunk_pool_roundtrip_and_reuse` mutates `PLOW_SLAB_KEEP`, which the
+//! slab reads live, so every test here takes `common::env_guard()`. That
+//! replaces the old `--test-threads=1` instruction, which nothing enforced.
 
 #![cfg(feature = "hsa")]
+
+mod common;
 
 use std::time::Instant;
 
@@ -77,6 +83,7 @@ fn granularity_is_a_usable_power_of_two() {
         eprintln!("skipped: set PLOW_GPU_TEST=1");
         return;
     }
+    let _env = common::env_guard();
     let be = backend();
     assert!(
         be.has_vmm(),
@@ -98,6 +105,7 @@ fn reserve_map_set_access_roundtrip() {
         eprintln!("skipped: set PLOW_GPU_TEST=1");
         return;
     }
+    let _env = common::env_guard();
     let be = backend();
     let gran = VmmOps::granularity(be).expect("granularity");
     let span = 8 * (1u64 << 30); // 8 GiB of VA, 0 B of HBM
@@ -138,6 +146,7 @@ fn one_handle_multi_mapped_aliases() {
         eprintln!("skipped: set PLOW_GPU_TEST=1");
         return;
     }
+    let _env = common::env_guard();
     let be = backend();
     let gran = VmmOps::granularity(be).expect("granularity");
     let span = 4 * gran;
@@ -179,6 +188,7 @@ fn map_and_set_access_cost_per_block() {
         eprintln!("skipped: set PLOW_GPU_TEST=1");
         return;
     }
+    let _env = common::env_guard();
     let be = backend();
     let gran = VmmOps::granularity(be).expect("granularity");
     println!("\ngranule = {} KiB", gran >> 10);
@@ -238,14 +248,15 @@ fn map_and_set_access_cost_per_block() {
 /// shape: a kept `VmmSlab`'s chunks must feed the next slab's mapper instead
 /// of re-paying `hsa_amd_vmem_handle_create`.
 ///
-/// Mutates `PLOW_SLAB_KEEP` — run with `--test-threads=1` as this file's
-/// header already requires.
+/// Mutates `PLOW_SLAB_KEEP` — serialized against the other tests in this file
+/// by `common::env_guard()`, which every test takes.
 #[test]
 fn slab_chunk_pool_roundtrip_and_reuse() {
     if !gpu_enabled() {
         eprintln!("skipped: set PLOW_GPU_TEST=1 (needs an HSA GPU)");
         return;
     }
+    let _env = common::env_guard();
     let be = backend();
     let gran = VmmOps::granularity(be).expect("granularity");
     let chunk = 4 * gran;

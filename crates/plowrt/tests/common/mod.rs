@@ -4,6 +4,59 @@
 
 use packet::{Body, Counter, Inst, Opcode, Program, ResourceKind};
 
+/// Serializes tests that set a `PLOW_*` knob the runtime reads LIVE.
+///
+/// Cargo runs one test binary's `#[test]`s as threads of a single process, and
+/// several knobs are read env-first on every call — by design, so a test can
+/// flip them after the config snapshot is cached. That makes any test which
+/// sets one of them change what every concurrently running test in the same
+/// binary sees.
+///
+/// Three files carried `run with --test-threads=1` in a doc comment instead,
+/// which nothing enforces: no script or CI path passes that flag. A lock is
+/// correct by construction, and unlike the flag it does not serialize the
+/// whole binary — only the tests that opt in.
+///
+/// **Every test in a file that mutates env must take this**, not just the
+/// mutators: the victim of a race is the test doing the reading.
+///
+/// Poisoning is irrelevant (a panicking test has already failed), so the guard
+/// unwraps through rather than reporting a second failure.
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Sets env vars for a scope and restores their previous values on drop,
+/// including the "was unset" case — so a failing assert cannot leak a knob
+/// into whatever runs next.
+pub struct EnvScope(Vec<(String, Option<String>)>);
+
+impl EnvScope {
+    pub fn set(kv: &[(&str, &str)]) -> Self {
+        let saved = kv
+            .iter()
+            .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        for (k, v) in kv {
+            std::env::set_var(k, v);
+        }
+        EnvScope(saved)
+    }
+}
+
+impl Drop for EnvScope {
+    fn drop(&mut self) {
+        for (k, v) in &self.0 {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
 /// A minimal decode-bucket program: one producer + one counter-gated consumer.
 pub fn tiny_program() -> Program {
     Program {

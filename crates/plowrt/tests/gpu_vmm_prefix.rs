@@ -13,11 +13,16 @@
 //!    twice (the gpu_lifecycle pattern with the VMM pool in the loop).
 //!
 //! Gated on `PLOW_GPU_TEST=1` + real assets (`PLOW_GPU_ASSETS`, default
-//! /root/gpu-assets-b4/b4). Tests mutate process env — run single-threaded:
-//! `gpulease vmm-impl cargo test -p plowrt --features cuda --release
-//!  --test gpu_vmm_prefix -- --nocapture --test-threads=1`
+//! /root/gpu-assets-b4/b4).
+//!
+//! Tests here mutate process env (`PLOW_VMM_PREFIX`, `PLOW_VMM_BLOCK_MIB`),
+//! which the engine reads live. Every test takes `common::env_guard()` so they
+//! cannot overlap; this file previously asked for `--test-threads=1` in a
+//! comment, which no script or CI path passes.
 
 #![cfg(feature = "cuda")]
+
+mod common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -99,6 +104,7 @@ fn created(s: &plowrt::memory::vmm::VmmStats) -> u64 {
 #[test]
 fn shared_prefix_token_identity_and_dedup() {
     let Some(assets) = gated() else { return };
+    let _env = common::env_guard();
     let ckpt = assets.join("checkpoint");
     let tok = load_tokenizer(&assets);
     let be = Arc::new(CudaBackend::new(0).expect("CUDA backend"));
@@ -215,6 +221,7 @@ fn shared_prefix_token_identity_and_dedup() {
 #[test]
 fn remap_after_release_cycle() {
     let Some(_assets) = gated() else { return };
+    let _env = common::env_guard();
     let be = Arc::new(CudaBackend::new(0).expect("CUDA backend"));
     let ops: Arc<dyn VmmOps> = Arc::clone(&be) as Arc<dyn VmmOps>;
     let geo = VmmGeometry {
@@ -251,6 +258,7 @@ fn remap_after_release_cycle() {
 #[test]
 fn attach_latency_vs_copy_baseline() {
     let Some(_assets) = gated() else { return };
+    let _env = common::env_guard();
     let be = Arc::new(CudaBackend::new(0).expect("CUDA backend"));
     let ops: Arc<dyn VmmOps> = Arc::clone(&be) as Arc<dyn VmmOps>;
 
@@ -336,6 +344,7 @@ fn attach_latency_vs_copy_baseline() {
 #[test]
 fn vmm_leak_cycle() {
     let Some(assets) = gated() else { return };
+    let _env = common::env_guard();
     let ckpt = assets.join("checkpoint");
     let tok = load_tokenizer(&assets);
     let be = Arc::new(CudaBackend::new(0).expect("CUDA backend"));
