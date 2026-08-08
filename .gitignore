@@ -1,6 +1,12 @@
 # Local-only plans / research scratchpad for coding agents
 plans/
 
+# Local re-runs of perf campaign dumps — do not re-commit
+perf-data/**/*-raw*.txt
+perf-data/**/*-raw-*.txt
+perf-data/**/*.jsonl
+!perf-data/block-configs/**
+
 # OS / editor
 .DS_Store
 *.swp
@@ -43,3 +49,6 @@ plow_profile.sqlite
 # GPU binary build outputs — never check in (bundles link them from build dirs)
 *.cubin
 *.hsaco
+
+# nix build output
+result/

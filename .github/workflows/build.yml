@@ -1,0 +1,43 @@
+name: build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The nix build runs on self-hosted hardware, so it must never be triggered by
+  # a pull request from a fork: that would execute untrusted code on our runner.
+  # Fork PRs are covered by the hosted job below and merged only after review.
+  nix-build:
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enter Nix shell
+        run: nix develop --command true
+      - name: Build default package
+        run: nix build
+      - name: Test workspace
+        run: nix develop --command cargo test --workspace
+
+  # Hosted, sandboxed: safe for fork PRs. CPU paths only, no GPU toolchain.
+  check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Type-check
+        run: cargo check --workspace --all-targets

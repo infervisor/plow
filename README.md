@@ -1,279 +1,410 @@
-# plow — Packet Language for On-device Warps
+# plow
 
-A product of **Infervisor**.
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-2021-orange.svg?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-sm__120-76B900.svg?logo=nvidia&logoColor=white)](#recipe-a--nvidia-rtx-5090-sm_120-170-sms-32-gb)
+[![ROCm](https://img.shields.io/badge/ROCm-gfx950-ED1C24.svg)](#recipe-c--amd-mi350x--mi355x-gfx950-256-cus)
+[![Nix](https://img.shields.io/badge/Nix-flakes-5277C3.svg?logo=nixos&logoColor=white)](https://nixos.org/)
+[![Lean 4](https://img.shields.io/badge/Lean-4-000000.svg)](lean-plow/)
+[![Infervisor](https://img.shields.io/badge/by-Infervisor-111111.svg)](https://infervisor.ai)
 
-plow is an LLM inference stack built around one idea: compile the whole model
-into a **packet stream** and run it with a **persistent on-device interpreter**
-— one cooperative kernel launch that stays resident, with warp-granularity op
-bodies and zero per-op dispatch. The compiler (`plowc`) lowers a checkpoint into
-packets; the runtime (`plowrt`) loads them and serves an OpenAI-compatible API;
-Lean checks (`lean-plow/`, `crates/lean_verify`) cover the non-obvious rewrites
-and the counter protocol.
+**Packet Language for On-device Warps** — an LLM inference stack from
+[Infervisor](https://infervisor.ai).
 
-**Supported today:** Gemma-4 (12B / 31B dense, 26B-A4B MoE), Qwen3, Llama-3.1 —
-bf16 and fp8 (weight-only e4m3) — on NVIDIA consumer Blackwell (sm_120, e.g.
-RTX 5090 / RTX PRO 6000 Blackwell) and AMD CDNA (gfx942/gfx950).
+plow compiles a Hugging Face checkpoint into a static **packet stream**, then
+runs it with a **persistent on-device interpreter**: one cooperative GPU launch
+that stays resident, executes ops at warp granularity, and coordinates with
+counters instead of per-op CPU dispatch.
 
-**Architecture:** see [`docs/arch/`](docs/arch/00-overview.md) — the overview
-indexes the compiler pipeline, tile graph, scheduler, packet ABI, counter
-system, runtime, cost model, formal verification, and multi-GPU. The full
-build-system rationale (one binary for CPU+GPU, `dlopen`, static linking, TLS)
-is in [`docs/BUILD.md`](docs/BUILD.md). **Every emit/build/runtime flag** is
-catalogued in [`docs/flags-reference.md`](docs/flags-reference.md); this README
-keeps only what you need to build, compile a model, and serve — plus the handful
-of traps that break an asset *silently*.
+| Component | Role |
+|-----------|------|
+| `plowc` | AOT compiler (checkpoint → `.pkt` + weight sidecars) |
+| `plowrt` | Host runtime + OpenAI-compatible HTTP server |
+| `runtime/` | CUDA / HSA persistent interpreters |
+| `lean-plow/` | Lean 4 checks for rewrites and the counter protocol |
 
-> **On `crates/rewrite` (egglog):** it runs, but it is **advisory — no rewrite it
-> finds reaches a GPU.** Both `plowc` paths discard their fused graph, and
-> `crates/devgen` (the emitter every shipped asset comes out of) has no
-> dependency on it. The fusions actually in a packet (`GemvQkv`, `GemvGlu`,
-> `NormResidualNorm`) are hand-written in `devgen`. This is not a bug to fix on
-> the way to a win: deleting 100 packets/token is worth ≤0.064 ms on gfx950 and
-> the un-fused arm ran *faster*. See `docs/arch/01-compiler-pipeline.md`.
+## Table of contents
+
+- [Fully supported today](#fully-supported-today)
+- [Requirements](#requirements)
+- [0. Build the host tools](#0-build-the-host-tools)
+- [1. Download Gemma-4-12B](#1-download-gemma-4-12b)
+- [Recipe A — NVIDIA RTX 5090](#recipe-a--nvidia-rtx-5090-sm_120-170-sms-32-gb)
+  - [A1. Interpreter cubins](#a1-interpreter-cubins)
+  - [A2. Compile the packet](#a2-compile-the-packet-bundle)
+  - [A3. Serve and chat](#a3-serve-and-chat)
+- [Recipe B — NVIDIA RTX PRO 6000 Blackwell](#recipe-b--nvidia-rtx-pro-6000-blackwell-sm_120-188-sms-96-gb)
+- [Recipe C — AMD MI350X / MI355X](#recipe-c--amd-mi350x--mi355x-gfx950-256-cus)
+  - [C1. Interpreter code objects](#c1-interpreter-code-objects)
+  - [C2. Compile the packet](#c2-compile-the-packet-bundle)
+  - [C3. Serve and chat](#c3-serve-and-chat)
+  - [Example running instance](#example-running-instance)
+- [Recipe D — AMD MI300X](#recipe-d--amd-mi300x-gfx942-304-cus)
+- [Asset layout](#asset-layout-what-serve-expects)
+- [Architecture](#architecture)
+- [Contributing](#contributing)
+- [Security](#security)
+- [License](#license)
+- [Code of Conduct](#code-of-conduct)
+
+## Fully supported today
+
+These paths are the ones exercised end-to-end for serving. Start here.
+
+| GPU | Arch | SMs / CUs | VRAM | `plowc` flags |
+|-----|------|-----------|------|----------------|
+| **NVIDIA RTX 5090** | `sm_120` | 170 SMs | 32 GB GDDR7 | `--gpu rtx5090 --n-cu 170` + `PLOW_UNISEG=1` |
+| **NVIDIA RTX PRO 6000 Blackwell** | `sm_120` | 188 SMs | 96 GB GDDR7 | `--gpu rtx6000pro --n-cu 188` + `PLOW_UNISEG=1` |
+| **AMD Instinct MI350X** | `gfx950` | 256 CUs | 288 GB HBM3E | `--arch gfx950 --gpu mi350x --n-cu 256` (**no** `PLOW_UNISEG`) |
+| **AMD Instinct MI355X** | `gfx950` | 256 CUs | 288 GB HBM3E | `--arch gfx950 --gpu mi355x --n-cu 256` (**no** `PLOW_UNISEG`) |
+| **AMD Instinct MI300X** | `gfx942` | 304 CUs | 192 GB HBM3 | `--arch gfx942 --gpu MI300X` (**no** `PLOW_UNISEG`) |
+
+| Model (first-run) | HF id | Notes |
+|-------------------|-------|--------|
+| **Gemma-4 12B Instruct** | `google/gemma-4-12B-it` | Dense bf16 primary path below |
+| Gemma-4 31B Instruct | `google/gemma-4-31B-it` | Same recipes; needs more VRAM / shorter ctx on 5090 |
+| Gemma-4 26B-A4B MoE | `google/gemma-4-26B-A4B-it` | MoE emit + serve on the same GPUs |
+
+Also emit-capable (not the first-run walkthrough): Qwen3, Llama-3.1; bf16 and
+weight-only fp8 (e4m3). Descriptors exist for other parts (H100, B200) — do
+**not** treat those as drop-in substitutes for the recipes below without
+matching interpreter objects and `--n-cu`.
 
 ## Requirements
 
-- Rust + Lean via **nix**: `nix develop` in the repo root provides cargo/rustc,
-  cmake, gcc, and elan. (First run: install nix, enable flakes.)
-- **NVIDIA path:** driver + **CUDA ≥ 12.9** (13.0 tested), `nvcc` on PATH,
-  sm_120 GPU for the shipped interpreter objects.
-- **AMD path:** a local **ROCm ≥ 7.2.4** install (`/opt/rocm`) for `hipcc` and
-  `clang-offload-bundler` — *not* from nix (the code objects are built by the
-  system ROCm toolchain). **7.0.2 is too old**: clang-20 lands the fp8/MLA
-  prefill objects at 262 regs / occ 1 and the build's register-cliff gate
-  rejects them; 7.2.4 (clang-22) lands them at 256 / occ-2.
-- A HuggingFace checkpoint directory (safetensors + config.json + tokenizer).
+- Nix with flakes → `nix develop` at the repo root (Rust / cmake / Lean)
+- **NVIDIA recipe:** driver + CUDA ≥ 12.9 (`nvcc` on `PATH`, usually
+  `/usr/local/cuda/bin`) to *build* cubins; run needs `libcuda.so.1` only
+- **AMD recipe:** ROCm ≥ **7.2.4** at `/opt/rocm` (`hipcc`, bundler); run needs
+  amdgpu + `libhsa-runtime64.so`. ROCm 7.0.2 is too old for the register cliff
+- Hugging Face access for `google/gemma-4-12B-it` (gated model — accept the
+  license and `hf auth login` first)
 
-## Build
+`plowrt` does not link CUDA/HIP. Features `cuda` / `hsa` `dlopen` the drivers at
+runtime.
+
+## 0. Build the host tools
 
 ```bash
-nix develop                               # toolchain shell
-cargo build --workspace --release         # compiler + runtime (CPU paths)
-cargo test  --workspace                   # full test suite
+cd /path/to/plow
+nix develop
 
-# GPU server binary. Both vendor backends are compiled in but neither is LINKED
-# — cuda dlopens libcuda.so.1, hsa dlopens libhsa-runtime64.so — so ONE binary
-# serves NVIDIA, AMD, and CPU-fallback hosts. The AMD feature is `hsa` (direct
-# ROCr, no HIP), not `rocm`:
-cargo build --release -p plowrt --features cuda,hsa,hub
-
-# Lean verifier (universal rewrite lemmas + the plow_verify CLI):
-(cd lean-plow && lake build)
-
-# Interpreter objects — NVIDIA cubins (sm_120a) and AMD code objects (gfx950):
-scripts/build_sm120_cubin.sh <out-dir>
-cmake -S runtime -B build-amd -DPLOW_GFX950_HSACO=ON && cmake --build build-amd -j
+cargo build --release -p plowc
+cargo build --release -p plowrt --features cuda,hsa
 ```
 
-The `plowrt` binary has **no link-time GPU dependency** — the driver is loaded at
-runtime via `dlopen`, so the same binary runs GPU-accelerated where a driver is
-present and falls back to the CPU reference backend (correct, orders of magnitude
-slower, logged with a loud banner) where none is. Building needs only Rust + a C
-compiler; `nvcc`/`hipcc` are needed *only* to build the interpreter objects,
-which ship prebuilt alongside assets. Driver probe order, the CPU-fallback
-contract, static-linking limits, and the (not-yet-wired) kernel plugin ABI are
-all in [`docs/BUILD.md`](docs/BUILD.md).
+Binaries: `./target/release/plowc`, `./target/release/plowrt`.
+(`cuda` / `hsa` already pull the HF tokenizer.)
 
-> Binaries built in the nix shell link the nix glibc loader. On a host where the
-> nix store is only visible inside nix (e.g. `nix-portable`), run them through
-> `nix develop --command ...` — outside it the kernel reports the missing ELF
-> interpreter as a bare `No such file or directory` on a file that plainly exists.
+If the nix store is only visible inside the shell, keep using
+`nix develop --command …` for every command below.
 
-### AMD interpreter objects
+Optional: `cargo test --workspace` and `(cd lean-plow && lake build)`.
 
-cmake drives the compile; **`hipcc` comes from the local ROCm**, not nix. One
-configure emits every object, so a packet cannot reach for a variant the build
-quietly skipped:
+## 1. Download Gemma-4-12B
 
 ```bash
-nix develop                               # for cmake — NOT for hipcc
-cmake -S runtime -B build-amd -DPLOW_GFX950_HSACO=ON -DPLOW_HSACO_ARCH=gfx950
+mkdir -p "$HOME/models"
+hf download google/gemma-4-12B-it \
+  --local-dir "$HOME/models/gemma-4-12B-it"
+```
+
+The API slug is the lowercased directory name: **`gemma-4-12b-it`**.
+Keep that name; `plowc` and `/v1/models` both derive it this way.
+
+---
+
+## Recipe A — NVIDIA RTX 5090 (`sm_120`, 170 SMs, 32 GB)
+
+Use a moderate context on 32 GB. `--n-cu` **must** be `170` for this SKU.
+
+### A1. Interpreter cubins
+
+`nvcc`/`cmake` should see the **system** CUDA, not nix’s glibc. From a normal
+shell (or with a clean `PATH`):
+
+```bash
+export PATH=/usr/local/cuda/bin:$PATH
+mkdir -p "$HOME/plow-assets/gemma4-12b-5090"
+scripts/build_sm120_cubin.sh \
+  "$HOME/plow-assets/gemma4-12b-5090/interp_sm120.cubin" \
+  -DPLOW_NV_FA_GF_FULL=4
+# writes interp_sm120.cubin + interp_sm120_pf.cubin beside it
+```
+
+### A2. Compile the packet (bundle)
+
+Back in `nix develop`:
+
+```bash
+ASSETS="$HOME/plow-assets/gemma4-12b-5090"
+CKPT="$HOME/models/gemma-4-12B-it"
+
+PLOW_UNISEG=1 PLOW_NS_FULL_ABS=8 \
+  ./target/release/plowc \
+  --hf-dir "$CKPT" \
+  --emit devblob \
+  --gpu rtx5090 \
+  --n-cu 170 \
+  --max-ctx 8192 \
+  --out "$ASSETS"
+```
+
+Bundle mode writes `model.pkt` + `weights.json` and symlinks `checkpoint` →
+`$CKPT` and `tokenizer.json`. Cubins from A1 must already sit in `$ASSETS`.
+
+`PLOW_UNISEG=1` is **NVIDIA-only**. Never set it for AMD.
+
+### A3. Serve and chat
+
+```bash
+ASSETS="$HOME/plow-assets/gemma4-12b-5090"
+./target/release/plowrt serve --assets "$ASSETS" --port 8080
+```
+
+Build must have included `--features cuda` (see §0). Re-run via cargo if
+needed:
+
+```bash
+cargo run --release -p plowrt --features cuda -- \
+  serve --assets "$ASSETS" --port 8080
+```
+
+```bash
+curl -s http://127.0.0.1:8080/v1/models | jq .
+
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "gemma-4-12b-it",
+    "messages": [{"role":"user","content":"What is the capital of France?"}],
+    "max_tokens": 64
+  }' | jq .
+```
+
+---
+
+## Recipe B — NVIDIA RTX PRO 6000 Blackwell (`sm_120`, 188 SMs, 96 GB)
+
+Same as A, but SKU flags and longer context:
+
+```bash
+ASSETS="$HOME/plow-assets/gemma4-12b-6000pro"
+CKPT="$HOME/models/gemma-4-12B-it"
+mkdir -p "$ASSETS"
+
+export PATH=/usr/local/cuda/bin:$PATH
+scripts/build_sm120_cubin.sh "$ASSETS/interp_sm120.cubin" -DPLOW_NV_FA_GF_FULL=4
+
+PLOW_UNISEG=1 PLOW_NS_FULL_ABS=8 \
+  ./target/release/plowc \
+  --hf-dir "$CKPT" \
+  --emit devblob \
+  --gpu rtx6000pro \
+  --n-cu 188 \
+  --max-ctx 131072 \
+  --out "$ASSETS"
+
+./target/release/plowrt serve --assets "$ASSETS" --port 8080
+```
+
+Curl uses the same `"model": "gemma-4-12b-it"`.
+
+`--n-cu` is **not** portable across SM counts. Emitting with `188` and running on
+a 170-SM 5090 (or the reverse) mis-schedules work.
+
+---
+
+## Recipe C — AMD MI350X / MI355X (`gfx950`, 256 CUs)
+
+Do **not** set `PLOW_UNISEG`. Use `--arch gfx950` and `--gpu mi350x` or
+`mi355x`.
+
+### C1. Interpreter code objects
+
+Needs system ROCm ≥ 7.2.4 (`hipcc` must not come from nix):
+
+```bash
+cmake -S runtime -B build-amd \
+  -DPLOW_GFX950_HSACO=ON \
+  -DPLOW_HSACO_ARCH=gfx950
 cmake --build build-amd -j
+# objects land in build-amd/hsaco/
 ```
 
-17 code objects land in `build-amd/hsaco/` (`interp_{prefill,decode,flash}.elf`
-+ `_gq` twins, the fp8 / fp8-KV / MX-FP4 / MLA-prefill variants, and
-`test_kernels.elf`). They keep the `.elf` suffix because `gemma4_chat.c` opens
-them by literal filename; they are hsaco code objects. Variant axes default
-**ON** — `-DPLOW_HSACO_{GQ,FP8,FP8KV,MXFP4,MLA}=OFF` to drop one. Two gates run
-*inside* the build so both are build errors, not runtime ones: a **register
-cliff** check (an 8-wave interpreter over 256 VGPR+AGPR drops to 1 wave and fails
-to launch with `HSA_STATUS_ERROR_INVALID_ISA`; the 4-wave flash object is allowed
-512/occ-1) and a **kernel-symbol** check (entry points resolved by name).
-`scripts/build_gfx950.sh` additionally builds the host `chat` harness and runs
-the `asm_audit.py` instruction-selection pass. Only the amdgpu kernel driver +
-ROCr (`libhsa-runtime64.so`) need be present to *deploy*.
+Equivalent: `scripts/build_gfx950.sh build-amd/hsaco`.
 
-### AMD gfx942 (MI300X) — supported
-
-CDNA3 is a first-class served target: the full interpreter object set builds
-and serves on MI300X. It is a separate build script rather than an `$ARCH`
-knob because CDNA3 genuinely diverges (64 KiB LDS forces a single-buffered
-GEMM stage at 192×256; no CDNA4 MFMA/fp4 primitives — `runtime/amd/amd_arch.h`
-is the shim layer; the exported symbols carry the arch suffix):
+### C2. Compile the packet (bundle)
 
 ```bash
-# Objects (outside nix — hipcc needs the system glibc). occ4 is the batch-1 profile.
+ASSETS="$HOME/plow-assets/gemma4-12b-mi355x"
+CKPT="$HOME/models/gemma-4-12B-it"
+mkdir -p "$ASSETS"
+
+./target/release/plowc \
+  --hf-dir "$CKPT" \
+  --emit devblob \
+  --arch gfx950 \
+  --gpu mi355x \
+  --n-cu 256 \
+  --max-ctx 131072 \
+  --out "$ASSETS"
+
+ln -sfn "$(pwd)/build-amd/hsaco" "$ASSETS/hsaco"
+```
+
+For MI350X swap `--gpu mi350x` and the assets dirname. `--n-cu` stays `256`.
+
+A correct Gemma-4 dense emit reports **121 segments per prefill bucket** in
+`build.json` (`2·layers + 1`). If you accidentally used `PLOW_UNISEG=1` on AMD,
+prefill can “finish” in a few ms with zero logits — that flag collapses
+wave-class segments and is invalid on gfx950.
+
+### C3. Serve and chat
+
+```bash
+./target/release/plowrt serve --assets "$ASSETS" --port 8080
+```
+
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "gemma-4-12b-it",
+    "messages": [{"role":"user","content":"What is the capital of France?"}],
+    "max_tokens": 64
+  }' | jq .
+```
+
+### Example running instance
+
+`plowrt serve` after a successful load — Gemma-4 12B (~22 GiB weights) on an
+NVIDIA GH200, OpenAI-compatible API on TCP:
+
+![plowrt serving Gemma-4 12B on NVIDIA GH200](media/plowrt-gemma4-12b-gh200.png)
+
+---
+
+## Recipe D — AMD MI300X (`gfx942`, 304 CUs)
+
+CDNA3 is a first-class served target: the full interpreter object set builds and
+serves on MI300X. It is a separate build script rather than an `$ARCH` knob
+because CDNA3 genuinely diverges — 64 KiB LDS forces a single-buffered GEMM
+stage at 192x256, and there are no CDNA4 MFMA/fp4 primitives, so
+`runtime/amd/amd_arch.h` is the shim layer and the exported symbols carry the
+arch suffix. Do **not** set `PLOW_UNISEG`.
+
+### D1. Interpreter code objects
+
+Build outside nix — `hipcc` needs the system glibc. `PLOW_OCC4=1` is the
+batch-1 occupancy profile:
+
+```bash
 PLOW_OCC4=1 PLOW_L2HIER=1 bash scripts/build_gfx942.sh build-amd/hsaco/gfx942
+```
 
-# Model blob. On gfx942, PLOW_FP8=1 PLOW_W8A8=1 is the per-channel fp8 serving
-# mode (weights + activations); PLOW_FP8_HEAD=1 additionally quantizes the
-# lm_head (scripts/quantize_fp8_head.py builds the missing shard). L2-domain
-# packet placement is ON by default for gfx942.
+### D2. Compile the packet (bundle)
+
+On gfx942, `PLOW_FP8=1 PLOW_W8A8=1` selects the per-channel fp8 serving mode
+(weights *and* activations); `PLOW_FP8_HEAD=1` additionally quantizes the
+lm_head, for which `scripts/quantize_fp8_head.py` builds the missing shard.
+L2-domain packet placement is on by default for gfx942.
+
+```bash
+ASSETS="$HOME/plow-assets/gemma4-12b-mi300x"
+CKPT="$HOME/models/gemma-4-12B-it"
+mkdir -p "$ASSETS"
+
 PLOW_FP8=1 PLOW_W8A8=1 PLOW_FP8_HEAD=1 PLOW_FUSE_HNR=1 \
-    cargo run --release -p plowc -- --hf-dir <hf-dir> --emit devblob \
-    --arch gfx942 --gpu MI300X --max-ctx <ctx> --out <assets>/model.pkt
+  ./target/release/plowc \
+    --hf-dir "$CKPT" \
+    --emit devblob \
+    --arch gfx942 \
+    --gpu MI300X \
+    --max-ctx 131072 \
+    --out "$ASSETS/model.pkt"
+
+ln -sfn "$(pwd)/build-amd/hsaco/gfx942" "$ASSETS/hsaco"
 ```
 
-Measured on one MI300X against vLLM 0.26 (Gemma-4-12B, bf16 vLLM vs fp8-served
-plow, same box, same bench client, interleaved rounds — the apples-to-apples
-protocol and the full tables live in `perf-data/plow-gfx942/`): plow's
-sliding-window decode is nearly context-flat, so it **wins from ~16k context
-up** (TPOT 11.31 vs 11.67 ms at 16k, 11.81 vs 14.10 at 32k, ~+20% at 64k) and
-trails at short context (10.95 vs 9.81 at 4k; ~tie at 8k). Prefill TTFT is the
-known weak side (1.5–3× behind, `perf-data` §18). MX-FP4 stays gfx950-only —
-CDNA3 has no fp4 hardware and `plowc` refuses it at emit.
+MX-FP4 stays gfx950-only — CDNA3 has no fp4 hardware and `plowc` refuses it at
+emit.
 
-## Compile a model (plowc)
+### D3. Serve and chat
+
+Identical to [C3](#c3-serve-and-chat): `plowrt serve --assets "$ASSETS"`.
+
+### Measured behaviour
+
+Gemma-4-12B on one MI300X against vLLM 0.26 — bf16 vLLM vs fp8-served plow, same
+box, same bench client, interleaved rounds. Full tables and the apples-to-apples
+protocol are in [`perf-data/plow-gfx942/`](perf-data/plow-gfx942/).
+
+plow's sliding-window decode is close to context-flat, so it leads from roughly
+16k context up and trails at short context:
+
+| Context | plow TPOT | vLLM 0.26 TPOT |
+|---------|-----------|----------------|
+| 4k  | 10.95 ms | 9.81 ms |
+| 8k  | ~tie     | ~tie    |
+| 16k | 11.31 ms | 11.67 ms |
+| 32k | 11.81 ms | 14.10 ms |
+
+Prefill TTFT is the known weak side — 1.5-3x behind, un-tuned; the auto-tuner
+does not cover the prefill path yet.
+
+---
+
+## Asset layout (what `serve` expects)
+
+After a successful recipe, `$ASSETS` contains at least:
+
+```
+model.pkt
+weights.json          # "network": "gemma-4-12b-it"
+tokenizer.json -> …   # symlink into the HF dir
+checkpoint -> …       # symlink to the HF dir (weights mmap’d / uploaded)
+# NVIDIA:
+interp_sm120.cubin
+interp_sm120_pf.cubin
+# AMD:
+hsaco/ -> …           # interp_decode.elf, interp_prefill.elf, interp_flash.elf, …
+```
+
+Confirm the slug before curling:
 
 ```bash
-# Decode+prefill device blob for a Gemma-4 checkpoint.
-#   --hf-dir   checkpoint directory      --max-ctx  max context tokens
-#   --n-cu     executor (SM) count       --out      .pkt path, or a dir for a
-#                                                    full servable bundle
-# NVIDIA (sm_120):
-PLOW_UNISEG=1 cargo run --release -p plowc -- \
-    --hf-dir /path/to/gemma-4-12B-it --emit devblob --max-ctx 131072 --n-cu 188 \
-    --out model.pkt
-
-# AMD (gfx950): NO PLOW_UNISEG, and target the GPU explicitly so --arch and
-# --gpu agree. Verify build.json shows 121 segments per prefill bucket.
-cargo run --release -p plowc -- \
-    --hf-dir /path/to/gemma-4-31B-it --emit devblob --arch gfx950 --gpu mi355x \
-    --max-ctx 131072 --out model.pkt
+jq -r .network "$ASSETS/weights.json"
+# → gemma-4-12b-it
 ```
 
-> ⚠️ **`PLOW_UNISEG=1` is NVIDIA-only. Never pass it when targeting gfx950** — it
-> collapses every op into one segment (right on sm_120, which runs one
-> cooperative launch) but on AMD it sends the **entire prefill program to the
-> 4-wave flash object**, which silently drops every GEMM/norm/lm_head. Prefill
-> "completes" fast and the logits are all zero. A correct Gemma-4 31B emit has
-> **121 segments per prefill bucket** (`2·layers + 1`) — check `build.json`.
+Streaming: `"stream": true`. Also `/healthz`, `/metrics`. Multiple
+`--assets DIR` register more models.
 
-`plowc` emits one **instruction** per operator, but the unit of *work* is finer:
-each program carries a per-CU stream of `StreamEnt{inst, slice, …}` tasks (one
-per `(op, slice)`), so a devblob is an **SM-level task graph**, not a kernel
-graph. Programs are chunk-level (prefill: one per sequence-chunk bucket; decode:
-one per batch size). The full emission model, the per-CU-stream vs global-queue
-scheduler note, and every emit knob (`PLOW_DECODE_BATCH`, `PLOW_MAX_CHUNK`,
-`PLOW_PF_LADDER`, `PLOW_L2_PLACE`, `PLOW_FINE_FORCE`, …) are in
+## Architecture
+
+Architecture chapters: [`docs/arch/`](docs/arch/00-overview.md) — compiler
+pipeline, tile graph, scheduler, packet ABI, counter system, runtime, cost
+model, formal verification, multi-GPU. Build-system rationale:
+[`docs/BUILD.md`](docs/BUILD.md). Every emit/build/runtime flag:
 [`docs/flags-reference.md`](docs/flags-reference.md).
 
-> The standalone `gemma4`/`tinygemma` binaries that predated `--emit devblob` are
-> deprecated; build them with `--features legacy-gemma-bins` if still needed.
+## Contributing
 
-### fp8 (compile/emit-time, off by default)
+See [CONTRIBUTING.md](CONTRIBUTING.md). Please follow the
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
-fp8 is **not** a runtime toggle — it is baked when the model is compiled and the
-interp objects are built. The default is the accuracy-safe **bf16** path; fp8 is
-opt-in because it is *lossy*. Precision flags are named by **axis** — `PLOW_W8A16`
-(fp8 weights / bf16 acts), `PLOW_W8A8` (fp8 weights + acts), `PLOW_MXFP4`,
-`PLOW_KV_FP8` (fp8 KV cache); the axes compose and an axis a family can't realize
-is *refused*, not silently downgraded. The spelling differs by model family and
-GPU — see the axis/family table in
-[`docs/flags-reference.md`](docs/flags-reference.md).
+## Security
 
-```bash
-# 1. weight twins (per-row e4m3 + f32 scales under fp8/ next to the checkpoint)
-python perf-data/harness/quantize_fp8.py <hf-dir>
-# 2. emit the fp8 blob (twins auto-detected). NVIDIA:
-PLOW_UNISEG=1 PLOW_FP8_HEAD=1 PLOW_FUSE_ARGMAX=1 \
-    cargo run --release -p plowc -- --hf-dir <hf-dir> --emit devblob --max-ctx <ctx> --n-cu 188 --out model.pkt
-# AMD (gfx950) — no PLOW_UNISEG, axis-named precision flags:
-PLOW_W8A8=1 PLOW_FP8_HEAD=1 PLOW_FUSE_ARGMAX=1 \
-    cargo run --release -p plowc -- --hf-dir <hf-dir> --emit devblob --arch gfx950 --gpu mi355x --max-ctx <ctx> --out model.pkt
-# 3. build the interp objects WITH the matching fp8 kernel arms:
-scripts/build_sm120_cubin.sh <out> -DPLOW_NV_W8A8=ON -DPLOW_FP8_KV=ON
-```
+Report vulnerabilities privately — see [SECURITY.md](SECURITY.md).
 
-> ⚠️ **The emit flag and its `-D` build flag must agree.** An fp8 packet served
-> against an interpreter built *without* the matching arm hits `default: __trap()`
-> and every launch dies with `CUDA_ERROR_LAUNCH_FAILED` — it looks like a driver
-> problem and is not. On gfx950, plain `PLOW_FP8=1` is *refused* at emit (it means
-> w8a16, but the gfx950 GEMM arm is w8a8); use `PLOW_W8A8=1`. Keep `--arch` and
-> `--gpu` in agreement.
+## License
 
-Measured (gemma-4-31B, single-user): fp8 **decode beats vLLM-fp8** (−41% vs vLLM
-bf16); fp8 **prefill** beats vLLM-bf16 at 32k. `PLOW_KV_FP8` doubles the 31B
-concurrency ceiling — but it is lossy and *degrades with context* (validate
-retrieval at *your* context length, not a short one). Full numbers and the KV
-caveats: [`docs/flags-reference.md`](docs/flags-reference.md).
+Copyright 2026 Infervisor.
 
-## Run the server (plowrt)
+Licensed under the [Apache License, Version 2.0](LICENSE).
 
-Assemble an assets directory:
+## Code of Conduct
 
-```
-assets/
-  model.pkt                  # from plowc
-  interp_sm120.cubin         # decode object   (build_sm120_cubin.sh)
-  interp_sm120_pf.cubin      # prefill object  (optional but strongly advised)
-  tokenizer.json             # from the checkpoint
-  checkpoint -> /path/to/hf-checkpoint-dir   # symlink (weights are mmap'd)
-  weights.json               # minimal manifest ({"buckets": []})
-```
-
-```bash
-plowrt serve --assets assets/ --port 8080
-curl localhost:8080/v1/chat/completions -d '{
-  "model": "<manifest network name>",
-  "messages": [{"role":"user","content":"What is the capital of France?"}]
-}'
-```
-
-Streaming (`"stream": true`), `/v1/models`, `/healthz`, `/metrics`, and `/trace`
-are supported. Multiple `--assets` dirs register multiple models.
-
-**Serving knobs** (`plowrt` env) tune prefill batching, chunking, and the VMM KV
-prefix cache — the useful defaults work out of the box. Chunked prefill is on by
-default; `PLOW_PF_BATCH=1` packs waiting requests' prefill into one launch
-(+27% saturated throughput); `PLOW_VMM_PREFIX=1` reuses a prior request's KV
-prefix (warm TTFT up to 23.8× at 128k). One thing plow does **not** do: mixed
-prefill⊕decode in a single launch (a tick that does both runs two launches). The
-full table, the three easily-conflated batching modes, and every loader override
-are in [`docs/flags-reference.md`](docs/flags-reference.md).
-
-## Feature flags & configurations
-
-Perf features from the rtx-11/12/13 campaigns are gated so the **default build is
-a fixed, validated bf16 configuration**; every flag is an A/B control with a
-correctness gate, and **unset = shipped default**. Almost nobody needs the
-individual knobs — pick one of the four configurations below and use its flags.
-The **emit** column is `plowc` env; the **build** column is `nvcc -D…` / CMake.
-
-| you want | emit | build | notes |
-|---|---|---|---|
-| **Default** — validated bf16 | `PLOW_UNISEG=1` | *(none)* | The shipped configuration. |
-| **fp8 weights** — faster prefill GEMM | `PLOW_UNISEG=1 PLOW_W8A8=1` | `-DPLOW_NV_W8A8=1` | −48% GEMM, −30…34% prefill. Needs fp8 twins. **Both flags or neither** — mismatch = `__trap()`. |
-| **Long context, multi-user** — fp8-KV | `PLOW_UNISEG=1 PLOW_W8A8=1 PLOW_FP8_KV_FULL=1` | `-DPLOW_NV_W8A8=1 -DPLOW_FP8_KV=ON -DPLOW_FP8_KV_FASTPF=ON` | Halves KV bytes (B=8 at 127k fits 32 GB). `FASTPF=ON` keeps prefill on the fast PIPE=1 arm (−21% at 67k). ⚠️ Lossy, degrades with context — validate retrieval at *your* ctx. |
-| **Legacy all-layer fp8 KV** | `… PLOW_FP8_KV=1` (no `_FULL`) | `-DPLOW_FP8_KV=ON` (FASTPF off) | e4m3 every layer; `FASTPF` must stay OFF (traps under PIPE=1). Prefer the mixed row above. |
-
-The **~200 individual build/emit/runtime knobs** — object-selection arms,
-precision, attention (`FA_PX4`/`FA_PIPE` carry the long-context wins), GEMM/GEMV,
-MoE, scheduling, per-model-family fusion arms, measurement-only ablations, and
-the runtime serving knobs — are documented, with measured deltas and the reason
-each default sits where it does, in
-[`docs/flags-reference.md`](docs/flags-reference.md).
-
-## Standalone harnesses & benchmarks
-
-`runtime/tests/` carries the HF-parity-gated chat/bench harnesses the perf
-campaigns use (e.g. `gemma4_sm120_chat.cu`). The numeric oracle is
-`runtime/tests/sm120_interp_op_test.cu` — every interpreter op body vs an f32 CPU
-reference, with a negative-control build that must fail. Build with nvcc
-`-arch=sm_120a` or via `runtime/CMakeLists.txt` (`PLOW_CUDA=ON`).
-
-Measured results live in `perf-data/` (one JSON + MD per campaign). Multi-user
-sweeps use HuggingFace `inference-benchmarker` via `perf-data/bench_ib.sh`
-against both plow and vLLM with identical profiles.
-</content>
+This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md).
+Report unacceptable behavior to **lava@infervisor.ai**.
