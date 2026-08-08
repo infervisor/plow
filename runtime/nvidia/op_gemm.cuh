@@ -783,7 +783,7 @@ static __device__ void d_gemv_qkv(__nv_bfloat16* __restrict__ Cq, __nv_bfloat16*
  * This is a MEASUREMENT-GATED default, not a verdict on the kernel. End-to-end prefill cannot be
  * measured without a checkpoint; set to 1 once a real prefill run shows the 1.15-1.22x on
  * GEMM_GLU outweighs the extra spills, or once TMA + setmaxnreg warp specialization relieves the
- * 255-register ceiling (which is the actual fix — see plans/h100-hopper-optimization.md). */
+ * 255-register ceiling (which is the actual fix — see the design notes). */
 #ifndef PGM90_FORK_GLU
 #define PGM90_FORK_GLU 0
 #endif
@@ -2062,7 +2062,7 @@ static __device__ void d_gemv_glu_sz(__nv_bfloat16* __restrict__ C, const __nv_b
 }
 
 /* ============================ fp8 (w8a16) DECODE GEMV ==================================
- * The settled decode recipe (plans/rtx-05 §T2, refuting mma.sync/TMA/warp-spec at M=1):
+ * The settled decode recipe (the design notes mma.sync/TMA/warp-spec at M=1):
  * FFMA dequant-on-load. The weight is e4m3 (1 byte/elt), HALF the bytes of the bf16 GEMV
  * above and therefore ~2x the bandwidth-bound roofline. The math is IDENTICAL to gemv_rows:
  * one WARP owns one output row n, each lane fmas 8 consecutive K elements per chunk, the warp
@@ -2116,7 +2116,7 @@ __device__ __forceinline__ float dot8_fp8(const uint2& w8, const bf16v8& x, floa
  * instead of B. Before this the fp8 arms were scalar-accumulator (row 0 only), which left rows
  * 1..B UNWRITTEN — fluent wrong text for every slot but the first, hence the compiler's
  * `fp8 && dbatch>1` refusal. MM==1 is byte-identical to that old body (the B=1 serving path).
- * The dequant (dot8_fp8) stays on the FFMA path: at these M it beats mma (plans/rtx-05 §T2),
+ * The dequant (dot8_fp8) stays on the FFMA path: at these M it beats mma,
  * and amortising it over MM rows only widens the margin. */
 template <int MM, int UN = gv_un_fp8<MM>::v>
 __device__ __forceinline__ void gemv_rows_fp8(__nv_bfloat16* __restrict__ C,

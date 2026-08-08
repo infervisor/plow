@@ -6,7 +6,7 @@
 # DEPRECATED — SCHEDULED FOR REMOVAL. The build lives in runtime/CMakeLists.txt
 # (`-DPLOW_SM120_CUBIN=ON`, target `sm120_cubins`). Do NOT add new callers; drive
 # CMake directly. This wrapper exists only so in-flight callers keep working
-# while they are migrated. See plans/interp-build-system.md for the checklist.
+# while they are migrated. See the design notes for the checklist.
 #
 # THIN WRAPPER. The build itself now lives in runtime/CMakeLists.txt
 # (`-DPLOW_SM120_CUBIN=ON`, target `sm120_cubins`) and this script configures and

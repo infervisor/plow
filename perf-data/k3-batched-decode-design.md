@@ -463,7 +463,7 @@ lease mid-experiment. That is the same contention §8.6c documents, and it is wh
 **Method note for anything that follows.** Every B=16 comparison in this campaign was a single run
 against a single baseline. At +/-1.4% noise with +45% outliers and a 6-8% inter-session drift, that
 resolves nothing under ~10%. Anything claiming less than that needs interleaved, order-reversed
-repeats — which is what `plans/knob-contract.md` §0-BENCH already required and which this section
+repeats — which is what the design notes already required and which this section
 did not do.
 
 # 8.7 THE B=16 STEP, ATTRIBUTED — the first trace ever taken at batch > 1

@@ -1,6 +1,6 @@
 //! Megatron weight sharding — which slice of a checkpoint tensor rank `r` owns.
 //!
-//! `plans/tp-design.md` §3a pairs a **column-parallel** producer with a
+//! the design notes pairs a **column-parallel** producer with a
 //! **row-parallel** consumer so each sublayer needs exactly one all-reduce and
 //! no all-gather. That makes the bind a two-case problem:
 //!

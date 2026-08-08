@@ -3,7 +3,7 @@
 //! consumer-block's first op tiles unblock as their specific producer-block
 //! last-op tiles complete, not after the whole tensor.
 //!
-//! Backs the design in `plans/lean-formal-verification-analysis.md §5.10-D`
+//! Backs the design in the design notes
 //! and the `plan_from_all_blocks` API.
 
 use costmodel::{Soc, SramPolicy, DEFAULT_PAGE_BYTES};

@@ -211,7 +211,7 @@ prefill GEMM FLOPs and is the GLU arm, which PX-7 showed is register-limited: at
 as the plain body. A per-op tile choice (`BN=64` for `GEMM_GLU`, `BN=128` for the plain
 projections) is worth `0.67*1.096 + 0.33*1.00` = **+6.4% weighted**, and it is a selector
 change, not a kernel change. Not taken here because it belongs to the tuning system
-(`plans/arch-gemm-tuning-system.md`), but it is the largest single win in the knob space.
+, but it is the largest single win in the knob space.
 
 ## Result 6 — two bit-exact body changes, +9% on the plain arm, 0% on GLU
 

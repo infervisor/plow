@@ -1,7 +1,7 @@
 # Kimi-K3 vs plow's gfx950 KERNEL inventory — audit and ranked gap list
 
 > **UPDATE 2026-07-28 — five items in §10 are CLOSED, measured on real weights on one gfx950.**
-> See `plans/kimi-k3-block-impl.md` for the residual tables.
+> See the design notes for the residual tables.
 >
 > | §10 | item | status |
 > |---|---|---|
@@ -751,7 +751,7 @@ concludes the merge is slow.
 ### 8c. RoPE must be REMOVED — **WRONG. It must be NEUTRALIZED. Corrected 2026-07-28 (rung 3)**
 
 > **This section's prescription — "skip both `HeadNormRope` emits", "It is a removal", "effort XS" —
-> is the bug, not the fix.** `plans/kimi-k3-frontend.md` §7 first flagged it; rung 3 implemented and
+> is the bug, not the fix.** the design notes first flagged it; rung 3 implemented and
 > gated the correct form.
 >
 > The k-side `HeadNormRope` (`d.t[0] = n.krot[slot]`) is

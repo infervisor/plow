@@ -23,7 +23,7 @@ extern "C" void hip_flash_mfma(const void* body, kctx* ctx) {
 //
 // LDS pressure (60 KiB usable): norm-prologue GEMM caps BN=128 and keeps gamma
 // in bf16 (8 KiB) + single-buffers A (weight B stays double-buffered as the
-// DMA-bound operand). Fallback: BK=32. Tile params in plans/gemma-4-31b-*.md.
+// DMA-bound operand). Fallback: BK=32. Tile params in the design notes*.md.
 // ==========================================================================
 
 // F1 FusedNormLinear (q/kv/gate/up): RMSNorm-prologue -> MFMA. in0=A, in1=B,

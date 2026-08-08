@@ -8,11 +8,11 @@
 #
 # The second is the one to watch: register allocation in the megakernel is the worst case over every
 # INLINED arm, and prefill already sits AT the 256-VGPR / occ-2 cliff with 2 VGPR spills
-# (plans/knob-contract.md §6g-WAVE4). A new instantiation of an existing template is exactly the
+#. A new instantiation of an existing template is exactly the
 # kind of change that is "free" until it is not.
 #
 # Run OUTSIDE `nix develop` — the nix shell's libstdc++/glibc shadow the system ones and every
-# system ROCm binary dies with GLIBC_2.38 (plans/knob-contract.md §0a). Compile-only; no GPU.
+# system ROCm binary dies with GLIBC_2.38. Compile-only; no GPU.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 R="$PWD/runtime"

@@ -229,7 +229,7 @@ fn ingest(db: &PathBuf, samples: &PathBuf, campaign: &str, provisional: bool) ->
 ///
 /// Grouped by `(N, K)` and laid out across M, because "the per-token cost of a decode GEMV as
 /// the batch widens" is one row of a table and not one number — and the point at which it stops
-/// falling is the whole result (`plans/knob-contract.md` §6g-BATCH: aggregate tok/s peaks at
+/// falling is the whole result (the design notes: aggregate tok/s peaks at
 /// B=8 and LOSES 30% at B=16).
 fn best(db: &PathBuf) -> Result<(), Err> {
     let store = TuneStore::new(db.clone());

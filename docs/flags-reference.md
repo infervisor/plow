@@ -163,7 +163,7 @@ shipped one.
   on dense Gemma it was a wash-to-loss (16.9 → 17.2 ms/token), which is why coarse
   is the default. Lean-safe (a fine list only lowers a threshold / narrows a wait
   set), and **unset = byte-identical** coarse. There is no all-to-all "everything
-  fine" mode — see `plans/fine-counter-deadlock-fix.md`.
+  fine" mode —
 - `PLOW_L2_PLACE=1` — **L2-domain packet grouping** (compiler half of physical-SM
   locality). *Was `PLOW_NV_PLACE`, still accepted as a deprecated alias: an L2
   domain is a GPC on NVIDIA and an XCD on AMD, and `hwspec` describes both, so the
@@ -199,7 +199,7 @@ shipped one.
   object and returns zero logits. So on gfx950 the **decode** program is placed and
   prefill is not. A placement blob carries a header flag (`PLOW_BLOB_F_L2DOM`, plus
   SMs/partition + domain count in `reserved`) that a runtime **without**
-  `PLOW_L2_PLACE_DISPATCH` refuses at load. See `plans/l2-placement-generic.md`.
+  `PLOW_L2_PLACE_DISPATCH` refuses at load.
 
   **Measured on Gemma-4-31B decode (MI355X, 3 interleaved folds, 64 steps): no
   effect** — 16.57 vs 16.54 ms/token, with fold deltas of +2.7%, −3.1%, −0.2%.

@@ -736,7 +736,7 @@ fn devblob_verify_hook(
             //
             // Under `PLOW_L2_PLACE` it is NOT. `Builder::finish` stable-sorts `gq_stream` by
             // `seg` into `l2_domains` windows, and the runtime gives each domain its OWN cursor
-            // over its OWN window (`plans/l2-placement-generic.md` §3). Entry `i`'s issue
+            // over its OWN window. Entry `i`'s issue
             // predecessor is then the previous entry OF ITS DOMAIN. Handing the placed stream to
             // the one-cursor model makes every counter edge that crosses from a later window
             // back to an earlier one look like a backward edge, and checkpoint D reports the
@@ -1040,7 +1040,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // not from an env-supplied constant; the flag only says whether to use it. `None` (flag
     // unset, or an unpartitioned GPU such as consumer Blackwell) ⇒ byte-identical blob. The
     // physical-SM dispatch that consumes this is a runtime/interp feature —
-    // see plans/l2-placement-generic.md.
+    // see the design notes
     //
     // WAS `PLOW_NV_PLACE`, still accepted. The concept is vendor-neutral — an L2 domain is a GPC
     // on NVIDIA and an XCD on AMD — and the NVIDIA-specific name was reading as "this is an

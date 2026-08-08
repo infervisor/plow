@@ -70,7 +70,7 @@
 # Env: PLOW_K3_CKPT (default the k3_farm symlink farm, else the HF snapshot), PLOW_K3_HSACO
 # (build-amd/hsaco), PLOW_K3_LAYERS (1,2), PLOW_K3_COS (0.9999), PLOW_K3_STEPS (3),
 # PLOW_K3_PROMPT ("The capital of France is"), PLOW_K3_OUT (a tmpdir), PLOW_K3_MIN_FREE_GIB (28).
-# `sg render` must be OUTSIDE nix; see plans/k3-decode-perf.md.
+# `sg render` must be OUTSIDE nix; see the design notes
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"

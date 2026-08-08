@@ -365,7 +365,7 @@ const STAGE: usize = 64 << 20;
 /// the launch loudly (never silent), so a stale value here cannot corrupt.
 const SMEM_PF: u32 = 21312 * 4;
 
-/// VMM prefix-sharing state (`PLOW_VMM_PREFIX=1`, plans/rtx-09): the pool
+/// VMM prefix-sharing state (`PLOW_VMM_PREFIX=1`): the pool
 /// backing every FULL layer's `kv.{l}.k/v` tensor with per-sequence VA
 /// windows, plus the sliding-ring metadata the boundary snapshots need
 /// (sliding layers stay on cudaMalloc; their last `window` rows are

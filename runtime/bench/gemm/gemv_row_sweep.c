@@ -281,7 +281,7 @@ int main(int argc, char** argv) {
      * object serving M=16 is the §6g-WALK arm — and pairing them the other way round hides it
      * behind "the diagonal". Only M >= MM is run: MM > M is legal (the `m < M` predicate covers
      * it) but it is the same work in a wider accumulator, which is a register question this
-     * harness cannot see and `plans/knob-contract.md` §6g-WALK already answers statically. */
+     * harness cannot see and the design notes already answers statically. */
     for (int im = 0; im < NMM; im++) {
         const unsigned M = MMS[im];
         /* Weight bytes are M-INVARIANT — one pass streams the whole weight — so per-token cost

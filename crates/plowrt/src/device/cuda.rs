@@ -194,7 +194,7 @@ driver_api! {
         fn(CUfunction, u32, u32, u32, u32, u32, u32, u32, CUstream, *mut *mut c_void) -> CUresult,
     cuLaunchKernel:
         fn(CUfunction, u32, u32, u32, u32, u32, u32, u32, CUstream, *mut *mut c_void, *mut *mut c_void) -> CUresult,
-    // VMM surface (plans/rtx-09-prefix-headmajor.md; probed by
+    // VMM surface (the design notes; probed by
     // runtime/nvidia/experiments/vmm_probe.cu on this driver line). Present
     // since CUDA 10.2 — safe to resolve unconditionally.
     cuMemGetAllocationGranularity:
@@ -208,7 +208,7 @@ driver_api! {
     cuMemSetAccess: fn(CUdeviceptr, usize, *const CUmemAccessDesc, usize) -> CUresult,
     // D2D copy: VMM sliding-window restore + the prefix-attach copy baseline.
     cuMemcpyDtoD_v2: fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult,
-    // Async submission surface (plans/plowrt-gpu-exec-critical-path.md §CUDA
+    // Async submission surface (the design notes
     // submission path): one ordered stream per engine, async copies/memsets,
     // events. All present since CUDA 4.0 — safe to resolve unconditionally.
     cuStreamCreate: fn(*mut CUstream, u32) -> CUresult,

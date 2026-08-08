@@ -5,7 +5,7 @@
 # Runs INSIDE `sg render -c` (this login session predates the render gid) and
 # unsets HIP_/CUDA_VISIBLE_DEVICES, which COMPOSE with the ROCR ids gpulease
 # exports and otherwise leave a HIP binary with "no ROCm-capable device"
-# (plans/knob-contract.md §0a).
+#.
 set -u
 unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

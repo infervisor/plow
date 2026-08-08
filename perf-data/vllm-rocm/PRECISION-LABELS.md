@@ -20,7 +20,7 @@ Verified against the checkpoints on disk, 2026-07-27:
 
 1. **The three Gemma rows are sound** and are the only clean bf16-vs-bf16 baselines here. Every
    apples-to-apples claim in this campaign rests on those.
-2. **GLM-5.2's baseline is an fp8 run.** An earlier note in `plans/knob-contract.md` claimed the
+2. **GLM-5.2's baseline is an fp8 run.** An earlier note in the design notes claimed the
    opposite — that "GLM-5.2-FP8 is a model name, not a run precision, so that row is bf16." That
    was wrong in the other direction: the name *and* the run are both fp8. Compare plow's GLM
    numbers against it as **fp8 vs fp8**, never as fp8 vs bf16.

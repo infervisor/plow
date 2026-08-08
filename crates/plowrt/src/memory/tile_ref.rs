@@ -37,7 +37,7 @@
 //! `(BN, BK)` is a shared-memory staging tile shape, not a global byte layout.
 //! [`Tiling::is_identity`] reports when the tiled layout coincides with
 //! row-major (`BN >= N && BK >= K`, i.e. a single tile); for the real Qwen3-4B
-//! `(128, 64)` it does not. See `plans/weight-loader.md` §"Kernel disagreement".
+//! `(128, 64)` it does not. See the design notes §"Kernel disagreement".
 
 /// The `(BN, BK)` byte-layout parameters for one tensor, from
 /// `plow_asset::WeightTiling`.

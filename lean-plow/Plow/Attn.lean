@@ -13,7 +13,7 @@ invariants the compiler + runtime depend on:
   correspond to an explicit predicate on `(query_pos, key_pos)`.
 * **T4**: decode KV read range `[0, past_len)` is correctly bounded by the
   runtime's `past_len` counter, matching the sidecar contract in
-  `plans/kv-decode-and-static.md`.
+  the design notes.
 -/
 import Plow.Basic
 import Plow.TilePartition

@@ -1,4 +1,4 @@
-// Perf A/B for the head-major prefix-cache design (plans/rtx-09-prefix-headmajor.md):
+// Perf A/B for the head-major prefix-cache design:
 // does reading KV through a VMM-mapped virtually-contiguous view cost anything
 // vs plain cudaMalloc — in particular when the 2 MiB physical granules are
 // FRAGMENTED (created amid allocator churn, mapped in shuffled order), which

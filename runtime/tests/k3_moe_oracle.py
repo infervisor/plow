@@ -174,7 +174,7 @@ assert Wdown_l.shape == (HE, HID) and Wup_l.shape == (HID, HE) and Wshg.shape ==
 # ---------------------------------------------------------------------------------------------
 # MXFP4 dequant. Nibble order = element 2i in the LOW nibble, CONFIRMED ON HARDWARE by
 # runtime/tests/k3_mxfp4_nibble_test.c against these exact bytes (1.6e-3 vs 1.4e0 for the swap).
-# E8M0 bias 127 (`plans/knob-contract.md` §2).
+# E8M0 bias 127.
 
 E2M1 = np.concatenate([np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], np.float32)] * 1)
 E2M1 = np.concatenate([E2M1, -E2M1])

@@ -157,7 +157,7 @@ fn parse_weight_tiling_and_logical_shape() {
     assert!(norm.dtype.is_none());
 }
 
-/// The `block.json` descriptor exactly as `plans/block-asset-harness.md` §4
+/// The `block.json` descriptor exactly as the design notes
 /// documents it (Kimi MLA+MoE block, layer 3). Guards the schema shape and the
 /// mixed `["T", 7168]` symbolic/fixed dimension list.
 const BLOCK_JSON: &str = r#"{

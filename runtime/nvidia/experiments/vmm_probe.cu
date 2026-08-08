@@ -1,5 +1,5 @@
 // CUDA VMM feasibility probe for the head-major prefix-cache design
-// (plans/rtx-09-prefix-headmajor.md): can a "virtually-contiguous KV address
+//: can a "virtually-contiguous KV address
 // view" be built from 2 MiB physical granules with cuMemAddressReserve /
 // cuMemCreate / cuMemMap / cuMemSetAccess, and what does each step cost?
 //

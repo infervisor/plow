@@ -5,7 +5,7 @@
 //! request, and get a [`Certificate`] back.
 //!
 //! Six checkpoints correspond to the pipeline stages in
-//! `plans/lean-formal-verification-analysis.md §5.10`:
+//! the design notes:
 //!
 //! | ID | Stage         | Status     |
 //! |----|---------------|------------|
@@ -19,7 +19,7 @@
 //! Additionally, the `query` interface allows the compiler to ask Lean for
 //! provably-optimal decisions (counter granularity, lower bounds, ordering
 //! quality) rather than reimplementing the logic in Rust. See
-//! `plans/lean-active-perf-impl.md`.
+//! the design notes.
 //!
 //! The `PLOW_VERIFY_BIN` env var overrides the binary path (default:
 //! `plow_verify` looked up on `PATH`, then `lean-plow/.lake/build/bin/plow_verify`

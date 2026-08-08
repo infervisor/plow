@@ -3,7 +3,7 @@
 #
 # Answers the question a locality-aware placement pass has to answer FIRST: how much of the
 # program's slice-level producer->consumer dataflow could same-domain placement capture?
-# See `plans/l2-placement-generic.md` §7.
+#
 #
 #   $1  out.pkt (default /tmp/placediff/census.pkt)   $2..  extra plowc args
 set -euo pipefail

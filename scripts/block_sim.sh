@@ -4,7 +4,7 @@
 # Compiles ONE representative transformer block, then walks it through the
 # plowrt CPU simulator and prints the resulting activation summary (packets
 # fired, makespan, per-op-family counts). This is Route S of
-# plans/block-asset-harness.md: block descriptor -> plowc -> plowrt simulate.
+# the design notes: block descriptor -> plowc -> plowrt simulate.
 #
 # Usage:
 #   ./scripts/block_sim.sh <hf-dir-or-config> [bucket]

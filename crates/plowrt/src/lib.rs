@@ -18,7 +18,7 @@
 //! * and serves an OpenAI-compatible API ([`serve`]).
 //!
 //! The design is documented per subsystem under `docs/runtime/` and in
-//! `plans/design-the-runtime-in-whimsical-leaf.md`.
+//! the design notes.
 
 pub mod analysis;
 pub mod asset;

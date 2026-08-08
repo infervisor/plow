@@ -405,7 +405,7 @@ impl DevBlob {
         // will be MIS-dispatched by a wave-class / static interp (it reads `seg`
         // as a wave-class segment). Refuse it unless this runtime opts into
         // physical-SM domain dispatch. (reserved[1]/[2] carry SMs/partition and
-        // the domain count for that dispatch.) See plans/l2-placement-generic.md.
+        // the domain count for that dispatch.) See the design notes
         //
         // `PLOW_NV_PLACE_DISPATCH` stays accepted alongside the new spelling: the flag was
         // renamed because an L2 domain is a GPC on NVIDIA and an XCD on AMD, and a run that

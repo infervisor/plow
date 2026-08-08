@@ -195,7 +195,7 @@ fn an_unmeasured_shape_still_selects() {
 ///
 /// Every other rung at that shape is flat to within 2%; only the smallest tile moved. That
 /// tile is the one EVERY narrow shape selects — the 0.8–3.5%-of-peak routers and
-/// `kv_a_proj`s that `plans/knob-contract.md` §0-EXT-RESULT calls the shape-coverage
+/// `kv_a_proj`s that the design notes calls the shape-coverage
 /// disasters — so a regression in it is a regression in exactly the class plow is already
 /// worst at.
 ///

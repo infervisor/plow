@@ -103,7 +103,7 @@ const CDNA3: [MmaShape; 2] = [
 /// `v_mfma_f32_32x32x16_bf16`. Both double the contraction depth of their CDNA3
 /// counterparts, which is where the generation's bf16 rate increase comes from.
 ///
-/// NOTE (known modelling gap, see `plans/gemma4-mi350x-sprint.md`): unlike
+/// NOTE (known modelling gap): unlike
 /// Hopper/Blackwell `wgmma` — where a *single instruction* spans n up to 256 —
 /// an MFMA is wave-scoped and tops out at n=32. A CDNA workgroup reaches a wide
 /// macro-tile by *repeating* MFMAs across N, not by issuing a wider one. So

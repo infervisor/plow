@@ -1,4 +1,4 @@
-//! Single-block launcher (plans/block-asset-harness.md §6, M1). Loads a
+//! Single-block launcher. Loads a
 //! block asset (a PLOWDEV blob compiled by `gemma4 --block`, its `block.json`
 //! descriptor, and a checkpoint) and drives just that block on the real GPU
 //! through two verbs on ONE loaded engine:

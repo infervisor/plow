@@ -28,7 +28,7 @@ pub mod indirection;
 pub mod oob;
 pub mod queue;
 /// Multi-GPU (tensor-parallel) device group: peer buffers, cross-GPU counters,
-/// and the per-token launch discipline. See `plans/tp-design.md` §6–§7.
+/// and the per-token launch discipline. See the design notes–§7.
 pub mod tp;
 
 use std::sync::Arc;

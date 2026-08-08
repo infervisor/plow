@@ -5,7 +5,7 @@
 //! Kept in `crates/schedule` so it lives close to the source types; no direct
 //! Lean dependency — just serialization + a `lean_verify` crate call.
 //!
-//! Design notes (`plans/lean-formal-verification-analysis.md` §5.10 D+F):
+//! Design notes (the design notes D+F):
 //!
 //! * `resource` — a stable `u64` per `ResourceId` (interned in the order
 //!   resources first appear in the schedule's placement map). Only identity

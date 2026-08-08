@@ -194,5 +194,5 @@ to the `HeadNormRope -> FlashMlaDecode` edge against its −0.509 ms ceiling.
 2. **`dev_isa.h`'s `PLOW_SE_FINE` deadlock argument depends on stream order**: "for any dependency
    A -> B EVERY slice of A precedes EVERY slice of B in EVERY CU's stream… the moment a scheduler is
    added that INTERLEAVES tiles across ops, that argument dies." A tile-granular scheme is exactly
-   that interleaving, and the file it points at (`plans/fine-counter-deadlock-fix.md`) **does not
+   that interleaving, and the file it points at **does not
    exist in this tree**. Slice-granular `Dep::Fine` stays inside the proof; tile-granular does not.

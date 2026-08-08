@@ -1680,7 +1680,7 @@ int main() {
     test_moe_combine_norm("moe_combine_norm H2816 k8", 2816, 8, 1e-6f);
     test_moe_glu_norm("moe_glu_norm E128 k8 I704 H2816", 128, 8, 704, 2816, 1e-6f);
 
-    /* ---- BATCHED DECODE (B>1, plans/batch-decode.md): every decode MoE op vs the SAME per-row
+    /* ---- BATCHED DECODE (B>1): every decode MoE op vs the SAME per-row
      * f32 golden. Each op is covered with rows routing to the SAME experts (share=1, the weight
      * reuse case the channel-major sweep is built for) and to DISJOINT experts (share=0, which
      * catches a row/slot index mixup), plus a top-k tie replicated across rows. ---- */

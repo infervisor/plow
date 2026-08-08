@@ -294,7 +294,7 @@ The **cost** side mirrors `collapse`'s contrapositive: a boundary *pays* only wh
 change lets an op run at a strictly better occupancy by more than the boundary's drain cost. Where
 neighbors share a class, no boundary is emitted (the run is maximal). The formal statement — validity
 (topological partition + dependency-preserving hand-off) and pays-iff-class-differs — is stated in
-[`plans/segmented-dispatch.md`](../../plans/segmented-dispatch.md) for mechanization alongside
+[the design notes](../../the design notes) for mechanization alongside
 `collapse` in `CounterGranularity.lean`.
 
 ### Relation to MPK (arXiv 2512.22219)

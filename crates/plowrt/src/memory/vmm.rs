@@ -1,5 +1,5 @@
 //! §L2 VMM-backed prefix sharing for the full-attention KV cache
-//! (plans/rtx-09-prefix-headmajor.md, "Implementation V1").
+//! (the design notes, "Implementation V1").
 //!
 //! ## What this buys
 //!

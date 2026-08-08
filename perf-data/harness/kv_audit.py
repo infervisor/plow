@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KV-0 compressibility audit for the P10 kv-zip plan (plans/p10-kv-zip.md).
+"""KV-0 compressibility audit for the P10 kv-zip plan.
 
 CPU-only. Reads a PLOW_DUMP_KV dump (raw head-major ring bytes exactly as
 d_headnorm_rope wrote them) and answers, per (layer-type, K|V):

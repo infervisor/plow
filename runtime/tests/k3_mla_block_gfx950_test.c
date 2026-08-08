@@ -80,7 +80,7 @@
  * a hard condition), the krot write still lands at row QPOS and nowhere else. They do NOT
  * assert fp8 is as accurate as bf16 — it is not, by ~25x at row M2, and the harness prints that
  * as an explicit COST line rather than hiding it in a loosened tolerance. See
- * plans/mla-fp8-kv.md for the full table.
+ * the design notes for the full table.
  *
  *   ./k3_mla_test [interp_decode.elf] [k3_mla_fixture.bin]
  */

@@ -228,7 +228,7 @@ A `NetworkBlockDefinition` supplies the concrete semantic DAG, state, precision,
 and phase buckets. The compiler deduplicates its op/region signatures, tunes
 only relevant missing cases, block-validates winners, and transactionally
 publishes qualified measurements. See
-[`plans/arch-gemm-tuning-system.md`](../../plans/arch-gemm-tuning-system.md#36-network-block-driven-tuning-and-database-publication).
+[the design notes](../../the design notes#36-network-block-driven-tuning-and-database-publication).
 
 No runtime stub, alias-only opcode, or uninstantiated tile may enter the
 TileGraph as a selectable candidate.

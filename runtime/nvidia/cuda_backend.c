@@ -12,7 +12,7 @@
  * and (c) cooperative launch. Only the driver API gives all three together, and
  * it keeps this file plain C — no nvcc needed to build it.
  *
- * Mapping (plans/rtx-04-nvidia-interpreter-port.md:100-116):
+ * Mapping (the design notes:100-116):
  *   hsa_init + agent enumerate      -> cuInit / cuDeviceGet / primary context
  *   code_object_reader + freeze     -> cuModuleLoadData
  *   executable_get_symbol(".kd")    -> cuModuleGetFunction

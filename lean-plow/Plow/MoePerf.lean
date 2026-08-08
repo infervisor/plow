@@ -1,8 +1,7 @@
 /-
 # Plow.MoePerf — MoE / EP performance theorems (§D1–D3).
 
-Proves three properties of the SM-local EP dispatch design
-(`plans/expert-parallel.md`):
+Proves three properties of the SM-local EP dispatch design:
 
 * **D1**: gate-weighted expert sum — the fixed-`top_k` packet stream with
   predicated skip (gate = 0 for unused slots) produces the same result as

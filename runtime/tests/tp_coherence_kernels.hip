@@ -7,7 +7,7 @@
  * weight stream evicting stale peer-VRAM lines before they are re-read).
  *
  * This is the cross-GPU / SYSTEM-scope analogue of the cross-XCD / AGENT-scope
- * CTR_FENCE stress test (plans/beat-vllm-decode.md). Same discipline:
+ * CTR_FENCE stress test. Same discipline:
  *   - TINY resident peer buffer (no weight stream to evict stale lines).
  *   - strict prime-then-overwrite LOCKSTEP ping-pong (each iter's payload is a
  *     DISTINCT value; the consumer MUST observe THIS iter's value, and its own L2

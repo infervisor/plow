@@ -208,14 +208,14 @@ enum {
     /* ===== CROSS-GPU (tensor-parallel) tile-graph ops. =========================
      * New opcodes assigned AFTER main's last (23), no collision. Names mirror the
      * generic infervisor RDMA-family variants (p2p/allreduce/allgather/reducescatter)
-     * so the two ABIs converge (see plans/tp-design.md §1b, §8).
+     * so the two ABIs converge.
      *
      * These are the ONLY ops that touch peer VRAM. Their wait/succ counters live in
      * the SYSTEM-scope `xctr` region, not the agent-scope `counters` — the stream
      * entry carries PLOW_SE_XCTR to select it. Weights/KV/residual never cross the
-     * fabric; only the H-wide reduction partials do (plans/tp-design.md §7). */
+     * fabric; only the H-wide reduction partials do. */
 
-    /* ALL-REDUCE, the TP primitive (plans/tp-design.md §8a). One-shot: each rank's
+    /* ALL-REDUCE, the TP primitive. One-shot: each rank's
      * producing GEMV (o_proj/down) has already published its partial H-vector into
      * its own peer_scratch slot and system-signalled every peer's xctr; this op is
      * the CONSUME half — it waits on N partials (SE_XCTR gate) then sums the N peer
@@ -227,18 +227,18 @@ enum {
 
     /* REDUCE-SCATTER + ALL-GATHER — the symmetric decomposition of all-reduce, kept
      * defined for CP / larger worlds. For N<=8 one-shot XREDUCE is lower-latency, so
-     * these are not emitted on the decode path yet (plans/tp-design.md §8a). */
+     * these are not emitted on the decode path yet. */
     PLOW_DOP_XREDUCESCATTER = 25,
     PLOW_DOP_XALLGATHER = 26,
 
-    /* CONTEXT-PARALLEL cross-GPU flash LSE-merge (plans/tp-design.md §8c, §9). Each
+    /* CONTEXT-PARALLEL cross-GPU flash LSE-merge. Each
      * rank produced a local (O_partial,m,l) over its KV-position shard; this folds
      * the N peers' partials (numerically-stable log-sum-exp) into the replicated
      * attention output. ABI mirrors FLASH_MERGE with t1.. in peer_scratch + xctr
      * gates. STUB for now (dispatch present, body deferred to CP phase). */
     PLOW_DOP_XFLASHMERGE = 27,
 
-    /* SHARDED lm_head argmax-merge (plans/tp-design.md §8d). lm_head is vocab-column
+    /* SHARDED lm_head argmax-merge. lm_head is vocab-column
      * parallel: each rank argmaxes its V/N logits to a packed (key,idx) u64; this
      * reads the N peer packed maxima and folds them to the global token id, written
      * into every rank's in.ids so the next EMBED needs no broadcast.
@@ -246,7 +246,7 @@ enum {
     PLOW_DOP_XARGMAX_FIN = 28,
 
     /* TWO-SHOT all-reduce (reduce-scatter + all-gather) for the LARGE prefill
-     * [T,hidden] message (plans/tp-prefill.md §4). Fused + self-contained like XREDUCE,
+     * [T,hidden] message. Fused + self-contained like XREDUCE,
      * but bandwidth-optimal: each rank reduces only its OWNED 1/N slice from every peer's
      * partial (writing it in-place, peer-visible), then gathers every peer's reduced
      * slice into the local full vector. Fabric ~2(N-1)/N*msg/rank vs one-shot (N-1)*msg.
@@ -314,8 +314,8 @@ enum {
     PLOW_DOP_HEADNORM_ROPE_FP8 = 37,
     PLOW_DOP_FLASH_DECODE_FP8 = 38,
     PLOW_DOP_FLASH_PREFILL_FP8 = 39,
-    /* ===== MoE data-dependent counter-gate ops (plans/moe-plow-design.md §3, =====
-     * plans/moe-ep-kernels.md §2-§3). Opcodes in the HIGH free range 40+ so they do NOT
+    /* ===== MoE data-dependent counter-gate ops (the design notes, =====
+     * the design notes§3). Opcodes in the HIGH free range 40+ so they do NOT
      * collide with the tp collectives (24-29) or the fp8 merge (30+). These are the FIRST
      * ops whose BODY branches on a runtime buffer (the routing table): the counter DAG stays
      * static (deadlock-free, executed==total), each expert packet ALWAYS signals its counter
@@ -447,7 +447,7 @@ enum {
      * t0=out t1=x t2=gamma t3=beta; i0=rows i1=feat i3=out_row0; f0=eps. [GLM52-DSA] */
     PLOW_DOP_LAYERNORM = 60,
 
-    /* ===== Gemma-4 26B-A4B bf16 sparse-MoE DECODE ops (plans/rtx-08-gemma4-moe-26b.md) =====
+    /* ===== Gemma-4 26B-A4B bf16 sparse-MoE DECODE ops =====
      * bf16 twins of the block-fp8 MoE ops (40-49), specialised to the Gemma-4 MoE block:
      * SOFTMAX router with a weightless-RMS + per-channel scale + H^-0.5 pre-transform and a
      * PER-EXPERT gate scale, FUSED gate_up expert weights ([E,2I,H]), gelu_tanh activation.
@@ -501,7 +501,7 @@ enum {
      * i0=H i1=k  f0=eps f1=layer_scalar */
     PLOW_DOP_MOE_COMBINE_RESID_NORM_GEMMA = 72,
 
-    /* ===== Gemma-4 26B-A4B bf16 grouped-MoE PREFILL ops (plans/p9-26b-prefill-moe.md) =====
+    /* ===== Gemma-4 26B-A4B bf16 grouped-MoE PREFILL ops =====
      * Token-sorted grouped expert GEMM for T>1. Op ids 73+ (71/72 left free; 72 reserved for
      * another in-flight change). These build ONLY in the prefill (_pf) object. */
 
@@ -568,7 +568,7 @@ enum {
     PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF_W8A8 = 81,
     PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF_W8A8 = 82,
 
-    /* Nemotron-3 Mamba-2 SSD mixer (plans/block-asset-harness.md §7, M4). NEW op family (90; 83-89 a
+    /* Nemotron-3 Mamba-2 SSD mixer. NEW op family (90; 83-89 a
      * gap after the MoE-prefill band). Mirrors packet::dev::DevOp::Mamba2Scan. The mixer CORE only —
      * in_proj/out_proj are ordinary GEMV/GEMM. Causal depthwise conv1d + SiLU over (x,B,C), the
      * selective SSD scan with per-head scalar decay, D skip, gated RMSNorm; reads+writes the carried
@@ -1052,7 +1052,7 @@ typedef struct {
  * slice of B in EVERY CU's stream. A fine list can only LOWER a threshold or NARROW a wait
  * set — it can never make a workgroup wait on something issued later in its own stream.
  * The moment a scheduler is added that INTERLEAVES tiles across ops, that argument dies
- * and this needs the relay machinery in plans/fine-counter-deadlock-fix.md. Do not reorder
+ * and this needs the relay machinery in the design notes Do not reorder
  * streams without reading that file.
  *
  * Coarse ops leave `flags == 0` and cost nothing: the interpreter reads the instruction's
@@ -1064,7 +1064,7 @@ typedef struct {
  * (a cross-GPU collective), not the agent-scope local `counters`. Orthogonal to
  * PLOW_SE_FINE. Set by the TP compiler on XREDUCE/XFLASHMERGE/XARGMAX_FIN packets and on
  * the producing GEMV whose successor is a cross-GPU "partial ready" bump. See
- * plans/tp-design.md §6a. Coarse xctr programs leave this clear and cost nothing. */
+ * the design notes. Coarse xctr programs leave this clear and cost nothing. */
 #define PLOW_SE_XCTR 2u /* wait/succ counters are cross-GPU (xctr, system scope)   */
 
 /* HOW MANY SLICES OF THIS PACKET LANDED ON THIS ENTRY'S L2 DOMAIN — the count the two-level
@@ -1073,7 +1073,7 @@ typedef struct {
  *
  * IT LIVES HERE BECAUSE IT IS ONLY KNOWABLE HERE. Under the plain global queue a workgroup claims
  * whatever entry is next, so which slices of a packet run on which XCD is decided at RUN TIME and
- * no per-XCD count exists — which is exactly what `plans/k3-decode-perf.md` records as the
+ * no per-XCD count exists — which is exactly what the design notes records as the
  * blocker on HIER2. Under PLOW_L2_PLACE the compiler assigns each slice a domain and stable-sorts
  * `gq_stream` by it, so `nper` is a static emit-time constant, and the runtime's
  * PLOW_L2_PLACE_DISPATCH gives domain `d`'s window only to XCD `d`'s workgroups (read from
@@ -1135,7 +1135,7 @@ typedef struct {
     void* const*         tensors;    /* device pointer table */
     PlowTraceRec*        trace;      /* NULL disables tracing entirely       */
     /* Segmented dispatch: the interpreter runs ONLY this segment's stream entries, so the host
-     * can relaunch it once per wave-class segment (see plans/segmented-dispatch.md). An
+     * can relaunch it once per wave-class segment. An
      * unsegmented program has n_seg==1 and every entry seg==0, so cur_seg==0 runs everything. */
     uint32_t             cur_seg;
     /* L2-DOMAIN PLACEMENT (PLOW_L2_PLACE): number of L2 domains `gq_seg_ofs` is windowed by,
@@ -1181,7 +1181,7 @@ typedef struct {
     uint32_t*            gq_cursor;   /* 1-word shared fetch-add cursor, zeroed per launch        */
     /* ===== CROSS-GPU (tensor-parallel) fields. Single-GPU runs leave these NULL/0 =====
      * Appended AFTER gq_cursor so every existing field (notably `trace`) keeps its offset
-     * and the ABI-lock test only sees the size grow. See plans/tp-design.md §6a, §12.
+     * and the ABI-lock test only sees the size grow.
      *
      * `xctr` points INTO this rank's own `peer_scratch[rank]` reduction region, at its
      * cross-GPU counter sub-region (SYSTEM-scope, peer-mapped, PLOW_CTR_STRIDE-strided).

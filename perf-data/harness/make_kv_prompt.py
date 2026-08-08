@@ -6,7 +6,7 @@ prompts are one phrase REPEATED (repetition inflates KV compressibility) and
 RandomDataset ids are token noise (unrepresentative activations). This script
 tokenizes genuine, non-repetitive text gathered from the repo:
 
-  --corpus prose : plans/*.md + perf-data/*.md + README (technical English)
+  --corpus prose: perf-data/*.md + README + docs (technical English)
   --corpus code  : runtime/nvidia/* + crates/**/*.rs (source code)
 
 Run under the vllm venv python (its transformers has the gemma-4 tokenizer):
@@ -19,7 +19,7 @@ import argparse, glob, os, struct, sys
 
 def gather(repo, corpus):
     if corpus == "prose":
-        pats = ["plans/*.md", "perf-data/*.md", "README.md", "docs/*.md"]
+        pats = ["perf-data/*.md", "README.md", "docs/*.md", "docs/arch/*.md"]
     elif corpus == "code":
         pats = ["runtime/nvidia/*.cuh", "runtime/nvidia/*.cu",
                 "crates/plowc/src/bin/*.rs", "crates/plowrt/src/**/*.rs"]

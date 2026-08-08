@@ -1,4 +1,4 @@
-/* sample_sm120.cu — device-side stochastic sampler (plans/plowrt-gpu-exec-critical-path
+/* sample_sm120.cu — device-side stochastic sampler (the design notes
  * stage 4). ONE 256-thread block per batch row samples that row's next token from its
  * `[V]` bf16 logits and writes it where the next decode step's EMBED reads it (`in.ids[b]`),
  * exactly as ARGMAX_FIN does for greedy — so `temperature > 0` no longer downloads the whole

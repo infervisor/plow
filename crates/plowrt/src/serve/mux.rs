@@ -29,7 +29,7 @@
 //!
 //! **Not here (yet):** true batched exec that fires all live slots in *one*
 //! bucket walk (needs per-slot KV routing / a `SAMPLE_BATCH` opcode) — see
-//! `plans/serve-request-mux.md`.
+//! the design notes.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

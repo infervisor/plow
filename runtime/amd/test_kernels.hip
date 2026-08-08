@@ -256,7 +256,7 @@ GEMM_VARIANT(gemm_c9, 192, 128, 64)
  * 4-8%), the opposite of Qwen (K=2560). No single global winner. 256x256 stays the DEFAULT;
  * a Qwen prefill object should build with -DGM_BM=192. o_proj/down (N=2560) are additionally
  * FILL-limited (62.5% at BN=256) where 128x384 helps — a per-shape tile-slot job
- * (plans/tile-specific-gemm.md). Compile-time-K specialisation was a WASH (+0.4%). These
+ *. Compile-time-K specialisation was a WASH (+0.4%). These
  * variants are kept as the calibration set the picker's per-shape sweep draws from. */
 
 /* The default the interpreter carries. */
@@ -613,7 +613,7 @@ GEMV_VARIANT(gemma_gemv_m16, 16)
  * macro of the object and the K-unroll is a runtime branch inside the kernel. They exist to
  * produce the M CURVE at the shapes the compiler actually asks for, which is the only thing
  * that can price the two OBJECT-level decisions: which `PLOW_GEMV_MM`, and whether the walk
- * is on. `plans/knob-contract.md` §6g-BATCH has the endpoint of that curve as aggregate tok/s
+ * is on. the design notes has the endpoint of that curve as aggregate tok/s
  * (57.9 / 106.5 / 141.7 / 202.3 / 142.4 at B=1/2/4/8/16, so B=8 is the peak and B=16 a 30%
  * regression); this is the per-shape decomposition underneath it.
  *

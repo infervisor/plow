@@ -29,7 +29,7 @@
 //! # What is on the fabric (and what must never be)
 //!
 //! Only the reduction partials, their result, and the cross-GPU counters are
-//! peer-mapped (`plans/tp-design.md` §7). Weights, KV, and the replicated
+//! peer-mapped. Weights, KV, and the replicated
 //! residual stream stay in local HBM: aggregate weight bandwidth of `N × 8 TB/s`
 //! is the entire win, and it evaporates the moment a weight read crosses a
 //! 58 GB/s link instead. For 12B decode that is 27 KB per GPU (15 KB of
@@ -88,7 +88,7 @@ pub const XCTR_STRIDE: usize = 128;
 /// Alignment of every sub-region inside the peer scratch.
 const PEER_ALIGN: u64 = XCTR_STRIDE as u64;
 
-/// COARSE peer-scratch layout (`plans/tp-design.md` §7a) — one peer-mapped
+/// COARSE peer-scratch layout — one peer-mapped
 /// region per GPU, laid out identically on every rank.
 ///
 /// ```text
@@ -511,7 +511,7 @@ impl TpGroup {
     /// Zero EVERY rank's cross-GPU counters.
     ///
     /// The one host obligation the deadlock argument rests on
-    /// (`plans/tp-design.md` §6d): the cross edges form a publish→consume cut
+    ///: the cross edges form a publish→consume cut
     /// with no cycle *provided* no rank starts a token seeing a counter left
     /// over from the previous one. Zeroing rank-by-rank as each is launched
     /// would break exactly that — an early rank could signal a late rank's

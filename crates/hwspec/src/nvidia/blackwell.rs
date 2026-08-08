@@ -124,7 +124,7 @@ pub const RTX_5090: GpuSpec = GpuSpec {
     compute_cap: (12, 0),
     sm_count: 170,
     sm: CONSUMER_BLACKWELL_SM,
-    dsm: None, // GB202 cluster size 1 -- no DSM (measured, see plans/rtx-01)
+    dsm: None, // GB202 cluster size 1 -- no DSM (measured)
     l2: Bytes::mib(96),
     mem: MemorySpec {
         kind: MemKind::Gddr7,
@@ -149,7 +149,7 @@ pub const RTX_6000_PRO: GpuSpec = GpuSpec {
     compute_cap: (12, 0),
     sm_count: 188,
     sm: CONSUMER_BLACKWELL_SM,
-    dsm: None, // GB202 cluster size 1 -- no DSM (measured, see plans/rtx-01)
+    dsm: None, // GB202 cluster size 1 -- no DSM (measured)
     l2: Bytes::mib(96),
     mem: MemorySpec {
         kind: MemKind::Gddr7,

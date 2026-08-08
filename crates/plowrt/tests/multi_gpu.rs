@@ -1,7 +1,7 @@
 //! Hardware test for the multi-GPU (tensor-parallel) host layer.
 //!
 //! Covers what the host owes the device before a single collective packet can
-//! run (`plans/tp-design.md` §6a, §6d, §7a): N backends with ranks, one
+//! run: N backends with ranks, one
 //! peer-mapped reduction region per rank visible to every peer, a
 //! cache-line-isolated cross-GPU counter region inside it, the `[n_gpu]`
 //! peer-pointer table, and the zero-every-rank-before-any-launch obligation.

@@ -106,7 +106,7 @@
  * stays the DEFAULT (it does not regress Gemma, and it wins the low-load / single-request
  * latency case for every model). A Qwen prefill object should be built with -DGM_BM=192
  * (+~15% weighted on the compute-heavy projections through the interpreter). The clean fix
- * is per-shape tile selection (plans/tile-specific-gemm.md). Also measured, and both a WASH:
+ * is per-shape tile selection. Also measured, and both a WASH:
  * compile-time-K specialisation (+0.4%; the mainloop is schedule-bound, not loop-bound) and
  * removing flash from the object (the 128/128 register split is the op union, not flash).
  * A 4x4 per-wave tile (256x256 all-arch) is 256 AccVGPRs and cannot run 8 waves.
@@ -3562,7 +3562,7 @@ __device__ __forceinline__ void gemv_glu_rows_fp8(bf16* __restrict__ C_,
  * q/k/v and writes a fourth disjoint [H*D] buffer. It is the same merge along the OUTPUT axis, one
  * stream wider: Ntot = Nq+Nk+Nv+Ng and the ownership run each workgroup takes is still a
  * contiguous slice of that concatenation, so all 256 CUs stay uniformly loaded. This is NOT the
- * `GLM_GROUP=1` collapse (plans/knob-contract.md 6g-KNOBS, 38% fewer ops for +2.88 ms): that one
+ * `GLM_GROUP=1` collapse (the design notes 6g-KNOBS, 38% fewer ops for +2.88 ms): that one
  * merged along a LOOP dimension and serialised work that had been running on disjoint CU slices.
  * Here the per-CU column count RISES from Ntot/256 to (Ntot+Ng)/256 -- the op gets WIDER, never
  * narrower, and nothing that ran in parallel starts running in sequence.

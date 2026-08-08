@@ -1,7 +1,7 @@
 /* moe_block_gfx950_test.c — the GLM-5.2 MoE dispatch prototype on the real interpreter.
  *
  * Builds, by hand, a decode program of N stacked MoE FFN blocks — the data-dependent
- * counter-gate in full (plans/moe-plow-design.md §3, moe-ep-kernels.md §2-§3):
+ * counter-gate in full (the design notes §2-§3):
  *
  *     for each block b:
  *        MoeRouter(x[b], Wr[b]) -> routing_table            (writes {expert_id, gate}[K])
@@ -19,7 +19,7 @@
  * Scope: the routed MoE FFN sublayer stacked N times (block 0 dense-equivalent numerically;
  * shared expert = NONE here, exercised bit-exact in the Rust core test crates/packet/
  * tests/moe_dispatch.rs). GLM-5.2 RouterCfg (sigmoid, norm_topk, route_scale=2.5),
- * cardinality-scaled (E=8, K=2) per plans/glm52-prototype-plan.md §2.
+ * cardinality-scaled (E=8, K=2)
  */
 #include "../amd/hsa_backend.h"
 #include "../common/dev_isa.h"

@@ -1074,7 +1074,7 @@ struct Tn {
     dg: u32,
     logits: u32,
     amax: u32,
-    // TP (n_gpu>1) peer-mapped partial slots (plans/tp-design.md §7a): the row-parallel
+    // TP (n_gpu>1) peer-mapped partial slots: the row-parallel
     // o_proj/down write their partial H-vector here (tp-host binds them into peer_scratch),
     // and XReduce sums the N peers' slots into `og`/`dg`. TENSOR_NONE when tp==1.
     og_tp: u32,
@@ -1096,7 +1096,7 @@ struct Tn {
     moe_sum: u32,
     moe_h2: u32,
     moe_comb: u32,
-    // Grouped-MoE PREFILL scratch (plans/p9-26b-prefill-moe.md). Declared only when moe && moe_pf;
+    // Grouped-MoE PREFILL scratch. Declared only when moe && moe_pf;
     // TENSOR_NONE otherwise so the decode-only blob stays byte-identical. total_pad = rows*top_k +
     // n_exp*128 (PGM_BM). meta = int32[3*n_exp+2] align/sort table; rowtok/rowpart = u32[total_pad]
     // gather maps; rowgate = f32[total_pad]; fug = bf16[total_pad*moe_inter] gathered GLU output.
@@ -1223,7 +1223,7 @@ fn declare(
     // Only `ids`/`pos` and the KV cache legitimately span the context: the cache IS the context,
     // and ids/pos are i32 (a rounding error). Everything else holds the CURRENT chunk.
     let rows = ctx.min(max_chunk(c.window));
-    // TP head split (plans/tp-design.md §3a): each rank owns heads/N q-heads and kvh/N kv-heads,
+    // TP head split: each rank owns heads/N q-heads and kvh/N kv-heads,
     // so every head-dimensioned activation and the KV cache shrink by N. Column/row-parallel
     // weights and the inter/vocab-dimensioned activations shrink by N too. tp==1 => /1, identical.
     let tp = c.tp;
@@ -1555,7 +1555,7 @@ fn declare(
         // and the layout FlashDecode reads with kv_stride — so the cache write is not a separate
         // copy, it IS the norm's store. Head-major makes one head's rows contiguous for the
         // decode read; a byte-repack (token-major, or vLLM-style paging) is a measured null here.
-        // Per-layer head split with SHARED-KV-HEAD REPLICATION (plans/tp-design.md §3a/§13.2).
+        // Per-layer head split with SHARED-KV-HEAD REPLICATION.
         // Full layers have kvh_full=4 kv-heads: tp<=4 splits cleanly (kvh_local = kvh/tp); at tp=8 a
         // full layer's 4 kv-heads can't split 8 ways, so tp/kvh ranks SHARE (replicate) each kv-head
         // — each such rank owns 1 kv-head (kvh_local=1) plus its heads/tp q-heads. KV storage is then
@@ -1857,7 +1857,7 @@ pub(crate) const PLOW_THREADS: u32 = 512;
 /// Mirrors `scripts/build_gfx950.sh`: `next_pow2(PLOW_DECODE_BATCH)`, clamped to
 /// [`GEMV_MAXM`], with an explicit `PLOW_GEMV_MM` override taking precedence. The override is
 /// what makes an object NARROWER than the program it serves expressible at all, and that
-/// combination is the whole subject of `plans/knob-contract.md` §6g-WALK.
+/// combination is the whole subject of the design notes.
 fn gemv_row_bucket(t: u32) -> u32 {
     if let Some(v) = emit_config::active().gemv_mm {
         return v.clamp(1, GEMV_MAXM);
@@ -2017,7 +2017,7 @@ fn kv_ring(full: bool, ctx: u32, window: u32, chunk: u32) -> (u32, u32) {
     }
 }
 
-/// This rank's local KV-head count under TP with SHARED-KV-HEAD REPLICATION (plans/tp-design.md
+/// This rank's local KV-head count under TP with SHARED-KV-HEAD REPLICATION (the design notes
 /// §3a/§13.2). Two regimes, both keep every rank's q-heads mapped to a kv-head it owns:
 ///   - `tp <= kvh_g` (clean split): each rank owns `kvh_g/tp` distinct kv-heads.
 ///   - `tp  > kvh_g` (replication): `tp/kvh_g` ranks share (replicate) one kv-head; each owns 1.
@@ -2312,7 +2312,7 @@ mod flash_merge_map_tests {
 
 /// Emit the layer all-reduce for a row-parallel producer (o_proj/down), all-reduce #1/#2.
 /// PREFILL uses the TWO-SHOT (reduce-scatter + all-gather): the [T,hidden] partial is
-/// bandwidth-bound, so ~N/2× less fabric than the one-shot (plans/tp-prefill.md §4). DECODE
+/// bandwidth-bound, so ~N/2× less fabric than the one-shot. DECODE
 /// keeps the one-shot — its tiny [1,hidden] message is latency-bound, so a single sync wins.
 /// Two-shot consumes TWO xctr gate ids (reduce-scatter + all-gather rendezvous); one-shot
 /// consumes one. `slot` is the byte offset of this collective's partial slot (0 or slot_b).
@@ -2437,7 +2437,7 @@ fn emit_xreduce_gather(
 /// `Decode` is (shape, gemv) = (true, true) and `Prefill` is (false, false) — the only two
 /// combinations that existed before — so both stay BYTE-IDENTICAL to the pre-enum emitter.
 /// `DecodeTiled` is the new third corner: (true, false), a decode-shaped step built from prefill
-/// kernels. See plans/decode-tiled.md.
+/// kernels. See the design notes
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     Prefill,
@@ -2577,7 +2577,7 @@ fn emit_phase(
     let decode = mode.decode_shape();
     let gemv_family = mode.gemv();
     let all = b.all();
-    // TENSOR-PARALLEL local shards (plans/tp-design.md §3). For tp==1 these equal the full dims,
+    // TENSOR-PARALLEL local shards. For tp==1 these equal the full dims,
     // so the whole emit is byte-identical to the pre-TP path; for tp>1 (decode only) every head-,
     // intermediate- and vocab-dimensioned op runs 1/N wide, and o_proj/down get an XReduce.
     let tp = c.tp;
@@ -2585,7 +2585,7 @@ fn emit_phase(
     let inter_l = c.inter / tp; // this rank's gate/up/down intermediate lanes
     let vocab_l = c.vocab; // lm_head REPLICATED under TP (Phase 2); see declare() note above
     let mut xgate: u32 = 0; // xctr gate-id allocator for XReduce (unique per collective)
-                            // XReduce runs on a REDUCED CU set (F-lever, plans/tp-design.md §8b/§10). The all-reduce is a
+                            // XReduce runs on a REDUCED CU set (F-lever). The all-reduce is a
                             // tiny memory-bound sum over the H-vector, but EVERY participating workgroup takes a SYSTEM-scope
                             // acquire (a full L2 invalidate) per collective — 2L=120 collectives/token at 31B. Fewer CUs =>
                             // fewer redundant system-acquires and less cross-XCD invalidation, at no bandwidth cost (H=5376
@@ -2609,7 +2609,7 @@ fn emit_phase(
             .clamp(1, n_cu);
         (0..k).collect()
     };
-    // TP prefill (plans/tp-prefill.md): the all-reduce partials are [T, hidden], not decode's
+    // TP prefill: the all-reduce partials are [T, hidden], not decode's
     // [1, hidden], so the XReduce reduces `xr_elems = t*hidden` elements. The two peer-scratch
     // partial slots (og_tp/dg_tp, §7a) must not overlap: partial_A occupies [0, rows_max*hidden*2),
     // partial_B starts at `slot_b = rows_max*hidden*2`. rows_max = the largest chunk (= og_tp's
@@ -3831,7 +3831,7 @@ fn emit_phase(
             )
         };
 
-        // o_proj is ROW-parallel (plans/tp-design.md §3a): input = this rank's qd heads, output =
+        // o_proj is ROW-parallel: input = this rank's qd heads, output =
         // the FULL H-vector but only a PARTIAL sum (this rank's head contribution). Under TP it
         // writes that partial into the peer-mapped og_tp slot and an XReduce sums the N peers'
         // partials into the replicated `og` that NormResidual consumes — all-reduce #1 of the layer.
@@ -4176,7 +4176,7 @@ fn emit_phase(
         };
         // down_proj is ROW-parallel (input = inter_l lanes) → a PARTIAL H-vector. Under TP it
         // writes dg_tp and an XReduce sums the N peers into `dg` — all-reduce #2 of the layer,
-        // at the second NormResidual boundary (plans/tp-design.md §3a, §8a). proj() picks the fp8
+        // at the second NormResidual boundary. proj() picks the fp8
         // (GemvFp8) arm on the decode fp8 path via the wd8/sd operands.
         // w8a8: quant the (inter-width) GLU output feeding down_proj.
         // qnorm_fuse (+ unfused GLU): c_gl IS the fused GLU+quant packet above.
@@ -4223,7 +4223,7 @@ fn emit_phase(
                 &[dfu],
             )
         };
-        // ===== Gemma-4 26B-A4B MoE branch (decode, B=1; plans/rtx-08-gemma4-moe-26b.md) =====
+        // ===== Gemma-4 26B-A4B MoE branch (decode, B=1) =====
         // The dense MLP above produced `n.dg`. The MoE block adds a routed-expert branch and sums
         // the two through the sandwich: combined = post_ffn_norm(post_ffn_1(dense) + post_ffn_2(moe)).
         // Router & experts both read the RESIDUAL (n.x, set by c_pf), NOT the pre-MLP norm. The
@@ -4388,7 +4388,7 @@ fn emit_phase(
                 };
                 (n.moe_comb, c_comb)
             } else {
-                // ===== GROUPED-MoE PREFILL (T rows; plans/p9-26b-prefill-moe.md) =====
+                // ===== GROUPED-MoE PREFILL (T rows) =====
                 // h1 = post_ffn_norm_1(dense), T rows. xn2 = pre_ffn_norm_2(residual), T rows.
                 let c_h1 = b.emit(DevOp::RmsNorm, rows.clone(), &[c_d], |d| {
                     d.t[0] = n.moe_h1;
@@ -4645,7 +4645,7 @@ fn emit_phase(
     // lm_head over the LAST row only (i4 = a_row0). Weight is the tied embedding table, or the
     // separate lm_head.weight when the checkpoint does not tie (Llama).
     let head_w = if c.tied { n.emb } else { n.head };
-    // lm_head is COLUMN(vocab)-parallel (plans/tp-design.md §3a/§8d): each rank produces its
+    // lm_head is COLUMN(vocab)-parallel: each rank produces its
     // vocab_l logit lanes. tp-host binds the rank's vocab slice of the (replicated) weight.
     // PLOW_PF_GEMV_HEAD=1 (PX-6 recommendation A): prefill lm_head is M=1 (see `lm_m` below), but
     // `pick_tile` hands it to the TILED arm, which computes BM=128 rows to keep one — 0.78% row
@@ -4858,11 +4858,11 @@ fn fuse_argmax_parts(n_cu: u32) -> u32 {
 //
 // The op sequence emit_glm_block produces is the EXACT 34-op block validated on
 // gfx950 by runtime/tests/glm52_real_block_gfx950_test.c against the HF oracle
-// (real 256 experts, real [128,128] block-fp8 scales) — see plans/glm52-campaign.md
+// (real 256 experts, real [128,128] block-fp8 scales) — see the design notes
 // "B4-CORE DONE". The offline glm_tests below assert byte-for-op equality with that
 // reference, so the emitted layer inherits the harness's passing GPU result.
 //
-// MILESTONE-1 STAGING (plans/glm52-campaign.md): the query/key RoPE is folded into
+// MILESTONE-1 STAGING: the query/key RoPE is folded into
 // the derived weights at a FIXED position by the host weight-prep (as the B4 harness
 // did) — valid for single-token validation. The dynamic INTERLEAVED-RoPE op (coming
 // from the kernels branch) replaces the fold for milestone-3 multi-token decode.
@@ -4901,7 +4901,7 @@ pub struct EmitArgs {
     /// `hwspec::GpuSpec::l2_partitioning`, plus its workgroup->domain map. `Some` groups the
     /// device blob's global-queue stream by L2 domain (via [`packet::devbuild::Builder`]'s
     /// `seg`-as-domain), so a physical-SM-aware interp pulls its domain's packets. `None` ⇒
-    /// byte-identical. Dense-GQA path only. See `plans/l2-placement-generic.md`.
+    /// byte-identical. Dense-GQA path only.
     pub l2_layout: Option<packet::devbuild::L2Layout>,
     /// Target GPU spec name (e.g. `"H100 SXM5"`), stamped into the blob header as
     /// [`packet::devbuild::gpu_fingerprint`] so the runtime can warn on a GPU
@@ -5058,7 +5058,7 @@ impl EmitArgs {
 }
 
 /// Uniform surface for lowering a checkpoint into a PLOWDEV program set, per model
-/// family (plans/devgen-trait-refactor.md). Phase 0: only the dense-GQA family
+/// family. Phase 0: only the dense-GQA family
 /// implements it, and only the `emit_phase` call sites are routed through it —
 /// `declare`/orchestration and the GLM/Nemotron families move behind it in later
 /// phases, at which point these signatures generalize. Behavior is byte-identical
@@ -5072,7 +5072,7 @@ trait DevblobEmitter {
 
 /// Dense GQA (Gemma / Llama / Qwen). Arch is DATA (`Cfg.arch` switches), so ONE
 /// emitter covers all three; it forwards to the shared `emit_phase`. See the
-/// "one DenseGqaEmitter" design decision in plans/devgen-trait-refactor.md.
+/// "one DenseGqaEmitter" design decision in the design notes
 /// Mint registry for `GEN_TMAP_BF16` descriptor tensors (sm_90a TMA prefill GEMM,
 /// `PLOW_TMA_GEMM=1`). Handles are GLOBAL — `base` (the declare()-time tensor count) plus
 /// the mint index — because each program's Builder adopts a clone of the declared list
@@ -5343,7 +5343,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // PLOW_L2_PLACE is wired only on the dense-GQA path below (b/bd builders). The
     // GLM/Kimi/DeepSeek/Nemotron emitters have their own builders and never call
     // set_l2_placement, so the flag would silently no-op there — say so rather
-    // than let a user believe placement is active. See plans/l2-placement-generic.md.
+    // than let a user believe placement is active. See the design notes
     //
     // AMD IS NO LONGER REFUSED HERE, and the reason the refusal existed is worth keeping.
     //
@@ -5440,7 +5440,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         mla::kimi_k3_emit(&dir, ctx, tp, block_spec.as_deref());
     }
     if model_type == "glm_moe_dsa" {
-        // GLM `--block` (M2, plans/block-asset-harness.md §5.3/§7): single-block
+        // GLM `--block` (M2): single-block
         // extraction on the separate GLM emitter. Absent => the unchanged glm_main
         // path (byte-identical).
         // THE HOOK USED TO STOP HERE. `verify` was moved into `emit_dense_gqa` and
@@ -5485,7 +5485,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             None => panic!(
                 "{model_type}: M3 supports only single-block extraction on the device path — pass \
                  --block <l>[..<r>] (or PLOW_BLOCK). Full-model Kimi/DeepSeek device emit is a later \
-                 milestone (plans/block-asset-harness.md §5.3)."
+                 milestone."
             ),
         }
         return;
@@ -5498,14 +5498,13 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
             Some(spec) => nemotron_emit_block(&dir, ctx, &out, n_cu, tp, spec, rope_gen),
             None => panic!(
                 "{model_type}: M4 supports only single-block extraction — pass --block <l>[..<r>] \
-                 (or PLOW_BLOCK). Full-model Nemotron device emit is a later milestone \
-                 (plans/block-asset-harness.md §5.3/§7)."
+                 (or PLOW_BLOCK). Full-model Nemotron device emit is a later milestone."
             ),
         }
         return;
     }
 
-    // Phase 2 (plans/devgen-trait-refactor.md): the dense-GQA family is its own
+    // Phase 2: the dense-GQA family is its own
     // function, so run_verified is now pure dispatch (GLM/Kimi/Nemotron early-return
     // above; everything else is dense). Byte-identical — the body moved verbatim.
     emit_dense_gqa(
@@ -6186,7 +6185,7 @@ fn emit_dense_gqa(
     // CAPPED AT MAX_CHUNK. Chunked prefill never emits a chunk larger than PLOW_MAX_CHUNK, so a
     // program for T > MAX_CHUNK can never be invoked -- the ladder used to run to 131072 and
     // every rung above 4096 was dead code that still cost compile time and packet size.
-    // Tensor-parallel now emits SHARDED PREFILL buckets too (plans/tp-prefill.md): every prefill
+    // Tensor-parallel now emits SHARDED PREFILL buckets too: every prefill
     // op is Megatron-sharded in emit_phase (q/k/v/gate/up column-parallel, o/down row-parallel with
     // an XReduce all-reduce, flash head-split) exactly as decode is — the [T,hidden] all-reduce is
     // the only new regime. The full ladder is emitted at every tp; tp==1 stays byte-identical.
@@ -6274,7 +6273,7 @@ fn emit_dense_gqa(
     // ns(t) from the SHARDED head count (heads/tp) — so ns_pre must be the worst-case over buckets
     // using that same sharded count, or a high-tp small-bucket program overflows opart (at tp=8 the
     // real ns is 32x the unsharded estimate → a GPU write fault). tp==1: hs==heads, ns_pre==1 (the
-    // old value, byte-identical). plans/tp-prefill.md.
+    // old value, byte-identical). the design notes
     let hs = (c.heads / c.tp).max(1);
     let max_splits = buckets
         .iter()
@@ -6304,7 +6303,7 @@ fn emit_dense_gqa(
         "MoE decode batch is capped at 32 (per-CTA inv[] scratch, PLOW_MOE_MAXB)"
     );
 
-    // Grouped-MoE PREFILL (plans/p9-26b-prefill-moe.md): token-sorted grouped expert GEMM buckets.
+    // Grouped-MoE PREFILL: token-sorted grouped expert GEMM buckets.
     // Enabled by default for the 26B-A4B MoE bf16 path; PLOW_MOE_PREFILL=0 restores the decode-only
     // blob (byte-identical to the pre-prefill build — the buffer sizing and new tensors are gated on
     // this flag). beat26b: fp8 grouped MoE prefill is now implemented for the w8a8 path (ops 81/82),
@@ -6313,7 +6312,7 @@ fn emit_dense_gqa(
     let moe_pf =
         c.moe && (!fp8 || w8a8) && ecfg.moe_prefill.as_deref() != Some("0");
 
-    // Phase 1 (plans/devgen-trait-refactor.md): the DenseGqaEmitter owns the dense
+    // Phase 1: the DenseGqaEmitter owns the dense
     // tensor declaration (declare) and the emit_phase call sites. Byte-identical —
     // `new` forwards to the same `declare`, `emit_*` to the same `emit_phase`.
     let (emitter, tensors, gen) = DenseGqaEmitter::new(
@@ -6371,7 +6370,7 @@ fn emit_dense_gqa(
     // `dbatch` is the SAME clamped(1,32) value used by declare() above — emission and
     // allocation must agree, so we reuse it here rather than re-reading the env (an unclamped
     // re-read would emit B>32 ops against buffers declare() sized for 32 → OOB writes).
-    // DECODE-TILED (PLOW_DECODE_TILED=1, plans/decode-tiled.md): emit the decode bucket from
+    // DECODE-TILED (PLOW_DECODE_TILED=1): emit the decode bucket from
     // PREFILL kernels — tiled GEMM + FlashPrefill at one query row — instead of the GEMV family.
     // Targets long context, where GEMV does not scale with batch and FlashDecode caps at n_cu.
     // Unset emits a byte-identical program. **The sm_120 interpreter traps on every prefill
@@ -6413,7 +6412,7 @@ fn emit_dense_gqa(
 
     // Emit v6 with sections when --embed-cubin/--embed-hsaco given, else v5.
     let mut sections = Vec::new();
-    // BLOCK MODE: embed the block.json descriptor (plans/block-asset-harness.md
+    // BLOCK MODE: embed the block.json descriptor (the design notes
     // §4) as SECT_METADATA — this also forces the to_blob_v6 path — and drop a
     // sibling block.json next to the blob for the record / the harness loader.
     if block_mode {
@@ -7049,7 +7048,7 @@ mod gfx950_coverage_tests {
           the unfused twin (it takes an already-normed x); the AMD arm exists for the A/B and \
           for a pre-fuse packet. Not a precision arm."),
         ("PLOW_DOP_XFLASHMERGE",
-         "CONTEXT-PARALLEL cross-rank LSE merge (plans/tp-design.md §8c). TP shards attention by \
+         "CONTEXT-PARALLEL cross-rank LSE merge. TP shards attention by \
           whole heads, so no rank holds a partial for another rank's head and there is nothing to \
           merge. Emitted only once CP exists; blocked on S4."),
     ];
@@ -7922,7 +7921,6 @@ mod pick_tile_tests {
     /// And the six M=128 "utilisation disaster" shapes are UNCHANGED, on purpose: 64x128 was
     /// already selected and is already the fastest of all twelve tiles compiled into the sweep.
     /// Their deficit is CU fill (2-34 tiles on 256 CUs), which no tile can fix — see the report
-    /// and `plans/` for why split-K is the lever there.
     #[test]
     fn the_new_rungs_change_the_fill_limited_shapes_and_leave_the_rest() {
         for (m, n, k, legacy, new, label) in [

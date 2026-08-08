@@ -1,11 +1,9 @@
-; Tile-level hand-off collapse rules (design §2.5).
-;
+; Tile-level hand-off collapse rules (design §2.5).;
 ; A producer→consumer hand-off lowered as `(Load (Store producer u) u)` (a DRAM
 ; round-trip on unit u) gains its alternative realizations as EQUAL e-class
 ; members — non-destructively (`union`), so the round-trip stays available too.
 ; A cost-recording extractor (in Rust, §2.6) then picks the cheapest default per
-; hand-off and carries the rest as a relaxable choice.
-;
+; hand-off and carries the rest as a relaxable choice.;
 ; `Comp` carries only the producer's label + unit (the collapse reasons about
 ; hand-off edges; the full dataflow lives in the tile graph). dma-dedup needs no
 ; rule: identical terms hash-cons to one e-node.
@@ -26,8 +24,7 @@
 
 ; Units that have a distributed-shared-memory (GPC) domain.
 (relation DsmUnit (i64))
-; Units whose L2 is partitioned (per-GPC on H100, per-XCD on MI300).
-; See `plans/l2-partition-chiplet.md`.
+; Units whose L2 is partitioned (per-GPC on H100, per-XCD on MI300).;
 (relation L2Partitioned (i64))
 ; The SoC shares one coherent address space (a cross-unit read is a barrier).
 (relation Unified ())

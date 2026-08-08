@@ -6,7 +6,7 @@
 //! per-task SM placement, and some `IntraGpu` counters turn out to have every
 //! producer and consumer on the same SM. Downgrading those to `IntraSm`
 //! swaps a ~40-cycle L2 atomic for a single-cycle SM-local barrier at runtime
-//! (§8.2 of `plans/lean-formal-verification-analysis.md`).
+//! (§8.2 of the design notes).
 //!
 //! # Safety
 //!

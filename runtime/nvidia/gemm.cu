@@ -55,7 +55,7 @@ extern "C" void cuda_gemm_w4a8(const void* body, kctx* ctx) {
 // ==========================================================================
 // Gemma 4 fused GEMM variants — single-SM, self-distributed multi-tile.
 //
-// Contract shared by every variant below (see plans/gemma-4-31b-*.md):
+// Contract shared by every variant below (see the design notes*.md):
 //  * ONE packet = the whole op (full m,n,k in PlowGemmBody). The kernel is
 //    launched with P = #SMs persistent blocks; block s owns output tiles
 //    s, s+P, s+2P, ... (grid-stride) and DMAs each tile's operands itself.

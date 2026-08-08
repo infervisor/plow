@@ -115,7 +115,7 @@
 
 /* ------------------------------------------------------------------ plow primitives (verbatim)
  * Copied from op_attention.cuh / sm120_common.cuh rather than #included: op_attention.cuh is
- * being edited concurrently by a sibling agent, and a harness that silently changes underneath
+ * being edited concurrently on another branch, and a harness that silently changes underneath
  * a measurement is worse than a duplicated 40 lines. */
 #define PLOW_NV_THREADS 256u
 #define PLOW_NV_WARPS 8u

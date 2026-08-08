@@ -68,7 +68,7 @@ pub struct Manifest {
     #[serde(default)]
     pub static_tensors_file_emitted: bool,
     /// Weight-tiling byte-layout spec — present iff `weight_shared`. See
-    /// `plans/weight-tiling.md` for the layout formula the runtime uses.
+    /// the design notes for the layout formula the runtime uses.
     #[serde(default)]
     pub weight_tiling: Option<WeightTiling>,
 }
@@ -80,7 +80,7 @@ pub struct WeightLayout {
     pub bk: i64,
 }
 
-/// Weight-tiling byte-layout spec. See `plans/weight-tiling.md`.
+/// Weight-tiling byte-layout spec.
 ///
 /// # Layout formula (as of `block_iteration = "n_major_k_inner"`,
 /// `within_block_layout = "n_outer_k_inner"`, `padding_policy = "zero_extend"`):
@@ -107,7 +107,7 @@ pub struct WeightTiling {
 
 /// One entry in the `static_tensors` manifest — a byte range in
 /// `static_tensors.bin` the runtime copies into an address-map slot at
-/// model init. See `plans/kv-decode-and-static.md` §Part 4.
+/// model init. See the design notes 4.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StaticTensorEntry {
     pub target_slot: String,
@@ -545,8 +545,8 @@ pub struct BlockTensor {
     pub dtype: String,
 }
 
-/// Architecture-specific dimensions. Only the keys `plans/block-asset-harness.md`
-/// §4 lists are modeled; each is optional since which apply depends on `kind`
+/// Architecture-specific dimensions. Only the modeled keys are listed here;
+/// each is optional since which apply depends on `kind`
 /// (a dense block carries `heads`; an MoE block adds `n_exp`/`top_k`/…).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BlockDims {
@@ -632,8 +632,7 @@ pub struct BlockPrograms {
     pub decode_t: i64,
 }
 
-/// `block.json` — the architecture-agnostic single-block descriptor
-/// (`plans/block-asset-harness.md` §4).
+/// `block.json` — the architecture-agnostic single-block descriptor.
 ///
 /// It is the shared driver of the block harness: an **input** to the schedule /
 /// CPU-sim route (`plowc --net`) and the **`SECT_METADATA`** mirror the device

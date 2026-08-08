@@ -284,7 +284,7 @@ pub struct Builder {
     /// (a cluster/XCC_ID cursor per domain) can pull only its domain's packets.
     /// The `cus` sets are NOT touched — placement is dynamic (cursor-claimed) at
     /// runtime, so it cannot regress disjoint `Builder::split` placements.
-    /// See `plans/l2-placement-generic.md`.
+    ///
     place_l2: Option<L2Layout>,
     /// The target cannot honour `PLOW_UNISEG` — set by an emitter that knows what it is building
     /// for. See [`Builder::deny_uniseg`].
@@ -326,7 +326,7 @@ impl Builder {
     /// (occupancy>1 or a grid≠sm_count mismatch, where `cu/sms` would exceed the runtime's
     /// domain count and orphan packets), and on any program with more than one wave class,
     /// where `seg` is already carrying information placement would destroy. Both fall back
-    /// byte-identical. See the field docs and `plans/l2-placement-generic.md`.
+    /// byte-identical. See the field docs and the design notes.
     pub fn set_l2_placement(&mut self, layout: Option<L2Layout>) {
         self.place_l2 = layout;
     }
@@ -860,7 +860,7 @@ impl Builder {
     /// precedes every slice of B in every CU's stream. A fine list can only lower a threshold
     /// or narrow a wait set, never make a workgroup wait on something issued later in its own
     /// in-order stream — which is exactly the deadlock that
-    /// `plans/fine-counter-deadlock-fix.md` documents. **Do not reorder streams** without
+    /// the design notes documents. **Do not reorder streams** without
     /// reading that file.
     pub fn finish(mut self) -> Program {
         let n_cu = self.n_cu as usize;
@@ -1102,7 +1102,7 @@ impl Builder {
         // other op wants 8 waves (2 waves/SIMD latency hiding). Occupancy is a launch-time property,
         // so the host relaunches once per maximal same-class run of ops in this (topological) emit
         // order, with that run's wave count. A segment is that run; `seg_of[i]` is op i's segment.
-        // The host reads the class back from the ops themselves. See plans/segmented-dispatch.md.
+        // The host reads the class back from the ops themselves. See the design notes
         // PLOW_UNISEG=1 collapses every op into ONE segment. The wave-class split exists so an AMD
         // host can relaunch FlashPrefill at a 4-wave occupancy; the sm_120 persistent interpreter
         // runs EVERY op at a fixed 256-thread (8-warp) block and synchronises the whole program in
@@ -1807,7 +1807,7 @@ pub struct Program {
     /// L2 domains `gq_seg_ofs` is windowed by. `0` ⇒ not placed (`seg` is
     /// wave-class). When non-zero, `gq_stream`'s `seg` is a domain and the blob
     /// header carries [`PLOW_BLOB_F_L2DOM`]; a runtime without physical-SM
-    /// domain dispatch must refuse it. See `plans/devblob-locality-placement.md`.
+    /// domain dispatch must refuse it.
     pub l2_sms: u32,
     pub l2_domains: u32,
 }
@@ -1919,7 +1919,7 @@ pub const PLOW_BLOB_F_GQ: u32 = 1;
 /// physical-SM domain dispatch (`PLOW_L2_PLACE_DISPATCH`) must REFUSE such a blob —
 /// its wave-class segmentation would mis-dispatch `seg`. `reserved[1]` carries SMs
 /// per partition, `reserved[2]` the domain count, so the interp need not be told
-/// via a build define. See `plans/devblob-locality-placement.md`.
+/// via a build define.
 pub const PLOW_BLOB_F_L2DOM: u32 = 2;
 
 /// Stable 32-bit fingerprint of a target GPU spec name (e.g. `"H100 SXM5"`), stamped into
@@ -2348,7 +2348,7 @@ impl Builder {
 /// domain's packets on workgroups the hardware runs somewhere else — so nothing downstream can
 /// catch it and it has to be pinned here.
 /// Why locality-aware placement has nothing to win on these programs, as a test rather than a
-/// paragraph. See `plans/l2-placement-generic.md` §7.
+/// paragraph.
 #[cfg(test)]
 mod locality_census_tests {
     use super::*;

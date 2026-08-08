@@ -2,7 +2,7 @@
  *
  *   C[M,N] = A[M,K] . B[N,K]^T   (bf16 operands, f32 accumulate, bf16 store)
  *
- * THE HYPOTHESIS UNDER TEST (see plans/gemm-occ1-poc.md):
+ * THE HYPOTHESIS UNDER TEST:
  *   plow's production prefill GEMM sits at MfmaUtil=30% at occ-2 (8 waves, 256-reg). The
  *   diagnosed wall is the LDS-read -> MFMA DEPENDENCY CHAIN: each ds_read feeds the very next
  *   MFMA with an s_barrier between and no independent work to hide the ds_read latency, and at

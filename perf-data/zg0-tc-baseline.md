@@ -2,7 +2,7 @@
 
 Date 2026-07-22. Branch `zg0-tc-baseline` (based on `origin/main`, 3d8caab).
 Model gemma-4-12B, RTX PRO 6000 Blackwell (188 SM, HBM peak 1792 / **1535 GB/s achievable**,
-L2 ~96 MiB). Plan `plans/p9-lossless-compression.md` §C-1T. System nvcc 13.0, `sm_120a`.
+L2 ~96 MiB). Plan the design notes. System nvcc 13.0, `sm_120a`.
 Harness `runtime/tests/zg0_tc_stream_sm120.cu` (+ `zg0_bwcal_sm120.cu` for the wall calibration).
 `op_gemm.cuh` UNCHANGED — standalone test only; default bf16 build byte-identical.
 

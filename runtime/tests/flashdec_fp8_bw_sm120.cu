@@ -9,7 +9,7 @@
  *   GF=4  (SHIPPED): gqa/GF = 2 head-groups per kv_head  -> each KV byte read TWICE.
  *   GF=8  (CANDIDATE): GF == gqa -> one group per kv_head -> each KV byte read ONCE (half HBM).
  *
- * KV-2 (plans/p10-kv-zip.md): + an SZ arm — the KVZIP-SZ12 v1.2 lossless row blob (800 B/row vs
+ * KV-2: + an SZ arm — the KVZIP-SZ12 v1.2 lossless row blob (800 B/row vs
  * 1024, 1.28x fewer KV bytes) decoded INLINE in d_flash_decode. KV content comes from a REAL
  * plow dump (PLOW_KV_DUMP, default /dev/shm/kv0/prose, tensor PLOW_KV_TENSOR, default kv.47 —
  * a full-attention hd512 layer) so escape rows and exponent spread are real; rows are tiled to

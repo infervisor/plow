@@ -7,7 +7,7 @@
  *
  *   ./kda_block_test [interp_decode.elf] [kda_fixture.bin]
  *
- * WHY A SINGLE LAYER. Section 5 of plans/knob-contract.md: single-block runs before full-network
+ * WHY A SINGLE LAYER. Section 5 of the design notes: single-block runs before full-network
  * launches, always. GLM's B4 gate de-risked one real-weight layer before anyone tried 78, and that
  * is why GLM's bugs were findable. A 93-layer K3 blob would fail here in a way nobody could
  * localise.

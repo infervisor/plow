@@ -6,7 +6,7 @@
  * this tree is CONFIG ONLY — 412 KB, no safetensors. So on every K3 number this campaign has
  * published, `expert_weight_table` is the zero-filled tail allocation, every routed slot returns
  * at the `wg_base == 0ull` test, and ops 48/49 execute NO GEMV. The `PLOW_K3_ABLATE=48,49` line in
- * `plans/k3-decode-perf.md` ("MoE group glu+down 0.62 ms") is therefore the cost of a body that is
+ * the design notes ("MoE group glu+down 0.62 ms") is therefore the cost of a body that is
  * not running, and so is `PLOW_MOE_GROUP_FLAT=1`'s recorded -0.76 ms loss.
  *
  * SHAPE. Read off the emitted packet, not assumed: `MoeGroupGluFp8Blk k=16 I_moe=384 H=3584

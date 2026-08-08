@@ -71,7 +71,7 @@
  * BKV=32), and a spilling flash inner loop costs more than the barriers it removes. And
  * the barriers were never the bottleneck: the combined-P variant removes the MOST barriers
  * yet is the SLOWEST, so D=128 flash at 8 waves is bound by LDS/MFMA/softmax throughput —
- * work that BKV=64 reorganises but does not reduce. See plans/qwen-flash-plus.md.
+ * work that BKV=64 reorganises but does not reduce. See the design notes
  *
  * D=256/512 (Gemma) is unconditionally 32: those arms size the FA_LDS_HALVES(512) union and
  * live in the 4-wave/512-reg flash object where the second accumulator would not fit. */
@@ -2851,7 +2851,7 @@ __device__ void d_flash_gather_prefill(float* __restrict__ Opart, float* __restr
  * both kernels are latency-bound at 256-CU fill. Realizing this lever needs a FUSED persistent
  * split-reduce + double-buffered per-CU MFMA (AITER's structure), an architectural change, not
  * a kernel port. Kept as the validated foundation for that follow-up. See
- * plans/glm-mla-flash-tuning.md. The production path is the scalar GF/nsplit kernel.
+ * the design notes The production path is the scalar GF/nsplit kernel.
  *
  * The scalar d_flash_mla_decode above re-streams the latent once per HEAD-GROUP
  * (GF heads/group => 64/GF groups), because the O accumulator oacc[GF][8] is in

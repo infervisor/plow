@@ -21,7 +21,7 @@ Batch 1, single-user, bf16, greedy. `vllm bench serve --dataset-name random --ra
 | 32k  | —        | 15.64    | —               | 13.56    | —        | 12.67    |
 | 64k  | 18.08*   | 17.73    | 14.73           | **15.61**| 16.47    | **14.79**|
 
-plow numbers are the bit-exact TP figures from `plans/tp-design.md` §14 (best xr-tuned config: TP2 xr64,
+plow numbers are the bit-exact TP figures from the design notes (best xr-tuned config: TP2 xr64,
 TP4 xr32 = plow's sweet spot 13.75 @1k, TP8 xr16). `*` plow TP2 @64k is the GQ-default value (no xr-tuned
 64k point recorded). plow single-GPU reference: **TP1 = 19.1 ms @1k, 22.9 @64k**.
 

@@ -97,7 +97,7 @@ pub fn packed_expert_table(
 }
 
 /// Offset-based expert-table resolution for **FUSED 3-D expert tensors** (Gemma-4 26B-A4B,
-/// `plans/rtx-08-gemma4-moe-26b.md`). Unlike GLM/DeepSeek — where each expert is a separately
+/// the design notes). Unlike GLM/DeepSeek — where each expert is a separately
 /// named `{gate, up, down}` tensor resolved by [`build_expert_table`] — Gemma stores ONE
 /// `experts.gate_up_proj [E, 2·I, H]` and ONE `experts.down_proj [E, H, I]` per layer. The SM's
 /// two-level lookup therefore indexes `expert_weight_table[eid*2 + {0,1}] = {gate_up base, down

@@ -366,7 +366,7 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
 }
 
 /* ================================================================================
- * bf16 Gemma-4 26B-A4B (sparse-MoE) DECODE bodies (plans/rtx-08-gemma4-moe-26b.md).
+ * bf16 Gemma-4 26B-A4B (sparse-MoE) DECODE bodies.
  *
  * These are the bf16 twins of the block-fp8 grouped kernels above, specialised to the
  * Gemma-4 MoE block: SOFTMAX router with a weightless-RMS + per-channel scale + H^-0.5
@@ -396,7 +396,7 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
  *                               (B*k) x 11.9 MB to (#distinct experts) x 11.9 MB.
  *
  * B>1 therefore uses CHANNEL-MAJOR. This is a pure permutation of independent one-warp outputs,
- * so it changes no arithmetic — see plans/batch-decode.md. B==1 keeps the legacy slot-major
+ * so it changes no arithmetic — see the design notes B==1 keeps the legacy slot-major
  * order (S == k makes the two equivalent for locality, and it protects the B=1 TPOT gate).
  *
  * Chosen over an explicit expert SORT + register-level multi-row reuse (the gemv_rows<MM> form,
@@ -453,7 +453,7 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
  * lane-split down arm and warp-per-row flash in place: UN=2 gives bf16 6.194 / fp8 5.709 vs
  * UN=4's 6.288 / 5.709 -- the shipped default had been carried over from an earlier round and
  * was no longer optimal once the other arms moved. Exactly the shape-dependence that argues
- * for putting these knobs under the tuner (plans/tuner-decode-sweep.md). */
+ * for putting these knobs under the tuner. */
 #ifndef GV_MOE_UN
 #define GV_MOE_UN 2
 #endif
@@ -528,7 +528,7 @@ __device__ __forceinline__ float plow_moe_gelu_tanh(float x) {
  *
  * VECTORIZED to the exact inner loop the dense-MLP decode GEMV uses (gemv_rows, op_gemm.cuh):
  * 128-bit loads (ld_glob8, 8 bf16/lane), GV_UNROLL=8 loads in flight before any is consumed,
- * dot8 FMA, warp_sum32 reduce. This is the #1 MoE decode lever (plans/rtx-08 §perf): the earlier
+ * dot8 FMA, warp_sum32 reduce. This is the #1 MoE decode lever: the earlier
  * scalar stride-32 single-accumulator dot was latency-bound at ~30% HBM BW (the megakernel caps
  * at 8 warps/SM, so ILP inside the warp — not occupancy — hides load latency); the vectorized
  * path runs the expert GEMVs at the dense path's ~55% BW. K need not be a GV_STEP multiple: the
@@ -1992,7 +1992,7 @@ static __device__ void d_moe_expert_glu_norm_gemma(bf16* __restrict__ fu,
 }
 
 /* ================================================================================
- * Gemma-4 26B-A4B bf16 grouped-MoE PREFILL bodies (plans/p9-26b-prefill-moe.md).
+ * Gemma-4 26B-A4B bf16 grouped-MoE PREFILL bodies.
  *
  * Token-sorted grouped expert GEMM for T>1. Router + align/sort are plain bodies; the two
  * grouped GEMMs reuse op_gemm.cuh's tiled-GEMM helpers (the PGM_ and pgm_ symbols), so they

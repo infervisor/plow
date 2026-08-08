@@ -233,7 +233,7 @@ fn dispatch_block(
 }
 
 fn glm_scaled_cfg() -> RouterCfg {
-    // GLM-5.2 RouterCfg, cardinality-scaled per plans/glm52-prototype-plan.md §2 (E=8, K=2;
+    // GLM-5.2 RouterCfg, cardinality-scaled per the design notes (E=8, K=2;
     // scoring/norm/scale are the REAL GLM values — the correctness points, kept exact).
     RouterCfg {
         n_exp: 8,

@@ -20,7 +20,7 @@ pub(crate) const LAUNCH_CYCLES: Cycles = 500;
 /// Per-op **decode dispatch floor** (µs): the counter-gate rendezvous "dead-air"
 /// every single-token (M=1) op pays at each op→op hand-off, independent of its
 /// tile work. Measured ≈4.6 µs on MI350X gfx950 — the decode autopsy's 164 µs/
-/// layer counter-gate dead-air ÷ ~36 ops/MoE-layer (`plans/glm-decode-gap-
+/// layer counter-gate dead-air ÷ ~36 ops/MoE-layer (the design notes
 /// autopsy.md`), and cross-checked by E2: removing 234 ops cut TPOT ~6 %.
 ///
 /// Unlike [`LAUNCH_CYCLES`] (grid setup, <1 % of a GEMV) this DOMINATES a decode

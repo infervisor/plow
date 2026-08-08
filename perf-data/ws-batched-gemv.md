@@ -1,6 +1,6 @@
 # WS-batched-gemv — weight-stationary wide GEMV rungs (Gemma-4-12B, sm_120)
 
-Campaign **WS-batched-gemv**, 2026-07-21, branch `worktree-agent-ab0b7e6b9c3528051`
+Campaign **WS-batched-gemv**, 2026-07-21, branch an internal branch
 @ `eafea6c` (kernel) — measurement pass on top of the committed
 `op_gemm.cuh` per-MM-unroll wide rungs. Box: 1× RTX PRO 6000 Blackwell 96 GB
 (sm_120, 188 SMs), driver 580.82.07, CUDA 13.0.

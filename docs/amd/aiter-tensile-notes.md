@@ -1,7 +1,7 @@
 # AITER / Tensile / CK / ThunderKittens — what transfers to plow, and what cannot
 
 Research note for the MI355X (gfx950 / CDNA4) window. Companion to
-`plans/mi355x-cdna4-readiness.md`. Written on a box with no AMD GPU, so every
+the design notes. Written on a box with no AMD GPU, so every
 quantitative claim here is either quoted from a measurement already recorded in
 this repo (attributed) or derived from disassembly (reproducible with
 `scripts/asm_audit.py`). Nothing is estimated.
@@ -32,7 +32,7 @@ this repo (attributed) or derived from disassembly (reproducible with
 > 5–8% of peak. **The skinny/small-M deficit is a tile-inventory problem** (Tensile ships 336 macro
 > tiles; plow's selector has 3, and plow's own measured-best tile is not selectable).
 >
-> Full detail and the ranked candidate survey: `plans/knob-contract.md` §0-EXT-RESULT.
+> Full detail and the ranked candidate survey: the design notes.
 > Working driver with the decoded ABI documented inline: `runtime/ubench/gemm_tensile_ext.c`.
 
 ## 1. The structural fact: none of them can be linked in
@@ -174,7 +174,7 @@ the power-limited regime that 256 CUs of sustained dense MFMA actually run in �
 which is the only regime serving runs in.
 
 So the tile is **K- and power-dependent, with no global winner**, and the
-correct fix is per-shape tile selection (`plans/tile-specific-gemm.md`), not a
+correct fix is per-shape tile selection, not a
 new default. `GM_BM`/`GM_BN` are already compile-time overridable for exactly
 this.
 

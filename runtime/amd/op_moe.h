@@ -1,6 +1,6 @@
 /* op_moe.h — the MoE data-dependent counter-gate kernels (gfx950).
  *
- * plans/moe-plow-design.md §3-§4, plans/moe-ep-kernels.md §2-§3. Four ops implement the
+ * the design notes§4, the design notes§3. Four ops implement the
  * dispatch CORE: a router that writes a routing table, K expert-body slots that read it and
  * compute-or-skip (streaming ONLY the chosen experts' weights via a two-level pointer
  * indirection), and a deterministic combine. The interpreter's gate/signal loop is

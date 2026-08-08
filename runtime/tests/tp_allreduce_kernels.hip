@@ -4,7 +4,7 @@
  * the publish-signal, the SYSTEM-scope xctr gate, and the f32-accumulate reduction,
  * exactly as the persistent megakernel's XREDUCE packet will run it. This is the
  * standalone correctness+latency proof for the runtime collective (P1-B), reusing
- * the transport primitives tp-transport already proved (plans/tp-transport.md).
+ * the transport primitives tp-transport already proved.
  *
  * The kernels call op_collective.h directly, so the bench validates THE op code, not
  * a copy — the same rule every op_*.h golden test follows.

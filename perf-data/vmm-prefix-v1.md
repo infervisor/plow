@@ -5,7 +5,7 @@ Edition (188 SMs, 95.0 GiB), driver 580.82.07, CUDA 13.0. plowrt
 `--features cuda`, release. Implementation: `crates/plowrt/src/memory/vmm.rs`
 (+ `device/cuda.rs` VMM driver surface, `exec/gpu.rs` KV binding), flag-gated
 `PLOW_VMM_PREFIX=1`, default **off**. Design + measured feasibility review:
-`plans/rtx-09-prefix-headmajor.md`.
+the design notes.
 
 ## What is measured
 

@@ -210,7 +210,7 @@ buys ~0 ms, so there is nothing to ship and nothing for the oracle to gate.
 
 ## 3. (c) the co-resident split — the premise was wrong, and the SIGN DEPENDS ON THE FOLD
 
-Full write-up in `plans/glm52-coresident.md` §4b.
+Full write-up in the design notes.
 
 ### 3.0 THE HEADLINE: this knob's answer is a property of the interpreter, not of the knob
 

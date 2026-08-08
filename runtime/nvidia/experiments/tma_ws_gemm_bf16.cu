@@ -959,7 +959,7 @@ int main(int argc, char** argv) {
  *      prefill GEMM does not use all 8 i[] words -- two uint32 i[] slots, or one
  *      i[] word packing two uint16 ids, is enough. No struct growth required.
  *   3. The host builds the table. Descriptor identity is (tensor, tile shape), and
- *      the tile shape is chosen by the SELECTOR (plans/arch-gemm-tuning-system.md),
+ * the tile shape is chosen by the SELECTOR,
  *      which is exactly where a descriptor id can be minted.
  *
  * HOW MANY DESCRIPTORS A GEMMA-4 PREFILL NEEDS.
@@ -1010,5 +1010,5 @@ int main(int argc, char** argv) {
  * (see the co-residency invariant in dev_isa.h). Dropping a 2-warpgroup, 128 KiB,
  * setmaxnreg-partitioned GEMM into that switch changes the megakernel's occupancy
  * for EVERY op. That is a bigger design question than the ABI, and it is the same
- * one plans/arch-gemm-tuning-system.md is already circling.
+ * one the design notes is already circling.
  */

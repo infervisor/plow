@@ -570,7 +570,7 @@ Arm E needs a retrieval test before it ships. Arm B is the parity-preserving con
 
 81% of arm E's wall is still serial prefill. **A decode step of zero leaves arm E 1.14x behind.**
 No remaining flag closes this. What is left is runtime work: the prefill GEMM (38% of fp8 peak at
-occupancy 1) and the missing prefill/decode overlap (`plans/mixed-batching.md`).
+occupancy 1) and the missing prefill/decode overlap.
 
 
 ## 14. PX-14 — batched prefill is a NO-OP on this cell, and a campaign invariant is FALSE

@@ -1,6 +1,6 @@
 //! MoE dispatch core — the reusable, model-general machinery for the
-//! data-dependent counter-gate (`plans/moe-plow-design.md` §3-§4,
-//! `plans/moe-ep-kernels.md` §2-§3).
+//! data-dependent counter-gate (the design notes§4,
+//! the design notes§3).
 //!
 //! Two halves live here, both model-invariant:
 //!

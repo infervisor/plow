@@ -486,7 +486,7 @@ run_once() {  # $1 assets  $2 ctx  $3 label  $4 batch -> echoes "ms vram" | "vra
   wait_for_idle >/dev/null
   set -e
 
-  # Read memory.used INSIDE the lease. Reading it before means a sibling agent's
+  # Read memory.used INSIDE the lease. Reading it before means another branch's
   # in-flight run looks like a permanent holder and the point is skipped, when
   # what should happen is that gpulease serialises us and we measure once the
   # card is actually ours. It also means the number recorded as provenance is

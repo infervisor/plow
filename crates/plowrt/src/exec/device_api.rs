@@ -123,7 +123,7 @@ pub trait EngineDevice: Send + Sync + 'static {
     /// blocking SDMA copy from a preallocated fill buffer. This is on the
     /// per-token path (counter re-arm), so the AMD engine should prefer to
     /// batch its zeroing rather than assume this is free — see
-    /// `plans/tp-design.md`'s counter-reset numbers for what a copy-engine
+    /// the design notes's counter-reset numbers for what a copy-engine
     /// round-trip actually costs.
     fn memset_d8_async(&self, dptr: u64, value: u8, n: usize, stream: &Self::Stream) -> Result<()>;
 

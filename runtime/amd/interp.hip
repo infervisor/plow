@@ -113,7 +113,7 @@ extern "C" __device__ unsigned plow_l2_place_dispatch_1 = 1;
 #endif
 
 /* Cross-GPU collective spin deadline (s_memrealtime ticks). s_memrealtime is 1 GHz on
- * gfx950 (plans/tp-transport.md §1), so ~1e9 ticks ≈ 1 s: a fabric on which the
+ * gfx950, so ~1e9 ticks ≈ 1 s: a fabric on which the
  * system-scope xctr atomic did NOT propagate bails with status 0xDEAD.... instead of
  * hanging the resident queue. Never reached on a healthy XGMI mesh. */
 #define PLOW_XCTR_DEADLINE_TICKS 1000000000ull
@@ -210,7 +210,7 @@ extern "C" __device__ unsigned plow_l2_place_dispatch_1 = 1;
  * kernels/tiles/register configs are byte-identical, so this is a pure scheduling change. Built as
  * separate _gq objects and selected at launch by the host (PLOW_GLOBAL_QUEUE=1). Measured (batch 1):
  * consistent decode win on both models (dynamic claim smooths static per-CU imbalance), prefill cost
- * model-size-dependent (small on 4B). See plans/global-queue-e1-result.md.
+ * model-size-dependent (small on 4B). See the design notes
  *
  * CORRECTION (measured 2026-07-27, MI355X, Gemma-4 31B bf16, real weights through gemma4_chat,
  * T=1024 single chunk): prefill GQ is NOT neutral on 31B, it is a WIN — 163 ms GQ vs 178 ms
@@ -1922,7 +1922,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                 (const int*)TEN(4));
             break;
         }
-        /* ===== MoE data-dependent counter-gate (plans/moe-ep-kernels.md §2-§3). Decode-path
+        /* ===== MoE data-dependent counter-gate (the design notes§3). Decode-path
          * (bs=1, K-slot dispatch). The body branches on the routing table; the interp still
          * signals the successor unconditionally, so the counter DAG is unchanged. The router's
          * n_exp<=256 score scratch reuses the LDS arena (sm->raw, the largest union member). */
@@ -2834,7 +2834,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         const unsigned succ_len = e.succ_len;
         const unsigned succ_ofs = e.succ_ofs;
 
-        /* CROSS-GPU gate (plans/tp-design.md §6a). When set, this entry's wait/succ
+        /* CROSS-GPU gate. When set, this entry's wait/succ
          * counters live in the SYSTEM-scope, peer-mapped `xctr` region, not the
          * agent-scope local `counters` — the fine per-tile-shard collective path
          * (§6c). The coarse self-contained XREDUCE (§6b, below) leaves this clear and
@@ -2967,13 +2967,13 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
 
 #if !defined(PLOW_BUCKET_FLASH)  /* collectives in the DECODE and 8-wave PREFILL interpreters —
          * TP PREFILL needs XReduce in the prefill interpreter too, not just decode
-         * (plans/tp-prefill.md). Excluded from the 4-wave flash object (class-4 flash segments
+         *. Excluded from the 4-wave flash object (class-4 flash segments
          * never contain an XReduce, and it keeps that object's tight register budget untouched).
          * Bodies use only the PlowProgram peer fields, present in every bucket. */
         /* CROSS-GPU collectives run here, not in plow_exec, because their bodies need the
          * PlowProgram peer fields (peer_scratch/rank/n_gpu/xctr). */
         if (in->op == PLOW_DOP_XREDUCE) {
-            /* COARSE self-contained one-shot all-reduce (plans/tp-design.md §6b, §8a).
+            /* COARSE self-contained one-shot all-reduce.
              * The local agent gate above already ensured THIS rank's producing GEMV wrote
              * its partial into peer_scratch[rank]; d_xreduce_mega then cross-signals, waits
              * N arrivals (system xctr), and sums the N peer slots. Validated bit-exact +
@@ -3000,7 +3000,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                                    in->i[0], in->i[2], xoff, in->i[3], in->i[4],
                                    PLOW_XCTR_DEADLINE_TICKS, nullptr, e.slice, in->blocks);
         } else if (in->op == PLOW_DOP_XARGMAX_FIN) {
-            /* Cross-rank fold for a VOCAB-COLUMN-PARALLEL lm_head (plans/tp-design.md §8d).
+            /* Cross-rank fold for a VOCAB-COLUMN-PARALLEL lm_head.
              * Subsumes ARGMAX_FIN: it does the local nparts fold too, then rebases the index
              * into global vocab space and takes the cross-rank max of the packed key.
              *   t0=ids t1=amax.part  i0=nparts i1=n_batch i2=vocab_l
@@ -3012,7 +3012,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                                prog.rank, xoff, in->i[3], in->i[4], PLOW_XCTR_DEADLINE_TICKS,
                                nullptr, e.slice);
         } else if (in->op == PLOW_DOP_XFLASHMERGE) {
-            /* STUB (plans/tp-design.md §8c): dispatch present so the switch is total and the
+            /* STUB: dispatch present so the switch is total and the
              * compiler's structural emit runs; the CP flash LSE-merge body lands with tp-host.
              * No-op keeps single-GPU decode bit-identical. */
         } else

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build_k3_moe.sh — the Kimi-K3 MoE-BLOCK numeric gate (rung 2) and the MXFP4 nibble probe.
 #                                                                    [K3-MOE-GATE] [K3-MXFP4]
-# Same environment traps as build_k3_real.sh / build_kda_real.sh (plans/knob-contract.md §0a):
+# Same environment traps as build_k3_real.sh / build_kda_real.sh:
 # the .co needs system ROCm, which `nix develop` BREAKS (GLIBC_2.38); the host binaries need SYSTEM
 # gcc in a scrubbed env or they abort as "stack smashing detected".
 #

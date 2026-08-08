@@ -2,7 +2,7 @@
  * independent f32 CPU reference, driving them through the ROCr/HSA backend.
  *
  * The reference here is written from HF `modeling_gemma4.py` semantics directly
- * (see plans/gemma4-mi350x-sprint.md §2.2), NOT from the kernels — otherwise a
+ *, NOT from the kernels — otherwise a
  * shared misreading of the model would pass silently.
  *
  * Needs a gfx950 device and `test_kernels.elf` next to the binary.

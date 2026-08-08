@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KV-1 host oracle for the frozen KVZIP-SZ12 v1.2 row blob (plans/p10-kv-zip.md).
+"""KV-1 host oracle for the frozen KVZIP-SZ12 v1.2 row blob.
 
 Layout (per kv-head, per ring row, hd elems; row_bytes = hd/2 + hd + 32):
   [0        .. hd/2)     code plane: 4-bit exponent codes, 2/byte,

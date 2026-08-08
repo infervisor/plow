@@ -35,7 +35,7 @@ workgroups have bumped. A consumer polls that counter from every one of ITS OWN 
 **The wait side is 1.4x the signal side.** This matters because cost is not symmetric: the release
 RMW is a posted, non-returning `global_atomic_add` measured at 0.07 us per workgroup, whereas the
 `buffer_wbl2` / `buffer_inv` cache maintenance around it is per-L2 and serialises (see
-`plans/k3-decode-perf.md`, grid sweep 32/16/8/4/1 WG per XCD -> 13.20/4.35/2.73/1.85/1.05 us).
+the design notes, grid sweep 32/16/8/4/1 WG per XCD -> 13.20/4.35/2.73/1.85/1.05 us).
 
 ## Poll cost is set by the CONSUMER's width, not the producer's
 

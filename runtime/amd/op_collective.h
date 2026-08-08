@@ -1,14 +1,14 @@
 /* op_collective.h — the cross-GPU (tensor-parallel) collectives.
  *
  * These are the ONLY device ops that touch PEER VRAM. They ride the transport the
- * `tp-transport` agent proved (plans/tp-transport.md): a coarse-grained VRAM buffer
+ * `tp-transport` agent proved: a coarse-grained VRAM buffer
  * made visible to every GPU with hsa_amd_agents_allow_access, synchronized by a
  * SYSTEM-scope atomic on peer memory (no HSA signal, no host, ~90 ns one-way).
  *
  * The single-GPU counter-gate in interp.hip uses __HIP_MEMORY_SCOPE_AGENT (orders
  * across XCDs within ONE GPU). The ONLY change for cross-GPU is widening that scope
  * to SYSTEM so the release/acquire reaches past this device's per-XCD L2 out onto
- * XGMI to the peer — exactly the xctr_* trio below (plans/tp-design.md §6a, §12).
+ * XGMI to the peer — exactly the xctr_* trio below.
  *
  * SHARED with the golden wrapper (test_kernels.hip) and the 2-GPU microbench
  * (tp_allreduce_kernels.hip), so the CPU/2-GPU reference validates THIS code, not a
@@ -97,7 +97,7 @@
 
 /* ---- cross-GPU counter helpers (SYSTEM scope) ---------------------------------
  * Mirror interp.hip's agent-scope ctr_poll/ctr_acquire/ctr_signal, widened to
- * __HIP_MEMORY_SCOPE_SYSTEM. Same discipline (plans/tp-design.md §12):
+ * __HIP_MEMORY_SCOPE_SYSTEM. Same discipline:
  *   - POLL relaxed (a system ACQUIRE load emits a full inv on EVERY iteration —
  *     never put it in the spin),
  *   - take exactly ONE system acquire once the gate clears,
@@ -117,7 +117,7 @@ __device__ __forceinline__ void xctr_signal(uint32_t* p) {
 /* ---- XREDUCE: the reduce half of the one-shot all-reduce ------------------------
  * The N partials are already published — each rank's producing GEMV (o_proj/down)
  * wrote its partial H-vector straight into its own peer_scratch slot (fused into the
- * GEMV epilogue, no extra copy, plans/tp-design.md §8a) — and the SE_XCTR gate has
+ * GEMV epilogue, no extra copy) — and the SE_XCTR gate has
  * already fired, so this is a pure local reduction over the N peer slots.
  *
  *   out          : local full H-vector result (bf16)
@@ -201,7 +201,7 @@ __device__ __forceinline__ void d_xreduce(bf16* out, const void* const* peer_scr
 }
 
 /* ---- ONE-SHOT all-reduce (publish-signal + gate + reduce), fused, no launch -----
- * The whole collective in one device call, matching plans/tp-transport.md §5's
+ * The whole collective in one device call, matching the design notes's
  * tp_allreduce_oneshot signature. Used by the 2-GPU microbench and the golden
  * reference. In the persistent megakernel the WAIT is instead handled by the
  * interpreter's SE_XCTR gate (system-scope) and the body is just d_xreduce — this
@@ -251,12 +251,12 @@ __device__ __forceinline__ void d_xreduce_oneshot(
  * d_xreduce_oneshot, but the peer gate words are addressed straight out of the
  * PlowProgram peer-scratch table instead of a precomputed pointer array (the
  * megakernel cannot build one per packet). Each rank's xctr region sits at the SAME
- * byte offset inside its peer_scratch (plans/tp-design.md §7a), so:
+ * byte offset inside its peer_scratch, so:
  *     peer r's gate = PLOW_CTR(peer_scratch[r] + xctr_byte_off, gate_id)
  * where xctr_byte_off = (char*)prog.xctr - (char*)prog.peer_scratch[rank] — computed
  * by the caller from the two §12 fields, no 5th field needed.
  *
- * COARSE (1 sync/collective, plans/tp-design.md §6b): gate_target = nranks, the host
+ * COARSE (1 sync/collective): gate_target = nranks, the host
  * having zeroed xctr before the token. The producing o_proj/down GEMV has already
  * written this rank's partial into peer_scratch[rank] (tp-host binds og/dg there), and
  * the interpreter's ordinary agent-scope gate on that GEMV is this op's LOCAL wait —
@@ -318,7 +318,7 @@ __device__ __forceinline__ void d_xreduce_mega(
 }
 
 /* ---- XARGMAX_FIN: the cross-rank fold for a VOCAB-COLUMN-PARALLEL lm_head ---------
- * plans/tp-design.md §8d, and the reason `crates/plowrt/src/asset/shard.rs` records
+ * the design notes the reason `crates/plowrt/src/asset/shard.rs` records
  * lm_head as REPLICATED: without this fold every rank must compute the full-vocab
  * argmax to agree on the token, so all N stream the whole 1.9 GB head every step.
  *
@@ -407,7 +407,7 @@ __device__ __forceinline__ void d_xargmax_fin_mega(
  * The one-shot d_xreduce_mega has EVERY rank read ALL N peers' FULL partial: ~(N-1)*msg
  * of fabric traffic per rank. That is optimal for decode's tiny [1,hidden] latency-bound
  * message, but the prefill partial is [T,hidden] — T* bigger, BANDWIDTH-bound — so the
- * O(N) fabric is what caps TP8 prefill at 4.74x instead of 8x (plans/tp-prefill.md §4).
+ * O(N) fabric is what caps TP8 prefill at 4.74x instead of 8x.
  *
  * Reduce-scatter + all-gather moves only ~2(N-1)/N*msg per rank (~N/2x less fabric).
  * Partition the flat [n] result into N CONTIGUOUS slices; slice s = [n*s/N, n*(s+1)/N).

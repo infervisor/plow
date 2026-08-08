@@ -125,7 +125,7 @@ __device__ __forceinline__ float dot8(const bf16v8& a, const bf16v8& b, float ac
     return acc;
 }
 
-/* ---- KVZIP-SZ12 v1.2 lossless KV row blob (plans/p10-kv-zip.md KV-2; bench-only until KV-3) --
+/* ---- KVZIP-SZ12 v1.2 lossless KV row blob (the design notes KV-2; bench-only until KV-3) --
  * Row blob = [D/2 B code plane (4-bit codes, low nibble = even dim) | D B lo plane (sign<<7|mant7)
  * | 32 B tail: u32 hdr = base | nesc<<8, then 9 x 3 B escape slots {exp u8, dim u16 LE}].
  * code c in [0,14]: exp = base + c; c == 15: exp from the slot carrying this dim. Decode is exact
@@ -2454,7 +2454,7 @@ __device__ void d_flash_prefill_px8(float* __restrict__ Opart, float* __restrict
  * the P.V is the fp16 mma twin.
  *
  * Tiling rationale, smem budget and the warp-specialization decision: see FA_PX23_SMEM_FLOATS
- * above and plans/hd256-fp8-prefill.md. In one line: BQ=64/BKV=32 with a 4x2 warp grid and NO hd
+ * above and the design notes In one line: BQ=64/BKV=32 with a 4x2 warp grid and NO hd
  * split, because at hd256 the query x kv tile already fills 8 warps — which deletes px4's second
  * score tile, and with it the naive retile's 104,464 B arena (over the 101,376 B cap). */
 template <int HD, int BQ, int BKV>

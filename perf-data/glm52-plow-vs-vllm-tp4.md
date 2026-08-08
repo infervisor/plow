@@ -25,7 +25,7 @@ Measured 2026-07-28.
 
 Nothing on this page comes from `plowrt amd-bench`, `glm52_decode`, or any other bespoke timing
 binary. Those instruments are legitimate for bring-up and correctness and their numbers must never
-appear beside a vLLM number (`plans/knob-contract.md` §0-BENCH).
+appear beside a vLLM number.
 
 **Provenance — the tree these numbers describe.** plow side: the merge commit that carries
 `73a3ec2` plus this branch's `tp:`/`bench:`/`tuning:` commits. Objects

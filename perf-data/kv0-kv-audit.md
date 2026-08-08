@@ -26,7 +26,7 @@ sz12 net ratio = 2·hd / (1.5·hd + 4·E), i.e. INCLUDES per-row fixed escape-sl
 provisioning at the p(overflow)<1e-6 slot count. Worst observed per-row escape
 count anywhere (10.5 GB, ~4.4 M rows): 8.
 
-## Gate verdicts (bars set in plans/p10-kv-zip.md §3 before measuring)
+## Gate verdicts (bars set in the design notes before measuring)
 
 - **bf16 sz12 → KV-1 GO.** Net ratio 1.24–1.30 ≥ 1.20 on every class; escape
   0.017–0.032% ≤ 0.5%; row-overflow tail bounded at E ≤ 7 ≤ 8. The ring

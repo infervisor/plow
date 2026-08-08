@@ -2,7 +2,7 @@
 
 Date 2026-07-22. Branch `c1r-decode-occupancy` (based on `c1-decode-splitzip`).
 Model gemma-4-12B, RTX PRO 6000 Blackwell (188 SM, 1535 GB/s achievable).
-Plan: `plans/p9-lossless-compression.md` §C-1R. All kernels **bit-exact** vs bf16 GEMV
+Plan: the design notes. All kernels **bit-exact** vs bf16 GEMV
 (reused the C-1 device oracle: sz/ws/cp output == bf16 output, byte-identical).
 
 ## TL;DR — C-1 is UN-KILLED for the B=1 decode path

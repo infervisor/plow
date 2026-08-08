@@ -7,7 +7,7 @@ license.workspace = true
 # The plow host runtime: loads compiled assets, coordinates the persistent-kernel
 # executors through counter pools / packet queues / an OOB channel, and fronts it
 # all with an OpenAI-compatible API. See `docs/runtime/` and
-# `plans/design-the-runtime-in-whimsical-leaf.md`.
+# the design notes.
 
 [[bin]]
 name = "plowrt"

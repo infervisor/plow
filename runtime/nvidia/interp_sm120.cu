@@ -974,7 +974,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 #endif /* !PLOW_NV_FA_ONLY (w8a16 arms) */
 #endif
 
-    /* ---- Gemma-4 26B-A4B bf16 grouped-MoE PREFILL (plans/p9-26b-prefill-moe.md) ----
+    /* ---- Gemma-4 26B-A4B bf16 grouped-MoE PREFILL ----
      * DEAD in a dense (12B/31B) GEMM segment; compiled OUT of the lean occ-2 object to relieve
      * register pressure toward 0 spill. A 26B MoE program would run its expert GEMV/GLU segments on
      * the occ-1 _pfseg object instead. Case gating only — op_moe.cuh (T9a) is untouched. */
@@ -1323,7 +1323,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
 
 #if PLOW_NV_GEMMA
     /* ---- fp8 (w8a16) weight-only DECODE GEMV family (Gemma gate) ----
-     * FFMA dequant-on-load, per-output-channel scale in the epilogue (plans/rtx-05 §T2).
+     * FFMA dequant-on-load, per-output-channel scale in the epilogue.
      * Weight is e4m3 (uint8), so TEN(2)/TEN(5) are cast to uint8*; the scale(s) are f32.
      * GEMV_FP8   t0=C t1=x t2=W(fp8) t5=w_scale(f32[N])  i0=M i1=N i2=K i4=a_row0.
      * GEMV_GLU_FP8 t0=fu t1=x t2=Wg(fp8) t5=Wu(fp8) t3=g_scale t4=u_scale  i0=M i1=N i2=K i5=act. */
@@ -1564,7 +1564,7 @@ __device__ __forceinline__ void plow_exec(const PlowDevInst* in, void* const* T,
         break;
 
 #if PLOW_NV_GEMMA && !PLOW_NV_PREFILL && PLOW_HAS_MOE_GEMMA
-    /* ---- Gemma-4 26B-A4B bf16 sparse-MoE DECODE (plans/rtx-08-gemma4-moe-26b.md) ----
+    /* ---- Gemma-4 26B-A4B bf16 sparse-MoE DECODE ----
      * BATCH B>1 (PLOW_DECODE_BATCH): the decode MoE ops carry the batch row count in a
      * spare immediate. The compiler leaves it 0 at B=1 so the B=1 packet is byte-identical
      * to the pre-batch blob; 0 and 1 both mean "one row" here. */
@@ -1950,7 +1950,7 @@ __global__ __launch_bounds__(256, PLOW_NV_MINBLK) void PLOW_SYM(interp_sm120)(Pl
     __shared__ unsigned gq_claim;
 #if PLOW_NV_PLACE_DISPATCH
     /* ===== EXPERIMENTAL / UNVALIDATED — physical-SM L2-domain dispatch =====
-     * plans/devblob-locality-placement.md. Consumes a compiler PLOW_NV_PLACE blob,
+     * the design notes Consumes a compiler PLOW_NV_PLACE blob,
      * whose gq_stream is grouped into P per-L2-domain windows (gq_seg_ofs). Each
      * block reads its PHYSICAL SM id and pulls ONLY its L2 domain's window via that
      * domain's cursor line, so a domain's packets run on the L2 slice that holds

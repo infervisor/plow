@@ -30,7 +30,7 @@
  *   sg render -c '/tmp/xcd_map'
  *
  * Build OUTSIDE `nix develop` (nix's glibc shadows the system one and hipcc dies with
- * GLIBC_2.38 not found); see plans/knob-contract.md §0a.
+ * GLIBC_2.38 not found);
  */
 #include <hip/hip_runtime.h>
 #include <stdio.h>

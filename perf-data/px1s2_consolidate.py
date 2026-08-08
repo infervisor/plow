@@ -3,7 +3,7 @@
 px1s2_consolidate.py — build perf-data/px1-stage2.json from the raw
 inference-benchmarker reports in perf-data/harness/b2-ib/px1s2-*/results/.
 
-PX-1 stage 2 (plans/rtx-11-prefill-experiments.md): block-diagonal varlen
+PX-1 stage 2: block-diagonal varlen
 flash — all packed requests' prefill attention in ONE persistent-grid kernel
 pass — three-armed against the serialized prefill (off) and the stage-1
 per-request-serial attention (s1), same binary, same 12B ctx8k B=16 blob,
@@ -82,7 +82,7 @@ def main():
     doc = {
         "campaign": "PX-1 stage 2 (block-diagonal varlen flash for batched prefill)",
         "date": "2026-07-21",
-        "plan": "plans/rtx-11-prefill-experiments.md PX-1, sequencing step 2",
+        "plan": "the design notes PX-1, sequencing step 2",
         "model": "/workspace/models/gemma-4-12B-it",
         "served_model_name": "gemma-4-12b-it",
         "tokenizer": "google/gemma-4-12B-it",

@@ -5,7 +5,7 @@
 #   interp_prefill.elf  plow_interp_gfx950        8 waves — GEMM + flash-prefill (class-8 segments)
 #   interp_decode.elf   plow_interp_dec_gfx950    8 waves — GEMV + flash-decode
 #   interp_flash.elf    plow_interp_flash_gfx950  4 waves / FA_DC=256 — the class-4 flash_prefill
-#                                                 SEGMENT only (segmented dispatch; plans/segmented-dispatch.md)
+# SEGMENT only (segmented dispatch)
 #   test_kernels.elf    golden __device__ wrappers (share the SAME op_*.h the interpreter runs)
 #   chat                the closed-loop host harness (gemma4_chat.c)
 #
@@ -77,7 +77,7 @@ unbundle() { # <in.co> <out.elf>
 # spill unchanged. It is the WIDTH that costs, not the loop — MM=32/64 stay at 256/occ 2 but
 # spill 0.35-0.53 scratch ops per FMA INSIDE the weight-stream loop (MM=1 is 0.022), and
 # NVIDIA's shallow-unroll rescue does not port because this megakernel has 8 registers of
-# headroom where sm_120 has 43. Full table + verdict: plans/knob-contract.md §6g-WALK.
+# headroom where sm_120 has 43. Full table + verdict: the design notes.
 #
 # next_pow2, clamped to PLOW_GEMV_MAXM (16). Register cost measured on ROCm 7.2.4 / gfx950:
 #   MM=1  248/occ2/spill 0     MM=2  248/occ2/spill 0 (free)     MM=4  252/occ2/spill 0
@@ -153,7 +153,7 @@ GQB="${PLOW_GQ_BATCH:-1}"
 # FP8 DECODE object (PLOW_FP8=1). A SEPARATE decode interpreter carrying the fp8 w8a16 GEMV arms
 # (GEMV_FP8 / GEMV_GLU_FP8) IN ADDITION TO the bf16 GEMV_GLU/QKV arms — they used to replace them,
 # which dropped the one bf16 GEMM every fp8 PREFILL packet still emits (the lm_head) and produced
-# all-zero logits; see plans/amd-fp-precision.md §4. Additive is register-free on ROCm 7.2.4
+# all-zero logits; Additive is register-free on ROCm 7.2.4
 # (248/occ 2/spill 0 either way). Mirrors Gemma's OWN decode flags (FA_DEC_VPIPE default 0, no
 # PLOW_FLASH_HD128 — Gemma runs segmented flash), only adding PLOW_FP8=1. Built only when asked.
 BUILD_FP8=0; [ "${PLOW_FP8:-0}" = 1 ] && BUILD_FP8=1

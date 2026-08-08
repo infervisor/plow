@@ -8,7 +8,7 @@
 //!
 //! * **LDS grows 64 KiB → 160 KiB per CU.** This is the big one — it is what
 //!   lets a head_dim=512 attention tile stage Q, K and V simultaneously (see
-//!   `plans/gemma4-mi350x-sprint.md` §5, Tier C).
+//! the design notes C).
 //! * **Double-K bf16 MFMA.** CDNA 3 tops out at `v_mfma_f32_16x16x16_bf16`;
 //!   gfx950 adds `v_mfma_f32_16x16x32_bf16` and `v_mfma_f32_32x32x16_bf16`,
 //!   doubling the contraction depth per instruction and with it the per-CU

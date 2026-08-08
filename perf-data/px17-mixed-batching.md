@@ -144,7 +144,7 @@ tick is **17.63 ms**, not 9–10 — the weight read is only ~half of the launch
 errors run opposite ways and the product lands inside the brief's stated "single-digit to low-teens
 percent" band, at the bottom of it.
 
-An earlier design note (`plans/mixed-batching.md` §1) sized this at **~0.6% at 127k** by assuming
+An earlier design note sized this at **~0.6% at 127k** by assuming
 the tick is a ~1390 ms chunk. The chunk is ~220 ms at the deployed chunk-1024 ladder, so that
 figure is ~9× low. Neither estimate was measured; both are now superseded by 22.46 s.
 
@@ -193,7 +193,7 @@ latency-sensitive profile, not on this throughput cell.
 
 ## 5. Design, validated against the code (for whoever revisits this at short context)
 
-Fusion is the right architecture and pays on a *different* profile — `plans/mixed-batching.md` sizes
+Fusion is the right architecture and pays on a *different* profile — the design notes sizes
 it at 9–12% at 2k/8k with high concurrency, where the prefill chunk is small and the decode launch
 is a comparable share of the tick. That case was not measured here. If it is built, the design below
 is what survives contact with the tree.
@@ -288,14 +288,14 @@ object). Binaries from this worktree, `cargo build --release -p plowrt --feature
 **Fusion is real, correctly designed in the brief, and too small to matter here.** The wall it can
 touch is 22.46 s of 282.55 s plus per-tick host cost; it projects to `28.99 → ~30.9 tok/s`, vLLM
 still 1.37× ahead — and a **six-line scheduler flag measures 31.05** on the same cell. Every version
-of the estimate made without measuring — 0.6% in `plans/mixed-batching.md`, "~992 ticks × 9–10 ms"
+of the estimate made without measuring — 0.6% in the design notes, "~992 ticks × 9–10 ms"
 in the brief, and this note's own first pass at 5.5% — was wrong in a different direction, which is
 the same failure mode px12 §8 and px14 §9 already called out. The one that survived is the one that
 was measured end to end.
 
 What this cell is still bounded by has not changed since `gemma4-12b-longctx-5090.md` §6: the
 prefill GEMM at 38% of fp8 peak, and 8 × 27.2 s of prefill that no decode-side change can touch.
-Fusion is worth building for the short-context/high-QPS profile, where `plans/mixed-batching.md`
+Fusion is worth building for the short-context/high-QPS profile, where the design notes
 sizes it at 9–12% — **that shape has not been measured and is the open question this note leaves.**
 
 **The most valuable thing in this note is not the sizing.** It is that `main` has been silently

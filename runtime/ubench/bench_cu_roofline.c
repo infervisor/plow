@@ -93,7 +93,7 @@ static const char* const KERNEL_ROLE[] = {
 };
 
 /* ============================================================================
- * Gemma 4 31B problem sizes (from plans/gemma4-mi350x-sprint.md)
+ * Gemma 4 31B problem sizes (from the design notes)
  * ============================================================================ */
 /* Hidden=5376, Intermediate=21504, Heads=32, KVHeads=16(sliding)/4(global),
  * HeadDim=256(sliding)/512(global), Vocab=262144 */

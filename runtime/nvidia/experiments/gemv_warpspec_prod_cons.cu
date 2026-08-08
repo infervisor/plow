@@ -2,7 +2,7 @@
 // for the plow persistent megakernel on sm_120a. Designed in the RTX campaign, NEVER
 // measured until now.
 //
-// Hypothesis (from plans/p9-26b-campaign.md "Revival candidate"): a uniform one-warp-
+// Hypothesis (from the design notes "Revival candidate"): a uniform one-warp-
 // per-row GEMV pays a memory-controller turnaround between consecutive rows. Split the
 // block into PRODUCER warps (cp.async weight rows into a depth-S smem ring) and CONSUMER
 // warps (cooperatively dot each row from smem), so producers pre-stage row r+1..r+S-1

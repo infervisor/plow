@@ -341,7 +341,7 @@ fn write_llama_config(dir: &Path) {
 }
 
 /// Byte-golden for the dense **Gemma** path — protects the Gemma `emit_phase`
-/// branches across the trait refactor (plans/devgen-trait-refactor.md). Bootstrap:
+/// branches across the trait refactor. Bootstrap:
 /// the assert message prints the actual hash on first run; pin it here.
 #[test]
 fn gemma_dense_blob_is_stable() {

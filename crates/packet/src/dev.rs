@@ -321,7 +321,7 @@ pub enum DevOp {
     XArgmaxFin = 28,
     /// TWO-SHOT all-reduce (reduce-scatter + all-gather) for the LARGE prefill
     /// [T,hidden] message — bandwidth-optimal where the one-shot [`DevOp::XReduce`] is
-    /// fabric-bound (plans/tp-prefill.md §4). Fused + self-contained like `XReduce`:
+    /// fabric-bound. Fused + self-contained like `XReduce`:
     /// partitions the flat [n] result into N contiguous slices, reduces THIS rank's
     /// owned slice from every peer's partial (writing it in-place, peer-visible), then
     /// gathers every peer's reduced slice into the local full vector. Two internal xctr
@@ -341,8 +341,8 @@ pub enum DevOp {
     /// MFMA is unchanged. `t3=K(fp8) t4=V(fp8) t6=k_scale t7=v_scale`; else as [`DevOp::FlashPrefill`].
     FlashPrefillFp8 = 39,
 
-    // ===== MoE data-dependent counter-gate ops (plans/moe-plow-design.md §3, =====
-    // plans/moe-ep-kernels.md §2-§3). Opcodes in the HIGH free range 40+ so they do
+    // ===== MoE data-dependent counter-gate ops (the design notes, =====
+    // the design notes§3). Opcodes in the HIGH free range 40+ so they do
     // NOT collide with tp's collectives (24-29) or the fp8 merge (30+). These are the
     // FIRST ops whose BODY branches on a runtime buffer (the routing table): the
     // counter DAG stays static (deadlock-free, `executed == total`), and each expert
@@ -528,7 +528,7 @@ pub enum DevOp {
     LayerNorm = 60,
 
     /// Gemma-4 26B-A4B bf16 sparse-MoE DECODE router (`d_moe_router_gemma`,
-    /// `plans/rtx-08-gemma4-moe-26b.md`). Weightless-RMS(resid) → `·scale[H]·root` →
+    /// the design notes). Weightless-RMS(resid) → `·scale[H]·root` →
     /// softmax(proj@·) → top-k (lowest-id tie) → norm_topk → `·per_expert_scale`. Writes
     /// `routing_table[k]={u32 id, f32 gate}`. ONE block. `t0=table t1=resid t2=proj t3=scale
     /// t4=per_expert_scale` · `i0=H i1=n_exp i2=k` · `f0=root(=H^-0.5) f1=eps`.
@@ -585,7 +585,7 @@ pub enum DevOp {
     /// `i0=H i1=k` · `f0=eps f1=layer_scalar`.
     MoeCombineResidNormGemma = 72,
 
-    // ===== Gemma-4 26B-A4B bf16 grouped-MoE PREFILL ops (plans/p9-26b-prefill-moe.md). =====
+    // ===== Gemma-4 26B-A4B bf16 grouped-MoE PREFILL ops. =====
     // Token-sorted grouped expert GEMM for T>1. Ids 73+ (71/72 free; 72 reserved elsewhere).
     // Built only in the prefill (_pf) interpreter object.
     /// T-token router: block-per-token loop of the exact decode router. Writes
@@ -649,7 +649,7 @@ pub enum DevOp {
     /// `i0=H i1=I_moe i2=n_exp`. Gated behind `PLOW_NV_W8A8`.
     MoeGroupDownGemmaPfW8a8 = 82,
 
-    // ===== Nemotron-3 Mamba-2 SSD mixer (plans/block-asset-harness.md §7 Nemotron, M4). =====
+    // ===== Nemotron-3 Mamba-2 SSD mixer (the design notes Nemotron, M4). =====
     // A NEW op family (opcode 90, leaving 83-89 as a gap after the MoE-prefill band). This is
     // the FIRST state-space op in the tree — no reuse of any existing kernel. The in_proj /
     // out_proj projections are ordinary GEMV/GEMM; this op is the mixer CORE: causal depthwise
@@ -1018,7 +1018,7 @@ pub enum DevOp {
     ///
     /// # This is the OUTPUT-dimension merge, and the distinction is the whole point
     ///
-    /// `plans/knob-contract.md` §6g-KNOBS measured `GLM_GROUP=1` removing 38% of the ops for
+    /// the design notes measured `GLM_GROUP=1` removing 38% of the ops for
     /// **+2.88 ms**: it collapsed work that ran on disjoint CU slices into a loop inside one
     /// packet, which destroys concurrency. Op count is not the objective function. This merge is
     /// the opposite shape — the per-CU column count RISES from `(Nq+Nk+Nv)/nblk` to
@@ -1193,7 +1193,7 @@ pub enum DevOp {
     /// This is the OUTPUT-dimension merge, the same direction [`DevOp::GemvQkvg`] documents. The
     /// per-CU column count RISES (6 / 2 / 1 across the three split sweeps → 9 fused, at K3's
     /// geometry over 256 CUs), so the op gets WIDER and nothing that ran in parallel starts running
-    /// in sequence — the opposite of `plans/knob-contract.md` §6g-KNOBS' `GLM_GROUP=1`, which
+    /// in sequence — the opposite of the design notes' `GLM_GROUP=1`, which
     /// removed 38% of the ops for **+2.88 ms** by collapsing disjoint-CU work into a loop.
     ///
     /// # `i5`/`i6`/`i7` are TENSOR HANDLES
@@ -1724,7 +1724,7 @@ pub const SE_FINE: u16 = 1;
 /// This entry's wait/succ counters live in the SYSTEM-scope, peer-mapped [`DevProgram::xctr`]
 /// region (a cross-GPU collective), not the agent-scope local `counters`. Orthogonal to
 /// [`SE_FINE`]. Set by the TP compiler on the collective packets and on a producing GEMV whose
-/// successor is a cross-GPU "partial ready" bump. See `plans/tp-design.md` §6a.
+/// successor is a cross-GPU "partial ready" bump.
 pub const SE_XCTR: u16 = 2;
 
 /// Shift of the per-(packet, L2 domain) slice count packed into [`StreamEnt::flags`].
@@ -1761,7 +1761,7 @@ pub const SE_NPER_MASK: u16 = 0x1FF0;
 /// CU's stream. A fine list can only *lower* a threshold or *narrow* a wait set; it can
 /// never make a workgroup wait on something issued later in its own stream. Add a scheduler
 /// that interleaves tiles across ops and that argument dies — see
-/// `plans/fine-counter-deadlock-fix.md`.
+/// the design notes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct StreamEnt {
@@ -1830,7 +1830,7 @@ pub struct DevProgram {
     pub gq_cursor: u64,
     // ===== Cross-GPU (tensor-parallel) fields. Single-GPU runs leave these 0. =====
     // Appended AFTER `gq_cursor` so every existing field (notably `trace`) keeps its
-    // offset — the ABI-lock test only sees the size grow. See `plans/tp-design.md` §6a.
+    // offset — the ABI-lock test only sees the size grow.
     /// This rank's cross-GPU counter region (SYSTEM-scope, peer-mapped). Points INTO
     /// `peer_scratch[rank]`; the per-rank offset is `xctr - peer_scratch[rank]`.
     pub xctr: u64,

@@ -11,7 +11,7 @@ use serde_json::Value;
 use super::*;
 use crate::block::{parse_block, write_block_descriptor};
 
-/// `plans/glm52-arch.md`. `H`/`NH`/`DK`(kv_lora)/`QL`(q_lora)/`QN`(qk_nope)/`DR`(qk_rope)/
+/// the design notes. `H`/`NH`/`DK`(kv_lora)/`QL`(q_lora)/`QN`(qk_nope)/`DR`(qk_rope)/
 /// `VD`(v_head) name the MLA geometry the kernels carry as compile-time operands.
 #[derive(Clone)]
 pub(crate) struct GlmCfg {
@@ -70,7 +70,7 @@ pub(crate) struct GlmCfg {
     // per rank, full moe_inter width — no CU-starve) instead of TP-sliced. Each rank fires only its
     // LOCAL chosen experts (host binds local expert bases, NULL for remote; the kernel skips a null
     // base). The combine XReduce (already summing shared partials over tp) folds the per-rank whole-
-    // expert partials in the SAME collective — no new op. See plans/moe-ep-kernels.md §5a.
+    // expert partials in the SAME collective — no new op.
     ep: bool,
     // Collapse the per-slot expert packets (2*top_k) into 2 grouped packets (ops 48/49) — the op-count
     // lever for M=1 decode. Bit-identical output; block-fp8 only.
@@ -264,7 +264,7 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
     }
 }
 
-/// Kimi K2.7 / DeepSeek-V2/V3 cfg (plans/block-asset-harness.md §5.0/§5.3, M3). These are plain
+/// Kimi K2.7 / DeepSeek-V2/V3 cfg. These are plain
 /// MLA + MoE — the SAME DeepSeek-derived config schema GLM uses (q/kv_lora, qk_nope/rope, v_head,
 /// n_routed_experts, moe_intermediate_size, first_k_dense_replace, routed_scaling_factor) but with
 /// NO DSA lightning indexer. So the cfg reuses `cfg_glm`'s parse verbatim and only forces the DSA
@@ -333,7 +333,7 @@ const GLM_GF_CROSSOVER: u32 = 4096; // max_ctx <= this -> GF=2; else GF=8
 /// instantiated GF can express at all (any odd `nh_l`, e.g. K3 at tp32 -> 3).
 fn glm_gf(ctx: u32, nh_l: u32) -> u32 {
     // ORIGIN OF THE 1.5-1.9x CLAIM, AND ITS STATUS. The number comes from
-    // plans/mla-sm120-kernels.md §7, which is an **sm120 (NVIDIA)** measurement, and it travelled
+    // the design notes is an **sm120 (NVIDIA)** measurement, and it travelled
     // into this comment as if it were a property of the op. On AMD it was never measurable at all
     // until now: the interpreter had no GF=8 arm, so every ctx>4096 GLM blob emitted i[7]=8 and
     // executed GF=4. Treat 1.5-1.9x as an NVIDIA result and an UNPROVEN hypothesis on gfx950.
@@ -446,7 +446,7 @@ fn require_gf_divides(gf: u32, nh_l: u32, phase: &str) {
 /// chain 123->155us at ns 128). The cost optimum balances the two: d/dns[ latent/nsplit + k*nsplit ]
 /// = 0 => nsplit grows with the latent stream (~ctx), capped at `fill` (chip) and `kv_tiles` (no
 /// empty splits). tp=1 is fill-capped to 16 (already chip-full), so byte-identical. See
-/// plans/glm-mla-flash-tuning.md and Plow.SplitK (the split reduction equals the sequential sum for
+/// the design notes and Plow.SplitK (the split reduction equals the sequential sum for
 /// ANY nsplit; occupancy is monotone in the split count up to n_cu).
 ///
 /// ## THE LADDER, RE-MEASURED END TO END (GLM-5.2 TP4, gfx950, default arm-absent object)
@@ -1210,7 +1210,7 @@ pub(crate) fn declare_glm_rows(
     // XReduce sums. zero_h is a persistent zero buffer used as the MoeCombine residual under TP (the
     // real residual xmid is added AFTER the all-reduce, so it is not summed N times).
     // og_tp is the o_proj partial on BOTH phases — prefill all-reduces a [T,hidden] partial through
-    // XReduceTwoShot (plans/tp-prefill.md), so it is row-dimensioned. dg_tp only ever carries the
+    // XReduceTwoShot, so it is row-dimensioned. dg_tp only ever carries the
     // decode FFN partial (the prefill FFN has no kernel), so it stays one row.
     let og_tp = if tp > 1 {
         ac(b, "og_tp", rows * h as u64 * BF16)
@@ -1968,7 +1968,7 @@ fn emit_glm_mla(
             d.f[0] = 1.0;
         })
     };
-    // Standard Gemma-proven decode fusions (plans/glm52-fusion-audit.md). Each defaults ON; set the
+    // Standard Gemma-proven decode fusions. Each defaults ON; set the
     // env to "0" to emit the unfused baseline for a before/after measurement. A and G are byte-exact
     // (GemvQkv concatenates output columns — identical per-column dot/wave_sum/f2bf as the split
     // GEMVs); B1 is algebraically exact (AddNorm reduces over the un-rounded sum — see note below).
@@ -2696,7 +2696,7 @@ fn emit_glm_mla_prefill(
     // 12 o_proj, row-parallel over this rank's head shard. Under TP the [T,hidden] partial goes
     //    through the TWO-SHOT all-reduce (reduce-scatter + all-gather), not decode's one-shot: the
     //    partial is bandwidth-bound at T rows, so the two-shot moves ~tp/2x less over the fabric
-    //    (plans/tp-prefill.md §4). `emit_xreduce(decode=false)` is that path, already in the tree.
+    //. `emit_xreduce(decode=false)` is that path, already in the tree.
     //
     //    Under GLM_LINEAR_FP8 `w.wo`/`w.wo_s` are the CHECKPOINT's block-fp8 bytes and its
     //    [128,128] weight_scale_inv grid, not the bf16 the prep dequantises to — the same pair the
@@ -3483,7 +3483,7 @@ pub(crate) fn emit_glm_block(
                             // expert partials in the same collective that already sums the shared partials.
     let imoe_e = if c.ep { imoe } else { imoe_l };
     let w = &n.lw[slot];
-    // CONCURRENT EXPERT SEGMENTS (plans/glm52-coresident.md): the M=1 experts underfill 256 CUs
+    // CONCURRENT EXPERT SEGMENTS: the M=1 experts underfill 256 CUs
     // (latency-starved, ~12x above the weight-bandwidth roofline), so run the top_k chosen experts as
     // CO-RESIDENT segments — each owns a DISJOINT CU slice (tk experts x 256/tk CUs), all gated on the
     // SAME router counter, so all tk run at once instead of serially on all-256. Pure work-PARTITION
@@ -4106,7 +4106,7 @@ fn glm_emit_full(
     // first op waits on the previous layer's completion (`dep`) — the layers run in sequence.
     // XReduce collectives (decode one-shot): each o_proj + FFN-down all-reduce takes a unique xctr
     // gate id (allocated by xgate). At tp==1 no XReduce is emitted. The all-reduce runs on `all` CUs
-    // by default; PLOW_XR_CUS caps it (the TP8 NUMA-crossing lever, plans/tp-design.md §8b).
+    // by default; PLOW_XR_CUS caps it (the TP8 NUMA-crossing lever).
     let mut xgate: u32 = 0;
     let xr_cus: Vec<u32> = {
         let k = emit_config::active().xr_cus;
@@ -4429,7 +4429,7 @@ pub(crate) enum MlaArch {
 }
 
 /// Build a single-block (layers `block`) MLA+MoE program + its descriptor, no file IO — the testable
-/// core of `--block` on the GLM emit path (plans/block-asset-harness.md §5.3, §7) and, via `arch`,
+/// core of `--block` on the GLM emit path and, via `arch`,
 /// the Kimi/DeepSeek reuse of that same emit (§5.0, M3). No embed / no final-norm+lm_head+argmax
 /// tail: `act.x` in, the last layer's residual out. The emitter is slot-indexed (per-layer vectors
 /// are built from `layer_ids`), so a range extraction is the existing single-layer bring-up
@@ -4875,7 +4875,7 @@ fn report_mla_prefill(m: &Model, pf: &[u32], scope: PrefillScope, enc: MoeEnc) {
     }
 }
 
-/// `--block` on the Kimi K2.7 / DeepSeek MLA+MoE path (plans/block-asset-harness.md §5.0/§5.3, M3).
+/// `--block` on the Kimi K2.7 / DeepSeek MLA+MoE path.
 /// Emits ONE block (layers `spec`) as a GPU-loadable PLOWDEV blob with a `SECT_METADATA` `block.json`
 /// descriptor + sibling file. REUSES the GLM MLA + MoE emit verbatim (glm_build_block) with a Kimi
 /// cfg (`has_dsa=false`) — no DSA, KV latent (ckv/krot) carried state, decode-only (the GLM emit has
@@ -4942,7 +4942,7 @@ pub(crate) fn kimi_emit_block(
     eprintln!("  block.json sibling written next to {out}");
 }
 
-// ===== Nemotron-3 Mamba-2 hybrid (plans/block-asset-harness.md §7 Nemotron, §11 M4). =========
+// ===== Nemotron-3 Mamba-2 hybrid (the design notes Nemotron, §11 M4). =========
 // Nemotron-3 Nano 30B-A3B is a HYBRID: 52 layers = 23 Mamba-2 mixers + 23 MoE FFNs + 6 GQA
 // attentions, interleaved by a `hybrid_override_pattern` string. The Mamba-2 mixer is the
 // genuinely NEW piece (the first state-space op in the tree — DevOp::Mamba2Scan, op_mamba.cuh,
@@ -5633,7 +5633,7 @@ pub(crate) enum K3Attn {
     /// DeepSeek-style MLA (q_a/q_b/kv_a_with_mqa/kv_b), 24 layers.
     Mla,
     /// Kimi Delta Attention: linear attention, recurrent state, short convs on q/k/v,
-    /// low-rank forget gate. 69 layers. See `docs/kimi-k3-kda.md` (sibling agent).
+    /// low-rank forget gate. 69 layers. See `docs/kimi-k3-kda.md`.
     Kda,
 }
 
@@ -7694,13 +7694,13 @@ mod glm_tests {
     //! The GLM-5.2 (GlmMoeDsa) single-layer emit is the FIRST milestone-1 gate: the emitted op
     //! sequence must be identical to the 34-op MoE block that runtime/tests/
     //! glm52_real_block_gfx950_test.c validated on gfx950 against the HF oracle (real 256 experts,
-    //! real [128,128] block-fp8 scales — plans/glm52-campaign.md "B4-CORE DONE"). Asserting op-for-op
+    //! real [128,128] block-fp8 scales — the design notes "B4-CORE DONE"). Asserting op-for-op
     //! equality here, offline, means the emitted layer inherits that passing GPU result. No GPU, no
     //! weights — a pure structural equivalence proof, exactly as the Gemma pick_tile tests lock in
     //! the tile choice offline.
     use super::*;
 
-    /// The real GLM-5.2-FP8 config dims (plans/glm52-arch.md). `layers` is trimmed — the single
+    /// The real GLM-5.2-FP8 config dims. `layers` is trimmed — the single
     /// block only touches one layer.
     fn glm_ref_cfg() -> GlmCfg {
         GlmCfg {
@@ -8749,7 +8749,7 @@ mod glm_tests {
 
 #[cfg(test)]
 mod kimi_tests {
-    //! Kimi K2.7 / DeepSeek MLA+MoE `--block` extraction (M3, plans/block-asset-harness.md §5.0/
+    //! Kimi K2.7 / DeepSeek MLA+MoE `--block` extraction (M3, the design notes/
     //! §5.3/§7). Kimi REUSES the GLM MLA + MoE emit verbatim (glm_build_block) with a cfg that holds
     //! the DSA gate off (`has_dsa=false`) — so a Kimi block is the SAME op sequence as a GLM block
     //! BELOW the DSA crossover, minus every indexer artifact: no DSA scratch, FlashMlaDecode (never
@@ -9232,7 +9232,7 @@ mod kimi_tests {
 
     /// PREFILL all-reduces the [T,hidden] o_proj partial with the TWO-SHOT collective, not decode's
     /// one-shot: the partial is bandwidth-bound at T rows, so the two-shot moves ~tp/2x less over
-    /// the fabric (plans/tp-prefill.md §4). tp=1 emits no collective at all.
+    /// the fabric. tp=1 emits no collective at all.
     #[test]
     fn mla_prefill_tp_emits_two_shot_allreduce() {
         let (m1, _) = pf_block(&kimi_tp_cfg(1), 512, &[128]);

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build_k3_mla.sh — the Kimi-K3 GATED MLA BLOCK numeric gate (rung 3).            [K3-MLA-GATE]
 #
-# Same environment traps as build_k3_moe.sh / build_k3_real.sh (plans/knob-contract.md §0a):
+# Same environment traps as build_k3_moe.sh / build_k3_real.sh:
 # the .co needs system ROCm, which `nix develop` BREAKS (GLIBC_2.38); the host binary needs SYSTEM
 # gcc in a scrubbed env or it aborts as "stack smashing detected".
 #

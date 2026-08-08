@@ -44,14 +44,14 @@ pub(crate) struct Cfg {
     pub(crate) tied: bool, // reuse embed_tokens as lm_head (Gemma, Qwen); Llama has lm_head.weight
     pub(crate) prefix: String, // weight-name prefix: "model.language_model." or "model."
     // Tensor-parallel degree (Megatron sharding). 1 = single-GPU (current path, byte-identical).
-    // >1 emits a DECODE-ONLY sharded blob (plans/tp-design.md §3): column-parallel q/k/v/gate/up/
+    // >1 emits a DECODE-ONLY sharded blob: column-parallel q/k/v/gate/up/
     // lm_head, row-parallel o_proj/down with an XReduce all-reduce after each, attention split by
     // heads. All ranks run the ONE blob; tp-host binds each rank's 1/N weight slice and sets
     // PlowProgram.rank/n_gpu/peer_scratch/xctr. Set from --tp in main() after cfg_from.
     pub(crate) tp: u32,
     // Gemma-4 26B-A4B sparse-MoE (`enable_moe_block`). Every layer is a HYBRID dense+MoE block:
     // the dense MLP (inter) AND the top-`top_k`-of-`n_exp` softmax-routed experts (moe_inter),
-    // summed via the h1+h2 sandwich (plans/rtx-08-gemma4-moe-26b.md). Decode-only for now.
+    // summed via the h1+h2 sandwich. Decode-only for now.
     pub(crate) moe: bool,
     pub(crate) n_exp: u32,     // 128 routed experts
     pub(crate) top_k: u32,     // 8 experts/token

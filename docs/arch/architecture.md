@@ -7,7 +7,7 @@
 > descriptor, opcode declaration, or compiling kernel does not make an operator
 > or model supported. Status claims below are bounded to the current checkout;
 > detailed tuning architecture and gates live in
-> [`plans/arch-gemm-tuning-system.md`](../../plans/arch-gemm-tuning-system.md).
+> [the design notes](../../the design notes).
 
 ---
 

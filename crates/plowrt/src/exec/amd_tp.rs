@@ -68,7 +68,7 @@
 //! `#[cfg(feature = "cuda")]`, so there is no AMD serve path to hang a TP group
 //! off yet. The entry point is `plowrt amd-bench --tp N`, which reproduces
 //! `tp_decode.c` token-for-token — a CORRECTNESS oracle. Under the benchmark law
-//! (`plans/knob-contract.md` §0-BENCH) any number from it is a **bring-up**
+//! any number from it is a **bring-up**
 //! number: headline comparisons come from `vllm bench serve` against the plowrt
 //! endpoint, same client for both engines, and this binary is banned from a
 //! table next to a vLLM number.
@@ -157,7 +157,7 @@
 //! work is nearly half the token and every conclusion above flips — including
 //! the sign on (3), since the extra dispatch a deferred stream costs shrinks
 //! with it. The instrument is checked in for exactly that day;
-//! `plans/tp-design.md` predicts 1.56 ms/token for a 12B at TP8.
+//! the design notes predicts 1.56 ms/token for a 12B at TP8.
 //!
 //! # Where the margin is expected to come from
 //!

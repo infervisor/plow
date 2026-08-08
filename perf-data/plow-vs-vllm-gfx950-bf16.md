@@ -13,7 +13,7 @@
 > order as the 0.81 ms margin** in the 12B 64k crossover below. So that crossover is *not* a safe
 > claim yet, and neither are the ratios in either table.
 >
-> Per `plans/knob-contract.md` §0-BENCH, every headline number must now come from **`vllm bench
+> Per the design notes headline number must now come from **`vllm bench
 > serve` pointed at the plowrt OpenAI endpoint** — same client binary, same harness, same metric
 > definitions for both engines. That path does not exist yet: `crates/plowrt/src/serve/mod.rs:252`
 > gates the engine map on `#[cfg(feature = "cuda")]`, so there is no AMD serve today. Building it
@@ -77,7 +77,7 @@ The model nearly triples and **plow's overhead moves 6.92 → 7.45 ms** (+8%). I
 count* (48 → 60, +25%), not weight bytes. vLLM's overhead is ~3–3.6 ms on the same ladder.
 
 This is the whole story, and it is consistent with the trace-level diagnosis in
-`plans/knob-contract.md §6a`: at full 256-workgroup occupancy plow runs at **96% of the memory
+the design notes: at full 256-workgroup occupancy plow runs at **96% of the memory
 ceiling**, and the deficit is time when the machine is *starved* — 300 of 676 decode packets
 (`norm_residual_norm` on **1** CU of 256, `headnorm_rope` on 4, `flash_merge` on 32) with a
 measured ready-queue of **zero** behind them, plus a 1.80 ms straggler tail.
@@ -91,7 +91,7 @@ Two consequences:
    the ~7 ms is precision-invariant, so halving the weight stream halves only the floor. Measured
    on 31B: fp8 buys plow just 16–19% where the floor says ~45% was available.
 
-So the ranked work is width, not precision — see `plans/knob-contract.md §6c`.
+So the ranked work is width, not precision — see the design notes.
 
 ## Reproduce
 

@@ -468,7 +468,7 @@ int main(int argc, char** argv) {
      * kvr-1 on a sliding one -- gemma4.rs kv_ring()). It is a sliding-window wrap, NOT a
      * page table. There is NO index array on this path: FlashDecode can address exactly
      * ONE contiguous run per (b, kv_head). It CANNOT express "shared prefix run + private
-     * suffix run". plans/serving.md B.2 assumed the kv_mask ring "already supports a
+     * suffix run". the design notes B.2 assumed the kv_mask ring "already supports a
      * discontinuity" and could be verified for two runs -- that assumption is WRONG, and
      * the correct reading is recorded in the report.
      *

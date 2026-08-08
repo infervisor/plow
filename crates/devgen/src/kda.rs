@@ -1,11 +1,11 @@
 //! KDA — Kimi Delta Attention. The mixer in **69 of Kimi-K3's 93 layers**.
 //!
-//! Spec: `docs/kimi-k3-kda.md`. Implementation notes: `plans/kimi-k3-kda-impl.md`.
+//! Spec: `docs/kimi-k3-kda.md`. Implementation notes: the design notes.
 //!
 //! This module emits ONE KDA layer. That is deliberate and it is the milestone: the GLM B4 gate
 //! de-risked one real-weight layer before anyone tried 78, and that discipline is why GLM's bugs
 //! were findable. A 93-layer K3 emit needs the AttnRes block, `situ`, LatentMoE, the MLA output
-//! gate and NoPE, all owned elsewhere (`plans/kimi-k3-frontend.md` §4).
+//! gate and NoPE, all owned elsewhere.
 //!
 //! # The shape of the layer, and why it is thirteen packets
 //!
@@ -27,7 +27,7 @@
 //!   P13 residual            Residual       hidden, attn        -> hidden'
 //! ```
 //!
-//! **Do not collapse P1–P6 along a LOOP axis.** `plans/knob-contract.md` §6g-KNOBS measured
+//! **Do not collapse P1–P6 along a LOOP axis.** the design notes measured
 //! `GLM_GROUP=1` removing **38% of the ops for +2.88 ms**, because collapsing work that ran on
 //! disjoint CU slices into a loop inside one packet destroys concurrency. Op count is not the
 //! objective function. The merge that IS safe is along the OUTPUT dimension, and P1–P4 now take
@@ -311,7 +311,7 @@ pub fn declare_kda_state(b: &mut Builder, c: &KdaCfg, prefix: &str, slots: u64) 
 ///
 /// # Why this merge is safe when `GLM_GROUP=1` was not
 ///
-/// `plans/knob-contract.md` §6g-KNOBS measured `GLM_GROUP=1` removing **38% of the ops for
+/// the design notes measured `GLM_GROUP=1` removing **38% of the ops for
 /// +2.88 ms**. It merged along a LOOP dimension: work that had been running on DISJOINT CU slices
 /// became a loop inside one packet, and the concurrency went with it. This merges along the
 /// OUTPUT dimension. Each of q/k/v/g is already `all` = 256 CUs, so per CU they were 4 x 48
