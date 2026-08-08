@@ -697,12 +697,24 @@ impl CudaBackend {
     /// `[rows][k]` bf16 K-major, box `{64, box_rows}`, 128 B swizzle, L2 128 B promotion,
     /// OOB zero-fill. Returns the 128 descriptor bytes for the loader to upload into the
     /// map tensor's buffer (`GEN_TMAP_BF16`). Errors on drivers older than CUDA 12.0.
-    pub fn encode_tmap_bf16(&self, base: u64, rows: u32, k: u32, box_rows: u32) -> Result<[u8; 128]> {
+    pub fn encode_tmap_bf16(
+        &self,
+        base: u64,
+        rows: u32,
+        k: u32,
+        box_rows: u32,
+    ) -> Result<[u8; 128]> {
         self.encode_tmap(base, rows, k, box_rows, false)
     }
 
     /// e4m3 twin: same 128 B swizzle, dtype UINT8, inner box 128 elems (= 128 B).
-    pub fn encode_tmap_e4m3(&self, base: u64, rows: u32, k: u32, box_rows: u32) -> Result<[u8; 128]> {
+    pub fn encode_tmap_e4m3(
+        &self,
+        base: u64,
+        rows: u32,
+        k: u32,
+        box_rows: u32,
+    ) -> Result<[u8; 128]> {
         self.encode_tmap(base, rows, k, box_rows, true)
     }
 
@@ -724,7 +736,10 @@ impl CudaBackend {
                     .into(),
             )
         })?;
-        assert!(hd % 64 == 0 && hd > 0, "GEN_TMAP_KV_PAIR needs hd%64==0, got {hd}");
+        assert!(
+            hd % 64 == 0 && hd > 0,
+            "GEN_TMAP_KV_PAIR needs hd%64==0, got {hd}"
+        );
         #[repr(C, align(128))]
         struct Buf([u8; 128]);
         let mut m = Buf([0u8; 128]);
@@ -757,7 +772,14 @@ impl CudaBackend {
         Ok(m.0)
     }
 
-    fn encode_tmap(&self, base: u64, rows: u32, k: u32, box_rows: u32, e4m3: bool) -> Result<[u8; 128]> {
+    fn encode_tmap(
+        &self,
+        base: u64,
+        rows: u32,
+        k: u32,
+        box_rows: u32,
+        e4m3: bool,
+    ) -> Result<[u8; 128]> {
         let f = self.tmap_encode.ok_or_else(|| {
             RuntimeError::Device(
                 "cuTensorMapEncodeTiled unresolved (driver < CUDA 12.0) but this packet \
@@ -767,7 +789,10 @@ impl CudaBackend {
         })?;
         // globalStrides entries must be 16-byte multiples; devgen only mints maps for
         // K%16B==0 (the kernel traps otherwise), so this is a build bug, not input.
-        assert!(k > 0 && (k as u64 * if e4m3 { 1 } else { 2 }) % 16 == 0, "GEN_TMAP K misaligned: {k}");
+        assert!(
+            k > 0 && (k as u64 * if e4m3 { 1 } else { 2 }) % 16 == 0,
+            "GEN_TMAP K misaligned: {k}"
+        );
         #[repr(C, align(128))]
         struct Buf([u8; 128]);
         let mut m = Buf([0u8; 128]);
@@ -1123,7 +1148,10 @@ impl CudaBackend {
     ) -> Result<GraphExec> {
         self.bind()?;
         let mut graph: CUgraph = std::ptr::null_mut();
-        self.check(unsafe { (self.api.cuGraphCreate)(&mut graph, 0) }, "cuGraphCreate")?;
+        self.check(
+            unsafe { (self.api.cuGraphCreate)(&mut graph, 0) },
+            "cuGraphCreate",
+        )?;
         let mut prev: CUgraphNode = std::ptr::null_mut();
         for (i, &(f, grid, block, smem)) in nodes.iter().enumerate() {
             let mut kp = [params_blobs[i]];
@@ -1148,7 +1176,11 @@ impl CudaBackend {
                 (self.api.cuGraphAddKernelNode_v2)(
                     &mut node,
                     graph,
-                    if ndeps == 0 { std::ptr::null() } else { deps.as_ptr() },
+                    if ndeps == 0 {
+                        std::ptr::null()
+                    } else {
+                        deps.as_ptr()
+                    },
                     ndeps,
                     &np,
                 )

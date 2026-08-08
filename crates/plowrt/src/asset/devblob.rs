@@ -585,8 +585,7 @@ impl DevProg {
                 ))
             })?;
             let op = inst.op;
-            let flash_op =
-                op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16;
+            let flash_op = op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16;
             if flash_op
                 && ((fa512_mode == 2 && (inst.i[6] == 256 || inst.i[6] == 512))
                     || (fa512_mode == 1 && inst.i[6] == 512))
@@ -624,9 +623,7 @@ impl DevProg {
                         && inst.i[6] != 0
                         && inst.i[7] != 0)
                 }
-                _ => {
-                    op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16
-                }
+                _ => op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16,
             };
             if flashy {
                 class[e.seg as usize] = 4;
@@ -641,7 +638,11 @@ impl DevProg {
         // never reads seg as a wave-class. The parse-time PLOW_BLOB_F_L2DOM gate has already
         // verified the runtime attested a placed cubin, so only out-of-range domains and the
         // still-unimplemented fine/xctr flags are errors here.
-        let seg_lim = if self.l2_domains != 0 { self.l2_domains as u16 } else { 1 };
+        let seg_lim = if self.l2_domains != 0 {
+            self.l2_domains as u16
+        } else {
+            1
+        };
         for (j, e) in self.stream.iter().enumerate() {
             if e.seg >= seg_lim || (e.flags & (packet::dev::SE_FINE | packet::dev::SE_XCTR)) != 0 {
                 return Err(RuntimeError::Device(format!(

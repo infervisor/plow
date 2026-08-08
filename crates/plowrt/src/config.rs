@@ -33,11 +33,21 @@ pub struct RuntimeConfig {
     pub checkpoint: Option<String>,
 
     /// Checkpoint prefetch depth in tensors.
-    #[arg(long = "rt-prefetch", env = "PLOW_PREFETCH", default_value_t = 256, global = true)]
+    #[arg(
+        long = "rt-prefetch",
+        env = "PLOW_PREFETCH",
+        default_value_t = 256,
+        global = true
+    )]
     pub prefetch: usize,
 
     /// Prefetch threads per rank. 0 disables prefetch.
-    #[arg(long = "rt-prefetch-threads", env = "PLOW_PREFETCH_THREADS", default_value_t = 16, global = true)]
+    #[arg(
+        long = "rt-prefetch-threads",
+        env = "PLOW_PREFETCH_THREADS",
+        default_value_t = 16,
+        global = true
+    )]
     pub prefetch_threads: usize,
 
     /// Single-allocation weight slab (both backends). --no-weight-slab to disable.
@@ -58,7 +68,11 @@ pub struct RuntimeConfig {
     /// S1 switch drain deadline (ms): past it the victim's live generations are
     /// preempted (`Preempted` finish, queued jobs 429). 0 = preempt immediately;
     /// unset = unbounded drain.
-    #[arg(long = "drain-timeout-ms", env = "PLOW_DRAIN_TIMEOUT_MS", global = true)]
+    #[arg(
+        long = "drain-timeout-ms",
+        env = "PLOW_DRAIN_TIMEOUT_MS",
+        global = true
+    )]
     pub drain_timeout_ms: Option<u64>,
 
     /// Speculative next-model preload after an S1 switch. --no-preload disables.
@@ -66,7 +80,12 @@ pub struct RuntimeConfig {
     pub preload: bool,
 
     /// Per-engine KV physical-block reuse pool cap (MiB). 0 disables pooling.
-    #[arg(long = "kv-pool-mib", env = "PLOW_KV_POOL_MIB", default_value_t = 512, global = true)]
+    #[arg(
+        long = "kv-pool-mib",
+        env = "PLOW_KV_POOL_MIB",
+        default_value_t = 512,
+        global = true
+    )]
     pub kv_pool_mib: u64,
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -111,7 +130,12 @@ pub struct RuntimeConfig {
 #[command(next_help_heading = "NVIDIA runtime")]
 pub struct NvidiaRuntimeConfig {
     /// Bounded device multi-step decode (steps per launch, 2..64). 0/1 = single-step.
-    #[arg(long = "multistep", env = "PLOW_MULTISTEP", default_value_t = 8, global = true)]
+    #[arg(
+        long = "multistep",
+        env = "PLOW_MULTISTEP",
+        default_value_t = 8,
+        global = true
+    )]
     pub multistep: u32,
 
     /// VMM-backed KV prefix cache. Warm TTFT 3.6×(4k)→23.8×(128k).
@@ -119,11 +143,21 @@ pub struct NvidiaRuntimeConfig {
     pub vmm_prefix: bool,
 
     /// VMM sharing block size (MiB). 2 MiB ≈ 4096 tokens at hd256 bf16.
-    #[arg(long = "vmm-block-mib", env = "PLOW_VMM_BLOCK_MIB", default_value_t = 2, global = true)]
+    #[arg(
+        long = "vmm-block-mib",
+        env = "PLOW_VMM_BLOCK_MIB",
+        default_value_t = 2,
+        global = true
+    )]
     pub vmm_block_mib: u32,
 
     /// Cap on retained (unreferenced) VMM blocks. 0 = no cache.
-    #[arg(long = "vmm-cache-mib", env = "PLOW_VMM_CACHE_MIB", default_value_t = 0, global = true)]
+    #[arg(
+        long = "vmm-cache-mib",
+        env = "PLOW_VMM_CACHE_MIB",
+        default_value_t = 0,
+        global = true
+    )]
     pub vmm_cache_mib: u32,
 
     /// VMM lazy-commit weight slab (CUDA default ON). --no-nv-weight-vmm to disable.
@@ -140,11 +174,21 @@ pub struct NvidiaRuntimeConfig {
 
     /// Chunked prefill quantum — rows admitted per tick before decode runs.
     /// 0 = uncapped.
-    #[arg(long = "pf-interleave", env = "PLOW_PF_INTERLEAVE", default_value_t = 2048, global = true)]
+    #[arg(
+        long = "pf-interleave",
+        env = "PLOW_PF_INTERLEAVE",
+        default_value_t = 2048,
+        global = true
+    )]
     pub pf_interleave: u32,
 
     /// Per-request prefill chunk-row cap. 0 = off.
-    #[arg(long = "pf-chunk", env = "PLOW_PF_CHUNK", default_value_t = 0, global = true)]
+    #[arg(
+        long = "pf-chunk",
+        env = "PLOW_PF_CHUNK",
+        default_value_t = 0,
+        global = true
+    )]
     pub pf_chunk: u32,
 
     /// Disable chunked prefill (whole-prompt-per-tick).
@@ -197,7 +241,11 @@ pub struct NvidiaRuntimeConfig {
     pub cubin_sample: Option<String>,
 
     /// Sample kernel symbol override.
-    #[arg(long = "nv-kernel-sample", env = "PLOW_NV_KERNEL_SAMPLE", global = true)]
+    #[arg(
+        long = "nv-kernel-sample",
+        env = "PLOW_NV_KERNEL_SAMPLE",
+        global = true
+    )]
     pub kernel_sample: Option<String>,
 
     /// libcuda.so path override.
@@ -222,7 +270,12 @@ pub struct NvidiaRuntimeConfig {
 
     /// Fixed cost of ONE prefill launch, in padded-row equivalents. 0 = old
     /// pure-minimum-padding policy. Default 512 (measured on sm_120 / gemma-4-12B).
-    #[arg(long = "pf-chunk-cost", env = "PLOW_PF_CHUNK_COST", default_value_t = 512, global = true)]
+    #[arg(
+        long = "pf-chunk-cost",
+        env = "PLOW_PF_CHUNK_COST",
+        default_value_t = 512,
+        global = true
+    )]
     pub pf_chunk_cost: usize,
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -335,7 +388,13 @@ pub struct AmdRuntimeConfig {
     // as the arg id, and two flattened structs with the same field name break
     // every full parse ("required argument was not provided"). Sharing the env
     // var across backends is intended; sharing the id is not.
-    #[arg(id = "amd_vmm_block_mib", long = "amd-vmm-block-mib", env = "PLOW_VMM_BLOCK_MIB", default_value_t = 2, global = true)]
+    #[arg(
+        id = "amd_vmm_block_mib",
+        long = "amd-vmm-block-mib",
+        env = "PLOW_VMM_BLOCK_MIB",
+        default_value_t = 2,
+        global = true
+    )]
     pub vmm_block_mib: u32,
 
     /// VMM weight slab on AMD (opt-in, unmeasured).
@@ -343,7 +402,12 @@ pub struct AmdRuntimeConfig {
     pub weight_vmm: bool,
 
     /// Upload-ring pipeline depth.
-    #[arg(long = "amd-upload-slots", env = "PLOW_UPLOAD_SLOTS", default_value_t = 4, global = true)]
+    #[arg(
+        long = "amd-upload-slots",
+        env = "PLOW_UPLOAD_SLOTS",
+        default_value_t = 4,
+        global = true
+    )]
     pub upload_slots: u32,
 
     /// Accept oversubscribed grid (blob.n_cu > device CUs).
@@ -359,7 +423,12 @@ pub struct AmdRuntimeConfig {
     pub tp_serial_load: bool,
 
     /// Cross-rank agreement interval (every Nth step).
-    #[arg(long = "amd-tp-agree-every", env = "PLOW_TP_AGREE_EVERY", default_value_t = 1, global = true)]
+    #[arg(
+        long = "amd-tp-agree-every",
+        env = "PLOW_TP_AGREE_EVERY",
+        default_value_t = 1,
+        global = true
+    )]
     pub tp_agree_every: u32,
 
     /// Disable redundant-rank audit (for timing runs).

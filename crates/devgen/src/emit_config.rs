@@ -71,7 +71,11 @@ pub struct EmitConfig {
     pub uniseg: bool,
 
     /// Batched decode dispatch width (sequences per launch).
-    #[arg(long = "emit-decode-batch", env = "PLOW_DECODE_BATCH", default_value_t = 1)]
+    #[arg(
+        long = "emit-decode-batch",
+        env = "PLOW_DECODE_BATCH",
+        default_value_t = 1
+    )]
     pub decode_batch: u32,
 
     /// Largest prefill chunk rows (power of two, ≤ 8192). Caps the bucket
@@ -449,11 +453,17 @@ impl EmitConfig {
                 // Legacy synthesis: GLM_FULL=1 → "all" (with GLM_NLAYERS cap),
                 // GLM_LAYER=L → "single:L", else "default" (caller decides).
                 if std::env::var("GLM_FULL").ok().as_deref() == Some("1") {
-                    match std::env::var("GLM_NLAYERS").ok().and_then(|s| s.parse::<u32>().ok()) {
+                    match std::env::var("GLM_NLAYERS")
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok())
+                    {
                         Some(n) => n.to_string(),
                         None => "all".into(),
                     }
-                } else if let Some(l) = std::env::var("GLM_LAYER").ok().and_then(|s| s.parse::<u32>().ok()) {
+                } else if let Some(l) = std::env::var("GLM_LAYER")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
                     format!("single:{l}")
                 } else {
                     "default".into()
@@ -501,14 +511,10 @@ impl EmitConfig {
 
         // Deprecated alias warnings
         if std::env::var("PLOW_KV_FP8").ok().as_deref() == Some("1") {
-            tracing::warn!(
-                "PLOW_KV_FP8 is deprecated — use --fp8-kv or PLOW_FP8_KV instead"
-            );
+            tracing::warn!("PLOW_KV_FP8 is deprecated — use --fp8-kv or PLOW_FP8_KV instead");
         }
         if std::env::var("PLOW_NV_PLACE").ok().as_deref() == Some("1") {
-            tracing::warn!(
-                "PLOW_NV_PLACE is deprecated — use --l2-place or PLOW_L2_PLACE instead"
-            );
+            tracing::warn!("PLOW_NV_PLACE is deprecated — use --l2-place or PLOW_L2_PLACE instead");
         }
     }
 
@@ -523,11 +529,15 @@ impl EmitConfig {
             "all" => (true, None, None),
             "default" => (false, None, None),
             s if s.starts_with("single:") => {
-                let l: u32 = s[7..].parse().expect("--*-layers single:N requires a number");
+                let l: u32 = s[7..]
+                    .parse()
+                    .expect("--*-layers single:N requires a number");
                 (false, None, Some(l))
             }
             s => {
-                let n: u32 = s.parse().expect("--*-layers expects 'all', 'default', 'single:N', or a number N");
+                let n: u32 = s
+                    .parse()
+                    .expect("--*-layers expects 'all', 'default', 'single:N', or a number N");
                 (true, Some(n), None)
             }
         }

@@ -2121,7 +2121,10 @@ impl GpuEngine {
             }
             // TMA reads the descriptor by device address; SLAB_ALIGN carving makes this
             // unbreakable today — assert so a future carve change fails loud.
-            assert!(devp[map].base % 128 == 0, "tensormap tensor not 128 B aligned");
+            assert!(
+                devp[map].base % 128 == 0,
+                "tensormap tensor not 128 B aligned"
+            );
             if g.kind == packet::rope::GEN_TMAP_KV_PAIR {
                 // K's rank-3 map at +0, V's at +128; V handle rides in `scale`, kv heads in
                 // `frac` (see GEN_TMAP_KV_PAIR). Box rows = the wgmma arm's BKV = 32.
@@ -2183,7 +2186,11 @@ impl GpuEngine {
         g.check_coarse_single_segment()?;
         // Single segment normally; an L2-PLACED program (l2_domains != 0) carries one
         // window per domain and the placed interpreter picks its window by physical SM.
-        let want_seg = if g.l2_domains != 0 { g.l2_domains as usize + 1 } else { 2 };
+        let want_seg = if g.l2_domains != 0 {
+            g.l2_domains as usize + 1
+        } else {
+            2
+        };
         if g.gq_stream.is_empty() || g.gq_seg_ofs.len() != want_seg {
             return Err(RuntimeError::Device(format!(
                 "decode program has no single-segment GQ appendix (n_seg bounds: {:?}) — \
@@ -2234,8 +2241,7 @@ impl GpuEngine {
         let ctr_bytes = g.n_counter as usize * CTR_STRIDE as usize * 4;
         // One cursor line per GQ segment (see the prefill-bucket twin of this note):
         // an L2-placed blob's interpreter fetch-adds PLOW_CTR(gq_cursor, domain).
-        let cursor_bytes =
-            g.gq_seg_ofs.len().saturating_sub(1).max(1) * CTR_STRIDE as usize * 4;
+        let cursor_bytes = g.gq_seg_ofs.len().saturating_sub(1).max(1) * CTR_STRIDE as usize * 4;
         let ctr_block = be.alloc(0, (ctr_bytes.max(4) + cursor_bytes) as u64)?;
         // Two aliased views of the one owned block; `ctr_block` is stored in
         // the engine so the storage outlives both.
@@ -2884,10 +2890,8 @@ impl GpuEngine {
         // Env first (tests flip PLOW_DEV_SAMPLE / PLOW_NV_CUBIN_SAMPLE
         // mid-process, after the config snapshot), then the config.
         let rt = crate::config::RuntimeConfig::get();
-        let explicit = crate::config::RuntimeConfig::env_str_or(
-            "PLOW_DEV_SAMPLE",
-            rt.nv.dev_sample.clone(),
-        );
+        let explicit =
+            crate::config::RuntimeConfig::env_str_or("PLOW_DEV_SAMPLE", rt.nv.dev_sample.clone());
         if explicit.as_deref() == Some("0") {
             return Ok(None);
         }
@@ -2896,7 +2900,7 @@ impl GpuEngine {
             rt.nv.cubin_sample.clone(),
         )
         .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| assets_dir.join("sample_sm120.cubin"));
+        .unwrap_or_else(|| assets_dir.join("sample_sm120.cubin"));
         if !cubin.is_file() {
             // Only a warning when the operator ASKED for it; on the default
             // path a bundle without the cubin is an ordinary host-sampling
@@ -2983,7 +2987,7 @@ impl GpuEngine {
             crate::config::RuntimeConfig::get().nv.cubin_sample.clone(),
         )
         .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| assets_dir.join("sample_sm120.cubin"));
+        .unwrap_or_else(|| assets_dir.join("sample_sm120.cubin"));
         if !cubin.is_file() {
             if raw.is_some() {
                 tracing::warn!(cubin = %cubin.display(), "PLOW_MULTISTEP set but no sampler cubin (has plow_advance)");
@@ -3829,17 +3833,19 @@ impl GpuEngine {
         // PLOW_UNISEG. Next step: promote to the asset manifest once the A/B settles.
         let seg_pf = match crate::config::RuntimeConfig::get().nv.pf_seg_dir.clone() {
             Some(dir) if !dir.is_empty() => {
-                let load = |file: &str, sym: &str, arena: &str| -> Result<(Module, KernelFn, u32, u32)> {
-                    let img = std::fs::read(std::path::Path::new(&dir).join(file)).map_err(|e| {
-                        RuntimeError::Device(format!("PLOW_PF_SEG_DIR: read {file}: {e}"))
-                    })?;
-                    let m = be.module_load(&img)?;
-                    let f = be.get_function(&m, sym)?;
-                    let sm = be.module_global_u32(&m, arena)?.unwrap_or(smem_pf);
-                    be.set_max_dynamic_smem(f, sm)?;
-                    let occ = be.occupancy_blocks_per_sm(f, BLOCK, sm as usize)?;
-                    Ok((m, f, sm, occ * be.sm_count()))
-                };
+                let load =
+                    |file: &str, sym: &str, arena: &str| -> Result<(Module, KernelFn, u32, u32)> {
+                        let img =
+                            std::fs::read(std::path::Path::new(&dir).join(file)).map_err(|e| {
+                                RuntimeError::Device(format!("PLOW_PF_SEG_DIR: read {file}: {e}"))
+                            })?;
+                        let m = be.module_load(&img)?;
+                        let f = be.get_function(&m, sym)?;
+                        let sm = be.module_global_u32(&m, arena)?.unwrap_or(smem_pf);
+                        be.set_max_dynamic_smem(f, sm)?;
+                        let occ = be.occupancy_blocks_per_sm(f, BLOCK, sm as usize)?;
+                        Ok((m, f, sm, occ * be.sm_count()))
+                    };
                 let (m1, f1, s1, g1) = load(
                     "interp_sm90a_pfseg.cubin",
                     "_Z18interp_sm90a_pfseg11PlowProgram",
@@ -3858,7 +3864,10 @@ impl GpuEngine {
                 // Optional third object (T12): dedicated hd512 flash. Only loaded when the
                 // file exists — the classing env (PLOW_PF_SEG_FA512) decides whether class-2
                 // segments are emitted at all.
-                let fa = if std::path::Path::new(&dir).join("interp_sm90a_pffa.cubin").exists() {
+                let fa = if std::path::Path::new(&dir)
+                    .join("interp_sm90a_pffa.cubin")
+                    .exists()
+                {
                     let (m3, f3, s3, g3) = load(
                         "interp_sm90a_pffa.cubin",
                         "_Z17interp_sm90a_pffa11PlowProgram",
@@ -3870,7 +3879,10 @@ impl GpuEngine {
                     // context, dead engine, every request 503. Refuse the mismatch here, the
                     // way a missing object is already refused. Absent symbol = older cubin,
                     // unconstrained (same convention as plow_arena_bytes).
-                    if crate::config::RuntimeConfig::get().nv.pf_seg_fa512.as_deref()
+                    if crate::config::RuntimeConfig::get()
+                        .nv
+                        .pf_seg_fa512
+                        .as_deref()
                         == Some("all")
                         && be.module_global_u32(&m3, "plow_fa_hd256_pffa")? == Some(0)
                     {
@@ -3887,8 +3899,12 @@ impl GpuEngine {
                     None
                 };
                 tracing::info!(
-                    grid_flash = g1, grid_gemm = g2, smem_flash = s1, smem_gemm = s2,
-                    block_gemm = blk2, fa512 = fa.is_some(),
+                    grid_flash = g1,
+                    grid_gemm = g2,
+                    smem_flash = s1,
+                    smem_gemm = s2,
+                    block_gemm = blk2,
+                    fa512 = fa.is_some(),
                     "segmented prefill pair loaded"
                 );
                 let (m_fa, fa512) = match fa {
@@ -3937,7 +3953,9 @@ impl GpuEngine {
                         sp.fa512 = Some((f3, mx, g3));
                     }
                     tracing::info!(
-                        smem = mx, grid_flash = sp.grid_flash, grid_gemm = sp.grid_gemm,
+                        smem = mx,
+                        grid_flash = sp.grid_flash,
+                        grid_gemm = sp.grid_gemm,
                         "seg pair smem equalized"
                     );
                 }
@@ -4535,7 +4553,8 @@ impl GpuEngine {
                 let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
                 let go = |params: &mut [*mut std::ffi::c_void]| -> Result<()> {
                     if noncoop {
-                        self.be.launch_kernel(f, gr, blk, sm, params, Some(&self.stream))
+                        self.be
+                            .launch_kernel(f, gr, blk, sm, params, Some(&self.stream))
                     } else {
                         self.be
                             .launch_cooperative(f, gr, blk, sm, params, Some(&self.stream))
@@ -4569,7 +4588,9 @@ impl GpuEngine {
                     gemm_ms = format!("{:.1}", by_class[0]).as_str(),
                     fat_ms = format!("{:.1}", by_class[1]).as_str(),
                     fa_ms = format!("{:.1}", by_class[2]).as_str(),
-                    n_gemm = n_by[0], n_fat = n_by[1], n_fa = n_by[2],
+                    n_gemm = n_by[0],
+                    n_fat = n_by[1],
+                    n_fa = n_by[2],
                     "seg-class wall time (chunk)"
                 );
                 // Top-10 slowest segments, to attribute inside a class.
@@ -4997,7 +5018,9 @@ impl GpuEngine {
             }
             return Ok(Some(s));
         }
-        let Some(m) = &self.module_pf else { return Ok(None) };
+        let Some(m) = &self.module_pf else {
+            return Ok(None);
+        };
         self.trace_summary_of(m)
     }
 
@@ -5015,10 +5038,7 @@ impl GpuEngine {
 
     fn trace_summary_of(&self, module: &Module) -> Result<Option<String>> {
         let mut raw = Vec::new();
-        if !self
-            .be
-            .module_global_bytes(module, "g_tr_n", 4, &mut raw)?
-        {
+        if !self.be.module_global_bytes(module, "g_tr_n", 4, &mut raw)? {
             return Ok(None);
         }
         let n = u32::from_le_bytes(raw[..4].try_into().expect("4B")) as usize;
@@ -5028,8 +5048,7 @@ impl GpuEngine {
         let cap = n.min(4096);
         let read_u32 = |name: &str, out: &mut Vec<u32>| -> Result<()> {
             let mut b = Vec::new();
-            self.be
-                .module_global_bytes(module, name, cap * 4, &mut b)?;
+            self.be.module_global_bytes(module, name, cap * 4, &mut b)?;
             *out = b
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes(c.try_into().expect("4B")))
@@ -5038,8 +5057,7 @@ impl GpuEngine {
         };
         let read_u64 = |name: &str, out: &mut Vec<u64>| -> Result<()> {
             let mut b = Vec::new();
-            self.be
-                .module_global_bytes(module, name, cap * 8, &mut b)?;
+            self.be.module_global_bytes(module, name, cap * 8, &mut b)?;
             *out = b
                 .chunks_exact(8)
                 .map(|c| u64::from_le_bytes(c.try_into().expect("8B")))

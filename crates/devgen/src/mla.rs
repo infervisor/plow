@@ -1982,9 +1982,9 @@ fn emit_glm_mla(
     let lin_fp8 = glm_linear_fp8(enc);
     let fuse_a = true; // Hardcoded ON (was PLOW_GLM_FUSE_A, never disabled)
     let fuse_g = true; // Hardcoded ON (was PLOW_GLM_FUSE_G, never disabled)
-    // B1 defaults OFF (opt-in): AddNorm reduces over the un-rounded a+b sum, so unlike A/G it is NOT
-    // byte-identical to the split Residual+RmsNorm — a reorder-level fp diff that flips one early
-    // greedy argmax and cascades. Ship it only behind the HF-coherence gate; PLOW_GLM_FUSE_B1=1 opts in.
+                       // B1 defaults OFF (opt-in): AddNorm reduces over the un-rounded a+b sum, so unlike A/G it is NOT
+                       // byte-identical to the split Residual+RmsNorm — a reorder-level fp diff that flips one early
+                       // greedy argmax and cascades. Ship it only behind the HF-coherence gate; PLOW_GLM_FUSE_B1=1 opts in.
     let fuse_b1 = emit_config::active().glm_fuse_b1;
 
     // --- MLA ---
@@ -3538,12 +3538,11 @@ pub(crate) fn emit_glm_block(
     // MEASURED: **+0.12 ms, i.e. nothing or slightly worse** (full model, TP4, ctx 1k, median of
     // 65 — perf-data/glm52-decode-emitter-abs.md §3). Kept as the instrument that priced it. Do not
     // re-propose this as a lever.
-    let router_cus: Vec<u32> =
-        if cores >= 2 && emit_config::active().glm_router_off_shared {
-            (0..n_cu - shared_w).collect()
-        } else {
-            all.clone()
-        };
+    let router_cus: Vec<u32> = if cores >= 2 && emit_config::active().glm_router_off_shared {
+        (0..n_cu - shared_w).collect()
+    } else {
+        all.clone()
+    };
 
     // --- MoE ---
     // 15 router. DEFAULT (split): the 256-expert x K=6144 score matmul is the ordinary MULTI-CU

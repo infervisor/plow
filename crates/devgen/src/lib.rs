@@ -2604,9 +2604,7 @@ fn emit_phase(
                             // Bit-identical to the old default: each element's sum still runs over the same N peer
                             // slots in the same order; only the element->workgroup partition changes.
     let xr_cus: Vec<u32> = {
-        let k = emit_config::active().xr_cus
-            .unwrap_or(32)
-            .clamp(1, n_cu);
+        let k = emit_config::active().xr_cus.unwrap_or(32).clamp(1, n_cu);
         (0..k).collect()
     };
     // TP prefill: the all-reduce partials are [T, hidden], not decode's
@@ -2689,11 +2687,15 @@ fn emit_phase(
     // builder-local tensor_gen would die with the program (measured: n_tensor stayed at
     // the declare()-time count and every map decl vanished from the blob). run_verified
     // folds the registry into the Model after all programs are emitted.
-    let tma_gemm = std::env::var("PLOW_TMA_GEMM").map(|v| v == "1").unwrap_or(false);
-    let tmap =
-        |target: u32, rows: u32, k: u32| -> u32 { tmaps.borrow_mut().handle(target, rows, k, false) };
-    let tmap8 =
-        |target: u32, rows: u32, k: u32| -> u32 { tmaps.borrow_mut().handle(target, rows, k, true) };
+    let tma_gemm = std::env::var("PLOW_TMA_GEMM")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let tmap = |target: u32, rows: u32, k: u32| -> u32 {
+        tmaps.borrow_mut().handle(target, rows, k, false)
+    };
+    let tmap8 = |target: u32, rows: u32, k: u32| -> u32 {
+        tmaps.borrow_mut().handle(target, rows, k, true)
+    };
     let tmap_kv = |kt: u32, vt: u32, ring: u32, hd: u32, nkv: u32| -> u32 {
         tmaps.borrow_mut().kv_pair(kt, vt, ring, hd, nkv)
     };
@@ -2775,9 +2777,8 @@ fn emit_phase(
         };
         // Only the three plain-tile rungs have the sm_90a TMA arm; Wide/C5 (gfx950) and
         // GLU/fp8 keep i6/i7 zero until their forks land.
-        let tm = (tma_gemm
-            && matches!(op, DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall))
-        .then(|| (tmap(a, m, k), tmap(w, nn, k)));
+        let tm = (tma_gemm && matches!(op, DevOp::Gemm | DevOp::GemmMed | DevOp::GemmSmall))
+            .then(|| (tmap(a, m, k), tmap(w, nn, k)));
         b.emit(op, cus, deps, |d| {
             d.t[0] = out;
             d.t[1] = a;
@@ -2823,9 +2824,8 @@ fn emit_phase(
     // gate + a full activation read per site per layer. PAIRING: needs a cubin whose RMSNORM
     // arm reads t3/t4 (this campaign's); an older cubin ignores them and the GEMMs read a
     // stale xq — same cubin/packet pairing contract as PLOW_W8A8 itself.
-    let qnorm_fuse = w8a8
-        && !gemv_family
-        && std::env::var("PLOW_QNORM_FUSE").ok().as_deref() == Some("1");
+    let qnorm_fuse =
+        w8a8 && !gemv_family && std::env::var("PLOW_QNORM_FUSE").ok().as_deref() == Some("1");
 
     // Qwen/Llama PRE-NORM decode fuses each (residual add, RMSNorm) pair into ONE AddNorm packet
     // (see the AddNorm emits in the loop). Deletes 72 packets/token and, more importantly, 72
@@ -3126,14 +3126,16 @@ fn emit_phase(
         // work, so summed flash_decode work grows with nsplit (ns 4/8/16/32/64 -> 59/80/112/174/285
         // ms) and decode ms/tok is best at ns=4-8 (4.3-4.4) vs 4.6 at ns=16. flash_decode is
         // over-fragmented, not under-filled. Inert by default; leaves Gemma's tuned mul path alone.
-        let ns = emit_config::active().ns_abs
+        let ns = emit_config::active()
+            .ns_abs
             .filter(|_| gemv_family)
             .unwrap_or(ns);
         // Full-attention-only decode split override. Unlike PLOW_NS_ABS this does not also
         // over-split Gemma's many hd256 sliding layers. It is the controlled sweep knob for
         // full-layer GQA-fusion experiments on sm_120 (GF4/ns24 => 8 groups * 24 = 192 work
         // items on the 188-SM RTX PRO 6000). Default unset preserves every existing packet.
-        let ns = emit_config::active().ns_full_abs
+        let ns = emit_config::active()
+            .ns_full_abs
             .filter(|_| gemv_family && full)
             .unwrap_or(ns);
 
@@ -3377,8 +3379,7 @@ fn emit_phase(
         // path, which is where the original observation came from; it is dead weight on the
         // global-queue path that every AMD decode object ships today.
         // Enable with PLOW_HN_SPLIT=1 if you are on the static scheduler.
-        let hn_split =
-            3 * nhn <= n_cu && emit_config::active().hn_split;
+        let hn_split = 3 * nhn <= n_cu && emit_config::active().hn_split;
         let hn_set = |i: u32| -> Vec<u32> {
             if hn_split {
                 (i * nhn..(i + 1) * nhn).collect()
@@ -3768,8 +3769,8 @@ fn emit_phase(
                 if let Some(h) = fa_tm {
                     d.t[7] = h;
                 }
-                                   // Fused epilogue: t[5] is the final bf16 attention output (n.at). When !fused
-                                   // it stays NONE and flash_prefill writes the f32 partial for d_flash_merge.
+                // Fused epilogue: t[5] is the final bf16 attention output (n.at). When !fused
+                // it stays NONE and flash_prefill writes the f32 partial for d_flash_merge.
                 if fused {
                     d.t[5] = n.at;
                 }
@@ -4065,9 +4066,13 @@ fn emit_phase(
             // w8a8: A e4m3 (t1=xqh) + per-row a_scale (t3=ash); Wg/Wu e4m3 + g/u scales — the
             // epilogue folds a_scale*sg (and a_scale*su) into both streams. Same fusion law.
             // sm_90a TMA GLU ring (see `tmap`): w8a8 only, 3 e4m3 maps in i6/i7/i3.
-            let tmg8 = (tma_gemm && w8a8)
-                .then(|| (tmap8(n.xqh, t, c.hidden), tmap8(w.wg8, inter_l, c.hidden),
-                          tmap8(w.wu8, inter_l, c.hidden)));
+            let tmg8 = (tma_gemm && w8a8).then(|| {
+                (
+                    tmap8(n.xqh, t, c.hidden),
+                    tmap8(w.wg8, inter_l, c.hidden),
+                    tmap8(w.wu8, inter_l, c.hidden),
+                )
+            });
             b.emit(DevOp::GemmGluFp8, all.clone(), &[dmlp], |d| {
                 d.t[0] = n.fu;
                 d.t[2] = w.wg8;
@@ -4092,9 +4097,13 @@ fn emit_phase(
             })
         } else if gemm_glu {
             // sm_90a TMA GLU ring: bf16 maps in i6/i7/i3.
-            let tmg = tma_gemm
-                .then(|| (tmap(mlp_src, t, c.hidden), tmap(w.wg, inter_l, c.hidden),
-                          tmap(w.wu, inter_l, c.hidden)));
+            let tmg = tma_gemm.then(|| {
+                (
+                    tmap(mlp_src, t, c.hidden),
+                    tmap(w.wg, inter_l, c.hidden),
+                    tmap(w.wu, inter_l, c.hidden),
+                )
+            });
             b.emit(DevOp::GemmGlu, all.clone(), &[c_pf], |d| {
                 d.t[0] = n.fu;
                 d.t[1] = mlp_src;
@@ -4340,8 +4349,7 @@ fn emit_phase(
                 // drift vs the pair). Oracle is bit-exact vs its own golden. Default OFF; only
                 // worth revisiting as a register-cached vectorized body that replicates NRN's
                 // summation order. Opt in: PLOW_GEMMA_MOE_TAIL_FUSE=1.
-                let tail_fuse =
-                    emit_config::active().gemma_moe_tail_fuse;
+                let tail_fuse = emit_config::active().gemma_moe_tail_fuse;
                 // op72 is a single-row 1-CTA body and is default-OFF (measured negative); it was not
                 // batched. Refuse the combination loudly rather than emit wrong rows 1..B.
                 assert!(
@@ -6309,8 +6317,7 @@ fn emit_dense_gqa(
     // this flag). beat26b: fp8 grouped MoE prefill is now implemented for the w8a8 path (ops 81/82),
     // so it is enabled under PLOW_W8A8; plain fp8 (w8a16 dequant) grouped prefill is still not
     // implemented and stays decode-only.
-    let moe_pf =
-        c.moe && (!fp8 || w8a8) && ecfg.moe_prefill.as_deref() != Some("0");
+    let moe_pf = c.moe && (!fp8 || w8a8) && ecfg.moe_prefill.as_deref() != Some("0");
 
     // Phase 1: the DenseGqaEmitter owns the dense
     // tensor declaration (declare) and the emit_phase call sites. Byte-identical —

@@ -1111,8 +1111,7 @@ impl Builder {
         // `deny_uniseg` wins over the environment: a target that cannot express one segment must
         // not be given one because a variable said so. See that method for the failure it prevents.
         let uniseg = !self.uniseg_denied
-            && (self.uniseg_forced
-                || std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1"));
+            && (self.uniseg_forced || std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1"));
         // PLOW_SEG_PURE_GEMM=1 (T11): class-8 segments carry ONLY GEMM-family ops; every light
         // op (norms, rope, quant, embed, softcap) joins the flash class. The point: the sm_90a
         // segmented launcher runs class-8 segments on the lean `_pfgemm` object, and a pure-GEMM
@@ -1134,7 +1133,8 @@ impl Builder {
         let pure_gemm = !uniseg
             && pure_mode != 0
             && self.ops.iter().any(|o| {
-                o.inst.op == DevOp::FlashPrefill as u16 || o.inst.op == DevOp::FlashPrefillFp8 as u16
+                o.inst.op == DevOp::FlashPrefill as u16
+                    || o.inst.op == DevOp::FlashPrefillFp8 as u16
             });
         // PLOW_SEG_FA512=1 (T12): hd512 (full-attention) FlashPrefill packets get their OWN
         // class (2) so the host can launch them on the dedicated *_pffa flash object. hd is
@@ -1164,9 +1164,7 @@ impl Builder {
                 // T37: the *_pffa object instantiates hd 256/512 only — other head dims
                 // (Qwen/Llama hd128) stay on the fat object rather than trapping there.
                 let hd = self.ops[i].inst.i[6];
-                if (fa512_mode == 2 && (hd == 256 || hd == 512))
-                    || (fa512_mode == 1 && hd == 512)
-                {
+                if (fa512_mode == 2 && (hd == 256 || hd == 512)) || (fa512_mode == 1 && hd == 512) {
                     2
                 } else {
                     4
@@ -1363,8 +1361,8 @@ impl Builder {
         // PLOW_SEG_SLICE_ALL=1 (T14): also double the machine-filling FLASH-class (light) ops
         // — the FATLITE object runs them at occ-2, so both resident blocks need slices.
         // Class-2 (dedicated flash) ops keep n_cu: the FA object is occ-1.
-        let seg_slice_all = seg_class_slice
-            && std::env::var("PLOW_SEG_SLICE_ALL").ok().as_deref() == Some("1");
+        let seg_slice_all =
+            seg_class_slice && std::env::var("PLOW_SEG_SLICE_ALL").ok().as_deref() == Some("1");
         if seg_class_slice {
             let n_cu_sz = self.n_cu as usize;
             // Ops that some other op depends on FINELY — skip these (map[] would desync).

@@ -285,7 +285,13 @@ impl GenTensor {
 
     /// The recipe for a [`GEN_TMAP_KV_PAIR`]: rank-3 maps over the K and V cache tensors
     /// (`[n_kv_head][ring_rows][hd]` bf16 each).
-    pub fn tmap_kv_pair(k_target: u32, v_target: u32, ring_rows: u32, hd: u32, n_kv_head: u32) -> GenTensor {
+    pub fn tmap_kv_pair(
+        k_target: u32,
+        v_target: u32,
+        ring_rows: u32,
+        hd: u32,
+        n_kv_head: u32,
+    ) -> GenTensor {
         GenTensor {
             tensor: 0,
             kind: GEN_TMAP_KV_PAIR,
