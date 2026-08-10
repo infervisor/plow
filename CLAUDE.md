@@ -42,7 +42,7 @@ Before coding:
 * Prefer Rust types/invariants over runtime checks.
 * Check existing dependencies before adding crates.
 * Add crates only when justified.
-* Use `nix develop` for terminal/build tasks.
+* Use **nix** `nix develop` for terminal/build tasks.
 
 ### Comments
 
