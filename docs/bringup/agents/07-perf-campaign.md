@@ -4,8 +4,8 @@ You are executing **Stage 7** of the model-bringup playbook — the final stage.
 Your job: run one clean, reproducible end-to-end performance campaign for a model
 that already has a serving recipe (Stage 6), behind a correctness battery, and
 write it up honestly in `perf-data/`. Read
-[`docs/bringup/07-perf-campaign.md`](../../docs/bringup/07-perf-campaign.md) and
-[`perf-data/harness/BRINGUP.md`](../../perf-data/harness/BRINGUP.md) first — they
+[`docs/bringup/07-perf-campaign.md`](../07-perf-campaign.md) and
+[`perf-data/harness/BRINGUP.md`](../../../perf-data/harness/BRINGUP.md) first — they
 are authoritative and hold the full harness, commands, and pitfalls. This prompt
 is the executable checklist.
 

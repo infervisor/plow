@@ -367,7 +367,8 @@ model, formal verification, multi-GPU. Build-system rationale:
 A staged playbook — operator IR → rewrite rules → formal verification →
 kernel tuning → single-block sweep → runtime optimization → measured
 campaign — lives in [`docs/bringup/`](docs/bringup/00-overview.md), with
-per-stage LLM-agent prompt templates in [`bringup/`](bringup/README.md).
+per-stage LLM-agent prompt templates in
+[`docs/bringup/agents/`](docs/bringup/agents/README.md).
 
 ## Contributing
 

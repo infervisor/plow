@@ -2,8 +2,8 @@
 
 You are executing **Stage 3** of the model bringup playbook: proving the
 compiled schedule correct with the Lean 4 verifier before Stage 4 (kernel
-tuning). Read [`docs/bringup/03-lean-verify.md`](../../docs/bringup/03-lean-verify.md)
-and [`docs/arch/08-formal-verification.md`](../../docs/arch/08-formal-verification.md)
+tuning). Read [`docs/bringup/03-lean-verify.md`](../03-lean-verify.md)
+and [`docs/arch/08-formal-verification.md`](../../arch/08-formal-verification.md)
 first; they are authoritative and were recently corrected against the code.
 
 ## Your objective

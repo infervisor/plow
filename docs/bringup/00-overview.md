@@ -6,9 +6,8 @@
 This playbook is the distilled form of how every model in the tree (Gemma,
 Llama, Qwen, DeepSeek, GLM, Kimi-K3, Nemotron) was actually brought up. Each
 stage has a **gate** — a concrete, checkable success criterion — and a matching
-agent prompt in [`bringup/agents/`](../../bringup/agents/) so the stage can be
-executed by an LLM coding agent under supervision (see
-[`bringup/README.md`](../../bringup/README.md)).
+agent prompt in [`agents/`](agents/) so the stage can be executed by an LLM
+coding agent under supervision (see [`agents/README.md`](agents/README.md)).
 
 ## The pipeline
 
@@ -46,6 +45,6 @@ sends you back to kernel tuning).
 ## Where things live
 
 - `docs/bringup/NN-*.md` — stage playbooks (this directory).
-- `bringup/agents/NN-*.md` — per-stage agent prompts.
+- `docs/bringup/agents/NN-*.md` — per-stage agent prompts.
 - `docs/arch/` — the architecture chapters the playbooks cite.
 - `perf-data/` — campaign methodology, harness scripts, and written results.
