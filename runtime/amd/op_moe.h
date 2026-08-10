@@ -666,13 +666,9 @@ __device__ __forceinline__ float wave_dot_mxfp4(const bf16* x, const unsigned ch
     for (unsigned c = 0; c < nchunk; c++) {
         const unsigned k = c * step + lane * 32;
         if (k + 32u <= K) {
-            const fp4v32 w = W[k >> 5];
-            bf16v8 a, b, cc, d;
-            fp4_to_bf16v8x4(w, e8m0_to_f32(srow[k >> 5]), a, b, cc, d);
-            acc = dot8(a, ld_glob8(x + k), acc);
-            acc = dot8(b, ld_glob8(x + k + 8), acc);
-            acc = dot8(cc, ld_glob8(x + k + 16), acc);
-            acc = dot8(d, ld_glob8(x + k + 24), acc);
+            const fp4_frag32 wf = fp4_prep32(W[k >> 5], e8m0_to_f32(srow[k >> 5]));
+            acc = fp4_dot32(wf, ld_glob8(x + k), ld_glob8(x + k + 8), ld_glob8(x + k + 16),
+                            ld_glob8(x + k + 24), acc);
         }
     }
     return wave_sum(acc);
@@ -744,11 +740,8 @@ __device__ __forceinline__ void wave_dot_mxfp4_x2(const bf16* x, const unsigned 
             const float s0 = e8m0_to_f32(S0[k >> 5]), s1 = e8m0_to_f32(S1[k >> 5]);
             const bf16v8 x0 = ld_glob8(x + k), x1 = ld_glob8(x + k + 8),
                          x2 = ld_glob8(x + k + 16), x3 = ld_glob8(x + k + 24);
-            bf16v8 p, q, r, s;
-            fp4_to_bf16v8x4(w0, s0, p, q, r, s);
-            a0 = dot8(s, x3, dot8(r, x2, dot8(q, x1, dot8(p, x0, a0))));
-            fp4_to_bf16v8x4(w1, s1, p, q, r, s);
-            a1 = dot8(s, x3, dot8(r, x2, dot8(q, x1, dot8(p, x0, a1))));
+            a0 = fp4_dot32(fp4_prep32(w0, s0), x0, x1, x2, x3, a0);
+            a1 = fp4_dot32(fp4_prep32(w1, s1), x0, x1, x2, x3, a1);
         }
     }
     o0 = wave_sum(a0);
@@ -801,11 +794,8 @@ __device__ __forceinline__ void wave_dot_mxfp4_lg2(const bf16* x, const unsigned
         const float sa = e8m0_to_f32(Sa[k >> 5]), sb = e8m0_to_f32(Sb[k >> 5]);
         const bf16v8 x0 = ld_glob8(x + k), x1 = ld_glob8(x + k + 8), x2 = ld_glob8(x + k + 16),
                      x3 = ld_glob8(x + k + 24);
-        bf16v8 p, q, r, s;
-        fp4_to_bf16v8x4(wa, sa, p, q, r, s);
-        a = dot8(s, x3, dot8(r, x2, dot8(q, x1, dot8(p, x0, a))));
-        fp4_to_bf16v8x4(wb, sb, p, q, r, s);
-        b = dot8(s, x3, dot8(r, x2, dot8(q, x1, dot8(p, x0, b))));
+        a = fp4_dot32(fp4_prep32(wa, sa), x0, x1, x2, x3, a);
+        b = fp4_dot32(fp4_prep32(wb, sb), x0, x1, x2, x3, b);
     }
 #pragma unroll
     for (unsigned off = LPG / 2; off > 0; off >>= 1) {

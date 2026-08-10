@@ -359,50 +359,90 @@ __device__ __forceinline__ unsigned char plow_f32_to_fp8_ocp(float v) {
     return (unsigned char)(mag ? (sgn | mag) : 0u);
 }
 
-/* One OCP e2m1 nibble -> f32. Magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6}, sign in bit 3.
- * Built as a bit pattern rather than a memory LUT so it stays in VALU: exponent and mantissa
- * are both 1 bit wide, so the f32 bits are a small shift/select of the nibble. */
-__device__ __forceinline__ float plow_fp4_to_f32(unsigned nib) {
-    /* 8 magnitudes as f32 bit patterns, indexed by the low 3 bits. */
-    const unsigned mag[8] = {0x00000000u, 0x3f000000u, 0x3f800000u, 0x3fc00000u,
-                             0x40000000u, 0x40400000u, 0x40800000u, 0x40c00000u};
-    unsigned u = mag[nib & 7u] | ((nib & 8u) << 28); /* bit 3 -> sign bit 31 */
-    float f;
-    __builtin_memcpy(&f, &u, 4);
-    return f;
-}
+/* ==========================================================================================
+ * MXFP4 ON CDNA3 — w4a16, in software, and EXACT.
+ *
+ * This used to be PLOW_MX_PAUSED: gfx942 has no fp4 datatype, no cvt_scalef32 and no scaled
+ * matrix core, so the decode returned a bf16 NaN pair rather than a plausible-looking number.
+ * That is still the right verdict for A4W4 (PLOW_HAS_MX_MMA, fp4 on BOTH operands through the
+ * matrix core) — there is no CDNA3 instruction to lower it to. It is NOT the right verdict for
+ * w4a16, where fp4 is only a WEIGHT ENCODING: the weights are dequantized to bf16 before they
+ * ever reach a matrix core or a dot, so the only thing CDNA3 lacks is the convert itself, and a
+ * convert is arithmetic. Kimi-K3's routed experts are mxfp4, so on gfx942 this is the difference
+ * between serving the model and not.
+ *
+ * THE IDENTITY THAT MAKES IT ONE SHIFT, NOT AN 8-WAY SELECT.
+ *
+ * e2m1 is `s eeee=ee m`: a 2-bit exponent (bias 1) and a 1-bit mantissa, so its 8 magnitudes are
+ * {0, .5, 1, 1.5, 2, 3, 4, 6} — and that ladder is NOT linear in the code, because code 0 and
+ * code 1 are SUBNORMALS (value m/2, no implicit leading 1) while codes 2..7 are normals
+ * (value 2^(e-1)(1 + m/2)). Every naive decoder pays for that discontinuity: a memory LUT (the
+ * previous body — a scratch load in the middle of a GEMV inner loop), or a compare-and-select
+ * chain, or SWAR predicates. All of them cost more than the dot product they feed.
+ *
+ * But IEEE already knows how to evaluate that exact discontinuity — it is the normal/subnormal
+ * boundary of any float format. So place e2m1's field bits at the BOTTOM of a wider format's
+ * fields and let the hardware decide which side of the boundary they are on:
+ *
+ *     fp16 (e5m10, bias 15): exp field := e (0..3), mantissa field := m << 9
+ *
+ *     e == 0 -> exp field 0 -> SUBNORMAL -> (m*2^9)/2^10 * 2^-14 = (m/2) * 2^-14
+ *     e >= 1 -> NORMAL                   -> 2^(e-15) * (1 + m/2) = 2^(e-1)(1+m/2) * 2^-14
+ *
+ * Both arms land on the true e2m1 value times the SAME constant 2^-14 — the subnormal case falls
+ * out of the format instead of being special-cased. So the decode is `(code & 7) << 9` for the
+ * magnitude and `(code & 8) << 12` for the sign, and the 2^14 is folded into the block scale,
+ * which every caller already applies once per 32 elements. Nothing is left over.
+ *
+ * EXACTNESS. The fp16 encoding above is the value times 2^-14 exactly (it is a bit-construction,
+ * not a rounding), v_cvt_f32_f16 of it is exact (fp16 -> f32 always is, subnormals included),
+ * the E8M0 block scale is a power of two, and 2^14 is a power of two — so the f32 product carries
+ * e2m1's <= 3 significant bits with nothing to round, and the bf16 narrowing at the end is exact
+ * for the same reason. This matches CDNA4's native cvt_scalef32_pk_bf16_fp4 VALUE FOR VALUE, and
+ * that is the bar: an object built here and an object built for gfx950 must agree bit for bit, or
+ * the nibble-order oracle (runtime/tests/k3_mxfp4_nibble_*) cannot arbitrate between them.
+ *
+ * ONE DIVERGENCE, and it is in the scale rather than the element: `scale * 2^14` overflows f32
+ * for E8M0 bytes above 240, i.e. a block scale past 2^113. CDNA4 feeds the byte to the hardware
+ * and does not. No quantizer emits it (it would need a weight block with magnitude ~2^113), and
+ * the surrounding code already treats a NaN/Inf scale as an upstream bug, so it is recorded here
+ * rather than branched on in the inner loop.
+ * ========================================================================================== */
+typedef _Float16 plow_f16x2 __attribute__((ext_vector_type(2)));
 
-/* MX (mxfp4 / mxfp8) IS PAUSED ON CDNA3.
+/* 8 fp4 nibbles (one u32) -> 4 PACKED fp16 PAIRS, each element carrying its true value * 2^-14.
+ * `h[j]` holds elements 2j (low half) and 2j+1 (high half) — the op_sel order of CDNA4's
+ * cvt_scalef32_pk_bf16_fp4, so the callers' lane order is unchanged.
  *
- * CDNA3 has no fp4 datatype, no cvt_scalef32 and no scaled matrix core, so every MX op would be
- * a software emulation -- and an emulation that has never been checked against the nibble-order
- * oracle (runtime/tests/k3_mxfp4_nibble_*) is not support, it is a plausible number. The decision
- * is to land bf16 and fp8 first and revisit MX as an explicit simulated path.
- *
- * So the decode below POISONS on CDNA3 rather than returning a value. NaN, not zero: the AMD
- * `default:` already writes nothing, so a zero output is indistinguishable from an op the packet
- * never dispatched, while a NaN propagates and is impossible to mistake for a result. */
-#if PLOW_CDNA4
-#define PLOW_MX_PAUSED 0
-#else
-#define PLOW_MX_PAUSED 1
-#endif
+ * WHY THE TWO SHUFFLE WORDS. A packed pair wants its two elements SIXTEEN bits apart; adjacent
+ * nibbles are four. Extracting them separately costs two masks and two DIFFERENT shifts per pair
+ * (the halves sit at different offsets), i.e. ten VALU per pair. Instead deinterleave once —
+ * `lo` takes the even elements into bytes, `hi` the odd ones — and reassemble so that each pair's
+ * members land exactly 16 bits apart. Then ONE mask and ONE shift serve BOTH halves, and the
+ * per-pair cost is four VALU. The two setup words are amortized over all four pairs. */
+__device__ __forceinline__ void plow_fp4x8_to_f16x4(unsigned w, unsigned h[4]) {
+    const unsigned lo = w & 0x0F0F0F0Fu;        /* elements 0,2,4,6 -> bytes 0..3 */
+    const unsigned hi = (w >> 4) & 0x0F0F0F0Fu; /* elements 1,3,5,7 -> bytes 0..3 */
+    /* z0: e0@0 e2@8 e1@16 e3@24   z1: e4@0 e6@8 e5@16 e7@24  — every pair is 16 bits apart. */
+    const unsigned z0 = (lo & 0x0000FFFFu) | (hi << 16);
+    const unsigned z1 = (lo >> 16) | (hi & 0xFFFF0000u);
+    /* mag -> fp16 bits [11:9] (exp field := e, mantissa top := m); sign bit 3 -> bit 15. */
+    h[0] = ((z0 & 0x00070007u) << 9) | ((z0 & 0x00080008u) << 12);
+    h[1] = ((z0 & 0x07000700u) << 1) | ((z0 & 0x08000800u) << 4);
+    h[2] = ((z1 & 0x00070007u) << 9) | ((z1 & 0x00080008u) << 12);
+    h[3] = ((z1 & 0x07000700u) << 1) | ((z1 & 0x08000800u) << 4);
+}
 
 /* One u32 of 8 fp4 -> 4 packed bf16 pairs (u32 each), scale folded. `out` gets 4 words. */
 __device__ __forceinline__ void plow_fp4x8_to_bf16x8(unsigned w, float scale, unsigned out[4]) {
-#if PLOW_MX_PAUSED
-    (void)w;
-    (void)scale;
-#pragma unroll
-    for (int j = 0; j < 4; j++) out[j] = 0x7FC07FC0u; /* bf16 NaN pair */
-#else
+    unsigned h[4];
+    plow_fp4x8_to_f16x4(w, h);
+    const float s = scale * 16384.0f; /* the 2^-14 the fp16 encoding above carries */
 #pragma unroll
     for (int j = 0; j < 4; j++) {
-        const float a = plow_fp4_to_f32((w >> (8 * j)) & 0xfu) * scale;
-        const float b = plow_fp4_to_f32((w >> (8 * j + 4)) & 0xfu) * scale;
-        out[j] = plow_pack_bf16x2(a, b);
+        const plow_f16x2 p = __builtin_bit_cast(plow_f16x2, h[j]);
+        out[j] = plow_pack_bf16x2((float)p[0] * s, (float)p[1] * s);
     }
-#endif
 }
 
 #endif /* PLOW_AMD_ARCH_H */

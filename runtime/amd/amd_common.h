@@ -703,10 +703,11 @@ __device__ __forceinline__ void fp4_to_bf16v8x4(fp4v32 w, float scale, bf16v8& a
     d = o[3].v;
 }
 #else
-/* CDNA3 arm: no fp4 datatype at all, so the nibble decode is a VALU table (plow_fp4_to_f32) and
- * the E8M0 scale is a plain multiply. Same op_sel ORDER as the CDNA4 instruction -- word j of the
- * output holds nibbles 2j and 2j+1 of the input, low nibble first -- so the fdot2-ready lane
- * order the GEMV reduction depends on is preserved. */
+/* CDNA3 arm: no fp4 datatype at all, so the nibble decode is the fp16-subnormal bit-construction
+ * in amd_arch.h (plow_fp4x8_to_bf16x8) and the E8M0 scale is a plain multiply. Same op_sel ORDER
+ * as the CDNA4 instruction -- word j of the output holds nibbles 2j and 2j+1 of the input, low
+ * nibble first -- so the fdot2-ready lane order the GEMV reduction depends on is preserved, and
+ * the VALUES are bit-identical to gfx950's native cvt. */
 __device__ __forceinline__ void fp4_to_bf16v8x4(fp4v32 w, float scale, bf16v8& a, bf16v8& b,
                                                 bf16v8& c, bf16v8& d) {
     union { bf16v8 v; unsigned u[4]; } o[4];
@@ -718,6 +719,98 @@ __device__ __forceinline__ void fp4_to_bf16v8x4(fp4v32 w, float scale, bf16v8& a
     d = o[3].v;
 }
 #endif /* PLOW_HAS_MX_CVT */
+
+/* ---------------------------------------------------------------------------
+ * 32 fp4 (EXACTLY one MX block) dotted against 32 bf16 activations.
+ *
+ * Every mxfp4 GEMV in this tree — the decode GEMV, its fused q|k|v and gate|up twins, and the
+ * three MoE expert walks — spells the same four lines: one `fp4_to_bf16v8x4`, then four `dot8`.
+ * This is that sequence, named, so the two arches can disagree about what happens in the middle.
+ *
+ * ON CDNA4 IT IS THE SAME FOUR LINES, byte for byte: one native cvt per pair with the scale
+ * folded free, then v_dot2c_f32_bf16. Nothing about that path changes and nothing about its
+ * numerics changes.
+ *
+ * ON CDNA3 THE bf16 IS PURE LOSS, and that is the whole reason this helper exists. gfx942 has no
+ * v_dot2c_f32_bf16 (amd_arch.h: "needs target feature dot12-insts"), so `dot8` there UNPACKS the
+ * bf16 back to f32 and issues two FMAs — meaning the shared path spent VALU packing a bf16 pair
+ * that the very next instruction took apart again. MEASURED, and it is not a rounding error's
+ * worth: at the large shapes the mxfp4 GEMV moved HALF the bytes of the fp8 GEMV and took the
+ * SAME time (70.69 us vs 67.11 us at N=32768 K=6144), i.e. 1513 GB/s against fp8's 3002 — the op
+ * was VALU-bound with the memory system half idle. So the CDNA3 arm goes fp4 -> fp16 -> f32 and
+ * stops: no bf16 is ever materialised, and `v_fma_mix_f32` consumes the fp16 half directly as an
+ * FMA source, which folds the widening into the multiply instead of paying a convert for it.
+ *
+ * TWO NUMERIC DIVERGENCES ON CDNA3, both deliberate, neither an approximation:
+ *
+ *   THE SCALE MOVES OUT OF THE ELEMENT AND ONTO THE SUM. All 32 elements of an MX block share one
+ *   E8M0 scale, so `sum(v_i * s * x_i)` becomes `s * sum(v_i * x_i)` — 32 multiplies become one.
+ *   This is EXACT, not merely close: `s` is a power of two (E8M0 is a bare exponent) and 2^14 is
+ *   too, so scaling every partial sum by it is a lossless exponent shift. Only overflow or a
+ *   subnormal partial could break that, and neither is reachable from e2m1's <= 3 significant
+ *   bits (§ amd_arch.h).
+ *
+ *   THE ACCUMULATION GROUPING CHANGES. Four independent f32 accumulators, one per 8-element word,
+ *   summed pairwise at the end, against CDNA4's single serial chain. It is the same license the
+ *   fp8 matrix-core quartering already takes ("Only the f32 accumulation GROUPING differs from
+ *   CDNA4", amd_arch.h) and it is taken for the same reason: a 32-deep dependent FMA chain at two
+ *   waves per SIMD is latency the arch cannot hide. Results agree with CDNA4 to f32 rounding, NOT
+ *   bit-for-bit. Any A/B that asserts elementwise equality must compare gfx942 against gfx942. */
+/* SPLIT INTO PREP AND DOT, and it is not cosmetic: three of the five call sites dequant ONCE and
+ * then dot against MM activation rows (the decode-batch loop). Fusing the two halves would move
+ * the dequant inside that loop and repeat it per row. The carrier is register-neutral — 4 bf16v8
+ * and 16 raw fp16 words are both 16 VGPRs — so the split costs nothing either arch pays for. */
+struct fp4_frag32 {
+#if PLOW_HAS_MX_CVT
+    bf16v8 v[4]; /* scale already folded by the native cvt */
+#else
+    unsigned h[16]; /* raw fp16 pairs: the value * 2^-14 */
+    float s;        /* scale * 2^14, applied once to the finished sum */
+#endif
+};
+
+__device__ __forceinline__ fp4_frag32 fp4_prep32(fp4v32 w, float scale) {
+    fp4_frag32 f;
+#if PLOW_HAS_MX_CVT
+    fp4_to_bf16v8x4(w, scale, f.v[0], f.v[1], f.v[2], f.v[3]);
+#else
+#pragma unroll
+    for (int i = 0; i < 4; i++) plow_fp4x8_to_f16x4((unsigned)w[i], &f.h[i * 4]);
+    f.s = scale * 16384.0f;
+#endif
+    return f;
+}
+
+__device__ __forceinline__ float fp4_dot32(const fp4_frag32& f, bf16v8 x0, bf16v8 x1, bf16v8 x2,
+                                           bf16v8 x3, float acc) {
+#if PLOW_HAS_MX_CVT
+    return dot8(f.v[3], x3, dot8(f.v[2], x2, dot8(f.v[1], x1, dot8(f.v[0], x0, acc))));
+#else
+    const bf16v8 xs[4] = {x0, x1, x2, x3};
+    float p[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        bf16v8_pairs xp{xs[i]};
+        float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const plow_f16x2 wv = __builtin_bit_cast(plow_f16x2, f.h[i * 4 + j]);
+            /* bf16 -> f32 is a 16-bit SHIFT, not a numeric conversion; see plow_dot2_bf16's note
+             * on the cast that looks right and silently returns zero. */
+            const unsigned xu = __builtin_bit_cast(unsigned, xp.p[j]);
+            float xa, xb;
+            unsigned t = xu << 16;
+            __builtin_memcpy(&xa, &t, 4);
+            t = xu & 0xffff0000u;
+            __builtin_memcpy(&xb, &t, 4);
+            s0 = __builtin_fmaf((float)wv[0], xa, s0); /* v_fma_mix_f32: f16 source, f32 acc */
+            s1 = __builtin_fmaf((float)wv[1], xb, s1);
+        }
+        p[i] = s0 + s1;
+    }
+    return acc + ((p[0] + p[1]) + (p[2] + p[3])) * f.s;
+#endif
+}
 
 /* One u32 (8 fp4) + one E8M0 scale -> bf16v8, the per-word slice of fp4_to_bf16v8x4. Used by the
  * w4a16 prefill GEMM's dequant-on-load B-fetch, where the 8-half load granularity wants exactly 8
