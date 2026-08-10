@@ -594,6 +594,14 @@ static_assert(FA_MLA_DEC_LDS_FLOATS(512, 64, (PLOW_GLM_GF8_ARM ? 8 : 4)) * sizeo
  * 64 KiB part exactly as GMPF_DBUF does; this pin is what keeps that true. */
 static_assert(MPF_LDS_HALVES * sizeof(bf16) <= sizeof(((plow_smem*)nullptr)->raw),
               "grouped-MoE prefill LDS tiles exceed the interpreter's shared allocation");
+#if PLOW_MOE_PF_A4W4
+/* Same pin for the mxfp4 grouped arm (both the CDNA4 A4W4 plan and the CDNA3 simulated one --
+ * MPF4_LDS_BYTES is arch-conditional). It had no assert because only 147 KiB arenas ever built
+ * it; the CDNA3 arm runs against a 64 KiB part, which is exactly where the MoE-PF class of
+ * silent LDS overrun lived. */
+static_assert(MPF4_LDS_BYTES <= sizeof(((plow_smem*)nullptr)->raw),
+              "mxfp4 grouped-MoE prefill LDS tiles exceed the interpreter's shared allocation");
+#endif
 #endif
 
 /* ---------------------------------------------------------------------------

@@ -125,9 +125,10 @@ __device__ __forceinline__ unsigned moe_bound_topk(unsigned char* table, unsigne
 #ifndef PLOW_MOE_PF_A4W4
 #define PLOW_MOE_PF_A4W4 0
 #endif
-#if PLOW_MOE_PF_A4W4 && !PLOW_HAS_MX_MMA
-#error "PLOW_MOE_PF_A4W4 requires the CDNA4 scaled f8f6f4 matrix core (gfx950). CDNA3 has no fp4."
-#endif
+/* This used to #error on CDNA3 ("no fp4"). The flag no longer demands the scaled f8f6f4 matrix
+ * core: without PLOW_HAS_MX_MMA the same ops compile as the SIMULATED arm — fp4 dequantized to
+ * bf16 in staging (exact: <= 3 significant bits, power-of-two scale) and fed to the ordinary
+ * bf16 MFMA. Same packet contract, same object name; see the CDNA3 body's header below. */
 /* i[3] on ops 85/86 selects the WEIGHT ENCODING at runtime, so switching a model between
  * precisions is a field change in the packet and not a re-emit (the emitter's contract). The
  * A4W4 body is still gated by the COMPILE-TIME flag above -- see the measurement in the commit
@@ -3103,8 +3104,15 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
  *   bs[2][BN][SPR]            B scale bytes                                  2048
  *   bridge f32[BM][BN/2]      GLU epilogue transpose (see the bridge note)  32768
  * = 76288 B, inside the 147464 B arena, so this op does not move the LDS high-water mark. */
+#if PLOW_HAS_MX_MMA
 #define MPF4_LDS_BYTES (2u * (MPF4_ATB + MPF4_BTB) + 2u * MPF4_BM * MPF4_SPR + \
                         2u * MPF4_BN * MPF4_SPR + MPF4_BM * (MPF4_BN / 2) * 4u)
+#else
+/* The CDNA3 simulated arm: single-buffered bf16 tiles at BK=64 (128-B rows), the GLU bridge
+ * aliased over them. 40,960 B — under the 64 KiB part's arena where the CDNA4 plan (76,288 B)
+ * is not, which is half the reason that arm stages bf16 the way it does. */
+#define MPF4_LDS_BYTES ((MPF4_BM + MPF4_BN) * 128u)
+#endif
 
 /* 16 bytes of fp4 payload held in registers between a staging phase's ISSUE and COMMIT halves
  * — one MX block for A (DOWN) or B. Vector-typed so the copy in and the copy out are each a
@@ -3608,6 +3616,349 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
 #undef MPF4_MFMA
 #undef MPF4_EPI_NGUARD
 #undef MPF4_ROWMETA
+}
+#else /* !PLOW_HAS_MX_MMA ------------------------------------------------------------------------
+ * CDNA3: THE SAME OPS, SIMULATED THROUGH THE bf16 MATRIX CORE. gfx942 has no scaled f8f6f4 MFMA
+ * and no fp4 datatype, so true A4W4 cannot be lowered here — but the PACKET does not ask for an
+ * instruction, it asks for a computation, and every piece of that computation is expressible:
+ * fp4 x 2^e8m0 is EXACT in bf16 (<= 3 significant bits, power-of-two scale), so dequantizing
+ * both operands to bf16 and feeding the ordinary bf16 MFMA computes the same products with f32
+ * accumulation, differing from the scaled-MFMA path only in accumulation GROUPING — the same
+ * license the fp8 matrix-core quartering in amd_arch.h already takes.
+ *
+ * The CONTRACT is byte-compatible with the CDNA4 body in both directions: same wtab/stab/meta
+ * layout, and the GLU epilogue still writes `fu` as MXFP4 + E8M0 in the sorted layout —
+ * an emitted packet cannot tell which arch ran it. Two deliberate divergences, both toward
+ * accuracy: (1) the GLU A side stages the gathered bf16 activation RAW instead of quantizing it
+ * to fp4 first — CDNA4 quantizes because its matrix core demands fp4 operands; this one does
+ * not, so the A-quantization error term simply does not exist here; (2) accumulation grouping,
+ * as above. Cross-arch outputs agree to quantization/rounding tolerance, NOT bit-for-bit.
+ *
+ * WHERE THE DEQUANT LIVES — IN STAGING, NOT IN THE MFMA BLOCK. The CDNA4 body stages raw fp4 and
+ * lets the matrix instruction apply the scales. Here each staged element must become bf16
+ * SOMEWHERE, and the two candidate homes differ by real VALU: a B fragment is re-read by
+ * MPF4_WMc waves and an A fragment by MPF4_WNc, so read-time dequant runs 2-4x per element,
+ * while COMMIT-time dequant runs exactly once — and lands in the staging phase, whose latency
+ * the in-flight global reads already cover. The MFMA block is then pure ds_read_b128 + MFMA
+ * with no scale traffic at all.
+ *
+ * WHAT THAT COSTS IN LDS, and why the tile is BK=64 single-buffered. bf16 staging doubles the
+ * tile bytes and CDNA3 halves the arena (64 KiB, PLOW_LDS_MAX_BYTES): the CDNA4 plan
+ * (BK=128, double-buffered fp4, 76,288 B) is over budget before the first bf16 byte. At BK=64,
+ * single-buffered bf16:
+ *
+ *   Atl bf16 [64][128 B]     8,192
+ *   Btl bf16 [256][128 B]   32,768
+ *   Bridge f32 [64][128]    32,768 — ALIASED over Atl+Btl (40,960 >= 32,768), which is safe
+ *                                    because the K loop's final barrier retires the tiles
+ *                                    before the GLU epilogue's first Bridge write
+ *   = 40,960 B against the gfx942 interpreter arena. The BM=64 x BN=256 OUTPUT tile, the 2x4
+ * wave grid and SNa=2 are unchanged — SNa=2 is what the GLU gate|up-in-one-lane trick and the
+ * unchanged epilogues depend on.
+ *
+ * Single-buffered is not un-pipelined: the next tile's global reads still issue BEFORE the MFMA
+ * block and land in registers across it (the ISSUE/COMMIT split, kept from the CDNA4 body); the
+ * cost against double buffering is one extra barrier per K tile, not exposed load latency. */
+#define MPF4_C3_BK 64u                      /* K per staged tile = 4 bf16 MFMA K=16 steps */
+#define MPF4_C3_RB (MPF4_C3_BK * 2u)        /* bf16 LDS row stride, bytes = 128 */
+/* XOR swizzle over 16-byte chunks, bits 4..6 — in-row for a 128-B row, and THREE bits on
+ * purpose: a 128-B row is exactly 8 chunks, and a fragment read walks 32 consecutive rows at a
+ * FIXED chunk column (row stride 128 B = 0 mod 8 chunks), so anything less than a full 3-bit
+ * spread leaves the ds_read_b128 bank-conflicted. MEASURED, interleaved in one lease at the
+ * bench shape (H=3584, IM=3072, 4096 rows, grid 304 — moe_prefill_a4w4_cdna3_test.hip
+ * MPA4C3_BENCH=1): 1-bit 737 GB/s, 2-bit 928, 3-bit 963 GB/s weight stream = 232 TF/s on the
+ * GLU, ~71% of this part's bf16 MFMA peak. ONE function for the write and every read; a second
+ * copy that drifts is the transposed-tile class of bug. */
+#define MPF4_C3_SWZ(row, off) ((off) ^ (((row) & 7u) << 4))
+
+template <bool GLU>
+__device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restrict__ Ain,
+                                    const unsigned char* __restrict__ Ascale,
+                                    const unsigned long long* __restrict__ wtab,
+                                    const unsigned long long* __restrict__ stab,
+                                    const int* __restrict__ meta,
+                                    const unsigned* __restrict__ row_token,
+                                    const unsigned* __restrict__ row_partidx,
+                                    const float* __restrict__ row_gate,
+                                    unsigned char* __restrict__ Cscale, unsigned N, unsigned K,
+                                    unsigned n_exp, unsigned act, unsigned slice, unsigned nblk,
+                                    float beta, float lbeta, void* ldsv) {
+    constexpr int SMa = MPF4_BM / MPF4_WMc / MFMA_M; /* 1 */
+    constexpr int SNa = MPF4_BN / MPF4_WNc / MFMA_N; /* 2 */
+    constexpr unsigned NB = GLU ? (MPF4_BN / 2) : MPF4_BN;
+    /* Staging items per tile: A is 16-B bf16 chunks under GLU (BM * BK/8) and 32-element MX
+     * blocks under DOWN (BM * BK/32); B is always MX blocks (BN * BK/32). */
+    constexpr unsigned C3_ANB = GLU ? (MPF4_BM * (MPF4_C3_BK / 8u)) : (MPF4_BM * (MPF4_C3_BK / 32u));
+    constexpr unsigned C3_BNB = MPF4_BN * (MPF4_C3_BK / 32u);
+    constexpr int C3_AIT = (int)((C3_ANB + PLOW_THREADS - 1) / PLOW_THREADS);
+    constexpr int C3_BIT = (int)((C3_BNB + PLOW_THREADS - 1) / PLOW_THREADS);
+
+    unsigned char* const L = (unsigned char*)ldsv;
+    unsigned char* const Atl = L;                            /* bf16 [BM][C3_RB] */
+    unsigned char* const Btl = Atl + MPF4_BM * MPF4_C3_RB;   /* bf16 [BN][C3_RB] */
+    float* const Bridge = (float*)L;                         /* GLU epilogue only; aliases tiles */
+    static_assert(MPF4_BM * (MPF4_BN / 2) * 4u <= (MPF4_BM + MPF4_BN) * MPF4_C3_RB,
+                  "the GLU bridge no longer fits inside the tile arena it aliases");
+
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 63u, wave = tid >> 6;
+    const unsigned wm = wave / MPF4_WNc, wn = wave % MPF4_WNc;
+    const unsigned frow = mfma_frag_row(lane); /* lane % 32 */
+    const unsigned khalf = lane / 32u;         /* which 8-k half of a K=16 step this lane feeds */
+
+    const int* rowoff = meta;
+    const int* tilep = meta + 2 * (int)n_exp;
+    const unsigned total_tiles = (unsigned)tilep[n_exp];
+    const unsigned tnc = (N + NB - 1u) / NB;
+    const unsigned n_tiles = total_tiles * tnc;
+    const unsigned NT = (K + MPF4_C3_BK - 1u) / MPF4_C3_BK;
+    const unsigned KS = K >> 1;  /* fp4 row stride in BYTES */
+    const unsigned KSC = K >> 5; /* E8M0 scale bytes per row */
+
+    for (unsigned lin = slice; lin < n_tiles; lin += nblk) {
+        const unsigned mt = lin / tnc, nt = lin % tnc;
+        const unsigned e = mpf_expert_of_tile(tilep, mt, n_exp);
+        const unsigned rowbase = (unsigned)rowoff[e] + (mt - (unsigned)tilep[e]) * MPF4_BM;
+        const unsigned n0 = nt * NB;
+
+        const unsigned long long wb0 = wtab[(size_t)e * 3 + (GLU ? 0 : 2)];
+        if (wb0 == 0ull) continue; /* EP: expert not local */
+        const PLOW_GLOB unsigned char* W0 = as_glob((const unsigned char*)(size_t)wb0);
+        const PLOW_GLOB unsigned char* W1 =
+            as_glob(GLU ? (const unsigned char*)(size_t)wtab[(size_t)e * 3 + 1] : nullptr);
+        const PLOW_GLOB unsigned char* SW0 =
+            as_glob((const unsigned char*)(size_t)stab[(size_t)e * 3 + (GLU ? 0 : 2)]);
+        const PLOW_GLOB unsigned char* SW1 =
+            as_glob(GLU ? (const unsigned char*)(size_t)stab[(size_t)e * 3 + 1] : nullptr);
+
+        f32x16 acc[SMa][SNa];
+#pragma unroll
+        for (int i = 0; i < SMa; i++)
+#pragma unroll
+            for (int j = 0; j < SNa; j++) acc[i][j] = (f32x16)(0.0f);
+
+        /* K-invariant per-item metadata, resolved once per output tile (CDNA4's hoist, kept). */
+        unsigned asrc_[C3_AIT]; /* gathered A row, PLOW_EXPERT_UNUSED = pad or idle */
+        unsigned brow_[C3_BIT]; /* weight row bn, or ~0u for the n tail */
+#pragma unroll
+        for (int it = 0; it < C3_AIT; it++) {
+            const unsigned t = tid + (unsigned)it * PLOW_THREADS;
+            constexpr unsigned APR = GLU ? (MPF4_C3_BK / 8u) : (MPF4_C3_BK / 32u);
+            if (t >= C3_ANB) asrc_[it] = PLOW_EXPERT_UNUSED;
+            else if constexpr (GLU) asrc_[it] = row_token[rowbase + t / APR];
+            else asrc_[it] = rowbase + t / APR;
+        }
+#pragma unroll
+        for (int it = 0; it < C3_BIT; it++) {
+            const unsigned t = tid + (unsigned)it * PLOW_THREADS;
+            unsigned bn = ~0u;
+            if (t < C3_BNB) {
+                const unsigned br = t / (MPF4_C3_BK / 32u);
+                const bool up = GLU && (br >= MPF4_BN / 2);
+                bn = n0 + (up ? br - MPF4_BN / 2 : br);
+                if (bn >= N) bn = ~0u;
+            }
+            brow_[it] = bn;
+        }
+
+/* --- staging, ISSUE/COMMIT split exactly as the CDNA4 body reasons: reads carry no LDS
+ * traffic and no dequant arithmetic, so no s_waitcnt lands between them and the MFMA block
+ * they hide behind. COMMIT dequants (the once-per-element home, see the header) and writes. */
+#define C3_A_ISSUE(k0)                                                                         \
+    _Pragma("unroll") for (int it = 0; it < C3_AIT; it++) {                                    \
+        const unsigned t = tid + (unsigned)it * PLOW_THREADS;                                  \
+        if (asrc_[it] != PLOW_EXPERT_UNUSED) {                                                 \
+            if constexpr (GLU) {                                                               \
+                const unsigned ac = t % (MPF4_C3_BK / 8u);                                     \
+                aw_[it] = ld_glob8((const bf16*)Ain + (size_t)asrc_[it] * K + (k0) + ac * 8u); \
+            } else {                                                                           \
+                const unsigned ab = t % (MPF4_C3_BK / 32u);                                    \
+                aq_[it] = mpf4_ld16(as_glob((const unsigned char*)Ain) +                       \
+                                    (size_t)asrc_[it] * KS + ((k0) >> 1) + ab * 16u);          \
+                asc_[it] = Ascale[(size_t)asrc_[it] * KSC + ((k0) >> 5) + ab];                 \
+            }                                                                                  \
+        }                                                                                      \
+    }
+#define C3_B_ISSUE(k0)                                                                         \
+    _Pragma("unroll") for (int it = 0; it < C3_BIT; it++) {                                    \
+        if (brow_[it] != ~0u) {                                                                \
+            const unsigned t = tid + (unsigned)it * PLOW_THREADS;                              \
+            const unsigned bb = t % (MPF4_C3_BK / 32u);                                        \
+            const unsigned br = t / (MPF4_C3_BK / 32u);                                        \
+            const bool up = GLU && (br >= MPF4_BN / 2);                                        \
+            const PLOW_GLOB unsigned char* bw = up ? W1 : W0;                                  \
+            const PLOW_GLOB unsigned char* bs = up ? SW1 : SW0;                                \
+            bq_[it] = mpf4_ld16(bw + (size_t)brow_[it] * KS + ((k0) >> 1) + bb * 16u);         \
+            bsc_[it] = bs[(size_t)brow_[it] * KSC + ((k0) >> 5) + bb];                         \
+        }                                                                                      \
+    }
+/* Dequant an MX block (16 fp4 bytes + scale) to 32 bf16 and write its four 16-B chunks through
+ * the swizzle. Zero fill for pads — bf16 zero needs no neutral-scale bookkeeping. */
+#define C3_BLK_COMMIT(dst_row_base, r_, blk_, q_, sc_, live_)                                  \
+    {                                                                                          \
+        const unsigned off0 = (blk_)*64u;                                                      \
+        if (live_) {                                                                           \
+            bf16v8 d0, d1, d2, d3;                                                             \
+            fp4_to_bf16v8x4(__builtin_bit_cast(fp4v32, (q_)), e8m0_to_f32(sc_), d0, d1, d2,    \
+                            d3);                                                               \
+            *(bf16v8*)((dst_row_base) + MPF4_C3_SWZ(r_, off0)) = d0;                           \
+            *(bf16v8*)((dst_row_base) + MPF4_C3_SWZ(r_, off0 + 16u)) = d1;                     \
+            *(bf16v8*)((dst_row_base) + MPF4_C3_SWZ(r_, off0 + 32u)) = d2;                     \
+            *(bf16v8*)((dst_row_base) + MPF4_C3_SWZ(r_, off0 + 48u)) = d3;                     \
+        } else {                                                                               \
+            _Pragma("unroll") for (unsigned q4 = 0; q4 < 4u; q4++) {                           \
+                *(bf16v8*)((dst_row_base) + MPF4_C3_SWZ(r_, off0 + q4 * 16u)) = (bf16v8)(bf16)0; \
+            }                                                                                  \
+        }                                                                                      \
+    }
+#define C3_COMMIT                                                                              \
+    _Pragma("unroll") for (int it = 0; it < C3_AIT; it++) {                                    \
+        const unsigned t = tid + (unsigned)it * PLOW_THREADS;                                  \
+        if (t < C3_ANB) {                                                                      \
+            if constexpr (GLU) {                                                               \
+                const unsigned ar = t / (MPF4_C3_BK / 8u), ac = t % (MPF4_C3_BK / 8u);         \
+                bf16v8 v = (asrc_[it] != PLOW_EXPERT_UNUSED) ? aw_[it] : (bf16v8)(bf16)0;      \
+                *(bf16v8*)(Atl + ar * MPF4_C3_RB + MPF4_C3_SWZ(ar, ac * 16u)) = v;             \
+            } else {                                                                           \
+                const unsigned ar = t / (MPF4_C3_BK / 32u), ab = t % (MPF4_C3_BK / 32u);       \
+                C3_BLK_COMMIT(Atl + ar * MPF4_C3_RB, ar, ab, aq_[it], asc_[it],                \
+                              asrc_[it] != PLOW_EXPERT_UNUSED)                                 \
+            }                                                                                  \
+        }                                                                                      \
+    }                                                                                          \
+    _Pragma("unroll") for (int it = 0; it < C3_BIT; it++) {                                    \
+        const unsigned t = tid + (unsigned)it * PLOW_THREADS;                                  \
+        if (t < C3_BNB) {                                                                      \
+            const unsigned br = t / (MPF4_C3_BK / 32u), bb = t % (MPF4_C3_BK / 32u);           \
+            C3_BLK_COMMIT(Btl + br * MPF4_C3_RB, br, bb, bq_[it], bsc_[it], brow_[it] != ~0u)  \
+        }                                                                                      \
+    }
+
+        /* Carriers across the MFMA block. */
+        bf16v8 aw_[GLU ? C3_AIT : 1];
+        mpf4_b16 aq_[GLU ? 1 : C3_AIT];
+        mpf4_b16 bq_[C3_BIT];
+        unsigned char asc_[C3_AIT], bsc_[C3_BIT];
+        (void)asc_;
+
+        __syncthreads(); /* the previous tile's epilogue may still be reading the arena */
+        C3_A_ISSUE(0u)
+        C3_B_ISSUE(0u)
+        C3_COMMIT
+        __syncthreads();
+
+        for (unsigned kt = 0; kt < NT; kt++) {
+            const unsigned kn = (kt + 1u) * MPF4_C3_BK;
+            if (kn < K) {
+                C3_A_ISSUE(kn)
+                C3_B_ISSUE(kn)
+            }
+            /* Four K=16 bf16 MFMA steps over the staged tile: pure fragment reads, no dequant,
+             * no scales — COMMIT already folded them. Lane feeds k = s*16 + 8*khalf + [0..7]. */
+#pragma unroll
+            for (int s = 0; s < (int)(MPF4_C3_BK / 16u); s++) {
+                const unsigned boff = (unsigned)s * 32u + khalf * 16u; /* bf16 bytes */
+                bf16x8 af[SMa], bf[SNa];
+#pragma unroll
+                for (int i = 0; i < SMa; i++) {
+                    const unsigned ar = wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + frow;
+                    af[i] = __builtin_bit_cast(
+                        bf16x8, *(const bf16v8*)(Atl + ar * MPF4_C3_RB + MPF4_C3_SWZ(ar, boff)));
+                }
+#pragma unroll
+                for (int j = 0; j < SNa; j++) {
+                    const unsigned br = (GLU ? j * (MPF4_BN / 2) + wn * MFMA_N
+                                             : wn * (MPF4_BN / MPF4_WNc) + j * MFMA_N) +
+                                        frow;
+                    bf[j] = __builtin_bit_cast(
+                        bf16x8, *(const bf16v8*)(Btl + br * MPF4_C3_RB + MPF4_C3_SWZ(br, boff)));
+                }
+                __builtin_amdgcn_s_setprio(1);
+#pragma unroll
+                for (int i = 0; i < SMa; i++)
+#pragma unroll
+                    for (int j = 0; j < SNa; j++)
+                        acc[i][j] = plow_mfma_bf16_32x32(af[i], bf[j], acc[i][j]);
+                __builtin_amdgcn_s_setprio(0);
+            }
+#pragma unroll
+            for (int i = 0; i < SMa; i++)
+#pragma unroll
+                for (int j = 0; j < SNa; j++) asm volatile("" : "+v"(acc[i][j]));
+            __syncthreads(); /* everyone done READING the tile */
+            if (kn < K) { C3_COMMIT }
+            __syncthreads(); /* publish the next tile (or retire the last: Bridge aliases it) */
+        }
+
+        if constexpr (GLU) {
+            /* --- the fused bridge, VERBATIM in structure from the CDNA4 arm (see its header
+             * for why the LDS transpose is unavoidable): SwiGLU -> Bridge f32 -> per-(row,
+             * 32-col block) amax -> MXFP4 + E8M0 in the sorted layout gemm2 reads. Bridge
+             * ALIASES the tile arena; the barrier above retired the tiles. */
+            float* const Br = Bridge;
+            const unsigned cc = wn * MFMA_N + mfma_acc_n(lane);
+            if (n0 + cc < N) {
+#pragma unroll
+                for (int i = 0; i < SMa; i++)
+#pragma unroll
+                    for (int el = 0; el < 16; el++) {
+                        const unsigned rr =
+                            wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
+                        Br[rr * (MPF4_BN / 2) + cc] =
+                            moe_glu(acc[i][0][el], acc[i][1][el], act, beta, lbeta);
+                    }
+            }
+            __syncthreads();
+            unsigned char* const fq = (unsigned char*)Cout;
+            const unsigned nblocks = MPF4_BM * (NB / 32u);
+            for (unsigned t = tid; t < nblocks; t += PLOW_THREADS) {
+                const unsigned r = t / (NB / 32u), blk = t % (NB / 32u);
+                if (row_partidx[rowbase + r] == PLOW_EXPERT_UNUSED) continue; /* pad row */
+                const unsigned c0 = blk * 32u;
+                if (n0 + c0 >= N) continue;
+                const float* const bs = Br + r * (MPF4_BN / 2) + c0;
+                float amax = 0.0f;
+#pragma unroll
+                for (int z = 0; z < 32; z++) amax = fmaxf(amax, fabsf(bs[z]));
+                const unsigned char sbv = e8m0_for_amax(amax);
+                const float inv = e8m0_inv_f32(sbv);
+                unsigned char* o = fq + (size_t)(rowbase + r) * (N >> 1) + ((n0 + c0) >> 1);
+                mpf4_b16 q;
+#pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    unsigned w = 0u;
+#pragma unroll
+                    for (int j = 0; j < 8; j++) w |= quant_fp4(bs[k * 8 + j] * inv) << (j * 4);
+                    q[k] = w;
+                }
+                mpf4_st16(o, q);
+                Cscale[(size_t)(rowbase + r) * (N >> 5) + ((n0 + c0) >> 5)] = sbv;
+            }
+        } else {
+            float* const part = (float*)Cout;
+#pragma unroll
+            for (int i = 0; i < SMa; i++)
+#pragma unroll
+                for (int j = 0; j < SNa; j++) {
+                    const unsigned nn =
+                        n0 + wn * (MPF4_BN / MPF4_WNc) + j * MFMA_N + mfma_acc_n(lane);
+                    if (nn >= N) continue;
+#pragma unroll
+                    for (int el = 0; el < 16; el++) {
+                        const unsigned rr =
+                            wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
+                        const unsigned pidx = row_partidx[rowbase + rr];
+                        if (pidx == PLOW_EXPERT_UNUSED) continue; /* pad row */
+                        part[(size_t)pidx * N + nn] = row_gate[rowbase + rr] * acc[i][j][el];
+                    }
+                }
+        }
+        __syncthreads();
+    }
+#undef C3_A_ISSUE
+#undef C3_B_ISSUE
+#undef C3_BLK_COMMIT
+#undef C3_COMMIT
 }
 #endif /* PLOW_HAS_MX_MMA */
 
