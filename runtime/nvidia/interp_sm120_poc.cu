@@ -1,7 +1,7 @@
 /* interp_sm120_poc.cu — proof-of-concept: the plow persistent on-device
  * interpreter, ported to NVIDIA consumer Blackwell (GB202, sm_120a).
  *
- * WHAT THIS PROVES (milestone M1, launch-model half — see the design notes):
+ * WHAT THIS PROVES (milestone M1, launch-model half):
  *   1. A single COOPERATIVE persistent grid (grid sized to occupancy, so every
  *      block is co-resident) can stay resident and walk a per-block packet
  *      stream — the CUDA analogue of interp.hip's "grid == CU count" model.

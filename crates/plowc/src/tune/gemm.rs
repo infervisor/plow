@@ -376,6 +376,20 @@ fn group_db_lists_render() -> bool {
     })
 }
 
+/// The ROCm install the harness is built and run against.
+///
+/// `ROCM_PATH` first because `/opt/rocm` is not reliably the install: an apt/versioned box has
+/// no such symlink at all, and this gfx942 box has an `/opt/rocm` that carries `bin` and neither
+/// `lib` nor `include` — the real tree is `/opt/rocm-7.2.4`. Both the compile (`-I`, `-L`) and
+/// the exec (`LD_LIBRARY_PATH`) read it from here so they cannot disagree.
+fn rocm_root() -> String {
+    std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into())
+}
+
+fn rocm_lib() -> String {
+    format!("{}/lib", rocm_root())
+}
+
 /// Build the host harness with the SYSTEM toolchain and a cleared environment.
 ///
 /// `env_clear` is correct HERE and wrong for emission (see the module docs): this links against
@@ -420,14 +434,8 @@ fn build_harness(root: &Path, obj: &Path) -> Result<PathBuf, Err> {
         // ROCM_PATH-relative, not hardcoded /opt/rocm: an apt/versioned install has no
         // /opt/rocm symlink and this build then dies on hsa/hsa.h — same treatment the
         // build scripts' bundler/readelf discovery already got.
-        .arg(format!(
-            "-I{}/include",
-            std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into())
-        ))
-        .arg(format!(
-            "-L{}/lib",
-            std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into())
-        ))
+        .arg(format!("-I{}/include", rocm_root()))
+        .arg(format!("-L{}", rocm_lib()))
         .args(["-lhsa-runtime64", "-lm"])
         .status()?;
     if !st.success() {
@@ -491,7 +499,12 @@ fn measure(
     cmd.env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", std::env::var("HOME").unwrap_or_default())
-        .env("LD_LIBRARY_PATH", "/opt/rocm/lib")
+        // ROCM_PATH-relative for the same reason `build_harness` already is: this box has an
+        // /opt/rocm with `bin` and nothing else — no `lib`, no `include` — and the real install
+        // is /opt/rocm-7.2.4. Hardcoding /opt/rocm/lib links the harness fine and then loses
+        // libhsa-runtime64.so.1 at exec time, which is a failure the campaign cannot recover
+        // from and could not previously be fixed from the caller's environment.
+        .env("LD_LIBRARY_PATH", rocm_lib())
         .env("PLOW_GEMM_JSONL", out);
     if let Ok(v) = std::env::var("ROCR_VISIBLE_DEVICES") {
         cmd.env("ROCR_VISIBLE_DEVICES", v);

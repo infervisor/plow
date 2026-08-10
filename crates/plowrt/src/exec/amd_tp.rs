@@ -68,7 +68,7 @@
 //! `#[cfg(feature = "cuda")]`, so there is no AMD serve path to hang a TP group
 //! off yet. The entry point is `plowrt amd-bench --tp N`, which reproduces
 //! `tp_decode.c` token-for-token — a CORRECTNESS oracle. Under the benchmark law
-//! any number from it is a **bring-up**
+//! (the benchmark law) any number from it is a **bring-up**
 //! number: headline comparisons come from `vllm bench serve` against the plowrt
 //! endpoint, same client for both engines, and this binary is banned from a
 //! table next to a vLLM number.
@@ -156,8 +156,8 @@
 //! per token, so on a model that decodes in ~1.5 ms rather than ~23 the same
 //! work is nearly half the token and every conclusion above flips — including
 //! the sign on (3), since the extra dispatch a deferred stream costs shrinks
-//! with it. The instrument is checked in for exactly that day;
-//! the design notes predicts 1.56 ms/token for a 12B at TP8.
+//! with it. The instrument is checked in for exactly that day; the design
+//! notes predict 1.56 ms/token for a 12B at TP8.
 //!
 //! # Where the margin is expected to come from
 //!
@@ -223,6 +223,13 @@ pub struct AmdTpGroup {
     /// from token one, and a scheme that armed at the END of the first window
     /// would serve `agree_every - 1` wrong tokens before looking.
     agree_tick: u32,
+    /// The decode program the LAST [`AmdTpGroup::submit_decode_batched`] launched — a rung of
+    /// the decode batch ladder (`PLOW_DECODE_BATCH_LADDER`), or the sole decode program.
+    ///
+    /// Carried rather than re-derived because `complete_decode` audits the gate expectations of
+    /// the program that actually ran, and submit/complete are separate calls by design (the
+    /// split is what lets the host do nothing between launch and drain).
+    cur_dp: usize,
 }
 
 impl AmdTpGroup {
@@ -459,6 +466,8 @@ impl AmdTpGroup {
             audit: !crate::config::RuntimeConfig::get().amd.tp_no_audit,
             agree_every,
             agree_tick: agree_every,
+            // Overwritten by the first submit; the widest rung is the safe pre-first-step value.
+            cur_dp: 0,
         })
     }
 
@@ -475,6 +484,25 @@ impl AmdTpGroup {
 
     pub fn n_gpu(&self) -> usize {
         self.ranks.len()
+    }
+
+    /// Task-9 differential counter audit: rank 0's end-state counters for `dp`.
+    pub fn ctr_snapshot(&mut self, dp: usize) -> Result<Vec<u32>> {
+        self.ranks[0].ctr_word0_snapshot(dp)
+    }
+
+    /// Task-9 round-7 data audit: rank 0's layer-0 KV slot head + named act tensors.
+    pub fn data_snapshot(
+        &mut self,
+        slot: usize,
+        kv_bytes: usize,
+        acts: &[&str],
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut out = self.ranks[0].snapshot_kv_slot(slot, kv_bytes)?;
+        for a in acts {
+            out.push(((*a).to_string(), self.ranks[0].snapshot_tensor(a)?));
+        }
+        Ok(out)
     }
 
     pub fn rank(&self, r: usize) -> &AmdEngine {
@@ -519,15 +547,29 @@ impl AmdTpGroup {
     /// `amd_bench`'s B=16 batched arm made (it compared every slot against slot 0 rather than
     /// against the first slot carrying its own prompt).
     pub fn decode_step_batched(&mut self, pos: &[u32], kvlen: &[u32]) -> Result<Vec<u32>> {
-        self.submit_decode_batched(pos, kvlen)?;
+        let dp = self.ranks[0].decode_prog();
+        self.decode_step_batched_at(pos, kvlen, dp)
+    }
+
+    /// [`Self::decode_step_batched`] on a NAMED decode rung — see `AmdEngine::decode_prog_for`.
+    pub fn decode_step_batched_at(
+        &mut self,
+        pos: &[u32],
+        kvlen: &[u32],
+        dp: usize,
+    ) -> Result<Vec<u32>> {
+        self.submit_decode_batched_at(pos, kvlen, dp)?;
         for e in &self.ranks {
             e.drain()?;
         }
+        // Only the rung's rows sampled; the reply still comes back `pos.len()` long so callers
+        // can index it BY SLOT, with the uncovered tail zeroed.
         let b = pos.len();
+        let rows = (self.ranks[0].prog_t(dp) as usize).min(b);
         let per_rank: Vec<Vec<u32>> = self
             .ranks
             .iter_mut()
-            .map(|e| e.read_sampled_batched(b))
+            .map(|e| e.read_sampled_batched(rows))
             .collect::<Result<_>>()?;
         for (r, ids) in per_rank.iter().enumerate().skip(1) {
             if ids != &per_rank[0] {
@@ -538,7 +580,9 @@ impl AmdTpGroup {
                 )));
             }
         }
-        Ok(per_rank.into_iter().next().expect(">=1 rank"))
+        let mut ids = per_rank.into_iter().next().expect(">=1 rank");
+        ids.resize(b, 0);
+        Ok(ids)
     }
 
     /// Dispatch one decode token on every rank and RETURN — no wait.
@@ -575,8 +619,19 @@ impl AmdTpGroup {
     /// `pos` and `kvlen` are per-sequence and may be RAGGED; every rank gets the same vectors,
     /// because TP replicates the residual and every rank runs all `B` sequences.
     pub fn submit_decode_batched(&mut self, pos: &[u32], kvlen: &[u32]) -> Result<()> {
-        use crate::obs::dstep;
         let dp = self.ranks[0].decode_prog();
+        self.submit_decode_batched_at(pos, kvlen, dp)
+    }
+
+    /// [`Self::submit_decode_batched`] on a NAMED decode rung of the ladder.
+    pub fn submit_decode_batched_at(
+        &mut self,
+        pos: &[u32],
+        kvlen: &[u32],
+        dp: usize,
+    ) -> Result<()> {
+        use crate::obs::dstep;
+        self.cur_dp = dp;
         for e in &mut self.ranks {
             dstep::timed(&dstep::PREPARE, || e.decode_prepare_batched(pos, kvlen))?;
             dstep::timed(&dstep::REARM, || e.rearm_prog(dp))?;
@@ -600,7 +655,7 @@ impl AmdTpGroup {
                 launched_at = Some(now);
             }
             let e = &mut ranks[i];
-            let k = e.decode_kernel();
+            let k = e.decode_kernel_for(dp);
             i += 1;
             e.enqueue(dp, k)
         })?;
@@ -655,7 +710,10 @@ impl AmdTpGroup {
             Ok(())
         })?;
         if self.audit {
-            let dp = self.ranks[0].decode_prog();
+            // The rung that actually launched, not the widest — a narrow rung emits fewer
+            // collectives and auditing it against the widest program's expectations would
+            // report a timeout on gates it never armed.
+            let dp = self.cur_dp;
             dstep::timed(&dstep::AUDIT, || {
                 self.group.audit_xctr(&self.gate_expect[dp])
             })?;
@@ -1020,8 +1078,8 @@ fn count_xgates(blob: &DevBlob) -> u32 {
     let mut top = 0u32;
     for p in &blob.progs {
         for d in &p.insts {
-            if d.op == DevOp::XReduce as u16 {
-                top = top.max(d.i[3] + 1); // one-shot: one gate, i3
+            if d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceAddNorm as u16 {
+                top = top.max(d.i[3] + 1); // one-shot: one gate, i3 (fused AddNorm form included)
             } else if d.op == DevOp::XReduceTwoShot as u16 {
                 // two-shot: reduce-scatter (i3) and all-gather (i4)
                 top = top.max(d.i[3] + 1).max(d.i[4] + 1);
@@ -1080,7 +1138,9 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
                 }
             };
             for d in &p.insts {
-                if d.op == DevOp::XReduce as u16 {
+                if d.op == DevOp::XReduce as u16 || d.op == DevOp::XReduceAddNorm as u16 {
+                    // One-shot rendezvous either way; the fused AddNorm form (116) signals
+                    // once per rank exactly like the standalone XReduce it replaces.
                     set(d.i[3], Some(n_gpu));
                 } else if d.op == DevOp::XReduceTwoShot as u16 {
                     set(d.i[3], Some(n_gpu));

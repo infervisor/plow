@@ -284,7 +284,7 @@ GEMM smem-staged epilogue + cluster multicast; fat per-layer packet fusion.
   no hidden in-model loss), fat ~30, FA 38, tail ~10, client 13. The last 65 ms
   to vLLM 175.5 = FA3-lite flash (-14) + GEMM TC 67→85% (-20) + fat fusion (-8)
   + launch amortization via cuGraph (-8) + margin. Designs in
-  the design notes "T28 design notes".
+  the "T28 design notes".
 
 **FINAL: fp8 240.1 ms (1.37x) | bf16 316.3 ms (1.58x) @4k.**
 

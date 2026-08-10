@@ -144,7 +144,7 @@ tick is **17.63 ms**, not 9–10 — the weight read is only ~half of the launch
 errors run opposite ways and the product lands inside the brief's stated "single-digit to low-teens
 percent" band, at the bottom of it.
 
-An earlier design note sized this at **~0.6% at 127k** by assuming
+An earlier design note (§1) sized this at **~0.6% at 127k** by assuming
 the tick is a ~1390 ms chunk. The chunk is ~220 ms at the deployed chunk-1024 ladder, so that
 figure is ~9× low. Neither estimate was measured; both are now superseded by 22.46 s.
 
@@ -193,7 +193,7 @@ latency-sensitive profile, not on this throughput cell.
 
 ## 5. Design, validated against the code (for whoever revisits this at short context)
 
-Fusion is the right architecture and pays on a *different* profile — the design notes sizes
+Fusion is the right architecture and pays on a *different* profile — the design notes size
 it at 9–12% at 2k/8k with high concurrency, where the prefill chunk is small and the decode launch
 is a comparable share of the tick. That case was not measured here. If it is built, the design below
 is what survives contact with the tree.
@@ -296,7 +296,7 @@ was measured end to end.
 What this cell is still bounded by has not changed since `gemma4-12b-longctx-5090.md` §6: the
 prefill GEMM at 38% of fp8 peak, and 8 × 27.2 s of prefill that no decode-side change can touch.
 Fusion is worth building for the short-context/high-QPS profile, where the design notes
-sizes it at 9–12% — **that shape has not been measured and is the open question this note leaves.**
+size it at 9–12% — **that shape has not been measured and is the open question this note leaves.**
 
 **The most valuable thing in this note is not the sizing.** It is that `main` has been silently
 corrupting every multi-launch fp8-KV prefill, and that the corruption presents as a 1.56× throughput

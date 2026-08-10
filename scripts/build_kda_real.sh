@@ -2,7 +2,7 @@
 # build_kda_real.sh — the Kimi-K3 KDA single-layer numeric gate.       [K3-KDA-GATE]
 #
 # Modelled on scripts/build_glm52_real.sh, including its two environment traps
-#:
+# (the design notes §0a):
 #   - the .co needs system ROCm, which `nix develop` BREAKS (GLIBC_2.38);
 #   - the host binary needs SYSTEM gcc in a scrubbed env, because nix's gcc bakes a RUNPATH to nix
 #     glibc while the ELF interpreter is the system one, and the result aborts as

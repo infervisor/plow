@@ -2,7 +2,7 @@
 
 Date 2026-07-22. Branch `c1t-tensorcore-bsweep` (based on `c1r-decode-occupancy`).
 Model gemma-4-12B, RTX PRO 6000 Blackwell (188 SM, 1535 GB/s achievable, L2 96 MiB).
-Plan the design notes. GPU RTX 13.0 toolchain, system nvcc.
+Per the design notes §C-1T. GPU RTX 13.0 toolchain, system nvcc.
 Sample: real gemma-4-12B layer-0 `down_proj` bf16 (112 MB), `EXP_BASE=109`, ratio 1.331×.
 Harnesses: `runtime/tests/sz_decomp_sm120.cu` (Thread 2), `runtime/tests/sz_tc_sm120.cu`
 (Thread 1). **All kernels bit-exact** (tc-sz output == tc-bf16 output, byte-identical; every

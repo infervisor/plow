@@ -7,7 +7,7 @@
 #
 # Every packet is compiled with the campaign's shipping flags:
 #   PLOW_UNISEG=1        mandatory — segmented programs trap the coarse-only
-# sm_120 interpreter
+#                        sm_120 interpreter (see the design notes)
 #   PLOW_NS_FULL_ABS=48  pairs with the GF_FULL=4 cubins below
 # fp8 packets additionally carry PLOW_FP8_HEAD (fp8 lm_head twin) — reported as
 # its own row, since vLLM's fp8 recipe keeps lm_head bf16.

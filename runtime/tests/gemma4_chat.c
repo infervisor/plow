@@ -64,7 +64,7 @@ typedef struct {
     void *d_inst, *d_stream, *d_sofs, *d_slen, *d_waits, *d_succs, *d_ctr;
     /* Segmented dispatch (derived from the stream, not stored in the blob): number of wave-class
      * segments and the wave count (8 or 4) of each. The host relaunches the interpreter once per
-     * segment on the matching code object. See the design notes */
+     * segment on the matching code object. See the design notes. */
     uint32_t n_seg;
     uint8_t seg_class[512];
     /* GLOBAL-QUEUE (Experiment E1): op-major stream + per-segment window bounds + per-segment
@@ -290,7 +290,7 @@ int main(int argc, char** argv) {
 
     /* Derive per-program segment metadata from the stream's seg tags (plowc wrote them; they are
      * not a separate blob field). n_seg = max seg + 1; a segment is wave-class 4 iff it holds a
-     * FlashPrefill, else 8. See the design notes */
+     * FlashPrefill, else 8. See the design notes. */
     for (uint32_t pi = 0; pi < B.h.n_prog; pi++) {
         Prog* g = &B.prog[pi];
         uint32_t ns = 1;

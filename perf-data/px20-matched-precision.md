@@ -467,9 +467,9 @@ kernel arm that does not exist yet.
    `|| in->op == PLOW_DOP_HEADNORM_ROPE_FP8` and `|| in->op == PLOW_DOP_FLASH_PREFILL_FP8` to the
    two loops (lines 788/790 and 880/882). **Not fixed here** — this is a measurement task, and
    changing the harness would invalidate the binaries PX-8's numbers came from.
-2. **`origin/worktree-plowrt-max-completion-tokens` does not compile with `--features cuda`.**
+2. **The completion-tokens branch does not compile with `--features cuda`.**
    `crates/plowrt/src/exec/gpu.rs` carries committed conflict markers (`<<<<<<< HEAD` … at line
-   2506) from the `agent-acfa45450cb637150` merge, inside a comment block. Only the `cuda` feature
+   2506) from an earlier merge, inside a comment block. Only the `cuda` feature
    compiles that path, so a default `cargo build` passes and the served binary does not exist.
    Resolved in this worktree (comment text merged, no semantic change).
 

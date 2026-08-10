@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # kimi_k3_prep.py — HOST WEIGHT-PREP for Kimi-K3 (moonshotai/Kimi-K3), the analogue of
-# scripts/glm52_prep.py. See the design notes for the design this implements.
+# scripts/glm52_prep.py.  See the design notes for the design this implements.
 #
 # THE CHECKPOINT (measured, not assumed — 44/96 shards on disk 2026-07-28):
 #   96 shards, ~1.59 TB projected (NOT the 618 GB in the original brief).  Roughly one layer per
@@ -39,7 +39,7 @@
 #     reads them from the original snapshot.  `--experts verbatim` copies them anyway, for a
 #     single-layer bring-up fixture.
 #
-#   * It does not emit a KDA layer's derived weights.  KDA semantics are owned by another component
+#   * It does not emit a KDA layer's derived weights.  KDA semantics are owned by another run
 #     (docs/kimi-k3-kda.md); this script passes KDA tensors through under their original names so
 #     that work is not pre-empted.
 #
@@ -392,7 +392,7 @@ def inspect(cfg, idx, present, total):
                   f"scale {sc} {'OK' if ok_s else f'EXPECTED {(n, k//cfg.group_size)}'} [N, K/{cfg.group_size}]")
         print("  E8M0 scales are BIASED BY 127 (knob-contract §2): neutral 127, byte 0 = 2^-127.")
         print("  Layout matches; NO REPACK is needed.  The MoE expert path already carries the")
-        print(" encoding (MoeEnc::Mxfp4=2, wave_dot_mxfp4 = w4a16) —")
+        print("  encoding (MoeEnc::Mxfp4=2, wave_dot_mxfp4 = w4a16) — see the design notes §4.")
 
     # Size accounting — the number that decides whether a full prep is even sensible.
     if present:
@@ -464,7 +464,7 @@ def prep_layer(cfg, idx, w, l, experts_mode):
         if cfg.mla_gate:
             w.add_raw(a_dst + "g_proj.weight", idx, a_src + "g_proj.weight")
     else:
-        # KDA: PASSTHROUGH under the original names.  Its semantics belong to another component
+        # KDA: PASSTHROUGH under the original names.  Its semantics belong to another run
         # (docs/kimi-k3-kda.md); inventing a derived form here would have to be redone.
         for t in KDA_TENSORS + ["g_proj", "o_proj"]:
             n = t if t in ("A_log", "dt_bias") else t + ".weight"

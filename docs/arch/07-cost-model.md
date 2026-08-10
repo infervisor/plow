@@ -37,31 +37,41 @@ flowchart TD
 
 ```rust
 pub struct CostModel<'a> {
-    spec: &'a GpuSpec,
-    pages: u64,               // total SRAM pages available
-    page_bytes: u64,          // bytes per page
-    available_pages: u64,     // after kernel reservation
+    pub spec: &'a GpuSpec,
+    pub sram: SramModel,   // paged SRAM budget (available bytes / page size)
+    pub elem_bytes: u64,   // staged operand element size (2 for bf16/f16)
+    pub buffering: u64,    // SRAM buffering depth (2 = double-buffer)
+    pub mma_dtype: MmaDtype, // matrix-engine operand dtype
+    pub split_k_max: u64,  // max split-K factor for small-M decode GEMMs
 }
 
 impl<'a> CostModel<'a> {
+    // Construction: `new` subtracts the kernel reservation; `with_available`
+    // takes an explicit post-reservation budget.
+    pub fn new(spec: &'a GpuSpec, page_bytes: u64) -> CostModel<'a>;
+    pub fn with_available(spec: &'a GpuSpec, available_bytes: u64, page_bytes: u64) -> CostModel<'a>;
+
     // GEMM tile enumeration and costing
     pub fn candidates(&self, g: GemmShape, policy: SramPolicy) -> Vec<TileShape>;
     pub fn gemm_cost(&self, g: GemmShape, tile: TileShape) -> Cycles;
     pub fn best_tile(&self, g: GemmShape, policy: SramPolicy) -> Option<(TileShape, Cycles)>;
-    
+
     // Flash attention tile enumeration and costing
     pub fn flash_candidates(&self, a: AttnShape, policy: SramPolicy) -> Vec<FlashTile>;
     pub fn flash_cost(&self, a: AttnShape, tile: FlashTile) -> Cycles;
     pub fn best_flash_tile(&self, a: AttnShape, policy: SramPolicy) -> Option<(FlashTile, Cycles)>;
-    
+
     // Row-wise op tiles
     pub fn best_row_tile(&self, r: RowShape, policy: SramPolicy) -> Option<(RowTile, Cycles)>;
-    
+
     // Utility
     pub fn passes(&self, tile: TileShape) -> u64;
     pub fn sram_pages(&self, tile: TileShape) -> u64;
 }
 ```
+
+The paged SRAM budget lives in `sram: SramModel` (available bytes divided by
+page size), not in bare `pages` / `available_pages` fields.
 
 ---
 
@@ -105,7 +115,7 @@ pub struct RowTile {
 
 ## Candidate Enumeration
 
-The [`candidates()`](../../crates/costmodel/src/lib.rs:115) function generates all legal tile shapes for a given problem:
+The [`candidates()`](../../crates/costmodel/src/lib.rs) function generates all legal tile shapes for a given problem:
 
 ```mermaid
 flowchart TD
@@ -193,35 +203,47 @@ Row ops (RMSNorm, SiLU, Softmax) are memory-bound: cost is proportional to data 
 ```rust
 pub struct GpuSpec {
     pub name: &'static str,
+    pub vendor: Vendor,
     pub arch: Arch,
+    pub compute_cap: (u32, u32),   // CUDA compute capability (or vendor equiv)
     pub sm_count: u32,
-    pub shared_mem_per_sm: u32,    // bytes
-    pub hbm_bandwidth: f64,        // GB/s
-    pub mma_throughput: u64,       // FLOPS at fp16
-    pub dma_engines: u32,
-    pub tmem_per_sm: u32,          // Blackwell only
-    pub l2_cache_bytes: u64,
-    // ... additional fields
+    pub sm: SmSpec,                // per-SM shared_mem, tmem, MMA capability
+    pub dsm: Option<DsmGrouping>,
+    pub l2: Bytes,
+    pub mem: MemorySpec,          // HBM bandwidth/capacity
+    pub copy_engines: u32,        // async DMA engines
+    pub interconnect: Option<Interconnect>,
+    pub chiplet: Option<ChipletGrouping>,
+    pub l2_partitioning: Option<L2Partitioning>,
+    pub clock_boost: Hertz,
 }
 ```
+
+Per-SM shared memory and TMEM live inside `SmSpec` (`spec.sm.shared_mem`,
+`spec.sm.tmem`); HBM bandwidth lives inside `MemorySpec` (`spec.mem`).
 
 ### Registry
 
 ```rust
-// Static hardware descriptors
-pub static H100_SXM: GpuSpec = GpuSpec { ... };
-pub static B200: GpuSpec = GpuSpec { ... };
-pub static RTX_6000_ADA: GpuSpec = GpuSpec { ... };
-pub static MI300X: GpuSpec = GpuSpec { ... };
-pub static MI350X: GpuSpec = GpuSpec { ... };
+// Const hardware descriptors
+pub const H100_SXM5: GpuSpec = GpuSpec { ... };
+pub const B200: GpuSpec = GpuSpec { ... };
+pub const RTX_5090: GpuSpec = GpuSpec { ... };
+pub const RTX_6000_PRO: GpuSpec = GpuSpec { ... };
+pub const RTX_4090: GpuSpec = GpuSpec { ... };
+pub const MI300X: GpuSpec = GpuSpec { ... };
+pub const MI350X: GpuSpec = GpuSpec { ... };
 ```
 
+All descriptors are collected in `hwspec::registry::ALL`.
+
 **Files:**
-- [`crates/hwspec/src/nvidia/h100.rs`](../../crates/hwspec/src/nvidia/h100.rs) — H100 SXM
-- [`crates/hwspec/src/nvidia/blackwell.rs`](../../crates/hwspec/src/nvidia/blackwell.rs) — B200
-- [`crates/hwspec/src/nvidia/ada.rs`](../../crates/hwspec/src/nvidia/ada.rs) — RTX 6000 Ada
-- [`crates/hwspec/src/amd/mi300.rs`](../../crates/hwspec/src/amd/mi300.rs) — MI300X
-- [`crates/hwspec/src/amd/mi350.rs`](../../crates/hwspec/src/amd/mi350.rs) — MI350X
+- [`crates/hwspec/src/nvidia/h100.rs`](../../crates/hwspec/src/nvidia/h100.rs) — H100 SXM5
+- [`crates/hwspec/src/nvidia/blackwell.rs`](../../crates/hwspec/src/nvidia/blackwell.rs) — B200, RTX 5090, RTX 6000 Pro
+- [`crates/hwspec/src/nvidia/ada.rs`](../../crates/hwspec/src/nvidia/ada.rs) — RTX 4090
+- [`crates/hwspec/src/amd/mi300.rs`](../../crates/hwspec/src/amd/mi300.rs) — MI300X, MI325X
+- [`crates/hwspec/src/amd/mi350.rs`](../../crates/hwspec/src/amd/mi350.rs) — MI350X, MI355X
+- [`crates/hwspec/src/registry.rs`](../../crates/hwspec/src/registry.rs) — `ALL` descriptor list
 
 ---
 
@@ -231,29 +253,37 @@ pub static MI350X: GpuSpec = GpuSpec { ... };
 
 ```rust
 pub struct Soc<'a> {
-    pub units: Vec<SocUnit<'a>>,
+    pub units: Vec<Unit<'a>>,
+    pub memory: MemoryModel,   // unified vs discrete address space
 }
 
-pub struct SocUnit<'a> {
-    pub spec: &'a GpuSpec,
-    pub sm_range: Range<u32>,   // SMs assigned to this unit
+pub struct Unit<'a> {
+    pub id: UnitId,
+    pub kind: UnitKind,        // Gpu | Npu | Cpu
+    pub weight: f64,           // relative throughput; regions sized ∝ weight
+    pub cm: CostModel<'a>,
 }
 ```
 
 A `Soc` models the full system:
-- Single GPU → `Soc { units: [SocUnit { spec: &H100 }] }`
-- 2×H100 NVLink → `Soc { units: [unit0, unit1] }`
-- Heterogeneous → `Soc { units: [gpu_unit, cpu_unit, dpu_unit] }`
+- Single GPU → `Soc::single(spec, page_bytes)` (one unit, unified memory)
+- Homogeneous multi-GPU → `Soc::homogeneous(...)`
+- Heterogeneous → units with mixed `UnitKind` and per-unit `weight`
+
+Today every unit is a GPU, so `partition_n` degenerates to one region covering
+the whole op.
 
 ### Multi-Unit Partitioning
 
 ```rust
-impl Soc {
-    pub fn partition_n(&self, n: u32) -> Vec<(UnitId, u32)>;
+impl<'a> Soc<'a> {
+    pub fn partition_n(&self, g: GemmShape) -> Vec<Region>;
 }
 ```
 
-Divides work along the N-axis proportional to each unit's throughput. For 2×H100: each gets N/2. For GPU+DPU: GPU gets 95%, DPU gets 5%.
+Divides work along the N (output-feature) axis proportional to each unit's
+`weight`. Each `Region` carries the assigned `unit`, its sub-`shape`, and the
+`n_start` offset.
 
 ---
 
@@ -283,25 +313,7 @@ The model's job is relative shortlisting, not an unqualified performance proof.
 No fixed “>90%” ranking-accuracy claim is made without a maintained validation
 set. Lean may prove that the minimum supplied finite cost was selected, but it
 cannot prove that a latency measurement predicts future hardware behavior.
-OLD
-replace_once($p,$old,$new);
-$old = <<'OLD';
-```rust
-pub fn kernel_reservation_bytes(arch: Arch) -> u64 {
-    match arch {
-        Arch::Hopper => 32 * 1024,     // 32KB for persistent kernel state
-        Arch::Blackwell => 48 * 1024,  // 48KB (larger tcgen05 state)
-        Arch::Ada => 16 * 1024,        // 16KB
-        Arch::Mi300 => 16 * 1024,      // 16KB
-        Arch::Mi350 => 16 * 1024,
-        _ => 16 * 1024,
-    }
-}
-```
 
-**Rationale:** The persistent kernel's interpreter warps consume a fixed SRAM footprint (stack, counter cache, instruction prefetch). This must be subtracted from the available budget *before* tile selection — otherwise the cost model would pick tiles that don't fit alongside the interpreter.
-OLD
-$new = <<'NEW';
 The current function applies a conservative per-architecture default. The
 target registry replaces this approximation with the measured resource
 envelope of the complete interpreter profile. A tile is legal only if the
@@ -309,22 +321,26 @@ compiled profile, not an abstract architecture label, fits.
 
 ### Decision: Kernel Reservation Subtraction
 
-**Chosen:** `available_pages = total_pages - kernel_reservation_pages(arch)`
+**Chosen:** `available = spec.sm.shared_mem - kernel_reservation_bytes(arch)`, then paged into the SRAM budget.
 
 ```rust
 pub fn kernel_reservation_bytes(arch: Arch) -> u64 {
     match arch {
-        Arch::Hopper => 32 * 1024,     // 32KB for persistent kernel state
-        Arch::Blackwell => 48 * 1024,  // 48KB (larger tcgen05 state)
-        Arch::Ada => 16 * 1024,        // 16KB
-        Arch::Mi300 => 16 * 1024,      // 16KB
-        Arch::Mi350 => 16 * 1024,      // 16KB
-        _ => 16 * 1024,
+        // Hopper: TMA descriptors + CTA barriers + smem_bar.
+        Arch::Hopper => 4 * 1024,
+        // Blackwell (consumer + datacenter): same TMA/barrier structure.
+        Arch::Blackwell => 4 * 1024,
+        // Ada Lovelace: no TMA; barriers + shared constants.
+        Arch::AdaLovelace => 2 * 1024,
+        // CDNA3 (MI300): LDS barrier slots + workgroup scratch.
+        Arch::CdnaV3 => 4 * 1024,
+        // CDNA4 (MI350): same fixed per-workgroup LDS cost as CDNA3.
+        Arch::CdnaV4 => 4 * 1024,
     }
 }
 ```
 
-**Rationale:** The persistent kernel's interpreter warps consume a fixed SRAM footprint (stack, counter cache, instruction prefetch). This must be subtracted from the available budget *before* tile selection — otherwise the cost model would pick tiles that don't fit alongside the interpreter.
+**Rationale:** The SM kernel reserves part of shared memory (barriers, TMA descriptors, LDS scratch) that is not available for operand tile staging. It is subtracted from `SmSpec.shared_mem` in the default [`CostModel::new`] path — otherwise the cost model would pick tiles that don't fit alongside the kernel's own footprint. The reservation is a fixed per-workgroup cost; it does not scale with LDS size, so it is a much smaller fraction on the larger CDNA4 (160 KiB LDS) part.
 
 ### Decision: Split-K for Small Batches
 

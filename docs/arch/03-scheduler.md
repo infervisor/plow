@@ -67,26 +67,32 @@ flowchart TD
 
 ```rust
 pub enum ResourceId {
-    Sm(usize, usize),    // (unit, sm_index)
-    Dma(usize, usize),   // (unit, engine_index)
-    Dpu(usize),          // DPU engine for RDMA
-    Host(usize),         // CPU thread (host coordination)
+    Sm(UnitId, SmId),    // (unit, sm index)
+    Dma(UnitId, usize),  // (unit, engine index)
+    Dpu(usize),          // node-level DPU engine (cross-unit RDMA / collectives)
+    Host(usize),         // node-level CPU thread (host coordination)
 }
 ```
+
+`UnitId` and `SmId` are `usize` aliases. SMs and DMA engines are per-unit; DPU
+engines and host threads are node-level (shared across all units).
 
 ### ResourceState
 
 ```rust
 pub struct ResourceState {
-    sm: Vec<IntervalSet>,       // one per SM — exclusive
-    dma: Vec<IntervalSet>,      // one per DMA engine — exclusive
-    dpu: Vec<IntervalSet>,      // one per DPU engine — exclusive
-    host: Vec<IntervalSet>,     // one per CPU thread — exclusive
-    hbm: BandwidthSet,          // HBM bandwidth — capacity
-    link: Vec<BandwidthSet>,    // per-link interconnect — capacity
-    sram: Vec<PagePool>,        // one per SM — paged allocation
+    sm: Vec<Vec<IntervalSet>>,  // [unit][sm]     exclusive (whole SM)
+    dma: Vec<Vec<IntervalSet>>, // [unit][engine] exclusive
+    dpu: Vec<IntervalSet>,      // node-level RDMA / collective engines
+    host: Vec<IntervalSet>,     // node-level CPU thread pool
+    hbm: Vec<BandwidthSet>,     // [unit]         capacity
+    link: BandwidthSet,         // aggregate interconnect capacity
 }
 ```
+
+`ResourceState` holds only the exclusive and capacity timelines. Per-page SRAM
+allocation is **not** a field here — it runs as a separate post-placement pass
+(`allocate_sram`, below), building one `PagePool` per SM on demand.
 
 ### The Two Primitives
 
@@ -101,60 +107,76 @@ pub struct IntervalSet {
 ```
 
 - **`overlaps(start, end)`** — does any reservation conflict?
-- **`earliest_free(after, dur)`** — first gap ≥ dur after cycle `after`
+- **`earliest_free(after, dur)`** — first gap ≥ dur after cycle `after` (a
+  single forward pass over the sorted reservations, entered via a
+  `partition_point` binary search past everything already behind the window)
 - **`reserve(start, dur)`** — claim `[start, start+dur)`
 
 This is the borrow checker's core: no two exclusive holds may overlap. An SM is a "place"; a task's execution is a "borrow".
 
 #### BandwidthSet (Capacity — fractional permissions)
 
+`BandwidthSet` stores a **stepwise aggregate-load profile**, not a list of
+reservations: `levels[i] = (t, load)` means the summed load is `load` on
+`[t, levels[i+1].0)`. The tail level is always 0 (every reservation ends), and
+the profile is anchored at `(0, 0.0)`.
+
 ```rust
 pub struct BandwidthSet {
-    res: Vec<(Cycle, Cycle, f64)>,  // [start, end), weight
+    levels: Vec<(Cycle, f64)>,  // (breakpoint, summed load on [t, next))
 }
 ```
 
-- **`peak(start, end)`** — maximum concurrent utilization in window
+- **`peak(start, end)`** — maximum concurrent utilization in window (binary
+  search + a walk over only the pieces inside the window)
 - **`capacity_ok(start, end, w, limit)`** — would adding `w` exceed `limit`?
-- **`reserve(start, end, w)`** — add a weighted hold
+- **`next_feasible(after, dur, w, limit)`** — earliest `t ≥ after` where adding
+  `w` over `[t, t+dur)` stays under `limit`; lets the scheduler jump straight to
+  a feasible window instead of probing
+- **`reserve(start, end, w)`** — add a weighted hold (splits the profile at the
+  window's breakpoints and raises the load between them)
 
-This models HBM bandwidth and interconnect links: multiple concurrent users are fine as long as their sum doesn't exceed capacity.
+This models HBM bandwidth and the interconnect: multiple concurrent users are fine as long as their summed load stays under capacity. The profile answers `peak` and `next_feasible` without rescanning every prior reservation.
 
 ---
 
 ## SRAM Page Pool
 
-**Module:** [`crates/schedule/src/resource.rs`](../../crates/schedule/src/resource.rs:26)
+**Module:** [`crates/schedule/src/resource.rs`](../../crates/schedule/src/resource.rs) (`PagePool`)
+
+Each page slot has its own exclusive timeline — the pool is a `Vec` of
+`IntervalSet`, one per page:
 
 ```rust
 pub struct PagePool {
-    pages: u64,
-    occupied: Vec<(Cycle, Cycle, Vec<usize>)>,
+    slots: Vec<IntervalSet>,
 }
 ```
 
-SRAM is managed as a **linear-scan page allocator**:
+SRAM is managed as a **linear-scan page allocator** (register-allocation shaped):
 
 1. Each SM has a fixed number of pages (computed from hardware SRAM size ÷ page_bytes)
 2. A tile's `sram_pages` demand must fit **simultaneously** with all other tiles live on that SM at that moment
-3. `allocate(start, end, need)` finds free page slots over the task's live interval
-4. If allocation fails → **spill** (the tile runs without on-chip staging)
+3. `allocate(start, end, need)` picks `need` specific slots each free over
+   `[start, end)`, reserving them
+4. If fewer than `need` slots are free → **spill** (returns `None`; the tile runs without on-chip staging)
 
 ### Working Set vs Output Pages
 
 ```rust
 pub fn allocate_with_working_set(
-    &mut self, start: Cycle, end: Cycle,
-    working: u64, working_end: Cycle,
-    output: u64, output_end: Cycle,
+    &mut self, start: Cycle,
+    end_compute: Cycle, working_pages: u64,
+    end_live: Cycle, out_pages: u64,
 ) -> Option<Vec<usize>>
 ```
 
-A tile has two page demands:
-- **Working set** (A/B staging): live only during compute — `[start, working_end)`
-- **Output pages** (C accumulator): live until last consumer reads — `[start, output_end)`
+A tile has two page demands, allocated from distinct slots and committed
+atomically (returns the **output** slot ids):
+- **Working set** (A/B staging): transient, live only during compute — `[start, end_compute)`
+- **Output pages** (C accumulator): live until last consumer reads — `[start, end_live)`
 
-This distinction enables temporal sharing: a working-set page freed at cycle 100 can be reused by another tile starting at cycle 100.
+This distinction enables temporal sharing: a working-set page freed at `end_compute` can be reused by another tile starting at that cycle. It also guarantees that during the compute window there is room for *both* groups at once, preventing the bug where A/B staging overflows behind still-live output pages.
 
 ---
 
@@ -162,33 +184,57 @@ This distinction enables temporal sharing: a working-set page freed at cycle 100
 
 **Module:** [`crates/schedule/src/passes.rs`](../../crates/schedule/src/passes.rs)
 
+Passes A and C are fused inside `list_schedule`; D and E run before it
+(`build_counters`); B, F, and G run after. Prefetch (`prefetch.rs`) and scope
+narrowing (`scope_narrow.rs`) are separate post-schedule modules.
+
 ### Pass A+C: Placement + Ordering (Fused)
 
-Placement and ordering are done together in the list scheduler:
+Placement and ordering are done together in the list scheduler (`list_schedule`):
 
 1. **Priority:** Critical-path length (longest remaining path to sink) → higher priority tasks scheduled first
-2. **Tie-breaking:** Out-degree (mobility) → shorter duration → lower task ID
-3. **Placement:** For each ready task, try all resources of its class; pick the one giving the earliest feasible start
+2. **Tie-breaking:** Out-degree (mobility) → shorter duration → lower task ID (encoded in `Prioritized`'s `Ord`)
+3. **Placement:** For each ready task, try all resources of its class (`choose_resource`); pick the one giving the earliest feasible start (`feasible_start` alternates the exclusive gap and the HBM/link capacity profile until both agree). A soft locality hint (`LOCALITY_SLACK`) prefers a predecessor's XCD/GPC when the start cost is within slack.
 
-### Pass B: Liveness
+### Pass B: On-Chip Memory Allocation
 
-Falls out naturally from start times + durations. A tile's "live range" is `[start, start + dur)` on its assigned resource.
+Runs after placement (`allocate_sram`, `allocate_tmem`). A tile's live range is
+`[start, start + dur)`; its output pages live until the last consumer *ends*.
+Two per-SM allocators run:
+- **SRAM pages** — `allocate_sram` groups compute tiles per SM and packs page slots over each tile's live interval (`allocate_with_working_set`). A tile that doesn't fit is a spill.
+- **TMEM columns** — `allocate_tmem` assigns each matmul tile its MMA-accumulator columns in the SM's Tensor Memory (Blackwell `tcgen05`; no-op where TMEM is absent). A column holds 128 f32; overflow is a `tmem_spill`.
 
 ### Pass D: Counter Clustering
 
-Groups dependency edges into counters. See [05-counter-system.md](05-counter-system.md).
+Groups dependency edges into counters (`build_counters`). `ClusterMode::Coarse`
+emits one counter per `(producer_node, consumer_node)` boundary;
+`ClusterMode::Fine` emits one per consumer tile, falling back to coarse for
+all-to-all boundaries. See [05-counter-system.md](05-counter-system.md).
 
 ### Pass E: Counter Scoping
 
-Assigns `Scope::IntraSm | IntraGpu | CrossUnit` based on placement. Same-SM → IntraSm (cheapest); same-GPU/different-SM → IntraGpu; different-GPU → CrossUnit.
+Assigned during clustering by `scope_of`: different unit → `CrossUnit`;
+same-node *and colocated* (pinned to one SM) → `IntraSm`; otherwise `IntraGpu`.
+A separate post-schedule pass (`scope_narrow::narrow_scopes`) then downgrades any
+`IntraGpu` counter whose producers and consumers all landed on the same SM to
+`IntraSm`, since actual placement is only known after scheduling.
 
 ### Pass F: Prefetch
 
-Emergent from the dependency-respecting schedule: DMA-in tasks are naturally scheduled before their consumer Compute tasks. The prefetch pass explicitly hoists them to overlap with prior compute.
+**Module:** [`crates/schedule/src/prefetch.rs`](../../crates/schedule/src/prefetch.rs)
+
+The dependency-respecting schedule already issues a DMA-in before its consumer,
+but `list_schedule`'s per-resource FIFO order can pin it behind unrelated tasks.
+`hoist_prefetches` reorders each stream so every `DmaIn` sits right after its
+last stream-local predecessor (position 0 if it has none), then recomputes
+starts — widening compute/DMA overlap while keeping the counter waits (and the
+happens-before proof) intact.
 
 ### Pass G: Packet Lowering
 
-Each placed, ordered task → one `Packet` struct with its counter wait/signal lists. Grouped by resource into streams.
+Each placed, ordered task → one `Packet` (`build_packets`) with its counter
+wait/successor lists, grouped by resource into streams. `emit.rs` lowers these
+further to the runtime `packet::Program` ABI.
 
 ---
 
@@ -198,34 +244,41 @@ Each placed, ordered task → one `Packet` struct with its counter wait/signal l
 
 ### Problem
 
-Assembly optimistically assigns `SramSameSm` handoffs for same-unit producer→consumer pairs. But SRAM is finite — if too many tiles' outputs are resident simultaneously, the page pool overflows.
+Assembly optimistically assigns `SramSameSm` hand-offs for same-unit producer→consumer pairs. But SRAM is finite — if a colocated producer's resident output plus its consumer's working set exceed one SM's page budget, they can't both live on that SM.
 
 ### Solution
 
 ```mermaid
 flowchart TD
-    A[Count resident pages from all SramSameSm handoffs]
-    A --> B{Total > SM page capacity?}
-    B -->|No| C[Accept: all handoffs fit]
-    B -->|Yes| D[Sort handoffs by cost delta ascending]
-    D --> E[Pop cheapest-to-demote handoff]
-    E --> F[Demote to Hbm: clear resident flags]
-    F --> G[Recalculate total]
-    G --> B
+    A[For each SramSameSm relaxable]
+    A --> B{producer_pages + consumer_pages > SM budget?}
+    B -->|No| C[Keep the same-SM default]
+    B -->|Yes| D[Pick cheapest non-same-SM alt from alts<br/>DSM preferred over HBM]
+    D --> E[Set locality req + flip resident flags on its DmaIn/DmaOut]
+    C --> F[Rebuild colocation groups from the hand-offs that stayed same-SM]
+    E --> F
 ```
 
-1. Computes resident-page sum from all `SramSameSm` handoffs
-2. If over capacity: sort by `alt_cost - default_cost` (cheapest demotion first)
-3. Greedily demote handoffs to `Hbm` until the budget fits
-4. Returns modified `(TileGraph, ConstraintSet)` with cleared `resident` flags
+The pass is **per-hand-off**, not a global budget loop:
 
-### Design Decision: Greedy Demotion Order
+1. For each `RelaxableHandoff` whose default is `SramSameSm`, compare the pair's
+   summed `sram_pages` against `pages_per_sm` for the producer's unit.
+2. If it fits, keep the default. If not, demote to the cheapest alternative in
+   `alts` that isn't `SramSameSm` (`min_by_key` on cost) — `Dsm`
+   (`SameDomain`, still resident) or `L2Local` (`SameL2Partition`, resident),
+   else `Hbm` (a round-trip).
+3. Update the pair's `LocalityReq` and flip the `resident` flags on the
+   corresponding `DmaIn`/`DmaOut` nodes.
+4. Rebuild `colocation_groups` (union-find) from the hand-offs that stayed
+   `SramSameSm`. Returns the modified `(TileGraph, ConstraintSet)`.
 
-**Chosen:** Sort by cost delta; demote cheapest-to-lose first.
+### Design Decision: Cheapest Feasible Alternative
 
-**Alternative:** ILP/branch-and-bound for globally optimal selection.
+**Chosen:** For each over-budget hand-off, demote to its cheapest realizable non-same-SM alternative independently.
 
-**Rationale:** The relaxation is a fallback for when the optimistic assembly over-committed SRAM. At the scale of typical layers (10-50 handoffs), greedy gives near-optimal results with O(n log n) complexity. ILP would dominate compile time for negligible improvement.
+**Alternative:** A global selection (ILP / branch-and-bound) over all hand-offs jointly.
+
+**Rationale:** The relaxation is a fallback for when the optimistic assembly over-committed one SM. Deciding each hand-off against its own pair budget is O(n) and near-optimal at the scale of typical layers; a global optimum would dominate compile time for negligible improvement.
 
 ---
 
@@ -233,25 +286,43 @@ flowchart TD
 
 **Module:** [`crates/schedule/src/expand.rs`](../../crates/schedule/src/expand.rs)
 
-The expand phase converts abstract TileNodes into concrete `Task`s with:
+The expand phase converts abstract TileNodes into concrete `Task`s:
 
 ```rust
+pub enum TaskKind { DmaIn, Compute, DmaOut, Host }
+
 pub struct Task {
     pub node: usize,          // index into TileGraph.nodes
     pub op: String,           // operation name
-    pub kind: TaskKind,       // Compute | TmaIn | TmaOut | Rdma | HostCoord
+    pub unit: UnitId,         // which SoC unit this belongs to
+    pub kind: TaskKind,
+    pub coord: Vec<i64>,      // this tile's grid coordinate
     pub dur: Cycle,           // execution duration (from cost model)
-    pub sram_pages: u64,      // working-set page demand
-    pub out_pages: u64,       // output page demand (live until consumer)
-    pub unit: usize,          // which SoC unit this belongs to
+    pub bytes: u64,           // per-tile transfer bytes (folded loads/stores for Compute)
+    pub tensor_bytes: u64,    // whole-tensor size (for the memory planner)
+    pub sram_pages: u64,      // working-set page demand (transient)
+    pub out_pages: u64,       // output page demand (live until last consumer)
+    pub tmem_cols: u64,       // MMA-accumulator columns (Blackwell tcgen05; 0 otherwise)
+    pub tensor: Option<String>,
+    pub cross_unit: bool,     // routed to a DPU over the interconnect
 }
 ```
 
+There are four task kinds — `DmaIn`, `Compute`, `DmaOut`, `Host`. (There is no
+separate `Rdma` kind: a cross-unit transfer is a `DmaIn`/`DmaOut` with
+`cross_unit = true`, which `choose_resource` routes to a DPU. `PacketKind`,
+the lowered form, does distinguish `Rdma`/`HostCoord`/`TmaIn`/`TmaOut`.)
+
 Key expansion rules:
-- `TileNode::DmaIn` → `Task { kind: TmaIn, dur: dma_cycles(...) }`
-- `TileNode::Compute` → `Task { kind: Compute, dur: passes * per_pass_cycles }`
-- `TileNode::DmaOut` → `Task { kind: TmaOut, dur: dma_cycles(...) }`
-- Resident DmaIn/DmaOut → `Task { dur: 0 }` (zero-cost fence)
+- `TileNode::DmaIn` → `Task { kind: DmaIn, dur: hbm_cycles(...) }` (or folded into the compute's `bytes` under `DmaModel::Collapsed` / an `inline_in` input — no separate task)
+- `TileNode::Compute` → `Task { kind: Compute, dur }` from the cost model, scaled by tile count under `PerOp`/`PerChunk` granularity
+- `TileNode::DmaOut` → `Task { kind: DmaOut, dur: hbm_cycles(...) }` (or folded into the epilogue under Collapsed / `inline_out`)
+- Resident (SRAM-hand-off) inputs/outputs emit no DMA task at all — ordering comes from a cross-op edge
+
+Granularity (`Granularity::PerTile | PerOp | PerChunk(k)`) controls whether each
+op expands to one task per tile, one task for the whole op, or one task per
+row-axis chunk. `expand_prefill_chunks` wraps the `PerChunk(k)` path for the
+double-buffered prefill kernel (see [13-prefill-chunking.md](13-prefill-chunking.md)).
 
 ---
 
@@ -283,6 +354,18 @@ they land at op/layer edges only because that is where flash sits; nothing is ha
 program with no class-4 op (e.g. decode) is a single segment and dispatches identically to the
 unsegmented path.
 
+**Deviation from implementation:** the two-way `wave_class` above is the design
+skeleton; the `wave_class` closure in `devbuild.rs::finish` carries more classes,
+gated by emit flags. A single-segment override (`uniseg`) forces class 8; the
+`FA512` modes give hd-256/512 FlashPrefill its own class 2; `FlashMlaPrefill`
+under `mla_v2` is class 4. The `seg_of` run-length recurrence and the soundness
+argument below are unchanged by the extra classes.
+
+When `PLOW_L2_PLACE` is set, the same `seg` field is repurposed to carry the
+per-slice **L2 domain** instead of the wave class, and `gq_seg_ofs` windows the
+global-queue stream by domain rather than by wave class — the wave-class meaning
+is byte-identical when L2 placement is off.
+
 ### Soundness (the segmentation theorem)
 
 Because segments partition the **topologically-ordered** stream, the no-deadlock invariant is
@@ -294,7 +377,7 @@ The **cost** side mirrors `collapse`'s contrapositive: a boundary *pays* only wh
 change lets an op run at a strictly better occupancy by more than the boundary's drain cost. Where
 neighbors share a class, no boundary is emitted (the run is maximal). The formal statement — validity
 (topological partition + dependency-preserving hand-off) and pays-iff-class-differs — is stated in
-[the design notes](../../the design notes) for mechanization alongside
+the design notes for mechanization alongside
 `collapse` in `CounterGranularity.lean`.
 
 ### Relation to MPK (arXiv 2512.22219)
@@ -316,20 +399,36 @@ notes in the cost-model doc).
 ```rust
 pub struct Machine {
     pub units: Vec<UnitHw>,
-    pub links: Vec<LinkClass>,
+    pub dpu_engines: usize,
+    pub host_threads: usize,
+    pub unified_memory: bool,
+    pub has_fast_interconnect: bool,       // NVLink / Infinity Fabric present
+    pub link_bytes_per_cycle: f64,         // interconnect capacity
 }
 
 pub struct UnitHw {
+    pub id: UnitId,
     pub sm_count: usize,
-    pub dma_engines: usize,
     pub pages_per_sm: u64,
-    pub tmem_cols: usize,          // Blackwell only
-    pub locality_domains: usize,   // GPC count / XCD count
-    pub locality_domain_sms: Vec<Vec<usize>>,
+    pub tmem_cols_per_sm: u64,             // Blackwell tcgen05 (0 elsewhere)
+    pub dsm_domains: usize,                // GPC / distributed-shared-memory grouping
+    pub sms_per_domain: usize,
+    pub chiplet_count: usize,              // L2-domain / XCD grouping
+    pub sms_per_chiplet: usize,
+    pub l2_partitions: usize,              // L2-slice grouping
+    pub sms_per_l2_partition: usize,
+    pub dma_engines: usize,
+    pub hbm_bytes_per_cycle: f64,          // HBM capacity limit
 }
 ```
 
-Built from `costmodel::Soc` + `Config`. Maps hardware topology to scheduling resources.
+Built from `costmodel::Soc` + `Config` (`Machine::from_soc`). Locality is
+tracked at three grain levels — DSM/GPC domains, chiplets/XCDs, and L2 partitions
+— which `locality_domain_of` / `locality_domain_sms` collapse into the unified
+"locality domain" the list scheduler uses for soft affinity (chiplet on MI300,
+GPC on H100/Blackwell, trivial on monolithic non-DSM dies). The interconnect is a
+single `LinkClass` per unit pair (`Unified` / `Fast` / `Slow`), computed by
+`Machine::link` rather than stored as a `Vec`.
 
 ---
 
@@ -401,17 +500,54 @@ Spills are a **correctness-preserving degradation**: the schedule remains valid,
 
 **Module:** [`crates/schedule/src/sim.rs`](../../crates/schedule/src/sim.rs)
 
-The `simulate()` function replays the schedule with counter semantics:
+The `simulate()` function replays the schedule as a longest path over two edge
+sets — resource-order edges (consecutive tasks on one resource) plus either
+direct data edges (**ideal**, perfect pipelining) or clustered-counter edges
+(**counter**, the real runtime). The gap between the two is the pipelining lost
+to coarse clustering.
 
 ```rust
 pub struct SimResult {
-    pub makespan: Cycle,
-    pub utilization: f64,
-    pub bottleneck: ResourceId,
+    pub makespan: Cycle,        // real, counter-gated
+    pub ideal_makespan: Cycle,  // perfect per-tile pipelining (dependency-gated)
+    pub busy: HashMap<ResourceId, Cycle>,  // per-resource busy cycles → utilization()
+    pub consistent: bool,       // replays to exactly schedule.makespan
+    pub cyclic: bool,           // counter graph has a cycle → would deadlock
 }
 ```
 
-This is used for:
-- Validating that counter gates don't deadlock
-- Measuring predicted utilization and identifying bottlenecks
-- Comparing schedule quality across configurations
+`clustering_overhead()` = `makespan − ideal_makespan`; `utilization(r)` derives
+from `busy`. This is used for:
+- Validating that counter gates don't deadlock (`cyclic`)
+- Checking the schedule replays to its costed makespan (`consistent`)
+- Measuring predicted utilization and the pipelining lost to clustering
+
+Peak HBM oversubscription is a separate check (`hbm_bandwidth_audit`, in
+`passes.rs`), which sweeps every HBM-touching task — including the transfer bytes
+folded onto compute tasks — for per-unit capacity violations the list scheduler's
+per-task reservation misses.
+
+---
+
+## HBM Memory Planner
+
+**Module:** [`crates/schedule/src/memory.rs`](../../crates/schedule/src/memory.rs)
+
+Where SRAM allocation packs on-chip page slots, this pass assigns every HBM
+buffer a byte **offset** in an arena and emits an `AddressMap` the runtime
+rebases to (compile-time layout, runtime addressing). Buffers are segregated by
+lifetime class into `[ Persistent | Static | RequestIo | Scratch | Growable… → ]`,
+so the growable region (KV cache) sits last and can extend into free HBM.
+
+- `BufClass::Scratch` (intermediate activations) is packed by a greedy
+  linear-scan first-fit planner — the same interval-conflict reuse as the SRAM
+  allocator, but in bytes: two scratch buffers share storage iff their live
+  intervals are disjoint.
+- Zero-copy **aliases** (reshapes, concat sub-regions) share a target's offset
+  and reserve no extra bytes; a chain resolves to a terminal root.
+- Multi-device: each device gets its own contiguous **segment** of the global
+  address space; a **replicated** tensor gets one physical copy per device.
+
+`plan_from_schedule` derives the buffer requests directly from a scheduled task
+graph (writers → Scratch, read-only leaves → Persistent, live intervals from the
+schedule's start times); KV/growable buffers are added by the caller.

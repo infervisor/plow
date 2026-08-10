@@ -195,7 +195,7 @@ fn an_unmeasured_shape_still_selects() {
 ///
 /// Every other rung at that shape is flat to within 2%; only the smallest tile moved. That
 /// tile is the one EVERY narrow shape selects — the 0.8–3.5%-of-peak routers and
-/// `kv_a_proj`s that the design notes calls the shape-coverage
+/// `kv_a_proj`s that the design notes §0-EXT-RESULT calls the shape-coverage
 /// disasters — so a regression in it is a regression in exactly the class plow is already
 /// worst at.
 ///
@@ -249,4 +249,119 @@ fn the_narrow_shapes_select_a_narrow_rung_and_follow_the_measurement() {
              scripts/rebench_tune_gemm.sh and `plowc tune ingest`."
         );
     }
+}
+
+/// The gfx942 cell must actually reach the compiler — the guard above only ever asked gfx950.
+///
+/// This test exists because the file it lives in mentioned `gfx950` eleven times and `gfx942`
+/// ZERO times, on a campaign that ships gfx942. `plowc tune status --gpu MI300X` on
+/// 2026-08-09 reported all 196 records in `amd/gfx942/mi300x` STALE — selection had been
+/// falling back to the analytical model for days, through every published measurement — and
+/// nothing was red, because the gfx950 tests kept passing on gfx950's data. A guard is only a
+/// guard for the configurations it enumerates.
+///
+/// The two shapes are GLM-5.2's own prefill projections, and they are the two the campaign
+/// actually measured (`lib.rs`: "GLM-5.2 came to have exactly two measured shapes (M=128
+/// N=256 K=6144, M=128 N=576 K=6144)"). Asserting on a shape nobody measured would pin a
+/// wish rather than a contract.
+///
+/// It separates the two failures the store can have, because they are different work orders:
+/// an EMPTY cell means the campaign never ran, while a cell with records and no usable ones
+/// means every record is stale and the campaign must be RE-run against the current object.
+#[test]
+fn gfx942_measurements_reach_the_compiler() {
+    if !probe_available_942() {
+        eprintln!(
+            "SKIP: cannot probe the gfx942 inventory (no hipcc) — refusing to assert the \
+                   analytical fallback as if it were the contract"
+        );
+        return;
+    }
+    devgen::set_amd_target_for("gfx942", "MI300X");
+
+    let cell = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tuning/amd/gfx942/mi300x/kernel_measurement.jsonl");
+    let on_disk = std::fs::read_to_string(&cell)
+        .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0);
+
+    // Shapes taken from the PUBLISHED CAMPAIGN, not from a code comment. The first version of
+    // this test pinned (128, 576, 6144) "GLM-5.2 kv_a_proj" out of a TP4-era note in lib.rs --
+    // and that shape DOES NOT EXIST in the shipping compile: TP8 shards the kv_a_proj into
+    // 128x512x6144 + 128x64x6144, so the guard was asserting on a shape the demand never asks
+    // about and would have reported 0 usable rungs forever, for the wrong reason.
+    //
+    // 2048x6144x256 is included deliberately: it is the largest disagreement the campaign found
+    // between the analytical model and the measurements (GEMM 192x256 at 74729 ns vs MED
+    // 128x128 at 55478 ns, 1.35x), so if measured selection ever stops reaching the compiler
+    // this is the shape that loses the most.
+    let shapes: &[(i64, i64, i64, &str)] = &[
+        (128, 256, 6144, "GLM-5.2 router/shared M=128"),
+        (128, 512, 6144, "GLM-5.2 kv_a_proj (TP8-sharded) M=128"),
+        (2048, 6144, 256, "GLM-5.2 M=2048 — the 1.35x disagreement"),
+    ];
+    let mut usable = 0usize;
+    for &(m, n, k, label) in shapes {
+        let r = gfx950_measured_rungs(m, n, k, Bf16);
+        eprintln!("  {label}: {r} usable rung(s)");
+        usable += r;
+    }
+    assert!(
+        on_disk > 0,
+        "tuning/amd/gfx942/mi300x holds NO records at all — the campaign was never ingested \
+         for this cell. Run: plowc --hf-dir <ckpt> ... tune gemm --obj <objdir> --samples \
+         <out.jsonl>, then plowc tune ingest."
+    );
+    // THE DECISION, not the lookup. `measured_rungs > 0` is NOT enough and asserting it is how
+    // this test first shipped: `select_kernel` uses measurements "only if EVERY candidate has
+    // one" (kernelcaps::select.rs:175), so a shape with 4 of 5 candidates measured falls back to
+    // the analytical model while every lookup still reports HIT. That is the live state on
+    // gfx942 as of 2026-08-09 -- the ingest rung table keys tiles to opcodes by GEOMETRY, and
+    // `Gemm` and `GemmC5` share 192x256x64 here, so all 48 timings landed on `GemmC5` and opcode
+    // 8 got zero records. A freshly published, wholly CURRENT campaign covering 48/48 demanded
+    // shapes emitted a packet BYTE-IDENTICAL to `--no-tuning`.
+    let mut decided = 0usize;
+    let mut by_measurement = 0usize;
+    for &(m, n, k, label) in shapes {
+        let tier = devgen::gfx950_prefill_tile_tier(m as u32, n as u32, k as u32, 304, Bf16);
+        let measured = tier == kernelcaps::CalibrationTier::SkuCalibrated;
+        eprintln!(
+            "  {label}: decided by {}",
+            if measured {
+                "MEASUREMENT"
+            } else {
+                "the analytical model"
+            }
+        );
+        decided += 1;
+        by_measurement += usize::from(measured);
+    }
+
+    assert!(
+        usable > 0,
+        "the gfx942 cell holds {on_disk} record(s) and the compiler can use NONE of them for \
+         GLM's own measured shapes: every record is STALE against the current build digest, so \
+         tile selection silently fell back to the analytical model and reports tier `portable` \
+         -- which is byte-identical to what it reports when nothing was ever measured. The \
+         staleness key is defines + toolchain + preprocessed-source digest, so ONE edit under \
+         runtime/amd/ re-stales the whole store. Re-run the campaign AGAINST THE SHIPPING \
+         OBJECT RECIPE (the defines participate in the digest, so a campaign run against a \
+         different -D set is stale on arrival), then plowc tune ingest. \
+         `plowc tune status --gpu MI300X` prints the digest census."
+    );
+    assert!(
+        decided > 0 && by_measurement == decided,
+        "{by_measurement} of {decided} tile decisions were made BY MEASUREMENT. The store has \
+         usable records for these shapes ({usable} rung(s) found by lookup) and selection STILL \
+         fell back to the analytical model -- which means the records do not cover every \
+         CANDIDATE, not that they are missing. Check the per-opcode census: \
+         `plowc tune status --gpu MI300X`, and compare the kernel_name histogram in \
+         tuning/amd/gfx942/mi300x/kernel_measurement.jsonl against the probed inventory. A rung \
+         with zero records disqualifies every shape it is a candidate for."
+    );
+}
+
+fn probe_available_942() -> bool {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    kernelcaps::dense_gemm_inventory(&root, hwspec::IsaLevel::Gfx942).is_ok()
 }

@@ -21,7 +21,9 @@
 | [10](10-implementation-status.md) | **Implementation Status** | What's built vs. planned |
 | [11](11-tuning-coverage.md) | **Tuning Coverage** | Per-family: distinct kernels, knobs, oracles, blockers |
 | [12](12-using-the-tuner.md) | **Using the Tuner** | `plowc tune`, reading the output, taking a measurement |
-| [architecture.md](architecture.md) | **Single-file reference** | Condensed full architecture |
+| [13](13-prefill-chunking.md) | **Prefill Chunking** | Bucket ladder, the ragged tail, ragged-M |
+| [14](14-amd-arch-divergence.md) | **AMD Arch Divergence** | gfx942 vs gfx950: one tree, what forks, the tripwire |
+| [architecture.md](architecture.md) | **Index / landing page** | Intro + linked table of contents for these chapters |
 
 ---
 
@@ -127,7 +129,7 @@ Every compiled schedule passes through Lean 4 theorem provers that verify partit
 graph LR
     subgraph plowc - Compile Time
         direction TB
-        A[frontend]
+        A[nn-graph]
         B[rewrite]
         C[costmodel]
         D[schedule]
@@ -166,7 +168,7 @@ graph LR
     M --> N --> O
 ```
 
-**Compile-time crates** (Rust): `frontend`, `rewrite`, `costmodel`, `schedule`, `packet`, `lean_verify`  
+**Compile-time crates** (Rust): `nn-graph` (frontend/graph IR), `rewrite`, `costmodel`, `schedule`, `packet`, `lean_verify`; plus `hwspec`, `kernelcaps`, and `tunedb` (hardware/kernel/tuning registries)  
 **Shared schema** (Rust): `plow-asset` — single source of truth for compiler↔runtime types  
 **Runtime host** (Rust): `plowrt` — HTTP server, mux, executor management  
 **Runtime device** (C/CUDA/HIP): `runtime/` — interpreter, dispatch table, vendor kernels
@@ -176,7 +178,7 @@ graph LR
 ## Data Flow Summary
 
 1. **Input:** HuggingFace model ID or `NetConfig` JSON
-2. **Frontend:** Resolves model → builds `nn_graph::Graph` specialized to shape bucket
+2. **Frontend (`nn-graph`):** Resolves model → builds `nn_graph::Graph` specialized to shape bucket
 3. **Rewrite:** Lowers to egglog, runs fusion rules to saturation, extracts `FusedGraph`
 4. **Bridge:** Converts `FusedGraph` → `LayerPlan` (named ops with shapes + operand wiring)
 5. **Assemble:** Lowers `LayerPlan` × `Soc` → `TileGraph` + `ConstraintSet`

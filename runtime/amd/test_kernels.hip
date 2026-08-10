@@ -256,7 +256,7 @@ GEMM_VARIANT(gemm_c9, 192, 128, 64)
  * 4-8%), the opposite of Qwen (K=2560). No single global winner. 256x256 stays the DEFAULT;
  * a Qwen prefill object should build with -DGM_BM=192. o_proj/down (N=2560) are additionally
  * FILL-limited (62.5% at BN=256) where 128x384 helps — a per-shape tile-slot job
- *. Compile-time-K specialisation was a WASH (+0.4%). These
+ * Compile-time-K specialisation was a WASH (+0.4%). These
  * variants are kept as the calibration set the picker's per-shape sweep draws from. */
 
 /* The default the interpreter carries. */
@@ -293,7 +293,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void gemma
  * absmax/round path that produces it. (The GEMM itself is already covered by gemm_fp8_c0, whose
  * 256/256/64 tile is the one the interpreter carries.) */
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void d_quant_fp8_k(
-    unsigned char* xq, const bf16* x, float* ascale, unsigned M, unsigned K) {
+    unsigned char* xq, bf16* x, float* ascale, unsigned M, unsigned K) {
     d_quant_fp8(xq, x, ascale, M, K, blockIdx.x, gridDim.x);
 }
 
@@ -613,7 +613,7 @@ GEMV_VARIANT(gemma_gemv_m16, 16)
  * macro of the object and the K-unroll is a runtime branch inside the kernel. They exist to
  * produce the M CURVE at the shapes the compiler actually asks for, which is the only thing
  * that can price the two OBJECT-level decisions: which `PLOW_GEMV_MM`, and whether the walk
- * is on. the design notes has the endpoint of that curve as aggregate tok/s
+ * is on. The design notes §6g-BATCH has the endpoint of that curve as aggregate tok/s
  * (57.9 / 106.5 / 141.7 / 202.3 / 142.4 at B=1/2/4/8/16, so B=8 is the peak and B=16 a 30%
  * regression); this is the per-shape decomposition underneath it.
  *
@@ -1034,6 +1034,51 @@ extern "C" __global__ __attribute__((flatten)) __launch_bounds__(PLOW_THREADS, P
                                                     n_batch, n_head, kv_stride, /*window=*/0, scale,
                                                     nsplit, PLOW_KV_MASK_NONE, blockIdx.x,
                                                     gridDim.x, lds, idx, top_k);
+}
+
+/* ===== DSA sparse PREFILL indexer (ops 117/118), isolated for the indexer microbench.
+ * These mirror exactly what interp.hip dispatches for PLOW_DOP_INDEX_SCORE_PF /
+ * PLOW_DOP_INDEX_SELECT_PF, with blockIdx.x standing in for the interpreter's `slice` and
+ * gridDim.x for `nblk` (the same substitution index_score_mfma_128 already makes).
+ * `runtime/bench/interp/dsa_pf_indexer_bench.c` times and gates them. [GLM52-DSA-PF-IDX] */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index_score_pf_128(
+    float* Score, const bf16* Qidx, const bf16* Kidx, const bf16* W, const int* kv_len,
+    unsigned n_tok, unsigned kv_stride, float scale) {
+    d_index_score_pf<128, 32>(Score, Qidx, Kidx, W, kv_len, n_tok, kv_stride, scale, blockIdx.x,
+                              gridDim.x);
+}
+
+/* Row-resident rebuild of the same score (op 117 arm B): one WORKGROUP per 8-query pack, the
+ * query fragment register-resident for the whole causal row, keys streamed through LDS once
+ * per pack instead of once per (query, 32-key) work item. Bit-identical by construction. */
+#define IDXPF_ROW_ARM(NAME, TN)                                                                  \
+    extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void NAME(             \
+        float* Score, const bf16* Qidx, const bf16* Kidx, const bf16* W, const int* kv_len,      \
+        unsigned n_tok, unsigned kv_stride, float scale) {                                       \
+        __shared__ bf16 ktile[(TN) * (128 + FA_PAD)];                                            \
+        d_index_score_pf_row<128, 32, (TN)>(Score, Qidx, Kidx, W, kv_len, n_tok, kv_stride,      \
+                                            scale, blockIdx.x, gridDim.x, ktile);                \
+    }
+IDXPF_ROW_ARM(index_score_pf_row_128, 128u) /* 34,816 B LDS -> 1 WG/CU, 2 waves/SIMD */
+IDXPF_ROW_ARM(index_score_pf_row64_128, 64u) /* 17,408 B LDS -> 3 WG/CU, 6 waves/SIMD */
+
+/* op 118 baseline (7 passes) and the fewer-passes arm, same LDS footprint. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index_select_pf_k(
+    int* idx, const float* Score, const int* kv_len, unsigned n_tok, unsigned top_k,
+    unsigned kv_stride) {
+    __shared__ unsigned lh[SEL_NB];
+    __shared__ unsigned red[4];
+    d_index_select_pf<false>(idx, Score, kv_len, n_tok, top_k, kv_stride, blockIdx.x, gridDim.x,
+                             lh, red);
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4) void index_select_pf_fast_k(
+    int* idx, const float* Score, const int* kv_len, unsigned n_tok, unsigned top_k,
+    unsigned kv_stride) {
+    __shared__ unsigned lh[SEL_NB];
+    __shared__ unsigned red[4];
+    d_index_select_pf<true>(idx, Score, kv_len, n_tok, top_k, kv_stride, blockIdx.x, gridDim.x, lh,
+                            red);
 }
 
 #endif /* !PLOW_TK_SAFE_ONLY */

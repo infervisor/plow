@@ -44,6 +44,7 @@ impl EnvScope {
         for (k, v) in kv {
             std::env::set_var(k, v);
         }
+        resnapshot();
         EnvScope(saved)
     }
 }
@@ -56,5 +57,22 @@ impl Drop for EnvScope {
                 None => std::env::remove_var(k),
             }
         }
+        resnapshot();
     }
+}
+
+/// Re-read the environment into the active [`crate::emit_config::EmitConfig`].
+///
+/// REQUIRED after any mutation, and easy to forget. The knobs this module was written for
+/// used to be read live on every call, so setting the var WAS the whole operation. Most are
+/// now `EmitConfig` fields, and `emit_config::active()` caches — the first reader in the
+/// process pins the snapshot, so without this a scoped `set` would change the environment
+/// and nothing else.
+///
+/// That caching is correct for production (one `plowc --emit` process = one config, and an
+/// A/B arm is a separate process), and wrong only for the in-process case this module exists
+/// to serve. `install` is built for it: last call wins, and the leaked box is bounded by the
+/// number of scopes.
+fn resnapshot() {
+    crate::emit_config::install(crate::emit_config::EmitConfig::from_env());
 }

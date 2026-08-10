@@ -167,6 +167,7 @@ macro_rules! driver_api {
 
 driver_api! {
     cuInit: fn(u32) -> CUresult,
+    cuDriverGetVersion: fn(*mut i32) -> CUresult,
     cuGetErrorName: fn(CUresult, *mut *const c_char) -> CUresult,
     cuDeviceGet: fn(*mut CUdevice, i32) -> CUresult,
     cuDeviceGetName: fn(*mut c_char, i32, CUdevice) -> CUresult,
@@ -194,7 +195,7 @@ driver_api! {
         fn(CUfunction, u32, u32, u32, u32, u32, u32, u32, CUstream, *mut *mut c_void) -> CUresult,
     cuLaunchKernel:
         fn(CUfunction, u32, u32, u32, u32, u32, u32, u32, CUstream, *mut *mut c_void, *mut *mut c_void) -> CUresult,
-    // VMM surface (the design notes; probed by
+    // VMM surface (probed by
     // runtime/nvidia/experiments/vmm_probe.cu on this driver line). Present
     // since CUDA 10.2 — safe to resolve unconditionally.
     cuMemGetAllocationGranularity:
@@ -208,8 +209,7 @@ driver_api! {
     cuMemSetAccess: fn(CUdeviceptr, usize, *const CUmemAccessDesc, usize) -> CUresult,
     // D2D copy: VMM sliding-window restore + the prefix-attach copy baseline.
     cuMemcpyDtoD_v2: fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult,
-    // Async submission surface (the design notes
-    // submission path): one ordered stream per engine, async copies/memsets,
+    // Async submission surface: one ordered stream per engine, async copies/memsets,
     // events. All present since CUDA 4.0 — safe to resolve unconditionally.
     cuStreamCreate: fn(*mut CUstream, u32) -> CUresult,
     cuStreamDestroy_v2: fn(CUstream) -> CUresult,
@@ -494,6 +494,9 @@ pub struct CudaBackend {
     /// Handed to every owned `DeviceMem`; its Drop releases the primary ctx.
     freer: Arc<CudaFreer>,
     pub device_ordinal: u8,
+    /// `cuDriverGetVersion` (e.g. 12080 = CUDA 12.8) — the load-time ceiling
+    /// on cubin toolkit versions; surfaced in the `module_load` error.
+    driver_version: i32,
     name: String,
     sm_count: u32,
     warp_size: u32,
@@ -608,6 +611,16 @@ impl CudaBackend {
         // GPU test).
         unsafe {
             check((api.cuInit)(0), "cuInit")?;
+            // The CUDA version this driver supports (e.g. 12080 = 12.8) — the
+            // ceiling on what cubins it will load. Kept for the module_load
+            // error path: a cubin from a newer nvcc fails there with the
+            // opaque CUDA_ERROR_INVALID_IMAGE, and the version is the fact
+            // that explains it.
+            let mut driver_version = 0i32;
+            check(
+                (api.cuDriverGetVersion)(&mut driver_version),
+                "cuDriverGetVersion",
+            )?;
             let mut dev: CUdevice = 0;
             check(
                 (api.cuDeviceGet)(&mut dev, device_ordinal as i32),
@@ -663,6 +676,7 @@ impl CudaBackend {
                 cc_major,
                 cc_minor,
                 coherent_host_dma,
+                driver = %format_args!("{}.{}", driver_version / 1000, (driver_version % 1000) / 10),
                 "CUDA device ready"
             );
             let api = Arc::new(api);
@@ -679,6 +693,7 @@ impl CudaBackend {
                 ctx: ctx as usize,
                 freer,
                 device_ordinal,
+                driver_version,
                 name,
                 sm_count,
                 warp_size,
@@ -1804,7 +1819,20 @@ impl Backend for CudaBackend {
         self.check(
             unsafe { (self.api.cuModuleLoadData)(&mut m, image.as_ptr() as *const c_void) },
             "cuModuleLoadData",
-        )?;
+        )
+        .map_err(|e| {
+            // The classic version trap reads as an opaque INVALID_IMAGE: state
+            // the driver's ceiling so it diagnoses itself (the sm90a build
+            // script's header documents exactly this failure).
+            RuntimeError::Device(format!(
+                "{e} — this driver supports CUDA {}.{} at most; a cubin built by a \
+                 newer nvcc fails here with CUDA_ERROR_INVALID_IMAGE. Rebuild the \
+                 cubin with a toolkit the driver accepts (PLOW_NVCC), or upgrade \
+                 the driver.",
+                self.driver_version / 1000,
+                (self.driver_version % 1000) / 10
+            ))
+        })?;
         let id = self.next_module.fetch_add(1, Ordering::Relaxed);
         self.modules.lock().insert(id, m as usize);
         Ok(Module { id })

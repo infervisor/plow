@@ -50,8 +50,17 @@ static double now(void) {
     return t.tv_sec + 1e-9 * t.tv_nsec;
 }
 
+/* OVERRIDABLE, because these two constants are gfx950/MI355X numbers and this harness also runs
+ * on gfx942. On MI300X the honest denominators are the MEASURED pure-MFMA issue ceiling
+ * (937 TF/s bf16 -- runtime/ubench/GEMM_MFMA_SHAPE_VERDICT.md, not the 1307 datasheet peak) and
+ * 5300 GB/s of HBM3. Printing 1660/6200 there overstates the machine by ~1.77x on compute and
+ * ~1.17x on bandwidth. Defaults unchanged, so every published gfx950 record still reproduces. */
+#ifndef PEAK_TFLOPS
 #define PEAK_TFLOPS 1660.0
+#endif
+#ifndef HBM_GBPS
 #define HBM_GBPS 6200.0
+#endif
 
 /* Keep in sync with test_kernels.hip's GEMM_VARIANT list. Symbol lookup failing is the
  * signal that a variant is not compiled, so an entry costs nothing when absent. */

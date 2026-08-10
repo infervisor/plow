@@ -1,5 +1,7 @@
 # Fusion review, op 115, and the batch×ctx crossover sweep (Gemma-4-12B, MI300X)
 
+> **Scope:** 8x MI300X (gfx942, CDNA3, 304 CU, 8 XCDs, 64 KiB LDS, ROCm 7.2.4), Gemma-4-12B fp8 · **AMD-GENERAL** — the fusion mechanisms are arch-independent; the crossover POINTS are CDNA3 (they are set by MFMA rate vs memory rate, which CDNA4 changes).
+
 Date: 2026-08-06. Objects: `PLOW_OCC4=1 PLOW_L2HIER=1 bash scripts/build_gfx942.sh`
 at 4631d82 (the Q-staging fix — see below). Blob: the cap recipe
 (`PLOW_FP8=1 PLOW_W8A8=1 PLOW_L2_PLACE=1`, `--seq 128,512,1024 --batch 1`).
@@ -71,11 +73,30 @@ CSV is known to under-report by ~30% at the two points that could be checked.
 
 ## 3. batch sweep, ctx 1024 (per-request ITL = decode-step ms)
 
+> **RETRACTED 2026-08-08 for every plow row with `concurrency > 1`.** The `concurrency` column
+> here IS the decode batch B (the prose below reads it as `b=1→4→16`), and those blobs were
+> emitted before **2130f04**, when `devgen`'s `GM_LDS_HALVES` was the CDNA4 arena (73,728
+> halves) on every part instead of gfx942's occ4 15,360. The emitter therefore fused batches
+> the object could not stage — at `hidden = 3840`, everything up to M=19 onto 4 rows — and the
+> rows past the arena were written past the end of `plow_smem`. Fluent wrong text, no fault.
+>
+> **This section says out loud why it could not notice**: "the b=1 serve gate is the
+> correctness anchor". The b=1 arm was gated; the b=4 and b=16 arms were timing-only. A B=1
+> gate cannot certify a B>1 blob, exactly as a stored-asset gate cannot certify a fresh emit.
+>
+> Also retracted, same cause: **117 ms/step** (occ4 at MM=16) and the back-referenced
+> **63.6 ms @b16** in the note below.
+>
+> **NOT RE-MEASURED here.** Post-fix batched numbers live in `glm52-decode-batch-ladder.md`
+> §7/§11 and are served, gated, and much worse than these (corrected B=16 is 109.74 ms TPOT at
+> conc 1, vs the 45.9 claimed here) — so the verdict "batching is decisively vLLM's region"
+> happens to survive, but NOT on this evidence. The vLLM columns are unaffected.
+
 | concurrency | plow best | plow objects | vLLM | plow aggregate | vLLM aggregate |
 |---|---|---|---|---|---|
 | 1  | 11.96 | occ4          | 6.84  | 84 tok/s  | 146 |
-| 4  | 27.4  | occ4 (=occ2)  | 7.50  | 146 tok/s | 533 |
-| 16 | 45.9  | occ2, MM=16   | 10.99 | 348 tok/s | 1456 |
+| 4  | ~~27.4~~ **RETRACTED**  | occ4 (=occ2)  | 7.50  | ~~146 tok/s~~ | 533 |
+| 16 | ~~45.9~~ **RETRACTED**  | occ2, MM=16   | 10.99 | ~~348 tok/s~~ | 1456 |
 
 (occ4 at MM=16 is 117 ms/step — the 104-VGPR cap is a batch-1 profile; batch
 objects must be built without PLOW_OCC4. Prior-session 63.6 ms @b16 predates
@@ -84,10 +105,13 @@ blobs L2-place prefill packets, which the prefill objects don't dispatch —
 costs the −1.5% decode lever on these points only. Timing-only measurements
 (amd-bench); the b=1 serve gate is the correctness anchor.
 
-**Batching is decisively vLLM's region.** plow's decode step grows 12→27→46 ms
+**Batching is decisively vLLM's region.** ~~plow's decode step grows 12→27→46 ms
 over b=1→4→16 (the packet-serial chain re-pays per-sequence work: 16 KV rings
 through flash, wider staging) while vLLM amortizes to 10.99. plow's aggregate
-scales only 4.2× at b=16.
+scales only 4.2× at b=16.~~ **RETRACTED** — the 27 and 46 are wrong-math timings
+(see the block above), so the stated MECHANISM (per-sequence work re-paid) is
+not evidenced here either. The conclusion still holds on the corrected numbers
+in `glm52-decode-batch-ladder.md` §7/§11, by a wider margin.
 
 ## 4. Where plow gains — the answer
 

@@ -1,7 +1,0 @@
-# vLLM 0.26.0+rocm723 (pip, wheels.vllm.ai/rocm), torch 2.11.0, ROCm 7.2.4 runtime (apt),
-# MI300X GPU 0, 2026-08-06. Same methodology as the stored CSVs (vllm bench serve, random,
-# output-len 128, concurrency 1, num-prompts 3), measured INTERLEAVED with plow in the same
-# session (see plow-gfx942/fusion-review-and-crossover-sweep.md §15). 4 rounds each.
-input_len,concurrency,tpot_ms_r1,tpot_ms_r2,tpot_ms_r3,tpot_ms_r4,tpot_ms_mean
-4096,1,9.79,9.81,9.81,9.83,9.81
-8192,1,10.93,10.91,10.94,10.95,10.933

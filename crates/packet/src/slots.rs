@@ -136,7 +136,10 @@ const DOC: &[S] = &[
     S { op: DevOp::ArgmaxFin, t: &["ids", "part"], i: &["blocks", "n_batch"], f: &[], j: &[] },
     S { op: DevOp::GemvGlu, t: &["fu", "x", "W_gate", "", "", "W_up"], i: &["M", "N", "K", "", "", "act"], f: &["situ_beta", "situ_linear_beta"], j: &[] },
     S { op: DevOp::GemmGlu, t: &["fu", "x", "W_gate", "", "", "W_up"], i: &["M", "N", "K", "", "", "act"], f: &[], j: &[] },
-    S { op: DevOp::GemvQkv, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v"], i: &["M", "Nq", "K", "Nk", "Nv"], f: &[], j: &[] },
+    // t7 != NONE is the Q-NORM FOLD (AMD decode, PLOW_GLM_FUSE_QNORM): t1 becomes the RAW
+    // pre-norm activation and this packet computes the producing RmsNorm into its own LDS
+    // staging, with f0 = eps. See gemv_norm_lds in op_gemm.h.
+    S { op: DevOp::GemvQkv, t: &["q_out", "x", "W_q", "k_out", "W_k", "v_out", "W_v", "gamma?"], i: &["M", "Nq", "K", "Nk", "Nv"], f: &["eps"], j: &[] },
     // `i5=Ng` and `i6=W_g` are both REQUIRED, and `i6` is a TENSOR HANDLE, not a
     // number: nine pointers (four outputs, four weights, `x`) do not fit the
     // eight `t` slots of a fixed 64-byte instruction, so a WEIGHT was demoted —
@@ -156,6 +159,7 @@ const DOC: &[S] = &[
     S { op: DevOp::XReduce, t: &["out"], i: &["H", "n_gpu", "slot", "gate", "gslot?", "gcols?", "row_w?"], f: &[], j: &[] },
     S { op: DevOp::XArgmaxFin, t: &["ids", "local_part"], i: &["n_gpu", "", "slot"], f: &[], j: &[] },
     S { op: DevOp::XReduceTwoShot, t: &["out"], i: &["n", "n_gpu", "slot", "gate_rs", "gate_ag"], f: &[], j: &[] },
+    S { op: DevOp::XReduceAddNorm, t: &["out2", "xmid_out", "x", "gamma"], i: &["feat", "n_gpu", "slot", "gate"], f: &["eps"], j: &[] },
     S { op: DevOp::HeadNormRopeFp8, t: &["out", "", "", "", "", "", "scale"], i: &[], f: &[], j: &[] },
     S { op: DevOp::MoeRouter, t: &[], i: &["H", "n_exp", "k", "flags"], f: &["route_scale"], j: &[] },
     S { op: DevOp::MoeExpertGlu, t: &["fu", "x", "routing_table", "expert_weight_table"], i: &["slot", "I_moe", "H", "n_exp", "", "act"], f: &[], j: &[] },
@@ -167,13 +171,16 @@ const DOC: &[S] = &[
     S { op: DevOp::DenseGluFp8Blk, t: &["fu", "x", "Wg", "Sg", "Su", "Wu"], i: &["N", "K", "", "", "", "act"], f: &[], j: &[] },
     S { op: DevOp::MoeGroupGluFp8Blk, t: &["fu", "x", "routing_table", "expert_weight_table", "expert_scale_table"], i: &["k", "I_moe", "H", "n_exp", "", "act", "enc"], f: &["situ_beta", "situ_linear_beta"], j: &[] },
     S { op: DevOp::MoeGroupDownFp8Blk, t: &["part", "fu", "routing_table", "expert_weight_table", "expert_scale_table"], i: &["k", "H", "I_moe", "n_exp"], f: &[], j: &[] },
-    S { op: DevOp::FlashMlaDecode, t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len"], i: &["n_batch", "n_head", "kv_stride", "window", "nsplit", "kv_mask"], f: &["scale"], j: &[] },
+    S { op: DevOp::FlashMlaDecode, t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "qr_cos?"], i: &["n_batch", "n_head", "kv_stride", "window", "nsplit", "kv_mask", "qr_sin", "gf"], f: &["scale"], j: &[] },
     S { op: DevOp::OUvFold, t: &["O", "Olat", "Wuv"], i: &["n_batch", "n_head", "V"], f: &[], j: &[] },
     S { op: DevOp::FlashGatherDecode, t: &["Opart", "mlpart", "Qabs", "Qrope", "Ckv", "Krope", "kv_len", "idx"], i: &["n_batch", "n_head", "kv_stride", "", "nsplit", "kv_mask", "top_k"], f: &["scale"], j: &[] },
     S { op: DevOp::MoeRouterTopk, t: &["table", "logit", "", "bias"], i: &["", "n_exp", "k", "flags"], f: &["route_scale"], j: &[] },
     S { op: DevOp::MlaMergeFold, t: &["O", "Opart", "mlpart", "Wuv"], i: &["n_batch", "n_head", "V", "", "nsplit"], f: &[], j: &[] },
     S { op: DevOp::IndexScore, t: &["Score", "Qidx", "Kidx", "W", "kv_len"], i: &["n_batch", "index_heads", "kv_stride", "index_head_dim"], f: &["scale"], j: &[] },
     S { op: DevOp::IndexSelect, t: &["idx", "Score", "gHist", "gCtl"], i: &["len", "top_k"], f: &[], j: &[] },
+    S { op: DevOp::IndexScorePf, t: &["Score", "Qidx", "Kidx", "W", "kv_len"], i: &["n_tok", "index_heads", "kv_stride", "index_head_dim"], f: &["scale"], j: &[] },
+    S { op: DevOp::IndexSelectPf, t: &["idx", "Score", "kv_len"], i: &["n_tok", "top_k", "kv_stride"], f: &[], j: &[] },
+    S { op: DevOp::IndexUnionPf, t: &["union", "umask", "idx", "kv_len"], i: &["n_tok", "top_k", "kv_stride", "cap"], f: &[], j: &[] },
     S { op: DevOp::LayerNorm, t: &["out", "x", "gamma", "beta"], i: &["rows", "feat", "", "out_row0"], f: &["eps"], j: &[] },
     S { op: DevOp::MoeRouterGemma, t: &["table", "resid", "proj", "scale", "per_expert_scale"], i: &["H", "n_exp", "k"], f: &["root", "eps"], j: &[] },
     S { op: DevOp::MoeExpertGluGemma, t: &["fu", "x", "table", "ewt"], i: &[], f: &[], j: &[] },
@@ -196,11 +203,11 @@ const DOC: &[S] = &[
     S { op: DevOp::GemvArgmax, t: &["C", "x", "W", "part"], i: &["1", "N", "K", "", "a_row0"], f: &["cap"], j: &[] },
     S { op: DevOp::MoeGroupGluGemmaPfW8a8, t: &["fu", "xq8", "ewt", "meta", "row_token", "ascale", "est"], i: &["I_moe", "H", "n_exp", "", "", "act"], f: &[], j: &[] },
     S { op: DevOp::MoeGroupDownGemmaPfW8a8, t: &["part", "fu8", "ewt", "meta", "row_partidx", "row_gate", "est", "fscale"], i: &["H", "I_moe", "n_exp"], f: &[], j: &[] },
-    S { op: DevOp::MoeRouterTopkPf, t: &["table", "logit", "", "bias"], i: &["", "n_exp", "k", "flags", "T"], f: &["route_scale"], j: &[] },
+    S { op: DevOp::MoeRouterTopkPf, t: &["table", "logit", "atom_acc?", "bias"], i: &["atom_h", "n_exp", "k", "flags", "T"], f: &["route_scale"], j: &[] },
     S { op: DevOp::MoeAlignPf, t: &["meta", "table", "row_token", "row_partidx", "row_gate"], i: &["T", "n_exp", "k"], f: &[], j: &[] },
     S { op: DevOp::MoeGroupGluPf, t: &["fu_g", "xn2", "expert_weight_table", "expert_scale_table", "meta", "row_token"], i: &["I_moe", "H", "n_exp", "fp8", "", "act"], f: &[], j: &[] },
-    S { op: DevOp::MoeGroupDownPf, t: &["part", "fu_g", "expert_weight_table", "expert_scale_table", "meta", "", "row_partidx", "row_gate"], i: &["H", "I_moe", "n_exp", "fp8"], f: &[], j: &[] },
-    S { op: DevOp::MoeCombinePf, t: &["out", "residual", "shared?", "part"], i: &["H", "k", "T"], f: &[], j: &[] },
+    S { op: DevOp::MoeGroupDownPf, t: &["part", "fu_g", "expert_weight_table", "expert_scale_table", "meta", "", "row_partidx", "row_gate"], i: &["H", "I_moe", "n_exp", "fp8", "atom_ksh", "det_ksh"], f: &[], j: &[] },
+    S { op: DevOp::MoeCombinePf, t: &["out", "residual?", "shared?", "part"], i: &["H", "k", "T", "t_row0", "det"], f: &[], j: &[] },
     S { op: DevOp::KdaConv, t: &["out", "x", "w", "conv_state"], i: &["T", "conv_dim", "W", "act"], f: &[], j: &[] },
     S { op: DevOp::KdaGate, t: &["g", "beta", "g_raw", "beta_raw", "A_log", "dt_bias"], i: &["T", "H", "D", "gate_mode"], f: &["lower_bound"], j: &[] },
     S { op: DevOp::GemvMxfp4, t: &["C", "x", "W", "S"], i: &["M", "N", "K"], f: &[], j: &[] },

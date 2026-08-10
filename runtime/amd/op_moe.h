@@ -1,6 +1,6 @@
 /* op_moe.h — the MoE data-dependent counter-gate kernels (gfx950).
  *
- * the design notes§4, the design notes§3. Four ops implement the
+ * The design notes §3-§4, §2-§3. Four ops implement the
  * dispatch CORE: a router that writes a routing table, K expert-body slots that read it and
  * compute-or-skip (streaming ONLY the chosen experts' weights via a two-level pointer
  * indirection), and a deterministic combine. The interpreter's gate/signal loop is
@@ -515,6 +515,100 @@ __device__ __forceinline__ float wave_dot_fp8_blk(const bf16* x, const unsigned 
     return wave_sum(acc);
 }
 
+/* ---- OPT-IN (PLOW_MOE_DEC_X2=1): the fp8 twin of `wave_dot_mxfp4_x2`, for GLM-5.2 decode ----
+ *                                                                            [FP8-DECODE-X2]
+ * TWO INDEPENDENT WEIGHT STREAMS IN ONE WAVE. `wave_dot_fp8_blk` above walks its K chunks one
+ * load at a time: issue, `s_waitcnt vmcnt(0)`, dequant, dot, next. At GLM-5.2's TP8 routed
+ * geometry (K = H = 6144, step = 1024) that is SIX serial HBM round trips per output channel
+ * with ONE load in flight, and the megakernel's grid gives 8 waves/CU (2/SIMD) so there is
+ * nothing else on the SIMD to hide them behind. The traced cost is in
+ * `perf-data/plow-gfx942/glm52-decode-gemv-aiter.md`.
+ *
+ * The header of `wave_dot_fp8_blk` records that a UN-deep prefetch of the SAME stream was tried
+ * and regressed; this is the other axis and the one aiter actually uses (`fmoe pf3` keeps 13-39
+ * loads outstanding across partial waits). gate and up are DIFFERENT weights at the SAME output
+ * channel, so one wave can carry both: `2*UN` loads are issued before any is consumed, and the
+ * activation fragments are read ONCE and used twice. `wave_dot_mxfp4_x2` measured 1.44x for
+ * exactly this pairing on the fp4 twin; block-fp8 was left out of it only because GLM-5.2 had to
+ * stay byte-identical, which an opt-in build axis is the sanctioned way around.
+ *
+ * BIT-IDENTICAL to two separate `wave_dot_fp8_blk` calls: each accumulator sees the same chunk
+ * partials, in the same order, scaled by the same per-128-block scale, and reduced by the same
+ * `wave_sum`. UN>1 only reorders ISSUE, never accumulation: chunk c+u is still added at step
+ * c+u, and an overshoot chunk (k >= K) loads zeros through the buffer descriptor and adds an
+ * exact +0.0, which is what NOT running it would have done.
+ *
+ * `UN` should divide `nchunk` or the tail iteration does dead converts — the divisor rule from
+ * `gv_un_fp8` (op_gemm.h). GLM-5.2: nchunk = 6144/1024 = 6, and UN=3 divides it exactly. */
+/* Both DECODE axes default OFF: with them unset this file compiles to the byte-identical
+ * shipped bodies (the two helpers are templates, so an uninstantiated one emits nothing).
+ * `scripts/build_gfx942.sh` carries PLOW_MOE_DEC_X2 / PLOW_MOE_DEC_LG as decode-row build axes. */
+#ifndef PLOW_MOE_DEC_X2
+#define PLOW_MOE_DEC_X2 0
+#endif
+#ifndef PLOW_MOE_DEC_LG
+#define PLOW_MOE_DEC_LG 0
+#endif
+/* CEILING INSTRUMENT ONLY — see the block in `d_moe_expert_down_fp8_blk`. */
+#ifndef PLOW_MOE_DEC_ABL
+#define PLOW_MOE_DEC_ABL 0
+#endif
+/* UN=1 IS THE MEASURED DEFAULT, and the reason is the megakernel's register budget, not the
+ * dependency graph. In a standalone TU (`-Rpass` unconstrained) UN=3 compiles to the textbook
+ * aiter shape: 18 loads issued, ZERO `vmcnt(0)`, every wait partial (vmcnt(11)..vmcnt(1)). In
+ * `interp_decode_fp8_gq` — 108 VGPR, the union over every arm — the allocator cannot hold
+ * 2*UN fp8v16 fragments and RE-SERIALIZES, and the drains come back. Audited per chunk-PAIR in
+ * the shipped object (`_Z24d_moe_expert_glu_fp8_blk...`, llvm-objdump --mcpu=gfx942):
+ *
+ *   shipped (2 separate wave_dot_fp8_blk)  282 insts   8 gload   2 full vmcnt(0)
+ *   UN=1                                   241         6         1 full + 3 x vmcnt(1)
+ *   UN=2                                   236         6         4 full
+ *   UN=3                                   235         6         3 full
+ *
+ * So the pairing pays at UN=1 and the deeper unrolls give the drains straight back. Keep the UN
+ * parameter — the shape IS reachable and a future object with register headroom wants it — but
+ * ship the depth the 108-register object can actually hold. */
+#ifndef PLOW_MOE_DEC_X2_UN
+#define PLOW_MOE_DEC_X2_UN 1
+#endif
+template <unsigned UN = PLOW_MOE_DEC_X2_UN>
+__device__ __forceinline__ void wave_dot_fp8_blk_x2(const bf16* x, const unsigned char* W0,
+                                                    const float* S0, const unsigned char* W1,
+                                                    const float* S1, unsigned K, unsigned lane,
+                                                    float& o0, float& o1) {
+    const __amdgpu_buffer_rsrc_t r0 = buf_rsrc_fp8_u(W0, K);
+    const __amdgpu_buffer_rsrc_t r1 = buf_rsrc_fp8_u(W1, K);
+    const unsigned step = PLOW_WAVE * 16;
+    const unsigned nchunk = (K + step - 1) / step;
+    const unsigned KB = (K + 127u) >> 7;
+    const auto* const s0 = as_glob(S0);
+    const auto* const s1 = as_glob(S1);
+    float a0 = 0.0f, a1 = 0.0f;
+    for (unsigned c = 0; c < nchunk; c += UN) {
+        fp8v16 w0[UN], w1[UN];
+        /* every load of the group issued before ANY of them is touched: 2*UN outstanding */
+#pragma unroll
+        for (unsigned u = 0; u < UN; u++) w0[u] = buf_ld_fp8(r0, (c + u) * step + lane * 16);
+#pragma unroll
+        for (unsigned u = 0; u < UN; u++) w1[u] = buf_ld_fp8(r1, (c + u) * step + lane * 16);
+#pragma unroll
+        for (unsigned u = 0; u < UN; u++) {
+            const unsigned k = (c + u) * step + lane * 16;
+            unsigned kb = k >> 7;
+            if (kb >= KB) kb = KB - 1;
+            const unsigned kx = (k < K) ? k : 0u;
+            const bf16v8 xlo = ld_glob8(x + kx), xhi = ld_glob8(x + kx + 8); /* read once, used 2x */
+            bf16v8 wlo, whi;
+            fp8_to_bf16v8(w0[u], wlo, whi);
+            a0 += dot8(whi, xhi, dot8(wlo, xlo, 0.0f)) * s0[kb];
+            fp8_to_bf16v8(w1[u], wlo, whi);
+            a1 += dot8(whi, xhi, dot8(wlo, xlo, 0.0f)) * s1[kb];
+        }
+    }
+    o0 = wave_sum(a0);
+    o1 = wave_sum(a1);
+}
+
 /* MXFP4 (OCP e2m1 + one E8M0 scale per 32) wave-reduced dot of ONE output channel — the fp4
  * twin of wave_dot_fp8_blk, for the DECODE experts. [MXFP4-DECODE]
  *
@@ -722,6 +816,94 @@ __device__ __forceinline__ void wave_dot_mxfp4_lg2(const bf16* x, const unsigned
     o1 = b;
 }
 
+/* ---- OPT-IN (PLOW_MOE_DEC_LG=1): NARROW-K LANE-GROUP DOWN, block-fp8 decode experts ----
+ *                                                                       [FP8-DECODE-DOWN-LG]
+ * THE SHAPE THIS FIXES. `wave_dot_fp8_blk` gives ONE OUTPUT ROW to a whole 64-lane wave and
+ * hands lane L the 16 fp8 at k = 16*L. GLM-5.2 at TP8 routes DOWN with K = I_moe = 256, so
+ * only lanes 0..15 are in range: 48 of 64 lanes convert and dot bytes the buffer descriptor
+ * returned as zero, the wave's `buffer_load_dwordx4` covers 256 useful bytes of a 1024-byte
+ * request, and `wave_sum`'s first two butterfly steps add nothing. Then the row's whole cost is
+ * ONE dependent load -> wait -> dequant -> dot -> reduce chain, repeated H/(nblk*PLOW_WAVES) = 24
+ * times per wave with ONE load in flight. Traced on the box (a 32-CU expert slice, ctx 1024):
+ * 1613 CU-us for 49 KB of weights per workgroup, i.e. ~1 GB/s per CU and the LARGEST single
+ * packet in a GLM MoE layer at 45-55 us — more than o_proj, which moves EIGHT TIMES the bytes
+ * in 23 us.
+ *
+ * THE MAP. Split the wave into RG row-groups of LPG = 64/RG lanes; group `g` owns its own output
+ * row and lane `sub = lane%LPG` owns k = 16*sub. At RG=4 that is LPG=16 lanes x 16 fp8 = 256 K =
+ * exactly GLM's contraction, so every lane is live. Then UNR row-BATCHES are issued back to back
+ * before any is consumed, so RG*UNR rows — 12 at the defaults — are in flight at once, which is
+ * the one discipline the aiter/Tensile diff (`glm52-asm-innerloop-diff.md`) identifies as the
+ * real difference: 13-39 outstanding loads, not a leaner instruction mix. The rows of a pass are
+ * CONSECUTIVE, so each of the UNR loads is a fully-coalesced 1024-byte fetch of RG whole rows
+ * instead of a quarter-used one.
+ *
+ * BIT-IDENTICAL, by the same argument `wave_dot_mxfp4_lg2` makes: the set of (lane -> k) fragments
+ * for a row is unchanged, each row's partials are summed by the SAME xor-butterfly, and the two
+ * leading offsets the 64-lane `wave_sum` applies (32 then 16) add lanes that held an exact +0.0.
+ * The only observable difference is the SIGN of a zero result (-0.0 + 0.0 = +0.0), which the f32
+ * `MoeCombine` that consumes `part` cannot distinguish. Which wave owns which row also moves, and
+ * that is unobservable: `part_slot[h]` is written by exactly one lane either way.
+ *
+ * GUARDED to K <= LPG*16 (the whole contraction must fit one fragment per lane) and to a
+ * 16-multiple K; anything wider falls through to the shipped per-row walk, which is exact at any
+ * width. Weight rows are loaded as plain 16-byte global vectors rather than through a buffer
+ * descriptor because the row index is now LANE-VARYING — a `buf_rsrc` built from a divergent base
+ * compiles to a readfirstlane waterfall, which is the cost this arm exists to remove. The `live`
+ * guard is what the descriptor's bounds check was doing. */
+#ifndef PLOW_MOE_DEC_LG_RG
+#define PLOW_MOE_DEC_LG_RG 4
+#endif
+/* UNR=6 = 24 rows in flight, swept on the ISA in the shipped 108-VGPR object (per OUTPUT ROW,
+ * `_Z25d_moe_expert_down_fp8_blk...`; the shipped wave-per-row body is the first line):
+ *
+ *   shipped   142 insts/row   122 VALU/row   4.0 gload/row   2.00 full vmcnt(0)/row
+ *   UNR=2      35.0            28.5           0.75            0.63
+ *   UNR=3      34.2            27.6           0.67            0.50
+ *   UNR=4      33.4            27.2           0.63            0.44
+ *   UNR=6      32.7            26.8           0.58            0.375
+ *
+ * Monotone, VGPR flat at 108 the whole way, and 6 is where GLM-5.2 stops being arbitrary: at
+ * H=6144 over nblk*PLOW_WAVES = 256 waves it makes `ng` exactly 256, so every wave runs ONE
+ * balanced pass over 24 consecutive rows instead of a ragged 1-or-2. */
+#ifndef PLOW_MOE_DEC_LG_UNR
+#define PLOW_MOE_DEC_LG_UNR 6
+#endif
+template <unsigned RG, unsigned UNR>
+__device__ __forceinline__ void moe_down_lg_fp8_blk(const bf16* x, const unsigned char* W,
+                                                    const float* S, unsigned h0, unsigned H,
+                                                    unsigned K, unsigned KB, unsigned lane,
+                                                    float (&o)[UNR]) {
+    constexpr unsigned LPG = PLOW_WAVE / RG; /* lanes per row-group */
+    const unsigned g = lane / LPG, sub = lane % LPG;
+    const unsigned k = sub * 16u;
+    const bool live = (k + 16u <= K);
+    const unsigned kx = live ? k : 0u;
+    const unsigned kb = kx >> 7;
+    const auto* const Wg = as_glob(W);
+    const auto* const Sg = as_glob(S);
+    fp8v16 wv[UNR];
+    float bs[UNR];
+    /* RG*UNR consecutive rows, every load issued before any is consumed */
+#pragma unroll
+    for (unsigned u = 0; u < UNR; u++) {
+        const unsigned h = h0 + u * RG + g;
+        const unsigned hc = (h < H) ? h : (H - 1u); /* clamp: the caller drops the value */
+        wv[u] = ld_glob_fp8v16((const unsigned char*)(Wg + (size_t)hc * K + kx));
+        bs[u] = Sg[(size_t)(hc >> 7) * KB + kb];
+    }
+    const bf16v8 xlo = ld_glob8(x + kx), xhi = ld_glob8(x + kx + 8); /* read once, used UNR times */
+#pragma unroll
+    for (unsigned u = 0; u < UNR; u++) {
+        bf16v8 wlo, whi;
+        fp8_to_bf16v8(wv[u], wlo, whi);
+        float a = live ? dot8(whi, xhi, dot8(wlo, xlo, 0.0f)) * bs[u] : 0.0f;
+#pragma unroll
+        for (unsigned off = LPG / 2; off > 0; off >>= 1) a += __shfl_xor(a, (int)off, PLOW_WAVE);
+        o[u] = a;
+    }
+}
+
 /* ONE quantized-expert dot, encoding selected at runtime. PLOW_MOE_ENC_* as on ops 85/86.
  * `srow_f` is the block-fp8 scale row (f32), `srow_b` the MXFP4 E8M0 row; the caller passes
  * whichever its encoding uses and the other is ignored.
@@ -800,6 +982,14 @@ __device__ void d_moe_expert_glu_fp8_blk(bf16* fu, const bf16* x, const unsigned
              * `wave_dot_mxfp4_x2`, including why this pairing is MXFP4-only. */
             wave_dot_mxfp4_x2(x, Wg + (size_t)n * wstr, Bg + brow, Wu + (size_t)n * wstr,
                               Bu + brow, H, lane, g, u);
+#if PLOW_MOE_DEC_X2
+        } else if (enc == PLOW_MOE_ENC_FP8BLK) {
+            /* OPT-IN — gate|up as ONE loop with both weight streams in flight and the activation
+             * fragments read once. Bit-identical to the two calls below; see
+             * `wave_dot_fp8_blk_x2`. */
+            wave_dot_fp8_blk_x2<>(x, Wg + (size_t)n * wstr, Sg + nrow, Wu + (size_t)n * wstr,
+                                  Su + nrow, H, lane, g, u);
+#endif
         } else {
             g = wave_dot_enc(enc, x, Wg + (size_t)n * wstr, Sg + nrow, Bg + brow, H, lane);
             u = wave_dot_enc(enc, x, Wu + (size_t)n * wstr, Su + nrow, Bu + brow, H, lane);
@@ -861,6 +1051,45 @@ __device__ void d_moe_expert_down_fp8_blk(float* part, const bf16* fu, const uns
         }
         return;
     }
+#if PLOW_MOE_DEC_LG && !PLOW_MOE_DEC_ABL
+    /* OPT-IN — narrow-K lane-group arm. GLM-5.2 TP8 lands here (I_moe = 256 = LPG*16 at RG=4);
+     * anything wider falls through to the shipped per-row walk below. See `moe_down_lg_fp8_blk`. */
+    {
+        constexpr unsigned RG = PLOW_MOE_DEC_LG_RG, UNR = PLOW_MOE_DEC_LG_UNR;
+        constexpr unsigned LPG = PLOW_WAVE / RG;
+        if (enc == PLOW_MOE_ENC_FP8BLK && I_moe <= LPG * 16u && (I_moe & 15u) == 0u) {
+            const unsigned per = RG * UNR;
+            const unsigned ng = (H + per - 1u) / per;
+            const unsigned sub = lane % LPG, grp = lane / LPG;
+            for (unsigned f = slice * PLOW_WAVES + wave; f < ng; f += wstride) {
+                const unsigned h0 = f * per;
+                float o[UNR];
+                moe_down_lg_fp8_blk<RG, UNR>(fu_slot, Wd, Sd, h0, H, I_moe, KB, lane, o);
+                if (sub == 0u) {
+#pragma unroll
+                    for (unsigned u = 0; u < UNR; u++) {
+                        const unsigned h = h0 + u * RG + grp;
+                        if (h < H) part_slot[h] = gate * o[u];
+                    }
+                }
+            }
+            return;
+        }
+    }
+#endif
+#if PLOW_MOE_DEC_ABL
+    /* CEILING INSTRUMENT ONLY (PLOW_MOE_DEC_ABL=1|2) — WRONG OUTPUT BY CONSTRUCTION, never a
+     * serve asset. 1 = keep the walk and the store, delete every load and the dot (prices the
+     * body's memory + VALU); 2 = retire the op entirely (prices the packet: gate poll, L2
+     * maintenance, counter release, launch). The pair is what turns "the arm changed the ISA 4x
+     * and the packet did not move" from a puzzle into a located bottleneck. */
+    for (unsigned h = slice * PLOW_WAVES + wave; h < H; h += wstride) {
+#if PLOW_MOE_DEC_ABL == 1
+        if (lane == 0) part_slot[h] = gate;
+#endif
+    }
+    return;
+#endif
     for (unsigned h = slice * PLOW_WAVES + wave; h < H; h += wstride) {
         const float y = wave_dot_enc(enc, fu_slot, Wd + (size_t)h * wstr,
                                      Sd + (size_t)(h >> 7) * KB,
@@ -1376,23 +1605,336 @@ __device__ void d_moe_combine(bf16* out, const bf16* residual, const bf16* share
  * ========================================================================================== */
 
 /* Rows are padded to this per expert; the align op and both GEMMs must agree. See the tile
- * note above for why it is 64 and when to raise it. */
+ * note above for why it is 64 and when to raise it.
+ *
+ * MPF_BK is overridable (-DMPF_BK=32) for the BATCHED-DECODE object: the OCC4 decode arena
+ * is 30,720 B and the (64+256)*64 tile needs 40,960, so the decode row builds at BK=32 with
+ * MPF_DBUF=1 — (64+256)*32*2 = 20,480 B. Halving BK doubles the k-passes but each expert
+ * weight byte still crosses HBM exactly once, so the stream the grouped form exists to
+ * amortise is unchanged; BN (and with it SN, which the epilogue's initializers hardcode at
+ * 2) stays put. The #ifndef is digest-safe: unset, the preprocessed expansion is identical. */
+#ifndef MPF_BM
 #define MPF_BM 64
+#endif
 #define MPF_BN 256
+#ifndef MPF_BK
 #define MPF_BK 64
+#endif
 #define MPF_WM 2
 #define MPF_WN 4
 #define MPF_SM (MPF_BM / MPF_WM / MFMA_M) /* 1 */
 #define MPF_SN (MPF_BN / MPF_WN / MFMA_N) /* 2 */
 #define MPF_STRIDE MPF_BK
 #define MPF_TILE ((MPF_BM + MPF_BN) * MPF_STRIDE)
-/* Halves of LDS the grouped GEMM needs (double-buffered). 81920 B — comfortably inside the
- * interpreter's existing arena (147464 B), so this op does not move the union's high-water
- * mark and cannot change any other op's occupancy. */
-#define MPF_LDS_HALVES (2 * MPF_TILE)
+/* Halves of LDS the grouped GEMM needs. Double-buffered (81,920 B) where the arena holds two
+ * tiles — CDNA4's 160 KiB does. CDNA3's `plow_smem` is 64,512 B, and the OLD unconditional
+ * `2 * MPF_TILE` layout was a MEASURED out-of-bounds on gfx942: the second buffer's B tile
+ * spans bytes [49,152, 81,920), i.e. 17,408 B past the union and 16,384 B past the 64 KiB
+ * physical LDS, and a hardware probe (lds_oob_probe) shows accesses past the allocation do
+ * not round-trip on gfx942 — so the GLU arm's odd-k-tile `up` weights and most of DOWN's odd
+ * k-tiles read garbage, silently. Same fix as the Gemma twin (`GMPF_DBUF`): one buffer on a
+ * 64 KiB part, with the extra barrier the DB==1 commit needs. The static_assert in interp.hip
+ * (mirroring the GMPF one) is what keeps this true if either side moves. */
+/* Overridable (-DMPF_DBUF=1) for the batched-decode object: the selector below compares
+ * against PHYSICAL LDS, but the OCC4 decode arena is 30,720 B — smaller than physical — so
+ * the decode row pins DBUF=1 alongside its BN=128. Digest-safe like MPF_BN's guard. */
+#ifndef MPF_DBUF
+#if (2 * MPF_TILE * 2) <= PLOW_LDS_MAX_BYTES
+#define MPF_DBUF 2
+#else
+#define MPF_DBUF 1
+#endif
+#endif
+#define MPF_LDS_HALVES (MPF_DBUF * MPF_TILE)
 /* Same 16-byte-column XOR swizzle d_gemm_t uses, for the same reason: the compact BK-half row
  * stride is exactly 32 banks, so without it every row of a ds_read_b128 fragment collides. */
 #define MPF_XORSWZ(row, off) ((off) ^ (((row) & (MPF_BK / 8 - 1)) << 3))
+/* SUB-QUANTUM A TILE (the OCC4 batched-decode recut, BM=64/BK=32): BM*BK/THREADS = 4 halves
+ * per thread, below the one-16-byte-vector staging quantum — APT/8 truncates to zero and the
+ * unfixed loop stages NO A tile (the recorded silent-wrong failure). The arm keyed on this
+ * macro MASKS the pass instead of narrowing the quantum: the first BM*BK/8 threads — whole
+ * waves, the predicate is wave-uniform — each stage one full 8-half vector in one pass.
+ * Loads stay 16-byte and the swizzled LDS cell map is unchanged (element k still lands at
+ * cell k ^ ((row & 3) << 3); the XOR touches bits 3-4 only, so an aligned 8-half store spans
+ * the same cells at any BK >= 8). */
+#define MPF_SUBQ ((MPF_BM * MPF_BK / PLOW_THREADS) < 8)
+/* Preshuffled-B address for element k = k0 + (el % BK) of output row r (the PRESHUFFLED note
+ * in MPF_FETCH_B). At BK=64 the k0/el form is exact: k0 is 64-aligned and el % BK == el & 63.
+ * At BK < 64 odd k-tiles start MID-slab and el & 63 aliases thread parity into the byte
+ * index, so both the slab index and the byte offset must derive from the element k itself. */
+#if MPF_BK == 64
+#define MPF_SHUF_WP(wsrc, k0, el, kk, r) \
+    ((wsrc) + ((((size_t)(k0) >> 6) * N + (r)) << 6) + ((el) & 63u))
+#else
+#define MPF_SHUF_WP(wsrc, k0, el, kk, r) \
+    ((wsrc) + ((((size_t)(kk) >> 6) * N + (r)) << 6) + ((kk) & 63u))
+#endif
+
+/* PLOW_MOE_PF_PIPE — the aiter-shape two-tile REGISTER pipeline for the grouped prefill
+ * GEMM's k-loop (CDNA3 default ON; =0 restores the shipped single-stage loop verbatim).
+ *
+ * WHY (glm52-asm-innerloop-diff.md): the shipped loop's waits are DATAFLOW-FORCED — the
+ * loop-head loads feed the SAME iteration's single-buffer LDS commit, so the commit drains
+ * to vmcnt(0) 3-4x per k-tile while aiter's fmoe `pf3` sustains 13-39 outstanding loads
+ * with partial waits. No scheduler hint can fix a dependency (PLOW_MOE_PF_SCHED proved
+ * null by construction). This restructure changes the DATAFLOW instead: two register
+ * stages rotate so that when stage S commits to LDS, the OTHER stage's loads for the
+ * tile after next are already in flight — the commit's wait becomes a partial vmcnt by
+ * construction, not by hint. The fp8 dequant moves from fetch to commit for the same
+ * reason: converting at fetch anchors a VALU consumer next to the loads and re-forces
+ * the drain. Raw staging is also SMALLER (fp8 bytes: 16 dwords/stage vs 32 converted).
+ * Bit-identical: same bytes to the same LDS cells, same MFMA and promotion order.
+ * CDNA4 keeps its LDS ping-pong (DB==2) and is out of scope. */
+/* MEASURED PERFORMANCE-NEUTRAL, so DEFAULT OFF (opt-in build axis). The restructure DID
+ * land the aiter pipeline shape — ISA-confirmed: the B-weight loads for the next tile now
+ * issue before the current commit, so the MFMAs run against LDS with partial `lgkmcnt`
+ * waits between them instead of the old vmcnt(0) drain. But served TTFT is a wash
+ * (1040.5 vs 1044.1 @4k, 1929.3 vs 1929.7 @8k, bit-identical logits): the vmcnt(0) drains
+ * that remain in the big loop (39 per glu body) are the DEPENDENT A-GATHER loads
+ * (row_token[...] -> A row), which the asm diff mis-attributed to weight-stream depth.
+ * No register pipeline of the B stream removes a dependent gather. This confirms the D2
+ * triple-falsification at the ISA level: the grouped-MoE prefill pair is gather/scatter
+ * bound, not weight-pipeline bound. Kept as the documented restructure; the real MoE lever
+ * is a gather-hiding or scatter-reducing rewrite, not deeper B prefetch. */
+#ifndef PLOW_MOE_PF_PIPE
+#define PLOW_MOE_PF_PIPE 0
+#endif
+
+/* PLOW_MOE_PF_GH — GATHER HIDING for the grouped-prefill A-gather (opt-in build axis,
+ * default OFF; wired from scripts/build_gfx942.sh like PLOW_MOE_PF_SCHED / _PIPE).
+ *
+ * WHAT IT ATTACKS. The register-pipeline record above localized the pair's remaining
+ * `vmcnt(0)` drains to the DEPENDENT A-gather, and the ISA says exactly that: the shipped
+ * k-loop opens
+ *      flat_load_dword v14, v[182:183]   ; row_token[rowbase + r]
+ *      s_waitcnt vmcnt(0)                ; <-- FULL DRAIN, on one dword
+ *      v_mad_u64_u32 ... v14 ...         ; the A row address
+ *      global_load_dwordx4 ...           ; the A row itself
+ * once PER K-TILE. The index load and the data load it addresses cannot overlap — that is a
+ * true dependency — so every k-tile pays a whole round trip before its A row can even issue.
+ *
+ * WHY IT IS REDUNDANT WORK, NOT MERELY BADLY ORDERED WORK. `row_token[rowbase + r]` is
+ * K-INVARIANT: `r` is `threadIdx.x / (MPF_BK/8)` and `rowbase` is fixed for the output tile,
+ * so all NT k-tiles load THE SAME DWORD FROM THE SAME ADDRESS. LLVM cannot hoist it itself —
+ * the k-loop is fenced by `__syncthreads()`, a memory barrier the load may not move across.
+ * The MPF4 (a4w4) body already resolves its gather row once per tile for exactly this reason
+ * (see its `asrc_` note); this is that hoist applied to the bf16/fp8 body.
+ *
+ *   PLOW_MOE_PF_GH=1  hoist only. The index resolves ONCE per output tile; NT-1 dependent
+ *                     index loads and their `vmcnt(0)` drains disappear, and the A row
+ *                     address becomes a register-resident base for the whole k-loop.
+ *   PLOW_MOE_PF_GH=2  hoist + software pipeline. The one surviving index load is issued a
+ *                     full OUTPUT TILE ahead: tile i's head loads the indices tile i+nblk
+ *                     will gather with, so its latency is covered by tile i's entire k-loop
+ *                     and the next tile's gather issues from a register with no exposed
+ *                     wait. The prefetch is issued BEFORE the `wb0 == 0` EP skip so the
+ *                     pipeline stays in step across skipped tiles; `d_moe_align_pf`
+ *                     initialises row_token over the WHOLE padded range (`total_pad =
+ *                     tilep[n_exp] * MPF_BM`), so the read is in bounds for every tile index
+ *                     this loop can visit.
+ *
+ * VALUE-IDENTICAL at both levels: same addresses, same dwords, same A rows, same LDS cells.
+ * GLU arm only — DOWN's A row is `rowbase + r` with no indirection, so the hoist costs it
+ * nothing and changes nothing. */
+#ifndef PLOW_MOE_PF_GH
+#define PLOW_MOE_PF_GH 0
+#endif
+
+/* Both arms below stage/resolve A by ALL threads at the 8-half quantum (PIPE also hardcodes
+ * the BK=64 promotion cadence, kb = KTV >> 1), so they are refused with the sub-quantum tile
+ * rather than left silently wrong. Both are prefill-only opt-ins; the prefill tile is BK=64. */
+#if MPF_SUBQ && (PLOW_MOE_PF_PIPE || PLOW_MOE_PF_GH)
+#error "sub-quantum grouped-MoE A staging (MPF_SUBQ) does not support PLOW_MOE_PF_PIPE/GH"
+#endif
+#if PLOW_MOE_PF_PIPE && MPF_BK != 64
+#error "PLOW_MOE_PF_PIPE hardcodes the BK=64 promotion cadence (kb = kt >> 1)"
+#endif
+
+/* PLOW_MOE_PF_ATOMIC -- FUSE ops 86 -> 87 by ACCUMULATING the routed-expert outputs in place
+ * instead of materialising the per-slot `part` buffer (opt-in build axis, default OFF; wired
+ * from scripts/build_gfx942.sh like PLOW_MOE_PF_EPI, and additionally gated per-packet by
+ * `i[4]` so an object that HAS the arm still runs an unflagged blob verbatim).
+ *
+ * WHAT IT REMOVES. Today op 86 scatters `part[row_partidx[row]][H]` as f32 and op 87 reads all
+ * `k` slots of a token back to sum them. At T=8192, TP8, H=6144, k=8 that is
+ * `T*k*H*4` = 1.611 GB WRITTEN by 86 and 1.611 GB READ by 87, per layer per rank -- against a
+ * 2.848 GB pair footprint that does not even count 87's read. aiter's fused
+ * `fmoe_..._g1u1` never writes it: disassembling the shipped gfx942 object
+ * `fmoe_fp8_blockscale_g1u1_subGU_256.co` shows 96 `global_atomic_pk_add_bf16` and no
+ * intermediate scatter at all. This is that decomposition.
+ *
+ * WHY IT MUST BE AN ATOMIC AND NOT AN LDS BRIDGE. The k slots of one token are produced by k
+ * DIFFERENT experts, so in the expert-sorted row order they live in k different m-tiles and, in
+ * general, k different workgroups on k different CUs. No LDS is shared between them; the k-way
+ * reduction is inherently cross-workgroup. The only two implementations are a second pass (which
+ * is what op 87 IS) or a global atomic. See glm52-moe-fusion.md for the LDS arithmetic that also
+ * rules out the 85->86 bridge (it needs 73,728 B against a 64,512 B arena).
+ *
+ * THE DECOMPOSITION.
+ *   op 83 (router) zeroes `acc[T*H]` f32 as a grid-strided prologue -- 201 MB, ~59 us/layer at
+ *         stream rate, on a packet that already precedes align -> GLU -> DOWN.
+ *   op 86 (DOWN)   `atomicAdd(&acc[tok*H + nn], gate * value)` instead of the non-temporal store
+ *         to `part[pidx*H + nn]`. `pidx = tok*k + slot` by construction (d_moe_align_pf), so
+ *         `tok = pidx >> log2(k)` -- one shift, no extra load and no division. The arm therefore
+ *         requires a power-of-two k, which the emit side asserts.
+ *   op 87 (combine) is UNCHANGED code: it is emitted with `k = 1` against the same buffer, so it
+ *         reads ONE contiguous f32 stream instead of k streams at H*4 = 24 KB stride.
+ *
+ * WHY THIS IS NOT PLOW_MOE_PF_PART16 AGAIN. part16 halved the same stream's BYTES and measured
+ * ~0% (glm52-moepf-activation-arms.md) because it left the SHAPE alone: op 87 still issued k
+ * strided loads per output element and op 86 still issued one store per element. This changes the
+ * shape -- 87 goes from k=8 strided streams to one contiguous stream -- and that is a different
+ * hypothesis, not a repeat of a falsified one.
+ *
+ * NUMERICS: NOT bit-identical, and the class is stated plainly. The k slot values are summed in
+ * f32 (as today) but in NON-DETERMINISTIC ORDER (atomic arrival), where the shipped combine sums
+ * them in fixed slot order. Same precision, different association => differences at the f32 ulp,
+ * then rounded to bf16 for the layer output. This is a strictly gentler class than part16, which
+ * rounded every slot to bf16 BEFORE summing (and flipped top-1). It is also RUN-TO-RUN
+ * nondeterministic, which the shipped path is not. */
+#ifndef PLOW_MOE_PF_ATOMIC
+#define PLOW_MOE_PF_ATOMIC 0
+#endif
+/* The trailing argument, present only when the axis is compiled in — see the signature note. */
+#if PLOW_MOE_PF_ATOMIC
+#define MPF_ATOM_ARG , atom_ksh
+#else
+#define MPF_ATOM_ARG
+#endif
+
+/* PLOW_MOE_PF_DET -- the DETERMINISTIC form of the same 86->87 fusion (opt-in build axis,
+ * default OFF, mutually exclusive with PLOW_MOE_PF_ATOMIC).
+ *
+ * WHY IT EXISTS. PLOW_MOE_PF_ATOMIC's win is real and its numerics are not: the k slot values
+ * of a token are summed in f32 in ATOMIC ARRIVAL ORDER, so the arm is neither bit-identical to
+ * the shipped combine nor reproducible against ITSELF (glm52-moe-fusion.md 9). The trace also
+ * shows the atomic itself buys nothing -- it COSTS 44.8 us/layer -- and that the entire
+ * -980 us/layer lives in op 87 reading ONE accumulator stream instead of k slot streams. So the
+ * fusion does not need atomic ARITHMETIC; it needs a cross-workgroup accumulator whose value
+ * does not depend on arrival order.
+ *
+ * THE MECHANISM. f32 addition is commutative but NOT associative, which is the whole defect.
+ * INTEGER addition is both. So this arm accumulates each contribution as an INTEGER-VALUED f64
+ * -- rint(gate * value * 2^32) -- and adds it with a device-scope f64 atomic. Every partial
+ * sum is an integer of magnitude < 2^53, i.e. EXACT in f64, so every add is exact and the total
+ * is INDEPENDENT OF ARRIVAL ORDER by construction, not by luck. op 87 scales by 2^-32 on the
+ * way out. Run-to-run bit-reproducibility is therefore a property of the arithmetic, not of the
+ * scheduler.
+ *
+ * THE EXACTNESS BOUND, stated as an inequality rather than a hope. Contributions are clamped to
+ * +-MPF_DET_CLAMP = 2^17 before scaling, so |addend| <= 2^49 and the k-way total is bounded by
+ * k * 2^49 <= 2^53 for k <= 16 -- inside f64's exact-integer range. The emit refuses k > 16.
+ * Quantisation is 2^-32 = 2.3e-10 ABSOLUTE, against a layer output that is rounded to bf16
+ * (8 mantissa bits) two lines later; a contribution below ~1e-9 loses relative precision it
+ * could not have carried into the output anyway.
+ *
+ * WHAT IT IS NOT. It is NOT bit-identical to the shipped combine, and it cannot be: the shipped
+ * combine sums the k slots in SLOT order (router score rank), whereas any in-place accumulator
+ * receives them in ROW order (expert id). Those two orders are uncorrelated, and enforcing slot
+ * order across workgroups costs either a stall or the `part` DRAM pass this fusion exists to
+ * delete -- see glm52-moe-deterministic-writer.md for the arithmetic on both. What this arm
+ * gives up is bit-identity with a particular association; what it gains over the atomic arm is
+ * that its own result is FIXED. */
+#ifndef PLOW_MOE_PF_DET
+#define PLOW_MOE_PF_DET 0
+#endif
+#if PLOW_MOE_PF_DET && PLOW_MOE_PF_ATOMIC
+#error "PLOW_MOE_PF_DET and PLOW_MOE_PF_ATOMIC are two writers for one accumulator - pick one"
+#endif
+#if PLOW_MOE_PF_DET
+#define MPF_DET_ARG , det_ksh
+/* 2^32 as the fixed-point scale and 2^17 as the pre-scale clamp: see the exactness bound above.
+ * Both are exact powers of two, so the scale multiply and the op-87 unscale are exact. */
+#define MPF_DET_SCALE 4294967296.0
+#define MPF_DET_UNSCALE 2.3283064365386962890625e-10
+#define MPF_DET_CLAMP 131072.0f
+/* One contribution, in the fixed-point domain. The clamp is what makes the k-way bound above an
+ * inequality instead of an assumption; it is 2^17 against activations that live near 1, so it is
+ * a guard, not a transform. NaN clamps (IEEE maxNum returns the non-NaN operand) rather than
+ * poisoning the whole accumulator row -- which is a DIFFERENCE from the shipped path, and the
+ * only one that is not a pure re-association. */
+__device__ __forceinline__ double mpf_det_q(float v) {
+    return __builtin_rint((double)fminf(fmaxf(v, -MPF_DET_CLAMP), MPF_DET_CLAMP) * MPF_DET_SCALE);
+}
+#else
+#define MPF_DET_ARG
+#endif
+
+/* PLOW_MOE_PF_EPI — DOWN-EPILOGUE ROW-METADATA HOIST (opt-in build axis, default OFF;
+ * wired from scripts/build_gfx942.sh like PLOW_MOE_PF_SCHED / _PIPE / _GH).
+ *
+ * WHAT IT ATTACKS. Disassembled from the shipped megakernel
+ * (`interp_prefill_fp8_mla_moe.elf`, `_Z19d_moe_group_down_pf...` @ 0x38114), the DOWN
+ * per-output-tile epilogue `0x3b81c..0x3d730` is 1,310 instructions carrying 128
+ * `flat_load_dword` and 128 full `s_waitcnt vmcnt(0) lgkmcnt(0)` at MAX OUTSTANDING 1:
+ *      flat_load_dword v16, v[28:29]     ; row_partidx[rowbase + rr]
+ *      s_waitcnt vmcnt(0) lgkmcnt(0)     ; <-- FULL DRAIN, on one dword
+ *      v_cmp_ne_u32 -1, v16              ; the PLOW_EXPERT_UNUSED test
+ *      flat_load_dword v25, v[30:31]     ; row_gate[rowbase + rr]
+ *      s_waitcnt vmcnt(0) lgkmcnt(0)     ; <-- FULL DRAIN, on one dword
+ *      global_store_short ... nt         ; one output element
+ * repeated once per output ELEMENT (64 run, 64 sit in the other store-width branch).
+ *
+ * WHY IT IS REDUNDANT WORK. `row_partidx[rowbase + rr]` / `row_gate[rowbase + rr]` depend on
+ * neither k nor n: `rowbase` is the m-tile's padded row start and `rr < MPF_BM` is a pure
+ * lane/element function. The same MPF_BM = 64 rows -- 512 bytes -- are re-fetched once per
+ * element, for every one of the `tn = N/MPF_BN = 24` n-tiles of every m-tile. At T=8192 that
+ * is 27,648 output tiles x 64 = 1.77 M serialized dependent round trips per layer per rank.
+ * LLVM cannot hoist them itself: the k-loop between the address and the use is fenced by
+ * `__syncthreads()`, which the load may not move across.
+ *
+ * THE HOIST. `MPF_BM == PLOW_WAVE == 64`, so one wave holds the whole row block one row per
+ * lane. Lane L loads `(row_partidx[rowbase+L], row_gate[rowbase+L])` -- two coalesced
+ * wave-wide dwords, both in flight at once -- and the epilogue reads row `rr` back out of
+ * lane `rr` with `ds_bpermute_b32`. Wave-local: no LDS cell (the tile already sits at 64,560
+ * of 65,536 B), no barrier, and 2 loop-carried VGPRs rather than the 32 an
+ * `unsigned[16] + float[16]` per-element cache would cost at a 256-VGPR/occupancy-2 kernel.
+ * 64 exposed round trips per output tile -> 2, and at EPI=1 those 2 are issued before the
+ * k-loop so its NT k-tiles cover them.
+ *
+ *   PLOW_MOE_PF_EPI=1  hoist, issued at tile head (latency covered by the k-loop).
+ *   PLOW_MOE_PF_EPI=2  hoist, issued just before the epilogue. Same 64 -> 2 round-trip
+ *                      collapse with no value live across the k-loop -- the control for
+ *                      "did the 2 extra loop-carried VGPRs cost more than the hiding won".
+ *
+ * BYTE-IDENTICAL: the lanes collectively read exactly the address set the shipped epilogue
+ * read (rows `rowbase + 0 .. rowbase + MPF_BM-1`, which `d_moe_align_pf` initialises over the
+ * whole padded range), the same dwords reach the same elements, and the arithmetic is
+ * untouched. DOWN arm only -- GLU passes `row_partidx = row_gate = nullptr`. */
+#ifndef PLOW_MOE_PF_EPI
+#define PLOW_MOE_PF_EPI 0
+#endif
+#if PLOW_MOE_PF_EPI && (MPF_BM != PLOW_WAVE)
+#error "PLOW_MOE_PF_EPI assumes one wave covers the m-tile's rows (MPF_BM == PLOW_WAVE)"
+#endif
+
+/* PLOW_MOE_PF_EPI_SIB -- THE SAME HOIST AT THE TWO SIBLING SITES (opt-in, default OFF).
+ *
+ * `PLOW_MOE_PF_EPI` above acts on `d_moe_group_pf_t`, the grouped fp8/bf16 prefill GEMM GLM
+ * and DeepSeek run. TWO other DOWN epilogues in this file carry the IDENTICAL pattern --
+ * `row_partidx[rowbase + rr]` and `row_gate[rowbase + rr]`, both k- and n-invariant, re-read
+ * once per OUTPUT ELEMENT with a full `s_waitcnt vmcnt(0)` between each -- and were left alone
+ * when that landed:
+ *
+ *   * `d_moe_group_pf_a4w4` (PLOW_MOE_PF_A4W4, CDNA4 only -- gfx942 has no fp4 matrix core,
+ *     so this arm is NOT COMPILED on this box and cannot be measured here).
+ *   * `d_moe_group_gemma_pf_t` (ops 75/76 bf16 and 81/82 w8a8, the Gemma-4 MoE twin). Its
+ *     W8A8 arm reads a THIRD k/n-invariant per-row quantity, `ascale[rowbase + rr]`, so this
+ *     hoist takes all three: leaving one behind would leave the per-element drain in place and
+ *     the collapse would not happen.
+ *
+ * Mechanism, register cost, EXEC discipline and the byte-identity argument are all exactly the
+ * PLOW_MOE_PF_EPI note above -- read it, this is the same transform applied twice more. It is
+ * a SEPARATE flag so the GLM canonical object recipe (`PLOW_MOE_PF_EPI=1`) is unperturbed by
+ * a change to kernels GLM never dispatches.
+ *
+ * GATED ON THE MODEL THAT USES EACH PATH, not on GLM: neither site is on GLM's hot path. */
+#ifndef PLOW_MOE_PF_EPI_SIB
+#define PLOW_MOE_PF_EPI_SIB 0
+#endif
+#if PLOW_MOE_PF_EPI_SIB && (MPF_BM != PLOW_WAVE)
+#error "PLOW_MOE_PF_EPI_SIB assumes one wave covers the m-tile's rows (MPF_BM == PLOW_WAVE)"
+#endif
 
 /* meta layout (int32), written by d_moe_align_pf and read by both grouped GEMMs:
  *   [0, n_exp)              rowoff    padded gathered-row start of expert e
@@ -1414,7 +1956,46 @@ __device__ void d_moe_combine(bf16* out, const bf16* residual, const bf16* share
 __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, const float* bias,
                                      unsigned n_exp, unsigned k, unsigned flags, float route_scale,
                                      unsigned T, unsigned slice, unsigned nblk, float* lds,
-                                     unsigned n_group = 0, unsigned topk_group = 0) {
+                                     unsigned n_group = 0, unsigned topk_group = 0
+#if PLOW_MOE_PF_ATOMIC
+                                     ,
+                                     float* acc = nullptr, unsigned acc_n = 0
+#endif
+#if PLOW_MOE_PF_DET
+                                     /* PLOW_MOE_PF_DET: the same prologue against an f64
+                                      * accumulator -- 8 bytes per element, not 4. INSIDE the
+                                      * #if for the mangled-name reason the atomic arm records. */
+                                     ,
+                                     double* acc = nullptr, unsigned acc_n = 0
+#endif
+                                     ) {
+#if PLOW_MOE_PF_ATOMIC
+    /* PLOW_MOE_PF_ATOMIC: zero the [T,H] f32 accumulator op 86 will atomically add into. This
+     * packet is the earliest one in the MoE chain (router -> align -> GLU -> DOWN), so the
+     * existing dependency edges already order it; no new packet and no new gate. ~201 MB at
+     * T=8192/H=6144 = ~59 us/layer of pure stream, non-temporal because nothing reads these
+     * lines until op 87, a full 304-CU round later. The `acc == nullptr` case is every
+     * unflagged blob and compiles to the shipped loop with one predicated branch in front. */
+    if (acc) {
+        const size_t total = (size_t)T * acc_n;
+        for (size_t i = (size_t)slice * PLOW_THREADS + threadIdx.x; i < total;
+             i += (size_t)nblk * PLOW_THREADS)
+            __builtin_nontemporal_store(0.0f, as_glob(acc) + i);
+        __syncthreads(); /* the token loop below reuses `lds`; keep the phases separate */
+    }
+#endif
+#if PLOW_MOE_PF_DET
+    /* PLOW_MOE_PF_DET: identical prologue, f64 accumulator (402 MB at T=8192/H=6144 against the
+     * atomic arm's 201 MB -- the price of an order-independent accumulator, priced in the
+     * report). Non-temporal for the same reason: nothing reads these lines until op 87. */
+    if (acc) {
+        const size_t total = (size_t)T * acc_n;
+        for (size_t i = (size_t)slice * PLOW_THREADS + threadIdx.x; i < total;
+             i += (size_t)nblk * PLOW_THREADS)
+            __builtin_nontemporal_store(0.0, as_glob(acc) + i);
+        __syncthreads(); /* the token loop below reuses `lds`; keep the phases separate */
+    }
+#endif
     for (unsigned tok = slice; tok < T; tok += nblk) {
         /* slice=0 so the callee's single-workgroup guard passes; this workgroup owns `tok`. */
         d_moe_router_topk(table + (size_t)tok * k * 8, logit + (size_t)tok * n_exp, bias, n_exp, k,
@@ -1558,6 +2139,77 @@ __device__ __forceinline__ bf16v8 mpf_ld_w8(const unsigned char* p) {
     return fp8v8_to_bf16v8(ld_glob_fp8v8(p));
 }
 
+/* HALVED fp8 decode for the CDNA3 B stage — ASM-probed at 14 VALU per 4 bytes against the
+ * shipping plow_fp8x4_ocp_to_bf16 chain's 21: the OCP x2 is NOT applied here (gfx942's
+ * cvt_pk_f32_fp8 decodes FNUZ = OCP/2, and the promotion below folds the x2 into the block
+ * scale instead — one scalar mul per 128-K block, not one per weight), and the bf16 pack is
+ * one v_perm_b32 per pair instead of lshr+and+or. BIT-IDENTICAL end to end: e4m3/2 is exact
+ * in bf16 (exponent shift only), sum(w_i/2 * a_i) == sum(w_i * a_i)/2 exactly in f32 (a
+ * power-of-two scale commutes with addition), and 2*bs is exact in f32. The 0x80 neg-0 mask
+ * is DROPPED here (6 VALU per 4 bytes) — the loader scrubs expert payloads at stage time, see
+ * the note inside mpf_fp8x4_to_bf16_h. CDNA3 ONLY: gfx950's decode is OCP-native, so
+ * doubling the scale there would be a 2x error. */
+/* Scheduler-shaping axis for the grouped k-loop — see the sched_group_barrier note at the
+ * MFMA site. Default off: the barriers change instruction ORDER only (bit-identical), but
+ * order is exactly what an A/B must judge. */
+#ifndef PLOW_MOE_PF_SCHED
+#define PLOW_MOE_PF_SCHED 0
+#endif
+#if PLOW_CDNA4
+#define MPF_W_HALF 0
+/* CDNA4 twins of the halved helpers below, SAME signatures and element order, so the fetch
+ * macros compile on both arches. No halving here: gfx950's convert decodes OCP e4m3 directly
+ * (the FNUZ=OCP/2 identity is CDNA3 silicon), so these decode full values and the epilogue's
+ * (MPF_W_HALF ? 2.0f : 1.0f) stays 1.0. scale=1.0 for the reason fp8_to_bf16v8 gives: the
+ * block scale folds into the f32 epilogue, never the convert. These used to not exist at all
+ * — the a8 branch is a runtime `if` inside d_moe_group_pf_t, so a toolchain that instantiates
+ * eagerly (ROCm 7.2.3) refused EVERY CDNA4 object over them, while 7.2.4+ only compiled them
+ * out of never-emitted instantiations. */
+__device__ __forceinline__ void mpf_fp8x4_to_bf16_h(unsigned w, unsigned& lo, unsigned& hi) {
+    typedef bf16_t bf16_2 __attribute__((ext_vector_type(2)));
+    const bf16_2 a = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(w, 1.0f, false); /* bytes 0,1 */
+    const bf16_2 c = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(w, 1.0f, true);  /* bytes 2,3 */
+    lo = __builtin_bit_cast(unsigned, a);
+    hi = __builtin_bit_cast(unsigned, c);
+}
+__device__ __forceinline__ void mpf_fp8v16_to_bf16_h(fp8v16 w, bf16v8& lo, bf16v8& hi) {
+    fp8_to_bf16v8(w, lo, hi);
+}
+#else
+#define MPF_W_HALF 1
+__device__ __forceinline__ unsigned mpf_perm_pack(float lo, float hi) {
+    unsigned a, b;
+    __builtin_memcpy(&a, &lo, 4);
+    __builtin_memcpy(&b, &hi, 4);
+    return __builtin_amdgcn_perm(b, a, 0x07060302u); /* (a>>16) | (b & 0xffff0000) */
+}
+__device__ __forceinline__ void mpf_fp8x4_to_bf16_h(unsigned w, unsigned& lo, unsigned& hi) {
+    /* NO neg-0 mask (ASM-probed: 6 VALU per 4 bytes against the masked form's 14). The loader
+     * SCRUBS 0x80 -> 0x00 out of every block-fp8 expert payload as it stages it
+     * (`scrub_fp8_neg0` in plowrt exec/amd.rs, one SWAR pass inside the pinned-slab copy;
+     * value-identical, -0 == +0 in every product), so the FNUZ decoder's one poison byte can
+     * never reach this path. That contract is exactly as wide as this helper's use: the B
+     * operands of ops 85/86, which are always expert-table payloads. Anything decoding
+     * UN-scrubbed checkpoint bytes must keep plow_fp8_mask_neg0. */
+    const f32x2 a = __builtin_amdgcn_cvt_pk_f32_fp8(w, false); /* bytes 0,1 */
+    const f32x2 c = __builtin_amdgcn_cvt_pk_f32_fp8(w, true);  /* bytes 2,3 */
+    lo = mpf_perm_pack(a[0], a[1]);
+    hi = mpf_perm_pack(c[0], c[1]);
+}
+/* fp8v16 form of the above: 16 HALVED bf16 weights, same element order as fp8_to_bf16v8. */
+__device__ __forceinline__ void mpf_fp8v16_to_bf16_h(fp8v16 w, bf16v8& lo, bf16v8& hi) {
+    union { bf16v8 v; unsigned u[4]; } ol, oh;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        auto& o = (i < 2) ? ol : oh;
+        const int b = (i & 1) * 2;
+        mpf_fp8x4_to_bf16_h((unsigned)w[i], o.u[b + 0], o.u[b + 1]);
+    }
+    lo = ol.v;
+    hi = oh.v;
+}
+#endif
+
 /* --- ops 85 / 86: the GROUPED EXPERT GEMM -------------------------------------------------
  * ONE body, two modes, because they differ only in where A comes from and where C goes:
  *
@@ -1582,13 +2234,66 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
                                  const unsigned* __restrict__ row_partidx,
                                  const float* __restrict__ row_gate, unsigned N, unsigned K,
                                  unsigned n_exp, unsigned act, unsigned slice, unsigned nblk,
-                                 float beta, float lbeta, bf16* lds) {
+                                 float beta, float lbeta, unsigned shuf, bf16* lds,
+                                 /* ACTIVATION-SIDE arms (the pair's real cost — see the
+                                  * preshuffle record's corrected traffic model). Both are
+                                  * runtime flags carried on the PACKET, so one object serves
+                                  * old and new blobs; the loader refuses old OBJECTS via the
+                                  * plow_moe_pf_*_arm markers below.
+                                  *   a8 (GLU only): A rows are fp8 (aq) + per-token f32 scale
+                                  *     (as_row), written by d_rmsnorm's fused quant. Decoded
+                                  *     with the maskless chain (the encoder never emits 0x80),
+                                  *     which yields OCP/2 — the x2 folds into as_row at the
+                                  *     epilogue, before the GLU nonlinearity.
+                                  *   part16 (DOWN only): the part scatter is bf16, halving the
+                                  *     pair's largest stream and the combine's readback. */
+                                 const unsigned char* __restrict__ aq = nullptr,
+                                 const float* __restrict__ as_row = nullptr, unsigned a8 = 0,
+                                 unsigned part16 = 0
+#if PLOW_MOE_PF_ATOMIC
+                                 /* PLOW_MOE_PF_ATOMIC (DOWN only): 0 = the shipped `part`
+                                  * scatter; otherwise log2(k)+1, and Cout is the [T,H] f32
+                                  * accumulator op 87 reads with k=1. See the header note.
+                                  * INSIDE the #if so the DEFAULT object's mangled names -- and
+                                  * therefore its .strtab, and therefore every byte of it -- are
+                                  * unchanged by this commit. */
+                                 ,
+                                 unsigned atom_ksh = 0
+#endif
+#if PLOW_MOE_PF_DET
+                                 /* PLOW_MOE_PF_DET (DOWN only): 0 = the shipped `part` scatter;
+                                  * otherwise log2(k)+1, and Cout is the [T,H] f64 fixed-point
+                                  * accumulator op 87 reads with k=1. Same #if placement rule. */
+                                 ,
+                                 unsigned det_ksh = 0
+#endif
+                                 ) {
     constexpr int SM = MPF_SM, SN = MPF_SN;
     constexpr int APT = MPF_BM * MPF_BK / PLOW_THREADS; /* 8  halves/thread */
     constexpr int BPT = MPF_BN * MPF_BK / PLOW_THREADS; /* 32 halves/thread */
+#if MPF_SUBQ
+    /* Sub-quantum A tile (APT < 8) — the masked arm, see the MPF_SUBQ header note. Waves
+     * 0 .. AACT/64-1 stage the whole A tile at the full quantum in one pass; the guard is
+     * wave-uniform and encloses no barrier. B is unaffected (BPT stays quantum-sized). */
+    constexpr int APASS = 1, BPASS = BPT / 8;
+    constexpr unsigned AACT = MPF_BM * MPF_BK / 8u; /* A-staging threads */
+    static_assert(AACT * 8u == MPF_BM * MPF_BK && APT > 0, "masked A pass must cover the tile");
+    static_assert(AACT % PLOW_WAVE == 0 && AACT < PLOW_THREADS,
+                  "masked A staging must be wave-uniform");
+    static_assert(BPT >= 8 && BPT % 8 == 0, "grouped-MoE B tile below the 8-half staging quantum");
+#else
     constexpr int APASS = APT / 8, BPASS = BPT / 8;
+    /* The staging quantum is one 16-byte vector (8 halves) per thread per pass. A tile whose
+     * per-thread share is below that truncates APASS/BPASS to ZERO and the loop stages
+     * NOTHING — the GEMM then runs on whatever the arena held, fluently and wrongly. That is
+     * not hypothetical: MPF_BM=64/MPF_BK=32 shipped exactly this (APT=4, APASS=0) and cost a
+     * day of bisecting. Tiles with BM*BK < 8*PLOW_THREADS take the MPF_SUBQ masked arm. */
+    static_assert(APT >= 8 && APT % 8 == 0, "grouped-MoE A tile below the 8-half staging quantum");
+    static_assert(BPT >= 8 && BPT % 8 == 0, "grouped-MoE B tile below the 8-half staging quantum");
+#endif
     /* Output columns a tile emits: GLU fuses two B halves into one column block. */
     constexpr unsigned NB = GLU ? (MPF_BN / 2) : MPF_BN;
+    constexpr unsigned DB = MPF_DBUF; /* see the MPF_DBUF header: 1 on a 64 KiB part */
 
     const unsigned lane = threadIdx.x & 63u;
     const unsigned wave = threadIdx.x >> 6;
@@ -1606,11 +2311,80 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
 #define MPF_ASM(b) (lds + (b) * MPF_TILE)
 #define MPF_BSM(b) (lds + (b) * MPF_TILE + MPF_BM * MPF_STRIDE)
 
+/* The gathered row of A pass `it`, for the tile whose padded start is `rb`. One expression,
+ * used by the hoist site below AND by the GH=2 prefetch, so the two can never disagree about
+ * which dword a pass consumes. */
+#define MPF_GROW(rb, it) \
+    row_token[(rb) + (threadIdx.x * 8u + (unsigned)(it) * (PLOW_THREADS * 8u)) / MPF_BK]
+
+#if PLOW_MOE_PF_EPI
+/* The hoisted fetch itself (see the PLOW_MOE_PF_EPI header note). One statement, used by both
+ * the EPI=1 tile-head site and the EPI=2 pre-epilogue site so the two cannot disagree about
+ * which dword a lane owns. as_glob keeps these off the flat path, so they carry no lgkmcnt. */
+#define MPF_EPI_LOAD                                                                           \
+    epi_pidx = as_glob(row_partidx)[rowbase + lane];                                           \
+    epi_gate = __builtin_bit_cast(int, as_glob(row_gate)[rowbase + lane]);
+#endif
+
+#if PLOW_MOE_PF_GH >= 2
+    /* One output tile of gather lookahead. APASS == 1 at the CDNA3 tile, so this is a single
+     * loop-carried VGPR. Primed for the first tile this workgroup owns; a workgroup with no
+     * tile never enters the loop and never reads it. */
+    unsigned ghn_[APASS];
+    if constexpr (GLU) {
+#pragma unroll
+        for (int it = 0; it < APASS; it++) ghn_[it] = PLOW_EXPERT_UNUSED;
+        if (slice < n_tiles) {
+            const unsigned mt0 = slice / tn;
+            const unsigned e0 = mpf_expert_of_tile(tilep, mt0, n_exp);
+            const unsigned rb0 = (unsigned)rowoff[e0] + (mt0 - (unsigned)tilep[e0]) * MPF_BM;
+#pragma unroll
+            for (int it = 0; it < APASS; it++) ghn_[it] = MPF_GROW(rb0, it);
+        }
+    }
+#endif
+
     for (unsigned lin = slice; lin < n_tiles; lin += nblk) {
         const unsigned mt = lin / tn, nt = lin % tn;
         const unsigned e = mpf_expert_of_tile(tilep, mt, n_exp);
         const unsigned rowbase = (unsigned)rowoff[e] + (mt - (unsigned)tilep[e]) * MPF_BM;
         const unsigned n0 = nt * NB;
+
+#if PLOW_MOE_PF_GH
+        /* ---- GATHER HIDING (see the PLOW_MOE_PF_GH header note) ----
+         * The A-gather row, resolved ONCE for this whole output tile instead of once per
+         * k-tile. Under GH=2 it was already loaded a tile ago and this is a register read. */
+        unsigned asrc_[APASS];
+#pragma unroll
+        for (int it = 0; it < APASS; it++) {
+            if constexpr (!GLU) {
+                asrc_[it] = rowbase +
+                            (threadIdx.x * 8u + (unsigned)it * (PLOW_THREADS * 8u)) / MPF_BK;
+            } else {
+#if PLOW_MOE_PF_GH >= 2
+                asrc_[it] = ghn_[it];
+#else
+                asrc_[it] = MPF_GROW(rowbase, it);
+#endif
+            }
+        }
+#if PLOW_MOE_PF_GH >= 2
+        /* ISSUE THE NEXT TILE'S INDICES NOW — before the weight-table read, before the EP
+         * skip, before any k-loop traffic — so the whole tile below is what covers them.
+         * Unconditional w.r.t. the skip below on purpose: the pipeline is indexed by LOOP
+         * ITERATION, not by tiles that survive the skip. */
+        if constexpr (GLU) {
+            const unsigned lin2 = lin + nblk;
+            if (lin2 < n_tiles) {
+                const unsigned mt2 = lin2 / tn;
+                const unsigned e2 = mpf_expert_of_tile(tilep, mt2, n_exp);
+                const unsigned rb2 = (unsigned)rowoff[e2] + (mt2 - (unsigned)tilep[e2]) * MPF_BM;
+#pragma unroll
+                for (int it = 0; it < APASS; it++) ghn_[it] = MPF_GROW(rb2, it);
+            }
+        }
+#endif
+#endif
 
         /* Weight + scale bases for THIS tile's expert. A null base is the EP "not my expert"
          * sentinel the decode ops already honour; skip rather than fault. */
@@ -1621,6 +2395,31 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
             GLU ? (const unsigned char*)(size_t)wtab[(size_t)e * 3 + 1] : nullptr;
         const float* S0 = FP8 ? (const float*)(size_t)stab[(size_t)e * 3 + (GLU ? 0 : 2)] : nullptr;
         const float* S1 = (FP8 && GLU) ? (const float*)(size_t)stab[(size_t)e * 3 + 1] : nullptr;
+
+#if PLOW_MOE_PF_EPI
+        /* ---- DOWN-EPILOGUE ROW-METADATA HOIST (see the PLOW_MOE_PF_EPI header note) ----
+         * Lane L takes row L of this m-tile; the epilogue bpermutes row rr out of lane rr.
+         * Both dwords issue back to back with nothing between them, so they are in flight
+         * together, and at EPI=1 the whole k-loop below covers them. */
+        unsigned epi_pidx = 0u;
+        int epi_gate = 0;
+#if PLOW_MOE_PF_EPI == 1
+        if constexpr (!GLU) {
+            MPF_EPI_LOAD
+        }
+#endif
+#endif
+
+/* The A-gather source for pass `it` at tile row `r`. GH=0 expands to the shipped statement
+ * VERBATIM, token for token, so the default object is byte-identical. */
+#if PLOW_MOE_PF_GH
+#define MPF_A_SRC(it, r) const unsigned src = asrc_[it];
+#else
+#define MPF_A_SRC(it, r)                                                                       \
+    unsigned src;                                                                              \
+    if constexpr (GLU) src = row_token[rowbase + (r)];                                         \
+    else src = rowbase + (r);
+#endif
 
         f32x16 acc[SM][SN], accf[SM][SN];
 #pragma unroll
@@ -1636,59 +2435,333 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
             (GLU ? nn_lane : nn_lane + MFMA_N) >> 7,
         };
 
+#if PLOW_MOE_PF_PIPE
+        /* ---- two-tile register pipeline (see the PLOW_MOE_PF_PIPE header note) ----
+         * Stage s holds tile t where t % 2 == s, RAW: A as loaded bf16 (or dequanted fp8
+         * under a8 — small), B as raw fp8 bytes (fp8v16) or loaded bf16. The k-loop is
+         * unrolled x2 so every stage array is indexed by a compile-time constant. */
+        __align__(16) bf16 ra0[APT], ra1[APT];
+        fp8v16 rbq0[FP8 ? BPASS / 2 : 1], rbq1[FP8 ? BPASS / 2 : 1];
+        __align__(16) bf16 rbh0[FP8 ? 1 : BPT], rbh1[FP8 ? 1 : BPT];
+
+#define MPF_FETCH_A_S(k0, ras)                                                                 \
+    _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                      \
+        const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                          \
+        const unsigned r = el / MPF_BK, kk = (k0) + (el % MPF_BK);                              \
+        MPF_A_SRC(it, r)                                                                        \
+        if (src == PLOW_EXPERT_UNUSED) {                                                        \
+            _Pragma("unroll") for (int j = 0; j < 8; j++) ras[it * 8 + j] = 0;                  \
+        } else if (GLU && a8) {                                                                 \
+            const fp8v8 w8 = ld_glob_fp8v8(aq + (size_t)src * K + kk);                          \
+            union { bf16v8 v; unsigned u[4]; } d8;                                              \
+            mpf_fp8x4_to_bf16_h((unsigned)w8[0], d8.u[0], d8.u[1]);                             \
+            mpf_fp8x4_to_bf16_h((unsigned)w8[1], d8.u[2], d8.u[3]);                             \
+            *(bf16v8*)&ras[it * 8] = d8.v;                                                      \
+        } else {                                                                                \
+            *(bf16v8*)&ras[it * 8] = ld_glob8(as_glob(A) + (size_t)src * K + kk);               \
+        }                                                                                       \
+    }
+
+/* B fetch stays RAW — the dequant happens at commit so the loads have no consumer until
+ * the other stage's loads are already in flight. Address selection (shuf / GLU up half /
+ * r >= N zero-fill) is byte-for-byte the legacy macro's. fp8 0x00 decodes to 0.0 on both
+ * cvt arms, so the raw zero-fill lands the same LDS zeros the legacy converted fill did. */
+#define MPF_FETCH_B_S(k0, rbqs, rbhs)                                                          \
+    if constexpr (FP8) {                                                                       \
+        _Pragma("unroll") for (int it = 0; it < BPASS / 2; it++) {                              \
+            const unsigned el = threadIdx.x * 16 + it * (PLOW_THREADS * 16);                    \
+            const unsigned br = el / MPF_BK, kk = (k0) + (el % MPF_BK);                         \
+            unsigned r = n0 + br;                                                               \
+            const unsigned char* wsrc = W0;                                                     \
+            if constexpr (GLU) {                                                                \
+                const bool up = (br >= MPF_BN / 2);                                             \
+                wsrc = up ? W1 : W0;                                                            \
+                r = n0 + (up ? br - MPF_BN / 2 : br);                                           \
+            }                                                                                   \
+            if (r < N) {                                                                        \
+                const unsigned char* wp =                                                       \
+                    shuf ? wsrc + ((((size_t)(k0) >> 6) * N + r) << 6) + (el & 63u)             \
+                         : wsrc + (size_t)r * K + kk;                                           \
+                rbqs[it] = ld_glob_fp8v16(wp);                                                  \
+            } else                                                                              \
+                rbqs[it] = (fp8v16)(0u);                                                        \
+        }                                                                                       \
+    } else {                                                                                    \
+        _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                  \
+            const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                      \
+            const unsigned br = el / MPF_BK, kk = (k0) + (el % MPF_BK);                         \
+            unsigned r = n0 + br;                                                               \
+            const unsigned char* wsrc = W0;                                                     \
+            if constexpr (GLU) {                                                                \
+                const bool up = (br >= MPF_BN / 2);                                             \
+                wsrc = up ? W1 : W0;                                                            \
+                r = n0 + (up ? br - MPF_BN / 2 : br);                                           \
+            }                                                                                   \
+            if (r < N)                                                                          \
+                *(bf16v8*)&rbhs[it * 8] =                                                       \
+                    ld_glob8(as_glob((const bf16*)wsrc) + (size_t)r * K + kk);                  \
+            else                                                                                \
+                _Pragma("unroll") for (int j = 0; j < 8; j++) rbhs[it * 8 + j] = 0;             \
+        }                                                                                       \
+    }
+
+#define MPF_COMMIT_S(ras, rbqs, rbhs)                                                          \
+    _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                      \
+        const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                          \
+        __builtin_memcpy(&MPF_ASM(0)[(el / MPF_BK) * MPF_STRIDE +                               \
+                                     MPF_XORSWZ(el / MPF_BK, el % MPF_BK)],                     \
+                         &ras[it * 8], 16);                                                     \
+    }                                                                                           \
+    if constexpr (FP8) { /* dequant AT COMMIT — same map, same LDS cells as legacy */           \
+        _Pragma("unroll") for (int it = 0; it < BPASS / 2; it++) {                              \
+            const unsigned el = threadIdx.x * 16 + it * (PLOW_THREADS * 16);                    \
+            const unsigned br = el / MPF_BK, kk = el % MPF_BK;                                  \
+            bf16v8 blo, bhi;                                                                    \
+            if constexpr (MPF_W_HALF) mpf_fp8v16_to_bf16_h(rbqs[it], blo, bhi);                 \
+            else fp8_to_bf16v8(rbqs[it], blo, bhi);                                             \
+            __builtin_memcpy(&MPF_BSM(0)[br * MPF_STRIDE + MPF_XORSWZ(br, kk)], &blo, 16);      \
+            __builtin_memcpy(&MPF_BSM(0)[br * MPF_STRIDE + MPF_XORSWZ(br, kk + 8)], &bhi, 16);  \
+        }                                                                                       \
+    } else {                                                                                    \
+        _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                  \
+            const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                      \
+            __builtin_memcpy(&MPF_BSM(0)[(el / MPF_BK) * MPF_STRIDE +                           \
+                                         MPF_XORSWZ(el / MPF_BK, el % MPF_BK)],                 \
+                             &rbhs[it * 8], 16);                                                \
+        }                                                                                       \
+    }
+
+/* The MFMA + promotion body for tile KTV — the legacy block verbatim, LDS buffer 0. */
+#define MPF_MFMA_PROMO(KTV)                                                                    \
+    _Pragma("unroll") for (int q = 0; q < MPF_BK / MFMA_K; q++) {                               \
+        bf16x8 af[SM], bfr[SN];                                                                 \
+        _Pragma("unroll") for (int i = 0; i < SM; i++) {                                        \
+            const unsigned arow = wm * (MPF_BM / MPF_WM) + i * MFMA_M + frow;                   \
+            __builtin_memcpy(&af[i],                                                            \
+                             &MPF_ASM(0)[arow * MPF_STRIDE +                                    \
+                                         MPF_XORSWZ(arow, mfma_frag_k(lane, q * MFMA_K))],      \
+                             16);                                                               \
+        }                                                                                       \
+        _Pragma("unroll") for (int j = 0; j < SN; j++) {                                        \
+            const unsigned brow = (GLU ? j * (MPF_BN / 2) + wn * MFMA_N                         \
+                                       : wn * (MPF_BN / MPF_WN) + j * MFMA_N) +                 \
+                                  frow;                                                         \
+            __builtin_memcpy(&bfr[j],                                                           \
+                             &MPF_BSM(0)[brow * MPF_STRIDE +                                    \
+                                         MPF_XORSWZ(brow, mfma_frag_k(lane, q * MFMA_K))],      \
+                             16);                                                               \
+        }                                                                                       \
+        __builtin_amdgcn_s_setprio(1);                                                          \
+        _Pragma("unroll") for (int i = 0; i < SM; i++)                                          \
+            _Pragma("unroll") for (int j = 0; j < SN; j++)                                       \
+                acc[i][j] = plow_mfma_bf16_32x32(af[i], bfr[j], acc[i][j]);                      \
+        __builtin_amdgcn_s_setprio(0);                                                          \
+    }                                                                                           \
+    if constexpr (FP8) {                                                                       \
+        if (((KTV) & 1u) == 1u || (KTV) == NT - 1u) {                                           \
+            const unsigned kb = (KTV) >> 1;                                                     \
+            _Pragma("unroll") for (int i = 0; i < SM; i++)                                      \
+                _Pragma("unroll") for (int j = 0; j < SN; j++) {                                 \
+                const float* Sj = (GLU && j == 1) ? S1 : S0;                                    \
+                const float bs =                                                                \
+                    Sj[(size_t)nblk_row[j] * KB + kb] * (MPF_W_HALF ? 2.0f : 1.0f);             \
+                accf[i][j] += acc[i][j] * bs;                                                   \
+                acc[i][j] = (f32x16)(0.0f);                                                     \
+            }                                                                                   \
+        }                                                                                       \
+    }
+
+        __syncthreads(); /* the previous tile's fragment readers must be done with the LDS */
+        MPF_FETCH_A_S(0, ra0) MPF_FETCH_B_S(0, rbq0, rbh0)
+        if (1u < NT) { MPF_FETCH_A_S(MPF_BK, ra1) MPF_FETCH_B_S(MPF_BK, rbq1, rbh1) }
+        MPF_COMMIT_S(ra0, rbq0, rbh0)
+        __syncthreads();
+        for (unsigned kt = 0; kt < NT; kt += 2u) {
+            /* EVEN: LDS holds tile kt; stage 1 holds kt+1; stage 0 is free. Its refill for
+             * kt+2 issues FIRST, so the commit of stage 1 below waits on a PARTIAL vmcnt. */
+            if (kt + 2u < NT) {
+                MPF_FETCH_A_S((kt + 2u) * MPF_BK, ra0)
+                MPF_FETCH_B_S((kt + 2u) * MPF_BK, rbq0, rbh0)
+            }
+            /* PIN THE ISSUE ORDER. The dataflow above PERMITS a partial wait at the commit,
+             * but the scheduler was measured sinking the refill loads below it (register
+             * pressure heuristic), which restores the vmcnt(0) drain. This full fence is the
+             * legitimate cousin of the PLOW_MOE_PF_SCHED null: that one tried to create depth
+             * the dependencies forbade; this one stops the scheduler from DESTROYING depth
+             * the restructure created. */
+            __builtin_amdgcn_sched_barrier(0);
+            MPF_MFMA_PROMO(kt)
+            if (kt + 1u < NT) {
+                __syncthreads(); /* every reader done with the one buffer */
+                MPF_COMMIT_S(ra1, rbq1, rbh1)
+                __syncthreads();
+                /* ODD: LDS holds kt+1; stage 0 holds kt+2; stage 1 refills for kt+3. */
+                if (kt + 3u < NT) {
+                    MPF_FETCH_A_S((kt + 3u) * MPF_BK, ra1)
+                    MPF_FETCH_B_S((kt + 3u) * MPF_BK, rbq1, rbh1)
+                }
+                __builtin_amdgcn_sched_barrier(0);
+                MPF_MFMA_PROMO(kt + 1u)
+                if (kt + 2u < NT) {
+                    __syncthreads();
+                    MPF_COMMIT_S(ra0, rbq0, rbh0)
+                    __syncthreads();
+                }
+            }
+        }
+#undef MPF_FETCH_A_S
+#undef MPF_FETCH_B_S
+#undef MPF_COMMIT_S
+#undef MPF_MFMA_PROMO
+#else /* !PLOW_MOE_PF_PIPE — the shipped single-stage loop, verbatim */
+#if MPF_SUBQ
+        __align__(16) bf16 ra[8], rb[BPT]; /* an ACTIVE A-staging thread carries a full quantum */
+#else
         __align__(16) bf16 ra[APT], rb[BPT];
+#endif
 
 /* Stage A: GLU gathers row_token[rowbase+r] out of xn2; DOWN reads fu_g contiguously from
  * rowbase. An UNUSED (pad) row zero-fills, which contributes nothing to any live output. */
+#if MPF_SUBQ
+/* Masked arm (MPF_SUBQ): same body at it = 0, staged by waves 0 .. AACT/64-1 only. */
+#define MPF_FETCH_A(k0)                                                                        \
+    if (threadIdx.x < AACT) {                                                                  \
+        const unsigned el = threadIdx.x * 8;                                                    \
+        const unsigned r = el / MPF_BK, kk = (k0) + (el % MPF_BK);                              \
+        MPF_A_SRC(0, r)                                                                         \
+        if (src == PLOW_EXPERT_UNUSED) {                                                        \
+            _Pragma("unroll") for (int j = 0; j < 8; j++) ra[j] = 0;                            \
+        } else if (GLU && a8) {                                                                 \
+            /* fp8 gathered A: 8 bytes -> 8 HALVED bf16 (maskless — the quantizer never       \
+             * emits 0x80); the x2 and the per-token scale apply at the epilogue. */            \
+            const fp8v8 w8 = ld_glob_fp8v8(aq + (size_t)src * K + kk);                          \
+            union { bf16v8 v; unsigned u[4]; } d8;                                              \
+            mpf_fp8x4_to_bf16_h((unsigned)w8[0], d8.u[0], d8.u[1]);                             \
+            mpf_fp8x4_to_bf16_h((unsigned)w8[1], d8.u[2], d8.u[3]);                             \
+            *(bf16v8*)&ra[0] = d8.v;                                                            \
+        } else {                                                                                \
+            *(bf16v8*)&ra[0] = ld_glob8(as_glob(A) + (size_t)src * K + kk);                     \
+        }                                                                                       \
+    }
+#else
 #define MPF_FETCH_A(k0)                                                                        \
     _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                      \
         const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                          \
         const unsigned r = el / MPF_BK, kk = (k0) + (el % MPF_BK);                              \
-        unsigned src;                                                                           \
-        if constexpr (GLU) src = row_token[rowbase + r];                                        \
-        else src = rowbase + r;                                                                 \
-        if (src != PLOW_EXPERT_UNUSED)                                                          \
-            *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)src * K + kk);                \
-        else                                                                                    \
+        MPF_A_SRC(it, r)                                                                        \
+        if (src == PLOW_EXPERT_UNUSED) {                                                        \
             _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] = 0;                   \
+        } else if (GLU && a8) {                                                                 \
+            /* fp8 gathered A: 8 bytes -> 8 HALVED bf16 (maskless — the quantizer never       \
+             * emits 0x80); the x2 and the per-token scale apply at the epilogue. */            \
+            const fp8v8 w8 = ld_glob_fp8v8(aq + (size_t)src * K + kk);                          \
+            union { bf16v8 v; unsigned u[4]; } d8;                                              \
+            mpf_fp8x4_to_bf16_h((unsigned)w8[0], d8.u[0], d8.u[1]);                             \
+            mpf_fp8x4_to_bf16_h((unsigned)w8[1], d8.u[2], d8.u[3]);                             \
+            *(bf16v8*)&ra[it * 8] = d8.v;                                                       \
+        } else {                                                                                \
+            *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)src * K + kk);                \
+        }                                                                                       \
     }
+#endif
 
 /* Stage B: the expert's weight rows [n0, n0+NB) at k0. Under GLU the tile's low half is the
  * gate weight and its high half is the up weight, both at the same output rows. fp8 decodes
- * EXACTLY to bf16 here; the block scale is applied later, to the f32 accumulator. */
+ * EXACTLY to bf16 here; the block scale is applied later, to the f32 accumulator.
+ *
+ * The fp8 arm fetches 16 WEIGHTS PER LOAD (fp8v16 + the packed fp8_to_bf16v8 pair), not 8:
+ * B is the stream that costs (the whole-kernel header), and 16 consecutive fp8 bytes stay
+ * inside one BK=64 row for every thread (BK/16 = 4 threads per row), so this halves the
+ * B-side global-load count and cuts the dequant VALU ~3x (amd_common.h fp8_to_bf16v8) while
+ * fetching the SAME bytes to the SAME rb elements — bit-identical by construction. The
+ * element->thread map changes with it, so the B half of MPF_COMMIT below mirrors the same
+ * map; LDS cell contents are unchanged. */
 #define MPF_FETCH_B(k0)                                                                        \
-    _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                      \
-        const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                          \
-        const unsigned br = el / MPF_BK, kk = (k0) + (el % MPF_BK);                             \
-        unsigned r = n0 + br;                                                                   \
-        const unsigned char* wsrc = W0;                                                         \
-        if constexpr (GLU) {                                                                    \
-            const bool up = (br >= MPF_BN / 2);                                                 \
-            wsrc = up ? W1 : W0;                                                                \
-            r = n0 + (up ? br - MPF_BN / 2 : br);                                               \
+    if constexpr (FP8) {                                                                       \
+        _Pragma("unroll") for (int it = 0; it < BPASS / 2; it++) {                              \
+            const unsigned el = threadIdx.x * 16 + it * (PLOW_THREADS * 16);                    \
+            const unsigned br = el / MPF_BK, kk = (k0) + (el % MPF_BK);                         \
+            unsigned r = n0 + br;                                                               \
+            const unsigned char* wsrc = W0;                                                     \
+            if constexpr (GLU) {                                                                \
+                const bool up = (br >= MPF_BN / 2);                                             \
+                wsrc = up ? W1 : W0;                                                            \
+                r = n0 + (up ? br - MPF_BN / 2 : br);                                           \
+            }                                                                                   \
+            if (r < N) {                                                                        \
+                /* PRESHUFFLED layout (PLOW_MOE_PF_SHUF, loader-built 2nd slab):                \
+                 * B'[K/64][N][64] -- this k-tile's B block is contiguous, full 128 B           \
+                 * lines instead of 64 B row-slices at K-stride. Same bytes to the same         \
+                 * rb elements => bit-identical. N == the projection buffer's rows on           \
+                 * BOTH arms (GLU: per-rank I_moe per gate/up buffer; DOWN: H). The             \
+                 * address form is BK-dependent -- see MPF_SHUF_WP at the tile macros. */       \
+                const unsigned char* wp =                                                       \
+                    shuf ? MPF_SHUF_WP(wsrc, k0, el, kk, r)                                     \
+                         : wsrc + (size_t)r * K + kk;                                           \
+                const fp8v16 w = ld_glob_fp8v16(wp);                                            \
+                if constexpr (MPF_W_HALF)                                                       \
+                    mpf_fp8v16_to_bf16_h(w, *(bf16v8*)&rb[it * 16], *(bf16v8*)&rb[it * 16 + 8]); \
+                else                                                                            \
+                    fp8_to_bf16v8(w, *(bf16v8*)&rb[it * 16], *(bf16v8*)&rb[it * 16 + 8]);       \
+            } else                                                                              \
+                _Pragma("unroll") for (int j = 0; j < 16; j++) rb[it * 16 + j] = 0;             \
         }                                                                                       \
-        if (r < N) {                                                                            \
-            if constexpr (FP8)                                                                  \
-                *(bf16v8*)&rb[it * 8] = mpf_ld_w8(wsrc + (size_t)r * K + kk);                   \
-            else                                                                                \
+    } else {                                                                                    \
+        _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                  \
+            const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                      \
+            const unsigned br = el / MPF_BK, kk = (k0) + (el % MPF_BK);                         \
+            unsigned r = n0 + br;                                                               \
+            const unsigned char* wsrc = W0;                                                     \
+            if constexpr (GLU) {                                                                \
+                const bool up = (br >= MPF_BN / 2);                                             \
+                wsrc = up ? W1 : W0;                                                            \
+                r = n0 + (up ? br - MPF_BN / 2 : br);                                           \
+            }                                                                                   \
+            if (r < N)                                                                          \
                 *(bf16v8*)&rb[it * 8] =                                                         \
                     ld_glob8(as_glob((const bf16*)wsrc) + (size_t)r * K + kk);                  \
-        } else                                                                                  \
-            _Pragma("unroll") for (int j = 0; j < 8; j++) rb[it * 8 + j] = 0;                   \
+            else                                                                                \
+                _Pragma("unroll") for (int j = 0; j < 8; j++) rb[it * 8 + j] = 0;               \
+        }                                                                                       \
     }
 
-#define MPF_COMMIT(buf)                                                                        \
+#if MPF_SUBQ
+/* Masked arm (MPF_SUBQ): the same 16-byte store at it = 0, by the A-staging waves only. */
+#define MPF_COMMIT_A(buf)                                                                      \
+    if (threadIdx.x < AACT) {                                                                  \
+        const unsigned el = threadIdx.x * 8;                                                    \
+        __builtin_memcpy(&MPF_ASM(buf)[(el / MPF_BK) * MPF_STRIDE +                             \
+                                       MPF_XORSWZ(el / MPF_BK, el % MPF_BK)],                   \
+                         &ra[0], 16);                                                           \
+    }
+#else
+#define MPF_COMMIT_A(buf)                                                                      \
     _Pragma("unroll") for (int it = 0; it < APASS; it++) {                                      \
         const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                          \
         __builtin_memcpy(&MPF_ASM(buf)[(el / MPF_BK) * MPF_STRIDE +                             \
                                        MPF_XORSWZ(el / MPF_BK, el % MPF_BK)],                   \
                          &ra[it * 8], 16);                                                      \
-    }                                                                                           \
-    _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                      \
-        const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                          \
-        __builtin_memcpy(&MPF_BSM(buf)[(el / MPF_BK) * MPF_STRIDE +                             \
-                                       MPF_XORSWZ(el / MPF_BK, el % MPF_BK)],                   \
-                         &rb[it * 8], 16);                                                      \
+    }
+#endif
+
+#define MPF_COMMIT(buf)                                                                        \
+    MPF_COMMIT_A(buf)                                                                          \
+    if constexpr (FP8) { /* same 16-element map as the fp8 MPF_FETCH_B above */                 \
+        _Pragma("unroll") for (int it = 0; it < BPASS / 2; it++) {                              \
+            const unsigned el = threadIdx.x * 16 + it * (PLOW_THREADS * 16);                    \
+            const unsigned br = el / MPF_BK, kk = el % MPF_BK;                                  \
+            __builtin_memcpy(&MPF_BSM(buf)[br * MPF_STRIDE + MPF_XORSWZ(br, kk)],               \
+                             &rb[it * 16], 16);                                                 \
+            __builtin_memcpy(&MPF_BSM(buf)[br * MPF_STRIDE + MPF_XORSWZ(br, kk + 8)],           \
+                             &rb[it * 16 + 8], 16);                                             \
+        }                                                                                       \
+    } else {                                                                                    \
+        _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                  \
+            const unsigned el = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                      \
+            __builtin_memcpy(&MPF_BSM(buf)[(el / MPF_BK) * MPF_STRIDE +                         \
+                                           MPF_XORSWZ(el / MPF_BK, el % MPF_BK)],               \
+                             &rb[it * 8], 16);                                                  \
+        }                                                                                       \
     }
 
         __syncthreads(); /* the previous tile's fragment readers must be done with the LDS */
@@ -1730,35 +2803,112 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
                     for (int j = 0; j < SN; j++)
                         acc[i][j] = plow_mfma_bf16_32x32(af[i], bfr[j], acc[i][j]);
                 __builtin_amdgcn_s_setprio(0);
+#if PLOW_MOE_PF_SCHED
+                /* OPT-IN (PLOW_MOE_PF_SCHED=1 build axis) — MEASURED NULL-BY-CONSTRUCTION,
+                 * kept as the documented do-not-retry. The asm diff against aiter's
+                 * fmoe/bf16gemm asm (glm52-asm-innerloop-diff.md) shows their loops keep
+                 * 13-39 loads OUTSTANDING (a single partial `vmcnt(22) lgkmcnt(0)` is the
+                 * bf16gemm loop's ONLY wait) while ours drains to vmcnt(0) 3-4x per k-tile.
+                 * These group barriers were the HIP-level attempt to close that: they moved
+                 * exactly 24 instructions (12 ds_read + their address adds) and left every
+                 * waitcnt in place, because the waits are DATAFLOW-forced — the loop-head
+                 * loads feed this same iteration's LDS commit (single buffer), and no
+                 * reordering changes that dependency. aiter's depth needs a multi-tile
+                 * register pipeline (their `pf3`) or asm waitcnt control, i.e. the asm-class
+                 * restructure, not a scheduler hint. */
+                __builtin_amdgcn_sched_group_barrier(0x008, 2, 0); /* 2 MFMA      */
+                __builtin_amdgcn_sched_group_barrier(0x020, 1, 0); /* 1 VMEM read */
+                __builtin_amdgcn_sched_group_barrier(0x100, 2, 0); /* 2 DS read   */
+                __builtin_amdgcn_sched_group_barrier(0x002, 8, 0); /* 8 VALU      */
+#endif
             }
 
             /* PROMOTION. A 128-element K scale block is exactly two BK=64 tiles, so the scale
              * boundary always falls here and never inside an MFMA. */
             if constexpr (FP8) {
+#if MPF_BK == 64
                 if ((kt & 1u) == 1u || kt == NT - 1u) {
                     const unsigned kb = kt >> 1;
+#else
+                /* At BK < 64 a scale block is 128/BK k-tiles, not two, and BOTH the cadence
+                 * and the index are element-derived. The cadence must cut the f32 accumulation
+                 * chain at the SCALE-BLOCK edge only: a mid-block cut (kt & 1 at BK=32) is
+                 * numerically fine but groups the sum differently from the BK=64 kernel and
+                 * the rung-1 decode path — the batch-determinism probe sees the ulps and the
+                 * ladder's solo-vs-paired byte-identity promise breaks. With the cut at the
+                 * block edge the MFMA chain runs k = 0..127 in the same order as BK=64 and
+                 * the promotion is bit-identical to it. (kt >> 1 as the INDEX additionally
+                 * charged the second half of every block to the NEXT block's scale.) */
+                constexpr unsigned KTPB = 128u / MPF_BK; /* k-tiles per scale block */
+                static_assert(128 % MPF_BK == 0 && (KTPB & (KTPB - 1u)) == 0,
+                              "scale-block promotion needs a power-of-two k-tile count");
+                if ((kt & (KTPB - 1u)) == KTPB - 1u || kt == NT - 1u) {
+                    const unsigned kb = kt / KTPB;
+#endif
 #pragma unroll
                     for (int i = 0; i < SM; i++)
 #pragma unroll
                         for (int j = 0; j < SN; j++) {
                             const float* Sj = (GLU && j == 1) ? S1 : S0;
-                            const float bs = Sj[(size_t)nblk_row[j] * KB + kb];
+                            /* MPF_W_HALF staged the weights at OCP/2 — the x2 folds into the
+                             * block scale here, exactly (power-of-two f32 mul). */
+                            const float bs = Sj[(size_t)nblk_row[j] * KB + kb] *
+                                             (MPF_W_HALF ? 2.0f : 1.0f);
                             accf[i][j] += acc[i][j] * bs;
                             acc[i][j] = (f32x16)(0.0f);
                         }
                 }
             }
 
-            if (kn < K) { MPF_COMMIT(buf ^ 1) }
+            if (kn < K) {
+                if constexpr (DB == 1) __syncthreads(); /* every reader done with the one buffer */
+                const unsigned cb = (DB == 2) ? (buf ^ 1u) : 0u;
+                MPF_COMMIT(cb)
+            }
             __syncthreads();
-            buf ^= 1;
+            if constexpr (DB == 2) buf ^= 1u;
         }
+#endif /* PLOW_MOE_PF_PIPE */
         if constexpr (!FP8) {
 #pragma unroll
             for (int i = 0; i < SM; i++)
 #pragma unroll
                 for (int j = 0; j < SN; j++) accf[i][j] = acc[i][j];
         }
+
+#if PLOW_MOE_PF_EPI
+#if PLOW_MOE_PF_EPI >= 2
+        if constexpr (!GLU) {
+            MPF_EPI_LOAD
+        }
+#endif
+/* Row `rr`'s hoisted metadata, read back out of the lane that loaded it.
+ *
+ * EXEC DISCIPLINE, and it is load-bearing: `ds_bpermute_b32` honours EXEC on the READ side --
+ * a lane sourcing from a lane that is masked off does NOT get that lane's value. Lane L wants
+ * row `rr(L)`, held by lane `rr(L)`, whose OWN activity is decided by row `rr(rr(L))` -- a
+ * different row. So neither the `nn < N` tail guard nor the PLOW_EXPERT_UNUSED pad-row test
+ * may be live when these issue: both fetches are emitted BEFORE either test (see
+ * MPF_EPI_NGUARD / MPF_ROWMETA), at the full wave EXEC the epilogue is entered with. The
+ * intrinsic is `convergent`, so LLVM may not sink it back into the divergent region. */
+#define MPF_ROW_PIDX(rr) \
+    ((unsigned)__builtin_amdgcn_ds_bpermute((int)((rr) << 2), (int)epi_pidx))
+#define MPF_ROW_GATE(rr) \
+    __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute((int)((rr) << 2), epi_gate))
+/* The n-tail guard becomes a predicate instead of a `continue`, so it does not mask EXEC
+ * above the fetches; the pad-row test then folds into one skip. Same stores, same values. */
+#define MPF_EPI_NGUARD(nn) const bool epi_nok = ((nn) < N)
+#define MPF_ROWMETA(rr, pidx, gv)                                                              \
+    const unsigned pidx = MPF_ROW_PIDX(rr);                                                    \
+    const float gv = MPF_ROW_GATE(rr);                                                         \
+    if (!epi_nok || pidx == PLOW_EXPERT_UNUSED) continue /* n tail or pad row */
+#else
+#define MPF_EPI_NGUARD(nn) if ((nn) >= N) continue
+#define MPF_ROWMETA(rr, pidx, gv)                                                              \
+    const unsigned pidx = row_partidx[rowbase + (rr)];                                         \
+    if (pidx == PLOW_EXPERT_UNUSED) continue; /* pad row */                                    \
+    const float gv = row_gate[rowbase + (rr)]
+#endif
 
         /* ---- epilogue */
         if constexpr (GLU) {
@@ -1771,10 +2921,103 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
                     for (int el = 0; el < 16; el++) {
                         const unsigned rr =
                             wm * (MPF_BM / MPF_WM) + i * MFMA_M + mfma_acc_m(lane, el);
+                        float g = accf[i][0][el], u = accf[i][1][el];
+                        if (a8) {
+                            /* Per-TOKEN A scale (and the fp8 decode's x2), applied to BOTH
+                             * branches BEFORE the GLU nonlinearity — silu(g*s) != s*silu(g).
+                             * A pad row has no token; its fu row is never read, write 0. */
+                            const unsigned tok = row_token[rowbase + rr];
+                            const float sr =
+                                (tok == PLOW_EXPERT_UNUSED) ? 0.0f : as_row[tok] * 2.0f;
+                            g *= sr;
+                            u *= sr;
+                        }
                         st_act1(&fu[(size_t)(rowbase + rr) * N + nn_lane],
-                                f2bf(moe_glu(accf[i][0][el], accf[i][1][el], act, beta, lbeta)));
+                                f2bf(moe_glu(g, u, act, beta, lbeta)));
                     }
             }
+#if PLOW_MOE_PF_ATOMIC
+        } else if (atom_ksh) {
+            /* FUSED 86->87 (PLOW_MOE_PF_ATOMIC). Same value, same gate multiply, same guard
+             * chain -- only the DESTINATION changes: the per-slot row `pidx` collapses onto its
+             * token's accumulator row, and the store becomes a device-scope f32 atomic add so
+             * the k slots reduce in place. `pidx = tok*k + slot` by construction, so `tok` is
+             * one shift; no extra load, no division, no LDS.
+             *
+             * RELAXED / AGENT is the weakest correct ordering: nothing in this packet reads the
+             * accumulator back, and op 87's read is separated by the packet gate, which already
+             * carries the release. AGENT (not WORKGROUP) is required -- the k contributions come
+             * from k different workgroups, in general on k different XCDs. */
+            float* const acc = (float*)Cout;
+            const unsigned ksh = atom_ksh - 1u;
+#pragma unroll
+            for (int i = 0; i < SM; i++)
+#pragma unroll
+                for (int j = 0; j < SN; j++) {
+                    const unsigned nn = n0 + wn * (MPF_BN / MPF_WN) + j * MFMA_N + mfma_acc_n(lane);
+                    MPF_EPI_NGUARD(nn);
+#pragma unroll
+                    for (int el = 0; el < 16; el++) {
+                        const unsigned rr =
+                            wm * (MPF_BM / MPF_WM) + i * MFMA_M + mfma_acc_m(lane, el);
+                        MPF_ROWMETA(rr, pidx, gv);
+                        __hip_atomic_fetch_add(
+                            (PLOW_GLOB float*)&acc[(size_t)(pidx >> ksh) * N + nn],
+                            gv * accf[i][j][el], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    }
+                }
+#endif
+#if PLOW_MOE_PF_DET
+        } else if (det_ksh) {
+            /* FUSED 86->87, DETERMINISTICALLY. Identical to the atomic arm in destination and in
+             * guard chain -- `pidx >> log2(k)` collapses the slot row onto its token's row -- and
+             * different in exactly one thing: the value crosses the atomic in the FIXED-POINT
+             * domain, so the k-way sum is an INTEGER sum and is therefore independent of the
+             * order the k workgroups happen to arrive in. That is the whole arm.
+             *
+             * RELAXED / AGENT for the reasons the atomic arm states: nothing here reads the
+             * accumulator back, op 87's read is behind the packet gate, and AGENT (not WORKGROUP)
+             * is required because the k contributions come from k different XCDs. */
+            double* const acc = (double*)Cout;
+            const unsigned ksh = det_ksh - 1u;
+#pragma unroll
+            for (int i = 0; i < SM; i++)
+#pragma unroll
+                for (int j = 0; j < SN; j++) {
+                    const unsigned nn = n0 + wn * (MPF_BN / MPF_WN) + j * MFMA_N + mfma_acc_n(lane);
+                    MPF_EPI_NGUARD(nn);
+#pragma unroll
+                    for (int el = 0; el < 16; el++) {
+                        const unsigned rr =
+                            wm * (MPF_BM / MPF_WM) + i * MFMA_M + mfma_acc_m(lane, el);
+                        MPF_ROWMETA(rr, pidx, gv);
+                        __hip_atomic_fetch_add(
+                            (PLOW_GLOB double*)&acc[(size_t)(pidx >> ksh) * N + nn],
+                            mpf_det_q(gv * accf[i][j][el]), __ATOMIC_RELAXED,
+                            __HIP_MEMORY_SCOPE_AGENT);
+                    }
+                }
+#endif
+        } else if (part16) {
+            /* bf16 part: halves the pair's largest stream (the scatter) and the combine's
+             * readback. Same slots, same gate multiply; only the store width changes. */
+            bf16* const part = (bf16*)Cout;
+#pragma unroll
+            for (int i = 0; i < SM; i++)
+#pragma unroll
+                for (int j = 0; j < SN; j++) {
+                    const unsigned nn = n0 + wn * (MPF_BN / MPF_WN) + j * MFMA_N + mfma_acc_n(lane);
+                    MPF_EPI_NGUARD(nn);
+#pragma unroll
+                    for (int el = 0; el < 16; el++) {
+                        const unsigned rr =
+                            wm * (MPF_BM / MPF_WM) + i * MFMA_M + mfma_acc_m(lane, el);
+                        MPF_ROWMETA(rr, pidx, gv);
+                        __builtin_nontemporal_store(
+                            f2bf(gv * accf[i][j][el]),
+                            (PLOW_GLOB bf16*)&part[(size_t)pidx * N + nn]);
+                    }
+                }
         } else {
             float* const part = (float*)Cout;
 #pragma unroll
@@ -1782,14 +3025,19 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
 #pragma unroll
                 for (int j = 0; j < SN; j++) {
                     const unsigned nn = n0 + wn * (MPF_BN / MPF_WN) + j * MFMA_N + mfma_acc_n(lane);
-                    if (nn >= N) continue;
+                    MPF_EPI_NGUARD(nn);
 #pragma unroll
                     for (int el = 0; el < 16; el++) {
                         const unsigned rr =
                             wm * (MPF_BM / MPF_WM) + i * MFMA_M + mfma_acc_m(lane, el);
-                        const unsigned pidx = row_partidx[rowbase + rr];
-                        if (pidx == PLOW_EXPERT_UNUSED) continue; /* pad row */
-                        part[(size_t)pidx * N + nn] = row_gate[rowbase + rr] * accf[i][j][el];
+                        MPF_ROWMETA(rr, pidx, gv);
+                        /* NON-TEMPORAL: part is written once here and read back only by the
+                         * combine, after a full 304-CU round — at T=2048 it is ~400 MB per
+                         * rank, far past L2, so caching these lines only evicts the weight
+                         * stream this kernel is bound on. Same value, same address. */
+                        __builtin_nontemporal_store(
+                            gv * accf[i][j][el],
+                            (PLOW_GLOB float*)&part[(size_t)pidx * N + nn]);
                     }
                 }
         }
@@ -1798,6 +3046,16 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
 #undef MPF_FETCH_A
 #undef MPF_FETCH_B
 #undef MPF_COMMIT
+#undef MPF_COMMIT_A
+#undef MPF_A_SRC
+#undef MPF_GROW
+#undef MPF_ROW_PIDX
+#undef MPF_ROW_GATE
+#undef MPF_EPI_NGUARD
+#undef MPF_ROWMETA
+#if PLOW_MOE_PF_EPI
+#undef MPF_EPI_LOAD
+#endif
 #undef MPF_ASM
 #undef MPF_BSM
 }
@@ -1861,6 +3119,10 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
 /* 16 bytes of fp4 payload held in registers between a staging phase's ISSUE and COMMIT halves
  * — one MX block for A (DOWN) or B. Vector-typed so the copy in and the copy out are each a
  * single wide access rather than sixteen byte ones. */
+#if PLOW_MOE_PF_EPI_SIB && (MPF4_BM != PLOW_WAVE)
+#error "PLOW_MOE_PF_EPI_SIB assumes one wave covers the m-tile's rows (MPF4_BM == PLOW_WAVE)"
+#endif
+
 typedef unsigned mpf4_b16 __attribute__((ext_vector_type(4), aligned(4)));
 
 /* BY VALUE, both directions. `__builtin_memcpy` straight into an `mpf4_b16` array element left
@@ -1998,6 +3260,21 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
             as_glob((const unsigned char*)(size_t)stab[(size_t)e * 3 + (GLU ? 0 : 2)]);
         const PLOW_GLOB unsigned char* SW1 =
             as_glob(GLU ? (const unsigned char*)(size_t)stab[(size_t)e * 3 + 1] : nullptr);
+
+#if PLOW_MOE_PF_EPI_SIB
+        /* ---- DOWN-EPILOGUE ROW-METADATA HOIST, A4W4 TWIN (see the PLOW_MOE_PF_EPI_SIB
+         * header note). MPF4_BM == PLOW_WAVE == 64, so one wave holds the whole row block one
+         * row per lane; the epilogue bpermutes row rr out of lane rr. Issued at the tile head
+         * so the k-loop covers the latency. DOWN arm only -- the GLU arm passes
+         * row_partidx = row_gate = nullptr and its own pad-row read is per 32-column BLOCK,
+         * not per element, so it is not this pattern. */
+        unsigned epi_pidx = 0u;
+        int epi_gate = 0;
+        if constexpr (!GLU) {
+            epi_pidx = as_glob(row_partidx)[rowbase + lane];
+            epi_gate = __builtin_bit_cast(int, as_glob(row_gate)[rowbase + lane]);
+        }
+#endif
 
         f32x16 acc[SMa][SNa];
 #pragma unroll
@@ -2228,6 +3505,26 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
             buf ^= 1;
         }
 
+/* Row `rr`'s hoisted metadata, read back out of the lane that loaded it. Same EXEC discipline
+ * as the grouped GEMM's MPF_ROWMETA: `ds_bpermute_b32` honours EXEC on the READ side, so both
+ * fetches are emitted BEFORE the lane-varying `nn < N` tail guard and the pad-row test, and
+ * those become a MASK rather than EXEC. */
+#if PLOW_MOE_PF_EPI_SIB
+#define MPF4_EPI_NGUARD(nn) const bool epi_nok = ((nn) < N)
+#define MPF4_ROWMETA(rr, pidx, gv)                                                             \
+    const unsigned pidx =                                                                      \
+        (unsigned)__builtin_amdgcn_ds_bpermute((int)((rr) << 2), (int)epi_pidx);               \
+    const float gv =                                                                           \
+        __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute((int)((rr) << 2), epi_gate));   \
+    if (!epi_nok || pidx == PLOW_EXPERT_UNUSED) continue /* n tail or pad row */
+#else
+#define MPF4_EPI_NGUARD(nn) if ((nn) >= N) continue
+#define MPF4_ROWMETA(rr, pidx, gv)                                                             \
+    const unsigned pidx = row_partidx[rowbase + (rr)];                                         \
+    if (pidx == PLOW_EXPERT_UNUSED) continue;                                                  \
+    const float gv = row_gate[rowbase + (rr)]
+#endif
+
         if constexpr (GLU) {
             /* --- THE FUSED BRIDGE ---------------------------------------------------------
              * SwiGLU, then MXFP4-quantize the result, then write it with its E8M0 scales in
@@ -2293,14 +3590,13 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                 for (int j = 0; j < SNa; j++) {
                     const unsigned nn =
                         n0 + wn * (MPF4_BN / MPF4_WNc) + j * MFMA_N + mfma_acc_n(lane);
-                    if (nn >= N) continue;
+                    MPF4_EPI_NGUARD(nn);
 #pragma unroll
                     for (int el = 0; el < 16; el++) {
                         const unsigned rr =
                             wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
-                        const unsigned pidx = row_partidx[rowbase + rr];
-                        if (pidx == PLOW_EXPERT_UNUSED) continue;
-                        part[(size_t)pidx * N + nn] = row_gate[rowbase + rr] * acc[i][j][el];
+                        MPF4_ROWMETA(rr, pidx, gv);
+                        part[(size_t)pidx * N + nn] = gv * acc[i][j][el];
                     }
                 }
         }
@@ -2320,6 +3616,8 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
 #undef MPF4_ISSUE
 #undef MPF4_COMMIT
 #undef MPF4_MFMA
+#undef MPF4_EPI_NGUARD
+#undef MPF4_ROWMETA
 }
 #endif /* PLOW_HAS_MX_MMA */
 
@@ -2380,8 +3678,13 @@ __device__ void d_moe_group_glu_pf(bf16* fu, const bf16* xn2, const unsigned lon
                                    unsigned nblk, float beta, float lbeta, bf16* lds,
                                    const unsigned char* xscale = nullptr,
                                    const unsigned* row_partidx = nullptr,
-                                   unsigned char* fu_scale = nullptr) {
+                                   unsigned char* fu_scale = nullptr, unsigned shuf = 0,
+                                   unsigned a8 = 0) {
     (void)xscale;
+    /* a8: on the block-fp8/bf16 arms t6/t7 carry the fp8 A rows + per-token f32 scales
+     * (A4W4 owns those slots for its own operands and never sets a8). */
+    const unsigned char* aq = a8 ? (const unsigned char*)row_partidx : nullptr;
+    const float* as_row = a8 ? (const float*)fu_scale : nullptr;
 #if PLOW_MOE_PF_A4W4
     if (enc == PLOW_MOE_ENC_MXFP4) {
         /* A4W4. `fu` is the MXFP4 gathered intermediate and `fu_scale` its E8M0 rows; the
@@ -2405,10 +3708,12 @@ __device__ void d_moe_group_glu_pf(bf16* fu, const bf16* xn2, const unsigned lon
     }
     if (enc == PLOW_MOE_ENC_FP8BLK)
         d_moe_group_pf_t<true, true>(fu, xn2, wtab, stab, meta, row_token, nullptr, nullptr, I_moe,
-                                     H, n_exp, act, slice, nblk, beta, lbeta, lds);
+                                     H, n_exp, act, slice, nblk, beta, lbeta, shuf, lds, aq,
+                                     as_row, a8);
     else
         d_moe_group_pf_t<false, true>(fu, xn2, wtab, stab, meta, row_token, nullptr, nullptr, I_moe,
-                                      H, n_exp, act, slice, nblk, beta, lbeta, lds);
+                                      H, n_exp, act, slice, nblk, beta, lbeta, 0u, lds, aq, as_row,
+                                      a8);
 }
 
 /* op 86: grouped down + gate-scale + scatter. t0=part([T*k,H] f32) t1=fu_g t2=wtab t3=stab
@@ -2418,7 +3723,17 @@ __device__ void d_moe_group_down_pf(float* part, const bf16* fu, const unsigned 
                                     const unsigned* row_partidx, const float* row_gate, unsigned H,
                                     unsigned I_moe, unsigned n_exp, unsigned enc, unsigned slice,
                                     unsigned nblk, bf16* lds,
-                                    const unsigned char* fu_scale = nullptr) {
+                                    const unsigned char* fu_scale = nullptr, unsigned shuf = 0,
+                                    unsigned part16 = 0
+#if PLOW_MOE_PF_ATOMIC
+                                    ,
+                                    unsigned atom_ksh = 0
+#endif
+#if PLOW_MOE_PF_DET
+                                    ,
+                                    unsigned det_ksh = 0
+#endif
+                                    ) {
 #if PLOW_MOE_PF_A4W4
     if (enc == PLOW_MOE_ENC_MXFP4) { /* A = the bridge's MXFP4 output + its E8M0 rows */
         d_moe_group_pf_a4w4<false>((void*)part, (const void*)fu, fu_scale, wtab, stab, meta,
@@ -2435,11 +3750,35 @@ __device__ void d_moe_group_down_pf(float* part, const bf16* fu, const unsigned 
     }
     if (enc == PLOW_MOE_ENC_FP8BLK)
         d_moe_group_pf_t<true, false>(part, fu, wtab, stab, meta, nullptr, row_partidx, row_gate, H,
-                                      I_moe, n_exp, 0, slice, nblk, 0.0f, 0.0f, lds);
+                                      I_moe, n_exp, 0, slice, nblk, 0.0f, 0.0f, shuf, lds, nullptr,
+                                      nullptr, 0u, part16 MPF_ATOM_ARG MPF_DET_ARG);
     else
         d_moe_group_pf_t<false, false>(part, fu, wtab, stab, meta, nullptr, row_partidx, row_gate,
-                                       H, I_moe, n_exp, 0, slice, nblk, 0.0f, 0.0f, lds);
+                                       H, I_moe, n_exp, 0, slice, nblk, 0.0f, 0.0f, 0u, lds,
+                                       nullptr, nullptr, 0u, part16 MPF_ATOM_ARG MPF_DET_ARG);
 }
+
+/* ARM MARKERS for the activation-side flags (packet fields i[7] on ops 85/86/87). The loader's
+ * `check_prefill_object` refuses a blob that requires an arm the object's symbol table cannot
+ * prove — without these, a part16 blob on an old object would store f32 into a half-sized part
+ * buffer (heap overrun) and an a8 blob would matmul fp8 bytes as bf16. Unconditional, like
+ * op_gemm.h's capacity marker: any object built from this source HAS the arms. */
+extern "C" __device__ unsigned plow_moe_pf_part16_arm = 1;
+extern "C" __device__ unsigned plow_moe_pf_a8_arm = 1;
+#if PLOW_MOE_PF_ATOMIC
+/* CONDITIONAL, unlike the two above: PLOW_MOE_PF_ATOMIC is a BUILD axis (default off, so the
+ * default object is byte-identical), and a blob emitted with the fused decomposition on an
+ * object without it would have op 86 scatter into a [T,H]-sized accumulator as if it were the
+ * [T*k,H] part buffer -- k-way heap overrun and silent garbage. The marker is what lets
+ * `check_prefill_object` refuse that pairing. */
+extern "C" __device__ unsigned plow_moe_pf_atomic_arm = 1;
+#endif
+#if PLOW_MOE_PF_DET
+/* CONDITIONAL for the same reason: a DET blob on an object without the arm would have op 86 take
+ * the `part` scatter branch with Cout pointing at a [T,H] f64 accumulator -- a k/2-fold heap
+ * overrun -- and op 87 would read f64 bytes as f32. */
+extern "C" __device__ unsigned plow_moe_pf_det_arm = 1;
+#endif
 
 /* --- op 87: T-TOKEN COMBINE (PLOW_DOP_MOE_COMBINE_PF) --------------------------------------
  * out[t] = residual[t] + shared[t] + Σ_slot part[t*k + slot], f32 accumulate in FIXED slot
@@ -2448,16 +3787,35 @@ __device__ void d_moe_group_down_pf(float* part, const bf16* fu, const unsigned 
  *   t0=out t1=residual([T,H]) t2=shared([T,H] or none) t3=part([T*k,H] f32)  i0=H i1=k i2=T */
 __device__ void d_moe_combine_pf(bf16* out, const bf16* residual, const bf16* shared,
                                  const float* part, unsigned H, unsigned k, unsigned T,
-                                 unsigned slice, unsigned nblk) {
+                                 unsigned slice, unsigned nblk, unsigned part16 = 0
+#if PLOW_MOE_PF_DET
+                                 /* PLOW_MOE_PF_DET: `part` is the [T,H] f64 FIXED-POINT
+                                  * accumulator op 86 summed in place (k == 1), so one contiguous
+                                  * stream, unscaled here. See the axis header. */
+                                 ,
+                                 unsigned det = 0
+#endif
+) {
     const size_t total = (size_t)T * H;
     const size_t gid = (size_t)slice * PLOW_THREADS + threadIdx.x;
     const size_t stride = (size_t)nblk * PLOW_THREADS;
+    const bf16* part_h = (const bf16*)part; /* part16: DOWN scattered bf16, same slot layout */
     for (size_t i = gid; i < total; i += stride) {
         const unsigned tok = (unsigned)(i / H), h = (unsigned)(i - (size_t)tok * H);
         float acc = residual ? bf2f(residual[i]) : 0.0f; /* optional — see d_moe_combine */
         if (shared) acc += bf2f(shared[i]);
-        const float* pt = part + (size_t)tok * k * H;
-        for (unsigned j = 0; j < k; j++) acc += pt[(size_t)j * H + h];
+#if PLOW_MOE_PF_DET
+        if (det) {
+            acc += (float)(((const double*)part)[i] * MPF_DET_UNSCALE);
+        } else
+#endif
+        if (part16) {
+            const bf16* pt = part_h + (size_t)tok * k * H;
+            for (unsigned j = 0; j < k; j++) acc += bf2f(pt[(size_t)j * H + h]);
+        } else {
+            const float* pt = part + (size_t)tok * k * H;
+            for (unsigned j = 0; j < k; j++) acc += pt[(size_t)j * H + h];
+        }
         st_act1(&out[i], f2bf(acc));
     }
 }
@@ -3376,6 +4734,12 @@ __device__ void d_moe_group_gemma_pf_t(void* __restrict__ Cout, const void* __re
     constexpr int APT = MPF_BM * MPF_BK / PLOW_THREADS;
     constexpr int BPT = MPF_BN * MPF_BK / PLOW_THREADS;
     constexpr int APASS = APT / 8, BPASS = BPT / 8;
+    /* This twin shares the MPF tile macros but has NO sub-quantum arm: at MPF_BK=32 (the
+     * batched-decode escape hatch) APASS truncates to zero and it would stage no A tile —
+     * the recorded silent-wrong failure. Refuse; build such objects with PLOW_MOE_GEMMA_PF=0
+     * (the OCC4 batched recipe already drops the _PF arm). */
+    static_assert(APT >= 8 && APT % 8 == 0, "Gemma grouped-MoE A tile below the 8-half staging quantum");
+    static_assert(BPT >= 8 && BPT % 8 == 0, "Gemma grouped-MoE B tile below the 8-half staging quantum");
     constexpr unsigned NB = GLU ? (MPF_BN / 2) : MPF_BN;
     constexpr unsigned DB = GMPF_DBUF;
 
@@ -3406,6 +4770,22 @@ __device__ void d_moe_group_gemma_pf_t(void* __restrict__ Cout, const void* __re
         /* TWO ULLs per expert (gate_up fused, down) — NOT three. */
         const unsigned long long wb = ewt[(size_t)e * 2 + (GLU ? 0 : 1)];
         if (wb == 0ull) continue; /* expert-parallel "not mine" sentinel; skip, do not fault */
+
+#if PLOW_MOE_PF_EPI_SIB
+        /* ---- DOWN-EPILOGUE ROW-METADATA HOIST, GEMMA TWIN (see the PLOW_MOE_PF_EPI_SIB
+         * header note). Lane L takes row L of this m-tile; the epilogue bpermutes row rr out
+         * of lane rr. Issued at the tile head so the k-loop below covers the latency, and
+         * THREE dwords rather than the grouped GEMM's two: this arm's W8A8 branch also reads
+         * a k- and n-invariant per-row `ascale[rowbase + rr]`, and leaving one of the three
+         * behind would leave the per-element `s_waitcnt vmcnt(0)` drain exactly where it is. */
+        unsigned epi_pidx = 0u;
+        int epi_gate = 0, epi_asc = 0;
+        if constexpr (!GLU) {
+            epi_pidx = as_glob(row_partidx)[rowbase + lane];
+            epi_gate = __builtin_bit_cast(int, as_glob(row_gate)[rowbase + lane]);
+            if constexpr (W8A8) epi_asc = __builtin_bit_cast(int, as_glob(ascale)[rowbase + lane]);
+        }
+#endif
         const bf16* W16 = (const bf16*)(size_t)wb;
         const unsigned char* W8 = (const unsigned char*)(size_t)wb;
         /* `if constexpr`, not a ternary: `est` is nullptr on the bf16 arms and a ternary would
@@ -3529,6 +4909,38 @@ __device__ void d_moe_group_gemma_pf_t(void* __restrict__ Cout, const void* __re
             if constexpr (DB == 2) buf ^= 1u;
         }
 
+/* Row `rr`'s hoisted metadata, read back out of the lane that loaded it.
+ *
+ * EXEC DISCIPLINE, load-bearing and the reason this is a macro pair rather than three
+ * inline reads: `ds_bpermute_b32` honours EXEC on the READ side, so a lane sourcing from a
+ * masked-off lane does NOT get that lane's value. Lane L wants row `rr(L)`, held by lane
+ * `rr(L)`, whose OWN activity is decided by row `rr(rr(L))` -- a different row. So neither
+ * the `nn < N` tail guard (lane-varying, via mfma_acc_n) nor the PLOW_EXPERT_UNUSED pad-row
+ * test may be live when these issue: all three fetches are emitted BEFORE either test, at
+ * the full wave EXEC the epilogue is entered with, and the guards are then applied as a
+ * MASK. The intrinsic is `convergent`, so LLVM may not sink it back into the divergent
+ * region. Verified in the ISA (perf-data/plow-gfx942/glm52-dropped-items.md). */
+#if PLOW_MOE_PF_EPI_SIB
+#define GMPF_ROW_BP(v, rr) __builtin_amdgcn_ds_bpermute((int)((rr) << 2), (v))
+#define GMPF_EPI_NGUARD(nn) const bool epi_nok = ((nn) < N)
+#define GMPF_ROWMETA(rr, pidx, gv)                                                             \
+    const unsigned pidx = (unsigned)GMPF_ROW_BP((int)epi_pidx, (rr));                          \
+    const float gv = __builtin_bit_cast(float, GMPF_ROW_BP(epi_gate, (rr)));                   \
+    const float epi_av = __builtin_bit_cast(float, GMPF_ROW_BP(epi_asc, (rr)));                \
+    if (!epi_nok || pidx == PLOW_EXPERT_UNUSED) continue /* n tail or pad row */
+/* The third fetch has to ride the SAME pre-EXEC window, so it is read unconditionally here
+ * and consumed only on the W8A8 arm. A bpermute of a register that arm never loaded is
+ * harmless; a bpermute issued under the pad-row mask would not be. */
+#define GMPF_ROW_ASC(rr) epi_av
+#else
+#define GMPF_EPI_NGUARD(nn) if ((nn) >= N) continue
+#define GMPF_ROWMETA(rr, pidx, gv)                                                             \
+    const unsigned pidx = row_partidx[rowbase + (rr)];                                         \
+    if (pidx == PLOW_EXPERT_UNUSED) continue; /* pad row */                                    \
+    const float gv = row_gate[rowbase + (rr)]
+#define GMPF_ROW_ASC(rr) ascale[rowbase + (rr)]
+#endif
+
         /* ---- epilogue */
         const unsigned nn_lane =
             n0 + (GLU ? wn * MFMA_N : wn * (MPF_BN / MPF_WN)) + mfma_acc_n(lane);
@@ -3565,14 +4977,13 @@ __device__ void d_moe_group_gemma_pf_t(void* __restrict__ Cout, const void* __re
 #pragma unroll
                 for (int j = 0; j < SN; j++) {
                     const unsigned nn = n0 + wn * (MPF_BN / MPF_WN) + j * MFMA_N + mfma_acc_n(lane);
-                    if (nn >= N) continue;
+                    GMPF_EPI_NGUARD(nn);
 #pragma unroll
                     for (int el = 0; el < 16; el++) {
                         const unsigned rr = wm * (MPF_BM / MPF_WM) + i * MFMA_M + mfma_acc_m(lane, el);
-                        const unsigned pidx = row_partidx[rowbase + rr];
-                        if (pidx == PLOW_EXPERT_UNUSED) continue; /* pad row */
-                        float y = row_gate[rowbase + rr] * acc[i][j][el];
-                        if constexpr (W8A8) y *= ascale[rowbase + rr] * wsc[nn];
+                        GMPF_ROWMETA(rr, pidx, gv);
+                        float y = gv * acc[i][j][el];
+                        if constexpr (W8A8) y *= GMPF_ROW_ASC(rr) * wsc[nn];
                         part[(size_t)pidx * N + nn] = y;
                     }
                 }
@@ -3584,6 +4995,12 @@ __device__ void d_moe_group_gemma_pf_t(void* __restrict__ Cout, const void* __re
 #undef GMPF_COMMIT
 #undef GMPF_ASM
 #undef GMPF_BSM
+#undef GMPF_EPI_NGUARD
+#undef GMPF_ROWMETA
+#undef GMPF_ROW_ASC
+#if PLOW_MOE_PF_EPI_SIB
+#undef GMPF_ROW_BP
+#endif
 }
 
 /* --- op 75: PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF ----------------------------------------------- */

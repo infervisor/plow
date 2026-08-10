@@ -164,7 +164,7 @@ static int find_tensor(Blob* B, const char* name){
 static int parse_ctx(const char* s){ int v=atoi(s); const char* p=s; while(*p&&(*p>='0'&&*p<='9'))p++;
     if(*p=='k'||*p=='K') v*=1024; else if(*p=='m'||*p=='M') v*=1024*1024; return v; }
 
-/* ---- GLM TP weight sharding ----------------------------------------------
+/* ---- GLM TP weight sharding ------------------------------------------------------------------
  * COLUMN-PARALLEL (output-row sharded): each rank owns a CONTIGUOUS row-range = a contiguous byte
  *   range of the [out,in] row-major matrix (weight AND its block-scale grid, whose rows shard the
  *   same way). q/v absorb, q_rope, shared+dense+expert gate/up + *_scale_inv.

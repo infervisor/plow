@@ -33,16 +33,30 @@ Plow models all four levels, but the compiler currently targets Levels 0-2 (with
 
 ## Parallelism Strategies
 
-**Module:** [`crates/plowc/src/lib.rs`](../../crates/plowc/src/lib.rs:60) — `Parallel` enum
+**Module:** [`crates/plowc/src/lib.rs`](../../crates/plowc/src/lib.rs) — `Parallel` enum
+
+`Parallel` is the `--parallel` CLI selector: unit variants, no payload. The GPU
+count is carried separately by `--num-gpus` (`Options::num_gpus`).
 
 ```rust
 pub enum Parallel {
-    Single,           // One GPU
-    Tensor(usize),    // TP: partition N across N units
-    Pipeline(usize),  // PP: partition layers across units
-    Expert(usize),    // EP: partition MoE experts across units
+    Tp, // tensor-parallel: split each GEMM along N across the GPUs (wired today)
+    Dp, // data-parallel: replicate the model, shard the batch (not yet implemented)
+    Pp, // pipeline-parallel: split layers across GPUs (not yet implemented)
+    Ep, // expert-parallel: shard MoE experts across GPUs (not yet implemented)
 }
 ```
+
+There is no `Single` variant — a single GPU is `--num-gpus 1` with any strategy;
+`build_soc` returns `Soc::single` when `num_gpus <= 1`. `Tp` is the default and
+the only strategy `build_soc` accepts today; `Dp`/`Pp`/`Ep` are rejected with
+`PlowcError::Parallelism` ("… is not yet implemented (only tensor-parallel)").
+
+A separate derivation helper (`crates/plowc/src/parallel.rs`) computes a
+`ParallelConfig { tp, pp, ep, dp }` (all `u32`, product = device count) from a
+`ModelSpec` and per-device HBM via `derive_parallel`, with `validate` checking
+divisibility/fit. That is the auto-sizing path; the `Parallel` enum above is the
+user-facing strategy selector.
 
 ### Tensor Parallelism (TP)
 
@@ -69,7 +83,7 @@ flowchart LR
    - For column-parallel: concatenation (no reduction needed)
    - For row-parallel: all-reduce (sum partial products)
 
-**Implementation:** `Soc::partition_n()` divides work; `assemble()` creates per-unit regions + Join nodes; the scheduler places Join on the unit that owns the consumer.
+**Implementation:** `Soc::partition_n` (in [`crates/costmodel/src/unit.rs`](../../crates/costmodel/src/unit.rs)) splits a GEMM along N into per-unit `Region`s, each sized ∝ its unit's throughput `weight` and rounded to that unit's MMA-N granularity; the tile-graph builder ([`crates/rewrite/src/tilegraph.rs`](../../crates/rewrite/src/tilegraph.rs)) emits a `Compute::Join` that concatenates the per-region slices on unit 0. A single-unit `Soc` degenerates to one region covering all of N (today's single-GPU path).
 
 ### Pipeline Parallelism (PP)
 
@@ -91,7 +105,9 @@ flowchart TD
 3. Each unit compiles and schedules its blocks independently
 4. A `CrossUnit` counter gates the inter-unit transfer
 
-**Status:** Planned. Current implementation compiles all blocks to one unit.
+**Status:** Not implemented. `Parallel::Pp` is rejected by `build_soc`; the current implementation compiles all blocks to one unit.
+
+**Deviation from implementation:** The design describes device-level PP. In code, `crates/plowc/src/parallel.rs` also carries a `pp` field on `ParallelConfig` and `derive_parallel` will compute `pp > 1` when weights still overflow after TP+EP, but no compilation path consumes it — the value is advisory only.
 
 ### Expert Parallelism (EP)
 
@@ -116,13 +132,13 @@ flowchart TD
 3. All-to-All communication redistributes results
 4. The routing decision determines which tokens go where (dynamic at runtime)
 
-**Status:** Schema support exists (`plow-asset::Experts`, `ExpertLayer`); compilation path planned.
+**Status:** Not implemented as cross-unit EP. Schema types exist (`plow_asset::Experts`, `plow_asset::ExpertLayer`) and single-unit MoE is compiled/served, but `Parallel::Ep` is rejected by `build_soc`; expert sharding across units is future work.
 
 ---
 
 ## The Parallelism Planner
 
-**Design §9.2:** Before tile assembly, a pre-pass decides the strategy:
+Before tile assembly, a pre-pass decides the strategy:
 
 ```mermaid
 flowchart TD
@@ -142,12 +158,17 @@ flowchart TD
 
 ### Strategy Selection Heuristic
 
-| Condition | Strategy | Rationale |
-|-----------|----------|-----------|
-| Single unit | `Single` | No parallelism needed |
-| N ≥ 4096 × n_units | `Tensor(n)` | N-axis large enough to partition without waste |
-| N < 4096 × n_units | `Pipeline(n)` | Small N = TP gives too-small slices |
-| MoE model | `Expert(n)` + TP/PP hybrid | Experts are naturally shardable |
+`derive_parallel` ([`crates/plowc/src/parallel.rs`](../../crates/plowc/src/parallel.rs)) picks a `ParallelConfig { tp, pp, ep, dp }` whose product equals the device count. The order it applies:
+
+| Step | Field set | Rationale |
+|------|-----------|-----------|
+| Single device (`num_devices <= 1`) | `tp=pp=ep=dp=1` | No parallelism needed |
+| Smallest TP that fits weights + KV + activations in 75% of HBM | `tp` (∈ {1,2,4,8}, must divide `heads` and `inter`) | N-axis partition without waste |
+| MoE model, devices left after TP | `ep` (largest divisor of `n_experts`) | Experts are naturally shardable |
+| Weights still overflow after TP·EP | `pp` (⌈overflow⌉, capped by layers / devices) | Depth reduction |
+| Remainder | `dp = num_devices / (tp·pp·ep)` | Batch replication |
+
+**Deviation from implementation:** `derive_parallel` produces `tp`/`pp`/`ep`/`dp` factors, but only `tp` (via `--num-gpus` + `Parallel::Tp`) is honored by the compile path today; `dp`/`pp`/`ep` are computed but not yet compiled (`build_soc` rejects the non-`Tp` strategies). The thresholds above (75% HBM headroom, TP candidate set) are the code's actual heuristic, not the "N ≥ 4096 × n_units" rule of thumb this section previously described.
 
 ---
 
@@ -168,16 +189,20 @@ When a dependency crosses unit boundaries:
 | Peer-to-peer (NVLink) | `P2p` | Consumer issues direct read over fabric |
 | Discrete memory | `Rdma` | DPU copies from producer's HBM to consumer's HBM |
 
+`HandoffKind` ([`crates/rewrite/src/tilegraph.rs`](../../crates/rewrite/src/tilegraph.rs)) also carries the intra-unit variants `Hbm`, `SramSameSm`, `Dsm`, and `L2Local`; the three above are the cross-unit realizations chosen by the `collapse` pass.
+
 ### Bandwidth Modeling
 
-Cross-unit transfers consume interconnect bandwidth, modeled as a `BandwidthSet`:
+Cross-unit transfers consume interconnect bandwidth, modeled by a `BandwidthSet` ([`crates/schedule/src/interval.rs`](../../crates/schedule/src/interval.rs)):
 
 ```rust
-// In ResourceState:
-link: Vec<BandwidthSet>,  // one per link (e.g., NVLink 0, NVLink 1, ...)
+// In the scheduler's ResourceState (crates/schedule/src/resource.rs):
+link: BandwidthSet,  // one aggregate interconnect capacity, not per-link
 ```
 
-The scheduler checks `bandwidth_set.capacity_ok(start, end, weight, limit)` before placing a cross-unit DMA, preventing link saturation.
+The scheduler calls `ResourceState::link_ok` — which delegates to `BandwidthSet::capacity_ok(start, end, weight, limit)` — before placing a cross-unit DMA, preventing link saturation. `link_next_feasible` / `reserve_link` complete the reservation API.
+
+**Deviation from implementation:** The model tracks a single aggregate interconnect budget, not a `Vec` of per-link (NVLink 0, NVLink 1, …) budgets.
 
 ---
 
@@ -226,7 +251,7 @@ KV cache uses **page-table indirection** (design §10.6):
 - Interleaved strategies create heterogeneous communication patterns that complicate counter scoping
 - For 2-8 GPU systems (the common case), pure TP with all-reduce is simpler and often faster than TP+PP
 
-**Counter-claim: TP all-reduce creates a bubble.** Response: With NVLink-connected GPUs, all-reduce for a 4096-dim vector takes ~5μs. The GEMM that produced it took ~100μs. The bubble is 5% — acceptable. For large models where the bubble grows, PP becomes attractive — hence the `Parallel::Pipeline` option.
+**Counter-claim: TP all-reduce creates a bubble.** Response: With NVLink-connected GPUs, all-reduce for a 4096-dim vector takes ~5μs. The GEMM that produced it took ~100μs. The bubble is 5% — acceptable. For large models where the bubble grows, PP becomes attractive — hence the `Parallel::Pp` option (not yet implemented).
 
 ### Decision: N-Axis Partitioning (not M-axis, not K-axis)
 
@@ -244,7 +269,7 @@ KV cache uses **page-table indirection** (design §10.6):
 
 ### Decision: Collectives as Tile Graph Nodes (not library calls)
 
-**Chosen:** All-reduce/all-gather operations appear as `TileNode::Compute { kind: Join }` in the graph.
+**Chosen:** All-reduce/all-gather operations appear as `Compute::Join` nodes in the tile graph (`crates/rewrite/src/tilegraph.rs`).
 
 **Alternative:** Black-box NCCL/RCCL library calls outside the scheduler's visibility.
 
@@ -269,16 +294,16 @@ The multi-GPU system is designed for heterogeneous topologies:
 | H100 + CPU | CrossUnit (system atomic) | PCIe DMA |
 | Multi-node | CrossUnit (RDMA) | DPU-routed RDMA |
 
-The cost model's `Soc` abstraction handles mixed units:
+The cost model's `Soc` abstraction ([`crates/costmodel/src/unit.rs`](../../crates/costmodel/src/unit.rs)) handles mixed units — each `Unit` carries a `UnitKind` (`Gpu`/`Npu`/`Cpu`), a throughput `weight`, and its own `CostModel`, over a `MemoryModel { unified }`:
 
 ```rust
-let soc = Soc {
-    units: vec![
-        SocUnit { spec: &H100_SXM, sm_range: 0..132 },
-        SocUnit { spec: &H100_SXM, sm_range: 132..264 },
-    ],
-};
+pub struct Soc<'a> {
+    pub units: Vec<Unit<'a>>,     // each: { id, kind, weight, cm }
+    pub memory: MemoryModel,      // { unified: bool }
+}
 ```
+
+Today every unit is a GPU (`Soc::single` / `Soc::homogeneous`); the heterogeneous-unit path (mixing NPU/CPU) is scaffolding for future work.
 
 ---
 
@@ -286,14 +311,16 @@ let soc = Soc {
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| `Parallel::Single` | ✅ Complete | Default path |
-| `Parallel::Tensor(n)` | ✅ Complete | N-axis partitioning, Join nodes, cross-unit counters |
+| Single GPU (`--num-gpus 1`) | ✅ Complete | Default path; `Soc::single` |
+| `Parallel::Tp` | ✅ Complete | N-axis partitioning, `Compute::Join` nodes, cross-unit counters |
 | Multi-unit `Soc` | ✅ Complete | `partition_n`, per-unit placement |
-| `CrossUnit` counter scope | ✅ Complete | System-scope atomics |
+| `CrossUnit` counter scope | ✅ Complete | System-scope atomics (`packet::Scope`) |
 | `HandoffKind::Barrier` | ✅ Complete | Unified memory fence |
 | `HandoffKind::P2p` | ✅ Complete | Direct fabric read |
-| `Parallel::Pipeline` | 🔲 Planned | Block partitioning across units |
-| `Parallel::Expert` | 🔲 Planned | Schema exists, compilation path needed |
-| `HandoffKind::Rdma` | 🔲 Planned | DPU integration |
-| Multi-node (Level 3) | 🔲 Planned | Requires DPU runtime |
-| Wavefront clustering for cross-unit | 🔲 Planned | Contention reduction |
+| `derive_parallel` sizing helper | ✅ Complete | Emits `tp/pp/ep/dp`; only `tp` is consumed downstream |
+| `Parallel::Pp` | 🔲 Not implemented | Rejected by `build_soc`; block partitioning across units is future work |
+| `Parallel::Ep` | 🔲 Not implemented | Rejected by `build_soc`; schema types exist, cross-unit sharding needed |
+| `Parallel::Dp` | 🔲 Not implemented | Rejected by `build_soc` |
+| `HandoffKind::Rdma` | 🔲 Not implemented | DPU integration |
+| Multi-node (Level 3) | 🔲 Not implemented | Requires DPU runtime |
+| Wavefront clustering for cross-unit | 🔲 Not implemented | Contention reduction |

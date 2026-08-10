@@ -96,12 +96,19 @@ mod amd_serve {
     ///
     /// Serving state is per slot: `pos[s]` is the next KV row sequence `s`
     /// writes, and `live[s]` says whether the slot holds a request. Every
-    /// decode dispatch advances ALL `B` rows whether or not they are live —
-    /// the program's `t` is compiled, not passed — so an idle slot is fed
+    /// decode dispatch advances ALL of the RUNG's rows whether or not they are
+    /// live — the program's `t` is compiled, not passed — so an idle slot is fed
     /// `pos = 0, kvlen = 1, id = 0` and computes a throwaway token over KV row
     /// 0 of its own block. That is wasted work, and it is the reason a large
     /// `B` costs latency at low concurrency; it is not a correctness problem,
     /// because an idle slot's block is touched by nothing else.
+    ///
+    /// THE DECODE BATCH LADDER is what bounds that waste. A blob emitted with
+    /// `PLOW_DECODE_BATCH_LADDER=1,2,4,8,16` carries one decode program per rung,
+    /// and `dispatch_all` picks the narrowest rung that covers the occupied slots
+    /// — so `B` is the CEILING on wasted rows, not the price of every step. `batch`
+    /// stays the widest rung, because that is what the KV cache holds and what the
+    /// mux sizes its slot table to; only the program under it moves.
     pub struct AmdServe {
         ranks: Ranks,
         stop_ids: Arc<Vec<u32>>,
@@ -132,6 +139,10 @@ mod amd_serve {
         /// in between. `PLOW_PF_NO_CHUNK=1` restores whole-prompt-per-tick.
         pf: Vec<Option<PfCursor>>,
         chunk_prefill: bool,
+        /// Width of the decode rung the last dispatch ran, so a rung CHANGE can be logged
+        /// once instead of every step. It is the only externally visible evidence that the
+        /// ladder is engaging, and a measurement that cannot show that is not a measurement.
+        last_rung: u32,
     }
 
     /// A prompt part-way through its prefill.
@@ -205,9 +216,12 @@ mod amd_serve {
                 )?)
             };
 
-            let (n_programs, max_ctx, bound) = match &ranks {
-                Ranks::One(e) => (e.n_programs(), e.max_ctx(), e.weights_bound()),
-                Ranks::Tp(g) => (g.rank(0).n_programs(), g.max_ctx(), g.weights_bound()),
+            // `has_prefill`, not `n_programs == 1`: with a DECODE BATCH LADDER a decode-only
+            // blob has one program PER RUNG, so counting programs would call a five-rung
+            // decode-only packet "has prefill" and hand a whole prompt to a decode program.
+            let (has_prefill, max_ctx, bound) = match &ranks {
+                Ranks::One(e) => (e.has_prefill(), e.max_ctx(), e.weights_bound()),
+                Ranks::Tp(g) => (g.rank(0).has_prefill(), g.max_ctx(), g.weights_bound()),
             };
             // TP + BATCH IS NOW SERVED. It was refused while
             // `AmdTpGroup::submit_decode` took ONE `(pos, kvlen)`: the rendezvous
@@ -234,11 +248,16 @@ mod amd_serve {
                         .into(),
                 ));
             }
+            let rungs = match &ranks {
+                Ranks::One(e) => e.decode_rungs(),
+                Ranks::Tp(g) => g.rank(0).decode_rungs(),
+            };
             tracing::info!(
                 n_gpu,
                 max_ctx,
                 batch,
-                decode_only = n_programs == 1,
+                decode_rungs = ?rungs,
+                decode_only = !has_prefill,
                 stop_ids = ?stop_ids,
                 "AMD serve engine ready"
             );
@@ -249,13 +268,14 @@ mod amd_serve {
                 pos: vec![0; batch],
                 live: vec![false; batch],
                 next_id: vec![0; batch],
-                decode_only: n_programs == 1,
+                decode_only: !has_prefill,
                 max_ctx,
                 prefix_cache: crate::config::RuntimeConfig::get().nv.prefix_cache,
                 cached_prompt: vec![Vec::new(); batch],
                 snap_at: vec![0; batch],
                 pf: (0..batch).map(|_| None).collect(),
                 chunk_prefill: !crate::config::RuntimeConfig::get().nv.pf_no_chunk,
+                last_rung: 0,
             })
         }
 
@@ -496,6 +516,14 @@ mod amd_serve {
             };
             let cur = self.pf[slot].as_mut().expect("just built");
             let step = cur.steps[cur.next];
+            tracing::debug!(
+                slot,
+                c0 = step.c0,
+                clen = step.clen,
+                chunk = cur.next,
+                frontier = cur.frontier,
+                "pf chunk"
+            );
             // Rebase for this chunk and hand the base back before returning: the decode that runs
             // later in this same tick refuses a non-zero base.
             g.kv_rebase_all(slot)?;
@@ -515,6 +543,7 @@ mod amd_serve {
             }
             let ids = g.read_sampled_all()?;
             let tok = AmdTpGroup::agree(&ids)?;
+            tracing::debug!(slot, tok, n = cur.prompt.len(), "pf complete");
             let n = cur.prompt.len() as u32;
             let (resume, arm) = (cur.resume, cur.arm);
             let prompt_owned = std::mem::take(&mut cur.prompt);
@@ -679,16 +708,105 @@ mod amd_serve {
             //
             // On a blob without `in.parked` this is a no-op, so a non-batched packet is unchanged.
             let parked: Vec<u32> = (0..self.batch).map(|s| u32::from(!self.live[s])).collect();
+            // THE DECODE BATCH LADDER (`PLOW_DECODE_BATCH_LADDER` at emit). Pick the
+            // NARROWEST decode program that still advances every occupied slot, and pay only
+            // that program's wasted rows instead of `batch`'s.
+            //
+            // THE ARGUMENT IS OVER SLOTS, NOT OVER LIVE COUNT, and the distinction is the
+            // whole of the correctness case. A rung of width `w` advances rows `[0, w)` only;
+            // a sequence sitting in slot 5 is simply not stepped by a width-4 rung, and since
+            // the host advances `pos` regardless it would decode from a KV row it never wrote.
+            // So the rung is chosen from the HIGHEST OCCUPIED SLOT INDEX, and slots are handed
+            // out lowest-first by the mux, which is what makes the two usually agree.
+            //
+            // NO COMPACTION on release. Freeing slot 0 while slot 5 is live leaves the rung
+            // where it was: moving a sequence down would mean copying its whole KV block
+            // (GiB), which costs far more than the rows it would save. The ladder narrows again
+            // when the high slots drain — which is the common shape, since a slot is reused by
+            // the next admission before higher ones are.
+            //
+            // A slot MID-PREFILL counts as occupied: its rows are real KV and the parked-row
+            // logic above already points it at its own frontier.
+            let rows = (0..self.batch)
+                .filter(|&s| self.live[s] || self.pf[s].is_some())
+                .map(|s| s + 1)
+                .max()
+                .unwrap_or(1);
+            // `advance` is drawn from the live slots, so `rows` covers it by construction —
+            // but the failure if it ever did not is a host position stepped past a KV row the
+            // device never wrote, which is fluent wrong text and no fault. Sixteen comparisons
+            // against an 11 ms token is the right price for closing that off in RELEASE, not
+            // just under debug_assert.
+            if let Some(&s) = advance.iter().find(|&&s| s >= rows) {
+                return Err(RuntimeError::Device(format!(
+                    "decode ladder: slot {s} is being advanced but the rung covers only \
+                     {rows} rows — the slot table and the live set disagree"
+                )));
+            }
             let out = match &mut self.ranks {
                 Ranks::One(e) => {
+                    let dp = e.decode_prog_for(rows);
+                    let w = e.prog_t(dp);
+                    if w != self.last_rung {
+                        tracing::info!(rung = w, occupied = rows, "decode ladder rung");
+                        self.last_rung = w;
+                    }
                     e.upload_parked(&parked)?;
                     e.seed_ids(&self.next_id)?;
-                    e.decode_step_batched(&p, &k)?
+                    e.decode_step_batched_at(&p, &k, dp)?
                 }
                 Ranks::Tp(g) => {
+                    let dp = g.rank(0).decode_prog_for(rows);
+                    let w = g.rank(0).prog_t(dp);
+                    if w != self.last_rung {
+                        tracing::info!(rung = w, occupied = rows, "decode ladder rung");
+                        self.last_rung = w;
+                    }
+                    tracing::debug!(
+                        rung = w,
+                        pos = ?&p[..(w as usize).min(p.len())],
+                        kvlen = ?&k[..(w as usize).min(k.len())],
+                        parked = ?&parked[..(w as usize).min(parked.len())],
+                        ids = ?&self.next_id[..(w as usize).min(self.next_id.len())],
+                        "dstep stage"
+                    );
                     g.upload_parked(&parked)?;
                     g.seed_ids(&self.next_id)?;
-                    g.decode_step_batched(&p, &k)?
+                    let out = g.decode_step_batched_at(&p, &k, dp)?;
+                    // Task-9 differential counter audit: dump rank-0 end-state
+                    // counters per tick for offline diff (same rung ⇒ must be
+                    // byte-identical every tick).
+                    if let Some(dir) = crate::config::RuntimeConfig::get().amd.ctr_snap.as_deref() {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static TICK: AtomicU64 = AtomicU64::new(0);
+                        let t = TICK.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(snap) = g.ctr_snapshot(dp) {
+                            let bytes: Vec<u8> =
+                                snap.iter().flat_map(|v| v.to_le_bytes()).collect();
+                            let _ = std::fs::write(format!("{dir}/tick_{t:05}_r{w}.bin"), bytes);
+                        }
+                    }
+                    // Round-7 data audit: layer-0 KV slot head + act tensors of
+                    // PLOW_SNAP_SLOT after each tick.
+                    if let Some(dir) = crate::config::RuntimeConfig::get().amd.tens_snap.as_deref()
+                    {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static DTICK: AtomicU64 = AtomicU64::new(0);
+                        let t = DTICK.fetch_add(1, Ordering::Relaxed);
+                        let slot = crate::config::RuntimeConfig::get().amd.snap_slot;
+                        if let Ok(snaps) = g.data_snapshot(
+                            slot,
+                            65536,
+                            &["act.qa", "act.oat", "act.attn", "act.xn"],
+                        ) {
+                            for (name, bytes) in snaps {
+                                let f = name.replace('/', "_");
+                                let _ =
+                                    std::fs::write(format!("{dir}/t{t:05}_r{w}_{f}.bin"), bytes);
+                            }
+                        }
+                    }
+                    out
                 }
             };
             for &s in advance {

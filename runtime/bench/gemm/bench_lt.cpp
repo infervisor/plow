@@ -36,6 +36,15 @@ int main(int argc, char** argv){
     {"down",     2560, 9728},
   };
 
+  /* SHAPE ON ARGV, so the same tuned-library reference can be pointed at another model's
+   * demand without a recompile per shape. `bench_lt <mode>` alone is unchanged: the Qwen
+   * table above. `bench_lt <mode> M N K [name]` replaces the whole cross product with the
+   * one (M,N,K), which is what a per-shape A/B against plow's own tile ladder needs. */
+  if(argc>4){
+    Ms.assign(1, (int64_t)atoll(argv[2]));
+    shapes.assign(1, Shape{ argc>5 ? argv[5] : "shape", (int64_t)atoll(argv[3]), (int64_t)atoll(argv[4]) });
+  }
+
   hipblasLtHandle_t handle; LCHK(hipblasLtCreate(&handle));
   size_t wsBytes = size_t(512)*1024*1024;
   void* ws; CHK(hipMalloc(&ws,wsBytes));

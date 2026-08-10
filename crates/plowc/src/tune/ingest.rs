@@ -30,6 +30,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use kernelcaps::QuantScheme;
+use packet::dev::DevOp;
 use tunedb::gemm::parse_quant;
 use tunedb::{
     gemm_op_case, gemm_rung_opcode, Correctness, Digests, KernelMeasurement, RecordState, Stats,
@@ -56,6 +58,13 @@ struct Row {
 /// Probing is REQUIRED, not best-effort: a record filed under a guessed build would be selectable
 /// against an object nobody measured, which is worse than no record at all.
 pub fn digests(root: &Path, isa: hwspec::IsaLevel) -> Result<Digests, Err> {
+    Ok(probe_inventory(root, isa)?.1)
+}
+
+fn probe_inventory(
+    root: &Path,
+    isa: hwspec::IsaLevel,
+) -> Result<(kernelcaps::Inventory, Digests), Err> {
     // `isa` is a PARAMETER because the digest identifies the object the records describe. Probing
     // Gfx950 unconditionally keyed every gfx942 measurement to a gfx950 build, which is exactly
     // the "record filed under a guessed build" this function's own doc comment refuses.
@@ -65,12 +74,13 @@ pub fn digests(root: &Path, isa: hwspec::IsaLevel) -> Result<Digests, Err> {
             "cannot probe the {arch} interpreter ({e}); ingest needs it to key records to a build"
         )
     })?;
-    Ok(Digests {
+    let want = Digests {
         implementation: inv.build().label(),
         interpreter: inv.build().label(),
         toolchain: inv.build().toolchain.clone(),
         oracle: GEMM_ORACLE.to_string(),
-    })
+    };
+    Ok((inv, want))
 }
 
 /// Publish a sample file into the store. Returns the number of QUALIFIED records published — the
@@ -86,9 +96,25 @@ pub fn ingest(
 ) -> Result<usize, Err> {
     let text = std::fs::read_to_string(samples)
         .map_err(|e| format!("cannot read samples {}: {e}", samples.display()))?;
-    let want = digests(root, isa)?;
+    let (inv, want) = probe_inventory(root, isa)?;
     println!("build digest: {}", want.interpreter);
     println!("toolchain   : {}", want.toolchain);
+
+    // Tile → opcodes, derived from the PROBED inventory rather than the static gfx950 RUNGS
+    // table. The distinction is load-bearing on gfx942: its object is built GM_BM=192 GM_BN=256,
+    // so `Gemm` and `GemmC5` carry the SAME 192x256x64 tile, and a map that files each geometry
+    // under one opcode leaves the other with zero records — after which `select_kernel` (which
+    // uses measurements only if EVERY candidate has one) discards the whole campaign. A timing is
+    // a fact about a tile in this build, so it is filed under every dispatched opcode carrying
+    // that tile.
+    let tile_ops: Vec<(String, QuantScheme, DevOp)> = inv
+        .iter()
+        .filter(|s| s.dispatched)
+        .filter_map(|s| {
+            s.tile
+                .map(|t| (format!("{}x{}x{}", t.bm, t.bn, t.bk), s.quant, s.id.0))
+        })
+        .collect();
 
     let mut records = Vec::new();
     let mut skipped_no_opcode: BTreeMap<String, usize> = BTreeMap::new();
@@ -102,12 +128,24 @@ pub fn ingest(
         let quant = parse_quant(&r.quant).ok_or_else(|| format!("unknown quant {:?}", r.quant))?;
         // A tile with no dispatch arm is a legitimate measurement of a kernel BODY and not a
         // selectable fact — the sweep also compiles calibration-only tiles (320x128, 384x128,
-        // 128x384, 192x128). Reported, never stored.
-        let Some(op) = gemm_rung_opcode(&r.tile, quant) else {
-            *skipped_no_opcode.entry(r.tile.clone()).or_default() += 1;
-            continue;
-        };
-        let (kernel_id, kernel_name) = (op as u16, op.c_name().to_string());
+        // 128x384, 192x128). Reported, never stored. The static RUNGS map is kept as a fallback
+        // for a probe that found no tiled specs (it is also what pins the sweep↔dispatch
+        // agreement in `rungs_map_to_distinct_opcodes`).
+        let mut ops: Vec<DevOp> = tile_ops
+            .iter()
+            .filter(|(t, q, _)| *t == r.tile && *q == quant)
+            .map(|(_, _, op)| *op)
+            .collect();
+        ops.sort_unstable_by_key(|op| *op as u16);
+        ops.dedup();
+        if ops.is_empty() {
+            if let Some(op) = gemm_rung_opcode(&r.tile, quant) {
+                ops.push(op);
+            } else {
+                *skipped_no_opcode.entry(r.tile.clone()).or_default() += 1;
+                continue;
+            }
+        }
         let stats = Stats::from_samples(r.samples_ns.clone())
             .map_err(|e| format!("{} {}x{}x{}: {e}", r.sym, r.m, r.n, r.k))?;
         let op_case = gemm_op_case(r.m, r.n, r.k, quant);
@@ -118,33 +156,37 @@ pub fn ingest(
                 detail: format!("f64 dot spot-check mismatch on {}", r.sym),
             }
         };
-        if !r.correct {
-            failed.push(format!("{op_case} {kernel_name}"));
+        for op in ops {
+            let (kernel_id, kernel_name) = (op as u16, op.c_name().to_string());
+            if !r.correct {
+                failed.push(format!("{op_case} {kernel_name}"));
+            }
+            records.push(KernelMeasurement {
+                op_case: op_case.clone(),
+                kernel_id,
+                kernel_name,
+                profile: "prefill_dense".into(),
+                hardware: cell.to_string(),
+                // The cell is `vendor/isa/sku` (store.rs), so the sku IS the cell's last segment.
+                // The historical gfx950 cell keeps its recorded label (MI355X silicon measured
+                // into the mi350x cell) rather than silently relabeling old provenance.
+                sku: if cell == tunedb::GFX950_CELL {
+                    "MI355X".into()
+                } else {
+                    cell.rsplit('/').next().unwrap_or(cell).to_uppercase()
+                },
+                digests: want.clone(),
+                stats: stats.clone(),
+                correctness: correctness.clone(),
+                // Deliberately None: the register cost of these tiles is a property of the
+                // OBJECT, and it is checked by `scripts/build_gfx950.sh`'s cliff gate rather
+                // than re-derived here. Recording a number this command did not probe would be
+                // a claim.
+                registers: None,
+                state: RecordState::Provisional,
+                campaign: campaign.into(),
+            });
         }
-        records.push(KernelMeasurement {
-            op_case,
-            kernel_id,
-            kernel_name,
-            profile: "prefill_dense".into(),
-            hardware: cell.to_string(),
-            // The cell is `vendor/isa/sku` (store.rs), so the sku IS the cell's last segment.
-            // The historical gfx950 cell keeps its recorded label (MI355X silicon measured
-            // into the mi350x cell) rather than silently relabeling old provenance.
-            sku: if cell == tunedb::GFX950_CELL {
-                "MI355X".into()
-            } else {
-                cell.rsplit('/').next().unwrap_or(cell).to_uppercase()
-            },
-            digests: want.clone(),
-            stats,
-            correctness,
-            // Deliberately None: the register cost of these tiles is a property of the OBJECT,
-            // and it is checked by `scripts/build_gfx950.sh`'s cliff gate rather than re-derived
-            // here. Recording a number this command did not probe would be a claim.
-            registers: None,
-            state: RecordState::Provisional,
-            campaign: campaign.into(),
-        });
     }
 
     for (tile, n) in &skipped_no_opcode {

@@ -42,6 +42,39 @@ fn glm_prefill_shape() {
         .map(|&(t, _)| t)
         .take(buckets.len().saturating_sub(1))
         .collect();
+    // THE COVER SWEEP, both policies and both launch prices, on ONE line per
+    // length. This is the table that shows WHERE the ragged-tail cliff bites and
+    // how wide it is: `pad` is the shipped padding-vs-launch DP, `rag` is the
+    // fewest-launch cover `PLOW_RAGGED_CHUNK` uses, and the `LR=` columns are the
+    // DP re-run at a corrected launch price (LAUNCH_ROWS understates a GLM
+    // launch by ~3.4x: 416 rows charged against ~1400 rows measured).
+    //
+    // Read it for the finding it encodes: repricing moves almost NOTHING, because
+    // the DP is not making a mistake. At 4097 it is choosing between 4224 padded
+    // rows in two launches and 8192 padded rows in one, and under the PADDED
+    // regime two launches really is cheaper. Only the row shrink, which makes the
+    // padding free, changes the answer.
+    eprintln!(
+        "\nlen      pad-cover                          n  rag-cover            n   LR=1400  LR=4000"
+    );
+    for &n in &[
+        128u32, 1024, 1025, 1152, 2048, 4096, 4097, 4224, 8192, 8193, 12345, 16384, 16385,
+    ] {
+        let pad = plowrt::exec::amd::plan_chunks_cfg(&bkt, n, 416, false).unwrap_or_default();
+        let rag = plowrt::exec::amd::plan_chunks_cfg(&bkt, n, 416, true).unwrap_or_default();
+        let lr14 = plowrt::exec::amd::plan_chunks_cfg(&bkt, n, 1400, false).unwrap_or_default();
+        let lr40 = plowrt::exec::amd::plan_chunks_cfg(&bkt, n, 4000, false).unwrap_or_default();
+        eprintln!(
+            "{n:<8} {:<34} {}  {:<20} {}   {:<8} {}",
+            format!("{pad:?}"),
+            pad.len(),
+            format!("{rag:?}"),
+            rag.len(),
+            lr14.len(),
+            lr40.len(),
+        );
+    }
+
     let chunks = plowrt::exec::amd::plan_chunks(&bkt, n_prompt).expect("plan");
     let cover: u32 = chunks.iter().sum();
     let segs: usize = chunks

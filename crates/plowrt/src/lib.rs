@@ -17,8 +17,7 @@
 //!   ([`orch`]),
 //! * and serves an OpenAI-compatible API ([`serve`]).
 //!
-//! The design is documented per subsystem under `docs/runtime/` and in
-//! the design notes.
+//! The design is documented per subsystem under `docs/runtime/`.
 
 pub mod analysis;
 pub mod asset;

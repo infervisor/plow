@@ -186,8 +186,34 @@ struct Cli {
     /// and everything else from that work (the manifest record, the degrade on
     /// a missing binary, and the fix for the GLM/Kimi/DeepSeek early-returns
     /// that were dropping the hook entirely) is unconditional and stays on.
+    ///
+    /// SCOPE OF THE BACK-OUT NARROWED 2026-08-10: the paragraph above is about
+    /// the SCHEDULE (per-bucket) path, which is where AddressMapSound runs and
+    /// where Gemma-4-12B rejects. The DEVBLOB path has its own defaulted
+    /// switch below (`--lean-verify-devblob`). This flag still force-enables
+    /// both paths.
     #[arg(long = "lean-verify", action = clap::ArgAction::SetTrue)]
     lean_verify: bool,
+
+    /// Lean ordering certificate on the DEVBLOB path — ON by default
+    /// (`--lean-verify-devblob=false` to disable). Default-on is safe here and
+    /// not on the schedule path: this path's checkpoint-D form (GQ order
+    /// topological over counter edges) passes every GLM-5.2 program, a missing
+    /// or unrunnable `plow_verify` degrades to a recorded skip, and a
+    /// REJECTION aborts the emit — a bug caught, never downgraded.
+    #[arg(long = "lean-verify-devblob", default_value_t = true,
+          action = clap::ArgAction::Set, num_args = 0..=1,
+          require_equals = true, default_missing_value = "true")]
+    lean_verify_devblob: bool,
+
+    /// Lean performance oracle on the DEVBLOB path — ON by default
+    /// (`--lean-oracle-devblob=false` to disable). Read-only: a log line and a
+    /// manifest record; the decode lower bound stays labeled certified=false
+    /// (analytical, no proof object attached on this path).
+    #[arg(long = "lean-oracle-devblob", default_value_t = true,
+          action = clap::ArgAction::Set, num_args = 0..=1,
+          require_equals = true, default_missing_value = "true")]
+    lean_oracle_devblob: bool,
 
     /// Drop counters already covered by resource-order (§8.1 counter
     /// elimination). Provably safe by the DAG-side theorem; combined with
@@ -736,7 +762,7 @@ fn devblob_verify_hook(
             //
             // Under `PLOW_L2_PLACE` it is NOT. `Builder::finish` stable-sorts `gq_stream` by
             // `seg` into `l2_domains` windows, and the runtime gives each domain its OWN cursor
-            // over its OWN window. Entry `i`'s issue
+            // over its OWN window (see the design notes). Entry `i`'s issue
             // predecessor is then the previous entry OF ITS DOMAIN. Handing the placed stream to
             // the one-cursor model makes every counter edge that crosses from a later window
             // back to an earlier one look like a backward edge, and checkpoint D reports the
@@ -807,6 +833,84 @@ fn devblob_verify_hook(
                 entries = n,
                 "lean ordering certificate: GQ order topological over counter edges"
             );
+            // LdsFitSound (checkpoint G): every always-staged GEMV instance in this
+            // program must fit the decode-object LDS arena — the task-9 bug class,
+            // rejected at emit. The staged set mirrors op_gemm.h's "x is ALWAYS
+            // staged in LDS here" family; demand is the kernel's rows*K (+ the
+            // q-norm fold scratch when t[7] rides GemvQkv). Plain Gemv is excluded
+            // by design: its body carries a per-op fit fallback.
+            {
+                use packet::dev::{DevOp, TENSOR_NONE};
+                const GV_NORM_SCRATCH: u64 = 16;
+                let staged: Vec<serde_json::Value> = p
+                    .insts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ix, inst)| {
+                        let (name, scratch) = if inst.op == DevOp::GemvQkv as u16 {
+                            (
+                                "GemvQkv",
+                                if inst.t[7] != TENSOR_NONE {
+                                    GV_NORM_SCRATCH
+                                } else {
+                                    0
+                                },
+                            )
+                        } else if inst.op == DevOp::GemvQkvg as u16 {
+                            ("GemvQkvg", 0)
+                        } else if inst.op == DevOp::GemvQkvMxfp4 as u16 {
+                            ("GemvQkvMxfp4", 0)
+                        } else if inst.op == DevOp::GemvGlu as u16 {
+                            ("GemvGlu", 0)
+                        } else if inst.op == DevOp::GemvGluSz as u16 {
+                            ("GemvGluSz", 0)
+                        } else if inst.op == DevOp::GemvGluMxfp4 as u16 {
+                            ("GemvGluMxfp4", 0)
+                        } else {
+                            return None;
+                        };
+                        Some(serde_json::json!({
+                            "op": name,
+                            "idx": ix,
+                            "rows": inst.i[0],
+                            "k": inst.i[2],
+                            "scratch": scratch,
+                        }))
+                    })
+                    .collect();
+                let n_staged = staged.len();
+                let arena = devgen::decode_arena_halves();
+                let cert = match lean_verify::call(
+                    "G",
+                    serde_json::json!({ "arena": arena, "ops": staged }),
+                ) {
+                    Ok(c) => c,
+                    Err(e) if e.is_binary_unusable() => {
+                        warn!(error = %e, "LdsFitSound skipped: verifier not runnable");
+                        rep.verified = false;
+                        rep.reason = Some(format!("verifier not runnable: {e}"));
+                        return Ok(rep);
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "program {pi} (T={t}): LdsFitSound call failed: {e}"
+                        ))
+                    }
+                };
+                if !cert.ok {
+                    return Err(format!(
+                        "program {pi} (T={t}): LdsFitSound REJECTED: {}",
+                        cert.reason.unwrap_or_default()
+                    ));
+                }
+                info!(
+                    program = pi,
+                    t,
+                    staged = n_staged,
+                    arena,
+                    "lean LdsFitSound: staged-LDS demand within arena"
+                );
+            }
         }
         // Every program certified. `verified` claims exactly that and nothing more.
         rep.verified = true;
@@ -1000,9 +1104,16 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     //    topological over its counter edges (plow_verify checkpoint D);
     //  * `--lean-oracle`: a Lean-certified decode lower bound — critical
     //    path + the weight-streaming bandwidth floor of the decode program.
-    let verify = if !cli.lean_verify && !cli.lean_oracle {
+    // DEVBLOB PATH: certificate and oracle are DEFAULT-ON as of 2026-08-10 via
+    // their own clap switches (`--lean-verify-devblob` / `--lean-oracle-devblob`,
+    // both defaulted true). The Gemma-4-12B AddressMapSound back-out is a
+    // SCHEDULE-path verdict and that path keeps its opt-in `--lean-verify`,
+    // which still force-enables here too.
+    let lean_verify_on = cli.lean_verify || cli.lean_verify_devblob;
+    let lean_oracle_on = cli.lean_oracle || cli.lean_oracle_devblob;
+    let verify = if !lean_verify_on && !lean_oracle_on {
         Some(devgen::skip_hook(
-            "both gates disabled on the command line (--no-lean-verify --no-lean-oracle)",
+            "both gates disabled (--lean-verify-devblob=false --lean-oracle-devblob=false)",
         ))
     } else if let Some(why) = lean_unavailable_reason() {
         // DEGRADE, DO NOT FAIL. Absent a verifier the compile proceeds and the
@@ -1029,8 +1140,8 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let bw_bytes_per_cycle =
             (spec.mem.bandwidth_for_bound().0 * 1e9 / spec.clock_boost.0 as f64) as u64;
         Some(devblob_verify_hook(
-            cli.lean_verify,
-            cli.lean_oracle,
+            lean_verify_on,
+            lean_oracle_on,
             bw_bytes_per_cycle,
             spec.clock_boost.0,
         )?)
@@ -1040,7 +1151,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // not from an env-supplied constant; the flag only says whether to use it. `None` (flag
     // unset, or an unpartitioned GPU such as consumer Blackwell) ⇒ byte-identical blob. The
     // physical-SM dispatch that consumes this is a runtime/interp feature —
-    // see the design notes
+    // see the design notes.
     //
     // WAS `PLOW_NV_PLACE`, still accepted. The concept is vendor-neutral — an L2 domain is a GPC
     // on NVIDIA and an XCD on AMD — and the NVIDIA-specific name was reading as "this is an

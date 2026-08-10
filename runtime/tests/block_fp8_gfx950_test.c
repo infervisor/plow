@@ -415,7 +415,7 @@ int main(int argc, char** argv) {
     const unsigned NCU = 64;
     printf("block-fp8 decode GEMV (weight_block_size [128,128])   [N=out, K=in]:\n");
     /* Real GLM-5.2-FP8 decode GEMV shapes (hidden 6144). N=out-channels, K=in. All 128-multiples
-     * except kv_a's N=576 (NB=ceil(576/128)=5). See the design notes */
+     * except kv_a's N=576 (NB=ceil(576/128)=5). See the design notes. */
     /* --- attention projections --- */
     run(h, &k, NCU, "q_a  6144->2048",   2048,  6144);
     run(h, &k, NCU, "q_b  2048->16384", 16384,  2048);

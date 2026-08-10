@@ -48,8 +48,9 @@ op set and a gap.
 | block-fp8 linears | `GEMV_FP8_BLK`, `DENSE_GLU_FP8_BLK` | yes |
 | GLM DSA indexer | `INDEX_SCORE`, `INDEX_SELECT`, `FLASH_GATHER_DECODE` | yes |
 | GLM DSA prefill | `FLASH_GATHER_PREFILL` | yes (`PLOW_MLA_PREFILL=1`) |
-| tensor-parallel | `XREDUCE`, `XREDUCE2`, `XFLASHMERGE`, `XARGMAX_FIN` | yes |
-| | `XALLGATHER`, `XREDUCESCATTER` | no |
+| tensor-parallel | `XREDUCE`, `XREDUCE2`, `XARGMAX_FIN` | yes |
+| | `XFLASHMERGE` | dispatch only — the arm is an empty STUB, no body, no emitter (allowlisted in `GFX950_UNEMITTED`) |
+| | `XALLGATHER`, `XREDUCESCATTER` | no — reserved opcode numbers, no arm on any backend and no emitter |
 
 **This gap is now closed.** `FLASH_MLA_PREFILL` and `FLASH_GATHER_PREFILL` were
 defined in the ISA and absent from the AMD switch, so these three models could

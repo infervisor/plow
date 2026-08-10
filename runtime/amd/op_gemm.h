@@ -1707,13 +1707,35 @@ __device__ void d_gemm_glu_fp8(bf16* C, const unsigned char* A, const unsigned c
  * is owned by ONE wave: the 64 lanes stride K, wave-reduce the row absmax, set a_scale = absmax/448,
  * then quantize xq = round_e4m3(x / a_scale) with the native packed cvt. Rows are sliced across the
  * `nblk` workgroups; a workgroup takes PLOW_WAVES rows at a time. e4m3 has no inf (fn), max 448. */
-__device__ void d_quant_fp8(unsigned char* __restrict__ xq_, const bf16* __restrict__ x_,
+/* T11 GLU FOLD (t3=gate, t4=up, i2=act on the packet; all absent on legacy ones). With `gate`
+ * set, `x` is an OUTPUT: the wave that owns the row PRODUCES fu = act(gate)*up itself, stores
+ * it, and takes the row amax from the bf16-ROUNDED value it just wrote — so xq/a_scale are
+ * BIT-IDENTICAL to the `Glu` packet + a re-reading QuantFp8 this replaces (`act_gate_only` is
+ * the same elementwise helper `d_glu` calls, and fmax is order-independent). What it deletes is
+ * that packet, its global gate, and one full inter-width pass over `fu`.
+ *
+ * THIS ARM IS WHY `plow_t11_gluquant_arm` EXISTS. The emitter DROPS the `Glu` packet when it
+ * folds, so an object without this arm quantizes an `fu` that was never computed: no fault, no
+ * NaN, just a garbage FFN output, a wrong KV cache, and fluent wrong tokens. That is exactly
+ * what shipped — the AMD dispatch ignored t3/t4 while the NVIDIA one honoured them — so the
+ * pairing is refused at load rather than trusted (`PREFILL_ARM_MARKERS` in exec/amd.rs).
+ *
+ * THE LANE->ELEMENT MAP IS THE SAME IN BOTH LOOPS, AND IT HAS TO BE. The quant loop re-reads the
+ * `fu` this function just stored; with the produce loop striding by lane (k = lane, +64) and the
+ * quant loop by pairs (k = 2*lane, +128), lane l would read back bytes lane l^1 wrote, which is
+ * a cross-lane dependency through memory with no waitcnt to order it. Both loops walk
+ * {2l, 2l+1, 2l+128, ...}, so every element is re-read by the lane that produced it. */
+__device__ void d_quant_fp8(unsigned char* __restrict__ xq_, bf16* __restrict__ x_,
                             float* __restrict__ ascale_, unsigned M, unsigned K, unsigned slice,
-                            unsigned nblk) {
+                            unsigned nblk, const bf16* __restrict__ gate_ = nullptr,
+                            const bf16* __restrict__ up_ = nullptr, unsigned act = 0) {
     const unsigned lane = threadIdx.x & 63;
     const unsigned wave = threadIdx.x >> 6;
     auto* const xq = as_glob(xq_);
-    const auto* const x = as_glob(x_);
+    auto* const xw = as_glob(x_);
+    const auto* const x = as_glob((const bf16*)x_);
+    const auto* const gg = as_glob(gate_);
+    const auto* const ug = as_glob(up_);
     auto* const ascale = as_glob(ascale_);
     const unsigned per = (M + nblk - 1) / nblk;
     const unsigned m0 = slice * per;
@@ -1721,7 +1743,18 @@ __device__ void d_quant_fp8(unsigned char* __restrict__ xq_, const bf16* __restr
     for (unsigned m = m0 + wave; m < m1; m += PLOW_WAVES) {
         const size_t row = (size_t)m * K;
         float amax = 0.0f;
-        for (unsigned k = lane; k < K; k += PLOW_WAVE) amax = fmaxf(amax, fabsf(bf2f(x[row + k])));
+        if (gate_) {
+            for (unsigned k = lane * 2; k < K; k += PLOW_WAVE * 2) {
+                for (unsigned j = k; j < k + 2 && j < K; j++) {
+                    const bf16 fb = f2bf(act_gate_only(bf2f(gg[row + j]), act) * bf2f(ug[row + j]));
+                    st_act1(&xw[row + j], fb);
+                    amax = fmaxf(amax, fabsf(bf2f(fb)));
+                }
+            }
+        } else {
+            for (unsigned k = lane; k < K; k += PLOW_WAVE)
+                amax = fmaxf(amax, fabsf(bf2f(x[row + k])));
+        }
 #pragma unroll
         for (int off = 32; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, PLOW_WAVE));
         const float as = fmaxf(amax * (1.0f / 448.0f), 1e-12f);
@@ -1813,6 +1846,26 @@ __device__ void d_quant_fp8(unsigned char* __restrict__ xq_, const bf16* __restr
 /* Halves reserved at the TOP of the GEMM arena for the fused norm's cross-wave reduction,
  * kept clear of the staged row. PLOW_WAVES floats = 2*PLOW_WAVES halves, rounded to 16 B. */
 #define GV_NORM_SCRATCH ((2u * PLOW_WAVES + 7u) & ~7u)
+
+/* PLOW_GLM_FUSE_QNORM -- THE Q-NORM FOLD ARM on op 22 `GemvQkv` (opt-in build axis, default
+ * OFF; the emit knob of the same name is what puts `t[7]` on the packet).
+ *
+ * GLM-5.2 decode runs `GemvQkv-A -> RmsNorm(q_a_layernorm) -> GemvQkv-G` and the middle packet
+ * is ONE WORKGROUP. The decode census (perf-data/plow-gfx942/glm52-decode-packet-folds.md
+ * section 1b) traces the window between the two GEMVs at 12.2 us for a 4.6 us body -- the
+ * largest packet-boundary window left on the chain -- because a b=1 packet waits for the
+ * slowest of ~149 workgroups, runs alone on 1 CU while 303 idle, and only then opens the next
+ * gate. 63.7% of all in-packet CU time in that census is gate-wait.
+ *
+ * This arm computes the norm inside fusion G's staging, exactly the way `d_gemv_t`'s
+ * `norm == 2` does, and the emitter stops emitting the packet. It is a BUILD AXIS as well as
+ * an emit knob so an object built without it is byte-identical to one built before this
+ * existed; a blob that carries the fold is refused on such an object by the
+ * `plow_glm_fuse_qnorm_arm` marker (exec/amd.rs DECODE_ARM_MARKERS), because the failure mode
+ * otherwise is an UNNORMED q_a row -- finite, fluent and wrong. */
+#ifndef PLOW_GLM_FUSE_QNORM
+#define PLOW_GLM_FUSE_QNORM 0
+#endif
 
 /* Normalize the LDS-staged activation in place: lds[k] = f2bf(bf2f(lds[k]) * inv * gamma[k]).
  * Structurally d_rmsnorm's `fits` path with the row read from LDS instead of HBM. */
@@ -2350,6 +2403,116 @@ __device__ __forceinline__ void gemv_rows_rs(bf16* __restrict__ C, const bf16* _
         gemv_rows_r<MM, XLDS, UN, R>(C, x, W, M, N, K, n, lane, lds);
     for (; n < gv_n1; n += PLOW_WAVES)
         gemv_rows_r<MM, XLDS, GV_UNROLL, 1>(C, x, W, M, N, K, n, lane, lds);
+}
+
+/* ---- OPT-IN (PLOW_GEMV_LG=1): NARROW-K LANE-GROUP bf16 GEMV ----------- [BF16-GEMV-NARROWK-LG]
+ *
+ * THE SHAPE THIS FIXES, and it is the bf16 twin of `moe_down_lg_fp8_blk` (op_moe.h) one kernel
+ * over. `gemv_rows`/`gemv_rows_r` give ONE OUTPUT ROW to a whole 64-lane wave and hand lane L the
+ * 8 halves at k = 8*L, so a wave covers 512 halves per chunk. GLM-5.2 at TP8 runs the SHARED-EXPERT
+ * DOWN projection at N=6144, K=256 (`layers.*.mlp.shared_experts.down_proj`, b=48, 75 packets a
+ * token), and 256 < 512: only lanes 0..31 are in range. Half the wave loads bytes the buffer
+ * descriptor returns as zero and then spends the full 16 VALU of widen+FMA multiplying them,
+ * `wave_sum`'s leading butterfly step adds an exact +0.0, and `nchunk = ceil(256/512) = 1` so the
+ * R-split's `UN` unroll has nothing to unroll over: of the R*UN = 14 `buffer_load_dwordx4` the
+ * shipped clause issues per two-column round, TWELVE are entirely past `num_records` and fetch
+ * nothing. Measured on the box (`PLOW_TRACE_RAW`, ctx 1024, one decode step): 1506 CU-us of busy
+ * over 48 workgroups for 3.0 MB of weights -- 86 GB/s, against the 1.24 TB/s the SAME body reaches
+ * on o_proj (N=6144 K=2048) in the same layer. Its 35.0 us span is the LONGEST of any Gemv packet
+ * in a GLM MoE layer despite moving an eighth of o_proj's bytes.
+ *
+ * THE MAP. Split the wave into RG row-groups of LPG = 64/RG lanes; group `g` owns its own output
+ * row and lane `sub = lane%LPG` owns k = 8*sub. At RG=2 that is LPG=32 lanes x 8 halves = 256 K =
+ * exactly GLM's contraction, so every lane is live and one `global_load_dwordx4` retires TWO WHOLE
+ * CONSECUTIVE ROWS as a fully-coalesced 1024-byte fetch. Then UNR row-BATCHES are issued back to
+ * back before any is consumed, so RG*UNR rows are in flight at once -- the discipline the aiter
+ * diff identifies as the real difference, and the one thing `nchunk = 1` denies the shipped body.
+ *
+ * BIT-IDENTICAL, by the argument `moe_down_lg_fp8_blk` makes. The (lane -> k) fragment set for a
+ * row is unchanged (lane `sub` holds exactly what lane `sub` held), each row's partials are summed
+ * by the SAME xor-butterfly, and the ONE leading offset the 64-lane `wave_sum` applies (32) adds a
+ * lane whose `dot8` started at +0.0f and accumulated only products of a zero weight -- i.e. an
+ * exact +0.0, and `v + 0.0` is bitwise `v` for every `v` this reduction can produce (a `dot8` chain
+ * seeded at +0.0f is never -0.0). Which wave owns which row moves, and that is unobservable: `C[n]`
+ * is written by exactly one lane either way. The workgroup's column OWNERSHIP is unchanged
+ * ([gv_n0, gv_n1)), so PLOW_FINE's gemv->headnorm dependency map is unaffected.
+ *
+ * GUARDED to K <= LPG*8 (the whole contraction must fit one fragment per lane), to an 8-multiple K
+ * and to M == 1; anything else falls through to the shipped R-split/single-column walk, which is
+ * exact at any width. o_proj (K=2048) and the router gate (K=6144) therefore keep the shipped body
+ * -- correctly, because at K >= 512 every lane is already live and neither has this defect.
+ *
+ * Weight rows are read as plain 16-byte global vectors rather than through a `buf_rsrc`, because
+ * the row index is now LANE-VARYING and a descriptor built from a divergent base compiles to the
+ * readfirstlane waterfall this file documents at length. The `live` guard is what the descriptor's
+ * bounds check was doing. */
+#ifndef PLOW_GEMV_LG
+#define PLOW_GEMV_LG 0
+#endif
+#ifndef PLOW_GEMV_LG_RG
+#define PLOW_GEMV_LG_RG 2
+#endif
+/* UNR=8 = RG*UNR = 16 rows in flight. 16 is not arbitrary at the GLM shape: gv_per = 6144/48 = 128
+ * rows a workgroup over PLOW_WAVES = 8 waves is exactly 16 rows a wave, so every wave runs ONE
+ * balanced pass and there is no ragged tail. Register-wise it is CHEAPER than what it replaces:
+ * 8 x bf16v8 = 32 VGPRs of weight against the R-split's R*UN = 14 vectors = 56. */
+#ifndef PLOW_GEMV_LG_UNR
+#define PLOW_GEMV_LG_UNR 8
+#endif
+template <unsigned RG, unsigned UNR>
+__device__ __forceinline__ void gemv_lg_batch(const bf16* __restrict__ lds,
+                                              const bf16* __restrict__ W_, unsigned n0, unsigned N,
+                                              unsigned K, unsigned lane, float (&o)[UNR]) {
+    constexpr unsigned LPG = PLOW_WAVE / RG; /* lanes per row-group */
+    const unsigned g = lane / LPG, sub = lane % LPG;
+    const unsigned k = sub * 8u;
+    const bool live = (k + 8u <= K);
+    const unsigned kx = live ? k : 0u;
+    const auto* const W = as_glob(W_);
+    bf16v8 wv[UNR];
+    /* RG*UNR consecutive rows, every load issued before any is consumed */
+#pragma unroll
+    for (unsigned u = 0; u < UNR; u++) {
+        const unsigned n = n0 + u * RG + g;
+        const unsigned nc = (n < N) ? n : (N - 1u); /* clamp: the caller drops the value */
+        wv[u] = GV_LDW(W + (size_t)nc * K + kx);
+    }
+    const bf16v8 xv = ld_lds8(lds + kx); /* read once, used UNR times */
+#pragma unroll
+    for (unsigned u = 0; u < UNR; u++) {
+        float a = live ? dot8(wv[u], xv, 0.0f) : 0.0f;
+#pragma unroll
+        for (unsigned off = LPG / 2; off > 0; off >>= 1) a += __shfl_xor(a, (int)off, PLOW_WAVE);
+        o[u] = a;
+    }
+}
+
+template <unsigned RG, unsigned UNR>
+__device__ __forceinline__ void gemv_rows_lg(bf16* __restrict__ C_, const bf16* __restrict__ W,
+                                             unsigned N, unsigned K, unsigned slice, unsigned nblk,
+                                             const bf16* lds) {
+    constexpr unsigned LPG = PLOW_WAVE / RG;
+    constexpr unsigned PER = RG * UNR;
+    const unsigned lane = threadIdx.x & 63;
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned sub = lane % LPG, grp = lane / LPG;
+    auto* const C = as_glob(C_);
+    /* IDENTICAL column ownership to `gemv_rows`/`gemv_rows_rs` -- only which wave takes which row
+     * inside [gv_n0, gv_n1) moves. */
+    const unsigned gv_per = (N + nblk - 1) / nblk;
+    const unsigned gv_n0 = slice * gv_per;
+    const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
+    for (unsigned n0 = gv_n0 + wave * PER; n0 < gv_n1; n0 += PLOW_WAVES * PER) {
+        float o[UNR];
+        gemv_lg_batch<RG, UNR>(lds, W, n0, N, K, lane, o);
+        if (sub == 0u) {
+#pragma unroll
+            for (unsigned u = 0; u < UNR; u++) {
+                const unsigned n = n0 + u * RG + grp;
+                if (n < gv_n1) st_act1(&C[n], f2bf(o[u]));
+            }
+        }
+    }
 }
 
 /* ------------- MFMA GEMV: THE MATRIX CORE INSTEAD OF THE EMULATED DOT ----------------------
@@ -3562,7 +3725,7 @@ __device__ __forceinline__ void gemv_glu_rows_fp8(bf16* __restrict__ C_,
  * q/k/v and writes a fourth disjoint [H*D] buffer. It is the same merge along the OUTPUT axis, one
  * stream wider: Ntot = Nq+Nk+Nv+Ng and the ownership run each workgroup takes is still a
  * contiguous slice of that concatenation, so all 256 CUs stay uniformly loaded. This is NOT the
- * `GLM_GROUP=1` collapse (the design notes 6g-KNOBS, 38% fewer ops for +2.88 ms): that one
+ * `GLM_GROUP=1` collapse (6g-KNOBS, 38% fewer ops for +2.88 ms): that one
  * merged along a LOOP dimension and serialised work that had been running on disjoint CU slices.
  * Here the per-CU column count RISES from Ntot/256 to (Ntot+Ng)/256 -- the op gets WIDER, never
  * narrower, and nothing that ran in parallel starts running in sequence.
@@ -4055,6 +4218,22 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
                 }
             }
 #endif
+#if PLOW_GEMV_LG
+            /* NARROW-K TAKES THE LANE-GROUP MAP, and it is tried BEFORE the R-split because the
+             * R-split cannot help here: at K <= 256 `nchunk` is 1, so its `UN` unroll has nothing
+             * to unroll over and its extra column only doubles a load clause that is 12/14 dead.
+             * See gemv_rows_lg [BF16-GEMV-NARROWK-LG]. M == 1 exactly, because the arm carries no
+             * per-m accumulator and the `live` predication the other bodies do is what would pay
+             * for one. */
+            if constexpr (MM == 1) {
+                constexpr unsigned LG_RG = PLOW_GEMV_LG_RG, LG_UNR = PLOW_GEMV_LG_UNR;
+                constexpr unsigned LG_LPG = PLOW_WAVE / LG_RG;
+                if (M == 1u && K <= LG_LPG * 8u && (K & 7u) == 0u) {
+                    gemv_rows_lg<LG_RG, LG_UNR>(C, W, N, K, slice, nblk, lds);
+                    return;
+                }
+            }
+#endif
             if constexpr (MM == 1 && GV_RS_R > 1) {
                 if ((K + PLOW_WAVE * 8 - 1) / (PLOW_WAVE * 8) >= (unsigned)GV_RS_MAXNCH)
                     gemv_rows<MM, true, false, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
@@ -4226,7 +4405,8 @@ __device__ void d_gemv_glu(bf16* C, const bf16* x, const bf16* Wg, const bf16* W
 __device__ void d_gemv_qkvg(bf16* Cq, bf16* Ck, bf16* Cv, bf16* Cg, const bf16* x, const bf16* Wq,
                           const bf16* Wk, const bf16* Wv, const bf16* Wg, unsigned M, unsigned Nq,
                           unsigned Nk, unsigned Nv, unsigned Ng, unsigned K, unsigned slice,
-                          unsigned nblk, bf16* lds) {
+                          unsigned nblk, bf16* lds, const bf16* gnorm = nullptr,
+                          float eps = 0.0f) {
   gemv_walk(M, [&](unsigned m0, unsigned M_) {
     const bf16* x_ = x + (size_t)m0 * K;
     bf16* Cq_ = Cq + (size_t)m0 * Nq;
@@ -4235,6 +4415,32 @@ __device__ void d_gemv_qkvg(bf16* Cq, bf16* Ck, bf16* Cv, bf16* Cg, const bf16* 
     bf16* Cg_ = Ng ? Cg + (size_t)m0 * Ng : Cg;
     stage_x_lds(lds, x_, (size_t)M_ * K);
     __syncthreads();
+#if PLOW_GLM_FUSE_QNORM
+    /* Q-NORM FOLD (emit knob PLOW_GLM_FUSE_QNORM, `t[7]` on op 22): normalize the staged copy
+     * IN PLACE, then fall through to the ORDINARY un-normed hot loop — the k-loop never learns
+     * this happened, so it keeps its register allocation and its unroll. `gemv_norm_lds`
+     * barriers on exit. See its header note for the bit-exactness argument; this is d_gemv_t's
+     * `norm == 2` arm, applied to the fused three-stream sweep.
+     *
+     * A RUNTIME BRANCH, not a template parameter, and that is the GF=8 lesson (op_attention.h):
+     * a second INSTANTIATION of `gemv_qkvg_rows` would grow the decode object for every packet
+     * in the program, inside a persistent megakernel where they all share one instruction
+     * stream. The branch is wave-uniform (`gnorm` comes from the packet), so it costs one
+     * scalar test.
+     *
+     * TRAP, DO NOT FALL BACK. There is no packet to fall back TO — the emitter deleted it —
+     * so a shape the fold cannot take must stop the run rather than feed the GEMV an unnormed
+     * row. `glm_fuse_qnorm` in mla.rs refuses the same shapes at emit; this is the half that
+     * cannot be bypassed by a hand-written blob. Scratch from the TOP of the arena, past the
+     * staged row: `plow_smem` is a union, so the interpreter's `part` aliases `gm`. */
+    if (gnorm) {
+        if (!(((size_t)M_ * K + GV_NORM_SCRATCH <= GM_LDS_HALVES) &&
+              (K <= RN_REG * PLOW_THREADS) && ((K & 7u) == 0)))
+            __builtin_trap();
+        gemv_norm_lds(lds, gnorm, M_, K, eps,
+                      (float*)(lds + (GM_LDS_HALVES - GV_NORM_SCRATCH)));
+    }
+#endif
     if (K == 2560)
         gemv_qkvg_rows<PLOW_GEMV_MM, 5>(Cq_, Ck_, Cv_, Cg_, Wq, Wk, Wv, Wg, M_, Nq, Nk, Nv, Ng, K, slice, nblk, lds);
     else if (K == 4096)
@@ -4250,9 +4456,10 @@ __device__ void d_gemv_qkvg(bf16* Cq, bf16* Ck, bf16* Cv, bf16* Cg, const bf16* 
 /* The 3-stream q|k|v form. A forwarder, not a second body: see gemv_qkvg_rows' ONE BODY note. */
 __device__ void d_gemv_qkv(bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x, const bf16* Wq,
                           const bf16* Wk, const bf16* Wv, unsigned M, unsigned Nq, unsigned Nk,
-                          unsigned Nv, unsigned K, unsigned slice, unsigned nblk, bf16* lds) {
+                          unsigned Nv, unsigned K, unsigned slice, unsigned nblk, bf16* lds,
+                          const bf16* gnorm = nullptr, float eps = 0.0f) {
     d_gemv_qkvg(Cq, Ck, Cv, nullptr, x, Wq, Wk, Wv, nullptr, M, Nq, Nk, Nv, 0u, K, slice, nblk,
-                lds);
+                lds, gnorm, eps);
 }
 
 /* PER-SHAPE UNROLL for the plain decode GEMV — BUILT, MEASURED, and DEFAULT-OFF because it drops

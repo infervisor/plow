@@ -1,7 +1,7 @@
 # PX-1 stage 1 — cross-request prefill batching (GEMM level), Gemma-4-12B, sm_120
 
 Campaign **PX1-s1**, 2026-07-21, branch `px1-gemm-batching`. Box: 1× RTX PRO
-6000 Blackwell 96 GB (sm_120, 188 SMs). Plan: the design notes
+6000 Blackwell 96 GB (sm_120, 188 SMs). Per the design notes,
 PX-1, sequencing step 1 — **GEMM-batching only, naive per-request-serial
 attention** (the block-diagonal varlen flash is stage 2).
 

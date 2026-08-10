@@ -32,7 +32,7 @@ pub mod record;
 pub mod sample;
 pub mod store;
 
-pub use gemm::{gemm_op_case, gemm_rung_opcode, GEMM_ORACLE, GFX950_CELL};
+pub use gemm::{amd_tuning_cell, gemm_op_case, gemm_rung_opcode, GEMM_ORACLE, GFX950_CELL};
 pub use gemv::{gemv_case, gemv_op_case, gemv_sample_bucket, gemv_sample_opcode, GEMV_ORACLE};
 
 pub use decode::{

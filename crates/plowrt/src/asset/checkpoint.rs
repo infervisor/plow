@@ -52,6 +52,10 @@ struct Entry {
     shard: usize,
     range: Range<usize>,
     shape: Vec<usize>,
+    /// Payload dtype is OCP e4m3 (`F8_E4M3`). Kept so the loader can scrub 0x80
+    /// (`-0`) bytes at stage time — see `is_fp8_e4m3` and
+    /// `HsaUploadRing::push_scrub_fp8_neg0`.
+    fp8: bool,
 }
 
 /// Sub-timings for [`Checkpoint::open`] (`PLOW_LOAD_PROFILE`).
@@ -142,6 +146,7 @@ impl Checkpoint {
                         shard,
                         range: info.data_offsets.0..info.data_offsets.1,
                         shape: info.shape.clone(),
+                        fp8: matches!(info.dtype, safetensors::Dtype::F8_E4M3),
                     },
                 );
             }
@@ -164,6 +169,13 @@ impl Checkpoint {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub fn tensor(&self, name: &str) -> Option<&[u8]> {
         self.tensor_ex(name).map(|(bytes, _)| bytes)
+    }
+
+    /// Is `name` an OCP e4m3 (`F8_E4M3`) payload? Drives the loader's 0x80
+    /// (`-0`) scrub — value-identical, and what lets the CDNA3 grouped-GEMM
+    /// staging decode drop its neg-0 mask (runtime/amd/op_moe.h).
+    pub fn is_fp8_e4m3(&self, name: &str) -> bool {
+        self.index.get(name).is_some_and(|e| e.fp8)
     }
 
     /// Tensor bytes **and** shape — what a row-parallel shard needs.

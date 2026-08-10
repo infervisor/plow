@@ -80,7 +80,7 @@ pub struct WeightLayout {
     pub bk: i64,
 }
 
-/// Weight-tiling byte-layout spec.
+/// Weight-tiling byte-layout spec. See the design notes.
 ///
 /// # Layout formula (as of `block_iteration = "n_major_k_inner"`,
 /// `within_block_layout = "n_outer_k_inner"`, `padding_policy = "zero_extend"`):
@@ -107,7 +107,7 @@ pub struct WeightTiling {
 
 /// One entry in the `static_tensors` manifest — a byte range in
 /// `static_tensors.bin` the runtime copies into an address-map slot at
-/// model init. See the design notes 4.
+/// model init. See the design notes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StaticTensorEntry {
     pub target_slot: String,
@@ -545,8 +545,8 @@ pub struct BlockTensor {
     pub dtype: String,
 }
 
-/// Architecture-specific dimensions. Only the modeled keys are listed here;
-/// each is optional since which apply depends on `kind`
+/// Architecture-specific dimensions. Only the keys the design notes
+/// list are modeled; each is optional since which apply depends on `kind`
 /// (a dense block carries `heads`; an MoE block adds `n_exp`/`top_k`/…).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BlockDims {

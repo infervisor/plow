@@ -3,8 +3,7 @@
 //! consumer-block's first op tiles unblock as their specific producer-block
 //! last-op tiles complete, not after the whole tensor.
 //!
-//! Backs the design in the design notes
-//! and the `plan_from_all_blocks` API.
+//! Backs the design notes and the `plan_from_all_blocks` API.
 
 use costmodel::{Soc, SramPolicy, DEFAULT_PAGE_BYTES};
 use nn_graph::{infer_shapes, ActKind, DType, Nn};

@@ -22,7 +22,13 @@ SYM="${3:?kernel symbol}"
 REQ="${4:?optional|required}"
 shift 4
 
-CLEAN=(env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin)
+# PLOW_NVCC_PATH replaces the clean PATH when the toolchain does not live in
+# /usr (the nix sandbox has no /usr/bin at all — the host gcc must come from
+# the caller). NVCC_PREPEND_FLAGS/NVCC_APPEND_FLAGS pass through for the same
+# reason: nix's nvcc gets its -ccbin that way, and `env -i` would strip it.
+CLEAN=(env -i PATH="${PLOW_NVCC_PATH:-/usr/local/cuda/bin:/usr/bin:/bin}")
+[ -n "${NVCC_PREPEND_FLAGS:-}" ] && CLEAN+=(NVCC_PREPEND_FLAGS="$NVCC_PREPEND_FLAGS")
+[ -n "${NVCC_APPEND_FLAGS:-}" ] && CLEAN+=(NVCC_APPEND_FLAGS="$NVCC_APPEND_FLAGS")
 CUOBJDUMP="$(dirname "$NVCC")/cuobjdump"
 
 fail() {

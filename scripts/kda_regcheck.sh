@@ -4,7 +4,7 @@
 # Same shape as build_gfx950.sh's check(): the 8-wave interpreters must stay <= 256 total
 # (2 waves/SIMD) or occupancy halves. Run OUTSIDE `nix develop` — the nix shell's libstdc++/glibc
 # shadow the system ones and every system ROCm binary dies with `GLIBC_2.38 not found`
-#.
+# (the design notes §0a).
 #
 #   ./scripts/kda_regcheck.sh
 set -uo pipefail

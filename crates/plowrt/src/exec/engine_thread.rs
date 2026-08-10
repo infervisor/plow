@@ -1,5 +1,5 @@
-//! Dedicated engine/submission thread (the design notes,
-//! stage 1): every GPU tick for one model runs on ONE persistent OS thread
+//! Dedicated engine/submission thread (stage 1): every GPU tick for one model
+//! runs on ONE persistent OS thread
 //! instead of a rotating tokio blocking-pool thread. The CUDA context is then
 //! bound to that thread once (the backend's per-call `cuCtxSetCurrent` elides
 //! on a context hit), the tick never pays blocking-pool dispatch, and later

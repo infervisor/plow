@@ -511,7 +511,7 @@ impl TpGroup {
     /// Zero EVERY rank's cross-GPU counters.
     ///
     /// The one host obligation the deadlock argument rests on
-    ///: the cross edges form a publish→consume cut
+    /// (the design notes): the cross edges form a publish→consume cut
     /// with no cycle *provided* no rank starts a token seeing a counter left
     /// over from the previous one. Zeroing rank-by-rank as each is launched
     /// would break exactly that — an early rank could signal a late rank's

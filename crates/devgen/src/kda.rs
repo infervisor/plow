@@ -27,7 +27,7 @@
 //!   P13 residual            Residual       hidden, attn        -> hidden'
 //! ```
 //!
-//! **Do not collapse P1–P6 along a LOOP axis.** the design notes measured
+//! **Do not collapse P1–P6 along a LOOP axis.** The design notes §6g-KNOBS measured
 //! `GLM_GROUP=1` removing **38% of the ops for +2.88 ms**, because collapsing work that ran on
 //! disjoint CU slices into a loop inside one packet destroys concurrency. Op count is not the
 //! objective function. The merge that IS safe is along the OUTPUT dimension, and P1–P4 now take
@@ -311,7 +311,7 @@ pub fn declare_kda_state(b: &mut Builder, c: &KdaCfg, prefix: &str, slots: u64) 
 ///
 /// # Why this merge is safe when `GLM_GROUP=1` was not
 ///
-/// the design notes measured `GLM_GROUP=1` removing **38% of the ops for
+/// The design notes §6g-KNOBS measured `GLM_GROUP=1` removing **38% of the ops for
 /// +2.88 ms**. It merged along a LOOP dimension: work that had been running on DISJOINT CU slices
 /// became a loop inside one packet, and the concurrency went with it. This merges along the
 /// OUTPUT dimension. Each of q/k/v/g is already `all` = 256 CUs, so per CU they were 4 x 48
@@ -331,7 +331,7 @@ pub fn declare_kda_state(b: &mut Builder, c: &KdaCfg, prefix: &str, slots: u64) 
 /// # The bound, and why it is a REFUSAL to fuse rather than a runtime fallback
 ///
 /// `gemv_qkvg_rows` reads `x` only through LDS (`op_gemm.h`: "x is ALWAYS staged in LDS here"),
-/// so the staged rows must fit [`crate::GM_LDS_HALVES`]. At `hidden = 7168` that is 10 rows —
+/// so the staged rows must fit [`crate::gm_lds_halves()`]. At `hidden = 7168` that is 10 rows —
 /// decode's `t = 1` always fits, and the 4-stream op is decode-only anyway. Mis-gating this is
 /// the §6g-BATCH silent corruption verbatim (rows past the arena fluent-but-wrong), so the check
 /// is here, at emit time, where it produces a DIFFERENT PACKET. There is no device-side fallback:
@@ -356,7 +356,7 @@ fn fuse_qkvg(t: u32, hidden: u32) -> bool {
     if t != 1 {
         return false;
     }
-    crate::gemv_staged_rows(t) as u64 * hidden as u64 <= crate::GM_LDS_HALVES
+    crate::gemv_staged_rows(t) as u64 * hidden as u64 <= crate::gm_lds_halves()
 }
 
 /// May the K3-specific chain collapse from SIX packets to THREE?
@@ -1010,8 +1010,8 @@ mod tests {
         // The arena bound, stated on the numbers it is derived from. It is no longer what DECIDES
         // t = 10 — `t != 1` gets there first — but it is still the reason the fused op cannot be
         // widened to prefill by simply deleting that check.
-        assert!(crate::gemv_staged_rows(10) as u64 * 7168 <= crate::GM_LDS_HALVES);
-        assert!(crate::gemv_staged_rows(11) as u64 * 7168 > crate::GM_LDS_HALVES);
+        assert!(crate::gemv_staged_rows(10) as u64 * 7168 <= crate::gm_lds_halves());
+        assert!(crate::gemv_staged_rows(11) as u64 * 7168 > crate::gm_lds_halves());
         // Every T above decode refuses, INCLUDING the ones the arena would have allowed.
         for t in [2u32, 8, 10, 11, 128, 8192] {
             assert!(

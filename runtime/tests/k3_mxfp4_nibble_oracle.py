@@ -82,7 +82,7 @@ assert scale.shape == (N, K // 32), (scale.shape, N, K // 32)
 print(f"K3 mxfp4 nibble probe: layer {LAYER} expert {EXPERT} w1  packed{list(packed.shape)} "
       f"scale{list(scale.shape)} -> N={N} K={K}")
 
-# E8M0, BIAS 127. the design notes: "E8M0 scales are biased by 127. Neutral = 127, not
+# E8M0, BIAS 127. the design notes §2: "E8M0 scales are biased by 127. Neutral = 127, not
 # 0. Byte 0 means 2^-127 and flushes the block to zero." Confirmed empirically from THIS
 # checkpoint in the gap doc §4b: bytes span 112-122, no byte is 0x00 and none is 0xFF.
 assert scale.min() > 0 and scale.max() < 255, (scale.min(), scale.max())

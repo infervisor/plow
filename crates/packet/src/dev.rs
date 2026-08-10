@@ -207,7 +207,8 @@ pub enum DevOp {
     ///
     /// `gt`/`ut` never reach HBM, and the [`DevOp::Glu`] packet and its gate disappear.
     GemmGlu = 20,
-    /// `t0=q_out t1=x t2=W_q t3=k_out t4=W_k t5=v_out t6=W_v` · `i0=M i1=Nq i2=K i3=Nk i4=Nv`,
+    /// `t0=q_out t1=x t2=W_q t3=k_out t4=W_k t5=v_out t6=W_v t7=gamma?` ·
+    /// `i0=M i1=Nq i2=K i3=Nk i4=Nv` · `f0=eps`,
     /// computing all three attention projections `q=W_q@x`, `k=W_k@x`, `v=W_v@x` in ONE GEMV.
     ///
     /// The three share the same `x` and `K`, so their output columns concatenate into one
@@ -219,6 +220,25 @@ pub enum DevOp {
     /// Structurally a single-stream GEMV (one weight row per column), so it keeps the plain
     /// GEMV's register budget, NOT the doubled one of [`DevOp::GemvGlu`]. Legal only when
     /// `M*K` fits LDS; plowc emits it only in decode (`M=1`), where it always does.
+    ///
+    /// **`t7` PRESENT = THE Q-NORM FOLD** (emit knob `PLOW_GLM_FUSE_QNORM`, build axis of the
+    /// same name in `op_gemm.h`): `t1` then carries the RAW pre-norm activation and this op
+    /// applies the producing `RmsNorm` itself, to the LDS copy of `x` it already stages, with
+    /// `f0` as eps — deleting the one-workgroup [`DevOp::RmsNorm`] packet that used to sit
+    /// between GLM's two fused MLA GEMVs. Bit-exact to that packet: the staged row is
+    /// normalized IN PLACE and ROUNDED to bf16 exactly as `d_rmsnorm`'s `fits` path does, and
+    /// the ordinary un-normed hot loop then reads LDS bytes identical to the HBM bytes the
+    /// deleted packet would have written (`gemv_norm_lds` in op_gemm.h). It is NOT
+    /// [`DevOp::Gemv`]'s `norm == 1`, which multiplies inside the k-loop in f32 and produces a
+    /// different number.
+    ///
+    /// `t7` absent is the pre-fold reading and every blob emitted without the knob is
+    /// byte-identical. Op 22 has never carried a `t7`, so the discriminator is unambiguous:
+    /// [`DevOp::GemvQkvg`]'s `t7` is `g_out` on a DIFFERENT opcode, and
+    /// [`DevOp::GemvQkvMxfp4`]/[`DevOp::GemvQkvFp8`] spend `i5/i6/i7` and leave `t7` alone.
+    /// Nothing here is a bitfield — unlike [`DevOp::FlashMlaPrefill`]'s `i6` (low 8 bits =
+    /// causal KV-split `ns`, bit 8 = `W_ofold`) — and the two ops never meet: 22 is decode,
+    /// 51 is prefill.
     GemvQkv = 22,
     /// `t0=C t1=x t2=W(fp8) t3=resid_out t4=b t5=w_scale(f32[N]) t6=gamma_b t7=gamma_n` ·
     /// `i0=M i1=N i2=K i3=nrn i4=a_row0` · `f0=eps f1=scale`. The fp8 (w8a16) twin
@@ -306,8 +326,18 @@ pub enum DevOp {
     XReduce = 24,
     /// Reduce-scatter half of the symmetric all-reduce decomposition. Kept defined for
     /// CP / larger worlds; not emitted on the N<=8 decode path (one-shot `XReduce` wins).
+    ///
+    /// UNIMPLEMENTED, not merely unselected. No kernel arm in any interpreter and no emitter
+    /// anywhere — these two numbers appear only in this enum, `dev_isa.h`, `ALL`, and the
+    /// `RESERVED` list in [`crate::slots`]. A packet carrying one would hit the AMD dispatch's
+    /// `default:` and silently do nothing. The decomposition that exists is the two-phase body
+    /// INSIDE [`DevOp::XReduceTwoShot`], which is one packet, not two.
+    ///
+    /// Kept rather than removed because the numbers are ABI: every blob on disk was built
+    /// against this enum, and reusing 25/26 would make an old blob run a new op.
     XReduceScatter = 25,
-    /// All-gather half of the symmetric decomposition. See [`DevOp::XReduceScatter`].
+    /// All-gather half of the symmetric decomposition. Unimplemented on every backend — see
+    /// [`DevOp::XReduceScatter`] for what that means and why the number is kept.
     XAllGather = 26,
     /// Context-parallel cross-GPU flash LSE-merge (tp-design §8c, §9). Folds N peers'
     /// `(O_partial,m,l)` over their KV-position shards into the replicated attention
@@ -341,8 +371,8 @@ pub enum DevOp {
     /// MFMA is unchanged. `t3=K(fp8) t4=V(fp8) t6=k_scale t7=v_scale`; else as [`DevOp::FlashPrefill`].
     FlashPrefillFp8 = 39,
 
-    // ===== MoE data-dependent counter-gate ops (the design notes, =====
-    // the design notes§3). Opcodes in the HIGH free range 40+ so they do
+    // ===== MoE data-dependent counter-gate ops =====
+    // Opcodes in the HIGH free range 40+ so they do
     // NOT collide with tp's collectives (24-29) or the fp8 merge (30+). These are the
     // FIRST ops whose BODY branches on a runtime buffer (the routing table): the
     // counter DAG stays static (deadlock-free, `executed == total`), and each expert
@@ -457,8 +487,31 @@ pub enum DevOp {
     /// `oacc[g] += p[g]·C_kv[j]` (PV accumulates on the latent). Emits latent-wide
     /// `(O_partial,m,l)` for [`DevOp::FlashMerge`] at `hd=512`; [`DevOp::OUvFold`]
     /// folds to `v_head_dim` after the merge.
-    /// `t0=Opart(f32) t1=mlpart(f32) t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len(i32)` ·
-    /// `i0=n_batch i1=n_head i2=kv_stride i3=window i4=nsplit i5=kv_mask` · `f0=scale`.
+    /// `t0=Opart(f32) t1=mlpart(f32) t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len(i32)
+    /// t7=qr_cos?` · `i0=n_batch i1=n_head i2=kv_stride i3=window i4=nsplit i5=kv_mask
+    /// i6=qr_sin i7=gf` · `f0=scale`.
+    ///
+    /// **`t7` PRESENT = THE Q-ROPE FOLD** (emit knob `PLOW_GLM_FUSE_ROPE`, `[HNR-FOLD]` in
+    /// `op_attention.h`): `t3` then carries the RAW `q_rope` projection and this op applies the
+    /// interleaved RoPE itself, in the query staging that already reads every one of those
+    /// `n_head*DR` elements — deleting the [`DevOp::HeadNormRope`] packet that used to sit
+    /// between the q GEMV and the flash. Bit-identical to that packet (it runs `gamma=None`,
+    /// `skip_norm=1`, so its value is `f2bf(v*cos -/+ partner*sin)` and nothing else).
+    ///
+    /// `t7` absent is the pre-fold reading and every blob emitted without the knob is
+    /// byte-identical. The position operand is free: `qpos = kv_len[b] - 1`, which every decode
+    /// entry point makes equal to the `pos[0]` the rope packet read.
+    ///
+    /// `i6` is the **sin table as a demoted tensor handle** — the [`DevOp::GemvQkvg`] rule for a
+    /// read-only operand when the `t` slots are full — and is read ONLY when `t7` is present.
+    /// It is a HANDLE, not a bitfield: unlike [`DevOp::FlashMlaPrefill`]'s `i6` (low 8 bits =
+    /// causal KV-split `ns`, bit 8 = `W_ofold`) there is nothing packed into it. The two do not
+    /// meet — 50 is decode, 51 is prefill.
+    ///
+    /// The fold is EXCLUSIVE with both sibling arms and always will be, because they spend the
+    /// same two slots: [`DevOp::FlashGatherDecode`] puts `idx` in `t7` and `top_k` in `i6`, and
+    /// [`DevOp::FlashMlaDecodeFp8`] puts its per-row scale strip in `t7`. plowc refuses the
+    /// combinations.
     FlashMlaDecode = 50,
     /// MLA prefill MFMA twin — not yet built (reserved so the ABI is stable).
     FlashMlaPrefill = 51,
@@ -527,8 +580,8 @@ pub enum DevOp {
     /// i3=out_row0` · `f0=eps`. `out_row0` writes the current token's index-key into its [ctx][DI] cache.
     LayerNorm = 60,
 
-    /// Gemma-4 26B-A4B bf16 sparse-MoE DECODE router (`d_moe_router_gemma`,
-    /// the design notes). Weightless-RMS(resid) → `·scale[H]·root` →
+    /// Gemma-4 26B-A4B bf16 sparse-MoE DECODE router (`d_moe_router_gemma`).
+    /// Weightless-RMS(resid) → `·scale[H]·root` →
     /// softmax(proj@·) → top-k (lowest-id tie) → norm_topk → `·per_expert_scale`. Writes
     /// `routing_table[k]={u32 id, f32 gate}`. ONE block. `t0=table t1=resid t2=proj t3=scale
     /// t4=per_expert_scale` · `i0=H i1=n_exp i2=k` · `f0=root(=H^-0.5) f1=eps`.
@@ -585,7 +638,7 @@ pub enum DevOp {
     /// `i0=H i1=k` · `f0=eps f1=layer_scalar`.
     MoeCombineResidNormGemma = 72,
 
-    // ===== Gemma-4 26B-A4B bf16 grouped-MoE PREFILL ops. =====
+    // ===== Gemma-4 26B-A4B bf16 grouped-MoE PREFILL ops =====
     // Token-sorted grouped expert GEMM for T>1. Ids 73+ (71/72 free; 72 reserved elsewhere).
     // Built only in the prefill (_pf) interpreter object.
     /// T-token router: block-per-token loop of the exact decode router. Writes
@@ -649,7 +702,7 @@ pub enum DevOp {
     /// `i0=H i1=I_moe i2=n_exp`. Gated behind `PLOW_NV_W8A8`.
     MoeGroupDownGemmaPfW8a8 = 82,
 
-    // ===== Nemotron-3 Mamba-2 SSD mixer (the design notes Nemotron, M4). =====
+    // ===== Nemotron-3 Mamba-2 SSD mixer =====
     // A NEW op family (opcode 90, leaving 83-89 as a gap after the MoE-prefill band). This is
     // the FIRST state-space op in the tree — no reuse of any existing kernel. The in_proj /
     // out_proj projections are ordinary GEMV/GEMM; this op is the mixer CORE: causal depthwise
@@ -678,7 +731,13 @@ pub enum DevOp {
     /// T-token router tail — a block-per-token loop of [`DevOp::MoeRouterTopk`], so it is
     /// bit-identical PER TOKEN to the decode router by construction. The `[T,n_exp]` logit matrix is
     /// an ordinary [`DevOp::Gemm`], already in the prefill bucket; only this tail was missing.
-    /// `t0=table[T*k] t1=logit(bf16[T,n_exp]) t3=bias` · `i1=n_exp i2=k i3=flags i4=T` · `f0=route_scale`.
+    /// `t0=table[T*k] t1=logit(bf16[T,n_exp]) t2=atom_acc? t3=bias` ·
+    /// `i0=atom_h i1=n_exp i2=k i3=flags i4=T` · `f0=route_scale`.
+    ///
+    /// `t2`/`i0` are PLOW_MOE_PF_ATOMIC's fused-MoE accumulator: when set, this packet also zeroes
+    /// `atom_acc[T, atom_h]` f32 before the top-k loop, because it is the earliest packet of the
+    /// MoE chain (83 -> 84 -> 85 -> 86) and op 86 atomically adds into it. TENSOR_NONE / 0 on
+    /// every other blob.
     MoeRouterTopkPf = 83,
     /// ALIGN/SORT, ONE workgroup: histogram the `T*k` routing slots by expert, build an
     /// `MPF_BM`-padded prefix, scatter each live slot into its expert's contiguous gathered-row
@@ -693,11 +752,27 @@ pub enum DevOp {
     MoeGroupGluPf = 85,
     /// Grouped down GEMM + gate-scale + SCATTER into `part[row_partidx][H]`; pad rows are dropped.
     /// `t0=part(f32[T*k,H]) t1=fu_g t2=expert_weight_table t3=expert_scale_table t4=meta
-    /// t6=row_partidx t7=row_gate` · `i0=H i1=I_moe i2=n_exp i3=fp8`.
+    /// t6=row_partidx t7=row_gate` · `i0=H i1=I_moe i2=n_exp i3=fp8 i4=atom_ksh i5=det_ksh`.
+    ///
+    /// `i4 = log2(k)+1` is PLOW_MOE_PF_ATOMIC: `t0` is then a `[T,H]` f32 ACCUMULATOR this op
+    /// atomically adds `gate*value` into at row `row_partidx[row] >> log2(k)`, not the `[T*k,H]`
+    /// scatter. 0 = the shipped scatter, every existing blob.
+    ///
+    /// `i5 = log2(k)+1` is PLOW_MOE_PF_DET, the DETERMINISTIC twin: `t0` is a `[T,H]` **f64**
+    /// FIXED-POINT accumulator (`rint(gate*value * 2^32)`, summed with an f64 atomic, exact and
+    /// therefore order-independent). A separate field from `i4` on purpose — the two arms are
+    /// separate build axes and a blob must never be readable as the other one.
     MoeGroupDownPf = 86,
     /// T-token combine — same expression and same FIXED slot order as [`DevOp::MoeCombine`], so at
     /// `T=1` it is bit-identical to it.
-    /// `t0=out t1=residual[T,H] t2=shared[T,H]|NONE t3=part(f32[T*k,H])` · `i0=H i1=k i2=T`.
+    /// `t0=out t1=residual[T,H]|NONE t2=shared[T,H]|NONE t3=part(f32[T*k,H])` ·
+    /// `i0=H i1=k i2=T i3=t_row0 i4=det`.
+    ///
+    /// `t1 = TENSOR_NONE` IS the zero residual — the kernel spells it `residual ? ... : 0.0f`,
+    /// which is what the TP path wants (xmid is added after the all-reduce). `i3 = t_row0` bands
+    /// the combine over token rows `[i3, i3+i2)`. `i4 = 1` is PLOW_MOE_PF_DET: `t3` is the `[T,H]`
+    /// f64 FIXED-POINT accumulator op 86 summed in place, read as one contiguous stream with
+    /// `i1 == 1` and scaled by 2^-32.
     MoeCombinePf = 87,
 
     // ===== KDA — Kimi Delta Attention, 69 of Kimi-K3's 93 layers. =====
@@ -1018,7 +1093,7 @@ pub enum DevOp {
     ///
     /// # This is the OUTPUT-dimension merge, and the distinction is the whole point
     ///
-    /// the design notes measured `GLM_GROUP=1` removing 38% of the ops for
+    /// The design notes measured `GLM_GROUP=1` removing 38% of the ops for
     /// **+2.88 ms**: it collapsed work that ran on disjoint CU slices into a loop inside one
     /// packet, which destroys concurrency. Op count is not the objective function. This merge is
     /// the opposite shape — the per-CU column count RISES from `(Nq+Nk+Nv)/nblk` to
@@ -1249,6 +1324,34 @@ pub enum DevOp {
     /// [`DevOp::GemvFp8`], which is this with `Nk = Nv = 0`. Decode-only; x staged in LDS when
     /// `M*K` fits, exactly as `d_gemv_fp8`.
     GemvQkvFp8 = 115,
+
+    /// FUSED TP all-reduce + residual + RMSNorm — the decode attention seam
+    /// `[XReduce -> AddNorm]` as ONE single-workgroup packet. `t0`=out (normed),
+    /// `t1`=resid_out, `t2`=a (residual in), `t3`=gamma; `i0`=feat, `i1`=n_gpu,
+    /// `i2`=partial slot byte offset, `i3`=xctr gate id; `f0`=eps. The kernel rounds
+    /// the peer reduction to bf16 before the residual add, so the fold is
+    /// BIT-IDENTICAL to the pair it replaces (dev_isa.h op 116's note). Decode-only
+    /// (one row); feat must fit one workgroup's strided pass (`feat <= 16 * 512`),
+    /// both enforced by the emitter.
+    /// `t0=out2 t1=xmid_out t2=x t3=gamma` · `i0=feat i1=n_gpu i2=slot i3=gate` · `f0=eps`.
+    XReduceAddNorm = 116,
+    /// DSA sparse-prefill T-row indexer score (dev_isa.h op 117): score[t][s] =
+    /// Σ_h w[t][h]·ReLU(q_idx[t][h]·k_idx[s]) for s <= q_pos0 + t. Score is f32
+    /// [n_tok][kv_stride].
+    /// `t0=Score t1=Qidx t2=Kidx t3=W t4=kv_len` · `i0=n_tok i1=index_heads i2=kv_stride
+    /// i3=index_head_dim` · `f0=scale`.
+    IndexScorePf = 117,
+    /// Per-query-row EXACT top-k select (op 118): one workgroup per row, the op-59
+    /// radix key (score desc, lowest-index tie-break) with LDS-only histograms. idx is
+    /// i32 [n_tok][top_k], unused slots -1.
+    /// `t0=idx t1=Score t2=kv_len` · `i0=n_tok i1=top_k i2=kv_stride`.
+    IndexSelectPf = 118,
+    /// Per-64-query-tile UNION build (op 119): membership-mask scatter + ascending
+    /// compaction into the table the gathered V2 flash walks (u32 counts header,
+    /// then per tile `[cap i32 pos][cap u32 maskLo][cap u32 maskHi]`).
+    /// umask scratch is u64 [n_qt][kv_stride].
+    /// `t0=union t1=umask t2=idx t3=kv_len` · `i0=n_tok i1=top_k i2=kv_stride i3=cap`.
+    IndexUnionPf = 119,
 }
 
 impl DevOp {
@@ -1374,6 +1477,10 @@ impl DevOp {
         DevOp::GemmGluMxfp4,
         DevOp::GemvQkvMxfp4,
         DevOp::GemvQkvFp8,
+        DevOp::XReduceAddNorm,
+        DevOp::IndexScorePf,
+        DevOp::IndexSelectPf,
+        DevOp::IndexUnionPf,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1510,6 +1617,10 @@ impl DevOp {
             DevOp::KdaConv3 => "PLOW_DOP_KDA_CONV3",
             DevOp::KdaStateStepG => "PLOW_DOP_KDA_STATE_STEP_G",
             DevOp::GemvQkvFp8 => "PLOW_DOP_GEMV_QKV_FP8",
+            DevOp::XReduceAddNorm => "PLOW_DOP_XREDUCE_ADD_NORM",
+            DevOp::IndexScorePf => "PLOW_DOP_INDEX_SCORE_PF",
+            DevOp::IndexSelectPf => "PLOW_DOP_INDEX_SELECT_PF",
+            DevOp::IndexUnionPf => "PLOW_DOP_INDEX_UNION_PF",
         }
     }
 
@@ -1538,7 +1649,8 @@ impl DevOp {
     /// `dev_isa.h`. Renumbering the later pair was the resolution. Two variants, one
     /// bump: this constant is one past the HIGHEST opcode, not a count, and adding a pair moves it
     /// by two whether or not the range has holes.
-    pub const COUNT: u16 = 116;
+    /// 116 -> 117 for `XReduceAddNorm = 116` (the fused TP seam).
+    pub const COUNT: u16 = 120;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
@@ -1724,7 +1836,7 @@ pub const SE_FINE: u16 = 1;
 /// This entry's wait/succ counters live in the SYSTEM-scope, peer-mapped [`DevProgram::xctr`]
 /// region (a cross-GPU collective), not the agent-scope local `counters`. Orthogonal to
 /// [`SE_FINE`]. Set by the TP compiler on the collective packets and on a producing GEMV whose
-/// successor is a cross-GPU "partial ready" bump.
+/// successor is a cross-GPU "partial ready" bump. See the design notes.
 pub const SE_XCTR: u16 = 2;
 
 /// Shift of the per-(packet, L2 domain) slice count packed into [`StreamEnt::flags`].
@@ -1830,7 +1942,7 @@ pub struct DevProgram {
     pub gq_cursor: u64,
     // ===== Cross-GPU (tensor-parallel) fields. Single-GPU runs leave these 0. =====
     // Appended AFTER `gq_cursor` so every existing field (notably `trace`) keeps its
-    // offset — the ABI-lock test only sees the size grow.
+    // offset — the ABI-lock test only sees the size grow. See the design notes.
     /// This rank's cross-GPU counter region (SYSTEM-scope, peer-mapped). Points INTO
     /// `peer_scratch[rank]`; the per-rank offset is `xctr - peer_scratch[rank]`.
     pub xctr: u64,

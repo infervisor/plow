@@ -41,7 +41,7 @@
 //!   is submitted to `plow_verify` (the Lean 4 CLI) for all six checkpoints
 //!   A–F. Every dispatcher is backed by a proven universal theorem; a
 //!   rejection fails the compile with `PlowcError::LeanVerify`. Requires
-//! `--features lean-verify`.
+//!   `--features lean-verify`. See the design notes.
 
 pub mod hf_config;
 pub mod net;
@@ -152,7 +152,7 @@ pub struct Options {
     /// disjointness; Phase 2 **mutates the compiled buckets** — it promotes
     /// accepted hand-offs back to SramSameSm and reschedules, so output with
     /// this flag differs from output without it
-    /// (5`).
+    /// (see the design notes).
     pub sram_fit: bool,
     /// Enable the Lean performance oracle. When `true`, the scheduler queries
     /// the `plow_verify` binary for provably-optimal decisions (counter
@@ -509,7 +509,7 @@ pub struct Report {
     /// Weight-tiling byte-layout spec — present iff `weight_shared`.
     /// The runtime uses this to arrange safetensor bytes into every
     /// `Persistent`-class GEMM-weight entry in the address map.
-    ///
+    /// See the design notes.
     pub weight_tiling: Option<WeightTiling>,
     /// Per-model+setting sizing summary. Persisted separately as
     /// `assets.json` (see `build_assets`) and skipped from `weights.json`
@@ -956,8 +956,8 @@ fn build_assets(
     }
 }
 
-/// Phase 4 stub: no static tensors materialized yet. Phase 5 (per
-/// the design notes) computes RoPE freq tables + causal
+/// Phase 4 stub: no static tensors materialized yet. Phase 5
+/// computes RoPE freq tables + causal
 /// masks and returns them here for emission.
 fn collect_static_tensors() -> (Vec<StaticTensorEntry>, Vec<u8>) {
     (Vec::new(), Vec::new())
@@ -969,7 +969,7 @@ fn collect_static_tensors() -> (Vec<StaticTensorEntry>, Vec<u8>) {
 pub const EXPERT_UNUSED_SENTINEL: u32 = u32::MAX;
 
 /// Build the decode-phase KV read address sidecar. Returns `None` for
-/// non-decode buckets. See the design notes 2.
+/// non-decode buckets. See the design notes.
 fn build_decode_kv_schema(
     bucket: &ShapeBucket,
     tasks: &schedule::TaskGraph,
@@ -1149,7 +1149,7 @@ fn build_request_io_schema(
     const ELEM_BYTES_I32: u32 = 4; // i32 for indices / positions
 
     // Every bucket, both phases, has these two runtime-owned control
-    // buffers. See the design notes 3.
+    // buffers. See the design notes.
     let rows = bucket.rows();
     let mut common = vec![
         RequestIoField {
@@ -1633,7 +1633,7 @@ fn emit_streams(
         )?;
 
         // Experts sidecar — MoE layers for expert-parallel dispatch.
-        // Phase 1 detection only;
+        // Phase 1 detection only; see the design notes.
         let experts = build_experts_schema(&bs.sched.tasks, src);
         let experts_file = format!("{stem}.experts.json");
         std::fs::write(
@@ -1651,7 +1651,7 @@ fn emit_streams(
         // Optional per-bucket verification via the Lean CLI. The whole
         // marshaling + subprocess lifecycle stays here in Rust so the boundary
         // is one function; Lean receives a JSON payload and returns a
-        // certificate.10`.
+        // certificate. See the design notes.
         if opts.lean_verify {
             let certified = run_lean_verify(
                 &stem,
@@ -1777,8 +1777,8 @@ fn footprint_csv(rows: &[Footprint]) -> String {
 /// and turn any rejection into a compile error.
 ///
 /// Orchestration stays in Rust — every Lean call is a pure decidable check
-/// backed by a proven universal lemma (see the design notes
-/// analysis.md §5.10`). Logs go to stderr so they don't perturb `weights.json`
+/// backed by a proven universal lemma (see the design notes). Logs go to
+/// stderr so they don't perturb `weights.json`
 /// on stdout. Compiled only with `--features lean-verify`.
 ///
 /// Order: A (rewrite rules), B (tile partition), D (schedule + reclamation),

@@ -57,7 +57,12 @@
 #
 #   # 3. ingest (needs nix for cargo; must NOT run under the lease)
 #   nix develop -c cargo run --release -p tunedb --bin tunedb-gemv -- \
-#       ingest --db tuning --samples /tmp/k3_gemv.jsonl --campaign k3-mxfp4-decode-gemv
+#       ingest --db tuning --gpu MI300X --samples /tmp/k3_gemv.jsonl \
+#       --campaign k3-mxfp4-decode-gemv
+#
+#   `--gpu` is REQUIRED and it is what picks the tuning cell. The binary used to hardcode
+#   gfx950's, so a sweep taken on a gfx942 box published into MI350X's cell and the compiler
+#   never read it — name the part the sweep actually ran on.
 #
 # Drop `PLOW_GEMV_ONLY` to sweep the GLM/Gemma rows too. `scripts/gemv_campaign_lease.sh` wraps
 # steps 2+3 under `gpulease -n 1`, but that helper takes the LOWEST free card, not a chosen one.
@@ -190,4 +195,5 @@ echo "wrote $(wc -l < "$JSONL") rows -> $JSONL"
 echo
 echo "NOW INGEST (needs nix for cargo; the sweep half above must NOT run under nix):"
 echo "  nix develop -c cargo run --release -p tunedb --bin tunedb-gemv -- \\"
-echo "      ingest --db tuning --samples $JSONL --campaign gemv-row-inventory"
+echo "      ingest --db tuning --gpu ${TUNE_GPU:-MI300X} --samples $JSONL \\"
+echo "      --campaign gemv-row-inventory"

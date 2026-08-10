@@ -2,7 +2,7 @@
 # build_k3_real.sh — the Kimi-K3 COMPLETE-BLOCK numeric gate.            [K3-BLOCK-GATE]
 #
 # Modelled on scripts/build_kda_real.sh, which is modelled on scripts/build_glm52_real.sh,
-# including the environment traps of the design notes:
+# including the environment traps of the design notes §0a:
 #   - the .co needs system ROCm, which `nix develop` BREAKS (GLIBC_2.38);
 #   - the host binary needs SYSTEM gcc in a scrubbed env, because nix's gcc bakes a RUNPATH to nix
 #     glibc while the ELF interpreter is the system one, and the result aborts as
@@ -29,7 +29,7 @@ rm -f i_decode.co interp_decode.elf k3_block_test
 # COMPILE-TIME constant defaulting to 1, and writes C[m*N+n] only for m < MM. At T>1 with the
 # default, every GEMV writes ROW 0 and leaves rows 1..T-1 UNTOUCHED — not a crash, three quarters
 # of the tokens carrying stale buffer contents, with the signature sqrt((T-1)/T) = 0.866 on every
-# post-GEMV stage. Recorded in the design notes and build_gfx950.sh:51-64.
+# post-GEMV stage. Recorded in the design notes §6.3 and build_gfx950.sh:51-64.
 GVMM="${PLOW_GEMV_MM:-${K3_T:-4}}"
 echo "[1/2] device code object ($ARCH, decode bucket, PLOW_GEMV_MM=$GVMM, PLOW_K3=1)"
 hipcc --offload-arch="$ARCH" -O3 -w -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM="$GVMM" -DPLOW_K3=1 \

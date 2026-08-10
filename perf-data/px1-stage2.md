@@ -2,7 +2,7 @@
 
 Campaign **PX1-s2**, 2026-07-21/22, branch `px1-varlen-flash` (based on
 `px1-gemm-batching` @ 62082c1). Box: 1× RTX PRO 6000 Blackwell 96 GB (sm_120,
-188 SMs). Plan: the design notes PX-1, sequencing step 2 —
+188 SMs). Per the design notes, PX-1, sequencing step 2 —
 replace stage 1's per-request-SERIAL attention with a true varlen/cu_seqlens
 block-diagonal flash: **all packed requests' prefill attention in ONE
 persistent-grid kernel pass**.
@@ -61,7 +61,7 @@ committed B=16 rows or vLLM's B=16-class numbers carry this caveat. A
 contention sampler (`nvidia-smi pmon`, 1 s) ran through the campaign: only the
 three arm servers burned SM — the windows are clean. (Earlier attempts were
 poisoned — VU1 ITL flapped 22 ms → exactly 100.0 ms while the foreign server
-served long-ctx traffic and another branch's microbenches ran; those runs
+served long-ctx traffic and another run's microbenches ran; those runs
 were discarded and rerun.)
 
 ## Three-arm sweep (B=8 blob, 4k/128, ConstantVUs)

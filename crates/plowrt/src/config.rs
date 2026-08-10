@@ -29,7 +29,16 @@ pub struct RuntimeConfig {
     // Shared (both NVIDIA + AMD backends)
     // ──────────────────────────────────────────────────────────────────────────
     /// Checkpoint directory for weight binding. Overrides <assets>/checkpoint.
-    #[arg(long = "rt-checkpoint", env = "PLOW_CHECKPOINT", global = true)]
+    ///
+    /// Explicit `id` for the reason spelled out on `hsaco` below: the long was
+    /// already `--rt-checkpoint`, but the clap id defaulted to the FIELD name and
+    /// collided with `amd-bench --checkpoint`.
+    #[arg(
+        id = "rt_checkpoint",
+        long = "rt-checkpoint",
+        env = "PLOW_CHECKPOINT",
+        global = true
+    )]
     pub checkpoint: Option<String>,
 
     /// Checkpoint prefetch depth in tensors.
@@ -439,8 +448,49 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-launch-rows", env = "PLOW_LAUNCH_ROWS", global = true)]
     pub launch_rows: Option<u32>,
 
+    /// RAGGED-M prefill: cover a prompt in the FEWEST launches and run the last
+    /// chunk at its real row count instead of its padded bucket width.
+    ///
+    /// **Default ON since the facts gate.** `PLOW_RAGGED_CHUNK=0` restores the
+    /// padding-vs-launch DP byte-identically and is the control arm for any A/B
+    /// in this area — an arm that merely omits the flag is no longer a control.
+    ///
+    /// What landing it accepts, stated plainly: **57.8% of prompt LENGTHS produce
+    /// different long-form wording than they did**, diverging ~11% into the
+    /// answer. That is large, and the reasons it is acceptable are measured, not
+    /// assumed: an identical plan gives byte-identical text (62/62); the
+    /// determinant is the LAST chunk's executed row count, so this DELETES the
+    /// narrow-tail numeric regime rather than adding one, moving prompts into the
+    /// wide-chunk regime every on-rung prompt already used; and the quality gate
+    /// that had been missing now exists, was proven able to fail, and passed —
+    /// `perf-data/probes/facts_gate.py`,
+    /// `perf-data/plow-gfx942/glm52-facts-gate.md`.
+    ///
+    /// ON, the last chunk's bucket is the smallest one that COVERS the remainder
+    /// (rather than the cheapest padded cover of it) and every prefill row-count
+    /// operand is rewritten from the bucket width to the chunk's real length, so
+    /// the padding costs nothing. That is what removes the tail launch a prompt
+    /// one token past a bucket used to pay -- measured -239 ms at 4097 tokens.
+    /// See `exec::amd::rebase_chunk_rows` and
+    /// `perf-data/plow-gfx942/glm52-ragged-tail-chunk.md`.
+    ///
+    /// The engine REFUSES to serve a packet whose prefill collectives are
+    /// row-banded (`PLOW_GLM_XR_BAND`) under this flag rather than half-applying
+    /// the shrink.
+    #[arg(long = "amd-ragged-chunk", env = "PLOW_RAGGED_CHUNK", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub ragged_chunk: bool,
+
     /// hsaco directory override. Default: <assets>/hsaco.
-    #[arg(long = "hsaco", env = "PLOW_HSACO", global = true)]
+    ///
+    /// The clap **id** and **long** are both `rt-hsaco`, not `hsaco`. A
+    /// `global = true` arg is propagated into every subcommand, so sharing an id
+    /// with `amd-bench`'s own `--hsaco` (a required `PathBuf` where this is an
+    /// `Option<String>`) made clap hold two definitions under one id and PANIC on
+    /// the type downcast — "Mismatch between definition and access of hsaco" —
+    /// on EVERY `amd-bench` invocation in the tree (every script under scripts/
+    /// that benches a blob). `checkpoint` above had the same collision. The
+    /// `rt-` prefix is the convention the other globals here already use.
+    #[arg(id = "rt_hsaco", long = "rt-hsaco", env = "PLOW_HSACO", global = true)]
     pub hsaco: Option<String>,
 
     /// fp8 checkpoint directory.
@@ -451,9 +501,66 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "trace-raw", env = "PLOW_TRACE_RAW", global = true)]
     pub trace_raw: Option<String>,
 
+    /// Directory for per-tick rank-0 counter snapshots (diagnostic).
+    #[arg(
+        long = "amd-ctr-snap",
+        env = "PLOW_CTR_SNAP",
+        hide = true,
+        global = true
+    )]
+    pub ctr_snap: Option<String>,
+
+    /// Directory for per-tick tensor snapshots (diagnostic).
+    #[arg(
+        long = "amd-tens-snap",
+        env = "PLOW_TENS_SNAP",
+        hide = true,
+        global = true
+    )]
+    pub tens_snap: Option<String>,
+
+    /// Sequence slot captured by `--amd-tens-snap`.
+    #[arg(
+        long = "amd-snap-slot",
+        env = "PLOW_SNAP_SLOT",
+        default_value_t = 5,
+        hide = true,
+        global = true
+    )]
+    pub snap_slot: usize,
+
+    /// Additional decode-object tiers: `dir:max[,dir:max]`, or one legacy dir.
+    #[arg(long = "amd-hsaco-lowrung", env = "PLOW_HSACO_LOWRUNG", global = true)]
+    pub hsaco_lowrung: Option<String>,
+
+    /// Widest rung served when `PLOW_HSACO_LOWRUNG` names one legacy directory.
+    #[arg(
+        long = "amd-lowrung-max",
+        env = "PLOW_LOWRUNG_MAX",
+        default_value_t = 2,
+        global = true
+    )]
+    pub lowrung_max: u32,
+
     /// LM head row0 debug mode.
     #[arg(long = "amd-lm-row0", env = "PLOW_LM_ROW0", default_value_t = false, hide = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub lm_row0: bool,
+
+    /// Route `FlashMlaPrefill` segments onto the 4-wave flash object (the V2 MLA
+    /// prefill kernel, which needs a 512-register budget the 8-wave interpreter
+    /// cannot give). The flash object must advertise `plow_mla_pf_v2_arm_1`.
+    ///
+    /// SERVE-TIME AND LOAD-BEARING, not a tuning knob: a `PLOW_GLM_OFOLD=1` blob
+    /// is REFUSED without it, because on the 8-wave kernel that blob leaves
+    /// unnormalized f32 partials for the fused GEMM to read as bf16 — finite,
+    /// fluent, and wrong. The canonical gfx942 recipe carries it.
+    #[arg(long = "amd-mla-pf-v2", env = "PLOW_MLA_PF_V2", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub mla_pf_v2: bool,
+
+    /// Download rank 0's copy of act tensors after the prefill/step:
+    /// `name:path[,name:path...]`. A measurement instrument, not a serving path.
+    #[arg(long = "amd-dump-act", env = "PLOW_DUMP_ACT", global = true)]
+    pub dump_act: Option<String>,
 }
 
 /// Global runtime config, initialized once at startup from CLI parse.
@@ -552,5 +659,125 @@ impl RuntimeConfig {
             }
             EnvOnly::parse_from(["plowrt"]).cfg
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A `RuntimeConfig` field that nothing reads is a CLI flag that silently does nothing.
+    ///
+    /// This is not hypothetical and it is why the test exists: `amd.trace_raw` was parsed here,
+    /// carried a `--trace-raw` flag, and had NO reader anywhere — while `main.rs` and
+    /// `exec/amd.rs` read `PLOW_TRACE_RAW` through `env::var_os` in four places. The env var
+    /// worked, so nothing looked broken; the flag was decoration. Same duplicated-parse shape as
+    /// the `PLOW_XR_CUS` defect, and `devgen::emit_config` already carries the twin of this test.
+    ///
+    /// Coarse on purpose — "does any plowrt source outside this file mention `.field`". A
+    /// reachability analysis needs the feature cross-product and a wrong one fails working
+    /// builds; naming is the cheap 90%, and what it catches is "nobody named it at all".
+    #[test]
+    fn every_field_has_a_reader() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let me = std::fs::read_to_string(src_dir.join("config.rs")).expect("own source");
+
+        // Field names from the struct bodies, not a hand-kept list — a hand-kept list is the
+        // thing that goes stale when someone adds a field.
+        let mut fields: Vec<String> = Vec::new();
+        for marker in [
+            "pub struct RuntimeConfig {",
+            "pub struct NvidiaRuntimeConfig {",
+            "pub struct AmdRuntimeConfig {",
+        ] {
+            let start = me
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker} not found"));
+            let body = &me[start..];
+            let end = body.find("\n}").expect("struct end");
+            for line in body[..end].lines() {
+                if let Some(rest) = line.trim().strip_prefix("pub ") {
+                    if let Some((name, _)) = rest.split_once(':') {
+                        fields.push(name.to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            fields.len() > 30,
+            "parsed {} fields; the parser is wrong",
+            fields.len()
+        );
+
+        let others: String = walk(&src_dir);
+        assert!(!others.is_empty(), "no sibling sources readable");
+
+        let dead: Vec<&String> = fields
+            .iter()
+            // `amd`/`nvidia` are the sub-struct handles; reads go through them as `.amd.x`.
+            .filter(|f| !others.contains(&format!(".{f}")))
+            .collect();
+        assert!(
+            dead.is_empty(),
+            "RuntimeConfig fields parsed but never read: {dead:?}. Each is a --flag that does \
+             nothing while its env var keeps working through a direct read elsewhere, which is \
+             exactly how `trace_raw` went unnoticed. Wire it, or delete the field and leave the \
+             env var to whoever already reads it."
+        );
+    }
+
+    /// The inverse: a knob read straight from the environment, bypassing `RuntimeConfig`.
+    /// Such a knob has no `--flag`, is absent from `--help`, and cannot be set any other way.
+    #[test]
+    fn no_raw_env_reads() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders: Vec<String> = Vec::new();
+        for (path, text) in files(&src_dir) {
+            if path.file_name().is_some_and(|n| n == "config.rs") {
+                continue;
+            }
+            for (i, line) in text.lines().enumerate() {
+                for pat in ["std::env::var(\"", "std::env::var_os(\""] {
+                    let Some(pos) = line.find(pat) else { continue };
+                    let rest = &line[pos + pat.len()..];
+                    let Some(end) = rest.find('"') else { continue };
+                    let var = &rest[..end];
+                    if var.starts_with("PLOW_") || var.starts_with("GLM_") {
+                        let f = path.file_name().unwrap().to_string_lossy().to_string();
+                        offenders.push(format!("{f}:{} {var}", i + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "plowrt reads these knobs straight from the environment, bypassing RuntimeConfig: \
+             {offenders:?}. Declare the field (with its `env =` attribute) and read it via \
+             `RuntimeConfig::get()`, so the knob also has a CLI flag and shows up in --help."
+        );
+    }
+
+    fn files(dir: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(files(&p));
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                if let Ok(t) = std::fs::read_to_string(&p) {
+                    out.push((p, t));
+                }
+            }
+        }
+        out
+    }
+
+    fn walk(dir: &std::path::Path) -> String {
+        files(dir)
+            .into_iter()
+            .filter(|(p, _)| p.file_name().is_some_and(|n| n != "config.rs"))
+            .map(|(_, t)| t)
+            .collect()
     }
 }

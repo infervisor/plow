@@ -17,6 +17,14 @@ flowchart LR
 
 The TileGraph is the **handoff artifact** — everything upstream (fusion, extraction, tile selection) writes into it; everything downstream (scheduling, emission, verification) reads from it. This makes it the single source of truth for the scheduled computation.
 
+> [!NOTE]
+> **Deviation from implementation:** the `LayerPlan` that `assemble` consumes on
+> the shipping `--emit devblob` path is built by `plowc::hf_config` /
+> `rewrite::plan_from_all_blocks` directly from the operator graph — the egglog
+> extraction step shown above does not run on the way to an asset (see
+> [01-compiler-pipeline.md](01-compiler-pipeline.md)). Everything below the
+> `LayerPlan` (tile selection, node generation, constraints) is exactly as built.
+
 ---
 
 ## Structure
@@ -159,35 +167,41 @@ The scheduler's **relax pass** can demote a handoff (e.g. `SramSameSm` → `Hbm`
 
 ```rust
 pub struct ConstraintSet {
-    pub handoffs: Vec<Handoff>,
-    pub relaxable: Vec<RelaxableHandoff>,
-    pub locality: HashMap<(usize, usize), LocalityReq>,
     pub colocation_groups: Vec<Vec<usize>>,
-    pub dedup_groups: Vec<Vec<usize>>,
     pub placement: HashMap<usize, UnitId>,
-    pub concat_groups: Vec<ConcatGroup>,
+    pub sram_pages: HashMap<usize, u64>,
+    pub staged_inputs: Vec<(String, Vec<usize>)>,
+    pub handoffs: Vec<Handoff>,
     pub tile_deps: Vec<TileDep>,
-    pub axis_couples: Vec<AxisCouple>,
+    pub domains: HashMap<usize, TileDomain>,
+    pub relaxables: Vec<RelaxableHandoff>,
+    pub locality: HashMap<(usize, usize), LocalityReq>,
+    pub op_io: HashMap<usize, OpDesc>,
+    pub unified_memory: bool,
+    pub concat_groups: Vec<ConcatGroup>,
 }
 ```
 
 | Constraint | Meaning | Scheduler Effect |
 |-----------|---------|-----------------|
-| `handoffs` | Which DmaOut → DmaIn pairs share data | Informs counter wiring |
-| `relaxable` | Handoffs the scheduler may demote under pressure | SRAM/occupancy trade-off |
-| `locality` | Placement proximity requirements | SM/GPC/unit pinning |
-| `colocation_groups` | Nodes that must share one SM | Serial execution on one SM |
-| `dedup_groups` | DmaIn nodes reading the same tensor | Single HBM read, shared staging |
-| `placement` | Pre-decided unit assignment | Multi-unit partitioning |
-| `concat_groups` | Join nodes collecting partial results | Ordering barrier |
-| `tile_deps` | Fine-grained tile-to-tile data deps | Counter determination |
-| `axis_couples` | Axes that must couple across ops | Shape compatibility |
+| `colocation_groups` | Compute nodes that must share one SM (same-unit handoffs) | Serial execution on one SM |
+| `placement` | Compute node → the unit it runs on | Multi-unit partitioning |
+| `sram_pages` | Compute node → its SRAM page footprint | Spatial demand per SM |
+| `staged_inputs` | Operand staged once from DRAM → the nodes reusing it (dma-dedup) | Single HBM read, shared staging |
+| `handoffs` | Producer DmaOut → consumer DmaIn pairs sharing data | Informs counter wiring |
+| `tile_deps` | Fine-grained cross-op tile-to-tile data deps | Counter determination |
+| `domains` | Compute node → its tile-coordinate domain | Per-tile expansion |
+| `relaxables` | Cost-driven handoff realizations the scheduler may relax | SRAM/occupancy trade-off |
+| `locality` | Producer→consumer edge → its placement requirement | SM/GPC/unit pinning |
+| `op_io` | Compute node → problem shape + operand names | Rebuild per-tile footprints/costs |
+| `unified_memory` | Whether the SoC's units share one coherent address space | Cross-unit handoff realization |
+| `concat_groups` | Contiguous concats the allocator realizes by adjacency | Output aliasing (no fresh alloc) |
 
 ---
 
 ## Assembly Algorithm
 
-The [`assemble()`](../../crates/rewrite/src/tilegraph.rs:369) function:
+The [`assemble()`](../../crates/rewrite/src/tilegraph.rs) function (`rewrite::assemble`):
 
 ```mermaid
 flowchart TD

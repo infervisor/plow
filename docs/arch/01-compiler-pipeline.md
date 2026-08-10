@@ -67,24 +67,40 @@ flowchart TD
 
 ## Stage 1: Frontend
 
-**Module:** `crates/frontend/src/lib.rs`  
+**Crate:** `crates/nn-graph` (in-workspace frontend IR)  
 **Input:** HuggingFace model ID or local config.json  
 **Output:** `nn_graph::Graph` (typed operator DAG)
 
-The frontend is intentionally thin — a hub layer over the `nn-graph` model zoo crate. It:
-1. Fetches `config.json` from HuggingFace Hub (via `hf-hub` with pure-Rust TLS)
+The frontend is the `nn-graph` crate: a model-agnostic operator-graph IR plus a
+model zoo. Architecture-specific builders (HF model → ops) live under
+`nn_graph::models` (behind the `models` feature); resolving a model *id* to its
+`config.json` over the network is `nn_graph::hub` (behind the `hub` feature). It:
+1. Resolves `config.json` from HuggingFace Hub (`nn_graph::hub`, via `hf-hub` 0.4)
 2. Parses model config (architecture, hidden_size, num_heads, num_layers, etc.)
-3. Builds a shape-specialized graph for the target bucket (batch, seq, phase)
+3. Builds a graph, runs symbolic shape inference (`infer_shapes`), then binds it
+   to concrete batch/seq/phase parameters for the target bucket
 
-**Supported architectures:** Gemma 2/3/4, Llama 2/3, Qwen 2/2.5, DeepSeek v2/v3, GLM 4/5
+**Supported architectures (`nn_graph::models`):** Gemma, Llama, Qwen 2.5/3/VL/Image,
+DeepSeek, GLM, Kimi, SigLIP.
 
-### Design Decision: nn-graph as External Vendor Crate
+> [!NOTE]
+> **Deviation from implementation:** the shipping `plowc --emit devblob` path
+> does **not** build an `nn_graph::Graph`. `plowc::hf_config` synthesizes a
+> full-model `LayerPlan` directly from `config.json` dimensions (compile-time
+> layer unroll) and feeds it straight to `assemble`, bypassing Stages 2–3
+> entirely. The `nn_graph::Graph` → egglog path is exercised only by the advisory
+> `report_devblob_egglog` fusion count.
 
-**Chosen:** `nn-graph` lives in its own private repo, used as a cargo git dependency from `https://github.com/infervisor/nn-graph.git`.
+### Design Decision: nn-graph as a Workspace Crate
 
-**Rationale:** The model zoo evolves independently (new architectures land frequently). Keeping it separate avoids polluting the compiler's Cargo.lock with model-specific dependencies and lets it maintain its own test suite.
+**Chosen:** `nn-graph` is an in-workspace crate (`crates/nn-graph`), consumed as a
+path dependency. It was formerly external; the `hub` feature and its optional
+`hf-hub` dependency are the remnants of that split.
 
-**Counter-claim:** A mono-repo would simplify the build. Response: the Nix flake pins it deterministically, and path-dep means `cargo` resolves it without git at eval time.
+**Rationale:** The model zoo evolves quickly (new architectures land often), but
+keeping it in-workspace lets `cargo` resolve it without git and keeps the frontend
+IR, its `DType` (which reaches emitted code via `costmodel::dtype_cost`), and the
+compiler in one lockfile.
 
 ---
 
@@ -96,31 +112,45 @@ The frontend is intentionally thin — a hub layer over the `nn-graph` model zoo
 
 ### 2.1 Lowering to Egglog
 
-The `lower` module translates the nn-graph DAG into egglog let-bindings:
+The `lower` module (`rewrite::lower`) walks the nn-graph DAG in program order,
+emitting one `(let nN <term>)` per node. Leaves inline as `(Input "name")` /
+`(Weight "name")` constructors; interior nodes reference earlier `let`
+variables. The term vocabulary is the `Expr` datatype in
+`crates/rewrite/src/egl/schema.egg` (e.g. `RmsNorm`, `Linear`, `Rope`,
+`Attention`, `Ew`, `Act`):
 
 ```
-(let norm_0 (rmsnorm x_0 wn_0))
-(let qkv_0 (gemm norm_0 wqkv_0))
-(let silu_0 (silu (gemm norm_0 wgate_0)))
+(let n0 (RmsNorm (Input "x") (Weight "input_layernorm.weight") 1e-6))
+(let n1 (Linear n0 (Weight "q_proj.weight") 4096))
+(let n2 (Act "silu" (Linear n0 (Weight "gate_proj.weight") 14336)))
 ```
 
-Each node becomes a typed egglog term. Shape information is preserved as term attributes.
+Each node becomes a fixed-arity, typed egglog term; scalar attributes
+(out-features, eps, rotary dim) ride along as term arguments.
 
 ### 2.2 Rewrite Rules
 
 **Source:** `crates/rewrite/src/egl/rules.egg`
 
-Rules are declarative and annotated with `; rule: <name>` for Lean verification:
+Rules are declarative and each is preceded by a `; rule: <name>` annotation that
+`plowc` parses and submits to Lean checkpoint A (`Plow.Rewrite.soundRules`). A
+rule missing that annotation, or whose name lacks a Lean theorem, fails the
+compile under `--lean-verify`. There are deliberately no `:cost` annotations:
+extraction runs on egglog's tree-additive cost (uniform head weight 1), so a
+fused target wins by having strictly fewer e-nodes. Representative rules:
 
 ```egglog
-; rule: gemm_silu_fuse
-(rewrite (silu (gemm ?a ?b)) (gemm_silu ?a ?b))
+; rule: rmsnorm-linear-fuse
+(rewrite (Linear (RmsNorm ?x ?w ?eps) ?wl ?out)
+         (FusedNormLinear ?x ?w ?wl ?eps ?out))
 
-; rule: rmsnorm_qkv_fuse
-(rewrite (gemm (rmsnorm ?x ?wn) ?w) (norm_gemm ?x ?wn ?w))
+; rule: gated-mlp-fuse
+(rewrite (Ew "mul" (Act ?k ?g) ?u)
+         (SwiGLU ?k ?g ?u))
 
-; rule: swiglu_fuse
-(rewrite (mul (silu (gemm ?x ?wg)) (gemm ?x ?wu)) (swiglu ?x ?wg ?wu))
+; rule: residual-rmsnorm-fuse
+(rewrite (RmsNorm (Ew "add" ?a ?b) ?w ?eps)
+         (FusedResidualNorm ?a ?b ?w ?eps))
 ```
 
 ### 2.3 Extraction
@@ -155,24 +185,33 @@ The custom extractor walks the saturated e-graph choosing the lowest-cost form p
 ## Stage 3: Bridge
 
 **Module:** `crates/rewrite/src/bridge.rs`  
-**Input:** `FusedGraph` + shape bucket  
+**Input:** shape-inferred `nn_graph::Graph` (as designed: `FusedGraph`) + shape bucket  
 **Output:** `LayerPlan`
 
-The bridge converts the egglog-extracted graph into a concrete plan:
+The bridge converts a shape-inferred graph into a concrete plan. A `LayerPlan` is
+just a list of `OpSpec`s in program order (data-flow is expressed by operand
+names, not a separate wiring list):
 
 ```rust
 pub struct LayerPlan {
-    pub ops: Vec<OpDesc>,
-    pub wiring: Vec<(String, String)>, // (producer_output, consumer_input)
+    pub ops: Vec<OpSpec>,
 }
 
-pub struct OpDesc {
+pub struct OpSpec {
     pub name: String,
-    pub kind: OpKind,      // Gemm(GemmShape) | Flash(AttnShape) | Row(RowShape) | Layout(LayoutSpec)
-    pub inputs: Vec<String>,
+    pub inputs: Vec<String>,   // inputs[0] is the shared activation; inputs[1..] parameters
     pub output: String,
+    pub kind: OpKind,          // Gemm(GemmShape) | Flash(AttnShape) | Row(RowShape) | Layout(LayoutSpec)
+    pub weight_dtype: nn_graph::DType,
+    pub compute_dtype: nn_graph::DType,
 }
 ```
+
+> [!NOTE]
+> **Deviation from implementation:** `plan_from_all_blocks` — the only bridge
+> entry with a production caller — lowers the **raw** `nn_graph::Graph`, not a
+> `FusedGraph`. `plan_from_fused` is the sole entry that consumes an
+> egglog-extracted term, and it has no production caller.
 
 **Current limitation:** these four generic kinds do not describe the complete
 production device surface. Model-specific emitters also select a much larger
@@ -224,14 +263,17 @@ The target flow inserts executable-kernel selection before assembly:
 4. price conversions, dispatch, state traffic, and fusions as a region;
 5. bake the chosen kernel/profile ID and tuning provenance into the artifact.
 
-A `NetworkBlockDefinition` supplies the concrete semantic DAG, state, precision,
-and phase buckets. The compiler deduplicates its op/region signatures, tunes
-only relevant missing cases, block-validates winners, and transactionally
-publishes qualified measurements. See
-[the design notes](../../the design notes#36-network-block-driven-tuning-and-database-publication).
+**Deviation from implementation:** the seam is partially wired. `OpSignature` and
+`KernelSpec` exist in `crates/kernelcaps`, and `assemble_tuned` already accepts a
+`KernelOracle` (`crates/rewrite/src/oracle.rs`) to filter and re-cost candidates.
+The default `assemble` passes `NoOracle`, so no capability registry is consulted
+on the shipping path — the analytical cost model still chooses every tile. A
+network-block definition that supplies the concrete semantic DAG, state,
+precision, and phase buckets, and the tuning/publication loop that deduplicates
+signatures and block-validates winners, are design intent, not built.
 
-No runtime stub, alias-only opcode, or uninstantiated tile may enter the
-TileGraph as a selectable candidate.
+The invariant the target flow enforces: no runtime stub, alias-only opcode, or
+uninstantiated tile may enter the TileGraph as a selectable candidate.
 
 See [02-tile-graph.md](02-tile-graph.md) for the full TileGraph design.
 
@@ -249,7 +291,7 @@ See [03-scheduler.md](03-scheduler.md) for the full scheduler design.
 
 ## Stage 6: Emission
 
-**Module:** `crates/packet/`  
+**Module:** `crates/schedule/src/emit.rs` (wire format defined in `crates/packet/`)  
 **Function:** `schedule::emit_program`
 
 Converts the scheduled task graph into a binary `.pkt` stream:

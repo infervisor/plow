@@ -1,5 +1,5 @@
 //! §L2 VMM-backed prefix sharing for the full-attention KV cache
-//! (the design notes, "Implementation V1").
+//! ("Implementation V1").
 //!
 //! ## What this buys
 //!

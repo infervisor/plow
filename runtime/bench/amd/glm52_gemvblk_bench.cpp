@@ -38,6 +38,12 @@ int main(int argc, char** argv) {
     CK(hipModuleGetFunction(&Ffp8, M, "k_blk_ship"));
     CK(hipModuleGetFunction(&Fbf, M, "k_bf16_ship"));
     struct Shape { const char* name; unsigned N, K; } shapes[] = {
+        /* shared_down_tp8 is THE narrow-K case PLOW_GEMV_BLK_LG targets. GLM-5.2 at TP8 routes
+         * the shared-expert DOWN with K = I_moe = 256, which makes nchunk = ceil(256/1024) = 1
+         * and dispatches UN=1: one chunk in flight, and since a chunk is PLOW_WAVE*16 = 1024
+         * K-elements against a K of 256, only lanes 0..15 are live. The TP4 row below (K=512)
+         * is the same defect at half strength and was already in this table. */
+        {"shared_down_tp8", 6144, 256},
         {"o_proj", 6144, 4096}, {"dense_down(44)", 6144, 3072}, {"shared_down", 6144, 512},
         {"shared_gate", 512, 6144}, {"kva_fusionA", 2624, 6144}, {"gate|up concat", 1024, 6144}, {"gate|up dense", 6144, 6144}, {"lm_head_like", 32768, 6144},
     };

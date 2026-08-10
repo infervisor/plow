@@ -23,7 +23,7 @@
 //!    nobody can audit.
 //! 2. **The M curve.** The one decision measurement can settle on this path is the *object*
 //!    one — which `PLOW_GEMV_MM`, and whether the outer walk is on — and that is answered by
-//! the same shape measured at several M. the design notes prices the
+//!    the same shape measured at several M. The design notes price the
 //!    endpoint of exactly that curve (57.9 / 106.5 / 141.7 / 202.3 / 142.4 tok/s at
 //!    B=1/2/4/8/16) and §6g-WALK attributes the B=16 loss to spill plus lost fusions. Those
 //!    are aggregate token rates; this cell is the per-shape decomposition under them.

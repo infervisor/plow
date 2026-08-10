@@ -32,14 +32,29 @@ R="$REPO/runtime"
 OUT="${1:-${PLOW_BUILD_DIR:-$REPO/build-amd/hsaco/gfx942}}"
 ARCH=gfx942
 HIPCC="${PLOW_HIPCC:-/opt/rocm/bin/hipcc}"
+# THE `|| true` IS LOAD-BEARING, and its absence cost two agents a build each.
+#
+# These probes list SEVERAL candidate paths and keep the first that exists — so `ls` reporting
+# "No such file" for the others is the NORMAL case, not an error. But `ls` still EXITS 2 when any
+# operand is missing, and under `set -euo pipefail` (line 28) `pipefail` promotes that exit
+# through `head -1` and `set -e` kills the script — at line 35, before a single `echo`. The
+# symptom is exit 2 and a COMPLETELY EMPTY log, which reads like a toolchain fault rather than a
+# shell quoting bug, and it fires only on a box that lacks the first candidate.
+#
+# `|| true` inside the substitution makes an all-candidates-missing probe yield the empty string
+# instead, which the checks below report by name. Fail loudly with a name, never silently at
+# line 35.
 BUN="${PLOW_BUNDLER:-$(ls -1 "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/clang-offload-bundler \
         "${ROCM_PATH:-/opt/rocm}"/llvm/bin/clang-offload-bundler \
-        /opt/rocm-*/lib/llvm/bin/clang-offload-bundler 2>/dev/null | head -1)}"
+        /opt/rocm-*/lib/llvm/bin/clang-offload-bundler 2>/dev/null | head -1 || true)}"
 # Same discovery for readelf: the cliff check below dies with empty fields (every row reported
 # OVER) when the hardcoded /opt/rocm path is absent, which fails a perfectly good build.
 READELF="${PLOW_READELF:-$(ls -1 "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/llvm-readelf \
         "${ROCM_PATH:-/opt/rocm}"/llvm/bin/llvm-readelf \
-        /opt/rocm-*/lib/llvm/bin/llvm-readelf 2>/dev/null | head -1)}"
+        /opt/rocm-*/lib/llvm/bin/llvm-readelf 2>/dev/null | head -1 || true)}"
+[ -x "$HIPCC" ] || { echo "FAIL: hipcc not found at '$HIPCC' (set PLOW_HIPCC)" >&2; exit 2; }
+[ -n "$BUN" ] || { echo "FAIL: clang-offload-bundler not found (set PLOW_BUNDLER)" >&2; exit 2; }
+[ -n "$READELF" ] || { echo "FAIL: llvm-readelf not found (set PLOW_READELF)" >&2; exit 2; }
 INC="-I$R/amd -I$R/common"
 JOBS="${JOBS:-8}"
 mkdir -p "$OUT"; cd "$OUT"
@@ -78,6 +93,14 @@ AX_PREFILL="-DPLOW_BUCKET_DECODE=0 $CDNA3_TILE $AX_GMOE"
 GVMM=1
 while [ "$GVMM" -lt "${PLOW_DECODE_BATCH:-1}" ] && [ "$GVMM" -lt 16 ]; do GVMM=$((GVMM * 2)); done
 AX_DECODE="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM $CDNA3_TILE $AX_GMOE"
+# OPT-IN (PLOW_GEMV_WALK=1): the §6g-WALK row-block outer loop — the object serves any M in
+# ceil(M/MM) passes of the compiled bucket, and the LDS staging bound becomes min(MM,M)*K.
+# REQUIRED for a PLOW_DECODE_BATCH>16 ladder (PLOW_GEMV_MAXM caps the bucket at 16; without
+# the walk, rows 16.. would never be written — plowrt refuses the pair on the missing
+# `plow_gemv_walk_1` marker rather than serving stale rows).
+if [ "${PLOW_GEMV_WALK:-0}" = 1 ]; then
+  AX_DECODE="$AX_DECODE -DPLOW_GEMV_WALK=1"
+fi
 # PLOW_OCC4=1 -- THE OCCUPANCY-4 DECODE PROFILE. MEASURED -10.4% on bf16 and -19.1% on fp8
 # (Gemma-4-12B, ctx 4096, three interleaved pairs, token-identical):
 #
@@ -111,10 +134,69 @@ fi
 # -- flash segments run on the 8-wave interpreter"), not an error. See the note
 # on AX_GMOE above for why that degrade is not benign.
 AX_FLASH="-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 $CDNA3_TILE_4W $AX_GMOE"
+# V2 MLA prefill arm (d_flash_mla_prefill_v2): the full-column-wave layout that needs this
+# object's 512-register budget. Marker `plow_mla_pf_v2_arm_1`; the host routes FlashMlaPrefill
+# segments here only under PLOW_MLA_PF_V2=1, so carrying the arm costs Gemma nothing.
+AX_FLASH="$AX_FLASH -DPLOW_MLA_PF_V2_ARM=1"
+# OPT-IN (PLOW_FA_LAZY=1): wave-voted skip of the online-softmax corr/rescale when the
+# running max did not move (bit-identical; see op_attention.h FA_LAZY_RESCALE). FLASH
+# OBJECT ONLY — the 8-wave prefill interpreter sits on the 256-reg cliff and even a
+# no-op perturbation of the flash branch's allocator can drop it to 1 wave/SIMD; the
+# 4-wave flash object has the 512-reg budget. Default OFF.
+if [ "${PLOW_FA_LAZY:-0}" = 1 ]; then
+  AX_FLASH="$AX_FLASH -DFA_LAZY_RESCALE=1"
+fi
 AX_FP8="-DPLOW_FP8=1"
 AX_FP8KV="-DPLOW_FP8_KV=1"
 AX_MLA="-DPLOW_MLA_PREFILL=1"
 AX_MOE="-DPLOW_MOE_PREFILL=1"
+
+# BATCHED DECODE (PLOW_DECODE_BATCH > 1): the GLM decode program emits its MoE/dense FFN with
+# the grouped PREFILL family at T = rows (the decode MoE ops carry no token dimension), so the
+# DECODE object must compile those case arms too — ops 83-87 are gated on PLOW_MOE_PREFILL,
+# which historically only the interp_prefill_*_mla_moe rows carried. Without this the load
+# refuses on the missing arm ("this packet dispatches MoeGroupGluPf, but interp_decode_gq.elf
+# was built without it"). Gated on the batch so a B=1 build stays byte-identical; watch the
+# cliff table below for the register cost the extra arms put on the decode megakernel.
+if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ]; then
+  AX_DECODE="$AX_DECODE $AX_MOE"
+  # THE GROUPED TILE IS NO LONGER THE OCC4 BLOCKER (2026-08-10 bisect). BM=64/BK=32 is FIXED:
+  # op_moe.h's MPF_SUBQ masked A-staging arm serves the sub-quantum tile (waves 0-3 stage the
+  # full 8-half vector each; the scale-block-edge fp8 promotion and kk-derived preshuffle
+  # address ride with it), and a BK=32 batched object at occ2 is BYTE-IDENTICAL in served
+  # output to the proven BK=64 object (48-token solo trajectories, one serve each). What
+  # HANGS the batched first dispatch is the OCC4 REGISTER RATION itself: with the identical
+  # 30,720 B arena, GM 128x256x32, NO_MLA_DEC and BK=32, the serve passes at PLOW_WPE=3
+  # (168 VGPR) and hangs at WPE=4 (128) and WPE=5 (104) — tile, LDS, NO_MLA_DEC and
+  # PLOW_GATE_HIER each exonerated one at a time, and the B=1 OCC4 object serves fine on the
+  # same binary. The BM=128 (SM=2) recut stays CLOSED for an unrelated reason: at SM=2 the
+  # acc+accf promotion accumulators alone are 128 VGPRs — the whole WPE=5 budget.
+  if [ "${PLOW_OCC4:-0}" = 1 ]; then
+    echo "FAIL: PLOW_OCC4=1 with PLOW_DECODE_BATCH>1 — the WPE=5/4 register ration hangs the"
+    echo "      batched program's first decode dispatch (2026-08-10 bisect; the BK32 grouped"
+    echo "      tile is fixed and exonerated — occ2+MPF_BK=32 and the WPE=3 recut both serve)."
+    echo "      Build without PLOW_OCC4, or take PLOW_DEC_SQUEEZE=1 (the validated WPE=3 recut)."
+    exit 1
+  fi
+  if [ "${PLOW_DEC_SQUEEZE:-0}" = 1 ]; then
+    # THE VALIDATED REGISTER-SQUEEZE RECUT (opt-in, 2026-08-10): the OCC4 profile's pieces at
+    # the deepest ration that still serves — GM 128x256x32 (30,720 B arena), NO_MLA_DEC (fmla
+    # aimed at raw, GF=4 fits, asserted in interp.hip), MPF_BK=32/DBUF=1 (the MPF_SUBQ tile),
+    # PLOW_WPE=3 -> 168 VGPR, spill 20-26. Gate record, one serve each, same session: smoke
+    # coherent; solo trajectory BYTE-IDENTICAL to the shipped BK=64 occ2 object over 48
+    # tokens; needle-content PASS @3000; rung-1 TPOT 40.218 -> 35.291 ms p50 (-12.3%, in=8192
+    # out=128, TTFT unmoved 2393->2391 — the correct negative control). WPE=4 (128 VGPR) and
+    # WPE=5 (104) HANG the first batched dispatch — that cliff is the open OCC4 task.
+    AX_DECODE="$AX_DECODE -DGM_BM=128 -DGM_BN=256 -DGM_BK=32 -DPLOW_NO_MLA_DEC=1 -DPLOW_WPE=3 \
+               -DPLOW_MOE_GEMMA_PF=0 -DMPF_BK=32 -DMPF_DBUF=1"
+  else
+    # MPF_BK=32 A/B escape hatch (like GM_BM/GM_BK above): the arena-fitting tile at occ2,
+    # validated byte-identical to BK=64 in served output. It drops the Gemma _PF arm exactly
+    # as the OCC4 profile does — the Gemma grouped twin has no sub-quantum arm and its
+    # static_assert refuses the pairing.
+    AX_DECODE="$AX_DECODE${MPF_BK:+ -DMPF_BK=$MPF_BK -DPLOW_MOE_GEMMA_PF=0} -DMPF_DBUF=1"
+  fi
+fi
 AX_GQ="-DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=${PLOW_GQ_BATCH:-1}"
 
 # PER-XCD QUEUES + TWO-LEVEL GATE MAINTENANCE -- ON BY DEFAULT. MEASURED -16.0%, TOKEN-IDENTICAL.
@@ -170,6 +252,297 @@ if [ "${PLOW_L2HIER:-1}" = 1 ]; then
   AX_DECODE="$AX_DECODE -DPLOW_L2_PLACE_DISPATCH=1 -DPLOW_GATE_HIER=1"
 fi
 
+# OPT-IN (PLOW_GLM_GF8=1): compile the GF=8 MLA flash-decode arm so PLOW_GLM_GF=4-vs-8
+# can be A/B'd ON THE SAME OBJECT (op_attention.h PLOW_GLM_GF8_ARM: comparing across
+# objects confounds with the +32% I$-growth effect). NEVER ship an arm-present object's
+# numbers as a default-config result — the arm's presence alone is the confound.
+#
+# NOT COMPOSABLE WITH PLOW_OCC4, and hipcc now says so instead of corrupting LDS: OCC4 passes
+# -DPLOW_NO_MLA_DEC=1, which aims the MLA decode arena at the 30,720 B GEMM tile, and the GF=8
+# layout is 42,048 B — 11,328 B past it. The static_assert in interp.hip next to the MPF one
+# refuses the pair at compile time. A GF=8 A/B under OCC4 needs a deliberately widened arena.
+if [ "${PLOW_GLM_GF8:-0}" = 1 ]; then
+  AX_DECODE="$AX_DECODE -DPLOW_GLM_GF8_ARM=1"
+fi
+
+# OPT-IN (PLOW_GLM_FUSE_QNORM=1): THE Q-NORM FOLD ARM on op 22 `GemvQkv` (op_gemm.h
+# PLOW_GLM_FUSE_QNORM). GLM-5.2 decode runs GemvQkv-A -> RmsNorm(q_a_layernorm) -> GemvQkv-G
+# and the middle packet is ONE workgroup: the traced window between the two GEMVs is 12.2 us
+# for a 4.6 us body, the largest packet-boundary window left on the decode chain
+# (perf-data/plow-gfx942/glm52-decode-packet-folds.md section 7 prices it at ~-0.9 ms). This
+# arm normalizes the staged copy of x in place -- d_gemv_t's `norm == 2` mechanism, bit-exact
+# to the deleted packet -- and the blob must be emitted with PLOW_GLM_FUSE_QNORM=1 too. Both
+# halves are needed: plowrt refuses a folded blob on an unarmed object via
+# `plow_glm_fuse_qnorm_arm`, because an unarmed object would silently run the GEMV over an
+# UNNORMED q_a row. DECODE ROWS ONLY (op 22 is decode-only; prefill picks a Gemm). Default
+# OFF, so the shipped objects are byte-unchanged.
+# ARM DEFAULT ON for gfx942 (opt out with PLOW_GLM_FUSE_QNORM=0), 2026-08-09: the arm is a
+# runtime branch discriminated on the packet's t[7], so an armed object serves an unfolded
+# blob byte-identically — defaulting it on just makes folded blobs loadable without a matched
+# hand-built object. The EMIT side stays opt-in.
+if [ "${PLOW_GLM_FUSE_QNORM:-1}" = 1 ]; then
+  AX_DECODE="$AX_DECODE -DPLOW_GLM_FUSE_QNORM=1"
+fi
+
+# OPT-IN (PLOW_L2HIER_PF=1): the same pair on the PREFILL objects, for blobs whose
+# prefill program is PLACED (GLM: uni-segment prefill, one object per program run, so
+# the mixed-protocol deadlock above cannot arise -- that hang needed one placed
+# program's segments split across objects with and without the define). On an
+# UNPLACED blob the define is inert (GATE_HIER's runtime precondition is
+# l2_domains != 0). Still: re-run the hang test (amd-bench --prompt at 2-4k completes
+# in normal wall time) before trusting any build that widens this.
+if [ "${PLOW_L2HIER_PF:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_L2_PLACE_DISPATCH=1 -DPLOW_GATE_HIER=1"
+fi
+
+# OPT-IN (PLOW_MLA_PF_QK1=1): MLA prefill computes QK^T + softmax on ONE wave per M-tile
+# and shares P + the per-row corrections through LDS instead of every wave recomputing
+# them (8x redundant on CDNA3, where the arena forces WPM = PLOW_WAVES). Byte-identical
+# output by construction — same values, same multiplies (op_attention.h PLOW_MLA_PF_QK1).
+# OPT-IN (PLOW_DSA_PF=1): the GATHERED arm of the V2 MLA prefill (DSA sparse prefill,
+# runtime ops 117-119 + t7 on op 51). FLASH OBJECT ONLY, and opt-in because the megakernel's
+# register allocation is the worst case over every inlined arm: instantiating the gathered
+# body costs the flash object spill 98 -> 287 even for blobs that never emit a union table.
+# A sparse blob loaded against an object built WITHOUT this reads no t7 and runs dense.
+if [ "${PLOW_DSA_PF:-0}" = 1 ]; then
+  AX_FLASH="$AX_FLASH -DPLOW_DSA_PF_ARM=1"
+fi
+
+if [ "${PLOW_MLA_PF_QK1:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MLA_PF_QK1=1"
+fi
+
+# PLOW_MLA_PF_SMX=0 opts OUT of the split-softmax MLA prefill (default ON for CDNA3 —
+# op_attention.h PLOW_MLA_PF_SMX; bit-identical, kill switch for A/B only).
+if [ "${PLOW_MLA_PF_SMX:-}" = 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MLA_PF_SMX=0"
+fi
+
+# CEILING INSTRUMENT ONLY (PLOW_MLA_PF_ABL=1..4): MLA-prefill ablation probes — one cost
+# term deleted each (op_attention.h PLOW_MLA_PF_ABL). WRONG OUTPUT by construction, never a
+# serve asset. Do not combine with PLOW_MLA_PF_QK1 (the ABL=2 arm changes what the QK1
+# cgrp-0 guard binds to).
+if [ "${PLOW_MLA_PF_ABL:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MLA_PF_ABL=${PLOW_MLA_PF_ABL}"
+fi
+
+# CEILING INSTRUMENT ONLY (PLOW_XR_NOWAIT=1): prefill objects with BOTH two-shot rendezvous
+# waits deleted (op_collective.h). The output is WRONG by construction — this prices what the
+# collective's synchronization costs, never ships, and must not touch a serve asset.
+if [ "${PLOW_XR_NOWAIT:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_XR_NOWAIT=1"
+fi
+
+# OPT-IN (PLOW_XR_MLP=1): PEER-BATCHED REDUCE in the cross-GPU collectives (op_collective.h).
+# The reduce bodies walked the N peers one serialised round trip at a time (ISA: a pointer
+# re-load + s_waitcnt vmcnt(0), then the remote load + another vmcnt(0), PER PEER PER ELEMENT);
+# this hoists the eight peer bases and issues all eight remote loads before consuming any.
+# BIT-IDENTICAL (same r=0..N-1 f32 sum, same element->thread map, same 2 B load width) and TP8
+# only. DECODE and PREFILL objects both -- the one-shot XREDUCE is decode's MoE-seam collective
+# and the two-shot's reduce-scatter is half of prefill's fabric bytes. Default OFF: unset, the
+# objects are byte-identical to a build from before this axis existed.
+# MEASURED NULL, slightly negative (+1.1%/+1.6% TTFT @4k/8k against a 0.7-1.3% control spread;
+# 181.7 vs 289.4 GB/s in the reduce-scatter microbench). This fabric is limited by request
+# concurrency ACROSS THREADS, not per-thread depth. Kept as the record; see op_collective.h and
+# perf-data/plow-gfx942/glm52-collective-tuning-mi300x.md. DO NOT turn it on expecting a win.
+if [ "${PLOW_XR_MLP:-0}" = 1 ]; then
+  AX_DECODE="$AX_DECODE -DPLOW_XR_MLP=1"
+  AX_PREFILL="$AX_PREFILL -DPLOW_XR_MLP=1"
+fi
+
+# OPT-IN (PLOW_XR_AGG=1): DEVICE-LOCAL AGGREGATION of the two-shot collective's `gate_ag`
+# signal (op_collective.h PLOW_XR_AGG). As built, all nblk workgroups each issue nranks
+# SYSTEM-scope returning RMWs on one 128 B line per peer -- 2432 remote atomics per rank per
+# collective at nblk=304/tp=8, measured at 51.8 us against 8.2 us for a 1-signaller gate.
+# This aggregates them on word 1 of the same counter line (PLOW_CTR_STRIDE is 32 words and
+# only word 0 is used) and lets the closing workgroup issue nranks signals carrying nblk each
+# -- so word 0 still lands on exactly nranks*nblk and plowrt's host audit is unchanged.
+# BIT-IDENTICAL (no value is touched) and objects-only: no blob, no emitter, no arm marker;
+# an object built without it is correct-just-slower. PREFILL ROWS ONLY -- `XReduceTwoShot`
+# is emitted 156x per prefill program and ZERO times in the decode program, so this is TTFT
+# work and exactly 0.0% of TPOT.
+# HISTORY: default-on 2026-08-09, reverted same day (an XR_AGG-only build FAILED the
+# 3000-token needle gate, '741' for '7413'), RE-ADOPTED 2026-08-10 after the ordering fix.
+# The failing cut released with a FENCE and arrived with a relaxed AGENT-scope RMW — that
+# orders nobody's stores for a remote observer, and agent-scope RMWs run cached in the
+# arriving XCD's L2 on the very line the peers' signals update memory-side. The fixed form
+# (op_collective.h): the arrival RMW itself is the release at SYSTEM scope, and the closing
+# workgroup takes the SYSTEM acquire before speaking. Gate record (2026-08-10, r4b4 ladder
+# asset): fixed arm PASSES needle 3000/8000 x2 each; a freshly rebuilt PRE-fix control ALSO
+# passed 2/2 the same day, so the original failure was INTERMITTENT — the fix stands on the
+# memory-model repair, the gate is its non-refutation. Opt out with PLOW_XR_AGG=0.
+if [ "${PLOW_XR_AGG:-1}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_XR_AGG=1"
+fi
+
+# OPT-IN (PLOW_MOE_PF_SCHED=1): sched_group_barrier pipeline shaping in the grouped MoE
+# prefill k-loop (op_moe.h). Instruction ORDER only — bit-identical output; the A/B judges
+# whether the aiter-style load/MFMA interleave beats LLVM's default schedule.
+if [ "${PLOW_MOE_PF_SCHED:-0}" = 1 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_SCHED=1"
+fi
+
+# PLOW_MOE_PF_PIPE=0 forces the shipped single-stage grouped-prefill k-loop (the aiter-shape
+# two-tile register pipeline is the CDNA3 DEFAULT in op_moe.h). Only "0" is meaningful here —
+# it is the A/B control against the default-on pipeline.
+if [ "${PLOW_MOE_PF_PIPE:-}" = 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_PIPE=0"
+fi
+
+# OPT-IN (PLOW_MOE_PF_GH=1|2): GATHER HIDING in the grouped MoE prefill A-gather (op_moe.h
+# PLOW_MOE_PF_GH). 1 hoists the K-INVARIANT `row_token[rowbase+r]` index out of the k-loop --
+# every k-tile currently re-loads the SAME dword and stalls on `s_waitcnt vmcnt(0)` before its
+# A row can issue; 2 additionally software-pipelines that one load a full OUTPUT TILE ahead.
+# Value-identical (same indices, same bytes, same LDS cells) -- this is an A/B on latency
+# exposure, not on arithmetic. Default OFF, so the shipped object is byte-unchanged.
+if [ "${PLOW_MOE_PF_GH:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_GH=${PLOW_MOE_PF_GH}"
+fi
+
+# OPT-IN (PLOW_MOE_PF_EPI=1|2): DOWN-EPILOGUE ROW-METADATA HOIST (op_moe.h PLOW_MOE_PF_EPI).
+# The shipped DOWN epilogue issues 128 flat_load_dword at max-outstanding 1, each followed by
+# a full `s_waitcnt vmcnt(0) lgkmcnt(0)`, to re-read the k- AND n-INVARIANT
+# row_partidx/row_gate pair once per OUTPUT ELEMENT. 1 loads the 64-row block one row per
+# lane at the tile head (latency covered by the k-loop) and bpermutes it back in the epilogue;
+# 2 issues the same two loads just before the epilogue instead, so nothing is live across the
+# k-loop. Same addresses, same dwords, same arithmetic -- BYTE-IDENTICAL output, an A/B on
+# round-trip serialization only. Default OFF, so the shipped object is byte-unchanged.
+# DEFAULT ON for gfx942 (opt out with PLOW_MOE_PF_EPI=0), 2026-08-09. The output is
+# BYTE-IDENTICAL -- same addresses, same dwords, same arithmetic -- so this is an A/B on
+# round-trip serialization and nothing else, and it is the difference between the MoE grouped
+# pair sitting 2.76x and 2.25x off aiter at the measured M=2048 shape
+# (glm52-current-cost-decomposition.md sec 1.6). It was already passed explicitly by the
+# canonical GLM object recipe; carrying it as a default removes the chance of building the
+# "shipped" objects without it. `=0` restores the pre-arm object exactly.
+if [ "${PLOW_MOE_PF_EPI:-1}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_EPI=${PLOW_MOE_PF_EPI:-1}"
+fi
+
+# OPT-IN (PLOW_MOE_PF_EPI_SIB=1): THE SAME HOIST AT THE TWO SIBLING SITES (op_moe.h
+# PLOW_MOE_PF_EPI_SIB) -- `d_moe_group_pf_a4w4` (CDNA4 only, not compiled here) and
+# `d_moe_group_gemma_pf_t` (the Gemma-4 MoE twin, ops 75/76 and 81/82; its w8a8 arm carries a
+# THIRD k/n-invariant per-row load, `ascale`, which this takes with the other two). Same
+# addresses, same dwords, same arithmetic -- BYTE-IDENTICAL output. A SEPARATE flag from
+# PLOW_MOE_PF_EPI so the GLM canonical recipe is unperturbed by a change to kernels GLM never
+# dispatches. Rides AX_PREFILL and AX_DECODE alike, because the Gemma MoE prefill bodies are
+# folded into every gfx942 row by AX_GMOE. Default OFF, so the shipped objects are unchanged.
+if [ "${PLOW_MOE_PF_EPI_SIB:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_EPI_SIB=1"
+  AX_DECODE="$AX_DECODE -DPLOW_MOE_PF_EPI_SIB=1"
+  AX_FLASH="$AX_FLASH -DPLOW_MOE_PF_EPI_SIB=1"
+fi
+
+# FALSIFICATION ARM (PLOW_F2BF_SELECT=1): the REFUTED branchless f2bf. Default 0 = the shipped branched form.
+# MEASURED AND REFUTED: the branchless form is -5.0% static instructions on the prefill
+# megakernel and +4.5/+5.3/+7.0% SERVED TTFT at 4k/8k/16k (4 interleaved arms, 2 rounds). It is
+# also not output-identical in situ despite being value-identical over all 2^32 float bit
+# patterns -- GSM8K 0.960 vs 0.970, reproducible per arm -- because a function this widely
+# inlined perturbs surrounding codegen and fp contraction. Kept so the falsification is
+# reproducible rather than a claim. Rides all three object groups: every one stores bf16.
+if [ "${PLOW_F2BF_SELECT:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_F2BF_SELECT=1"
+  AX_DECODE="$AX_DECODE -DPLOW_F2BF_SELECT=1"
+  AX_FLASH="$AX_FLASH -DPLOW_F2BF_SELECT=1"
+fi
+
+# OPT-IN (PLOW_MOE_PF_ATOMIC=1): FUSE the grouped MoE prefill's ops 86 -> 87 (op_moe.h
+# PLOW_MOE_PF_ATOMIC). The DOWN epilogue stops scattering part[T*k, H] and atomically adds into
+# a [T, H] f32 accumulator that op 83 zeroes and op 87 reads with k=1 -- removing 1.611 GB
+# written + 1.611 GB read per layer per rank at T=8192 and collapsing op 87 from k=8 streams at
+# 24 KB stride to one contiguous stream. This is aiter's decomposition (its shipped
+# fmoe_..._g1u1 gfx942 object carries 96 global_atomic_pk_add_bf16 and no scatter at all).
+# The BLOB must be emitted with PLOW_MOE_PF_ATOMIC=1 too; plow_moe_pf_atomic_arm refuses the
+# mismatch. NUMERICS-CHANGING (atomic-arrival-order f32 sum, and run-to-run nondeterministic),
+# so it is opt-in on both sides and the default object is byte-identical without it.
+if [ "${PLOW_MOE_PF_ATOMIC:-0}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_ATOMIC=${PLOW_MOE_PF_ATOMIC}"
+fi
+
+# OPT-IN (PLOW_MOE_PF_DET=1): the DETERMINISTIC form of the same 86 -> 87 fusion (op_moe.h
+# PLOW_MOE_PF_DET). Op 86 accumulates rint(gate*value * 2^32) into a [T,H] f64 accumulator with a
+# device-scope f64 atomic: every partial sum is an integer below 2^53, so every add is EXACT and
+# the k-way total does not depend on which workgroup arrives first. Op 87 reads one contiguous
+# stream and scales by 2^-32. Twice the accumulator bytes of PLOW_MOE_PF_ATOMIC, and run-to-run
+# BIT-REPRODUCIBLE, which that arm is not. Mutually exclusive with it (the header #errors).
+# The BLOB must be emitted with PLOW_MOE_PF_DET=1 too; plow_moe_pf_det_arm refuses the mismatch.
+#
+# DEFAULT ON for gfx942 (opt out with PLOW_MOE_PF_DET=0), 2026-08-09. The numerics blocker that
+# kept this opt-in is CLEARED BY MEASUREMENT, not waived: full-set paired GSM8K, per-question,
+# one server load per arm, GPU-locked and HSA/coherence gated --
+#     control 1268/1319 = 0.9613     det 1268/1319 = 0.9613     paired difference +0.00 pp
+#     discordant b = 10, c = 10      McNemar exact two-sided p = 1.0000
+#     minimum detectable difference at this discordance ~0.66 pp
+# with TTFT -1.79/-2.88/-1.89/-1.66%% at 1k/4k/8k/16k against control spreads of 0.1-1.1%%, and
+# DRAM -1.711 GB per MoE layer per rank. The arm was NEVER going to pass the character-identity
+# gate it was held to -- sec 2 of glm52-moe-deterministic-writer.md proves no scheme can be
+# bit-identical here -- and that gate cannot tell "degraded the model" from "reworded a correct
+# answer". It changes 1.8%% of served answers (ten correctness flips each way, netting zero),
+# which is a product property, not a defect. An OLD blob on a new object is unaffected (the arm
+# is only reached when the packet arms i[5]); a new blob on a PRE-ARM object is a LOUD refusal.
+if [ "${PLOW_MOE_PF_DET:-1}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_DET=${PLOW_MOE_PF_DET:-1}"
+fi
+
+# CEILING INSTRUMENT ONLY (PLOW_MLA_PF2_ABL=1..4): the V2 MLA prefill's ablation probes —
+# one cost term deleted each (op_attention.h d_flash_mla_prefill_v2): 1 = no K-slab stage,
+# 2 = no QK MFMA, 3 = no softmax math, 4 = no PV. WRONG OUTPUT by construction, never a
+# serve asset. FLASH object only (the V2 body lives there).
+if [ "${PLOW_MLA_PF2_ABL:-0}" != 0 ]; then
+  AX_FLASH="$AX_FLASH -DPLOW_MLA_PF2_ABL=${PLOW_MLA_PF2_ABL}"
+fi
+
+# PLOW_MLA_PF2_DBUF=0 kill switch: the V2 kernel's register-prefetch K-slab pipeline
+# (default ON in op_attention.h — bit-identical, see the kernel note). The switch exists
+# for A/B only.
+if [ "${PLOW_MLA_PF2_DBUF:-1}" = 0 ]; then
+  AX_FLASH="$AX_FLASH -DPLOW_MLA_PF2_DBUF=0"
+fi
+
+# OPT-IN (PLOW_MLA_FOLD_TB=<G>): TOKEN-BLOCKED MlaMergeFold (op_attention.h
+# d_mla_merge_fold_tb, dispatched by interp.hip's exec_mla_merge_fold).
+#
+# The shipped fold gives one workgroup one (token, head) row and streams the whole 256 KiB
+# W_uv[head] panel to produce one 256-wide output row, so at GLM-5.2 TP8 T=8192 the packet
+# re-reads 16.8 GB of W_uv out of L2 per layer to do 8.6 GMAC -- 8.6% of a prefill layer's CU
+# budget, 120 ms of TTFT at 8k. This arm gives a workgroup G consecutive token-rows of ONE head,
+# so a W_uv element in a register is consumed by G accumulators and the stream divides by G.
+# Nothing else moves: same lane->column map, same l-slice split, same unroll, same fold tree, and
+# the per-token accumulation ORDER is untouched -- so the output is BIT-IDENTICAL and this is an
+# OBJECT-level knob like PLOW_MLA_PF_SV: no blob, no emit, no host plumbing, no manifest
+# `requires`. PREFILL objects only (the prefill packet is the only one whose n_batch is the token
+# count; decode's n_batch=1 fails the arm's own guard). Default OFF, so a build without it is
+# byte-identical to one from before this block. Measured standalone at TP8 T=8192 ns=2
+# (runtime/bench/amd/glm52_kbench_fold_pf, perf-data/plow-gfx942/glm52-mla-merge-fold.md):
+# 1626 us/packet -> 616 at G=8, 692 at G=4, 940 at G=2.
+# HISTORY: default-8 2026-08-09, reverted same day, RE-ADOPTED 2026-08-10. The 08-09 revert
+# note said "alone or with XR_AGG", but the bisect record (686a3bf) is explicit that this arm
+# was tested only IN COMBINATION with the then-broken XR_AGG and "was never content-gated at
+# length alone" — it was condemned by association. Solo gate 2026-08-10 (r4b4 ladder asset):
+# PASSES needle 3000/8000 x2 each; combined with the FIXED XR_AGG it is gated again before
+# every recipe publish. TTFT −3.8/−5.5/−6.2% @4k/8k/16k. Opt out with PLOW_MLA_FOLD_TB=0.
+if [ "${PLOW_MLA_FOLD_TB:-8}" != 0 ]; then
+  AX_PREFILL="$AX_PREFILL -DPLOW_MLA_FOLD_TB=${PLOW_MLA_FOLD_TB:-8}"
+fi
+
+# OPT-IN (PLOW_MLA_PF_SV=1): the V2 kernel's V-STAGE arm — kv-block LDS swizzle that makes
+# the PV transpose read bank-conflict-free, plus double-buffered QK/PV LDS fragments (see
+# op_attention.h PLOW_MLA_PF_SV). FLASH OBJECT ONLY (the V2 body lives there);
+# BIT-IDENTICAL (LDS addresses and load issue order only), so it is an OBJECT-level knob
+# like PLOW_MLA_PF2_DBUF — no blob/emit/host plumbing, no manifest `requires`. Default OFF:
+# with it unset every row is byte-identical to a build without this block.
+# DEFAULT ON for gfx942 (opt out with PLOW_MLA_PF_SV=0), 2026-08-09. BIT-IDENTICAL by
+# construction (LDS addresses and load issue order only), and the adoption gate is already on
+# record: objects-only A/B, 3 interleaved rounds, TTFT -1.2%% @4k / -2.5%% @8k / -2.5%% @16k
+# against a control whose own round-to-round spread is 0.38-0.40%%, with EVERY sv round below
+# EVERY control round at 8k and 16k, and 4/4 character-identical answers including two long
+# free-form generations (glm52-flash-streamed-v.md, ADOPTION GATE). The win scaling with KV-tile
+# count is what an LDS-side fix predicts and an MFMA-issue-bound loop would not produce.
+# Object-level knob: no blob, no emit, no manifest `requires`, so an object built WITHOUT it
+# stays fully correct and merely slower -- degrade, not corrupt.
+if [ "${PLOW_MLA_PF_SV:-1}" = 1 ]; then
+  AX_FLASH="$AX_FLASH -DPLOW_MLA_PF_SV=1"
+fi
+
 # FA_DEC_ILV -- interleave the flash-decode K-phase row->wave map. DECODE ROWS ONLY (d_flash_decode
 # lives in the decode object; the flash object runs PREFILL). The blocked default gives wave w rows
 # [w*64,(w+1)*64) of a 512-row tile, so a split shorter than 64 rows leaves SEVEN OF EIGHT WAVES
@@ -206,6 +579,105 @@ if [ "${PLOW_INST_PF:-1}" = 1 ]; then
   AX_DECODE="$AX_DECODE -DPLOW_INST_PF=1"
 fi
 
+# MEASUREMENT INSTRUMENT ONLY (PLOW_TRACE_PHASE=1): two extra `s_memrealtime` per (workgroup,
+# packet), inside `if (prog.trace)`, that split the traced packet into claim+gate / acquire /
+# body / publish and pack the two extra deltas into the trace record's unused `pc` field (see
+# interp.hip). An UNTRACED run is unaffected; a TRACED run carries the same instrument in every
+# arm. DECODE ROWS ONLY. Never ship it on -- it is how the packet-protocol decomposition was
+# taken, not a tuning axis.
+if [ "${PLOW_TRACE_PHASE:-0}" != 0 ]; then
+  AX_DECODE="$AX_DECODE -DPLOW_TRACE_PHASE=${PLOW_TRACE_PHASE}"
+fi
+
+# OPT-IN (PLOW_MOE_DEC_X2=1): the block-fp8 DECODE experts run gate|up as ONE loop with both
+# weight streams in flight and the activation fragments read once (op_moe.h
+# `wave_dot_fp8_blk_x2`). Bit-identical; the fp4 twin of the same pairing measured 1.44x.
+# DECODE ROWS ONLY — the grouped PREFILL bodies are a different kernel entirely.
+if [ "${PLOW_MOE_DEC_X2:-0}" = 1 ]; then
+  AX_DECODE="$AX_DECODE -DPLOW_MOE_DEC_X2=1${PLOW_MOE_DEC_X2_UN:+ -DPLOW_MOE_DEC_X2_UN=$PLOW_MOE_DEC_X2_UN}"
+fi
+
+# OPT-IN (PLOW_MOE_DEC_LG=1): the block-fp8 DECODE expert DOWN takes the narrow-K lane-group map —
+# RG row-groups of 64/RG lanes, UNR consecutive row-batches issued before any is consumed, so
+# RG*UNR rows are in flight (op_moe.h `moe_down_lg_fp8_blk`). GLM-5.2 TP8 routes DOWN at
+# K = I_moe = 256, where the shipped wave-per-row body leaves 48 of 64 lanes dead and keeps ONE
+# load outstanding. Bit-identical (modulo the sign of a zero, which MoeCombine cannot see);
+# anything wider than LPG*16 falls through to the shipped walk.
+#
+# DEFAULT ON (opt out with PLOW_MOE_DEC_LG=0). MEASURED -7.6% TPOT, CHARACTER-IDENTICAL.
+#
+# It shipped OFF because the campaign that built it measured it NULL -- and that measurement was
+# taken on `interp_decode_fp8_gq.elf`, which a GLM-5.2 packet never loads (`Variant::detect`
+# matches `GemvFp8`, not the block-scaled `GemvFp8Blk` family, so the blob detects as Bf16 and
+# decode runs on `interp_decode_gq.elf`). Rebuilt into the object the run does open, three
+# interleaved rounds of `scripts/bench_speed.sh`, port 8195:
+#
+#   ctx 1024   TPOT 28.957 -> 26.760 ms/token   -7.6%   control spread 0.14%
+#   ctx 4096        31.290 -> 29.013            -7.3%   control spread 0.16%
+#
+# i.e. 50x the control's own round-to-round spread, no distribution overlap, TTFT unmoved (this
+# is a decode-only axis). Serve gate PASSES on the three canonical prompts AND on a ~14.7k-token
+# long-context prompt, character-identical to the control on all four; all 8 ranks
+# token-identical on every step of 15 amd-bench runs. Bit-identical by construction -- see
+# op_moe.h [FP8-DECODE-DOWN-LG] and glm52-decode-gemv-aiter.md section 3 for the off-device
+# reduction and row-coverage proofs. Guarded to K <= LPG*16 and a 16-multiple K, so a wider
+# contraction (K3 at TP8 routes DOWN with I_moe=384) falls through to the shipped walk, and
+# Gemma's MoE decode is a different function entirely (`d_moe_expert_down_gemma_fp8`).
+# Full record: perf-data/plow-gfx942/glm52-packet-protocol-xcd.md.
+#
+# Its twin PLOW_MOE_DEC_X2 stays OPT-IN: it adds 0.9% on top, which is at the edge of what this
+# box can resolve, and its own census row moves the wrong way (GLU busy 4386 -> 4571 CU-us/layer).
+if [ "${PLOW_MOE_DEC_LG:-1}" = 1 ]; then
+  AX_DECODE="$AX_DECODE -DPLOW_MOE_DEC_LG=1${PLOW_MOE_DEC_LG_RG:+ -DPLOW_MOE_DEC_LG_RG=$PLOW_MOE_DEC_LG_RG}${PLOW_MOE_DEC_LG_UNR:+ -DPLOW_MOE_DEC_LG_UNR=$PLOW_MOE_DEC_LG_UNR}"
+fi
+
+# DEFAULT ON for gfx942 (opt out with PLOW_GEMV_LG=0): the bf16 DECODE GEMV takes the narrow-K
+# lane-group map -- RG row-groups
+# of 64/RG lanes, UNR consecutive row-batches issued before any is consumed, so RG*UNR rows are in
+# flight (op_gemm.h `gemv_rows_lg`, [BF16-GEMV-NARROWK-LG]). The bf16 twin of PLOW_MOE_DEC_LG, one
+# kernel over: GLM-5.2 TP8 runs the SHARED-EXPERT DOWN at N=6144 K=256, and `gemv_rows` hands lane L
+# the 8 halves at k=8*L, so at K=256 half the wave is out of range and `nchunk = ceil(K/512) = 1`
+# leaves the shipped R-split issuing 14 buffer loads of which 12 fetch nothing. Bit-identical by
+# construction (same lane->k map per row, same xor-butterfly; only the leading +0.0 butterfly step
+# and which wave owns which row change). Guarded to M==1, an 8-multiple K and K <= (64/RG)*8, so
+# o_proj (K=2048) and the router gate (K=6144) fall through to the shipped body -- at K >= 512 every
+# lane is already live and neither has this defect.
+#
+# FLIPPED TO DEFAULT-ON FOR gfx942 (2026-08-09). It was landed default-OFF and then simply never
+# passed by any recipe, so the shipped configuration left a measured win on the floor for weeks.
+#
+# ORIGINAL MEASUREMENT (branch `gemv-narrowk`, commits 52d6dd5 / 2f6af04): -1.57/-1.31/-1.36% TPOT
+# at ctx 1k/4k/8k against a 0.11-0.21% control spread, ranges disjoint over 3 interleaved rounds;
+# traced shared-down packet busy 1506 -> 386 CU-us/layer (-74%) and span 35.0 -> 9.7 us (-72%),
+# every other op row flat; 5/5 serve answers CHARACTER-IDENTICAL including a 14.1k-token prompt;
+# 108 VGPR / 0 spill unchanged.
+#
+# INDEPENDENTLY REPRODUCED before flipping (2026-08-09, one session, one client, same box):
+#   control  hsaco_r2  TPOT 26.503 ms  (reps 26.494/26.503/26.505, spread 0.04%)
+#   arm      hsaco_t0  TPOT 26.077 ms  (reps 26.070/26.077/26.152, spread 0.31%)
+#   => -1.61%, i.e. 5x the round-to-round spread, and inside the original -1.3..-1.6% band.
+# TTFT unchanged (+0.1/+0.4/+1.1% at 1k/4k/8k, all inside spread) -- the correct negative control
+# for a DECODE-only flag. Coherence gate PASS.
+#
+# It is smaller than PLOW_MOE_DEC_LG's -7.5% on the same defect because this packet already ran
+# concurrently with the routed-expert slices, so only the unhidden part of its span reaches the
+# token. Full record: perf-data/plow-gfx942/glm52-gemv-narrowk.md.
+#
+# The header default in op_gemm.h stays 0 -- SAFE value in the header, POLICY in this script, the
+# same split PLOW_L2HIER and PLOW_MOE_DEC_LG already use. Including the header never changes
+# behaviour; building via this script does.
+if [ "${PLOW_GEMV_LG:-1}" = 1 ]; then
+  AX_DECODE="$AX_DECODE -DPLOW_GEMV_LG=1${PLOW_GEMV_LG_RG:+ -DPLOW_GEMV_LG_RG=$PLOW_GEMV_LG_RG}${PLOW_GEMV_LG_UNR:+ -DPLOW_GEMV_LG_UNR=$PLOW_GEMV_LG_UNR}"
+fi
+
+# CEILING INSTRUMENT ONLY (PLOW_MOE_DEC_ABL=1|2): the block-fp8 decode expert DOWN with its body
+# deleted — 1 keeps the walk and the store and drops every load + the dot, 2 retires the op. WRONG
+# OUTPUT by construction; this prices what the packet costs when the kernel costs nothing, and must
+# never touch a serve asset.
+if [ "${PLOW_MOE_DEC_ABL:-0}" != 0 ]; then
+  AX_DECODE="$AX_DECODE -DPLOW_MOE_DEC_ABL=${PLOW_MOE_DEC_ABL}"
+fi
+
 # THE TABLE: <stem>|<axes>. Names must match exec/amd.rs `object_name()`
 # EXACTLY -- it composes stem + variant infix + arm infix + sched suffix and
 # opens the result by literal filename.
@@ -225,6 +697,25 @@ ROWS=(
   "interp_prefill_fp8kv_mla|$AX_PREFILL $AX_MLA $AX_FP8 $AX_FP8KV"
   "interp_prefill_fp8kv_mla_moe|$AX_PREFILL $AX_MLA $AX_MOE $AX_FP8 $AX_FP8KV"
 )
+
+# PLOW_ROWS_ONLY=<substring>: build only the rows whose stem matches — for iterating on
+# ONE object family (e.g. interp_flash) without paying the full 28-object build. The
+# resulting dir is PARTIAL; copy it over a full set before serving from it.
+if [ -n "${PLOW_ROWS_ONLY:-}" ]; then
+  FILTERED=()
+  for row in "${ROWS[@]}"; do
+    case "${row%%|*}" in *"${PLOW_ROWS_ONLY}"*) FILTERED+=("$row");; esac
+  done
+  # A mistyped filter matching NOTHING must refuse, not print "ready (0 objects)" — that state
+  # has already invalidated performance work once (see LESSONS).
+  [ "${#FILTERED[@]}" -gt 0 ] || {
+    echo "FAIL: PLOW_ROWS_ONLY='${PLOW_ROWS_ONLY}' matches no object row; stems are:"
+    for row in "${ROWS[@]}"; do echo "  ${row%%|*}"; done
+    exit 1
+  }
+  ROWS=("${FILTERED[@]}")
+  echo ">>> PLOW_ROWS_ONLY=${PLOW_ROWS_ONLY}: building ${#ROWS[@]} row(s)"
+fi
 
 # Delete FIRST. A build that dies must leave nothing behind to run: a stale .elf
 # that a test prints CORRECT against is the failure every guard here exists for.
@@ -249,6 +740,31 @@ printf '%s\n' "${ROWS[@]}" | while IFS='|' read -r stem axes; do
   echo "$stem|$axes"
   echo "${stem}_gq|$axes $AX_GQ"
 done | xargs -P "$JOBS" -I{} bash -c 'IFS="|" read -r s a <<< "{}"; one "$s" $a'
+
+# test_kernels.elf -- the golden __device__ wrappers, which call the SAME op_*.h bodies the
+# interpreter runs, so they must be rebuilt WITH it or a test passes against a stale kernel.
+#
+# ADDED 2026-08-09, and its absence was the root of a four-link failure. `plowc tune gemm --obj
+# <dir>` needs a freshly built test_kernels.elf to time; build_gfx950.sh has always produced one
+# and this script never did. So the gfx942 tuning cell could not be REFRESHED by any command in
+# the repo -- it was seeded once by hand, went stale on the first runtime/amd/ edit after that,
+# and stayed stale, while `tuned_tile_selection` (gfx950-only until today) stayed green. Net
+# effect: every gfx942 compile selected GEMM tiles from the analytical model and reported tier
+# `portable`, which is what it reports when nothing was ever measured.
+#
+# Skipped under PLOW_ROWS_ONLY, which is for iterating on one interpreter family and does not
+# want the extra minute.
+if [ -z "${PLOW_ROWS_ONLY:-}" ]; then
+  if "$HIPCC" --offload-arch="$ARCH" -O3 -w --genco "$R/amd/test_kernels.hip" \
+        -o tk.co $INC > test_kernels.log 2>&1; then
+    "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
+        --input=tk.co --output=test_kernels.elf
+    rm -f tk.co test_kernels.log
+    echo "ok    test_kernels"
+  else
+    echo "FAIL  test_kernels"; tail -20 test_kernels.log; exit 1
+  fi
+fi
 
 # THE CLIFF CHECK. Over budget is HSA_STATUS_ERROR_INVALID_ISA at launch, which
 # surfaces as a dead run rather than a build failure -- so it is checked here.
@@ -280,6 +796,22 @@ for row in "${ROWS[@]}"; do
     esac
   done
 done
+# INSTRUCTION-SELECTION gate, the CDNA3 twin of the one in build_gfx950.sh. The cliff table above
+# catches a kernel that will not launch; it does not catch one that launches, is numerically
+# correct, and quietly runs on the wrong matrix instruction. The gfx950 expectations cannot be
+# reused -- CDNA3's bf16 MFMA is v_mfma_f32_32x32x8_bf16 (half the K) and its only fp8 MFMA is
+# the one that file FORBIDS -- so the contract has its own file, and asm_audit.py refuses the
+# cross-arch pairing by reading each object's ELF header. Skipped when the file is absent.
+EXPECT="$REPO/scripts/asm_expect_gfx942.json"
+if [ -f "$EXPECT" ] && command -v python3 >/dev/null; then
+  echo ""
+  echo "   --- instruction-selection audit ---"
+  # Captured rather than piped: `cmd | tail` reports tail's status, so piping would swallow the
+  # audit's exit code and the gate would print FAIL lines and then say the build is ready.
+  audit=$(python3 "$REPO/scripts/asm_audit.py" --expect "$EXPECT" ./*.elf) || fail=1
+  echo "$audit" | tail -20
+fi
+
 echo ""
 [ "$fail" = 0 ] && echo ">>> $OUT ready ($(ls "$OUT"/*.elf | wc -l) objects)" || {
   echo "!!! one or more rows are over the cliff or missing"; exit 1; }

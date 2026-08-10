@@ -59,7 +59,7 @@ pub fn select(executors: u32) -> Arc<dyn Backend> {
 /// Enumerate ALL visible devices and return a backend per device, in ordinal
 /// order.
 ///
-/// Multi-GPU bring-up (the design notes: `rank`, `n_gpu`) starts here:
+/// Multi-GPU bring-up (`rank`, `n_gpu`) starts here:
 /// [`crate::exec::tp::TpGroup::split_replicas`] carves this list into the
 /// node's TP replicas, and a backend's position within its replica is its rank.
 /// Falls back to a single CPU backend if no accelerators are found; that
@@ -151,7 +151,7 @@ pub struct ExecutorTarget {
 }
 
 /// Peer-mapped device memory — the substrate the inline cross-GPU collectives
-/// ride on (the design notes).
+/// ride on.
 ///
 /// The point of this trait is a buffer that a kernel on *any* GPU may load,
 /// store, and run a **system-scope atomic** on, so a collective is a gated

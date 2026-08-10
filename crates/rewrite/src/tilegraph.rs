@@ -188,7 +188,7 @@ pub enum HandoffKind {
     /// from the same slice without an HBM round-trip. Available on both
     /// H100 (per-GPC L2) and MI300 (per-XCD L2). Fills the middle ground
     /// between `SramSameSm` (fastest, serialized) and `Hbm` (parallel,
-    /// full round-trip).
+    /// full round-trip). See the design notes.
     L2Local,
     /// Cross-unit under unified memory: a fence, no data movement.
     Barrier,

@@ -356,7 +356,7 @@ def main():
     fclasses = [agg_row(k, a, fp8=True) for k, a in sorted(fp_aggs.items())]
     res = {
         "date": time.strftime("%Y-%m-%d"), "model": model_dir,
-        "plan": "the design notes C-0",
+        "plan": "P9 lossless-compression C-0",
         "decode_stream_gb": round(tot_n * 2 / 1e9, 3),
         "bf16_classes": classes, "bf16_tensors": bf_rows,
         "fp8_classes": fclasses, "fp8_tensors": fp_rows,

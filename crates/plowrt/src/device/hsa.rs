@@ -354,6 +354,7 @@ macro_rules! hsa_fns {
 
 hsa_fns! {
     hsa_init: unsafe extern "C" fn() -> HsaStatus,
+    hsa_system_get_info: unsafe extern "C" fn(u32, *mut c_void) -> HsaStatus,
     hsa_shut_down: unsafe extern "C" fn() -> HsaStatus,
     hsa_iterate_agents: unsafe extern "C" fn(AgentCb, *mut c_void) -> HsaStatus,
     hsa_agent_get_info: unsafe extern "C" fn(HsaAgent, u32, *mut c_void) -> HsaStatus,
@@ -410,6 +411,7 @@ impl HsaDriver {
 
         let drv = HsaDriver {
             hsa_init: resolve!(lib, b"hsa_init\0"),
+            hsa_system_get_info: resolve!(lib, b"hsa_system_get_info\0"),
             hsa_shut_down: resolve!(lib, b"hsa_shut_down\0"),
             hsa_iterate_agents: resolve!(lib, b"hsa_iterate_agents\0"),
             hsa_agent_get_info: resolve!(lib, b"hsa_agent_get_info\0"),
@@ -639,6 +641,9 @@ impl DeviceFree for HsaFree {
 pub struct HsaBackend {
     shared: Arc<SharedDriver>,
     pub device_ordinal: u8,
+    /// ROCr's HSA interface version (major, minor); (0, 0) when the query
+    /// failed. Surfaced in the `module_load` error.
+    rocr_version: (u16, u16),
     agent: HsaAgent,
     /// EVERY visible GPU agent, in ordinal order — not just this backend's.
     ///
@@ -724,6 +729,28 @@ impl HsaBackend {
         if rc != HSA_STATUS_SUCCESS {
             return Err(hsa_fault(rc, "hsa_init"));
         }
+
+        // ROCr's HSA interface version (HSA_SYSTEM_INFO_VERSION_MAJOR/MINOR,
+        // both uint16_t). Logged and kept for the module_load error path: a
+        // code object built for an ISA this ROCr does not know fails there
+        // with the opaque HSA_STATUS_ERROR_INVALID_ISA, and the version is
+        // the fact that explains it. A query failure is not fatal — 0.0 just
+        // means "unknown" in the message.
+        let rocr_version = unsafe {
+            let mut major: u16 = 0;
+            let mut minor: u16 = 0;
+            let a = (drv.hsa_system_get_info)(0, &mut major as *mut u16 as *mut c_void);
+            let b = (drv.hsa_system_get_info)(1, &mut minor as *mut u16 as *mut c_void);
+            if a == HSA_STATUS_SUCCESS && b == HSA_STATUS_SUCCESS {
+                (major, minor)
+            } else {
+                (0, 0)
+            }
+        };
+        tracing::info!(
+            rocr = %format_args!("{}.{}", rocr_version.0, rocr_version.1),
+            "HSA runtime initialised"
+        );
 
         // Discover agents.
         let mut acc = AgentAccum {
@@ -898,6 +925,7 @@ impl HsaBackend {
         Ok(HsaBackend {
             shared,
             device_ordinal,
+            rocr_version,
             agent,
             agents,
             cpu_agent,
@@ -1242,9 +1270,19 @@ impl Backend for HsaBackend {
                 (self.shared.drv.hsa_executable_destroy)(exe);
                 (self.shared.drv.hsa_code_object_reader_destroy)(reader);
             }
+            // INVALID_ISA here is the version trap: an object whose ISA (or
+            // register budget) this ROCr does not accept. Name the runtime
+            // version so the error diagnoses itself instead of reading like
+            // a corrupt file.
             return Err(self.fault(
                 rc,
-                "hsa_executable_load_agent_code_object (raw ELF expected — did you unbundle?)",
+                &format!(
+                    "hsa_executable_load_agent_code_object (raw ELF expected — did you \
+                     unbundle?; ROCr HSA {}.{} — an object built for a newer ISA or over \
+                     this agent's register budget fails here with \
+                     HSA_STATUS_ERROR_INVALID_ISA; rebuild against this ROCm or upgrade it)",
+                    self.rocr_version.0, self.rocr_version.1
+                ),
             ));
         }
 
@@ -2135,6 +2173,29 @@ impl Drop for HsaPinned {
     }
 }
 
+/// Copy `src` into `dst`, rewriting every 0x80 byte (OCP e4m3 `-0`) to 0x00.
+///
+/// SWAR over u64 words — the same per-byte zero test the device-side
+/// `plow_fp8_mask_neg0` uses (runtime/amd/amd_arch.h), which that header verified
+/// exhaustively over all 2^32 words: XOR makes a 0x80 byte 0x00, the carry test
+/// marks exactly the zero bytes, and the marker widens to 0xff. See
+/// [`HsaUploadRing::push_scrub_fp8_neg0`] for who may use this and why.
+fn scrub_fp8_neg0(dst: &mut [u8], src: &[u8]) {
+    const H: u64 = 0x8080808080808080;
+    const L: u64 = 0x7f7f7f7f7f7f7f7f;
+    let n = src.len() & !7;
+    for i in (0..n).step_by(8) {
+        let w = u64::from_le_bytes(src[i..i + 8].try_into().unwrap());
+        let t = w ^ H;
+        let z = !(t & L).wrapping_add(L) & !t & H;
+        let m = z | z.wrapping_sub(z >> 7);
+        dst[i..i + 8].copy_from_slice(&(w & !m).to_le_bytes());
+    }
+    for i in n..src.len() {
+        dst[i] = if src[i] == 0x80 { 0 } else { src[i] };
+    }
+}
+
 /// One staging slab and the signal that says whether its copy has retired.
 struct RingSlot {
     buf: HsaPinned,
@@ -2245,6 +2306,23 @@ impl HsaUploadRing {
     /// own slab, not in `src`. The copy is not complete, though — nothing may
     /// read `dptr` until [`HsaUploadRing::drain`].
     pub fn push(&mut self, dptr: u64, src: &[u8]) -> Result<()> {
+        self.push_inner(dptr, src, false)
+    }
+
+    /// [`HsaUploadRing::push`], but rewriting every 0x80 byte (OCP e4m3 `-0`) to 0x00 inside
+    /// the pinned-slab copy — one SWAR pass over bytes that were being copied anyway.
+    ///
+    /// VALUE-IDENTICAL: `-0 == +0` in every product a weight byte enters. The point is the
+    /// CDNA3 decoder: gfx942's `v_cvt_pk_f32_fp8` reads e4m3fnuz, where 0x80 is NaN, so the
+    /// kernels guarded every decode with a ~8-VALU neg-0 mask. A scrubbed-at-rest payload
+    /// lets the hot staging loop drop that mask (`mpf_fp8x4_to_bf16_h`, op_moe.h). Callers:
+    /// block-fp8 expert payloads ONLY — never scales, never bf16, and never MXFP4 payloads
+    /// (there 0x80 is two fp4 nibbles, and zeroing them would corrupt real values).
+    pub fn push_scrub_fp8_neg0(&mut self, dptr: u64, src: &[u8]) -> Result<()> {
+        self.push_inner(dptr, src, true)
+    }
+
+    fn push_inner(&mut self, dptr: u64, src: &[u8], scrub: bool) -> Result<()> {
         if src.is_empty() {
             return Ok(());
         }
@@ -2261,7 +2339,11 @@ impl HsaUploadRing {
         let slot = &mut self.slots[i];
         // Re-arm BEFORE the copy is submitted; the copy decrements to 0.
         unsafe { (self.shared.drv.hsa_signal_store_screlease)(slot.sig, 1) };
-        slot.buf.as_mut_slice()[..src.len()].copy_from_slice(src);
+        if scrub {
+            scrub_fp8_neg0(&mut slot.buf.as_mut_slice()[..src.len()], src);
+        } else {
+            slot.buf.as_mut_slice()[..src.len()].copy_from_slice(src);
+        }
         let rc = unsafe {
             (self.shared.drv.hsa_amd_memory_async_copy)(
                 dptr as *mut c_void,
@@ -3205,6 +3287,29 @@ impl crate::memory::vmm::VmmOps for HsaBackend {
             released += b;
         }
         released
+    }
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::scrub_fp8_neg0;
+
+    /// Every byte value, at every position within the 8-byte SWAR word and in the
+    /// scalar tail: only 0x80 is rewritten, and it is rewritten to 0x00.
+    #[test]
+    fn scrubs_exactly_neg_zero() {
+        for pos in 0..11usize {
+            for b in 0..=255u8 {
+                let mut src = [0xA5u8; 11]; // non-trivial background
+                src[pos] = b;
+                let mut dst = [0u8; 11];
+                scrub_fp8_neg0(&mut dst, &src);
+                for (i, (&s, &d)) in src.iter().zip(dst.iter()).enumerate() {
+                    let want = if s == 0x80 { 0 } else { s };
+                    assert_eq!(d, want, "pos {pos} byte {b:#x} lane {i}");
+                }
+            }
+        }
     }
 }
 

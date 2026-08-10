@@ -50,7 +50,7 @@
 // MS=1 is the default because MS=2 (BM=128) leaves only 4*32 = 128 output tiles
 // at N=4096 -- fewer than the 132 SMs -- so it starves the machine there even
 // though its higher A/B reuse wins at N=15360. This shape-dependent BM choice is
-// exactly the kind of thing the the design notes selector wants.
+// exactly the kind of thing the design-notes selector wants.
 
 #include <cstdio>
 #include <cstdint>

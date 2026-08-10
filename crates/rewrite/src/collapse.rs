@@ -148,8 +148,7 @@ pub fn try_collapse(
             alts.push((HandoffKind::Dsm, c.dsm));
         }
         // L2Local: the egglog `L2Handoff` rule fires only when the unit has
-        // `L2Partitioning` — that's the source of truth. See
-        // the design notes.
+        // `L2Partitioning` — that's the source of truth. See the design notes.
         if l2.contains(&label) {
             alts.push((HandoffKind::L2Local, c.l2_local));
         }

@@ -1,6 +1,6 @@
 # G7 — fp8 weight-only DECODE for Gemma-4-12B on the sm_120 interpreter
 
-**Date:** 2026-07-18 · **branch:** an internal branch (base `rtx` @ 32cc434) ·
+**Date:** 2026-07-18 · **base:** `rtx` @ 32cc434 ·
 **GPU:** RTX PRO 6000 Blackwell Server Edition (sm_120, 188 SMs, 96 GB) · **metric:** decode
 TPOT ms/tok, batch 1, greedy (lower is better), repo methodology (112 timed steps after 16
 warmup, `qwen3_sm120_chat` harness reused for Gemma).

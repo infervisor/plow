@@ -10,5 +10,8 @@ rm -f "$JSONL"
 env GPU_LEASE_TIMEOUT=3600 "$WT/perf-data/harness/gpulease" -n 1 "gemv-$LABEL" sg render -c \
   "cd $OBJ && unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES && PLOW_GEMV_JSONL=$JSONL ./gemv_row_sweep $N $K $LABEL"
 cd "$WT"
+# TUNE_GPU DECIDES THE CELL. `tunedb-gemv` used to hardcode gfx950's, so a sweep taken here
+# published into MI350X's cell and the compiler never looked at it. Default is this box.
 nix develop -c cargo run --release -p tunedb --bin tunedb-gemv -- \
-    ingest --db tuning --samples "$JSONL" --campaign gemv-row-inventory
+    ingest --db tuning --gpu "${TUNE_GPU:-MI300X}" --samples "$JSONL" \
+    --campaign gemv-row-inventory

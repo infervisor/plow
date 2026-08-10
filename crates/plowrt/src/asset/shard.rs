@@ -1,6 +1,6 @@
 //! Megatron weight sharding — which slice of a checkpoint tensor rank `r` owns.
 //!
-//! the design notes pairs a **column-parallel** producer with a
+//! The design notes pair a **column-parallel** producer with a
 //! **row-parallel** consumer so each sublayer needs exactly one all-reduce and
 //! no all-gather. That makes the bind a two-case problem:
 //!
@@ -90,7 +90,15 @@ pub fn shard_of(name: &str) -> Shard {
         ".w1.weight",
         ".w3.weight",
     ];
-    const ROW: [&str; 3] = ["o_proj.weight", "down_proj.weight", ".w2.weight"];
+    // `derived.o_fold.weight` = the prep-fused W_uv·W_o ([H, NH*DK], head-major columns):
+    // its contraction dim slices per rank exactly as o_proj's does (rank r takes columns
+    // h∈[r·nh_l, (r+1)·nh_l)·DK — a strided column range), so it rides the same Row class.
+    const ROW: [&str; 4] = [
+        "o_proj.weight",
+        "down_proj.weight",
+        ".w2.weight",
+        "derived.o_fold.weight",
+    ];
 
     // --- Mixtral `w1|w2|w3` routed experts (Kimi-K3), in the generic tables above ---
     //

@@ -526,7 +526,12 @@ pub fn probe_macros(
     header: &str,
     names: &[&str],
 ) -> Result<Vec<Option<i64>>, ProbeError> {
-    let dir = std::env::temp_dir().join(format!("plow_macro_probe_{}", std::process::id()));
+    // Process id ALONE is not unique enough: parallel probes inside one test process share it
+    // and delete each other's source mid-preprocess (reproduced as a spurious preprocessing
+    // failure). A per-process atomic sequence makes every probe's directory its own.
+    static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("plow_macro_probe_{}_{}", std::process::id(), seq));
     std::fs::create_dir_all(&dir)?;
     let src = dir.join("macro_probe.cu");
     let marker = "PLOWPROBE_MARKER";

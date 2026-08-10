@@ -69,7 +69,7 @@ run_one() { # <tag> <objdir>
   echo "############ $tag  (objects $obj)"
   # UNDER `nix develop`: plowrt is nix-linked, and outside the shell its ELF interpreter is a
   # missing /nix/store glibc — which reports as "No such file or directory" on a file that is
-  # plainly there. Running under the lease is fine; only COMPILING
+  # plainly there (the design notes §0a). Running under the lease is fine; only COMPILING
   # under it is forbidden.
   nix develop -c "$PLOWRT" amd-bench --blob "$AB/$tag/model.pkt" --hsaco "$obj" \
       --checkpoint "$CKPT" --prompt "$PROMPT" --steps 65 --ctx 1024 --batched 2>&1 \
@@ -81,11 +81,13 @@ case "$PHASE" in
   emit)
     emit_one b8ctl   8  ""  0
     emit_one b16ctl  16 ""  0
-    emit_one b16walk 16 8   1;
+    emit_one b16walk 16 8   1
+    ;;
   run)
     unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
     run_one b8ctl   /home/lava/plow/build-amd/walk-ctl-b8
     run_one b16ctl  /home/lava/plow/build-amd/walk-ctl-b16
-    run_one b16walk /home/lava/plow/build-amd/walk-mm8-b16;
+    run_one b16walk /home/lava/plow/build-amd/walk-mm8-b16
+    ;;
   *) echo "usage: $0 emit|run" >&2; exit 2;;
 esac

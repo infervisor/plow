@@ -37,7 +37,9 @@ pub enum IsaLevel {
     /// via `mma.sync`; **no** `tcgen05`, **no** TMEM. Sharing the "Blackwell"
     /// name with [`Self::Sm100a`] does not share its instructions.
     Sm120a,
-    /// AMD CDNA 3 (MI300X/MI325X).
+    /// AMD CDNA 3 (MI300X/MI325X). 64 KiB LDS, `v_mfma_f32_32x32x8_bf16`.
+    /// See [`IsaLevel::geometry`] for the tile and stage-buffer policy that
+    /// budget forces.
     Gfx942,
     /// AMD CDNA 4 (MI350X/MI355X). 160 KiB LDS, double-K bf16 MFMA.
     Gfx950,
@@ -223,6 +225,142 @@ impl IsaLevel {
                 mma_dtypes: &[],
             },
         }
+    }
+
+    /// Device geometry for this level, or `None` where no interpreter object is
+    /// built (`CpuRef`) or where the host does not yet mirror one.
+    ///
+    /// AMD only today, and deliberately: the NVIDIA GEMM's tile is one
+    /// object-wide macro triple that `kernelcaps` probes out of `op_gemm.cuh`
+    /// per build, so there is no second copy for a table to disagree with. The
+    /// CDNA numbers are per-arch DEFAULTS chosen inside the header (`PLOW_CDNA4`)
+    /// and re-cut by a build script, which is exactly the shape that drifts.
+    pub fn geometry(self) -> Option<ArchGeometry> {
+        Some(match self {
+            // CDNA3, 64 KiB/workgroup. The default 256x256x64 stage is 147,456 B
+            // — 2.25x over budget — so `op_gemm.h` defaults this part to a
+            // SINGLE-buffered 192x256x64 (64,512 B, fits). Decode re-cuts again
+            // under `PLOW_OCC4=1` to 128x256x32 (30,720 B), the smallest arena
+            // the fused-GLU epilogue's `SN == 2` assert allows.
+            IsaLevel::Gfx942 => ArchGeometry {
+                lds_bytes: 64 * 1024,
+                gemm_stage_buffers: 1,
+                gemm_tile: GemmTile {
+                    bm: 192,
+                    bn: 256,
+                    bk: 64,
+                },
+                decode_gemm_tile: GemmTile {
+                    bm: 128,
+                    bn: 256,
+                    bk: 32,
+                },
+            },
+            // CDNA4, 160 KiB/workgroup. 256x256x64 double-buffered is 144 KiB and
+            // fits, so prefill and decode are built at the same tile.
+            IsaLevel::Gfx950 => ArchGeometry {
+                lds_bytes: 160 * 1024,
+                gemm_stage_buffers: 2,
+                gemm_tile: GemmTile {
+                    bm: 256,
+                    bn: 256,
+                    bk: 64,
+                },
+                decode_gemm_tile: GemmTile {
+                    bm: 256,
+                    bn: 256,
+                    bk: 64,
+                },
+            },
+            _ => return None,
+        })
+    }
+}
+
+/// One GEMM stage tile, `BM x BN x BK`, exactly as `runtime/amd/op_gemm.h` spells
+/// it (`GM_BM` / `GM_BN` / `GM_BK`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GemmTile {
+    pub bm: u32,
+    pub bn: u32,
+    pub bk: u32,
+}
+
+impl GemmTile {
+    /// `GM_STRIDE`'s row padding, in halves. A fragment read walks 32 consecutive
+    /// rows at one k, so an unpadded `BK*2`-byte stride lands every lane on the
+    /// same bank; +8 halves shifts each row by 16 B and breaks the conflict.
+    pub const PAD_HALVES: u32 = 8;
+
+    /// `GM_LDS_HALVES_T(BM, BN, BK)` at `buffers` stage buffers.
+    pub const fn stage_halves(self, buffers: u32) -> u64 {
+        buffers as u64 * (self.bm + self.bn) as u64 * (self.bk + Self::PAD_HALVES) as u64
+    }
+
+    /// The same arena in bytes — the number that has to fit
+    /// [`ArchGeometry::lds_bytes`].
+    pub const fn stage_bytes(self, buffers: u32) -> u64 {
+        self.stage_halves(buffers) * 2
+    }
+}
+
+/// Device geometry the HOST has to know, because it decides what the emitter is
+/// allowed to emit.
+///
+/// # Why this is a queryable table and not a doc comment
+///
+/// These are compile-time constants of the interpreter object, and the host
+/// duplicates them: `devgen` picks a FUSED decode GEMV opcode only when the
+/// staged rows fit the GEMM arena (`op_gemm.h`: *"x is ALWAYS staged in LDS
+/// here: plowc emits this op only when M*K fits GM_LDS_HALVES"*), and the cost
+/// model offers a tile only when its stage fits the LDS budget. A host copy that
+/// is right for one part and wrong for another does not fail loudly — it emits
+/// an opcode the object cannot run.
+///
+/// That is not hypothetical. `devgen`'s `GM_LDS_HALVES` mirror was the CDNA4
+/// value (73,728 halves) on every part, while gfx942's shipped occ4 decode
+/// profile holds **15,360** — so a Gemma-4-12B batch of up to 19 rows was fused
+/// onto an arena holding four, and every row past the fourth was written past
+/// the end of `plow_smem`. No batched-decode blob was ever correct on gfx942.
+///
+/// `crates/hwspec/tests/device_header_agreement.rs` asserts this table against
+/// `runtime/amd/op_gemm.h` and `scripts/build_gfx942.sh` directly, so drift
+/// fails a test rather than a serve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchGeometry {
+    /// LDS available to ONE workgroup. The interpreter is persistent — one
+    /// workgroup per CU — so this is the whole per-CU budget.
+    pub lds_bytes: u64,
+    /// `GM_DBUF`: stage buffers the GEMM mainloop trades between. 2 hides the
+    /// commit behind the MFMA clusters; 1 exists because on a 64 KiB part
+    /// double-buffering IS the tile ceiling — no tile wider than 64x128 fits
+    /// with it, and 64x128 measures 2.8x worse than a single-buffered 192x256.
+    pub gemm_stage_buffers: u32,
+    /// The default `GM_BM`/`GM_BN`/`GM_BK` — what `d_gemm` instantiates, and
+    /// what the PREFILL object is built at.
+    pub gemm_tile: GemmTile,
+    /// The tile the SHIPPED DECODE object is built at, which is not the default
+    /// on every part.
+    ///
+    /// gfx942 decode ships `PLOW_OCC4=1` (`scripts/build_gfx942.sh`), which
+    /// re-cuts the arena to 128x256x32 to reach 4 waves/SIMD on both the LDS and
+    /// the VGPR axis. The emitter cannot know which profile the objects will be
+    /// built with — that is chosen when the OBJECTS are built, long after the
+    /// blob is emitted — so the smaller of the two is the only value that is
+    /// right for both.
+    pub decode_gemm_tile: GemmTile,
+}
+
+impl ArchGeometry {
+    /// `GM_LDS_HALVES` in a PREFILL object built for this arch.
+    pub const fn gemm_arena_halves(&self) -> u64 {
+        self.gemm_tile.stage_halves(self.gemm_stage_buffers)
+    }
+
+    /// `GM_LDS_HALVES` in the DECODE object — the arena a fused GEMV stages its
+    /// `x` rows through, and therefore the bound the emitter's fusion gate owes.
+    pub const fn decode_arena_halves(&self) -> u64 {
+        self.decode_gemm_tile.stage_halves(self.gemm_stage_buffers)
     }
 }
 

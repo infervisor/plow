@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""asm_audit.py — assert what the compiler ACTUALLY emitted for gfx950.
+"""asm_audit.py — assert what the compiler ACTUALLY emitted, per arch.
 
-The register-cliff check in build_gfx950.sh catches a kernel that will not
-launch. It does not catch the failure that costs the most: a kernel that
+The register-cliff check in build_gfx950.sh / build_gfx942.sh catches a kernel
+that will not launch. It does not catch the failure that costs the most: a kernel that
 compiles, launches, produces correct numbers, and is 4x slow because the
 backend picked the narrow MFMA, widened an fp4 operand to bf16, or spilled the
 accumulator to scratch. On a box with no GPU that failure is invisible.
@@ -13,9 +13,19 @@ Usage
     asm_audit.py <object.elf|object.co> [...]            # report
     asm_audit.py --expect expectations.json <object...>  # report + assert
 
-`--expect` takes a two-level map, object-substring -> kernel-substring -> checks:
+`--expect` takes a two-level map, object-substring -> kernel-substring -> checks,
+plus a mandatory top-level `_arch`:
 
-    {"interp_prefill_fp8": {"plow_exec": {"cbsz": 0, "blgp": 0}}}
+    {"_arch": "gfx950",
+     "interp_prefill_fp8": {"plow_exec": {"cbsz": 0, "blgp": 0}}}
+
+THE ARCH IS PART OF THE CONTRACT, not a formality. `v_mfma_f32_32x32x16_fp8_fp8`
+is the only fp8 MFMA gfx942 has and it is the WRONG one on gfx950 (half rate
+against the K=64 f8f6f4 form), so the gfx950 file `forbid`s exactly the
+instruction the gfx942 file `require_min`s. One expectation file cannot state
+both, and quietly auditing an object against the other arch's contract inverts
+every fp8 assertion. Each object's arch is read from its own ELF header and
+checked against `_arch` before anything is asserted.
 
 Scoping by object matters: a kernel absent from an object is only a failure if
 that object was supposed to contain it, and every object is audited against a
@@ -85,9 +95,35 @@ def tool(name):
     sys.exit(f"asm_audit: cannot find {name} (set ROCM_PATH)")
 
 
-def disassemble(path):
+ELF_ARCH = re.compile(r"\b(gfx\d+[a-z]*)\b")
+
+
+def elf_arch(path):
+    """The arch the object was BUILT for, out of its own ELF header.
+
+    Read rather than passed in: the objects carry it (`Flags: 0x54c, gfx942,
+    xnack, sramecc`), and a `--mcpu` the caller supplies is a second opinion
+    about a fact the file already states. That mattered here — this script had
+    `--mcpu=gfx950` hardcoded, which the disassembler happened to override from
+    the ELF, so the wrong-arch audit produced a correct disassembly checked
+    against an inverted contract.
+    """
     out = subprocess.run(
-        [tool("llvm-objdump"), "-d", "--mcpu=gfx950", path],
+        [tool("llvm-readelf"), "-h", path], capture_output=True, text=True
+    )
+    if out.returncode != 0:
+        sys.exit(f"asm_audit: readelf failed on {path}:\n{out.stderr}")
+    for line in out.stdout.splitlines():
+        if line.strip().startswith("Flags:"):
+            m = ELF_ARCH.search(line)
+            if m:
+                return m.group(1)
+    sys.exit(f"asm_audit: {path} declares no gfx target in its ELF flags")
+
+
+def disassemble(path, arch):
+    out = subprocess.run(
+        [tool("llvm-objdump"), "-d", f"--mcpu={arch}", path],
         capture_output=True, text=True,
     )
     if out.returncode != 0:
@@ -314,11 +350,23 @@ def main(argv):
     if not paths:
         sys.exit(__doc__)
 
+    want_arch = expect.pop("_arch", None) if expect else None
+    if expect is not None and not want_arch:
+        sys.exit("asm_audit: the expectation file must declare a top-level \"_arch\"")
+
     fails, checked = [], 0
     for p in paths:
-        kernels = parse(disassemble(p))
+        arch = elf_arch(p)
+        kernels = parse(disassemble(p, arch))
         report(p, kernels)
         if not expect:
+            continue
+        if arch != want_arch:
+            fails.append(
+                f"{os.path.basename(p)}: built for {arch}, but these expectations are "
+                f"for {want_arch} — the fp8 and bf16 MFMA contracts are INVERTED between "
+                f"the two CDNA levels, so this audit would assert the opposite of the truth"
+            )
             continue
         base = os.path.basename(p)
         # Longest matching object key wins, so "interp_decode_fp8" does not also
@@ -334,7 +382,7 @@ def main(argv):
             for f in fails:
                 print(f"FAIL  {f}")
             return 1
-        print(f"PASS  all assertions held over {checked} audited object(s)")
+        print(f"PASS  all {want_arch} assertions held over {checked} audited object(s)")
     return 0
 
 

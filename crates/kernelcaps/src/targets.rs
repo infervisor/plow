@@ -66,6 +66,12 @@ const AMD_INCLUDES: &[&str] = &["runtime/common", "runtime/amd"];
 const AMD_PREFILL_DEFINES_CDNA4: &[&str] = &["PLOW_BUCKET_DECODE=0"];
 /// CDNA3's shipping prefill geometry. The 64 KiB LDS makes double-buffering the tile ceiling, so
 /// the stage is single-buffered (`GM_DBUF=1`) and that buys 192x256 at eight waves, occupancy 2.
+///
+/// A `&'static [&str]` because `ObjectRecipe` is a static table; the numbers in it are checked
+/// against `hwspec::IsaLevel::geometry` by `cdna3_recipe_matches_the_arch_geometry` below, which
+/// is in turn checked against `op_gemm.h` by `hwspec`'s own header-agreement test. A recipe that
+/// over- or under-states the geometry stops describing the object the build produces, and the
+/// inventory it probes is then keyed to a build nobody made.
 const AMD_PREFILL_DEFINES_CDNA3: &[&str] = &[
     "PLOW_BUCKET_DECODE=0",
     "PLOW_WG_WAVES=8",
@@ -346,6 +352,27 @@ mod tests {
             for inc in r.includes {
                 assert!(root().join(inc).exists(), "include {inc} missing");
             }
+        }
+    }
+
+    /// The CDNA3 recipe's tile flags are the same fact `hwspec` states per arch. Two copies,
+    /// one of which is a string list a compiler never type-checks.
+    #[test]
+    fn cdna3_recipe_matches_the_arch_geometry() {
+        let g = IsaLevel::Gfx942.geometry().expect("gfx942 geometry");
+        for (flag, want) in [
+            ("GM_DBUF", g.gemm_stage_buffers),
+            ("GM_BM", g.gemm_tile.bm),
+            ("GM_BN", g.gemm_tile.bn),
+        ] {
+            let want = format!("{flag}={want}");
+            assert!(
+                AMD_PREFILL_DEFINES_CDNA3.contains(&want.as_str()),
+                "recipe says {:?}, hwspec says {want}",
+                AMD_PREFILL_DEFINES_CDNA3
+                    .iter()
+                    .find(|d| d.starts_with(&format!("{flag}=")))
+            );
         }
     }
 

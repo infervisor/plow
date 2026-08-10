@@ -114,7 +114,25 @@ def checkC (payload : Json) : Certificate :=
     | .error (i, reason) =>
       reject "C" s!"handoff[{d.handoffs.length - 1 - i}]: {reason}"
 
+/-! ## Checkpoint G: staged-LDS fit (LdsFitSound). -/
+
+/-- Verify every always-staged GEMV instance in a program fits the decode-object
+    LDS arena. Backed by `Plow.LdsFit.fits_of_check_ok`; the demand model is the
+    kernel's own `rows*K + scratch` halves (op_gemm.h staged-x contract), the
+    arena comes from hwspec via the Rust caller. A rejection names the first
+    violating instance — the task-9 bug class caught at emit. -/
+def checkG (payload : Json) : Certificate :=
+  match Payload.parseLdsFit payload with
+  | .error msg => reject "G" s!"payload parse error: {msg}"
+  | .ok d =>
+    match Plow.LdsFit.checkLdsFit d.arena d.ops with
+    | .ok () =>
+      ok "G" s!"staged-LDS fit: {d.ops.length} staged instances verified against arena {d.arena} halves"
+    | .error s =>
+      reject "G" s!"inst {s.idx} ({s.op}): staged demand rows={s.rows} * k={s.k} + scratch={s.scratch} = {Plow.LdsFit.demand s} halves exceeds arena {d.arena} — the always-staged kernel would read past the LDS window (task-9 class)"
+
 /-! ## Checkpoint D: Counter protocol + reclamation (§5.10-D). -/
+
 
 /-- Verify a concrete `(TaskGraph, CounterProtocol, AddressMap)` produced by
     `plowc`. Runs the executable verifier `verifyAddressMap` and additionally

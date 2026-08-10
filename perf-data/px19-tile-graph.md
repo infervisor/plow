@@ -251,7 +251,7 @@ different compiled object.
 
 1. **The campaign tip does not compile.** `crates/plowrt/src/exec/gpu.rs:2506` carries committed
    `<<<<<<< HEAD` / `=======` / `>>>>>>>` markers from merge `a31d568`
-   (an internal branch into `worktree-plowrt-max-completion-tokens`).
+   (merged from another worktree into the completion-tokens branch).
    `cargo build -p plowrt` fails with *"encountered diff marker"*. The conflict is **comment-only
    — no code differs**. Fixed here by keeping both facts in one sentence. Any agent that has not
    built `plowrt` since that merge has not noticed.
@@ -280,7 +280,7 @@ different compiled object.
 | **single-block measurement before any whole-model claim** | **PASSED** — §2/§5, one sliding (L4) and one full (L5) block, `block_run bench`, all four arms |
 | scheduler A/B (global queue vs static per-CU streams) | **PASSED** — §2, 2.36 vs 2.38 ms |
 | reproducibility | **PASSED** — L4 prefill 2.35 / 2.36 / 2.37 / 2.38 ms across four separate leases = **1.3%** spread, inside the 3% band |
-| GPU exclusive | **ENFORCED** — every run under `perf-data/harness/gpulease`; another job was active on the card and the lease serialised it |
+| GPU exclusive | **ENFORCED** — every run under `perf-data/harness/gpulease`; another run was active on the card and the lease serialised it |
 | **byte-identical blob when the feature is off** | **PASSED** — nothing was implemented, so there is no feature. The working tree touches exactly two files, both in `plowrt` (a new example + a comment-only conflict fix); `devgen`/`packet`/`plowc`/`runtime` are untouched. Re-emit hash: `b3c03f8c…011e9` for both the original and a fresh emit of `blk-slide` |
 | **byte-identical cubins** | **PASSED, structurally** — no `.cu`/`.cuh` was modified (`git status` shows zero files under `runtime/`) |
 | `cargo test --workspace` | **PASSED** — **95 suites, 666 tests, 0 failures** |

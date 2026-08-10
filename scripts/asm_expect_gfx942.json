@@ -1,0 +1,79 @@
+{
+ "_comment": [
+  "Instruction-selection contract for the gfx942 (CDNA3) code objects, asserted by asm_audit.py",
+  "against the disassembly. The gfx950 twin is scripts/asm_expect_gfx950.json and this file is",
+  "NOT a copy of it with a different name -- the two contracts are INVERSES on both matrix axes:",
+  "",
+  "                        gfx950 (CDNA4)                 gfx942 (CDNA3)",
+  "  bf16 MFMA    v_mfma_f32_32x32x16_bf16       v_mfma_f32_32x32x8_bf16   (half the K)",
+  "  fp8  MFMA    v_mfma_f32_32x32x64_f8f6f4     v_mfma_f32_32x32x16_fp8_fp8",
+  "",
+  "so the gfx950 file FORBIDS v_mfma_f32_32x32x16_fp8_fp8 -- correct there, where selecting it",
+  "means half rate -- while here it is the only fp8 matrix instruction the silicon has, and its",
+  "ABSENCE is the failure. One expectation file cannot state both, which is why running the",
+  "gfx950 contract over a gfx942 object asserted the exact opposite of the truth. asm_audit.py",
+  "reads each object's arch out of its own ELF header and refuses the pairing.",
+  "",
+  "SPELLING: ROCm 7.2.4 / clang-23 prints the CDNA3 bf16 MFMA as v_mfma_f32_32x32x8_bf16; older",
+  "AMDGPU asm printers spelled the same instruction v_mfma_f32_32x32x8bf16_1k. require_min",
+  "matches on the common prefix so a toolchain bump does not read as an instruction-selection",
+  "regression, while the forbid entries stay exact -- they are the thing being asserted.",
+  "",
+  "COVERAGE. These are the rows a `PLOW_ROWS_ONLY=interp_prefill bash scripts/build_gfx942.sh`",
+  "produces, i.e. what can be audited without a full 28-object build. The decode objects are not",
+  "here yet: gfx942 decode ships PLOW_OCC4=1, which is a different tile and a different register",
+  "budget, and an expectation written against a non-occ4 decode object would describe an object",
+  "nobody serves.",
+  "",
+  "Keys are object-name substrings; the LONGEST match wins. Values are kernel-name substrings",
+  "-> checks. _arch is asserted against each object's ELF header before any rule runs."
+ ],
+ "_arch": "gfx942",
+ "_fp8_note": [
+  "The fp8 prefill object legitimately holds BOTH matrix families: d_gemm_fp8_t and",
+  "d_gemm_glu_fp8 issue the fp8 MFMA, while the bf16 bodies (d_gemm_t, d_gemm_glu, the Gemma",
+  "grouped-MoE prefill pair) are inlined into the same plow_exec. Requiring both is what",
+  "distinguishes 'the fp8 arm is present' from 'the fp8 arm silently dequantized to bf16' --",
+  "the CDNA3 shape of the w4a16-wearing-an-A4W4-name failure the gfx950 file documents.",
+  "",
+  "cbsz/blgp are deliberately NOT asserted here. They are f8f6f4 operand-format fields; the",
+  "CDNA3 fp8 MFMA has no such field, so every instruction reads as (0,0) and the check would",
+  "pass on anything."
+ ],
+ "interp_prefill_fp8": {
+  "plow_exec": {
+   "require_min": {
+    "v_mfma_f32_32x32x16_fp8_fp8": 1,
+    "v_mfma_f32_32x32x8": 1
+   },
+   "forbid": [
+    "v_mfma_f32_32x32x64_f8f6f4",
+    "v_mfma_scale_f32_32x32x64_f8f6f4",
+    "v_mfma_f32_32x32x16_bf16"
+   ]
+  }
+ },
+ "interp_prefill_mla_moe": {
+  "plow_exec": {
+   "require_min": {
+    "v_mfma_f32_32x32x8": 1
+   },
+   "forbid": [
+    "v_mfma_f32_32x32x16_bf16",
+    "v_mfma_f32_32x32x64_f8f6f4"
+   ]
+  }
+ },
+ "interp_prefill": {
+  "plow_exec": {
+   "require_min": {
+    "v_mfma_f32_32x32x8": 1
+   },
+   "forbid": [
+    "v_mfma_f32_32x32x16_bf16",
+    "v_mfma_f32_32x32x64_f8f6f4",
+    "v_mfma_f32_32x32x16_fp8_fp8"
+   ]
+  }
+ }
+}

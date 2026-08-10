@@ -77,6 +77,10 @@ pub fn is_host_filled_table(name: &str) -> bool {
         || name.ends_with("mlp.expert_scale_table")
         || name.ends_with("mlp.dense_weight_table")
         || name.ends_with("mlp.dense_scale_table")
+        // The PRESHUFFLED twin of expert_weight_table (PLOW_MOE_PF_SHUF): points into a second
+        // packed slab whose per-projection layout is [K/64][R][64] so the grouped prefill GEMM's
+        // B stream is contiguous per k-tile. Host-computed addresses, no checkpoint bytes.
+        || name.ends_with("mlp.expert_weight_table_pf")
 }
 
 /// True when this declared tensor's bytes must come from the checkpoint.

@@ -126,6 +126,39 @@ pub(crate) fn record(m: i64, n: i64, k: i64, quant: QuantScheme, hit: bool) {
     }
 }
 
+static DECIDED_MEASURED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DECISIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Record what actually DECIDED one tile: the selector's calibration tier.
+///
+/// Deliberately NOT the same signal as `record`'s `hit` above, and the difference is a bug this
+/// file already shipped once. `hit` means "the store held a record for this op_case"; it does
+/// NOT mean a measurement chose the tile. `select_kernel` uses measurements "only if EVERY
+/// candidate has one" (`kernelcaps::select.rs:175`), so a shape with 4 of 5 candidates measured
+/// falls back to the analytical model while every lookup still reports HIT.
+///
+/// That is not hypothetical. On 2026-08-09 a freshly published, wholly CURRENT gfx942 campaign
+/// covered 48/48 demanded shapes and changed NOTHING: the ingest rung table maps tiles to
+/// opcodes by GEOMETRY, and on gfx942 `Gemm` and `GemmC5` share 192x256x64, so every timing
+/// landed on `GemmC5` and opcode 8 got zero records. Five independent signals said "measured"
+/// -- `tune status`, `tune shapes`, the guard test, and `build.json`'s own `tile_source`, all of
+/// which read the `hit` tally -- while the emitted packet was byte-identical to a `--no-tuning`
+/// build. Provenance has to come from the DECISION, not from the lookup.
+pub fn note_decision(measured: bool) {
+    DECISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if measured {
+        DECIDED_MEASURED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `(decided_by_measurement, decisions)` over every dense-GEMM tile this process selected.
+pub fn tally() -> (usize, usize) {
+    (
+        DECIDED_MEASURED.load(std::sync::atomic::Ordering::Relaxed),
+        DECISIONS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Collapse a lookup log into the distinct shapes a campaign must cover.
 ///
 /// Sorted by `(K, N, M)` so the output is deterministic and shapes that share a weight matrix sit
@@ -199,5 +232,46 @@ mod tests {
             },
         ]);
         assert_eq!(out.len(), 2);
+    }
+}
+
+/// Print the tile-provenance verdict ONCE per process, at emit time.
+///
+/// The point is that a compile should say what it is when it is being made, not leave the
+/// answer to be excavated afterwards. plowc already warns when records are STALE, but that
+/// warning cannot fire in the case that actually happened on 2026-08-09: a store that is
+/// CURRENT and COMPLETE by every count (48/48 op cases, 192 qualified records at the live
+/// digest) and still decides nothing, because `select_kernel` needs EVERY candidate measured
+/// and one rung had zero records. Records-present and measurement-used are different facts and
+/// only the second one matters.
+pub fn report() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let (measured, total) = tally();
+    if total == 0 {
+        return;
+    }
+    if measured == total {
+        eprintln!("  tunedb: all {total} dense-GEMM tile(s) chosen BY MEASUREMENT");
+    } else if measured == 0 {
+        eprintln!(
+            "  >>> tunedb: ALL {total} dense-GEMM tile(s) chosen by the ANALYTICAL MODEL. This \
+             build is UNMEASURED -- `pick_tile` reports tier `portable`, which is what it \
+             reports when no campaign has ever run. Diagnose with `plowc tune status --gpu \
+             <gpu>`: if records are STALE, re-run the campaign against THIS object recipe \
+             (defines are part of the digest); if they are CURRENT, check the per-opcode census \
+             -- a rung with zero records disqualifies every shape it is a candidate for, \
+             because selection uses measurements only if EVERY candidate has one."
+        );
+    } else {
+        eprintln!(
+            "  >>> tunedb: {measured} of {total} dense-GEMM tile(s) chosen by measurement; the \
+             remaining {} fell back to the ANALYTICAL MODEL. Mixed provenance -- `plowc tune \
+             status --gpu <gpu>` names which shapes are uncovered.",
+            total - measured
+        );
     }
 }

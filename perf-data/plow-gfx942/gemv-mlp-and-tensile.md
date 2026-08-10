@@ -1,5 +1,7 @@
 # The decode GEMV on MI300X: what limits it, and what the ceiling actually is
 
+> **Scope:** 8x MI300X (gfx942, CDNA3, 304 CU, 8 XCDs, 64 KiB LDS, ROCm 7.2.4); aiter/hipBLASLt reference kernels from /workspace/aiter/hsa/gfx942 · **AMD-GENERAL mechanism / CDNA3 constants** — decode GEMV is weight-bandwidth-bound on both arches, so 'MLP is not the limit' should hold; the 1.76-3.49 TB/s library ceilings and the 5.3 TB/s figure are MI300X HBM3 and do not.
+
 Written after fourteen transforms were built and falsified by measurement (the
 full table is at the bottom). The short version: **memory-level parallelism is
 not the limit, contiguity is not the limit, the arithmetic is worth at most 3.2%,
@@ -272,7 +274,42 @@ That is the honest end of this thread: the megakernel's LDS union costs the GEMV
 about 40% (549 vs 976 at the shape where it hurts most), the cost is real and
 measured, and NO reachable configuration of the current arenas collects it.
 
-## Batched decode: 4.7x on the dispatch, 2.2x through serve, and it costs conc-1
+## Batched decode: ~~4.7x on the dispatch, 2.2x through serve~~ — RETRACTED (wrong math)
+
+> ## RETRACTED 2026-08-08 — EVERY B>1 NUMBER IN THIS SECTION IS A TIMING OF WRONG MATH
+>
+> The blobs behind the `batch 4 / 8 / 16` rows below were emitted before **2130f04**, when
+> `devgen`'s mirror of the decode GEMM arena (`GM_LDS_HALVES`) was the CDNA4 constant on every
+> part. `gemv_qkv_rows` / `gemv_glu_rows` stage `x` ONLY through LDS, so the emitter fused
+> batches up to **M=19** at Gemma-4-12B's `hidden = 3840` onto a gfx942 occ4 object that holds
+> **15,360 halves = 4 rows**; every row past the arena was written past the end of `plow_smem`.
+> The result on the wider default tile is fluent wrong text, not a fault — and this section
+> records **no correctness gate at B>1**, so nothing here could have caught it.
+>
+> These are therefore timings of a DIFFERENT COMPUTATION, not merely inaccurate ones. They are
+> not directionally useful either: the corrupted rows do other work at an unknown rate, so the
+> "8 is the sweet spot" mechanism, the `4.7x` and `2.2x` in this heading, and the prefill
+> attribution derived from them are all unsupported.
+>
+> **The mechanism paragraph is self-incriminating.** It reasons from `GM_LDS_HALVES` = 32,256 —
+> which is neither the CDNA4 value the emitter actually used (73,728) nor the gfx942 occ4 arena
+> the objects actually had (15,360). The B=8 "it JUST fits" claim was never true on this part:
+> `8 * 3840 = 30,720` against a 15,360-half arena overruns it 2x.
+>
+> **NOT RE-MEASURED.** A replacement needs a fresh `PLOW_DECODE_BATCH=8` emit and matching
+> `PLOW_GEMV_MM=8` objects. The post-fix batched numbers that DO exist are in
+> `glm52-decode-batch-ladder.md` §7 and §11 (arms `b`, `b4`, `c`, `c4`) — emitted after
+> 2130f04, each with its own served `Paris` gate. Note they do not agree with this section: at
+> conc 1 the corrected B=16 arm costs **109.74 ms** TPOT, not the 63.6 ms/dispatch implied here.
+>
+> **What survives.** The `batch 1` row of the first table, and the vLLM column of the second
+> (vLLM never ran plow's emitter). B=1 blobs were verified byte-identical across 2130f04, so
+> every single-row number in this file — including the `PLOW_GQ_BATCH` sweep further down,
+> which is decode-batch-1 despite its name — is unaffected.
+>
+> Retained rather than deleted so the claims that cite it stay traceable:
+> `glm52-tp4-pp2-evaluation.md` §E.1 and `glm52-experiments.md`.
+
 
 `PLOW_DECODE_BATCH` is fully implemented (KV, activations, GEMV M, flash n_batch
 and per-sequence argmax all sized for B). Enabling it needs NO code change --
@@ -281,12 +318,12 @@ emit the blob with `PLOW_DECODE_BATCH=8` and build the objects with the matching
 
 Raw batched dispatch (`amd-bench --batched`, 12B, ctx 4096):
 
-| batch | aggregate tok/s | per-dispatch |
-|--:|--:|--:|
-| 1 | 47.3 | 21.1 ms |
-| 4 | 149.3 | 26.8 ms |
-| **8** | **220.3** | 36.3 ms |
-| 16 | 251.5 | 63.6 ms |
+| batch | aggregate tok/s | per-dispatch | status |
+|--:|--:|--:|---|
+| 1 | 47.3 | 21.1 ms | ok (B=1, byte-identical across 2130f04) |
+| 4 | ~~149.3~~ | ~~26.8 ms~~ | **RETRACTED** — wrong math |
+| **8** | ~~**220.3**~~ | ~~36.3 ms~~ | **RETRACTED** — wrong math |
+| 16 | ~~251.5~~ | ~~63.6 ms~~ | **RETRACTED** — wrong math |
 
 **8 is the sweet spot and there is a mechanism.** The staged-x arm is taken only
 when `M*K <= GM_LDS_HALVES` (32,256). At B=8, K=3840 that is 30,720 -- it JUST
@@ -297,12 +334,16 @@ Through the SERVE path the same blob only reaches 103.7 tok/s at concurrency 16,
 and concurrency 1 gets WORSE (TPOT 33.98 vs 20.39 ms with a batch-1 blob --
 the decode program runs all 8 slots whether or not they are occupied):
 
+RETRACTED — the whole `plow b8` half of this table is a B=8 blob (`g12b-b8_b8_tp1_general.csv`,
+also retracted in place). The `conc 1` row is NOT a safe B=1 number: the decode program advances
+8 rows however many requests are in flight. The vLLM column is unaffected.
+
 | conc | plow b8 TPOT | plow b8 tok/s | vLLM tok/s |
 |--:|--:|--:|--:|
-| 1 | 33.98 | 25.9 | 134.8 |
-| 4 | 49.12 | 69.0 | 479.1 |
-| 8 | 66.61 | 103.7 | ~700 |
-| 16 | 70.29 | 105.7 | 1227.2 |
+| 1 | ~~33.98~~ | ~~25.9~~ | 134.8 |
+| 4 | ~~49.12~~ | ~~69.0~~ | 479.1 |
+| 8 | ~~66.61~~ | ~~103.7~~ | ~700 |
+| 16 | ~~70.29~~ | ~~105.7~~ | 1227.2 |
 
 The serve number is HALF what the same blob does under `amd-bench --batched`
 (103.7 vs 220.3), and p99 ITL is 646 ms against a median of 37 ms. That is not
@@ -326,11 +367,15 @@ than turning the axis on.
 
 The same batch-8 blob, varying only the prompt length:
 
+RETRACTED — all three rows are the same B=8 blob. The prefill attribution built on them
+(620 ms serial prefill x 8 = the 103.7) may well still be the right STORY, but it is not
+evidenced by these numbers and must be re-derived on a corrected blob before it is quoted.
+
 | condition | tok/s | vs raw dispatch |
 |---|--:|--:|
-| `amd-bench --batched` (no serve stack) | 220.3 | — |
-| serve, GEN_CTX=**128** | **187.4** | 85% |
-| serve, GEN_CTX=**4096** | 103.7 | 47% |
+| `amd-bench --batched` (no serve stack) | ~~220.3~~ | — |
+| serve, GEN_CTX=**128** | ~~**187.4**~~ | ~~85%~~ |
+| serve, GEN_CTX=**4096** | ~~103.7~~ | ~~47%~~ |
 
 The mux keeps 85% of the raw batched dispatch, so continuous batching itself is
 working. What halves throughput at 4k is that **decode is batched and prefill is
@@ -1776,3 +1821,18 @@ CAVEAT THAT DOMINATES ITEM (4): at 8k the deficit is 1.02 ms against a vLLM numb
 be re-measured on this box and that has already moved 33% once under re-measurement. Before
 spending the above, re-baseline both engines in one session (task #9). It is entirely possible
 8k is already a tie.
+
+## Elimination-table addendum (2026-08-07): dispatch-width cap — the one untested transform, now tested
+
+`PLOW_GEMV_WG` (dense path; unset = byte-identical) caps every decode GEMV's
+workgroup count. Motivated by the GLM result (PLOW_GLM_GEMV_WG=152 = −1.4 ms,
+its fusions run ~1.1 rows/wave). On Gemma-4 12B fp8 it is a **monotone
+REGRESSION** (bench_speed, 2 gated interleaved rounds, ms @4k/8k):
+uncapped 11.08-11.13 / 11.18-11.24; wg200 11.30-11.32 / 11.44; wg152
+11.72-11.77 / 11.85-11.89. Consistent with this file's law rather than
+against it: rows/wave governs only in the collapse zone (<~2). Gemma's
+worst decode GEMV sits at ~1.6-2.6 rows/wave and its wide MLP GemvGlu
+(N=15360) wants all 304 CUs' aggregate bandwidth, so narrowing trades away
+more than it buys. GLM's 1.1-rows/wave fusions were in the zone; Gemma's
+ops are not. **Do not re-try on Gemma; DO try on any model whose narrow
+GEMVs fall below ~1.5 rows/wave.**

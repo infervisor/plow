@@ -150,7 +150,7 @@ tree (all op_* forks + the interpreter, at the 255-reg ceiling), where FORK_GLU 
 ~680 spills on top of the plain fork's ~910 and spills OTHER arms (+252 attn, +261
 interp). Isolated, the kernel is spill-free — the register pressure, not the kernel,
 is the cost. This is why FORK_GLU defaults OFF and why fp8 prefill wants TMA +
-setmaxnreg warp-spec (the real fix).
+setmaxnreg warp-spec (the real fix, per the design notes).
 
 **Accuracy (fp8 is lossy — sanity only):** w8a8 vs bf16-kernel output relL2 =
 **8.3–9.3 %** (GEMM) / **13.4 %** (GLU). Unscaled worst case (scale≡1, values in

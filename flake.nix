@@ -8,18 +8,190 @@
   outputs = { self, nixpkgs }:
     let
       systems = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" "aarch64-linux" ];
-      linuxSystems = [ "x86_64-linux" "aarch64-linux" ];
       forAll = nixpkgs.lib.genAttrs systems;
-      forLinux = nixpkgs.lib.genAttrs linuxSystems;
-      pkgsFor = system: import nixpkgs { inherit system; };
+      # allowUnfree is for the CUDA toolchain only (nvcc's EULA); ROCm is free.
+      # The insecure-package allowance is exactly the optional vllm baseline
+      # shell (nixpkgs flags this release; it never enters a plow build).
+      pkgsFor = system: import nixpkgs {
+        inherit system;
+        config = {
+          allowUnfree = true;
+          permittedInsecurePackages = [ "python3.13-vllm-0.16.0" ];
+        };
+      };
 
-      cargoLock = { lockFile = ./Cargo.lock; };
+      cargoLock = {
+        lockFile = ./Cargo.lock;
+        # tools/bench's optional `ib` feature pins a git dependency; importCargoLock
+        # needs its hash spelled out even though plowc/plowrt never compile it.
+        outputHashes = {
+          "inference-benchmarker-1.1.0" = "sha256-Tr/urmjuYQXH50kxCn05DOLfv4JTYv+mjsBv5EhQXAE=";
+        };
+      };
+
+      # GPU toolchains, from nix. This is what makes the build self-contained:
+      # no /opt/rocm, no /usr/local/cuda anywhere in a `nix build`.
+      #
+      # VERSION NOTE: ROCm here is 7.14 (clang-23) — the toolchain the branch's
+      # kernel measurements were taken on (scripts/build_gfx942.sh header).
+      # 7.14 exists ONLY as TheRock nightly SDK tarballs: AMD's apt channel
+      # stops at 7.2.4 and nixpkgs at 7.2.3 (both checked 2026-08-10). The SDK
+      # is built relocatable, so nix serves it from the store after patching
+      # ELF interpreters. ONE family tarball (gfx950-dcgpu) compiles BOTH
+      # offload arches: the compiler, device-lib bitcode and ROCr are
+      # family-independent; only the prebuilt math libraries differ per
+      # family, and plow links none of them.
+      rocmVersion = "7.14.0a20260612";
+      gpuToolsFor = pkgs: rec {
+        cuda = pkgs.cudaPackages;
+        rocm = pkgs.stdenv.mkDerivation {
+          pname = "rocm-therock-gfx950-dcgpu";
+          version = rocmVersion;
+          src = pkgs.fetchurl {
+            url = "https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-linux-gfx950-dcgpu-${rocmVersion}.tar.gz";
+            sha256 = "0y208k446im2a2iaqbg5h5hfzb2szlb9f1dflf4k3ikknp22xg8r";
+          };
+          dontUnpack = true;
+          # autoPatchelf sets the nix ELF interpreter and resolves the few
+          # NEEDED libs the SDK does not bundle; everything else already
+          # carries $ORIGIN rpaths. IgnoreMissing: the tree ships hundreds of
+          # test/bench binaries whose extra deps plow never runs.
+          nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+          buildInputs = [
+            pkgs.stdenv.cc.cc.lib
+            pkgs.zlib
+            pkgs.zstd
+            pkgs.ncurses
+            pkgs.libxml2
+            pkgs.libdrm
+            pkgs.numactl
+            pkgs.elfutils
+            pkgs.expat
+          ];
+          autoPatchelfIgnoreMissingDeps = true;
+          dontStrip = true;
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out
+            tar -xzf $src -C $out --strip-components=1
+
+            # AMD's clang expects a host gcc under /usr for libstdc++ and libc
+            # headers; the nix sandbox has no /usr, and the HIP runtime wrapper
+            # includes <cstdlib> in every device pass. Clang loads
+            # <basename>.cfg from the invoked binary's directory (symlink dir
+            # counts), so baking the paths here makes hipcc/clang work for any
+            # caller with no environment setup — and pins ONE glibc, the same
+            # one everything else in the flake uses.
+            gccdir=$(echo ${pkgs.gcc-unwrapped}/lib/gcc/*/*)
+            for dir in $out/bin $out/lib/llvm/bin; do
+              for c in clang clang++ clang-23 clang-cpp amdclang amdclang++ amdclang-cpp; do
+                [ -e "$dir/$c" ] || continue
+                # -idirafter, NOT -isystem: libstdc++'s <cmath> reaches libc via
+                # #include_next, which only searches directories AFTER the C++
+                # headers — an -isystem libc lands before them and math.h is
+                # "not found" the moment no /usr/include is there to mask it.
+                printf -- '--gcc-install-dir=%s\n-idirafter %s\n' \
+                  "$gccdir" "${pkgs.glibc.dev}/include" > "$dir/$c.cfg"
+              done
+            done
+            runHook postInstall
+          '';
+          meta = {
+            description = "ROCm ${rocmVersion} SDK (TheRock nightly, clang-23)";
+            platforms = [ "x86_64-linux" ];
+          };
+        };
+        # Classic /opt/rocm layout: bundler and llvm-readelf share lib/llvm/bin
+        # (hipcc_hsaco.sh finds readelf next to the bundler via dirname).
+        rocmLlvmBin = "${rocm}/lib/llvm/bin";
+        # Explicit for the same reason as ever: a clang that cannot find the
+        # bitcode dies with "cannot find ROCm device library" on --genco.
+        hipDeviceLibPath = "${rocm}/lib/llvm/amdgcn/bitcode";
+        # Classic single-prefix layout: bin/nvcc, bin/cuobjdump, include/ — the
+        # shape the scripts' `$(dirname $NVCC)` discovery expects.
+        cudatoolkit = cuda.cudatoolkit;
+        # The PATH the scripts' `env -i` nvcc calls run under (PLOW_NVCC_PATH in
+        # runtime/cmake/nvcc_cubin.sh and scripts/build_sm90a_cubin.sh): the nix
+        # sandbox has no /usr/bin, so nvcc's host compiler must come from here.
+        nvccPath = pkgs.lib.makeBinPath [
+          cudatoolkit
+          cuda.backendStdenv.cc
+          pkgs.coreutils
+          pkgs.gnugrep
+          pkgs.gnused
+          pkgs.bash
+        ];
+        # -ccbin: nix's nvcc has no default host compiler. -I: nvcc resolves its
+        # TOP through the bin/nvcc symlink to the real cuda_nvcc package, whose
+        # include/ lacks cuda_runtime.h — the merged toolkit's include has it.
+        nvccCcbin = "-ccbin ${cuda.backendStdenv.cc}/bin -I ${cudatoolkit}/include";
+      };
     in
     {
-      packages = forLinux (system:
+      packages = forAll (system:
         let
           pkgs = pkgsFor system;
+          lib = pkgs.lib;
+          isLinux = pkgs.stdenv.isLinux;
+          # The GPU toolchains only exist here: the ROCm SDK tarball is a
+          # linux-x86_64 binary distribution.
+          isGpuHost = system == "x86_64-linux";
           src = ./.;
+          gpu = gpuToolsFor pkgs;
+
+          # One cmake configure per served-object family, driving the canonical
+          # tables in runtime/CMakeLists.txt (never the per-object scripts: the
+          # tables are the single definition of each object's define set, and
+          # this file must not become another copy that drifts).
+          mkHsaco = arch: extraFlags: pkgs.stdenv.mkDerivation {
+            pname = "plow-interp-${arch}";
+            version = "0.1.0";
+            src = ./runtime;
+            nativeBuildInputs = [ pkgs.cmake ];
+            cmakeFlags = [
+              "-DPLOW_GFX950_HSACO=ON"
+              "-DPLOW_HSACO_ARCH=${arch}"
+              "-DPLOW_HSACO_HIPCC=${gpu.rocm}/bin/hipcc"
+              "-DPLOW_HSACO_BUNDLER=${gpu.rocmLlvmBin}/clang-offload-bundler"
+              "-DPLOW_HSACO_DIR=${placeholder "out"}/hsaco/${arch}"
+            ] ++ extraFlags;
+            env.HIP_DEVICE_LIB_PATH = gpu.hipDeviceLibPath;
+            buildPhase = ''
+              runHook preBuild
+              cmake --build . --target gfx950_hsaco -j "$NIX_BUILD_CORES"
+              runHook postBuild
+            '';
+            dontInstall = true;
+            meta = {
+              description = "plow ${arch} persistent-interpreter code objects (.elf hsaco)";
+              platforms = lib.platforms.linux;
+            };
+          };
+
+          mkNvCubin = tag: flags: pkgs.stdenv.mkDerivation {
+            pname = "plow-interp-${tag}";
+            version = "0.1.0";
+            src = ./runtime;
+            nativeBuildInputs = [ pkgs.cmake ];
+            cmakeFlags = [
+              "-DPLOW_CUBIN_NVCC=${gpu.cudatoolkit}/bin/nvcc"
+              "-DPLOW_CUBIN_DIR=${placeholder "out"}/cubin"
+            ] ++ flags;
+            env = {
+              PLOW_NVCC_PATH = gpu.nvccPath;
+              NVCC_PREPEND_FLAGS = gpu.nvccCcbin;
+            };
+            buildPhase = ''
+              runHook preBuild
+              cmake --build . --target nv_cubins -j "$NIX_BUILD_CORES"
+              runHook postBuild
+            '';
+            dontInstall = true;
+            meta = {
+              description = "plow ${tag} interpreter cubins `plowrt serve` loads";
+              platforms = lib.platforms.linux;
+            };
+          };
         in
         rec {
           default = plowrt;
@@ -27,7 +199,8 @@
           # --- compiler -------------------------------------------------------
           # Pure Rust, thanks to the rustls TLS stack (the workspace pins hf-hub
           # with `default-features = false`, so no native-tls → no openssl-sys).
-          # Nothing here needs pkg-config or a system library.
+          # Nothing here needs pkg-config or a system library. Builds on darwin
+          # too: macOS is a supported plowc host.
           plowc = pkgs.rustPlatform.buildRustPackage {
             pname = "plowc";
             version = "0.1.0";
@@ -39,18 +212,18 @@
             meta = {
               description = "plow compiler: model/network → packet streams for a hardware spec";
               mainProgram = "plowc";
-              platforms = nixpkgs.lib.platforms.linux;
+              platforms = nixpkgs.lib.platforms.unix;
             };
           };
 
           # --- runtime (one binary, CPU + GPU) ---------------------------------
-          # A single artifact that serves CPU and GPU. Both vendor backends are
-          # compiled in, but neither is *linked*: `device::select` `dlopen`s
-          # libcuda.so.1 / libamdhip64.so at startup and falls back to the CPU
-          # reference backend when neither loads. So this builds on a machine with
-          # no GPU toolchain, runs on a machine with no GPU driver, and lights up
-          # the GPU when one is present — and one process can drive NVIDIA and AMD
-          # side by side (`cu*` and `hip*` share no symbol names).
+          # On Linux: a single artifact that serves CPU and GPU. Both vendor
+          # backends are compiled in, but neither is *linked*: `device::select`
+          # `dlopen`s libcuda.so.1 / libamdhip64.so at startup and falls back to
+          # the CPU reference backend when neither loads. So this builds on a
+          # machine with no GPU toolchain, runs on a machine with no GPU driver,
+          # and lights up the GPU when one is present — and one process can drive
+          # NVIDIA and AMD side by side (`cu*` and `hip*` share no symbol names).
           #
           # It is therefore *dynamically* linked, and cannot be `crt-static`: a
           # static musl binary cannot `dlopen` at all (musl stubs it out), which
@@ -58,22 +231,28 @@
           # libc/libm/libdl/libgcc_s — every Rust crate is still static, and there
           # is no GPU link-time dependency. Speed comes from the release profile
           # (fat LTO, one codegen unit, panic=abort) — see the workspace Cargo.toml.
+          #
+          # On darwin: CPU reference backend only. There is no CUDA or ROCm on
+          # macOS, so the GPU features stay off and the binary serves the CPU path.
           plowrt = pkgs.rustPlatform.buildRustPackage {
             pname = "plowrt";
             version = "0.1.0";
             inherit src cargoLock;
 
-            buildFeatures = [ "cuda" "rocm" ];
+            # `hsa`, not "rocm": the AMD backend is direct ROCr (dlopen of
+            # libhsa-runtime64), no HIP runtime involved.
+            buildFeatures = lib.optionals isLinux [ "cuda" "hsa" ];
             cargoBuildFlags = [ "--package" "plowrt" ];
             cargoTestFlags = [ "--package" "plowrt" ];
 
             meta = {
-              description = "plow host runtime — CPU + GPU in one binary, drivers dlopen'd";
+              description = "plow host runtime — CPU + GPU in one binary on Linux (drivers dlopen'd), CPU-only on darwin";
               mainProgram = "plowrt";
-              platforms = nixpkgs.lib.platforms.linux;
+              platforms = nixpkgs.lib.platforms.unix;
             };
           };
-
+        }
+        // lib.optionalAttrs isLinux {
           # --- C runtime core (CPU) --------------------------------------------
           # libplow_runtime.a: packet decode, dispatch table, interpreter, memmap,
           # and the CPU golden kernels that serve as the correctness oracle. Built
@@ -81,7 +260,10 @@
           plow-runtime = pkgs.stdenv.mkDerivation {
             pname = "plow-runtime";
             version = "0.1.0";
-            src = ./runtime;
+            # The whole tree, not ./runtime: the C core includes ../include/packet.h
+            # (the ABI header the Rust side shares), which a runtime-only src cuts off.
+            inherit src;
+            preConfigure = "cd runtime";
 
             nativeBuildInputs = [ pkgs.cmake ];
             doCheck = true;
@@ -96,17 +278,62 @@
               platforms = nixpkgs.lib.platforms.linux;
             };
           };
-        });
+        }
+        // lib.optionalAttrs isGpuHost (rec {
+          # --- served interpreter objects, one package per arch -----------------
+          # ROCm: the full hsaco table (runtime/CMakeLists.txt PLOW_GFX950_HSACO).
+          # gfx942 turns the MXFP4/K3 axes off — parity with what
+          # scripts/build_gfx942.sh builds for CDNA3; those rows have never been
+          # measured against the gfx942 register cliff.
+          plow-interp-gfx950 = mkHsaco "gfx950" [ ];
+          plow-interp-gfx942 = mkHsaco "gfx942" [
+            "-DPLOW_HSACO_MXFP4=OFF"
+            "-DPLOW_HSACO_K3=OFF"
+          ];
+          # CUDA: the served cubin tables (PLOW_SM120_CUBIN / PLOW_SM90A_CUBIN),
+          # fp8-KV twins included, built the fast-prefill way.
+          plow-interp-sm120a = mkNvCubin "sm120a" [
+            "-DPLOW_SM120_CUBIN=ON"
+            "-DPLOW_SM120_CUBIN_FP8KV=ON"
+            "-DPLOW_FP8_KV_FASTPF=ON"
+          ];
+          plow-interp-sm90a = mkNvCubin "sm90a" [
+            "-DPLOW_SM90A_CUBIN=ON"
+            "-DPLOW_SM120_CUBIN_FP8KV=ON"
+            "-DPLOW_FP8_KV_FASTPF=ON"
+          ];
+          # Every flavour under one root: hsaco/<gfx-arch>/*.elf + cubin/*.cubin.
+          plow-interp = pkgs.symlinkJoin {
+            name = "plow-interp";
+            paths = [
+              plow-interp-gfx942
+              plow-interp-gfx950
+              plow-interp-sm90a
+              plow-interp-sm120a
+            ];
+          };
+        }));
 
-      # `nix flake check` on Linux: build the compiler, the static runtime, and the
-      # C core (whose ctest suite runs as part of its build).
-      checks = forLinux (system:
-        let p = self.packages.${system}; in {
-          inherit (p) plowc plowrt plow-runtime;
-        });
+      # `nix flake check`: compiler + runtime everywhere; the C core (whose ctest
+      # suite runs as part of its build) on Linux. The interp flavours are `nix
+      # build` targets, not checks — they pull the multi-GB GPU toolchains.
+      checks = forAll (system:
+        let
+          p = self.packages.${system};
+          pkgs = pkgsFor system;
+        in
+        { inherit (p) plowc plowrt; }
+        // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux { inherit (p) plow-runtime; });
 
       devShells = forAll (system:
-        let pkgs = pkgsFor system; in {
+        let
+          pkgs = pkgsFor system;
+          gpu = gpuToolsFor pkgs;
+          # nixpkgs' ROCm stack is x86_64-linux-only; the GPU dev wiring goes
+          # with it. aarch64-linux gets the plain Rust/CMake shell.
+          isGpuHost = system == "x86_64-linux";
+        in
+        {
           default = pkgs.mkShell {
             name = "plow-dev";
             packages = [
@@ -120,10 +347,16 @@
               # Lean 4 toolchain manager — installs the version pinned by
               # lean-plow/lean-toolchain on first `lake` invocation.
               pkgs.elan
-            ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            ] ++ pkgs.lib.optionals isGpuHost [
+              # GPU dev requirements (x86_64-linux only; darwin builds plowc and
+              # the CPU plowrt, nothing else): hipcc + nvcc from nix, so kernel
+              # and interpreter builds need no /opt/rocm or /usr/local/cuda.
+              # `rocm` is the full 7.14 SDK: bin/hipcc, bin/rocminfo, lib/llvm.
+              gpu.rocm
+              gpu.cudatoolkit
               # ROCr's own shared-library dependencies, from nix rather than
               # the system. `plowrt --features hsa` dlopens
-              # /opt/rocm/lib/libhsa-runtime64.so, which needs libelf, libdrm,
+              # libhsa-runtime64.so, which needs libelf, libdrm,
               # libnuma and libz. Putting /usr/lib/x86_64-linux-gnu on
               # LD_LIBRARY_PATH to satisfy them does NOT work: the nix-built
               # binary then resolves libc.so.6 to the system glibc 2.35 and
@@ -143,32 +376,60 @@
                 echo "lean toolchain: $(cat lean-plow/lean-toolchain)"
               fi
 
-            '' + pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-              # The AMD GPU path. ROCm itself stays SYSTEM-installed (the code
-              # objects are built by the system hipcc); only its library search
-              # path is wired up here. /opt/amdgpu carries libdrm_amdgpu, which
-              # ROCr loads for the kernel driver. Deliberately does NOT include
-              # /usr/lib/x86_64-linux-gnu — see the package list above.
+            '' + pkgs.lib.optionalString isGpuHost ''
+              # The GPU toolchains, from nix (ROCm ${rocmVersion},
+              # CUDA ${gpu.cudatoolkit.version}). The PLOW_* variables are the
+              # override knobs every kernel build script already honors, so
+              # scripts/build_gfx942.sh, build_gfx950.sh, build_sm90a_cubin.sh
+              # and the cmake served-object targets all pick the nix toolchain
+              # with no flags. A system toolchain under /opt can still be
+              # selected per-invocation by overriding these.
+              export ROCM_PATH=${gpu.rocm}
+              export HIP_PATH=${gpu.rocm}
+              export CUDA_PATH=${gpu.cudatoolkit}
+              export HIP_DEVICE_LIB_PATH=${gpu.hipDeviceLibPath}
+              export PLOW_HIPCC=${gpu.rocm}/bin/hipcc
+              export PLOW_BUNDLER=${gpu.rocmLlvmBin}/clang-offload-bundler
+              export PLOW_READELF=${gpu.rocmLlvmBin}/llvm-readelf
+              # build_gfx950.sh's host `chat` harness: pair the nix cc with the
+              # nix ROCm libs (the system gcc cannot link the nix libhsa — its
+              # symbol versions are nix-glibc's).
+              export PLOW_HOST_CC=cc
+              export PLOW_NVCC=${gpu.cudatoolkit}/bin/nvcc
+              export PLOW_NVCC_PATH=${gpu.nvccPath}
+              export NVCC_PREPEND_FLAGS='${gpu.nvccCcbin}'
+
               # mkShell wires nix packages for BUILD time only; a dlopen at run
               # time reads LD_LIBRARY_PATH, so the nix lib dirs go on it
-              # explicitly. Without this, ROCr's libelf is simply not found and
+              # explicitly. Deliberately does NOT include
+              # /usr/lib/x86_64-linux-gnu — see the package list above.
+              # Without this, ROCr's libelf is simply not found and
               # `--features hsa` falls back to the CPU backend — which looks
               # like "no GPU on this box" rather than a missing library.
               export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [
                 pkgs.elfutils pkgs.libdrm pkgs.numactl pkgs.zlib
+                gpu.rocm
                 # ROCr is C++; libstdc++ must come from the SAME toolchain as
                 # the rest of the process, not from /usr.
                 pkgs.stdenv.cc.cc.lib
               ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              # System fallback, AFTER the nix dirs: /opt/amdgpu carries
+              # libdrm_amdgpu for the kernel driver, and a box that wants its
+              # system ROCm (7.14) instead of nix's can still resolve it here.
               for d in /opt/rocm/lib /opt/amdgpu/lib/x86_64-linux-gnu; do
                 [ -d "$d" ] && export LD_LIBRARY_PATH="''${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$d"
               done
               if [ -e /dev/kfd ]; then
-                echo "amd gpu: $(ls /dev/dri/renderD* 2>/dev/null | wc -l) render node(s), ROCm $(cat /opt/rocm/.info/version 2>/dev/null || echo '?')"
+                echo "amd gpu: $(ls /dev/dri/renderD* 2>/dev/null | wc -l) render node(s), system ROCm $(cat /opt/rocm/.info/version 2>/dev/null || echo '-')"
               fi
             '';
           };
 
+        }
+        # Weight quantization: everywhere except legacy x86_64-darwin, where
+        # nixpkgs' torch/arrow stack is marked broken and even *evaluating* the
+        # shell fails `nix flake check --all-systems`.
+        // pkgs.lib.optionalAttrs (system != "x86_64-darwin") {
           # Weight quantization only. SEPARATE from `default` on purpose.
           #
           # `perf-data/harness/quantize_fp8.py` needs torch for
@@ -208,6 +469,20 @@
             ];
             shellHook = ''
               echo "plow quantize shell — $(python3 -c 'import torch; print("torch", torch.__version__)')"
+            '';
+          };
+        }
+        # vllm is OPTIONAL: a comparison/baseline tool, not a build input, and
+        # its closure is torch-sized. Same per-task-shell rule as `quantize`:
+        #   nix develop .#vllm
+        // pkgs.lib.optionalAttrs isGpuHost {
+          vllm = pkgs.mkShell {
+            name = "plow-vllm";
+            packages = [
+              (pkgs.python3.withPackages (ps: [ ps.vllm ]))
+            ];
+            shellHook = ''
+              echo "plow vllm shell — $(python3 -c 'import vllm; print("vllm", vllm.__version__)')"
             '';
           };
         });

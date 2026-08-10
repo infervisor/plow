@@ -350,7 +350,13 @@ __device__ __forceinline__ unsigned char plow_f32_to_fp8_ocp(float v) {
         const unsigned m = (unsigned)__builtin_roundevenf(q * 512.0f);
         mag = (m > 7u) ? 0x08u : m;
     }
-    return (unsigned char)(sgn | mag);
+    /* NEVER EMIT 0x80 (OCP -0): a negative value whose magnitude rounds to zero encodes as +0,
+     * the SAME VALUE. This makes every CDNA3 device-produced e4m3 stream (the fp8 KV cache, the
+     * fused w8a8 activation quant) 0x80-free BY CONSTRUCTION, so their decoders can skip the
+     * neg-0 SWAR mask (~8 of the chain's 14 VALU per 4 bytes — see
+     * perf-data/plow-gfx942/fp8-dequant-valu-audit.md). CDNA3-only guarantee: gfx950 encodes
+     * with the native cvt, which does emit -0. */
+    return (unsigned char)(mag ? (sgn | mag) : 0u);
 }
 
 /* One OCP e2m1 nibble -> f32. Magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6}, sign in bit 3.

@@ -119,7 +119,7 @@ model's prefill GEMM target is available **without a full-model run**.
 
 ## Task 2 — does the plow tune system help? **No, not on this GPU/path.**
 
-Read `crates/plowc/src/{tune,tuned}.rs` + the design notes, built
+Read `crates/plowc/src/{tune,tuned}.rs`, built
 `plowc`, and RAN the tuner on H100 NVL. What it tunes: **prefill dense-GEMM tile
 selection** (BM×BN×BK) via a probed capability inventory + analytical cost model
 (+ optional measured DB). It does **not** benchmark (by design) and does **not**

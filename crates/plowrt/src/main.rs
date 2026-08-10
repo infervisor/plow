@@ -104,11 +104,18 @@ enum Cmd {
         #[arg(long)]
         blob: PathBuf,
         /// Directory of gfx950 code objects (`interp_*.elf`).
-        #[arg(long)]
+        #[arg(long, id = "amd_bench_hsaco")]
         hsaco: PathBuf,
         /// Safetensors checkpoint. Omit to run with UNBOUND weights: the
         /// schedule and the timing are real, the tokens are not.
-        #[arg(long)]
+        ///
+        /// The clap ID is EXPLICIT because the GLOBAL `--rt-checkpoint`
+        /// (config.rs) already claims the derived id `checkpoint`, and clap
+        /// resolves ids, not long names: two args with the same id and
+        /// different value types PANIC at access time
+        /// ("Mismatch between definition and access of `checkpoint`"), which is
+        /// what `amd-bench --checkpoint <dir>` did on EVERY invocation.
+        #[arg(long, id = "amd_bench_checkpoint")]
         checkpoint: Option<PathBuf>,
         /// Prompt token ids to decode from, comma-separated. Needs
         /// `--checkpoint` to mean anything.
@@ -154,6 +161,26 @@ enum Cmd {
         /// `scripts/glm52_logit_cmp.py` is the reader.
         #[arg(long)]
         dump_logits: Option<PathBuf>,
+        /// TIER-2 PREFILL SWEEP: comma-separated prompt lengths, each timed
+        /// `--prefill-reps` times on ONE loaded engine, reported as a median.
+        ///
+        /// It exists because the `--prompt` path prefills exactly ONCE and
+        /// prints one decimal — 0.1 ms of quantisation on a 12 ms single-layer
+        /// block is 0.8%, which is the size of the effects a tier-2 harness is
+        /// built to rank. Amortising the load over every context in the sweep
+        /// is the other half: on a truncated GLM blob the load is ~8-25 s and a
+        /// prefill is ~12-110 ms, so one invocation per LENGTH would be a
+        /// harness that spends 99% of its time loading.
+        ///
+        /// `prefill` is position-stateless (every chunk's rows come from its
+        /// `ChunkStep`), so repeating it simply rewrites the same KV rows.
+        #[arg(long)]
+        prefill_sweep: Option<String>,
+        /// Timed repetitions per `--prefill-sweep` length (one warm-up pass is
+        /// always run first and discarded). Zero would leave the sample vector
+        /// empty and the median index out of bounds, so the range starts at 1.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
+        prefill_reps: u32,
     },
 
     /// Run a BLOCK asset (act.x in, act.x out) through the AMD engine.
@@ -166,9 +193,9 @@ enum Cmd {
         /// Compiled block blob (`model.pkt`).
         #[arg(long)]
         blob: PathBuf,
-        #[arg(long)]
+        #[arg(long, id = "amd_block_hsaco")]
         hsaco: PathBuf,
-        #[arg(long)]
+        #[arg(long, id = "amd_block_checkpoint")]
         checkpoint: Option<PathBuf>,
         /// Prompt token ids (comma-separated) for a model-shaped block — one
         /// that carries `in.ids`/`embed_tokens` and can be driven end to end.
@@ -342,6 +369,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             batched,
             tp,
             dump_logits,
+            prefill_sweep,
+            prefill_reps,
         } => {
             if tp > 1 {
                 amd_bench_tp(
@@ -354,7 +383,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tp,
                     batched,
                     dump_logits,
+                    prefill_sweep,
+                    prefill_reps,
                 )
+            } else if prefill_sweep.is_some() {
+                Err("--prefill-sweep is implemented on the TP path only (--tp N, N>1)".into())
             } else {
                 amd_bench(
                     blob,
@@ -610,7 +643,7 @@ fn amd_bench(
             // single-GPU path did not, so `K3_PREFILL=0` — the arm K3 did its whole
             // bring-up on — simply could not run on one GPU. It is a real forward
             // pass: step `p` writes KV row `p` and attends over `[0, p+1)`.
-            let tok = if eng.n_programs() == 1 {
+            let tok = if !eng.has_prefill() {
                 let mut last = 0;
                 for (p, id) in ids.iter().enumerate() {
                     eng.seed_ids(&[*id])?;
@@ -741,7 +774,7 @@ fn trace_dump_1(
     eng: &plowrt::exec::amd::AmdEngine,
     suffix: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(p) = std::env::var_os("PLOW_TRACE_RAW") {
+    if let Some(p) = plowrt::config::RuntimeConfig::get().amd.trace_raw.as_ref() {
         let mut p = PathBuf::from(p).into_os_string();
         p.push(suffix);
         let p = PathBuf::from(p);
@@ -753,7 +786,7 @@ fn trace_dump_1(
 
 #[cfg(feature = "hsa")]
 fn trace_dump(g: &plowrt::exec::amd_tp::AmdTpGroup) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(p) = std::env::var_os("PLOW_TRACE_RAW") {
+    if let Some(p) = plowrt::config::RuntimeConfig::get().amd.trace_raw.as_ref() {
         let p = PathBuf::from(p);
         g.rank(0).trace_write(&p)?;
         println!("packet trace -> {}", p.display());
@@ -772,6 +805,8 @@ fn amd_bench_tp(
     tp: u32,
     batched: bool,
     dump_logits: Option<PathBuf>,
+    prefill_sweep: Option<String>,
+    prefill_reps: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::exec::amd_tp::AmdTpGroup;
 
@@ -800,6 +835,24 @@ fn amd_bench_tp(
     // real arithmetic difference, and the whole prefill question is which of
     // those a token flip is.
     let dump = |g: &AmdTpGroup, tag: &str| -> Result<(), Box<dyn std::error::Error>> {
+        // PLOW_DUMP_ACT="name:path[,name:path...]" — download rank 0's copy of any act
+        // tensor after the prefill/step this closure runs for. A measurement instrument
+        // (e.g. the DSA union-coverage analysis reads `act.iumask`), not a serving path;
+        // dumped once per tag, later tags overwrite-with-suffix like the logits do.
+        if let Some(spec) = plowrt::config::RuntimeConfig::get().amd.dump_act.as_ref() {
+            for one in spec.split(',').filter(|s| !s.is_empty()) {
+                if let Some((name, path)) = one.split_once(':') {
+                    let n = g
+                        .rank(0)
+                        .tensor_bytes(name)
+                        .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
+                        as usize;
+                    let mut buf = vec![0u8; n];
+                    g.rank(0).read_tensor(name, &mut buf)?;
+                    std::fs::write(format!("{path}.{tag}.bin"), &buf)?;
+                }
+            }
+        }
         let Some(dir) = &dump_logits else {
             return Ok(());
         };
@@ -813,6 +866,60 @@ fn amd_bench_tp(
         std::fs::write(dir.join(format!("logits_{tag}.bin")), &buf)?;
         Ok(())
     };
+
+    // TIER-2 PREFILL SWEEP. One load, every context, median of N — see the flag's own
+    // documentation for why the `--prompt` path cannot serve this role. Terminal: it
+    // returns rather than falling through to the decode ladder, because a sweep run has
+    // no single position to decode from.
+    if let Some(spec) = prefill_sweep.as_deref() {
+        let lens: Vec<u32> = spec
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().parse::<u32>())
+            .collect::<std::result::Result<_, _>>()?;
+        if lens.is_empty() {
+            return Err("--prefill-sweep parsed to no lengths".into());
+        }
+        if lens.contains(&0) {
+            return Err("--prefill-sweep contains a zero-length prompt".into());
+        }
+        println!(
+            "\nprefill sweep: {} rep(s) + 1 discarded warm-up per length, max_ctx={}",
+            prefill_reps,
+            g.max_ctx()
+        );
+        for t in lens {
+            if t as usize > g.max_ctx() {
+                println!("  T={t:<6} SKIP (> max_ctx {})", g.max_ctx());
+                continue;
+            }
+            // The ids are meaningless by construction (weights are unbound unless a
+            // checkpoint was passed); only the ROW COUNT reaches the schedule.
+            let ids: Vec<u32> = (0..t).map(|i| 100 + (i % 1000)).collect();
+            let mut ms: Vec<f64> = Vec::with_capacity(prefill_reps as usize);
+            for r in 0..=prefill_reps {
+                let t0 = std::time::Instant::now();
+                let _ = AmdTpGroup::agree(&g.prefill(&ids)?)?;
+                if r > 0 {
+                    ms.push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med = ms[ms.len() / 2];
+            let spread = if med > 0.0 {
+                100.0 * (ms[ms.len() - 1] - ms[0]) / med
+            } else {
+                0.0
+            };
+            let reps: Vec<String> = ms.iter().map(|v| format!("{v:.3}")).collect();
+            println!(
+                "  PFSWEEP T={t} median_ms={med:.3} spread_pct={spread:.2} reps=[{}]",
+                reps.join(",")
+            );
+        }
+        trace_dump(&g)?;
+        return Ok(());
+    }
 
     // BATCHED TP — the arm `scripts/k3_batch_gate.sh` drives. K3 is TP8-only, so without this
     // the gate has nothing to run against and the two refusals could never be retired on
@@ -915,7 +1022,7 @@ fn amd_bench_tp(
             // step `p` writes KV row `p` and attends over `[0, p+1)`, so nothing
             // is read that was not written. It is O(prompt) dispatches, hence a
             // fallback and not the default.
-            let tok = if g.rank(0).n_programs() == 1 {
+            let tok = if !g.rank(0).has_prefill() {
                 let mut last = 0;
                 for (p, id) in ids.iter().enumerate() {
                     g.seed_ids(&[*id])?;
@@ -944,7 +1051,7 @@ fn amd_bench_tp(
             // 2459 packets of GEMV, i.e. the decode program. Prefill has been untraceable.
             //
             // Written to `<PLOW_TRACE_RAW>.prefill` so both survive one run.
-            if let Some(t) = std::env::var_os("PLOW_TRACE_RAW") {
+            if let Some(t) = plowrt::config::RuntimeConfig::get().amd.trace_raw.as_ref() {
                 let mut pf = PathBuf::from(t).into_os_string();
                 pf.push(".prefill");
                 let pf = PathBuf::from(pf);

@@ -17,5 +17,7 @@ rc=$?
 [ "$rc" -eq 0 ] || { echo "sweep failed rc=$rc — NOT ingesting"; exit "$rc"; }
 
 cd "$WT"
+# TUNE_GPU DECIDES THE CELL — see scripts/gemv_one_shape.sh. Default is this box.
 nix develop -c cargo run --release -p tunedb --bin tunedb-gemv -- \
-    ingest --db tuning --samples "$JSONL" --campaign gemv-row-inventory
+    ingest --db tuning --gpu "${TUNE_GPU:-MI300X}" --samples "$JSONL" \
+    --campaign gemv-row-inventory

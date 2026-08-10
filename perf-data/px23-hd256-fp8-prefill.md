@@ -258,7 +258,7 @@ The attribution chain, each step a separate run under its own lease:
 
 So **prefill serving of Gemma-4-12B is broken on this branch base (`main`) independently of this
 change**, and no end-to-end number is obtainable here. PX-20 ran this exact model successfully on
-`worktree-plowrt-max-completion-tokens`, which is **102 commits ahead** and carries PX-17's
+the completion-tokens branch, which is **102 commits ahead** and carries PX-17's
 prefill patch-site fix among others. The merge of that branch into this worktree was **refused by
 the permission classifier**, twice, which is why this work sits on the older base.
 

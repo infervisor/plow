@@ -48,9 +48,25 @@
  * A decode norm is one CU, one row, ~21 KB. Issued together, that is ONE ~1.3 us round trip and
  * nothing more; issued in two dependent phases it is two. Nothing else in the op costs anything
  * like as much, so the load ORDER was most of its runtime. */
+/* Workgroup max, same shape (and same `part` reuse contract) as block_sum. */
+__device__ __forceinline__ float block_max(float v, float* part) {
+#pragma unroll
+    for (int off = 32; off > 0; off >>= 1) v = fmaxf(v, __shfl_xor(v, off, PLOW_WAVE));
+    const unsigned wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
+    if (lane == 0) part[wave] = v;
+    __syncthreads();
+    float t = part[0];
+#pragma unroll
+    for (int i = 1; i < PLOW_WAVES; i++) t = fmaxf(t, part[i]);
+    __syncthreads();
+    return t;
+}
+
 __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                           const bf16* __restrict__ gamma, unsigned rows, unsigned feat,
-                          float eps, unsigned out_row0, unsigned slice, unsigned nblk, float* part) {
+                          float eps, unsigned out_row0, unsigned slice, unsigned nblk, float* part,
+                          unsigned char* __restrict__ xq = nullptr,
+                          float* __restrict__ ascale = nullptr) {
     /* feat % 8 == 0 is what lets the row be read 16 bytes at a time; Gemma's 5376 is. */
     const bool fits = (feat <= RN_REG * PLOW_THREADS) && ((feat & 7u) == 0);
     const auto* xg = as_glob(x);
@@ -97,6 +113,47 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                         o[j] = f2bf(bf2f(v[c][j]) * inv * g);
                     }
                     st_glob8(og + obase + i, o);
+                    v[c] = o; /* keep the ROUNDED row for the fused quant below */
+                }
+            }
+            /* FUSED w8a8 ACTIVATION QUANT (t[3]/t[4] set). Quantizes the just-ROUNDED bf16
+             * outputs exactly as d_quant_fp8 would after re-reading them: fmax is order-
+             * independent, the scale formula and the encoder are the same code, so xq/ascale
+             * are BIT-IDENTICAL to the separate QUANT_FP8 packet this replaces — what it
+             * deletes is that packet's full read+write pass over the row and its serial
+             * gate. Only emitted with out_row0 == 0, so xq rows index like the packet's. */
+            if (xq) {
+                float amax = 0.0f;
+#pragma unroll
+                for (int c = 0; c < RN_VEC; c++) {
+                    const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+                    if (i < feat)
+#pragma unroll
+                        for (int j = 0; j < 8; j++) amax = fmaxf(amax, fabsf(bf2f(v[c][j])));
+                }
+                amax = block_max(amax, part);
+                const float as = fmaxf(amax * (1.0f / 448.0f), 1e-12f);
+                const float qinv = 1.0f / as;
+                auto* const xqg = as_glob(xq);
+                if (threadIdx.x == 0) st_act<float>(&as_glob(ascale)[row], as);
+#pragma unroll
+                for (int c = 0; c < RN_VEC; c++) {
+                    const unsigned i = (threadIdx.x + (unsigned)c * PLOW_THREADS) * 8;
+                    if (i < feat) {
+#pragma unroll
+                        for (int j = 0; j < 8; j += 2) {
+                            const float qa = bf2f(v[c][j]) * qinv;
+                            const float qb = bf2f(v[c][j + 1]) * qinv;
+#if PLOW_CDNA4
+                            const unsigned pk = __builtin_amdgcn_cvt_pk_fp8_f32(qa, qb, 0u, false);
+#else
+                            const unsigned pk = (unsigned)plow_f32_to_fp8_ocp(qa) |
+                                                ((unsigned)plow_f32_to_fp8_ocp(qb) << 8);
+#endif
+                            st_act1_u8(&xqg[base + i + j], (unsigned char)(pk & 0xffu));
+                            st_act1_u8(&xqg[base + i + j + 1], (unsigned char)((pk >> 8) & 0xffu));
+                        }
+                    }
                 }
             }
         } else {
@@ -106,9 +163,33 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                 ss += v * v;
             }
             const float inv = rsqrtf(block_sum(ss, part) / (float)feat + eps);
+            float amax = 0.0f;
             for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
                 const float g = gamma ? bf2f(gamma[i]) : 1.0f;
-                st_act1(&out[obase + i], f2bf(bf2f(x[base + i]) * inv * g));
+                const bf16 o = f2bf(bf2f(x[base + i]) * inv * g);
+                st_act1(&out[obase + i], o);
+                amax = fmaxf(amax, fabsf(bf2f(o)));
+            }
+            /* Fused quant, non-resident arm: each thread encodes the elements it just
+             * produced (the encoder is ELEMENTWISE — pairing in d_quant_fp8 is only an
+             * encode-width optimization — so the bytes are identical), avoiding any
+             * cross-thread re-read of the just-written row. */
+            if (xq) {
+                amax = block_max(amax, part);
+                const float as = fmaxf(amax * (1.0f / 448.0f), 1e-12f);
+                const float qinv = 1.0f / as;
+                auto* const xqg = as_glob(xq);
+                if (threadIdx.x == 0) st_act<float>(&as_glob(ascale)[row], as);
+                for (unsigned i = threadIdx.x; i < feat; i += PLOW_THREADS) {
+                    const float g = gamma ? bf2f(gamma[i]) : 1.0f;
+                    const float qa = bf2f(f2bf(bf2f(x[base + i]) * inv * g)) * qinv;
+#if PLOW_CDNA4
+                    const unsigned pk = __builtin_amdgcn_cvt_pk_fp8_f32(qa, 0.0f, 0u, false);
+#else
+                    const unsigned pk = (unsigned)plow_f32_to_fp8_ocp(qa);
+#endif
+                    st_act1_u8(&xqg[base + i], (unsigned char)(pk & 0xffu));
+                }
             }
         }
     }

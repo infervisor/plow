@@ -20,7 +20,7 @@
 #   scripts/k3_block_sweep.sh PLOW_K3_FUSE_A=1     # any emit knob, applied to the emit
 #
 # Env: PLOW_K3_HSACO (default build-amd/hsaco), PLOW_K3_STEPS (64), PLOW_K3_CTX (8000,16000,32000).
-# `sg render` must be OUTSIDE nix; see the design notes
+# `sg render` must be OUTSIDE nix; see the design notes.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"

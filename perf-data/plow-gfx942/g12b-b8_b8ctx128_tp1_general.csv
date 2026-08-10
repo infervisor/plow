@@ -1,2 +1,0 @@
-input_len,concurrency,ttft_ms,prefill_tok_s,tpot_ms,itl_ms,itl_med_ms,itl_p99_ms,decode_tok_s,req_per_s,out_tok_s,ok_reqs,gen_toks
-128,8,250.98,510.0,40.920,40.600,35.520,129.970,24.44,1.460,187.4,64,8192

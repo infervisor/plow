@@ -14,7 +14,7 @@
 #       from GLM's data-dependent MoE routing doing less work on garbage activations.
 #   (c) the §5 coherence gate on the CONTROL object set.
 #
-# Companion: perf-data/glm52_xgate_prefill_ab.sh (phase 1), the design notes.
+# Companion: perf-data/glm52_xgate_prefill_ab.sh (phase 1); see the design notes §7e-XGATE.
 W=/home/lava/models/GLM-5.2-plow
 # Repo root, derived rather than hardcoded: this was an absolute path into a
 # `.claude/worktrees/` directory, which is gitignored and belongs to an agent worktree

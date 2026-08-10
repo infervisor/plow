@@ -80,7 +80,7 @@ Per sliding layer: fused qkv is coarse, so 3 headnorm→flash + 1 flash→merge 
 
 Scheduler is compile-time (`PLOW_NV_SCHED`). Production default = 1 (global-queue,
 op-major reordered). The topological deadlock-safety argument in
-the design notes holds for the **per-CU in-order** stream
+The design notes hold for the **per-CU in-order** stream
 (sched=0), NOT for a reordering scheduler — and that is exactly what we observe.
 
 | model | sched | baseline (coarse) | SE_FINE forced | Δ | parity |

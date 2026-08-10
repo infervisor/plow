@@ -57,7 +57,7 @@ run use `wave_dot_fp8_blk`, which keeps **one load in flight** per wave and read
 EVERY workgroup, keeps `UN` chunks in flight per column (`UN=3` at `nchunk=6`, i.e. K=6144) and
 stages `x` in LDS. Same wave count, ~4x the CU spread and ~3x the in-flight weight bytes.
 
-This is why the other branch's op-44 tail patch did not help op 47: **they are different kernels**,
+This is why the other run's op-44 tail patch did not help op 47: **they are different kernels**,
 and the patch (`op_gemm.h:1819`, the odd-column duplicate) only touches op 44.
 
 ### 1.3 What was built — and why NO weight concatenation was needed
@@ -249,7 +249,7 @@ Even the best case — gather only the q/kv/rope chain, leave the router replica
 
 ### 2.6 If the collective work is ever revisited, this is the trap
 
-Another branch found and fixed a live instance of it today: `count_xgates`
+Another run found and fixed a live instance of it today: `count_xgates`
 (`crates/plowrt/src/exec/amd_tp.rs:456`) never counted `XArgmaxFin`'s two ids, so the sharded-head
 fold **wrote past the end of `xctr` with no fault, and the four ranks sampled four different
 tokens**. Any change to the number or kind of collectives must update `count_xgates` in the same

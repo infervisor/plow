@@ -418,7 +418,14 @@ endif()
 # used, so this configures with no CUDA language support at all. One maintained
 # definition of the build beats CMake purity.
 option(PLOW_SM120_CUBIN "Emit the sm_120a .cubin artifacts `plowrt serve` loads" OFF)
-option(PLOW_SM120_CUBIN_FP8KV "Also emit the _fp8kv cubin variants" OFF)
+# The Hopper twin. Same base + axes as sm_120a; what differs is the TU
+# (nvidia/interp_sm90a.cu), the -arch, the mangled symbols, and the per-arch
+# define set scripts/build_sm90a_cubin.sh has always applied (dead-arm gating +
+# the H100 decode-arm fixes — see _nv_var_sm90a below, which cites the script).
+# That script remains the way to get the experimental segmented/lean objects
+# (PLOW_BUILD_SEG etc.); the two DEFAULT served objects come from here.
+option(PLOW_SM90A_CUBIN "Emit the sm_90a .cubin artifacts `plowrt serve` loads" OFF)
+option(PLOW_SM120_CUBIN_FP8KV "Also emit the _fp8kv cubin variants (all enabled arches)" OFF)
 
 # GQA fusion factor for the FULL-attention (hd512) flash-decode instantiation.
 # Measured: GF_FULL should equal `gqa` when the full layers have kv_heads == 1
@@ -440,7 +447,7 @@ set(PLOW_EXTRA_DEFINES "" CACHE STRING "extra raw nvcc flags appended to every s
 # they have always been. See the header block in nvidia/interp_sm120.cu.
 set(PLOW_CUBIN_CONFIG "" CACHE FILEPATH "generated plow_config.h to specialise the cubins for one packet")
 
-if(PLOW_SM120_CUBIN)
+if(PLOW_SM120_CUBIN OR PLOW_SM90A_CUBIN)
     # An fp8-KV build without FASTPF puts the PREFILL objects on the synchronous
     # PIPE=0 staging arm. That is correct, and it is slow: measured 175.90 s vs
     # 32.39 s on a 127k prefill. Say so at configure time rather than let it be
@@ -455,7 +462,6 @@ if(PLOW_SM120_CUBIN)
     endif()
 
     string(REPLACE " " ";" _cubin_extra "${PLOW_EXTRA_DEFINES}")
-    set(_cubin_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/interp_sm120.cu")
     set(_cubin_inc -I "${CMAKE_CURRENT_SOURCE_DIR}/common" -I "${CMAKE_CURRENT_SOURCE_DIR}/nvidia")
     set(_cubin_run "${CMAKE_CURRENT_SOURCE_DIR}/cmake/nvcc_cubin.sh")
 
@@ -488,47 +494,80 @@ if(PLOW_SM120_CUBIN)
         set(_ax_fp8kv_pf -DPLOW_FP8_KV=1 -DPLOW_NV_FA_PIPE=0)
     endif()
 
-    set(_ksym_dec "_Z12interp_sm12011PlowProgram")
-    set(_ksym_pf "_Z15interp_sm120_pf11PlowProgram")
-
-    # THE TABLE: <stem> <kernel symbol> <axis-1 var> [<axis-2 var>]. Nothing below
-    # spells out a define set; every row is base + axes.
-    set(_cubin_rows
-        "interp_sm120|${_ksym_dec}|_ax_decode|"
-        "interp_sm120_pf|${_ksym_pf}|_ax_prefill|")
-    if(PLOW_SM120_CUBIN_FP8KV)
-        list(APPEND _cubin_rows
-            "interp_sm120_fp8kv|${_ksym_dec}|_ax_decode|_ax_fp8kv"
-            "interp_sm120_pf_fp8kv|${_ksym_pf}|_ax_prefill|_ax_fp8kv_pf")
+    # ARCH VARIANTS: <stem>|<-arch>|<TU>|<decode symbol>|<prefill symbol>|<per-arch defs var>.
+    # Rows are still base + axes; a variant adds only what its arch has always
+    # carried. sm_120a adds nothing. sm_90a adds the two define sets
+    # scripts/build_sm90a_cubin.sh applies unconditionally:
+    #   * dead-arm gating (h100-interp arm-ablation): MLA/MAMBA/DSA are op
+    #     families a Gemma model never emits; compiling them out shrinks the
+    #     decode cubin ~43% and its stack to 0. The flags default ON in the
+    #     source, so the sm_120a objects stay byte-identical.
+    #   * the H100 decode-arm fixes (perf-data/gemma26b-h100-gemv-mlp.md):
+    #     GEMV row-blocking + warp router, MoE-down lane split, flash
+    #     warp-per-row, fp8 RB=4. All default 0 in the sources.
+    set(_nv_var_sm120a "")
+    set(_nv_var_sm90a
+        -DPLOW_NV_MLA=0 -DPLOW_NV_MAMBA=0 -DPLOW_NV_DSA=0
+        -DPLOW_NV_GEMV_RB=1 -DPLOW_MOE_DOWN_LANESPLIT=1 -DPLOW_NV_FA_WPR=1 -DPLOW_NV_FP8_RB=4)
+    set(_cubin_variants "")
+    if(PLOW_SM120_CUBIN)
+        list(APPEND _cubin_variants
+            "interp_sm120|${PLOW_CUBIN_ARCH}|interp_sm120.cu|_Z12interp_sm12011PlowProgram|_Z15interp_sm120_pf11PlowProgram|_nv_var_sm120a")
+    endif()
+    if(PLOW_SM90A_CUBIN)
+        list(APPEND _cubin_variants
+            "interp_sm90a|sm_90a|interp_sm90a.cu|_Z12interp_sm90a11PlowProgram|_Z15interp_sm90a_pf11PlowProgram|_nv_var_sm90a")
     endif()
 
     set(_cubin_outs "")
-    foreach(_row ${_cubin_rows})
-        string(REPLACE "|" ";" _f "${_row}")
-        list(GET _f 0 _stem)
-        list(GET _f 1 _sym)
-        list(GET _f 2 _a1)
-        list(GET _f 3 _a2)
-        set(_defs ${_cubin_base} ${${_a1}})
-        if(_a2)
-            list(APPEND _defs ${${_a2}})
+    foreach(_variant ${_cubin_variants})
+        string(REPLACE "|" ";" _vf "${_variant}")
+        list(GET _vf 0 _vstem)
+        list(GET _vf 1 _varch)
+        list(GET _vf 2 _vtu)
+        list(GET _vf 3 _ksym_dec)
+        list(GET _vf 4 _ksym_pf)
+        list(GET _vf 5 _vdefs_var)
+        set(_vsrc "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/${_vtu}")
+
+        # THE TABLE: <stem> <kernel symbol> <axis-1 var> [<axis-2 var>]. Nothing below
+        # spells out a define set; every row is base + variant + axes.
+        set(_cubin_rows
+            "${_vstem}|${_ksym_dec}|_ax_decode|"
+            "${_vstem}_pf|${_ksym_pf}|_ax_prefill|")
+        if(PLOW_SM120_CUBIN_FP8KV)
+            list(APPEND _cubin_rows
+                "${_vstem}_fp8kv|${_ksym_dec}|_ax_decode|_ax_fp8kv"
+                "${_vstem}_pf_fp8kv|${_ksym_pf}|_ax_prefill|_ax_fp8kv_pf")
         endif()
-        set(_out "${PLOW_CUBIN_DIR}/${_stem}.cubin")
-        add_custom_command(OUTPUT "${_out}"
-            COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_out}" "${_sym}" required
-                    -arch=${PLOW_CUBIN_ARCH} -O3 -cubin ${_cubin_inc}
-                    ${_defs} ${_cubin_extra} "${_cubin_src}"
-            DEPENDS "${_cubin_src}" "${_cubin_run}"
-            COMMENT "nvcc ${_stem}.cubin (${_defs})"
-            VERBATIM)
-        list(APPEND _cubin_outs "${_out}")
+
+        foreach(_row ${_cubin_rows})
+            string(REPLACE "|" ";" _f "${_row}")
+            list(GET _f 0 _stem)
+            list(GET _f 1 _sym)
+            list(GET _f 2 _a1)
+            list(GET _f 3 _a2)
+            set(_defs ${_cubin_base} ${${_vdefs_var}} ${${_a1}})
+            if(_a2)
+                list(APPEND _defs ${${_a2}})
+            endif()
+            set(_out "${PLOW_CUBIN_DIR}/${_stem}.cubin")
+            add_custom_command(OUTPUT "${_out}"
+                COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_out}" "${_sym}" required
+                        -arch=${_varch} -O3 -cubin ${_cubin_inc}
+                        ${_defs} ${_cubin_extra} "${_vsrc}"
+                DEPENDS "${_vsrc}" "${_cubin_run}"
+                COMMENT "nvcc ${_stem}.cubin (${_defs})"
+                VERBATIM)
+            list(APPEND _cubin_outs "${_out}")
+        endforeach()
     endforeach()
 
     # The device stochastic sampler is NOT the megakernel and shares none of its
     # defines, so it is not a row in the table above. A failure here is non-fatal:
     # serving falls back to host sampling (hence `optional`).
     set(_smp_src "${CMAKE_CURRENT_SOURCE_DIR}/nvidia/sample_sm120.cu")
-    if(EXISTS "${_smp_src}")
+    if(PLOW_SM120_CUBIN AND EXISTS "${_smp_src}")
         set(_smp_out "${PLOW_CUBIN_DIR}/sample_sm120.cubin")
         add_custom_command(OUTPUT "${_smp_out}"
             COMMAND bash "${_cubin_run}" "${PLOW_CUBIN_NVCC}" "${_smp_out}" plow_sample optional
@@ -539,7 +578,10 @@ if(PLOW_SM120_CUBIN)
         list(APPEND _cubin_outs "${_smp_out}")
     endif()
 
-    add_custom_target(sm120_cubins ALL DEPENDS ${_cubin_outs})
+    # `nv_cubins` builds every enabled arch variant; `sm120_cubins` keeps the
+    # name scripts/build_sm120_cubin.sh has always driven.
+    add_custom_target(nv_cubins ALL DEPENDS ${_cubin_outs})
+    add_custom_target(sm120_cubins DEPENDS ${_cubin_outs})
 endif()
 
 # --- the SERVED gfx950 code objects (.hsaco) ----------------------------------
@@ -745,9 +787,18 @@ if(PLOW_GFX950_HSACO)
     set(_hs_ax_k3_moe_a4w4_fp8kv
         ${_hs_ax_k3_moe_fp8kv} -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1)
 
-    set(_hs_kpf "plow_interp_gfx950")
-    set(_hs_kdec "plow_interp_dec_gfx950")
-    set(_hs_kfl "plow_interp_flash_gfx950")
+    # Symbols carry the arch: the loader builds the kernel name from the LIVE
+    # HSA agent name (exec/amd.rs symbol_name), so a gfx942 object must export
+    # plow_interp*_gfx942. -DPLOW_ARCH_SUFFIX is what renames them; interp.hip
+    # defaults it to gfx950, so passing it explicitly keeps the gfx950 objects
+    # byte-identical. The CDNA3 codegen divergences (64 KiB LDS tile, single
+    # buffering, MFMA halving) are NOT flags here: they are defaults in
+    # op_gemm.h / amd_arch.h keyed on PLOW_CDNA4, exactly so a build that
+    # forgets them still gets an arena that fits (see scripts/build_gfx942.sh).
+    set(_hs_arch_def -DPLOW_ARCH_SUFFIX=${PLOW_HSACO_ARCH})
+    set(_hs_kpf "plow_interp_${PLOW_HSACO_ARCH}")
+    set(_hs_kdec "plow_interp_dec_${PLOW_HSACO_ARCH}")
+    set(_hs_kfl "plow_interp_flash_${PLOW_HSACO_ARCH}")
 
     # THE TABLE: <stem> <kernel symbol> <axis-1> <axis-2> <max total regs> <min occ>.
     # The 8-wave interpreters must stay <= 256 total (2 waves/SIMD); the 4-wave
@@ -889,7 +940,7 @@ if(PLOW_GFX950_HSACO)
             add_custom_command(OUTPUT "${_out}"
                 COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
                         "${PLOW_HSACO_ARCH}" "${_out}" "${_sym}${_sfx}" ${_maxreg} ${_minocc}
-                        ${_hs_inc} ${${_a1}} ${${_a2}} ${_gq} ${_hs_extra} "${_hs_src}"
+                        ${_hs_inc} ${_hs_arch_def} ${${_a1}} ${${_a2}} ${_gq} ${_hs_extra} "${_hs_src}"
                 DEPENDS "${_hs_src}" "${_hs_run}" ${_hs_hdrs}
                 COMMENT "hipcc ${_stem}${_sfx}.elf"
                 VERBATIM)

@@ -9,8 +9,13 @@
   "is invisible until benchmark day, which is exactly the day there is no time to fix it.",
   "",
   "Keys are object-name substrings; the LONGEST match wins, so interp_decode_fp8 does not also",
-  "inherit interp_decode's rules. Values are kernel-name substrings -> checks."
+  "inherit interp_decode's rules. Values are kernel-name substrings -> checks.",
+  "",
+  "_arch is asserted against each object's own ELF header before any rule runs. It is not a",
+  "label: the fp8 contract here is the INVERSE of scripts/asm_expect_gfx942.json's, because the",
+  "instruction this file forbids is the only fp8 MFMA CDNA3 has."
  ],
+ "_arch": "gfx950",
  "interp_prefill_fp8": {
   "plow_exec": {
    "require_min": {

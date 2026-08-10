@@ -1,4 +1,4 @@
-//! VMM prefix-sharing GPU gates (the design notes V1):
+//! VMM prefix-sharing GPU gates (V1):
 //!
 //! 1. `shared_prefix_token_identity_and_dedup` — two sequences sharing a
 //!    prefix under `PLOW_VMM_PREFIX=1` produce greedy tokens IDENTICAL to two

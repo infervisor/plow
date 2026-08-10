@@ -159,9 +159,9 @@ decides what can actually be tuned today.
 
 | harness | op | oracle |
 |---|---|---|
-| `runtime/bench/interp_gemm_bench.c` | GEMM **through the interpreter** | CPU dot, `rel > 0.02` fails |
-| `runtime/bench/qwen_interp_bench.c` | GEMM, Qwen shapes | same |
-| `runtime/bench/dsa_gather_bench.c` | DSA score/select/gather | three independent CPU refs, incl. **exact** top-k set equality |
+| `runtime/bench/interp/interp_gemm_bench.c` | GEMM **through the interpreter** | CPU dot, `rel > 0.02` fails |
+| `runtime/bench/interp/qwen_interp_bench.c` | GEMM, Qwen shapes | same |
+| `runtime/bench/interp/dsa_gather_bench.c` | DSA score/select/gather | three independent CPU refs, incl. **exact** top-k set equality |
 | `runtime/tests/tp_allreduce_bench.c` | all-reduce | bit-exact sum, 2 GPUs |
 
 `interp_gemm_bench.c` is the template worth generalizing. Its header makes the

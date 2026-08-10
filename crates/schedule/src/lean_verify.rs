@@ -5,7 +5,7 @@
 //! Kept in `crates/schedule` so it lives close to the source types; no direct
 //! Lean dependency — just serialization + a `lean_verify` crate call.
 //!
-//! Design notes (the design notes D+F):
+//! Design notes (§5.10 D+F):
 //!
 //! * `resource` — a stable `u64` per `ResourceId` (interned in the order
 //!   resources first appear in the schedule's placement map). Only identity

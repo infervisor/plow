@@ -1950,7 +1950,7 @@ __global__ __launch_bounds__(256, PLOW_NV_MINBLK) void PLOW_SYM(interp_sm120)(Pl
     __shared__ unsigned gq_claim;
 #if PLOW_NV_PLACE_DISPATCH
     /* ===== EXPERIMENTAL / UNVALIDATED — physical-SM L2-domain dispatch =====
-     * the design notes Consumes a compiler PLOW_NV_PLACE blob,
+     * The design notes. Consumes a compiler PLOW_NV_PLACE blob,
      * whose gq_stream is grouped into P per-L2-domain windows (gq_seg_ofs). Each
      * block reads its PHYSICAL SM id and pulls ONLY its L2 domain's window via that
      * domain's cursor line, so a domain's packets run on the L2 slice that holds

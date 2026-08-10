@@ -222,6 +222,43 @@ struct Shapes {
     moe_enc: BTreeSet<u32>,
     /// Any w4a16 MXFP4 projection opcode present (91/92/93).
     mxfp4_proj: bool,
+    /// Any prefill DOWN/combine with `i[7]=1` — bf16 `part` scatter (PLOW_MOE_PF_PART16).
+    moe_pf_part16: bool,
+    /// Any prefill GLU with `i[7]=1` — fp8 gathered activations (PLOW_MOE_PF_A8).
+    moe_pf_a8: bool,
+    /// Any prefill DOWN with `i[4]!=0` — the fused 86->87 decomposition (PLOW_MOE_PF_ATOMIC):
+    /// t[0] is a [T,H] f32 accumulator the DOWN epilogue atomically adds into, NOT the
+    /// [T*k,H] `part` scatter. An object without the arm would overrun it k-fold.
+    moe_pf_atomic: bool,
+    /// Any prefill DOWN with `i[5]!=0` — the DETERMINISTIC fused decomposition (PLOW_MOE_PF_DET):
+    /// t[0] is a [T,H] **f64** fixed-point accumulator. Same overrun class as `moe_pf_atomic`,
+    /// and additionally op 87 would read f64 bytes as f32 without the arm.
+    moe_pf_det: bool,
+    /// Any DENSE FlashMlaPrefill with `(i[6] & 0xff) > 1` — the causal KV-split partial
+    /// layout (PLOW_MLA_PF_NS). The sparse GATHER arm reuses `i[6]` whole as `cap`,
+    /// disambiguated by the union table in `t[7]`.
+    mla_pf_ns: bool,
+    /// Any dense `FlashMlaPrefill` with `i[6]` bit 8 set and no t7 — the W_ofold fusion
+    /// (PLOW_GLM_OFOLD): normalized-bf16 flash epilogue + fused o-GEMM. Exclusive with the
+    /// KV-split on a packet (the fold consumes the un-split l), so the two live in one
+    /// bitfield: low 8 bits = ns, bit 8 = ofold.
+    glm_ofold: bool,
+    /// Any dense `FlashMlaDecode` (op 50) carrying a `t[7]` — the DECODE q-rope fold
+    /// (PLOW_GLM_FUSE_ROPE): t7 = cos table, i6 = sin handle, and `t[3]` is the RAW q_rope
+    /// projection. A pre-arm object ignores both and stages `t[3]` verbatim, i.e. it feeds the
+    /// flash an UNROPED query and returns finite, fluent, wrong tokens. Refuse at load.
+    glm_fuse_rope: bool,
+    /// Any `QuantFp8` carrying a `t[3]` — the T11 GLU-into-quant fold (PLOW_T11_GLUQUANT):
+    /// t3=gate, t4=up, i2=act, and `t[1]` becomes an OUTPUT. The emitter DELETES the `Glu`
+    /// packet when it folds, so an object whose QUANT_FP8 arm ignores t3/t4 quantizes an
+    /// activation nothing produced — garbage FFN output, wrong KV cache, fluent wrong tokens.
+    /// That is the shape the AMD runtime shipped in; refuse the pairing at load.
+    quant_glu_fold: bool,
+    /// Any `GemvQkv` (op 22) carrying a `t[7]` — the DECODE q-norm fold
+    /// (PLOW_GLM_FUSE_QNORM): t7 = gamma, f0 = eps, and `t[1]` is the RAW pre-norm activation.
+    /// A pre-arm object ignores both and stages `t[1]` verbatim, i.e. it runs the projection
+    /// over an UNNORMED row and returns finite, fluent, wrong tokens. Refuse at load.
+    glm_fuse_qnorm: bool,
     /// Opcode names present, for the encoding-aware corrections below. Kept as names because that
     /// is what `features` keys on, and the two must not disagree.
     ops_present: BTreeSet<String>,
@@ -234,9 +271,11 @@ fn union_has(s: &Shapes, name: &str) -> bool {
 
 fn shapes(m: &Model) -> Shapes {
     let mut s = Shapes::default();
-    let last = m.progs.len().saturating_sub(1);
+    // Every program from `dec_lo` on is a DECODE RUNG, not a prefill bucket. Without a
+    // ladder that is the last program alone, i.e. exactly the `pi == last` this replaced.
+    let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
     for (pi, p) in m.progs.iter().enumerate() {
-        let decode = pi == last;
+        let decode = pi >= dec_lo;
         if !decode {
             s.prefill_buckets
                 .push(m.prog_t.get(pi).copied().unwrap_or(0));
@@ -286,6 +325,74 @@ fn shapes(m: &Model) -> Shapes {
                 // expert COUNT as an encoding.
                 DevOp::MoeGroupGluPf | DevOp::MoeGroupDownPf => {
                     s.moe_enc.insert(inst.i[3]);
+                    // i[7] carries the activation-side arms: a8 on GLU, part16 on DOWN.
+                    if inst.i[7] != 0 {
+                        if op == DevOp::MoeGroupGluPf {
+                            s.moe_pf_a8 = true;
+                        } else {
+                            s.moe_pf_part16 = true;
+                        }
+                    }
+                    // i[4] on DOWN is the fused decomposition's log2(k)+1 (PLOW_MOE_PF_ATOMIC).
+                    if op == DevOp::MoeGroupDownPf && inst.i[4] != 0 {
+                        s.moe_pf_atomic = true;
+                    }
+                    // i[5] on DOWN is the deterministic arm's log2(k)+1 (PLOW_MOE_PF_DET).
+                    if op == DevOp::MoeGroupDownPf && inst.i[5] != 0 {
+                        s.moe_pf_det = true;
+                    }
+                }
+                DevOp::QuantFp8 => {
+                    if inst.t[3] != packet::TENSOR_NONE {
+                        s.quant_glu_fold = true;
+                    }
+                }
+                DevOp::MoeCombinePf => {
+                    if inst.i[7] != 0 {
+                        s.moe_pf_part16 = true;
+                    }
+                }
+                // Dense V2 arm i[6] bitfield (sparse GATHER packets carry i[6]=cap but
+                // always with t7 = the union table — the t7 test is the discriminator):
+                // low 8 bits = causal KV-split ns, bit 8 = the W_ofold epilogue.
+                // Op 50's t[7] is the q-rope fold and nothing else: the GATHER twin (54) and the
+                // fp8 twin (109) are separate opcodes, and dense op 50 never had a t7 before the
+                // fold. So presence IS the feature, with no bitfield to decode — unlike op 51
+                // below, whose i[6] packs two.
+                DevOp::FlashMlaDecode => {
+                    if inst.t[7] != packet::TENSOR_NONE {
+                        s.glm_fuse_rope = true;
+                    }
+                    // `i[0] = n_batch` on the MLA decode flash, exactly as on the dense-GQA
+                    // twin above. Without this a batched GLM blob records `decode_batch: 1`
+                    // and `gv_mm_max: 1`, and the object recipe built from that manifest is
+                    // too narrow — `check_gemv_capacity` then refuses at load, or worse, an
+                    // MM=1 object serves one correct row of B.
+                    if decode {
+                        s.decode_batch = s.decode_batch.max(inst.i[0]);
+                    }
+                }
+                DevOp::FlashGatherDecode | DevOp::FlashMlaDecodeFp8 => {
+                    if decode {
+                        s.decode_batch = s.decode_batch.max(inst.i[0]);
+                    }
+                }
+                // Op 22's t[7] is the q-norm fold and nothing else: op 108 `GemvQkvg`'s t7 is
+                // `g_out` on a DIFFERENT opcode, and ops 114/115 put their scale rows in
+                // i5/i6/i7. Dense op 22 never had a t7 before the fold, so presence IS the
+                // feature — no bitfield to decode.
+                DevOp::GemvQkv => {
+                    if inst.t[7] != packet::TENSOR_NONE {
+                        s.glm_fuse_qnorm = true;
+                    }
+                }
+                DevOp::FlashMlaPrefill => {
+                    if (inst.i[6] & 0xff) > 1 && inst.t[7] == packet::TENSOR_NONE {
+                        s.mla_pf_ns = true;
+                    }
+                    if (inst.i[6] >> 8) & 1 == 1 && inst.t[7] == packet::TENSOR_NONE {
+                        s.glm_ofold = true;
+                    }
                 }
                 DevOp::MoeExpertGluFp8Blk
                 | DevOp::MoeExpertDownFp8Blk
@@ -513,6 +620,17 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     // A packet is meant to be ALL of one encoding. Two on the grouped ops means a mixed run, which
     // is a thing to see in the manifest rather than to discover in a benchmark number.
     f.insert("moe_enc_mixed".into(), json!(s.moe_enc.len() > 1));
+    // Activation-side prefill arms — instruction FIELDS, so they must be surfaced here for the
+    // object `requires` derivation (an old object silently heap-overruns on a part16 packet).
+    f.insert("moe_pf_part16".into(), json!(s.moe_pf_part16));
+    f.insert("moe_pf_atomic".into(), json!(s.moe_pf_atomic));
+    f.insert("moe_pf_det".into(), json!(s.moe_pf_det));
+    f.insert("moe_pf_a8".into(), json!(s.moe_pf_a8));
+    f.insert("quant_glu_fold".into(), json!(s.quant_glu_fold));
+    f.insert("mla_pf_ns".into(), json!(s.mla_pf_ns));
+    f.insert("glm_ofold".into(), json!(s.glm_ofold));
+    f.insert("glm_fuse_rope".into(), json!(s.glm_fuse_rope));
+    f.insert("glm_fuse_qnorm".into(), json!(s.glm_fuse_qnorm));
 }
 
 /// Performance constants derived by RULE from the shapes, never hardcoded. Both
@@ -530,6 +648,28 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
 fn tuning(s: &Shapes) -> Map<String, Value> {
     let mut t = Map::new();
     t.insert("gv_mm_max".into(), json!(next_pow2(s.decode_batch.max(1))));
+    // TILE PROVENANCE. Written because its absence made a real regression unauditable: for
+    // several days every AMD compile selected GEMM tiles from the ANALYTICAL MODEL (both tuning
+    // cells were wholly stale against the current build digest) and nothing in the emitted
+    // artifact said so -- `pick_tile` reports tier `portable` when it falls back, which is
+    // exactly what it reports when no campaign has ever run. A blob has to be able to answer
+    // "were my tiles measured?" long after the tree that built it moved on.
+    crate::tune_demand::report();
+    let (hits, lookups) = crate::tune_demand::tally();
+    if lookups > 0 {
+        t.insert("tile_lookups".into(), json!(lookups));
+        t.insert("tile_measured".into(), json!(hits));
+        t.insert(
+            "tile_source".into(),
+            json!(if hits == 0 {
+                "analytical"
+            } else if hits == lookups {
+                "measured"
+            } else {
+                "mixed"
+            }),
+        );
+    }
     if s.full_kv_heads == 1 && s.gqa > 0 {
         // The template is instantiated at 1|2|4|8 only.
         let gf = next_pow2(s.gqa).min(8);
@@ -644,10 +784,18 @@ fn backend_amd(
     // CDNA3 LDS budget. `GM_DBUF=1` single-buffers the GEMM stage, which is what makes the
     // 192x256 tile fit 64 KiB at eight waves; on CDNA4 the double-buffered default fits and is
     // faster, so this is genuinely arch-conditional and not a tuning preference.
+    //
+    // Spelled from `hwspec`'s per-arch geometry rather than as literals: this manifest is what a
+    // consumer CHECKS an object against, so a stale copy here reports a mismatch on a correctly
+    // built object (or, worse, passes a wrongly built one).
     if arch == "gfx942" && !s.prefill_buckets.is_empty() {
-        for d in ["PLOW_WG_WAVES=8", "GM_DBUF=1", "GM_BM=192", "GM_BN=256"] {
-            req.push(d.into());
-        }
+        let g = hwspec::IsaLevel::Gfx942
+            .geometry()
+            .expect("gfx942 geometry");
+        req.push("PLOW_WG_WAVES=8".into());
+        req.push(format!("GM_DBUF={}", g.gemm_stage_buffers));
+        req.push(format!("GM_BM={}", g.gemm_tile.bm));
+        req.push(format!("GM_BN={}", g.gemm_tile.bn));
     }
     // Phase. A packet with prefill buckets needs the prefill object; the decode object is always
     // needed because every packet has a decode program.
@@ -679,6 +827,60 @@ fn backend_amd(
     }
     if on("a4w4") {
         req.push("PLOW_MOE_PF_A4W4=1".into());
+    }
+    // Runtime-flag arms (packet i[7] on ops 85/86/87): every object built since the arms landed
+    // carries them (unconditional plow_moe_pf_*_arm markers in op_moe.h); an OLDER object would
+    // store f32 into a half-sized part buffer / matmul fp8 bytes as bf16 — refuse at load.
+    if on("moe_pf_part16") {
+        req.push("PLOW_MOE_PF_PART16=1".into());
+    }
+    if on("moe_pf_a8") {
+        req.push("PLOW_MOE_PF_A8=1".into());
+    }
+    // The fused 86->87 decomposition. Unlike the two above this is a BUILD axis (the atomic
+    // branch is `#if PLOW_MOE_PF_ATOMIC`), so an object may genuinely not have it.
+    if on("moe_pf_atomic") {
+        req.push("PLOW_MOE_PF_ATOMIC=1".into());
+    }
+    // The DETERMINISTIC twin — a BUILD axis for the same reason, and mutually exclusive with it.
+    if on("moe_pf_det") {
+        req.push("PLOW_MOE_PF_DET=1".into());
+    }
+    // T11 GLU-into-quant fold (QuantFp8 t3/t4/i2). Same class as the two above and the reason
+    // this entry exists at all: the fold deletes the `Glu` packet, and the AMD dispatch ignored
+    // t3/t4 for its whole life — so the packet quantized an `fu` nothing had written and the
+    // model answered fluently and wrongly. Unconditional arm, so the marker is the whole test.
+    if on("quant_glu_fold") {
+        req.push("PLOW_T11_GLUQUANT=1".into());
+    }
+    // Dense causal KV-split partial layout (op 51 i[6] low bits): an older object's V2 arm
+    // writes nsplit=1 partials while the merge reads ns of them — refuse at load.
+    if on("mla_pf_ns") {
+        req.push("PLOW_MLA_PF_NS=1".into());
+    }
+    // The W_ofold fusion (op 51 i[6] bit 8): the FLASH object must carry the ofold-aware V2
+    // arm AND the serve must route MLA prefill there (PLOW_MLA_PF_V2=1) — the 8-wave kernel
+    // ignores i[6] and the fused GEMM would read unnormalized f32 partials as bf16. plowrt
+    // enforces both.
+    if on("glm_ofold") {
+        req.push("PLOW_GLM_OFOLD=1".into());
+    }
+    // The DECODE q-rope fold (op 50 t[7]). The arm is a runtime branch inside
+    // `d_flash_mla_decode`, so every object built since it landed carries the marker and every
+    // older one does not. Getting this wrong is silent in the worst way: an old object stages
+    // `t[3]` as if it were already roped, so the query is UNROPED, attention still runs, and the
+    // model answers fluently and wrongly. plowrt refuses the pairing at load.
+    if on("glm_fuse_rope") {
+        req.push("PLOW_GLM_FUSE_ROPE=1".into());
+    }
+    // The DECODE q-norm fold (op 22 t[7]). Unlike the rope fold this arm is a BUILD AXIS, not an
+    // unconditional runtime branch — an object built without `-DPLOW_GLM_FUSE_QNORM=1` has no
+    // fold body at all — so the marker is conditional and its absence means the object cannot
+    // run the packet, not merely that it predates it. The failure is the same silent class: the
+    // raw pre-norm q_a row goes straight into the projection, attention still runs, and the model
+    // answers fluently and wrongly.
+    if on("glm_fuse_qnorm") {
+        req.push("PLOW_GLM_FUSE_QNORM=1".into());
     }
     // KIMI-K3's BLOCK ops. Not a prefill axis and not a precision one — a model axis, and the only
     // arm flag here that both buckets need. Its absence is the most completely silent failure this
@@ -1278,6 +1480,40 @@ mod tests {
         );
         // nvcc is still rendered — adding a backend must not remove one.
         assert!(man["backends"]["nvcc"]["requires"].is_array());
+    }
+
+    /// A `QuantFp8` carrying `t[3]` must ask for `PLOW_T11_GLUQUANT=1`, and a plain one must not.
+    ///
+    /// THE REGRESSION THIS PINS. `qnorm_fuse` folds the GLU producer into the quant packet
+    /// (t3=gate, t4=up, i2=act) and DELETES the `Glu` packet that used to compute `fu`. The AMD
+    /// dispatch ignored t3/t4 for its whole life, so the packet quantized an `fu` nothing had
+    /// written: no fault, no NaN, just a garbage FFN output, a wrong KV cache, and fluent wrong
+    /// tokens. `gfx950_coverage_tests::dispatched_list_matches_the_amd_interpreter` could not see
+    /// it — the OPCODE was dispatched, only its operands were dropped — which is why the pairing
+    /// is stated here, at the field, and refused by `PREFILL_ARM_MARKERS` at load.
+    #[test]
+    fn a_folded_quant_packet_requires_the_glu_arm() {
+        let req = |t3: u32| -> Vec<String> {
+            let mut q = inst(DevOp::QuantFp8, [0; 8]);
+            q.t = [0, 1, 2, t3, 4, 0, 0, 0];
+            let m = Model {
+                n_cu: 256,
+                target: 0,
+                tensors: vec![],
+                progs: vec![prog(vec![q, inst(DevOp::GemmFp8, [0; 8])])],
+                kv_row_insts: vec![],
+                prog_t: vec![128],
+                gen: vec![],
+            };
+            build(&m, "gfx942")["backends"]["gfx942"]["requires"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        };
+        assert!(req(3).contains(&"PLOW_T11_GLUQUANT=1".to_string()));
+        assert!(!req(packet::TENSOR_NONE).contains(&"PLOW_T11_GLUQUANT=1".to_string()));
     }
 
     /// A packet carrying Kimi-K3's BLOCK ops must ask for `PLOW_K3=1`.

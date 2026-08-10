@@ -1178,7 +1178,7 @@ Things that are easy to get wrong and produce plausible-but-wrong output:
 > **Update 2026-07-28 — implemented and measured.** Ops 88/89/102/103 (`KdaConv`, `KdaGate`,
 > `KdaStateStep`, `KdaGatedNorm`) now exist with gfx950 arms, an emitter
 > (`crates/devgen/src/kda.rs`) and a real-weight numeric gate that **passes** on layer 0
-> (`runtime/tests/kda_real_oracle.py` + `kda_block_gfx950_test.c`, `scripts/build_kda_real.sh`);
+> (`runtime/tests/kda_real_oracle.py` + `kda_block_gfx950_test.c`, `scripts/build_kda_real.sh`).
 > Items **3** and **4** below are CLOSED; item 2 is unchanged;
 > the state dtype is settled as **f32** from `fla/ops/kda/fused_recurrent.py`'s explicit
 > `dtype=torch.float32`, against AMD's contradictory 2-byte formula.
@@ -1245,7 +1245,7 @@ Stated plainly, because someone will implement 69 layers from this.
    an epilogue fold into `KdaStateStep` — unmeasured either way.
 
 7. **The `situ` activation, AttnRes (`attn_res_block_size: 12`), and LatentMoE. CLOSED for
-   DECODE (2026-07-28)** — the design notes. Two opcodes (`AttnRes = 104`,
+   DECODE (2026-07-28)**. Two opcodes (`AttnRes = 104`,
    `SituGlu = 105`), `PLOW_MOE_ACT_SITU = 2` inside the routed-expert GLU, and one kernel line
    (`d_moe_combine`'s residual is now optional, which is what a latent-width combine needs).
    **A complete K3 block now runs end to end against a real-weight oracle at both rungs**: layer 0

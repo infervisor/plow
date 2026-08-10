@@ -61,12 +61,12 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_glu_bf16(
     __shared__ gv_smem sm;
     for (unsigned e = 0; e < nrep; e++)
         d_gemv_glu(C, x, Wg + (size_t)e * N * K * 2, Wg + (size_t)e * N * K * 2 + (size_t)N * K, 1u,
-                   N, K, PLOW_ACT_SILU_, blockIdx.x, gridDim.x, sm.xstage);
+                   N, K, PLOW_ACT_SILU_, blockIdx.x, gridDim.x, sm.xstage, 0.0f, 0.0f);
 }
 extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_glu_blk(
     bf16* C, const bf16* x, const unsigned char* Wg, const float* s, unsigned nrep, unsigned N,
     unsigned K) {
     for (unsigned e = 0; e < nrep; e++)
         d_dense_glu_fp8_blk(C, x, Wg + (size_t)e * N * K * 2, Wg + (size_t)e * N * K * 2 + (size_t)N * K,
-                            s, s, N, K, PLOW_ACT_SILU_, blockIdx.x, gridDim.x);
+                            s, s, N, K, PLOW_ACT_SILU_, blockIdx.x, gridDim.x, 0.0f, 0.0f);
 }

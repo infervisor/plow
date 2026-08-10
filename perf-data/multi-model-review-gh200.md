@@ -1,8 +1,8 @@
 # Multi-model support review + two-model verification — GH200 (2026-08-07)
 
 Post-PR-#55 review of plowrt multi-model (S1 switching) support, verified live with
-two models on GH200. Companion design doc: the design notes
-(spec-decode/MTP + PP + disagg as instances of one abstraction).
+two models on GH200. Companion design notes cover
+spec-decode/MTP + PP + disagg as instances of one abstraction.
 
 ## 1. What multi-model is today (decision of record)
 

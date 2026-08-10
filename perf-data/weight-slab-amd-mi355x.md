@@ -59,7 +59,7 @@ problem, and the first thing to try is the prefetch depth: `prefetch_depth()`
 defaults to 256 TENSORS and its doc comment sizes that against a "~1.4 MiB expert
 projection", which is the **tp=1** figure. Under TP8 the per-rank read is
 357 KiB, so the real lookahead is 89 MiB — about a third of a second of work.
-
+See the design notes §0.
 
 ## 2. Why the memory moves — ROCr's rounding
 

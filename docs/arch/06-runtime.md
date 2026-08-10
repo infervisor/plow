@@ -164,62 +164,87 @@ relative to the ~120 segment boundaries, and it does not touch the interpreter.
 
 **Module:** [`runtime/common/interp.c`](../../runtime/common/interp.c) + [`runtime/common/interp.h`](../../runtime/common/interp.h)
 
+`interp.c` is the **host serial reference** interpreter for a `.pkt` stream — it
+walks instructions in issue order, gates each on its wait-counter thresholds, and
+increments successor counters on completion. It runs the CPU golden kernels to
+execute a whole program (used by `simulate` and by tests). The on-device
+persistent-kernel interpreters live under `runtime/nvidia/` (`interp_sm120.cu`,
+`interp_sm90a.cu`) and `runtime/amd/interp.hip`.
+
 ### Core Loop
 
+The real signature and body (paraphrased from `plow_interp_run`):
+
 ```c
-void plow_interp_run(
-    const uint8_t* stream,    // packet bytes
-    uint32_t*      counters,  // counter pool
-    void*          arena,     // device memory arena
-    const Device*  dev        // dispatch table
-) {
-    StreamHeader* hdr = (StreamHeader*)stream;
-    uint8_t* cursor = stream + sizeof(StreamHeader);
-    
-    for (uint32_t i = 0; i < hdr->n_inst; i++) {
-        Inst* inst = (Inst*)cursor;
-        
-        // Phase 1: Wait on dependencies
-        for (uint16_t w = 0; w < inst->n_wait; w++) {
-            uint16_t ctr_id = inst->wait[w];
-            uint16_t threshold = counter_table[ctr_id].threshold;
-            while (atomic_load(&counters[ctr_id]) < threshold) {
-                // spin (optionally with backoff)
-            }
+// Returns 0 ok; -1 missing kernel; -2 unsatisfied wait (bad order);
+// -3 decode error; -4 non-control inst missing its binding.
+int plow_interp_run(const uint8_t* buf, size_t len, const dispatch_table* dt,
+                    kctx* ctx, const PlowBinding* bindings, uint32_t n_bindings) {
+    PlowInst insts[...]; uint32_t n_insts, n_counters;
+    const PlowCounter* counters;
+    plow_decode(buf, len, insts, ..., &n_insts, &counters, &n_counters, ...);
+
+    for (uint32_t i = 0; i < n_insts; i++) {
+        const PlowInst* in = &insts[i];
+
+        // Gate: every wait counter must have reached its threshold.
+        // (In a valid issue order a serial walk already satisfies this.)
+        for (uint8_t w = 0; w < in->wait_len; w++) {
+            uint32_t cid = in->wait[w];
+            uint32_t thr = threshold_of(counters, n_counters, cid);
+            if (cid >= ctx->n_counters || ctx->counters[cid] < thr) return -2;
         }
-        
-        // Phase 2: Dispatch
-        dispatch(dev, inst->opcode, inst->body, arena);
-        
-        // Phase 3: Signal successors
-        for (uint16_t s = 0; s < inst->n_succ; s++) {
-            atomic_fetch_add(&counters[inst->succ[s]], 1);
+
+        // Bind operands; every family except CONTROL needs a binding.
+        ctx->bind = (bindings && in->index < n_bindings) ? &bindings[in->index] : NULL;
+        if (plow_op_family(in->opcode) != PLOW_FAMILY_CONTROL && !ctx->bind) return -4;
+
+        // Dispatch: one masked lookup in dt->fn[opcode & 0x0FFF].
+        if (dt_dispatch(dt, in->opcode, in->body, ctx) != 0) return -1;
+
+        // Signal: bump every successor counter.
+        for (uint8_t s = 0; s < in->succ_len; s++) {
+            uint32_t cid = in->succ[s];
+            if (cid < ctx->n_counters) ctx->counters[cid]++;
         }
-        
-        cursor += inst_size(inst);
     }
+    return 0;
 }
 ```
 
+The host reference walks a valid issue order, so its "gate" is a *check* (returns
+`-2` on violation) rather than a spin-wait. The device interpreters spin on the
+same counter thresholds — that is the persistent-kernel behavior the sequence
+diagram above depicts.
+
 ### Dispatch Table
 
-**Module:** [`runtime/common/dispatch.c`](../../runtime/common/dispatch.c)
+**Module:** [`runtime/common/dispatch.h`](../../runtime/common/dispatch.h) + [`runtime/common/dispatch.c`](../../runtime/common/dispatch.c)
+
+Every kernel — golden or performant, any backend, any family — has the same C
+entry shape, so the dispatch table is one flat array of function pointers
+indexed by the opcode's low 12 bits (`family << 8 | variant`), not a struct of
+named per-family slots:
 
 ```c
-typedef void (*KernelFn)(const void* body, void* arena);
+// runtime/common/kernel.h — the one entry shape every kernel implements.
+// `body` casts to the family struct; `ctx` carries slots/tensors/binding.
+typedef void (*kernel_fn)(const void* body, kctx* ctx);
 
-typedef struct Device {
-    KernelFn gemm;
-    KernelFn flash;
-    KernelFn row;
-    KernelFn dma;
-    KernelFn layout;
-    KernelFn token;
-    KernelFn rdma;
-} Device;
+// runtime/common/dispatch.h
+#define PLOW_OP_SLOTS 4096            // 16 families × 256 variants
+typedef struct dispatch_table {
+    kernel_fn fn[PLOW_OP_SLOTS];
+} dispatch_table;
+
+static inline int plow_op_index(uint16_t opcode) { return opcode & 0x0FFF; }
 ```
 
-The dispatch table is populated at registration time per backend. The interpreter indexes by `opcode.family()` (one shift + lookup).
+Kernels are bound per backend at registration time (`dt_register`). Dispatch is
+`dt_dispatch(dt, opcode, body, ctx)` → one masked index (`opcode & 0x0FFF`) into
+`fn[]`; it returns `-1` if no kernel is registered for the opcode. The `kctx`
+supplies operand handles, counters, and the current instruction's binding —
+there is no `arena` argument.
 
 ---
 
@@ -236,12 +261,14 @@ The dispatch table is populated at registration time per backend. The interprete
 | `row.cu` | Row-wise ops: RMSNorm, SiLU, Softmax, RoPE |
 | `dma.cu` | TMA bulk copy |
 | `layout.cu` | Strided gather/scatter via TMA |
-| `gemma_sm120.cu` | Blackwell tcgen05 GEMM path |
+| `gemma_sm120.cu` | Consumer-Blackwell (`sm_120`) warp-`mma.sync` Gemma-family GEMM |
 
 Registration files:
-- `register_hopper.cu` — H100 (SM 9.0)
-- `register_blackwell.cu` — B200 (SM 12.0)
-- `register_rtx6000.cu` — Ada (SM 8.9)
+- `register_hopper.cu` — Hopper H100 (`sm_90a`), wgmma path
+- `register_blackwell.cu` — datacenter Blackwell B200 (`sm_100a`), tcgen05 path
+- `register_rtx6000.cu` — RTX PRO 6000 Blackwell / GB202 consumer Blackwell (`sm_120a`), wires the `sm_120` warp-`mma.sync` Gemma kernels from `gemma_sm120.cu`
+
+Each table registers the golden f32 kernels as the correctness-oracle fallback and overlays the performant bf16 kernels that exist for that arch.
 
 ### AMD Backend
 
@@ -256,7 +283,9 @@ Registration files:
 | `hsa_backend.c` | HSA queue submission |
 
 Registration:
-- `register_mi300.hip` — MI300X (gfx942)
+- `register_mi300.hip` — MI300 (`gfx942` / CDNA3)
+
+The AMD op headers (`op_*.h`) branch on CDNA3 (`gfx942`) vs CDNA4 (`gfx950`) via `amd_arch.h`; several perf paths and the device interpreter target `gfx950`.
 
 ### CPU Backend
 
@@ -288,9 +317,21 @@ The runtime allocates a single contiguous arena per device at startup:
 └──────────────────────────────────────────────────────┘
 ```
 
-All addresses in the packet stream are **offsets into this arena** — the compiler resolves absolute layout, and the runtime just adds the arena base pointer.
+All addresses in the packet stream are **offsets into this arena** — the compiler
+emits a `PlowMemMap` of slot→offset entries and the runtime resolves each to
+`arena_base + offset` (`plow_memmap_resolve`). Only the map plus the chosen
+`arena_base` bind the layout to physical memory.
 
-**Module:** [`runtime/common/memmap.c`](../../runtime/common/memmap.c)
+**Module:** [`runtime/common/memmap.h`](../../runtime/common/memmap.h) + [`runtime/common/memmap.c`](../../runtime/common/memmap.c)
+
+**Deviation from implementation:** The single contiguous-arena diagram describes
+the compiler-computed static layout resolved by `memmap.c`. The Rust host
+(`crates/plowrt/src/memory/`) does not manage KV/prefix as a slice of that one
+arena — it adds dedicated allocators on top: `BlockAllocator` (paged KV blocks),
+`GrowablePool` (per-`(kv,head)` growable KV slabs), the RadixAttention
+`PrefixCache`, and the VMM-backed prefix path (`vmm.rs`). The static regions
+(counters, packet stream, weights, activation scratch) follow the arena/offset
+model; dynamic KV does not.
 
 ### KV Cache Paging
 
@@ -314,11 +355,12 @@ flowchart TD
     R1 --> P0
 ```
 
-KV cache uses **page-table indirection** (à la vLLM/PagedAttention):
-- Fixed-size pages (128 or 256 tokens × head_dim)
-- Per-request page list in the address map
-- Growable entries for decode phase (added via `inject_kv_growable_entry`)
-- Block pool with prefix-cache sharing
+KV cache uses **page-table indirection** (à la vLLM/PagedAttention). In the host
+(`crates/plowrt/src/memory/kv.rs`):
+- A `BlockAllocator` carves the KV region into fixed-size blocks (`KvPaging::block_bytes`) and hands out `BlockId`s from a LIFO free list
+- Each sequence owns a `PageTable` (logical token window → physical `BlockId`s), appended to as it grows and **never reallocated**
+- Growth for decode is applied via an `UPDATE_INDIRECTION` OOB message that writes the new block's physical address into an indirection slot (there is no `inject_kv_growable_entry` symbol)
+- Prefix sharing is a separate `PrefixCache` (RadixAttention / automatic prefix caching) over a `GrowablePool`, in `memory/prefix.rs` — a shared prefix resolves to a strided set of per-`(layer,kv,head)` runs, not one block
 
 ### Design Decision: Arena (not per-tensor malloc)
 
@@ -342,24 +384,32 @@ KV cache uses **page-table indirection** (à la vLLM/PagedAttention):
 
 ### Subcommands
 
+The `Cmd` enum in `main.rs` defines these subcommands:
+
 ```
-plowrt serve [--addr 0.0.0.0:8080] [--uds /path/to/sock]
-plowrt simulate --model <path> [--math f16|f32] [--log trace.json]
+plowrt serve    --assets <dir>... [--port 8080] [--socket <path>]
+                [--executors 8] [--trace] [--max-hold-ms 8.0] [--slo-ms 250.0]
+plowrt simulate --assets <dir> [--bucket <phase:batch:seq> | --all-buckets]
+                [--math dry|golden] [--log <path>] [--chrome <path>]
+plowrt devices  [--tp ...]           # multi-GPU bring-up / peer-visibility, no model
+plowrt amd-bench / amd-block         # AMD (gfx950) engine + block A/B (needs --features hsa)
+plowrt disasm   <blob>               # offline device-blob disassembly, no GPU
 ```
 
 #### `serve` — Production HTTP Server
 
-- Async Rust (tokio + hyper)
-- Unix domain socket or TCP
-- Loads compiled `.pkt` artifacts + weight manifest
-- Manages request lifecycle: tokenize → schedule bucket → submit → decode → respond
+- Async Rust: `tokio` runtime, `axum` router, `hyper` used directly to serve the same router over a Unix domain socket alongside the TCP listener
+- `--assets` takes one or more compiled-model directories; `--port` for TCP, `--socket` for an optional parallel UDS listener
+- `--executors` sets the CPU reference-backend thread count; `--trace` records a per-packet timeline dumpable at `GET /trace`
+- `--max-hold-ms` / `--slo-ms` tune the request muxer (batch-formation hold and admission SLO)
+- OpenAI-compatible router; manages request lifecycle: tokenize → schedule bucket → submit → decode → respond
 
 #### `simulate` — Dry-Run Validator
 
-- Uses CPU backend (no GPU required)
-- Replays packet stream with counter semantics
-- Validates: no deadlocks, all dependencies honored, correct memory access patterns
-- Outputs Chrome trace for visualization
+- Uses the CPU backend (no GPU required); `--assets` is a single compiled-model directory
+- `--math dry` walks the stream with counter semantics only; `--math golden` also runs the f32 reference numerics (there is no `f16`/`f32` dtype selector)
+- `--bucket <phase:batch:seq>` restricts to one bucket; `--all-buckets` runs every bucket in the bundle
+- `--log` writes the per-packet log (default stdout); `--chrome` writes a Chrome-trace JSON
 
 ### Design Decision: Separate Compile and Serve
 
@@ -394,6 +444,11 @@ Tenant switch = swap the packet stream pointer + reset counters. The persistent 
 - Arena regions are non-overlapping (hardware page protection where available)
 - Watchdog timer detects stalled tenants (counter progress monitoring)
 
+**Deviation from implementation:** None of this is built. There is no
+per-tenant counter-pool isolation, arena partitioning, or tenant-switch path in
+`crates/plowrt/`. Multi-*model* switching (`--drain-timeout-ms`, S1 switching)
+exists, but it swaps whole engines, not per-tenant regions on a shared kernel.
+
 ---
 
 ## Error Handling
@@ -409,10 +464,18 @@ Tenant switch = swap the packet stream pointer + reset counters. The persistent 
 
 ### Watchdog Architecture
 
-A host thread monitors counter-pool progress:
+The intended design: a host thread monitors counter-pool progress —
+
 - Snapshots counter values every 100ms
 - If no counter has advanced → potential deadlock
 - After 3 consecutive stalls → force-terminate the stream
 - Report includes: last-advanced counter ID, waiting instruction index
 
-This is implemented as a simple progress check — not a complex deadlock detector. The compiler's formal verification (Lean checkpoint D) proves deadlock-freedom for well-formed streams; the watchdog catches hardware faults and cosmic rays.
+A simple progress check, not a complex deadlock detector. The compiler's formal
+verification (Lean checkpoint D) proves deadlock-freedom for well-formed streams,
+so the watchdog is only intended to catch hardware faults.
+
+**Deviation from implementation:** No standalone watchdog thread exists in
+`crates/plowrt/` today. The pieces that exist are a compiler cycle estimate that
+would feed a progress curve and a `CANCEL` OOB message that can unwedge a stuck
+stream; the periodic-snapshot monitor above is not yet built.

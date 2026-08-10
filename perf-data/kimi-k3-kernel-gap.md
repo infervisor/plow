@@ -751,7 +751,7 @@ concludes the merge is slow.
 ### 8c. RoPE must be REMOVED — **WRONG. It must be NEUTRALIZED. Corrected 2026-07-28 (rung 3)**
 
 > **This section's prescription — "skip both `HeadNormRope` emits", "It is a removal", "effort XS" —
-> is the bug, not the fix.** the design notes first flagged it; rung 3 implemented and
+> is the bug, not the fix.** The design notes §7 first flagged it; rung 3 implemented and
 > gated the correct form.
 >
 > The k-side `HeadNormRope` (`d.t[0] = n.krot[slot]`) is

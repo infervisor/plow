@@ -1,6 +1,6 @@
 # 08 — Formal Verification
 
-> Every compiled schedule can optionally pass through Lean 4 theorem provers that verify six correctness properties. Failures reject the compilation — proving correctness once at compile time rather than testing every possible runtime interleaving.
+> Every compiled schedule can optionally pass through a Lean 4 verifier that checks seven correctness properties (checkpoints A–G). Failures reject the compilation — proving correctness once at compile time rather than testing every possible runtime interleaving.
 
 ---
 
@@ -16,13 +16,14 @@ flowchart TD
 
     subgraph Lean 4 - lean-plow
         CLI[plow_verify CLI]
-        PARSE[Parse JSON schema]
+        PARSE[Parse JSON payload]
         CK_A[Checkpoint A: Rewrite Soundness]
-        CK_B[Checkpoint B: Tile Partition]
-        CK_C[Checkpoint C: SRAM Fit]
+        CK_B[Checkpoint B: Tile Partition + Cost]
+        CK_C[Checkpoint C: SRAM Temporal Fit]
         CK_D[Checkpoint D: Counter Protocol]
         CK_E[Checkpoint E: Wire Format]
         CK_F[Checkpoint F: Address Map]
+        CK_G[Checkpoint G: Staged-LDS Fit]
     end
 
     COMP --> SER --> INVOKE --> CLI
@@ -33,32 +34,39 @@ flowchart TD
     PARSE --> CK_D
     PARSE --> CK_E
     PARSE --> CK_F
+    PARSE --> CK_G
 ```
 
-**Rust module:** [`crates/schedule/src/lean_verify.rs`](../../crates/schedule/src/lean_verify.rs) (feature-gated: `lean-verify`)  
+**Rust client:** [`crates/lean_verify/`](../../crates/lean_verify/) — `call`, `require`, and `query` entry points in [`lib.rs`](../../crates/lean_verify/src/lib.rs), typed per-checkpoint wrappers under [`checkpoints/`](../../crates/lean_verify/src/checkpoints/) (feature-gated: `lean-verify`)  
+**Compiler integration:** [`crates/schedule/src/lean_verify.rs`](../../crates/schedule/src/lean_verify.rs)  
 **Lean project:** [`lean-plow/`](../../lean-plow/)  
-**CLI binary:** `lean-plow/.lake/build/bin/plow_verify`
+**CLI binary:** `lean-plow/.lake/build/bin/plow_verify` (overridable via `PLOW_VERIFY_BIN`)
 
 ---
 
-## The Six Checkpoints
+## The Checkpoints
+
+Seven checkpoints (A–G) are dispatched by `runCheckpoint` in [`lean-plow/Main.lean`](../../lean-plow/Main.lean); each handler lives in [`Plow.CLI.Checkpoints`](../../lean-plow/Plow/CLI/Checkpoints.lean). The `checkpoint` field of the JSON request selects one. Beyond accept/reject checkpoints, the same CLI answers performance *queries* (`counter_granularity`, `lower_bound`) dispatched by `runQuery`.
+
+The checkpoint IDs correspond to compile-pipeline stages: A Rewrite, B Assemble, C Collapse/Relax, D Schedule, E Emit, F Memory. G is a later addition (staged-LDS fit) that has no stage of its own — it re-checks an emit-time obligation.
 
 ### Checkpoint A — Rewrite Rule Soundness
 
-**Property:** Every fusion rule in `rules.egg` preserves semantic equivalence.
+**Property:** Every fusion rule the egglog engine fires (annotated `; rule: <name>` in `rules.egg`) preserves semantic equivalence.
 
-**How:** Each rule `(rewrite (LHS ?args) (RHS ?args))` has a corresponding Lean theorem:
+**How:** Each rule fuses a composition of base ops into a single fused op. In Lean, every fused op unfolds — via `Plow.Rewrite.expand` — to exactly its unfused composition, and each rule's soundness is a definitional-equality (`rfl`) theorem `Plow.Rewrite.rule_*`. Example (the `gated-mlp-fuse` rule):
 
 ```lean
-theorem gemm_silu_fuse_sound (a b : Tensor) :
-    silu (gemm a b) = gemm_silu a b
+theorem rule_gated_mlp_fuse (g u : Op) (k : String) :
+    expand (Op.SwiGLU g u k) =
+      Op.Ew "mul" (Op.Act k (expand g)) (expand u) := rfl
 ```
 
 **Module:** [`lean-plow/Plow/Rewrite.lean`](../../lean-plow/Plow/Rewrite.lean)
 
-**What it proves:** The fused form produces bit-identical output to the unfused form (under IEEE 754 associativity relaxation where annotated).
+**What it proves:** The fused op is *definitionally* the unfused composition, so the two denote the same value. (The mini-IR is intentionally abstract: each op carries only the operand references from its egglog signature; the definitional-equality argument carries through unchanged if types/denotations are attached.)
 
-**Verification:** The compiler parses `rules.egg`, extracts rule names, and checks that every name has a corresponding Lean theorem in the catalog.
+**Verification:** The Rust side submits the list of fired rule names (`{"rules": [...]}`); `checkA` rejects any name not in the closed enumeration `Plow.Rewrite.soundRules`. That table holds one entry per `rule_*` theorem — 19 rules today, mirroring the `; rule:` annotations in `rules.egg`.
 
 ### Checkpoint B — Tile Partition Validity
 
@@ -66,73 +74,84 @@ theorem gemm_silu_fuse_sound (a b : Tensor) :
 
 **Module:** [`lean-plow/Plow/TilePartition.lean`](../../lean-plow/Plow/TilePartition.lean)
 
-**What it proves:**
-```lean
-theorem partition_covers (M N K bm bn bk : Nat) :
-    (∀ i j, i < M → j < N → ∃ tile ∈ partition, (i, j) ∈ tile.region)
+**What it proves:** completeness of the tiling (`tile_partition_covers` — every in-range `(i, j)` lands in a tile) plus validity of the executable partition check (`check_sound`, backing the per-candidate `checkPartition`). The cost bound is enforced directly: for each candidate, `checkB` rejects when `tileCount · bm · bn · bk > cost_bound`.
 
-theorem partition_disjoint (M N K bm bn bk : Nat) :
-    (∀ t1 t2 ∈ partition, t1 ≠ t2 → t1.region ∩ t2.region = ∅)
+```lean
+theorem tile_partition_covers (g : Gemm) (t : Tile) (v : ValidPartition g t) : …
+
+theorem check_sound (g : Gemm) (t : Tile) (h : checkPartition g t = .ok ()) : …
 ```
 
-**Payload:** The compiler sends `(M, N, K, bm, bn, bk, splits)` per GEMM; Lean verifies the arithmetic.
+**Payload:** a list of tile candidates, each carrying its GEMM shape, tile shape, and a `cost_bound`. `checkB` runs `checkTileCandidate` over all of them (positive dims, each tile dim ≤ its GEMM dim, plus the cost bound).
 
 ### Checkpoint C — SRAM Temporal Fit
 
-**Property:** No SM's page pool is overcommitted at any point in the schedule.
+**Property:** Producer and consumer never hold their pages at the same time across a hand-off, so the shared page budget is never overcommitted.
 
 **Module:** [`lean-plow/Plow/Sram.lean`](../../lean-plow/Plow/Sram.lean)
 
-**What it proves:** For every cycle `t` and SM `s`, the sum of live pages ≤ `pages_per_sm`.
+**What it proves:** The universal theorem `Plow.Sram.occupancy_le_of_temporal_fit` — when a hand-off is temporally disjoint (`producer_release ≤ consumer_acquire`) and each side fits the budget, occupancy at every cycle stays ≤ budget.
 
-**Payload:** Per-SM page allocation timeline (task → [alloc_start, free_end, pages]).
+**Payload:** a budget plus a list of `Handoff` records (`producer_pages`, `consumer_pages`, `producer_release`, `consumer_acquire`, `consumer_release`). `checkC` re-checks each hand-off; a rejection names the first violating one.
 
-**Note:** This is opt-in and expensive for large schedules. The scheduler's `PagePool` already enforces this invariant; the Lean check is a defense-in-depth double-check.
+**Note:** The Rust `sram_fit::analyze_temporal_fit` pass already filters candidates against this rule; the Lean check re-verifies it so the promotion story is closed by the universal theorem.
 
 ### Checkpoint D — Counter Protocol Correctness
 
 **Property:** The counter-gated schedule enforces every data dependency in the TileGraph. No consumer can start before all its producers complete.
 
-**Module:** [`lean-plow/Plow/Protocol.lean`](../../lean-plow/Plow/Protocol.lean)
+**Modules:** [`lean-plow/Plow/Protocol.lean`](../../lean-plow/Plow/Protocol.lean) (happens-before theory), [`lean-plow/Plow/Verify.lean`](../../lean-plow/Plow/Verify.lean) (the executable address-map verifier), [`lean-plow/Plow/Memory.lean`](../../lean-plow/Plow/Memory.lean) (`AddressMapSound`).
 
-**Universal theorems (proved once, applied to every schedule):**
+**Universal theorems (proved once in `Plow.Protocol`, applied to every schedule):**
 
 ```lean
 -- The counter protocol's happens-before relation covers the dependency DAG
-theorem protocol_covers_deps :
-    ∀ edge ∈ dag.edges, happensBefore schedule edge.src edge.dst
+theorem protocol_covers_deps {tg : TaskGraph} (p : CounterProtocol tg)
+    (wf : WellFormed p) :
+    ∀ e ∈ tg.edges, happensBefore p e.1 e.2
 
--- Resource ordering is a subset of happens-before
-theorem resourceOrdered_sub_happensBefore :
-    resourceOrdered schedule ⊆ happensBefore schedule
-
--- Well-formed schedules are deadlock-free
-theorem WellFormed.no_deadlock :
-    ∀ s : Schedule, WellFormed s → ¬Deadlock s
+-- Happens-before implies increasing schedule order (acyclicity ⇒ deadlock-free)
+theorem happensBefore_acyclic {tg : TaskGraph} (p : CounterProtocol tg)
+    (wf : WellFormed p) : …
 ```
 
-**Payload:** The counter graph (counter ID → producers × consumers × threshold × scope) + placement map.
+`resourceOrdered` is a subset of `happensBefore` by construction — the `happensBefore.resource` constructor injects it directly. `Plow.Memory.AddressMapSound` (reclamation safety) factors through `protocol_covers_deps`.
+
+**Handler:** `checkD` runs the executable verifier `verifyAddressMap` (via the stack-safe twin `Plow.CLI.FastCheckD`, since the reference recursion overflows on real ~590k-task schedules) *and* a reader/writer disjointness check. Together these establish the **strict** `AddressMapSound` guarantee, not just the loose form.
+
+**Payload:** the `(TaskGraph, CounterProtocol, AddressMap)` bundle produced by `plowc` — the address-map entries plus the counter/resource ordering.
 
 ### Checkpoint E — Wire Format Round-Trip
 
-**Property:** `Program.decode(Program.to_bytes(p)) == Ok(p)` for the specific compiled program.
+**Property:** `decode(encode(frames)) = some frames`, and `encode(frames) = raw` — the encoding is lossless.
 
 **Module:** [`lean-plow/Plow/Wire.lean`](../../lean-plow/Plow/Wire.lean)
 
-**What it proves:** The binary encoding/decoding is lossless — no field gets silently truncated or misaligned.
+**What it proves:** the universal framing invariant `Plow.Wire.decodeProgram_encodeProgram` — decode inverts encode on every well-formed program.
 
-**Payload:** The encoded `.pkt` bytes + the expected decoded `Program` structure.
+**Deviation from implementation:** The Lean model is *abstract, not byte-identical*. It proves the framing invariant every scheme (including packet's) must satisfy; it deliberately does not re-derive the actual `packet::Program::to_bytes` layout (MAGIC/VERSION header, per-body POD structs, length-prefixed wait/succ lists), which has its own round-trip test suite in `crates/packet`.
 
-### Checkpoint F — Address Map Validity
+**Payload:** the `frames` plus the expected encoded `raw` bytes. `checkE` requires both `encode(frames) = raw` and `decode(raw) = some frames`, so schema drift on either side of the bridge is caught; rejection names the first diverging byte.
 
-**Property:** All memory allocations in the address map are:
-1. Non-overlapping (no two buffers share bytes)
-2. Within the arena bounds
-3. Properly aligned
+### Checkpoint F — Allocation Safety
 
-**Module:** [`lean-plow/Plow/Memory.lean`](../../lean-plow/Plow/Memory.lean)
+**Property:** No two byte-overlapping address-map entries lack a bridging counter/resource ordering — i.e. the placed allocation is reclamation-safe.
 
-**Payload:** The full `MemoryMap` JSON (per-buffer offset, size, alignment).
+**Modules:** [`lean-plow/Plow/Memory.lean`](../../lean-plow/Plow/Memory.lean), [`lean-plow/Plow/Verify.lean`](../../lean-plow/Plow/Verify.lean).
+
+**Handler:** `checkF` runs the *same* verifier and disjointness check as `checkD` on the same `ScheduleRequest` bundle — F is conceptually "post-emit" verification of identical math (strict `AddressMapSound`). The Rust `call` helper caches the verdict by payload hash across the D/F pair so the second (expensive) spawn is free.
+
+**Payload:** the same `(TaskGraph, CounterProtocol, AddressMap)` bundle as D.
+
+### Checkpoint G — Staged-LDS Fit
+
+**Property:** Every always-staged GEMV instance the emitter produces fits the decode object's LDS arena.
+
+**Module:** [`lean-plow/Plow/LdsFit.lean`](../../lean-plow/Plow/LdsFit.lean)
+
+**What it proves:** `Plow.LdsFit.fits_of_check_ok` — an accepted list contains no instance whose staged demand exceeds the arena. The always-staged family (`gemv_qkv_rows` / `gemv_glu_rows` in `op_gemm.h`) reads `x` only through LDS, so choosing the fused opcode is a promise that `rows·K + scratch` halves fit. Emitting past the fit reads garbage `x` and answers fluently-but-wrong; this checkpoint re-checks the emitter's fusion gate so a path that forgets it is rejected at emit.
+
+**Payload:** the arena size (halves, supplied from `hwspec` by the Rust caller) plus one `StagedOp` record per staged instance (`op`, `idx`, `rows`, `k`, `scratch`). Rejection names the first violating instance. (This is the machine-checked half of the same host/device duplication defect class described in [14 — AMD Arch Divergence §5](14-amd-arch-divergence.md).)
 
 ---
 
@@ -145,71 +164,67 @@ sequenceDiagram
     participant Lean Kernel
 
     plowc->>plowc: Compile bucket, emit schedule
-    plowc->>plow_verify: JSON payload via stdin
-    plow_verify->>plow_verify: Parse payload
-    plow_verify->>Lean Kernel: Apply universal theorems to instance
-    Lean Kernel-->>plow_verify: QED or counterexample
-    plow_verify-->>plowc: Exit 0 (pass) or Exit 1 + error JSON
-    plowc->>plowc: On failure: PlowcError::LeanVerifyFailed
+    plowc->>plow_verify: JSON request via stdin
+    plow_verify->>plow_verify: Parse request, dispatch on checkpoint
+    plow_verify->>Lean Kernel: Run the checkpoint's executable check
+    Lean Kernel-->>plow_verify: ok / reject with reason
+    plow_verify-->>plowc: Exit 0 (ok) or Exit 1 + certificate JSON
+    plowc->>plowc: On reject: PlowcError::LeanVerify
 ```
 
 ### JSON-IPC Protocol
 
-The Rust compiler serializes a checkpoint-specific JSON payload:
+Every request wraps a checkpoint-specific payload under two top-level keys — `checkpoint` selects the handler, `payload` carries its data:
 
 ```json
 {
   "checkpoint": "B",
-  "bucket_id": 3,
-  "gemms": [
-    {"m": 2048, "n": 4096, "k": 512, "bm": 128, "bn": 128, "bk": 64, "splits": 1}
-  ]
+  "payload": {
+    "candidates": [
+      {"gemm": {"m": 2048, "n": 4096, "k": 512},
+       "tile": {"bm": 128, "bn": 128, "bk": 64},
+       "cost_bound": 4294967296}
+    ]
+  }
 }
 ```
 
-The Lean CLI returns structured results:
+The Lean CLI returns a `Certificate`: `ok` plus `notes` on success, or `ok: false` plus a `reason` on rejection. Exit code is 0 iff `ok`.
 
 ```json
-{
-  "status": "pass",
-  "checkpoint": "B",
-  "theorems_applied": ["partition_covers", "partition_disjoint"],
-  "time_ms": 42
-}
+{ "ok": true, "checkpoint": "B", "notes": "tile-partition + cost bound verified: 1 candidates" }
 ```
+
+Performance queries use a `query` key instead and return a computed `answer` with a `certificate` string (see `Plow.CLI.Queries`).
 
 ---
 
 ## Lean Project Structure
 
+Abbreviated (checkpoint-relevant modules; the tree also carries proof libraries — `Cost`, `CostBounds`, `KvPool`, `Prefetch`, `Wave`, `Layout`, `Row`, `Attn`, `SplitK`, `Weight`, `TransitiveReduction`, and the `*Perf` performance-query proofs):
+
 ```
 lean-plow/
 ├── lakefile.lean          # Build configuration
 ├── lean-toolchain         # Lean version pin
-├── Main.lean              # CLI entry point (plow_verify)
-├── Plow.lean              # Module root
+├── Main.lean              # CLI entry point (plow_verify): runCheckpoint / runQuery
+├── Plow.lean              # Module root (re-exports)
 └── Plow/
-    ├── Basic.lean         # Core definitions (Tensor, Op, Schedule)
-    ├── Rewrite.lean       # Checkpoint A: rule soundness theorems
-    ├── TilePartition.lean # Checkpoint B: partition coverage
+    ├── Basic.lean         # Core definitions (TaskGraph, Op, …)
+    ├── Rewrite.lean       # Checkpoint A: rule soundness (rule_*, soundRules)
+    ├── TilePartition.lean # Checkpoint B: partition coverage + cost
     ├── Sram.lean          # Checkpoint C: SRAM temporal fit
-    ├── Protocol.lean      # Checkpoint D: counter protocol
-    ├── Wire.lean          # Checkpoint E: wire format
-    ├── Memory.lean        # Checkpoint F: address map
-    ├── Verify.lean        # Top-level verification orchestrator
-    ├── Cost.lean          # Cost bound proofs
-    ├── CostBounds.lean    # Parametric cost theorems
-    ├── KvPool.lean        # KV cache allocation proofs
-    ├── Prefetch.lean      # Prefetch ordering proofs
-    ├── Wave.lean          # Wavefront clustering proofs
-    ├── Layout.lean        # Layout transformation proofs
-    ├── Row.lean           # Row-op correctness
-    ├── Attn.lean          # Attention correctness
-    ├── SplitK.lean        # Split-K reduction correctness
+    ├── Protocol.lean      # Checkpoint D: counter protocol / happens-before
+    ├── Memory.lean        # Checkpoint D/F: AddressMapSound
+    ├── Verify.lean        # Executable address-map verifier (D/F)
+    ├── Wire.lean          # Checkpoint E: wire format round-trip
+    ├── LdsFit.lean        # Checkpoint G: staged-LDS fit
     └── CLI/
-        ├── Checkpoints.lean  # Checkpoint dispatch
+        ├── Checkpoints.lean  # Per-checkpoint handlers (checkA … checkG)
+        ├── FastCheckD.lean   # Stack-safe twin of verifyAddressMap (D/F)
+        ├── Queries.lean      # Performance oracles (counter_granularity, lower_bound)
         ├── Payload.lean      # JSON deserialization
-        └── Schema.lean       # Payload schema types
+        └── Schema.lean       # Payload schema types + Certificate
 ```
 
 ---
@@ -227,7 +242,7 @@ lean-plow/
 4. Property-based testing (QuickCheck) — probabilistic, not proof
 
 **Rationale:**
-- Lean 4 has a native code compiler → `plow_verify` runs in ~50ms per checkpoint (fast enough for CI)
+- Lean 4 has a native code compiler → `plow_verify` runs fast enough for CI (checkpoints D/F dominate; the client caches the shared D/F verdict so the pair costs one spawn)
 - `Decidable` type class lets many properties be checked by computation, not proof construction
 - The CLI model (serialize → invoke → parse result) decouples Lean from Rust without FFI
 - Lean's metaprogramming (`macro`, `elab`) enables auto-generating proof obligations from the JSON payload
@@ -261,31 +276,35 @@ lean-plow/
 - Cross-platform: JSON-IPC works on any OS; FFI bindings are platform-specific
 - Debuggable: `cat payload.json | plow_verify` for manual testing
 
-**Counter-claim: Process spawn overhead.** Response: ~2ms per invocation (fork + exec). With 6 checkpoints × 4 buckets = 24 invocations, total overhead is ~50ms — negligible compared to the scheduler's runtime (seconds).
+**Counter-claim: Process spawn overhead.** Response: each invocation is a fork + exec. The client streams stdin from a helper thread while draining stdout (checkpoint-D payloads scale with task count and would otherwise deadlock on full pipes), and caches the identical D/F verdict so only one of the pair spawns. Total overhead stays negligible against the scheduler's runtime (seconds).
 
 ### Decision: Opt-In Verification (not mandatory)
 
-**Chosen:** Lean verification is controlled by `--lean-verify` flag. Default: off.
+**Chosen:** Lean verification is controlled by `Options::lean_verify`, and the whole client is gated behind the `lean-verify` cargo feature. Default: off. When a caller runs the gate by default, only `VerifyError::is_binary_unusable` (no runnable `plow_verify` here) is downgraded to a warning; every rejection is a hard failure.
 
 **Rationale:**
 - Lean toolchain is not universally installed (requires `elan` + `lake build`)
 - Development iteration speed matters: most edits don't affect proven properties
 - CI always runs it; developers run it before merge
-- The scheduler's built-in `verify::verify_schedule()` (Rust, fast, no external deps) catches the common cases; Lean is the gold-standard backup
+- The scheduler's built-in `schedule::verify::verify_schedule` (Rust, fast, no external deps) catches the common cases; Lean is the gold-standard backup
 
 ---
 
 ## Test Coverage
 
-Integration tests verify the Lean pipeline end-to-end:
+Integration tests verify the Lean pipeline end-to-end (in `crates/plowc/tests/`, compiled under `--features lean-verify` and `#[ignore]`d since they need the `plow_verify` binary):
 
 | Test | File | What it checks |
 |------|------|---------------|
-| Positive | [`lean_verify.rs`](../../crates/plowc/tests/lean_verify.rs) | All checkpoints pass for a valid schedule |
+| Positive | [`lean_verify.rs`](../../crates/plowc/tests/lean_verify.rs) | Every bucket of a valid schedule is accepted |
 | Negative | [`lean_verify_negative.rs`](../../crates/plowc/tests/lean_verify_negative.rs) | Intentionally broken schedule is rejected |
-| Rewrite | [`lean_verify_rewrite.rs`](../../crates/plowc/tests/lean_verify_rewrite.rs) | Rule catalog matches Lean theorems |
-| Tile partition | [`lean_verify_tile_partition.rs`](../../crates/plowc/tests/lean_verify_tile_partition.rs) | Partition coverage for all tile shapes |
+| Rewrite | [`lean_verify_rewrite.rs`](../../crates/plowc/tests/lean_verify_rewrite.rs) | Fired rule names match the sound-rules table |
+| Tile partition | [`lean_verify_tile_partition.rs`](../../crates/plowc/tests/lean_verify_tile_partition.rs) | Partition coverage + cost bound per candidate |
 | Wire | [`lean_verify_wire.rs`](../../crates/plowc/tests/lean_verify_wire.rs) | Round-trip for sample programs |
-| SRAM fit | [`lean_verify_sram_fit.rs`](../../crates/plowc/tests/lean_verify_sram_fit.rs) | Page pool never overflows |
+| SRAM fit | [`lean_verify_sram_fit.rs`](../../crates/plowc/tests/lean_verify_sram_fit.rs) | Hand-offs fit the shared page budget |
 | Schema | [`lean_verify_schema.rs`](../../crates/plowc/tests/lean_verify_schema.rs) | Payload schema matches Lean parser |
-| Growable KV | [`lean_verify_growable_kv.rs`](../../crates/plowc/tests/lean_verify_growable_kv.rs) | KV growth entries pass address-map check |
+| Growable KV | [`lean_verify_growable_kv.rs`](../../crates/plowc/tests/lean_verify_growable_kv.rs) | Growable KV entries pass the D/F address-map check |
+| LDS fit (G) | [`lean_verify_lds_fit.rs`](../../crates/plowc/tests/lean_verify_lds_fit.rs) | Staged GEMV instances fit the decode LDS arena (task-9 shape rejected) |
+| Disabled | [`lean_verify_disabled.rs`](../../crates/plowc/tests/lean_verify_disabled.rs) | Build without the feature reports the correct error |
+
+The `lean_verify` crate also carries its own [`end_to_end.rs`](../../crates/lean_verify/tests/end_to_end.rs).

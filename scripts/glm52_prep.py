@@ -13,7 +13,7 @@
 #     + f32 scale grids, no dequant),
 #   - bf16 norms + router gate.weight + f32 e_score_correction_bias.
 # The rope fold at a FIXED position (index_pos) is the documented milestone-1 simplification
-#: single-token validation. Milestone-3 multi-token decode replaces the
+# single-token validation. Milestone-3 multi-token decode replaces the
 # fold with the dynamic interleaved-RoPE op (kernels branch).
 #
 # By default it preps ONE MoE layer (layer 3 = first sparse layer, "shared" indexer -> DSA no-op,

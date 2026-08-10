@@ -7,7 +7,7 @@
  * fans out over dev = 0..N-1.
  *
  * SOURCE OF TRUTH: the design notes (§6-§8 orchestration, §12 interface
- * contract) + the design notes (plow_hsa_alloc_peer, the ~90ns system-scope
+ * contract) + the transport notes (plow_hsa_alloc_peer, the ~90ns system-scope
  * atomic handshake). The backend (hsa_backend.c) is ALREADY N-device — per-GPU
  * queues/signals/pools exist and every call takes `dev`; this file is the
  * orchestration that was missing, not a backend change.
@@ -277,7 +277,7 @@ typedef struct {
 #define PEER_SCRATCH_BYTES (64u * 1024u)
 
 /* Is `name` a column-parallel weight? (output-dim sharded: HF [out,in] row-major ⇒ a
- * CONTIGUOUS row-range, the design notes.) q/k/v/gate/up. lm_head is REPLICATED
+ * CONTIGUOUS row-range, the design notes §3a/§3b.) q/k/v/gate/up. lm_head is REPLICATED
  * (compiler keeps it full-vocab under TP), so it is NOT here. */
 static int is_col_parallel(const char* n) {
     return strstr(n, "q_proj.weight") || strstr(n, "k_proj.weight") ||
@@ -289,7 +289,7 @@ static int is_row_parallel(const char* n) {
     return strstr(n, "o_proj.weight") || strstr(n, "down_proj.weight");
 }
 
-/* Bind one rank's 1/N WEIGHT SLICE (the design notes — the real work). Column-parallel
+/* Bind one rank's 1/N WEIGHT SLICE (the design notes §3b — the real work). Column-parallel
  * weights (q/k/v/gate/up) are a contiguous output-row range of the [out,in] checkpoint matrix;
  * row-parallel weights (o/down) are a strided input-column range; everything else (norms,
  * embed_tokens/lm_head) is replicated full. tp==1 loads full (byte-identical to the old path).
@@ -534,7 +534,7 @@ static void fill_program(PlowProgram* pr, Dev* d, Blob* B, int dp) {
     pr->gq_stream = d->d_gq_stream; pr->gq_seg_ofs = d->d_gq_seg; pr->gq_cursor = d->d_gq_cursor;
     pr->trace = d->d_trace;   /* NULL on all ranks unless PLOW_TRACE_RAW set (rank 0 only) */
     (void)g;
-    /* [§12 HOOK] — wire tp-core's four cross-GPU PlowProgram fields (the design notes,
+    /* [§12 HOOK] — wire tp-core's four cross-GPU PlowProgram fields (the design notes §7a,
      * §12). peer_scratch[rank] layout: [partial_A(H*2)][partial_B(H*2)][xctr(...)]; og_tp/dg_tp
      * are bound into partial_A/partial_B (see main), so the row-parallel o_proj/down write their
      * partials peer-visibly and XReduce sums the N peer slots. xctr sits at byte 2*H*2 = 4*H into
@@ -986,9 +986,9 @@ int main(int argc, char** argv) {
     const size_t STAGE = 64u << 20;
     void* stage = plow_hsa_alloc_host(h, STAGE);
     Dev devs[MAX_DEV];
-    /* peer layout: partial_A[0,slot_b) partial_B[slot_b,2*slot_b) xctr[2*slot_b,...).
+    /* peer layout (the design notes): partial_A[0,slot_b) partial_B[slot_b,2*slot_b) xctr[2*slot_b,...).
      * slot_b = rows_max*hidden*2 from the blob (=2*hidden for a decode-only tp==1 fallback where it is 0). */
-    /* 512 counters, 128B each = 64 KB. The TWO-SHOT prefill all-reduce
+    /* 512 counters, 128B each = 64 KB. The TWO-SHOT prefill all-reduce (the design notes)
      * uses 2 xctr gate ids per collective (reduce-scatter + all-gather) = 4/layer × 60 layers
      * = 240 ids/program; one-shot decode uses 2/layer = 120. 512 leaves comfortable headroom. */
     const size_t XCTR_BYTES = 512u * PLOW_CTR_STRIDE * 4u;

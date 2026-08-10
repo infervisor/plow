@@ -134,7 +134,7 @@ deployment trade rather than a defect.
 
 Routing it is therefore a numerics decision to be taken with these numbers in hand, not defaulted
 into every MLA blob. What routing would take is listed in `GFX950_UNEMITTED`'s entry and in
-the design notes.
+the design notes §5.
 
 ## 9. Not measured here
 

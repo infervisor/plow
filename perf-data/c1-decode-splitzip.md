@@ -1,7 +1,7 @@
 # C-1 — Decode weight SplitZip: measured KILL at the real decode geometry
 
 Date 2026-07-22. Branch `c1-decode-splitzip`. Model gemma-4-12B, RTX PRO 6000
-Blackwell (188 SM, 1535 GB/s achievable). Plan: the design notes
+Blackwell (188 SM, 1535 GB/s achievable). Per the design notes
 §C-1. **Directive: decode-only (prefill accepted as a non-win).**
 
 ## TL;DR

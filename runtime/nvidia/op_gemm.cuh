@@ -2062,7 +2062,7 @@ static __device__ void d_gemv_glu_sz(__nv_bfloat16* __restrict__ C, const __nv_b
 }
 
 /* ============================ fp8 (w8a16) DECODE GEMV ==================================
- * The settled decode recipe (the design notes mma.sync/TMA/warp-spec at M=1):
+ * The settled decode recipe (refuting mma.sync/TMA/warp-spec at M=1):
  * FFMA dequant-on-load. The weight is e4m3 (1 byte/elt), HALF the bytes of the bf16 GEMV
  * above and therefore ~2x the bandwidth-bound roofline. The math is IDENTICAL to gemv_rows:
  * one WARP owns one output row n, each lane fmas 8 consecutive K elements per chunk, the warp

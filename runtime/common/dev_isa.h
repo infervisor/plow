@@ -208,7 +208,7 @@ enum {
     /* ===== CROSS-GPU (tensor-parallel) tile-graph ops. =========================
      * New opcodes assigned AFTER main's last (23), no collision. Names mirror the
      * generic infervisor RDMA-family variants (p2p/allreduce/allgather/reducescatter)
-     * so the two ABIs converge.
+     * so the two ABIs converge (see the design notes §1b, §8).
      *
      * These are the ONLY ops that touch peer VRAM. Their wait/succ counters live in
      * the SYSTEM-scope `xctr` region, not the agent-scope `counters` — the stream
@@ -227,7 +227,22 @@ enum {
 
     /* REDUCE-SCATTER + ALL-GATHER — the symmetric decomposition of all-reduce, kept
      * defined for CP / larger worlds. For N<=8 one-shot XREDUCE is lower-latency, so
-     * these are not emitted on the decode path yet. */
+     * these are not emitted on the decode path yet.
+     *
+     * UNIMPLEMENTED — RESERVED NUMBERS, NOT DEFERRED SELECTION. There is NO kernel arm for
+     * either opcode in ANY interpreter (verified by grep over runtime/: they appear only in
+     * this enum) and NO emitter anywhere in crates/. "Not emitted yet" above described the
+     * SELECTION and reads as though a body exists to select; it does not. A packet carrying
+     * 25 or 26 would fall through interp.hip's `default:` and silently no-op.
+     *
+     * The decomposition that IS built lives INSIDE `d_xreduce_twoshot_mega` (XREDUCE2, 33) as
+     * two phases of one packet, not as two packets. Anyone reaching for these numbers is
+     * writing both halves from scratch.
+     *
+     * KEPT rather than deleted: the numbers are ABI, every blob on disk was built against this
+     * enum, and reusing 25/26 for something else would make an old blob run a new op. They are
+     * `Provenance::Reserved` in crates/packet/src/slots.rs, which is the machine-readable form
+     * of this paragraph. */
     PLOW_DOP_XREDUCESCATTER = 25,
     PLOW_DOP_XALLGATHER = 26,
 
@@ -314,8 +329,8 @@ enum {
     PLOW_DOP_HEADNORM_ROPE_FP8 = 37,
     PLOW_DOP_FLASH_DECODE_FP8 = 38,
     PLOW_DOP_FLASH_PREFILL_FP8 = 39,
-    /* ===== MoE data-dependent counter-gate ops (the design notes, =====
-     * the design notes§3). Opcodes in the HIGH free range 40+ so they do NOT
+    /* ===== MoE data-dependent counter-gate ops =====
+     * Opcodes in the HIGH free range 40+ so they do NOT
      * collide with the tp collectives (24-29) or the fp8 merge (30+). These are the FIRST
      * ops whose BODY branches on a runtime buffer (the routing table): the counter DAG stays
      * static (deadlock-free, executed==total), each expert packet ALWAYS signals its counter
@@ -568,7 +583,7 @@ enum {
     PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF_W8A8 = 81,
     PLOW_DOP_MOE_GROUP_DOWN_GEMMA_PF_W8A8 = 82,
 
-    /* Nemotron-3 Mamba-2 SSD mixer. NEW op family (90; 83-89 a
+    /* Nemotron-3 Mamba-2 SSD mixer (M4). NEW op family (90; 83-89 a
      * gap after the MoE-prefill band). Mirrors packet::dev::DevOp::Mamba2Scan. The mixer CORE only —
      * in_proj/out_proj are ordinary GEMV/GEMM. Causal depthwise conv1d + SiLU over (x,B,C), the
      * selective SSD scan with per-head scalar decay, D skip, gated RMSNorm; reads+writes the carried
@@ -964,6 +979,52 @@ enum {
      * ONE BODY with op 30, which is this with Nk = Nv = 0. See op_gemm.h d_gemv_qkv_fp8. */
     PLOW_DOP_GEMV_QKV_FP8 = 115,
 
+    /* t0=out(normed) t1=resid_out t2=a(residual in) t3=gamma
+     * i0=feat i1=n_gpu i2=partial slot byte offset i3=xctr gate id  f0=eps
+     *
+     * FUSED TP ALL-REDUCE + RESIDUAL + RMSNORM — the GLM decode attention seam
+     * [XREDUCE (12 wg) -> gate -> ADD_NORM (1 wg)] as ONE single-workgroup packet:
+     * same cross-rank rendezvous as PLOW_DOP_XREDUCE, then per element
+     * f = bf2f(a[e]) + bf2f(f2bf(sum_r partial_r[e])) — the inner round reproduces the
+     * bf16 store the standalone XREDUCE would have made, so the fold is BIT-IDENTICAL
+     * to the [XReduce -> AddNorm] pair it replaces (the same discipline as d_xreduce's
+     * folded-gather term). Deletes one packet + one counter gate per TP seam per layer.
+     * DECODE ONLY (rows == 1); feat must fit one workgroup's strided pass
+     * (feat <= 16 * PLOW_THREADS), both enforced at emit. See op_norm.h
+     * d_xreduce_add_norm_mega. */
+    PLOW_DOP_XREDUCE_ADD_NORM = 116,
+
+    /* ===== DSA sparse PREFILL (ops 117-119 + a sparse arm on op 51). [GLM52-DSA-PF]
+     *
+     * The decode indexer chain (58/59/54) scores ONE query; a prefill needs one top-k row
+     * PER QUERY TOKEN. These three ops produce that, and the FLASH_MLA_PREFILL packet grows
+     * an optional t7 (the per-64-query-tile UNION table) that switches the V2 flash arm to a
+     * gathered walk. t7 == NONE keeps every existing blob byte-compatible; a sparse blob run
+     * on the 8-wave object (no V2 routing) DEGRADES TO DENSE attention — never corrupts.
+     *
+     * T-row indexer SCORE (d_index_score_pf): score[t][s] = sum_h w[t][h]*ReLU(q_idx[t][h].k_idx[s])
+     * for s <= q_pos0+t (q_pos0 = kv_len - n_tok). The decode MFMA subtile (32 heads x 32
+     * positions) under a per-query work axis; fragments straight from global (keys are L2-hot
+     * across the whole query dimension).
+     *   t0=Score(f32[n_tok][kv_stride]) t1=Qidx(bf16[n_tok][HI*DI]) t2=Kidx(cache) t3=W(bf16[n_tok][HI])
+     *   t4=kv_len; i0=n_tok i1=HI i2=kv_stride i3=DI; f0=scale */
+    PLOW_DOP_INDEX_SCORE_PF = 117,
+
+    /* T-row top-k SELECT (d_index_select_pf): per query row, the EXACT top-k positions by the
+     * same monotone packed key as op 59 (score desc, lowest index tie-break), one workgroup
+     * per row, 7-pass LDS radix + emit. Rows with len <= top_k emit the identity. Trailing
+     * unused slots are -1.
+     *   t0=idx(i32[n_tok][top_k]) t1=Score t2=kv_len; i0=n_tok i1=top_k i2=kv_stride */
+    PLOW_DOP_INDEX_SELECT_PF = 118,
+
+    /* Per-64-query-tile UNION build (d_index_union_pf): scatter each tile's 64 idx rows into a
+     * u64 membership mask over kv positions, then compact ascending into the union table the
+     * gathered flash walks: header u32 count[n_qt] (256 B aligned), then per tile
+     * [cap i32 pos][cap u32 maskLo][cap u32 maskHi].
+     *   t0=union t1=umask(u64[n_qt][kv_stride] scratch) t2=idx t3=kv_len
+     *   i0=n_tok i1=top_k i2=kv_stride i3=cap */
+    PLOW_DOP_INDEX_UNION_PF = 119,
+
     PLOW_DOP__COUNT
 };
 
@@ -1052,7 +1113,7 @@ typedef struct {
  * slice of B in EVERY CU's stream. A fine list can only LOWER a threshold or NARROW a wait
  * set — it can never make a workgroup wait on something issued later in its own stream.
  * The moment a scheduler is added that INTERLEAVES tiles across ops, that argument dies
- * and this needs the relay machinery in the design notes Do not reorder
+ * and this needs the relay machinery in the design notes. Do not reorder
  * streams without reading that file.
  *
  * Coarse ops leave `flags == 0` and cost nothing: the interpreter reads the instruction's
@@ -1064,7 +1125,7 @@ typedef struct {
  * (a cross-GPU collective), not the agent-scope local `counters`. Orthogonal to
  * PLOW_SE_FINE. Set by the TP compiler on XREDUCE/XFLASHMERGE/XARGMAX_FIN packets and on
  * the producing GEMV whose successor is a cross-GPU "partial ready" bump. See
- * the design notes. Coarse xctr programs leave this clear and cost nothing. */
+ * the design notes §6a. Coarse xctr programs leave this clear and cost nothing. */
 #define PLOW_SE_XCTR 2u /* wait/succ counters are cross-GPU (xctr, system scope)   */
 
 /* HOW MANY SLICES OF THIS PACKET LANDED ON THIS ENTRY'S L2 DOMAIN — the count the two-level
@@ -1135,7 +1196,7 @@ typedef struct {
     void* const*         tensors;    /* device pointer table */
     PlowTraceRec*        trace;      /* NULL disables tracing entirely       */
     /* Segmented dispatch: the interpreter runs ONLY this segment's stream entries, so the host
-     * can relaunch it once per wave-class segment. An
+     * can relaunch it once per wave-class segment (see the design notes). An
      * unsegmented program has n_seg==1 and every entry seg==0, so cur_seg==0 runs everything. */
     uint32_t             cur_seg;
     /* L2-DOMAIN PLACEMENT (PLOW_L2_PLACE): number of L2 domains `gq_seg_ofs` is windowed by,
@@ -1181,7 +1242,7 @@ typedef struct {
     uint32_t*            gq_cursor;   /* 1-word shared fetch-add cursor, zeroed per launch        */
     /* ===== CROSS-GPU (tensor-parallel) fields. Single-GPU runs leave these NULL/0 =====
      * Appended AFTER gq_cursor so every existing field (notably `trace`) keeps its offset
-     * and the ABI-lock test only sees the size grow.
+     * and the ABI-lock test only sees the size grow. See the design notes §6a, §12.
      *
      * `xctr` points INTO this rank's own `peer_scratch[rank]` reduction region, at its
      * cross-GPU counter sub-region (SYSTEM-scope, peer-mapped, PLOW_CTR_STRIDE-strided).

@@ -7,8 +7,19 @@
 //! maps each swept symbol onto the opcode it exercises, and applies the store's gates —
 //! correct before fast, never on a sample too small to carry dispersion, atomic publication.
 //!
-//!   tunedb-gemv ingest --db tuning --samples <sweep.jsonl> [--campaign NAME] [--provisional]
-//!   tunedb-gemv best   --db tuning
+//!   tunedb-gemv ingest --db tuning --gpu MI300X --samples <sweep.jsonl> [--campaign NAME] [--provisional]
+//!   tunedb-gemv best   --db tuning --gpu MI300X
+//!
+//! # `--gpu` decides the cell, and it used to be a constant
+//!
+//! The cell and the probed ISA came from `GFX950_CELL` / `IsaLevel::Gfx950` at seven sites, so a
+//! decode-GEMV campaign run on an MI300X would have measured gfx942 kernels, keyed them to a
+//! gfx950 build digest and published them into MI350X's cell — where `devgen`'s reader
+//! (`amd_tuning_cell`, which HAS keyed off `--gpu` since the same defect was fixed on the GEMM
+//! side) would never look, and where `amd_tuning_cell` would reject them as wrong-hardware if it
+//! did. That is the mechanical reason the decode-GEMV census has zero records on any AMD part
+//! while GLM decode is GEMV-bound. Both halves now call `tunedb::amd_tuning_cell`, so the writer
+//! and the reader cannot disagree.
 //!
 //! # Read `tunedb::gemv` before assuming this selects anything
 //!
@@ -38,8 +49,42 @@ use tunedb::gemm::parse_quant;
 use tunedb::gemv::gemv_sample_family;
 use tunedb::{
     gemv_op_case, gemv_sample_bucket, gemv_sample_opcode, Correctness, Digests, KernelMeasurement,
-    RecordState, Stats, TuneStore, GEMV_ORACLE, GFX950_CELL as CELL,
+    RecordState, Stats, TuneStore, GEMV_ORACLE, GFX950_CELL,
 };
+
+/// The part this invocation's records belong to: cell, probed ISA, and the SKU label.
+///
+/// Resolved once from `--gpu` and threaded, rather than read at each of the seven sites the
+/// constant used to sit at. `--gpu` is REQUIRED: defaulting it is what made a gfx942 campaign
+/// publish into gfx950's cell in the first place, and a wrong cell is silent — the records land,
+/// the gates stay green, and the compiler finds nothing.
+struct Target {
+    cell: String,
+    isa: hwspec::IsaLevel,
+    sku: String,
+}
+
+impl Target {
+    fn resolve(gpu: &str) -> Result<Target, Err> {
+        let spec = hwspec::registry::lookup(gpu)
+            .ok_or_else(|| format!("unknown GPU {gpu:?}; see hwspec::registry"))?;
+        let hw = hwspec::HardwareFingerprint::from_spec(spec)
+            .ok_or_else(|| format!("{} has no ISA level mapping", spec.name))?;
+        let cell = tunedb::amd_tuning_cell(spec);
+        Ok(Target {
+            // The gfx950 cell keeps its recorded label (MI355X silicon measured into the mi350x
+            // cell) rather than silently relabelling old provenance — the same rule
+            // `plowc tune ingest` applies. Every other cell takes its SKU from the fingerprint.
+            sku: if cell == GFX950_CELL {
+                "MI355X".into()
+            } else {
+                hw.sku.clone()
+            },
+            isa: hw.isa,
+            cell,
+        })
+    }
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -84,17 +129,22 @@ fn run() -> Result<(), Err> {
     match cmd {
         "ingest" => {
             let samples = opt("--samples").ok_or("ingest needs --samples <sweep.jsonl>")?;
+            let target = Target::resolve(&opt("--gpu").ok_or("ingest needs --gpu <name>")?)?;
             ingest(
                 &db,
+                &target,
                 &PathBuf::from(samples),
                 &opt("--campaign").unwrap_or_else(|| "gemv-row-inventory".into()),
                 flag("--provisional"),
             )
         }
-        "best" => best(&db),
+        "best" => best(
+            &db,
+            &Target::resolve(&opt("--gpu").ok_or("best needs --gpu <name>")?)?,
+        ),
         _ => {
-            eprintln!("usage: tunedb-gemv ingest --db <dir> --samples <sweep.jsonl>");
-            eprintln!("       tunedb-gemv best   --db <dir>");
+            eprintln!("usage: tunedb-gemv ingest --db <dir> --gpu <name> --samples <sweep.jsonl>");
+            eprintln!("       tunedb-gemv best   --db <dir> --gpu <name>");
             Err("no command".into())
         }
     }
@@ -104,10 +154,14 @@ fn run() -> Result<(), Err> {
 ///
 /// Probing is REQUIRED, not best-effort: a record filed under a guessed build would be
 /// selectable against an object nobody measured, which is worse than no record at all.
-fn digests(root: &std::path::Path) -> Result<Digests, Err> {
-    let inv = kernelcaps::dense_gemm_inventory(root, hwspec::IsaLevel::Gfx950).map_err(|e| {
+fn digests(root: &std::path::Path, isa: hwspec::IsaLevel) -> Result<Digests, Err> {
+    // The ISA comes from `--gpu` too. Probing gfx950 for a gfx942 campaign keys the records to
+    // the WRONG object's digest — `devgen` would then find them stale against the build it
+    // actually compiled, which reads as "re-measure" rather than "you probed another GPU".
+    let inv = kernelcaps::dense_gemm_inventory(root, isa).map_err(|e| {
         format!(
-            "cannot probe the gfx950 interpreter ({e}); ingest needs it to key records to a build"
+            "cannot probe the {} interpreter ({e}); ingest needs it to key records to a build",
+            isa.arch_flag()
         )
     })?;
     Ok(Digests {
@@ -125,9 +179,17 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn ingest(db: &PathBuf, samples: &PathBuf, campaign: &str, provisional: bool) -> Result<(), Err> {
+fn ingest(
+    db: &PathBuf,
+    target: &Target,
+    samples: &PathBuf,
+    campaign: &str,
+    provisional: bool,
+) -> Result<(), Err> {
+    let cell = target.cell.as_str();
     let text = std::fs::read_to_string(samples)?;
-    let want = digests(&repo_root())?;
+    let want = digests(&repo_root(), target.isa)?;
+    println!("cell        : {cell}");
     println!("build       : {}", want.interpreter);
     println!("toolchain   : {}", want.toolchain);
 
@@ -176,8 +238,8 @@ fn ingest(db: &PathBuf, samples: &PathBuf, campaign: &str, provisional: bool) ->
             // different rooflines. A shared profile would let `best_for` rank one against the
             // other at a coincidentally equal shape.
             profile: "decode_gemv".into(),
-            hardware: CELL.into(),
-            sku: "MI355X".into(),
+            hardware: cell.to_string(),
+            sku: target.sku.clone(),
             digests: want.clone(),
             stats,
             correctness,
@@ -202,7 +264,7 @@ fn ingest(db: &PathBuf, samples: &PathBuf, campaign: &str, provisional: bool) ->
         .into_iter()
         .partition(|r| !matches!(r.correctness, Correctness::Pass));
     if !bad.is_empty() {
-        let n = store.record_rejected(CELL, bad, "gemv row-coverage/dot check failed")?;
+        let n = store.record_rejected(cell, bad, "gemv row-coverage/dot check failed")?;
         println!(
             "rejected    : {n} record(s) failed the oracle: {}",
             failed.join(", ")
@@ -213,13 +275,13 @@ fn ingest(db: &PathBuf, samples: &PathBuf, campaign: &str, provisional: bool) ->
             "provisional : {} record(s) stored, NOT selectable",
             good.len()
         );
-        let n = store.record_rejected(CELL, good, "--provisional: screening pass only")?;
+        let n = store.record_rejected(cell, good, "--provisional: screening pass only")?;
         println!("stored      : {n}");
         return Ok(());
     }
-    let n = store.publish(CELL, good)?;
+    let n = store.publish(cell, good)?;
     println!(
-        "published   : {n} qualified record(s) into {}/{CELL}",
+        "published   : {n} qualified record(s) into {}/{cell}",
         db.display()
     );
     Ok(())
@@ -231,11 +293,12 @@ fn ingest(db: &PathBuf, samples: &PathBuf, campaign: &str, provisional: bool) ->
 /// the batch widens" is one row of a table and not one number — and the point at which it stops
 /// falling is the whole result (the design notes: aggregate tok/s peaks at
 /// B=8 and LOSES 30% at B=16).
-fn best(db: &PathBuf) -> Result<(), Err> {
+fn best(db: &PathBuf, target: &Target) -> Result<(), Err> {
+    let cell = target.cell.as_str();
     let store = TuneStore::new(db.clone());
-    let want = digests(&repo_root())?;
-    let (best, stale) = store.best_for(CELL, &want)?;
-    println!("cell        : {CELL}");
+    let want = digests(&repo_root(), target.isa)?;
+    let (best, stale) = store.best_for(cell, &want)?;
+    println!("cell        : {cell}");
     println!("build       : {}", want.interpreter);
     let mut rows: BTreeMap<(u32, u32, String), BTreeMap<u32, f64>> = BTreeMap::new();
     for (case, rec) in &best {

@@ -3,7 +3,7 @@
 px1_consolidate.py — build perf-data/px1-stage1.json from the raw
 inference-benchmarker reports in perf-data/harness/b2-ib/px1-{off,on}/results/.
 
-PX-1 stage 1: cross-request prefill
+PX-1 stage 1 (see the design notes): cross-request prefill
 batching at the GEMM level (naive per-request-serial attention), A/B'd against
 the serialized prefill on the SAME binary, SAME assets (12B ctx8k B=16 blob),
 SAME harness/profile as the B2 concurrency campaign.
@@ -70,7 +70,7 @@ def main():
     doc = {
         "campaign": "PX-1 stage 1 (GEMM-level cross-request prefill batching)",
         "date": "2026-07-21",
-        "plan": "the design notes PX-1, sequencing step 1",
+        "plan": "PX-1, sequencing step 1",
         "model": "/workspace/models/gemma-4-12B-it",
         "served_model_name": "gemma-4-12b-it",
         "tokenizer": "google/gemma-4-12B-it",

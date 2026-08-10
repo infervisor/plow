@@ -1,7 +1,6 @@
 # AITER / Tensile / CK / ThunderKittens — what transfers to plow, and what cannot
 
-Research note for the MI355X (gfx950 / CDNA4) window. Companion to
-the design notes. Written on a box with no AMD GPU, so every
+Research note for the MI355X (gfx950 / CDNA4) window. Written on a box with no AMD GPU, so every
 quantitative claim here is either quoted from a measurement already recorded in
 this repo (attributed) or derived from disassembly (reproducible with
 `scripts/asm_audit.py`). Nothing is estimated.
@@ -32,7 +31,7 @@ this repo (attributed) or derived from disassembly (reproducible with
 > 5–8% of peak. **The skinny/small-M deficit is a tile-inventory problem** (Tensile ships 336 macro
 > tiles; plow's selector has 3, and plow's own measured-best tile is not selectable).
 >
-> Full detail and the ranked candidate survey: the design notes.
+> Full detail and the ranked candidate survey are in the design notes.
 > Working driver with the decoded ABI documented inline: `runtime/ubench/gemm_tensile_ext.c`.
 
 ## 1. The structural fact: none of them can be linked in

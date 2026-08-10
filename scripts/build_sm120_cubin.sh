@@ -44,10 +44,14 @@ trap 'rm -rf "$BUILD_DIR"' EXIT
 
 FP8KV="${PLOW_BUILD_FP8KV:-0}"
 
+# PLOW_NVCC (the nix dev shell exports it) selects the toolchain, same knob as
+# build_sm90a_cubin.sh; an explicit -DPLOW_CUBIN_NVCC=... in "$@" still wins,
+# since later cmake -D flags override earlier ones.
 "$CMAKE" -S "$HERE/runtime" -B "$BUILD_DIR" \
     -DPLOW_SM120_CUBIN=ON \
     -DPLOW_SM120_CUBIN_FP8KV="$([ "$FP8KV" = 1 ] && echo ON || echo OFF)" \
     -DPLOW_CUBIN_DIR="$BUILD_DIR/cubin" \
+    -DPLOW_CUBIN_NVCC="${PLOW_NVCC:-/usr/local/cuda/bin/nvcc}" \
     -DPLOW_EXTRA_DEFINES="${PLOW_EXTRA_DEFINES:-}" \
     "$@" >/dev/null
 "$CMAKE" --build "$BUILD_DIR" --target sm120_cubins

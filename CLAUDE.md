@@ -1,72 +1,89 @@
-# plow
-
-## Plans & research
-
-- Implementation plans, design proposals, and research notes live in `plans/`.
-- This directory is **local-only** (gitignored) — it is a scratchpad for coding
-  agents and is not checked into version control.
-- Read the relevant file in `plans/` before starting work, and update it as
-  decisions change.
-
 # CLAUDE.md
 
-## 1. Think Before Coding
+## Context
 
-Don't assume. Don't hide confusion. Surface tradeoffs.
+* Plans/research live in `plans/` (gitignored).
+* Read relevant plan before work. Update only when decisions change.
 
-Before implementing:
+## Core Rules
 
-- State your assumptions explicitly. If uncertain, ask.
-- If multiple interpretations exist, present them.
-- If a simpler approach exists, say so.
-- If something is unclear, stop. Name what's confusing.
-- Always provide a high level design plan
+### Think First
 
-## 2. Simplicity First
+Before coding:
 
-Minimum code that solves the problem. Nothing speculative.
+* Check assumptions. Ask only when ambiguity blocks progress.
+* Choose simplest valid approach.
+* Note important tradeoffs only.
+* Give a brief design/plan before non-trivial changes.
+* Skip plan for trivial changes.
 
-- No features beyond what was asked.
-- No abstractions for single-use code.
-- No “flexibility” that wasn't requested.
-- If 200 lines could be 50, rewrite it.
+### Keep Changes Minimal
 
-## 3. Surgical Changes
+* Implement only requested behavior.
+* Touch only necessary files/code.
+* No speculative features.
+* No premature abstractions.
+* No unrelated refactors or cleanup.
+* Match existing patterns/style.
+* Mention unrelated issues; don't fix them.
 
-Touch only what you must. Clean up only your own mess.
+### Verify
 
-- Don't refactor things that aren't broken.
-- Match existing style, even if you'd do it differently.
-- If you notice dead code, mention it — don't delete it.
+* Define concrete success criteria.
+* Reproduce bugs when practical.
+* Run relevant tests/checks after changes.
+* Fix failures caused by your changes.
+* Don't repeatedly summarize completed work.
 
-## 4. Goal-Driven Execution
+## Code
 
-Define success criteria. Loop until verified.
+* Prefer small, direct implementations.
+* Reuse existing code/patterns when appropriate.
+* Prefer Rust types/invariants over runtime checks.
+* Check existing dependencies before adding crates.
+* Add crates only when justified.
+* Use `nix develop` for terminal/build tasks.
 
-Transform tasks into verifiable goals:
+### Comments
 
-- “Fix the bug” → “Reproduce it in a test, then fix”
-- “Refactor X” → “Ensure tests pass before and after”
+* Minimize comments.
+* Don't explain obvious code.
+* Don't narrate implementation.
+* Comment only non-obvious constraints, invariants, safety requirements, or reasoning.
+* Prefer clear names/types over comments.
+* Don't add doc comments unless useful or required by existing style.
 
+## Performance
 
-Rules:
-- Use very short sentences
-- Remove filler words (the, a, an, is, are, etc. where possible)
-- No politeness (no "sure", "happy to help")
-- No long explanations unless asked
-- Keep only meaningful words
-- Prefer symbols (→, =, vs)
-- Output dense, compact answers
+For `plowrt`:
 
+* Performance > abstraction/convenience.
+* Latency matters at microsecond scale.
+* Avoid unnecessary allocations, copies, syscalls, locking, and indirection.
+* Don't sacrifice performance for cleaner abstractions without reason.
+* Measure when performance impact is uncertain.
 
-## Development
+## Communication
 
-- check for relevant rust crates
-- for launching terminal tasks Use "nix develop"
-- use rust types 
-- focus on code reuse and consistency
+Default output must be compact.
 
-## runtime and kernels
+* Short sentences.
+* No filler or pleasantries.
+* No restating request.
+* No long explanations unless asked.
+* No play-by-play narration.
+* Don't explain obvious commands/code.
+* Prefer bullets over prose.
+* Prefer `→`, `=`, `vs` when clearer.
+* Report only decisions, important findings, blockers, changes, and verification.
+* Ask questions only when answer materially affects implementation.
 
-- for plowrt performance is more important
-- every microsecond is important
+### Final Response
+
+Use this format when applicable:
+
+* Changed: 1–3 bullets.
+* Verified: tests/checks run.
+* Notes: only blockers, risks, or required follow-up.
+
+Omit empty sections.

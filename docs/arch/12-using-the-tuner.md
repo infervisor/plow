@@ -231,14 +231,14 @@ Wrap the **run**, not the build. Compiling needs no GPU.
 
 ### A worked example
 
-`runtime/bench/interp_dispatch_floor_nv.cu` is the reference for a measurement
+`runtime/bench/dispatch/interp_dispatch_floor_nv.cu` is the reference for a measurement
 done properly — cooperative launch at the resident grid, the interpreter's real
 `ld.acquire.gpu`/`red.release.gpu` lowering, warm-up discarded, median plus
 percentiles reported, repeated until clean:
 
 ```console
 $ nvcc -arch=sm_90a -O3 -std=c++17 -w \
-    runtime/bench/interp_dispatch_floor_nv.cu -o floor_nv
+    runtime/bench/dispatch/interp_dispatch_floor_nv.cu -o floor_nv
 $ perf-data/harness/gpulease floor ./floor_nv 400
 ```
 

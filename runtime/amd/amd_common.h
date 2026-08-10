@@ -510,12 +510,57 @@ __device__ __forceinline__ float bf2f(bf16 b) {
     return f;
 }
 
+/* BRANCHED, and the branchless form is REFUTED ON HARDWARE. `PLOW_F2BF_SELECT=1` restores it.
+ *
+ * The NaN guard is an `if` with an early return, which on gfx942 lowers to an exec-mask
+ * save/restore around the rounding rather than to a select. Replacing it with a select looked
+ * unambiguously right on every static measure -- over a 64-conversion tile (`probes/f2bf.hip`)
+ * 1881 -> 838 instructions, 1098 -> 643 VALU, 151 -> 19 exec-mask ops, and on the real prefill
+ * megakernel -5.0% instructions, -13.3% SALU, -30% exec-mask, object 243104 -> 234680 B.
+ *
+ * SERVED, IT IS SLOWER, and not marginally (4 interleaved arms, 2 rounds each, GLM-5.2 TP8):
+ *
+ *   ctx     branchless   branched      delta
+ *   1024        325.6      323.1      +0.77%
+ *   4096        751.4      718.9      +4.51%
+ *   8192       1708.6     1622.2      +5.33%
+ *  16384       3783.6     3535.8      +7.01%
+ *   TPOT       26.485     26.271      +0.81%
+ *
+ * Ordering is ruled out as the cause: the branchless arm reproduces to within 0.1% whether it
+ * runs first or third (751.6/751.1 at 4k), so sequence position has no effect on this box.
+ *
+ * TWO THINGS THIS COSTS, AND BOTH ARE WORTH KEEPING WRITTEN DOWN:
+ *
+ * 1. Static instruction count is not time. -5% instructions bought +5% wall clock. The select
+ *    form computes BOTH the RNE and the quiet-NaN on every conversion where the branch computed
+ *    one, and f2bf sits on every store path in this file's list -- so the deleted exec-mask
+ *    overhead was cheaper than the arithmetic that replaced it. An exec-mask pair around a
+ *    rarely-taken branch is not obviously a cost on this hardware.
+ * 2. "Value-identical in isolation" does NOT imply "output-identical in situ". The branchless
+ *    form is value-identical over ALL 2^32 float bit patterns (`probes/f2bf_gate.c`, 0
+ *    mismatches, with a deliberately-wrong control the same gate catches 1.8 M times) -- and the
+ *    served arms still disagree on GSM8K, reproducibly, 0.960 vs 0.970 in BOTH rounds. Changing
+ *    a function this widely inlined perturbs surrounding codegen (scheduling, and at -O3 which
+ *    fp contractions form), so downstream f32 arithmetic is not guaranteed to round the same
+ *    way. An earlier version of this note claimed "logits byte-identical by construction"; that
+ *    was wrong, and the accuracy column is what caught it.
+ */
+#ifndef PLOW_F2BF_SELECT /* =1 restores the REFUTED branchless form, for a reproducible A/B */
+#define PLOW_F2BF_SELECT 0
+#endif
 __device__ __forceinline__ bf16 f2bf(float f) {
     unsigned u;
     __builtin_memcpy(&u, &f, 4);
+#if PLOW_F2BF_SELECT
+    const unsigned rne = (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+    const unsigned qnan = (u >> 16) | 0x0040u;
+    return (bf16)(((u & 0x7fffffffu) > 0x7f800000u) ? qnan : rne);
+#else
     if ((u & 0x7fffffffu) > 0x7f800000u) return (bf16)((u >> 16) | 0x0040u); /* qNaN */
     u += 0x7fffu + ((u >> 16) & 1u);                                          /* RNE */
     return (bf16)(u >> 16);
+#endif
 }
 
 /* 16 fp8 (a b128 load) -> two bf16v8, in fdot2-ready lane order. Each u32 word holds 4 fp8.

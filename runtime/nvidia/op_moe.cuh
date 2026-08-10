@@ -396,7 +396,7 @@ static __global__ void plow_moe_slot_glu_fp8_blk(bf16* __restrict__ fu, const bf
  *                               (B*k) x 11.9 MB to (#distinct experts) x 11.9 MB.
  *
  * B>1 therefore uses CHANNEL-MAJOR. This is a pure permutation of independent one-warp outputs,
- * so it changes no arithmetic — see the design notes B==1 keeps the legacy slot-major
+ * so it changes no arithmetic — see the design notes. B==1 keeps the legacy slot-major
  * order (S == k makes the two equivalent for locality, and it protects the B=1 TPOT gate).
  *
  * Chosen over an explicit expert SORT + register-level multi-row reuse (the gemv_rows<MM> form,

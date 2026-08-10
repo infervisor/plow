@@ -61,6 +61,14 @@ SRC="$HERE/runtime/nvidia/interp_sm90a.cu"
 # (e.g. a CUDA 13 cubin on a 570.x / CUDA 12.8 driver). Check `nvidia-smi`.
 NVCC="${PLOW_NVCC:-/usr/local/cuda/bin/nvcc}"
 CUDA_BIN="$(dirname "$NVCC")"
+# The clean environment every nvcc/cuobjdump call below runs under (see the
+# CPATH note above). PLOW_NVCC_PATH replaces the PATH when the toolchain does
+# not live in /usr (the nix sandbox has no /usr/bin — the host gcc must come
+# from the caller); NVCC_PREPEND_FLAGS/NVCC_APPEND_FLAGS pass through because
+# nix's nvcc receives its -ccbin that way, and `env -i` would strip it.
+NVENV=(env -i PATH="${PLOW_NVCC_PATH:-$CUDA_BIN:/usr/bin:/bin}")
+[ -n "${NVCC_PREPEND_FLAGS:-}" ] && NVENV+=(NVCC_PREPEND_FLAGS="$NVCC_PREPEND_FLAGS")
+[ -n "${NVCC_APPEND_FLAGS:-}" ] && NVENV+=(NVCC_APPEND_FLAGS="$NVCC_APPEND_FLAGS")
 KSYM=_Z12interp_sm90a11PlowProgram
 OUT_PF="${OUT%.cubin}_pf.cubin"
 KSYM_PF=_Z15interp_sm90a_pf11PlowProgram
@@ -171,13 +179,13 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
     # lean object — at the default 4 stages the claim alone (132160 B) pins occupancy to 1.
     FATLITE_GATE="-DPLOW_NV_FATLITE=1 -DPGM90_TMA_STAGES=3"
   fi
-  env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+  "${NVENV[@]}" \
     "$NVCC" -arch=sm_90a -O3 -cubin \
     -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
     -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 $FATLITE_GATE \
     -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
     -o "$OUT_PFSEG" "$SRC"
-  env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+  "${NVENV[@]}" \
     cuobjdump -symbols "$OUT_PFSEG" | grep -q "_pfseg" || { echo "FATAL: _pfseg symbol missing" >&2; exit 1; }
   echo "built $OUT_PFSEG ($(stat -c%s "$OUT_PFSEG") B)"
   # PLOW_BUILD_GEMM_ONLY=1 (T11): build the lean object PURE — every non-GEMM arm
@@ -223,14 +231,14 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
   if [ "${PLOW_BUILD_GEMM_WS384:-0}" = "1" ]; then
     GEMM_ONLY_GATE="-DPLOW_NV_GEMM_ONLY=1 -DPGM90_UNI_BN256=1 -DPLOW_NV_SEG_WS384=1"
   fi
-  env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+  "${NVENV[@]}" \
     "$NVCC" -arch=sm_90a -O3 -cubin \
     -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
     -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_SEG_GEMM=1 -DPGM90_TMA_STAGES=3 \
     -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 $GEMM_ONLY_GATE \
     -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
     -o "$OUT_PFGEMM" "$SRC"
-  env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+  "${NVENV[@]}" \
     cuobjdump -symbols "$OUT_PFGEMM" | grep -q "_pfgemm" || { echo "FATAL: _pfgemm symbol missing" >&2; exit 1; }
   echo "built $OUT_PFGEMM ($(stat -c%s "$OUT_PFGEMM") B)"
 
@@ -256,26 +264,26 @@ if [ "${PLOW_BUILD_SEG:-0}" = "1" ]; then
     if [ "${PLOW_BUILD_FA_ROPE:-0}" = "1" ]; then
       FA_WG="$FA_WG -DPLOW_NV_FA_ROPE=1"
     fi
-    env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+    "${NVENV[@]}" \
       "$NVCC" -arch=sm_90a -O3 -cubin \
       -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
       -DPLOW_NV_PREFILL=1 -DPLOW_NV_SEGMENTS=1 -DPLOW_NV_FA_ONLY=1 $FA_WG \
       -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 \
       -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
       -o "$OUT_PFFA" "$SRC"
-    env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+    "${NVENV[@]}" \
       cuobjdump -symbols "$OUT_PFFA" | grep -q "_pffa" || { echo "FATAL: _pffa symbol missing" >&2; exit 1; }
     echo "built $OUT_PFFA ($(stat -c%s "$OUT_PFFA") B)"
   fi
 fi
 
-env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+"${NVENV[@]}" \
   "$NVCC" -arch=sm_90a -O3 -cubin \
   -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
   -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_FA_GF_FULL=4 -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA \
   -o "$OUT" "$SRC"
 
-if ! env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+if ! "${NVENV[@]}" \
     cuobjdump -symbols "$OUT" | grep -q "$KSYM"; then
   echo "FATAL: $KSYM not found in $OUT — kernel name/signature changed;" >&2
   echo "       update exec::gpu's kernel-name constant (or set PLOW_NV_KERNEL)." >&2
@@ -283,13 +291,13 @@ if ! env -i PATH="$CUDA_BIN":/usr/bin:/bin \
 fi
 echo "built $OUT ($(stat -c%s "$OUT") B), kernel $KSYM present"
 
-env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+"${NVENV[@]}" \
   "$NVCC" -arch=sm_90a -O3 -cubin \
   -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
   -DPLOW_NV_PREFILL=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_EMBED_SMEM=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
   -o "$OUT_PF" "$SRC"
 
-if ! env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+if ! "${NVENV[@]}" \
     cuobjdump -symbols "$OUT_PF" | grep -q "$KSYM_PF"; then
   echo "FATAL: $KSYM_PF not found in $OUT_PF — prefill kernel name/signature" >&2
   echo "       changed; update exec::gpu's KERNEL_PF constant (or PLOW_NV_KERNEL_PF)." >&2
@@ -304,12 +312,12 @@ echo "built $OUT_PF ($(stat -c%s "$OUT_PF") B), kernel $KSYM_PF present"
 if [ "${PLOW_BUILD_FP8KV:-0}" = "1" ]; then
   OUT_KV="${OUT%.cubin}_fp8kv.cubin"
   OUT_PF_KV="${OUT%.cubin}_pf_fp8kv.cubin"
-  env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+  "${NVENV[@]}" \
     "$NVCC" -arch=sm_90a -O3 -cubin \
     -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
     -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_FA_GF_FULL=4 -DPLOW_NV_EMBED_SMEM=1 -DPLOW_FP8_KV=1 $GEMMA_GATE $GEMV_RB $EXTRA \
     -o "$OUT_KV" "$SRC"
-  env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+  "${NVENV[@]}" \
     cuobjdump -symbols "$OUT_KV" | grep -q "$KSYM" || { echo "FATAL: $KSYM missing in $OUT_KV" >&2; exit 1; }
   echo "built $OUT_KV ($(stat -c%s "$OUT_KV") B), kernel $KSYM present"
   # fp8 prefill dequants at the smem stage, so it needs the PIPE=0 synchronous-staging arm
@@ -327,13 +335,13 @@ if [ "${PLOW_BUILD_FP8KV:-0}" = "1" ]; then
   if [ "${PLOW_FP8_KV_FASTPF:-0}" = "1" ]; then
     FA_PIPE_KV="-DPLOW_NV_FA_PIPE=1"
   fi
-  env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+  "${NVENV[@]}" \
     "$NVCC" -arch=sm_90a -O3 -cubin \
     -I "$HERE/runtime/common" -I "$HERE/runtime/nvidia" \
     -DPLOW_NV_PREFILL=1 -DPLOW_NV_GEMMA=1 -DPLOW_NV_FA_GF=2 -DPLOW_NV_EMBED_SMEM=1 -DPLOW_FP8_KV=1 $GEMMA_GATE $GEMV_RB $EXTRA $PF_EXTRA \
     $FA_PIPE_KV \
     -o "$OUT_PF_KV" "$SRC"
-  env -i PATH="$CUDA_BIN":/usr/bin:/bin \
+  "${NVENV[@]}" \
     cuobjdump -symbols "$OUT_PF_KV" | grep -q "$KSYM_PF" || { echo "FATAL: $KSYM_PF missing in $OUT_PF_KV" >&2; exit 1; }
   echo "built $OUT_PF_KV ($(stat -c%s "$OUT_PF_KV") B), kernel $KSYM_PF present"
 fi

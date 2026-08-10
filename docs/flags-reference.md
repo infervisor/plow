@@ -163,7 +163,7 @@ shipped one.
   on dense Gemma it was a wash-to-loss (16.9 → 17.2 ms/token), which is why coarse
   is the default. Lean-safe (a fine list only lowers a threshold / narrows a wait
   set), and **unset = byte-identical** coarse. There is no all-to-all "everything
-  fine" mode —
+  fine" mode — see the design notes.
 - `PLOW_L2_PLACE=1` — **L2-domain packet grouping** (compiler half of physical-SM
   locality). *Was `PLOW_NV_PLACE`, still accepted as a deprecated alias: an L2
   domain is a GPC on NVIDIA and an XCD on AMD, and `hwspec` describes both, so the

@@ -172,7 +172,7 @@ emit-time `max_ctx` (135168 here), not of the prompt length at runtime, so `i[7]
 on every decode packet in both blobs and every cell in this document ran the GF=4 arm.
 
 The emitter's claim that GF=8 is 1.5-1.9x faster at ctx>=8192 is cited to
-the design notes — **sm120, i.e. NVIDIA**. It has never been realised on AMD.
+the design notes §7 — **sm120, i.e. NVIDIA**. It has never been realised on AMD.
 
 > **So the TPOT curve below is a GF=4 curve, and it is a FLOOR.** The flat degradation
 > (TP4: 29.38 -> 32.48 ms over 8x ctx; TP8: 1.50x over 32x) was achieved on the slower

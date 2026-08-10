@@ -231,7 +231,7 @@ agent does not re-derive it.
 5. **Q4 (counter granularity) was not run**, and the reason is Q1: `Builder::select_granularity`
    operates on devgen's emitted op stream, which egglog does not influence. A coarse-vs-fine A/B
    would have been a measurement of devgen, not of the rewrite axis, and duplicates work already
-   owned by other branches.
+   owned by other runs.
 
 ---
 
@@ -275,4 +275,4 @@ honesty:
 
 **None of this is where the 29.91 → 42.49 gap lives.** 81% of plow's wall is prefill and 98% of
 prefill's FLOPs are `linear`; the leverage is in the GEMM and attention kernels, which is what
-other branches are working on.
+other runs are working on.

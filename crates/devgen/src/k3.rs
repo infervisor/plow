@@ -241,7 +241,7 @@ fn fuse_mla_a(t: u32, hidden: u32) -> bool {
     if t != 1 {
         return false;
     }
-    crate::gemv_staged_rows(t) as u64 * hidden as u64 <= crate::GM_LDS_HALVES
+    crate::gemv_staged_rows(t) as u64 * hidden as u64 <= crate::gm_lds_halves()
 }
 
 /// May an [`DevOp::AttnRes`] absorb the RMSNorm that always follows it?
@@ -349,7 +349,7 @@ fn fuse_shared_glu(t: u32, hidden: u32) -> bool {
     if t != 1 {
         return false;
     }
-    crate::gemv_staged_rows(t) as u64 * hidden as u64 <= crate::GM_LDS_HALVES
+    crate::gemv_staged_rows(t) as u64 * hidden as u64 <= crate::gm_lds_halves()
 }
 
 /// May a `b=1` [`DevOp::RmsNorm`] be folded into the `b=256` [`DevOp::Gemv`] that reads it?
@@ -491,7 +491,8 @@ pub(crate) fn fuse_norm_gemv(t: u32, feat: u32, site: NormSite) -> bool {
     // device; this is the half that must not emit the opcode in the first place.
     // + GV_NORM_SCRATCH: the fold takes its cross-wave reduction scratch from the TOP of the
     // arena, because `plow_smem` is a union and the interpreter's `part` aliases the staged row.
-    crate::gemv_staged_rows(t) as u64 * feat as u64 + crate::GV_NORM_SCRATCH <= crate::GM_LDS_HALVES
+    crate::gemv_staged_rows(t) as u64 * feat as u64 + crate::GV_NORM_SCRATCH
+        <= crate::gm_lds_halves()
         && feat <= crate::RN_REG * crate::PLOW_THREADS
         && feat % 8 == 0
 }

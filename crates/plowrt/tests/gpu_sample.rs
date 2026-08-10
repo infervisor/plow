@@ -1,4 +1,4 @@
-//! Device sampler equivalence test (the design notes stage 4).
+//! Device sampler equivalence test.
 //!
 //! Builds `runtime/nvidia/sample_sm120.cu` with nvcc (like `cuda_gpu.rs` builds
 //! vadd), then validates `plow_sample` against a CPU reference that implements

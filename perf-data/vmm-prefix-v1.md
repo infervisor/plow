@@ -4,7 +4,7 @@ Campaign **V1-vmm-prefix**, 2026-07-20. NVIDIA RTX PRO 6000 Blackwell Server
 Edition (188 SMs, 95.0 GiB), driver 580.82.07, CUDA 13.0. plowrt
 `--features cuda`, release. Implementation: `crates/plowrt/src/memory/vmm.rs`
 (+ `device/cuda.rs` VMM driver surface, `exec/gpu.rs` KV binding), flag-gated
-`PLOW_VMM_PREFIX=1`, default **off**. Design + measured feasibility review:
+`PLOW_VMM_PREFIX=1`, default **off**. Design + measured feasibility review in
 the design notes.
 
 ## What is measured

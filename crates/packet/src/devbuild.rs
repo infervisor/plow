@@ -284,7 +284,7 @@ pub struct Builder {
     /// (a cluster/XCC_ID cursor per domain) can pull only its domain's packets.
     /// The `cus` sets are NOT touched — placement is dynamic (cursor-claimed) at
     /// runtime, so it cannot regress disjoint `Builder::split` placements.
-    ///
+    /// See the design notes.
     place_l2: Option<L2Layout>,
     /// The target cannot honour `PLOW_UNISEG` — set by an emitter that knows what it is building
     /// for. See [`Builder::deny_uniseg`].
@@ -860,7 +860,7 @@ impl Builder {
     /// precedes every slice of B in every CU's stream. A fine list can only lower a threshold
     /// or narrow a wait set, never make a workgroup wait on something issued later in its own
     /// in-order stream — which is exactly the deadlock that
-    /// the design notes documents. **Do not reorder streams** without
+    /// the design notes document. **Do not reorder streams** without
     /// reading that file.
     pub fn finish(mut self) -> Program {
         let n_cu = self.n_cu as usize;
@@ -1102,7 +1102,7 @@ impl Builder {
         // other op wants 8 waves (2 waves/SIMD latency hiding). Occupancy is a launch-time property,
         // so the host relaunches once per maximal same-class run of ops in this (topological) emit
         // order, with that run's wave count. A segment is that run; `seg_of[i]` is op i's segment.
-        // The host reads the class back from the ops themselves. See the design notes
+        // The host reads the class back from the ops themselves. See the design notes.
         // PLOW_UNISEG=1 collapses every op into ONE segment. The wave-class split exists so an AMD
         // host can relaunch FlashPrefill at a 4-wave occupancy; the sm_120 persistent interpreter
         // runs EVERY op at a fixed 256-thread (8-warp) block and synchronises the whole program in
@@ -1112,6 +1112,14 @@ impl Builder {
         // not be given one because a variable said so. See that method for the failure it prevents.
         let uniseg = !self.uniseg_denied
             && (self.uniseg_forced || std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1"));
+        // PLOW_MLA_PF_V2=1 splits FlashMlaPrefill (bf16, op 51) into its own wave-class-4
+        // segments so the AMD host can route them to the 4-wave flash object's V2 kernel
+        // (d_flash_mla_prefill_v2). Emit-time, because segments only form on wave_class
+        // BOUNDARIES: reclassifying host-side would drag whatever ops share the segment onto
+        // an object that silently skips them. Unset = byte-identical blobs. The host applies
+        // its own purity + size guards (exec/amd.rs derive_segments), so an env mismatch in
+        // either direction degrades to the 8-wave kernel rather than corrupting.
+        let mla_v2 = !uniseg && std::env::var("PLOW_MLA_PF_V2").ok().as_deref() == Some("1");
         // PLOW_SEG_PURE_GEMM=1 (T11): class-8 segments carry ONLY GEMM-family ops; every light
         // op (norms, rope, quant, embed, softcap) joins the flash class. The point: the sm_90a
         // segmented launcher runs class-8 segments on the lean `_pfgemm` object, and a pure-GEMM
@@ -1169,6 +1177,8 @@ impl Builder {
                 } else {
                     4
                 }
+            } else if mla_v2 && op == DevOp::FlashMlaPrefill as u16 {
+                4
             } else if seg_v2
                 && pure_gemm // pure_gemm implies a prefill program — decode stays unsegmented
                 && fa512_mode == 2
@@ -1805,7 +1815,7 @@ pub struct Program {
     /// L2 domains `gq_seg_ofs` is windowed by. `0` ⇒ not placed (`seg` is
     /// wave-class). When non-zero, `gq_stream`'s `seg` is a domain and the blob
     /// header carries [`PLOW_BLOB_F_L2DOM`]; a runtime without physical-SM
-    /// domain dispatch must refuse it.
+    /// domain dispatch must refuse it. See the design notes.
     pub l2_sms: u32,
     pub l2_domains: u32,
 }
@@ -1840,6 +1850,34 @@ pub fn is_blob_magic(m: &[u8; 8]) -> bool {
 }
 pub const NAME_LEN: usize = 80;
 pub const INIT_NONE: u64 = u64::MAX;
+
+// --- decode batch ladder -----------------------------------------------------
+
+/// Widest decode rung any emit may declare. Two independent ceilings sit under it:
+/// the MoE decode router's per-CTA `inv[]` scratch (`PLOW_MOE_MAXB`, 32) and the
+/// decode GEMV's compile-time row bucket (`PLOW_GEMV_MAXM`, 16 — enforced against
+/// the code OBJECT by the runtime, not here, because it is an object property).
+pub const DECODE_RUNG_MAX: u32 = 32;
+
+/// Index of the FIRST decode program in `prog_t`, i.e. the start of the decode
+/// rung ladder. Everything before it is a prefill bucket.
+///
+/// THE RULE, and why it needs no new blob field. Programs are emitted
+/// prefill-buckets-ascending then decode-rungs-ascending, and the two ranges are
+/// disjoint by construction: a decode rung is at most [`DECODE_RUNG_MAX`] rows and a
+/// prefill bucket is a chunk width (128 and up — `emit_decode_ladder_rungs_are_below_every_prefill_bucket`
+/// asserts the separation at emit, so a blob that would confuse this cannot be written).
+/// So the ladder is the maximal trailing run of programs whose `t` is `<= DECODE_RUNG_MAX`.
+///
+/// A blob with ONE decode program lands on `prog_t.len() - 1`, which is the
+/// `progs.len() - 1` every caller used before the ladder existed.
+pub fn decode_rung_lo(prog_t: &[u32]) -> usize {
+    let mut lo = prog_t.len().saturating_sub(1);
+    while lo > 0 && prog_t[lo - 1] <= DECODE_RUNG_MAX && prog_t[lo - 1] < prog_t[lo] {
+        lo -= 1;
+    }
+    lo
+}
 
 // --- v6 section directory ----------------------------------------------------
 
@@ -1917,7 +1955,7 @@ pub const PLOW_BLOB_F_GQ: u32 = 1;
 /// physical-SM domain dispatch (`PLOW_L2_PLACE_DISPATCH`) must REFUSE such a blob —
 /// its wave-class segmentation would mis-dispatch `seg`. `reserved[1]` carries SMs
 /// per partition, `reserved[2]` the domain count, so the interp need not be told
-/// via a build define.
+/// via a build define. See the design notes.
 pub const PLOW_BLOB_F_L2DOM: u32 = 2;
 
 /// Stable 32-bit fingerprint of a target GPU spec name (e.g. `"H100 SXM5"`), stamped into
@@ -2346,7 +2384,7 @@ impl Builder {
 /// domain's packets on workgroups the hardware runs somewhere else — so nothing downstream can
 /// catch it and it has to be pinned here.
 /// Why locality-aware placement has nothing to win on these programs, as a test rather than a
-/// paragraph.
+/// paragraph. See the design notes.
 #[cfg(test)]
 mod locality_census_tests {
     use super::*;
@@ -3137,5 +3175,27 @@ mod v6_tests {
         let v5_gq_end = v5.len(); // v5 ends after GQ01
                                   // In v6, sections appear after the GQ01 appendix, then the directory
         assert!(blob.len() > v5_gq_end, "v6 is larger due to sections");
+    }
+
+    /// The DECODE BATCH LADDER is separated from the prefill bucket ladder by WIDTH alone
+    /// (`decode_rung_lo`), so the separation is worth pinning: a misclassification hands a
+    /// prefill bucket to a decode dispatch, which is a wrong answer and not a crash.
+    #[test]
+    fn decode_rung_lo_separates_the_two_ladders() {
+        // No ladder: prefill buckets then ONE decode program. This is every blob emitted
+        // before the ladder existed, and it must land on `len - 1`.
+        assert_eq!(decode_rung_lo(&[128, 512, 1024, 1]), 3);
+        assert_eq!(decode_rung_lo(&[128, 512, 1024, 16]), 3);
+        // Decode-only (GLM-5.2 shape).
+        assert_eq!(decode_rung_lo(&[1]), 0);
+        // A full ladder behind a bucket ladder.
+        assert_eq!(decode_rung_lo(&[128, 512, 1024, 1, 2, 4, 8, 16]), 3);
+        // A ladder with no prefill at all.
+        assert_eq!(decode_rung_lo(&[1, 2, 4, 8, 16]), 0);
+        // Non-power-of-two rungs are just as separable — the rule is width, not shape.
+        assert_eq!(decode_rung_lo(&[128, 1024, 1, 3, 6, 12]), 2);
+        // The widest rung IS the last program: a descending tail is not a ladder, and the
+        // scan must not walk into it.
+        assert_eq!(decode_rung_lo(&[128, 16, 8]), 2);
     }
 }

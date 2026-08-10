@@ -24,7 +24,7 @@ pub mod registry;
 pub mod spec;
 pub mod units;
 
-pub use isa::{CalibrationTier, HardwareFingerprint, IsaCaps, IsaLevel};
+pub use isa::{ArchGeometry, CalibrationTier, GemmTile, HardwareFingerprint, IsaCaps, IsaLevel};
 pub use spec::{
     Arch, ChipletGrouping, DsmDomainKind, DsmGrouping, GpuSpec, Interconnect, InterconnectKind,
     L2Partitioning, MatrixThroughput, MemKind, MemorySpec, MmaDtype, SmSpec, Vendor,

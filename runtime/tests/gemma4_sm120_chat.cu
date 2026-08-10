@@ -1278,7 +1278,7 @@ int main(int argc, char** argv) {
     }
     free(dt);
 
-    /* ---- PLOW_DUMP_KV: raw KV-ring dump for the P10 kv-zip audit (the design notes KV-0) --
+    /* ---- PLOW_DUMP_KV: raw KV-ring dump for the P10 kv-zip audit (KV-0) --
      * Dumps every kv.* cache tensor VERBATIM (head-major ring bytes exactly as d_headnorm_rope
      * wrote them) plus a manifest carrying the final ctx, so the offline audit can slice valid
      * rows. Tensors are dumped WHOLE rather than [0..ctx): ring geometry (kvh/ring/hd) is

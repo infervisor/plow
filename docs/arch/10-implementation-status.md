@@ -19,7 +19,7 @@
 
 ## Workspace Overview
 
-**Build system:** Cargo workspace, 10 member crates  
+**Build system:** Cargo workspace, 13 member crates (`nn-graph`, `hwspec`, `kernelcaps`, `tunedb`, `costmodel`, `devgen`, `rewrite`, `schedule`, `packet`, `plowc`, `lean_verify`, `plow-asset`, `plowrt`)  
 **Language:** Rust (compiler/host), C/CUDA/HIP (device runtime)  
 **Formal verification:** Lean 4 (optional, feature-gated)  
 **CI target:** `cargo test --workspace` + CMake for runtime
@@ -28,14 +28,17 @@
 
 ## Crate-by-Crate Status
 
-### `crates/frontend/` — Model Hub Layer
+### `crates/nn-graph/` — Frontend / Model Graph IR
+
+The former `frontend` crate is folded into `nn-graph`: model resolution lives
+behind its `hub` feature and architecture builders behind its `models` feature.
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| HuggingFace config fetch | ✅ | Via `hf-hub` with pure-Rust TLS |
-| nn-graph integration | ✅ | Git dep from github.com/infervisor/nn-graph |
-| Model architectures | ✅ | Gemma 2/3/4, Llama 2/3, Qwen 2/2.5, DeepSeek v2/v3 |
-| Shape bucket specialization | ✅ | Per-bucket graph construction |
+| HuggingFace config fetch | ✅ | `nn_graph::hub::build_from_pretrained` via `hf-hub` with pure-Rust TLS |
+| Symbolic graph IR | ✅ | `nn_graph::Graph`: build, symbolic shape inference, bind B/S/L |
+| Model architectures | ✅ | `nn_graph::models`: Gemma 2/3/4, Llama 2/3, Qwen 2/2.5, DeepSeek v2/v3 |
+| Shape bucket specialization | ✅ | `nn_graph::models::ShapeBucket` + `Bindings` |
 
 ### `crates/rewrite/` — Egglog Rewriting
 
@@ -71,6 +74,30 @@
 | SoC partitioning | ✅ | `partition_n` proportional to throughput |
 | SRAM page model | ✅ | `sram.rs` with optile integration |
 
+### `crates/kernelcaps/` — Kernel Capability Registry
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| `KernelSpec` + capability filtering | ✅ | What a built interpreter object can actually execute |
+| Alias detection (`alias_groups`) | ✅ | Reports opcodes that share one body (NVIDIA GEMM/MED/SMALL) |
+| Resource gates (`resource`) | 🔧 | Parses both vendors' register/spill reports; NVIDIA build not yet wired to fail |
+| Inventory probe from built object | 🔧 | Derives inventory from a built object; gfx950 awaits a ROCm probe run |
+| `select_kernel` | 🔧 | `gemma4::pick_tile` routes through it; other model pickers not yet migrated |
+
+### `crates/tunedb/` — Calibrated Measurement Store
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Normalized store + states | ✅ | Records keyed below serving-level (GPU/shape/tile/kernel) |
+| Atomic qualified publication | ✅ | Negative/stale records retained for provenance, not selected |
+| `NetworkBlockDefinition` → manifest | 🔲 | Block-driven tune manifest is open work |
+
+### `crates/devgen/` — Legacy Device-Blob Emitter
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| `gemma4` HF checkpoint → device packet program | 🔧 | **Deprecated**; superseded by `plowc --hf-dir`. Built only with `--features legacy-gemma-bins`, slated for removal |
+
 ### `crates/hwspec/` — Hardware Registry
 
 | Component | Status | Notes |
@@ -79,7 +106,7 @@
 | NVIDIA B200 (Blackwell datacenter) | ✅ | SM **10.0**, TMEM/`tcgen05`. The previous "SM 12.0" here was wrong |
 | NVIDIA RTX 5090 / 6000 Pro (Blackwell consumer) | ✅ | SM 12.0, `mma.sync`, **no** TMEM, **no** `wgmma` |
 | NVIDIA RTX 6000 Ada | ✅ | SM 8.9 |
-| ISA level vs `Arch` | 🔧 | `Arch::Blackwell` conflates SM100 and SM120; `hwspec::IsaLevel` separates them. `costmodel/tile.rs:59` still branches on `Arch` |
+| ISA level vs `Arch` | 🔧 | `costmodel::Arch::Blackwell` conflates SM100 and SM120; `hwspec::IsaLevel` (in `hwspec::isa`) separates them. `costmodel` still branches on `Arch` (`tile.rs`, `mma.rs`, `lib.rs`) |
 | AMD MI300X | ✅ | gfx942, 304 CUs, 192GB HBM3 |
 | AMD MI350X | ✅ | gfx950 |
 | Arch-specific MMA specs | ✅ | Per-instruction throughput/latency |
@@ -175,9 +202,9 @@
 | **NVIDIA kernels** | | |
 | Generic GEMM/Flash/Row/DMA/Layout sources | 🔧 | Reference and fused families exist; performant registration is not uniform by architecture |
 | SM120 specialized Gemma dense/MoE decode+prefill | ✅ | Strong GPU/model benchmark evidence for explicit campaign cells |
-| SM120 MLA/DSA decode | 🔧 | Dispatch arms exist: `FLASH_MLA_DECODE` (`interp_sm120.cu:993`), `MLA_MERGE_FOLD` (`:1021`), `INDEX_SCORE` (`:1032`), `INDEX_SELECT`, `FLASH_GATHER_DECODE`. Not GPU-qualified here |
+| SM120 MLA/DSA decode | 🔧 | Dispatch arms exist in `runtime/nvidia/interp_sm120.cu`: `FLASH_MLA_DECODE`, `MLA_MERGE_FOLD`, `INDEX_SCORE`, `INDEX_SELECT`, `FLASH_GATHER_DECODE`. Not GPU-qualified here |
 | SM120 MLA/DSA prefill | 🔲 | `FLASH_MLA_PREFILL=51` and `FLASH_GATHER_PREFILL=55` are declared in both ABIs with **no dispatch arm on any backend** |
-| SM120 Mamba | 🔧 | `MAMBA2_SCAN=90` is in both ABIs and dispatches at `interp_sm120.cu:1199`. No model-level validation |
+| SM120 Mamba | 🔧 | `MAMBA2_SCAN=90` is in both ABIs and dispatches in `runtime/nvidia/interp_sm120.cu` (case `PLOW_DOP_MAMBA2_SCAN`). No model-level validation |
 | Hopper/Blackwell generic registrations | 🔧 | Registration sources explicitly leave some performant variants unregistered |
 | **AMD kernels** | | |
 | GEMM/Flash/Row + HSA/device interpreter | 🔧 | Core and specialized gfx paths exist; coverage is op/model/shape specific |
@@ -274,9 +301,9 @@ than by discipline — previously no test compared a single opcode value.
 
 | interpreter | dispatch switch | opcodes with an arm |
 |---|---|---|
-| sm120 | `runtime/nvidia/interp_sm120.cu:482` | 63 / 84 |
+| sm120 | dispatch `switch (in->op)` in `runtime/nvidia/interp_sm120.cu` | 63 / 84 |
 | sm90a | shares the sm120 source | inherits, gated by `PLOW_NV_HOPPER` |
-| gfx950 | `runtime/amd/interp.hip:437` | 51 / 84 |
+| gfx950 | dispatch `switch (in->op)` in `runtime/amd/interp.hip` | 51 / 84 |
 
 Declared with **no dispatch arm on any backend**: `GEMM_NORM=9`,
 `XREDUCESCATTER=25`, `XALLGATHER=26`, `FLASH_MLA_PREFILL=51`,
@@ -288,18 +315,19 @@ capability registry probes built artifacts instead:
 - `interp_sm90a.cu` is a 42-line wrapper that `#include`s `interp_sm120.cu`
   with `PLOW_NV_HOPPER=1`. Hopper shares the dispatch table and gates
   internally, so a grep of that file finds zero opcodes.
-- CMake builds **eight distinct interpreter objects from that one translation
-  unit** (`runtime/CMakeLists.txt:127-320`), differing only in `-D` flags. Real
+- CMake builds **multiple distinct interpreter objects from that one translation
+  unit** (`runtime/CMakeLists.txt`: `plow_interp_sm120`, `plow_interp_sm90a`,
+  `plow_interp_sm120_gemma`, and variants), differing only in `-D` flags. Real
   capability is a property of an object, not of the source.
 
 ### Aliased opcodes
 
 On NVIDIA, `GEMM`, `GEMM_MED`, and `GEMM_SMALL` all fall through to a single
-`d_gemm` body — `interp_sm120.cu:524`, comment: *"one body, three tile
-opcodes"*. The tile is a compile-time macro per object, so the tuning axis on
-NVIDIA is which object is built, not which opcode is emitted. AMD dispatches the
-same three opcodes to three genuinely distinct instantiations
-(`interp.hip:555`), because a runtime tile switch would pull all three into the
+`d_gemm` body in `runtime/nvidia/interp_sm120.cu`, comment: *"one body, three
+tile opcodes"*. The tile is a compile-time macro per object, so the tuning axis
+on NVIDIA is which object is built, not which opcode is emitted. AMD dispatches
+the same three opcodes to three genuinely distinct instantiations
+(`runtime/amd/interp.hip`), because a runtime tile switch would pull all three into the
 interpreter's worst-case register allocation and fail the dispatch outright.
 
 `kernelcaps::Inventory::alias_groups` reports this, so a campaign cannot rank
@@ -315,10 +343,10 @@ scripts:
 | `interp_sm90a` (decode) | 208 | 0 | "150 regs" |
 | `interp_sm90a_pf` (prefill) | 255 | 180 B store / 644 B load | "236 regs", zero spill required |
 
-`interp_sm120.cu:21` states the gate as *"must show 0 bytes spill and >= 1
-block/SM"*, but no script or CMake target runs it — unlike AMD, which parses
+The `runtime/nvidia/interp_sm120.cu` header states the gate as *"must show 0
+bytes spill and >= 1 block/SM"*, but no script or CMake target runs it — unlike AMD, which parses
 `-Rpass-analysis=kernel-resource-usage` and **fails the build** past the
-register cliff (`scripts/build_gfx950.sh:118`). The prefill object currently
+register cliff (`scripts/build_gfx950.sh`). The prefill object currently
 violates its own documented gate. `kernelcaps::resource` parses both vendors'
 reports and applies the gate; wiring it into the NVIDIA build is open work.
 
@@ -330,7 +358,7 @@ These items are described in the design documents but have no corresponding impl
 |----------------|-----|----------|
 | Kernel tuning architecture | `crates/kernelcaps` lands `KernelSpec`, capability filtering, alias detection, resource gates, and a probe that derives the inventory from a built object. gfx950 awaits a probe run on ROCm | 🔧 Highest |
 | Block-driven tuning | `crates/tunedb` lands the normalized store, states, and atomic publication. `NetworkBlockDefinition` → manifest is open | 🔧 Highest |
-| Compiler selection | `gemma4::pick_tile` now goes through `kernelcaps::select_kernel` (differential-verified over 5760 shapes). `llama3.rs:78` still has its own picker | 🔧 Highest |
+| Compiler selection | `gemma4::pick_tile` (in `devgen`) now goes through `kernelcaps::select_kernel` (differential-verified over 5760 shapes). The `llama3` binary (`crates/plowc/src/bin/llama3.rs`) still has its own `pick_tile` | 🔧 Highest |
 | Interpreter readiness | Resource-compatible dense/MoE/latent/Mamba profiles and complete-object gates | High |
 | Extended ops | SM120 MLA/DSA completion, MLA prefill, then Mamba state/scan support | High |
 | §7.4 Wavefront clustering | Counter tree for >200 tiles/boundary | Low (not needed for current models) |
@@ -353,20 +381,31 @@ These items are described in the design documents but have no corresponding impl
 ```toml
 [workspace]
 members = [
-    "crates/costmodel",
-    "crates/frontend",
+    "crates/nn-graph",
     "crates/hwspec",
-    "crates/packet",
-    "crates/plow-asset",
-    "crates/plowc",
-    "crates/plowrt",
+    "crates/kernelcaps",
+    "crates/tunedb",
+    "crates/costmodel",
+    "crates/devgen",
     "crates/rewrite",
     "crates/schedule",
+    "crates/packet",
+    "crates/plowc",
+    "crates/lean_verify",
+    "crates/plow-asset",
+    "crates/plowrt",
+    "tools/bench",
 ]
 
+# Tuned for plowrt, the latency-critical artifact: fat LTO across a single
+# codegen unit inlines the packet-decode → dispatch → counter path, and
+# `panic = "abort"` drops unwind tables from it.
 [profile.release]
+opt-level = 3
 lto = "fat"
 codegen-units = 1
+panic = "abort"
+strip = "symbols"
 ```
 
 ### Feature Gates

@@ -13,6 +13,7 @@ import Plow.Basic
 import Plow.Protocol
 import Plow.Memory
 import Plow.Sram
+import Plow.LdsFit
 import Plow.Wire
 import Plow.TilePartition
 
@@ -258,6 +259,49 @@ def parseSramFit (payload : Json) : Except String SramFitPayload := do
     | _ => throw "handoffs: expected array"
     : Except String (List Sram.Handoff))
   return { budget := budget, handoffs := hos }
+
+/-! ## Checkpoint G — staged-LDS fit payload. -/
+
+structure LdsFitPayload where
+  arena : Nat
+  ops   : List LdsFit.StagedOp
+
+/-- Strict-read one `StagedOp` from JSON. -/
+def parseStagedOp (j : Json) : Except String LdsFit.StagedOp := do
+  let getNatF (k : String) : Except String Nat :=
+    match j.getObjVal? k with
+    | .error _ => throw s!"staged op: missing {k}"
+    | .ok v => match v.getNat? with
+      | .ok n => pure n
+      | _ => throw s!"staged op {k}: expected Nat"
+  let opName ← (match j.getObjVal? "op" with
+    | .error _ => throw "staged op: missing op"
+    | .ok v => match v.getStr? with
+      | .ok s => pure s
+      | _ => throw "staged op op: expected String"
+    : Except String String)
+  let idx ← getNatF "idx"
+  let rows ← getNatF "rows"
+  let k ← getNatF "k"
+  let scratch ← getNatF "scratch"
+  return { op := opName, idx := idx, rows := rows, k := k, scratch := scratch }
+
+/-- Parse the full G-checkpoint payload:
+    `{ "arena": Nat, "ops": [ {op, idx, rows, k, scratch}, ... ] }`. -/
+def parseLdsFit (payload : Json) : Except String LdsFitPayload := do
+  let arena ← match payload.getObjVal? "arena" with
+    | .error _ => throw "missing arena"
+    | .ok v => match v.getNat? with
+      | .ok n => pure n
+      | _ => throw "arena: expected Nat"
+  let opsJson := (payload.getObjVal? "ops").toOption.getD (Json.arr #[])
+  let ops ← (match opsJson with
+    | .arr arr => do
+      let out ← arr.mapM parseStagedOp
+      pure out.toList
+    | _ => throw "ops: expected array"
+    : Except String (List LdsFit.StagedOp))
+  return { arena := arena, ops := ops }
 
 /-! ## Checkpoint E — wire-format round-trip payload. -/
 

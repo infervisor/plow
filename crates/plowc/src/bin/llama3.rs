@@ -235,8 +235,18 @@ fn declare(b: &mut Builder, c: &Cfg, ctx: u32, ns_pre: u32) -> Tn {
     t
 }
 
-/// LDS the GEMM arena holds, in halves.
-const GM_LDS_HALVES: u64 = 2 * (256 + 256) * (64 + 8);
+/// LDS the DECODE object's GEMM arena holds, in halves — the bound the fused-GLU GEMV gate owes.
+///
+/// This binary emits for gfx950 only (`pick_tile` delegates to the gfx950 ladder), so it names
+/// that level rather than deriving one. It READS the arena out of `hwspec`'s per-arch table
+/// instead of restating `2*(256+256)*72`: that literal is the copy which was the CDNA4 value on
+/// every part inside `devgen`, where it silently corrupted every batched gfx942 decode.
+fn gm_lds_halves() -> u64 {
+    hwspec::IsaLevel::Gfx950
+        .geometry()
+        .expect("gfx950 geometry")
+        .decode_arena_halves()
+}
 
 const Q_TILE_ROWS: u32 = 8 * 32; // PLOW_WAVES * FA_BQ
 
@@ -458,7 +468,7 @@ fn emit_phase(b: &mut Builder, c: &Cfg, n: &Tn, t: u32, ctx: u32, decode: bool, 
         let (mlp_src, mlp_g) = (n.hn, TENSOR_NONE);
 
         // SwiGLU fusion (decode: GemvGlu, prefill: GemmGlu when the tile is 256x256).
-        let glu_fused = decode && (t as u64 * c.hidden as u64) <= GM_LDS_HALVES;
+        let glu_fused = decode && (t as u64 * c.hidden as u64) <= gm_lds_halves();
         let gemm_glu = !decode && pick_tile(t, c.inter, c.hidden, n_cu) == DevOp::Gemm;
         let c_d = if glu_fused {
             let c_gl = b.emit(DevOp::GemvGlu, all.clone(), &[c_pn], |d| {

@@ -1,5 +1,44 @@
 # plow on MI300X (gfx942) — first baseline
 
+> **Scope:** 8x MI300X (gfx942, CDNA3, 304 CU, 8 XCDs, 64 KiB LDS, ROCm 7.2.4) · **CDNA3-SPECIFIC** — every plow/vLLM ratio here is this box. MI355X has 256 CU and 2x the bf16 MFMA rate per CU, so the absolute numbers and the ratios both move.
+
+## Reading the `Scope:` line
+
+Every file in this directory opens with one. It exists because the directory NAME was carrying the
+arch claim for the whole corpus, and findings were inheriting it silently — an audit on 2026-08-09
+found 30 of 38 files named their hardware but only **2 of 38** said whether a result was
+CDNA3-specific or general, and 24 never mentioned gfx950 at all. That gap has already cost real
+work: `docs/amd/aiter-tensile-notes.md` is explicitly an **MI355X (gfx950 / CDNA4)** note and
+`runtime/amd/op_gemm.h:29` says outright "MEASURED CEILINGS ON THIS MACHINE (gfx950, 8x MI350X)" —
+both were cited in a gfx942 task ranking before anyone noticed the arch mismatch. The GEMM tile
+table there cannot even be evaluated here: 256x256 needs 147,456 B of LDS against this box's
+64 KiB cap.
+
+| class | means | carrying it to gfx950 |
+|---|---|---|
+| **CDNA3-SPECIFIC** | the result depends on an MI300X/CDNA3 constant — MFMA rate, 64 KiB LDS, 304 CU, 8 XCDs, or an instruction that exists (or does not) here | **re-measure.** The number is wrong and the ranking may be |
+| **CDNA3-CRITICAL** | stronger: the CONCLUSION inverts on CDNA4, usually via fp8 MFMA running at bf16 rate here and 2x bf16 there | **re-derive.** The argument, not just the number |
+| **AMD-GENERAL** | mechanism holds across CDNA3/CDNA4 (wave64, weight-bandwidth-bound decode, atomic accumulation); constants differ | direction carries, magnitude does not |
+| **PLOW-ARCHITECTURAL** | a property of the persistent-kernel execution model — packets, gates, placement, chunk policy, emit structure. Several have replicated across three architectures | carries, including to NVIDIA |
+| **MODEL-PROPERTY** | a property of GLM-5.2's weights, routing or DSA selections. No GPU involved | carries everywhere |
+| **METHOD** | instrument and gate design | carries everywhere |
+| **EXTERNAL** | about another stack (vLLM, aiter), not about plow | re-check against that stack's build |
+
+The classes are about the **argument**, not the file: a CDNA3-SPECIFIC file can still contain an
+arch-independent lemma, and the Scope line says so where that is true.
+
+> **Start here.** This directory was consolidated on 2026-08-09 from 71 reports to 36.
+>
+> | file | what it is |
+> |---|---|
+> | [`glm52-experiments.md`](glm52-experiments.md) | **The ledger.** Every experiment, its verdict, and why — LANDED, CLOSED BY MEASUREMENT, and OPEN. Read the CLOSED table before proposing work. |
+> | [`LESSONS.md`](LESSONS.md) | **The method lessons.** Ten ways this campaign produced confident wrong answers, and the discipline that now prevents each. Worth reading even if you never touch gfx942. |
+> | `docs/arch/13`, `docs/arch/14` | The architecture the campaign produced — chunking policy, and why the AMD kernels are one tree. |
+>
+> The remaining files are the detailed records the ledger cites. Thirty-five single-experiment
+> reports were consolidated into the ledger and removed; their verdicts and lessons are preserved
+> there, and nothing that a source comment points at was deleted.
+
 The first plow inference numbers on CDNA3. Produced by `scripts/bench_plow_rocm.sh`,
 which is a deliberate mirror of `scripts/bench_vllm_rocm.sh`: the same
 `vllm bench serve` client, the same regex parse, the same phases and the same CSV
@@ -40,6 +79,17 @@ attention reads a KV cache that was never computed. Use the serve path
 (`plowrt serve` + a real prompt) as the gate; it answers 'Paris' on the current
 build. Several "token-identical" claims made earlier in this directory's history
 rest on that meaningless signal and are corrected in `gemv-mlp-and-tensile.md`.
+
+AND A SECOND, INDEPENDENT `amd-bench` TRAP: **never price a SHARDING change on an
+unbound run.** Unbound, `amd-bench` does not load the packed routed experts — the
+exact term that changes when you re-shard — so it reports the *timing of a
+different model*. On the TP4-vs-TP8 comparison this got the **sign wrong**:
+unbound gave `alpha` = 0.965 with a beautiful 0.1% spread (TP4 apparently
+*cheaper* than TP8), while bound gave 1.170 decode / 1.261 prefill. The tell was
+in the log all along — the unbound TP4 arm's `memset_ms` was *smaller* than
+TP8's, which cannot happen if the larger per-rank shard is really resident. A
+tight control spread is not evidence you measured the right thing.
+Full worked example: `glm52-tp4-pp2-evaluation.md` §D.1.
 
 ## Read these caveats before quoting a number
 
@@ -283,3 +333,107 @@ MEASUREMENT NOTE worth more than the last decimal: two runs in this session prod
 13.59 ms outliers against a ~12.05 baseline. Both came from a bench started while a `serve`
 process was still tearing down -- the PERSISTENT COOPERATIVE MEGAKERNEL outlives its host
 process. `rocm-smi --showuse` must read 0% before any A/B on this box, and that is task #10.
+
+## Battery discipline: the `pgrep` self-match trap (cost time twice on 2026-08-08)
+
+A spin-wait written as `while pgrep -f "plowrt serve" >/dev/null; do sleep 10; done` **matches
+its own launcher**. When a battery script is created via a heredoc inside a shell command, the
+launcher process's argv contains the entire script text — including the literal string
+`plowrt serve` — so `pgrep -f` finds it, the guard never clears, and the script spins forever
+**while holding the GPU lock**. Nothing is running; nothing can run; the lock looks legitimately
+held.
+
+It also false-positives on any other run's shell whose command line happens to contain the
+string, which is how one run's first guarded attempt stalled.
+
+**Use `pgrep -x plowrt`** (exact binary name, not full command line). If you need the serve
+subcommand specifically, match on something that cannot appear in a script body, or check the
+port with `ss -lptn`.
+
+Symptom to recognise: the lock directory exists, `pgrep -cx plowrt` returns 0, and the battery's
+output file was never created (the script blocks before its first write). Fix by killing the
+*launcher* shell, not the battery — the battery then proceeds normally.
+
+## Battery discipline: never launch a battery twice
+
+Two concurrent copies of one A/B script each start a server on the same port. Whichever binds
+first answers BOTH arms, so control and test are measured against the same binary and the delta
+is meaningless in either direction — including a null. This is the same failure class that voided
+a battery earlier in the campaign via a sibling's server on a shared port.
+
+If unsure whether a detached script started, check with `pgrep -af`. Do not relaunch.
+Assert exactly one server, pointing at the intended asset, before each arm.
+
+## Killing a run: SIGTERM, not SIGKILL
+
+`kill -9` on `plowrt` leaves the PERSISTENT cooperative megakernel RESIDENT on the GPU, where it
+writes into memory that later runs allocate and silently corrupts unrelated benchmarks. Send
+SIGTERM and give it time to tear down. (Bash wrapper scripts can be hard-killed freely — the
+hazard is the megakernel, not the shell.)
+
+## A lock-releasing `trap` MUST `exit`
+
+A battery script whose handler is `trap 'release_lock' EXIT INT TERM` releases the GPU lock on
+SIGTERM **and then keeps running**, because the handler returns and the script resumes. The
+result is a battery driving the GPU with no lock held, so the next holder's arms interleave with
+its own. Worse, its EXIT handler will later delete whatever lock directory now exists — which by
+then belongs to a *different* agent.
+
+`trap 'release_lock; exit 143' INT TERM` — the `exit` is not optional. If you find a script in
+this state, `SIGSTOP` it rather than `SIGTERM`, precisely so its trap cannot fire and take a
+sibling's lock with it.
+
+## Asset assembly: ALWAYS copy `build.json` next to `model.pkt`
+
+`plowc --emit devblob --out <dir>/model.pkt` writes **two** files: `model.pkt` and `build.json`.
+`build.json` is what carries the blob's `requires` set, and it is what the runtime's arm-refusal
+chain reads to reject a blob whose object lacks a required arm.
+
+Several assets in this campaign were assembled by copying `model.pkt` alone. Those assets have an
+**inert arm-refusal chain** — a blob that should be refused runs anyway, on an object missing the
+arm it needs, and the failure mode is wrong output rather than a loud error. `glm52-tp8-final2`
+(the shipped canonical at the time) was one of them.
+
+When assembling an asset by hand, copy `build.json` with the blob. If an asset predates this note,
+check for it before trusting any arm-gated A/B run on it.
+
+## The Gemma cross-gate must RE-EMIT: `scripts/gemma_xgate.sh` (2026-08-08)
+
+For weeks the standing Gemma cross-gate re-used the stored asset
+`/workspace/assets/gfx942/g12b-fp8` and rebuilt only the OBJECTS. That asset was emitted
+2026-08-04, before the fused activation quant landed, so the gate kept re-certifying **a blob
+that could not contain the regression under test** while a freshly emitted blob answered
+"capital of France" with `,1___....1.111111111111`.
+
+**A gate that never re-emits cannot catch an emitter regression** — not "usually misses one",
+cannot, by construction. Three properties conspired to hide it: the asset is a stored artifact
+an emitter change cannot reach; the failure is fluent and confident, so a liveness check
+passes; and the fold lives in PREFILL, which `amd-bench` never runs (its `last id` is not a
+correctness signal).
+
+`scripts/gemma_xgate.sh` replaces the procedure. It emits from the current checkout every run,
+builds the objects from the same tree unless handed a prebuilt set, writes `weights.json`
+(which `plowc` does not, and `plowrt serve` opens unconditionally), keeps `build.json` next to
+`model.pkt` per the note above, and asserts on the CONTENT of three answers. `PLOW_XGATE_STORED`
+still serves a stored asset — as a bracketing control, never as the subject.
+
+**It was proven to FAIL before it was trusted to pass.** `PLOW_XGATE_EMIT_ENV=PLOW_QNORM_FUSE=1`
+re-enables the broken fold on gfx942 (75fb82f changed only the DEFAULT) and the gate goes red;
+the default emit goes green. Both transcripts: `gemma-xgate-fresh-blob.md` §2. A gate that has
+never been shown to fail on a known-bad input is not evidence of anything — if you add a
+prompt or an arm to that script, re-run the known-bad arm and check it still goes red.
+
+**`pgrep -x plowrt` is not enough either.** On 2026-08-08 a sibling was serving as
+`/tmp/plowrt_stock` at 93% GPU and `pgrep -x plowrt` reported nothing — `-x` demands an exact
+`comm` match and the binary had been copied under another name. Use `pgrep '^plowrt'`: a prefix
+match on the NAME, so it catches `plowrt_stock`/`plowrt.old`/`plowrt-ab` and still cannot
+self-match your own launcher the way `-f` does.
+
+Two box facts that gate scripts here must handle, both learned the expensive way:
+`ss` / `lsof` / `netstat` / `fuser` are ALL absent, so a port-ownership check written against
+`ss` degrades silently into no check at all (`scripts/gemma_xgate_portowner.py` walks `/proc`
+instead and prints a distinguishable token when it cannot answer); and `scripts/build_gfx942.sh`
+dies with **exit 2 and an empty log** here, because its bundler probe is
+`ls -1 <3 candidates> | head -1` under `set -o pipefail` and
+`/opt/rocm/lib/llvm/bin/clang-offload-bundler` does not exist on this box. Pass `PLOW_HIPCC`
+and `PLOW_BUNDLER` explicitly.

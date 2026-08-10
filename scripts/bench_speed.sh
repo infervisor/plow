@@ -52,7 +52,7 @@ echo "  model: $MODEL"
 
 # A fast wrong server is not a result — same gate bench_plowrt_serve.sh applies.
 curl -s --max-time 300 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France? Answer in one short sentence.\"}],\"max_tokens\":32,\"temperature\":0}" \
+  -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France?\"}],\"max_tokens\":32,\"temperature\":0}" \
   | grep -qi paris || { echo ">>> coherence gate FAIL"; exit 1; }
 echo ">>> coherence gate: PASS"
 

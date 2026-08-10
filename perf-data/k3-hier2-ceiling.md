@@ -76,7 +76,7 @@ pays SC1's store cost for a saving HIER2 has already taken. **Drop SC1; keep HIE
 
 ## 3. The blocker dissolved: `PLOW_L2_PLACE_DISPATCH` already exists
 
-the design notes blocks HIER2 on *"the global queue having no per-packet leader"*: a
+The design notes block HIER2 on *"the global queue having no per-packet leader"*: a
 workgroup claims whatever entry is next, so which slices of a packet land on which XCD — and
 therefore the per-(packet, XCD) arrival count the rendezvous needs — is decided at run time.
 
@@ -122,7 +122,7 @@ still reaches `blocks[p]` and no consumer's threshold changes.
 59k slots ≈ 7.6 MB at the current 128 B stride, and it triples the per-token counter re-arm
 (315 KB → 1.26 MB); a device-side reset is the obvious answer if the memcpy shows up.
 
-**Risk:** this is the class the design notes warns about. The leader election
+**Risk:** this is the class the design notes warn about. The leader election
 is by return value of an atomic, so exactly one workgroup wins each role, but the publish leader
 must not be able to run before a follower has retired — which is what the follower's
 `__syncthreads()` before its bump guarantees.

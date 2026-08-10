@@ -469,8 +469,8 @@ pub fn plan_from_schedule(
     plan_from_schedule_with_task_sets(tasks, sched, cons).0
 }
 
-/// Per-tensor writer / reader task-id sets (the design notes
-/// §6.2.5). Keyed by tensor name (matches `AddrEntry.name`). Callers who need
+/// Per-tensor writer / reader task-id sets (per the design notes).
+/// Keyed by tensor name (matches `AddrEntry.name`). Callers who need
 /// to feed the Lean verifier build a `ScheduleRequest` from these plus the
 /// `AddressMap`.
 pub type TensorTaskSets = HashMap<String, (Vec<crate::expand::TaskId>, Vec<crate::expand::TaskId>)>;
