@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/plow_mark.svg">
+    <img src="assets/plow_mark_light.svg" alt="plow" width="96">
+  </picture>
+</p>
+
 # plow
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
