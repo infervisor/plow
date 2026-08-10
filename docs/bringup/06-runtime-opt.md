@@ -1,0 +1,395 @@
+# Stage 6 — Runtime Optimization
+
+> Turn a correct model into a **server that holds up under load**. Serve the
+> whole model on `plowrt` so that time-to-first-token (TTFT) and time-per-output-
+> token (TPOT) stay within budget at a target concurrency, and the working set
+> (weights + KV cache + activation scratch) fits device memory.
+
+**Precondition:** Stage 5 complete — one block is numerically correct and at its
+per-block latency target, and `plowc` emits a full-model `model.pkt` that loads.
+Nothing in this stage recompiles the model; every lever is a `plowrt` flag or a
+`PLOW_*` environment variable read at serve time. Choosing the decode batch width
+`B` is the one lever that may send you *back* to Stage 5 to recompile.
+
+**Gate out (into Stage 7, e2e campaign):** the model serves at the target
+concurrency with TTFT and TPOT within budget, memory fits (target concurrency is
+admitted, not shed on KV OOM), no spurious shedding, and any lever that can
+change numerics was re-verified against a correctness gate. The output is a
+**serving recipe** — a `plowrt serve` command line + `PLOW_*` knobs + measured
+TTFT/TPOT/throughput/memory numbers.
+
+---
+
+## The runtime, in one picture
+
+```
+HTTP / UDS  →  per-model mux (continuous batching)  →  device engine
+                slot table · admission · hold          persistent/segmented interpreter
+```
+
+* The **mux** (`crates/plowrt/src/serve/mux.rs`) holds a fixed-size **slot
+  table** sized to the engine's compiled decode batch. Each tick it admits new
+  arrivals into idle slots, runs one batched decode launch that advances every
+  live slot by one token (or K tokens under multi-step), and frees finished
+  slots — so a fresh request does not wait for prior requests to reach
+  `max_tokens` before its first token.
+* The **engine** is one of two shapes (`serve/engine.rs`, `enum ServeEngine`):
+
+| engine | module | shape |
+|---|---|---|
+| CUDA / sm_120 | `exec::gpu::GpuEngine` | **slotted**: B independent sequence slots, chunked prefill, prefix sharing, device sampling. Most runtime levers live here. |
+| AMD / gfx950 | `exec::amd` (`enum Ranks { One, Tp }`) | **single-sequence** per rank (one KV ring, one position, greedy on-device sampling), optionally tensor-parallel. One model per process, no paging, no residency manager. |
+
+* Memory is a single per-device **arena** with compiler-resolved offsets
+  (`memory::AddressSpace`); KV is carved from it by `memory::streamer::KvArena`
+  over per-head `memory::pool::GrowablePool`s.
+
+Read `docs/arch/06-runtime.md` for the execution model (persistent kernel,
+segmented dispatch, counter DAG, arena, KV paging), `docs/arch/09-multi-gpu.md`
+for TP, `docs/arch/13-prefill-chunking.md` for how a prompt is a sum of compiled
+rungs.
+
+---
+
+## The levers
+
+Grouped by what they move. **Platform** marks CUDA/sm_120, AMD/gfx950, or both.
+Defaults are the in-tree defaults from `config.rs` / `main.rs`. Where a lever is
+design-intent but **not wired**, it says so.
+
+### 1. Concurrency and batch width — platform: both
+
+The decode batch `B` is **compiled into the blob** (`PLOW_DECODE_BATCH` at
+compile time); the mux sizes its slot table to exactly `B` (mux slot *i* IS
+engine slot *i*). The first concurrency decision was therefore made in Stage 5.
+
+| lever | flag / env | default | effect |
+|---|---|---|---|
+| CPU executor threads | `--executors N` | 8 | reference backend only; GPU engines run one dedicated engine thread per model |
+| Multi-step decode | `PLOW_MULTISTEP=K` | 8 | device advances K greedy tokens per host round-trip. **~1.74× on its own, free** — the single highest-value default (`perf-data/gemma4-12b-sm120-serving.md`). Stochastic rows fall back to per-token. *(sm_120)* |
+| Device sampling | `PLOW_DEV_SAMPLE=1` | on (sm_120) | argmax/sample on device, no logits round-trip; pairs with multi-step *(sm_120)* |
+
+> **Pitfall — a wide fixed `B` is not a free win.** Decode is HBM-bandwidth-
+> bound: doubling `B` ~doubles per-token latency. On a 12B-class model, `B=16`
+> crosses a 50 ms inter-token SLO at ~2 concurrent users where `B=8` holds to ~4
+> (`perf-data/serving-capacity-report.md`, `perf-data/b2-concurrency-family.md`).
+> Pick `B` from the **TPOT budget**, not the peak-throughput number. A fixed
+> large `B` also overpays at partial load — a `B=32` blob costs full width at 16
+> live slots. For MoE the batching win is weaker still: the expert union
+> saturates weight-read by modest B (`perf-data/concurrent-decode-26b-h100.md`).
+
+### 2. KV cache and memory fit — platform: both
+
+The live allocator is `KvArena` (`memory::streamer`) over per-head
+`GrowablePool`s. The vLLM-style paged `BlockAllocator`/`PageTable` in
+`memory/kv.rs` is **retained but not on the serving path** (superseded by the
+`GrowablePool` layout — design-intent for a future page-table-over-pool view).
+
+| lever | flag / env | default | effect |
+|---|---|---|---|
+| Prefill chunk / KV ring size | (chunk knobs below) | — | ring = `next_pow2(window + chunk − 1)`; smaller chunk → smaller resident KV ring → more sequences fit. 12B KV ~10.7→3.0 GiB from 8192→1024 chunk for ~2% prefill cost — a **fit enabler, not a speed win** (`perf-data/gemma4-12b-sm120-serving.md`) |
+| Per-engine KV reuse pool | `--kv-pool-mib` / `PLOW_KV_POOL_MIB` | 512 | zero-ref physical KV blocks park (bounded) instead of being freed; next request pays a map, not an allocation. 0 disables |
+| VMM-backed KV (AMD) | `--amd-vmm-kv` / `PLOW_VMM_KV` | off | driver-VMM physical backing (`memory::vmm::VmmKv`); block size `--vmm-block-mib` |
+
+> **KV OOM is a shed, not a crash.** `admit_into` fails a request whose KV does
+> not fit with a typed OOM error rather than holding a slot open under pressure.
+> If the target concurrency sheds on KV, shrink the chunk (smaller ring) or widen
+> the VRAM budget — do not grow the slot table.
+
+### 3. Prefix caching — platform: split
+
+| lever | flag / env | default | effect |
+|---|---|---|---|
+| VMM prefix sharing | `--vmm-prefix` / `PLOW_VMM_PREFIX=1` | **off** | shared prefix's full-attention KV held once, `cuMemMap`'d into every sharer (`memory::prefix::PrefixCache`). Warm-TTFT 3.6×(4k)→23.8×(128k), dedup ~10 GiB/sharer at 31B/128k, TPOT-neutral (`perf-data/vmm-prefix-v1.md`). Block size is the real knob (`--vmm-block-mib`, best 64 MiB @128k). Hit stats on `/metrics` via `VmmStatsHandle`. *(sm_120)* |
+| AMD same-slot prefix cache | `--prefix-cache` / `PLOW_PREFIX_CACHE=1` | off | for recurrent/linear-attn models: MLA KV half is free, recurrent state checkpointed via one batched D2D copy. ~24% lower per-query latency, ~1.9× better median TTFT at 75% hit (`perf-data/k3-prefix-cache-design.md`). *(gfx950, TP path)* |
+
+> **Pitfall — report the hit rate with any prefix-cache number.** A cache that
+> misses pays snapshot/insert cost with no benefit; at low hit rates the AMD
+> same-slot cache is a net *loss*. VMM prefix sharing is off by default pending
+> its e2e integration — enable it deliberately and measure. Open safety gap: the
+> VMM `BlockHash` collision check is **not implemented** (`memory/vmm.rs`), so a
+> hash collision would attach the wrong prefix's KV. Measured-good, not hardened.
+
+### 4. Prefill: chunking, batching, interleave — platform: mostly sm_120
+
+Prefill is a launch-count game: each launch has a fixed cost (~32 ms measured on
+sm_120; a `139 ms + 0.943 ms/row` model on gfx950 TP4,
+`perf-data/glm52-ttft-breakdown.md`), so fewer launches is faster — at the cost
+of a bigger KV ring.
+
+| lever | flag / env | default | effect |
+|---|---|---|---|
+| Chunk-interleave quantum | `--pf-interleave N` / `PLOW_PF_INTERLEAVE` | 2048 | rows admitted per tick before decode runs; caps how long a decode stream stalls behind a new prefill (one chunk, not one prompt) *(sm_120)* |
+| Per-request chunk-row cap | `--pf-chunk N` / `PLOW_PF_CHUNK` | 0 (off) | finer chunking. **Tail-latency tool** — measured a net throughput *loss* at B=8 (`perf-data/serving-capacity-report.md`) *(sm_120)* |
+| Disable chunking / interleave | `--pf-no-chunk`, `--pf-no-interleave` | off | A/B and pure-throughput controls *(sm_120)* |
+| Chunk cost model | `--pf-chunk-cost N` / `PLOW_PF_CHUNK_COST`, `--pf-cover` | 512 | fixed launch cost in padded-row equivalents (`perf-data/chunk-cost-model.md`, `perf-data/rtx12-chunked-packing.md`) *(sm_120)* |
+| Cross-request batched prefill | `--pf-batch` / `PLOW_PF_BATCH=1` | off | packs waiting requests' chunks into one launch. Wins on small per-request chunks; **no-op** when the pack budget already equals the serial chunk, **force-off on fp8-KV** (`perf-data/px14-batched-prefill-fp8.md`) *(sm_120)* |
+| Throughput mode | `--pf-defer-decode` / `PLOW_PF_DEFER_DECODE=1` | off | run prefill chains to completion before any decode. Trades streaming latency (TTFT collapses) for aggregate tok/s. Not a shippable default *(sm_120)* |
+| AMD ragged-tail chunk | `--amd-ragged-chunk` / `PLOW_RAGGED_CHUNK` | **on** | cover a prompt in fewest launches, run the last chunk at its real row count (−239 ms @4097 tok; `exec::amd::rebase_chunk_rows`). `=0` restores the padding-vs-launch DP for a controlled A/B — see the flag's own doc in `config.rs` for the quality-gate caveat *(gfx950)* |
+| Segmented prefill | `--pf-seg-*` (sm_120), `--amd-seg-window` (AMD) | seg-window on | prefill as a sequence of same-occupancy launches: −11%/−12% at 8k/16k (`docs/arch/06-runtime.md`, `perf-data/gemma12b-gh200-prefill-campaign.md`). `--pf-seg-*` are mostly A/B diagnostics; emit-side classing must match the blob |
+
+> **Pitfall — cross-request batched prefill is not numerics-neutral.** Greedy
+> tokens can differ across chunk boundaries (the flash split count is
+> chunk-dependent; `perf-data/px14-batched-prefill-fp8.md`). If bit-identical
+> decode matters, keep packing off or gate on a facts probe.
+
+### 5. Admission: SLO, hold, shedding — platform: both
+
+The mux admits, holds, and sheds via `sched::admission` and
+`sched::batching::formation_window_ms`.
+
+| lever | flag | default | effect |
+|---|---|---|---|
+| Admission SLO | `--slo-ms` | 250.0 | treated as a **floor**: effective SLO = `max(slo_ms, 8 × service_ms)`, scaling with the decode batch so a wide blob is not shed wholesale |
+| Cold-start hold | `--max-hold-ms` | 8.0 | upper bound on the arrival-rate batch-formation hold; used only when the slot table is empty. With slots draining, the hot path never sleeps |
+| Trace | `--trace` | off | per-packet timeline, dumpable at `GET /trace` |
+
+> **Pitfall — the SLO shed masquerades as an emitter bug.** The old serial
+> `predicted_wait = live × service_ms` 429'd *every live slot* once
+> `live × step_ms` crossed a flat SLO — a B=16 blob shedding all streams at ~8
+> users while the kernel was byte-identical and error-free
+> (`perf-data/serving-capacity-report.md`, `perf-data/b2-concurrency-family.md`).
+> Fixed by a `ceil(live/batch) × service_ms` predictor + the SLO floor. Two
+> consequences: (1) a throughput benchmark that sheds counts the 429'd requests
+> as *successful* with ~12 tokens each → fake tok/s; **raise `--slo-ms` when
+> throughput-benching**. (2) If your served concurrency is 429'd, check
+> `plowrt_admit_shed_total` vs `plowrt_rejected_total` before touching the blob —
+> distinct signals (shed = controller dropping live work; rejected = a full slot
+> table or an oversize prompt).
+
+### 6. Weight load and cold start — platform: both (some sm_120-only)
+
+Faster load is faster time-to-serving; it does not touch steady-state TPOT.
+
+| lever | flag / env | default | effect |
+|---|---|---|---|
+| Weight slab | `--rt-weight-slab` / `PLOW_WEIGHT_SLAB`; `--rt-slab-keep` / `PLOW_SLAB_KEEP` | on / off | one allocation for all weights. AMD MI355X named-tensor alloc ~6.4–8.8 s → ~0.1–0.27 s, wall halved (`perf-data/weight-slab-amd-mi355x.md`) |
+| VMM lazy-commit weight slab | `--nv-weight-vmm` / `PLOW_WEIGHT_VMM`; `--nv-upload-direct` / `PLOW_UPLOAD_DIRECT` | on (CUDA) / off (AMD) | commit chunks behind the upload. GH200 12B load 3.67→2.0 s (`perf-data/vmm-weight-slab-gh200.md`). **AMD default off — a measured regression there** |
+| Prefetch | `--rt-prefetch` / `PLOW_PREFETCH`, `--rt-prefetch-threads` / `PLOW_PREFETCH_THREADS` | 256 / 16 | parallel weight upload. GH200 12B cold start 17.55→11.19 s (`perf-data/coldstart-plow-vs-vllm-gh200.md`). Drive saturates ~16 readers |
+
+### 7. Tensor parallelism (TP) — platform: both; the ONLY wired multi-GPU mode
+
+Serving selects TP via `enum Ranks { One, Tp }` (`serve/engine.rs`); the host
+side is `exec::tp` (`TpGroup`, `TpRank`, `PeerLayout`) and, on AMD,
+`exec::amd_tp::AmdTpGroup`. See `docs/arch/09-multi-gpu.md`.
+
+Bring up and time a TP group **without** a full serve:
+
+* `plowrt devices --tp N` — peer-mapped reduction regions, cross-GPU counter
+  tables, all-pairs peer-visibility check (no model).
+* `plowrt amd-bench --tp N` — times decode across ranks. **Every rank must emit
+  an identical token stream** — that identity is the TP correctness gate, not a
+  sanity check (a rank whose collective silently timed out still samples fluent
+  ids from its own shard).
+
+TP knobs: `--amd-tp-agree-every N` (agreement interval; serving samples, the
+oracle checks every step), `--amd-tp-no-audit` (timing runs), `--amd-share-ckpt`
+(shared checkpoint mapping), `--amd-tp-serial-load`.
+
+> **Not wired — say so honestly.** There is **no** unified
+> `Parallel { Tp, Dp, Pp, Ep }` selector. Data-parallel (**DP**) and cross-GPU
+> pipeline-parallel (**PP**) do not exist as GPU modes. Expert-parallel (**EP**)
+> exists only as a MoE weight-base-remap path (`orch::moe`, AMD MoE dispatch),
+> not a general selector. Prefill/decode **disaggregation** is a skeleton
+> (`orch::disagg`: `Pool`, `KvHandoff` types only, no dispatch). Plan multi-GPU
+> serving around TP only.
+
+### 8. Multi-model residency — platform: CUDA only
+
+* **S1 switching** (`serve::manager::ModelManager`) — keep the largest
+  VRAM-fitting subset resident; a non-resident request evicts LRU and loads.
+  Knobs: `--drain-timeout-ms` / `PLOW_DRAIN_TIMEOUT_MS` (bounded-drain preemption
+  on switch — a live 512-tok generation drains O(max_tokens)≈13 s unbounded vs
+  258 ms at a 250 ms deadline), `--preload` / `PLOW_PRELOAD` (speculative
+  next-model preload), `--vram-budget-mib` / `PLOW_VRAM_BUDGET_MIB`. See
+  `perf-data/m1-multimodel-sm120.md`, `perf-data/multi-model-switch-gh200.md`.
+* **AMD serve is one model per process** by decision — no `ModelManager`, no
+  paging, no residency (`serve/engine.rs` module doc).
+
+> **Planned, not implemented — do not depend on it.** The `docs/arch/06-runtime.md`
+> **multi-tenancy** section (isolated counter pools, per-tenant arena partitions,
+> priority-weighted scheduling) and the **watchdog** timer (stall detection via
+> counter-progress monitoring) are design intent. There is no S2 multi-tenancy
+> and no host watchdog in the runtime today. `memory::streamer::Streamer`'s
+> reclaim policy (`EvictKv`/`StreamWeights`/`Preempt`) is likewise a skeleton
+> whose `execute_reclaim` arms are no-ops.
+
+---
+
+## Step by step
+
+Fix a concrete target first: **model, prompt length, target concurrency, TTFT
+budget, TPOT budget**. Everything below is measured against it. Commands assume a
+built `plowrt` (`nix develop`, then `cargo build -p plowrt --release --features
+cuda` or `--features hsa`) and Stage 5 assets in `$ASSETS`.
+
+### 0. Sanity — does the schedule even run? (no GPU)
+
+```bash
+plowrt simulate --assets $ASSETS --all-buckets --chrome sim.json
+```
+
+`simulate` replays the packet stream on the CPU reference with full visibility:
+no deadlocks, all dependencies honored, correct memory access. `--bucket
+decode:1:128` isolates one bucket; `--math golden` runs reference numerics. The
+only whole-schedule instrument that needs no device.
+
+### 1. Single-stream latency floor (device, one sequence)
+
+```bash
+# decode TPOT at a context depth; with --prompt, a real greedy decode + TTFT:
+plowrt amd-bench --blob $ASSETS/model.pkt --rt-hsaco $ASSETS/hsaco \
+    --checkpoint $CKPT --prompt 1,2,3,4 --steps 64 --ctx 1024
+```
+
+Reports load time, per-token decode ms (TPOT floor), and — with a multi-token
+`--prompt` — prefill ms and tok/s (TTFT floor). This is the AMD path; the CUDA
+engine's single-stream floor is measured through `serve` at concurrency 1.
+`amd-bench` is a **latency/bring-up** instrument: without `--checkpoint` the
+weights are unbound, so *timing is real but the token ids are noise*. A
+prefill-vs-length sweep on TP:
+
+```bash
+plowrt amd-bench --blob $ASSETS/model.pkt --rt-hsaco $ASSETS/hsaco --tp 4 \
+    --prefill-sweep 512,1024,2048,4096,8192 --prefill-reps 3
+```
+
+### 2. Bring up serving and baseline it
+
+```bash
+plowrt serve --assets $ASSETS --port 8080 --executors 8 \
+    --max-hold-ms 8 --slo-ms 250
+```
+
+Drive it at the target concurrency and prompt length, and scrape `/metrics`:
+
+| series | read |
+|---|---|
+| `rate(plowrt_batch_size_sum[5m]) / rate(plowrt_batch_count_total[5m])` | windowed mean batch size actually run |
+| `plowrt_admit_shed_total` vs `plowrt_rejected_total` | shedding (controller) vs capacity (full table / oversize) |
+| `plowrt_utilization`, `plowrt_arrival_rate` | queueing ρ = λ/μ, and λ |
+
+Record baseline TTFT, TPOT, throughput. **If shedding at the target concurrency,
+raise `--slo-ms` first and re-measure** (Lever 5 pitfall).
+
+### 3. Fit memory to the target concurrency
+
+If KV OOM sheds (`kv arena OOM` in the log, typed OOM to the client), shrink the
+prefill chunk / KV ring so the target concurrency fits, and confirm the weight +
+KV + scratch budget:
+
+```bash
+PLOW_LOAD_PROFILE=1 plowrt serve --assets $ASSETS --port 8080
+```
+
+### 4. Turn the levers, one at a time, and measure
+
+Apply highest-value first, re-measuring TTFT/TPOT/throughput after each and
+keeping only what helps *your* target:
+
+1. **Multi-step + device sampling** (sm_120): confirm `PLOW_MULTISTEP=8`,
+   `PLOW_DEV_SAMPLE=1` — the largest single decode win.
+2. **Batch width `B`** from the TPOT budget (Lever 1 pitfall) — may send you back
+   to Stage 5 to recompile at a different `PLOW_DECODE_BATCH`.
+3. **Prefill chunking / interleave** if TTFT-under-load (tail) is the problem
+   (`--pf-interleave`, `--pf-chunk`); measure — finer chunking often *loses*
+   throughput.
+4. **Prefix cache** if traffic shares prompt prefixes (`--vmm-prefix` on sm_120,
+   `--prefix-cache` on AMD recurrent). **Report the hit rate.**
+5. **TP** if one GPU cannot hold the model or hit the latency budget. Gate on
+   rank token-identity (`amd-bench --tp N`, `devices --tp N`).
+6. **Load / cold start** (`--rt-prefetch-threads`, weight-slab knobs) if
+   time-to-serving matters.
+
+### 5. Diagnostics when a number is off
+
+| instrument | env / flag |
+|---|---|
+| TTFT timeline (queue→prefill→first token; conc. 1) | `PLOW_TTFT_LOG=1` |
+| per-decode-step host-phase breakdown | `PLOW_DSTEP_LOG=1` (+ `--rt-dstep-every N`) |
+| prefix-cache timing | `PLOW_PFX_LOG=1` |
+| per-tick prefill-vs-decode wall split | `PLOW_PF_PACKLOG=1` |
+| packet timeline | `PLOW_TRACE_RAW=path` (AMD) or `--trace` + `GET /trace` |
+| static blob analysis (no device) | `plowrt disasm $ASSETS --counters --kernargs --tensors` |
+
+---
+
+## Success criteria
+
+The model gates into Stage 7 when **all** hold:
+
+1. **TTFT** at the target prompt length is within budget at concurrency 1 and
+   does not blow past budget at the target concurrency.
+2. **TPOT** at the target concurrency is within budget — and stays under it as
+   concurrency rises to the target, not just at concurrency 1.
+3. **Memory fits**: the target concurrency is *admitted*, not shed on KV OOM;
+   `PLOW_LOAD_PROFILE=1` shows weights + KV + scratch resident with headroom.
+4. **No spurious shedding**: `plowrt_admit_shed_total` ~0 at the target load; any
+   429s are genuine capacity (`plowrt_rejected_total`).
+5. **Correctness held**: every lever that can change numerics (batched prefill,
+   ragged tail, prefix sharing) was re-checked against a correctness gate, not
+   assumed neutral. On TP, rank token-identity holds.
+6. **A recorded recipe**: the `plowrt serve` command + `PLOW_*` knobs with the
+   measured TTFT/TPOT/throughput/memory numbers.
+
+---
+
+## Pitfalls (from real serving campaigns)
+
+* **Flat SLO sheds a wide blob.** A constant `--slo-ms` 429s every live stream
+  once `live × step_ms` crosses it; looks like a B>8 emitter bug, is the
+  admission model (`serving-capacity-report.md`).
+* **Shed requests count as "successful" in benchmarks** with ~12 tokens each →
+  fake throughput. Raise `--slo-ms` when throughput-benching.
+* **A wide `B` doubles latency for the throughput.** Decode is bandwidth-bound;
+  pick `B` from the TPOT budget (`b2-concurrency-family.md`).
+* **A fixed large `B` overpays at partial load** — bad default for mixed traffic.
+* **Finer prefill chunking usually loses throughput** — it multiplies launches
+  and re-reads growing KV; it is a tail-latency tool (`serving-capacity-report.md`).
+* **Cross-request batched prefill is not numerics-neutral** and is a no-op /
+  force-off in common cases (`px14-batched-prefill-fp8.md`).
+* **Prefix cache with a low hit rate is a net loss.** Always report the hit rate;
+  the VMM `BlockHash` collision check is not yet implemented.
+* **VMM weight-slab helps CUDA, hurts AMD** — leave the AMD default off.
+* **Serve width must match the compiled width.** A blob compiled for one decode
+  batch (or `-DGV_MM_MAX`) but driven at another routes through a predicated
+  remainder arm and runs *slower* (`px10-batched-decode.md`).
+* **Multi-model traps (CUDA):** duplicate network names silently drop a bundle;
+  engine looked up by network but installed by slug (a slug override falls to the
+  CPU reference path); `PLOW_PF_SEG_*` are process-global, so two models with
+  different emit classing can't both be optimal (`multi-model-review-gh200.md`).
+* **`gpulease` rc=76 is a false positive** for any serving benchmark on a shared
+  box (`glm52-ttft-breakdown.md`).
+* **`out_tok_s` / `bench_speed` throughput is confounded** on variable-completion
+  benchmarks (prefix cache moves the stop position) — prefer `req_s`
+  (`k3-throughput-architecture-review.md`).
+
+---
+
+## Code pointers
+
+| symbol / path (`crates/plowrt/src/`) | role |
+|---|---|
+| `serve::mux` — `spawn`, `run_one_tick`, `admit_into`, `Slot`, `MuxConfig`, `advance_health` | continuous-batching mux / slot table / admission |
+| `serve::engine::{ServeEngine, Ranks}` | per-backend engine seam (CUDA slotted vs AMD single-sequence / TP) |
+| `serve::mod::{AppState, app}` | router: `/v1/chat/completions`, `/metrics`, `/trace`, `/healthz` |
+| `sched::admission::{LoadEstimator, Admit, admit}` | admission controller, SLO shed |
+| `sched::batching::{select_bucket, formation_window_ms}` | bucket pick + adaptive hold |
+| `sched::multistep::MultiStep::for_batch` | multi-step depth from batch size |
+| `memory::AddressSpace` (`kv_layer_bases`) | per-device arena, physical rebase |
+| `memory::streamer::{KvArena, SlotHandle, KvOom, Streamer}` | live KV allocator (`Streamer` reclaim = skeleton) |
+| `memory::pool::GrowablePool` | per-head KV pool (Lean-mirrored) |
+| `memory::prefix::{PrefixCache, Match}` | radix prefix cache, head-major runs |
+| `memory::vmm::{VmmKv, VmmStatsHandle, WeightSlab, VmmSlab}` | VMM prefix sharing + weight slabs |
+| `memory::kv::{BlockAllocator, PageTable}` | vLLM-style paged pool — **retained, off-path** |
+| `exec::{ExecutorSet}`, `exec::gpu::GpuEngine`, `exec::amd::AmdEngine` (`rebase_chunk_rows`), `exec::amd_tp::AmdTpGroup` | executors / device engines |
+| `exec::tp::{TpGroup, TpRank, PeerLayout}` | TP host side |
+| `serve::manager::{ModelManager, BlobPlan, SwitchReport}` | S1 residency / switch (CUDA) |
+| `orch::registry::Registry`; `orch::moe`, `orch::disagg` (skeleton) | model registry; EP/disagg |
+| `config::{RuntimeConfig, NvidiaRuntimeConfig, AmdRuntimeConfig}` | every `PLOW_*` env var + CLI flag |
+| `obs::Metrics::to_prometheus`, `obs::{ttft, dstep, pfx, trace}` | metrics + diagnostics |
+
+Architecture reading: `docs/arch/06-runtime.md` (execution model — note its
+multi-tenancy/watchdog sections are marked Planned), `docs/arch/09-multi-gpu.md`
+(TP), `docs/arch/05-counter-system.md` (counter DAG),
+`docs/arch/13-prefill-chunking.md`.

@@ -389,6 +389,13 @@ model, formal verification, multi-GPU. Build-system rationale:
 [`docs/BUILD.md`](docs/BUILD.md). Every emit/build/runtime flag:
 [`docs/flags-reference.md`](docs/flags-reference.md).
 
+## Bringing up a new model
+
+A staged playbook — operator IR → rewrite rules → formal verification →
+kernel tuning → single-block sweep → runtime optimization → measured
+campaign — lives in [`docs/bringup/`](docs/bringup/00-overview.md), with
+per-stage LLM-agent prompt templates in [`bringup/`](bringup/README.md).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Please follow the

@@ -1,0 +1,338 @@
+# Stage 4 — Kernel Tuning to the Roofline
+
+> Bring each hot kernel family of the new model — prefill GEMM, decode GEMV,
+> attention, MoE — to a stated fraction of its roofline ceiling on the target
+> GPU, and leave the winners recorded where the compiler actually reads them.
+> Stage 3 proved the schedule correct; this stage makes the kernels inside it
+> fast, *before* Stage 5 measures a whole block. The ceiling is defined by the
+> cost model, not by feel: a kernel is "done" when its measured throughput sits
+> against the min(compute, bandwidth) bound for its shape, and "tuned" when the
+> winning tile/knob is a qualified record or a recorded build define.
+
+**Precondition:** Stage 3 complete — every bucket verifies, so the schedule
+being timed is the schedule that will ship. You also need the vendor toolchain
+(`nvcc` or `hipcc`) for probing, the GPU itself plus
+`perf-data/harness/gpulease` for measuring, and `nix develop` for all cargo
+builds.
+
+**Gate out (into Stage 5, single-block sweep):** every demanded hot-kernel
+shape has a measurement census entry (HIT or an explicit, explained MISS), the
+winners are `qualified` records or recorded `-D` defines, `plowc tune --shape`
+reports rationale `measured` on the shapes that have records, and the per-family
+roofline % is written down with a clean (`gpulease` rc=0) provenance.
+
+Authoritative references: [`docs/arch/11-tuning-coverage.md`](../arch/11-tuning-coverage.md)
+(what is tunable per family and what blocks each) and
+[`docs/arch/12-using-the-tuner.md`](../arch/12-using-the-tuner.md) (how to take
+a measurement the database will accept). This stage is those two documents
+turned into a bringup sequence.
+
+---
+
+## What "tuned" means here
+
+Two load-bearing properties from the tuner design constrain everything below:
+
+* **`compile` reads, `tune` writes.** `plowc compile` may consume qualified
+  records; only an explicit tuning run publishes one. A build must never
+  calibrate itself against its own output.
+* **Capability is probed from a built object, never declared.** The same
+  interpreter TU becomes different objects under different `-D` sets, so "which
+  kernels exist" and "which macros are knobs" are questions about an object.
+  `plowc tune inventory` answers them with the vendor preprocessor — no GPU
+  needed.
+
+And one from the store (`crates/tunedb/`): **correct before fast.** A
+measurement without a passing correctness oracle can be stored (`provisional`)
+but never selected. This single rule decides most of what is tunable today —
+see the coverage table below.
+
+## Step 0 — establish the ceiling before measuring anything
+
+The roofline % is meaningless until the denominator is right.
+
+* **The cost model defines the analytic ceiling.** `costmodel::CostModel::new`
+  takes the GPU's `SmSpec`, subtracts `kernel_reservation_bytes(arch)` (2–4 KiB
+  of barriers/TMA descriptors/LDS scratch that tiles cannot use) from
+  `shared_mem`, and enumerates tile candidates under double-buffering. DMA cost
+  comes from `sm_bytes_per_cycle` — the **datasheet** bandwidth divided across
+  SMs, used deliberately for *ranking* (a constant derate cancels in a relative
+  comparison). Anything that reports an **absolute** floor must use the measured
+  `MemorySpec::bandwidth_for_bound()` instead (this is what `plowc
+  --lean-oracle` does).
+* **Use measured machine ceilings for the % you report.** The sweep harness
+  headers record the honest denominators: on gfx950, 1660 TF/s *sustained* bf16
+  MFMA (not the datasheet peak) and 6200 GB/s HBM; on gfx942 the measured
+  pure-MFMA issue ceiling is 937 TF/s (vs the 1307 datasheet) and 5300 GB/s.
+  `gemm_tile_sweep.c` makes its `PEAK_TFLOPS` / HBM constants overridable
+  macros for exactly this reason — printing gfx950 denominators on gfx942
+  overstates the machine by ~1.77× on compute.
+* **Single-unit rooflines come from `runtime/ubench/`.**
+  `ubench_cu_roofline` runs the *production* op headers (same code, same
+  register pressure) on one CU and prints efficiency vs the single-unit
+  ceiling, with `--decode` switching to M=1 shapes:
+
+  ```bash
+  cd runtime
+  cmake -B build -DPLOW_ROCM=ON -DPLOW_UBENCH=ON -DPLOW_HIP_ARCH=gfx950
+  cmake --build build --target ubench
+  cd ubench && ./run_ubench_cu.sh --timing-only     # or --kernel d_gemm, --json out.json
+  ```
+
+  These numbers are **evidence, not selectable records** — `runtime/ubench/`
+  has no correctness oracle, so nothing it produces can qualify in `tunedb`.
+  Use it to decide whether a kernel is compute- or bandwidth-bound and how far
+  from the ceiling it sits; use the oracle-bearing harnesses below to publish.
+
+## Step 1 — inventory: what is actually tunable on this object
+
+Do this before spending any GPU time. Three questions decide whether a family
+is tunable at all (see `11-tuning-coverage.md` for the full derivation):
+
+1. does the opcode reach a *distinct* kernel (or is it an alias)?
+2. is there a parameter to vary (an `#ifndef`-guarded macro, not a hard
+   `#define`)?
+3. is there a correctness oracle?
+
+```bash
+nix develop --command cargo build -p plowc --bin plowc     # `tuner` is a default feature
+plowc tune inventory --gpu "MI350X" --root .               # executable kernels + aliases
+plowc tune select --gpu "MI350X" --shape 4096,4096,4096    # what would this shape get, and why
+plowc tune status --gpu "MI350X" --db tuning               # what the store already holds
+```
+
+Read the **aliases** block first: opcodes listed together reach one function
+body, and ranking within such a group measures dispatch noise. On NVIDIA the
+three dense-GEMM opcodes are one body whose tile is an object-wide macro — the
+tuning axis there is *which object is built*, not which opcode is emitted. On
+AMD the same opcodes are separately compiled instantiations and genuinely
+rankable. Before sweeping any macro, confirm it is a knob:
+`kernelcaps::classify_macro(header, "PGM_BN") == Sweepable::Overridable`. A
+`-D` on a hard-defined macro is a redefinition, and the numbers describe a tile
+that was never built.
+
+Condensed coverage picture (full table in `11-tuning-coverage.md`):
+
+| family | knob | oracle | verdict |
+|---|---|---|---|
+| prefill GEMM | AMD `GM_BM`/`GM_BN`/`GM_BK`; NV Ampere `PGM_BN`/stages; Hopper `PGM90_STAGES`/`PGM90_FP8_PROMOTE` | AMD yes | **tunable now (AMD)**; NV blocked on oracle merge |
+| decode GEMV | `GV_*` unroll ladder, `GV_MM_MAX`, `PLOW_GEMV_MM`/`WALK` | AMD yes | tunable, high value |
+| MoE | shares dense `PGM_*` tile | weak | blocked (oracle + shared tile) |
+| attention / MLA / DSA | AMD `FA_*`; NV tiles are template literals, not macros | DSA strongest | partial |
+| collectives | `PLOW_XR_CUS` | 2-GPU | park until N≥2 GPUs |
+
+## Step 2 — identify the hot shapes from the compiler's own demand
+
+Do not hand-author a shape list; that is exactly how GLM-5.2 prefill ended up
+100% unmeasured. The demand comes from the compile itself:
+
+```bash
+# derive the demanded GEMM shapes from a real emit (the compile flags go BEFORE `tune`):
+plowc --hf-dir <ckpt> --max-ctx 4096 --n-cu 256 --num-gpus <g> tune shapes --gpu mi350
+
+# decode-side census: one TUNEDUMP_GEMV line per resolved GEMV shape
+PLOW_TUNE_DUMP=1 plowc --emit devblob ...      # scripts/rebench_tune_gemv.sh derives its list from this
+```
+
+The hot families for a transformer are known in advance — qkv/o and MLP
+projections (GEMM at prefill, GEMV at decode), flash attention
+(decode/prefill), MoE router/experts/combine — but the *shapes* are per-model
+and per-bucket, and only the emit knows them.
+
+## Step 3 — run the sweeps, under the lease
+
+Every timed run goes through `perf-data/harness/gpulease <label> <cmd>`, which
+audits for foreign compute processes and **exits 76 if the GPU was contended**.
+`tunedb::measurement_is_trustworthy` accepts only exit 0 — a 76 is a failed
+measurement, never a result with a caveat. Wrap the run, not the build.
+
+| sweep | harness | ingest / consumer |
+|---|---|---|
+| prefill GEMM tiles (AMD) | `plowc … tune gemm` (measure + ingest + verify, one command) or `gemm_tile_sweep <M> <N> <K> [label] [quant]` with `PLOW_GEMM_JSONL=<path>` | `plowc tune ingest --samples <jsonl>`; read back by `devgen::pick_tile` |
+| decode GEMV rungs (AMD) | `gemv_row_sweep <N> <K> [label]` with `PLOW_GEMV_JSONL=<path>`; list from the `TUNEDUMP_GEMV` census (`scripts/rebench_tune_gemv.sh`) | `tunedb-gemv ingest --db tuning --gpu <SKU> --samples <jsonl>` |
+| decode knob grid (NVIDIA) | `scripts/tune_decode_sweep.sh` — joint OBJECT knobs (`PLOW_NV_FORCE_MINBLK`, `GV_UNROLL*`, `GV_MM_MAX`, `PLOW_MOE_DOWN_SG`) scored by end-to-end step TPOT | `tunedb-decode ingest --db tuning --results <jsonl>` |
+| single-CU roofline (evidence only) | `run_ubench_cu.sh` | none — no oracle, never selectable |
+| dispatch floor (evidence only) | `runtime/bench/dispatch/interp_dispatch_floor_nv.cu` / `.hip` | stored `provisional` with `reason_not_qualified` |
+
+The end-to-end prefill-GEMM campaign on AMD, in one command (objects built
+first by `scripts/rebench_build_objs.sh` → `test_kernels.elf`):
+
+```bash
+nix develop --command ./target/release/plowc \
+    --hf-dir <ckpt> --max-ctx <c> --n-cu 256 --num-gpus <g> \
+    tune gemm --gpu mi350 --root . --obj <objdir> --samples <out.jsonl> --lease
+```
+
+`--shapes auto` (the default) derives the list from the compile's demand;
+`--lease` wraps every GPU invocation in `gpulease`. Repeat until clean — one
+clean run is still one sample of the run distribution.
+
+Two knob couplings to respect in any sweep design (from `11-tuning-coverage.md`):
+`GV_MM_MAX` moves the register ceiling of **every** arm in the object because
+the interpreter inlines all of them, and MoE grouped GEMM shares the dense
+`PGM_*` tile triple, so sweeping one moves the other. `PGM_BM` is additionally
+packet-layout-visible (the MoE routing histogram pads to it).
+
+## Step 4 — read the roofline %
+
+For each family, compute the % against the bound that binds:
+
+* **Bandwidth-bound (decode GEMV, decode attention):** bytes actually moved
+  (weights + KV + activations) ÷ measured time, as a fraction of
+  `bandwidth_for_bound()`. `gemv_row_sweep` reports per-(arm, MM) samples;
+  decode GEMV should sit near the weight-streaming bound, and the M curve is
+  what prices the object-level choice of `PLOW_GEMV_MM` and `PLOW_GEMV_WALK`.
+* **Compute-bound (prefill GEMM):** achieved TF/s as a fraction of the
+  *measured sustained* MFMA peak. `gemm_tile_sweep` prints TF/s, and — for the
+  small-M shapes — the **TILE COUNT and CU FILL** each tile achieves, because
+  at M=128 the limit is usually fill, not the tile's own efficiency. A tile
+  that "wins" by 3% while dropping CU fill has not won.
+* **Timings are never a single number.** Records carry
+  `median_ns`/`p10`/`p90`/`min`/`samples`, and `Stats::beats` refuses a win
+  inside the noise. A 1 ns edge under 30 ns of spread is not a result.
+
+When a family is far from its bound, attribute before re-sweeping: the
+occupancy probes (`runtime/bench/nvidia/occ_probe.cu`, `px16_occ_bench.cu`,
+`runtime/ubench/gemm_occ1_bench.c`) separate residency effects from wave
+quantization — see the pitfalls.
+
+## Step 5 — record the winners where the compiler will find them
+
+* **Prefill GEMM (AMD):** `plowc tune gemm` ingests as it measures; a manual
+  sweep goes through `plowc tune ingest --samples <jsonl>`. Records are keyed
+  by cell (`tunedb::amd_tuning_cell(spec)` — the ONE rule shared by writer and
+  reader), op case (`gemm_op_case(m,n,k,quant)` — quant is in the key so a bf16
+  timing is never served for an fp8 op), and tile; `gemm_rung_opcode` maps a
+  winning tile back to the opcode that carries it, and returns `None` for
+  calibration-only tiles that must not become selectable facts.
+* **Decode GEMV (AMD):** `tunedb-gemv ingest --db tuning --gpu <SKU>
+  --samples <jsonl>`. `--gpu` is required — it decides the cell.
+* **Decode knobs (NVIDIA):** the winner is an object, not a record the emitter
+  reads; consume it as build defines:
+
+  ```bash
+  PLOW_EXTRA_DEFINES="$(tunedb-decode best --db tuning \
+      --hardware nvidia/sm_120a/rtx-5090 --print defines)" \
+    scripts/build_sm120_cubin.sh out/interp_sm120.cubin
+  ```
+
+  `--print` refuses when the filter leaves more than one cell standing: a flag
+  string names ONE object, and the union of two cells' winners is an object
+  nobody measured.
+
+Then **verify consumption** — a publish that lands in a cell nobody reads is
+silent in both directions:
+
+```bash
+plowc tune status --gpu <name> --db tuning      # the cell now holds qualified records
+plowc tune select --gpu <name> --shape M,N,K    # rationale: measured; tier: sku-calibrated
+```
+
+If the selection still says `analytical cold start` / tier `portable` for a
+shape you just measured, the campaign published into the wrong cell or under a
+stale digest — a miss is byte-identical to "never measured", so this check is
+the only thing that distinguishes a working campaign from a no-op one.
+
+## Success criteria
+
+1. **Coverage census is explicit.** Every hot-kernel shape from the compiler's
+   demand (`tune shapes`, `TUNEDUMP_GEMV`) is HIT in the store, or its MISS is
+   explained (no oracle for the family, no knob, alias group).
+2. **Winners are qualified.** Winning records are in state `qualified` — oracle
+   passed, ≥ `Stats::MIN_SAMPLES`, decisive under `Stats::beats` — and object
+   winners are recorded as the exact `-D` define string.
+3. **The compiler sees them.** `plowc tune select` reports rationale `measured`
+   and tier `sku-calibrated` (or better) on covered shapes.
+4. **Roofline % recorded per family** against the measured (not datasheet)
+   denominators, with the binding side (compute vs bandwidth) named.
+5. **Every timed run was uncontended** (`gpulease` rc=0); every rc=76 run was
+   discarded and re-measured.
+6. **Untunable is written down, not skipped over.** Families with no oracle or
+   no knob on this target are recorded as such (they will resurface in
+   Stage 5/6 as build-knob work, not tuner work).
+
+## Pitfalls (from real campaigns)
+
+* **Ranking an alias group measures dispatch noise.** NVIDIA's three dense-GEMM
+  opcodes reach one body; a "winner" among them will not reproduce. Read the
+  `aliases` block before designing any sweep. Body-level aliases (AMD MoE group
+  ops are `k`-loops over the expert ops at default flags) do not appear there —
+  known blind spot.
+* **A hard `#define` is not a knob.** `-D` on it is a redefinition and the
+  numbers describe a tile that was never built. `classify_macro` first, always.
+  NVIDIA attention tiles are not macros at all — `BQ`/`BKV` are template
+  literals at the dispatch sites, so sweeping them is a code edit, not a
+  parameter search.
+* **Standalone kernel numbers do not transfer.** A standalone GEMM and the same
+  GEMM inlined into the interpreter get different register allocations —
+  measured 212 vs 770 TF/s for the same tile family. Measure *through* the
+  interpreter (`interp_gemm_bench.c` builds a one-instruction `PlowProgram`);
+  the bringup runbook (`perf-data/harness/BRINGUP.md`) states the same probe
+  law from the serving side.
+* **Contended runs are quietly ~35% wrong.** The first campaign needed three
+  attempts before the `gpulease` audit came back clean, and the contended runs
+  differed from clean ones by ~35% on the gate term. rc=76 is a failed
+  measurement, full stop.
+* **Publishing into the wrong cell is silent in both directions.** `tunedb-gemv`
+  once hardcoded the gfx950 cell while the reader keyed off `--gpu`, so a
+  gfx942 campaign would publish records nobody could read — the mechanical
+  reason the decode-GEMV census had zero records. The reader finds nothing,
+  falls back to the analytical model, and reports `portable`, which is exactly
+  what it reports when nothing was ever measured. Always re-check
+  `tune select` after ingest.
+* **Calibration-only tiles must not become selectable.** The sweep also
+  compiles tiles (320x128, 384x128, …) that no interpreter arm carries; they
+  are legitimate measurements of a body and NOT selectable facts —
+  `gemm_rung_opcode` returns `None` for them by design.
+* **Stub kernels benchmark at ~0 ns and win.** AMD's `XFLASH_MERGE` /
+  `XARGMAX_FIN` have live `case` labels with empty bodies.
+  `ProbedObject::executes` excludes them; a hand-rolled harness will not.
+* **An occupancy "win" can be wave quantization.** A per-cell occ-2 signal of
+  1.1–1.4× on decode flash collapsed to 1.07× (and negative at the deployed
+  config) once a matched-grid control was run
+  (`perf-data/px16-decode-occupancy.md`). Never accept an occupancy delta
+  without the matched-grid control.
+* **Datasheet denominators flatter the kernel.** Judged against gfx942's
+  datasheet peak, a kernel at the measured MFMA issue ceiling looks 28% "slow".
+  Report % of the measured sustained ceiling and say which one you used.
+* **No oracle → no record, however fast it runs.** `runtime/ubench/` numbers
+  and the dispatch-floor probes are evidence and stay `provisional`. On NVIDIA
+  the timing benches and the oracle tests exist in separate files
+  (`sm120_interp_op_test.cu` validates but has no events; the `*_bw_*.cu`
+  timers have no oracle); merging them is the shortest path to a qualifying
+  NVIDIA measurement — until then, NVIDIA GEMM winners are screening results.
+* **The tuner can be a structural no-op on your path.** If every relevant
+  opcode aliases to one body and the tile is object-wide, the real axis is a
+  build knob (`-D` grid → `tune_decode_sweep.sh`), not a per-op record. Confirm
+  the tuner selects something before reporting the family "tuned" (Stage 5's
+  gate re-checks this).
+
+## Code pointers
+
+| symbol / path | role |
+|---|---|
+| `plowc tune` — `inventory\|select\|status\|shapes\|gemm\|ingest\|best\|regress` (`crates/plowc/src/main.rs`, `crates/plowc/src/tune/`) | probe, explain, campaign, ingest |
+| `kernelcaps::select_kernel`, `OpSignature`, `KernelSpec`, `MeasuredCosts` (`crates/kernelcaps/src/select.rs`, `spec.rs`) | selection: measured → analytical fallback, alias collapse |
+| `kernelcaps::probe::dispatch_arms`, `ProbedObject::executes` / `::stubs` (`crates/kernelcaps/src/probe.rs`) | derived kernel inventory, alias + stub detection |
+| `kernelcaps::classify_macro`, `Sweepable` (`crates/kernelcaps/src/sweep.rs`) | is this macro a knob |
+| `tunedb::amd_tuning_cell`, `gemm_op_case`, `gemm_rung_opcode`, `GEMM_ORACLE` (`crates/tunedb/src/gemm.rs`) | record keying — cell, op case, tile→opcode |
+| `tunedb::gemv_case` / `gemv_sample_*` (`crates/tunedb/src/gemv.rs`); `rank_by_cell`, `DecodeKnobs` (`decode.rs`) | GEMV and decode-knob record shapes |
+| `tunedb::Stats` (`beats`, `MIN_SAMPLES`), `TuneStore`, `RecordState`, `Digests` (`crates/tunedb/src/`) | noise gate, staleness, state machine |
+| `tunedb::measurement_is_trustworthy`, `GPULEASE_CONTENDED` (`crates/tunedb/src/lib.rs`) | rc=76 is a failed measurement |
+| `tunedb-gemv` / `tunedb-decode` (`crates/tunedb/src/bin/`) | ingest + `best` for the decode-side stores |
+| `costmodel::CostModel::new`, `kernel_reservation_bytes` (`crates/costmodel/src/lib.rs`); `dma_cycles`, `sm_bytes_per_cycle` (`cost.rs`) | the analytic ceiling and SRAM budget |
+| `hwspec::SmSpec`, `MemorySpec::bandwidth_for_bound` (`crates/hwspec/src/spec.rs`) | per-SM resources; measured-bandwidth floor |
+| `devgen::pick_tile` (`crates/devgen/src/lib.rs`) | the emit-side consumer of qualified GEMM records |
+| `runtime/bench/gemm/gemm_tile_sweep.c`, `gemm_bench_8k.c`, `gemv_row_sweep.c` | tile / row-bucket sweeps with oracle + JSONL |
+| `runtime/bench/interp/interp_gemm_bench.c`, `qwen_interp_bench.c`, `dsa_gather_bench.c` | time-and-validate through the interpreter |
+| `runtime/bench/dispatch/interp_dispatch_floor.hip` / `_nv.cu` | dispatch-floor calibration (provisional evidence) |
+| `runtime/ubench/bench_cu_roofline.c`, `run_ubench_cu.sh`, `bench_cu_gfx950.hip` | single-CU roofline vs theoretical ceilings |
+| `scripts/rebench_build_objs.sh`, `rebench_tune_gemm_all.sh`, `rebench_tune_gemv.sh`, `tune_decode_sweep.sh`, `build_sm120_cubin.sh` | campaign orchestration |
+| `perf-data/harness/gpulease`, `perf-data/harness/BRINGUP.md` | the lease + the measurement runbook |
+| `tuning/README.md`, `tuning/<vendor>/<isa>/<sku>/` | the record schema and the store itself |
+
+Related context: `docs/arch/11-tuning-coverage.md` (per-family verdicts this
+stage executes against), `docs/arch/12-using-the-tuner.md` (reading inventories,
+tiers, and the record schema), `perf-data/px16-decode-occupancy.md` /
+`perf-data/px19-tile-graph.md` (measured occupancy / tile-granularity results
+worth reading before re-deriving them).

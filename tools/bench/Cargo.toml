@@ -9,9 +9,10 @@
 # so the rev and its full transitive tree are version-locked in Cargo.lock
 # while `cargo build --workspace` never compiles (or links) any of it.
 #
-# The benchmark runs use the tool's own binary, built from the SAME rev by
-# `perf-data/bench_ib.sh` (cargo install --git … --rev … --root target/tools).
-# Keep the rev here and in that script in sync.
+# The benchmark runs use the tool's own binary, built from the SAME rev
+# (cargo install --git … --rev … --root target/tools); see
+# docs/bringup/07-perf-campaign.md. Keep the rev here and in the campaign
+# invocation in sync.
 
 [package]
 name = "bench-ib"
