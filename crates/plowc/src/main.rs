@@ -92,19 +92,20 @@ struct Cli {
     #[arg(long)]
     out: Option<PathBuf>,
 
-    /// Artifact form to emit (requires --hf-dir):
-    ///   * `packets` (default) — scheduled `.pkt` bucket streams + manifest,
-    ///     run on the CPU reference interpreter / simulator;
-    ///   * `devblob` — a single PLOWDEV `model.pkt` the GPU runtime executes,
-    ///     plus a servable `weights.json`. Replaces the deprecated `gemma4`
-    ///     binary; the `PLOW_*` emit knobs (FP8, PLOW_BLOCK, PLOW_UNISEG, …)
-    ///     are honored exactly as before;
+    /// Artifact form to emit:
+    ///   * `devblob` (default with --hf-dir) — a single PLOWDEV `model.pkt`
+    ///     the GPU runtime executes, plus a servable `weights.json`. Replaces
+    ///     the deprecated `gemma4` binary; the `PLOW_*` emit knobs (FP8,
+    ///     PLOW_BLOCK, PLOW_UNISEG, …) are honored exactly as before;
+    ///   * `packets` (default with --net/--model) — scheduled `.pkt` bucket
+    ///     streams + manifest, run on the CPU reference interpreter /
+    ///     simulator;
     ///   * `devblob+cubin` — as `devblob`, then BUILD the interpreter object
     ///     from the manifest it just wrote. Opt-in, and only this form needs a
     ///     CUDA toolkit: `devblob` alone still requires none, so the shipped
     ///     binaries keep working against prebuilt assets.
-    #[arg(long, value_enum, default_value_t = EmitKind::Packets)]
-    emit: EmitKind,
+    #[arg(long, value_enum)]
+    emit: Option<EmitKind>,
 
     /// devblob only: target ISA recorded in `build.json` (`sm_120a`, `sm_90a`,
     /// `gfx950`, …), and the arch `--emit devblob+cubin` builds for.
@@ -310,6 +311,19 @@ struct Cli {
     emit_cfg: EmitConfig,
 }
 
+impl Cli {
+    /// `--emit` with its context-dependent default: `devblob` when compiling a
+    /// checkpoint (`--hf-dir`), `packets` for the `--net`/`--model` simulator
+    /// flows (devblob requires a checkpoint).
+    fn emit(&self) -> EmitKind {
+        self.emit.unwrap_or(if self.hf_dir.is_some() {
+            EmitKind::Devblob
+        } else {
+            EmitKind::Packets
+        })
+    }
+}
+
 /// Bucket presets control the batch×seq grid.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Preset {
@@ -352,7 +366,8 @@ enum PhaseArg {
 /// What kind of artifact `plowc` writes. See `Cli::emit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum EmitKind {
-    /// Scheduled `.pkt` bucket streams + manifest (the default pipeline).
+    /// Scheduled `.pkt` bucket streams + manifest (the `--net`/`--model`
+    /// default).
     Packets,
     /// A single PLOWDEV device blob the GPU runtime executes.
     Devblob,
@@ -533,7 +548,7 @@ fn main() -> ExitCode {
         batch = ?cli.batch,
         seq = ?cli.seq,
         phase = ?cli.phase,
-        emit = ?cli.emit,
+        emit = ?cli.emit(),
         preset = ?cli.preset,
         parallel = ?cli.parallel,
         page_kib = cli.page_kib,
@@ -570,7 +585,7 @@ fn main() -> ExitCode {
         };
     }
 
-    if matches!(cli.emit, EmitKind::Devblob | EmitKind::DevblobCubin) {
+    if matches!(cli.emit(), EmitKind::Devblob | EmitKind::DevblobCubin) {
         info!(gpu = %cli.gpu, "devblob emit started");
         return match run_devblob(&cli) {
             Ok(out) => {
@@ -1236,7 +1251,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // Runs AFTER emission, from the manifest that emission produced — never from
     // the CLI's idea of what was emitted, which is the drift this whole change
     // exists to remove.
-    if cli.emit == EmitKind::DevblobCubin {
+    if cli.emit() == EmitKind::DevblobCubin {
         build_cubin_from_manifest(&pkt, &cli.arch)?;
     }
 
