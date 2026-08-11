@@ -141,7 +141,7 @@
  * WHAT IT ATTACKS. `gate_ag` is the two-shot's SECOND rendezvous and, unlike `gate_rs`, it
  * needs `nranks*nblk` arrivals -- every workgroup must speak for itself, because PHASE 1
  * writes the owned slice COLLABORATIVELY (the note on RENDEZVOUS 2 below is the argument and
- * it stands). As built, each of the `nblk` workgroups issues `nranks` SYSTEM-scope returning
+ * it stands). Without aggregation, each of the `nblk` workgroups issues `nranks` SYSTEM-scope returning
  * RMWs on ONE 128 B line per peer: at nblk=304, tp=8 that is 2432 remote atomics per rank per
  * collective, all contending on eight lines.
  *
@@ -149,10 +149,9 @@
  * 1-signaller N-way gate round costs 8.2 us; this 304-signaller one costs 51.8 us -- 6.3x.
  * The mechanism is confirmed independently by the atomics probe in
  * glm52-packet-protocol-xcd.md section 2: a returning atomic is 392 ns on a PRIVATE line and
- * 2770 ns at 304 claimants on ONE line (7.1x). It is PREFILL-ONLY: `XReduceTwoShot` appears
- * 156x in every prefill program and 0x in the decode program (decode's collective is the
- * one-shot `d_xreduce_mega`, one `i[3]` gate), so the prize is ~8 ms of TTFT per launch and
- * EXACTLY 0.0% of TPOT.
+ * 2770 ns at 304 claimants on ONE line (7.1x). It was originally prefill-only. Batched K3
+ * decode also emits `XReduceTwoShot`; B32 has 186 instances, so the same aggregation is
+ * decode-critical there. B1 and ordinary decode retain the one-shot `d_xreduce_mega`.
  *
  * THE FIX, AND WHY IT NEEDS NO BLOB CHANGE. `PLOW_CTR_STRIDE` is 32 words (128 B) per
  * counter and only word 0 is ever used, so word 1 of this gate's OWN line is a free

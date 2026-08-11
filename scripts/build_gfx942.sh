@@ -442,10 +442,9 @@ fi
 # This aggregates them on word 1 of the same counter line (PLOW_CTR_STRIDE is 32 words and
 # only word 0 is used) and lets the closing workgroup issue nranks signals carrying nblk each
 # -- so word 0 still lands on exactly nranks*nblk and plowrt's host audit is unchanged.
-# BIT-IDENTICAL (no value is touched) and objects-only: no blob, no emitter, no arm marker;
-# an object built without it is correct-just-slower. PREFILL ROWS ONLY -- `XReduceTwoShot`
-# is emitted 156x per prefill program and ZERO times in the decode program, so this is TTFT
-# work and exactly 0.0% of TPOT.
+# BIT-IDENTICAL (no value is touched) and objects-only: no blob or emitter change. Generic
+# decode uses the one-shot, while batched K3 decode emits 186 two-shot collectives at B32 and
+# enables the same mechanism through PLOW_K3_DECODE_XR_AGG below.
 # HISTORY: default-on 2026-08-09, reverted same day (an XR_AGG-only build FAILED the
 # 3000-token needle gate, '741' for '7413'), RE-ADOPTED 2026-08-10 after the ordering fix.
 # The failing cut released with a FENCE and arrived with a relaxed AGENT-scope RMW — that
@@ -544,6 +543,11 @@ case "${PLOW_K3_DECODE_ROUTER_LOCAL:-1}" in
   0) AX_K3_ROUTER_LOCAL="" ;;
   1) AX_K3_ROUTER_LOCAL="-DPLOW_MOE_ROUTER_SELECT_LOCAL=1" ;;
   *) echo "FAIL: PLOW_K3_DECODE_ROUTER_LOCAL must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${PLOW_K3_DECODE_XR_AGG:-1}" in
+  0) AX_K3_DECODE_XR_AGG="" ;;
+  1) AX_K3_DECODE_XR_AGG="-DPLOW_XR_AGG=1" ;;
+  *) echo "FAIL: PLOW_K3_DECODE_XR_AGG must be 0 or 1" >&2; exit 2 ;;
 esac
 case "${PLOW_K3_DECODE_GROUPED:-0}" in
   0|1) ;;
@@ -828,8 +832,8 @@ ROWS=(
   # K3Moe and K3MoeA4w4 onto PrefillArm::K3 for the decode phase), and it carries the mxfp4
   # EXPERT walks by default. `$AX_K3_DECODE_MXFP4` rides along so an all-fp4 packet finds its fp4
   # PROJECTION ops in the same object rather than falling through the silent dispatch `default:`.
-  "interp_decode_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4"
-  "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_FP8KV"
+  "interp_decode_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_K3_DECODE_XR_AGG"
+  "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_FP8KV $AX_K3_DECODE_XR_AGG"
   # ATTENTION-ONLY, exactly as on gfx950: without $AX_MOE the grouped expert packets fall through
   # `default:` and write nothing. A whole-layer K3 prompt needs the `_moe` rows below.
   "interp_prefill_k3|$AX_PREFILL $AX_MLA_K3 $AX_MXFP4"
@@ -970,6 +974,19 @@ for row in "${ROWS[@]}"; do
           echo "  UNEXPECTED GEMV WALK: PLOW_GEMV_WALK=0"
           fail=1
         fi
+        case "$stem" in
+          interp_decode_k3*|interp_decode_fp8kv_k3*)
+            if [ -n "$AX_K3_DECODE_XR_AGG" ]; then
+              grep -qE "OBJECT .* plow_xr_agg_1$" <<<"$symbols" || {
+                echo "  MISSING XR AGG: expected plow_xr_agg_1"
+                fail=1
+              }
+            elif grep -qE "OBJECT .* plow_xr_agg_1$" <<<"$symbols"; then
+              echo "  UNEXPECTED XR AGG: PLOW_K3_DECODE_XR_AGG=0"
+              fail=1
+            fi
+            ;;
+        esac
         ;;
     esac
   done

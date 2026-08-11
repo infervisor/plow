@@ -108,6 +108,9 @@ typedef struct {
  * bit-identical to the [XReduce -> AddNorm] pair it replaces (dev_isa.h op 116).
  * Marker symbol so a future loader check can refuse op-116 blobs on old objects. */
 extern "C" __device__ unsigned plow_xrn_1 = 1;
+#if PLOW_XR_AGG_ON
+extern "C" __device__ unsigned plow_xr_agg_1 = 1;
+#endif
 
 __device__ __forceinline__ void d_xreduce_add_norm_mega(
     bf16* out, bf16* resid, const bf16* a, const bf16* gamma,
