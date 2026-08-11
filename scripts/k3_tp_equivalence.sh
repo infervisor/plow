@@ -19,7 +19,7 @@
 #
 # A peer-slot contract violation is invisible to every per-op gate, every per-layer fixture and
 # every tp=1 run. This script is the control that sees it. Measured discrimination, real weights,
-# `K3_NLAYERS=2`, cosine of the full 163840-wide logit vector:
+# `PLOW_K3_LAYERS=2`, cosine of the full 163840-wide logit vector:
 #
 #            tp1 vs tp8 cos      argmax
 #   BROKEN      0.946582         64052 vs 2336        (prefill)
@@ -30,7 +30,7 @@
 # — four orders of magnitude in `1 - cos`. The default floor of 0.9999 sits between them with
 # enormous margin in both directions.
 #
-# WHY `K3_NLAYERS=2`, AND DO NOT "OPTIMISE" IT DOWN TO 1.
+# WHY `PLOW_K3_LAYERS=2`, AND DO NOT "OPTIMISE" IT DOWN TO 1.
 #
 # Layer 0 is KDA + a DENSE MLP (`first_k_dense_replace = 1`) and has no shared expert and no
 # routed experts, so it exercises no MoE collective. Layer 1 is the first latent MoE. That is not
@@ -46,7 +46,7 @@
 # ALREADY differing — the token said "different" long before it said how much. So the gate is a
 # cosine floor on the full vector, plus argmax equality, and it reports both.
 #
-# WHAT IT DELIBERATELY DOES NOT COVER. `K3_NLAYERS=4` adds the first MLA layer (0-based 3) and its
+# WHAT IT DELIBERATELY DOES NOT COVER. `PLOW_K3_LAYERS=4` adds the first MLA layer (0-based 3) and its
 # fp8 KV cache, whose quantisation differs between the tp=1 and tp=8 FlashMLA geometries
 # (`nsplit`/`gf` are functions of the LOCAL head count). Measured after the fix: mostly 0.99997,
 # but one step at 0.990 — real and benign, and a floor loose enough to admit it is too loose to be
@@ -58,28 +58,30 @@
 # degree. A prefill ladder on one side and not the other would confound TP with the GEMM/GEMV seam.
 #
 # COST AND PREREQUISITES. Real weights only — there is nothing to compare on unbound weights.
-# `K3_NLAYERS=2` is ~20 GiB of checkpoint: at tp=8 that is ~2.6 GiB a rank, at tp=1 it is ~20 GiB
+# `PLOW_K3_LAYERS=2` is ~20 GiB of checkpoint: at tp=8 that is ~2.6 GiB a rank, at tp=1 it is ~20 GiB
 # on GPU 0 alone, so the tp=1 side is what sets the free-VRAM requirement. About 60 s a side
 # including emit, load and bind; ~3 minutes for the default two-depth sweep. Every prerequisite is
 # a clean SKIP (exit 0) rather than a failure, so a CI wrapper may call this unconditionally on a
 # box that has neither 8 GPUs nor 1.5 TB of Kimi-K3.
 #
-#   scripts/k3_tp_equivalence.sh
-#   PLOW_K3_LAYERS=1,2,4 PLOW_K3_COS=0.985 scripts/k3_tp_equivalence.sh
+#   nix develop --command scripts/k3_tp_equivalence.sh
+#   nix develop --command env PLOW_K3_LAYERS=1,2,4 PLOW_K3_COS=0.985 scripts/k3_tp_equivalence.sh
 #
 # Env: PLOW_K3_CKPT (default the k3_farm symlink farm, else the HF snapshot), PLOW_K3_HSACO
-# (build-amd/hsaco), PLOW_K3_LAYERS (1,2), PLOW_K3_COS (0.9999), PLOW_K3_STEPS (3),
+# (/home/lava/models/k3_mi325x/hsaco), PLOW_K3_LAYERS (1,2), PLOW_K3_COS (0.9999), PLOW_K3_STEPS (3),
 # PLOW_K3_PROMPT ("The capital of France is"), PLOW_K3_OUT (a tmpdir), PLOW_K3_MIN_FREE_GIB (28).
-# `sg render` must be OUTSIDE nix; see the design notes.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/nix_rocm_714.sh"
+plow_init_rocm_714
 
 skip() { echo "SKIP: $*"; exit 0; }
 fail() { echo "FAIL: $*"; exit 1; }
 
 CK="${PLOW_K3_CKPT:-/home/lava/models/k3_farm}"
-HS="${PLOW_K3_HSACO:-build-amd/hsaco}"
+HS="${PLOW_K3_HSACO:-/home/lava/models/k3_mi325x/hsaco}"
+LEASE="$ROOT/perf-data/harness/gpulease"
 STEPS="${PLOW_K3_STEPS:-3}"
 COS="${PLOW_K3_COS:-0.9999}"
 PROMPT="${PLOW_K3_PROMPT:-1008,10484,318,15383,387}"   # "The capital of France is"
@@ -101,8 +103,8 @@ ls "$CK"/*.safetensors >/dev/null 2>&1 || skip "$CK has no safetensors shards"
 [ -x ./target/release/plowc ]  || skip "target/release/plowc absent — cargo build --release -p plowc"
 [ -x ./target/release/plowrt ] || skip "target/release/plowrt absent — cargo build --release -p plowrt --features hsa"
 [ -d "$HS" ] || skip "$HS absent — see docs/BUILD.md for the AMD objects"
+[ -x "$LEASE" ] || skip "$LEASE absent — repository GPU lease helper is required"
 command -v rocm-smi >/dev/null 2>&1 || skip "rocm-smi absent — cannot count GPUs"
-python3 -c 'import numpy' 2>/dev/null || skip "python3 numpy absent — needed to compare the logit vectors"
 
 NGPU="$(rocm-smi --showid 2>/dev/null | grep -oE '^GPU\[[0-9]+\]' | sort -u | wc -l)"
 [ "$NGPU" -ge 8 ] || skip "$NGPU GPU(s) visible, this gate needs 8 (the tp=8 side is the point)"
@@ -138,39 +140,45 @@ for N in "${NLAYERS[@]}"; do
     mkdir -p "$b" "$l"
     # K3_PREFILL=0 on BOTH sides: one program, walked a token at a time, so the degree is the
     # only difference. `--num-gpus` is what makes the emit sharded; there is no `--tp` on plowc.
-    nix develop --command bash -c \
-      "K3_FULL=1 K3_NLAYERS=$N K3_PREFILL=0 PLOW_FP8_KV=1 PLOW_MXFP4=1 ./target/release/plowc \
-         --hf-dir '$CK' --emit devblob --arch gfx950 --gpu mi350 --num-gpus $G --parallel tp \
-         --max-ctx 4096 --n-cu 256 --out '$b'" 2>&1 | grep -aE "^kimi_k3: emitted" \
+    K3_FULL=1 PLOW_K3_LAYERS="$N" K3_PREFILL=0 PLOW_FP8_KV=1 PLOW_MXFP4=1 \
+      ./target/release/plowc --hf-dir "$CK" --emit devblob --arch gfx942 --gpu MI325X \
+      --num-gpus "$G" --parallel tp --max-ctx 4096 --n-cu 304 --out "$b" 2>&1 \
+      | grep -aE "^kimi_k3: emitted" \
       || fail "N=$N tp=$G: emit failed"
-    # `sg render` OUTSIDE nix. `--dump-logits` on the tp==1 path needs the decode-walk fallback
-    # and the dump closure that `amd_bench` gained with this gate; older plowrt binaries will
-    # report "no prefill bucket at or under the max chunk" here.
+    # `--dump-logits` on the tp==1 path needs the decode-walk fallback and the dump closure that
+    # `amd_bench` gained with this gate; older plowrt binaries report "no prefill bucket at or
+    # under the max chunk" here.
     #
     # The run's output is CAPTURED rather than piped straight into `grep`, because a pipeline
     # whose grep matched the word `Error` would have "succeeded" and this loop would have walked
     # on to compare two dumps that were never written.
     log="$OUT/run_${N}_${G}.txt"
-    sg render -c "cd '$ROOT' && flock /tmp/plow_gpu.lock nix develop --command \
-       ./target/release/plowrt amd-bench --blob '$b/model.pkt' --hsaco '$HS' \
-       --checkpoint '$CK' --prompt '$PROMPT' --steps $STEPS --ctx 512 --tp $G \
-       --dump-logits '$l'" > "$log" 2>&1 || true
+    run_rc=0
+    "$LEASE" -n "$G" "k3-tp-equiv-n${N}-tp${G}" \
+      ./target/release/plowrt amd-bench --blob "$b/model.pkt" --hsaco "$HS" \
+      --checkpoint "$CK" --prompt "$PROMPT" --steps "$STEPS" --ctx 512 --tp "$G" \
+      --dump-logits "$l" > "$log" 2>&1 || run_rc=$?
     grep -aE "^prefill:|^  \[" "$log" || true
     if grep -aq "^Error" "$log"; then
       sed -n 's/^Error/  Error/p' "$log" | head -3
       fail "N=$N tp=$G: the run errored (full output in $log)"
     fi
+    [ "$run_rc" -eq 0 ] || fail "N=$N tp=$G: leased run exited $run_rc (full output in $log)"
   done
 
   python3 - "$OUT/log_${N}_1" "$OUT/log_${N}_8" "$COS" "$N" "$STEPS" <<'PY' || bad=1
-import sys, os
-import numpy as np
+import array, math, os, struct, sys
 
 _, d1, d8, cos_floor, n, steps = sys.argv
 cos_floor, n, steps = float(cos_floor), int(n), int(steps)
 
 def rd(p):
-    return (np.fromfile(p, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+    raw = array.array("H")
+    with open(p, "rb") as f:
+        raw.fromfile(f, os.path.getsize(p) // 2)
+    if sys.byteorder != "little":
+        raw.byteswap()
+    return [struct.unpack("<f", struct.pack("<I", u << 16))[0] for u in raw]
 
 tags = ["prefill"] + [f"{i:03d}" for i in range(steps)]
 bad = 0
@@ -181,13 +189,17 @@ for tag in tags:
         bad = 1
         continue
     x, y = rd(p1), rd(p8)
-    if x.shape != y.shape:
-        print(f"  N={n} {tag:8s} SHAPE {x.shape} vs {y.shape}")
+    if len(x) != len(y):
+        print(f"  N={n} {tag:8s} SHAPE {len(x)} vs {len(y)}")
         bad = 1
         continue
-    cos = float(x @ y / (np.linalg.norm(x) * np.linalg.norm(y)))
-    a1, a8 = int(x.argmax()), int(y.argmax())
-    mx = float(np.abs(x - y).max())
+    dot = sum(a * b for a, b in zip(x, y))
+    nx = math.sqrt(sum(a * a for a in x))
+    ny = math.sqrt(sum(b * b for b in y))
+    cos = dot / (nx * ny)
+    a1 = max(range(len(x)), key=x.__getitem__)
+    a8 = max(range(len(y)), key=y.__getitem__)
+    mx = max(abs(a - b) for a, b in zip(x, y))
     ok = cos >= cos_floor and a1 == a8
     print(f"  N={n} {tag:8s} cos {cos:.8f}  argmax {a1} vs {a8}  maxabs {mx:.5f}  "
           f"{'ok' if ok else 'MISMATCH'}")

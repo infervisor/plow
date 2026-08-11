@@ -744,6 +744,7 @@ ROWS=(
   # ATTENTION-ONLY, exactly as on gfx950: without $AX_MOE the grouped expert packets fall through
   # `default:` and write nothing. A whole-layer K3 prompt needs the `_moe` rows below.
   "interp_prefill_k3|$AX_PREFILL $AX_MLA_K3 $AX_MXFP4"
+  "interp_prefill_fp8kv_k3|$AX_PREFILL $AX_MLA_K3 $AX_MXFP4 $AX_FP8KV"
   "interp_prefill_k3_moe|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_MXFP4"
   # THE ROW A K3 PREFILL PACKET ACTUALLY LOADS (exec/amd.rs: grouped ops with i[3] == MXFP4
   # resolve the K3MoeA4w4 arm). On this arch it contains the simulated body -- see AX_A4W4.

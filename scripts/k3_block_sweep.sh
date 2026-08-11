@@ -2,7 +2,7 @@
 # k3_block_sweep.sh — the FAST K3 decode iteration loop: a 5-layer TP8 asset swept over ctx.
 #
 # WHY A BLOCK AND NOT THE MODEL. A full 93-layer emit + load + 32 steps is ~5 minutes a point,
-# almost all of it weight-table allocation and bind. `K3_NLAYERS=5` is the smallest span that
+# almost all of it weight-table allocation and bind. `PLOW_K3_LAYERS=5` is the smallest span that
 # contains BOTH mixers (4 KDA + 1 MLA, because layer 3 is the first MLA layer), so it exercises the
 # ctx-invariant half of a layer AND the ctx-scaling half. It loads in ~1 s and sweeps three context
 # points in under two minutes.
@@ -19,28 +19,57 @@
 #   scripts/k3_block_sweep.sh                      # baseline sweep
 #   scripts/k3_block_sweep.sh PLOW_K3_FUSE_A=1     # any emit knob, applied to the emit
 #
-# Env: PLOW_K3_HSACO (default build-amd/hsaco), PLOW_K3_STEPS (64), PLOW_K3_CTX (8000,16000,32000).
-# `sg render` must be OUTSIDE nix; see the design notes.
+# Env: PLOW_K3_HSACO, PLOW_K3_STEPS (64), PLOW_K3_CTX (8000,16000,32000).
+# Invoke the script through `nix develop --command`; it refuses every other ROCm environment.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-CK="${PLOW_K3_CKPT:-$(ls -d "$HOME"/.cache/huggingface/hub/models--moonshotai--Kimi-K3/snapshots/*/ | head -1)}"
-HS="${PLOW_K3_HSACO:-build-amd/hsaco}"
+source "$ROOT/scripts/nix_rocm_714.sh"
+plow_init_rocm_714
+
+CK="${PLOW_K3_CKPT:-/home/lava/models/k3_farm}"
+HS="${PLOW_K3_HSACO:-/home/lava/models/k3_mi325x/hsaco}"
 STEPS="${PLOW_K3_STEPS:-64}"
 OUT="${PLOW_K3_OUT:-/home/lava/models/k3blk_sweep}"
 IFS=, read -ra CTXS <<< "${PLOW_K3_CTX:-8000,16000,32000}"
 
-echo "=== emit (K3_NLAYERS=5, K3_PREFILL=0, TP8, fp8 KV) ${*:-no extra knobs}"
-nix develop --command bash -c \
-  "K3_FULL=1 K3_NLAYERS=5 K3_PREFILL=0 PLOW_FP8_KV=1 PLOW_MXFP4=1 $* ./target/release/plowc \
-     --hf-dir '$CK' --emit devblob --arch gfx950 --gpu mi350 --num-gpus 8 --parallel tp \
-     --max-ctx 32768 --n-cu 256 --out '$OUT'" 2>&1 | grep -aE "emitted 5 layers|decode instructions|ABLATE"
+[ -d "$CK" ] || { echo "FAIL: checkpoint directory not found: $CK" >&2; exit 2; }
+[ -d "$HS" ] || { echo "FAIL: gfx942 object directory not found: $HS" >&2; exit 2; }
+[ -x ./target/release/plowc ] || { echo "FAIL: build plowc in nix develop" >&2; exit 2; }
+[ -x ./target/release/plowrt ] || { echo "FAIL: build plowrt with HSA in nix develop" >&2; exit 2; }
+
+echo "=== emit (PLOW_K3_LAYERS=5, K3_PREFILL=0, TP8, fp8 KV) ${*:-no extra knobs}"
+env K3_FULL=1 PLOW_K3_LAYERS=5 K3_PREFILL=0 PLOW_FP8_KV=1 PLOW_MXFP4=1 "$@" \
+  ./target/release/plowc --hf-dir "$CK" --emit devblob --arch gfx942 --gpu MI325X \
+  --num-gpus 8 --parallel tp --max-ctx 32768 --n-cu 304 --out "$OUT" 2>&1 \
+  | grep -aE "emitted 5 layers|decode instructions|ABLATE"
 
 echo "=== sweep"
-for C in "${CTXS[@]}"; do
-  # `pos` starts at ctx and increments, so ctx must leave room for --steps under max_ctx.
-  printf 'ctx=%-6s ' "$C"
-  sg render -c "cd '$ROOT' && PLOW_TP_NO_AUDIT=1 nix develop --command ./target/release/plowrt \
-     amd-bench --blob '$OUT/model.pkt' --hsaco '$HS' --steps $STEPS --ctx $C --tp 8" 2>&1 \
-    | grep -aoE "[0-9.]+ ms/token \([0-9.]+ tok/s\)" || echo FAILED
-done
+export PLOW_K3_CTXS="${PLOW_K3_CTX:-8000,16000,32000}"
+export PLOW_K3_PLOWRT="$ROOT/target/release/plowrt"
+export PLOW_K3_BLOB="$OUT/model.pkt"
+export PLOW_K3_HSACO_DIR="$HS"
+export PLOW_K3_CHECKPOINT="$CK"
+export PLOW_K3_PROMPT_IDS="${PLOW_K3_PROMPT:-1008,10484,318,15383,387}"
+export PLOW_K3_STEP_COUNT="$STEPS"
+"$ROOT/perf-data/harness/gpulease" -n 8 k3-mi325x-block-sweep \
+  bash -c 'set -euo pipefail
+    IFS=, read -ra ctxs <<< "$PLOW_K3_CTXS"
+    for ctx in "${ctxs[@]}"; do
+      printf "ctx=%-6s " "$ctx"
+      log="/tmp/k3-mi325x-block-${ctx}.log"
+      if ! PLOW_TP_NO_AUDIT=1 "$PLOW_K3_PLOWRT" amd-bench \
+        --blob "$PLOW_K3_BLOB" --hsaco "$PLOW_K3_HSACO_DIR" \
+        --checkpoint "$PLOW_K3_CHECKPOINT" --prompt "$PLOW_K3_PROMPT_IDS" \
+        --steps "$PLOW_K3_STEP_COUNT" --ctx "$ctx" --tp 8 >"$log" 2>&1; then
+        echo FAILED
+        tail -40 "$log"
+        exit 1
+      fi
+      if ! grep -aoE "[0-9.]+ ms/token \([0-9.]+ tok/s\)" "$log"; then
+        echo FAILED
+        tail -40 "$log"
+        exit 1
+      fi
+    done' \
+  </dev/null
