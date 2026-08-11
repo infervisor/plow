@@ -216,6 +216,7 @@ pub struct AmdTpGroup {
     /// premium against that. `PLOW_TP_NO_AUDIT=1` turns it off for a timing run.
     audit: bool,
     audit_direct: bool,
+    audit_compact: bool,
     /// Read EVERY rank's sampled id, rather than just rank 0's, once every this
     /// many decode tokens — see [`AmdTpGroup::audit_cadence`].
     agree_every: u32,
@@ -303,6 +304,19 @@ impl AmdTpGroup {
         }
         let max_tokens = (tp.slot_bytes / msg) as u32;
         let n_xctr = count_xgates(&blob);
+        let audit_compact = crate::config::RuntimeConfig::get().amd.tp_audit_compact;
+        if audit_compact
+            && blob
+                .progs
+                .iter()
+                .flat_map(|p| &p.stream)
+                .any(|e| e.flags & packet::dev::SE_XCTR != 0)
+        {
+            return Err(RuntimeError::Device(
+                "compact TP audit does not support SE_XCTR fine-gate programs; use the direct or copy audit"
+                    .into(),
+            ));
+        }
         let gate_expect = gate_expectations(&blob, n_gpu, n_xctr);
         let layout = PeerLayout::new(tp.hidden, max_tokens, n_xctr).ok_or_else(|| {
             RuntimeError::Device(format!(
@@ -366,6 +380,7 @@ impl AmdTpGroup {
                     n_gpu,
                     peer_table: tr.peer_scratch_table(),
                     xctr: tr.xctr(),
+                    xstatus_id: n_xctr,
                     scratch_base: tr.scratch_base(),
                     slot_b: tp.slot_bytes,
                 },
@@ -466,6 +481,7 @@ impl AmdTpGroup {
             gate_expect,
             audit: !crate::config::RuntimeConfig::get().amd.tp_no_audit,
             audit_direct: crate::config::RuntimeConfig::get().amd.tp_audit_direct,
+            audit_compact,
             agree_every,
             agree_tick: agree_every,
             // Overwritten by the first submit; the widest rung is the safe pre-first-step value.
@@ -717,7 +733,27 @@ impl AmdTpGroup {
             // report a timeout on gates it never armed.
             let dp = self.cur_dp;
             dstep::timed(&dstep::AUDIT, || {
-                if self.audit_direct {
+                if self.audit_compact {
+                    for (e, r) in self.ranks.iter().zip(self.group.ranks()) {
+                        e.enqueue_xaudit(
+                            dp,
+                            r.xctr(),
+                            self.group.layout().n_xctr,
+                            self.group.n_gpu(),
+                            r.xstatus(),
+                        )?;
+                    }
+                    for e in &self.ranks {
+                        e.drain()?;
+                    }
+                    match self.group.audit_xstatus_direct() {
+                        Ok(()) => Ok(()),
+                        Err(status) => self
+                            .group
+                            .audit_xctr_direct(&self.gate_expect[dp])
+                            .and(Err(status)),
+                    }
+                } else if self.audit_direct {
                     self.group.audit_xctr_direct(&self.gate_expect[dp])
                 } else {
                     self.group.audit_xctr(&self.gate_expect[dp])

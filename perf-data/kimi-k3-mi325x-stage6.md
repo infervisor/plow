@@ -55,6 +55,10 @@ host-mapped large-BAR memory after the device drain. It remains opt-in. A
 token identical on all eight ranks. This is 8.2% faster than the 79.8 ms/token
 audited control while retaining per-token gate validation.
 
+The deliberately unaudited 64-token diagnostic floor is 69.091 ms/token. It is
+not a serving recipe; it bounds the remaining host audit opportunity at 4.161
+ms/token before any device-kernel change.
+
 ```bash
 nix develop --command env \
   PLOW_L2_PLACE_DISPATCH=1 PLOW_TP_AUDIT_DIRECT=1 \
@@ -65,6 +69,40 @@ nix develop --command env \
   --checkpoint /home/lava/models/k3_farm \
   --prompt 1008,10484,318,15383,387 --steps 64 --ctx 5 --tp 8
 ```
+
+## Serve-path gate
+
+The OpenAI-compatible serve path loaded the GPU backend and real K3 tokenizer,
+then completed the four-prompt `bringup_gate.sh` battery under one TP8 lease.
+All responses were coherent; the first prompt, `The capital of France is`,
+returned exactly `Paris.`. This exercises tokenization, the complete graph,
+carried KDA/MLA state, hidden-state flow, TP sampling, and detokenization rather
+than only the `amd-bench` id path.
+
+The optional flash object still refuses K3 capability and safely falls back to
+the eight-wave interpreter. Current K3 FP8 MLA op 110 is excluded from class-4
+routing, so merely adding the marker would remove the warning without changing
+the measured K3 path.
+
+## Adopted single-stream recipe
+
+The gated asset now uses the 152-workgroup GEMV ownership packet described in
+`perf-data/kimi-k3-mi325x-gemv-wg152.md` and FP8-KV decode objects containing the
+compact exact-counter audit kernel. The composed 64-token result is 55.639
+ms/token (18.0 tok/s), with all eight ranks token-identical. The OpenAI serve
+gate also passed on this exact packet/object/runtime combination.
+
+```bash
+nix develop --command env \
+  PLOW_L2_PLACE_DISPATCH=1 PLOW_TP_AUDIT_COMPACT=1 \
+  perf-data/harness/gpulease -n 8 k3-mi325x-serve \
+  ./target/release/plowrt serve \
+  --assets /home/lava/models/k3_mi325x --port 8000
+```
+
+This AMD engine is single-sequence per rank. Concurrency above one measures
+queueing rather than batched kernel capacity; it is not yet a Stage-7
+concurrency result.
 
 ## Remaining comparison gate
 

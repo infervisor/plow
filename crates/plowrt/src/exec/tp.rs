@@ -95,6 +95,7 @@ const PEER_ALIGN: u64 = XCTR_STRIDE as u64;
 ///   [0]           partial_A   tokens·hidden·2 B   o_proj partial
 ///   [slot_b]      partial_B   tokens·hidden·2 B   down   partial
 ///   [xctr_off]    xctr        n_xctr·128 B        cross-GPU counters
+///   [xstatus_off] xstatus     128 B               compact-audit result
 /// ```
 ///
 /// The layout is identical on every rank on purpose: a producer signalling peer
@@ -133,6 +134,8 @@ pub struct PeerLayout {
     partial_bytes: u64,
     /// Byte offset of the counter sub-region within the peer scratch.
     xctr_off: u64,
+    /// Byte offset of the compact-audit status line.
+    xstatus_off: u64,
     /// Total peer-mapped bytes per rank.
     total: u64,
 }
@@ -183,13 +186,15 @@ impl PeerLayout {
             return None;
         }
         let xctr_off = partial_bytes * PARTIAL_SLOTS;
-        let total = xctr_off + n_xctr as u64 * XCTR_STRIDE as u64;
+        let xstatus_off = xctr_off + n_xctr as u64 * XCTR_STRIDE as u64;
+        let total = xstatus_off + XCTR_STRIDE as u64;
         Some(PeerLayout {
             hidden,
             max_tokens,
             n_xctr,
             partial_bytes,
             xctr_off,
+            xstatus_off,
             total,
         })
     }
@@ -218,6 +223,15 @@ impl PeerLayout {
     pub fn xctr_bytes(&self) -> u64 {
         self.n_xctr as u64 * XCTR_STRIDE as u64
     }
+
+    /// Byte offset of the isolated compact-audit status line.
+    pub fn xstatus_off(&self) -> u64 {
+        self.xstatus_off
+    }
+
+    fn xstate_bytes(&self) -> u64 {
+        self.xctr_bytes() + XCTR_STRIDE as u64
+    }
 }
 
 /// One rank: its backend, its peer-mapped scratch, and its device-resident
@@ -240,6 +254,8 @@ pub struct TpRank {
     /// `scratch.base + layout.xctr_off()`, precomputed: it is read once per
     /// dispatch and the interpreter needs it as a bare pointer.
     xctr: u64,
+    /// One isolated, peer-mapped line latched by compact device audit.
+    xstatus: u64,
     /// Executor count — the persistent dispatch's grid. Read from the device,
     /// never assumed: a wrong value here is a wrong launch, not a wrong log
     /// line (the CU-count agent-info enum was off by two and reported 30115).
@@ -269,6 +285,10 @@ impl TpRank {
     /// `PlowProgram::xctr` — this rank's counters, inside its own peer region.
     pub fn xctr(&self) -> u64 {
         self.xctr
+    }
+
+    pub fn xstatus(&self) -> u64 {
+        self.xstatus
     }
 
     /// This rank's peer-mapped region base (== `peer_scratch[rank]`).
@@ -480,6 +500,7 @@ impl TpGroup {
                 rank: rank as u32,
                 ordinal: ordinals[rank],
                 xctr: scratch.base + layout.xctr_off(),
+                xstatus: scratch.base + layout.xstatus_off(),
                 backend: be,
                 scratch,
                 peer_table,
@@ -526,7 +547,7 @@ impl TpGroup {
                 .ok_or_else(|| {
                     RuntimeError::Device(format!("rank {} lost its peer facility", r.rank))
                 })?
-                .zero_peer(r.xctr, self.layout.xctr_bytes())?;
+                .zero_peer(r.xctr, self.layout.xstate_bytes())?;
         }
         Ok(())
     }
@@ -633,6 +654,29 @@ impl TpGroup {
         Ok(())
     }
 
+    /// Read the device-compacted audit status: one large-BAR word per rank.
+    pub fn audit_xstatus_direct(&self) -> Result<()> {
+        for r in &self.ranks {
+            if !r.backend.peer().is_some_and(|p| p.peer_host_writable()) {
+                return Err(RuntimeError::Device(format!(
+                    "rank {} peer memory is not host-mapped — compact TP audit needs large BAR",
+                    r.rank
+                )));
+            }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            // SAFETY: `xstatus` is an isolated line in this host-mapped allocation,
+            // and all interpreter and audit dispatches have drained.
+            let status = unsafe { std::ptr::read_volatile(r.xstatus as *const u32) };
+            if status != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "compact cross-GPU audit failed on rank {} (status {status:#010x})",
+                    r.rank
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Bring-up self-check: every ordered rank pair must be able to reach the
     /// other's peer region, byte-exact.
     ///
@@ -730,7 +774,7 @@ impl TpGroup {
     /// still the default and this is opt-in — the 16 µs is the price of not
     /// guessing about a memory model.
     pub fn zero_xctr_direct(&self) -> Result<()> {
-        let n = self.layout.xctr_bytes() as usize;
+        let n = self.layout.xstate_bytes() as usize;
         for r in &self.ranks {
             if !r.backend.peer().is_some_and(|p| p.peer_host_writable()) {
                 return Err(RuntimeError::Device(format!(
@@ -816,6 +860,7 @@ mod tests {
         assert_eq!(l.partial_off(2).unwrap(), 2 * 3840 * 2);
         assert_eq!(l.xctr_off(), 3 * 3840 * 2);
         assert_eq!(l.xctr_bytes(), 96 * 128);
+        assert_eq!(l.xstatus_off(), l.xctr_off() + l.xctr_bytes());
         assert!(l.bytes() < 48 * 1024, "peer footprint {} B", l.bytes());
     }
 
@@ -829,7 +874,10 @@ mod tests {
         assert_eq!(l.n_xctr, 192, "two xctr gates per XReduceTwoShot");
         // devgen: slot_b = t*h*2.
         assert_eq!(l.partial_off(1).unwrap(), 2048 * h as u64 * 2);
-        assert_eq!(l.bytes(), PARTIAL_SLOTS * 2048 * h as u64 * 2 + 192 * 128);
+        assert_eq!(
+            l.bytes(),
+            PARTIAL_SLOTS * 2048 * h as u64 * 2 + (192 + 1) * 128
+        );
         // ~84 MiB of peer VRAM: negligible next to weights, but three orders of
         // magnitude past the decode region — which is the whole reason
         // `max_tokens` is a parameter and not an assumption.

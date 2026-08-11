@@ -71,6 +71,23 @@
 extern "C" __device__ unsigned plow_k3_arms_1 = 1;
 #endif
 
+/* Compact TP audit. `i[7] == 0` keeps old packets byte-compatible; plowrt patches
+ * TP collective instructions to status_id+1 while loading them. */
+__device__ __forceinline__ uint32_t* plow_xaudit_status(const PlowProgram& prog,
+                                                        const PlowDevInst* in) {
+    return in->i[7] ? PLOW_CTR(prog.xctr, in->i[7] - 1u) : nullptr;
+}
+
+typedef struct {
+    const PlowDevInst* insts;
+    uint32_t n_inst;
+    uint32_t _pad;
+    const uint32_t* xctr;
+    uint32_t n_xctr;
+    uint32_t n_gpu;
+    uint32_t* status;
+} PlowXAuditArgs;
+
 #if !defined(PLOW_BUCKET_FLASH)
 /* PLOW_DOP_XREDUCE_ADD_NORM (116): fused TP all-reduce + residual + RMSNorm, one
  * workgroup. Same rendezvous as d_xreduce_mega; then d_add_norm's math with the `b`
@@ -83,7 +100,7 @@ __device__ __forceinline__ void d_xreduce_add_norm_mega(
     bf16* out, bf16* resid, const bf16* a, const bf16* gamma,
     const void* const* peer_scratch, uint32_t nranks, uint32_t rank, uint32_t feat,
     uint32_t slot_bytes, size_t xctr_byte_off, uint32_t gate_id, uint64_t deadline_ticks,
-    float eps) {
+    uint32_t* status, float eps) {
     __shared__ float xrn_part[PLOW_WAVES];
     __shared__ int xrn_bailed;
     if (threadIdx.x == 0) xrn_bailed = 0;
@@ -99,6 +116,7 @@ __device__ __forceinline__ void d_xreduce_add_norm_mega(
         const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
         while (xctr_poll(lg) < nranks) {
             if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+                if (status) *status = 0xDEAD0000u | rank;
                 xrn_bailed = 1;
                 break;
             }
@@ -175,6 +193,7 @@ __device__ __forceinline__ void d_xreduce_add_norm_mega(
         }
     }
 }
+
 #endif
 
 /* The KV-ENCODING axis, made observable the same way and for a STRICTER reason.  [MLA-FP8-KV]
@@ -3507,18 +3526,20 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
              * and the arm is then byte-identical to the pre-gather one. */
             const size_t xoff =
                 (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+            uint32_t* const xaudit = plow_xaudit_status(prog, in);
             d_xreduce_mega((bf16*)tens[in->t[0]], prog.peer_scratch, prog.n_gpu, prog.rank,
                            in->i[0], in->i[2], xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS,
-                           nullptr, e.slice, in->blocks, in->i[4], in->i[5], in->i[6]);
+                           xaudit, e.slice, in->blocks, in->i[4], in->i[5], in->i[6]);
         } else if (in->op == PLOW_DOP_XREDUCE_ADD_NORM) {
             /* Fused all-reduce + residual + RMSNorm (op 116, one workgroup):
              *   t0=out t1=resid t2=a t3=gamma  i0=feat i1=n_gpu i2=slot i3=gate  f0=eps */
             const size_t xoff =
                 (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+            uint32_t* const xaudit = plow_xaudit_status(prog, in);
             d_xreduce_add_norm_mega((bf16*)tens[in->t[0]], (bf16*)tens[in->t[1]],
                                     (const bf16*)tens[in->t[2]], (const bf16*)tens[in->t[3]],
                                     prog.peer_scratch, prog.n_gpu, prog.rank, in->i[0], in->i[2],
-                                    xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS, in->fj[0].f);
+                                    xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS, xaudit, in->fj[0].f);
         } else if (in->op == PLOW_DOP_XREDUCE2) {
             /* TWO-SHOT all-reduce for the LARGE prefill [T,hidden] partial (§4, bandwidth-
              * optimal): reduce-scatter this rank's owned 1/N slice from every peer, then
@@ -3534,6 +3555,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
              *   with its own gate pair; band 0's transfer overlaps band 1..K-1's producers. */
             const size_t xoff =
                 (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+            uint32_t* const xaudit = plow_xaudit_status(prog, in);
             /* t1/t2 = fused-residual operands (absent on every pre-fold blob): resid in,
              * summed output out2 — see the kernel's fused-residual note. Both take the
              * band offset e0, like out. */
@@ -3545,7 +3567,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             d_xreduce_twoshot_mega((bf16*)tens[in->t[0]] + in->i[5], prog.peer_scratch,
                                    prog.n_gpu, prog.rank,
                                    in->i[0], in->i[2] + in->i[5] * 2u, xoff, in->i[3], in->i[4],
-                                   PLOW_XCTR_DEADLINE_TICKS, nullptr, e.slice, in->blocks,
+                                   PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,
                                    xr_res, xr_o2);
         } else if (in->op == PLOW_DOP_XARGMAX_FIN) {
             /* Cross-rank fold for a VOCAB-COLUMN-PARALLEL lm_head.
@@ -3555,10 +3577,11 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
              *   i3=xctr arrival-gate id  i4=xctr value-slot id (a DIFFERENT id) */
             const size_t xoff =
                 (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+            uint32_t* const xaudit = plow_xaudit_status(prog, in);
             d_xargmax_fin_mega((int*)tens[in->t[0]], (const unsigned long long*)tens[in->t[1]],
                                in->i[0], in->i[1], in->i[2], prog.peer_scratch, prog.n_gpu,
                                prog.rank, xoff, in->i[3], in->i[4], PLOW_XCTR_DEADLINE_TICKS,
-                               nullptr, e.slice);
+                               xaudit, e.slice);
         } else if (in->op == PLOW_DOP_XFLASHMERGE) {
             /* STUB: dispatch present so the switch is total and the
              * compiler's structural emit runs; the CP flash LSE-merge body lands with tp-host.
@@ -3685,6 +3708,35 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                 prog.trace[base + ix] = r;
             }
         }
+        }
+    }
+}
+
+/* Runs only after every rank's interpreter has drained. It preserves the old
+ * exact audit, including zero for unused gates, while reducing the healthy host
+ * path to one status-word read per rank. Defined after the interpreter so the
+ * build scripts' first-kernel resource summary remains the serving kernel. */
+extern "C" __global__ void plow_xctr_audit(PlowXAuditArgs a) {
+    for (uint32_t gate = blockIdx.x * blockDim.x + threadIdx.x; gate < a.n_xctr;
+         gate += gridDim.x * blockDim.x) {
+        uint32_t want = 0;
+        bool data = false;
+        for (uint32_t j = 0; j < a.n_inst; j++) {
+            const PlowDevInst& d = a.insts[j];
+            if (d.op == PLOW_DOP_XREDUCE || d.op == PLOW_DOP_XREDUCE_ADD_NORM) {
+                if (d.i[3] == gate) want = a.n_gpu;
+            } else if (d.op == PLOW_DOP_XREDUCE2) {
+                if (d.i[3] == gate) want = a.n_gpu;
+                if (d.i[4] == gate) want = a.n_gpu * d.blocks;
+            } else if (d.op == PLOW_DOP_XARGMAX_FIN) {
+                if (d.i[3] == gate) want = a.n_gpu;
+                if (d.i[4] == gate) data = true;
+            }
+        }
+        if (!data) {
+            const uint32_t got = xctr_poll(PLOW_CTR(a.xctr, gate));
+            if (got != want)
+                atomicCAS(a.status, 0u, 0xA0000000u | (gate & 0x000FFFFFu));
         }
     }
 }

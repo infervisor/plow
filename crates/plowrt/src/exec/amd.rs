@@ -2885,6 +2885,19 @@ fn rebase_chunk_rows(
     }
 }
 
+fn patch_tp_xaudit(insts: &mut [DevInst64], status_id: u32) {
+    for d in insts {
+        if matches!(
+            DevOp::from_u16(d.op),
+            Some(
+                DevOp::XReduce | DevOp::XReduceTwoShot | DevOp::XReduceAddNorm | DevOp::XArgmaxFin
+            )
+        ) {
+            d.i[7] = status_id + 1;
+        }
+    }
+}
+
 /// This rank's place in a TP group — everything the engine needs from
 /// [`crate::exec::tp::TpGroup`], as plain device addresses.
 ///
@@ -2909,6 +2922,8 @@ pub struct TpBind {
     /// This rank's cross-GPU counters, inside its own peer region —
     /// `PlowProgram::xctr`. From `TpRank::xctr`.
     pub xctr: u64,
+    /// Reserved xctr id used by the compact device audit status line.
+    pub xstatus_id: u32,
     /// This rank's peer-region base (`peer_scratch[rank]`). `act.og_tp` binds at
     /// offset 0 and `act.dg_tp` at [`TpBind::slot_b`], so the row-parallel
     /// o_proj/down write their partials where peers can read them.
@@ -2918,6 +2933,18 @@ pub struct TpBind {
     /// rather than recomputed: a host that computed its own would put `dg_tp`
     /// where no peer reads it, and nothing would say so.
     pub slot_b: u64,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct XAuditArgs {
+    insts: u64,
+    n_inst: u32,
+    _pad: u32,
+    xctr: u64,
+    n_xctr: u32,
+    n_gpu: u32,
+    status: u64,
 }
 
 /// One chunk of a prefill plan: which bucket program runs it, and over which
@@ -2935,6 +2962,7 @@ pub struct ChunkStep {
 /// One program's device-resident tables.
 struct AmdProg {
     t: u32,
+    n_inst: u32,
     trace_records: usize,
     n_counter: u32,
     d_inst: DeviceMem,
@@ -3057,6 +3085,7 @@ pub struct AmdEngine {
 
     k_prefill: HsaKernel,
     k_decode: HsaKernel,
+    k_xaudit: Option<HsaKernel>,
     /// Task-13: low-rung decode tier ladder, ascending (max_rung, kernel).
     decode_tiers: Vec<(u32, HsaKernel)>,
     k_flash: Option<HsaKernel>,
@@ -3328,7 +3357,15 @@ impl AmdEngine {
         // stronger than the env var ever was -- `plow_l2_place_dispatch_1` is checked against the
         // OBJECT below, so a genuinely mismatched pairing is still refused, by inspection instead
         // of by assertion. PLOW_L2_PLACE_DISPATCH=1 still works for anyone scripting it.
-        let blob = DevBlob::parse_l2(&raw, true)?;
+        let mut blob = DevBlob::parse_l2(&raw, true)?;
+        let tp_audit_compact =
+            tp.is_some() && crate::config::RuntimeConfig::get().amd.tp_audit_compact;
+        if tp_audit_compact {
+            let status_id = tp.expect("checked").xstatus_id;
+            for p in &mut blob.progs {
+                patch_tp_xaudit(&mut p.insts, status_id);
+            }
+        }
         // WHICH PHASE is L2-placed, not "is anything placed". `Builder::finish` skips placement
         // per PROGRAM when that program is segmented, and AMD prefill always is -- so a normal
         // gfx942 blob has a PLACED DECODE program and UNPLACED prefill ones. Requiring the
@@ -3545,6 +3582,7 @@ impl AmdEngine {
         // loaded rather than between two of them.
         let requires = build_requires(blob_path)?;
         let mut modules = Vec::new();
+        let mut k_xaudit = None;
         // Task-13 per-rung co-load: an optional SECOND decode object for the low
         // rungs (PLOW_HSACO_LOWRUNG=<dir>), so rung 1-2 traffic runs the tight
         // single-slot codegen while wide rungs keep the batched object. Same
@@ -3710,6 +3748,15 @@ impl AmdEngine {
                 let sym = symbol_name(phase, sched, &arch);
                 let k = EngineDevice::get_function(&*be, &m, &sym)
                     .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {sym}: {e}")))?;
+                if phase == Phase::Decode && tp_audit_compact && k_xaudit.is_none() {
+                    k_xaudit = Some(
+                        EngineDevice::get_function(&*be, &m, "plow_xctr_audit").map_err(|e| {
+                            RuntimeError::Device(format!(
+                            "{name}: compact TP audit requested but plow_xctr_audit is absent: {e}"
+                        ))
+                        })?,
+                    );
+                }
                 // STALE-OBJECT REFUSAL. An object's kernarg segment is its explicit
                 // args, 8-aligned, plus the COv5 implicit block — a FIXED 256 B tail
                 // that hipcc emits only when the kernel uses a hidden arg (the flash
@@ -4373,6 +4420,7 @@ impl AmdEngine {
             };
             progs.push(AmdProg {
                 t: p.t,
+                n_inst: p.insts.len() as u32,
                 trace_records: p.stream.len(),
                 n_counter: p.n_counter,
                 d_inst,
@@ -4669,6 +4717,7 @@ impl AmdEngine {
             trace_write_bytes: Cell::new(0),
             k_prefill,
             k_decode,
+            k_xaudit,
             decode_tiers,
             k_flash,
             sched_prefill,
@@ -4993,6 +5042,39 @@ impl AmdEngine {
     /// Wait for everything this rank has enqueued.
     pub fn drain(&self) -> Result<()> {
         EngineDevice::synchronize(&*self.be)
+    }
+
+    /// Enqueue the post-drain exact xctr scan used by compact TP audit.
+    pub fn enqueue_xaudit(
+        &self,
+        p: usize,
+        xctr: u64,
+        n_xctr: u32,
+        n_gpu: u32,
+        status: u64,
+    ) -> Result<()> {
+        let k = self
+            .k_xaudit
+            .ok_or_else(|| RuntimeError::Device("compact TP audit kernel was not loaded".into()))?;
+        let prog = &self.progs[p];
+        let arg = XAuditArgs {
+            insts: prog.d_inst.base,
+            n_inst: prog.n_inst,
+            _pad: 0,
+            xctr,
+            n_xctr,
+            n_gpu,
+            status,
+        };
+        EngineDevice::launch_kernel(
+            &*self.be,
+            k,
+            1,
+            256,
+            0,
+            as_bytes(std::slice::from_ref(&arg)),
+            None,
+        )
     }
 
     /// Run every segment of program `p`, then drain ONCE.
@@ -6286,6 +6368,28 @@ mod tests {
         // this instance is only ever measured, never dispatched).
         let p: DevProgram = unsafe { std::mem::zeroed() };
         assert_eq!(kernarg_bytes(&p).len(), std::mem::size_of::<DevProgram>());
+    }
+
+    #[test]
+    fn compact_audit_patches_only_tp_collectives() {
+        let mut insts = [
+            DevInst64 {
+                op: DevOp::XReduce as u16,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::XArgmaxFin as u16,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::Gemm as u16,
+                ..Default::default()
+            },
+        ];
+        patch_tp_xaudit(&mut insts, 464);
+        assert_eq!(insts[0].i[7], 465);
+        assert_eq!(insts[1].i[7], 465);
+        assert_eq!(insts[2].i[7], 0);
     }
 
     /// The flash object follows the PREFILL scheduler: a flash segment IS a
