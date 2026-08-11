@@ -1024,8 +1024,9 @@ fn check_dspark_noncausal(syms: &[&str], path: &Path, need: bool) -> Result<()> 
 
 fn requires_k3_spec_verify(progs: &[DevProg]) -> bool {
     progs.iter().flat_map(|p| p.insts.iter()).any(|i| {
-        (i.op == DevOp::FlashMlaDecode as u16 || i.op == DevOp::FlashMlaDecodeFp8 as u16)
-            && i.fj[1] > 1
+        ((i.op == DevOp::FlashMlaDecode as u16 || i.op == DevOp::FlashMlaDecodeFp8 as u16)
+            && i.fj[1] > 1)
+            || (i.op == DevOp::KdaStateStepG as u16 && i.i[4] & 4 != 0)
     })
 }
 
@@ -7521,6 +7522,12 @@ mod tests {
         assert!(!requires_k3_spec_verify(&packet));
         packet[0].insts[0].fj[1] = 1;
         assert!(!requires_k3_spec_verify(&packet));
+
+        let mut kda_only = vec![prog_gemv(&[DevOp::KdaStateStepG], 1)];
+        kda_only[0].insts[0].i[4] = 4;
+        assert!(requires_k3_spec_verify(&kda_only));
+        kda_only[0].insts[0].i[4] = 0;
+        assert!(!requires_k3_spec_verify(&kda_only));
     }
 
     #[test]
