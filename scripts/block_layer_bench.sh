@@ -12,7 +12,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CFG="${1:?usage: block_layer_bench.sh <block-config.json> [-- extra args]}"; shift
 [ "${1:-}" = "--" ] && shift || true
 PY="${PLOW_PY:-/workspace/venvs/vllm-blk/bin/python}"
-GPULEASE="${GPULEASE:-$REPO/perf-data/harness/gpulease}"
+GPULEASE="${GPULEASE:-$REPO/perf-data/tools/gpulease}"
 mkdir -p /workspace/gpu 2>/dev/null || true
 if [ -x "$GPULEASE" ]; then
   exec "$GPULEASE" "blklayer-$(basename "$CFG" .json)" "$PY" "$REPO/scripts/block_layer_bench.py" "$CFG" "$@"

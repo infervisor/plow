@@ -45,7 +45,7 @@ One JSON object per line, appended, never rewritten. Fields are
 
 ## Measurement policy
 
-Runs are serialized through `perf-data/harness/gpulease`, which audits for
+Runs are serialized through `perf-data/tools/gpulease`, which audits for
 foreign compute processes and **exits 76 if the GPU was contended**. A contended
 run is discarded, not stored with a caveat — `tunedb::measurement_is_trustworthy`
 accepts only exit 0. The first campaign in this tree needed three attempts

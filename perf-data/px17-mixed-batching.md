@@ -2,7 +2,7 @@
 
 RTX 5090 (sm_120a, 170 SM, 31.36 GiB usable) · 2026-07-26 · Gemma-4-12B-it, fp8 W8A8, MIXED
 fp8-KV packet (e4m3 on the 8 hd512 FULL layers, bf16 on the 40 sliding rings). Every GPU run under
-`perf-data/harness/gpulease`. Companion to `gemma4-12b-longctx-5090.md` §12–§14,
+`perf-data/tools/gpulease`. Companion to `gemma4-12b-longctx-5090.md` §12–§14,
 `px12-consolidated-baseline.md` (§3 is the cell) and `px14-batched-prefill-fp8.md`.
 
 **Question.** plow loses the matched 127k cell 29.91 vs vLLM 42.49 (1.42×), and ~81% of its wall is
@@ -271,12 +271,12 @@ patch loops. px14 §6 prices it; it is unchanged by this note.
 | pure-decode tick must not regress | **NOT RUN** — no fused object. Measured baseline for it is recorded above: 28.00 ms at B=5.16, 20.19 ms at B=1 |
 | occupancy of a merged object | **NOT RUN** — §5 gives the check (`-Xptxas -v` + load-time `grid == n_cu`) and the reason to expect no movement |
 | long-context coherence after the fix | **PARTIAL** — the fixed build reproduces px12's wall to 0.2%/3.1%, which the corrupt build misses by 1.76×/1.56×. No needle-in-haystack was run on this branch |
-| GPU exclusive | **ENFORCED** — every run under `perf-data/harness/gpulease`, rc=0 |
+| GPU exclusive | **ENFORCED** — every run under `perf-data/tools/gpulease`, rc=0 |
 
 ## 7. Reproduce
 
-    perf-data/harness/gpulease px17-B perf-data/px17_run.sh B                          # baseline
-    perf-data/harness/gpulease px17-C perf-data/px17_run.sh C /root/px12/mx/E PLOW_PF_DEFER_DECODE=1
+    perf-data/tools/gpulease px17-B perf-data/px17_run.sh B                          # baseline
+    perf-data/tools/gpulease px17-C perf-data/px17_run.sh C /root/px12/mx/E PLOW_PF_DEFER_DECODE=1
 
 `px17_run.sh` runs a conc-1 127k prefill probe and then the cell in ONE serve session with
 `PLOW_PF_PACKLOG=1`; the probe's PACKLOG line is the prefix of the cell's. Asset

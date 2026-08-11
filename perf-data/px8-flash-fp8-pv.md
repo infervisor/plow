@@ -2,7 +2,7 @@
 
 RTX 5090 (sm_120a, **170 SMs**, 96 MiB L2, 101,376 B dynamic-smem cap) · 2026-07-26
 bench `runtime/bench/nvidia/px8_flash_fp8pv_bench.cu` · raw `perf-data/px8-flash-fp8-pv-raw.txt`
-run under `perf-data/harness/gpulease`
+run under `perf-data/tools/gpulease`
 Follows PX-7 Result 4/5. `px7_w8a8_ceiling_bench.cu` untouched.
 
 ## Question

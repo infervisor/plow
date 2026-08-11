@@ -45,7 +45,7 @@
  *        perf-data/px6_wavequant_bench.cu -o /tmp/px6            # PGM_BN=128 default
  *   nvcc ... -DPGM_BN=64 ... -o /tmp/px6_bn64                    # E3 arm
  * RUN (always under the lease -- a contended run silently invalidates every number):
- *   perf-data/harness/gpulease px6 /tmp/px6
+ *   perf-data/tools/gpulease px6 /tmp/px6
  */
 #include <cstdio>
 #include <cstdint>

@@ -404,7 +404,7 @@ unset CPATH LIBRARY_PATH LD_LIBRARY_PATH          # nix CPATH collides with CUDA
 
 # E1a — bandwidth denominator + SM count
 nvcc -arch=sm_120a -O3 -o /tmp/zg0bw runtime/tests/zg0_bwcal_sm120.cu
-perf-data/harness/gpulease px6-e1a /tmp/zg0bw
+perf-data/tools/gpulease px6-e1a /tmp/zg0bw
 
 # the campaign harness
 nvcc -arch=sm_120a -O3 -I runtime/common -I runtime/nvidia \
@@ -412,11 +412,11 @@ nvcc -arch=sm_120a -O3 -I runtime/common -I runtime/nvidia \
 nvcc -arch=sm_120a -O3 -I runtime/common -I runtime/nvidia -DPGM_BN=64 \
      runtime/bench/nvidia/px6_wavequant_bench.cu -o /tmp/px6_bn64
 
-perf-data/harness/gpulease px6-cliff  /tmp/px6      cliff    # null control + cliff
-perf-data/harness/gpulease px6-stair  /tmp/px6      stair    # staircase
-perf-data/harness/gpulease px6-shapes /tmp/px6      shapes   # premise test
-perf-data/harness/gpulease px6-rho    /tmp/px6      rho      # the decisive number
-perf-data/harness/gpulease px6-bn64   /tmp/px6_bn64 shapes   # E3
+perf-data/tools/gpulease px6-cliff  /tmp/px6      cliff    # null control + cliff
+perf-data/tools/gpulease px6-stair  /tmp/px6      stair    # staircase
+perf-data/tools/gpulease px6-shapes /tmp/px6      shapes   # premise test
+perf-data/tools/gpulease px6-rho    /tmp/px6      rho      # the decisive number
+perf-data/tools/gpulease px6-bn64   /tmp/px6_bn64 shapes   # E3
 ```
 
 Runtime: ~4 min for `cliff`+`rho`, ~6 min for each `shapes`, ~3 min for `stair`.

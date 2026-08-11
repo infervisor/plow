@@ -4906,7 +4906,7 @@ const AMAX_BLOCKS: u32 = 64;
 /// rounds at S=2, and N=5376 is not even divisible by 512 (23 of the 512 slices get no work).
 ///
 /// MEASURED, MI355X, Gemma-4-31B bf16 real weights, 1024-token prompt, 64 greedy decode steps,
-/// interleaved arms under `perf-data/harness/gpulease -n 1`, contended (rc=76) runs discarded.
+/// interleaved arms under `perf-data/tools/gpulease -n 1`, contended (rc=76) runs discarded.
 /// Objects `build-amd/l2-hsaco2`, blobs `build-amd/l2-s{1,2,4}`, harness `gemma4_chat.c`:
 ///
 /// | S | slices/gemv | wg-packets/token | decode ms/token (median, n) | spread | Δ |

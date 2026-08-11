@@ -64,5 +64,5 @@ exec env -i PATH=/usr/bin:/bin HOME="\$HOME" LD_LIBRARY_PATH=/opt/rocm/lib \\
   PLOW_INTERP=interp_prefill_mla_moe.elf \\
   ./glm52_run blk$LAYER.pkt "$CKPT" pf_l${LAYER}_T${T}.bin $LAYER
 EOF
-exec "$REPO/perf-data/harness/gpulease" -n 1 "glm52-pf-l$LAYER" \
+exec "$REPO/perf-data/tools/gpulease" -n 1 "glm52-pf-l$LAYER" \
      sg render -c "bash $OUT/.run.sh"

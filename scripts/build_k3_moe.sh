@@ -17,7 +17,7 @@
 #       python3 runtime/tests/k3_moe_oracle.py <outdir>/k3_moe_fixture.bin
 #   PYTHONNOUSERSITE=1 nix develop .#quantize --command \
 #       python3 runtime/tests/k3_mxfp4_nibble_oracle.py <outdir>/mxnib_fixture.bin
-#   perf-data/harness/gpulease -n 1 k3moe sg render -c \
+#   perf-data/tools/gpulease -n 1 k3moe sg render -c \
 #       'unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES; cd <outdir> && \
 #        LD_LIBRARY_PATH=/opt/rocm/lib ./k3_moe_test interp_decode.elf k3_moe_fixture.bin'
 set -euo pipefail

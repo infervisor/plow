@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # glm52_dsa_l4_oracle.sh — the DSA correctness question on a TRUNCATED model, in seconds.
 #
-#   perf-data/harness/gpulease -n 4 dsa-l4 sg render -c './scripts/glm52_dsa_l4_oracle.sh 4'
+#   perf-data/tools/gpulease -n 4 dsa-l4 sg render -c './scripts/glm52_dsa_l4_oracle.sh 4'
 #
 # WHY THIS EXISTS. The DSA arm was falsified on the full 78-layer model (perf-data/
 # glm52-dsa-correctness.md §8), and every iteration on it paid the 167-255 s / 183 GiB-per-rank

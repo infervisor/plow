@@ -4,7 +4,7 @@
 GSM8K and a speed bench.
 
 Everything below is against **33.24 ms/token = 30.1 tok/s**, measured 2026-07-30 on 8× gfx950,
-K3 93 layers TP8, ctx 32000, `--steps 200`, UNBOUND, under `perf-data/harness/gpulease` with
+K3 93 layers TP8, ctx 32000, `--steps 200`, UNBOUND, under `perf-data/tools/gpulease` with
 `foreign-during=0`. 75 tok/s is **13.33 ms/token — a 2.49× speedup.**
 
 ---
@@ -133,7 +133,7 @@ that factor and should be re-measured before any further prefill work is scoped.
 
 ## 6. METHOD RULES THIS CAMPAIGN LEARNED THE HARD WAY
 
-* **`perf-data/harness/gpulease`, never a bare `flock /tmp/plow_gpu.lock`.** The bare lock
+* **`perf-data/tools/gpulease`, never a bare `flock /tmp/plow_gpu.lock`.** The bare lock
   serialises but neither waits for nor warns about a concurrent agent's campaign. Timed that way
   one arm read **46.418 ms at position 2 and 33.802 at position 1** — the sign followed the order.
 * **UNBOUND for sub-ms work**, bound only for correctness: a bound run re-reads 195 GiB/rank and

@@ -335,7 +335,7 @@ change leaked into the shipped configuration.
 ## 11.2 Serving
 
 ```bash
-perf-data/harness/gpulease -n 8 serve sg render -c \
+perf-data/tools/gpulease -n 8 serve sg render -c \
   "PLOW_L2_PLACE_DISPATCH=1 nix develop --command ./target/release/plowrt serve \
    --assets /home/lava/models/k3_b4 --port 8000"
 ```

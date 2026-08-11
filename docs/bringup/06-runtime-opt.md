@@ -7,9 +7,13 @@
 
 **Precondition:** Stage 5 complete — one block is numerically correct and at its
 per-block latency target, and `plowc` emits a full-model `model.pkt` that loads.
-Nothing in this stage recompiles the model; every lever is a `plowrt` flag or a
-`PLOW_*` environment variable read at serve time. Choosing the decode batch width
-`B` is the one lever that may send you *back* to Stage 5 to recompile.
+The [`target.md`](target.md) block is filled in; this stage is written against
+`$VENDOR`, `$GPU`, `$NGPU`, `$PARALLEL`, `$MAXCTX`, `$FEATURES` and `$BW_BOUND`,
+and **which levers exist at all is a function of `$VENDOR`** — see the table
+below. Nothing in this stage recompiles the model; every lever is a `plowrt`
+flag or a `PLOW_*` environment variable read at serve time. Choosing the decode
+batch width `B` is the one lever that may send you *back* to Stage 5 to
+recompile.
 
 **Gate out (into Stage 7, e2e campaign):** the model serves at the target
 concurrency with TTFT and TPOT within budget, memory fits (target concurrency is
@@ -35,10 +39,14 @@ HTTP / UDS  →  per-model mux (continuous batching)  →  device engine
   `max_tokens` before its first token.
 * The **engine** is one of two shapes (`serve/engine.rs`, `enum ServeEngine`):
 
-| engine | module | shape |
+| `$VENDOR` | module | shape |
 |---|---|---|
-| CUDA / sm_120 | `exec::gpu::GpuEngine` | **slotted**: B independent sequence slots, chunked prefill, prefix sharing, device sampling. Most runtime levers live here. |
-| AMD / gfx950 | `exec::amd` (`enum Ranks { One, Tp }`) | **single-sequence** per rank (one KV ring, one position, greedy on-device sampling), optionally tensor-parallel. One model per process, no paging, no residency manager. |
+| nvidia | `exec::gpu::GpuEngine` | **slotted**: B independent sequence slots, chunked prefill, prefix sharing, device sampling. Most runtime levers live here. |
+| amd | `exec::amd` (`enum Ranks { One, Tp }`) | **single-sequence** per rank (one KV ring, one position, greedy on-device sampling), optionally tensor-parallel. One model per process, no paging, no residency manager. |
+
+The seam is per **vendor**, not per ISA: every NVIDIA `$ISA` reaches
+`GpuEngine` and every AMD `$ISA` reaches `exec::amd`. A lever marked for one
+vendor below does not exist on the other — it is not merely untuned there.
 
 * Memory is a single per-device **arena** with compiler-resolved offsets
   (`memory::AddressSpace`); KV is carved from it by `memory::streamer::KvArena`
@@ -53,11 +61,17 @@ rungs.
 
 ## The levers
 
-Grouped by what they move. **Platform** marks CUDA/sm_120, AMD/gfx950, or both.
-Defaults are the in-tree defaults from `config.rs` / `main.rs`. Where a lever is
-design-intent but **not wired**, it says so.
+Grouped by what they move. **Platform** is stated as `$VENDOR`: nvidia, amd, or
+both. Defaults are the in-tree defaults from `config.rs` / `main.rs` — the full
+catalogue of every flag is [`docs/flags-reference.md`](../flags-reference.md);
+this section is only the serving-relevant subset and its measured evidence.
+Where a lever is design-intent but **not wired**, it says so.
 
-### 1. Concurrency and batch width — platform: both
+Every measured figure quoted below was taken on the part named with it. None of
+them is a target for `$GPU`; they say a lever *has* an effect and roughly where
+it comes from. Re-measure the size on `$GPU`.
+
+### 1. Concurrency and batch width — `$VENDOR`: both
 
 The decode batch `B` is **compiled into the blob** (`PLOW_DECODE_BATCH` at
 compile time); the mux sizes its slot table to exactly `B` (mux slot *i* IS
@@ -66,19 +80,22 @@ engine slot *i*). The first concurrency decision was therefore made in Stage 5.
 | lever | flag / env | default | effect |
 |---|---|---|---|
 | CPU executor threads | `--executors N` | 8 | reference backend only; GPU engines run one dedicated engine thread per model |
-| Multi-step decode | `PLOW_MULTISTEP=K` | 8 | device advances K greedy tokens per host round-trip. **~1.74× on its own, free** — the single highest-value default (`perf-data/gemma4-12b-sm120-serving.md`). Stochastic rows fall back to per-token. *(sm_120)* |
-| Device sampling | `PLOW_DEV_SAMPLE=1` | on (sm_120) | argmax/sample on device, no logits round-trip; pairs with multi-step *(sm_120)* |
+| Multi-step decode | `PLOW_MULTISTEP=K` | 8 | device advances K greedy tokens per host round-trip; the single highest-value default (measured ~1.74× on its own, 12B on RTX 5090 — `perf-data/gemma4-12b-sm120-serving.md`). Stochastic rows fall back to per-token. *(nvidia)* |
+| Device sampling | `PLOW_DEV_SAMPLE=1` | on (nvidia) | argmax/sample on device, no logits round-trip; pairs with multi-step *(nvidia)* |
 
 > **Pitfall — a wide fixed `B` is not a free win.** Decode is HBM-bandwidth-
-> bound: doubling `B` ~doubles per-token latency. On a 12B-class model, `B=16`
-> crosses a 50 ms inter-token SLO at ~2 concurrent users where `B=8` holds to ~4
-> (`perf-data/serving-capacity-report.md`, `perf-data/b2-concurrency-family.md`).
-> Pick `B` from the **TPOT budget**, not the peak-throughput number. A fixed
+> bound against `$BW_BOUND`: doubling `B` ~doubles per-token latency, on any
+> part. Where the crossover lands is per-part — on a 12B-class model on RTX
+> 5090, `B=16` crossed a 50 ms inter-token SLO at ~2 concurrent users where
+> `B=8` held to ~4 (`perf-data/serving-capacity-report.md`,
+> `perf-data/b2-concurrency-family.md`). Derive your own crossover on `$GPU`;
+> pick `B` from the **TPOT budget**, not the peak-throughput number. A fixed
 > large `B` also overpays at partial load — a `B=32` blob costs full width at 16
 > live slots. For MoE the batching win is weaker still: the expert union
-> saturates weight-read by modest B (`perf-data/concurrent-decode-26b-h100.md`).
+> saturates weight-read by modest B (measured 26B on H100,
+> `perf-data/concurrent-decode-26b-h100.md`).
 
-### 2. KV cache and memory fit — platform: both
+### 2. KV cache and memory fit — `$VENDOR`: both
 
 The live allocator is `KvArena` (`memory::streamer`) over per-head
 `GrowablePool`s. The vLLM-style paged `BlockAllocator`/`PageTable` in
@@ -87,53 +104,80 @@ The live allocator is `KvArena` (`memory::streamer`) over per-head
 
 | lever | flag / env | default | effect |
 |---|---|---|---|
-| Prefill chunk / KV ring size | (chunk knobs below) | — | ring = `next_pow2(window + chunk − 1)`; smaller chunk → smaller resident KV ring → more sequences fit. 12B KV ~10.7→3.0 GiB from 8192→1024 chunk for ~2% prefill cost — a **fit enabler, not a speed win** (`perf-data/gemma4-12b-sm120-serving.md`) |
+| Prefill chunk / KV ring size | (chunk knobs below) | — | ring = `next_pow2(window + chunk − 1)`; smaller chunk → smaller resident KV ring → more sequences fit. Measured 12B: KV ~10.7→3.0 GiB from 8192→1024 chunk for ~2% prefill cost — a **fit enabler, not a speed win** (`perf-data/gemma4-12b-sm120-serving.md`) |
 | Per-engine KV reuse pool | `--kv-pool-mib` / `PLOW_KV_POOL_MIB` | 512 | zero-ref physical KV blocks park (bounded) instead of being freed; next request pays a map, not an allocation. 0 disables |
-| VMM-backed KV (AMD) | `--amd-vmm-kv` / `PLOW_VMM_KV` | off | driver-VMM physical backing (`memory::vmm::VmmKv`); block size `--vmm-block-mib` |
+| VMM-backed KV | `--amd-vmm-kv` / `PLOW_VMM_KV` | off | driver-VMM physical backing (`memory::vmm::VmmKv`); block size `--vmm-block-mib` *(amd)* |
+
+KV capacity is a `$GPU` property, not an `$ISA` one — two parts at the same
+`$ISA` can differ in HBM capacity and therefore in which concurrencies fit
+while emitting identical code.
+
+**Compute the budget before you serve**, rather than discovering it as a startup
+refusal or a shed at the target concurrency. Every term comes from the Stage 1
+geometry audit except `ctx` (`$MAXCTX`), the decode width `B`, and the chunk:
+
+```
+ring            = min(ctx, next_pow2(window + chunk − 1))
+sliding_per_seq = ring × n_slide × kvh_slide × hd_slide × 2 (k,v) × elt
+full_per_seq    = ctx  × n_full  × kvh_full  × hd_full  × 2 (k,v) × elt
+total           = weights + B × (sliding_per_seq + full_per_seq) + activations
+```
+
+**The ring is set by the prefill chunk, not by the model.** That is why
+`PLOW_MAX_CHUNK` defaults to `next_pow2(window)` on a windowed model and stays
+at 8192 when `window == 0`. There is a **hard floor at `next_pow2(window)`**: a
+1024 window cannot ring fewer than 2048 rows however small the chunk, so below
+that point shrinking the chunk buys launches for nothing. The size of the effect,
+as an illustration and not a target: on a 12B-class windowed model at B=16, a
+fixed 8192 chunk wanted 21.32 GiB of KV where the window-derived chunk wants
+6.09 GiB — the difference between fitting and not fitting beside the weights on
+a 32 GiB card.
 
 > **KV OOM is a shed, not a crash.** `admit_into` fails a request whose KV does
 > not fit with a typed OOM error rather than holding a slot open under pressure.
 > If the target concurrency sheds on KV, shrink the chunk (smaller ring) or widen
 > the VRAM budget — do not grow the slot table.
 
-### 3. Prefix caching — platform: split
+### 3. Prefix caching — `$VENDOR`: split
 
 | lever | flag / env | default | effect |
 |---|---|---|---|
-| VMM prefix sharing | `--vmm-prefix` / `PLOW_VMM_PREFIX=1` | **off** | shared prefix's full-attention KV held once, `cuMemMap`'d into every sharer (`memory::prefix::PrefixCache`). Warm-TTFT 3.6×(4k)→23.8×(128k), dedup ~10 GiB/sharer at 31B/128k, TPOT-neutral (`perf-data/vmm-prefix-v1.md`). Block size is the real knob (`--vmm-block-mib`, best 64 MiB @128k). Hit stats on `/metrics` via `VmmStatsHandle`. *(sm_120)* |
-| AMD same-slot prefix cache | `--prefix-cache` / `PLOW_PREFIX_CACHE=1` | off | for recurrent/linear-attn models: MLA KV half is free, recurrent state checkpointed via one batched D2D copy. ~24% lower per-query latency, ~1.9× better median TTFT at 75% hit (`perf-data/k3-prefix-cache-design.md`). *(gfx950, TP path)* |
+| VMM prefix sharing | `--vmm-prefix` / `PLOW_VMM_PREFIX=1` | **off** | shared prefix's full-attention KV held once, `cuMemMap`'d into every sharer (`memory::prefix::PrefixCache`). Measured warm-TTFT 3.6×(4k)→23.8×(128k), dedup ~10 GiB/sharer at 31B/128k, TPOT-neutral (`perf-data/vmm-prefix-v1.md`). Block size is the real knob (`--vmm-block-mib`; 64 MiB @128k won on the measured part). Hit stats on `/metrics` via `VmmStatsHandle`. *(nvidia)* |
+| Same-slot prefix cache | `--prefix-cache` / `PLOW_PREFIX_CACHE=1` | off | for recurrent/linear-attn models: MLA KV half is free, recurrent state checkpointed via one batched D2D copy. Measured ~24% lower per-query latency, ~1.9× better median TTFT at 75% hit (`perf-data/k3-prefix-cache-design.md`). *(amd, `$PARALLEL = tp` path)* |
 
 > **Pitfall — report the hit rate with any prefix-cache number.** A cache that
-> misses pays snapshot/insert cost with no benefit; at low hit rates the AMD
+> misses pays snapshot/insert cost with no benefit; at low hit rates the
 > same-slot cache is a net *loss*. VMM prefix sharing is off by default pending
 > its e2e integration — enable it deliberately and measure. Open safety gap: the
 > VMM `BlockHash` collision check is **not implemented** (`memory/vmm.rs`), so a
 > hash collision would attach the wrong prefix's KV. Measured-good, not hardened.
 
-### 4. Prefill: chunking, batching, interleave — platform: mostly sm_120
+### 4. Prefill: chunking, batching, interleave — `$VENDOR`: mostly nvidia
 
-Prefill is a launch-count game: each launch has a fixed cost (~32 ms measured on
-sm_120; a `139 ms + 0.943 ms/row` model on gfx950 TP4,
-`perf-data/glm52-ttft-breakdown.md`), so fewer launches is faster — at the cost
-of a bigger KV ring.
+Prefill is a launch-count game: each launch has a fixed cost, so fewer launches
+is faster — at the cost of a bigger KV ring. **Measure that fixed cost on
+`$GPU`** before choosing a chunk size; it is a per-part constant and it sets
+the whole trade. Two recorded fits, as illustrations of the shape and not as
+values to reuse: ~32 ms/launch on one NVIDIA part, and `139 ms + 0.943 ms/row`
+on an AMD TP4 configuration (`perf-data/glm52-ttft-breakdown.md`).
 
 | lever | flag / env | default | effect |
 |---|---|---|---|
-| Chunk-interleave quantum | `--pf-interleave N` / `PLOW_PF_INTERLEAVE` | 2048 | rows admitted per tick before decode runs; caps how long a decode stream stalls behind a new prefill (one chunk, not one prompt) *(sm_120)* |
-| Per-request chunk-row cap | `--pf-chunk N` / `PLOW_PF_CHUNK` | 0 (off) | finer chunking. **Tail-latency tool** — measured a net throughput *loss* at B=8 (`perf-data/serving-capacity-report.md`) *(sm_120)* |
-| Disable chunking / interleave | `--pf-no-chunk`, `--pf-no-interleave` | off | A/B and pure-throughput controls *(sm_120)* |
-| Chunk cost model | `--pf-chunk-cost N` / `PLOW_PF_CHUNK_COST`, `--pf-cover` | 512 | fixed launch cost in padded-row equivalents (`perf-data/chunk-cost-model.md`, `perf-data/rtx12-chunked-packing.md`) *(sm_120)* |
-| Cross-request batched prefill | `--pf-batch` / `PLOW_PF_BATCH=1` | off | packs waiting requests' chunks into one launch. Wins on small per-request chunks; **no-op** when the pack budget already equals the serial chunk, **force-off on fp8-KV** (`perf-data/px14-batched-prefill-fp8.md`) *(sm_120)* |
-| Throughput mode | `--pf-defer-decode` / `PLOW_PF_DEFER_DECODE=1` | off | run prefill chains to completion before any decode. Trades streaming latency (TTFT collapses) for aggregate tok/s. Not a shippable default *(sm_120)* |
-| AMD ragged-tail chunk | `--amd-ragged-chunk` / `PLOW_RAGGED_CHUNK` | **on** | cover a prompt in fewest launches, run the last chunk at its real row count (−239 ms @4097 tok; `exec::amd::rebase_chunk_rows`). `=0` restores the padding-vs-launch DP for a controlled A/B — see the flag's own doc in `config.rs` for the quality-gate caveat *(gfx950)* |
-| Segmented prefill | `--pf-seg-*` (sm_120), `--amd-seg-window` (AMD) | seg-window on | prefill as a sequence of same-occupancy launches: −11%/−12% at 8k/16k (`docs/arch/06-runtime.md`, `perf-data/gemma12b-gh200-prefill-campaign.md`). `--pf-seg-*` are mostly A/B diagnostics; emit-side classing must match the blob |
+| Chunk-interleave quantum | `--pf-interleave N` / `PLOW_PF_INTERLEAVE` | 2048 | rows admitted per tick before decode runs; caps how long a decode stream stalls behind a new prefill (one chunk, not one prompt) *(nvidia)* |
+| Per-request chunk-row cap | `--pf-chunk N` / `PLOW_PF_CHUNK` | 0 (off) | finer chunking. **Tail-latency tool** — measured a net throughput *loss* at B=8 (`perf-data/serving-capacity-report.md`) *(nvidia)* |
+| Disable chunking / interleave | `--pf-no-chunk`, `--pf-no-interleave` | off | A/B and pure-throughput controls *(nvidia)* |
+| Chunk cost model | `--pf-chunk-cost N` / `PLOW_PF_CHUNK_COST`, `--pf-cover` | 512 | fixed launch cost in padded-row equivalents — **re-fit this on `$GPU`**, the default is another part's number (`perf-data/chunk-cost-model.md`, `perf-data/rtx12-chunked-packing.md`) *(nvidia)* |
+| Cross-request batched prefill | `--pf-batch` / `PLOW_PF_BATCH=1` | off | packs waiting requests' chunks into one launch. Wins on small per-request chunks; **no-op** when the pack budget already equals the serial chunk, **force-off on fp8-KV** (`perf-data/px14-batched-prefill-fp8.md`) *(nvidia)* |
+| Throughput mode | `--pf-defer-decode` / `PLOW_PF_DEFER_DECODE=1` | off | run prefill chains to completion before any decode. Trades streaming latency (TTFT collapses) for aggregate tok/s. Not a shippable default *(nvidia)* |
+| Ragged-tail chunk | `--amd-ragged-chunk` / `PLOW_RAGGED_CHUNK` | **on** | cover a prompt in fewest launches, run the last chunk at its real row count (measured −239 ms @4097 tok on one part; `exec::amd::rebase_chunk_rows`). `=0` restores the padding-vs-launch DP for a controlled A/B — see the flag's own doc in `config.rs` for the quality-gate caveat *(amd)* |
+| Segmented prefill | `--pf-seg-*` (nvidia), `--amd-seg-window` (amd) | seg-window on | prefill as a sequence of same-occupancy launches (measured −11%/−12% at 8k/16k on one part — `docs/arch/06-runtime.md`, `perf-data/gemma12b-gh200-prefill-campaign.md`). `--pf-seg-*` are mostly A/B diagnostics; emit-side classing must match the blob |
 
 > **Pitfall — cross-request batched prefill is not numerics-neutral.** Greedy
 > tokens can differ across chunk boundaries (the flash split count is
 > chunk-dependent; `perf-data/px14-batched-prefill-fp8.md`). If bit-identical
 > decode matters, keep packing off or gate on a facts probe.
 
-### 5. Admission: SLO, hold, shedding — platform: both
+### 5. Admission: SLO, hold, shedding — `$VENDOR`: both
 
 The mux admits, holds, and sheds via `sched::admission` and
 `sched::batching::formation_window_ms`.
@@ -157,27 +201,34 @@ The mux admits, holds, and sheds via `sched::admission` and
 > distinct signals (shed = controller dropping live work; rejected = a full slot
 > table or an oversize prompt).
 
-### 6. Weight load and cold start — platform: both (some sm_120-only)
+### 6. Weight load and cold start — `$VENDOR`: both (some nvidia-only)
 
 Faster load is faster time-to-serving; it does not touch steady-state TPOT.
+(The part names in the citations below are where those campaigns ran; some —
+GH200 among them — are **not** `--gpu` registry entries. Take `$GPU` from
+`plowc --list-gpus`, never from a write-up's filename.)
 
 | lever | flag / env | default | effect |
 |---|---|---|---|
-| Weight slab | `--rt-weight-slab` / `PLOW_WEIGHT_SLAB`; `--rt-slab-keep` / `PLOW_SLAB_KEEP` | on / off | one allocation for all weights. AMD MI355X named-tensor alloc ~6.4–8.8 s → ~0.1–0.27 s, wall halved (`perf-data/weight-slab-amd-mi355x.md`) |
-| VMM lazy-commit weight slab | `--nv-weight-vmm` / `PLOW_WEIGHT_VMM`; `--nv-upload-direct` / `PLOW_UPLOAD_DIRECT` | on (CUDA) / off (AMD) | commit chunks behind the upload. GH200 12B load 3.67→2.0 s (`perf-data/vmm-weight-slab-gh200.md`). **AMD default off — a measured regression there** |
-| Prefetch | `--rt-prefetch` / `PLOW_PREFETCH`, `--rt-prefetch-threads` / `PLOW_PREFETCH_THREADS` | 256 / 16 | parallel weight upload. GH200 12B cold start 17.55→11.19 s (`perf-data/coldstart-plow-vs-vllm-gh200.md`). Drive saturates ~16 readers |
+| Weight slab | `--rt-weight-slab` / `PLOW_WEIGHT_SLAB`; `--rt-slab-keep` / `PLOW_SLAB_KEEP` | on / off | one allocation for all weights. Measured on MI355X: named-tensor alloc ~6.4–8.8 s → ~0.1–0.27 s, wall halved (`perf-data/weight-slab-amd-mi355x.md`) |
+| VMM lazy-commit weight slab | `--nv-weight-vmm` / `PLOW_WEIGHT_VMM`; `--nv-upload-direct` / `PLOW_UPLOAD_DIRECT` | on (nvidia) / off (amd) | commit chunks behind the upload. Measured 12B on GH200: load 3.67→2.0 s (`perf-data/vmm-weight-slab-gh200.md`). **Default off on `$VENDOR = amd` — a measured regression there** |
+| Prefetch | `--rt-prefetch` / `PLOW_PREFETCH`, `--rt-prefetch-threads` / `PLOW_PREFETCH_THREADS` | 256 / 16 | parallel weight upload. Measured 12B on GH200: cold start 17.55→11.19 s (`perf-data/coldstart-plow-vs-vllm-gh200.md`). Reader count saturates against the host storage, not `$GPU` — re-fit per host |
 
-### 7. Tensor parallelism (TP) — platform: both; the ONLY wired multi-GPU mode
+### 7. Tensor parallelism (TP) — `$VENDOR`: both; the ONLY wired multi-GPU mode
 
 Serving selects TP via `enum Ranks { One, Tp }` (`serve/engine.rs`); the host
 side is `exec::tp` (`TpGroup`, `TpRank`, `PeerLayout`) and, on AMD,
 `exec::amd_tp::AmdTpGroup`. See `docs/arch/09-multi-gpu.md`.
 
+`$PARALLEL` must be `tp` — the devblob path *errors* on `dp`/`pp`/`ep`, so a
+non-TP value is a blocker at emit time, not a slower path. `$NGPU` is the rank
+count.
+
 Bring up and time a TP group **without** a full serve:
 
-* `plowrt devices --tp N` — peer-mapped reduction regions, cross-GPU counter
+* `plowrt devices --tp $NGPU` — peer-mapped reduction regions, cross-GPU counter
   tables, all-pairs peer-visibility check (no model).
-* `plowrt amd-bench --tp N` — times decode across ranks. **Every rank must emit
+* `plowrt amd-bench --tp $NGPU` — times decode across ranks. **Every rank must emit
   an identical token stream** — that identity is the TP correctness gate, not a
   sanity check (a rank whose collective silently timed out still samples fluent
   ids from its own shard).
@@ -194,17 +245,18 @@ oracle checks every step), `--amd-tp-no-audit` (timing runs), `--amd-share-ckpt`
 > (`orch::disagg`: `Pool`, `KvHandoff` types only, no dispatch). Plan multi-GPU
 > serving around TP only.
 
-### 8. Multi-model residency — platform: CUDA only
+### 8. Multi-model residency — `$VENDOR`: nvidia only
 
 * **S1 switching** (`serve::manager::ModelManager`) — keep the largest
   VRAM-fitting subset resident; a non-resident request evicts LRU and loads.
   Knobs: `--drain-timeout-ms` / `PLOW_DRAIN_TIMEOUT_MS` (bounded-drain preemption
-  on switch — a live 512-tok generation drains O(max_tokens)≈13 s unbounded vs
-  258 ms at a 250 ms deadline), `--preload` / `PLOW_PRELOAD` (speculative
-  next-model preload), `--vram-budget-mib` / `PLOW_VRAM_BUDGET_MIB`. See
+  on switch — measured, a live 512-tok generation drained O(max_tokens)≈13 s
+  unbounded vs 258 ms at a 250 ms deadline), `--preload` / `PLOW_PRELOAD`
+  (speculative next-model preload), `--vram-budget-mib` /
+  `PLOW_VRAM_BUDGET_MIB` — the budget is a `$GPU` capacity question. See
   `perf-data/m1-multimodel-sm120.md`, `perf-data/multi-model-switch-gh200.md`.
-* **AMD serve is one model per process** by decision — no `ModelManager`, no
-  paging, no residency (`serve/engine.rs` module doc).
+* **`$VENDOR = amd` serve is one model per process** by decision — no
+  `ModelManager`, no paging, no residency (`serve/engine.rs` module doc).
 
 > **Planned, not implemented — do not depend on it.** The `docs/arch/06-runtime.md`
 > **multi-tenancy** section (isolated counter pools, per-tenant arena partitions,
@@ -219,9 +271,9 @@ oracle checks every step), `--amd-tp-no-audit` (timing runs), `--amd-share-ckpt`
 ## Step by step
 
 Fix a concrete target first: **model, prompt length, target concurrency, TTFT
-budget, TPOT budget**. Everything below is measured against it. Commands assume a
-built `plowrt` (`nix develop`, then `cargo build -p plowrt --release --features
-cuda` or `--features hsa`) and Stage 5 assets in `$ASSETS`.
+budget, TPOT budget**. Everything below is measured against it, on `$GPU`.
+Commands assume a built `plowrt` (`nix develop`, then `cargo build -p plowrt
+--release $FEATURES`) and Stage 5 assets in `$ASSETS`.
 
 ### 0. Sanity — does the schedule even run? (no GPU)
 
@@ -243,14 +295,14 @@ plowrt amd-bench --blob $ASSETS/model.pkt --rt-hsaco $ASSETS/hsaco \
 ```
 
 Reports load time, per-token decode ms (TPOT floor), and — with a multi-token
-`--prompt` — prefill ms and tok/s (TTFT floor). This is the AMD path; the CUDA
-engine's single-stream floor is measured through `serve` at concurrency 1.
-`amd-bench` is a **latency/bring-up** instrument: without `--checkpoint` the
-weights are unbound, so *timing is real but the token ids are noise*. A
-prefill-vs-length sweep on TP:
+`--prompt` — prefill ms and tok/s (TTFT floor). This is the `$VENDOR = amd`
+path; on nvidia the single-stream floor is measured through `serve` at
+concurrency 1. `amd-bench` is a **latency/bring-up** instrument: without
+`--checkpoint` the weights are unbound, so *timing is real but the token ids are
+noise*. A prefill-vs-length sweep on TP (sweep points must all be ≤ `$MAXCTX`):
 
 ```bash
-plowrt amd-bench --blob $ASSETS/model.pkt --rt-hsaco $ASSETS/hsaco --tp 4 \
+plowrt amd-bench --blob $ASSETS/model.pkt --rt-hsaco $ASSETS/hsaco --tp $NGPU \
     --prefill-sweep 512,1024,2048,4096,8192 --prefill-reps 3
 ```
 
@@ -287,17 +339,17 @@ PLOW_LOAD_PROFILE=1 plowrt serve --assets $ASSETS --port 8080
 Apply highest-value first, re-measuring TTFT/TPOT/throughput after each and
 keeping only what helps *your* target:
 
-1. **Multi-step + device sampling** (sm_120): confirm `PLOW_MULTISTEP=8`,
-   `PLOW_DEV_SAMPLE=1` — the largest single decode win.
+1. **Multi-step + device sampling** (`$VENDOR = nvidia`): confirm
+   `PLOW_MULTISTEP=8`, `PLOW_DEV_SAMPLE=1` — the largest single decode win.
 2. **Batch width `B`** from the TPOT budget (Lever 1 pitfall) — may send you back
    to Stage 5 to recompile at a different `PLOW_DECODE_BATCH`.
 3. **Prefill chunking / interleave** if TTFT-under-load (tail) is the problem
    (`--pf-interleave`, `--pf-chunk`); measure — finer chunking often *loses*
    throughput.
-4. **Prefix cache** if traffic shares prompt prefixes (`--vmm-prefix` on sm_120,
-   `--prefix-cache` on AMD recurrent). **Report the hit rate.**
-5. **TP** if one GPU cannot hold the model or hit the latency budget. Gate on
-   rank token-identity (`amd-bench --tp N`, `devices --tp N`).
+4. **Prefix cache** if traffic shares prompt prefixes (`--vmm-prefix` on nvidia,
+   `--prefix-cache` on amd recurrent). **Report the hit rate.**
+5. **TP** if one `$GPU` cannot hold the model or hit the latency budget. Gate on
+   rank token-identity (`amd-bench --tp $NGPU`, `devices --tp $NGPU`).
 6. **Load / cold start** (`--rt-prefetch-threads`, weight-slab knobs) if
    time-to-serving matters.
 
@@ -309,8 +361,30 @@ keeping only what helps *your* target:
 | per-decode-step host-phase breakdown | `PLOW_DSTEP_LOG=1` (+ `--rt-dstep-every N`) |
 | prefix-cache timing | `PLOW_PFX_LOG=1` |
 | per-tick prefill-vs-decode wall split | `PLOW_PF_PACKLOG=1` |
-| packet timeline | `PLOW_TRACE_RAW=path` (AMD) or `--trace` + `GET /trace` |
+| packet timeline | `PLOW_TRACE_RAW=path` (amd) or `--trace` + `GET /trace` |
 | static blob analysis (no device) | `plowrt disasm $ASSETS --counters --kernargs --tensors` |
+
+**The attribution ladder.** Do not open a profiler first. Walk these in order,
+cheapest first, and drill to the next level only when the current one comes back
+flat — each rung costs more and perturbs more than the one above it. **The
+ordering is the general part; the instruments are not**, and where a rung has no
+tool for `$VENDOR` the honest move is to skip it and say the level went
+unattributed.
+
+| # | question | instrument | `$VENDOR` |
+|---|---|---|---|
+| 1 | client or server? | `PLOW_TTFT_LOG=1` — per-request TTFT decomposition (template / tokenize / queue / prefill / detok / unaccounted-HTTP). A large `UNACCOUNTED` means instrument before comparing anything | both |
+| 2 | which class of work? | `PLOW_PF_SEG_TIME=1` — wraps every segment launch in device events, logs per-class totals (GEMM / fat / flash) + the slowest segments. Perturbs ~5%: read **shares, not absolutes** | nvidia (segmented prefill stack only) |
+| 3 | which op? | build the device object with `-DPLOW_NV_TRACE=1`, serve with `PLOW_PF_TRACE_LOG=1` — per-opcode gate/body/signal cycles from block 0. Block 0 undercounts imbalanced ops several-fold: again shares, not absolutes | nvidia |
+| 4 | host or device? | `PLOW_STEP_TIME=1` prints `gap_us=<G> dev_interp_ms=<K>` per decode step. **This is the branch point:** `G ≫ K` → host-bound, go to Lever 1/4; `K ≫ G` → kernel-bound, go back to Stage 4/5; comparable → do the host side first, it is free | nvidia |
+| 5 | which stall inside the kernel? | `sudo ncu --set full` + Warp State Statistics (`nsys` cannot intercept a dlopen'd driver, so it does not see plowrt); `rocprof` on the AMD side | vendor profiler |
+| 6 | is it the silicon? | sample clocks / power / throttle reasons **during** the bench (`nvidia-smi --query-gpu=clocks.sm,power.draw,clocks_throttle_reasons.active -lms 500`, or `rocm-smi` equivalents) before blaming the part | both |
+
+Rungs 2–4 are NVIDIA-only as instruments: there is no in-tree AMD equivalent of
+the per-class segment timer, the per-op cycle trace, or the host-gap split. On
+`$VENDOR = amd` attribution runs rung 1, then jumps to rung 5 (`rocprof`) — a
+real gap in coverage, and one worth stating in the write-up rather than
+substituting a rung-1 number for a rung-4 conclusion.
 
 ---
 
@@ -330,7 +404,13 @@ The model gates into Stage 7 when **all** hold:
    ragged tail, prefix sharing) was re-checked against a correctness gate, not
    assumed neutral. On TP, rank token-identity holds.
 6. **A recorded recipe**: the `plowrt serve` command + `PLOW_*` knobs with the
-   measured TTFT/TPOT/throughput/memory numbers.
+   measured TTFT/TPOT/throughput/memory numbers, **stamped with `$GPU`, `$ISA`,
+   `$NGPU`/`$PARALLEL` and `$MAXCTX`**. A recipe that does not name the part it
+   was measured on is not a result — it will be read as a target on the next
+   part and silently be wrong.
+7. **Every lever kept was measured on `$GPU`.** Defaults carried over from
+   another part's campaign (chunk cost, `B`, prefetch threads) count as
+   unmeasured until re-checked here.
 
 ---
 
@@ -350,11 +430,16 @@ The model gates into Stage 7 when **all** hold:
   force-off in common cases (`px14-batched-prefill-fp8.md`).
 * **Prefix cache with a low hit rate is a net loss.** Always report the hit rate;
   the VMM `BlockHash` collision check is not yet implemented.
-* **VMM weight-slab helps CUDA, hurts AMD** — leave the AMD default off.
+* **VMM weight-slab helps nvidia, hurts amd** — leave the amd default off.
 * **Serve width must match the compiled width.** A blob compiled for one decode
   batch (or `-DGV_MM_MAX`) but driven at another routes through a predicated
   remainder arm and runs *slower* (`px10-batched-decode.md`).
-* **Multi-model traps (CUDA):** duplicate network names silently drop a bundle;
+* **A blob built for another part still loads and still runs.** `--arch` is
+  packet metadata and its default disagrees with `--gpu`'s default by design;
+  `PLOW_UNISEG` on `$VENDOR = amd` is warn-and-ignore, not a refusal. Nothing
+  stops you serving an asset compiled for the wrong `$GPU`/`$NCU` — check the
+  `build.json` before trusting a serving number.
+* **Multi-model traps (nvidia):** duplicate network names silently drop a bundle;
   engine looked up by network but installed by slug (a slug override falls to the
   CPU reference path); `PLOW_PF_SEG_*` are process-global, so two models with
   different emit classing can't both be optimal (`multi-model-review-gh200.md`).
@@ -371,7 +456,7 @@ The model gates into Stage 7 when **all** hold:
 | symbol / path (`crates/plowrt/src/`) | role |
 |---|---|
 | `serve::mux` — `spawn`, `run_one_tick`, `admit_into`, `Slot`, `MuxConfig`, `advance_health` | continuous-batching mux / slot table / admission |
-| `serve::engine::{ServeEngine, Ranks}` | per-backend engine seam (CUDA slotted vs AMD single-sequence / TP) |
+| `serve::engine::{ServeEngine, Ranks}` | per-vendor engine seam (nvidia slotted vs amd single-sequence / TP) |
 | `serve::mod::{AppState, app}` | router: `/v1/chat/completions`, `/metrics`, `/trace`, `/healthz` |
 | `sched::admission::{LoadEstimator, Admit, admit}` | admission controller, SLO shed |
 | `sched::batching::{select_bucket, formation_window_ms}` | bucket pick + adaptive hold |
@@ -384,7 +469,7 @@ The model gates into Stage 7 when **all** hold:
 | `memory::kv::{BlockAllocator, PageTable}` | vLLM-style paged pool — **retained, off-path** |
 | `exec::{ExecutorSet}`, `exec::gpu::GpuEngine`, `exec::amd::AmdEngine` (`rebase_chunk_rows`), `exec::amd_tp::AmdTpGroup` | executors / device engines |
 | `exec::tp::{TpGroup, TpRank, PeerLayout}` | TP host side |
-| `serve::manager::{ModelManager, BlobPlan, SwitchReport}` | S1 residency / switch (CUDA) |
+| `serve::manager::{ModelManager, BlobPlan, SwitchReport}` | S1 residency / switch (nvidia) |
 | `orch::registry::Registry`; `orch::moe`, `orch::disagg` (skeleton) | model registry; EP/disagg |
 | `config::{RuntimeConfig, NvidiaRuntimeConfig, AmdRuntimeConfig}` | every `PLOW_*` env var + CLI flag |
 | `obs::Metrics::to_prometheus`, `obs::{ttft, dstep, pfx, trace}` | metrics + diagnostics |

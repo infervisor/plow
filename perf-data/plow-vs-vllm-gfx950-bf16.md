@@ -32,7 +32,7 @@ Lower is better. Measured 2026-07-27.
   `0.23.1.dev1`) — the newest CDNA tag on Docker Hub as of this date. Served endpoint,
   `vllm bench serve`, HIP graphs on. Data: `perf-data/vllm-rocm/*_ctxsweep_c1.csv`.
 - **plow**: `plowrt amd-bench`, real weights bound, real schedule, global-queue scheduler,
-  64 decode steps per point, under `perf-data/harness/gpulease -n 1` (rc=0, uncontended).
+  64 decode steps per point, under `perf-data/tools/gpulease -n 1` (rc=0, uncontended).
 - Both checkpoints carry no `quantization_config` and BF16 tensors, so both columns really are
   bf16 — see `perf-data/vllm-rocm/PRECISION-LABELS.md` for why that check matters here.
 
@@ -102,7 +102,7 @@ scripts/bench_vllm_rocm.sh google/gemma-4-12B-it 1     # PHASES=ctxsweep for the
 # plow
 ./target/release/plowc --hf-dir <ckpt> --emit devblob --arch gfx950 --gpu mi355x \
     --n-cu 256 --max-ctx 131072 --out build-amd/g12b-bf16
-perf-data/harness/gpulease -n 1 bench sg render -c \
+perf-data/tools/gpulease -n 1 bench sg render -c \
   'plowrt amd-bench --blob build-amd/g12b-bf16/model.pkt --hsaco build-amd/hsaco \
       --checkpoint <ckpt> --steps 64 --ctx 65536'
 ```

@@ -11,7 +11,7 @@ WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OBJ="${1:-/home/lava/plow/build-amd/gemvsweep-objs}"
 JSONL="${2:-/tmp/gemv_sweep.jsonl}"
 
-env GPU_LEASE_TIMEOUT=7200 "$WT/perf-data/harness/gpulease" -n 1 gemv-campaign \
+env GPU_LEASE_TIMEOUT=7200 "$WT/perf-data/tools/gpulease" -n 1 gemv-campaign \
   sg render -c "bash $WT/scripts/rebench_tune_gemv.sh $OBJ $JSONL"
 rc=$?
 [ "$rc" -eq 0 ] || { echo "sweep failed rc=$rc — NOT ingesting"; exit "$rc"; }

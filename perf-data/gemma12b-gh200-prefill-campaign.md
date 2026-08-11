@@ -366,7 +366,7 @@ on NVIDIA (n128-vs-n256 by (M,N,K), BKV per hd, ws384-vs-uniform), the oracle is
 the right home — but today the knobs are build/env-level and nothing on the
 NVIDIA path consults measurements.
 
-Bring-up methodology codified for future networks: perf-data/harness/BRINGUP.md
+Bring-up methodology codified for future networks: docs/bringup/
 (+ bringup_gate/bench/showdown/ceiling scripts).
 
 ## Main-merge consolidation (2026-08-07)

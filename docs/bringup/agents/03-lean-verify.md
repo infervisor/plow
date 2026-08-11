@@ -1,5 +1,12 @@
 # Agent Prompt — Stage 3: Formal Verification with Lean
 
+## Target parameters — none
+
+This stage is **target-independent**: it proves, it does not measure. Do not
+name a GPU, ISA, CU count or toolchain anywhere in it — a checkpoint that holds
+only on one part is not a proof. The parameter block in
+[`../target.md`](../target.md) is filled in at Stage 4, not here.
+
 You are executing **Stage 3** of the model bringup playbook: proving the
 compiled schedule correct with the Lean 4 verifier before Stage 4 (kernel
 tuning). Read [`docs/bringup/03-lean-verify.md`](../03-lean-verify.md)

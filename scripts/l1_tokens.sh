@@ -18,7 +18,7 @@ PROMPT=$(python3 "$W/scripts/l1_prompt.py")
 
 one() { # <label> <blob-dir> <hsaco-dir>
   local log; log=$(mktemp)
-  "$W/perf-data/harness/gpulease" -n 1 "l1-tok-$1" \
+  "$W/perf-data/tools/gpulease" -n 1 "l1-tok-$1" \
       "$W/target/release/plowrt" amd-bench \
       --blob "$2/model.pkt" --hsaco "$3" --checkpoint "$CK" \
       --prompt "$PROMPT" --steps "$STEPS" >"$log" 2>&1 || { cat "$log"; exit 1; }

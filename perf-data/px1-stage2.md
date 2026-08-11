@@ -8,7 +8,7 @@ block-diagonal flash: **all packed requests' prefill attention in ONE
 persistent-grid kernel pass**.
 
 Source of every perf number: `perf-data/px1-stage2.json` (transcribed verbatim
-from the tool's reports in `perf-data/harness/b2-ib/px1s2b8-{off,s1,varlen}/`).
+from the tool's reports in `perf-data/tools/b2-ib/px1s2b8-{off,s1,varlen}/`).
 Harness: `huggingface/inference-benchmarker` rev `bad4f947` via
 `perf-data/bench_b2_ib.sh`, 4000-token github_code prompts / 128 out, greedy,
 streaming, 15 s warm + 120 s measure. TTFT includes server-side queueing.

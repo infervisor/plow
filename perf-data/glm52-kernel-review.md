@@ -22,7 +22,7 @@ hipcc --offload-arch=gfx950 -O3 -w -DPLOW_BUCKET_DECODE=1 -std=c++17 --genco \
       runtime/bench/amd/glm52_kbench_dev.hip -o /tmp/glm_kdev.co -Iruntime/amd -Iruntime/common
 g++ -O2 -std=c++17 runtime/bench/amd/glm52_kbench_moe.cpp -o /tmp/kb_moe \
       -I/opt/rocm/include -D__HIP_PLATFORM_AMD__ -L/opt/rocm/lib -lamdhip64
-perf-data/harness/gpulease -n 1 kbench sg render -c \
+perf-data/tools/gpulease -n 1 kbench sg render -c \
       'unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES; /tmp/kb_moe /tmp/glm_kdev.co slot-outer'
 ```
 `unset HIP_VISIBLE_DEVICES` is load-bearing: `gpulease` exports BOTH `ROCR_VISIBLE_DEVICES` and

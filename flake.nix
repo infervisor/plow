@@ -432,7 +432,7 @@
         // pkgs.lib.optionalAttrs (system != "x86_64-darwin") {
           # Weight quantization only. SEPARATE from `default` on purpose.
           #
-          # `perf-data/harness/quantize_fp8.py` needs torch for
+          # `perf-data/tools/quantize_fp8.py` needs torch for
           # `torch.float8_e4m3fn`: that dtype's RTN+saturate rounding is the
           # reference the emitted fp8 twins are DEFINED against, so
           # approximating it would silently shift every fp8 weight.
@@ -445,7 +445,7 @@
           # place to accumulate everything anyone needs.
           #
           #   nix develop .#quantize --command python3 \
-          #       perf-data/harness/quantize_fp8.py <hf-dir>
+          #       perf-data/tools/quantize_fp8.py <hf-dir>
           #
           # From nix rather than pip because PyPI is unreachable from this box
           # (`pip download numpy` and `curl https://pypi.org/simple/` both time

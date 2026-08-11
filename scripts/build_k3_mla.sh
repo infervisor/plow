@@ -12,7 +12,7 @@
 #   ./scripts/build_k3_mla.sh [outdir]                       # build, OUTSIDE nix
 #   PYTHONNOUSERSITE=1 nix develop .#quantize --command \
 #       python3 runtime/tests/k3_mla_oracle.py <outdir>/k3_mla_fixture.bin
-#   perf-data/harness/gpulease -n 1 k3mla sg render -c \
+#   perf-data/tools/gpulease -n 1 k3mla sg render -c \
 #       'unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES; cd <outdir> && \
 #        LD_LIBRARY_PATH=/opt/rocm/lib ./k3_mla_test interp_decode.elf k3_mla_fixture.bin'
 set -euo pipefail

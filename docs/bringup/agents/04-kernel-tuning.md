@@ -1,5 +1,27 @@
 # Agent — Stage 4: Kernel Tuning to the Roofline
 
+## Target parameters — fill this in FIRST
+
+This stage is target-specific. Read [`../target.md`](../target.md) and fill
+every row before running anything. A row you cannot fill is a **blocker**, not
+a default. Every command below is written in these names — **never substitute a
+literal part name into a command.**
+
+| param | value | source |
+|---|---|---|
+| `$VENDOR` | | `amd` or `nvidia` |
+| `$ISA` | | the `--arch` string (`IsaLevel::arch_flag()`) |
+| `$GPU` | | a name from `plowc --list-gpus` — do not guess one |
+| `$NCU` | | `--n-cu`; leave `0` to take `$GPU`'s `sm_count` |
+| `$NGPU` / `$PARALLEL` | | `--num-gpus` (default 1) / `--parallel` (must be `tp`) |
+| `$MAXCTX` | | `--max-ctx` |
+| `$TOOLCHAIN` | | `hipcc` or `nvcc`, + version |
+| `$BUILD` | | `scripts/build_<isa>.sh` for `$ISA` |
+| `$FEATURES` | | `--features hsa` or `--features cuda` |
+| `$BW_BOUND` | | `MemorySpec::bandwidth_for_bound()` — **state whether it is measured or a datasheet fallback** |
+| `$COMPUTE_CEIL` | | measured sustained matrix-core ceiling **on `$GPU`** (Step 1 below) |
+| `$RESULTS` | | `perf-data/plow-<isa>/` if it exists, else `perf-data/` |
+
 You are executing **Stage 4** of the model-bringup playbook. Your job: identify
 the target model's hot kernels, **measure each family against its roofline
 ceiling**, sweep the knobs that are genuinely knobs, **register the winners
@@ -14,10 +36,10 @@ the executable checklist.
 
 * Stage 3 passed: every compiled bucket verifies, so the schedule you time is
   the schedule that ships.
-* You know the target GPU (`--gpu`, `--n-cu`, ISA) and have its vendor
-  toolchain — `hipcc` or `nvcc` is required even for GPU-free probing, because
-  capability is derived from a built object, never declared.
-* You have the GPU itself and `perf-data/harness/gpulease` for measurement.
+* The target block above is filled in, and `$TOOLCHAIN` is installed — it is
+  required even for GPU-free probing, because capability is derived from a
+  built object, never declared.
+* You have `$GPU` itself and `perf-data/tools/gpulease` for measurement.
   Use `nix develop` for all cargo builds; `tuner` is a default `plowc` feature.
 
 If any is missing, **stop and report** — a tuning campaign without the
@@ -28,23 +50,25 @@ toolchain or the lease produces numbers that cannot be trusted or filed.
 Before any GPU time, establish per family whether there is anything to tune:
 
 ```bash
-plowc tune inventory --gpu "<name>" --root .     # executable kernels + ALIASES
-plowc tune status   --gpu "<name>" --db tuning   # what the store already holds
+plowc tune inventory --gpu "$GPU" --root .     # executable kernels + ALIASES
+plowc tune status   --gpu "$GPU" --db tuning   # what the store already holds
 ```
 
 * The **aliases** block is the most important output: opcodes listed together
   reach one body, and ranking within a group measures dispatch noise. On
-  NVIDIA the dense-GEMM opcodes alias and the tile is object-wide — the tuning
-  axis is *which object is built* (a `-D` grid), not which opcode is emitted.
-  On AMD the same opcodes are distinct and genuinely rankable.
+  `$VENDOR = nvidia` the dense-GEMM opcodes alias and the tile is object-wide —
+  the tuning axis is *which object is built* (a `-D` grid), not which opcode is
+  emitted. On `$VENDOR = amd` the same opcodes are distinct and genuinely
+  rankable.
 * Check every macro you plan to sweep with `kernelcaps::classify_macro` —
   `Overridable` only. A `-D` on a hard `#define` is a redefinition; the numbers
   describe a tile that was never built.
 * Check the family has a **correctness oracle** (`11-tuning-coverage.md`,
   oracle table). No oracle → nothing you measure can become a `qualified`
-  record. On this tree the time-and-validate harnesses are AMD
+  record. On this tree the time-and-validate harnesses are on the AMD side
   (`interp_gemm_bench.c`, `qwen_interp_bench.c`, `dsa_gather_bench.c`,
-  `tp_allreduce_bench.c`); NVIDIA timing and oracles live in separate files.
+  `tp_allreduce_bench.c`); on `$VENDOR = nvidia` timing and oracles live in
+  separate files, so nothing there qualifies until they are merged.
 
 Record the verdict per family (GEMM / GEMV / attention / MoE / collectives)
 before proceeding: tunable now, blocked-on-oracle, blocked-on-knob, or alias
@@ -56,13 +80,18 @@ no-op.
 
 * Analytic: the cost model's tile candidates come from `SmSpec.shared_mem`
   minus `costmodel::kernel_reservation_bytes(arch)`, double-buffered; DMA cost
-  from datasheet bandwidth (ranking only). For **reported** roofline %, use
-  measured denominators — `MemorySpec::bandwidth_for_bound()` for bandwidth,
-  the measured sustained MFMA ceiling for compute (gfx950 1660 TF/s, gfx942
-  937 TF/s — not the datasheet numbers).
-* Machine: single-CU roofline of the production op bodies:
+  from datasheet bandwidth (ranking only).
+* Reported: fill `$BW_BOUND` and `$COMPUTE_CEIL` **for `$GPU`**, and record
+  which kind each is. `MemorySpec::bandwidth_for_bound()` returns
+  `bandwidth_measured` when the registry has it and **silently falls back to
+  the datasheet peak when it does not** — which is the case for almost every
+  entry. `$COMPUTE_CEIL` is a sustained figure measured here, not a datasheet
+  peak; on one AMD part the two differ by 28%. Carrying either number from
+  another part invents the result.
+* Machine: single-CU roofline of the production op bodies (`$VENDOR = amd`;
+  on nvidia use the `runtime/bench/nvidia/` occupancy probes instead):
   ```bash
-  cd runtime && cmake -B build -DPLOW_ROCM=ON -DPLOW_UBENCH=ON -DPLOW_HIP_ARCH=<arch>
+  cd runtime && cmake -B build -DPLOW_ROCM=ON -DPLOW_UBENCH=ON -DPLOW_HIP_ARCH=$ISA
   cmake --build build --target ubench
   cd ubench && ./run_ubench_cu.sh --timing-only        # --decode for M=1 shapes
   ```
@@ -72,7 +101,8 @@ no-op.
 ### 2. Derive the hot shapes from demand — never hand-author
 
 ```bash
-plowc --hf-dir <ckpt> --max-ctx <c> --n-cu <N> --num-gpus <g> tune shapes --gpu <name>
+plowc --hf-dir <ckpt> --arch $ISA --max-ctx $MAXCTX --n-cu $NCU --num-gpus $NGPU \
+    tune shapes --gpu "$GPU"
 PLOW_TUNE_DUMP=1 plowc --emit devblob ...     # TUNEDUMP_GEMV census for the decode side
 ```
 
@@ -82,24 +112,27 @@ for one configuration. Hand-authored lists are how GLM-5.2 prefill ended up
 
 ### 3. Sweep, under the lease
 
-Every timed run: `perf-data/harness/gpulease <label> <cmd>`. Exit 76 =
+Every timed run: `perf-data/tools/gpulease <label> <cmd>`. Exit 76 =
 contended = **failed measurement** (`tunedb::measurement_is_trustworthy`
 accepts only 0). Wrap the run, not the build. Repeat until clean.
 
-* **Prefill GEMM (AMD)** — one command measures, ingests, verifies:
+Which of the following applies is decided by `$VENDOR`; the other does not
+exist on your target.
+
+* **Prefill GEMM (`$VENDOR = amd`)** — one command measures, ingests, verifies:
   ```bash
   scripts/rebench_build_objs.sh <objdir>       # build test_kernels.elf objects (outside the lease)
   nix develop --command ./target/release/plowc \
-      --hf-dir <ckpt> --max-ctx <c> --n-cu <N> --num-gpus <g> \
-      tune gemm --gpu <name> --root . --obj <objdir> --samples <out.jsonl> --lease
+      --hf-dir <ckpt> --arch $ISA --max-ctx $MAXCTX --n-cu $NCU --num-gpus $NGPU \
+      tune gemm --gpu "$GPU" --root . --obj <objdir> --samples <out.jsonl> --lease
   ```
   Manual alternative: `gemm_tile_sweep <M> <N> <K> [label] [quant]` with
   `PLOW_GEMM_JSONL=<path>`, then `plowc tune ingest --samples <path>`.
-* **Decode GEMV (AMD):** `gemv_row_sweep <N> <K>` with `PLOW_GEMV_JSONL`
-  (shape list via `scripts/rebench_tune_gemv.sh` from the census), then
-  `tunedb-gemv ingest --db tuning --gpu <SKU> --samples <jsonl>`. `--gpu` is
-  required — it decides the cell.
-* **Decode knobs (NVIDIA object grid):** `scripts/tune_decode_sweep.sh`
+* **Decode GEMV (`$VENDOR = amd`):** `gemv_row_sweep <N> <K>` with
+  `PLOW_GEMV_JSONL` (shape list via `scripts/rebench_tune_gemv.sh` from the
+  census), then `tunedb-gemv ingest --db tuning --gpu "$GPU" --samples <jsonl>`.
+  `--gpu` is required — it decides the cell.
+* **Decode knobs (`$VENDOR = nvidia`, object grid):** `scripts/tune_decode_sweep.sh`
   (sweeps `PLOW_NV_FORCE_MINBLK`, `GV_UNROLL*`, `GV_MM_MAX`, MoE knobs jointly,
   scored by end-to-end step TPOT), then `tunedb-decode ingest`.
 
@@ -110,8 +143,8 @@ packet-layout-visible. These cannot be swept independently.
 ### 4. Interpret
 
 * Compute the roofline % per family against the **binding** side: bytes/time
-  vs `bandwidth_for_bound()` for decode GEMV/attention; TF/s vs measured
-  sustained peak for prefill GEMM. Name which denominator you used.
+  vs `$BW_BOUND` for decode GEMV/attention; TF/s vs `$COMPUTE_CEIL` for prefill
+  GEMM. Name which denominator you used and whether it is measured on `$GPU`.
 * For small-M GEMM, read TILE COUNT / CU FILL — fill, not tile efficiency, is
   usually the limit at M=128. A tile that wins 3% while dropping fill has not
   won.
@@ -123,16 +156,20 @@ packet-layout-visible. These cannot be swept independently.
 
 ### 5. Register winners and verify consumption
 
-* AMD GEMM/GEMV winners → `qualified` records (oracle passed,
-  ≥ `Stats::MIN_SAMPLES`, decisive). NVIDIA decode winner → build defines:
+* On `$VENDOR = amd`, GEMM/GEMV winners → `qualified` records (oracle passed,
+  ≥ `Stats::MIN_SAMPLES`, decisive). On `$VENDOR = nvidia` the decode winner is
+  an object — consume it as build defines through `$BUILD`:
   ```bash
-  PLOW_EXTRA_DEFINES="$(tunedb-decode best --db tuning --hardware <cell> --print defines)" \
-    scripts/build_sm120_cubin.sh out/interp_sm120.cubin
+  PLOW_EXTRA_DEFINES="$(tunedb-decode best --db tuning \
+      --hardware $VENDOR/$ISA/<sku-slug> --print defines)" \
+    $BUILD out/interp_$ISA.cubin
   ```
+  `--print` refuses when the filter leaves more than one cell standing; take the
+  `<sku-slug>` from the store layout `tuning/<vendor>/<isa>/<sku>/`.
 * Then prove the compiler sees them:
   ```bash
-  plowc tune status --gpu <name> --db tuning
-  plowc tune select --gpu <name> --shape M,N,K    # expect rationale: measured, tier: sku-calibrated
+  plowc tune status --gpu "$GPU" --db tuning
+  plowc tune select --gpu "$GPU" --shape M,N,K   # expect rationale: measured, tier: sku-calibrated
   ```
   A miss is byte-identical to "never measured" — if a just-measured shape still
   reports `analytical cold start` / `portable`, the campaign published into the
@@ -148,10 +185,13 @@ Pass when **all** hold:
 2. Winners are `qualified` records or recorded `-D` define strings; nothing
    selectable came from an oracle-less harness.
 3. `plowc tune select` reports `measured` / `sku-calibrated` on covered shapes.
-4. Per-family roofline % is written down with measured denominators and clean
+4. Per-family roofline % is written down against `$BW_BOUND` / `$COMPUTE_CEIL`
+   as established for `$GPU`, with the denominator's kind stated and clean
    (`gpulease` rc=0) provenance.
 5. Untunable families are documented as such — Stage 5 will re-check that
    "tuned" was real before trusting block latency.
+6. No command in the campaign contained a literal part name; every `--gpu`,
+   `--arch` and `--n-cu` came from the target block.
 
 ## Pitfalls to actively guard against
 
@@ -159,27 +199,33 @@ Pass when **all** hold:
   reproduce. Body-level aliases (AMD MoE group ops wrap the expert ops) do not
   appear in the aliases block — known blind spot.
 * Sweeping a hard `#define` measures a tile that was never built. Classify
-  first. NVIDIA attention tiles are template literals, not macros — that sweep
-  is a code edit, not a parameter search.
-* Standalone kernels do not transfer: same tile family measured 212 vs 770
-  TF/s standalone vs inlined in the interpreter. Measure through the
-  interpreter (`interp_gemm_bench.c` pattern).
+  first. On `$VENDOR = nvidia` the attention tiles are template literals, not
+  macros — that sweep is a code edit, not a parameter search.
+* Standalone kernels do not transfer: on one measured part the same tile family
+  scored 212 vs 770 TF/s standalone vs inlined in the interpreter. Measure
+  through the interpreter (`interp_gemm_bench.c` pattern) on `$GPU`.
 * Contended runs skewed a real campaign ~35%; rc=76 is a failed measurement,
   never a caveat.
 * Wrong-cell publication is silent in both directions (the `tunedb-gemv`
-  hardcoded-cell defect left the decode-GEMV census at zero records). Always
-  run the `tune select` read-back.
+  hardcoded-cell defect left the decode-GEMV census at zero records for the
+  other ISA). Always run the `tune select` read-back.
 * Calibration-only tiles (320x128, …) are measurements, not selectable facts —
   `gemm_rung_opcode` returns `None` for them; do not force them in.
 * Stub kernels (`XFLASH_MERGE`, `XARGMAX_FIN`) benchmark at ~0 ns and win;
   only rank what `ProbedObject::executes` lists.
-* Datasheet denominators overstate the gap (gfx942: 1307 vs 937 TF/s measured).
-  Report % of the measured ceiling and say so.
+* Datasheet denominators overstate the gap — on one AMD part, 1307 datasheet vs
+  937 TF/s measured. Report % of `$COMPUTE_CEIL` and say which kind it is; and
+  remember `$BW_BOUND` is itself the datasheet peak unless `$GPU`'s registry
+  entry carries a measured bandwidth.
 * `plowc tune` does not run benchmarks itself (by design); do not wait for it
   to. The harnesses above are the measurement layer.
 
 ## When to stop and ask
 
+* Any row of the target block cannot be filled — in particular `$GPU` is not in
+  `plowc --list-gpus`, `$ISA` has no `$BUILD` script, or `$BW_BOUND` /
+  `$COMPUTE_CEIL` cannot be measured on this box. Do not substitute another
+  part's value.
 * The family you must tune has **no correctness oracle** in-tree (e.g. MoE, or
   NVIDIA GEMM before the oracle/timer merge) — its winners can only be
   screening results; ask whether to build the oracle or proceed provisional.
@@ -196,6 +242,8 @@ Pass when **all** hold:
 
 ## Report back
 
+* **The filled target block** — every row, with `$BW_BOUND` and `$COMPUTE_CEIL`
+  labelled measured-here or datasheet-fallback.
 * **Per-family verdict:** tunable / blocked (and on what) / alias no-op, per
   the inventory.
 * **Shapes covered:** demand census size, HIT/MISS counts, explained misses.

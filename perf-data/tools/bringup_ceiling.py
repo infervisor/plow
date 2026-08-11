@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Practical GEMM ceiling on THIS box at YOUR model's exact prefill shapes
-(BRINGUP.md §4). cuBLASLt via torch._scaled_mm (fp8) and torch.matmul (bf16).
+(docs/bringup/07-perf-campaign.md). cuBLASLt via torch._scaled_mm (fp8) and torch.matmul (bf16).
 
 Knowing the real ceiling is what separates "the kernel is slow" from "the box
 is the wall": on GH200/Gemma-12B it measured fp8 1324-1468 / bf16 804-861 TF/s
 and directly justified the 384-thread warp-specialized object.
 
 Edit SHAPES for your model: (M=chunk_rows, N=out_features, K=in_features, name).
-Run under gpulease: perf-data/harness/gpulease ceil python3 bringup_ceiling.py
+Run under gpulease: perf-data/tools/gpulease ceil python3 bringup_ceiling.py
 """
 import time
 

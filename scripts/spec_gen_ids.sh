@@ -16,7 +16,7 @@ STEPS="${2:-400}"
 CKPT="${CKPT:-/home/lava/models/k3_farm}"
 BIN="${PLOWRT_BIN:-$WT/target/release/plowrt}"
 
-exec "$WT/perf-data/harness/gpulease" -n 8 specgen sg render -c \
+exec "$WT/perf-data/tools/gpulease" -n 8 specgen sg render -c \
   "nix develop $WT --command $BIN amd-bench \
    --blob $ASSETS/model.pkt --hsaco $ASSETS/hsaco --checkpoint $CKPT \
    --tp 8 --steps $STEPS --ctx 512 --prompt '1008,10484,318,15383,387'"

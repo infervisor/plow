@@ -4,7 +4,7 @@ RTX 5090 (sm_120a, **170 SMs**, 96 MiB L2) · 2026-07-26
 bench `runtime/bench/nvidia/px16_occ_bench.cu` (calls the SHIPPED `d_flash_decode<512,GF,true>` directly,
 px11 style) · build `px16_build.sh` · runner `px16_run.sh` · ptxas `px16_regs.sh` /
 `px16_minblk.sh` · raw `perf-data/px16-decode-occupancy-raw.txt`
-Every GPU run under `perf-data/harness/gpulease` (labels `px16`, `px16b`, `px16c`; rc=0).
+Every GPU run under `perf-data/tools/gpulease` (labels `px16`, `px16b`, `px16c`; rc=0).
 
 Companion to **PX-11**, whose ladder, denominators and 1700 GB/s measured wall are reused, not
 re-derived. PX-11's numbers are not edited.
@@ -400,6 +400,6 @@ the GEMV arms, at n_cu=340, end-to-end — and flash decode will be paying 0.88�
 ## Reproduce
 
     bash perf-data/px16_build.sh /tmp/px16_base
-    GPU_LEASE_TIMEOUT=3600 perf-data/harness/gpulease px16 bash perf-data/px16_run.sh 20
+    GPU_LEASE_TIMEOUT=3600 perf-data/tools/gpulease px16 bash perf-data/px16_run.sh 20
     bash perf-data/px16_regs.sh        # ptxas on the objects the deployment builds
     bash perf-data/px16_minblk.sh      # the real decode object at __launch_bounds__(256,1) vs (256,2)

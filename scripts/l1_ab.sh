@@ -29,7 +29,7 @@ run() { # <arm>
   fi
   log=$(mktemp)
   set +e
-  "$W/perf-data/harness/gpulease" -n 1 "l1-$arm" \
+  "$W/perf-data/tools/gpulease" -n 1 "l1-$arm" \
       "$W/target/release/plowrt" amd-bench \
       --blob "$dir/model.pkt" --hsaco "$hs" --checkpoint "$CK" \
       --ctx "$CTX" --steps "$STEPS" >"$log" 2>&1

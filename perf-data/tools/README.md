@@ -23,11 +23,12 @@
 
 ## Model / GPU bring-up
 
-- **`BRINGUP.md`** — the bring-up runbook: gpulease discipline, the
-  token-identity gate, baseline rules, the attribution ladder
-  (PLOW_TTFT_LOG → PLOW_PF_SEG_TIME → PLOW_NV_TRACE → sudo ncu), the probe law
-  (standalone probes overstate — in-model only), roofline sanity, the canonical
-  sm_90a prefill config, and the refuted-ideas list. Distilled from the
-  GH200/Gemma-4-12B campaign (`perf-data/gemma12b-gh200-prefill-campaign.md`).
+The runbook is `docs/bringup/` — gpulease discipline, the token-identity gate,
+baseline rules, the attribution ladder, the probe law (standalone probes
+overstate — in-model only), roofline sanity, and the campaign write-up format.
+Measured detail behind it: `perf-data/gemma12b-gh200-prefill-campaign.md`
+(sm_90a prefill, canonical config, refuted ideas) and
+`perf-data/gemma4-12b-sm120-serving.md` (sm_120a decode/serving).
+
 - `bringup_gate.sh` / `bringup_bench.sh` / `bringup_showdown.sh` /
-  `bringup_ceiling.py` — the parameterized harness scripts BRINGUP.md drives.
+  `bringup_ceiling.py` — the parameterized scripts those stages drive.

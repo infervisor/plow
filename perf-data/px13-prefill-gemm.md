@@ -3,7 +3,7 @@
 RTX 5090 (sm_120a, **170 SMs**, 96 MiB L2, driver 580.159.03, CUDA 13.0) · 2026-07-26
 Gemma-4-12B-it, fp8 W8A8, the PX-12 §2b asset. Benches `runtime/bench/nvidia/px9_gemm_body_bench.cu`
 (extended) and `runtime/bench/nvidia/px13_tma_stage_bench.cu` (new). Every GPU run under
-`perf-data/harness/gpulease`.
+`perf-data/tools/gpulease`.
 
 Companion to PX-9 (`px9-gemm-body.md`) and PX-12 (`px12-consolidated-baseline.md`). Neither file
 is edited; where PX-13 corrects one it says so here.
@@ -298,8 +298,8 @@ Two further gaps found while doing it, both reported not fixed:
 ## Reproduce
 
     perf-data/px13_build.sh                        # isolated-bench arms
-    GPU_LEASE_TIMEOUT=3000 perf-data/harness/gpulease px13c perf-data/px13_run3.sh
+    GPU_LEASE_TIMEOUT=3000 perf-data/tools/gpulease px13c perf-data/px13_run3.sh
     perf-data/px13_sweep_build.sh                  # one prefill object + asset dir per arm
-    GPU_LEASE_TIMEOUT=7200 perf-data/harness/gpulease px13sweep perf-data/px13_sweep_e2e.sh 1
+    GPU_LEASE_TIMEOUT=7200 perf-data/tools/gpulease px13sweep perf-data/px13_sweep_e2e.sh 1
     perf-data/px13_emit_tuning.py <sweep stdout captures>
-    perf-data/px13_build_tma.sh && perf-data/harness/gpulease px13tma /tmp/px13tma
+    perf-data/px13_build_tma.sh && perf-data/tools/gpulease px13tma /tmp/px13tma

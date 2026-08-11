@@ -118,7 +118,7 @@ about the instrument.
 ```bash
 # any arm: drop caches immediately before, or the run is warm and meaningless
 sync; sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
-perf-data/harness/gpulease -n 8 cold sg render -c \
+perf-data/tools/gpulease -n 8 cold sg render -c \
   "PLOW_WEIGHT_SLAB=1 PLOW_PREFETCH=256 PLOW_PREFETCH_THREADS=16 \
    nix develop --command ./target/release/plowrt amd-bench \
      --blob /home/lava/models/k3_b1/model.pkt \

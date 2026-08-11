@@ -534,7 +534,7 @@ int main(int argc, char** argv) {
             uint64_t got = 0;
             /* THE TWO SIDES DISAGREE ON WHETHER THE "fp8/" PREFIX IS PART OF THE KEY, so accept
              * both. The emitter declares the twin as `fp8/<name>`; this loader stripped the
-             * prefix before the lookup, while perf-data/harness/quantize_fp8.py writes the key
+             * prefix before the lookup, while perf-data/tools/quantize_fp8.py writes the key
              * WITH it ("keyed EXACTLY as the emitter declares the twins"). Neither convention is
              * obviously canonical and picking one silently would just move the failure — so try
              * the declared name first, then the stripped one, and report BOTH spellings if

@@ -116,7 +116,7 @@ static bool load_dump(){
 /* cache row -> dump row, decorrelated per kv-head, identical across arms (bit-exact A/B). */
 static inline unsigned src_row(unsigned head, unsigned i){ return (i + head*10007u) % g_nrows; }
 
-/* ---- host KVZIP-SZ12 v1.2 encoder (normative spec: perf-data/harness/kvzip_oracle.py) ------- */
+/* ---- host KVZIP-SZ12 v1.2 encoder (normative spec: perf-data/tools/kvzip_oracle.py) ------- */
 static void sz_encode_row(const uint16_t* x, uint8_t* blob){
     uint8_t e[D], lo[D]; int hist[256]={0};
     for (unsigned i=0;i<D;i++){ e[i]=(x[i]>>7)&0xFF; lo[i]=((x[i]>>8)&0x80)|(x[i]&0x7F); hist[e[i]]++; }

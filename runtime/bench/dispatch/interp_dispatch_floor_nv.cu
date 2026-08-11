@@ -31,7 +31,7 @@
 //
 // BUILD/RUN
 //   nvcc -arch=sm_90a -O3 -std=c++17 -w interp_dispatch_floor_nv.cu -o floor_nv
-//   perf-data/harness/gpulease floor ./floor_nv [nstep]
+//   perf-data/tools/gpulease floor ./floor_nv [nstep]
 //
 // gpulease exits 76 if the GPU was contended; a contended run is discarded, not
 // reported, because a contended timing is indistinguishable from a real one.

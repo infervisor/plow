@@ -395,7 +395,7 @@ it is scheduler engineering in `serve/mux.rs` + `sched/`, not a kernel change.
 
 The decisive experiment, and it should have been the first one. `PLOW_FP8=1
 PLOW_W8A8=1` against per-output-channel e4m3 twins built with
-`perf-data/harness/quantize_fp8.py` (10.91 GB over 328 projections):
+`perf-data/tools/quantize_fp8.py` (10.91 GB over 328 projections):
 
     weights 22.2 GiB (bf16)  ->  12.0 GiB (fp8)      a 46% cut in bytes read
     bf16  20.635 20.846 20.755   mean 20.745 ms/token

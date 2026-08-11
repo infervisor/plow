@@ -138,7 +138,7 @@ log is the check that they are right:
 ## 5. Reproducing
 
 ```bash
-perf-data/harness/gpulease -n 8 slabab sg render -c \
+perf-data/tools/gpulease -n 8 slabab sg render -c \
   "PLOW_WEIGHT_SLAB=1 PLOW_LOAD_PROFILE=1 nix develop --command \
      ./target/release/plowrt amd-bench \
        --blob /home/lava/models/k3_b1/model.pkt \
