@@ -183,6 +183,33 @@ const WG_THREADS_8: u32 = 8 * 64;
 /// `INVALID_ISA`, not a slowdown.
 const WG_THREADS_4: u32 = 4 * 64;
 
+/// Host dispatch semantics for a program whose stream carries `seg` tags.
+///
+/// L2 placement reuses those tags for domains that drain concurrently inside
+/// one launch. Only ordinary wave-class segments are separate host launches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProgramDispatch {
+    L2Domains(u32),
+    WaveSegments(usize),
+}
+
+impl ProgramDispatch {
+    pub(crate) fn classify(l2_domains: u32, n_segments: usize) -> Self {
+        if l2_domains != 0 {
+            Self::L2Domains(l2_domains)
+        } else {
+            Self::WaveSegments(n_segments)
+        }
+    }
+
+    pub(crate) fn launches(self) -> usize {
+        match self {
+            Self::L2Domains(_) => 1,
+            Self::WaveSegments(n) => n,
+        }
+    }
+}
+
 /// Sanity bound on `seg`, so a corrupt stream cannot make the host allocate
 /// unboundedly. Was 512 — the width of the reference driver's `seg_class[512]`.
 ///
@@ -5022,7 +5049,9 @@ impl AmdEngine {
     /// The building block of both the single-GPU segmented run and the TP
     /// per-segment rendezvous. Each launch memcpy's its own kernarg slot, so
     /// mutating `cur_seg` between launches is safe — every packet has already
-    /// captured its own copy.
+    /// captured its own copy. For an L2-placed program the caller invokes this
+    /// exactly once with `seg == 0`; the device ignores `cur_seg` and drains all
+    /// domain windows concurrently.
     pub fn enqueue_segment(&mut self, p: usize, seg: usize) -> Result<()> {
         self.trace_write_bytes
             .set(self.progs[p].trace_records * TRACE_REC_BYTES);
@@ -6344,6 +6373,13 @@ impl AmdEngine {
     /// Segment count for program `p`.
     pub fn prog_segments(&self, p: usize) -> usize {
         self.progs[p].seg_class.len()
+    }
+
+    /// Whether `seg` denotes concurrently-drained L2 domains or sequential
+    /// wave-class launches for program `p`.
+    pub(crate) fn prog_dispatch(&self, p: usize) -> ProgramDispatch {
+        let g = &self.progs[p];
+        ProgramDispatch::classify(g.l2_domains, g.seg_class.len())
     }
 
     pub fn schedulers(&self) -> (Sched, Sched) {

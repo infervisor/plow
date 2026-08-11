@@ -18,8 +18,9 @@
 //! # Decode and prefill do NOT have the same shape
 //!
 //! Decode is one dispatch per rank, so "launch all, drain all" is the whole
-//! story. Prefill is SEGMENTED, and there the obvious generalisation — let each
-//! rank enqueue all of its segments, then drain everyone — is wrong.
+//! story. Wave-class prefill is SEGMENTED, and there the obvious
+//! generalisation — let each rank enqueue all of its segments, then drain
+//! everyone — is wrong.
 //! `runtime/tests/tp_decode.c` records the failure verbatim:
 //!
 //! > Per-rank-all-segments let the ranks desync — a lagging rank made peers time
@@ -31,7 +32,10 @@
 //! `PLOW_XCTR_DEADLINE_TICKS` deadline (1 s) and give up. So prefill goes
 //! **per-segment, all-ranks, with a host barrier between segments** — see
 //! [`AmdTpGroup::prefill`]. The barrier costs one drain per segment and buys the
-//! rendezvous; it is not a conservatism that could be relaxed.
+//! rendezvous; it is not a conservatism that could be relaxed. L2-domain
+//! placement is not wave-class segmentation: every domain drains concurrently
+//! inside one launch, so a placed prefill program uses launch-all/drain-all
+//! exactly once.
 //!
 //! # Status, measured on this node (Gemma-4 31B bf16, gfx950 x8, 2026-07-27)
 //!
@@ -1010,13 +1014,14 @@ impl AmdTpGroup {
         self.ranks[0].chunk_steps(&chunks, n_prompt)
     }
 
-    /// Run ONE prefill chunk across every rank, per-segment with a host barrier.
+    /// Run ONE prefill chunk across every rank.
     ///
-    /// Unlike decode this cannot be split into submit/complete, and the reason
-    /// is the barrier itself: the ranks must be inside the SAME segment for
-    /// their collectives to rendezvous, so the drain between segments is part of
-    /// the algorithm, not a convenience. A server that wants to overlap prefill
-    /// with other work overlaps whole CHUNKS, which is the granularity chunked
+    /// A wave-class segmented program needs a host barrier after each segment:
+    /// the ranks must be inside the SAME segment for their collectives to
+    /// rendezvous. An L2-placed program is different: its `seg` values are
+    /// domains that drain concurrently inside ONE launch, so it is launched on
+    /// every rank and drained once. A server that wants to overlap prefill with
+    /// other work overlaps whole CHUNKS, which is the granularity chunked
     /// prefill already schedules at.
     pub fn prefill_chunk(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
         use crate::obs::ttft;
@@ -1033,16 +1038,19 @@ impl AmdTpGroup {
         self.group.zero_xctr()?;
         ttft::PF_XCTR.add(t.elapsed().as_nanos() as u64);
 
-        let n_seg = self.ranks[0].prog_segments(step.prog);
-        ttft::PF_SEGMENTS.tally(n_seg as u64);
-        for seg in 0..n_seg {
+        let dispatch = self.ranks[0].prog_dispatch(step.prog);
+        let launches = dispatch.launches();
+        ttft::PF_SEGMENTS.tally(launches as u64);
+        for seg in 0..launches {
             let t = std::time::Instant::now();
             for e in &mut self.ranks {
                 e.enqueue_segment(step.prog, seg)?;
             }
             ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
-            // THE BARRIER. Without it the ranks drift apart across segments and
-            // the collectives inside a later segment miss each other.
+            // For WaveSegments this is THE BARRIER. Without it the ranks drift
+            // apart across segments and collectives in a later segment miss
+            // each other. L2Domains has one iteration and this is its final
+            // all-rank drain.
             let t = std::time::Instant::now();
             for e in &self.ranks {
                 e.drain()?;
@@ -1203,6 +1211,23 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn l2_domains_are_one_tp_launch_not_wave_segments() {
+        use crate::exec::amd::ProgramDispatch;
+
+        let placed = ProgramDispatch::classify(8, 8);
+        assert_eq!(placed, ProgramDispatch::L2Domains(8));
+        assert_eq!(placed.launches(), 1);
+
+        let segmented = ProgramDispatch::classify(0, 3);
+        assert_eq!(segmented, ProgramDispatch::WaveSegments(3));
+        assert_eq!(segmented.launches(), 3);
+
+        let ordinary = ProgramDispatch::classify(0, 1);
+        assert_eq!(ordinary, ProgramDispatch::WaveSegments(1));
+        assert_eq!(ordinary.launches(), 1);
+    }
 
     /// Rank agreement is the acceptance test, so its failure must name the rank
     /// and both ids rather than just returning false.
