@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 px1s2_consolidate.py — build perf-data/px1-stage2.json from the raw
-inference-benchmarker reports in perf-data/harness/b2-ib/px1s2-*/results/.
+inference-benchmarker reports in perf-data/tools/b2-ib/px1s2-*/results/.
 
 PX-1 stage 2 (see the design notes): block-diagonal varlen
 flash — all packed requests' prefill attention in ONE persistent-grid kernel

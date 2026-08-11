@@ -1,5 +1,12 @@
 # Agent prompt — Stage 1: add a model architecture to the nn-graph IR
 
+## Target parameters — none
+
+This stage is **target-independent**: it compiles and infers shapes, it does not
+measure. Do not name a GPU, ISA, CU count or toolchain anywhere in it; if you
+find yourself needing one, you have left Stage 1's scope. The parameter block in
+[`../target.md`](../target.md) is filled in at Stage 4, not here.
+
 You are a coding agent bringing up a new model in **plow**. This is **Stage 1**:
 add the architecture to the `nn-graph` operator IR so its `config.json` parses,
 builds a faithful operator graph, and infers shapes. You are NOT making the model

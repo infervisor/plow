@@ -454,6 +454,7 @@ nobody re-runs them.
 | `PLOW_NV_FA_VDBUF` | 0 | V double-buffer. **MEASURED NEGATIVE**: wash at 32k/64k, **+2.2% slower at 128k** — the 128k full-attn flash is HBM-bound. |
 | `PLOW_NV_FA_CORRSKIP` | 0 | fp8mma only — skip the softmax rescale when every lane's `corr` is exactly 1.0. Bitwise identical. |
 | `PLOW_NV_KVBOUNDS` | 0 | per-batch KV bounds checking. |
+| `PLOW_NV_FA256_BKV` / `PLOW_NV_FA512_BKV` | 32 / 16 | KV rows staged per flash-**prefill** tile, per head dim. The trade is smem footprint vs staging granularity. **64 / 32 are the sm_90a measured optima** and are what `build_sm90a_cubin.sh` is driven with; they are not validated as sm_120a defaults. |
 | `PLOW_FLASH_HD128` | off | enable the fused-write path in inline flash for D=128 (Llama/Qwen), avoiding register spill on the 8-wave interpreter. |
 | `PLOW_FA_GF_FULL` | 2 | **AMD** flash-decode GQA fusion factor on full-attention layers (paired env+define; the NVIDIA analogue is `PLOW_NV_FA_GF_FULL`, which it must agree with or kernel/packet disagree). |
 
@@ -494,6 +495,10 @@ data race; used only to price a protocol cost): `PLOW_GATE_HIER_CEIL`,
 | `PGM_STAGES` | 3 | GEMM cp.async pipeline depth. **px9 measured 3→6 = 0%** — the mainloop is not latency-bound. |
 | `GV_UNROLL` | 8 (NV) / 11 (AMD); 14 for K3 | dense bf16 GEMV inner-K unroll = 128-bit weight vectors prefetched before consumed (memory-level parallelism). Swept by `tunedb`, per-arch in CMake. Bit-exact. |
 | `GV_UNROLL_GLU` | 4 (NV) / 6 (AMD) | same unroll for the bf16 GLU/SwiGLU-fused GEMV. Also swept. |
+| `GV_UN16` / `GV_UN_GLU16` | 4 / 2 | inner-K unroll for the **MM=16** decode rung specifically (`GV_UNROLL` covers the base rungs). Needs `GV_MM_MAX=16` to be reachable at all. Worth ~2%; `=8` measured best on sm_120a. |
+| `GV_UN32` / `GV_UN_GLU32` | 2 / 1 | same for the MM=32 rung. |
+| `GV_UNROLL_FP8` / `GV_UNROLL_GLU_FP8` | = the bf16 twins | rung unroll on the fp8 GEMV arms. The optimum is **precision-dependent** — sweep at the precision you ship, do not inherit the bf16 winner. |
+| `GV_MOE_RB` / `GV_MOE_RB_DN` / `GV_MOE_UN` | 2 / 2 / 2 | MoE GEMV output-channels-per-warp (main / `down` arm) and inner unroll. Shape-dependent; the source notes the previous optimum stopped being one once neighbouring arms moved. |
 | `PGM_GLU_STAGES` | 2 | same for the fused GLU arm (kept shallower to fit the 100 KiB dynamic-smem cap). |
 | `PGM_W8A8_LDS64` | **1** | **px9** — read the fp8 fragment as one `uint2`. **+6.5% on plain w8a8, 0% on GLU, +2.2% weighted.** Bit-exact. |
 | `PGM_SW8_V2` | **1** | **px9** — `Swizzle<2,4,2>` matched to the ACTUAL 64-byte fp8 row. +0.5% on top of LDS64. |
@@ -546,6 +551,60 @@ All produce wrong logits by construction.
 
 Harness-only (not the served cubins): `PLOW_SM120_SMS` (188) and
 `PLOW_SMP_THREADS` (256).
+
+### sm_90a object selection (`PLOW_BUILD_*`) — **sm_90a only**
+
+`scripts/build_sm90a_cubin.sh` compiles a **five-object** prefill stack rather
+than one megakernel, and these envs — read by the build script, not passed as
+raw `-D` — decide which objects it emits and which arms each carries. They have
+no effect on any other `--arch`; the sm_120 script builds one decode + one
+prefill object and ignores them.
+
+The reason the stack exists is the register-allocation coupling that the section
+header above describes: a heavyweight wgmma body loses probe-grade allocation
+when compiled into the wide-armed interpreter TU, so on sm_90a the tuning axis
+is **which object gets built**, not which tile a macro selects.
+
+| build env | object it shapes | meaning |
+|---|---|---|
+| `PLOW_BUILD_SEG` | `_pfseg` + `_pfgemm` | build the segmented pair at all. Packets must be emitted **without** `PLOW_UNISEG`. |
+| `PLOW_BUILD_FATLITE` | `_pfseg` | the fat object arm-stripped of flash → 128 regs, occupancy 2. |
+| `PLOW_BUILD_GEMM_WS384` | `_pfgemm` | 384-thread producer/consumer GEMM; carries **both** precisions' n256 bodies, so one lean object serves bf16 and fp8. |
+| `PLOW_BUILD_FA512` + `PLOW_BUILD_FA_WG` + `PLOW_BUILD_FA_HD256` | `_pffa` | the dedicated flash object: wgmma arms, hd512 and hd256. `--pf-seg-fa512 all` **requires** `FA_HD256=1` (the loader refuses the mismatch). |
+| `PLOW_BUILD_TMA_GEMM` / `PLOW_BUILD_W8A8` | all | TMA GEMM bodies / fp8 w8a8 arms. Drop `W8A8` for bf16-only cubins. |
+
+The canonical build measured in the GH200 campaign:
+
+```bash
+PLOW_EXTRA_DEFINES="-DPLOW_NV_FA256_BKV=64 -DPLOW_NV_FA512_BKV=32" \
+PLOW_BUILD_TMA_GEMM=1 PLOW_BUILD_W8A8=1 PLOW_BUILD_SEG=1 \
+PLOW_BUILD_FATLITE=1 PLOW_BUILD_GEMM_WS384=1 \
+PLOW_BUILD_FA512=1 PLOW_BUILD_FA_WG=1 PLOW_BUILD_FA_HD256=1 \
+scripts/build_sm90a_cubin.sh <out-dir>/interp_sm90a.cubin
+```
+
+Its serve-side and emit-side counterparts are in
+[Segmented prefill (sm_90a / GH200)](#segmented-prefill-sm_90a--gh200) below;
+the emit knob and the serve knob **must pair** (`PLOW_SEG_PURE_GEMM` ↔
+`--pf-seg-pure`, `PLOW_SEG_FA512` ↔ `--pf-seg-fa512`) — the classing decides
+which object a packet lands on and a mismatched object `__trap()`s by design.
+
+Ablation-only `PLOW_BUILD_*` switches, default off, leave them off unless
+reproducing a specific finding: `FA_ROPE`, `FA_WGITEM`, `FP8KV`, `GEMM_OCC1`,
+`GEMM_ONLY`, `GEMM_UNI256`, `GEMV_HEAD`, `SEG_NOGLU`, `SEG_WS`, `SEG_WS_ENTRY`,
+`WS_BN256`.
+
+Two sm_90a-only `-D` tuning knobs on the GEMM side:
+
+| flag | default | effect |
+|---|---|---|
+| `PGM90_TILE_BAND` | 16 | band rasterization width for the sm_90a GEMM — how many M-tiles share a B-tile in L2 before the walk advances. |
+| `PGM90_UNI256_NS` | 4 | TMA ring depth of the n256 body. bf16 256-byte k-stages at `NS=2` measured **−44 ms** (ring starvation); do not lower it casually. |
+
+The runtime companion of an sm_90a decode build is `PLOW_NS_FULL_ABS`, and its
+value is a **cliff, not a slope** — see the header of `build_sm90a_cubin.sh`,
+which derives it as `n_cu / gcd(n_grp, n_cu)` and records what the neighbouring
+values cost.
 
 ---
 

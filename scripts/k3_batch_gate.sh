@@ -56,7 +56,7 @@ BLOB="${1:?blob dir}"; HSACO="${2:?hsaco dir}"; CKPT="${3:?checkpoint}"; B="${4:
 ALT_BLOB="${5:-}"; ALT_HSACO="${6:-}"
 STEPS="${STEPS:-24}"; CTX="${CTX:-5}"
 BIN="${PLOWRT_BIN:-$WT/target/release/plowrt}"
-LEASE="$WT/perf-data/harness/gpulease"
+LEASE="$WT/perf-data/tools/gpulease"
 
 # Four prompts of DELIBERATELY UNEQUAL length. Token ids, not text: `--prompt` takes ids.
 P1="1008,10484,318,15383,387"          # 5 — the README's known-good "capital of France"

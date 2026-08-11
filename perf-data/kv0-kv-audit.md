@@ -10,7 +10,7 @@ repeated measure_tpot phrases, NOT random ids. 5.6 GB of KV per dump,
 kvh1/ring32768/hd512). fp8-e4m3 and nvfp4 twins derived offline with the
 exact kernel schemes (per-row amax/448 RNE; block-16 amax/6).
 
-Tooling: `perf-data/harness/make_kv_prompt.py`, `perf-data/harness/kv_audit.py`.
+Tooling: `perf-data/tools/make_kv_prompt.py`, `perf-data/tools/kv_audit.py`.
 Raw numbers: `kv0-kv-audit-prose.{json,md}`, `kv0-kv-audit-code.{json,md}`.
 
 ## Headline (prose dump; code dump within 0.6% everywhere)

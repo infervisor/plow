@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 px1_consolidate.py — build perf-data/px1-stage1.json from the raw
-inference-benchmarker reports in perf-data/harness/b2-ib/px1-{off,on}/results/.
+inference-benchmarker reports in perf-data/tools/b2-ib/px1-{off,on}/results/.
 
 PX-1 stage 1 (see the design notes): cross-request prefill
 batching at the GEMM level (naive per-request-serial attention), A/B'd against

@@ -4,7 +4,7 @@
 # BOTH into one HSA context and races them.  No HIP runtime, no libhipblaslt.
 #
 #   nix develop --command bash -c './scripts/build_tensile_ext.sh /tmp/tsext'
-#   perf-data/harness/gpulease -n 1 tsext sg render -c 'cd /tmp/tsext && \
+#   perf-data/tools/gpulease -n 1 tsext sg render -c 'cd /tmp/tsext && \
 #       /usr/bin/env -i PATH=/usr/bin:/bin HOME=$HOME LD_LIBRARY_PATH=/opt/rocm/lib \
 #       ./gemm_tensile_ext tensile.co <sym> test_kernels.elf gemm_c5 4096 8192 5376'
 set -euo pipefail

@@ -34,7 +34,7 @@ Two properties are load-bearing, and both constrain how you use it:
 |---|---|
 | inspect an NVIDIA target | `nvcc` (preprocessor only — no GPU) |
 | inspect an AMD target | `hipcc` (preprocessor only — no GPU) |
-| take a measurement | the GPU itself, plus `perf-data/harness/gpulease` |
+| take a measurement | the GPU itself, plus `perf-data/tools/gpulease` |
 
 Probing is preprocessor-only, so you can inspect a target you cannot run.
 You cannot inspect a target whose compiler you do not have — that is deliberate,
@@ -217,7 +217,7 @@ the state machine working, not a gap.
 ### Always run under the lease
 
 ```console
-$ perf-data/harness/gpulease <label> <command>
+$ perf-data/tools/gpulease <label> <command>
 ```
 
 `gpulease` audits for foreign compute processes and **exits 76 if the GPU was
@@ -239,7 +239,7 @@ percentiles reported, repeated until clean:
 ```console
 $ nvcc -arch=sm_90a -O3 -std=c++17 -w \
     runtime/bench/dispatch/interp_dispatch_floor_nv.cu -o floor_nv
-$ perf-data/harness/gpulease floor ./floor_nv 400
+$ perf-data/tools/gpulease floor ./floor_nv 400
 ```
 
 Repeat until it exits 0, then take the median across clean runs — one clean run

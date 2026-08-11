@@ -5,7 +5,7 @@ bench `runtime/bench/nvidia/px11_flash_decode_bench.cu` (calls the SHIPPED `d_fl
 cubin, no megakernel dispatch, px8 arm-Bp style) · raw `perf-data/px11-flash-decode-raw.txt`
 build `perf-data/px11_build.sh` · runners `px11_run.sh` / `px11_knobs.sh` / `px11_run2.sh` /
 `px11_run3.sh` · SASS `px11_sass.sh` + `px11_sass.py` · ptxas `px11_regs.sh`
-Every GPU run under `perf-data/harness/gpulease`.
+Every GPU run under `perf-data/tools/gpulease`.
 
 Companion to **PX-10**, which owns end-to-end attribution and is not re-derived here. PX-10's
 numbers are used as the scaling base and are **not edited**.
@@ -368,8 +368,8 @@ its value on the table.
 
     bash perf-data/px11_build.sh /tmp/px11_base
     bash perf-data/px11_build.sh /tmp/px11_fp8ld16 -DPLOW_FP8_LD16 -DPLOW_FP8_FAST
-    GPU_LEASE_TIMEOUT=3000 perf-data/harness/gpulease px11 bash perf-data/px11_run2.sh 20
-    GPU_LEASE_TIMEOUT=3000 perf-data/harness/gpulease px11 bash perf-data/px11_run3.sh 20
+    GPU_LEASE_TIMEOUT=3000 perf-data/tools/gpulease px11 bash perf-data/px11_run2.sh 20
+    GPU_LEASE_TIMEOUT=3000 perf-data/tools/gpulease px11 bash perf-data/px11_run3.sh 20
     bash perf-data/px11_regs.sh          # ptxas on the real megakernel object
 
 ## Recommended order

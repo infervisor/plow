@@ -1,7 +1,7 @@
 # Bringup agent harness
 
 Prompt templates for driving a model bringup with LLM coding agents. Each file
-in [`agents/`]() is a self-contained prompt for one stage of the
+in this directory is a self-contained prompt for one stage of the
 pipeline described in [`docs/bringup/00-overview.md`](../00-overview.md):
 
 | Prompt | Stage |
@@ -14,13 +14,22 @@ pipeline described in [`docs/bringup/00-overview.md`](../00-overview.md):
 | [`agents/06-runtime-opt.md`](06-runtime-opt.md) | Whole-model serving optimization |
 | [`agents/07-perf-campaign.md`](07-perf-campaign.md) | End-to-end measured campaign + written results |
 
+Prompts **01–03 are target-independent** and take no target parameters.
+Prompts **04–07 each open with the parameter block** from
+[`docs/bringup/target.md`](../target.md) — `$VENDOR $ISA $GPU $NCU $NGPU
+$PARALLEL $MAXCTX $TOOLCHAIN $BUILD $FEATURES $BW_BOUND $COMPUTE_CEIL
+$RESULTS` — which must be filled in before the agent runs anything. Their
+commands are written in those names; a literal part name in a command is a
+defect, and a row that cannot be filled is a blocker, not a default.
+
 ## How to run a stage
 
 1. Open a coding agent (any tool that can read the repo, run shell commands,
    and edit files) in the repo root, inside the nix dev shell or with the
    ability to invoke `nix develop --command`.
-2. Paste the stage prompt, filling in the model placeholders at the top
-   (HF model id, target arch, parameter budget).
+2. Paste the stage prompt, filling in the placeholders at the top — the model
+   ones (HF model id, parameter budget) and, for stages 4–7, the whole target
+   parameter block.
 3. The prompt tells the agent what to read first, the edits to make, the
    commands to run, and the **gate** it must pass. The agent reports back in a
    fixed format; a human reviews the gate evidence before the next stage.
@@ -29,6 +38,9 @@ pipeline described in [`docs/bringup/00-overview.md`](../00-overview.md):
 
 - **Gates are blocking.** An agent that cannot pass its gate stops and reports;
   it does not proceed or weaken the gate.
+- **The target is never hardcoded.** Stages 4–7 write `--gpu $GPU --arch $ISA`;
+  a number measured on one part is never carried to another, including between
+  two parts at the same `$ISA`.
 - **Stop-and-ask conditions are listed per stage** — hardware access, ambiguous
   numerics tolerances, and anything that would change another stage's contract.
 - **Measurements follow the campaign conventions**: GPU leasing, same-session

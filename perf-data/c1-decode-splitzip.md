@@ -119,4 +119,4 @@ fusion/scheduling advantages — out of scope here.
 - `runtime/common/dev_isa.h`, `crates/packet/src/dev.rs` — opcodes 78/79.
 - `runtime/tests/sz_batch_sm120.cu` — the faithful A/B (the evidence above).
 - `runtime/nvidia/experiments/splitzip_gemv12.cu` — 12B-shape microbench refresh.
-- `perf-data/harness/{compress_audit,sz_oracle}.py`, `perf-data/c0-compress-audit.*`.
+- `perf-data/tools/{compress_audit,sz_oracle}.py`, `perf-data/c0-compress-audit.*`.

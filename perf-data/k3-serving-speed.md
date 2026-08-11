@@ -2,7 +2,7 @@
 
 **Measured 2026-07-30**, Kimi-K3 93 layers TP8 over 8× gfx950 (MI355X), fp8 KV + mxfp4 experts,
 blob and objects emitted from this tree with **`PLOW_GATE_HIER` + `PLOW_L2_PLACE` +
-`PLOW_K3_SHARD_HEAD`**, under `perf-data/harness/gpulease`. Client is `scripts/bench_speed.sh`.
+`PLOW_K3_SHARD_HEAD`**, under `perf-data/tools/gpulease`. Client is `scripts/bench_speed.sh`.
 
 **§0-BENCH.** `bench_plowrt_serve.sh` is the REFERENCE harness and is preferred whenever it can
 run, because it drives `vllm bench serve` so plow and vLLM are measured by the same client binary
@@ -65,7 +65,7 @@ lands, TTFT is dominated by 69 layers that the merged win does not touch. Anyone
 ## 4. Reproduce
 
 ```bash
-perf-data/harness/gpulease -n 8 speed sg render -c \
+perf-data/tools/gpulease -n 8 speed sg render -c \
   "PLOW_L2_PLACE_DISPATCH=1 IN_LENS='128 1024 4096' CONCS=1 NPROMPT=6 OUTLEN=128 \
    PLOWRT_BIN=<hsa-built plowrt> scripts/bench_speed.sh <assets> 8421 auto 1800"
 ```

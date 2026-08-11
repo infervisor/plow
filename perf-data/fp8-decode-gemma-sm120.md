@@ -12,7 +12,7 @@ scope). Prefill stays bf16 GEMM on the bf16 weights; only the DECODE GEMV family
 
 ## What landed
 
-- **Quantizer** `perf-data/harness/quantize_fp8.py`: per-output-channel (per-row) e4m3, the
+- **Quantizer** `perf-data/tools/quantize_fp8.py`: per-output-channel (per-row) e4m3, the
   settled convention (matches the AMD path, `runtime/amd/op_gemm.h:1440`):
   `scale[n] = amax(|W[n,:]|)/448`, `W8[n,k] = round_e4m3(W[n,k]/scale[n])`, dequant
   `W ≈ float(W8)·scale[n]` (scale applied ONCE in the epilogue). Output is one

@@ -1,5 +1,27 @@
 # Agent — Stage 6: Runtime Optimization
 
+## Target parameters — fill this in FIRST
+
+This stage is target-specific, and on this stage `$VENDOR` decides **which
+levers exist at all**. Read [`../target.md`](../target.md) and fill every row
+before touching a flag. A row you cannot fill is a **blocker**, not a default.
+Every command below is written in these names — **never substitute a literal
+part name into a command.**
+
+| param | value | source |
+|---|---|---|
+| `$VENDOR` | | `amd` or `nvidia` — selects the engine and the lever set |
+| `$ISA` | | the `--arch` string (`IsaLevel::arch_flag()`) |
+| `$GPU` | | a name from `plowc --list-gpus` — do not guess one |
+| `$NCU` | | `--n-cu`; leave `0` to take `$GPU`'s `sm_count` |
+| `$NGPU` / `$PARALLEL` | | `--num-gpus` / `--parallel`; **must be `tp`** — the devblob path errors on dp/pp/ep |
+| `$MAXCTX` | | `--max-ctx`; must hold `input + output` of every request you serve |
+| `$TOOLCHAIN` | | `hipcc` or `nvcc`, + version |
+| `$BUILD` | | `scripts/build_<isa>.sh` for `$ISA` |
+| `$FEATURES` | | `--features hsa` (amd) or `--features cuda` (nvidia) |
+| `$BW_BOUND` | | carried from Stage 4 — decode is bandwidth-bound against it |
+| `$RESULTS` | | `perf-data/plow-<isa>/` if it exists, else `perf-data/` |
+
 You are executing **Stage 6** of the model-bringup playbook. Your job: take a
 model whose single block is correct and tuned (Stage 5) and make it **serve the
 whole model efficiently** on `plowrt` — profile the runtime, apply the levers,
@@ -17,10 +39,10 @@ compiled into the blob and may send you back to Stage 5.
   latency target.
 * `plowc --emit devblob` produces a full-model `model.pkt` that loads, with the
   Stage-5 assets in `$ASSETS` (`.pkt` + `weights.json` + sidecars; `hsaco` dir
-  for AMD).
-* You know the target arch/GPU and have a GPU to run on. Use `nix develop` for
-  all build/cargo commands: `cargo build -p plowrt --release --features cuda`
-  (sm_120) or `--features hsa` (gfx950).
+  on `$VENDOR = amd`) — emitted for `$GPU`/`$ISA`, not another part.
+* The target block above is filled in and you have `$GPU` to run on. Use
+  `nix develop` for all build/cargo commands:
+  `cargo build -p plowrt --release $FEATURES`.
 
 If any is missing, **stop and report** — do not optimize a runtime around a block
 that has not gated out of Stage 5.
@@ -28,15 +50,20 @@ that has not gated out of Stage 5.
 ## Fix the target first — everything is measured against it
 
 Before touching a flag, write down: **model + family, prompt length, target
-concurrency, TTFT budget, TPOT budget.** A "faster" number that ignores the TPOT
-budget at the target concurrency is not progress. Also note which engine you are
-on — the lever set differs:
+concurrency, TTFT budget, TPOT budget** — all of them for `$GPU`. A "faster"
+number that ignores the TPOT budget at the target concurrency is not progress,
+and a budget inherited from another part is not a budget. `$VENDOR` selects the
+engine, and with it the lever set:
 
-* **CUDA / sm_120** (`ServeEngine::Cuda`, slotted): B sequence slots, chunked
-  prefill, VMM prefix sharing, device sampling, multi-model residency.
-* **AMD / gfx950** (`ServeEngine::Amd`, single-sequence per rank, optional TP):
-  one model per process, no paging, no residency; ragged-tail chunking + same-
-  slot prefix cache for recurrent models are the AMD-side levers.
+* **`$VENDOR = nvidia`** (`ServeEngine::Cuda`, slotted): B sequence slots,
+  chunked prefill, VMM prefix sharing, device sampling, multi-model residency.
+* **`$VENDOR = amd`** (`ServeEngine::Amd`, single-sequence per rank, optional
+  TP): one model per process, no paging, no residency; ragged-tail chunking +
+  same-slot prefix cache for recurrent models are the levers on this side.
+
+The seam is per vendor, not per ISA — every `$ISA` of a vendor reaches the same
+engine. A lever listed for the other vendor **does not exist** on your target;
+it is not merely untuned.
 
 ## Procedure
 
@@ -59,9 +86,10 @@ plowrt amd-bench --blob $ASSETS/model.pkt --rt-hsaco $ASSETS/hsaco \
 
 Records the TPOT floor (per-token decode ms) and, with a multi-token `--prompt`,
 the TTFT floor (prefill ms / tok/s). **Without `--checkpoint` the ids are noise —
-timing only.** On CUDA, measure the single-stream floor through `serve` at
-concurrency 1 instead. For TP prefill scaling: `--tp N --prefill-sweep
-512,1024,2048,4096,8192 --prefill-reps 3`.
+timing only.** This is the `$VENDOR = amd` path; on nvidia, measure the
+single-stream floor through `serve` at concurrency 1 instead. For TP prefill
+scaling: `--tp $NGPU --prefill-sweep 512,1024,2048,4096,8192 --prefill-reps 3`
+(every sweep point ≤ `$MAXCTX`).
 
 ### 3. Bring up serving and baseline
 
@@ -91,27 +119,33 @@ slot *i* is engine slot *i*.
 
 Highest value first; keep only what helps *your* target:
 
-1. **Multi-step + device sampling** (sm_120): `PLOW_MULTISTEP=8`,
-   `PLOW_DEV_SAMPLE=1`. Largest single decode win (~1.74×, free).
-2. **Batch width `B`** from the **TPOT budget**, not peak throughput. If a
-   different `B` is needed, recompile in Stage 5 (`PLOW_DECODE_BATCH`).
+1. **Multi-step + device sampling** (`$VENDOR = nvidia`): `PLOW_MULTISTEP=8`,
+   `PLOW_DEV_SAMPLE=1`. Largest single decode win (measured ~1.74× on one part;
+   confirm the size on `$GPU`).
+2. **Batch width `B`** from the **TPOT budget**, not peak throughput. Decode is
+   bandwidth-bound against `$BW_BOUND`, so the crossover is a `$GPU` property —
+   derive it, do not inherit it. If a different `B` is needed, recompile in
+   Stage 5 (`PLOW_DECODE_BATCH`).
 3. **Prefill chunking / interleave** only if the TTFT-under-load tail is the
-   problem (`--pf-interleave`, `--pf-chunk`). Measure — finer often loses
-   throughput. AMD ragged-tail (`PLOW_RAGGED_CHUNK`) is on by default.
-4. **Prefix cache** if traffic shares prefixes: `--vmm-prefix` (sm_120,
-   `--vmm-block-mib 64` at long ctx) or `--prefix-cache` (AMD recurrent).
+   problem (`--pf-interleave`, `--pf-chunk`; `$VENDOR = nvidia`). Measure —
+   finer often loses throughput; and re-fit `--pf-chunk-cost` on `$GPU`, its
+   default is another part's launch cost. On `$VENDOR = amd` the ragged-tail
+   chunk (`PLOW_RAGGED_CHUNK`) is on by default.
+4. **Prefix cache** if traffic shares prefixes: `--vmm-prefix` (nvidia;
+   `--vmm-block-mib` is the real knob — 64 MiB won at long ctx on the measured
+   part) or `--prefix-cache` (amd, recurrent families).
    **Always report the hit rate** — a low-hit cache is a net loss.
-5. **TP** if one GPU cannot hold the model / hit the budget. Gate on rank
-   token-identity: `plowrt devices --tp N`, `plowrt amd-bench --tp N` (every rank
-   must emit the identical stream).
+5. **TP** if one `$GPU` cannot hold the model / hit the budget; `$PARALLEL` must
+   be `tp`. Gate on rank token-identity: `plowrt devices --tp $NGPU`,
+   `plowrt amd-bench --tp $NGPU` (every rank must emit the identical stream).
 6. **Load / cold start** (`--rt-prefetch-threads`, weight-slab knobs) only if
-   time-to-serving matters. `PLOW_WEIGHT_VMM` helps CUDA, hurts AMD — leave AMD's
-   default off.
+   time-to-serving matters. `PLOW_WEIGHT_VMM` helps nvidia, hurts amd — leave
+   the amd default off.
 
 ### 6. Diagnose off numbers
 
 `PLOW_TTFT_LOG=1` (conc. 1), `PLOW_DSTEP_LOG=1`, `PLOW_PFX_LOG=1`,
-`PLOW_PF_PACKLOG=1`; `--trace` + `GET /trace` or `PLOW_TRACE_RAW=path` (AMD);
+`PLOW_PF_PACKLOG=1`; `--trace` + `GET /trace` or `PLOW_TRACE_RAW=path` (amd);
 `plowrt disasm $ASSETS --counters --kernargs --tensors` for static analysis.
 
 ## The gate before Stage 7
@@ -127,7 +161,11 @@ blocker:
 4. `plowrt_admit_shed_total` ~0 at target load; any 429s are genuine capacity.
 5. Any numerics-changing lever (batched prefill, ragged tail, prefix sharing)
    re-verified against a correctness gate. On TP, rank token-identity holds.
-6. A recorded recipe: `plowrt serve` command + `PLOW_*` knobs + measured numbers.
+6. A recorded recipe: `plowrt serve` command + `PLOW_*` knobs + measured
+   numbers, **stamped with `$GPU`, `$ISA`, `$NGPU`/`$PARALLEL`, `$MAXCTX`**. An
+   unstamped recipe gets read as a target on the next part.
+7. Every lever kept was measured on `$GPU`; nothing was carried over from
+   another part's campaign as "already tuned".
 
 ## Pitfalls to actively guard against
 
@@ -150,19 +188,28 @@ blocker:
   (only TP is wired; EP is a MoE remap, disagg is a skeleton), no S2
   multi-tenancy, no host watchdog, `Streamer::execute_reclaim` is a no-op.
 * **`gpulease` rc=76** is a false positive on a shared box; discard and re-run.
-* Multi-model (CUDA): duplicate network names silently drop a bundle; install-by-
-  slug vs lookup-by-network can fall to the CPU reference path.
+* Multi-model (`$VENDOR = nvidia`): duplicate network names silently drop a
+  bundle; install-by-slug vs lookup-by-network can fall to the CPU reference
+  path.
+* **An asset built for another part still serves.** `--arch` is packet metadata
+  and its default disagrees with `--gpu`'s default by design; `PLOW_UNISEG` on
+  amd is warn-and-ignore, not a refusal. Check `build.json` names `$GPU`/`$ISA`
+  before trusting a serving number.
 
 ## When to stop and ask
 
+* Any row of the target block cannot be filled — in particular `$PARALLEL` is
+  not `tp`, or `$GPU` is not in `plowc --list-gpus`.
 * The full-model emit aborts, or `simulate` deadlocks / never terminates → a
   Stage 1–5 defect, not a runtime one.
-* KV cannot be made to fit the target concurrency at any sane chunk size on the
-  available VRAM → a memory-budget decision (smaller `B`, TP, or a different
-  card), not a knob.
+* KV cannot be made to fit the target concurrency at any sane chunk size on
+  `$GPU`'s VRAM → a memory-budget decision (smaller `B`, TP, or a different
+  part), not a knob.
 * The target needs a mode that is **not wired** (DP/PP GPU parallelism, prefill/
   decode disaggregation, multi-tenancy, a watchdog) → report the gap; do not
   hand-roll it.
+* A lever your plan depends on exists only on the other `$VENDOR` — report it
+  as a target-capability gap, do not substitute an unrelated knob.
 * A numerics-changing lever helps latency but you cannot get a correctness gate
   to confirm it (no facts probe / oracle for the family) → surface it and ask.
 * TP ranks disagree on tokens → a collective is not running; this is a
@@ -170,8 +217,9 @@ blocker:
 
 ## Report back
 
-* **Engine + geometry**: CUDA slotted vs AMD single-sequence/TP; compiled `B`,
-  TP degree, prompt length, target concurrency.
+* **The filled target block** — every row.
+* **Engine + geometry**: nvidia slotted vs amd single-sequence/TP; compiled `B`,
+  `$NGPU`, prompt length, target concurrency.
 * **Baseline vs tuned**: TTFT, TPOT, throughput at the target concurrency, and
   which levers moved which number (with the measured delta).
 * **Memory budget**: weights / KV / scratch, and the concurrency that fits.
@@ -179,6 +227,7 @@ blocker:
   re-verified (facts probe, oracle, TP token-identity). Prefix-cache hit rate if
   used.
 * **Gate decision**: ready for Stage 7, or blocked (with the specific blocker).
-* **The recipe**: the exact `plowrt serve` command line + `PLOW_*` knobs.
+* **The recipe**: the exact `plowrt serve` command line + `PLOW_*` knobs,
+  stamped with `$GPU` / `$ISA` / `$NGPU` / `$MAXCTX`.
 * **Real-vs-ideal caveats** affecting trust: contention, benched-on-shed
   throughput, any lever left off because it was unwired or unverified.

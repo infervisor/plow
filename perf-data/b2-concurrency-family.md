@@ -8,7 +8,7 @@ measure) for both engines. Greedy (temperature 0), streaming, 128 output
 tokens. **TTFT includes server-side queueing** — the capacity convention.
 
 Source of every number: `perf-data/b2-concurrency-12b.json` (transcribed
-verbatim from the tool's own report JSON; `perf-data/harness/b2-ib/<tag>/results/`).
+verbatim from the tool's own report JSON; `perf-data/tools/b2-ib/<tag>/results/`).
 
 ## Scope actually measured this pass
 
@@ -126,4 +126,4 @@ B=8 mux saturates by VU4. The vLLM 16k comparator is queued for the next lease.
 - `perf-data/bench_b2_ib.sh` — parameterized driver (`CAMPAIGN`, `PROMPT_TOKS`,
   `VUS`, `DO_SWEEP`, `MODEL_NAME`, `TOKENIZER`, `ASSETS`); one server config per
   `gpulease`.
-- `perf-data/harness/b2-ib/{slo_capacity,summarize}.py` — scratch reducers.
+- `perf-data/tools/b2-ib/{slo_capacity,summarize}.py` — scratch reducers.

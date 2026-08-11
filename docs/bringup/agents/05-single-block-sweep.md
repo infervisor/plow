@@ -1,5 +1,26 @@
 # Agent — Stage 5: Single-Block Sweep
 
+## Target parameters — fill this in FIRST
+
+Correctness in this stage is target-independent; **latency is not**. Read
+[`../target.md`](../target.md) and fill every row before any timing. A row you
+cannot fill is a **blocker**, not a default. Every command below is written in
+these names — **never substitute a literal part name into a command.**
+
+| param | value | source |
+|---|---|---|
+| `$VENDOR` | | `amd` or `nvidia` |
+| `$ISA` | | the `--arch` string (`IsaLevel::arch_flag()`) |
+| `$GPU` | | a name from `plowc --list-gpus` — do not guess one |
+| `$NCU` | | `--n-cu`; leave `0` to take `$GPU`'s `sm_count` |
+| `$NGPU` / `$PARALLEL` | | `--num-gpus` (default 1) / `--parallel` (must be `tp`) |
+| `$MAXCTX` | | `--max-ctx`; must cover every ctx you sweep |
+| `$TOOLCHAIN` | | `hipcc` or `nvcc`, + version; must match the installed driver |
+| `$BUILD` | | `scripts/build_<isa>.sh` for `$ISA` |
+| `$FEATURES` | | `--features hsa` or `--features cuda` |
+| `$BW_BOUND` / `$COMPUTE_CEIL` | | carried from Stage 4, measured on `$GPU` |
+| `$RESULTS` | | `perf-data/plow-<isa>/` if it exists, else `perf-data/` |
+
 You are executing **Stage 5** of the model-bringup playbook. Your job: take one
 transformer block of the target model, **prove it is numerically correct**, then
 **tune its isolated latency to the per-block target**, and decide whether the
@@ -13,8 +34,8 @@ commands, and pitfalls. This prompt is the executable checklist.
   intermediate size, expert layout, which family: Gemma-dense / Gemma-MoE / GLM
   MLA+MoE / Kimi-K3 / DeepSeek / Nemotron).
 * `plowc --emit devblob` produces a full-model `model.pkt` without aborting.
-* You know your target arch/GPU (`--arch`, `--gpu`, `--n-cu`) and have a GPU to
-  run on. Use `nix develop` for all build/cargo commands.
+* The target block above is filled in and you have `$GPU` to run on. Use
+  `nix develop` for all build/cargo commands.
 
 If any is missing, **stop and report** — do not start Stage 5 on an unvalidated
 emit.
@@ -40,8 +61,8 @@ Confirm which you have with `plowrt amd-block --list-tensors` or
 ### 1. Emit and inspect one block
 
 ```bash
-plowc --emit devblob --block 0 --max-ctx <ctx> --n-cu <N> --gpu <gpu> \
-  --hf-dir <ckpt-dir> --out <asset>/
+plowc --emit devblob --block 0 --arch $ISA --gpu "$GPU" --n-cu $NCU \
+  --max-ctx $MAXCTX --num-gpus $NGPU --hf-dir <ckpt-dir> --out <asset>/
 plowrt disasm <asset>/model.pkt --program 1      # confirm the expected ops are present
 ```
 
@@ -97,29 +118,34 @@ worthless.
   ```
 * **MLA family:** truncated-model sweep — `./scripts/k3_block_sweep.sh` (Kimi),
   `./scripts/glm52_block_sweep_gfx942.sh` (GLM). Apply emit knobs as
-  `KNOB=val ./scripts/k3_block_sweep.sh`.
+  `KNOB=val ./scripts/k3_block_sweep.sh`. **Both scripts pin a part in their
+  headers** (one in its filename); read and re-point them at `$ISA`/`$GPU`
+  before trusting any number they print.
 
-Every timed run must be uncontended (`gpulease` rc=0). Discard and re-run any
-rc=76.
+Every timed run must be uncontended (`perf-data/tools/gpulease` rc=0). Discard
+and re-run any rc=76.
 
 ### 5. Anchor and attribute
 
-* Anchor the isolated per-block number against a reference-framework floor:
+* Anchor the isolated per-block number against a reference-framework floor
+  **measured on `$GPU` in the same session**:
   `per_block_us ≈ (TPOT_ms − fixed_overhead_ms) × 1000 / num_layers`. Run the
   reference side with `scripts/block_layer_bench.py` / `block_baseline.py`, join
   with `scripts/block_compare.py --phase {decode,prefill}`. Check
-  `block_us × layers ≈ decode body`.
+  `block_us × layers ≈ decode body`. A floor taken from another part — including
+  another part at the same `$ISA` — is not an anchor.
 * Attribute per-op with `scripts/block_op_bench.py --phases decode,prefill` (the
-  reference target by kernel) and a `-DPLOW_NV_TRACE=1` cubin +
-  `trace_summary` in `block_run` (plow's own breakdown).
+  reference target by kernel) and, on `$VENDOR = nvidia`, a `-DPLOW_NV_TRACE=1`
+  device object + `trace_summary` in `block_run` (plow's own breakdown).
 
 ## Interpreting results
 
 * **Correct + at target →** gate passes. Go to Stage 6 with the per-op profile;
   name the largest single op (commonly `moe_experts`, then `qkv_proj`) as the
   first optimization prize.
-* **Correct + slow →** report the gap **as a %-of-HBM-peak (decode) or TFLOP/s
-  (prefill) per projection**, not a single latency. A roughly uniform gap across
+* **Correct + slow →** report the gap **as a % of `$BW_BOUND` (decode) or of
+  `$COMPUTE_CEIL` (prefill) per projection**, not a single latency, and name
+  which kind of denominator each is. A roughly uniform gap across
   projections points at a shared occupancy ceiling (attack blocks/SM globally),
   not one bad kernel. Hand this to Stage 6.
 * **Incorrect →** stop. Localize with the per-substep diff, fix the emitter/op,
@@ -128,24 +154,31 @@ rc=76.
 ## Pitfalls to actively guard against
 
 * Block ms ≠ model ms — truncated-model scores are **rankings**, not TTFT.
-* Isolated whole-block us **over-states** the norm/launch floor (~180 us of
-  launch overhead plow fuses away). Trust the per-op GEMV/attn rows.
-* An **eager** reference baseline flatters plow ~2.5× — the reference must
-  CUDA-graph the decode step.
+* Isolated whole-block us **over-states** the norm/launch floor (on one measured
+  part, ~180 us of launch overhead plow fuses away — re-measure the split on
+  `$GPU`). Trust the per-op GEMV/attn rows.
+* An **eager** reference baseline flatters plow (measured ~2.5× on one part) —
+  the reference must graph-capture the decode step.
 * Few-instances-per-block ops (router/combine) sink into timer noise on a block —
   defer them to the full network.
 * A knob measured on an isolated kernel can **invert** in the megakernel — prefer
   a truncated-model blob for ranking runtime knobs.
 * Reference geometry may be an approximation (MoE expert count / top-k) — fix the
   descriptor before comparing MoE.
-* Cross-GPU numbers are not comparable; re-anchor per card.
-* The tune system may be a no-op on your GPU/precision (aliased GEMM, no decode
+* Cross-GPU numbers are not comparable; re-anchor on `$GPU`. Two parts at the
+  same `$ISA` still differ in memory subsystem and CU/SM count.
+* The tune system may be a no-op on `$GPU`/precision (aliased GEMM, no decode
   GEMV kernel) — confirm it selects something before calling the block "tuned".
-* Driver/toolchain mismatch (`CUDA_ERROR_INVALID_IMAGE`, "driver too old") fails
-  runs for reasons unrelated to the block.
+* Driver/`$TOOLCHAIN` mismatch (`CUDA_ERROR_INVALID_IMAGE`, "driver too old",
+  or the HSA-side equivalent) fails runs for reasons unrelated to the block.
+* An asset emitted for another part still loads and runs — `--arch` is packet
+  metadata, and its default disagrees with `--gpu`'s default by design. Check
+  `build.json` before trusting a latency number.
 
 ## When to stop and ask
 
+* Any row of the target block cannot be filled — do not substitute another
+  part's value, and do not proceed to timing without `$GPU` established.
 * The full-model emit aborts, or the block asset lacks tensors you expect
   (`--list-tensors` / `disasm` disagree with the config) → a Stage 1–4 defect.
 * No C oracle harness / oracle fixture exists for this family in
@@ -158,6 +191,8 @@ rc=76.
 
 ## Report back
 
+* **The filled target block** — every row; latency numbers are meaningless
+  without it.
 * **Family + block shape** (model-shaped vs act.x-only) and how you drove it.
 * **Correctness:** pass/fail, tolerance used, per-substep results, any silent
   zeros found.
@@ -166,4 +201,5 @@ rc=76.
 * **Per-op profile** and the single biggest op.
 * **Gate decision:** ready for Stage 6, or blocked (with the specific blocker).
 * **Real-vs-ideal caveats** that affect trust in the numbers (contention,
-  geometry approximation, cross-GPU anchor, toolchain).
+  geometry approximation, whether the anchor was measured on `$GPU`,
+  `$TOOLCHAIN`/driver).

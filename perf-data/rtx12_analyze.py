@@ -166,7 +166,7 @@ def main(mode_dirs):
     out = {"cells": cells, "note": "R = requests packed per batched-prefill launch; "
            "chunk_rows = per-request rows that launch; walltime split from cumulative "
            "PACKLOG WALL counters diffed over each cell's log-line bracket."}
-    root = os.path.dirname(os.path.dirname(os.path.abspath(mode_dirs[0])))  # perf-data/harness/.. -> perf-data
+    root = os.path.dirname(os.path.dirname(os.path.abspath(mode_dirs[0])))  # perf-data/tools/.. -> perf-data
     outjson = os.path.join(root, "..", "rtx12-packing-baseline.json")
     # write json next to perf-data; OUTBASE env overrides the file stem
     # (RTX-12 chunked-packing campaign writes rtx12-chunked-packing.{json,md}).

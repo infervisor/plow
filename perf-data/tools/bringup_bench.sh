@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One benchmark pass over one serving endpoint with the vLLM bench client
-# (see BRINGUP.md §2: same client for EVERY arm, sequential + exclusive).
+# (see docs/bringup/07-perf-campaign.md: same client for EVERY arm, sequential + exclusive).
 #   bringup_bench.sh <tag> <base_url> <model> <tokenizer_dir> [round]
 # Env: IN_LENS (default "128 1024 4096"), NPROMPT (default 6), OUTLEN (default 8),
 #      BRINGUP_OUT (default /tmp/bringup-$USER).

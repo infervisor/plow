@@ -24,7 +24,7 @@
  *     L2 on this card will otherwise serve a 31 MB weight entirely from cache (PX-6 E1a:
  *     4090 GB/s warm at 32 MB vs 1695.6 GB/s at 2 GB);
  *   - 8 warm + 30 timed, cudaEvent around the whole batch;
- *   - run it under perf-data/harness/gpulease.
+ *   - run it under perf-data/tools/gpulease.
  *
  * NULL CONTROL: the bf16 arm at the same shape/grid must reproduce PX-6's ~116 TFLOPS.  If it
  * does not, the harness is wrong and the fp8 number means nothing.

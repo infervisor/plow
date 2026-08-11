@@ -268,7 +268,7 @@ esac
 # which it is on the H100 box and is NOT here — and a bare `gpulease` that is
 # missing does not fail the sweep, it fails every RUN, so the sweep completes
 # having recorded nothing and looks like a grid with no trustworthy samples.
-GPULEASE="$(command -v gpulease || echo "$ROOT/perf-data/harness/gpulease")"
+GPULEASE="$(command -v gpulease || echo "$ROOT/perf-data/tools/gpulease")"
 [ -x "$GPULEASE" ] || { echo "no gpulease at $GPULEASE" >&2; exit 2; }
 
 # WHICH libcuda. `device::cuda` tries /usr/local/cuda/compat BEFORE the distro

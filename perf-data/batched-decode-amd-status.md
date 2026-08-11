@@ -225,7 +225,7 @@ move.
         --out /home/lava/plow/build-amd/g31b-db$B
     done
     # the gate
-    perf-data/harness/gpulease -n 1 gate sg render -c 'nix develop -c \
+    perf-data/tools/gpulease -n 1 gate sg render -c 'nix develop -c \
       ./target/release/plowrt amd-bench --blob build-amd/g31b-db4/model.pkt \
         --hsaco build-amd/hsaco-b4 --checkpoint <ckpt> --steps 4 --ctx 1024 --batched \
         --prompt "2,106,1645;2,106,1645,236764,3689;2,3689,506,7534,529,6427,236761;2,106,1645,236764"'

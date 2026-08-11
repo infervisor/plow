@@ -4,12 +4,12 @@
 #
 #   ./scripts/glm52_tpctx_sweep.sh emit                 # plowc only. NO GPU, NO lease.
 #   ./scripts/glm52_tpctx_sweep.sh tune <objdir>        # gemm tile campaign + gate. 1 GPU.
-#   perf-data/harness/gpulease -n 4 glm-ctx4 sg render -c \
+#   perf-data/tools/gpulease -n 4 glm-ctx4 sg render -c \
 #       './scripts/glm52_tpctx_sweep.sh run 4'          # coherence -> plow -> vLLM, TP4
-#   perf-data/harness/gpulease -n 8 glm-ctx8 sg render -c \
+#   perf-data/tools/gpulease -n 8 glm-ctx8 sg render -c \
 #       './scripts/glm52_tpctx_sweep.sh run 8'          # ditto, TP8 (needs ALL EIGHT cards)
 #   ./scripts/glm52_tpctx_sweep.sh emitns               # the 8-bundle GF x nsplit grid. NO GPU.
-#   VARIANT=gf4ns64- perf-data/harness/gpulease -n 4 ns4 sg render -c \
+#   VARIANT=gf4ns64- perf-data/tools/gpulease -n 4 ns4 sg render -c \
 #       './scripts/glm52_tpctx_sweep.sh nsrun 4'        # ONE nsplit arm: op-level + identity
 #
 # ============================================================================

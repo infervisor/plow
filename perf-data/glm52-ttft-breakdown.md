@@ -218,7 +218,7 @@ nix develop -c bash scripts/rebench_emit_glm.sh <bundle>/model.pkt
 
 # the run. sg render (this login predates the render gid); ttft_run.sh unsets
 # HIP_/CUDA_VISIBLE_DEVICES, which COMPOSE with gpulease's ROCR ids.
-GPU_LEASE_TIMEOUT=7200 perf-data/harness/gpulease -n 4 ttft \
+GPU_LEASE_TIMEOUT=7200 perf-data/tools/gpulease -n 4 ttft \
   sg render -c "bash $PWD/scripts/ttft_run.sh"
 ```
 

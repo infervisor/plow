@@ -31,7 +31,7 @@
  *   nvcc -arch=sm_120a -O3 -I runtime/common -I runtime/nvidia \
  *        perf-data/px9_gemm_body_bench.cu -o /tmp/px9 -lcublasLt
  * RUN (always under the lease):
- *   perf-data/harness/gpulease px9 /tmp/px9 [ladder|gemm|lt|all]
+ *   perf-data/tools/gpulease px9 /tmp/px9 [ladder|gemm|lt|all]
  *
  * NOT a correctness test — random operands, no reference.  The vectorized frag read proposed in
  * rung 2 is a pure address bijection over the SAME bytes (see px9_load_* below) and is gated by

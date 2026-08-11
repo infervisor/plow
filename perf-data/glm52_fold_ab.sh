@@ -1,6 +1,6 @@
 #!/bin/sh
 # A/B the MLA_MERGE_FOLD rewrite against the current best decode object, end to end.
-# Run under: perf-data/harness/gpulease -n 4 mfab sg render -c '.... this script ...'
+# Run under: perf-data/tools/gpulease -n 4 mfab sg render -c '.... this script ...'
 # NOTE: no `env -i` anywhere — that strips ROCR_VISIBLE_DEVICES and destroys the lease (§0a/§6e).
 set -e
 D=/home/lava/models/glm52_tp

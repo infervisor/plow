@@ -1,7 +1,7 @@
 # HIER2 on K3: the ceiling is −13.8%, and the thing that blocked it is already built
 
 **Measured 2026-07-30**, 8× gfx950 (MI355X), K3 93 layers TP8, `/home/lava/models/k3_base/model.pkt`,
-ctx 32000, `--steps 200`, UNBOUND weights, every run under `perf-data/harness/gpulease`,
+ctx 32000, `--steps 200`, UNBOUND weights, every run under `perf-data/tools/gpulease`,
 `foreign-during=0` on every run quoted.
 
 **§0-BENCH.** `plowrt amd-bench` with no `--checkpoint` — the schedule, the counters and the
@@ -164,12 +164,12 @@ Order of work:
 # microbench (one GPU)
 hipcc --offload-arch=gfx950 -O3 -std=c++17 -w [-DFAN=256|-DHIER2|-DRELAXSIG|-DNOACQ] \
       runtime/bench/ctr_convergence.hip -o ctrconv
-perf-data/harness/gpulease -n 1 ctrconv sg render -c './ctrconv 400'
+perf-data/tools/gpulease -n 1 ctrconv sg render -c './ctrconv 400'
 
 # the arm (8 GPUs, unbound, interleaved with order reversal)
 cmake -S runtime -B ba_hier <flags> -DPLOW_HSACO_EXTRA_DEFINES="-DPLOW_GATE_HIER_CEIL=1"
 cmake --build ba_hier --target gfx950_hsaco -j 32
-perf-data/harness/gpulease -n 8 hier sg render -c "nix develop <repo> --command \
+perf-data/tools/gpulease -n 8 hier sg render -c "nix develop <repo> --command \
   plowrt amd-bench --blob /home/lava/models/k3_base/model.pkt --hsaco ba_hier/hsaco \
   --steps 200 --ctx 32000 --tp 8"
 ```
@@ -177,7 +177,7 @@ perf-data/harness/gpulease -n 8 hier sg render -c "nix develop <repo> --command 
 **Trap that cost this campaign its first day of numbers:** a bare `flock /tmp/plow_gpu.lock`
 serialises against other runs but does **not** take the gpulease lease, so it neither waits for
 nor warns about a concurrent agent's campaign. Timed that way, one arm measured **46.418 ms at
-position 2 and 33.802 at position 1**. Use `perf-data/harness/gpulease`; it audits and it logs.
+position 2 and 33.802 at position 1**. Use `perf-data/tools/gpulease`; it audits and it logs.
 
 ---
 
