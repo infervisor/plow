@@ -282,6 +282,49 @@ if(PLOW_ROCM)
     target_link_libraries(k3_moe_grid_sweep PRIVATE ${PLOW_AMDHIP64} m)
     add_dependencies(k3_moe_grid_sweep k3_moe_grid_sweep_gfx942_object)
 
+    # Exact one-workgroup K3 B1 router tail. Two objects differ only in whether
+    # each lane caches its packed expert keys across the 16 block reductions.
+    set(K3_ROUTER_TOPK_SRC ${CMAKE_CURRENT_SOURCE_DIR}/amd/k3_router_topk_sweep.hip)
+    set(K3_ROUTER_TOPK_CTL ${CMAKE_CURRENT_BINARY_DIR}/k3_router_topk_control_gfx942.elf)
+    set(K3_ROUTER_TOPK_LOCAL ${CMAKE_CURRENT_BINARY_DIR}/k3_router_topk_local_gfx942.elf)
+    add_custom_command(
+        OUTPUT ${K3_ROUTER_TOPK_CTL}
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+                "$ENV{PLOW_HIPCC}" "$ENV{PLOW_BUNDLER}" gfx942
+                ${K3_ROUTER_TOPK_CTL} k3_router_topk 256 2
+                -std=c++17 -DPLOW_BUCKET_DECODE=1 -DPLOW_K3=1
+                -DPLOW_MOE_ROUTER_SELECT=1 -DPLOW_MOE_ROUTER_SELECT_LOCAL=0
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                ${K3_ROUTER_TOPK_SRC}
+        DEPENDS ${K3_ROUTER_TOPK_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_moe.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+        VERBATIM)
+    add_custom_command(
+        OUTPUT ${K3_ROUTER_TOPK_LOCAL}
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+                "$ENV{PLOW_HIPCC}" "$ENV{PLOW_BUNDLER}" gfx942
+                ${K3_ROUTER_TOPK_LOCAL} k3_router_topk 256 2
+                -std=c++17 -DPLOW_BUCKET_DECODE=1 -DPLOW_K3=1
+                -DPLOW_MOE_ROUTER_SELECT=1 -DPLOW_MOE_ROUTER_SELECT_LOCAL=1
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                ${K3_ROUTER_TOPK_SRC}
+        DEPENDS ${K3_ROUTER_TOPK_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_moe.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+        VERBATIM)
+    add_custom_target(k3_router_topk_sweep_gfx942_objects
+        DEPENDS ${K3_ROUTER_TOPK_CTL} ${K3_ROUTER_TOPK_LOCAL})
+    add_executable(k3_router_topk_sweep amd/k3_router_topk_sweep.cpp)
+    target_compile_features(k3_router_topk_sweep PRIVATE cxx_std_17)
+    target_include_directories(k3_router_topk_sweep PRIVATE "$ENV{ROCM_PATH}/include")
+    target_compile_definitions(k3_router_topk_sweep PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_compile_options(k3_router_topk_sweep PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(k3_router_topk_sweep PRIVATE ${PLOW_AMDHIP64} m)
+    add_dependencies(k3_router_topk_sweep k3_router_topk_sweep_gfx942_objects)
+
     set(K3_KDA_DB_CO ${CMAKE_CURRENT_BINARY_DIR}/k3_kda_conv_step_db_gfx942.co)
     add_custom_command(
         OUTPUT ${K3_KDA_DB_CO}
