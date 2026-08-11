@@ -57,15 +57,15 @@
   ; dropped every weight but the first.
   (Conv1dDepthwise Expr Expr i64)     ; x, weight, kernel  (KDA's short causal conv)
   (SituGlu Expr Expr f64 f64)         ; gate, up, beta, linear_beta
-  ; q, k, v, gate, beta, kind-token, num_heads, head_dim. The recurrent state is
+  ; q, k, v, gate, beta, A_log, dt_bias, kind-token, num_heads, head_dim. The recurrent state is
   ; a runtime resource, not an edge — same convention as `Attention` and the KV
   ; cache (see `nn_graph::Op::LinearAttention`).
-  (LinearAttention Expr Expr Expr Expr Expr String i64 i64)
+  (LinearAttention Expr Expr Expr Expr Expr Expr Expr String i64 i64)
 
   ; K3's block residual. The snapshot stack is variable-length (0..max_snapshots),
   ; so it rides as a cons chain — the `Concat` precedent above, for the same
   ; reason: egglog constructors are fixed-arity and no leaf may be dropped.
-  (BlockResidual Expr Expr Expr i64)  ; prefix, snapshot-chain, score_weight, max_snapshots
+  (BlockResidual Expr Expr Expr Expr i64)  ; prefix, snapshots, norm_weight, proj_weight, max_snapshots
   (SnapCons Expr Expr)                ; snapshot, rest
   (SnapNil)                           ; end of the snapshot chain
 
@@ -110,5 +110,6 @@
   ; already numerically gated on real weights — `KdaGatedNorm = 103` and
   ; `MlaOutGate = 106`. The unfused graph spells each as 3-5 e-nodes, so these
   ; rules are what lets extraction reach a kernel the runtime can already run.
-  (FusedKdaGatedNorm Expr Expr f64 Expr Expr i64)  ; o, o_normw, eps, x, gatew, gate_out
+  (FusedKdaGatedNorm Expr Expr f64 Expr Expr i64 String)
+      ; o, o_normw, eps, x, gatew, gate_out, gate-shape
   (FusedMlaOutGate Expr Expr Expr i64))            ; attn, x, gatew, gate_out

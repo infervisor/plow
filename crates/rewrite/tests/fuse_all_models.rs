@@ -638,12 +638,14 @@ const KIMI_K3: &str = r#"{
       "num_hidden_layers": 4, "num_attention_heads": 4,
       "q_lora_rank": 64, "kv_lora_rank": 32,
       "qk_rope_head_dim": 16, "qk_nope_head_dim": 32, "v_head_dim": 32,
+      "mla_use_output_gate": true,
       "num_experts": 8, "num_experts_per_token": 2, "num_shared_experts": 1,
       "moe_intermediate_size": 128, "routed_expert_hidden_size": 192,
       "first_k_dense_replace": 1,
       "attn_res_block_size": 2,
       "linear_attn_config": {
         "num_heads": 4, "head_dim": 32, "short_conv_kernel_size": 4,
+        "use_full_rank_gate": true,
         "full_attn_layers": [1, 3], "kda_layers": [2, 4]
       }
     }

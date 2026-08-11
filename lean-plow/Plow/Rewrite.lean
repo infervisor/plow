@@ -26,6 +26,7 @@ open Plow
 
 /-! ## Mini-IR — abstract syntax covering every rewrite in `rules.egg`. -/
 
+set_option maxHeartbeats 400000 in
 inductive Op
   -- Base ops.
   | Var        (name : String)
@@ -37,6 +38,7 @@ inductive Op
   | Act        (kind : String) (x : Op)
   | Rope       (x : Op) (dim theta : Nat)
   | Scale      (x : Op) (factor : Nat)
+  | Reshape    (x : Op) (shape : String)
   | Ew         (kind : String) (x y : Op)
   | Conv3d     (x w : Op) (stride pad : Nat)
   | Conv3dBias (x w b : Op) (stride pad : Nat)
@@ -64,9 +66,9 @@ inductive Op
   | FusedGroupNormActConv3dBias (x w b cw cb : Op) (g eps : Nat) (kind : String)
       (stride pad : Nat)
   | FusedEmbeddingScale     (ids table : Op) (factor : Nat)
-  /-- Kimi-K3 KDA output half: `o_norm(o) * sigmoid(g_proj(x))`. -/
-  | FusedKdaGatedNorm       (o nw x gw : Op) (eps : Nat)
-  /-- Kimi-K3 MLA output gate: `attn * sigmoid(o_gate_proj(x))`. -/
+  /-- Kimi-K3 KDA output half: `o_norm(o) * sigmoid(reshape(g_proj(x)))`. -/
+  | FusedKdaGatedNorm       (o nw x gw : Op) (eps : Nat) (shape : String)
+  /-- Kimi-K3 MLA output gate: `attn * sigmoid(g_proj(x))`. -/
   | FusedMlaOutGate         (attn x gw : Op)
   deriving Repr, DecidableEq
 
@@ -111,9 +113,9 @@ def expand : Op → Op
         (expand cw) (expand cb) stride pad
   | Op.FusedEmbeddingScale ids table factor =>
       Op.Scale (Op.Embedding (expand ids) (expand table)) factor
-  | Op.FusedKdaGatedNorm o nw x gw eps =>
+  | Op.FusedKdaGatedNorm o nw x gw eps shape =>
       Op.Ew "mul" (Op.RmsNorm (expand o) (expand nw) eps)
-        (Op.Act "sigmoid" (Op.Linear (expand x) (expand gw)))
+        (Op.Act "sigmoid" (Op.Reshape (Op.Linear (expand x) (expand gw)) shape))
   | Op.FusedMlaOutGate attn x gw =>
       Op.Ew "mul" (expand attn) (Op.Act "sigmoid" (Op.Linear (expand x) (expand gw)))
   -- Base ops → structural recursion.
@@ -125,6 +127,7 @@ def expand : Op → Op
   | Op.Act k x => Op.Act k (expand x)
   | Op.Rope x d t => Op.Rope (expand x) d t
   | Op.Scale x f => Op.Scale (expand x) f
+  | Op.Reshape x shape => Op.Reshape (expand x) shape
   | Op.Ew k x y => Op.Ew k (expand x) (expand y)
   | Op.Conv3d x w s p => Op.Conv3d (expand x) (expand w) s p
   | Op.Conv3dBias x w b s p => Op.Conv3dBias (expand x) (expand w) (expand b) s p
@@ -228,10 +231,10 @@ theorem rule_embedding_scale_fuse (ids table : Op) (factor : Nat) :
       Op.Scale (Op.Embedding (expand ids) (expand table)) factor := rfl
 
 /-- `kda-gated-norm-fuse` -/
-theorem rule_kda_gated_norm_fuse (o nw x gw : Op) (eps : Nat) :
-    expand (Op.FusedKdaGatedNorm o nw x gw eps) =
+theorem rule_kda_gated_norm_fuse (o nw x gw : Op) (eps : Nat) (shape : String) :
+    expand (Op.FusedKdaGatedNorm o nw x gw eps shape) =
       Op.Ew "mul" (Op.RmsNorm (expand o) (expand nw) eps)
-        (Op.Act "sigmoid" (Op.Linear (expand x) (expand gw))) := rfl
+        (Op.Act "sigmoid" (Op.Reshape (Op.Linear (expand x) (expand gw)) shape)) := rfl
 
 /-- `mla-out-gate-fuse` -/
 theorem rule_mla_out_gate_fuse (attn x gw : Op) :
