@@ -229,6 +229,12 @@ enum Cmd {
         /// Tensor-parallel ranks for a decode-block run.
         #[arg(long, default_value_t = 1)]
         tp: usize,
+        /// Untimed decode-block dispatches before measurement.
+        #[arg(long, default_value_t = 0)]
+        warmup: u32,
+        /// Timed decode-block dispatches. Reuses the loaded fixtures.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        reps: u32,
     },
 
     /// Dry-run the compiled packets (no device): walk each packet honoring
@@ -448,6 +454,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             decode_pos,
             decode_kvlen,
             tp,
+            warmup,
+            reps,
         } => amd_block(
             blob,
             hsaco,
@@ -460,6 +468,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             decode_pos,
             decode_kvlen,
             tp,
+            warmup,
+            reps,
         ),
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBlock { .. } => Err("plowrt was built without --features hsa".into()),
@@ -1265,6 +1275,38 @@ fn load_block_fixtures(
 }
 
 #[cfg(feature = "hsa")]
+fn read_block_input(
+    eng: &plowrt::exec::amd::AmdEngine,
+    dir: &std::path::Path,
+    rank: usize,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let ranked = dir.join(format!("rank{rank}")).join("act.x.bin");
+    let common = dir.join("act.x.bin");
+    let path = if ranked.is_file() {
+        ranked
+    } else if common.is_file() {
+        common
+    } else {
+        return Err(format!(
+            "repeated block timing requires an act.x fixture for rank {rank} under {}",
+            dir.display()
+        )
+        .into());
+    };
+    let bytes = std::fs::read(&path)?;
+    let want = eng.tensor_bytes("act.x").unwrap_or(0) as usize;
+    if bytes.len() != want {
+        return Err(format!(
+            "fixture {} is {} B; tensor act.x on rank {rank} is {want} B",
+            path.display(),
+            bytes.len()
+        )
+        .into());
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "hsa")]
 fn read_block_tensor(
     eng: &plowrt::exec::amd::AmdEngine,
     name: &str,
@@ -1296,6 +1338,66 @@ fn print_block_tensor(name: &str, raw: &[u8]) {
 }
 
 #[cfg(feature = "hsa")]
+fn print_block_timings(tp: usize, warmup: u32, samples: &mut [f64]) {
+    samples.sort_unstable_by(f64::total_cmp);
+    let median = samples[samples.len() / 2];
+    let p90 = samples[(samples.len() * 9 / 10).min(samples.len() - 1)];
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    println!(
+        "block timing: tp={tp} warmup={warmup} samples={} median_ms={median:.6} \
+         p90_ms={p90:.6} mean_ms={mean:.6}",
+        samples.len()
+    );
+}
+
+#[cfg(feature = "hsa")]
+fn block_query_rows(blob: &std::path::Path) -> Result<u32, Box<dyn std::error::Error>> {
+    use packet::dev::{DevOp, TENSOR_NONE16};
+    use plowrt::asset::devblob::DevBlob;
+
+    let raw = std::fs::read(blob)?;
+    let parsed = DevBlob::parse_l2(&raw, true)?;
+    let program = parsed.decode_prog()?;
+    Ok(program
+        .insts
+        .iter()
+        .filter(|inst| {
+            inst.op == DevOp::FlashMlaDecode as u16 && inst.t[7] == TENSOR_NONE16 && inst.i[6] > 1
+        })
+        .map(|inst| inst.i[6])
+        .max()
+        .unwrap_or(1))
+}
+
+#[cfg(feature = "hsa")]
+fn load_block_positions(
+    eng: &mut plowrt::exec::amd::AmdEngine,
+    pos: u32,
+    rows: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = eng
+        .tensor_bytes("in.pos")
+        .ok_or("decode block has no in.pos tensor")? as usize;
+    if bytes % 4 != 0 || rows as usize > bytes / 4 {
+        return Err(format!(
+            "{rows} query rows exceed the in.pos capacity of {} rows",
+            bytes / 4
+        )
+        .into());
+    }
+    let mut positions = vec![0u8; bytes];
+    for row in 0..rows {
+        let off = row as usize * 4;
+        let query_pos = pos
+            .checked_add(row)
+            .ok_or("query position exceeds the u32 packet ABI")?;
+        positions[off..off + 4].copy_from_slice(&query_pos.to_le_bytes());
+    }
+    eng.write_tensor("in.pos", &positions)?;
+    Ok(())
+}
+
+#[cfg(feature = "hsa")]
 fn amd_block(
     blob: PathBuf,
     hsaco: PathBuf,
@@ -1308,6 +1410,8 @@ fn amd_block(
     decode_pos: Option<u32>,
     decode_kvlen: Option<u32>,
     tp: usize,
+    warmup: u32,
+    reps: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::exec::amd::AmdEngine;
 
@@ -1326,6 +1430,8 @@ fn amd_block(
             decode_pos,
             decode_kvlen,
             tp,
+            warmup,
+            reps,
         );
     }
 
@@ -1383,11 +1489,37 @@ fn amd_block(
 
     if let Some(pos) = decode_pos {
         let kvlen = decode_kvlen.ok_or("--decode-pos requires --decode-kvlen")?;
+        let query_rows = block_query_rows(&blob)?;
+        load_block_positions(&mut eng, pos, query_rows)?;
         let dp = eng.decode_prog();
-        eng.decode_prepare(pos, kvlen)?;
-        eng.run(dp, eng.decode_kernel_for(dp))?;
-        println!("decode block at pos={pos}, committed kvlen={kvlen}");
+        let input = load_dir
+            .as_ref()
+            .map(|dir| read_block_input(&eng, dir, 0))
+            .transpose()?;
+        let iterations = warmup
+            .checked_add(reps)
+            .ok_or("--warmup + --reps overflow")?;
+        if iterations > 1 && input.is_none() {
+            return Err("repeated block timing requires --load-dir with act.x.bin".into());
+        }
+        let mut samples = Vec::with_capacity(reps as usize);
+        for iteration in 0..iterations {
+            if let Some(input) = &input {
+                eng.write_tensor("act.x", input)?;
+            }
+            let start = std::time::Instant::now();
+            eng.decode_prepare(pos, kvlen)?;
+            eng.run(dp, eng.decode_kernel_for(dp))?;
+            if iteration >= warmup {
+                samples.push(start.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        println!("decode block at pos={pos}, query_rows={query_rows}, committed kvlen={kvlen}");
+        print_block_timings(1, warmup, &mut samples);
     } else {
+        if warmup != 0 || reps != 1 {
+            return Err("--warmup/--reps require --decode-pos".into());
+        }
         let ids: Vec<u32> = prompt
             .as_deref()
             .unwrap_or("2,1000,2000,3000")
@@ -1457,6 +1589,8 @@ fn amd_block_tp(
     decode_pos: Option<u32>,
     decode_kvlen: Option<u32>,
     tp: usize,
+    warmup: u32,
+    reps: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::exec::amd_tp::AmdTpGroup;
 
@@ -1483,8 +1617,29 @@ fn amd_block_tp(
     }
     let pos = decode_pos.ok_or("TP block runs require --decode-pos")?;
     let kvlen = decode_kvlen.ok_or("--decode-pos requires --decode-kvlen")?;
-    group.decode_block_step(pos, kvlen)?;
-    println!("TP{tp} decode block at pos={pos}, committed kvlen={kvlen}");
+    let query_rows = block_query_rows(&blob)?;
+    for rank in 0..tp {
+        load_block_positions(group.rank_mut(rank), pos, query_rows)?;
+    }
+    let inputs: Vec<_> = (0..tp)
+        .map(|rank| read_block_input(group.rank(rank), &dir, rank))
+        .collect::<Result<_, _>>()?;
+    let iterations = warmup
+        .checked_add(reps)
+        .ok_or("--warmup + --reps overflow")?;
+    let mut samples = Vec::with_capacity(reps as usize);
+    for iteration in 0..iterations {
+        for rank in 0..tp {
+            group.rank_mut(rank).write_tensor("act.x", &inputs[rank])?;
+        }
+        let start = std::time::Instant::now();
+        group.decode_block_step(pos, kvlen)?;
+        if iteration >= warmup {
+            samples.push(start.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    println!("TP{tp} decode block at pos={pos}, query_rows={query_rows}, committed kvlen={kvlen}");
+    print_block_timings(tp, warmup, &mut samples);
 
     println!(
         "\n{:<16} {:>12} {:>10} {:>14}",
