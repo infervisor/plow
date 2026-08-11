@@ -141,7 +141,7 @@ fn json_u8_boundary_round_trips_through_lean() {
 #[test]
 #[ignore = "requires plow_verify binary"]
 fn abstract_framing_shape_matches_packet_body_ordering() {
-    use packet::{Body, Inst, Program, ResourceKind};
+    use packet::{Body, Counter, Inst, Program, ResourceKind};
 
     // A tiny 2-instruction program: one DMA followed by a GEMM.
     let program = Program {
@@ -181,7 +181,12 @@ fn abstract_framing_shape_matches_packet_body_ordering() {
                 succ: vec![],
             },
         ],
-        counters: vec![],
+        counters: vec![Counter {
+            id: 1,
+            threshold: 1,
+            scope: 1,
+            _pad: [0; 3],
+        }],
         bucket_id: 0,
         plan_gen: 0,
         flags: 0,
