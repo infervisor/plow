@@ -201,6 +201,14 @@ if(PLOW_ROCM)
     target_link_libraries(k3_gemv_grid_sweep PRIVATE ${PLOW_AMDHIP64} m)
     add_dependencies(k3_gemv_grid_sweep k3_gemv_grid_sweep_gfx942_object)
 
+    add_executable(k3_gemv_rsplit_sweep amd/k3_gemvbf16_bench.cpp)
+    target_compile_features(k3_gemv_rsplit_sweep PRIVATE cxx_std_17)
+    target_include_directories(k3_gemv_rsplit_sweep PRIVATE "$ENV{ROCM_PATH}/include")
+    target_compile_definitions(k3_gemv_rsplit_sweep PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_compile_options(k3_gemv_rsplit_sweep PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(k3_gemv_rsplit_sweep PRIVATE ${PLOW_AMDHIP64} m)
+    add_dependencies(k3_gemv_rsplit_sweep k3_gemv_grid_sweep_gfx942_object)
+
     # Model-free full-grid screen for replacing K3 B1 dense BF16 weights with
     # block-scaled E4M3 W8A16. Only candidates projecting >=5 ms/token proceed
     # to checkpoint conversion and TP8 serving.
