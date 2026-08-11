@@ -36,10 +36,52 @@ For single-CU/SM micro-benchmarks (gridDim=1, roofline analysis), see
 ### Interpreter GEMM throughput (AMD)
 
 ```bash
-cd runtime && cmake -B build -DPLOW_ROCM=ON -DPLOW_HIP_ARCH=gfx950 -DPLOW_BENCH=ON
-cmake --build build --target interp_gemm_bench
-./build/bench/interp/interp_gemm_bench
+nix develop --command cmake -S runtime -B runtime/build -DPLOW_ROCM=ON \
+  -DPLOW_HIP_ARCH=gfx950 -DPLOW_BENCH=ON
+nix develop --command cmake --build runtime/build --target interp_gemm_bench
+nix develop --command runtime/build/bench/interp/interp_gemm_bench
 ```
+
+### Interpreter MXFP4 GEMM ladder (AMD)
+
+Build before taking the GPU lease. This uses the runtime CU count (304 on MI325X), dispatches
+each MXFP4 rung as an interpreter packet, and emits 12 timing samples plus sentinel/f64-oracle
+correctness.
+
+```bash
+nix develop --command cmake -S runtime -B runtime/build -DPLOW_ROCM=ON \
+  -DPLOW_HIP_ARCH=gfx942 -DPLOW_BENCH=ON
+nix develop --command cmake --build runtime/build --target interp_mxfp4_bench
+nix develop --command bash scripts/build_gfx942.sh /tmp/plow-gfx942-hsaco
+
+nix develop --command env PLOW_STAGE4_CLEARED=1 PLOW_GPU=MI325X \
+  PLOW_TOOLCHAIN_LABEL=rocm-7.14.0-nix PLOW_BUILD_ID=<git-revision> \
+  PLOW_LEASE_LABEL=mi325x-mxfp4 PLOW_GEMM_JSONL=/tmp/interp-mxfp4.jsonl \
+  perf-data/harness/gpulease -n 1 mi325x-mxfp4 \
+  runtime/build/bench/interp/interp_mxfp4_bench \
+  /tmp/plow-gfx942-hsaco/interp_prefill_k3_moe_a4w4.elf 4096 4224 7168 k3-tp8
+```
+
+### gfx942 fused MXFP4 GLU experiment
+
+After Stages 1–3 pass, this compares production `GemmGluMxfp4` with the counter-gated
+production `GemmMxfp4 + GemmMxfp4 + Glu` program. Both arms use the gfx942 default
+192×256×64 tile and the runtime CU count. The harness requires at least ten samples, a
+full-output NaN sentinel check, a sampled f64 oracle, and JSONL provenance.
+
+```bash
+nix develop --command cmake --build runtime/build \
+  --target interp_mxfp4_glu_gfx942
+
+nix develop --command env PLOW_STAGE4_CLEARED=1 PLOW_GPU=MI325X \
+  PLOW_TOOLCHAIN_LABEL=rocm-7.14.0-nix PLOW_BUILD_ID=<git-revision> \
+  PLOW_LEASE_LABEL=k3-mxfp4-glu PLOW_GEMM_GLU_JSONL=/tmp/k3-mxfp4-glu.jsonl \
+  perf-data/harness/gpulease -n 1 k3-mxfp4-glu \
+  runtime/build/bench/interp_mxfp4_glu_gfx942 \
+  /tmp/plow-gfx942-hsaco/interp_prefill_k3_moe_a4w4.elf 4096 768 7168 15
+```
+
+Discard the result when `gpulease` returns 76.
 
 ### hipBLASLt comparison
 

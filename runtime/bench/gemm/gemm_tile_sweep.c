@@ -207,6 +207,9 @@ int main(int argc, char** argv) {
         const unsigned tbn = mx ? MXTILES[t].bn : TILES[t].bn;
         plow_hsa_kernel k;
         if (plow_hsa_get_kernel(H, 0, sym, &k) != 0) continue;
+        /* A NaN sentinel makes incomplete tile coverage fail instead of inheriting a prior result. */
+        for (size_t i = 0; i < nC; i++) hC[i] = (bf16)0x7fc0u;
+        plow_hsa_copy_h2d(H, 0, dC, hC, nC * 2);
         /* 50 warm-up launches: the governor ramps sclk over tens of ms and an under-warmed
          * kernel reads slow, which silently re-ranks the sweep (gemm_bench_8k.c note). */
         for (int w = 0; w < 50; w++)
@@ -235,6 +238,9 @@ int main(int argc, char** argv) {
 
         plow_hsa_copy_d2h(H, 0, hC, dC, nC * 2);
         int bad = 0;
+        for (size_t i = 0; i < nC; i++) {
+            if (!isfinite(bf2f(hC[i]))) { bad++; break; }
+        }
         for (int s = 0; s < 24; s++) {
             unsigned m = (unsigned)(rand() % (int)M), nn = (unsigned)(rand() % (int)N);
             double acc = 0;

@@ -40,6 +40,18 @@ if(PLOW_ROCM)
     target_compile_definitions(interp_gemm_bench PRIVATE _POSIX_C_SOURCE=199309L)
     target_link_libraries(interp_gemm_bench PRIVATE hsa-runtime64 m)
 
+    # interp_mxfp4_bench: w4a16 GEMM ladder through the production interpreter
+    add_executable(interp_mxfp4_bench
+        interp/interp_mxfp4_bench.c
+        ../amd/hsa_backend.c)
+    target_include_directories(interp_mxfp4_bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+        ${CMAKE_CURRENT_SOURCE_DIR}/../common
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_compile_definitions(interp_mxfp4_bench PRIVATE _POSIX_C_SOURCE=199309L)
+    target_compile_options(interp_mxfp4_bench PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(interp_mxfp4_bench PRIVATE hsa-runtime64 m)
+
     # qwen_interp_bench: same as above but Qwen3 shapes
     add_executable(qwen_interp_bench
         interp/qwen_interp_bench.c
@@ -82,6 +94,18 @@ if(PLOW_ROCM)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
     target_compile_definitions(gemm_tile_sweep PRIVATE _POSIX_C_SOURCE=199309L)
     target_link_libraries(gemm_tile_sweep PRIVATE hsa-runtime64 m)
+
+    # Same-tile fused-vs-unfused MXFP4 GLU through the gfx942 interpreter.
+    add_executable(interp_mxfp4_glu_gfx942
+        gemm/interp_mxfp4_glu_gfx942.c
+        ../amd/hsa_backend.c)
+    target_include_directories(interp_mxfp4_glu_gfx942 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+        ${CMAKE_CURRENT_SOURCE_DIR}/../common
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_compile_definitions(interp_mxfp4_glu_gfx942 PRIVATE _POSIX_C_SOURCE=200809L)
+    target_compile_options(interp_mxfp4_glu_gfx942 PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(interp_mxfp4_glu_gfx942 PRIVATE hsa-runtime64 m)
 
     add_executable(gemm_tensile_ext
         gemm/gemm_tensile_ext.c
