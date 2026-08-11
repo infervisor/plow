@@ -4690,11 +4690,16 @@ impl AmdEngine {
             // stride below would alias every sequence onto every other's — no
             // fault, no missing weight, just fluent wrong output.
             const KDA_F_SEQ_ROWS: u32 = 2;
-            let unbatched = blob.progs[decode]
-                .insts
-                .iter()
-                .find(|d| d.op == DevOp::KdaStateStepG as u16 && d.i[4] & KDA_F_SEQ_ROWS == 0);
-            if let (Some(t), Some(_)) = (
+            let unbatched = blob.progs[dec_ix..].iter().find_map(|p| {
+                p.insts
+                    .iter()
+                    .any(|d| {
+                        (d.op == DevOp::KdaStateStep as u16 || d.op == DevOp::KdaStateStepG as u16)
+                            && d.i[4] & KDA_F_SEQ_ROWS == 0
+                    })
+                    .then_some(p.t)
+            });
+            if let (Some(t), Some(rung)) = (
                 blob.tensors
                     .iter()
                     .find(|t| t.name.starts_with("kv.") && t.name.contains("state")),
@@ -4702,7 +4707,7 @@ impl AmdEngine {
             ) {
                 return Err(RuntimeError::Device(format!(
                     "PLOW_DECODE_BATCH = {batch} with a recurrent-state tensor `{}` whose decode \
-                     program does NOT carry PLOW_KDA_F_SEQ_ROWS. The state is one block with no \
+                     rung T={rung} does NOT carry PLOW_KDA_F_SEQ_ROWS. The state is one block with no \
                      slot axis, so the per-slot stride below would alias every sequence's state \
                      onto every other's. Re-emit with PLOW_DECODE_BATCH = {batch} so the emitter \
                      sizes the state per slot and sets the flag, or run at batch 1.",

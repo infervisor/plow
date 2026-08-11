@@ -462,13 +462,33 @@ impl DevBlob {
             .and_then(|s| buf.get(s.offset..s.offset + s.size))
     }
 
-    /// The decode program: last, `t == B` (the compiler's contract; `plowc
-    /// gemma4` emits the decode program last with `t` = `PLOW_DECODE_BATCH`,
-    /// 1 by default, capped at 32). Prefill buckets all have `t >= 128`, so a
-    /// small `t` unambiguously identifies the decode program.
+    /// Index of the first decode rung. The compiler emits prefill buckets first,
+    /// then a trailing ascending decode ladder whose widths are at most 32.
+    pub fn decode_rung_lo(&self) -> usize {
+        let widths: Vec<u32> = self.progs.iter().map(|p| p.t).collect();
+        packet::devbuild::decode_rung_lo(&widths)
+    }
+
+    /// Prefill bucket programs, excluding every decode rung.
+    pub fn prefill_progs(&self) -> &[DevProg] {
+        &self.progs[..self.decode_rung_lo()]
+    }
+
+    /// Decode rung programs in ascending width order.
+    pub fn decode_progs(&self) -> &[DevProg] {
+        &self.progs[self.decode_rung_lo()..]
+    }
+
+    /// Widths advertised by the decode ladder.
+    pub fn decode_rungs(&self) -> Vec<u32> {
+        self.decode_progs().iter().map(|p| p.t).collect()
+    }
+
+    /// The widest decode program. This remains the last program for both the
+    /// legacy one-rung blob and a decode ladder.
     pub fn decode_prog(&self) -> Result<&DevProg> {
         let g = self
-            .progs
+            .decode_progs()
             .last()
             .ok_or_else(|| RuntimeError::Device("devblob: no programs".into()))?;
         if g.t == 0 || g.t > 32 {
@@ -1002,6 +1022,25 @@ mod tests {
 
         g.check_coarse_single_segment().unwrap();
         g.check_gq_topological().unwrap();
+    }
+
+    #[test]
+    fn program_roles_cover_a_decode_ladder() {
+        let mut m = tiny_model();
+        m.progs.pop();
+        for _ in 0..5 {
+            m.progs.push(tiny_model().progs.pop().unwrap());
+        }
+        m.prog_t = vec![128, 1, 2, 4, 8, 16];
+
+        let b = DevBlob::parse(&m.to_blob()).unwrap();
+        assert_eq!(b.decode_rung_lo(), 1);
+        assert_eq!(
+            b.prefill_progs().iter().map(|p| p.t).collect::<Vec<_>>(),
+            vec![128]
+        );
+        assert_eq!(b.decode_rungs(), vec![1, 2, 4, 8, 16]);
+        assert_eq!(b.decode_prog().unwrap().t, 16);
     }
 
     #[test]

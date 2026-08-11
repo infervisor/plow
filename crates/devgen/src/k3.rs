@@ -1228,7 +1228,10 @@ pub fn emit_k3_latent_moe(
         // Top-k tail, block per token. Bit-identical PER TOKEN to the decode tail (the kernel is
         // that kernel under a token loop), so a prefill chunk makes the selection decode would
         // have made for the same row — which is what makes the two phases the same model.
-        let c_rt = b.emit(DevOp::MoeRouterTopkPf, all.clone(), &[c_rl], |d| {
+        // One workgroup owns one token at a time. Launching more than T only creates empty
+        // interpreter entries; launching fewer keeps the kernel's existing strided token loop.
+        let router_blocks: Vec<u32> = (0..t.min(n_cu)).collect();
+        let c_rt = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_rl], |d| {
             d.t[0] = tab;
             d.t[1] = logit;
             d.t[3] = w.router_bias;
@@ -4608,6 +4611,24 @@ mod tests {
             .unwrap();
         assert_eq!(al.blocks, 1);
         assert_eq!(al.i[0], t);
+    }
+
+    #[test]
+    fn grouped_router_uses_one_block_per_token_up_to_the_cu_count() {
+        for (t, want) in [(32, 32), (128, 128), (512, 256)] {
+            let rows = if t == 32 {
+                RowKind::Sequences
+            } else {
+                RowKind::Tokens
+            };
+            let p = build_full_rows(8, t, rows);
+            let router = p
+                .insts
+                .iter()
+                .find(|i| i.op == DevOp::MoeRouterTopkPf as u16)
+                .expect("missing grouped router");
+            assert_eq!(router.blocks, want, "T={t}");
+        }
     }
 
     /// The gathered row arrays are sized on the MPF_BM-PADDED bound, not on `T*k`.

@@ -4,6 +4,7 @@ pub mod admission;
 pub mod batching;
 pub mod mdq;
 pub mod multistep;
+pub mod rungs;
 
 use crate::asset::{Bucket, ModelBundle, Phase};
 use crate::exec::counters::CounterPool;

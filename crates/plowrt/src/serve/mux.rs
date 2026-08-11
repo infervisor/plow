@@ -50,6 +50,7 @@ use crate::obs::Metrics;
 use crate::sched::admission::{admit, Admit, LoadEstimator};
 use crate::sched::batching::{formation_window_ms, select_bucket};
 use crate::sched::multistep::MultiStep;
+use crate::sched::rungs::{DecodeRungs, RungController, RungLoad};
 use crate::serve::stream::{ChunkSender, FinishReason, StreamChunk};
 use crate::serve::{
     bucket_has_sample_batch, reference_logits_row, sample_vocab, seeded_unit, AppState, GenParams,
@@ -376,14 +377,30 @@ pub fn spawn(
         .map(|k| k.batch.max(1) as usize)
         .max()
         .unwrap_or(1);
-    // GPU-engine bundles are bucketless: the ceiling is the engine's compiled
-    // decode batch (PLOW_DECODE_BATCH), one slot per engine sequence slot —
-    // mux slot i IS engine slot i.
+    // GPU-engine bundles are bucketless: take both capacity and the optional
+    // decode ladder from the loaded engine once, before the hot loop starts.
     #[cfg(any(feature = "cuda", feature = "hsa"))]
-    let capacity = state
-        .gpu_engine(bundle.network())
-        .map(|e| e.lock().batch())
-        .unwrap_or(capacity);
+    let gpu_shape = state.gpu_engine(bundle.network()).map(|e| {
+        let e = e.lock();
+        (e.batch(), e.decode_rungs())
+    });
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    let capacity = gpu_shape.as_ref().map(|x| x.0).unwrap_or(capacity);
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    let rung_widths = gpu_shape.map(|x| x.1);
+    #[cfg(not(any(feature = "cuda", feature = "hsa")))]
+    let rung_widths: Option<Box<[u32]>> = None;
+    let mut rung_controller =
+        rung_widths
+            .as_deref()
+            .and_then(|widths| match DecodeRungs::new(widths, capacity) {
+                Ok(rungs) if rungs.len() > 1 => Some(RungController::new(rungs)),
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::warn!(?err, ?widths, capacity, "decode rung policy disabled");
+                    None
+                }
+            });
     let ingress_capacity = if cfg.max_queued_requests == 0 {
         capacity.saturating_mul(4).max(1)
     } else {
@@ -541,13 +558,66 @@ pub fn spawn(
                 }
             }
 
+            // A decode ladder controls ADMISSION separately from execution.
+            // New jobs use only the low slot prefix under `admission_limit`;
+            // existing high slots are never moved and continue to pin the
+            // engine's occupied-extent rung until they drain.
+            let admission_limit = if let Some(controller) = rung_controller.as_mut() {
+                let occupied_extent = slots
+                    .iter()
+                    .rposition(Option::is_some)
+                    .map(|i| i + 1)
+                    .unwrap_or(1);
+                let queued = metrics.queued_requests.load(Ordering::Relaxed) as usize;
+                let (sum, n) = slots
+                    .iter()
+                    .flatten()
+                    .fold((0usize, 0usize), |(s, n), slot| {
+                        (s.saturating_add(slot.gen.max_tokens.max(1)), n + 1)
+                    });
+                let mean_output_tokens = if n == 0 { 1.0 } else { sum as f64 / n as f64 };
+                let before = controller.admission_limit();
+                let decision = controller.decide(RungLoad {
+                    occupied_extent,
+                    queued,
+                    oldest_wait_ms: 0.0,
+                    arrival_rps: load.lambda.get(),
+                    mean_output_tokens,
+                    slo_ms: cfg.slo_ms,
+                });
+                let admission = controller.admission_limit();
+                metrics
+                    .decode_rung_admission
+                    .store(admission as u64, Ordering::Relaxed);
+                metrics
+                    .decode_occupied_extent
+                    .store(occupied_extent as u64, Ordering::Relaxed);
+                if admission != before {
+                    Metrics::inc(&metrics.decode_rung_switches);
+                    tracing::info!(
+                        from = before,
+                        to = admission,
+                        occupied_extent,
+                        queued,
+                        reason = ?decision.reason,
+                        "decode admission rung"
+                    );
+                }
+                admission
+            } else {
+                capacity
+            };
+
             // Non-blocking drain: fill every idle slot the queue can serve.
             // A short hold when we still have empty slots and no live work
             // yet keeps us from waking up on a single arrival amid a burst.
-            let idle = slots.iter().filter(|s| s.is_none()).count();
+            let idle = slots[..admission_limit]
+                .iter()
+                .filter(|s| s.is_none())
+                .count();
             if !draining && idle > 0 {
                 let lambda = load.lambda.get();
-                let live_now = capacity - idle;
+                let live_now = admission_limit - idle;
                 // Only hold when the slot table is empty (cold-start burst);
                 // if any slot is already live, spinning up the tick delivers
                 // TTFT faster than waiting for more arrivals.
@@ -561,7 +631,7 @@ pub fn spawn(
                     Metrics::inc(&metrics.hold_count);
                     let deadline =
                         Instant::now() + std::time::Duration::from_secs_f64(hold_ms / 1000.0);
-                    while slots.iter().any(|s| s.is_none()) {
+                    while slots[..admission_limit].iter().any(|s| s.is_none()) {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
                             break;
@@ -571,7 +641,7 @@ pub fn spawn(
                                 note_dequeued(&msg, &metrics);
                                 match msg {
                                     MuxMsg::Job(job) => admit_into(
-                                        &mut slots,
+                                        &mut slots[..admission_limit],
                                         job,
                                         &mut load,
                                         &mut last_arrival,
@@ -592,13 +662,13 @@ pub fn spawn(
                     }
                 }
                 // Any additional pending arrivals (no wait).
-                while !draining && slots.iter().any(|s| s.is_none()) {
+                while !draining && slots[..admission_limit].iter().any(|s| s.is_none()) {
                     match rx.try_recv() {
                         Ok(msg) => {
                             note_dequeued(&msg, &metrics);
                             match msg {
                                 MuxMsg::Job(job) => admit_into(
-                                    &mut slots,
+                                    &mut slots[..admission_limit],
                                     job,
                                     &mut load,
                                     &mut last_arrival,
@@ -622,6 +692,21 @@ pub fn spawn(
             if live == 0 {
                 continue;
             }
+            let (service_capacity, tick_rung) = if let Some(controller) = rung_controller.as_ref() {
+                let occupied_extent = slots
+                    .iter()
+                    .rposition(Option::is_some)
+                    .map(|i| i + 1)
+                    .unwrap_or(1);
+                let rung = controller.covering(occupied_extent);
+                let width = controller.width(rung);
+                metrics
+                    .decode_rung_actual
+                    .store(width as u64, Ordering::Relaxed);
+                (width, Some(rung))
+            } else {
+                (capacity, None)
+            };
 
             // Pick the covering bucket for (Decode, live, max seq requirement)
             // and its cached bufs — CPU reference path only; the GPU engine
@@ -682,7 +767,7 @@ pub fn spawn(
             // though every user's real inter-token latency was ~40 ms (well
             // under the SLO). Proven on GPU: b16 8-way passes token-identity
             // with the shed off, sheds to 1 token/req with it on.
-            let predicted_wait = predicted_wait_ms(live, capacity, load.service_ms.get());
+            let predicted_wait = predicted_wait_ms(live, service_capacity, load.service_ms.get());
             // A FLAT SLO cannot be right across decode batches. `service_ms` is
             // one tick of real work and grows with B (measured Gemma-4-12B:
             // 22 ms at B=8, 26 ms at B=16, 58 ms at B=32), so a constant 250 ms
@@ -807,6 +892,11 @@ pub fn spawn(
                     // predictor and sheds live decode streams.
                     if let Some(sample) = service_sample(ms, did_prefill) {
                         load.service_ms.update(sample);
+                        if let (Some(controller), Some(rung)) =
+                            (rung_controller.as_mut(), tick_rung)
+                        {
+                            controller.observe_decode(rung, sample);
+                        }
                     }
                     slots = returned_slots;
                     if let Some(b) = returned_bufs {

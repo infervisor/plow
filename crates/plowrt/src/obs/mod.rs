@@ -37,6 +37,11 @@ pub struct Metrics {
     pub hold_count: AtomicU64,
     /// Requests shed by admission (predicted wait > SLO or memory OOM).
     pub admit_shed: AtomicU64,
+    /// Decode-ladder state. Zero means the model has no compiled ladder.
+    pub decode_rung_actual: AtomicU64,
+    pub decode_rung_admission: AtomicU64,
+    pub decode_occupied_extent: AtomicU64,
+    pub decode_rung_switches: AtomicU64,
 }
 
 impl Metrics {
@@ -117,7 +122,19 @@ impl Metrics {
              plowrt_hold_count_total {}\n\
              # HELP plowrt_hold_ms_mean Lifetime mean hold; prefer rate(sum)/rate(count).\n\
              # TYPE plowrt_hold_ms_mean gauge\n\
-             plowrt_hold_ms_mean {:.3}\n",
+             plowrt_hold_ms_mean {:.3}\n\
+             # HELP plowrt_decode_rung_actual Decode width selected by occupied slot extent; zero means no ladder.\n\
+             # TYPE plowrt_decode_rung_actual gauge\n\
+             plowrt_decode_rung_actual {}\n\
+             # HELP plowrt_decode_rung_admission Maximum slot prefix open to new admissions; zero means no ladder.\n\
+             # TYPE plowrt_decode_rung_admission gauge\n\
+             plowrt_decode_rung_admission {}\n\
+             # HELP plowrt_decode_occupied_extent Highest occupied slot plus one; zero means no ladder.\n\
+             # TYPE plowrt_decode_occupied_extent gauge\n\
+             plowrt_decode_occupied_extent {}\n\
+             # HELP plowrt_decode_rung_switches_total Decode admission-rung changes.\n\
+             # TYPE plowrt_decode_rung_switches_total counter\n\
+             plowrt_decode_rung_switches_total {}\n",
             g(&self.requests),
             g(&self.tokens),
             g(&self.rejected),
@@ -131,6 +148,10 @@ impl Metrics {
             hs,
             hc,
             mean(hs, hc),
+            g(&self.decode_rung_actual),
+            g(&self.decode_rung_admission),
+            g(&self.decode_occupied_extent),
+            g(&self.decode_rung_switches),
         )
     }
 }

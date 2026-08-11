@@ -1212,28 +1212,24 @@ fn k3_build_model(
     // Above 16 rows the gfx942 GEMV object must carry PLOW_GEMV_WALK: its largest compiled row
     // bucket is 16, and the walk is what covers the remaining rows instead of leaving stale
     // logits. XArgmaxFin's two peer-data lines are the hard 32-row ceiling.
-    // THE DECODE BATCH LADDER IS NOT WIRED HERE. `PLOW_DECODE_BATCH_LADDER` builds one decode
-    // program per rung on the dense-GQA path (crates/devgen/src/lib.rs); K3 emits ONE decode
-    // program at `dbatch`. Silently emitting a single-rung blob for an operator who asked for a
-    // ladder is the shape of failure this codebase keeps paying for, so refuse.
-    //
-    // What it would take, recorded so the next person does not have to re-derive it: the loop
-    // below already runs per program, so the rungs are a `for` — but the KDA recurrent state is
-    // the constraint. `RowKind::Sequences` is what sizes it per slot and sets
-    // `PLOW_KDA_F_SEQ_ROWS`, and it is currently armed on `dbatch > 1`; under a ladder EVERY rung
-    // must carry it, the one-row rung included (which is exactly what `PLOW_K3_SEQ_ROWS` does,
-    // and why that instrument exists).
-    assert!(
-        emit_config::active().decode_ladder.is_none(),
-        "PLOW_DECODE_BATCH_LADDER is not implemented for the K3 emitter — it emits ONE decode \
-         program. Use PLOW_DECODE_BATCH for this family."
-    );
-    let dbatch = checked_k3_decode_batch(
-        emit_config::active().decode_batch,
-        emit_config::active().gemv_walk,
-    );
+    // A ladder carries one independent-sequence decode program per rung, including B1. Build the
+    // widest first: it declares the authoritative slot-major state/cache extents and preserves
+    // the old single-rung tensor handles byte for byte. Narrower programs adopt that table.
+    let ladder_on = emit_config::active().decode_ladder.is_some();
+    let rungs: Vec<u32> = emit_config::active()
+        .decode_rungs()
+        .into_iter()
+        .map(|r| checked_k3_decode_batch(r, emit_config::active().gemv_walk))
+        .collect();
+    let dbatch = *rungs.last().expect("decode_rungs is non-empty");
     let slot_rows = pf.iter().copied().max().unwrap_or(1).max(dbatch);
-    for (i, &t) in std::iter::once(&dbatch).chain(pf.iter()).enumerate() {
+    let mut decode_build_order = Vec::with_capacity(rungs.len());
+    decode_build_order.push(dbatch);
+    decode_build_order.extend_from_slice(&rungs[..rungs.len() - 1]);
+
+    let mut decode = Vec::with_capacity(rungs.len());
+    let mut prefill = Vec::with_capacity(pf.len());
+    for (i, &t) in decode_build_order.iter().enumerate() {
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
         // PLOW_L2_PLACE: `None` => byte-identical. Until this line the flag reached the dense-GQA
@@ -1250,17 +1246,16 @@ fn k3_build_model(
             t,
             slot_rows,
             n_cu,
-            // The DECODE program (i == 0) carries independent sequences when batched; every
-            // prefill bucket is always consecutive tokens of one sequence.
-            //
-            // PLOW_K3_SEQ_ROWS FORCES the sequence-row carriers on at dbatch == 1. It is a
+            // Every rung of a ladder carries independent sequences, including B1. Without a
+            // ladder, B1 remains byte-identical unless PLOW_K3_SEQ_ROWS forces the carrier.
+            // PLOW_K3_SEQ_ROWS is a
             // BISECTION INSTRUMENT, not a serving knob: at one row every carrier is a no-op by
             // construction (the only slot is slot 0, at offset 0 under either addressing), so a
             // B=1 emit with it on MUST reproduce the known-good B=1 stream token for token. If it
             // does not, the carrier that broke it is separable from batching itself — which is the
             // one question a B>1 run cannot answer, because at B>1 there is no reference stream to
             // compare against.
-            if i == 0 && (dbatch > 1 || emit_config::active().k3_seq_rows) {
+            if ladder_on || t > 1 || emit_config::active().k3_seq_rows {
                 crate::k3::RowKind::Sequences
             } else {
                 crate::k3::RowKind::Tokens
@@ -1274,18 +1269,34 @@ fn k3_build_model(
         }
         let prog = b.finish();
         tensors = prog.tensors.clone();
-        built.push(prog);
+        decode.push((t, prog));
     }
-    // buckets ascending, decode LAST — the order `Model::prog_t` and `manifest.rs` both assume
-    // (`prog_t`'s last entry is the decode program; everything before it is a prefill bucket).
-    let decode = built.remove(0);
-    built.push(decode);
-    // The decode entry is `dbatch`, not 1: at PLOW_DECODE_BATCH = B the decode program is emitted
-    // at B rows (`RowKind::Sequences`), and `AmdEngine::load` cross-checks `prog_t.last()` against
-    // `in.kvlen`'s row count. Leaving 1 here made a B=4 blob refuse itself at load with
-    // "in.kvlen is 4 rows but the decode program is compiled for t=1" — a real mismatch between
-    // two records of the same fact, which is exactly what that check is for.
-    let prog_t: Vec<u32> = pf.iter().copied().chain(std::iter::once(dbatch)).collect();
+    for &t in pf {
+        let mut b = Builder::new(n_cu);
+        b.set_tensor_dedup(true);
+        b.set_l2_placement(l2_layout);
+        b.adopt_tensors(tensors.clone());
+        crate::k3::emit_k3_model(
+            &mut b,
+            &mcfg,
+            &|l| matches!(c.attn[l as usize], K3Attn::Kda),
+            &layers,
+            ctx,
+            t,
+            slot_rows,
+            n_cu,
+            crate::k3::RowKind::Tokens,
+        );
+        let prog = b.finish();
+        tensors = prog.tensors.clone();
+        prefill.push(prog);
+    }
+    decode.sort_unstable_by_key(|(t, _)| *t);
+    built.extend(prefill);
+    built.extend(decode.into_iter().map(|(_, p)| p));
+    // Prefill buckets first, then trailing ascending decode rungs. `decode_rung_lo` and the
+    // runtime both derive the split from this ordering.
+    let prog_t: Vec<u32> = pf.iter().copied().chain(rungs.iter().copied()).collect();
 
     Model {
         n_cu,
@@ -1739,6 +1750,42 @@ mod kimi_k3_tests {
             1024 * ring(&bare),
             "the ring is [T][nb_cap][hidden]"
         );
+    }
+
+    #[test]
+    fn k3_decode_ladder_is_trailing_ascending_and_every_rung_is_sequence_state() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_DECODE_BATCH_LADDER", "1,3,7,16,32"),
+            ("PLOW_GEMV_WALK", "1"),
+        ]);
+        let d = k3_dir("decode_ladder");
+        let m = k3_build_model(&d, 4096, 256, 1, &[128], None);
+
+        assert_eq!(m.prog_t, [128, 1, 3, 7, 16, 32]);
+        for (&t, p) in m.prog_t[1..].iter().zip(&m.progs[1..]) {
+            let state_steps: Vec<_> = p
+                .insts
+                .iter()
+                .filter(|i| {
+                    i.op == DevOp::KdaStateStep as u16 || i.op == DevOp::KdaStateStepG as u16
+                })
+                .collect();
+            assert!(
+                !state_steps.is_empty(),
+                "decode rung T={t} has no KDA state"
+            );
+            assert!(
+                state_steps.iter().all(|i| i.i[4] & 2 != 0),
+                "decode rung T={t} lost independent-sequence KDA state"
+            );
+        }
+        let parked = m
+            .tensors
+            .iter()
+            .find(|t| t.name == "in.parked")
+            .expect("ladder must declare the parked mask");
+        assert_eq!(parked.bytes, 32 * 4);
     }
 
     /// Every program must address the same peer slot B. The host has one peer layout for the

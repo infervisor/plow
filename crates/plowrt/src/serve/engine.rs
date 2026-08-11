@@ -38,6 +38,16 @@ impl ServeEngine {
         }
     }
 
+    /// Compiled decode widths, ascending. Allocated once by the mux at model load.
+    pub fn decode_rungs(&self) -> Box<[u32]> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(e) => vec![e.batch() as u32].into_boxed_slice(),
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => e.decode_rungs().into(),
+        }
+    }
+
     /// The checkpoint's stop-token set.
     pub fn stop_ids(&self) -> &Arc<Vec<u32>> {
         match self {
@@ -112,6 +122,7 @@ mod amd_serve {
     pub struct AmdServe {
         ranks: Ranks,
         stop_ids: Arc<Vec<u32>>,
+        decode_rungs: Box<[u32]>,
         /// Sequences one decode dispatch advances (compiled `PLOW_DECODE_BATCH`).
         batch: usize,
         /// Next KV row each slot writes.
@@ -120,6 +131,11 @@ mod amd_serve {
         live: Vec<bool>,
         /// The token each slot feeds into the next dispatch. Idle slots feed 0.
         next_id: Vec<u32>,
+        /// Reused host staging for one batched dispatch. These stay at the widest
+        /// rung so steady decode does not allocate.
+        pos_stage: Vec<u32>,
+        kvlen_stage: Vec<u32>,
+        parked_stage: Vec<u32>,
         /// The packet declares exactly one program, so there is no prefill
         /// bucket ladder to chunk a prompt over and the prompt is walked
         /// through the decode program one token at a time. GLM-5.2 is this
@@ -164,6 +180,25 @@ mod amd_serve {
     /// Shortest prefix worth caching. Below this the snapshot/restore pair costs more than the
     /// prefill it skips, and it churns the slot's cached prompt for nothing.
     const MIN_PREFIX: u32 = 128;
+
+    fn stage_parked(parked: &mut [u32], advance: &[usize]) {
+        parked.fill(1);
+        for &slot in advance {
+            parked[slot] = 0;
+        }
+    }
+
+    fn invalidate_prefix_metadata(
+        enabled: bool,
+        cached_prompt: &mut [Vec<u32>],
+        snap_at: &mut [u32],
+        slot: usize,
+    ) {
+        if enabled {
+            cached_prompt[slot].clear();
+            snap_at[slot] = 0;
+        }
+    }
 
     fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
         a.iter().zip(b).take_while(|(x, y)| x == y).count()
@@ -248,15 +283,16 @@ mod amd_serve {
                         .into(),
                 ));
             }
-            let rungs = match &ranks {
+            let decode_rungs = match &ranks {
                 Ranks::One(e) => e.decode_rungs(),
                 Ranks::Tp(g) => g.rank(0).decode_rungs(),
-            };
+            }
+            .into_boxed_slice();
             tracing::info!(
                 n_gpu,
                 max_ctx,
                 batch,
-                decode_rungs = ?rungs,
+                decode_rungs = ?decode_rungs,
                 decode_only = !has_prefill,
                 stop_ids = ?stop_ids,
                 "AMD serve engine ready"
@@ -264,10 +300,14 @@ mod amd_serve {
             Ok(AmdServe {
                 ranks,
                 stop_ids,
+                decode_rungs,
                 batch,
                 pos: vec![0; batch],
                 live: vec![false; batch],
                 next_id: vec![0; batch],
+                pos_stage: vec![0; batch],
+                kvlen_stage: vec![1; batch],
+                parked_stage: vec![1; batch],
                 decode_only: !has_prefill,
                 max_ctx,
                 prefix_cache: crate::config::RuntimeConfig::get().nv.prefix_cache,
@@ -277,6 +317,10 @@ mod amd_serve {
                 chunk_prefill: !crate::config::RuntimeConfig::get().nv.pf_no_chunk,
                 last_rung: 0,
             })
+        }
+
+        pub fn decode_rungs(&self) -> &[u32] {
+            &self.decode_rungs
         }
 
         /// Sequence slots one decode dispatch advances. The mux sizes its slot
@@ -334,7 +378,9 @@ mod amd_serve {
             self.live[slot] = true;
             let tok = if prompt.len() == 1 {
                 // Nothing to consume: seed the single id and take one step,
-                // which writes KV row 0 and samples the first token.
+                // which writes KV row 0 and samples the first token. This bypasses the prefix
+                // planner, so invalidate the old prefix before that write.
+                self.invalidate_prefix(slot);
                 self.next_id[slot] = prompt[0];
                 self.dispatch(slot)?
             } else if self.decode_only {
@@ -344,11 +390,10 @@ mod amd_serve {
                 // not written. This is what `runtime/tests/glm52_decode.c`
                 // does; it is O(prompt) dispatches, hence a fallback.
                 //
-                // At batch > 1 every OTHER slot also advances a row per
-                // dispatch, so this holds their positions still and lets them
-                // re-write the row they were going to write anyway. Nothing
-                // reads a row before its own slot writes it, so the throwaway
-                // K/V is overwritten before it can matter — see `dispatch`.
+                // At batch > 1 every other slot still executes throwaway KV
+                // work at its next row, but its recurrent state is parked and
+                // its host position does not move — see `dispatch_all`.
+                self.invalidate_prefix(slot);
                 let mut last = 0;
                 for id in prompt {
                     self.next_id[slot] = *id;
@@ -357,6 +402,9 @@ mod amd_serve {
                 last
             } else {
                 let (resume, arm) = self.plan_prefix(slot, prompt);
+                if resume == 0 {
+                    self.invalidate_prefix(slot);
+                }
                 let t = match &mut self.ranks {
                     Ranks::One(e) => e.prefill_slot(slot, prompt)?,
                     // `prefill_slot` and not `prefill`: the latter fills slot 0
@@ -432,6 +480,18 @@ mod amd_serve {
             }
         }
 
+        /// A miss is about to overwrite this slot's KV from row zero. Make the old snapshot
+        /// ineligible before the first write so cancellation or a device error cannot later pair
+        /// old recurrent state with the newly overwritten KV rows.
+        fn invalidate_prefix(&mut self, slot: usize) {
+            invalidate_prefix_metadata(
+                self.prefix_cache,
+                &mut self.cached_prompt,
+                &mut self.snap_at,
+                slot,
+            );
+        }
+
         /// Advance slot `slot`'s prefill by ONE CHUNK. `Ok(None)` means more chunks remain.
         ///
         /// This is what makes prefill yieldable. `AmdServe::prefill` runs a whole prompt in one
@@ -479,6 +539,9 @@ mod amd_serve {
                 // the cursor from the cached plan is all it takes — they were alternatives only
                 // because the first cut of this function bailed out when the cache was on.
                 let (resume, arm) = self.plan_prefix(slot, prompt);
+                if resume == 0 {
+                    self.invalidate_prefix(slot);
+                }
                 let (steps, snap_after) = match &mut self.ranks {
                     Ranks::Tp(g) => {
                         if resume > 0 {
@@ -648,9 +711,9 @@ mod amd_serve {
         ///   row 0 of its own block, which is sound because an admitted request
         ///   restarts at `pos = 0` and rewrites row 0 before reading it.
         /// * a LIVE slot not in `advance` (a slot waiting while another slot's
-        ///   decode-only prompt walk runs). It rewrites row `pos[s]` — the row
-        ///   it is about to write for real — and nothing reads `[0, pos[s]+1)`
-        ///   until it does. Its `pos` does not move, so its stream is unaffected.
+        ///   decode-only prompt walk runs). Its KDA recurrence is parked. Its
+        ///   append-only KV work rewrites row `pos[s]` — the row it is about to
+        ///   write for real — and its host position does not move.
         ///
         /// The cost is wasted work, and it is why a blob compiled at a large
         /// `PLOW_DECODE_BATCH` is slower at concurrency 1 than one compiled at 1.
@@ -682,10 +745,6 @@ mod amd_serve {
                 }
                 return Ok(vec![t]);
             }
-            let (mut p, mut k) = (
-                Vec::with_capacity(self.batch),
-                Vec::with_capacity(self.batch),
-            );
             for s in 0..self.batch {
                 // A slot MID-CHUNKED-PREFILL is not live, but it must not be fed row 0 either:
                 // its rows [0, frontier) are real prefilled KV and a throwaway write at row 0
@@ -697,17 +756,17 @@ mod amd_serve {
                     (None, true) => (self.pos[s], self.pos[s] + 1),
                     (None, false) => (0, 1),
                 };
-                p.push(pp);
-                k.push(kk);
+                self.pos_stage[s] = pp;
+                self.kvlen_stage[s] = kk;
             }
-            // PER-ROW PARKED MASK. A dispatch advances all B rows because `t` is compiled, which
-            // is harmless for the append-only KV cache and NOT harmless for the KDA recurrence:
-            // it reads and writes `state[row]` unconditionally, so an idle row's recurrence was
-            // being advanced by a throwaway token every single step. Parking those rows is both
-            // a correctness improvement and less work.
+            // PER-ROW PARKED MASK. The device executes every covered row, but only `advance`
+            // owns a logical token this dispatch. Parking merely idle rows is insufficient:
+            // one-token admission and decode-only prompt walking advance one slot while other
+            // live slots wait. Advancing their recurrence without their host position corrupts
+            // the next real token.
             //
             // On a blob without `in.parked` this is a no-op, so a non-batched packet is unchanged.
-            let parked: Vec<u32> = (0..self.batch).map(|s| u32::from(!self.live[s])).collect();
+            stage_parked(&mut self.parked_stage, advance);
             // THE DECODE BATCH LADDER (`PLOW_DECODE_BATCH_LADDER` at emit). Pick the
             // NARROWEST decode program that still advances every occupied slot, and pay only
             // that program's wasted rows instead of `batch`'s.
@@ -751,9 +810,9 @@ mod amd_serve {
                         tracing::info!(rung = w, occupied = rows, "decode ladder rung");
                         self.last_rung = w;
                     }
-                    e.upload_parked(&parked)?;
+                    e.upload_parked(&self.parked_stage)?;
                     e.seed_ids(&self.next_id)?;
-                    e.decode_step_batched_at(&p, &k, dp)?
+                    e.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?
                 }
                 Ranks::Tp(g) => {
                     let dp = g.rank(0).decode_prog_for(rows);
@@ -764,15 +823,15 @@ mod amd_serve {
                     }
                     tracing::debug!(
                         rung = w,
-                        pos = ?&p[..(w as usize).min(p.len())],
-                        kvlen = ?&k[..(w as usize).min(k.len())],
-                        parked = ?&parked[..(w as usize).min(parked.len())],
+                        pos = ?&self.pos_stage[..(w as usize).min(self.pos_stage.len())],
+                        kvlen = ?&self.kvlen_stage[..(w as usize).min(self.kvlen_stage.len())],
+                        parked = ?&self.parked_stage[..(w as usize).min(self.parked_stage.len())],
                         ids = ?&self.next_id[..(w as usize).min(self.next_id.len())],
                         "dstep stage"
                     );
-                    g.upload_parked(&parked)?;
+                    g.upload_parked(&self.parked_stage)?;
                     g.seed_ids(&self.next_id)?;
-                    let out = g.decode_step_batched_at(&p, &k, dp)?;
+                    let out = g.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
                     // Task-9 differential counter audit: dump rank-0 end-state
                     // counters per tick for offline diff (same rung ⇒ must be
                     // byte-identical every tick).
@@ -813,6 +872,42 @@ mod amd_serve {
                 self.pos[s] += 1;
             }
             Ok(out)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{invalidate_prefix_metadata, stage_parked};
+
+        #[test]
+        fn parked_rows_follow_the_advance_set_not_liveness() {
+            let mut parked = vec![0; 4];
+            stage_parked(&mut parked, &[2]);
+            assert_eq!(parked, [1, 1, 0, 1]);
+
+            stage_parked(&mut parked, &[0, 1, 2, 3]);
+            assert_eq!(parked, [0, 0, 0, 0]);
+
+            stage_parked(&mut parked, &[]);
+            assert_eq!(parked, [1, 1, 1, 1]);
+        }
+
+        #[test]
+        fn prefix_miss_is_ineligible_even_if_prefill_is_cancelled() {
+            let mut cached = vec![vec![1, 2, 3], vec![4, 5, 6]];
+            let mut snap_at = vec![2, 3];
+            invalidate_prefix_metadata(true, &mut cached, &mut snap_at, 1);
+            assert!(cached[1].is_empty());
+            assert_eq!(snap_at, [2, 0]);
+        }
+
+        #[test]
+        fn prefix_invalidation_is_inert_when_the_cache_is_disabled() {
+            let mut cached = vec![vec![1, 2, 3]];
+            let mut snap_at = vec![2];
+            invalidate_prefix_metadata(false, &mut cached, &mut snap_at, 0);
+            assert_eq!(cached, [vec![1, 2, 3]]);
+            assert_eq!(snap_at, [2]);
         }
     }
 }
