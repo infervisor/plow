@@ -57,6 +57,10 @@ Audited median output throughput is **50.082 tok/s**; range is
 50.008--50.116 tok/s. Every detailed result has 128 output tokens per request,
 an empty error, no in-band `[error:` text, and prompt+completion below 32,768.
 
+The adopted dead-projection compile arm raises the served median to
+**50.862 tok/s** with exact matched generated text. See
+`perf-data/kimi-k3-mi325x-kernel-capacity.md`.
+
 ```bash
 nix develop .#vllm --command vllm bench serve \
   --backend openai-chat --base-url http://127.0.0.1:8018 \
