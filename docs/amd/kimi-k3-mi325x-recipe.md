@@ -188,6 +188,20 @@ primary HSACO inventory. Its decode objects must export
 `plow_moe_pf_a4w4_arm`; the build and runtime both refuse an incompatible
 object.
 
+Build the B2/B4/B8 tiers:
+
+```bash
+for b in 2 4 8; do
+  nix develop --command env \
+    PLOW_DECODE_BATCH="$b" \
+    PLOW_K3_DECODE_MXFP4_PROJ=0 \
+    PLOW_ROWS_ONLY=interp_decode_fp8kv_k3 \
+    JOBS=2 \
+    scripts/build_gfx942.sh \
+    "/home/lava/plow/build-amd/k3-b${b}-ladder-grouped"
+done
+```
+
 On gfx942, the active grouped kernels must contain
 `v_mfma_f32_32x32x8_bf16` and software FP4 decode. Native CDNA4 scaled-MX
 instructions are forbidden by the audit.
@@ -271,7 +285,7 @@ nix develop --command env \
   PLOW_L2_PLACE_DISPATCH=1 \
   PLOW_TP_AUDIT_COMPACT=1 \
   PLOW_CTR_DBUF=1 \
-  PLOW_HSACO_LOWRUNG=/home/lava/plow/build-amd/k3-b1-ladder-grouped:1 \
+  PLOW_HSACO_LOWRUNG=/home/lava/plow/build-amd/k3-b1-ladder-grouped:1,/home/lava/plow/build-amd/k3-b2-ladder-grouped:2,/home/lava/plow/build-amd/k3-b4-ladder-grouped:4,/home/lava/plow/build-amd/k3-b8-ladder-grouped:8 \
   PLOW_DSTEP_LOG=1 \
   PLOW_DSTEP_EVERY=64 \
   perf-data/harness/gpulease -n 8 k3-ladder-slo-serve \
@@ -291,8 +305,9 @@ prefill batching, no speculative decoding, shared checkpoint mappings, and the
 global-queue object selected by packet capability.
 
 The low-rung override changes only packets whose occupied extent is at most
-one. At C1 it reduced served median TPOT from 85.33 to 53.40 ms with
-byte-identical output; B32 continues to use the primary MM16+walk inventory.
+eight. It reduced served median TPOT by 11.9--37.4% at C1/C2/C4/C8 with
+byte-identical output. B16 and B32 continue to use the primary MM16+walk
+inventory.
 
 ## 8. Measure served throughput
 
@@ -394,9 +409,9 @@ Rank these against this recipe as the control:
 3. **Ragged/weight-stream-aware grouped MoE.** Remove expert padding without
    rereading weights. BM32, BK32, final-wave culling, implicit-pad removal,
    grouped weight NT, and selected-W2 cache touching were measured and rejected.
-4. **Additional low-rung objects.** B1 is adopted at 53.40 ms TPOT vs 85.33 ms
-   on the MM16+walk object. Measure compatible B2/B4/B8 objects before extending
-   `PLOW_HSACO_LOWRUNG`; object capability must match each ladder packet.
+4. **Low-rung object selection.** B1/B2/B4/B8 are adopted; each exact-width
+   object beats MM16+walk by 11.9--37.4% TPOT. Keep B16/B32 on the primary
+   object; object capability must match each ladder packet.
 5. **Pipeline recurrent-state admission.** Initializing one slot clears about
    56.6 MiB/rank across 276 KDA/conv tensors using many blocking fills. Batch or
    enqueue these clears without advancing already-live slots.
