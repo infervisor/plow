@@ -31,30 +31,32 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 R="$REPO/runtime"
 OUT="${1:-${PLOW_BUILD_DIR:-$REPO/build-amd/hsaco/gfx942}}"
 ARCH=gfx942
-HIPCC="${PLOW_HIPCC:-/opt/rocm/bin/hipcc}"
-# THE `|| true` IS LOAD-BEARING, and its absence cost two agents a build each.
-#
-# These probes list SEVERAL candidate paths and keep the first that exists — so `ls` reporting
-# "No such file" for the others is the NORMAL case, not an error. But `ls` still EXITS 2 when any
-# operand is missing, and under `set -euo pipefail` (line 28) `pipefail` promotes that exit
-# through `head -1` and `set -e` kills the script — at line 35, before a single `echo`. The
-# symptom is exit 2 and a COMPLETELY EMPTY log, which reads like a toolchain fault rather than a
-# shell quoting bug, and it fires only on a box that lacks the first candidate.
-#
-# `|| true` inside the substitution makes an all-candidates-missing probe yield the empty string
-# instead, which the checks below report by name. Fail loudly with a name, never silently at
-# line 35.
-BUN="${PLOW_BUNDLER:-$(ls -1 "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/clang-offload-bundler \
-        "${ROCM_PATH:-/opt/rocm}"/llvm/bin/clang-offload-bundler \
-        /opt/rocm-*/lib/llvm/bin/clang-offload-bundler 2>/dev/null | head -1 || true)}"
-# Same discovery for readelf: the cliff check below dies with empty fields (every row reported
-# OVER) when the hardcoded /opt/rocm path is absent, which fails a perfectly good build.
-READELF="${PLOW_READELF:-$(ls -1 "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/llvm-readelf \
-        "${ROCM_PATH:-/opt/rocm}"/llvm/bin/llvm-readelf \
-        /opt/rocm-*/lib/llvm/bin/llvm-readelf 2>/dev/null | head -1 || true)}"
-[ -x "$HIPCC" ] || { echo "FAIL: hipcc not found at '$HIPCC' (set PLOW_HIPCC)" >&2; exit 2; }
-[ -n "$BUN" ] || { echo "FAIL: clang-offload-bundler not found (set PLOW_BUNDLER)" >&2; exit 2; }
-[ -n "$READELF" ] || { echo "FAIL: llvm-readelf not found (set PLOW_READELF)" >&2; exit 2; }
+[ -n "${IN_NIX_SHELL:-}" ] || { echo "FAIL: run this script through nix develop" >&2; exit 2; }
+: "${PLOW_HIPCC:?nix develop did not set PLOW_HIPCC}"
+: "${PLOW_BUNDLER:?nix develop did not set PLOW_BUNDLER}"
+: "${PLOW_READELF:?nix develop did not set PLOW_READELF}"
+[ "${PLOW_TOOLCHAIN_LABEL:-}" = "rocm-7.14.0-nix" ] || {
+  echo "FAIL: expected ROCm 7.14.0 from the flake, got ${PLOW_TOOLCHAIN_LABEL:-unset}" >&2; exit 2; }
+HIPCC="$PLOW_HIPCC"
+BUN="$PLOW_BUNDLER"
+READELF="$PLOW_READELF"
+require_nix_tool() {
+  local name="$1" path="$2" target
+  target="$(readlink -f "$path")"
+  case "$target" in
+    /nix/store/*) ;;
+    *) echo "FAIL: $name must resolve into /nix/store, got ${target:-missing}" >&2; exit 2 ;;
+  esac
+  [ -x "$target" ] || { echo "FAIL: $name not executable at $target" >&2; exit 2; }
+}
+require_nix_tool hipcc "$HIPCC"
+require_nix_tool clang-offload-bundler "$BUN"
+require_nix_tool llvm-readelf "$READELF"
+HIP_VERSION="$("$HIPCC" --version)"
+case "$HIP_VERSION" in
+  *"HIP version: 7.14."*) ;;
+  *) echo "FAIL: expected HIP 7.14 from the flake" >&2; exit 2 ;;
+esac
 INC="-I$R/amd -I$R/common"
 JOBS="${JOBS:-8}"
 mkdir -p "$OUT"; cd "$OUT"

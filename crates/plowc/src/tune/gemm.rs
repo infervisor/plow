@@ -390,11 +390,10 @@ fn rocm_lib() -> String {
     format!("{}/lib", rocm_root())
 }
 
-/// Build the host harness with the SYSTEM toolchain and a cleared environment.
+/// Build the host harness with the active toolchain.
 ///
-/// `env_clear` is correct HERE and wrong for emission (see the module docs): this links against
-/// `/opt/rocm` headers and `libhsa-runtime64`, and the nix dev shell's `CPATH`/`LIBRARY_PATH`
-/// shadow the system glibc that ROCm was built against. Same rule as `build_gfx950.sh`'s `chat`.
+/// Campaigns run inside `nix develop`, so `CC`, `ROCM_PATH`, and the active Nix paths must stay
+/// intact. Clearing them silently swaps the measured toolchain back to the host system.
 fn build_harness(root: &Path, obj: &Path) -> Result<PathBuf, Err> {
     // The sweep source MOVED to runtime/bench/gemm/ and this path did not follow it, so every
     // campaign died in gcc with "No such file or directory" -- i.e. `plowc tune gemm` could not
@@ -417,9 +416,10 @@ fn build_harness(root: &Path, obj: &Path) -> Result<PathBuf, Err> {
             )
             .into()
         })?;
-    let st = Command::new("/usr/bin/gcc")
+    let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let st = Command::new(cc)
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", std::env::var("HOME").unwrap_or_default())
         .current_dir(obj)
         .args(["-O2", "-std=gnu11", "-o", "gemm_tile_sweep"])
@@ -485,26 +485,14 @@ fn measure(
 
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]).current_dir(obj);
-    // A CURATED environment, not the ambient one and not an empty one.
-    //
-    // Cleared, because plowc lives inside `nix develop` and the harness is a SYSTEM binary: with
-    // nix's `LD_LIBRARY_PATH` inherited it loads nix's libelf/libdrm/libnuma/libstdc++ against
-    // the system glibc and dies with `GLIBC_2.38 not found` before reaching main. That is
-    // knob-contract §0a's "do NOT run ROCm builds under nix develop", at run time.
-    //
-    // But NOT `env -i`. Stripping the environment wholesale is how the lease gets destroyed —
-    // §0a records three instances of exactly that bug (`env -i` in the TP scripts, `sudo -g
-    // render`), where the run lands on GPU 0 regardless of its lease and produces numbers that
-    // are silently invalid rather than loudly wrong. So the lease variable is forwarded BY NAME.
+    // Keep the active Nix toolchain and runtime closure while limiting unrelated state.
     cmd.env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", std::env::var("HOME").unwrap_or_default())
-        // ROCM_PATH-relative for the same reason `build_harness` already is: this box has an
-        // /opt/rocm with `bin` and nothing else — no `lib`, no `include` — and the real install
-        // is /opt/rocm-7.2.4. Hardcoding /opt/rocm/lib links the harness fine and then loses
-        // libhsa-runtime64.so.1 at exec time, which is a failure the campaign cannot recover
-        // from and could not previously be fixed from the caller's environment.
-        .env("LD_LIBRARY_PATH", rocm_lib())
+        .env(
+            "LD_LIBRARY_PATH",
+            std::env::var("LD_LIBRARY_PATH").unwrap_or_default(),
+        )
         .env("PLOW_GEMM_JSONL", out);
     if let Ok(v) = std::env::var("ROCR_VISIBLE_DEVICES") {
         cmd.env("ROCR_VISIBLE_DEVICES", v);
