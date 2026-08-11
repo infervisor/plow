@@ -209,15 +209,16 @@ AX_MXFP4="-DPLOW_MXFP4=1"
 # decode GEMV is K=7168, whose nchunk is exactly 14 (runtime/CMakeLists.txt records the sweep).
 AX_K3="-DPLOW_K3=1 -DGV_UNROLL=14"
 AX_MLA_K3="$AX_MLA -DPLOW_K3=1"
-# NO A4W4 ROW ON CDNA3, AND IT IS NOT AN OVERSIGHT. `PLOW_MOE_PF_A4W4` is fp4 on BOTH operands
-# through v_mfma_scale_f32_32x32x64_f8f6f4, which has no CDNA3 analogue at all (CDNA3's widest fp8
-# MFMA is K=16 and unscaled), so op_moe.h refuses the pair at compile time with an #error rather
-# than emulating it. The consequence is specific and worth stating where the rows are: gfx942
-# serves K3 DECODE (`interp_decode_k3`), and a K3 PREFILL bucket whose grouped-expert ops carry
-# `i[3] == PLOW_MOE_ENC_MXFP4` resolves to `interp_prefill_k3_moe_a4w4.elf`, which this arch
-# cannot build. Closing that needs a w4a16 grouped-prefill body (dequant fp4 -> bf16 in the
-# B-fetch, then the ordinary bf16 MFMA -- exactly what `d_gemm_mxfp4`'s WFP4 fetch already does
-# for the dense GEMM), not a flag.
+# THE A4W4 ROWS BUILD HERE TOO, as the SIMULATED arm. True A4W4 (fp4 on both operands through
+# v_mfma_scale_f32_32x32x64_f8f6f4) has no CDNA3 analogue, but the ops do not ask for an
+# instruction: without PLOW_HAS_MX_MMA, `d_moe_group_pf_a4w4` compiles as the CDNA3 body --
+# fp4 dequantized to bf16 in staging (EXACT: <= 3 significant bits, power-of-two scale) and fed
+# to the ordinary bf16 MFMA, same packet contract, same GLU bridge writing fu as MXFP4 + E8M0.
+# Verified on this silicon by runtime/tests/moe_prefill_a4w4_cdna3_test.hip: the bridge output
+# is quantized-value-IDENTICAL to an f64 host reference and DOWN agrees to 2.5e-8 rms. The arm
+# costs the prefill object NOTHING (256 VGPR / occ 2 / 8 spill, byte-for-byte the same resource
+# report as the object without it).
+AX_A4W4="-DPLOW_MOE_PF_A4W4=1"
 
 # PER-XCD QUEUES + TWO-LEVEL GATE MAINTENANCE -- ON BY DEFAULT. MEASURED -16.0%, TOKEN-IDENTICAL.
 #
@@ -723,9 +724,13 @@ ROWS=(
   "interp_decode_k3|$AX_DECODE $AX_K3 $AX_MXFP4"
   "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_MXFP4 $AX_FP8KV"
   # ATTENTION-ONLY, exactly as on gfx950: without $AX_MOE the grouped expert packets fall through
-  # `default:` and write nothing. A whole-layer K3 prompt needs the `_moe` row below.
+  # `default:` and write nothing. A whole-layer K3 prompt needs the `_moe` rows below.
   "interp_prefill_k3|$AX_PREFILL $AX_MLA_K3 $AX_MXFP4"
   "interp_prefill_k3_moe|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_MXFP4"
+  # THE ROW A K3 PREFILL PACKET ACTUALLY LOADS (exec/amd.rs: grouped ops with i[3] == MXFP4
+  # resolve the K3MoeA4w4 arm). On this arch it contains the simulated body -- see AX_A4W4.
+  "interp_prefill_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_MXFP4"
+  "interp_prefill_fp8kv_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_MXFP4 $AX_FP8KV"
 )
 
 # PLOW_ROWS_ONLY=<substring>: build only the rows whose stem matches — for iterating on
