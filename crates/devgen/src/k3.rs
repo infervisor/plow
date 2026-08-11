@@ -716,10 +716,10 @@ pub fn emit_k3_linear(
     n: u32,
     k: u32,
     n_cu: u32,
-    seq_rows: bool,
+    decode_rows: bool,
     deps: &[u32],
 ) -> u32 {
-    emit_k3_linear_norm(b, out, x, wt, t, n, k, n_cu, seq_rows, None, deps)
+    emit_k3_linear_norm(b, out, x, wt, t, n, k, n_cu, decode_rows, None, deps)
 }
 
 /// [`emit_k3_linear`] with the option of ABSORBING the [`DevOp::RmsNorm`] that produced `x`.
@@ -741,7 +741,7 @@ pub fn emit_k3_linear_norm(
     n: u32,
     k: u32,
     n_cu: u32,
-    seq_rows: bool,
+    decode_rows: bool,
     fold: Option<(u32, f32)>,
     deps: &[u32],
 ) -> u32 {
@@ -755,7 +755,7 @@ pub fn emit_k3_linear_norm(
     // runs on the DECODE object, where AMD's dispatch `default:` writes NOTHING rather than
     // trapping. The packet then leaves its output holding whatever the arena held — the run
     // completes, every row is finite and plausible, and every row is wrong.
-    let gemv_arm = t == 1 || seq_rows;
+    let gemv_arm = t == 1 || decode_rows;
     let op = if gemv_arm {
         DevOp::Gemv
     } else {
@@ -995,6 +995,7 @@ pub fn emit_k3_latent_moe(
     x: u32,
     t: u32,
     seq_rows: bool,
+    decode_rows: bool,
     n_cu: u32,
     tp: &mut K3Tp,
     // `Some(p)` FOLDS the block-output residual into this block's own tail add, so `out` is the
@@ -1052,7 +1053,7 @@ pub fn emit_k3_latent_moe(
     let shd = bft(b, format!("{a}sh_down"), tt * hid as u64);
 
     let gemv = |b: &mut Builder, out: u32, row: u32, wt: u32, n: u32, k: u32, dep: u32| {
-        emit_k3_linear(b, out, row, wt, t, n, k, n_cu, seq_rows, &[dep])
+        emit_k3_linear(b, out, row, wt, t, n, k, n_cu, decode_rows, &[dep])
     };
 
     // Router — scores the HIDDEN state. `logit` is [T, n_exp] on both phases; only the top-k TAIL
@@ -1374,7 +1375,7 @@ pub fn emit_k3_latent_moe(
         up_n,
         lat,
         n_cu,
-        seq_rows,
+        decode_rows,
         fold_ln.then_some((w.latent_norm, cb.eps)),
         &[c_ln],
     );
@@ -1478,7 +1479,7 @@ pub fn emit_k3_latent_moe(
         hid,
         si_l,
         n_cu,
-        seq_rows,
+        decode_rows,
         &sh_deps,
     );
 
@@ -1691,6 +1692,9 @@ pub fn emit_k3_mla_mixer(
     // `true` when the `t` rows are INDEPENDENT SEQUENCES (batched decode) rather than
     // consecutive tokens of one. Selects the DECODE flash arm at t > 1 and sets n_batch.
     seq_rows: bool,
+    // `true` for batched decode and serial target verification. Selects decode-family
+    // projections/attention without changing the state/cache batch addressing above.
+    decode_rows: bool,
 ) -> (u32, u32) {
     let all: Vec<u32> = (0..n_cu).collect();
     let a = act_prefix;
@@ -1726,7 +1730,7 @@ pub fn emit_k3_mla_mixer(
     // twice over: the arena is contiguous, so the writes land in whatever tensor follows and the
     // run completes with plausible garbage rather than faulting. This is the same
     // "`t > 1` does not mean prefill" trap the arm selection below spells out, one buffer earlier.
-    let nsplit = if t == 1 || seq_rows { c.n_split } else { 1 };
+    let nsplit = if t == 1 || decode_rows { c.n_split } else { 1 };
     let opart = f32t(
         b,
         format!("{a}o_part"),
@@ -1742,7 +1746,7 @@ pub fn emit_k3_mla_mixer(
     };
 
     let gemv = |b: &mut Builder, out: u32, row: u32, wt: u32, n: u32, k: u32, dep: &[u32]| {
-        emit_k3_linear(b, out, row, wt, t, n, k, n_cu, seq_rows, dep)
+        emit_k3_linear(b, out, row, wt, t, n, k, n_cu, decode_rows, dep)
     };
     let rms = |b: &mut Builder, out: u32, inp: u32, gw: u32, n: u32, dep: &[u32]| {
         b.emit(DevOp::RmsNorm, norm_cus(&all, t), dep, |d| {
@@ -1819,7 +1823,7 @@ pub fn emit_k3_mla_mixer(
         nh * dk,
         ql,
         n_cu,
-        seq_rows,
+        decode_rows,
         qn,
         &[c_rnq],
     );
@@ -1832,7 +1836,7 @@ pub fn emit_k3_mla_mixer(
         nh * dr,
         ql,
         n_cu,
-        seq_rows,
+        decode_rows,
         qn,
         &[c_rnq],
     );
@@ -1939,7 +1943,7 @@ pub fn emit_k3_mla_mixer(
     // program has `t` INDEPENDENT sequences of one token each and wants the DECODE arm with
     // `i[4] = n_split` and `n_batch = t`. Selecting on `t == 1` alone silently routes a batched
     // decode to the prefill kernel, which would then read the `t` rows as one sequence's history.
-    let decode_arm = t == 1 || seq_rows;
+    let decode_arm = t == 1 || decode_rows;
     let c_fl = b.emit(
         match (decode_arm, c.fp8_kv) {
             (true, false) => DevOp::FlashMlaDecode,
@@ -1977,6 +1981,9 @@ pub fn emit_k3_mla_mixer(
             d.i[6] = 0; // keep the 64-wide NoPE/rope cache in bf16
             d.i[7] = c.gf;
             d.f[0] = c.scale;
+            if decode_rows && !seq_rows && t > 1 {
+                d.j[0] = t;
+            }
         },
     );
     // The partials are `[b][t][head][nsplit][DK]` and the fold indexes them as `(b*n_head + h)`,
@@ -2133,7 +2140,8 @@ pub fn emit_k3_dense_mlp(
     down_w: u32,
     inter: u32,
     t: u32,
-    seq_rows: bool,
+    _seq_rows: bool,
+    decode_rows: bool,
     n_cu: u32,
     tp: &mut K3Tp,
     deps: &[u32],
@@ -2149,7 +2157,7 @@ pub fn emit_k3_dense_mlp(
     let act = b.tensor(&format!("{a}mlp_act"), sz);
     let _ = &all;
     let gemv = |b: &mut Builder, out: u32, row: u32, wt: u32, n: u32, k: u32, dep: &[u32]| {
-        emit_k3_linear(b, out, row, wt, t, n, k, n_cu, seq_rows, dep)
+        emit_k3_linear(b, out, row, wt, t, n, k, n_cu, decode_rows, dep)
     };
     let c_g = gemv(b, g, x, gate_w, inter, cb.hidden, deps);
     let c_u = gemv(b, u, x, up_w, inter, cb.hidden, deps);
@@ -2228,6 +2236,9 @@ pub fn emit_k3_block(
     // than consecutive tokens of one. Only the KDA mixer cares: its recurrence and its conv
     // window carry state between rows, and sharing that across independent sequences is silent.
     seq_rows: bool,
+    // Decode-family arithmetic with one serial state/cache stream. This differs from
+    // `seq_rows` only for speculative target verification.
+    decode_rows: bool,
 ) -> u32 {
     let all: Vec<u32> = (0..n_cu).collect();
     let a = act_prefix;
@@ -2294,6 +2305,7 @@ pub fn emit_k3_block(
             fuse_pre,
             &[dep],
             seq_rows,
+            decode_rows,
         ),
         K3Mixer::Mla { cfg, w: mw } => emit_k3_mla_mixer(
             b,
@@ -2308,6 +2320,7 @@ pub fn emit_k3_block(
             fuse_pre,
             &[dep],
             seq_rows,
+            decode_rows,
         ),
     };
     let (c_o, attn) = if tp.on() {
@@ -2407,6 +2420,7 @@ pub fn emit_k3_block(
             h3,
             t,
             seq_rows,
+            decode_rows,
             n_cu,
             tp,
             fuse_bo.then_some(prefix),
@@ -2429,6 +2443,7 @@ pub fn emit_k3_block(
             *inter,
             t,
             seq_rows,
+            decode_rows,
             n_cu,
             tp,
             &[dep],
@@ -2502,6 +2517,33 @@ pub enum RowKind {
     Tokens,
     /// Independent sequences, one token each.
     Sequences,
+    /// Consecutive target-verification tokens using decode kernels.
+    Verify,
+}
+
+impl RowKind {
+    fn slots(self, t: u32) -> u64 {
+        match self {
+            Self::Tokens | Self::Verify => 1,
+            Self::Sequences => t as u64,
+        }
+    }
+
+    fn sequence_rows(self) -> bool {
+        self == Self::Sequences
+    }
+
+    fn decode_rows(self) -> bool {
+        matches!(self, Self::Sequences | Self::Verify)
+    }
+
+    fn sample_rows(self, t: u32) -> u32 {
+        if self.decode_rows() {
+            t
+        } else {
+            1
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2519,11 +2561,9 @@ pub fn emit_k3_model(
     // HOW MANY INDEPENDENT SEQUENCES this program carries KDA state for. NOT the same as `t`:
     // a prefill program has `t` rows and ONE slot (its rows thread through one carried state);
     // a batched decode program has `t == B` rows and `B` slots.
-    let slots: u64 = match rows {
-        RowKind::Tokens => 1,
-        RowKind::Sequences => t as u64,
-    };
-    let seq_rows = matches!(rows, RowKind::Sequences);
+    let slots = rows.slots(t);
+    let seq_rows = rows.sequence_rows();
+    let decode_rows = rows.decode_rows();
     // SHARING IS EXPRESSED THROUGH THE BUILDER, not through the naming. Re-declaring a name now
     // returns the existing handle and grows it to the larger size, which is what makes the shared
     // prefill prefix below actually share one buffer instead of allocating 93 identically-named
@@ -2596,7 +2636,7 @@ pub fn emit_k3_model(
     // the bucket is — a [T, vocab] logit matrix would cost a 163k-wide GEMM per prompt token to
     // throw all but one row away. A batched DECODE samples ALL of them, because its rows are
     // independent sequences and each one needs its own token.
-    let s_rows = if seq_rows { t } else { 1 };
+    let s_rows = rows.sample_rows(t);
     let logits = b.tensor("act.logits", s_rows as u64 * vocab_l as u64 * 2);
     let amax = b.tensor("act.amax", s_rows as u64 * crate::AMAX_BLOCKS as u64 * 8);
     // The block-residual ring: compiler-owned, per-sequence, `kv.`-prefixed so
@@ -2774,7 +2814,8 @@ pub fn emit_k3_model(
             n_cu,
             &mut tp,
             &[dep],
-            rows == RowKind::Sequences,
+            seq_rows,
+            decode_rows,
         );
         cur = nxt;
     }
@@ -2856,7 +2897,7 @@ pub fn emit_k3_model(
         d.i[2] = hid;
         // a_row0: the last real row on a prefill bucket, row 0 on a batched decode (which wants
         // every row, so it starts at the first). The host re-patches this per prefill chunk.
-        d.i[4] = if seq_rows { 0 } else { t - 1 };
+        d.i[4] = if decode_rows { 0 } else { t - 1 };
     });
     let c_am = b.emit(
         DevOp::Argmax,
@@ -2868,7 +2909,7 @@ pub fn emit_k3_model(
             d.i[0] = vocab_l;
             // `d_argmax`'s n_batch, which it has always taken and no emitter has ever set:
             // "i1 = n_batch (0/1 => single sequence, byte-identical)" (runtime/amd/interp.hip:1299).
-            d.i[1] = if seq_rows { t } else { 0 };
+            d.i[1] = if decode_rows { t } else { 0 };
         },
     );
     if k3_shard_head(c) {
@@ -2902,7 +2943,7 @@ pub fn emit_k3_model(
             d.t[0] = ids;
             d.t[1] = amax;
             d.i[0] = crate::AMAX_BLOCKS;
-            d.i[1] = if seq_rows { t } else { 0 }; // n_batch, as on Argmax above
+            d.i[1] = if decode_rows { t } else { 0 }; // n_batch, as on Argmax above
         });
     }
 }
@@ -3198,6 +3239,7 @@ mod tests {
             256,
             &mut K3Tp::none(),
             &[seed],
+            false,
             false,
         );
         b.finish()
@@ -4186,6 +4228,81 @@ mod tests {
             rows,
         );
         b.finish()
+    }
+
+    #[test]
+    fn target_verify_uses_decode_math_with_one_serial_state_and_all_logits() {
+        let mut c = model_cfg();
+        c.tp = 8;
+        c.mla.fp8_kv = true;
+        let mut b = Builder::new(304);
+        emit_k3_model(
+            &mut b,
+            &c,
+            &|layer| layer != 3,
+            &[0, 1, 2, 3],
+            4096,
+            8,
+            8,
+            304,
+            RowKind::Verify,
+        );
+        let p = b.finish();
+        let tensor_bytes = |name: &str| {
+            p.tensors
+                .iter()
+                .find(|tensor| tensor.name == name)
+                .unwrap_or_else(|| panic!("missing tensor {name}"))
+                .bytes
+        };
+
+        assert_eq!(tensor_bytes("in.kvlen"), 4, "one sequence, not a B8 batch");
+        assert_eq!(tensor_bytes("act.logits"), 8 * 163840 * 2);
+        assert_eq!(
+            tensor_bytes("kv.0.state"),
+            12 * 128 * 128 * 4,
+            "one TP8-local recurrent state"
+        );
+        for step in p
+            .insts
+            .iter()
+            .filter(|inst| inst.op == DevOp::KdaStateStepG as u16)
+        {
+            assert_eq!(step.i[0], 8);
+            assert_eq!(step.i[4] & 2, 0, "rows must thread one serial state");
+        }
+
+        let flash = p
+            .insts
+            .iter()
+            .find(|inst| inst.op == DevOp::FlashMlaDecodeFp8 as u16)
+            .expect("the verifier must use the FP8 MLA decode arm");
+        assert_eq!(flash.i[0], 1, "one sequence");
+        assert_eq!(flash.j[0], 8, "causal query-token count");
+        assert_eq!(flash.i[4], c.mla.n_split);
+        assert_eq!(
+            p.insts
+                .iter()
+                .find(|inst| inst.op == DevOp::MlaMergeFold as u16)
+                .unwrap()
+                .i[0],
+            8
+        );
+
+        let head = p
+            .insts
+            .iter()
+            .rev()
+            .find(|inst| inst.op == DevOp::Gemv as u16 && inst.i[1] == 163840)
+            .expect("eight-row lm_head");
+        assert_eq!(head.i[0], 8);
+        assert_eq!(head.i[4], 0);
+        let argmax = p
+            .insts
+            .iter()
+            .find(|inst| inst.op == DevOp::Argmax as u16)
+            .unwrap();
+        assert_eq!(argmax.i[1], 8);
     }
 
     /// Opcodes that exist ONLY in the decode interpreter object. A prefill bucket carrying any of

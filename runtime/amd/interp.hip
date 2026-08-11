@@ -55,6 +55,13 @@
 #define PLOW_DSPARK_NONCAUSAL 0
 #endif
 
+/* Eight-row causal target verification. `fj[1].u` carries n_tok on the MLA decode packets;
+ * zero preserves every ordinary one-token packet. This replaces the ordinary decode body rather
+ * than adding another dispatch arm. */
+#ifndef PLOW_K3_SPEC_VERIFY
+#define PLOW_K3_SPEC_VERIFY 0
+#endif
+
 #include "amd_common.h"
 #include "op_attention.h"
 #include "op_collective.h"
@@ -84,6 +91,9 @@ extern "C" __device__ unsigned plow_kda_conv_step_db_arm = 1;
 #endif
 #if PLOW_DSPARK_NONCAUSAL
 extern "C" __device__ unsigned plow_dspark_noncausal_1 = 1;
+#endif
+#if PLOW_K3_SPEC_VERIFY
+extern "C" __device__ unsigned plow_k3_spec_verify_1 = 1;
 #endif
 
 /* Compact TP audit. `i[7] == 0` keeps old packets byte-compatible; plowrt patches
@@ -1117,26 +1127,27 @@ __device__ __forceinline__ void exec_flash_mla_decode(CInst in, CTens T, unsigne
                 in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
                 n_tok, nullptr, 0, qrc, qrs);
 #else
+        const unsigned n_tok = PLOW_K3_SPEC_VERIFY && in->fj[1].u ? in->fj[1].u : 1u;
         if (gf == 2)
             d_flash_mla_decode<512, 64, 2>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
                 in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
-                1, nullptr, 0, qrc, qrs);
+                n_tok, nullptr, 0, qrc, qrs);
 #if PLOW_GLM_GF8_ARM
         else if (gf == 8)
             d_flash_mla_decode<512, 64, 8>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
                 in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
-                1, nullptr, 0, qrc, qrs);
+                n_tok, nullptr, 0, qrc, qrs);
 #endif
         else
             d_flash_mla_decode<512, 64, 4>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
                 in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
-                1, nullptr, 0, qrc, qrs);
+                n_tok, nullptr, 0, qrc, qrs);
 #endif
     }
 #undef IEN
@@ -1163,17 +1174,20 @@ __device__ __forceinline__ void exec_flash_mla_decode_fp8(CInst in, CTens T, uns
      * Trap rather than read address 0 — this object has no silent-NOP budget left. */
     if (TEN(7) == nullptr) __builtin_trap();
     const unsigned gf = in->i[7] ? in->i[7] : (unsigned)GLM_MLA_GF;
+    const unsigned n_tok = PLOW_K3_SPEC_VERIFY && in->fj[1].u ? in->fj[1].u : 1u;
     if (gf == 2)
         d_flash_mla_decode<512, 64, 2, /*GATHER=*/false, /*FP8=*/true>(
             (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
             (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
-            in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0, 1,
+            in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
+            n_tok,
             (const float*)TEN(7), in->i[6]);
     else
         d_flash_mla_decode<512, 64, 4, /*GATHER=*/false, /*FP8=*/true>(
             (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
             (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
-            in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0, 1,
+            in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
+            n_tok,
             (const float*)TEN(7), in->i[6]);
 #undef TEN
 }

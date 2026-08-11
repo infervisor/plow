@@ -253,6 +253,10 @@ struct Shapes {
     /// over one committed context; the ordinary causal body would let later queries attend
     /// earlier ones and silently change the draft distribution.
     dspark_noncausal: bool,
+    /// Any causal MLA decode packet carrying more than one consecutive token in `j[0]`.
+    /// The verifier object advances one sequence through those rows; an ordinary decode object
+    /// hardcodes one token and would use the wrong causal frontier after row zero.
+    k3_spec_verify: bool,
     /// Any `QuantFp8` carrying a `t[3]` — the T11 GLU-into-quant fold (PLOW_T11_GLUQUANT):
     /// t3=gate, t4=up, i2=act, and `t[1]` becomes an OUTPUT. The emitter DELETES the `Glu`
     /// packet when it folds, so an object whose QUANT_FP8 arm ignores t3/t4 quantizes an
@@ -365,6 +369,9 @@ fn shapes(m: &Model) -> Shapes {
                 // fold. So presence IS the feature, with no bitfield to decode — unlike op 51
                 // below, whose i[6] packs two.
                 DevOp::FlashMlaDecode => {
+                    if inst.j[0] > 1 {
+                        s.k3_spec_verify = true;
+                    }
                     if inst.t[7] != packet::TENSOR_NONE {
                         s.glm_fuse_rope = true;
                     } else if inst.i[6] > 1 {
@@ -379,7 +386,15 @@ fn shapes(m: &Model) -> Shapes {
                         s.decode_batch = s.decode_batch.max(inst.i[0]);
                     }
                 }
-                DevOp::FlashGatherDecode | DevOp::FlashMlaDecodeFp8 => {
+                DevOp::FlashMlaDecodeFp8 => {
+                    if inst.j[0] > 1 {
+                        s.k3_spec_verify = true;
+                    }
+                    if decode {
+                        s.decode_batch = s.decode_batch.max(inst.i[0]);
+                    }
+                }
+                DevOp::FlashGatherDecode => {
                     if decode {
                         s.decode_batch = s.decode_batch.max(inst.i[0]);
                     }
@@ -638,6 +653,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("glm_ofold".into(), json!(s.glm_ofold));
     f.insert("glm_fuse_rope".into(), json!(s.glm_fuse_rope));
     f.insert("dspark_noncausal".into(), json!(s.dspark_noncausal));
+    f.insert("k3_spec_verify".into(), json!(s.k3_spec_verify));
     f.insert("glm_fuse_qnorm".into(), json!(s.glm_fuse_qnorm));
 }
 
@@ -886,6 +902,9 @@ fn backend_amd(
     }
     if on("dspark_noncausal") {
         req.push("PLOW_DSPARK_NONCAUSAL=1".into());
+    }
+    if on("k3_spec_verify") {
+        req.push("PLOW_K3_SPEC_VERIFY=1".into());
     }
     // The DECODE q-norm fold (op 22 t[7]). Unlike the rope fold this arm is a BUILD AXIS, not an
     // unconditional runtime branch — an object built without `-DPLOW_GLM_FUSE_QNORM=1` has no
@@ -1560,6 +1579,37 @@ mod tests {
         let rope_fold = manifest(7, 12);
         assert_eq!(rope_fold["features"]["dspark_noncausal"], json!(false));
         assert_eq!(rope_fold["features"]["glm_fuse_rope"], json!(true));
+    }
+
+    #[test]
+    fn k3_causal_multi_token_decode_requires_the_verifier_object() {
+        let manifest = |op: DevOp, token_rows: u32| {
+            let mut flash = inst(op, [1, 0, 0, 0, 0, 0, 0, 0]);
+            flash.j[0] = token_rows;
+            let m = Model {
+                n_cu: 304,
+                target: 0,
+                tensors: vec![],
+                progs: vec![prog(vec![flash])],
+                kv_row_insts: vec![],
+                prog_t: vec![1],
+                gen: vec![],
+            };
+            build(&m, "gfx942")
+        };
+
+        for op in [DevOp::FlashMlaDecode, DevOp::FlashMlaDecodeFp8] {
+            let verify = manifest(op, 8);
+            assert_eq!(verify["features"]["k3_spec_verify"], json!(true));
+            assert!(verify["backends"]["gfx942"]["requires"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "PLOW_K3_SPEC_VERIFY=1"));
+
+            assert_eq!(manifest(op, 1)["features"]["k3_spec_verify"], json!(false));
+            assert_eq!(manifest(op, 0)["features"]["k3_spec_verify"], json!(false));
+        }
     }
 
     /// A packet carrying Kimi-K3's BLOCK ops must ask for `PLOW_K3=1`.

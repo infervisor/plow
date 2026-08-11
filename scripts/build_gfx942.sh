@@ -253,6 +253,17 @@ esac
 # KIMI-K3. `GV_UNROLL=14` is on the K3 rows only and is measured, not derived: K3's dominant
 # decode GEMV is K=7168, whose nchunk is exactly 14 (runtime/CMakeLists.txt records the sweep).
 AX_K3="-DPLOW_K3=1 -DGV_UNROLL=14"
+case "${PLOW_K3_SPEC_VERIFY:-0}" in
+  0) AX_K3_SPEC_VERIFY="" ;;
+  1)
+    [ "$GVMM" -ge 8 ] || {
+      echo "REFUSING: PLOW_K3_SPEC_VERIFY=1 requires PLOW_GEMV_MM=8 or wider." >&2
+      exit 1
+    }
+    AX_K3_SPEC_VERIFY="-DPLOW_K3_SPEC_VERIFY=1"
+    ;;
+  *) echo "FAIL: PLOW_K3_SPEC_VERIFY must be 0 or 1" >&2; exit 2 ;;
+esac
 AX_MLA_K3="$AX_MLA -DPLOW_K3=1"
 # THE A4W4 ROWS BUILD HERE TOO, as the SIMULATED arm. True A4W4 (fp4 on both operands through
 # v_mfma_scale_f32_32x32x64_f8f6f4) has no CDNA3 analogue, but the ops do not ask for an
@@ -553,7 +564,8 @@ case "${PLOW_K3_DECODE_GROUPED:-0}" in
   0|1) ;;
   *) echo "FAIL: PLOW_K3_DECODE_GROUPED must be 0 or 1" >&2; exit 2 ;;
 esac
-if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] || [ "${PLOW_K3_DECODE_GROUPED:-0}" = 1 ]; then
+if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] || [ "${PLOW_K3_DECODE_GROUPED:-0}" = 1 ] ||
+   [ "${PLOW_K3_SPEC_VERIFY:-0}" = 1 ]; then
   AX_K3_DECODE_A4W4="$AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_TILE_SEARCH $AX_K3_ALIGN_PREFIX $AX_K3_ROUTER_LOCAL"
 fi
 # Compile-only falsification axis: the grouped MXFP4 expert body is gated by
@@ -842,8 +854,8 @@ ROWS=(
   # K3Moe and K3MoeA4w4 onto PrefillArm::K3 for the decode phase), and it carries the mxfp4
   # EXPERT walks by default. `$AX_K3_DECODE_MXFP4` rides along so an all-fp4 packet finds its fp4
   # PROJECTION ops in the same object rather than falling through the silent dispatch `default:`.
-  "interp_decode_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_K3_DECODE_XR_AGG $AX_K3_MOE_GROUP_INLINE $AX_K3_KDA_CONV_STEP_DB"
-  "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_FP8KV $AX_K3_DECODE_XR_AGG $AX_K3_MOE_GROUP_INLINE $AX_K3_KDA_CONV_STEP_DB"
+  "interp_decode_k3|$AX_DECODE $AX_K3 $AX_K3_SPEC_VERIFY $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_K3_DECODE_XR_AGG $AX_K3_MOE_GROUP_INLINE $AX_K3_KDA_CONV_STEP_DB"
+  "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_K3_SPEC_VERIFY $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_FP8KV $AX_K3_DECODE_XR_AGG $AX_K3_MOE_GROUP_INLINE $AX_K3_KDA_CONV_STEP_DB"
   # ATTENTION-ONLY, exactly as on gfx950: without $AX_MOE the grouped expert packets fall through
   # `default:` and write nothing. A whole-layer K3 prompt needs the `_moe` rows below.
   "interp_prefill_k3|$AX_PREFILL $AX_MLA_K3 $AX_MXFP4"
@@ -1000,6 +1012,15 @@ for row in "${ROWS[@]}"; do
             }
             ;;
           interp_decode_k3*|interp_decode_fp8kv_k3*)
+            if [ -n "$AX_K3_SPEC_VERIFY" ]; then
+              grep -qE "OBJECT .* plow_k3_spec_verify_1$" <<<"$symbols" || {
+                echo "  MISSING K3 SPEC VERIFY: expected plow_k3_spec_verify_1"
+                fail=1
+              }
+            elif grep -qE "OBJECT .* plow_k3_spec_verify_1$" <<<"$symbols"; then
+              echo "  UNEXPECTED K3 SPEC VERIFY: PLOW_K3_SPEC_VERIFY=0"
+              fail=1
+            fi
             if [ -n "$AX_K3_DECODE_XR_AGG" ]; then
               grep -qE "OBJECT .* plow_xr_agg_1$" <<<"$symbols" || {
                 echo "  MISSING XR AGG: expected plow_xr_agg_1"
@@ -1043,7 +1064,8 @@ fi
 # B>1 K3 decode dispatches grouped ops 85/86 with MXFP4 encoding. Check the
 # capability marker before the body: the generic grouped arm also contains
 # bf16 MFMA, so disassembly alone cannot prove that the enc=2 arm exists.
-if { [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] || [ "${PLOW_K3_DECODE_GROUPED:-0}" = 1 ]; } && command -v python3 >/dev/null; then
+if { [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] || [ "${PLOW_K3_DECODE_GROUPED:-0}" = 1 ] ||
+     [ "${PLOW_K3_SPEC_VERIFY:-0}" = 1 ]; } && command -v python3 >/dev/null; then
   K3_BATCH_EXPECT="$REPO/scripts/asm_expect_gfx942_k3_batched.json"
   k3_batch_objects=()
   for object in \
@@ -1057,7 +1079,8 @@ if { [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] || [ "${PLOW_K3_DECODE_GROUPED:-0}" = 1
       fail=1
     }
   done
-  if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] && [ "${#k3_batch_objects[@]}" -gt 0 ] && [ -f "$K3_BATCH_EXPECT" ]; then
+  if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] && [ "${#k3_batch_objects[@]}" -gt 0 ] &&
+     [ -f "$K3_BATCH_EXPECT" ]; then
     echo ""
     echo "   --- K3 batched A4W4 instruction-selection audit ---"
     batch_audit=$(python3 "$REPO/scripts/asm_audit.py" --expect "$K3_BATCH_EXPECT" \

@@ -252,6 +252,10 @@ pub struct EmitConfig {
     #[arg(long = "k3-layers", env = "PLOW_K3_LAYERS", default_value = "all")]
     pub k3_layers: String,
 
+    /// Experimental eight-row causal target-verification program.
+    #[arg(long, env = "PLOW_K3_SPEC_VERIFY", hide = true, default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub k3_spec_verify: bool,
+
     /// K3 prefill bucket control. "0" disables prefill.
     #[arg(long, env = "K3_PREFILL")]
     pub k3_prefill: Option<String>,
@@ -612,6 +616,7 @@ impl EmitConfig {
             k3_fuse_a: env_bool("PLOW_K3_FUSE_A"),
             k3_ns: env_u32("PLOW_K3_NS"),
             k3_layers: env_str("PLOW_K3_LAYERS").unwrap_or_else(|| "all".into()),
+            k3_spec_verify: env_bool("PLOW_K3_SPEC_VERIFY"),
             k3_prefill: env_str("K3_PREFILL"),
             glm_dsa: env_str("PLOW_GLM_DSA"),
             glm_gf: env_u32("PLOW_GLM_GF"),
