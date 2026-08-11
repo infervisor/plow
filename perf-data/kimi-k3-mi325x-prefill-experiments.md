@@ -129,3 +129,49 @@ candidate won 0/12 pairs. Provenance and raw samples are in
 `/tmp/k3-kda-oracle-cmake-clang/bench/moe_prefill_a4w4_w2_touch_gfx942.elf`
 (`w2-touch-43960b`). Reject: the candidate added the 11.156 MiB touch without
 a combined-latency win, so it is not promoted to production packets/runtime.
+
+## Current-digest dense MXFP4 tune
+
+The MI325X tune cell contained 686 qualified records for stale build digest
+`51ea87e49b736bd0`; none was selectable by the current interpreter. The
+production K3 gfx942 prefill object was rebuilt with Nix ROCm 7.14.0 and passed
+the full ISA/resource audit (static/GQ: 256 VGPR, 64560 B LDS, spill 8/30).
+The interpreter harness then measured 96 K3 TP8 shapes across all five MXFP4
+opcode rungs, with 50 warmups and 12 samples of four launches per case. Every
+f64 spot oracle and full-output sentinel gate passed.
+
+```bash
+nix develop --command env \
+  PLOW_ROWS_ONLY=interp_prefill_fp8kv_k3_moe_a4w4 JOBS=2 \
+  scripts/build_gfx942.sh build-amd/k3-mi325x-roof-current
+nix develop --command env \
+  PLOW_K3_OBJECT=$PWD/build-amd/k3-mi325x-roof-current/interp_prefill_fp8kv_k3_moe_a4w4.elf \
+  PLOW_GEMM_JSONL=/tmp/k3-mi325x-mxfp4-20260811-root.jsonl \
+  PLOW_K3_BUILD_DIR=$PWD/build-amd/k3-mi325x-roof-harness \
+  PLOW_CAMPAIGN=k3-mi325x-rocm714-current-mxfp4 \
+  scripts/rebench_k3_mxfp4_gfx942.sh
+```
+
+This published 672 qualified records under current digest
+`gfx942-dcf6e94ea74f540a`. `plowc tune status --gpu MI325X` reports 96
+selectable op cases; the 686 old rows remain present but stale. The compiler
+now selects the measured small/medium/wide/default opcode per shape instead of
+falling back for this digest. These dense MXFP4 comparison shapes are useful
+for K3 bring-up and other MXFP4 models, but the frozen K3 production packet
+uses grouped routed-expert MXFP4 kernels and BF16 dense projections, so this
+database refresh is not claimed as an end-to-end K3 speedup.
+
+## Grouped A4W4 DOWN wave ownership
+
+Grouped DOWN was the lowest-roof live prefill body: 57.6 TF/s, 11.3% of the
+measured 1063.1 TF/s production BF16-MFMA roof, with 4164 GB/s measured HBM.
+A bounded WNc8 experiment changed only the CDNA3 DOWN wave grid from 2x4 to
+1x8 while retaining BM64/BN256/BK64, eight waves, the XOR LDS swizzle, staged
+bytes, MFMA count, GLU, packet ABI, and numerics. Static/GQ resources stayed at
+256 VGPR, 64560 B LDS, and spill 8/30; the candidate removed 32 scalar
+instructions and passed the full ISA audit and f64 oracle.
+
+Under one clean MI325X lease at the emitted TP8 4096-token/896-expert shape,
+GLU was unchanged (2.864 vs 2.865 ms). DOWN regressed from 5.479 to 5.783 ms
+(+5.55%), 57.6 to 54.6 TF/s, and 11.3% to 10.7% of roof. Raw samples are in
+`/tmp/k3-down-wnc{4,8}-roof.jsonl`. Reject: WNc8 is not retained in production.
