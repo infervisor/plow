@@ -64,7 +64,7 @@
 //! 3. **State is V-FIRST `[h][v][k]`.** Transposing it gives garbage with exactly the right norm.
 //!    [`KDA_STATE_LAYOUT`] is carried into the block descriptor for that reason.
 
-use packet::dev::DevOp;
+use packet::dev::{DevOp, WG_WAVES};
 use packet::devbuild::Builder;
 
 /// K3's KDA geometry (`text_config.linear_attn_config` plus `hidden_size`).
@@ -148,6 +148,15 @@ impl KdaCfg {
     pub fn state_step_blocks_rows(&self, n_cu: u32, rows: u32) -> u32 {
         let items = (self.proj() / self.bv).saturating_mul(rows.max(1));
         items.min(n_cu).max(1)
+    }
+
+    /// Workgroups for [`DevOp::KdaGatedNorm`]: one wave per `(token, head)` row.
+    pub fn gated_norm_blocks_rows(&self, n_cu: u32, rows: u32) -> u32 {
+        rows.max(1)
+            .saturating_mul(self.heads)
+            .div_ceil(WG_WAVES)
+            .min(n_cu)
+            .max(1)
     }
 }
 
@@ -834,7 +843,8 @@ fn emit_kda_mixer_ex(
 
     // P11 — output gate. Gated on P4 (whose GEMV has had the whole conv+gate+state chain to hide
     // under) and P10.
-    let c_norm = b.emit(DevOp::KdaGatedNorm, all.clone(), &[c_g, c_step], |d| {
+    let norm_cus: Vec<u32> = (0..c.gated_norm_blocks_rows(n_cu, t)).collect();
+    let c_norm = b.emit(DevOp::KdaGatedNorm, norm_cus, &[c_g, c_step], |d| {
         d.t[0] = y;
         d.t[1] = o;
         d.t[2] = w.o_norm;
@@ -1012,6 +1022,11 @@ mod tests {
             192,
             "BV=8 restores 192"
         );
+        assert_eq!(c.gated_norm_blocks_rows(256, 1), 12);
+        assert_eq!(tp8.gated_norm_blocks_rows(256, 1), 2);
+        assert_eq!(tp8.gated_norm_blocks_rows(256, 32), 48);
+        assert_eq!(tp8.gated_norm_blocks_rows(256, 128), 192);
+        assert_eq!(tp8.gated_norm_blocks_rows(256, 512), 256);
     }
 
     /// The state is f32 and CONSTANT in context length. 6.00 MiB + 0.5625 MiB per layer per seq.

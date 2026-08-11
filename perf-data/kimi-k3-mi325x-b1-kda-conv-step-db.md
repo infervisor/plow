@@ -113,7 +113,9 @@ Emit from the canonical K3 B1/128K recipe, changing only the packet flag:
 ```bash
 nix develop --command env \
   K3_FULL=1 PLOW_FP8_KV=1 PLOW_MXFP4=1 PLOW_MLA_PF_V2=1 \
-  PLOW_K3_NS=64 PLOW_DECODE_BATCH=1 PLOW_K3_KDA_CONV_STEP_DB=1 \
+  PLOW_L2_PLACE=1 PLOW_K3_NS=64 PLOW_DECODE_BATCH=1 \
+  PLOW_DECODE_BATCH_LADDER=1 PLOW_GLM_GEMV_WG=128 \
+  PLOW_K3_KDA_CONV_STEP_DB=1 \
   ./target/release/plowc --hf-dir /home/lava/models/k3_farm \
     --emit devblob --arch gfx942 --gpu MI325X --num-gpus 8 --parallel tp \
     --max-ctx 131072 --n-cu 304 \

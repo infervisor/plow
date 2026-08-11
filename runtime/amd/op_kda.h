@@ -705,9 +705,9 @@ __device__ void d_kda_conv_state_step_g(
  *     before.
  *
  * One wave per (token, head) row: T*H items, the reduction is a wave_sum over D/64 elements per
- * lane, and nothing crosses a wave. At T=1 that is 96 rows, so blocks = 96 (37.5%) — acceptable
- * on an op that touches 12288 elements, and the alternative (folding it into op 102's epilogue)
- * needs a grid-wide barrier because a head's D outputs are spread over D/BV workgroups there.
+ * lane, and nothing crosses a wave. The packet therefore needs ceil(T*H/PLOW_WAVES) workgroups:
+ * 12 at TP1 B1 and 2 at TP8 B1. Folding this into op 102's epilogue instead needs a grid-wide
+ * barrier because a head's D outputs are spread over D/BV workgroups there.
  */
 __device__ void d_kda_gated_norm(bf16* __restrict__ y, const bf16* __restrict__ o,
                                  const float* __restrict__ norm_w, const bf16* __restrict__ g_raw,
