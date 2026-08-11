@@ -11,7 +11,7 @@
  *   nix develop --command env PLOW_STAGE4_CLEARED=1 \
  *     PLOW_GPU=MI325X PLOW_TOOLCHAIN_LABEL=rocm-7.14.0-nix PLOW_BUILD_ID=<revision> \
  *     PLOW_LEASE_LABEL=k3-mxfp4-glu PLOW_GEMM_GLU_JSONL=<samples.jsonl> \
- *     perf-data/harness/gpulease -n 1 k3-mxfp4-glu \
+ *     perf-data/tools/gpulease -n 1 k3-mxfp4-glu \
  *     runtime/build/bench/interp_mxfp4_glu_gfx942 \
  *     <interp_prefill_k3_moe_a4w4.elf> <M> <N> <K> [samples]
  */

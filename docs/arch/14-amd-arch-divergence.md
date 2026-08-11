@@ -96,7 +96,7 @@ nothing else.
 | bf16 MFMA | `32x32x16` / `16x16x32` | `32x32x8` / `16x16x16`, issued twice |
 | fp8 MFMA | `32x32x64_f8f6f4`, scaled form available | `32x32x16_fp8_fp8`, unscaled |
 | fp8 encoding | OCP e4m3 | e4m3**FNUZ** — `0x80` is NaN, every other byte is half its OCP value |
-| MX converts / fp4 | `cvt_scalef32_*`, native | **absent**; `PLOW_MX_PAUSED` poisons with NaN |
+| MX converts / fp4 | `cvt_scalef32_*`, native | native convert absent; exact software e2m1 decode for w4a16 |
 | `global_load_lds` | 16 B/lane | 4 B/lane |
 
 The fragment map (`MFMA_M/N/K = 32/32/16`) is identical on both, so no call site re-indexes: one
@@ -104,9 +104,10 @@ CDNA4 issue is exactly two CDNA3 issues over the two halves of the same lane fra
 accumulator, same f32 accumulation order per k-step. **That equality is what makes a bit-identical
 cross-arch GEMM comparison meaningful**, and it is worth preserving deliberately.
 
-`PLOW_MX_PAUSED` is the pattern for "this arch cannot do this at all": it **poisons with NaN**, not
-zero. A zero output is indistinguishable from an op the packet never dispatched; a NaN propagates
-and cannot be mistaken for a result.
+gfx942 implements w4a16 by decoding checkpoint fp4 weights to bf16 before the dot or MFMA. True
+A4W4 still requires an architecture-specific body because CDNA3 has no native fp4 matrix core.
+Unsupported encodings must be refused by the packet/object capability handshake rather than
+silently producing a plausible value.
 
 ### 3.2 The per-arch geometry table owns BUDGET AND SHAPE
 
@@ -157,8 +158,8 @@ is what `d_gemm_fp8_t` and the A4W4 grouped-MoE bodies already are. Not a separa
 - everything they share — tiling, LDS layout, epilogue plumbing — is still shared;
 - the arch predicate appears once, at the dispatch, not throughout.
 
-`PLOW_MX_PAUSED` is the degenerate case of the same rule: when one arch has no implementation at
-all, the fork is "a body and a poison", still in one file.
+When one arch has no implementation, keep the refusal beside the implemented body and expose it
+through the packet/object capability contract; do not compile a silent fallback.
 
 ---
 

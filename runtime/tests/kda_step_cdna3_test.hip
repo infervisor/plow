@@ -26,7 +26,7 @@
  *       runtime/tests/kda_step_cdna3_test.hip -o /tmp/kda3.co -Iruntime/amd -Iruntime/common
  *   hipcc -O2 -w -x c++ -D__HIP_PLATFORM_AMD__=1 -I/opt/rocm/include \
  *       runtime/tests/kda_step_cdna3_test.hip -o /tmp/kda3 -L/opt/rocm/lib -lamdhip64
- *   perf-data/harness/gpulease -n 1 kda3 '/tmp/kda3 /tmp/kda3.co'
+ *   perf-data/tools/gpulease -n 1 kda3 '/tmp/kda3 /tmp/kda3.co'
  */
 
 #ifdef KDA3_DEVICE

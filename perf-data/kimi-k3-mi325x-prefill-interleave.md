@@ -53,7 +53,7 @@ nix develop --command env -u PLOW_STATE_CLEAR_DEVICE \
   PLOW_HSACO=/home/lava/plow/build-amd/k3-mi325x-v2fp8-seg-hsaco \
   PLOW_L2_PLACE_DISPATCH=1 PLOW_TP_AUDIT_COMPACT=1 PLOW_CTR_DBUF=1 \
   PLOW_HSACO_LOWRUNG=/home/lava/plow/build-amd/k3-b1-ladder-grouped:1,/home/lava/plow/build-amd/k3-b2-ladder-grouped:2,/home/lava/plow/build-amd/k3-b4-ladder-grouped:4,/home/lava/plow/build-amd/k3-b8-ladder-grouped:8 \
-  perf-data/harness/gpulease -n 8 k3-pf-interleave \
+  perf-data/tools/gpulease -n 8 k3-pf-interleave \
   target/release/plowrt serve \
   --assets /home/lava/models/k3_mi325x_ladder_router_v2fp8_seg2 --port 8054
 ```

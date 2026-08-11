@@ -34,24 +34,27 @@ if(PLOW_ROCM)
     target_compile_definitions(aql_launch_floor PRIVATE _POSIX_C_SOURCE=199309L)
     target_link_libraries(aql_launch_floor PRIVATE hsa-runtime64 m)
 
-    set(PLOW_CONTROL_QUEUE_HIPCC "$ENV{PLOW_HIPCC}")
-    if(NOT PLOW_CONTROL_QUEUE_HIPCC MATCHES "^/nix/store/")
-        message(FATAL_ERROR "control-queue gfx942 probe requires Nix PLOW_HIPCC")
+    if(PLOW_HSACO_ARCH STREQUAL "gfx942")
+        set(PLOW_CONTROL_QUEUE_HIPCC "$ENV{PLOW_HIPCC}")
+        if(PLOW_CONTROL_QUEUE_HIPCC MATCHES "^/nix/store/")
+            set(CONTROL_QUEUE_PROBE_SRC
+                ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/control_queue_dispatch_floor.hip)
+            set(CONTROL_QUEUE_PROBE_BIN
+                ${CMAKE_CURRENT_BINARY_DIR}/control_queue_dispatch_floor_gfx942.bin)
+            add_custom_command(
+                OUTPUT ${CONTROL_QUEUE_PROBE_BIN}
+                COMMAND "${PLOW_CONTROL_QUEUE_HIPCC}" --offload-arch=gfx942 -O3 -std=c++17
+                        -Wall -Wextra -Werror ${CONTROL_QUEUE_PROBE_SRC}
+                        -o ${CONTROL_QUEUE_PROBE_BIN}
+                DEPENDS ${CONTROL_QUEUE_PROBE_SRC}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/../common/control_queue_probe.h
+                VERBATIM)
+            add_custom_target(control_queue_dispatch_floor_gfx942
+                DEPENDS ${CONTROL_QUEUE_PROBE_BIN})
+        else()
+            message(WARNING "Skipping control-queue gfx942 probe: Nix PLOW_HIPCC is unavailable")
+        endif()
     endif()
-    set(CONTROL_QUEUE_PROBE_SRC
-        ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/control_queue_dispatch_floor.hip)
-    set(CONTROL_QUEUE_PROBE_BIN
-        ${CMAKE_CURRENT_BINARY_DIR}/control_queue_dispatch_floor_gfx942.bin)
-    add_custom_command(
-        OUTPUT ${CONTROL_QUEUE_PROBE_BIN}
-        COMMAND "${PLOW_CONTROL_QUEUE_HIPCC}" --offload-arch=gfx942 -O3 -std=c++17
-                -Wall -Wextra -Werror ${CONTROL_QUEUE_PROBE_SRC}
-                -o ${CONTROL_QUEUE_PROBE_BIN}
-        DEPENDS ${CONTROL_QUEUE_PROBE_SRC}
-                ${CMAKE_CURRENT_SOURCE_DIR}/../common/control_queue_probe.h
-        VERBATIM)
-    add_custom_target(control_queue_dispatch_floor_gfx942
-        DEPENDS ${CONTROL_QUEUE_PROBE_BIN})
 
     # --- interp family ---
     # interp_gemm_bench: GEMM throughput through the persistent interpreter
@@ -77,14 +80,25 @@ if(PLOW_ROCM)
     target_compile_options(interp_mxfp4_bench PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(interp_mxfp4_bench PRIVATE hsa-runtime64 m)
 
-    set(PLOW_MLA_HIPCC "$ENV{PLOW_HIPCC}")
-    set(PLOW_MLA_BUNDLER "$ENV{PLOW_BUNDLER}")
-    if(NOT PLOW_MLA_HIPCC MATCHES "^/nix/store/")
-        message(FATAL_ERROR "MLA gfx942 benches require Nix PLOW_HIPCC")
-    endif()
-    if(NOT PLOW_MLA_BUNDLER MATCHES "^/nix/store/")
-        message(FATAL_ERROR "MLA gfx942 benches require Nix PLOW_BUNDLER")
-    endif()
+    if(PLOW_HSACO_ARCH STREQUAL "gfx942")
+        set(PLOW_MLA_HIPCC "$ENV{PLOW_HIPCC}")
+        set(PLOW_MLA_BUNDLER "$ENV{PLOW_BUNDLER}")
+        find_library(PLOW_AMDHIP64 amdhip64 PATHS "$ENV{ROCM_PATH}/lib" NO_DEFAULT_PATH)
+        set(PLOW_GFX942_PROBES_READY TRUE)
+        if(NOT PLOW_MLA_HIPCC MATCHES "^/nix/store/")
+            message(WARNING "Skipping gfx942 probes: Nix PLOW_HIPCC is unavailable")
+            set(PLOW_GFX942_PROBES_READY FALSE)
+        endif()
+        if(NOT PLOW_MLA_BUNDLER MATCHES "^/nix/store/")
+            message(WARNING "Skipping gfx942 probes: Nix PLOW_BUNDLER is unavailable")
+            set(PLOW_GFX942_PROBES_READY FALSE)
+        endif()
+        if(NOT PLOW_AMDHIP64 MATCHES "^/nix/store/")
+            message(WARNING "Skipping gfx942 probes: Nix amdhip64 is unavailable")
+            set(PLOW_GFX942_PROBES_READY FALSE)
+        endif()
+
+        if(PLOW_GFX942_PROBES_READY)
 
     set(MLA_PREFILL_BENCH_ELF ${CMAKE_CURRENT_BINARY_DIR}/mla_prefill_bench_gfx942.elf)
     add_custom_command(
@@ -174,13 +188,6 @@ if(PLOW_ROCM)
     # packets through the production gfx942 persistent interpreter object.
     set(MOE_A4W4_TEST_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tests/moe_prefill_a4w4_cdna3_test.hip)
     set_source_files_properties(${MOE_A4W4_TEST_SRC} PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x c++")
-    find_library(PLOW_AMDHIP64 amdhip64 PATHS "$ENV{ROCM_PATH}/lib" NO_DEFAULT_PATH)
-    if(NOT PLOW_AMDHIP64)
-        message(FATAL_ERROR "amdhip64 from the active Nix ROCm shell was not found")
-    endif()
-    if(NOT PLOW_AMDHIP64 MATCHES "^/nix/store/")
-        message(FATAL_ERROR "amdhip64 must resolve from the Nix store: ${PLOW_AMDHIP64}")
-    endif()
     set(MOE_A4W4_W2_TOUCH_ELF
         ${CMAKE_CURRENT_BINARY_DIR}/moe_prefill_a4w4_w2_touch_gfx942.elf)
     add_custom_command(
@@ -505,14 +512,8 @@ if(PLOW_ROCM)
 
     # Standalone gfx942 grouped A8W4 experiment. It is intentionally a raw code object plus a
     # module-loading host oracle: no production packet or interpreter arm is changed.
-    set(PLOW_A8W4_HIPCC "$ENV{PLOW_HIPCC}")
-    set(PLOW_A8W4_BUNDLER "$ENV{PLOW_BUNDLER}")
-    if(NOT PLOW_A8W4_HIPCC MATCHES "^/nix/store/")
-        message(FATAL_ERROR "A8W4 experiment hipcc must resolve from the Nix store")
-    endif()
-    if(NOT PLOW_A8W4_BUNDLER MATCHES "^/nix/store/")
-        message(FATAL_ERROR "A8W4 experiment bundler must resolve from the Nix store")
-    endif()
+    set(PLOW_A8W4_HIPCC "${PLOW_MLA_HIPCC}")
+    set(PLOW_A8W4_BUNDLER "${PLOW_MLA_BUNDLER}")
     set(MOE_A8W4_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tests/moe_prefill_a8w4_gfx942_test.hip)
     set(MOE_A8W4_ELF ${CMAKE_CURRENT_BINARY_DIR}/moe_prefill_a8w4_gfx942.elf)
     add_custom_command(
@@ -550,14 +551,8 @@ if(PLOW_ROCM)
     # Standalone K3 grouped W4A16 bridge control. It is deliberately not an interpreter arm:
     # CMake emits a private gfx942 code object from the device half of the source, while the host
     # half supplies routing/padding sentinels and the f64 oracle.
-    set(PLOW_W4A16_HIPCC "$ENV{PLOW_HIPCC}")
-    set(PLOW_W4A16_BUNDLER "$ENV{PLOW_BUNDLER}")
-    if(NOT PLOW_W4A16_HIPCC MATCHES "^/nix/store/")
-        message(FATAL_ERROR "W4A16 control hipcc must resolve from the Nix store")
-    endif()
-    if(NOT PLOW_W4A16_BUNDLER MATCHES "^/nix/store/")
-        message(FATAL_ERROR "W4A16 control bundler must resolve from the Nix store")
-    endif()
+    set(PLOW_W4A16_HIPCC "${PLOW_MLA_HIPCC}")
+    set(PLOW_W4A16_BUNDLER "${PLOW_MLA_BUNDLER}")
     set(MOE_W4A16_SRC
         ${CMAKE_CURRENT_SOURCE_DIR}/../tests/moe_prefill_w4a16_bridge_gfx942_test.hip)
     set(MOE_W4A16_ELF
@@ -588,6 +583,44 @@ if(PLOW_ROCM)
     target_link_libraries(moe_prefill_w4a16_bridge_gfx942_test PRIVATE ${PLOW_AMDHIP64} m)
     add_dependencies(moe_prefill_w4a16_bridge_gfx942_test
         moe_prefill_w4a16_bridge_gfx942_elf)
+
+    set(FP4_DEQUANT_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tests/fp4_dequant_cdna3_test.hip)
+    set(FP4_DEQUANT_BIN ${CMAKE_CURRENT_BINARY_DIR}/fp4_dequant_cdna3_test)
+    add_custom_command(
+        OUTPUT ${FP4_DEQUANT_BIN}
+        COMMAND "${PLOW_MLA_HIPCC}" --offload-arch=gfx942 -O3 -w
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                ${FP4_DEQUANT_SRC} -o ${FP4_DEQUANT_BIN}
+        DEPENDS ${FP4_DEQUANT_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_arch.h
+        VERBATIM)
+    add_custom_target(fp4_dequant_cdna3_test ALL DEPENDS ${FP4_DEQUANT_BIN})
+
+    add_test(NAME fp4_dequant_cdna3_oracle COMMAND ${FP4_DEQUANT_BIN})
+    set_tests_properties(fp4_dequant_cdna3_oracle
+        PROPERTIES LABELS "gpu;gfx942" RUN_SERIAL TRUE)
+    add_test(NAME kda_state_resident_gfx942_oracle
+        COMMAND kda_state_resident_gfx942_test ${KDA_STATE_RESIDENT_ELF})
+    add_test(NAME kda_journal_gfx942_oracle
+        COMMAND kda_journal_gfx942_test ${KDA_JOURNAL_ELF})
+    add_test(NAME k3_dspark_mla_gfx942_oracle
+        COMMAND k3_dspark_mla_gfx942_test ${K3_DSPARK_MLA_ELF})
+    add_test(NAME moe_prefill_a8w4_gfx942_oracle
+        COMMAND moe_prefill_a8w4_gfx942_test ${MOE_A8W4_ELF})
+    add_test(NAME moe_prefill_w4a16_gfx942_oracle
+        COMMAND moe_prefill_w4a16_bridge_gfx942_test ${MOE_W4A16_ELF})
+    set_tests_properties(
+        kda_state_resident_gfx942_oracle
+        kda_journal_gfx942_oracle
+        k3_dspark_mla_gfx942_oracle
+        moe_prefill_a8w4_gfx942_oracle
+        moe_prefill_w4a16_gfx942_oracle
+        PROPERTIES LABELS "gpu;gfx942" RUN_SERIAL TRUE)
+
+        endif()
+    endif()
 
     # qwen_interp_bench: same as above but Qwen3 shapes
     add_executable(qwen_interp_bench

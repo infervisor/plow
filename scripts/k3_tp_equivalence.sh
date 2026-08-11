@@ -81,7 +81,7 @@ fail() { echo "FAIL: $*"; exit 1; }
 
 CK="${PLOW_K3_CKPT:-/home/lava/models/k3_farm}"
 HS="${PLOW_K3_HSACO:-/home/lava/models/k3_mi325x/hsaco}"
-LEASE="$ROOT/perf-data/harness/gpulease"
+LEASE="$ROOT/perf-data/tools/gpulease"
 STEPS="${PLOW_K3_STEPS:-3}"
 COS="${PLOW_K3_COS:-0.9999}"
 PROMPT="${PLOW_K3_PROMPT:-1008,10484,318,15383,387}"   # "The capital of France is"

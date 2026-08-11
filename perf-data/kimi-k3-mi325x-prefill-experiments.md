@@ -46,7 +46,7 @@ nix develop --command cmake -S runtime -B /tmp/k3-kda-oracle-cmake-clang \
   -DCMAKE_HIP_COMPILER=/nix/store/9i3g77yxafyrsiphzmpljmq6j5xj4imx-rocm-therock-gfx94X-dcgpu-7.14.0/lib/llvm/bin/clang++
 nix develop --command cmake --build /tmp/k3-kda-oracle-cmake-clang \
   --target kda_state_resident_gfx942_test -- -j1
-nix develop --command perf-data/harness/gpulease -n 1 \
+nix develop --command perf-data/tools/gpulease -n 1 \
   kda-state-resident-oracle \
   /tmp/k3-kda-oracle-cmake-clang/bench/kda_state_resident_gfx942_test \
   /tmp/k3-kda-oracle-cmake-clang/bench/kda_state_resident_gfx942.elf
@@ -62,7 +62,7 @@ ARM=base PORT=8027
 nix develop --command env \
   PLOW_HSACO="/tmp/k3-kda-state-serve-$ARM" \
   PLOW_TP_AUDIT_COMPACT=1 PLOW_TTFT_LOG=1 \
-  perf-data/harness/gpulease -n 8 "k3-kda-prefill-$ARM" \
+  perf-data/tools/gpulease -n 8 "k3-kda-prefill-$ARM" \
   ./target/release/plowrt serve \
   --assets /home/lava/models/k3_mi325x_b16 --port "$PORT"
 
@@ -108,7 +108,7 @@ Build, oracle, and clean one-GPU timing:
 ```bash
 nix develop --command cmake --build /tmp/k3-kda-oracle-cmake-clang \
   --target moe_prefill_a4w4_cdna3_test -- -j1
-nix develop --command perf-data/harness/gpulease -n 1 \
+nix develop --command perf-data/tools/gpulease -n 1 \
   a4w4-w2-touch-oracle \
   /tmp/k3-kda-oracle-cmake-clang/bench/moe_prefill_a4w4_cdna3_test \
   /tmp/k3-kda-oracle-cmake-clang/bench/moe_prefill_a4w4_w2_touch_gfx942.elf
@@ -117,7 +117,7 @@ nix develop --command env MPA4C3_W2_TOUCH_BENCH=1 \
   PLOW_GPU=MI325X PLOW_TOOLCHAIN_LABEL=rocm-7.14.0-nix \
   PLOW_BUILD_ID=w2-touch-43960b \
   PLOW_LEASE_LABEL=a4w4-w2-touch-clean \
-  perf-data/harness/gpulease -n 1 a4w4-w2-touch-clean \
+  perf-data/tools/gpulease -n 1 a4w4-w2-touch-clean \
   /tmp/k3-kda-oracle-cmake-clang/bench/moe_prefill_a4w4_cdna3_test \
   /tmp/k3-kda-oracle-cmake-clang/bench/moe_prefill_a4w4_w2_touch_gfx942.elf
 ```

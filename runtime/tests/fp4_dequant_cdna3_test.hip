@@ -27,7 +27,7 @@
  *
  *   hipcc --offload-arch=gfx942 -O3 -w runtime/tests/fp4_dequant_cdna3_test.hip \
  *         -o /tmp/fp4dq -Iruntime/amd -Iruntime/common
- *   perf-data/harness/gpulease -n 1 fp4dq /tmp/fp4dq
+ *   perf-data/tools/gpulease -n 1 fp4dq /tmp/fp4dq
  */
 #include <hip/hip_runtime.h>
 #include <math.h>
