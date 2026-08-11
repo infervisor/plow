@@ -34,6 +34,7 @@ fn kimi_ref_cfg() -> GlmCfg {
         route_scale: 2.5,
         attn_scale: (48f32).powf(-0.5), // 1/sqrt(qk_nope+qk_rope = 48)
         rope_theta: Some(50_000.0),
+        rope_scale: RopeScale::None,
         prefix: "model.".into(),
         tp: 1,
         ep: false,
@@ -88,11 +89,14 @@ fn kimi_moe_sequence(use_fp8: bool, top_k: usize) -> Vec<u16> {
     ops.into_iter().map(|o| o as u16).collect()
 }
 
-/// Expected DENSE-block op sequence: shared MLA (12) + block-fp8 SwiGLU (gate/up + down) +
-/// residual. The GLM emitter's dense FFN is block-fp8 regardless of `use_fp8`, so Kimi's dense
-/// layer (layer 0) inherits those opcodes.
-fn kimi_dense_sequence() -> Vec<u16> {
+/// Expected DENSE-block op sequence: shared MLA (12) + fused SwiGLU + down + residual.
+fn kimi_dense_sequence(use_fp8: bool) -> Vec<u16> {
     use DevOp::*;
+    let (glu, down) = if use_fp8 {
+        (DenseGluFp8Blk, GemvFp8Blk)
+    } else {
+        (GemvGlu, Gemv)
+    };
     vec![
         RmsNorm,
         GemvQkv,
@@ -106,8 +110,8 @@ fn kimi_dense_sequence() -> Vec<u16> {
         Gemv,
         Residual,
         RmsNorm,
-        DenseGluFp8Blk,
-        GemvFp8Blk,
+        glu,
+        down,
         Residual,
     ]
     .into_iter()
@@ -192,12 +196,27 @@ fn kimi_block_descriptor_dense() {
     assert_eq!(d.dsa_role, None);
 }
 
+#[test]
+fn bf16_dense_block_uses_bf16_ops_and_no_scale_grids() {
+    let c = kimi_ref_cfg();
+    let (m, _) = glm_build_block(&c, 512, 256, 0..1, false, "kimi-ref", MlaArch::Kimi);
+    let ops: Vec<u16> = m.progs[0].insts.iter().map(|d| d.op).collect();
+    assert_eq!(ops, kimi_dense_sequence(false));
+    for tensor in &m.tensors {
+        assert!(
+            !tensor.name.contains("weight_scale_inv"),
+            "bf16 block declared an fp8 scale grid: {}",
+            tensor.name
+        );
+    }
+}
+
 /// A multi-layer `--block 0..2` extraction chains dense layer 0 then MoE layer 1, and the
 /// residual ping-pong lands the output back in `act.x` after an even layer count.
 #[test]
 fn kimi_block_multi_layer_chains() {
     let c = kimi_ref_cfg();
-    let mut want = kimi_dense_sequence(); // layer 0 (dense)
+    let mut want = kimi_dense_sequence(true); // layer 0 (dense)
     want.extend(kimi_moe_sequence(true, 4)); // layer 1 (MoE)
     assert_eq!(
         block_ops(&c, 512, 0..2, MlaArch::Kimi),

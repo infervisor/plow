@@ -30,12 +30,18 @@ pub enum RopeScale {
         high: f64,
         orig: f64,
     },
+    Yarn {
+        factor: f64,
+        beta_fast: f64,
+        beta_slow: f64,
+        orig: f64,
+    },
 }
 
 /// Llama-3.1 inv_freq rescaling: low frequencies (long wavelengths) are divided by `factor`, high
 /// frequencies pass through, with a smooth interpolation between. Mirrors HF
 /// `_compute_llama3_parameters`. [`RopeScale::None`] returns inv unchanged (Gemma/Qwen).
-fn scale_inv_freq(inv: f64, scale: RopeScale) -> f64 {
+fn scale_inv_freq(inv: f64, j: usize, hd: u32, theta: f64, scale: RopeScale) -> f64 {
     match scale {
         RopeScale::None => inv,
         RopeScale::Llama3 {
@@ -55,6 +61,27 @@ fn scale_inv_freq(inv: f64, scale: RopeScale) -> f64 {
                 let smooth = (orig / wl - low) / (high - low);
                 (1.0 - smooth) * inv / factor + smooth * inv
             }
+        }
+        RopeScale::Yarn {
+            factor,
+            beta_fast,
+            beta_slow,
+            orig,
+        } => {
+            let correction = |rotations: f64| {
+                hd as f64 * (orig / (rotations * 2.0 * std::f64::consts::PI)).ln()
+                    / (2.0 * theta.ln())
+            };
+            let low = correction(beta_fast).floor().max(0.0);
+            let high = correction(beta_slow).ceil().min(hd as f64 - 1.0);
+            let ramp = if low == high {
+                ((j as f64 - low) / 0.001).clamp(0.0, 1.0)
+            } else {
+                ((j as f64 - low) / (high - low)).clamp(0.0, 1.0)
+            };
+            let extrapolation_mask = 1.0 - ramp;
+            let interpolated = inv / factor;
+            interpolated * (1.0 - extrapolation_mask) + inv * extrapolation_mask
         }
     }
 }
@@ -78,7 +105,13 @@ pub fn rope_tables(t: u32, hd: u32, theta: f64, frac: f64, scale: RopeScale) -> 
     for p in 0..t as usize {
         for j in 0..h2 {
             let (c, s) = if j < rope_angles {
-                let inv = scale_inv_freq(1.0 / theta.powf(2.0 * j as f64 / hd as f64), scale);
+                let inv = scale_inv_freq(
+                    1.0 / theta.powf(2.0 * j as f64 / hd as f64),
+                    j,
+                    hd,
+                    theta,
+                    scale,
+                );
                 let a = p as f64 * inv;
                 (a.cos(), a.sin())
             } else {
@@ -153,6 +186,8 @@ pub const GEN_TMAP_KV_PAIR: u32 = 6;
 pub const ROPE_SCALE_NONE: u32 = 0;
 /// [`GenTensor::scale`]: Llama-3.1 smooth low-frequency rescaling.
 pub const ROPE_SCALE_LLAMA3: u32 = 1;
+/// [`GenTensor::scale`]: YaRN smooth interpolation/extrapolation blend.
+pub const ROPE_SCALE_YARN: u32 = 2;
 
 /// A recipe for one tensor the runtime materialises at bind time instead of
 /// reading from the blob's init section. Mirrors `PlowGenTensor` in
@@ -222,6 +257,12 @@ impl GenTensor {
                 high: self.high,
                 orig: self.orig,
             },
+            ROPE_SCALE_YARN => RopeScale::Yarn {
+                factor: self.factor,
+                beta_fast: self.low,
+                beta_slow: self.high,
+                orig: self.orig,
+            },
             _ => RopeScale::None,
         };
         let (cos, sin) = match self.kind {
@@ -250,6 +291,12 @@ impl GenTensor {
                 high,
                 orig,
             } => (ROPE_SCALE_LLAMA3, factor, low, high, orig),
+            RopeScale::Yarn {
+                factor,
+                beta_fast,
+                beta_slow,
+                orig,
+            } => (ROPE_SCALE_YARN, factor, beta_fast, beta_slow, orig),
         };
         let base = GenTensor {
             tensor: 0,
@@ -378,6 +425,20 @@ mod tests {
         };
         let (cos, sin) = rope_tables(256, 128, 500_000.0, 1.0, scale);
         let [gc, gs] = GenTensor::rope_pair(256, 128, 500_000.0, 1.0, scale);
+        assert_eq!(gc.generate().unwrap(), cos);
+        assert_eq!(gs.generate().unwrap(), sin);
+    }
+
+    #[test]
+    fn recipe_roundtrips_yarn_scaling() {
+        let scale = RopeScale::Yarn {
+            factor: 32.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            orig: 32768.0,
+        };
+        let (cos, sin) = rope_tables(256, 64, 50_000.0, 1.0, scale);
+        let [gc, gs] = GenTensor::rope_pair(256, 64, 50_000.0, 1.0, scale);
         assert_eq!(gc.generate().unwrap(), cos);
         assert_eq!(gs.generate().unwrap(), sin);
     }

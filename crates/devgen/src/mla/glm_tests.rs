@@ -31,6 +31,7 @@ fn glm_ref_cfg() -> GlmCfg {
         route_scale: 2.5,
         attn_scale: (256f32).powf(-0.5),
         rope_theta: Some(8_000_000.0),
+        rope_scale: RopeScale::None,
         prefix: "model.".into(),
         tp: 1,
         ep: false,

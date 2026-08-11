@@ -134,6 +134,7 @@ PLOW_SASSERT(sizeof(PlowProgHeader) == 24, "PlowProgHeader size");
 /* PlowGenTensor.scale */
 #define PLOW_ROPE_SCALE_NONE   0u
 #define PLOW_ROPE_SCALE_LLAMA3 1u
+#define PLOW_ROPE_SCALE_YARN   2u
 
 /* Mirrors `packet::rope::GenTensor`; locked by crates/packet/tests/dev_abi.rs.
  * Flat union across every kind — slots a kind does not use are zero. */
