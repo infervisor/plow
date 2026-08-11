@@ -63,3 +63,14 @@ but skipped the requested compact cross-GPU counter audit. Commit `45851e1e`
 fixed the runtime path. Three corrected serving runs measure
 50.008--50.116 output tok/s with a 50.082 tok/s median and exact output/error
 gates; see `perf-data/kimi-k3-mi325x-b8-serve.md`.
+
+The official K3 recipe now exists at
+`https://recipes.vllm.ai/moonshotai/Kimi-K3?hardware=mi325x`. It requires a
+K3-enabled vLLM 0.27.0+ nightly engine; vLLM 0.26.0 remains the matched
+benchmark client. The published AMD image is
+`vllm/vllm-openai-rocm:kimi-k3`, currently
+`sha256:5aa7e626ff73672f5ca7aae46754570488c23d33ca1ac90756a1d2d1a3fe099b`
+(14.53 GB compressed). The AMD profile enables AITER, SiTUv2 A8W4, and
+full-decode graphs. This host has no Docker/Podman binary or runtime socket, so
+the engine arm remains blocked until a Nix-managed OCI runtime is added. Do not
+substitute the client-only `.#vllm` shell as an engine result.
