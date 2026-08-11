@@ -86,7 +86,7 @@ The server ran inside one eight-GPU `gpulease`:
 
 ```bash
 nix develop --command cp target/release/plowrt /tmp/k3-b16-mm16ctl-plowrt
-nix develop --command perf-data/harness/gpulease -n 8 k3-b16-mm16ctl \
+nix develop --command perf-data/tools/gpulease -n 8 k3-b16-mm16ctl \
   env PLOW_TP_AUDIT_COMPACT=1 PLOW_DSTEP_EVERY=1 PLOW_DSTEP_LOG=1 \
   /tmp/k3-b16-mm16ctl-plowrt serve \
   --assets /tmp/k3-b16-mm16ctl.yL0gEC --port 8026

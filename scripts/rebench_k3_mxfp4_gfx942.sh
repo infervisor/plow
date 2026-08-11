@@ -31,7 +31,7 @@ if [ "${PLOW_K3_MXFP4_WORKER:-0}" != 1 ]; then
         exit 2
     }
     mkdir -p "$(dirname "$JSONL")"
-    "$ROOT/perf-data/harness/gpulease" -n 1 "$LEASE" \
+    "$ROOT/perf-data/tools/gpulease" -n 1 "$LEASE" \
         env PLOW_K3_MXFP4_WORKER=1 "$0"
     cd "$ROOT"
     "$PLOWC" tune ingest --gpu MI325X --db tuning --samples "$JSONL" --campaign "$CAMPAIGN"

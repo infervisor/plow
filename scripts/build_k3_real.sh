@@ -7,7 +7,7 @@
 #   nix develop --command ./scripts/build_k3_real.sh [outdir]
 #   nix develop .#quantize --command env PYTHONNOUSERSITE=1 \
 #       python3 runtime/tests/k3_real_oracle.py <outdir>/k3_fixture.bin    # fixture, ONCE
-#   nix develop --command perf-data/harness/gpulease -n 1 k3-real \
+#   nix develop --command perf-data/tools/gpulease -n 1 k3-real \
 #       <outdir>/k3_block_test <outdir>/interp_decode_k3.elf <outdir>/k3_fixture.bin
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -157,7 +157,7 @@ nix develop -c env -u PLOW_STATE_CLEAR_DEVICE \
   PLOW_HSACO_LOWRUNG=/home/lava/plow/build-amd/k3-b1-ladder-grouped:1,/home/lava/plow/build-amd/k3-b2-ladder-grouped:2,/home/lava/plow/build-amd/k3-b4-ladder-grouped:4,/home/lava/plow/build-amd/k3-b8-ladder-grouped:8 \
   N=200 SHOTS=8 MAXTOK=320 CONC=1 GSM8K_TEMPERATURE=0 \
   PLOWRT_BIN=/tmp/k3-v2fp8-seg-ab-plowrt \
-  perf-data/harness/gpulease -n 8 k3-v2fp8-seg2-gsm8k \
+  perf-data/tools/gpulease -n 8 k3-v2fp8-seg2-gsm8k \
   scripts/bench_gsm8k.sh \
   /home/lava/models/k3_mi325x_ladder_router_v2fp8_seg2 8053 auto 1800
 ```

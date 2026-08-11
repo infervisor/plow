@@ -290,7 +290,7 @@ nix develop --command env \
   PLOW_HSACO_LOWRUNG=/home/lava/plow/build-amd/k3-b1-ladder-grouped:1,/home/lava/plow/build-amd/k3-b2-ladder-grouped:2,/home/lava/plow/build-amd/k3-b4-ladder-grouped:4,/home/lava/plow/build-amd/k3-b8-ladder-grouped:8 \
   PLOW_DSTEP_LOG=1 \
   PLOW_DSTEP_EVERY=64 \
-  perf-data/harness/gpulease -n 8 k3-ladder-slo-serve \
+  perf-data/tools/gpulease -n 8 k3-ladder-slo-serve \
   ./target/release/plowrt serve \
   --assets /home/lava/models/k3_mi325x_ladder_router \
   --port 8018

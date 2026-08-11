@@ -21,6 +21,10 @@ jobs:
     runs-on: [self-hosted, linux]
     steps:
       - uses: actions/checkout@v4
+      - name: Reject stale perf tool paths
+        run: |
+          old_path='perf-data/'"harness/"
+          ! git grep -n --fixed-strings "$old_path" -- .
       - name: Enter Nix shell
         run: nix develop --command true
       - name: Build default package
@@ -34,6 +38,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Reject stale perf tool paths
+        run: |
+          old_path='perf-data/'"harness/"
+          ! git grep -n --fixed-strings "$old_path" -- .
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt

@@ -24,13 +24,13 @@ if(PLOW_ROCM)
             OUTPUT ${output}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/ceiling
             COMMAND ${PLOW_HSACO_HIPCC} --genco
-                    --offload-arch=${PLOW_HSACO_ARCH} -O3 -w
+                    --offload-arch=${PLOW_HIP_ARCH} -O3 -w
                     -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
                     -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
                     -I ${CMAKE_CURRENT_SOURCE_DIR}/../../include
                     ${source} -o ${bundle}
             COMMAND ${PLOW_HSACO_BUNDLER} --unbundle --type=o
-                    --targets=hipv4-amdgcn-amd-amdhsa--${PLOW_HSACO_ARCH}
+                    --targets=hipv4-amdgcn-amd-amdhsa--${PLOW_HIP_ARCH}
                     --input=${bundle} --output=${output}
             COMMAND ${CMAKE_COMMAND} -E rm -f ${bundle}
             DEPENDS ${source}

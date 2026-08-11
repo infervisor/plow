@@ -57,7 +57,7 @@ nix develop --command bash scripts/build_gfx942.sh /tmp/plow-gfx942-hsaco
 nix develop --command env PLOW_STAGE4_CLEARED=1 PLOW_GPU=MI325X \
   PLOW_TOOLCHAIN_LABEL=rocm-7.14.0-nix PLOW_BUILD_ID=<git-revision> \
   PLOW_LEASE_LABEL=mi325x-mxfp4 PLOW_GEMM_JSONL=/tmp/interp-mxfp4.jsonl \
-  perf-data/harness/gpulease -n 1 mi325x-mxfp4 \
+  perf-data/tools/gpulease -n 1 mi325x-mxfp4 \
   runtime/build/bench/interp/interp_mxfp4_bench \
   /tmp/plow-gfx942-hsaco/interp_prefill_k3_moe_a4w4.elf 4096 4224 7168 k3-tp8
 ```
@@ -88,7 +88,7 @@ nix develop --command env PLOW_STAGE4_CLEARED=1 PLOW_GPU=MI325X \
   PLOW_TOOLCHAIN_LABEL=rocm-7.14.0-nix PLOW_BUILD_ID=<git-revision> \
   PLOW_GM_BM=192 PLOW_GM_BK=64 PLOW_GM_DBUF=1 \
   PLOW_LEASE_LABEL=k3-mxfp4-glu PLOW_GEMM_GLU_JSONL=/tmp/k3-mxfp4-glu.jsonl \
-  perf-data/harness/gpulease -n 1 k3-mxfp4-glu \
+  perf-data/tools/gpulease -n 1 k3-mxfp4-glu \
   runtime/build/bench/interp_mxfp4_glu_gfx942 \
   /tmp/plow-gfx942-hsaco/interp_prefill_k3_moe_a4w4.elf 4096 768 7168 15
 ```
@@ -112,7 +112,7 @@ nix develop --command env PLOW_ROWS_ONLY=interp_prefill_fp8kv_k3_moe_a4w4 JOBS=1
   scripts/build_gfx942.sh /tmp/k3-a4w4
 
 nix develop --command env MPA4C3_INTERP=1 \
-  perf-data/harness/gpulease -n 1 k3-a4w4-correct \
+  perf-data/tools/gpulease -n 1 k3-a4w4-correct \
   build-amd/k3-mi325x-roof/bench/moe_prefill_a4w4_cdna3_test \
   /tmp/k3-a4w4/interp_prefill_fp8kv_k3_moe_a4w4.elf
 
@@ -120,7 +120,7 @@ nix develop --command env MPA4C3_INTERP=1 MPA4C3_BENCH=1 \
   MPA4C3_JSONL=/tmp/k3-a4w4.jsonl PLOW_STAGE4_CLEARED=1 PLOW_GPU=MI325X \
   PLOW_TOOLCHAIN_LABEL=rocm-7.14.0-nix PLOW_BUILD_ID=<object-sha> \
   PLOW_LEASE_LABEL=k3-a4w4 PLOW_MFMA_TFLOPS=1063.1 PLOW_HBM_GBPS=4164 \
-  perf-data/harness/gpulease -n 1 k3-a4w4 \
+  perf-data/tools/gpulease -n 1 k3-a4w4 \
   build-amd/k3-mi325x-roof/bench/moe_prefill_a4w4_cdna3_test \
   /tmp/k3-a4w4/interp_prefill_fp8kv_k3_moe_a4w4.elf
 ```

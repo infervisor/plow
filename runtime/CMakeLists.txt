@@ -725,7 +725,7 @@ if(PLOW_GFX950_HSACO)
     # THE AXES. No row below spells out a define set; every row is axes only.
     set(_hs_ax_none "")
     set(_hs_ax_prefill -DPLOW_BUCKET_DECODE=0)
-    if(PLOW_XR_AGG)
+    if(PLOW_XR_AGG AND PLOW_HSACO_ARCH STREQUAL "gfx942")
         list(APPEND _hs_ax_prefill -DPLOW_XR_AGG=1)
     endif()
     # next_pow2(PLOW_DECODE_BATCH), clamped to PLOW_GEMV_MAXM (16). One instantiation with a

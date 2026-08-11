@@ -79,7 +79,7 @@ Link both arms to the same `hsaco/`, then run:
 
 ```bash
 nix develop --command env PLOW_TP_AUDIT_DIRECT=1 BATCHED=0 STEPS=64 \
-  perf-data/harness/gpulease -n 8 k3-gemv-wg152-ab \
+  perf-data/tools/gpulease -n 8 k3-gemv-wg152-ab \
   scripts/k3_ab_bench.sh ctl /tmp/k3-wgctl wg152 /tmp/k3-wg152 4 0
 ```
 

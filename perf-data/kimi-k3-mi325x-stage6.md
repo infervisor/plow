@@ -62,7 +62,7 @@ ms/token before any device-kernel change.
 ```bash
 nix develop --command env \
   PLOW_L2_PLACE_DISPATCH=1 PLOW_TP_AUDIT_DIRECT=1 \
-  perf-data/harness/gpulease -n 8 k3-mi325x-audit-direct \
+  perf-data/tools/gpulease -n 8 k3-mi325x-audit-direct \
   ./target/release/plowrt amd-bench \
   --blob /home/lava/models/k3_mi325x/model.pkt \
   --hsaco /home/lava/models/k3_mi325x/hsaco \
@@ -95,7 +95,7 @@ gate also passed on this exact packet/object/runtime combination.
 ```bash
 nix develop --command env \
   PLOW_L2_PLACE_DISPATCH=1 PLOW_TP_AUDIT_COMPACT=1 \
-  perf-data/harness/gpulease -n 8 k3-mi325x-serve \
+  perf-data/tools/gpulease -n 8 k3-mi325x-serve \
   ./target/release/plowrt serve \
   --assets /home/lava/models/k3_mi325x --port 8000
 ```

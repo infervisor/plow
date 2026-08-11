@@ -36,7 +36,7 @@
  *       --target moe_prefill_a4w4_cdna3_test
  *   nix develop --command env PLOW_ROWS_ONLY=interp_prefill_fp8kv_k3_moe_a4w4 JOBS=1 \
  *       scripts/build_gfx942.sh /tmp/k3-a4w4
- *   nix develop --command env MPA4C3_INTERP=1 perf-data/harness/gpulease -n 1 mpa4c3 \
+ *   nix develop --command env MPA4C3_INTERP=1 perf-data/tools/gpulease -n 1 mpa4c3 \
  *       build-amd/k3-mi325x-roof/bench/moe_prefill_a4w4_cdna3_test \
  *       /tmp/k3-a4w4/interp_prefill_fp8kv_k3_moe_a4w4.elf
  *

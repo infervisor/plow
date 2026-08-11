@@ -58,7 +58,7 @@ nix develop --command env \
   PLOW_CTR_DBUF=1 \
   PLOW_DSTEP_LOG=1 \
   PLOW_DSTEP_EVERY=64 \
-  perf-data/harness/gpulease -n 8 k3-ladder-slo-serve \
+  perf-data/tools/gpulease -n 8 k3-ladder-slo-serve \
   /tmp/k3-ladder-slo-plowrt serve \
   --assets /home/lava/models/k3_mi325x_ladder_router --port 8018
 ```

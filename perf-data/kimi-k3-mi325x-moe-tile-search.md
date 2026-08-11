@@ -111,7 +111,7 @@ nix develop --command env \
   PLOW_L2_PLACE_DISPATCH=1 PLOW_TP_AUDIT_COMPACT=1 PLOW_CTR_DBUF=1 \
   PLOW_DSTEP_LOG=1 PLOW_DSTEP_EVERY=64 \
   PLOW_HSACO_LOWRUNG=/home/lava/plow/build-amd/k3-b1-ladder-grouped:1,/home/lava/plow/build-amd/k3-b2-ladder-grouped:2,/home/lava/plow/build-amd/k3-b4-ladder-grouped:4,/home/lava/plow/build-amd/k3-b8-ladder-grouped:8 \
-  perf-data/harness/gpulease -n 8 k3-tile-default \
+  perf-data/tools/gpulease -n 8 k3-tile-default \
   ./target/release/plowrt serve \
   --assets /home/lava/models/k3_mi325x_ladder_router_v2fp8_seg2 --port 8054
 ```

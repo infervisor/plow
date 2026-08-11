@@ -4,7 +4,7 @@
 //   "$PLOW_HIPCC" --offload-arch=gfx942 -O3 -std=c++17 \
 //     runtime/bench/dispatch/control_queue_dispatch_floor.hip -o /tmp/plow-control-floor
 // Run only under a GPU lease:
-//   perf-data/harness/gpulease -n 1 control-floor /tmp/plow-control-floor
+//   perf-data/tools/gpulease -n 1 control-floor /tmp/plow-control-floor
 //
 // The baseline and resident arms execute the same grid, block size, and synthetic one-rung body.
 // This bounds outer dispatch savings; it does not execute a K3 packet program and makes no K3

@@ -50,7 +50,7 @@ Exact measured build and run:
 nix develop -c bash -lc '"$PLOW_HIPCC" --offload-arch=gfx942 -O3 -std=c++17 \
   -Wall -Wextra -Werror runtime/bench/dispatch/control_queue_dispatch_floor.hip \
   -o /tmp/plow-control-floor-gfx942'
-nix develop -c bash -lc 'perf-data/harness/gpulease -n 1 control-floor \
+nix develop -c bash -lc 'perf-data/tools/gpulease -n 1 control-floor \
   /tmp/plow-control-floor-gfx942 10000 > /tmp/plow-control-floor-result.json'
 ```
 

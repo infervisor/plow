@@ -38,7 +38,7 @@ nix develop --command env \
   PLOW_L2_PLACE_DISPATCH=1 PLOW_TP_AUDIT_COMPACT=1 \
   N=200 SHOTS=8 MAXTOK=320 CONC=1 \
   PLOWRT_BIN=/home/lava/plow/target/release/plowrt \
-  perf-data/harness/gpulease -n 8 k3-mi325x-gsm8k \
+  perf-data/tools/gpulease -n 8 k3-mi325x-gsm8k \
   scripts/bench_gsm8k.sh /home/lava/models/k3_mi325x 8196 auto 1800
 ```
 
@@ -74,3 +74,11 @@ to vLLM 0.27.0 as well. The published AMD image is
 full-decode graphs. This host has no Docker/Podman binary or runtime socket, so
 the engine arm remains blocked until a Nix-managed OCI runtime is added. Do not
 substitute the client-only `.#vllm` shell as an engine result.
+
+## Merge disposition
+
+This is a known-open comparison gate, not a merge blocker. The Plow accuracy and
+capacity results above remain valid without a cross-engine number. Re-run the
+same-session comparator when the bring-up container provides the pinned OCI
+engine; until then, report the comparator as unavailable rather than borrowing a
+result from another architecture or session.
