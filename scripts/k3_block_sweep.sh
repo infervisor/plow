@@ -52,7 +52,7 @@ export PLOW_K3_HSACO_DIR="$HS"
 export PLOW_K3_CHECKPOINT="$CK"
 export PLOW_K3_PROMPT_IDS="${PLOW_K3_PROMPT:-1008,10484,318,15383,387}"
 export PLOW_K3_STEP_COUNT="$STEPS"
-"$ROOT/perf-data/harness/gpulease" -n 8 k3-mi325x-block-sweep \
+"$ROOT/perf-data/tools/gpulease" -n 8 k3-mi325x-block-sweep \
   bash -c 'set -euo pipefail
     IFS=, read -ra ctxs <<< "$PLOW_K3_CTXS"
     for ctx in "${ctxs[@]}"; do

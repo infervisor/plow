@@ -6,6 +6,10 @@ At every join it selects the predecessor that actually finished last, then
 charges the elapsed time from that predecessor's completion to the consumer's
 completion. The charges telescope to the traced step span while preserving
 overlap on sibling branches.
+
+`pre_body` is the spine charge minus this packet's traced work envelope. At a
+join it includes work on the hidden sibling subtree; it is not a packet-local
+queue-stall estimate.
 """
 
 import argparse
@@ -43,6 +47,8 @@ def main():
     parser.add_argument("trace")
     parser.add_argument("disasm_json")
     parser.add_argument("--top", type=int, default=30)
+    parser.add_argument("--gemv-shapes", action="store_true")
+    parser.add_argument("--gemv-instances", type=int, default=0)
     args = parser.parse_args()
 
     packets = fold_trace(args.trace)
@@ -88,6 +94,8 @@ def main():
     start = min(packet[2] for packet in packets.values())
     final_end = packets[spine[-1]][4]
     aggregate = defaultdict(lambda: [0, 0.0, 0.0, 0.0])
+    gemv_shapes = defaultdict(lambda: [0, 0.0, 0.0, 0.0])
+    gemv_instances = []
     previous_end = start
     total_charge = 0.0
     for idx in spine:
@@ -103,6 +111,40 @@ def main():
         row[1] += charge
         row[2] += pre_body
         row[3] += body
+        if name == "Gemv":
+            values = {value["name"]: value["value"] for value in insts[idx]["ints"]}
+            shape = (
+                values["N"],
+                values["K"],
+                insts[idx]["blocks"],
+                values["norm"],
+            )
+            shape_row = gemv_shapes[shape]
+            shape_row[0] += 1
+            shape_row[1] += charge
+            shape_row[2] += pre_body
+            shape_row[3] += body
+            weight = next(
+                value.get("tensor", "")
+                for value in insts[idx]["tensors"]
+                if value["name"] == "W"
+            )
+            predecessor = predecessors[idx]
+            latest = max(predecessor, key=lambda value: packets[value][4]) if predecessor else None
+            gemv_instances.append(
+                (
+                    charge,
+                    idx,
+                    values["N"],
+                    values["K"],
+                    insts[idx]["blocks"],
+                    pre_body,
+                    body,
+                    latest,
+                    insts[latest]["op_name"] if latest is not None else "-",
+                    weight,
+                )
+            )
         total_charge += charge
         previous_end = end
 
@@ -120,6 +162,29 @@ def main():
     )[: args.top]:
         print(f"{name:<30}{count:>6}{charge:>13.3f}{pre_body:>13.3f}{body:>13.3f}")
     print(f"{'TOTAL':<30}{len(spine):>6}{total_charge:>13.3f}")
+    if args.gemv_shapes:
+        print()
+        print(f"{'N':>8}{'K':>8}{'grid':>8}{'norm':>7}{'n':>6}{'charge_us':>13}{'pre_body':>13}{'body_us':>13}")
+        for (n, k, grid, norm), (count, charge, pre_body, body) in sorted(
+            gemv_shapes.items(), key=lambda item: -item[1][1]
+        ):
+            print(
+                f"{n:>8}{k:>8}{grid:>8}{norm:>7}{count:>6}"
+                f"{charge:>13.3f}{pre_body:>13.3f}{body:>13.3f}"
+            )
+    if args.gemv_instances:
+        print()
+        print(
+            f"{'idx':>6}{'N':>8}{'K':>8}{'grid':>8}{'charge':>11}{'pre_body':>11}"
+            f"{'body':>11}{'pred':>8} {'pred_op':<20} weight"
+        )
+        for charge, idx, n, k, grid, pre_body, body, latest, pred_op, weight in sorted(
+            gemv_instances, reverse=True
+        )[: args.gemv_instances]:
+            print(
+                f"{idx:>6}{n:>8}{k:>8}{grid:>8}{charge:>11.3f}{pre_body:>11.3f}"
+                f"{body:>11.3f}{('-' if latest is None else latest):>8} {pred_op:<20} {weight}"
+            )
 
 
 if __name__ == "__main__":
