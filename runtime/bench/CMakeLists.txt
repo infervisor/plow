@@ -201,6 +201,32 @@ if(PLOW_ROCM)
     target_link_libraries(k3_gemv_grid_sweep PRIVATE ${PLOW_AMDHIP64} m)
     add_dependencies(k3_gemv_grid_sweep k3_gemv_grid_sweep_gfx942_object)
 
+    # Model-free full-grid screen for replacing K3 B1 dense BF16 weights with
+    # block-scaled E4M3 W8A16. Only candidates projecting >=5 ms/token proceed
+    # to checkpoint conversion and TP8 serving.
+    set(K3_GEMV_W8_CO ${CMAKE_CURRENT_BINARY_DIR}/k3_gemv_w8a16_sweep_gfx942.co)
+    add_custom_command(
+        OUTPUT ${K3_GEMV_W8_CO}
+        COMMAND "$ENV{PLOW_HIPCC}" --offload-arch=gfx942 -O3 -w -std=c++17 --genco
+                -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=1 -DPLOW_K3=1
+                -DGV_UNROLL=14 -DPLOW_FP8_KV=1 -DPLOW_GEMV_LG=1
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                ${CMAKE_CURRENT_SOURCE_DIR}/amd/k3_gemv_w8a16_sweep.hip
+                -o ${K3_GEMV_W8_CO}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/amd/k3_gemv_w8a16_sweep.hip
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_gemm.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
+        VERBATIM)
+    add_custom_target(k3_gemv_w8a16_sweep_gfx942_object DEPENDS ${K3_GEMV_W8_CO})
+    add_executable(k3_gemv_w8a16_sweep amd/k3_gemv_w8a16_sweep.cpp)
+    target_compile_features(k3_gemv_w8a16_sweep PRIVATE cxx_std_17)
+    target_include_directories(k3_gemv_w8a16_sweep PRIVATE "$ENV{ROCM_PATH}/include")
+    target_compile_definitions(k3_gemv_w8a16_sweep PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_compile_options(k3_gemv_w8a16_sweep PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(k3_gemv_w8a16_sweep PRIVATE ${PLOW_AMDHIP64} m)
+    add_dependencies(k3_gemv_w8a16_sweep k3_gemv_w8a16_sweep_gfx942_object)
+
     # Exact K3 B1 FP8 MLA single-op sweep. GF4 is the shipped control; GF6/GF12
     # test latent-row reuse before any interpreter or packet change.
     set(K3_MLA_GF_CO ${CMAKE_CURRENT_BINARY_DIR}/k3_mla_gf_sweep_gfx942.co)
