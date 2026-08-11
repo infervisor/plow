@@ -64,7 +64,7 @@ pub struct Campaign {
     /// Output JSONL of raw samples.
     pub samples: PathBuf,
     pub shapes: ShapeSource,
-    /// Wrap every GPU invocation in `perf-data/harness/gpulease -n 1`. Off by default, matching
+    /// Wrap every GPU invocation in `perf-data/tools/gpulease -n 1`. Off by default, matching
     /// the bash script, whose caller holds the lease.
     pub lease: bool,
     /// Skip the publish step. For an A/B that only wants the JSONL.
@@ -472,7 +472,7 @@ fn measure(
     // by the time we reach this point the gid is present because preflight refused otherwise.
     if lease {
         let mut wrapped = vec![
-            root.join("perf-data/harness/gpulease")
+            root.join("perf-data/tools/gpulease")
                 .to_string_lossy()
                 .into_owned(),
             "-n".into(),

@@ -12,7 +12,7 @@
  *         perf-data/glm52_gemvblk_bench.hip -o /tmp/gvb.co -Iruntime/amd -Iruntime/common
  *   g++ -O2 -std=c++17 perf-data/glm52_gemvblk_bench.cpp -o /tmp/gvb \
  *         -I/opt/rocm/include -D__HIP_PLATFORM_AMD__ -L/opt/rocm/lib -lamdhip64
- *   perf-data/harness/gpulease -n 1 gvb sg render -c \
+ *   perf-data/tools/gpulease -n 1 gvb sg render -c \
  *         'unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES; /tmp/gvb /tmp/gvb.co 256 21'
  * `unset HIP_VISIBLE_DEVICES` is load-bearing: gpulease exports BOTH it and ROCR to the same
  * absolute id and they COMPOSE, so hipInit reports "no ROCm-capable device" on a leased GPU. */

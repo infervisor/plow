@@ -479,7 +479,7 @@ struct TuneCli {
     #[arg(long, default_value = "auto", value_name = "auto|FILE")]
     shapes: String,
 
-    /// `gemm`: wrap every GPU invocation in `perf-data/harness/gpulease -n 1`. Off by default,
+    /// `gemm`: wrap every GPU invocation in `perf-data/tools/gpulease -n 1`. Off by default,
     /// matching the bash script, whose caller holds the lease.
     #[arg(long)]
     lease: bool,

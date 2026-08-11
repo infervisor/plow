@@ -1,7 +1,7 @@
 # PX-12 — the §2b cell re-run with the campaign's corrections applied
 
 RTX 5090 (sm_120a, 170 SM, 32 GiB / 31.36 usable, driver 580.159.03) · 2026-07-26 ·
-Gemma-4-12B-it, fp8 weights (W8A8). Every GPU run under `perf-data/harness/gpulease`.
+Gemma-4-12B-it, fp8 weights (W8A8). Every GPU run under `perf-data/tools/gpulease`.
 Companion to `perf-data/gemma4-12b-longctx-5090.md` (§2b is the cell), `px10-batched-decode.md`,
 `px11-flash-decode.md`. Those documents are **not edited**; corrections to them are stated here.
 
@@ -154,7 +154,7 @@ a different merge), so it needs its own greedy gate.
 | FASTPF legality on `/root/plow-out/lc-b8` | **FAIL, and that is the finding** — `CUDA_ERROR_LAUNCH_FAILED` at an 18-token prompt. lc-b8 is an all-layer fp8-KV packet (§0a) |
 | PX-11's isolated bench reproduces on this GPU | **PASS** — GF=4/ns=32 2.6806 vs PX-11's 2.6918; GF=8/ns=21 1.7969 vs 1.7656 (2–4%, inside PX-11's stated band) |
 | GF bit-exactness at fixed nsplit | **PASS** — `maxdiff` 0.000e+00 in every cell of the re-run |
-| GPU exclusive | **ENFORCED** — every run under `perf-data/harness/gpulease`, rc=0, no foreign-process warning |
+| GPU exclusive | **ENFORCED** — every run under `perf-data/tools/gpulease`, rc=0, no foreign-process warning |
 | GPU health cross-check | **PASS** — the bandwidth ladder reproduces the in-tree ceiling, so the slow prefill in §2 is the build, not the card |
 | TTFT / TPOT | **NOT REPORTED, deliberately** — invalid for plow (role-only SSE chunk poisons the first ITL sample) |
 | **GEMV vs flash split of the tuned arm's +9.3%** | **NOT RUN** — needs two more full cells; one per arm was the budget |

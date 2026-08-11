@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
 
     /* fp8 weight twins (PLOW_FP8_DIR). A fp8 decode packet declares uint8 weights + f32 scales
      * under an "fp8/" name prefix (crates/plowc/src/bin/gemma4.rs w8()/sc()); this dir holds
-     * their quantized bytes (perf-data/harness/quantize_fp8.py output, one model.safetensors).
+     * their quantized bytes (perf-data/tools/quantize_fp8.py output, one model.safetensors).
      * st_find ignores the dtype string, so the raw byte range is bound verbatim. */
     Safet Sf;
     int have_fp8 = 0;

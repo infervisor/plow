@@ -24,7 +24,7 @@
  *   3. the output hash is asserted != the ZERO-plane hash and != the reference hash of a
  *      DIFFERENT shape, so a degenerate (all-zero / all-NaN / stuck) output cannot pass.
  *
- * Run under perf-data/harness/gpulease.  Build: perf-data/px23_build.sh
+ * Run under perf-data/tools/gpulease.  Build: perf-data/px23_build.sh
  */
 #include <cstdio>
 #include <cstdint>

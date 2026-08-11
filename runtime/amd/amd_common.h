@@ -188,7 +188,7 @@ __device__ __forceinline__ bf16v8 ld_glob8_nt(const PLOW_GLOB bf16* p) {
  * has almost nothing to write back. That is a cheaper fence, not a deleted one. Its timing is
  * NOT recorded here: every A/B this campaign ran was contended by a concurrent agent holding
  * all 8 GPUs, and a bare `flock /tmp/plow_gpu.lock` neither waits for nor warns about that —
- * use `perf-data/harness/gpulease`, which does both. The one arm measured both ways
+ * use `perf-data/tools/gpulease`, which does both. The one arm measured both ways
  * contradicted itself by 12.6 ms (46.418 at position 2 vs 33.802 at position 1).
  *
  * SCOPE, AND WHY ONE AND NOT TWO. Activation stores are really two classes —

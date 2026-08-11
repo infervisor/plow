@@ -3,7 +3,7 @@
 RTX 5090 (sm_120a, 170 SM, 32 GiB, driver 580.159.03), Gemma-4-12B unified,
 fp8 weights (W8A8) + bf16 sliding KV + fp8 full-layer KV — the config the
 concurrency-8 127k measurement in `perf-data/gemma4-12b-longctx-5090.md` §8 ran.
-All GPU runs under `perf-data/harness/gpulease`.
+All GPU runs under `perf-data/tools/gpulease`.
 
 **Verdict: the gap is NOT long-context and NOT the sliding layers. It is a pure
 BATCH effect, it appears as a single discontinuity at B=4 → B=8, and it is two

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Sequential-EXCLUSIVE multi-arm showdown template (BRINGUP.md §2): every arm on
+# Sequential-EXCLUSIVE multi-arm showdown template (docs/bringup/07-perf-campaign.md): every arm on
 # the same box with the same client, one server at a time, medians over >=5
 # rounds. Wrap the whole script in gpulease:
-#   perf-data/harness/gpulease showdown perf-data/harness/bringup_showdown.sh
+#   perf-data/tools/gpulease showdown perf-data/tools/bringup_showdown.sh
 #
 # Edit the CONFIG block and the arm list at the bottom for your model/box.
 set -u

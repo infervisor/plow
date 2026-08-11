@@ -3,7 +3,7 @@
 RTX 5090 (sm_120a, 170 SM, 96 MiB **unified** L2, 101,376 B smem optin) · Gemma-4-12B-it,
 w8a8 fp8 weights · single-block assets, layer **4 (sliding)** and layer **5 (full)** ·
 `crates/plowrt/examples/tilegraph_stat.rs` (added by this note) + `block_run bench` under
-`perf-data/harness/gpulease`.
+`perf-data/tools/gpulease`.
 
 Companion to `px18-egglog-wholemodel.md` (the compiler/graph axis) and `px9-gemm-body.md`
 (the kernel axis). **This is a NEGATIVE result delivered before implementation, at the
@@ -280,7 +280,7 @@ different compiled object.
 | **single-block measurement before any whole-model claim** | **PASSED** — §2/§5, one sliding (L4) and one full (L5) block, `block_run bench`, all four arms |
 | scheduler A/B (global queue vs static per-CU streams) | **PASSED** — §2, 2.36 vs 2.38 ms |
 | reproducibility | **PASSED** — L4 prefill 2.35 / 2.36 / 2.37 / 2.38 ms across four separate leases = **1.3%** spread, inside the 3% band |
-| GPU exclusive | **ENFORCED** — every run under `perf-data/harness/gpulease`; another run was active on the card and the lease serialised it |
+| GPU exclusive | **ENFORCED** — every run under `perf-data/tools/gpulease`; another run was active on the card and the lease serialised it |
 | **byte-identical blob when the feature is off** | **PASSED** — nothing was implemented, so there is no feature. The working tree touches exactly two files, both in `plowrt` (a new example + a comment-only conflict fix); `devgen`/`packet`/`plowc`/`runtime` are untouched. Re-emit hash: `b3c03f8c…011e9` for both the original and a fresh emit of `blk-slide` |
 | **byte-identical cubins** | **PASSED, structurally** — no `.cu`/`.cuh` was modified (`git status` shows zero files under `runtime/`) |
 | `cargo test --workspace` | **PASSED** — **95 suites, 666 tests, 0 failures** |

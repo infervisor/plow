@@ -8,7 +8,7 @@
 #   --dtype auto, VLLM_ROCM_USE_AITER=1, no --kv-cache-dtype, no --quantization.
 #
 # Usage:
-#   perf-data/harness/gpulease -n 4 vprec sg render -c \
+#   perf-data/tools/gpulease -n 4 vprec sg render -c \
 #       './scripts/glm52_vllm_precision_probe.sh 4 /home/lava/models/glm52_precision'
 #
 # WHY THE ARITHMETIC MATTERS. `kv_cache_dtype=auto` is a FLAG; what it resolved to is a

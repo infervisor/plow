@@ -4,5 +4,5 @@
 set -uo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export GPU_LEASE_TIMEOUT="${GPU_LEASE_TIMEOUT:-14400}"
-exec "$WT/perf-data/harness/gpulease" -n 4 glu-split sg render -c \
+exec "$WT/perf-data/tools/gpulease" -n 4 glu-split sg render -c \
   "cd '$WT' && unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES && nix develop -c bash scripts/glm52_glusplit_run.sh"

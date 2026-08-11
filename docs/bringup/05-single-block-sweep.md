@@ -8,11 +8,14 @@
 
 **Precondition:** Stages 1–4 complete — the model's config is understood, its
 weights load, and the emitter produces a full-model `model.pkt` without aborting.
+The [`target.md`](target.md) block is filled in and every command below is
+written against it (`--gpu $GPU --arch $ISA --n-cu $NCU`), never a literal part.
 
 **Gate out (into Stage 6, runtime optimization):** one block matches a host
 reference within tolerance **and** its isolated per-step latency is at or near
-the per-block target derived from a reference framework's TPOT. Only then is it
-worth optimizing the runtime around the whole model.
+the per-block target derived from a reference framework's TPOT **measured on
+`$GPU` itself**. Only then is it worth optimizing the runtime around the whole
+model.
 
 ---
 
@@ -34,10 +37,75 @@ There are two distinct questions, and they use different tools:
 
 | question | tool | reference |
 |---|---|---|
-| **Is the block correct?** | `plowrt amd-block` (A/B), or a C oracle harness | host/HF f64 or bf16 reference, bit-for-bit within tol |
-| **Is the block fast enough?** | `block_run bench` (Gemma path) or a truncated-model sweep (MLA path) | a reference framework's per-block floor |
+| **Is the block correct?** | `plowrt amd-block` (A/B, `$VENDOR = amd`), or a C oracle harness | host/HF f64 or bf16 reference, bit-for-bit within tol |
+| **Is the block fast enough?** | `block_run bench` (Gemma path) or a truncated-model sweep (MLA path) | a reference framework's per-block floor, measured on `$GPU` |
+
+Correctness is target-independent — the oracle is a host reference, and a block
+that matches it on one part matches it on another at the same precision.
+Latency is not: every number in Step 3 is a statement about `$GPU`.
 
 Do correctness first. A fast wrong block is worthless.
+
+---
+
+## Where this stage sits: the four-tier measurement ladder
+
+Every knob in the tree is scored at one of four tiers, and **which tier a knob
+belongs to is a property of the knob, not of your budget.** Scoring a knob at
+the wrong tier produces a confident wrong answer, not a noisy one. This stage is
+tier 2 — the one you should be doing most of your sweeping on.
+
+| tier | harness | cost per config | what it is for |
+|---|---|---|---|
+| 1 — prune | standalone kernel probes: `runtime/tests/*.c[u]`, `runtime/bench/**`, `runtime/nvidia/experiments/*.cu` | seconds, no blob | **correctness-gating a rung** and killing obviously-bad shapes. **Never trust its ranking.** |
+| 2 — sweep | `plowc --emit devblob --block` + `block_run bench`, or the truncated-model sweep for the MLA families (this stage) | seconds to ~a minute | the wide sweep — real `GpuEngine`, real megakernel, reproduces full-model ratios |
+| 3 — confirm | `examples/step_bench` — whole blob, real layer mix, no HTTP/mux | ~a minute | final scoring before serving |
+| 4 — accept | a serving client against `plowrt serve` ([Stage 7](07-perf-campaign.md)) | minutes | end-to-end, and the **only** tier that sees host-gap knobs |
+
+```bash
+nix develop --command bash -c 'cargo build --release -p plowrt $FEATURES --example step_bench'
+PLOW_STEP_TIME=1 ./target/release/examples/step_bench <assets> [slots] [ctx] [steps]
+```
+
+`scripts/tune_block_sweep.sh` automates tier 2; `scripts/tune_decode_sweep.sh`
+covers tier 1 → 3 (both are written against `$VENDOR = nvidia` — read their
+headers and re-point them at `$ISA`/`$GPU` before quoting a number).
+
+**Why tier 1 cannot score.** A standalone probe re-runs one kernel on hot inputs;
+its operands and outputs become cache-resident in ways a real forward pass never
+sees, and the ops that would co-schedule against it are absent. Recorded in both
+directions on measured campaigns: a probe win of +15% was −3 ms in-model, and a
+decode-GEMV lever scored **1.00× isolated where the megakernel measured 1.43×**
+— the same lever tier 2 put at 1.45×, i.e. within ~1.4% of the full model. A
+probe may motivate a variant or prune one; only an in-model gate + bench decides
+whether it lands. [Stage 4](04-kernel-tuning.md) and
+[Stage 7](07-perf-campaign.md) state the same law from their own sides.
+
+### What tier 2 cannot score
+
+A block sweep is not universal, and these four categories are the ones that
+silently return a null instead of an answer:
+
+* **Prefill dispatch/classing knobs** — per-object block size, segment classing,
+  segment graphs. The block harness drives the decode/single-segment path, so on
+  `$VENDOR = nvidia` the segmented prefill stack is only exercised at tier 4.
+* **Prefill bucket policy** (`PLOW_PF_COVER`, `PLOW_PF_CHUNK_COST`,
+  `PLOW_PF_LADDER_APPEND`) — needs *varied prompt lengths* to have any effect at
+  all, which means a client, i.e. tier 4.
+* **Host-gap knobs** (`PLOW_DEV_SAMPLE`, `PLOW_MULTISTEP`, `--slo-ms`) — their
+  effect is *between* kernels. No single-engine harness at any tier below 4 can
+  see them.
+* **`PLOW_MAX_CHUNK`** needs no benchmark at all: it is an analytic
+  memory-sizing decision derived from the model's window (the ring formula in
+  [Stage 6](06-runtime-opt.md)). Benchmarking it measures the wrong axis.
+
+Note also the harness caveat that makes tier 2 mis-report if ignored:
+`block_run --batch` selects *active slots*, not kernel width, so scoring a decode
+batch means emitting one block asset per `PLOW_DECODE_BATCH` you want to score.
+And layer kinds are not interchangeable — emit one block per kind and score the
+kind-weighted sum of **marginal** per-layer cost
+(`score = N_slide·L_slide + N_full·L_full`); the fixed per-block overhead and the
+lm_head cancel in a ranking.
 
 ---
 
@@ -141,6 +209,11 @@ The authoritative correctness check diffs plow's block output against an
 independent host reference (an HF-transformers oracle fixture, or an f64/bf16 CPU
 reference). One harness per family lives in `runtime/tests/`:
 
+The `_gfx950_` in these filenames is historical — it names the ISA they were
+first brought up on, not a restriction. The oracle they diff against is a host
+reference and is target-independent; what is target-specific is the interpreter
+object they load (`$BUILD`) and the device they run on.
+
 | family | harness | oracle |
 |---|---|---|
 | GLM-5.2 (`glm_moe_dsa`) | `runtime/tests/glm52_block_gfx950_test.c` | `glm52_oracle.py` fixture (HF transformers) |
@@ -184,12 +257,12 @@ per-pass **prefill** ms, both over a batch × context (B × T) grid, timed with
 device events (pure GPU time). Numerics are irrelevant to the *timing* — the
 per-step kernel time is data-independent — so a bench needs no correct weights.
 
-### Gemma / NVIDIA path (model-shaped block, `block_run bench`)
+### Gemma path (model-shaped block, `block_run bench`)
 
 ```bash
 # emit one Gemma-4 block:
-plowc --emit devblob --block 0 --max-ctx 4096 --n-cu 170 --gpu rtx5090 \
-  --hf-dir /path/to/gemma-hf-dir --out <asset>/
+plowc --emit devblob --block 0 --arch $ISA --gpu "$GPU" --n-cu $NCU \
+  --max-ctx $MAXCTX --hf-dir /path/to/gemma-hf-dir --out <asset>/
 
 # bench decode B×T and prefill:
 ./target/release/examples/block_run <asset> bench \
@@ -199,7 +272,7 @@ plowc --emit devblob --block 0 --max-ctx 4096 --n-cu 170 --gpu rtx5090 \
 `block_run bench` prefills B slots to T rows, times N decode steps per (B,T), and
 writes `sweep.json`. Both phases are timed with the same warmup / median / p95
 treatment; the decode step is held at a fixed context so shapes stay static and
-the step is CUDA-graph capturable.
+the step is graph-capturable on `$VENDOR = nvidia`.
 
 ### MLA family (GLM / Kimi / DeepSeek): truncated-model sweep
 
@@ -216,7 +289,9 @@ drive it. Two options:
 ./scripts/k3_block_sweep.sh                    # baseline
 ./scripts/k3_block_sweep.sh PLOW_K3_FUSE_A=1   # any emit knob, applied to the emit
 
-# GLM-5.2 few-layer prefill sweep (gfx942), kind-weighted per-layer score:
+# GLM-5.2 few-layer prefill sweep, kind-weighted per-layer score.
+# NOTE: this script is pinned to one ISA in its name and its flags — read its
+# header and re-point it at $ISA/$GPU before trusting a number from it.
 ./scripts/glm52_block_sweep_gfx942.sh
 ```
 
@@ -252,8 +327,8 @@ Per-op attribution (the target-to-beat by kernel, not just end-to-end):
 python3 scripts/block_op_bench.py <block-config>.json --phases decode,prefill --ctx 1024,4096
 ```
 
-For plow's own per-op breakdown, build a `-DPLOW_NV_TRACE=1` cubin and read
-`trace_reset` / `trace_summary` in `block_run`.
+For plow's own per-op breakdown on `$VENDOR = nvidia`, build the device object
+with `-DPLOW_NV_TRACE=1` and read `trace_reset` / `trace_summary` in `block_run`.
 
 ---
 
@@ -274,11 +349,17 @@ The block passes Stage 5 and gates into Stage 6 when **all** hold:
    NaN/Inf from `block_run check`.
 
 3. **Latency at target.** Isolated per-block decode us (and prefill ms) is at or
-   near the per-block floor derived from the reference-framework TPOT, and
-   `block_us × layers ≈ decode body` reconciles forward and reverse.
+   near the per-block floor derived from the reference-framework TPOT **measured
+   on `$GPU`**, and `block_us × layers ≈ decode body` reconciles forward and
+   reverse. The floor is a number for this part; a floor carried over from
+   another part does not satisfy this criterion.
 
 4. **Sweep is uncontended.** Every timed run is on a card to itself (`gpulease`
    rc=0). A contended run (rc=76) is discarded and re-measured, never reported.
+
+5. **The asset under test was built for this target.** The emit's `--gpu`/
+   `--arch`/`--n-cu` and the loaded device object (`$BUILD`) all name `$GPU` /
+   `$ISA`; a block benched against a foreign object measures the wrong machine.
 
 ---
 
@@ -291,25 +372,29 @@ The block passes Stage 5 and gates into Stage 6 when **all** hold:
 
 * **Isolated single-block decode over-states the norm floor.** A whole isolated
   block launches ~10 separate RMSNorm/RoPE/residual/combine kernels, each paying
-  a launch-latency floor at M=1 (measured ~180 us of the 356 us whole-block
-  number). plow fuses these into the packet, so that overhead is an artifact of
+  a launch-latency floor at M=1 (on one measured part, ~180 us of a 356 us
+  whole-block number — re-measure the split on `$GPU`, do not reuse the ratio).
+  plow fuses these into the packet, so that overhead is an artifact of
   running one block in isolation, not a real per-block cost in a full-model graph.
   **The transferable numbers are the per-op GEMV/attn rows, not the whole-block
   us.**
 
-* **An eager reference baseline flatters plow ~2.5×.** At decode (M=1) a block is
-  ~15–20 tiny ops; eager mode launches each separately (~100–150 us is pure launch
-  overhead). Capture the decode step into a CUDA graph (the block-baseline harness
-  does this by default) before comparing — an eager number is not a real target.
+* **An eager reference baseline flatters plow.** At decode (M=1) a block is
+  ~15–20 tiny ops; eager mode launches each separately, and on one measured part
+  that pure launch overhead was ~100–150 us — enough to flatter plow ~2.5×.
+  Capture the decode step into a device graph (the block-baseline harness does
+  this by default) before comparing — an eager number is not a real target.
 
 * **A few-instances-per-block op lands in noise.** A block has only ~4–5 MoE
   layers, so ablating `MoeRouterTopk` or `MoeCombine` on a block sweep is inside
-  timer noise (measured: base 3.184, router-ablated 3.152, combine-ablated 3.230
-  ms/token — one spread apart). Those need the full network.
+  timer noise (one measured campaign: base 3.184, router-ablated 3.152,
+  combine-ablated 3.230 ms/token — one spread apart). Those need the full
+  network. The spread is per-target; re-establish it on `$GPU` before calling an
+  ablation null.
 
 * **A tune knob measured on an isolated kernel can invert in the megakernel.**
   A GEMV harness once timed one `gemv_rows<16>` as equal to two `gemv_rows<8>`,
-  while in the real megakernel the same knob went 41.17 → 28.8 ms. A truncated
+  while in the real megakernel on the same part the knob went 41.17 → 28.8 ms. A truncated
   *model* blob runs the real megakernel and keeps the context an isolated kernel
   loses — prefer it for ranking runtime knobs.
 
@@ -320,20 +405,22 @@ The block passes Stage 5 and gates into Stage 6 when **all** hold:
   comparing MoE against a served number.
 
 * **Cross-GPU block numbers are not comparable.** A per-block floor is only valid
-  when the reference framework was measured on the *same* card. Re-anchor before
+  when the reference framework was measured on the *same* card — and this holds
+  between two parts at the same `$ISA` too, since they can differ in memory
+  subsystem and CU/SM count while emitting identical code. Re-anchor before
   claiming any ratio.
 
 * **The tune system is not always a lever.** On some GPU/precision paths all GEMM
   opcodes alias to one body with a fixed compile-time tile, and the decode GEMV
   has no tunable kernel at all. Confirm the tuner actually selects something
   before treating "tuned" as a step (see Stage 6). The real axis on such paths is
-  a build knob (rebuilding the interpreter cubin with different `-D` macros),
-  outside the tune system.
+  a build knob (rebuilding the device object via `$BUILD` with different `-D`
+  macros), outside the tune system.
 
-* **Driver / toolchain mismatch fails both halves silently-ish.** Prebuilt cubins
-  and a reference venv's runtime must match the installed driver
-  (`CUDA_ERROR_INVALID_IMAGE` / "driver too old" otherwise). Check before blaming
-  the block.
+* **Driver / toolchain mismatch fails both halves silently-ish.** Prebuilt device
+  objects and a reference venv's runtime must match the installed driver
+  (`CUDA_ERROR_INVALID_IMAGE` / "driver too old", or the HSA-side equivalent).
+  Confirm `$TOOLCHAIN` and the driver agree before blaming the block.
 
 ---
 

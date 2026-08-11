@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Token-identity correctness gate (see BRINGUP.md §1): serve a bundle, run fixed
+# Token-identity correctness gate (see docs/bringup/07-perf-campaign.md): serve a bundle, run fixed
 # greedy prompts, dump outputs for diffing against the reference arm.
 #   bringup_gate.sh <assets-dir> <tag> <port> [plowrt-binary]
 # Wrap in gpulease. Compare arms with: diff $BRINGUP_OUT/gate-out/<a>.txt <b>.txt

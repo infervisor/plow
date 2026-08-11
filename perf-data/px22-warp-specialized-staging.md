@@ -1,7 +1,7 @@
 # PX-22 — warp specialization DOES pay on sm_120a: 1.14x on the w8a8 prefill GEMM body, bit-exact
 
 RTX 5090 (sm_120a, 170 SMs, 96 MiB L2) · 2026-07-26 · bench `runtime/bench/nvidia/px22_ws_stage_bench.cu`,
-build `perf-data/px22_build.sh`, run under `perf-data/harness/gpulease`.
+build `perf-data/px22_build.sh`, run under `perf-data/tools/gpulease`.
 
 ## Question
 

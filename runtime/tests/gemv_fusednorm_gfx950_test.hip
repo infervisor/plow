@@ -31,7 +31,7 @@
  *       runtime/tests/gemv_fusednorm_gfx950_test.hip -o /tmp/fnorm.co -Iruntime/amd -Iruntime/common
  *   hipcc -O2 -w -x c++ -D__HIP_PLATFORM_AMD__=1 -I/opt/rocm/include \
  *       runtime/tests/gemv_fusednorm_gfx950_test.hip -o /tmp/fnorm_test -L/opt/rocm/lib -lamdhip64
- *   sg render -c 'perf-data/harness/gpulease -n 1 fnorm /tmp/fnorm_test /tmp/fnorm.co'
+ *   sg render -c 'perf-data/tools/gpulease -n 1 fnorm /tmp/fnorm_test /tmp/fnorm.co'
  */
 
 struct KArgs {

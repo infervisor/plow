@@ -4,7 +4,7 @@
 # =============================================================================
 # Descends from the deleted perf-data/bench_vllm_tp.sh (commit ebfb2a6^), which
 # produced perf-data/vllm-tp-baseline.md. Same serve flags and same parse, plus:
-#   - takes a GPU LEASE (perf-data/harness/gpulease) instead of hard-coding GPUS,
+#   - takes a GPU LEASE (perf-data/tools/gpulease) instead of hard-coding GPUS,
 #     so concurrent agents cannot land on the same cards mid-measurement;
 #   - two phases: `general` (concurrency sweep) and `ctxsweep` (concurrency 1).
 #
@@ -56,7 +56,7 @@ HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-7200}"
 COMPILE_CACHE="${COMPILE_CACHE:-$HOME/.cache/vllm-bench-container}"
 mkdir -p "$COMPILE_CACHE"
 SERVE_ONLY="${SERVE_ONLY:-0}"
-GPULEASE="${GPULEASE:-$REPO/perf-data/harness/gpulease}"
+GPULEASE="${GPULEASE:-$REPO/perf-data/tools/gpulease}"
 
 QUANT="${QUANT:-bf16}"; KVFP8="${KVFP8:-0}"; QUANT_ARGS=""
 [ "$QUANT" = "fp8" ] && QUANT_ARGS="--quantization fp8"

@@ -188,7 +188,7 @@ for arm in $ARMS; do
 
   log="$WORK/log/run_${arm}.log"
   set +e
-  "$ROOT/perf-data/harness/gpulease" "${LABEL}-${arm}" \
+  "$ROOT/perf-data/tools/gpulease" "${LABEL}-${arm}" \
     "$BLOCK_RUN" "$adir" bench --batch "$BATCH" --ctx "$CTX" \
       --iters "$ITERS" --warmup "$WARMUP" --prefill-iters "$PF_ITERS" \
       --pf-chunk "$PF_CHUNK" >"$log" 2>&1

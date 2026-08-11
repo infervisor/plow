@@ -17,7 +17,7 @@
 #
 # Env:
 #   PLOW_PY        python with a CUDA torch (default: python3)
-#   GPULEASE       path to the gpulease script (default: perf-data/harness/gpulease)
+#   GPULEASE       path to the gpulease script (default: perf-data/tools/gpulease)
 #   GPU_LEASE_*    forwarded to gpulease (GPU_LEASE_TIMEOUT, ...)
 set -euo pipefail
 
@@ -26,7 +26,7 @@ DESC="${1:?usage: block_baseline.sh <descriptor.json> [-- extra args]}"; shift
 [ "${1:-}" = "--" ] && shift || true
 
 PY="${PLOW_PY:-python3}"
-GPULEASE="${GPULEASE:-$REPO/perf-data/harness/gpulease}"
+GPULEASE="${GPULEASE:-$REPO/perf-data/tools/gpulease}"
 LABEL="blkbase-$(basename "$DESC" .json)"
 
 # gpulease writes its lock/log under /workspace/gpu; make sure it exists.

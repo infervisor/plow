@@ -52,7 +52,7 @@ sampling, and SSE — in a way `amd-bench` cannot.
 ## Reproduce
 
 ```bash
-perf-data/harness/gpulease -n 8 gsm8k sg render -c \
+perf-data/tools/gpulease -n 8 gsm8k sg render -c \
   "N=200 SHOTS=8 MAXTOK=320 PLOWRT_BIN=<hsa-built plowrt> \
    scripts/bench_gsm8k.sh <assets> 8412 auto 1800"
 ```

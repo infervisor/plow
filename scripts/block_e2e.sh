@@ -32,7 +32,7 @@ MAXCTX="${4:-2048}"
 
 PY="${PLOW_PY:-/workspace/venvs/vllm-blk/bin/python}"
 CUBIN_DIR="${CUBIN_DIR:-/workspace/assets/cubin-sm90a}"
-GPULEASE="${GPULEASE:-$REPO/perf-data/harness/gpulease}"
+GPULEASE="${GPULEASE:-$REPO/perf-data/tools/gpulease}"
 BATCH="${BATCH:-1,4}"
 CTX="${CTX:-128,1024}"
 OUT="${OUT:-/dev/shm/block-e2e}"

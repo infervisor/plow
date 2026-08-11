@@ -2,7 +2,7 @@
 
 RTX 5090 (sm_120a, 170 SM, 31.36 GiB usable) · 2026-07-26 · Gemma-4-12B-it, fp8 W8A8, MIXED
 fp8-KV packet (e4m3 on the 8 hd512 FULL layers, bf16 on the 40 sliding rings). Every GPU run under
-`perf-data/harness/gpulease`. Companion to `px12-consolidated-baseline.md` (§3 is the cell) and
+`perf-data/tools/gpulease`. Companion to `px12-consolidated-baseline.md` (§3 is the cell) and
 `px1-stage1.md` / `px1-stage2.md` (the PX-1 batched-prefill design).
 
 **Question.** PX-1 (`PLOW_PF_BATCH=1`) packs several waiting requests' prefill chunks into ONE
@@ -151,11 +151,11 @@ the same reason, and "packing is numerics-neutral" must be retired as a claim.
 ## 8. Reproduce
 
     perf-data/px14_emit_chunks.sh                 # 4 packets, B=1, chunk 1024/2048/4096/8192
-    perf-data/harness/gpulease px14-c1024 perf-data/px14_probe.sh 1024   # ... 2048 4096 8192
+    perf-data/tools/gpulease px14-c1024 perf-data/px14_probe.sh 1024   # ... 2048 4096 8192
     perf-data/px14_emit_b8.sh 2048                # the B=8 chunk-2048 packet
-    perf-data/harness/gpulease px14-cell perf-data/px14_cell.sh 2048     # -> VRAM refusal
-    perf-data/harness/gpulease px14-par perf-data/px14_parity.sh 1024    # arm E parity, then 8192
-    perf-data/harness/gpulease px14-parC perf-data/px14_parity_armC.sh 1024  # arm C, then 8192
+    perf-data/tools/gpulease px14-cell perf-data/px14_cell.sh 2048     # -> VRAM refusal
+    perf-data/tools/gpulease px14-par perf-data/px14_parity.sh 1024    # arm E parity, then 8192
+    perf-data/tools/gpulease px14-parC perf-data/px14_parity_armC.sh 1024  # arm C, then 8192
 
 Binaries: `plowc`/`plowrt` from the px12 worktree (code-identical to this branch — the only commit
 ahead, 28cc330, touches docs only — and the exact binaries that produced px12 §3).

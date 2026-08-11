@@ -6,7 +6,7 @@ warmup steps, 120 measured steps, and three exact vLLM RandomDataset seed-0
 prompts at each of the seven B1 contexts.  Generate the prompt files first:
 
   /workspace/venvs/vllm/bin/python \
-    perf-data/harness/make_vllm_random_ids.py MODEL_DIR PROMPT_DIR
+    perf-data/tools/make_vllm_random_ids.py MODEL_DIR PROMPT_DIR
 
 One invocation covers one explicitly labelled precision/packet pair and takes
 one gpulease around all 21 processes.  Full-FP8 is intentionally not inferred:
@@ -14,7 +14,7 @@ the caller must provide both its actual label and its FP8 weight directory.
 
 Example BF16 run:
 
-  python3 perf-data/harness/run_gemma4_26b_decode_sweep.py \
+  python3 perf-data/tools/run_gemma4_26b_decode_sweep.py \
     --precision-label bf16 --binary /tmp/gemma4_sm120_chat \
     --packet /tmp/gemma26-bf16.pkt \
     --model-dir /workspace/models/gemma-4-26B-A4B-it \
@@ -23,7 +23,7 @@ Example BF16 run:
 Example for a real FP8 asset (name the path honestly, for example
 ``fp8-dense-only`` while experts/router remain BF16):
 
-  python3 perf-data/harness/run_gemma4_26b_decode_sweep.py \
+  python3 perf-data/tools/run_gemma4_26b_decode_sweep.py \
     --precision-label fp8-full --vllm-config fp8 \
     --fp8-dir /workspace/models/gemma-4-26B-A4B-it-fp8 \
     --binary /tmp/gemma4_sm120_chat_fp8 --packet /tmp/gemma26-fp8.pkt \

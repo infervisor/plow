@@ -15,7 +15,7 @@
 #       python3 runtime/tests/k3_moe_oracle.py <outdir>/k3_moe_fixture.bin
 #   nix develop .#quantize --command env PYTHONNOUSERSITE=1 \
 #       python3 runtime/tests/k3_mxfp4_nibble_oracle.py <outdir>/mxnib_fixture.bin
-#   nix develop --command perf-data/harness/gpulease -n 1 k3moe \
+#   nix develop --command perf-data/tools/gpulease -n 1 k3moe \
 #       <outdir>/k3_moe_test <outdir>/interp_decode_k3.elf <outdir>/k3_moe_fixture.bin
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

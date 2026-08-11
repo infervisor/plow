@@ -10,7 +10,7 @@
 #   nix develop --command ./scripts/build_k3_mla.sh [outdir]
 #   nix develop .#quantize --command env PYTHONNOUSERSITE=1 \
 #       python3 runtime/tests/k3_mla_oracle.py <outdir>/k3_mla_fixture.bin
-#   nix develop --command perf-data/harness/gpulease -n 1 k3mla \
+#   nix develop --command perf-data/tools/gpulease -n 1 k3mla \
 #       <outdir>/k3_mla_test <outdir>/interp_decode_k3.elf <outdir>/k3_mla_fixture.bin
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

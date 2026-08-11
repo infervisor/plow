@@ -20,7 +20,7 @@
 **Instrument, both engines:** `vllm bench serve --backend openai-chat`, the SAME client binary
 against two different base-urls. `--dataset-name random --random-input-len 1024
 --random-output-len 128 --max-concurrency 1 --num-prompts 32 --num-warmups 4`. Under
-`perf-data/harness/gpulease -n 4`, `rc=0` on every run quoted here (no contention).
+`perf-data/tools/gpulease -n 4`, `rc=0` on every run quoted here (no contention).
 Measured 2026-07-28.
 
 Nothing on this page comes from `plowrt amd-bench`, `glm52_decode`, or any other bespoke timing
