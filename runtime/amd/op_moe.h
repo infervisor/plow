@@ -29,6 +29,14 @@
 #ifndef PLOW_MOE_GROUP_FLAT
 #define PLOW_MOE_GROUP_FLAT 0
 #endif
+#ifndef PLOW_MOE_GROUP_FORCEINLINE
+#define PLOW_MOE_GROUP_FORCEINLINE 0
+#endif
+#if PLOW_MOE_GROUP_FORCEINLINE
+#define PLOW_MOE_GROUP_INLINE __forceinline__
+#else
+#define PLOW_MOE_GROUP_INLINE
+#endif
 /* Grouped gate/up on the XDL matrix cores (fp8->bf16 16x16x32 MFMA, M=1 padded) vs the fdot2 VALU
  * path. 1 = MFMA. Bit-close (not bit-identical). Build-time A/B knob. */
 #ifndef PLOW_MOE_MFMA
@@ -1140,12 +1148,10 @@ __device__ void d_moe_group_glu_mfma(bf16*, const bf16*, const unsigned char*,
                                      unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                                      unsigned, float, float);
 #endif
-__device__ void d_moe_group_glu_fp8_blk(bf16* fu, const bf16* x, const unsigned char* table,
-                                        const unsigned long long* wtab,
-                                        const unsigned long long* stab, unsigned k, unsigned I_moe,
-                                        unsigned H, unsigned n_exp, unsigned act, unsigned slice,
-                                        unsigned nblk, unsigned enc, float beta,
-                                        float lbeta) {
+__device__ PLOW_MOE_GROUP_INLINE void d_moe_group_glu_fp8_blk(
+    bf16* fu, const bf16* x, const unsigned char* table, const unsigned long long* wtab,
+    const unsigned long long* stab, unsigned k, unsigned I_moe, unsigned H, unsigned n_exp,
+    unsigned act, unsigned slice, unsigned nblk, unsigned enc, float beta, float lbeta) {
 #if PLOW_MOE_MFMA
     /* `enc` IS NOW HONOURED HERE. It used to be dropped on the floor with a comment saying so:
      * `d_moe_group_glu_mfma` was block-fp8 only, so under this non-default axis an MXFP4 packet's
@@ -1248,11 +1254,10 @@ __device__ void d_moe_group_glu_fp8_blk(bf16* fu, const bf16* x, const unsigned 
 #endif
 }
 
-__device__ void d_moe_group_down_fp8_blk(float* part, const bf16* fu, const unsigned char* table,
-                                         const unsigned long long* wtab,
-                                         const unsigned long long* stab, unsigned k, unsigned H,
-                                         unsigned I_moe, unsigned n_exp, unsigned slice,
-                                         unsigned nblk, unsigned enc) {
+__device__ PLOW_MOE_GROUP_INLINE void d_moe_group_down_fp8_blk(
+    float* part, const bf16* fu, const unsigned char* table, const unsigned long long* wtab,
+    const unsigned long long* stab, unsigned k, unsigned H, unsigned I_moe, unsigned n_exp,
+    unsigned slice, unsigned nblk, unsigned enc) {
 #if PLOW_MOE_GROUP_FLAT
     const unsigned KB = (I_moe + 127u) >> 7;
     const unsigned lane = threadIdx.x & 63;

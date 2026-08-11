@@ -563,6 +563,11 @@ AX_K3_DECODE_MXFP4="$AX_MXFP4"
 if [ "${PLOW_K3_DECODE_MXFP4_PROJ:-1}" = 0 ]; then
   AX_K3_DECODE_MXFP4=""
 fi
+case "${PLOW_K3_MOE_GROUP_FORCEINLINE:-0}" in
+  0) AX_K3_MOE_GROUP_INLINE="" ;;
+  1) AX_K3_MOE_GROUP_INLINE="-DPLOW_MOE_GROUP_FORCEINLINE=1" ;;
+  *) echo "FAIL: PLOW_K3_MOE_GROUP_FORCEINLINE must be 0 or 1" >&2; exit 2 ;;
+esac
 
 # FALSIFICATION ARM (PLOW_F2BF_SELECT=1): the REFUTED branchless f2bf. Default 0 = the shipped branched form.
 # MEASURED AND REFUTED: the branchless form is -5.0% static instructions on the prefill
@@ -832,8 +837,8 @@ ROWS=(
   # K3Moe and K3MoeA4w4 onto PrefillArm::K3 for the decode phase), and it carries the mxfp4
   # EXPERT walks by default. `$AX_K3_DECODE_MXFP4` rides along so an all-fp4 packet finds its fp4
   # PROJECTION ops in the same object rather than falling through the silent dispatch `default:`.
-  "interp_decode_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_K3_DECODE_XR_AGG"
-  "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_FP8KV $AX_K3_DECODE_XR_AGG"
+  "interp_decode_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_K3_DECODE_XR_AGG $AX_K3_MOE_GROUP_INLINE"
+  "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_FP8KV $AX_K3_DECODE_XR_AGG $AX_K3_MOE_GROUP_INLINE"
   # ATTENTION-ONLY, exactly as on gfx950: without $AX_MOE the grouped expert packets fall through
   # `default:` and write nothing. A whole-layer K3 prompt needs the `_moe` rows below.
   "interp_prefill_k3|$AX_PREFILL $AX_MLA_K3 $AX_MXFP4"
