@@ -1,4 +1,4 @@
-# Kimi-K3 MI325X decode GEMV workgroup A/B
+# Kimi-K3 MI325X decode GEMV workgroup campaign
 
 Date: 2026-08-10. Hardware: 8 leased MI325X GPUs (gfx942, 304 CUs each).
 Toolchain: flake-pinned ROCm 7.14.0. Every emit and device run used
@@ -97,3 +97,25 @@ at 55.639 ms/token (18.0 tok/s). Its step breakdown reports 52.679 ms in the
 device program and 1.276 ms in the complete post-device audit, down from 4.147
 ms for direct host reads. The combined result is not folded into the wg152 A/B
 table because it changes a second axis.
+
+## Follow-up bracket
+
+The compact-audit packet was then bracketed at workgroup caps 200 and 128 in one
+lease. The screen measured wg200 at 59.843 ms/token, wg152 at 55.686/55.661,
+and wg128 at 54.486. wg200 was rejected.
+
+Three order-reversed wg152/wg128 pairs confirmed a disjoint result:
+
+| arm | median ms/token | min | max | sd | n |
+|---|---:|---:|---:|---:|---:|
+| wg152 | 55.617 | 55.605 | 55.625 | 0.010 | 3 |
+| wg128 | 54.463 | 54.409 | 54.473 | 0.034 | 3 |
+
+wg128 improves the median by 2.07%. Its corrected trace span is 51.468 ms vs
+52.722 ms for wg152. The dominant `N=3584,K=7168` body improves 4.238→3.736
+ms and `N=896,K=7168` improves 3.498→3.061 ms. The hot
+`N=7168,K=768` row regresses 2.533→3.417 ms, so the predefined stop rule was
+met: wg96 was not run. wg128 is the adopted packet.
+
+The full 64-token stream remained byte-identical across arms and ranks. The
+OpenAI four-prompt serve gate passed after installing wg128.
