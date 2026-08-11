@@ -92,17 +92,43 @@ AX_PREFILL="-DPLOW_BUCKET_DECODE=0 $CDNA3_TILE $AX_GMOE"
 # ladder instantiates MM in {1,2,4,8,16} and one instantiation with a runtime M serves every
 # M <= MM, so the bucket is a CEILING. Passing the raw batch through was a bug in this script:
 # PLOW_DECODE_BATCH=32 handed -DPLOW_GEMV_MM=32 to hipcc and every decode row failed to build.
-GVMM=1
-while [ "$GVMM" -lt "${PLOW_DECODE_BATCH:-1}" ] && [ "$GVMM" -lt 16 ]; do GVMM=$((GVMM * 2)); done
-AX_DECODE="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM $CDNA3_TILE $AX_GMOE"
+GVMM="${PLOW_DECODE_BATCH:-1}"
+case "$GVMM" in ''|*[!0-9]*) GVMM=1;; esac
+[ "$GVMM" -lt 1 ] && GVMM=1
+P2=1
+while [ "$P2" -lt "$GVMM" ]; do P2=$((P2 * 2)); done
+[ "$P2" -gt 16 ] && P2=16
+GVMM="$P2"
+
+# The row bucket and the packet batch are separate axes when the walk is enabled. A B16 packet
+# on MM8 is sound only with PLOW_GEMV_WALK=1: the kernel makes two weight passes and advertises
+# both markers, which plowrt validates before launch. Without the walk, rows MM..B-1 stay stale.
+WALK="${PLOW_GEMV_WALK:-0}"
+case "$WALK" in
+  0) AX_GEMV_WALK="" ;;
+  1) AX_GEMV_WALK="-DPLOW_GEMV_WALK=1" ;;
+  *) echo "PLOW_GEMV_WALK must be 0 or 1" >&2; exit 1 ;;
+esac
+if [ -n "${PLOW_GEMV_MM:-}" ]; then
+  case "$PLOW_GEMV_MM" in
+    ''|*[!0-9]*) echo "PLOW_GEMV_MM must be a number" >&2; exit 1 ;;
+    1|2|4|8|16) ;;
+    *) echo "PLOW_GEMV_MM must be one of 1,2,4,8,16" >&2; exit 1 ;;
+  esac
+  if [ "$PLOW_GEMV_MM" -lt "$GVMM" ] && [ "$WALK" != 1 ]; then
+    echo "REFUSING: PLOW_GEMV_MM=$PLOW_GEMV_MM < batch $GVMM with PLOW_GEMV_WALK unset." >&2
+    echo "  Without the walk, gemv_rows<MM> writes rows 0..MM-1 and leaves the rest STALE." >&2
+    exit 1
+  fi
+  GVMM="$PLOW_GEMV_MM"
+fi
+AX_DECODE="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM $AX_GEMV_WALK $CDNA3_TILE $AX_GMOE"
+echo "   decode GEMV batch bucket: PLOW_GEMV_MM=$GVMM walk=$WALK (PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH:-1})"
 # OPT-IN (PLOW_GEMV_WALK=1): the §6g-WALK row-block outer loop — the object serves any M in
 # ceil(M/MM) passes of the compiled bucket, and the LDS staging bound becomes min(MM,M)*K.
 # REQUIRED for a PLOW_DECODE_BATCH>16 ladder (PLOW_GEMV_MAXM caps the bucket at 16; without
 # the walk, rows 16.. would never be written — plowrt refuses the pair on the missing
 # `plow_gemv_walk_1` marker rather than serving stale rows).
-if [ "${PLOW_GEMV_WALK:-0}" = 1 ]; then
-  AX_DECODE="$AX_DECODE -DPLOW_GEMV_WALK=1"
-fi
 # PLOW_OCC4=1 -- THE OCCUPANCY-4 DECODE PROFILE. MEASURED -10.4% on bf16 and -19.1% on fp8
 # (Gemma-4-12B, ctx 4096, three interleaved pairs, token-identical):
 #
@@ -126,7 +152,7 @@ if [ "${PLOW_OCC4:-0}" = 1 ]; then
   # -DPLOW_MOE_GEMMA only, NOT _PF: the grouped-MoE PREFILL tile is (64+256)*64 halves = 40,960 B
   # and its static_assert wants that much `raw`, which the 30,720 B arena cannot give. It is a
   # prefill arm and the decode bucket never dispatches op 73, so dropping it costs nothing here.
-  AX_DECODE="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM -DPLOW_WG_WAVES=8 -DPLOW_MOE_GEMMA=1 \
+  AX_DECODE="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM $AX_GEMV_WALK -DPLOW_WG_WAVES=8 -DPLOW_MOE_GEMMA=1 \
              -DGM_BM=128 -DGM_BN=256 -DGM_BK=32 -DPLOW_NO_MLA_DEC=1 -DPLOW_WPE=5"
 fi
 # $AX_GMOE on the FLASH row too. The flash object runs only class-4 flash
@@ -874,6 +900,24 @@ for row in "${ROWS[@]}"; do
     case "$stem" in
       interp_flash*) [ "$v" -le 512 ] || { echo "  OVER REG: $v > 512"; fail=1; } ;;
       *)             [ "$v" -le 256 ] || { echo "  OVER REG: $v > 256"; fail=1; } ;;
+    esac
+    case "$stem" in
+      interp_decode*)
+        symbols=$("$READELF" -sW "$stem.elf" 2>/dev/null)
+        grep -qE "OBJECT .* plow_gemv_mm_cap_${GVMM}$" <<<"$symbols" || {
+          echo "  WRONG GEMV CAP: expected plow_gemv_mm_cap_${GVMM}"
+          fail=1
+        }
+        if [ "$WALK" = 1 ]; then
+          grep -qE "OBJECT .* plow_gemv_walk_1$" <<<"$symbols" || {
+            echo "  MISSING GEMV WALK: expected plow_gemv_walk_1"
+            fail=1
+          }
+        elif grep -qE "OBJECT .* plow_gemv_walk_1$" <<<"$symbols"; then
+          echo "  UNEXPECTED GEMV WALK: PLOW_GEMV_WALK=0"
+          fail=1
+        fi
+        ;;
     esac
   done
 done
