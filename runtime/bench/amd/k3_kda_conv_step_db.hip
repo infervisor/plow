@@ -65,6 +65,54 @@ void kda_step_control(bf16* output, const bf16* mix, const bf16* gate_raw,
                        nullptr);
 }
 
+__device__ __forceinline__ void kda_grid_sync(unsigned* control, unsigned blocks) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        const unsigned generation = atomicAdd(&control[1], 0u);
+        const unsigned arrivals = atomicAdd(&control[0], 1u) + 1u;
+        if (arrivals == blocks) {
+            atomicExch(&control[0], 0u);
+            atomicExch(&control[1], generation + 1u);
+        } else {
+            while (atomicAdd(&control[1], 0u) == generation) {
+            }
+        }
+        __threadfence();
+    }
+    __syncthreads();
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, 1)
+void kda_conv_step_barrier(bf16* output, bf16* mix, const bf16* raw, const float* weight,
+                           float* conv_state, const bf16* gate_raw, const bf16* beta_raw,
+                           const float* a_log, const float* dt_bias, float* state,
+                           unsigned* control, unsigned layer) {
+    extern __shared__ float lds[];
+    const size_t p3 = 3u * P;
+    const size_t cs_stride = p3 * W;
+    raw += (size_t)layer * p3;
+    weight += (size_t)layer * cs_stride;
+    conv_state += (size_t)layer * cs_stride;
+    mix += (size_t)layer * p3;
+    gate_raw += (size_t)layer * P;
+    beta_raw += (size_t)layer * H;
+    a_log += (size_t)layer * H;
+    dt_bias += (size_t)layer * P;
+    state += (size_t)layer * H * D * D;
+    output += (size_t)layer * P;
+
+    d_kda_conv3(mix, mix + P, mix + 2u * P, raw, raw + P, raw + 2u * P, weight,
+                weight + (size_t)P * W, weight + (size_t)2u * P * W, conv_state,
+                conv_state + (size_t)P * W, conv_state + (size_t)2u * P * W, 1, P, W, 1,
+                blockIdx.x, gridDim.x, 0, nullptr);
+    kda_grid_sync(control, gridDim.x);
+    d_kda_state_step_g(output, mix, mix + P, mix + 2u * P, gate_raw, beta_raw, a_log, dt_bias,
+                       PLOW_KDA_GATE_LOWER_BOUND, -5.0f, state, 1, H, D, BV,
+                       PLOW_KDA_F_QK_L2NORM, rsqrtf((float)D), blockIdx.x, gridDim.x, lds, 0,
+                       nullptr);
+}
+
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, 1)
 void kda_conv_step_db(bf16* output, bf16* mix_out, const bf16* raw, const float* weight,
                       const float* conv_source, float* conv_target, const bf16* gate_raw,

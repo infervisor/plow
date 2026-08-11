@@ -68,12 +68,19 @@ double median(std::vector<double> values) {
     return 0.5 * (values[(values.size() - 1) / 2] + values[values.size() / 2]);
 }
 
-size_t differences(const void* left, const void* right, size_t bytes) {
+size_t differences(const char* label, const void* left, const void* right, size_t bytes) {
     std::vector<unsigned char> a(bytes), b(bytes);
     CK(hipMemcpy(a.data(), left, bytes, hipMemcpyDeviceToHost));
     CK(hipMemcpy(b.data(), right, bytes, hipMemcpyDeviceToHost));
     size_t count = 0;
-    for (size_t i = 0; i < bytes; ++i) count += a[i] != b[i];
+    const bool detail = std::getenv("PLOW_KDA_DIFF_DETAIL") != nullptr;
+    for (size_t i = 0; i < bytes; ++i) {
+        if (a[i] == b[i]) continue;
+        if (detail && count < 8)
+            std::fprintf(stderr, "%s byte[%zu] control=%02x fused=%02x\n", label, i, a[i],
+                         b[i]);
+        ++count;
+    }
     return count;
 }
 
@@ -134,10 +141,11 @@ int main(int argc, char** argv) {
     CK(hipInit(0));
     hipModule_t module;
     CK(hipModuleLoad(&module, object));
-    hipFunction_t conv, step, fused;
+    hipFunction_t conv, step, fused, barrier;
     CK(hipModuleGetFunction(&conv, module, "kda_conv3_control"));
     CK(hipModuleGetFunction(&step, module, "kda_step_control"));
     CK(hipModuleGetFunction(&fused, module, "kda_conv_step_db"));
+    CK(hipModuleGetFunction(&barrier, module, "kda_conv_step_barrier"));
 
     uint16_t* d_raw = upload(raw);
     uint16_t* d_gate = upload(gate);
@@ -147,18 +155,28 @@ int main(int argc, char** argv) {
     float* d_alog = upload(alog);
     float* d_dt_bias = upload(dt_bias);
     float* d_state_source = upload(state_source);
-    uint16_t *mix_control = allocate<uint16_t>(p3), *mix_fused = allocate<uint16_t>(p3);
+    uint16_t *mix_control = allocate<uint16_t>(p3), *mix_fused = allocate<uint16_t>(p3),
+             *mix_barrier = allocate<uint16_t>(p3);
     uint16_t *output_control = allocate<uint16_t>(output_count),
-             *output_fused = allocate<uint16_t>(output_count);
-    float *conv_control = allocate<float>(cs_count), *conv_fused = allocate<float>(cs_count);
-    float *state_control = allocate<float>(state_count), *state_fused = allocate<float>(state_count);
+             *output_fused = allocate<uint16_t>(output_count),
+             *output_barrier = allocate<uint16_t>(output_count);
+    float *conv_control = allocate<float>(cs_count), *conv_fused = allocate<float>(cs_count),
+          *conv_barrier = allocate<float>(cs_count);
+    float *state_control = allocate<float>(state_count), *state_fused = allocate<float>(state_count),
+          *state_barrier = allocate<float>(state_count);
+    unsigned* barrier_control = allocate<unsigned>(2);
 
     auto reset = [&] {
         CK(hipMemcpy(conv_control, d_conv_source, cs_count * sizeof(float), hipMemcpyDeviceToDevice));
+        CK(hipMemcpy(conv_barrier, d_conv_source, cs_count * sizeof(float),
+                     hipMemcpyDeviceToDevice));
         CK(hipMemcpy(state_control, d_state_source, state_count * sizeof(float),
                      hipMemcpyDeviceToDevice));
         CK(hipMemcpy(state_fused, d_state_source, state_count * sizeof(float),
                      hipMemcpyDeviceToDevice));
+        CK(hipMemcpy(state_barrier, d_state_source, state_count * sizeof(float),
+                     hipMemcpyDeviceToDevice));
+        CK(hipMemset(barrier_control, 0, 2 * sizeof(unsigned)));
     };
     auto run_control = [&] {
         for (unsigned layer = 0; layer < kLayers; ++layer) {
@@ -177,21 +195,42 @@ int main(int argc, char** argv) {
             launch(fused, kItems, kSharedBytes, args);
         }
     };
+    auto run_barrier = [&] {
+        for (unsigned layer = 0; layer < kLayers; ++layer) {
+            void* args[] = {&output_barrier, &mix_barrier, &d_raw, &d_weight, &conv_barrier,
+                            &d_gate, &d_beta, &d_alog, &d_dt_bias, &state_barrier,
+                            &barrier_control, &layer};
+            launch(barrier, 304, kSharedBytes, args);
+        }
+    };
 
     reset();
     run_control();
     run_fused();
+    run_barrier();
     CK(hipDeviceSynchronize());
-    const size_t mix_diff = differences(mix_control, mix_fused, p3 * sizeof(uint16_t));
-    const size_t conv_diff = differences(conv_control, conv_fused, cs_count * sizeof(float));
-    const size_t state_diff = differences(state_control, state_fused, state_count * sizeof(float));
+    const size_t mix_diff =
+        differences("mix", mix_control, mix_fused, p3 * sizeof(uint16_t));
+    const size_t conv_diff =
+        differences("conv", conv_control, conv_fused, cs_count * sizeof(float));
+    const size_t state_diff =
+        differences("state", state_control, state_fused, state_count * sizeof(float));
     const size_t output_diff =
-        differences(output_control, output_fused, output_count * sizeof(uint16_t));
+        differences("output", output_control, output_fused, output_count * sizeof(uint16_t));
     const auto mix_error = error(mix_control, mix_fused, p3, bf16_value);
     const auto state_error = error(state_control, state_fused, state_count,
                                    [](float value) { return value; });
     const auto output_error = error(output_control, output_fused, output_count, bf16_value);
-    if (conv_diff || mix_error.nonfinite || state_error.nonfinite || output_error.nonfinite ||
+    const size_t barrier_mix_diff =
+        differences("barrier_mix", mix_control, mix_barrier, p3 * sizeof(uint16_t));
+    const size_t barrier_conv_diff =
+        differences("barrier_conv", conv_control, conv_barrier, cs_count * sizeof(float));
+    const size_t barrier_state_diff =
+        differences("barrier_state", state_control, state_barrier, state_count * sizeof(float));
+    const size_t barrier_output_diff = differences(
+        "barrier_output", output_control, output_barrier, output_count * sizeof(uint16_t));
+    if (conv_diff || barrier_mix_diff || barrier_conv_diff || barrier_state_diff ||
+        barrier_output_diff || mix_error.nonfinite || state_error.nonfinite || output_error.nonfinite ||
         mix_error.rel_l2 > 1e-4 || state_error.rel_l2 > 1e-4 || output_error.rel_l2 > 1e-4) {
         std::fprintf(stderr,
                      "FAIL mix=%zu/%.3e conv=%zu state=%zu/%.3e output=%zu/%.3e\n", mix_diff,
@@ -222,12 +261,16 @@ int main(int argc, char** argv) {
     };
     const double control_ms = measure(run_control);
     const double fused_ms = measure(run_fused);
+    const double barrier_ms = measure(run_barrier);
     std::printf("{\"schema\":\"plow.k3-kda-conv-step-db.v1\",\"layers\":%u,"
                 "\"control_ms\":%.6f,\"fused_ms\":%.6f,\"saving_ms\":%.6f,"
+                "\"barrier_ms\":%.6f,\"barrier_saving_ms\":%.6f,"
                 "\"mix_diff\":%zu,\"conv_diff\":%zu,\"state_diff\":%zu,"
                 "\"output_diff\":%zu,\"mix_rel_l2\":%.9g,\"state_rel_l2\":%.9g,"
-                "\"output_rel_l2\":%.9g,\"state_max_abs\":%.9g}\n",
-                kLayers, control_ms, fused_ms, control_ms - fused_ms, mix_diff, conv_diff,
+                "\"output_rel_l2\":%.9g,\"state_max_abs\":%.9g,"
+                "\"barrier_exact\":true}\n",
+                kLayers, control_ms, fused_ms, control_ms - fused_ms, barrier_ms,
+                control_ms - barrier_ms, mix_diff, conv_diff,
                 state_diff, output_diff, mix_error.rel_l2, state_error.rel_l2,
                 output_error.rel_l2, state_error.max_abs);
     CK(hipModuleUnload(module));
