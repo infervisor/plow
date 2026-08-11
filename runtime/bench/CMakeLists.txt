@@ -294,13 +294,13 @@ if(PLOW_ROCM)
     add_dependencies(k3_mla_kdu_sweep k3_mla_kdu_sweep_gfx942_objects)
 
     # Model-free full-grid screen for replacing K3 B1 dense BF16 weights with
-    # block-scaled E4M3 W8A16. Only candidates projecting >=5 ms/token proceed
-    # to checkpoint conversion and TP8 serving.
+    # block-scaled E4M3 W8A16 or checkpoint-native-layout MXFP4. Only candidates
+    # projecting >=5 ms/token proceed to checkpoint conversion and TP8 serving.
     set(K3_GEMV_W8_CO ${CMAKE_CURRENT_BINARY_DIR}/k3_gemv_w8a16_sweep_gfx942.co)
     add_custom_command(
         OUTPUT ${K3_GEMV_W8_CO}
         COMMAND "$ENV{PLOW_HIPCC}" --offload-arch=gfx942 -O3 -w -std=c++17 --genco
-                -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=1 -DPLOW_K3=1
+                -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=1 -DPLOW_K3=1 -DPLOW_MXFP4=1
                 -DGV_UNROLL=14 -DPLOW_FP8_KV=1 -DPLOW_GEMV_LG=1
                 -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
                 -I ${CMAKE_CURRENT_SOURCE_DIR}/../common

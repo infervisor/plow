@@ -80,3 +80,16 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_w8a16_row(
         __syncthreads();
     }
 }
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_mxfp4(
+    bf16* C, const bf16* x, const unsigned char* W, const unsigned char* scale, unsigned nrep,
+    unsigned N, unsigned K) {
+    __shared__ k3_w8_smem sm;
+    const size_t wstride = (size_t)N * K / 2u;
+    const size_t sstride = (size_t)N * K / 32u;
+    for (unsigned e = 0; e < nrep; ++e) {
+        d_gemv_mxfp4(C, x, W + (size_t)e * wstride, scale + (size_t)e * sstride, 1u, N, K,
+                     blockIdx.x, gridDim.x, sm.xstage);
+        __syncthreads();
+    }
+}
