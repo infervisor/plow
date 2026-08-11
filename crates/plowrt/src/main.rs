@@ -306,6 +306,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_hold_ms,
             slo_ms,
         } => {
+            tracing::info!(
+                assets = ?assets,
+                port,
+                socket = ?socket,
+                executors,
+                trace,
+                max_hold_ms,
+                slo_ms,
+                runtime = ?RuntimeConfig::global(),
+                environment = ?runtime_environment(),
+                "resolved serve configuration"
+            );
             serve(
                 assets,
                 port,
@@ -416,6 +428,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBlock { .. } => Err("plowrt was built without --features hsa".into()),
     }
+}
+
+fn runtime_environment() -> Vec<(String, String)> {
+    let mut vars: Vec<_> = std::env::vars()
+        .filter(|(key, _)| {
+            key.starts_with("PLOW_")
+                || matches!(
+                    key.as_str(),
+                    "RUST_LOG"
+                        | "ROCR_VISIBLE_DEVICES"
+                        | "HIP_VISIBLE_DEVICES"
+                        | "CUDA_VISIBLE_DEVICES"
+                        | "HSA_XNACK"
+                        | "HSA_OVERRIDE_GFX_VERSION"
+                        | "OMP_NUM_THREADS"
+                )
+        })
+        .map(|(key, value)| {
+            let upper = key.to_ascii_uppercase();
+            let secret = ["TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "API_KEY"]
+                .iter()
+                .any(|needle| upper.contains(needle));
+            (key, if secret { "<redacted>".into() } else { value })
+        })
+        .collect();
+    vars.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    vars
 }
 
 /// Bring the AMD engine up and time decode steps.

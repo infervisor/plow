@@ -47,3 +47,13 @@ nix develop --command env \
 The accuracy requirement passes. Stage 7 remains blocked on a same-box sound
 gfx942 comparator and on the unrun capacity/context ladders. Therefore this
 record makes no vLLM performance claim.
+
+## 2026-08-11 capacity follow-up
+
+The B8 capacity and concurrent 16k/32k context gates now pass. Three identical
+vLLM 0.26.0 `bench serve` runs against `plowrt serve` measured
+50.604--50.787 aggregate output tok/s with 32/32 requests and 4,096/4,096
+generated tokens per run. See `perf-data/kimi-k3-mi325x-b8-serve.md`.
+
+This removes the capacity/context blocker. Stage 7 still requires B8 GSM8K,
+state-reuse/ragged correctness, and the same-box vLLM serving-engine comparator.

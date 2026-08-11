@@ -16,7 +16,7 @@
         inherit system;
         config = {
           allowUnfree = true;
-          permittedInsecurePackages = [ "python3.13-vllm-0.16.0" ];
+          permittedInsecurePackages = [ "python3.13-vllm-0.26.0" ];
         };
       };
 
@@ -469,13 +469,56 @@
         # its closure is torch-sized. Same per-task-shell rule as `quantize`:
         #   nix develop .#vllm
         // pkgs.lib.optionalAttrs isGpuHost {
-          vllm = pkgs.mkShell {
-            name = "plow-vllm";
+          vllm = let
+            # `vllm bench serve` is a pure HTTP client. Building vLLM's CPU
+            # execution extension is unnecessary here and currently fails
+            # against nixpkgs' newer Torch API. Keep the upstream Python client
+            # and its declared dependencies, but omit only the server extension.
+            vllmClient = pkgs.python3Packages.vllm.overridePythonAttrs (old: {
+              version = "0.26.0";
+              src = pkgs.fetchFromGitHub {
+                owner = "vllm-project";
+                repo = "vllm";
+                rev = "v0.26.0";
+                hash = "sha256-jFzV6vQX88FhemF98HmT5j3t6Trj5lXVlym4WD/X+Kw=";
+              };
+              patches = [ ];
+              postPatch = "";
+              pyproject = null;
+              format = "other";
+              dontBuild = true;
+              doCheck = false;
+              pythonImportsCheck = [ ];
+              installPhase = ''
+                runHook preInstall
+                site="$out/${pkgs.python3.sitePackages}"
+                mkdir -p "$site" "$site/vllm-0.26.0.dist-info" "$out/bin"
+                cp -r vllm "$site/"
+                cat > "$site/vllm/_version.py" <<'EOF'
+                __version__ = "0.26.0"
+                __version_tuple__ = (0, 26, 0)
+                EOF
+                cat > "$site/vllm-0.26.0.dist-info/METADATA" <<'EOF'
+                Metadata-Version: 2.1
+                Name: vllm
+                Version: 0.26.0
+                EOF
+                cat > "$out/bin/vllm" <<'EOF'
+                #!/usr/bin/env python3
+                from vllm.entrypoints.cli.main import main
+                main()
+                EOF
+                chmod +x "$out/bin/vllm"
+                runHook postInstall
+              '';
+            });
+          in pkgs.mkShell {
+            name = "plow-vllm-client";
             packages = [
-              (pkgs.python3.withPackages (ps: [ ps.vllm ]))
+              (pkgs.python3.withPackages (_: [ vllmClient ]))
             ];
             shellHook = ''
-              echo "plow vllm shell — $(python3 -c 'import vllm; print("vllm", vllm.__version__)')"
+              echo "plow vllm client shell — $(python3 -c 'import vllm; print(vllm.__version__)')"
             '';
           };
         });
