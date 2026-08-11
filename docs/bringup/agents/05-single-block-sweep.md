@@ -121,6 +121,12 @@ worthless.
   `KNOB=val ./scripts/k3_block_sweep.sh`. **Both scripts pin a part in their
   headers** (one in its filename); read and re-point them at `$ISA`/`$GPU`
   before trusting any number they print.
+* **Decode-only MLA/state block:** generate exact-size fixtures with
+  `scripts/block_fixture_seed.py`, then use `plowrt amd-block --tp $NGPU
+  --load-dir <fixtures> --decode-pos <p> --decode-kvlen <l>`. Inspect the block
+  output and retain the automatic byte-identical all-rank check. For an
+  attention split sweep, change only the packet's split field and scratch
+  extents; reuse fixtures, weights and interpreter object.
 
 Every timed run must be uncontended (`perf-data/tools/gpulease` rc=0). Discard
 and re-run any rc=76.

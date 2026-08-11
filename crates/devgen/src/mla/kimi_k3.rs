@@ -1070,7 +1070,7 @@ fn k3_emit_layers(c: &K3Cfg) -> Vec<u32> {
 ///
 /// Consumers read stale buffers, so tokens are garbage. That is intended and is the same standing
 /// as `PLOW_CHAIN_BYPASS`: wrong numerics are a valid instrument for scheduling and for cost.
-fn k3_ablate_bodies(m: &mut Model) {
+pub(crate) fn k3_ablate_bodies(m: &mut Model) {
     let Some(ref spec) = emit_config::active().k3_ablate else {
         return;
     };

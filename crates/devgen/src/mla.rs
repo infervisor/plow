@@ -1229,7 +1229,7 @@ pub(crate) fn declare_glm_rows(
     rows: u32,
     enc: MoeEnc,
 ) -> GlmTn {
-    declare_glm_rows_batched(b, c, ctx, layer_ids, rows, 1, 1, enc)
+    declare_glm_rows_batched(b, c, ctx, layer_ids, rows, 1, 1, enc, false)
 }
 
 /// As [`declare_glm_rows`], with a DECODE batch: `dbatch` slots share the blob. Three families
@@ -1253,6 +1253,7 @@ pub(crate) fn declare_glm_rows_batched(
     dbatch: u32,
     query_tokens: u32,
     enc: MoeEnc,
+    model_io: bool,
 ) -> GlmTn {
     let dbatch = dbatch.max(1);
     let query_tokens = query_tokens.max(1);
@@ -1295,18 +1296,30 @@ pub(crate) fn declare_glm_rows_batched(
     let [cos_t, sin_t] = GenTensor::rope_pair(ctx, c.qk_rope, c.rope_theta(), 1.0, c.rope_scale);
     let cos = b.tensor_gen("in.cos", cos_t.byte_len(), cos_t);
     let sin = b.tensor_gen("in.sin", sin_t.byte_len(), sin_t);
-    let emb = b.tensor(
-        &format!("{}embed_tokens.weight", c.prefix),
-        (c.vocab * h) as u64 * BF16,
-    );
-    let fin = b.tensor(&format!("{}norm.weight", c.prefix), h as u64 * BF16);
+    let emb = if model_io {
+        b.tensor(
+            &format!("{}embed_tokens.weight", c.prefix),
+            (c.vocab * h) as u64 * BF16,
+        )
+    } else {
+        TENSOR_NONE
+    };
+    let fin = if model_io {
+        b.tensor(&format!("{}norm.weight", c.prefix), h as u64 * BF16)
+    } else {
+        TENSOR_NONE
+    };
     // lm_head. REPLICATED by default (`crates/plowrt/src/asset/shard.rs`'s module note): every rank
     // computes the full-vocab argmax so they agree on the token without a cross-rank fold, at the
     // cost of all N ranks streaming the whole `vocab*hidden` table every step. GLM_SHARD_HEAD=1
     // takes the vocab-column-parallel arm instead — `glm_vocab_l` rows per rank, a local argmax over
     // this rank's shard, and an XARGMAX_FIN that rebases to global vocab space and folds the N
     // packed keys. Both the emit and the host bind change together; see `glm_emit_full`.
-    let head = b.tensor("lm_head.weight", (glm_vocab_l(c) * h) as u64 * BF16);
+    let head = if model_io {
+        b.tensor("lm_head.weight", (glm_vocab_l(c) * h) as u64 * BF16)
+    } else {
+        TENSOR_NONE
+    };
 
     let x = ac(b, "x", rows * h as u64 * BF16);
     let xn = ac(b, "xn", rows * h as u64 * BF16);
@@ -1808,7 +1821,8 @@ pub(crate) fn declare_glm_rows_batched(
             dgate: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => t(b, "mlp.gate_proj.weight", (di_l * h) as u64 / 2),
-                    _ => t(b, "mlp.gate_proj.weight", (di_l * h) as u64),
+                    MoeEnc::Fp8Blk => t(b, "mlp.gate_proj.weight", (di_l * h) as u64),
+                    MoeEnc::Bf16 => t(b, "mlp.gate_proj.weight", (di_l * h) as u64 * BF16),
                 }
             } else {
                 TENSOR_NONE
@@ -1829,7 +1843,8 @@ pub(crate) fn declare_glm_rows_batched(
             dup: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => t(b, "mlp.up_proj.weight", (di_l * h) as u64 / 2),
-                    _ => t(b, "mlp.up_proj.weight", (di_l * h) as u64),
+                    MoeEnc::Fp8Blk => t(b, "mlp.up_proj.weight", (di_l * h) as u64),
+                    MoeEnc::Bf16 => t(b, "mlp.up_proj.weight", (di_l * h) as u64 * BF16),
                 }
             } else {
                 TENSOR_NONE
@@ -1848,7 +1863,8 @@ pub(crate) fn declare_glm_rows_batched(
             ddown: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => t(b, "mlp.down_proj.weight", (h * di_l) as u64 / 2),
-                    _ => t(b, "mlp.down_proj.weight", (h * di_l) as u64),
+                    MoeEnc::Fp8Blk => t(b, "mlp.down_proj.weight", (h * di_l) as u64),
+                    MoeEnc::Bf16 => t(b, "mlp.down_proj.weight", (h * di_l) as u64 * BF16),
                 }
             } else {
                 TENSOR_NONE
@@ -5980,7 +5996,7 @@ fn glm_emit_full(
     // serves every program. max_rows == 1 reproduces `declare_glm` exactly, which is what keeps a
     // decode-only emit byte-identical to one from before this path existed. `dbatch` widens only
     // the KV rings, `in.kvlen`, the lm_head tail and the flash partials — see the declare's doc.
-    let tn = declare_glm_rows_batched(&mut tb, &c, ctx, &layers, max_rows, dbatch, 1, enc);
+    let tn = declare_glm_rows_batched(&mut tb, &c, ctx, &layers, max_rows, dbatch, 1, enc, true);
     let tensors = tb.tensors();
     let gen = tb.gen_tensors();
 
@@ -6568,6 +6584,7 @@ pub(crate) fn glm_build_block_pf(
         1,
         query_rows,
         enc,
+        false,
     );
     let tensors = tb.tensors();
     let gen = tb.gen_tensors();
@@ -6940,7 +6957,6 @@ fn report_mla_prefill(m: &Model, pf: &[u32], scope: PrefillScope, enc: MoeEnc) {
 /// no prefill program, so programs.prefill_buckets stays empty). `arch` picks the Kimi vs DeepSeek
 /// descriptor tag.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn kimi_emit_block(
     dir: &Path,
     ctx: u32,
@@ -6987,6 +7003,7 @@ pub(crate) fn kimi_emit_block(
         enc,
     );
     if arch == MlaArch::K3DSpark {
+        kimi_k3::k3_ablate_bodies(&mut m);
         let declared = m
             .tensors
             .iter()

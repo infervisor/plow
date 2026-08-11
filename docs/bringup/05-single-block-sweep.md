@@ -300,6 +300,26 @@ loads in ~1 s and sweeps three contexts in under two minutes. The GLM sweep
 times three spans and differences them into a `3·L_dense + 75·L_moe` comparator
 (GLM-5.2 is 3 dense + 75 MoE via `first_k_dense_replace = 3`).
 
+For decode-only MLA blocks and recurrent-state experiments, replay the packet
+directly instead of manufacturing a model-shaped wrapper. Emit a small-context
+block, create finite deterministic fixtures, and run the same packet on every
+TP rank:
+
+```bash
+nix develop --command scripts/block_fixture_seed.py \
+  --blob <block>/model.pkt --out <fixtures>
+nix develop --command ./target/release/plowrt amd-block \
+  --blob <block>/model.pkt --hsaco <hsaco> --checkpoint <ckpt> --tp $NGPU \
+  --load-dir <fixtures> --decode-pos 32 --decode-kvlen 32 \
+  --inspect act.xnext --dump <result>
+```
+
+`amd-block` requires exact-size `<tensor>.bin` files; `rankN/<tensor>.bin`
+overrides a common fixture when state is sharded. It runs the real TP launch,
+collectives, counter audit and interpreter, then requires every inspected
+tensor to be byte-identical across ranks. This is the preferred tier-2 vehicle
+for attention split counts, state snapshot/restore and packet-body variants.
+
 ### Anchoring against a reference framework
 
 A single block cannot be *served* by a reference framework in isolation, so the

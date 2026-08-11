@@ -215,6 +215,20 @@ enum Cmd {
         /// two precisions.
         #[arg(long)]
         dump: Option<PathBuf>,
+        /// Tensor fixtures. Files are named `<tensor>.bin`; TP runs first look
+        /// under `rankN/`, then fall back to the common file.
+        #[arg(long)]
+        load_dir: Option<PathBuf>,
+        /// Run the decode program at this absolute query position instead of
+        /// driving a model-shaped prefill.
+        #[arg(long)]
+        decode_pos: Option<u32>,
+        /// Number of committed context rows visible to a decode-block run.
+        #[arg(long, requires = "decode_pos")]
+        decode_kvlen: Option<u32>,
+        /// Tensor-parallel ranks for a decode-block run.
+        #[arg(long, default_value_t = 1)]
+        tp: usize,
     },
 
     /// Dry-run the compiled packets (no device): walk each packet honoring
@@ -430,7 +444,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             inspect,
             list_tensors,
             dump,
-        } => amd_block(blob, hsaco, checkpoint, prompt, inspect, list_tensors, dump),
+            load_dir,
+            decode_pos,
+            decode_kvlen,
+            tp,
+        } => amd_block(
+            blob,
+            hsaco,
+            checkpoint,
+            prompt,
+            inspect,
+            list_tensors,
+            dump,
+            load_dir,
+            decode_pos,
+            decode_kvlen,
+            tp,
+        ),
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBlock { .. } => Err("plowrt was built without --features hsa".into()),
     }
@@ -1200,6 +1230,72 @@ fn amd_bench_tp(
 
 /// Drive a block asset: fill `act.x`, run its prefill program, read `act.x`.
 #[cfg(feature = "hsa")]
+fn load_block_fixtures(
+    eng: &mut plowrt::exec::amd::AmdEngine,
+    dir: &std::path::Path,
+    rank: usize,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let names = eng.tensor_names().to_vec();
+    let mut loaded = 0usize;
+    for name in names {
+        let ranked = dir.join(format!("rank{rank}")).join(format!("{name}.bin"));
+        let common = dir.join(format!("{name}.bin"));
+        let path = if ranked.is_file() {
+            ranked
+        } else if common.is_file() {
+            common
+        } else {
+            continue;
+        };
+        let bytes = std::fs::read(&path)?;
+        let want = eng.tensor_bytes(&name).unwrap_or(0) as usize;
+        if bytes.len() != want {
+            return Err(format!(
+                "fixture {} is {} B; tensor {name:?} on rank {rank} is {want} B",
+                path.display(),
+                bytes.len()
+            )
+            .into());
+        }
+        eng.write_tensor(&name, &bytes)?;
+        println!("rank {rank}: loaded {name} ({} B)", bytes.len());
+        loaded += 1;
+    }
+    Ok(loaded)
+}
+
+#[cfg(feature = "hsa")]
+fn read_block_tensor(
+    eng: &plowrt::exec::amd::AmdEngine,
+    name: &str,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    let Some(bytes) = eng.tensor_bytes(name) else {
+        return Ok(None);
+    };
+    let mut raw = vec![0u8; bytes as usize];
+    eng.read_tensor(name, &mut raw)?;
+    Ok(Some(raw))
+}
+
+#[cfg(feature = "hsa")]
+fn print_block_tensor(name: &str, raw: &[u8]) {
+    let n = raw.len() / 2;
+    let nz = raw.chunks_exact(2).filter(|c| c != &[0u8, 0u8]).count();
+    let sum: f64 = raw
+        .chunks_exact(2)
+        .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16).abs() as f64)
+        .sum();
+    println!(
+        "{name:<16} {nz:>12} {:>9.1}% {sum:>14.4}",
+        if n == 0 {
+            0.0
+        } else {
+            100.0 * nz as f64 / n as f64
+        }
+    );
+}
+
+#[cfg(feature = "hsa")]
 fn amd_block(
     blob: PathBuf,
     hsaco: PathBuf,
@@ -1208,8 +1304,30 @@ fn amd_block(
     inspect: String,
     list_tensors: bool,
     dump: Option<PathBuf>,
+    load_dir: Option<PathBuf>,
+    decode_pos: Option<u32>,
+    decode_kvlen: Option<u32>,
+    tp: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::exec::amd::AmdEngine;
+
+    if tp == 0 {
+        return Err("--tp must be at least 1".into());
+    }
+    if tp > 1 {
+        return amd_block_tp(
+            blob,
+            hsaco,
+            checkpoint,
+            inspect,
+            list_tensors,
+            dump,
+            load_dir,
+            decode_pos,
+            decode_kvlen,
+            tp,
+        );
+    }
 
     let be = Arc::new(plowrt::device::hsa::HsaBackend::new(0)?);
     let mut eng = AmdEngine::load(Arc::clone(&be), &blob, &hsaco, checkpoint.as_deref())?;
@@ -1218,6 +1336,11 @@ fn amd_block(
             println!("{n}\t{}", eng.tensor_bytes(n).unwrap_or(0));
         }
         return Ok(());
+    }
+    if let Some(dir) = &load_dir {
+        if load_block_fixtures(&mut eng, dir, 0)? == 0 {
+            return Err(format!("no tensor fixtures found under {}", dir.display()).into());
+        }
     }
 
     // The lm_head's operands BEFORE anything runs: if its weight is a tensor
@@ -1258,14 +1381,22 @@ fn amd_block(
         }
     }
 
-    let ids: Vec<u32> = prompt
-        .as_deref()
-        .unwrap_or("2,1000,2000,3000")
-        .split(',')
-        .map(|s| s.trim().parse::<u32>())
-        .collect::<std::result::Result<_, _>>()?;
-    let tok = eng.prefill(&ids)?;
-    println!("prefill {} tokens -> sampled id {tok}", ids.len());
+    if let Some(pos) = decode_pos {
+        let kvlen = decode_kvlen.ok_or("--decode-pos requires --decode-kvlen")?;
+        let dp = eng.decode_prog();
+        eng.decode_prepare(pos, kvlen)?;
+        eng.run(dp, eng.decode_kernel_for(dp))?;
+        println!("decode block at pos={pos}, committed kvlen={kvlen}");
+    } else {
+        let ids: Vec<u32> = prompt
+            .as_deref()
+            .unwrap_or("2,1000,2000,3000")
+            .split(',')
+            .map(|s| s.trim().parse::<u32>())
+            .collect::<std::result::Result<_, _>>()?;
+        let tok = eng.prefill(&ids)?;
+        println!("prefill {} tokens -> sampled id {tok}", ids.len());
+    }
 
     // ZERO vs WRONG is the whole question and the two are different hunts. A
     // scale-convention or arithmetic bug gives wrong-but-VARIED values; an
@@ -1310,6 +1441,79 @@ fn amd_block(
          wrong-but-varied values. The first zero tensor walking the chain is the\n\
          link to investigate."
     );
+    Ok(())
+}
+
+#[cfg(feature = "hsa")]
+#[allow(clippy::too_many_arguments)]
+fn amd_block_tp(
+    blob: PathBuf,
+    hsaco: PathBuf,
+    checkpoint: Option<PathBuf>,
+    inspect: String,
+    list_tensors: bool,
+    dump: Option<PathBuf>,
+    load_dir: Option<PathBuf>,
+    decode_pos: Option<u32>,
+    decode_kvlen: Option<u32>,
+    tp: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use plowrt::exec::amd_tp::AmdTpGroup;
+
+    let mut backends = Vec::with_capacity(tp);
+    for rank in 0..tp {
+        backends.push(Arc::new(plowrt::device::hsa::HsaBackend::new(rank as u8)?));
+    }
+    let mut group = AmdTpGroup::load(backends, &blob, &hsaco, checkpoint.as_deref())?;
+    if list_tensors {
+        for name in group.rank(0).tensor_names() {
+            println!("{name}\t{}", group.rank(0).tensor_bytes(name).unwrap_or(0));
+        }
+        return Ok(());
+    }
+    let dir = load_dir.ok_or("TP decode-block runs require --load-dir")?;
+    for rank in 0..tp {
+        if load_block_fixtures(group.rank_mut(rank), &dir, rank)? == 0 {
+            return Err(format!(
+                "no tensor fixtures found for rank {rank} under {}",
+                dir.display()
+            )
+            .into());
+        }
+    }
+    let pos = decode_pos.ok_or("TP block runs require --decode-pos")?;
+    let kvlen = decode_kvlen.ok_or("--decode-pos requires --decode-kvlen")?;
+    group.decode_block_step(pos, kvlen)?;
+    println!("TP{tp} decode block at pos={pos}, committed kvlen={kvlen}");
+
+    println!(
+        "\n{:<16} {:>12} {:>10} {:>14}",
+        "tensor", "non-zero", "%", "sum|x| (bf16)"
+    );
+    for name in inspect.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some(reference) = read_block_tensor(group.rank(0), name)? else {
+            println!("{name:<16} {:>12}", "(absent)");
+            continue;
+        };
+        print_block_tensor(name, &reference);
+        for rank in 1..tp {
+            let got = read_block_tensor(group.rank(rank), name)?
+                .ok_or_else(|| format!("tensor {name:?} exists on rank 0 but not rank {rank}"))?;
+            if got != reference {
+                return Err(format!(
+                    "TP block output {name:?} differs between rank 0 and rank {rank}"
+                )
+                .into());
+            }
+        }
+        if let Some(dir) = &dump {
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(dir.join(format!("{name}.bin")), &reference)?;
+        }
+    }
+    if let Some(dir) = &dump {
+        println!("\nwrote rank-identical raw tensors to {}", dir.display());
+    }
     Ok(())
 }
 

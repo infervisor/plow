@@ -1689,6 +1689,23 @@ fn k3_dspark_block_is_one_sequence_with_seven_noncausal_query_rows() {
     let bytes = |name: &str| m.tensors.iter().find(|t| t.name == name).unwrap().bytes;
     assert_eq!(bytes("in.kvlen"), 4, "one context frontier");
     assert_eq!(bytes("act.x"), 7 * c.hidden as u64 * 2);
+    for projection in ["gate_proj", "up_proj", "down_proj"] {
+        assert_eq!(
+            bytes(&format!("{}layers.0.mlp.{projection}.weight", c.prefix)),
+            c.hidden as u64 * c.dense_inter as u64 * 2,
+            "DSpark dense BF16 weights must declare two bytes per element"
+        );
+    }
+    for name in [
+        format!("{}embed_tokens.weight", c.prefix),
+        format!("{}norm.weight", c.prefix),
+        "lm_head.weight".to_owned(),
+    ] {
+        assert!(
+            m.tensors.iter().all(|tensor| tensor.name != name),
+            "a block asset must not declare unused model I/O tensor {name}"
+        );
+    }
 
     let p = &m.progs[0];
     let flash = p
