@@ -232,6 +232,35 @@ if(PLOW_ROCM)
     target_link_libraries(k3_gemv_cohort_sweep PRIVATE ${PLOW_AMDHIP64} m)
     add_dependencies(k3_gemv_cohort_sweep k3_gemv_cohort_sweep_gfx942_object)
 
+    set(K3_MLA_KDU4_CO ${CMAKE_CURRENT_BINARY_DIR}/k3_mla_kdu4_gfx942.co)
+    set(K3_MLA_KDU1_CO ${CMAKE_CURRENT_BINARY_DIR}/k3_mla_kdu1_gfx942.co)
+    set(K3_MLA_KDU2_CO ${CMAKE_CURRENT_BINARY_DIR}/k3_mla_kdu2_gfx942.co)
+    set(K3_MLA_KDU8_CO ${CMAKE_CURRENT_BINARY_DIR}/k3_mla_kdu8_gfx942.co)
+    foreach(KDU IN ITEMS 1 2 4 8)
+        add_custom_command(
+            OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/k3_mla_kdu${KDU}_gfx942.co
+            COMMAND "$ENV{PLOW_HIPCC}" --offload-arch=gfx942 -O3 -w -std=c++17 --genco
+                    -DPLOW_BUCKET_DECODE=1 -DPLOW_FP8_KV=1 -DPLOW_K3=1
+                    -DPLOW_WG_WAVES=8 -DFA_MLA_KDU=${KDU}
+                    -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                    -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                    ${CMAKE_CURRENT_SOURCE_DIR}/amd/k3_mla_kdu_sweep.hip
+                    -o ${CMAKE_CURRENT_BINARY_DIR}/k3_mla_kdu${KDU}_gfx942.co
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/amd/k3_mla_kdu_sweep.hip
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention.h
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
+            VERBATIM)
+    endforeach()
+    add_custom_target(k3_mla_kdu_sweep_gfx942_objects
+        DEPENDS ${K3_MLA_KDU1_CO} ${K3_MLA_KDU2_CO} ${K3_MLA_KDU4_CO} ${K3_MLA_KDU8_CO})
+    add_executable(k3_mla_kdu_sweep amd/k3_mla_kdu_sweep.cpp)
+    target_compile_features(k3_mla_kdu_sweep PRIVATE cxx_std_17)
+    target_include_directories(k3_mla_kdu_sweep PRIVATE "$ENV{ROCM_PATH}/include")
+    target_compile_definitions(k3_mla_kdu_sweep PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_compile_options(k3_mla_kdu_sweep PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(k3_mla_kdu_sweep PRIVATE ${PLOW_AMDHIP64} m)
+    add_dependencies(k3_mla_kdu_sweep k3_mla_kdu_sweep_gfx942_objects)
+
     # Model-free full-grid screen for replacing K3 B1 dense BF16 weights with
     # block-scaled E4M3 W8A16. Only candidates projecting >=5 ms/token proceed
     # to checkpoint conversion and TP8 serving.
