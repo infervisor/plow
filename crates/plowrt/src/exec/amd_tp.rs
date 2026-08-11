@@ -576,9 +576,7 @@ impl AmdTpGroup {
         dp: usize,
     ) -> Result<Vec<u32>> {
         self.submit_decode_batched_at(pos, kvlen, dp)?;
-        for e in &self.ranks {
-            e.drain()?;
-        }
+        self.drain_and_audit()?;
         // Only the rung's rows sampled; the reply still comes back `pos.len()` long so callers
         // can index it BY SLOT, with the uncovered tail zeroed.
         let b = pos.len();
@@ -720,6 +718,20 @@ impl AmdTpGroup {
     /// silent again — as it was before either check existed.
     pub fn complete_decode(&mut self) -> Result<Vec<u32>> {
         use crate::obs::dstep;
+        self.drain_and_audit()?;
+        let all = self.agree_tick >= self.agree_every;
+        self.agree_tick = if all { 1 } else { self.agree_tick + 1 };
+        dstep::timed(&dstep::READ, || {
+            if all {
+                self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
+            } else {
+                Ok(vec![self.ranks[0].read_sampled()?])
+            }
+        })
+    }
+
+    fn drain_and_audit(&mut self) -> Result<()> {
+        use crate::obs::dstep;
         dstep::timed(&dstep::DRAIN, || -> Result<()> {
             for e in &self.ranks {
                 e.drain()?;
@@ -759,15 +771,7 @@ impl AmdTpGroup {
                 }
             })?;
         }
-        let all = self.agree_tick >= self.agree_every;
-        self.agree_tick = if all { 1 } else { self.agree_tick + 1 };
-        dstep::timed(&dstep::READ, || {
-            if all {
-                self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
-            } else {
-                Ok(vec![self.ranks[0].read_sampled()?])
-            }
-        })
+        Ok(())
     }
 
     /// Prefill `prompt` on every rank. Returns each rank's first sampled id.

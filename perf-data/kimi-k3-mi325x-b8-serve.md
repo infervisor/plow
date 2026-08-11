@@ -8,9 +8,9 @@ Toolchain: flake-pinned ROCm 7.14.0. Client: flake-pinned vLLM 0.26.0
 ## Artifact and correctness
 
 The B8 TP8 artifact uses the real Kimi-K3 checkpoint, native MXFP4 weights,
-FP8 KV, the 128-workgroup GEMV cap, L2-placed prefill, and the compact exact TP
-counter audit. Batched decode contains the grouped MXFP4 A4W4 arm; the runtime
-refuses an object missing that capability marker.
+FP8 KV, the 128-workgroup GEMV cap, and L2-placed prefill. Batched decode
+contains the grouped MXFP4 A4W4 arm; the runtime refuses an object missing that
+capability marker.
 
 - OpenAI coherence gate: `The capital of France is **Paris**.`
 - 16k and 32k prompt requests ran concurrently and completed successfully.
@@ -35,8 +35,15 @@ tokens and exactly 4,096 generated tokens.
 | 3 | 80.650 | 50.787 | 827.02 | 148.28 | 480.38 | 32/32 | 4096/4096 |
 
 Median output throughput is **50.685 tok/s**; range is 50.604--50.787 tok/s.
-This clears the 50 aggregate tok/s target. It does not claim 50 tok/s for one
-stream; the B1 latency result remains 18.4 tok/s.
+This clears the 50 aggregate tok/s diagnostic target. It does not claim 50
+tok/s for one stream; the B1 latency result remains 18.4 tok/s.
+
+Post-run audit found that the batched TP completion path performed full-vector
+rank agreement but bypassed the configured compact cross-GPU counter audit.
+These three measurements therefore are not production-adoption numbers. The
+runtime now factors drain+audit into the scalar and batched paths; its GPU gate
+reports one nonzero compact audit per step (~1.64 ms). The corrected serving
+result must replace this table before B8 is adopted.
 
 ```bash
 nix develop .#vllm --command vllm bench serve \
