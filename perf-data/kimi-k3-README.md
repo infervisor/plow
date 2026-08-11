@@ -151,7 +151,7 @@ Warmup: arms emitted with different `--n-cu` were observed to sample warmup toke
 | `PLOW_K3_SHARD_UP` | **on** (`!= "0"`, needs tp>1) | column-parallel `routed_expert_up_proj`, gather folded into the shared reduce. −22.8% GEMV bytes |
 | `PLOW_K3_SHARD_HEAD=1` | off | column-parallel `lm_head` (`XArgmaxFin`). Gate passes; `k3_tp_equivalence.sh` CANNOT gate it — `--dump-logits` dumps `act.logits`, `vocab/tp` wide at tp=8, so its shape check fails by construction |
 | `PLOW_K3_FUSE_ARNORM` | **on** (`!= "0"`) | fuse the AttnRes norm |
-| `PLOW_K3_FUSE_NGEMV=1` | **off** | fold the `b=1` RMSNORM gates into the `b=256` GEMVs that read them (`routed_expert_norm` x92 fan=1, `q_a_layernorm` x24 fan=2). Removes all 116 RMSNORM packets; critical path 1831 -> 1715. **NOT BIT-EXACT END-TO-END YET** — bit-exact in the isolated hardware gate, diverges ~1 ULP through the full model. Do not enable for a real serve. `perf-data/k3-narrow-gate-fusion.md` |
+| `PLOW_K3_FUSE_NGEMV` | **on** | fold the `b=1` RMSNORM gates into their GEMV consumers (`routed_expert_norm` x92, `q_a_layernorm` x24). Removes 116 packets and moves critical path 1831 -> 1715. Current TP8 full-logit A/B is byte-exact; two served pairs improve TPOT 1.33--1.45 ms. `=0` restores the control. `perf-data/k3-narrow-gate-fusion.md` |
 | `PLOW_SEG_PER_OP=1` | off | one AQL segment per op (host-side chaining). **BROKEN at TP8** — ranks desync, a collective hits its deadline and returns WITHOUT reducing |
 | `PLOW_FINE_FORCE=1` | off | keep genuinely-sparse `Dep::Fine` edges. **No-op on K3** — the K3 emitter creates zero fine deps |
 | `PLOW_UNISEG=1` | off | force one wave-class segment |

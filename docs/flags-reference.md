@@ -259,7 +259,7 @@ are not parity-preserving.
 | `PLOW_K3_SHARD_UP` | **on** (tp>1) | column-parallel `routed_expert_up_proj`; `=0` = replicated A/B. |
 | `PLOW_K3_WGFIT` | **on** | narrow workgroup/CU counts to what a packet uses (bit-identical). |
 | `PLOW_K3_NS` | measured | pin FlashMLA-decode `nsplit` for K3 MLA layers. |
-| `PLOW_K3_FUSE_NGEMV` | **off** ⚠️ | fold `norm→GEMV`; off due to an unresolved ~1-ULP end-to-end divergence — risks a fluent-but-wrong model. |
+| `PLOW_K3_FUSE_NGEMV` | **on** | fold the two B1 `norm→GEMV` sites; `0` restores the unfused control, `lat`/`q` isolate one site. Full TP8 BF16-logit gate is byte-exact. |
 | `PLOW_K3_SHARD_HEAD` | **off** ⚠️ | vocab-column-parallel `lm_head`; unvalidated on real K3. |
 | `PLOW_GLM_FUSE_A` / `PLOW_GLM_FUSE_G` | **on** | fuse the GLM A-projection / gate GEMVs (byte-identical); `=0` splits. |
 | `PLOW_GLM_DSA` | **on** (ctx>65536) | arm the DSA sparse-indexer gather above the measured ctx crossover; `=0` forces dense. |

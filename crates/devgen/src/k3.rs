@@ -418,32 +418,18 @@ fn fuse_shared_glu(t: u32, hidden: u32) -> bool {
 /// The standalone kernel test PASSED throughout, because it declared two separate `__shared__`
 /// arrays and therefore did not alias. See `perf-data/k3-narrow-gate-fusion.md` §4.
 ///
-/// # STATUS: NOT BIT-EXACT END-TO-END. DEFAULT OFF. Do not turn this on without reading this.
+/// # STATUS: BIT-EXACT END-TO-END. DEFAULT ON.
 ///
 /// The design below is bit-exact and the isolated hardware gate agrees — `norm = 2` reproduces
 /// the RMSNORM+GEMV pair to ZERO differing halves at every shape the emitter folds, including the
 /// tp8-sharded `N=896 K=3584 b=224` geometry (`runtime/tests/gemv_fusednorm_gfx950_test.hip`).
 ///
-/// The WHOLE MODEL does not agree, and the cause is not yet found. At `--ctx 5` (decode over
-/// prefilled KV only), against a control that reproduces itself 33/33:
-///
-/// ```text
-///   q-only   (24 sites, K=1536)   33/33 logit files identical
-///   lat-only (92 sites, K=3584)   diverges from decode step 14
-///   both, part aliasing the row   diverges from step 24   (25/33)
-///   both, scratch at arena top    diverges from step  9   (10/33)
-/// ```
-///
-/// The token stream is IDENTICAL over 32 steps in every variant and the argmax agrees at the
-/// first differing step; the drift is ~1-2 bf16 ULP (median 0.047), which is the scale
-/// `op_collective.h` prices at ~0.03 logits over 92 MoE layers. So it is small, and it is still
-/// disqualifying: this tree's whole A/B discipline rests on an emit knob being a CONTROL.
-///
-/// What is known: `plow_smem` is a UNION, so the interpreter's `part` and `gm` are one buffer and
-/// the first version reduced through the row it was normalizing. Moving the scratch to the top of
-/// the arena removed that alias and made the divergence EARLIER, not gone — so the arena is
-/// contended by something else too (`d_gemv_t` mentions a prefetch ring living in it). The next
-/// step is to find what else writes that arena during a GEMV, not to try a third offset.
+/// The current gfx942 TP8 gate compares rank-0's complete BF16 logit row after prefill and all 32
+/// decode steps at `ctx=5`. Every vector is byte-identical (`maxabs=0`), all eight ranks emit the
+/// same token stream, and two matched `plowrt serve` pairs improve TPOT by 1.33--1.45 ms. The
+/// earlier divergent implementation reduced through storage aliased by `plow_smem`; the derived
+/// arena-top scratch below makes that pointer unreachable. `PLOW_K3_FUSE_NGEMV=0` retains the
+/// unfused control packet.
 ///
 /// # Why it is bit-exact by construction, when the arena is not contended
 ///
@@ -460,9 +446,8 @@ fn fuse_shared_glu(t: u32, hidden: u32) -> bool {
 /// WRITES NOTHING — a silent no-op, not a crash. The row must also fit the staged arm
 /// (`GM_LDS_HALVES`) and `d_rmsnorm`'s register path (`feat <= RN_REG*PLOW_THREADS`, `feat % 8`).
 ///
-/// `PLOW_K3_FUSE_NGEMV=1` opts in (default OFF); `=lat` and `=q` enable ONE site each, which is
-/// how the table above was produced — a whole-model A/B that moves cannot say which rewrite
-/// moved it.
+/// `PLOW_K3_FUSE_NGEMV=0` restores the unfused control; `=lat` and `=q` enable ONE site each,
+/// which is how the original divergence was bisected.
 /// Which fold site a [`fuse_norm_gemv`] call is asking about. The knob can name ONE of them, which
 /// is what makes an end-to-end divergence bisectable: `lat` and `q` are independent rewrites and a
 /// whole-model A/B that moves cannot say which one moved it.
@@ -475,11 +460,10 @@ pub(crate) enum NormSite {
 }
 
 pub(crate) fn fuse_norm_gemv(t: u32, feat: u32, site: NormSite) -> bool {
-    // DEFAULT OFF. Opt-in only, until the divergence in the header above is resolved — this
-    // emitter's job is to not ship a fluent wrong model, and an unexplained 1-ULP drift through
-    // 92 layers is exactly that risk. `=1` both sites, `=lat`/`=q` one site (for bisecting).
+    // Default on after the full-model BF16-logit gate above. `=0` is the measured control;
+    // `=lat`/`=q` keep the two sites independently bisectable.
     match crate::emit_config::active().k3_fuse_ngemv.as_deref() {
-        Some("1") => {}
+        None | Some("1") => {}
         Some("lat") if site == NormSite::Lat => {}
         Some("q") if site == NormSite::Q => {}
         _ => return false,
@@ -4331,36 +4315,22 @@ mod tests {
         assert!(waits.contains(&routed_reduce));
     }
 
-    /// The narrow-norm fusion is OFF in a default emit, and that is the shipped state.
-    ///
-    /// `fuse_norm_gemv` is bit-exact in isolation but NOT end-to-end yet (its doc carries the
-    /// table). Until that is resolved the default emit must carry all 116 RMSNORM packets and no
-    /// `norm = 2` GEMV — this test is what stops it being switched on by accident, which on this
-    /// interpreter would be a silent ~1-ULP-per-layer drift rather than a failure.
+    /// The default decode emit carries the full-model-gated narrow-norm fusion.
     #[test]
-    fn the_narrow_norm_fusion_is_off_by_default() {
+    fn the_narrow_norm_fusion_is_on_by_default() {
         let p = build_full(8);
         let fused = p
             .insts
             .iter()
             .filter(|i| i.op == DevOp::Gemv as u16 && i.i[3] == 2)
             .count();
-        assert_eq!(
-            fused, 0,
-            "PLOW_K3_FUSE_NGEMV must be opt-in: no norm=2 GEMV in a default emit"
-        );
-        // Every narrow norm still has its own packet. The exact per-width counts (92 at 3584,
-        // 24 at 1536) are a property of the 93-layer ASSET, not of this synthetic cfg, so they
-        // are recorded in `fuse_norm_gemv`'s doc and checked against a real emit, not here.
+        assert!(fused > 0, "the default K3 decode must carry norm=2 GEMVs");
         let norms = p
             .insts
             .iter()
             .filter(|i| i.op == DevOp::RmsNorm as u16)
             .count();
-        assert!(
-            norms > 0,
-            "the fold is off, so the RMSNORM packets must all still be emitted"
-        );
+        assert!(norms > 0, "non-fusable RMSNORM packets must remain");
         let widths: std::collections::BTreeSet<u32> = p
             .insts
             .iter()
