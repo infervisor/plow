@@ -221,7 +221,10 @@ AX_MLA_K3="$AX_MLA -DPLOW_K3=1"
 # costs the prefill object NOTHING (256 VGPR / occ 2 / 8 spill, byte-for-byte the same resource
 # report as the object without it).
 AX_A4W4="-DPLOW_MOE_PF_A4W4=1"
-AX_K3_A4W4=""
+# K3's full prefill program is L2-placed on gfx942, unlike the segmented prefill programs this
+# script otherwise builds. Arm the queue interpretation on exactly the K3 A4W4 rows; hierarchy
+# remains a separate, unmeasured PLOW_L2HIER_PF experiment.
+AX_K3_A4W4="-DPLOW_L2_PLACE_DISPATCH=1"
 # Value-identical CDNA3 DOWN metadata hoist: 6.155 -> 5.490 ms at the emitted TP8
 # 4096-token/896-expert shape. Keep it on the K3 A4W4 rows so unrelated model objects do not move.
 if [ "${PLOW_K3_A4W4_EPI:-1}" != 0 ]; then
