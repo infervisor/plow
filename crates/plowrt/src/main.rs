@@ -1361,10 +1361,24 @@ fn block_query_rows(blob: &std::path::Path) -> Result<u32, Box<dyn std::error::E
     Ok(program
         .insts
         .iter()
-        .filter(|inst| {
-            inst.op == DevOp::FlashMlaDecode as u16 && inst.t[7] == TENSOR_NONE16 && inst.i[6] > 1
+        .filter_map(|inst| {
+            if inst.op == DevOp::FlashMlaDecode as u16
+                && inst.t[7] == TENSOR_NONE16
+                && inst.i[6] > 1
+            {
+                Some(inst.i[6])
+            } else if (inst.op == DevOp::FlashMlaDecode as u16
+                || inst.op == DevOp::FlashMlaDecodeFp8 as u16)
+                && inst.fj[1] > 1
+            {
+                Some(inst.fj[1])
+            } else if inst.op == DevOp::KdaStateStepG as u16 && inst.i[4] & 4 != 0 && inst.i[0] > 1
+            {
+                Some(inst.i[0])
+            } else {
+                None
+            }
         })
-        .map(|inst| inst.i[6])
         .max()
         .unwrap_or(1))
 }
@@ -1423,6 +1437,7 @@ fn amd_block(
             blob,
             hsaco,
             checkpoint,
+            prompt,
             inspect,
             list_tensors,
             dump,
@@ -1582,6 +1597,7 @@ fn amd_block_tp(
     blob: PathBuf,
     hsaco: PathBuf,
     checkpoint: Option<PathBuf>,
+    prompt: Option<String>,
     inspect: String,
     list_tensors: bool,
     dump: Option<PathBuf>,
@@ -1624,46 +1640,122 @@ fn amd_block_tp(
     let inputs: Vec<_> = (0..tp)
         .map(|rank| read_block_input(group.rank(rank), &dir, rank))
         .collect::<Result<_, _>>()?;
-    let iterations = warmup
-        .checked_add(reps)
-        .ok_or("--warmup + --reps overflow")?;
+    let forced: Option<Vec<u32>> = prompt
+        .as_deref()
+        .map(|text| {
+            text.split(',')
+                .map(|s| s.trim().parse::<u32>())
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    if forced.is_some() && (warmup != 0 || reps != 1) {
+        return Err("--prompt decode replay requires --warmup 0 --reps 1".into());
+    }
+    if let Some(ids) = &forced {
+        if query_rows > 1 && ids.len() != query_rows as usize {
+            return Err(format!(
+                "verifier packet has {query_rows} query rows but --prompt supplied {} ids",
+                ids.len()
+            )
+            .into());
+        }
+        if ids.is_empty() {
+            return Err("--prompt must contain at least one token id".into());
+        }
+    }
+    let iterations = if query_rows == 1 {
+        forced.as_ref().map_or_else(
+            || warmup.checked_add(reps).ok_or("--warmup + --reps overflow"),
+            |ids| Ok(ids.len() as u32),
+        )?
+    } else {
+        warmup
+            .checked_add(reps)
+            .ok_or("--warmup + --reps overflow")?
+    };
+    let inspect_names: Vec<_> = inspect
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     let mut samples = Vec::with_capacity(reps as usize);
+    let mut sequence_outputs = vec![Vec::new(); inspect_names.len()];
     for iteration in 0..iterations {
         for rank in 0..tp {
             group.rank_mut(rank).write_tensor("act.x", &inputs[rank])?;
+            if let Some(ids) = &forced {
+                let bytes: Vec<u8> = if query_rows == 1 {
+                    ids[iteration as usize].to_le_bytes().to_vec()
+                } else {
+                    ids.iter().flat_map(|id| id.to_le_bytes()).collect()
+                };
+                group.rank_mut(rank).write_tensor("in.ids", &bytes)?;
+            }
         }
         let start = std::time::Instant::now();
-        group.decode_block_step(pos, kvlen)?;
-        if iteration >= warmup {
+        let step = if forced.is_some() && query_rows == 1 {
+            iteration
+        } else {
+            0
+        };
+        group.decode_block_step(pos + step, kvlen + step)?;
+        if forced.is_some() && query_rows == 1 {
+            for (name, sequence) in inspect_names.iter().zip(&mut sequence_outputs) {
+                let Some(row) = read_block_tensor(group.rank(0), name)? else {
+                    continue;
+                };
+                for rank in 1..tp {
+                    let got = read_block_tensor(group.rank(rank), name)?.ok_or_else(|| {
+                        format!("tensor {name:?} exists on rank 0 but not rank {rank}")
+                    })?;
+                    if got != row {
+                        return Err(format!(
+                            "TP serial replay {name:?} differs between rank 0 and rank {rank} at step {step}"
+                        )
+                        .into());
+                    }
+                }
+                sequence.extend_from_slice(&row);
+            }
+        } else if iteration >= warmup {
             samples.push(start.elapsed().as_secs_f64() * 1e3);
         }
     }
     println!("TP{tp} decode block at pos={pos}, query_rows={query_rows}, committed kvlen={kvlen}");
-    print_block_timings(tp, warmup, &mut samples);
+    if forced.is_some() && query_rows == 1 {
+        println!("serial replay: {} forced target rows", iterations);
+    } else {
+        print_block_timings(tp, warmup, &mut samples);
+    }
 
     println!(
         "\n{:<16} {:>12} {:>10} {:>14}",
         "tensor", "non-zero", "%", "sum|x| (bf16)"
     );
-    for name in inspect.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let Some(reference) = read_block_tensor(group.rank(0), name)? else {
+    for (name, sequence_raw) in inspect_names.iter().zip(&sequence_outputs) {
+        let sequence = (!sequence_raw.is_empty()).then_some(sequence_raw.as_slice());
+        let loaded = read_block_tensor(group.rank(0), name)?;
+        let Some(reference) = sequence.or(loaded.as_deref()) else {
             println!("{name:<16} {:>12}", "(absent)");
             continue;
         };
-        print_block_tensor(name, &reference);
-        for rank in 1..tp {
-            let got = read_block_tensor(group.rank(rank), name)?
-                .ok_or_else(|| format!("tensor {name:?} exists on rank 0 but not rank {rank}"))?;
-            if got != reference {
-                return Err(format!(
-                    "TP block output {name:?} differs between rank 0 and rank {rank}"
-                )
-                .into());
+        print_block_tensor(name, reference);
+        if sequence.is_none() {
+            for rank in 1..tp {
+                let got = read_block_tensor(group.rank(rank), name)?.ok_or_else(|| {
+                    format!("tensor {name:?} exists on rank 0 but not rank {rank}")
+                })?;
+                if got != reference {
+                    return Err(format!(
+                        "TP block output {name:?} differs between rank 0 and rank {rank}"
+                    )
+                    .into());
+                }
             }
         }
         if let Some(dir) = &dump {
             std::fs::create_dir_all(dir)?;
-            std::fs::write(dir.join(format!("{name}.bin")), &reference)?;
+            std::fs::write(dir.join(format!("{name}.bin")), reference)?;
         }
     }
     if let Some(dir) = &dump {
