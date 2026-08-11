@@ -893,6 +893,32 @@ if [ -f "$EXPECT" ] && command -v python3 >/dev/null; then
   echo "$audit" | tail -20
 fi
 
+# B>1 K3 decode dispatches grouped ops 85/86 with MXFP4 encoding. Check the
+# capability marker before the body: the generic grouped arm also contains
+# bf16 MFMA, so disassembly alone cannot prove that the enc=2 arm exists.
+if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] && command -v python3 >/dev/null; then
+  K3_BATCH_EXPECT="$REPO/scripts/asm_expect_gfx942_k3_batched.json"
+  k3_batch_objects=()
+  for object in \
+      interp_decode_k3.elf interp_decode_k3_gq.elf \
+      interp_decode_fp8kv_k3.elf interp_decode_fp8kv_k3_gq.elf; do
+    [ -f "$object" ] || continue
+    k3_batch_objects+=("$object")
+    symbols=$("$READELF" -sW "$object" 2>/dev/null)
+    grep -qE "OBJECT .* plow_moe_pf_a4w4_arm$" <<<"$symbols" || {
+      echo "FAIL  $object: missing plow_moe_pf_a4w4_arm for PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH}"
+      fail=1
+    }
+  done
+  if [ "${#k3_batch_objects[@]}" -gt 0 ] && [ -f "$K3_BATCH_EXPECT" ]; then
+    echo ""
+    echo "   --- K3 batched A4W4 instruction-selection audit ---"
+    batch_audit=$(python3 "$REPO/scripts/asm_audit.py" --expect "$K3_BATCH_EXPECT" \
+        "${k3_batch_objects[@]}") || fail=1
+    echo "$batch_audit" | tail -20
+  fi
+fi
+
 echo ""
 [ "$fail" = 0 ] && echo ">>> $OUT ready ($(ls "$OUT"/*.elf | wc -l) objects)" || {
   echo "!!! one or more rows are over the cliff or missing"; exit 1; }
