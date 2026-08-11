@@ -203,6 +203,15 @@ use crate::{Result, RuntimeError};
 /// rather than ~23 the same microseconds are worth cadencing. Measure first.
 const DEFAULT_AGREE_EVERY: u32 = 1;
 
+fn next_spec_commit(current: u32, row: usize) -> Result<u32> {
+    if current >= 9 || row >= 8 {
+        return Err(RuntimeError::Device(format!(
+            "invalid speculative journal transition: bank={current}, row={row}"
+        )));
+    }
+    Ok((current + 1 + row as u32) % 9)
+}
+
 /// N co-resident ranks of one sharded model.
 pub struct AmdTpGroup {
     /// Peer buffers, counter regions, and the launch discipline.
@@ -235,6 +244,8 @@ pub struct AmdTpGroup {
     /// the program that actually ran, and submit/complete are separate calls by design (the
     /// split is what lets the host do nothing between launch and drain).
     cur_dp: usize,
+    /// Host mirror of the one selector shared by every verifier rank.
+    spec_commit: Option<u32>,
 }
 
 impl AmdTpGroup {
@@ -319,6 +330,16 @@ impl AmdTpGroup {
             ));
         }
         let gate_expect = gate_expectations(&blob, n_gpu, n_xctr);
+        let has_spec_commit = match blob.tensors.iter().find(|t| t.name == "kv.spec_commit") {
+            Some(t) if t.bytes == 4 => true,
+            Some(t) => {
+                return Err(RuntimeError::Device(format!(
+                    "kv.spec_commit is {} bytes, expected one u32",
+                    t.bytes
+                )))
+            }
+            None => false,
+        };
         let layout = PeerLayout::new(tp.hidden, max_tokens, n_xctr).ok_or_else(|| {
             RuntimeError::Device(format!(
                 "peer layout for hidden={} x {max_tokens} tokens is not 128 B-aligned",
@@ -372,6 +393,7 @@ impl AmdTpGroup {
         // Every rank's binding, resolved before any of them loads, so the load
         // itself borrows nothing from `group`.
         let mut binds = Vec::with_capacity(backends.len());
+        let spec_commit = group.rank(0)?.scratch_base() + group.layout().spec_commit_off();
         for (r, be) in backends.into_iter().enumerate() {
             let tr = group.rank(r as u32)?;
             binds.push((
@@ -382,6 +404,7 @@ impl AmdTpGroup {
                     peer_table: tr.peer_scratch_table(),
                     xctr: tr.xctr(),
                     xstatus_id: n_xctr,
+                    spec_commit,
                     scratch_base: tr.scratch_base(),
                     slot_b: tp.slot_bytes,
                 },
@@ -487,6 +510,7 @@ impl AmdTpGroup {
             agree_tick: agree_every,
             // Overwritten by the first submit; the widest rung is the safe pre-first-step value.
             cur_dp: 0,
+            spec_commit: has_spec_commit.then_some(0),
         })
     }
 
@@ -503,6 +527,28 @@ impl AmdTpGroup {
 
     pub fn n_gpu(&self) -> usize {
         self.ranks.len()
+    }
+
+    /// Commit verifier row `row` after its TP dispatch, counter audit, rank agreement, and
+    /// sampler decision have all succeeded. Every rank reads the same peer-mapped selector, so
+    /// one completed write publishes the transition atomically to the whole group.
+    pub fn commit_spec_row(&mut self, row: usize) -> Result<u32> {
+        let current = self.spec_commit.ok_or_else(|| {
+            RuntimeError::Device("packet has no kv.spec_commit journal selector".into())
+        })?;
+        let next = next_spec_commit(current, row)?;
+        self.group
+            .rank(0)?
+            .write_scratch(self.group.layout().spec_commit_off(), &next.to_le_bytes())?;
+        self.spec_commit = Some(next);
+        Ok(next)
+    }
+
+    /// Leave the committed recurrent state and visible KV frontier unchanged.
+    pub fn rollback_spec(&self) -> Result<u32> {
+        self.spec_commit.ok_or_else(|| {
+            RuntimeError::Device("packet has no kv.spec_commit journal selector".into())
+        })
     }
 
     /// Task-9 differential counter audit: rank 0's end-state counters for `dp`.
@@ -1308,6 +1354,16 @@ mod tests {
     #[test]
     fn cross_rank_agreement_is_not_sampled_by_default() {
         assert_eq!(DEFAULT_AGREE_EVERY, 1);
+    }
+
+    #[test]
+    fn speculative_commit_rotates_without_touching_rollback_state() {
+        assert_eq!(next_spec_commit(0, 0).unwrap(), 1);
+        assert_eq!(next_spec_commit(0, 7).unwrap(), 8);
+        assert_eq!(next_spec_commit(7, 0).unwrap(), 8);
+        assert_eq!(next_spec_commit(7, 7).unwrap(), 6);
+        assert!(next_spec_commit(9, 0).is_err());
+        assert!(next_spec_commit(0, 8).is_err());
     }
 
     /// The cadence must fire on token ZERO. A rank that bound the wrong shard is

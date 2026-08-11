@@ -1030,14 +1030,20 @@ fn requires_k3_spec_verify(progs: &[DevProg]) -> bool {
 }
 
 fn check_k3_spec_verify(syms: &[&str], path: &Path, need: bool) -> Result<()> {
-    if !need || syms.contains(&K3_SPEC_VERIFY_SYM) {
+    let armed = syms.contains(&K3_SPEC_VERIFY_SYM);
+    if need == armed {
         return Ok(());
     }
+    let detail = if need {
+        "the packet carries a causal multi-token MLA block but the object is ordinary"
+    } else {
+        "the object is a state-journaling verifier but the packet is ordinary"
+    };
     Err(RuntimeError::Device(format!(
-        "packet/object K3 target-verifier MISMATCH: this packet carries a causal multi-token MLA \
-         decode block, but {} lacks `{K3_SPEC_VERIFY_SYM}`. Rebuild the dedicated object with \
-         -DPLOW_K3_SPEC_VERIFY=1; an ordinary decode object would verify every row against the \
-         wrong one-token causal frontier.",
+        "packet/object K3 target-verifier MISMATCH: {detail}: {}. Pair verifier packets only with \
+         objects built with PLOW_K3_SPEC_VERIFY=1 and advertising `{K3_SPEC_VERIFY_SYM}`; an \
+         asymmetric pairing changes the causal frontier or interprets KDA journal operands as \
+         ordinary strides.",
         path.display()
     )))
 }
@@ -3091,6 +3097,8 @@ pub struct TpBind {
     pub xctr: u64,
     /// Reserved xctr id used by the compact device audit status line.
     pub xstatus_id: u32,
+    /// One group-wide selector shared by every rank's speculative verifier.
+    pub spec_commit: u64,
     /// This rank's peer-region base (`peer_scratch[rank]`). `act.og_tp` binds at
     /// offset 0 and `act.dg_tp` at [`TpBind::slot_b`], so the row-parallel
     /// o_proj/down write their partials where peers can read them.
@@ -3100,6 +3108,18 @@ pub struct TpBind {
     /// rather than recomputed: a host that computed its own would put `dg_tp`
     /// where no peer reads it, and nothing would say so.
     pub slot_b: u64,
+}
+
+impl TpBind {
+    fn tensor_base(self, name: &str) -> Option<u64> {
+        match name {
+            "act.og_tp" => Some(self.scratch_base),
+            "act.dg_tp" => Some(self.scratch_base + self.slot_b),
+            "act.ug_tp" => Some(self.scratch_base + 2 * self.slot_b),
+            "kv.spec_commit" => Some(self.spec_commit),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4288,12 +4308,7 @@ impl AmdEngine {
         //     have every rank reduce slots its peers never wrote.
         //   * full-layer KV under VMM — the pool's VA reservation, mapped lazily
         //     at the per-sequence frontier.
-        let is_peer_slot = |name: &str| {
-            matches!(
-                (tp.is_some(), name),
-                (true, "act.og_tp") | (true, "act.dg_tp") | (true, "act.ug_tp")
-            )
-        };
+        let is_peer_slot = |name: &str| tp.and_then(|t| t.tensor_base(name)).is_some();
         let is_vmm = |name: &str| {
             vmm.as_ref()
                 .and_then(|v| {
@@ -4377,14 +4392,7 @@ impl AmdEngine {
             // A non-owning view: the storage belongs to the `TpRank`'s peer
             // allocation, which outlives the engine. `devgen` only declares
             // these two tensors when tp > 1.
-            let peer_slot = match (tp, td.name.as_str()) {
-                (Some(t), "act.og_tp") => Some(t.scratch_base),
-                (Some(t), "act.dg_tp") => Some(t.scratch_base + t.slot_b),
-                // Slot 2, the GATHER slot: a column-parallel partial the reduce out of
-                // slot 0 folds in (`PARTIAL_SLOTS`). Only K3's LatentMoE declares it.
-                (Some(t), "act.ug_tp") => Some(t.scratch_base + 2 * t.slot_b),
-                _ => None,
-            };
+            let peer_slot = tp.and_then(|t| t.tensor_base(&td.name));
             if let Some(base) = peer_slot {
                 tracing::debug!(
                     name = %td.name, base = format_args!("{base:#x}"), bytes = td.bytes,
@@ -7506,11 +7514,32 @@ mod tests {
         assert!(err.contains(K3_SPEC_VERIFY_SYM));
         assert!(err.contains("PLOW_K3_SPEC_VERIFY"));
         assert!(check_k3_spec_verify(&[K3_SPEC_VERIFY_SYM], obj, true).is_ok());
+        assert!(check_k3_spec_verify(&[], obj, false).is_ok());
+        assert!(check_k3_spec_verify(&[K3_SPEC_VERIFY_SYM], obj, false).is_err());
 
         packet[0].insts[0].fj[1] = 0;
         assert!(!requires_k3_spec_verify(&packet));
         packet[0].insts[0].fj[1] = 1;
         assert!(!requires_k3_spec_verify(&packet));
+    }
+
+    #[test]
+    fn tp_verifier_binds_one_group_wide_commit_selector() {
+        let bind = TpBind {
+            rank: 3,
+            n_gpu: 8,
+            peer_table: 0x1000,
+            xctr: 0x2000,
+            xstatus_id: 17,
+            spec_commit: 0x3000,
+            scratch_base: 0x4000,
+            slot_b: 0x800,
+        };
+        assert_eq!(bind.tensor_base("kv.spec_commit"), Some(0x3000));
+        assert_eq!(bind.tensor_base("act.og_tp"), Some(0x4000));
+        assert_eq!(bind.tensor_base("act.dg_tp"), Some(0x4800));
+        assert_eq!(bind.tensor_base("act.ug_tp"), Some(0x5000));
+        assert_eq!(bind.tensor_base("kv.0.state"), None);
     }
 
     #[test]

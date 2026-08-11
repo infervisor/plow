@@ -510,6 +510,33 @@ if(PLOW_ROCM)
     target_link_libraries(kda_state_resident_gfx942_test PRIVATE ${PLOW_AMDHIP64} m)
     add_dependencies(kda_state_resident_gfx942_test kda_state_resident_gfx942_elf)
 
+    set(KDA_JOURNAL_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tests/kda_journal_gfx942_test.hip)
+    set(KDA_JOURNAL_ELF ${CMAKE_CURRENT_BINARY_DIR}/kda_journal_gfx942.elf)
+    add_custom_command(
+        OUTPUT ${KDA_JOURNAL_ELF}
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+                "$ENV{PLOW_HIPCC}" "$ENV{PLOW_BUNDLER}" gfx942
+                ${KDA_JOURNAL_ELF} k_journal_state 256 2
+                -DKDAJ_DEVICE=1 -DPLOW_K3_SPEC_VERIFY=1
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                ${KDA_JOURNAL_SRC}
+        DEPENDS ${KDA_JOURNAL_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_kda.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_elementwise.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+        VERBATIM)
+    add_custom_target(kda_journal_gfx942_elf DEPENDS ${KDA_JOURNAL_ELF})
+    set_source_files_properties(${KDA_JOURNAL_SRC}
+        PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x c++")
+    add_executable(kda_journal_gfx942_test ${KDA_JOURNAL_SRC})
+    target_compile_features(kda_journal_gfx942_test PRIVATE cxx_std_17)
+    target_include_directories(kda_journal_gfx942_test PRIVATE "$ENV{ROCM_PATH}/include")
+    target_compile_definitions(kda_journal_gfx942_test PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_compile_options(kda_journal_gfx942_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(kda_journal_gfx942_test PRIVATE ${PLOW_AMDHIP64} m)
+    add_dependencies(kda_journal_gfx942_test kda_journal_gfx942_elf)
+
     # Exact seven-query DSpark MLA semantic oracle. The device object contains both the
     # non-causal specialization and the ordinary causal control; the host requires the former to
     # match an independent f64 reference and the latter to diverge on the same committed prefix.
