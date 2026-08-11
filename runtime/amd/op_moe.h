@@ -3139,6 +3139,17 @@ typedef unsigned mpf4_b16 __attribute__((ext_vector_type(4), aligned(4)));
 __device__ __forceinline__ mpf4_b16 mpf4_ld16(const PLOW_GLOB unsigned char* p) {
     return *(const PLOW_GLOB mpf4_b16*)(const PLOW_GLOB void*)p;
 }
+#ifndef PLOW_MOE_PF_A4W4_WEIGHT_NT
+#define PLOW_MOE_PF_A4W4_WEIGHT_NT 0
+#endif
+__device__ __forceinline__ mpf4_b16 mpf4_ld16_weight(const PLOW_GLOB unsigned char* p) {
+#if PLOW_MOE_PF_A4W4_WEIGHT_NT
+    return __builtin_nontemporal_load(
+        (const PLOW_GLOB mpf4_b16*)(const PLOW_GLOB void*)p);
+#else
+    return mpf4_ld16(p);
+#endif
+}
 __device__ __forceinline__ void mpf4_st16(unsigned char* p, mpf4_b16 v) {
     *(mpf4_b16*)(void*)p = v;
 }
@@ -3376,7 +3387,7 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
 
 #define MPF4_B_ISSUE1(k0, q, sc)                                                               \
     {                                                                                          \
-        (q) = mpf4_ld16(bw_ + (size_t)bn_ * KS + ((k0) >> 1) + bb_ * 16u);                     \
+        (q) = mpf4_ld16_weight(bw_ + (size_t)bn_ * KS + ((k0) >> 1) + bb_ * 16u);              \
         (sc) = bs_[(size_t)bn_ * KSC + ((k0) >> 5) + bb_];                                     \
     }
 
@@ -3806,7 +3817,8 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
             const bool up = GLU && (br >= MPF4_BN / 2);                                        \
             const PLOW_GLOB unsigned char* bw = up ? W1 : W0;                                  \
             const PLOW_GLOB unsigned char* bs = up ? SW1 : SW0;                                \
-            bq_[it] = mpf4_ld16(bw + (size_t)brow_[it] * KS + ((k0) >> 1) + bb * 16u);         \
+            bq_[it] = mpf4_ld16_weight(                                                        \
+                bw + (size_t)brow_[it] * KS + ((k0) >> 1) + bb * 16u);                        \
             bsc_[it] = bs[(size_t)brow_[it] * KSC + ((k0) >> 5) + bb];                         \
         }                                                                                      \
     }

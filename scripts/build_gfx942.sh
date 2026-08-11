@@ -207,6 +207,11 @@ AX_GQ="-DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=${PLOW_GQ_BATCH:-1}"
 # rungs, GemmGluMxfp4 (113), GemvQkvMxfp4 (114) -- and nothing else: the mxfp4 EXPERT walks that
 # K3 decode actually runs (ops 45/46 with i6 = PLOW_MOE_ENC_MXFP4) are not behind it.
 AX_MXFP4="-DPLOW_MXFP4=1"
+case "${PLOW_MXFP4_DEC_NT:-1}" in
+  0) AX_MXFP4="$AX_MXFP4 -DPLOW_MXFP4_DEC_NT=0" ;;
+  1) ;;
+  *) echo "FAIL: PLOW_MXFP4_DEC_NT must be 0 or 1" >&2; exit 2 ;;
+esac
 # KIMI-K3. `GV_UNROLL=14` is on the K3 rows only and is measured, not derived: K3's dominant
 # decode GEMV is K=7168, whose nchunk is exactly 14 (runtime/CMakeLists.txt records the sweep).
 AX_K3="-DPLOW_K3=1 -DGV_UNROLL=14"
@@ -221,6 +226,11 @@ AX_MLA_K3="$AX_MLA -DPLOW_K3=1"
 # costs the prefill object NOTHING (256 VGPR / occ 2 / 8 spill, byte-for-byte the same resource
 # report as the object without it).
 AX_A4W4="-DPLOW_MOE_PF_A4W4=1"
+case "${PLOW_MOE_PF_A4W4_WEIGHT_NT:-0}" in
+  0) ;;
+  1) AX_A4W4="$AX_A4W4 -DPLOW_MOE_PF_A4W4_WEIGHT_NT=1" ;;
+  *) echo "FAIL: PLOW_MOE_PF_A4W4_WEIGHT_NT must be 0 or 1" >&2; exit 2 ;;
+esac
 # K3's full prefill program is L2-placed on gfx942, unlike the segmented prefill programs this
 # script otherwise builds. Arm the queue interpretation on exactly the K3 A4W4 rows; hierarchy
 # remains a separate, unmeasured PLOW_L2HIER_PF experiment.

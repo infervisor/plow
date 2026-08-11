@@ -652,6 +652,10 @@ option(PLOW_HSACO_MLA "Also emit the MLA prefill object (Kimi/DeepSeek/GLM)" ON)
 option(PLOW_HSACO_K3 "Also emit the Kimi-K3 / KDA objects (decode + prefill)" ON)
 option(PLOW_K3_DECODE_MXFP4_PROJ
        "Include standalone MXFP4 projection ops in K3 decode objects" ON)
+option(PLOW_MXFP4_DECODE_NT
+       "Use non-temporal loads for one-use decode MXFP4 projection weights" ON)
+option(PLOW_MOE_PF_A4W4_WEIGHT_NT
+       "Use non-temporal loads for grouped A4W4 expert weights" OFF)
 
 set(PLOW_HSACO_ARCH "gfx950" CACHE STRING "offload arch for the served code objects")
 set(PLOW_HSACO_HIPCC "/opt/rocm/bin/hipcc" CACHE FILEPATH "hipcc used for the served code objects")
@@ -711,6 +715,9 @@ if(PLOW_GFX950_HSACO)
     set(_hs_ax_fp8kv -DPLOW_FP8_KV=1)     # KV encoding: fp8 e4m3 cache + per-row scales
     set(_hs_ax_fp8_fp8kv ${_hs_ax_fp8} ${_hs_ax_fp8kv})   # both, the shipped fp8-KV profile
     set(_hs_ax_mxfp4 -DPLOW_MXFP4=1)      # WEIGHT encoding: MXFP4 e2m1+E8M0 (w4a16 projections)
+    if(NOT PLOW_MXFP4_DECODE_NT)
+        list(APPEND _hs_ax_mxfp4 -DPLOW_MXFP4_DEC_NT=0)
+    endif()
     set(_hs_ax_mla -DPLOW_MLA_PREFILL=1)
     # Composed, not spelled out: an all-fp8 Kimi K2.7 / GLM-5.2 / DeepSeek prefill
     # needs the MLA attention arms AND the w8a8 GEMM arms in the same object, and a
@@ -725,7 +732,12 @@ if(PLOW_GFX950_HSACO)
     # A4W4: MXFP4 on BOTH operands through the matrix core, the encoding ATOM runs. Compile-time
     # like every other precision axis -- a runtime encoding switch would make the register
     # allocator budget for the worst body and then every body spills (interp.hip states the trap).
-    set(_hs_ax_mla_moe_a4w4 ${_hs_ax_mla_moe} -DPLOW_MOE_PF_A4W4=1)
+    set(_hs_ax_a4w4_weight "")
+    if(PLOW_MOE_PF_A4W4_WEIGHT_NT)
+        set(_hs_ax_a4w4_weight -DPLOW_MOE_PF_A4W4_WEIGHT_NT=1)
+    endif()
+    set(_hs_ax_mla_moe_a4w4
+        ${_hs_ax_mla_moe} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight})
     # THE ALL-MXFP4 MLA PREFILL OBJECT. A Kimi/GLM/DeepSeek all-fp4 packet needs the MXFP4
     # PROJECTIONS (GemmMxfp4, op 93 — gated by PLOW_MXFP4) and the A4W4 grouped EXPERTS (ops
     # 85/86) in the SAME object; they were previously on separate rows, so no single object
@@ -771,13 +783,13 @@ if(PLOW_GFX950_HSACO)
     if(PLOW_DECODE_BATCH GREATER 1)
         set(_hs_ax_k3_dec_mxfp4 "")
         if(PLOW_K3_DECODE_MXFP4_PROJ)
-            set(_hs_ax_k3_dec_mxfp4 -DPLOW_MXFP4=1)
+            set(_hs_ax_k3_dec_mxfp4 ${_hs_ax_mxfp4})
         endif()
         set(_hs_ax_k3_dec ${_hs_ax_k3_dec} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1
-            ${_hs_ax_k3_dec_mxfp4})
+            ${_hs_ax_a4w4_weight} ${_hs_ax_k3_dec_mxfp4})
         set(_hs_ax_k3_dec_fp8kv
             ${_hs_ax_k3_dec_fp8kv} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1
-            ${_hs_ax_k3_dec_mxfp4})
+            ${_hs_ax_a4w4_weight} ${_hs_ax_k3_dec_mxfp4})
     endif()
     # ...and the FFN half. A K3 prefill bucket runs the GROUPED expert chain (ops 83-87), not the
     # per-slot decode ops: at T rows an expert's weights cross HBM once for every token that chose
@@ -791,9 +803,11 @@ if(PLOW_GFX950_HSACO)
     # takes `moe_pf_refuse` (loud, by design) rather than computing anything. PLOW_MXFP4 rides
     # along for the same reason `_mla_moe_a4w4_full` carries it: an all-fp4 packet needs the fp4
     # PROJECTIONS (op 93) in the same object as the fp4 experts, and they were on separate rows.
-    set(_hs_ax_k3_moe_a4w4 ${_hs_ax_k3_moe} -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1)
+    set(_hs_ax_k3_moe_a4w4
+        ${_hs_ax_k3_moe} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight} -DPLOW_MXFP4=1)
     set(_hs_ax_k3_moe_a4w4_fp8kv
-        ${_hs_ax_k3_moe_fp8kv} -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1)
+        ${_hs_ax_k3_moe_fp8kv} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight}
+        -DPLOW_MXFP4=1)
 
     # Symbols carry the arch: the loader builds the kernel name from the LIVE
     # HSA agent name (exec/amd.rs symbol_name), so a gfx942 object must export
