@@ -70,9 +70,44 @@ BM128 wins through M4096; BM192 wins at M8192. A runtime branch inside one kerne
 safe way to select both because it changes register allocation. The next valid design is a
 separate fused opcode rung or bucket-specific object.
 
+## Production grouped simulated-A4W4
+
+The grouped harness dispatches production ops 85 and 86 through `plow_interp_gfx942`. Its
+small unequal-expert fixture passes an FP64 bridge/DOWN oracle. The timed fixture matches the
+emitted TP8 packet geometry at a 4096-token prefill chunk: 896 experts, top-16, H=3584,
+I/rank=384, 65,536 routed rows, and 114,688 BM64-padded rows. Each result has 20 warmups and
+12 samples of four launches under one MI325X lease.
+
+The existing benchmark's prior H=3584, I=3072, 32-expert geometry was not K3 TP8 demand and
+was replaced before taking these measurements.
+
+| object | GLU | DOWN | DOWN change | result |
+|---|---:|---:|---:|---|
+| pre-change production | 2.880 ms | 6.155 ms | baseline | pass |
+| DOWN row-metadata hoist | 2.883 ms | 5.490 ms | -10.81% | pass |
+| BK32 falsification arm | 3.640 ms | 6.249 ms | +1.53% | rejected |
+| MFMA priority disabled | 2.861 ms | 5.477 ms | -11.02% | neutral/noise vs hoist |
+| shipping rebuild | 2.882 ms | 5.497 ms | -10.69% | pass |
+
+The shipping change loads `row_partidx` and `row_gate` once at the tile head and distributes
+them with `ds_bpermute` during the DOWN epilogue. It is enabled only for K3 A4W4 gfx942 rows;
+unrelated model objects are unchanged. The shipping object reaches 219.1 TFLOP/s and 42.5%
+of its roof on GLU, but only 57.4 TFLOP/s and 11.3% on DOWN.
+
+BM64 padding expands 65,536 useful routes to 114,688 rows (1.75x). This is now the dominant
+known structural target: a ragged/sub-quantum grouped path can remove more work than another
+small instruction-level epilogue change. BK32 staging is not that design and regressed both
+arms.
+
+The K3 artifact is a PLOWDEV bundle with its program ladder embedded in `model.pkt` and an
+intentionally empty `weights.json.buckets`. Generic `plowrt simulate --all-buckets` therefore
+does not apply. `plowrt disasm --counters --range 0..0` parsed all seven embedded programs
+T={128,512,1024,2048,4096,8192,1}; the full 41-object gfx942 ISA audit passed 30 applicable
+object rules. The only reported dead counter in each program is terminal `ArgmaxFin`.
+
 ## Scope
 
-The actual checkpoint uses grouped simulated-A4W4/MXFP4 routed experts. Dense MXFP4 and fused
-GLU are aligned kernel experiments, but are not yet the model's production hot path. Stage 4
-therefore remains open until the grouped MoE path is measured and tuned. No vLLM/SGLang result
-is claimed here; that comparison requires a same-box, same-session TP8 serving campaign.
+The actual checkpoint's grouped simulated-A4W4/MXFP4 routed-expert hot path is now measured and
+has one shipping improvement, but DOWN remains at 11.3% of roof. Stage 4 remains open for a
+padding-aware grouped design and end-to-end validation. No vLLM/SGLang result is claimed here;
+that comparison requires a same-box, same-session TP8 serving campaign.

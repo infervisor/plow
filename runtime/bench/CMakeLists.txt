@@ -16,6 +16,8 @@ endif()
 # AMD / ROCm interpreter benchmarks (dispatch/ and interp/)
 # ============================================================================
 if(PLOW_ROCM)
+    enable_language(CXX)
+
     # --- dispatch family ---
     # aql_launch_floor: raw HSA dispatch-chain overhead measurement
     add_executable(aql_launch_floor
@@ -51,6 +53,26 @@ if(PLOW_ROCM)
     target_compile_definitions(interp_mxfp4_bench PRIVATE _POSIX_C_SOURCE=199309L)
     target_compile_options(interp_mxfp4_bench PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(interp_mxfp4_bench PRIVATE hsa-runtime64 m)
+
+    # Grouped simulated-A4W4 GLU+DOWN oracle/benchmark. MPA4C3_INTERP=1 sends the
+    # packets through the production gfx942 persistent interpreter object.
+    set(MOE_A4W4_TEST_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tests/moe_prefill_a4w4_cdna3_test.hip)
+    set_source_files_properties(${MOE_A4W4_TEST_SRC} PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x c++")
+    find_library(PLOW_AMDHIP64 amdhip64 PATHS "$ENV{ROCM_PATH}/lib" NO_DEFAULT_PATH)
+    if(NOT PLOW_AMDHIP64)
+        message(FATAL_ERROR "amdhip64 from the active Nix ROCm shell was not found")
+    endif()
+    if(NOT PLOW_AMDHIP64 MATCHES "^/nix/store/")
+        message(FATAL_ERROR "amdhip64 must resolve from the Nix store: ${PLOW_AMDHIP64}")
+    endif()
+    add_executable(moe_prefill_a4w4_cdna3_test ${MOE_A4W4_TEST_SRC})
+    target_include_directories(moe_prefill_a4w4_cdna3_test PRIVATE
+        "$ENV{ROCM_PATH}/include"
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+        ${CMAKE_CURRENT_SOURCE_DIR}/../common)
+    target_compile_definitions(moe_prefill_a4w4_cdna3_test PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_compile_options(moe_prefill_a4w4_cdna3_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(moe_prefill_a4w4_cdna3_test PRIVATE ${PLOW_AMDHIP64} m)
 
     # qwen_interp_bench: same as above but Qwen3 shapes
     add_executable(qwen_interp_bench

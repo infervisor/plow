@@ -27,14 +27,18 @@
  *   quantizer ladder on its own f64 GEMM (> 99% of bytes; the residue is f32-vs-f64 flips at
  *   ladder cut points, which move a nibble by one step).
  *
- * Two passes, because op_moe.h is DEVICE-ONLY in this tree (its host pass does not compile —
- * same reason gemv_qkv_mxfp4_gfx950_test is two TUs):
+ * Build the host oracle with CMake and the production interpreter with the repository script.
+ * Both commands must run inside the flake shell:
  *
- *   hipcc --offload-arch=gfx942 -O3 -w -DMPA4C3_DEVICE -DPLOW_MOE_PF_A4W4=1 --genco \
- *       runtime/tests/moe_prefill_a4w4_cdna3_test.hip -o /tmp/mpa4c3.co -Iruntime/amd -Iruntime/common
- *   hipcc -O2 -w -x c++ -D__HIP_PLATFORM_AMD__=1 -I/opt/rocm/include \
- *       runtime/tests/moe_prefill_a4w4_cdna3_test.hip -o /tmp/mpa4c3 -L/opt/rocm/lib -lamdhip64
- *   perf-data/harness/gpulease -n 1 mpa4c3 '/tmp/mpa4c3 /tmp/mpa4c3.co'
+ *   nix develop --command cmake -S runtime -B build-amd/k3-mi325x-roof \
+ *       -DPLOW_ROCM=ON -DPLOW_BENCH=ON -DCMAKE_BUILD_TYPE=Release
+ *   nix develop --command cmake --build build-amd/k3-mi325x-roof \
+ *       --target moe_prefill_a4w4_cdna3_test
+ *   nix develop --command env PLOW_ROWS_ONLY=interp_prefill_fp8kv_k3_moe_a4w4 JOBS=1 \
+ *       scripts/build_gfx942.sh /tmp/k3-a4w4
+ *   nix develop --command env MPA4C3_INTERP=1 perf-data/harness/gpulease -n 1 mpa4c3 \
+ *       build-amd/k3-mi325x-roof/bench/moe_prefill_a4w4_cdna3_test \
+ *       /tmp/k3-a4w4/interp_prefill_fp8kv_k3_moe_a4w4.elf
  */
 
 #ifdef MPA4C3_DEVICE
@@ -75,7 +79,9 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_down(KA* a) {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
 #include <vector>
+#include "dev_isa.h"
 
 #define UNUSED_ROW 0xFFFFFFFFu /* PLOW_EXPERT_UNUSED */
 typedef unsigned short bf16;
@@ -107,6 +113,14 @@ static unsigned char e8m0_for_amax_h(double amax) {
     return (unsigned char)e;
 }
 static double silu(double x) { return x / (1.0 + exp(-x)); }
+static void json_string(FILE* f, const char* s) {
+    fputc('"', f);
+    for (; *s; s++) {
+        if (*s == '"' || *s == '\\') fputc('\\', f);
+        fputc(*s, f);
+    }
+    fputc('"', f);
+}
 
 #define HC(x)                                                                                    \
     do {                                                                                         \
@@ -124,21 +138,26 @@ int main(int argc, char** argv) {
     hipDeviceProp_t p; HC(hipGetDeviceProperties(&p, 0));
     printf("dev: %s\n", p.gcnArchName);
     hipModule_t M; HC(hipModuleLoad(&M, argc > 1 ? argv[1] : "/tmp/mpa4c3.co"));
+    const bool INTERP = getenv("MPA4C3_INTERP") != nullptr;
     hipFunction_t fglu, fdown;
-    HC(hipModuleGetFunction(&fglu, M, "k_glu"));
-    HC(hipModuleGetFunction(&fdown, M, "k_down"));
+    if (INTERP) {
+        HC(hipModuleGetFunction(&fglu, M, "plow_interp_gfx942"));
+        fdown = fglu;
+    } else {
+        HC(hipModuleGetFunction(&fglu, M, "k_glu"));
+        HC(hipModuleGetFunction(&fdown, M, "k_down"));
+    }
 
-    /* MPA4C3_BENCH=1: time the two arms at K3's REAL routed shape (latent width 3584, expert
-     * intermediate 3072, 32 experts x 128 rows — a 4096-row prefill's worth of routed work) and
-     * report the achieved weight stream. No host reference at this size — correctness is the
-     * small shape's job; this mode prices the kernel. */
+    /* MPA4C3_BENCH=1: TP8 packet geometry for a 4096-token, top-16 K3 chunk. */
     const bool BENCH = getenv("MPA4C3_BENCH") != nullptr;
-    const unsigned H = BENCH ? 3584 : 512, IM = BENCH ? 3072 : 384, NTOK = BENCH ? 4096 : 8,
-                   NEXP = BENCH ? 32 : 2, BM = 64, GRID = BENCH ? 304 : 5;
+    const unsigned H = BENCH ? 3584 : 512, IM = 384, NTOK = BENCH ? 4096 : 8,
+                   NEXP = BENCH ? 896 : 2, BM = 64, GRID = BENCH ? 304 : 5;
     std::vector<unsigned> real_rows_v(NEXP), pad_rows_v(NEXP);
     for (unsigned e = 0; e < NEXP; e++) {
-        real_rows_v[e] = BENCH ? 128 : (e == 0 ? 70 : 50);
-        pad_rows_v[e] = BENCH ? 128 : (e == 0 ? 128 : 64);
+        real_rows_v[e] = BENCH ? (NTOK * 16 / NEXP + (e < (NTOK * 16) % NEXP))
+                               : (e == 0 ? 70 : 50);
+        pad_rows_v[e] = BENCH ? ((real_rows_v[e] + BM - 1) / BM * BM)
+                              : (e == 0 ? 128 : 64);
     }
     const unsigned* real_rows = real_rows_v.data();
     const unsigned* pad_rows = pad_rows_v.data();
@@ -221,35 +240,184 @@ int main(int argc, char** argv) {
     ka.rgate = (unsigned long long)(size_t)d_rgate;
     ka.N = IM; ka.K = H; ka.n_exp = NEXP; ka.act = 1; /* silu */
     void* d_ka; HC(hipMalloc(&d_ka, sizeof ka)); HC(hipMemcpy(d_ka, &ka, sizeof ka, hipMemcpyHostToDevice));
-    void* args[] = {&d_ka};
-    HC(hipModuleLaunchKernel(fglu, GRID, 1, 1, 512, 1, 1, 0, 0, args, nullptr));
+
+    PlowDevInst interp_inst{};
+    PlowProgram interp_prog{};
+    void *d_inst = nullptr, *d_stream = nullptr, *d_sofs = nullptr, *d_slen = nullptr,
+         *d_ctr = nullptr, *d_tensors = nullptr;
+    if (INTERP) {
+        std::vector<PlowStreamEnt> stream(GRID);
+        std::vector<unsigned> sofs(GRID), slen(GRID, 1u);
+        for (unsigned cu = 0; cu < GRID; cu++) {
+            stream[cu].slice = cu;
+            sofs[cu] = cu;
+        }
+        HC(hipMalloc(&d_inst, sizeof interp_inst));
+        HC(hipMalloc(&d_stream, stream.size() * sizeof stream[0]));
+        HC(hipMalloc(&d_sofs, sofs.size() * sizeof sofs[0]));
+        HC(hipMalloc(&d_slen, slen.size() * sizeof slen[0]));
+        HC(hipMalloc(&d_ctr, PLOW_CTR_STRIDE * sizeof(unsigned)));
+        HC(hipMalloc(&d_tensors, 8 * sizeof(void*)));
+        HC(hipMemcpy(d_stream, stream.data(), stream.size() * sizeof stream[0], hipMemcpyHostToDevice));
+        HC(hipMemcpy(d_sofs, sofs.data(), sofs.size() * sizeof sofs[0], hipMemcpyHostToDevice));
+        HC(hipMemcpy(d_slen, slen.data(), slen.size() * sizeof slen[0], hipMemcpyHostToDevice));
+        HC(hipMemset(d_ctr, 0, PLOW_CTR_STRIDE * sizeof(unsigned)));
+        interp_prog.insts = (const PlowDevInst*)d_inst;
+        interp_prog.stream = (const PlowStreamEnt*)d_stream;
+        interp_prog.stream_ofs = (const unsigned*)d_sofs;
+        interp_prog.stream_len = (const unsigned*)d_slen;
+        interp_prog.counters = (unsigned*)d_ctr;
+        interp_prog.tensors = (void* const*)d_tensors;
+    }
+    void* wrapper_args[] = {&d_ka};
+    void* interp_args[] = {&interp_prog};
+    void** launch_args = INTERP ? interp_args : wrapper_args;
+    auto select_arm = [&](bool glu) {
+        if (!INTERP) {
+            if (glu) {
+                ka.Ain = (unsigned long long)(size_t)d_x;
+                ka.Asc = 0;
+                ka.Cout = (unsigned long long)(size_t)d_fu;
+                ka.Csc = (unsigned long long)(size_t)d_fus;
+                ka.N = IM;
+                ka.K = H;
+            } else {
+                ka.Ain = (unsigned long long)(size_t)d_fu;
+                ka.Asc = (unsigned long long)(size_t)d_fus;
+                ka.Cout = (unsigned long long)(size_t)d_part;
+                ka.N = H;
+                ka.K = IM;
+            }
+            HC2(hipMemcpy(d_ka, &ka, sizeof ka, hipMemcpyHostToDevice));
+            return;
+        }
+        void* tensors[8] = {d_fu, d_x, d_wtab, d_stab, d_meta, d_rtok, d_rpix, d_fus};
+        interp_inst = {};
+        interp_inst.blocks = (unsigned short)GRID;
+        for (unsigned i = 0; i < 8; i++) interp_inst.t[i] = (unsigned short)i;
+        interp_inst.i[2] = NEXP;
+        interp_inst.i[3] = 2u; /* PLOW_MOE_ENC_MXFP4 */
+        if (glu) {
+            interp_inst.op = PLOW_DOP_MOE_GROUP_GLU_PF;
+            interp_inst.i[0] = IM;
+            interp_inst.i[1] = H;
+            interp_inst.i[5] = 1;
+        } else {
+            interp_inst.op = PLOW_DOP_MOE_GROUP_DOWN_PF;
+            interp_inst.i[0] = H;
+            interp_inst.i[1] = IM;
+            tensors[0] = d_part;
+            tensors[1] = d_fu;
+            tensors[5] = d_fus;
+            tensors[7] = d_rgate;
+        }
+        HC2(hipMemcpy(d_inst, &interp_inst, sizeof interp_inst, hipMemcpyHostToDevice));
+        HC2(hipMemcpy(d_tensors, tensors, sizeof tensors, hipMemcpyHostToDevice));
+    };
+    auto launch = [&](hipFunction_t f) {
+        return hipModuleLaunchKernel(f, GRID, 1, 1, 512, 1, 1, 0, 0, launch_args, nullptr);
+    };
+
+    select_arm(true);
+    HC(launch(fglu));
     HC(hipDeviceSynchronize());
 
     if (BENCH) {
-        auto time_arm = [&](hipFunction_t f, const char* nm, double wbytes) {
+        const char* jsonl = getenv("MPA4C3_JSONL");
+        const char* gpu = getenv("PLOW_GPU");
+        const char* toolchain = getenv("PLOW_TOOLCHAIN_LABEL");
+        const char* build_id = getenv("PLOW_BUILD_ID");
+        const char* lease = getenv("PLOW_LEASE_LABEL");
+        const char* cleared = getenv("PLOW_STAGE4_CLEARED");
+        const char* mfma_env = getenv("PLOW_MFMA_TFLOPS");
+        const char* hbm_env = getenv("PLOW_HBM_GBPS");
+        if (!INTERP || !jsonl || !gpu || strcmp(gpu, "MI325X") || !toolchain || !build_id ||
+            !lease || !cleared || strcmp(cleared, "1") || !mfma_env || !hbm_env) {
+            fprintf(stderr, "REFUSED: interpreter benchmark requires Stage-4 MI325X provenance\n");
+            return 2;
+        }
+        const double mfma_roof = atof(mfma_env), hbm_roof = atof(hbm_env);
+        auto time_arm = [&](hipFunction_t f, const char* nm, double wbytes, double bytes,
+                            double flops, bool glu) {
+            select_arm(glu);
             hipEvent_t t0, t1; HC2(hipEventCreate(&t0)); HC2(hipEventCreate(&t1));
-            for (int w = 0; w < 3; w++) HC2(hipModuleLaunchKernel(f, GRID, 1, 1, 512, 1, 1, 0, 0, args, nullptr));
+            for (int w = 0; w < 20; w++) HC2(launch(f));
             HC2(hipDeviceSynchronize());
-            HC2(hipEventRecord(t0));
-            const int IT = 20;
-            for (int w = 0; w < IT; w++) HC2(hipModuleLaunchKernel(f, GRID, 1, 1, 512, 1, 1, 0, 0, args, nullptr));
-            HC2(hipEventRecord(t1)); HC2(hipEventSynchronize(t1));
-            float ms; HC2(hipEventElapsedTime(&ms, t0, t1)); ms /= IT;
-            printf("  %-5s %8.3f ms   weight stream %7.0f GB/s\n", nm, ms, wbytes / (ms * 1e6));
-            return ms;
+            std::vector<double> samples(12);
+            for (double& sample : samples) {
+                HC2(hipEventRecord(t0));
+                for (int w = 0; w < 4; w++) HC2(launch(f));
+                HC2(hipEventRecord(t1));
+                HC2(hipEventSynchronize(t1));
+                float ms;
+                HC2(hipEventElapsedTime(&ms, t0, t1));
+                sample = ms / 4.0;
+            }
+            std::vector<double> sorted = samples;
+            std::sort(sorted.begin(), sorted.end());
+            const double ms = (sorted[5] + sorted[6]) * 0.5;
+            const double tflops = flops / ms / 1e9;
+            const double roof = std::min(mfma_roof, hbm_roof * (flops / bytes) / 1000.0);
+            printf("  %-5s %8.3f ms  %7.1f TF/s  %5.1f%% roof  weight %7.0f GB/s\n", nm,
+                   ms, tflops, 100.0 * tflops / roof, wbytes / (ms * 1e6));
+            return samples;
         };
         /* weight bytes per pass: every m-tile re-reads its expert's full weight (both halves
          * under GLU), fp4 + scales */
         unsigned mt = 0; for (unsigned e = 0; e < NEXP; e++) mt += pad_rows[e] / BM;
         const double wglu = (double)mt * ((double)IM * H /*2 mats x K/2 bytes*/ + 2.0 * IM * H / 32);
         const double wdown = (double)mt * ((double)H * IM / 2 + (double)H * IM / 32);
+        const double fglu_ops = 4.0 * R * IM * H;
+        const double fdown_ops = 2.0 * R * H * IM;
+        const double bglu = wglu + (double)mt * (IM / 128) * BM * H * 2 +
+                            (double)np * (IM / 2 + IM / 32);
+        const double bdown = wdown + (double)mt * (H / 256) * BM * (IM / 2 + IM / 32) +
+                             (double)np * H * 4;
         printf("bench: H=%u IM=%u rows=%u experts=%u grid=%d (routed GLU+DOWN of a %u-token K3 prefill chunk)\n",
                H, IM, R, NEXP, GRID, NTOK);
-        time_arm(fglu, "GLU", wglu);
-        ka.Ain = (unsigned long long)(size_t)d_fu; ka.Asc = (unsigned long long)(size_t)d_fus;
-        ka.Cout = (unsigned long long)(size_t)d_part; ka.N = H; ka.K = IM;
-        HC(hipMemcpy(d_ka, &ka, sizeof ka, hipMemcpyHostToDevice));
-        time_arm(fdown, "DOWN", wdown);
+        const std::vector<double> glu_samples =
+            time_arm(fglu, "GLU", wglu, bglu, fglu_ops, true);
+        const std::vector<double> down_samples =
+            time_arm(fdown, "DOWN", wdown, bdown, fdown_ops, false);
+        std::vector<unsigned char> fu_check(4096);
+        std::vector<float> part_check(256);
+        HC(hipMemcpy(fu_check.data(), d_fu, fu_check.size(), hipMemcpyDeviceToHost));
+        HC(hipMemcpy(part_check.data(), d_part, part_check.size() * sizeof(float),
+                     hipMemcpyDeviceToHost));
+        const bool fu_changed = std::any_of(fu_check.begin(), fu_check.end(),
+                                            [](unsigned char v) { return v != 0xEE; });
+        const bool part_finite = std::all_of(part_check.begin(), part_check.end(),
+                                             [](float v) { return isfinite(v); });
+        const bool part_nonzero = std::any_of(part_check.begin(), part_check.end(),
+                                              [](float v) { return v != 0.0f; });
+        if (!fu_changed || !part_finite || !part_nonzero) {
+            fprintf(stderr, "FAIL: benchmark output sentinel/finite check\n");
+            return 1;
+        }
+        FILE* jf = fopen(jsonl, "a");
+        if (!jf) {
+            perror(jsonl);
+            return 1;
+        }
+        auto write_json = [&](const char* arm, const std::vector<double>& samples) {
+            fputs("{\"gpu\":", jf); json_string(jf, gpu);
+            fputs(",\"arch\":\"gfx942\",\"toolchain\":", jf); json_string(jf, toolchain);
+            fputs(",\"build_id\":", jf); json_string(jf, build_id);
+            fputs(",\"lease_label\":", jf); json_string(jf, lease);
+            fputs(",\"object\":", jf); json_string(jf, argv[1]);
+            fputs(",\"interpreter_symbol\":\"plow_interp_gfx942\",\"arm\":", jf);
+            json_string(jf, arm);
+            fprintf(jf, ",\"tokens\":%u,\"topk\":16,\"routed_rows\":%u,\"padded_rows\":%u,"
+                        "\"experts\":%u,\"h\":%u,\"i_tp8\":%u,\"cu\":%u,\"correct\":true,"
+                        "\"mfma_tflops\":%.3f,\"hbm_gbps\":%.3f,\"samples_ms\":[",
+                    NTOK, np, R, NEXP, H, IM, GRID, mfma_roof, hbm_roof);
+            for (size_t i = 0; i < samples.size(); i++)
+                fprintf(jf, "%s%.6f", i ? "," : "", samples[i]);
+            fputs("]}\n", jf);
+        };
+        write_json("glu", glu_samples);
+        write_json("down", down_samples);
+        fclose(jf);
         printf("PASS\n");
         return 0;
     }
@@ -315,10 +483,8 @@ int main(int argc, char** argv) {
            glurms, bytemis * 100.0);
 
     /* ---- DOWN, consuming the device's own fu bytes */
-    ka.Ain = (unsigned long long)(size_t)d_fu; ka.Asc = (unsigned long long)(size_t)d_fus;
-    ka.Cout = (unsigned long long)(size_t)d_part; ka.N = H; ka.K = IM;
-    HC(hipMemcpy(d_ka, &ka, sizeof ka, hipMemcpyHostToDevice));
-    HC(hipModuleLaunchKernel(fdown, GRID, 1, 1, 512, 1, 1, 0, 0, args, nullptr));
+    select_arm(false);
+    HC(launch(fdown));
     HC(hipDeviceSynchronize());
     std::vector<float> part((size_t)np * H);
     HC(hipMemcpy(part.data(), d_part, part.size() * 4, hipMemcpyDeviceToHost));

@@ -1907,8 +1907,7 @@ __device__ __forceinline__ double mpf_det_q(float v) {
  * once per OUTPUT ELEMENT with a full `s_waitcnt vmcnt(0)` between each -- and were left alone
  * when that landed:
  *
- *   * `d_moe_group_pf_a4w4` (PLOW_MOE_PF_A4W4, CDNA4 only -- gfx942 has no fp4 matrix core,
- *     so this arm is NOT COMPILED on this box and cannot be measured here).
+ *   * `d_moe_group_pf_a4w4` (PLOW_MOE_PF_A4W4, native CDNA4 and simulated CDNA3).
  *   * `d_moe_group_gemma_pf_t` (ops 75/76 bf16 and 81/82 w8a8, the Gemma-4 MoE twin). Its
  *     W8A8 arm reads a THIRD k/n-invariant per-row quantity, `ascale[rowbase + rr]`, so this
  *     hoist takes all three: leaving one behind would leave the per-element drain in place and
@@ -3659,8 +3658,17 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
  * Single-buffered is not un-pipelined: the next tile's global reads still issue BEFORE the MFMA
  * block and land in registers across it (the ISSUE/COMMIT split, kept from the CDNA4 body); the
  * cost against double buffering is one extra barrier per K tile, not exposed load latency. */
-#define MPF4_C3_BK 64u                      /* K per staged tile = 4 bf16 MFMA K=16 steps */
-#define MPF4_C3_RB (MPF4_C3_BK * 2u)        /* bf16 LDS row stride, bytes = 128 */
+#ifndef PLOW_MOE_PF_A4W4_C3_BK
+#define PLOW_MOE_PF_A4W4_C3_BK 64u
+#endif
+#if PLOW_MOE_PF_A4W4_C3_BK != 32u && PLOW_MOE_PF_A4W4_C3_BK != 64u
+#error "PLOW_MOE_PF_A4W4_C3_BK must be 32 or 64"
+#endif
+#ifndef PLOW_MOE_PF_A4W4_PRIO
+#define PLOW_MOE_PF_A4W4_PRIO 1
+#endif
+#define MPF4_C3_BK PLOW_MOE_PF_A4W4_C3_BK  /* K per staged tile */
+#define MPF4_C3_RB (MPF4_C3_BK * 2u)        /* bf16 LDS row stride */
 /* XOR swizzle over 16-byte chunks, bits 4..6 — in-row for a 128-B row, and THREE bits on
  * purpose: a 128-B row is exactly 8 chunks, and a fragment read walks 32 consecutive rows at a
  * FIXED chunk column (row stride 128 B = 0 mod 8 chunks), so anything less than a full 3-bit
@@ -3669,7 +3677,8 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
  * MPA4C3_BENCH=1): 1-bit 737 GB/s, 2-bit 928, 3-bit 963 GB/s weight stream = 232 TF/s on the
  * GLU, ~71% of this part's bf16 MFMA peak. ONE function for the write and every read; a second
  * copy that drifts is the transposed-tile class of bug. */
-#define MPF4_C3_SWZ(row, off) ((off) ^ (((row) & 7u) << 4))
+#define MPF4_C3_SWZ(row, off) \
+    ((off) ^ (((row) & (MPF4_C3_RB / 16u - 1u)) << 4))
 
 template <bool GLU>
 __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restrict__ Ain,
@@ -3697,8 +3706,8 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
     unsigned char* const Atl = L;                            /* bf16 [BM][C3_RB] */
     unsigned char* const Btl = Atl + MPF4_BM * MPF4_C3_RB;   /* bf16 [BN][C3_RB] */
     float* const Bridge = (float*)L;                         /* GLU epilogue only; aliases tiles */
-    static_assert(MPF4_BM * (MPF4_BN / 2) * 4u <= (MPF4_BM + MPF4_BN) * MPF4_C3_RB,
-                  "the GLU bridge no longer fits inside the tile arena it aliases");
+    static_assert(MPF4_BM * (MPF4_BN / 2) * 4u <= PLOW_LDS_MAX_BYTES,
+                  "the GLU bridge exceeds the gfx942 LDS arena");
 
     const unsigned tid = threadIdx.x;
     const unsigned lane = tid & 63u, wave = tid >> 6;
@@ -3730,6 +3739,15 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
             as_glob((const unsigned char*)(size_t)stab[(size_t)e * 3 + (GLU ? 0 : 2)]);
         const PLOW_GLOB unsigned char* SW1 =
             as_glob(GLU ? (const unsigned char*)(size_t)stab[(size_t)e * 3 + 1] : nullptr);
+
+#if PLOW_MOE_PF_EPI_SIB
+        unsigned epi_pidx = 0u;
+        int epi_gate = 0;
+        if constexpr (!GLU) {
+            epi_pidx = as_glob(row_partidx)[rowbase + lane];
+            epi_gate = __builtin_bit_cast(int, as_glob(row_gate)[rowbase + lane]);
+        }
+#endif
 
         f32x16 acc[SMa][SNa];
 #pragma unroll
@@ -3873,13 +3891,17 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                     bf[j] = __builtin_bit_cast(
                         bf16x8, *(const bf16v8*)(Btl + br * MPF4_C3_RB + MPF4_C3_SWZ(br, boff)));
                 }
+#if PLOW_MOE_PF_A4W4_PRIO
                 __builtin_amdgcn_s_setprio(1);
+#endif
 #pragma unroll
                 for (int i = 0; i < SMa; i++)
 #pragma unroll
                     for (int j = 0; j < SNa; j++)
                         acc[i][j] = plow_mfma_bf16_32x32(af[i], bf[j], acc[i][j]);
+#if PLOW_MOE_PF_A4W4_PRIO
                 __builtin_amdgcn_s_setprio(0);
+#endif
             }
 #pragma unroll
             for (int i = 0; i < SMa; i++)
@@ -3889,6 +3911,22 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
             if (kn < K) { C3_COMMIT }
             __syncthreads(); /* publish the next tile (or retire the last: Bridge aliases it) */
         }
+
+#if PLOW_MOE_PF_EPI_SIB
+#define C3_EPI_NGUARD(nn) const bool epi_nok = ((nn) < N)
+#define C3_ROWMETA(rr, pidx, gv)                                                               \
+    const unsigned pidx =                                                                      \
+        (unsigned)__builtin_amdgcn_ds_bpermute((int)((rr) << 2), (int)epi_pidx);               \
+    const float gv =                                                                           \
+        __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute((int)((rr) << 2), epi_gate));   \
+    if (!epi_nok || pidx == PLOW_EXPERT_UNUSED) continue
+#else
+#define C3_EPI_NGUARD(nn) if ((nn) >= N) continue
+#define C3_ROWMETA(rr, pidx, gv)                                                               \
+    const unsigned pidx = row_partidx[rowbase + (rr)];                                         \
+    if (pidx == PLOW_EXPERT_UNUSED) continue;                                                  \
+    const float gv = row_gate[rowbase + (rr)]
+#endif
 
         if constexpr (GLU) {
             /* --- the fused bridge, VERBATIM in structure from the CDNA4 arm (see its header
@@ -3942,14 +3980,13 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                 for (int j = 0; j < SNa; j++) {
                     const unsigned nn =
                         n0 + wn * (MPF4_BN / MPF4_WNc) + j * MFMA_N + mfma_acc_n(lane);
-                    if (nn >= N) continue;
+                    C3_EPI_NGUARD(nn);
 #pragma unroll
                     for (int el = 0; el < 16; el++) {
                         const unsigned rr =
                             wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
-                        const unsigned pidx = row_partidx[rowbase + rr];
-                        if (pidx == PLOW_EXPERT_UNUSED) continue; /* pad row */
-                        part[(size_t)pidx * N + nn] = row_gate[rowbase + rr] * acc[i][j][el];
+                        C3_ROWMETA(rr, pidx, gv);
+                        part[(size_t)pidx * N + nn] = gv * acc[i][j][el];
                     }
                 }
         }
@@ -3959,6 +3996,8 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
 #undef C3_B_ISSUE
 #undef C3_BLK_COMMIT
 #undef C3_COMMIT
+#undef C3_EPI_NGUARD
+#undef C3_ROWMETA
 }
 #endif /* PLOW_HAS_MX_MMA */
 

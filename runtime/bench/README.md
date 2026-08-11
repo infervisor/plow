@@ -95,6 +95,40 @@ nix develop --command env PLOW_STAGE4_CLEARED=1 PLOW_GPU=MI325X \
 
 Discard the result when `gpulease` returns 76.
 
+### Kimi-K3 grouped simulated-A4W4 on gfx942
+
+This gate sends the production grouped GLU and DOWN packets through
+`plow_interp_gfx942`. The default run uses a small unequal-expert fixture and checks the
+MXFP4 bridge plus DOWN against an FP64 oracle. `MPA4C3_BENCH=1` switches to the emitted TP8
+4096-token geometry: 896 experts, top-16, H=3584, I/rank=384, 65,536 routed rows, and 114,688
+BM64-padded rows.
+
+```bash
+nix develop --command cmake -S runtime -B build-amd/k3-mi325x-roof \
+  -DPLOW_ROCM=ON -DPLOW_BENCH=ON -DCMAKE_BUILD_TYPE=Release
+nix develop --command cmake --build build-amd/k3-mi325x-roof \
+  --target moe_prefill_a4w4_cdna3_test
+nix develop --command env PLOW_ROWS_ONLY=interp_prefill_fp8kv_k3_moe_a4w4 JOBS=1 \
+  scripts/build_gfx942.sh /tmp/k3-a4w4
+
+nix develop --command env MPA4C3_INTERP=1 \
+  perf-data/harness/gpulease -n 1 k3-a4w4-correct \
+  build-amd/k3-mi325x-roof/bench/moe_prefill_a4w4_cdna3_test \
+  /tmp/k3-a4w4/interp_prefill_fp8kv_k3_moe_a4w4.elf
+
+nix develop --command env MPA4C3_INTERP=1 MPA4C3_BENCH=1 \
+  MPA4C3_JSONL=/tmp/k3-a4w4.jsonl PLOW_STAGE4_CLEARED=1 PLOW_GPU=MI325X \
+  PLOW_TOOLCHAIN_LABEL=rocm-7.14.0-nix PLOW_BUILD_ID=<object-sha> \
+  PLOW_LEASE_LABEL=k3-a4w4 PLOW_MFMA_TFLOPS=1063.1 PLOW_HBM_GBPS=4164 \
+  perf-data/harness/gpulease -n 1 k3-a4w4 \
+  build-amd/k3-mi325x-roof/bench/moe_prefill_a4w4_cdna3_test \
+  /tmp/k3-a4w4/interp_prefill_fp8kv_k3_moe_a4w4.elf
+```
+
+The benchmark performs 20 warmups and records 12 samples of four launches per arm. Use a new
+JSONL path for each object. A result is publishable only after the small FP64 gate passes for
+that exact object.
+
 ### hipBLASLt comparison
 
 ```bash

@@ -221,6 +221,12 @@ AX_MLA_K3="$AX_MLA -DPLOW_K3=1"
 # costs the prefill object NOTHING (256 VGPR / occ 2 / 8 spill, byte-for-byte the same resource
 # report as the object without it).
 AX_A4W4="-DPLOW_MOE_PF_A4W4=1"
+AX_K3_A4W4=""
+# Value-identical CDNA3 DOWN metadata hoist: 6.155 -> 5.490 ms at the emitted TP8
+# 4096-token/896-expert shape. Keep it on the K3 A4W4 rows so unrelated model objects do not move.
+if [ "${PLOW_K3_A4W4_EPI:-1}" != 0 ]; then
+  AX_K3_A4W4="$AX_K3_A4W4 -DPLOW_MOE_PF_EPI_SIB=1"
+fi
 
 # PER-XCD QUEUES + TWO-LEVEL GATE MAINTENANCE -- ON BY DEFAULT. MEASURED -16.0%, TOKEN-IDENTICAL.
 #
@@ -442,17 +448,27 @@ if [ "${PLOW_MOE_PF_EPI:-1}" != 0 ]; then
 fi
 
 # OPT-IN (PLOW_MOE_PF_EPI_SIB=1): THE SAME HOIST AT THE TWO SIBLING SITES (op_moe.h
-# PLOW_MOE_PF_EPI_SIB) -- `d_moe_group_pf_a4w4` (CDNA4 only, not compiled here) and
+# PLOW_MOE_PF_EPI_SIB) -- `d_moe_group_pf_a4w4` (native CDNA4 and simulated CDNA3) and
 # `d_moe_group_gemma_pf_t` (the Gemma-4 MoE twin, ops 75/76 and 81/82; its w8a8 arm carries a
 # THIRD k/n-invariant per-row load, `ascale`, which this takes with the other two). Same
 # addresses, same dwords, same arithmetic -- BYTE-IDENTICAL output. A SEPARATE flag from
 # PLOW_MOE_PF_EPI so the GLM canonical recipe is unperturbed by a change to kernels GLM never
 # dispatches. Rides AX_PREFILL and AX_DECODE alike, because the Gemma MoE prefill bodies are
-# folded into every gfx942 row by AX_GMOE. Default OFF, so the shipped objects are unchanged.
+# folded into every gfx942 row by AX_GMOE. Default OFF globally; K3 A4W4 rows enable it above.
 if [ "${PLOW_MOE_PF_EPI_SIB:-0}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_EPI_SIB=1"
   AX_DECODE="$AX_DECODE -DPLOW_MOE_PF_EPI_SIB=1"
   AX_FLASH="$AX_FLASH -DPLOW_MOE_PF_EPI_SIB=1"
+fi
+
+# Simulated-A4W4 CDNA3 staging experiments. Defaults preserve BK64 and its MFMA priority bracket.
+AX_K3_A4W4_TUNE=""
+if [ -n "${PLOW_MOE_PF_A4W4_C3_BK:-}" ]; then
+  case "$PLOW_MOE_PF_A4W4_C3_BK" in 32|64) ;; *) echo "FAIL: PLOW_MOE_PF_A4W4_C3_BK must be 32 or 64" >&2; exit 2;; esac
+  AX_K3_A4W4_TUNE="$AX_K3_A4W4_TUNE -DPLOW_MOE_PF_A4W4_C3_BK=$PLOW_MOE_PF_A4W4_C3_BK"
+fi
+if [ "${PLOW_MOE_PF_A4W4_PRIO:-1}" = 0 ]; then
+  AX_K3_A4W4_TUNE="$AX_K3_A4W4_TUNE -DPLOW_MOE_PF_A4W4_PRIO=0"
 fi
 
 # FALSIFICATION ARM (PLOW_F2BF_SELECT=1): the REFUTED branchless f2bf. Default 0 = the shipped branched form.
@@ -731,8 +747,8 @@ ROWS=(
   "interp_prefill_k3_moe|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_MXFP4"
   # THE ROW A K3 PREFILL PACKET ACTUALLY LOADS (exec/amd.rs: grouped ops with i[3] == MXFP4
   # resolve the K3MoeA4w4 arm). On this arch it contains the simulated body -- see AX_A4W4.
-  "interp_prefill_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_MXFP4"
-  "interp_prefill_fp8kv_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_MXFP4 $AX_FP8KV"
+  "interp_prefill_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_MXFP4"
+  "interp_prefill_fp8kv_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_MXFP4 $AX_FP8KV"
 )
 
 # PLOW_ROWS_ONLY=<substring>: build only the rows whose stem matches — for iterating on
