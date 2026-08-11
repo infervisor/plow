@@ -150,6 +150,7 @@ measurement, never a result with a caveat. Wrap the run, not the build.
 |---|---|---|
 | prefill GEMM tiles (AMD) | `plowc … tune gemm` (measure + ingest + verify, one command) or `gemm_tile_sweep <M> <N> <K> [label] [quant]` with `PLOW_GEMM_JSONL=<path>` | `plowc tune ingest --samples <jsonl>`; read back by `devgen::pick_tile` |
 | decode GEMV rungs (AMD) | `gemv_row_sweep <N> <K> [label]` with `PLOW_GEMV_JSONL=<path>`; list from the `TUNEDUMP_GEMV` census (`scripts/rebench_tune_gemv.sh`) | `tunedb-gemv ingest --db tuning --gpu <SKU> --samples <jsonl>` |
+| decode attention split count | emit matched packet arms with the model's `nsplit` knob (K3: `PLOW_K3_NS`) and score with `plowrt serve` + `vllm bench serve`; keep weights and interpreter object fixed | packet/program selection, not the kernel tune store |
 | decode knob grid (NVIDIA) | `scripts/tune_decode_sweep.sh` — joint OBJECT knobs (`PLOW_NV_FORCE_MINBLK`, `GV_UNROLL*`, `GV_MM_MAX`, `PLOW_MOE_DOWN_SG`) scored by end-to-end step TPOT | `tunedb-decode ingest --db tuning --results <jsonl>` |
 | single-CU roofline (evidence only) | `run_ubench_cu.sh` | none — no oracle, never selectable |
 | dispatch floor (evidence only) | `runtime/bench/dispatch/interp_dispatch_floor_nv.cu` / `.hip` | stored `provisional` with `reason_not_qualified` |
@@ -172,6 +173,28 @@ Two knob couplings to respect in any sweep design (from `11-tuning-coverage.md`)
 the interpreter inlines all of them, and MoE grouped GEMM shares the dense
 `PGM_*` tile triple, so sweeping one moves the other. `PGM_BM` is additionally
 packet-layout-visible (the MoE routing histogram pads to it).
+
+### Decode-attention packet split sweep
+
+Treat attention `nsplit` as a packet-decomposition sweep, not a kernel-tile
+sweep. It divides one KV scan into independent ranges and increases the flash
+grid, while the following merge grows linearly with the number of partials.
+The result is context-dependent and U-shaped.
+
+For every arm, re-emit only the packet, reuse the exact weights and interpreter
+object, and prove by disassembly that only the attention and merge packets plus
+their scratch extents changed. Sweep at the shortest and longest served context,
+then add crossover points before choosing thresholds. K3 TP8 uses
+`workgroups = (local_heads / head_group) * PLOW_K3_NS`; its measured 128K sweep
+was ns16/ns32/ns64/ns128 = 81.400/67.417/60.569/60.683 ms TPOT, so ns64 won and
+ns128 bracketed the merge-cost reversal.
+
+Changing split boundaries changes floating-point reduction association. Require
+finite outputs, exact cross-rank/counter audits, the model quality gate, and
+served `vllm bench serve` measurements; byte-identical text across arms is not a
+valid requirement. A production context ladder must select a pre-emitted program
+by live KV length. It must not patch packet instructions or resize scratch in the
+hot path.
 
 ## Step 4 — read the roofline %
 

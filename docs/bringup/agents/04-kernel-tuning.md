@@ -102,6 +102,17 @@ accepts only 0). Wrap the run, not the build. Repeat until clean.
 * **Decode knobs (NVIDIA object grid):** `scripts/tune_decode_sweep.sh`
   (sweeps `PLOW_NV_FORCE_MINBLK`, `GV_UNROLL*`, `GV_MM_MAX`, MoE knobs jointly,
   scored by end-to-end step TPOT), then `tunedb-decode ingest`.
+* **Decode-attention split count (packet grid):** when the model exposes a
+  split knob (K3: `PLOW_K3_NS`), emit matched packets across a geometric grid
+  such as 16/32/64/128 while reusing the exact weights and interpreter object.
+  Confirm only attention/merge packets and scratch extents differ. Measure the
+  shortest context, longest context, and enough crossover points to derive a
+  context table. Score with `plowrt serve` and the pinned `vllm bench serve`
+  client, not an isolated kernel timer. The curve is U-shaped: more splits fill
+  more CUs, but merge work grows with the partial count. Split boundaries change
+  reduction association, so require rank/counter audits and the model quality
+  gate rather than byte-identical cross-arm text. This is consumed as packet
+  programs/runtime context selection, not a tune-store record.
 
 Respect the couplings: `GV_MM_MAX` moves the register ceiling of every arm in
 the object; MoE grouped GEMM shares the dense `PGM_*` tile; `PGM_BM` is
