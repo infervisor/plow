@@ -138,6 +138,38 @@ if(PLOW_ROCM)
     target_link_libraries(mla_gfx942_test PRIVATE hsa-runtime64 m)
     add_dependencies(mla_gfx942_test mla_fixture mla_prefill_bench_gfx942_elf)
 
+    # Exact TP8 K3 latent-MoE seam: current two-packet combine -> XReduce
+    # protocol versus per-slice fused publication, both at H=3584/top-k=16/b=7.
+    set(K3_CXR_ELF ${CMAKE_CURRENT_BINARY_DIR}/tp_moe_combine_xreduce_gfx942.elf)
+    add_custom_command(
+        OUTPUT ${K3_CXR_ELF}
+        COMMAND "${PLOW_MLA_HIPCC}" --offload-arch=gfx942 -O3 -w -std=c++17 --genco
+                -DPLOW_BUCKET_DECODE=1
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tests/tp_moe_combine_xreduce_kernels.hip
+                -o ${K3_CXR_ELF}.co
+        COMMAND "${PLOW_MLA_BUNDLER}" --unbundle --type=o
+                --targets=hipv4-amdgcn-amd-amdhsa--gfx942
+                --input=${K3_CXR_ELF}.co --output=${K3_CXR_ELF}
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${K3_CXR_ELF}.co
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tests/tp_moe_combine_xreduce_kernels.hip
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_moe.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_collective.h
+        VERBATIM)
+    add_custom_target(tp_moe_combine_xreduce_gfx942_elf DEPENDS ${K3_CXR_ELF})
+    add_executable(tp_moe_combine_xreduce_bench
+        ../tests/tp_moe_combine_xreduce_bench.c
+        ../amd/hsa_backend.c)
+    target_include_directories(tp_moe_combine_xreduce_bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+        ${CMAKE_CURRENT_SOURCE_DIR}/../common
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_compile_definitions(tp_moe_combine_xreduce_bench PRIVATE _POSIX_C_SOURCE=199309L)
+    target_compile_options(tp_moe_combine_xreduce_bench PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(tp_moe_combine_xreduce_bench PRIVATE hsa-runtime64 m)
+    add_dependencies(tp_moe_combine_xreduce_bench tp_moe_combine_xreduce_gfx942_elf)
+
     # Grouped simulated-A4W4 GLU+DOWN oracle/benchmark. MPA4C3_INTERP=1 sends the
     # packets through the production gfx942 persistent interpreter object.
     set(MOE_A4W4_TEST_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tests/moe_prefill_a4w4_cdna3_test.hip)
