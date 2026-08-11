@@ -1108,14 +1108,11 @@ fn k3_nsplit(ctx: u32) -> u32 {
         return v.max(1);
     }
     let _ = ctx;
-    // SWEPT on the real TP8 asset at ctx 8000, 32 steps, fp8 KV, everything else fixed:
-    //   ns  4 -> 42.226 ms/token   (flash dispatched on 12 of 256 workgroups)
-    //   ns 16 -> 39.700 ms/token   (48)
-    //   ns 32 -> 39.582 ms/token   (96)
-    // 16 and 32 are tied inside run-to-run spread, which is the U-shape this doc predicts: the
-    // flash keeps getting more parallel while `MlaMergeFold` reduces over more partials. 16 is the
-    // knee — same time as 32 for half the `o_part`/`ml_part` scratch.
-    16
+    // SWEPT on the real gfx942 TP8 asset with FP8 KV and the same interpreter object. At 128K,
+    // ns16/ns32/ns64/ns128 measured 81.400/67.417/60.569/60.683 ms TPOT. ns128 brackets the
+    // merge-cost reversal. ns64 is tied with ns16 at 149 tokens, wins from 4K through 128K, and
+    // retains the established 197/200 GSM8K gate. Keep the explicit override for future GPUs.
+    64
 }
 
 fn k3_build_model(

@@ -263,12 +263,40 @@ then add crossover points before choosing thresholds. K3 TP8 uses
 was ns16/ns32/ns64/ns128 = 81.400/67.417/60.569/60.683 ms TPOT, so ns64 won and
 ns128 bracketed the merge-cost reversal.
 
+Screen the full grid with a truncated real-model asset containing one production
+attention layer and its merge/output/residual tail. This retains the interpreter,
+packet counters, FP8 KV layout, and real weights while avoiding a full-model load
+per arm. Use the isolated result to discard losers and locate approximate
+crossovers; only the finalists proceed to whole-model serving. An isolated flash
+kernel alone is insufficient because it omits the growing merge term.
+
+For K3, zero-based layer 3 is an MLA layer. Emit the screen with the production
+packet and object settings, changing only the layer set and split count:
+
+```bash
+for ns in 16 32 64 128; do
+  nix develop --command env \
+    K3_FULL=1 PLOW_K3_LAYERS=single:3 PLOW_K3_NS="$ns" \
+    PLOW_FP8_KV=1 PLOW_MXFP4=1 PLOW_MLA_PF_V2=1 \
+    PLOW_L2_PLACE=1 PLOW_DECODE_BATCH=1 PLOW_GEMV_MM=1 \
+    ./target/release/plowc --hf-dir /home/lava/models/k3_farm \
+      --emit devblob --arch gfx942 --gpu MI325X --num-gpus 8 --parallel tp \
+      --max-ctx 131072 --n-cu 304 --out "build-amd/k3-ns${ns}-layer3"
+done
+```
+
+Reuse one matching HSACO tree for every arm. Check that only the 24 decode
+attention packets, their 24 merge packets, and scratch extents differ. The
+single-layer screen ranks candidates; it is not a served-model or quality gate.
+
 Changing split boundaries changes floating-point reduction association. Require
 finite outputs, exact cross-rank/counter audits, the model quality gate, and
 served `vllm bench serve` measurements; byte-identical text across arms is not a
-valid requirement. A production context ladder must select a pre-emitted program
-by live KV length. It must not patch packet instructions or resize scratch in the
-hot path.
+valid requirement. Add a production context ladder only when matched crossover
+wins exceed noise. It must select a pre-emitted program by live KV length, never
+patch packet instructions or resize scratch in the hot path. K3's measured ns64
+arm tied ns16 at short context and won at every measured context from 4K through
+128K, so the current production choice is one fixed ns64 program, not a ladder.
 
 ## Step 4 — read the roofline %
 

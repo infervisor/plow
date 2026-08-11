@@ -145,7 +145,13 @@ exist on your target.
   more CUs, but merge work grows with the partial count. Split boundaries change
   reduction association, so require rank/counter audits and the model quality
   gate rather than byte-identical cross-arm text. This is consumed as packet
-  programs/runtime context selection, not a tune-store record.
+  programs/runtime context selection, not a tune-store record. Screen the broad
+  grid first with `K3_FULL=1 PLOW_K3_LAYERS=single:3` and a truncated
+  real-model asset containing that MLA layer plus its production
+  merge/output/residual tail; an isolated flash kernel omits the merge cost.
+  Promote only the 2–3 finalists to full-model serving. Do not add a runtime
+  context ladder unless matched crossover wins exceed noise; a fixed winner has
+  less packet/scratch state.
 
 Respect the couplings: `GV_MM_MAX` moves the register ceiling of every arm in
 the object; MoE grouped GEMM shares the dense `PGM_*` tile; `PGM_BM` is
