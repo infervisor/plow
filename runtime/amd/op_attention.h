@@ -3206,7 +3206,7 @@ __device__ void d_flash_mla_prefill_mfma(float* __restrict__ Opart,
       4 * 16 * FA_MLA_PF2_BKV) *                                                         \
      2)
 
-template <int DK, int DR, bool GATHER = false>
+template <int DK, int DR, bool GATHER = false, bool FP8 = false>
 __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restrict__ mlpart,
                                        const bf16* __restrict__ Qabs,
                                        const bf16* __restrict__ Qrope,
@@ -3217,10 +3217,13 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                                        unsigned window, float scale, unsigned kv_mask,
                                        unsigned slice, unsigned nblk, bf16* lds,
                                        const unsigned char* __restrict__ uni = nullptr,
-                                       unsigned cap = 0, unsigned ns = 1, bool ofold = false) {
+                                       unsigned cap = 0, unsigned ns = 1, bool ofold = false,
+                                       const float* __restrict__ kv_scale = nullptr,
+                                       unsigned krot_fp8 = 0) {
     constexpr int RW = 16;                 /* q rows per wave                    */
     constexpr int BQ = 4 * RW;             /* 64 — the 4-wave tile               */
     constexpr int BKV = FA_MLA_PF2_BKV;    /* kv rows per staged slab            */
+    constexpr unsigned WG = 256;            /* V2 is always a four-wave kernel    */
     constexpr int D = DK + DR;             /* 576: latent | rope, one padded row */
     constexpr int KSTR = D + FA_MLA_PF2_PAD;
     constexpr int NKT = D / 32;            /* QK k-tiles (32-deep shim)          */
@@ -3322,6 +3325,10 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
 
         const auto* cbase = as_glob(Ckv) + (size_t)b * kv_stride * DK;
         const auto* rbase = as_glob(Krope) + (size_t)b * kv_stride * DR;
+        const auto* cb8 = (const unsigned char*)Ckv + (size_t)b * kv_stride * DK;
+        const auto* rb8 = (const unsigned char*)Krope + (size_t)b * kv_stride * DR;
+        const float* csc = FP8 ? kv_scale + (size_t)b * kv_stride : nullptr;
+        const float* rsc = FP8 ? kv_scale + (size_t)(n_batch + b) * kv_stride : nullptr;
 
         /* Q -> REGISTERS, once: lane's A-fragment row is my_q0+fr, k-slice kt*32 + kg*8. */
         bf16x8 qa[NKT];
@@ -3361,7 +3368,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
         auto ld_slab = [&](unsigned base) {
 #pragma unroll
             for (int it = 0; it < 8; it++) {
-                const unsigned e = tid * 8 + (unsigned)it * (PLOW_THREADS * 8);
+                const unsigned e = tid * 8 + (unsigned)it * (WG * 8);
                 const unsigned r = e / DK, c = e % DK;
                 bf16v8 v = bf16v8_zero();
 #if PLOW_MLA_PF2_ABL != 1
@@ -3369,11 +3376,21 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     const unsigned u = base + r;
                     if (u < ucount) {
                         const unsigned kv = (unsigned)as_glob(upos)[u];
-                        v = ld_glob8(cbase + (size_t)(kv & kv_mask) * DK + c);
+                        if constexpr (FP8)
+                            v = fp8v8_to_bf16v8(
+                                ld_glob_fp8v8(cb8 + (size_t)(kv & kv_mask) * DK + c));
+                        else
+                            v = ld_glob8(cbase + (size_t)(kv & kv_mask) * DK + c);
                     }
                 } else {
                     const unsigned kv = base + r;
-                    if (kv < kv_end) v = ld_glob8(cbase + (size_t)(kv & kv_mask) * DK + c);
+                    if (kv < kv_end) {
+                        if constexpr (FP8)
+                            v = fp8v8_to_bf16v8(
+                                ld_glob_fp8v8(cb8 + (size_t)(kv & kv_mask) * DK + c));
+                        else
+                            v = ld_glob8(cbase + (size_t)(kv & kv_mask) * DK + c);
+                    }
                 }
 #endif
                 rl[it] = v;
@@ -3387,11 +3404,27 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     const unsigned u = base + r;
                     if (u < ucount) {
                         const unsigned kv = (unsigned)as_glob(upos)[u];
-                        v = ld_glob8(rbase + (size_t)(kv & kv_mask) * DR + c);
+                        if constexpr (FP8) {
+                            if (krot_fp8)
+                                v = fp8v8_to_bf16v8(
+                                    ld_glob_fp8v8(rb8 + (size_t)(kv & kv_mask) * DR + c));
+                            else
+                                v = ld_glob8(rbase + (size_t)(kv & kv_mask) * DR + c);
+                        } else
+                            v = ld_glob8(rbase + (size_t)(kv & kv_mask) * DR + c);
                     }
                 } else {
                     const unsigned kv = base + r;
-                    if (kv < kv_end) v = ld_glob8(rbase + (size_t)(kv & kv_mask) * DR + c);
+                    if (kv < kv_end) {
+                        if constexpr (FP8) {
+                            if (krot_fp8)
+                                v = fp8v8_to_bf16v8(
+                                    ld_glob_fp8v8(rb8 + (size_t)(kv & kv_mask) * DR + c));
+                            else
+                                v = ld_glob8(rbase + (size_t)(kv & kv_mask) * DR + c);
+                        } else
+                            v = ld_glob8(rbase + (size_t)(kv & kv_mask) * DR + c);
+                    }
                 }
 #endif
                 rl[8] = v;
@@ -3408,7 +3441,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
              * also stages the row's mask word. ---- */
             __syncthreads(); /* every wave's PV reads of the previous slab are done */
             if constexpr (GATHER) {
-                for (unsigned r = tid; r < (unsigned)BKV; r += PLOW_THREADS) {
+                for (unsigned r = tid; r < (unsigned)BKV; r += WG) {
                     const unsigned u = kv0 + r;
                     Msm[r] = (u < ucount)
                                  ? (((unsigned long long)as_glob(mhi)[u] << 32) |
@@ -3423,7 +3456,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
              * so no reachable tile is ever skipped (GLM MLA runs window=0 besides). */
 #pragma unroll
             for (int it = 0; it < 8; it++) {
-                const unsigned e = tid * 8 + (unsigned)it * (PLOW_THREADS * 8);
+                const unsigned e = tid * 8 + (unsigned)it * (WG * 8);
                 __builtin_memcpy(&Ksm[krow(e / DK) + e % DK], &rl[it], 16);
             }
             {
@@ -3435,33 +3468,59 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                 ld_slab(kv0 + BKV); /* next tile's globals issue NOW, land behind compute */
 #else
 #if PLOW_MLA_PF2_ABL != 1
-            for (unsigned e = tid * 8; e < (unsigned)(BKV * DK); e += PLOW_THREADS * 8) {
+            for (unsigned e = tid * 8; e < (unsigned)(BKV * DK); e += WG * 8) {
                 const unsigned r = e / DK, c = e % DK;
                 bf16v8 v = bf16v8_zero();
                 if constexpr (GATHER) {
                     const unsigned u = kv0 + r;
                     if (u < ucount) {
                         const unsigned kv = (unsigned)as_glob(upos)[u];
-                        v = ld_glob8(cbase + (size_t)(kv & kv_mask) * DK + c);
+                        if constexpr (FP8)
+                            v = fp8v8_to_bf16v8(
+                                ld_glob_fp8v8(cb8 + (size_t)(kv & kv_mask) * DK + c));
+                        else
+                            v = ld_glob8(cbase + (size_t)(kv & kv_mask) * DK + c);
                     }
                 } else {
                     const unsigned kv = kv0 + r;
-                    if (kv < kv_end) v = ld_glob8(cbase + (size_t)(kv & kv_mask) * DK + c);
+                    if (kv < kv_end) {
+                        if constexpr (FP8)
+                            v = fp8v8_to_bf16v8(
+                                ld_glob_fp8v8(cb8 + (size_t)(kv & kv_mask) * DK + c));
+                        else
+                            v = ld_glob8(cbase + (size_t)(kv & kv_mask) * DK + c);
+                    }
                 }
                 __builtin_memcpy(&Ksm[krow(r) + c], &v, 16);
             }
-            for (unsigned e = tid * 8; e < (unsigned)(BKV * DR); e += PLOW_THREADS * 8) {
+            for (unsigned e = tid * 8; e < (unsigned)(BKV * DR); e += WG * 8) {
                 const unsigned r = e / DR, c = e % DR;
                 bf16v8 v = bf16v8_zero();
                 if constexpr (GATHER) {
                     const unsigned u = kv0 + r;
                     if (u < ucount) {
                         const unsigned kv = (unsigned)as_glob(upos)[u];
-                        v = ld_glob8(rbase + (size_t)(kv & kv_mask) * DR + c);
+                        if constexpr (FP8) {
+                            if (krot_fp8)
+                                v = fp8v8_to_bf16v8(
+                                    ld_glob_fp8v8(rb8 + (size_t)(kv & kv_mask) * DR + c));
+                            else
+                                v = ld_glob8(rbase + (size_t)(kv & kv_mask) * DR + c);
+                        } else
+                            v = ld_glob8(rbase + (size_t)(kv & kv_mask) * DR + c);
                     }
                 } else {
                     const unsigned kv = kv0 + r;
-                    if (kv < kv_end) v = ld_glob8(rbase + (size_t)(kv & kv_mask) * DR + c);
+                    if (kv < kv_end) {
+                        if constexpr (FP8) {
+                            if (krot_fp8)
+                                v = fp8v8_to_bf16v8(
+                                    ld_glob_fp8v8(rb8 + (size_t)(kv & kv_mask) * DR + c));
+                            else
+                                v = ld_glob8(rbase + (size_t)(kv & kv_mask) * DR + c);
+                        } else
+                            v = ld_glob8(rbase + (size_t)(kv & kv_mask) * DR + c);
+                    }
                 }
                 __builtin_memcpy(&Ksm[krow(r) + DK + c], &v, 16);
             }
@@ -3471,6 +3530,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
 
             /* ---- S = Q·K^T over the full 576, registers × LDS, zero redundancy ---- */
             f32x4 sacc[2] = {(f32x4)(0.0f), (f32x4)(0.0f)};
+            f32x4 srope[2] = {(f32x4)(0.0f), (f32x4)(0.0f)};
 #if PLOW_MLA_PF2_ABL != 2
 #if PLOW_MLA_PF_SV
             /* SV(2): flattened + double-buffered. The shipped form below reloads `kf` into
@@ -3478,7 +3538,7 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
              * `ds_read_b128; s_waitcnt lgkmcnt(0); mfma; mfma` 36 times — ONE LDS read in
              * flight, its full latency exposed every fragment. Issuing s+1's read before
              * s's MFMAs lets the wait drop to lgkmcnt(1). Same fragments, same order. */
-            {
+            if constexpr (!FP8) {
                 bf16x8 kf[2];
                 auto kload = [&](int s, int slot) {
                     __builtin_memcpy(&kf[slot],
@@ -3493,16 +3553,51 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                     sacc[st / NKT] =
                         plow_mfma_bf16_16x16(qa[st % NKT], kf[st & 1], sacc[st / NKT]);
                 }
+            } else {
+#pragma unroll
+                for (int nt = 0; nt < 2; nt++) {
+#pragma unroll
+                    for (int kt = 0; kt < DK / 32; kt++) {
+                        bf16x8 kf;
+                        __builtin_memcpy(
+                            &kf, &Ksm[krow(nt * 16 + fr) + (unsigned)kt * 32 + kg * 8], 16);
+                        sacc[nt] = plow_mfma_bf16_16x16(qa[kt], kf, sacc[nt]);
+                    }
+#pragma unroll
+                    for (int kt = DK / 32; kt < NKT; kt++) {
+                        bf16x8 kf;
+                        __builtin_memcpy(
+                            &kf, &Ksm[krow(nt * 16 + fr) + (unsigned)kt * 32 + kg * 8], 16);
+                        srope[nt] = plow_mfma_bf16_16x16(qa[kt], kf, srope[nt]);
+                    }
+                }
             }
 #else
 #pragma unroll
             for (int nt = 0; nt < 2; nt++) {
+                if constexpr (FP8) {
 #pragma unroll
-                for (int kt = 0; kt < NKT; kt++) {
-                    bf16x8 kf;
-                    __builtin_memcpy(
-                        &kf, &Ksm[krow(nt * 16 + fr) + (unsigned)kt * 32 + kg * 8], 16);
-                    sacc[nt] = plow_mfma_bf16_16x16(qa[kt], kf, sacc[nt]);
+                    for (int kt = 0; kt < DK / 32; kt++) {
+                        bf16x8 kf;
+                        __builtin_memcpy(
+                            &kf, &Ksm[krow(nt * 16 + fr) + (unsigned)kt * 32 + kg * 8], 16);
+                        sacc[nt] = plow_mfma_bf16_16x16(qa[kt], kf, sacc[nt]);
+                    }
+#pragma unroll
+                    for (int kt = DK / 32; kt < NKT; kt++) {
+                        bf16x8 kf;
+                        __builtin_memcpy(
+                            &kf, &Ksm[krow(nt * 16 + fr) + (unsigned)kt * 32 + kg * 8], 16);
+                        srope[nt] = plow_mfma_bf16_16x16(qa[kt], kf, srope[nt]);
+                    }
+                } else {
+#pragma unroll
+                    for (int kt = 0; kt < NKT; kt++) {
+                        bf16x8 kf;
+                        __builtin_memcpy(
+                            &kf, &Ksm[krow(nt * 16 + fr) + (unsigned)kt * 32 + kg * 8], 16);
+                        sacc[nt] = plow_mfma_bf16_16x16(qa[kt], kf, sacc[nt]);
+                    }
                 }
             }
 #endif
@@ -3543,7 +3638,14 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
                         valid = (qi < n_tok) && (kvg < kv_end) && (kvg <= qg) &&
                                 (!window || (qg - kvg) < window);
                     }
-                    sv[nt] = valid ? sacc[nt][i] * FA_SCALE(scale) : FA_NEG_INF;
+                    float score = sacc[nt][i];
+                    if constexpr (FP8) {
+                        const unsigned row = kvg & kv_mask;
+                        const float cs = csc[row];
+                        const float rs = krot_fp8 ? rsc[row] : 1.0f;
+                        score = score * cs + srope[nt][i] * rs;
+                    }
+                    sv[nt] = valid ? score * FA_SCALE(scale) : FA_NEG_INF;
                     rmax = fmaxf(rmax, sv[nt]);
                 }
 #pragma unroll
@@ -3572,8 +3674,12 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
 #pragma unroll
             for (int nt = 0; nt < 2; nt++)
 #pragma unroll
-                for (int i = 0; i < 4; i++)
-                    Pw[(kg * 4 + i) * BKV + (unsigned)nt * 16 + fr] = f2bf(pe[nt][i]);
+                for (int i = 0; i < 4; i++) {
+                    float p = pe[nt][i];
+                    if constexpr (FP8)
+                        p *= csc[(kv0 + (unsigned)nt * 16 + fr) & kv_mask];
+                    Pw[(kg * 4 + i) * BKV + (unsigned)nt * 16 + fr] = f2bf(p);
+                }
 
             /* ---- O += P·V, V = the latent columns of the SAME slab ---- */
             bf16x8 pf;

@@ -247,6 +247,9 @@ extern "C" __device__ unsigned plow_moe_gemma_pf_arms_1 = 1;
  * silently — the marker lets exec/amd.rs refuse instead. */
 #if PLOW_MLA_PF_V2_ARM
 extern "C" __device__ unsigned plow_mla_pf_v2_arm_1 = 1;
+#if PLOW_FP8_KV
+extern "C" __device__ unsigned plow_mla_pf_v2_fp8_arm_1 = 1;
+#endif
 #endif
 /* Same contract as the arms markers above, for L2-DOMAIN DISPATCH. A blob compiled with
  * PLOW_L2_PLACE repurposes the global-queue `seg` as an L2 domain rather than a wave class, so an
@@ -1635,14 +1638,23 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if PLOW_MLA_PF_V2_ARM
     /* V2 MLA prefill: the full-column-wave layout this 4-wave/512-reg object exists to
-     * afford (op_attention.h d_flash_mla_prefill_v2). bf16 KV only — fp8-KV blobs keep
-     * their MLA segments on the 8-wave object (the host never routes op 110 here).
+     * afford (op_attention.h d_flash_mla_prefill_v2).
      *   t0=Opart t1=mlpart t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len
      *   i0=n_batch i1=n_head i2=kv_stride i3=window i4=n_tok i5=kv_mask f0=scale */
     static_assert(PLOW_WAVES == 4, "the V2 MLA prefill arm is shaped for the 4-wave object");
     static_assert(FA_MLA_PF2_LDS_BYTES(512, 64) <= (int)sizeof(((plow_smem*)nullptr)->fa),
                   "V2 MLA prefill LDS exceeds the flash arena");
-    if (in->op == PLOW_DOP_FLASH_MLA_PREFILL) {
+    if (in->op == PLOW_DOP_FLASH_MLA_PREFILL_FP8) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+        d_flash_mla_prefill_v2<512, 64, /*GATHER=*/false, /*FP8=*/true>(
+            (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+            (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0],
+            in->i[4], in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk,
+            sm->fa, nullptr, 0u, 1u, false, (const float*)TEN(7), in->i[6]);
+#undef TEN
+    }
+#if !PLOW_FP8_KV
+    else if (in->op == PLOW_DOP_FLASH_MLA_PREFILL) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
         /* t7 = the DSA per-64-query-tile union table (op 119) selects the GATHER arm:
          * same full-column-wave body, but the KV walk covers the tile's union entries and
@@ -1674,6 +1686,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 ((in->i[6] >> 8) & 1u) != 0u);
 #undef TEN
     }
+#endif
 #endif
     (void)slice;
 #else

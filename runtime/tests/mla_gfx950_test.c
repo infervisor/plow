@@ -53,6 +53,10 @@ static void check(const char* what, const bf16* got, const float* want, size_t n
 
 static plow_hsa* H;
 static void* dev(size_t b) { return plow_hsa_alloc(H, 0, b); }
+static uint32_t rnd_u32(uint32_t* state) {
+    *state = *state * 1664525u + 1013904223u;
+    return *state;
+}
 
 /* Little-endian readers over the fixture byte stream. */
 static const uint8_t* P;
@@ -61,6 +65,7 @@ static float rd_f32(void) { float v; memcpy(&v, P, 4); P += 4; return v; }
 
 int main(int argc, char** argv) {
     const char* fx = argc > 1 ? argv[1] : "fixture.bin";
+    const char* object = argc > 2 ? argv[2] : "test_kernels.elf";
     FILE* ff = fopen(fx, "rb");
     if (!ff) { perror(fx); return 1; }
     fseek(ff, 0, SEEK_END); long fn = ftell(ff); fseek(ff, 0, SEEK_SET);
@@ -77,8 +82,8 @@ int main(int argc, char** argv) {
     plow_hsa_device_info(H, 0, nm, &cus, &lds);
     printf("dev0: %s  CUs=%u  LDS=%u B\n\n", nm, cus, lds);
 
-    FILE* f = fopen("test_kernels.elf", "rb");
-    if (!f) { perror("test_kernels.elf"); return 1; }
+    FILE* f = fopen(object, "rb");
+    if (!f) { perror(object); return 1; }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     void* co = malloc(n);
     if (fread(co, 1, n, f) != (size_t)n) return 1;
@@ -493,10 +498,14 @@ int main(int argc, char** argv) {
      * krot_fp8 = 0: K3 keeps the 64-wide rope cache in bf16 (op 110 carries i6=0), so
      * that is the shipped form and the one gated here.
      * ==================================================================== */
-    plow_hsa_kernel kpf8, kpfm8;
+    plow_hsa_kernel kpf8, kpfm8, kpfv8;
     if (plow_hsa_get_kernel(H, 0, "mla_flash_prefill_fp8_512", &kpf8) ||
         plow_hsa_get_kernel(H, 0, "mla_flash_prefill_mfma_fp8_512", &kpfm8)) {
         fprintf(stderr, "fp8 prefill sym: %s\n", plow_hsa_last_error());
+        return 1;
+    }
+    if (plow_hsa_get_kernel(H, 0, "mla_flash_prefill_v2_fp8_512", &kpfv8)) {
+        fprintf(stderr, "fp8 v2 sym: %s\n", plow_hsa_last_error());
         return 1;
     }
     printf("\nMLA PREFILL, FP8 LATENT (tiled vs the shipped scalar fp8 body):\n");
@@ -505,7 +514,7 @@ int main(int argc, char** argv) {
         static const unsigned CX[] = {2048, 2048, 512, 1024};
         static const unsigned TK[] = {130, 64, 512, 65};
         uint32_t rs = 99991u;
-#define RND (rs = rs * 1664525u + 1013904223u)
+#define RND rnd_u32(&rs)
         for (unsigned c = 0; c < sizeof(NH) / sizeof(NH[0]); c++) {
             const unsigned nh = NH[c], ctx = CX[c], T = TK[c], DK = 512, DR = 64;
             const size_t nckv = (size_t)ctx * DK, nkr = (size_t)ctx * DR;
@@ -543,6 +552,7 @@ int main(int argc, char** argv) {
             void* dL = dev(4); plow_hsa_copy_h2d(H, 0, dL, pL, 4);
             void* dO1 = dev(nop * 4); void* dM1 = dev(nml * 4);
             void* dO2 = dev(nop * 4); void* dM2 = dev(nml * 4);
+            void* dO3 = dev(nop * 4); void* dM3 = dev(nml * 4);
 
             struct __attribute__((packed)) {
                 void *op, *ml; const void *qa, *qr, *ckv, *kr, *len;
@@ -556,15 +566,27 @@ int main(int argc, char** argv) {
                                 0, &a2, sizeof(a2)) != 0) {
                 fprintf(stderr, "fp8 launch: %s\n", plow_hsa_last_error()); fails++;
             }
+            {
+                typeof(a1) a3 = {dO3, dM3, dQa, dQr, dC, dR, dL, 1, T, nh, ctx, 0,
+                                 0.0883883f, dS, 0};
+                if (plow_hsa_launch(H, 0, &kpfv8, cus * 256u, 1, 1, 256u, 1, 1, 0, &a3,
+                                    sizeof(a3)) != 0) {
+                    fprintf(stderr, "fp8 v2 launch: %s\n", plow_hsa_last_error()); fails++;
+                }
+            }
             plow_hsa_wait(H, 0);
             float* hO1 = plow_hsa_alloc_host(H, nop * 4);
             float* hM1 = plow_hsa_alloc_host(H, nml * 4);
             float* hO2 = plow_hsa_alloc_host(H, nop * 4);
             float* hM2 = plow_hsa_alloc_host(H, nml * 4);
+            float* hO3 = plow_hsa_alloc_host(H, nop * 4);
+            float* hM3 = plow_hsa_alloc_host(H, nml * 4);
             plow_hsa_copy_d2h(H, 0, hO1, dO1, nop * 4);
             plow_hsa_copy_d2h(H, 0, hM1, dM1, nml * 4);
             plow_hsa_copy_d2h(H, 0, hO2, dO2, nop * 4);
             plow_hsa_copy_d2h(H, 0, hM2, dM2, nml * 4);
+            plow_hsa_copy_d2h(H, 0, hO3, dO3, nop * 4);
+            plow_hsa_copy_d2h(H, 0, hM3, dM3, nml * 4);
 
             float err = 0.0f;
             for (size_t row = 0; row < (size_t)T * nh; row++) {
@@ -589,11 +611,33 @@ int main(int argc, char** argv) {
             printf("  %-42s %s  (max rel err %.2e, tol %.0e)\n", label, bad ? "FAIL" : "PASS",
                    err, (double)MLA_PF_MFMA_TOL);
             if (bad) fails++;
+            {
+                float v2_err = 0.0f;
+                for (size_t row = 0; row < (size_t)T * nh; row++) {
+                    const float l1 = hM1[row * 2 + 1], l3 = hM3[row * 2 + 1];
+                    float mag = 0.0f, dif = 0.0f;
+                    for (unsigned d = 0; d < DK; d++) {
+                        const float v1 = l1 > 0.0f ? hO1[row * DK + d] / l1 : 0.0f;
+                        const float v3 = l3 > 0.0f ? hO3[row * DK + d] / l3 : 0.0f;
+                        const float av = v1 < 0 ? -v1 : v1;
+                        const float dv = (v1 - v3) < 0 ? (v3 - v1) : (v1 - v3);
+                        if (av > mag) mag = av;
+                        if (dv > dif) dif = dv;
+                    }
+                    const float e = mag > 0.0f ? dif / mag : dif;
+                    if (e > v2_err) v2_err = e;
+                }
+                const int v2_bad = !(v2_err <= MLA_PF_MFMA_TOL);
+                printf("  %-42s %s  (max rel err %.2e, tol %.0e)\n", "  \\_ fp8 V2",
+                       v2_bad ? "FAIL" : "PASS", v2_err, (double)MLA_PF_MFMA_TOL);
+                if (v2_bad) fails++;
+            }
 
             plow_hsa_free(H, dC); plow_hsa_free(H, dR); plow_hsa_free(H, dQa);
             plow_hsa_free(H, dQr); plow_hsa_free(H, dS); plow_hsa_free(H, dL);
             plow_hsa_free(H, dO1); plow_hsa_free(H, dM1);
             plow_hsa_free(H, dO2); plow_hsa_free(H, dM2);
+            plow_hsa_free(H, dO3); plow_hsa_free(H, dM3);
         }
 #undef RND
     }

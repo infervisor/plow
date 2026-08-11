@@ -54,6 +54,67 @@ if(PLOW_ROCM)
     target_compile_options(interp_mxfp4_bench PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(interp_mxfp4_bench PRIVATE hsa-runtime64 m)
 
+    set(PLOW_MLA_HIPCC "$ENV{PLOW_HIPCC}")
+    set(PLOW_MLA_BUNDLER "$ENV{PLOW_BUNDLER}")
+    if(NOT PLOW_MLA_HIPCC MATCHES "^/nix/store/")
+        message(FATAL_ERROR "MLA gfx942 benches require Nix PLOW_HIPCC")
+    endif()
+    if(NOT PLOW_MLA_BUNDLER MATCHES "^/nix/store/")
+        message(FATAL_ERROR "MLA gfx942 benches require Nix PLOW_BUNDLER")
+    endif()
+
+    set(MLA_PREFILL_BENCH_ELF ${CMAKE_CURRENT_BINARY_DIR}/mla_prefill_bench_gfx942.elf)
+    add_custom_command(
+        OUTPUT ${MLA_PREFILL_BENCH_ELF}
+        COMMAND "${PLOW_MLA_HIPCC}" --offload-arch=gfx942 -O3 -w --genco
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/test_kernels.hip
+                -o ${MLA_PREFILL_BENCH_ELF}.co
+        COMMAND "${PLOW_MLA_BUNDLER}" --unbundle --type=o
+                --targets=hipv4-amdgcn-amd-amdhsa--gfx942
+                --input=${MLA_PREFILL_BENCH_ELF}.co --output=${MLA_PREFILL_BENCH_ELF}
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${MLA_PREFILL_BENCH_ELF}.co
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../amd/test_kernels.hip
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention.h
+        VERBATIM)
+    add_custom_target(mla_prefill_bench_gfx942_elf DEPENDS ${MLA_PREFILL_BENCH_ELF})
+    add_executable(mla_prefill_bench_gfx942
+        ../tests/mla_prefill_bench_gfx950.c
+        ../amd/hsa_backend.c)
+    target_include_directories(mla_prefill_bench_gfx942 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+        ${CMAKE_CURRENT_SOURCE_DIR}/../common
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_compile_definitions(mla_prefill_bench_gfx942 PRIVATE _POSIX_C_SOURCE=199309L)
+    target_compile_options(mla_prefill_bench_gfx942 PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(mla_prefill_bench_gfx942 PRIVATE hsa-runtime64 m)
+    add_dependencies(mla_prefill_bench_gfx942 mla_prefill_bench_gfx942_elf)
+
+    set(MLA_FIXTURE ${CMAKE_CURRENT_BINARY_DIR}/mla_fixture.bin)
+    set(MLA_REF ${CMAKE_CURRENT_BINARY_DIR}/mla_ref)
+    find_program(PLOW_BENCH_RUSTC rustc REQUIRED)
+    add_custom_command(
+        OUTPUT ${MLA_FIXTURE}
+        COMMAND ${PLOW_BENCH_RUSTC} -O ${CMAKE_CURRENT_SOURCE_DIR}/../tests/mla_ref.rs
+                -o ${MLA_REF}
+        COMMAND ${MLA_REF} ${MLA_FIXTURE}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../tests/mla_ref.rs
+        VERBATIM)
+    add_custom_target(mla_fixture DEPENDS ${MLA_FIXTURE})
+    add_executable(mla_gfx942_test
+        ../tests/mla_gfx950_test.c
+        ../amd/hsa_backend.c)
+    target_include_directories(mla_gfx942_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+        ${CMAKE_CURRENT_SOURCE_DIR}/../common
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_compile_definitions(mla_gfx942_test PRIVATE _POSIX_C_SOURCE=199309L)
+    target_compile_options(mla_gfx942_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(mla_gfx942_test PRIVATE hsa-runtime64 m)
+    add_dependencies(mla_gfx942_test mla_fixture mla_prefill_bench_gfx942_elf)
+
     # Grouped simulated-A4W4 GLU+DOWN oracle/benchmark. MPA4C3_INTERP=1 sends the
     # packets through the production gfx942 persistent interpreter object.
     set(MOE_A4W4_TEST_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tests/moe_prefill_a4w4_cdna3_test.hip)

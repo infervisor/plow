@@ -175,6 +175,9 @@ AX_FLASH="-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=2
 # object's 512-register budget. Marker `plow_mla_pf_v2_arm_1`; the host routes FlashMlaPrefill
 # segments here only under PLOW_MLA_PF_V2=1, so carrying the arm costs Gemma nothing.
 AX_FLASH="$AX_FLASH -DPLOW_MLA_PF_V2_ARM=1"
+# Small K3 buckets remain L2-placed while machine-filling V2 buckets use wave segments.
+# The dispatch arm is inert when `l2_domains == 0`, so one object safely serves both forms.
+AX_FLASH="$AX_FLASH -DPLOW_L2_PLACE_DISPATCH=1"
 # OPT-IN (PLOW_FA_LAZY=1): wave-voted skip of the online-softmax corr/rescale when the
 # running max did not move (bit-identical; see op_attention.h FA_LAZY_RESCALE). FLASH
 # OBJECT ONLY — the 8-wave prefill interpreter sits on the 256-reg cliff and even a
@@ -799,7 +802,7 @@ ROWS=(
   "interp_decode_fp8|$AX_DECODE $AX_FP8"
   "interp_prefill_fp8kv|$AX_PREFILL $AX_FP8 $AX_FP8KV"
   "interp_decode_fp8kv|$AX_DECODE $AX_FP8 $AX_FP8KV"
-  "interp_flash_fp8kv|$AX_FLASH $AX_FP8KV"
+  "interp_flash_fp8kv|$AX_FLASH $AX_FP8KV -DPLOW_K3=1"
   "interp_prefill_mla|$AX_PREFILL $AX_MLA"
   "interp_prefill_mla_moe|$AX_PREFILL $AX_MLA $AX_MOE"
   "interp_prefill_fp8_mla|$AX_PREFILL $AX_MLA $AX_FP8"
@@ -920,6 +923,23 @@ for row in "${ROWS[@]}"; do
       *)             [ "$v" -le 256 ] || { echo "  OVER REG: $v > 256"; fail=1; } ;;
     esac
     case "$stem" in
+      interp_flash*)
+        symbols=$("$READELF" -sW "$stem.elf" 2>/dev/null)
+        grep -qE "OBJECT .* plow_mla_pf_v2_arm_1$" <<<"$symbols" || {
+          echo "  MISSING MLA V2: expected plow_mla_pf_v2_arm_1"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_l2_place_dispatch_1$" <<<"$symbols" || {
+          echo "  MISSING L2 DISPATCH: expected plow_l2_place_dispatch_1"
+          fail=1
+        }
+        if [[ "$stem" == interp_flash_fp8kv* ]]; then
+          grep -qE "OBJECT .* plow_mla_pf_v2_fp8_arm_1$" <<<"$symbols" || {
+            echo "  MISSING FP8 MLA V2: expected plow_mla_pf_v2_fp8_arm_1"
+            fail=1
+          }
+        fi
+        ;;
       interp_decode*)
         symbols=$("$READELF" -sW "$stem.elf" 2>/dev/null)
         grep -qE "OBJECT .* plow_gemv_mm_cap_${GVMM}$" <<<"$symbols" || {

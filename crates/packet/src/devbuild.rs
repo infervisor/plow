@@ -302,6 +302,10 @@ pub struct Builder {
     tr_dropped: usize,
 }
 
+fn mla_v2_segment(op: u16, n_tok: u32) -> bool {
+    n_tok >= 2048 && (op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16)
+}
+
 impl Builder {
     pub fn new(n_cu: u32) -> Self {
         Self {
@@ -1112,9 +1116,11 @@ impl Builder {
         // not be given one because a variable said so. See that method for the failure it prevents.
         let uniseg = !self.uniseg_denied
             && (self.uniseg_forced || std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1"));
-        // PLOW_MLA_PF_V2=1 splits FlashMlaPrefill (bf16, op 51) into its own wave-class-4
-        // segments so the AMD host can route them to the 4-wave flash object's V2 kernel
-        // (d_flash_mla_prefill_v2). Emit-time, because segments only form on wave_class
+        // PLOW_MLA_PF_V2=1 splits FlashMlaPrefill (bf16, op 51) and its fp8-KV twin
+        // (op 110) into their own wave-class-4
+        // segments at T>=2048 so the AMD host can route them to the 4-wave flash object's V2
+        // kernel (d_flash_mla_prefill_v2). Smaller buckets remain one 8-wave L2-placed launch.
+        // Emit-time, because segments only form on wave_class
         // BOUNDARIES: reclassifying host-side would drag whatever ops share the segment onto
         // an object that silently skips them. Unset = byte-identical blobs. The host applies
         // its own purity + size guards (exec/amd.rs derive_segments), so an env mismatch in
@@ -1177,7 +1183,7 @@ impl Builder {
                 } else {
                     4
                 }
-            } else if mla_v2 && op == DevOp::FlashMlaPrefill as u16 {
+            } else if mla_v2 && mla_v2_segment(op, self.ops[i].inst.i[4]) {
                 4
             } else if seg_v2
                 && pure_gemm // pure_gemm implies a prefill program — decode stays unsegmented
@@ -2756,6 +2762,15 @@ mod granularity_tests {
 #[cfg(test)]
 mod seg_window_tests {
     use super::*;
+
+    #[test]
+    fn mla_v2_segments_only_machine_filling_prefill_buckets() {
+        assert!(!mla_v2_segment(DevOp::FlashMlaPrefill as u16, 1024));
+        assert!(!mla_v2_segment(DevOp::FlashMlaPrefillFp8 as u16, 1024));
+        assert!(mla_v2_segment(DevOp::FlashMlaPrefill as u16, 2048));
+        assert!(mla_v2_segment(DevOp::FlashMlaPrefillFp8 as u16, 2048));
+        assert!(!mla_v2_segment(DevOp::Gemv as u16, 8192));
+    }
 
     /// The number of segments a program's stream spans, derived the way every
     /// runtime derives it (`plowrt::exec::amd::derive_segments`,

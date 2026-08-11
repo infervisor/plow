@@ -64,6 +64,7 @@ struct pf_args {
 int main(int argc, char** argv) {
     const unsigned n_head = (unsigned)(argc > 1 ? atoi(argv[1]) : 12);
     const unsigned iters = (unsigned)(argc > 2 ? atoi(argv[2]) : 5);
+    const char* object = argc > 3 ? argv[3] : "test_kernels.elf";
     const unsigned DK = 512, DR = 64;
 
     H = plow_hsa_init();
@@ -72,8 +73,8 @@ int main(int argc, char** argv) {
     plow_hsa_device_info(H, 0, nm, &cus, &ldsb);
     printf("dev0: %s  CUs=%u  LDS=%u B   n_head=%u  iters=%u\n", nm, cus, ldsb, n_head, iters);
 
-    FILE* f = fopen("test_kernels.elf", "rb");
-    if (!f) { perror("test_kernels.elf"); return 1; }
+    FILE* f = fopen(object, "rb");
+    if (!f) { perror(object); return 1; }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     void* co = malloc(n);
     if (fread(co, 1, n, f) != (size_t)n) return 1;
@@ -178,9 +179,13 @@ int main(int argc, char** argv) {
         fflush(stdout);
     }
 
+    plow_hsa_kernel kv2;
+    if (plow_hsa_get_kernel(H, 0, "mla_flash_prefill_v2_fp8_512", &kv2)) {
+        fprintf(stderr, "v2 sym: %s\n", plow_hsa_last_error()); return 1;
+    }
     printf("\nfp8 latent (op 110 — the arm Kimi-K3 dispatches)\n");
-    printf("  %6s %6s | %11s %11s %7s | %9s %9s\n", "ctx", "n_tok", "scalar ms",
-           "tiled ms", "speedup", "sc TF/s", "ti TF/s");
+    printf("  %6s %6s | %10s %10s %10s | %8s %8s\n", "ctx", "n_tok", "scalar ms",
+           "tiled ms", "v2 ms", "ti/v2", "v2 TF/s");
     for (unsigned c = 0; c < NC; c++) {
         const unsigned ctx = CTX[c], T = TOK[c];
         pLen[0] = (int)ctx;
@@ -191,12 +196,14 @@ int main(int argc, char** argv) {
         for (unsigned t = 0; t < T; t++) kvpairs += (double)(ctx - T + t + 1);
         const double flop = kvpairs * (double)n_head * (double)(DK + DR + DK) * 2.0;
 
-        double best[2] = {1e30, 1e30};
-        for (int which = 0; which < 2; which++) {
-            plow_hsa_kernel* k = which ? &km8 : &ks8;
+        double best[3] = {1e30, 1e30, 1e30};
+        const int nk = 3;
+        for (int which = 0; which < nk; which++) {
+            plow_hsa_kernel* k = which == 0 ? &ks8 : (which == 1 ? &km8 : &kv2);
+            const unsigned threads = which == 2 ? 256u : PLOW_WG_THREADS;
             for (unsigned it = 0; it < iters + 1; it++) {
                 const double t0 = now_s();
-                if (plow_hsa_launch(H, 0, k, cus * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1,
+                if (plow_hsa_launch(H, 0, k, cus * threads, 1, 1, threads, 1, 1,
                                     0, &a, sizeof(a)) != 0) {
                     fprintf(stderr, "launch: %s\n", plow_hsa_last_error());
                     return 1;
@@ -206,8 +213,9 @@ int main(int argc, char** argv) {
                 if (it && dt < best[which]) best[which] = dt;
             }
         }
-        printf("  %6u %6u | %11.3f %11.3f %6.2fx | %9.1f %9.1f\n", ctx, T, best[0] * 1e3,
-               best[1] * 1e3, best[0] / best[1], flop / best[0] / 1e12, flop / best[1] / 1e12);
+        printf("  %6u %6u | %10.3f %10.3f %10.3f | %7.2fx %8.1f\n", ctx, T,
+               best[0] * 1e3, best[1] * 1e3, best[2] * 1e3, best[1] / best[2],
+               flop / best[2] / 1e12);
         fflush(stdout);
     }
 

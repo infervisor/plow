@@ -660,6 +660,8 @@ option(PLOW_MOE_PF_A4W4_WEIGHT_NT
        "Use non-temporal loads for grouped A4W4 expert weights" OFF)
 option(PLOW_KDA_PF_STATE_RESIDENT
        "Keep K3 TP8 prefill KDA state in registers across serial tokens" OFF)
+option(PLOW_MLA_PF_SV
+       "Use the V2 MLA-prefill LDS swizzle and fragment staging" ON)
 
 set(PLOW_HSACO_ARCH "gfx950" CACHE STRING "offload arch for the served code objects")
 set(PLOW_HSACO_HIPCC "/opt/rocm/bin/hipcc" CACHE FILEPATH "hipcc used for the served code objects")
@@ -721,6 +723,12 @@ if(PLOW_GFX950_HSACO)
     # (the Q-hoist spills Q to scratch, cheaper than the L2 re-read it replaces).
     set(_hs_ax_flash -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4
                      -DFA_DC=256 -DFA_DBUF=1)
+    if(PLOW_HSACO_ARCH STREQUAL "gfx942")
+        list(APPEND _hs_ax_flash -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_L2_PLACE_DISPATCH=1)
+        if(PLOW_MLA_PF_SV)
+            list(APPEND _hs_ax_flash -DPLOW_MLA_PF_SV=1)
+        endif()
+    endif()
     set(_hs_ax_gq -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=${PLOW_GQ_BATCH})
     # PRECISION AXES, ONE PER INDEPENDENT CHOICE. They were not independent: _hs_ax_fp8kv used
     # to expand to `-DPLOW_FP8=1 -DPLOW_FP8_KV=1`, so the KV-encoding axis silently dragged the
@@ -730,6 +738,11 @@ if(PLOW_GFX950_HSACO)
     # arms REPLACED the bf16 GEMV_GLU/GEMV_QKV it needs. Now the axes compose instead.
     set(_hs_ax_fp8 -DPLOW_FP8=1)          # WEIGHT encoding: fp8 e4m3 (prefill w8a8, decode w8a16)
     set(_hs_ax_fp8kv -DPLOW_FP8_KV=1)     # KV encoding: fp8 e4m3 cache + per-row scales
+    if(PLOW_HSACO_ARCH STREQUAL "gfx942")
+        set(_hs_ax_fp8kv_k3_flash ${_hs_ax_fp8kv} -DPLOW_K3=1)
+    else()
+        set(_hs_ax_fp8kv_k3_flash ${_hs_ax_fp8kv})
+    endif()
     set(_hs_ax_fp8_fp8kv ${_hs_ax_fp8} ${_hs_ax_fp8kv})   # both, the shipped fp8-KV profile
     set(_hs_ax_mxfp4 -DPLOW_MXFP4=1)      # WEIGHT encoding: MXFP4 e2m1+E8M0 (w4a16 projections)
     if(NOT PLOW_MXFP4_DECODE_NT)
@@ -888,7 +901,7 @@ if(PLOW_GFX950_HSACO)
             # its hd512 flash on the 8-wave interpreter — correct, but without the
             # 512-register budget the Q-hoist needs. Same cliff as the bf16 twin
             # (measured 256+256 = 512 / occ 1 / spill 228, the intentional Q-hoist).
-            "interp_flash_fp8kv|${_hs_kfl}|_hs_ax_flash|_hs_ax_fp8kv|512|1")
+            "interp_flash_fp8kv|${_hs_kfl}|_hs_ax_flash|_hs_ax_fp8kv_k3_flash|512|1")
     endif()
     if(PLOW_HSACO_MXFP4)
         # Same asymmetry: PLOW_DOP_GEMM_MXFP4 (93) is the w4a16 PREFILL twin of the

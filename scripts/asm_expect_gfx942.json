@@ -85,6 +85,19 @@
   "MoE path dequantizes MXFP4 activations and weights to bf16 on CDNA3, so it must select the",
   "gfx942 bf16 MFMA and must not inherit the native-fp8 expectation from interp_prefill_fp8."
  ],
+ "interp_flash_fp8kv": {
+  "plow_interp_flash": {
+   "require_min": {
+    "v_mfma_f32_16x16x16_bf16": 1,
+    "v_perm_b32": 1
+   },
+   "no_scratch": true,
+   "forbid": [
+    "v_mfma_f32_32x32x64_f8f6f4",
+    "v_mfma_scale_f32_32x32x64_f8f6f4"
+   ]
+  }
+ },
  "interp_prefill_fp8kv_k3": {
   "plow_exec": {
    "require_min": {

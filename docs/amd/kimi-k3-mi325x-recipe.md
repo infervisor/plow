@@ -22,8 +22,8 @@ oracles, serving scheduler, and performance records.
   GEMV walk, batched width, and recurrent sequence-row addressing.
 - The final ladder fixes slot-stable recurrent state flow and exact TP counter
   auditing across rung changes. The post-soak reuse gate is byte-identical.
-- The branch is production-capable for the measured TP8 path, but its accuracy
-  and comparison evidence is incomplete: final-ladder GSM8K was not rerun and
+- The branch is production-capable for the measured TP8 path. The V2 final
+  ladder scored 197/200 GSM8K; comparison evidence remains incomplete because
   the upstream vLLM engine fails before model load on this host.
 - CUDA can read ladder metadata but still executes its widest decode program;
   the dynamic-rung performance path is AMD-only in this branch.
@@ -219,6 +219,7 @@ nix develop --command env \
   PLOW_FP8_KV=1 \
   PLOW_MXFP4=1 \
   PLOW_L2_PLACE=1 \
+  PLOW_MLA_PF_V2=1 \
   PLOW_DECODE_BATCH=32 \
   PLOW_DECODE_BATCH_LADDER=1,2,4,8,16,32 \
   PLOW_GEMV_MM=16 \
@@ -271,10 +272,9 @@ nix develop --command env \
   scripts/k3_tp_equivalence.sh
 ```
 
-The adopted single-rung B1 asset scored GSM8K 197/200. That accuracy result was
-not repeated on the final ladder packet, so do not present it as a final-ladder
-accuracy measurement. A production release should repeat GSM8K and the 16K/32K
-context gates.
+The V2 final-ladder asset scored GSM8K 197/200 (8-shot, greedy, N=200), exactly
+matching the adopted single-rung B1 score. Its served 8K/16K/32K context gates
+also passed. See `perf-data/kimi-k3-mi325x-fp8-mla-v2.md`.
 
 ## 7. Serve
 
@@ -283,6 +283,7 @@ The reported run held one exclusive lease for the server lifetime:
 ```bash
 nix develop --command env \
   PLOW_L2_PLACE_DISPATCH=1 \
+  PLOW_MLA_PF_V2=1 \
   PLOW_TP_AUDIT_COMPACT=1 \
   PLOW_CTR_DBUF=1 \
   PLOW_STATE_CLEAR_DEVICE=1 \
@@ -399,13 +400,19 @@ MXFP4 MFMA, and the standalone A8W4 FP8-MFMA probe was 21.5% slower than the
 current A4/BF16 path. Padding, selected-expert weight traffic, LDS staging,
 register spills, and per-layer counter convergence dominate.
 
-## Pending performance work
+## Performance status and pending work
 
 Rank these against this recipe as the control:
 
-1. **K3 FP8 MLA flash prefill.** Add op110 to the specialized flash object and
-   route only compatible segments. Projected flash share grows from about 5%
-   at 8K to 17% at 32K.
+The B1 long-context baseline is frozen in
+`perf-data/kimi-k3-mi325x-b1-128k.md`: served TPOT grows from 56.33 ms at 8K
+to 82.58 ms at 128K, while TTFT grows from 4.87 s to 156.63 s.
+
+1. **K3 FP8 MLA flash prefill — adopted.** The op110 four-wave V2 arm reduces
+   served TTFT by 5.01%, 9.19%, 15.38%, 23.35%, and 33.14% at
+   8K/16K/32K/64K/128K. TPOT is effectively flat and GSM8K is 197/200.
+   Machine-filling buckets trade L2-domain placement for wave segmentation;
+   smaller buckets remain placed and single-launch.
 2. **Cross-request packed prefill.** The mux currently runs one request chunk,
    then decode, synchronously. Pack pending KDA rows and block-diagonal MLA
    work to reduce cold C8/C32 TTFT and improve expert fill.
@@ -415,9 +422,10 @@ Rank these against this recipe as the control:
 4. **Low-rung object selection.** B1/B2/B4/B8 are adopted; each exact-width
    object beats MM16+walk by 11.9--37.4% TPOT. Keep B16/B32 on the primary
    object; object capability must match each ladder packet.
-5. **Pipeline recurrent-state admission.** Initializing one slot clears about
-   56.6 MiB/rank across 276 KDA/conv tensors using many blocking fills. Batch or
-   enqueue these clears without advancing already-live slots.
+5. **Pack cold admissions and prefill.** Device-local recurrent-state clear is
+   adopted (one kernel/rank instead of 276 blocking fills). The remaining cold
+   path serializes each request's prefill chunks; pack independent request rows
+   without advancing parked KDA/conv state.
 6. **Refresh MI325X tuning data.** The checked-in 686-row cell is stale against
    the final source/toolchain digest. Re-measure interpreter packets before
    allowing tuned selection; do not reuse MI300X records.

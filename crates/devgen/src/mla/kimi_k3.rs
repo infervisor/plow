@@ -1236,6 +1236,9 @@ fn k3_build_model(
         // builders only, and `kimi_k3` is absent from the arch list that warns about being
         // ignored (`lib.rs:4327`), so setting it on K3 was a silent no-op.
         b.set_l2_placement(l2_layout);
+        if crate::emit_is_amd() {
+            b.deny_uniseg();
+        }
         b.adopt_tensors(tensors.clone());
         crate::k3::emit_k3_model(
             &mut b,
@@ -1275,6 +1278,9 @@ fn k3_build_model(
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
         b.set_l2_placement(l2_layout);
+        if crate::emit_is_amd() {
+            b.deny_uniseg();
+        }
         b.adopt_tensors(tensors.clone());
         crate::k3::emit_k3_model(
             &mut b,

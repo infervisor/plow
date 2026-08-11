@@ -343,7 +343,7 @@ pub fn tile_cost(
 /// byte-stable when no emit wrapper is installed; NVIDIA emit MUST call [`with_emit_target_amd`]
 /// `(false, …)` or the gfx950 analytical inventory re-selects `GemmWide`/`GemmC5` and Hopper
 /// prefills trap.
-fn emit_is_amd() -> bool {
+pub(crate) fn emit_is_amd() -> bool {
     EMIT_IS_AMD.with(|c| c.get())
 }
 

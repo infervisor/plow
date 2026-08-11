@@ -1322,8 +1322,9 @@ pub fn mla_pf_v2_enabled() -> bool {
     crate::config::RuntimeConfig::get().amd.mla_pf_v2
 }
 
-/// The V2 arm's marker symbol (see `plow_mla_pf_v2_arm_1` in interp.hip).
+/// The V2 arms' marker symbols (see `interp.hip`).
 const MLA_PF_V2_SYM: &str = "plow_mla_pf_v2_arm_1";
+const MLA_PF_V2_FP8_SYM: &str = "plow_mla_pf_v2_fp8_arm_1";
 
 /// Per-segment wave class, derived from the stream.
 ///
@@ -1332,12 +1333,15 @@ const MLA_PF_V2_SYM: &str = "plow_mla_pf_v2_arm_1";
 /// 8. The fp8 twin is included here and is NOT in the reference — omitting it
 /// silently ran fp8-KV flash segments on the 8-wave object.
 ///
-/// Under `PLOW_MLA_PF_V2=1`, `FlashMlaPrefill` (bf16, op 51) is class 4 too — but only in
+/// Under `PLOW_MLA_PF_V2=1`, the bf16 and fp8-KV MLA prefill ops (51 and 110) are class 4 too — but only in
 /// programs whose bucket is big enough to fill the machine at the V2 kernel's BQ=64 work
 /// decomposition (`t >= 2048`: 256+ items over 304 CUs). Smaller buckets keep the 8-wave
-/// kernel, whose BQ=32 fills at half the tokens. The fp8 twin (op 110) NEVER routes here —
-/// the V2 arm is bf16-only.
+/// kernel, whose BQ=32 fills at half the tokens.
 pub fn derive_segments(prog: &DevProg) -> Result<Vec<u8>> {
+    derive_segments_for(prog, mla_pf_v2_enabled() && prog.t >= 2048)
+}
+
+fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
     let mut n_seg: u32 = 1;
     for e in &prog.stream {
         let s = e.seg as u32 + 1;
@@ -1357,7 +1361,6 @@ pub fn derive_segments(prog: &DevProg) -> Result<Vec<u8>> {
     // the split fails the purity test and stays whole on the 8-wave object; a split blob run
     // without the env falls to the t/env guard and likewise runs 8-wave. Either mismatch
     // degrades, never corrupts.
-    let v2 = mla_pf_v2_enabled() && prog.t >= 2048;
     let mut mla_pure = vec![v2; n_seg as usize];
     let mut needs_v2: Vec<(usize, u32)> = Vec::new();
     let mut mla_any = vec![false; n_seg as usize];
@@ -1375,7 +1378,7 @@ pub fn derive_segments(prog: &DevProg) -> Result<Vec<u8>> {
             .op;
         if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
             class[e.seg as usize] = 4;
-        } else if op == DevOp::FlashMlaPrefill as u16 {
+        } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
             // A dense causal KV-split packet (i6 = ns, no union table in t7) writes ns
             // partials per (token, head) and the merge reads ns of them. The 8-wave
             // fallback kernel writes the nsplit=1 layout — so the env/routing mismatches
@@ -1390,7 +1393,10 @@ pub fn derive_segments(prog: &DevProg) -> Result<Vec<u8>> {
             // on the 8-wave kernel anyway -- while `v2` is true so the old guard stayed silent.
             // The requirement is not "the env is set", it is "THIS packet's segment was actually
             // routed to the V2 arm", which is only known once the class pass below has run.
-            if d.i[6] > 1 && d.t[7] == packet::dev::TENSOR_NONE16 {
+            if op == DevOp::FlashMlaPrefill as u16
+                && d.i[6] > 1
+                && d.t[7] == packet::dev::TENSOR_NONE16
+            {
                 needs_v2.push((e.seg as usize, d.i[6]));
             }
             mla_any[e.seg as usize] = true;
@@ -3739,6 +3745,13 @@ impl AmdEngine {
                         .iter()
                         .any(|i| i.op == DevOp::FlashMlaPrefill as u16)
             });
+        let need_mla_v2_fp8 = mla_pf_v2_enabled()
+            && blob.progs[..dec_ix].iter().any(|p| {
+                p.t >= 2048
+                    && p.insts
+                        .iter()
+                        .any(|i| i.op == DevOp::FlashMlaPrefillFp8 as u16)
+            });
 
         // --- code objects ---------------------------------------------------
         // Resolve the symbol immediately after each load: the HSA backend
@@ -3886,6 +3899,14 @@ impl AmdEngine {
                      writes NOTHING, so those packets would silently skip. Rebuild the flash \
                      object (scripts/build_gfx942.sh adds -DPLOW_MLA_PF_V2_ARM=1) or unset \
                      PLOW_MLA_PF_V2.",
+                        path.display()
+                    )));
+                }
+                if phase == Phase::Flash && need_mla_v2_fp8 && !syms.contains(&MLA_PF_V2_FP8_SYM) {
+                    return Err(RuntimeError::Device(format!(
+                        "PLOW_MLA_PF_V2=1 routes FlashMlaPrefillFp8 segments to {}, but it was \
+                     compiled without the fp8 V2 arm (no `{MLA_PF_V2_FP8_SYM}`). Rebuild the \
+                     fp8-KV flash object or unset PLOW_MLA_PF_V2.",
                         path.display()
                     )));
                 }
@@ -6671,6 +6692,47 @@ fn kernarg_bytes(p: &DevProgram) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn segmented_prog(ops: &[DevOp], segs: &[u16]) -> DevProg {
+        assert_eq!(ops.len(), segs.len());
+        DevProg {
+            t: 2048,
+            n_counter: 0,
+            insts: ops
+                .iter()
+                .map(|&op| DevInst64 {
+                    op: op as u16,
+                    ..Default::default()
+                })
+                .collect(),
+            stream: segs
+                .iter()
+                .enumerate()
+                .map(|(inst, &seg)| packet::dev::StreamEnt {
+                    inst: inst as u32,
+                    seg,
+                    ..Default::default()
+                })
+                .collect(),
+            stream_ofs: Vec::new(),
+            stream_len: Vec::new(),
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        }
+    }
+
+    #[test]
+    fn fp8_mla_v2_routes_only_a_pure_segment_to_four_waves() {
+        let pure = segmented_prog(&[DevOp::FlashMlaPrefillFp8], &[0]);
+        assert_eq!(derive_segments_for(&pure, true).unwrap(), [4]);
+        assert_eq!(derive_segments_for(&pure, false).unwrap(), [8]);
+
+        let mixed = segmented_prog(&[DevOp::FlashMlaPrefillFp8, DevOp::Gemv], &[0, 0]);
+        assert_eq!(derive_segments_for(&mixed, true).unwrap(), [8]);
+    }
 
     #[test]
     fn state_clear_ranges_cover_each_slot_stride_once() {
