@@ -1660,3 +1660,78 @@ fn deepseek_arch_tag() {
     assert_eq!(d.kind, vec!["mla_attn", "moe_ffn"]);
     assert_eq!(d.dsa_role, None);
 }
+
+#[test]
+fn k3_dspark_block_is_one_sequence_with_seven_noncausal_query_rows() {
+    let mut c = kimi_ref_cfg();
+    c.layers = 5;
+    c.first_k_dense = 5;
+    let (m, d) = glm_build_block_pf(
+        &c,
+        512,
+        256,
+        0..5,
+        false,
+        "kimi-k3-dspark",
+        MlaArch::K3DSpark,
+        &[],
+        PrefillScope::Attn,
+        MoeEnc::Bf16,
+    );
+
+    assert_eq!(
+        m.prog_t,
+        vec![1],
+        "one committed context sequence, not batch seven"
+    );
+    assert_eq!(d.arch, "k3_dspark");
+    assert_eq!(d.programs.decode_t, 1);
+    let bytes = |name: &str| m.tensors.iter().find(|t| t.name == name).unwrap().bytes;
+    assert_eq!(bytes("in.kvlen"), 4, "one context frontier");
+    assert_eq!(bytes("act.x"), 7 * c.hidden as u64 * 2);
+
+    let p = &m.progs[0];
+    let flash = p
+        .insts
+        .iter()
+        .filter(|i| i.op == DevOp::FlashMlaDecode as u16)
+        .collect::<Vec<_>>();
+    assert_eq!(flash.len(), 5, "one non-causal MLA packet per draft layer");
+    assert!(
+        p.insts
+            .iter()
+            .all(|i| i.op != DevOp::FlashMlaDecodeFp8 as u16),
+        "the first query-block contract keeps context KV bf16 because i6 carries n_tok"
+    );
+    for f in flash {
+        assert_eq!(f.i[0], 1, "one cache sequence");
+        assert_eq!(f.i[6], 7, "seven mutually non-causal query rows");
+        let need = 7u64 * f.i[1] as u64 * f.i[4] as u64 * c.kv_lora as u64 * 4;
+        assert!(
+            m.tensors[f.t[0] as usize].bytes >= need,
+            "flash partial buffer must hold query*head*split rows"
+        );
+    }
+
+    let folds = p
+        .insts
+        .iter()
+        .filter(|i| i.op == DevOp::MlaMergeFold as u16)
+        .collect::<Vec<_>>();
+    assert_eq!(folds.len(), 5);
+    assert!(folds.iter().all(|i| i.i[0] == 7));
+
+    let kv_outputs = m
+        .tensors
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            t.name.starts_with("kv.") && (t.name.ends_with(".ckv") || t.name.ends_with(".krot"))
+        })
+        .map(|(i, _)| i as u32)
+        .collect::<Vec<_>>();
+    assert!(
+        p.insts.iter().all(|i| !kv_outputs.contains(&i.t[0])),
+        "draft query rows must read committed context KV without appending themselves"
+    );
+}
