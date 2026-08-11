@@ -44,6 +44,8 @@
  * four tokens, top-16 routing, 896 experts, H=3584, I=384, and a 304-CU grid.
  * `MPA4C3_DECODE4_BENCH=1` times that shape through the standalone `k_glu`/`k_down`
  * wrappers and writes the same provenance JSONL used by the prefill benchmark.
+ * `MPA4C3_W2_TOUCH_BENCH=1` runs an interleaved combined-chain A/B at that shape. The candidate
+ * touches only route-selected W2 tiles after GLU, with the same slice ownership DOWN will use.
  */
 
 #ifdef MPA4C3_DEVICE
@@ -53,7 +55,7 @@
 #include "op_moe.h"
 
 struct KA {
-    unsigned long long Cout, Ain, Asc, wtab, stab, meta, rtok, rpix, rgate, Csc;
+    unsigned long long Cout, Ain, Asc, wtab, stab, meta, rtok, rpix, rgate, Csc, touch;
     unsigned N, K, n_exp, act;
     float beta, lbeta;
 };
@@ -75,6 +77,53 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_down(KA* a) {
                                (const unsigned*)a->rtok, (const unsigned*)a->rpix,
                                (const float*)a->rgate, (unsigned char*)a->Csc, a->N, a->K,
                                a->n_exp, a->act, blockIdx.x, gridDim.x, a->beta, a->lbeta, lds);
+}
+
+/* Test-only Laneformer axis. The GLU workgroup touches exactly the W2 tile that the same
+ * (slice,nblk) owner will consume in the following DOWN launch. Experts absent from tilep have
+ * no tile and are never touched; no production packet or interpreter arm depends on this. */
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_glu_w2_touch(KA* a) {
+    __shared__ unsigned char lds[MPF4_LDS_BYTES];
+    d_moe_group_pf_a4w4<true>((void*)a->Cout, (const void*)a->Ain,
+                              (const unsigned char*)a->Asc,
+                              (const unsigned long long*)a->wtab,
+                              (const unsigned long long*)a->stab, (const int*)a->meta,
+                              (const unsigned*)a->rtok, (const unsigned*)a->rpix,
+                              (const float*)a->rgate, (unsigned char*)a->Csc, a->N, a->K,
+                              a->n_exp, a->act, blockIdx.x, gridDim.x, a->beta, a->lbeta, lds);
+
+    const int* meta = (const int*)a->meta;
+    const int* tilep = meta + 2 * (int)a->n_exp;
+    const unsigned total_tiles = (unsigned)tilep[a->n_exp];
+    const unsigned down_n = a->K, down_k = a->N;
+    const unsigned tnc = (down_n + MPF4_BN - 1u) / MPF4_BN;
+    const unsigned ks = down_k >> 1, ksc = down_k >> 5;
+    const unsigned long long* wtab = (const unsigned long long*)a->wtab;
+    const unsigned long long* stab = (const unsigned long long*)a->stab;
+    unsigned sum = 0;
+    for (unsigned lin = blockIdx.x; lin < total_tiles * tnc; lin += gridDim.x) {
+        const unsigned mt = lin / tnc, nt = lin % tnc;
+        const unsigned e = mpf_expert_of_tile(tilep, mt, a->n_exp);
+        const unsigned n0 = nt * MPF4_BN;
+        const unsigned nr = down_n - n0 < MPF4_BN ? down_n - n0 : MPF4_BN;
+        const PLOW_GLOB volatile unsigned char* w =
+            (const PLOW_GLOB volatile unsigned char*)(size_t)wtab[(size_t)e * 3 + 2];
+        const PLOW_GLOB volatile unsigned char* s =
+            (const PLOW_GLOB volatile unsigned char*)(size_t)stab[(size_t)e * 3 + 2];
+        const size_t wb = (size_t)nr * ks, sb = (size_t)nr * ksc;
+        for (size_t line = threadIdx.x; line * 64u < wb; line += PLOW_THREADS)
+            sum += w[(size_t)n0 * ks + line * 64u];
+        for (size_t line = threadIdx.x; line * 64u < sb; line += PLOW_THREADS)
+            sum += s[(size_t)n0 * ksc + line * 64u];
+    }
+    unsigned* reduce = (unsigned*)lds;
+    reduce[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned d = PLOW_THREADS / 2; d; d >>= 1) {
+        if (threadIdx.x < d) reduce[threadIdx.x] += reduce[threadIdx.x + d];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) ((unsigned*)a->touch)[blockIdx.x] = reduce[0];
 }
 
 #else
@@ -137,7 +186,7 @@ static void json_string(FILE* f, const char* s) {
     } while (0)
 
 struct KA {
-    unsigned long long Cout, Ain, Asc, wtab, stab, meta, rtok, rpix, rgate, Csc;
+    unsigned long long Cout, Ain, Asc, wtab, stab, meta, rtok, rpix, rgate, Csc, touch;
     unsigned N, K, n_exp, act;
     float beta, lbeta;
 };
@@ -147,19 +196,22 @@ int main(int argc, char** argv) {
     printf("dev: %s\n", p.gcnArchName);
     hipModule_t M; HC(hipModuleLoad(&M, argc > 1 ? argv[1] : "/tmp/mpa4c3.co"));
     const bool INTERP = getenv("MPA4C3_INTERP") != nullptr;
-    hipFunction_t fglu, fdown;
+    hipFunction_t fglu, fdown, fglu_touch = nullptr;
     if (INTERP) {
         HC(hipModuleGetFunction(&fglu, M, "plow_interp_gfx942"));
         fdown = fglu;
     } else {
         HC(hipModuleGetFunction(&fglu, M, "k_glu"));
         HC(hipModuleGetFunction(&fdown, M, "k_down"));
+        if (getenv("MPA4C3_W2_TOUCH_BENCH"))
+            HC(hipModuleGetFunction(&fglu_touch, M, "k_glu_w2_touch"));
     }
 
     /* MPA4C3_BENCH=1: TP8 packet geometry for a 4096-token, top-16 K3 chunk. */
     const bool BENCH = getenv("MPA4C3_BENCH") != nullptr;
     const bool DECODE4_BASELINE = getenv("MPA4C3_DECODE4_BENCH") != nullptr;
-    const bool DECODE4 = getenv("MPA4C3_DECODE4") != nullptr || DECODE4_BASELINE;
+    const bool W2_TOUCH_BENCH = getenv("MPA4C3_W2_TOUCH_BENCH") != nullptr;
+    const bool DECODE4 = getenv("MPA4C3_DECODE4") != nullptr || DECODE4_BASELINE || W2_TOUCH_BENCH;
     const bool K3_SHAPE = BENCH || DECODE4;
     const unsigned H = K3_SHAPE ? 3584 : 512, IM = 384,
                    NTOK = DECODE4 ? 4 : (BENCH ? 4096 : 8),
@@ -255,6 +307,8 @@ int main(int argc, char** argv) {
     HC(hipMalloc(&d_fu, (size_t)R * IM / 2)); HC(hipMemset(d_fu, 0xEE, (size_t)R * IM / 2));
     HC(hipMalloc(&d_fus, (size_t)R * IM / 32)); HC(hipMemset(d_fus, 127, (size_t)R * IM / 32));
     HC(hipMalloc(&d_part, (size_t)np * H * 4)); HC(hipMemset(d_part, 0, (size_t)np * H * 4));
+    void* d_touch; HC(hipMalloc(&d_touch, (size_t)GRID * sizeof(unsigned)));
+    HC(hipMemset(d_touch, 0, (size_t)GRID * sizeof(unsigned)));
 
     KA ka{};
     ka.Ain = (unsigned long long)(size_t)d_x; ka.Cout = (unsigned long long)(size_t)d_fu;
@@ -262,6 +316,7 @@ int main(int argc, char** argv) {
     ka.stab = (unsigned long long)(size_t)d_stab; ka.meta = (unsigned long long)(size_t)d_meta;
     ka.rtok = (unsigned long long)(size_t)d_rtok; ka.rpix = (unsigned long long)(size_t)d_rpix;
     ka.rgate = (unsigned long long)(size_t)d_rgate;
+    ka.touch = (unsigned long long)(size_t)d_touch;
     ka.N = IM; ka.K = H; ka.n_exp = NEXP;
     ka.act = DECODE4 ? 2u : 1u;
     ka.beta = DECODE4 ? 4.0f : 0.0f;
@@ -346,6 +401,149 @@ int main(int argc, char** argv) {
     auto launch = [&](hipFunction_t f) {
         return hipModuleLaunchKernel(f, GRID, 1, 1, 512, 1, 1, 0, 0, launch_args, nullptr);
     };
+
+    if (W2_TOUCH_BENCH) {
+        const char* jsonl = getenv("MPA4C3_JSONL");
+        const char* gpu = getenv("PLOW_GPU");
+        const char* toolchain = getenv("PLOW_TOOLCHAIN_LABEL");
+        const char* build_id = getenv("PLOW_BUILD_ID");
+        const char* lease = getenv("PLOW_LEASE_LABEL");
+        if (INTERP || !jsonl || !gpu || strcmp(gpu, "MI325X") || !toolchain || !build_id ||
+            !lease) {
+            fprintf(stderr, "REFUSED: W2-touch A/B requires the standalone gfx942 object and "
+                            "MI325X/toolchain/build/lease/JSONL provenance\n");
+            return 2;
+        }
+
+        KA kg = ka, kd = ka;
+        kg.Ain = (unsigned long long)(size_t)d_x;
+        kg.Asc = 0;
+        kg.Cout = (unsigned long long)(size_t)d_fu;
+        kg.Csc = (unsigned long long)(size_t)d_fus;
+        kg.N = IM;
+        kg.K = H;
+        kd.Ain = (unsigned long long)(size_t)d_fu;
+        kd.Asc = (unsigned long long)(size_t)d_fus;
+        kd.Cout = (unsigned long long)(size_t)d_part;
+        kd.N = H;
+        kd.K = IM;
+        void *d_kg, *d_kd;
+        HC(hipMalloc(&d_kg, sizeof kg));
+        HC(hipMalloc(&d_kd, sizeof kd));
+        HC(hipMemcpy(d_kg, &kg, sizeof kg, hipMemcpyHostToDevice));
+        HC(hipMemcpy(d_kd, &kd, sizeof kd, hipMemcpyHostToDevice));
+        void* glu_args[] = {&d_kg};
+        void* down_args[] = {&d_kd};
+        auto run_chain = [&](bool touch) {
+            HC2(hipModuleLaunchKernel(touch ? fglu_touch : fglu, GRID, 1, 1, 512, 1, 1, 0, 0,
+                                      glu_args, nullptr));
+            HC2(hipModuleLaunchKernel(fdown, GRID, 1, 1, 512, 1, 1, 0, 0, down_args, nullptr));
+        };
+        auto reset_outputs = [&]() {
+            HC2(hipMemset(d_fu, 0xEE, (size_t)R * IM / 2));
+            HC2(hipMemset(d_fus, 127, (size_t)R * IM / 32));
+            HC2(hipMemset(d_part, 0, (size_t)np * H * sizeof(float)));
+            HC2(hipMemset(d_touch, 0, (size_t)GRID * sizeof(unsigned)));
+        };
+
+        std::vector<unsigned char> fu_base((size_t)R * IM / 2), fus_base((size_t)R * IM / 32),
+            fu_touch(fu_base.size()), fus_touch(fus_base.size());
+        std::vector<float> part_base((size_t)np * H), part_touch(part_base.size());
+        reset_outputs();
+        run_chain(false);
+        HC(hipDeviceSynchronize());
+        HC(hipMemcpy(fu_base.data(), d_fu, fu_base.size(), hipMemcpyDeviceToHost));
+        HC(hipMemcpy(fus_base.data(), d_fus, fus_base.size(), hipMemcpyDeviceToHost));
+        HC(hipMemcpy(part_base.data(), d_part, part_base.size() * sizeof(float),
+                     hipMemcpyDeviceToHost));
+        reset_outputs();
+        run_chain(true);
+        HC(hipDeviceSynchronize());
+        HC(hipMemcpy(fu_touch.data(), d_fu, fu_touch.size(), hipMemcpyDeviceToHost));
+        HC(hipMemcpy(fus_touch.data(), d_fus, fus_touch.size(), hipMemcpyDeviceToHost));
+        HC(hipMemcpy(part_touch.data(), d_part, part_touch.size() * sizeof(float),
+                     hipMemcpyDeviceToHost));
+        std::vector<unsigned> touch_sum(GRID);
+        HC(hipMemcpy(touch_sum.data(), d_touch, touch_sum.size() * sizeof(unsigned),
+                     hipMemcpyDeviceToHost));
+        const bool exact = !memcmp(fu_base.data(), fu_touch.data(), fu_base.size()) &&
+                           !memcmp(fus_base.data(), fus_touch.data(), fus_base.size()) &&
+                           !memcmp(part_base.data(), part_touch.data(),
+                                   part_base.size() * sizeof(float));
+        const bool touched = std::any_of(touch_sum.begin(), touch_sum.end(),
+                                         [](unsigned v) { return v != 0; });
+        if (!exact || !touched) {
+            fprintf(stderr, "FAIL: W2-touch output mismatch or touch sentinel remained zero\n");
+            return 1;
+        }
+
+        for (int w = 0; w < 10; w++) {
+            run_chain(false);
+            run_chain(true);
+        }
+        HC(hipDeviceSynchronize());
+        hipEvent_t t0, t1;
+        HC(hipEventCreate(&t0));
+        HC(hipEventCreate(&t1));
+        std::vector<double> base_ms(12), touch_ms(12);
+        auto sample = [&](bool touch) {
+            HC2(hipEventRecord(t0));
+            for (int rep = 0; rep < 4; rep++) run_chain(touch);
+            HC2(hipEventRecord(t1));
+            HC2(hipEventSynchronize(t1));
+            float ms;
+            HC2(hipEventElapsedTime(&ms, t0, t1));
+            return (double)ms / 4.0;
+        };
+        for (unsigned i = 0; i < base_ms.size(); i++) {
+            if (i & 1u) {
+                touch_ms[i] = sample(true);
+                base_ms[i] = sample(false);
+            } else {
+                base_ms[i] = sample(false);
+                touch_ms[i] = sample(true);
+            }
+        }
+        auto median = [](std::vector<double> v) {
+            std::sort(v.begin(), v.end());
+            return (v[5] + v[6]) * 0.5;
+        };
+        const double base_med = median(base_ms), touch_med = median(touch_ms);
+        unsigned paired_wins = 0;
+        for (unsigned i = 0; i < base_ms.size(); i++) paired_wins += touch_ms[i] < base_ms[i];
+        const unsigned total_tiles = (unsigned)tilep[NEXP];
+        const double touch_bytes =
+            (double)total_tiles * H * IM * (0.5 + 1.0 / 32.0);
+        const bool win = touch_med < base_med * 0.995 && paired_wins >= 8;
+        printf("W2 touch: selected-only requested %.3f MiB, baseline %.6f ms, touch %.6f ms "
+               "(%+.2f%%), paired wins %u/12 => %s\n",
+               touch_bytes / (1024.0 * 1024.0), base_med, touch_med,
+               100.0 * (touch_med / base_med - 1.0), paired_wins, win ? "KEEP" : "REJECT");
+
+        FILE* jf = fopen(jsonl, "a");
+        if (!jf) {
+            perror(jsonl);
+            return 1;
+        }
+        fputs("{\"gpu\":", jf); json_string(jf, gpu);
+        fputs(",\"arch\":\"gfx942\",\"toolchain\":", jf); json_string(jf, toolchain);
+        fputs(",\"build_id\":", jf); json_string(jf, build_id);
+        fputs(",\"lease_label\":", jf); json_string(jf, lease);
+        fputs(",\"object\":", jf); json_string(jf, argv[1]);
+        fprintf(jf, ",\"experiment\":\"selected_w2_touch\",\"tokens\":%u,\"topk\":16,"
+                    "\"routed_rows\":%u,\"padded_rows\":%u,\"experts\":%u,\"h\":%u,"
+                    "\"i_tp8\":%u,\"cu\":%u,\"touch_requested_bytes\":%.0f,"
+                    "\"exact_baseline\":true,\"accepted\":%s,\"base_samples_ms\":[",
+                NTOK, np, R, NEXP, H, IM, GRID, touch_bytes, win ? "true" : "false");
+        for (size_t i = 0; i < base_ms.size(); i++)
+            fprintf(jf, "%s%.6f", i ? "," : "", base_ms[i]);
+        fputs("],\"touch_samples_ms\":[", jf);
+        for (size_t i = 0; i < touch_ms.size(); i++)
+            fprintf(jf, "%s%.6f", i ? "," : "", touch_ms[i]);
+        fputs("]}\n", jf);
+        fclose(jf);
+        return win ? 0 : 3;
+    }
 
     select_arm(true);
     HC(launch(fglu));

@@ -103,9 +103,10 @@ shipped one.
   doubt.
 - `PLOW_UNISEG=1` — single-segment programs (required for the prefill buckets on
   the sm_120 interpreter).
-- `PLOW_DECODE_BATCH=B` — emit a batched decode program (B ∈ 1..8) for multi-user
-  serving (WS-GEMV shares weight reads across streams). `B=1` blobs are
-  byte-identical to unset.
+- `PLOW_DECODE_BATCH=B` — emit a batched decode program for multi-user serving
+  (WS-GEMV shares weight reads across streams). Kimi-K3 supports `B` in 1..32;
+  `B>16` requires `PLOW_GEMV_WALK=1`. Other model families may impose a lower
+  ceiling. `B=1` blobs are byte-identical to unset.
 - `PLOW_MAX_CHUNK=N` — largest prefill chunk for this compile (power of two,
   ≤ 8192). **This caps the bucket ladder**, so it also sets the ceiling for the
   runtime `PLOW_PF_INTERLEAVE` — raising that knob above this value is a no-op.
@@ -219,8 +220,9 @@ More emit knobs (all **byte-identical when unset** unless noted):
   `next_pow2(PLOW_DECODE_BATCH)` clamped to 16 and baked into the ELF symbol
   `plow_gemv_mm_cap_<MM>` (the plowrt loader validates it). `PLOW_GEMV_WALK`
   toggles the outer `ceil(M/MM)` loop so one MM object serves any M; **serving
-  batch > MM without WALK is refused.** NVIDIA analogue is the build-time
-  `GV_MM_MAX`.
+  batch > MM without WALK is refused.** Kimi-K3 requires WALK for decode batches
+  17..32 because the largest compiled AMD bucket is 16. NVIDIA analogue is the
+  build-time `GV_MM_MAX`.
 - `PLOW_PF_GEMV_HEAD` — force prefill `lm_head` onto the M=1 GEMV arm vs a tiled
   BM=128 tile (on by default for AMD; `=1`/`=0` to force). Traps on M≠1.
 - `PLOW_NO_FUSE_QKV=1` — revert the fused QKV projection to the historical

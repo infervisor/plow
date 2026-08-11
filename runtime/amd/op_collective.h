@@ -485,9 +485,9 @@ __device__ __forceinline__ void d_xreduce_mega(
  * an op that runs after the whole FFN).
  *
  * `val_id` must NOT be the arrival gate's id: the gate is an atomic counter.
- * Batch is capped at 16 by the 128-byte line: `n_batch` packed keys of 8 B each must fit one
- * PLOW_CTR_STRIDE counter, so 16*8 = 128 B is exact. `PLOW_XAMAX_MAX_BATCH` and the emitter's
- * matching assert (k3.rs, XArgmaxFin) are the two halves of that bound.
+ * Each 128-byte line carries sixteen packed 8-byte keys; batches above 16 use the immediately
+ * following line. `PLOW_XAMAX_MAX_BATCH` and the emitter's matching assert are the two halves of
+ * the 32-row bound.
  *
  * KNOWN, UNRESOLVED (perf-data/k3-batched-decode-design.md §9): a GSM8K run at B=4 hit ONE
  * cross-rank disagreement in ~1e4-1e5 steps where two ranks folded DIFFERENT winners that both

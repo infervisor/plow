@@ -43,6 +43,10 @@
 
 #include "amd_common.h"
 
+#ifndef PLOW_KDA_PF_STATE_RESIDENT
+#define PLOW_KDA_PF_STATE_RESIDENT 0
+#endif
+
 /* Gate activation modes, mirroring [fla]'s `safe_gate` switch (fla/ops/kda/gate.py:118-124). */
 enum { PLOW_KDA_GATE_SOFTPLUS = 0, PLOW_KDA_GATE_LOWER_BOUND = 1 };
 /* Flag bits for d_kda_state_step. */
@@ -404,6 +408,22 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
         const size_t dtb = (size_t)h * D;
         const float a_h = GATE ? __expf(a_log[h]) : 0.0f;
 
+#if PLOW_KDA_PF_STATE_RESIDENT
+        /* TP8 prefill assigns exactly one value column to each wave. Keep that column's two
+         * D=128 lane elements live across the serial token recurrence instead of round-tripping
+         * them through HBM at every token. Independent decode rows must retain the per-row path. */
+        const bool resident = PL == 2 && !bstride && BV == PLOW_WAVES;
+        float resident_sc[PL];
+        float* resident_col = nullptr;
+        if (resident) {
+            const unsigned j = tile * BV + wave;
+            resident_col = st_h + (size_t)j * D;
+#pragma unroll
+            for (unsigned r = 0; r < PL; r++)
+                resident_sc[r] = resident_col[r * PLOW_WAVE + lane];
+        }
+#endif
+
         for (unsigned t = bstride ? row : 0u; t < (bstride ? row + 1u : T); t++) {
             /* PER-ROW PARKED MASK (non-zero = skip). Only a sequence-rows program supplies one,
              * and skipping the
@@ -471,7 +491,11 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
 #pragma unroll
                 for (unsigned r = 0; r < PL; r++) {
                     const unsigned d = r * PLOW_WAVE + lane;
+#if PLOW_KDA_PF_STATE_RESIDENT
+                    sc[r] = (resident ? resident_sc[r] : col[d]) * l_g[d];
+#else
                     sc[r] = col[d] * l_g[d];
+#endif
                     pk += sc[r] * l_k[d];
                 }
                 pk = wave_sum(pk); /* S'^T k, over k, inside one wave */
@@ -484,7 +508,14 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                 for (unsigned r = 0; r < PL; r++) {
                     const unsigned d = r * PLOW_WAVE + lane;
                     sc[r] += bu * l_k[d]; /* rank-1 write */
+#if PLOW_KDA_PF_STATE_RESIDENT
+                    if (resident)
+                        resident_sc[r] = sc[r];
+                    else
+                        col[d] = sc[r];
+#else
                     col[d] = sc[r];
+#endif
                     pq += sc[r] * l_q[d]; /* read the UPDATED state */
                 }
                 pq = wave_sum(pq);
@@ -492,6 +523,13 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
             }
             __syncthreads(); /* l_q/l_k/l_g are rewritten by the next token */
         }
+#if PLOW_KDA_PF_STATE_RESIDENT
+        if (resident) {
+#pragma unroll
+            for (unsigned r = 0; r < PL; r++)
+                resident_col[r * PLOW_WAVE + lane] = resident_sc[r];
+        }
+#endif
     }
 }
 

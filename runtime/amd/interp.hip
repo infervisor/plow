@@ -3731,6 +3731,7 @@ extern "C" __global__ void plow_xctr_audit(PlowXAuditArgs a) {
             } else if (d.op == PLOW_DOP_XARGMAX_FIN) {
                 if (d.i[3] == gate) want = a.n_gpu;
                 if (d.i[4] == gate) data = true;
+                if (d.i[1] > PLOW_XAMAX_LINE && d.i[4] + 1u == gate) data = true;
             }
         }
         if (!data) {

@@ -15,7 +15,7 @@
  *     by D^-1/2, decay -> delta -> rank-1 write -> read of the UPDATED state, V-FIRST [h][v][k]
  *     state layout. The reference implements the spec, not the kernel, so a shared mistake would
  *     have to be made twice independently.
- *   - PREFILL mode (bstride=0): T=5 tokens threading serially through ONE state.
+ *   - PREFILL mode (bstride=0, BV=8): T=5 tokens threading serially through ONE state.
  *   - BATCHED-DECODE mode (bstride=H*D*D): 3 rows, each its OWN state — the axis fold whose
  *     absence ran batch-16 decode serially (see the kernel's header).
  *   - op 103 (`d_kda_gated_norm`): RMSNorm over D inside a head, one shared [D] weight, sigmoid
@@ -132,10 +132,10 @@ int main(int argc, char** argv) {
     HC(hipModuleGetFunction(&fstep, M, "k_step"));
     HC(hipModuleGetFunction(&fnorm, M, "k_norm"));
 
-    const unsigned H = 96, D = 128, BV = 16, GRID = 37;
+    const unsigned H = 96, D = 128, GRID = 37;
     srand(1337);
 
-    auto run_mode = [&](const char* nm, unsigned T, bool batched) -> double {
+    auto run_mode = [&](const char* nm, unsigned T, unsigned BV, bool batched) -> double {
         const unsigned nstate = batched ? T : 1;
         std::vector<bf16> q(T * H * D), k(q.size()), v(q.size()), graw(q.size()), braw(T * H);
         std::vector<float> alog(H), dtb(H * D);
@@ -188,8 +188,8 @@ int main(int argc, char** argv) {
             const double d_ = b2f(og[i]) - oref[i]; se2 += d_ * d_; sw2 += oref[i] * oref[i];
         }
         const double srms = sqrt(se / (sw + 1e-30)), orms = sqrt(se2 / (sw2 + 1e-30));
-        printf("  %-18s T=%u  state rms rel %.3e (bar 1e-4)   o rms rel %.3e (bar 1e-2)\n", nm, T,
-               srms, orms);
+        printf("  %-18s T=%u BV=%u  state rms rel %.3e (bar 1e-4)   o rms rel %.3e (bar 1e-2)\n",
+               nm, T, BV, srms, orms);
         /* op 103 on this mode's output */
         std::vector<float> nw(D);
         std::vector<bf16> g2((size_t)T * H * D);
@@ -223,8 +223,8 @@ int main(int argc, char** argv) {
     };
 
     double worst = 0;
-    worst = fmax(worst, run_mode("prefill (serial)", 5, false));
-    worst = fmax(worst, run_mode("batched decode", 3, true));
+    worst = fmax(worst, run_mode("prefill (serial)", 5, 8, false));
+    worst = fmax(worst, run_mode("batched decode", 3, 16, true));
     printf("%s\n", worst < 1.0 ? "PASS" : "FAIL");
     return worst >= 1.0;
 }

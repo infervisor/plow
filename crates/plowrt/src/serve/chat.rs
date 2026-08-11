@@ -145,12 +145,22 @@ pub async fn chat_completions(
         arrived: std::time::Instant::now(),
         respond: tx,
     };
-    if mux.submit(job).is_err() {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "model dispatcher unavailable"})),
-        )
-            .into_response();
+    if let Err(err) = mux.submit(job) {
+        return match err {
+            crate::serve::mux::SubmitError::Full(_) => {
+                crate::obs::Metrics::inc(&state.metrics.rejected);
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({"error": "model request queue full"})),
+                )
+                    .into_response()
+            }
+            crate::serve::mux::SubmitError::Closed(_) => (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "model dispatcher unavailable"})),
+            )
+                .into_response(),
+        };
     }
 
     let request_id = request_id();

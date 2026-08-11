@@ -940,7 +940,11 @@ pub(crate) fn k3_emit_full(
     let covered_layers = truncated.then(|| {
         let first = *layers.first().expect("K3 emits at least one layer") as usize;
         let end = *layers.last().expect("K3 emits at least one layer") as usize + 1;
-        assert_eq!(layers.len(), end - first, "K3 layer selection must be contiguous");
+        assert_eq!(
+            layers.len(),
+            end - first,
+            "K3 layer selection must be contiguous"
+        );
         first..end
     });
     match crate::checkpoint::validate_coverage(
@@ -1200,15 +1204,14 @@ fn k3_build_model(
     let mut tensors: Vec<packet::devbuild::TensorDecl> = Vec::new();
     let mut gen = Vec::new();
     let mut built: Vec<packet::devbuild::Program> = Vec::new();
-    let slot_rows = pf.iter().copied().max().unwrap_or(1);
     // BATCHED DECODE. `PLOW_DECODE_BATCH=B` makes the DECODE program carry B INDEPENDENT
     // SEQUENCES rather than one, which is a different thing from a prefill bucket's `t` rows and
     // is why it is paired with `RowKind::Sequences` rather than just a larger `t`
     // (perf-data/k3-batched-decode-design.md §1). B=1 is byte-identical to the pre-batch blob.
     //
-    // Capped at PLOW_GEMV_MAXM=16: `AmdEngine::load` refuses above it because the gfx950 decode
-    // GEMV is a compile-time row bucket and sequences 16.. would get zero logits. The KDA state
-    // is the other bound — 0.44 GiB per slot, constant in context.
+    // Above 16 rows the gfx942 GEMV object must carry PLOW_GEMV_WALK: its largest compiled row
+    // bucket is 16, and the walk is what covers the remaining rows instead of leaving stale
+    // logits. XArgmaxFin's two peer-data lines are the hard 32-row ceiling.
     // THE DECODE BATCH LADDER IS NOT WIRED HERE. `PLOW_DECODE_BATCH_LADDER` builds one decode
     // program per rung on the dense-GQA path (crates/devgen/src/lib.rs); K3 emits ONE decode
     // program at `dbatch`. Silently emitting a single-rung blob for an operator who asked for a
@@ -1225,7 +1228,11 @@ fn k3_build_model(
         "PLOW_DECODE_BATCH_LADDER is not implemented for the K3 emitter — it emits ONE decode \
          program. Use PLOW_DECODE_BATCH for this family."
     );
-    let dbatch: u32 = emit_config::active().decode_batch.clamp(1, 16);
+    let dbatch = checked_k3_decode_batch(
+        emit_config::active().decode_batch,
+        emit_config::active().gemv_walk,
+    );
+    let slot_rows = pf.iter().copied().max().unwrap_or(1).max(dbatch);
     for (i, &t) in std::iter::once(&dbatch).chain(pf.iter()).enumerate() {
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
@@ -1289,6 +1296,19 @@ fn k3_build_model(
         prog_t,
         gen,
     }
+}
+
+fn checked_k3_decode_batch(decode_batch: u32, gemv_walk: bool) -> u32 {
+    let dbatch = decode_batch.max(1);
+    assert!(
+        dbatch <= 32,
+        "K3 PLOW_DECODE_BATCH={dbatch} exceeds the 32-sequence XArgmaxFin ceiling"
+    );
+    assert!(
+        dbatch <= 16 || gemv_walk,
+        "K3 PLOW_DECODE_BATCH={dbatch} requires PLOW_GEMV_WALK=1 above 16 rows"
+    );
+    dbatch
 }
 
 /// The prefill rungs a K3 emit builds programs for.
@@ -1547,6 +1567,15 @@ fn textwrap72(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod kimi_k3_tests {
     use super::*;
+
+    #[test]
+    fn decode_batch_above_sixteen_requires_walk_and_caps_at_thirty_two() {
+        assert_eq!(checked_k3_decode_batch(0, false), 1);
+        assert_eq!(checked_k3_decode_batch(16, false), 16);
+        assert_eq!(checked_k3_decode_batch(32, true), 32);
+        assert!(std::panic::catch_unwind(|| checked_k3_decode_batch(17, false)).is_err());
+        assert!(std::panic::catch_unwind(|| checked_k3_decode_batch(33, true)).is_err());
+    }
 
     /// A faithful miniature of the real `config.json`: same key spellings, same nesting, same
     /// 1-based layer lists, scaled to 6 layers (2 MLA at 1-based {3,6}, 4 KDA).

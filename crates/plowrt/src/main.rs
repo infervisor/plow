@@ -59,6 +59,9 @@ enum Cmd {
         /// Muxer: admission SLO (ms) — predicted wait above this sheds requests.
         #[arg(long, default_value_t = 250.0)]
         slo_ms: f64,
+        /// Requests allowed to wait outside engine slots. `0` = four batches.
+        #[arg(long, default_value_t = 0)]
+        max_queued_requests: usize,
     },
 
     /// Enumerate every visible device and, with `--tp`, bring up the
@@ -305,6 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             trace,
             max_hold_ms,
             slo_ms,
+            max_queued_requests,
         } => {
             tracing::info!(
                 assets = ?assets,
@@ -314,6 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 trace,
                 max_hold_ms,
                 slo_ms,
+                max_queued_requests,
                 runtime = ?RuntimeConfig::global(),
                 environment = ?runtime_environment(),
                 "resolved serve configuration"
@@ -327,6 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 MuxConfig {
                     max_hold_ms,
                     slo_ms,
+                    max_queued_requests,
                     ..MuxConfig::default()
                 },
             )

@@ -656,6 +656,8 @@ option(PLOW_MXFP4_DECODE_NT
        "Use non-temporal loads for one-use decode MXFP4 projection weights" ON)
 option(PLOW_MOE_PF_A4W4_WEIGHT_NT
        "Use non-temporal loads for grouped A4W4 expert weights" OFF)
+option(PLOW_KDA_PF_STATE_RESIDENT
+       "Keep K3 TP8 prefill KDA state in registers across serial tokens" OFF)
 
 set(PLOW_HSACO_ARCH "gfx950" CACHE STRING "offload arch for the served code objects")
 set(PLOW_HSACO_HIPCC "/opt/rocm/bin/hipcc" CACHE FILEPATH "hipcc used for the served code objects")
@@ -673,9 +675,19 @@ set(PLOW_GQ_BATCH "1" CACHE STRING "global-queue claim batch")
 # first sampled token 0 off an all-zero logits row -- with a correct B-wide program around
 # it. See scripts/build_gfx950.sh for the full note.
 set(PLOW_DECODE_BATCH "1" CACHE STRING "decode batch bucket (-> PLOW_GEMV_MM)")
+option(PLOW_GEMV_WALK "Walk a <=16-row GEMV object across wider decode batches" OFF)
 set(PLOW_HSACO_EXTRA_DEFINES "" CACHE STRING "extra raw hipcc flags appended to every code object")
 
 if(PLOW_GFX950_HSACO)
+    if(NOT PLOW_DECODE_BATCH MATCHES "^[0-9]+$")
+        message(FATAL_ERROR "PLOW_DECODE_BATCH must be an integer in 1..32")
+    endif()
+    if(PLOW_DECODE_BATCH LESS 1 OR PLOW_DECODE_BATCH GREATER 32)
+        message(FATAL_ERROR "PLOW_DECODE_BATCH must be in 1..32")
+    endif()
+    if(PLOW_DECODE_BATCH GREATER 16 AND NOT PLOW_GEMV_WALK)
+        message(FATAL_ERROR "PLOW_DECODE_BATCH above 16 requires PLOW_GEMV_WALK=ON")
+    endif()
     string(REPLACE " " ";" _hs_extra "${PLOW_HSACO_EXTRA_DEFINES}")
     set(_hs_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/interp.hip")
     set(_hs_tk_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/test_kernels.hip")
@@ -700,6 +712,9 @@ if(PLOW_GFX950_HSACO)
         math(EXPR _hs_gvmm "${_hs_gvmm} * 2")
     endwhile()
     set(_hs_ax_decode -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=${_hs_gvmm})
+    if(PLOW_GEMV_WALK)
+        list(APPEND _hs_ax_decode -DPLOW_GEMV_WALK=1)
+    endif()
     # 4 waves => 1 wave/SIMD => a 512-reg budget, and ITS spill is intentional
     # (the Q-hoist spills Q to scratch, cheaper than the L2 re-read it replaces).
     set(_hs_ax_flash -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4
@@ -798,16 +813,21 @@ if(PLOW_GFX950_HSACO)
     # ATTENTION-ONLY object and a whole-layer K3 prompt needs one of these two.
     set(_hs_ax_k3_moe ${_hs_ax_mla_k3} -DPLOW_MOE_PREFILL=1)
     set(_hs_ax_k3_moe_fp8kv ${_hs_ax_mla_k3_fp8kv} -DPLOW_MOE_PREFILL=1)
+    set(_hs_ax_k3_pf_state "")
+    if(PLOW_KDA_PF_STATE_RESIDENT)
+        set(_hs_ax_k3_pf_state -DPLOW_KDA_PF_STATE_RESIDENT=1)
+    endif()
     # THE ROW A K3 PACKET ACTUALLY LOADS. K3 ships MXFP4 experts, and `enc = PLOW_MOE_ENC_MXFP4`
     # on ops 85/86 selects the A4W4 body — which lives behind PLOW_MOE_PF_A4W4. Without it the arm
     # takes `moe_pf_refuse` (loud, by design) rather than computing anything. PLOW_MXFP4 rides
     # along for the same reason `_mla_moe_a4w4_full` carries it: an all-fp4 packet needs the fp4
     # PROJECTIONS (op 93) in the same object as the fp4 experts, and they were on separate rows.
     set(_hs_ax_k3_moe_a4w4
-        ${_hs_ax_k3_moe} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight} -DPLOW_MXFP4=1)
+        ${_hs_ax_k3_moe} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight}
+        ${_hs_ax_k3_pf_state} -DPLOW_MXFP4=1)
     set(_hs_ax_k3_moe_a4w4_fp8kv
         ${_hs_ax_k3_moe_fp8kv} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight}
-        -DPLOW_MXFP4=1)
+        ${_hs_ax_k3_pf_state} -DPLOW_MXFP4=1)
 
     # Symbols carry the arch: the loader builds the kernel name from the LIVE
     # HSA agent name (exec/amd.rs symbol_name), so a gfx942 object must export

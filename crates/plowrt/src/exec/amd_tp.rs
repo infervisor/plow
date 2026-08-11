@@ -289,8 +289,7 @@ impl AmdTpGroup {
         }
         if tp.hidden == 0 {
             return Err(RuntimeError::Device(
-                "packet collective has zero width, so its hidden size is unrecoverable"
-                    .into(),
+                "packet collective has zero width, so its hidden size is unrecoverable".into(),
             ));
         }
 
@@ -1126,6 +1125,14 @@ impl AmdTpGroup {
 /// rendezvous and its published u64 past the end of `xctr` into the partial
 /// slots. Measured on the GLM-5.2 TP4 stacked blob: `n_xctr = 312`, prefill fold
 /// at 312/313, and the ranks sampled `[99419, 785, 99419, 785]`.
+fn xargmax_value_lines(n_batch: u32) -> u32 {
+    if n_batch > 16 {
+        2
+    } else {
+        1
+    }
+}
+
 fn count_xgates(blob: &DevBlob) -> u32 {
     use packet::dev::DevOp;
     let mut top = 0u32;
@@ -1137,8 +1144,10 @@ fn count_xgates(blob: &DevBlob) -> u32 {
                 // two-shot: reduce-scatter (i3) and all-gather (i4)
                 top = top.max(d.i[3] + 1).max(d.i[4] + 1);
             } else if d.op == DevOp::XArgmaxFin as u16 {
-                // sharded-head fold: arrival gate (i3) and value slot (i4)
-                top = top.max(d.i[3] + 1).max(d.i[4] + 1);
+                // sharded-head fold: arrival gate (i3), then one or two value lines at i4
+                top = top
+                    .max(d.i[3] + 1)
+                    .max(d.i[4] + xargmax_value_lines(d.i[1]));
             }
         }
     }
@@ -1172,8 +1181,8 @@ fn count_xgates(blob: &DevBlob) -> u32 {
 /// equality check rather than a range test — it then also catches a stale count
 /// that survived a missing `zero_xctr`.
 ///
-/// `None` means NOT A COUNTER. `XArgmaxFin`'s `i[4]` is a peer-visible u64 data
-/// slot that happens to live in the counter region because a counter line is 128
+/// `None` means NOT A COUNTER. `XArgmaxFin`'s `i[4]` names one or two peer-visible u64 data
+/// lines that happen to live in the counter region because a counter line is 128
 /// aligned peer-visible bytes the host already zeroes; its low word is the
 /// complement of the winning global vocab index, i.e. an arbitrary value. Auditing
 /// it as an arrival count would fail every step on a correct run. Skipping it is
@@ -1200,7 +1209,9 @@ fn gate_expectations(blob: &DevBlob, n_gpu: u32, n_xctr: u32) -> Vec<Vec<Option<
                     set(d.i[4], Some(n_gpu * d.blocks as u32));
                 } else if d.op == DevOp::XArgmaxFin as u16 {
                     set(d.i[3], Some(n_gpu));
-                    set(d.i[4], None); // data, not a counter
+                    for line in 0..xargmax_value_lines(d.i[1]) {
+                        set(d.i[4] + line, None); // data, not a counter
+                    }
                 }
             }
             e
@@ -1282,7 +1293,7 @@ mod tests {
         );
     }
 
-    /// The sharded-lm_head fold owns TWO xctr ids and they are allocated AFTER
+    /// The sharded-lm_head fold owns two or three xctr ids and they are allocated AFTER
     /// every layer collective, so a sizer that only counts reduces under-sizes
     /// the region by exactly the fold — and the fold then signals past the end
     /// of `xctr` with no fault. Measured: on the GLM-5.2 TP4 stacked blob the
@@ -1317,7 +1328,7 @@ mod tests {
         };
         // A prefill bucket whose two-shot reduces top out at id 1, then the fold
         // at 2 (gate) and 3 (value slot).
-        let blob = DevBlob {
+        let mut blob = DevBlob {
             n_cu: 256,
             flags: 0,
             target: 0,
@@ -1346,5 +1357,12 @@ mod tests {
             e[0][3], None,
             "the fold's published u64 is data, not a count"
         );
+
+        blob.progs[0].insts[1].i[1] = 32;
+        assert_eq!(count_xgates(&blob), 5);
+        let e = gate_expectations(&blob, 4, 5);
+        assert_eq!(e[0][2], Some(4));
+        assert_eq!(e[0][3], None);
+        assert_eq!(e[0][4], None);
     }
 }

@@ -2866,21 +2866,22 @@ pub fn emit_k3_model(
     if k3_shard_head(c) {
         // XArgmaxFin SUBSUMES ArgmaxFin — it folds the AMAX_BLOCKS partials itself, rebases the
         // winning index by `rank * vocab_l` and takes the cross-rank max. Emitting both would fold
-        // twice and write the LOCAL winner's id first. Two xctr ids: the arrival gate and the
-        // peer-visible 8-byte value slot, distinct because one is an atomic counter and one is data.
+        // twice and write the LOCAL winner's id first. Two or three xctr ids: the arrival gate and
+        // peer-visible value line(s), distinct because one is an atomic counter and the others
+        // are data. Each 128-byte line carries sixteen u64 winners.
         let gate = tp.xgate;
-        tp.xgate += 2;
+        let value_lines = if s_rows > 16 { 2 } else { 1 };
+        tp.xgate += 1 + value_lines;
         b.emit(DevOp::XArgmaxFin, vec![0u32], &[c_am], |d| {
             d.t[0] = ids;
             d.t[1] = amax;
             d.i[0] = crate::AMAX_BLOCKS;
-            // n_batch. The fold publishes one u64 per sequence into ONE 128-byte xctr counter
-            // line, so it carries at most PLOW_XAMAX_MAX_BATCH = 16 — asserted rather than left
-            // to silently leave ids[16..] holding the previous step's token.
-            const XAMAX_MAX_BATCH: u32 = 16;
+            // n_batch. The fold publishes one u64 per sequence into one or two 128-byte peer
+            // lines, matching PLOW_XAMAX_MAX_BATCH in op_collective.h.
+            const XAMAX_MAX_BATCH: u32 = 32;
             assert!(
                 s_rows <= XAMAX_MAX_BATCH,
-                "XArgmaxFin carries at most {XAMAX_MAX_BATCH} sequences in one xctr counter line, \
+                "XArgmaxFin carries at most {XAMAX_MAX_BATCH} sequences in two xctr data lines, \
                  got {s_rows}"
             );
             d.i[1] = s_rows;

@@ -92,11 +92,16 @@ AX_PREFILL="-DPLOW_BUCKET_DECODE=0 $CDNA3_TILE $AX_GMOE"
 # ladder instantiates MM in {1,2,4,8,16} and one instantiation with a runtime M serves every
 # M <= MM, so the bucket is a CEILING. Passing the raw batch through was a bug in this script:
 # PLOW_DECODE_BATCH=32 handed -DPLOW_GEMV_MM=32 to hipcc and every decode row failed to build.
-GVMM="${PLOW_DECODE_BATCH:-1}"
-case "$GVMM" in ''|*[!0-9]*) GVMM=1;; esac
-[ "$GVMM" -lt 1 ] && GVMM=1
+RAW_BATCH="${PLOW_DECODE_BATCH:-1}"
+case "$RAW_BATCH" in
+  ''|*[!0-9]*) echo "PLOW_DECODE_BATCH must be an integer in 1..32" >&2; exit 1 ;;
+esac
+if [ "$RAW_BATCH" -lt 1 ] || [ "$RAW_BATCH" -gt 32 ]; then
+  echo "PLOW_DECODE_BATCH must be in 1..32, got $RAW_BATCH" >&2
+  exit 1
+fi
 P2=1
-while [ "$P2" -lt "$GVMM" ]; do P2=$((P2 * 2)); done
+while [ "$P2" -lt "$RAW_BATCH" ]; do P2=$((P2 * 2)); done
 [ "$P2" -gt 16 ] && P2=16
 GVMM="$P2"
 
@@ -109,14 +114,18 @@ case "$WALK" in
   1) AX_GEMV_WALK="-DPLOW_GEMV_WALK=1" ;;
   *) echo "PLOW_GEMV_WALK must be 0 or 1" >&2; exit 1 ;;
 esac
+if [ "$RAW_BATCH" -gt 16 ] && [ "$WALK" != 1 ]; then
+  echo "REFUSING: PLOW_DECODE_BATCH=$RAW_BATCH requires PLOW_GEMV_WALK=1 above 16 rows." >&2
+  exit 1
+fi
 if [ -n "${PLOW_GEMV_MM:-}" ]; then
   case "$PLOW_GEMV_MM" in
     ''|*[!0-9]*) echo "PLOW_GEMV_MM must be a number" >&2; exit 1 ;;
     1|2|4|8|16) ;;
     *) echo "PLOW_GEMV_MM must be one of 1,2,4,8,16" >&2; exit 1 ;;
   esac
-  if [ "$PLOW_GEMV_MM" -lt "$GVMM" ] && [ "$WALK" != 1 ]; then
-    echo "REFUSING: PLOW_GEMV_MM=$PLOW_GEMV_MM < batch $GVMM with PLOW_GEMV_WALK unset." >&2
+  if [ "$PLOW_GEMV_MM" -lt "$RAW_BATCH" ] && [ "$WALK" != 1 ]; then
+    echo "REFUSING: PLOW_GEMV_MM=$PLOW_GEMV_MM < batch $RAW_BATCH with PLOW_GEMV_WALK unset." >&2
     echo "  Without the walk, gemv_rows<MM> writes rows 0..MM-1 and leaves the rest STALE." >&2
     exit 1
   fi
@@ -261,6 +270,11 @@ esac
 # script otherwise builds. Arm the queue interpretation on exactly the K3 A4W4 rows; hierarchy
 # remains a separate, unmeasured PLOW_L2HIER_PF experiment.
 AX_K3_A4W4="-DPLOW_L2_PLACE_DISPATCH=1"
+case "${PLOW_KDA_PF_STATE_RESIDENT:-0}" in
+  0) AX_K3_PF_STATE="" ;;
+  1) AX_K3_PF_STATE="-DPLOW_KDA_PF_STATE_RESIDENT=1" ;;
+  *) echo "FAIL: PLOW_KDA_PF_STATE_RESIDENT must be 0 or 1" >&2; exit 2 ;;
+esac
 # Value-identical CDNA3 DOWN metadata hoist: 6.155 -> 5.490 ms at the emitted TP8
 # 4096-token/896-expert shape. Keep it on the K3 A4W4 rows so unrelated model objects do not move.
 if [ "${PLOW_K3_A4W4_EPI:-1}" != 0 ]; then
@@ -801,8 +815,8 @@ ROWS=(
   "interp_prefill_k3_moe|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_MXFP4"
   # THE ROW A K3 PREFILL PACKET ACTUALLY LOADS (exec/amd.rs: grouped ops with i[3] == MXFP4
   # resolve the K3MoeA4w4 arm). On this arch it contains the simulated body -- see AX_A4W4.
-  "interp_prefill_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_MXFP4"
-  "interp_prefill_fp8kv_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_MXFP4 $AX_FP8KV"
+  "interp_prefill_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_PF_STATE $AX_MXFP4"
+  "interp_prefill_fp8kv_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_PF_STATE $AX_MXFP4 $AX_FP8KV"
 )
 
 # PLOW_ROWS_ONLY=<substring>: build only the rows whose stem matches — for iterating on

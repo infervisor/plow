@@ -65,6 +65,23 @@ if(PLOW_ROCM)
     if(NOT PLOW_AMDHIP64 MATCHES "^/nix/store/")
         message(FATAL_ERROR "amdhip64 must resolve from the Nix store: ${PLOW_AMDHIP64}")
     endif()
+    set(MOE_A4W4_W2_TOUCH_ELF
+        ${CMAKE_CURRENT_BINARY_DIR}/moe_prefill_a4w4_w2_touch_gfx942.elf)
+    add_custom_command(
+        OUTPUT ${MOE_A4W4_W2_TOUCH_ELF}
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+                "$ENV{PLOW_HIPCC}" "$ENV{PLOW_BUNDLER}" gfx942
+                ${MOE_A4W4_W2_TOUCH_ELF} k_glu_w2_touch 256 2
+                -DMPA4C3_DEVICE=1 -DPLOW_MOE_PF_A4W4=1
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                ${MOE_A4W4_TEST_SRC}
+        DEPENDS ${MOE_A4W4_TEST_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_moe.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+        VERBATIM)
+    add_custom_target(moe_prefill_a4w4_w2_touch_gfx942_elf
+        DEPENDS ${MOE_A4W4_W2_TOUCH_ELF})
     add_executable(moe_prefill_a4w4_cdna3_test ${MOE_A4W4_TEST_SRC})
     target_include_directories(moe_prefill_a4w4_cdna3_test PRIVATE
         "$ENV{ROCM_PATH}/include"
@@ -73,6 +90,35 @@ if(PLOW_ROCM)
     target_compile_definitions(moe_prefill_a4w4_cdna3_test PRIVATE __HIP_PLATFORM_AMD__=1)
     target_compile_options(moe_prefill_a4w4_cdna3_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(moe_prefill_a4w4_cdna3_test PRIVATE ${PLOW_AMDHIP64} m)
+    add_dependencies(moe_prefill_a4w4_cdna3_test moe_prefill_a4w4_w2_touch_gfx942_elf)
+
+    # Focused BV8 oracle for the opt-in K3 prefill state-residency path.
+    set(KDA_STATE_RESIDENT_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tests/kda_step_cdna3_test.hip)
+    set(KDA_STATE_RESIDENT_ELF ${CMAKE_CURRENT_BINARY_DIR}/kda_state_resident_gfx942.elf)
+    add_custom_command(
+        OUTPUT ${KDA_STATE_RESIDENT_ELF}
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+                "$ENV{PLOW_HIPCC}" "$ENV{PLOW_BUNDLER}" gfx942
+                ${KDA_STATE_RESIDENT_ELF} k_step 256 2
+                -DKDA3_DEVICE=1 -DPLOW_KDA_PF_STATE_RESIDENT=1
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                ${KDA_STATE_RESIDENT_SRC}
+        DEPENDS ${KDA_STATE_RESIDENT_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_kda.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_elementwise.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+        VERBATIM)
+    add_custom_target(kda_state_resident_gfx942_elf DEPENDS ${KDA_STATE_RESIDENT_ELF})
+    set_source_files_properties(${KDA_STATE_RESIDENT_SRC}
+        PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x c++")
+    add_executable(kda_state_resident_gfx942_test ${KDA_STATE_RESIDENT_SRC})
+    target_compile_features(kda_state_resident_gfx942_test PRIVATE cxx_std_17)
+    target_include_directories(kda_state_resident_gfx942_test PRIVATE "$ENV{ROCM_PATH}/include")
+    target_compile_definitions(kda_state_resident_gfx942_test PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_compile_options(kda_state_resident_gfx942_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(kda_state_resident_gfx942_test PRIVATE ${PLOW_AMDHIP64} m)
+    add_dependencies(kda_state_resident_gfx942_test kda_state_resident_gfx942_elf)
 
     # Standalone gfx942 grouped A8W4 experiment. It is intentionally a raw code object plus a
     # module-loading host oracle: no production packet or interpreter arm is changed.
