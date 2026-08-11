@@ -29,6 +29,46 @@
   "-> checks. _arch is asserted against each object's ELF header before any rule runs."
  ],
  "_arch": "gfx942",
+ "_k3_decode_note": [
+  "K3 decode is MXFP4 expert GEMV, not a matrix-core path on CDNA3. The two outlined expert",
+  "bodies must retain the software fp4 -> fp16 decode and f32 accumulation used by gfx942.",
+  "Requiring those instructions catches an object that compiled without the K3/MXFP4 arms or",
+  "accidentally selected the CDNA4 native MX conversion. Both bodies must remain spill-free."
+ ],
+ "interp_decode_k3": {
+  "d_moe_expert_glu_fp8_blk": {
+   "require_min": {
+    "v_fma_mix_f32": 32
+   },
+   "no_scratch": true,
+   "forbid": ["v_mfma"]
+  },
+  "d_moe_expert_down_fp8_blk": {
+   "require_min": {
+    "v_cvt_f32_f16": 64,
+    "v_fmac_f32": 16
+   },
+   "no_scratch": true,
+   "forbid": ["v_mfma"]
+  }
+ },
+ "interp_decode_fp8kv_k3": {
+  "d_moe_expert_glu_fp8_blk": {
+   "require_min": {
+    "v_fma_mix_f32": 32
+   },
+   "no_scratch": true,
+   "forbid": ["v_mfma"]
+  },
+  "d_moe_expert_down_fp8_blk": {
+   "require_min": {
+    "v_cvt_f32_f16": 64,
+    "v_fmac_f32": 16
+   },
+   "no_scratch": true,
+   "forbid": ["v_mfma"]
+  }
+ },
  "_fp8_note": [
   "The fp8 prefill object legitimately holds BOTH matrix families: d_gemm_fp8_t and",
   "d_gemm_glu_fp8 issue the fp8 MFMA, while the bf16 bodies (d_gemm_t, d_gemm_glu, the Gemma",
@@ -40,6 +80,24 @@
   "CDNA3 fp8 MFMA has no such field, so every instruction reads as (0,0) and the check would",
   "pass on anything."
  ],
+ "_k3_fp8kv_note": [
+  "K3's fp8kv prefill rows use FP8 only for KV-cache storage. Their simulated A4W4 grouped",
+  "MoE path dequantizes MXFP4 activations and weights to bf16 on CDNA3, so it must select the",
+  "gfx942 bf16 MFMA and must not inherit the native-fp8 expectation from interp_prefill_fp8."
+ ],
+ "interp_prefill_fp8kv_k3": {
+  "plow_exec": {
+   "require_min": {
+    "v_mfma_f32_32x32x8": 1
+   },
+   "forbid": [
+    "v_mfma_f32_32x32x16_bf16",
+    "v_mfma_f32_32x32x64_f8f6f4",
+    "v_mfma_scale_f32_32x32x64_f8f6f4",
+    "v_mfma_f32_32x32x16_fp8_fp8"
+   ]
+  }
+ },
  "interp_prefill_fp8": {
   "plow_exec": {
    "require_min": {

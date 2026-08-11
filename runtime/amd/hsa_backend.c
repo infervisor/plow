@@ -283,15 +283,28 @@ int plow_hsa_copy_d2h(plow_hsa* h, int dev, void* dst, const void* src, size_t b
 
 int plow_hsa_upload(plow_hsa* h, int dev, void* dst, const void* src, size_t bytes) {
     if (!h || dev < 0 || dev >= h->n_dev) return -1;
+    if (!bytes) return 0;
     /* Pin the caller's pages and get the address the agent should read them
      * through. Without this, an SDMA read of a stack/malloc pointer faults the
      * GPU — and the fault surfaces as an opaque "memory access fault", not as an
      * error from the copy. */
     void* pinned = NULL;
     hsa_agent_t agent = h->dev[dev].agent;
-    TRY(hsa_amd_memory_lock((void*)src, bytes, &agent, 1, &pinned), "hsa_amd_memory_lock");
-    const int rc = copy_blocking(h, dev, dst, agent, pinned, h->cpu, bytes);
-    hsa_amd_memory_unlock((void*)src);
+    if (hsa_amd_memory_lock((void*)src, bytes, &agent, 1, &pinned) == HSA_STATUS_SUCCESS) {
+        const int rc = copy_blocking(h, dev, dst, agent, pinned, h->cpu, bytes);
+        hsa_amd_memory_unlock((void*)src);
+        return rc;
+    }
+
+    /* Read-only file mappings cannot be locked by ROCr. Weight fixtures use
+     * MAP_PRIVATE|PROT_READ so copying through a fine-grained staging allocation
+     * is the only valid path; returning an ignored lock error leaves VRAM zeroed
+     * and makes every packet appear to execute correctly on zero inputs. */
+    void* staging = plow_hsa_alloc_host(h, bytes);
+    if (!staging) return -1;
+    memcpy(staging, src, bytes);
+    const int rc = copy_blocking(h, dev, dst, agent, staging, h->cpu, bytes);
+    hsa_amd_memory_pool_free(staging);
     return rc;
 }
 
