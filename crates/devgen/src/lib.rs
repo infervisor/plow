@@ -5551,6 +5551,26 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         }
         mla::kimi_k3_emit(&dir, ctx, tp, block_spec.as_deref());
     }
+    if model_type == "k3_dspark" {
+        let spec = block_spec.as_deref().unwrap_or_else(|| {
+            panic!(
+                "k3_dspark currently supports exact single-block extraction; pass --block <l>[..<r>]"
+            )
+        });
+        kimi_emit_block(
+            &dir,
+            ctx,
+            &out,
+            n_cu,
+            tp,
+            spec,
+            MlaArch::K3DSpark,
+            rope_gen,
+            &arch,
+            verify.as_ref(),
+        );
+        return;
+    }
     if model_type == "glm_moe_dsa" {
         // GLM `--block` (M2): single-block
         // extraction on the separate GLM emitter. Absent => the unchanged glm_main

@@ -55,6 +55,7 @@ pub(crate) struct GlmCfg {
     ///
     /// `cfg_glm` now REFUSES rather than defaulting, and [`GlmCfg::rope_theta`] is the only reader.
     rope_theta: Option<f64>,
+    rope_scale: RopeScale,
     /// The namespace this checkpoint's weights live under, `.`-terminated — `model.` for GLM /
     /// DeepSeek / Kimi-K2.7, `language_model.model.` for a multimodal wrapper like Kimi-K3.
     ///
@@ -284,6 +285,7 @@ fn cfg_glm(dir: &Path) -> GlmCfg {
         route_scale: v["routed_scaling_factor"].as_f64().unwrap() as f32,
         attn_scale: (qk_head as f32).powf(-0.5),
         rope_theta,
+        rope_scale: RopeScale::None,
         // Flat checkpoint: GLM / DeepSeek / Kimi-K2.7 all ship `model.layers.…` at the root.
         // A nested (multimodal) variant sets this from its own wrapper, and nothing else changes.
         prefix: "model.".to_string(),
@@ -313,6 +315,76 @@ fn cfg_kimi(dir: &Path) -> GlmCfg {
     let mut c = cfg_glm(dir);
     c.has_dsa = false;
     c
+}
+
+fn cfg_k3_dspark(dir: &Path) -> GlmCfg {
+    let v: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).expect("config.json"))
+            .unwrap();
+    let g = |k: &str| {
+        v[k].as_u64()
+            .unwrap_or_else(|| panic!("config.json missing {k}")) as u32
+    };
+    assert_eq!(v["model_type"].as_str(), Some("k3_dspark"));
+    assert_eq!(v["mla_use_nope"].as_bool(), Some(false));
+    assert_eq!(v["mla_use_output_gate"].as_bool(), Some(false));
+    let rp = &v["rope_parameters"];
+    assert_eq!(rp["rope_type"].as_str(), Some("yarn"));
+    let factor = rp["factor"].as_f64().expect("rope_parameters.factor");
+    let orig = rp["original_max_position_embeddings"]
+        .as_f64()
+        .expect("rope_parameters.original_max_position_embeddings");
+    let beta_fast = rp["beta_fast"].as_f64().expect("rope_parameters.beta_fast");
+    let beta_slow = rp["beta_slow"].as_f64().expect("rope_parameters.beta_slow");
+    let mscale_all_dim = rp["mscale_all_dim"].as_f64().unwrap_or(0.0);
+    let mscale = if factor <= 1.0 {
+        1.0
+    } else {
+        0.1 * mscale_all_dim * factor.ln() + 1.0
+    };
+    let qk_head = g("qk_nope_head_dim") + g("qk_rope_head_dim");
+    let layers = g("num_hidden_layers");
+    GlmCfg {
+        layers,
+        hidden: g("hidden_size"),
+        heads: g("num_attention_heads"),
+        kv_lora: g("kv_lora_rank"),
+        q_lora: g("q_lora_rank"),
+        qk_nope: g("qk_nope_head_dim"),
+        qk_rope: g("qk_rope_head_dim"),
+        v_head: g("v_head_dim"),
+        vocab: g("vocab_size"),
+        eps: v["rms_norm_eps"].as_f64().expect("rms_norm_eps") as f32,
+        n_exp: 1,
+        top_k: 1,
+        n_group: 1,
+        topk_group: 1,
+        moe_inter: g("intermediate_size"),
+        dense_inter: g("intermediate_size"),
+        first_k_dense: layers,
+        route_scale: 1.0,
+        attn_scale: (qk_head as f32).powf(-0.5) * (mscale * mscale) as f32,
+        rope_theta: Some(
+            rp["rope_theta"]
+                .as_f64()
+                .expect("rope_parameters.rope_theta"),
+        ),
+        rope_scale: RopeScale::Yarn {
+            factor,
+            beta_fast,
+            beta_slow,
+            orig,
+        },
+        prefix: String::new(),
+        tp: 1,
+        ep: false,
+        group: false,
+        index_heads: 0,
+        index_dim: 0,
+        index_topk: 0,
+        indexer_full: Vec::new(),
+        has_dsa: false,
+    }
 }
 
 /// MLA head-fusion factor `d_flash_mla_decode<512,64,GF>`, chosen PER PACKET from the pkt's fixed
@@ -1218,7 +1290,7 @@ pub(crate) fn declare_glm_rows_batched(
     // dispatch selects the INTERLEAVE=true template. See rope_tables + op_norm.h.
     // `c.rope_theta()`, not the field: a NoPE cfg refuses here rather than materialising tables
     // for a rotation the model does not have.
-    let [cos_t, sin_t] = GenTensor::rope_pair(ctx, c.qk_rope, c.rope_theta(), 1.0, RopeScale::None);
+    let [cos_t, sin_t] = GenTensor::rope_pair(ctx, c.qk_rope, c.rope_theta(), 1.0, c.rope_scale);
     let cos = b.tensor_gen("in.cos", cos_t.byte_len(), cos_t);
     let sin = b.tensor_gen("in.sin", sin_t.byte_len(), sin_t);
     let emb = b.tensor(
@@ -1740,11 +1812,12 @@ pub(crate) fn declare_glm_rows_batched(
             dgate_s: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => mxs(b, "mlp.gate_proj.weight", di_l as u64, h as u64),
-                    _ => t(
+                    MoeEnc::Fp8Blk => t(
                         b,
                         "mlp.gate_proj.weight_scale_inv",
                         (db_l * hb) as u64 * F32,
                     ),
+                    MoeEnc::Bf16 => TENSOR_NONE,
                 }
             } else {
                 TENSOR_NONE
@@ -1760,7 +1833,10 @@ pub(crate) fn declare_glm_rows_batched(
             dup_s: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => mxs(b, "mlp.up_proj.weight", di_l as u64, h as u64),
-                    _ => t(b, "mlp.up_proj.weight_scale_inv", (db_l * hb) as u64 * F32),
+                    MoeEnc::Fp8Blk => {
+                        t(b, "mlp.up_proj.weight_scale_inv", (db_l * hb) as u64 * F32)
+                    }
+                    MoeEnc::Bf16 => TENSOR_NONE,
                 }
             } else {
                 TENSOR_NONE
@@ -1776,11 +1852,12 @@ pub(crate) fn declare_glm_rows_batched(
             ddown_s: if dense {
                 match enc {
                     MoeEnc::Mxfp4 => mxs(b, "mlp.down_proj.weight", h as u64, di_l as u64),
-                    _ => t(
+                    MoeEnc::Fp8Blk => t(
                         b,
                         "mlp.down_proj.weight_scale_inv",
                         (hb * db_l) as u64 * F32,
                     ),
+                    MoeEnc::Bf16 => TENSOR_NONE,
                 }
             } else {
                 TENSOR_NONE
@@ -5481,13 +5558,12 @@ pub(crate) fn emit_glm_block(
     }
 }
 
-/// The dense-FFN down projection's opcode for an encoding. Block-fp8 and bf16 both go through
-/// `GEMV_FP8_BLK` (the dense down has no bf16-specific op); MXFP4 has its own.
+/// The dense-FFN down projection's opcode for an encoding.
 fn dense_down_op(enc: MoeEnc) -> DevOp {
-    if enc == MoeEnc::Mxfp4 {
-        DevOp::GemvMxfp4
-    } else {
-        DevOp::GemvFp8Blk
+    match enc {
+        MoeEnc::Bf16 => DevOp::Gemv,
+        MoeEnc::Fp8Blk => DevOp::GemvFp8Blk,
+        MoeEnc::Mxfp4 => DevOp::GemvMxfp4,
     }
 }
 
@@ -5532,8 +5608,8 @@ pub(crate) fn emit_glm_dense_block(
     // the E8M0 rows land in t3/t4 exactly where the block-fp8 grids did. i[0]/i[1] swap meaning
     // between the two ops (op 47 is i0=N i1=K; op 92 is i0=M i1=N i2=K), which is why this is a
     // separate emit rather than an opcode substitution.
-    let c_glu = if enc == MoeEnc::Mxfp4 {
-        b.emit(DevOp::GemvGluMxfp4, all.clone(), &[c_rn2], |d| {
+    let c_glu = match enc {
+        MoeEnc::Mxfp4 => b.emit(DevOp::GemvGluMxfp4, all.clone(), &[c_rn2], |d| {
             d.t[0] = n.dfu;
             d.t[1] = n.xn2;
             d.t[2] = w.dgate;
@@ -5544,9 +5620,8 @@ pub(crate) fn emit_glm_dense_block(
             d.i[1] = di_l;
             d.i[2] = h;
             d.i[5] = GLM_ACT_SILU;
-        })
-    } else {
-        b.emit(DevOp::DenseGluFp8Blk, all.clone(), &[c_rn2], |d| {
+        }),
+        MoeEnc::Fp8Blk => b.emit(DevOp::DenseGluFp8Blk, all.clone(), &[c_rn2], |d| {
             d.t[0] = n.dfu;
             d.t[1] = n.xn2;
             d.t[2] = w.dgate;
@@ -5556,7 +5631,17 @@ pub(crate) fn emit_glm_dense_block(
             d.i[0] = di_l;
             d.i[1] = h;
             d.i[5] = GLM_ACT_SILU;
-        })
+        }),
+        MoeEnc::Bf16 => b.emit(DevOp::GemvGlu, all.clone(), &[c_rn2], |d| {
+            d.t[0] = n.dfu;
+            d.t[1] = n.xn2;
+            d.t[2] = w.dgate;
+            d.t[5] = w.dup;
+            d.i[0] = 1;
+            d.i[1] = di_l;
+            d.i[2] = h;
+            d.i[5] = GLM_ACT_SILU;
+        }),
     };
     // dense down (block-fp8 GEMV, op 44) — row-parallel (di_l input). Under TP writes a PARTIAL into
     //   the dg_tp peer slot, XReduce all-reduces into n.attn, then residual; at tp==1 writes n.shared
@@ -6314,6 +6399,7 @@ pub(crate) enum MlaArch {
     Glm,
     Kimi,
     DeepSeek,
+    K3DSpark,
 }
 
 /// Build a single-block (layers `block`) MLA+MoE program + its descriptor, no file IO — the testable
@@ -6573,6 +6659,7 @@ pub(crate) fn glm_build_block_pf(
         MlaArch::Glm => ("glm_mla_dsa", "mla_dsa"),
         MlaArch::Kimi => ("kimi_mla_moe", "mla_attn"),
         MlaArch::DeepSeek => ("deepseek_mla_moe", "mla_attn"),
+        MlaArch::K3DSpark => ("k3_dspark", "mla_draft"),
     };
     let is_glm = arch == MlaArch::Glm;
     let desc = BlockDescriptor {
@@ -6786,7 +6873,11 @@ pub(crate) fn kimi_emit_block(
     target: &str,
     verify: Option<&crate::VerifyHook>,
 ) {
-    let mut c = cfg_kimi(dir);
+    let mut c = if arch == MlaArch::K3DSpark {
+        cfg_k3_dspark(dir)
+    } else {
+        cfg_kimi(dir)
+    };
     c.tp = tp;
     // See the note in `glm_emit_block`: the shared MLA+MoE emit is TP-parameterized, so `--num-gpus
     // N` sharding is emission-complete on this path too. tp must divide the head count.
@@ -6815,6 +6906,59 @@ pub(crate) fn kimi_emit_block(
         scope,
         enc,
     );
+    if arch == MlaArch::K3DSpark {
+        let declared = m
+            .tensors
+            .iter()
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        crate::checkpoint::validate_coverage(
+            dir,
+            "layers.",
+            &declared,
+            Some(block.clone()),
+            &[
+                "q_b_proj.weight",
+                "kv_b_proj.weight",
+                "kv_a_proj_with_mqa.weight",
+            ],
+            &[],
+            &["derived."],
+        )
+        .unwrap_or_else(|e| panic!("k3_dspark: {e}"));
+        let mut expected = Vec::with_capacity(block.len() * 5);
+        for layer in block.clone() {
+            let prefix = format!("layers.{layer}.self_attn.");
+            expected.extend([
+                (
+                    format!("{prefix}derived.q_absorb.weight"),
+                    vec![(c.heads * c.kv_lora) as u64, c.q_lora as u64],
+                ),
+                (
+                    format!("{prefix}derived.q_rope.weight"),
+                    vec![(c.heads * c.qk_rope) as u64, c.q_lora as u64],
+                ),
+                (
+                    format!("{prefix}derived.kv_a_latent.weight"),
+                    vec![c.kv_lora as u64, c.hidden as u64],
+                ),
+                (
+                    format!("{prefix}derived.k_rope.weight"),
+                    vec![c.qk_rope as u64, c.hidden as u64],
+                ),
+                (
+                    format!("{prefix}derived.v_absorb.weight"),
+                    vec![(c.heads * c.kv_lora) as u64, c.v_head as u64],
+                ),
+            ]);
+        }
+        crate::checkpoint::validate_bf16_sidecar(
+            dir,
+            "model-idx-derived-dspark.safetensors",
+            &expected,
+        )
+        .unwrap_or_else(|e| panic!("k3_dspark: {e}"));
+    }
     let section = write_block_descriptor(out, &desc);
     if !rope_gen {
         m.bake_gen();

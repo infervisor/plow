@@ -189,6 +189,95 @@ fn ckpt_names_all(dir: &Path) -> HashSet<String> {
     out
 }
 
+pub(crate) fn validate_bf16_sidecar(
+    dir: &Path,
+    filename: &str,
+    expected: &[(String, Vec<u64>)],
+) -> Result<(), String> {
+    use std::io::Read;
+
+    let path = dir.join(filename);
+    let mut file = std::fs::File::open(&path).map_err(|e| {
+        format!(
+            "{}: required derived-weight sidecar is unavailable: {e}",
+            path.display()
+        )
+    })?;
+    let mut len = [0u8; 8];
+    file.read_exact(&mut len).map_err(|e| {
+        format!(
+            "{}: cannot read safetensors header length: {e}",
+            path.display()
+        )
+    })?;
+    let header_len = u64::from_le_bytes(len);
+    let mut header = vec![0u8; header_len as usize];
+    file.read_exact(&mut header)
+        .map_err(|e| format!("{}: cannot read safetensors header: {e}", path.display()))?;
+    let header: Value = serde_json::from_slice(&header)
+        .map_err(|e| format!("{}: bad safetensors header: {e}", path.display()))?;
+    let header = header
+        .as_object()
+        .ok_or_else(|| format!("{}: safetensors header is not an object", path.display()))?;
+    let data_bytes = file
+        .metadata()
+        .map_err(|e| format!("{}: cannot stat sidecar: {e}", path.display()))?
+        .len()
+        .checked_sub(8 + header_len)
+        .ok_or_else(|| format!("{}: truncated safetensors header", path.display()))?;
+
+    for (name, shape) in expected {
+        let entry = header
+            .get(name)
+            .ok_or_else(|| format!("{}: missing required tensor {name}", path.display()))?;
+        if entry["dtype"].as_str() != Some("BF16") {
+            return Err(format!(
+                "{}: {name} must be BF16, got {}",
+                path.display(),
+                entry["dtype"]
+            ));
+        }
+        let got_shape: Vec<u64> = entry["shape"]
+            .as_array()
+            .ok_or_else(|| format!("{}: {name} has no shape", path.display()))?
+            .iter()
+            .map(|v| {
+                v.as_u64()
+                    .ok_or_else(|| format!("{}: {name} has a non-integer shape", path.display()))
+            })
+            .collect::<Result<_, _>>()?;
+        if &got_shape != shape {
+            return Err(format!(
+                "{}: {name} shape {got_shape:?}, expected {shape:?}",
+                path.display()
+            ));
+        }
+        let offsets = entry["data_offsets"]
+            .as_array()
+            .ok_or_else(|| format!("{}: {name} has no data_offsets", path.display()))?;
+        if offsets.len() != 2 {
+            return Err(format!(
+                "{}: {name} has invalid data_offsets",
+                path.display()
+            ));
+        }
+        let lo = offsets[0]
+            .as_u64()
+            .ok_or_else(|| format!("{}: {name} has invalid start offset", path.display()))?;
+        let hi = offsets[1]
+            .as_u64()
+            .ok_or_else(|| format!("{}: {name} has invalid end offset", path.display()))?;
+        let want_bytes = shape.iter().try_fold(2u64, |n, dim| n.checked_mul(*dim));
+        if want_bytes != hi.checked_sub(lo) || hi > data_bytes {
+            return Err(format!(
+                "{}: {name} byte range [{lo},{hi}) is inconsistent with BF16 {shape:?}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The namespaces this checkpoint puts its transformer layers under, DERIVED from the tensor
 /// names rather than assumed, with a count each.
 ///
@@ -208,7 +297,9 @@ fn ckpt_names_all(dir: &Path) -> HashSet<String> {
 fn layer_namespaces(names: &HashSet<String>) -> std::collections::BTreeMap<String, usize> {
     let mut out = std::collections::BTreeMap::new();
     for n in names {
-        if let Some((head, _)) = n.split_once(".layers.") {
+        if n.starts_with("layers.") {
+            *out.entry("layers.".to_string()).or_insert(0) += 1;
+        } else if let Some((head, _)) = n.split_once(".layers.") {
             *out.entry(format!("{head}.layers.")).or_insert(0) += 1;
         }
     }
@@ -237,7 +328,9 @@ fn layer_namespaces(names: &HashSet<String>) -> std::collections::BTreeMap<Strin
 /// in a sibling directory, not `dir`) are all out of scope by construction.
 /// Layer index in a `...layers.<N>....` tensor name, if it has one.
 fn layer_of(name: &str) -> Option<usize> {
-    let rest = name.split_once(".layers.")?.1;
+    let rest = name
+        .strip_prefix("layers.")
+        .or_else(|| name.split_once(".layers.").map(|(_, rest)| rest))?;
     rest.split('.').next()?.parse().ok()
 }
 
