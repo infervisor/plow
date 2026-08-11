@@ -600,6 +600,7 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
 /// object would refuse every GLM asset in the tree. Each check therefore only looks at the flags
 /// ITS table names and leaves the rest to the other phase.
 const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
+    ("PLOW_KDA_CONV_STEP_DB", &["plow_kda_conv_step_db_arm"]),
     // The GLM decode q-rope fold (op 50 t7 = cos, i6 = sin handle, t3 = RAW q_rope). An object
     // built before the arm stages t3 verbatim — an UNROPED query into the flash. Attention still
     // runs, nothing traps, and the model answers fluently and wrongly. This is the same silent
@@ -943,6 +944,14 @@ fn is_lm_head_matmul(op: u16) -> bool {
 /// existed, and every object built with it off, carries no such symbol and has no K3 arm.
 const K3_ARMS_SYM: &str = "plow_k3_arms_1";
 const MOE_PF_A4W4_SYM: &str = "plow_moe_pf_a4w4_arm";
+const KDA_CONV_STEP_DB_SYM: &str = "plow_kda_conv_step_db_arm";
+const KDA_CONV_STEP_DB_REPLACED_OPS: &[DevOp] = &[
+    DevOp::KdaConv,
+    DevOp::KdaGate,
+    DevOp::KdaStateStep,
+    DevOp::KdaConv3,
+    DevOp::KdaStateStepG,
+];
 
 /// Every opcode that reaches an arm behind `PLOW_K3` in `runtime/amd/interp.hip`.
 ///
@@ -959,6 +968,7 @@ const K3_ARM_OPS: &[DevOp] = &[
     DevOp::KdaGatedNorm,
     DevOp::KdaConv3,
     DevOp::KdaStateStepG,
+    DevOp::KdaConvStateStepG,
     DevOp::AttnRes,
     DevOp::SituGlu,
     DevOp::MlaOutGate,
@@ -979,6 +989,42 @@ fn required_moe_pf_a4w4(progs: &[DevProg]) -> Option<DevOp> {
             && i.i[MOE_PF_ENC_SLOT] == MOE_ENC_MXFP4)
             .then_some(op)
     })
+}
+
+fn required_kda_conv_step_db(progs: &[DevProg]) -> Option<DevOp> {
+    first_op_in(progs, &[DevOp::KdaConvStateStepG])
+}
+
+fn check_kda_conv_step_db(
+    syms: &[&str],
+    path: &Path,
+    need: Option<DevOp>,
+    legacy: Option<DevOp>,
+) -> Result<()> {
+    let armed = syms.contains(&KDA_CONV_STEP_DB_SYM);
+    if let Some(op) = need {
+        if armed {
+            return Ok(());
+        }
+        return Err(RuntimeError::Device(format!(
+            "packet/object KDA Conv3+state MISMATCH: this packet dispatches {op:?} (op {}), but \
+             {} was compiled without PLOW_KDA_CONV_STEP_DB (it does not advertise \
+             `{KDA_CONV_STEP_DB_SYM}`). Rebuild the K3 decode object with \
+             -DPLOW_KDA_CONV_STEP_DB=1.",
+            op as u16,
+            path.display()
+        )));
+    }
+    if let (true, Some(op)) = (armed, legacy) {
+        return Err(RuntimeError::Device(format!(
+            "packet/object KDA Conv3+state MISMATCH: {} advertises `{KDA_CONV_STEP_DB_SYM}` and \
+             replaces the legacy {op:?} arm (op {}), but the packet still dispatches it. Use the \
+             default K3 decode object or re-emit with PLOW_K3_KDA_CONV_STEP_DB=1.",
+            path.display(),
+            op as u16
+        )));
+    }
+    Ok(())
 }
 
 fn check_moe_pf_a4w4(syms: &[&str], path: &Path, need: Option<DevOp>) -> Result<()> {
@@ -2787,6 +2833,7 @@ const KDA_ROW_COUNT_OPS: &[DevOp] = &[
     DevOp::KdaGate,
     DevOp::KdaStateStep,
     DevOp::KdaStateStepG,
+    DevOp::KdaConvStateStepG,
     DevOp::KdaGatedNorm,
 ];
 
@@ -3328,6 +3375,11 @@ pub struct AmdEngine {
     /// Per-slot snapshot of `carried_slot` taken at a prompt prefix boundary,
     /// for [`AmdEngine::restore_carried`]. `None` until a slot arms one.
     prefix_snap: Vec<Option<DeviceMem>>,
+    /// `(alternate bank, legacy bank, bytes)` for the B1 KDA conv-window ping-pong arm.
+    kda_conv_bank_pairs: Vec<(u64, u64, u64)>,
+    /// Legacy prefill updates only bank 0; a set bit requires one bank0→bank1 mirror before
+    /// decode selects a source by absolute-position parity.
+    kda_conv_alt_stale: Vec<bool>,
     /// VMM-backed FULL-attention KV, or `None` for the flat allocation.
     ///
     /// The tensor table still holds ONE base per `kv.{l}.{k,v}` and
@@ -3724,6 +3776,29 @@ impl AmdEngine {
         let need_k3_decode = required_k3_op(&blob.progs[dec_ix..]);
         let need_k3_prefill = required_k3_op(&blob.progs[..dec_ix]);
         let need_a4w4_decode = required_moe_pf_a4w4(&blob.progs[dec_ix..]);
+        let need_kda_conv_step_db = required_kda_conv_step_db(&blob.progs[dec_ix..]);
+        let legacy_kda_decode = first_op_in(&blob.progs[dec_ix..], KDA_CONV_STEP_DB_REPLACED_OPS);
+        if let Some(p) = blob.progs[..dec_ix].iter().find(|p| {
+            p.insts
+                .iter()
+                .any(|i| i.op == DevOp::KdaConvStateStepG as u16)
+        }) {
+            return Err(RuntimeError::Device(format!(
+                "KdaConvStateStepG is B1 decode-only, but prefill program T={} dispatches it",
+                p.t
+            )));
+        }
+        if let Some(p) = blob.progs[dec_ix..].iter().find(|p| {
+            p.t != 1
+                && p.insts
+                    .iter()
+                    .any(|i| i.op == DevOp::KdaConvStateStepG as u16)
+        }) {
+            return Err(RuntimeError::Device(format!(
+                "KdaConvStateStepG is B1-only, but decode program T={} dispatches it",
+                p.t
+            )));
+        }
         // Gemma-4 MoE, both halves, per phase. Same silent-NOP argument as K3 above.
         let need_gm_decode = first_op_in(&blob.progs[dec_ix..], MOE_GEMMA_OPS);
         let need_gm_prefill = first_op_in(&blob.progs[..dec_ix], MOE_GEMMA_OPS);
@@ -3886,6 +3961,7 @@ impl AmdEngine {
                 check_k3_arms(&syms, &path, need_k3)?;
                 if phase == Phase::Decode {
                     check_moe_pf_a4w4(&syms, &path, need_a4w4_decode)?;
+                    check_kda_conv_step_db(&syms, &path, need_kda_conv_step_db, legacy_kda_decode)?;
                 }
                 let (need_gm, need_gmpf) = match phase {
                     Phase::Decode => (need_gm_decode, need_gmpf_decode),
@@ -4746,6 +4822,43 @@ impl AmdEngine {
             .map(|(i, t)| (i, t.bytes / batch as u64))
             .collect();
 
+        let mut kda_conv_bank_pairs = Vec::new();
+        for (alt_i, alt) in blob.tensors.iter().enumerate() {
+            if !alt.name.contains(".conv_state_alt.") {
+                continue;
+            }
+            if batch != 1 {
+                return Err(RuntimeError::Device(format!(
+                    "{} is a double-buffered KDA conv window, but the packet batch is {batch}; \
+                     KdaConvStateStepG is B1-only",
+                    alt.name
+                )));
+            }
+            let base_name = alt.name.replacen(".conv_state_alt.", ".conv_state.", 1);
+            let base_i = blob
+                .tensors
+                .iter()
+                .position(|t| t.name == base_name)
+                .ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "{} has no matching legacy KDA conv window {base_name}",
+                        alt.name
+                    ))
+                })?;
+            if devp[alt_i].len != devp[base_i].len {
+                return Err(RuntimeError::Device(format!(
+                    "KDA conv banks disagree: {} is {} bytes, {base_name} is {} bytes",
+                    alt.name, devp[alt_i].len, devp[base_i].len
+                )));
+            }
+            kda_conv_bank_pairs.push((devp[alt_i].base, devp[base_i].base, devp[alt_i].len));
+        }
+        if need_kda_conv_step_db.is_some() && kda_conv_bank_pairs.is_empty() {
+            return Err(RuntimeError::Device(
+                "KdaConvStateStepG packet has no alternate KDA conv-window tensors".into(),
+            ));
+        }
+
         let clear_ranges = if state_clear_device {
             state_clear_ranges(&devp, &carried_slot)?
         } else {
@@ -4974,6 +5087,8 @@ impl AmdEngine {
             kv_slot: 0,
             carried_slot,
             prefix_snap: (0..batch).map(|_| None).collect(),
+            kda_conv_bank_pairs,
+            kda_conv_alt_stale: vec![false; batch],
             vmm,
             lm_detail: std::cell::RefCell::new(None),
             pf_stream: blob.progs.iter().map(|g| g.stream.clone()).collect(),
@@ -5549,6 +5664,7 @@ impl AmdEngine {
                 self.max_ctx
             )));
         }
+        self.sync_kda_conv_alt(self.kv_slot)?;
         let dp = self.decode;
         self.patch_kvrow(dp, pos)?;
 
@@ -5755,6 +5871,9 @@ impl AmdEngine {
     /// Upload one chunk's `ids`/`pos`/`kvlen` and patch its bucket program. No
     /// dispatch.
     pub fn prefill_prepare(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
+        if !self.kda_conv_bank_pairs.is_empty() {
+            self.kda_conv_alt_stale[self.kv_slot] = true;
+        }
         let ch = self.progs[step.prog].t;
         // in.kvlen FIRST, so it can borrow the head of the staging slab before
         // ids/pos fill it — the slab is sized for exactly `ids + pos` at the
@@ -6116,6 +6235,7 @@ impl AmdEngine {
             v.begin_seq(seq);
             v.ensure_rows(seq, 1)?;
         }
+        self.kda_conv_alt_stale[seq] = false;
         Ok(())
     }
 
@@ -6188,6 +6308,16 @@ impl AmdEngine {
             let stride = m.len / b;
             EngineDevice::memset_d8(&*self.be, m.base + stride * seq as u64, 0, stride as usize)?;
         }
+        self.kda_conv_alt_stale[seq] = false;
+        Ok(())
+    }
+
+    fn sync_kda_conv_alt(&mut self, slot: usize) -> Result<()> {
+        if !self.kda_conv_alt_stale.get(slot).copied().unwrap_or(false) {
+            return Ok(());
+        }
+        self.be.memcpy_dtod_batch(&self.kda_conv_bank_pairs)?;
+        self.kda_conv_alt_stale[slot] = false;
         Ok(())
     }
 
@@ -6222,6 +6352,7 @@ impl AmdEngine {
                 self.batch
             )));
         }
+        self.sync_kda_conv_alt(slot)?;
         let total = self.carried_bytes();
         if total == 0 {
             return Ok(());
@@ -6272,6 +6403,7 @@ impl AmdEngine {
         }
         let t = std::time::Instant::now();
         self.be.memcpy_dtod_batch(&pairs)?;
+        self.kda_conv_alt_stale[slot] = false;
         crate::obs::pfx::RESTORE.add(t.elapsed().as_nanos() as u64);
         Ok(())
     }
@@ -6338,6 +6470,7 @@ impl AmdEngine {
                 self.max_ctx
             )));
         }
+        self.sync_kda_conv_alt(self.kv_slot)?;
         if b == 1 {
             self.patch_kvrow(self.decode, pos[0])?;
         }
@@ -7250,6 +7383,44 @@ mod tests {
         assert!(check_moe_pf_a4w4(&bare, obj, None).is_ok());
     }
 
+    #[test]
+    fn kda_conv_step_db_requires_exact_packet_object_pairing() {
+        let obj = Path::new("interp_decode_fp8kv_k3.elf");
+        let bare = [K3_ARMS_SYM];
+        let armed = [K3_ARMS_SYM, KDA_CONV_STEP_DB_SYM];
+        let fused = vec![prog_gemv(&[DevOp::KdaConvStateStepG], 1)];
+        let legacy = vec![prog_gemv(&[DevOp::KdaConv3, DevOp::KdaStateStepG], 1)];
+
+        assert!(check_kda_conv_step_db(
+            &bare,
+            obj,
+            required_kda_conv_step_db(&fused),
+            first_op_in(&fused, KDA_CONV_STEP_DB_REPLACED_OPS),
+        )
+        .is_err());
+        assert!(check_kda_conv_step_db(
+            &armed,
+            obj,
+            required_kda_conv_step_db(&fused),
+            first_op_in(&fused, KDA_CONV_STEP_DB_REPLACED_OPS),
+        )
+        .is_ok());
+        assert!(check_kda_conv_step_db(
+            &armed,
+            obj,
+            required_kda_conv_step_db(&legacy),
+            first_op_in(&legacy, KDA_CONV_STEP_DB_REPLACED_OPS),
+        )
+        .is_err());
+        assert!(check_kda_conv_step_db(
+            &bare,
+            obj,
+            required_kda_conv_step_db(&legacy),
+            first_op_in(&legacy, KDA_CONV_STEP_DB_REPLACED_OPS),
+        )
+        .is_ok());
+    }
+
     /// A packet dispatching a Gemma-4 MoE op against an object built without the matching axis is
     /// REFUSED — the same argument as the K3 gate, and for a family that until the AMD port had
     /// NO arm at all, so its silent-NOP failure was not hypothetical. [GEMMA4-MOE-AMD]
@@ -7462,16 +7633,26 @@ mod tests {
         // The LAST `#if PLOW_K3` is the dispatch region; the earlier ones guard the includes and
         // the marker. Scan to its matching `#endif`.
         let mut in_region = false;
+        let mut nested = 0usize;
         let mut found: Vec<String> = Vec::new();
         for line in src.lines() {
             let t = line.trim();
             if t == "#if PLOW_K3" {
                 in_region = true;
+                nested = 0;
                 found.clear(); // a later region supersedes an earlier one
                 continue;
             }
+            if in_region && t.starts_with("#if") {
+                nested += 1;
+                continue;
+            }
             if in_region && t.starts_with("#endif") {
-                in_region = false;
+                if nested == 0 {
+                    in_region = false;
+                } else {
+                    nested -= 1;
+                }
                 continue;
             }
             if in_region {
@@ -8096,6 +8277,7 @@ mod tests {
         for n in [
             "kv.0.state",
             "kv.12.conv_state.q",
+            "kv.12.conv_state_alt.q",
             "kv.blkres",
             "kv.3.state.v",
         ] {

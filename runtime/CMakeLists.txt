@@ -670,6 +670,8 @@ option(PLOW_XR_AGG
        "Aggregate prefill two-shot all-gather signals per rank" ON)
 option(PLOW_KDA_PF_STATE_RESIDENT
        "Keep K3 TP8 prefill KDA state in registers across serial tokens" OFF)
+option(PLOW_K3_KDA_CONV_STEP_DB
+       "Fuse K3 B1 Conv3 into StateStepG with ping-pong convolution windows" OFF)
 option(PLOW_MLA_PF_SV
        "Use the V2 MLA-prefill LDS swizzle and fragment staging" ON)
 
@@ -823,6 +825,10 @@ if(PLOW_GFX950_HSACO)
     # and that headroom is not spare).
     set(_hs_ax_k3_dec ${_hs_ax_k3})
     set(_hs_ax_k3_dec_fp8kv ${_hs_ax_k3_fp8kv})
+    if(PLOW_K3_KDA_CONV_STEP_DB)
+        list(APPEND _hs_ax_k3_dec -DPLOW_KDA_CONV_STEP_DB=1)
+        list(APPEND _hs_ax_k3_dec_fp8kv -DPLOW_KDA_CONV_STEP_DB=1)
+    endif()
     if(PLOW_DECODE_BATCH GREATER 1 OR PLOW_K3_DECODE_GROUPED)
         set(_hs_ax_k3_tile_search "")
         if(PLOW_K3_DECODE_TILE_BINSEARCH)

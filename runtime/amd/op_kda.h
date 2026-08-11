@@ -46,6 +46,9 @@
 #ifndef PLOW_KDA_PF_STATE_RESIDENT
 #define PLOW_KDA_PF_STATE_RESIDENT 0
 #endif
+#ifndef PLOW_KDA_CONV_STEP_DB
+#define PLOW_KDA_CONV_STEP_DB 0
+#endif
 
 /* Gate activation modes, mirroring [fla]'s `safe_gate` switch (fla/ops/kda/gate.py:118-124). */
 enum { PLOW_KDA_GATE_SOFTPLUS = 0, PLOW_KDA_GATE_LOWER_BOUND = 1 };
@@ -581,6 +584,114 @@ __device__ void d_kda_state_step_g(bf16* __restrict__ o, const bf16* __restrict_
     PLOW_KDA_STEP_RUNGS(true)
 }
 #undef PLOW_KDA_STEP_RUNGS
+
+#if PLOW_KDA_CONV_STEP_DB
+__device__ __forceinline__ bf16 kda_conv_db_one(
+    const bf16* raw, const float* weight, const float* source, float* target, unsigned channel,
+    unsigned W, bool write_state) {
+    float win[8], tap[8];
+    const unsigned width = W < 8 ? W : 8;
+#pragma unroll
+    for (unsigned j = 0; j < 8; ++j) {
+        win[j] = j < width ? source[(size_t)channel * W + j] : 0.0f;
+        tap[j] = j < width ? weight[(size_t)channel * W + j] : 0.0f;
+    }
+#pragma unroll
+    for (unsigned j = 0; j + 1 < 8; ++j) win[j] = win[j + 1];
+    win[width - 1] = bf2f(raw[channel]);
+    float value = 0.0f;
+#pragma unroll
+    for (unsigned j = 0; j < 8; ++j) value += win[j] * tap[j];
+    if (write_state) {
+#pragma unroll
+        for (unsigned j = 0; j < 8; ++j)
+            if (j < width) target[(size_t)channel * W + j] = win[j];
+    }
+    return f2bf(act_silu(value));
+}
+
+/* B1-only Conv3 + StateStepG candidate. The old and new conv-window banks are distinct for the
+ * whole packet, so every value tile can read the old q/k window before tile 0 publishes the next
+ * one. This is the cross-workgroup race an in-place fusion cannot avoid. */
+__device__ void d_kda_conv_state_step_g(
+    bf16* output, const bf16* q_raw, const bf16* k_raw, const bf16* v_raw,
+    const bf16* gate_raw, const bf16* beta_raw, float* state, const float* wq, const float* wk,
+    const float* wv, const float* csq_source, const float* csk_source,
+    const float* csv_source, float* csq_target, float* csk_target, float* csv_target,
+    const float* a_log, const float* dt_bias, unsigned H, unsigned D, unsigned BV, unsigned W,
+    unsigned flags, unsigned gate_mode, float scale, float lb, unsigned slice, unsigned nblk,
+    float* lds) {
+    if (H != 12 || D != 128 || BV != 8 || W != 4 || !(flags & PLOW_KDA_F_QK_L2NORM))
+        __builtin_trap();
+    const unsigned items = H * D / BV;
+    if (slice >= items) return;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 63u;
+    const unsigned wave = tid >> 6;
+    const unsigned h = slice / (D / BV);
+    const unsigned tile = slice % (D / BV);
+    float* l_q = lds;
+    float* l_k = lds + D;
+    float* l_g = lds + 2u * D;
+    float* l_v = lds + 3u * D + 2u * PLOW_WAVES;
+    const unsigned hd0 = h * D;
+    float qsum = 0.0f, ksum = 0.0f;
+    if (tid < D) {
+        const unsigned channel = hd0 + tid;
+        const bf16 q = kda_conv_db_one(q_raw, wq, csq_source, csq_target, channel, W, tile == 0);
+        const bf16 k = kda_conv_db_one(k_raw, wk, csk_source, csk_target, channel, W, tile == 0);
+        l_q[tid] = bf2f(q);
+        l_k[tid] = bf2f(k);
+        float gate;
+        const float gate_input = bf2f(gate_raw[channel]) + dt_bias[channel];
+        if (gate_mode == PLOW_KDA_GATE_LOWER_BOUND)
+            gate = lb * kda_sigmoid(__expf(a_log[h]) * gate_input);
+        else
+            gate = -__expf(a_log[h]) * kda_softplus(gate_input);
+        l_g[tid] = __expf(gate);
+        qsum = l_q[tid] * l_q[tid];
+        ksum = l_k[tid] * l_k[tid];
+    }
+    if (tid < BV) {
+        const unsigned channel = hd0 + tile * BV + tid;
+        const bf16 v = kda_conv_db_one(v_raw, wv, csv_source, csv_target, channel, W, true);
+        l_v[tid] = bf2f(v);
+    }
+    qsum = block_sum(qsum, lds + 3u * D);
+    ksum = block_sum(ksum, lds + 3u * D + PLOW_WAVES);
+    const float rq = scale / sqrtf(qsum + 1e-6f);
+    const float rk = 1.0f / sqrtf(ksum + 1e-6f);
+    if (tid < D) {
+        l_q[tid] *= rq;
+        l_k[tid] *= rk;
+    }
+    __syncthreads();
+
+    const unsigned j = tile * BV + wave;
+    float* column = state + (size_t)h * D * D + (size_t)j * D;
+    float sc[2];
+    float pk = 0.0f;
+#pragma unroll
+    for (unsigned r = 0; r < 2; ++r) {
+        const unsigned d = r * PLOW_WAVE + lane;
+        sc[r] = column[d] * l_g[d];
+        pk += sc[r] * l_k[d];
+    }
+    pk = wave_sum(pk);
+    const float update = kda_sigmoid(bf2f(beta_raw[h])) * (l_v[wave] - pk);
+    float pq = 0.0f;
+#pragma unroll
+    for (unsigned r = 0; r < 2; ++r) {
+        const unsigned d = r * PLOW_WAVE + lane;
+        sc[r] += update * l_k[d];
+        column[d] = sc[r];
+        pq += sc[r] * l_q[d];
+    }
+    pq = wave_sum(pq);
+    if (lane == 0) output[hd0 + j] = f2bf(pq);
+    (void)nblk;
+}
+#endif
 
 /* -------------------------------------------------------------------------------------------
  * op 103 — KDA output gate. y[h,d] = RMSNorm_D(o[h,:])[d] * sigmoid(g_raw[h,d]).

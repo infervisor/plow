@@ -2689,9 +2689,14 @@ pub fn emit_k3_model(
         let kda_pair;
         let mla_w;
         let mixer = if is_kda(l) {
+            let state = if crate::emit_config::active().k3_kda_conv_step_db {
+                crate::kda::declare_kda_state_db(b, &kda_l, &format!("kv.{l}."), slots, pos)
+            } else {
+                crate::kda::declare_kda_state(b, &kda_l, &format!("kv.{l}."), slots)
+            };
             kda_pair = Some((
                 crate::kda::declare_kda_weights(b, &kda_l, &format!("{lp}self_attn."), &lp),
-                crate::kda::declare_kda_state(b, &kda_l, &format!("kv.{l}."), slots),
+                state,
             ));
             let (kw, ks) = kda_pair.as_ref().unwrap();
             K3Mixer::Kda {

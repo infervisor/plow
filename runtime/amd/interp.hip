@@ -70,6 +70,9 @@
 #if PLOW_K3
 extern "C" __device__ unsigned plow_k3_arms_1 = 1;
 #endif
+#if PLOW_K3 && PLOW_KDA_CONV_STEP_DB
+extern "C" __device__ unsigned plow_kda_conv_step_db_arm = 1;
+#endif
 
 /* Compact TP audit. `i[7] == 0` keeps old packets byte-compatible; plowrt patches
  * TP collective instructions to status_id+1 while loading them. */
@@ -1833,6 +1836,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * built with the axis is a different question, answered at load time by `plow_k3_arms_1`.
          * The drift test reads `case PLOW_DOP_*` labels textually and is unaffected by the `#if`. */
 #if PLOW_K3
+#if !PLOW_KDA_CONV_STEP_DB
         case PLOW_DOP_KDA_CONV:
             d_kda_conv((bf16*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2), (float*)TEN(3),
                        in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk,
@@ -1855,11 +1859,13 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              /* op 102 predates the per-row mask and carries no slot for it. */
                              nullptr);
             break;
+#endif
         case PLOW_DOP_KDA_GATED_NORM:
             d_kda_gated_norm((bf16*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
                              (const bf16*)TEN(3), in->i[0], in->i[1], in->i[2], in->fj[0].f, slice,
                              nblk);
             break;
+#if !PLOW_KDA_CONV_STEP_DB
         /* FUSED KDA — ops 88x3 -> 109 and 89+102 -> 110. Six packets per layer become three, 207
          * per token over 69 KDA layers, against a measured ~12 us per packet.
          *
@@ -1927,6 +1933,35 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                    : nullptr);
             break;
         }
+#endif
+#if PLOW_KDA_CONV_STEP_DB
+        case PLOW_DOP_KDA_CONV_STATE_STEP_G: {
+            const unsigned* desc = (const unsigned*)TEN(7);
+            if (desc == nullptr || in->i[0] != 1) __builtin_trap();
+#pragma unroll
+            for (unsigned i = 0; i < 12; ++i)
+                if (desc[i] == PLOW_TENSOR_NONE) __builtin_trap();
+            if (in->i[4] & PLOW_KDA_F_SEQ_ROWS) {
+                if (desc[12] == PLOW_TENSOR_NONE) __builtin_trap();
+                if (((const unsigned*)T[desc[12]])[0]) break;
+            }
+            const unsigned bank = ((const unsigned*)T[desc[11]])[0] & 1u;
+            const unsigned source = 3u + bank * 3u;
+            const unsigned target = 3u + (bank ^ 1u) * 3u;
+            d_kda_conv_state_step_g(
+                (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
+                (float*)TEN(6), (const float*)T[desc[0]], (const float*)T[desc[1]],
+                (const float*)T[desc[2]], (const float*)T[desc[source]],
+                (const float*)T[desc[source + 1]], (const float*)T[desc[source + 2]],
+                (float*)T[desc[target]], (float*)T[desc[target + 1]],
+                (float*)T[desc[target + 2]], (const float*)T[desc[9]],
+                (const float*)T[desc[10]], in->i[1], in->i[2], in->i[3], in->i[5],
+                in->i[4], in->i[6], in->fj[0].f, in->fj[1].f, slice, nblk,
+                (float*)sm->raw);
+            break;
+        }
+#endif
         /* Kimi-K3 BLOCK structure (op_k3.h). Both arms are in BOTH buckets: a K3 layer runs the
          * same graph at T=1 and T>1, and AttnRes in particular replaces the residual add on the
          * PREFILL path too — an AttnRes that exists only in the decode object would make prefill
