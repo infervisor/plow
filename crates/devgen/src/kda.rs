@@ -475,6 +475,9 @@ pub fn emit_kda_mixer(
     // See `emit_kda_mixer_ex`'s parameter of the same name: `true` means the `t` rows are
     // independent sequences (batched decode), each carrying its own state.
     seq_rows: bool,
+    // Select decode-family projection kernels without changing the recurrent-state layout.
+    // Target verification is serial state (`seq_rows=false`) over multiple decode rows.
+    decode_rows: bool,
 ) -> (u32, u32) {
     emit_kda_mixer_ex(
         b,
@@ -490,6 +493,7 @@ pub fn emit_kda_mixer(
         deps,
         fuse_kda(),
         seq_rows,
+        decode_rows,
     )
 }
 
@@ -516,6 +520,7 @@ fn emit_kda_mixer_ex(
     // Do this mixer's `t` rows carry one state between them, or one state EACH? `true` is a
     // batched decode program (independent sequences); everything today is `false`.
     seq_rows: bool,
+    decode_rows: bool,
 ) -> (u32, u32) {
     assert_eq!(
         c.head_dim % 64,
@@ -605,7 +610,7 @@ fn emit_kda_mixer_ex(
     // `Gemv` at t == 1, a tiled GEMM above it — see [`crate::k3::emit_k3_linear`]. The seam is
     // here rather than at the call sites because all eight projections take it.
     let gemv = |b: &mut Builder, out: u32, row: u32, wt: u32, n: u32, k: u32, dep: u32| {
-        crate::k3::emit_k3_linear(b, out, row, wt, t, n, k, n_cu, seq_rows, &[dep])
+        crate::k3::emit_k3_linear(b, out, row, wt, t, n, k, n_cu, decode_rows, &[dep])
     };
     // P1-P4 collapse into ONE packet along the OUTPUT axis. See [`fuse_qkvg`] for why that is the
     // safe direction and the LDS bound that decides it; P5/P6 stay separate because their weights
@@ -884,7 +889,19 @@ pub fn emit_kda_layer(
     deps: &[u32],
 ) -> u32 {
     let (c_o, attn) = emit_kda_mixer(
-        b, c, w, st, act_prefix, t, hidden, None, n_cu, false, deps, false,
+        b,
+        c,
+        w,
+        st,
+        act_prefix,
+        t,
+        hidden,
+        None,
+        n_cu,
+        false,
+        deps,
+        false,
+        t == 1,
     );
     let all: Vec<u32> = (0..n_cu).collect();
     b.emit(
@@ -1305,6 +1322,7 @@ mod tests {
                 &[seed],
                 fuse,
                 false,
+                true,
             );
             b.finish()
         };
@@ -1413,6 +1431,7 @@ mod tests {
                 &[seed],
                 true,
                 seq_rows,
+                true,
             );
             let p = b.finish();
             let fused: Vec<_> = p

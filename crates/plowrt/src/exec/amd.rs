@@ -618,6 +618,7 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
 const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_KDA_CONV_STEP_DB", &["plow_kda_conv_step_db_arm"]),
     ("PLOW_DSPARK_NONCAUSAL", &["plow_dspark_noncausal_1"]),
+    ("PLOW_K3_SPEC_VERIFY", &["plow_k3_spec_verify_1"]),
     // The GLM decode q-rope fold (op 50 t7 = cos, i6 = sin handle, t3 = RAW q_rope). An object
     // built before the arm stages t3 verbatim — an UNROPED query into the flash. Attention still
     // runs, nothing traps, and the model answers fluently and wrongly. This is the same silent
@@ -961,6 +962,7 @@ fn is_lm_head_matmul(op: u16) -> bool {
 /// existed, and every object built with it off, carries no such symbol and has no K3 arm.
 const K3_ARMS_SYM: &str = "plow_k3_arms_1";
 const DSPARK_NONCAUSAL_SYM: &str = "plow_dspark_noncausal_1";
+const K3_SPEC_VERIFY_SYM: &str = "plow_k3_spec_verify_1";
 const MOE_PF_A4W4_SYM: &str = "plow_moe_pf_a4w4_arm";
 const KDA_CONV_STEP_DB_SYM: &str = "plow_kda_conv_step_db_arm";
 const KDA_CONV_STEP_DB_REPLACED_OPS: &[DevOp] = &[
@@ -1016,6 +1018,26 @@ fn check_dspark_noncausal(syms: &[&str], path: &Path, need: bool) -> Result<()> 
          `{DSPARK_NONCAUSAL_SYM}`). A normal MLA decode arm would make the seven draft rows \
          attend one another or silently use only one row. Rebuild the dedicated DSpark object \
          with -DPLOW_DSPARK_NONCAUSAL=1.",
+        path.display()
+    )))
+}
+
+fn requires_k3_spec_verify(progs: &[DevProg]) -> bool {
+    progs.iter().flat_map(|p| p.insts.iter()).any(|i| {
+        (i.op == DevOp::FlashMlaDecode as u16 || i.op == DevOp::FlashMlaDecodeFp8 as u16)
+            && i.fj[1] > 1
+    })
+}
+
+fn check_k3_spec_verify(syms: &[&str], path: &Path, need: bool) -> Result<()> {
+    if !need || syms.contains(&K3_SPEC_VERIFY_SYM) {
+        return Ok(());
+    }
+    Err(RuntimeError::Device(format!(
+        "packet/object K3 target-verifier MISMATCH: this packet carries a causal multi-token MLA \
+         decode block, but {} lacks `{K3_SPEC_VERIFY_SYM}`. Rebuild the dedicated object with \
+         -DPLOW_K3_SPEC_VERIFY=1; an ordinary decode object would verify every row against the \
+         wrong one-token causal frontier.",
         path.display()
     )))
 }
@@ -3815,6 +3837,8 @@ impl AmdEngine {
         let need_k3_prefill = required_k3_op(&blob.progs[..dec_ix]);
         let need_dspark_decode = requires_dspark_noncausal(&blob.progs[dec_ix..]);
         let need_dspark_prefill = requires_dspark_noncausal(&blob.progs[..dec_ix]);
+        let need_spec_verify_decode = requires_k3_spec_verify(&blob.progs[dec_ix..]);
+        let need_spec_verify_prefill = requires_k3_spec_verify(&blob.progs[..dec_ix]);
         let need_a4w4_decode = required_moe_pf_a4w4(&blob.progs[dec_ix..]);
         let need_kda_conv_step_db = required_kda_conv_step_db(&blob.progs[dec_ix..]);
         let legacy_kda_decode = first_op_in(&blob.progs[dec_ix..], KDA_CONV_STEP_DB_REPLACED_OPS);
@@ -4008,6 +4032,11 @@ impl AmdEngine {
                     Phase::Prefill | Phase::Flash => need_dspark_prefill,
                 };
                 check_dspark_noncausal(&syms, &path, need_dspark)?;
+                let need_spec_verify = match phase {
+                    Phase::Decode => need_spec_verify_decode,
+                    Phase::Prefill | Phase::Flash => need_spec_verify_prefill,
+                };
+                check_k3_spec_verify(&syms, &path, need_spec_verify)?;
                 if phase == Phase::Decode {
                     check_moe_pf_a4w4(&syms, &path, need_a4w4_decode)?;
                     check_kda_conv_step_db(&syms, &path, need_kda_conv_step_db, legacy_kda_decode)?;
@@ -7462,6 +7491,26 @@ mod tests {
             !requires_dspark_noncausal(&packet),
             "op-50 t7 means q-rope fold, where i6 is a tensor handle"
         );
+    }
+
+    #[test]
+    fn k3_causal_multi_token_packet_requires_the_verifier_object() {
+        let obj = Path::new("interp_decode_fp8kv_k3_verify.elf");
+        let mut packet = vec![prog_gemv(&[DevOp::FlashMlaDecodeFp8], 1)];
+        packet[0].insts[0].fj[1] = 8;
+
+        assert!(requires_k3_spec_verify(&packet));
+        let err = check_k3_spec_verify(&[], obj, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(K3_SPEC_VERIFY_SYM));
+        assert!(err.contains("PLOW_K3_SPEC_VERIFY"));
+        assert!(check_k3_spec_verify(&[K3_SPEC_VERIFY_SYM], obj, true).is_ok());
+
+        packet[0].insts[0].fj[1] = 0;
+        assert!(!requires_k3_spec_verify(&packet));
+        packet[0].insts[0].fj[1] = 1;
+        assert!(!requires_k3_spec_verify(&packet));
     }
 
     #[test]

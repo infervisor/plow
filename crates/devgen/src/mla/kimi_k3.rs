@@ -1219,10 +1219,27 @@ fn k3_build_model(
         .map(|r| checked_k3_decode_batch(r, emit_config::active().gemv_walk))
         .collect();
     let dbatch = *rungs.last().expect("decode_rungs is non-empty");
-    let slot_rows = pf.iter().copied().max().unwrap_or(1).max(dbatch);
-    let mut decode_build_order = Vec::with_capacity(rungs.len());
-    decode_build_order.push(dbatch);
-    decode_build_order.extend_from_slice(&rungs[..rungs.len() - 1]);
+    let spec_verify = emit_config::active().k3_spec_verify;
+    assert!(
+        !spec_verify || (rungs.as_slice() == [1] && pf.is_empty()),
+        "PLOW_K3_SPEC_VERIFY=1 emits a dedicated B1 verifier asset: disable the prefill and \
+         decode ladders (K3_PREFILL=0 and no PLOW_DECODE_BATCH_LADDER)"
+    );
+    let slot_rows = pf
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(dbatch)
+        .max(if spec_verify { 8 } else { 1 });
+    let decode_build_order = if spec_verify {
+        vec![8]
+    } else {
+        let mut order = Vec::with_capacity(rungs.len());
+        order.push(dbatch);
+        order.extend_from_slice(&rungs[..rungs.len() - 1]);
+        order
+    };
 
     let mut decode = Vec::with_capacity(rungs.len());
     let mut prefill = Vec::with_capacity(pf.len());
@@ -1255,7 +1272,9 @@ fn k3_build_model(
             // does not, the carrier that broke it is separable from batching itself — which is the
             // one question a B>1 run cannot answer, because at B>1 there is no reference stream to
             // compare against.
-            if ladder_on || t > 1 || emit_config::active().k3_seq_rows {
+            if spec_verify {
+                crate::k3::RowKind::Verify
+            } else if ladder_on || t > 1 || emit_config::active().k3_seq_rows {
                 crate::k3::RowKind::Sequences
             } else {
                 crate::k3::RowKind::Tokens
@@ -1269,7 +1288,7 @@ fn k3_build_model(
         }
         let prog = b.finish();
         tensors = prog.tensors.clone();
-        decode.push((t, prog));
+        decode.push((if spec_verify { 1 } else { t }, prog));
     }
     for &t in pf {
         let mut b = Builder::new(n_cu);
@@ -1299,7 +1318,19 @@ fn k3_build_model(
     built.extend(decode.into_iter().map(|(_, p)| p));
     // Prefill buckets first, then trailing ascending decode rungs. `decode_rung_lo` and the
     // runtime both derive the split from this ordering.
-    let prog_t: Vec<u32> = pf.iter().copied().chain(rungs.iter().copied()).collect();
+    let prog_t: Vec<u32> = pf
+        .iter()
+        .copied()
+        .chain(
+            if spec_verify {
+                [1].as_slice()
+            } else {
+                rungs.as_slice()
+            }
+            .iter()
+            .copied(),
+        )
+        .collect();
 
     Model {
         n_cu,
