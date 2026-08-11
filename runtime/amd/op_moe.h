@@ -2114,13 +2114,29 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
     }
 }
 
-/* Which expert owns m-tile `mt`. n_exp <= 512 and the scan is uniform across the workgroup, so
- * a linear walk costs a few scalar ops and no memory traffic worth naming. */
+/* Which expert owns m-tile `mt`. Duplicate prefix entries are valid for empty experts, so this
+ * is an upper-bound search for the last tilep[e] <= mt. */
+#ifndef PLOW_MOE_TILE_BINSEARCH
+#define PLOW_MOE_TILE_BINSEARCH 0
+#endif
 __device__ __forceinline__ unsigned mpf_expert_of_tile(const int* tilep, unsigned mt,
                                                        unsigned n_exp) {
+#if PLOW_MOE_TILE_BINSEARCH
+    unsigned lo = 0;
+    unsigned hi = n_exp;
+    while (lo + 1u < hi) {
+        const unsigned mid = lo + (hi - lo) / 2u;
+        if ((unsigned)tilep[mid] <= mt)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return lo;
+#else
     unsigned e = 0;
     while (e + 1u < n_exp && (unsigned)tilep[e + 1] <= mt) e++;
     return e;
+#endif
 }
 
 /* Exact fp8 -> bf16 for 8 consecutive weight bytes. NO scale: the block scale is applied to the
