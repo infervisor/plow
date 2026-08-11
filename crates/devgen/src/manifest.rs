@@ -248,6 +248,11 @@ struct Shapes {
     /// projection. A pre-arm object ignores both and stages `t[3]` verbatim, i.e. it feeds the
     /// flash an UNROPED query and returns finite, fluent, wrong tokens. Refuse at load.
     glm_fuse_rope: bool,
+    /// Any dense `FlashMlaDecode` carrying more than one query row in `i[6]` without the
+    /// q-rope fold in `t[7]`. K3-DSpark uses this packet shape for seven independent queries
+    /// over one committed context; the ordinary causal body would let later queries attend
+    /// earlier ones and silently change the draft distribution.
+    dspark_noncausal: bool,
     /// Any `QuantFp8` carrying a `t[3]` — the T11 GLU-into-quant fold (PLOW_T11_GLUQUANT):
     /// t3=gate, t4=up, i2=act, and `t[1]` becomes an OUTPUT. The emitter DELETES the `Glu`
     /// packet when it folds, so an object whose QUANT_FP8 arm ignores t3/t4 quantizes an
@@ -362,6 +367,8 @@ fn shapes(m: &Model) -> Shapes {
                 DevOp::FlashMlaDecode => {
                     if inst.t[7] != packet::TENSOR_NONE {
                         s.glm_fuse_rope = true;
+                    } else if inst.i[6] > 1 {
+                        s.dspark_noncausal = true;
                     }
                     // `i[0] = n_batch` on the MLA decode flash, exactly as on the dense-GQA
                     // twin above. Without this a batched GLM blob records `decode_batch: 1`
@@ -630,6 +637,7 @@ fn encoding_features(f: &mut Map<String, Value>, s: &Shapes) {
     f.insert("mla_pf_ns".into(), json!(s.mla_pf_ns));
     f.insert("glm_ofold".into(), json!(s.glm_ofold));
     f.insert("glm_fuse_rope".into(), json!(s.glm_fuse_rope));
+    f.insert("dspark_noncausal".into(), json!(s.dspark_noncausal));
     f.insert("glm_fuse_qnorm".into(), json!(s.glm_fuse_qnorm));
 }
 
@@ -875,6 +883,9 @@ fn backend_amd(
     // model answers fluently and wrongly. plowrt refuses the pairing at load.
     if on("glm_fuse_rope") {
         req.push("PLOW_GLM_FUSE_ROPE=1".into());
+    }
+    if on("dspark_noncausal") {
+        req.push("PLOW_DSPARK_NONCAUSAL=1".into());
     }
     // The DECODE q-norm fold (op 22 t[7]). Unlike the rope fold this arm is a BUILD AXIS, not an
     // unconditional runtime branch — an object built without `-DPLOW_GLM_FUSE_QNORM=1` has no
@@ -1517,6 +1528,38 @@ mod tests {
         };
         assert!(req(3).contains(&"PLOW_T11_GLUQUANT=1".to_string()));
         assert!(!req(packet::TENSOR_NONE).contains(&"PLOW_T11_GLUQUANT=1".to_string()));
+    }
+
+    #[test]
+    fn dspark_multi_query_decode_requires_the_noncausal_object() {
+        let manifest = |query_rows: u32, rope_table: u32| {
+            let mut flash = inst(DevOp::FlashMlaDecode, [1, 0, 0, 0, 0, 0, query_rows, 0]);
+            flash.t[7] = rope_table;
+            let m = Model {
+                n_cu: 304,
+                target: 0,
+                tensors: vec![],
+                progs: vec![prog(vec![flash])],
+                kv_row_insts: vec![],
+                prog_t: vec![1],
+                gen: vec![],
+            };
+            build(&m, "gfx942")
+        };
+
+        let dspark = manifest(7, packet::TENSOR_NONE);
+        assert_eq!(dspark["features"]["dspark_noncausal"], json!(true));
+        assert!(dspark["backends"]["gfx942"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "PLOW_DSPARK_NONCAUSAL=1"));
+
+        let ordinary = manifest(1, packet::TENSOR_NONE);
+        assert_eq!(ordinary["features"]["dspark_noncausal"], json!(false));
+        let rope_fold = manifest(7, 12);
+        assert_eq!(rope_fold["features"]["dspark_noncausal"], json!(false));
+        assert_eq!(rope_fold["features"]["glm_fuse_rope"], json!(true));
     }
 
     /// A packet carrying Kimi-K3's BLOCK ops must ask for `PLOW_K3=1`.

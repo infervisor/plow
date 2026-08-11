@@ -368,6 +368,9 @@ pub enum PrefillArm {
     /// arms it does not use in an object 140 KB larger. The encoding is a
     /// packet field, so it is not a guess.
     K3MoeA4w4,
+    /// K3 DSpark's seven-query block. It uses the grouped dense-FFN packets but replaces the
+    /// ordinary dense BF16 MLA decode specialization with a non-causal multi-query body.
+    DSpark,
 }
 
 impl PrefillArm {
@@ -381,6 +384,7 @@ impl PrefillArm {
             PrefillArm::K3 => "_k3",
             PrefillArm::K3Moe => "_k3_moe",
             PrefillArm::K3MoeA4w4 => "_k3_moe_a4w4",
+            PrefillArm::DSpark => "_dspark",
         }
     }
 
@@ -394,9 +398,16 @@ impl PrefillArm {
         let mut moe = false;
         let mut a4w4 = false;
         let mut k3 = false;
+        let mut dspark = false;
         for p in progs {
             for i in &p.insts {
                 let op = i.op;
+                if op == DevOp::FlashMlaDecode as u16
+                    && i.t[7] == packet::dev::TENSOR_NONE16
+                    && i.i[6] > 1
+                {
+                    dspark = true;
+                }
                 if op == DevOp::FlashMlaPrefill as u16
                     || op == DevOp::FlashGatherPrefill as u16
                     || op == DevOp::MlaMergeFold as u16
@@ -439,6 +450,9 @@ impl PrefillArm {
                 }
             }
         }
+        if dspark {
+            return PrefillArm::DSpark;
+        }
         match (k3, moe, a4w4, mla) {
             (true, true, true, _) => PrefillArm::K3MoeA4w4,
             (true, true, false, _) => PrefillArm::K3Moe,
@@ -474,6 +488,8 @@ pub fn object_name(phase: Phase, variant: Variant, arm: PrefillArm, sched: Sched
     // A K3 decode packet handed the plain `interp_decode.elf` has no `case` for AttnRes, situ, the
     // output gate or the KDA recurrence, and this interpreter's `default:` writes nothing.
     let arm = match (phase, arm) {
+        (Phase::Decode, PrefillArm::DSpark) => PrefillArm::DSpark,
+        (Phase::Prefill | Phase::Flash, PrefillArm::DSpark) => PrefillArm::None,
         (Phase::Prefill, a) => a,
         (Phase::Decode, PrefillArm::K3 | PrefillArm::K3Moe | PrefillArm::K3MoeA4w4) => {
             PrefillArm::K3
@@ -601,6 +617,7 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
 /// ITS table names and leaves the rest to the other phase.
 const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_KDA_CONV_STEP_DB", &["plow_kda_conv_step_db_arm"]),
+    ("PLOW_DSPARK_NONCAUSAL", &["plow_dspark_noncausal_1"]),
     // The GLM decode q-rope fold (op 50 t7 = cos, i6 = sin handle, t3 = RAW q_rope). An object
     // built before the arm stages t3 verbatim — an UNROPED query into the flash. Attention still
     // runs, nothing traps, and the model answers fluently and wrongly. This is the same silent
@@ -943,6 +960,7 @@ fn is_lm_head_matmul(op: u16) -> bool {
 /// Present iff the axis is on, so absence is not ambiguous: every object built before the axis
 /// existed, and every object built with it off, carries no such symbol and has no K3 arm.
 const K3_ARMS_SYM: &str = "plow_k3_arms_1";
+const DSPARK_NONCAUSAL_SYM: &str = "plow_dspark_noncausal_1";
 const MOE_PF_A4W4_SYM: &str = "plow_moe_pf_a4w4_arm";
 const KDA_CONV_STEP_DB_SYM: &str = "plow_kda_conv_step_db_arm";
 const KDA_CONV_STEP_DB_REPLACED_OPS: &[DevOp] = &[
@@ -980,6 +998,26 @@ fn required_k3_op(progs: &[DevProg]) -> Option<DevOp> {
         .iter()
         .flat_map(|p| p.insts.iter())
         .find_map(|i| K3_ARM_OPS.iter().copied().find(|&o| o as u16 == i.op))
+}
+
+fn requires_dspark_noncausal(progs: &[DevProg]) -> bool {
+    progs.iter().flat_map(|p| p.insts.iter()).any(|i| {
+        i.op == DevOp::FlashMlaDecode as u16 && i.t[7] == packet::dev::TENSOR_NONE16 && i.i[6] > 1
+    })
+}
+
+fn check_dspark_noncausal(syms: &[&str], path: &Path, need: bool) -> Result<()> {
+    if !need || syms.contains(&DSPARK_NONCAUSAL_SYM) {
+        return Ok(());
+    }
+    Err(RuntimeError::Device(format!(
+        "packet/object DSpark MISMATCH: this packet carries a multi-query non-causal MLA block, \
+         but {} was compiled without PLOW_DSPARK_NONCAUSAL (it does not advertise \
+         `{DSPARK_NONCAUSAL_SYM}`). A normal MLA decode arm would make the seven draft rows \
+         attend one another or silently use only one row. Rebuild the dedicated DSpark object \
+         with -DPLOW_DSPARK_NONCAUSAL=1.",
+        path.display()
+    )))
 }
 
 fn required_moe_pf_a4w4(progs: &[DevProg]) -> Option<DevOp> {
@@ -3775,6 +3813,8 @@ impl AmdEngine {
         // asked about the phase it actually serves rather than about the blob as a whole.
         let need_k3_decode = required_k3_op(&blob.progs[dec_ix..]);
         let need_k3_prefill = required_k3_op(&blob.progs[..dec_ix]);
+        let need_dspark_decode = requires_dspark_noncausal(&blob.progs[dec_ix..]);
+        let need_dspark_prefill = requires_dspark_noncausal(&blob.progs[..dec_ix]);
         let need_a4w4_decode = required_moe_pf_a4w4(&blob.progs[dec_ix..]);
         let need_kda_conv_step_db = required_kda_conv_step_db(&blob.progs[dec_ix..]);
         let legacy_kda_decode = first_op_in(&blob.progs[dec_ix..], KDA_CONV_STEP_DB_REPLACED_OPS);
@@ -3874,7 +3914,9 @@ impl AmdEngine {
                 tracing::info!(object = %name, ?phase, ?variant, ?prefill_arm, ?sched,
                            "code object");
                 let image = std::fs::read(&path).map_err(|e| {
-                    if phase == Phase::Prefill && prefill_arm != PrefillArm::None {
+                    if phase == Phase::Prefill
+                        && !matches!(prefill_arm, PrefillArm::None | PrefillArm::DSpark)
+                    {
                         RuntimeError::Device(format!(
                             "code object {}: {e} — this packet's prefill programs contain {} \
                          opcodes, which requires {name} in {}, and it is not there. Build it \
@@ -3888,6 +3930,7 @@ impl AmdEngine {
                                 PrefillArm::K3 => "Kimi-K3 block",
                                 PrefillArm::K3Moe => "Kimi-K3 block + grouped MoE prefill",
                                 PrefillArm::K3MoeA4w4 => "Kimi-K3 block + grouped A4W4 MoE prefill",
+                                PrefillArm::DSpark => unreachable!(),
                                 PrefillArm::None => unreachable!(),
                             },
                             hsaco_dir.display(),
@@ -3902,6 +3945,7 @@ impl AmdEngine {
                                     "PLOW_K3=1 PLOW_MLA_PREFILL=1 PLOW_MOE_PREFILL=1 \
                                  PLOW_MOE_PF_A4W4=1 PLOW_MXFP4=1"
                                 }
+                                PrefillArm::DSpark => unreachable!(),
                                 PrefillArm::None => unreachable!(),
                             },
                         ))
@@ -3959,6 +4003,11 @@ impl AmdEngine {
                     Phase::Prefill | Phase::Flash => need_k3_prefill,
                 };
                 check_k3_arms(&syms, &path, need_k3)?;
+                let need_dspark = match phase {
+                    Phase::Decode => need_dspark_decode,
+                    Phase::Prefill | Phase::Flash => need_dspark_prefill,
+                };
+                check_dspark_noncausal(&syms, &path, need_dspark)?;
                 if phase == Phase::Decode {
                     check_moe_pf_a4w4(&syms, &path, need_a4w4_decode)?;
                     check_kda_conv_step_db(&syms, &path, need_kda_conv_step_db, legacy_kda_decode)?;
@@ -7148,6 +7197,24 @@ mod tests {
             ),
             "interp_prefill_fp8kv_k3_moe_a4w4_gq.elf"
         );
+        assert_eq!(
+            object_name(
+                Phase::Decode,
+                Variant::Bf16,
+                PrefillArm::DSpark,
+                Sched::GlobalQueue,
+            ),
+            "interp_decode_dspark_gq.elf"
+        );
+        assert_eq!(
+            object_name(
+                Phase::Prefill,
+                Variant::Bf16,
+                PrefillArm::DSpark,
+                Sched::Static,
+            ),
+            "interp_prefill.elf"
+        );
     }
 
     /// Synthetic packets exercising `PrefillArm::detect` — the axis whose
@@ -7276,6 +7343,16 @@ mod tests {
         ])];
         assert_eq!(PrefillArm::detect(&k3_decode), PrefillArm::K3);
 
+        let mut dspark = prog_with_ops(&[
+            DevOp::FlashMlaDecode,
+            DevOp::MlaMergeFold,
+            DevOp::MoeGroupGluPf,
+            DevOp::MoeGroupDownPf,
+        ]);
+        dspark.insts[0].t[7] = packet::dev::TENSOR_NONE16;
+        dspark.insts[0].i[6] = 7;
+        assert_eq!(PrefillArm::detect(&[dspark]), PrefillArm::DSpark);
+
         // The MLA-only K3 bucket (attention emitted, FFN still on the decode ops) is `K3`, not
         // `K3MoeA4w4`: the grouped chain is what `PLOW_MOE_PREFILL` builds and it is absent here.
         let k3_attn = vec![prog_with_ops(&[
@@ -7360,6 +7437,31 @@ mod tests {
         assert_eq!(required_k3_op(&plain), None);
         assert!(check_k3_arms(&bare, obj, required_k3_op(&plain)).is_ok());
         assert!(check_k3_arms(&with_k3, obj, required_k3_op(&plain)).is_ok());
+    }
+
+    #[test]
+    fn dspark_multi_query_packet_requires_the_noncausal_object() {
+        let obj = Path::new("interp_decode_dspark.elf");
+        let mut packet = vec![prog_gemv(&[DevOp::FlashMlaDecode], 1)];
+        packet[0].insts[0].t[7] = packet::dev::TENSOR_NONE16;
+        packet[0].insts[0].i[6] = 7;
+
+        assert!(requires_dspark_noncausal(&packet));
+        let err = check_dspark_noncausal(&[], obj, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(DSPARK_NONCAUSAL_SYM));
+        assert!(err.contains("PLOW_DSPARK_NONCAUSAL"));
+        assert!(check_dspark_noncausal(&[DSPARK_NONCAUSAL_SYM], obj, true).is_ok());
+
+        packet[0].insts[0].i[6] = 1;
+        assert!(!requires_dspark_noncausal(&packet));
+        packet[0].insts[0].i[6] = 7;
+        packet[0].insts[0].t[7] = 0;
+        assert!(
+            !requires_dspark_noncausal(&packet),
+            "op-50 t7 means q-rope fold, where i6 is a tensor handle"
+        );
     }
 
     #[test]

@@ -650,6 +650,8 @@ option(PLOW_HSACO_MLA "Also emit the MLA prefill object (Kimi/DeepSeek/GLM)" ON)
 # (+14.9% on decode) and is exactly why these stay SEPARATE OBJECTS rather than becoming defines
 # on the rows above. Cost of the default: ~31 s of build, doubled by the `_gq` twins, and ~3 MB.
 option(PLOW_HSACO_K3 "Also emit the Kimi-K3 / KDA objects (decode + prefill)" ON)
+option(PLOW_HSACO_DSPARK_NONCAUSAL
+       "Emit the Kimi-K3 DSpark seven-query non-causal decode object" OFF)
 option(PLOW_K3_DECODE_MXFP4_PROJ
        "Include standalone MXFP4 projection ops in K3 decode objects" ON)
 option(PLOW_K3_DECODE_GROUPED
@@ -734,6 +736,7 @@ if(PLOW_GFX950_HSACO)
     if(PLOW_GEMV_WALK)
         list(APPEND _hs_ax_decode -DPLOW_GEMV_WALK=1)
     endif()
+    set(_hs_ax_dspark_decode -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=8)
     # 4 waves => 1 wave/SIMD => a 512-reg budget, and ITS spill is intentional
     # (the Q-hoist spills Q to scratch, cheaper than the L2 re-read it replaces).
     set(_hs_ax_flash -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4
@@ -773,6 +776,7 @@ if(PLOW_GFX950_HSACO)
     # and write nothing — so these are the rows that actually make a Kimi/GLM/DeepSeek
     # prompt runnable. Measured: the grouped-expert GEMM costs occ NOTHING (see the rows).
     set(_hs_ax_mla_moe ${_hs_ax_mla} -DPLOW_MOE_PREFILL=1)
+    set(_hs_ax_dspark -DPLOW_MOE_PREFILL=1 -DPLOW_DSPARK_NONCAUSAL=1)
     set(_hs_ax_mla_moe_fp8 ${_hs_ax_mla_fp8} -DPLOW_MOE_PREFILL=1)
     # A4W4: MXFP4 on BOTH operands through the matrix core, the encoding ATOM runs. Compile-time
     # like every other precision axis -- a runtime encoding switch would make the register
@@ -1005,6 +1009,10 @@ if(PLOW_GFX950_HSACO)
                 "interp_prefill_fp8kv_k3_moe|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_fp8kv|256|2"
                 "interp_prefill_fp8kv_k3_moe_a4w4|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_a4w4_fp8kv|256|2")
         endif()
+    endif()
+    if(PLOW_HSACO_DSPARK_NONCAUSAL)
+        list(APPEND _hs_rows
+            "interp_decode_dspark|${_hs_kdec}|_hs_ax_dspark_decode|_hs_ax_dspark|256|2")
     endif()
 
     set(_hs_kinds static)

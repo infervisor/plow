@@ -1229,7 +1229,7 @@ pub(crate) fn declare_glm_rows(
     rows: u32,
     enc: MoeEnc,
 ) -> GlmTn {
-    declare_glm_rows_batched(b, c, ctx, layer_ids, rows, 1, enc)
+    declare_glm_rows_batched(b, c, ctx, layer_ids, rows, 1, 1, enc)
 }
 
 /// As [`declare_glm_rows`], with a DECODE batch: `dbatch` slots share the blob. Three families
@@ -1251,9 +1251,11 @@ pub(crate) fn declare_glm_rows_batched(
     layer_ids: &[u32],
     rows: u32,
     dbatch: u32,
+    query_tokens: u32,
     enc: MoeEnc,
 ) -> GlmTn {
     let dbatch = dbatch.max(1);
+    let query_tokens = query_tokens.max(1);
     let rows = (rows.max(1) as u64).max(dbatch as u64);
     let (h, nh, dk, dr, vd, ql, e, tk, imoe) = (
         c.hidden,
@@ -1329,7 +1331,9 @@ pub(crate) fn declare_glm_rows_batched(
     // rows*nh_l*pf_ns partials (each split a ceil-equal share of its tile's causal range;
     // dead splits carry m=-inf/l=0, which d_mla_merge_fold weighs 0 branch-free — the old
     // "empty split divides the merge" objection predates that merge rewrite).
-    let osplits = (ns * dbatch).max(rows as u32 * glm_pf_ns());
+    let osplits = (ns * dbatch)
+        .max(rows as u32 * glm_pf_ns())
+        .max(ns * query_tokens);
     let opart = ac(b, "opart", (nh_l * osplits * dk) as u64 * F32);
     let mlpart = ac(b, "mlpart", (nh_l * osplits * 2) as u64 * F32);
     let olat = ac(b, "olat", (nh_l * dk) as u64 * BF16);
@@ -2358,12 +2362,17 @@ fn emit_glm_mla(
     ctx: u32,
     rows: u32,
     dbatch: u32,
+    noncausal_queries: bool,
     enc: MoeEnc,
     x_in: u32,
     pre: &[u32],
     xgate: &mut u32,
     xr_cus: &[u32],
 ) -> u32 {
+    assert!(
+        !noncausal_queries || (rows > 1 && dbatch == 1),
+        "non-causal query blocks require one cache sequence and more than one query row"
+    );
     let all = b.all();
     let one = vec![0u32];
     let (h, nh, dk, dr, vd, ql) = (c.hidden, c.heads, c.kv_lora, c.qk_rope, c.v_head, c.q_lora);
@@ -2630,6 +2639,10 @@ fn emit_glm_mla(
     // single-workgroup packet sitting between a 149-wide GEMV and the 128-wide flash, so the
     // chain pays a full gate round trip plus a 1-CU body for 512 elements of work.
     let fuse_rope = emit_config::active().glm_fuse_rope;
+    assert!(
+        !(noncausal_queries && fuse_rope),
+        "DSpark non-causal query blocks use i[6] for query-token count and require explicit per-row RoPE"
+    );
     let c_qr = if fuse_rope {
         c_qrr
     } else {
@@ -2661,96 +2674,108 @@ fn emit_glm_mla(
     //   kv_row_writer scan patches its i[3]; the bf16 RmsNorm writer's row is i[2].
     let fp8kv = glm_fp8_kv();
     assert!(
+        !(noncausal_queries && fp8kv),
+        "DSpark non-causal query blocks currently require bf16 context KV: op 109 spends i[6] on the k-rope encoding"
+    );
+    assert!(
         !(fp8kv && rows > 1),
         "PLOW_GLM_FP8_KV=1 with a batched decode program (rows={rows}): the fp8 latent writer's \
          batch-ring form is unvalidated on GLM. Emit the ladder blob without fp8-KV."
     );
-    let c_rnkv = if fp8kv {
-        b.emit(DevOp::HeadNormRopeFp8, one.clone(), &[c_ckvd], |d| {
-            d.t[0] = n.ckv[slot];
-            d.t[1] = n.ckvraw;
-            d.t[2] = w.gkva;
-            d.t[5] = n.pos;
-            d.t[6] = n.kv_scale[slot];
-            d.i[0] = 1;
-            d.i[1] = 1;
-            d.i[2] = dk;
-            d.i[3] = 0; // row, patched per step
-            d.i[4] = 0; // apply RMSNorm before quantizing
-            d.f[0] = eps;
-            d.j[1] = KV_MASK_NONE;
-        })
-    } else if rows > 1 || dbatch > 1 {
-        // BATCHED latent writer. The single-row form is a plain RmsNorm whose write row is a
-        // host-patched immediate (`i[2]`) — no per-row form exists on that op, and `patch_kvrow`
-        // deliberately does not run at ENGINE batch > 1. That skip is keyed on the BLOB batch,
-        // not the rung: on a laddered blob even the rows==1 rung must take this form, or every
-        // rung-1 step writes its KV into ring row 0 (measured: needle@3000 answers '741' — the
-        // model retrieves from prefill rows and loses every decode-written one). This is the
-        // same kernel family as the k-rope below: HeadNormRope at HD=dk, ONE head, gamma armed
-        // (RMSNorm over the head), trig tables ABSENT (rope skipped), and the batch-major ring
-        // write `((t*nhead + hh)*out_stride + pos[t]) * hd` selected by `i[6] != 0 && j[0] != 0`.
-        b.emit(
-            DevOp::HeadNormRope,
-            rope_cus(&all, rq.len() + rk.len(), rows, 1),
-            &[c_ckvd],
-            |d| {
+    let c_rnkv = if noncausal_queries {
+        None
+    } else {
+        Some(if fp8kv {
+            b.emit(DevOp::HeadNormRopeFp8, one.clone(), &[c_ckvd], |d| {
                 d.t[0] = n.ckv[slot];
                 d.t[1] = n.ckvraw;
                 d.t[2] = w.gkva;
-                d.t[3] = TENSOR_NONE;
-                d.t[4] = TENSOR_NONE;
                 d.t[5] = n.pos;
-                d.i[0] = rows;
+                d.t[6] = n.kv_scale[slot];
+                d.i[0] = 1;
                 d.i[1] = 1;
                 d.i[2] = dk;
-                d.i[3] = 0;
-                // i[4] is SKIP_NORM on this op (interleave is selected by HD, not a field).
-                // The rope packets pass 1 because they must NOT norm; this writer exists to
-                // apply kv_a_layernorm, so it passes 0 — the one-field difference that, wrong,
-                // caches an unnormalized latent and turns every batched row to garbage.
-                d.i[4] = 0;
-                d.i[6] = rows; // n_batch_kv: row t writes slot t's ring at pos[t]
+                d.i[3] = 0; // row, patched per step
+                d.i[4] = 0; // apply RMSNorm before quantizing
                 d.f[0] = eps;
-                d.j[0] = ctx; // out_stride = the per-slot ring length
                 d.j[1] = KV_MASK_NONE;
-            },
-        )
-    } else {
-        b.emit(DevOp::RmsNorm, one.clone(), &[c_ckvd], |d| {
-            d.t[0] = n.ckv[slot];
-            d.t[1] = n.ckvraw;
-            d.t[2] = w.gkva;
-            d.i[0] = 1;
-            d.i[1] = dk;
-            d.f[0] = eps;
+            })
+        } else if rows > 1 || dbatch > 1 {
+            // BATCHED latent writer. The single-row form is a plain RmsNorm whose write row is a
+            // host-patched immediate (`i[2]`) — no per-row form exists on that op, and `patch_kvrow`
+            // deliberately does not run at ENGINE batch > 1. That skip is keyed on the BLOB batch,
+            // not the rung: on a laddered blob even the rows==1 rung must take this form, or every
+            // rung-1 step writes its KV into ring row 0 (measured: needle@3000 answers '741' — the
+            // model retrieves from prefill rows and loses every decode-written one). This is the
+            // same kernel family as the k-rope below: HeadNormRope at HD=dk, ONE head, gamma armed
+            // (RMSNorm over the head), trig tables ABSENT (rope skipped), and the batch-major ring
+            // write `((t*nhead + hh)*out_stride + pos[t]) * hd` selected by `i[6] != 0 && j[0] != 0`.
+            b.emit(
+                DevOp::HeadNormRope,
+                rope_cus(&all, rq.len() + rk.len(), rows, 1),
+                &[c_ckvd],
+                |d| {
+                    d.t[0] = n.ckv[slot];
+                    d.t[1] = n.ckvraw;
+                    d.t[2] = w.gkva;
+                    d.t[3] = TENSOR_NONE;
+                    d.t[4] = TENSOR_NONE;
+                    d.t[5] = n.pos;
+                    d.i[0] = rows;
+                    d.i[1] = 1;
+                    d.i[2] = dk;
+                    d.i[3] = 0;
+                    // i[4] is SKIP_NORM on this op (interleave is selected by HD, not a field).
+                    // The rope packets pass 1 because they must NOT norm; this writer exists to
+                    // apply kv_a_layernorm, so it passes 0 — the one-field difference that, wrong,
+                    // caches an unnormalized latent and turns every batched row to garbage.
+                    d.i[4] = 0;
+                    d.i[6] = rows; // n_batch_kv: row t writes slot t's ring at pos[t]
+                    d.f[0] = eps;
+                    d.j[0] = ctx; // out_stride = the per-slot ring length
+                    d.j[1] = KV_MASK_NONE;
+                },
+            )
+        } else {
+            b.emit(DevOp::RmsNorm, one.clone(), &[c_ckvd], |d| {
+                d.t[0] = n.ckv[slot];
+                d.t[1] = n.ckvraw;
+                d.t[2] = w.gkva;
+                d.i[0] = 1;
+                d.i[1] = dk;
+                d.f[0] = eps;
+            })
         })
     };
     // 8 k_rope dynamic INTERLEAVED RoPE (shared 1-head) on n.krr from the fused (or split) down-proj,
     //   writing the rope cache at row=out_row0 (i[3]; the decode step patches it to the current pos).
     //   At rows > 1 the write switches to the batch-major ring form (i[6]/j[0]), same as the latent
     //   writer above — row t's angle AND write row both come from pos[t].
-    let c_krd = b.emit(DevOp::HeadNormRope, rk.clone(), &[c_krr], |d| {
-        d.t[0] = n.krot[slot];
-        d.t[1] = n.krr;
-        d.t[2] = TENSOR_NONE;
-        d.t[3] = n.cos;
-        d.t[4] = n.sin;
-        d.t[5] = n.pos;
-        d.i[0] = rows;
-        d.i[1] = 1;
-        d.i[2] = dr;
-        d.i[3] = 0;
-        d.i[4] = 1;
-        if rows > 1 || dbatch > 1 {
-            d.i[6] = rows;
-            d.j[0] = ctx;
-        } else {
-            d.j[0] = 0;
-        }
-        d.f[0] = eps;
-        d.j[1] = KV_MASK_NONE;
-    });
+    let c_krd = if noncausal_queries {
+        None
+    } else {
+        Some(b.emit(DevOp::HeadNormRope, rk.clone(), &[c_krr], |d| {
+            d.t[0] = n.krot[slot];
+            d.t[1] = n.krr;
+            d.t[2] = TENSOR_NONE;
+            d.t[3] = n.cos;
+            d.t[4] = n.sin;
+            d.t[5] = n.pos;
+            d.i[0] = rows;
+            d.i[1] = 1;
+            d.i[2] = dr;
+            d.i[3] = 0;
+            d.i[4] = 1;
+            if rows > 1 || dbatch > 1 {
+                d.i[6] = rows;
+                d.j[0] = ctx;
+            } else {
+                d.j[0] = 0;
+            }
+            d.f[0] = eps;
+            d.j[1] = KV_MASK_NONE;
+        }))
+    };
     // --- DSA lightning indexer (G2/G5): ctx>2048 => project q_idx/k_idx/w, score, top-k select ->
     //     idx table, then FLASH_GATHER over the top_k selected latent rows. ctx<=2048 => dense flash
     //     (top-k is a no-op). 'full' layers own the indexer; 'shared' layers reuse the last full
@@ -2923,7 +2948,13 @@ fn emit_glm_mla(
     // Under the q-rope fold `c_qr` IS `c_qrr` (= the fused q GEMV, which is also `c_qa`), so the
     // list would name one producer twice. Dedup: a repeated dep is not wrong, but it inflates the
     // packet's wait set and the counter analysis reads it as a wider gate than it is.
-    let mut fl_deps = vec![c_qa, c_qr, c_rnkv, c_krd];
+    let mut fl_deps = vec![c_qa, c_qr];
+    if let Some(dep) = c_rnkv {
+        fl_deps.push(dep);
+    }
+    if let Some(dep) = c_krd {
+        fl_deps.push(dep);
+    }
     fl_deps.dedup();
     if full {
         fl_deps.push(c_sel);
@@ -2960,7 +2991,14 @@ fn emit_glm_mla(
             (false, false) => DevOp::FlashMlaDecode,
             (false, true) => DevOp::FlashMlaDecodeFp8,
         },
-        flash_mla_cus(&all, rows, 1, nh_l, glm_gf(ctx, nh_l), ns_attn),
+        flash_mla_cus(
+            &all,
+            if noncausal_queries { 1 } else { rows },
+            if noncausal_queries { rows } else { 1 },
+            nh_l,
+            glm_gf(ctx, nh_l),
+            ns_attn,
+        ),
         &fl_deps,
         |d| {
             d.t[0] = n.opart;
@@ -2970,13 +3008,16 @@ fn emit_glm_mla(
             d.t[4] = n.ckv[slot];
             d.t[5] = n.krot[slot];
             d.t[6] = n.kvlen;
-            d.i[0] = rows;
+            d.i[0] = if noncausal_queries { 1 } else { rows };
             d.i[1] = nh_l;
             d.i[2] = ctx;
             d.i[4] = ns_attn;
             d.i[5] = KV_MASK_NONE;
             d.i[7] = glm_gf(ctx, nh_l); // per-pkt head-fusion factor (interp dispatches 2/4/8 on this)
             d.f[0] = c.attn_scale;
+            if noncausal_queries {
+                d.i[6] = rows;
+            }
             if fuse_rope {
                 // Q-ROPE FOLD. `t[3]` carries the RAW q_rope projection instead of the roped
                 // one — SAME SLOT, so the fold costs one t and one i, not three: the position
@@ -5179,7 +5220,7 @@ pub(crate) fn emit_glm_block(
     let lin_fp8 = glm_linear_fp8(enc);
     let glu_split = glm_shared_glu_split(enc);
     let c_rn2 = emit_glm_mla(
-        b, c, n, slot, ctx, rows, dbatch, enc, x_in, pre, xgate, xr_cus,
+        b, c, n, slot, ctx, rows, dbatch, false, enc, x_in, pre, xgate, xr_cus,
     );
     if rows > 1 {
         // BATCHED DECODE FFN: the decode MoE op family carries no token dimension
@@ -5580,6 +5621,7 @@ pub(crate) fn emit_glm_dense_block(
     ctx: u32,
     rows: u32,
     dbatch: u32,
+    noncausal_queries: bool,
     enc: MoeEnc,
     x_in: u32,
     x_out: u32,
@@ -5589,7 +5631,19 @@ pub(crate) fn emit_glm_dense_block(
 ) -> u32 {
     assert!(slot < n.lw.len(), "slot out of range");
     let c_rn2 = emit_glm_mla(
-        b, c, n, slot, ctx, rows, dbatch, enc, x_in, pre, xgate, xr_cus,
+        b,
+        c,
+        n,
+        slot,
+        ctx,
+        rows,
+        dbatch,
+        noncausal_queries,
+        enc,
+        x_in,
+        pre,
+        xgate,
+        xr_cus,
     );
     if rows > 1 {
         // BATCHED DECODE dense FFN. `DenseGluFp8Blk` (op 47) is i0=N — it has no M axis at all —
@@ -5926,7 +5980,7 @@ fn glm_emit_full(
     // serves every program. max_rows == 1 reproduces `declare_glm` exactly, which is what keeps a
     // decode-only emit byte-identical to one from before this path existed. `dbatch` widens only
     // the KV rings, `in.kvlen`, the lm_head tail and the flash partials — see the declare's doc.
-    let tn = declare_glm_rows_batched(&mut tb, &c, ctx, &layers, max_rows, dbatch, enc);
+    let tn = declare_glm_rows_batched(&mut tb, &c, ctx, &layers, max_rows, dbatch, 1, enc);
     let tensors = tb.tensors();
     let gen = tb.gen_tensors();
 
@@ -6049,6 +6103,7 @@ fn glm_emit_full(
                     ctx,
                     rb,
                     dbatch,
+                    false,
                     MoeEnc::from_flags(use_fp8, false),
                     cur,
                     nxt,
@@ -6309,6 +6364,7 @@ pub(crate) fn glm_main(
             ctx,
             1,
             1,
+            false,
             MoeEnc::from_flags(use_fp8, false),
             tn.x,
             tn.xnext,
@@ -6467,6 +6523,11 @@ pub(crate) fn glm_build_block_pf(
 ) -> (Model, plow_asset::BlockDescriptor) {
     use plow_asset::*;
     let layers: Vec<u32> = block.clone().map(|l| l as u32).collect();
+    let query_rows = if arch == MlaArch::K3DSpark { 7 } else { 1 };
+    assert!(
+        arch != MlaArch::K3DSpark || pf.is_empty(),
+        "K3 DSpark query-block assets do not carry prefill buckets; context KV is precomputed separately"
+    );
     // A whole-layer prefill needs a T-row FFN for EVERY layer in the block. Both kinds now have
     // one: MoE layers on the grouped expert arms, dense layers on those SAME arms with degenerate
     // 1-expert routing (`emit_glm_dense_block_prefill`). MXFP4 is the remaining hole — its grouped
@@ -6494,12 +6555,18 @@ pub(crate) fn glm_build_block_pf(
 
     let mut tb = Builder::new(n_cu);
     // One tensor table serves every program, so it is sized for the widest bucket (1 = decode-only).
-    let tn = declare_glm_rows(
+    let tn = declare_glm_rows_batched(
         &mut tb,
         c,
         ctx,
         &layers,
-        pf.iter().copied().max().unwrap_or(1),
+        pf.iter()
+            .copied()
+            .max()
+            .unwrap_or(query_rows)
+            .max(query_rows),
+        1,
+        query_rows,
         enc,
     );
     let tensors = tb.tensors();
@@ -6592,7 +6659,20 @@ pub(crate) fn glm_build_block_pf(
         let nxt = if cur == tn.x { tn.xnext } else { tn.x };
         let d = if c.is_dense(l) {
             emit_glm_dense_block(
-                &mut b, c, &tn, slot, ctx, 1, 1, enc, cur, nxt, &dep, &mut xgate, &xr_cus,
+                &mut b,
+                c,
+                &tn,
+                slot,
+                ctx,
+                query_rows,
+                1,
+                arch == MlaArch::K3DSpark,
+                enc,
+                cur,
+                nxt,
+                &dep,
+                &mut xgate,
+                &xr_cus,
             )
         } else {
             emit_glm_block(
@@ -6923,7 +7003,12 @@ pub(crate) fn kimi_emit_block(
                 "kv_a_proj_with_mqa.weight",
             ],
             &[],
-            &["derived."],
+            &[
+                "derived.",
+                // Seven-row dense FFNs use the grouped kernel. The runtime fills this three-u64
+                // table from the declared gate/up/down device addresses before launch.
+                "dense_weight_table",
+            ],
         )
         .unwrap_or_else(|e| panic!("k3_dspark: {e}"));
         let mut expected = Vec::with_capacity(block.len() * 5);

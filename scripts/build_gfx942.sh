@@ -855,6 +855,14 @@ ROWS=(
   "interp_prefill_fp8kv_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_PF_STATE $AX_MXFP4 $AX_FP8KV"
 )
 
+if [ "${PLOW_DSPARK_NONCAUSAL:-0}" = 1 ]; then
+  [ "$GVMM" -ge 8 ] || {
+    echo "REFUSING: DSpark's seven query rows require PLOW_DECODE_BATCH=8 or PLOW_GEMV_MM=8." >&2
+    exit 1
+  }
+  ROWS+=("interp_decode_dspark|$AX_DECODE $AX_MOE -DPLOW_DSPARK_NONCAUSAL=1")
+fi
+
 # PLOW_ROWS_ONLY=<substring>: build only the rows whose stem matches — for iterating on
 # ONE object family (e.g. interp_flash) without paying the full 28-object build. The
 # resulting dir is PARTIAL; copy it over a full set before serving from it.
@@ -985,6 +993,12 @@ for row in "${ROWS[@]}"; do
           fail=1
         fi
         case "$stem" in
+          interp_decode_dspark*)
+            grep -qE "OBJECT .* plow_dspark_noncausal_1$" <<<"$symbols" || {
+              echo "  MISSING DSPARK NONCAUSAL: expected plow_dspark_noncausal_1"
+              fail=1
+            }
+            ;;
           interp_decode_k3*|interp_decode_fp8kv_k3*)
             if [ -n "$AX_K3_DECODE_XR_AGG" ]; then
               grep -qE "OBJECT .* plow_xr_agg_1$" <<<"$symbols" || {

@@ -148,6 +148,7 @@ fn emitted_dense_ops() -> Vec<u16> {
         512,
         1,
         1,
+        false,
         MoeEnc::Fp8Blk,
         tn.x,
         tn.xnext,

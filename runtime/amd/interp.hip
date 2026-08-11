@@ -46,6 +46,15 @@
 #define PLOW_K3 0
 #endif
 
+/* K3 DSpark's seven draft rows share one committed context and must not attend one another.
+ * This is a replacement specialization of the dense BF16 MLA decode body, not an additive arm:
+ * keeping both instantiations in the persistent megakernel would charge every model the larger
+ * instruction/register union. The packet advertises its seven query rows in op-50 i[6], and the
+ * loader requires the marker below before pairing such a packet with an object. */
+#ifndef PLOW_DSPARK_NONCAUSAL
+#define PLOW_DSPARK_NONCAUSAL 0
+#endif
+
 #include "amd_common.h"
 #include "op_attention.h"
 #include "op_collective.h"
@@ -72,6 +81,9 @@ extern "C" __device__ unsigned plow_k3_arms_1 = 1;
 #endif
 #if PLOW_K3 && PLOW_KDA_CONV_STEP_DB
 extern "C" __device__ unsigned plow_kda_conv_step_db_arm = 1;
+#endif
+#if PLOW_DSPARK_NONCAUSAL
+extern "C" __device__ unsigned plow_dspark_noncausal_1 = 1;
 #endif
 
 /* Compact TP audit. `i[7] == 0` keeps old packets byte-compatible; plowrt patches
@@ -1082,6 +1094,29 @@ __device__ __forceinline__ void exec_flash_mla_decode(CInst in, CTens T, unsigne
         const float* qrc = (const float*)TEN(7);
         const float* qrs = qrc ? (const float*)IEN(6) : nullptr;
         if (qrc && !qrs) __builtin_trap();
+#if PLOW_DSPARK_NONCAUSAL
+        const unsigned n_tok = qrc ? 1u : (in->i[6] ? in->i[6] : 1u);
+        if (gf == 2)
+            d_flash_mla_decode<512, 64, 2, false, false, true>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
+                in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
+                n_tok, nullptr, 0, qrc, qrs);
+#if PLOW_GLM_GF8_ARM
+        else if (gf == 8)
+            d_flash_mla_decode<512, 64, 8, false, false, true>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
+                in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
+                n_tok, nullptr, 0, qrc, qrs);
+#endif
+        else
+            d_flash_mla_decode<512, 64, 4, false, false, true>(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
+                in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
+                n_tok, nullptr, 0, qrc, qrs);
+#else
         if (gf == 2)
             d_flash_mla_decode<512, 64, 2>(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
@@ -1102,6 +1137,7 @@ __device__ __forceinline__ void exec_flash_mla_decode(CInst in, CTens T, unsigne
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0], in->i[1],
                 in->i[2], in->i[3], in->fj[0].f, in->i[4], in->i[5], slice, nblk, lds, nullptr, 0,
                 1, nullptr, 0, qrc, qrs);
+#endif
     }
 #undef IEN
 #undef TEN
