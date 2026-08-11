@@ -370,10 +370,12 @@ mod amd_serve {
             // state across 69 of 93 layers. `AmdEngine::begin_slot` carries the
             // argument for why an append-only KV cache needs no clear and a
             // recurrence does.
-            match &mut self.ranks {
-                Ranks::One(e) => e.begin_slot(slot)?,
-                Ranks::Tp(g) => g.begin_slot(slot)?,
-            }
+            crate::obs::ttft::timed(&crate::obs::ttft::PF_STATE_CLEAR, || {
+                match &mut self.ranks {
+                    Ranks::One(e) => e.begin_slot(slot),
+                    Ranks::Tp(g) => g.begin_slot(slot),
+                }
+            })?;
             self.pos[slot] = 0;
             self.live[slot] = true;
             let tok = if prompt.len() == 1 {
@@ -529,10 +531,12 @@ mod amd_serve {
                     )));
                 }
                 self.check_slot(slot)?;
-                match &mut self.ranks {
-                    Ranks::One(e) => e.begin_slot(slot)?,
-                    Ranks::Tp(g) => g.begin_slot(slot)?,
-                }
+                crate::obs::ttft::timed(&crate::obs::ttft::PF_STATE_CLEAR, || {
+                    match &mut self.ranks {
+                        Ranks::One(e) => e.begin_slot(slot),
+                        Ranks::Tp(g) => g.begin_slot(slot),
+                    }
+                })?;
                 let n = prompt.len() as u32;
                 // CHUNKING AND THE PREFIX CACHE COMPOSE. The cache decides WHICH span still has
                 // to be prefilled; chunking decides how that span is broken into ticks. Building

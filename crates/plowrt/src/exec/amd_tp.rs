@@ -881,6 +881,27 @@ impl AmdTpGroup {
     /// so a rank that skipped the clear would carry stale state for its own heads only and the
     /// ranks would disagree about the sequence from its very first token.
     pub fn begin_slot(&mut self, slot: usize) -> Result<()> {
+        if self
+            .ranks
+            .first()
+            .is_some_and(AmdEngine::device_state_clear_enabled)
+        {
+            if !self.ranks.iter().all(AmdEngine::device_state_clear_enabled) {
+                return Err(RuntimeError::Device(
+                    "device recurrent-state clear is not enabled on every TP rank".into(),
+                ));
+            }
+            for e in &mut self.ranks {
+                e.prepare_device_state_clear(slot)?;
+            }
+            for e in &self.ranks {
+                e.enqueue_state_clear(slot)?;
+            }
+            for e in &self.ranks {
+                e.drain()?;
+            }
+            return Ok(());
+        }
         for e in &mut self.ranks {
             e.begin_slot(slot)?;
         }

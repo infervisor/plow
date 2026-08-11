@@ -3001,6 +3001,60 @@ struct XAuditArgs {
     status: u64,
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct StateClearRange {
+    base: u64,
+    slot_stride: u64,
+    words: u32,
+    _pad: u32,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct StateClearArgs {
+    ranges: u64,
+    n_ranges: u32,
+    slot: u32,
+}
+
+const STATE_CLEAR_CHUNK: u64 = 256 * 1024;
+
+fn state_clear_ranges(
+    devp: &[DeviceMem],
+    carried: &[(usize, u64)],
+) -> Result<Vec<StateClearRange>> {
+    let mut out = Vec::new();
+    for &(i, stride) in carried {
+        let m = devp.get(i).ok_or_else(|| {
+            RuntimeError::Device(format!("carried-state tensor index {i} is out of range"))
+        })?;
+        if m.base == 0 || stride == 0 {
+            continue;
+        }
+        if m.base % 4 != 0 || stride % 4 != 0 {
+            return Err(RuntimeError::Device(format!(
+                "carried-state range {i} is not u32-aligned: base={:#x} stride={stride}",
+                m.base
+            )));
+        }
+        let mut off = 0;
+        while off < stride {
+            let bytes = (stride - off).min(STATE_CLEAR_CHUNK);
+            out.push(StateClearRange {
+                base: m.base + off,
+                slot_stride: stride,
+                words: u32::try_from(bytes / 4).map_err(|_| {
+                    RuntimeError::Device(format!("carried-state clear chunk is too large: {bytes}"))
+                })?,
+                _pad: 0,
+            });
+            off += bytes;
+        }
+    }
+    Ok(out)
+}
+
 /// One chunk of a prefill plan: which bucket program runs it, and over which
 /// absolute token range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3198,6 +3252,7 @@ pub struct AmdEngine {
     k_prefill: HsaKernel,
     k_decode: HsaKernel,
     k_xaudit: Option<HsaKernel>,
+    k_state_clear: Option<HsaKernel>,
     /// Task-13: low-rung decode tier ladder, ascending (max_rung, kernel).
     decode_tiers: Vec<(u32, HsaKernel)>,
     k_flash: Option<HsaKernel>,
@@ -3216,6 +3271,8 @@ pub struct AmdEngine {
     h_zero: HsaPinned,
     /// Pinned staging for a prefill program's whole instruction array.
     h_pf_inst: HsaPinned,
+    d_state_clear: Option<DeviceMem>,
+    n_state_clear: u32,
     /// Pristine host copy of each program's instructions. Prefill patching
     /// rebuilds from these every chunk: `c0` changes per chunk, so patches must
     /// not accumulate.
@@ -3696,6 +3753,8 @@ impl AmdEngine {
         let requires = build_requires(blob_path)?;
         let mut modules = Vec::new();
         let mut k_xaudit = None;
+        let mut k_state_clear = None;
+        let state_clear_device = crate::config::RuntimeConfig::get().amd.state_clear_device;
         // Task-13 per-rung co-load: an optional SECOND decode object for the low
         // rungs (PLOW_HSACO_LOWRUNG=<dir>), so rung 1-2 traffic runs the tight
         // single-slot codegen while wide rungs keep the batched object. Same
@@ -3870,6 +3929,16 @@ impl AmdEngine {
                             RuntimeError::Device(format!(
                             "{name}: compact TP audit requested but plow_xctr_audit is absent: {e}"
                         ))
+                        })?,
+                    );
+                }
+                if phase == Phase::Decode && state_clear_device && k_state_clear.is_none() {
+                    k_state_clear = Some(
+                        EngineDevice::get_function(&*be, &m, "plow_state_clear").map_err(|e| {
+                            RuntimeError::Device(format!(
+                                "{name}: device recurrent-state clear requested but \
+                                 plow_state_clear is absent: {e}. Rebuild the decode object"
+                            ))
                         })?,
                     );
                 }
@@ -4656,6 +4725,22 @@ impl AmdEngine {
             .map(|(i, t)| (i, t.bytes / batch as u64))
             .collect();
 
+        let clear_ranges = if state_clear_device {
+            state_clear_ranges(&devp, &carried_slot)?
+        } else {
+            Vec::new()
+        };
+        let n_state_clear = u32::try_from(clear_ranges.len())
+            .map_err(|_| RuntimeError::Device("too many recurrent-state clear ranges".into()))?;
+        let d_state_clear = if clear_ranges.is_empty() {
+            None
+        } else {
+            let bytes = std::mem::size_of_val(clear_ranges.as_slice()) as u64;
+            let d = EngineDevice::alloc(&*be, bytes)?;
+            EngineDevice::upload(&*be, &d, 0, as_bytes(&clear_ranges))?;
+            Some(d)
+        };
+
         if !carried_slot.is_empty() {
             tracing::info!(
                 tensors = carried_slot.len(),
@@ -4839,6 +4924,7 @@ impl AmdEngine {
             k_prefill,
             k_decode,
             k_xaudit,
+            k_state_clear,
             decode_tiers,
             k_flash,
             sched_prefill,
@@ -4848,6 +4934,8 @@ impl AmdEngine {
             h_scalar,
             h_zero,
             h_pf_inst,
+            d_state_clear,
+            n_state_clear,
             pf_src,
             kvrow,
             kvrow_i2,
@@ -5984,6 +6072,64 @@ impl AmdEngine {
     /// re-establishes it. Clearing it was always belt-and-braces; skipping it at `batch > 1`
     /// is strictly safer than clearing every live slot's rows.
     pub fn begin_slot(&mut self, seq: usize) -> Result<()> {
+        if self.k_state_clear.is_some() {
+            self.prepare_device_state_clear(seq)?;
+            self.enqueue_state_clear(seq)?;
+            return self.drain();
+        }
+        self.clear_state_serial(seq)
+    }
+
+    pub fn device_state_clear_enabled(&self) -> bool {
+        self.k_state_clear.is_some()
+    }
+
+    pub fn prepare_device_state_clear(&mut self, seq: usize) -> Result<()> {
+        if seq >= self.batch {
+            return Err(RuntimeError::Device(format!(
+                "prepare_device_state_clear {seq} past batch {}",
+                self.batch
+            )));
+        }
+        if let Some(v) = &self.vmm {
+            v.begin_seq(seq);
+            v.ensure_rows(seq, 1)?;
+        }
+        Ok(())
+    }
+
+    pub fn enqueue_state_clear(&self, seq: usize) -> Result<()> {
+        if seq >= self.batch {
+            return Err(RuntimeError::Device(format!(
+                "enqueue_state_clear {seq} past batch {}",
+                self.batch
+            )));
+        }
+        let Some(k) = self.k_state_clear else {
+            return Err(RuntimeError::Device(
+                "device recurrent-state clear kernel was not loaded".into(),
+            ));
+        };
+        let Some(ranges) = &self.d_state_clear else {
+            return Ok(());
+        };
+        let arg = StateClearArgs {
+            ranges: ranges.base,
+            n_ranges: self.n_state_clear,
+            slot: seq as u32,
+        };
+        EngineDevice::launch_kernel(
+            &*self.be,
+            k,
+            self.n_state_clear,
+            256,
+            0,
+            as_bytes(std::slice::from_ref(&arg)),
+            None,
+        )
+    }
+
+    fn clear_state_serial(&mut self, seq: usize) -> Result<()> {
         if seq >= self.batch {
             return Err(RuntimeError::Device(format!(
                 "begin_slot {seq} past batch {}",
@@ -6525,6 +6671,26 @@ fn kernarg_bytes(p: &DevProgram) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_clear_ranges_cover_each_slot_stride_once() {
+        let devp = vec![
+            DeviceMem::view(0x1000, 3 * STATE_CLEAR_CHUNK),
+            DeviceMem::view(0x20_0000, 24 * 1024),
+        ];
+        let ranges =
+            state_clear_ranges(&devp, &[(0, 3 * STATE_CLEAR_CHUNK), (1, 24 * 1024)]).unwrap();
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(ranges[0].base, 0x1000);
+        assert_eq!(ranges[2].base, 0x1000 + 2 * STATE_CLEAR_CHUNK);
+        assert!(ranges[..3]
+            .iter()
+            .all(|r| r.slot_stride == 3 * STATE_CLEAR_CHUNK));
+        assert_eq!(
+            ranges.iter().map(|r| r.words as u64 * 4).sum::<u64>(),
+            3 * STATE_CLEAR_CHUNK + 24 * 1024
+        );
+    }
 
     #[test]
     fn tp_counter_banks_are_clean_on_first_use_and_alternate() {

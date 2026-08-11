@@ -285,6 +285,7 @@ nix develop --command env \
   PLOW_L2_PLACE_DISPATCH=1 \
   PLOW_TP_AUDIT_COMPACT=1 \
   PLOW_CTR_DBUF=1 \
+  PLOW_STATE_CLEAR_DEVICE=1 \
   PLOW_HSACO_LOWRUNG=/home/lava/plow/build-amd/k3-b1-ladder-grouped:1,/home/lava/plow/build-amd/k3-b2-ladder-grouped:2,/home/lava/plow/build-amd/k3-b4-ladder-grouped:4,/home/lava/plow/build-amd/k3-b8-ladder-grouped:8 \
   PLOW_DSTEP_LOG=1 \
   PLOW_DSTEP_EVERY=64 \
@@ -296,7 +297,9 @@ nix develop --command env \
 
 `PLOW_DSTEP_*` is diagnostic and may be removed after reproduction. Keep the
 placement, compact audit, and counter-double-buffer flags explicit in measured
-runs. The runtime chooses the narrowest rung covering the highest occupied
+runs. `PLOW_STATE_CLEAR_DEVICE=1` requires decode objects built from this tree;
+it replaces 276 host-staged recurrent-state fills per rank with one local-HBM
+kernel. The runtime chooses the narrowest rung covering the highest occupied
 slot; slots are never compacted or moved. The admission controller widens on
 backlog/SLO pressure and narrows with hysteresis.
 

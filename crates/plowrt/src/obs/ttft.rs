@@ -73,6 +73,7 @@ pub static ENCODE: Phase = Phase::new("tokenize (HF BPE)");
 pub static QUEUE: Phase = Phase::new("queue: submit -> prefill call");
 
 /// Inside `AmdServe::prefill` / `AmdTpGroup::prefill`.
+pub static PF_STATE_CLEAR: Phase = Phase::new("  begin_slot (recurrent-state clear)");
 pub static PF_PLAN: Phase = Phase::new("  plan_chunks + chunk_steps");
 pub static PF_PREPARE: Phase = Phase::new("  prefill_prepare (ids/pos/patch upload)");
 pub static PF_REARM: Phase = Phase::new("  rearm_prog (counter zeroing)");
@@ -92,6 +93,7 @@ const PHASES: &[&Phase] = &[
     &ENCODE,
     &QUEUE,
     &PREFILL,
+    &PF_STATE_CLEAR,
     &PF_PLAN,
     &PF_PREPARE,
     &PF_REARM,

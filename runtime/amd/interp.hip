@@ -88,6 +88,19 @@ typedef struct {
     uint32_t* status;
 } PlowXAuditArgs;
 
+typedef struct {
+    uint64_t base;
+    uint64_t slot_stride;
+    uint32_t words;
+    uint32_t _pad;
+} PlowStateClearRange;
+
+typedef struct {
+    const PlowStateClearRange* ranges;
+    uint32_t n_ranges;
+    uint32_t slot;
+} PlowStateClearArgs;
+
 #if !defined(PLOW_BUCKET_FLASH)
 /* PLOW_DOP_XREDUCE_ADD_NORM (116): fused TP all-reduce + residual + RMSNorm, one
  * workgroup. Same rendezvous as d_xreduce_mega; then d_add_norm's math with the `b`
@@ -3740,4 +3753,14 @@ extern "C" __global__ void plow_xctr_audit(PlowXAuditArgs a) {
                 atomicCAS(a.status, 0u, 0xA0000000u | (gate & 0x000FFFFFu));
         }
     }
+}
+
+/* Admission-time clear for slot-major recurrent state. One block owns one
+ * load-time range; ranges are chunked so large KDA states cannot strand CUs. */
+extern "C" __global__ void plow_state_clear(PlowStateClearArgs a) {
+    const uint32_t r = blockIdx.x;
+    if (r >= a.n_ranges) return;
+    const PlowStateClearRange d = a.ranges[r];
+    uint32_t* p = (uint32_t*)(d.base + (uint64_t)a.slot * d.slot_stride);
+    for (uint32_t i = threadIdx.x; i < d.words; i += blockDim.x) p[i] = 0;
 }
