@@ -29,7 +29,7 @@ require_nix_tool jq
 require_nix_tool curl
 
 VLLM_VERSION="$(python3 -c 'import importlib.metadata; print(importlib.metadata.version("vllm"))')"
-[ "$VLLM_VERSION" = 0.26.0 ] || fail "expected flake-pinned vLLM 0.26.0, got $VLLM_VERSION"
+[ "$VLLM_VERSION" = 0.27.0 ] || fail "expected flake-pinned vLLM 0.27.0, got $VLLM_VERSION"
 
 BASE_URL="${PLOW_K3_BASE_URL:-http://127.0.0.1:8018}"
 MODEL="${PLOW_K3_MODEL:-k3_farm}"

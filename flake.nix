@@ -16,7 +16,7 @@
         inherit system;
         config = {
           allowUnfree = true;
-          permittedInsecurePackages = [ "python3.13-vllm-0.26.0" ];
+          permittedInsecurePackages = [ "python3.13-vllm-0.27.0" ];
         };
       };
 
@@ -470,17 +470,34 @@
         #   nix develop .#vllm
         // pkgs.lib.optionalAttrs isGpuHost {
           vllm = let
+            xgrammarClient = pkgs.python3Packages.xgrammar.overridePythonAttrs (old: {
+              version = "0.2.3";
+              src = pkgs.fetchFromGitHub {
+                owner = "mlc-ai";
+                repo = "xgrammar";
+                tag = "v0.2.3";
+                fetchSubmodules = true;
+                hash = "sha256-bznSz1fOCCGFR3NsuXm5eWo7EXrvBrFavEllC5+vDHM=";
+              };
+              patches = [ ];
+              doCheck = false;
+              build-system = old.build-system ++ [ pkgs.python3Packages.apache-tvm-ffi ];
+              dependencies = old.dependencies ++ [
+                pkgs.python3Packages.apache-tvm-ffi
+                pkgs.python3Packages.typing-extensions
+              ];
+            });
             # `vllm bench serve` is a pure HTTP client. Building vLLM's CPU
             # execution extension is unnecessary here and currently fails
             # against nixpkgs' newer Torch API. Keep the upstream Python client
             # and its declared dependencies, but omit only the server extension.
             vllmClient = pkgs.python3Packages.vllm.overridePythonAttrs (old: {
-              version = "0.26.0";
+              version = "0.27.0";
               src = pkgs.fetchFromGitHub {
                 owner = "vllm-project";
                 repo = "vllm";
-                rev = "v0.26.0";
-                hash = "sha256-jFzV6vQX88FhemF98HmT5j3t6Trj5lXVlym4WD/X+Kw=";
+                rev = "v0.27.0";
+                hash = "sha256-ksKzkMDZGbqramOydhW49DU+p4lBteaAvvTKEjHfEAs=";
               };
               patches = [ ];
               postPatch = "";
@@ -489,19 +506,22 @@
               dontBuild = true;
               doCheck = false;
               pythonImportsCheck = [ ];
+              dependencies = map
+                (dep: if (dep.pname or "") == "xgrammar" then xgrammarClient else dep)
+                old.dependencies;
               installPhase = ''
                 runHook preInstall
                 site="$out/${pkgs.python3.sitePackages}"
-                mkdir -p "$site" "$site/vllm-0.26.0.dist-info" "$out/bin"
+                mkdir -p "$site" "$site/vllm-0.27.0.dist-info" "$out/bin"
                 cp -r vllm "$site/"
                 cat > "$site/vllm/_version.py" <<'EOF'
-                __version__ = "0.26.0"
-                __version_tuple__ = (0, 26, 0)
+                __version__ = "0.27.0"
+                __version_tuple__ = (0, 27, 0)
                 EOF
-                cat > "$site/vllm-0.26.0.dist-info/METADATA" <<'EOF'
+                cat > "$site/vllm-0.27.0.dist-info/METADATA" <<'EOF'
                 Metadata-Version: 2.1
                 Name: vllm
-                Version: 0.26.0
+                Version: 0.27.0
                 EOF
                 cat > "$out/bin/vllm" <<'EOF'
                 #!/usr/bin/env python3

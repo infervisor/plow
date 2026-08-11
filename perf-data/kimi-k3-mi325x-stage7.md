@@ -66,8 +66,8 @@ gates; see `perf-data/kimi-k3-mi325x-b8-serve.md`.
 
 The official K3 recipe now exists at
 `https://recipes.vllm.ai/moonshotai/Kimi-K3?hardware=mi325x`. It requires a
-K3-enabled vLLM 0.27.0+ nightly engine; vLLM 0.26.0 remains the matched
-benchmark client. The published AMD image is
+K3-enabled vLLM 0.27.0+ nightly engine. The Nix benchmark client is now pinned
+to vLLM 0.27.0 as well. The published AMD image is
 `vllm/vllm-openai-rocm:kimi-k3`, currently
 `sha256:5aa7e626ff73672f5ca7aae46754570488c23d33ca1ac90756a1d2d1a3fe099b`
 (14.53 GB compressed). The AMD profile enables AITER, SiTUv2 A8W4, and
