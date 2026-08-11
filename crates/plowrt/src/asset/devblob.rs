@@ -82,16 +82,15 @@ pub struct DevTp {
     /// TP degree the blob was compiled for (`XReduce.i[1]`). Always `> 1`:
     /// a tp=1 blob emits no collective, so it has no [`DevTp`] at all.
     pub n_gpu: u32,
-    /// Model hidden size (`XReduce.i[0]`, decode's `t·hidden` at `t == 1`).
-    /// Sizes the all-reduce message and hence the peer region.
+    /// Model hidden size (`collective.i[0] / program.t`). Sizes the all-reduce
+    /// message and hence the peer region.
     pub hidden: u32,
     /// Byte offset of partial slot B within the peer region — `max(i[2])` over
     /// the program's collectives, since slot A carries `i[2] == 0`.
     ///
     /// `devgen` computes it as `rows_max·hidden·2` where `rows_max` is the
     /// LARGEST prefill chunk, and bakes that same value into every bucket AND
-    /// the decode program. So decode's copy is authoritative for the whole
-    /// blob, which is why scanning one program is enough.
+    /// the decode program.
     pub slot_bytes: u64,
 }
 
@@ -165,9 +164,9 @@ fn take<T: Copy>(buf: &[u8], off: &mut usize, n: usize, what: &str) -> Result<Ve
 /// The three fields come from different places on purpose:
 ///
 /// * `n_gpu` — `i[1]`, identical on every collective.
-/// * `hidden` — `i[0]` of a ONE-SHOT [`DevOp::XReduce`] only. Decode compiles at
-///   `t == 1`, so there `i[0] == hidden`; prefill's two-shot carries
-///   `t·hidden`, and reading hidden from it would be wrong by the chunk size.
+/// * `hidden` — `i[0] / program.t` for every collective. Both one-shot and
+///   two-shot packets carry `t·width`; the maximum width is the model hidden
+///   size when narrower latent collectives are also present.
 /// * `slot_bytes` — `max(i[2])`, because slot A carries 0 and slot B carries the
 ///   offset. `devgen` derives it from the LARGEST prefill chunk and bakes the
 ///   same value into every program, so the max over all of them is that one
@@ -176,25 +175,11 @@ fn recover_tp(progs: &[DevProg]) -> Option<DevTp> {
     let (mut n_gpu, mut hidden, mut slot_bytes) = (0u32, 0u32, 0u64);
     for p in progs {
         for d in &p.insts {
-            let one_shot = d.op == DevOp::XReduce as u16;
-            if !one_shot && d.op != DevOp::XReduceTwoShot as u16 {
+            if d.op != DevOp::XReduce as u16 && d.op != DevOp::XReduceTwoShot as u16 {
                 continue;
             }
             n_gpu = n_gpu.max(d.i[1]);
-            if one_shot {
-                // PER ROW, not per message. `i[0]` is `t * width`, and this used to read it
-                // as the width outright — correct only while the one-shot was DECODE's alone
-                // (`emit_xreduce` picked the two-shot for every t > 1) and t was therefore
-                // always 1. Kimi-K3's shared-expert reduce carries a folded all-gather, which
-                // the two-shot's decomposition cannot express, so it stays one-shot on BOTH
-                // phases — and the widest prefill bucket then reported `hidden` as
-                // `8192 * 7168`. Dividing by the program's own `t` is right for every case
-                // and needs no phase test: decode divides by 1.
-                //
-                // The max over the result is what picks `hidden` out of a model with narrower
-                // collectives — K3 also reduces the expert combine at its 3584-wide LATENT.
-                hidden = hidden.max(d.i[0] / p.t.max(1));
-            }
+            hidden = hidden.max(d.i[0] / p.t.max(1));
             slot_bytes = slot_bytes.max(d.i[2] as u64);
         }
     }
@@ -840,8 +825,8 @@ mod tests {
         assert_eq!(b.tp, None);
     }
 
-    /// Decode's one-shot is where `hidden` comes from: at `t == 1`, `i[0]` IS
-    /// the hidden size. `slot_bytes` is `max(i[2])` because slot A carries 0.
+    /// At decode `t == 1`, `i[0]` is the hidden size directly. `slot_bytes` is
+    /// `max(i[2])` because slot A carries 0.
     #[test]
     fn a_sharded_decode_blob_describes_itself() {
         let mut m = tiny_model();
@@ -853,16 +838,15 @@ mod tests {
         assert_eq!(tp.slot_bytes, 5376 * 2, "max(i[2]), since slot A is 0");
     }
 
-    /// PREFILL's two-shot carries `i[0] = t·hidden`, so reading `hidden` from it
-    /// would be wrong by the chunk size — 1024x here. Only the one-shot may
-    /// supply it, and `slot_bytes` still comes from the max across BOTH.
+    /// Both collective forms carry `i[0] = t·hidden`, so dividing by the
+    /// program row count recovers hidden from either form.
     #[test]
-    fn prefills_two_shot_never_supplies_hidden() {
+    fn two_shot_supplies_hidden() {
         let h = 5376u32;
-        let slot_b = 1024 * h * 2; // devgen: rows_max * hidden * 2
+        let slot_b = 128 * h * 2; // tiny_model's largest program is 128 rows
         let mut m = tiny_model();
         let dp = m.progs.len() - 1;
-        with_xreduce(&mut m, 0, false, 4, 1024 * h, slot_b); // prefill bucket
+        with_xreduce(&mut m, 0, false, 4, 128 * h, slot_b); // prefill bucket
         with_xreduce(&mut m, dp, true, 4, h, slot_b); // decode
 
         let tp = DevBlob::parse(&m.to_blob()).unwrap().tp.expect("sharded");
@@ -876,13 +860,10 @@ mod tests {
         // A prefill-only asset is just as unloadable on one GPU, so the scan
         // must see it even with no decode collective to fall back on.
         let mut pf = tiny_model();
-        with_xreduce(&mut pf, 0, false, 2, 1024 * h, slot_b);
+        with_xreduce(&mut pf, 0, false, 2, 128 * h, slot_b);
         let only = DevBlob::parse(&pf.to_blob()).unwrap().tp.expect("sharded");
         assert_eq!((only.n_gpu, only.slot_bytes), (2, slot_b as u64));
-        assert_eq!(
-            only.hidden, 0,
-            "unrecoverable from two-shot alone, not guessed"
-        );
+        assert_eq!(only.hidden, h, "two-shot supplies t*hidden");
     }
 
     /// A v7 blob must be DISCOVERED, parsed, and its recipes materialised.

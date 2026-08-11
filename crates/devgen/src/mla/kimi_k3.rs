@@ -937,11 +937,17 @@ pub(crate) fn k3_emit_full(
     // legitimately uncovered, and without this every truncated emit would read as "an
     // architecture this emitter does not implement".
     let truncated = (layers.len() as u32) < c.layers;
+    let covered_layers = truncated.then(|| {
+        let first = *layers.first().expect("K3 emits at least one layer") as usize;
+        let end = *layers.last().expect("K3 emits at least one layer") as usize + 1;
+        assert_eq!(layers.len(), end - first, "K3 layer selection must be contiguous");
+        first..end
+    });
     match crate::checkpoint::validate_coverage(
         dir,
         K3_PREFIX,
         &m.tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
-        truncated.then(|| 0..layers.len()),
+        covered_layers,
         K3_INDIRECT,
         K3_PAIRED,
         K3_SYNTHESIZED,
@@ -1027,12 +1033,16 @@ const K3_INDIRECT: &[&str] = &[
 ];
 
 fn k3_emit_layers(c: &K3Cfg) -> Vec<u32> {
-    let (full, cap, _single) = emit_config::active().k3_layer_cfg();
-    let nl = if full {
-        cap.unwrap_or(c.layers).min(c.layers)
-    } else {
-        cap.unwrap_or(c.layers).min(c.layers)
-    };
+    let (_full, cap, single) = emit_config::active().k3_layer_cfg();
+    if let Some(layer) = single {
+        assert!(
+            layer < c.layers,
+            "--k3-layers single:{layer} is outside the model's {} layers",
+            c.layers
+        );
+        return vec![layer];
+    }
+    let nl = cap.unwrap_or(c.layers).min(c.layers);
     (0..nl).collect()
 }
 

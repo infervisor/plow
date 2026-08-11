@@ -80,7 +80,10 @@ echo "=== CHECK A: $B copies of one prompt must give $B identical streams ==="
 same=""
 for _ in $(seq 1 "$B"); do same="${same:+$same;}$P1"; done
 mapfile -t A < <(run "identical" "$BLOB" "$HSACO" "$same" --batched)
-if [ "${#A[@]}" -eq 0 ]; then
+if grep -qE '^Error:| ERROR |>>> .*FAIL' /tmp/k3bg_identical.log; then
+  echo "  decode command failed — see /tmp/k3bg_identical.log"
+  echo ">>> CHECK A: FAIL"; A_OK=1
+elif [ "${#A[@]}" -eq 0 ]; then
   echo "  NO STREAMS PARSED — see /tmp/k3bg_identical.log"
   grep -viE "^\[2m|dev shell|lean tool|amd gpu" /tmp/k3bg_identical.log | tail -4
   echo ">>> CHECK A: INCONCLUSIVE"; A_OK=2
@@ -90,8 +93,14 @@ elif [ "${#A[@]}" -ne "$B" ]; then
 else
   uniq_n=$(printf '%s\n' "${A[@]}" | sort -u | wc -l)
   printf '  %s\n' "${A[@]}"
-  [ "$uniq_n" -eq 1 ] && { echo ">>> CHECK A: PASS ($B identical)"; A_OK=0; } \
-                      || { echo ">>> CHECK A: FAIL — $uniq_n distinct streams; a slot is reading another's state"; A_OK=1; }
+  if ! printf '%s\n' "${A[@]}" | grep -Eq '[1-9]'; then
+    echo ">>> CHECK A: FAIL — every generated token is zero; identical dead streams are not correctness"
+    A_OK=1
+  elif [ "$uniq_n" -eq 1 ]; then
+    echo ">>> CHECK A: PASS ($B identical)"; A_OK=0
+  else
+    echo ">>> CHECK A: FAIL — $uniq_n distinct streams; a slot is reading another's state"; A_OK=1
+  fi
 fi
 
 echo
@@ -111,10 +120,14 @@ mapfile -t BATCHED < <(run "ragged" "$BLOB" "$HSACO" "$spec" --batched)
 mapfile -t ALT < <(run "ragged_alt" "$ALT_BLOB" "$ALT_HSACO" "$spec" --batched)
 B_OK=0
 n=$(( ${#BATCHED[@]} < ${#ALT[@]} ? ${#BATCHED[@]} : ${#ALT[@]} ))
-if [ "${#BATCHED[@]}" -ne "$B" ]; then
+if grep -qE '^Error:| ERROR |>>> .*FAIL' /tmp/k3bg_ragged.log /tmp/k3bg_ragged_alt.log; then
+  echo "  a decode command failed — see /tmp/k3bg_ragged{,_alt}.log"; B_OK=1
+elif [ "${#BATCHED[@]}" -ne "$B" ]; then
   echo "  expected $B streams from the primary build, got ${#BATCHED[@]}"; B_OK=1
 elif [ "$n" -lt 2 ]; then
   echo "  alt build produced $n comparable streams — nothing to compare"; B_OK=1
+elif ! printf '%s\n' "${BATCHED[@]}" "${ALT[@]}" | grep -Eq '[1-9]'; then
+  echo "  every generated token is zero — cross-width agreement is vacuous"; B_OK=1
 else
   echo "  comparing $n slots ($B-wide vs ${#ALT[@]}-wide)"
   for i in $(seq 0 $((n-1))); do

@@ -285,8 +285,7 @@ impl AmdTpGroup {
         }
         if tp.hidden == 0 {
             return Err(RuntimeError::Device(
-                "packet has no one-shot XReduce, so its hidden size is unrecoverable — \
-                 a decode program is required to size the peer region"
+                "packet collective has zero width, so its hidden size is unrecoverable"
                     .into(),
             ));
         }
