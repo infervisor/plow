@@ -290,7 +290,11 @@ pub struct KdaState {
     pub conv_state_alt: Option<[u32; 3]>,
     /// `in.pos`, whose parity selects the source bank without another host upload.
     pub bank_pos: Option<u32>,
+    /// Shared rotating-bank selector for speculative target verification.
+    pub journal_commit: Option<u32>,
 }
+
+pub const KDA_JOURNAL_BANKS: u64 = 9;
 
 /// Declare the carried state for one KDA layer. `prefix` is a COMPILER-owned namespace
 /// (`kv.`-style), not a checkpoint one: these are runtime buffers, not weights.
@@ -319,6 +323,32 @@ pub fn declare_kda_state(b: &mut Builder, c: &KdaCfg, prefix: &str, slots: u64) 
         ],
         conv_state_alt: None,
         bank_pos: None,
+        journal_commit: None,
+    }
+}
+
+pub fn declare_kda_state_journal(
+    b: &mut Builder,
+    c: &KdaCfg,
+    prefix: &str,
+    slots: u64,
+) -> KdaState {
+    assert_eq!(slots, 1, "KDA speculative journal is B1-only");
+    let commit = b.tensor("kv.spec_commit", 4);
+    let cw = c.proj() as u64 * c.conv_w as u64 * 4 * KDA_JOURNAL_BANKS;
+    KdaState {
+        state: b.tensor(
+            &format!("{prefix}state"),
+            c.state_elems() * 4 * KDA_JOURNAL_BANKS,
+        ),
+        conv_state: [
+            b.tensor(&format!("{prefix}conv_state.q"), cw),
+            b.tensor(&format!("{prefix}conv_state.k"), cw),
+            b.tensor(&format!("{prefix}conv_state.v"), cw),
+        ],
+        conv_state_alt: None,
+        bank_pos: None,
+        journal_commit: Some(commit),
     }
 }
 
@@ -755,6 +785,9 @@ fn emit_kda_mixer_ex(
             // `j[1]` (= `fj[2]`), the last free slot on this op. Read only when `j[0] != 0`,
             // which is exactly the seq-rows condition, so a non-batched blob is unchanged.
             d.j[1] = parked;
+            if let Some(commit) = st.journal_commit {
+                d.j[0] = commit;
+            }
         });
         // P9+P10 — the gate is computed inside the recurrence's LDS staging, where its only
         // consumer already is. `blocks` is the SAME `cus` the unfused step takes; that is the
@@ -777,6 +810,9 @@ fn emit_kda_mixer_ex(
             // bit1 (PLOW_KDA_F_SEQ_ROWS): the rows are INDEPENDENT SEQUENCES, so the recurrence
             // strides its carried state per row instead of threading them all through one.
             d.i[4] = 1 | if seq_rows { 2 } else { 0 };
+            if st.journal_commit.is_some() {
+                d.i[4] |= 4;
+            }
             d.i[5] = w.dt_bias;
             d.i[6] = gate_mode;
             // `i[7]`, the one free integer slot. Read only when the flags word carries
@@ -785,6 +821,7 @@ fn emit_kda_mixer_ex(
             d.i[7] = parked;
             d.f[0] = scale;
             d.f[1] = lower_bound;
+            d.j[1] = st.journal_commit.unwrap_or(0);
         })
     } else {
         // P8a-c — the three short convs, one per stream, each over H*D = 12288 channels and each

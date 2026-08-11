@@ -96,6 +96,7 @@ const PEER_ALIGN: u64 = XCTR_STRIDE as u64;
 ///   [slot_b]      partial_B   tokens·hidden·2 B   down   partial
 ///   [xctr_off]    xctr        n_xctr·128 B        cross-GPU counters
 ///   [xstatus_off] xstatus     128 B               compact-audit result
+///   [spec_off]    spec        128 B               shared speculative commit selector
 /// ```
 ///
 /// The layout is identical on every rank on purpose: a producer signalling peer
@@ -136,6 +137,8 @@ pub struct PeerLayout {
     xctr_off: u64,
     /// Byte offset of the compact-audit status line.
     xstatus_off: u64,
+    /// Byte offset of the group-wide speculative commit selector.
+    spec_commit_off: u64,
     /// Total peer-mapped bytes per rank.
     total: u64,
 }
@@ -187,7 +190,8 @@ impl PeerLayout {
         }
         let xctr_off = partial_bytes * PARTIAL_SLOTS;
         let xstatus_off = xctr_off + n_xctr as u64 * XCTR_STRIDE as u64;
-        let total = xstatus_off + XCTR_STRIDE as u64;
+        let spec_commit_off = xstatus_off + XCTR_STRIDE as u64;
+        let total = spec_commit_off + XCTR_STRIDE as u64;
         Some(PeerLayout {
             hidden,
             max_tokens,
@@ -195,6 +199,7 @@ impl PeerLayout {
             partial_bytes,
             xctr_off,
             xstatus_off,
+            spec_commit_off,
             total,
         })
     }
@@ -227,6 +232,11 @@ impl PeerLayout {
     /// Byte offset of the isolated compact-audit status line.
     pub fn xstatus_off(&self) -> u64 {
         self.xstatus_off
+    }
+
+    /// Byte offset of the selector shared by every rank's verifier packet.
+    pub fn spec_commit_off(&self) -> u64 {
+        self.spec_commit_off
     }
 
     fn xstate_bytes(&self) -> u64 {
@@ -861,6 +871,7 @@ mod tests {
         assert_eq!(l.xctr_off(), 3 * 3840 * 2);
         assert_eq!(l.xctr_bytes(), 96 * 128);
         assert_eq!(l.xstatus_off(), l.xctr_off() + l.xctr_bytes());
+        assert_eq!(l.spec_commit_off(), l.xstatus_off() + 128);
         assert!(l.bytes() < 48 * 1024, "peer footprint {} B", l.bytes());
     }
 
@@ -876,7 +887,7 @@ mod tests {
         assert_eq!(l.partial_off(1).unwrap(), 2048 * h as u64 * 2);
         assert_eq!(
             l.bytes(),
-            PARTIAL_SLOTS * 2048 * h as u64 * 2 + (192 + 1) * 128
+            PARTIAL_SLOTS * 2048 * h as u64 * 2 + (192 + 2) * 128
         );
         // ~84 MiB of peer VRAM: negligible next to weights, but three orders of
         // magnitude past the decode region — which is the whole reason

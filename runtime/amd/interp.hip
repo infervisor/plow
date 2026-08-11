@@ -1907,7 +1907,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                  ? (size_t)in->i[1] * in->i[2] * in->i[2]
                                  : (size_t)0,
                              /* op 102 predates the per-row mask and carries no slot for it. */
-                             nullptr);
+                             nullptr
+#if PLOW_K3_SPEC_VERIFY
+                             , nullptr
+#endif
+            );
             break;
 #endif
         case PLOW_DOP_KDA_GATED_NORM:
@@ -1936,6 +1940,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                         (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
                         (const float*)TEN(7), wv, cs[0], cs[1], cs[2], in->i[0], in->i[1],
                         in->i[2], in->i[3], slice, nblk,
+#if PLOW_K3_SPEC_VERIFY
+                        /* The verifier repurposes j0 from a stride into the shared journal
+                         * selector. Its dedicated object is symmetrically paired at load. */
+                        (size_t)0, nullptr, (const unsigned*)T[in->fj[1].u]
+#else
                         /* PER-ROW CONV-WINDOW STRIDE, carried in `fj[1].u` (= j[0]).
                          *
                          * NOT `i[4]`. All eight integer slots are operands on this op — the
@@ -1956,7 +1965,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                          * op. Gated on `fj[1].u != 0` — the per-row stride — because that is
                          * exactly the seq-rows condition the emitter sets both under, so a blob
                          * emitted before the mask existed reads no mask. */
-                        in->fj[1].u ? (const unsigned*)T[in->fj[2].u] : nullptr);
+                        in->fj[1].u ? (const unsigned*)T[in->fj[2].u] : nullptr
+#endif
+            );
             break;
         }
         case PLOW_DOP_KDA_STATE_STEP_G: {
@@ -1980,7 +1991,13 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                 * leaves i[7] at 0 there. */
                                (in->i[4] & PLOW_KDA_F_SEQ_ROWS)
                                    ? (const unsigned*)T[in->i[7]]
-                                   : nullptr);
+                                   : nullptr
+#if PLOW_K3_SPEC_VERIFY
+                               , (in->i[4] & PLOW_KDA_F_JOURNAL)
+                                     ? (const unsigned*)T[in->fj[2].u]
+                                     : nullptr
+#endif
+            );
             break;
         }
 #endif

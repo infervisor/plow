@@ -2729,7 +2729,9 @@ pub fn emit_k3_model(
         let kda_pair;
         let mla_w;
         let mixer = if is_kda(l) {
-            let state = if crate::emit_config::active().k3_kda_conv_step_db {
+            let state = if rows == RowKind::Verify {
+                crate::kda::declare_kda_state_journal(b, &kda_l, &format!("kv.{l}."), slots)
+            } else if crate::emit_config::active().k3_kda_conv_step_db {
                 crate::kda::declare_kda_state_db(b, &kda_l, &format!("kv.{l}."), slots, pos)
             } else {
                 crate::kda::declare_kda_state(b, &kda_l, &format!("kv.{l}."), slots)
@@ -4260,9 +4262,11 @@ mod tests {
         assert_eq!(tensor_bytes("act.logits"), 8 * 163840 * 2);
         assert_eq!(
             tensor_bytes("kv.0.state"),
-            12 * 128 * 128 * 4,
-            "one TP8-local recurrent state"
+            9 * 12 * 128 * 128 * 4,
+            "one committed plus eight candidate recurrent states"
         );
+        assert_eq!(tensor_bytes("kv.0.conv_state.q"), 9 * 12 * 128 * 4 * 4);
+        assert_eq!(tensor_bytes("kv.spec_commit"), 4);
         for step in p
             .insts
             .iter()
@@ -4270,6 +4274,15 @@ mod tests {
         {
             assert_eq!(step.i[0], 8);
             assert_eq!(step.i[4] & 2, 0, "rows must thread one serial state");
+            assert_ne!(step.i[4] & 4, 0, "serial state must be journaled");
+            assert_ne!(step.j[1], 0, "state step must name the commit selector");
+        }
+        for conv in p
+            .insts
+            .iter()
+            .filter(|inst| inst.op == DevOp::KdaConv3 as u16)
+        {
+            assert_ne!(conv.j[0], 0, "conv must name the commit selector");
         }
 
         let flash = p

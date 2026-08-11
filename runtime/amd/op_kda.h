@@ -49,6 +49,16 @@
 #ifndef PLOW_KDA_CONV_STEP_DB
 #define PLOW_KDA_CONV_STEP_DB 0
 #endif
+#define PLOW_KDA_F_JOURNAL 4u
+#define PLOW_KDA_JOURNAL_BANKS 9u
+
+#if PLOW_K3_SPEC_VERIFY
+#define PLOW_KDA_JOURNAL_PARAM , const unsigned* __restrict__ journal_commit
+#define PLOW_KDA_JOURNAL_ARG , journal_commit
+#else
+#define PLOW_KDA_JOURNAL_PARAM
+#define PLOW_KDA_JOURNAL_ARG
+#endif
 
 /* Gate activation modes, mirroring [fla]'s `safe_gate` switch (fla/ops/kda/gate.py:118-124). */
 enum { PLOW_KDA_GATE_SOFTPLUS = 0, PLOW_KDA_GATE_LOWER_BOUND = 1 };
@@ -116,7 +126,40 @@ __device__ __forceinline__ void kda_conv_range(bf16* __restrict__ out, const bf1
                                                float* __restrict__ state, unsigned T,
                                                unsigned conv_dim, unsigned W, unsigned act,
                                                unsigned c0, unsigned c1, size_t bstride,
-                                               const unsigned* __restrict__ parked) {
+                                               const unsigned* __restrict__ parked
+                                                   PLOW_KDA_JOURNAL_PARAM) {
+#if PLOW_K3_SPEC_VERIFY
+    if (journal_commit != nullptr) {
+        const unsigned committed = *journal_commit;
+        if (committed >= PLOW_KDA_JOURNAL_BANKS) __builtin_trap();
+        const size_t bank_elems = (size_t)conv_dim * W;
+        for (unsigned c = c0 + threadIdx.x; c < c1; c += PLOW_THREADS) {
+            float win[8], tap[8];
+            const unsigned width = W < 8 ? W : 8;
+            const float* source = state + (size_t)committed * bank_elems + (size_t)c * W;
+#pragma unroll
+            for (unsigned j = 0; j < 8; ++j) {
+                win[j] = j < width ? source[j] : 0.0f;
+                tap[j] = j < width ? w[(size_t)c * W + j] : 0.0f;
+            }
+            for (unsigned t = 0; t < T; ++t) {
+#pragma unroll
+                for (unsigned j = 0; j + 1 < 8; ++j) win[j] = win[j + 1];
+                win[width - 1] = bf2f(x[(size_t)t * conv_dim + c]);
+                float y = 0.0f;
+#pragma unroll
+                for (unsigned j = 0; j < 8; ++j) y += win[j] * tap[j];
+                st_act1(&out[(size_t)t * conv_dim + c], f2bf(act == 1u ? act_silu(y) : y));
+                const unsigned target_bank = (committed + 1u + t) % PLOW_KDA_JOURNAL_BANKS;
+                float* target = state + (size_t)target_bank * bank_elems + (size_t)c * W;
+#pragma unroll
+                for (unsigned j = 0; j < 8; ++j)
+                    if (j < width) target[j] = win[j];
+            }
+        }
+        return;
+    }
+#endif
     /* INDEPENDENT-SEQUENCE PATH. `bstride != 0` means the T rows are B separate sequences
      * (batched decode), so each row owns its own sliding window: load it, roll ONE token
      * through, store it back. The shared path below is the opposite and is the one every
@@ -192,7 +235,12 @@ __device__ void d_kda_conv(bf16* __restrict__ out, const bf16* __restrict__ x,
     const unsigned c0 = slice * chunk;
     unsigned c1 = c0 + chunk;
     if (c1 > conv_dim) c1 = conv_dim;
-    if (c0 < c1) kda_conv_range(out, x, w, state, T, conv_dim, W, act, c0, c1, bstride, nullptr);
+    if (c0 < c1)
+        kda_conv_range(out, x, w, state, T, conv_dim, W, act, c0, c1, bstride, nullptr
+#if PLOW_K3_SPEC_VERIFY
+                       , nullptr
+#endif
+        );
 }
 
 /* -------------------------------------------------------------------------------------------
@@ -225,7 +273,7 @@ __device__ void d_kda_conv3(bf16* __restrict__ oq, bf16* __restrict__ ok, bf16* 
                             float* __restrict__ sq, float* __restrict__ sk,
                             float* __restrict__ sv, unsigned T, unsigned C, unsigned W,
                             unsigned act, unsigned slice, unsigned nblk, size_t bstride,
-                            const unsigned* __restrict__ parked) {
+                            const unsigned* __restrict__ parked PLOW_KDA_JOURNAL_PARAM) {
     const unsigned total = 3u * C;
     const unsigned chunk = (total + nblk - 1) / nblk;
     const unsigned g0 = slice * chunk;
@@ -250,7 +298,8 @@ __device__ void d_kda_conv3(bf16* __restrict__ oq, bf16* __restrict__ ok, bf16* 
         const bf16* x = s == 0 ? xq : (s == 1 ? xk : xv);
         const float* w = s == 0 ? wq : (s == 1 ? wk : wv);
         float* st = s == 0 ? sq : (s == 1 ? sk : sv);
-        kda_conv_range(o, x, w, st, T, C, W, act, a, b, bstride, parked);
+        kda_conv_range(o, x, w, st, T, C, W, act, a, b, bstride, parked
+                           PLOW_KDA_JOURNAL_ARG);
     }
 }
 
@@ -371,7 +420,7 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                                    float* __restrict__ state, unsigned T, unsigned H, unsigned D,
                                    unsigned BV, unsigned flags, float scale, unsigned slice,
                                    unsigned nblk, float* __restrict__ lds, size_t bstride,
-                                   const unsigned* __restrict__ parked) {
+                                   const unsigned* __restrict__ parked PLOW_KDA_JOURNAL_PARAM) {
     const unsigned lane = threadIdx.x & (PLOW_WAVE - 1);
     const unsigned wave = threadIdx.x >> 6;
     const unsigned ntile = D / BV; /* column tiles per head */
@@ -392,6 +441,13 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
      * first was the per-row STRIDE without the axis. */
     const unsigned trep = bstride ? T : 1u;
     const unsigned nitem = items * trep;
+#if PLOW_K3_SPEC_VERIFY
+    const bool journal = (flags & PLOW_KDA_F_JOURNAL) != 0;
+    if (journal && journal_commit == nullptr) __builtin_trap();
+    const unsigned committed = journal ? *journal_commit : 0u;
+    if (journal && committed >= PLOW_KDA_JOURNAL_BANKS) __builtin_trap();
+    const size_t journal_stride = (size_t)H * D * D;
+#endif
 
     float* l_q = lds;         /* [D] */
     float* l_k = lds + D;     /* [D] */
@@ -415,7 +471,11 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
         /* TP8 prefill assigns exactly one value column to each wave. Keep that column's two
          * D=128 lane elements live across the serial token recurrence instead of round-tripping
          * them through HBM at every token. Independent decode rows must retain the per-row path. */
-        const bool resident = PL == 2 && !bstride && BV == PLOW_WAVES;
+        const bool resident = PL == 2 && !bstride && BV == PLOW_WAVES
+#if PLOW_K3_SPEC_VERIFY
+                              && !journal
+#endif
+            ;
         float resident_sc[PL];
         float* resident_col = nullptr;
         if (resident) {
@@ -487,6 +547,17 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                  * That distinction is invisible in `T` alone, which is why it is its own
                  * parameter and not inferred (see perf-data/k3-batched-decode-design.md §1). */
                 float* col = st_h + (size_t)t * bstride + (size_t)j * D; /* V-FIRST: [v][k] */
+                float* out_col = col;
+#if PLOW_K3_SPEC_VERIFY
+                if (journal) {
+                    const unsigned source_bank = (committed + t) % PLOW_KDA_JOURNAL_BANKS;
+                    const unsigned target_bank = (committed + 1u + t) % PLOW_KDA_JOURNAL_BANKS;
+                    col = state + (size_t)source_bank * journal_stride + (size_t)h * D * D +
+                          (size_t)j * D;
+                    out_col = state + (size_t)target_bank * journal_stride +
+                              (size_t)h * D * D + (size_t)j * D;
+                }
+#endif
 
                 /* decay, in registers: S' = exp(g) * S */
                 float sc[PL];
@@ -515,9 +586,9 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                     if (resident)
                         resident_sc[r] = sc[r];
                     else
-                        col[d] = sc[r];
+                        out_col[d] = sc[r];
 #else
-                    col[d] = sc[r];
+                    out_col[d] = sc[r];
 #endif
                     pq += sc[r] * l_q[d]; /* read the UPDATED state */
                 }
@@ -543,15 +614,15 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
     if (D == 128)                                                                                 \
         d_kda_state_step_t<2, GATE_>(o, q, k, v, g, beta, g_raw, beta_raw, a_log, dt_bias,        \
                                      gate_mode, lb, state, T, H, D, BV, flags, scale, slice,      \
-                                     nblk, lds, bstride, parked);                                                  \
+                                     nblk, lds, bstride, parked PLOW_KDA_JOURNAL_ARG);                           \
     else if (D == 64)                                                                             \
         d_kda_state_step_t<1, GATE_>(o, q, k, v, g, beta, g_raw, beta_raw, a_log, dt_bias,        \
                                      gate_mode, lb, state, T, H, D, BV, flags, scale, slice,      \
-                                     nblk, lds, bstride, parked);                                                  \
+                                     nblk, lds, bstride, parked PLOW_KDA_JOURNAL_ARG);                           \
     else if (D == 256)                                                                            \
         d_kda_state_step_t<4, GATE_>(o, q, k, v, g, beta, g_raw, beta_raw, a_log, dt_bias,        \
                                      gate_mode, lb, state, T, H, D, BV, flags, scale, slice,      \
-                                     nblk, lds, bstride, parked);
+                                     nblk, lds, bstride, parked PLOW_KDA_JOURNAL_ARG);
 
 __device__ void d_kda_state_step(bf16* __restrict__ o, const bf16* __restrict__ q,
                                  const bf16* __restrict__ k, const bf16* __restrict__ v,
@@ -559,7 +630,7 @@ __device__ void d_kda_state_step(bf16* __restrict__ o, const bf16* __restrict__ 
                                  float* __restrict__ state, unsigned T, unsigned H, unsigned D,
                                  unsigned BV, unsigned flags, float scale, unsigned slice,
                                  unsigned nblk, float* __restrict__ lds, size_t bstride,
-                                 const unsigned* __restrict__ parked) {
+                                 const unsigned* __restrict__ parked PLOW_KDA_JOURNAL_PARAM) {
     const bf16 *g_raw = nullptr, *beta_raw = nullptr;
     const float *a_log = nullptr, *dt_bias = nullptr;
     const unsigned gate_mode = 0;
@@ -579,7 +650,7 @@ __device__ void d_kda_state_step_g(bf16* __restrict__ o, const bf16* __restrict_
                                    float* __restrict__ state, unsigned T, unsigned H, unsigned D,
                                    unsigned BV, unsigned flags, float scale, unsigned slice,
                                    unsigned nblk, float* __restrict__ lds, size_t bstride,
-                                   const unsigned* __restrict__ parked) {
+                                   const unsigned* __restrict__ parked PLOW_KDA_JOURNAL_PARAM) {
     const float *g = nullptr, *beta = nullptr;
     PLOW_KDA_STEP_RUNGS(true)
 }
@@ -729,4 +800,6 @@ __device__ void d_kda_gated_norm(bf16* __restrict__ y, const bf16* __restrict__ 
     }
 }
 
+#undef PLOW_KDA_JOURNAL_ARG
+#undef PLOW_KDA_JOURNAL_PARAM
 #endif /* PLOW_OP_KDA_H */
