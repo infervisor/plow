@@ -62,11 +62,22 @@ nix develop --command env PLOW_STAGE4_CLEARED=1 PLOW_GPU=MI325X \
   /tmp/plow-gfx942-hsaco/interp_prefill_k3_moe_a4w4.elf 4096 4224 7168 k3-tp8
 ```
 
+The complete Kimi-K3 TP8 shape census uses the production FP8-KV/MXFP4 interpreter,
+holds one MI325X lease for the campaign, and publishes qualified rows only after all
+96 MXFP4 shapes pass:
+
+```bash
+nix develop --command env \
+  PLOW_GEMM_JSONL=/tmp/k3-mi325x-mxfp4-full.jsonl \
+  scripts/rebench_k3_mxfp4_gfx942.sh
+```
+
 ### gfx942 fused MXFP4 GLU experiment
 
 After Stages 1–3 pass, this compares production `GemmGluMxfp4` with the counter-gated
-production `GemmMxfp4 + GemmMxfp4 + Glu` program. Both arms use the gfx942 default
-192×256×64 tile and the runtime CU count. The harness requires at least ten samples, a
+production `GemmMxfp4 + GemmMxfp4 + Glu` program. Both arms use the same compiled gfx942 tile
+and the runtime CU count. Set `PLOW_GM_BM`, `PLOW_GM_BK`, and `PLOW_GM_DBUF` to the object's
+compiled geometry (defaults 192, 64, and 1). The harness requires at least ten samples, a
 full-output NaN sentinel check, a sampled f64 oracle, and JSONL provenance.
 
 ```bash
@@ -75,6 +86,7 @@ nix develop --command cmake --build runtime/build \
 
 nix develop --command env PLOW_STAGE4_CLEARED=1 PLOW_GPU=MI325X \
   PLOW_TOOLCHAIN_LABEL=rocm-7.14.0-nix PLOW_BUILD_ID=<git-revision> \
+  PLOW_GM_BM=192 PLOW_GM_BK=64 PLOW_GM_DBUF=1 \
   PLOW_LEASE_LABEL=k3-mxfp4-glu PLOW_GEMM_GLU_JSONL=/tmp/k3-mxfp4-glu.jsonl \
   perf-data/harness/gpulease -n 1 k3-mxfp4-glu \
   runtime/build/bench/interp_mxfp4_glu_gfx942 \

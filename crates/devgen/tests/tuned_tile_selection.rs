@@ -361,6 +361,31 @@ fn gfx942_measurements_reach_the_compiler() {
     );
 }
 
+#[test]
+fn gfx942_mi325x_mxfp4_measurements_reach_the_compiler() {
+    if !probe_available_942() {
+        eprintln!("SKIP: cannot probe the gfx942 inventory (no hipcc)");
+        return;
+    }
+    devgen::set_amd_target_for("gfx942", "MI325X");
+    let shapes = [(128, 4224, 7168), (4096, 4224, 7168), (8192, 7168, 4224)];
+    for (m, n, k) in shapes {
+        let rungs = gfx950_measured_rungs(m, n, k, kernelcaps::QuantScheme::Mxfp4);
+        assert!(rungs >= 5, "{m}x{n}x{k}: only {rungs} measured MXFP4 rungs");
+        assert_eq!(
+            devgen::gfx950_prefill_tile_tier(
+                m as u32,
+                n as u32,
+                k as u32,
+                304,
+                kernelcaps::QuantScheme::Mxfp4,
+            ),
+            kernelcaps::CalibrationTier::SkuCalibrated,
+            "{m}x{n}x{k}: compiler did not use the MI325X measurement",
+        );
+    }
+}
+
 fn probe_available_942() -> bool {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     kernelcaps::dense_gemm_inventory(&root, hwspec::IsaLevel::Gfx942).is_ok()

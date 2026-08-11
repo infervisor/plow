@@ -307,6 +307,9 @@ int main(int argc, char** argv) {
     const char* toolchain = getenv("PLOW_TOOLCHAIN_LABEL");
     const char* build_id = getenv("PLOW_BUILD_ID");
     const char* lease = getenv("PLOW_LEASE_LABEL");
+    const char* gm_bm_env = getenv("PLOW_GM_BM");
+    const char* gm_bk_env = getenv("PLOW_GM_BK");
+    const char* gm_dbuf_env = getenv("PLOW_GM_DBUF");
     if (!cleared || strcmp(cleared, "1") != 0) {
         fprintf(stderr, "REFUSED: set PLOW_STAGE4_CLEARED=1 only after Stages 1-3 pass\n");
         return 2;
@@ -324,10 +327,23 @@ int main(int argc, char** argv) {
     const unsigned n = (unsigned)strtoul(argv[3], NULL, 10);
     const unsigned kdim = (unsigned)strtoul(argv[4], NULL, 10);
     const unsigned nsamples = argc == 6 ? (unsigned)strtoul(argv[5], NULL, 10) : 15u;
+    const unsigned gm_bm = gm_bm_env ? (unsigned)strtoul(gm_bm_env, NULL, 10) : 192u;
+    const unsigned gm_bk = gm_bk_env ? (unsigned)strtoul(gm_bk_env, NULL, 10) : 64u;
+    const unsigned gm_dbuf = gm_dbuf_env ? (unsigned)strtoul(gm_dbuf_env, NULL, 10) : 1u;
     if (!m || !n || !kdim || kdim % 64u || nsamples < 10u || (uint64_t)m * n > UINT32_MAX) {
         fprintf(stderr, "REFUSED: nonzero M/N/K, K%%64==0, M*N<=u32, samples>=10 required\n");
         return 2;
     }
+    if (gm_bm != 64u && gm_bm != 128u && gm_bm != 192u) {
+        fprintf(stderr, "REFUSED: PLOW_GM_BM must be 64, 128, or 192\n");
+        return 2;
+    }
+    if ((gm_bk != 32u && gm_bk != 64u) || (gm_dbuf != 1u && gm_dbuf != 2u)) {
+        fprintf(stderr, "REFUSED: PLOW_GM_BK must be 32 or 64 and PLOW_GM_DBUF 1 or 2\n");
+        return 2;
+    }
+    char tile[32];
+    snprintf(tile, sizeof tile, "%ux256x%u", gm_bm, gm_bk);
     FILE* jf = fopen(jsonl, "a");
     if (!jf) {
         perror(jsonl);
@@ -450,7 +466,7 @@ int main(int argc, char** argv) {
     }
     const double fm = percentile(fused_ns, nsamples, 0.5);
     const double um = percentile(unfused_ns, nsamples, 0.5);
-    printf("gfx942 CUs=%u tile=192x256x64 M=%u N=%u K=%u samples=%u\n", ncu, m, n, kdim,
+    printf("gfx942 CUs=%u tile=%s M=%u N=%u K=%u samples=%u\n", ncu, tile, m, n, kdim,
            nsamples);
     printf("  fused   median %.4f ms p10 %.4f p90 %.4f\n", fm / 1e6,
            percentile(fused_ns, nsamples, 0.1) / 1e6, percentile(fused_ns, nsamples, 0.9) / 1e6);
@@ -471,10 +487,12 @@ int main(int argc, char** argv) {
     json_string(jf, gpu);
     fputs(",\"arch\":", jf);
     json_string(jf, arch);
+    fprintf(jf, ",\"cu_count\":%u,\"tile\":", ncu);
+    json_string(jf, tile);
     fprintf(jf,
-            ",\"cu_count\":%u,\"tile\":\"192x256x64\",\"object_bytes\":%ld,"
+            ",\"double_buffer\":%u,\"object_bytes\":%ld,"
             "\"object_fnv1a64\":\"%016llx\",\"object\":",
-            ncu, object_bytes, (unsigned long long)object_fnv1a);
+            gm_dbuf, object_bytes, (unsigned long long)object_fnv1a);
     json_string(jf, argv[1]);
     fputs(",\"kernel\":\"plow_interp_gfx942\",\"toolchain\":", jf);
     json_string(jf, toolchain);

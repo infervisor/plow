@@ -7,7 +7,7 @@
 //!
 //! MI300X and MI325X are the same compute die (304 CUs); they differ only in
 //! the HBM subsystem. Numbers are theoretical peaks from AMD's CDNA 3 / MI300
-//! datasheets.
+//! datasheets except where a sustained machine measurement is recorded explicitly.
 
 use crate::spec::{
     Arch, ChipletGrouping, GpuSpec, Interconnect, InterconnectKind, L2Partitioning,
@@ -95,8 +95,9 @@ pub const MI325X: GpuSpec = GpuSpec {
         kind: MemKind::Hbm3e,
         capacity: Bytes::gib(256),
         bandwidth: GBps(6000.0),
-        // Not measured on this part; a reported bound falls back to the datasheet peak.
-        bandwidth_measured: None,
+        // Median stream result over three clean 16 GB leased runs on this MI325X with the
+        // flake-pinned ROCm 7.14 toolchain (runtime/tests/decode_bw_probe.hip).
+        bandwidth_measured: Some(GBps(4164.0)),
         bus_width_bits: 8192,
     },
     copy_engines: 4, // SDMA engines (approx.)

@@ -3,32 +3,16 @@
 
 WHY THIS EXISTS RATHER THAN `--shapes auto`
 -------------------------------------------
-`plowc tune gemm --shapes auto` derives a campaign's shape list by RUNNING a real emit and reading
-back every `pick_tile` lookup, which is the only construction that cannot drift from the compiler.
-It does not work for K3, and the reason is recorded in the tree rather than guessed:
-`devgen::mla::kimi_k3_emit` is an analysis-and-refusal path, not an emitter. It prints
-
-    MISSING CAPABILITIES - 2 of them, ranked (blocker first).
-     1. full-model emit for a hybrid MLA arch - THE ONE REMAINING BLOCKER  [the whole blob]
-        ... `crates/devgen/src/k3.rs` and `crates/devgen/src/kda.rs` are reached by NOTHING
-        outside their own `#[cfg(test)]` modules ... No function composes them into even ONE
-        complete layer, and there is no loop over layers anywhere.
-
-and then panics. It never reaches a single `pick_tile`, so there is no demand log to read: `auto`
-returns "the emit asked the tuning store about no dense GEMM at all", which is that command
-correctly refusing to invent a campaign.
-
-WHEN THAT BLOCKER CLOSES, DELETE THIS FILE and switch `scripts/rebench_tune_gemm_all.sh` to
-`--shapes auto`. A generator is second best and this header should not outlive its reason.
+`plowc tune gemm --shapes auto` derives demand through the schedule-model path. K3's production
+path is the hybrid devblob emitter, while the schedule path remains an analysis/refusal path, so
+`auto` still cannot observe K3 demand. This generator is cross-checked against the emitted TP8
+`model.pkt`: every unique `Gemm*` `(N,K)` in prefill must appear below.
 
 SO WHAT IS THIS INSTEAD
 -----------------------
-The next best thing, and deliberately not a hand-typed list: every N and K below is COMPUTED from
-named `config.json` fields, and the shapes are read off `crates/nn-graph/src/models/kimi_k3.rs`'s
-graph builder -- the one place in the tree that does state K3's projections completely (`mla()`,
-`kda()`, `situ_mlp()`, `latent_moe()`). Change the config and the list moves with it. What it
-CANNOT catch is the emitter choosing to fuse, split or skip a projection, which is exactly the
-class of drift `auto` exists to close.
+Every N and K below is computed from named `config.json` fields and mirrors the production K3
+devblob emitter. Change the config and the list moves with it. The checked-in output is also
+validated against a real packet census so emitter fusion/splitting drift is visible.
 
 TP8 SHARDING, as the task's contract states it and as `nn-graph` computes it:
   * the HEAD axis shards by 8 -- MLA's `nh`, KDA's `num_heads`, and the widths derived from them
@@ -43,7 +27,7 @@ BOTH ENCODINGS AT EVERY SHAPE. The campaign measures `None` and `Mxfp4` over the
 "is mxfp4 faster than bf16 here" is a question the store can answer per shape rather than per
 model. It is not a rhetorical question -- the measured answer is no at some shapes.
 
-M LADDER: the shipping prefill buckets (512, 2048, 4096, 8192; `MAX_CHUNK = 8192` in
+M LADDER: the shipping prefill buckets (512, 1024, 2048, 4096, 8192; `MAX_CHUNK = 8192` in
 `plowrt/src/exec/amd.rs` filters anything above), plus 128. 128 is not a serving bucket; it is
 kept because it is the shape `op_gemm.h`'s own MXFP4 note is about -- "Kimi's mxfp4 kv_a_proj
 (M=128, N=576) ran at ~0.4% of peak: at that shape 256x256 is THREE tiles on 256 CUs" -- and it
@@ -56,7 +40,7 @@ import os
 import sys
 
 TP = 8
-M_LADDER = [128, 512, 2048, 4096, 8192]
+M_LADDER = [128, 512, 1024, 2048, 4096, 8192]
 QUANTS = ["None", "Mxfp4"]
 
 
@@ -64,7 +48,6 @@ def shapes(t):
     """Every (N, K, label) a K3 prefill layer asks `pick_tile` about, at TP8."""
     h = t["hidden_size"]
     nh = t["num_attention_heads"] // TP
-    qk_head = t["qk_nope_head_dim"] + t["qk_rope_head_dim"]
     v_head = t["v_head_dim"]
     q_lora, kv_lora = t["q_lora_rank"], t["kv_lora_rank"]
     lac = t["linear_attn_config"]
@@ -75,12 +58,13 @@ def shapes(t):
     dense = t["intermediate_size"] // TP
     out = [
         # --- MLA, 24 layers. `mla()` in nn-graph/src/models/kimi_k3.rs.
-        (q_lora, h, "mla-q-a"),                              # latent: not sharded
-        (nh * qk_head, q_lora, "mla-q-b"),                   # head axis on N
-        (kv_lora + t["qk_rope_head_dim"], h, "mla-kv-a"),    # latent: not sharded
-        (nh * (t["qk_nope_head_dim"] + v_head), kv_lora, "mla-kv-b"),
-        (nh * v_head, h, "mla-o-gate"),                      # K3's MLA output gate
-        (h, nh * v_head, "mla-o"),                           # head axis on K
+        (q_lora, h, "mla-q-a"),
+        (kv_lora, h, "mla-kv-a"),
+        (t["qk_rope_head_dim"], h, "mla-k-rope-down"),
+        (nh * kv_lora, q_lora, "mla-q-absorb"),
+        (nh * t["qk_rope_head_dim"], q_lora, "mla-q-rope"),
+        (nh * v_head, h, "mla-o-gate"),
+        (h, nh * v_head, "mla-o"),
         # --- KDA, 69 layers. `kda()`.
         (kda_inner, h, "kda-qkvg"),                          # q|k|v|g_proj, same shape
         (gate_rank, h, "kda-f-a"),                           # forget-gate rank: not sharded
@@ -90,7 +74,7 @@ def shapes(t):
         # --- Latent MoE, 92 layers. `latent_moe()`.
         (t["num_experts"], h, "moe-router"),                 # replicated
         (latent, h, "moe-latent-down"),                      # latent: not sharded
-        (h, latent, "moe-latent-up"),                        # latent: not sharded
+        (h // TP, latent, "moe-latent-up"),
         (shared, h, "moe-shared-gateup"),
         (h, shared, "moe-shared-down"),
         # --- Dense FFN, first_k_dense_replace layers. `situ_mlp()`.

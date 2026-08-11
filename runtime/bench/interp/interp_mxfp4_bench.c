@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
             fprintf(jf, ",\"m\":%u,\"n\":%u,\"k\":%u,\"quant\":\"Mxfp4\",\"label\":",
                     M, N, K);
             json_string(jf, label);
-            fprintf(jf, ",\"tile\":\"%ux%ux64\",\"symbol\":", rungs[r].bm, rungs[r].bn);
+            fprintf(jf, ",\"tile\":\"%ux%ux64\",\"sym\":", rungs[r].bm, rungs[r].bn);
             json_string(jf, rungs[r].symbol);
             fputs(",\"interpreter_symbol\":", jf);
             json_string(jf, interp_symbol);

@@ -18,6 +18,51 @@ endif()
 # AMD / ROCm path
 # ============================================================================
 if(PLOW_ROCM)
+    function(plow_rocm_code_object output source)
+        set(bundle "${output}.co")
+        add_custom_command(
+            OUTPUT ${output}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/ceiling
+            COMMAND ${PLOW_HSACO_HIPCC} --genco
+                    --offload-arch=${PLOW_HSACO_ARCH} -O3 -w
+                    -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                    -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                    -I ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+                    ${source} -o ${bundle}
+            COMMAND ${PLOW_HSACO_BUNDLER} --unbundle --type=o
+                    --targets=hipv4-amdgcn-amd-amdhsa--${PLOW_HSACO_ARCH}
+                    --input=${bundle} --output=${output}
+            COMMAND ${CMAKE_COMMAND} -E rm -f ${bundle}
+            DEPENDS ${source}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_arch.h
+            VERBATIM)
+    endfunction()
+
+    set(MFMA_RATE_ELF ${CMAKE_CURRENT_BINARY_DIR}/ceiling/mfma_rate.elf)
+    set(DECODE_BW_ELF ${CMAKE_CURRENT_BINARY_DIR}/ceiling/bw_probe.elf)
+    plow_rocm_code_object(${MFMA_RATE_ELF}
+                          ${CMAKE_CURRENT_SOURCE_DIR}/mfma_rate_gfx942.hip)
+    plow_rocm_code_object(${DECODE_BW_ELF}
+                          ${CMAKE_CURRENT_SOURCE_DIR}/../tests/decode_bw_probe.hip)
+    add_custom_target(ceiling_probe_objects DEPENDS ${MFMA_RATE_ELF} ${DECODE_BW_ELF})
+
+    add_executable(mfma_rate_test mfma_rate_test.c ../amd/hsa_backend.c)
+    add_executable(decode_bw_probe ../tests/decode_bw_probe.c ../amd/hsa_backend.c)
+    foreach(probe mfma_rate_test decode_bw_probe)
+        target_include_directories(${probe} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../common
+            ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        target_compile_definitions(${probe} PRIVATE _POSIX_C_SOURCE=199309L)
+        target_compile_options(${probe} PRIVATE -Wall -Wextra -Werror)
+        target_link_libraries(${probe} PRIVATE hsa-runtime64 m)
+        set_target_properties(${probe} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/ceiling)
+        add_dependencies(${probe} ceiling_probe_objects)
+    endforeach()
+    add_custom_target(ceiling_probes DEPENDS mfma_rate_test decode_bw_probe ceiling_probe_objects)
+
     # The benchmark code object includes the production op headers directly.
     # It compiles the EXACT same device code the interpreter runs.
     set(UBENCH_HIP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/bench_cu_gfx950.hip)
