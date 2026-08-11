@@ -88,6 +88,7 @@ was replaced before taking these measurements.
 | BK32 falsification arm | 3.640 ms | 6.249 ms | +1.53% | rejected |
 | MFMA priority disabled | 2.861 ms | 5.477 ms | -11.02% | neutral/noise vs hoist |
 | shipping rebuild | 2.882 ms | 5.497 ms | -10.69% | pass |
+| BM64 final-tile wave cull | 2.856 ms | 5.698 ms | -7.43% | rejected: pair +2.09% |
 
 The shipping change loads `row_partidx` and `row_gate` once at the tile head and distributes
 them with `ds_bpermute` during the DOWN epilogue. It is enabled only for K3 A4W4 gfx942 rows;
@@ -97,7 +98,10 @@ of its roof on GLU, but only 57.4 TFLOP/s and 11.3% on DOWN.
 BM64 padding expands 65,536 useful routes to 114,688 rows (1.75x). This is now the dominant
 known structural target: a ragged/sub-quantum grouped path can remove more work than another
 small instruction-level epilogue change. BK32 staging is not that design and regressed both
-arms.
+arms. A second falsification kept the 1,792 BM64 expert tiles and culled the lower wave on
+final tiles with at most 32 live rows, reducing executed MFMA rows to 86,016. Its FP64 gate
+passed, but GLU+DOWN rose from 8.379 to 8.554 ms, so the branch was removed rather than shipped.
+This confirms that weight/staging traffic, not padded MFMA issue alone, dominates this shape.
 
 The K3 artifact is a PLOWDEV bundle with its program ladder embedded in `model.pkt` and an
 intentionally empty `weights.json.buckets`. Generic `plowrt simulate --all-buckets` therefore

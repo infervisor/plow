@@ -169,7 +169,10 @@ int main(int argc, char** argv) {
     std::vector<int> meta(2 * NEXP + NEXP + 1);
     int* tilep = meta.data() + 2 * NEXP;
     for (unsigned e = 0, ro = 0, tp = 0; e <= NEXP; e++) {
-        if (e < NEXP) meta[e] = (int)ro;
+        if (e < NEXP) {
+            meta[e] = (int)ro;
+            meta[NEXP + e] = (int)real_rows[e];
+        }
         tilep[e] = (int)tp;
         if (e < NEXP) { ro += pad_rows[e]; tp += pad_rows[e] / BM; }
     }
