@@ -449,6 +449,9 @@
                 ps.torch
                 ps.safetensors
                 ps.numpy
+                # Kimi-K3 ships a tiktoken model; its tokenizer conversion
+                # verifies every sampled id against the reference decoder.
+                ps.tiktoken
                 # scripts/glm52_prep_full.py reads the checkpoint's config.json
                 # through `transformers.AutoConfig`. GLM-5.2's full-model weight
                 # repack is a ~750 GB CPU/IO job and this shell is where it runs;
