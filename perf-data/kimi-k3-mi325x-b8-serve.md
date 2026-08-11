@@ -40,10 +40,22 @@ tok/s for one stream; the B1 latency result remains 18.4 tok/s.
 
 Post-run audit found that the batched TP completion path performed full-vector
 rank agreement but bypassed the configured compact cross-GPU counter audit.
-These three measurements therefore are not production-adoption numbers. The
-runtime now factors drain+audit into the scalar and batched paths; its GPU gate
-reports one nonzero compact audit per step (~1.64 ms). The corrected serving
-result must replace this table before B8 is adopted.
+Those three measurements remain diagnostic. Commit `45851e1e` factors
+drain+audit into the scalar and batched paths; its GPU gate reports one nonzero
+compact audit per step (~1.64 ms).
+
+The corrected production runs used the same protocol with the compact audit
+enabled:
+
+| run | duration (s) | output tok/s | median TTFT (ms) | median TPOT (ms) | P99 ITL (ms) | success | output tokens |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 81.91 | 50.008 | 826.37 | 151.09 | 482.30 | 32/32 | 4096/4096 |
+| 2 | 81.79 | 50.082 | 828.06 | 150.58 | 483.00 | 32/32 | 4096/4096 |
+| 3 | 81.73 | 50.116 | 827.02 | 150.49 | 482.20 | 32/32 | 4096/4096 |
+
+Audited median output throughput is **50.082 tok/s**; range is
+50.008--50.116 tok/s. Every detailed result has 128 output tokens per request,
+an empty error, no in-band `[error:` text, and prompt+completion below 32,768.
 
 ```bash
 nix develop .#vllm --command vllm bench serve \

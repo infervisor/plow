@@ -58,7 +58,8 @@ generated tokens per run. See `perf-data/kimi-k3-mi325x-b8-serve.md`.
 This removes the capacity/context blocker. Stage 7 still requires B8 GSM8K,
 state-reuse/ragged correctness, and the same-box vLLM serving-engine comparator.
 
-Audit correction: the measured B8 path performed full-vector rank agreement
-but skipped the requested compact cross-GPU counter audit. The runtime path is
-fixed, but this capacity table is diagnostic until re-measured with the audit
-line executing once per decode step.
+Audit correction: the original B8 path performed full-vector rank agreement
+but skipped the requested compact cross-GPU counter audit. Commit `45851e1e`
+fixed the runtime path. Three corrected serving runs measure
+50.008--50.116 output tok/s with a 50.082 tok/s median and exact output/error
+gates; see `perf-data/kimi-k3-mi325x-b8-serve.md`.
