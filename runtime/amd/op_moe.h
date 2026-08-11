@@ -1999,10 +1999,9 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
  * scatter each live slot into its expert's contiguous gathered-row range. Pad rows are marked
  * PLOW_EXPERT_UNUSED so the A-gather zero-fills them and the DOWN scatter drops them.
  *
- * Single-workgroup and serial-prefix on thread 0 is not laziness: n_exp <= 512 and T*k is a few
- * thousand, so this is microseconds, and it must be ONE workgroup because the padded prefix is
- * a global scan. The 255 other CUs are gated behind it by the counter DAG exactly as they are
- * behind the decode router.
+ * This remains one workgroup because the padded prefix is a global scan. The generic path uses
+ * thread 0; K3 decode can enable a workgroup scan for its 896-expert table. Other CUs are gated
+ * behind it by the counter DAG exactly as they are behind the decode router.
  *
  * The scatter uses an LDS atomic cursor, so the row ORDER within an expert is not deterministic
  * across runs. That is safe HERE and only here: row_partidx carries each row's destination in
@@ -2053,6 +2052,9 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
  * `row_partidx[pos] = s == token` makes the DOWN scatter the identity, and `gate == 1` makes it
  * unscaled. The atomic-cursor row order is still nondeterministic and still does not matter,
  * for the same reason it does not matter above. */
+#ifndef PLOW_MOE_ALIGN_PAR_PREFIX
+#define PLOW_MOE_ALIGN_PAR_PREFIX 0
+#endif
 __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* row_token,
                                unsigned* row_partidx, float* row_gate, unsigned T, unsigned n_exp,
                                unsigned k, unsigned slice, unsigned* lds) {
@@ -2076,6 +2078,40 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
     }
     __syncthreads();
 
+#if PLOW_MOE_ALIGN_PAR_PREFIX
+    unsigned* scan = tot + 1; /* [PLOW_THREADS], after the existing align scratch */
+    const unsigned chunk = (n_exp + PLOW_THREADS - 1u) / PLOW_THREADS;
+    const unsigned begin = tid * chunk;
+    const unsigned end = begin + chunk < n_exp ? begin + chunk : n_exp;
+    unsigned thread_tiles = 0u;
+    for (unsigned e = begin; e < end; e++)
+        thread_tiles += (cnt[e] + MPF_BM - 1u) / MPF_BM;
+    scan[tid] = thread_tiles;
+    __syncthreads();
+
+    for (unsigned offset = 1u; offset < PLOW_THREADS; offset <<= 1u) {
+        const unsigned add = tid >= offset ? scan[tid - offset] : 0u;
+        __syncthreads();
+        scan[tid] += add;
+        __syncthreads();
+    }
+
+    unsigned tp = tid == 0 ? 0u : scan[tid - 1u];
+    int* rowoff = meta;
+    int* mcnt = meta + n_exp;
+    int* tilep = meta + 2u * n_exp;
+    for (unsigned e = begin; e < end; e++) {
+        tilep[e] = (int)tp;
+        rowoff[e] = (int)(tp * MPF_BM);
+        mcnt[e] = (int)cnt[e];
+        cur[e] = tp * MPF_BM;
+        tp += (cnt[e] + MPF_BM - 1u) / MPF_BM;
+    }
+    if (tid == PLOW_THREADS - 1u) {
+        tilep[n_exp] = (int)scan[tid];
+        *tot = scan[tid] * MPF_BM;
+    }
+#else
     if (tid == 0) {
         int* rowoff = meta;
         int* mcnt = meta + n_exp;
@@ -2091,6 +2127,7 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
         tilep[n_exp] = (int)tp;
         *tot = tp * MPF_BM;
     }
+#endif
     __syncthreads();
 
     const unsigned total_pad = *tot;
@@ -2109,7 +2146,7 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
         row_token[pos] = s / k;  /* source token row of xn2 */
         row_partidx[pos] = s;    /* destination row of part[T*k, H] == token*k + slot */
         /* gate == 1 under synthetic routing: a dense FFN applies no routing weight, and the DOWN
-         * op multiplies by this unconditionally. */
+ * op multiplies by this unconditionally. */
         row_gate[pos] = synth ? 1.0f : moe_slot_gate(table, s);
     }
 }
