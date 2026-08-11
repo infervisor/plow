@@ -556,6 +556,12 @@ impl AmdTpGroup {
         self.complete_decode()
     }
 
+    /// Run a decode-only block across all ranks without reading a sampled token.
+    pub fn decode_block_step(&mut self, pos: u32, kvlen: u32) -> Result<()> {
+        self.submit_decode(pos, kvlen)?;
+        self.drain_and_audit()
+    }
+
     /// One batched decode step across every rank: submit, drain, return the `pos.len()` sampled
     /// ids.
     ///
