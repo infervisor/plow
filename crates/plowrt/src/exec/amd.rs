@@ -2935,6 +2935,7 @@ pub struct ChunkStep {
 /// One program's device-resident tables.
 struct AmdProg {
     t: u32,
+    trace_records: usize,
     n_counter: u32,
     d_inst: DeviceMem,
     d_stream: DeviceMem,
@@ -3044,15 +3045,15 @@ pub struct AmdEngine {
     /// so dropping them would free the memory those tables point at.
     _expert_bufs: Vec<DeviceMem>,
 
-    /// Per-(workgroup, packet) `PlowTraceRec` buffer for the DECODE program,
+    /// Per-(workgroup, packet) `PlowTraceRec` buffer for the widest program,
     /// allocated only when `PLOW_TRACE_RAW` is set. The interpreter treats a
     /// null `trace` pointer as "tracing off" and then does not even read the
     /// clock, so an untraced build pays nothing for this field being here.
     ///
-    /// Decode only: it is the packet chain the protocol cost lives on, and a
-    /// prefill program's stream is an order of magnitude larger.
     d_trace: Option<DeviceMem>,
     trace_bytes: usize,
+    /// Extent of the last program dispatched into `d_trace`.
+    trace_write_bytes: Cell<usize>,
 
     k_prefill: HsaKernel,
     k_decode: HsaKernel,
@@ -4372,6 +4373,7 @@ impl AmdEngine {
             };
             progs.push(AmdProg {
                 t: p.t,
+                trace_records: p.stream.len(),
                 n_counter: p.n_counter,
                 d_inst,
                 d_stream,
@@ -4664,6 +4666,7 @@ impl AmdEngine {
             _expert_bufs: expert_bufs,
             d_trace,
             trace_bytes,
+            trace_write_bytes: Cell::new(0),
             k_prefill,
             k_decode,
             decode_tiers,
@@ -4811,7 +4814,13 @@ impl AmdEngine {
                 "trace buffer was not allocated — set PLOW_TRACE_RAW before loading".into(),
             ));
         };
-        let mut buf = vec![0u8; self.trace_bytes];
+        let bytes = self.trace_write_bytes.get();
+        if bytes == 0 || bytes > self.trace_bytes {
+            return Err(RuntimeError::Device(
+                "trace buffer has no completed program extent".into(),
+            ));
+        }
+        let mut buf = vec![0u8; bytes];
         EngineDevice::download(&*self.be, m, 0, &mut buf)?;
         std::fs::write(path, &buf)
             .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))
@@ -4935,6 +4944,8 @@ impl AmdEngine {
     /// mutating `cur_seg` between launches is safe — every packet has already
     /// captured its own copy.
     pub fn enqueue_segment(&mut self, p: usize, seg: usize) -> Result<()> {
+        self.trace_write_bytes
+            .set(self.progs[p].trace_records * TRACE_REC_BYTES);
         let use4 = self.k_flash.is_some() && self.progs[p].seg_class[seg] == 4;
         let (k, threads) = match (use4, self.k_flash) {
             (true, Some(kf)) => (kf, WG_THREADS_4),
@@ -4963,6 +4974,8 @@ impl AmdEngine {
     /// been dispatched to produce — reintroducing exactly the launched-collective
     /// latency the inline design exists to avoid.
     pub fn enqueue(&mut self, p: usize, k: HsaKernel) -> Result<()> {
+        self.trace_write_bytes
+            .set(self.progs[p].trace_records * TRACE_REC_BYTES);
         let arg = self.kernarg(p, 0);
         EngineDevice::launch_cooperative(
             &*self.be,

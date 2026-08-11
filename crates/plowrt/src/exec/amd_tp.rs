@@ -215,6 +215,7 @@ pub struct AmdTpGroup {
     /// SILENTLY wrong token, and one 12 KiB readback per rank is a cheap
     /// premium against that. `PLOW_TP_NO_AUDIT=1` turns it off for a timing run.
     audit: bool,
+    audit_direct: bool,
     /// Read EVERY rank's sampled id, rather than just rank 0's, once every this
     /// many decode tokens — see [`AmdTpGroup::audit_cadence`].
     agree_every: u32,
@@ -464,6 +465,7 @@ impl AmdTpGroup {
             reset: XctrReset::Host,
             gate_expect,
             audit: !crate::config::RuntimeConfig::get().amd.tp_no_audit,
+            audit_direct: crate::config::RuntimeConfig::get().amd.tp_audit_direct,
             agree_every,
             agree_tick: agree_every,
             // Overwritten by the first submit; the widest rung is the safe pre-first-step value.
@@ -715,7 +717,11 @@ impl AmdTpGroup {
             // report a timeout on gates it never armed.
             let dp = self.cur_dp;
             dstep::timed(&dstep::AUDIT, || {
-                self.group.audit_xctr(&self.gate_expect[dp])
+                if self.audit_direct {
+                    self.group.audit_xctr_direct(&self.gate_expect[dp])
+                } else {
+                    self.group.audit_xctr(&self.gate_expect[dp])
+                }
             })?;
         }
         let all = self.agree_tick >= self.agree_every;

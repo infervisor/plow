@@ -37,6 +37,35 @@ the runtime safely falls back to the eight-wave prefill interpreter. Correctness
 is preserved; a K3-specific flash object remains a measured prefill-performance
 experiment rather than a Stage-6 blocker.
 
+## Decode attribution and TP audit experiment
+
+Raw interpreter tracing now writes only the completed program's live extent.
+The previous widest-buffer readback retained prefill records after decode and
+could report impossible workgroups above the MI325X limit.
+
+The corrected one-token trace contains 2,459 decode packets and spans 67.576
+ms inside an 80.022 ms wall step. Dense GEMV is the largest device component:
+28.506 ms for 14.021 GB/rank/token, about 492 GB/s. The default TP safety audit
+accounts for another 10.3--10.5 ms/token because it copies every cross-GPU
+counter back through the copy engine.
+
+`PLOW_TP_AUDIT_DIRECT=1` instead checks the same expected counter values through
+host-mapped large-BAR memory after the device drain. It remains opt-in. A
+64-token real-weight soak completed at 73.252 ms/token (13.7 tok/s), with every
+token identical on all eight ranks. This is 8.2% faster than the 79.8 ms/token
+audited control while retaining per-token gate validation.
+
+```bash
+nix develop --command env \
+  PLOW_L2_PLACE_DISPATCH=1 PLOW_TP_AUDIT_DIRECT=1 \
+  perf-data/harness/gpulease -n 8 k3-mi325x-audit-direct \
+  ./target/release/plowrt amd-bench \
+  --blob /home/lava/models/k3_mi325x/model.pkt \
+  --hsaco /home/lava/models/k3_mi325x/hsaco \
+  --checkpoint /home/lava/models/k3_farm \
+  --prompt 1008,10484,318,15383,387 --steps 64 --ctx 5 --tp 8
+```
+
 ## Remaining comparison gate
 
 No same-box Kimi-K3 vLLM or SGLang environment is installed. A performance-win

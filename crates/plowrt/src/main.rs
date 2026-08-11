@@ -1067,10 +1067,17 @@ fn amd_bench_tp(
         let mut out = Vec::new();
         let t = std::time::Instant::now();
         for s in 0..steps {
+            let t_tok = plowrt::obs::dstep::on().then(std::time::Instant::now);
             let ids = g.decode_step(pos, pos + 1)?;
-            out.push(AmdTpGroup::agree(&ids)?);
+            out.push(plowrt::obs::dstep::timed(
+                &plowrt::obs::dstep::AGREE,
+                || AmdTpGroup::agree(&ids),
+            )?);
             dump(&g, &format!("{s:03}"))?;
             pos += 1;
+            if let Some(t) = t_tok {
+                plowrt::obs::dstep::token(t.elapsed().as_nanos() as u64);
+            }
         }
         let ms = t.elapsed().as_secs_f64() * 1e3 / steps as f64;
         println!("  {out:?}");

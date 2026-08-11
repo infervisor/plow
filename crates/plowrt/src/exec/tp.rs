@@ -604,6 +604,35 @@ impl TpGroup {
         Ok(())
     }
 
+    /// Audit cross-GPU gates through their host-mapped large-BAR addresses.
+    pub fn audit_xctr_direct(&self, expect: &[Option<u32>]) -> Result<()> {
+        let n = (self.layout.n_xctr as usize).min(expect.len());
+        for r in &self.ranks {
+            if !r.backend.peer().is_some_and(|p| p.peer_host_writable()) {
+                return Err(RuntimeError::Device(format!(
+                    "rank {} peer memory is not host-mapped — direct TP audit needs large BAR",
+                    r.rank
+                )));
+            }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            for (gate, expected) in expect.iter().take(n).enumerate() {
+                let Some(want) = expected else { continue };
+                let ptr = (r.xctr + (gate * XCTR_STRIDE) as u64) as *const u32;
+                // SAFETY: `xctr` is host-mapped (checked above), each gate is a
+                // 128-byte slot within the allocation, and the dispatch drained.
+                let v = unsafe { std::ptr::read_volatile(ptr) };
+                if v != *want {
+                    return Err(RuntimeError::Device(format!(
+                        "cross-GPU gate {gate} on rank {} reads {v}, expected {want}. \
+                         Direct audit found an incomplete or stale collective.",
+                        r.rank
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Bring-up self-check: every ordered rank pair must be able to reach the
     /// other's peer region, byte-exact.
     ///

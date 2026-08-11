@@ -444,6 +444,10 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-tp-no-audit", env = "PLOW_TP_NO_AUDIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_no_audit: bool,
 
+    /// Read the TP counter audit through host-mapped large BAR memory.
+    #[arg(long = "amd-tp-audit-direct", env = "PLOW_TP_AUDIT_DIRECT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_audit_direct: bool,
+
     /// Override prefill pad/launch-rows tradeoff.
     #[arg(long = "amd-launch-rows", env = "PLOW_LAUNCH_ROWS", global = true)]
     pub launch_rows: Option<u32>,
