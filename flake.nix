@@ -516,6 +516,8 @@
             name = "plow-vllm-client";
             packages = [
               (pkgs.python3.withPackages (_: [ vllmClient ]))
+              pkgs.jq
+              pkgs.curl
             ];
             shellHook = ''
               echo "plow vllm client shell — $(python3 -c 'import vllm; print(vllm.__version__)')"
