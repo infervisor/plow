@@ -1965,7 +1965,8 @@ __device__ void d_flash_merge(bf16* __restrict__ O_, const float* __restrict__ O
  * quantization error here is common-mode across all `n_head` heads rather than confined to one.
  * That is a reason to MEASURE this family separately from the dense one, not a reason it cannot
  * work; the numbers are in perf-data/mla-fp8-kv.md. */
-template <int DK, int DR, int GF, bool GATHER = false, bool FP8 = false>
+template <int DK, int DR, int GF, bool GATHER = false, bool FP8 = false,
+          bool NONCAUSAL_BLOCK = false>
 __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict__ mlpart,
                                    const bf16* __restrict__ Qabs, const bf16* __restrict__ Qrope,
                                    const bf16* __restrict__ Ckv, const bf16* __restrict__ Krope,
@@ -2001,11 +2002,11 @@ __device__ void d_flash_mla_decode(float* __restrict__ Opart, float* __restrict_
         const unsigned h0 = hg * GF; /* the GF consecutive query heads this item carries */
 
         const unsigned len = (unsigned)kv_len[b];
-        /* Query token t of this chunk sits at len-n_tok+t. Decode (n_tok=1) gives len-1. */
-        const unsigned qpos = len - n_tok + t;
-        /* The causal end for THIS query. Dense only: a gathered set is assumed causal already
-         * (the selector produced it), which is why GATHER applies no mask at all below. */
-        const unsigned cend = qpos + 1;
+        /* DSpark's parallel query block reads one committed context prefix and never appends its
+         * sibling query rows to that prefix. All rows therefore share cend=len. The ordinary
+         * decode/prefill specialization retains the original len-n_tok+t causal bound. */
+        const unsigned qpos = NONCAUSAL_BLOCK ? len - 1 : len - n_tok + t;
+        const unsigned cend = NONCAUSAL_BLOCK ? len : qpos + 1;
         /* GATHER splits over the SELECTED slots; dense splits over the KV window, which for prefill
          * is the per-token window ending at qpos, not at len.
          *

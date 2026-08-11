@@ -503,6 +503,35 @@ if(PLOW_ROCM)
     target_link_libraries(kda_state_resident_gfx942_test PRIVATE ${PLOW_AMDHIP64} m)
     add_dependencies(kda_state_resident_gfx942_test kda_state_resident_gfx942_elf)
 
+    # Exact seven-query DSpark MLA semantic oracle. The device object contains both the
+    # non-causal specialization and the ordinary causal control; the host requires the former to
+    # match an independent f64 reference and the latter to diverge on the same committed prefix.
+    set(K3_DSPARK_MLA_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tests/k3_dspark_mla_gfx942_test.hip)
+    set(K3_DSPARK_MLA_ELF ${CMAKE_CURRENT_BINARY_DIR}/k3_dspark_mla_gfx942.elf)
+    add_custom_command(
+        OUTPUT ${K3_DSPARK_MLA_ELF}
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+                "$ENV{PLOW_HIPCC}" "$ENV{PLOW_BUNDLER}" gfx942
+                ${K3_DSPARK_MLA_ELF} k_dspark_noncausal 256 1
+                -DK3DSPARK_MLA_DEVICE=1
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                ${K3_DSPARK_MLA_SRC}
+        DEPENDS ${K3_DSPARK_MLA_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/op_attention.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+        VERBATIM)
+    add_custom_target(k3_dspark_mla_gfx942_elf DEPENDS ${K3_DSPARK_MLA_ELF})
+    set_source_files_properties(${K3_DSPARK_MLA_SRC}
+        PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x c++")
+    add_executable(k3_dspark_mla_gfx942_test ${K3_DSPARK_MLA_SRC})
+    target_compile_features(k3_dspark_mla_gfx942_test PRIVATE cxx_std_17)
+    target_include_directories(k3_dspark_mla_gfx942_test PRIVATE "$ENV{ROCM_PATH}/include")
+    target_compile_definitions(k3_dspark_mla_gfx942_test PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_compile_options(k3_dspark_mla_gfx942_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(k3_dspark_mla_gfx942_test PRIVATE ${PLOW_AMDHIP64} m)
+    add_dependencies(k3_dspark_mla_gfx942_test k3_dspark_mla_gfx942_elf)
+
     # Standalone gfx942 grouped A8W4 experiment. It is intentionally a raw code object plus a
     # module-loading host oracle: no production packet or interpreter arm is changed.
     set(PLOW_A8W4_HIPCC "$ENV{PLOW_HIPCC}")
