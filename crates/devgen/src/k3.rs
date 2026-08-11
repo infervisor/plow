@@ -1079,6 +1079,17 @@ pub fn emit_k3_latent_moe(
     // router, so it overlaps the rank pass.
     let c_xe = gemv(b, xe, x, w.down_latent, lat, hid, deps[0]);
 
+    let si_l = tp.local(c.shared_inter);
+    // Only independent decode sequences take this overlap. Prefill token rows keep their proven
+    // recurrent schedule, and B1 keeps the fused packet below.
+    let early_shared = if seq_rows && !fuse_shared_glu(t, c.hidden) {
+        let c_sg = gemv(b, shg, x, w.shared_gate, si_l, hid, deps[0]);
+        let c_su = gemv(b, shu, x, w.shared_up, si_l, hid, deps[0]);
+        Some((c_sg, c_su))
+    } else {
+        None
+    };
+
     // Under TP the combine lands in the peer slot and is all-reduced BEFORE the
     // norm: `routed_expert_norm` is nonlinear, so normalising a partial sum
     // would be finite, plausible and wrong.
@@ -1388,7 +1399,6 @@ pub fn emit_k3_latent_moe(
     // branch too, so a fused emit here would poison (loudly, by design) rather than run. The
     // fusion is a real win on GLM's silu shared expert and is not available to this activation
     // until an epilogue takes the betas the way `moe_glu` does.
-    let si_l = tp.local(c.shared_inter);
     // FUSED gate|up|situ when the epilogue can take the betas, three packets otherwise.
     //
     // This is the fusion the comment above used to say was unavailable, and the blocker was real:
@@ -1423,8 +1433,14 @@ pub fn emit_k3_latent_moe(
             },
         )
     } else {
-        let c_sg = gemv(b, shg, x, w.shared_gate, si_l, hid, deps[0]);
-        let c_su = gemv(b, shu, x, w.shared_up, si_l, hid, deps[0]);
+        let (c_sg, c_su) = if let Some(pair) = early_shared {
+            pair
+        } else {
+            (
+                gemv(b, shg, x, w.shared_gate, si_l, hid, deps[0]),
+                gemv(b, shu, x, w.shared_up, si_l, hid, deps[0]),
+            )
+        };
         emit_situ_glu(b, cb, sha, shg, shu, t * si_l, n_cu, &[c_sg, c_su])
     };
 
@@ -4155,6 +4171,10 @@ mod tests {
 
     /// Build the 93-layer hybrid at `t` rows, at a given TP degree.
     fn build_full_t(tp: u32, t: u32) -> packet::devbuild::Program {
+        build_full_rows(tp, t, RowKind::Tokens)
+    }
+
+    fn build_full_rows(tp: u32, t: u32, rows: RowKind) -> packet::devbuild::Program {
         let mut c = model_cfg();
         c.tp = tp;
         let mut mla: std::collections::BTreeSet<u32> =
@@ -4171,7 +4191,7 @@ mod tests {
             t,
             t,
             256,
-            RowKind::Tokens,
+            rows,
         );
         b.finish()
     }
@@ -4239,6 +4259,73 @@ mod tests {
         );
         assert_eq!(n(DevOp::Embed), 1);
         assert_eq!(n(DevOp::ArgmaxFin), 1);
+    }
+
+    #[test]
+    fn early_shared_gate_up_is_batched_decode_only_and_keeps_tp_slot_order() {
+        let locate = |p: &packet::devbuild::Program, suffix: &str| {
+            let weight = p
+                .tensors
+                .iter()
+                .position(|t| t.name.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing tensor ending in {suffix}"))
+                as u32;
+            p.insts
+                .iter()
+                .position(|i| i.t[2] == weight)
+                .unwrap_or_else(|| panic!("missing instruction for weight handle {weight}"))
+        };
+
+        let batched = build_full_rows(8, 32, RowKind::Sequences);
+        let prefill = build_full_rows(8, 128, RowKind::Tokens);
+        let score_name = "layers.1.block_sparse_moe.gate.weight";
+        let latent_name = "layers.1.block_sparse_moe.routed_expert_down_proj.weight";
+        let gate_name = "layers.1.block_sparse_moe.shared_experts.gate_proj.weight";
+        let up_name = "layers.1.block_sparse_moe.shared_experts.up_proj.weight";
+        let down_name = "layers.1.block_sparse_moe.shared_experts.down_proj.weight";
+
+        let score = locate(&batched, score_name);
+        let latent = locate(&batched, latent_name);
+        let gate = locate(&batched, gate_name);
+        let up = locate(&batched, up_name);
+        let router = batched
+            .insts
+            .iter()
+            .position(|i| i.op == DevOp::MoeRouterTopkPf as u16)
+            .expect("missing batched router");
+        assert!(score < gate && score < up && gate < router && up < router);
+        let h3 = batched.insts[score].t[1];
+        assert_eq!(batched.insts[latent].t[1], h3);
+        assert_eq!(batched.insts[gate].t[1], h3);
+        assert_eq!(batched.insts[up].t[1], h3);
+
+        let prefill_router = prefill
+            .insts
+            .iter()
+            .position(|i| i.op == DevOp::MoeRouterTopkPf as u16)
+            .expect("missing prefill router");
+        assert!(locate(&prefill, gate_name) > prefill_router);
+        assert!(locate(&prefill, up_name) > prefill_router);
+
+        let down = locate(&batched, down_name);
+        let combine = batched
+            .insts
+            .iter()
+            .position(|i| i.op == DevOp::MoeCombinePf as u16)
+            .expect("missing routed combine");
+        let routed_reduce = ((combine + 1)..down)
+            .find(|&id| {
+                let op = batched.insts[id].op;
+                op == DevOp::XReduce as u16 || op == DevOp::XReduceTwoShot as u16
+            })
+            .expect("missing routed TP collective after combine");
+        let mut waits = Vec::new();
+        for entry in batched.stream.iter().filter(|e| e.inst as usize == down) {
+            for k in 0..entry.wait_len as usize {
+                waits.push(batched.waits[entry.wait_ofs as usize + k].id as usize);
+            }
+        }
+        assert!(waits.contains(&routed_reduce));
     }
 
     /// The narrow-norm fusion is OFF in a default emit, and that is the shipped state.

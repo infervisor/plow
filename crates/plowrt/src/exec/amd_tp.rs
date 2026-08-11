@@ -130,12 +130,11 @@
 //!    overlooks *where they write*. `patch_kvrow` memcpy's into `progs[dp].
 //!    d_inst`, the very instruction buffer the resident megakernel is executing
 //!    from; `pos` and `kvlen` are device tensors every RoPE and attention op
-//!    re-reads through the tick; and `rearm_prog` zeroes the local counters the
-//!    resident tick is still signalling — the same hazard §6d rules out for
-//!    `xctr`, restated one scope down. Hoisting any of the three corrupts the
-//!    tick in flight, silently. It needs double-buffered `d_inst`/`in.pos`/
-//!    `in.kvlen`/counters and a kernarg to select the copy — a devgen and ABI
-//!    change — to buy at most the 527 µs those three rows total at TP8: 2.3%.
+//!    re-reads through the tick. Those buffers still cannot be hoisted without
+//!    double-buffered `d_inst`/`in.pos`/`in.kvlen` and a kernarg to select the
+//!    copy. Local counters are different: they are already banked in the
+//!    kernarg, so decode selects a clean bank before launch and re-arms the
+//!    inactive one only after every rank is resident.
 //! 2. **The window would be empty anyway.** With the `pre` rows excluded by (1),
 //!    the only host work left to overlap is the `post` block, and its
 //!    non-device-touching part — detokenise, stop check, SSE frame, channel
@@ -650,9 +649,24 @@ impl AmdTpGroup {
     ) -> Result<()> {
         use crate::obs::dstep;
         self.cur_dp = dp;
+        let counter_dbuf = self.ranks[0].tp_counter_double_buffered();
+        // Preparation can fail without changing bank state. Only after EVERY
+        // rank is prepared may TP select the banks this dispatch will capture.
         for e in &mut self.ranks {
             dstep::timed(&dstep::PREPARE, || e.decode_prepare_batched(pos, kvlen))?;
-            dstep::timed(&dstep::REARM, || e.rearm_prog(dp))?;
+        }
+        if let Some(rank) = self.ranks.iter().position(|e| !e.tp_counter_bank_ready(dp)) {
+            return Err(RuntimeError::Device(format!(
+                "rank {rank} program {dp} has no clean inactive counter bank; refusing to \
+                 reuse stale local counters after a failed or omitted re-arm"
+            )));
+        }
+        for e in &self.ranks {
+            if counter_dbuf {
+                e.tp_begin_counter_bank(dp)?;
+            } else {
+                dstep::timed(&dstep::REARM, || e.tp_begin_counter_bank(dp))?;
+            }
         }
         // `launch_token` owns zero-all-then-launch-all; the closure only says
         // what a launch IS.
@@ -679,6 +693,15 @@ impl AmdTpGroup {
         })?;
         if let Some(z) = launched_at {
             dstep::ENQUEUE.add(z.elapsed().as_nanos() as u64);
+        }
+        // Do not put this work inside the launch closure: every rank must be
+        // resident before ~1.5 ms of TP8 counter clears can begin. These are
+        // rank-local inactive banks, not peer-visible xctr; xctr remains the
+        // single prelaunch reset owned by `launch_token`.
+        if counter_dbuf {
+            for e in &self.ranks {
+                dstep::timed(&dstep::REARM, || e.tp_rearm_inactive_counter_bank(dp))?;
+            }
         }
         Ok(())
     }

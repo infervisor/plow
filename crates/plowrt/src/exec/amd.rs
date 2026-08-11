@@ -3013,6 +3013,64 @@ pub struct ChunkStep {
     pub clen: u32,
 }
 
+/// Per-program local counter-bank state.
+///
+/// TP keeps `current` on the bank used by the last dispatch so diagnostic
+/// snapshots still read that dispatch's counters. The other bank must be
+/// re-armed successfully before a later TP dispatch may select it.
+struct CounterBankState {
+    current: Cell<u32>,
+    inactive_ready: Cell<bool>,
+}
+
+impl CounterBankState {
+    fn new() -> Self {
+        Self {
+            current: Cell::new(0),
+            // Both banks are zeroed at allocation time.
+            inactive_ready: Cell::new(true),
+        }
+    }
+
+    fn current(&self) -> u32 {
+        self.current.get()
+    }
+
+    fn inactive(&self) -> u32 {
+        1 - self.current()
+    }
+
+    fn inactive_ready(&self) -> bool {
+        self.inactive_ready.get()
+    }
+
+    /// Select the already-clean inactive bank for a TP dispatch.
+    ///
+    /// Returns `false` for the single-bank fallback, whose caller must re-arm
+    /// the current bank synchronously. A failed/omitted inactive clear leaves
+    /// `inactive_ready == false`, so stale local counters cannot be reused.
+    fn begin_tp(&self, double_buffered: bool) -> std::result::Result<bool, ()> {
+        if !double_buffered {
+            return Ok(false);
+        }
+        if !self.inactive_ready.replace(false) {
+            return Err(());
+        }
+        self.current.set(self.inactive());
+        Ok(true)
+    }
+
+    fn mark_inactive_ready(&self) {
+        self.inactive_ready.set(true);
+    }
+
+    fn select_rearmed_inactive(&self) {
+        self.current.set(self.inactive());
+        // The old current bank was dirtied by the dispatch that just launched.
+        self.inactive_ready.set(false);
+    }
+}
+
 /// One program's device-resident tables.
 struct AmdProg {
     t: u32,
@@ -3046,9 +3104,9 @@ struct AmdProg {
     /// Bytes in ONE counter bank — `n_counter * CTR_STRIDE_U32 * 4`, i.e. what
     /// the old single-bank allocation was in total.
     ctr_span: u64,
-    /// Which bank the NEXT dispatch of this program runs out of; 0 unless
-    /// [`ctr_dbuf`] is on. See [`AmdEngine::run`].
-    bank: Cell<u32>,
+    /// Local counter/cursor bank state. See [`AmdEngine::run`] and the TP
+    /// begin/post-launch methods.
+    bank: CounterBankState,
 }
 
 struct AmdGq {
@@ -4506,7 +4564,7 @@ impl AmdEngine {
                     0
                 },
                 ctr_span,
-                bank: Cell::new(0),
+                bank: CounterBankState::new(),
             });
         }
         let decode = progs.len() - 1;
@@ -4963,7 +5021,7 @@ impl AmdEngine {
             succs: g.d_succs.base,
             // BANKED. `bank` is 0 for the whole life of a single-buffered
             // program, so this is the old expression there.
-            counters: g.d_ctr.base + g.bank.get() as u64 * g.ctr_span,
+            counters: g.d_ctr.base + g.bank.current() as u64 * g.ctr_span,
             tensors: self.d_tens.base,
             // EVERY program traces, not just decode. The buffer is sized for the widest one
             // (see `d_trace`'s allocation), and each dispatch writes slot `base + ix` of its own
@@ -4985,10 +5043,9 @@ impl AmdEngine {
             // static kernel never reads them, so one path serves both.
             gq_stream: g.gq.as_ref().map_or(0, |q| q.d_stream.base),
             gq_seg_ofs: g.gq.as_ref().map_or(0, |q| q.d_seg_ofs.base),
-            gq_cursor: g
-                .gq
-                .as_ref()
-                .map_or(0, |q| q.d_cursor.base + g.bank.get() as u64 * q.cur_span),
+            gq_cursor: g.gq.as_ref().map_or(0, |q| {
+                q.d_cursor.base + g.bank.current() as u64 * q.cur_span
+            }),
             // Single-GPU leaves all four at zero, and `n_gpu == 0` is the
             // interpreter's "not a group" convention (`tp_decode.c:551` fills
             // them only when `n_gpu > 1`). The collective opcodes never appear
@@ -5006,7 +5063,7 @@ impl AmdEngine {
     /// an earlier launch, so zeroing between segments unsatisfies them and the
     /// next segment waits on a count that will never come again.
     fn rearm(&self, p: usize) -> Result<()> {
-        self.rearm_bank(p, self.progs[p].bank.get())
+        self.rearm_bank(p, self.progs[p].bank.current())
     }
 
     /// Zero ONE bank of program `p`'s counters and GQ cursor.
@@ -5033,10 +5090,54 @@ impl AmdEngine {
         Ok(())
     }
 
-    /// Re-arm program `p`'s counters and cursor. Public so a TP driver can
-    /// re-arm EVERY rank before dispatching ANY of them (§6d).
+    /// Re-arm program `p`'s counters and cursor. Used by prefill and by TP's
+    /// synchronous single-bank fallback.
     pub fn rearm_prog(&self, p: usize) -> Result<()> {
         self.rearm(p)
+    }
+
+    /// Whether TP may select this program's inactive local-counter bank.
+    ///
+    /// The preflight is separate so a group checks EVERY rank before changing
+    /// any rank's bank selection.
+    pub fn tp_counter_bank_ready(&self, p: usize) -> bool {
+        !ctr_dbuf() || self.progs[p].bank.inactive_ready()
+    }
+
+    /// Whether TP should use the post-launch inactive-bank re-arm path.
+    pub fn tp_counter_double_buffered(&self) -> bool {
+        ctr_dbuf()
+    }
+
+    /// Select a clean counter bank for the next TP dispatch.
+    ///
+    /// With double-buffering disabled this performs the original synchronous
+    /// current-bank re-arm. The caller must invoke it on every rank only after
+    /// all rank preparation has succeeded.
+    pub fn tp_begin_counter_bank(&self, p: usize) -> Result<()> {
+        match self.progs[p].bank.begin_tp(ctr_dbuf()) {
+            Ok(true) => Ok(()),
+            Ok(false) => self.rearm(p),
+            Err(()) => Err(RuntimeError::Device(format!(
+                "program {p} inactive counter bank is stale: its previous post-launch re-arm \
+                 did not complete; refusing to dispatch with uncleared local counters"
+            ))),
+        }
+    }
+
+    /// Re-arm the inactive TP counter/cursor bank after every rank has launched.
+    ///
+    /// The blocking SDMA copy overlaps the resident megakernels. The bank is
+    /// marked reusable only after both its counter and optional GQ-cursor clears
+    /// complete successfully.
+    pub fn tp_rearm_inactive_counter_bank(&self, p: usize) -> Result<()> {
+        if !ctr_dbuf() {
+            return Ok(());
+        }
+        let bank = self.progs[p].bank.inactive();
+        self.rearm_bank(p, bank)?;
+        self.progs[p].bank.mark_inactive_ready();
+        Ok(())
     }
 
     /// Number of segments in program `p`, and whether segment `seg` is class 4.
@@ -5235,9 +5336,9 @@ impl AmdEngine {
             return Err(e);
         }
         if ctr_dbuf() {
-            let cur = self.progs[p].bank.get();
+            let cur = self.progs[p].bank.current();
             dstep::timed(&dstep::REARM, || self.rearm_bank(p, 1 - cur))?;
-            self.progs[p].bank.set(1 - cur);
+            self.progs[p].bank.select_rearmed_inactive();
         }
         // The drain is where an async kernel trap surfaces — capture the
         // dispatch shape at the site before propagating.
@@ -6356,7 +6457,7 @@ impl AmdEngine {
         EngineDevice::download(
             &*self.be,
             &g.d_ctr,
-            g.bank.get() as u64 * g.ctr_span,
+            g.bank.current() as u64 * g.ctr_span,
             &mut buf,
         )?;
         Ok(buf
@@ -6419,6 +6520,59 @@ fn kernarg_bytes(p: &DevProgram) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tp_counter_banks_are_clean_on_first_use_and_alternate() {
+        let state = CounterBankState::new();
+        assert_eq!(state.current(), 0);
+        assert!(state.inactive_ready());
+
+        let mut used = Vec::new();
+        for _ in 0..3 {
+            assert_eq!(state.begin_tp(true), Ok(true));
+            used.push(state.current());
+            assert!(!state.inactive_ready());
+            let executed = state.current();
+            state.mark_inactive_ready();
+            assert_eq!(state.current(), executed, "re-arm must not move snapshots");
+        }
+        assert_eq!(used, [1, 0, 1]);
+    }
+
+    #[test]
+    fn tp_counter_bank_state_is_per_program() {
+        let rung8 = CounterBankState::new();
+        let rung32 = CounterBankState::new();
+
+        assert_eq!(rung8.begin_tp(true), Ok(true));
+        rung8.mark_inactive_ready();
+        assert_eq!(rung8.current(), 1);
+        assert_eq!(rung32.current(), 0);
+
+        assert_eq!(rung32.begin_tp(true), Ok(true));
+        assert_eq!(rung32.current(), 1);
+        assert_eq!(rung8.current(), 1);
+    }
+
+    #[test]
+    fn tp_counter_single_bank_mode_requires_synchronous_rearm() {
+        let state = CounterBankState::new();
+        assert_eq!(state.begin_tp(false), Ok(false));
+        assert_eq!(state.current(), 0);
+        assert!(state.inactive_ready());
+    }
+
+    #[test]
+    fn tp_counter_bank_refuses_stale_inactive_bank() {
+        let state = CounterBankState::new();
+        assert_eq!(state.begin_tp(true), Ok(true));
+        assert_eq!(state.begin_tp(true), Err(()));
+        assert_eq!(state.current(), 1, "failed selection must not change banks");
+
+        state.mark_inactive_ready();
+        assert_eq!(state.begin_tp(true), Ok(true));
+        assert_eq!(state.current(), 0);
+    }
 
     /// The kernarg slice must cover the WHOLE struct.
     ///
