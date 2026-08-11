@@ -1,0 +1,15 @@
+{
+  "_arch": "gfx942",
+  "moe_prefill_a8w4_gfx942": {
+    "a8w4_group_glu": {
+      "require_min": {"v_mfma_f32_32x32x16_fp8_fp8": 8},
+      "no_scratch": true,
+      "forbid": ["v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x64_f8f6f4", "v_mfma_scale"]
+    },
+    "a8w4_group_down": {
+      "require_min": {"v_mfma_f32_32x32x16_fp8_fp8": 8},
+      "no_scratch": true,
+      "forbid": ["v_mfma_f32_32x32x8_bf16", "v_mfma_f32_32x32x64_f8f6f4", "v_mfma_scale"]
+    }
+  }
+}

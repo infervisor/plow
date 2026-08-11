@@ -74,6 +74,92 @@ if(PLOW_ROCM)
     target_compile_options(moe_prefill_a4w4_cdna3_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(moe_prefill_a4w4_cdna3_test PRIVATE ${PLOW_AMDHIP64} m)
 
+    # Standalone gfx942 grouped A8W4 experiment. It is intentionally a raw code object plus a
+    # module-loading host oracle: no production packet or interpreter arm is changed.
+    set(PLOW_A8W4_HIPCC "$ENV{PLOW_HIPCC}")
+    set(PLOW_A8W4_BUNDLER "$ENV{PLOW_BUNDLER}")
+    if(NOT PLOW_A8W4_HIPCC MATCHES "^/nix/store/")
+        message(FATAL_ERROR "A8W4 experiment hipcc must resolve from the Nix store")
+    endif()
+    if(NOT PLOW_A8W4_BUNDLER MATCHES "^/nix/store/")
+        message(FATAL_ERROR "A8W4 experiment bundler must resolve from the Nix store")
+    endif()
+    set(MOE_A8W4_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tests/moe_prefill_a8w4_gfx942_test.hip)
+    set(MOE_A8W4_ELF ${CMAKE_CURRENT_BINARY_DIR}/moe_prefill_a8w4_gfx942.elf)
+    add_custom_command(
+        OUTPUT ${MOE_A8W4_ELF}
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+                ${PLOW_A8W4_HIPCC} ${PLOW_A8W4_BUNDLER} gfx942
+                ${MOE_A8W4_ELF} a8w4_group_glu 256 2
+                -std=c++17 -DMPA8W4_DEVICE=1
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../common
+                -I ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+                ${MOE_A8W4_SRC}
+        DEPENDS ${MOE_A8W4_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_arch.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+        VERBATIM)
+    add_custom_target(moe_prefill_a8w4_gfx942_elf DEPENDS ${MOE_A8W4_ELF})
+    find_program(PLOW_BENCH_PYTHON python3 REQUIRED)
+    add_custom_target(moe_prefill_a8w4_gfx942_audit
+        COMMAND ${PLOW_BENCH_PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/asm_audit.py
+                --expect ${CMAKE_CURRENT_SOURCE_DIR}/../tests/moe_prefill_a8w4_gfx942_expect.json
+                ${MOE_A8W4_ELF}
+        DEPENDS moe_prefill_a8w4_gfx942_elf
+        VERBATIM)
+    set_source_files_properties(${MOE_A8W4_SRC} PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x c++")
+    add_executable(moe_prefill_a8w4_gfx942_test ${MOE_A8W4_SRC})
+    target_compile_features(moe_prefill_a8w4_gfx942_test PRIVATE cxx_std_17)
+    target_include_directories(moe_prefill_a8w4_gfx942_test PRIVATE "$ENV{ROCM_PATH}/include")
+    target_compile_definitions(moe_prefill_a8w4_gfx942_test PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_compile_options(moe_prefill_a8w4_gfx942_test PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(moe_prefill_a8w4_gfx942_test PRIVATE ${PLOW_AMDHIP64} m)
+    add_dependencies(moe_prefill_a8w4_gfx942_test moe_prefill_a8w4_gfx942_elf)
+
+    # Standalone K3 grouped W4A16 bridge control. It is deliberately not an interpreter arm:
+    # CMake emits a private gfx942 code object from the device half of the source, while the host
+    # half supplies routing/padding sentinels and the f64 oracle.
+    set(PLOW_W4A16_HIPCC "$ENV{PLOW_HIPCC}")
+    set(PLOW_W4A16_BUNDLER "$ENV{PLOW_BUNDLER}")
+    if(NOT PLOW_W4A16_HIPCC MATCHES "^/nix/store/")
+        message(FATAL_ERROR "W4A16 control hipcc must resolve from the Nix store")
+    endif()
+    if(NOT PLOW_W4A16_BUNDLER MATCHES "^/nix/store/")
+        message(FATAL_ERROR "W4A16 control bundler must resolve from the Nix store")
+    endif()
+    set(MOE_W4A16_SRC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tests/moe_prefill_w4a16_bridge_gfx942_test.hip)
+    set(MOE_W4A16_ELF
+        ${CMAKE_CURRENT_BINARY_DIR}/moe_prefill_w4a16_bridge_gfx942.elf)
+    add_custom_command(
+        OUTPUT ${MOE_W4A16_ELF}
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+            ${PLOW_W4A16_HIPCC} ${PLOW_W4A16_BUNDLER} gfx942
+            ${MOE_W4A16_ELF} k_w4a16 256 1
+            -I ${CMAKE_CURRENT_SOURCE_DIR}/../amd
+            -DMPW4A16_DEVICE=1 ${MOE_W4A16_SRC}
+        DEPENDS ${MOE_W4A16_SRC}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_common.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/../amd/amd_arch.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/hipcc_hsaco.sh
+        VERBATIM)
+    add_custom_target(moe_prefill_w4a16_bridge_gfx942_elf DEPENDS ${MOE_W4A16_ELF})
+    set_source_files_properties(${MOE_W4A16_SRC}
+        PROPERTIES LANGUAGE CXX COMPILE_FLAGS "-x c++")
+    add_executable(moe_prefill_w4a16_bridge_gfx942_test ${MOE_W4A16_SRC})
+    target_compile_features(moe_prefill_w4a16_bridge_gfx942_test PRIVATE cxx_std_17)
+    target_include_directories(moe_prefill_w4a16_bridge_gfx942_test PRIVATE
+        "$ENV{ROCM_PATH}/include")
+    target_compile_definitions(moe_prefill_w4a16_bridge_gfx942_test
+        PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_compile_options(moe_prefill_w4a16_bridge_gfx942_test
+        PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(moe_prefill_w4a16_bridge_gfx942_test PRIVATE ${PLOW_AMDHIP64} m)
+    add_dependencies(moe_prefill_w4a16_bridge_gfx942_test
+        moe_prefill_w4a16_bridge_gfx942_elf)
+
     # qwen_interp_bench: same as above but Qwen3 shapes
     add_executable(qwen_interp_bench
         interp/qwen_interp_bench.c

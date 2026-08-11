@@ -42,6 +42,8 @@
  *
  * `MPA4C3_DECODE4=1` runs the same oracle at the production batched-decode shape:
  * four tokens, top-16 routing, 896 experts, H=3584, I=384, and a 304-CU grid.
+ * `MPA4C3_DECODE4_BENCH=1` times that shape through the standalone `k_glu`/`k_down`
+ * wrappers and writes the same provenance JSONL used by the prefill benchmark.
  */
 
 #ifdef MPA4C3_DEVICE
@@ -156,7 +158,8 @@ int main(int argc, char** argv) {
 
     /* MPA4C3_BENCH=1: TP8 packet geometry for a 4096-token, top-16 K3 chunk. */
     const bool BENCH = getenv("MPA4C3_BENCH") != nullptr;
-    const bool DECODE4 = getenv("MPA4C3_DECODE4") != nullptr;
+    const bool DECODE4_BASELINE = getenv("MPA4C3_DECODE4_BENCH") != nullptr;
+    const bool DECODE4 = getenv("MPA4C3_DECODE4") != nullptr || DECODE4_BASELINE;
     const bool K3_SHAPE = BENCH || DECODE4;
     const unsigned H = K3_SHAPE ? 3584 : 512, IM = 384,
                    NTOK = DECODE4 ? 4 : (BENCH ? 4096 : 8),
@@ -348,7 +351,7 @@ int main(int argc, char** argv) {
     HC(launch(fglu));
     HC(hipDeviceSynchronize());
 
-    if (BENCH) {
+    if (BENCH || DECODE4_BASELINE) {
         const char* jsonl = getenv("MPA4C3_JSONL");
         const char* gpu = getenv("PLOW_GPU");
         const char* toolchain = getenv("PLOW_TOOLCHAIN_LABEL");
@@ -357,9 +360,13 @@ int main(int argc, char** argv) {
         const char* cleared = getenv("PLOW_STAGE4_CLEARED");
         const char* mfma_env = getenv("PLOW_MFMA_TFLOPS");
         const char* hbm_env = getenv("PLOW_HBM_GBPS");
-        if (!INTERP || !jsonl || !gpu || strcmp(gpu, "MI325X") || !toolchain || !build_id ||
-            !lease || !cleared || strcmp(cleared, "1") || !mfma_env || !hbm_env) {
-            fprintf(stderr, "REFUSED: interpreter benchmark requires Stage-4 MI325X provenance\n");
+        if (!jsonl || !gpu || strcmp(gpu, "MI325X") || !toolchain || !build_id || !lease ||
+            !mfma_env || !hbm_env ||
+            (BENCH && (!INTERP || !cleared || strcmp(cleared, "1"))) ||
+            (DECODE4_BASELINE && INTERP)) {
+            fprintf(stderr, "REFUSED: benchmark requires MI325X/toolchain/build/lease/roof "
+                            "provenance; prefill also requires the Stage-4 interpreter, while "
+                            "decode4 baseline requires the standalone object\n");
             return 2;
         }
         const double mfma_roof = atof(mfma_env), hbm_roof = atof(hbm_env);
@@ -399,8 +406,9 @@ int main(int argc, char** argv) {
                             (double)np * (IM / 2 + IM / 32);
         const double bdown = wdown + (double)mt * (H / 256) * BM * (IM / 2 + IM / 32) +
                              (double)np * H * 4;
-        printf("bench: H=%u IM=%u rows=%u experts=%u grid=%d (routed GLU+DOWN of a %u-token K3 prefill chunk)\n",
-               H, IM, R, NEXP, GRID, NTOK);
+        printf("bench: H=%u IM=%u rows=%u experts=%u grid=%d (routed GLU+DOWN of a %u-token "
+               "K3 %s)\n", H, IM, R, NEXP, GRID, NTOK,
+               DECODE4_BASELINE ? "standalone decode baseline" : "prefill chunk");
         const std::vector<double> glu_samples =
             time_arm(fglu, "GLU", wglu, bglu, fglu_ops, true);
         const std::vector<double> down_samples =
@@ -431,7 +439,10 @@ int main(int argc, char** argv) {
             fputs(",\"build_id\":", jf); json_string(jf, build_id);
             fputs(",\"lease_label\":", jf); json_string(jf, lease);
             fputs(",\"object\":", jf); json_string(jf, argv[1]);
-            fputs(",\"interpreter_symbol\":\"plow_interp_gfx942\",\"arm\":", jf);
+            fputs(DECODE4_BASELINE ? ",\"entry\":\"standalone\""
+                                   : ",\"entry\":\"plow_interp_gfx942\"",
+                  jf);
+            fputs(",\"arm\":", jf);
             json_string(jf, arm);
             fprintf(jf, ",\"tokens\":%u,\"topk\":16,\"routed_rows\":%u,\"padded_rows\":%u,"
                         "\"experts\":%u,\"h\":%u,\"i_tp8\":%u,\"cu\":%u,\"correct\":true,"
