@@ -3348,8 +3348,7 @@ __device__ __forceinline__ void gemv_mx_rows_1(bf16* __restrict__ Cq_, bf16* __r
             const unsigned kx = (k < K) ? k : 0u;
             const unsigned sb = k >> 5; /* this lane's block index; one per fragment */
             const float sc = (sb < nsb) ? e8m0_to_f32(sr[sb]) : 0.0f;
-            bf16v8 w0, w1, w2, w3;
-            fp4_to_bf16v8x4(wv[u], sc, w0, w1, w2, w3);
+            const fp4_frag32 wf = fp4_prep32(wv[u], sc);
 #pragma unroll
             for (int m = 0; m < MM; m++) {
                 const bool live = ((unsigned)m < M);
@@ -3357,7 +3356,7 @@ __device__ __forceinline__ void gemv_mx_rows_1(bf16* __restrict__ Cq_, bf16* __r
                 const bf16v8 x1 = xv8(live ? m : 0, kx + 8);
                 const bf16v8 x2 = xv8(live ? m : 0, kx + 16);
                 const bf16v8 x3 = xv8(live ? m : 0, kx + 24);
-                acc[m] += live ? dot8(w3, x3, dot8(w2, x2, dot8(w1, x1, dot8(w0, x0, 0.0f)))) : 0.0f;
+                acc[m] += live ? fp4_dot32(wf, x0, x1, x2, x3, 0.0f) : 0.0f;
             }
         }
     }
@@ -3459,9 +3458,8 @@ __device__ __forceinline__ void gemv_rows_mxfp4(bf16* __restrict__ Cq_, bf16* __
                 const unsigned sb = k >> 5; /* this lane's block index; one per fragment */
                 const float sc = (sb < nsb) ? e8m0_to_f32(sr[sb]) : 0.0f;
                 const float sc2 = (sb < nsb) ? e8m0_to_f32(sr2[sb]) : 0.0f;
-                bf16v8 w0, w1, w2, w3, y0, y1, y2, y3;
-                fp4_to_bf16v8x4(wv[u], sc, w0, w1, w2, w3);
-                fp4_to_bf16v8x4(wv2[u], sc2, y0, y1, y2, y3);
+                const fp4_frag32 wf = fp4_prep32(wv[u], sc);
+                const fp4_frag32 wf2 = fp4_prep32(wv2[u], sc2);
 #pragma unroll
                 for (int m = 0; m < MM; m++) {
                     const bool live = ((unsigned)m < M);
@@ -3469,10 +3467,8 @@ __device__ __forceinline__ void gemv_rows_mxfp4(bf16* __restrict__ Cq_, bf16* __
                     const bf16v8 x1 = xv8(live ? m : 0, kx + 8);
                     const bf16v8 x2 = xv8(live ? m : 0, kx + 16);
                     const bf16v8 x3 = xv8(live ? m : 0, kx + 24);
-                    acc[m] += live ? dot8(w3, x3, dot8(w2, x2, dot8(w1, x1, dot8(w0, x0, 0.0f))))
-                                   : 0.0f;
-                    acc2[m] += live ? dot8(y3, x3, dot8(y2, x2, dot8(y1, x1, dot8(y0, x0, 0.0f))))
-                                    : 0.0f;
+                    acc[m] += live ? fp4_dot32(wf, x0, x1, x2, x3, 0.0f) : 0.0f;
+                    acc2[m] += live ? fp4_dot32(wf2, x0, x1, x2, x3, 0.0f) : 0.0f;
                 }
             }
         }
@@ -4926,9 +4922,8 @@ __device__ __forceinline__ void gemv_glu_rows_mxfp4(
                 const unsigned sb = k >> 5; /* this lane's block index; one E8M0 scale per fragment */
                 const float scg = (sb < nsb) ? e8m0_to_f32(sg[sb]) : 0.0f;
                 const float scu = (sb < nsb) ? e8m0_to_f32(su[sb]) : 0.0f;
-                bf16v8 g0, g1, g2, g3, u0, u1, u2, u3;
-                fp4_to_bf16v8x4(wg[u], scg, g0, g1, g2, g3);
-                fp4_to_bf16v8x4(wu[u], scu, u0, u1, u2, u3);
+                const fp4_frag32 gf = fp4_prep32(wg[u], scg);
+                const fp4_frag32 uf = fp4_prep32(wu[u], scu);
 #pragma unroll
                 for (int m = 0; m < MM; m++) {
                     const bool live = ((unsigned)m < M);
@@ -4936,8 +4931,8 @@ __device__ __forceinline__ void gemv_glu_rows_mxfp4(
                     const bf16v8 x1 = xv8(live ? m : 0, kx + 8);
                     const bf16v8 x2 = xv8(live ? m : 0, kx + 16);
                     const bf16v8 x3 = xv8(live ? m : 0, kx + 24);
-                    ag[m] += live ? dot8(g3, x3, dot8(g2, x2, dot8(g1, x1, dot8(g0, x0, 0.0f)))) : 0.0f;
-                    au[m] += live ? dot8(u3, x3, dot8(u2, x2, dot8(u1, x1, dot8(u0, x0, 0.0f)))) : 0.0f;
+                    ag[m] += live ? fp4_dot32(gf, x0, x1, x2, x3, 0.0f) : 0.0f;
+                    au[m] += live ? fp4_dot32(uf, x0, x1, x2, x3, 0.0f) : 0.0f;
                 }
             }
         }

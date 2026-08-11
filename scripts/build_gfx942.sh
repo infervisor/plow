@@ -198,6 +198,26 @@ if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ]; then
   fi
 fi
 AX_GQ="-DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=${PLOW_GQ_BATCH:-1}"
+# WEIGHT encoding: MXFP4 e2m1 + E8M0 (w4a16). This used to be gfx950-only because CDNA3 has no
+# fp4 datatype and amd_arch.h poisoned the decode to NaN; it now decodes in software, exactly (the
+# fp16-subnormal identity, verified against the ladder on this silicon). It gates the fp4
+# PROJECTION ops -- GemvMxfp4 (91), GemvGluMxfp4 (92), GemmMxfp4 (93) and the four extra GEMM
+# rungs, GemmGluMxfp4 (113), GemvQkvMxfp4 (114) -- and nothing else: the mxfp4 EXPERT walks that
+# K3 decode actually runs (ops 45/46 with i6 = PLOW_MOE_ENC_MXFP4) are not behind it.
+AX_MXFP4="-DPLOW_MXFP4=1"
+# KIMI-K3. `GV_UNROLL=14` is on the K3 rows only and is measured, not derived: K3's dominant
+# decode GEMV is K=7168, whose nchunk is exactly 14 (runtime/CMakeLists.txt records the sweep).
+AX_K3="-DPLOW_K3=1 -DGV_UNROLL=14"
+AX_MLA_K3="$AX_MLA -DPLOW_K3=1"
+# NO A4W4 ROW ON CDNA3, AND IT IS NOT AN OVERSIGHT. `PLOW_MOE_PF_A4W4` is fp4 on BOTH operands
+# through v_mfma_scale_f32_32x32x64_f8f6f4, which has no CDNA3 analogue at all (CDNA3's widest fp8
+# MFMA is K=16 and unscaled), so op_moe.h refuses the pair at compile time with an #error rather
+# than emulating it. The consequence is specific and worth stating where the rows are: gfx942
+# serves K3 DECODE (`interp_decode_k3`), and a K3 PREFILL bucket whose grouped-expert ops carry
+# `i[3] == PLOW_MOE_ENC_MXFP4` resolves to `interp_prefill_k3_moe_a4w4.elf`, which this arch
+# cannot build. Closing that needs a w4a16 grouped-prefill body (dequant fp4 -> bf16 in the
+# B-fetch, then the ordinary bf16 MFMA -- exactly what `d_gemm_mxfp4`'s WFP4 fetch already does
+# for the dense GEMM), not a flag.
 
 # PER-XCD QUEUES + TWO-LEVEL GATE MAINTENANCE -- ON BY DEFAULT. MEASURED -16.0%, TOKEN-IDENTICAL.
 #
@@ -696,6 +716,16 @@ ROWS=(
   "interp_prefill_fp8_mla_moe|$AX_PREFILL $AX_MLA $AX_MOE $AX_FP8"
   "interp_prefill_fp8kv_mla|$AX_PREFILL $AX_MLA $AX_FP8 $AX_FP8KV"
   "interp_prefill_fp8kv_mla_moe|$AX_PREFILL $AX_MLA $AX_MOE $AX_FP8 $AX_FP8KV"
+  # KIMI-K3. `interp_decode_k3` is the row a K3 decode packet actually loads (exec/amd.rs folds
+  # K3Moe and K3MoeA4w4 onto PrefillArm::K3 for the decode phase), and it carries the mxfp4
+  # EXPERT walks by default. `$AX_MXFP4` rides along so an all-fp4 packet finds its fp4
+  # PROJECTION ops in the same object rather than falling through the silent dispatch `default:`.
+  "interp_decode_k3|$AX_DECODE $AX_K3 $AX_MXFP4"
+  "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_MXFP4 $AX_FP8KV"
+  # ATTENTION-ONLY, exactly as on gfx950: without $AX_MOE the grouped expert packets fall through
+  # `default:` and write nothing. A whole-layer K3 prompt needs the `_moe` row below.
+  "interp_prefill_k3|$AX_PREFILL $AX_MLA_K3 $AX_MXFP4"
+  "interp_prefill_k3_moe|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_MXFP4"
 )
 
 # PLOW_ROWS_ONLY=<substring>: build only the rows whose stem matches — for iterating on
