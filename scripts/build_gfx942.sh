@@ -480,6 +480,13 @@ AX_K3_DECODE_A4W4=""
 if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ]; then
   AX_K3_DECODE_A4W4="$AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE"
 fi
+# Compile-only falsification axis: the grouped MXFP4 expert body is gated by
+# PLOW_MOE_PF_A4W4, independently of the standalone MXFP4 projection ops. Keep those projection
+# ops by default; `=0` removes them only from the two K3 decode rows.
+AX_K3_DECODE_MXFP4="$AX_MXFP4"
+if [ "${PLOW_K3_DECODE_MXFP4_PROJ:-1}" = 0 ]; then
+  AX_K3_DECODE_MXFP4=""
+fi
 
 # FALSIFICATION ARM (PLOW_F2BF_SELECT=1): the REFUTED branchless f2bf. Default 0 = the shipped branched form.
 # MEASURED AND REFUTED: the branchless form is -5.0% static instructions on the prefill
@@ -747,10 +754,10 @@ ROWS=(
   "interp_prefill_fp8kv_mla_moe|$AX_PREFILL $AX_MLA $AX_MOE $AX_FP8 $AX_FP8KV"
   # KIMI-K3. `interp_decode_k3` is the row a K3 decode packet actually loads (exec/amd.rs folds
   # K3Moe and K3MoeA4w4 onto PrefillArm::K3 for the decode phase), and it carries the mxfp4
-  # EXPERT walks by default. `$AX_MXFP4` rides along so an all-fp4 packet finds its fp4
+  # EXPERT walks by default. `$AX_K3_DECODE_MXFP4` rides along so an all-fp4 packet finds its fp4
   # PROJECTION ops in the same object rather than falling through the silent dispatch `default:`.
-  "interp_decode_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_MXFP4"
-  "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_MXFP4 $AX_FP8KV"
+  "interp_decode_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4"
+  "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_FP8KV"
   # ATTENTION-ONLY, exactly as on gfx950: without $AX_MOE the grouped expert packets fall through
   # `default:` and write nothing. A whole-layer K3 prompt needs the `_moe` rows below.
   "interp_prefill_k3|$AX_PREFILL $AX_MLA_K3 $AX_MXFP4"

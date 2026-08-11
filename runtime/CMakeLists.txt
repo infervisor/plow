@@ -650,6 +650,8 @@ option(PLOW_HSACO_MLA "Also emit the MLA prefill object (Kimi/DeepSeek/GLM)" ON)
 # (+14.9% on decode) and is exactly why these stay SEPARATE OBJECTS rather than becoming defines
 # on the rows above. Cost of the default: ~31 s of build, doubled by the `_gq` twins, and ~3 MB.
 option(PLOW_HSACO_K3 "Also emit the Kimi-K3 / KDA objects (decode + prefill)" ON)
+option(PLOW_K3_DECODE_MXFP4_PROJ
+       "Include standalone MXFP4 projection ops in K3 decode objects" ON)
 
 set(PLOW_HSACO_ARCH "gfx950" CACHE STRING "offload arch for the served code objects")
 set(PLOW_HSACO_HIPCC "/opt/rocm/bin/hipcc" CACHE FILEPATH "hipcc used for the served code objects")
@@ -767,9 +769,15 @@ if(PLOW_GFX950_HSACO)
     set(_hs_ax_k3_dec ${_hs_ax_k3})
     set(_hs_ax_k3_dec_fp8kv ${_hs_ax_k3_fp8kv})
     if(PLOW_DECODE_BATCH GREATER 1)
-        set(_hs_ax_k3_dec ${_hs_ax_k3_dec} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1)
+        set(_hs_ax_k3_dec_mxfp4 "")
+        if(PLOW_K3_DECODE_MXFP4_PROJ)
+            set(_hs_ax_k3_dec_mxfp4 -DPLOW_MXFP4=1)
+        endif()
+        set(_hs_ax_k3_dec ${_hs_ax_k3_dec} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1
+            ${_hs_ax_k3_dec_mxfp4})
         set(_hs_ax_k3_dec_fp8kv
-            ${_hs_ax_k3_dec_fp8kv} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1)
+            ${_hs_ax_k3_dec_fp8kv} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1
+            ${_hs_ax_k3_dec_mxfp4})
     endif()
     # ...and the FFN half. A K3 prefill bucket runs the GROUPED expert chain (ops 83-87), not the
     # per-slot decode ops: at T rows an expert's weights cross HBM once for every token that chose
