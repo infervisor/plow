@@ -40,6 +40,9 @@
 #ifndef PLOW_MOE_ROUTER_SELECT
 #define PLOW_MOE_ROUTER_SELECT PLOW_K3
 #endif
+#ifndef PLOW_MOE_ROUTER_SELECT_LOCAL
+#define PLOW_MOE_ROUTER_SELECT_LOCAL 0
+#endif
 
 /* THE ONLY HARD BOUND IN THIS FILE IS top_k, AND IT IS 16 (was 8 until Kimi-K3).
  *
@@ -429,6 +432,31 @@ __device__ void d_moe_router_topk(unsigned char* table, const bf16* logit, const
                                     PLOW_MOE_MAX_GROUPS));
 
 #if PLOW_MOE_ROUTER_SELECT
+#if PLOW_MOE_ROUTER_SELECT_LOCAL
+    if (n_exp <= 4u * PLOW_THREADS) {
+        unsigned long long local[4] = {0ull, 0ull, 0ull, 0ull};
+        unsigned nlocal = 0u;
+        for (unsigned e = tid; e < n_exp; e += PLOW_THREADS) local[nlocal++] = keys[e];
+        for (unsigned i = 1u; i < 4u; i++) {
+            const unsigned long long v = local[i];
+            unsigned p = i;
+            while (p > 0u && v > local[p - 1u]) {
+                local[p] = local[p - 1u];
+                p--;
+            }
+            local[p] = v;
+        }
+        unsigned next = 0u;
+        for (unsigned j = 0; j < k; j++) {
+            const unsigned long long mine = next < nlocal ? local[next] : 0ull;
+            const unsigned long long best =
+                block_max_u64(mine, (unsigned long long*)(wl + PLOW_MOE_MAX_TOPK));
+            if (mine == best) next++;
+            if (tid == 0) wl[j] = n_exp - 1u - (unsigned)(best & 0xFFFFFu);
+        }
+    } else
+#endif
+    {
     for (unsigned j = 0; j < k; j++) {
         unsigned long long mine = 0ull;
         for (unsigned e = tid; e < n_exp; e += PLOW_THREADS)
@@ -441,6 +469,7 @@ __device__ void d_moe_router_topk(unsigned char* table, const bf16* logit, const
             keys[eid] = 0ull;
         }
         __syncthreads();
+    }
     }
 #else
     for (unsigned e = tid; e < n_exp; e += PLOW_THREADS) {

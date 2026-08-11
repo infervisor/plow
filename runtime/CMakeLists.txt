@@ -662,6 +662,8 @@ option(PLOW_K3_DECODE_TILE_BINSEARCH
        "Use binary expert-tile lookup in batched K3 decode" ON)
 option(PLOW_K3_DECODE_ALIGN_PAR_PREFIX
        "Use a workgroup-parallel expert prefix in batched K3 decode" ON)
+option(PLOW_K3_DECODE_ROUTER_LOCAL
+       "Cache each lane's router keys across K3 top-k reductions" ON)
 option(PLOW_KDA_PF_STATE_RESIDENT
        "Keep K3 TP8 prefill KDA state in registers across serial tokens" OFF)
 option(PLOW_MLA_PF_SV
@@ -823,17 +825,21 @@ if(PLOW_GFX950_HSACO)
         if(PLOW_K3_DECODE_ALIGN_PAR_PREFIX)
             set(_hs_ax_k3_align_prefix -DPLOW_MOE_ALIGN_PAR_PREFIX=1)
         endif()
+        set(_hs_ax_k3_router_local "")
+        if(PLOW_K3_DECODE_ROUTER_LOCAL)
+            set(_hs_ax_k3_router_local -DPLOW_MOE_ROUTER_SELECT_LOCAL=1)
+        endif()
         set(_hs_ax_k3_dec_mxfp4 "")
         if(PLOW_K3_DECODE_MXFP4_PROJ)
             set(_hs_ax_k3_dec_mxfp4 ${_hs_ax_mxfp4})
         endif()
         set(_hs_ax_k3_dec ${_hs_ax_k3_dec} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1
             ${_hs_ax_a4w4_weight} ${_hs_ax_k3_tile_search} ${_hs_ax_k3_align_prefix}
-            ${_hs_ax_k3_dec_mxfp4})
+            ${_hs_ax_k3_router_local} ${_hs_ax_k3_dec_mxfp4})
         set(_hs_ax_k3_dec_fp8kv
             ${_hs_ax_k3_dec_fp8kv} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1
             ${_hs_ax_a4w4_weight} ${_hs_ax_k3_tile_search} ${_hs_ax_k3_align_prefix}
-            ${_hs_ax_k3_dec_mxfp4})
+            ${_hs_ax_k3_router_local} ${_hs_ax_k3_dec_mxfp4})
     endif()
     # ...and the FFN half. A K3 prefill bucket runs the GROUPED expert chain (ops 83-87), not the
     # per-slot decode ops: at T rows an expert's weights cross HBM once for every token that chose

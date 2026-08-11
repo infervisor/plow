@@ -540,12 +540,17 @@ case "${PLOW_K3_DECODE_ALIGN_PAR_PREFIX:-1}" in
   1) AX_K3_ALIGN_PREFIX="-DPLOW_MOE_ALIGN_PAR_PREFIX=1" ;;
   *) echo "FAIL: PLOW_K3_DECODE_ALIGN_PAR_PREFIX must be 0 or 1" >&2; exit 2 ;;
 esac
+case "${PLOW_K3_DECODE_ROUTER_LOCAL:-1}" in
+  0) AX_K3_ROUTER_LOCAL="" ;;
+  1) AX_K3_ROUTER_LOCAL="-DPLOW_MOE_ROUTER_SELECT_LOCAL=1" ;;
+  *) echo "FAIL: PLOW_K3_DECODE_ROUTER_LOCAL must be 0 or 1" >&2; exit 2 ;;
+esac
 case "${PLOW_K3_DECODE_GROUPED:-0}" in
   0|1) ;;
   *) echo "FAIL: PLOW_K3_DECODE_GROUPED must be 0 or 1" >&2; exit 2 ;;
 esac
 if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] || [ "${PLOW_K3_DECODE_GROUPED:-0}" = 1 ]; then
-  AX_K3_DECODE_A4W4="$AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_TILE_SEARCH $AX_K3_ALIGN_PREFIX"
+  AX_K3_DECODE_A4W4="$AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_TILE_SEARCH $AX_K3_ALIGN_PREFIX $AX_K3_ROUTER_LOCAL"
 fi
 # Compile-only falsification axis: the grouped MXFP4 expert body is gated by
 # PLOW_MOE_PF_A4W4, independently of the standalone MXFP4 projection ops. Keep those projection
