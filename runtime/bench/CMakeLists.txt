@@ -12,6 +12,10 @@ if(NOT PLOW_BENCH)
     return()
 endif()
 
+add_executable(control_queue_probe_test dispatch/control_queue_probe_test.c)
+target_compile_options(control_queue_probe_test PRIVATE -Wall -Wextra -Werror)
+add_test(NAME control_queue_probe_abi COMMAND control_queue_probe_test)
+
 # ============================================================================
 # AMD / ROCm interpreter benchmarks (dispatch/ and interp/)
 # ============================================================================
@@ -29,6 +33,25 @@ if(PLOW_ROCM)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
     target_compile_definitions(aql_launch_floor PRIVATE _POSIX_C_SOURCE=199309L)
     target_link_libraries(aql_launch_floor PRIVATE hsa-runtime64 m)
+
+    set(PLOW_CONTROL_QUEUE_HIPCC "$ENV{PLOW_HIPCC}")
+    if(NOT PLOW_CONTROL_QUEUE_HIPCC MATCHES "^/nix/store/")
+        message(FATAL_ERROR "control-queue gfx942 probe requires Nix PLOW_HIPCC")
+    endif()
+    set(CONTROL_QUEUE_PROBE_SRC
+        ${CMAKE_CURRENT_SOURCE_DIR}/dispatch/control_queue_dispatch_floor.hip)
+    set(CONTROL_QUEUE_PROBE_BIN
+        ${CMAKE_CURRENT_BINARY_DIR}/control_queue_dispatch_floor_gfx942.bin)
+    add_custom_command(
+        OUTPUT ${CONTROL_QUEUE_PROBE_BIN}
+        COMMAND "${PLOW_CONTROL_QUEUE_HIPCC}" --offload-arch=gfx942 -O3 -std=c++17
+                -Wall -Wextra -Werror ${CONTROL_QUEUE_PROBE_SRC}
+                -o ${CONTROL_QUEUE_PROBE_BIN}
+        DEPENDS ${CONTROL_QUEUE_PROBE_SRC}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../common/control_queue_probe.h
+        VERBATIM)
+    add_custom_target(control_queue_dispatch_floor_gfx942
+        DEPENDS ${CONTROL_QUEUE_PROBE_BIN})
 
     # --- interp family ---
     # interp_gemm_bench: GEMM throughput through the persistent interpreter
