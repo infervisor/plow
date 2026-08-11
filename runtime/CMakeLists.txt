@@ -652,6 +652,8 @@ option(PLOW_HSACO_MLA "Also emit the MLA prefill object (Kimi/DeepSeek/GLM)" ON)
 option(PLOW_HSACO_K3 "Also emit the Kimi-K3 / KDA objects (decode + prefill)" ON)
 option(PLOW_K3_DECODE_MXFP4_PROJ
        "Include standalone MXFP4 projection ops in K3 decode objects" ON)
+option(PLOW_K3_DECODE_GROUPED
+       "Include grouped A4W4 expert ops in a K3 B=1 decode object" OFF)
 option(PLOW_MXFP4_DECODE_NT
        "Use non-temporal loads for one-use decode MXFP4 projection weights" ON)
 option(PLOW_MOE_PF_A4W4_WEIGHT_NT
@@ -795,7 +797,7 @@ if(PLOW_GFX950_HSACO)
     # and that headroom is not spare).
     set(_hs_ax_k3_dec ${_hs_ax_k3})
     set(_hs_ax_k3_dec_fp8kv ${_hs_ax_k3_fp8kv})
-    if(PLOW_DECODE_BATCH GREATER 1)
+    if(PLOW_DECODE_BATCH GREATER 1 OR PLOW_K3_DECODE_GROUPED)
         set(_hs_ax_k3_dec_mxfp4 "")
         if(PLOW_K3_DECODE_MXFP4_PROJ)
             set(_hs_ax_k3_dec_mxfp4 ${_hs_ax_mxfp4})

@@ -527,7 +527,11 @@ fi
 # therefore need the A4W4 body in the decode object too; without it the deliberate refusal path
 # writes NaNs. Keep B=1 byte-identical because it uses the per-expert decode opcodes instead.
 AX_K3_DECODE_A4W4=""
-if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ]; then
+case "${PLOW_K3_DECODE_GROUPED:-0}" in
+  0|1) ;;
+  *) echo "FAIL: PLOW_K3_DECODE_GROUPED must be 0 or 1" >&2; exit 2 ;;
+esac
+if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] || [ "${PLOW_K3_DECODE_GROUPED:-0}" = 1 ]; then
   AX_K3_DECODE_A4W4="$AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE"
 fi
 # Compile-only falsification axis: the grouped MXFP4 expert body is gated by
@@ -954,7 +958,7 @@ fi
 # B>1 K3 decode dispatches grouped ops 85/86 with MXFP4 encoding. Check the
 # capability marker before the body: the generic grouped arm also contains
 # bf16 MFMA, so disassembly alone cannot prove that the enc=2 arm exists.
-if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] && command -v python3 >/dev/null; then
+if { [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] || [ "${PLOW_K3_DECODE_GROUPED:-0}" = 1 ]; } && command -v python3 >/dev/null; then
   K3_BATCH_EXPECT="$REPO/scripts/asm_expect_gfx942_k3_batched.json"
   k3_batch_objects=()
   for object in \
@@ -968,7 +972,7 @@ if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] && command -v python3 >/dev/null; then
       fail=1
     }
   done
-  if [ "${#k3_batch_objects[@]}" -gt 0 ] && [ -f "$K3_BATCH_EXPECT" ]; then
+  if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] && [ "${#k3_batch_objects[@]}" -gt 0 ] && [ -f "$K3_BATCH_EXPECT" ]; then
     echo ""
     echo "   --- K3 batched A4W4 instruction-selection audit ---"
     batch_audit=$(python3 "$REPO/scripts/asm_audit.py" --expect "$K3_BATCH_EXPECT" \

@@ -168,6 +168,26 @@ nix develop --command bash -lc '
 '
 ```
 
+Build the ladder-compatible B1 decode object separately. The grouped override
+is required because ladder B1 uses grouped MXFP4 expert packets even though its
+row count is one:
+
+```bash
+nix develop --command env \
+  PLOW_DECODE_BATCH=1 \
+  PLOW_K3_DECODE_GROUPED=1 \
+  PLOW_K3_DECODE_MXFP4_PROJ=0 \
+  PLOW_ROWS_ONLY=interp_decode_fp8kv_k3 \
+  JOBS=2 \
+  scripts/build_gfx942.sh \
+  /home/lava/plow/build-amd/k3-b1-ladder-grouped
+```
+
+The partial directory is valid only as a rung override. Do not use it as the
+primary HSACO inventory. Its decode objects must export
+`plow_moe_pf_a4w4_arm`; the build and runtime both refuse an incompatible
+object.
+
 On gfx942, the active grouped kernels must contain
 `v_mfma_f32_32x32x8_bf16` and software FP4 decode. Native CDNA4 scaled-MX
 instructions are forbidden by the audit.
@@ -251,6 +271,7 @@ nix develop --command env \
   PLOW_L2_PLACE_DISPATCH=1 \
   PLOW_TP_AUDIT_COMPACT=1 \
   PLOW_CTR_DBUF=1 \
+  PLOW_HSACO_LOWRUNG=/home/lava/plow/build-amd/k3-b1-ladder-grouped:1 \
   PLOW_DSTEP_LOG=1 \
   PLOW_DSTEP_EVERY=64 \
   perf-data/harness/gpulease -n 8 k3-ladder-slo-serve \
@@ -265,9 +286,13 @@ runs. The runtime chooses the narrowest rung covering the highest occupied
 slot; slots are never compacted or moved. The admission controller widens on
 backlog/SLO pressure and narrows with hysteresis.
 
-The measured run used the default chunked/ragged prefill, no prefix cache, no
+The measured aggregate run used the default chunked/ragged prefill, no prefix cache, no
 prefill batching, no speculative decoding, shared checkpoint mappings, and the
 global-queue object selected by packet capability.
+
+The low-rung override changes only packets whose occupied extent is at most
+one. At C1 it reduced served median TPOT from 85.33 to 53.40 ms with
+byte-identical output; B32 continues to use the primary MM16+walk inventory.
 
 ## 8. Measure served throughput
 
@@ -369,9 +394,9 @@ Rank these against this recipe as the control:
 3. **Ragged/weight-stream-aware grouped MoE.** Remove expert padding without
    rereading weights. BM32, BK32, final-wave culling, implicit-pad removal,
    grouped weight NT, and selected-W2 cache touching were measured and rejected.
-4. **Dedicated low-rung objects.** The ladder fixes correctness and admission,
-   but all rungs share the MM16+walk megakernel. Select B1/B2/B4 objects with
-   lower register and instruction footprints to recover single-stream latency.
+4. **Additional low-rung objects.** B1 is adopted at 53.40 ms TPOT vs 85.33 ms
+   on the MM16+walk object. Measure compatible B2/B4/B8 objects before extending
+   `PLOW_HSACO_LOWRUNG`; object capability must match each ladder packet.
 5. **Pipeline recurrent-state admission.** Initializing one slot clears about
    56.6 MiB/rank across 276 KDA/conv tensors using many blocking fills. Batch or
    enqueue these clears without advancing already-live slots.
