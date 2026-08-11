@@ -4145,6 +4145,9 @@ __device__ void d_moe_group_down_pf(float* part, const bf16* fu, const unsigned 
  * op_gemm.h's capacity marker: any object built from this source HAS the arms. */
 extern "C" __device__ unsigned plow_moe_pf_part16_arm = 1;
 extern "C" __device__ unsigned plow_moe_pf_a8_arm = 1;
+#if PLOW_MOE_PF_A4W4
+extern "C" __device__ unsigned plow_moe_pf_a4w4_arm = 1;
+#endif
 #if PLOW_MOE_PF_ATOMIC
 /* CONDITIONAL, unlike the two above: PLOW_MOE_PF_ATOMIC is a BUILD axis (default off, so the
  * default object is byte-identical), and a blob emitted with the fused decomposition on an

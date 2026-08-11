@@ -473,6 +473,13 @@ fi
 if [ "${PLOW_MOE_PF_A4W4_PRIO:-1}" = 0 ]; then
   AX_K3_A4W4_TUNE="$AX_K3_A4W4_TUNE -DPLOW_MOE_PF_A4W4_PRIO=0"
 fi
+# Batched K3 decode lowers routed experts to the grouped prefill opcodes (83-87). MXFP4 packets
+# therefore need the A4W4 body in the decode object too; without it the deliberate refusal path
+# writes NaNs. Keep B=1 byte-identical because it uses the per-expert decode opcodes instead.
+AX_K3_DECODE_A4W4=""
+if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ]; then
+  AX_K3_DECODE_A4W4="$AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE"
+fi
 
 # FALSIFICATION ARM (PLOW_F2BF_SELECT=1): the REFUTED branchless f2bf. Default 0 = the shipped branched form.
 # MEASURED AND REFUTED: the branchless form is -5.0% static instructions on the prefill
@@ -742,8 +749,8 @@ ROWS=(
   # K3Moe and K3MoeA4w4 onto PrefillArm::K3 for the decode phase), and it carries the mxfp4
   # EXPERT walks by default. `$AX_MXFP4` rides along so an all-fp4 packet finds its fp4
   # PROJECTION ops in the same object rather than falling through the silent dispatch `default:`.
-  "interp_decode_k3|$AX_DECODE $AX_K3 $AX_MXFP4"
-  "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_MXFP4 $AX_FP8KV"
+  "interp_decode_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_MXFP4"
+  "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_MXFP4 $AX_FP8KV"
   # ATTENTION-ONLY, exactly as on gfx950: without $AX_MOE the grouped expert packets fall through
   # `default:` and write nothing. A whole-layer K3 prompt needs the `_moe` rows below.
   "interp_prefill_k3|$AX_PREFILL $AX_MLA_K3 $AX_MXFP4"

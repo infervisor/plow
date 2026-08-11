@@ -915,6 +915,7 @@ fn is_lm_head_matmul(op: u16) -> bool {
 /// Present iff the axis is on, so absence is not ambiguous: every object built before the axis
 /// existed, and every object built with it off, carries no such symbol and has no K3 arm.
 const K3_ARMS_SYM: &str = "plow_k3_arms_1";
+const MOE_PF_A4W4_SYM: &str = "plow_moe_pf_a4w4_arm";
 
 /// Every opcode that reaches an arm behind `PLOW_K3` in `runtime/amd/interp.hip`.
 ///
@@ -942,6 +943,32 @@ fn required_k3_op(progs: &[DevProg]) -> Option<DevOp> {
         .iter()
         .flat_map(|p| p.insts.iter())
         .find_map(|i| K3_ARM_OPS.iter().copied().find(|&o| o as u16 == i.op))
+}
+
+fn required_moe_pf_a4w4(progs: &[DevProg]) -> Option<DevOp> {
+    progs.iter().flat_map(|p| p.insts.iter()).find_map(|i| {
+        let op = DevOp::from_u16(i.op)?;
+        ((op == DevOp::MoeGroupGluPf || op == DevOp::MoeGroupDownPf)
+            && i.i[MOE_PF_ENC_SLOT] == MOE_ENC_MXFP4)
+            .then_some(op)
+    })
+}
+
+fn check_moe_pf_a4w4(syms: &[&str], path: &Path, need: Option<DevOp>) -> Result<()> {
+    let Some(op) = need else {
+        return Ok(());
+    };
+    if syms.contains(&MOE_PF_A4W4_SYM) {
+        return Ok(());
+    }
+    Err(RuntimeError::Device(format!(
+        "packet/object A4W4 MISMATCH: this packet dispatches {op:?} (op {}) with MXFP4 encoding, \
+         but {} was compiled without PLOW_MOE_PF_A4W4 (it does not advertise \
+         `{MOE_PF_A4W4_SYM}`). The kernel refusal path writes NaNs by design. Rebuild the object \
+         with -DPLOW_MOE_PF_A4W4=1.",
+        op as u16,
+        path.display()
+    )))
 }
 
 /// Refuse a code object that has no K3/KDA arms against a packet that dispatches one.
@@ -3548,6 +3575,7 @@ impl AmdEngine {
         // asked about the phase it actually serves rather than about the blob as a whole.
         let need_k3_decode = required_k3_op(&blob.progs[dec_ix..]);
         let need_k3_prefill = required_k3_op(&blob.progs[..dec_ix]);
+        let need_a4w4_decode = required_moe_pf_a4w4(&blob.progs[dec_ix..]);
         // Gemma-4 MoE, both halves, per phase. Same silent-NOP argument as K3 above.
         let need_gm_decode = first_op_in(&blob.progs[dec_ix..], MOE_GEMMA_OPS);
         let need_gm_prefill = first_op_in(&blob.progs[..dec_ix], MOE_GEMMA_OPS);
@@ -3699,6 +3727,9 @@ impl AmdEngine {
                     Phase::Prefill | Phase::Flash => need_k3_prefill,
                 };
                 check_k3_arms(&syms, &path, need_k3)?;
+                if phase == Phase::Decode {
+                    check_moe_pf_a4w4(&syms, &path, need_a4w4_decode)?;
+                }
                 let (need_gm, need_gmpf) = match phase {
                     Phase::Decode => (need_gm_decode, need_gmpf_decode),
                     Phase::Prefill | Phase::Flash => (need_gm_prefill, need_gmpf_prefill),
@@ -6773,6 +6804,27 @@ mod tests {
         assert_eq!(required_k3_op(&plain), None);
         assert!(check_k3_arms(&bare, obj, required_k3_op(&plain)).is_ok());
         assert!(check_k3_arms(&with_k3, obj, required_k3_op(&plain)).is_ok());
+    }
+
+    #[test]
+    fn batched_mxfp4_moe_requires_a4w4_in_the_decode_object() {
+        let obj = Path::new("interp_decode_k3.elf");
+        let mut pkt = vec![prog_gemv(&[DevOp::MoeGroupGluPf, DevOp::MoeGroupDownPf], 4)];
+        for i in &mut pkt[0].insts {
+            i.i[MOE_PF_ENC_SLOT] = MOE_ENC_MXFP4;
+        }
+        let need = required_moe_pf_a4w4(&pkt);
+        assert_eq!(need, Some(DevOp::MoeGroupGluPf));
+        let bare = ["plow_k3_arms_1"];
+        let armed = ["plow_k3_arms_1", MOE_PF_A4W4_SYM];
+        let e = check_moe_pf_a4w4(&bare, obj, need).unwrap_err();
+        assert!(e.to_string().contains("PLOW_MOE_PF_A4W4"));
+        assert!(check_moe_pf_a4w4(&armed, obj, need).is_ok());
+
+        pkt[0].insts[0].i[MOE_PF_ENC_SLOT] = 1;
+        pkt[0].insts[1].i[MOE_PF_ENC_SLOT] = 0;
+        assert_eq!(required_moe_pf_a4w4(&pkt), None);
+        assert!(check_moe_pf_a4w4(&bare, obj, None).is_ok());
     }
 
     /// A packet dispatching a Gemma-4 MoE op against an object built without the matching axis is

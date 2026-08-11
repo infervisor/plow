@@ -39,6 +39,9 @@
  *   nix develop --command env MPA4C3_INTERP=1 perf-data/harness/gpulease -n 1 mpa4c3 \
  *       build-amd/k3-mi325x-roof/bench/moe_prefill_a4w4_cdna3_test \
  *       /tmp/k3-a4w4/interp_prefill_fp8kv_k3_moe_a4w4.elf
+ *
+ * `MPA4C3_DECODE4=1` runs the same oracle at the production batched-decode shape:
+ * four tokens, top-16 routing, 896 experts, H=3584, I=384, and a 304-CU grid.
  */
 
 #ifdef MPA4C3_DEVICE
@@ -113,6 +116,9 @@ static unsigned char e8m0_for_amax_h(double amax) {
     return (unsigned char)e;
 }
 static double silu(double x) { return x / (1.0 + exp(-x)); }
+static double situ(double g, double u) {
+    return 4.0 * tanh(g / 4.0) / (1.0 + exp(-g)) * 25.0 * tanh(u / 25.0);
+}
 static void json_string(FILE* f, const char* s) {
     fputc('"', f);
     for (; *s; s++) {
@@ -150,14 +156,26 @@ int main(int argc, char** argv) {
 
     /* MPA4C3_BENCH=1: TP8 packet geometry for a 4096-token, top-16 K3 chunk. */
     const bool BENCH = getenv("MPA4C3_BENCH") != nullptr;
-    const unsigned H = BENCH ? 3584 : 512, IM = 384, NTOK = BENCH ? 4096 : 8,
-                   NEXP = BENCH ? 896 : 2, BM = 64, GRID = BENCH ? 304 : 5;
+    const bool DECODE4 = getenv("MPA4C3_DECODE4") != nullptr;
+    const bool K3_SHAPE = BENCH || DECODE4;
+    const unsigned H = K3_SHAPE ? 3584 : 512, IM = 384,
+                   NTOK = DECODE4 ? 4 : (BENCH ? 4096 : 8),
+                   NEXP = K3_SHAPE ? 896 : 2, BM = 64, GRID = K3_SHAPE ? 304 : 5;
+    const unsigned decode4_experts[] = {
+        187, 228, 280, 346, 460, 608, 632, 647, 712, 713, 759, 769, 800, 819, 829, 864,
+    };
     std::vector<unsigned> real_rows_v(NEXP), pad_rows_v(NEXP);
     for (unsigned e = 0; e < NEXP; e++) {
-        real_rows_v[e] = BENCH ? (NTOK * 16 / NEXP + (e < (NTOK * 16) % NEXP))
-                               : (e == 0 ? 70 : 50);
-        pad_rows_v[e] = BENCH ? ((real_rows_v[e] + BM - 1) / BM * BM)
-                              : (e == 0 ? 128 : 64);
+        const unsigned* decode4_end =
+            decode4_experts + sizeof(decode4_experts) / sizeof(decode4_experts[0]);
+        const bool decode4_selected =
+            std::find(decode4_experts, decode4_end, e) != decode4_end;
+        real_rows_v[e] = DECODE4 ? (decode4_selected ? 4u : 0u)
+                                 : (K3_SHAPE ? (NTOK * 16 / NEXP +
+                                                (e < (NTOK * 16) % NEXP))
+                                             : (e == 0 ? 70 : 50));
+        pad_rows_v[e] = K3_SHAPE ? ((real_rows_v[e] + BM - 1) / BM * BM)
+                                 : (e == 0 ? 128 : 64);
     }
     const unsigned* real_rows = real_rows_v.data();
     const unsigned* pad_rows = pad_rows_v.data();
@@ -241,7 +259,10 @@ int main(int argc, char** argv) {
     ka.stab = (unsigned long long)(size_t)d_stab; ka.meta = (unsigned long long)(size_t)d_meta;
     ka.rtok = (unsigned long long)(size_t)d_rtok; ka.rpix = (unsigned long long)(size_t)d_rpix;
     ka.rgate = (unsigned long long)(size_t)d_rgate;
-    ka.N = IM; ka.K = H; ka.n_exp = NEXP; ka.act = 1; /* silu */
+    ka.N = IM; ka.K = H; ka.n_exp = NEXP;
+    ka.act = DECODE4 ? 2u : 1u;
+    ka.beta = DECODE4 ? 4.0f : 0.0f;
+    ka.lbeta = DECODE4 ? 25.0f : 0.0f;
     void* d_ka; HC(hipMalloc(&d_ka, sizeof ka)); HC(hipMemcpy(d_ka, &ka, sizeof ka, hipMemcpyHostToDevice));
 
     PlowDevInst interp_inst{};
@@ -304,7 +325,9 @@ int main(int argc, char** argv) {
             interp_inst.op = PLOW_DOP_MOE_GROUP_GLU_PF;
             interp_inst.i[0] = IM;
             interp_inst.i[1] = H;
-            interp_inst.i[5] = 1;
+            interp_inst.i[5] = DECODE4 ? 2u : 1u;
+            interp_inst.fj[0].f = DECODE4 ? 4.0f : 0.0f;
+            interp_inst.fj[1].f = DECODE4 ? 25.0f : 0.0f;
         } else {
             interp_inst.op = PLOW_DOP_MOE_GROUP_DOWN_PF;
             interp_inst.i[0] = H;
@@ -441,7 +464,7 @@ int main(int argc, char** argv) {
                     g += xv * wat(wg[e], sg[e], H, n, k);
                     u += xv * wat(wu[e], su[e], H, n, k);
                 }
-                gluref[(size_t)row * IM + n] = silu(g) * u;
+                gluref[(size_t)row * IM + n] = DECODE4 ? situ(g, u) : silu(g) * u;
             }
             for (unsigned b = 0; b < IM / 32; b++) {
                 /* value check: dequantized device bytes vs unquantized f64 SwiGLU */
