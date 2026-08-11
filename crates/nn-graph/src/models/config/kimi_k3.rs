@@ -59,6 +59,8 @@ pub struct KimiK3TextConfig {
     pub qk_rope_head_dim: u32,
     pub qk_nope_head_dim: u32,
     pub v_head_dim: u32,
+    #[serde(default)]
+    pub mla_use_output_gate: bool,
 
     // --- MoE. Kimi-K3 spellings; see the module note. ---
     pub num_experts: u32,
@@ -108,6 +110,8 @@ pub struct LinearAttnConfig {
     pub short_conv_kernel_size: u32,
     #[serde(default)]
     pub gate_lower_bound: Option<f32>,
+    #[serde(default)]
+    pub use_full_rank_gate: bool,
     /// **1-BASED** layer indices. Converted once, in [`KimiK3TextConfig::attn_kinds`].
     pub full_attn_layers: Vec<i64>,
     /// **1-BASED**, and disjoint from `full_attn_layers`.

@@ -390,10 +390,16 @@ impl Ctx<'_> {
                 if x.rank() != 3 {
                     return Err(self.err("conv1d_depthwise expects [B, S, C]"));
                 }
-                if w.rank() != 2 {
-                    return Err(self.err("conv1d_depthwise weight must be [C, kernel]"));
+                if w.rank() != 3 {
+                    return Err(self.err("conv1d_depthwise weight must be [C, 1, kernel]"));
                 }
-                let kw = req_static(self, w.dim(1), "kernel")?;
+                if req_static(self, w.dim(1), "input channels per group")? != 1 {
+                    return Err(self.err(format!(
+                        "conv1d_depthwise input channels per group is {}, expected 1",
+                        w.dim(1)
+                    )));
+                }
+                let kw = req_static(self, w.dim(2), "kernel")?;
                 if kw != *kernel as i64 {
                     return Err(self.err(format!(
                         "conv1d_depthwise weight kernel is {kw}, op says {kernel}"
@@ -417,12 +423,14 @@ impl Ctx<'_> {
                 head_dim,
                 ..
             } => {
-                self.expect_arity(inputs, 5)?;
+                self.expect_arity(inputs, 7)?;
                 let q = self.input_shape(inputs, 0)?;
                 let k = self.input_shape(inputs, 1)?;
                 let v = self.input_shape(inputs, 2)?;
                 let g = self.input_shape(inputs, 3)?;
                 let beta = self.input_shape(inputs, 4)?;
+                let a_log = self.input_shape(inputs, 5)?;
+                let dt_bias = self.input_shape(inputs, 6)?;
                 if q.rank() != 4 {
                     return Err(self.err("linear_attention q must be [B, S, heads, head_dim]"));
                 }
@@ -458,6 +466,20 @@ impl Ctx<'_> {
                         "linear_attention num_heads is {nh} in the tensors, {num_heads} on the op"
                     )));
                 }
+                if a_log.rank() != 1 || a_log.dim(0).provably_ne(q.dim(2)) {
+                    return Err(self.err(format!(
+                        "linear_attention A_log shape {a_log} must be [num_heads = {}]",
+                        q.dim(2)
+                    )));
+                }
+                let projection = nh * hd;
+                if dt_bias.rank() != 1
+                    || req_static(self, dt_bias.dim(0), "dt_bias width")? != projection
+                {
+                    return Err(self.err(format!(
+                        "linear_attention dt_bias shape {dt_bias} must be [num_heads * head_dim = {projection}]"
+                    )));
+                }
                 // The KDA state is square ([head_dim, head_dim]), so the output
                 // carries the VALUE head dim — read off v rather than assumed.
                 Ok(replace_last(&q, v.dim(3).clone()))
@@ -471,8 +493,8 @@ impl Ctx<'_> {
             }
 
             Op::BlockResidual { max_snapshots } => {
-                // [prefix, snapshot_0.., score_weight] — prefix + weight at minimum.
-                self.expect_arity_range(inputs, 2, 2 + *max_snapshots as usize)?;
+                // [prefix, snapshot_0.., norm_weight, proj_weight].
+                self.expect_arity_range(inputs, 3, 3 + *max_snapshots as usize)?;
                 let prefix = self.input_shape(inputs, 0)?;
                 if prefix.rank() == 0 {
                     return Err(self.err("block_residual prefix must have rank >= 1"));
@@ -480,7 +502,7 @@ impl Ctx<'_> {
                 // Every snapshot is an earlier value of the same running sum, so
                 // it has to match the prefix exactly; a mismatch means the
                 // snapshot stack was pushed from the wrong place.
-                for i in 1..inputs.len() - 1 {
+                for i in 1..inputs.len() - 2 {
                     let s = self.input_shape(inputs, i)?;
                     if s.rank() != prefix.rank()
                         || s.dim(s.rank() - 1)
@@ -490,6 +512,22 @@ impl Ctx<'_> {
                             "block_residual snapshot {i} has shape {s}, expected the prefix shape {prefix}"
                         )));
                     }
+                }
+                let hidden = prefix.dim(prefix.rank() - 1);
+                let norm = self.input_shape(inputs, inputs.len() - 2)?;
+                if norm.rank() != 1 || norm.dim(0).provably_ne(hidden) {
+                    return Err(self.err(format!(
+                        "block_residual norm weight has shape {norm}, expected [{hidden}]"
+                    )));
+                }
+                let proj = self.input_shape(inputs, inputs.len() - 1)?;
+                if proj.rank() != 2
+                    || req_static(self, proj.dim(0), "projection rows")? != 1
+                    || proj.dim(1).provably_ne(hidden)
+                {
+                    return Err(self.err(format!(
+                        "block_residual projection weight has shape {proj}, expected [1, {hidden}]"
+                    )));
                 }
                 Ok(prefix)
             }

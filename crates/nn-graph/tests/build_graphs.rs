@@ -830,12 +830,14 @@ fn k3_json(extra_text: &str) -> String {
             "num_hidden_layers": 4, "num_attention_heads": 4,
             "q_lora_rank": 64, "kv_lora_rank": 32,
             "qk_rope_head_dim": 16, "qk_nope_head_dim": 32, "v_head_dim": 32,
+            "mla_use_output_gate": true,
             "num_experts": 8, "num_experts_per_token": 2, "num_shared_experts": 1,
             "moe_intermediate_size": 128, "routed_expert_hidden_size": 192,
             "first_k_dense_replace": 1,
             "attn_res_block_size": 2,
             "linear_attn_config": {{
               "num_heads": 4, "head_dim": 32, "short_conv_kernel_size": 4,
+              "use_full_rank_gate": true,
               "full_attn_layers": [1, 3], "kda_layers": [2, 4]
             }}
             {extra_text}
@@ -873,6 +875,46 @@ fn kimi_k3_builds_a_hybrid_of_mla_and_kda_layers() {
         g.count_ops(|o| matches!(o, nn_graph::Op::SituGlu { .. })) >= 4,
         "K3 uses situ on every GLU, not SiLU"
     );
+}
+
+/// K3's manifest uses the released checkpoint names, shapes, and F32 state scalars.
+#[test]
+fn kimi_k3_weight_manifest_matches_checkpoint_contract() {
+    let g = build_from_config_json(&k3_json("")).expect("K3 must build");
+    let manifest = g.weight_manifest();
+    let find = |name: &str| {
+        manifest
+            .iter()
+            .find(|w| w.name == name)
+            .unwrap_or_else(|| panic!("missing K3 weight {name}"))
+    };
+
+    for (name, shape) in [
+        ("layers.0.self_attn.g_proj.weight", "[128, 256]"),
+        ("layers.1.self_attn.q_proj.weight", "[128, 256]"),
+        ("layers.1.self_attn.q_conv1d.weight", "[128, 1, 4]"),
+        ("layers.1.self_attn.A_log", "[4]"),
+        ("layers.1.self_attn.dt_bias", "[128]"),
+        ("layers.1.self_attn.o_norm.weight", "[32]"),
+        ("layers.1.self_attention_res_norm.weight", "[256]"),
+        ("layers.1.self_attention_res_proj.weight", "[1, 256]"),
+        ("layers.1.mlp_res_norm.weight", "[256]"),
+        ("layers.1.mlp_res_proj.weight", "[1, 256]"),
+    ] {
+        let w = find(name);
+        assert_eq!(w.shape.unwrap().display_with(&g.syms), shape, "{name}");
+    }
+
+    assert_eq!(find("layers.1.self_attn.A_log").dtype, nn_graph::DType::F32);
+    for name in [
+        "layers.1.self_attn.dt_bias",
+        "layers.1.self_attn.q_conv1d.weight",
+        "layers.1.self_attn.o_norm.weight",
+    ] {
+        assert_eq!(find(name).dtype, nn_graph::DType::F32, "{name}");
+    }
+    assert!(manifest.iter().all(|w| !w.name.contains(".linear_attn.")));
+    assert!(manifest.iter().all(|w| !w.name.ends_with("_res.weight")));
 }
 
 /// The block residual is present and is NOT a plain add.

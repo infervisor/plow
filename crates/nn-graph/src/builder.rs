@@ -51,6 +51,17 @@ impl Nn {
         self.g.weight(name, Shape::new(dims), self.weight_dtype)
     }
 
+    /// A checkpoint parameter whose storage dtype differs from the model's
+    /// configured weight dtype.
+    pub fn param_dtype(
+        &mut self,
+        name: &str,
+        dims: impl IntoIterator<Item = Dim>,
+        dtype: DType,
+    ) -> TensorId {
+        self.g.weight(name, Shape::new(dims), dtype)
+    }
+
     fn emit(&mut self, op: Op, inputs: Vec<TensorId>) -> TensorId {
         self.g.op(op, inputs, self.act_dtype)
     }
@@ -97,6 +108,18 @@ impl Nn {
 
     pub fn rmsnorm(&mut self, name: &str, x: TensorId, hidden: i64, eps: f32) -> TensorId {
         let w = self.param(&format!("{name}.weight"), [Dim::stat(hidden)]);
+        self.emit(Op::RmsNorm { eps }, vec![x, w])
+    }
+
+    pub fn rmsnorm_dtype(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        hidden: i64,
+        eps: f32,
+        dtype: DType,
+    ) -> TensorId {
+        let w = self.param_dtype(&format!("{name}.weight"), [Dim::stat(hidden)], dtype);
         self.emit(Op::RmsNorm { eps }, vec![x, w])
     }
 
@@ -378,10 +401,12 @@ impl Nn {
         x: TensorId,
         channels: i64,
         kernel: u32,
+        weight_dtype: DType,
     ) -> TensorId {
-        let w = self.param(
+        let w = self.param_dtype(
             &format!("{name}.weight"),
-            [Dim::stat(channels), Dim::stat(kernel as i64)],
+            [Dim::stat(channels), Dim::stat(1), Dim::stat(kernel as i64)],
+            weight_dtype,
         );
         self.emit(Op::Conv1dDepthwise { kernel }, vec![x, w])
     }
@@ -397,6 +422,8 @@ impl Nn {
         v: TensorId,
         gate: TensorId,
         beta: TensorId,
+        a_log: TensorId,
+        dt_bias: TensorId,
         num_heads: u32,
         head_dim: u32,
     ) -> TensorId {
@@ -406,7 +433,7 @@ impl Nn {
                 num_heads,
                 head_dim,
             },
-            vec![q, k, v, gate, beta],
+            vec![q, k, v, gate, beta, a_log, dt_bias],
         )
     }
 
@@ -431,11 +458,16 @@ impl Nn {
         hidden: i64,
         max_snapshots: u32,
     ) -> TensorId {
-        let w = self.param(&format!("{name}.weight"), [Dim::stat(1), Dim::stat(hidden)]);
-        let mut ins = Vec::with_capacity(snapshots.len() + 2);
+        let norm = self.param(&format!("{name}_norm.weight"), [Dim::stat(hidden)]);
+        let proj = self.param(
+            &format!("{name}_proj.weight"),
+            [Dim::stat(1), Dim::stat(hidden)],
+        );
+        let mut ins = Vec::with_capacity(snapshots.len() + 3);
         ins.push(prefix);
         ins.extend_from_slice(snapshots);
-        ins.push(w);
+        ins.push(norm);
+        ins.push(proj);
         self.emit(Op::BlockResidual { max_snapshots }, ins)
     }
 
