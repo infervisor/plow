@@ -449,6 +449,27 @@ fn emit_v4_attn(
     let knw = b.tensor(&format!("{p}.attn.kv_norm.weight"), hd as u64 * BF16);
     // NOT skippable: this arm also performs the KV RING WRITE, so dropping it
     // leaves the ring unwritten and the attention gathers uninitialised keys.
+    // TIMING PROBE by duplication: the ring write is idempotent at a fixed
+    // position, so a second emission writes the same bytes and the delta is one
+    // kv rope. This is the last attention op never measured, and the FFN's
+    // packets cost ~63 us against attention's ~190 us, so attention has
+    // something expensive that is NOT a uniform dispatch floor.
+    if v4_skip("kvrope2") {
+        b.emit(DevOp::HeadNormRope, all.clone(), &[kva], |d| {
+            d.t[0] = kvring;
+            d.t[1] = tn.kv;
+            d.t[2] = knw;
+            d.t[3] = tn.cos;
+            d.t[4] = tn.sin;
+            d.t[5] = tn.pos;
+            d.i[0] = 1;
+            d.i[1] = 1;
+            d.i[2] = hd;
+            d.i[5] = 1;
+            d.f[0] = 1e-6;
+            d.j[1] = c.window - 1;
+        });
+    }
     let kvrope = b.emit(DevOp::HeadNormRope, all.clone(), &[kva], |d| {
         d.t[0] = kvring;
         d.t[1] = tn.kv;
