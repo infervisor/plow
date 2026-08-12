@@ -647,3 +647,44 @@ pub(crate) fn deepseek_v4_emit(dir: &Path, ctx: u32, tp: u32) -> ! {
     );
     std::process::exit(2);
 }
+
+#[cfg(test)]
+/// A small but structurally faithful V4 config for emitter tests: the real
+/// hc/head geometry, four layers, one of each compress kind.
+pub(crate) fn cfg_deepseek_v4_for_test() -> V4Cfg {
+    V4Cfg {
+        layers: 4,
+        hidden: 4096,
+        heads: 64,
+        head_dim: 512,
+        rope_head_dim: 64,
+        q_lora: 1024,
+        o_groups: 8,
+        o_lora: 1024,
+        vocab: 129280,
+        window: 128,
+        compress_ratios: vec![0, 0, 4, 128],
+        rope_theta: 10000.0,
+        compress_rope_theta: 160000.0,
+        index_heads: 64,
+        index_head_dim: 128,
+        index_topk: 512,
+        n_exp: 256,
+        shared_exp: 1,
+        top_k: 6,
+        moe_inter: 2048,
+        hash_layers: 3,
+        swiglu_limit: 10.0,
+        score_func: "sqrtsoftplus".into(),
+        route_scale: 1.5,
+        hc_mult: 4,
+        hc_iters: 20,
+        expert_dtype: "fp4".into(),
+        quant_method: "fp8".into(),
+        quant_block: vec![128, 128],
+        scale_fmt: "ue8m0".into(),
+        mtp_layers: 1,
+        dspark_block: 5,
+        dspark_targets: vec![],
+    }
+}
