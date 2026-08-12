@@ -641,8 +641,15 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     // Routed experts, fp4, through the existing mxfp4 expert arms; the shared
     // expert is fp8 and always runs.
     let fu = b.tensor(&format!("act.fu.{l}"), 2 * imoe as u64 * BF16);
-    let ewt = b.tensor(&format!("{p}.ffn.experts.w"), 1);
-    let est = b.tensor(&format!("{p}.ffn.experts.s"), 1);
+    // HOST-FILLED POINTER TABLES, not checkpoint tensors: they hold device
+    // addresses the loader computes after packing the 256 experts. The names
+    // must end in `mlp.expert_weight_table` / `mlp.expert_scale_table` because
+    // `packet::names::is_host_filled_table` SUFFIX-matches those exactly — the
+    // prefix is ours to choose, the suffix is not. Named anything else they
+    // classify as checkpoint weights and the load dies looking for a tensor no
+    // checkpoint contains.
+    let ewt = b.tensor(&format!("layers.{l}.mlp.expert_weight_table"), 8 * e as u64);
+    let est = b.tensor(&format!("layers.{l}.mlp.expert_scale_table"), 8 * e as u64);
     let glu = b.emit(DevOp::MoeExpertGluFp8Blk, all.clone(), &[rt], |d| {
         d.t[0] = fu;
         d.t[1] = tn.xn;
@@ -1081,6 +1088,22 @@ mod tests {
             ("layers.2.attn.compressor.ape", 4 * 1024 * 4),
             ("layers.2.attn.indexer.wq_b.weight", 8192 * 1024),
         ];
+        // The expert pointer tables must classify as HOST-FILLED. Named
+        // anything but the `mlp.expert_*_table` suffix they look like weights,
+        // and the load dies hunting a tensor no checkpoint contains.
+        for l in 0..c.layers {
+            for suf in ["mlp.expert_weight_table", "mlp.expert_scale_table"] {
+                let n = format!("layers.{l}.{suf}");
+                let t = p.tensors.iter().find(|t| t.name == n);
+                assert!(t.is_some(), "emitter never declared `{n}`");
+                assert!(
+                    packet::names::is_host_filled_table(&n),
+                    "`{n}` must be host-filled, not looked up in the checkpoint"
+                );
+                assert!(!is_checkpoint_weight(&n));
+            }
+        }
+
         for (n, bytes) in want {
             let t = p
                 .tensors
