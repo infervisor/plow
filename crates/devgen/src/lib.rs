@@ -5565,7 +5565,8 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // someone widens a pattern. `deepseek_v4_emit` never returns: it validates
     // what the front end can and reports what is not implemented.
     if model_type == "deepseek_v4" {
-        mla::deepseek_v4_emit(&dir, ctx, tp);
+        mla::deepseek_v4_emit(&dir, ctx, tp, &out, n_cu);
+        return;
     }
     if model_type == "glm_moe_dsa" {
         // GLM `--block` (M2): single-block

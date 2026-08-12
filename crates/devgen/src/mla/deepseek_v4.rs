@@ -490,7 +490,7 @@ fn v4_gaps(c: &V4Cfg) -> Vec<V4Gap> {
 }
 
 /// Report what V4 is and what it needs, then refuse. Never returns.
-pub(crate) fn deepseek_v4_emit(dir: &Path, ctx: u32, tp: u32) -> ! {
+pub(crate) fn deepseek_v4_emit(dir: &Path, ctx: u32, tp: u32, out: &str, n_cu: u32) {
     let c = cfg_deepseek_v4(dir);
     let (hdrs, have, total) = k3_shard_headers(dir);
     let mismatches = v4_config_vs_tensors(&c, &hdrs);
@@ -498,7 +498,11 @@ pub(crate) fn deepseek_v4_emit(dir: &Path, ctx: u32, tp: u32) -> ! {
     /* PLOW_V4_FULL takes the real emit; the default stays this report, because
      * a blob that cannot load is worse than a refusal that says why. */
     if std::env::var("PLOW_V4_FULL").ok().as_deref() == Some("1") {
-        crate::v4::v4_emit_full(dir, ctx, "v4_decode.pkt", 304, tp, 0);
+        /* Returns, so plowc's bundle path still writes `weights.json` and the
+         * checkpoint symlinks next to the blob. Exiting here produced a lone
+         * `.pkt` in the CWD and no servable directory at all. */
+        crate::v4::v4_emit_full(dir, ctx, out, n_cu, tp, 0);
+        return;
     }
     eprintln!("deepseek_v4: config ACCEPTED, emission REFUSED.\n");
     eprintln!("  checkpoint  {}", dir.display());

@@ -310,7 +310,18 @@ impl Variant {
                 {
                     return Variant::Fp8Kv;
                 }
-                if i.op == DevOp::GemvFp8 as u16 {
+                // BLOCK-fp8 counts too. A program whose every projection is
+                // `GemvFp8Blk` and whose experts are `MoeExpert*Fp8Blk` is not
+                // bf16 by any reading, but this used to say so — and then asked
+                // for a bf16 object that is not built, so the load died naming a
+                // missing file rather than the wrong precision. Every model that
+                // reached `Fp8`/`Fp8Kv` before still does: they all carry an fp8
+                // flash op, which returns above this line.
+                if i.op == DevOp::GemvFp8 as u16
+                    || i.op == DevOp::GemvFp8Blk as u16
+                    || i.op == DevOp::MoeExpertGluFp8Blk as u16
+                    || i.op == DevOp::MoeExpertDownFp8Blk as u16
+                {
                     v = Variant::Fp8;
                 }
             }
@@ -972,6 +983,24 @@ const K3_ARM_OPS: &[DevOp] = &[
     DevOp::AttnRes,
     DevOp::SituGlu,
     DevOp::MlaOutGate,
+    // DeepSeek-V4. Every one of these sits inside interp.hip's `#if PLOW_K3`
+    // region, so on an object built without that flag the dispatch `default:`
+    // is a silent NOP — the whole model would run as a chain of no-ops and
+    // still emit tokens. Listing them here turns that into a load-time refusal
+    // naming the missing arm, which is the only form of this failure anyone
+    // can debug.
+    DevOp::V4HcReduce,
+    DevOp::V4HcExpand,
+    DevOp::V4HcReduceHead,
+    DevOp::V4HcDot,
+    DevOp::V4HcMix,
+    DevOp::V4SparseAttn,
+    DevOp::V4KvCompress,
+    DevOp::V4IndexScore,
+    DevOp::V4IndexTopk,
+    DevOp::V4GroupedLinear,
+    DevOp::V4MoeRoute,
+    DevOp::V4ClampedSwiGlu,
 ];
 
 /// The first K3/KDA opcode in these programs, or `None` if the packet needs no K3 arm.

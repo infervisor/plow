@@ -913,7 +913,7 @@ pub(crate) fn emit_v4_decode(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, ctx: u32, n_
 /// resolve yet. That is a deliberate intermediate: the packet DAG, the counts
 /// and the ordering are all testable without a single byte of the 167 GB
 /// checkpoint, and they are tested (`the_shipped_43_layer_program_builds`).
-pub(crate) fn v4_emit_full(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, target: u32) -> ! {
+pub(crate) fn v4_emit_full(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, target: u32) {
     assert_eq!(
         tp, 1,
         "V4 TP is not wired: the indexer's score must be all-reduced BEFORE its top-k, so the \
@@ -945,12 +945,10 @@ pub(crate) fn v4_emit_full(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, 
     std::fs::write(out, &blob).expect("write blob");
     eprintln!("  wrote {} ({} bytes)", out, blob.len());
     eprintln!(
-        "\nNOT LOADABLE YET. The routed-expert weight/scale TABLES and the two quantized layouts \
-         (block-fp8 scale grids, fp4 packing) still need their host-side bind; every other weight \
-         is declared under the checkpoint's own name and should resolve. `plowrt serve` on this \
-         blob will fail at load, loudly, naming the first tensor it cannot find."
+        "  the host-side bind of the two quantized layouts (block-fp8 scale grids, fp4 packing) \
+         is what decides whether this LOADS; every weight is declared under the checkpoint's own \
+         name, so a failure names the first tensor it cannot find."
     );
-    std::process::exit(0);
 }
 
 fn b_tensor_count(p: &packet::devbuild::Program) -> usize {
