@@ -738,3 +738,98 @@ fn fuse_qwen3() {
         "fusion dropped or duplicated weight leaves in Qwen3"
     );
 }
+
+// --- DeepSeek-V4 (hyper-connections, compressed KV, hash-routed MoE) ---
+
+const DEEPSEEK_V4: &str = r#"{
+    "model_type": "deepseek_v4",
+    "vocab_size": 1000,
+    "hidden_size": 128,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "head_dim": 32,
+    "qk_rope_head_dim": 8,
+    "q_lora_rank": 64,
+    "o_groups": 2,
+    "o_lora_rank": 16,
+    "rms_norm_eps": 1e-6,
+    "rope_theta": 10000.0,
+    "sliding_window": 8,
+    "compress_ratios": [0, 0, 4, 128],
+    "compress_rope_theta": 160000.0,
+    "index_n_heads": 4,
+    "index_head_dim": 16,
+    "index_topk": 32,
+    "n_routed_experts": 8,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 64,
+    "num_hash_layers": 2,
+    "swiglu_limit": 10.0,
+    "routed_scaling_factor": 1.5,
+    "scoring_func": "sqrtsoftplus",
+    "hc_mult": 4,
+    "hc_sinkhorn_iters": 20,
+    "hc_eps": 1e-6,
+    "torch_dtype": "bfloat16"
+}"#;
+
+/// V4 lowers end to end and saturates. The point of this test is mostly the
+/// weight-leaf equality at the bottom: V4 introduced eight constructors, and
+/// the way to get one wrong is to drop an operand — which is exactly what
+/// lowering to `Opaque` would have done.
+#[test]
+fn fuse_deepseek_v4() {
+    let g = build_from_config_json(DEEPSEEK_V4).expect("build deepseek-v4");
+    let (fused, stats) = rewrite::rewrite_graph(&g).expect("rewrite");
+
+    // The norm→linear fusion still fires: every sub-layer norm feeds a
+    // projection (attn_norm→wq_a, q_norm→wq_b, ffn_norm→gate/w1/w3).
+    assert!(
+        fused.contains("FusedNormLinear"),
+        "rmsnorm→linear fusion did not fire in DeepSeek-V4"
+    );
+    assert!(
+        stats.ops_after < stats.ops_before,
+        "fusion did not reduce ops: {} -> {}",
+        stats.ops_before,
+        stats.ops_after
+    );
+
+    // V4 has no residual add, so the fusion that fires at every other model's
+    // block boundary cannot fire here. Asserted so that a future rule which
+    // "fixes" this by matching HcExpand as an Add gets caught.
+    assert!(
+        !fused.contains("FusedResidualNorm"),
+        "V4 has no residual add; a residual+norm fusion here means HcExpand was \
+         matched as one"
+    );
+
+    // The V4 constructors are present, i.e. nothing fell back to Opaque.
+    for term in [
+        "HcReduce",
+        "HcExpand",
+        "GroupedLinear",
+        "ClampedSwiGlu",
+        "KvCompress",
+        "RopeInverse",
+        "AttentionSink",
+        "AttentionSinkMask",
+        "RmsNormNoGain",
+        "MoeRouterHashed",
+        "MoeRouterBias",
+    ] {
+        assert!(fused.contains(term), "{term} did not survive lowering");
+    }
+    assert!(
+        !fused.contains("Opaque"),
+        "an op fell back to Opaque, which drops every operand but the first"
+    );
+
+    // Weight-manifest completeness.
+    assert_eq!(
+        fused_weights(&fused),
+        graph_weights(&g),
+        "fusion dropped or duplicated weight leaves in DeepSeek-V4"
+    );
+}

@@ -69,6 +69,11 @@ fn term_for(
     Ok(match op {
         Op::Embedding => format!("(Embedding {} {})", e(0)?, e(1)?),
         Op::Scale(f) => format!("(Scale {} {})", e(0)?, f64lit(*f)),
+        // Two inputs is the gained form; one is V4's per-head query rescale,
+        // which has no checkpoint tensor to name.
+        Op::RmsNorm { eps } if inputs.len() == 1 => {
+            format!("(RmsNormNoGain {} {})", e(0)?, f64lit(*eps))
+        }
         Op::RmsNorm { eps } => format!("(RmsNorm {} {} {})", e(0)?, e(1)?, f64lit(*eps)),
         Op::LayerNorm { eps } => {
             format!("(LayerNorm {} {} {} {})", e(0)?, e(1)?, e(2)?, f64lit(*eps))
@@ -104,11 +109,12 @@ fn term_for(
             inverse: false,
             ..
         } => format!("(Rope {} {} {})", e(0)?, *dim, f64lit(*theta)),
-        Op::Rope { inverse: true, .. } => {
-            return Err(LowerError::Unsupported {
-                op: "rope (inverse)",
-            })
-        }
+        Op::Rope {
+            dim,
+            theta,
+            inverse: true,
+            ..
+        } => format!("(RopeInverse {} {} {})", e(0)?, *dim, f64lit(*theta)),
         Op::Attention {
             num_heads,
             num_kv_heads,
@@ -128,7 +134,38 @@ fn term_for(
                 logit_softcap.map(|c| f64lit(c)).unwrap_or_default(),
                 *attn_sink as u8,
             );
-            format!("(Attention {} {} {} {})", e(0)?, e(1)?, e(2)?, quote(&cfg))
+            // The sink is a weight leaf and the mask is a whole subgraph;
+            // neither fits in the config token, so each combination is its own
+            // constructor. Dropping either would orphan its operands.
+            match (*attn_sink, inputs.len()) {
+                (false, 3) => {
+                    format!("(Attention {} {} {} {})", e(0)?, e(1)?, e(2)?, quote(&cfg))
+                }
+                (true, 4) => format!(
+                    "(AttentionSink {} {} {} {} {})",
+                    e(0)?,
+                    e(1)?,
+                    e(2)?,
+                    e(3)?,
+                    quote(&cfg)
+                ),
+                (true, 5) => format!(
+                    "(AttentionSinkMask {} {} {} {} {} {})",
+                    e(0)?,
+                    e(1)?,
+                    e(2)?,
+                    e(3)?,
+                    e(4)?,
+                    quote(&cfg)
+                ),
+                // A masked attention with no sink has no term yet, and no model
+                // in the tree builds one. Refused rather than silently dropped.
+                _ => {
+                    return Err(LowerError::Unsupported {
+                        op: "attention (masked, no sink)",
+                    })
+                }
+            }
         }
         Op::Elementwise(k) => format!("(Ew {} {} {})", quote(ew(*k)), e(0)?, e(1)?),
         Op::Act(k) => format!("(Act {} {})", quote(act(*k)), e(0)?),
@@ -234,20 +271,36 @@ fn term_for(
                 op: "moe_router (group-limited)",
             })
         }
-        // Same reasoning as the grouped arm: the term cannot say that the expert
-        // set came from a token-id table, or that a selection bias reordered it.
-        Op::MoeRouter { hash: true, .. } => {
-            return Err(LowerError::Unsupported {
-                op: "moe_router (hash-routed)",
-            })
-        }
+        // Distinct constructors, not extra operands on `MoeRouter`: both pick a
+        // different expert set, so sharing an e-node with flat top-k would let a
+        // rule rewrite one into the other.
         Op::MoeRouter {
-            select_bias: true, ..
-        } => {
-            return Err(LowerError::Unsupported {
-                op: "moe_router (selection bias)",
-            })
-        }
+            num_experts,
+            top_k,
+            hash: true,
+            ..
+        } => format!(
+            "(MoeRouterHashed {} {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            e(2)?,
+            e(3)?,
+            num_experts,
+            top_k
+        ),
+        Op::MoeRouter {
+            num_experts,
+            top_k,
+            select_bias: true,
+            ..
+        } => format!(
+            "(MoeRouterBias {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            e(2)?,
+            num_experts,
+            top_k
+        ),
         // --- Kimi-K3 ---
         Op::Conv1dDepthwise { kernel } => {
             format!("(Conv1dDepthwise {} {} {})", e(0)?, e(1)?, kernel)
@@ -284,22 +337,69 @@ fn term_for(
                 head_dim
             )
         }
-        // DeepSeek-V4's ops have no e-graph representation yet: Stage 2 decides
-        // which of them earn rewrite rules. Refusing is what keeps a rule from
-        // firing on a node the language cannot actually express.
-        Op::HcReduce { .. } => return Err(LowerError::Unsupported { op: "hc_reduce" }),
-        Op::HcExpand { .. } => return Err(LowerError::Unsupported { op: "hc_expand" }),
-        Op::GroupedLinear { .. } => {
-            return Err(LowerError::Unsupported {
-                op: "grouped_linear",
-            })
+        // --- DeepSeek-V4 ---
+        Op::HcReduce { hc_mult, mode, eps } => {
+            // The mode decides both the projection height and whether a Sinkhorn
+            // normalization runs, so it rides as a token rather than being
+            // flattened into the iteration count.
+            let m = match mode {
+                nn_graph::op::HcMode::Sinkhorn { iters } => format!("sinkhorn:{iters}"),
+                nn_graph::op::HcMode::SigmoidGate => "sigmoid".to_string(),
+            };
+            format!(
+                "(HcReduce {} {} {} {} {} {} {})",
+                e(0)?,
+                e(1)?,
+                e(2)?,
+                e(3)?,
+                hc_mult,
+                quote(&m),
+                f64lit(*eps)
+            )
         }
-        Op::ClampedSwiGlu { .. } => {
-            return Err(LowerError::Unsupported {
-                op: "clamped_swiglu",
-            })
+        Op::HcExpand {
+            hc_mult,
+            sinkhorn_iters,
+            eps,
+        } => format!(
+            "(HcExpand {} {} {} {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            e(2)?,
+            e(3)?,
+            e(4)?,
+            hc_mult,
+            sinkhorn_iters,
+            f64lit(*eps)
+        ),
+        Op::GroupedLinear {
+            groups,
+            out_features,
+        } => format!(
+            "(GroupedLinear {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            groups,
+            out_features
+        ),
+        Op::ClampedSwiGlu { limit } => {
+            format!("(ClampedSwiGlu {} {} {})", e(0)?, e(1)?, f64lit(*limit))
         }
-        Op::KvCompress { .. } => return Err(LowerError::Unsupported { op: "kv_compress" }),
+        Op::KvCompress {
+            ratio,
+            overlap,
+            out_seq,
+        } => format!(
+            "(KvCompress {} {} {} {} {} {} {} {})",
+            e(0)?,
+            e(1)?,
+            e(2)?,
+            e(3)?,
+            e(4)?,
+            ratio,
+            quote(&format!("{overlap}")),
+            quote(&format!("{out_seq}"))
+        ),
         // Variable snapshots lower to a cons chain; both checkpoint weights remain leaves.
         Op::BlockResidual { max_snapshots } => {
             let norm = inputs.len() - 2;

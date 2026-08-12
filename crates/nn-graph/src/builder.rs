@@ -270,7 +270,9 @@ impl Nn {
         )
     }
 
-    /// Attention with a learned per-head sink logit in the softmax denominator.
+    /// Attention with a learned per-head sink logit in the softmax denominator,
+    /// and optionally a score mask (DeepSeek-V4 masks the compressed history
+    /// with its indexer's scores).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_sink(
         &mut self,
@@ -278,6 +280,7 @@ impl Nn {
         q: TensorId,
         k: TensorId,
         v: TensorId,
+        mask: Option<TensorId>,
         num_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
@@ -285,6 +288,9 @@ impl Nn {
         sliding_window: Option<u32>,
     ) -> TensorId {
         let sink = self.param_dtype(name, [Dim::stat(num_heads as i64)], DType::F32);
+        let mut inputs = vec![q, k, v];
+        inputs.extend(mask);
+        inputs.push(sink);
         self.emit(
             Op::Attention {
                 num_heads,
@@ -295,7 +301,7 @@ impl Nn {
                 logit_softcap: None,
                 attn_sink: true,
             },
-            vec![q, k, v, sink],
+            inputs,
         )
     }
 

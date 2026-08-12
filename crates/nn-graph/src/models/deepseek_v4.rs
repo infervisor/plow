@@ -202,6 +202,7 @@ fn attention(
     let kv = nn.reshape(kv, [b.clone(), s.clone(), Dim::stat(1), Dim::stat(hd)]);
 
     // ---- compressed history, and the indexer that scores it ----------------
+    let mut index_scores = None;
     let kv = match ratio {
         None => kv,
         Some(r) => {
@@ -219,7 +220,10 @@ fn attention(
             let c = rope_tail(nn, c, hd, rd, theta);
             let c = nn.reshape(c, [b.clone(), seq_c, Dim::stat(1), Dim::stat(hd)]);
             if overlap {
-                indexer(nn, cfg, p, qr, x, b, s, r, theta);
+                // The scores decide which compressed entries the layer may
+                // attend to, so they enter attention as its score mask. Only
+                // the top-k selection over them is data-dependent.
+                index_scores = Some(indexer(nn, cfg, p, qr, x, b, s, r, theta));
             }
             // Attention reads the window and the compressed history as one
             // key/value sequence.
@@ -232,6 +236,7 @@ fn attention(
         q,
         kv,
         kv,
+        index_scores,
         nh,
         1,
         cfg.head_dim,
@@ -335,15 +340,19 @@ fn moe(
     let k = cfg.num_experts_per_tok;
 
     // The leading layers do not select from the scores at all.
-    if layer < cfg.num_hash_layers {
-        nn.moe_router_hashed(&format!("{p}.gate"), x, ids, h, cfg.vocab_size, e, k);
+    let scores = if layer < cfg.num_hash_layers {
+        nn.moe_router_hashed(&format!("{p}.gate"), x, ids, h, cfg.vocab_size, e, k)
     } else {
-        nn.moe_router_select_bias(&format!("{p}.gate"), x, h, e, k);
-    }
+        nn.moe_router_select_bias(&format!("{p}.gate"), x, h, e, k)
+    };
 
     // Dispatch is runtime indirection; the static graph carries one
-    // representative routed expert, as the V2/V3 builder does.
+    // representative routed expert, as the V2/V3 builder does. Its combine
+    // weight is that expert's own routing score — modeled, rather than the
+    // router being left dangling, so the gate weights stay reachable.
     let routed = expert(nn, cfg, &format!("{p}.experts.0"), x, DType::F4);
+    let weight = nn.slice(scores, -1, 0, 1);
+    let routed = nn.mul(routed, weight);
     let shared = expert(nn, cfg, &format!("{p}.shared_experts"), x, DType::F8E4M3);
     nn.add(routed, shared)
 }
