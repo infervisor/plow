@@ -713,6 +713,20 @@ fn emit_v4_attn(
         );
         return emit_hc_expand(b, c, tn, tn.xr, n_cu, &[wob]);
     }
+    // TIMING PROBE by duplication: wo_a was 33.9 ms before its grid fix and has
+    // been ASSUMED fast since, on the strength of a model-level 7.3x. The second
+    // emission writes the same values, so the delta is one wo_a.
+    if v4_skip("woa2") {
+        b.emit(DevOp::V4GroupedLinear, all.clone(), &[inv], |d| {
+            d.t[0] = ob;
+            d.t[1] = tn.attn_out;
+            d.t[2] = woa;
+            d.i[0] = 1;
+            d.i[1] = og;
+            d.i[2] = orank;
+            d.i[3] = nh * hd / og;
+        });
+    }
     let gl = b.emit(DevOp::V4GroupedLinear, all, &[inv], |d| {
         d.t[0] = ob;
         d.t[1] = tn.attn_out;
