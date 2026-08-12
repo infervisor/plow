@@ -58,6 +58,12 @@
 //! structurally correct program that cannot load, which is why the entry point
 //! is behind `PLOW_V4_FULL` and the default stays the capability report.
 
+// The per-op width rules, borrowed WHOLE from K3 rather than restated. They
+// encode how each shared kernel maps work onto workgroups, which is a property
+// of the kernel and not of the model: `d_rmsnorm` reduces a row inside one
+// workgroup, `d_headnorm_rope` takes one wave per (token, head), `d_moe_combine`
+// one element per thread. V4 handed all three the full CU set.
+use crate::k3::{combine_cus, k3_rope_cus, norm_cus};
 use crate::mla::deepseek_v4::{cfg_deepseek_v4, V4Cfg};
 use packet::dev::DevOp;
 use packet::devbuild::{Builder, Model};
@@ -196,7 +202,13 @@ fn emit_hc_reduce(
     // its opcode doc says exactly that. Fresh device memory made ONE reduce
     // site per program correct by accident; the second site in a layer, and
     // every site on the second token, accumulated onto the previous residue.
-    let z = b.emit(DevOp::V4HcZero, all.clone(), deps, |d| {
+    // ONE CU. The packet floor is per-WORKGROUP cache maintenance (interp.hip's
+    // GATE_HIER note: every workgroup issues buffer_wbl2 + buffer_inv, per-L2,
+    // so each XCD's L2 repeats the same writeback and they serialise). Measured
+    // on this program: a 128-CU packet costs ~32 us and a 1-CU packet ~10 us,
+    // whatever it computes. This one zeroes 25 floats, so every CU past the
+    // first buys nothing and pays the full maintenance round.
+    let z = b.emit(DevOp::V4HcZero, vec![0], deps, |d| {
         d.t[0] = tn.hc_partial;
         d.i[0] = 1 + mix as u32;
     });
@@ -255,7 +267,11 @@ fn emit_hc_expand(
             d.i[2] = c.hc_mult;
         });
     }
-    b.emit(DevOp::V4HcExpand, all, deps, |d| {
+    // `d_hc_expand` is grid-strided ONE ELEMENT PER THREAD over `T * D`, not over
+    // `T * HC * D` — each thread owns one depth and writes all HC streams for it.
+    // So it saturates at ceil(D / 512) = 8 workgroups at hidden 4096, and the 120
+    // beyond that arrive, find nothing, and still pay the maintenance round.
+    b.emit(DevOp::V4HcExpand, combine_cus(&all, c.hidden as u32), deps, |d| {
         d.t[0] = tn.x; // in place: every output reads the whole stream vector first
         d.t[1] = branch;
         d.t[2] = tn.x;
@@ -416,7 +432,7 @@ fn emit_v4_attn(
             d.f[0] = 1e-6;
         });
     }
-    let nrm = b.emit(DevOp::RmsNorm, all.clone(), &[red], |d| {
+    let nrm = b.emit(DevOp::RmsNorm, norm_cus(&all, 1), &[red], |d| {
         d.t[0] = tn.xn;
         d.t[1] = tn.xr;
         d.t[2] = anw;
@@ -438,7 +454,7 @@ fn emit_v4_attn(
         &[nrm],
     );
     let qnw = b.tensor(&format!("{p}.attn.q_norm.weight"), ql as u64 * BF16);
-    let qn = b.emit(DevOp::RmsNorm, all.clone(), &[qa], |d| {
+    let qn = b.emit(DevOp::RmsNorm, norm_cus(&all, 1), &[qa], |d| {
         d.t[0] = qlr;
         d.t[1] = qlr;
         d.t[2] = qnw;
@@ -459,7 +475,7 @@ fn emit_v4_attn(
     // `gamma == NONE` is the weightless rescale; i5 == 1 selects the
     // INTERLEAVED HD=512 template, which ropes the trailing lanes through an
     // identity-prefix table (see the v4_rope oracle).
-    let qrope = if v4_skip("rope") { qb } else { b.emit(DevOp::HeadNormRope, all.clone(), &[qb], |d| {
+    let qrope = if v4_skip("rope") { qb } else { b.emit(DevOp::HeadNormRope, k3_rope_cus(&all, 0, 1, nh), &[qb], |d| {
         d.t[0] = tn.q;
         d.t[1] = tn.q;
         d.t[2] = packet::dev::TENSOR_NONE;
@@ -512,7 +528,10 @@ fn emit_v4_attn(
             d.j[1] = c.window - 1;
         });
     }
-    let kvrope = b.emit(DevOp::HeadNormRope, all.clone(), &[kva], |d| {
+    // ONE head, and DISJOINT from the q rope above: both are gated on `nrm`
+    // through their own GEMV and run together, so sharing slice 0 would
+    // serialise them. Same rule and same reason as K3's `k3_rope_cus` start.
+    let kvrope = b.emit(DevOp::HeadNormRope, k3_rope_cus(&all, 8, 1, 1), &[kva], |d| {
         d.t[0] = kvring;
         d.t[1] = tn.kv;
         d.t[2] = knw;
@@ -607,7 +626,7 @@ fn emit_v4_attn(
     // aperture violation, not a wrong number. Zero is a legal KV row, and the
     // f32 0.0 this writes has the same bit pattern as the i32 0.
     if c.compress_ratio(l) != Some(4) {
-        let z = b.emit(DevOp::V4HcZero, all.clone(), &[kvrope], |d| {
+        let z = b.emit(DevOp::V4HcZero, vec![0], &[kvrope], |d| {
             d.t[0] = idx;
             d.i[0] = c.index_topk;
         });
@@ -731,7 +750,7 @@ fn emit_v4_attn(
     });
 
     // The output de-rotation: the same arm with `sin` negated.
-    let inv = if v4_skip("rope") { amg } else { b.emit(DevOp::HeadNormRope, all.clone(), &[amg], |d| {
+    let inv = if v4_skip("rope") { amg } else { b.emit(DevOp::HeadNormRope, k3_rope_cus(&all, 0, 1, nh), &[amg], |d| {
         d.t[0] = tn.attn_out;
         d.t[1] = tn.attn_out;
         d.t[2] = packet::dev::TENSOR_NONE;
@@ -925,7 +944,7 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
 
     let red = emit_hc_reduce(b, c, tn, &format!("{p}.hc_ffn"), tn.xr, n_cu, deps);
     let fnw = b.tensor(&format!("{p}.ffn_norm.weight"), h as u64 * BF16);
-    let nrm = b.emit(DevOp::RmsNorm, all.clone(), &[red], |d| {
+    let nrm = b.emit(DevOp::RmsNorm, norm_cus(&all, 1), &[red], |d| {
         d.t[0] = tn.xn;
         d.t[1] = tn.xr;
         d.t[2] = fnw;
@@ -1087,7 +1106,7 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
             d.i[3] = e;
             d.i[MOE_ENC_SLOT] = 2;
         });
-        let cmb = b.emit(DevOp::MoeCombine, all, &[dn, shdep], |d| {
+        let cmb = b.emit(DevOp::MoeCombine, combine_cus(&all, h), &[dn, shdep], |d| {
             d.t[0] = tn.xr;
             d.t[1] = tn.xr;
             d.t[2] = shared;
@@ -1147,7 +1166,7 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     // itself — the hyper-connection reduce's output, which is what the expert
     // sum is added to.
     downs.push(shdep);
-    let cmb = b.emit(DevOp::MoeCombine, all, &downs, |d| {
+    let cmb = b.emit(DevOp::MoeCombine, combine_cus(&all, h), &downs, |d| {
         d.t[0] = tn.xr;
         d.t[1] = tn.xr;
         d.t[2] = shared;
@@ -1208,7 +1227,7 @@ pub(crate) fn emit_v4_decode(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, ctx: u32, n_
     // the first reduce in layer 0 mixes uninitialised memory into every layer
     // after it — which is what a 43-layer program returning byte-identical
     // output to a 0-layer one looks like from the outside.
-    let bc = b.emit(DevOp::V4HcBroadcast, all.clone(), &[emb], |d| {
+    let bc = b.emit(DevOp::V4HcBroadcast, combine_cus(&all, c.hidden as u32), &[emb], |d| {
         d.t[0] = tn.x;
         d.t[1] = tn.x;
         d.i[0] = 1;
@@ -1239,7 +1258,7 @@ pub(crate) fn emit_v4_decode(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, ctx: u32, n_
         d.f[0] = 1e-6;
         d.f[1] = 1e-6;
     });
-    let fnrm = b.emit(DevOp::RmsNorm, all.clone(), &[hr], |d| {
+    let fnrm = b.emit(DevOp::RmsNorm, norm_cus(&all, 1), &[hr], |d| {
         d.t[0] = tn.xn;
         d.t[1] = tn.xr;
         d.t[2] = tn.fin_norm;
@@ -1310,16 +1329,28 @@ pub(crate) fn v4_emit_full(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, 
     }
     let mut b = Builder::new(n_cu);
     let tn = declare_v4(&mut b, &c, ctx);
-    // EXPERIMENT: the width every packet is emitted at, independent of the
-    // device's CU count. Every packet in this emitter takes all 304, so every
-    // dispatch waits on 304 counters; GLM and K3 use narrower per-op sets and do
-    // not pay a ~50 us floor on this same interpreter. If the floor is counter
-    // sync rather than a fixed cost, this dial moves it.
+    // The width every packet is emitted at, independent of the device's CU
+    // count. The packet floor is per-WORKGROUP cache maintenance, not counter
+    // sync (interp.hip's GATE_HIER note: buffer_wbl2 + buffer_inv are per-L2, so
+    // each XCD's L2 repeats the same writeback once per workgroup and they
+    // serialise), so width is paid on EVERY packet whether or not it needs the
+    // parallelism. Swept on the shipped 43-layer program, ctx 16384, batch 1:
+    //
+    //      4  396.8 ms/token     64   52.1   <- min
+    //      8  205.9              128  53.5
+    //     16  112.9              304  81.0
+    //     32   69.3
+    //
+    // U-shaped: below 64 the GEMVs lose the bandwidth they need, above it the
+    // maintenance round costs more than the extra CUs return. 304 — what this
+    // defaulted to — is 55% worse than 64, and every measurement in this branch
+    // was taken with the env var set, so the default was never the thing
+    // measured.
     let ecu = std::env::var("PLOW_V4_NCU")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .map(|v| v.clamp(1, n_cu))
-        .unwrap_or(n_cu);
+        .unwrap_or_else(|| n_cu.min(64));
     emit_v4_decode(&mut b, &c, &tn, ctx, ecu);
     let prog = b.finish();
 
