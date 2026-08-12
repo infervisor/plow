@@ -136,10 +136,22 @@ static int run_case(unsigned T, unsigned H, unsigned HD, unsigned NC, unsigned K
                                                 const std::pair<double, int>& b) {
             return a.first != b.first ? a.first > b.first : a.second < b.second;
         });
+        /* THE SET, NOT THE ORDER. `torch.topk` returns indices in descending
+         * score; a radix select returns them in ascending index. Both feed
+         * `d_v4_sparse_attn`, which sums over the selected entries under an
+         * online softmax and is invariant to their order, so what has to match
+         * is membership — including the tie-break, since two ranks that keep
+         * different entries at equal score decode different tokens. Comparing
+         * the sequence would fail a selector that is exactly right. */
+        std::vector<int> want, got;
         for (unsigned k = 0; k < K; k++) {
-            const int want = (k < v.size()) ? v[k].second + offset : -1;
-            if (gidx[(size_t)t * K + k] != want) selbad++;
+            if (k < v.size()) want.push_back(v[k].second + offset);
+            const int g = gidx[(size_t)t * K + k];
+            if (g >= 0) got.push_back(g);
         }
+        std::sort(want.begin(), want.end());
+        std::sort(got.begin(), got.end());
+        if (want != got) selbad++;
     }
     printf("  %-24s score max rel %.3e   selection %s\n", "index_score+topk", worst,
            selbad ? "MISMATCH" : "exact");

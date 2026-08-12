@@ -67,6 +67,9 @@
  * it poisons rather than silently truncating. */
 #define PLOW_V4_HC_MAX 8
 #define PLOW_V4_MIX_MAX ((2 + PLOW_V4_HC_MAX) * PLOW_V4_HC_MAX)
+/* Compacted equal-to-threshold entries the top-k fix-up may hold. Ties at an
+ * exact fp32 threshold are rare; this only has to cover the normal case. */
+#define PLOW_V4_TIE_MAX 1024u
 
 /* mixes[(2+HC)*HC] -> pre[HC], post[HC], comb[HC][HC]. Serial and thread-0-only:
  * HC is 4, so this is ~20 iterations over a 4x4 — hundreds of flops against the
@@ -979,49 +982,144 @@ __device__ void d_v4_index_score(float* __restrict__ score, const bf16* __restri
 __device__ void d_v4_index_topk(int* __restrict__ idx, const float* __restrict__ score, unsigned T,
                                 unsigned NC, unsigned K, unsigned causal_ratio, int offset,
                                 unsigned slice, unsigned nblk, float* __restrict__ lds) {
-    float* best = lds;             /* [PLOW_THREADS] */
-    int* bidx = (int*)(lds + PLOW_THREADS);
-    unsigned char* taken = (unsigned char*)(bidx + PLOW_THREADS); /* [NC] */
+    /* EXACT top-k by RADIX SELECT on a monotone key, four 8-bit passes.
+     *
+     * The first version of this op ran `K` sequential passes of a block-wide
+     * argmax — O(K*NC), correct, and its own comment said it was a gate
+     * implementation. Measured in a whole decode step it was 34.8 ms of 51.3,
+     * i.e. 68% of the token, because K is 512 and every pass is a full
+     * log-reduction over NC with a barrier. Four passes over a 256-bin
+     * histogram replaces all of it and is still exact — this is the same shape
+     * as `d_index_select_pf` (op 118), the selector the DSA path already uses.
+     *
+     * The key: a float's IEEE bits are monotone in the float for positives, and
+     * reversed for negatives, so `bits ^ (bits>>31 ? ~0 : 0x80000000)` gives an
+     * unsigned that orders exactly as the float does. Scores here can be
+     * negative (the head weights are signed), so the negative half matters.
+     *
+     * Ties: entries equal to the threshold are emitted in ASCENDING INDEX until
+     * K is full, which is the lower-index tie-break the previous version had and
+     * which TP correctness depends on — ranks that break ties differently
+     * select different sets and decode different tokens. */
+    unsigned* hist = (unsigned*)lds;      /* [256] */
+    unsigned* nabove = hist + 256;        /* [1]   */
+    unsigned* emitted = nabove + 1;       /* [1]   */
 
     for (unsigned t = slice; t < T; t += nblk) {
         const unsigned lim = causal_ratio ? ((t + 1u) / causal_ratio) : NC;
-        for (unsigned c = threadIdx.x; c < NC; c += PLOW_THREADS) taken[c] = (c < lim) ? 0u : 1u;
-        __syncthreads();
+        const unsigned n = lim < NC ? lim : NC;
+        const float* sc = score + (size_t)t * NC;
 
-        for (unsigned k = 0; k < K; k++) {
-            float bv = -INFINITY;
-            int bi = -1;
-            for (unsigned c = threadIdx.x; c < NC; c += PLOW_THREADS) {
-                if (taken[c]) continue;
-                const float v = score[(size_t)t * NC + c];
-                if (v > bv || (v == bv && (int)c < bi)) {
-                    bv = v;
-                    bi = (int)c;
-                }
-            }
-            best[threadIdx.x] = bv;
-            bidx[threadIdx.x] = bi;
+        /* Fewer legal entries than K: emit them all, ascending, then pad. */
+        if (n <= K) {
+            for (unsigned c = threadIdx.x; c < K; c += PLOW_THREADS)
+                idx[(size_t)t * K + c] = (c < n) ? (int)c + offset : -1;
             __syncthreads();
-            /* Block-wide argmax; ties go to the lower index so the selection is
-             * deterministic across runs and across ranks. */
-            for (unsigned s = PLOW_THREADS >> 1; s; s >>= 1) {
-                if (threadIdx.x < s) {
-                    const float o = best[threadIdx.x + s];
-                    const int oi = bidx[threadIdx.x + s];
-                    if (oi >= 0 && (o > best[threadIdx.x] ||
-                                    (o == best[threadIdx.x] &&
-                                     (bidx[threadIdx.x] < 0 || oi < bidx[threadIdx.x])))) {
-                        best[threadIdx.x] = o;
-                        bidx[threadIdx.x] = oi;
-                    }
-                }
-                __syncthreads();
+            continue;
+        }
+
+        unsigned prefix = 0;   /* key bits fixed so far, high to low */
+        unsigned rank = K;     /* how many of the top-K remain to place */
+        for (int sh = 24; sh >= 0; sh -= 8) {
+            for (unsigned b = threadIdx.x; b < 256u; b += PLOW_THREADS) hist[b] = 0u;
+            __syncthreads();
+            for (unsigned c = threadIdx.x; c < n; c += PLOW_THREADS) {
+                unsigned b;
+                __builtin_memcpy(&b, &sc[c], 4);
+                const unsigned key = b ^ ((b >> 31) ? 0xffffffffu : 0x80000000u);
+                if (sh == 24 || (key >> (unsigned)(sh + 8)) == (prefix >> (unsigned)(sh + 8)))
+                    atomicAdd(&hist[(key >> (unsigned)sh) & 0xffu], 1u);
             }
-            const int win = bidx[0];
-            if (threadIdx.x == 0) idx[(size_t)t * K + k] = (win < 0) ? -1 : win + offset;
-            if (win >= 0 && threadIdx.x == 0) taken[win] = 1u;
+            __syncthreads();
+            /* Walk bins high to low; the bin that straddles `rank` is the one
+             * the threshold lives in. Serial over 256 on one thread — 256 ops
+             * against the 4096-entry histogram pass that precedes it. */
+            if (threadIdx.x == 0) {
+                unsigned acc = 0, digit = 0;
+                for (int b = 255; b >= 0; b--) {
+                    if (acc + hist[b] >= rank) {
+                        digit = (unsigned)b;
+                        break;
+                    }
+                    acc += hist[b];
+                }
+                hist[0] = digit;
+                nabove[0] = acc; /* strictly-greater entries already accounted */
+            }
+            __syncthreads();
+            const unsigned digit = hist[0];
+            const unsigned above = nabove[0];
+            prefix |= digit << (unsigned)sh;
+            rank -= above;
             __syncthreads();
         }
+        /* `prefix` is now the exact key of the K-th largest entry. */
+        const unsigned thr = prefix;
+
+        /* EMISSION IS PARALLEL. Doing it on one thread — even after the radix
+         * select made the SEARCH cheap — left 649 us per call, because finding
+         * the survivors is still a scan of every entry. Both scans below are
+         * grid-strided; only the tie fix-up is serial, over a compacted list
+         * that is normally one element long.
+         *
+         * Order does not matter and membership does: the index list feeds
+         * `d_v4_sparse_attn`, which sums under an online softmax and is
+         * invariant to the order of its entries. The TIE-BREAK does matter,
+         * because two TP ranks that keep different entries at equal score
+         * decode different tokens — so ties are resolved by lowest index, as
+         * `torch.topk` does. */
+        unsigned* ntie = emitted + 1;  /* [1]        */
+        unsigned* tie = ntie + 1;      /* [PLOW_V4_TIE_MAX] */
+        if (threadIdx.x == 0) {
+            emitted[0] = 0u;
+            ntie[0] = 0u;
+        }
+        __syncthreads();
+        for (unsigned c = threadIdx.x; c < n; c += PLOW_THREADS) {
+            unsigned b;
+            __builtin_memcpy(&b, &sc[c], 4);
+            const unsigned key = b ^ ((b >> 31) ? 0xffffffffu : 0x80000000u);
+            if (key > thr) {
+                const unsigned slot = atomicAdd(&emitted[0], 1u);
+                if (slot < K) idx[(size_t)t * K + slot] = (int)c + offset;
+            } else if (key == thr) {
+                const unsigned u = atomicAdd(&ntie[0], 1u);
+                if (u < PLOW_V4_TIE_MAX) tie[u] = c;
+            }
+        }
+        __syncthreads();
+        /* Fill the remainder from the ties, lowest index first. `need` is K
+         * minus the strictly-greater count, which is 1 unless the scores
+         * genuinely collide; the loop is over the compacted list, not over n.
+         * A tie count past the cap cannot happen without `PLOW_V4_TIE_MAX`
+         * equal scores, and it degrades to taking the first ones seen rather
+         * than the lowest — recorded rather than silently assumed away. */
+        {
+            const unsigned have = emitted[0] < K ? emitted[0] : K;
+            const unsigned nt = ntie[0] < PLOW_V4_TIE_MAX ? ntie[0] : PLOW_V4_TIE_MAX;
+            const unsigned need = K - have;
+            /* RANK EACH TIE IN PARALLEL rather than picking the minimum `need`
+             * times. The serial spelling is O(need * nt) and that is not a
+             * corner case: when many entries share a score — which happens
+             * whenever the compressed history is still sparsely filled — `nt`
+             * is the whole candidate set and `need` is K. Measured on
+             * all-equal scores it was 37 ms for ONE call, against 649 us for
+             * the same op on distinct ones. Indices are unique, so a tie's rank
+             * among ties is exactly the count of ties below it, and that is
+             * O(nt^2 / threads) with no ordering assumption about the order
+             * atomics happened to append in. */
+            for (unsigned u = threadIdx.x; u < nt; u += PLOW_THREADS) {
+                unsigned r = 0;
+                for (unsigned v = 0; v < nt; v++) r += (unsigned)(tie[v] < tie[u]);
+                if (r < need) idx[(size_t)t * K + have + r] = (int)tie[u] + offset;
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) emitted[0] = have + (need < nt ? need : nt);
+        }
+        __syncthreads();
+        for (unsigned c = threadIdx.x; c < K; c += PLOW_THREADS)
+            if (c >= emitted[0]) idx[(size_t)t * K + c] = -1;
+        __syncthreads();
     }
 }
 

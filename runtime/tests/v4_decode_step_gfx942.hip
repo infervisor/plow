@@ -142,6 +142,8 @@ static double time_us(F f, int reps = 11) {
     return t[t.size() / 2];
 }
 
+__global__ void k_null(void) {}
+
 static bf16* dev_bf16(size_t n) {
     bf16* p;
     HC_CHECK(hipMalloc(&p, n * 2));
@@ -152,6 +154,18 @@ static float* dev_f32(size_t n) {
     float* p;
     HC_CHECK(hipMalloc(&p, n * 4));
     HC_CHECK(hipMemset(p, 0, n * 4));
+    return p;
+}
+/* Distinct values, because a zero-filled score buffer makes EVERY entry tie at
+ * the top-k threshold — a degenerate input that measures the tie fix-up rather
+ * than the selector. It found a real O(need*nt) defect, but it is not the
+ * decode step's shape. */
+static float* dev_f32_varied(size_t n) {
+    std::vector<float> h(n);
+    for (size_t i = 0; i < n; i++) h[i] = (float)drand48() * 2.0f - 1.0f;
+    float* p;
+    HC_CHECK(hipMalloc(&p, n * 4));
+    HC_CHECK(hipMemcpy(p, h.data(), n * 4, hipMemcpyHostToDevice));
     return p;
 }
 
@@ -175,7 +189,7 @@ int main(void) {
     bf16* Warena = dev_bf16(ARENA / 2);
     bf16* xbuf = dev_bf16(1 << 20);
     bf16* obuf = dev_bf16(1 << 22);
-    float* fbuf = dev_f32(1 << 22);
+    float* fbuf = dev_f32_varied(1 << 22);
     int* ibuf;
     HC_CHECK(hipMalloc(&ibuf, (size_t)(1 << 20) * 4));
     HC_CHECK(hipMemset(ibuf, 0, (size_t)(1 << 20) * 4));
@@ -187,6 +201,15 @@ int main(void) {
         off += bytes;
         return p;
     };
+
+    /* The per-launch floor, measured with an empty kernel at the same grid.
+     * ~1900 packets in a V4 step means this is not a rounding error, and the
+     * persistent interpreter does not pay it: packets are dispatched by a
+     * counter DAG inside one long-running kernel. Both numbers are reported —
+     * as-measured, and with the floor removed — because neither alone is
+     * honest. The second is an ESTIMATE of the interpreter-resident cost, not
+     * a measurement of one. */
+    const double floor_us = time_us([&] { k_null<<<NCU, PLOW_THREADS>>>(); });
 
     struct Row {
         const char* name;
@@ -275,10 +298,18 @@ int main(void) {
                r.bytes > 0 ? r.bytes / (r.us * 1e-6) / 1e9 : 0.0);
     }
     const double ms = tot_us / 1000.0;
-    printf("\n  %-32s       %9s %10.3f %9.1f\n", "TOTAL", "", ms,
+    int nlaunch = 0;
+    for (const auto& r : rows) nlaunch += r.count;
+    const double floor_ms = floor_us * nlaunch / 1000.0;
+    const double net_ms = ms - floor_ms;
+    printf("\n  %-32s %5d %9s %10.3f %9.1f\n", "TOTAL", nlaunch, "", ms,
            tot_bytes / (tot_us * 1e-6) / 1e9);
-    printf("\n  %.3f ms/token  =>  %.1f tok/s      target 200 tok/s (5.000 ms)  %s\n", ms,
-           1000.0 / ms, ms <= 5.0 ? "MET" : "NOT MET");
+    printf("\n  as measured        %.3f ms/token  =>  %6.1f tok/s   %s\n", ms, 1000.0 / ms,
+           ms <= 5.0 ? "MET" : "NOT MET");
+    printf("  launch floor       %.3f ms  (%d kernels x %.2f us) — harness only\n", floor_ms,
+           nlaunch, floor_us);
+    printf("  floor removed      %.3f ms/token  =>  %6.1f tok/s   %s   <- interpreter estimate\n",
+           net_ms, 1000.0 / net_ms, net_ms <= 5.0 ? "MET" : "NOT MET");
     printf("  weight+KV bytes moved: %.2f GB/token; roofline at 4164 GB/s = %.3f ms\n",
            tot_bytes / 1e9, tot_bytes / BW * 1e3);
     printf("  achieved %.1f%% of measured peak bandwidth\n",
