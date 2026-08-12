@@ -685,6 +685,82 @@ pub(crate) fn emit_v4_layer(
     emit_v4_ffn(b, c, tn, l, n_cu, &[a])
 }
 
+/// The whole decode program for one token: embed, every layer, the final
+/// hyper-connection reduce, the norm, the lm_head and the argmax.
+///
+/// The head reduce is a DIFFERENT formula from the per-layer one and not a
+/// special case of it: `[hc, hc*D]` weights, a scalar scale, a sigmoid gate,
+/// and no Sinkhorn — so it is `V4HcReduceHead`, not `V4HcDot` + `V4HcMix` with
+/// the iteration count set to zero.
+pub(crate) fn emit_v4_decode(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, ctx: u32, n_cu: u32) {
+    let all: Vec<u32> = (0..n_cu).collect();
+    let h = c.hidden as u32;
+
+    let emb = b.emit(DevOp::Embed, all.clone(), &[], |d| {
+        d.t[0] = tn.x;
+        d.t[1] = tn.embed;
+        d.t[2] = tn.ids;
+        d.i[0] = 1;
+        d.i[1] = h;
+        d.f[0] = 1.0;
+    });
+
+    let mut dep = emb;
+    for l in 0..c.layers {
+        dep = emit_v4_layer(b, c, tn, l, ctx, n_cu, &[dep]);
+    }
+
+    // The final reduce collapses the streams for the head.
+    let hfn = b.tensor(
+        "hc_head_fn",
+        c.hc_mult as u64 * c.hc_mult as u64 * h as u64 * F32,
+    );
+    let hsc = b.tensor("hc_head_scale", F32);
+    let hba = b.tensor("hc_head_base", c.hc_mult as u64 * F32);
+    let hr = b.emit(DevOp::V4HcReduceHead, all.clone(), &[dep], |d| {
+        d.t[0] = tn.xr;
+        d.t[1] = tn.x;
+        d.t[2] = hfn;
+        d.t[3] = hsc;
+        d.t[4] = hba;
+        d.i[0] = 1;
+        d.i[1] = h;
+        d.i[2] = c.hc_mult;
+        d.f[0] = 1e-6;
+        d.f[1] = 1e-6;
+    });
+    let fnrm = b.emit(DevOp::RmsNorm, all.clone(), &[hr], |d| {
+        d.t[0] = tn.xn;
+        d.t[1] = tn.xr;
+        d.t[2] = tn.fin_norm;
+        d.i[0] = 1;
+        d.i[1] = h;
+        d.f[0] = 1e-6;
+    });
+    // lm_head is bf16 and replicated; at 129280 x 4096 it is 9.3% of a decode
+    // step's bytes on its own (perf-data/tools/v4_decode_budget.py).
+    let lm = b.emit(DevOp::Gemv, all.clone(), &[fnrm], |d| {
+        d.t[0] = tn.logits;
+        d.t[1] = tn.xn;
+        d.t[2] = tn.head;
+        d.i[0] = 1;
+        d.i[1] = c.vocab as u32;
+        d.i[2] = h;
+    });
+    let am = b.emit(DevOp::Argmax, all, &[lm], |d| {
+        d.t[0] = tn.amax;
+        d.t[1] = tn.logits;
+        d.i[0] = c.vocab as u32;
+        d.i[1] = 1;
+    });
+    b.emit(DevOp::ArgmaxFin, vec![0], &[am], |d| {
+        d.t[0] = tn.ids;
+        d.t[1] = tn.amax;
+        d.i[0] = n_cu;
+        d.i[1] = 1;
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,6 +897,61 @@ mod tests {
             0,
             "V4 has no residual add anywhere"
         );
+    }
+
+    /// The whole decode program: one embed, every layer's boundaries, and a
+    /// tail that ends in a token id. A program that does not end in ArgmaxFin
+    /// cannot advance the sequence, and one whose head reduce is the per-layer
+    /// op is a different function at the last step.
+    #[test]
+    fn decode_program_spans_embed_to_token() {
+        let c = cfg_deepseek_v4_for_test();
+        let mut b = Builder::new(8);
+        let tn = declare_v4(&mut b, &c, 16384);
+        emit_v4_decode(&mut b, &c, &tn, 16384, 8);
+        let p = b.finish();
+        let n = |op: DevOp| p.insts.iter().filter(|i| i.op == op as u16).count();
+        assert_eq!(n(DevOp::Embed), 1);
+        assert_eq!(n(DevOp::V4HcExpand), 2 * c.layers as usize);
+        assert_eq!(n(DevOp::V4HcReduceHead), 1, "the head reduce is its OWN op");
+        assert_eq!(n(DevOp::ArgmaxFin), 1);
+        assert_eq!(n(DevOp::Residual), 0, "V4 has no residual add");
+        let last = p.insts.last().expect("a program");
+        assert_eq!(last.op, DevOp::ArgmaxFin as u16);
+        assert_eq!(last.t[0] as u32, tn.ids, "the tail writes in.ids");
+    }
+
+    /// The REAL geometry: 43 layers, 21 of them indexed, at 16k. This is the
+    /// program `plowrt serve` would run at batch 1, and the packet count is
+    /// what the launch-floor argument in the decode-step harness was about —
+    /// under the interpreter these are counter-gated packets, not launches.
+    #[test]
+    fn the_shipped_43_layer_program_builds() {
+        let mut c = cfg_deepseek_v4_for_test();
+        c.layers = 43;
+        c.compress_ratios = (0..46)
+            .map(|i| match i {
+                0 | 1 | 43 | 44 | 45 => 0,
+                n if n % 2 == 0 => 4,
+                _ => 128,
+            })
+            .collect();
+        let mut b = Builder::new(304);
+        let tn = declare_v4(&mut b, &c, 16384);
+        emit_v4_decode(&mut b, &c, &tn, 16384, 304);
+        let p = b.finish();
+        let n = |op: DevOp| p.insts.iter().filter(|i| i.op == op as u16).count();
+        assert_eq!(n(DevOp::V4HcExpand), 86, "two boundaries x 43 layers");
+        assert_eq!(n(DevOp::V4SparseAttn), 86, "split + merge per layer");
+        assert_eq!(n(DevOp::V4IndexScore), 21, "the ratio-4 layers");
+        assert_eq!(n(DevOp::V4KvCompress), 41, "every compressed layer");
+        assert_eq!(n(DevOp::V4MoeRoute), 43);
+        assert!(
+            p.insts.len() > 500,
+            "a 43-layer V4 step is many packets: {}",
+            p.insts.len()
+        );
+        eprintln!("V4 decode program: {} packets", p.insts.len());
     }
 
     /// The expand reads `x` and writes `x`. That aliasing is deliberate and
