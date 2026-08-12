@@ -471,6 +471,7 @@ __device__ __forceinline__ __amdgpu_buffer_rsrc_t buf_rsrc_u(const bf16* base, u
     const bf16* ub = (const bf16*)(size_t)(((unsigned long long)hi << 32) | lo);
     return __builtin_amdgcn_make_buffer_rsrc((void*)ub, (short)0, n_halves * 2u, PLOW_BUF_RSRC3);
 }
+
 /* `aux` = 3 (glc|slc): streaming/non-temporal, exactly as the bf16 weight stream — zero reuse. */
 __device__ __forceinline__ fp8v16 buf_ld_fp8(__amdgpu_buffer_rsrc_t r, unsigned byte_off) {
     return __builtin_bit_cast(fp8v16,
