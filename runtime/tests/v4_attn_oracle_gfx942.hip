@@ -57,11 +57,15 @@
         }                                                                                         \
     } while (0)
 
+enum { ATTN_LDS = 40960 };
+
 __global__ __launch_bounds__(PLOW_THREADS) void k_attn(bf16* out, const bf16* q, const bf16* kv,
                                                        const int* idx, const float* sink,
                                                        unsigned T, unsigned H, unsigned D,
                                                        unsigned TOPK, float scale) {
-    d_v4_sparse_attn(out, q, kv, idx, sink, T, H, D, TOPK, scale, blockIdx.x, gridDim.x);
+    __shared__ __align__(16) char raw[ATTN_LDS];
+    d_v4_sparse_attn(out, q, kv, idx, sink, T, H, D, TOPK, scale, blockIdx.x, gridDim.x,
+                     (float*)raw);
 }
 
 static bf16 f2bf_host(float f) {
@@ -117,7 +121,10 @@ static int run_case(unsigned T, unsigned H, unsigned D, unsigned NKV, unsigned T
     HC_CHECK(hipMemcpy(d_idx, idx.data(), idx.size() * 4, hipMemcpyHostToDevice));
     HC_CHECK(hipMemcpy(d_sink, sink.data(), sink.size() * 4, hipMemcpyHostToDevice));
 
-    const unsigned blocks = T < 4u ? T : 4u;
+    /* One workgroup per (token, head). Deliberately fewer than T*H on one case
+     * so the `for (w = slice; w < T*H; w += nblk)` wrap is exercised — a block
+     * that handles two work items must reset its LDS partials between them. */
+    const unsigned blocks = (T * H > 96u) ? 96u : T * H;
     k_attn<<<blocks, PLOW_THREADS>>>(d_out, d_q, d_kv, d_idx, d_sink, T, H, D, TOPK, scale);
     HC_CHECK(hipDeviceSynchronize());
     std::vector<bf16> got(q.size());

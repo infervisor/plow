@@ -71,7 +71,98 @@
 /* mixes[(2+HC)*HC] -> pre[HC], post[HC], comb[HC][HC]. Serial and thread-0-only:
  * HC is 4, so this is ~20 iterations over a 4x4 — hundreds of flops against the
  * projection's hundreds of thousands. Parallelizing it would cost more in
- * barriers than it saves. */
+ * barriers than it saves.
+ *
+ * THE STATE HAS TO BE IN REGISTERS, AND THAT NEEDS A COMPILE-TIME `HC`.
+ *
+ * The arithmetic is a strict dependency chain — every element of round `it`
+ * reads what round `it - 1` wrote — so nothing hides the latency of whatever
+ * memory it lives in. Three spellings, all measured on this part at the shipped
+ * HC=4, iters=20, as the tail of the split reduce:
+ *
+ *   state in LDS                        78.6 us
+ *   plain local arrays, runtime HC     174.8 us   <- WORSE
+ *   local arrays, compile-time HC        (below)
+ *
+ * The middle one is the trap: a local array indexed by a runtime-derived
+ * `j * HC + k` is not a register file, it is SCRATCH, which is global memory
+ * with a private aperture. So the fast path is templated on `HC` — the same
+ * reason `d_headnorm_rope` templates `head_dim` rather than passing it — and a
+ * checkpoint with any other `hc_mult` keeps the generic LDS path. */
+template <unsigned HCT>
+__device__ __forceinline__ void d_hc_split_sinkhorn_t(const float* __restrict__ mixes,
+                                                      const float* __restrict__ scale,
+                                                      const float* __restrict__ base,
+                                                      unsigned iters, float eps,
+                                                      float* __restrict__ pre_out,
+                                                      float* __restrict__ post_out,
+                                                      float* __restrict__ comb_out) {
+    float pre[HCT], post[HCT], comb[HCT * HCT];
+#pragma unroll
+    for (unsigned j = 0; j < HCT; j++) {
+        pre[j] = 1.0f / (1.0f + __expf(-(mixes[j] * scale[0] + base[j]))) + eps;
+        post[j] = 2.0f / (1.0f + __expf(-(mixes[j + HCT] * scale[1] + base[j + HCT])));
+    }
+#pragma unroll
+    for (unsigned j = 0; j < HCT; j++)
+#pragma unroll
+        for (unsigned k = 0; k < HCT; k++) {
+            const unsigned m = 2u * HCT + j * HCT + k;
+            comb[j * HCT + k] = mixes[m] * scale[2] + base[m];
+        }
+#pragma unroll
+    for (unsigned j = 0; j < HCT; j++) {
+        float mx = comb[j * HCT];
+#pragma unroll
+        for (unsigned k = 1; k < HCT; k++) mx = fmaxf(mx, comb[j * HCT + k]);
+        float s = 0.0f;
+#pragma unroll
+        for (unsigned k = 0; k < HCT; k++) {
+            const float e = __expf(comb[j * HCT + k] - mx);
+            comb[j * HCT + k] = e;
+            s += e;
+        }
+        const float is = 1.0f / s;
+#pragma unroll
+        for (unsigned k = 0; k < HCT; k++) comb[j * HCT + k] = comb[j * HCT + k] * is + eps;
+    }
+#pragma unroll
+    for (unsigned k = 0; k < HCT; k++) {
+        float c = eps;
+#pragma unroll
+        for (unsigned j = 0; j < HCT; j++) c += comb[j * HCT + k];
+        const float ic = 1.0f / c;
+#pragma unroll
+        for (unsigned j = 0; j < HCT; j++) comb[j * HCT + k] *= ic;
+    }
+    for (unsigned it = 1; it < iters; it++) {
+#pragma unroll
+        for (unsigned j = 0; j < HCT; j++) {
+            float r = eps;
+#pragma unroll
+            for (unsigned k = 0; k < HCT; k++) r += comb[j * HCT + k];
+            const float ir = 1.0f / r;
+#pragma unroll
+            for (unsigned k = 0; k < HCT; k++) comb[j * HCT + k] *= ir;
+        }
+#pragma unroll
+        for (unsigned k = 0; k < HCT; k++) {
+            float c = eps;
+#pragma unroll
+            for (unsigned j = 0; j < HCT; j++) c += comb[j * HCT + k];
+            const float ic = 1.0f / c;
+#pragma unroll
+            for (unsigned j = 0; j < HCT; j++) comb[j * HCT + k] *= ic;
+        }
+    }
+#pragma unroll
+    for (unsigned j = 0; j < HCT; j++) {
+        pre_out[j] = pre[j];
+        post_out[j] = post[j];
+    }
+#pragma unroll
+    for (unsigned j = 0; j < HCT * HCT; j++) comb_out[j] = comb[j];
+}
 __device__ __forceinline__ void d_hc_split_sinkhorn(const float* __restrict__ mixes,
                                                     const float* __restrict__ scale,
                                                     const float* __restrict__ base, unsigned HC,
@@ -102,25 +193,33 @@ __device__ __forceinline__ void d_hc_split_sinkhorn(const float* __restrict__ mi
         }
         for (unsigned k = 0; k < HC; k++) comb[j * HC + k] = comb[j * HC + k] / s + eps;
     }
-    /* ...then a column pass, and only then the (iters-1) symmetric rounds. */
+    /* ...then a column pass, and only then the (iters-1) symmetric rounds.
+     *
+     * ONE RECIPROCAL PER ROW, NOT A DIVIDE PER ELEMENT. `iters` is 20 and each
+     * round normalizes `HC` rows and `HC` columns, so the naive spelling issues
+     * `2 * iters * HC * HC` = 640 fp32 divides — and an fp32 divide is an
+     * instruction SEQUENCE, not one VALU op. Measured, that was the entire cost
+     * of the reduce's tail: 91.8 us of a 104.5 us pair, single-threaded and
+     * replicated across every block, against 8.0 us for the 1.5 MiB projection
+     * it follows. Hoisting the reciprocal makes it `2 * iters * HC` = 160. */
     for (unsigned k = 0; k < HC; k++) {
-        float c = 0.0f;
+        float c = eps;
         for (unsigned j = 0; j < HC; j++) c += comb[j * HC + k];
-        c += eps;
-        for (unsigned j = 0; j < HC; j++) comb[j * HC + k] /= c;
+        const float ic = 1.0f / c;
+        for (unsigned j = 0; j < HC; j++) comb[j * HC + k] *= ic;
     }
     for (unsigned it = 1; it < iters; it++) {
         for (unsigned j = 0; j < HC; j++) {
-            float r = 0.0f;
+            float r = eps;
             for (unsigned k = 0; k < HC; k++) r += comb[j * HC + k];
-            r += eps;
-            for (unsigned k = 0; k < HC; k++) comb[j * HC + k] /= r;
+            const float ir = 1.0f / r;
+            for (unsigned k = 0; k < HC; k++) comb[j * HC + k] *= ir;
         }
         for (unsigned k = 0; k < HC; k++) {
-            float c = 0.0f;
+            float c = eps;
             for (unsigned j = 0; j < HC; j++) c += comb[j * HC + k];
-            c += eps;
-            for (unsigned j = 0; j < HC; j++) comb[j * HC + k] /= c;
+            const float ic = 1.0f / c;
+            for (unsigned j = 0; j < HC; j++) comb[j * HC + k] *= ic;
         }
     }
 }
@@ -197,7 +296,10 @@ __device__ void d_hc_reduce(bf16* __restrict__ out, float* __restrict__ mix_out,
                 for (unsigned w = 0; w < PLOW_WAVES; w++) d += part[w * (1u + MIX) + 1u + m];
                 mixes[m] = d * rs;
             }
-            d_hc_split_sinkhorn(mixes, scale, base, HC, iters, hc_eps, pre, post, comb);
+            if (HC == 4)
+                d_hc_split_sinkhorn_t<4>(mixes, scale, base, iters, hc_eps, pre, post, comb);
+            else
+                d_hc_split_sinkhorn(mixes, scale, base, HC, iters, hc_eps, pre, post, comb);
             /* Stash post ++ comb for the expand at the other end of the sub-layer. */
             float* mo = mix_out + (size_t)t * (HC + HC * HC);
             for (unsigned j = 0; j < HC; j++) mo[j] = post[j];
@@ -234,20 +336,26 @@ __device__ void d_hc_expand(bf16* __restrict__ out, const bf16* __restrict__ bra
                 st_act1(&out[(size_t)t * HC * D + i], (bf16)0x7fc1u);
         return;
     }
-    for (unsigned t = slice; t < T; t += nblk) {
+    /* Grid-strided over (token, depth), not over tokens. The expand is
+     * embarrassingly parallel — every `(t, d)` is independent — so a
+     * token-parallel loop left it on ONE CU at decode, where it measured 25.2 us
+     * for 72 KiB of traffic and would have been co-dominant with the reduce it
+     * pairs with. Same defect, same fix, and it is worth stating twice because
+     * both were written the same way. */
+    const size_t work = (size_t)T * D;
+    for (size_t w = (size_t)slice * PLOW_THREADS + threadIdx.x; w < work;
+         w += (size_t)nblk * PLOW_THREADS) {
+        const unsigned t = (unsigned)(w / D), d = (unsigned)(w - (size_t)t * D);
         const float* mi = mix_in + (size_t)t * (HC + HC * HC);
         const bf16* rt = residual + (size_t)t * HC * D;
-        const bf16* bt = branch + (size_t)t * D;
         bf16* ot = out + (size_t)t * HC * D;
-        for (unsigned d = threadIdx.x; d < D; d += PLOW_THREADS) {
-            float r[PLOW_V4_HC_MAX];
-            for (unsigned j = 0; j < HC; j++) r[j] = bf2f(rt[(size_t)j * D + d]);
-            const float b = bf2f(bt[d]);
-            for (unsigned k = 0; k < HC; k++) {
-                float acc = mi[k] * b; /* post[k] * branch */
-                for (unsigned j = 0; j < HC; j++) acc += mi[HC + j * HC + k] * r[j];
-                st_act1(&ot[(size_t)k * D + d], f2bf(acc));
-            }
+        float r[PLOW_V4_HC_MAX];
+        for (unsigned j = 0; j < HC; j++) r[j] = bf2f(rt[(size_t)j * D + d]);
+        const float b = bf2f(branch[(size_t)t * D + d]);
+        for (unsigned k = 0; k < HC; k++) {
+            float acc = mi[k] * b; /* post[k] * branch */
+            for (unsigned j = 0; j < HC; j++) acc += mi[HC + j * HC + k] * r[j];
+            st_act1(&ot[(size_t)k * D + d], f2bf(acc));
         }
     }
 }
@@ -352,44 +460,102 @@ __device__ void d_hc_reduce_head(bf16* __restrict__ out, const bf16* __restrict_
  * it as both, so there is no `v_head_dim != qk_head_dim` split to carry and the
  * output width is D.
  *
- * PERFORMANCE STATUS: this is a CORRECTNESS reference, not a tuned arm. Lanes
- * own dims and keys are consumed one at a time, so every key costs a six-shuffle
- * wave reduction against 8 useful MACs. That is the right shape to prove the
- * numerics and the wrong shape to ship: Stage 4 replaces the score reduction
- * with an MFMA tile over a key block, exactly as the tilelang reference does
- * (`block = 64`, `T.gemm`). No performance claim is made here and none has been
- * measured. */
+ * WORK DECOMPOSITION, and why the first version of this op was 0.0% of roofline.
+ *
+ * It parallelized over TOKENS only — `for (t = slice; t < T; t += nblk)`. At
+ * decode `T == 1`, so exactly ONE workgroup had work and 303 of 304 CUs idled;
+ * the measured 8.3 ms against a 1.03 us VALU roof was almost entirely that, not
+ * the inner loop. Token-parallel is the right axis for prefill and the wrong one
+ * for the shape that decides interactive latency.
+ *
+ * So the work index is `(t, h)` flattened: one workgroup per (token, head), and
+ * the block's waves SPLIT THE KEYS, each carrying its own `(m, l, acc)` and
+ * combining through LDS at the end — the standard flash-decoding split. At the
+ * shipped shape that is 64 workgroups x 8 key-splits instead of 1 workgroup.
+ *
+ * Still not the last word: lanes own dims and keys are consumed one at a time,
+ * so a key costs a six-shuffle reduction against `D/64` useful MACs. Replacing
+ * that with an MFMA tile over a key block (as the tilelang reference does with
+ * `block = 64`, `T.gemm`) is the remaining factor and it is a bigger rewrite. */
 __device__ void d_v4_sparse_attn(bf16* __restrict__ out, const bf16* __restrict__ q,
                                  const bf16* __restrict__ kv, const int* __restrict__ idx,
                                  const float* __restrict__ sink, unsigned T, unsigned H,
                                  unsigned D, unsigned TOPK, float scale, unsigned slice,
-                                 unsigned nblk) {
+                                 unsigned nblk, float* __restrict__ lds) {
     /* One lane per 64th of the head dim. A D that is not a multiple of 64 would
      * leave a ragged tail this layout cannot address; poison rather than drop
      * the tail silently. V4 uses D=512 (attention) and D=128 (indexer). */
     if ((D & 63u) || H == 0) {
-        for (unsigned t = slice; t < T; t += nblk)
-            for (unsigned i = threadIdx.x; i < H * D; i += PLOW_THREADS)
-                st_act1(&out[(size_t)t * H * D + i], (bf16)0x7fc1u);
+        for (unsigned w = slice; w < T * H; w += nblk) {
+            bf16* oh = out + (size_t)w * D;
+            for (unsigned i = threadIdx.x; i < D; i += PLOW_THREADS)
+                st_act1(&oh[i], (bf16)0x7fc1u);
+        }
         return;
     }
     const unsigned DPL = D >> 6; /* dims per lane */
     const unsigned wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
     const unsigned nwave = PLOW_THREADS >> 6;
+    float* pacc = lds;                       /* [nwave][D]  partial numerators */
+    float* pml = lds + (size_t)nwave * D;    /* [nwave][2]  partial m and l    */
 
-    for (unsigned t = slice; t < T; t += nblk) {
+    /* One workgroup per (token, head); the block's waves split the keys. */
+    for (unsigned w = slice; w < T * H; w += nblk) {
+        const unsigned t = w / H, h = w % H;
         const int* it = idx + (size_t)t * TOPK;
-        /* Waves partition the heads; nothing is shared between them. */
-        for (unsigned h = wave; h < H; h += nwave) {
-            const bf16* qh = q + ((size_t)t * H + h) * D;
-            float qv[16], acc[16]; /* DPL <= 16 given D <= 1024 */
-            for (unsigned e = 0; e < DPL; e++) {
-                qv[e] = bf2f(qh[lane * DPL + e]);
-                acc[e] = 0.0f;
-            }
-            float m = -INFINITY, l = 0.0f;
+        const bf16* qh = q + ((size_t)t * H + h) * D;
+        float qv[16], acc[16]; /* DPL <= 16 given D <= 1024 */
+        for (unsigned e = 0; e < DPL; e++) {
+            qv[e] = bf2f(qh[lane * DPL + e]);
+            acc[e] = 0.0f;
+        }
+        float m = -INFINITY, l = 0.0f;
 
-            for (unsigned j = 0; j < TOPK; j++) {
+        /* `DPL == 8` is D=512, the shipped attention width: one `bf16v8` per lane
+         * and the score dot is four `v_dot2c_f32_bf16` instead of eight
+         * shift-convert-FMA triples. Anything else takes the scalar path.
+         *
+         * KEYS ARE TAKEN FOUR AT A TIME. The gather is indirect (`kv[idx[j]]`),
+         * so the address is not known until `idx` lands and a one-key loop is a
+         * chain of DEPENDENT global loads with the online-softmax update between
+         * them — at occupancy 2 there is nothing to hide that with. Four
+         * independent loads in flight is what turns this from latency-bound
+         * into throughput-bound; the softmax chain itself stays strictly
+         * sequential, so the arithmetic is unchanged. */
+        const unsigned KU = 4;
+        if (DPL == 8) {
+            const bf16v8 q8 = ld_glob8(qh + lane * 8);
+            for (unsigned j0 = wave * KU; j0 < TOPK; j0 += nwave * KU) {
+                int p[KU];
+                bf16v8 k8[KU];
+                float part[KU];
+#pragma unroll
+                for (unsigned u = 0; u < KU; u++) {
+                    const unsigned j = j0 + u;
+                    p[u] = (j < TOPK) ? it[j] : -1;
+                    if (p[u] >= 0) k8[u] = ld_glob8(kv + (size_t)p[u] * D + lane * 8);
+                }
+#pragma unroll
+                for (unsigned u = 0; u < KU; u++)
+                    part[u] = (p[u] >= 0) ? dot8(q8, k8[u], 0.0f) : 0.0f;
+#pragma unroll
+                for (unsigned u = 0; u < KU; u++)
+                    for (int o = 32; o; o >>= 1) part[u] += __shfl_xor(part[u], o);
+#pragma unroll
+                for (unsigned u = 0; u < KU; u++) {
+                    if (p[u] < 0) continue;
+                    const float s = part[u] * scale;
+                    const float mn = fmaxf(m, s);
+                    const float resc = (m == -INFINITY) ? 0.0f : __expf(m - mn);
+                    const float pe = __expf(s - mn);
+                    for (unsigned e = 0; e < 8; e++)
+                        acc[e] = acc[e] * resc + pe * bf2f(k8[u][e]);
+                    l = l * resc + pe;
+                    m = mn;
+                }
+            }
+        } else {
+            for (unsigned j = wave; j < TOPK; j += nwave) {
                 const int p = it[j];
                 float kvv[16];
                 float part = 0.0f;
@@ -413,14 +579,36 @@ __device__ void d_v4_sparse_attn(bf16* __restrict__ out, const bf16* __restrict_
                 l = l * resc + pe;
                 m = mn;
             }
-            /* The sink joins the DENOMINATOR only, at the final max, after the
-             * rescale chain has finished. */
-            if (m != -INFINITY) l += __expf(sink[h] - m);
-            const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
-            bf16* oh = out + ((size_t)t * H + h) * D;
-            for (unsigned e = 0; e < DPL; e++)
-                st_act1(&oh[lane * DPL + e], f2bf(acc[e] * inv));
         }
+
+        /* Flash combine across the key-split waves. Each wave's partial is at
+         * its own max, so rescale to the block max before summing. */
+        for (unsigned e = 0; e < DPL; e++) pacc[(size_t)wave * D + lane * DPL + e] = acc[e];
+        if (lane == 0) {
+            pml[wave * 2] = m;
+            pml[wave * 2 + 1] = l;
+        }
+        __syncthreads();
+
+        float mb = -INFINITY;
+        for (unsigned v = 0; v < nwave; v++) mb = fmaxf(mb, pml[v * 2]);
+        float lb = 0.0f;
+        for (unsigned v = 0; v < nwave; v++)
+            if (pml[v * 2] != -INFINITY) lb += pml[v * 2 + 1] * __expf(pml[v * 2] - mb);
+        /* The sink joins the DENOMINATOR only, at the block max, after every
+         * partial has been rescaled onto it. */
+        if (mb != -INFINITY) lb += __expf(sink[h] - mb);
+        const float inv = (lb > 0.0f) ? 1.0f / lb : 0.0f;
+
+        bf16* oh = out + ((size_t)t * H + h) * D;
+        for (unsigned d = threadIdx.x; d < D; d += PLOW_THREADS) {
+            float s = 0.0f;
+            for (unsigned v = 0; v < nwave; v++)
+                if (pml[v * 2] != -INFINITY)
+                    s += pacc[(size_t)v * D + d] * __expf(pml[v * 2] - mb);
+            st_act1(&oh[d], f2bf(s * inv));
+        }
+        __syncthreads(); /* `pacc`/`pml` are reused by the next work item */
     }
 }
 
@@ -711,18 +899,66 @@ __device__ void d_v4_index_score(float* __restrict__ score, const bf16* __restri
                                  const bf16* __restrict__ ckv, const bf16* __restrict__ w,
                                  unsigned T, unsigned H, unsigned HD, unsigned NC, unsigned slice,
                                  unsigned nblk) {
-    for (unsigned t = slice; t < T; t += nblk)
-        for (unsigned c = threadIdx.x; c < NC; c += PLOW_THREADS) {
-            const bf16* kc = ckv + (size_t)c * HD;
-            float acc = 0.0f;
-            for (unsigned h = 0; h < H; h++) {
-                const bf16* qh = q + ((size_t)t * H + h) * HD;
-                float d = 0.0f;
-                for (unsigned e = 0; e < HD; e++) d += bf2f(qh[e]) * bf2f(kc[e]);
-                acc += fmaxf(d, 0.0f) * bf2f(w[(size_t)t * H + h]); /* relu INSIDE the sum */
+    /* ONE WAVE PER COMPRESSED ENTRY, ONE HEAD PER LANE. `index_n_heads` is 64
+     * and a wave is 64 lanes, so the head sum is exactly a wave reduction and
+     * every lane has a full `[HD]` dot to itself — no cross-lane traffic until
+     * the fold.
+     *
+     * The first version of this op strided `c` by the block and `t` by the
+     * grid, which at decode (T=1) left one workgroup with all NC entries and
+     * 303 CUs idle: 34 ms measured against a 1.64 us VALU roof. The work index
+     * here is `(t, c)` flattened over WAVES across the whole grid. */
+    const unsigned wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
+    const unsigned nwave = PLOW_THREADS >> 6;
+    const unsigned wid = slice * nwave + wave;    /* global wave id  */
+    const unsigned wstride = nblk * nwave;
+
+    if (H != 64) {
+        /* The lane==head mapping is what makes this shape work. Anything else
+         * falls back to the portable form rather than computing nonsense. */
+        for (unsigned x = slice; x < T * NC; x += nblk)
+            for (unsigned c = threadIdx.x; c < 1u; c += PLOW_THREADS) {
+                const unsigned t = x / NC, cc = x % NC;
+                const bf16* kc = ckv + (size_t)cc * HD;
+                float acc = 0.0f;
+                for (unsigned h = 0; h < H; h++) {
+                    const bf16* qh = q + ((size_t)t * H + h) * HD;
+                    float d = 0.0f;
+                    for (unsigned e = 0; e < HD; e++) d += bf2f(qh[e]) * bf2f(kc[e]);
+                    acc += fmaxf(d, 0.0f) * bf2f(w[(size_t)t * H + h]);
+                }
+                score[(size_t)t * NC + cc] = acc;
             }
-            score[(size_t)t * NC + c] = acc;
+        return;
+    }
+
+    /* `q` and the head weight depend on the TOKEN and the lane, not on the
+     * entry, so they are hoisted out of the entry loop and live in registers:
+     * `HD/8` = 16 `bf16v8` per lane. Re-reading them per entry was 134 MB of
+     * redundant L1 traffic at NC=8192 for a 16 KiB tensor. */
+    const unsigned NV = HD >> 3;
+    for (unsigned t = 0; t < T; t++) {
+        bf16v8 q8[16]; /* HD <= 128 */
+        if (NV <= 16)
+            for (unsigned u = 0; u < NV; u++)
+                q8[u] = ld_glob8(q + ((size_t)t * H + lane) * HD + u * 8);
+        const float wq = bf2f(w[(size_t)t * H + lane]);
+
+        for (unsigned c = wid; c < NC; c += wstride) {
+            const bf16* kc = ckv + (size_t)c * HD;
+            float d = 0.0f;
+            if (NV <= 16 && (HD & 7u) == 0) {
+                /* Four VALU ops per eight elements, no conversions. */
+                for (unsigned u = 0; u < NV; u++) d = dot8(q8[u], ld_glob8(kc + u * 8), d);
+            } else {
+                const bf16* qh = q + ((size_t)t * H + lane) * HD;
+                for (unsigned e = 0; e < HD; e++) d += bf2f(qh[e]) * bf2f(kc[e]);
+            }
+            float part = fmaxf(d, 0.0f) * wq; /* relu INSIDE the head sum */
+            for (int o = 32; o; o >>= 1) part += __shfl_xor(part, o);
+            if (lane == 0) score[(size_t)t * NC + c] = part;
         }
+    }
 }
 
 /* Top-k selection over the scores, with the prefill causal mask and the KV-ring
@@ -786,5 +1022,143 @@ __device__ void d_v4_index_topk(int* __restrict__ idx, const float* __restrict__
             if (win >= 0 && threadIdx.x == 0) taken[win] = 1u;
             __syncthreads();
         }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Hyper-connection reduce, SPLIT across the grid.
+ * ---------------------------------------------------------------------------
+ *
+ * `d_hc_reduce` above does the whole reduce in one workgroup, which is correct
+ * and is what the oracle gates. It is also, at decode, the single most
+ * expensive thing in the model: `hc_fn` is 1.5 MiB per sub-layer and there are
+ * 86 of them, so a token streams 135 MiB through ONE CU. Measured 238 us per
+ * site against a 0.39 us bandwidth roof — 0.2%, and 20.5 ms/token, an order of
+ * magnitude more than all 43 layers of attention put together.
+ *
+ * The obstacle is a genuine global dependency: `pre` needs all `MIX` mix values,
+ * each of which is a dot over the whole `hc*D` flattened stream, so no part of
+ * the output can be produced before the whole reduction is done. One workgroup
+ * is the only way to do that in ONE packet.
+ *
+ * So it becomes two, ordered by the counter DAG exactly as split-K GEMV already
+ * is in this tree:
+ *
+ *   d_v4_hc_dot   grid-parallel partial reduction of `sum(x^2)` and the MIX dot
+ *                 products into a `[T][1+MIX]` f32 scratch, one atomicAdd per
+ *                 value per block. This is the part that moves the 1.5 MiB.
+ *   d_v4_hc_mix   reads the scratch, does the rsqrt / Sinkhorn split (a few
+ *                 hundred flops over a 4x4 — recomputed per block rather than
+ *                 broadcast, which is cheaper than another dependency), and
+ *                 writes `out` parallel over D.
+ *
+ * The scratch MUST be zeroed before `d_v4_hc_dot` runs.
+ *
+ * `hc_fn` is fp32 IN THE CHECKPOINT, which is why this moves 1.5 MiB and not
+ * 768 KiB. Storing it bf16 would halve the dominant cost of the model at decode;
+ * that is a numerics question for a later pass, not a scheduling one, and it is
+ * recorded here because the roofline says it is worth asking. */
+__device__ void d_v4_hc_dot(float* __restrict__ partial, const bf16* __restrict__ x,
+                            const float* __restrict__ hc_fn, unsigned T, unsigned D, unsigned HC,
+                            unsigned slice, unsigned nblk, float* __restrict__ lds) {
+    const unsigned MIX = (2u + HC) * HC;
+    const unsigned N = HC * D;
+    if (HC > PLOW_V4_HC_MAX || HC == 0) return;
+    const unsigned nwave = PLOW_THREADS >> 6;
+
+    /* THE WEIGHT IS SWEPT LINEARLY, and that is the whole point of this shape.
+     *
+     * `hc_fn` is `[MIX][N]`. The obvious loop — own an `i`, walk `m` — reads
+     * MIX values `N * 4` bytes apart, i.e. 24 separate cache lines per thread
+     * 64 KiB apart. That was measured: it left 272 of 304 blocks with no work
+     * at all (the grid stride exceeded `N`) and ran the rest uncoalesced, for
+     * 10 GB/s against a 4164 GB/s bound.
+     *
+     * So the grid is strided over the FLATTENED `[MIX * N]` weight instead.
+     * Consecutive lanes read consecutive floats of `hc_fn`, which is one
+     * coalesced stream, and the `(m, i)` decode is two integer ops. Each thread
+     * may land on several `m`, so its products go into an LDS accumulator per
+     * mix row rather than a register per row. */
+    float* bdot = lds; /* [1 + MIX] per block */
+    for (unsigned t = 0; t < T; t++) {
+        const bf16* xt = x + (size_t)t * N;
+        for (unsigned k = threadIdx.x; k < 1u + MIX; k += PLOW_THREADS) bdot[k] = 0.0f;
+        __syncthreads();
+
+        const size_t total = (size_t)MIX * N;
+        const size_t gstride = (size_t)nblk * PLOW_THREADS;
+        const unsigned lane = threadIdx.x & 63u;
+        float ss = 0.0f;
+        for (size_t e = (size_t)slice * PLOW_THREADS + threadIdx.x; e < total; e += gstride) {
+            const unsigned m = (unsigned)(e / N), i = (unsigned)(e - (size_t)m * N);
+            const float v = bf2f(xt[i]);
+            /* `sum(x^2)` rides the m == 0 pass, which visits every i exactly once. */
+            if (m == 0) ss += v * v;
+            const float prod = v * hc_fn[e];
+            /* A wave's 64 lanes are consecutive in `e`, so they almost always
+             * share `m` — and an LDS atomic from 64 lanes to ONE address is a
+             * 64-way conflict, fully serialized. That, not the bandwidth, was
+             * what held this at 15 GB/s. Reduce in-wave and let one lane commit.
+             * A wave that straddles a row boundary falls back to per-lane
+             * atomics rather than silently summing into the wrong row. */
+            if ((unsigned)((e - lane) % N) + 63u < N) {
+                float s = prod;
+                for (int o = 32; o; o >>= 1) s += __shfl_xor(s, o);
+                if (lane == 0) atomicAdd(&bdot[1u + m], s);
+            } else {
+                atomicAdd(&bdot[1u + m], prod);
+            }
+        }
+        for (int o = 32; o; o >>= 1) ss += __shfl_xor(ss, o);
+        if ((threadIdx.x & 63u) == 0) atomicAdd(&bdot[0], ss);
+        __syncthreads();
+
+        /* One global atomic per value per BLOCK, not per wave or per lane. */
+        if (threadIdx.x < 1u + MIX)
+            atomicAdd(&partial[(size_t)t * (1u + MIX) + threadIdx.x], bdot[threadIdx.x]);
+        __syncthreads();
+    }
+    (void)nwave;
+}
+
+/* The cheap tail: Sinkhorn split from the reduced partials, then the weighted
+ * stream mix, parallel over D across the whole grid. */
+__device__ void d_v4_hc_mix(bf16* __restrict__ out, float* __restrict__ mix_out,
+                            const bf16* __restrict__ x, const float* __restrict__ partial,
+                            const float* __restrict__ scale, const float* __restrict__ base,
+                            unsigned T, unsigned D, unsigned HC, unsigned iters, float norm_eps,
+                            float hc_eps, unsigned slice, unsigned nblk, float* __restrict__ lds) {
+    const unsigned MIX = (2u + HC) * HC;
+    const unsigned N = HC * D;
+    if (HC > PLOW_V4_HC_MAX || HC == 0) return;
+    float* mixes = lds;
+    float* pre = mixes + MIX;
+    float* post = pre + HC;
+    float* comb = post + HC;
+
+    for (unsigned t = 0; t < T; t++) {
+        const float* pt = partial + (size_t)t * (1u + MIX);
+        if (threadIdx.x == 0) {
+            /* Registers, then one copy out — see `d_hc_split_sinkhorn`. */
+            const float rs = rsqrtf(pt[0] / (float)N + norm_eps);
+            for (unsigned m = 0; m < MIX; m++) mixes[m] = pt[1u + m] * rs;
+            if (HC == 4)
+                d_hc_split_sinkhorn_t<4>(mixes, scale, base, iters, hc_eps, pre, post, comb);
+            else
+                d_hc_split_sinkhorn(mixes, scale, base, HC, iters, hc_eps, pre, post, comb);
+            if (slice == 0) {
+                float* mo = mix_out + (size_t)t * (HC + HC * HC);
+                for (unsigned j = 0; j < HC; j++) mo[j] = post[j];
+                for (unsigned j = 0; j < HC * HC; j++) mo[HC + j] = comb[j];
+            }
+        }
+        __syncthreads();
+        const bf16* xt = x + (size_t)t * N;
+        for (unsigned d = slice * PLOW_THREADS + threadIdx.x; d < D; d += nblk * PLOW_THREADS) {
+            float acc = 0.0f;
+            for (unsigned j = 0; j < HC; j++) acc += pre[j] * bf2f(xt[(size_t)j * D + d]);
+            st_act1(&out[(size_t)t * D + d], f2bf(acc));
+        }
+        __syncthreads();
     }
 }
