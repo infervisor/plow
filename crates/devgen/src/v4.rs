@@ -487,6 +487,18 @@ fn emit_v4_attn(
     // The indexer, on the 21 ratio-4 layers: its own compressed KV, a scorer,
     // and the top-k that decides what attention may read.
     let idx = b.tensor(&format!("act.topk.{l}"), c.index_topk as u64 * I32);
+    // A LAYER WITHOUT AN INDEXER NEVER WRITES `idx`, and `d_v4_sparse_attn`
+    // gathers `kv[idx[j]]`. Left as whatever the allocator held, those are
+    // arbitrary 32-bit values and the gather walks off the KV ring — an
+    // aperture violation, not a wrong number. Zero is a legal KV row, and the
+    // f32 0.0 this writes has the same bit pattern as the i32 0.
+    if c.compress_ratio(l) != Some(4) {
+        let z = b.emit(DevOp::V4HcZero, all.clone(), &[kvrope], |d| {
+            d.t[0] = idx;
+            d.i[0] = c.index_topk;
+        });
+        adeps.push(z);
+    }
     if c.compress_ratio(l) == Some(4) {
         let ih = c.index_heads;
         let ihd = c.index_head_dim;
