@@ -758,17 +758,30 @@ __device__ void d_v4_grouped_linear(bf16* __restrict__ out, const bf16* __restri
      * (see `d_hc_reduce` and `d_hc_expand`, whose comment already says the same
      * thing twice). A T=1 decode makes that shape a single-CU kernel every
      * time. */
+    /* ONE WAVE PER OUTPUT, not one thread.
+     *
+     * Thread-per-output gave each lane its own weight ROW, so the 64 lanes of a
+     * wave read addresses WIDTH*2 bytes apart — a fully uncoalesced gather, 4096
+     * of them per output. The packet trace put this op at 61.3% of the decode
+     * step's CRITICAL PATH (11.1M of 18.2M ticks), by far the largest single
+     * link, even after its grid fix took its MARGINAL cost to 0.069 ms.
+     *
+     * A wave per output makes all 64 lanes read consecutive elements of the SAME
+     * row, which is one coalesced 128-byte transaction per step, and the tail is
+     * a 6-step wave reduction. */
+    const unsigned wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
+    const unsigned nwave = PLOW_THREADS >> 6;
     const size_t work = (size_t)T * GRP * R;
-    for (size_t x = (size_t)slice * PLOW_THREADS + threadIdx.x; x < work;
-         x += (size_t)nblk * PLOW_THREADS) {
+    for (size_t x = (size_t)slice * nwave + wave; x < work; x += (size_t)nblk * nwave) {
         const unsigned t = (unsigned)(x / (GRP * R));
         const unsigned i = (unsigned)(x - (size_t)t * GRP * R);
         const unsigned g = i / R, r = i % R;
         const bf16* orow = o + (size_t)t * GRP * WIDTH + (size_t)g * WIDTH;
         const bf16* wrow = w + ((size_t)g * R + r) * WIDTH;
         float acc = 0.0f;
-        for (unsigned k = 0; k < WIDTH; k++) acc += bf2f(orow[k]) * bf2f(wrow[k]);
-        st_act1(&out[(size_t)t * GRP * R + i], f2bf(acc));
+        for (unsigned k = lane; k < WIDTH; k += 64) acc += bf2f(orow[k]) * bf2f(wrow[k]);
+        for (unsigned d = 32; d; d >>= 1) acc += __shfl_down(acc, d, 64);
+        if (lane == 0) st_act1(&out[(size_t)t * GRP * R + i], f2bf(acc));
     }
 }
 
