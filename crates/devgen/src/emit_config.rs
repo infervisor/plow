@@ -347,6 +347,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_K3_FUSE_NGEMV")]
     pub k3_fuse_ngemv: Option<String>,
 
+    /// K3 B1 Conv3 + StateStepG with double-buffered convolution windows.
+    #[arg(long, env = "PLOW_K3_KDA_CONV_STEP_DB", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub k3_kda_conv_step_db: bool,
+
     /// K3 up-projection no-gather mode (diagnostic).
     #[arg(long, env = "PLOW_K3_UP_NOGATHER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub k3_up_nogather: bool,
@@ -628,6 +632,7 @@ impl EmitConfig {
             glm_router_off_shared: env_bool("GLM_ROUTER_OFF_SHARED"),
             glm_router_old: env_bool("GLM_ROUTER_OLD"),
             k3_fuse_ngemv: env_str("PLOW_K3_FUSE_NGEMV"),
+            k3_kda_conv_step_db: env_bool("PLOW_K3_KDA_CONV_STEP_DB"),
             k3_up_nogather: env_bool("PLOW_K3_UP_NOGATHER"),
             k3_up_gather_only: env_bool("PLOW_K3_UP_GATHER_ONLY"),
             k3_shard_head: env_bool("PLOW_K3_SHARD_HEAD"),

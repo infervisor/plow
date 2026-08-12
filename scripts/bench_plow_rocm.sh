@@ -58,7 +58,7 @@ OUTPUT_LEN="${OUTPUT_LEN:-128}"
 NUM_PROMPTS="${NUM_PROMPTS:-3}"
 READY_TIMEOUT="${READY_TIMEOUT:-1800}"
 QTAG="${QTAG:-bf16}"
-GPULEASE="${GPULEASE:-$REPO/perf-data/harness/gpulease}"
+GPULEASE="${GPULEASE:-$REPO/perf-data/tools/gpulease}"
 BENCH="${BENCH:-/workspace/rocm7-bench-venv/bin/vllm}"
 # PLOWRT_BIN exists because target/release/plowrt is SHARED. A concurrent agent
 # running `cargo build -p plowrt` with no features replaces it mid-benchmark

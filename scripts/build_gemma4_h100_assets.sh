@@ -42,7 +42,7 @@ if [ -d "$FP8_TWIN" ]; then
   PLOW_UNISEG=1 PLOW_NS_FULL_ABS=33 PLOW_FP8=1 \
     "$GEMMA4" "$MODEL" "$CTX" "$OUT/fp8/model.pkt" "$NCU"
 else
-  echo "!!! fp8 twins absent ($FP8_TWIN) — run perf-data/harness/quantize_fp8.py first; skipping fp8"
+  echo "!!! fp8 twins absent ($FP8_TWIN) — run perf-data/tools/quantize_fp8.py first; skipping fp8"
   rmdir "$OUT/fp8" 2>/dev/null || true
 fi
 

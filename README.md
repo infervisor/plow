@@ -173,6 +173,8 @@ NVIDIA GH200, OpenAI-compatible API on TCP:
 
 Measured campaigns and their protocols live in
 [`perf-data/plow-gfx942/`](perf-data/plow-gfx942/).
+The full Kimi-K3 TP8/MI325X build and serving recipe is
+[`docs/amd/kimi-k3-mi325x-recipe.md`](docs/amd/kimi-k3-mi325x-recipe.md).
 
 ## Asset layout (what `serve` expects)
 

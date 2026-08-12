@@ -328,10 +328,10 @@ nix develop -c bash -c 'for a in ctl fit; do
 GRAPHSTAT_V=1 nix develop -c ./target/release/examples/graphstat <pkt>   # per-packet `blocks=`
 
 # the A/B (timing AND token identity out of one 4-minute weight load)
-perf-data/harness/gpulease -n 4 glm-wgfit sg render -c 'perf-data/glm52_wgfit_ab.sh'
+perf-data/tools/gpulease -n 4 glm-wgfit sg render -c 'perf-data/glm52_wgfit_ab.sh'
 
 # the §0-BENCH-legal arm (coherence + vllm bench serve -> plowrt)
-perf-data/harness/gpulease -n 4 glm-wgfit-srv sg render -c 'perf-data/glm52_wgfit_srv_ab.sh'
+perf-data/tools/gpulease -n 4 glm-wgfit-srv sg render -c 'perf-data/glm52_wgfit_srv_ab.sh'
 ```
 
 Raw: `glm52-dispatch-width-raw-lease{1,2}.txt`, `…-raw-serve.txt`. Drivers: `glm52_wgfit_ab.sh`,

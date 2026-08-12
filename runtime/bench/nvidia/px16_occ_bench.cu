@@ -30,7 +30,7 @@
  * natural arm. maxdiff is printed as a self-check that the cap did not change the kernel.
  *
  * Build:  bash perf-data/px16_build.sh /tmp/px16 [extra -D...]
- * Run:    perf-data/harness/gpulease px16 bash perf-data/px16_run.sh
+ * Run:    perf-data/tools/gpulease px16 bash perf-data/px16_run.sh
  */
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>

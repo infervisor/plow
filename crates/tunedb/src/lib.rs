@@ -47,7 +47,7 @@ pub use store::{StaleNote, StoreError, TuneStore};
 
 /// Exit code `gpulease` uses for "the run completed but the GPU was contended".
 ///
-/// `perf-data/harness/README.md` is explicit that a contended run silently
+/// `perf-data/tools/README.md` is explicit that a contended run silently
 /// invalidates timings, so this is treated as a failed measurement rather than
 /// a result with a caveat.
 pub const GPULEASE_CONTENDED: i32 = 76;

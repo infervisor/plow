@@ -2,7 +2,7 @@
 
 RTX 5090 (sm_120a, 170 SM, 32 GiB / 30.86 GiB free at startup, driver 580.159.03) · 2026-07-26 ·
 Gemma-4-12B-it, **fp8 weights on both engines in every row**. Every GPU run under
-`perf-data/harness/gpulease`. Companion to `px12-consolidated-baseline.md` (the 127k cell),
+`perf-data/tools/gpulease`. Companion to `px12-consolidated-baseline.md` (the 127k cell),
 `gemma4-12b-longctx-5090.md` §9a (the needle claim) and `px17-mixed-batching.md` (the prefill
 patch-site fix this note depends on). Those documents are **not edited**; corrections are stated
 here.
@@ -449,7 +449,7 @@ kernel arm that does not exist yet.
 | plow all-layer fp8-KV on the FASTPF prefill arm | **STRUCTURALLY IMPOSSIBLE** — an all-layer packet emits hd256 `FLASH_PREFILL_FP8`, and the PIPE=1 px4 fp8-mma arm `__trap()`s on it (`interp_sm120.cu:846`). plow's fp8-KV row is PIPE=0 by construction, and that is most of its fp8 deficit (§4) |
 | `PLOW_PF_DEFER_DECODE` off in every reported row | **PASS** — never set by `px20_cell.sh`; no throughput-mode row is reported |
 | TTFT / TPOT | **NOT REPORTED, deliberately** — invalid for plow (role-only SSE chunk poisons the first ITL sample) |
-| GPU exclusive | **ENFORCED** — 17 `perf-data/harness/gpulease` leases, **all rc=0**, zero `WARN foreign` lines for any `px20-*` label |
+| GPU exclusive | **ENFORCED** — 17 `perf-data/tools/gpulease` leases, **all rc=0**, zero `WARN foreign` lines for any `px20-*` label |
 | sanity vs physical bounds | **PASS** — the fastest decode step in the note (plow, 127k bf16, conc 1, 13.98 ms) implies 2.64 GiB of KV read per step = **202 GB/s**; the busiest (plow, 127k bf16, conc 8, 6 × 2.64 GiB / 49.20 ms) = **345 GB/s**. Both far under the 1792 GB/s ceiling, as expected for a latency-bound decode — no row needs a bandwidth denominator to be believed |
 | greedy parity between the two plow KV arms | **NOT RUN, and not meaningful** — changing the KV cache dtype changes the numerics by construction; there is no bit-exactness to gate |
 | plow arm tuned per KV dtype | **NOT RUN** — both arms use `GF_FULL=8` and stock `GV_MM_MAX`. `FP8PV` (the largest lever in PX-12/13) is unreachable here because it needs FASTPF, which needs a mixed packet |
@@ -482,8 +482,8 @@ kernel arm that does not exist yet.
     perf-data/px20_build_cubins.sh               # the two served cubin sets
     perf-data/px20_emit.sh <name> <ctx> <B> <bf16|fp8kv>
     perf-data/px20_make_needle.py --tokens 66901 --out /tmp/px20/needle67k.json
-    perf-data/harness/gpulease px20-vllm-needle perf-data/px20_vllm_needle.sh 70000
-    perf-data/harness/gpulease px20-plow-needle perf-data/px20_plow_needle.sh
+    perf-data/tools/gpulease px20-vllm-needle perf-data/px20_vllm_needle.sh 70000
+    perf-data/tools/gpulease px20-plow-needle perf-data/px20_plow_needle.sh
     perf-data/px20_queue.sh                      # conc-8 matrix, one lease per cell
     perf-data/px20_retool_gf4.sh                 # deployed GF_FULL=4 cubins
     perf-data/px20_mk_gf4_assets.sh              # same packets, GF_FULL=4 decode object

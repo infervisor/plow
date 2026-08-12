@@ -251,18 +251,20 @@ fn mla_attention(
     let attn = nn.attention(q, k, value, nh, nh, qk_head as u32, true, None, None);
     let merged = nn.reshape(attn, [b.clone(), s.clone(), Dim::stat(nh as i64 * v_head)]);
 
-    // K3's MLA OUTPUT GATE — sigmoid(W_g · x) * attn, before o_proj. Absent
-    // from K2. Skipping it leaves every full-attention layer un-gated, which
-    // scales the residual wrongly rather than failing.
-    let gate = nn.linear(
-        &format!("{p}.self_attn.o_gate_proj"),
-        x,
-        h,
-        nh as i64 * v_head,
-        false,
-    );
-    let gate = nn.act(ActKind::Sigmoid, gate);
-    let gated = nn.mul(merged, gate);
+    // K3's optional MLA output gate, before o_proj.
+    let gated = if cfg.mla_use_output_gate {
+        let gate = nn.linear(
+            &format!("{p}.self_attn.g_proj"),
+            x,
+            h,
+            nh as i64 * v_head,
+            false,
+        );
+        let gate = nn.act(ActKind::Sigmoid, gate);
+        nn.mul(merged, gate)
+    } else {
+        merged
+    };
 
     nn.linear(
         &format!("{p}.self_attn.o_proj"),
@@ -297,12 +299,13 @@ fn kda_attention(
     // q / k / v, each [B, S, inner], each through its own depthwise causal conv.
     let mut qkv = Vec::with_capacity(3);
     for which in ["q", "k", "v"] {
-        let proj = nn.linear(&format!("{p}.linear_attn.{which}_proj"), x, h, inner, false);
+        let proj = nn.linear(&format!("{p}.self_attn.{which}_proj"), x, h, inner, false);
         let conv = nn.conv1d_depthwise(
-            &format!("{p}.linear_attn.{which}_conv1d"),
+            &format!("{p}.self_attn.{which}_conv1d"),
             proj,
             inner,
             conv_k,
+            DType::F32,
         );
         qkv.push(nn.reshape(
             conv,
@@ -315,9 +318,9 @@ fn kda_attention(
     // The rank is read off the checkpoint dims rather than named in config, so
     // it is derived from the declared f_a width.
     let gate_rank = lac.head_dim as i64; // f_a_proj is [rank=head_dim, hidden]
-    let fa = nn.linear(&format!("{p}.linear_attn.f_a_proj"), x, h, gate_rank, false);
+    let fa = nn.linear(&format!("{p}.self_attn.f_a_proj"), x, h, gate_rank, false);
     let fb = nn.linear(
-        &format!("{p}.linear_attn.f_b_proj"),
+        &format!("{p}.self_attn.f_b_proj"),
         fa,
         gate_rank,
         inner,
@@ -329,8 +332,19 @@ fn kda_attention(
     );
 
     // beta — ONE write-strength scalar per (token, head), not per channel.
-    let beta = nn.linear(&format!("{p}.linear_attn.b_proj"), x, h, nh as i64, false);
+    let beta = nn.linear(&format!("{p}.self_attn.b_proj"), x, h, nh as i64, false);
     let beta = nn.act(ActKind::Sigmoid, beta);
+
+    let a_log = nn.param_dtype(
+        &format!("{p}.self_attn.A_log"),
+        [Dim::stat(nh as i64)],
+        DType::F32,
+    );
+    let dt_bias = nn.param_dtype(
+        &format!("{p}.self_attn.dt_bias"),
+        [Dim::stat(inner)],
+        DType::F32,
+    );
 
     // The recurrence. The [heads, head_dim, head_dim] state is a runtime
     // resource (see the module note), so it is not an input here.
@@ -341,18 +355,35 @@ fn kda_attention(
         v,
         gate,
         beta,
+        a_log,
+        dt_bias,
         nh,
         lac.head_dim,
     );
 
     // Output gate + norm, then project back to hidden.
-    let o = nn.reshape(o, [b.clone(), s.clone(), Dim::stat(inner)]);
-    let o = nn.rmsnorm(&format!("{p}.linear_attn.o_norm"), o, inner, eps);
-    let g = nn.linear(&format!("{p}.linear_attn.g_proj"), x, h, inner, false);
+    let o = nn.rmsnorm_dtype(&format!("{p}.self_attn.o_norm"), o, hd, eps, DType::F32);
+    let g = if lac.use_full_rank_gate {
+        nn.linear(&format!("{p}.self_attn.g_proj"), x, h, inner, false)
+    } else {
+        let ga = nn.linear(&format!("{p}.self_attn.g_a_proj"), x, h, gate_rank, false);
+        nn.linear(
+            &format!("{p}.self_attn.g_b_proj"),
+            ga,
+            gate_rank,
+            inner,
+            false,
+        )
+    };
+    let g = nn.reshape(
+        g,
+        [b.clone(), s.clone(), Dim::stat(nh as i64), Dim::stat(hd)],
+    );
     let g = nn.act(ActKind::Sigmoid, g);
     let y = nn.mul(o, g);
+    let y = nn.reshape(y, [b.clone(), s.clone(), Dim::stat(inner)]);
 
-    nn.linear(&format!("{p}.linear_attn.o_proj"), y, inner, h, false)
+    nn.linear(&format!("{p}.self_attn.o_proj"), y, inner, h, false)
 }
 
 /// Dense FFN with K3's `situ` GLU.

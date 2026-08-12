@@ -54,9 +54,9 @@ int main(int argc, char** argv) {
     CK(hipModuleLoad(&M, argc > 1 ? argv[1] : "/tmp/gvbf.co"));
     const int IT = argc > 2 ? atoi(argv[2]) : 41;
 
-    const char* sym[] = {"k_steady", "k_packet", "k_packet_aa", "k_r2",
-                         "k_wstage", "k_stageonly", "k_noldsx", "k_comb", "k_rA", "k_rL"};
-    const int NARM = 10;
+    const char* sym[] = {"k_steady", "k_packet", "k_packet_aa", "k_r2", "k_wstage", "k_stageonly",
+                         "k_noldsx", "k_comb", "k_rA", "k_rL", "k_rF"};
+    const int NARM = 11;
     hipFunction_t fn[NARM];
     for (int i = 0; i < NARM; i++) CK(hipModuleGetFunction(&fn[i], M, sym[i]));
 
@@ -64,13 +64,14 @@ int main(int argc, char** argv) {
         const char* name;
         unsigned N, K, blk, inst;
     } shapes[] = {
-        {"moe_down_latent", 3584, 7168, 256, 92}, {"moe_up_latent", 7168, 3584, 256, 92},
-        {"o_proj", 7168, 1536, 256, 93},          {"router_gate", 896, 7168, 224, 92},
-        {"shared_down", 7168, 768, 256, 92},      {"q_a", 1536, 7168, 256, 24},
-        {"q_absorb", 6144, 1536, 256, 24},        {"kv_a", 512, 7168, 256, 24},
-        {"f_a", 128, 7168, 128, 69},              {"q_rope", 768, 1536, 256, 24},
-        {"f_b", 1536, 128, 256, 69},              {"k_rope_d", 64, 7168, 64, 24},
-        {"b_proj", 12, 7168, 12, 69},             {"lm_head/10", 16384, 7168, 256, 10},
+        {"moe_down_latent", 3584, 7168, 128, 92}, {"routed_up", 896, 3584, 128, 92},
+        {"o_proj", 7168, 1536, 128, 93},          {"router_gate", 896, 7168, 128, 92},
+        {"shared_down", 7168, 768, 128, 92},      {"q_a", 1536, 7168, 128, 48},
+        {"q_absorb", 6144, 1536, 128, 24},        {"kv_a", 512, 7168, 128, 24},
+        {"f_a", 128, 7168, 128, 69},              {"q_rope", 768, 1536, 128, 24},
+        {"f_b", 1536, 128, 128, 69},              {"k_rope_d", 64, 7168, 64, 24},
+        {"b_proj", 12, 7168, 12, 69},             {"final_gate", 4224, 7168, 128, 2},
+        {"final_proj", 7168, 4224, 128, 1},        {"lm_head/10", 16384, 7168, 304, 10},
     };
     const int NS = (int)(sizeof(shapes) / sizeof(shapes[0]));
 
@@ -94,10 +95,11 @@ int main(int argc, char** argv) {
         CK(hipMemcpy(xb, h.data(), 1u << 22, hipMemcpyHostToDevice));
     }
 
-    printf("%-16s %7s %6s %4s %5s %4s | %9s %9s %9s | %8s %8s %8s %8s %8s %8s %8s\n", "shape", "N", "K", "blk",
+    printf("%-16s %7s %6s %4s %5s %4s | %9s %9s %9s | %8s %8s %8s %8s %8s %8s %8s %8s\n", "shape", "N", "K", "blk",
            "inst", "nrep", "steady_us", "packet_us", "stage_us", "GBs_pkt", "r2/pkt", "wstg/pkt",
-           "nolds/pkt", "comb/pkt", "rA/pkt", "rL/pkt");
-    double tot_pkt = 0, tot_stdy = 0, tot_r2 = 0, tot_ws = 0, tot_nl = 0, tot_cb = 0, tot_ra = 0, tot_rl = 0;
+           "nolds/pkt", "comb/pkt", "rA/pkt", "rL/pkt", "rF/pkt");
+    double tot_pkt = 0, tot_stdy = 0, tot_r2 = 0, tot_ws = 0, tot_nl = 0, tot_cb = 0, tot_ra = 0,
+           tot_rl = 0, tot_rf = 0;
     double aa_lo = 9, aa_hi = 0;
     for (int s = 0; s < NS; s++) {
         const Shape& S = shapes[s];
@@ -122,22 +124,23 @@ int main(int argc, char** argv) {
             CK(hipMemset(C1, 0, 1u << 22));
             CK(hipMemset(C2, 0, 1u << 22));
             CK(hipModuleLaunchKernel(fn[1], (int)S.blk, 1, 1, T, 1, 1, 0, 0, b1, nullptr));
-            CK(hipModuleLaunchKernel(fn[8], (int)S.blk, 1, 1, T, 1, 1, 0, 0, b2, nullptr));
+            CK(hipModuleLaunchKernel(fn[10], (int)S.blk, 1, 1, T, 1, 1, 0, 0, b2, nullptr));
             CK(hipDeviceSynchronize());
             std::vector<unsigned short> h1(S.N), h2(S.N);
             CK(hipMemcpy(h1.data(), C1, S.N * 2, hipMemcpyDeviceToHost));
             CK(hipMemcpy(h2.data(), C2, S.N * 2, hipMemcpyDeviceToHost));
             size_t bad = 0;
             for (unsigned i = 0; i < S.N; i++) bad += (h1[i] != h2[i]);
-            if (bad) printf("!! %s: %zu/%u outputs DIFFER (rA vs packet)\n", S.name, bad, S.N);
+            if (bad) printf("!! %s: %zu/%u outputs DIFFER (rF vs packet)\n", S.name, bad, S.N);
         }
         const double gb = (double)slab / 1e9;
         const double aa = us[2] / us[1];
         aa_lo = std::min(aa_lo, aa);
         aa_hi = std::max(aa_hi, aa);
-        printf("%-16s %7u %6u %4u %5u %4u | %9.3f %9.3f %9.3f | %8.0f %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f\n",
+        printf("%-16s %7u %6u %4u %5u %4u | %9.3f %9.3f %9.3f | %8.0f %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f\n",
                S.name, S.N, S.K, S.blk, S.inst, nrep, us[0], us[1], us[5], gb / (us[1] * 1e-6),
-               us[1] / us[3], us[1] / us[4], us[1] / us[6], us[1] / us[7], us[1] / us[8], us[1] / us[9]);
+               us[1] / us[3], us[1] / us[4], us[1] / us[6], us[1] / us[7], us[1] / us[8],
+               us[1] / us[9], us[1] / us[10]);
         tot_stdy += us[0] * S.inst / 1e3;
         tot_pkt += us[1] * S.inst / 1e3;
         tot_r2 += us[3] * S.inst / 1e3;
@@ -146,10 +149,11 @@ int main(int argc, char** argv) {
         tot_cb += us[7] * S.inst / 1e3;
         tot_ra += us[8] * S.inst / 1e3;
         tot_rl += us[9] * S.inst / 1e3;
+        tot_rf += us[10] * S.inst / 1e3;
     }
     printf("\nA/A control (pkt_aa / packet): %.4f .. %.4f\n", aa_lo, aa_hi);
     printf("per-token totals over the tabulated instance counts (lm_head scaled x10 by hand):\n");
-    printf("  steady %.3f  packet %.3f  r2 %.3f  wstage %.3f  noldsx %.3f  COMB %.3f  rA %.3f  rL %.3f ms\n",
-           tot_stdy, tot_pkt, tot_r2, tot_ws, tot_nl, tot_cb, tot_ra, tot_rl);
+    printf("  steady %.3f  packet %.3f  r2 %.3f  wstage %.3f  noldsx %.3f  COMB %.3f  rA %.3f  rL %.3f  rF %.3f ms\n",
+           tot_stdy, tot_pkt, tot_r2, tot_ws, tot_nl, tot_cb, tot_ra, tot_rl, tot_rf);
     return 0;
 }

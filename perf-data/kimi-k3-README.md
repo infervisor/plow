@@ -151,7 +151,7 @@ Warmup: arms emitted with different `--n-cu` were observed to sample warmup toke
 | `PLOW_K3_SHARD_UP` | **on** (`!= "0"`, needs tp>1) | column-parallel `routed_expert_up_proj`, gather folded into the shared reduce. −22.8% GEMV bytes |
 | `PLOW_K3_SHARD_HEAD=1` | off | column-parallel `lm_head` (`XArgmaxFin`). Gate passes; `k3_tp_equivalence.sh` CANNOT gate it — `--dump-logits` dumps `act.logits`, `vocab/tp` wide at tp=8, so its shape check fails by construction |
 | `PLOW_K3_FUSE_ARNORM` | **on** (`!= "0"`) | fuse the AttnRes norm |
-| `PLOW_K3_FUSE_NGEMV=1` | **off** | fold the `b=1` RMSNORM gates into the `b=256` GEMVs that read them (`routed_expert_norm` x92 fan=1, `q_a_layernorm` x24 fan=2). Removes all 116 RMSNORM packets; critical path 1831 -> 1715. **NOT BIT-EXACT END-TO-END YET** — bit-exact in the isolated hardware gate, diverges ~1 ULP through the full model. Do not enable for a real serve. `perf-data/k3-narrow-gate-fusion.md` |
+| `PLOW_K3_FUSE_NGEMV` | **on** | fold the `b=1` RMSNORM gates into their GEMV consumers (`routed_expert_norm` x92, `q_a_layernorm` x24). Removes 116 packets and moves critical path 1831 -> 1715. Current TP8 full-logit A/B is byte-exact; two served pairs improve TPOT 1.33--1.45 ms. `=0` restores the control. `perf-data/k3-narrow-gate-fusion.md` |
 | `PLOW_SEG_PER_OP=1` | off | one AQL segment per op (host-side chaining). **BROKEN at TP8** — ranks desync, a collective hits its deadline and returns WITHOUT reducing |
 | `PLOW_FINE_FORCE=1` | off | keep genuinely-sparse `Dep::Fine` edges. **No-op on K3** — the K3 emitter creates zero fine deps |
 | `PLOW_UNISEG=1` | off | force one wave-class segment |
@@ -335,7 +335,7 @@ change leaked into the shipped configuration.
 ## 11.2 Serving
 
 ```bash
-perf-data/harness/gpulease -n 8 serve sg render -c \
+perf-data/tools/gpulease -n 8 serve sg render -c \
   "PLOW_L2_PLACE_DISPATCH=1 nix develop --command ./target/release/plowrt serve \
    --assets /home/lava/models/k3_b4 --port 8000"
 ```
@@ -517,3 +517,30 @@ blobs; they are 211 MB each and the emit takes 3.4 s.
 This is the largest un-chased item this section leaves behind: nothing here has tried to make the
 long-context blob's decode as fast as the short one's, and the 27% is a measurement rather than a
 diagnosis.
+
+# 13. Pending K3 experiments
+
+These are the remaining production-relevant experiments for the B1 >=50 tok/s target. Each item
+requires an exact packet/object pair, full-grid or full-model measurement, all-rank compact audit,
+and matched `vllm bench serve` gates. Standalone timing is screening evidence only.
+
+1. **K3 specialized GEMV/body path (short context).** Ordinary BF16 GEMV is the largest fixed
+   family (~22 ms in the current trace). A new load/reduction map or producer/consumer fusion must
+   recover multiple milliseconds; WG, R-split, W8A16, MXFP4, and opcode-pruning screens are closed.
+2. **Runtime live-`kv_len` MLA split selection.** The adopted fixed `PLOW_K3_NS=64` wins the
+   existing sweep. Selecting `nsplit` from live context is still unimplemented and must preserve
+   partial-buffer sizing, merge order, packet hashes, and stateful serving.
+3. **K3 GF12 MLA replacement.** The single-latent-pass GF12 screen used 54,848 B LDS, 113 spills,
+   and failed its output oracle; it is rejected unless a new resource-safe implementation preserves
+   the exact FP8 dequant/softmax/merge contract.
+4. **K3 TP8 collective gather.** A `XReduceTwoShotGather` could reduce routed shared-down collective
+   reads, but needs a standalone f64/bit-exact oracle, owner-index proof, and 8K/32K/128K serving A/B.
+   Generic row-banding and combine-XReduce fusion are already rejected.
+5. **KDA recurrent-state residency.** The default-off state-resident prefill arm passes static and
+   numerical gates but still needs uncontested TP8 timing at 8K/16K/32K.
+6. **Specialized verifier/speculation.** DSpark remains experimental and is excluded from the
+   production merge until corrected causal-frontier, MLA merge-map, recurrent-state, and full-model
+   token/state gates pass.
+
+The current validated B1 served baseline is below 50 tok/s at every context through 128K; no item
+in this list is considered adopted until it closes that gap with full-model evidence.

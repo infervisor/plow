@@ -343,7 +343,7 @@ pub fn tile_cost(
 /// byte-stable when no emit wrapper is installed; NVIDIA emit MUST call [`with_emit_target_amd`]
 /// `(false, …)` or the gfx950 analytical inventory re-selects `GemmWide`/`GemmC5` and Hopper
 /// prefills trap.
-fn emit_is_amd() -> bool {
+pub(crate) fn emit_is_amd() -> bool {
     EMIT_IS_AMD.with(|c| c.get())
 }
 
@@ -4906,7 +4906,7 @@ const AMAX_BLOCKS: u32 = 64;
 /// rounds at S=2, and N=5376 is not even divisible by 512 (23 of the 512 slices get no work).
 ///
 /// MEASURED, MI355X, Gemma-4-31B bf16 real weights, 1024-token prompt, 64 greedy decode steps,
-/// interleaved arms under `perf-data/harness/gpulease -n 1`, contended (rc=76) runs discarded.
+/// interleaved arms under `perf-data/tools/gpulease -n 1`, contended (rc=76) runs discarded.
 /// Objects `build-amd/l2-hsaco2`, blobs `build-amd/l2-s{1,2,4}`, harness `gemma4_chat.c`:
 ///
 /// | S | slices/gemv | wg-packets/token | decode ms/token (median, n) | spread | Δ |
@@ -5849,6 +5849,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_INDEX_UNION_PF",
     "PLOW_DOP_KDA_CONV",
     "PLOW_DOP_KDA_CONV3",
+    "PLOW_DOP_KDA_CONV_STATE_STEP_G",
     "PLOW_DOP_KDA_GATE",
     "PLOW_DOP_KDA_GATED_NORM",
     "PLOW_DOP_KDA_STATE_STEP",

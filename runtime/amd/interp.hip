@@ -70,6 +70,39 @@
 #if PLOW_K3
 extern "C" __device__ unsigned plow_k3_arms_1 = 1;
 #endif
+#if PLOW_K3 && PLOW_KDA_CONV_STEP_DB
+extern "C" __device__ unsigned plow_kda_conv_step_db_arm = 1;
+#endif
+
+/* Compact TP audit. `i[7] == 0` keeps old packets byte-compatible; plowrt patches
+ * TP collective instructions to status_id+1 while loading them. */
+__device__ __forceinline__ uint32_t* plow_xaudit_status(const PlowProgram& prog,
+                                                        const PlowDevInst* in) {
+    return in->i[7] ? PLOW_CTR(prog.xctr, in->i[7] - 1u) : nullptr;
+}
+
+typedef struct {
+    const PlowDevInst* insts;
+    uint32_t n_inst;
+    uint32_t _pad;
+    const uint32_t* xctr;
+    uint32_t n_xctr;
+    uint32_t n_gpu;
+    uint32_t* status;
+} PlowXAuditArgs;
+
+typedef struct {
+    uint64_t base;
+    uint64_t slot_stride;
+    uint32_t words;
+    uint32_t _pad;
+} PlowStateClearRange;
+
+typedef struct {
+    const PlowStateClearRange* ranges;
+    uint32_t n_ranges;
+    uint32_t slot;
+} PlowStateClearArgs;
 
 #if !defined(PLOW_BUCKET_FLASH)
 /* PLOW_DOP_XREDUCE_ADD_NORM (116): fused TP all-reduce + residual + RMSNorm, one
@@ -78,12 +111,15 @@ extern "C" __device__ unsigned plow_k3_arms_1 = 1;
  * bit-identical to the [XReduce -> AddNorm] pair it replaces (dev_isa.h op 116).
  * Marker symbol so a future loader check can refuse op-116 blobs on old objects. */
 extern "C" __device__ unsigned plow_xrn_1 = 1;
+#if PLOW_XR_AGG_ON
+extern "C" __device__ unsigned plow_xr_agg_1 = 1;
+#endif
 
 __device__ __forceinline__ void d_xreduce_add_norm_mega(
     bf16* out, bf16* resid, const bf16* a, const bf16* gamma,
     const void* const* peer_scratch, uint32_t nranks, uint32_t rank, uint32_t feat,
     uint32_t slot_bytes, size_t xctr_byte_off, uint32_t gate_id, uint64_t deadline_ticks,
-    float eps) {
+    uint32_t* status, float eps) {
     __shared__ float xrn_part[PLOW_WAVES];
     __shared__ int xrn_bailed;
     if (threadIdx.x == 0) xrn_bailed = 0;
@@ -99,6 +135,7 @@ __device__ __forceinline__ void d_xreduce_add_norm_mega(
         const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
         while (xctr_poll(lg) < nranks) {
             if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+                if (status) *status = 0xDEAD0000u | rank;
                 xrn_bailed = 1;
                 break;
             }
@@ -175,6 +212,7 @@ __device__ __forceinline__ void d_xreduce_add_norm_mega(
         }
     }
 }
+
 #endif
 
 /* The KV-ENCODING axis, made observable the same way and for a STRICTER reason.  [MLA-FP8-KV]
@@ -215,6 +253,9 @@ extern "C" __device__ unsigned plow_moe_gemma_pf_arms_1 = 1;
  * silently — the marker lets exec/amd.rs refuse instead. */
 #if PLOW_MLA_PF_V2_ARM
 extern "C" __device__ unsigned plow_mla_pf_v2_arm_1 = 1;
+#if PLOW_FP8_KV
+extern "C" __device__ unsigned plow_mla_pf_v2_fp8_arm_1 = 1;
+#endif
 #endif
 /* Same contract as the arms markers above, for L2-DOMAIN DISPATCH. A blob compiled with
  * PLOW_L2_PLACE repurposes the global-queue `seg` as an L2 domain rather than a wave class, so an
@@ -1603,14 +1644,23 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #if PLOW_MLA_PF_V2_ARM
     /* V2 MLA prefill: the full-column-wave layout this 4-wave/512-reg object exists to
-     * afford (op_attention.h d_flash_mla_prefill_v2). bf16 KV only — fp8-KV blobs keep
-     * their MLA segments on the 8-wave object (the host never routes op 110 here).
+     * afford (op_attention.h d_flash_mla_prefill_v2).
      *   t0=Opart t1=mlpart t2=Qabs t3=Qrope t4=Ckv t5=Krope t6=kv_len
      *   i0=n_batch i1=n_head i2=kv_stride i3=window i4=n_tok i5=kv_mask f0=scale */
     static_assert(PLOW_WAVES == 4, "the V2 MLA prefill arm is shaped for the 4-wave object");
     static_assert(FA_MLA_PF2_LDS_BYTES(512, 64) <= (int)sizeof(((plow_smem*)nullptr)->fa),
                   "V2 MLA prefill LDS exceeds the flash arena");
-    if (in->op == PLOW_DOP_FLASH_MLA_PREFILL) {
+    if (in->op == PLOW_DOP_FLASH_MLA_PREFILL_FP8) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+        d_flash_mla_prefill_v2<512, 64, /*GATHER=*/false, /*FP8=*/true>(
+            (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+            (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0],
+            in->i[4], in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk,
+            sm->fa, nullptr, 0u, 1u, false, (const float*)TEN(7), in->i[6]);
+#undef TEN
+    }
+#if !PLOW_FP8_KV
+    else if (in->op == PLOW_DOP_FLASH_MLA_PREFILL) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
         /* t7 = the DSA per-64-query-tile union table (op 119) selects the GATHER arm:
          * same full-column-wave body, but the KV walk covers the tile's union entries and
@@ -1642,6 +1692,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 ((in->i[6] >> 8) & 1u) != 0u);
 #undef TEN
     }
+#endif
 #endif
     (void)slice;
 #else
@@ -1785,6 +1836,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * built with the axis is a different question, answered at load time by `plow_k3_arms_1`.
          * The drift test reads `case PLOW_DOP_*` labels textually and is unaffected by the `#if`. */
 #if PLOW_K3
+#if !PLOW_KDA_CONV_STEP_DB
         case PLOW_DOP_KDA_CONV:
             d_kda_conv((bf16*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2), (float*)TEN(3),
                        in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk,
@@ -1807,11 +1859,13 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              /* op 102 predates the per-row mask and carries no slot for it. */
                              nullptr);
             break;
+#endif
         case PLOW_DOP_KDA_GATED_NORM:
             d_kda_gated_norm((bf16*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
                              (const bf16*)TEN(3), in->i[0], in->i[1], in->i[2], in->fj[0].f, slice,
                              nblk);
             break;
+#if !PLOW_KDA_CONV_STEP_DB
         /* FUSED KDA — ops 88x3 -> 109 and 89+102 -> 110. Six packets per layer become three, 207
          * per token over 69 KDA layers, against a measured ~12 us per packet.
          *
@@ -1879,6 +1933,35 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                    : nullptr);
             break;
         }
+#endif
+#if PLOW_KDA_CONV_STEP_DB
+        case PLOW_DOP_KDA_CONV_STATE_STEP_G: {
+            const unsigned* desc = (const unsigned*)TEN(7);
+            if (desc == nullptr || in->i[0] != 1) __builtin_trap();
+#pragma unroll
+            for (unsigned i = 0; i < 12; ++i)
+                if (desc[i] == PLOW_TENSOR_NONE) __builtin_trap();
+            if (in->i[4] & PLOW_KDA_F_SEQ_ROWS) {
+                if (desc[12] == PLOW_TENSOR_NONE) __builtin_trap();
+                if (((const unsigned*)T[desc[12]])[0]) break;
+            }
+            const unsigned bank = ((const unsigned*)T[desc[11]])[0] & 1u;
+            const unsigned source = 3u + bank * 3u;
+            const unsigned target = 3u + (bank ^ 1u) * 3u;
+            d_kda_conv_state_step_g(
+                (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
+                (float*)TEN(6), (const float*)T[desc[0]], (const float*)T[desc[1]],
+                (const float*)T[desc[2]], (const float*)T[desc[source]],
+                (const float*)T[desc[source + 1]], (const float*)T[desc[source + 2]],
+                (float*)T[desc[target]], (float*)T[desc[target + 1]],
+                (float*)T[desc[target + 2]], (const float*)T[desc[9]],
+                (const float*)T[desc[10]], in->i[1], in->i[2], in->i[3], in->i[5],
+                in->i[4], in->i[6], in->fj[0].f, in->fj[1].f, slice, nblk,
+                (float*)sm->raw);
+            break;
+        }
+#endif
         /* Kimi-K3 BLOCK structure (op_k3.h). Both arms are in BOTH buckets: a K3 layer runs the
          * same graph at T=1 and T>1, and AttnRes in particular replaces the residual add on the
          * PREFILL path too — an AttnRes that exists only in the decode object would make prefill
@@ -3507,18 +3590,20 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
              * and the arm is then byte-identical to the pre-gather one. */
             const size_t xoff =
                 (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+            uint32_t* const xaudit = plow_xaudit_status(prog, in);
             d_xreduce_mega((bf16*)tens[in->t[0]], prog.peer_scratch, prog.n_gpu, prog.rank,
                            in->i[0], in->i[2], xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS,
-                           nullptr, e.slice, in->blocks, in->i[4], in->i[5], in->i[6]);
+                           xaudit, e.slice, in->blocks, in->i[4], in->i[5], in->i[6]);
         } else if (in->op == PLOW_DOP_XREDUCE_ADD_NORM) {
             /* Fused all-reduce + residual + RMSNorm (op 116, one workgroup):
              *   t0=out t1=resid t2=a t3=gamma  i0=feat i1=n_gpu i2=slot i3=gate  f0=eps */
             const size_t xoff =
                 (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+            uint32_t* const xaudit = plow_xaudit_status(prog, in);
             d_xreduce_add_norm_mega((bf16*)tens[in->t[0]], (bf16*)tens[in->t[1]],
                                     (const bf16*)tens[in->t[2]], (const bf16*)tens[in->t[3]],
                                     prog.peer_scratch, prog.n_gpu, prog.rank, in->i[0], in->i[2],
-                                    xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS, in->fj[0].f);
+                                    xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS, xaudit, in->fj[0].f);
         } else if (in->op == PLOW_DOP_XREDUCE2) {
             /* TWO-SHOT all-reduce for the LARGE prefill [T,hidden] partial (§4, bandwidth-
              * optimal): reduce-scatter this rank's owned 1/N slice from every peer, then
@@ -3534,6 +3619,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
              *   with its own gate pair; band 0's transfer overlaps band 1..K-1's producers. */
             const size_t xoff =
                 (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+            uint32_t* const xaudit = plow_xaudit_status(prog, in);
             /* t1/t2 = fused-residual operands (absent on every pre-fold blob): resid in,
              * summed output out2 — see the kernel's fused-residual note. Both take the
              * band offset e0, like out. */
@@ -3545,7 +3631,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             d_xreduce_twoshot_mega((bf16*)tens[in->t[0]] + in->i[5], prog.peer_scratch,
                                    prog.n_gpu, prog.rank,
                                    in->i[0], in->i[2] + in->i[5] * 2u, xoff, in->i[3], in->i[4],
-                                   PLOW_XCTR_DEADLINE_TICKS, nullptr, e.slice, in->blocks,
+                                   PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,
                                    xr_res, xr_o2);
         } else if (in->op == PLOW_DOP_XARGMAX_FIN) {
             /* Cross-rank fold for a VOCAB-COLUMN-PARALLEL lm_head.
@@ -3555,10 +3641,11 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
              *   i3=xctr arrival-gate id  i4=xctr value-slot id (a DIFFERENT id) */
             const size_t xoff =
                 (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+            uint32_t* const xaudit = plow_xaudit_status(prog, in);
             d_xargmax_fin_mega((int*)tens[in->t[0]], (const unsigned long long*)tens[in->t[1]],
                                in->i[0], in->i[1], in->i[2], prog.peer_scratch, prog.n_gpu,
                                prog.rank, xoff, in->i[3], in->i[4], PLOW_XCTR_DEADLINE_TICKS,
-                               nullptr, e.slice);
+                               xaudit, e.slice);
         } else if (in->op == PLOW_DOP_XFLASHMERGE) {
             /* STUB: dispatch present so the switch is total and the
              * compiler's structural emit runs; the CP flash LSE-merge body lands with tp-host.
@@ -3687,4 +3774,44 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         }
         }
     }
+}
+
+/* Runs only after every rank's interpreter has drained. It preserves the old
+ * exact audit, including zero for unused gates, while reducing the healthy host
+ * path to one status-word read per rank. Defined after the interpreter so the
+ * build scripts' first-kernel resource summary remains the serving kernel. */
+extern "C" __global__ void plow_xctr_audit(PlowXAuditArgs a) {
+    for (uint32_t gate = blockIdx.x * blockDim.x + threadIdx.x; gate < a.n_xctr;
+         gate += gridDim.x * blockDim.x) {
+        uint32_t want = 0;
+        bool data = false;
+        for (uint32_t j = 0; j < a.n_inst; j++) {
+            const PlowDevInst& d = a.insts[j];
+            if (d.op == PLOW_DOP_XREDUCE || d.op == PLOW_DOP_XREDUCE_ADD_NORM) {
+                if (d.i[3] == gate) want = a.n_gpu;
+            } else if (d.op == PLOW_DOP_XREDUCE2) {
+                if (d.i[3] == gate) want = a.n_gpu;
+                if (d.i[4] == gate) want = a.n_gpu * d.blocks;
+            } else if (d.op == PLOW_DOP_XARGMAX_FIN) {
+                if (d.i[3] == gate) want = a.n_gpu;
+                if (d.i[4] == gate) data = true;
+                if (d.i[1] > PLOW_XAMAX_LINE && d.i[4] + 1u == gate) data = true;
+            }
+        }
+        if (!data) {
+            const uint32_t got = xctr_poll(PLOW_CTR(a.xctr, gate));
+            if (got != want)
+                atomicCAS(a.status, 0u, 0xA0000000u | (gate & 0x000FFFFFu));
+        }
+    }
+}
+
+/* Admission-time clear for slot-major recurrent state. One block owns one
+ * load-time range; ranges are chunked so large KDA states cannot strand CUs. */
+extern "C" __global__ void plow_state_clear(PlowStateClearArgs a) {
+    const uint32_t r = blockIdx.x;
+    if (r >= a.n_ranges) return;
+    const PlowStateClearRange d = a.ranges[r];
+    uint32_t* p = (uint32_t*)(d.base + (uint64_t)a.slot * d.slot_stride);
+    for (uint32_t i = threadIdx.x; i < d.words; i += blockDim.x) p[i] = 0;
 }

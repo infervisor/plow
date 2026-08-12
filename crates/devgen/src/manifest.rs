@@ -828,6 +828,9 @@ fn backend_amd(
     if on("a4w4") {
         req.push("PLOW_MOE_PF_A4W4=1".into());
     }
+    if has("KdaConvStateStepG") {
+        req.push("PLOW_KDA_CONV_STEP_DB=1".into());
+    }
     // Runtime-flag arms (packet i[7] on ops 85/86/87): every object built since the arms landed
     // carries them (unconditional plow_moe_pf_*_arm markers in op_moe.h); an OLDER object would
     // store f32 into a half-sized part buffer / matmul fp8 bytes as bf16 — refuse at load.

@@ -1,6 +1,6 @@
 //! §I Per-model request muxer — slot-oriented continuous-batching engine.
 //!
-//! Each loaded model has one dispatcher task with an unbounded MPSC ingress.
+//! Each loaded model has one dispatcher task with a bounded MPSC ingress.
 //! The dispatcher holds a fixed-size **slot table** sized to the largest
 //! compiled `bucket.batch` in the bundle. Between decode ticks it admits new
 //! arrivals from ingress into idle slots — so a fresh request doesn't wait for
@@ -50,6 +50,7 @@ use crate::obs::Metrics;
 use crate::sched::admission::{admit, Admit, LoadEstimator};
 use crate::sched::batching::{formation_window_ms, select_bucket};
 use crate::sched::multistep::MultiStep;
+use crate::sched::rungs::{DecodeRungs, RungController, RungLoad};
 use crate::serve::stream::{ChunkSender, FinishReason, StreamChunk};
 use crate::serve::{
     bucket_has_sample_batch, reference_logits_row, sample_vocab, seeded_unit, AppState, GenParams,
@@ -147,6 +148,9 @@ pub struct MuxConfig {
     /// [`PacketQueue`](crate::exec::queue::PacketQueue) to overlap host
     /// bookkeeping with device launch latency.
     pub queue_depth: usize,
+    /// Maximum requests waiting outside the engine slot table. `0` derives a
+    /// bound of four full engine batches.
+    pub max_queued_requests: usize,
 }
 
 impl Default for MuxConfig {
@@ -156,6 +160,7 @@ impl Default for MuxConfig {
             slo_ms: 250.0,
             multi_step: true,
             queue_depth: 0,
+            max_queued_requests: 0,
         }
     }
 }
@@ -176,7 +181,8 @@ pub struct Job {
 /// Handle to a per-model dispatcher — cheap to clone (wraps a Sender).
 #[derive(Clone)]
 pub struct ModelMux {
-    tx: mpsc::UnboundedSender<MuxMsg>,
+    tx: mpsc::Sender<MuxMsg>,
+    metrics: Arc<Metrics>,
     /// Preempt request flag, checked by the dispatcher at every loop top —
     /// the ONLY signal that reaches it while a full slot table keeps it away
     /// from the message channel (see [`ModelMux::preempt`]).
@@ -189,6 +195,11 @@ enum MuxMsg {
     /// Graceful drain: stop admitting new requests, finish in-flight slots,
     /// then signal completion through the oneshot.
     Drain(tokio::sync::oneshot::Sender<()>),
+}
+
+pub enum SubmitError {
+    Full(Job),
+    Closed(Job),
 }
 
 /// Per-dispatcher engine health, driven by the device faults a tick surfaces.
@@ -249,11 +260,20 @@ fn fanout_err(err: &crate::RuntimeError, msg: &str) -> crate::RuntimeError {
 
 impl ModelMux {
     /// Submit a job. Returns immediately; the caller awaits the stream.
-    pub fn submit(&self, job: Job) -> std::result::Result<(), Job> {
-        self.tx.send(MuxMsg::Job(job)).map_err(|e| match e.0 {
-            MuxMsg::Job(j) => j,
-            _ => unreachable!(),
-        })
+    pub fn submit(&self, job: Job) -> std::result::Result<(), SubmitError> {
+        Metrics::inc(&self.metrics.queued_requests);
+        match self.tx.try_send(MuxMsg::Job(job)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(MuxMsg::Job(job))) => {
+                self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                Err(SubmitError::Full(job))
+            }
+            Err(mpsc::error::TrySendError::Closed(MuxMsg::Job(job))) => {
+                self.metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
+                Err(SubmitError::Closed(job))
+            }
+            Err(_) => unreachable!(),
+        }
     }
 
     /// Initiate graceful drain: no new requests accepted, all live slots run to
@@ -261,7 +281,7 @@ impl ModelMux {
     /// `Registry::unload` to avoid mid-generation errors.
     pub async fn drain(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.tx.send(MuxMsg::Drain(tx));
+        let _ = self.tx.send(MuxMsg::Drain(tx)).await;
         let _ = rx.await;
     }
 
@@ -277,7 +297,7 @@ impl ModelMux {
         // and carries the completion signal; the flag is what the tick loop
         // sees when a full slot table keeps it off the channel.
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.tx.send(MuxMsg::Drain(tx));
+        let _ = self.tx.send(MuxMsg::Drain(tx)).await;
         let _ = rx.await;
     }
 }
@@ -344,10 +364,10 @@ pub fn spawn(
     state: Arc<AppState>,
     cfg: MuxConfig,
 ) -> ModelMux {
-    let (tx, mut rx) = mpsc::unbounded_channel::<MuxMsg>();
     let preempt_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let preempt_seen = Arc::clone(&preempt_flag);
     let metrics = Arc::clone(&state.metrics);
+    let handle_metrics = Arc::clone(&metrics);
 
     // Slot capacity from the compiler-emitted ladder — the largest decode
     // bucket sets the ceiling for concurrent live requests.
@@ -357,14 +377,37 @@ pub fn spawn(
         .map(|k| k.batch.max(1) as usize)
         .max()
         .unwrap_or(1);
-    // GPU-engine bundles are bucketless: the ceiling is the engine's compiled
-    // decode batch (PLOW_DECODE_BATCH), one slot per engine sequence slot —
-    // mux slot i IS engine slot i.
+    // GPU-engine bundles are bucketless: take both capacity and the optional
+    // decode ladder from the loaded engine once, before the hot loop starts.
     #[cfg(any(feature = "cuda", feature = "hsa"))]
-    let capacity = state
-        .gpu_engine(bundle.network())
-        .map(|e| e.lock().batch())
-        .unwrap_or(capacity);
+    let gpu_shape = state.gpu_engine(bundle.network()).map(|e| {
+        let e = e.lock();
+        (e.batch(), e.decode_rungs())
+    });
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    let capacity = gpu_shape.as_ref().map(|x| x.0).unwrap_or(capacity);
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    let rung_widths = gpu_shape.map(|x| x.1);
+    #[cfg(not(any(feature = "cuda", feature = "hsa")))]
+    let rung_widths: Option<Box<[u32]>> = None;
+    let mut rung_controller =
+        rung_widths
+            .as_deref()
+            .and_then(|widths| match DecodeRungs::new(widths, capacity) {
+                Ok(rungs) if rungs.len() > 1 => Some(RungController::new(rungs)),
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::warn!(?err, ?widths, capacity, "decode rung policy disabled");
+                    None
+                }
+            });
+    let ingress_capacity = if cfg.max_queued_requests == 0 {
+        capacity.saturating_mul(4).max(1)
+    } else {
+        cfg.max_queued_requests
+    };
+    let (tx, mut rx) = mpsc::channel::<MuxMsg>(ingress_capacity);
+    tracing::info!(%slug, capacity, ingress_capacity, "mux capacity resolved");
 
     // Per-model KV arena from the first decode bucket that declares paging
     // (all rungs share the same paging shape). `None` when no bucket carries
@@ -473,6 +516,7 @@ pub fn spawn(
                 // indistinguishable from a crash (the shed path at the
                 // admission gate sets the precedent).
                 while let Ok(msg) = rx.try_recv() {
+                    note_dequeued(&msg, &metrics);
                     match msg {
                         MuxMsg::Drain(done) => {
                             let _ = done.send(());
@@ -493,6 +537,7 @@ pub fn spawn(
             // when every ModelMux clone has dropped and the channel closes).
             if live == 0 {
                 let Some(msg) = rx.recv().await else { break };
+                note_dequeued(&msg, &metrics);
                 match msg {
                     MuxMsg::Job(job) => {
                         admit_into(
@@ -513,13 +558,66 @@ pub fn spawn(
                 }
             }
 
+            // A decode ladder controls ADMISSION separately from execution.
+            // New jobs use only the low slot prefix under `admission_limit`;
+            // existing high slots are never moved and continue to pin the
+            // engine's occupied-extent rung until they drain.
+            let admission_limit = if let Some(controller) = rung_controller.as_mut() {
+                let occupied_extent = slots
+                    .iter()
+                    .rposition(Option::is_some)
+                    .map(|i| i + 1)
+                    .unwrap_or(1);
+                let queued = metrics.queued_requests.load(Ordering::Relaxed) as usize;
+                let (sum, n) = slots
+                    .iter()
+                    .flatten()
+                    .fold((0usize, 0usize), |(s, n), slot| {
+                        (s.saturating_add(slot.gen.max_tokens.max(1)), n + 1)
+                    });
+                let mean_output_tokens = if n == 0 { 1.0 } else { sum as f64 / n as f64 };
+                let before = controller.admission_limit();
+                let decision = controller.decide(RungLoad {
+                    occupied_extent,
+                    queued,
+                    oldest_wait_ms: 0.0,
+                    arrival_rps: load.lambda.get(),
+                    mean_output_tokens,
+                    slo_ms: cfg.slo_ms,
+                });
+                let admission = controller.admission_limit();
+                metrics
+                    .decode_rung_admission
+                    .store(admission as u64, Ordering::Relaxed);
+                metrics
+                    .decode_occupied_extent
+                    .store(occupied_extent as u64, Ordering::Relaxed);
+                if admission != before {
+                    Metrics::inc(&metrics.decode_rung_switches);
+                    tracing::info!(
+                        from = before,
+                        to = admission,
+                        occupied_extent,
+                        queued,
+                        reason = ?decision.reason,
+                        "decode admission rung"
+                    );
+                }
+                admission
+            } else {
+                capacity
+            };
+
             // Non-blocking drain: fill every idle slot the queue can serve.
             // A short hold when we still have empty slots and no live work
             // yet keeps us from waking up on a single arrival amid a burst.
-            let idle = slots.iter().filter(|s| s.is_none()).count();
+            let idle = slots[..admission_limit]
+                .iter()
+                .filter(|s| s.is_none())
+                .count();
             if !draining && idle > 0 {
                 let lambda = load.lambda.get();
-                let live_now = capacity - idle;
+                let live_now = admission_limit - idle;
                 // Only hold when the slot table is empty (cold-start burst);
                 // if any slot is already live, spinning up the tick delivers
                 // TTFT faster than waiting for more arrivals.
@@ -533,25 +631,30 @@ pub fn spawn(
                     Metrics::inc(&metrics.hold_count);
                     let deadline =
                         Instant::now() + std::time::Duration::from_secs_f64(hold_ms / 1000.0);
-                    while slots.iter().any(|s| s.is_none()) {
+                    while slots[..admission_limit].iter().any(|s| s.is_none()) {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
                             break;
                         }
                         match tokio::time::timeout(remaining, rx.recv()).await {
-                            Ok(Some(MuxMsg::Job(job))) => admit_into(
-                                &mut slots,
-                                job,
-                                &mut load,
-                                &mut last_arrival,
-                                arena.as_ref(),
-                                &metrics,
-                                &health,
-                            ),
-                            Ok(Some(MuxMsg::Drain(done))) => {
-                                draining = true;
-                                drain_done = Some(done);
-                                break;
+                            Ok(Some(msg)) => {
+                                note_dequeued(&msg, &metrics);
+                                match msg {
+                                    MuxMsg::Job(job) => admit_into(
+                                        &mut slots[..admission_limit],
+                                        job,
+                                        &mut load,
+                                        &mut last_arrival,
+                                        arena.as_ref(),
+                                        &metrics,
+                                        &health,
+                                    ),
+                                    MuxMsg::Drain(done) => {
+                                        draining = true;
+                                        drain_done = Some(done);
+                                        break;
+                                    }
+                                }
                             }
                             Ok(None) => break,
                             Err(_) => break,
@@ -559,21 +662,26 @@ pub fn spawn(
                     }
                 }
                 // Any additional pending arrivals (no wait).
-                while !draining && slots.iter().any(|s| s.is_none()) {
+                while !draining && slots[..admission_limit].iter().any(|s| s.is_none()) {
                     match rx.try_recv() {
-                        Ok(MuxMsg::Job(job)) => admit_into(
-                            &mut slots,
-                            job,
-                            &mut load,
-                            &mut last_arrival,
-                            arena.as_ref(),
-                            &metrics,
-                            &health,
-                        ),
-                        Ok(MuxMsg::Drain(done)) => {
-                            draining = true;
-                            drain_done = Some(done);
-                            break;
+                        Ok(msg) => {
+                            note_dequeued(&msg, &metrics);
+                            match msg {
+                                MuxMsg::Job(job) => admit_into(
+                                    &mut slots[..admission_limit],
+                                    job,
+                                    &mut load,
+                                    &mut last_arrival,
+                                    arena.as_ref(),
+                                    &metrics,
+                                    &health,
+                                ),
+                                MuxMsg::Drain(done) => {
+                                    draining = true;
+                                    drain_done = Some(done);
+                                    break;
+                                }
+                            }
                         }
                         Err(_) => break,
                     }
@@ -584,6 +692,21 @@ pub fn spawn(
             if live == 0 {
                 continue;
             }
+            let (service_capacity, tick_rung) = if let Some(controller) = rung_controller.as_ref() {
+                let occupied_extent = slots
+                    .iter()
+                    .rposition(Option::is_some)
+                    .map(|i| i + 1)
+                    .unwrap_or(1);
+                let rung = controller.covering(occupied_extent);
+                let width = controller.width(rung);
+                metrics
+                    .decode_rung_actual
+                    .store(width as u64, Ordering::Relaxed);
+                (width, Some(rung))
+            } else {
+                (capacity, None)
+            };
 
             // Pick the covering bucket for (Decode, live, max seq requirement)
             // and its cached bufs — CPU reference path only; the GPU engine
@@ -644,7 +767,7 @@ pub fn spawn(
             // though every user's real inter-token latency was ~40 ms (well
             // under the SLO). Proven on GPU: b16 8-way passes token-identity
             // with the shed off, sheds to 1 token/req with it on.
-            let predicted_wait = predicted_wait_ms(live, capacity, load.service_ms.get());
+            let predicted_wait = predicted_wait_ms(live, service_capacity, load.service_ms.get());
             // A FLAT SLO cannot be right across decode batches. `service_ms` is
             // one tick of real work and grows with B (measured Gemma-4-12B:
             // 22 ms at B=8, 26 ms at B=16, 58 ms at B=32), so a constant 250 ms
@@ -769,6 +892,11 @@ pub fn spawn(
                     // predictor and sheds live decode streams.
                     if let Some(sample) = service_sample(ms, did_prefill) {
                         load.service_ms.update(sample);
+                        if let (Some(controller), Some(rung)) =
+                            (rung_controller.as_mut(), tick_rung)
+                        {
+                            controller.observe_decode(rung, sample);
+                        }
                     }
                     slots = returned_slots;
                     if let Some(b) = returned_bufs {
@@ -843,7 +971,14 @@ pub fn spawn(
 
     ModelMux {
         tx,
+        metrics: handle_metrics,
         preempt: preempt_flag,
+    }
+}
+
+fn note_dequeued(msg: &MuxMsg, metrics: &Metrics) {
+    if matches!(msg, MuxMsg::Job(_)) {
+        metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1488,11 +1623,9 @@ fn run_one_tick(
         // the engine's slot table and this one are the same indices.
         //
         // A tick is EITHER one prefill (the prefill program is single-sequence
-        // and holds the whole device, so at most one per tick, and on a
-        // decode-only packet like GLM-5.2's it is `n` decode dispatches) OR one
-        // batched decode step across every live slot. Prefill is not chunked
-        // and not interleaved — that is the deliberate difference from the CUDA
-        // engine, and it is what bounds TTFT under load by the longest prompt.
+        // and holds the whole device, so at most one per tick) followed by one
+        // batched decode step across every live slot. The two phases interleave
+        // by tick but never overlap on the device because they share scratch.
         //
         // Irrefutable in an hsa-only build (the enum then has one variant) and
         // refutable alongside `cuda` — the same arm has to compile as both.
@@ -1552,9 +1685,9 @@ fn run_one_tick(
                 });
             }
 
-            // ONE prefill per tick, lowest slot first. Everything else waits;
-            // the dispatcher loops straight back, so a second pending prompt is
-            // admitted on the next tick.
+            // ONE prefill chunk per tick, oldest pending request first. Slot
+            // indices are reused, so index order can starve an older high slot
+            // when short requests repeatedly refill lower slots.
             //
             // PREFILL AND DECODE NOW SHARE THE TICK. This arm used to `return`,
             // which made a tick EITHER a prefill OR a decode and meant every
@@ -1578,22 +1711,17 @@ fn run_one_tick(
             //     (`seed_ids` + `decode_prepare_batched` on one side,
             //     `prefill_prepare` on the other) before it reads them.
             //
-            // What this deliberately does NOT do is run a prefill CHUNK and a
-            // decode concurrently. A decode dispatch advances all B rows
-            // unconditionally, and while that is harmless for the append-only KV
-            // cache it would advance a mid-prefill slot's KDA recurrence with a
-            // garbage token. Interleaving at sub-prompt granularity therefore
-            // still needs the per-row active mask that `op_kda.h` does not have
-            // (`perf-data/k3-throughput-architecture-review.md` §3.1). Whole
-            // prompts are the granularity that is safe today, and for the common
-            // ~1k-token prompt the bucket ladder makes that ONE chunk anyway.
+            // Prefill and decode remain sequential inside the tick because they
+            // share input/activation buffers. The parked-row mask prevents a
+            // mid-prefill KDA state from advancing during the decode dispatch.
             //
             // `--pf-no-interleave` / `PLOW_PF_NO_INTERLEAVE=1` restores the old
             // prefill-only tick.
             let mut did_prefill = false;
             let no_interleave = crate::config::RuntimeConfig::get().nv.pf_no_interleave;
             let pending = (0..b.min(slots.len()))
-                .find(|&i| slots[i].as_ref().map(|s| s.step == 0).unwrap_or(false));
+                .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step == 0))
+                .min_by_key(|&i| slots[i].as_ref().map(|s| s.arrived));
             if let Some(i) = pending {
                 // §DISAGG phase-0. The AMD tick is EITHER a prefill OR a decode
                 // (this arm returns before the decode launch below), so unlike
@@ -2370,6 +2498,42 @@ mod tests {
     use crate::exec::indirection::slots as ind_slots;
     use crate::serve::RunObserver;
     use plow_asset::{KvLayerPaging, KvPaging};
+
+    fn test_job() -> Job {
+        let (respond, _rx) = crate::serve::stream::channel();
+        Job {
+            prompt_ids: vec![1],
+            gen: GenParams::default(),
+            arrived: Instant::now(),
+            respond,
+        }
+    }
+
+    #[test]
+    fn bounded_ingress_reports_full_closed_and_depth() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, mut rx) = mpsc::channel(1);
+        let mux = ModelMux {
+            tx,
+            metrics: Arc::clone(&metrics),
+            preempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        assert!(mux.submit(test_job()).is_ok());
+        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);
+        assert!(matches!(mux.submit(test_job()), Err(SubmitError::Full(_))));
+        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 1);
+
+        let msg = rx.try_recv().unwrap();
+        note_dequeued(&msg, &metrics);
+        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
+        drop(rx);
+        assert!(matches!(
+            mux.submit(test_job()),
+            Err(SubmitError::Closed(_))
+        ));
+        assert_eq!(metrics.queued_requests.load(Ordering::Relaxed), 0);
+    }
 
     fn fault(fatal: bool) -> crate::DeviceErrorInfo {
         crate::DeviceErrorInfo {

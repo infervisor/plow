@@ -43,6 +43,13 @@
 
 #include "amd_common.h"
 
+#ifndef PLOW_KDA_PF_STATE_RESIDENT
+#define PLOW_KDA_PF_STATE_RESIDENT 0
+#endif
+#ifndef PLOW_KDA_CONV_STEP_DB
+#define PLOW_KDA_CONV_STEP_DB 0
+#endif
+
 /* Gate activation modes, mirroring [fla]'s `safe_gate` switch (fla/ops/kda/gate.py:118-124). */
 enum { PLOW_KDA_GATE_SOFTPLUS = 0, PLOW_KDA_GATE_LOWER_BOUND = 1 };
 /* Flag bits for d_kda_state_step. */
@@ -404,6 +411,22 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
         const size_t dtb = (size_t)h * D;
         const float a_h = GATE ? __expf(a_log[h]) : 0.0f;
 
+#if PLOW_KDA_PF_STATE_RESIDENT
+        /* TP8 prefill assigns exactly one value column to each wave. Keep that column's two
+         * D=128 lane elements live across the serial token recurrence instead of round-tripping
+         * them through HBM at every token. Independent decode rows must retain the per-row path. */
+        const bool resident = PL == 2 && !bstride && BV == PLOW_WAVES;
+        float resident_sc[PL];
+        float* resident_col = nullptr;
+        if (resident) {
+            const unsigned j = tile * BV + wave;
+            resident_col = st_h + (size_t)j * D;
+#pragma unroll
+            for (unsigned r = 0; r < PL; r++)
+                resident_sc[r] = resident_col[r * PLOW_WAVE + lane];
+        }
+#endif
+
         for (unsigned t = bstride ? row : 0u; t < (bstride ? row + 1u : T); t++) {
             /* PER-ROW PARKED MASK (non-zero = skip). Only a sequence-rows program supplies one,
              * and skipping the
@@ -471,7 +494,11 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
 #pragma unroll
                 for (unsigned r = 0; r < PL; r++) {
                     const unsigned d = r * PLOW_WAVE + lane;
+#if PLOW_KDA_PF_STATE_RESIDENT
+                    sc[r] = (resident ? resident_sc[r] : col[d]) * l_g[d];
+#else
                     sc[r] = col[d] * l_g[d];
+#endif
                     pk += sc[r] * l_k[d];
                 }
                 pk = wave_sum(pk); /* S'^T k, over k, inside one wave */
@@ -484,7 +511,14 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                 for (unsigned r = 0; r < PL; r++) {
                     const unsigned d = r * PLOW_WAVE + lane;
                     sc[r] += bu * l_k[d]; /* rank-1 write */
+#if PLOW_KDA_PF_STATE_RESIDENT
+                    if (resident)
+                        resident_sc[r] = sc[r];
+                    else
+                        col[d] = sc[r];
+#else
                     col[d] = sc[r];
+#endif
                     pq += sc[r] * l_q[d]; /* read the UPDATED state */
                 }
                 pq = wave_sum(pq);
@@ -492,6 +526,13 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
             }
             __syncthreads(); /* l_q/l_k/l_g are rewritten by the next token */
         }
+#if PLOW_KDA_PF_STATE_RESIDENT
+        if (resident) {
+#pragma unroll
+            for (unsigned r = 0; r < PL; r++)
+                resident_col[r * PLOW_WAVE + lane] = resident_sc[r];
+        }
+#endif
     }
 }
 
@@ -544,6 +585,114 @@ __device__ void d_kda_state_step_g(bf16* __restrict__ o, const bf16* __restrict_
 }
 #undef PLOW_KDA_STEP_RUNGS
 
+#if PLOW_KDA_CONV_STEP_DB
+__device__ __forceinline__ bf16 kda_conv_db_one(
+    const bf16* raw, const float* weight, const float* source, float* target, unsigned channel,
+    unsigned W, bool write_state) {
+    float win[8], tap[8];
+    const unsigned width = W < 8 ? W : 8;
+#pragma unroll
+    for (unsigned j = 0; j < 8; ++j) {
+        win[j] = j < width ? source[(size_t)channel * W + j] : 0.0f;
+        tap[j] = j < width ? weight[(size_t)channel * W + j] : 0.0f;
+    }
+#pragma unroll
+    for (unsigned j = 0; j + 1 < 8; ++j) win[j] = win[j + 1];
+    win[width - 1] = bf2f(raw[channel]);
+    float value = 0.0f;
+#pragma unroll
+    for (unsigned j = 0; j < 8; ++j) value += win[j] * tap[j];
+    if (write_state) {
+#pragma unroll
+        for (unsigned j = 0; j < 8; ++j)
+            if (j < width) target[(size_t)channel * W + j] = win[j];
+    }
+    return f2bf(act_silu(value));
+}
+
+/* B1-only Conv3 + StateStepG candidate. The old and new conv-window banks are distinct for the
+ * whole packet, so every value tile can read the old q/k window before tile 0 publishes the next
+ * one. This is the cross-workgroup race an in-place fusion cannot avoid. */
+__device__ void d_kda_conv_state_step_g(
+    bf16* output, const bf16* q_raw, const bf16* k_raw, const bf16* v_raw,
+    const bf16* gate_raw, const bf16* beta_raw, float* state, const float* wq, const float* wk,
+    const float* wv, const float* csq_source, const float* csk_source,
+    const float* csv_source, float* csq_target, float* csk_target, float* csv_target,
+    const float* a_log, const float* dt_bias, unsigned H, unsigned D, unsigned BV, unsigned W,
+    unsigned flags, unsigned gate_mode, float scale, float lb, unsigned slice, unsigned nblk,
+    float* lds) {
+    if (H != 12 || D != 128 || BV != 8 || W != 4 || !(flags & PLOW_KDA_F_QK_L2NORM))
+        __builtin_trap();
+    const unsigned items = H * D / BV;
+    if (slice >= items) return;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 63u;
+    const unsigned wave = tid >> 6;
+    const unsigned h = slice / (D / BV);
+    const unsigned tile = slice % (D / BV);
+    float* l_q = lds;
+    float* l_k = lds + D;
+    float* l_g = lds + 2u * D;
+    float* l_v = lds + 3u * D + 2u * PLOW_WAVES;
+    const unsigned hd0 = h * D;
+    float qsum = 0.0f, ksum = 0.0f;
+    if (tid < D) {
+        const unsigned channel = hd0 + tid;
+        const bf16 q = kda_conv_db_one(q_raw, wq, csq_source, csq_target, channel, W, tile == 0);
+        const bf16 k = kda_conv_db_one(k_raw, wk, csk_source, csk_target, channel, W, tile == 0);
+        l_q[tid] = bf2f(q);
+        l_k[tid] = bf2f(k);
+        float gate;
+        const float gate_input = bf2f(gate_raw[channel]) + dt_bias[channel];
+        if (gate_mode == PLOW_KDA_GATE_LOWER_BOUND)
+            gate = lb * kda_sigmoid(__expf(a_log[h]) * gate_input);
+        else
+            gate = -__expf(a_log[h]) * kda_softplus(gate_input);
+        l_g[tid] = __expf(gate);
+        qsum = l_q[tid] * l_q[tid];
+        ksum = l_k[tid] * l_k[tid];
+    }
+    if (tid < BV) {
+        const unsigned channel = hd0 + tile * BV + tid;
+        const bf16 v = kda_conv_db_one(v_raw, wv, csv_source, csv_target, channel, W, true);
+        l_v[tid] = bf2f(v);
+    }
+    qsum = block_sum(qsum, lds + 3u * D);
+    ksum = block_sum(ksum, lds + 3u * D + PLOW_WAVES);
+    const float rq = scale / sqrtf(qsum + 1e-6f);
+    const float rk = 1.0f / sqrtf(ksum + 1e-6f);
+    if (tid < D) {
+        l_q[tid] *= rq;
+        l_k[tid] *= rk;
+    }
+    __syncthreads();
+
+    const unsigned j = tile * BV + wave;
+    float* column = state + (size_t)h * D * D + (size_t)j * D;
+    float sc[2];
+    float pk = 0.0f;
+#pragma unroll
+    for (unsigned r = 0; r < 2; ++r) {
+        const unsigned d = r * PLOW_WAVE + lane;
+        sc[r] = column[d] * l_g[d];
+        pk += sc[r] * l_k[d];
+    }
+    pk = wave_sum(pk);
+    const float update = kda_sigmoid(bf2f(beta_raw[h])) * (l_v[wave] - pk);
+    float pq = 0.0f;
+#pragma unroll
+    for (unsigned r = 0; r < 2; ++r) {
+        const unsigned d = r * PLOW_WAVE + lane;
+        sc[r] += update * l_k[d];
+        column[d] = sc[r];
+        pq += sc[r] * l_q[d];
+    }
+    pq = wave_sum(pq);
+    if (lane == 0) output[hd0 + j] = f2bf(pq);
+    (void)nblk;
+}
+#endif
+
 /* -------------------------------------------------------------------------------------------
  * op 103 — KDA output gate. y[h,d] = RMSNorm_D(o[h,:])[d] * sigmoid(g_raw[h,d]).
  *
@@ -556,9 +705,9 @@ __device__ void d_kda_state_step_g(bf16* __restrict__ o, const bf16* __restrict_
  *     before.
  *
  * One wave per (token, head) row: T*H items, the reduction is a wave_sum over D/64 elements per
- * lane, and nothing crosses a wave. At T=1 that is 96 rows, so blocks = 96 (37.5%) — acceptable
- * on an op that touches 12288 elements, and the alternative (folding it into op 102's epilogue)
- * needs a grid-wide barrier because a head's D outputs are spread over D/BV workgroups there.
+ * lane, and nothing crosses a wave. The packet therefore needs ceil(T*H/PLOW_WAVES) workgroups:
+ * 12 at TP1 B1 and 2 at TP8 B1. Folding this into op 102's epilogue instead needs a grid-wide
+ * barrier because a head's D outputs are spread over D/BV workgroups there.
  */
 __device__ void d_kda_gated_norm(bf16* __restrict__ y, const bf16* __restrict__ o,
                                  const float* __restrict__ norm_w, const bf16* __restrict__ g_raw,

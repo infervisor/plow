@@ -21,16 +21,15 @@
  * must not be WORSE. (Byte-exactness is the bar for the decode QKV fusion, where both sides
  * compute the identical per-column dot; it is the wrong bar here and claiming it would be a lie.)
  *
- * TILE. `d_gemm_glu_mxfp4` exists at 256x256 only — the epilogue's wave->column remap needs
- * SN == 2 — so this file also times the unfused pair at EVERY fp4 rung, which is what makes the
- * emitter's `glu_fusion_wins_mxfp4` restriction checkable rather than asserted: if a narrower rung
- * beats 256x256 by more than the round trip costs, the pair should stay unfused at that shape.
+ * TILE. `d_gemm_glu_mxfp4` uses the architecture-default GEMM tile (256x256 on gfx950,
+ * 192x256 on gfx942). This file also times the unfused pair at every fp4 rung, so the emitter can
+ * compare fusion against the actual default rather than assuming one architecture's geometry.
  *
- *   hipcc --offload-arch=gfx950 -O3 -w -DGGMX_DEVICE --genco \
- *       runtime/tests/gemm_glu_mxfp4_gfx950_test.hip -o /tmp/ggmx.co -Iruntime/amd -Iruntime/common
- *   hipcc -O2 -w -x c++ -D__HIP_PLATFORM_AMD__=1 -I/opt/rocm/include \
- *       runtime/tests/gemm_glu_mxfp4_gfx950_test.hip -o /tmp/ggmx_test -L/opt/rocm/lib -lamdhip64
- *   sg render -c 'ROCR_VISIBLE_DEVICES=7 /tmp/ggmx_test /tmp/ggmx.co'
+ *   nix develop --command bash -c 'hipcc --offload-arch=gfx950 -O3 -w -DGGMX_DEVICE --genco \
+ *       runtime/tests/gemm_glu_mxfp4_gfx950_test.hip -o /tmp/ggmx.co -Iruntime/amd -Iruntime/common'
+ *   nix develop --command bash -c 'hipcc -O2 -w -x c++ -D__HIP_PLATFORM_AMD__=1 -I"$ROCM_PATH/include" \
+ *       runtime/tests/gemm_glu_mxfp4_gfx950_test.hip -o /tmp/ggmx_test -L"$ROCM_PATH/lib" -lamdhip64'
+ *   sg render -c 'nix develop --command env ROCR_VISIBLE_DEVICES=7 /tmp/ggmx_test /tmp/ggmx.co'
  */
 
 struct GArgs {
@@ -89,7 +88,8 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_gemm_glu(const GArg
 
 /* PLOW_ACT_SILU_ = 1 (op_elementwise.h); 0 is GELU-tanh, which is what an `act` typo silently
  * selects — and the resulting output is finite, plausible and wrong by ~100% on negative gates. */
-static const unsigned NBLK = 256, NTHREADS = 512, ACT_SILU = 1;
+static unsigned NBLK = 256;
+static const unsigned NTHREADS = 512, ACT_SILU = 1;
 
 static unsigned rng_state = 0x13579BDFu;
 static unsigned urand() {
@@ -291,23 +291,23 @@ static void run_shape(unsigned T, unsigned N, unsigned K) {
     struct {
         const char* name;
         hipFunction_t f;
-    } rungs[] = {{"256x256", f_c0}, {"128x128", f_med}, {"64x128", f_small},
+    } rungs[] = {{"default", f_c0}, {"128x128", f_med}, {"64x128", f_small},
                  {"128x256", f_wide}, {"192x256", f_c5}};
-    float best = 1e30f, t256 = 0;
+    float best = 1e30f, tdefault = 0;
     const char* bestn = "";
     printf("  timing (%d iters):\n", iters);
     for (auto& r : rungs) {
         g_split = r.f;
         const float t = time_ms(run_split, iters);
         printf("    unfused 2x%-8s + Glu : %8.4f ms\n", r.name, t);
-        if (strcmp(r.name, "256x256") == 0) t256 = t;
+        if (strcmp(r.name, "default") == 0) tdefault = t;
         if (t < best) {
             best = t;
             bestn = r.name;
         }
     }
     printf("    FUSED GemmGluMxfp4      : %8.4f ms   %+.2f%% vs the SAME tile unfused\n", tf,
-           100.0 * (tf - t256) / t256);
+           100.0 * (tf - tdefault) / tdefault);
 
     /* HBM traffic the fusion removes: gate+up written and read back, minus the one fu write the
      * fused arm still does. Weights and A are identical in both arms. */
@@ -329,6 +329,7 @@ int main(int argc, char** argv) {
     const char* co = argc > 1 ? argv[1] : "/tmp/ggmx.co";
     hipDeviceProp_t prop;
     HIP_OK(hipGetDeviceProperties(&prop, 0));
+    NBLK = (unsigned)prop.multiProcessorCount;
     hipModule_t mod;
     HIP_OK(hipModuleLoad(&mod, co));
     HIP_OK(hipModuleGetFunction(&f_c0, mod, "k_gemm_c0"));

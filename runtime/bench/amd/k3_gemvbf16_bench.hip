@@ -22,6 +22,7 @@
  *              record of why (ragged tail: half the waves fall into the R=1 path).
  *   k_rA       R=2/UN=7 below nchunk 8 + wide staging. THE SHIPPED COMBINATION.
  *   k_rL       R=4 -> R=2 -> R=1 ladder. Wins at nchunk=2, loses at nchunk=7, net worse than rA.
+ *   k_rF       Current-WG128 fit: R=7 at nchunk=2, the ladder at nchunk=3, R=2 otherwise.
  *   k_noldsx   x from global instead of LDS. A 1.2-1.6x LOSS at every shape including gv_per==1,
  *              which is the measured answer to "the staging cannot be worth it for one column".
  *
@@ -248,6 +249,34 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_rL(bf16* C, const b
                                                             blockIdx.x, gridDim.x, sm.xstage);
         else
             gemv_rows_lad<PLOW_GEMV_MM, true>(C, x, Wp, 1u, N, K, blockIdx.x, gridDim.x, sm.xstage);
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_rF(bf16* C, const bf16* x,
+                                                                const bf16* W, unsigned nrep,
+                                                                unsigned N, unsigned K) {
+    __shared__ gv_smem sm;
+    for (unsigned e = 0; e < nrep; e++) {
+        const unsigned nv = K >> 3;
+        for (unsigned i = threadIdx.x; i < nv; i += PLOW_THREADS)
+            *(bf16v8*)(sm.xstage + i * 8) = ld_glob8(as_glob(x) + i * 8);
+        for (unsigned i = (nv << 3) + threadIdx.x; i < K; i += PLOW_THREADS) sm.xstage[i] = x[i];
+        __syncthreads();
+        const bf16* Wp = W + (size_t)e * N * K;
+        const unsigned nch = (K + PLOW_WAVE * 8 - 1) / (PLOW_WAVE * 8);
+        if (nch >= 8u)
+            gemv_rows<PLOW_GEMV_MM, true, false, GV_UNROLL>(C, x, Wp, nullptr, nullptr, 1u, N, K,
+                                                            blockIdx.x, gridDim.x, sm.xstage);
+        else if (nch == 2u)
+            gemv_rows_rsplit<PLOW_GEMV_MM, true, 2, 7>(C, x, Wp, 1u, N, K, blockIdx.x,
+                                                       gridDim.x, sm.xstage);
+        else if (nch == 3u)
+            gemv_rows_lad<PLOW_GEMV_MM, true>(C, x, Wp, 1u, N, K, blockIdx.x, gridDim.x,
+                                              sm.xstage);
+        else
+            gemv_rows_rsplit<PLOW_GEMV_MM, true, 7, 2>(C, x, Wp, 1u, N, K, blockIdx.x,
+                                                       gridDim.x, sm.xstage);
         __syncthreads();
     }
 }

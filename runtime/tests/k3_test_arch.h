@@ -1,0 +1,15 @@
+#ifndef PLOW_K3_TEST_ARCH_H
+#define PLOW_K3_TEST_ARCH_H
+
+#ifndef PLOW_TEST_ARCH_SUFFIX
+#define PLOW_TEST_ARCH_SUFFIX gfx950
+#endif
+
+#define PLOW_TEST_JOIN_I(a, b) a##b
+#define PLOW_TEST_JOIN(a, b) PLOW_TEST_JOIN_I(a, b)
+#define PLOW_TEST_STRING_I(x) #x
+#define PLOW_TEST_STRING(x) PLOW_TEST_STRING_I(x)
+#define PLOW_K3_DECODE_KERNEL \
+    PLOW_TEST_STRING(PLOW_TEST_JOIN(plow_interp_dec_, PLOW_TEST_ARCH_SUFFIX))
+
+#endif

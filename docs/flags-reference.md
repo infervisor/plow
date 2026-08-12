@@ -103,9 +103,10 @@ shipped one.
   doubt.
 - `PLOW_UNISEG=1` — single-segment programs (required for the prefill buckets on
   the sm_120 interpreter).
-- `PLOW_DECODE_BATCH=B` — emit a batched decode program (B ∈ 1..8) for multi-user
-  serving (WS-GEMV shares weight reads across streams). `B=1` blobs are
-  byte-identical to unset.
+- `PLOW_DECODE_BATCH=B` — emit a batched decode program for multi-user serving
+  (WS-GEMV shares weight reads across streams). Kimi-K3 supports `B` in 1..32;
+  `B>16` requires `PLOW_GEMV_WALK=1`. Other model families may impose a lower
+  ceiling. `B=1` blobs are byte-identical to unset.
 - `PLOW_MAX_CHUNK=N` — largest prefill chunk for this compile (power of two,
   ≤ 8192). **This caps the bucket ladder**, so it also sets the ceiling for the
   runtime `PLOW_PF_INTERLEAVE` — raising that knob above this value is a no-op.
@@ -219,8 +220,9 @@ More emit knobs (all **byte-identical when unset** unless noted):
   `next_pow2(PLOW_DECODE_BATCH)` clamped to 16 and baked into the ELF symbol
   `plow_gemv_mm_cap_<MM>` (the plowrt loader validates it). `PLOW_GEMV_WALK`
   toggles the outer `ceil(M/MM)` loop so one MM object serves any M; **serving
-  batch > MM without WALK is refused.** NVIDIA analogue is the build-time
-  `GV_MM_MAX`.
+  batch > MM without WALK is refused.** Kimi-K3 requires WALK for decode batches
+  17..32 because the largest compiled AMD bucket is 16. NVIDIA analogue is the
+  build-time `GV_MM_MAX`.
 - `PLOW_PF_GEMV_HEAD` — force prefill `lm_head` onto the M=1 GEMV arm vs a tiled
   BM=128 tile (on by default for AMD; `=1`/`=0` to force). Traps on M≠1.
 - `PLOW_NO_FUSE_QKV=1` — revert the fused QKV projection to the historical
@@ -257,7 +259,8 @@ are not parity-preserving.
 | `PLOW_K3_SHARD_UP` | **on** (tp>1) | column-parallel `routed_expert_up_proj`; `=0` = replicated A/B. |
 | `PLOW_K3_WGFIT` | **on** | narrow workgroup/CU counts to what a packet uses (bit-identical). |
 | `PLOW_K3_NS` | measured | pin FlashMLA-decode `nsplit` for K3 MLA layers. |
-| `PLOW_K3_FUSE_NGEMV` | **off** ⚠️ | fold `norm→GEMV`; off due to an unresolved ~1-ULP end-to-end divergence — risks a fluent-but-wrong model. |
+| `PLOW_K3_FUSE_NGEMV` | **on** | fold the two B1 `norm→GEMV` sites; `0` restores the unfused control, `lat`/`q` isolate one site. Full TP8 BF16-logit gate is byte-exact. |
+| `PLOW_K3_KDA_CONV_STEP_DB` | off | B1-only experiment: emit `KdaConvStateStepG` and allocate ping-pong KDA convolution-window banks. The selected decode object must also be built with `PLOW_KDA_CONV_STEP_DB=1`; packet/object mismatch is refused. |
 | `PLOW_K3_SHARD_HEAD` | **off** ⚠️ | vocab-column-parallel `lm_head`; unvalidated on real K3. |
 | `PLOW_GLM_FUSE_A` / `PLOW_GLM_FUSE_G` | **on** | fuse the GLM A-projection / gate GEMVs (byte-identical); `=0` splits. |
 | `PLOW_GLM_DSA` | **on** (ctx>65536) | arm the DSA sparse-indexer gather above the measured ctx crossover; `=0` forces dense. |
@@ -413,6 +416,7 @@ symbol, CUDA 13.0, and are **per-arch — they do not transfer**.
 | `PLOW_MLA_PREFILL` | off | compile the MLA chunked-prefill ops (51/55); also read at emit for the tune census. |
 | `PLOW_MOE_PREFILL` | off | grouped MoE prefill ops (83–87). Also an emit gate: on for MoE bf16 by default, `=0` opts the bf16 MoE-prefill path out. |
 | `PLOW_MOE_PF_A4W4` | off | A4W4 grouped-expert GEMM body (ops 85/86, MXFP4 on both operands); set for K3 rows in CMake, required by the devgen manifest. |
+| `PLOW_K3_DECODE_GROUPED` | off | Build-only K3 override for a B1 object that must serve grouped ladder packets. Adds the A4W4 expert body and capability marker without changing `PLOW_DECODE_BATCH`; required by the K3 MI325X rung-1 recipe. |
 | `PLOW_MOE_ROUTER_SELECT` | =`PLOW_K3` | `1` = k parallel block-max router passes (K3's 896-expert / top-16); `0` = single all-pairs rank pass. |
 | `PLOW_BUCKET_DECODE` / `PLOW_BUCKET_PREFILL` | decode=1 selects | which interp bucket the object serves (`PLOW_BUCKET_PREFILL` is derived as `!DECODE`); emitted into manifest `req` strings. |
 | `PLOW_BUCKET_FLASH` | off | compile the standalone 4-wave flash-decode object. |
@@ -454,6 +458,7 @@ nobody re-runs them.
 | `PLOW_NV_FA_VDBUF` | 0 | V double-buffer. **MEASURED NEGATIVE**: wash at 32k/64k, **+2.2% slower at 128k** — the 128k full-attn flash is HBM-bound. |
 | `PLOW_NV_FA_CORRSKIP` | 0 | fp8mma only — skip the softmax rescale when every lane's `corr` is exactly 1.0. Bitwise identical. |
 | `PLOW_NV_KVBOUNDS` | 0 | per-batch KV bounds checking. |
+| `PLOW_NV_FA256_BKV` / `PLOW_NV_FA512_BKV` | 32 / 16 | KV rows staged per flash-**prefill** tile, per head dim. The trade is smem footprint vs staging granularity. **64 / 32 are the sm_90a measured optima** and are what `build_sm90a_cubin.sh` is driven with; they are not validated as sm_120a defaults. |
 | `PLOW_FLASH_HD128` | off | enable the fused-write path in inline flash for D=128 (Llama/Qwen), avoiding register spill on the 8-wave interpreter. |
 | `PLOW_FA_GF_FULL` | 2 | **AMD** flash-decode GQA fusion factor on full-attention layers (paired env+define; the NVIDIA analogue is `PLOW_NV_FA_GF_FULL`, which it must agree with or kernel/packet disagree). |
 
@@ -494,6 +499,10 @@ data race; used only to price a protocol cost): `PLOW_GATE_HIER_CEIL`,
 | `PGM_STAGES` | 3 | GEMM cp.async pipeline depth. **px9 measured 3→6 = 0%** — the mainloop is not latency-bound. |
 | `GV_UNROLL` | 8 (NV) / 11 (AMD); 14 for K3 | dense bf16 GEMV inner-K unroll = 128-bit weight vectors prefetched before consumed (memory-level parallelism). Swept by `tunedb`, per-arch in CMake. Bit-exact. |
 | `GV_UNROLL_GLU` | 4 (NV) / 6 (AMD) | same unroll for the bf16 GLU/SwiGLU-fused GEMV. Also swept. |
+| `GV_UN16` / `GV_UN_GLU16` | 4 / 2 | inner-K unroll for the **MM=16** decode rung specifically (`GV_UNROLL` covers the base rungs). Needs `GV_MM_MAX=16` to be reachable at all. Worth ~2%; `=8` measured best on sm_120a. |
+| `GV_UN32` / `GV_UN_GLU32` | 2 / 1 | same for the MM=32 rung. |
+| `GV_UNROLL_FP8` / `GV_UNROLL_GLU_FP8` | = the bf16 twins | rung unroll on the fp8 GEMV arms. The optimum is **precision-dependent** — sweep at the precision you ship, do not inherit the bf16 winner. |
+| `GV_MOE_RB` / `GV_MOE_RB_DN` / `GV_MOE_UN` | 2 / 2 / 2 | MoE GEMV output-channels-per-warp (main / `down` arm) and inner unroll. Shape-dependent; the source notes the previous optimum stopped being one once neighbouring arms moved. |
 | `PGM_GLU_STAGES` | 2 | same for the fused GLU arm (kept shallower to fit the 100 KiB dynamic-smem cap). |
 | `PGM_W8A8_LDS64` | **1** | **px9** — read the fp8 fragment as one `uint2`. **+6.5% on plain w8a8, 0% on GLU, +2.2% weighted.** Bit-exact. |
 | `PGM_SW8_V2` | **1** | **px9** — `Swizzle<2,4,2>` matched to the ACTUAL 64-byte fp8 row. +0.5% on top of LDS64. |
@@ -547,6 +556,60 @@ All produce wrong logits by construction.
 Harness-only (not the served cubins): `PLOW_SM120_SMS` (188) and
 `PLOW_SMP_THREADS` (256).
 
+### sm_90a object selection (`PLOW_BUILD_*`) — **sm_90a only**
+
+`scripts/build_sm90a_cubin.sh` compiles a **five-object** prefill stack rather
+than one megakernel, and these envs — read by the build script, not passed as
+raw `-D` — decide which objects it emits and which arms each carries. They have
+no effect on any other `--arch`; the sm_120 script builds one decode + one
+prefill object and ignores them.
+
+The reason the stack exists is the register-allocation coupling that the section
+header above describes: a heavyweight wgmma body loses probe-grade allocation
+when compiled into the wide-armed interpreter TU, so on sm_90a the tuning axis
+is **which object gets built**, not which tile a macro selects.
+
+| build env | object it shapes | meaning |
+|---|---|---|
+| `PLOW_BUILD_SEG` | `_pfseg` + `_pfgemm` | build the segmented pair at all. Packets must be emitted **without** `PLOW_UNISEG`. |
+| `PLOW_BUILD_FATLITE` | `_pfseg` | the fat object arm-stripped of flash → 128 regs, occupancy 2. |
+| `PLOW_BUILD_GEMM_WS384` | `_pfgemm` | 384-thread producer/consumer GEMM; carries **both** precisions' n256 bodies, so one lean object serves bf16 and fp8. |
+| `PLOW_BUILD_FA512` + `PLOW_BUILD_FA_WG` + `PLOW_BUILD_FA_HD256` | `_pffa` | the dedicated flash object: wgmma arms, hd512 and hd256. `--pf-seg-fa512 all` **requires** `FA_HD256=1` (the loader refuses the mismatch). |
+| `PLOW_BUILD_TMA_GEMM` / `PLOW_BUILD_W8A8` | all | TMA GEMM bodies / fp8 w8a8 arms. Drop `W8A8` for bf16-only cubins. |
+
+The canonical build measured in the GH200 campaign:
+
+```bash
+PLOW_EXTRA_DEFINES="-DPLOW_NV_FA256_BKV=64 -DPLOW_NV_FA512_BKV=32" \
+PLOW_BUILD_TMA_GEMM=1 PLOW_BUILD_W8A8=1 PLOW_BUILD_SEG=1 \
+PLOW_BUILD_FATLITE=1 PLOW_BUILD_GEMM_WS384=1 \
+PLOW_BUILD_FA512=1 PLOW_BUILD_FA_WG=1 PLOW_BUILD_FA_HD256=1 \
+scripts/build_sm90a_cubin.sh <out-dir>/interp_sm90a.cubin
+```
+
+Its serve-side and emit-side counterparts are in
+[Segmented prefill (sm_90a / GH200)](#segmented-prefill-sm_90a--gh200) below;
+the emit knob and the serve knob **must pair** (`PLOW_SEG_PURE_GEMM` ↔
+`--pf-seg-pure`, `PLOW_SEG_FA512` ↔ `--pf-seg-fa512`) — the classing decides
+which object a packet lands on and a mismatched object `__trap()`s by design.
+
+Ablation-only `PLOW_BUILD_*` switches, default off, leave them off unless
+reproducing a specific finding: `FA_ROPE`, `FA_WGITEM`, `FP8KV`, `GEMM_OCC1`,
+`GEMM_ONLY`, `GEMM_UNI256`, `GEMV_HEAD`, `SEG_NOGLU`, `SEG_WS`, `SEG_WS_ENTRY`,
+`WS_BN256`.
+
+Two sm_90a-only `-D` tuning knobs on the GEMM side:
+
+| flag | default | effect |
+|---|---|---|
+| `PGM90_TILE_BAND` | 16 | band rasterization width for the sm_90a GEMM — how many M-tiles share a B-tile in L2 before the walk advances. |
+| `PGM90_UNI256_NS` | 4 | TMA ring depth of the n256 body. bf16 256-byte k-stages at `NS=2` measured **−44 ms** (ring starvation); do not lower it casually. |
+
+The runtime companion of an sm_90a decode build is `PLOW_NS_FULL_ABS`, and its
+value is a **cliff, not a slope** — see the header of `build_sm90a_cubin.sh`,
+which derives it as `n_cu / gcd(n_grp, n_cu)` and records what the neighbouring
+values cost.
+
 ---
 
 ## Serving / runtime knobs (`plowrt` env)
@@ -586,6 +649,8 @@ Harness-only (not the served cubins): `PLOW_SM120_SMS` (188) and
 | `PLOW_TP_AGREE_EVERY=N` | 1 | TP cross-rank agreement interval. `PLOW_TP_NO_AUDIT=1` disables the redundant-rank audit (timing runs); `PLOW_TP_SERIAL_LOAD=1` restores one-at-a-time per-rank load. |
 | `PLOW_LOAD_PROFILE=1` | off | split upload wall time into alloc / stage+DMA profiling. |
 | `PLOW_STEP_TIME=1`, `PLOW_TTFT_LOG=1` | off | per-decode-step host-op timing / TTFT breakdown logging (diagnostics). |
+| `PLOW_HSACO_LOWRUNG=dir:max[,dir:max…]` | unset | AMD decode-object tiers. The runtime selects the narrowest tier whose `max` covers the occupied decode rung, pairing-checks each tier at that width, and falls back to the primary HSACO inventory above it. A single legacy `dir` uses `PLOW_LOWRUNG_MAX` (default 2). |
+| `PLOW_STATE_CLEAR_DEVICE=1` | off | AMD admission experiment: clear slot-major recurrent state with one device kernel per rank instead of host-staged SDMA fills. Requires rebuilt decode objects carrying `plow_state_clear`. |
 
 ### Segmented prefill (sm_90a / GH200)
 

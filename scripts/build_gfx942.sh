@@ -31,30 +31,32 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 R="$REPO/runtime"
 OUT="${1:-${PLOW_BUILD_DIR:-$REPO/build-amd/hsaco/gfx942}}"
 ARCH=gfx942
-HIPCC="${PLOW_HIPCC:-/opt/rocm/bin/hipcc}"
-# THE `|| true` IS LOAD-BEARING, and its absence cost two agents a build each.
-#
-# These probes list SEVERAL candidate paths and keep the first that exists — so `ls` reporting
-# "No such file" for the others is the NORMAL case, not an error. But `ls` still EXITS 2 when any
-# operand is missing, and under `set -euo pipefail` (line 28) `pipefail` promotes that exit
-# through `head -1` and `set -e` kills the script — at line 35, before a single `echo`. The
-# symptom is exit 2 and a COMPLETELY EMPTY log, which reads like a toolchain fault rather than a
-# shell quoting bug, and it fires only on a box that lacks the first candidate.
-#
-# `|| true` inside the substitution makes an all-candidates-missing probe yield the empty string
-# instead, which the checks below report by name. Fail loudly with a name, never silently at
-# line 35.
-BUN="${PLOW_BUNDLER:-$(ls -1 "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/clang-offload-bundler \
-        "${ROCM_PATH:-/opt/rocm}"/llvm/bin/clang-offload-bundler \
-        /opt/rocm-*/lib/llvm/bin/clang-offload-bundler 2>/dev/null | head -1 || true)}"
-# Same discovery for readelf: the cliff check below dies with empty fields (every row reported
-# OVER) when the hardcoded /opt/rocm path is absent, which fails a perfectly good build.
-READELF="${PLOW_READELF:-$(ls -1 "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/llvm-readelf \
-        "${ROCM_PATH:-/opt/rocm}"/llvm/bin/llvm-readelf \
-        /opt/rocm-*/lib/llvm/bin/llvm-readelf 2>/dev/null | head -1 || true)}"
-[ -x "$HIPCC" ] || { echo "FAIL: hipcc not found at '$HIPCC' (set PLOW_HIPCC)" >&2; exit 2; }
-[ -n "$BUN" ] || { echo "FAIL: clang-offload-bundler not found (set PLOW_BUNDLER)" >&2; exit 2; }
-[ -n "$READELF" ] || { echo "FAIL: llvm-readelf not found (set PLOW_READELF)" >&2; exit 2; }
+[ -n "${IN_NIX_SHELL:-}" ] || { echo "FAIL: run this script through nix develop" >&2; exit 2; }
+: "${PLOW_HIPCC:?nix develop did not set PLOW_HIPCC}"
+: "${PLOW_BUNDLER:?nix develop did not set PLOW_BUNDLER}"
+: "${PLOW_READELF:?nix develop did not set PLOW_READELF}"
+[ "${PLOW_TOOLCHAIN_LABEL:-}" = "rocm-7.14.0-nix" ] || {
+  echo "FAIL: expected ROCm 7.14.0 from the flake, got ${PLOW_TOOLCHAIN_LABEL:-unset}" >&2; exit 2; }
+HIPCC="$PLOW_HIPCC"
+BUN="$PLOW_BUNDLER"
+READELF="$PLOW_READELF"
+require_nix_tool() {
+  local name="$1" path="$2" target
+  target="$(readlink -f "$path")"
+  case "$target" in
+    /nix/store/*) ;;
+    *) echo "FAIL: $name must resolve into /nix/store, got ${target:-missing}" >&2; exit 2 ;;
+  esac
+  [ -x "$target" ] || { echo "FAIL: $name not executable at $target" >&2; exit 2; }
+}
+require_nix_tool hipcc "$HIPCC"
+require_nix_tool clang-offload-bundler "$BUN"
+require_nix_tool llvm-readelf "$READELF"
+HIP_VERSION="$("$HIPCC" --version)"
+case "$HIP_VERSION" in
+  *"HIP version: 7.14."*) ;;
+  *) echo "FAIL: expected HIP 7.14 from the flake" >&2; exit 2 ;;
+esac
 INC="-I$R/amd -I$R/common"
 JOBS="${JOBS:-8}"
 mkdir -p "$OUT"; cd "$OUT"
@@ -90,17 +92,52 @@ AX_PREFILL="-DPLOW_BUCKET_DECODE=0 $CDNA3_TILE $AX_GMOE"
 # ladder instantiates MM in {1,2,4,8,16} and one instantiation with a runtime M serves every
 # M <= MM, so the bucket is a CEILING. Passing the raw batch through was a bug in this script:
 # PLOW_DECODE_BATCH=32 handed -DPLOW_GEMV_MM=32 to hipcc and every decode row failed to build.
-GVMM=1
-while [ "$GVMM" -lt "${PLOW_DECODE_BATCH:-1}" ] && [ "$GVMM" -lt 16 ]; do GVMM=$((GVMM * 2)); done
-AX_DECODE="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM $CDNA3_TILE $AX_GMOE"
+RAW_BATCH="${PLOW_DECODE_BATCH:-1}"
+case "$RAW_BATCH" in
+  ''|*[!0-9]*) echo "PLOW_DECODE_BATCH must be an integer in 1..32" >&2; exit 1 ;;
+esac
+if [ "$RAW_BATCH" -lt 1 ] || [ "$RAW_BATCH" -gt 32 ]; then
+  echo "PLOW_DECODE_BATCH must be in 1..32, got $RAW_BATCH" >&2
+  exit 1
+fi
+P2=1
+while [ "$P2" -lt "$RAW_BATCH" ]; do P2=$((P2 * 2)); done
+[ "$P2" -gt 16 ] && P2=16
+GVMM="$P2"
+
+# The row bucket and the packet batch are separate axes when the walk is enabled. A B16 packet
+# on MM8 is sound only with PLOW_GEMV_WALK=1: the kernel makes two weight passes and advertises
+# both markers, which plowrt validates before launch. Without the walk, rows MM..B-1 stay stale.
+WALK="${PLOW_GEMV_WALK:-0}"
+case "$WALK" in
+  0) AX_GEMV_WALK="" ;;
+  1) AX_GEMV_WALK="-DPLOW_GEMV_WALK=1" ;;
+  *) echo "PLOW_GEMV_WALK must be 0 or 1" >&2; exit 1 ;;
+esac
+if [ "$RAW_BATCH" -gt 16 ] && [ "$WALK" != 1 ]; then
+  echo "REFUSING: PLOW_DECODE_BATCH=$RAW_BATCH requires PLOW_GEMV_WALK=1 above 16 rows." >&2
+  exit 1
+fi
+if [ -n "${PLOW_GEMV_MM:-}" ]; then
+  case "$PLOW_GEMV_MM" in
+    ''|*[!0-9]*) echo "PLOW_GEMV_MM must be a number" >&2; exit 1 ;;
+    1|2|4|8|16) ;;
+    *) echo "PLOW_GEMV_MM must be one of 1,2,4,8,16" >&2; exit 1 ;;
+  esac
+  if [ "$PLOW_GEMV_MM" -lt "$RAW_BATCH" ] && [ "$WALK" != 1 ]; then
+    echo "REFUSING: PLOW_GEMV_MM=$PLOW_GEMV_MM < batch $RAW_BATCH with PLOW_GEMV_WALK unset." >&2
+    echo "  Without the walk, gemv_rows<MM> writes rows 0..MM-1 and leaves the rest STALE." >&2
+    exit 1
+  fi
+  GVMM="$PLOW_GEMV_MM"
+fi
+AX_DECODE="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM $AX_GEMV_WALK $CDNA3_TILE $AX_GMOE"
+echo "   decode GEMV batch bucket: PLOW_GEMV_MM=$GVMM walk=$WALK (PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH:-1})"
 # OPT-IN (PLOW_GEMV_WALK=1): the §6g-WALK row-block outer loop — the object serves any M in
 # ceil(M/MM) passes of the compiled bucket, and the LDS staging bound becomes min(MM,M)*K.
 # REQUIRED for a PLOW_DECODE_BATCH>16 ladder (PLOW_GEMV_MAXM caps the bucket at 16; without
 # the walk, rows 16.. would never be written — plowrt refuses the pair on the missing
 # `plow_gemv_walk_1` marker rather than serving stale rows).
-if [ "${PLOW_GEMV_WALK:-0}" = 1 ]; then
-  AX_DECODE="$AX_DECODE -DPLOW_GEMV_WALK=1"
-fi
 # PLOW_OCC4=1 -- THE OCCUPANCY-4 DECODE PROFILE. MEASURED -10.4% on bf16 and -19.1% on fp8
 # (Gemma-4-12B, ctx 4096, three interleaved pairs, token-identical):
 #
@@ -124,7 +161,7 @@ if [ "${PLOW_OCC4:-0}" = 1 ]; then
   # -DPLOW_MOE_GEMMA only, NOT _PF: the grouped-MoE PREFILL tile is (64+256)*64 halves = 40,960 B
   # and its static_assert wants that much `raw`, which the 30,720 B arena cannot give. It is a
   # prefill arm and the decode bucket never dispatches op 73, so dropping it costs nothing here.
-  AX_DECODE="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM -DPLOW_WG_WAVES=8 -DPLOW_MOE_GEMMA=1 \
+  AX_DECODE="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM $AX_GEMV_WALK -DPLOW_WG_WAVES=8 -DPLOW_MOE_GEMMA=1 \
              -DGM_BM=128 -DGM_BN=256 -DGM_BK=32 -DPLOW_NO_MLA_DEC=1 -DPLOW_WPE=5"
 fi
 # $AX_GMOE on the FLASH row too. The flash object runs only class-4 flash
@@ -138,6 +175,9 @@ AX_FLASH="-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=2
 # object's 512-register budget. Marker `plow_mla_pf_v2_arm_1`; the host routes FlashMlaPrefill
 # segments here only under PLOW_MLA_PF_V2=1, so carrying the arm costs Gemma nothing.
 AX_FLASH="$AX_FLASH -DPLOW_MLA_PF_V2_ARM=1"
+# Small K3 buckets remain L2-placed while machine-filling V2 buckets use wave segments.
+# The dispatch arm is inert when `l2_domains == 0`, so one object safely serves both forms.
+AX_FLASH="$AX_FLASH -DPLOW_L2_PLACE_DISPATCH=1"
 # OPT-IN (PLOW_FA_LAZY=1): wave-voted skip of the online-softmax corr/rescale when the
 # running max did not move (bit-identical; see op_attention.h FA_LAZY_RESCALE). FLASH
 # OBJECT ONLY — the 8-wave prefill interpreter sits on the 256-reg cliff and even a
@@ -205,6 +245,11 @@ AX_GQ="-DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=${PLOW_GQ_BATCH:-1}"
 # rungs, GemmGluMxfp4 (113), GemvQkvMxfp4 (114) -- and nothing else: the mxfp4 EXPERT walks that
 # K3 decode actually runs (ops 45/46 with i6 = PLOW_MOE_ENC_MXFP4) are not behind it.
 AX_MXFP4="-DPLOW_MXFP4=1"
+case "${PLOW_MXFP4_DEC_NT:-1}" in
+  0) AX_MXFP4="$AX_MXFP4 -DPLOW_MXFP4_DEC_NT=0" ;;
+  1) ;;
+  *) echo "FAIL: PLOW_MXFP4_DEC_NT must be 0 or 1" >&2; exit 2 ;;
+esac
 # KIMI-K3. `GV_UNROLL=14` is on the K3 rows only and is measured, not derived: K3's dominant
 # decode GEMV is K=7168, whose nchunk is exactly 14 (runtime/CMakeLists.txt records the sweep).
 AX_K3="-DPLOW_K3=1 -DGV_UNROLL=14"
@@ -219,6 +264,25 @@ AX_MLA_K3="$AX_MLA -DPLOW_K3=1"
 # costs the prefill object NOTHING (256 VGPR / occ 2 / 8 spill, byte-for-byte the same resource
 # report as the object without it).
 AX_A4W4="-DPLOW_MOE_PF_A4W4=1"
+case "${PLOW_MOE_PF_A4W4_WEIGHT_NT:-0}" in
+  0) ;;
+  1) AX_A4W4="$AX_A4W4 -DPLOW_MOE_PF_A4W4_WEIGHT_NT=1" ;;
+  *) echo "FAIL: PLOW_MOE_PF_A4W4_WEIGHT_NT must be 0 or 1" >&2; exit 2 ;;
+esac
+# K3's full prefill program is L2-placed on gfx942, unlike the segmented prefill programs this
+# script otherwise builds. Arm the queue interpretation on exactly the K3 A4W4 rows; hierarchy
+# remains a separate, unmeasured PLOW_L2HIER_PF experiment.
+AX_K3_A4W4="-DPLOW_L2_PLACE_DISPATCH=1"
+case "${PLOW_KDA_PF_STATE_RESIDENT:-0}" in
+  0) AX_K3_PF_STATE="" ;;
+  1) AX_K3_PF_STATE="-DPLOW_KDA_PF_STATE_RESIDENT=1" ;;
+  *) echo "FAIL: PLOW_KDA_PF_STATE_RESIDENT must be 0 or 1" >&2; exit 2 ;;
+esac
+# Value-identical CDNA3 DOWN metadata hoist: 6.155 -> 5.490 ms at the emitted TP8
+# 4096-token/896-expert shape. Keep it on the K3 A4W4 rows so unrelated model objects do not move.
+if [ "${PLOW_K3_A4W4_EPI:-1}" != 0 ]; then
+  AX_K3_A4W4="$AX_K3_A4W4 -DPLOW_MOE_PF_EPI_SIB=1"
+fi
 
 # PER-XCD QUEUES + TWO-LEVEL GATE MAINTENANCE -- ON BY DEFAULT. MEASURED -16.0%, TOKEN-IDENTICAL.
 #
@@ -378,10 +442,9 @@ fi
 # This aggregates them on word 1 of the same counter line (PLOW_CTR_STRIDE is 32 words and
 # only word 0 is used) and lets the closing workgroup issue nranks signals carrying nblk each
 # -- so word 0 still lands on exactly nranks*nblk and plowrt's host audit is unchanged.
-# BIT-IDENTICAL (no value is touched) and objects-only: no blob, no emitter, no arm marker;
-# an object built without it is correct-just-slower. PREFILL ROWS ONLY -- `XReduceTwoShot`
-# is emitted 156x per prefill program and ZERO times in the decode program, so this is TTFT
-# work and exactly 0.0% of TPOT.
+# BIT-IDENTICAL (no value is touched) and objects-only: no blob or emitter change. Generic
+# decode uses the one-shot, while batched K3 decode emits 186 two-shot collectives at B32 and
+# enables the same mechanism through PLOW_K3_DECODE_XR_AGG below.
 # HISTORY: default-on 2026-08-09, reverted same day (an XR_AGG-only build FAILED the
 # 3000-token needle gate, '741' for '7413'), RE-ADOPTED 2026-08-10 after the ordering fix.
 # The failing cut released with a FENCE and arrived with a relaxed AGENT-scope RMW — that
@@ -440,18 +503,76 @@ if [ "${PLOW_MOE_PF_EPI:-1}" != 0 ]; then
 fi
 
 # OPT-IN (PLOW_MOE_PF_EPI_SIB=1): THE SAME HOIST AT THE TWO SIBLING SITES (op_moe.h
-# PLOW_MOE_PF_EPI_SIB) -- `d_moe_group_pf_a4w4` (CDNA4 only, not compiled here) and
+# PLOW_MOE_PF_EPI_SIB) -- `d_moe_group_pf_a4w4` (native CDNA4 and simulated CDNA3) and
 # `d_moe_group_gemma_pf_t` (the Gemma-4 MoE twin, ops 75/76 and 81/82; its w8a8 arm carries a
 # THIRD k/n-invariant per-row load, `ascale`, which this takes with the other two). Same
 # addresses, same dwords, same arithmetic -- BYTE-IDENTICAL output. A SEPARATE flag from
 # PLOW_MOE_PF_EPI so the GLM canonical recipe is unperturbed by a change to kernels GLM never
 # dispatches. Rides AX_PREFILL and AX_DECODE alike, because the Gemma MoE prefill bodies are
-# folded into every gfx942 row by AX_GMOE. Default OFF, so the shipped objects are unchanged.
+# folded into every gfx942 row by AX_GMOE. Default OFF globally; K3 A4W4 rows enable it above.
 if [ "${PLOW_MOE_PF_EPI_SIB:-0}" != 0 ]; then
   AX_PREFILL="$AX_PREFILL -DPLOW_MOE_PF_EPI_SIB=1"
   AX_DECODE="$AX_DECODE -DPLOW_MOE_PF_EPI_SIB=1"
   AX_FLASH="$AX_FLASH -DPLOW_MOE_PF_EPI_SIB=1"
 fi
+
+# Simulated-A4W4 CDNA3 staging experiments. Defaults preserve BK64 and its MFMA priority bracket.
+AX_K3_A4W4_TUNE=""
+if [ -n "${PLOW_MOE_PF_A4W4_C3_BK:-}" ]; then
+  case "$PLOW_MOE_PF_A4W4_C3_BK" in 32|64) ;; *) echo "FAIL: PLOW_MOE_PF_A4W4_C3_BK must be 32 or 64" >&2; exit 2;; esac
+  AX_K3_A4W4_TUNE="$AX_K3_A4W4_TUNE -DPLOW_MOE_PF_A4W4_C3_BK=$PLOW_MOE_PF_A4W4_C3_BK"
+fi
+if [ "${PLOW_MOE_PF_A4W4_PRIO:-1}" = 0 ]; then
+  AX_K3_A4W4_TUNE="$AX_K3_A4W4_TUNE -DPLOW_MOE_PF_A4W4_PRIO=0"
+fi
+# Batched K3 decode lowers routed experts to the grouped prefill opcodes (83-87). MXFP4 packets
+# therefore need the A4W4 body in the decode object too; without it the deliberate refusal path
+# writes NaNs. Keep B=1 byte-identical because it uses the per-expert decode opcodes instead.
+AX_K3_DECODE_A4W4=""
+case "${PLOW_K3_DECODE_TILE_BINSEARCH:-1}" in
+  0) AX_K3_TILE_SEARCH="" ;;
+  1) AX_K3_TILE_SEARCH="-DPLOW_MOE_TILE_BINSEARCH=1" ;;
+  *) echo "FAIL: PLOW_K3_DECODE_TILE_BINSEARCH must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${PLOW_K3_DECODE_ALIGN_PAR_PREFIX:-1}" in
+  0) AX_K3_ALIGN_PREFIX="" ;;
+  1) AX_K3_ALIGN_PREFIX="-DPLOW_MOE_ALIGN_PAR_PREFIX=1" ;;
+  *) echo "FAIL: PLOW_K3_DECODE_ALIGN_PAR_PREFIX must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${PLOW_K3_DECODE_ROUTER_LOCAL:-1}" in
+  0) AX_K3_ROUTER_LOCAL="" ;;
+  1) AX_K3_ROUTER_LOCAL="-DPLOW_MOE_ROUTER_SELECT_LOCAL=1" ;;
+  *) echo "FAIL: PLOW_K3_DECODE_ROUTER_LOCAL must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${PLOW_K3_DECODE_XR_AGG:-1}" in
+  0) AX_K3_DECODE_XR_AGG="" ;;
+  1) AX_K3_DECODE_XR_AGG="-DPLOW_XR_AGG=1" ;;
+  *) echo "FAIL: PLOW_K3_DECODE_XR_AGG must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${PLOW_K3_DECODE_GROUPED:-0}" in
+  0|1) ;;
+  *) echo "FAIL: PLOW_K3_DECODE_GROUPED must be 0 or 1" >&2; exit 2 ;;
+esac
+if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] || [ "${PLOW_K3_DECODE_GROUPED:-0}" = 1 ]; then
+  AX_K3_DECODE_A4W4="$AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_TILE_SEARCH $AX_K3_ALIGN_PREFIX $AX_K3_ROUTER_LOCAL"
+fi
+# Compile-only falsification axis: the grouped MXFP4 expert body is gated by
+# PLOW_MOE_PF_A4W4, independently of the standalone MXFP4 projection ops. Keep those projection
+# ops by default; `=0` removes them only from the two K3 decode rows.
+AX_K3_DECODE_MXFP4="$AX_MXFP4"
+if [ "${PLOW_K3_DECODE_MXFP4_PROJ:-1}" = 0 ]; then
+  AX_K3_DECODE_MXFP4=""
+fi
+case "${PLOW_K3_MOE_GROUP_FORCEINLINE:-0}" in
+  0) AX_K3_MOE_GROUP_INLINE="" ;;
+  1) AX_K3_MOE_GROUP_INLINE="-DPLOW_MOE_GROUP_FORCEINLINE=1" ;;
+  *) echo "FAIL: PLOW_K3_MOE_GROUP_FORCEINLINE must be 0 or 1" >&2; exit 2 ;;
+esac
+case "${PLOW_K3_KDA_CONV_STEP_DB:-0}" in
+  0) AX_K3_KDA_CONV_STEP_DB="" ;;
+  1) AX_K3_KDA_CONV_STEP_DB="-DPLOW_KDA_CONV_STEP_DB=1" ;;
+  *) echo "FAIL: PLOW_K3_KDA_CONV_STEP_DB must be 0 or 1" >&2; exit 2 ;;
+esac
 
 # FALSIFICATION ARM (PLOW_F2BF_SELECT=1): the REFUTED branchless f2bf. Default 0 = the shipped branched form.
 # MEASURED AND REFUTED: the branchless form is -5.0% static instructions on the prefill
@@ -710,7 +831,7 @@ ROWS=(
   "interp_decode_fp8|$AX_DECODE $AX_FP8"
   "interp_prefill_fp8kv|$AX_PREFILL $AX_FP8 $AX_FP8KV"
   "interp_decode_fp8kv|$AX_DECODE $AX_FP8 $AX_FP8KV"
-  "interp_flash_fp8kv|$AX_FLASH $AX_FP8KV"
+  "interp_flash_fp8kv|$AX_FLASH $AX_FP8KV -DPLOW_K3=1"
   "interp_prefill_mla|$AX_PREFILL $AX_MLA"
   "interp_prefill_mla_moe|$AX_PREFILL $AX_MLA $AX_MOE"
   "interp_prefill_fp8_mla|$AX_PREFILL $AX_MLA $AX_FP8"
@@ -719,18 +840,19 @@ ROWS=(
   "interp_prefill_fp8kv_mla_moe|$AX_PREFILL $AX_MLA $AX_MOE $AX_FP8 $AX_FP8KV"
   # KIMI-K3. `interp_decode_k3` is the row a K3 decode packet actually loads (exec/amd.rs folds
   # K3Moe and K3MoeA4w4 onto PrefillArm::K3 for the decode phase), and it carries the mxfp4
-  # EXPERT walks by default. `$AX_MXFP4` rides along so an all-fp4 packet finds its fp4
+  # EXPERT walks by default. `$AX_K3_DECODE_MXFP4` rides along so an all-fp4 packet finds its fp4
   # PROJECTION ops in the same object rather than falling through the silent dispatch `default:`.
-  "interp_decode_k3|$AX_DECODE $AX_K3 $AX_MXFP4"
-  "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_MXFP4 $AX_FP8KV"
+  "interp_decode_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_K3_DECODE_XR_AGG $AX_K3_MOE_GROUP_INLINE $AX_K3_KDA_CONV_STEP_DB"
+  "interp_decode_fp8kv_k3|$AX_DECODE $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_FP8KV $AX_K3_DECODE_XR_AGG $AX_K3_MOE_GROUP_INLINE $AX_K3_KDA_CONV_STEP_DB"
   # ATTENTION-ONLY, exactly as on gfx950: without $AX_MOE the grouped expert packets fall through
   # `default:` and write nothing. A whole-layer K3 prompt needs the `_moe` rows below.
   "interp_prefill_k3|$AX_PREFILL $AX_MLA_K3 $AX_MXFP4"
+  "interp_prefill_fp8kv_k3|$AX_PREFILL $AX_MLA_K3 $AX_MXFP4 $AX_FP8KV"
   "interp_prefill_k3_moe|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_MXFP4"
   # THE ROW A K3 PREFILL PACKET ACTUALLY LOADS (exec/amd.rs: grouped ops with i[3] == MXFP4
   # resolve the K3MoeA4w4 arm). On this arch it contains the simulated body -- see AX_A4W4.
-  "interp_prefill_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_MXFP4"
-  "interp_prefill_fp8kv_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_MXFP4 $AX_FP8KV"
+  "interp_prefill_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_PF_STATE $AX_MXFP4"
+  "interp_prefill_fp8kv_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_PF_STATE $AX_MXFP4 $AX_FP8KV"
 )
 
 # PLOW_ROWS_ONLY=<substring>: build only the rows whose stem matches — for iterating on
@@ -829,6 +951,63 @@ for row in "${ROWS[@]}"; do
       interp_flash*) [ "$v" -le 512 ] || { echo "  OVER REG: $v > 512"; fail=1; } ;;
       *)             [ "$v" -le 256 ] || { echo "  OVER REG: $v > 256"; fail=1; } ;;
     esac
+    case "$stem" in
+      interp_flash*)
+        symbols=$("$READELF" -sW "$stem.elf" 2>/dev/null)
+        grep -qE "OBJECT .* plow_mla_pf_v2_arm_1$" <<<"$symbols" || {
+          echo "  MISSING MLA V2: expected plow_mla_pf_v2_arm_1"
+          fail=1
+        }
+        grep -qE "OBJECT .* plow_l2_place_dispatch_1$" <<<"$symbols" || {
+          echo "  MISSING L2 DISPATCH: expected plow_l2_place_dispatch_1"
+          fail=1
+        }
+        if [[ "$stem" == interp_flash_fp8kv* ]]; then
+          grep -qE "OBJECT .* plow_mla_pf_v2_fp8_arm_1$" <<<"$symbols" || {
+            echo "  MISSING FP8 MLA V2: expected plow_mla_pf_v2_fp8_arm_1"
+            fail=1
+          }
+        fi
+        ;;
+      interp_decode*)
+        symbols=$("$READELF" -sW "$stem.elf" 2>/dev/null)
+        grep -qE "OBJECT .* plow_gemv_mm_cap_${GVMM}$" <<<"$symbols" || {
+          echo "  WRONG GEMV CAP: expected plow_gemv_mm_cap_${GVMM}"
+          fail=1
+        }
+        if [ "$WALK" = 1 ]; then
+          grep -qE "OBJECT .* plow_gemv_walk_1$" <<<"$symbols" || {
+            echo "  MISSING GEMV WALK: expected plow_gemv_walk_1"
+            fail=1
+          }
+        elif grep -qE "OBJECT .* plow_gemv_walk_1$" <<<"$symbols"; then
+          echo "  UNEXPECTED GEMV WALK: PLOW_GEMV_WALK=0"
+          fail=1
+        fi
+        case "$stem" in
+          interp_decode_k3*|interp_decode_fp8kv_k3*)
+            if [ -n "$AX_K3_DECODE_XR_AGG" ]; then
+              grep -qE "OBJECT .* plow_xr_agg_1$" <<<"$symbols" || {
+                echo "  MISSING XR AGG: expected plow_xr_agg_1"
+                fail=1
+              }
+            elif grep -qE "OBJECT .* plow_xr_agg_1$" <<<"$symbols"; then
+              echo "  UNEXPECTED XR AGG: PLOW_K3_DECODE_XR_AGG=0"
+              fail=1
+            fi
+            if [ -n "$AX_K3_KDA_CONV_STEP_DB" ]; then
+              grep -qE "OBJECT .* plow_kda_conv_step_db_arm$" <<<"$symbols" || {
+                echo "  MISSING KDA CONV-STEP DB: expected plow_kda_conv_step_db_arm"
+                fail=1
+              }
+            elif grep -qE "OBJECT .* plow_kda_conv_step_db_arm$" <<<"$symbols"; then
+              echo "  UNEXPECTED KDA CONV-STEP DB: PLOW_K3_KDA_CONV_STEP_DB=0"
+              fail=1
+            fi
+            ;;
+        esac
+        ;;
+    esac
   done
 done
 # INSTRUCTION-SELECTION gate, the CDNA3 twin of the one in build_gfx950.sh. The cliff table above
@@ -845,6 +1024,32 @@ if [ -f "$EXPECT" ] && command -v python3 >/dev/null; then
   # audit's exit code and the gate would print FAIL lines and then say the build is ready.
   audit=$(python3 "$REPO/scripts/asm_audit.py" --expect "$EXPECT" ./*.elf) || fail=1
   echo "$audit" | tail -20
+fi
+
+# B>1 K3 decode dispatches grouped ops 85/86 with MXFP4 encoding. Check the
+# capability marker before the body: the generic grouped arm also contains
+# bf16 MFMA, so disassembly alone cannot prove that the enc=2 arm exists.
+if { [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] || [ "${PLOW_K3_DECODE_GROUPED:-0}" = 1 ]; } && command -v python3 >/dev/null; then
+  K3_BATCH_EXPECT="$REPO/scripts/asm_expect_gfx942_k3_batched.json"
+  k3_batch_objects=()
+  for object in \
+      interp_decode_k3.elf interp_decode_k3_gq.elf \
+      interp_decode_fp8kv_k3.elf interp_decode_fp8kv_k3_gq.elf; do
+    [ -f "$object" ] || continue
+    k3_batch_objects+=("$object")
+    symbols=$("$READELF" -sW "$object" 2>/dev/null)
+    grep -qE "OBJECT .* plow_moe_pf_a4w4_arm$" <<<"$symbols" || {
+      echo "FAIL  $object: missing plow_moe_pf_a4w4_arm for PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH}"
+      fail=1
+    }
+  done
+  if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ] && [ "${#k3_batch_objects[@]}" -gt 0 ] && [ -f "$K3_BATCH_EXPECT" ]; then
+    echo ""
+    echo "   --- K3 batched A4W4 instruction-selection audit ---"
+    batch_audit=$(python3 "$REPO/scripts/asm_audit.py" --expect "$K3_BATCH_EXPECT" \
+        "${k3_batch_objects[@]}") || fail=1
+    echo "$batch_audit" | tail -20
+  fi
 fi
 
 echo ""

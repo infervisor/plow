@@ -159,7 +159,8 @@ pub enum Op {
     },
 
     /// Depthwise causal 1-D convolution over the sequence axis, `[B, S, C]`.
-    /// Inputs `[x, weight]` or `[x, weight, bias]` with `weight: [C, kernel]`.
+    /// Inputs `[x, weight]` or `[x, weight, bias]` with
+    /// `weight: [C, 1, kernel]`.
     /// Shape-preserving: the reference left-pads by `kernel - 1` so output
     /// length equals input length.
     ///
@@ -181,10 +182,9 @@ pub enum Op {
 
     /// Linear (sub-quadratic) attention with a carried recurrent state.
     ///
-    /// Inputs `[q, k, v, gate, beta]`, each `[B, S, heads, head_dim]` except
-    /// `beta` which is per-head `[B, S, heads]`. Output has q's shape with the
-    /// last dim replaced by `head_dim` (the state is square in KDA, so this is
-    /// shape-preserving there).
+    /// Inputs `[q, k, v, gate, beta, A_log, dt_bias]`: q/k/v/gate are rank-4
+    /// `[B, S, heads, head_dim]`, beta is `[B, S, heads]`, A_log is `[heads]`,
+    /// and dt_bias is `[heads * head_dim]`. Output has q's shape.
     ///
     /// # Why the state is not an input, and why this is not [`Op::Attention`]
     ///
@@ -230,9 +230,8 @@ pub enum Op {
     /// prefix sum and up to `max_snapshots` earlier snapshots of it, applied in
     /// place of the plain residual add.
     ///
-    /// Inputs `[prefix, snapshot_0, .., snapshot_n, score_weight]` — at least
-    /// the prefix and the score weight. Output is shape-equal to `prefix`.
-    ///
+    /// Inputs `[prefix, snapshot_0, .., snapshot_n, norm_weight, proj_weight]`.
+    /// Output is shape-equal to `prefix`.
     /// `attn_res_block_size` layers apart, the block pushes a snapshot and
     /// resets the prefix, so this is what makes a K3 layer structurally unlike
     /// `residual + attn; residual + mlp`. Modeled explicitly because a plain

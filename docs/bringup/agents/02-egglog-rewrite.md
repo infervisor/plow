@@ -1,5 +1,12 @@
 # Agent — Bringup Stage 2: Egglog Equality-Saturation Rewriting
 
+## Target parameters — none
+
+This stage is **target-independent**: it rewrites and proves, it does not
+measure. Do not name a GPU, ISA, CU count or toolchain anywhere in it — a rule
+whose soundness depends on a part is not sound. The parameter block in
+[`../target.md`](../target.md) is filled in at Stage 4, not here.
+
 You are executing **Stage 2** of the plow model-bringup playbook for a new
 model/architecture: egglog equality-saturation rewriting (operator graph →
 fused/optimized graph), plus its Checkpoint-A soundness tie-in.

@@ -1352,6 +1352,12 @@ pub enum DevOp {
     /// umask scratch is u64 [n_qt][kv_stride].
     /// `t0=union t1=umask t2=idx t3=kv_len` · `i0=n_tok i1=top_k i2=kv_stride i3=cap`.
     IndexUnionPf = 119,
+    /// B1 KDA Conv3 + gated state step with double-buffered convolution windows.
+    /// `t7` is a u32 tensor-handle descriptor:
+    /// `[wq,wk,wv, cs0q,cs0k,cs0v, cs1q,cs1k,cs1v, A_log,dt_bias,in.pos,parked?]`.
+    /// `t0=o t1=q_raw t2=k_raw t3=v_raw t4=g_raw t5=beta_raw t6=state t7=descriptor` ·
+    /// `i0=T(1) i1=H i2=D i3=BV i4=flags i5=W i6=gate_mode` · `f0=scale f1=lower_bound`.
+    KdaConvStateStepG = 120,
 }
 
 impl DevOp {
@@ -1481,6 +1487,7 @@ impl DevOp {
         DevOp::IndexScorePf,
         DevOp::IndexSelectPf,
         DevOp::IndexUnionPf,
+        DevOp::KdaConvStateStepG,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1621,6 +1628,7 @@ impl DevOp {
             DevOp::IndexScorePf => "PLOW_DOP_INDEX_SCORE_PF",
             DevOp::IndexSelectPf => "PLOW_DOP_INDEX_SELECT_PF",
             DevOp::IndexUnionPf => "PLOW_DOP_INDEX_UNION_PF",
+            DevOp::KdaConvStateStepG => "PLOW_DOP_KDA_CONV_STATE_STEP_G",
         }
     }
 
@@ -1650,7 +1658,7 @@ impl DevOp {
     /// bump: this constant is one past the HIGHEST opcode, not a count, and adding a pair moves it
     /// by two whether or not the range has holes.
     /// 116 -> 117 for `XReduceAddNorm = 116` (the fused TP seam).
-    pub const COUNT: u16 = 120;
+    pub const COUNT: u16 = 121;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

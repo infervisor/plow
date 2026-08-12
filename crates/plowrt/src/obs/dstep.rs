@@ -79,8 +79,8 @@ pub static DRAIN: Phase = Phase::new("GPU  drain (all ranks)");
 
 // --- after the dispatch ------------------------------------------------------
 
-/// `audit_xctr` — a 12 KiB D2H per rank, gated on `AmdTpGroup::audit`.
-pub static AUDIT: Phase = Phase::new("post audit_xctr (12 KiB D2H x ranks)");
+/// TP counter safety audit, gated on `AmdTpGroup::audit`.
+pub static AUDIT: Phase = Phase::new("post TP safety audit");
 /// `read_sampled` on every rank — 4 B D2H each. Rank 0's is the token; the rest
 /// are the cross-rank audit.
 pub static READ: Phase = Phase::new("post read_sampled (4 B D2H x ranks)");

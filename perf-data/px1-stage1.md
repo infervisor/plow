@@ -10,7 +10,7 @@ Harness: `huggingface/inference-benchmarker` rev `bad4f947` via
 4000-token prompts (github_code.json, variance 0), 128 output tokens, greedy,
 streaming, 15 s warm + 120 s measure. **TTFT includes server-side queueing.**
 Source of every number: `perf-data/px1-stage1.json` (transcribed verbatim from
-the tool's reports in `perf-data/harness/b2-ib/px1-{off,on}/results/`).
+the tool's reports in `perf-data/tools/b2-ib/px1-{off,on}/results/`).
 
 ## What was built
 

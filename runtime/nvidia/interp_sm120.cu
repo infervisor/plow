@@ -693,6 +693,10 @@ __device__ __forceinline__ PlowStreamEnt ld_stream_ent(const PlowStreamEnt* p) {
 #endif
 #if PLOW_NV_EMBED_SMEM
 extern "C" __device__ unsigned PLOW_SYM(plow_arena_bytes) = PLOW_NV_ARENA_FLOATS * sizeof(float);
+/* Widest row block instantiated by gemv_walk. This is a throughput capacity, not a
+ * correctness ceiling: M > GV_MM_MAX walks multiple weight passes. The decode loader reads
+ * it to report the packet/object pairing and refuses zero, which would make the walk stall. */
+extern "C" __device__ unsigned PLOW_SYM(plow_gemv_mm_cap) = GV_MM_MAX;
 /* T31: this object's launch block size (the segmented launcher reads it; absent/256 = legacy). */
 extern "C" __device__ unsigned PLOW_SYM(plow_block) = PLOW_NV_SEG_WS384 ? 384u : 256u;
 /* Capability flag (cuModuleGetGlobal, like plow_arena_bytes): this object's

@@ -13,7 +13,7 @@
 #   SHOTS      few-shot exemplars (default 8 — the standard GSM8K setting)
 #   MAXTOK     generation cap per question (default 320)
 #   CONC       in-flight requests (default 1); >1 is what tests a BATCHED packet end to end
-#   TEMP       sampling temperature (default 0 — greedy, so the run is reproducible)
+#   GSM8K_TEMPERATURE sampling temperature (default 0 — greedy and reproducible)
 #   GSM8K      path to a local `test.jsonl`; else it is fetched once to $CACHE
 #   CACHE      dataset cache dir (default /home/lava/models/gsm8k)
 #   PLOWRT_BIN pre-copied binary, same reason as bench_plowrt_serve.sh
@@ -37,7 +37,8 @@
 set -u
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ASSETS="${1:?assets dir}"; PORT="${2:?port}"; MODEL="${3:?model slug}"; READY="${4:-1800}"
-N="${N:-200}"; SHOTS="${SHOTS:-8}"; MAXTOK="${MAXTOK:-320}"; TEMP="${TEMP:-0}"
+N="${N:-200}"; SHOTS="${SHOTS:-8}"; MAXTOK="${MAXTOK:-320}"
+TEMPERATURE="${GSM8K_TEMPERATURE:-0}"
 CONC="${CONC:-1}"
 CACHE="${CACHE:-/home/lava/models/gsm8k}"
 BIN="${PLOWRT_BIN:-$WT/target/release/plowrt}"
@@ -92,12 +93,12 @@ GATE=$(curl -s --max-time 300 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'C
 echo "$GATE" | grep -qi paris || { echo ">>> coherence gate FAIL — accuracy below would be meaningless"; echo "$GATE" | head -c 500; exit 1; }
 echo ">>> coherence gate: PASS"
 
-N="$N" SHOTS="$SHOTS" MAXTOK="$MAXTOK" TEMP="$TEMP" MODEL="$MODEL" PORT="$PORT" CONC="$CONC" \
+N="$N" SHOTS="$SHOTS" MAXTOK="$MAXTOK" TEMPERATURE="$TEMPERATURE" MODEL="$MODEL" PORT="$PORT" CONC="$CONC" \
 DATA="$DATA" TRAIN="$TRAIN" python3 - <<'PY'
 import json, threading, queue, os, re, sys, time, urllib.request
 
 N=int(os.environ["N"]); SHOTS=int(os.environ["SHOTS"]); MAXTOK=int(os.environ["MAXTOK"])
-TEMP=float(os.environ["TEMP"]); MODEL=os.environ["MODEL"]; PORT=os.environ["PORT"]
+TEMP=float(os.environ["TEMPERATURE"]); MODEL=os.environ["MODEL"]; PORT=os.environ["PORT"]
 CONC=int(os.environ.get("CONC","1"))
 URL=f"http://127.0.0.1:{PORT}/v1/chat/completions"
 

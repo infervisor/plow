@@ -59,6 +59,9 @@ enum Cmd {
         /// Muxer: admission SLO (ms) — predicted wait above this sheds requests.
         #[arg(long, default_value_t = 250.0)]
         slo_ms: f64,
+        /// Requests allowed to wait outside engine slots. `0` = four batches.
+        #[arg(long, default_value_t = 0)]
+        max_queued_requests: usize,
     },
 
     /// Enumerate every visible device and, with `--tp`, bring up the
@@ -305,7 +308,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             trace,
             max_hold_ms,
             slo_ms,
+            max_queued_requests,
         } => {
+            tracing::info!(
+                assets = ?assets,
+                port,
+                socket = ?socket,
+                executors,
+                trace,
+                max_hold_ms,
+                slo_ms,
+                max_queued_requests,
+                runtime = ?RuntimeConfig::global(),
+                environment = ?runtime_environment(),
+                "resolved serve configuration"
+            );
             serve(
                 assets,
                 port,
@@ -315,6 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 MuxConfig {
                     max_hold_ms,
                     slo_ms,
+                    max_queued_requests,
                     ..MuxConfig::default()
                 },
             )
@@ -416,6 +434,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBlock { .. } => Err("plowrt was built without --features hsa".into()),
     }
+}
+
+fn runtime_environment() -> Vec<(String, String)> {
+    let mut vars: Vec<_> = std::env::vars()
+        .filter(|(key, _)| {
+            key.starts_with("PLOW_")
+                || matches!(
+                    key.as_str(),
+                    "RUST_LOG"
+                        | "ROCR_VISIBLE_DEVICES"
+                        | "HIP_VISIBLE_DEVICES"
+                        | "CUDA_VISIBLE_DEVICES"
+                        | "HSA_XNACK"
+                        | "HSA_OVERRIDE_GFX_VERSION"
+                        | "OMP_NUM_THREADS"
+                )
+        })
+        .map(|(key, value)| {
+            let upper = key.to_ascii_uppercase();
+            let secret = ["TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "API_KEY"]
+                .iter()
+                .any(|needle| upper.contains(needle));
+            (key, if secret { "<redacted>".into() } else { value })
+        })
+        .collect();
+    vars.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    vars
 }
 
 /// Bring the AMD engine up and time decode steps.
@@ -1067,10 +1112,17 @@ fn amd_bench_tp(
         let mut out = Vec::new();
         let t = std::time::Instant::now();
         for s in 0..steps {
+            let t_tok = plowrt::obs::dstep::on().then(std::time::Instant::now);
             let ids = g.decode_step(pos, pos + 1)?;
-            out.push(AmdTpGroup::agree(&ids)?);
+            out.push(plowrt::obs::dstep::timed(
+                &plowrt::obs::dstep::AGREE,
+                || AmdTpGroup::agree(&ids),
+            )?);
             dump(&g, &format!("{s:03}"))?;
             pos += 1;
+            if let Some(t) = t_tok {
+                plowrt::obs::dstep::token(t.elapsed().as_nanos() as u64);
+            }
         }
         let ms = t.elapsed().as_secs_f64() * 1e3 / steps as f64;
         println!("  {out:?}");

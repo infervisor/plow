@@ -650,6 +650,30 @@ option(PLOW_HSACO_MLA "Also emit the MLA prefill object (Kimi/DeepSeek/GLM)" ON)
 # (+14.9% on decode) and is exactly why these stay SEPARATE OBJECTS rather than becoming defines
 # on the rows above. Cost of the default: ~31 s of build, doubled by the `_gq` twins, and ~3 MB.
 option(PLOW_HSACO_K3 "Also emit the Kimi-K3 / KDA objects (decode + prefill)" ON)
+option(PLOW_K3_DECODE_MXFP4_PROJ
+       "Include standalone MXFP4 projection ops in K3 decode objects" ON)
+option(PLOW_K3_DECODE_GROUPED
+       "Include grouped A4W4 expert ops in a K3 B=1 decode object" OFF)
+option(PLOW_MXFP4_DECODE_NT
+       "Use non-temporal loads for one-use decode MXFP4 projection weights" ON)
+option(PLOW_MOE_PF_A4W4_WEIGHT_NT
+       "Use non-temporal loads for grouped A4W4 expert weights" OFF)
+option(PLOW_K3_DECODE_TILE_BINSEARCH
+       "Use binary expert-tile lookup in batched K3 decode" ON)
+option(PLOW_K3_DECODE_ALIGN_PAR_PREFIX
+       "Use a workgroup-parallel expert prefix in batched K3 decode" ON)
+option(PLOW_K3_DECODE_ROUTER_LOCAL
+       "Cache each lane's router keys across K3 top-k reductions" ON)
+option(PLOW_K3_DECODE_XR_AGG
+       "Aggregate batched K3 decode two-shot all-gather signals per rank" ON)
+option(PLOW_XR_AGG
+       "Aggregate prefill two-shot all-gather signals per rank" ON)
+option(PLOW_KDA_PF_STATE_RESIDENT
+       "Keep K3 TP8 prefill KDA state in registers across serial tokens" OFF)
+option(PLOW_K3_KDA_CONV_STEP_DB
+       "Fuse K3 B1 Conv3 into StateStepG with ping-pong convolution windows" OFF)
+option(PLOW_MLA_PF_SV
+       "Use the V2 MLA-prefill LDS swizzle and fragment staging" ON)
 
 set(PLOW_HSACO_ARCH "gfx950" CACHE STRING "offload arch for the served code objects")
 set(PLOW_HSACO_HIPCC "/opt/rocm/bin/hipcc" CACHE FILEPATH "hipcc used for the served code objects")
@@ -667,9 +691,19 @@ set(PLOW_GQ_BATCH "1" CACHE STRING "global-queue claim batch")
 # first sampled token 0 off an all-zero logits row -- with a correct B-wide program around
 # it. See scripts/build_gfx950.sh for the full note.
 set(PLOW_DECODE_BATCH "1" CACHE STRING "decode batch bucket (-> PLOW_GEMV_MM)")
+option(PLOW_GEMV_WALK "Walk a <=16-row GEMV object across wider decode batches" OFF)
 set(PLOW_HSACO_EXTRA_DEFINES "" CACHE STRING "extra raw hipcc flags appended to every code object")
 
 if(PLOW_GFX950_HSACO)
+    if(NOT PLOW_DECODE_BATCH MATCHES "^[0-9]+$")
+        message(FATAL_ERROR "PLOW_DECODE_BATCH must be an integer in 1..32")
+    endif()
+    if(PLOW_DECODE_BATCH LESS 1 OR PLOW_DECODE_BATCH GREATER 32)
+        message(FATAL_ERROR "PLOW_DECODE_BATCH must be in 1..32")
+    endif()
+    if(PLOW_DECODE_BATCH GREATER 16 AND NOT PLOW_GEMV_WALK)
+        message(FATAL_ERROR "PLOW_DECODE_BATCH above 16 requires PLOW_GEMV_WALK=ON")
+    endif()
     string(REPLACE " " ";" _hs_extra "${PLOW_HSACO_EXTRA_DEFINES}")
     set(_hs_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/interp.hip")
     set(_hs_tk_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/test_kernels.hip")
@@ -684,6 +718,9 @@ if(PLOW_GFX950_HSACO)
     # THE AXES. No row below spells out a define set; every row is axes only.
     set(_hs_ax_none "")
     set(_hs_ax_prefill -DPLOW_BUCKET_DECODE=0)
+    if(PLOW_XR_AGG AND PLOW_HSACO_ARCH STREQUAL "gfx942")
+        list(APPEND _hs_ax_prefill -DPLOW_XR_AGG=1)
+    endif()
     # next_pow2(PLOW_DECODE_BATCH), clamped to PLOW_GEMV_MAXM (16). One instantiation with a
     # runtime M and an `m < M` predicate serves every M <= MM, so the bucket is a ceiling, not
     # an exact width. Do NOT make this a runtime ladder -- that was built, measured at 276
@@ -694,10 +731,19 @@ if(PLOW_GFX950_HSACO)
         math(EXPR _hs_gvmm "${_hs_gvmm} * 2")
     endwhile()
     set(_hs_ax_decode -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=${_hs_gvmm})
+    if(PLOW_GEMV_WALK)
+        list(APPEND _hs_ax_decode -DPLOW_GEMV_WALK=1)
+    endif()
     # 4 waves => 1 wave/SIMD => a 512-reg budget, and ITS spill is intentional
     # (the Q-hoist spills Q to scratch, cheaper than the L2 re-read it replaces).
     set(_hs_ax_flash -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4
                      -DFA_DC=256 -DFA_DBUF=1)
+    if(PLOW_HSACO_ARCH STREQUAL "gfx942")
+        list(APPEND _hs_ax_flash -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_L2_PLACE_DISPATCH=1)
+        if(PLOW_MLA_PF_SV)
+            list(APPEND _hs_ax_flash -DPLOW_MLA_PF_SV=1)
+        endif()
+    endif()
     set(_hs_ax_gq -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=${PLOW_GQ_BATCH})
     # PRECISION AXES, ONE PER INDEPENDENT CHOICE. They were not independent: _hs_ax_fp8kv used
     # to expand to `-DPLOW_FP8=1 -DPLOW_FP8_KV=1`, so the KV-encoding axis silently dragged the
@@ -707,8 +753,16 @@ if(PLOW_GFX950_HSACO)
     # arms REPLACED the bf16 GEMV_GLU/GEMV_QKV it needs. Now the axes compose instead.
     set(_hs_ax_fp8 -DPLOW_FP8=1)          # WEIGHT encoding: fp8 e4m3 (prefill w8a8, decode w8a16)
     set(_hs_ax_fp8kv -DPLOW_FP8_KV=1)     # KV encoding: fp8 e4m3 cache + per-row scales
+    if(PLOW_HSACO_ARCH STREQUAL "gfx942")
+        set(_hs_ax_fp8kv_k3_flash ${_hs_ax_fp8kv} -DPLOW_K3=1)
+    else()
+        set(_hs_ax_fp8kv_k3_flash ${_hs_ax_fp8kv})
+    endif()
     set(_hs_ax_fp8_fp8kv ${_hs_ax_fp8} ${_hs_ax_fp8kv})   # both, the shipped fp8-KV profile
     set(_hs_ax_mxfp4 -DPLOW_MXFP4=1)      # WEIGHT encoding: MXFP4 e2m1+E8M0 (w4a16 projections)
+    if(NOT PLOW_MXFP4_DECODE_NT)
+        list(APPEND _hs_ax_mxfp4 -DPLOW_MXFP4_DEC_NT=0)
+    endif()
     set(_hs_ax_mla -DPLOW_MLA_PREFILL=1)
     # Composed, not spelled out: an all-fp8 Kimi K2.7 / GLM-5.2 / DeepSeek prefill
     # needs the MLA attention arms AND the w8a8 GEMM arms in the same object, and a
@@ -723,7 +777,12 @@ if(PLOW_GFX950_HSACO)
     # A4W4: MXFP4 on BOTH operands through the matrix core, the encoding ATOM runs. Compile-time
     # like every other precision axis -- a runtime encoding switch would make the register
     # allocator budget for the worst body and then every body spills (interp.hip states the trap).
-    set(_hs_ax_mla_moe_a4w4 ${_hs_ax_mla_moe} -DPLOW_MOE_PF_A4W4=1)
+    set(_hs_ax_a4w4_weight "")
+    if(PLOW_MOE_PF_A4W4_WEIGHT_NT)
+        set(_hs_ax_a4w4_weight -DPLOW_MOE_PF_A4W4_WEIGHT_NT=1)
+    endif()
+    set(_hs_ax_mla_moe_a4w4
+        ${_hs_ax_mla_moe} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight})
     # THE ALL-MXFP4 MLA PREFILL OBJECT. A Kimi/GLM/DeepSeek all-fp4 packet needs the MXFP4
     # PROJECTIONS (GemmMxfp4, op 93 — gated by PLOW_MXFP4) and the A4W4 grouped EXPERTS (ops
     # 85/86) in the SAME object; they were previously on separate rows, so no single object
@@ -766,10 +825,38 @@ if(PLOW_GFX950_HSACO)
     # and that headroom is not spare).
     set(_hs_ax_k3_dec ${_hs_ax_k3})
     set(_hs_ax_k3_dec_fp8kv ${_hs_ax_k3_fp8kv})
-    if(PLOW_DECODE_BATCH GREATER 1)
-        set(_hs_ax_k3_dec ${_hs_ax_k3_dec} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1)
+    if(PLOW_K3_KDA_CONV_STEP_DB)
+        list(APPEND _hs_ax_k3_dec -DPLOW_KDA_CONV_STEP_DB=1)
+        list(APPEND _hs_ax_k3_dec_fp8kv -DPLOW_KDA_CONV_STEP_DB=1)
+    endif()
+    if(PLOW_DECODE_BATCH GREATER 1 OR PLOW_K3_DECODE_GROUPED)
+        set(_hs_ax_k3_tile_search "")
+        if(PLOW_K3_DECODE_TILE_BINSEARCH)
+            set(_hs_ax_k3_tile_search -DPLOW_MOE_TILE_BINSEARCH=1)
+        endif()
+        set(_hs_ax_k3_align_prefix "")
+        if(PLOW_K3_DECODE_ALIGN_PAR_PREFIX)
+            set(_hs_ax_k3_align_prefix -DPLOW_MOE_ALIGN_PAR_PREFIX=1)
+        endif()
+        set(_hs_ax_k3_router_local "")
+        if(PLOW_K3_DECODE_ROUTER_LOCAL)
+            set(_hs_ax_k3_router_local -DPLOW_MOE_ROUTER_SELECT_LOCAL=1)
+        endif()
+        set(_hs_ax_k3_decode_xr_agg "")
+        if(PLOW_K3_DECODE_XR_AGG)
+            set(_hs_ax_k3_decode_xr_agg -DPLOW_XR_AGG=1)
+        endif()
+        set(_hs_ax_k3_dec_mxfp4 "")
+        if(PLOW_K3_DECODE_MXFP4_PROJ)
+            set(_hs_ax_k3_dec_mxfp4 ${_hs_ax_mxfp4})
+        endif()
+        set(_hs_ax_k3_dec ${_hs_ax_k3_dec} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1
+            ${_hs_ax_a4w4_weight} ${_hs_ax_k3_tile_search} ${_hs_ax_k3_align_prefix}
+            ${_hs_ax_k3_router_local} ${_hs_ax_k3_decode_xr_agg} ${_hs_ax_k3_dec_mxfp4})
         set(_hs_ax_k3_dec_fp8kv
-            ${_hs_ax_k3_dec_fp8kv} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1)
+            ${_hs_ax_k3_dec_fp8kv} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1
+            ${_hs_ax_a4w4_weight} ${_hs_ax_k3_tile_search} ${_hs_ax_k3_align_prefix}
+            ${_hs_ax_k3_router_local} ${_hs_ax_k3_decode_xr_agg} ${_hs_ax_k3_dec_mxfp4})
     endif()
     # ...and the FFN half. A K3 prefill bucket runs the GROUPED expert chain (ops 83-87), not the
     # per-slot decode ops: at T rows an expert's weights cross HBM once for every token that chose
@@ -778,14 +865,21 @@ if(PLOW_GFX950_HSACO)
     # ATTENTION-ONLY object and a whole-layer K3 prompt needs one of these two.
     set(_hs_ax_k3_moe ${_hs_ax_mla_k3} -DPLOW_MOE_PREFILL=1)
     set(_hs_ax_k3_moe_fp8kv ${_hs_ax_mla_k3_fp8kv} -DPLOW_MOE_PREFILL=1)
+    set(_hs_ax_k3_pf_state "")
+    if(PLOW_KDA_PF_STATE_RESIDENT)
+        set(_hs_ax_k3_pf_state -DPLOW_KDA_PF_STATE_RESIDENT=1)
+    endif()
     # THE ROW A K3 PACKET ACTUALLY LOADS. K3 ships MXFP4 experts, and `enc = PLOW_MOE_ENC_MXFP4`
     # on ops 85/86 selects the A4W4 body — which lives behind PLOW_MOE_PF_A4W4. Without it the arm
     # takes `moe_pf_refuse` (loud, by design) rather than computing anything. PLOW_MXFP4 rides
     # along for the same reason `_mla_moe_a4w4_full` carries it: an all-fp4 packet needs the fp4
     # PROJECTIONS (op 93) in the same object as the fp4 experts, and they were on separate rows.
-    set(_hs_ax_k3_moe_a4w4 ${_hs_ax_k3_moe} -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1)
+    set(_hs_ax_k3_moe_a4w4
+        ${_hs_ax_k3_moe} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight}
+        ${_hs_ax_k3_pf_state} -DPLOW_MXFP4=1)
     set(_hs_ax_k3_moe_a4w4_fp8kv
-        ${_hs_ax_k3_moe_fp8kv} -DPLOW_MOE_PF_A4W4=1 -DPLOW_MXFP4=1)
+        ${_hs_ax_k3_moe_fp8kv} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight}
+        ${_hs_ax_k3_pf_state} -DPLOW_MXFP4=1)
 
     # Symbols carry the arch: the loader builds the kernel name from the LIVE
     # HSA agent name (exec/amd.rs symbol_name), so a gfx942 object must export
@@ -844,7 +938,7 @@ if(PLOW_GFX950_HSACO)
             # its hd512 flash on the 8-wave interpreter — correct, but without the
             # 512-register budget the Q-hoist needs. Same cliff as the bf16 twin
             # (measured 256+256 = 512 / occ 1 / spill 228, the intentional Q-hoist).
-            "interp_flash_fp8kv|${_hs_kfl}|_hs_ax_flash|_hs_ax_fp8kv|512|1")
+            "interp_flash_fp8kv|${_hs_kfl}|_hs_ax_flash|_hs_ax_fp8kv_k3_flash|512|1")
     endif()
     if(PLOW_HSACO_MXFP4)
         # Same asymmetry: PLOW_DOP_GEMM_MXFP4 (93) is the w4a16 PREFILL twin of the

@@ -29,6 +29,14 @@
 #ifndef PLOW_MOE_GROUP_FLAT
 #define PLOW_MOE_GROUP_FLAT 0
 #endif
+#ifndef PLOW_MOE_GROUP_FORCEINLINE
+#define PLOW_MOE_GROUP_FORCEINLINE 0
+#endif
+#if PLOW_MOE_GROUP_FORCEINLINE
+#define PLOW_MOE_GROUP_INLINE __forceinline__
+#else
+#define PLOW_MOE_GROUP_INLINE
+#endif
 /* Grouped gate/up on the XDL matrix cores (fp8->bf16 16x16x32 MFMA, M=1 padded) vs the fdot2 VALU
  * path. 1 = MFMA. Bit-close (not bit-identical). Build-time A/B knob. */
 #ifndef PLOW_MOE_MFMA
@@ -39,6 +47,9 @@
  * O(k*E/threads) plus 3*k barriers. Preserve the established path for other models. */
 #ifndef PLOW_MOE_ROUTER_SELECT
 #define PLOW_MOE_ROUTER_SELECT PLOW_K3
+#endif
+#ifndef PLOW_MOE_ROUTER_SELECT_LOCAL
+#define PLOW_MOE_ROUTER_SELECT_LOCAL 0
 #endif
 
 /* THE ONLY HARD BOUND IN THIS FILE IS top_k, AND IT IS 16 (was 8 until Kimi-K3).
@@ -429,6 +440,31 @@ __device__ void d_moe_router_topk(unsigned char* table, const bf16* logit, const
                                     PLOW_MOE_MAX_GROUPS));
 
 #if PLOW_MOE_ROUTER_SELECT
+#if PLOW_MOE_ROUTER_SELECT_LOCAL
+    if (n_exp <= 4u * PLOW_THREADS) {
+        unsigned long long local[4] = {0ull, 0ull, 0ull, 0ull};
+        unsigned nlocal = 0u;
+        for (unsigned e = tid; e < n_exp; e += PLOW_THREADS) local[nlocal++] = keys[e];
+        for (unsigned i = 1u; i < 4u; i++) {
+            const unsigned long long v = local[i];
+            unsigned p = i;
+            while (p > 0u && v > local[p - 1u]) {
+                local[p] = local[p - 1u];
+                p--;
+            }
+            local[p] = v;
+        }
+        unsigned next = 0u;
+        for (unsigned j = 0; j < k; j++) {
+            const unsigned long long mine = next < nlocal ? local[next] : 0ull;
+            const unsigned long long best =
+                block_max_u64(mine, (unsigned long long*)(wl + PLOW_MOE_MAX_TOPK));
+            if (mine == best) next++;
+            if (tid == 0) wl[j] = n_exp - 1u - (unsigned)(best & 0xFFFFFu);
+        }
+    } else
+#endif
+    {
     for (unsigned j = 0; j < k; j++) {
         unsigned long long mine = 0ull;
         for (unsigned e = tid; e < n_exp; e += PLOW_THREADS)
@@ -441,6 +477,7 @@ __device__ void d_moe_router_topk(unsigned char* table, const bf16* logit, const
             keys[eid] = 0ull;
         }
         __syncthreads();
+    }
     }
 #else
     for (unsigned e = tid; e < n_exp; e += PLOW_THREADS) {
@@ -1111,12 +1148,10 @@ __device__ void d_moe_group_glu_mfma(bf16*, const bf16*, const unsigned char*,
                                      unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                                      unsigned, float, float);
 #endif
-__device__ void d_moe_group_glu_fp8_blk(bf16* fu, const bf16* x, const unsigned char* table,
-                                        const unsigned long long* wtab,
-                                        const unsigned long long* stab, unsigned k, unsigned I_moe,
-                                        unsigned H, unsigned n_exp, unsigned act, unsigned slice,
-                                        unsigned nblk, unsigned enc, float beta,
-                                        float lbeta) {
+__device__ PLOW_MOE_GROUP_INLINE void d_moe_group_glu_fp8_blk(
+    bf16* fu, const bf16* x, const unsigned char* table, const unsigned long long* wtab,
+    const unsigned long long* stab, unsigned k, unsigned I_moe, unsigned H, unsigned n_exp,
+    unsigned act, unsigned slice, unsigned nblk, unsigned enc, float beta, float lbeta) {
 #if PLOW_MOE_MFMA
     /* `enc` IS NOW HONOURED HERE. It used to be dropped on the floor with a comment saying so:
      * `d_moe_group_glu_mfma` was block-fp8 only, so under this non-default axis an MXFP4 packet's
@@ -1219,11 +1254,10 @@ __device__ void d_moe_group_glu_fp8_blk(bf16* fu, const bf16* x, const unsigned 
 #endif
 }
 
-__device__ void d_moe_group_down_fp8_blk(float* part, const bf16* fu, const unsigned char* table,
-                                         const unsigned long long* wtab,
-                                         const unsigned long long* stab, unsigned k, unsigned H,
-                                         unsigned I_moe, unsigned n_exp, unsigned slice,
-                                         unsigned nblk, unsigned enc) {
+__device__ PLOW_MOE_GROUP_INLINE void d_moe_group_down_fp8_blk(
+    float* part, const bf16* fu, const unsigned char* table, const unsigned long long* wtab,
+    const unsigned long long* stab, unsigned k, unsigned H, unsigned I_moe, unsigned n_exp,
+    unsigned slice, unsigned nblk, unsigned enc) {
 #if PLOW_MOE_GROUP_FLAT
     const unsigned KB = (I_moe + 127u) >> 7;
     const unsigned lane = threadIdx.x & 63;
@@ -1907,8 +1941,7 @@ __device__ __forceinline__ double mpf_det_q(float v) {
  * once per OUTPUT ELEMENT with a full `s_waitcnt vmcnt(0)` between each -- and were left alone
  * when that landed:
  *
- *   * `d_moe_group_pf_a4w4` (PLOW_MOE_PF_A4W4, CDNA4 only -- gfx942 has no fp4 matrix core,
- *     so this arm is NOT COMPILED on this box and cannot be measured here).
+ *   * `d_moe_group_pf_a4w4` (PLOW_MOE_PF_A4W4, native CDNA4 and simulated CDNA3).
  *   * `d_moe_group_gemma_pf_t` (ops 75/76 bf16 and 81/82 w8a8, the Gemma-4 MoE twin). Its
  *     W8A8 arm reads a THIRD k/n-invariant per-row quantity, `ascale[rowbase + rr]`, so this
  *     hoist takes all three: leaving one behind would leave the per-element drain in place and
@@ -2000,10 +2033,9 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
  * scatter each live slot into its expert's contiguous gathered-row range. Pad rows are marked
  * PLOW_EXPERT_UNUSED so the A-gather zero-fills them and the DOWN scatter drops them.
  *
- * Single-workgroup and serial-prefix on thread 0 is not laziness: n_exp <= 512 and T*k is a few
- * thousand, so this is microseconds, and it must be ONE workgroup because the padded prefix is
- * a global scan. The 255 other CUs are gated behind it by the counter DAG exactly as they are
- * behind the decode router.
+ * This remains one workgroup because the padded prefix is a global scan. The generic path uses
+ * thread 0; K3 decode can enable a workgroup scan for its 896-expert table. Other CUs are gated
+ * behind it by the counter DAG exactly as they are behind the decode router.
  *
  * The scatter uses an LDS atomic cursor, so the row ORDER within an expert is not deterministic
  * across runs. That is safe HERE and only here: row_partidx carries each row's destination in
@@ -2054,6 +2086,9 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
  * `row_partidx[pos] = s == token` makes the DOWN scatter the identity, and `gate == 1` makes it
  * unscaled. The atomic-cursor row order is still nondeterministic and still does not matter,
  * for the same reason it does not matter above. */
+#ifndef PLOW_MOE_ALIGN_PAR_PREFIX
+#define PLOW_MOE_ALIGN_PAR_PREFIX 0
+#endif
 __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* row_token,
                                unsigned* row_partidx, float* row_gate, unsigned T, unsigned n_exp,
                                unsigned k, unsigned slice, unsigned* lds) {
@@ -2077,6 +2112,40 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
     }
     __syncthreads();
 
+#if PLOW_MOE_ALIGN_PAR_PREFIX
+    unsigned* scan = tot + 1; /* [PLOW_THREADS], after the existing align scratch */
+    const unsigned chunk = (n_exp + PLOW_THREADS - 1u) / PLOW_THREADS;
+    const unsigned begin = tid * chunk;
+    const unsigned end = begin + chunk < n_exp ? begin + chunk : n_exp;
+    unsigned thread_tiles = 0u;
+    for (unsigned e = begin; e < end; e++)
+        thread_tiles += (cnt[e] + MPF_BM - 1u) / MPF_BM;
+    scan[tid] = thread_tiles;
+    __syncthreads();
+
+    for (unsigned offset = 1u; offset < PLOW_THREADS; offset <<= 1u) {
+        const unsigned add = tid >= offset ? scan[tid - offset] : 0u;
+        __syncthreads();
+        scan[tid] += add;
+        __syncthreads();
+    }
+
+    unsigned tp = tid == 0 ? 0u : scan[tid - 1u];
+    int* rowoff = meta;
+    int* mcnt = meta + n_exp;
+    int* tilep = meta + 2u * n_exp;
+    for (unsigned e = begin; e < end; e++) {
+        tilep[e] = (int)tp;
+        rowoff[e] = (int)(tp * MPF_BM);
+        mcnt[e] = (int)cnt[e];
+        cur[e] = tp * MPF_BM;
+        tp += (cnt[e] + MPF_BM - 1u) / MPF_BM;
+    }
+    if (tid == PLOW_THREADS - 1u) {
+        tilep[n_exp] = (int)scan[tid];
+        *tot = scan[tid] * MPF_BM;
+    }
+#else
     if (tid == 0) {
         int* rowoff = meta;
         int* mcnt = meta + n_exp;
@@ -2092,6 +2161,7 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
         tilep[n_exp] = (int)tp;
         *tot = tp * MPF_BM;
     }
+#endif
     __syncthreads();
 
     const unsigned total_pad = *tot;
@@ -2110,18 +2180,34 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
         row_token[pos] = s / k;  /* source token row of xn2 */
         row_partidx[pos] = s;    /* destination row of part[T*k, H] == token*k + slot */
         /* gate == 1 under synthetic routing: a dense FFN applies no routing weight, and the DOWN
-         * op multiplies by this unconditionally. */
+ * op multiplies by this unconditionally. */
         row_gate[pos] = synth ? 1.0f : moe_slot_gate(table, s);
     }
 }
 
-/* Which expert owns m-tile `mt`. n_exp <= 512 and the scan is uniform across the workgroup, so
- * a linear walk costs a few scalar ops and no memory traffic worth naming. */
+/* Which expert owns m-tile `mt`. Duplicate prefix entries are valid for empty experts, so this
+ * is an upper-bound search for the last tilep[e] <= mt. */
+#ifndef PLOW_MOE_TILE_BINSEARCH
+#define PLOW_MOE_TILE_BINSEARCH 0
+#endif
 __device__ __forceinline__ unsigned mpf_expert_of_tile(const int* tilep, unsigned mt,
                                                        unsigned n_exp) {
+#if PLOW_MOE_TILE_BINSEARCH
+    unsigned lo = 0;
+    unsigned hi = n_exp;
+    while (lo + 1u < hi) {
+        const unsigned mid = lo + (hi - lo) / 2u;
+        if ((unsigned)tilep[mid] <= mt)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return lo;
+#else
     unsigned e = 0;
     while (e + 1u < n_exp && (unsigned)tilep[e + 1] <= mt) e++;
     return e;
+#endif
 }
 
 /* Exact fp8 -> bf16 for 8 consecutive weight bytes. NO scale: the block scale is applied to the
@@ -3140,6 +3226,17 @@ typedef unsigned mpf4_b16 __attribute__((ext_vector_type(4), aligned(4)));
 __device__ __forceinline__ mpf4_b16 mpf4_ld16(const PLOW_GLOB unsigned char* p) {
     return *(const PLOW_GLOB mpf4_b16*)(const PLOW_GLOB void*)p;
 }
+#ifndef PLOW_MOE_PF_A4W4_WEIGHT_NT
+#define PLOW_MOE_PF_A4W4_WEIGHT_NT 0
+#endif
+__device__ __forceinline__ mpf4_b16 mpf4_ld16_weight(const PLOW_GLOB unsigned char* p) {
+#if PLOW_MOE_PF_A4W4_WEIGHT_NT
+    return __builtin_nontemporal_load(
+        (const PLOW_GLOB mpf4_b16*)(const PLOW_GLOB void*)p);
+#else
+    return mpf4_ld16(p);
+#endif
+}
 __device__ __forceinline__ void mpf4_st16(unsigned char* p, mpf4_b16 v) {
     *(mpf4_b16*)(void*)p = v;
 }
@@ -3377,7 +3474,7 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
 
 #define MPF4_B_ISSUE1(k0, q, sc)                                                               \
     {                                                                                          \
-        (q) = mpf4_ld16(bw_ + (size_t)bn_ * KS + ((k0) >> 1) + bb_ * 16u);                     \
+        (q) = mpf4_ld16_weight(bw_ + (size_t)bn_ * KS + ((k0) >> 1) + bb_ * 16u);              \
         (sc) = bs_[(size_t)bn_ * KSC + ((k0) >> 5) + bb_];                                     \
     }
 
@@ -3659,8 +3756,17 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
  * Single-buffered is not un-pipelined: the next tile's global reads still issue BEFORE the MFMA
  * block and land in registers across it (the ISSUE/COMMIT split, kept from the CDNA4 body); the
  * cost against double buffering is one extra barrier per K tile, not exposed load latency. */
-#define MPF4_C3_BK 64u                      /* K per staged tile = 4 bf16 MFMA K=16 steps */
-#define MPF4_C3_RB (MPF4_C3_BK * 2u)        /* bf16 LDS row stride, bytes = 128 */
+#ifndef PLOW_MOE_PF_A4W4_C3_BK
+#define PLOW_MOE_PF_A4W4_C3_BK 64u
+#endif
+#if PLOW_MOE_PF_A4W4_C3_BK != 32u && PLOW_MOE_PF_A4W4_C3_BK != 64u
+#error "PLOW_MOE_PF_A4W4_C3_BK must be 32 or 64"
+#endif
+#ifndef PLOW_MOE_PF_A4W4_PRIO
+#define PLOW_MOE_PF_A4W4_PRIO 1
+#endif
+#define MPF4_C3_BK PLOW_MOE_PF_A4W4_C3_BK  /* K per staged tile */
+#define MPF4_C3_RB (MPF4_C3_BK * 2u)        /* bf16 LDS row stride */
 /* XOR swizzle over 16-byte chunks, bits 4..6 — in-row for a 128-B row, and THREE bits on
  * purpose: a 128-B row is exactly 8 chunks, and a fragment read walks 32 consecutive rows at a
  * FIXED chunk column (row stride 128 B = 0 mod 8 chunks), so anything less than a full 3-bit
@@ -3669,7 +3775,8 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
  * MPA4C3_BENCH=1): 1-bit 737 GB/s, 2-bit 928, 3-bit 963 GB/s weight stream = 232 TF/s on the
  * GLU, ~71% of this part's bf16 MFMA peak. ONE function for the write and every read; a second
  * copy that drifts is the transposed-tile class of bug. */
-#define MPF4_C3_SWZ(row, off) ((off) ^ (((row) & 7u) << 4))
+#define MPF4_C3_SWZ(row, off) \
+    ((off) ^ (((row) & (MPF4_C3_RB / 16u - 1u)) << 4))
 
 template <bool GLU>
 __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restrict__ Ain,
@@ -3697,8 +3804,8 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
     unsigned char* const Atl = L;                            /* bf16 [BM][C3_RB] */
     unsigned char* const Btl = Atl + MPF4_BM * MPF4_C3_RB;   /* bf16 [BN][C3_RB] */
     float* const Bridge = (float*)L;                         /* GLU epilogue only; aliases tiles */
-    static_assert(MPF4_BM * (MPF4_BN / 2) * 4u <= (MPF4_BM + MPF4_BN) * MPF4_C3_RB,
-                  "the GLU bridge no longer fits inside the tile arena it aliases");
+    static_assert(MPF4_BM * (MPF4_BN / 2) * 4u <= PLOW_LDS_MAX_BYTES,
+                  "the GLU bridge exceeds the gfx942 LDS arena");
 
     const unsigned tid = threadIdx.x;
     const unsigned lane = tid & 63u, wave = tid >> 6;
@@ -3730,6 +3837,15 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
             as_glob((const unsigned char*)(size_t)stab[(size_t)e * 3 + (GLU ? 0 : 2)]);
         const PLOW_GLOB unsigned char* SW1 =
             as_glob(GLU ? (const unsigned char*)(size_t)stab[(size_t)e * 3 + 1] : nullptr);
+
+#if PLOW_MOE_PF_EPI_SIB
+        unsigned epi_pidx = 0u;
+        int epi_gate = 0;
+        if constexpr (!GLU) {
+            epi_pidx = as_glob(row_partidx)[rowbase + lane];
+            epi_gate = __builtin_bit_cast(int, as_glob(row_gate)[rowbase + lane]);
+        }
+#endif
 
         f32x16 acc[SMa][SNa];
 #pragma unroll
@@ -3788,7 +3904,8 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
             const bool up = GLU && (br >= MPF4_BN / 2);                                        \
             const PLOW_GLOB unsigned char* bw = up ? W1 : W0;                                  \
             const PLOW_GLOB unsigned char* bs = up ? SW1 : SW0;                                \
-            bq_[it] = mpf4_ld16(bw + (size_t)brow_[it] * KS + ((k0) >> 1) + bb * 16u);         \
+            bq_[it] = mpf4_ld16_weight(                                                        \
+                bw + (size_t)brow_[it] * KS + ((k0) >> 1) + bb * 16u);                        \
             bsc_[it] = bs[(size_t)brow_[it] * KSC + ((k0) >> 5) + bb];                         \
         }                                                                                      \
     }
@@ -3873,13 +3990,17 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                     bf[j] = __builtin_bit_cast(
                         bf16x8, *(const bf16v8*)(Btl + br * MPF4_C3_RB + MPF4_C3_SWZ(br, boff)));
                 }
+#if PLOW_MOE_PF_A4W4_PRIO
                 __builtin_amdgcn_s_setprio(1);
+#endif
 #pragma unroll
                 for (int i = 0; i < SMa; i++)
 #pragma unroll
                     for (int j = 0; j < SNa; j++)
                         acc[i][j] = plow_mfma_bf16_32x32(af[i], bf[j], acc[i][j]);
+#if PLOW_MOE_PF_A4W4_PRIO
                 __builtin_amdgcn_s_setprio(0);
+#endif
             }
 #pragma unroll
             for (int i = 0; i < SMa; i++)
@@ -3889,6 +4010,22 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
             if (kn < K) { C3_COMMIT }
             __syncthreads(); /* publish the next tile (or retire the last: Bridge aliases it) */
         }
+
+#if PLOW_MOE_PF_EPI_SIB
+#define C3_EPI_NGUARD(nn) const bool epi_nok = ((nn) < N)
+#define C3_ROWMETA(rr, pidx, gv)                                                               \
+    const unsigned pidx =                                                                      \
+        (unsigned)__builtin_amdgcn_ds_bpermute((int)((rr) << 2), (int)epi_pidx);               \
+    const float gv =                                                                           \
+        __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute((int)((rr) << 2), epi_gate));   \
+    if (!epi_nok || pidx == PLOW_EXPERT_UNUSED) continue
+#else
+#define C3_EPI_NGUARD(nn) if ((nn) >= N) continue
+#define C3_ROWMETA(rr, pidx, gv)                                                               \
+    const unsigned pidx = row_partidx[rowbase + (rr)];                                         \
+    if (pidx == PLOW_EXPERT_UNUSED) continue;                                                  \
+    const float gv = row_gate[rowbase + (rr)]
+#endif
 
         if constexpr (GLU) {
             /* --- the fused bridge, VERBATIM in structure from the CDNA4 arm (see its header
@@ -3942,14 +4079,13 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                 for (int j = 0; j < SNa; j++) {
                     const unsigned nn =
                         n0 + wn * (MPF4_BN / MPF4_WNc) + j * MFMA_N + mfma_acc_n(lane);
-                    if (nn >= N) continue;
+                    C3_EPI_NGUARD(nn);
 #pragma unroll
                     for (int el = 0; el < 16; el++) {
                         const unsigned rr =
                             wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
-                        const unsigned pidx = row_partidx[rowbase + rr];
-                        if (pidx == PLOW_EXPERT_UNUSED) continue; /* pad row */
-                        part[(size_t)pidx * N + nn] = row_gate[rowbase + rr] * acc[i][j][el];
+                        C3_ROWMETA(rr, pidx, gv);
+                        part[(size_t)pidx * N + nn] = gv * acc[i][j][el];
                     }
                 }
         }
@@ -3959,6 +4095,8 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
 #undef C3_B_ISSUE
 #undef C3_BLK_COMMIT
 #undef C3_COMMIT
+#undef C3_EPI_NGUARD
+#undef C3_ROWMETA
 }
 #endif /* PLOW_HAS_MX_MMA */
 
@@ -4106,6 +4244,9 @@ __device__ void d_moe_group_down_pf(float* part, const bf16* fu, const unsigned 
  * op_gemm.h's capacity marker: any object built from this source HAS the arms. */
 extern "C" __device__ unsigned plow_moe_pf_part16_arm = 1;
 extern "C" __device__ unsigned plow_moe_pf_a8_arm = 1;
+#if PLOW_MOE_PF_A4W4
+extern "C" __device__ unsigned plow_moe_pf_a4w4_arm = 1;
+#endif
 #if PLOW_MOE_PF_ATOMIC
 /* CONDITIONAL, unlike the two above: PLOW_MOE_PF_ATOMIC is a BUILD axis (default off, so the
  * default object is byte-identical), and a blob emitted with the fused decomposition on an

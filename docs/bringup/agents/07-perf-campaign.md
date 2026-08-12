@@ -1,13 +1,35 @@
 # Agent — Stage 7: End-to-End Performance Campaign
 
+## Target parameters — fill this in FIRST
+
+A campaign is a statement about **one part**. Read [`../target.md`](../target.md)
+and fill every row before leasing a GPU; the filled block goes verbatim into the
+write-up's header. A row you cannot fill is a **blocker**, not a default. Every
+command below is written in these names — **never substitute a literal part name
+into a command.**
+
+| param | value | source |
+|---|---|---|
+| `$VENDOR` | | `amd` or `nvidia` — selects the engine shape and the SMI tool |
+| `$ISA` | | the `--arch` string (`IsaLevel::arch_flag()`) |
+| `$GPU` | | a name from `plowc --list-gpus` — do not guess one, and do not take one from a write-up's filename |
+| `$NCU` | | `--n-cu`; `0` means `$GPU`'s `sm_count` |
+| `$NGPU` / `$PARALLEL` | | `--num-gpus` / `--parallel` (`tp` only) |
+| `$MAXCTX` | | `--max-ctx`; must hold `input + output` of **every campaign row** or the request is refused |
+| `$TOOLCHAIN` | | `hipcc` or `nvcc`, + version |
+| `$BUILD` | | `scripts/build_<isa>.sh` for `$ISA` |
+| `$FEATURES` | | `--features hsa` (amd) or `--features cuda` (nvidia) |
+| `$BW_BOUND` / `$COMPUTE_CEIL` | | from Stage 4 — **state for each whether it is measured on `$GPU` or a datasheet fallback** |
+| `$RESULTS` | | `perf-data/plow-<isa>/` if it exists for `$ISA`, else `perf-data/` |
+
 You are executing **Stage 7** of the model-bringup playbook — the final stage.
 Your job: run one clean, reproducible end-to-end performance campaign for a model
 that already has a serving recipe (Stage 6), behind a correctness battery, and
-write it up honestly in `perf-data/`. Read
-[`docs/bringup/07-perf-campaign.md`](../07-perf-campaign.md) and
-[`perf-data/harness/BRINGUP.md`](../../../perf-data/harness/BRINGUP.md) first — they
-are authoritative and hold the full harness, commands, and pitfalls. This prompt
-is the executable checklist.
+write it up honestly in `$RESULTS`. Read
+[`docs/bringup/07-perf-campaign.md`](../07-perf-campaign.md) first — it is
+authoritative and holds the full harness, commands, and pitfalls; the scripts
+themselves are described in `perf-data/tools/README.md`. This prompt is the
+executable checklist.
 
 **Nothing here recompiles or re-tunes.** A campaign measures the gated recipe and
 documents it. If a run suggests a new lever, record it as open work and finish
@@ -25,10 +47,10 @@ carries the caveat that makes it honest.
 * Memory fits at the target concurrency (admitted, not KV-OOM shed); no spurious
   shedding; every numerics-changing lever already re-verified.
 * Assets in `$ASSETS` (bundle dir: `.pkt` + `weights.json` + sidecars; `hsaco`
-  dir for AMD). A built `plowrt` (`nix develop`; `cargo build -p plowrt --release
-  --features cuda` or `--features hsa`).
-* A GPU you can lease exclusively, and — for a comparator arm — a working
-  reference framework (e.g. vLLM) **on the same box**.
+  dir on `$VENDOR = amd`), emitted for `$GPU`/`$ISA`. A built `plowrt`
+  (`nix develop`; `cargo build -p plowrt --release $FEATURES`).
+* `$GPU` — all `$NGPU` of it — leasable exclusively, and, for a comparator arm,
+  a working reference framework (e.g. vLLM) **on the same box**.
 
 If any is missing, **stop and report**. Do not run a campaign on a recipe that
 has not gated out of Stage 6, and do not quote a comparator ratio you cannot
@@ -38,14 +60,18 @@ produce in the same session.
 
 Before leasing a GPU, write down: **models + precisions, prompt lengths, output
 length, the concurrency ladder (VUs), the context ladder, the SLOs (e.g. ITL/TPOT
-p99 ≤ 50 ms, TTFT p99 ≤ 5 s), and the comparator (if any).** Note the engine
-shape — it changes what the concurrency sweep means:
+p99 ≤ 50 ms, TTFT p99 ≤ 5 s), and the comparator (if any).** `$VENDOR` sets the
+engine shape, which changes what the concurrency sweep means:
 
-* **CUDA / sm_120 slotted** (`B` mux slots): a real capacity sweep up to `B`, then
-  mux queueing.
-* **AMD single-sequence per rank** (`batch=1`, optional TP): only the
-  concurrency-1 rows compare kernels; higher VUs measure requests *queueing*, not
-  a batched engine. Say so; do not read those ratio columns as a kernel contest.
+* **`$VENDOR = nvidia`, slotted** (`B` mux slots): a real capacity sweep up to
+  `B`, then mux queueing.
+* **`$VENDOR = amd`, single-sequence per rank** (`batch=1`, optional TP): only
+  the concurrency-1 rows compare kernels; higher VUs measure requests *queueing*,
+  not a batched engine. Say so; do not read those ratio columns as a kernel
+  contest.
+
+Every SLO and target in the plan is a number for `$GPU`. If it came from another
+part's campaign, it is a hypothesis, not a target — say which.
 
 ## Procedure
 
@@ -53,11 +79,12 @@ shape — it changes what the concurrency sweep means:
 
 * Confirm `backend ready — GPU accelerated` in the serve log — CPU fallback is a
   warning, not an error, and benches the CPU path.
-* `rocm-smi --showuse` / `nvidia-smi --query-compute-apps` reads **0%** before any
-  A/B. The persistent megakernel outlives its host process; a bench started while
-  a prior `serve` tears down reads a contended box.
-* Everything through `nix develop`. Every GPU run through
-  `perf-data/harness/gpulease <label> <cmd>` — rc=76 = contended, discard and
+* The `$VENDOR` SMI tool (`rocm-smi --showuse` / `nvidia-smi
+  --query-compute-apps`) reads **0%** on all `$NGPU` devices before any A/B. The
+  persistent megakernel outlives its host process; a bench started while a prior
+  `serve` tears down reads a contended box.
+* `$TOOLCHAIN` and the driver agree. Everything through `nix develop`. Every GPU run through
+  `perf-data/tools/gpulease <label> <cmd>` — rc=76 = contended, discard and
   re-run.
 
 ### 1. Correctness battery — before ANY performance cell
@@ -65,7 +92,7 @@ shape — it changes what the concurrency sweep means:
 **Token-identity gate**, for each arm you will bench, that same build:
 
 ```bash
-perf-data/harness/gpulease gate perf-data/harness/bringup_gate.sh $ASSETS <tag> 8080
+perf-data/tools/gpulease gate perf-data/tools/bringup_gate.sh $ASSETS <tag> 8080
 diff $BRINGUP_OUT/gate-out/<reference>.txt $BRINGUP_OUT/gate-out/<tag>.txt
 ```
 
@@ -78,7 +105,7 @@ with a real prompt.
 **Accuracy number**, at least one:
 
 ```bash
-perf-data/harness/gpulease gsm8k scripts/bench_gsm8k.sh   # 8-shot greedy, n=200
+perf-data/tools/gpulease gsm8k scripts/bench_gsm8k.sh   # 8-shot greedy, n=200
 ```
 
 A throughput number without an accuracy number is not publishable — token
@@ -87,12 +114,15 @@ identity proves self-consistency only.
 ### 2. Roofline sanity (decide "slow" vs "box is the wall" by arithmetic)
 
 ```bash
-perf-data/harness/gpulease ceil python3 perf-data/harness/bringup_ceiling.py
+perf-data/tools/gpulease ceil python3 perf-data/tools/bringup_ceiling.py
 ```
 
-Edit `SHAPES` to your model's prefill GEMMs. Decode capacity is usually
-HBM-bandwidth-bound — state the bytes moved and the achieved GB/s next to the ms,
-not the ms alone.
+Edit `SHAPES` to your model's prefill GEMMs. The script is written against
+cuBLASLt; on `$VENDOR = amd` use the hipBLASLt equivalent or carry
+`$COMPUTE_CEIL` from Stage 4. Decode capacity is usually HBM-bandwidth-bound —
+state the bytes moved, the achieved GB/s, and the % of `$BW_BOUND`, naming
+whether `$BW_BOUND` is measured on `$GPU` or the datasheet peak
+`bandwidth_for_bound()` falls back to. Never the ms alone.
 
 ### 3. Same-session baseline (both engines, interleaved)
 
@@ -102,7 +132,7 @@ headline). `bringup_showdown.sh` is the template — edit the arm list:
 ```bash
 SNAP=$HF_SNAPSHOT MODEL_ID=$SERVED_ID BUNDLES=$BUNDLE_DIR CUBINS=$CUBIN_DIR \
 IN_LENS="1024 4096" NPROMPT=9 \
-  perf-data/harness/gpulease showdown perf-data/harness/bringup_showdown.sh
+  perf-data/tools/gpulease showdown perf-data/tools/bringup_showdown.sh
 ```
 
 Cross-engine checks, mandatory: identical `Total input tokens`; identical `Total
@@ -118,9 +148,9 @@ queueing. Sweep the ladder — never one point:
 ```bash
 CAMPAIGN=<name> PROMPT_TOKS=4096 VUS="1 2 4 8 16 32" \
 MODEL_NAME=$SERVED_ID TOKENIZER=$HF_SNAPSHOT ASSETS=$BUNDLE_DIR \
-  perf-data/harness/gpulease b2 perf-data/bench_b2_ib.sh
+  perf-data/tools/gpulease b2 perf-data/bench_b2_ib.sh
 python3 perf-data/consolidate_b2_ib.py
-python3 perf-data/harness/b2-ib/slo_capacity.py
+python3 perf-data/tools/b2-ib/slo_capacity.py
 ```
 
 If `bench_ib.sh`/`bench_b2_ib.sh` is not in the tree, drive the pinned
@@ -132,7 +162,8 @@ TTFT = mux queueing above `B` (the capacity answer), not a decode regression.
 
 ### 5. Context sweep (context scaling)
 
-At concurrency 1, sweep `IN_LENS="1024 4096 8192 16384 32768 65536"`; report TTFT
+At concurrency 1, sweep `IN_LENS="1024 4096 8192 16384 32768 65536"` (every
+point ≤ `$MAXCTX`, and `$MAXCTX` must also cover the output); report TTFT
 and TPOT at each. Characterize TPOT-vs-context (plow's decode is often close to
 context-flat). Watch the chunk ladder: a template-inflated prompt that splits
 `[4096,128]` pays a second full-model tail pass — credit it in a TTFT ratio. A
@@ -144,14 +175,19 @@ recompile, do not re-run.
 
 Transcribe every number verbatim from the tool's report JSON. Consolidators build
 the `*.json`; **you write the markdown by hand** from those JSONs with the prose
-and caveats. Commit under `perf-data/` (per-arch home `perf-data/plow-gfx942/`;
-cross-arch capacity reports at the `perf-data/` root). Match the established
-structure:
+and caveats. Commit under `$RESULTS` (per-ISA home `perf-data/plow-<isa>/` —
+`perf-data/plow-gfx942/` is the only one in the tree today; cross-arch capacity
+reports at the `perf-data/` root). If `$ISA` has no home yet, create one on the
+same pattern rather than filing under another ISA's directory. Match the
+established structure:
 
-* header (date, branch@commit, box, both engine configs, harness+pinned rev,
-  profile, TTFT convention);
+* header (date, branch@commit, the filled target block — `$GPU`, `$ISA`,
+  `$NCU`, `$NGPU`/`$PARALLEL`, `$MAXCTX`, driver, `$TOOLCHAIN` — both engine
+  configs, harness+pinned rev, profile, TTFT convention, and the provenance of
+  `$BW_BOUND`/`$COMPUTE_CEIL`);
 * **honesty banner** — what ran and, explicitly, what did **not** (label, never
-  project); in `plow-gfx942/`, add the `Scope:` class line;
+  project); in a per-ISA home, add the `Scope:` class line saying how far the
+  finding generalizes (this µarch / this vendor / plow-architectural / method);
 * tables, one row per (tag, VU) / (tag, ctx), percentiles, `valid: false` on any
   ungated row;
 * per-model "what holds it back" with the roofline arithmetic;
@@ -170,8 +206,11 @@ Passes when **all** hold; otherwise the model is blocked with a specific blocker
 3. Same-session and uncontended: both engines one lease, every run `gpulease`
    rc=0, no stored baseline quoted as same-session.
 4. Swept: a concurrency ladder and a context ladder, not one cell.
-5. Documented in `perf-data/` in the established format, every cell traceable to
+5. Documented in `$RESULTS` in the established format, every cell traceable to
    a JSON + a command, neutral tone, no win/loss framing.
+6. The write-up names `$GPU`, `$ISA`, `$NCU`, `$NGPU`/`$PARALLEL`, `$MAXCTX`,
+   the provenance of every denominator, and a `Scope:` line. An unscoped number
+   will be reused on a part it was never measured on.
 
 ## Pitfalls to actively guard against
 
@@ -180,6 +219,7 @@ Passes when **all** hold; otherwise the model is blocked with a specific blocker
   GPU first.
 * **A stored baseline is not same-session.** A recorded comparator CSV moved 33%
   on re-measure. Re-baseline both engines in one session or label the ratio.
+  A baseline from another part is likewise not a baseline for `$GPU`.
 * **A/B order / session drift** — when background load changes, re-baseline
   everything; do not compare arms measured under different contention.
 * **Shed requests bench as successful** (~12 tok) → fake tok/s. Raise `--slo-ms`
@@ -188,8 +228,8 @@ Passes when **all** hold; otherwise the model is blocked with a specific blocker
   tokens` every arm.
 * **A wide fixed `B` doubles latency for the same throughput** — capacity is
   bandwidth/prefill-bound, not batch-size-bound.
-* **Single-sequence engine**: only concurrency-1 compares kernels; higher VUs are
-  queueing, not batching.
+* **Single-sequence engine** (`$VENDOR = amd`): only concurrency-1 compares
+  kernels; higher VUs are queueing, not batching.
 * **Chat-route token inflation** (~11% extra prefill) — credit it in a TTFT ratio.
 * **ctx/profile mismatch is a refusal, not a slow run** — flag `valid: false`,
   recompile.
@@ -199,9 +239,15 @@ Passes when **all** hold; otherwise the model is blocked with a specific blocker
   one answers both arms (delta meaningless); `kill -9` leaves the megakernel
   resident and corrupts later runs.
 * **Standalone probes overstate** (probe law) — quote only in-serve numbers.
+* **A prior campaign's number is not a target.** Everything in `perf-data/` is
+  attributed to the box it ran on. Reuse the method; re-measure the values on
+  `$GPU`. Two parts at the same `$ISA` differ here too.
 
 ## When to stop and ask
 
+* Any row of the target block cannot be filled — in particular `$GPU` is not in
+  `plowc --list-gpus`, or `$MAXCTX` cannot cover the planned ladder (that is a
+  recompile in Stage 5/6, not a campaign row).
 * The correctness gate fails (garbage, wrong first token, TP ranks disagree, or
   accuracy far below the reference) → a correctness blocker; stop, do not report
   a perf number behind it.
@@ -219,18 +265,19 @@ Passes when **all** hold; otherwise the model is blocked with a specific blocker
 
 ## Report back
 
-* **Campaign scope**: models, precisions, box (GPU/arch/CU-or-SM/driver), engine
-  configs, harness + pinned rev, profile, and — explicitly — what ran vs what did
-  not.
+* **The filled target block**, verbatim.
+* **Campaign scope**: models, precisions, box (`$GPU`/`$ISA`/`$NCU`/driver),
+  engine configs, harness + pinned rev, profile, and — explicitly — what ran vs
+  what did not.
 * **Correctness**: token-identity gate result per arm, the accuracy number(s), TP
   rank-identity where applicable.
 * **Capacity**: max users under each SLO and peak throughput per model, with the
   concurrency curve's shape (where TTFT vs ITL breaks).
 * **Context scaling**: TPOT/TTFT vs context, and any crossover (stated as a
   trend, not a served point).
-* **Roofline**: measured GEMM ceiling and the achieved fraction; the honest
-  per-model limiter.
-* **The write-up**: path to the committed `perf-data/` doc + its JSONs, and the
+* **Roofline**: `$COMPUTE_CEIL` / `$BW_BOUND` with their provenance and the
+  achieved fraction of each; the honest per-model limiter.
+* **The write-up**: path to the committed `$RESULTS` doc + its JSONs, and the
   reproduction command per table.
 * **Real-vs-ideal caveats**: contention, stored-vs-same-session baselines,
   chat-route inflation, any comparator that could not be reproduced — everything

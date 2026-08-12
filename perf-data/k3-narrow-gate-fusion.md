@@ -10,10 +10,10 @@ Taken for `RmsNorm`, **refused for the other two**, and one of that paragraph's 
 turns out not to survive measurement. Everything below is read off emitted blobs
 (`plowrt disasm --program 1 --counters`) or measured on gfx950 under `gpulease`.
 
-**STATUS: the fold is OFF by default (`PLOW_K3_FUSE_NGEMV=1` opts in).** It is bit-exact in
-isolation and NOT bit-exact end-to-end yet; §4 has the table and what is known about why. What is
-settled and reusable regardless: the fan-out census, the arithmetic that rejects `AttnRes`, the
-chain-level measurement, and the correction to this doc's counter-traffic claim.
+**STATUS: adopted and ON by default on gfx942 TP8 as of 2026-08-11.** Sections 1--5 preserve the
+original implementation and its failed gate; §6 records the corrected current-kernel logit and
+serving gates. The fan-out census, the arithmetic that rejects `AttnRes`, and the correction to
+this doc's counter-traffic claim remain applicable.
 
 ---
 
@@ -191,3 +191,44 @@ What the change is expected to be worth, from the static result and this tree's 
 figure: 116 chain levels at ~5.7 us of protocol cost is ~0.66 ms/token, against a ~36 ms token.
 `scripts/k3_block_sweep.sh` with `PLOW_K3_FUSE_NGEMV=0` as the control arm is the A/B to run on a
 quiet box; use unbound-weight runs (`kimi-k3-README.md` §5 trap 2) since the effect is sub-1 ms.
+
+## 6. Current gfx942 TP8 gate and adoption
+
+The current interpreter derives the reduction scratch from the arena top, so the original
+aliased pointer cannot be passed. Control and candidate were re-emitted from the same binary with
+identical 5,411-tensor tables and the same ns64 packet/object settings. The only emit difference
+was `PLOW_K3_FUSE_NGEMV=0` versus `=1`.
+
+| Decode structure | Control | Fused |
+|---|---:|---:|
+| packets | 2,459 | 2,343 |
+| counters | 61,475 | 58,575 |
+| critical path | 1,831 | 1,715 |
+
+Packet SHA256:
+
+```text
+e17025ab76237f6d7f5c6006a982be14e20803431f8bab49760b1051ece09805  control
+d2b058e2a701ba182db6bea3228c2a04fbcf85759355759f1206695e61a3695d  fused
+```
+
+Two matched vLLM 0.27 `bench serve` cells used C1, actual input 149, output 512,
+one warmup, TP8 compact exact counter audit, counter double buffering, device state clear,
+FP8 MLA V2, and the same gfx942 object inventory:
+
+| repetition | Control TPOT | Fused TPOT | Delta |
+|---:|---:|---:|---:|
+| 1 | 55.118 ms | 53.668 ms | -1.450 ms (-2.63%) |
+| 2 | 54.994 ms | 53.663 ms | -1.331 ms (-2.42%) |
+
+Every cell completed 1/1 with 512 output tokens and empty errors. Generated text is byte-identical
+for each matched pair. Detailed JSON is retained under `/tmp/k3-ngemv-result/`.
+
+The stronger gate used real weights, prompt ids `1008,10484,318,15383,387`, `ctx=5`, and dumped
+rank 0's complete BF16 vocabulary row after prefill and each of 32 decode steps. All 33 vectors
+are byte-identical: relative error zero, `maxabs=0`, and the same argmax at every step. All eight
+ranks also emitted the same token stream. Evidence directories are
+`/tmp/k3-ngemv-logits-{control,candidate}`.
+
+Decision: enable the fusion by default for K3 B1 decode. `PLOW_K3_FUSE_NGEMV=0` preserves the
+unfused control; `lat` and `q` retain the site-level bisect.

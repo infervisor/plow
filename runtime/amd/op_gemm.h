@@ -3245,6 +3245,18 @@ __device__ __forceinline__ void gemv_rows_fp8(bf16* __restrict__ Cq_, bf16* __re
  * and fp4 zero decodes to 0.0, so an overshoot chunk contributes nothing. The scale byte is guarded
  * explicitly — it is 1/16 the traffic of the weights and stays in L1/L2, so a predicated scalar
  * load is not worth a buffer resource of its own. */
+#ifndef PLOW_MXFP4_DEC_NT
+#define PLOW_MXFP4_DEC_NT 1
+#endif
+__device__ __forceinline__ fp8v16 buf_ld_mxfp4(__amdgpu_buffer_rsrc_t r,
+                                               unsigned byte_off) {
+#if PLOW_MXFP4_DEC_NT
+    return buf_ld_fp8(r, byte_off);
+#else
+    return __builtin_bit_cast(
+        fp8v16, __builtin_amdgcn_raw_buffer_load_b128(r, byte_off, 0, 1));
+#endif
+}
 /* ONE BODY, THREE STREAMS -- and the 1-stream form is this with Nk = Nv = 0.
  *
  * `PLOW_DOP_GEMV_MXFP4` (op 91) reaches this function with Nk = Nv = 0 and the k/v weight, scale
@@ -3341,7 +3353,7 @@ __device__ __forceinline__ void gemv_mx_rows_1(bf16* __restrict__ Cq_, bf16* __r
 #pragma unroll
         for (int u = 0; u < UN; u++)
             wv[u] = __builtin_bit_cast(
-                fp4v32, buf_ld_fp8(wr, ((c + (unsigned)u) * step + lane * 32) >> 1));
+                fp4v32, buf_ld_mxfp4(wr, ((c + (unsigned)u) * step + lane * 32) >> 1));
 #pragma unroll
         for (int u = 0; u < UN; u++) {
             const unsigned k = (c + (unsigned)u) * step + lane * 32;
@@ -3446,11 +3458,11 @@ __device__ __forceinline__ void gemv_rows_mxfp4(bf16* __restrict__ Cq_, bf16* __
 #pragma unroll
             for (int u = 0; u < UN; u++)
                 wv[u] = __builtin_bit_cast(
-                    fp4v32, buf_ld_fp8(wr, ((c + (unsigned)u) * step + lane * 32) >> 1));
+                    fp4v32, buf_ld_mxfp4(wr, ((c + (unsigned)u) * step + lane * 32) >> 1));
 #pragma unroll
             for (int u = 0; u < UN; u++)
                 wv2[u] = __builtin_bit_cast(
-                    fp4v32, buf_ld_fp8(wr2, ((c + (unsigned)u) * step + lane * 32) >> 1));
+                    fp4v32, buf_ld_mxfp4(wr2, ((c + (unsigned)u) * step + lane * 32) >> 1));
 #pragma unroll
             for (int u = 0; u < UN; u++) {
                 const unsigned k = (c + (unsigned)u) * step + lane * 32;
@@ -4910,11 +4922,11 @@ __device__ __forceinline__ void gemv_glu_rows_mxfp4(
 #pragma unroll
             for (int u = 0; u < UN; u++)
                 wg[u] = __builtin_bit_cast(
-                    fp4v32, buf_ld_fp8(rg, ((c + (unsigned)u) * step + lane * 32) >> 1));
+                    fp4v32, buf_ld_mxfp4(rg, ((c + (unsigned)u) * step + lane * 32) >> 1));
 #pragma unroll
             for (int u = 0; u < UN; u++)
                 wu[u] = __builtin_bit_cast(
-                    fp4v32, buf_ld_fp8(ru, ((c + (unsigned)u) * step + lane * 32) >> 1));
+                    fp4v32, buf_ld_mxfp4(ru, ((c + (unsigned)u) * step + lane * 32) >> 1));
 #pragma unroll
             for (int u = 0; u < UN; u++) {
                 const unsigned k = (c + (unsigned)u) * step + lane * 32;

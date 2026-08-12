@@ -24,7 +24,7 @@
  * BUILD (plain env — nix CPATH collides with the CUDA headers):
  *   perf-data/px13_build_tma.sh
  * RUN:
- *   perf-data/harness/gpulease px13tma /tmp/px13tma
+ *   perf-data/tools/gpulease px13tma /tmp/px13tma
  *
  * NOT a correctness test on its own: `verify` mode checks that all three arms land the SAME
  * bytes in the SAME smem slots, which is the property a staging swap has to have.

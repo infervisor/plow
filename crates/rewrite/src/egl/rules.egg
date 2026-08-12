@@ -135,18 +135,17 @@
 ; the second, because the gate multiplies the mixer output rather than the
 ; other way round.
 ;
-; Ordering note: the KDA pattern matches BOTH rules (its `?o` is an RmsNorm).
-; That is intended and safe — both e-nodes live in the e-graph and tree-additive
-; cost picks `FusedKdaGatedNorm`, which absorbs the norm and so is strictly
-; smaller than `FusedMlaOutGate` applied to a surviving `RmsNorm` node.
+; The KDA pattern includes its per-head reshape, so it does not alias the MLA
+; gate rule; both remain pinned to a sigmoid gate on the second mul operand.
 
-; kda-gated-norm-fuse: KDA's output half — `o_norm(o) * sigmoid(g_proj(x))`,
+; kda-gated-norm-fuse: KDA's output half — `o_norm(o) * sigmoid(reshape(g_proj(x)))`,
 ; 5 e-nodes → 1. This is `DevOp::KdaGatedNorm` (103) exactly.
 ; rule: kda-gated-norm-fuse
-(rewrite (Ew "mul" (RmsNorm ?o ?nw ?eps) (Act "sigmoid" (Linear ?x ?gw ?gout)))
-         (FusedKdaGatedNorm ?o ?nw ?eps ?x ?gw ?gout))
+(rewrite (Ew "mul" (RmsNorm ?o ?nw ?eps)
+                    (Act "sigmoid" (Reshape (Linear ?x ?gw ?gout) ?gshape)))
+         (FusedKdaGatedNorm ?o ?nw ?eps ?x ?gw ?gout ?gshape))
 
-; mla-out-gate-fuse: K3's MLA output gate — `attn * sigmoid(o_gate_proj(x))`,
+; mla-out-gate-fuse: K3's MLA output gate — `attn * sigmoid(g_proj(x))`,
 ; applied BEFORE o_proj. 3 e-nodes → 1. This is `DevOp::MlaOutGate` (106).
 ; `?x` is the post-input_layernorm hidden, NOT the attention output; the rule
 ; keeps them distinct operands so that stays true after extraction.

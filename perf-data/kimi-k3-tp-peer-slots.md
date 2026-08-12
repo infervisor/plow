@@ -1,18 +1,26 @@
 # Kimi-K3 TP: the third peer slot, and the ordering dependency it would buy back
 
-**Status: the third slot LANDED, but for a different reason than this note proposed, and the
-ordering dependency below is still paid.** `PARTIAL_SLOTS` is now 3 and the host binds
+**Status: the fourth-slot experiment was measured and rejected.** `PARTIAL_SLOTS` remains 3 and the host binds
 `act.ug_tp` at `scratch_base + 2*slot_b` — not to give the shared expert's `down_proj` a private
 slot, but to give the newly COLUMN-PARALLEL `routed_expert_up_proj` a peer-visible home for its
 partial, which `d_xreduce` then ALL-GATHERS inside the shared expert's existing all-reduce
 (`gcols`/`row_w`, `emit_xreduce_gather`). That shard is worth **-4.14 GB/rank/token** of decode
 weight traffic, measured off the blob: the bf16 `Gemv` family goes 18.157 -> 14.021 GB.
 
-So the layout change this note priced as a risk has now been taken anyway, and the peer region
-is one slot bigger for every TP model. **The cheap A/B below is still the right next step** and
-is still unrun: nothing about the gather removes the `c_cmb` edge, because the shared expert's
-`down_proj` still writes slot 0. What a FOURTH slot would buy is exactly what a third was
-proposed to buy here, and the arithmetic is unchanged.
+The opt-in experiment gave shared DOWN slot 3 only on independent-sequence decode rungs, removed
+its routed-combine wait, and left prefill on the established dependency. The recovered peer stride
+remained 117,440,512 bytes; 244 devgen and 218 HSA runtime tests passed. On eight MI325X GPUs,
+`plowrt serve` plus vLLM 0.27 C32/N32/input32/output512/one warmup measured:
+
+| arm | output tok/s | median TPOT |
+|---|---:|---:|
+| three-slot control | 119.050 | 246.63 ms |
+| dedicated slot 3 | 118.921 | 247.03 ms |
+
+Both completed 32/32 with 16,384 output tokens, empty errors, compact exact TP audits, and
+byte-identical generated-text arrays. The candidate lost 0.11% throughput and 0.16% TPOT, with
+no consistent GPU-drain reduction. It stays out of the runtime and emitter. Raw detailed results:
+`/tmp/k3-sharedslot-{ctl2,s3d}-c32-out512/seed0.json`.
 
 Original note follows.
 

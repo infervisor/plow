@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 consolidate_b2_ib.py — build perf-data/b2-concurrency-{12b,31b,26b}.json from
-the raw inference-benchmarker reports in perf-data/harness/b2-ib/<tag>/results/.
+the raw inference-benchmarker reports in perf-data/tools/b2-ib/<tag>/results/.
 
 Final-numbers campaign (v2): multi-user concurrency/capacity head-to-head,
 vLLM 0.25.1 vs `plowrt serve`, whole Gemma-4 family, bf16:

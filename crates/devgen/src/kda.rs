@@ -64,7 +64,7 @@
 //! 3. **State is V-FIRST `[h][v][k]`.** Transposing it gives garbage with exactly the right norm.
 //!    [`KDA_STATE_LAYOUT`] is carried into the block descriptor for that reason.
 
-use packet::dev::DevOp;
+use packet::dev::{DevOp, WG_WAVES};
 use packet::devbuild::Builder;
 
 /// K3's KDA geometry (`text_config.linear_attn_config` plus `hidden_size`).
@@ -148,6 +148,15 @@ impl KdaCfg {
     pub fn state_step_blocks_rows(&self, n_cu: u32, rows: u32) -> u32 {
         let items = (self.proj() / self.bv).saturating_mul(rows.max(1));
         items.min(n_cu).max(1)
+    }
+
+    /// Workgroups for [`DevOp::KdaGatedNorm`]: one wave per `(token, head)` row.
+    pub fn gated_norm_blocks_rows(&self, n_cu: u32, rows: u32) -> u32 {
+        rows.max(1)
+            .saturating_mul(self.heads)
+            .div_ceil(WG_WAVES)
+            .min(n_cu)
+            .max(1)
     }
 }
 
@@ -277,6 +286,10 @@ pub struct KdaState {
     pub state: u32,
     /// `[H*D, W]` f32 per stream (q, k, v), current token at slot `W-1`.
     pub conv_state: [u32; 3],
+    /// Alternate q/k/v window bank for the B1 Conv3+state experiment.
+    pub conv_state_alt: Option<[u32; 3]>,
+    /// `in.pos`, whose parity selects the source bank without another host upload.
+    pub bank_pos: Option<u32>,
 }
 
 /// Declare the carried state for one KDA layer. `prefix` is a COMPILER-owned namespace
@@ -304,7 +317,28 @@ pub fn declare_kda_state(b: &mut Builder, c: &KdaCfg, prefix: &str, slots: u64) 
             b.tensor(&format!("{prefix}conv_state.k"), cw),
             b.tensor(&format!("{prefix}conv_state.v"), cw),
         ],
+        conv_state_alt: None,
+        bank_pos: None,
     }
+}
+
+pub fn declare_kda_state_db(
+    b: &mut Builder,
+    c: &KdaCfg,
+    prefix: &str,
+    slots: u64,
+    pos: u32,
+) -> KdaState {
+    assert_eq!(slots, 1, "KDA Conv3/state fusion is currently B1-only");
+    let mut state = declare_kda_state(b, c, prefix, slots);
+    let cw = c.proj() as u64 * c.conv_w as u64 * 4;
+    state.conv_state_alt = Some([
+        b.tensor(&format!("{prefix}conv_state_alt.q"), cw),
+        b.tensor(&format!("{prefix}conv_state_alt.k"), cw),
+        b.tensor(&format!("{prefix}conv_state_alt.v"), cw),
+    ]);
+    state.bank_pos = Some(pos);
+    state
 }
 
 /// May P1-P4 collapse into one [`DevOp::GemvQkvg`] packet for `t` rows of width `hidden`?
@@ -621,10 +655,56 @@ fn emit_kda_mixer_ex(
     let cus: Vec<u32> = (0..nb).collect();
     let gate_mode = u32::from(c.gate_lower_bound.is_some());
     let lower_bound = c.gate_lower_bound.unwrap_or(0.0);
+    let parked = seq_rows.then(|| b.tensor("in.parked", 4 * t as u64));
     // scale = D^-0.5, applied to q AFTER the L2 norm; k is NOT scaled.
     let scale = (c.head_dim as f32).powf(-0.5);
 
-    let c_step = if fuse {
+    let c_step = if let (1, Some(alt), Some(bank_pos)) = (t, st.conv_state_alt, st.bank_pos) {
+        let handles = [
+            w.conv_w[0],
+            w.conv_w[1],
+            w.conv_w[2],
+            st.conv_state[0],
+            st.conv_state[1],
+            st.conv_state[2],
+            alt[0],
+            alt[1],
+            alt[2],
+            w.a_log,
+            w.dt_bias,
+            bank_pos,
+            parked.unwrap_or(packet::dev::TENSOR_NONE_I),
+        ];
+        let mut descriptor = Vec::with_capacity(handles.len() * 4);
+        for handle in handles {
+            descriptor.extend_from_slice(&handle.to_le_bytes());
+        }
+        let desc = b.tensor_init(&format!("{a}conv_step_db.desc"), descriptor);
+        b.emit(
+            DevOp::KdaConvStateStepG,
+            cus,
+            &[c_q, c_k, c_v, c_fb, c_bb],
+            |d| {
+                d.t[0] = o;
+                d.t[1] = raw[0];
+                d.t[2] = raw[1];
+                d.t[3] = raw[2];
+                d.t[4] = f_raw;
+                d.t[5] = b_raw;
+                d.t[6] = st.state;
+                d.t[7] = desc;
+                d.i[0] = t;
+                d.i[1] = nh;
+                d.i[2] = hd;
+                d.i[3] = c.bv;
+                d.i[4] = 1 | if seq_rows { 2 } else { 0 };
+                d.i[5] = c.conv_w;
+                d.i[6] = gate_mode;
+                d.f[0] = scale;
+                d.f[1] = lower_bound;
+            },
+        )
+    } else if fuse {
         // P8 — ONE conv over the 3*H*D concatenated channel axis, still all 256 CUs, with the
         // per-CU channel count RISING 3x. The three streams keep separate buffers; the op takes
         // twelve pointers and four of them ride in `i[]`.
@@ -645,11 +725,7 @@ fn emit_kda_mixer_ex(
         //
         // Declared here rather than threaded through the signature: the builder dedups by name,
         // so this returns the one `in.active` no matter how many layers ask for it.
-        let parked = if seq_rows {
-            b.tensor("in.parked", 4 * t as u64)
-        } else {
-            0
-        };
+        let parked = parked.unwrap_or(0);
         let c_conv = b.emit(DevOp::KdaConv3, all.clone(), &[c_q, c_k, c_v], |d| {
             d.t[0] = mix[0];
             d.t[1] = mix[1];
@@ -767,7 +843,8 @@ fn emit_kda_mixer_ex(
 
     // P11 — output gate. Gated on P4 (whose GEMV has had the whole conv+gate+state chain to hide
     // under) and P10.
-    let c_norm = b.emit(DevOp::KdaGatedNorm, all.clone(), &[c_g, c_step], |d| {
+    let norm_cus: Vec<u32> = (0..c.gated_norm_blocks_rows(n_cu, t)).collect();
+    let c_norm = b.emit(DevOp::KdaGatedNorm, norm_cus, &[c_g, c_step], |d| {
         d.t[0] = y;
         d.t[1] = o;
         d.t[2] = w.o_norm;
@@ -945,6 +1022,11 @@ mod tests {
             192,
             "BV=8 restores 192"
         );
+        assert_eq!(c.gated_norm_blocks_rows(256, 1), 12);
+        assert_eq!(tp8.gated_norm_blocks_rows(256, 1), 2);
+        assert_eq!(tp8.gated_norm_blocks_rows(256, 32), 48);
+        assert_eq!(tp8.gated_norm_blocks_rows(256, 128), 192);
+        assert_eq!(tp8.gated_norm_blocks_rows(256, 512), 256);
     }
 
     /// The state is f32 and CONSTANT in context length. 6.00 MiB + 0.5625 MiB per layer per seq.
@@ -1301,6 +1383,73 @@ mod tests {
         }
         assert_ne!(s1.i[5], packet::dev::TENSOR_NONE, "dt_bias rides in i5");
         assert_eq!(s1.f[1], -5.0, "gate_lower_bound rides in f1");
+    }
+
+    #[test]
+    fn b1_double_buffered_state_emits_one_typed_packet_and_both_conv_banks() {
+        for seq_rows in [false, true] {
+            let c = KdaCfg {
+                heads: 12,
+                bv: 8,
+                ..k3()
+            };
+            let mut b = Builder::new(304);
+            let hidden = b.tensor("in.hidden", 7168 * 2);
+            let pos = b.tensor("in.pos", 4);
+            let w = declare_kda_weights(&mut b, &c, "p.", "l.");
+            let st = declare_kda_state_db(&mut b, &c, "kv.0.", 1, pos);
+            let seed = b.emit(DevOp::Nop, (0..304).collect(), &[], |_| {});
+            emit_kda_mixer_ex(
+                &mut b,
+                &c,
+                &w,
+                &st,
+                "act.kda0.",
+                1,
+                hidden,
+                None,
+                304,
+                false,
+                &[seed],
+                true,
+                seq_rows,
+            );
+            let p = b.finish();
+            let fused: Vec<_> = p
+                .insts
+                .iter()
+                .filter(|i| i.op == DevOp::KdaConvStateStepG as u16)
+                .collect();
+            assert_eq!(fused.len(), 1);
+            assert_eq!(
+                fused[0].i[..7],
+                [1, 12, 128, 8, 1 | if seq_rows { 2 } else { 0 }, 4, 1]
+            );
+            assert_eq!(fused[0].blocks, 192, "one BV8 state column per block");
+            for old in [DevOp::KdaConv3, DevOp::KdaStateStepG] {
+                assert!(p.insts.iter().all(|i| i.op != old as u16), "{old:?}");
+            }
+            for stream in ["q", "k", "v"] {
+                assert!(p
+                    .tensors
+                    .iter()
+                    .any(|t| t.name == format!("kv.0.conv_state.{stream}")));
+                assert!(p
+                    .tensors
+                    .iter()
+                    .any(|t| t.name == format!("kv.0.conv_state_alt.{stream}")));
+            }
+            let desc = &p.tensors[fused[0].t[7] as usize];
+            assert_eq!(desc.bytes, 13 * 4);
+            let init = desc.init.as_ref().expect("descriptor initializer");
+            assert_eq!(init.len(), 13 * 4);
+            let parked = u32::from_le_bytes(init[48..52].try_into().unwrap());
+            if seq_rows {
+                assert_eq!(p.tensors[parked as usize].name, "in.parked");
+            } else {
+                assert_eq!(parked, packet::dev::TENSOR_NONE_I);
+            }
+        }
     }
 
     /// TP8 is the shape K3 decode runs, and it is where a fixed `BV` strands the step on 96 of 256

@@ -1,0 +1,18 @@
+{
+ "_comment": [
+  "Additional instruction-selection contract for K3 batched decode on gfx942.",
+  "Applied only when PLOW_DECODE_BATCH>1 after checking the grouped-A4W4 marker.",
+  "gfx942 decodes MXFP4 into bf16 staging and issues CDNA3 bf16 MFMA."
+ ],
+ "_arch": "gfx942",
+ "interp_decode": {
+  "d_moe_group_glu_pf": {
+   "require_min": {"v_mfma_f32_32x32x8": 1, "v_perm_b32": 1},
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x64_f8f6f4", "v_mfma_scale_f32_32x32x64_f8f6f4", "v_mfma_f32_32x32x16_fp8_fp8"]
+  },
+  "d_moe_group_down_pf": {
+   "require_min": {"v_mfma_f32_32x32x8": 1, "v_perm_b32": 1},
+   "forbid": ["v_mfma_f32_32x32x16_bf16", "v_mfma_f32_32x32x64_f8f6f4", "v_mfma_scale_f32_32x32x64_f8f6f4", "v_mfma_f32_32x32x16_fp8_fp8"]
+  }
+ }
+}

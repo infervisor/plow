@@ -31,7 +31,7 @@
  * scored against it (max abs, max rel, RMS).  e4m3 P carries ~2 decimal digits and the online
  * rescale must not compound; the gate is arm B's error staying at arm A's order of magnitude.
  *
- * Run it under perf-data/harness/gpulease.  Build (needs the fp8 arms compiled in):
+ * Run it under perf-data/tools/gpulease.  Build (needs the fp8 arms compiled in):
  *   nvcc -std=c++17 -gencode arch=compute_120a,code=sm_120a -O3 -I runtime/common -I runtime/nvidia \
  *        -DPLOW_FP8_KV=1 -Xptxas -v perf-data/px8_flash_fp8pv_bench.cu -o /tmp/px8bench
  * (-gencode, not -arch: -arch also emits a compute_120 PTX image and the 8-bit ldmatrix is

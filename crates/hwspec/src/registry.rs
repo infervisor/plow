@@ -141,6 +141,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn measured_bandwidth_governs_a_reported_bound_on_mi325() {
+        let s = lookup("MI325X").unwrap();
+        assert_eq!(s.mem.bandwidth.0, 6000.0);
+        assert_eq!(s.mem.bandwidth_measured.map(|b| b.0), Some(4164.0));
+        assert_eq!(s.mem.bandwidth_for_bound().0, 4164.0);
+    }
+
     /// Parts with no measurement fall back to the datasheet peak rather than to zero — a `None`
     /// that divided as 0 would make every bound infinite.
     #[test]

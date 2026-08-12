@@ -1025,6 +1025,10 @@ enum {
      *   i0=n_tok i1=top_k i2=kv_stride i3=cap */
     PLOW_DOP_INDEX_UNION_PF = 119,
 
+    /* B1 KDA Conv3 + StateStepG with ping-pong convolution windows. t7 is a u32 tensor-handle
+     * descriptor: wq,wk,wv, cs0q,cs0k,cs0v, cs1q,cs1k,cs1v, A_log,dt_bias,in.pos,parked. */
+    PLOW_DOP_KDA_CONV_STATE_STEP_G = 120,
+
     PLOW_DOP__COUNT
 };
 

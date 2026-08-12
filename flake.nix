@@ -16,7 +16,7 @@
         inherit system;
         config = {
           allowUnfree = true;
-          permittedInsecurePackages = [ "python3.13-vllm-0.16.0" ];
+          permittedInsecurePackages = [ "python3.13-vllm-0.27.0" ];
         };
       };
 
@@ -34,22 +34,20 @@
       #
       # VERSION NOTE: ROCm here is 7.14 (clang-23) — the toolchain the branch's
       # kernel measurements were taken on (scripts/build_gfx942.sh header).
-      # 7.14 exists ONLY as TheRock nightly SDK tarballs: AMD's apt channel
-      # stops at 7.2.4 and nixpkgs at 7.2.3 (both checked 2026-08-10). The SDK
-      # is built relocatable, so nix serves it from the store after patching
-      # ELF interpreters. ONE family tarball (gfx950-dcgpu) compiles BOTH
-      # offload arches: the compiler, device-lib bitcode and ROCr are
-      # family-independent; only the prebuilt math libraries differ per
-      # family, and plow links none of them.
-      rocmVersion = "7.14.0a20260612";
+      # AMD publishes 7.14.0 as a stable relocatable TheRock SDK. The gfx94X
+      # family package carries the MI300/MI325 kernel packs. Its compiler,
+      # device-lib bitcode and ROCr can also compile Plow gfx950 code objects;
+      # only vendor math-library kernel packs are family-specific, and Plow
+      # links none of those into its interpreter.
+      rocmVersion = "7.14.0";
       gpuToolsFor = pkgs: rec {
         cuda = pkgs.cudaPackages;
         rocm = pkgs.stdenv.mkDerivation {
-          pname = "rocm-therock-gfx950-dcgpu";
+          pname = "rocm-therock-gfx94X-dcgpu";
           version = rocmVersion;
           src = pkgs.fetchurl {
-            url = "https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-linux-gfx950-dcgpu-${rocmVersion}.tar.gz";
-            sha256 = "0y208k446im2a2iaqbg5h5hfzb2szlb9f1dflf4k3ikknp22xg8r";
+            url = "https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx94X-dcgpu-${rocmVersion}.tar.gz";
+            sha256 = "sha256-MuFtyn+EQKCKjWNqan2wA0xhUY8y6pFTR7mNn1UZmww=";
           };
           dontUnpack = true;
           # autoPatchelf sets the nix ELF interpreter and resolves the few
@@ -97,7 +95,7 @@
             runHook postInstall
           '';
           meta = {
-            description = "ROCm ${rocmVersion} SDK (TheRock nightly, clang-23)";
+            description = "ROCm ${rocmVersion} SDK (TheRock stable, clang-23)";
             platforms = [ "x86_64-linux" ];
           };
         };
@@ -282,14 +280,10 @@
         // lib.optionalAttrs isGpuHost (rec {
           # --- served interpreter objects, one package per arch -----------------
           # ROCm: the full hsaco table (runtime/CMakeLists.txt PLOW_GFX950_HSACO).
-          # gfx942 turns the MXFP4/K3 axes off — parity with what
-          # scripts/build_gfx942.sh builds for CDNA3; those rows have never been
-          # measured against the gfx942 register cliff.
+          # gfx942 carries the same MXFP4/K3 object rows as the canonical CMake
+          # table. The CDNA3 bodies and register cliffs are gated by that table.
           plow-interp-gfx950 = mkHsaco "gfx950" [ ];
-          plow-interp-gfx942 = mkHsaco "gfx942" [
-            "-DPLOW_HSACO_MXFP4=OFF"
-            "-DPLOW_HSACO_K3=OFF"
-          ];
+          plow-interp-gfx942 = mkHsaco "gfx942" [ ];
           # CUDA: the served cubin tables (PLOW_SM120_CUBIN / PLOW_SM90A_CUBIN),
           # fp8-KV twins included, built the fast-prefill way.
           plow-interp-sm120a = mkNvCubin "sm120a" [
@@ -391,10 +385,12 @@
               export PLOW_HIPCC=${gpu.rocm}/bin/hipcc
               export PLOW_BUNDLER=${gpu.rocmLlvmBin}/clang-offload-bundler
               export PLOW_READELF=${gpu.rocmLlvmBin}/llvm-readelf
+              export PLOW_TOOLCHAIN_LABEL=rocm-${rocmVersion}-nix
               # build_gfx950.sh's host `chat` harness: pair the nix cc with the
               # nix ROCm libs (the system gcc cannot link the nix libhsa — its
               # symbol versions are nix-glibc's).
               export PLOW_HOST_CC=cc
+              export LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib ]}''${LIBRARY_PATH:+:$LIBRARY_PATH}"
               export PLOW_NVCC=${gpu.cudatoolkit}/bin/nvcc
               export PLOW_NVCC_PATH=${gpu.nvccPath}
               export NVCC_PREPEND_FLAGS='${gpu.nvccCcbin}'
@@ -413,14 +409,8 @@
                 # the rest of the process, not from /usr.
                 pkgs.stdenv.cc.cc.lib
               ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-              # System fallback, AFTER the nix dirs: /opt/amdgpu carries
-              # libdrm_amdgpu for the kernel driver, and a box that wants its
-              # system ROCm (7.14) instead of nix's can still resolve it here.
-              for d in /opt/rocm/lib /opt/amdgpu/lib/x86_64-linux-gnu; do
-                [ -d "$d" ] && export LD_LIBRARY_PATH="''${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$d"
-              done
               if [ -e /dev/kfd ]; then
-                echo "amd gpu: $(ls /dev/dri/renderD* 2>/dev/null | wc -l) render node(s), system ROCm $(cat /opt/rocm/.info/version 2>/dev/null || echo '-')"
+                echo "amd gpu: $(ls /dev/dri/renderD* 2>/dev/null | wc -l) render node(s), ROCm ${rocmVersion} (nix)"
               fi
             '';
           };
@@ -432,7 +422,7 @@
         // pkgs.lib.optionalAttrs (system != "x86_64-darwin") {
           # Weight quantization only. SEPARATE from `default` on purpose.
           #
-          # `perf-data/harness/quantize_fp8.py` needs torch for
+          # `perf-data/tools/quantize_fp8.py` needs torch for
           # `torch.float8_e4m3fn`: that dtype's RTN+saturate rounding is the
           # reference the emitted fp8 twins are DEFINED against, so
           # approximating it would silently shift every fp8 weight.
@@ -445,7 +435,7 @@
           # place to accumulate everything anyone needs.
           #
           #   nix develop .#quantize --command python3 \
-          #       perf-data/harness/quantize_fp8.py <hf-dir>
+          #       perf-data/tools/quantize_fp8.py <hf-dir>
           #
           # From nix rather than pip because PyPI is unreachable from this box
           # (`pip download numpy` and `curl https://pypi.org/simple/` both time
@@ -459,6 +449,9 @@
                 ps.torch
                 ps.safetensors
                 ps.numpy
+                # Kimi-K3 ships a tiktoken model; its tokenizer conversion
+                # verifies every sampled id against the reference decoder.
+                ps.tiktoken
                 # scripts/glm52_prep_full.py reads the checkpoint's config.json
                 # through `transformers.AutoConfig`. GLM-5.2's full-model weight
                 # repack is a ~750 GB CPU/IO job and this shell is where it runs;
@@ -476,13 +469,78 @@
         # its closure is torch-sized. Same per-task-shell rule as `quantize`:
         #   nix develop .#vllm
         // pkgs.lib.optionalAttrs isGpuHost {
-          vllm = pkgs.mkShell {
-            name = "plow-vllm";
+          vllm = let
+            xgrammarClient = pkgs.python3Packages.xgrammar.overridePythonAttrs (old: {
+              version = "0.2.3";
+              src = pkgs.fetchFromGitHub {
+                owner = "mlc-ai";
+                repo = "xgrammar";
+                tag = "v0.2.3";
+                fetchSubmodules = true;
+                hash = "sha256-bznSz1fOCCGFR3NsuXm5eWo7EXrvBrFavEllC5+vDHM=";
+              };
+              patches = [ ];
+              doCheck = false;
+              build-system = old.build-system ++ [ pkgs.python3Packages.apache-tvm-ffi ];
+              dependencies = old.dependencies ++ [
+                pkgs.python3Packages.apache-tvm-ffi
+                pkgs.python3Packages.typing-extensions
+              ];
+            });
+            # `vllm bench serve` is a pure HTTP client. Building vLLM's CPU
+            # execution extension is unnecessary here and currently fails
+            # against nixpkgs' newer Torch API. Keep the upstream Python client
+            # and its declared dependencies, but omit only the server extension.
+            vllmClient = pkgs.python3Packages.vllm.overridePythonAttrs (old: {
+              version = "0.27.0";
+              src = pkgs.fetchFromGitHub {
+                owner = "vllm-project";
+                repo = "vllm";
+                rev = "v0.27.0";
+                hash = "sha256-ksKzkMDZGbqramOydhW49DU+p4lBteaAvvTKEjHfEAs=";
+              };
+              patches = [ ];
+              postPatch = "";
+              pyproject = null;
+              format = "other";
+              dontBuild = true;
+              doCheck = false;
+              pythonImportsCheck = [ ];
+              dependencies = map
+                (dep: if (dep.pname or "") == "xgrammar" then xgrammarClient else dep)
+                old.dependencies;
+              installPhase = ''
+                runHook preInstall
+                site="$out/${pkgs.python3.sitePackages}"
+                mkdir -p "$site" "$site/vllm-0.27.0.dist-info" "$out/bin"
+                cp -r vllm "$site/"
+                cat > "$site/vllm/_version.py" <<'EOF'
+                __version__ = "0.27.0"
+                __version_tuple__ = (0, 27, 0)
+                EOF
+                cat > "$site/vllm-0.27.0.dist-info/METADATA" <<'EOF'
+                Metadata-Version: 2.1
+                Name: vllm
+                Version: 0.27.0
+                EOF
+                cat > "$out/bin/vllm" <<'EOF'
+                #!/usr/bin/env python3
+                from vllm.entrypoints.cli.main import main
+                main()
+                EOF
+                chmod +x "$out/bin/vllm"
+                runHook postInstall
+              '';
+            });
+          in pkgs.mkShell {
+            name = "plow-vllm-client";
             packages = [
-              (pkgs.python3.withPackages (ps: [ ps.vllm ]))
+              (pkgs.python3.withPackages (_: [ vllmClient ]))
+              pkgs.jq
+              pkgs.curl
             ];
             shellHook = ''
-              echo "plow vllm shell — $(python3 -c 'import vllm; print("vllm", vllm.__version__)')"
+              echo "plow vllm client shell — $(python3 -c 'import vllm; print(vllm.__version__)')"
             '';
           };
         });

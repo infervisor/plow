@@ -68,6 +68,7 @@
 
 #include "../amd/hsa_backend.h"
 #include "../common/dev_isa.h"
+#include "k3_test_arch.h"
 
 /* The two fused opcodes. Defined here as a fallback ONLY so this file still compiles against a
  * dev_isa.h that predates them; if the header has them, the header wins and a drift in either
@@ -155,7 +156,7 @@ int main(int argc, char** argv) {
     fclose(f);
     if (plow_hsa_load_code_object(h, 0, co, co_n)) { printf("load failed\n"); return 1; }
     plow_hsa_kernel kern;
-    if (plow_hsa_get_kernel(h, 0, "plow_interp_dec_gfx950", &kern)) { printf("no kernel\n"); return 1; }
+    if (plow_hsa_get_kernel(h, 0, PLOW_K3_DECODE_KERNEL, &kern)) { printf("no kernel\n"); return 1; }
 
     /* ---- device buffers, one set per layer (the real thing has per-layer weights and a per-layer
      * state; sharing them would make this measure an L2 hit rate instead of a chain). ---- */
@@ -177,7 +178,7 @@ int main(int argc, char** argv) {
     for (int l = 0; l < L; l++) {
         for (int s = 0; s < 3; s++) {
             ly[l].raw[s] = DRND_BF(bp);
-            ly[l].mix[s] = DNEW(bp);
+            ly[l].mix[s] = DRND_BF(bp);
             ly[l].cw[s] = DRND_F32(cwb);
             ly[l].cs[s] = DRND_F32(cwb);
         }
@@ -272,9 +273,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    double ms[2];
-    long pk[2];
-    for (int mode = 0; mode < 2; mode++) {
+    double ms[3];
+    long pk[3];
+    for (int mode = 0; mode < 3; mode++) {
         g_nops = 0; g_nw = 0;
         int prev = -1;
         for (int l = 0; l < L; l++) {
@@ -309,7 +310,7 @@ int main(int argc, char** argv) {
                 g_inst[i_step].fj[0].f = SCALE;
                 for (int s = 0; s < 3; s++) addwait(i_step, i_conv[s], ALL);
                 addwait(i_step, i_gate, ALL);
-            } else {
+            } else if (mode == 1) {
                 /* ---- FUSED: one conv over the 3*P concatenated channel axis, and the gate
                  * folded into the state step's LDS staging. ---- */
                 int i_c3 = emitop(PLOW_DOP_KDA_CONV3, ALL);
@@ -336,6 +337,22 @@ int main(int argc, char** argv) {
                 g_inst[i_step].i[5] = (uint32_t)z->dtb; g_inst[i_step].i[6] = GMODE;
                 g_inst[i_step].fj[0].f = SCALE; g_inst[i_step].fj[1].f = LB;
                 addwait(i_step, i_c3, ALL);
+            } else {
+                /* Protocol lower bound for a sound Conv3+StateStepG fusion. The convolved inputs
+                 * are pre-populated, so this removes exactly the Conv3 packet and its gate while
+                 * retaining the shipping state-step and norm bodies. It is not a correctness
+                 * candidate: a real fused body must still compute the convolution from a
+                 * double-buffered window. */
+                i_step = emitop(PLOW_DOP_KDA_STATE_STEP_G, sb);
+                g_inst[i_step].t[0] = z->o; g_inst[i_step].t[1] = z->mix[0];
+                g_inst[i_step].t[2] = z->mix[1]; g_inst[i_step].t[3] = z->mix[2];
+                g_inst[i_step].t[4] = z->graw; g_inst[i_step].t[5] = z->braw;
+                g_inst[i_step].t[6] = z->state; g_inst[i_step].t[7] = z->alog;
+                g_inst[i_step].i[0] = T; g_inst[i_step].i[1] = H; g_inst[i_step].i[2] = D;
+                g_inst[i_step].i[3] = BV; g_inst[i_step].i[4] = 1;
+                g_inst[i_step].i[5] = (uint32_t)z->dtb; g_inst[i_step].i[6] = GMODE;
+                g_inst[i_step].fj[0].f = SCALE; g_inst[i_step].fj[1].f = LB;
+                if (prev >= 0) addwait(i_step, prev, ALL);
             }
             i_norm = emitop(PLOW_DOP_KDA_GATED_NORM, ALL);
             g_inst[i_norm].t[0] = z->y; g_inst[i_norm].t[1] = z->o;
@@ -404,10 +421,12 @@ int main(int argc, char** argv) {
         qsort(s, nrun, sizeof(double), cmpd);
         ms[mode] = s[nrun / 2];
         printf("\n%-6s  %4d packets (%.2f/layer)  median %.4f ms   min %.4f  p90 %.4f\n",
-               mode ? "FUSED" : "BASE", n_ops, (double)n_ops / L, s[nrun / 2], s[0],
+               mode == 0 ? "BASE" : (mode == 1 ? "FUSED" : "FLOOR"), n_ops,
+               (double)n_ops / L, s[nrun / 2], s[0],
                s[(nrun * 9) / 10]);
         printf("        per-CU work: conv %s, state-step %u of %u CUs (%.1f%%), items=%u\n",
-               mode ? "3*P/nblk channels" : "P/nblk channels", sb, NCU, 100.0 * sb / NCU, items);
+               mode == 0 ? "P/nblk channels" : (mode == 1 ? "3*P/nblk channels" : "omitted"),
+               sb, NCU, 100.0 * sb / NCU, items);
         free(s); free(zc); free(stream); free(sofs); free(slen);
     }
 
@@ -416,5 +435,7 @@ int main(int argc, char** argv) {
     printf("  chain wall     %.4f ms -> %.4f ms   (%+.1f%%)\n", ms[0], ms[1],
            100.0 * (ms[1] - ms[0]) / ms[0]);
     printf("  per packet     %.1f us -> %.1f us\n", ms[0] * 1e3 / pk[0], ms[1] * 1e3 / pk[1]);
+    printf("  conv-step lower bound  %.4f ms -> %.4f ms   (%+.1f%%, %+.4f ms)\n",
+           ms[1], ms[2], 100.0 * (ms[2] - ms[1]) / ms[1], ms[2] - ms[1]);
     return 0;
 }

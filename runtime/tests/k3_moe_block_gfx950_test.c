@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "../amd/hsa_backend.h"
+#include "k3_test_arch.h"
 #include "../common/dev_isa.h"
 
 typedef uint16_t bf16;
@@ -44,6 +45,12 @@ static float b2f(bf16 b) {
     union { uint32_t u; float f; } c;
     c.u = (uint32_t)b << 16;
     return c.f;
+}
+static void upload_or_die(plow_hsa* h, void* dst, const void* src, size_t bytes) {
+    if (plow_hsa_upload(h, 0, dst, src, bytes)) {
+        fprintf(stderr, "upload %zu failed: %s\n", bytes, plow_hsa_last_error());
+        exit(1);
+    }
 }
 
 static PlowDevInst g_inst[512];
@@ -115,7 +122,7 @@ int main(int argc, char** argv) {
     fclose(f);
     if (plow_hsa_load_code_object(h, 0, co, co_n)) { printf("load failed\n"); return 1; }
     plow_hsa_kernel kern;
-    if (plow_hsa_get_kernel(h, 0, "plow_interp_dec_gfx950", &kern)) { printf("no kernel\n"); return 1; }
+    if (plow_hsa_get_kernel(h, 0, PLOW_K3_DECODE_KERNEL, &kern)) { printf("no kernel\n"); return 1; }
 
     int fd = open(fix, O_RDONLY);
     if (fd < 0) { perror(fix); return 1; }
@@ -205,7 +212,7 @@ int main(int argc, char** argv) {
     }
 
 #define DUP(ptr, bytes) ({ void* _d = plow_hsa_alloc(h, 0, (bytes)); \
-                           plow_hsa_upload(h, 0, _d, (ptr), (bytes)); reg(_d); })
+                           upload_or_die(h, _d, (ptr), (bytes)); reg(_d); })
 #define DNEW(bytes) ({ void* _d = plow_hsa_alloc(h, 0, (bytes)); reg(_d); })
     const size_t tp = (size_t)T * P, thid = (size_t)T * HID;
     int t_prefix_in = DUP(P_prefix_in, thid * 2);
@@ -245,7 +252,7 @@ int main(int argc, char** argv) {
         const size_t sz[6] = { W1P, W1S, W1P, W1S, W2P, W2S };
         for (int q = 0; q < 6; q++) {
             dw[q] = plow_hsa_alloc(h, 0, sz[q]);
-            plow_hsa_upload(h, 0, dw[q], P_exp[j][q], sz[q]);
+            upload_or_die(h, dw[q], P_exp[j][q], sz[q]);
             exp_bytes += sz[q];
         }
         const unsigned e = P_eid[j];
@@ -462,7 +469,7 @@ int main(int argc, char** argv) {
         slen[cu] = (uint32_t)si - sofs[cu];
     }
     void* d_tens = plow_hsa_alloc(h, 0, (size_t)g_nt * sizeof(void*));
-    plow_hsa_upload(h, 0, d_tens, g_tens, (size_t)g_nt * sizeof(void*));
+    upload_or_die(h, d_tens, g_tens, (size_t)g_nt * sizeof(void*));
     void* d_inst = plow_hsa_alloc(h, 0, (size_t)n_ops * sizeof(PlowDevInst));
     void* d_stream = plow_hsa_alloc(h, 0, total * sizeof(PlowStreamEnt));
     void* d_sofs = plow_hsa_alloc(h, 0, 4u * NCU);
@@ -470,14 +477,14 @@ int main(int argc, char** argv) {
     void* d_waits = plow_hsa_alloc(h, 0, (size_t)(g_nw ? g_nw : 1) * sizeof(PlowWait));
     void* d_succs = plow_hsa_alloc(h, 0, (size_t)n_ops * 4);
     void* d_ctr = plow_hsa_alloc(h, 0, (size_t)n_ops * PLOW_CTR_STRIDE * 4);
-    plow_hsa_upload(h, 0, d_inst, g_inst, (size_t)n_ops * sizeof(PlowDevInst));
-    plow_hsa_upload(h, 0, d_stream, stream, total * sizeof(PlowStreamEnt));
-    plow_hsa_upload(h, 0, d_sofs, sofs, 4u * NCU);
-    plow_hsa_upload(h, 0, d_slen, slen, 4u * NCU);
-    if (g_nw) plow_hsa_upload(h, 0, d_waits, g_wait, (size_t)g_nw * sizeof(PlowWait));
-    plow_hsa_upload(h, 0, d_succs, g_succ, (size_t)n_ops * 4);
+    upload_or_die(h, d_inst, g_inst, (size_t)n_ops * sizeof(PlowDevInst));
+    upload_or_die(h, d_stream, stream, total * sizeof(PlowStreamEnt));
+    upload_or_die(h, d_sofs, sofs, 4u * NCU);
+    upload_or_die(h, d_slen, slen, 4u * NCU);
+    if (g_nw) upload_or_die(h, d_waits, g_wait, (size_t)g_nw * sizeof(PlowWait));
+    upload_or_die(h, d_succs, g_succ, (size_t)n_ops * 4);
     uint32_t* zc = calloc((size_t)n_ops * PLOW_CTR_STRIDE, 4);
-    plow_hsa_upload(h, 0, d_ctr, zc, (size_t)n_ops * PLOW_CTR_STRIDE * 4);
+    upload_or_die(h, d_ctr, zc, (size_t)n_ops * PLOW_CTR_STRIDE * 4);
     PlowProgram prog; memset(&prog, 0, sizeof(prog));
     prog.insts = d_inst; prog.stream = d_stream; prog.stream_ofs = d_sofs; prog.stream_len = d_slen;
     prog.waits = d_waits; prog.succs = d_succs; prog.counters = d_ctr;
@@ -487,6 +494,7 @@ int main(int argc, char** argv) {
         printf("LAUNCH FAILED\n");
         return 1;
     }
+    if (plow_hsa_wait(h, 0)) { printf("WAIT FAILED\n"); return 1; }
 
     bf16* o_ha = malloc(thid * 2); bf16* o_x = malloc(thid * 2);
     bf16* o_attn = malloc(thid * 2); bf16* o_prefix = malloc(thid * 2);

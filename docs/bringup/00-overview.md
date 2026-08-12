@@ -25,15 +25,31 @@ Stages are ordered by dependency, not by wall-clock share: in practice stages
 4–7 dominate the effort, and stages 4/5 iterate (a block-sweep finding often
 sends you back to kernel tuning).
 
+## The target is a parameter, not a constant
+
+**Stages 1–3 are target-independent.** They compile and prove; nothing in them
+names a GPU, and their gates hold on any host with the dev shell.
+
+**Stages 4–7 are not.** A roofline %, a block latency, a serving recipe and a
+campaign number are each a statement about one specific part. Before starting
+Stage 4, fill in the parameter block in [`target.md`](target.md) — `$VENDOR`,
+`$ISA`, `$GPU`, `$NCU`, `$NGPU`, `$PARALLEL`, `$MAXCTX`, `$TOOLCHAIN`,
+`$BUILD`, `$FEATURES`, `$BW_BOUND`, `$COMPUTE_CEIL`, `$RESULTS` — and carry it
+through stages 4–7 and their agent prompts. Those docs are written in terms of
+those names; a row you cannot fill is a blocker, not a default.
+
 ## Conventions that apply to every stage
 
 - **Build through nix.** `nix develop --command bash -c '<cargo …>'` — there is
   no cargo on PATH outside the dev shell. GPU kernel builds are separate
-  scripts (`scripts/build_*.sh`), not cargo.
+  scripts (`$BUILD`, i.e. `scripts/build_*.sh`), not cargo.
+- **Never hardcode a part.** Commands are written `--gpu $GPU --arch $ISA`; the
+  flags themselves are catalogued in
+  [`docs/flags-reference.md`](../flags-reference.md).
 - **One lever at a time.** Historical campaigns that changed two knobs in one
   run always paid for it in attribution time.
 - **Same-session measurement.** Any A/B comparison must run both arms in the
-  same GPU lease (`perf-data/harness/gpulease`); cross-session numbers drift.
+  same GPU lease (`perf-data/tools/gpulease`); cross-session numbers drift.
 - **Honest reporting.** Results are quantified, caveated, and neutral — no
   win/loss framing. A measurement that refutes the hypothesis is a result,
   not a failure; write it down (the tree keeps several such write-ups in
@@ -44,6 +60,7 @@ sends you back to kernel tuning).
 
 ## Where things live
 
+- `docs/bringup/target.md` — the parameter block stages 4–7 are written against.
 - `docs/bringup/NN-*.md` — stage playbooks (this directory).
 - `docs/bringup/agents/NN-*.md` — per-stage agent prompts.
 - `docs/arch/` — the architecture chapters the playbooks cite.

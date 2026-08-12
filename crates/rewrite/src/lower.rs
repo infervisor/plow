@@ -241,31 +241,33 @@ fn term_for(
                 nn_graph::op::LinearAttnKind::KimiDelta => "kimi_delta",
             };
             format!(
-                "(LinearAttention {} {} {} {} {} {} {} {})",
+                "(LinearAttention {} {} {} {} {} {} {} {} {} {})",
                 e(0)?,
                 e(1)?,
                 e(2)?,
                 e(3)?,
                 e(4)?,
+                e(5)?,
+                e(6)?,
                 quote(k),
                 num_heads,
                 head_dim
             )
         }
-        // Inputs are `[prefix, snapshot_0, .., snapshot_n, score_weight]`. The
-        // snapshot count varies per layer, so it lowers to a cons chain rather
-        // than a fixed-arity constructor — every snapshot stays a named leaf.
+        // Variable snapshots lower to a cons chain; both checkpoint weights remain leaves.
         Op::BlockResidual { max_snapshots } => {
-            let last = inputs.len() - 1;
+            let norm = inputs.len() - 2;
+            let proj = inputs.len() - 1;
             let mut chain = String::from("(SnapNil)");
-            for i in (1..last).rev() {
+            for i in (1..norm).rev() {
                 chain = format!("(SnapCons {} {})", expr_of(g, inputs[i], var)?, chain);
             }
             format!(
-                "(BlockResidual {} {} {} {})",
+                "(BlockResidual {} {} {} {} {})",
                 e(0)?,
                 chain,
-                expr_of(g, inputs[last], var)?,
+                expr_of(g, inputs[norm], var)?,
+                expr_of(g, inputs[proj], var)?,
                 max_snapshots
             )
         }

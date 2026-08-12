@@ -475,8 +475,9 @@ struct PrefillBucket {
     _tables: Vec<DeviceMem>,
 }
 
-/// The per-model GPU engine: one loaded decode program, one KV cache, one
-/// live sequence. `begin()` resets the sequence; `step()` advances it.
+/// The per-model GPU engine: the widest decode program, one KV cache, and its
+/// sequence slots. A packet may advertise narrower decode rungs; loading those
+/// as execution states is a separate scheduling optimization.
 pub struct GpuEngine {
     be: Arc<CudaBackend>,
     f: KernelFn,
@@ -1575,6 +1576,28 @@ impl GpuEngine {
                 (module, f, kname, smem, grid, dec_source, image_len)
             }
         };
+        let gemv_mm_cap = be.module_global_u32(&module, "plow_gemv_mm_cap")?;
+        if gemv_mm_cap == Some(0) {
+            return Err(RuntimeError::Device(
+                "decode interpreter advertises GV_MM_MAX=0 — its GEMV row walk cannot make progress"
+                    .into(),
+            ));
+        }
+        let decode_rungs = blob.decode_rungs();
+        if let Some(cap) = gemv_mm_cap {
+            let widest = decode_rungs.last().copied().unwrap_or(1);
+            tracing::info!(
+                ?decode_rungs,
+                gemv_mm_cap = cap,
+                gemv_weight_passes = widest.div_ceil(cap),
+                "NVIDIA decode capacity metadata"
+            );
+        } else if decode_rungs.len() > 1 {
+            tracing::warn!(
+                ?decode_rungs,
+                "decode ladder uses a legacy NVIDIA object without GV_MM_MAX metadata"
+            );
+        }
 
         // ---- VMM prefix sharing (PLOW_VMM_PREFIX=1; default off) ----
         let vmm = {
@@ -2085,7 +2108,8 @@ impl GpuEngine {
         let decode_t0 = load_tim.as_ref().map(|t| t.ms_since_t0()).unwrap_or(0.0);
         let sys_decode = std::time::SystemTime::now();
         let pf_batch_env = crate::config::RuntimeConfig::get().nv.pf_batch;
-        let pf_max_t_blob = blob.progs[..blob.progs.len().saturating_sub(1)]
+        let pf_max_t_blob = blob
+            .prefill_progs()
             .iter()
             .map(|g| g.t as usize)
             .max()
@@ -3797,8 +3821,8 @@ impl GpuEngine {
         self.prefill[self.pick_prefill_bucket(avail, usize::MAX)].t as usize
     }
 
-    /// Bring up the `_pf` prefill object and upload every non-decode (all but
-    /// the last) bucket program. Port of the harness `prep_prog` for the prefill objects:
+    /// Bring up the `_pf` prefill object and upload every prefill bucket program.
+    /// Port of the harness `prep_prog` for the prefill objects:
     /// upload tables, verify the single coarse segment, and precompute the
     /// per-chunk patch sites. Returns `Err` (prefill then disabled) if the cubin
     /// grid disagrees with `n_cu`, a bucket is segmented, or the GQ appendix is
@@ -3987,9 +4011,7 @@ impl GpuEngine {
             Ok(mem)
         };
         let mut buckets = Vec::new();
-        // Every program but the last (the decode program, t == B) is a
-        // prefill bucket.
-        for g in &blob.progs[..blob.progs.len().saturating_sub(1)] {
+        for g in blob.prefill_progs() {
             // Wave-class segmented programs are legal exactly when the SegPf pair is
             // loaded: segments launch per class in order. Otherwise the coarse
             // single-segment contract holds as before.

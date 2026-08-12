@@ -368,6 +368,10 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-ctr-dbuf", env = "PLOW_CTR_DBUF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub ctr_dbuf: bool,
 
+    /// Clear per-slot recurrent state with one device kernel per rank.
+    #[arg(long = "amd-state-clear-device", env = "PLOW_STATE_CLEAR_DEVICE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub state_clear_device: bool,
+
     /// Global-queue scheduler. "0" = static per-block-stream, "1" = GQ.
     #[arg(long = "amd-global-queue", env = "PLOW_GLOBAL_QUEUE", global = true)]
     pub global_queue: Option<String>,
@@ -443,6 +447,14 @@ pub struct AmdRuntimeConfig {
     /// Disable redundant-rank audit (for timing runs).
     #[arg(long = "amd-tp-no-audit", env = "PLOW_TP_NO_AUDIT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_no_audit: bool,
+
+    /// Read the TP counter audit through host-mapped large BAR memory.
+    #[arg(long = "amd-tp-audit-direct", env = "PLOW_TP_AUDIT_DIRECT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_audit_direct: bool,
+
+    /// Compact the exact TP counter audit on device, then read one status word per rank.
+    #[arg(long = "amd-tp-audit-compact", env = "PLOW_TP_AUDIT_COMPACT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub tp_audit_compact: bool,
 
     /// Override prefill pad/launch-rows tradeoff.
     #[arg(long = "amd-launch-rows", env = "PLOW_LAUNCH_ROWS", global = true)]

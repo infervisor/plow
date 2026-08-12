@@ -175,3 +175,30 @@ fn full_fusion_preserves_all_weights() {
 
     assert_eq!(fused_w, graph_w, "fusion altered the weight manifest");
 }
+
+/// A K3 MLA layer without an output gate must not acquire one during rewriting.
+#[test]
+fn kimi_k3_ungated_mla_does_not_fuse_an_output_gate() {
+    let json = r#"{
+        "model_type": "kimi_k3",
+        "text_config": {
+          "vocab_size": 100, "hidden_size": 64, "intermediate_size": 128,
+          "num_hidden_layers": 2, "num_attention_heads": 2,
+          "q_lora_rank": 16, "kv_lora_rank": 16,
+          "qk_rope_head_dim": 8, "qk_nope_head_dim": 16, "v_head_dim": 16,
+          "num_experts": 4, "num_experts_per_token": 2, "num_shared_experts": 1,
+          "moe_intermediate_size": 32, "routed_expert_hidden_size": 32,
+          "first_k_dense_replace": 2, "attn_res_block_size": 2,
+          "linear_attn_config": {
+            "num_heads": 2, "head_dim": 16, "short_conv_kernel_size": 4,
+            "use_full_rank_gate": true,
+            "full_attn_layers": [1], "kda_layers": [2]
+          }
+        }
+    }"#;
+    let g = build_from_config_json(json).expect("build K3");
+    let (fused, _) = rewrite::rewrite_graph(&g).expect("rewrite");
+
+    assert!(fused.contains("FusedKdaGatedNorm"));
+    assert!(!fused.contains("FusedMlaOutGate"));
+}

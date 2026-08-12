@@ -183,6 +183,33 @@ const WG_THREADS_8: u32 = 8 * 64;
 /// `INVALID_ISA`, not a slowdown.
 const WG_THREADS_4: u32 = 4 * 64;
 
+/// Host dispatch semantics for a program whose stream carries `seg` tags.
+///
+/// L2 placement reuses those tags for domains that drain concurrently inside
+/// one launch. Only ordinary wave-class segments are separate host launches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProgramDispatch {
+    L2Domains(u32),
+    WaveSegments(usize),
+}
+
+impl ProgramDispatch {
+    pub(crate) fn classify(l2_domains: u32, n_segments: usize) -> Self {
+        if l2_domains != 0 {
+            Self::L2Domains(l2_domains)
+        } else {
+            Self::WaveSegments(n_segments)
+        }
+    }
+
+    pub(crate) fn launches(self) -> usize {
+        match self {
+            Self::L2Domains(_) => 1,
+            Self::WaveSegments(n) => n,
+        }
+    }
+}
+
 /// Sanity bound on `seg`, so a corrupt stream cannot make the host allocate
 /// unboundedly. Was 512 — the width of the reference driver's `seg_class[512]`.
 ///
@@ -573,6 +600,7 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
 /// object would refuse every GLM asset in the tree. Each check therefore only looks at the flags
 /// ITS table names and leaves the rest to the other phase.
 const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
+    ("PLOW_KDA_CONV_STEP_DB", &["plow_kda_conv_step_db_arm"]),
     // The GLM decode q-rope fold (op 50 t7 = cos, i6 = sin handle, t3 = RAW q_rope). An object
     // built before the arm stages t3 verbatim — an UNROPED query into the flash. Attention still
     // runs, nothing traps, and the model answers fluently and wrongly. This is the same silent
@@ -915,6 +943,15 @@ fn is_lm_head_matmul(op: u16) -> bool {
 /// Present iff the axis is on, so absence is not ambiguous: every object built before the axis
 /// existed, and every object built with it off, carries no such symbol and has no K3 arm.
 const K3_ARMS_SYM: &str = "plow_k3_arms_1";
+const MOE_PF_A4W4_SYM: &str = "plow_moe_pf_a4w4_arm";
+const KDA_CONV_STEP_DB_SYM: &str = "plow_kda_conv_step_db_arm";
+const KDA_CONV_STEP_DB_REPLACED_OPS: &[DevOp] = &[
+    DevOp::KdaConv,
+    DevOp::KdaGate,
+    DevOp::KdaStateStep,
+    DevOp::KdaConv3,
+    DevOp::KdaStateStepG,
+];
 
 /// Every opcode that reaches an arm behind `PLOW_K3` in `runtime/amd/interp.hip`.
 ///
@@ -931,6 +968,7 @@ const K3_ARM_OPS: &[DevOp] = &[
     DevOp::KdaGatedNorm,
     DevOp::KdaConv3,
     DevOp::KdaStateStepG,
+    DevOp::KdaConvStateStepG,
     DevOp::AttnRes,
     DevOp::SituGlu,
     DevOp::MlaOutGate,
@@ -942,6 +980,68 @@ fn required_k3_op(progs: &[DevProg]) -> Option<DevOp> {
         .iter()
         .flat_map(|p| p.insts.iter())
         .find_map(|i| K3_ARM_OPS.iter().copied().find(|&o| o as u16 == i.op))
+}
+
+fn required_moe_pf_a4w4(progs: &[DevProg]) -> Option<DevOp> {
+    progs.iter().flat_map(|p| p.insts.iter()).find_map(|i| {
+        let op = DevOp::from_u16(i.op)?;
+        ((op == DevOp::MoeGroupGluPf || op == DevOp::MoeGroupDownPf)
+            && i.i[MOE_PF_ENC_SLOT] == MOE_ENC_MXFP4)
+            .then_some(op)
+    })
+}
+
+fn required_kda_conv_step_db(progs: &[DevProg]) -> Option<DevOp> {
+    first_op_in(progs, &[DevOp::KdaConvStateStepG])
+}
+
+fn check_kda_conv_step_db(
+    syms: &[&str],
+    path: &Path,
+    need: Option<DevOp>,
+    legacy: Option<DevOp>,
+) -> Result<()> {
+    let armed = syms.contains(&KDA_CONV_STEP_DB_SYM);
+    if let Some(op) = need {
+        if armed {
+            return Ok(());
+        }
+        return Err(RuntimeError::Device(format!(
+            "packet/object KDA Conv3+state MISMATCH: this packet dispatches {op:?} (op {}), but \
+             {} was compiled without PLOW_KDA_CONV_STEP_DB (it does not advertise \
+             `{KDA_CONV_STEP_DB_SYM}`). Rebuild the K3 decode object with \
+             -DPLOW_KDA_CONV_STEP_DB=1.",
+            op as u16,
+            path.display()
+        )));
+    }
+    if let (true, Some(op)) = (armed, legacy) {
+        return Err(RuntimeError::Device(format!(
+            "packet/object KDA Conv3+state MISMATCH: {} advertises `{KDA_CONV_STEP_DB_SYM}` and \
+             replaces the legacy {op:?} arm (op {}), but the packet still dispatches it. Use the \
+             default K3 decode object or re-emit with PLOW_K3_KDA_CONV_STEP_DB=1.",
+            path.display(),
+            op as u16
+        )));
+    }
+    Ok(())
+}
+
+fn check_moe_pf_a4w4(syms: &[&str], path: &Path, need: Option<DevOp>) -> Result<()> {
+    let Some(op) = need else {
+        return Ok(());
+    };
+    if syms.contains(&MOE_PF_A4W4_SYM) {
+        return Ok(());
+    }
+    Err(RuntimeError::Device(format!(
+        "packet/object A4W4 MISMATCH: this packet dispatches {op:?} (op {}) with MXFP4 encoding, \
+         but {} was compiled without PLOW_MOE_PF_A4W4 (it does not advertise \
+         `{MOE_PF_A4W4_SYM}`). The kernel refusal path writes NaNs by design. Rebuild the object \
+         with -DPLOW_MOE_PF_A4W4=1.",
+        op as u16,
+        path.display()
+    )))
 }
 
 /// Refuse a code object that has no K3/KDA arms against a packet that dispatches one.
@@ -1268,8 +1368,9 @@ pub fn mla_pf_v2_enabled() -> bool {
     crate::config::RuntimeConfig::get().amd.mla_pf_v2
 }
 
-/// The V2 arm's marker symbol (see `plow_mla_pf_v2_arm_1` in interp.hip).
+/// The V2 arms' marker symbols (see `interp.hip`).
 const MLA_PF_V2_SYM: &str = "plow_mla_pf_v2_arm_1";
+const MLA_PF_V2_FP8_SYM: &str = "plow_mla_pf_v2_fp8_arm_1";
 
 /// Per-segment wave class, derived from the stream.
 ///
@@ -1278,12 +1379,15 @@ const MLA_PF_V2_SYM: &str = "plow_mla_pf_v2_arm_1";
 /// 8. The fp8 twin is included here and is NOT in the reference — omitting it
 /// silently ran fp8-KV flash segments on the 8-wave object.
 ///
-/// Under `PLOW_MLA_PF_V2=1`, `FlashMlaPrefill` (bf16, op 51) is class 4 too — but only in
+/// Under `PLOW_MLA_PF_V2=1`, the bf16 and fp8-KV MLA prefill ops (51 and 110) are class 4 too — but only in
 /// programs whose bucket is big enough to fill the machine at the V2 kernel's BQ=64 work
 /// decomposition (`t >= 2048`: 256+ items over 304 CUs). Smaller buckets keep the 8-wave
-/// kernel, whose BQ=32 fills at half the tokens. The fp8 twin (op 110) NEVER routes here —
-/// the V2 arm is bf16-only.
+/// kernel, whose BQ=32 fills at half the tokens.
 pub fn derive_segments(prog: &DevProg) -> Result<Vec<u8>> {
+    derive_segments_for(prog, mla_pf_v2_enabled() && prog.t >= 2048)
+}
+
+fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
     let mut n_seg: u32 = 1;
     for e in &prog.stream {
         let s = e.seg as u32 + 1;
@@ -1303,7 +1407,6 @@ pub fn derive_segments(prog: &DevProg) -> Result<Vec<u8>> {
     // the split fails the purity test and stays whole on the 8-wave object; a split blob run
     // without the env falls to the t/env guard and likewise runs 8-wave. Either mismatch
     // degrades, never corrupts.
-    let v2 = mla_pf_v2_enabled() && prog.t >= 2048;
     let mut mla_pure = vec![v2; n_seg as usize];
     let mut needs_v2: Vec<(usize, u32)> = Vec::new();
     let mut mla_any = vec![false; n_seg as usize];
@@ -1321,7 +1424,7 @@ pub fn derive_segments(prog: &DevProg) -> Result<Vec<u8>> {
             .op;
         if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
             class[e.seg as usize] = 4;
-        } else if op == DevOp::FlashMlaPrefill as u16 {
+        } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
             // A dense causal KV-split packet (i6 = ns, no union table in t7) writes ns
             // partials per (token, head) and the merge reads ns of them. The 8-wave
             // fallback kernel writes the nsplit=1 layout — so the env/routing mismatches
@@ -1336,7 +1439,10 @@ pub fn derive_segments(prog: &DevProg) -> Result<Vec<u8>> {
             // on the 8-wave kernel anyway -- while `v2` is true so the old guard stayed silent.
             // The requirement is not "the env is set", it is "THIS packet's segment was actually
             // routed to the V2 arm", which is only known once the class pass below has run.
-            if d.i[6] > 1 && d.t[7] == packet::dev::TENSOR_NONE16 {
+            if op == DevOp::FlashMlaPrefill as u16
+                && d.i[6] > 1
+                && d.t[7] == packet::dev::TENSOR_NONE16
+            {
                 needs_v2.push((e.seg as usize, d.i[6]));
             }
             mla_any[e.seg as usize] = true;
@@ -2727,6 +2833,7 @@ const KDA_ROW_COUNT_OPS: &[DevOp] = &[
     DevOp::KdaGate,
     DevOp::KdaStateStep,
     DevOp::KdaStateStepG,
+    DevOp::KdaConvStateStepG,
     DevOp::KdaGatedNorm,
 ];
 
@@ -2885,6 +2992,19 @@ fn rebase_chunk_rows(
     }
 }
 
+fn patch_tp_xaudit(insts: &mut [DevInst64], status_id: u32) {
+    for d in insts {
+        if matches!(
+            DevOp::from_u16(d.op),
+            Some(
+                DevOp::XReduce | DevOp::XReduceTwoShot | DevOp::XReduceAddNorm | DevOp::XArgmaxFin
+            )
+        ) {
+            d.i[7] = status_id + 1;
+        }
+    }
+}
+
 /// This rank's place in a TP group — everything the engine needs from
 /// [`crate::exec::tp::TpGroup`], as plain device addresses.
 ///
@@ -2909,6 +3029,8 @@ pub struct TpBind {
     /// This rank's cross-GPU counters, inside its own peer region —
     /// `PlowProgram::xctr`. From `TpRank::xctr`.
     pub xctr: u64,
+    /// Reserved xctr id used by the compact device audit status line.
+    pub xstatus_id: u32,
     /// This rank's peer-region base (`peer_scratch[rank]`). `act.og_tp` binds at
     /// offset 0 and `act.dg_tp` at [`TpBind::slot_b`], so the row-parallel
     /// o_proj/down write their partials where peers can read them.
@@ -2918,6 +3040,72 @@ pub struct TpBind {
     /// rather than recomputed: a host that computed its own would put `dg_tp`
     /// where no peer reads it, and nothing would say so.
     pub slot_b: u64,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct XAuditArgs {
+    insts: u64,
+    n_inst: u32,
+    _pad: u32,
+    xctr: u64,
+    n_xctr: u32,
+    n_gpu: u32,
+    status: u64,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct StateClearRange {
+    base: u64,
+    slot_stride: u64,
+    words: u32,
+    _pad: u32,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct StateClearArgs {
+    ranges: u64,
+    n_ranges: u32,
+    slot: u32,
+}
+
+const STATE_CLEAR_CHUNK: u64 = 256 * 1024;
+
+fn state_clear_ranges(
+    devp: &[DeviceMem],
+    carried: &[(usize, u64)],
+) -> Result<Vec<StateClearRange>> {
+    let mut out = Vec::new();
+    for &(i, stride) in carried {
+        let m = devp.get(i).ok_or_else(|| {
+            RuntimeError::Device(format!("carried-state tensor index {i} is out of range"))
+        })?;
+        if m.base == 0 || stride == 0 {
+            continue;
+        }
+        if m.base % 4 != 0 || stride % 4 != 0 {
+            return Err(RuntimeError::Device(format!(
+                "carried-state range {i} is not u32-aligned: base={:#x} stride={stride}",
+                m.base
+            )));
+        }
+        let mut off = 0;
+        while off < stride {
+            let bytes = (stride - off).min(STATE_CLEAR_CHUNK);
+            out.push(StateClearRange {
+                base: m.base + off,
+                slot_stride: stride,
+                words: u32::try_from(bytes / 4).map_err(|_| {
+                    RuntimeError::Device(format!("carried-state clear chunk is too large: {bytes}"))
+                })?,
+                _pad: 0,
+            });
+            off += bytes;
+        }
+    }
+    Ok(out)
 }
 
 /// One chunk of a prefill plan: which bucket program runs it, and over which
@@ -2932,9 +3120,69 @@ pub struct ChunkStep {
     pub clen: u32,
 }
 
+/// Per-program local counter-bank state.
+///
+/// TP keeps `current` on the bank used by the last dispatch so diagnostic
+/// snapshots still read that dispatch's counters. The other bank must be
+/// re-armed successfully before a later TP dispatch may select it.
+struct CounterBankState {
+    current: Cell<u32>,
+    inactive_ready: Cell<bool>,
+}
+
+impl CounterBankState {
+    fn new() -> Self {
+        Self {
+            current: Cell::new(0),
+            // Both banks are zeroed at allocation time.
+            inactive_ready: Cell::new(true),
+        }
+    }
+
+    fn current(&self) -> u32 {
+        self.current.get()
+    }
+
+    fn inactive(&self) -> u32 {
+        1 - self.current()
+    }
+
+    fn inactive_ready(&self) -> bool {
+        self.inactive_ready.get()
+    }
+
+    /// Select the already-clean inactive bank for a TP dispatch.
+    ///
+    /// Returns `false` for the single-bank fallback, whose caller must re-arm
+    /// the current bank synchronously. A failed/omitted inactive clear leaves
+    /// `inactive_ready == false`, so stale local counters cannot be reused.
+    fn begin_tp(&self, double_buffered: bool) -> std::result::Result<bool, ()> {
+        if !double_buffered {
+            return Ok(false);
+        }
+        if !self.inactive_ready.replace(false) {
+            return Err(());
+        }
+        self.current.set(self.inactive());
+        Ok(true)
+    }
+
+    fn mark_inactive_ready(&self) {
+        self.inactive_ready.set(true);
+    }
+
+    fn select_rearmed_inactive(&self) {
+        self.current.set(self.inactive());
+        // The old current bank was dirtied by the dispatch that just launched.
+        self.inactive_ready.set(false);
+    }
+}
+
 /// One program's device-resident tables.
 struct AmdProg {
     t: u32,
+    n_inst: u32,
+    trace_records: usize,
     n_counter: u32,
     d_inst: DeviceMem,
     d_stream: DeviceMem,
@@ -2963,9 +3211,9 @@ struct AmdProg {
     /// Bytes in ONE counter bank — `n_counter * CTR_STRIDE_U32 * 4`, i.e. what
     /// the old single-bank allocation was in total.
     ctr_span: u64,
-    /// Which bank the NEXT dispatch of this program runs out of; 0 unless
-    /// [`ctr_dbuf`] is on. See [`AmdEngine::run`].
-    bank: Cell<u32>,
+    /// Local counter/cursor bank state. See [`AmdEngine::run`] and the TP
+    /// begin/post-launch methods.
+    bank: CounterBankState,
 }
 
 struct AmdGq {
@@ -3044,18 +3292,20 @@ pub struct AmdEngine {
     /// so dropping them would free the memory those tables point at.
     _expert_bufs: Vec<DeviceMem>,
 
-    /// Per-(workgroup, packet) `PlowTraceRec` buffer for the DECODE program,
+    /// Per-(workgroup, packet) `PlowTraceRec` buffer for the widest program,
     /// allocated only when `PLOW_TRACE_RAW` is set. The interpreter treats a
     /// null `trace` pointer as "tracing off" and then does not even read the
     /// clock, so an untraced build pays nothing for this field being here.
     ///
-    /// Decode only: it is the packet chain the protocol cost lives on, and a
-    /// prefill program's stream is an order of magnitude larger.
     d_trace: Option<DeviceMem>,
     trace_bytes: usize,
+    /// Extent of the last program dispatched into `d_trace`.
+    trace_write_bytes: Cell<usize>,
 
     k_prefill: HsaKernel,
     k_decode: HsaKernel,
+    k_xaudit: Option<HsaKernel>,
+    k_state_clear: Option<HsaKernel>,
     /// Task-13: low-rung decode tier ladder, ascending (max_rung, kernel).
     decode_tiers: Vec<(u32, HsaKernel)>,
     k_flash: Option<HsaKernel>,
@@ -3074,6 +3324,8 @@ pub struct AmdEngine {
     h_zero: HsaPinned,
     /// Pinned staging for a prefill program's whole instruction array.
     h_pf_inst: HsaPinned,
+    d_state_clear: Option<DeviceMem>,
+    n_state_clear: u32,
     /// Pristine host copy of each program's instructions. Prefill patching
     /// rebuilds from these every chunk: `c0` changes per chunk, so patches must
     /// not accumulate.
@@ -3123,6 +3375,11 @@ pub struct AmdEngine {
     /// Per-slot snapshot of `carried_slot` taken at a prompt prefix boundary,
     /// for [`AmdEngine::restore_carried`]. `None` until a slot arms one.
     prefix_snap: Vec<Option<DeviceMem>>,
+    /// `(alternate bank, legacy bank, bytes)` for the B1 KDA conv-window ping-pong arm.
+    kda_conv_bank_pairs: Vec<(u64, u64, u64)>,
+    /// Legacy prefill updates only bank 0; a set bit requires one bank0→bank1 mirror before
+    /// decode selects a source by absolute-position parity.
+    kda_conv_alt_stale: Vec<bool>,
     /// VMM-backed FULL-attention KV, or `None` for the flat allocation.
     ///
     /// The tensor table still holds ONE base per `kv.{l}.{k,v}` and
@@ -3327,7 +3584,15 @@ impl AmdEngine {
         // stronger than the env var ever was -- `plow_l2_place_dispatch_1` is checked against the
         // OBJECT below, so a genuinely mismatched pairing is still refused, by inspection instead
         // of by assertion. PLOW_L2_PLACE_DISPATCH=1 still works for anyone scripting it.
-        let blob = DevBlob::parse_l2(&raw, true)?;
+        let mut blob = DevBlob::parse_l2(&raw, true)?;
+        let tp_audit_compact =
+            tp.is_some() && crate::config::RuntimeConfig::get().amd.tp_audit_compact;
+        if tp_audit_compact {
+            let status_id = tp.expect("checked").xstatus_id;
+            for p in &mut blob.progs {
+                patch_tp_xaudit(&mut p.insts, status_id);
+            }
+        }
         // WHICH PHASE is L2-placed, not "is anything placed". `Builder::finish` skips placement
         // per PROGRAM when that program is segmented, and AMD prefill always is -- so a normal
         // gfx942 blob has a PLACED DECODE program and UNPLACED prefill ones. Requiring the
@@ -3510,6 +3775,30 @@ impl AmdEngine {
         // asked about the phase it actually serves rather than about the blob as a whole.
         let need_k3_decode = required_k3_op(&blob.progs[dec_ix..]);
         let need_k3_prefill = required_k3_op(&blob.progs[..dec_ix]);
+        let need_a4w4_decode = required_moe_pf_a4w4(&blob.progs[dec_ix..]);
+        let need_kda_conv_step_db = required_kda_conv_step_db(&blob.progs[dec_ix..]);
+        let legacy_kda_decode = first_op_in(&blob.progs[dec_ix..], KDA_CONV_STEP_DB_REPLACED_OPS);
+        if let Some(p) = blob.progs[..dec_ix].iter().find(|p| {
+            p.insts
+                .iter()
+                .any(|i| i.op == DevOp::KdaConvStateStepG as u16)
+        }) {
+            return Err(RuntimeError::Device(format!(
+                "KdaConvStateStepG is B1 decode-only, but prefill program T={} dispatches it",
+                p.t
+            )));
+        }
+        if let Some(p) = blob.progs[dec_ix..].iter().find(|p| {
+            p.t != 1
+                && p.insts
+                    .iter()
+                    .any(|i| i.op == DevOp::KdaConvStateStepG as u16)
+        }) {
+            return Err(RuntimeError::Device(format!(
+                "KdaConvStateStepG is B1-only, but decode program T={} dispatches it",
+                p.t
+            )));
+        }
         // Gemma-4 MoE, both halves, per phase. Same silent-NOP argument as K3 above.
         let need_gm_decode = first_op_in(&blob.progs[dec_ix..], MOE_GEMMA_OPS);
         let need_gm_prefill = first_op_in(&blob.progs[..dec_ix], MOE_GEMMA_OPS);
@@ -3531,6 +3820,13 @@ impl AmdEngine {
                         .iter()
                         .any(|i| i.op == DevOp::FlashMlaPrefill as u16)
             });
+        let need_mla_v2_fp8 = mla_pf_v2_enabled()
+            && blob.progs[..dec_ix].iter().any(|p| {
+                p.t >= 2048
+                    && p.insts
+                        .iter()
+                        .any(|i| i.op == DevOp::FlashMlaPrefillFp8 as u16)
+            });
 
         // --- code objects ---------------------------------------------------
         // Resolve the symbol immediately after each load: the HSA backend
@@ -3544,6 +3840,9 @@ impl AmdEngine {
         // loaded rather than between two of them.
         let requires = build_requires(blob_path)?;
         let mut modules = Vec::new();
+        let mut k_xaudit = None;
+        let mut k_state_clear = None;
+        let state_clear_device = crate::config::RuntimeConfig::get().amd.state_clear_device;
         // Task-13 per-rung co-load: an optional SECOND decode object for the low
         // rungs (PLOW_HSACO_LOWRUNG=<dir>), so rung 1-2 traffic runs the tight
         // single-slot codegen while wide rungs keep the batched object. Same
@@ -3660,6 +3959,10 @@ impl AmdEngine {
                     Phase::Prefill | Phase::Flash => need_k3_prefill,
                 };
                 check_k3_arms(&syms, &path, need_k3)?;
+                if phase == Phase::Decode {
+                    check_moe_pf_a4w4(&syms, &path, need_a4w4_decode)?;
+                    check_kda_conv_step_db(&syms, &path, need_kda_conv_step_db, legacy_kda_decode)?;
+                }
                 let (need_gm, need_gmpf) = match phase {
                     Phase::Decode => (need_gm_decode, need_gmpf_decode),
                     Phase::Prefill | Phase::Flash => (need_gm_prefill, need_gmpf_prefill),
@@ -3672,6 +3975,14 @@ impl AmdEngine {
                      writes NOTHING, so those packets would silently skip. Rebuild the flash \
                      object (scripts/build_gfx942.sh adds -DPLOW_MLA_PF_V2_ARM=1) or unset \
                      PLOW_MLA_PF_V2.",
+                        path.display()
+                    )));
+                }
+                if phase == Phase::Flash && need_mla_v2_fp8 && !syms.contains(&MLA_PF_V2_FP8_SYM) {
+                    return Err(RuntimeError::Device(format!(
+                        "PLOW_MLA_PF_V2=1 routes FlashMlaPrefillFp8 segments to {}, but it was \
+                     compiled without the fp8 V2 arm (no `{MLA_PF_V2_FP8_SYM}`). Rebuild the \
+                     fp8-KV flash object or unset PLOW_MLA_PF_V2.",
                         path.display()
                     )));
                 }
@@ -3709,6 +4020,25 @@ impl AmdEngine {
                 let sym = symbol_name(phase, sched, &arch);
                 let k = EngineDevice::get_function(&*be, &m, &sym)
                     .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {sym}: {e}")))?;
+                if phase == Phase::Decode && tp_audit_compact && k_xaudit.is_none() {
+                    k_xaudit = Some(
+                        EngineDevice::get_function(&*be, &m, "plow_xctr_audit").map_err(|e| {
+                            RuntimeError::Device(format!(
+                            "{name}: compact TP audit requested but plow_xctr_audit is absent: {e}"
+                        ))
+                        })?,
+                    );
+                }
+                if phase == Phase::Decode && state_clear_device && k_state_clear.is_none() {
+                    k_state_clear = Some(
+                        EngineDevice::get_function(&*be, &m, "plow_state_clear").map_err(|e| {
+                            RuntimeError::Device(format!(
+                                "{name}: device recurrent-state clear requested but \
+                                 plow_state_clear is absent: {e}. Rebuild the decode object"
+                            ))
+                        })?,
+                    );
+                }
                 // STALE-OBJECT REFUSAL. An object's kernarg segment is its explicit
                 // args, 8-aligned, plus the COv5 implicit block — a FIXED 256 B tail
                 // that hipcc emits only when the kernel uses a hidden arg (the flash
@@ -4372,6 +4702,8 @@ impl AmdEngine {
             };
             progs.push(AmdProg {
                 t: p.t,
+                n_inst: p.insts.len() as u32,
+                trace_records: p.stream.len(),
                 n_counter: p.n_counter,
                 d_inst,
                 d_stream,
@@ -4398,7 +4730,7 @@ impl AmdEngine {
                     0
                 },
                 ctr_span,
-                bank: Cell::new(0),
+                bank: CounterBankState::new(),
             });
         }
         let decode = progs.len() - 1;
@@ -4490,6 +4822,59 @@ impl AmdEngine {
             .map(|(i, t)| (i, t.bytes / batch as u64))
             .collect();
 
+        let mut kda_conv_bank_pairs = Vec::new();
+        for (alt_i, alt) in blob.tensors.iter().enumerate() {
+            if !alt.name.contains(".conv_state_alt.") {
+                continue;
+            }
+            if batch != 1 {
+                return Err(RuntimeError::Device(format!(
+                    "{} is a double-buffered KDA conv window, but the packet batch is {batch}; \
+                     KdaConvStateStepG is B1-only",
+                    alt.name
+                )));
+            }
+            let base_name = alt.name.replacen(".conv_state_alt.", ".conv_state.", 1);
+            let base_i = blob
+                .tensors
+                .iter()
+                .position(|t| t.name == base_name)
+                .ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "{} has no matching legacy KDA conv window {base_name}",
+                        alt.name
+                    ))
+                })?;
+            if devp[alt_i].len != devp[base_i].len {
+                return Err(RuntimeError::Device(format!(
+                    "KDA conv banks disagree: {} is {} bytes, {base_name} is {} bytes",
+                    alt.name, devp[alt_i].len, devp[base_i].len
+                )));
+            }
+            kda_conv_bank_pairs.push((devp[alt_i].base, devp[base_i].base, devp[alt_i].len));
+        }
+        if need_kda_conv_step_db.is_some() && kda_conv_bank_pairs.is_empty() {
+            return Err(RuntimeError::Device(
+                "KdaConvStateStepG packet has no alternate KDA conv-window tensors".into(),
+            ));
+        }
+
+        let clear_ranges = if state_clear_device {
+            state_clear_ranges(&devp, &carried_slot)?
+        } else {
+            Vec::new()
+        };
+        let n_state_clear = u32::try_from(clear_ranges.len())
+            .map_err(|_| RuntimeError::Device("too many recurrent-state clear ranges".into()))?;
+        let d_state_clear = if clear_ranges.is_empty() {
+            None
+        } else {
+            let bytes = std::mem::size_of_val(clear_ranges.as_slice()) as u64;
+            let d = EngineDevice::alloc(&*be, bytes)?;
+            EngineDevice::upload(&*be, &d, 0, as_bytes(&clear_ranges))?;
+            Some(d)
+        };
+
         if !carried_slot.is_empty() {
             tracing::info!(
                 tensors = carried_slot.len(),
@@ -4524,11 +4909,16 @@ impl AmdEngine {
             // stride below would alias every sequence onto every other's — no
             // fault, no missing weight, just fluent wrong output.
             const KDA_F_SEQ_ROWS: u32 = 2;
-            let unbatched = blob.progs[decode]
-                .insts
-                .iter()
-                .find(|d| d.op == DevOp::KdaStateStepG as u16 && d.i[4] & KDA_F_SEQ_ROWS == 0);
-            if let (Some(t), Some(_)) = (
+            let unbatched = blob.progs[dec_ix..].iter().find_map(|p| {
+                p.insts
+                    .iter()
+                    .any(|d| {
+                        (d.op == DevOp::KdaStateStep as u16 || d.op == DevOp::KdaStateStepG as u16)
+                            && d.i[4] & KDA_F_SEQ_ROWS == 0
+                    })
+                    .then_some(p.t)
+            });
+            if let (Some(t), Some(rung)) = (
                 blob.tensors
                     .iter()
                     .find(|t| t.name.starts_with("kv.") && t.name.contains("state")),
@@ -4536,7 +4926,7 @@ impl AmdEngine {
             ) {
                 return Err(RuntimeError::Device(format!(
                     "PLOW_DECODE_BATCH = {batch} with a recurrent-state tensor `{}` whose decode \
-                     program does NOT carry PLOW_KDA_F_SEQ_ROWS. The state is one block with no \
+                     rung T={rung} does NOT carry PLOW_KDA_F_SEQ_ROWS. The state is one block with no \
                      slot axis, so the per-slot stride below would alias every sequence's state \
                      onto every other's. Re-emit with PLOW_DECODE_BATCH = {batch} so the emitter \
                      sizes the state per slot and sets the flag, or run at batch 1.",
@@ -4664,8 +5054,11 @@ impl AmdEngine {
             _expert_bufs: expert_bufs,
             d_trace,
             trace_bytes,
+            trace_write_bytes: Cell::new(0),
             k_prefill,
             k_decode,
+            k_xaudit,
+            k_state_clear,
             decode_tiers,
             k_flash,
             sched_prefill,
@@ -4675,6 +5068,8 @@ impl AmdEngine {
             h_scalar,
             h_zero,
             h_pf_inst,
+            d_state_clear,
+            n_state_clear,
             pf_src,
             kvrow,
             kvrow_i2,
@@ -4692,6 +5087,8 @@ impl AmdEngine {
             kv_slot: 0,
             carried_slot,
             prefix_snap: (0..batch).map(|_| None).collect(),
+            kda_conv_bank_pairs,
+            kda_conv_alt_stale: vec![false; batch],
             vmm,
             lm_detail: std::cell::RefCell::new(None),
             pf_stream: blob.progs.iter().map(|g| g.stream.clone()).collect(),
@@ -4811,7 +5208,13 @@ impl AmdEngine {
                 "trace buffer was not allocated — set PLOW_TRACE_RAW before loading".into(),
             ));
         };
-        let mut buf = vec![0u8; self.trace_bytes];
+        let bytes = self.trace_write_bytes.get();
+        if bytes == 0 || bytes > self.trace_bytes {
+            return Err(RuntimeError::Device(
+                "trace buffer has no completed program extent".into(),
+            ));
+        }
+        let mut buf = vec![0u8; bytes];
         EngineDevice::download(&*self.be, m, 0, &mut buf)?;
         std::fs::write(path, &buf)
             .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))
@@ -4847,7 +5250,7 @@ impl AmdEngine {
             succs: g.d_succs.base,
             // BANKED. `bank` is 0 for the whole life of a single-buffered
             // program, so this is the old expression there.
-            counters: g.d_ctr.base + g.bank.get() as u64 * g.ctr_span,
+            counters: g.d_ctr.base + g.bank.current() as u64 * g.ctr_span,
             tensors: self.d_tens.base,
             // EVERY program traces, not just decode. The buffer is sized for the widest one
             // (see `d_trace`'s allocation), and each dispatch writes slot `base + ix` of its own
@@ -4869,10 +5272,9 @@ impl AmdEngine {
             // static kernel never reads them, so one path serves both.
             gq_stream: g.gq.as_ref().map_or(0, |q| q.d_stream.base),
             gq_seg_ofs: g.gq.as_ref().map_or(0, |q| q.d_seg_ofs.base),
-            gq_cursor: g
-                .gq
-                .as_ref()
-                .map_or(0, |q| q.d_cursor.base + g.bank.get() as u64 * q.cur_span),
+            gq_cursor: g.gq.as_ref().map_or(0, |q| {
+                q.d_cursor.base + g.bank.current() as u64 * q.cur_span
+            }),
             // Single-GPU leaves all four at zero, and `n_gpu == 0` is the
             // interpreter's "not a group" convention (`tp_decode.c:551` fills
             // them only when `n_gpu > 1`). The collective opcodes never appear
@@ -4890,7 +5292,7 @@ impl AmdEngine {
     /// an earlier launch, so zeroing between segments unsatisfies them and the
     /// next segment waits on a count that will never come again.
     fn rearm(&self, p: usize) -> Result<()> {
-        self.rearm_bank(p, self.progs[p].bank.get())
+        self.rearm_bank(p, self.progs[p].bank.current())
     }
 
     /// Zero ONE bank of program `p`'s counters and GQ cursor.
@@ -4917,10 +5319,54 @@ impl AmdEngine {
         Ok(())
     }
 
-    /// Re-arm program `p`'s counters and cursor. Public so a TP driver can
-    /// re-arm EVERY rank before dispatching ANY of them (§6d).
+    /// Re-arm program `p`'s counters and cursor. Used by prefill and by TP's
+    /// synchronous single-bank fallback.
     pub fn rearm_prog(&self, p: usize) -> Result<()> {
         self.rearm(p)
+    }
+
+    /// Whether TP may select this program's inactive local-counter bank.
+    ///
+    /// The preflight is separate so a group checks EVERY rank before changing
+    /// any rank's bank selection.
+    pub fn tp_counter_bank_ready(&self, p: usize) -> bool {
+        !ctr_dbuf() || self.progs[p].bank.inactive_ready()
+    }
+
+    /// Whether TP should use the post-launch inactive-bank re-arm path.
+    pub fn tp_counter_double_buffered(&self) -> bool {
+        ctr_dbuf()
+    }
+
+    /// Select a clean counter bank for the next TP dispatch.
+    ///
+    /// With double-buffering disabled this performs the original synchronous
+    /// current-bank re-arm. The caller must invoke it on every rank only after
+    /// all rank preparation has succeeded.
+    pub fn tp_begin_counter_bank(&self, p: usize) -> Result<()> {
+        match self.progs[p].bank.begin_tp(ctr_dbuf()) {
+            Ok(true) => Ok(()),
+            Ok(false) => self.rearm(p),
+            Err(()) => Err(RuntimeError::Device(format!(
+                "program {p} inactive counter bank is stale: its previous post-launch re-arm \
+                 did not complete; refusing to dispatch with uncleared local counters"
+            ))),
+        }
+    }
+
+    /// Re-arm the inactive TP counter/cursor bank after every rank has launched.
+    ///
+    /// The blocking SDMA copy overlaps the resident megakernels. The bank is
+    /// marked reusable only after both its counter and optional GQ-cursor clears
+    /// complete successfully.
+    pub fn tp_rearm_inactive_counter_bank(&self, p: usize) -> Result<()> {
+        if !ctr_dbuf() {
+            return Ok(());
+        }
+        let bank = self.progs[p].bank.inactive();
+        self.rearm_bank(p, bank)?;
+        self.progs[p].bank.mark_inactive_ready();
+        Ok(())
     }
 
     /// Number of segments in program `p`, and whether segment `seg` is class 4.
@@ -4933,8 +5379,12 @@ impl AmdEngine {
     /// The building block of both the single-GPU segmented run and the TP
     /// per-segment rendezvous. Each launch memcpy's its own kernarg slot, so
     /// mutating `cur_seg` between launches is safe — every packet has already
-    /// captured its own copy.
+    /// captured its own copy. For an L2-placed program the caller invokes this
+    /// exactly once with `seg == 0`; the device ignores `cur_seg` and drains all
+    /// domain windows concurrently.
     pub fn enqueue_segment(&mut self, p: usize, seg: usize) -> Result<()> {
+        self.trace_write_bytes
+            .set(self.progs[p].trace_records * TRACE_REC_BYTES);
         let use4 = self.k_flash.is_some() && self.progs[p].seg_class[seg] == 4;
         let (k, threads) = match (use4, self.k_flash) {
             (true, Some(kf)) => (kf, WG_THREADS_4),
@@ -4963,6 +5413,8 @@ impl AmdEngine {
     /// been dispatched to produce — reintroducing exactly the launched-collective
     /// latency the inline design exists to avoid.
     pub fn enqueue(&mut self, p: usize, k: HsaKernel) -> Result<()> {
+        self.trace_write_bytes
+            .set(self.progs[p].trace_records * TRACE_REC_BYTES);
         let arg = self.kernarg(p, 0);
         EngineDevice::launch_cooperative(
             &*self.be,
@@ -4980,6 +5432,39 @@ impl AmdEngine {
     /// Wait for everything this rank has enqueued.
     pub fn drain(&self) -> Result<()> {
         EngineDevice::synchronize(&*self.be)
+    }
+
+    /// Enqueue the post-drain exact xctr scan used by compact TP audit.
+    pub fn enqueue_xaudit(
+        &self,
+        p: usize,
+        xctr: u64,
+        n_xctr: u32,
+        n_gpu: u32,
+        status: u64,
+    ) -> Result<()> {
+        let k = self
+            .k_xaudit
+            .ok_or_else(|| RuntimeError::Device("compact TP audit kernel was not loaded".into()))?;
+        let prog = &self.progs[p];
+        let arg = XAuditArgs {
+            insts: prog.d_inst.base,
+            n_inst: prog.n_inst,
+            _pad: 0,
+            xctr,
+            n_xctr,
+            n_gpu,
+            status,
+        };
+        EngineDevice::launch_kernel(
+            &*self.be,
+            k,
+            1,
+            256,
+            0,
+            as_bytes(std::slice::from_ref(&arg)),
+            None,
+        )
     }
 
     /// Run every segment of program `p`, then drain ONCE.
@@ -5080,9 +5565,9 @@ impl AmdEngine {
             return Err(e);
         }
         if ctr_dbuf() {
-            let cur = self.progs[p].bank.get();
+            let cur = self.progs[p].bank.current();
             dstep::timed(&dstep::REARM, || self.rearm_bank(p, 1 - cur))?;
-            self.progs[p].bank.set(1 - cur);
+            self.progs[p].bank.select_rearmed_inactive();
         }
         // The drain is where an async kernel trap surfaces — capture the
         // dispatch shape at the site before propagating.
@@ -5179,6 +5664,7 @@ impl AmdEngine {
                 self.max_ctx
             )));
         }
+        self.sync_kda_conv_alt(self.kv_slot)?;
         let dp = self.decode;
         self.patch_kvrow(dp, pos)?;
 
@@ -5385,6 +5871,9 @@ impl AmdEngine {
     /// Upload one chunk's `ids`/`pos`/`kvlen` and patch its bucket program. No
     /// dispatch.
     pub fn prefill_prepare(&mut self, prompt: &[u32], step: ChunkStep) -> Result<()> {
+        if !self.kda_conv_bank_pairs.is_empty() {
+            self.kda_conv_alt_stale[self.kv_slot] = true;
+        }
         let ch = self.progs[step.prog].t;
         // in.kvlen FIRST, so it can borrow the head of the staging slab before
         // ids/pos fill it — the slab is sized for exactly `ids + pos` at the
@@ -5723,6 +6212,65 @@ impl AmdEngine {
     /// re-establishes it. Clearing it was always belt-and-braces; skipping it at `batch > 1`
     /// is strictly safer than clearing every live slot's rows.
     pub fn begin_slot(&mut self, seq: usize) -> Result<()> {
+        if self.k_state_clear.is_some() {
+            self.prepare_device_state_clear(seq)?;
+            self.enqueue_state_clear(seq)?;
+            return self.drain();
+        }
+        self.clear_state_serial(seq)
+    }
+
+    pub fn device_state_clear_enabled(&self) -> bool {
+        self.k_state_clear.is_some()
+    }
+
+    pub fn prepare_device_state_clear(&mut self, seq: usize) -> Result<()> {
+        if seq >= self.batch {
+            return Err(RuntimeError::Device(format!(
+                "prepare_device_state_clear {seq} past batch {}",
+                self.batch
+            )));
+        }
+        if let Some(v) = &self.vmm {
+            v.begin_seq(seq);
+            v.ensure_rows(seq, 1)?;
+        }
+        self.kda_conv_alt_stale[seq] = false;
+        Ok(())
+    }
+
+    pub fn enqueue_state_clear(&self, seq: usize) -> Result<()> {
+        if seq >= self.batch {
+            return Err(RuntimeError::Device(format!(
+                "enqueue_state_clear {seq} past batch {}",
+                self.batch
+            )));
+        }
+        let Some(k) = self.k_state_clear else {
+            return Err(RuntimeError::Device(
+                "device recurrent-state clear kernel was not loaded".into(),
+            ));
+        };
+        let Some(ranges) = &self.d_state_clear else {
+            return Ok(());
+        };
+        let arg = StateClearArgs {
+            ranges: ranges.base,
+            n_ranges: self.n_state_clear,
+            slot: seq as u32,
+        };
+        EngineDevice::launch_kernel(
+            &*self.be,
+            k,
+            self.n_state_clear,
+            256,
+            0,
+            as_bytes(std::slice::from_ref(&arg)),
+            None,
+        )
+    }
+
+    fn clear_state_serial(&mut self, seq: usize) -> Result<()> {
         if seq >= self.batch {
             return Err(RuntimeError::Device(format!(
                 "begin_slot {seq} past batch {}",
@@ -5760,6 +6308,16 @@ impl AmdEngine {
             let stride = m.len / b;
             EngineDevice::memset_d8(&*self.be, m.base + stride * seq as u64, 0, stride as usize)?;
         }
+        self.kda_conv_alt_stale[seq] = false;
+        Ok(())
+    }
+
+    fn sync_kda_conv_alt(&mut self, slot: usize) -> Result<()> {
+        if !self.kda_conv_alt_stale.get(slot).copied().unwrap_or(false) {
+            return Ok(());
+        }
+        self.be.memcpy_dtod_batch(&self.kda_conv_bank_pairs)?;
+        self.kda_conv_alt_stale[slot] = false;
         Ok(())
     }
 
@@ -5794,6 +6352,7 @@ impl AmdEngine {
                 self.batch
             )));
         }
+        self.sync_kda_conv_alt(slot)?;
         let total = self.carried_bytes();
         if total == 0 {
             return Ok(());
@@ -5844,6 +6403,7 @@ impl AmdEngine {
         }
         let t = std::time::Instant::now();
         self.be.memcpy_dtod_batch(&pairs)?;
+        self.kda_conv_alt_stale[slot] = false;
         crate::obs::pfx::RESTORE.add(t.elapsed().as_nanos() as u64);
         Ok(())
     }
@@ -5910,6 +6470,7 @@ impl AmdEngine {
                 self.max_ctx
             )));
         }
+        self.sync_kda_conv_alt(self.kv_slot)?;
         if b == 1 {
             self.patch_kvrow(self.decode, pos[0])?;
         }
@@ -6201,7 +6762,7 @@ impl AmdEngine {
         EngineDevice::download(
             &*self.be,
             &g.d_ctr,
-            g.bank.get() as u64 * g.ctr_span,
+            g.bank.current() as u64 * g.ctr_span,
             &mut buf,
         )?;
         Ok(buf
@@ -6218,6 +6779,13 @@ impl AmdEngine {
     /// Segment count for program `p`.
     pub fn prog_segments(&self, p: usize) -> usize {
         self.progs[p].seg_class.len()
+    }
+
+    /// Whether `seg` denotes concurrently-drained L2 domains or sequential
+    /// wave-class launches for program `p`.
+    pub(crate) fn prog_dispatch(&self, p: usize) -> ProgramDispatch {
+        let g = &self.progs[p];
+        ProgramDispatch::classify(g.l2_domains, g.seg_class.len())
     }
 
     pub fn schedulers(&self) -> (Sched, Sched) {
@@ -6258,6 +6826,120 @@ fn kernarg_bytes(p: &DevProgram) -> &[u8] {
 mod tests {
     use super::*;
 
+    fn segmented_prog(ops: &[DevOp], segs: &[u16]) -> DevProg {
+        assert_eq!(ops.len(), segs.len());
+        DevProg {
+            t: 2048,
+            n_counter: 0,
+            insts: ops
+                .iter()
+                .map(|&op| DevInst64 {
+                    op: op as u16,
+                    ..Default::default()
+                })
+                .collect(),
+            stream: segs
+                .iter()
+                .enumerate()
+                .map(|(inst, &seg)| packet::dev::StreamEnt {
+                    inst: inst as u32,
+                    seg,
+                    ..Default::default()
+                })
+                .collect(),
+            stream_ofs: Vec::new(),
+            stream_len: Vec::new(),
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        }
+    }
+
+    #[test]
+    fn fp8_mla_v2_routes_only_a_pure_segment_to_four_waves() {
+        let pure = segmented_prog(&[DevOp::FlashMlaPrefillFp8], &[0]);
+        assert_eq!(derive_segments_for(&pure, true).unwrap(), [4]);
+        assert_eq!(derive_segments_for(&pure, false).unwrap(), [8]);
+
+        let mixed = segmented_prog(&[DevOp::FlashMlaPrefillFp8, DevOp::Gemv], &[0, 0]);
+        assert_eq!(derive_segments_for(&mixed, true).unwrap(), [8]);
+    }
+
+    #[test]
+    fn state_clear_ranges_cover_each_slot_stride_once() {
+        let devp = vec![
+            DeviceMem::view(0x1000, 3 * STATE_CLEAR_CHUNK),
+            DeviceMem::view(0x20_0000, 24 * 1024),
+        ];
+        let ranges =
+            state_clear_ranges(&devp, &[(0, 3 * STATE_CLEAR_CHUNK), (1, 24 * 1024)]).unwrap();
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(ranges[0].base, 0x1000);
+        assert_eq!(ranges[2].base, 0x1000 + 2 * STATE_CLEAR_CHUNK);
+        assert!(ranges[..3]
+            .iter()
+            .all(|r| r.slot_stride == 3 * STATE_CLEAR_CHUNK));
+        assert_eq!(
+            ranges.iter().map(|r| r.words as u64 * 4).sum::<u64>(),
+            3 * STATE_CLEAR_CHUNK + 24 * 1024
+        );
+    }
+
+    #[test]
+    fn tp_counter_banks_are_clean_on_first_use_and_alternate() {
+        let state = CounterBankState::new();
+        assert_eq!(state.current(), 0);
+        assert!(state.inactive_ready());
+
+        let mut used = Vec::new();
+        for _ in 0..3 {
+            assert_eq!(state.begin_tp(true), Ok(true));
+            used.push(state.current());
+            assert!(!state.inactive_ready());
+            let executed = state.current();
+            state.mark_inactive_ready();
+            assert_eq!(state.current(), executed, "re-arm must not move snapshots");
+        }
+        assert_eq!(used, [1, 0, 1]);
+    }
+
+    #[test]
+    fn tp_counter_bank_state_is_per_program() {
+        let rung8 = CounterBankState::new();
+        let rung32 = CounterBankState::new();
+
+        assert_eq!(rung8.begin_tp(true), Ok(true));
+        rung8.mark_inactive_ready();
+        assert_eq!(rung8.current(), 1);
+        assert_eq!(rung32.current(), 0);
+
+        assert_eq!(rung32.begin_tp(true), Ok(true));
+        assert_eq!(rung32.current(), 1);
+        assert_eq!(rung8.current(), 1);
+    }
+
+    #[test]
+    fn tp_counter_single_bank_mode_requires_synchronous_rearm() {
+        let state = CounterBankState::new();
+        assert_eq!(state.begin_tp(false), Ok(false));
+        assert_eq!(state.current(), 0);
+        assert!(state.inactive_ready());
+    }
+
+    #[test]
+    fn tp_counter_bank_refuses_stale_inactive_bank() {
+        let state = CounterBankState::new();
+        assert_eq!(state.begin_tp(true), Ok(true));
+        assert_eq!(state.begin_tp(true), Err(()));
+        assert_eq!(state.current(), 1, "failed selection must not change banks");
+
+        state.mark_inactive_ready();
+        assert_eq!(state.begin_tp(true), Ok(true));
+        assert_eq!(state.current(), 0);
+    }
+
     /// The kernarg slice must cover the WHOLE struct.
     ///
     /// It was a literal `128`, and appending `seg_ofs` made the struct 136: the
@@ -6273,6 +6955,28 @@ mod tests {
         // this instance is only ever measured, never dispatched).
         let p: DevProgram = unsafe { std::mem::zeroed() };
         assert_eq!(kernarg_bytes(&p).len(), std::mem::size_of::<DevProgram>());
+    }
+
+    #[test]
+    fn compact_audit_patches_only_tp_collectives() {
+        let mut insts = [
+            DevInst64 {
+                op: DevOp::XReduce as u16,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::XArgmaxFin as u16,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::Gemm as u16,
+                ..Default::default()
+            },
+        ];
+        patch_tp_xaudit(&mut insts, 464);
+        assert_eq!(insts[0].i[7], 465);
+        assert_eq!(insts[1].i[7], 465);
+        assert_eq!(insts[2].i[7], 0);
     }
 
     /// The flash object follows the PREFILL scheduler: a flash segment IS a
@@ -6658,6 +7362,65 @@ mod tests {
         assert!(check_k3_arms(&with_k3, obj, required_k3_op(&plain)).is_ok());
     }
 
+    #[test]
+    fn batched_mxfp4_moe_requires_a4w4_in_the_decode_object() {
+        let obj = Path::new("interp_decode_k3.elf");
+        let mut pkt = vec![prog_gemv(&[DevOp::MoeGroupGluPf, DevOp::MoeGroupDownPf], 4)];
+        for i in &mut pkt[0].insts {
+            i.i[MOE_PF_ENC_SLOT] = MOE_ENC_MXFP4;
+        }
+        let need = required_moe_pf_a4w4(&pkt);
+        assert_eq!(need, Some(DevOp::MoeGroupGluPf));
+        let bare = ["plow_k3_arms_1"];
+        let armed = ["plow_k3_arms_1", MOE_PF_A4W4_SYM];
+        let e = check_moe_pf_a4w4(&bare, obj, need).unwrap_err();
+        assert!(e.to_string().contains("PLOW_MOE_PF_A4W4"));
+        assert!(check_moe_pf_a4w4(&armed, obj, need).is_ok());
+
+        pkt[0].insts[0].i[MOE_PF_ENC_SLOT] = 1;
+        pkt[0].insts[1].i[MOE_PF_ENC_SLOT] = 0;
+        assert_eq!(required_moe_pf_a4w4(&pkt), None);
+        assert!(check_moe_pf_a4w4(&bare, obj, None).is_ok());
+    }
+
+    #[test]
+    fn kda_conv_step_db_requires_exact_packet_object_pairing() {
+        let obj = Path::new("interp_decode_fp8kv_k3.elf");
+        let bare = [K3_ARMS_SYM];
+        let armed = [K3_ARMS_SYM, KDA_CONV_STEP_DB_SYM];
+        let fused = vec![prog_gemv(&[DevOp::KdaConvStateStepG], 1)];
+        let legacy = vec![prog_gemv(&[DevOp::KdaConv3, DevOp::KdaStateStepG], 1)];
+
+        assert!(check_kda_conv_step_db(
+            &bare,
+            obj,
+            required_kda_conv_step_db(&fused),
+            first_op_in(&fused, KDA_CONV_STEP_DB_REPLACED_OPS),
+        )
+        .is_err());
+        assert!(check_kda_conv_step_db(
+            &armed,
+            obj,
+            required_kda_conv_step_db(&fused),
+            first_op_in(&fused, KDA_CONV_STEP_DB_REPLACED_OPS),
+        )
+        .is_ok());
+        assert!(check_kda_conv_step_db(
+            &armed,
+            obj,
+            required_kda_conv_step_db(&legacy),
+            first_op_in(&legacy, KDA_CONV_STEP_DB_REPLACED_OPS),
+        )
+        .is_err());
+        assert!(check_kda_conv_step_db(
+            &bare,
+            obj,
+            required_kda_conv_step_db(&legacy),
+            first_op_in(&legacy, KDA_CONV_STEP_DB_REPLACED_OPS),
+        )
+        .is_ok());
+    }
+
     /// A packet dispatching a Gemma-4 MoE op against an object built without the matching axis is
     /// REFUSED — the same argument as the K3 gate, and for a family that until the AMD port had
     /// NO arm at all, so its silent-NOP failure was not hypothetical. [GEMMA4-MOE-AMD]
@@ -6870,16 +7633,26 @@ mod tests {
         // The LAST `#if PLOW_K3` is the dispatch region; the earlier ones guard the includes and
         // the marker. Scan to its matching `#endif`.
         let mut in_region = false;
+        let mut nested = 0usize;
         let mut found: Vec<String> = Vec::new();
         for line in src.lines() {
             let t = line.trim();
             if t == "#if PLOW_K3" {
                 in_region = true;
+                nested = 0;
                 found.clear(); // a later region supersedes an earlier one
                 continue;
             }
+            if in_region && t.starts_with("#if") {
+                nested += 1;
+                continue;
+            }
             if in_region && t.starts_with("#endif") {
-                in_region = false;
+                if nested == 0 {
+                    in_region = false;
+                } else {
+                    nested -= 1;
+                }
                 continue;
             }
             if in_region {
@@ -7504,6 +8277,7 @@ mod tests {
         for n in [
             "kv.0.state",
             "kv.12.conv_state.q",
+            "kv.12.conv_state_alt.q",
             "kv.blkres",
             "kv.3.state.v",
         ] {

@@ -55,7 +55,7 @@
  * L2. B is 59 MB against a 96 MiB L2, and PX-9 measured cold vs warm within 0.5% on both engines
  * at these shapes, so no replication protocol here: this bench measures the ISSUE path.
  *
- * BUILD: perf-data/px22_build.sh      RUN: perf-data/harness/gpulease px22 /tmp/px22
+ * BUILD: perf-data/px22_build.sh      RUN: perf-data/tools/gpulease px22 /tmp/px22
  */
 #include <cstdio>
 #include <cstdint>

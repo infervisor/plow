@@ -221,6 +221,7 @@ const DOC: &[S] = &[
     // f32 output, and `i5` is the `dt_bias` handle. There is no slot for a precomputed `g`, which
     // is deliberate — this op cannot silently degrade to the unfused reading of the packet.
     S { op: DevOp::KdaStateStepG, t: &["o", "q", "k", "v", "g_raw", "beta_raw", "state", "A_log"], i: &["T", "H", "D", "BV", "flags", "dt_bias", "gate_mode", "parked"], f: &["scale", "lower_bound"], j: &[] },
+    S { op: DevOp::KdaConvStateStepG, t: &["o", "q_raw", "k_raw", "v_raw", "g_raw", "beta_raw", "state", "descriptor"], i: &["T", "H", "D", "BV", "flags", "W", "gate_mode"], f: &["scale", "lower_bound"], j: &[] },
     S { op: DevOp::KdaGatedNorm, t: &["y", "o", "norm_w", "g_raw"], i: &["T", "H", "D"], f: &["eps"], j: &[] },
     // `gamma?` is the FUSED post-norm: present, the mix is RMSNormed IN PLACE over `out` and the
     // packet subsumes the RMSNORM that would otherwise follow it. See `crate::k3::fuse_attnres_norm`.

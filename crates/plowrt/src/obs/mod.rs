@@ -20,6 +20,8 @@ pub struct Metrics {
     /// controller dropping live slots because predicted wait exceeded the SLO.
     /// Both end as a 429; conflating them hides which pressure caused it.
     pub rejected: AtomicU64,
+    /// Requests accepted by the HTTP path but not yet moved into engine slots.
+    pub queued_requests: AtomicU64,
     /// λ and ρ scaled ×1000 (atomics are integer; f64 read back on export).
     /// ρ here is the QUEUEING utilization λ/μ from `sched::admission`, not a
     /// memory or SM occupancy figure — see `LoadEstimator::utilization`.
@@ -35,6 +37,11 @@ pub struct Metrics {
     pub hold_count: AtomicU64,
     /// Requests shed by admission (predicted wait > SLO or memory OOM).
     pub admit_shed: AtomicU64,
+    /// Decode-ladder state. Zero means the model has no compiled ladder.
+    pub decode_rung_actual: AtomicU64,
+    pub decode_rung_admission: AtomicU64,
+    pub decode_occupied_extent: AtomicU64,
+    pub decode_rung_switches: AtomicU64,
 }
 
 impl Metrics {
@@ -77,15 +84,18 @@ impl Metrics {
         let (bs, bc) = (g(&self.batch_size_sum), g(&self.batch_count));
         let (hs, hc) = (g(&self.hold_ms_sum), g(&self.hold_count));
         format!(
-            "# HELP plowrt_requests_total Requests accepted for service.\n\
+            "# HELP plowrt_requests_total Requests received by the chat endpoint.\n\
              # TYPE plowrt_requests_total counter\n\
              plowrt_requests_total {}\n\
              # HELP plowrt_tokens_total Tokens generated (prompt + generation, not split).\n\
              # TYPE plowrt_tokens_total counter\n\
              plowrt_tokens_total {}\n\
-             # HELP plowrt_rejected_total Requests refused: capacity, empty prompt, or past max_ctx.\n\
+             # HELP plowrt_rejected_total Requests refused: full queue, capacity, invalid prompt, or max_ctx.\n\
              # TYPE plowrt_rejected_total counter\n\
              plowrt_rejected_total {}\n\
+             # HELP plowrt_queued_requests Requests waiting outside engine slots.\n\
+             # TYPE plowrt_queued_requests gauge\n\
+             plowrt_queued_requests {}\n\
              # HELP plowrt_admit_shed_total Live slots dropped by admission (predicted wait over SLO).\n\
              # TYPE plowrt_admit_shed_total counter\n\
              plowrt_admit_shed_total {}\n\
@@ -112,10 +122,23 @@ impl Metrics {
              plowrt_hold_count_total {}\n\
              # HELP plowrt_hold_ms_mean Lifetime mean hold; prefer rate(sum)/rate(count).\n\
              # TYPE plowrt_hold_ms_mean gauge\n\
-             plowrt_hold_ms_mean {:.3}\n",
+             plowrt_hold_ms_mean {:.3}\n\
+             # HELP plowrt_decode_rung_actual Decode width selected by occupied slot extent; zero means no ladder.\n\
+             # TYPE plowrt_decode_rung_actual gauge\n\
+             plowrt_decode_rung_actual {}\n\
+             # HELP plowrt_decode_rung_admission Maximum slot prefix open to new admissions; zero means no ladder.\n\
+             # TYPE plowrt_decode_rung_admission gauge\n\
+             plowrt_decode_rung_admission {}\n\
+             # HELP plowrt_decode_occupied_extent Highest occupied slot plus one; zero means no ladder.\n\
+             # TYPE plowrt_decode_occupied_extent gauge\n\
+             plowrt_decode_occupied_extent {}\n\
+             # HELP plowrt_decode_rung_switches_total Decode admission-rung changes.\n\
+             # TYPE plowrt_decode_rung_switches_total counter\n\
+             plowrt_decode_rung_switches_total {}\n",
             g(&self.requests),
             g(&self.tokens),
             g(&self.rejected),
+            g(&self.queued_requests),
             g(&self.admit_shed),
             g(&self.lambda_milli) as f64 / 1000.0,
             g(&self.util_milli) as f64 / 1000.0,
@@ -125,6 +148,10 @@ impl Metrics {
             hs,
             hc,
             mean(hs, hc),
+            g(&self.decode_rung_actual),
+            g(&self.decode_rung_admission),
+            g(&self.decode_occupied_extent),
+            g(&self.decode_rung_switches),
         )
     }
 }

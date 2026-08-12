@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SCOPE-1: does device-level decode throughput SCALE with PLOW_DECODE_BATCH on gfx950?
 # One leased GPU, one blob per B, hsaco built at the matching PLOW_GEMV_MM.
-# Run under: perf-data/harness/gpulease -n 1 batch-ceiling sg render -c '<this>'
+# Run under: perf-data/tools/gpulease -n 1 batch-ceiling sg render -c '<this>'
 set -u
 # Repo root, derived rather than hardcoded: this was an absolute path into a
 # `.claude/worktrees/` directory, which is gitignored and belongs to an agent worktree

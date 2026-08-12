@@ -240,7 +240,8 @@ pub fn dense_gemm_inventory(root: &Path, isa: IsaLevel) -> Result<Inventory, Pro
         program: format!("no interpreter recipe for {}", isa.arch_flag()),
     })?;
     let target = recipe.target(root);
-    let obj = probe(&target, isa, toolchain_label(&recipe))?;
+    let toolchain = toolchain_label(&recipe);
+    let obj = probe(&target, isa, &toolchain)?;
 
     let gemm_ops = [DevOp::Gemm, DevOp::GemmMed, DevOp::GemmSmall];
     let mut specs = Vec::new();
@@ -291,7 +292,7 @@ pub fn dense_gemm_inventory(root: &Path, isa: IsaLevel) -> Result<Inventory, Pro
                 } else {
                     let mut t = target.clone();
                     t.defines.extend(extra.iter().map(|s| s.to_string()));
-                    match probe(&t, isa, toolchain_label(&recipe)) {
+                    match probe(&t, isa, &toolchain) {
                         Ok(o) => (o, t),
                         Err(_) => continue,
                     }
@@ -321,14 +322,13 @@ pub fn dense_gemm_inventory(root: &Path, isa: IsaLevel) -> Result<Inventory, Pro
     Ok(Inventory::probed(obj.build().clone(), specs))
 }
 
-fn toolchain_label(recipe: &ObjectRecipe) -> &'static str {
-    // Recorded rather than detected: a probe that silently accepted whatever
-    // compiler happened to be on PATH would key its inventory to the wrong
-    // build. Detection belongs in the tuning campaign, which knows the
-    // deployment.
+fn toolchain_label(recipe: &ObjectRecipe) -> String {
+    if let Ok(label) = std::env::var("PLOW_TOOLCHAIN_LABEL") {
+        return label;
+    }
     match recipe.isa {
-        IsaLevel::Gfx942 | IsaLevel::Gfx950 => "rocm",
-        _ => "cuda",
+        IsaLevel::Gfx942 | IsaLevel::Gfx950 => "rocm".into(),
+        _ => "cuda".into(),
     }
 }
 

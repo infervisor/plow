@@ -40,6 +40,43 @@ mode this IR is designed to make hard to reach.
 
 ---
 
+## The geometry audit — write these down before you build anything
+
+Read `config.json` once and record these fields. They are not only builder
+inputs: each one selects kernel arms in Stage 4, sizes the KV budget in Stage 6,
+and bounds what Stage 7 is able to serve at all. Every one of them is a property
+of the model, not of `$VENDOR` / `$ISA` / `$GPU` — this audit is the same on
+every target.
+
+| field | what it decides downstream |
+|---|---|
+| `layer_types` (full vs sliding counts) | which flash arms the model needs; sliding layers get a KV ring, full layers do not |
+| `head_dim` per family | heterogeneous head dims (e.g. 256 sliding / 512 full) force one kernel instantiation **per head dim**, not one parameterized kernel |
+| `num_key_value_heads` per family | a `kvh=1` layer is a different GEMV/flash shape from `kvh=8`, not the same kernel with a shorter loop |
+| `sliding_window` | the KV ring floor — Stage 6's VRAM budget formula is written on it |
+| `vocab_size` | lm_head GEMV width + sampler scratch |
+| `rope_parameters` (per-family sub-objects) | the per-family RoPE recipe; partial RoPE and per-layer-type theta both live here |
+| MoE vs dense | a different op family entirely (router / experts / combine), not a wider MLP |
+| `num_hidden_layers` | segment count scales with it; the loader caps segments (2048 today, raised from 512 when a 60-layer model tripped it) |
+
+Also check **GEMM tile divisibility** for every projection the model will emit:
+each projection's `N` must divide the object's N-tile and each `K` its K-tile,
+or that GEMM falls off the tiled path. The tile is a `$VENDOR` property and is
+not a constant you can carry between targets — on AMD it comes from
+`hwspec::IsaLevel::geometry()`, on NVIDIA it is an object-wide macro triple you
+read off the built object (`plowc tune inventory`); see
+[`target.md`](target.md). A non-conforming GEMM is not a correctness bug: it
+either refuses at emit or falls back to a slower generic path — which is a
+Stage 4 finding you want *before* you spend GPU time measuring one.
+
+> Worked example: Gemma-4-12B is 48 layers = 8 full (kvh 1, hd 512) + 40 sliding
+> (kvh 8, hd 256), window 1024, vocab 262144, dense, bf16 — five distinct
+> attention instantiations implied by two rows of that table. Its projection
+> dims (4096 / 512 / 3840 / 15360) divide the `$ISA = sm_90a` n256 bodies' 256/128
+> tiles, as do every other model shipped in the tree.
+
+---
+
 ## What you are editing, and what it affects
 
 Read the crate's own honesty note (`crates/nn-graph/src/lib.rs`, "Where this

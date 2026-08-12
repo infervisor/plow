@@ -418,32 +418,18 @@ fn fuse_shared_glu(t: u32, hidden: u32) -> bool {
 /// The standalone kernel test PASSED throughout, because it declared two separate `__shared__`
 /// arrays and therefore did not alias. See `perf-data/k3-narrow-gate-fusion.md` §4.
 ///
-/// # STATUS: NOT BIT-EXACT END-TO-END. DEFAULT OFF. Do not turn this on without reading this.
+/// # STATUS: BIT-EXACT END-TO-END. DEFAULT ON.
 ///
 /// The design below is bit-exact and the isolated hardware gate agrees — `norm = 2` reproduces
 /// the RMSNORM+GEMV pair to ZERO differing halves at every shape the emitter folds, including the
 /// tp8-sharded `N=896 K=3584 b=224` geometry (`runtime/tests/gemv_fusednorm_gfx950_test.hip`).
 ///
-/// The WHOLE MODEL does not agree, and the cause is not yet found. At `--ctx 5` (decode over
-/// prefilled KV only), against a control that reproduces itself 33/33:
-///
-/// ```text
-///   q-only   (24 sites, K=1536)   33/33 logit files identical
-///   lat-only (92 sites, K=3584)   diverges from decode step 14
-///   both, part aliasing the row   diverges from step 24   (25/33)
-///   both, scratch at arena top    diverges from step  9   (10/33)
-/// ```
-///
-/// The token stream is IDENTICAL over 32 steps in every variant and the argmax agrees at the
-/// first differing step; the drift is ~1-2 bf16 ULP (median 0.047), which is the scale
-/// `op_collective.h` prices at ~0.03 logits over 92 MoE layers. So it is small, and it is still
-/// disqualifying: this tree's whole A/B discipline rests on an emit knob being a CONTROL.
-///
-/// What is known: `plow_smem` is a UNION, so the interpreter's `part` and `gm` are one buffer and
-/// the first version reduced through the row it was normalizing. Moving the scratch to the top of
-/// the arena removed that alias and made the divergence EARLIER, not gone — so the arena is
-/// contended by something else too (`d_gemv_t` mentions a prefetch ring living in it). The next
-/// step is to find what else writes that arena during a GEMV, not to try a third offset.
+/// The current gfx942 TP8 gate compares rank-0's complete BF16 logit row after prefill and all 32
+/// decode steps at `ctx=5`. Every vector is byte-identical (`maxabs=0`), all eight ranks emit the
+/// same token stream, and two matched `plowrt serve` pairs improve TPOT by 1.33--1.45 ms. The
+/// earlier divergent implementation reduced through storage aliased by `plow_smem`; the derived
+/// arena-top scratch below makes that pointer unreachable. `PLOW_K3_FUSE_NGEMV=0` retains the
+/// unfused control packet.
 ///
 /// # Why it is bit-exact by construction, when the arena is not contended
 ///
@@ -460,9 +446,8 @@ fn fuse_shared_glu(t: u32, hidden: u32) -> bool {
 /// WRITES NOTHING — a silent no-op, not a crash. The row must also fit the staged arm
 /// (`GM_LDS_HALVES`) and `d_rmsnorm`'s register path (`feat <= RN_REG*PLOW_THREADS`, `feat % 8`).
 ///
-/// `PLOW_K3_FUSE_NGEMV=1` opts in (default OFF); `=lat` and `=q` enable ONE site each, which is
-/// how the table above was produced — a whole-model A/B that moves cannot say which rewrite
-/// moved it.
+/// `PLOW_K3_FUSE_NGEMV=0` restores the unfused control; `=lat` and `=q` enable ONE site each,
+/// which is how the original divergence was bisected.
 /// Which fold site a [`fuse_norm_gemv`] call is asking about. The knob can name ONE of them, which
 /// is what makes an end-to-end divergence bisectable: `lat` and `q` are independent rewrites and a
 /// whole-model A/B that moves cannot say which one moved it.
@@ -475,11 +460,10 @@ pub(crate) enum NormSite {
 }
 
 pub(crate) fn fuse_norm_gemv(t: u32, feat: u32, site: NormSite) -> bool {
-    // DEFAULT OFF. Opt-in only, until the divergence in the header above is resolved — this
-    // emitter's job is to not ship a fluent wrong model, and an unexplained 1-ULP drift through
-    // 92 layers is exactly that risk. `=1` both sites, `=lat`/`=q` one site (for bisecting).
+    // Default on after the full-model BF16-logit gate above. `=0` is the measured control;
+    // `=lat`/`=q` keep the two sites independently bisectable.
     match crate::emit_config::active().k3_fuse_ngemv.as_deref() {
-        Some("1") => {}
+        None | Some("1") => {}
         Some("lat") if site == NormSite::Lat => {}
         Some("q") if site == NormSite::Q => {}
         _ => return false,
@@ -1079,6 +1063,17 @@ pub fn emit_k3_latent_moe(
     // router, so it overlaps the rank pass.
     let c_xe = gemv(b, xe, x, w.down_latent, lat, hid, deps[0]);
 
+    let si_l = tp.local(c.shared_inter);
+    // Only independent decode sequences take this overlap. Prefill token rows keep their proven
+    // recurrent schedule, and B1 keeps the fused packet below.
+    let early_shared = if seq_rows && !fuse_shared_glu(t, c.hidden) {
+        let c_sg = gemv(b, shg, x, w.shared_gate, si_l, hid, deps[0]);
+        let c_su = gemv(b, shu, x, w.shared_up, si_l, hid, deps[0]);
+        Some((c_sg, c_su))
+    } else {
+        None
+    };
+
     // Under TP the combine lands in the peer slot and is all-reduced BEFORE the
     // norm: `routed_expert_norm` is nonlinear, so normalising a partial sum
     // would be finite, plausible and wrong.
@@ -1217,7 +1212,10 @@ pub fn emit_k3_latent_moe(
         // Top-k tail, block per token. Bit-identical PER TOKEN to the decode tail (the kernel is
         // that kernel under a token loop), so a prefill chunk makes the selection decode would
         // have made for the same row — which is what makes the two phases the same model.
-        let c_rt = b.emit(DevOp::MoeRouterTopkPf, all.clone(), &[c_rl], |d| {
+        // One workgroup owns one token at a time. Launching more than T only creates empty
+        // interpreter entries; launching fewer keeps the kernel's existing strided token loop.
+        let router_blocks: Vec<u32> = (0..t.min(n_cu)).collect();
+        let c_rt = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_rl], |d| {
             d.t[0] = tab;
             d.t[1] = logit;
             d.t[3] = w.router_bias;
@@ -1388,7 +1386,6 @@ pub fn emit_k3_latent_moe(
     // branch too, so a fused emit here would poison (loudly, by design) rather than run. The
     // fusion is a real win on GLM's silu shared expert and is not available to this activation
     // until an epilogue takes the betas the way `moe_glu` does.
-    let si_l = tp.local(c.shared_inter);
     // FUSED gate|up|situ when the epilogue can take the betas, three packets otherwise.
     //
     // This is the fusion the comment above used to say was unavailable, and the blocker was real:
@@ -1423,8 +1420,14 @@ pub fn emit_k3_latent_moe(
             },
         )
     } else {
-        let c_sg = gemv(b, shg, x, w.shared_gate, si_l, hid, deps[0]);
-        let c_su = gemv(b, shu, x, w.shared_up, si_l, hid, deps[0]);
+        let (c_sg, c_su) = if let Some(pair) = early_shared {
+            pair
+        } else {
+            (
+                gemv(b, shg, x, w.shared_gate, si_l, hid, deps[0]),
+                gemv(b, shu, x, w.shared_up, si_l, hid, deps[0]),
+            )
+        };
         emit_situ_glu(b, cb, sha, shg, shu, t * si_l, n_cu, &[c_sg, c_su])
     };
 
@@ -2686,9 +2689,14 @@ pub fn emit_k3_model(
         let kda_pair;
         let mla_w;
         let mixer = if is_kda(l) {
+            let state = if crate::emit_config::active().k3_kda_conv_step_db {
+                crate::kda::declare_kda_state_db(b, &kda_l, &format!("kv.{l}."), slots, pos)
+            } else {
+                crate::kda::declare_kda_state(b, &kda_l, &format!("kv.{l}."), slots)
+            };
             kda_pair = Some((
                 crate::kda::declare_kda_weights(b, &kda_l, &format!("{lp}self_attn."), &lp),
-                crate::kda::declare_kda_state(b, &kda_l, &format!("kv.{l}."), slots),
+                state,
             ));
             let (kw, ks) = kda_pair.as_ref().unwrap();
             K3Mixer::Kda {
@@ -2866,21 +2874,22 @@ pub fn emit_k3_model(
     if k3_shard_head(c) {
         // XArgmaxFin SUBSUMES ArgmaxFin — it folds the AMAX_BLOCKS partials itself, rebases the
         // winning index by `rank * vocab_l` and takes the cross-rank max. Emitting both would fold
-        // twice and write the LOCAL winner's id first. Two xctr ids: the arrival gate and the
-        // peer-visible 8-byte value slot, distinct because one is an atomic counter and one is data.
+        // twice and write the LOCAL winner's id first. Two or three xctr ids: the arrival gate and
+        // peer-visible value line(s), distinct because one is an atomic counter and the others
+        // are data. Each 128-byte line carries sixteen u64 winners.
         let gate = tp.xgate;
-        tp.xgate += 2;
+        let value_lines = if s_rows > 16 { 2 } else { 1 };
+        tp.xgate += 1 + value_lines;
         b.emit(DevOp::XArgmaxFin, vec![0u32], &[c_am], |d| {
             d.t[0] = ids;
             d.t[1] = amax;
             d.i[0] = crate::AMAX_BLOCKS;
-            // n_batch. The fold publishes one u64 per sequence into ONE 128-byte xctr counter
-            // line, so it carries at most PLOW_XAMAX_MAX_BATCH = 16 — asserted rather than left
-            // to silently leave ids[16..] holding the previous step's token.
-            const XAMAX_MAX_BATCH: u32 = 16;
+            // n_batch. The fold publishes one u64 per sequence into one or two 128-byte peer
+            // lines, matching PLOW_XAMAX_MAX_BATCH in op_collective.h.
+            const XAMAX_MAX_BATCH: u32 = 32;
             assert!(
                 s_rows <= XAMAX_MAX_BATCH,
-                "XArgmaxFin carries at most {XAMAX_MAX_BATCH} sequences in one xctr counter line, \
+                "XArgmaxFin carries at most {XAMAX_MAX_BATCH} sequences in two xctr data lines, \
                  got {s_rows}"
             );
             d.i[1] = s_rows;
@@ -4154,6 +4163,10 @@ mod tests {
 
     /// Build the 93-layer hybrid at `t` rows, at a given TP degree.
     fn build_full_t(tp: u32, t: u32) -> packet::devbuild::Program {
+        build_full_rows(tp, t, RowKind::Tokens)
+    }
+
+    fn build_full_rows(tp: u32, t: u32, rows: RowKind) -> packet::devbuild::Program {
         let mut c = model_cfg();
         c.tp = tp;
         let mut mla: std::collections::BTreeSet<u32> =
@@ -4170,7 +4183,7 @@ mod tests {
             t,
             t,
             256,
-            RowKind::Tokens,
+            rows,
         );
         b.finish()
     }
@@ -4240,36 +4253,89 @@ mod tests {
         assert_eq!(n(DevOp::ArgmaxFin), 1);
     }
 
-    /// The narrow-norm fusion is OFF in a default emit, and that is the shipped state.
-    ///
-    /// `fuse_norm_gemv` is bit-exact in isolation but NOT end-to-end yet (its doc carries the
-    /// table). Until that is resolved the default emit must carry all 116 RMSNORM packets and no
-    /// `norm = 2` GEMV — this test is what stops it being switched on by accident, which on this
-    /// interpreter would be a silent ~1-ULP-per-layer drift rather than a failure.
     #[test]
-    fn the_narrow_norm_fusion_is_off_by_default() {
+    fn early_shared_gate_up_is_batched_decode_only_and_keeps_tp_slot_order() {
+        let locate = |p: &packet::devbuild::Program, suffix: &str| {
+            let weight = p
+                .tensors
+                .iter()
+                .position(|t| t.name.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing tensor ending in {suffix}"))
+                as u32;
+            p.insts
+                .iter()
+                .position(|i| i.t[2] == weight)
+                .unwrap_or_else(|| panic!("missing instruction for weight handle {weight}"))
+        };
+
+        let batched = build_full_rows(8, 32, RowKind::Sequences);
+        let prefill = build_full_rows(8, 128, RowKind::Tokens);
+        let score_name = "layers.1.block_sparse_moe.gate.weight";
+        let latent_name = "layers.1.block_sparse_moe.routed_expert_down_proj.weight";
+        let gate_name = "layers.1.block_sparse_moe.shared_experts.gate_proj.weight";
+        let up_name = "layers.1.block_sparse_moe.shared_experts.up_proj.weight";
+        let down_name = "layers.1.block_sparse_moe.shared_experts.down_proj.weight";
+
+        let score = locate(&batched, score_name);
+        let latent = locate(&batched, latent_name);
+        let gate = locate(&batched, gate_name);
+        let up = locate(&batched, up_name);
+        let router = batched
+            .insts
+            .iter()
+            .position(|i| i.op == DevOp::MoeRouterTopkPf as u16)
+            .expect("missing batched router");
+        assert!(score < gate && score < up && gate < router && up < router);
+        let h3 = batched.insts[score].t[1];
+        assert_eq!(batched.insts[latent].t[1], h3);
+        assert_eq!(batched.insts[gate].t[1], h3);
+        assert_eq!(batched.insts[up].t[1], h3);
+
+        let prefill_router = prefill
+            .insts
+            .iter()
+            .position(|i| i.op == DevOp::MoeRouterTopkPf as u16)
+            .expect("missing prefill router");
+        assert!(locate(&prefill, gate_name) > prefill_router);
+        assert!(locate(&prefill, up_name) > prefill_router);
+
+        let down = locate(&batched, down_name);
+        let combine = batched
+            .insts
+            .iter()
+            .position(|i| i.op == DevOp::MoeCombinePf as u16)
+            .expect("missing routed combine");
+        let routed_reduce = ((combine + 1)..down)
+            .find(|&id| {
+                let op = batched.insts[id].op;
+                op == DevOp::XReduce as u16 || op == DevOp::XReduceTwoShot as u16
+            })
+            .expect("missing routed TP collective after combine");
+        let mut waits = Vec::new();
+        for entry in batched.stream.iter().filter(|e| e.inst as usize == down) {
+            for k in 0..entry.wait_len as usize {
+                waits.push(batched.waits[entry.wait_ofs as usize + k].id as usize);
+            }
+        }
+        assert!(waits.contains(&routed_reduce));
+    }
+
+    /// The default decode emit carries the full-model-gated narrow-norm fusion.
+    #[test]
+    fn the_narrow_norm_fusion_is_on_by_default() {
         let p = build_full(8);
         let fused = p
             .insts
             .iter()
             .filter(|i| i.op == DevOp::Gemv as u16 && i.i[3] == 2)
             .count();
-        assert_eq!(
-            fused, 0,
-            "PLOW_K3_FUSE_NGEMV must be opt-in: no norm=2 GEMV in a default emit"
-        );
-        // Every narrow norm still has its own packet. The exact per-width counts (92 at 3584,
-        // 24 at 1536) are a property of the 93-layer ASSET, not of this synthetic cfg, so they
-        // are recorded in `fuse_norm_gemv`'s doc and checked against a real emit, not here.
+        assert!(fused > 0, "the default K3 decode must carry norm=2 GEMVs");
         let norms = p
             .insts
             .iter()
             .filter(|i| i.op == DevOp::RmsNorm as u16)
             .count();
-        assert!(
-            norms > 0,
-            "the fold is off, so the RMSNORM packets must all still be emitted"
-        );
+        assert!(norms > 0, "non-fusable RMSNORM packets must remain");
         let widths: std::collections::BTreeSet<u32> = p
             .insts
             .iter()
@@ -4520,6 +4586,24 @@ mod tests {
             .unwrap();
         assert_eq!(al.blocks, 1);
         assert_eq!(al.i[0], t);
+    }
+
+    #[test]
+    fn grouped_router_uses_one_block_per_token_up_to_the_cu_count() {
+        for (t, want) in [(32, 32), (128, 128), (512, 256)] {
+            let rows = if t == 32 {
+                RowKind::Sequences
+            } else {
+                RowKind::Tokens
+            };
+            let p = build_full_rows(8, t, rows);
+            let router = p
+                .insts
+                .iter()
+                .find(|i| i.op == DevOp::MoeRouterTopkPf as u16)
+                .expect("missing grouped router");
+            assert_eq!(router.blocks, want, "T={t}");
+        }
     }
 
     /// The gathered row arrays are sized on the MPF_BM-PADDED bound, not on `T*k`.
