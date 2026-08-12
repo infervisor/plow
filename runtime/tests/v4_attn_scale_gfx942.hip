@@ -33,6 +33,13 @@
 #include "amd_common.h"
 #include "op_deepseek_v4.h"
 
+__global__ __launch_bounds__(PLOW_THREADS) void k_topk(int* idx, const float* sc, unsigned T,
+                                                       unsigned NC, unsigned K, unsigned ratio,
+                                                       int off) {
+    __shared__ __align__(16) char raw[40960];
+    d_v4_index_topk(idx, sc, T, NC, K, ratio, off, blockIdx.x, gridDim.x, (float*)raw);
+}
+
 #define HC_CHECK(x)                                                                               \
     do {                                                                                          \
         hipError_t e_ = (x);                                                                      \
@@ -115,6 +122,35 @@ int main(void) {
         hipFree(d_o);
         hipFree(d_i);
     }
+    /* THE SAME QUESTION FOR THE TOP-K, which runs ONE block per row and so one
+     * block per layer at decode. If its total is flat as rows are added it is
+     * starved too, and the fix is a multi-block histogram; if it scales from
+     * the first row, one block already saturates something. */
+    {
+        const unsigned NC = 4096, KK = 512;
+        printf("\n  top-k: one block per row\n");
+        printf("  %4s %7s %11s %13s %10s\n", "rows", "blocks", "us total", "us/row", "vs 1");
+        float* scb = nullptr;
+        int* oi = nullptr;
+        HC_CHECK(hipMalloc(&scb, (size_t)64 * NC * 4));
+        std::vector<float> hh((size_t)64 * NC);
+        for (auto& v : hh) v = (float)drand48();
+        HC_CHECK(hipMemcpy(scb, hh.data(), hh.size() * 4, hipMemcpyHostToDevice));
+        HC_CHECK(hipMalloc(&oi, (size_t)64 * KK * 4));
+        double b0 = 0.0;
+        const unsigned RS[] = {1u, 2u, 4u, 8u, 16u, 64u};
+        for (unsigned ri = 0; ri < 6; ri++) {
+            const unsigned rows = RS[ri];
+            const double us =
+                time_us([&] { k_topk<<<rows, PLOW_THREADS>>>(oi, scb, rows, NC, KK, 0, 0); });
+            if (ri == 0) b0 = us;
+            printf("  %4u %7u %11.2f %13.2f %9.2fx\n", rows, rows, us, us / rows,
+                   (us / rows) / b0);
+        }
+        hipFree(scb);
+        hipFree(oi);
+    }
+
     printf("\n  If us/token falls sharply through T=4 (grid 256 < 304 CUs) the op is\n"
            "  CU-STARVED at decode and needs split-K across blocks. If it is flat,\n"
            "  the inner loop is the cost and only an MFMA tile helps.\n");
