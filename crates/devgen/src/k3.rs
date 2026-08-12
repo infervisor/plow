@@ -354,7 +354,7 @@ fn fuse_shared_glu(t: u32, hidden: u32) -> bool {
 
 /// May a `b=1` [`DevOp::RmsNorm`] be folded into the `b=256` [`DevOp::Gemv`] that reads it?
 ///
-/// This is recommendation 2 of `perf-data/k3-decode-counter-graph.md`, taken for the ONE of its
+/// This is recommendation 2 of `perf-data/archive/k3/k3-decode-counter-graph.md`, taken for the ONE of its
 /// three named ops that survives the check `op_gemm.h` demands before any such fusion.
 ///
 /// # The lever, and why a narrow gate in front of a wide consumer is worth more than it looks
@@ -416,7 +416,7 @@ fn fuse_shared_glu(t: u32, hidden: u32) -> bool {
 /// data-dependent, the token stream stayed IDENTICAL over 32 steps, and only the logits drifted
 /// ~1 ULP per layer — the exact scale `op_collective.h` prices at ~0.03 logits over 92 MoE layers.
 /// The standalone kernel test PASSED throughout, because it declared two separate `__shared__`
-/// arrays and therefore did not alias. See `perf-data/k3-narrow-gate-fusion.md` §4.
+/// arrays and therefore did not alias. See `perf-data/archive/k3/k3-narrow-gate-fusion.md` §4.
 ///
 /// # STATUS: BIT-EXACT END-TO-END. DEFAULT ON.
 ///
@@ -613,7 +613,7 @@ impl K3BlockCfg {
 ///
 /// **One workgroup per token.** Both reductions span the full 7168-wide row and the softmax couples
 /// the rows, so `blocks = min(T, n_cu)` — at `T = 1` that is 1 of 256. It stays ONE packet:
-/// `perf-data/kimi-k3-kernel-gap.md` §10 item 7 measured "three packets x 186 is 3.3 ms/token of
+/// `perf-data/archive/k3/kimi-k3-kernel-gap.md` §10 item 7 measured "three packets x 186 is 3.3 ms/token of
 /// pure protocol", which rules out finishing the reduction in a second packet.
 ///
 /// The launch geometry is still one workgroup, but the BODY is no longer what that note assumed.
@@ -863,7 +863,7 @@ pub fn emit_mla_out_gate(
 ///
 /// # THIS IS NOT A REMOVAL, and that is the whole point
 ///
-/// `perf-data/kimi-k3-kernel-gap.md` §8c calls the fix "skip both `HeadNormRope` emits — a removal,
+/// `perf-data/archive/k3/kimi-k3-kernel-gap.md` §8c calls the fix "skip both `HeadNormRope` emits — a removal,
 /// effort XS". It is not. The k-side [`DevOp::HeadNormRope`] is the **only writer of the
 /// `kv.{l}.krot` cache row**, AND it is the instruction that
 /// `plowrt::exec::amd::kv_write_row_field` and `runtime/tests/glm52_decode.c:419` both SCAN FOR in
@@ -1508,7 +1508,7 @@ pub fn emit_k3_latent_moe(
     // agent-visible before this rank signals, and the up GEMV is the only writer of slot 2.
     //
     // Slot 2 is safe to reuse next layer for the same reason slot 0 is
-    // (`perf-data/kimi-k3-tp-peer-slots.md`): a peer signals the NEXT layer's attention
+    // (`perf-data/archive/k3/kimi-k3-tp-peer-slots.md`): a peer signals the NEXT layer's attention
     // reduce only after leaving this one, and two collectives separate the two writes.
     if shard_up {
         // With the outer residual folded in, one add is still owed (`out = ffn + prefix`) and
@@ -2495,7 +2495,7 @@ pub struct K3ModelCfg {
 /// fluent, plausible, WRONG output — no crash, no NaN — which is why the distinction is a type
 /// and not a `bool` parameter that reads as `false` at the call site.
 ///
-/// See `perf-data/k3-batched-decode-design.md`.
+/// See `perf-data/archive/k3/k3-batched-decode-design.md`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RowKind {
     /// Consecutive tokens of one sequence.

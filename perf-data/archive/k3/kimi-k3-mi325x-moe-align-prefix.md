@@ -72,7 +72,7 @@ nix develop --command env \
 ```
 
 The server/client settings are the same as
-`perf-data/kimi-k3-mi325x-moe-tile-search.md`, changing only the two primary
+`perf-data/archive/k3/kimi-k3-mi325x-moe-tile-search.md`, changing only the two primary
 decode objects in `PLOW_HSACO`. Raw evidence:
 
 ```text

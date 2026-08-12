@@ -151,7 +151,7 @@ Warmup: arms emitted with different `--n-cu` were observed to sample warmup toke
 | `PLOW_K3_SHARD_UP` | **on** (`!= "0"`, needs tp>1) | column-parallel `routed_expert_up_proj`, gather folded into the shared reduce. −22.8% GEMV bytes |
 | `PLOW_K3_SHARD_HEAD=1` | off | column-parallel `lm_head` (`XArgmaxFin`). Gate passes; `k3_tp_equivalence.sh` CANNOT gate it — `--dump-logits` dumps `act.logits`, `vocab/tp` wide at tp=8, so its shape check fails by construction |
 | `PLOW_K3_FUSE_ARNORM` | **on** (`!= "0"`) | fuse the AttnRes norm |
-| `PLOW_K3_FUSE_NGEMV` | **on** | fold the `b=1` RMSNORM gates into their GEMV consumers (`routed_expert_norm` x92, `q_a_layernorm` x24). Removes 116 packets and moves critical path 1831 -> 1715. Current TP8 full-logit A/B is byte-exact; two served pairs improve TPOT 1.33--1.45 ms. `=0` restores the control. `perf-data/k3-narrow-gate-fusion.md` |
+| `PLOW_K3_FUSE_NGEMV` | **on** | fold the `b=1` RMSNORM gates into their GEMV consumers (`routed_expert_norm` x92, `q_a_layernorm` x24). Removes 116 packets and moves critical path 1831 -> 1715. Current TP8 full-logit A/B is byte-exact; two served pairs improve TPOT 1.33--1.45 ms. `=0` restores the control. `perf-data/archive/k3/k3-narrow-gate-fusion.md` |
 | `PLOW_SEG_PER_OP=1` | off | one AQL segment per op (host-side chaining). **BROKEN at TP8** — ranks desync, a collective hits its deadline and returns WITHOUT reducing |
 | `PLOW_FINE_FORCE=1` | off | keep genuinely-sparse `Dep::Fine` edges. **No-op on K3** — the K3 emitter creates zero fine deps |
 | `PLOW_UNISEG=1` | off | force one wave-class segment |
@@ -308,7 +308,7 @@ Composed (chunked prefill + prefix cache), GSM8K B=4/CONC=4: **758 s -> 561 s, 2
 ## 11.1 Emitting a batched blob
 
 `PLOW_DECODE_BATCH=B` makes the DECODE program carry **B independent sequences**, which is a
-different thing from a prefill bucket's `t` rows — see `k3-batched-decode-design.md` §1 for why the
+different thing from a prefill bucket's `t` rows — see `archive/k3/k3-batched-decode-design.md` §1 for why the
 distinction is the whole problem. B is capped at 16 (`PLOW_GEMV_MAXM`).
 
 ```bash
@@ -395,7 +395,7 @@ the suffix. The KV rows are already the slot's own.
 
 The design and the general problem — why prefix caching, paged attention and speculative decoding
 all assume positional state, and what changes when 69 of 93 layers keep a *folded* state instead —
-are written up separately in **`perf-data/k3-prefix-cache-design.md`**. Read that before changing
+are written up separately in **`perf-data/archive/k3/k3-prefix-cache-design.md`**. Read that before changing
 anything here.
 
 Operationally: 56 MiB per slot per rank, allocated lazily on first arm (a workload with no shared
@@ -430,7 +430,7 @@ which is exactly how the missing `begin_slot` on the TP path was found (81.0% ->
   `cargo build --release -p plowrt --features hsa` after a workspace test. Hit twice.
 * **A 500 from `serve` at B>1 kills every in-flight request at once**, because they share the decode
   step. A burst of exactly B failures is ONE event. The known open one is a rare cross-rank
-  divergence in `d_xargmax_fin_mega` (~1 request in 200) — `k3-batched-decode-design.md` §9.
+  divergence in `d_xargmax_fin_mega` (~1 request in 200) — `archive/k3/k3-batched-decode-design.md` §9.
 
 ---
 

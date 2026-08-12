@@ -488,7 +488,7 @@ __device__ __forceinline__ void d_xreduce_mega(
  * following line. `PLOW_XAMAX_MAX_BATCH` and the emitter's matching assert are the two halves of
  * the 32-row bound.
  *
- * KNOWN, UNRESOLVED (perf-data/k3-batched-decode-design.md §9): a GSM8K run at B=4 hit ONE
+ * KNOWN, UNRESOLVED (perf-data/archive/k3/k3-batched-decode-design.md §9): a GSM8K run at B=4 hit ONE
  * cross-rank disagreement in ~1e4-1e5 steps where two ranks folded DIFFERENT winners that both
  * lay in the same rank's vocab shard — i.e. a peer's read of a published `myv[b]` did not match
  * what the publisher folded. Not a deadline bail (that would surface an id from the bailing

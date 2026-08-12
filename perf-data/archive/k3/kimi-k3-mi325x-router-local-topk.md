@@ -65,7 +65,7 @@ nix develop --command env \
 ```
 
 The server and client settings match
-`perf-data/kimi-k3-mi325x-moe-align-prefix.md`, changing only the two primary
+`perf-data/archive/k3/kimi-k3-mi325x-moe-align-prefix.md`, changing only the two primary
 decode objects in `PLOW_HSACO`. Raw evidence:
 
 ```text

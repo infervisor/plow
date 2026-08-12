@@ -274,7 +274,7 @@ nix develop --command env \
 
 The V2 final-ladder asset scored GSM8K 197/200 (8-shot, greedy, N=200), exactly
 matching the adopted single-rung B1 score. Its served 8K/16K/32K context gates
-also passed. See `perf-data/kimi-k3-mi325x-fp8-mla-v2.md`.
+also passed. See `perf-data/archive/k3/kimi-k3-mi325x-fp8-mla-v2.md`.
 
 ## 7. Serve
 
@@ -405,7 +405,7 @@ register spills, and per-layer counter convergence dominate.
 Rank these against this recipe as the control:
 
 The B1 long-context baseline is frozen in
-`perf-data/kimi-k3-mi325x-b1-128k.md`: served TPOT grows from 56.33 ms at 8K
+`perf-data/archive/k3/kimi-k3-mi325x-b1-128k.md`: served TPOT grows from 56.33 ms at 8K
 to 82.58 ms at 128K, while TTFT grows from 4.87 s to 156.63 s.
 
 1. **K3 FP8 MLA flash prefill — adopted.** The op110 four-wave V2 arm reduces
@@ -464,9 +464,9 @@ that no TP degree can fit, or KV capacity beyond the current 32K/B32 target.
 
 Raw evidence is in:
 
-- `perf-data/kimi-k3-mi325x-ladder-130tps.md`
-- `perf-data/kimi-k3-mi325x-stage4.md`
-- `perf-data/kimi-k3-mi325x-kernel-audit.md`
-- `perf-data/kimi-k3-mi325x-prefill-experiments.md`
-- `perf-data/kimi-k3-mi325x-b32-serve.md`
-- `perf-data/kimi-k3-mi325x-vllm-eager.md`
+- `perf-data/archive/k3/kimi-k3-mi325x-ladder-130tps.md`
+- `perf-data/archive/k3/kimi-k3-mi325x-stage4.md`
+- `perf-data/archive/k3/kimi-k3-mi325x-kernel-audit.md`
+- `perf-data/archive/k3/kimi-k3-mi325x-prefill-experiments.md`
+- `perf-data/archive/k3/kimi-k3-mi325x-b32-serve.md`
+- `perf-data/archive/k3/kimi-k3-mi325x-vllm-eager.md`

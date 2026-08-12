@@ -652,7 +652,7 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
                  the DECLARE: `declare_glm` sizes every expert weight with K = hidden, wrong here \
                  by {}/{} = 2x, and the combine accumulator must run at latent rather than hidden \
                  width (the four decode `MoeCombine` `d.i[0] = h` sites and the two prefill \
-                 combine sites, which perf-data/kimi-k3-kernel-gap.md §5e omits from its list).",
+                 combine sites, which perf-data/archive/k3/kimi-k3-kernel-gap.md §5e omits from its list).",
                 c.hidden,
                 c.moe_latent,
                 c.moe_latent,
@@ -755,7 +755,7 @@ fn k3_gaps(c: &K3Cfg) -> Vec<K3Gap> {
                  patch its out_row to the current position every step. Delete it and the scan \
                  simply finds fewer layers — no error, no count check. So a NoPE MLA needs the \
                  WRITE KEPT and the ROTATION removed, not the op removed; \
-                 perf-data/kimi-k3-kernel-gap.md 8c and item #2 (\"a removal, effort XS\") are \
+                 perf-data/archive/k3/kimi-k3-kernel-gap.md 8c and item #2 (\"a removal, effort XS\") are \
                  wrong on this point. The KV layout does NOT change: krot stays [ctx][{dr}] and \
                  holds the raw, unrotated k_rot.",
                 c.mla_nope,
@@ -1204,7 +1204,7 @@ fn k3_build_model(
     // BATCHED DECODE. `PLOW_DECODE_BATCH=B` makes the DECODE program carry B INDEPENDENT
     // SEQUENCES rather than one, which is a different thing from a prefill bucket's `t` rows and
     // is why it is paired with `RowKind::Sequences` rather than just a larger `t`
-    // (perf-data/k3-batched-decode-design.md §1). B=1 is byte-identical to the pre-batch blob.
+    // (perf-data/archive/k3/k3-batched-decode-design.md §1). B=1 is byte-identical to the pre-batch blob.
     //
     // Above 16 rows the gfx942 GEMV object must carry PLOW_GEMV_WALK: its largest compiled row
     // bucket is 16, and the walk is what covers the remaining rows instead of leaving stale

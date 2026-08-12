@@ -279,7 +279,7 @@ positions and kvlens it exists to test. B=4, B=8 and B=16 agree exactly.
 
 ## 8.5 What is NOT done, stated plainly
 
-* ~~**GSM8K at B>1 has not been run.**~~ **RUN — see `perf-data/k3-gsm8k.md` §2.** Three runs:
+* ~~**GSM8K at B>1 has not been run.**~~ **RUN — see `perf-data/archive/k3/k3-gsm8k.md` §2.** Three runs:
   B=1/c1 **0.8100**, B=4/c1 **0.8400**, B=4/c4 **0.9031**. Accuracy HOLDS at B=4 — and the
   intermediate reading that the grouped MoE kernel is *better* was **refuted by its own control**:
   isolate the kernel (B=1/c1 -> B=4/c1) and the effect is +3.0pp at **z=0.79, not significant**.

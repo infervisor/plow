@@ -2,7 +2,7 @@
  *
  * AttnRes runs 186 times per K3 token (2 per layer x 93 layers) on ONE workgroup, because both
  * reductions span the full 7168-wide row and the softmax couples the rows
- * (`crates/devgen/src/k3.rs::emit_attn_res`). `perf-data/kimi-k3-kernel-gap.md` §10 item 7 forbids
+ * (`crates/devgen/src/k3.rs::emit_attn_res`). `perf-data/archive/k3/kimi-k3-kernel-gap.md` §10 item 7 forbids
  * splitting it into a second packet, so the only lever is the body of the single workgroup.
  *
  * This file holds BOTH bodies:

@@ -87,7 +87,7 @@ the measured K3 path.
 ## Adopted single-stream recipe
 
 The gated asset now uses the 128-workgroup GEMV ownership packet described in
-`perf-data/kimi-k3-mi325x-gemv-wg152.md` and FP8-KV decode objects containing the
+`perf-data/archive/k3/kimi-k3-mi325x-gemv-wg152.md` and FP8-KV decode objects containing the
 compact exact-counter audit kernel. The composed 64-token median is 54.463
 ms/token (18.4 tok/s), with all eight ranks token-identical. The OpenAI serve
 gate also passed on this exact packet/object/runtime combination.

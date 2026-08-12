@@ -143,7 +143,7 @@ a 32 GiB card.
 | lever | flag / env | default | effect |
 |---|---|---|---|
 | VMM prefix sharing | `--vmm-prefix` / `PLOW_VMM_PREFIX=1` | **off** | shared prefix's full-attention KV held once, `cuMemMap`'d into every sharer (`memory::prefix::PrefixCache`). Measured warm-TTFT 3.6×(4k)→23.8×(128k), dedup ~10 GiB/sharer at 31B/128k, TPOT-neutral (`perf-data/vmm-prefix-v1.md`). Block size is the real knob (`--vmm-block-mib`; 64 MiB @128k won on the measured part). Hit stats on `/metrics` via `VmmStatsHandle`. *(nvidia)* |
-| Same-slot prefix cache | `--prefix-cache` / `PLOW_PREFIX_CACHE=1` | off | for recurrent/linear-attn models: MLA KV half is free, recurrent state checkpointed via one batched D2D copy. Measured ~24% lower per-query latency, ~1.9× better median TTFT at 75% hit (`perf-data/k3-prefix-cache-design.md`). *(amd, `$PARALLEL = tp` path)* |
+| Same-slot prefix cache | `--prefix-cache` / `PLOW_PREFIX_CACHE=1` | off | for recurrent/linear-attn models: MLA KV half is free, recurrent state checkpointed via one batched D2D copy. Measured ~24% lower per-query latency, ~1.9× better median TTFT at 75% hit (`perf-data/archive/k3/k3-prefix-cache-design.md`). *(amd, `$PARALLEL = tp` path)* |
 
 > **Pitfall — report the hit rate with any prefix-cache number.** A cache that
 > misses pays snapshot/insert cost with no benefit; at low hit rates the

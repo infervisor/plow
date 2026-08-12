@@ -3,7 +3,7 @@
 #
 #   ./scripts/spec_gen_ids.sh [assets] [steps]
 #
-# `perf-data/k3-speculative-decoding.md` §1 measures n-gram acceptance on REAL tokens rather than
+# `perf-data/archive/k3/k3-speculative-decoding.md` §1 measures n-gram acceptance on REAL tokens rather than
 # on words, because word granularity flatters prompt-lookup (a matched word is 1-2 BPE tokens).
 # This is what produces those tokens; pipe the bracketed id list into `scripts/spec_accept_sim.py`.
 #

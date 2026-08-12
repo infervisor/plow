@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # k3_mxfp4_nibble_oracle.py — settle the ONE unverified bit of plow's MXFP4 encoding. [K3-MXFP4]
 #
-# `perf-data/kimi-k3-kernel-gap.md` §4c: everything about plow's mxfp4 layout was verified
+# `perf-data/archive/k3/kimi-k3-kernel-gap.md` §4c: everything about plow's mxfp4 layout was verified
 # byte-exact against the Kimi-K3 checkpoint — `weight_packed [N, K/2]`, `weight_scale [N, K/32]`,
 # group 32 along K, E8M0 bias 127 confirmed empirically from the scale bytes — EXCEPT the nibble
 # order, and that section is explicit that the data provably CANNOT settle it:

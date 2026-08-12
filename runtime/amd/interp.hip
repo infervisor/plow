@@ -35,7 +35,7 @@
  * These seven arms landed with no object-size or ITL measurement at all, in every object Gemma-4,
  * Qwen and GLM-5.2 load — none of which dispatch a single one of them. Gating restores the
  * property the other five axes already have: an object carries an arm because a model needs it.
- * `perf-data/kimi-k3-kernel-gap.md:791` independently reached the same conclusion from the
+ * `perf-data/archive/k3/kimi-k3-kernel-gap.md:791` independently reached the same conclusion from the
  * register side ("Build it as a 4th co-resident object, not an arm").
  *
  * TURNING THIS OFF IS NOT SILENT — see `plow_k3_arms_1` below. AMD's dispatch `default:` writes
@@ -953,7 +953,7 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
          * falls into the scalar `else`, the body the 2026-07-28 rewrite replaced for being 7.7x
          * slower. GLM-5.2's V=256 never hits it; Kimi-K3's `v_head_dim: 128` hits it at TP1
          * (bh = 96, 768 > nblk/8) and at batch >= 2 on TP4. Recorded in
-         * perf-data/kimi-k3-kernel-gap.md §8b as item 11.
+         * perf-data/archive/k3/kimi-k3-kernel-gap.md §8b as item 11.
          *
          * THIS BRANCH does not touch GLM: only V in [128, 256) routes here, and GLM-5.2's V is
          * 256. V < 128 keeps the old behaviour (scalar body) rather than growing a third
@@ -3065,7 +3065,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 /* The two knobs do not compose, and combined they are silently worse than either. The HIER_CEIL
  * follower hand-rolls its relaxed RMW rather than calling `ctr_signal`, so under SC1 it would
  * also skip the `s_waitcnt vmcnt(0)` that arm performs — 248 of 256 workgroups would bump their
- * counter without retiring their stores at all. `perf-data/k3-hier2-ceiling.md` §2 says to drop
+ * counter without retiring their stores at all. `perf-data/archive/k3/k3-hier2-ceiling.md` §2 says to drop
  * SC1 anyway; this makes the combination a build error instead of a debugging session. */
 #if PLOW_GATE_HIER_CEIL && PLOW_GATE_SC1
 #error "PLOW_GATE_HIER_CEIL and PLOW_GATE_SC1 are mutually exclusive (see k3-hier2-ceiling.md §2)"
@@ -3162,7 +3162,7 @@ __device__ __forceinline__ void ctr_signal(uint32_t* p) {
      * It is not a speedup either: the numerically-correct variant measured +0.67% on K3 TP8, and
      * `PLOW_GATE_HIER_CEIL` — which keeps the release and amortises it per XCD instead — measured
      * -14.5%. The two do not compose (see the #error above). Full record and the token streams:
-     * `runtime/amd/amd_common.h` and `perf-data/k3-hier2-ceiling.md` §2.
+     * `runtime/amd/amd_common.h` and `perf-data/archive/k3/k3-hier2-ceiling.md` §2.
      *
      * The wait side is UNCHANGED — `ctr_acquire` still takes the agent acquire and its
      * `buffer_inv`. Dropping it additionally requires every activation LOAD to be `sc1`.

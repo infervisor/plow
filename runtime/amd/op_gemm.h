@@ -1817,7 +1817,7 @@ __device__ void d_quant_fp8(unsigned char* __restrict__ xq_, bf16* __restrict__ 
  * reduction across N consumers costs (N-1) extra reductions -- check N first.
  *
  * It is back because K3 answers that check differently, and the census is in
- * `perf-data/k3-decode-counter-graph.md` plus the fan-out pass in `k3.rs fuse_norm_gemv`:
+ * `perf-data/archive/k3/k3-decode-counter-graph.md` plus the fan-out pass in `k3.rs fuse_norm_gemv`:
  * 92 of K3's 116 decode RMSNORMs have fan-out ONE (`routed_expert_norm` -> the latent up
  * projection), so mode 2 there costs ZERO extra reductions, not four. K3 also pays far more
  * per packet than Gemma did: its decode graph is a 1831-level chain at mean width 1.41, so a

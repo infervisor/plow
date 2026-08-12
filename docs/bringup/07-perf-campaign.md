@@ -50,7 +50,7 @@ Three properties separate a campaign number from a benchmark you can't trust:
   baseline for `$GPU`.
 * **Behind a correctness gate.** No performance cell is recorded for an arm that
   has not passed the token-identity gate that same build, plus at least one
-  accuracy number for the campaign (`perf-data/k3-gsm8k.md`). A fast wrong kernel
+  accuracy number for the campaign (`perf-data/archive/k3/k3-gsm8k.md`). A fast wrong kernel
   is a wrong kernel.
 * **Swept, not single-point.** plow's fixed-width decode makes its position
   strongly concurrency- and context-dependent — in one recorded campaign it led
@@ -194,7 +194,7 @@ perf-data/tools/gpulease gsm8k scripts/bench_gsm8k.sh   # 8-shot greedy, n=200
 ```
 
 A throughput number without an accuracy number is not publishable against a
-comparator (`perf-data/k3-gsm8k.md`): token-identity proves self-consistency
+comparator (`perf-data/archive/k3/k3-gsm8k.md`): token-identity proves self-consistency
 only — a blob wrong the same way on every rank passes it.
 
 ### 2. Roofline sanity (so "slow" vs "the box is the wall" is decided by arithmetic)
@@ -461,7 +461,7 @@ The model completes bringup when **all** hold:
 | `scripts/bench_gsm8k.sh` | whole-stack accuracy battery (GSM8K 8-shot greedy) |
 | `$RESULTS` (`perf-data/plow-gfx942/` is the one per-ISA home in the tree today) | the per-ISA results home (README = index, LESSONS = method) |
 | `perf-data/b2-concurrency-family.md`, `serving-capacity-report.md` | the model campaign template (tables, honesty banner, per-model limiter, open-work) |
-| `perf-data/k3-gsm8k.md`, `perf-data/gemma12b-gh200-prefill-campaign.md` | accuracy-number method; roofline / prefill campaign |
+| `perf-data/archive/k3/k3-gsm8k.md`, `perf-data/gemma12b-gh200-prefill-campaign.md` | accuracy-number method; roofline / prefill campaign |
 
 Architecture reading: `docs/arch/06-runtime.md` (execution model),
 `docs/arch/11-tuning-coverage.md` and `docs/arch/12-using-the-tuner.md` (what the

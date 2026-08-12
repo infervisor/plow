@@ -144,7 +144,7 @@ whereas (1) and (3) scale only parts of it.
 entries removed` at emit time, and `disasm --counters` now finds 0 remaining redundant edges.
 
 (2) **is IMPLEMENTED for `RmsNorm` only, and is OFF by default pending a numerical issue**, and the numbers above oversold it in one specific way. See
-`perf-data/k3-narrow-gate-fusion.md`. In short:
+`perf-data/archive/k3/k3-narrow-gate-fusion.md`. In short:
 
 * **The chain-level claim held exactly.** Folding all 116 `RmsNorm` gates into their GEMV
   consumers took the decode program 2459 -> 2343 packets, 2969 -> 2853 edges, and the critical

@@ -13,7 +13,7 @@
  * whether THIS PART agrees: if the hardware or the compiler's denormal mode flushes fp16
  * subnormals to zero, then code 1 — the value 0.5, one magnitude in eight — silently decodes to
  * 0.0. Nothing faults. The GEMV returns finite, plausible, wrong numbers, which is precisely the
- * failure mode `perf-data/kimi-k3-kernel-gap.md` §4c warns reads as "the model is just bad".
+ * failure mode `perf-data/archive/k3/kimi-k3-kernel-gap.md` §4c warns reads as "the model is just bad".
  *
  * So this runs the REAL `fp4_to_bf16v8x4` on device over every nibble value in every one of the 8
  * positions within a word, at E8M0 scales spanning the exponent range a quantizer emits, and
