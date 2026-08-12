@@ -483,3 +483,22 @@ stage executes against), `docs/arch/12-using-the-tuner.md` (reading inventories,
 tiers, and the record schema), `perf-data/px16-decode-occupancy.md` /
 `perf-data/px19-tile-graph.md` (measured occupancy / tile-granularity results
 worth reading before re-deriving them).
+# Shape-keyed GEMV workgroup tuning
+
+For a measured GEMV shape, pass an emit-time table rather than changing the
+kernel or runtime globally:
+
+```text
+PLOW_GEMV_WG_TUNING='896x7168=224,1536x7168=152' plowc ...
+```
+
+Entries are `N x K = workgroups`; matching is exact and the first matching
+entry wins. Invalid or unrelated entries are ignored. The setting is currently
+consumed by K3's blocked GEMV emitter only; unset output is byte-identical to
+the default. It changes packet workgroup counts, so the corresponding object
+must be rebuilt and audited, while the HSACO does not need a new kernel arm.
+
+Keep tables tied to measured `(arch, model, compiler, object)` provenance. A
+future tuner can emit this table from the existing block-sweep results; do not
+make an unmeasured heuristic the default because workgroup caps trade occupancy
+against bandwidth and can regress wide shapes.

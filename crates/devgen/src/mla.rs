@@ -2243,6 +2243,22 @@ pub(crate) fn blocked_gemv_cus(cus: &[u32], n: u32) -> Vec<u32> {
     cus[..need as usize].to_vec()
 }
 
+/// Apply an opt-in shape-keyed cap, then reuse the standard fixed-point mapping.
+pub(crate) fn blocked_gemv_cus_tuned(cus: &[u32], n: u32, k: u32) -> Vec<u32> {
+    let Some(cap) = emit_config::active().gemv_wg_for(n, k) else {
+        return blocked_gemv_cus(cus, n);
+    };
+    if !wgfit() || cus.is_empty() || n == 0 {
+        return cus.to_vec();
+    }
+    let mut scoped = cus.to_vec();
+    scoped.truncate(cap.min(scoped.len() as u32).max(1) as usize);
+    let per = n.div_ceil(scoped.len() as u32);
+    let need = n.div_ceil(per).clamp(1, scoped.len() as u32);
+    scoped.truncate(need as usize);
+    scoped
+}
+
 /// Emit the shared MLA attention sub-block (input norm -> q/kv down + absorbed folds -> dynamic
 /// interleaved RoPE on the 64 rope dims -> FLASH_MLA_DECODE -> merge -> O_UV_FOLD -> o_proj ->
 /// residual -> post-attention norm). Writes `n.xn2` (the FFN input) and returns the post-attn-norm

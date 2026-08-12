@@ -191,7 +191,38 @@ packet-layout-visible. These cannot be swept independently.
   A miss is byte-identical to "never measured" — if a just-measured shape still
   reports `analytical cold start` / `portable`, the campaign published into the
   wrong cell or under a stale digest. This check is the difference between a
-  working campaign and a green-gated no-op.
+   working campaign and a green-gated no-op.
+
+### 5a. Publish shape-keyed GEMV workgroup findings
+
+For a GEMV workgroup cap that is not yet represented by a typed tuner record,
+publish the measured result as an emit-time table while preserving the default:
+
+```bash
+PLOW_GEMV_WG_TUNING='896x7168=224,1536x7168=152' \
+  plowc --emit devblob ...
+```
+
+The table is exact `(N,K)` matching and is consumed only by the K3 blocked-GEMV
+emitter. An unset table must be the control packet; compare its packet census,
+object resources, correctness output, and served TPOT before accepting a tuned
+table. Keep the table in the campaign record with GPU/ISA/compiler/object
+digests and the clean lease evidence.
+
+The promotion path is:
+
+1. Run the single-block sweep and reject contended or oracle-less samples.
+2. Ingest the JSONL into `tunedb-gemv`; require a qualified, SKU/digest-matched
+   record and a decisive `Stats::beats` result.
+3. Generate the shape table from those qualified records, then re-emit and run
+   the whole-model gate. The table is a reproducible projection of the database,
+   not a second source of truth.
+4. If no qualified record exists, leave the shape at the default. A heuristic
+   may rank candidates for the next sweep, but it must not silently alter the
+   emitted packet or become the default without measurements.
+
+This keeps old performance as the hard control: unset means no extra parser
+branch in emission and the normal `blocked_gemv_cus` mapping.
 
 ## Gate (into Stage 5)
 

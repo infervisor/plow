@@ -400,6 +400,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMV_WG")]
     pub gemv_wg: Option<u32>,
 
+    /// Shape-keyed GEMV caps, for example `896x7168=224,1536x7168=152`.
+    /// Unset preserves the normal workgroup selection.
+    #[arg(long, env = "PLOW_GEMV_WG_TUNING")]
+    pub gemv_wg_tuning: Option<String>,
+
     /// Route GLM's DSA indexer through the prefill chain (requires `has_dsa`).
     #[arg(long, env = "PLOW_GLM_DSA_PF", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub glm_dsa_pf: bool,
@@ -543,6 +548,21 @@ pub struct EmitConfig {
 }
 
 impl EmitConfig {
+    /// Return the first valid shape-keyed workgroup cap for `(N,K)`.
+    pub fn gemv_wg_for(&self, n: u32, k: u32) -> Option<u32> {
+        self.gemv_wg_tuning
+            .as_deref()?
+            .split(',')
+            .find_map(|entry| {
+                let (shape, cap) = entry.split_once('=')?;
+                let (sn, sk) = shape.split_once('x').or_else(|| shape.split_once('X'))?;
+                let sn = sn.trim().parse::<u32>().ok()?;
+                let sk = sk.trim().parse::<u32>().ok()?;
+                let cap = cap.trim().parse::<u32>().ok()?.max(1);
+                (sn == n && sk == k).then_some(cap)
+            })
+    }
+
     /// Construct an EmitConfig by reading environment variables (legacy path).
     /// Mirrors what clap's `env` attribute does: each field reads its `PLOW_*` var.
     pub fn from_env() -> EmitConfig {
@@ -645,6 +665,7 @@ impl EmitConfig {
             qnorm_fuse: env_bool("PLOW_QNORM_FUSE"),
             fuse_quant: env_opt_out("PLOW_FUSE_QUANT"),
             gemv_wg: env_u32("PLOW_GEMV_WG"),
+            gemv_wg_tuning: env_str("PLOW_GEMV_WG_TUNING"),
             glm_dsa_pf: env_bool("PLOW_GLM_DSA_PF"),
             glm_fp8_kv: env_bool("PLOW_GLM_FP8_KV"),
             glm_gemv_wg: env_u32("PLOW_GLM_GEMV_WG"),
@@ -839,6 +860,31 @@ pub fn active() -> &'static EmitConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::EmitConfig;
+
+    #[test]
+    fn shape_keyed_gemv_cap_parses_exact_shapes() {
+        let mut cfg = EmitConfig::from_env();
+        cfg.gemv_wg_tuning = Some("896x7168=224,1536X7168=152".into());
+        assert_eq!(cfg.gemv_wg_for(896, 7168), Some(224));
+        assert_eq!(cfg.gemv_wg_for(1536, 7168), Some(152));
+        assert_eq!(cfg.gemv_wg_for(896, 3584), None);
+    }
+
+    #[test]
+    fn shape_keyed_gemv_cap_ignores_bad_entries() {
+        let mut cfg = EmitConfig::from_env();
+        cfg.gemv_wg_tuning = Some("bad,896x=4,896x7168=no,896x7168=0,896x7168=224".into());
+        assert_eq!(cfg.gemv_wg_for(896, 7168), Some(1));
+    }
+
+    #[test]
+    fn unset_shape_keyed_tuning_is_a_noop() {
+        let mut cfg = EmitConfig::from_env();
+        cfg.gemv_wg_tuning = None;
+        assert_eq!(cfg.gemv_wg_for(896, 7168), None);
+    }
+
     /// EVERY `EmitConfig` FIELD MUST BE READ SOMEWHERE, and this is a source grep because the
     /// compiler cannot see the difference.
     ///
@@ -907,6 +953,7 @@ mod tests {
             ("fp8", "any_fp8_weights()"),
             ("w8a8", "any_fp8_weights()"),
             ("w8a16", "any_fp8_weights()"),
+            ("gemv_wg_tuning", "gemv_wg_for("),
         ];
 
         let dead: Vec<&str> = fields

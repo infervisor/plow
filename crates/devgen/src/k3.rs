@@ -774,7 +774,7 @@ pub fn emit_k3_linear_norm(
     // unchanged and the packet is bit-identical. Tiled prefill ops own TILES, not column runs, so
     // the rule applies to the GEMV arm only.
     let blocks = if gemv_arm {
-        crate::mla::blocked_gemv_cus(&all, n)
+        crate::mla::blocked_gemv_cus_tuned(&all, n, k)
     } else {
         all
     };
