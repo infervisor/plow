@@ -180,7 +180,17 @@ fn emit_hc_reduce(
     let fnw = b.tensor(&format!("{name}_fn"), mix * hc * h * F32);
     let scale = b.tensor(&format!("{name}_scale"), 3 * F32);
     let base = b.tensor(&format!("{name}_base"), mix * F32);
-    let all: Vec<u32> = (0..n_cu).collect();
+    // `d_v4_hc_dot` accumulates its [1+MIX] partial with one atomicAdd PER VALUE
+    // PER BLOCK. Every extra block is 25 more atomics onto the same 25
+    // addresses, so past some width the grid buys contention rather than
+    // bandwidth. PLOW_V4_HCCU sweeps it; the reduce runs twice a layer, 86
+    // times a token, so this is the widest lever on the step.
+    let hccu = std::env::var("PLOW_V4_HCCU")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.clamp(1, n_cu))
+        .unwrap_or(n_cu);
+    let all: Vec<u32> = (0..hccu).collect();
 
     // `V4HcDot` accumulates with atomics, so its partial must start at zero —
     // its opcode doc says exactly that. Fresh device memory made ONE reduce
