@@ -10,6 +10,7 @@
 pub mod config;
 
 mod deepseek;
+mod deepseek_v4;
 mod gemma;
 mod gemma4_multimodal;
 mod glm;
@@ -73,6 +74,7 @@ pub fn build_graph(cfg: &ModelConfig, bucket: &ShapeBucket) -> Result<Graph, Bui
         ModelConfig::Llama(c) => llama::build(c),
         ModelConfig::Qwen3(c) => qwen3::build(c),
         ModelConfig::DeepSeek(c) => deepseek::build(c),
+        ModelConfig::DeepSeekV4(c) => deepseek_v4::build(c),
         ModelConfig::Siglip(c) => siglip::build(c),
         ModelConfig::QwenVl(c) => qwen_vl::build(c),
         ModelConfig::QwenImageDit(c) => qwen_image_dit::build(c, bucket),
@@ -98,6 +100,7 @@ pub fn build_encoder_graph(cfg: &ModelConfig, taps: &[u32]) -> Result<Graph, Bui
                 ModelConfig::Kimi(_) => "kimi",
                 ModelConfig::KimiK3(_) => "kimi_k3",
                 ModelConfig::DeepSeek(_) => "deepseek",
+                ModelConfig::DeepSeekV4(_) => "deepseek_v4",
                 ModelConfig::Siglip(_) => "siglip",
                 ModelConfig::QwenVl(_) => "qwen_vl",
                 ModelConfig::QwenImageDit(_) => "qwen_image_dit",

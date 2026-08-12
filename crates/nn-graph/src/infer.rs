@@ -133,9 +133,13 @@ impl Ctx<'_> {
                 self.input_shape(inputs, 0)
             }
 
-            // Shape-preserving ops with weight inputs.
+            // Shape-preserving ops with weight inputs. RMSNorm takes one input
+            // when the reference normalizes without a learned gain (DeepSeek-V4
+            // rescales the query heads that way); fabricating an all-ones weight
+            // would put a tensor in the manifest that the checkpoint does not
+            // ship.
             Op::RmsNorm { .. } => {
-                self.expect_arity(inputs, 2)?;
+                self.expect_arity_range(inputs, 1, 2)?;
                 self.input_shape(inputs, 0)
             }
             Op::LayerNorm { .. } => {
@@ -150,7 +154,8 @@ impl Ctx<'_> {
             Op::Attention { .. } => {
                 // Output has the query's batch/seq/head axes but the *value's*
                 // head dim (these differ for MLA, where qk_head_dim != v_head_dim).
-                self.expect_arity_range(inputs, 3, 4)?;
+                // 3 = q/k/v, +1 each for an optional mask and an optional sink.
+                self.expect_arity_range(inputs, 3, 5)?;
                 let q = self.input_shape(inputs, 0)?;
                 let k = self.input_shape(inputs, 1)?;
                 let v = self.input_shape(inputs, 2)?;
@@ -352,9 +357,16 @@ impl Ctx<'_> {
             }
 
             Op::MoeRouter {
-                num_experts, group, ..
+                num_experts,
+                group,
+                hash,
+                select_bias,
+                ..
             } => {
-                self.expect_arity(inputs, 2)?;
+                // Hash routing reads the expert set out of a frozen table, so it
+                // carries the token ids and that table as extra inputs.
+                let arity = 2 + usize::from(*select_bias) + if *hash { 2 } else { 0 };
+                self.expect_arity(inputs, arity)?;
                 let x = self.input_shape(inputs, 0)?;
                 if x.rank() == 0 {
                     return Err(self.err("moe_router input must have rank >= 1"));
@@ -530,6 +542,130 @@ impl Ctx<'_> {
                     )));
                 }
                 Ok(prefix)
+            }
+
+            // --- DeepSeek-V4 ---
+            Op::HcReduce { hc_mult, .. } => {
+                // [x, hc_fn, hc_scale, hc_base] -> x with the stream axis gone.
+                self.expect_arity(inputs, 4)?;
+                let x = self.input_shape(inputs, 0)?;
+                if x.rank() < 2 {
+                    return Err(self.err("hc_reduce input must have rank >= 2"));
+                }
+                let streams = x.dim(x.rank() - 2);
+                if req_static(self, streams, "hc stream count")? != *hc_mult as i64 {
+                    return Err(self.err(format!(
+                        "hc_reduce input has {streams} streams, expected hc_mult = {hc_mult}"
+                    )));
+                }
+                let mut dims: Vec<Dim> = x.dims().to_vec();
+                dims.remove(x.rank() - 2);
+                Ok(Shape::new(dims))
+            }
+
+            Op::HcExpand { hc_mult, .. } => {
+                // [branch, residual, hc_fn, hc_scale, hc_base] -> residual's shape.
+                self.expect_arity(inputs, 5)?;
+                let branch = self.input_shape(inputs, 0)?;
+                let residual = self.input_shape(inputs, 1)?;
+                if residual.rank() != branch.rank() + 1 {
+                    return Err(self.err(format!(
+                        "hc_expand residual {residual} must have exactly one axis more than the branch {branch}"
+                    )));
+                }
+                let streams = residual.dim(residual.rank() - 2);
+                if req_static(self, streams, "hc stream count")? != *hc_mult as i64 {
+                    return Err(self.err(format!(
+                        "hc_expand residual has {streams} streams, expected hc_mult = {hc_mult}"
+                    )));
+                }
+                if branch
+                    .dim(branch.rank() - 1)
+                    .provably_ne(residual.dim(residual.rank() - 1))
+                {
+                    return Err(self.err(format!(
+                        "hc_expand branch {branch} and residual {residual} disagree on the hidden dim"
+                    )));
+                }
+                Ok(residual)
+            }
+
+            Op::GroupedLinear {
+                groups,
+                out_features,
+            } => {
+                self.expect_arity(inputs, 2)?;
+                let x = self.input_shape(inputs, 0)?;
+                if x.rank() < 2 {
+                    return Err(self.err("grouped_linear input must have rank >= 2"));
+                }
+                let g = x.dim(x.rank() - 2);
+                if req_static(self, g, "grouped_linear group count")? != *groups as i64 {
+                    return Err(self.err(format!(
+                        "grouped_linear input has {g} groups, expected {groups}"
+                    )));
+                }
+                // One checkpoint tensor holds all the blocks stacked on rows.
+                let w = self.input_shape(inputs, 1)?;
+                let rows = *groups as i64 * *out_features;
+                if w.rank() != 2
+                    || req_static(self, w.dim(0), "grouped_linear weight rows")? != rows
+                {
+                    return Err(self.err(format!(
+                        "grouped_linear weight has shape {w}, expected [{rows}, in]"
+                    )));
+                }
+                if w.dim(1).provably_ne(x.dim(x.rank() - 1)) {
+                    return Err(self.err(format!(
+                        "grouped_linear weight {w} does not match the per-group input width in {x}"
+                    )));
+                }
+                Ok(replace_last(&x, Dim::stat(*out_features)))
+            }
+
+            Op::ClampedSwiGlu { .. } => {
+                self.expect_arity(inputs, 2)?;
+                let gate = self.input_shape(inputs, 0)?;
+                let up = self.input_shape(inputs, 1)?;
+                if gate.rank() != up.rank()
+                    || gate.dim(gate.rank() - 1).provably_ne(up.dim(up.rank() - 1))
+                {
+                    return Err(self.err(format!(
+                        "clamped_swiglu branches disagree: gate {gate}, up {up}"
+                    )));
+                }
+                Ok(gate)
+            }
+
+            Op::KvCompress { ratio, out_seq, .. } => {
+                // [x, wkv, wgate, ape, norm_weight]. This is the only op that
+                // changes the sequence rate; `out_seq` carries the compressed
+                // length because `S / ratio` is not a representable dim.
+                self.expect_arity(inputs, 5)?;
+                let x = self.input_shape(inputs, 0)?;
+                if x.rank() != 3 {
+                    return Err(self.err("kv_compress input must be [B, S, D]"));
+                }
+                let norm = self.input_shape(inputs, 4)?;
+                if norm.rank() != 1 {
+                    return Err(self.err(format!(
+                        "kv_compress norm weight has shape {norm}, expected [out]"
+                    )));
+                }
+                // When the input length is concrete the rate relation is
+                // checkable, and a mismatch means the wrong symbol was bound.
+                if let (Some(s), Some(c)) = (x.dim(1).as_static(), out_seq.as_static()) {
+                    if c * *ratio as i64 != s {
+                        return Err(self.err(format!(
+                            "kv_compress out_seq {c} * ratio {ratio} does not match the input length {s}"
+                        )));
+                    }
+                }
+                Ok(Shape::new([
+                    x.dim(0).clone(),
+                    out_seq.clone(),
+                    norm.dim(0).clone(),
+                ]))
             }
         }
     }

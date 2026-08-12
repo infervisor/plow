@@ -106,9 +106,45 @@ impl Nn {
         )
     }
 
+    /// `linear` whose weight carries an explicit checkpoint dtype (a quantized
+    /// projection in an otherwise bf16 graph).
+    pub fn linear_dtype(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        in_f: i64,
+        out_f: i64,
+        bias: bool,
+        dtype: DType,
+    ) -> TensorId {
+        let w = self.param_dtype(
+            &format!("{name}.weight"),
+            [Dim::stat(out_f), Dim::stat(in_f)],
+            dtype,
+        );
+        let mut inputs = vec![x, w];
+        if bias {
+            inputs.push(self.param(&format!("{name}.bias"), [Dim::stat(out_f)]));
+        }
+        self.emit(
+            Op::Linear {
+                out_features: out_f,
+                bias,
+            },
+            inputs,
+        )
+    }
+
     pub fn rmsnorm(&mut self, name: &str, x: TensorId, hidden: i64, eps: f32) -> TensorId {
         let w = self.param(&format!("{name}.weight"), [Dim::stat(hidden)]);
         self.emit(Op::RmsNorm { eps }, vec![x, w])
+    }
+
+    /// RMSNorm with no learned gain (DeepSeek-V4 rescales its query heads this
+    /// way). Separate from [`Nn::rmsnorm`] because the difference is a
+    /// checkpoint tensor that either exists or does not.
+    pub fn rmsnorm_weightless(&mut self, x: TensorId, eps: f32) -> TensorId {
+        self.emit(Op::RmsNorm { eps }, vec![x])
     }
 
     pub fn rmsnorm_dtype(
@@ -167,6 +203,7 @@ impl Nn {
                 dim,
                 theta,
                 interleave: false,
+                inverse: false,
             },
             vec![x],
         )
@@ -178,6 +215,21 @@ impl Nn {
                 dim,
                 theta,
                 interleave: true,
+                inverse: false,
+            },
+            vec![x],
+        )
+    }
+
+    /// De-rotation by the conjugate angle, as DeepSeek-V4 applies to the rope
+    /// lanes of the attention output.
+    pub fn rope_inverse(&mut self, x: TensorId, dim: u32, theta: f32) -> TensorId {
+        self.emit(
+            Op::Rope {
+                dim,
+                theta,
+                interleave: false,
+                inverse: true,
             },
             vec![x],
         )
@@ -212,8 +264,38 @@ impl Nn {
                 causal,
                 sliding_window,
                 logit_softcap,
+                attn_sink: false,
             },
             vec![q, k, v],
+        )
+    }
+
+    /// Attention with a learned per-head sink logit in the softmax denominator.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_sink(
+        &mut self,
+        name: &str,
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        causal: bool,
+        sliding_window: Option<u32>,
+    ) -> TensorId {
+        let sink = self.param_dtype(name, [Dim::stat(num_heads as i64)], DType::F32);
+        self.emit(
+            Op::Attention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                causal,
+                sliding_window,
+                logit_softcap: None,
+                attn_sink: true,
+            },
+            vec![q, k, v, sink],
         )
     }
 
@@ -359,8 +441,78 @@ impl Nn {
                 num_experts,
                 top_k,
                 group: None,
+                hash: false,
+                select_bias: false,
             },
             vec![x, w],
+        )
+    }
+
+    /// Flat top-k gate with DeepSeek's per-expert selection bias.
+    pub fn moe_router_select_bias(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        hidden: i64,
+        num_experts: u32,
+        top_k: u32,
+    ) -> TensorId {
+        let w = self.param(
+            &format!("{name}.weight"),
+            [Dim::stat(num_experts as i64), Dim::stat(hidden)],
+        );
+        let bias = self.param_dtype(
+            &format!("{name}.bias"),
+            [Dim::stat(num_experts as i64)],
+            DType::F32,
+        );
+        self.emit(
+            Op::MoeRouter {
+                num_experts,
+                top_k,
+                group: None,
+                hash: false,
+                select_bias: true,
+            },
+            vec![x, w, bias],
+        )
+    }
+
+    /// MoE gate whose expert set comes from a frozen `[vocab, top_k]` token-id
+    /// table rather than from the scores (DeepSeek-V4's first `n_hash_layers`).
+    ///
+    /// Its own constructor for the same reason as [`Nn::moe_router_grouped`]:
+    /// the scores still produce the combine weights, so a hash layer built as a
+    /// scored one looks right and routes every token somewhere else.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_router_hashed(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        ids: TensorId,
+        hidden: i64,
+        vocab: i64,
+        num_experts: u32,
+        top_k: u32,
+    ) -> TensorId {
+        let w = self.param(
+            &format!("{name}.weight"),
+            [Dim::stat(num_experts as i64), Dim::stat(hidden)],
+        );
+        let table = self.param_dtype(
+            &format!("{name}.tid2eid"),
+            [Dim::stat(vocab), Dim::stat(top_k as i64)],
+            DType::I64,
+        );
+        self.emit(
+            Op::MoeRouter {
+                num_experts,
+                top_k,
+                group: None,
+                hash: true,
+                select_bias: false,
+            },
+            vec![x, w, ids, table],
         )
     }
 
@@ -389,6 +541,8 @@ impl Nn {
                 num_experts,
                 top_k,
                 group: Some(group),
+                hash: false,
+                select_bias: false,
             },
             vec![x, w],
         )
@@ -469,6 +623,167 @@ impl Nn {
         ins.push(norm);
         ins.push(proj);
         self.emit(Op::BlockResidual { max_snapshots }, ins)
+    }
+
+    // ---- DeepSeek-V4 hyper-connections -------------------------------------
+
+    /// The three weights a hyper-connection mix reads. `rows` is the projection
+    /// height: `(2 + hc_mult) * hc_mult` per layer, `hc_mult` at the head.
+    fn hc_params(
+        &mut self,
+        name: &str,
+        rows: i64,
+        hc_mult: u32,
+        hidden: i64,
+        scale_len: i64,
+    ) -> [TensorId; 3] {
+        let f = self.param_dtype(
+            &format!("{name}_fn"),
+            [Dim::stat(rows), Dim::stat(hc_mult as i64 * hidden)],
+            DType::F32,
+        );
+        let scale = self.param_dtype(&format!("{name}_scale"), [Dim::stat(scale_len)], DType::F32);
+        let base = self.param_dtype(&format!("{name}_base"), [Dim::stat(rows)], DType::F32);
+        [f, scale, base]
+    }
+
+    /// Collapse `[.., hc_mult, hidden]` residual streams to `[.., hidden]`.
+    pub fn hc_reduce(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        hc_mult: u32,
+        hidden: i64,
+        sinkhorn_iters: u32,
+        eps: f32,
+    ) -> TensorId {
+        let rows = (2 + hc_mult as i64) * hc_mult as i64;
+        let [f, scale, base] = self.hc_params(name, rows, hc_mult, hidden, 3);
+        self.emit(
+            Op::HcReduce {
+                hc_mult,
+                mode: crate::op::HcMode::Sinkhorn {
+                    iters: sinkhorn_iters,
+                },
+                eps,
+            },
+            vec![x, f, scale, base],
+        )
+    }
+
+    /// The final, un-normalized reduce that feeds the lm_head.
+    pub fn hc_reduce_head(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        hc_mult: u32,
+        hidden: i64,
+        eps: f32,
+    ) -> TensorId {
+        let [f, scale, base] = self.hc_params(name, hc_mult as i64, hc_mult, hidden, 1);
+        self.emit(
+            Op::HcReduce {
+                hc_mult,
+                mode: crate::op::HcMode::SigmoidGate,
+                eps,
+            },
+            vec![x, f, scale, base],
+        )
+    }
+
+    /// Write `branch` back into the `residual` streams. `name` must match the
+    /// [`Nn::hc_reduce`] it pairs with — both read the same three weights.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_expand(
+        &mut self,
+        name: &str,
+        branch: TensorId,
+        residual: TensorId,
+        hc_mult: u32,
+        hidden: i64,
+        sinkhorn_iters: u32,
+        eps: f32,
+    ) -> TensorId {
+        let rows = (2 + hc_mult as i64) * hc_mult as i64;
+        let [f, scale, base] = self.hc_params(name, rows, hc_mult, hidden, 3);
+        self.emit(
+            Op::HcExpand {
+                hc_mult,
+                sinkhorn_iters,
+                eps,
+            },
+            vec![branch, residual, f, scale, base],
+        )
+    }
+
+    // ---- DeepSeek-V4 attention/FFN pieces -----------------------------------
+
+    /// Block-diagonal projection over the group axis, from one stacked tensor.
+    pub fn grouped_linear(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        groups: u32,
+        in_f: i64,
+        out_f: i64,
+        dtype: DType,
+    ) -> TensorId {
+        let w = self.param_dtype(
+            &format!("{name}.weight"),
+            [Dim::stat(groups as i64 * out_f), Dim::stat(in_f)],
+            dtype,
+        );
+        self.emit(
+            Op::GroupedLinear {
+                groups,
+                out_features: out_f,
+            },
+            vec![x, w],
+        )
+    }
+
+    pub fn clamped_swiglu(&mut self, gate: TensorId, up: TensorId, limit: f32) -> TensorId {
+        self.emit(Op::ClampedSwiGlu { limit }, vec![gate, up])
+    }
+
+    /// Learned KV pooling over `ratio` consecutive tokens.
+    ///
+    /// `overlap` layers project twice the width, because each window also
+    /// carries the previous window's half.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_compress(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        hidden: i64,
+        ratio: u32,
+        out: i64,
+        overlap: bool,
+        out_seq: Dim,
+    ) -> TensorId {
+        let wide = if overlap { 2 * out } else { out };
+        let wkv = self.param(
+            &format!("{name}.wkv.weight"),
+            [Dim::stat(wide), Dim::stat(hidden)],
+        );
+        let wgate = self.param(
+            &format!("{name}.wgate.weight"),
+            [Dim::stat(wide), Dim::stat(hidden)],
+        );
+        let ape = self.param_dtype(
+            &format!("{name}.ape"),
+            [Dim::stat(ratio as i64), Dim::stat(wide)],
+            DType::F32,
+        );
+        let norm = self.param(&format!("{name}.norm.weight"), [Dim::stat(out)]);
+        self.emit(
+            Op::KvCompress {
+                ratio,
+                overlap,
+                out_seq,
+            },
+            vec![x, wkv, wgate, ape, norm],
+        )
     }
 
     // ---- finish ------------------------------------------------------------

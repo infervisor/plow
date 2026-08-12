@@ -7,6 +7,7 @@
 //! ignored and missing fields fall back to architecture defaults.
 
 mod deepseek;
+mod deepseek_v4;
 mod gemma;
 mod gemma4_multimodal;
 mod glm;
@@ -20,6 +21,7 @@ mod qwen_vl;
 mod siglip;
 
 pub use deepseek::DeepSeekConfig;
+pub use deepseek_v4::DeepSeekV4Config;
 pub use gemma::{GemmaConfig, RopeParameters, RopeSpec};
 pub use gemma4_multimodal::{Gemma4MultimodalConfig, MmProjectorConfig};
 pub use glm::GlmConfig;
@@ -60,6 +62,10 @@ pub enum ModelConfig {
     /// Qwen3 / Qwen2.5: GQA + SwiGLU (dense).
     Qwen3(Qwen3Config),
     DeepSeek(DeepSeekConfig),
+    /// DeepSeek-V4: hyper-connected residual streams, sliding-window MQA with a
+    /// learned KV compressor and sparse indexer, FP4 MoE with hash-routed
+    /// leading layers.
+    DeepSeekV4(DeepSeekV4Config),
     Siglip(SiglipConfig),
     QwenVl(QwenVlVisionConfig),
     QwenImageDit(QwenImageDitConfig),
@@ -130,6 +136,10 @@ impl ModelConfig {
             "deepseek" | "deepseek_v2" | "deepseek_v3" => {
                 Ok(ModelConfig::DeepSeek(serde_json::from_value(v)?))
             }
+            // V4 shares the vendor and almost nothing else: hyper-connected
+            // residual streams, one KV head with a learned compressor, and
+            // hash-routed leading layers. It gets its own config and builder.
+            "deepseek_v4" => Ok(ModelConfig::DeepSeekV4(serde_json::from_value(v)?)),
             "glm_moe_dsa" | "glm" | "glm4" => Ok(ModelConfig::Glm(serde_json::from_value(v)?)),
             "siglip" | "siglip_vision_model" => {
                 let sub = sub_config(&v, "vision_config");
@@ -162,6 +172,9 @@ fn model_type(v: &serde_json::Value) -> Option<String> {
         .and_then(|a| a.as_str())?;
     let mapped = match arch {
         a if a.starts_with("Gemma") => "gemma3",
+        // Claim V4 before the V2/V3 prefixes: the DSpark draft head ships as
+        // `DSparkDraftModel`, but the decoder itself is `DeepseekV4*`.
+        a if a.starts_with("DeepseekV4") => "deepseek_v4",
         a if a.starts_with("DeepseekV3") || a.starts_with("DeepseekV2") => "deepseek_v3",
         a if a.starts_with("GlmMoeDsa") || a.starts_with("Glm") => "glm_moe_dsa",
         // `KimiLinear*` is Kimi-K3, NOT K2, and the two share almost no

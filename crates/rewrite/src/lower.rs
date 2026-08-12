@@ -96,7 +96,19 @@ fn term_for(
                 .join(",");
             format!("(Transpose {} {})", e(0)?, quote(&tok))
         }
-        Op::Rope { dim, theta, .. } => format!("(Rope {} {} {})", e(0)?, *dim, f64lit(*theta)),
+        // A de-rotation is not the rotation: they must not share an e-node, so
+        // the direction rides in the term rather than being dropped.
+        Op::Rope {
+            dim,
+            theta,
+            inverse: false,
+            ..
+        } => format!("(Rope {} {} {})", e(0)?, *dim, f64lit(*theta)),
+        Op::Rope { inverse: true, .. } => {
+            return Err(LowerError::Unsupported {
+                op: "rope (inverse)",
+            })
+        }
         Op::Attention {
             num_heads,
             num_kv_heads,
@@ -104,15 +116,17 @@ fn term_for(
             causal,
             sliding_window,
             logit_softcap,
+            attn_sink,
         } => {
             // Serialize the attention config into one deterministic opaque
             // token so differently-configured attentions stay distinct e-nodes
             // (schema.egg: attributes ride along as opaque tokens).
             let cfg = format!(
-                "heads={num_heads};kv={num_kv_heads};hd={head_dim};causal={};win={};cap={}",
+                "heads={num_heads};kv={num_kv_heads};hd={head_dim};causal={};win={};cap={};sink={}",
                 *causal as u8,
                 sliding_window.map(|w| w.to_string()).unwrap_or_default(),
                 logit_softcap.map(|c| f64lit(c)).unwrap_or_default(),
+                *attn_sink as u8,
             );
             format!("(Attention {} {} {} {})", e(0)?, e(1)?, e(2)?, quote(&cfg))
         }
@@ -210,12 +224,28 @@ fn term_for(
             num_experts,
             top_k,
             group: None,
+            hash: false,
+            select_bias: false,
         } => {
             format!("(MoeRouter {} {} {} {})", e(0)?, e(1)?, num_experts, top_k)
         }
         Op::MoeRouter { group: Some(_), .. } => {
             return Err(LowerError::Unsupported {
                 op: "moe_router (group-limited)",
+            })
+        }
+        // Same reasoning as the grouped arm: the term cannot say that the expert
+        // set came from a token-id table, or that a selection bias reordered it.
+        Op::MoeRouter { hash: true, .. } => {
+            return Err(LowerError::Unsupported {
+                op: "moe_router (hash-routed)",
+            })
+        }
+        Op::MoeRouter {
+            select_bias: true, ..
+        } => {
+            return Err(LowerError::Unsupported {
+                op: "moe_router (selection bias)",
             })
         }
         // --- Kimi-K3 ---
@@ -254,6 +284,22 @@ fn term_for(
                 head_dim
             )
         }
+        // DeepSeek-V4's ops have no e-graph representation yet: Stage 2 decides
+        // which of them earn rewrite rules. Refusing is what keeps a rule from
+        // firing on a node the language cannot actually express.
+        Op::HcReduce { .. } => return Err(LowerError::Unsupported { op: "hc_reduce" }),
+        Op::HcExpand { .. } => return Err(LowerError::Unsupported { op: "hc_expand" }),
+        Op::GroupedLinear { .. } => {
+            return Err(LowerError::Unsupported {
+                op: "grouped_linear",
+            })
+        }
+        Op::ClampedSwiGlu { .. } => {
+            return Err(LowerError::Unsupported {
+                op: "clamped_swiglu",
+            })
+        }
+        Op::KvCompress { .. } => return Err(LowerError::Unsupported { op: "kv_compress" }),
         // Variable snapshots lower to a cons chain; both checkpoint weights remain leaves.
         Op::BlockResidual { max_snapshots } => {
             let norm = inputs.len() - 2;
