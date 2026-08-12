@@ -374,6 +374,19 @@ fn emit_v4_attn(
     // hc reduce -> attn_norm
     let red = emit_hc_reduce(b, c, tn, &format!("{p}.hc_attn"), tn.xr, n_cu, deps);
     let anw = b.tensor(&format!("{p}.attn_norm.weight"), h as u64 * BF16);
+    // TIMING PROBE by duplication: RmsNorm is idempotent, so a second emission
+    // costs exactly one norm. ~2.7 ms of this layer is unaccounted and the two
+    // norms are among the last candidates left.
+    if v4_skip("rms2") {
+        b.emit(DevOp::RmsNorm, all.clone(), &[red], |d| {
+            d.t[0] = tn.xn;
+            d.t[1] = tn.xr;
+            d.t[2] = anw;
+            d.i[0] = 1;
+            d.i[1] = h;
+            d.f[0] = 1e-6;
+        });
+    }
     let nrm = b.emit(DevOp::RmsNorm, all.clone(), &[red], |d| {
         d.t[0] = tn.xn;
         d.t[1] = tn.xr;
