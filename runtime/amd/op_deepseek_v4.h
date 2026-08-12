@@ -536,3 +536,140 @@ __device__ void d_v4_kv_compress(bf16* __restrict__ out, const bf16* __restrict_
         __syncthreads();
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * Block-diagonal output projection (`wo_a`).
+ * ---------------------------------------------------------------------------
+ *
+ * `o`      [T, H*D] bf16        attention output, head-major
+ * `w`      [G*R, H*D/G] bf16    ONE stacked tensor, viewed as [G, R, H*D/G]
+ * `out`    [T, G*R] bf16
+ *
+ * Group `g` projects ONLY its own slice of the head axis. A dense `[G*R, H*D]`
+ * linear of the same element count mixes groups the reference keeps apart, and
+ * is what a reader who saw one tensor would naturally write — `nn_graph::
+ * Op::GroupedLinear` exists to make that impossible to express by accident.
+ *
+ * The reference spells it `torch.einsum("bsgd,grd->bsgr", o.view(b,s,G,-1),
+ * wo_a.view(G, R, -1))`, and notes that `wo_a` is fp8 in the checkpoint but is
+ * applied in bf16 "for simplicity"; this follows the reference, so the fp8
+ * arm is a Stage-4 question, not a correctness one. */
+__device__ void d_v4_grouped_linear(bf16* __restrict__ out, const bf16* __restrict__ o,
+                                    const bf16* __restrict__ w, unsigned T, unsigned GRP,
+                                    unsigned R, unsigned WIDTH, unsigned slice, unsigned nblk) {
+    for (unsigned t = slice; t < T; t += nblk)
+        for (unsigned i = threadIdx.x; i < GRP * R; i += PLOW_THREADS) {
+            const unsigned g = i / R, r = i % R;
+            const bf16* orow = o + (size_t)t * GRP * WIDTH + (size_t)g * WIDTH;
+            const bf16* wrow = w + ((size_t)g * R + r) * WIDTH;
+            float acc = 0.0f;
+            for (unsigned k = 0; k < WIDTH; k++) acc += bf2f(orow[k]) * bf2f(wrow[k]);
+            st_act1(&out[(size_t)t * GRP * R + i], f2bf(acc));
+        }
+}
+
+/* ---------------------------------------------------------------------------
+ * MoE routing — scored and hash-routed.
+ * ---------------------------------------------------------------------------
+ *
+ * `logits` [T, E] f32   gate GEMM output (`w_gate @ x`, computed in fp32)
+ * `bias`   [E] f32      selection bias, or nullptr on a hash layer
+ * `tid2eid`[V, K] i64   token-id -> expert table, or nullptr on a scored layer
+ * `ids`    [T] i32      token ids, only read on a hash layer
+ * `sel`    [T, K] i32   chosen experts
+ * `wts`    [T, K] f32   combine weights
+ *
+ * TRANSCRIBED FROM `Gate.forward`. Four things it pins:
+ *
+ *   1. SCORING IS `sqrt(softplus(x))` — not softmax, not sigmoid. Both of the
+ *      others are already in this tree, so picking one by habit is the easy
+ *      mistake.
+ *   2. THE BIAS SHIFTS SELECTION ONLY. `scores + bias` chooses the top-k; the
+ *      COMBINE WEIGHTS are gathered from the UNBIASED scores. Using the biased
+ *      score as the weight is a plausible reading of the code and a different
+ *      model.
+ *   3. RENORMALIZATION IS OVER THE SELECTED SET, and it happens for every
+ *      scoring function except softmax — so for V4 it always happens.
+ *   4. A HASH LAYER DOES NOT SCORE AT ALL: the expert set comes from
+ *      `tid2eid[token_id]`, and the scores only supply the (still renormalized)
+ *      weights. The gate GEMM is dead weight on those layers, which is a
+ *      Stage-4 saving, not a correctness matter.
+ *
+ * Top-k here is a serial selection over E; E is 256 and K is 6, so this is 6
+ * passes of 256 compares per token. */
+__device__ void d_v4_moe_route(int* __restrict__ sel, float* __restrict__ wts,
+                               const float* __restrict__ logits, const float* __restrict__ bias,
+                               const long long* __restrict__ tid2eid, const int* __restrict__ ids,
+                               unsigned T, unsigned E, unsigned K, float route_scale,
+                               unsigned slice, unsigned nblk, float* __restrict__ lds) {
+    for (unsigned t = slice; t < T; t += nblk) {
+        const float* lg = logits + (size_t)t * E;
+        /* `sqrt(softplus(x))`, in fp32 as the reference computes it. */
+        for (unsigned e = threadIdx.x; e < E; e += PLOW_THREADS) {
+            const float x = lg[e];
+            /* log1p(exp(x)) without overflowing for large x. */
+            const float sp = (x > 20.0f) ? x : __logf(1.0f + __expf(x));
+            lds[e] = sqrtf(sp);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int* s = sel + (size_t)t * K;
+            float* w = wts + (size_t)t * K;
+            if (tid2eid != nullptr) {
+                const long long* row = tid2eid + (size_t)ids[t] * K;
+                for (unsigned k = 0; k < K; k++) s[k] = (int)row[k];
+            } else {
+                /* Top-k on the BIASED score; the bias never reaches `w`. */
+                for (unsigned k = 0; k < K; k++) s[k] = -1;
+                for (unsigned k = 0; k < K; k++) {
+                    float best = -INFINITY;
+                    int bi = -1;
+                    for (unsigned e = 0; e < E; e++) {
+                        bool taken = false;
+                        for (unsigned j = 0; j < k; j++) taken |= (s[j] == (int)e);
+                        if (taken) continue;
+                        const float v = lds[e] + (bias ? bias[e] : 0.0f);
+                        if (v > best) {
+                            best = v;
+                            bi = (int)e;
+                        }
+                    }
+                    s[k] = bi;
+                }
+            }
+            float sum = 0.0f;
+            for (unsigned k = 0; k < K; k++) {
+                w[k] = lds[s[k]]; /* UNBIASED score */
+                sum += w[k];
+            }
+            /* Renormalize over the selected set, then scale. */
+            const float inv = (sum != 0.0f) ? 1.0f / sum : 0.0f;
+            for (unsigned k = 0; k < K; k++) w[k] = w[k] * inv * route_scale;
+        }
+        __syncthreads();
+    }
+}
+
+/* Clamped SwiGLU — every expert in the model (`swiglu_limit: 10`).
+ *
+ *     gate = min(gate, limit)                  # ONE-SIDED
+ *     up   = clamp(up, -limit, +limit)         # TWO-SIDED
+ *     out  = silu(gate) * up
+ *
+ * The asymmetry is the reference's (`Expert.forward`), and it is why this is
+ * not `Act(Silu)` + `Mul`: the clamp binds only in the tail, so dropping it
+ * agrees on almost every token and diverges exactly where the activation blows
+ * up. Same reasoning as `SituGlu`. */
+__device__ void d_v4_clamped_swiglu(bf16* __restrict__ out, const bf16* __restrict__ gate,
+                                    const bf16* __restrict__ up, unsigned n, float limit) {
+    for (unsigned i = threadIdx.x + blockIdx.x * PLOW_THREADS; i < n;
+         i += PLOW_THREADS * gridDim.x) {
+        float g = bf2f(gate[i]), u = bf2f(up[i]);
+        if (limit > 0.0f) {
+            g = fminf(g, limit);
+            u = fminf(fmaxf(u, -limit), limit);
+        }
+        const float s = g / (1.0f + __expf(-g)); /* silu */
+        st_act1(&out[i], f2bf(s * u));
+    }
+}
