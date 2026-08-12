@@ -87,3 +87,21 @@ for v in "${VARIANTS[@]}"; do
 done
 echo
 echo "logs: $OUT"
+
+# ---------------------------------------------------------------------------
+# 15-run result for the configuration at 9af491c2, three batches of five, one
+# arm per GPU (the third batch followed a revert back to that same HEAD, so all
+# fifteen samples are one binary):
+#
+#     n = 15     median 4.999 ms/token = 200.0 tok/s
+#     min 4.685  max 5.222              8 of 15 runs under 5.000 ms
+#
+# AT the 5.000 ms target, with no margin: nearly half the runs land the wrong
+# side and the spread is 25x the distance from the median to the line. Read it
+# as "at the threshold", never as "beats it".
+#
+# A wave-level split-K was tried for headroom and REVERTED as a loss: mapping
+# (token, head, chunk) onto a wave deletes the per-block 8-wave combine, but
+# that combine AMORTIZES the partial write — eight waves each publishing their
+# own [D] partial is 8x the traffic the block version emits after folding them.
+# Best wave variant 5.386 ms against 5.013 block-level, SPLIT swept 4..64.
