@@ -290,5 +290,76 @@ int main(void) {
         hipFree(d_q); hipFree(d_c); hipFree(d_w); hipFree(d_sc);
     }
 
+    /* ---------------- PREFILL: the throughput shape ----------------------- *
+     * Decode says what one token's latency costs; prefill says what the engine
+     * can absorb. They stress opposite things — decode had no work to spread
+     * and prefill has plenty, so a kernel can be fine in one and bad in the
+     * other. Both matter for a serving engine and both are measured. */
+    {
+        const unsigned T = 4096, D = 4096, HC = 4, MIX = (2 + HC) * HC, N = HC * D;
+        printf("PREFILL shapes (T=%u)\n", T);
+        std::vector<bf16> x((size_t)T * N);
+        for (auto& v : x) v = f2bf_host(drand48() * 0.1);
+        bf16 *d_x, *d_o, *d_e;
+        float *d_fn, *d_sc, *d_ba, *d_mix, *d_part;
+        HC_CHECK(hipMalloc(&d_x, x.size() * 2));
+        HC_CHECK(hipMalloc(&d_o, (size_t)T * D * 2));
+        HC_CHECK(hipMalloc(&d_e, (size_t)T * N * 2));
+        HC_CHECK(hipMalloc(&d_fn, (size_t)MIX * N * 4));
+        HC_CHECK(hipMalloc(&d_sc, 12));
+        HC_CHECK(hipMalloc(&d_ba, MIX * 4));
+        HC_CHECK(hipMalloc(&d_mix, (size_t)T * (HC + HC * HC) * 4));
+        HC_CHECK(hipMalloc(&d_part, (size_t)T * (1 + MIX) * 4));
+        HC_CHECK(hipMemcpy(d_x, x.data(), x.size() * 2, hipMemcpyHostToDevice));
+
+        /* At T=4096 the weight is read ONCE and amortized over every token, so
+         * the compulsory traffic is the ACTIVATION, not `hc_fn` — the opposite
+         * of decode, and the reason the bound side flips. */
+        const double bp = (double)MIX * N * 4 + (double)T * N * 2 + (double)T * D * 2;
+        const double fp = (double)T * (2.0 * MIX * N + 2.0 * N + 2.0 * HC * D);
+        const double usd = time_us([&] {
+            HC_CHECK(hipMemsetAsync(d_part, 0, (size_t)T * (1 + MIX) * 4));
+            k_hcdot<<<NCU, PLOW_THREADS>>>(d_part, d_x, d_fn, T, D, HC);
+            k_hcmix<<<NCU, PLOW_THREADS>>>(d_o, d_mix, d_x, d_part, d_sc, d_ba, T, D, HC, 20);
+        });
+        row("hc_dot+hc_mix", usd, bp, fp);
+        const double use =
+            time_us([&] { k_expand<<<NCU, PLOW_THREADS>>>(d_e, d_o, d_x, d_mix, T, D, HC); });
+        row("hc_expand", use, (double)T * D * 2 + 2.0 * T * N * 2,
+            (double)T * HC * D * (1.0 + 2.0 * HC));
+        printf("    per 4096-token prefill, all 86 sites: %.1f ms\n\n", (usd + use) * 86 / 1000.0);
+        hipFree(d_x); hipFree(d_o); hipFree(d_e); hipFree(d_fn); hipFree(d_sc); hipFree(d_ba);
+        hipFree(d_mix); hipFree(d_part);
+    }
+    {
+        /* Attention at prefill: every query attends its own window plus the
+         * compressed history, so the work is T x the decode shape. */
+        const unsigned T = 1024, H = 64, D = 512, NKV = 8192, TOPK = 640;
+        std::vector<bf16> q((size_t)T * H * D), kv((size_t)NKV * D);
+        std::vector<int> idx((size_t)T * TOPK);
+        for (auto& v : q) v = f2bf_host(drand48() * 0.1);
+        for (auto& v : kv) v = f2bf_host(drand48() * 0.1);
+        for (auto& v : idx) v = (int)(lrand48() % NKV);
+        bf16 *d_q, *d_kv, *d_o;
+        int* d_i;
+        float* d_s;
+        HC_CHECK(hipMalloc(&d_q, q.size() * 2));
+        HC_CHECK(hipMalloc(&d_kv, kv.size() * 2));
+        HC_CHECK(hipMalloc(&d_o, q.size() * 2));
+        HC_CHECK(hipMalloc(&d_i, idx.size() * 4));
+        HC_CHECK(hipMalloc(&d_s, H * 4));
+        HC_CHECK(hipMemcpy(d_q, q.data(), q.size() * 2, hipMemcpyHostToDevice));
+        HC_CHECK(hipMemcpy(d_kv, kv.data(), kv.size() * 2, hipMemcpyHostToDevice));
+        HC_CHECK(hipMemcpy(d_i, idx.data(), idx.size() * 4, hipMemcpyHostToDevice));
+        printf("sparse attention, prefill (T=%u, H=64, D=512, topk=640)\n", T);
+        const double us = time_us([&] {
+            k_attn<<<NCU, PLOW_THREADS>>>(d_o, d_q, d_kv, d_i, d_s, T, H, D, TOPK, 0.0442f);
+        });
+        const double b = 2.0 * (double)T * H * D * 2 + (double)NKV * D * 2 + (double)T * TOPK * 4;
+        const double f = 4.0 * (double)T * H * TOPK * D;
+        row("sparse_attn", us, b, f);
+        printf("    per 1024-token prefill, all 43 layers: %.1f ms\n\n", us * 43 / 1000.0);
+        hipFree(d_q); hipFree(d_kv); hipFree(d_o); hipFree(d_i); hipFree(d_s);
+    }
     return 0;
 }

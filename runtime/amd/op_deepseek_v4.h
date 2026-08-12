@@ -1079,17 +1079,44 @@ __device__ void d_v4_hc_dot(float* __restrict__ partial, const bf16* __restrict_
      * coalesced stream, and the `(m, i)` decode is two integer ops. Each thread
      * may land on several `m`, so its products go into an LDS accumulator per
      * mix row rather than a register per row. */
+    /* TWO DECOMPOSITIONS, because decode and prefill want opposite ones.
+     *
+     * At decode there is ONE token, so the only parallelism is the `MIX * N`
+     * projection and every block must take a slice of it. At prefill there are
+     * thousands of tokens and the loop below is per token, so the decode form
+     * runs `T` sequential grid passes. Splitting TOKENS across blocks instead
+     * turns that into `T / nblk` passes, and is the better shape for a batched
+     * decode of a few dozen tokens.
+     *
+     * IT DOES NOT RESCUE PREFILL, AND THE MEASUREMENT SAYS WHY. At T=4096 the
+     * two decompositions are 50.3 ms and 48.4 ms — indistinguishable, both 0.1%
+     * of roof. The cost is not scheduling: a token-parallel block re-reads the
+     * whole 1.5 MiB `hc_fn` for every token it owns, so total weight traffic is
+     * `T * 1.5 MiB` = 6.1 GiB either way. Amortizing a weight across tokens is
+     * tiling, i.e. a GEMM — the projection at prefill is `[T, N] x [MIX, N]^T`
+     * with AI 20.6, just above the ridge point.
+     *
+     * So the emitter should issue `DevOp::Gemm` for the mixes at prefill and
+     * this pair only at decode, where it already sits at the launch floor. Both
+     * spellings are available and the choice is the emitter's; no decomposition
+     * of a per-token GEMV can substitute for the GEMM. */
     float* bdot = lds; /* [1 + MIX] per block */
-    for (unsigned t = 0; t < T; t++) {
+    const bool token_par = T >= nblk;
+    const unsigned t0 = token_par ? slice : 0;
+    const unsigned tstep = token_par ? nblk : 1;
+    for (unsigned t = t0; t < T; t += tstep) {
         const bf16* xt = x + (size_t)t * N;
         for (unsigned k = threadIdx.x; k < 1u + MIX; k += PLOW_THREADS) bdot[k] = 0.0f;
         __syncthreads();
 
         const size_t total = (size_t)MIX * N;
-        const size_t gstride = (size_t)nblk * PLOW_THREADS;
+        /* Token-parallel blocks each sweep the WHOLE projection for their own
+         * tokens; element-parallel blocks split it between them. */
+        const size_t gstride = token_par ? PLOW_THREADS : (size_t)nblk * PLOW_THREADS;
+        const size_t e0 = token_par ? threadIdx.x : (size_t)slice * PLOW_THREADS + threadIdx.x;
         const unsigned lane = threadIdx.x & 63u;
         float ss = 0.0f;
-        for (size_t e = (size_t)slice * PLOW_THREADS + threadIdx.x; e < total; e += gstride) {
+        for (size_t e = e0; e < total; e += gstride) {
             const unsigned m = (unsigned)(e / N), i = (unsigned)(e - (size_t)m * N);
             const float v = bf2f(xt[i]);
             /* `sum(x^2)` rides the m == 0 pass, which visits every i exactly once. */

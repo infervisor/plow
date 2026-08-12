@@ -277,6 +277,54 @@ const EMITTER_SRC: &[&str] = &[
 /// question — "what selects this, and is that selector complete over precisions?"
 const GFX950_UNEMITTED: &[(&str, &str)] = &[
     (
+        "PLOW_DOP_V4_HC_REDUCE",
+        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+    ),
+    (
+        "PLOW_DOP_V4_HC_EXPAND",
+        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+    ),
+    (
+        "PLOW_DOP_V4_HC_REDUCE_HEAD",
+        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+    ),
+    (
+        "PLOW_DOP_V4_SPARSE_ATTN",
+        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+    ),
+    (
+        "PLOW_DOP_V4_KV_COMPRESS",
+        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+    ),
+    (
+        "PLOW_DOP_V4_INDEX_SCORE",
+        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+    ),
+    (
+        "PLOW_DOP_V4_INDEX_TOPK",
+        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+    ),
+    (
+        "PLOW_DOP_V4_GROUPED_LINEAR",
+        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+    ),
+    (
+        "PLOW_DOP_V4_MOE_ROUTE",
+        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+    ),
+    (
+        "PLOW_DOP_V4_CLAMPED_SWIGLU",
+        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+    ),
+    (
+        "PLOW_DOP_V4_HC_DOT",
+        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+    ),
+    (
+        "PLOW_DOP_V4_HC_MIX",
+        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+    ),
+    (
         "PLOW_DOP_FLASH_GATHER_PREFILL",
         "Sparse MLA prefill needs one causal top-k index row per query token. IndexScore and \
           IndexSelect currently produce only a single-query index, so mla.rs deliberately emits \

@@ -235,6 +235,8 @@ const DOC: &[S] = &[
     S { op: DevOp::V4GroupedLinear, t: &["out", "o", "w"], i: &["T", "G", "R", "W"], f: &[], j: &[] },
     S { op: DevOp::V4MoeRoute, t: &["sel", "wts", "logits", "bias", "tid2eid", "ids"], i: &["T", "E", "K"], f: &["route_scale"], j: &[] },
     S { op: DevOp::V4ClampedSwiGlu, t: &["out", "gate", "up"], i: &["n"], f: &["limit"], j: &[] },
+    S { op: DevOp::V4HcDot, t: &["partial", "x", "hc_fn"], i: &["T", "D", "hc"], f: &[], j: &[] },
+    S { op: DevOp::V4HcMix, t: &["out", "x", "partial", "hc_scale", "hc_base", "mix_out"], i: &["T", "D", "hc", "sinkhorn_iters"], f: &["norm_eps", "hc_eps"], j: &[] },
     // `gamma?` is the FUSED post-norm: present, the mix is RMSNormed IN PLACE over `out` and the
     // packet subsumes the RMSNORM that would otherwise follow it. See `crate::k3::fuse_attnres_norm`.
     S { op: DevOp::AttnRes, t: &["out", "prefix_sum", "block_residual", "score_w", "push_src?", "gamma?"], i: &["T", "H", "nb", "push_row", "nb_cap"], f: &["eps"], j: &[] },

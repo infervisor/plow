@@ -1451,6 +1451,26 @@ pub enum DevOp {
     ///
     /// `t0=out t1=gate t2=up` · `i0=n` · `f0=limit`. All three are `[n]` bf16.
     V4ClampedSwiGlu = 130,
+    /// **Hyper-connection reduce, part 1 of 2**: the grid-parallel projection.
+    ///
+    /// `t0=partial([T,1+mix] f32) t1=x([T,hc,D] bf16) t2=hc_fn([mix,hc*D] f32)` ·
+    /// `i0=T i1=D i2=hc`, with `mix = (2 + hc) * hc`.
+    ///
+    /// [`DevOp::V4HcReduce`] does the whole reduce in one workgroup because
+    /// `pre` needs every mix value, so nothing can be emitted until the entire
+    /// projection is done. At decode that put 1.5 MiB per sub-layer through ONE
+    /// CU — measured 238 us against a 0.39 us bandwidth bound, and 20.4 ms per
+    /// token across all 86 sites. This pair splits it the way split-K GEMV is
+    /// already split, and the two spellings are bit-identical.
+    ///
+    /// `t0` MUST BE ZEROED before this runs: it is accumulated into with atomics.
+    V4HcDot = 131,
+    /// **Hyper-connection reduce, part 2 of 2**: Sinkhorn split and stream mix.
+    ///
+    /// `t0=out([T,D] bf16) t1=x([T,hc,D] bf16) t2=partial([T,1+mix] f32)
+    /// t3=hc_scale([3] f32) t4=hc_base([mix] f32) t5=mix_out([T,hc+hc*hc] f32)` ·
+    /// `i0=T i1=D i2=hc i3=sinkhorn_iters` · `f0=norm_eps f1=hc_eps`.
+    V4HcMix = 132,
 }
 
 impl DevOp {
@@ -1591,6 +1611,8 @@ impl DevOp {
         DevOp::V4GroupedLinear,
         DevOp::V4MoeRoute,
         DevOp::V4ClampedSwiGlu,
+        DevOp::V4HcDot,
+        DevOp::V4HcMix,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1742,6 +1764,8 @@ impl DevOp {
             DevOp::V4GroupedLinear => "PLOW_DOP_V4_GROUPED_LINEAR",
             DevOp::V4MoeRoute => "PLOW_DOP_V4_MOE_ROUTE",
             DevOp::V4ClampedSwiGlu => "PLOW_DOP_V4_CLAMPED_SWIGLU",
+            DevOp::V4HcDot => "PLOW_DOP_V4_HC_DOT",
+            DevOp::V4HcMix => "PLOW_DOP_V4_HC_MIX",
         }
     }
 
@@ -1772,7 +1796,8 @@ impl DevOp {
     /// by two whether or not the range has holes.
     /// 116 -> 117 for `XReduceAddNorm = 116` (the fused TP seam).
     /// 121 -> 131 for the ten DeepSeek-V4 opcodes (121..=130).
-    pub const COUNT: u16 = 131;
+    /// 131 -> 133 for the split hyper-connection reduce (131..=132).
+    pub const COUNT: u16 = 133;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

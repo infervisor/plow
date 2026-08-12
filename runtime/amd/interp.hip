@@ -2028,6 +2028,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                            (const long long*)TEN(4), (const int*)TEN(5), in->i[0], in->i[1],
                            in->i[2], in->fj[0].f, slice, nblk, (float*)sm->raw);
             break;
+        case PLOW_DOP_V4_HC_DOT:
+            d_v4_hc_dot((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2), in->i[0],
+                        in->i[1], in->i[2], slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_HC_MIX:
+            d_v4_hc_mix((bf16*)TEN(0), (float*)TEN(5), (const bf16*)TEN(1), (const float*)TEN(2),
+                        (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1], in->i[2],
+                        in->i[3], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)sm->raw);
+            break;
         case PLOW_DOP_V4_CLAMPED_SWIGLU:
             d_v4_clamped_swiglu((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
                                 in->fj[0].f);
