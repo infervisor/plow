@@ -1,0 +1,597 @@
+//! DeepSeek-V4 (`deepseek_v4`) front-end claim and capability report.
+//!
+//! V4 has no emitter. This module exists so that saying so is *accurate and
+//! actionable* rather than a panic naming the wrong architecture, and so the
+//! claim happens before any arm that would parse it as something else.
+//!
+//! That risk is not hypothetical. V4 spells `q_lora_rank`, `n_routed_experts`,
+//! `num_experts_per_tok` and `moe_intermediate_size` exactly as DeepSeek-V3
+//! does, so a `starts_with("deepseek")` arm — or anyone adding one — parses
+//! this config, finds every key it looks for, and emits a blob for a model that
+//! shares none of V4's dataflow: no `kv_lora_rank`, no residual add, one KV
+//! head instead of MLA's latent, a learned KV compressor, and FP4 experts. That
+//! is the Kimi-K3-as-K2 failure with a different pair of names, and the fix is
+//! the same one: claim the `model_type` explicitly and refuse loudly.
+//!
+//! The report follows `kimi_k3::kimi_k3_emit`: geometry, config-vs-tensor
+//! agreement (tensors win), what already exists so it is not rebuilt, and a
+//! ranked gap list.
+
+use super::kimi_k3::{k3_shard_headers, textwrap72};
+use serde_json::Value;
+use std::path::Path;
+
+pub(crate) struct V4Cfg {
+    pub layers: u32,
+    pub hidden: i64,
+    pub heads: u32,
+    pub head_dim: u32,
+    pub rope_head_dim: u32,
+    pub q_lora: i64,
+    pub o_groups: u32,
+    pub o_lora: i64,
+    pub vocab: i64,
+    pub window: u32,
+    pub compress_ratios: Vec<u32>,
+    pub rope_theta: f64,
+    pub compress_rope_theta: f64,
+    pub index_heads: u32,
+    pub index_head_dim: u32,
+    pub index_topk: u32,
+    pub n_exp: u32,
+    pub shared_exp: u32,
+    pub top_k: u32,
+    pub moe_inter: i64,
+    pub hash_layers: u32,
+    pub swiglu_limit: f64,
+    pub score_func: String,
+    pub route_scale: f64,
+    pub hc_mult: u32,
+    pub hc_iters: u32,
+    pub expert_dtype: String,
+    pub quant_method: String,
+    pub quant_block: Vec<i64>,
+    pub scale_fmt: String,
+    pub mtp_layers: u32,
+    pub dspark_block: u32,
+    pub dspark_targets: Vec<u32>,
+}
+
+impl V4Cfg {
+    /// Layers whose KV history is compressed at all.
+    pub fn n_compressed(&self) -> usize {
+        self.compress_ratios
+            .iter()
+            .take(self.layers as usize)
+            .filter(|&&r| r != 0)
+            .count()
+    }
+
+    /// Layers that additionally run the sparse indexer (`ratio == 4`).
+    pub fn n_indexed(&self) -> usize {
+        self.compress_ratios
+            .iter()
+            .take(self.layers as usize)
+            .filter(|&&r| r == 4)
+            .count()
+    }
+
+    pub fn nope_head_dim(&self) -> u32 {
+        self.head_dim - self.rope_head_dim
+    }
+
+    /// Rows of a per-layer hyper-connection projection.
+    pub fn hc_rows(&self) -> i64 {
+        (2 + self.hc_mult as i64) * self.hc_mult as i64
+    }
+}
+
+pub(crate) fn cfg_deepseek_v4(dir: &Path) -> V4Cfg {
+    let v: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).expect("config.json"))
+            .expect("config.json is not valid JSON");
+    let u = |k: &str| -> u32 {
+        v[k].as_u64()
+            .unwrap_or_else(|| panic!("deepseek_v4: config.json is missing `{k}`")) as u32
+    };
+    let i = |k: &str| -> i64 {
+        v[k].as_i64()
+            .unwrap_or_else(|| panic!("deepseek_v4: config.json is missing `{k}`"))
+    };
+    let f = |k: &str, d: f64| v[k].as_f64().unwrap_or(d);
+    let s = |k: &str, d: &str| v[k].as_str().unwrap_or(d).to_string();
+    let q = &v["quantization_config"];
+
+    V4Cfg {
+        layers: u("num_hidden_layers"),
+        hidden: i("hidden_size"),
+        heads: u("num_attention_heads"),
+        head_dim: u("head_dim"),
+        rope_head_dim: u("qk_rope_head_dim"),
+        q_lora: i("q_lora_rank"),
+        o_groups: u("o_groups"),
+        o_lora: i("o_lora_rank"),
+        vocab: i("vocab_size"),
+        window: u("sliding_window"),
+        compress_ratios: v["compress_ratios"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64())
+                    .map(|x| x as u32)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        rope_theta: f("rope_theta", 10_000.0),
+        compress_rope_theta: f("compress_rope_theta", 0.0),
+        index_heads: u("index_n_heads"),
+        index_head_dim: u("index_head_dim"),
+        index_topk: u("index_topk"),
+        n_exp: u("n_routed_experts"),
+        shared_exp: u("n_shared_experts"),
+        top_k: u("num_experts_per_tok"),
+        moe_inter: i("moe_intermediate_size"),
+        hash_layers: u("num_hash_layers"),
+        swiglu_limit: f("swiglu_limit", 0.0),
+        score_func: s("scoring_func", "?"),
+        route_scale: f("routed_scaling_factor", 1.0),
+        hc_mult: u("hc_mult"),
+        hc_iters: u("hc_sinkhorn_iters"),
+        expert_dtype: s("expert_dtype", "bf16"),
+        quant_method: q["quant_method"].as_str().unwrap_or("none").to_string(),
+        quant_block: q["weight_block_size"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+            .unwrap_or_default(),
+        scale_fmt: q["scale_fmt"].as_str().unwrap_or("?").to_string(),
+        mtp_layers: v["num_nextn_predict_layers"].as_u64().unwrap_or(0) as u32,
+        dspark_block: v["dspark_block_size"].as_u64().unwrap_or(0) as u32,
+        dspark_targets: v["dspark_target_layer_ids"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64())
+                    .map(|x| x as u32)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Cross-check config-derived shapes against the shard headers. **Tensors win.**
+///
+/// Same discipline as `k3_config_vs_tensors`, and it has already earned its keep
+/// here: `num_nextn_predict_layers` in this checkpoint's `config.json` says 1
+/// while the tensors carry three `mtp.*` stages.
+fn v4_config_vs_tensors(
+    c: &V4Cfg,
+    h: &std::collections::BTreeMap<String, (String, Vec<i64>)>,
+) -> Vec<String> {
+    let mut errs = Vec::new();
+    let mut check = |name: String, want: Vec<i64>| {
+        if let Some((_, got)) = h.get(&name) {
+            if *got != want {
+                errs.push(format!(
+                    "{name}: config implies {want:?}, tensor is {got:?}"
+                ));
+            }
+        }
+    };
+
+    let d = c.hidden;
+    check("embed.weight".into(), vec![c.vocab, d]);
+    check("head.weight".into(), vec![c.vocab, d]);
+    check("norm.weight".into(), vec![d]);
+    check(
+        "hc_head_fn".into(),
+        vec![c.hc_mult as i64, c.hc_mult as i64 * d],
+    );
+
+    for l in 0..c.layers {
+        check(format!("layers.{l}.attn.wq_a.weight"), vec![c.q_lora, d]);
+        check(
+            format!("layers.{l}.attn.wq_b.weight"),
+            vec![c.heads as i64 * c.head_dim as i64, c.q_lora],
+        );
+        check(
+            format!("layers.{l}.attn.wkv.weight"),
+            vec![c.head_dim as i64, d],
+        );
+        check(
+            format!("layers.{l}.attn.wo_a.weight"),
+            vec![
+                c.o_groups as i64 * c.o_lora,
+                c.heads as i64 * c.head_dim as i64 / c.o_groups as i64,
+            ],
+        );
+        check(
+            format!("layers.{l}.attn.wo_b.weight"),
+            vec![d, c.o_groups as i64 * c.o_lora],
+        );
+        check(format!("layers.{l}.attn.attn_sink"), vec![c.heads as i64]);
+        check(
+            format!("layers.{l}.hc_attn_fn"),
+            vec![c.hc_rows(), c.hc_mult as i64 * d],
+        );
+        check(format!("layers.{l}.hc_ffn_base"), vec![c.hc_rows()]);
+        check(
+            format!("layers.{l}.ffn.gate.weight"),
+            vec![c.n_exp as i64, d],
+        );
+
+        // The compressor projects twice its output width exactly on the
+        // overlapping (ratio == 4) layers.
+        if let Some(&r) = c.compress_ratios.get(l as usize) {
+            if r != 0 {
+                let wide = if r == 4 { 2 } else { 1 } * c.head_dim as i64;
+                check(
+                    format!("layers.{l}.attn.compressor.wkv.weight"),
+                    vec![wide, d],
+                );
+                check(
+                    format!("layers.{l}.attn.compressor.wgate.weight"),
+                    vec![wide, d],
+                );
+                check(
+                    format!("layers.{l}.attn.compressor.ape"),
+                    vec![r as i64, wide],
+                );
+                check(
+                    format!("layers.{l}.attn.compressor.norm.weight"),
+                    vec![c.head_dim as i64],
+                );
+            }
+            if r == 4 {
+                check(
+                    format!("layers.{l}.attn.indexer.wq_b.weight"),
+                    vec![c.index_heads as i64 * c.index_head_dim as i64, c.q_lora],
+                );
+                check(
+                    format!("layers.{l}.attn.indexer.weights_proj.weight"),
+                    vec![c.index_heads as i64, d],
+                );
+                check(
+                    format!("layers.{l}.attn.indexer.compressor.wkv.weight"),
+                    vec![2 * c.index_head_dim as i64, d],
+                );
+            }
+        }
+    }
+
+    // Hash layers carry a token-id table and no selection bias; scored layers
+    // are the other way round. Presence, not shape, is the thing to check.
+    for l in 0..c.layers {
+        let table = h.contains_key(&format!("layers.{l}.ffn.gate.tid2eid"));
+        let bias = h.contains_key(&format!("layers.{l}.ffn.gate.bias"));
+        let want_hash = l < c.hash_layers;
+        if !h.is_empty() && h.contains_key(&format!("layers.{l}.ffn.gate.weight")) {
+            if want_hash && !table {
+                errs.push(format!(
+                    "layers.{l}.ffn.gate: config says hash-routed (num_hash_layers={}) but the \
+                     checkpoint has no tid2eid table",
+                    c.hash_layers
+                ));
+            }
+            if !want_hash && !bias {
+                errs.push(format!(
+                    "layers.{l}.ffn.gate: config says score-routed but the checkpoint has no \
+                     selection bias"
+                ));
+            }
+        }
+    }
+
+    // `num_nextn_predict_layers` vs the mtp stacks actually shipped.
+    let mtp_seen = (0..8)
+        .filter(|i| h.contains_key(&format!("mtp.{i}.attn.wkv.weight")))
+        .count() as u32;
+    if mtp_seen > 0 && mtp_seen != c.mtp_layers {
+        errs.push(format!(
+            "mtp stages: config num_nextn_predict_layers={} but the checkpoint ships {mtp_seen} \
+             (inference/config.json says n_mtp_layers=3 — the HF config is the one that is wrong)",
+            c.mtp_layers
+        ));
+    }
+    errs
+}
+
+struct V4Gap {
+    what: &'static str,
+    scope: String,
+    why: String,
+    fix: &'static str,
+}
+
+/// Ranked missing-capability list, blocker first.
+///
+/// Ordering rule, as for K3: a gap that blocks EVERY layer outranks one that
+/// blocks a subset.
+fn v4_gaps(c: &V4Cfg) -> Vec<V4Gap> {
+    vec![
+        V4Gap {
+            what: "hyper-connections (hc_pre / hc_post) in place of the residual",
+            scope: format!("{}/{} layers, both sub-layers", c.layers, c.layers),
+            why: format!(
+                "the hidden state is {} PARALLEL residual streams, not one. Each sub-layer \
+                 RMS-scales the flattened streams, projects them through hc_*_fn to {} mixing \
+                 coefficients, runs {} Sinkhorn row/column normalization iterations, reduces the \
+                 streams to one vector, and afterwards writes the branch output back as \
+                 `post (x) branch + comb . residual`. There is no residual add anywhere in this \
+                 model: emitting one is the hc_mult=1, post=comb=1 special case and is a \
+                 different network. The Sinkhorn loop is a per-token {}x{} normalization, which \
+                 is a new kernel shape for this tree - nothing in devgen iterates like it.",
+                c.hc_mult,
+                c.hc_rows(),
+                c.hc_iters,
+                c.hc_mult,
+                c.hc_mult
+            ),
+            fix: "one fused op per sub-layer boundary (reduce and expand share the same three \
+                  weights and the same mixes, so they are two halves of one kernel, not two \
+                  independent ones). nn-graph models them as Op::HcReduce / Op::HcExpand; the \
+                  Lean-side obligation is that expand's output equals the reference composition.",
+        },
+        V4Gap {
+            what: "single-KV-head attention at head_dim 512 with a learned sink",
+            scope: format!("{}/{} layers", c.layers, c.layers),
+            why: format!(
+                "one KV vector of {} lanes ({} content + {} rope) is shared by all {} query \
+                 heads - a kvh=1, hd={} flash shape, which is its own kernel instantiation and \
+                 not a short loop over an existing one. Queries are RMS-rescaled per head with NO \
+                 learned gain, the last {} lanes carry rope, and the OUTPUT is de-rotated by the \
+                 conjugate angle before the projection. The sink is a learned per-head logit that \
+                 joins the softmax denominator without a value row, so it shifts every \
+                 probability in the row.",
+                c.head_dim,
+                c.nope_head_dim(),
+                c.rope_head_dim,
+                c.heads,
+                c.head_dim,
+                c.rope_head_dim
+            ),
+            fix: "a kvh=1/hd=512 flash arm with a sink term in the running denominator, plus the \
+                  inverse rope on the output. The sliding window is only 128, so the window part \
+                  is small and dense; the size is all in the compressed history.",
+        },
+        V4Gap {
+            what: "learned KV compressor (gated pooling, sequence-rate changing)",
+            scope: format!(
+                "{}/{} layers ({} overlapping at ratio 4, the rest at their own ratio)",
+                c.n_compressed(),
+                c.layers,
+                c.n_indexed()
+            ),
+            why: "every `ratio` consecutive tokens are pooled into ONE compressed KV entry by a \
+                  softmax over learned gate scores plus a per-offset positional bias, then \
+                  RMS-normed and roped at the compressed position. This is the only rate-changing \
+                  op in the model. The ratio-4 layers additionally OVERLAP their windows - each \
+                  window carries the previous window's half, which is why their wkv/wgate/ape are \
+                  twice as wide - and the overlapped form builds its windows by value-padding (0 \
+                  for KV, -inf for the scores). Attention then reads the sliding window and the \
+                  compressed history as one KV sequence."
+                .to_string(),
+            fix: "a compressor kernel writing into the tail of the same KV ring the window uses, \
+                  with a decode-time incremental form (the reference keeps a per-sequence window \
+                  state and only emits an entry every `ratio` steps, so the state is a runtime \
+                  resource exactly like the KV cache).",
+        },
+        V4Gap {
+            what: "sparse indexer (top-k selection over the compressed history)",
+            scope: format!("{}/{} layers", c.n_indexed(), c.layers),
+            why: format!(
+                "a second, independent compressor at width {} plus a {}-head scorer: score = \
+                 sum_h relu(q_h . kv) * w_h, then keep the top {} compressed entries. Under TP \
+                 the score is all-reduced BEFORE the top-k, so the selection is a collective, not \
+                 a per-rank decision - ranks that disagree on the selected set produce different \
+                 tokens.",
+                c.index_head_dim, c.index_heads, c.index_topk
+            ),
+            fix: "the DSA machinery for GLM-5.2 is the closest existing arm and is the thing to \
+                  read first (crates/devgen/src/mla.rs, the glm_* indexer path). What is new here \
+                  is that the indexer scores a COMPRESSED sequence it computes itself, rather \
+                  than the raw KV.",
+        },
+        V4Gap {
+            what: "FP4 routed experts with hash-routed leading layers",
+            scope: format!(
+                "{} experts/layer (top-{}) + {} shared, {} hash-routed layers",
+                c.n_exp, c.top_k, c.shared_exp, c.hash_layers
+            ),
+            why: format!(
+                "routed experts are {} ({} nibble-packed, one {}-element scale group per row \
+                 chunk) while the shared expert and the attention projections stay {}. Routing is \
+                 `{}` scoring - NOT softmax and NOT sigmoid - with a selection bias that shifts \
+                 the top-k comparison but not the combine weights, renormalization over the \
+                 selected set, and a route scale of {}. The first {} layers do not score at all: \
+                 the expert set is read from a [vocab, top_k] token-id table. The expert SwiGLU \
+                 clamps both branches at {}.",
+                c.expert_dtype,
+                if c.expert_dtype == "fp4" { "e2m1" } else { "-" },
+                32,
+                c.quant_method,
+                c.score_func,
+                c.route_scale,
+                c.hash_layers,
+                c.swiglu_limit
+            ),
+            fix: "the mxfp4 expert path (MoeEnc::Mxfp4, runtime/amd/op_moe.h wave_dot_mxfp4) is \
+                  w4a16 and already exists - see the K3 report's ALREADY-COVERED section. What is \
+                  new is sqrtsoftplus scoring, the clamped SwiGLU, and the hash table (a gather, \
+                  not a top-k, and it makes the router's score GEMM dead weight on those layers).",
+        },
+        V4Gap {
+            what: "block-diagonal output projection (wo_a)",
+            scope: format!("{}/{} layers", c.layers, c.layers),
+            why: format!(
+                "{} independent [{}, {}] blocks stored as ONE stacked tensor, applied to the \
+                 matching slice of the head axis. A dense linear of the same total size mixes \
+                 groups the reference keeps separate.",
+                c.o_groups,
+                c.o_lora,
+                c.heads as i64 * c.head_dim as i64 / c.o_groups as i64
+            ),
+            fix: "a grouped GEMM over the head axis, then the ordinary wo_b projection. Cheap \
+                  next to the rest of this list, but it is a shape no existing arm emits.",
+        },
+        V4Gap {
+            what: "DSpark / MTP draft stages",
+            scope: format!(
+                "{} mtp stage(s), block size {}, target layers {:?}",
+                c.mtp_layers, c.dspark_block, c.dspark_targets
+            ),
+            why: "the draft network reads the mean-pooled hidden state of the target layers, runs \
+                  its own attention variant over a noise-token block, and scores candidates with \
+                  a Markov head plus a confidence head. It is a separate network sharing the \
+                  embedding and the lm_head."
+                .to_string(),
+            fix: "out of scope until the main tower runs. Speculative decoding is a throughput \
+                  multiplier on top of a correct model, never a prerequisite for one.",
+        },
+    ]
+}
+
+/// Report what V4 is and what it needs, then refuse. Never returns.
+pub(crate) fn deepseek_v4_emit(dir: &Path, ctx: u32, tp: u32) -> ! {
+    let c = cfg_deepseek_v4(dir);
+    let (hdrs, have, total) = k3_shard_headers(dir);
+    let mismatches = v4_config_vs_tensors(&c, &hdrs);
+
+    eprintln!("deepseek_v4: config ACCEPTED, emission REFUSED.\n");
+    eprintln!("  checkpoint  {}", dir.display());
+    if total == 0 {
+        eprintln!("  shards      none on disk — every dimension below is CONFIG-ONLY, unverified");
+    } else {
+        eprintln!(
+            "  shards      {have}/{total} readable, {} tensors{}",
+            hdrs.len(),
+            if have < total {
+                "  (PARTIAL: a tensor's absence proves nothing)"
+            } else {
+                ""
+            }
+        );
+    }
+    eprintln!(
+        "  tower       {} layers | hidden {} | heads {} | vocab {} | ctx {ctx} | tp {tp}",
+        c.layers, c.hidden, c.heads, c.vocab
+    );
+    eprintln!(
+        "  attention   kvh=1 hd={} ({}+{} rope) | q_lora {} | window {} | sink=yes | \
+         out {}x{} block-diag",
+        c.head_dim,
+        c.nope_head_dim(),
+        c.rope_head_dim,
+        c.q_lora,
+        c.window,
+        c.o_groups,
+        c.o_lora
+    );
+    eprintln!(
+        "  kv history  {} of {} layers compressed ({} of them overlapping at ratio 4) | \
+         rope_theta {} window / {} compressed",
+        c.n_compressed(),
+        c.layers,
+        c.n_indexed(),
+        c.rope_theta,
+        c.compress_rope_theta
+    );
+    eprintln!(
+        "  indexer     {} layers | {} heads x {} dim | top-{}",
+        c.n_indexed(),
+        c.index_heads,
+        c.index_head_dim,
+        c.index_topk
+    );
+    eprintln!(
+        "  MoE         {} routed (top-{}) + {} shared | inter {} | experts {} | scoring {} \
+         (scale {}) | swiglu clamp {} | hash-routed L<{}",
+        c.n_exp,
+        c.top_k,
+        c.shared_exp,
+        c.moe_inter,
+        c.expert_dtype,
+        c.score_func,
+        c.route_scale,
+        c.swiglu_limit,
+        c.hash_layers
+    );
+    eprintln!(
+        "  residual    HYPER-CONNECTIONS: {} streams, {} Sinkhorn iters, {}-row mix — \
+         there is NO residual add in this model",
+        c.hc_mult,
+        c.hc_iters,
+        c.hc_rows()
+    );
+    eprintln!(
+        "  quant       {} | block {:?} | scale_fmt {} | routed experts {} (attn/shared stay fp8)",
+        c.quant_method, c.quant_block, c.scale_fmt, c.expert_dtype
+    );
+    eprintln!(
+        "  draft       {} mtp stage(s), dspark block {}, targets {:?}",
+        c.mtp_layers, c.dspark_block, c.dspark_targets
+    );
+
+    if mismatches.is_empty() {
+        eprintln!(
+            "\n  config vs tensors: AGREE on every dimension the {} readable tensors can speak to.",
+            hdrs.len()
+        );
+    } else {
+        eprintln!(
+            "\n  config vs tensors: {} DISAGREEMENT(S). TRUST THE TENSORS (GLM-5.2 lesson):",
+            mismatches.len()
+        );
+        for m in &mismatches {
+            eprintln!("    - {m}");
+        }
+    }
+
+    eprintln!("\nALREADY COVERED — do not rebuild these:");
+    eprintln!(
+        "  operator IR           `deepseek_v4` parses, builds and shape-infers in nn-graph, and \
+         its weight\n                        manifest is name-exact against this checkpoint (1328 \
+         tensors in scope,\n                        none missing, none invented). Read \
+         crates/nn-graph/src/models/deepseek_v4.rs\n                        before deciding what \
+         any kernel has to compute — the op order there is the\n                        reference \
+         forward pass, already checked."
+    );
+    eprintln!(
+        "  egglog vocabulary     every V4 op lowers (HcReduce/HcExpand, KvCompress, \
+         GroupedLinear,\n                        ClampedSwiGlu, RopeInverse, AttentionSinkMask, \
+         RmsNormNoGain, and the two\n                        router variants). No new rewrite rule \
+         was needed, so Checkpoint A carries\n                        no new obligation."
+    );
+    eprintln!(
+        "  fp4 expert weights    MoeEnc::Mxfp4 + `wave_dot_mxfp4` (runtime/amd/op_moe.h) is w4a16 \
+         against\n                        nibble-packed fp4 — this checkpoint's exact scheme. The \
+         on-disk layout is\n                        [N, K/2] packed with an e8m0 scale per 32 \
+         elements. Nothing to convert."
+    );
+    eprintln!(
+        "  block-fp8 attention   the fp8 e4m3 / ue8m0 128x128 block scheme on the attention \
+         projections is\n                        the same one GLM-5.2 already ships on this ISA."
+    );
+
+    let gaps = v4_gaps(&c);
+    eprintln!(
+        "\nOPEN — {} capabilities this checkpoint needs and plow does not have. Blocker first.\n",
+        gaps.len()
+    );
+    for (i, g) in gaps.iter().enumerate() {
+        eprintln!("G{:<2} {}  [{}]", i + 1, g.what, g.scope);
+        for line in textwrap72(&g.why) {
+            eprintln!("      {line}");
+        }
+        for (n, line) in textwrap72(g.fix).into_iter().enumerate() {
+            eprintln!("      {} {line}", if n == 0 { "fix:" } else { "    " });
+        }
+        eprintln!();
+    }
+
+    eprintln!(
+        "The first three gaps block every layer, so there is no partial blob and no single-block\n\
+         extraction worth running yet: a `--block` of one V4 layer needs G1, G2 and G3 together.\n\
+         Nothing above is a measurement claim — no V4 kernel has been run on any part."
+    );
+    std::process::exit(2);
+}

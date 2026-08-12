@@ -5551,6 +5551,20 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         }
         mla::kimi_k3_emit(&dir, ctx, tp, block_spec.as_deref());
     }
+    // DeepSeek-V4 (`deepseek_v4`), claimed for the same reason K3 is claimed
+    // above: it spells `q_lora_rank`, `n_routed_experts`, `num_experts_per_tok`
+    // and `moe_intermediate_size` exactly as V3 does, so the `deepseek_v3` arm
+    // below — or any future `starts_with("deepseek")` — finds every key it looks
+    // for and emits a blob for a model with none of V4's dataflow: no
+    // `kv_lora_rank` at all, one KV head instead of MLA's latent, a learned KV
+    // compressor, hyper-connections in place of the residual, and FP4 experts.
+    // Without this arm the failure was at least loud (`cfg_from` panicking on an
+    // unknown model_type), which is exactly what makes it worth claiming before
+    // someone widens a pattern. `deepseek_v4_emit` never returns: it validates
+    // what the front end can and reports what is not implemented.
+    if model_type == "deepseek_v4" {
+        mla::deepseek_v4_emit(&dir, ctx, tp);
+    }
     if model_type == "glm_moe_dsa" {
         // GLM `--block` (M2): single-block
         // extraction on the separate GLM emitter. Absent => the unchanged glm_main

@@ -295,7 +295,7 @@ fn k3_attn_map(t: &Value, layers: u32) -> Vec<K3Attn> {
 /// shards and a download in progress is the normal case, so this reads whatever has landed and
 /// reports the count. **A tensor's absence proves nothing** — every caller below must only ever
 /// use this to CONTRADICT the config, never to conclude something does not exist.
-fn k3_shard_headers(
+pub(crate) fn k3_shard_headers(
     dir: &Path,
 ) -> (
     std::collections::BTreeMap<String, (String, Vec<i64>)>,
@@ -1558,7 +1558,7 @@ pub(crate) fn kimi_k3_emit(dir: &Path, ctx: u32, tp: u32, block_spec: Option<&st
 }
 
 /// Minimal greedy wrap so the capability report stays readable in a terminal.
-fn textwrap72(s: &str) -> Vec<String> {
+pub(crate) fn textwrap72(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut line = String::new();
     for w in s.split_whitespace() {

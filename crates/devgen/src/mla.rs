@@ -7507,6 +7507,9 @@ pub(crate) fn nemotron_emit_block(
 mod kimi_k3;
 pub(crate) use kimi_k3::{k3_emit_full, kimi_k3_emit};
 
+mod deepseek_v4;
+pub(crate) use deepseek_v4::deepseek_v4_emit;
+
 // ===== tests moved from lib.rs (module breakdown): access mla internals directly =====
 #[cfg(test)]
 #[path = "mla/ckpt_quant_tests.rs"]
