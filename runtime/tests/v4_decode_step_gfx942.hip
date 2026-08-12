@@ -263,9 +263,11 @@ int main(void) {
         float* fn = dev_f32((size_t)MIX * HC * HID);
         float* part = dev_f32(1 + MIX);
         float* mixo = dev_f32(HC + HC * HC);
+        float* hsc = dev_f32(3);
+        float* hba = dev_f32(MIX);
         const double us = time_us([&] {
             k_hcdot<<<NCU, PLOW_THREADS>>>(part, xbuf, fn, HID);
-            k_hcmix<<<NCU, PLOW_THREADS>>>(obuf, mixo, xbuf, part, fbuf, fbuf, HID);
+            k_hcmix<<<NCU, PLOW_THREADS>>>(obuf, mixo, xbuf, part, hsc, hba, HID);
         });
         rows.push_back({"hc reduce (dot+mix)", us, (double)MIX * HC * HID * 4, 2 * L});
         const double ue =
@@ -284,32 +286,47 @@ int main(void) {
         const unsigned SP = V4_ATTN_SPLIT;
         float* op = dev_f32((size_t)64 * SP * 512);
         float* mlp = dev_f32((size_t)64 * SP * 2);
+        float* asink = dev_f32(64);
         const double us =
             (SP <= 1u)
                 ? time_us([&] {
-                      k_attn<<<64, PLOW_THREADS>>>(obuf, xbuf, kv, ibuf, fbuf, 64, 512, TOPK);
+                      k_attn<<<64, PLOW_THREADS>>>(obuf, xbuf, kv, ibuf, asink, 64, 512, TOPK);
                   })
                 : time_us([&] {
                       k_attn_sp<<<64 * SP, PLOW_THREADS>>>(op, mlp, xbuf, kv, ibuf, 64, 512, TOPK,
                                                            SP);
-                      k_attn_mg<<<64, PLOW_THREADS>>>(obuf, op, mlp, fbuf, 64, 512, SP);
+                      k_attn_mg<<<64, PLOW_THREADS>>>(obuf, op, mlp, asink, 64, 512, SP);
                   });
         rows.push_back({"sparse attention (split-K)", us, (double)TOPK * 512 * 2, L});
     }
     {
         bf16* ckv = dev_bf16((size_t)NC4 * 128);
+        /* Own output, own weights — sized as the layer's tensors are. Sharing
+         * the 16 MB scratch cost the top-k 5.6x below, so no op here reads or
+         * writes it any more. */
+        float* iscore = dev_f32(NC4);
+        bf16* iq = dev_bf16((size_t)64 * 128);
+        bf16* iw = dev_bf16(64);
         const double us =
-            time_us([&] { k_idx<<<NCU, PLOW_THREADS>>>(fbuf, xbuf, ckv, xbuf, 64, 128, NC4); });
+            time_us([&] { k_idx<<<NCU, PLOW_THREADS>>>(iscore, iq, ckv, iw, 64, 128, NC4); });
         rows.push_back({"indexer score", us, (double)NC4 * 128 * 2, 21});
-        const double ut = time_us([&] { k_topk<<<1, PLOW_THREADS>>>(ibuf, fbuf, NC4, 512); });
+        /* A DEDICATED score buffer. Reading the shared `fbuf` measured 87 us
+         * here while the same shapes in isolation measure 16.5 us
+         * (v4_attn_scale_gfx942.hip), and a 5x gap between two timings of the
+         * same op is a harness question before it is a kernel one. */
+        float* tsc = dev_f32_varied(NC4);
+        const double ut = time_us([&] { k_topk<<<1, PLOW_THREADS>>>(ibuf, tsc, NC4, 512); });
         rows.push_back({"indexer top-k", ut, (double)NC4 * 4, 21});
     }
     {
         float* kvs = dev_f32((size_t)2 * 4 * 1024);
         float* scs = dev_f32((size_t)2 * 4 * 1024);
         float* ape = dev_f32((size_t)4 * 1024);
+        float* kvp = dev_f32(1024);
+        float* scp = dev_f32(1024);
+        bf16* cnw = dev_bf16(512);
         const double us = time_us(
-            [&] { k_cstep<<<1, PLOW_THREADS>>>(obuf, kvs, scs, fbuf, fbuf, ape, xbuf, 512, 4, 1); });
+            [&] { k_cstep<<<1, PLOW_THREADS>>>(obuf, kvs, scs, kvp, scp, ape, cnw, 512, 4, 1); });
         rows.push_back({"kv compress step", us, 0.0, 41});
     }
     {
