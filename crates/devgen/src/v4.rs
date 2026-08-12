@@ -58,9 +58,10 @@
 //! structurally correct program that cannot load, which is why the entry point
 //! is behind `PLOW_V4_FULL` and the default stays the capability report.
 
-use crate::mla::deepseek_v4::V4Cfg;
+use crate::mla::deepseek_v4::{cfg_deepseek_v4, V4Cfg};
 use packet::dev::DevOp;
-use packet::devbuild::Builder;
+use packet::devbuild::{Builder, Model};
+use std::path::Path;
 
 /// Tensor handles a V4 decode program needs. One table serves the whole
 /// program, as `Model` requires.
@@ -759,6 +760,69 @@ pub(crate) fn emit_v4_decode(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, ctx: u32, n_
         d.i[0] = n_cu;
         d.i[1] = 1;
     });
+}
+
+/// Emit a V4 decode blob. Behind `PLOW_V4_FULL=1`; the default emit stays the
+/// capability report, because a blob that cannot LOAD is worse than a refusal
+/// that says why.
+///
+/// # The load contract, and why this is still gated
+///
+/// Every weight above is declared under the checkpoint's own name — including
+/// the `.scale` companion of each block-fp8 tensor. `plowrt` binds by that
+/// name, so the emit side of the contract is complete and checkable: the blob
+/// says exactly which tensors it wants. What is NOT yet done is the host side
+/// for V4's two quantized layouts — block-fp8 `[N/128][K/128]` scale grids and
+/// the fp4 expert packing — plus the routed-expert weight/scale TABLES, which
+/// are one handle per layer standing for 256 experts and need the loader to
+/// build the table rather than bind a tensor.
+///
+/// So this writes a structurally complete program whose weights do not all
+/// resolve yet. That is a deliberate intermediate: the packet DAG, the counts
+/// and the ordering are all testable without a single byte of the 167 GB
+/// checkpoint, and they are tested (`the_shipped_43_layer_program_builds`).
+pub(crate) fn v4_emit_full(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, target: u32) -> ! {
+    assert_eq!(
+        tp, 1,
+        "V4 TP is not wired: the indexer's score must be all-reduced BEFORE its top-k, so the \
+         selection is a collective. Emitting per-rank selections would let ranks decode different \
+         tokens — refused rather than approximated."
+    );
+    let c = cfg_deepseek_v4(dir);
+    let mut b = Builder::new(n_cu);
+    let tn = declare_v4(&mut b, &c, ctx);
+    emit_v4_decode(&mut b, &c, &tn, ctx, n_cu);
+    let prog = b.finish();
+
+    eprintln!(
+        "deepseek_v4: decode program built — {} packets, {} tensors, {} layers, ctx {ctx}",
+        prog.insts.len(),
+        b_tensor_count(&prog),
+        c.layers
+    );
+    let m = Model {
+        n_cu,
+        target,
+        tensors: prog.tensors.clone(),
+        progs: vec![prog],
+        kv_row_insts: Vec::new(),
+        prog_t: vec![1],
+        gen: Vec::new(),
+    };
+    let blob = m.to_blob();
+    std::fs::write(out, &blob).expect("write blob");
+    eprintln!("  wrote {} ({} bytes)", out, blob.len());
+    eprintln!(
+        "\nNOT LOADABLE YET. The routed-expert weight/scale TABLES and the two quantized layouts \
+         (block-fp8 scale grids, fp4 packing) still need their host-side bind; every other weight \
+         is declared under the checkpoint's own name and should resolve. `plowrt serve` on this \
+         blob will fail at load, loudly, naming the first tensor it cannot find."
+    );
+    std::process::exit(0);
+}
+
+fn b_tensor_count(p: &packet::devbuild::Program) -> usize {
+    p.tensors.len()
 }
 
 #[cfg(test)]

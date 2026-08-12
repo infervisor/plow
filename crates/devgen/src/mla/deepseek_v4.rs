@@ -495,6 +495,11 @@ pub(crate) fn deepseek_v4_emit(dir: &Path, ctx: u32, tp: u32) -> ! {
     let (hdrs, have, total) = k3_shard_headers(dir);
     let mismatches = v4_config_vs_tensors(&c, &hdrs);
 
+    /* PLOW_V4_FULL takes the real emit; the default stays this report, because
+     * a blob that cannot load is worse than a refusal that says why. */
+    if std::env::var("PLOW_V4_FULL").ok().as_deref() == Some("1") {
+        crate::v4::v4_emit_full(dir, ctx, "v4_decode.pkt", 304, tp, 0);
+    }
     eprintln!("deepseek_v4: config ACCEPTED, emission REFUSED.\n");
     eprintln!("  checkpoint  {}", dir.display());
     if total == 0 {
