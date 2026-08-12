@@ -562,6 +562,129 @@ fn emit_v4_attn(
     emit_hc_expand(b, c, tn, tn.xr, n_cu, &[wob])
 }
 
+/// The FFN sub-layer: reduce, norm, route, experts, and the expand back.
+///
+/// Routing is `sqrt(softplus(.))` with a selection bias that shifts WHICH
+/// experts run without reaching their combine weights — and on the first
+/// `num_hash_layers` there is no scoring at all, the set comes from a frozen
+/// `[vocab, top_k]` table. Both are `V4MoeRoute`; which one is selected by
+/// whether `tid2eid` is bound, so a hash layer emitted as a scored one routes
+/// every token somewhere else and still runs.
+#[allow(clippy::too_many_arguments)]
+fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &[u32]) -> u32 {
+    let p = format!("layers.{l}");
+    let all: Vec<u32> = (0..n_cu).collect();
+    let h = c.hidden as u32;
+    let e = c.n_exp;
+    let k = c.top_k;
+    let imoe = c.moe_inter as u32;
+    let hash = l < c.hash_layers;
+
+    let red = emit_hc_reduce(b, c, tn, &format!("{p}.hc_ffn"), tn.xr, n_cu, deps);
+    let fnw = b.tensor(&format!("{p}.ffn_norm.weight"), h as u64 * BF16);
+    let nrm = b.emit(DevOp::RmsNorm, all.clone(), &[red], |d| {
+        d.t[0] = tn.xn;
+        d.t[1] = tn.xr;
+        d.t[2] = fnw;
+        d.i[0] = 1;
+        d.i[1] = h;
+        d.f[0] = 1e-6;
+    });
+
+    // Gate scores. The GEMM is bf16 and small; on a hash layer it is dead
+    // weight the emitter still pays, which is a Stage-4 saving, not a bug.
+    let glog = b.tensor(&format!("act.glogit.{l}"), e as u64 * F32);
+    let gw = b.tensor(&format!("{p}.ffn.gate.weight"), e as u64 * h as u64 * BF16);
+    let gg = b.emit(DevOp::Gemv, all.clone(), &[nrm], |d| {
+        d.t[0] = glog;
+        d.t[1] = tn.xn;
+        d.t[2] = gw;
+        d.i[0] = 1;
+        d.i[1] = e;
+        d.i[2] = h;
+    });
+
+    let sel = b.tensor(&format!("act.sel.{l}"), k as u64 * I32);
+    let wts = b.tensor(&format!("act.wts.{l}"), k as u64 * F32);
+    let bias = if hash {
+        packet::dev::TENSOR_NONE
+    } else {
+        b.tensor(&format!("{p}.ffn.gate.bias"), e as u64 * F32)
+    };
+    let tid = if hash {
+        b.tensor(
+            &format!("{p}.ffn.gate.tid2eid"),
+            c.vocab as u64 * k as u64 * 8,
+        )
+    } else {
+        packet::dev::TENSOR_NONE
+    };
+    let rt = b.emit(DevOp::V4MoeRoute, vec![0], &[gg], |d| {
+        d.t[0] = sel;
+        d.t[1] = wts;
+        d.t[2] = glog;
+        d.t[3] = bias;
+        d.t[4] = tid;
+        d.t[5] = tn.ids;
+        d.i[0] = 1;
+        d.i[1] = e;
+        d.i[2] = k;
+        d.f[0] = c.route_scale as f32;
+    });
+
+    // Routed experts, fp4, through the existing mxfp4 expert arms; the shared
+    // expert is fp8 and always runs.
+    let fu = b.tensor(&format!("act.fu.{l}"), 2 * imoe as u64 * BF16);
+    let ewt = b.tensor(&format!("{p}.ffn.experts.w"), 1);
+    let est = b.tensor(&format!("{p}.ffn.experts.s"), 1);
+    let glu = b.emit(DevOp::MoeExpertGluFp8Blk, all.clone(), &[rt], |d| {
+        d.t[0] = fu;
+        d.t[1] = tn.xn;
+        d.t[2] = sel;
+        d.t[3] = ewt;
+        d.t[4] = est;
+        d.i[1] = imoe;
+        d.i[2] = h;
+        d.i[3] = e;
+    });
+    // V4's activation is a CLAMPED SwiGLU (limit 10), one-sided on the gate and
+    // two-sided on the up branch. It is a separate packet rather than an `act`
+    // code because the clamp transforms the UP branch too.
+    let act = b.emit(DevOp::V4ClampedSwiGlu, all.clone(), &[glu], |d| {
+        d.t[0] = fu;
+        d.t[1] = fu;
+        d.t[2] = fu;
+        d.i[0] = imoe;
+        d.f[0] = c.swiglu_limit as f32;
+    });
+    let down = b.emit(DevOp::MoeExpertDownFp8Blk, all, &[act], |d| {
+        d.t[0] = tn.xr;
+        d.t[1] = fu;
+        d.t[2] = sel;
+        d.t[3] = ewt;
+        d.t[4] = est;
+        d.i[1] = h;
+        d.i[2] = imoe;
+        d.i[3] = e;
+    });
+
+    emit_hc_expand(b, c, tn, tn.xr, n_cu, &[down])
+}
+
+/// One whole V4 layer.
+pub(crate) fn emit_v4_layer(
+    b: &mut Builder,
+    c: &V4Cfg,
+    tn: &V4Tn,
+    l: u32,
+    ctx: u32,
+    n_cu: u32,
+    deps: &[u32],
+) -> u32 {
+    let a = emit_v4_attn(b, c, tn, l, ctx, n_cu, deps);
+    emit_v4_ffn(b, c, tn, l, n_cu, &[a])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +772,55 @@ mod tests {
             assert_eq!(has(DevOp::V4KvCompress), want_comp, "layer {l} compressor");
             assert_eq!(has(DevOp::V4IndexScore), want_idx, "layer {l} indexer");
         }
+    }
+
+    /// Hash-routed layers bind `tid2eid` and NO selection bias; scored layers
+    /// are the other way round. The router op is the same either way, so this
+    /// is the only place the split is visible before it reaches the device.
+    #[test]
+    fn hash_layers_bind_the_table_and_scored_layers_bind_the_bias() {
+        let c = cfg_deepseek_v4_for_test();
+        for (l, hash) in [(0u32, true), (2, true), (3, false)] {
+            let mut b = Builder::new(8);
+            let tn = declare_v4(&mut b, &c, 16384);
+            emit_v4_ffn(&mut b, &c, &tn, l, 8, &[]);
+            let p = b.finish();
+            let r = p
+                .insts
+                .iter()
+                .find(|i| i.op == DevOp::V4MoeRoute as u16)
+                .expect("a router");
+            // The BUILDER sentinel (0xFFFF_FFFF), not the packed one (0xFFFF):
+            // comparing against TENSOR_NONE16 here reports every absent operand
+            // as bound.
+            let none = packet::dev::TENSOR_NONE;
+            assert_eq!(r.t[4] != none, hash, "layer {l} tid2eid bound?");
+            assert_eq!(r.t[3] != none, !hash, "layer {l} selection bias bound?");
+        }
+    }
+
+    /// A whole layer, both sub-layers, with the expand appearing exactly twice
+    /// — once per sub-layer boundary. V4 has no residual add, so the count of
+    /// expands IS the count of residual writes.
+    #[test]
+    fn a_layer_has_exactly_two_hyper_connection_boundaries() {
+        let c = cfg_deepseek_v4_for_test();
+        let mut b = Builder::new(8);
+        let tn = declare_v4(&mut b, &c, 16384);
+        emit_v4_layer(&mut b, &c, &tn, 2, 16384, 8, &[]);
+        let p = b.finish();
+        let n = |op: DevOp| p.insts.iter().filter(|i| i.op == op as u16).count();
+        assert_eq!(n(DevOp::V4HcExpand), 2);
+        assert_eq!(n(DevOp::V4HcDot), 2);
+        assert_eq!(n(DevOp::V4HcMix), 2);
+        assert_eq!(
+            p.insts
+                .iter()
+                .filter(|i| i.op == DevOp::Residual as u16)
+                .count(),
+            0,
+            "V4 has no residual add anywhere"
+        );
     }
 
     /// The expand reads `x` and writes `x`. That aliasing is deliberate and
