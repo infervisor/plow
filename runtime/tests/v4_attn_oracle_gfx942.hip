@@ -68,6 +68,21 @@ __global__ __launch_bounds__(PLOW_THREADS) void k_attn(bf16* out, const bf16* q,
                      (float*)raw);
 }
 
+__global__ __launch_bounds__(PLOW_THREADS) void k_split(float* op, float* mlp, const bf16* q,
+                                                        const bf16* kv, const int* idx, unsigned T,
+                                                        unsigned H, unsigned D, unsigned TOPK,
+                                                        unsigned SP, float scale) {
+    __shared__ __align__(16) char raw[ATTN_LDS];
+    d_v4_sparse_attn_split(op, mlp, q, kv, idx, T, H, D, TOPK, SP, scale, blockIdx.x, gridDim.x,
+                           (float*)raw);
+}
+__global__ __launch_bounds__(PLOW_THREADS) void k_merge(bf16* out, const float* op,
+                                                        const float* mlp, const float* sink,
+                                                        unsigned T, unsigned H, unsigned D,
+                                                        unsigned SP) {
+    d_v4_sparse_attn_merge(out, op, mlp, sink, T, H, D, SP, blockIdx.x, gridDim.x);
+}
+
 static bf16 f2bf_host(float f) {
     unsigned u;
     memcpy(&u, &f, 4);
@@ -160,6 +175,31 @@ static int run_case(unsigned T, unsigned H, unsigned D, unsigned NKV, unsigned T
             l += exp((double)sink[h] - m); /* denominator only */
             for (unsigned d = 0; d < D; d++) ref[((size_t)t * H + h) * D + d] = o[d] / l;
         }
+
+    /* SPLIT-K must equal the single-kernel path — same op, more blocks. */
+    {
+        const unsigned SP = 4;
+        float *d_op, *d_mlp;
+        bf16* d_out2;
+        HC_CHECK(hipMalloc(&d_op, (size_t)T * H * SP * D * 4));
+        HC_CHECK(hipMalloc(&d_mlp, (size_t)T * H * SP * 2 * 4));
+        HC_CHECK(hipMalloc(&d_out2, q.size() * 2));
+        k_split<<<T * H * SP, PLOW_THREADS>>>(d_op, d_mlp, d_q, d_kv, d_idx, T, H, D, TOPK, SP,
+                                              scale);
+        HC_CHECK(hipDeviceSynchronize());
+        k_merge<<<T * H, PLOW_THREADS>>>(d_out2, d_op, d_mlp, d_sink, T, H, D, SP);
+        HC_CHECK(hipDeviceSynchronize());
+        std::vector<bf16> g2(q.size());
+        HC_CHECK(hipMemcpy(g2.data(), d_out2, g2.size() * 2, hipMemcpyDeviceToHost));
+        double wsp = 0.0;
+        for (size_t i = 0; i < g2.size(); i++)
+            wsp = std::max(wsp, fabs(bf2f_host(got[i]) - bf2f_host(g2[i])));
+        printf("  %-28s split-K vs single: max abs %.3e  %s\n", "", wsp,
+               wsp <= 5e-2 ? "ok" : "FAIL");
+        hipFree(d_op);
+        hipFree(d_mlp);
+        hipFree(d_out2);
+    }
 
     double worst = 0.0;
     const double r = rms_of(ref);

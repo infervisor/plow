@@ -96,6 +96,18 @@ __global__ __launch_bounds__(PLOW_THREADS) void k_attn(bf16* o, const bf16* q, c
     __shared__ __align__(16) char raw[40960];
     d_v4_sparse_attn(o, q, kv, i, s, 1, H, D, TOPK, 0.0442f, blockIdx.x, gridDim.x, (float*)raw);
 }
+__global__ __launch_bounds__(PLOW_THREADS) void k_attn_sp(float* op, float* mlp, const bf16* q,
+                                                          const bf16* kv, const int* i, unsigned H,
+                                                          unsigned D, unsigned TOPK, unsigned SP) {
+    __shared__ __align__(16) char raw[40960];
+    d_v4_sparse_attn_split(op, mlp, q, kv, i, 1, H, D, TOPK, SP, 0.0442f, blockIdx.x, gridDim.x,
+                           (float*)raw);
+}
+__global__ __launch_bounds__(PLOW_THREADS) void k_attn_mg(bf16* o, const float* op,
+                                                          const float* mlp, const float* s,
+                                                          unsigned H, unsigned D, unsigned SP) {
+    d_v4_sparse_attn_merge(o, op, mlp, s, 1, H, D, SP, blockIdx.x, gridDim.x);
+}
 __global__ __launch_bounds__(PLOW_THREADS) void k_idx(float* sc, const bf16* q, const bf16* ckv,
                                                       const bf16* w, unsigned H, unsigned HD,
                                                       unsigned NC) {
@@ -262,9 +274,27 @@ int main(void) {
     }
     {
         bf16* kv = dev_bf16((size_t)KVROWS * 512);
+        /* SPLIT-K. The (token, head) work index gives 64 blocks at T=1 on a
+         * 304-CU part; v4_attn_scale_gfx942.hip shows the total is FLAT from 64
+         * to 256 blocks, i.e. the op is CU-starved rather than slow. Four key
+         * chunks fill the machine. */
+#ifndef V4_ATTN_SPLIT
+#define V4_ATTN_SPLIT 4u
+#endif
+        const unsigned SP = V4_ATTN_SPLIT;
+        float* op = dev_f32((size_t)64 * SP * 512);
+        float* mlp = dev_f32((size_t)64 * SP * 2);
         const double us =
-            time_us([&] { k_attn<<<64, PLOW_THREADS>>>(obuf, xbuf, kv, ibuf, fbuf, 64, 512, TOPK); });
-        rows.push_back({"sparse attention", us, (double)TOPK * 512 * 2, L});
+            (SP <= 1u)
+                ? time_us([&] {
+                      k_attn<<<64, PLOW_THREADS>>>(obuf, xbuf, kv, ibuf, fbuf, 64, 512, TOPK);
+                  })
+                : time_us([&] {
+                      k_attn_sp<<<64 * SP, PLOW_THREADS>>>(op, mlp, xbuf, kv, ibuf, 64, 512, TOPK,
+                                                           SP);
+                      k_attn_mg<<<64, PLOW_THREADS>>>(obuf, op, mlp, fbuf, 64, 512, SP);
+                  });
+        rows.push_back({"sparse attention (split-K)", us, (double)TOPK * 512 * 2, L});
     }
     {
         bf16* ckv = dev_bf16((size_t)NC4 * 128);

@@ -79,7 +79,10 @@ for v in "${VARIANTS[@]}"; do
   [ -f "$f" ] || { printf '%-8s %14s\n' "$lab" "(no run)"; continue; }
   am=$(grep -oE 'as measured *[0-9.]+ ms' "$f" | grep -oE '[0-9.]+' | head -1)
   fr=$(grep -oE 'floor removed *[0-9.]+ ms' "$f" | grep -oE '[0-9.]+' | head -1)
-  at=$(awk '/sparse attention/ {print $4; exit}' "$f")   # $3 is the packet COUNT
+  # Take the field AFTER the integer packet count, so a label with spaces in it
+  # (e.g. "sparse attention (split-K)") does not shift the column out from under
+  # this. Reading a fixed $N here has already reported the count as a timing.
+  at=$(awk '/sparse attention/ {for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) { print $(i+1); exit }}' "$f")
   printf '%-8s %11s ms %11s ms %9s us\n' "$lab" "${am:--}" "${fr:--}" "${at:--}"
 done
 echo

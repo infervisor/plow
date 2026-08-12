@@ -1420,3 +1420,152 @@ __device__ void d_v4_kv_compress_step(bf16* __restrict__ out, float* __restrict_
         }
     __syncthreads();
 }
+
+/* ---------------------------------------------------------------------------
+ * Sparse attention, SPLIT-K across blocks — the decode shape.
+ * ---------------------------------------------------------------------------
+ *
+ * `d_v4_sparse_attn` indexes work by (token, head), so a T=1 step launches
+ * H = 64 blocks on a 304-CU part and leaves 240 CUs idle. That is not a guess:
+ * `runtime/tests/v4_attn_scale_gfx942.hip` times the same kernel at T = 1..16
+ * and the TOTAL is flat from 64 to 256 blocks —
+ *
+ *     T=1  64 blocks  39.52 us      T=4  256 blocks  41.08 us
+ *     T=2 128 blocks  39.72 us      T=8  512 blocks  84.36 us
+ *
+ * — four times the work for the same wall clock, then linear once the grid
+ * passes the CU count. The op is CU-starved at decode, not slow.
+ *
+ * So the key range is split `SPLIT` ways across blocks as well: the work index
+ * becomes (token, head, key-chunk) and a T=1 step fills the machine. Each block
+ * carries its own `(m, l, acc)` over its chunk and writes them as PARTIALS;
+ * `d_v4_sparse_attn_merge` rescales them onto a common max and folds in the
+ * sink. Same structure as `FlashDecode` + `FlashMerge` already in this tree.
+ *
+ * `opart`  [T*H*SPLIT, D] f32   per-chunk numerators
+ * `mlpart` [T*H*SPLIT, 2] f32   per-chunk (m, l)
+ *
+ * The sink is NOT applied here — it belongs to the whole row's denominator, and
+ * adding it per chunk would count it `SPLIT` times. */
+__device__ void d_v4_sparse_attn_split(float* __restrict__ opart, float* __restrict__ mlpart,
+                                       const bf16* __restrict__ q, const bf16* __restrict__ kv,
+                                       const int* __restrict__ idx, unsigned T, unsigned H,
+                                       unsigned D, unsigned TOPK, unsigned SPLIT, float scale,
+                                       unsigned slice, unsigned nblk, float* __restrict__ lds) {
+    if ((D & 63u) || H == 0 || SPLIT == 0) return;
+    const unsigned DPL = D >> 6;
+    const unsigned wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
+    const unsigned nwave = PLOW_THREADS >> 6;
+    float* pacc = lds;
+    float* pml = lds + (size_t)nwave * D;
+
+    for (unsigned w = slice; w < T * H * SPLIT; w += nblk) {
+        const unsigned t = w / (H * SPLIT);
+        const unsigned r = w - t * H * SPLIT;
+        const unsigned h = r / SPLIT, sp = r - h * SPLIT;
+        /* Contiguous chunk so the index reads stay coalesced. */
+        const unsigned per = (TOPK + SPLIT - 1u) / SPLIT;
+        const unsigned lo = sp * per, hi = (lo + per) < TOPK ? (lo + per) : TOPK;
+        const int* it = idx + (size_t)t * TOPK;
+        const bf16* qh = q + ((size_t)t * H + h) * D;
+
+        float qv[16], acc[16];
+        bf16v8 q8;
+        if (DPL == 8) q8 = ld_glob8(qh + lane * 8);
+        for (unsigned e = 0; e < DPL; e++) {
+            qv[e] = bf2f(qh[lane * DPL + e]);
+            acc[e] = 0.0f;
+        }
+        float m = -INFINITY, l = 0.0f;
+
+        for (unsigned j = lo + wave; j < hi; j += nwave) {
+            const int p = it[j];
+            float kvv[16];
+            float part = 0.0f;
+            if (p >= 0) {
+                const bf16* kr = kv + (size_t)p * D;
+                if (DPL == 8) {
+                    const bf16v8 k8 = ld_glob8(kr + lane * 8);
+                    part = dot8(q8, k8, 0.0f);
+                    for (unsigned e = 0; e < 8; e++) kvv[e] = bf2f(k8[e]);
+                } else {
+                    for (unsigned e = 0; e < DPL; e++) {
+                        kvv[e] = bf2f(kr[lane * DPL + e]);
+                        part += qv[e] * kvv[e];
+                    }
+                }
+            } else {
+                for (unsigned e = 0; e < DPL; e++) kvv[e] = 0.0f;
+            }
+            for (int o = 32; o; o >>= 1) part += __shfl_xor(part, o);
+            const float sv = (p >= 0) ? part * scale : -INFINITY;
+            const float mn = fmaxf(m, sv);
+            const float resc = (m == -INFINITY) ? 0.0f : __expf(m - mn);
+            const float pe = (sv == -INFINITY) ? 0.0f : __expf(sv - mn);
+            for (unsigned e = 0; e < DPL; e++) acc[e] = acc[e] * resc + pe * kvv[e];
+            l = l * resc + pe;
+            m = mn;
+        }
+
+        /* Fold the block's waves, then publish one partial for the chunk. */
+        for (unsigned e = 0; e < DPL; e++) pacc[(size_t)wave * D + lane * DPL + e] = acc[e];
+        if (lane == 0) {
+            pml[wave * 2] = m;
+            pml[wave * 2 + 1] = l;
+        }
+        __syncthreads();
+        float mb = -INFINITY;
+        for (unsigned v = 0; v < nwave; v++) mb = fmaxf(mb, pml[v * 2]);
+        float lb = 0.0f;
+        for (unsigned v = 0; v < nwave; v++)
+            if (pml[v * 2] != -INFINITY) lb += pml[v * 2 + 1] * __expf(pml[v * 2] - mb);
+        for (unsigned d = threadIdx.x; d < D; d += PLOW_THREADS) {
+            float sacc = 0.0f;
+            for (unsigned v = 0; v < nwave; v++)
+                if (pml[v * 2] != -INFINITY) sacc += pacc[(size_t)v * D + d] * __expf(pml[v * 2] - mb);
+            opart[(size_t)w * D + d] = sacc;
+        }
+        if (threadIdx.x == 0) {
+            mlpart[(size_t)w * 2] = mb;
+            mlpart[(size_t)w * 2 + 1] = lb;
+        }
+        __syncthreads();
+    }
+}
+
+/* Rescale the `SPLIT` partials of each row onto a common max, fold in the sink,
+ * and normalize. Grid-strided over (token, head, depth) so this fills the
+ * machine too. */
+__device__ void d_v4_sparse_attn_merge(bf16* __restrict__ out, const float* __restrict__ opart,
+                                       const float* __restrict__ mlpart,
+                                       const float* __restrict__ sink, unsigned T, unsigned H,
+                                       unsigned D, unsigned SPLIT, unsigned slice,
+                                       unsigned nblk) {
+    const size_t rows = (size_t)T * H;
+    for (size_t r = slice; r < rows; r += nblk) {
+        const unsigned h = (unsigned)(r % H);
+        float m = -INFINITY;
+        for (unsigned sp = 0; sp < SPLIT; sp++) {
+            const float ms = mlpart[(r * SPLIT + sp) * 2];
+            m = fmaxf(m, ms);
+        }
+        float l = 0.0f;
+        for (unsigned sp = 0; sp < SPLIT; sp++) {
+            const float ms = mlpart[(r * SPLIT + sp) * 2];
+            if (ms != -INFINITY) l += mlpart[(r * SPLIT + sp) * 2 + 1] * __expf(ms - m);
+        }
+        /* The sink joins the DENOMINATOR once, for the whole row. */
+        if (m != -INFINITY) l += __expf(sink[h] - m);
+        const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+        for (unsigned d = threadIdx.x; d < D; d += PLOW_THREADS) {
+            float acc = 0.0f;
+            for (unsigned sp = 0; sp < SPLIT; sp++) {
+                const float ms = mlpart[(r * SPLIT + sp) * 2];
+                if (ms != -INFINITY)
+                    acc += opart[((r * SPLIT + sp) * (size_t)D) + d] * __expf(ms - m);
+            }
+            st_act1(&out[r * D + d], f2bf(acc * inv));
+        }
+        __syncthreads();
+    }
+}
