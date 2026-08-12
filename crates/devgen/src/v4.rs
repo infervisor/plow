@@ -715,7 +715,18 @@ fn emit_v4_shared_expert(
     dep: u32,
 ) -> (u32, u32) {
     let p = format!("layers.{l}.ffn.shared_experts");
-    let all: Vec<u32> = (0..n_cu).collect();
+    // OVERLAP PROBE: the shared expert and the routed experts are independent —
+    // both gate on the norm, neither reads the other — but both are emitted on
+    // every CU, so the counter DAG runs them back to back. PLOW_V4_SPLITCU
+    // gives them disjoint sets so they can actually overlap.
+    let split = std::env::var("PLOW_V4_SPLITCU")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.clamp(1, n_cu - 1));
+    let all: Vec<u32> = match split {
+        Some(k) => (0..k).collect(),
+        None => (0..n_cu).collect(),
+    };
     let h = c.hidden as u32;
     let i = c.moe_inter as u32;
     let sh = b.tensor(&format!("act.shared.{l}"), h as u64 * BF16);
@@ -884,6 +895,15 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     // here: V4's routed experts are MXFP4, an unset `i[6]` reads as
     // `PLOW_MOE_ENC_BF16`, and the quantized dot answers an encoding it does not
     // implement with a NaN rather than a wrong number.
+    // The complement of the shared expert's set under PLOW_V4_SPLITCU.
+    let all: Vec<u32> = match std::env::var("PLOW_V4_SPLITCU")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.clamp(1, n_cu - 1))
+    {
+        Some(k) => (k..n_cu).collect(),
+        None => all,
+    };
     let enc = 2u32; // PLOW_MOE_ENC_MXFP4
     let v4_clamp = 3u32; // PLOW_MOE_ACT_V4CLAMP
     let mut downs: Vec<u32> = Vec::with_capacity(k as usize);
