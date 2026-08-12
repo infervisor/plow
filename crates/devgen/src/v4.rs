@@ -254,6 +254,16 @@ fn emit_hc_expand(
 /// suffix or an `attn` vs `self_attn` prefix wrong here is a load failure, not
 /// a wrong number.
 #[allow(clippy::too_many_arguments)]
+/// Is this op differenced OUT of the emitted program for timing?
+///
+/// `PLOW_V4_SKIP=<tag>` drops one op so its cost is the difference between two
+/// runs. This is the only technique that has correctly identified a hot spot in
+/// this bring-up; every cost REASONED about has been wrong. Programs emitted
+/// with it set are not the model and are for measurement only.
+fn v4_skip(tag: &str) -> bool {
+    std::env::var("PLOW_V4_SKIP").as_deref() == Ok(tag)
+}
+
 /// A plain bf16 GEMV.
 ///
 /// NOT every V4 projection is quantized, and assuming so is a load failure at
@@ -387,7 +397,7 @@ fn emit_v4_attn(
     // `gamma == NONE` is the weightless rescale; i5 == 1 selects the
     // INTERLEAVED HD=512 template, which ropes the trailing lanes through an
     // identity-prefix table (see the v4_rope oracle).
-    let qrope = b.emit(DevOp::HeadNormRope, all.clone(), &[qb], |d| {
+    let qrope = if v4_skip("rope") { qb } else { b.emit(DevOp::HeadNormRope, all.clone(), &[qb], |d| {
         d.t[0] = tn.q;
         d.t[1] = tn.q;
         d.t[2] = packet::dev::TENSOR_NONE;
@@ -399,7 +409,7 @@ fn emit_v4_attn(
         d.i[2] = hd;
         d.i[5] = 1;
         d.f[0] = 1e-6;
-    });
+    })};
 
     // The single shared KV head, roped and written into the sliding-window ring.
     let kvring = b.tensor(
@@ -417,6 +427,8 @@ fn emit_v4_attn(
         &[nrm],
     );
     let knw = b.tensor(&format!("{p}.attn.kv_norm.weight"), hd as u64 * BF16);
+    // NOT skippable: this arm also performs the KV RING WRITE, so dropping it
+    // leaves the ring unwritten and the attention gathers uninitialised keys.
     let kvrope = b.emit(DevOp::HeadNormRope, all.clone(), &[kva], |d| {
         d.t[0] = kvring;
         d.t[1] = tn.kv;
@@ -599,7 +611,7 @@ fn emit_v4_attn(
     });
 
     // The output de-rotation: the same arm with `sin` negated.
-    let inv = b.emit(DevOp::HeadNormRope, all.clone(), &[amg], |d| {
+    let inv = if v4_skip("rope") { amg } else { b.emit(DevOp::HeadNormRope, all.clone(), &[amg], |d| {
         d.t[0] = tn.attn_out;
         d.t[1] = tn.attn_out;
         d.t[2] = packet::dev::TENSOR_NONE;
@@ -611,7 +623,7 @@ fn emit_v4_attn(
         d.i[2] = hd;
         d.i[4] = 1; // skip_norm: the rescale already happened on q
         d.i[5] = 1;
-    });
+    })};
 
     // wo_a is BLOCK-DIAGONAL over the head groups, from one stacked tensor; a
     // dense linear of the same element count mixes groups the reference keeps
