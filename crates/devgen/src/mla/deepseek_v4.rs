@@ -403,7 +403,9 @@ fn v4_gaps(c: &V4Cfg) -> Vec<V4Gap> {
                   read first (crates/devgen/src/mla.rs, the glm_* indexer path). What is new here \
                   is that the indexer scores a COMPRESSED sequence it computes itself, rather \
                   than the raw KV.",
-            done: None,
+            done: Some(
+                "STRUCTURE ONLY - the fp4 activation simulation is NOT modeled, see below.                  d_v4_index_score + d_v4_index_topk; the second compressor is d_v4_kv_compress at                  index width, already closed above. Gated by                  runtime/tests/v4_index_oracle_gfx942.hip: scores match to 7.7e-7 (they are fp32)                  and the SELECTED SET is compared EXACTLY, including the prefill causal limit and                  the ring offset. Controls: moving the relu outside the head sum gives 3.4-4.4                  and a different set; using t/ratio instead of (t+1)/ratio for the causal limit                  leaves the scores untouched and breaks only the prefill selection. Ties resolve                  to the LOWER index so the choice is deterministic across ranks. NOT MODELED: the                  reference Hadamard-rotates and fp4 quantize-dequantizes both q and the                  compressed KV. The Hadamard is orthogonal and applied to BOTH sides of the dot,                  so it cancels exactly; the fp4 rounding does not, and near a tie it can flip a                  selection. TP: the score is all-reduced BEFORE the top-k - the emitter must                  place that reduction, and it is not optional.",
+            ),
         },
         V4Gap {
             what: "FP4 routed experts with hash-routed leading layers",

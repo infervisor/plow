@@ -673,3 +673,118 @@ __device__ void d_v4_clamped_swiglu(bf16* __restrict__ out, const bf16* __restri
         st_act1(&out[i], f2bf(s * u));
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * Sparse indexer — scoring and top-k over the compressed history.
+ * ---------------------------------------------------------------------------
+ *
+ * Runs on the 21 layers whose compress ratio is 4, and decides which compressed
+ * entries their attention may read.
+ *
+ * `q`     [T, H, HD] bf16   indexer queries (wq_b of the shared q-lora, roped)
+ * `ckv`   [NC, HD]   bf16   the indexer's OWN compressed KV (d_v4_kv_compress
+ *                           at HD width — it does not reuse the layer's)
+ * `w`     [T, H]     bf16   weights_proj output, ALREADY scaled by
+ *                           `softmax_scale * H^-0.5` as the reference does
+ * `score` [T, NC]    f32
+ *
+ *     score[t][c] = sum_h relu(q[t][h] . ckv[c]) * w[t][h]
+ *
+ * The relu is INSIDE the head sum, so a head that disagrees contributes zero
+ * rather than cancelling another head's evidence — mean-pooling the raw dots
+ * would be a different selector.
+ *
+ * WHAT IS NOT MODELED HERE, and it is a numerics gap rather than a structural
+ * one: the reference runs `rotate_activation` (a Hadamard) and then an
+ * fp4 quantize-dequantize on BOTH `q` and the compressed KV, as QAT
+ * simulation. The Hadamard is orthogonal and applied to both sides of the dot
+ * product, so it CANCELS exactly and its absence changes nothing; the fp4
+ * rounding does not cancel, and near a tie it can flip which entries the top-k
+ * keeps. Closing that means the fp4 activation path, which is Stage-4 work
+ * alongside the other quantized arms.
+ *
+ * UNDER TP the reference all-reduces `score` BEFORE the top-k, so the selection
+ * is a collective: ranks that disagree on the selected set decode different
+ * tokens. This op computes a rank-local score; the reduction is the emitter's
+ * to place, and it is not optional. */
+__device__ void d_v4_index_score(float* __restrict__ score, const bf16* __restrict__ q,
+                                 const bf16* __restrict__ ckv, const bf16* __restrict__ w,
+                                 unsigned T, unsigned H, unsigned HD, unsigned NC, unsigned slice,
+                                 unsigned nblk) {
+    for (unsigned t = slice; t < T; t += nblk)
+        for (unsigned c = threadIdx.x; c < NC; c += PLOW_THREADS) {
+            const bf16* kc = ckv + (size_t)c * HD;
+            float acc = 0.0f;
+            for (unsigned h = 0; h < H; h++) {
+                const bf16* qh = q + ((size_t)t * H + h) * HD;
+                float d = 0.0f;
+                for (unsigned e = 0; e < HD; e++) d += bf2f(qh[e]) * bf2f(kc[e]);
+                acc += fmaxf(d, 0.0f) * bf2f(w[(size_t)t * H + h]); /* relu INSIDE the sum */
+            }
+            score[(size_t)t * NC + c] = acc;
+        }
+}
+
+/* Top-k selection over the scores, with the prefill causal mask and the KV-ring
+ * offset the layer's index list needs.
+ *
+ * `idx` [T, K] i32 — the selected compressed positions, `+ offset`, or -1.
+ *
+ * `causal_ratio != 0` selects the PREFILL rule: query `t` may only see
+ * compressed entries strictly below `(t + 1) / ratio`, because entry `c` pools
+ * tokens `[c*ratio, (c+1)*ratio)` and a query must not see its own window's
+ * future. Decode passes 0 and every entry is legal.
+ *
+ * Fewer legal entries than `K` is normal near the start of a sequence: the tail
+ * of `idx` is -1, which `d_v4_sparse_attn` treats as inert.
+ *
+ * PERFORMANCE STATUS: K serial passes of a block-wide argmax — correct, and
+ * O(K*NC). The reference calls `torch.topk`. This is a gate implementation. */
+__device__ void d_v4_index_topk(int* __restrict__ idx, const float* __restrict__ score, unsigned T,
+                                unsigned NC, unsigned K, unsigned causal_ratio, int offset,
+                                unsigned slice, unsigned nblk, float* __restrict__ lds) {
+    float* best = lds;             /* [PLOW_THREADS] */
+    int* bidx = (int*)(lds + PLOW_THREADS);
+    unsigned char* taken = (unsigned char*)(bidx + PLOW_THREADS); /* [NC] */
+
+    for (unsigned t = slice; t < T; t += nblk) {
+        const unsigned lim = causal_ratio ? ((t + 1u) / causal_ratio) : NC;
+        for (unsigned c = threadIdx.x; c < NC; c += PLOW_THREADS) taken[c] = (c < lim) ? 0u : 1u;
+        __syncthreads();
+
+        for (unsigned k = 0; k < K; k++) {
+            float bv = -INFINITY;
+            int bi = -1;
+            for (unsigned c = threadIdx.x; c < NC; c += PLOW_THREADS) {
+                if (taken[c]) continue;
+                const float v = score[(size_t)t * NC + c];
+                if (v > bv || (v == bv && (int)c < bi)) {
+                    bv = v;
+                    bi = (int)c;
+                }
+            }
+            best[threadIdx.x] = bv;
+            bidx[threadIdx.x] = bi;
+            __syncthreads();
+            /* Block-wide argmax; ties go to the lower index so the selection is
+             * deterministic across runs and across ranks. */
+            for (unsigned s = PLOW_THREADS >> 1; s; s >>= 1) {
+                if (threadIdx.x < s) {
+                    const float o = best[threadIdx.x + s];
+                    const int oi = bidx[threadIdx.x + s];
+                    if (oi >= 0 && (o > best[threadIdx.x] ||
+                                    (o == best[threadIdx.x] &&
+                                     (bidx[threadIdx.x] < 0 || oi < bidx[threadIdx.x])))) {
+                        best[threadIdx.x] = o;
+                        bidx[threadIdx.x] = oi;
+                    }
+                }
+                __syncthreads();
+            }
+            const int win = bidx[0];
+            if (threadIdx.x == 0) idx[(size_t)t * K + k] = (win < 0) ? -1 : win + offset;
+            if (win >= 0 && threadIdx.x == 0) taken[win] = 1u;
+            __syncthreads();
+        }
+    }
+}
