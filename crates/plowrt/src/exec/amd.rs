@@ -996,6 +996,8 @@ const K3_ARM_OPS: &[DevOp] = &[
     DevOp::V4HcMix,
     DevOp::V4HcZero,
     DevOp::V4HcBroadcast,
+    DevOp::V4SparseAttnSplit,
+    DevOp::V4SparseAttnMerge,
     DevOp::V4SparseAttn,
     DevOp::V4KvCompress,
     DevOp::V4IndexScore,

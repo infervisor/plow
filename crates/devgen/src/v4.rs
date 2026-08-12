@@ -551,19 +551,24 @@ fn emit_v4_attn(
     let opart = b.tensor(&format!("act.opart.{l}"), (nh * sp * hd) as u64 * F32);
     let mlpart = b.tensor(&format!("act.mlpart.{l}"), (nh * sp * 2) as u64 * F32);
     let sink = b.tensor(&format!("{p}.attn.attn_sink"), nh as u64 * F32);
-    let asp = b.emit(DevOp::V4SparseAttn, all.clone(), &adeps, |d| {
+    // TWO OPCODES, because they are two kernels. Both used to be emitted as
+    // `V4SparseAttn`, for which the interpreter has exactly one arm — so the
+    // merge ran the SPLIT kernel and `attn_sink`, 64 floats, arrived where the
+    // `idx` gather list belongs.
+    let asp = b.emit(DevOp::V4SparseAttnSplit, all.clone(), &adeps, |d| {
         d.t[0] = opart;
-        d.t[1] = tn.q;
-        d.t[2] = kvring;
-        d.t[3] = idx;
-        d.t[4] = mlpart;
+        d.t[1] = mlpart;
+        d.t[2] = tn.q;
+        d.t[3] = kvring;
+        d.t[4] = idx;
         d.i[0] = 1;
         d.i[1] = nh;
         d.i[2] = hd;
         d.i[3] = topk;
+        d.i[4] = sp;
         d.f[0] = 1.0 / (hd as f32).sqrt();
     });
-    let amg = b.emit(DevOp::V4SparseAttn, all.clone(), &[asp], |d| {
+    let amg = b.emit(DevOp::V4SparseAttnMerge, all.clone(), &[asp], |d| {
         d.t[0] = tn.attn_out;
         d.t[1] = opart;
         d.t[2] = mlpart;
@@ -1123,8 +1128,10 @@ mod tests {
                 GemvFp8Blk,
                 V4IndexScore,
                 V4IndexTopk, // indexer
-                V4SparseAttn,
-                V4SparseAttn, // split + merge
+                // TWO opcodes. Pinned as one for most of this bring-up, which
+                // is how the merge came to run the split kernel.
+                V4SparseAttnSplit,
+                V4SparseAttnMerge,
                 HeadNormRope, // INVERSE rope
                 V4GroupedLinear,
                 GemvFp8Blk, // wo_a (block-diag), wo_b
@@ -1242,7 +1249,8 @@ mod tests {
         let p = b.finish();
         let n = |op: DevOp| p.insts.iter().filter(|i| i.op == op as u16).count();
         assert_eq!(n(DevOp::V4HcExpand), 86, "two boundaries x 43 layers");
-        assert_eq!(n(DevOp::V4SparseAttn), 86, "split + merge per layer");
+        assert_eq!(n(DevOp::V4SparseAttnSplit), 43, "one split per layer");
+        assert_eq!(n(DevOp::V4SparseAttnMerge), 43, "one merge per layer");
         assert_eq!(n(DevOp::V4IndexScore), 21, "the ratio-4 layers");
         assert_eq!(n(DevOp::V4KvCompress), 41, "every compressed layer");
         assert_eq!(n(DevOp::V4MoeRoute), 43);

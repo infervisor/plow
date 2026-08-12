@@ -1048,6 +1048,8 @@ enum {
     PLOW_DOP_V4_HC_ZERO = 133,
     /* Broadcast [T,D] into the [T,hc,D] streams. t0=x t1=src i0=T i1=D i2=hc. */
     PLOW_DOP_V4_HC_BROADCAST = 134,
+    PLOW_DOP_V4_SPARSE_ATTN_SPLIT = 135,
+    PLOW_DOP_V4_SPARSE_ATTN_MERGE = 136,
 
     PLOW_DOP__COUNT
 };

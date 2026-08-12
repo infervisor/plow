@@ -2014,6 +2014,17 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1],
                              in->i[2], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)sm->raw);
             break;
+        case PLOW_DOP_V4_SPARSE_ATTN_SPLIT: /* t0=opart t1=mlpart t2=q t3=kv t4=idx */
+            d_v4_sparse_attn_split((float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
+                                   (const bf16*)TEN(3), (const int*)TEN(4), in->i[0], in->i[1],
+                                   in->i[2], in->i[3], in->i[4], in->fj[0].f, slice, nblk,
+                                   (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_SPARSE_ATTN_MERGE: /* t0=out t1=opart t2=mlpart t3=sink */
+            d_v4_sparse_attn_merge((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),
+                                   (const float*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[3],
+                                   slice, nblk);
+            break;
         case PLOW_DOP_V4_SPARSE_ATTN:
             d_v4_sparse_attn((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                              (const int*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1],

@@ -1492,6 +1492,22 @@ pub enum DevOp {
     ///
     /// `t0=x([T,hc,D] bf16) t1=src([T,D] bf16)` · `i0=T i1=D i2=hc`.
     V4HcBroadcast = 134,
+    /// **Split-K sparse attention, part 1 of 2.** `d_v4_sparse_attn_split`.
+    ///
+    /// `t0=opart([T,H,SPLIT,D] f32) t1=mlpart([T,H,SPLIT,2] f32) t2=q t3=kv
+    /// t4=idx` · `i0=T i1=H i2=D i3=TOPK i4=SPLIT` · `f0=scale`.
+    V4SparseAttnSplit = 135,
+    /// **Split-K sparse attention, part 2 of 2.** `d_v4_sparse_attn_merge`.
+    ///
+    /// A DISTINCT OPCODE, not the split with different immediates. Both were
+    /// emitted as `V4SparseAttn` and the interpreter has one arm for that name,
+    /// so the merge ran the SPLIT kernel with `attn_sink` — 64 floats — reinter-
+    /// preted as the `idx` gather list. Arbitrary indices into the KV ring is an
+    /// aperture violation, which is exactly what it did.
+    ///
+    /// `t0=out([T,H,D] bf16) t1=opart t2=mlpart t3=sink` ·
+    /// `i0=T i1=H i2=D i3=SPLIT`.
+    V4SparseAttnMerge = 136,
 }
 
 impl DevOp {
@@ -1636,6 +1652,8 @@ impl DevOp {
         DevOp::V4HcMix,
         DevOp::V4HcZero,
         DevOp::V4HcBroadcast,
+        DevOp::V4SparseAttnSplit,
+        DevOp::V4SparseAttnMerge,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1791,6 +1809,8 @@ impl DevOp {
             DevOp::V4HcMix => "PLOW_DOP_V4_HC_MIX",
             DevOp::V4HcZero => "PLOW_DOP_V4_HC_ZERO",
             DevOp::V4HcBroadcast => "PLOW_DOP_V4_HC_BROADCAST",
+            DevOp::V4SparseAttnSplit => "PLOW_DOP_V4_SPARSE_ATTN_SPLIT",
+            DevOp::V4SparseAttnMerge => "PLOW_DOP_V4_SPARSE_ATTN_MERGE",
         }
     }
 
@@ -1822,7 +1842,7 @@ impl DevOp {
     /// 116 -> 117 for `XReduceAddNorm = 116` (the fused TP seam).
     /// 121 -> 131 for the ten DeepSeek-V4 opcodes (121..=130).
     /// 131 -> 133 for the split hyper-connection reduce (131..=132).
-    pub const COUNT: u16 = 135;
+    pub const COUNT: u16 = 137;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
