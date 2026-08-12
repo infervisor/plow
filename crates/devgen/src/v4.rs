@@ -410,14 +410,19 @@ fn emit_v4_attn(
             &format!("{p}.attn.compressor.norm.weight"),
             hd as u64 * BF16,
         );
-        // Window state is a RUNTIME resource, like the KV ring: it persists
-        // across steps and is not produced by any packet.
+        // Window state is a RUNTIME resource and a PER-SEQUENCE one, exactly
+        // like the KV ring — it carries the partial window between steps. So it
+        // is named under `kv.`, which is what makes the runtime allocate and
+        // rotate it per sequence. A `state.` prefix is not recognised as
+        // runtime at all: the loader would go looking for it in the checkpoint
+        // and fail with MISSING WEIGHT, which is exactly what the
+        // name-classification test caught.
         let kvs = b.tensor(
-            &format!("state.ckv.{l}"),
+            &format!("kv.cstate.{l}"),
             (coff * r) as u64 * w as u64 * F32,
         );
         let scs = b.tensor(
-            &format!("state.csc.{l}"),
+            &format!("kv.cscore.{l}"),
             (coff * r) as u64 * w as u64 * F32,
         );
         let step = b.emit(DevOp::V4KvCompress, vec![0], &[g1, g2], |d| {
@@ -1016,6 +1021,78 @@ mod tests {
             p.insts.len()
         );
         eprintln!("V4 decode program: {} packets", p.insts.len());
+    }
+
+    /// EVERY declared tensor must classify correctly for the loader, and the
+    /// checkpoint-weight ones must match the checkpoint's real names and sizes.
+    ///
+    /// `plowrt` binds by EXACT NAME with a byte-size check
+    /// (`exec/gpu.rs`: `ckpt.tensor(&td.name)` then `src.len() != td.bytes`),
+    /// so a name this emitter spells wrong is a load failure and a size it
+    /// computes wrong is a load failure — both loud, but only if someone runs
+    /// the 167 GB load. This test is that check without the checkpoint: it
+    /// asserts the SPLIT (runtime scratch vs checkpoint weight) and, for a
+    /// sample of real tensors, the exact byte counts the safetensors headers
+    /// carry.
+    #[test]
+    fn declared_names_classify_and_size_as_the_loader_expects() {
+        use packet::names::{is_checkpoint_weight, is_runtime_tensor};
+        let mut c = cfg_deepseek_v4_for_test();
+        c.layers = 43;
+        c.compress_ratios = (0..46)
+            .map(|i| match i {
+                0 | 1 | 43 | 44 | 45 => 0,
+                n if n % 2 == 0 => 4,
+                _ => 128,
+            })
+            .collect();
+        let mut b = Builder::new(304);
+        let tn = declare_v4(&mut b, &c, 16384);
+        emit_v4_decode(&mut b, &c, &tn, 16384, 304);
+        let p = b.finish();
+
+        // Anything the model does not ship must be runtime-classified, or the
+        // loader will go looking for it in the checkpoint and fail.
+        for t in &p.tensors {
+            let n = &t.name;
+            let scratch = n.starts_with("act.") || n.starts_with("in.") || n.starts_with("kv.");
+            if scratch {
+                assert!(
+                    is_runtime_tensor(n),
+                    "`{n}` is scratch but the loader would look for it in the checkpoint"
+                );
+            }
+        }
+
+        // The real geometry, from the released checkpoint's headers.
+        let want: &[(&str, u64)] = &[
+            ("embed.weight", 129280 * 4096 * 2),
+            ("head.weight", 129280 * 4096 * 2),
+            ("norm.weight", 4096 * 2),
+            ("hc_head_fn", 4 * 4 * 4096 * 4),
+            ("layers.0.hc_attn_fn", 24 * 4 * 4096 * 4),
+            ("layers.0.hc_ffn_base", 24 * 4),
+            ("layers.0.attn.wq_a.weight", 1024 * 4096),
+            ("layers.0.attn.wq_b.weight", 32768 * 1024),
+            ("layers.0.attn.wkv.weight", 512 * 4096),
+            ("layers.0.attn.wo_b.weight", 4096 * 8192),
+            ("layers.0.attn.attn_sink", 64 * 4),
+            ("layers.0.attn_norm.weight", 4096 * 2),
+            ("layers.2.attn.compressor.ape", 4 * 1024 * 4),
+            ("layers.2.attn.indexer.wq_b.weight", 8192 * 1024),
+        ];
+        for (n, bytes) in want {
+            let t = p
+                .tensors
+                .iter()
+                .find(|t| &t.name == n)
+                .unwrap_or_else(|| panic!("emitter never declared `{n}`"));
+            assert!(
+                is_checkpoint_weight(n),
+                "`{n}` must bind from the checkpoint"
+            );
+            assert_eq!(t.bytes, *bytes, "`{n}` byte count the loader will check");
+        }
     }
 
     /// The expand reads `x` and writes `x`. That aliasing is deliberate and
