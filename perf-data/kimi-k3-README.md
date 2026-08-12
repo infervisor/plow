@@ -517,3 +517,30 @@ blobs; they are 211 MB each and the emit takes 3.4 s.
 This is the largest un-chased item this section leaves behind: nothing here has tried to make the
 long-context blob's decode as fast as the short one's, and the 27% is a measurement rather than a
 diagnosis.
+
+# 13. Pending K3 experiments
+
+These are the remaining production-relevant experiments for the B1 >=50 tok/s target. Each item
+requires an exact packet/object pair, full-grid or full-model measurement, all-rank compact audit,
+and matched `vllm bench serve` gates. Standalone timing is screening evidence only.
+
+1. **K3 specialized GEMV/body path (short context).** Ordinary BF16 GEMV is the largest fixed
+   family (~22 ms in the current trace). A new load/reduction map or producer/consumer fusion must
+   recover multiple milliseconds; WG, R-split, W8A16, MXFP4, and opcode-pruning screens are closed.
+2. **Runtime live-`kv_len` MLA split selection.** The adopted fixed `PLOW_K3_NS=64` wins the
+   existing sweep. Selecting `nsplit` from live context is still unimplemented and must preserve
+   partial-buffer sizing, merge order, packet hashes, and stateful serving.
+3. **K3 GF12 MLA replacement.** The single-latent-pass GF12 screen used 54,848 B LDS, 113 spills,
+   and failed its output oracle; it is rejected unless a new resource-safe implementation preserves
+   the exact FP8 dequant/softmax/merge contract.
+4. **K3 TP8 collective gather.** A `XReduceTwoShotGather` could reduce routed shared-down collective
+   reads, but needs a standalone f64/bit-exact oracle, owner-index proof, and 8K/32K/128K serving A/B.
+   Generic row-banding and combine-XReduce fusion are already rejected.
+5. **KDA recurrent-state residency.** The default-off state-resident prefill arm passes static and
+   numerical gates but still needs uncontested TP8 timing at 8K/16K/32K.
+6. **Specialized verifier/speculation.** DSpark remains experimental and is excluded from the
+   production merge until corrected causal-frontier, MLA merge-map, recurrent-state, and full-model
+   token/state gates pass.
+
+The current validated B1 served baseline is below 50 tok/s at every context through 128K; no item
+in this list is considered adopted until it closes that gap with full-model evidence.
