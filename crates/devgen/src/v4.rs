@@ -891,6 +891,25 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     // is the ordinary table, which is why the shipped mxfp4 expert arms can
     // stream its experts with no V4-specific kernel at all.
     let tab = b.tensor(&format!("act.moetab.{l}"), k as u64 * 8);
+    // TIMING PROBE, by DUPLICATION rather than removal: emitting the router
+    // twice leaves the program correct (the second write is identical to the
+    // first) and the difference in layer time IS one router. Removal would have
+    // needed the expert emission factored out; duplication needs nothing.
+    if v4_skip("route2") {
+        b.emit(DevOp::V4MoeRoute, vec![0], &[gg], |d| {
+            d.t[0] = sel;
+            d.t[1] = wts;
+            d.t[2] = glog;
+            d.t[3] = bias;
+            d.t[4] = tid;
+            d.t[5] = tn.ids;
+            d.t[6] = tab;
+            d.i[0] = 1;
+            d.i[1] = e;
+            d.i[2] = k;
+            d.f[0] = c.route_scale as f32;
+        });
+    }
     let rt = b.emit(DevOp::V4MoeRoute, vec![0], &[gg], |d| {
         d.t[0] = sel;
         d.t[1] = wts;
