@@ -1221,6 +1221,20 @@ __device__ void d_v4_index_topk(int* __restrict__ idx, const float* __restrict__
  * 768 KiB. Storing it bf16 would halve the dominant cost of the model at decode;
  * that is a numerics question for a later pass, not a scheduling one, and it is
  * recorded here because the roofline says it is worth asking. */
+/* Zero a hyper-connection partial. `d_v4_hc_dot` accumulates into it with one
+ * atomicAdd per value per block, so it has to start at zero — its own comment
+ * says so, and nothing enforced it.
+ *
+ * Grid-strided over the whole grid rather than done on block 0, because block 0
+ * finishing early does not order the other blocks' atomics; the counter-DAG
+ * orders this packet against the dot, and every block participating keeps the
+ * zero a property of the PACKET rather than of one workgroup's timing. */
+__device__ void d_v4_hc_zero(float* __restrict__ partial, unsigned n, unsigned slice,
+                             unsigned nblk) {
+    for (unsigned i = slice * PLOW_THREADS + threadIdx.x; i < n; i += nblk * PLOW_THREADS)
+        partial[i] = 0.0f;
+}
+
 __device__ void d_v4_hc_dot(float* __restrict__ partial, const bf16* __restrict__ x,
                             const float* __restrict__ hc_fn, unsigned T, unsigned D, unsigned HC,
                             unsigned slice, unsigned nblk, float* __restrict__ lds) {

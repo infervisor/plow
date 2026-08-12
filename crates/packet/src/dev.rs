@@ -1471,6 +1471,19 @@ pub enum DevOp {
     /// t3=hc_scale([3] f32) t4=hc_base([mix] f32) t5=mix_out([T,hc+hc*hc] f32)` ·
     /// `i0=T i1=D i2=hc i3=sinkhorn_iters` · `f0=norm_eps f1=hc_eps`.
     V4HcMix = 132,
+    /// **Zero a hyper-connection partial** so [`DevOp::V4HcDot`] can accumulate
+    /// into it.
+    ///
+    /// `V4HcDot` states the requirement in its own doc — "`t0` MUST BE ZEROED
+    /// before this runs: it is accumulated into with atomics" — and there was no
+    /// op that could satisfy it. Fresh device memory is zero, so ONE reduce site
+    /// in a program is correct by accident; a second site accumulates onto the
+    /// first's residue, and every site accumulates across TOKENS. Per-site
+    /// buffers do not fix the second of those, which is why this is an op and
+    /// not a bigger allocation.
+    ///
+    /// `t0=partial([n] f32)` · `i0=n`.
+    V4HcZero = 133,
 }
 
 impl DevOp {
@@ -1613,6 +1626,7 @@ impl DevOp {
         DevOp::V4ClampedSwiGlu,
         DevOp::V4HcDot,
         DevOp::V4HcMix,
+        DevOp::V4HcZero,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1766,6 +1780,7 @@ impl DevOp {
             DevOp::V4ClampedSwiGlu => "PLOW_DOP_V4_CLAMPED_SWIGLU",
             DevOp::V4HcDot => "PLOW_DOP_V4_HC_DOT",
             DevOp::V4HcMix => "PLOW_DOP_V4_HC_MIX",
+            DevOp::V4HcZero => "PLOW_DOP_V4_HC_ZERO",
         }
     }
 
@@ -1797,7 +1812,7 @@ impl DevOp {
     /// 116 -> 117 for `XReduceAddNorm = 116` (the fused TP seam).
     /// 121 -> 131 for the ten DeepSeek-V4 opcodes (121..=130).
     /// 131 -> 133 for the split hyper-connection reduce (131..=132).
-    pub const COUNT: u16 = 133;
+    pub const COUNT: u16 = 134;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

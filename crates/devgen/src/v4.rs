@@ -182,7 +182,15 @@ fn emit_hc_reduce(
     let base = b.tensor(&format!("{name}_base"), mix * F32);
     let all: Vec<u32> = (0..n_cu).collect();
 
-    let dot = b.emit(DevOp::V4HcDot, all.clone(), deps, |d| {
+    // `V4HcDot` accumulates with atomics, so its partial must start at zero —
+    // its opcode doc says exactly that. Fresh device memory made ONE reduce
+    // site per program correct by accident; the second site in a layer, and
+    // every site on the second token, accumulated onto the previous residue.
+    let z = b.emit(DevOp::V4HcZero, all.clone(), deps, |d| {
+        d.t[0] = tn.hc_partial;
+        d.i[0] = 1 + mix as u32;
+    });
+    let dot = b.emit(DevOp::V4HcDot, all.clone(), &[z], |d| {
         d.t[0] = tn.hc_partial;
         d.t[1] = tn.x;
         d.t[2] = fnw;
@@ -1038,11 +1046,18 @@ mod tests {
         let ops: Vec<u16> = p.insts.iter().map(|i| i.op).collect();
         assert_eq!(
             ops,
-            vec![DevOp::V4HcDot as u16, DevOp::V4HcMix as u16],
-            "the reduce is two packets, projection then Sinkhorn tail"
+            vec![
+                DevOp::V4HcZero as u16,
+                DevOp::V4HcDot as u16,
+                DevOp::V4HcMix as u16
+            ],
+            "zero, projection, Sinkhorn tail — the zero is not optional, the dot \
+             accumulates with atomics"
         );
-        // Both must name the SAME partial: the mix reads what the dot wrote.
-        assert_eq!(p.insts[0].t[0], p.insts[1].t[2]);
+        // All three must name the SAME partial: the zero clears what the dot
+        // accumulates into and the mix reads.
+        assert_eq!(p.insts[0].t[0], p.insts[1].t[0], "zero clears the dot's target");
+        assert_eq!(p.insts[1].t[0], p.insts[2].t[2], "the mix reads what the dot wrote");
     }
 
     /// The attention chain, as a SEQUENCE. Order is the model here: a
@@ -1065,6 +1080,7 @@ mod tests {
         assert_eq!(
             ops,
             vec![
+                V4HcZero,
                 V4HcDot,
                 V4HcMix, // reduce the streams
                 RmsNorm, // attn_norm

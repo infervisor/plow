@@ -1043,6 +1043,9 @@ enum {
     PLOW_DOP_V4_CLAMPED_SWIGLU = 130,
     PLOW_DOP_V4_HC_DOT = 131,
     PLOW_DOP_V4_HC_MIX = 132,
+    /* Zero a hyper-connection partial so V4_HC_DOT can accumulate into it
+     * with atomics. t0=partial i0=n. */
+    PLOW_DOP_V4_HC_ZERO = 133,
 
     PLOW_DOP__COUNT
 };
