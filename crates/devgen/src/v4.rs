@@ -863,8 +863,17 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     // order. One handle per expert is not enough: the arms index
     // `expert_weight_table[eid * 3 + j]`.
     let tbl = 3 * 8 * e as u64;
-    let ewt = b.tensor(&format!("layers.{l}.mlp.expert_weight_table"), tbl);
-    let est = b.tensor(&format!("layers.{l}.mlp.expert_scale_table"), tbl);
+    // Declared only when something streams them: the loader refuses a table no
+    // decode instruction reads ("nothing to pack against"), which is the right
+    // refusal and which the PLOW_V4_SKIP=moe probe would otherwise trip.
+    let (ewt, est) = if v4_skip("moe") {
+        (packet::dev::TENSOR_NONE, packet::dev::TENSOR_NONE)
+    } else {
+        (
+            b.tensor(&format!("layers.{l}.mlp.expert_weight_table"), tbl),
+            b.tensor(&format!("layers.{l}.mlp.expert_scale_table"), tbl),
+        )
+    };
     // ONE PACKET PAIR PER SLOT, and the slot index is what makes them different
     // work: `i[0]` tells the arm which of the k table entries to stream. A
     // single pair with `i[0]` left at zero runs the top-1 expert k times over
@@ -878,7 +887,16 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     let enc = 2u32; // PLOW_MOE_ENC_MXFP4
     let v4_clamp = 3u32; // PLOW_MOE_ACT_V4CLAMP
     let mut downs: Vec<u32> = Vec::with_capacity(k as usize);
-    for sl in 0..k {
+    // TIMING PROBE: drop all 2k routed-expert packets and hand the combine a
+    // zeroed partial buffer instead. The difference is what the routed experts
+    // cost; the combine, router and shared expert stay.
+    if v4_skip("moe") {
+        downs.push(b.emit(DevOp::V4HcZero, all.clone(), &[rt], |d| {
+            d.t[0] = part;
+            d.i[0] = k * h;
+        }));
+    }
+    for sl in 0..(if v4_skip("moe") { 0 } else { k }) {
         let glu = b.emit(DevOp::MoeExpertGluFp8Blk, all.clone(), &[rt], |d| {
             d.t[0] = fu;
             d.t[1] = tn.xn;
