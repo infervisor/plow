@@ -54,7 +54,7 @@ __global__ __launch_bounds__(PLOW_THREADS) void k_route(int* sel, float* wts, co
                                                         unsigned T, unsigned E, unsigned K,
                                                         float rs) {
     __shared__ __align__(16) char raw[LDS_BYTES];
-    d_v4_moe_route(sel, wts, logits, bias, tid2eid, ids, T, E, K, rs, blockIdx.x, gridDim.x,
+    d_v4_moe_route(sel, wts, nullptr, logits, bias, tid2eid, ids, T, E, K, rs, blockIdx.x, gridDim.x,
                    (float*)raw);
 }
 __global__ __launch_bounds__(PLOW_THREADS) void k_glu(bf16* out, const bf16* g, const bf16* u,

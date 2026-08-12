@@ -576,6 +576,83 @@ fn emit_v4_attn(
 /// `[vocab, top_k]` table. Both are `V4MoeRoute`; which one is selected by
 /// whether `tid2eid` is bound, so a hash layer emitted as a scored one routes
 /// every token somewhere else and still runs.
+/// The `i[]` slot the MoE weight ENCODING travels in on the decode expert ops
+/// (45/46). It is deliberately not `i[3]`: those ops carry `n_exp` there, and
+/// writing the encoding into it would set `n_exp = 2`, send every expert id >= 2
+/// down the sentinel-skip path, and produce a silently DEAD MoE. Mirrors
+/// `mla::MoeEnc::DECODE_SLOT`.
+const MOE_ENC_SLOT: usize = 6;
+
+/// The shared expert: fp8, ungated, and it runs for EVERY token.
+///
+/// Returned as `(output tensor, last packet)` because the combine needs both —
+/// the tensor to read and the packet to wait on. Folding the shared expert into
+/// the routed sum without gating it on its own producer is a race that shows up
+/// as a small, load-dependent numeric drift, which is the hardest kind to find.
+fn emit_v4_shared_expert(
+    b: &mut Builder,
+    c: &V4Cfg,
+    tn: &V4Tn,
+    l: u32,
+    n_cu: u32,
+    dep: u32,
+) -> (u32, u32) {
+    let p = format!("layers.{l}.ffn.shared_experts");
+    let all: Vec<u32> = (0..n_cu).collect();
+    let h = c.hidden as u32;
+    let i = c.moe_inter as u32;
+    let sh = b.tensor(&format!("act.shared.{l}"), h as u64 * BF16);
+    let sg = b.tensor(&format!("act.shgate.{l}"), i as u64 * BF16);
+    let su = b.tensor(&format!("act.shup.{l}"), i as u64 * BF16);
+    // Block-fp8 `[N/128][K/128]`, one scale per 128x128 tile.
+    let blk = |n: u32, kk: u32| (n as u64).div_ceil(128) * (kk as u64).div_ceil(128);
+    let (w1, s1) = (
+        b.tensor(&format!("{p}.w1.weight"), i as u64 * h as u64),
+        b.tensor(&format!("{p}.w1.scale"), blk(i, h)),
+    );
+    let (w3, s3) = (
+        b.tensor(&format!("{p}.w3.weight"), i as u64 * h as u64),
+        b.tensor(&format!("{p}.w3.scale"), blk(i, h)),
+    );
+    let (w2, s2) = (
+        b.tensor(&format!("{p}.w2.weight"), h as u64 * i as u64),
+        b.tensor(&format!("{p}.w2.scale"), blk(h, i)),
+    );
+    #[allow(clippy::too_many_arguments)]
+    fn gemv(
+        b: &mut Builder,
+        cus: &[u32],
+        out: u32,
+        w: u32,
+        s: u32,
+        n: u32,
+        kk: u32,
+        src: u32,
+        d0: u32,
+    ) -> u32 {
+        b.emit(DevOp::GemvFp8Blk, cus.to_vec(), &[d0], |d| {
+            d.t[0] = out;
+            d.t[1] = src;
+            d.t[2] = w;
+            d.t[3] = s;
+            d.i[0] = 1;
+            d.i[1] = n;
+            d.i[2] = kk;
+        })
+    }
+    let g = gemv(b, &all, sg, w1, s1, i, h, tn.xn, dep);
+    let u = gemv(b, &all, su, w3, s3, i, h, tn.xn, dep);
+    let a = b.emit(DevOp::V4ClampedSwiGlu, all.clone(), &[g, u], |d| {
+        d.t[0] = sg;
+        d.t[1] = sg;
+        d.t[2] = su;
+        d.i[0] = i;
+        d.f[0] = c.swiglu_limit as f32;
+    });
+    let dn = gemv(b, &all, sh, w2, s2, h, i, sg, a);
+    (sh, dn)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &[u32]) -> u32 {
     let p = format!("layers.{l}");
@@ -625,6 +702,12 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     } else {
         packet::dev::TENSOR_NONE
     };
+    // `tab` is the selection in the layout ops 45/46 read — `[k]` of
+    // `{u32 expert_id, f32 gate}` (`d_moe_router`, runtime/amd/op_moe.h). V4
+    // SCORES differently from every other family, but what it hands the experts
+    // is the ordinary table, which is why the shipped mxfp4 expert arms can
+    // stream its experts with no V4-specific kernel at all.
+    let tab = b.tensor(&format!("act.moetab.{l}"), k as u64 * 8);
     let rt = b.emit(DevOp::V4MoeRoute, vec![0], &[gg], |d| {
         d.t[0] = sel;
         d.t[1] = wts;
@@ -632,6 +715,7 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
         d.t[3] = bias;
         d.t[4] = tid;
         d.t[5] = tn.ids;
+        d.t[6] = tab;
         d.i[0] = 1;
         d.i[1] = e;
         d.i[2] = k;
@@ -640,7 +724,12 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
 
     // Routed experts, fp4, through the existing mxfp4 expert arms; the shared
     // expert is fp8 and always runs.
-    let fu = b.tensor(&format!("act.fu.{l}"), 2 * imoe as u64 * BF16);
+    // `fu` is PER SLOT: the GLU arm writes `fu[slot * I_moe + n]` and the down
+    // arm reads the same stride, so this is k rows of I_moe, not a gate|up pair.
+    let fu = b.tensor(&format!("act.fu.{l}"), k as u64 * imoe as u64 * BF16);
+    // k independent f32 partials of H, folded by the combine.
+    let part = b.tensor(&format!("act.part.{l}"), k as u64 * h as u64 * F32);
+    let (shared, shdep) = emit_v4_shared_expert(b, c, tn, l, n_cu, nrm);
     // HOST-FILLED POINTER TABLES, not checkpoint tensors: they hold device
     // addresses the loader computes after packing the 256 experts. The names
     // must end in `mlp.expert_weight_table` / `mlp.expert_scale_table` because
@@ -650,38 +739,69 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     // checkpoint contains.
     let ewt = b.tensor(&format!("layers.{l}.mlp.expert_weight_table"), 8 * e as u64);
     let est = b.tensor(&format!("layers.{l}.mlp.expert_scale_table"), 8 * e as u64);
-    let glu = b.emit(DevOp::MoeExpertGluFp8Blk, all.clone(), &[rt], |d| {
-        d.t[0] = fu;
-        d.t[1] = tn.xn;
-        d.t[2] = sel;
-        d.t[3] = ewt;
-        d.t[4] = est;
-        d.i[1] = imoe;
-        d.i[2] = h;
-        d.i[3] = e;
-    });
-    // V4's activation is a CLAMPED SwiGLU (limit 10), one-sided on the gate and
-    // two-sided on the up branch. It is a separate packet rather than an `act`
-    // code because the clamp transforms the UP branch too.
-    let act = b.emit(DevOp::V4ClampedSwiGlu, all.clone(), &[glu], |d| {
-        d.t[0] = fu;
-        d.t[1] = fu;
-        d.t[2] = fu;
-        d.i[0] = imoe;
-        d.f[0] = c.swiglu_limit as f32;
-    });
-    let down = b.emit(DevOp::MoeExpertDownFp8Blk, all, &[act], |d| {
+    // ONE PACKET PAIR PER SLOT, and the slot index is what makes them different
+    // work: `i[0]` tells the arm which of the k table entries to stream. A
+    // single pair with `i[0]` left at zero runs the top-1 expert k times over
+    // and drops the other five — arithmetic that completes, on a sixth of the
+    // model.
+    //
+    // `i[6]` is the ENCODING (`MoeEnc::DECODE_SLOT`), and it is not optional
+    // here: V4's routed experts are MXFP4, an unset `i[6]` reads as
+    // `PLOW_MOE_ENC_BF16`, and the quantized dot answers an encoding it does not
+    // implement with a NaN rather than a wrong number.
+    let enc = 2u32; // PLOW_MOE_ENC_MXFP4
+    let v4_clamp = 3u32; // PLOW_MOE_ACT_V4CLAMP
+    let mut downs: Vec<u32> = Vec::with_capacity(k as usize);
+    for sl in 0..k {
+        let glu = b.emit(DevOp::MoeExpertGluFp8Blk, all.clone(), &[rt], |d| {
+            d.t[0] = fu;
+            d.t[1] = tn.xn;
+            d.t[2] = tab;
+            d.t[3] = ewt;
+            d.t[4] = est;
+            d.i[0] = sl;
+            d.i[1] = imoe;
+            d.i[2] = h;
+            d.i[3] = e;
+            // V4's activation is a CLAMPED SwiGLU (limit 10): one-sided on the
+            // gate, two-sided on the up branch. It rides the GLU epilogue as an
+            // activation code rather than a following packet because the arm
+            // has `g` and `u` in registers there — a separate packet would
+            // round `fu` to bf16, read it back, and clamp a number the clamp
+            // was supposed to bound before the rounding.
+            d.i[5] = v4_clamp;
+            d.i[MOE_ENC_SLOT] = enc;
+            d.f[0] = c.swiglu_limit as f32;
+        });
+        let down = b.emit(DevOp::MoeExpertDownFp8Blk, all.clone(), &[glu], |d| {
+            d.t[0] = part;
+            d.t[1] = fu;
+            d.t[2] = tab;
+            d.t[3] = ewt;
+            d.t[4] = est;
+            d.i[0] = sl;
+            d.i[1] = h;
+            d.i[2] = imoe;
+            d.i[3] = e;
+            d.i[MOE_ENC_SLOT] = enc;
+        });
+        downs.push(down);
+    }
+    // The k slots wrote k INDEPENDENT f32 partials; the combine folds them onto
+    // the stream. V4 has no residual add, so the residual operand is `xr`
+    // itself — the hyper-connection reduce's output, which is what the expert
+    // sum is added to.
+    downs.push(shdep);
+    let cmb = b.emit(DevOp::MoeCombine, all, &downs, |d| {
         d.t[0] = tn.xr;
-        d.t[1] = fu;
-        d.t[2] = sel;
-        d.t[3] = ewt;
-        d.t[4] = est;
-        d.i[1] = h;
-        d.i[2] = imoe;
-        d.i[3] = e;
+        d.t[1] = tn.xr;
+        d.t[2] = shared;
+        d.t[3] = part;
+        d.i[0] = h;
+        d.i[1] = k;
     });
 
-    emit_hc_expand(b, c, tn, tn.xr, n_cu, &[down])
+    emit_hc_expand(b, c, tn, tn.xr, n_cu, &[cmb])
 }
 
 /// One whole V4 layer.
@@ -1116,6 +1236,69 @@ mod tests {
             );
             assert_eq!(t.bytes, *bytes, "`{n}` byte count the loader will check");
         }
+    }
+
+    /// Every routed-expert packet must name its SLOT and its ENCODING.
+    ///
+    /// Both defects this pins were live and neither was visible: the emitter
+    /// sent ONE gate/up + down pair with `i[0]` unset, which runs the top-1
+    /// expert and silently drops the other five, and it left `i[6]` at zero,
+    /// which the quantized dot reads as bf16 and answers with a NaN. Packet
+    /// counts alone cannot see either — the program built, the ops were right,
+    /// the immediates were wrong — so this asserts the immediates.
+    #[test]
+    fn routed_experts_carry_their_slot_and_the_mxfp4_encoding() {
+        let c = cfg_deepseek_v4_for_test();
+        let mut b = Builder::new(8);
+        let tn = declare_v4(&mut b, &c, 16384);
+        emit_v4_decode(&mut b, &c, &tn, 16384, 8);
+        let p = b.finish();
+        let k = c.top_k;
+
+        for (op, what) in [
+            (DevOp::MoeExpertGluFp8Blk, "gate/up"),
+            (DevOp::MoeExpertDownFp8Blk, "down"),
+        ] {
+            let ins: Vec<_> = p.insts.iter().filter(|i| i.op == op as u16).collect();
+            assert_eq!(
+                ins.len() as u32,
+                k * c.layers,
+                "{what}: one packet per slot per layer"
+            );
+            // The k slots of one layer must be 0..k, not k copies of slot 0.
+            let mut slots: Vec<u32> = ins[..k as usize].iter().map(|i| i.i[0]).collect();
+            slots.sort_unstable();
+            assert_eq!(
+                slots,
+                (0..k).collect::<Vec<_>>(),
+                "{what}: layer 0 must stream every routed slot exactly once"
+            );
+            for i in &ins {
+                assert_eq!(
+                    i.i[MOE_ENC_SLOT], 2,
+                    "{what}: V4 experts are MXFP4; encoding 0 decodes as bf16 and poisons"
+                );
+                assert_eq!(i.i[3], c.n_exp, "{what}: n_exp must stay in i[3]");
+            }
+        }
+        // The gate/up arm owns the clamped SwiGLU, so the clamp limit must ride
+        // with it — a zero limit would clamp every activation to <= 0.
+        let glu = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeExpertGluFp8Blk as u16)
+            .expect("a routed gate/up packet");
+        assert_eq!(glu.i[5], 3, "PLOW_MOE_ACT_V4CLAMP");
+        assert_eq!(glu.f[0], c.swiglu_limit as f32);
+
+        // One combine per layer folds the k partials plus the shared expert.
+        let cmb: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::MoeCombine as u16)
+            .collect();
+        assert_eq!(cmb.len() as u32, c.layers, "one combine per layer");
+        assert_eq!(cmb[0].i[1], k, "the combine must fold ALL k partials");
     }
 
     /// The expand reads `x` and writes `x`. That aliasing is deliberate and

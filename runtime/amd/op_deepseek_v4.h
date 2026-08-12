@@ -789,6 +789,7 @@ __device__ void d_v4_grouped_linear(bf16* __restrict__ out, const bf16* __restri
  * Top-k here is a serial selection over E; E is 256 and K is 6, so this is 6
  * passes of 256 compares per token. */
 __device__ void d_v4_moe_route(int* __restrict__ sel, float* __restrict__ wts,
+                               unsigned char* __restrict__ table,
                                const float* __restrict__ logits, const float* __restrict__ bias,
                                const long long* __restrict__ tid2eid, const int* __restrict__ ids,
                                unsigned T, unsigned E, unsigned K, float route_scale,
@@ -836,6 +837,20 @@ __device__ void d_v4_moe_route(int* __restrict__ sel, float* __restrict__ wts,
             /* Renormalize over the selected set, then scale. */
             const float inv = (sum != 0.0f) ? 1.0f / sum : 0.0f;
             for (unsigned k = 0; k < K; k++) w[k] = w[k] * inv * route_scale;
+            /* The SAME selection, in the layout the shipped expert arms read:
+             * `[k] of {u32 expert_id, f32 gate}` (`d_moe_router`, op_moe.h). V4
+             * scores and selects differently from every other family, but what
+             * it hands the experts is the ordinary table — so ops 45/46 stream
+             * its experts unmodified and `sel`/`wts` stay for the gate that
+             * checks this against the reference. */
+            if (table != nullptr) {
+                unsigned char* tb = table + (size_t)t * K * 8;
+                for (unsigned k = 0; k < K; k++) {
+                    const unsigned id = (s[k] < 0) ? 0xFFFFFFFFu : (unsigned)s[k];
+                    __builtin_memcpy(tb + k * 8, &id, 4);
+                    __builtin_memcpy(tb + k * 8 + 4, &w[k], 4);
+                }
+            }
         }
         __syncthreads();
     }

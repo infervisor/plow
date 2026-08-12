@@ -2039,7 +2039,10 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                 in->i[1], in->i[2], in->i[3], slice, nblk);
             break;
         case PLOW_DOP_V4_MOE_ROUTE:
-            d_v4_moe_route((int*)TEN(0), (float*)TEN(1), (const float*)TEN(2), (const float*)TEN(3),
+            /* t6 = the ops-45/46 expert table; absent on the numeric gate, which
+             * checks sel/wts against the reference and has no experts to feed. */
+            d_v4_moe_route((int*)TEN(0), (float*)TEN(1), (unsigned char*)TEN(6),
+                           (const float*)TEN(2), (const float*)TEN(3),
                            (const long long*)TEN(4), (const int*)TEN(5), in->i[0], in->i[1],
                            in->i[2], in->fj[0].f, slice, nblk, (float*)sm->raw);
             break;

@@ -1961,7 +1961,8 @@ struct ExpertNames {
     proj: [&'static str; 3],
     /// `.weight` or `.weight_packed`.
     payload: &'static str,
-    /// `.weight_scale_inv` (block-fp8 f32 grid) or `.weight_scale` (E8M0 row).
+    /// `.weight_scale_inv` (block-fp8 f32 grid), or `.weight_scale` / `.scale`
+    /// (E8M0 row).
     scale: &'static str,
 }
 
@@ -1976,8 +1977,12 @@ impl ExpertNames {
 
     /// Is the scale an MX microscaling row (one E8M0 byte per 32 elements along
     /// K) rather than a block-fp8 `[N/128][K/128]` f32 grid?
+    /// Only the block-fp8 grid is NOT microscaled, so this asks that question
+    /// rather than listing the MX spellings — a third MX name (V4's bare
+    /// `.scale`) must not silently fall into the f32-grid branch, where the
+    /// geometry check would compare an E8M0 row against a `[N/128][K/128]` grid.
     fn microscaled(&self) -> bool {
-        self.scale == ".weight_scale"
+        self.scale != ".weight_scale_inv"
     }
 }
 
@@ -1998,14 +2003,32 @@ fn resolve_expert_names(
     ckpt: &crate::asset::checkpoint::Checkpoint,
     pfx: &str,
 ) -> Result<ExpertNames> {
-    const TEMPLATES: [([&str; 3], &str); 2] = [
+    const TEMPLATES: [([&str; 3], &str); 3] = [
         (["gate_proj", "up_proj", "down_proj"], ".weight"),
         (["w1", "w3", "w2"], ".weight_packed"),
+        // DeepSeek-V4: `w1/w3/w2` like the packed spelling, but a plain
+        // `.weight` payload (the fp4 nibble packing is in the DTYPE, not the
+        // name) and a bare `.scale`. Added AFTER the two above so every
+        // existing checkpoint still resolves on the probe it resolved on
+        // before.
+        (["w1", "w3", "w2"], ".weight"),
     ];
-    const SCALES: [&str; 2] = [".weight_scale_inv", ".weight_scale"];
+    const SCALES: [&str; 3] = [".weight_scale_inv", ".weight_scale", ".scale"];
     let base = pfx.strip_prefix("moe.").unwrap_or(pfx);
     let mut tried: Vec<String> = Vec::new();
-    for sub in ["", "mlp.", "block_sparse_moe."] {
+    // `mlp.` is stripped as a SECOND base because the packet's table name must
+    // end in `mlp.expert_weight_table` for `packet::names` to classify it as
+    // host-filled, while the checkpoint's own MoE namespace may be something
+    // else entirely — V4's is `layers.{l}.ffn.experts.`. Probed after the
+    // unstripped base so the documented first-candidate order is unchanged.
+    let bases: Vec<&str> = match base.strip_suffix("mlp.") {
+        Some(b) if b != base => vec![base, b],
+        _ => vec![base],
+    };
+    for (base, sub) in bases
+        .iter()
+        .flat_map(|b| ["", "mlp.", "block_sparse_moe.", "ffn."].map(|s| (*b, s)))
+    {
         for (proj, payload) in TEMPLATES {
             let ns = format!("{base}{sub}experts.");
             let probe = format!("{ns}0.{}{payload}", proj[0]);
