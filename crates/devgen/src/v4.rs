@@ -856,7 +856,18 @@ pub(crate) fn emit_v4_layer(
     n_cu: u32,
     deps: &[u32],
 ) -> u32 {
+    // DEBUG BISECT, same argument as PLOW_V4_LAYERS: a GPU fault names no
+    // packet, so the halves are emitted separately to find out which one it is.
+    // `attn` and `ffn` each still produce a well-formed program — neither is the
+    // model, and both say so.
+    let half = std::env::var("PLOW_V4_HALF").unwrap_or_default();
+    if half == "ffn" {
+        return emit_v4_ffn(b, c, tn, l, n_cu, deps);
+    }
     let a = emit_v4_attn(b, c, tn, l, ctx, n_cu, deps);
+    if half == "attn" {
+        return a;
+    }
     emit_v4_ffn(b, c, tn, l, n_cu, &[a])
 }
 
