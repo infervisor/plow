@@ -268,6 +268,10 @@ const EMITTER_SRC: &[&str] = &[
     "kda.rs",
     "k3.rs",
     "mla/kimi_k3.rs",
+    // The V4 decode emitter. Absent from this list, the twelve V4 arms it routes
+    // to read as unemitted, and the four added last (zero/broadcast/split/merge)
+    // could not be added to GFX950_DISPATCHED without failing the sibling test.
+    "v4.rs",
 ];
 
 /// Arms gfx950 dispatches that NOTHING emits, each with why that is deliberate.
@@ -278,51 +282,11 @@ const EMITTER_SRC: &[&str] = &[
 const GFX950_UNEMITTED: &[(&str, &str)] = &[
     (
         "PLOW_DOP_V4_HC_REDUCE",
-        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
-    ),
-    (
-        "PLOW_DOP_V4_HC_EXPAND",
-        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
-    ),
-    (
-        "PLOW_DOP_V4_HC_REDUCE_HEAD",
-        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+        "DeepSeek-V4. SUPERSEDED, not pending: the emitter builds the reduce out of PLOW_DOP_V4_HC_DOT + PLOW_DOP_V4_HC_MIX, which split the fused arm's atomic accumulation from its Sinkhorn tail so the two can take different CU widths. The fused arm still passes its numeric gate and is kept for the prefill shape, where one packet per token beats three.",
     ),
     (
         "PLOW_DOP_V4_SPARSE_ATTN",
-        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
-    ),
-    (
-        "PLOW_DOP_V4_KV_COMPRESS",
-        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
-    ),
-    (
-        "PLOW_DOP_V4_INDEX_SCORE",
-        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
-    ),
-    (
-        "PLOW_DOP_V4_INDEX_TOPK",
-        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
-    ),
-    (
-        "PLOW_DOP_V4_GROUPED_LINEAR",
-        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
-    ),
-    (
-        "PLOW_DOP_V4_MOE_ROUTE",
-        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
-    ),
-    (
-        "PLOW_DOP_V4_CLAMPED_SWIGLU",
-        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
-    ),
-    (
-        "PLOW_DOP_V4_HC_DOT",
-        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
-    ),
-    (
-        "PLOW_DOP_V4_HC_MIX",
-        "DeepSeek-V4. The kernel exists, is dispatched, and passes a numeric gate against the reference (runtime/tests/v4_*_oracle_gfx942.hip), but NO emitter builds a V4 program yet, so nothing selects it. This is the honest state of a bring-up mid-flight rather than a dead arm: the entry comes OUT the moment emit_v4_block routes to it, and this test is what will force that.",
+        "DeepSeek-V4. SUPERSEDED, not pending: the emitter routes to PLOW_DOP_V4_SPARSE_ATTN_SPLIT + _MERGE, which partition the window and the compressed history across disjoint CU sets and then combine with the learned sink. The single-packet arm remains gated and correct, but nothing selects it at decode.",
     ),
     (
         "PLOW_DOP_FLASH_GATHER_PREFILL",

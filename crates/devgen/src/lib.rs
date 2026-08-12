@@ -5867,8 +5867,8 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_KDA_CONV",
     "PLOW_DOP_KDA_CONV3",
     "PLOW_DOP_KDA_CONV_STATE_STEP_G",
-    // DeepSeek-V4. Dispatched, but no emitter builds a V4 program yet, so
-    // nothing issues these; the list tracks interp.hip, not usage.
+    // DeepSeek-V4. The list tracks interp.hip, not usage — though `PLOW_V4_FULL`
+    // now does build a program that issues all of these.
     "PLOW_DOP_V4_HC_REDUCE",
     "PLOW_DOP_V4_HC_EXPAND",
     "PLOW_DOP_V4_HC_REDUCE_HEAD",
@@ -5881,6 +5881,10 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_V4_CLAMPED_SWIGLU",
     "PLOW_DOP_V4_HC_DOT",
     "PLOW_DOP_V4_HC_MIX",
+    "PLOW_DOP_V4_HC_ZERO",
+    "PLOW_DOP_V4_HC_BROADCAST",
+    "PLOW_DOP_V4_SPARSE_ATTN_SPLIT",
+    "PLOW_DOP_V4_SPARSE_ATTN_MERGE",
     "PLOW_DOP_KDA_GATE",
     "PLOW_DOP_KDA_GATED_NORM",
     "PLOW_DOP_KDA_STATE_STEP",
