@@ -242,6 +242,19 @@ fn emit_hc_expand(
     deps: &[u32],
 ) -> u32 {
     let all: Vec<u32> = (0..n_cu).collect();
+    // TIMING PROBE: V4HcBroadcast writes the same [T, hc, D] shape from a [T, D]
+    // source, so it stands in for the expand without changing the program's
+    // structure. The expand is in-place and NOT idempotent, so duplication
+    // cannot time it; this is the differencing form.
+    if v4_skip("expand") {
+        return b.emit(DevOp::V4HcBroadcast, all, deps, |d| {
+            d.t[0] = tn.x;
+            d.t[1] = branch;
+            d.i[0] = 1;
+            d.i[1] = c.hidden as u32;
+            d.i[2] = c.hc_mult;
+        });
+    }
     b.emit(DevOp::V4HcExpand, all, deps, |d| {
         d.t[0] = tn.x; // in place: every output reads the whole stream vector first
         d.t[1] = branch;
