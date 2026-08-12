@@ -390,6 +390,22 @@ fn emit_v4_attn(
     // TIMING PROBE by duplication: RmsNorm is idempotent, so a second emission
     // costs exactly one norm. ~2.7 ms of this layer is unaccounted and the two
     // norms are among the last candidates left.
+    // `rms2` emits the duplicate in PARALLEL (same deps) and measured ~0.
+    // `rms2s` chains it in SERIES, adding one level of depth and nothing else.
+    // If the layer's cost is per-LEVEL rather than per-op, these two must differ
+    // by a level even though they run identical work.
+    let red = if v4_skip("rms2s") {
+        b.emit(DevOp::RmsNorm, all.clone(), &[red], |d| {
+            d.t[0] = tn.xn;
+            d.t[1] = tn.xr;
+            d.t[2] = anw;
+            d.i[0] = 1;
+            d.i[1] = h;
+            d.f[0] = 1e-6;
+        })
+    } else {
+        red
+    };
     if v4_skip("rms2") {
         b.emit(DevOp::RmsNorm, all.clone(), &[red], |d| {
             d.t[0] = tn.xn;
