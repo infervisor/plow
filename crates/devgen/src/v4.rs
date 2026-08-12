@@ -218,7 +218,14 @@ fn emit_hc_reduce(
         d.i[0] = 1;
         d.i[1] = c.hidden as u32;
         d.i[2] = c.hc_mult;
-        d.i[3] = c.hc_iters;
+        // TIMING PROBE: PLOW_V4_HCITERS overrides the Sinkhorn iteration count.
+        // `d_v4_hc_mix` runs its token loop UNSTRIDED, so every block executes
+        // the whole tail; if that is the cost, iteration count is the dial that
+        // shows it. Any value but the config's 20 is a DIFFERENT MODEL.
+        d.i[3] = std::env::var("PLOW_V4_HCITERS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(c.hc_iters);
         d.f[0] = 1e-6;
         d.f[1] = 1e-6; /* hc_eps */
     })
