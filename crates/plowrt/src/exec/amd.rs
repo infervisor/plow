@@ -3804,7 +3804,17 @@ impl AmdEngine {
         // a whole-layer GLM/Kimi/DeepSeek prefill packet selects the object
         // that actually has the arms instead of silently falling back to
         // `interp_prefill{,_gq}.elf`, whose `default:` case does not trap.
-        let prefill_arm = PrefillArm::detect(&blob.progs);
+        let mut prefill_arm = PrefillArm::detect(&blob.progs);
+        // A packet can need the K3 OBJECT without carrying a single K3 PREFILL
+        // op. DeepSeek-V4 is that packet: its V4* opcodes all live inside
+        // interp.hip's `#if PLOW_K3` region, but it emits no MLA/MoE prefill
+        // arm at all, so `PrefillArm::detect` returns `None` and the load asks
+        // for an object compiled without the region — where every V4 op is a
+        // silent NOP. `required_k3_op` is the same scan the load-time refusal
+        // uses, so the object SELECTED and the object DEMANDED cannot disagree.
+        if prefill_arm == PrefillArm::None && required_k3_op(&blob.progs).is_some() {
+            prefill_arm = PrefillArm::K3;
+        }
 
         // THE WIDEST GEMV EACH OBJECT WILL BE HANDED, split the way the objects
         // are. The decode program runs on the decode object; every prefill

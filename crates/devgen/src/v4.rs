@@ -109,6 +109,10 @@ pub(crate) fn declare_v4(b: &mut Builder, c: &V4Cfg, ctx: u32) -> V4Tn {
     let hd = c.head_dim as u64;
 
     let ids = b.tensor("in.ids", ctx as u64 * I32);
+    // `in.kvlen` is what makes this a MODEL rather than a block asset: the
+    // runtime's token-level entry points look for it by name and refuse the
+    // blob outright when it is absent. Sized `batch * 4`, batch 1 here.
+    b.tensor("in.kvlen", I32);
     let pos = b.tensor("in.pos", ctx as u64 * I32);
     let cos = b.tensor("in.cos", ctx as u64 * (hd / 2) * F32);
     let sin = b.tensor("in.sin", ctx as u64 * (hd / 2) * F32);
@@ -232,6 +236,35 @@ fn emit_hc_expand(
 /// suffix or an `attn` vs `self_attn` prefix wrong here is a load failure, not
 /// a wrong number.
 #[allow(clippy::too_many_arguments)]
+/// A plain bf16 GEMV.
+///
+/// NOT every V4 projection is quantized, and assuming so is a load failure at
+/// best: `compressor.wkv` / `compressor.wgate` ship BF16 in the released
+/// checkpoint, so the fp8 path declared half the bytes they occupy and invented
+/// a `.scale` twin that does not exist.
+#[allow(clippy::too_many_arguments)]
+fn emit_bf16_gemv(
+    b: &mut Builder,
+    name: &str,
+    out: u32,
+    x: u32,
+    n: u32,
+    k: u32,
+    n_cu: u32,
+    deps: &[u32],
+) -> u32 {
+    let w = b.tensor(&format!("{name}.weight"), n as u64 * k as u64 * BF16);
+    let all: Vec<u32> = (0..n_cu).collect();
+    b.emit(DevOp::Gemv, all, deps, |d| {
+        d.t[0] = out;
+        d.t[1] = x;
+        d.t[2] = w;
+        d.i[0] = 1;
+        d.i[1] = n;
+        d.i[2] = k;
+    })
+}
+
 fn emit_fp8_gemv(
     b: &mut Builder,
     name: &str,
@@ -382,7 +415,7 @@ fn emit_v4_attn(
         let w = coff * hd;
         let ckv = b.tensor(&format!("act.ckv.{l}"), w as u64 * F32);
         let cgt = b.tensor(&format!("act.cgate.{l}"), w as u64 * F32);
-        let g1 = emit_fp8_gemv(
+        let g1 = emit_bf16_gemv(
             b,
             &format!("{p}.attn.compressor.wkv"),
             ckv,
@@ -392,7 +425,7 @@ fn emit_v4_attn(
             n_cu,
             &[nrm],
         );
-        let g2 = emit_fp8_gemv(
+        let g2 = emit_bf16_gemv(
             b,
             &format!("{p}.attn.compressor.wgate"),
             cgt,
@@ -737,8 +770,12 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     // prefix is ours to choose, the suffix is not. Named anything else they
     // classify as checkpoint weights and the load dies looking for a tensor no
     // checkpoint contains.
-    let ewt = b.tensor(&format!("layers.{l}.mlp.expert_weight_table"), 8 * e as u64);
-    let est = b.tensor(&format!("layers.{l}.mlp.expert_scale_table"), 8 * e as u64);
+    // [E][3] u64 device addresses — gate, up, down per expert, in that slot
+    // order. One handle per expert is not enough: the arms index
+    // `expert_weight_table[eid * 3 + j]`.
+    let tbl = 3 * 8 * e as u64;
+    let ewt = b.tensor(&format!("layers.{l}.mlp.expert_weight_table"), tbl);
+    let est = b.tensor(&format!("layers.{l}.mlp.expert_scale_table"), tbl);
     // ONE PACKET PAIR PER SLOT, and the slot index is what makes them different
     // work: `i[0]` tells the arm which of the k table entries to stream. A
     // single pair with `i[0]` left at zero runs the top-1 expert k times over
@@ -1011,8 +1048,12 @@ mod tests {
                 HeadNormRope, // q path
                 GemvFp8Blk,
                 HeadNormRope, // kv + ring write
-                GemvFp8Blk,
-                GemvFp8Blk,
+                // BF16, not block-fp8. This pair read `GemvFp8Blk` until the
+                // load proved otherwise — `compressor.wkv.weight` is 8388608 B
+                // on disk against the 4194304 B the fp8 path declared — so the
+                // sequence was pinning a defect rather than the model.
+                Gemv,
+                Gemv,
                 V4KvCompress, // compressor
                 GemvFp8Blk,
                 V4IndexScore,

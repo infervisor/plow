@@ -828,7 +828,16 @@ ROWS=(
   "interp_decode|$AX_DECODE"
   "interp_flash|$AX_FLASH"
   "interp_prefill_fp8|$AX_PREFILL $AX_FP8"
+  # The prefill twin of interp_decode_fp8_k3 — same reason, same axis. V4
+  # has no prefill buckets yet, so its prompt walks the decode program; the
+  # object is still selected and loaded, so it still has to exist.
+  "interp_prefill_fp8_k3|$AX_PREFILL $AX_FP8 $AX_K3"
   "interp_decode_fp8|$AX_DECODE $AX_FP8"
+  # DeepSeek-V4: block-fp8 projections (so the fp8 variant) with a bf16 KV
+  # cache (so NOT fp8kv) and the V4 ops, which live inside the PLOW_K3
+  # region. That combination had no row, so the load asked for an object
+  # built without the region and every V4 op would have silently NOPed.
+  "interp_decode_fp8_k3|$AX_DECODE $AX_FP8 $AX_K3 $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_K3_DECODE_XR_AGG $AX_K3_MOE_GROUP_INLINE $AX_K3_KDA_CONV_STEP_DB"
   "interp_prefill_fp8kv|$AX_PREFILL $AX_FP8 $AX_FP8KV"
   "interp_decode_fp8kv|$AX_DECODE $AX_FP8 $AX_FP8KV"
   "interp_flash_fp8kv|$AX_FLASH $AX_FP8KV -DPLOW_K3=1"
