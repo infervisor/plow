@@ -1247,7 +1247,17 @@ pub(crate) fn v4_emit_full(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, 
     }
     let mut b = Builder::new(n_cu);
     let tn = declare_v4(&mut b, &c, ctx);
-    emit_v4_decode(&mut b, &c, &tn, ctx, n_cu);
+    // EXPERIMENT: the width every packet is emitted at, independent of the
+    // device's CU count. Every packet in this emitter takes all 304, so every
+    // dispatch waits on 304 counters; GLM and K3 use narrower per-op sets and do
+    // not pay a ~50 us floor on this same interpreter. If the floor is counter
+    // sync rather than a fixed cost, this dial moves it.
+    let ecu = std::env::var("PLOW_V4_NCU")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.clamp(1, n_cu))
+        .unwrap_or(n_cu);
+    emit_v4_decode(&mut b, &c, &tn, ctx, ecu);
     let prog = b.finish();
 
     eprintln!(
