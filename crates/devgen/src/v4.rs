@@ -604,6 +604,27 @@ fn emit_v4_attn(
         &format!("{p}.attn.wo_a.weight"),
         (og * orank) as u64 * (nh * hd / og) as u64,
     );
+    // TIMING PROBE. Replaces wo_a with a zero-fill of the same buffer so the
+    // program keeps its shape and the difference is that ONE op's cost. The
+    // attention chain's 35 ms is flat in context and concentrated in one or two
+    // packets; this is how each candidate gets timed.
+    if std::env::var("PLOW_V4_SKIP").as_deref() == Ok("woa") {
+        let z = b.emit(DevOp::V4HcZero, all.clone(), &[inv], |d| {
+            d.t[0] = ob;
+            d.i[0] = og * orank;
+        });
+        let wob = emit_fp8_gemv(
+            b,
+            &format!("{p}.attn.wo_b"),
+            tn.xr,
+            ob,
+            h,
+            og * orank,
+            n_cu,
+            &[z],
+        );
+        return emit_hc_expand(b, c, tn, tn.xr, n_cu, &[wob]);
+    }
     let gl = b.emit(DevOp::V4GroupedLinear, all, &[inv], |d| {
         d.t[0] = ob;
         d.t[1] = tn.attn_out;

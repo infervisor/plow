@@ -748,15 +748,28 @@ __device__ void d_v4_kv_compress(bf16* __restrict__ out, const bf16* __restrict_
 __device__ void d_v4_grouped_linear(bf16* __restrict__ out, const bf16* __restrict__ o,
                                     const bf16* __restrict__ w, unsigned T, unsigned GRP,
                                     unsigned R, unsigned WIDTH, unsigned slice, unsigned nblk) {
-    for (unsigned t = slice; t < T; t += nblk)
-        for (unsigned i = threadIdx.x; i < GRP * R; i += PLOW_THREADS) {
-            const unsigned g = i / R, r = i % R;
-            const bf16* orow = o + (size_t)t * GRP * WIDTH + (size_t)g * WIDTH;
-            const bf16* wrow = w + ((size_t)g * R + r) * WIDTH;
-            float acc = 0.0f;
-            for (unsigned k = 0; k < WIDTH; k++) acc += bf2f(orow[k]) * bf2f(wrow[k]);
-            st_act1(&out[(size_t)t * GRP * R + i], f2bf(acc));
-        }
+    /* GRID-STRIDED OVER (token, output), not over tokens. The token loop left
+     * every output of a DECODE step — T = 1 — on block 0, so 303 of 304 CUs sat
+     * idle while one workgroup's 256 threads each walked 32 outputs x WIDTH
+     * serially. Measured: 33.9 ms of a 35.4 ms attention chain, 96% of the whole
+     * decode step, on a projection that moves 64 MiB.
+     *
+     * This is the THIRD op in this file written with a token-parallel outer loop
+     * (see `d_hc_reduce` and `d_hc_expand`, whose comment already says the same
+     * thing twice). A T=1 decode makes that shape a single-CU kernel every
+     * time. */
+    const size_t work = (size_t)T * GRP * R;
+    for (size_t x = (size_t)slice * PLOW_THREADS + threadIdx.x; x < work;
+         x += (size_t)nblk * PLOW_THREADS) {
+        const unsigned t = (unsigned)(x / (GRP * R));
+        const unsigned i = (unsigned)(x - (size_t)t * GRP * R);
+        const unsigned g = i / R, r = i % R;
+        const bf16* orow = o + (size_t)t * GRP * WIDTH + (size_t)g * WIDTH;
+        const bf16* wrow = w + ((size_t)g * R + r) * WIDTH;
+        float acc = 0.0f;
+        for (unsigned k = 0; k < WIDTH; k++) acc += bf2f(orow[k]) * bf2f(wrow[k]);
+        st_act1(&out[(size_t)t * GRP * R + i], f2bf(acc));
+    }
 }
 
 /* ---------------------------------------------------------------------------
