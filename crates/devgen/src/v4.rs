@@ -289,6 +289,15 @@ fn emit_fp8_gemv(
         n.div_ceil(128) as u64 * k.div_ceil(128) as u64 * F32,
     );
     let all: Vec<u32> = (0..n_cu).collect();
+    // TIMING PROBE: replace every block-fp8 GEMV with a zero-fill of its output
+    // so the program keeps its shape and the difference is what the four GEMVs
+    // in a layer actually cost. Same technique that found wo_a.
+    if std::env::var("PLOW_V4_SKIP").as_deref() == Ok("gemv") {
+        return b.emit(DevOp::V4HcZero, all, deps, |d| {
+            d.t[0] = out;
+            d.i[0] = n.div_ceil(2); // bf16 out, f32 writes
+        });
+    }
     b.emit(DevOp::GemvFp8Blk, all, deps, |d| {
         d.t[0] = out;
         d.t[1] = x;
