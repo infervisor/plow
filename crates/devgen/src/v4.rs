@@ -989,6 +989,51 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     };
     let enc = 2u32; // PLOW_MOE_ENC_MXFP4
     let v4_clamp = 3u32; // PLOW_MOE_ACT_V4CLAMP
+    // GROUPED, not per-slot: ops 48/49 stream all k slots in ONE packet pair
+    // instead of 2k. At a ~50-100 us dispatch floor the packet COUNT is the
+    // cost, not the arithmetic — 12 packets measured 0.615 ms while moving 50
+    // MiB, which is 50x its byte time. K3 already emits this path; V4 chose the
+    // per-slot arms and paid 10 extra dispatches a layer for it.
+    //
+    // Same operands, same encoding, same clamped-SwiGLU epilogue. The slot index
+    // becomes `i[0] = k` (a COUNT here, not an index).
+    if !v4_skip("perslot") {
+        let g = b.emit(DevOp::MoeGroupGluFp8Blk, all.clone(), &[rt], |d| {
+            d.t[0] = fu;
+            d.t[1] = tn.xn;
+            d.t[2] = tab;
+            d.t[3] = ewt;
+            d.t[4] = est;
+            d.i[0] = k;
+            d.i[1] = imoe;
+            d.i[2] = h;
+            d.i[3] = e;
+            d.i[5] = 3; // PLOW_MOE_ACT_V4CLAMP
+            d.i[MOE_ENC_SLOT] = 2; // PLOW_MOE_ENC_MXFP4
+            d.f[0] = c.swiglu_limit as f32;
+        });
+        let dn = b.emit(DevOp::MoeGroupDownFp8Blk, all.clone(), &[g], |d| {
+            d.t[0] = part;
+            d.t[1] = fu;
+            d.t[2] = tab;
+            d.t[3] = ewt;
+            d.t[4] = est;
+            d.i[0] = k;
+            d.i[1] = h;
+            d.i[2] = imoe;
+            d.i[3] = e;
+            d.i[MOE_ENC_SLOT] = 2;
+        });
+        let cmb = b.emit(DevOp::MoeCombine, all, &[dn, shdep], |d| {
+            d.t[0] = tn.xr;
+            d.t[1] = tn.xr;
+            d.t[2] = shared;
+            d.t[3] = part;
+            d.i[0] = h;
+            d.i[1] = k;
+        });
+        return emit_hc_expand(b, c, tn, tn.xr, n_cu, &[cmb]);
+    }
     let mut downs: Vec<u32> = Vec::with_capacity(k as usize);
     // TIMING PROBE: drop all 2k routed-expert packets and hand the combine a
     // zeroed partial buffer instead. The difference is what the routed experts
@@ -1548,23 +1593,20 @@ mod tests {
         let k = c.top_k;
 
         for (op, what) in [
-            (DevOp::MoeExpertGluFp8Blk, "gate/up"),
-            (DevOp::MoeExpertDownFp8Blk, "down"),
+            (DevOp::MoeGroupGluFp8Blk, "gate/up"),
+            (DevOp::MoeGroupDownFp8Blk, "down"),
         ] {
             let ins: Vec<_> = p.insts.iter().filter(|i| i.op == op as u16).collect();
-            assert_eq!(
-                ins.len() as u32,
-                k * c.layers,
-                "{what}: one packet per slot per layer"
-            );
-            // The k slots of one layer must be 0..k, not k copies of slot 0.
-            let mut slots: Vec<u32> = ins[..k as usize].iter().map(|i| i.i[0]).collect();
-            slots.sort_unstable();
-            assert_eq!(
-                slots,
-                (0..k).collect::<Vec<_>>(),
-                "{what}: layer 0 must stream every routed slot exactly once"
-            );
+            // GROUPED: ONE packet per layer streaming all k slots, not k
+            // packets. The per-slot form cost 10 extra dispatches a layer at a
+            // ~55 us floor; see the packet-count note in `emit_v4_ffn`.
+            assert_eq!(ins.len() as u32, c.layers, "{what}: one grouped packet per layer");
+            // `i[0]` is the slot COUNT on the grouped arms, not an index — the
+            // defect this test was written for (every packet streaming slot 0)
+            // becomes "the count is wrong" here.
+            for i in &ins {
+                assert_eq!(i.i[0], k, "{what}: must stream all k routed slots");
+            }
             for i in &ins {
                 assert_eq!(
                     i.i[MOE_ENC_SLOT], 2,
@@ -1578,7 +1620,7 @@ mod tests {
         let glu = p
             .insts
             .iter()
-            .find(|i| i.op == DevOp::MoeExpertGluFp8Blk as u16)
+            .find(|i| i.op == DevOp::MoeGroupGluFp8Blk as u16)
             .expect("a routed gate/up packet");
         assert_eq!(glu.i[5], 3, "PLOW_MOE_ACT_V4CLAMP");
         assert_eq!(glu.f[0], c.swiglu_limit as f32);
