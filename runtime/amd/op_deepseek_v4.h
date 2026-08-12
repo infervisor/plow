@@ -1235,6 +1235,24 @@ __device__ void d_v4_hc_zero(float* __restrict__ partial, unsigned n, unsigned s
         partial[i] = 0.0f;
 }
 
+/* Replicate `src[t]` into every hyper-connection stream of `x[t]`.
+ *
+ * The alternative — leaving streams 1..HC-1 at whatever the allocator last held
+ * — is not "approximately right at layer 0": `d_hc_reduce` reads all HC streams
+ * on the first reduce, so uninitialised memory enters the Sinkhorn mix and then
+ * every layer after it. */
+__device__ void d_v4_hc_broadcast(bf16* __restrict__ x, const bf16* __restrict__ src, unsigned T,
+                                  unsigned D, unsigned HC, unsigned slice, unsigned nblk) {
+    const size_t work = (size_t)T * D;
+    for (size_t w = (size_t)slice * PLOW_THREADS + threadIdx.x; w < work;
+         w += (size_t)nblk * PLOW_THREADS) {
+        const unsigned t = (unsigned)(w / D), d = (unsigned)(w - (size_t)t * D);
+        const bf16 v = src[(size_t)t * D + d];
+        bf16* xt = x + (size_t)t * HC * D;
+        for (unsigned k = 0; k < HC; k++) st_act1(&xt[(size_t)k * D + d], v);
+    }
+}
+
 __device__ void d_v4_hc_dot(float* __restrict__ partial, const bf16* __restrict__ x,
                             const float* __restrict__ hc_fn, unsigned T, unsigned D, unsigned HC,
                             unsigned slice, unsigned nblk, float* __restrict__ lds) {

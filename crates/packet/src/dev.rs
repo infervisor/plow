@@ -1484,6 +1484,14 @@ pub enum DevOp {
     ///
     /// `t0=partial([n] f32)` · `i0=n`.
     V4HcZero = 133,
+    /// **Broadcast the embedding across the hyper-connection streams.**
+    ///
+    /// `Embed` writes ONE `[D]` hidden vector; V4's residual state is `[hc, D]`
+    /// parallel streams. Writing only stream 0 leaves 1..hc-1 uninitialised, and
+    /// the first reduce in layer 0 mixes that memory into everything downstream.
+    ///
+    /// `t0=x([T,hc,D] bf16) t1=src([T,D] bf16)` · `i0=T i1=D i2=hc`.
+    V4HcBroadcast = 134,
 }
 
 impl DevOp {
@@ -1627,6 +1635,7 @@ impl DevOp {
         DevOp::V4HcDot,
         DevOp::V4HcMix,
         DevOp::V4HcZero,
+        DevOp::V4HcBroadcast,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1781,6 +1790,7 @@ impl DevOp {
             DevOp::V4HcDot => "PLOW_DOP_V4_HC_DOT",
             DevOp::V4HcMix => "PLOW_DOP_V4_HC_MIX",
             DevOp::V4HcZero => "PLOW_DOP_V4_HC_ZERO",
+            DevOp::V4HcBroadcast => "PLOW_DOP_V4_HC_BROADCAST",
         }
     }
 
@@ -1812,7 +1822,7 @@ impl DevOp {
     /// 116 -> 117 for `XReduceAddNorm = 116` (the fused TP seam).
     /// 121 -> 131 for the ten DeepSeek-V4 opcodes (121..=130).
     /// 131 -> 133 for the split hyper-connection reduce (131..=132).
-    pub const COUNT: u16 = 134;
+    pub const COUNT: u16 = 135;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

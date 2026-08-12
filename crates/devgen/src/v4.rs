@@ -899,7 +899,18 @@ pub(crate) fn emit_v4_decode(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, ctx: u32, n_
         d.f[0] = 1.0;
     });
 
-    let mut dep = emb;
+    // `Embed` wrote ONE [D] vector; the residual state is [hc, D]. Without this
+    // the first reduce in layer 0 mixes uninitialised memory into every layer
+    // after it — which is what a 43-layer program returning byte-identical
+    // output to a 0-layer one looks like from the outside.
+    let bc = b.emit(DevOp::V4HcBroadcast, all.clone(), &[emb], |d| {
+        d.t[0] = tn.x;
+        d.t[1] = tn.x;
+        d.i[0] = 1;
+        d.i[1] = h;
+        d.i[2] = c.hc_mult;
+    });
+    let mut dep = bc;
     for l in 0..c.layers {
         dep = emit_v4_layer(b, c, tn, l, ctx, n_cu, &[dep]);
     }

@@ -1046,6 +1046,8 @@ enum {
     /* Zero a hyper-connection partial so V4_HC_DOT can accumulate into it
      * with atomics. t0=partial i0=n. */
     PLOW_DOP_V4_HC_ZERO = 133,
+    /* Broadcast [T,D] into the [T,hc,D] streams. t0=x t1=src i0=T i1=D i2=hc. */
+    PLOW_DOP_V4_HC_BROADCAST = 134,
 
     PLOW_DOP__COUNT
 };

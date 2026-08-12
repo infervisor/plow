@@ -2046,6 +2046,10 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                            (const long long*)TEN(4), (const int*)TEN(5), in->i[0], in->i[1],
                            in->i[2], in->fj[0].f, slice, nblk, (float*)sm->raw);
             break;
+        case PLOW_DOP_V4_HC_BROADCAST: /* t0=x t1=src; i0=T i1=D i2=hc */
+            d_v4_hc_broadcast((bf16*)TEN(0), (const bf16*)TEN(1), in->i[0], in->i[1], in->i[2],
+                              slice, nblk);
+            break;
         case PLOW_DOP_V4_HC_ZERO: /* t0=partial; i0=n */
             d_v4_hc_zero((float*)TEN(0), in->i[0], slice, nblk);
             break;
