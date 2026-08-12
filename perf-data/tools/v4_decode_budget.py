@@ -11,7 +11,7 @@ import json, os, re, struct, collections
 
 DIR = '/home/lava/models/DeepSeek-V4-Flash-0731'
 BW = 4164e9          # measured, registry
-TARGET_TOKS = 150.0
+TARGET_TOKS = 200.0
 CTX = 16384
 
 cfg = json.load(open(os.path.join(DIR, 'config.json')))

@@ -1741,6 +1741,21 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                      (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
                                      in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
                                      in->i[4], slice, nblk, in->i[6]);
+            /* HD=512 INTERLEAVED is DeepSeek-V4: one KV head of 512 lanes whose
+             * LAST `qk_rope_head_dim`=64 carry RoPE, paired (x[0],x[1]) as
+             * `view_as_complex` does. Same trick the DSA indexer uses at HD=128,
+             * mirrored: an identity PREFIX in the cos/sin table (cos=1, sin=0 for
+             * the 224 leading pairs) leaves the content lanes alone, and negating
+             * `sin` gives the conjugate rotation V4 applies to the attention
+             * OUTPUT. So V4 needs no rope kernel of its own — only this arm, and
+             * a table the emitter builds. `gamma == NONE` is its weightless
+             * per-head query rescale. */
+            else if (in->i[2] == 512 && in->i[5] == 1)
+                d_headnorm_rope<512, /*INTERLEAVE=*/true>(
+                                     (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                     (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
+                                     in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
+                                     in->i[4], slice, nblk, in->i[6]);
             else if (in->i[2] == 512)
                 d_headnorm_rope<512>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                      (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),

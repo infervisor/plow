@@ -284,10 +284,21 @@ __device__ __forceinline__ void st_glob8(PLOW_GLOB bf16* p, bf16v8 v) {
 /* One activation half. This is the ragged tail every op writes when its width is not a multiple
  * of 8; under the default it is exactly `*p = v` and the emitted code is unchanged. */
 __device__ __forceinline__ void st_act1(bf16* p, bf16 v) { st_act<bf16>(p, v); }
+/* The address-space-1 twin, mirroring `st_glob8`'s pair. `d_headnorm_rope`
+ * stores through an `as_glob` pointer, so any translation unit that instantiates
+ * it needs this overload — which no unit did until a .hip test included
+ * `op_norm.h` directly (the interpreter is built `--genco`, device-only, and the
+ * generic overload satisfied it there). */
+__device__ __forceinline__ void st_act1(PLOW_GLOB bf16* p, bf16 v) {
+    *p = v;
+}
 
 /* The fp8 tail. `d_headnorm_rope_fp8` writes the KV cache one BYTE at a time when the head
  * width is ragged; that store is an activation publish exactly like the bf16 ones, and leaving
  * it plain is enough on its own to reinstate the race PLOW_GATE_SC1 exists to remove. */
+__device__ __forceinline__ void st_act1_u8(PLOW_GLOB unsigned char* p, unsigned char v) {
+    *p = v;
+}
 __device__ __forceinline__ void st_act1_u8(unsigned char* p, unsigned char v) {
     st_act<unsigned char>(p, v);
 }
