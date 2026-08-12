@@ -667,7 +667,12 @@ fn emit_v4_shared_expert(
             d.t[0] = out;
             d.t[1] = src;
             d.t[2] = w;
-            d.t[3] = s;
+            // t5, NOT t3. `interp.hip`'s arm reads `(const float*)TEN(5)`; with
+            // the scale in t3 the kernel dereferenced an UNSET t5 — a null
+            // pointer straight into an aperture violation on the first decode
+            // step. `emit_fp8_gemv` had it right and this one did not, which is
+            // exactly why the slot is now written the same way in both.
+            d.t[5] = s;
             d.i[0] = 1;
             d.i[1] = n;
             d.i[2] = kk;
@@ -957,7 +962,17 @@ pub(crate) fn v4_emit_full(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, 
          selection is a collective. Emitting per-rank selections would let ranks decode different \
          tokens — refused rather than approximated."
     );
-    let c = cfg_deepseek_v4(dir);
+    let mut c = cfg_deepseek_v4(dir);
+    // DEBUG BISECT. A decode program that faults on the GPU gives no packet
+    // index back — the AMD dispatch is a persistent counter-DAG interpreter, so
+    // "which op" is not in the error. Truncating the layer count and re-running
+    // is the probe that answers it, and it is here rather than in a scratch
+    // branch because the alternative is guessing (which has already cost this
+    // bring-up five wrong hypotheses).
+    if let Some(n) = std::env::var("PLOW_V4_LAYERS").ok().and_then(|v| v.parse::<u32>().ok()) {
+        c.layers = c.layers.min(n);
+        eprintln!("deepseek_v4: PLOW_V4_LAYERS={n} — TRUNCATED, not the real model");
+    }
     let mut b = Builder::new(n_cu);
     let tn = declare_v4(&mut b, &c, ctx);
     emit_v4_decode(&mut b, &c, &tn, ctx, n_cu);
@@ -1338,6 +1353,38 @@ mod tests {
             .collect();
         assert_eq!(cmb.len() as u32, c.layers, "one combine per layer");
         assert_eq!(cmb[0].i[1], k, "the combine must fold ALL k partials");
+    }
+
+    /// EVERY block-fp8 GEMV must carry its scale in t5.
+    ///
+    /// `interp.hip` reads `(const float*)TEN(5)` on op 44. A scale written to
+    /// any other slot leaves t5 UNSET, and the kernel then dereferences a null
+    /// pointer — which is not a wrong number but an
+    /// HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION on the first decode step.
+    /// That is exactly what the shared expert did: it declared the right
+    /// tensor, bound it, and put it one slot away from where it is read.
+    #[test]
+    fn every_block_fp8_gemv_carries_its_scale_in_t5() {
+        let c = cfg_deepseek_v4_for_test();
+        let mut b = Builder::new(8);
+        let tn = declare_v4(&mut b, &c, 16384);
+        emit_v4_decode(&mut b, &c, &tn, 16384, 8);
+        let p = b.finish();
+        let n = packet::dev::TENSOR_NONE;
+        let mut seen = 0;
+        for i in p.insts.iter().filter(|i| i.op == DevOp::GemvFp8Blk as u16) {
+            seen += 1;
+            assert!(
+                i.t[5] != n,
+                "a block-fp8 GEMV with no scale in t5 faults rather than mis-computes"
+            );
+        }
+        // Per layer: wq_a, wq_b, wkv, wo_b, gate, and the shared expert's three.
+        assert!(
+            seen >= c.layers as usize * 5,
+            "expected at least 5 block-fp8 GEMVs per layer, saw {seen} over {} layers",
+            c.layers
+        );
     }
 
     /// The expand reads `x` and writes `x`. That aliasing is deliberate and
