@@ -315,7 +315,20 @@ fn emit_fp8_gemv(
         &format!("{name}.scale"),
         n.div_ceil(128) as u64 * k.div_ceil(128) as u64 * F32,
     );
-    let all: Vec<u32> = (0..n_cu).collect();
+    // OVERLAP PROBE, same mechanism as PLOW_V4_SPLITCU in the FFN: the q path
+    // (wq_a -> q_norm -> wq_b) and the kv path (wkv) both gate on attn_norm and
+    // neither reads the other, but both are emitted on every CU so the counter
+    // DAG runs them back to back. wkv is 2 MiB against wq_b's 33, so the kv path
+    // gets the small slice.
+    let split = std::env::var("PLOW_V4_SPLITCU")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|v| v.clamp(1, n_cu - 1));
+    let all: Vec<u32> = match split {
+        Some(k) if name.ends_with(".attn.wkv") => (n_cu - k..n_cu).collect(),
+        Some(k) if name.contains(".attn.wq_") => (0..n_cu - k).collect(),
+        _ => (0..n_cu).collect(),
+    };
     // TIMING PROBE: replace every block-fp8 GEMV with a zero-fill of its output
     // so the program keeps its shape and the difference is what the four GEMVs
     // in a layer actually cost. Same technique that found wo_a.
