@@ -152,7 +152,7 @@ pub struct PeerLayout {
 ///
 /// Reusing slot 0 or 1 instead is not available: the one-shot's gate says every peer
 /// ARRIVED, not that every peer finished READING, so a slot may only be overwritten
-/// after an intervening collective (`perf-data/kimi-k3-tp-peer-slots.md`). The up
+/// after an intervening collective (`perf-data/archive/k3/kimi-k3-tp-peer-slots.md`). The up
 /// projection sits between the expert-combine reduce (slot 1) and the shared-expert
 /// reduce (slot 0) with no collective of its own to hide behind.
 ///

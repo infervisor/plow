@@ -1,6 +1,6 @@
 # Kimi-K3 decode: folding the narrow `b=1` gates into their wide consumers
 
-Follows `perf-data/k3-decode-counter-graph.md`, whose recommendation 2 was:
+Follows `perf-data/archive/k3/k3-decode-counter-graph.md`, whose recommendation 2 was:
 
 > **Fuse the narrow gates into their consumers.** `AttnRes`/`RmsNorm`/`MoeRouterTopk` at `b=1` in
 > front of `b=256` consumers are 19% of counter traffic AND they lengthen the chain by one level
@@ -115,7 +115,7 @@ same count. Poll traffic is a property of the CONSUMER's width and of how many e
 this fusion changes neither.
 
 So the lever is the chain level, at ~5.7 us of measured per-packet protocol cost, and it should be
-argued for on that basis alone. `perf-data/k3-decode-counter-graph.md` §"Free wins" recommendation
+argued for on that basis alone. `perf-data/archive/k3/k3-decode-counter-graph.md` §"Free wins" recommendation
 1 (transitive reduction) has since landed — the emitter now reports `69 ... 207 wait entries
 removed` at emit time and the disassembler finds 0 remaining redundant edges.
 

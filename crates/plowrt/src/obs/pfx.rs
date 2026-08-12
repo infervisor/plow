@@ -3,7 +3,7 @@
 //! The prefix cache removes prefill tokens and adds a device-to-device copy of one slot's carried
 //! recurrent state (MEASURED: 56 MiB, 276 tensors, per rank). On the batched benchmark it removed
 //! 75% of prefill tokens for +7.1% throughput, and the gap between those two numbers was INFERRED
-//! to be this copy — which is exactly the kind of inference `perf-data/k3-hier2-ceiling.md` §4
+//! to be this copy — which is exactly the kind of inference `perf-data/archive/k3/k3-hier2-ceiling.md` §4
 //! says to replace with a measurement before optimising against it. This is that measurement.
 //!
 //! `PLOW_PFX_LOG=1` prints the totals at exit.

@@ -87,7 +87,7 @@
 //! the refusal keyed on the carrier in `AmdEngine::load` is what tells them apart.
 //! What remains genuinely absent on this backend is chunked/interleaved prefill,
 //! VMM on TP, and prefix sharing; see
-//! `perf-data/k3-throughput-architecture-review.md`.
+//! `perf-data/archive/k3/k3-throughput-architecture-review.md`.
 //!
 //! # Measured: the concurrency axis (Gemma-4 31B, one MI355X, ctx 1024)
 //!

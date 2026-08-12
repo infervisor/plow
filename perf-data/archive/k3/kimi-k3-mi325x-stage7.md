@@ -53,7 +53,7 @@ record makes no vLLM performance claim.
 The B8 capacity and concurrent 16k/32k context gates now pass. Three identical
 vLLM 0.26.0 `bench serve` runs against `plowrt serve` measured
 50.604--50.787 aggregate output tok/s with 32/32 requests and 4,096/4,096
-generated tokens per run. See `perf-data/kimi-k3-mi325x-b8-serve.md`.
+generated tokens per run. See `perf-data/archive/k3/kimi-k3-mi325x-b8-serve.md`.
 
 This removes the capacity/context blocker. Stage 7 still requires B8 GSM8K,
 state-reuse/ragged correctness, and the same-box vLLM serving-engine comparator.
@@ -62,7 +62,7 @@ Audit correction: the original B8 path performed full-vector rank agreement
 but skipped the requested compact cross-GPU counter audit. Commit `45851e1e`
 fixed the runtime path. Three corrected serving runs measure
 50.008--50.116 output tok/s with a 50.082 tok/s median and exact output/error
-gates; see `perf-data/kimi-k3-mi325x-b8-serve.md`.
+gates; see `perf-data/archive/k3/kimi-k3-mi325x-b8-serve.md`.
 
 The official K3 recipe now exists at
 `https://recipes.vllm.ai/moonshotai/Kimi-K3?hardware=mi325x`. It requires a

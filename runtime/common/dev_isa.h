@@ -770,7 +770,7 @@ enum {
      * separately. `nb = 0` degenerates to an exact copy (softmax over one element).
      * One WORKGROUP per token, because both reductions span the full row and the softmax couples
      * the rows: blocks = min(T, ncu). At T=1 that is 1 of 256 and it is a known perf gap, recorded
-     * in op_k3.h rather than hidden; §10 item 7 of perf-data/kimi-k3-kernel-gap.md requires this to
+     * in op_k3.h rather than hidden; §10 item 7 of perf-data/archive/k3/kimi-k3-kernel-gap.md requires this to
      * stay ONE packet, which rules out splitting the reduction across blocks.
      * t0=out([T,H] bf16) t1=prefix_sum([T,H] bf16) t2=block_residual([T,nb,H] bf16)
      * t3=score_w([H] f32)   i0=T i1=H i2=nb   f0=eps */

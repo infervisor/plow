@@ -65,7 +65,7 @@ enum {
      *
      * So the distinction is carried explicitly. Clear (every program that exists today) makes the
      * per-row state stride 0, the state pointer does not move, and the emitted code is unchanged.
-     * See perf-data/k3-batched-decode-design.md §1. */
+     * See perf-data/archive/k3/k3-batched-decode-design.md §1. */
     PLOW_KDA_F_SEQ_ROWS = 2u,
 };
 
@@ -485,7 +485,7 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                  * It is `H*D*D` for a BATCHED DECODE program, where the rows are B INDEPENDENT
                  * sequences and sharing a state would run sequence 1's token into sequence 0's.
                  * That distinction is invisible in `T` alone, which is why it is its own
-                 * parameter and not inferred (see perf-data/k3-batched-decode-design.md §1). */
+                 * parameter and not inferred (see perf-data/archive/k3/k3-batched-decode-design.md §1). */
                 float* col = st_h + (size_t)t * bstride + (size_t)j * D; /* V-FIRST: [v][k] */
 
                 /* decay, in registers: S' = exp(g) * S */

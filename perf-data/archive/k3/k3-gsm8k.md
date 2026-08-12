@@ -111,7 +111,7 @@ this file does not yet distinguish them:
 
 1. The 07-30 baseline ran on a different tree state and different assets. Plausible and boring.
 2. There is genuine run-to-run nondeterminism. This is NOT speculation: §9 of
-   `perf-data/k3-batched-decode-design.md` records a MEASURED cross-rank divergence in the
+   `perf-data/archive/k3/k3-batched-decode-design.md` records a MEASURED cross-rank divergence in the
    `d_xargmax_fin_mega` fold — a race that changes a sampled token. A race that changes tokens
    changes accuracy, and it would make greedy runs non-reproducible by construction.
 
@@ -167,7 +167,7 @@ Worth stating plainly, because the earlier sections argued the opposite:
 ## 2.4 The 4 errors are one fault, not four
 
 All four failures are a single cross-rank divergence in one decode step
-(`perf-data/k3-batched-decode-design.md` §9). At B>1 every in-flight request shares the step, so
+(`perf-data/archive/k3/k3-batched-decode-design.md` §9). At B>1 every in-flight request shares the step, so
 one bad step fails the whole batch — which is why they arrive as a burst of exactly B. Both CONC=1
 runs had **zero** errors and zero divergences over 200 sequential requests each, which is
 consistent with the race needing concurrent slot occupancy to show up, but 2 runs is not evidence
@@ -176,6 +176,6 @@ of a rate.
 ## 2.2 The 4 errors are one fault, not four
 
 All four failures are a single cross-rank divergence in one decode step
-(`perf-data/k3-batched-decode-design.md` §9). At B>1 every in-flight request shares the step, so
+(`perf-data/archive/k3/k3-batched-decode-design.md` §9). At B>1 every in-flight request shares the step, so
 one bad step fails the whole batch — which is why they arrive as a burst of exactly B. The B=1
 control had **zero** errors and zero divergences over 200 sequential requests.

@@ -59,7 +59,7 @@ an empty error, no in-band `[error:` text, and prompt+completion below 32,768.
 
 The adopted dead-projection compile arm raises the served median to
 **50.862 tok/s** with exact matched generated text. See
-`perf-data/kimi-k3-mi325x-kernel-capacity.md`.
+`perf-data/archive/k3/kimi-k3-mi325x-kernel-capacity.md`.
 
 ```bash
 nix develop .#vllm --command vllm bench serve \

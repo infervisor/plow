@@ -63,37 +63,37 @@ new implementation hypothesis.
 ### Reproducibility, architecture, and runtime
 
 - [`kimi-k3-README.md`](kimi-k3-README.md) — build, flags, serving, measurement rules.
-- [`k3-batched-decode-design.md`](k3-batched-decode-design.md) — batch/state contract.
-- [`k3-decode-counter-graph.md`](k3-decode-counter-graph.md) — packet/counter graph.
-- [`k3-prefix-cache-design.md`](k3-prefix-cache-design.md) — recurrent-state prefix cache.
-- [`k3-throughput-architecture-review.md`](k3-throughput-architecture-review.md) — runtime review.
+- [`archive/k3/k3-batched-decode-design.md`](archive/k3/k3-batched-decode-design.md) — batch/state contract.
+- [`archive/k3/k3-decode-counter-graph.md`](archive/k3/k3-decode-counter-graph.md) — packet/counter graph.
+- [`archive/k3/k3-prefix-cache-design.md`](archive/k3/k3-prefix-cache-design.md) — recurrent-state prefix cache.
+- [`archive/k3/k3-throughput-architecture-review.md`](archive/k3/k3-throughput-architecture-review.md) — runtime review.
 - [`k3-tp-peer-slots.md`](k3-tp-peer-slots.md) — TP slot-D proposal.
-- [`k3-narrow-gate-fusion.md`](k3-narrow-gate-fusion.md) — adopted fusion rationale.
-- [`k3-prefill-attribution.md`](k3-prefill-attribution.md) — prefill roofline attribution.
-- [`k3-speculative-decoding.md`](k3-speculative-decoding.md) — prior speculation decision.
+- [`archive/k3/k3-narrow-gate-fusion.md`](archive/k3/k3-narrow-gate-fusion.md) — adopted fusion rationale.
+- [`archive/k3/k3-prefill-attribution.md`](archive/k3/k3-prefill-attribution.md) — prefill roofline attribution.
+- [`archive/k3/k3-speculative-decoding.md`](archive/k3/k3-speculative-decoding.md) — prior speculation decision.
 
 ### MI325X B1 and kernel screens
 
 See `kimi-k3-mi325x-b1-*.md` for the complete B1 screen set: 128K serving, ablation census,
 collectives, dense quantization, GEMV cohorts/grids, KDA state/conv/norm, interpreter, MLA KDU,
 MoE grid, router blocks, shared scheduling, and W8A16. The latest MLA split records are
-[`kimi-k3-mi325x-mla-nsplit.md`](kimi-k3-mi325x-mla-nsplit.md) and
-[`kimi-k3-mi325x-mla-nsplit-fine-sweep.md`](kimi-k3-mi325x-mla-nsplit-fine-sweep.md).
+[`archive/k3/kimi-k3-mi325x-mla-nsplit.md`](archive/k3/kimi-k3-mi325x-mla-nsplit.md) and
+[`archive/k3/kimi-k3-mi325x-mla-nsplit-fine-sweep.md`](archive/k3/kimi-k3-mi325x-mla-nsplit-fine-sweep.md).
 
 ### Batched and long-context serving
 
-- `kimi-k3-mi325x-b8-serve.md`, `kimi-k3-mi325x-b8-long-context.md`
-- `kimi-k3-mi325x-b16-mm8-walk.md`, `kimi-k3-mi325x-b32-serve.md`
-- `kimi-k3-mi325x-ladder-130tps.md`, `kimi-k3-mi325x-lowrung-b1.md`
-- `kimi-k3-mi325x-fp8-mla-v2.md`, `kimi-k3-mi325x-state-clear.md`
-- `kimi-k3-mi325x-prefill-experiments.md`, `kimi-k3-mi325x-prefill-interleave.md`
+- `archive/k3/kimi-k3-mi325x-b8-serve.md`, `archive/k3/kimi-k3-mi325x-b8-long-context.md`
+- `archive/k3/kimi-k3-mi325x-b16-mm8-walk.md`, `archive/k3/kimi-k3-mi325x-b32-serve.md`
+- `archive/k3/kimi-k3-mi325x-ladder-130tps.md`, `archive/k3/kimi-k3-mi325x-lowrung-b1.md`
+- `archive/k3/kimi-k3-mi325x-fp8-mla-v2.md`, `archive/k3/kimi-k3-mi325x-state-clear.md`
+- `archive/k3/kimi-k3-mi325x-prefill-experiments.md`, `archive/k3/kimi-k3-mi325x-prefill-interleave.md`
 
 ### Staged MI325X evidence
 
-`kimi-k3-mi325x-stage4.md` through `kimi-k3-mi325x-stage7.md` remain historical stage records;
-they are not independent current baselines. `kimi-k3-mi325x-kernel-audit.md`,
-`kimi-k3-mi325x-kernel-capacity.md`, `kimi-k3-mi325x-cache-policy.md`, and
-`kimi-k3-mi325x-decode-xr-agg.md` contain the corresponding static/resource audits.
+`archive/k3/kimi-k3-mi325x-stage4.md` through `archive/k3/kimi-k3-mi325x-stage7.md` remain historical stage records;
+they are not independent current baselines. `archive/k3/kimi-k3-mi325x-kernel-audit.md`,
+`archive/k3/kimi-k3-mi325x-kernel-capacity.md`, `archive/k3/kimi-k3-mi325x-cache-policy.md`, and
+`archive/k3/kimi-k3-mi325x-decode-xr-agg.md` contain the corresponding static/resource audits.
 
 ### DSpark
 
@@ -105,8 +105,8 @@ These are explicitly experimental and excluded from the production merge.
 
 ### Historical design/reference records
 
-`k3-gsm8k.md`, `k3-hier2-ceiling.md`, `k3-serving-speed.md`, `k3-75tps-program.md`,
-`kimi-k3-kernel-gap.md`, `kimi-k3-atom-reference.md`, and `coldstart-amd-k3-tp8.md` are retained
+`archive/k3/k3-gsm8k.md`, `archive/k3/k3-hier2-ceiling.md`, `archive/k3/k3-serving-speed.md`, `archive/k3/k3-75tps-program.md`,
+`archive/k3/kimi-k3-kernel-gap.md`, `archive/k3/kimi-k3-atom-reference.md`, and `archive/k3/coldstart-amd-k3-tp8.md` are retained
 only when their historical context is needed; their numbers must not be compared with the current
 MI325X B1 baseline.
 

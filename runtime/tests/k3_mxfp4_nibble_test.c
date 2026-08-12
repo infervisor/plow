@@ -1,6 +1,6 @@
 /* k3_mxfp4_nibble_test.c — which nibble holds element 2i? One GEMV, one real K3 expert tensor.
  *                                                                                  [K3-MXFP4]
- * `perf-data/kimi-k3-kernel-gap.md` §4c is explicit that this is the ONE mxfp4 fact the checkpoint
+ * `perf-data/archive/k3/kimi-k3-kernel-gap.md` §4c is explicit that this is the ONE mxfp4 fact the checkpoint
  * bytes cannot settle: a nibble swap permutes elements within a byte and leaves every per-block
  * multiset — and therefore every histogram — unchanged. It is also explicit about the cost of
  * being wrong: "every mxfp4 number is garbage in a way that looks like 'the model is just bad'".

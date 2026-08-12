@@ -979,7 +979,7 @@ pub enum DevOp {
     ///
     /// Slice map, honestly: **one workgroup per token**, `blocks = min(T, ncu)`, because both
     /// reductions span the full 7168-wide row and the softmax couples the rows. At `T = 1` that
-    /// is 1 of 256 CUs. `perf-data/kimi-k3-kernel-gap.md` §10 item 7 requires this to stay ONE
+    /// is 1 of 256 CUs. `perf-data/archive/k3/kimi-k3-kernel-gap.md` §10 item 7 requires this to stay ONE
     /// packet ("three packets × 186 is 3.3 ms/token of pure protocol"), which rules out the
     /// obvious fix of splitting the reduction across blocks and finishing it in a second packet.
     ///
@@ -1050,7 +1050,7 @@ pub enum DevOp {
     ///    `attn_output.reshape(batch, seq, -1)` produces. No permute is implied.
     ///
     /// Not folded into [`DevOp::MlaMergeFold`]'s epilogue — which
-    /// `perf-data/kimi-k3-kernel-gap.md` §10 item 6 suggests and which would be nearly free —
+    /// `perf-data/archive/k3/kimi-k3-kernel-gap.md` §10 item 6 suggests and which would be nearly free —
     /// because that op is GLM-5.2's too and is on its critical path. A separate streaming pass
     /// keeps GLM's packet bytes and register table untouched, and keeps the fold and the gate
     /// independently diffable in a stage-by-stage gate.

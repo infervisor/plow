@@ -54,7 +54,7 @@
  * SLICE MAP, stated honestly. Work items = T tokens, one WORKGROUP each, because both reductions
  * (the per-row variance and the per-row score) span the whole 7168-wide row and a softmax couples
  * the rows. At T = 1 that is `blocks = 1` of 256 — the `Mamba2Scan` occupancy shape, and it is
- * recorded here rather than hidden. `perf-data/kimi-k3-kernel-gap.md` §10 item 7 requires it to be
+ * recorded here rather than hidden. `perf-data/archive/k3/kimi-k3-kernel-gap.md` §10 item 7 requires it to be
  * ONE packet ("at ~5.9 us of gate per narrow packet, three packets x 186 is 3.3 ms/token of pure
  * protocol"), which rules out splitting the reduction across blocks with a second packet to finish
  * it. So the ONLY lever at T = 1 is the body of that one workgroup.
@@ -468,7 +468,7 @@ __device__ void d_situ_glu(bf16* __restrict__ out, const bf16* __restrict__ gate
  * in the tail is a factor of ~|x|. A `GLU(act=1)` here would produce finite, correctly-shaped,
  * wrong output on 24 layers of every token.
  *
- * WHY NOT FOLD IT INTO PLOW_DOP_MLA_MERGE_FOLD's EPILOGUE, which perf-data/kimi-k3-kernel-gap.md
+ * WHY NOT FOLD IT INTO PLOW_DOP_MLA_MERGE_FOLD's EPILOGUE, which perf-data/archive/k3/kimi-k3-kernel-gap.md
  * §10 item 6 suggests and which is nearly free (that op runs at ~2.9% of the bandwidth ceiling).
  * Because MLA_MERGE_FOLD is GLM-5.2's op too and is on its critical path. A K3-only transform
  * inside it either costs GLM a branch and an operand slot, or costs a second template

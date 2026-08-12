@@ -2,7 +2,7 @@
 # k3_batch_gate.sh — the correctness gate batched K3 decode must pass BEFORE its refusals are
 # lifted.                                                                    [K3-BATCH-GATE]
 #
-# WRITE THE GATE FIRST. `perf-data/k3-batched-decode-design.md` §5/§6.2 puts this ahead of the
+# WRITE THE GATE FIRST. `perf-data/archive/k3/k3-batched-decode-design.md` §5/§6.2 puts this ahead of the
 # remaining wiring on purpose: the KDA recurrence is the model's core, a wrong one is FLUENT
 # rather than broken, and the two refusals it would replace
 # (`exec/amd.rs:3264`, `serve/engine.rs:187`) are today the only thing standing between a
