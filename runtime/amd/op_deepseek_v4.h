@@ -830,6 +830,52 @@ __device__ void d_v4_moe_route(int* __restrict__ sel, float* __restrict__ wts,
             lds[e] = sqrtf(sp);
         }
         __syncthreads();
+        /* BLOCK-PARALLEL TOP-K. This used to be K passes of an E-wide argmax
+         * with an inner taken-check, all on THREAD 0 — K*E*K compares on one
+         * lane. The packet trace put this op at 11.2% of the decode step's
+         * critical path, second only to wo_a.
+         *
+         * Selection is bit-identical to the serial loop: each lane keeps the
+         * best (value, index) over its strided share, the block reduces with
+         * the SAME strict-greater / lower-index rule, and `ksel` accumulates the
+         * chosen set so later passes can mask it. It runs for every t, including
+         * the hash path, whose result thread 0 simply overwrites — cheaper than
+         * a divergent branch around a barrier.  */
+        float* rv = lds + E;                    /* [PLOW_THREADS] */
+        int* ri = (int*)(rv + PLOW_THREADS);    /* [PLOW_THREADS] */
+        int* ksel = ri + PLOW_THREADS;          /* [K]            */
+        for (unsigned k = 0; k < K; k++) {
+            float bv = -INFINITY;
+            int bi = -1;
+            for (unsigned e = threadIdx.x; e < E; e += PLOW_THREADS) {
+                bool taken = false;
+                for (unsigned j = 0; j < k; j++) taken |= (ksel[j] == (int)e);
+                if (taken) continue;
+                const float v = lds[e] + (bias ? bias[e] : 0.0f);
+                if (v > bv || (v == bv && bi >= 0 && (int)e < bi)) {
+                    bv = v;
+                    bi = (int)e;
+                }
+            }
+            rv[threadIdx.x] = bv;
+            ri[threadIdx.x] = bi;
+            __syncthreads();
+            for (unsigned d = PLOW_THREADS >> 1; d; d >>= 1) {
+                if (threadIdx.x < d) {
+                    const float ov = rv[threadIdx.x + d];
+                    const int oi = ri[threadIdx.x + d];
+                    if (oi >= 0 && (ov > rv[threadIdx.x] ||
+                                    (ov == rv[threadIdx.x] &&
+                                     (ri[threadIdx.x] < 0 || oi < ri[threadIdx.x])))) {
+                        rv[threadIdx.x] = ov;
+                        ri[threadIdx.x] = oi;
+                    }
+                }
+                __syncthreads();
+            }
+            if (threadIdx.x == 0) ksel[k] = ri[0];
+            __syncthreads();
+        }
         if (threadIdx.x == 0) {
             int* s = sel + (size_t)t * K;
             float* w = wts + (size_t)t * K;
@@ -837,23 +883,7 @@ __device__ void d_v4_moe_route(int* __restrict__ sel, float* __restrict__ wts,
                 const long long* row = tid2eid + (size_t)ids[t] * K;
                 for (unsigned k = 0; k < K; k++) s[k] = (int)row[k];
             } else {
-                /* Top-k on the BIASED score; the bias never reaches `w`. */
-                for (unsigned k = 0; k < K; k++) s[k] = -1;
-                for (unsigned k = 0; k < K; k++) {
-                    float best = -INFINITY;
-                    int bi = -1;
-                    for (unsigned e = 0; e < E; e++) {
-                        bool taken = false;
-                        for (unsigned j = 0; j < k; j++) taken |= (s[j] == (int)e);
-                        if (taken) continue;
-                        const float v = lds[e] + (bias ? bias[e] : 0.0f);
-                        if (v > best) {
-                            best = v;
-                            bi = (int)e;
-                        }
-                    }
-                    s[k] = bi;
-                }
+                for (unsigned k = 0; k < K; k++) s[k] = ksel[k];
             }
             float sum = 0.0f;
             for (unsigned k = 0; k < K; k++) {
