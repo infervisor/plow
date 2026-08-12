@@ -947,17 +947,52 @@ __device__ void d_v4_index_score(float* __restrict__ score, const bf16* __restri
                 q8[u] = ld_glob8(q + ((size_t)t * H + lane) * HD + u * 8);
         const float wq = bf2f(w[(size_t)t * H + lane]);
 
-        for (unsigned c = wid; c < NC; c += wstride) {
+        /* FOUR ENTRIES IN FLIGHT. Each wave owns barely two of the NC entries
+         * (4096 entries over 304x8 waves), and one entry is 16 dependent
+         * `bf16v8` loads of a row that has to come from HBM — so the op sat at
+         * ~1.5 TF/s with nothing to overlap the latency against. Issuing four
+         * INDEPENDENT rows before reducing any of them is the same fix the
+         * attention gather needed, and for the same reason: the arithmetic was
+         * never the cost. The reduction chain and the result are unchanged. */
+        const unsigned CU4 = 4u;
+        unsigned c = wid;
+        for (; c + 3u * wstride < NC; c += CU4 * wstride) {
+            float d[CU4];
+#pragma unroll
+            for (unsigned u = 0; u < CU4; u++) d[u] = 0.0f;
+            if (NV <= 16 && (HD & 7u) == 0) {
+                for (unsigned e = 0; e < NV; e++) {
+                    bf16v8 kk[CU4];
+#pragma unroll
+                    for (unsigned u = 0; u < CU4; u++)
+                        kk[u] = ld_glob8(ckv + (size_t)(c + u * wstride) * HD + e * 8);
+#pragma unroll
+                    for (unsigned u = 0; u < CU4; u++) d[u] = dot8(q8[e], kk[u], d[u]);
+                }
+            } else {
+                const bf16* qh = q + ((size_t)t * H + lane) * HD;
+                for (unsigned u = 0; u < CU4; u++) {
+                    const bf16* kc = ckv + (size_t)(c + u * wstride) * HD;
+                    for (unsigned e = 0; e < HD; e++) d[u] += bf2f(qh[e]) * bf2f(kc[e]);
+                }
+            }
+#pragma unroll
+            for (unsigned u = 0; u < CU4; u++) {
+                float part = fmaxf(d[u], 0.0f) * wq; /* relu INSIDE the head sum */
+                for (int o = 32; o; o >>= 1) part += __shfl_xor(part, o);
+                if (lane == 0) score[(size_t)t * NC + c + u * wstride] = part;
+            }
+        }
+        for (; c < NC; c += wstride) {
             const bf16* kc = ckv + (size_t)c * HD;
             float d = 0.0f;
             if (NV <= 16 && (HD & 7u) == 0) {
-                /* Four VALU ops per eight elements, no conversions. */
                 for (unsigned u = 0; u < NV; u++) d = dot8(q8[u], ld_glob8(kc + u * 8), d);
             } else {
                 const bf16* qh = q + ((size_t)t * H + lane) * HD;
                 for (unsigned e = 0; e < HD; e++) d += bf2f(qh[e]) * bf2f(kc[e]);
             }
-            float part = fmaxf(d, 0.0f) * wq; /* relu INSIDE the head sum */
+            float part = fmaxf(d, 0.0f) * wq;
             for (int o = 32; o; o >>= 1) part += __shfl_xor(part, o);
             if (lane == 0) score[(size_t)t * NC + c] = part;
         }
