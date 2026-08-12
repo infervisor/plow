@@ -423,3 +423,116 @@ __device__ void d_v4_sparse_attn(bf16* __restrict__ out, const bf16* __restrict_
         }
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * Learned KV compressor — prefill form.
+ * ---------------------------------------------------------------------------
+ *
+ * Pools every `ratio` consecutive tokens into ONE compressed KV entry. This is
+ * the only op in the model that changes the sequence rate, and 41 of 43 layers
+ * have one (21 of those additionally overlapping, at ratio 4).
+ *
+ * `x`       [T, HID] bf16      the layer input
+ * `wkv`     [COFF*D, HID] bf16   COFF = 2 when overlapping, else 1
+ * `wgate`   [COFF*D, HID] bf16
+ * `ape`     [ratio, COFF*D] f32  per-offset-within-window bias on the scores
+ * `norm_w`  [D] bf16
+ * `out`     [T/ratio, D] bf16
+ *
+ * TRANSCRIBED FROM `inference/model.py::Compressor.forward` at `start_pos == 0`.
+ * Four things it pins:
+ *
+ *   1. THE SOFTMAX IS PER OUTPUT DIM. `score` has the same width as `kv`, and
+ *      `score.softmax(dim=2)` normalizes over the pooled ROWS independently for
+ *      every one of the D columns. It is not one weight per row.
+ *   2. `ape` is added to the scores BEFORE the overlap transform, indexed by
+ *      the token's position WITHIN ITS OWN window — so an overlapped group's
+ *      two halves carry ape rows from two different windows.
+ *   3. THE OVERLAPPED FORM POOLS 2*ratio ROWS: the PREVIOUS window's tokens
+ *      through the FIRST half of the projection (`[0:D]`), and the CURRENT
+ *      window's through the SECOND (`[D:2D]`). That is what the doubled weight
+ *      width is for. Group 0 has no previous window, and its first `ratio` rows
+ *      are a zero value at a `-inf` score — inert, not zero-weighted-average.
+ *   4. the pooled result is RMS-normed with `norm_w`, and only then (outside
+ *      this op, as in the IR) roped at the compressed position.
+ *
+ * NOT IMPLEMENTED HERE: the decode-incremental form (`start_pos > 0`), which
+ * keeps a per-sequence window state and emits one entry every `ratio` steps,
+ * and the prefill remainder that seeds that state. Both are the KV-ring side of
+ * the op and belong with the runtime's cache management; this is the half a
+ * single-block correctness sweep needs. `T` not a multiple of `ratio` has its
+ * tail DROPPED here rather than silently folded into the last group.
+ *
+ * PERFORMANCE STATUS: correctness reference. Every pooled row re-streams the
+ * whole projection, which is inherent to a per-token GEMV but is exactly what a
+ * prefill GEMM would batch away. No performance claim is made. */
+__device__ void d_v4_kv_compress(bf16* __restrict__ out, const bf16* __restrict__ x,
+                                 const bf16* __restrict__ wkv, const bf16* __restrict__ wgate,
+                                 const float* __restrict__ ape, const bf16* __restrict__ norm_w,
+                                 unsigned T, unsigned HID, unsigned D, unsigned ratio,
+                                 unsigned overlap, float eps, unsigned slice, unsigned nblk,
+                                 float* __restrict__ lds) {
+    const unsigned G = ratio ? T / ratio : 0u;
+    if (ratio == 0 || G == 0) return;
+    const unsigned COFF = overlap ? 2u : 1u;
+    const unsigned NROW = overlap ? 2u * ratio : ratio;
+
+    for (unsigned g = slice; g < G; g += nblk) {
+        /* Online softmax per output dim: one pass over the pooled rows, so the
+         * scores never have to be materialized (`ratio` reaches 128). */
+        for (unsigned dd = threadIdx.x; dd < D; dd += PLOW_THREADS) {
+            float m = -INFINITY, l = 0.0f, acc = 0.0f;
+            for (unsigned r = 0; r < NROW; r++) {
+                unsigned tok, wrow, arow;
+                if (!overlap) {
+                    tok = g * ratio + r;
+                    wrow = dd;
+                    arow = r;
+                } else if (r < ratio) {
+                    if (g == 0) continue; /* no previous window: -inf score, 0 value */
+                    tok = (g - 1u) * ratio + r;
+                    wrow = dd; /* FIRST half of the projection */
+                    arow = r;
+                } else {
+                    const unsigned i = r - ratio;
+                    tok = g * ratio + i;
+                    wrow = D + dd; /* SECOND half */
+                    arow = i;
+                }
+                const bf16* xt = x + (size_t)tok * HID;
+                const bf16* wk = wkv + (size_t)wrow * HID;
+                const bf16* wg = wgate + (size_t)wrow * HID;
+                float kvv = 0.0f, sc = 0.0f;
+                for (unsigned i = 0; i < HID; i++) {
+                    const float xv = bf2f(xt[i]);
+                    kvv += xv * bf2f(wk[i]);
+                    sc += xv * bf2f(wg[i]);
+                }
+                sc += ape[(size_t)arow * (COFF * D) + wrow];
+
+                const float mn = fmaxf(m, sc);
+                const float resc = (m == -INFINITY) ? 0.0f : __expf(m - mn);
+                const float pe = __expf(sc - mn);
+                acc = acc * resc + pe * kvv;
+                l = l * resc + pe;
+                m = mn;
+            }
+            lds[dd] = (l > 0.0f) ? acc / l : 0.0f;
+        }
+        __syncthreads();
+
+        /* RMSNorm over the pooled entry. */
+        float ss = 0.0f;
+        for (unsigned dd = threadIdx.x; dd < D; dd += PLOW_THREADS) ss += lds[dd] * lds[dd];
+        for (int o = 32; o; o >>= 1) ss += __shfl_xor(ss, o);
+        float* red = lds + D;
+        if ((threadIdx.x & 63u) == 0) red[threadIdx.x >> 6] = ss;
+        __syncthreads();
+        float tot = 0.0f;
+        for (unsigned w = 0; w < (PLOW_THREADS >> 6); w++) tot += red[w];
+        const float rs = rsqrtf(tot / (float)D + eps);
+        for (unsigned dd = threadIdx.x; dd < D; dd += PLOW_THREADS)
+            st_act1(&out[(size_t)g * D + dd], f2bf(lds[dd] * rs * bf2f(norm_w[dd])));
+        __syncthreads();
+    }
+}
