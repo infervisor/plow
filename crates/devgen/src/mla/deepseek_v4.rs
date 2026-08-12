@@ -300,6 +300,10 @@ struct V4Gap {
     scope: String,
     why: String,
     fix: &'static str,
+    /// `Some(evidence)` once a kernel exists AND passes a real numeric gate.
+    /// Printed verbatim in the CLOSED section, and it is the reason not to
+    /// rebuild the thing — K3's report has actually caused that.
+    done: Option<&'static str>,
 }
 
 /// Ranked missing-capability list, blocker first.
@@ -330,6 +334,9 @@ fn v4_gaps(c: &V4Cfg) -> Vec<V4Gap> {
                   weights and the same mixes, so they are two halves of one kernel, not two \
                   independent ones). nn-graph models them as Op::HcReduce / Op::HcExpand; the \
                   Lean-side obligation is that expand's output equals the reference composition.",
+            done: Some(
+                "d_hc_reduce / d_hc_expand / d_hc_reduce_head in runtime/amd/op_deepseek_v4.h.                  Gated by runtime/tests/v4_hc_oracle_gfx942.hip against a host transcription in                  double at the shipped HC=4/iters=20/D=4096, at T>1 across workgroups, and with                  the expand output ALIASING the residual: max rel 6.0e-3..1.1e-2 vs a 2e-2 bf16                  floor. Two negative controls, both loud: dropping post's factor of 2 gives 1.15,                  normalizing over D instead of HC*D gives 2.8e-1. The reduce STASHES post/comb to                  a [T, HC+HC*HC] fp32 scratch that the expand reads - do not re-run the                  projection there.",
+            ),
         },
         V4Gap {
             what: "single-KV-head attention at head_dim 512 with a learned sink",
@@ -352,6 +359,9 @@ fn v4_gaps(c: &V4Cfg) -> Vec<V4Gap> {
             fix: "a kvh=1/hd=512 flash arm with a sink term in the running denominator, plus the \
                   inverse rope on the output. The sliding window is only 128, so the window part \
                   is small and dense; the size is all in the compressed history.",
+            done: Some(
+                "d_v4_sparse_attn. NOTE this op also covers the CONSUMPTION side of the                  compressed history and the indexer: Attention.forward builds ONE index list per                  query (window ++ compressed) and there is no dense arm. Gated by                  runtime/tests/v4_attn_oracle_gfx942.hip at H=64/D=512/TOPK=640, with a masked                  prefix, at T>1, and at the indexer's D=128: max rel 7.1e-3..1.5e-2. Controls: a                  -1 index reading row 0 gives 9.7; dropping the sink gives only 2.2e-2 at 640                  keys, so the gate carries a sequence-start row (8 keys) where it is 1.56.                  CORRECTNESS REFERENCE, NOT TUNED: keys are consumed one at a time, so each costs                  a six-shuffle reduction against 8 MACs - Stage 4 owes it an MFMA key tile.",
+            ),
         },
         V4Gap {
             what: "learned KV compressor (gated pooling, sequence-rate changing)",
@@ -374,6 +384,9 @@ fn v4_gaps(c: &V4Cfg) -> Vec<V4Gap> {
                   with a decode-time incremental form (the reference keeps a per-sequence window \
                   state and only emits an entry every `ratio` steps, so the state is a runtime \
                   resource exactly like the KV cache).",
+            done: Some(
+                "d_v4_kv_compress - PREFILL FORM ONLY. Gated by                  runtime/tests/v4_compress_oracle_gfx942.hip at ratio 4 overlapping, ratio 128                  plain, and the indexer's D=128, over several groups so group 0's absent                  predecessor is exercised: max rel 7.4e-3..1.1e-2. Controls: collapsing the                  PER-OUTPUT-DIM softmax to a per-row one gives 2.9-5.5; swapping which half of                  the projection each window half reads gives 4.3-5.8 on the overlapping cases and                  correctly leaves the plain one alone. STILL OPEN: the decode-incremental form                  (start_pos > 0) and the prefill remainder that seeds its state, and a T that is                  not a multiple of ratio has its tail DROPPED.",
+            ),
         },
         V4Gap {
             what: "sparse indexer (top-k selection over the compressed history)",
@@ -390,6 +403,7 @@ fn v4_gaps(c: &V4Cfg) -> Vec<V4Gap> {
                   read first (crates/devgen/src/mla.rs, the glm_* indexer path). What is new here \
                   is that the indexer scores a COMPRESSED sequence it computes itself, rather \
                   than the raw KV.",
+            done: None,
         },
         V4Gap {
             what: "FP4 routed experts with hash-routed leading layers",
@@ -418,6 +432,9 @@ fn v4_gaps(c: &V4Cfg) -> Vec<V4Gap> {
                   w4a16 and already exists - see the K3 report's ALREADY-COVERED section. What is \
                   new is sqrtsoftplus scoring, the clamped SwiGLU, and the hash table (a gather, \
                   not a top-k, and it makes the router's score GEMM dead weight on those layers).",
+            done: Some(
+                "ROUTING AND ACTIVATION ONLY; the FP4 expert GEMM is the existing mxfp4 path and                  was never missing. d_v4_moe_route + d_v4_clamped_swiglu, gated by                  runtime/tests/v4_moe_oracle_gfx942.hip at 256 experts / top-6 / scale 1.5 /                  limit 10: the router reproduces the reference's expert SET exactly and its                  weights to 1.3e-7, the SwiGLU to 4.5e-3. Controls: letting the selection bias                  reach the combine weight gives 1.4e-1 (and correctly leaves the hash layers,                  which have no bias, untouched); exp() scoring picks DIFFERENT experts; dropping                  the clamp gives 14.4. The clamp control only bites with inputs that reach the                  limit.",
+            ),
         },
         V4Gap {
             what: "block-diagonal output projection (wo_a)",
@@ -432,6 +449,9 @@ fn v4_gaps(c: &V4Cfg) -> Vec<V4Gap> {
             ),
             fix: "a grouped GEMM over the head axis, then the ordinary wo_b projection. Cheap \
                   next to the rest of this list, but it is a shape no existing arm emits.",
+            done: Some(
+                "d_v4_grouped_linear, gated by runtime/tests/v4_moe_oracle_gfx942.hip at the                  shipped 8 groups x rank 1024 over 4096-wide slices: max rel 9.0e-3. Control: a                  dense linear of the same element count gives 4.63. Applied in bf16, as the                  reference does explicitly ('wo_a is FP8 in checkpoint; using BF16 for                  simplicity') - the fp8 arm is a Stage-4 question, not a correctness one.",
+            ),
         },
         V4Gap {
             what: "DSpark / MTP draft stages",
@@ -446,6 +466,7 @@ fn v4_gaps(c: &V4Cfg) -> Vec<V4Gap> {
                 .to_string(),
             fix: "out of scope until the main tower runs. Speculative decoding is a throughput \
                   multiplier on top of a correct model, never a prerequisite for one.",
+            done: None,
         },
     ]
 }
@@ -573,25 +594,54 @@ pub(crate) fn deepseek_v4_emit(dir: &Path, ctx: u32, tp: u32) -> ! {
     );
 
     let gaps = v4_gaps(&c);
-    eprintln!(
-        "\nOPEN — {} capabilities this checkpoint needs and plow does not have. Blocker first.\n",
-        gaps.len()
-    );
-    for (i, g) in gaps.iter().enumerate() {
-        eprintln!("G{:<2} {}  [{}]", i + 1, g.what, g.scope);
-        for line in textwrap72(&g.why) {
-            eprintln!("      {line}");
+    let (closed, open): (Vec<_>, Vec<_>) = gaps.iter().partition(|g| g.done.is_some());
+
+    // CLOSED FIRST, and in full — the point of this section is to stop the next
+    // reader rebuilding what already passes a gate, which is a failure K3's
+    // report has actually caused rather than a hypothetical one.
+    if !closed.is_empty() {
+        eprintln!(
+            "\nCLOSED — {} capabilities that WERE on this list and now have a kernel WITH a \
+             passing\nnumeric gate. DO NOT REBUILD THESE. Read the `done:` line first; several \
+             say what is\nstill missing inside an otherwise-closed item.\n",
+            closed.len()
+        );
+        for (i, g) in closed.iter().enumerate() {
+            eprintln!("C{:<2} {}  [{}]", i + 1, g.what, g.scope);
+            for (n, line) in textwrap72(g.done.unwrap()).into_iter().enumerate() {
+                eprintln!("      {} {line}", if n == 0 { "done:" } else { "     " });
+            }
+            eprintln!();
         }
-        for (n, line) in textwrap72(g.fix).into_iter().enumerate() {
-            eprintln!("      {} {line}", if n == 0 { "fix:" } else { "    " });
+    }
+
+    if !open.is_empty() {
+        eprintln!(
+            "OPEN — {} capabilities this checkpoint needs and plow does not have.\n",
+            open.len()
+        );
+        for (i, g) in open.iter().enumerate() {
+            eprintln!("G{:<2} {}  [{}]", i + 1, g.what, g.scope);
+            for line in textwrap72(&g.why) {
+                eprintln!("      {line}");
+            }
+            for (n, line) in textwrap72(g.fix).into_iter().enumerate() {
+                eprintln!("      {} {line}", if n == 0 { "fix:" } else { "    " });
+            }
+            eprintln!();
         }
-        eprintln!();
     }
 
     eprintln!(
-        "The first three gaps block every layer, so there is no partial blob and no single-block\n\
-         extraction worth running yet: a `--block` of one V4 layer needs G1, G2 and G3 together.\n\
-         Nothing above is a measurement claim — no V4 kernel has been run on any part."
+        "STILL NOT EMITTABLE. Every kernel above is gated in ISOLATION against the reference; \
+         none\nof them is wired into a DevOp, an emitter or the interpreter, so there is no blob \
+         and no\n`--block` extraction yet. That wiring — plus the indexer (G4) and the decode \
+         side of the\ncompressor — is what stands between this and a single V4 layer running.\n\
+         \n\
+         NO PERFORMANCE CLAIM IS MADE ANYWHERE IN THIS REPORT. The closed kernels are \
+         correctness\nreferences: the attention consumes keys one at a time and the compressor \
+         re-streams its\nprojection per pooled row. Both are Stage-4 work and neither has been \
+         timed on any part."
     );
     std::process::exit(2);
 }
