@@ -1014,6 +1014,7 @@ pub fn emit_k3_latent_moe(
     let all: Vec<u32> = (0..n_cu).collect();
     let a = act_prefix;
     let (tt, hid, lat) = (t as u64, c.hidden, c.latent);
+    let spec_rows = decode_rows && !seq_rows && t > 1;
     let bft = |b: &mut Builder, n: String, e: u64| b.tensor(&n, e * 2);
     let f32t = |b: &mut Builder, n: String, e: u64| b.tensor(&n, e * 4);
 
@@ -1028,7 +1029,7 @@ pub fn emit_k3_latent_moe(
     // its GLU output into a row-sorted `fu_g` sized on the padded row bound instead. Declaring it
     // anyway would be `T*k*imoe` bf16 of arena that no op in the program touches, which is the
     // `Mamba2Scan` smell this tree keeps finding.
-    let fu = if t == 1 {
+    let fu = if t == 1 || spec_rows {
         bft(b, format!("{a}fu"), tt * c.top_k as u64 * imoe as u64)
     } else {
         packet::dev::TENSOR_NONE
@@ -1086,18 +1087,38 @@ pub fn emit_k3_latent_moe(
     // `group_decode=false` retains the old one-pair-per-slot graph as an A/B control. Prefill is a
     // different grouping: it SORTS the T*k (token, expert) pairs by expert and runs one grouped
     // GEMM per phase, so an expert's weights cross HBM once for every token that chose it.
-    let mut c_cmb = if t == 1 {
-        let c_rt = b.emit(DevOp::MoeRouterTopk, vec![0], &[c_rl], |d| {
-            d.t[0] = tab;
-            d.t[1] = logit;
-            d.t[3] = w.router_bias;
-            d.i[1] = c.n_exp;
-            d.i[2] = c.top_k;
-            d.i[3] = c.route_flags;
-            d.i[6] = c.n_group;
-            d.i[7] = c.topk_group;
-            d.f[0] = c.route_scale;
-        });
+    let mut c_cmb = if t == 1 || spec_rows {
+        let c_rt = if spec_rows {
+            b.emit(
+                DevOp::MoeRouterTopkPf,
+                (0..t.min(n_cu)).collect(),
+                &[c_rl],
+                |d| {
+                    d.t[0] = tab;
+                    d.t[1] = logit;
+                    d.t[3] = w.router_bias;
+                    d.i[1] = c.n_exp;
+                    d.i[2] = c.top_k;
+                    d.i[3] = c.route_flags;
+                    d.i[4] = t;
+                    d.i[6] = c.n_group;
+                    d.i[7] = c.topk_group;
+                    d.f[0] = c.route_scale;
+                },
+            )
+        } else {
+            b.emit(DevOp::MoeRouterTopk, vec![0], &[c_rl], |d| {
+                d.t[0] = tab;
+                d.t[1] = logit;
+                d.t[3] = w.router_bias;
+                d.i[1] = c.n_exp;
+                d.i[2] = c.top_k;
+                d.i[3] = c.route_flags;
+                d.i[6] = c.n_group;
+                d.i[7] = c.topk_group;
+                d.f[0] = c.route_scale;
+            })
+        };
         if c.group_decode {
             let c_g = b.emit(DevOp::MoeGroupGluFp8Blk, all.clone(), &[c_rt, c_xe], |d| {
                 d.t[0] = fu;
@@ -1109,6 +1130,7 @@ pub fn emit_k3_latent_moe(
                 d.i[1] = imoe;
                 d.i[2] = lat;
                 d.i[3] = c.n_exp;
+                d.i[4] = if spec_rows { t } else { 0 };
                 d.i[5] = K3_MOE_ACT_SITU;
                 d.i[6] = c.enc;
                 d.f[0] = cb.situ_beta;
@@ -1124,14 +1146,25 @@ pub fn emit_k3_latent_moe(
                 d.i[1] = lat;
                 d.i[2] = imoe;
                 d.i[3] = c.n_exp;
+                d.i[4] = if spec_rows { t } else { 0 };
                 d.i[6] = c.enc;
             });
-            b.emit(DevOp::MoeCombine, combine_cus(&all, t * lat), &[c_d], |d| {
-                d.t[0] = cmb_dst;
-                d.t[3] = part;
-                d.i[0] = lat;
-                d.i[1] = c.top_k;
-            })
+            if spec_rows {
+                b.emit(DevOp::MoeCombinePf, all.clone(), &[c_d], |d| {
+                    d.t[0] = cmb_dst;
+                    d.t[3] = part;
+                    d.i[0] = lat;
+                    d.i[1] = c.top_k;
+                    d.i[2] = t;
+                })
+            } else {
+                b.emit(DevOp::MoeCombine, combine_cus(&all, t * lat), &[c_d], |d| {
+                    d.t[0] = cmb_dst;
+                    d.t[3] = part;
+                    d.i[0] = lat;
+                    d.i[1] = c.top_k;
+                })
+            }
         } else {
             // Baseline: one gate/up + down pair per selected slot.
             let mut c_down = Vec::with_capacity(c.top_k as usize);
@@ -1401,7 +1434,14 @@ pub fn emit_k3_latent_moe(
     // column n and streams BOTH weight rows for it — so the byte count is unchanged, two packets
     // and one whole activation round-trip of `sha` disappear, and each wave now has twice the loads
     // in flight, which is the starvation `op_gemm.h`'s own GEMV sweep names as the sub-ceiling cause.
-    let fused_sh = fuse_shared_glu(t, c.hidden);
+    let spec_shared_fits =
+        spec_rows && crate::gemv_staged_rows(1) as u64 * c.hidden as u64 <= crate::gm_lds_halves();
+    assert!(
+        !spec_rows || spec_shared_fits,
+        "K3 target verification requires the serial GemvGlu map, but {t}x{} BF16 rows exceed LDS",
+        c.hidden
+    );
+    let fused_sh = fuse_shared_glu(t, c.hidden) || spec_shared_fits;
     let c_sa = if fused_sh {
         b.emit(
             DevOp::GemvGlu,
@@ -1412,9 +1452,10 @@ pub fn emit_k3_latent_moe(
                 d.t[1] = x;
                 d.t[2] = w.shared_gate;
                 d.t[5] = w.shared_up;
-                d.i[0] = t;
+                d.i[0] = if spec_rows { 1 } else { t };
                 d.i[1] = si_l;
                 d.i[2] = hid;
+                d.i[4] = if spec_rows { t } else { 0 };
                 d.i[5] = K3_MOE_ACT_SITU;
                 d.f[0] = cb.situ_beta;
                 d.f[1] = cb.situ_linear_beta;
@@ -4316,6 +4357,44 @@ mod tests {
             .find(|inst| inst.op == DevOp::Argmax as u16)
             .unwrap();
         assert_eq!(argmax.i[1], 8);
+
+        assert!(
+            p.insts
+                .iter()
+                .all(|inst| inst.op != DevOp::MoeAlignPf as u16
+                    && inst.op != DevOp::MoeGroupGluPf as u16
+                    && inst.op != DevOp::MoeGroupDownPf as u16),
+            "verification must not use the reassociating prefill MoE bodies"
+        );
+        for glu in p
+            .insts
+            .iter()
+            .filter(|inst| inst.op == DevOp::MoeGroupGluFp8Blk as u16)
+        {
+            assert_eq!(glu.i[4], 8, "the B1 body must visit every verifier row");
+        }
+        for down in p
+            .insts
+            .iter()
+            .filter(|inst| inst.op == DevOp::MoeGroupDownFp8Blk as u16)
+        {
+            assert_eq!(down.i[4], 8, "the B1 body must visit every verifier row");
+        }
+        for combine in p
+            .insts
+            .iter()
+            .filter(|inst| inst.op == DevOp::MoeCombinePf as u16)
+        {
+            assert_eq!(combine.i[2], 8);
+        }
+        for shared in p
+            .insts
+            .iter()
+            .filter(|inst| inst.op == DevOp::GemvGlu as u16)
+        {
+            assert_eq!(shared.i[0], 1, "shared GLU keeps the B1 staged arithmetic");
+            assert_eq!(shared.i[4], 8, "the verifier loops the B1 body over rows");
+        }
     }
 
     /// Opcodes that exist ONLY in the decode interpreter object. A prefill bucket carrying any of

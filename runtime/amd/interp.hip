@@ -931,6 +931,12 @@ __device__ __forceinline__ void exec_mla_merge_fold(CInst in, CTens T, unsigned 
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     const unsigned bh = in->i[0] * in->i[1]; /* n_batch * n_head_local */
     const unsigned V = in->i[2];             /* v_head_dim: GLM-5.2 256, Kimi-K3 128 */
+#if PLOW_K3_SPEC_VERIFY
+    d_mla_merge_fold<512, PLOW_MLA_FOLD_VT>(
+        (bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2), (const bf16*)TEN(3),
+        in->i[0], in->i[1], in->i[2], in->i[4], slice, nblk, raw);
+    return;
+#endif
 #if PLOW_MLA_FOLD_TB > 1
     /* TOKEN-BLOCKED PREFILL ARM (-DPLOW_MLA_FOLD_TB=<G>; op_attention.h d_mla_merge_fold_tb).
      *
@@ -2377,9 +2383,18 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         case PLOW_DOP_GEMV_GLU:
             /* f[0]/f[1] carry the situ betas, exactly as PLOW_DOP_SITU_GLU does. They are 0 on
              * every non-K3 packet, and act != 2 ignores them. */
+#if PLOW_K3_SPEC_VERIFY
+            for (unsigned r = 0, rows = in->i[4] ? in->i[4] : 1u; r < rows; ++r) {
+                d_gemv_glu((bf16*)TEN(0) + (size_t)r * in->i[1],
+                           (const bf16*)TEN(1) + (size_t)r * in->i[2],
+                           (const bf16*)TEN(2), (const bf16*)TEN(5), 1u, in->i[1], in->i[2],
+                           in->i[5], slice, nblk, sm->gm, in->fj[0].f, in->fj[1].f);
+            }
+#else
             d_gemv_glu((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                        (const bf16*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[5], slice, nblk,
                        sm->gm, in->fj[0].f, in->fj[1].f);
+#endif
             break;
         case PLOW_DOP_GEMV_QKV:
             /* t7 PRESENT = THE Q-NORM FOLD (emit knob PLOW_GLM_FUSE_QNORM): t1 then carries the
@@ -2562,17 +2577,40 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                       in->i[3], slice, nblk, in->i[6]);
             break;
         case PLOW_DOP_MOE_GROUP_GLU_FP8_BLK: /* grouped: t3=wtab t4=stab; i0=k i1=I_moe i2=H i3=n_exp i5=act i6=ENC */
+#if PLOW_K3_SPEC_VERIFY
+            for (unsigned r = 0, rows = in->i[4] ? in->i[4] : 1u; r < rows; ++r) {
+                d_moe_group_glu_fp8_blk(
+                    (bf16*)TEN(0) + (size_t)r * in->i[0] * in->i[1],
+                    (const bf16*)TEN(1) + (size_t)r * in->i[2],
+                    (const unsigned char*)TEN(2) + (size_t)r * in->i[0] * 8u,
+                    (const unsigned long long*)TEN(3), (const unsigned long long*)TEN(4),
+                    in->i[0], in->i[1], in->i[2], in->i[3], in->i[5], slice, nblk, in->i[6],
+                    in->fj[0].f, in->fj[1].f);
+            }
+#else
             d_moe_group_glu_fp8_blk((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
                                     (const unsigned long long*)TEN(3),
                                     (const unsigned long long*)TEN(4), in->i[0], in->i[1], in->i[2],
                                     in->i[3], in->i[5], slice, nblk, in->i[6], in->fj[0].f,
                                     in->fj[1].f);
+#endif
             break;
         case PLOW_DOP_MOE_GROUP_DOWN_FP8_BLK: /* grouped: t3=wtab t4=stab; i0=k i1=H i2=I_moe i3=n_exp i6=ENC */
+#if PLOW_K3_SPEC_VERIFY
+            for (unsigned r = 0, rows = in->i[4] ? in->i[4] : 1u; r < rows; ++r) {
+                d_moe_group_down_fp8_blk(
+                    (float*)TEN(0) + (size_t)r * in->i[0] * in->i[1],
+                    (const bf16*)TEN(1) + (size_t)r * in->i[0] * in->i[2],
+                    (const unsigned char*)TEN(2) + (size_t)r * in->i[0] * 8u,
+                    (const unsigned long long*)TEN(3), (const unsigned long long*)TEN(4),
+                    in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk, in->i[6]);
+            }
+#else
             d_moe_group_down_fp8_blk((float*)TEN(0), (const bf16*)TEN(1),
                                      (const unsigned char*)TEN(2), (const unsigned long long*)TEN(3),
                                      (const unsigned long long*)TEN(4), in->i[0], in->i[1], in->i[2],
                                      in->i[3], slice, nblk, in->i[6]);
+#endif
             break;
         case PLOW_DOP_MOE_COMBINE:
             d_moe_combine((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
