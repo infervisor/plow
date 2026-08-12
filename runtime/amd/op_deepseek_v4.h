@@ -312,3 +312,114 @@ __device__ void d_hc_reduce_head(bf16* __restrict__ out, const bf16* __restrict_
         __syncthreads();
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * Sparse attention with a learned sink — V4's ONLY attention kernel.
+ * ---------------------------------------------------------------------------
+ *
+ * The window and the compressed history are not two kernels. `Attention.forward`
+ * builds ONE index list per query — `cat(window_idxs, compress_idxs)` — and
+ * hands it to `sparse_attn`; the sliding window is just the first `window_size`
+ * entries and the compressed history the rest. A layer with no compression
+ * passes the window indices alone. So this one op covers G2's window attention
+ * and the consumption side of G3/G4, and there is no dense arm to write.
+ *
+ * `q`         [T, H, D] bf16     H query heads
+ * `kv`        [NKV, D]  bf16     ONE shared KV head — key and value are the
+ *                                same tensor, not two projections
+ * `idx`       [T, TOPK] i32      gathered positions; -1 means "no entry"
+ * `sink`      [H] f32            learned per-head logit
+ * `out`       [T, H, D] bf16
+ *
+ * TRANSCRIBED FROM `inference/kernel.py::sparse_attn_kernel`, which is the
+ * authority for three things the model file does not state:
+ *
+ *   1. THE SINK NEVER ENTERS THE NUMERATOR. It is added to the denominator
+ *      once, after the loop, as `exp(sink[h] - m_final)` — it has no value row.
+ *      A sink with a value row is a different function; a sink that only
+ *      inflates the denominator is this one.
+ *   2. Whether it joins the running max is NOT a correctness question, and the
+ *      earlier note here claiming otherwise was wrong. Softmax is shift
+ *      invariant, so folding `sink` into the max and rescaling `acc`/`l` by
+ *      `exp(m - max(m, sink))` computes the identical value — measured, not
+ *      argued: that variant passes this op's oracle unchanged at every swept
+ *      shape. It is a numerical-range choice, and the reference's form (max
+ *      over real keys only) is kept because it is the reference's.
+ *   3. `idx == -1` contributes a `-inf` score AND a zeroed KV row, so a padded
+ *      block is inert rather than reading position 0.
+ *
+ * K AND V ARE THE SAME ROWS. V4 projects one `[D]` KV vector per token and uses
+ * it as both, so there is no `v_head_dim != qk_head_dim` split to carry and the
+ * output width is D.
+ *
+ * PERFORMANCE STATUS: this is a CORRECTNESS reference, not a tuned arm. Lanes
+ * own dims and keys are consumed one at a time, so every key costs a six-shuffle
+ * wave reduction against 8 useful MACs. That is the right shape to prove the
+ * numerics and the wrong shape to ship: Stage 4 replaces the score reduction
+ * with an MFMA tile over a key block, exactly as the tilelang reference does
+ * (`block = 64`, `T.gemm`). No performance claim is made here and none has been
+ * measured. */
+__device__ void d_v4_sparse_attn(bf16* __restrict__ out, const bf16* __restrict__ q,
+                                 const bf16* __restrict__ kv, const int* __restrict__ idx,
+                                 const float* __restrict__ sink, unsigned T, unsigned H,
+                                 unsigned D, unsigned TOPK, float scale, unsigned slice,
+                                 unsigned nblk) {
+    /* One lane per 64th of the head dim. A D that is not a multiple of 64 would
+     * leave a ragged tail this layout cannot address; poison rather than drop
+     * the tail silently. V4 uses D=512 (attention) and D=128 (indexer). */
+    if ((D & 63u) || H == 0) {
+        for (unsigned t = slice; t < T; t += nblk)
+            for (unsigned i = threadIdx.x; i < H * D; i += PLOW_THREADS)
+                st_act1(&out[(size_t)t * H * D + i], (bf16)0x7fc1u);
+        return;
+    }
+    const unsigned DPL = D >> 6; /* dims per lane */
+    const unsigned wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
+    const unsigned nwave = PLOW_THREADS >> 6;
+
+    for (unsigned t = slice; t < T; t += nblk) {
+        const int* it = idx + (size_t)t * TOPK;
+        /* Waves partition the heads; nothing is shared between them. */
+        for (unsigned h = wave; h < H; h += nwave) {
+            const bf16* qh = q + ((size_t)t * H + h) * D;
+            float qv[16], acc[16]; /* DPL <= 16 given D <= 1024 */
+            for (unsigned e = 0; e < DPL; e++) {
+                qv[e] = bf2f(qh[lane * DPL + e]);
+                acc[e] = 0.0f;
+            }
+            float m = -INFINITY, l = 0.0f;
+
+            for (unsigned j = 0; j < TOPK; j++) {
+                const int p = it[j];
+                float kvv[16];
+                float part = 0.0f;
+                if (p >= 0) {
+                    const bf16* kr = kv + (size_t)p * D;
+                    for (unsigned e = 0; e < DPL; e++) {
+                        kvv[e] = bf2f(kr[lane * DPL + e]);
+                        part += qv[e] * kvv[e];
+                    }
+                } else {
+                    for (unsigned e = 0; e < DPL; e++) kvv[e] = 0.0f;
+                }
+                /* Full-wave sum: every lane ends with the same score. */
+                for (int o = 32; o; o >>= 1) part += __shfl_xor(part, o);
+                const float s = (p >= 0) ? part * scale : -INFINITY;
+
+                const float mn = fmaxf(m, s);
+                const float resc = (m == -INFINITY) ? 0.0f : __expf(m - mn);
+                const float pe = (s == -INFINITY) ? 0.0f : __expf(s - mn);
+                for (unsigned e = 0; e < DPL; e++) acc[e] = acc[e] * resc + pe * kvv[e];
+                l = l * resc + pe;
+                m = mn;
+            }
+            /* The sink joins the DENOMINATOR only, at the final max, after the
+             * rescale chain has finished. */
+            if (m != -INFINITY) l += __expf(sink[h] - m);
+            const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+            bf16* oh = out + ((size_t)t * H + h) * D;
+            for (unsigned e = 0; e < DPL; e++)
+                st_act1(&oh[lane * DPL + e], f2bf(acc[e] * inv));
+        }
+    }
+}
