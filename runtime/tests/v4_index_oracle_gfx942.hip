@@ -48,7 +48,7 @@
         }                                                                                         \
     } while (0)
 
-enum { LDS_BYTES = 32768 };
+enum { LDS_BYTES = 40960 };
 
 __global__ __launch_bounds__(PLOW_THREADS) void k_score(float* sc, const bf16* q, const bf16* ckv,
                                                         const bf16* w, unsigned T, unsigned H,

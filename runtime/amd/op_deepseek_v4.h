@@ -1031,20 +1031,35 @@ __device__ void d_v4_index_topk(int* __restrict__ idx, const float* __restrict__
                     atomicAdd(&hist[(key >> (unsigned)sh) & 0xffu], 1u);
             }
             __syncthreads();
-            /* Walk bins high to low; the bin that straddles `rank` is the one
-             * the threshold lives in. Serial over 256 on one thread — 256 ops
-             * against the 4096-entry histogram pass that precedes it. */
-            if (threadIdx.x == 0) {
-                unsigned acc = 0, digit = 0;
-                for (int b = 255; b >= 0; b--) {
-                    if (acc + hist[b] >= rank) {
-                        digit = (unsigned)b;
-                        break;
-                    }
-                    acc += hist[b];
+            /* Find the bin that straddles `rank` by a PARALLEL SUFFIX SCAN over
+             * the 256 bins, not by walking them on one thread. The serial walk
+             * is 256 dependent LDS reads and it runs once per pass; at four
+             * passes that was the dominant cost of the whole op once the
+             * histogram itself was parallel — the selector spent its time
+             * deciding, not counting. Eight scan steps replace 256 reads. */
+            unsigned* suf = hist + 256 + 2 + PLOW_V4_TIE_MAX; /* [256] scratch */
+            /* Staging the KEYS in LDS as well was tried and measured as a
+             * no-op (7.09 -> 7.23 ms/token, i.e. noise), so the five passes
+             * read the scores from HBM. Recorded because it is the obvious
+             * next idea and it does not pay. */
+            if (threadIdx.x < 256u) suf[threadIdx.x] = hist[threadIdx.x];
+            __syncthreads();
+            for (unsigned d = 1; d < 256u; d <<= 1) {
+                unsigned v = 0;
+                if (threadIdx.x < 256u && threadIdx.x + d < 256u) v = suf[threadIdx.x + d];
+                __syncthreads();
+                if (threadIdx.x < 256u) suf[threadIdx.x] += v;
+                __syncthreads();
+            }
+            /* `suf[b]` is now the count of entries in bins >= b. The digit is
+             * the largest b with `suf[b] >= rank`, and the entries strictly
+             * above it are `suf[b+1]`. */
+            if (threadIdx.x < 256u) {
+                const unsigned above = (threadIdx.x + 1u < 256u) ? suf[threadIdx.x + 1u] : 0u;
+                if (suf[threadIdx.x] >= rank && above < rank) {
+                    hist[0] = threadIdx.x;
+                    nabove[0] = above;
                 }
-                hist[0] = digit;
-                nabove[0] = acc; /* strictly-greater entries already accounted */
             }
             __syncthreads();
             const unsigned digit = hist[0];
