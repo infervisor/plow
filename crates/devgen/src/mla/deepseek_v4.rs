@@ -76,6 +76,22 @@ impl V4Cfg {
             .count()
     }
 
+    /// KV compression ratio of `layer`, or `None` for a sliding-window-only
+    /// layer. The list is longer than `layers` because the checkpoint appends
+    /// its DSpark stages to it.
+    pub fn compress_ratio(&self, layer: u32) -> Option<u32> {
+        match self.compress_ratios.get(layer as usize).copied() {
+            Some(0) | None => None,
+            Some(r) => Some(r),
+        }
+    }
+
+    /// The compressor overlaps its windows exactly on the `ratio == 4` layers,
+    /// which is also what gives those layers a sparse indexer.
+    pub fn overlaps(ratio: u32) -> bool {
+        ratio == 4
+    }
+
     pub fn nope_head_dim(&self) -> u32 {
         self.head_dim - self.rope_head_dim
     }
