@@ -606,6 +606,43 @@ fn emit_v4_attn(
     // `V4SparseAttn`, for which the interpreter has exactly one arm — so the
     // merge ran the SPLIT kernel and `attn_sink`, 64 floats, arrived where the
     // `idx` gather list belongs.
+    // TIMING PROBE: replace split+merge with a zero-fill of attn_out. Everything
+    // upstream (q/kv projections, ropes, ring write, compressor, indexer) and
+    // downstream (inverse rope, wo_a, wo_b, expand) still runs.
+    if v4_skip("attn") {
+        let z = b.emit(DevOp::V4HcZero, all.clone(), &adeps, |d| {
+            d.t[0] = tn.attn_out;
+            d.i[0] = nh * hd / 2; // bf16 buffer, f32 writes
+        });
+        let inv0 = z;
+        let og = c.o_groups;
+        let orank = c.o_lora as u32;
+        let ob = b.tensor(&format!("act.ob.{l}"), (og * orank) as u64 * BF16);
+        let woa = b.tensor(
+            &format!("{p}.attn.wo_a.weight"),
+            (og * orank) as u64 * (nh * hd / og) as u64,
+        );
+        let gl = b.emit(DevOp::V4GroupedLinear, all.clone(), &[inv0], |d| {
+            d.t[0] = ob;
+            d.t[1] = tn.attn_out;
+            d.t[2] = woa;
+            d.i[0] = 1;
+            d.i[1] = og;
+            d.i[2] = orank;
+            d.i[3] = nh * hd / og;
+        });
+        let wob = emit_fp8_gemv(
+            b,
+            &format!("{p}.attn.wo_b"),
+            tn.xr,
+            ob,
+            h,
+            og * orank,
+            n_cu,
+            &[gl],
+        );
+        return emit_hc_expand(b, c, tn, tn.xr, n_cu, &[wob]);
+    }
     let asp = b.emit(DevOp::V4SparseAttnSplit, all.clone(), &adeps, |d| {
         d.t[0] = opart;
         d.t[1] = mlpart;
