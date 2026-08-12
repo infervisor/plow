@@ -778,8 +778,18 @@ __device__ void d_v4_grouped_linear(bf16* __restrict__ out, const bf16* __restri
         const unsigned g = i / R, r = i % R;
         const bf16* orow = o + (size_t)t * GRP * WIDTH + (size_t)g * WIDTH;
         const bf16* wrow = w + ((size_t)g * R + r) * WIDTH;
+        /* EIGHT ELEMENTS PER LANE PER STEP. One-at-a-time was already coalesced
+         * across the wave, but each step moved only 64 * 2 = 128 B and needed a
+         * full address computation; `ld_glob8` covers 512 B per lane-step and
+         * `dot8` is 4 v_dot2c_f32_bf16 with no converts. Same accumulation order
+         * within a lane, same wave reduction, so the numerics are unchanged. */
         float acc = 0.0f;
-        for (unsigned k = lane; k < WIDTH; k += 64) acc += bf2f(orow[k]) * bf2f(wrow[k]);
+        if ((WIDTH & 7u) == 0u) {
+            for (unsigned k = lane * 8u; k < WIDTH; k += 64u * 8u)
+                acc = dot8(ld_glob8(orow + k), ld_glob8(wrow + k), acc);
+        } else {
+            for (unsigned k = lane; k < WIDTH; k += 64) acc += bf2f(orow[k]) * bf2f(wrow[k]);
+        }
         for (unsigned d = 32; d; d >>= 1) acc += __shfl_down(acc, d, 64);
         if (lane == 0) st_act1(&out[(size_t)t * GRP * R + i], f2bf(acc));
     }
