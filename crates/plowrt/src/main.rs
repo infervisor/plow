@@ -208,6 +208,9 @@ enum Cmd {
         /// Comma-separated; this is the "zero vs merely wrong" instrument.
         #[arg(long, default_value = "act.x,act.hn,act.logits")]
         inspect: String,
+        /// Inspect this TP rank without requiring the tensor to be replicated.
+        #[arg(long)]
+        inspect_rank: Option<usize>,
         /// List the blob's tensors and exit.
         #[arg(long, default_value_t = false)]
         list_tensors: bool,
@@ -448,6 +451,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             checkpoint,
             prompt,
             inspect,
+            inspect_rank,
             list_tensors,
             dump,
             load_dir,
@@ -462,6 +466,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             checkpoint,
             prompt,
             inspect,
+            inspect_rank,
             list_tensors,
             dump,
             load_dir,
@@ -1418,6 +1423,7 @@ fn amd_block(
     checkpoint: Option<PathBuf>,
     prompt: Option<String>,
     inspect: String,
+    inspect_rank: Option<usize>,
     list_tensors: bool,
     dump: Option<PathBuf>,
     load_dir: Option<PathBuf>,
@@ -1432,6 +1438,9 @@ fn amd_block(
     if tp == 0 {
         return Err("--tp must be at least 1".into());
     }
+    if inspect_rank.is_some_and(|rank| rank >= tp) {
+        return Err(format!("--inspect-rank must be below --tp {tp}").into());
+    }
     if tp > 1 {
         return amd_block_tp(
             blob,
@@ -1439,6 +1448,7 @@ fn amd_block(
             checkpoint,
             prompt,
             inspect,
+            inspect_rank,
             list_tensors,
             dump,
             load_dir,
@@ -1599,6 +1609,7 @@ fn amd_block_tp(
     checkpoint: Option<PathBuf>,
     prompt: Option<String>,
     inspect: String,
+    inspect_rank: Option<usize>,
     list_tensors: bool,
     dump: Option<PathBuf>,
     load_dir: Option<PathBuf>,
@@ -1701,18 +1712,21 @@ fn amd_block_tp(
         group.decode_block_step(pos + step, kvlen + step)?;
         if forced.is_some() && query_rows == 1 {
             for (name, sequence) in inspect_names.iter().zip(&mut sequence_outputs) {
-                let Some(row) = read_block_tensor(group.rank(0), name)? else {
+                let rank = inspect_rank.unwrap_or(0);
+                let Some(row) = read_block_tensor(group.rank(rank), name)? else {
                     continue;
                 };
-                for rank in 1..tp {
-                    let got = read_block_tensor(group.rank(rank), name)?.ok_or_else(|| {
-                        format!("tensor {name:?} exists on rank 0 but not rank {rank}")
-                    })?;
-                    if got != row {
-                        return Err(format!(
-                            "TP serial replay {name:?} differs between rank 0 and rank {rank} at step {step}"
-                        )
-                        .into());
+                if inspect_rank.is_none() {
+                    for peer in 1..tp {
+                        let got = read_block_tensor(group.rank(peer), name)?.ok_or_else(|| {
+                            format!("tensor {name:?} exists on rank 0 but not rank {peer}")
+                        })?;
+                        if got != row {
+                            return Err(format!(
+                                "TP serial replay {name:?} differs between rank 0 and rank {peer} at step {step}"
+                            )
+                            .into());
+                        }
                     }
                 }
                 sequence.extend_from_slice(&row);
@@ -1734,13 +1748,14 @@ fn amd_block_tp(
     );
     for (name, sequence_raw) in inspect_names.iter().zip(&sequence_outputs) {
         let sequence = (!sequence_raw.is_empty()).then_some(sequence_raw.as_slice());
-        let loaded = read_block_tensor(group.rank(0), name)?;
+        let rank = inspect_rank.unwrap_or(0);
+        let loaded = read_block_tensor(group.rank(rank), name)?;
         let Some(reference) = sequence.or(loaded.as_deref()) else {
             println!("{name:<16} {:>12}", "(absent)");
             continue;
         };
         print_block_tensor(name, reference);
-        if sequence.is_none() {
+        if sequence.is_none() && inspect_rank.is_none() {
             for rank in 1..tp {
                 let got = read_block_tensor(group.rank(rank), name)?.ok_or_else(|| {
                     format!("tensor {name:?} exists on rank 0 but not rank {rank}")
@@ -1759,7 +1774,14 @@ fn amd_block_tp(
         }
     }
     if let Some(dir) = &dump {
-        println!("\nwrote rank-identical raw tensors to {}", dir.display());
+        if let Some(rank) = inspect_rank {
+            println!(
+                "\nwrote rank-local raw tensors from rank {rank} to {}",
+                dir.display()
+            );
+        } else {
+            println!("\nwrote rank-identical raw tensors to {}", dir.display());
+        }
     }
     Ok(())
 }

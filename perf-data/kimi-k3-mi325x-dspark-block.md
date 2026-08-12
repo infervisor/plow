@@ -80,6 +80,7 @@ nix develop --command env \
     --warmup 2 --reps 21 --inspect act.xnext
 ```
 
-The next gate is an eight-row target verifier with versioned KDA/conv state.
-Only measured acceptance and `plowrt serve` effective TPOT can establish the
-50 tok/s B1 goal.
+The eight-row target verifier and versioned KDA/conv state are implemented,
+but the full-depth serial-equivalence gate fails. Speculative serving and
+acceptance measurement remain blocked; see
+`perf-data/kimi-k3-mi325x-dspark-verifier.md`.
