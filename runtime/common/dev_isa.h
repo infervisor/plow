@@ -1029,6 +1029,19 @@ enum {
      * descriptor: wq,wk,wv, cs0q,cs0k,cs0v, cs1q,cs1k,cs1v, A_log,dt_bias,in.pos,parked. */
     PLOW_DOP_KDA_CONV_STATE_STEP_G = 120,
 
+    /* ---- DeepSeek-V4. Operand slots are documented on the Rust `DevOp`
+     * variants (crates/packet/src/dev.rs); dev_opcodes.rs locks the values. */
+    PLOW_DOP_V4_HC_REDUCE = 121,
+    PLOW_DOP_V4_HC_EXPAND = 122,
+    PLOW_DOP_V4_HC_REDUCE_HEAD = 123,
+    PLOW_DOP_V4_SPARSE_ATTN = 124,
+    PLOW_DOP_V4_KV_COMPRESS = 125,
+    PLOW_DOP_V4_INDEX_SCORE = 126,
+    PLOW_DOP_V4_INDEX_TOPK = 127,
+    PLOW_DOP_V4_GROUPED_LINEAR = 128,
+    PLOW_DOP_V4_MOE_ROUTE = 129,
+    PLOW_DOP_V4_CLAMPED_SWIGLU = 130,
+
     PLOW_DOP__COUNT
 };
 

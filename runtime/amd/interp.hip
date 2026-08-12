@@ -49,6 +49,7 @@
 #include "amd_common.h"
 #include "op_attention.h"
 #include "op_collective.h"
+#include "op_deepseek_v4.h"
 #include "op_elementwise.h"
 #include "op_gemm.h"
 #if PLOW_K3
@@ -1982,6 +1983,54 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         case PLOW_DOP_SITU_GLU:
             d_situ_glu((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
                        in->fj[0].f, in->fj[1].f, slice, nblk);
+            break;
+        /* ---- DeepSeek-V4. Operand slots are on the Rust `DevOp` variants. ---- */
+        case PLOW_DOP_V4_HC_REDUCE:
+            d_hc_reduce((bf16*)TEN(0), (float*)TEN(5), (const bf16*)TEN(1), (const float*)TEN(2),
+                        (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1], in->i[2],
+                        in->i[3], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_HC_EXPAND:
+            d_hc_expand((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                        (const float*)TEN(3), in->i[0], in->i[1], in->i[2], slice, nblk);
+            break;
+        case PLOW_DOP_V4_HC_REDUCE_HEAD:
+            d_hc_reduce_head((bf16*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
+                             (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1],
+                             in->i[2], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_SPARSE_ATTN:
+            d_v4_sparse_attn((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                             (const int*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1],
+                             in->i[2], in->i[3], in->fj[0].f, slice, nblk);
+            break;
+        case PLOW_DOP_V4_KV_COMPRESS:
+            d_v4_kv_compress((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                             (const bf16*)TEN(3), (const float*)TEN(4), (const bf16*)TEN(5),
+                             in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, slice,
+                             nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_INDEX_SCORE:
+            d_v4_index_score((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                             (const bf16*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[3], slice,
+                             nblk);
+            break;
+        case PLOW_DOP_V4_INDEX_TOPK:
+            d_v4_index_topk((int*)TEN(0), (const float*)TEN(1), in->i[0], in->i[1], in->i[2],
+                            in->i[3], (int)in->i[4], slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_GROUPED_LINEAR:
+            d_v4_grouped_linear((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                                in->i[1], in->i[2], in->i[3], slice, nblk);
+            break;
+        case PLOW_DOP_V4_MOE_ROUTE:
+            d_v4_moe_route((int*)TEN(0), (float*)TEN(1), (const float*)TEN(2), (const float*)TEN(3),
+                           (const long long*)TEN(4), (const int*)TEN(5), in->i[0], in->i[1],
+                           in->i[2], in->fj[0].f, slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_CLAMPED_SWIGLU:
+            d_v4_clamped_swiglu((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                                in->fj[0].f);
             break;
         case PLOW_DOP_MLA_OUT_GATE:
             d_mla_out_gate((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0], slice,

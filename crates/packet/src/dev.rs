@@ -1358,6 +1358,99 @@ pub enum DevOp {
     /// `t0=o t1=q_raw t2=k_raw t3=v_raw t4=g_raw t5=beta_raw t6=state t7=descriptor` ·
     /// `i0=T(1) i1=H i2=D i3=BV i4=flags i5=W i6=gate_mode` · `f0=scale f1=lower_bound`.
     KdaConvStateStepG = 120,
+
+    // ---- DeepSeek-V4 -------------------------------------------------------
+    /// **Hyper-connection reduce.** Collapses the `hc` parallel residual streams
+    /// to the single vector a sub-layer consumes, and stashes the coefficients
+    /// its paired [`DevOp::V4HcExpand`] needs.
+    ///
+    /// `t0=out([T,D] bf16) t1=x([T,hc,D] bf16) t2=hc_fn([mix,hc*D] f32)
+    /// t3=hc_scale([3] f32) t4=hc_base([mix] f32) t5=mix_out([T,hc+hc*hc] f32)` ·
+    /// `i0=T i1=D i2=hc i3=sinkhorn_iters` · `f0=norm_eps f1=hc_eps`,
+    /// with `mix = (2 + hc) * hc`.
+    ///
+    /// V4 has NO residual add: this and `V4HcExpand` are what stand in its
+    /// place at all 86 sub-layer boundaries. `t5` is a compiler-owned scratch,
+    /// not a checkpoint tensor — the expand reads it rather than re-running the
+    /// projection, which would cost 393K MAC per token to recover ~64 flops.
+    V4HcReduce = 121,
+    /// **Hyper-connection expand.** `out[k] = post[k]*branch + sum_j comb[j][k]*residual[j]`.
+    ///
+    /// `t0=out([T,hc,D] bf16) t1=branch([T,D] bf16) t2=residual([T,hc,D] bf16)
+    /// t3=mix_in([T, hc+hc*hc] f32)` · `i0=T i1=D i2=hc`.
+    ///
+    /// `t0` MAY alias `t2`: every output element reads the whole stream vector
+    /// at its own `(t, d)` before storing any of it.
+    V4HcExpand = 122,
+    /// **Final hyper-connection reduce** (`Block.hc_head`), feeding the lm_head.
+    /// A different formula from [`DevOp::V4HcReduce`], not a special case:
+    /// `[hc, hc*D]` weights, a scalar scale, a sigmoid gate, no Sinkhorn.
+    ///
+    /// `t0=out([T,D]) t1=x([T,hc,D]) t2=hc_fn([hc,hc*D] f32) t3=scale([1] f32)
+    /// t4=base([hc] f32)` · `i0=T i1=D i2=hc` · `f0=norm_eps f1=hc_eps`.
+    V4HcReduceHead = 123,
+    /// **Sparse attention with a learned sink** — V4's only attention op.
+    ///
+    /// `t0=out([T,H,D] bf16) t1=q([T,H,D] bf16) t2=kv([NKV,D] bf16, K AND V)
+    /// t3=idx([T,TOPK] i32) t4=sink([H] f32)` · `i0=T i1=H i2=D i3=TOPK` ·
+    /// `f0=scale`.
+    ///
+    /// The window and the compressed history are ONE index list, so there is no
+    /// dense arm. `idx == -1` is inert (-inf score, zeroed KV row). The sink
+    /// joins the DENOMINATOR only — it has no value row.
+    V4SparseAttn = 124,
+    /// **Learned KV compressor**, prefill form: pools every `ratio` tokens into
+    /// one entry. The only rate-changing op in the model.
+    ///
+    /// `t0=out([T/ratio,D] bf16) t1=x([T,HID] bf16) t2=wkv([COFF*D,HID] bf16)
+    /// t3=wgate([COFF*D,HID] bf16) t4=ape([ratio,COFF*D] f32) t5=norm_w([D] bf16)` ·
+    /// `i0=T i1=HID i2=D i3=ratio i4=overlap` · `f0=eps`.
+    ///
+    /// `overlap` (the ratio-4 layers) doubles the projection width and pools
+    /// `2*ratio` rows: the previous window through the FIRST half, the current
+    /// through the SECOND. The softmax is per OUTPUT DIM, not per row.
+    V4KvCompress = 125,
+    /// **Indexer scoring.** `score[t][c] = sum_h relu(q[t][h] . ckv[c]) * w[t][h]`,
+    /// the relu INSIDE the head sum.
+    ///
+    /// `t0=score([T,NC] f32) t1=q([T,H,HD] bf16) t2=ckv([NC,HD] bf16)
+    /// t3=w([T,H] bf16, pre-scaled)` · `i0=T i1=H i2=HD i3=NC`.
+    ///
+    /// Under TP the score must be ALL-REDUCED before [`DevOp::V4IndexTopk`]:
+    /// the selection is a collective, and ranks that disagree on the set decode
+    /// different tokens.
+    V4IndexScore = 126,
+    /// **Indexer top-k**, with the prefill causal mask and the KV-ring offset.
+    ///
+    /// `t0=idx([T,K] i32) t1=score([T,NC] f32)` ·
+    /// `i0=T i1=NC i2=K i3=causal_ratio i4=offset`.
+    ///
+    /// `causal_ratio != 0` limits query `t` to entries below `(t+1)/ratio`.
+    /// Ties go to the LOWER index so the choice is deterministic across ranks.
+    V4IndexTopk = 127,
+    /// **Block-diagonal projection** (`wo_a`): each group projects only its own
+    /// slice of the head axis, from one stacked tensor.
+    ///
+    /// `t0=out([T,G*R] bf16) t1=o([T,G*W] bf16) t2=w([G*R,W] bf16)` ·
+    /// `i0=T i1=G i2=R i3=W`.
+    V4GroupedLinear = 128,
+    /// **MoE routing**, scored or hash-routed.
+    ///
+    /// `t0=sel([T,K] i32) t1=wts([T,K] f32) t2=logits([T,E] f32)
+    /// t3=bias([E] f32 or NONE) t4=tid2eid([V,K] i64 or NONE) t5=ids([T] i32)` ·
+    /// `i0=T i1=E i2=K` · `f0=route_scale`.
+    ///
+    /// Scoring is `sqrt(softplus(x))`. The bias shifts SELECTION only; the
+    /// weights come from the unbiased scores, renormalized over the selected
+    /// set. `t4 != NONE` selects hash routing, which ignores the scores for
+    /// selection entirely.
+    V4MoeRoute = 129,
+    /// **Clamped SwiGLU** — every expert (`swiglu_limit: 10`).
+    /// `silu(min(gate,limit)) * clamp(up,-limit,limit)`: one-sided on the gate,
+    /// two-sided on the up branch.
+    ///
+    /// `t0=out t1=gate t2=up` · `i0=n` · `f0=limit`. All three are `[n]` bf16.
+    V4ClampedSwiGlu = 130,
 }
 
 impl DevOp {
@@ -1488,6 +1581,16 @@ impl DevOp {
         DevOp::IndexSelectPf,
         DevOp::IndexUnionPf,
         DevOp::KdaConvStateStepG,
+        DevOp::V4HcReduce,
+        DevOp::V4HcExpand,
+        DevOp::V4HcReduceHead,
+        DevOp::V4SparseAttn,
+        DevOp::V4KvCompress,
+        DevOp::V4IndexScore,
+        DevOp::V4IndexTopk,
+        DevOp::V4GroupedLinear,
+        DevOp::V4MoeRoute,
+        DevOp::V4ClampedSwiGlu,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1629,6 +1732,16 @@ impl DevOp {
             DevOp::IndexSelectPf => "PLOW_DOP_INDEX_SELECT_PF",
             DevOp::IndexUnionPf => "PLOW_DOP_INDEX_UNION_PF",
             DevOp::KdaConvStateStepG => "PLOW_DOP_KDA_CONV_STATE_STEP_G",
+            DevOp::V4HcReduce => "PLOW_DOP_V4_HC_REDUCE",
+            DevOp::V4HcExpand => "PLOW_DOP_V4_HC_EXPAND",
+            DevOp::V4HcReduceHead => "PLOW_DOP_V4_HC_REDUCE_HEAD",
+            DevOp::V4SparseAttn => "PLOW_DOP_V4_SPARSE_ATTN",
+            DevOp::V4KvCompress => "PLOW_DOP_V4_KV_COMPRESS",
+            DevOp::V4IndexScore => "PLOW_DOP_V4_INDEX_SCORE",
+            DevOp::V4IndexTopk => "PLOW_DOP_V4_INDEX_TOPK",
+            DevOp::V4GroupedLinear => "PLOW_DOP_V4_GROUPED_LINEAR",
+            DevOp::V4MoeRoute => "PLOW_DOP_V4_MOE_ROUTE",
+            DevOp::V4ClampedSwiGlu => "PLOW_DOP_V4_CLAMPED_SWIGLU",
         }
     }
 
@@ -1658,7 +1771,8 @@ impl DevOp {
     /// bump: this constant is one past the HIGHEST opcode, not a count, and adding a pair moves it
     /// by two whether or not the range has holes.
     /// 116 -> 117 for `XReduceAddNorm = 116` (the fused TP seam).
-    pub const COUNT: u16 = 121;
+    /// 121 -> 131 for the ten DeepSeek-V4 opcodes (121..=130).
+    pub const COUNT: u16 = 131;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
