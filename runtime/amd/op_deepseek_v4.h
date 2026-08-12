@@ -1189,3 +1189,121 @@ __device__ void d_v4_hc_mix(bf16* __restrict__ out, float* __restrict__ mix_out,
         __syncthreads();
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * KV compressor — DECODE step (the incremental form).
+ * ---------------------------------------------------------------------------
+ *
+ * `d_v4_kv_compress` above is the prefill form: it pools whole windows out of a
+ * sequence that is already there. At decode a token arrives at a time, so the
+ * compressor carries a per-sequence window STATE and emits one compressed entry
+ * every `ratio` steps. That state is a runtime resource exactly like the KV
+ * cache, which is why it is an operand here and not a graph edge.
+ *
+ * THE PROJECTIONS ARE NOT DONE HERE. `wkv`/`wgate` are `[COFF*D, HID]` and at
+ * decode that is an ordinary GEMV, which this tree already has a tuned arm for.
+ * Doing it inside this op would put 4.2M MAC per layer on whatever grid the
+ * state update wants — the same mistake the first hyper-connection reduce made.
+ * So the emitter issues two `Gemv` packets and hands the results in.
+ *
+ * `kv_p`     [COFF*D] f32   wkv  @ x   for this token
+ * `sc_p`     [COFF*D] f32   wgate@ x   for this token
+ * `kv_state` [COFF*ratio, COFF*D] f32  persistent window state
+ * `sc_state` [COFF*ratio, COFF*D] f32  persistent, holds scores + ape
+ * `out`      [D] bf16       the compressed entry, written ONLY on an emit step
+ *
+ * TRANSCRIBED FROM `Compressor.forward` at `start_pos > 0`:
+ *
+ *   score += ape[start_pos % ratio]
+ *   plain:    state[start_pos % ratio] = (kv, score)
+ *             emit when (start_pos+1) % ratio == 0, pooling `ratio` rows
+ *   overlap:  state[ratio + start_pos % ratio] = (kv, score)
+ *             emit pools 2*ratio rows: the FIRST half's columns [0:D] from
+ *             state rows [0,ratio), the SECOND half's columns [D:2D] from rows
+ *             [ratio,2*ratio) — then SHIFTS state[:ratio] = state[ratio:]
+ *
+ * The shift is what makes an overlapped window see the previous one, and it is
+ * the piece with no prefill counterpart: prefill has both windows in hand at
+ * once. `start_pos` is patched per step by the host, as `out_row0` already is
+ * at every headnorm site.
+ *
+ * NOT AN EMIT STEP => THIS OP WRITES NOTHING to `out`. The caller must not
+ * consume `out` on those steps; the emitter knows the cadence statically from
+ * `ratio` even though `start_pos` is runtime. */
+__device__ void d_v4_kv_compress_step(bf16* __restrict__ out, float* __restrict__ kv_state,
+                                      float* __restrict__ sc_state,
+                                      const float* __restrict__ kv_p,
+                                      const float* __restrict__ sc_p,
+                                      const float* __restrict__ ape,
+                                      const bf16* __restrict__ norm_w, unsigned D, unsigned ratio,
+                                      unsigned overlap, unsigned start_pos, float eps,
+                                      unsigned slice, unsigned nblk, float* __restrict__ lds) {
+    if (ratio == 0) return;
+    const unsigned COFF = overlap ? 2u : 1u;
+    const unsigned W = COFF * D;                  /* projection width      */
+    const unsigned NROW = overlap ? 2u * ratio : ratio;
+    const unsigned phase = start_pos % ratio;
+    const unsigned slot = overlap ? (ratio + phase) : phase;
+    const bool emit = ((start_pos + 1u) % ratio) == 0u;
+
+    /* Every block writes the same state slot with the same values — the update
+     * is idempotent, so no cross-block ordering is needed for it. Only the
+     * pooling below is partitioned. */
+    for (unsigned i = threadIdx.x; i < W; i += PLOW_THREADS) {
+        kv_state[(size_t)slot * W + i] = kv_p[i];
+        sc_state[(size_t)slot * W + i] = sc_p[i] + ape[(size_t)phase * W + i];
+    }
+    __threadfence();
+    __syncthreads();
+    if (!emit) return;
+
+    /* Pool. Each thread owns output dims; the softmax is per dim over the rows,
+     * as in the prefill form. */
+    float* red = lds;
+    for (unsigned d = slice * PLOW_THREADS + threadIdx.x; d < D; d += nblk * PLOW_THREADS) {
+        float m = -INFINITY, l = 0.0f, acc = 0.0f;
+        for (unsigned r = 0; r < NROW; r++) {
+            /* Overlap: rows [0,ratio) contribute their FIRST half's column d,
+             * rows [ratio,2r) their SECOND half's. */
+            const unsigned col = (overlap && r >= ratio) ? (D + d) : d;
+            const float sc = sc_state[(size_t)r * W + col];
+            const float kv = kv_state[(size_t)r * W + col];
+            const float mn = fmaxf(m, sc);
+            const float resc = (m == -INFINITY) ? 0.0f : __expf(m - mn);
+            /* `sc_state` starts at -inf so the FIRST window of an overlapped
+             * layer has no predecessor. `exp(-inf - -inf)` is NaN, not 0, and
+             * that NaN is the whole difference between this and the prefill
+             * form — which never evaluates those rows because it skips group 0's
+             * missing predecessor outright. Measured: with this unguarded,
+             * groups 1..7 matched prefill EXACTLY and group 0 was 3.2. */
+            const float pe = (sc == -INFINITY) ? 0.0f : __expf(sc - mn);
+            acc = acc * resc + pe * kv;
+            l = l * resc + pe;
+            m = mn;
+        }
+        red[d] = (l > 0.0f) ? acc / l : 0.0f;
+    }
+    __syncthreads();
+
+    /* RMSNorm over the pooled entry, then publish. */
+    float ss = 0.0f;
+    for (unsigned d = threadIdx.x; d < D; d += PLOW_THREADS) ss += red[d] * red[d];
+    for (int o = 32; o; o >>= 1) ss += __shfl_xor(ss, o);
+    float* wr = lds + D;
+    if ((threadIdx.x & 63u) == 0) wr[threadIdx.x >> 6] = ss;
+    __syncthreads();
+    float tot = 0.0f;
+    for (unsigned w = 0; w < (PLOW_THREADS >> 6); w++) tot += wr[w];
+    const float rs = rsqrtf(tot / (float)D + eps);
+    for (unsigned d = threadIdx.x; d < D; d += PLOW_THREADS)
+        st_act1(&out[d], f2bf(red[d] * rs * bf2f(norm_w[d])));
+    __syncthreads();
+
+    /* The overlap SHIFT: this window becomes the next one's predecessor. */
+    if (overlap)
+        for (unsigned i = threadIdx.x; i < (size_t)ratio * W; i += PLOW_THREADS) {
+            kv_state[i] = kv_state[(size_t)ratio * W + i];
+            sc_state[i] = sc_state[(size_t)ratio * W + i];
+        }
+    __syncthreads();
+}
