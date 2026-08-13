@@ -1051,3 +1051,239 @@ fn kimi_k3_never_builds_as_k2() {
         "a K3 config must not produce an all-softmax (K2-shaped) graph"
     );
 }
+
+// ---------------------------------------------------------------------------
+// DeepSeek-V4
+// ---------------------------------------------------------------------------
+
+/// A structurally faithful, scaled-down V4: hyper-connections on every
+/// sub-layer, one KV head, per-layer compress ratios (0 / 4 / 128), a sparse
+/// indexer on the ratio-4 layers, and hash-routed leading layers.
+///
+/// `drop_field`, when non-empty, removes one required key so the config must
+/// error instead of defaulting.
+fn v4_json(drop_field: &str) -> String {
+    let base = r#"{
+        "model_type": "deepseek_v4",
+        "vocab_size": 1000,
+        "hidden_size": 128,
+        "num_hidden_layers": 5,
+        "num_attention_heads": 4,
+        "head_dim": 32,
+        "qk_rope_head_dim": 8,
+        "q_lora_rank": 64,
+        "o_groups": 2,
+        "o_lora_rank": 16,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "sliding_window": 8,
+        "compress_ratios": [0, 0, 4, 128, 4, 0],
+        "compress_rope_theta": 160000.0,
+        "index_n_heads": 4,
+        "index_head_dim": 16,
+        "index_topk": 32,
+        "n_routed_experts": 8,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 64,
+        "num_hash_layers": 2,
+        "swiglu_limit": 10.0,
+        "routed_scaling_factor": 1.5,
+        "scoring_func": "sqrtsoftplus",
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 20,
+        "hc_eps": 1e-6,
+        "torch_dtype": "bfloat16"
+    }"#;
+    if drop_field.is_empty() {
+        return base.to_string();
+    }
+    base.lines()
+        .filter(|l| !l.trim_start().starts_with(&format!("\"{drop_field}\"")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn deepseek_v4_hyper_connections_and_compressed_kv() {
+    let g = build_from_config_json(&v4_json("")).expect("build deepseek-v4");
+    assert_fully_inferred(&g);
+    assert_eq!(output_shape_str(&g), "[B, S, 1000]");
+
+    // Two hyper-connection sub-layers per layer, plus the final head reduce;
+    // every reduce pairs with an expand except that head one.
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::HcReduce { .. })),
+        5 * 2 + 1
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::HcExpand { .. })),
+        5 * 2
+    );
+    // There is no residual add anywhere in this model: the only Add is the
+    // shared expert joining the routed one, once per layer.
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::Elementwise(nn_graph::op::EwKind::Add))),
+        5
+    );
+
+    // compress_ratios = [0,0,4,128,4] over 5 layers ⇒ 3 compressed layers, and
+    // each ratio-4 layer adds a second compressor inside its indexer.
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::KvCompress { .. })),
+        3 + 2
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::KvCompress { overlap: true, .. })),
+        2 + 2
+    );
+
+    // Every layer attends with a sink, projects out block-diagonally, and runs
+    // clamped SwiGLU in both its routed and its shared expert.
+    assert_eq!(
+        g.count_ops(|o| matches!(
+            o,
+            nn_graph::Op::Attention {
+                attn_sink: true,
+                ..
+            }
+        )),
+        5
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::GroupedLinear { .. })),
+        5
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::ClampedSwiGlu { limit } if *limit == 10.0)),
+        5 * 2
+    );
+
+    // num_hash_layers = 2 ⇒ layers 0,1 route from the token-id table and the
+    // other three from the biased scores. Getting this split wrong routes every
+    // token to a different expert set and still builds.
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::MoeRouter { hash: true, .. })),
+        2
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(
+            o,
+            nn_graph::Op::MoeRouter {
+                hash: false,
+                select_bias: true,
+                ..
+            }
+        )),
+        3
+    );
+
+    // The output de-rotation is a distinct rotation, once per layer.
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::Rope { inverse: true, .. })),
+        5
+    );
+}
+
+/// The manifest is the loader's contract, and V4 spells its tensors its own
+/// way — `layers.N.attn.wq_a`, not V2/V3's `model.layers.N.self_attn.*`.
+#[test]
+fn deepseek_v4_weight_manifest_matches_checkpoint_contract() {
+    let g = build_from_config_json(&v4_json("")).expect("build deepseek-v4");
+    let manifest = g.weight_manifest();
+    let names: std::collections::HashSet<&str> = manifest.iter().map(|w| w.name).collect();
+
+    for want in [
+        "embed.weight",
+        "norm.weight",
+        "head.weight",
+        "hc_head_fn",
+        "hc_head_scale",
+        "hc_head_base",
+        "layers.0.hc_attn_fn",
+        "layers.0.hc_ffn_base",
+        "layers.0.attn_norm.weight",
+        "layers.0.ffn_norm.weight",
+        "layers.0.attn.wq_a.weight",
+        "layers.0.attn.q_norm.weight",
+        "layers.0.attn.wq_b.weight",
+        "layers.0.attn.wkv.weight",
+        "layers.0.attn.kv_norm.weight",
+        "layers.0.attn.attn_sink",
+        "layers.0.attn.wo_a.weight",
+        "layers.0.attn.wo_b.weight",
+        "layers.0.ffn.gate.weight",
+        "layers.0.ffn.gate.tid2eid",
+        "layers.2.ffn.gate.bias",
+        "layers.0.ffn.experts.0.w1.weight",
+        "layers.0.ffn.experts.0.w2.weight",
+        "layers.0.ffn.experts.0.w3.weight",
+        "layers.0.ffn.shared_experts.w1.weight",
+        "layers.2.attn.compressor.wkv.weight",
+        "layers.2.attn.compressor.wgate.weight",
+        "layers.2.attn.compressor.ape",
+        "layers.2.attn.compressor.norm.weight",
+        "layers.2.attn.indexer.wq_b.weight",
+        "layers.2.attn.indexer.weights_proj.weight",
+        "layers.2.attn.indexer.compressor.ape",
+    ] {
+        assert!(names.contains(want), "manifest is missing {want}");
+    }
+
+    // A hash layer has no selection bias; a scored layer has no lookup table.
+    assert!(!names.contains("layers.0.ffn.gate.bias"));
+    assert!(!names.contains("layers.2.ffn.gate.tid2eid"));
+    // Sliding-window-only layers have neither compressor nor indexer, and a
+    // ratio-128 layer compresses without indexing.
+    assert!(!names.contains("layers.0.attn.compressor.wkv.weight"));
+    assert!(names.contains("layers.3.attn.compressor.wkv.weight"));
+    assert!(!names.contains("layers.3.attn.indexer.wq_b.weight"));
+
+    let shape_of = |n: &str| {
+        manifest
+            .iter()
+            .find(|w| w.name == n)
+            .unwrap_or_else(|| panic!("missing V4 weight {n}"))
+            .shape
+            .map(|s| format!("{s}"))
+            .expect("weight shape")
+    };
+    // wo_a is ONE stacked [groups*rank, group_width] tensor, not `groups`
+    // separate projections, and the overlapped compressor projects twice its
+    // output width while the plain one does not.
+    assert_eq!(shape_of("layers.0.attn.wo_a.weight"), "[32, 64]");
+    assert_eq!(shape_of("layers.0.attn.wq_b.weight"), "[128, 64]");
+    assert_eq!(shape_of("layers.0.attn.wkv.weight"), "[32, 128]");
+    assert_eq!(shape_of("layers.2.attn.compressor.wkv.weight"), "[64, 128]");
+    assert_eq!(shape_of("layers.3.attn.compressor.wkv.weight"), "[32, 128]");
+    assert_eq!(shape_of("layers.0.hc_attn_fn"), "[24, 512]");
+    assert_eq!(shape_of("hc_head_fn"), "[4, 512]");
+    assert_eq!(shape_of("layers.0.ffn.gate.tid2eid"), "[1000, 2]");
+}
+
+#[test]
+fn deepseek_v4_partial_config_is_rejected_not_defaulted() {
+    // Geometry with no honest default: without it the graph would model a
+    // different attention or residual shape and still build.
+    for field in ["head_dim", "o_groups", "hc_mult", "compress_ratios"] {
+        let err = build_from_config_json(&v4_json(field))
+            .expect_err("a V4 config missing required geometry must not build");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing field"),
+            "V4 must fail on the missing {field} rather than defaulting, got: {msg}"
+        );
+    }
+}
+
+/// `DeepseekV4ForCausalLM` must not fall through to the V2/V3 prefix arms: a V3
+/// build would model MLA with a `kv_lora_rank` this checkpoint has no tensor for.
+#[test]
+fn deepseek_v4_architectures_fallback_does_not_reach_v3() {
+    let cfg = r#"{"architectures": ["DeepseekV4ForCausalLM"], "hidden_size": 128}"#;
+    let err = build_from_config_json(cfg).expect_err("no geometry ⇒ must not build");
+    assert!(
+        err.to_string().contains("missing field"),
+        "V4 must be claimed by its own arm, got: {err}"
+    );
+}

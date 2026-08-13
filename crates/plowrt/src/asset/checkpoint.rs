@@ -9,6 +9,86 @@ use rustc_hash::FxHashMap;
 
 use crate::{Result, RuntimeError};
 
+/// One header entry, as the file states it.
+struct RawInfo {
+    /// The dtype STRING, not an enum. See [`read_header`].
+    dtype: String,
+    shape: Vec<usize>,
+    begin: usize,
+    end: usize,
+}
+
+/// Parse a safetensors header directly instead of through
+/// `SafeTensors::read_metadata`.
+///
+/// THE CRATE'S `Dtype` IS A CLOSED ENUM AND CHECKPOINTS ARE NOT. DeepSeek-V4
+/// ships `F8_E8M0` scale tensors; safetensors 0.4 has no such variant, so
+/// `read_metadata` fails the WHOLE SHARD with `InvalidHeaderDeserialization` —
+/// not just the tensor it cannot name. The loader never needed the enum: it
+/// keeps a byte range, a shape, and one `fp8` bool, and every quantized layout
+/// is decided later by the packet that reads it. So the dtype stays a string
+/// here and an unknown one costs nothing.
+///
+/// The `__metadata__` key is skipped: it is a string map, not a tensor.
+fn read_header(map: &[u8]) -> std::result::Result<(usize, Vec<(String, RawInfo)>), String> {
+    if map.len() < 8 {
+        return Err("file shorter than the 8-byte header length".into());
+    }
+    let n = u64::from_le_bytes(map[..8].try_into().expect("8 bytes")) as usize;
+    let end = 8usize
+        .checked_add(n)
+        .filter(|e| *e <= map.len())
+        .ok_or_else(|| format!("header length {n} runs past the end of a {}-byte file", map.len()))?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&map[8..end]).map_err(|e| format!("header is not JSON: {e}"))?;
+    let obj = json.as_object().ok_or("header is not a JSON object")?;
+
+    let mut out = Vec::with_capacity(obj.len());
+    for (name, v) in obj {
+        if name == "__metadata__" {
+            continue;
+        }
+        let bad = |what: &str| format!("`{name}`: {what}");
+        let dtype = v
+            .get("dtype")
+            .and_then(|d| d.as_str())
+            .ok_or_else(|| bad("no dtype"))?
+            .to_string();
+        let shape = v
+            .get("shape")
+            .and_then(|s| s.as_array())
+            .ok_or_else(|| bad("no shape"))?
+            .iter()
+            .map(|d| d.as_u64().map(|x| x as usize).ok_or_else(|| bad("non-integer shape entry")))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let off = v
+            .get("data_offsets")
+            .and_then(|o| o.as_array())
+            .filter(|o| o.len() == 2)
+            .ok_or_else(|| bad("no 2-element data_offsets"))?;
+        let g = |i: usize| {
+            off[i]
+                .as_u64()
+                .map(|x| x as usize)
+                .ok_or_else(|| bad("non-integer data_offset"))
+        };
+        let (begin, end_off) = (g(0)?, g(1)?);
+        if end_off < begin {
+            return Err(bad("data_offsets run backwards"));
+        }
+        out.push((
+            name.clone(),
+            RawInfo {
+                dtype,
+                shape,
+                begin,
+                end: end_off,
+            },
+        ));
+    }
+    Ok((n, out))
+}
+
 /// Accumulated per-worker `Checkpoint::populate` time + bytes.
 ///
 /// `ns` is the **sum of Instant durations across all prefetch threads** — a
@@ -119,17 +199,15 @@ impl Checkpoint {
             }
 
             let t_meta = std::time::Instant::now();
-            let (header_len, meta) =
-                safetensors::SafeTensors::read_metadata(&map).map_err(|e| {
-                    RuntimeError::Device(format!("safetensors {}: {e}", path.display()))
-                })?;
+            let (header_len, meta) = read_header(&map)
+                .map_err(|e| RuntimeError::Device(format!("safetensors {}: {e}", path.display())))?;
             if let Some(t) = timing.as_mut() {
                 t.meta_ms += t_meta.elapsed().as_secs_f64() * 1e3;
             }
 
             let data_off = 8 + header_len;
             let shard = shards.len();
-            let tensors = meta.tensors();
+            let tensors = meta;
             tracing::debug!(
                 shard = shard,
                 file = %path.display(),
@@ -141,12 +219,12 @@ impl Checkpoint {
             index.reserve(tensors.len());
             for (name, info) in tensors {
                 index.insert(
-                    name.clone(),
+                    name,
                     Entry {
                         shard,
-                        range: info.data_offsets.0..info.data_offsets.1,
-                        shape: info.shape.clone(),
-                        fp8: matches!(info.dtype, safetensors::Dtype::F8_E4M3),
+                        range: info.begin..info.end,
+                        shape: info.shape,
+                        fp8: info.dtype == "F8_E4M3",
                     },
                 );
             }

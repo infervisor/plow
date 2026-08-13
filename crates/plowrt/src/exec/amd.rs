@@ -310,7 +310,18 @@ impl Variant {
                 {
                     return Variant::Fp8Kv;
                 }
-                if i.op == DevOp::GemvFp8 as u16 {
+                // BLOCK-fp8 counts too. A program whose every projection is
+                // `GemvFp8Blk` and whose experts are `MoeExpert*Fp8Blk` is not
+                // bf16 by any reading, but this used to say so — and then asked
+                // for a bf16 object that is not built, so the load died naming a
+                // missing file rather than the wrong precision. Every model that
+                // reached `Fp8`/`Fp8Kv` before still does: they all carry an fp8
+                // flash op, which returns above this line.
+                if i.op == DevOp::GemvFp8 as u16
+                    || i.op == DevOp::GemvFp8Blk as u16
+                    || i.op == DevOp::MoeExpertGluFp8Blk as u16
+                    || i.op == DevOp::MoeExpertDownFp8Blk as u16
+                {
                     v = Variant::Fp8;
                 }
             }
@@ -972,6 +983,29 @@ const K3_ARM_OPS: &[DevOp] = &[
     DevOp::AttnRes,
     DevOp::SituGlu,
     DevOp::MlaOutGate,
+    // DeepSeek-V4. Every one of these sits inside interp.hip's `#if PLOW_K3`
+    // region, so on an object built without that flag the dispatch `default:`
+    // is a silent NOP — the whole model would run as a chain of no-ops and
+    // still emit tokens. Listing them here turns that into a load-time refusal
+    // naming the missing arm, which is the only form of this failure anyone
+    // can debug.
+    DevOp::V4HcReduce,
+    DevOp::V4HcExpand,
+    DevOp::V4HcReduceHead,
+    DevOp::V4HcDot,
+    DevOp::V4HcMix,
+    DevOp::V4HcZero,
+    DevOp::V4HcBroadcast,
+    DevOp::V4SparseAttnSplit,
+    DevOp::V4SparseAttnMerge,
+    DevOp::V4KvCompressStep,
+    DevOp::V4SparseAttn,
+    DevOp::V4KvCompress,
+    DevOp::V4IndexScore,
+    DevOp::V4IndexTopk,
+    DevOp::V4GroupedLinear,
+    DevOp::V4MoeRoute,
+    DevOp::V4ClampedSwiGlu,
 ];
 
 /// The first K3/KDA opcode in these programs, or `None` if the packet needs no K3 arm.
@@ -1961,7 +1995,8 @@ struct ExpertNames {
     proj: [&'static str; 3],
     /// `.weight` or `.weight_packed`.
     payload: &'static str,
-    /// `.weight_scale_inv` (block-fp8 f32 grid) or `.weight_scale` (E8M0 row).
+    /// `.weight_scale_inv` (block-fp8 f32 grid), or `.weight_scale` / `.scale`
+    /// (E8M0 row).
     scale: &'static str,
 }
 
@@ -1976,8 +2011,12 @@ impl ExpertNames {
 
     /// Is the scale an MX microscaling row (one E8M0 byte per 32 elements along
     /// K) rather than a block-fp8 `[N/128][K/128]` f32 grid?
+    /// Only the block-fp8 grid is NOT microscaled, so this asks that question
+    /// rather than listing the MX spellings — a third MX name (V4's bare
+    /// `.scale`) must not silently fall into the f32-grid branch, where the
+    /// geometry check would compare an E8M0 row against a `[N/128][K/128]` grid.
     fn microscaled(&self) -> bool {
-        self.scale == ".weight_scale"
+        self.scale != ".weight_scale_inv"
     }
 }
 
@@ -1998,14 +2037,32 @@ fn resolve_expert_names(
     ckpt: &crate::asset::checkpoint::Checkpoint,
     pfx: &str,
 ) -> Result<ExpertNames> {
-    const TEMPLATES: [([&str; 3], &str); 2] = [
+    const TEMPLATES: [([&str; 3], &str); 3] = [
         (["gate_proj", "up_proj", "down_proj"], ".weight"),
         (["w1", "w3", "w2"], ".weight_packed"),
+        // DeepSeek-V4: `w1/w3/w2` like the packed spelling, but a plain
+        // `.weight` payload (the fp4 nibble packing is in the DTYPE, not the
+        // name) and a bare `.scale`. Added AFTER the two above so every
+        // existing checkpoint still resolves on the probe it resolved on
+        // before.
+        (["w1", "w3", "w2"], ".weight"),
     ];
-    const SCALES: [&str; 2] = [".weight_scale_inv", ".weight_scale"];
+    const SCALES: [&str; 3] = [".weight_scale_inv", ".weight_scale", ".scale"];
     let base = pfx.strip_prefix("moe.").unwrap_or(pfx);
     let mut tried: Vec<String> = Vec::new();
-    for sub in ["", "mlp.", "block_sparse_moe."] {
+    // `mlp.` is stripped as a SECOND base because the packet's table name must
+    // end in `mlp.expert_weight_table` for `packet::names` to classify it as
+    // host-filled, while the checkpoint's own MoE namespace may be something
+    // else entirely — V4's is `layers.{l}.ffn.experts.`. Probed after the
+    // unstripped base so the documented first-candidate order is unchanged.
+    let bases: Vec<&str> = match base.strip_suffix("mlp.") {
+        Some(b) if b != base => vec![base, b],
+        _ => vec![base],
+    };
+    for (base, sub) in bases
+        .iter()
+        .flat_map(|b| ["", "mlp.", "block_sparse_moe.", "ffn."].map(|s| (*b, s)))
+    {
         for (proj, payload) in TEMPLATES {
             let ns = format!("{base}{sub}experts.");
             let probe = format!("{ns}0.{}{payload}", proj[0]);
@@ -3752,7 +3809,17 @@ impl AmdEngine {
         // a whole-layer GLM/Kimi/DeepSeek prefill packet selects the object
         // that actually has the arms instead of silently falling back to
         // `interp_prefill{,_gq}.elf`, whose `default:` case does not trap.
-        let prefill_arm = PrefillArm::detect(&blob.progs);
+        let mut prefill_arm = PrefillArm::detect(&blob.progs);
+        // A packet can need the K3 OBJECT without carrying a single K3 PREFILL
+        // op. DeepSeek-V4 is that packet: its V4* opcodes all live inside
+        // interp.hip's `#if PLOW_K3` region, but it emits no MLA/MoE prefill
+        // arm at all, so `PrefillArm::detect` returns `None` and the load asks
+        // for an object compiled without the region — where every V4 op is a
+        // silent NOP. `required_k3_op` is the same scan the load-time refusal
+        // uses, so the object SELECTED and the object DEMANDED cannot disagree.
+        if prefill_arm == PrefillArm::None && required_k3_op(&blob.progs).is_some() {
+            prefill_arm = PrefillArm::K3;
+        }
 
         // THE WIDEST GEMV EACH OBJECT WILL BE HANDED, split the way the objects
         // are. The decode program runs on the decode object; every prefill

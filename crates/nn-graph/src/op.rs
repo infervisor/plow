@@ -56,10 +56,14 @@ pub enum Op {
     /// Shape-preserving. `dim` rotated may be < head_dim (partial RoPE).
     /// `interleave`: when true, pairs (x[0],x[1]), (x[2],x[3])... (GLM-style);
     /// when false, pairs (x[0],x[d/2]), (x[1],x[d/2+1])... (Llama-style).
+    /// `inverse`: rotate by the conjugate angle. DeepSeek-V4 rotates the query
+    /// and key, then de-rotates the attention OUTPUT's rope lanes by the same
+    /// positions, so the two directions must be distinguishable.
     Rope {
         dim: u32,
         theta: f32,
         interleave: bool,
+        inverse: bool,
     },
 
     /// Pointwise activation. Inputs `[x]`. Shape-preserving.
@@ -75,9 +79,11 @@ pub enum Op {
     /// Softmax along `axis`. Inputs `[x]`. Shape-preserving.
     Softmax { axis: i32 },
 
-    /// Scaled-dot-product / flash attention. Inputs `[q, k, v]` (optionally a
-    /// 4th mask tensor). Output shape is Q with its last dim replaced by V's
-    /// last dim (these differ for MLA where `qk_head_dim != v_head_dim`).
+    /// Scaled-dot-product / flash attention. Inputs `[q, k, v]`, then the
+    /// optional mask, then the optional per-head sink — each present only when
+    /// its attribute says so, and always in that order. Output shape is Q with
+    /// its last dim replaced by V's last dim (these differ for MLA where
+    /// `qk_head_dim != v_head_dim`).
     /// Attributes drive lowering and document the variant.
     Attention {
         num_heads: u32,
@@ -88,6 +94,11 @@ pub enum Op {
         sliding_window: Option<u32>,
         /// Tanh logit soft-cap (Gemma2). Documentational for shape inference.
         logit_softcap: Option<f32>,
+        /// A learned per-head logit that joins the softmax denominator without
+        /// contributing a value row (DeepSeek-V4's `attn_sink`). When true the
+        /// last input is that `[heads]` weight. It shifts every probability in
+        /// the row, so a graph that dropped it would be plausible and wrong.
+        attn_sink: bool,
     },
 
     /// Token-embedding lookup. Inputs `[ids, table]` with `table: [vocab, H]`.
@@ -152,10 +163,25 @@ pub enum Op {
     /// `group` is DeepSeek's `noaux_tc` group-limited routing, which Kimi-K3
     /// and DeepSeek-V3 use and which is NOT the same expert set as a flat
     /// top-k. See [`MoeGroups`]; `None` is flat top-k over all experts.
+    ///
+    /// `hash` layers do not select experts from the scores at all: the expert
+    /// set is looked up from the token id through a frozen `[vocab, top_k]`
+    /// table, and the scores only supply the combine weights. Inputs are then
+    /// `[x, weight, ids, tid2eid]`. DeepSeek-V4's first `n_hash_layers` route
+    /// this way; scoring them like the rest picks a different expert set for
+    /// every token, which is exactly the silent-wrong-model failure the
+    /// `group` split above exists to prevent.
+    ///
+    /// `select_bias` is DeepSeek's per-expert selection bias: it is added to the
+    /// scores for the top-k comparison and then dropped, so it changes WHICH
+    /// experts run without changing their combine weights. When true it is the
+    /// input right after `weight`.
     MoeRouter {
         num_experts: u32,
         top_k: u32,
         group: Option<MoeGroups>,
+        hash: bool,
+        select_bias: bool,
     },
 
     /// Depthwise causal 1-D convolution over the sequence axis, `[B, S, C]`.
@@ -239,6 +265,118 @@ pub enum Op {
     /// (measured 3.0e-3 at the block output against 8.1e-1 at the mix itself),
     /// so a graph that used `Add` here would look right and be wrong.
     BlockResidual { max_snapshots: u32 },
+
+    /// DeepSeek-V4 hyper-connection **reduce**: collapse the `hc_mult` parallel
+    /// residual streams `[B, S, hc, D]` down to the single `[B, S, D]` a
+    /// sub-layer consumes.
+    ///
+    /// Inputs `[x, hc_fn, hc_scale, hc_base]`; `hc_fn` is `[mix, hc*D]` with
+    /// `mix = (2 + hc_mult) * hc_mult` for [`HcMode::Sinkhorn`] and `hc` for
+    /// [`HcMode::SigmoidGate`]. The mixing coefficients come from an
+    /// RMS-scaled projection of the flattened streams, so the weights are read
+    /// by both this op and the matching [`Op::HcExpand`].
+    HcReduce {
+        hc_mult: u32,
+        mode: HcMode,
+        eps: f32,
+    },
+
+    /// DeepSeek-V4 hyper-connection **expand**: write a sub-layer's output back
+    /// into the `hc_mult` residual streams, in place of a residual add.
+    ///
+    /// Inputs `[branch, residual, hc_fn, hc_scale, hc_base]` where `residual`
+    /// is the same `[B, S, hc, D]` the paired [`Op::HcReduce`] consumed; output
+    /// is shape-equal to `residual`. The post/combine coefficients are a pure
+    /// function of `residual` and these weights, which is why recomputing them
+    /// here keeps this enum's single-output invariant without changing what is
+    /// computed.
+    ///
+    /// # Why this is not `Add`
+    ///
+    /// The stream update is `post ⊗ branch + comb · residual` with a learned,
+    /// input-dependent, Sinkhorn-normalized `comb` mixing every stream into
+    /// every other. A plain residual add is the special case `hc_mult = 1,
+    /// post = comb = 1`; using it for a 4-stream model produces a graph that
+    /// type-checks and models a different network — the same reasoning that
+    /// made [`Op::BlockResidual`] its own op.
+    HcExpand {
+        hc_mult: u32,
+        sinkhorn_iters: u32,
+        eps: f32,
+    },
+
+    /// Block-diagonal linear: `groups` independent projections applied to the
+    /// matching slice of the input, from ONE checkpoint tensor.
+    ///
+    /// Inputs `[x, weight]` with `x: [.., groups, in]` and
+    /// `weight: [groups * out_features, in]`, viewed as
+    /// `[groups, out_features, in]`; output is `[.., groups, out_features]`.
+    ///
+    /// DeepSeek-V4's `wo_a` is this: 8 groups of attention heads each projected
+    /// by their own `[o_lora_rank, in]` block. It is not [`Op::Linear`] — that
+    /// is a dense `[groups*out, groups*in]` map, which mixes groups the
+    /// reference keeps separate — and it cannot be `groups` separate `Linear`s
+    /// either, because the manifest is the loader's contract and the checkpoint
+    /// ships exactly one tensor here.
+    GroupedLinear { groups: u32, out_features: i64 },
+
+    /// SwiGLU whose two branches are clamped before the product. Inputs
+    /// `[gate, up]`, shape-preserving:
+    ///
+    /// ```text
+    /// out = silu(min(gate, limit)) * clamp(up, -limit, limit)
+    /// ```
+    ///
+    /// # Why this is not `Act(Silu)` + `Mul`
+    ///
+    /// The clamp is one-sided on the gate and two-sided on the up branch, and
+    /// it binds only in the tail. Dropping it leaves a graph that agrees with
+    /// the reference on almost every token and diverges exactly where the
+    /// activation blows up — the failure mode [`Op::SituGlu`] was carved out
+    /// for. DeepSeek-V4 trains with `swiglu_limit = 10`.
+    ClampedSwiGlu { limit: f32 },
+
+    /// DeepSeek-V4's learned KV compressor: pool every `ratio` consecutive
+    /// tokens into one compressed KV entry, `[B, S, D] -> [B, S/ratio, out]`.
+    ///
+    /// Inputs `[x, wkv, wgate, ape, norm_weight]`. Within a window the gate
+    /// scores (plus the per-offset `ape` bias) are softmaxed and used to average
+    /// the projected KV; the result is RMS-normed. When `overlap` (the
+    /// `ratio == 4` layers) each window also carries the previous window's
+    /// half, which is why those layers' `wkv`/`wgate`/`ape` are twice as wide.
+    ///
+    /// # Why this is its own op
+    ///
+    /// It is the only op in the IR that changes the sequence rate, and the
+    /// overlapped form builds its windows by value-padding (`0` for KV, `-inf`
+    /// for the scores) — there is no pad op to express that with, and modelling
+    /// an overlapped layer as the non-overlapped one silently halves its
+    /// receptive field.
+    ///
+    /// `out_seq` names the compressed length. [`crate::Dim`] is a polynomial
+    /// with integer coefficients, so `S / ratio` is not a dim it can hold; the
+    /// builder passes a symbol (`Sc4`, `Sc128`) instead, one per rate, and
+    /// inference checks the relation whenever the input length is static.
+    KvCompress {
+        ratio: u32,
+        overlap: bool,
+        out_seq: crate::Dim,
+    },
+}
+
+/// How an [`Op::HcReduce`] turns its projection into per-stream weights.
+///
+/// The two modes are not a parameter of one formula: the per-layer reduce
+/// Sinkhorn-normalizes a `(2 + hc_mult) * hc_mult` block (which also yields the
+/// post/combine halves [`Op::HcExpand`] needs), while the final head reduce is
+/// a bare sigmoid gate over `hc_mult` coefficients with no normalization and no
+/// expand partner.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum HcMode {
+    /// Per-layer: `iters` rounds of Sinkhorn row/column normalization.
+    Sinkhorn { iters: u32 },
+    /// Final head: `sigmoid(mix * scale + base) + eps`, no normalization.
+    SigmoidGate,
 }
 
 /// DeepSeek `noaux_tc` group-limited expert routing.
@@ -297,6 +435,11 @@ impl Op {
             Op::LinearAttention { .. } => "linear_attention",
             Op::SituGlu { .. } => "situ_glu",
             Op::BlockResidual { .. } => "block_residual",
+            Op::HcReduce { .. } => "hc_reduce",
+            Op::HcExpand { .. } => "hc_expand",
+            Op::GroupedLinear { .. } => "grouped_linear",
+            Op::ClampedSwiGlu { .. } => "clamped_swiglu",
+            Op::KvCompress { .. } => "kv_compress",
         }
     }
 }

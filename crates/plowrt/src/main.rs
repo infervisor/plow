@@ -664,6 +664,27 @@ fn amd_bench(
         // ask whether TP's own geometry (K3's 12 local KDA heads at BV=8, against
         // the 96-head BV=16 shape every block gate validates) changed the answer.
         let dump = |e: &AmdEngine, tag: &str| -> Result<(), Box<dyn std::error::Error>> {
+            // PLOW_DUMP_ACT="name:path[,name:path...]" — the SAME instrument the TP
+            // path has carried (see `amd_bench_tp`'s dump), which single-GPU did not,
+            // so `PLOW_DUMP_ACT` set on a tp=1 run silently produced nothing.
+            //
+            // That gap is why a NaN in this model cost a bisect instead of one run:
+            // with only `--dump-logits` you can see THAT the head is NaN and never
+            // which activation went NaN first. Reading act.xn, act.fu, act.part and
+            // act.shared is the whole diagnosis.
+            if let Some(spec) = plowrt::config::RuntimeConfig::get().amd.dump_act.as_ref() {
+                for one in spec.split(',').filter(|s| !s.is_empty()) {
+                    if let Some((name, path)) = one.split_once(':') {
+                        let n = e
+                            .tensor_bytes(name)
+                            .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
+                            as usize;
+                        let mut buf = vec![0u8; n];
+                        e.read_tensor(name, &mut buf)?;
+                        std::fs::write(format!("{path}.{tag}.bin"), &buf)?;
+                    }
+                }
+            }
             let Some(dir) = &dump_logits else {
                 return Ok(());
             };

@@ -1002,6 +1002,23 @@ mod tests {
             // Deliberate dual read: env first, `.or(emit_config::active().glm_gf)` second, so an
             // A/B script can repin it mid-process. The config field IS consumed.
             ("PLOW_GLM_GF", "dual read, config field consumed via .or()"),
+            // V4 BRING-UP INSTRUMENTS. Each one makes the emitter build a program
+            // that is NOT the model — a truncated layer stack, a skipped op, a
+            // different Sinkhorn iteration count — so that differencing two runs
+            // prices one thing. They are deliberately awkward to reach and must
+            // never appear in `--help` beside real emit flags, because a build
+            // record showing one of them SET is a build record of a wrong model.
+            // The two that survived bring-up as tuning (V4_NCU's width, V4_HCCU's)
+            // now carry their measured defaults in code, and the var is only a
+            // sweep override — same shape as PLOW_GLM_GF above.
+            ("PLOW_V4_LAYERS", "bring-up probe: truncates the layer stack"),
+            ("PLOW_V4_HALF", "bring-up probe: emits attn-only or ffn-only"),
+            ("PLOW_V4_SKIP", "bring-up probe: replaces one op with a zero-fill"),
+            ("PLOW_V4_HCITERS", "bring-up probe: overrides Sinkhorn iterations"),
+            ("PLOW_V4_NCU", "sweep override; measured default (64) is in code"),
+            ("PLOW_V4_HCCU", "sweep override; measured default is in code"),
+            ("PLOW_V4_SPLITCU", "sweep override; measured default is in code"),
+            ("PLOW_V4_SP", "sweep override: attention split-K factor, default 4"),
         ];
 
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
