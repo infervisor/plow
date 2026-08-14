@@ -1024,12 +1024,7 @@ __device__ void d_v4_index_score(float* __restrict__ score, const bf16* __restri
      * `HD/8` = 16 `bf16v8` per lane. Re-reading them per entry was 134 MB of
      * redundant L1 traffic at NC=8192 for a 16 KiB tensor. */
     const unsigned NV = HD >> 3;
-    const bool token_par = T > 1 && nblk >= T && nblk % T == 0;
-    const unsigned bpt = token_par ? nblk / T : nblk;
-    const unsigned t0 = token_par ? slice / bpt : 0;
-    const unsigned t1 = token_par ? t0 + 1 : T;
-    const unsigned part = token_par ? slice % bpt : slice;
-    for (unsigned t = t0; t < t1; t++) {
+    for (unsigned t = 0; t < T; t++) {
         const size_t cbase = pos ? (size_t)t * NC : 0;
         bf16v8 q8[16]; /* HD <= 128 */
         const unsigned live = pos && live_ratio
@@ -1450,7 +1445,12 @@ __device__ void d_v4_hc_mix(bf16* __restrict__ out, float* __restrict__ mix_out,
     float* post = pre + HC;
     float* comb = post + HC;
 
-    for (unsigned t = 0; t < T; t++) {
+    const bool token_par = T > 1 && nblk >= T && nblk % T == 0;
+    const unsigned bpt = token_par ? nblk / T : nblk;
+    const unsigned t0 = token_par ? slice / bpt : 0;
+    const unsigned t1 = token_par ? t0 + 1 : T;
+    const unsigned part = token_par ? slice % bpt : slice;
+    for (unsigned t = t0; t < t1; t++) {
         const float* pt = partial + (size_t)t * (1u + MIX);
         if (threadIdx.x == 0) {
             /* Registers, then one copy out — see `d_hc_split_sinkhorn`. */
