@@ -347,7 +347,7 @@ __device__ __forceinline__ unsigned gm_remap(unsigned lin, unsigned n_tiles, uns
 #endif
 template <int BM, int BN, int BK, int WM, int WN, bool NORM, int SWZ = GM_SWZ, int WGM = GM_WGM,
           bool PP = (GM_PP != 0), bool KEXACT = true, bool GLU = false, bool WFP4 = false,
-          bool WFP8BLK = false>
+          bool WFP8BLK = false, bool V4_INDEX_SCORE = false>
 __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                          const bf16* __restrict__ B, const float* __restrict__ rms,
                          const bf16* __restrict__ gamma, unsigned M, unsigned N, unsigned K,
@@ -356,7 +356,9 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                          const unsigned char* __restrict__ bscale = nullptr,
                          const float* __restrict__ bsblk = nullptr,
                          const unsigned char* __restrict__ bscale2 = nullptr,
-                         unsigned lda = 0, unsigned ldc = 0) {
+                         unsigned lda = 0, unsigned ldc = 0,
+                         const bf16* __restrict__ index_w = nullptr,
+                         float* __restrict__ index_score = nullptr) {
     (void)B2;
     (void)bscale;
     (void)bsblk;
@@ -400,6 +402,8 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
     static_assert(!WFP8BLK || !WFP4, "one weight encoding at a time");
     static_assert(!WFP8BLK || BK == 64, "the 128-K scale block must be exactly two BK tiles");
     static_assert(!WFP8BLK || BN % 128 == 0, "n0 must be 128-aligned for a per-lane N-scale block");
+    static_assert(!V4_INDEX_SCORE || (!GLU && !WFP4 && !WFP8BLK),
+                  "the V4 index epilogue requires an ordinary bf16 GEMM");
     (void)act;
     constexpr int THREADS = WM * WN * PLOW_WAVE;
     /* COMPACT row stride (no +8 pad). global_load_lds writes the 64 lanes CONTIGUOUSLY from a
@@ -928,7 +932,41 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
          * flat_store_short (188 of them in the prefill kernel), carrying a full 64-bit address
          * per lane and tracking on lgkmcnt as well as vmcnt. as_glob is free. */
         auto* const Cg = as_glob(C);
-        if constexpr (GLU) {
+        if constexpr (V4_INDEX_SCORE) {
+            /* Each tile owns every index head for BM compressed entries. Fold
+             * relu(dot)*head_weight in LDS instead of materialising the
+             * [NC,H] product. No other block touches these BM score rows. */
+            float* sums = (float*)lds; /* [BM, WN*SN] */
+            for (unsigned i = threadIdx.x; i < BM * WN * SN; i += PLOW_THREADS)
+                sums[i] = 0.0f;
+            __syncthreads();
+#pragma unroll
+            for (int i = 0; i < SM; i++)
+#pragma unroll
+                for (int j = 0; j < SN; j++) {
+                    const unsigned nn = n0 + wn * (BN / WN) + j * MFMA_N + mfma_acc_n(lane);
+#pragma unroll
+                    for (int e = 0; e < 16; e++) {
+                        const unsigned mm =
+                            m0 + wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e);
+                        float part = nn < N && mm < M
+                                         ? fmaxf(acc[i][j][e], 0.0f) * bf2f(index_w[nn])
+                                         : 0.0f;
+#pragma unroll
+                        for (int o = 16; o; o >>= 1) part += __shfl_down(part, o, 32);
+                        if ((lane & 31u) == 0u && mm < M)
+                            sums[(mm - m0) * (WN * SN) + wn * SN + j] = part;
+                    }
+                }
+            __syncthreads();
+            for (unsigned i = threadIdx.x; i < BM && m0 + i < M; i += PLOW_THREADS) {
+                float sum = 0.0f;
+#pragma unroll
+                for (int p = 0; p < WN * SN; p++) sum += sums[i * (WN * SN) + p];
+                index_score[m0 + i] = sum;
+            }
+            __syncthreads();
+        } else if constexpr (GLU) {
             /* THE FUSED EPILOGUE. acc[i][0] is gate and acc[i][1] is up FOR THE SAME OUTPUT
              * ELEMENT, in the same lane -- that is what the wave->column remap above bought.
              * No shuffle, no LDS exchange, and `fu` is the only thing that reaches HBM: the
@@ -1166,6 +1204,29 @@ __device__ void d_v4_grouped_gemm(bf16* C, const bf16* A, const bf16* B, unsigne
             C + (size_t)g * R, A + (size_t)g * WIDTH, B + (size_t)g * R * WIDTH, nullptr,
             nullptr, T, R, WIDTH, tile, tiles, lds, nullptr, 0, nullptr, nullptr, nullptr,
             GRP * WIDTH, GRP * R);
+    }
+}
+
+/* B32 index scoring is a batch of `[NC,128] x [64,128]^T` products. Fuse the
+ * per-head ReLU/weight fold into the MFMA epilogue so the `[NC,64]` matrix never
+ * reaches HBM. Each work item owns one sequence and one 64-entry tile. */
+__device__ void d_v4_index_gemm(float* score, const bf16* q, const bf16* ckv, const bf16* w,
+                                const int* pos, unsigned live_ratio, unsigned T, unsigned H,
+                                unsigned HD, unsigned NC, unsigned slice, unsigned nblk,
+                                bf16* lds) {
+    const unsigned tiles = (NC + GM_SM_BM - 1u) / GM_SM_BM;
+    for (unsigned work = slice; work < T * tiles; work += nblk) {
+        const unsigned t = work / tiles;
+        const unsigned tile = work - t * tiles;
+        const unsigned live = pos && live_ratio
+                                  ? min(NC, ((unsigned)pos[t] + 1u) / live_ratio)
+                                  : NC;
+        if (tile * GM_SM_BM >= live) continue;
+        d_gemm_t<GM_SM_BM, GM_SM_BN, GM_SM_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM,
+                 (GM_PP != 0), true, false, false, false, true>(
+            nullptr, ckv + (size_t)t * NC * HD, q + (size_t)t * H * HD, nullptr, nullptr,
+            live, H, HD, tile, tiles, lds, nullptr, 0, nullptr, nullptr, nullptr, 0, 0,
+            w + (size_t)t * H, score + (size_t)t * NC);
     }
 }
 __device__ void d_gemm_med(bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned N,

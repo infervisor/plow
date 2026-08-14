@@ -2052,9 +2052,14 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                             in->i[1], in->i[2], slice, nblk);
             break;
         case PLOW_DOP_V4_INDEX_SCORE:
-            d_v4_index_score((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
-                             (const bf16*)TEN(3), (const int*)TEN(4), in->i[4], in->i[0],
-                             in->i[1], in->i[2], in->i[3], slice, nblk);
+            if (in->i[0] > 1)
+                d_v4_index_gemm((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                (const bf16*)TEN(3), (const int*)TEN(4), in->i[4], in->i[0],
+                                in->i[1], in->i[2], in->i[3], slice, nblk, (bf16*)sm->raw);
+            else
+                d_v4_index_score((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                 (const bf16*)TEN(3), (const int*)TEN(4), in->i[4], in->i[0],
+                                 in->i[1], in->i[2], in->i[3], slice, nblk);
             break;
         case PLOW_DOP_V4_INDEX_TOPK:
             d_v4_index_topk((int*)TEN(0), (const float*)TEN(1), in->i[0], in->i[1], in->i[2],
