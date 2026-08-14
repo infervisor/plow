@@ -8,8 +8,8 @@ DeepSeek-V4-Flash-0731 checkpoint. The checkpoint upload is 145.30 GiB; the
 
 | Batch | Context | Step time | Aggregate rate | Correctness |
 |---:|---:|---:|---:|---|
-| 1 | 8K | pending | pending | re-gate after fp32 compressor repair |
-| 1 | 16K | pending | pending | re-gate after fp32 compressor repair |
+| 1 | 8K | 42.6 ms | 23.5 tok/s | real checkpoint |
+| 1 | 16K | 42.6 ms | 23.5 tok/s | real checkpoint |
 | 32 | 8K | 203.8 ms | 157.0 tok/s | 32 identical prompts agree |
 | 32 | 16K | 204.0 ms | 156.9 tok/s | 32 identical prompts agree |
 
@@ -75,8 +75,8 @@ split-K to fill the device.
 
 ## Open gaps
 
-- B32 needs 6.37x more throughput to reach the requested gate. B1 needs a fresh
-  measurement. Kernel utilization, not the HBM byte roof, is the immediate limit.
+- B1 needs 2.13x and B32 needs 6.37x more throughput to reach the requested
+  gates. Kernel utilization, not the HBM byte roof, is the immediate limit.
 - Converting the 129 shared-expert projections to dense block-FP8 GEMM is fast
   and exact by itself. Combining it with the 193 attention GEMMs exposes a
   same-row divergence in the routed-MoE/later residual path. A deterministic
