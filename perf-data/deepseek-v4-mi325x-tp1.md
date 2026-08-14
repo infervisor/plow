@@ -8,8 +8,8 @@ DeepSeek-V4-Flash-0731 checkpoint. The checkpoint upload is 145.30 GiB; the
 
 | Batch | Context | Step time | Aggregate rate | Evidence |
 |---:|---:|---:|---:|---|
-| 1 | 8K | 44.1 ms | 22.7 tok/s | bound checkpoint, requested position |
-| 1 | 16K | 44.4 ms | 22.5 tok/s | bound checkpoint, requested position |
+| 1 | 8K | 41.6 ms | 24.0 tok/s | bound checkpoint, requested position |
+| 1 | 16K | 42.4 ms | 23.6 tok/s | bound checkpoint, requested position |
 | 32 | 8K | 186.7 ms | 171.4 tok/s | bound checkpoint, requested positions |
 | 32 | 16K | 191.4 ms | 167.2 tok/s | bound checkpoint, requested positions |
 
@@ -66,8 +66,13 @@ untraced 186.7 ms gate.
 An eight-GPU independent sweep of sparse-attention split counts
 `1,2,3,4,6,8,12,16` found B32 aggregate rates of
 `175.6,172.5,174.3,172.1,170.7,165.0,165.6,158.7` tok/s. All arms retained
-same-prompt token-stream agreement. `SPLIT=1` is now the B32 default; B1 keeps four-way
-split-K to fill the device.
+same-prompt token-stream agreement. `SPLIT=1` is now the B32 default.
+
+An eight-GPU B1 sweep of `SPLIT=1,2,3,4,6,8,12,16`, followed by a same-GPU
+paired gate of the leading arms, selected two-way split-K. At 8K it measured
+41.6 vs 42.0 ms/token for the prior four-way default; at 16K, 42.4 vs 42.7 ms.
+The full-checkpoint prompt stream remains unchanged. `SPLIT=2` is now the B1
+default.
 
 The compressor projection must accumulate and store fp32 to match the reference
 model. Vectorizing its bf16 inputs and weights in groups of eight reduced its
@@ -96,8 +101,8 @@ to 186.7 ms / 171.4 tok/s. The short-prompt correctness stream remains exact.
 
 ## Open gaps
 
-- At 8K, B1 needs 2.20x and B32 needs 5.83x more throughput. At 16K they need
-  2.22x and 5.98x. Kernel utilization, not the HBM byte roof, is the immediate
+- At 8K, B1 needs 2.08x and B32 needs 5.83x more throughput. At 16K they need
+  2.12x and 5.98x. Kernel utilization, not the HBM byte roof, is the immediate
   limit.
 - Converting the 129 shared-expert projections to dense block-FP8 GEMM is fast
   and exact by itself. Combining it with the 193 attention GEMMs exposes a

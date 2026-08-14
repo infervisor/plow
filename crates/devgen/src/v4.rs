@@ -860,7 +860,7 @@ fn emit_v4_attn(
     let sp = crate::emit_config::active()
         .v4_sp
         .filter(|v| *v >= 1)
-        .unwrap_or_else(|| if tn.rows > 1 { 1 } else { 4 });
+        .unwrap_or_else(|| if tn.rows > 1 { 1 } else { 2 });
     let opart = b.tensor(
         &format!("act.opart.{l}"),
         tn.rows as u64 * (nh * sp * hd) as u64 * F32,
@@ -1842,6 +1842,12 @@ mod tests {
                 V4HcExpand,
             ]
         );
+        let attn = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::V4SparseAttnSplit as u16)
+            .unwrap();
+        assert_eq!(attn.i[4], 2, "B1 uses the measured two-way sparse split");
     }
 
     /// A sliding-window-only layer emits neither compressor nor indexer, and a
