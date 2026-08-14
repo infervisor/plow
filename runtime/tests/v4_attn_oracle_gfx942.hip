@@ -176,9 +176,9 @@ static int run_case(unsigned T, unsigned H, unsigned D, unsigned NKV, unsigned T
             for (unsigned d = 0; d < D; d++) ref[((size_t)t * H + h) * D + d] = o[d] / l;
         }
 
-    /* SPLIT-K must equal the single-kernel path — same op, more blocks. */
-    {
-        const unsigned SP = 4;
+    /* SPLIT-K must equal the single-kernel path — same op, more blocks. SP=1
+     * is batched decode's shared-KV head-group path; SP=4 is B1 split-K. */
+    for (unsigned SP : {1u, 4u}) {
         float *d_op, *d_mlp;
         bf16* d_out2;
         HC_CHECK(hipMalloc(&d_op, (size_t)T * H * SP * D * 4));
@@ -194,7 +194,7 @@ static int run_case(unsigned T, unsigned H, unsigned D, unsigned NKV, unsigned T
         double wsp = 0.0;
         for (size_t i = 0; i < g2.size(); i++)
             wsp = std::max(wsp, fabs(bf2f_host(got[i]) - bf2f_host(g2[i])));
-        printf("  %-28s split-K vs single: max abs %.3e  %s\n", "", wsp,
+        printf("  split-%u vs single             max abs %.3e  %s\n", SP, wsp,
                wsp <= 5e-2 ? "ok" : "FAIL");
         hipFree(d_op);
         hipFree(d_mlp);

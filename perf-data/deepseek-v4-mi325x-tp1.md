@@ -10,8 +10,8 @@ DeepSeek-V4-Flash-0731 checkpoint. The checkpoint upload is 145.30 GiB; the
 |---:|---:|---:|---:|---|
 | 1 | 8K | 41.6 ms | 24.0 tok/s | bound checkpoint, requested position |
 | 1 | 16K | 42.4 ms | 23.6 tok/s | bound checkpoint, requested position |
-| 32 | 8K | 160.1 ms | 199.9 tok/s | bound checkpoint, requested positions |
-| 32 | 16K | 161.7 ms | 197.9 tok/s | bound checkpoint, requested positions |
+| 32 | 8K | 131.8 ms | 242.8 tok/s | bound checkpoint, requested positions |
+| 32 | 16K | 134.0 ms | 238.9 tok/s | bound checkpoint, requested positions |
 
 These are decode-step timing gates with the real checkpoint bound. V4 has no
 prefill bucket yet, so the requested positions read KV rows that this run did
@@ -46,12 +46,12 @@ latency/occupancy limited rather than HBM-roof limited.
 
 The corrected fp32-compressor B32 trace at a true 8K position, after moving the
 grouped output and index-score projections onto MFMA, attributes the largest
-families as follows. Its 159.3 ms packet span closely reproduces the untraced
-160.1 ms gate.
+families as follows. Its 130.6 ms packet span closely reproduces the untraced
+131.8 ms gate.
 
 | Family | Step span |
 |---|---:|
-| Sparse attention | 47.8 ms |
+| Sparse attention | 20.9 ms |
 | Shared-expert block-FP8 GEMV | 24.0 ms |
 | Dense block-FP8 attention GEMM | 22.6 ms |
 | V4 grouped output linear | 5.2 ms |
@@ -103,6 +103,17 @@ all 16,384 selected top-k indices. The 8K pair improved from 174.9 ms / 183.0
 tok/s to 160.1 ms / 199.9 tok/s, and the 16K pair from 179.4 ms / 178.4 tok/s to
 161.7 ms / 197.9 tok/s.
 
+V4 has one KV head shared by all 64 query heads. The original B32 attention
+packet assigned one block per query head, making every group of eight waves
+fetch the same gathered KV rows eight times. The B32 split-1 path now assigns
+one wave per query head and stages four shared KV rows at a time in LDS. B1's
+split-2 path is unchanged. The sparse-attention trace span fell from 49.7 to
+20.9 ms. The direct host-transcription oracle passes the shipped 64x512 shape,
+masked prefixes, and sequence-start sink case with max relative error 1.53e-2;
+full-checkpoint attention intermediates and logits are byte-exact at the prompt
+gate. Same-GPU pairs improved 8K from 160.2 ms / 199.8 tok/s to 131.8 ms / 242.8
+tok/s and 16K from 161.8 ms / 197.8 tok/s to 134.0 ms / 238.9 tok/s.
+
 ## Plow-specific advantages
 
 - The counter-DAG persistent interpreter runs the 1,632-packet model in one
@@ -119,8 +130,8 @@ tok/s to 160.1 ms / 199.9 tok/s, and the 16K pair from 179.4 ms / 178.4 tok/s to
 
 ## Open gaps
 
-- At 8K, B1 needs 2.08x and B32 needs 5.00x more throughput. At 16K they need
-  2.12x and 5.05x. Kernel utilization, not the HBM byte roof, is the immediate
+- At 8K, B1 needs 2.08x and B32 needs 4.12x more throughput. At 16K they need
+  2.12x and 4.19x. Kernel utilization, not the HBM byte roof, is the immediate
   limit.
 - Converting the 129 shared-expert projections to dense block-FP8 GEMM is fast
   and exact by itself. Combining it with the 193 attention GEMMs exposes a

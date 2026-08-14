@@ -1770,6 +1770,81 @@ __device__ void d_v4_sparse_attn_split(float* __restrict__ opart, float* __restr
     float* pacc = lds;
     float* pml = lds + (size_t)nwave * D;
 
+    /* Batched decode has enough token rows to fill the machine without
+     * split-K. V4 has one shared KV head, so assigning one wave to each query
+     * head lets all eight waves reuse an LDS-staged KV row instead of fetching
+     * it eight times. Four keys per stage amortize the two block barriers. */
+    if (T > 1 && SPLIT == 1 && D == 512 && H % nwave == 0) {
+        const unsigned KU = 4;
+        bf16* kstage = (bf16*)lds; /* [KU,D] */
+        for (unsigned work = slice; work < T * (H / nwave); work += nblk) {
+            const unsigned t = work / (H / nwave);
+            const unsigned hg = work - t * (H / nwave);
+            const unsigned h = hg * nwave + wave;
+            const int* it = idx + (size_t)t * (TOPK - WINDOW);
+            const bf16* kvt = kv + (size_t)t * KVSTRIDE * D;
+            const bf16* qh = q + ((size_t)t * H + h) * D;
+            const bf16v8 q8 = ld_glob8(qh + lane * 8);
+            float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+            float m = -INFINITY, l = 0.0f;
+
+            for (unsigned j0 = 0; j0 < TOPK; j0 += KU) {
+                int ps[KU];
+#pragma unroll
+                for (unsigned u = 0; u < KU; u++) {
+                    const unsigned j = j0 + u;
+                    int p = -1;
+                    if (j < TOPK) {
+                        if (j < WINDOW) {
+                            if (!pos) {
+                                p = (int)j;
+                            } else {
+                                const unsigned end = (unsigned)pos[t] + 1u;
+                                const unsigned live = end < WINDOW ? end : WINDOW;
+                                p = j < live ? (int)((end - live + j) & (WINDOW - 1u)) : -1;
+                            }
+                        } else if (RATIO == 0 || RATIO == 4) {
+                            p = it[j - WINDOW];
+                        } else {
+                            p = (j - WINDOW < ((unsigned)pos[t] + 1u) / RATIO) ? (int)j : -1;
+                        }
+                    }
+                    ps[u] = p;
+                    kstage[u * D + threadIdx.x] =
+                        p >= 0 ? kvt[(size_t)p * D + threadIdx.x] : (bf16)0;
+                }
+                __syncthreads();
+
+#pragma unroll
+                for (unsigned u = 0; u < KU; u++) {
+                    if (ps[u] < 0) continue;
+                    const bf16v8 k8 = *(const bf16v8*)(kstage + u * D + lane * 8);
+                    float part = dot8(q8, k8, 0.0f);
+                    for (int o = 32; o; o >>= 1) part += __shfl_xor(part, o);
+                    const float sv = part * scale;
+                    const float mn = fmaxf(m, sv);
+                    const float resc = (m == -INFINITY) ? 0.0f : __expf(m - mn);
+                    const float pe = __expf(sv - mn);
+#pragma unroll
+                    for (unsigned e = 0; e < 8; e++)
+                        acc[e] = acc[e] * resc + pe * bf2f(k8[e]);
+                    l = l * resc + pe;
+                    m = mn;
+                }
+                __syncthreads();
+            }
+
+            const size_t row = (size_t)t * H + h;
+#pragma unroll
+            for (unsigned e = 0; e < 8; e++) opart[row * D + lane * 8 + e] = acc[e];
+            if (lane == 0) {
+                mlpart[row * 2] = m;
+                mlpart[row * 2 + 1] = l;
+            }
+        }
+        return;
+    }
+
     for (unsigned w = slice; w < T * H * SPLIT; w += nblk) {
         const unsigned t = w / (H * SPLIT);
         const unsigned r = w - t * H * SPLIT;
