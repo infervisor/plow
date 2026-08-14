@@ -227,37 +227,29 @@ fn emit_hc_reduce(
         d.i[1] = c.hidden as u32;
         d.i[2] = c.hc_mult;
     });
-    // The Sinkhorn tail runs on THREAD 0 OF EVERY BLOCK with the token loop
-    // unstrided, and only the output pass takes a slice — one element per thread
-    // over D, so `slice * 512 >= D` blocks write nothing at all. At hidden 4096
-    // that is 8 workgroups doing the work and 56 re-running the whole 20-iteration
-    // Sinkhorn to discard it, then paying the maintenance round. Narrowing is
-    // bit-identical for exactly that reason: the discarded blocks wrote nothing.
-    b.emit(
-        DevOp::V4HcMix,
-        combine_cus(&all, c.hidden as u32),
-        &[dot],
-        |d| {
-            d.t[0] = out;
-            d.t[1] = tn.x;
-            d.t[2] = tn.hc_partial;
-            d.t[3] = scale;
-            d.t[4] = base;
-            d.t[5] = tn.hc_mix;
-            d.i[0] = tn.rows;
-            d.i[1] = c.hidden as u32;
-            d.i[2] = c.hc_mult;
-            // TIMING PROBE: PLOW_V4_HCITERS overrides the Sinkhorn iteration count.
-            // `d_v4_hc_mix` runs its token loop UNSTRIDED, so every block executes
-            // the whole tail; if that is the cost, iteration count is the dial that
-            // shows it. Any value but the config's 20 is a DIFFERENT MODEL.
-            d.i[3] = crate::emit_config::active()
-                .v4_hc_iters
-                .unwrap_or(c.hc_iters);
-            d.f[0] = 1e-6;
-            d.f[1] = 1e-6; /* hc_eps */
-        },
-    )
+    // Give each batch row enough blocks to cover D. The kernel maps the logical
+    // slice to (token, depth-part), so rows run concurrently instead of every
+    // block serially walking all T Sinkhorn tails.
+    let mix_bpt = (n_cu / tn.rows).max(1).min((c.hidden as u32).div_ceil(512));
+    let mix_cus: Vec<u32> = (0..tn.rows * mix_bpt).map(|i| i % n_cu).collect();
+    b.emit(DevOp::V4HcMix, mix_cus, &[dot], |d| {
+        d.t[0] = out;
+        d.t[1] = tn.x;
+        d.t[2] = tn.hc_partial;
+        d.t[3] = scale;
+        d.t[4] = base;
+        d.t[5] = tn.hc_mix;
+        d.i[0] = tn.rows;
+        d.i[1] = c.hidden as u32;
+        d.i[2] = c.hc_mult;
+        // TIMING PROBE: PLOW_V4_HCITERS overrides the Sinkhorn iteration count.
+        // Any value but the config's 20 is a DIFFERENT MODEL.
+        d.i[3] = crate::emit_config::active()
+            .v4_hc_iters
+            .unwrap_or(c.hc_iters);
+        d.f[0] = 1e-6;
+        d.f[1] = 1e-6; /* hc_eps */
+    })
 }
 
 /// Write the branch output back into the residual streams.
@@ -1209,12 +1201,13 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     // is the ordinary table, which is why the shipped mxfp4 expert arms can
     // stream its experts with no V4-specific kernel at all.
     let tab = b.tensor(&format!("act.moetab.{l}"), tn.rows as u64 * k as u64 * 8);
+    let route_cus: Vec<u32> = (0..tn.rows.min(n_cu)).collect();
     // TIMING PROBE, by DUPLICATION rather than removal: emitting the router
     // twice leaves the program correct (the second write is identical to the
     // first) and the difference in layer time IS one router. Removal would have
     // needed the expert emission factored out; duplication needs nothing.
     if v4_skip("route2") {
-        b.emit(DevOp::V4MoeRoute, vec![0], &[gg], |d| {
+        b.emit(DevOp::V4MoeRoute, route_cus.clone(), &[gg], |d| {
             d.t[0] = sel;
             d.t[1] = wts;
             d.t[2] = glog;
@@ -1228,7 +1221,7 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
             d.f[0] = c.route_scale as f32;
         });
     }
-    let rt = b.emit(DevOp::V4MoeRoute, vec![0], &[gg], |d| {
+    let rt = b.emit(DevOp::V4MoeRoute, route_cus, &[gg], |d| {
         d.t[0] = sel;
         d.t[1] = wts;
         d.t[2] = glog;
@@ -1600,7 +1593,8 @@ pub(crate) fn emit_v4_decode(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, ctx: u32, n_
         d.i[0] = c.vocab as u32;
         d.i[1] = tn.rows;
     });
-    b.emit(DevOp::ArgmaxFin, vec![0], &[am], |d| {
+    let fin_cus: Vec<u32> = (0..tn.rows.div_ceil(8).min(n_cu).max(1)).collect();
+    b.emit(DevOp::ArgmaxFin, fin_cus, &[am], |d| {
         d.t[0] = tn.ids;
         d.t[1] = tn.amax;
         d.i[0] = n_cu;

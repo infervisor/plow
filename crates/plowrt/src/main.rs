@@ -695,6 +695,7 @@ fn amd_bench(
                 }
             }
         }
+        trace_dump_1(&eng, "")?;
         return Ok(());
     }
 

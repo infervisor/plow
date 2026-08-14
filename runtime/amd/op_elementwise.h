@@ -260,15 +260,19 @@ __device__ void d_argmax(unsigned long long* __restrict__ part, const bf16* __re
  * reads it. BATCH>1: ids[b] gets sequence b's token; `part` is [n_batch][nparts].
  * n_batch == 0/1 is byte-identical (ids[0] from part[0..nparts)). */
 __device__ void d_argmax_fin(int* __restrict__ ids, const unsigned long long* __restrict__ part,
-                             unsigned nparts, unsigned n_batch, unsigned slice) {
-    if (slice != 0 || threadIdx.x != 0) return;
+                             unsigned nparts, unsigned n_batch, unsigned slice, unsigned nblk) {
     const auto* pg = as_glob(part);
     const unsigned B = n_batch ? n_batch : 1u;
-    for (unsigned b = 0; b < B; b++) {
+    const unsigned wave = threadIdx.x >> 6, lane = threadIdx.x & 63u;
+    const unsigned nwave = PLOW_THREADS >> 6;
+    for (unsigned b = slice * nwave + wave; b < B; b += nblk * nwave) {
         const auto* pb = pg + (size_t)b * nparts;
         unsigned long long best = 0;
-        for (unsigned i = 0; i < nparts; i++) best = pb[i] > best ? pb[i] : best;
-        st_act<int>(&as_glob(ids)[b], (int)~(unsigned)(best & 0xFFFFFFFFull));
+        for (unsigned i = lane; i < nparts; i += PLOW_WAVE)
+            best = pb[i] > best ? pb[i] : best;
+        best = wave_max_u64(best);
+        if (lane == 0)
+            st_act<int>(&as_glob(ids)[b], (int)~(unsigned)(best & 0xFFFFFFFFull));
     }
 }
 

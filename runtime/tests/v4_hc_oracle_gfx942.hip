@@ -343,7 +343,7 @@ static int run_split_identical_rows(void) {
     HC_CHECK(hipMemcpy(d_base, base.data(), base.size() * 4, hipMemcpyHostToDevice));
     HC_CHECK(hipMemset(d_partial, 0, (size_t)T * (1 + MIX) * 4));
     k_dot<<<304, PLOW_THREADS>>>(d_partial, d_x, d_fn, T, D, HC);
-    k_mix<<<8, PLOW_THREADS>>>(d_out, d_mix, d_x, d_partial, d_scale, d_base, T, D, HC, 20,
+    k_mix<<<256, PLOW_THREADS>>>(d_out, d_mix, d_x, d_partial, d_scale, d_base, T, D, HC, 20,
                                1e-6f, 1e-6f);
     HC_CHECK(hipDeviceSynchronize());
 

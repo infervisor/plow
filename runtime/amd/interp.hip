@@ -2102,7 +2102,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             break;
         case PLOW_DOP_ARGMAX_FIN:
             d_argmax_fin((int*)TEN(0), (const unsigned long long*)TEN(1), in->i[0], in->i[1],
-                         slice);
+                         slice, nblk);
             break;
 #if PLOW_BUCKET_PREFILL
 #if PLOW_FP8
