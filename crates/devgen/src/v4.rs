@@ -828,9 +828,10 @@ fn emit_v4_attn(
             d.i[4] = 4;
             d.i[3] = ctx / 4;
         });
-        // ONE block: the selection is a per-row reduction. Under TP the score
-        // must be all-reduced BEFORE this packet.
-        let tk = b.emit(DevOp::V4IndexTopk, vec![0], &[sc], |d| {
+        // One block per row: each selection is an independent reduction. Under
+        // TP the score must be all-reduced BEFORE this packet.
+        let topk_cus: Vec<u32> = (0..tn.rows.min(n_cu)).collect();
+        let tk = b.emit(DevOp::V4IndexTopk, topk_cus, &[sc], |d| {
             d.t[0] = idx;
             d.t[1] = isc;
             d.i[0] = tn.rows;
@@ -1971,6 +1972,12 @@ mod tests {
             .unwrap();
         assert_eq!(attn.i[0], 32);
         assert_eq!(attn.i[4], 1, "B32 does not need decode's split-K occupancy");
+        let topk = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::V4IndexTopk as u16)
+            .unwrap();
+        assert_eq!(topk.blocks, 8, "selector rows fill every available CU");
         let kv_rows: Vec<_> = p
             .insts
             .iter()
