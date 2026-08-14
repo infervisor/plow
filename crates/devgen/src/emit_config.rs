@@ -116,6 +116,42 @@ pub struct EmitConfig {
     #[arg(long = "emit-decode-batch-ladder", env = "PLOW_DECODE_BATCH_LADDER")]
     pub decode_ladder: Option<String>,
 
+    /// DeepSeek-V4 packet width. Unset uses the measured in-code default.
+    #[arg(long, env = "PLOW_V4_NCU")]
+    pub v4_ncu: Option<u32>,
+
+    /// DeepSeek-V4 hyper-connection reduction width. Unset follows V4 packet width.
+    #[arg(long, env = "PLOW_V4_HCCU")]
+    pub v4_hccu: Option<u32>,
+
+    /// Emit the executable DeepSeek-V4 model instead of the capability report.
+    #[arg(long, env = "PLOW_V4_FULL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub v4_full: bool,
+
+    /// Limit a DeepSeek-V4 diagnostic asset to the first N layers.
+    #[arg(long, env = "PLOW_V4_LAYERS")]
+    pub v4_layers: Option<u32>,
+
+    /// Emit only one half of each V4 block (`attn` or `ffn`); diagnostic only.
+    #[arg(long, env = "PLOW_V4_HALF")]
+    pub v4_half: Option<String>,
+
+    /// Replace one V4 body with its timing probe; diagnostic only.
+    #[arg(long, env = "PLOW_V4_SKIP")]
+    pub v4_skip: Option<String>,
+
+    /// V4 q/KV and shared/routed expert CU split; diagnostic only.
+    #[arg(long, env = "PLOW_V4_SPLITCU")]
+    pub v4_split_cu: Option<u32>,
+
+    /// V4 sparse-attention split count.
+    #[arg(long, env = "PLOW_V4_SP")]
+    pub v4_sp: Option<u32>,
+
+    /// Override V4 Sinkhorn iterations; changes numerics and is diagnostic only.
+    #[arg(long, env = "PLOW_V4_HCITERS")]
+    pub v4_hc_iters: Option<u32>,
+
     /// Largest prefill chunk rows (power of two, ≤ 8192). Caps the bucket
     /// ladder and the runtime PLOW_PF_INTERLEAVE ceiling.
     #[arg(long = "emit-max-chunk", env = "PLOW_MAX_CHUNK")]
@@ -583,6 +619,15 @@ impl EmitConfig {
             uniseg: env_bool("PLOW_UNISEG"),
             decode_batch: env_u32("PLOW_DECODE_BATCH").unwrap_or(1),
             decode_ladder: env_str("PLOW_DECODE_BATCH_LADDER"),
+            v4_ncu: env_u32("PLOW_V4_NCU"),
+            v4_hccu: env_u32("PLOW_V4_HCCU"),
+            v4_full: env_bool("PLOW_V4_FULL"),
+            v4_layers: env_u32("PLOW_V4_LAYERS"),
+            v4_half: env_str("PLOW_V4_HALF"),
+            v4_skip: env_str("PLOW_V4_SKIP"),
+            v4_split_cu: env_u32("PLOW_V4_SPLITCU"),
+            v4_sp: env_u32("PLOW_V4_SP"),
+            v4_hc_iters: env_u32("PLOW_V4_HCITERS"),
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
             gemv_split: env_u32("PLOW_GEMV_SPLIT").unwrap_or(1),
             decode_tiled: env_bool("PLOW_DECODE_TILED"),
@@ -1002,23 +1047,6 @@ mod tests {
             // Deliberate dual read: env first, `.or(emit_config::active().glm_gf)` second, so an
             // A/B script can repin it mid-process. The config field IS consumed.
             ("PLOW_GLM_GF", "dual read, config field consumed via .or()"),
-            // V4 BRING-UP INSTRUMENTS. Each one makes the emitter build a program
-            // that is NOT the model — a truncated layer stack, a skipped op, a
-            // different Sinkhorn iteration count — so that differencing two runs
-            // prices one thing. They are deliberately awkward to reach and must
-            // never appear in `--help` beside real emit flags, because a build
-            // record showing one of them SET is a build record of a wrong model.
-            // The two that survived bring-up as tuning (V4_NCU's width, V4_HCCU's)
-            // now carry their measured defaults in code, and the var is only a
-            // sweep override — same shape as PLOW_GLM_GF above.
-            ("PLOW_V4_LAYERS", "bring-up probe: truncates the layer stack"),
-            ("PLOW_V4_HALF", "bring-up probe: emits attn-only or ffn-only"),
-            ("PLOW_V4_SKIP", "bring-up probe: replaces one op with a zero-fill"),
-            ("PLOW_V4_HCITERS", "bring-up probe: overrides Sinkhorn iterations"),
-            ("PLOW_V4_NCU", "sweep override; measured default (64) is in code"),
-            ("PLOW_V4_HCCU", "sweep override; measured default is in code"),
-            ("PLOW_V4_SPLITCU", "sweep override; measured default is in code"),
-            ("PLOW_V4_SP", "sweep override: attention split-K factor, default 4"),
         ];
 
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

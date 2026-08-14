@@ -448,6 +448,9 @@ impl PrefillArm {
                     // reachable at all.
                     k3 = true;
                 }
+                if K3_ARM_OPS.iter().any(|&candidate| candidate as u16 == op) {
+                    k3 = true;
+                }
             }
         }
         match (k3, moe, a4w4, mla) {
@@ -2278,7 +2281,7 @@ fn gather_expert_entry<'a>(
 }
 
 fn bind_packed_experts(
-    be: &HsaBackend,
+    be: &Arc<HsaBackend>,
     blob: &DevBlob,
     ckpt: &crate::asset::checkpoint::Checkpoint,
     devp: &[DeviceMem],
@@ -2289,7 +2292,7 @@ fn bind_packed_experts(
     prof: &LoadProf,
     do_prefault: bool,
     populate: bool,
-) -> Result<(Vec<DeviceMem>, u64)> {
+) -> Result<(Vec<DeviceMem>, Vec<crate::memory::vmm::VmmSlab>, u64)> {
     let layers: Vec<(usize, String)> = blob
         .tensors
         .iter()
@@ -2301,7 +2304,7 @@ fn bind_packed_experts(
         })
         .collect();
     if layers.is_empty() {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), Vec::new(), 0));
     }
     let t0 = std::time::Instant::now();
     // `I_moe` is not inferred: it is read off the very instruction that will
@@ -2349,6 +2352,7 @@ fn bind_packed_experts(
     };
 
     let mut bufs = Vec::with_capacity(layers.len() * 2);
+    let mut vmm_bufs = Vec::with_capacity(layers.len() * 6);
     let mut i_moe = 0u64;
     // Which spelling the checkpoint turned out to have, for the one log line
     // that says so. A load that binds the wrong layout is silent by nature, so
@@ -2425,11 +2429,113 @@ fn bind_packed_experts(
             / if whole { 1 } else { n_gpu as u64 };
 
         let t_alloc = Instant::now();
-        let d_w = EngineDevice::alloc(be, (n_local * 3 * w_stride).max(1))?;
-        let d_s = EngineDevice::alloc(be, (n_local * 3 * s_stride).max(1))?;
+        const EXPERT_CHUNK: u64 = 32;
+        let alloc_expert = |bytes: u64| {
+            if crate::config::RuntimeConfig::get().amd.expert_host {
+                be.alloc_pinned_expert(bytes)
+            } else {
+                EngineDevice::alloc(be.as_ref(), bytes)
+            }
+        };
+        // Reserve one virtual range per projection and commit it in HSA VMM
+        // chunks. This avoids asking ROCr for a physically contiguous 1--3 GiB
+        // block while preserving the packed [expert][gate,up,down] ABI.
+        const VMM_CHUNK: u64 = 1 << 30;
+        let mut slabs = Vec::with_capacity(6);
+        let mut d_w = Vec::with_capacity(3);
+        let mut d_s = Vec::with_capacity(3);
+        // Keep the mmap-style path opt-in until ROCr's gfx942 VMM handle
+        // quota is available; failed commits can perturb the driver's arena
+        // before the ordinary fallback gets a chance.
+        let vmm_requested = crate::config::RuntimeConfig::get().amd.expert_vmm;
+        let mut vmm_ok = vmm_requested;
+        for _ in 0..3 {
+            if !vmm_ok {
+                break;
+            }
+            let slab = match crate::memory::vmm::VmmSlab::new(
+                Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
+                (n_local * w_stride).max(1),
+                VMM_CHUNK,
+            ) {
+                Ok(slab) => slab,
+                Err(e) => {
+                    tracing::warn!(error = %e, "HSA VMM expert slab unavailable; falling back to chunked HSA allocations");
+                    vmm_ok = false;
+                    break;
+                }
+            };
+            if let Err(e) = slab.wait_mapped(slab.len()) {
+                tracing::warn!(error = %e, "HSA VMM expert commit unavailable; falling back to chunked HSA allocations");
+                vmm_ok = false;
+                break;
+            }
+            d_w.push(DeviceMem::view(slab.base(), slab.len()));
+            slabs.push(slab);
+        }
+        if vmm_ok {
+            for _ in 0..3 {
+                let slab = match crate::memory::vmm::VmmSlab::new(
+                    Arc::clone(be) as Arc<dyn crate::memory::vmm::VmmOps>,
+                    (n_local * s_stride).max(1),
+                    VMM_CHUNK,
+                ) {
+                    Ok(slab) => slab,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "HSA VMM scale slab unavailable; falling back to chunked HSA allocations");
+                        vmm_ok = false;
+                        break;
+                    }
+                };
+                if let Err(e) = slab.wait_mapped(slab.len()) {
+                    tracing::warn!(error = %e, "HSA VMM scale commit unavailable; falling back to chunked HSA allocations");
+                    vmm_ok = false;
+                    break;
+                }
+                d_s.push(DeviceMem::view(slab.base(), slab.len()));
+                slabs.push(slab);
+            }
+        }
+        if !vmm_ok {
+            slabs.clear();
+            d_w.clear();
+            d_s.clear();
+            let n_chunk = n_local.div_ceil(EXPERT_CHUNK) as usize;
+            for chunk in 0..n_chunk {
+                let count = (n_local - (chunk as u64 * EXPERT_CHUNK)).min(EXPERT_CHUNK);
+                for _ in 0..3 {
+                    d_w.push(alloc_expert((count * w_stride).max(1))?);
+                }
+                for _ in 0..3 {
+                    d_s.push(alloc_expert((count * s_stride).max(1))?);
+                }
+            }
+        }
         LoadProf::add(&prof.alloc_ns, t_alloc);
-        let wtab = crate::orch::moe::packed_expert_table(d_w.base, w_stride, n_exp, owned.clone());
-        let stab = crate::orch::moe::packed_expert_table(d_s.base, s_stride, n_exp, owned.clone());
+        let w_bases: Vec<u64> = d_w.iter().map(|d| d.base).collect();
+        let s_bases: Vec<u64> = d_s.iter().map(|d| d.base).collect();
+        let wtab = crate::orch::moe::packed_expert_table_chunked(
+            &w_bases,
+            if vmm_ok {
+                n_local.max(1) as u32
+            } else {
+                EXPERT_CHUNK as u32
+            },
+            w_stride,
+            n_exp,
+            owned.clone(),
+        );
+        let stab = crate::orch::moe::packed_expert_table_chunked(
+            &s_bases,
+            if vmm_ok {
+                n_local.max(1) as u32
+            } else {
+                EXPERT_CHUNK as u32
+            },
+            s_stride,
+            n_exp,
+            owned.clone(),
+        );
         // PRESHUFFLED PREFILL SLAB (PLOW_MOE_PF_SHUF): the blob declaring
         // `{pfx}expert_weight_table_pf` is the emit-time opt-in. A SECOND slab holds every
         // projection permuted to B'[K/64][R][64] so the grouped prefill GEMM's per-k-tile B
@@ -2448,7 +2554,7 @@ fn bind_packed_experts(
                 )));
             }
             let t_a = Instant::now();
-            let d = EngineDevice::alloc(be, (n_local * 3 * w_stride).max(1))?;
+            let d = alloc_expert((n_local * 3 * w_stride).max(1))?;
             LoadProf::add(&prof.alloc_ns, t_a);
             let t = crate::orch::moe::packed_expert_table(d.base, w_stride, n_exp, owned.clone());
             (Some(d), Some(t))
@@ -2518,6 +2624,7 @@ fn bind_packed_experts(
         // `gather_ns`/`fault_ns` become worker-summed parallel time — same
         // convention as `PrefetchStats`, and they can exceed wall clock.
         let workers = expert_gather_threads(n_gpu).min(plan.len().max(1));
+        let host_expert = crate::config::RuntimeConfig::get().amd.expert_host;
         let next = std::sync::atomic::AtomicUsize::new(0);
         let stop = std::sync::atomic::AtomicBool::new(false);
         let plan = &plan;
@@ -2531,7 +2638,23 @@ fn bind_packed_experts(
             for (o, chunk) in g.data.chunks(stage_bytes).enumerate() {
                 let t = Instant::now();
                 let at = g.dst + (o * stage_bytes) as u64;
-                if g.scrub {
+                if host_expert {
+                    let mut owned;
+                    let src = if g.scrub {
+                        owned = chunk.to_vec();
+                        for b in &mut owned {
+                            if *b == 0x80 {
+                                *b = 0;
+                            }
+                        }
+                        &owned
+                    } else {
+                        chunk
+                    };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src.as_ptr(), at as *mut u8, src.len());
+                    }
+                } else if g.scrub {
                     ring.push_scrub_fp8_neg0(at, chunk)?;
                 } else {
                     ring.push(at, chunk)?;
@@ -2543,7 +2666,17 @@ fn bind_packed_experts(
             if let Some((pf_dst, shuffled)) = g.pf {
                 for (o, chunk) in shuffled.chunks(stage_bytes).enumerate() {
                     let t = Instant::now();
-                    ring.push_scrub_fp8_neg0(pf_dst + (o * stage_bytes) as u64, chunk)?;
+                    if host_expert {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                chunk.as_ptr(),
+                                (pf_dst + (o * stage_bytes) as u64) as *mut u8,
+                                chunk.len(),
+                            );
+                        }
+                    } else {
+                        ring.push_scrub_fp8_neg0(pf_dst + (o * stage_bytes) as u64, chunk)?;
+                    }
                     LoadProf::add(&prof.memcpy_ns, t);
                     prof.chunks.set(prof.chunks.get() + 1);
                 }
@@ -2590,16 +2723,17 @@ fn bind_packed_experts(
             }
             first_err.map_or(Ok(()), Err)
         })?;
-        EngineDevice::upload(be, &devp[*i_ewt], 0, as_bytes(&wtab))?;
-        EngineDevice::upload(be, &devp[i_est], 0, as_bytes(&stab))?;
+        EngineDevice::upload(be.as_ref(), &devp[*i_ewt], 0, as_bytes(&wtab))?;
+        EngineDevice::upload(be.as_ref(), &devp[i_est], 0, as_bytes(&stab))?;
         if let (Some(ip), Some(tab)) = (i_ewt_pf, &wptab) {
-            EngineDevice::upload(be, &devp[ip], 0, as_bytes(tab))?;
+            EngineDevice::upload(be.as_ref(), &devp[ip], 0, as_bytes(tab))?;
         }
-        bufs.push(d_w);
-        bufs.push(d_s);
+        bufs.extend(d_w);
+        bufs.extend(d_s);
         if let Some(d) = d_wp {
             bufs.push(d);
         }
+        vmm_bufs.extend(slabs);
     }
     // No expert is bound until its copy has retired. The pointer tables above
     // are uploaded through the blocking path and name a DIFFERENT address, so
@@ -2613,7 +2747,7 @@ fn bind_packed_experts(
         secs = format!("{:.1}", t0.elapsed().as_secs_f64()).as_str(),
         "routed experts packed; expert pointer tables filled"
     );
-    Ok((bufs, wbytes))
+    Ok((bufs, vmm_bufs, wbytes))
 }
 
 /// Contiguous instruction span covering every KV-row patch site, or `None` when
@@ -3348,6 +3482,7 @@ pub struct AmdEngine {
     /// `expert_weight_table`/`expert_scale_table` — but they are owning handles,
     /// so dropping them would free the memory those tables point at.
     _expert_bufs: Vec<DeviceMem>,
+    _expert_vmm: Vec<crate::memory::vmm::VmmSlab>,
 
     /// Per-(workgroup, packet) `PlowTraceRec` buffer for the widest program,
     /// allocated only when `PLOW_TRACE_RAW` is set. The interpreter treats a
@@ -4623,10 +4758,11 @@ impl AmdEngine {
             );
         }
         let mut expert_bufs = Vec::new();
+        let mut expert_vmm = Vec::new();
         if let Some(c) = ckpt.as_ref() {
             let eprof = LoadProf::default();
             let t_exp = Instant::now();
-            let (bufs, bytes) = bind_packed_experts(
+            let (bufs, vmm, bytes) = bind_packed_experts(
                 &be,
                 &blob,
                 c,
@@ -4643,6 +4779,7 @@ impl AmdEngine {
             )?;
             eprof.report("packed experts", t_exp.elapsed(), bytes);
             expert_bufs = bufs;
+            expert_vmm = vmm;
             wbytes += bytes;
         }
         // Dense-FFN prefill tables. Must run AFTER the named-weight upload above
@@ -5119,6 +5256,7 @@ impl AmdEngine {
             d_tens,
             tensor_names: names,
             _expert_bufs: expert_bufs,
+            _expert_vmm: expert_vmm,
             d_trace,
             trace_bytes,
             trace_write_bytes: Cell::new(0),
@@ -7330,6 +7468,21 @@ mod tests {
             PrefillArm::K3Moe,
             "block-fp8 experts"
         );
+        let mut v4 = prog_with_ops(&[DevOp::V4HcBroadcast]);
+        for op in [DevOp::MoeGroupGluPf, DevOp::MoeGroupDownPf] {
+            let mut i = [0u32; 8];
+            i[MOE_PF_ENC_SLOT] = 2;
+            v4.insts.push(DevInst64 {
+                op: op as u16,
+                i,
+                ..Default::default()
+            });
+        }
+        assert_eq!(
+            PrefillArm::detect(&[v4]),
+            PrefillArm::K3MoeA4w4,
+            "V4 opcodes share the PLOW_K3 object axis"
+        );
 
         // A DECODE-ONLY K3 blob still selects the K3 objects. This is what makes
         // `interp_decode_k3` reachable at all, and it is not a corner: K3 emitted decode-only for
@@ -7913,6 +8066,18 @@ mod tests {
             src.contains("#if PLOW_GEMV_WALK"),
             "the walk marker must be gated on PLOW_GEMV_WALK itself, or a \
              non-walking object would advertise a capacity it does not have"
+        );
+        let block_fp8 = src
+            .split("__device__ void d_gemv_fp8_blk")
+            .nth(1)
+            .expect("d_gemv_fp8_blk")
+            .split("#undef GEMV_FP8_BLK_DISP")
+            .next()
+            .expect("d_gemv_fp8_blk body");
+        assert!(
+            block_fp8.contains("gemv_walk(M"),
+            "a walking object must walk block-FP8 GEMVs too; otherwise M > PLOW_GEMV_MM \
+             silently leaves the later rows unwritten"
         );
     }
 

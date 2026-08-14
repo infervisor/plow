@@ -521,15 +521,56 @@ fn amd_bench(
                 .collect::<std::result::Result<_, _>>()?,
         };
         if !prompts.is_empty() {
-            for s in 0..b {
-                let ids = &prompts[s % prompts.len()];
-                let tok = eng.prefill_slot(s, ids)?;
-                println!("  slot {s}: prefill {} tokens -> sampled {tok}", ids.len());
-                pos[s] = ids.len() as u32;
-                chains[s].push(tok);
+            if eng.has_prefill() {
+                for s in 0..b {
+                    let ids = &prompts[s % prompts.len()];
+                    let tok = eng.prefill_slot(s, ids)?;
+                    println!("  slot {s}: prefill {} tokens -> sampled {tok}", ids.len());
+                    pos[s] = ids.len() as u32;
+                    chains[s].push(tok);
+                }
+            } else {
+                let n = prompts[0].len();
+                if prompts.iter().any(|p| p.len() != n) {
+                    return Err("decode-only batched prefill requires equal-length prompts".into());
+                }
+                if n == 0 {
+                    return Err("--prompt contains an empty sequence".into());
+                }
+                let mut last = vec![0u32; b];
+                for p in 0..n {
+                    let feed: Vec<u32> = (0..b).map(|s| prompts[s % prompts.len()][p]).collect();
+                    eng.seed_ids(&feed)?;
+                    let at = vec![p as u32; b];
+                    let kv = vec![p as u32 + 1; b];
+                    last = eng.decode_step_batched(&at, &kv)?;
+                }
+                for s in 0..b {
+                    pos[s] = n as u32;
+                    chains[s].push(last[s]);
+                    println!(
+                        "  slot {s}: decode-only prefill {n} tokens -> sampled {}",
+                        last[s]
+                    );
+                }
             }
         } else {
             eng.seed_ids(&vec![0u32; b])?;
+        }
+        if !prompts.is_empty() {
+            if let Some(spec) = plowrt::config::RuntimeConfig::get().amd.dump_act.as_ref() {
+                for one in spec.split(',').filter(|s| !s.is_empty()) {
+                    if let Some((name, path)) = one.split_once(':') {
+                        let n = eng
+                            .tensor_bytes(name)
+                            .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
+                            as usize;
+                        let mut buf = vec![0u8; n];
+                        eng.read_tensor(name, &mut buf)?;
+                        std::fs::write(format!("{path}.batched-prefill.bin"), &buf)?;
+                    }
+                }
+            }
         }
 
         for i in 0..4u32 {
@@ -640,6 +681,19 @@ fn amd_bench(
         );
         if !eng.weights_bound() {
             println!("  (weights unbound — timing real, ids are not)");
+        }
+        if let Some(spec) = plowrt::config::RuntimeConfig::get().amd.dump_act.as_ref() {
+            for one in spec.split(',').filter(|s| !s.is_empty()) {
+                if let Some((name, path)) = one.split_once(':') {
+                    let n = eng
+                        .tensor_bytes(name)
+                        .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
+                        as usize;
+                    let mut buf = vec![0u8; n];
+                    eng.read_tensor(name, &mut buf)?;
+                    std::fs::write(format!("{path}.batched.bin"), &buf)?;
+                }
+            }
         }
         return Ok(());
     }

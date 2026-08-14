@@ -4771,15 +4771,18 @@ __device__ void d_gemv_qkv_fp8(bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x,
  * every shape at matched K, zero risk (overshoot stays correct at any UN). */
 #define GEMV_FP8_BLK_DISP(UN)                                                                       \
     do {                                                                                            \
-        if (lds_ok) gemv_rows_fp8_blk<PLOW_GEMV_MM, true, UN>(C, x, W, wscale, M, N, K, slice, nblk, lds);  \
-        else gemv_rows_fp8_blk<PLOW_GEMV_MM, false, UN>(C, x, W, wscale, M, N, K, slice, nblk, lds); \
+        if (lds_ok) gemv_rows_fp8_blk<PLOW_GEMV_MM, true, UN>(C_, x_, W, wscale, M_, N, K, slice, nblk, lds);  \
+        else gemv_rows_fp8_blk<PLOW_GEMV_MM, false, UN>(C_, x_, W, wscale, M_, N, K, slice, nblk, lds); \
     } while (0)
 __device__ void d_gemv_fp8_blk(bf16* C, const bf16* x, const unsigned char* W, const float* wscale,
                                unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk,
                                bf16* lds) {
-    const bool lds_ok = (size_t)M * K <= GM_LDS_HALVES;
+  gemv_walk(M, [&](unsigned m0, unsigned M_) {
+    bf16* const C_ = C + (size_t)m0 * N;
+    const bf16* const x_ = x + (size_t)m0 * K;
+    const bool lds_ok = (size_t)M_ * K <= GM_LDS_HALVES;
     if (lds_ok)
-        stage_x_lds(lds, x, (size_t)M * K);
+        stage_x_lds(lds, x_, (size_t)M_ * K);
     if (lds_ok) __syncthreads();
     /* UN must DIVIDE nchunk. Two GLM TP4 shapes fell through to a UN that does not, and both were
      * measured losing double digits on gfx950 (grid 256, blockDim 512, 6200 GB/s denominator):
@@ -4797,6 +4800,8 @@ __device__ void d_gemv_fp8_blk(bf16* C, const bf16* x, const unsigned char* W, c
     else if (nchunk == 2u) GEMV_FP8_BLK_DISP(2);   /* short-K (q_b/kv_b): fewest dead converts */
     else if (nchunk == 4u) GEMV_FP8_BLK_DISP(4);   /* K=4096 (o_proj): one exact group of 4 */
     else GEMV_FP8_BLK_DISP(3);                     /* K=6144: 6 chunks -> 2 clean groups of 3 */
+    if (PLOW_GEMV_WALK) __syncthreads();
+  });
 }
 #undef GEMV_FP8_BLK_DISP
 

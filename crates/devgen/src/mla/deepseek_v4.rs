@@ -497,7 +497,7 @@ pub(crate) fn deepseek_v4_emit(dir: &Path, ctx: u32, tp: u32, out: &str, n_cu: u
 
     /* PLOW_V4_FULL takes the real emit; the default stays this report, because
      * a blob that cannot load is worse than a refusal that says why. */
-    if std::env::var("PLOW_V4_FULL").ok().as_deref() == Some("1") {
+    if crate::emit_config::active().v4_full {
         /* Returns, so plowc's bundle path still writes `weights.json` and the
          * checkpoint symlinks next to the blob. Exiting here produced a lone
          * `.pkt` in the CWD and no servable directory at all. */

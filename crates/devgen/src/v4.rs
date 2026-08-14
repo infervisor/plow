@@ -65,6 +65,7 @@
 // one element per thread. V4 handed all three the full CU set.
 use crate::k3::{combine_cus, k3_rope_cus, norm_cus};
 use crate::mla::deepseek_v4::{cfg_deepseek_v4, V4Cfg};
+use crate::mla::{MoeEnc, MPF_BM, MX_BLOCK};
 use packet::dev::DevOp;
 use packet::devbuild::{Builder, Model};
 use std::path::Path;
@@ -72,6 +73,8 @@ use std::path::Path;
 /// Tensor handles a V4 decode program needs. One table serves the whole
 /// program, as `Model` requires.
 pub(crate) struct V4Tn {
+    /// Number of independent decode rows carried by this program.
+    pub rows: u32,
     pub ids: u32,
     pub pos: u32,
     pub cos: u32,
@@ -107,18 +110,19 @@ const I32: u64 = 4;
 ///
 /// Weight handles are declared per layer by [`emit_v4_layer`] so their names
 /// match the checkpoint exactly — that name IS the loader's contract.
-pub(crate) fn declare_v4(b: &mut Builder, c: &V4Cfg, ctx: u32) -> V4Tn {
+pub(crate) fn declare_v4(b: &mut Builder, c: &V4Cfg, ctx: u32, rows: u32) -> V4Tn {
     let h = c.hidden as u64;
     let hc = c.hc_mult as u64;
     let mix = (2 + hc) * hc;
     let nh = c.heads as u64;
     let hd = c.head_dim as u64;
 
-    let ids = b.tensor("in.ids", ctx as u64 * I32);
+    let rows = rows.max(1);
+    let ids = b.tensor("in.ids", rows as u64 * I32);
     // `in.kvlen` is what makes this a MODEL rather than a block asset: the
     // runtime's token-level entry points look for it by name and refuse the
     // blob outright when it is absent. Sized `batch * 4`, batch 1 here.
-    b.tensor("in.kvlen", I32);
+    b.tensor("in.kvlen", rows as u64 * I32);
     let pos = b.tensor("in.pos", ctx as u64 * I32);
     let cos = b.tensor("in.cos", ctx as u64 * (hd / 2) * F32);
     let sin = b.tensor("in.sin", ctx as u64 * (hd / 2) * F32);
@@ -131,18 +135,19 @@ pub(crate) fn declare_v4(b: &mut Builder, c: &V4Cfg, ctx: u32) -> V4Tn {
 
     let ac = |b: &mut Builder, n: &str, sz: u64| b.tensor(&format!("act.{n}"), sz);
     // `x` is [hc, hidden]: the parallel residual streams, not one vector.
-    let x = ac(b, "x", hc * h * BF16);
-    let xr = ac(b, "xr", h * BF16);
-    let xn = ac(b, "xn", h * BF16);
-    let q = ac(b, "q", nh * hd * BF16);
-    let kv = ac(b, "kv", hd * BF16);
-    let attn_out = ac(b, "attn_out", nh * hd * BF16);
-    let logits = ac(b, "logits", c.vocab as u64 * F32);
-    let amax = ac(b, "amax", 256 * F32);
-    let hc_partial = ac(b, "hc_partial", (1 + mix) * F32);
-    let hc_mix = ac(b, "hc_mix", (hc + hc * hc) * F32);
+    let x = ac(b, "x", rows as u64 * hc * h * BF16);
+    let xr = ac(b, "xr", rows as u64 * h * BF16);
+    let xn = ac(b, "xn", rows as u64 * h * BF16);
+    let q = ac(b, "q", rows as u64 * nh * hd * BF16);
+    let kv = ac(b, "kv", rows as u64 * hd * BF16);
+    let attn_out = ac(b, "attn_out", rows as u64 * nh * hd * BF16);
+    let logits = ac(b, "logits", rows as u64 * c.vocab as u64 * F32);
+    let amax = ac(b, "amax", rows as u64 * 256 * F32);
+    let hc_partial = ac(b, "hc_partial", rows as u64 * (1 + mix) * F32);
+    let hc_mix = ac(b, "hc_mix", rows as u64 * (hc + hc * hc) * F32);
 
     V4Tn {
+        rows,
         ids,
         pos,
         cos,
@@ -191,9 +196,8 @@ fn emit_hc_reduce(
     // addresses, so past some width the grid buys contention rather than
     // bandwidth. PLOW_V4_HCCU sweeps it; the reduce runs twice a layer, 86
     // times a token, so this is the widest lever on the step.
-    let hccu = std::env::var("PLOW_V4_HCCU")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
+    let hccu = crate::emit_config::active()
+        .v4_hccu
         .map(|v| v.clamp(1, n_cu))
         .unwrap_or(n_cu);
     let all: Vec<u32> = (0..hccu).collect();
@@ -210,13 +214,13 @@ fn emit_hc_reduce(
     // first buys nothing and pays the full maintenance round.
     let z = b.emit(DevOp::V4HcZero, vec![0], deps, |d| {
         d.t[0] = tn.hc_partial;
-        d.i[0] = 1 + mix as u32;
+        d.i[0] = tn.rows * (1 + mix as u32);
     });
     let dot = b.emit(DevOp::V4HcDot, all.clone(), &[z], |d| {
         d.t[0] = tn.hc_partial;
         d.t[1] = tn.x;
         d.t[2] = fnw;
-        d.i[0] = 1;
+        d.i[0] = tn.rows;
         d.i[1] = c.hidden as u32;
         d.i[2] = c.hc_mult;
     });
@@ -226,27 +230,31 @@ fn emit_hc_reduce(
     // that is 8 workgroups doing the work and 56 re-running the whole 20-iteration
     // Sinkhorn to discard it, then paying the maintenance round. Narrowing is
     // bit-identical for exactly that reason: the discarded blocks wrote nothing.
-    b.emit(DevOp::V4HcMix, combine_cus(&all, c.hidden as u32), &[dot], |d| {
-        d.t[0] = out;
-        d.t[1] = tn.x;
-        d.t[2] = tn.hc_partial;
-        d.t[3] = scale;
-        d.t[4] = base;
-        d.t[5] = tn.hc_mix;
-        d.i[0] = 1;
-        d.i[1] = c.hidden as u32;
-        d.i[2] = c.hc_mult;
-        // TIMING PROBE: PLOW_V4_HCITERS overrides the Sinkhorn iteration count.
-        // `d_v4_hc_mix` runs its token loop UNSTRIDED, so every block executes
-        // the whole tail; if that is the cost, iteration count is the dial that
-        // shows it. Any value but the config's 20 is a DIFFERENT MODEL.
-        d.i[3] = std::env::var("PLOW_V4_HCITERS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(c.hc_iters);
-        d.f[0] = 1e-6;
-        d.f[1] = 1e-6; /* hc_eps */
-    })
+    b.emit(
+        DevOp::V4HcMix,
+        combine_cus(&all, c.hidden as u32),
+        &[dot],
+        |d| {
+            d.t[0] = out;
+            d.t[1] = tn.x;
+            d.t[2] = tn.hc_partial;
+            d.t[3] = scale;
+            d.t[4] = base;
+            d.t[5] = tn.hc_mix;
+            d.i[0] = tn.rows;
+            d.i[1] = c.hidden as u32;
+            d.i[2] = c.hc_mult;
+            // TIMING PROBE: PLOW_V4_HCITERS overrides the Sinkhorn iteration count.
+            // `d_v4_hc_mix` runs its token loop UNSTRIDED, so every block executes
+            // the whole tail; if that is the cost, iteration count is the dial that
+            // shows it. Any value but the config's 20 is a DIFFERENT MODEL.
+            d.i[3] = crate::emit_config::active()
+                .v4_hc_iters
+                .unwrap_or(c.hc_iters);
+            d.f[0] = 1e-6;
+            d.f[1] = 1e-6; /* hc_eps */
+        },
+    )
 }
 
 /// Write the branch output back into the residual streams.
@@ -268,7 +276,7 @@ fn emit_hc_expand(
         return b.emit(DevOp::V4HcBroadcast, all, deps, |d| {
             d.t[0] = tn.x;
             d.t[1] = branch;
-            d.i[0] = 1;
+            d.i[0] = tn.rows;
             d.i[1] = c.hidden as u32;
             d.i[2] = c.hc_mult;
         });
@@ -277,15 +285,20 @@ fn emit_hc_expand(
     // `T * HC * D` — each thread owns one depth and writes all HC streams for it.
     // So it saturates at ceil(D / 512) = 8 workgroups at hidden 4096, and the 120
     // beyond that arrive, find nothing, and still pay the maintenance round.
-    b.emit(DevOp::V4HcExpand, combine_cus(&all, c.hidden as u32), deps, |d| {
-        d.t[0] = tn.x; // in place: every output reads the whole stream vector first
-        d.t[1] = branch;
-        d.t[2] = tn.x;
-        d.t[3] = tn.hc_mix;
-        d.i[0] = 1;
-        d.i[1] = c.hidden as u32;
-        d.i[2] = c.hc_mult;
-    })
+    b.emit(
+        DevOp::V4HcExpand,
+        combine_cus(&all, c.hidden as u32),
+        deps,
+        |d| {
+            d.t[0] = tn.x; // in place: every output reads the whole stream vector first
+            d.t[1] = branch;
+            d.t[2] = tn.x;
+            d.t[3] = tn.hc_mix;
+            d.i[0] = tn.rows;
+            d.i[1] = c.hidden as u32;
+            d.i[2] = c.hc_mult;
+        },
+    )
 }
 
 /// A block-fp8 decode GEMV, the arm every V4 projection uses.
@@ -303,7 +316,11 @@ fn emit_hc_expand(
 /// this bring-up; every cost REASONED about has been wrong. Programs emitted
 /// with it set are not the model and are for measurement only.
 fn v4_skip(tag: &str) -> bool {
-    std::env::var("PLOW_V4_SKIP").as_deref() == Ok(tag)
+    crate::emit_config::active().v4_skip.as_deref() == Some(tag)
+}
+
+fn v4_rows() -> u32 {
+    crate::emit_config::active().decode_batch.max(1)
 }
 
 /// A plain bf16 GEMV.
@@ -329,12 +346,27 @@ fn emit_bf16_gemv(
         d.t[0] = out;
         d.t[1] = x;
         d.t[2] = w;
-        d.i[0] = 1;
+        d.i[0] = v4_rows();
         d.i[1] = n;
         d.i[2] = k;
     })
 }
 
+fn v4_fp8_gemv_tag(name: &str) -> &'static str {
+    if name.ends_with(".attn.wq_a") {
+        "wqa"
+    } else if name.ends_with(".attn.wq_b") {
+        "wqb"
+    } else if name.ends_with(".attn.wkv") {
+        "wkv"
+    } else if name.ends_with(".attn.indexer.wq_b") {
+        "idx"
+    } else if name.ends_with(".attn.wo_b") {
+        "wob"
+    } else {
+        "other"
+    }
+}
 fn emit_fp8_gemv(
     b: &mut Builder,
     name: &str,
@@ -355,9 +387,8 @@ fn emit_fp8_gemv(
     // neither reads the other, but both are emitted on every CU so the counter
     // DAG runs them back to back. wkv is 2 MiB against wq_b's 33, so the kv path
     // gets the small slice.
-    let split = std::env::var("PLOW_V4_SPLITCU")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
+    let split = crate::emit_config::active()
+        .v4_split_cu
         .map(|v| v.clamp(1, n_cu - 1));
     let all: Vec<u32> = match split {
         Some(k) if name.ends_with(".attn.wkv") => (n_cu - k..n_cu).collect(),
@@ -367,10 +398,16 @@ fn emit_fp8_gemv(
     // TIMING PROBE: replace every block-fp8 GEMV with a zero-fill of its output
     // so the program keeps its shape and the difference is what the four GEMVs
     // in a layer actually cost. Same technique that found wo_a.
-    if std::env::var("PLOW_V4_SKIP").as_deref() == Ok("gemv") {
+    let gemv_only = crate::emit_config::active()
+        .v4_skip
+        .as_deref()
+        .and_then(|s| s.strip_prefix("gemv_only_"));
+    if v4_skip("gemv")
+        || gemv_only.is_some_and(|tags| !tags.split(',').any(|tag| tag == v4_fp8_gemv_tag(name)))
+    {
         return b.emit(DevOp::V4HcZero, all, deps, |d| {
             d.t[0] = out;
-            d.i[0] = n.div_ceil(2); // bf16 out, f32 writes
+            d.i[0] = (v4_rows() * n).div_ceil(2); // bf16 output, f32 writes
         });
     }
     b.emit(DevOp::GemvFp8Blk, all, deps, |d| {
@@ -378,7 +415,7 @@ fn emit_fp8_gemv(
         d.t[1] = x;
         d.t[2] = w;
         d.t[5] = ws;
-        d.i[0] = 1;
+        d.i[0] = v4_rows();
         d.i[1] = n;
         d.i[2] = k;
     })
@@ -421,7 +458,7 @@ fn emit_v4_attn(
             d.t[0] = tn.xn;
             d.t[1] = tn.xr;
             d.t[2] = anw;
-            d.i[0] = 1;
+            d.i[0] = tn.rows;
             d.i[1] = h;
             d.f[0] = 1e-6;
         })
@@ -433,7 +470,7 @@ fn emit_v4_attn(
             d.t[0] = tn.xn;
             d.t[1] = tn.xr;
             d.t[2] = anw;
-            d.i[0] = 1;
+            d.i[0] = tn.rows;
             d.i[1] = h;
             d.f[0] = 1e-6;
         });
@@ -442,13 +479,12 @@ fn emit_v4_attn(
         d.t[0] = tn.xn;
         d.t[1] = tn.xr;
         d.t[2] = anw;
-        d.i[0] = 1;
+        d.i[0] = tn.rows;
         d.i[1] = h;
         d.f[0] = 1e-6;
     });
-
     // q: wq_a -> q_norm -> wq_b -> weightless per-head RMS + rope tail.
-    let qlr = b.tensor("act.qlr", ql as u64 * BF16);
+    let qlr = b.tensor("act.qlr", tn.rows as u64 * ql as u64 * BF16);
     let qa = emit_fp8_gemv(
         b,
         &format!("{p}.attn.wq_a"),
@@ -464,7 +500,7 @@ fn emit_v4_attn(
         d.t[0] = qlr;
         d.t[1] = qlr;
         d.t[2] = qnw;
-        d.i[0] = 1;
+        d.i[0] = tn.rows;
         d.i[1] = ql;
         d.f[0] = 1e-6;
     });
@@ -481,24 +517,33 @@ fn emit_v4_attn(
     // `gamma == NONE` is the weightless rescale; i5 == 1 selects the
     // INTERLEAVED HD=512 template, which ropes the trailing lanes through an
     // identity-prefix table (see the v4_rope oracle).
-    let qrope = if v4_skip("rope") { qb } else { b.emit(DevOp::HeadNormRope, k3_rope_cus(&all, 0, 1, nh), &[qb], |d| {
-        d.t[0] = tn.q;
-        d.t[1] = tn.q;
-        d.t[2] = packet::dev::TENSOR_NONE;
-        d.t[3] = tn.cos;
-        d.t[4] = tn.sin;
-        d.t[5] = tn.pos;
-        d.i[0] = 1;
-        d.i[1] = nh;
-        d.i[2] = hd;
-        d.i[5] = 1;
-        d.f[0] = 1e-6;
-    })};
+    let qrope = if v4_skip("rope") {
+        qb
+    } else {
+        b.emit(
+            DevOp::HeadNormRope,
+            k3_rope_cus(&all, 0, 1, nh),
+            &[qb],
+            |d| {
+                d.t[0] = tn.q;
+                d.t[1] = tn.q;
+                d.t[2] = packet::dev::TENSOR_NONE;
+                d.t[3] = tn.cos;
+                d.t[4] = tn.sin;
+                d.t[5] = tn.pos;
+                d.i[0] = tn.rows;
+                d.i[1] = nh;
+                d.i[2] = hd;
+                d.i[5] = 1;
+                d.f[0] = 1e-6;
+            },
+        )
+    };
 
     // The single shared KV head, roped and written into the sliding-window ring.
     let kvring = b.tensor(
         &format!("kv.{l}"),
-        (c.window as u64 + ctx as u64 / 4) * hd as u64 * BF16,
+        tn.rows as u64 * (c.window as u64 + ctx as u64 / 4) * hd as u64 * BF16,
     );
     let kva = emit_fp8_gemv(
         b,
@@ -526,10 +571,17 @@ fn emit_v4_attn(
             d.t[3] = tn.cos;
             d.t[4] = tn.sin;
             d.t[5] = tn.pos;
-            d.i[0] = 1;
+            d.i[0] = tn.rows;
             d.i[1] = 1;
             d.i[2] = hd;
             d.i[5] = 1;
+            if tn.rows > 1 {
+                d.i[6] = tn.rows;
+                // Batch-major KV rows are packed at the allocated ring stride,
+                // not at the full context length. Using `ctx` here makes row
+                // t>0 write past `kv.{l}` as soon as the batch path is used.
+                d.j[0] = c.window + ctx / 4;
+            }
             d.f[0] = 1e-6;
             d.j[1] = c.window - 1;
         });
@@ -537,22 +589,31 @@ fn emit_v4_attn(
     // ONE head, and DISJOINT from the q rope above: both are gated on `nrm`
     // through their own GEMV and run together, so sharing slice 0 would
     // serialise them. Same rule and same reason as K3's `k3_rope_cus` start.
-    let kvrope = b.emit(DevOp::HeadNormRope, k3_rope_cus(&all, 8, 1, 1), &[kva], |d| {
-        d.t[0] = kvring;
-        d.t[1] = tn.kv;
-        d.t[2] = knw;
-        d.t[3] = tn.cos;
-        d.t[4] = tn.sin;
-        d.t[5] = tn.pos;
-        d.i[0] = 1;
-        d.i[1] = 1;
-        d.i[2] = hd;
-        d.i[5] = 1;
-        d.f[0] = 1e-6;
-        // `j1` is the ring mask: the window is a power-of-two ring, so the
-        // write position wraps with one `v_and_b32`.
-        d.j[1] = c.window - 1;
-    });
+    let kvrope = b.emit(
+        DevOp::HeadNormRope,
+        k3_rope_cus(&all, 8, 1, 1),
+        &[kva],
+        |d| {
+            d.t[0] = kvring;
+            d.t[1] = tn.kv;
+            d.t[2] = knw;
+            d.t[3] = tn.cos;
+            d.t[4] = tn.sin;
+            d.t[5] = tn.pos;
+            d.i[0] = tn.rows;
+            d.i[1] = 1;
+            d.i[2] = hd;
+            d.i[5] = 1;
+            if tn.rows > 1 {
+                d.i[6] = tn.rows;
+                d.j[0] = c.window + ctx / 4;
+            }
+            d.f[0] = 1e-6;
+            // `j1` is the ring mask: the window is a power-of-two ring, so the
+            // write position wraps with one `v_and_b32`.
+            d.j[1] = c.window - 1;
+        },
+    );
 
     let mut adeps = vec![qrope, kvrope];
 
@@ -560,8 +621,8 @@ fn emit_v4_attn(
     if let Some(r) = c.compress_ratio(l) {
         let coff = if V4Cfg::overlaps(r) { 2 } else { 1 };
         let w = coff * hd;
-        let ckv = b.tensor(&format!("act.ckv.{l}"), w as u64 * F32);
-        let cgt = b.tensor(&format!("act.cgate.{l}"), w as u64 * F32);
+        let ckv = b.tensor(&format!("act.ckv.{l}"), tn.rows as u64 * w as u64 * F32);
+        let cgt = b.tensor(&format!("act.cgate.{l}"), tn.rows as u64 * w as u64 * F32);
         let g1 = emit_bf16_gemv(
             b,
             &format!("{p}.attn.compressor.wkv"),
@@ -599,11 +660,11 @@ fn emit_v4_attn(
         // name-classification test caught.
         let kvs = b.tensor(
             &format!("kv.cstate.{l}"),
-            (coff * r) as u64 * w as u64 * F32,
+            tn.rows as u64 * (coff * r) as u64 * w as u64 * F32,
         );
         let scs = b.tensor(
             &format!("kv.cscore.{l}"),
-            (coff * r) as u64 * w as u64 * F32,
+            tn.rows as u64 * (coff * r) as u64 * w as u64 * F32,
         );
         // V4KvCompressStep, NOT V4KvCompress. 125 is the PREFILL kernel and
         // takes different operands; issued with these it opened on
@@ -625,6 +686,9 @@ fn emit_v4_attn(
             d.i[1] = r;
             d.i[2] = coff - 1;
             d.f[0] = 1e-6;
+            d.i[3] = tn.rows;
+            d.i[4] = c.window + ctx / 4;
+            d.i[5] = c.window;
             let _ = h;
         });
         adeps.push(step);
@@ -632,7 +696,10 @@ fn emit_v4_attn(
 
     // The indexer, on the 21 ratio-4 layers: its own compressed KV, a scorer,
     // and the top-k that decides what attention may read.
-    let idx = b.tensor(&format!("act.topk.{l}"), c.index_topk as u64 * I32);
+    let idx = b.tensor(
+        &format!("act.topk.{l}"),
+        tn.rows as u64 * c.index_topk as u64 * I32,
+    );
     // A LAYER WITHOUT AN INDEXER NEVER WRITES `idx`, and `d_v4_sparse_attn`
     // gathers `kv[idx[j]]`. Left as whatever the allocator held, those are
     // arbitrary 32-bit values and the gather walks off the KV ring — an
@@ -641,17 +708,26 @@ fn emit_v4_attn(
     if c.compress_ratio(l) != Some(4) {
         let z = b.emit(DevOp::V4HcZero, vec![0], &[kvrope], |d| {
             d.t[0] = idx;
-            d.i[0] = c.index_topk;
+            d.i[0] = tn.rows * c.index_topk;
         });
         adeps.push(z);
     }
     if c.compress_ratio(l) == Some(4) {
         let ih = c.index_heads;
         let ihd = c.index_head_dim;
-        let iq = b.tensor(&format!("act.iq.{l}"), (ih * ihd) as u64 * BF16);
-        let isc = b.tensor(&format!("act.iscore.{l}"), (ctx / 4) as u64 * F32);
-        let ickv = b.tensor(&format!("kv.idx.{l}"), (ctx / 4) as u64 * ihd as u64 * BF16);
-        let iw = b.tensor(&format!("act.iw.{l}"), ih as u64 * BF16);
+        let iq = b.tensor(
+            &format!("act.iq.{l}"),
+            tn.rows as u64 * (ih * ihd) as u64 * BF16,
+        );
+        let isc = b.tensor(
+            &format!("act.iscore.{l}"),
+            tn.rows as u64 * (ctx / 4) as u64 * F32,
+        );
+        let ickv = b.tensor(
+            &format!("kv.idx.{l}"),
+            tn.rows as u64 * (ctx / 4) as u64 * ihd as u64 * BF16,
+        );
+        let iw = b.tensor(&format!("act.iw.{l}"), tn.rows as u64 * ih as u64 * BF16);
         let g = emit_fp8_gemv(
             b,
             &format!("{p}.attn.indexer.wq_b"),
@@ -662,14 +738,87 @@ fn emit_v4_attn(
             n_cu,
             &[qn],
         );
-        let sc = b.emit(DevOp::V4IndexScore, all.clone(), &[g], |d| {
+        let iwg = emit_bf16_gemv(
+            b,
+            &format!("{p}.attn.indexer.weights_proj"),
+            iw,
+            tn.xn,
+            ih,
+            h,
+            n_cu,
+            &[nrm],
+        );
+        let ir = 4;
+        let icoff = 2;
+        let iwid = icoff * ihd;
+        let ikv_p = b.tensor(&format!("act.ickv.{l}"), tn.rows as u64 * iwid as u64 * F32);
+        let isc_p = b.tensor(
+            &format!("act.icgate.{l}"),
+            tn.rows as u64 * iwid as u64 * F32,
+        );
+        let ikvg = emit_bf16_gemv(
+            b,
+            &format!("{p}.attn.indexer.compressor.wkv"),
+            ikv_p,
+            tn.xn,
+            iwid,
+            h,
+            n_cu,
+            &[nrm],
+        );
+        let iscg = emit_bf16_gemv(
+            b,
+            &format!("{p}.attn.indexer.compressor.wgate"),
+            isc_p,
+            tn.xn,
+            iwid,
+            h,
+            n_cu,
+            &[nrm],
+        );
+        let iape = b.tensor(
+            &format!("{p}.attn.indexer.compressor.ape"),
+            ir as u64 * iwid as u64 * F32,
+        );
+        let inw = b.tensor(
+            &format!("{p}.attn.indexer.compressor.norm.weight"),
+            ihd as u64 * BF16,
+        );
+        let ikvs = b.tensor(
+            &format!("kv.icstate.{l}"),
+            tn.rows as u64 * (icoff * ir) as u64 * iwid as u64 * F32,
+        );
+        let iscs = b.tensor(
+            &format!("kv.icscore.{l}"),
+            tn.rows as u64 * (icoff * ir) as u64 * iwid as u64 * F32,
+        );
+        let istep = b.emit(DevOp::V4KvCompressStep, vec![0], &[ikvg, iscg], |d| {
+            d.t[0] = ickv;
+            d.t[1] = ikvs;
+            d.t[2] = iscs;
+            d.t[3] = ikv_p;
+            d.t[4] = isc_p;
+            d.t[5] = iape;
+            d.t[6] = inw;
+            d.t[7] = tn.pos;
+            d.i[0] = ihd;
+            d.i[1] = ir;
+            d.i[2] = icoff - 1;
+            d.i[3] = tn.rows;
+            d.i[4] = ctx / 4;
+            d.i[5] = 0;
+            d.f[0] = 1e-6;
+        });
+        let sc = b.emit(DevOp::V4IndexScore, all.clone(), &[g, iwg, istep], |d| {
             d.t[0] = isc;
             d.t[1] = iq;
             d.t[2] = ickv;
             d.t[3] = iw;
-            d.i[0] = 1;
+            d.i[0] = tn.rows;
             d.i[1] = ih;
             d.i[2] = ihd;
+            d.t[4] = tn.pos;
+            d.i[4] = 4;
             d.i[3] = ctx / 4;
         });
         // ONE block: the selection is a per-row reduction. Under TP the score
@@ -677,33 +826,41 @@ fn emit_v4_attn(
         let tk = b.emit(DevOp::V4IndexTopk, vec![0], &[sc], |d| {
             d.t[0] = idx;
             d.t[1] = isc;
-            d.i[0] = 1;
+            d.i[0] = tn.rows;
             d.i[1] = ctx / 4;
             d.i[2] = c.index_topk;
             d.i[3] = 0;
+            d.t[2] = tn.pos;
+            d.i[5] = 4;
             d.i[4] = c.window;
         });
         adeps.push(tk);
     }
 
     // Split-K attention, then the merge that folds the partials and the sink.
+    let ratio = c.compress_ratio(l).unwrap_or(0);
     let topk = c.window
-        + if c.compress_ratio(l).is_some() {
-            c.index_topk
-        } else {
-            0
+        + match ratio {
+            4 => c.index_topk,
+            0 => 0,
+            r => ctx / r,
         };
     // SPLIT-K over the gathered keys. `d_v4_sparse_attn_split` grid-strides over
     // (token, head, split), so this sets the work-item count: T*H*SPLIT = 1*64*4
     // = 256 against the 128 workgroups the packet takes, i.e. two grid passes.
     // Never swept — the merge folds any SPLIT, so it is a free dial.
-    let sp = std::env::var("PLOW_V4_SP")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
+    let sp = crate::emit_config::active()
+        .v4_sp
         .filter(|v| *v >= 1)
         .unwrap_or(4u32);
-    let opart = b.tensor(&format!("act.opart.{l}"), (nh * sp * hd) as u64 * F32);
-    let mlpart = b.tensor(&format!("act.mlpart.{l}"), (nh * sp * 2) as u64 * F32);
+    let opart = b.tensor(
+        &format!("act.opart.{l}"),
+        tn.rows as u64 * (nh * sp * hd) as u64 * F32,
+    );
+    let mlpart = b.tensor(
+        &format!("act.mlpart.{l}"),
+        tn.rows as u64 * (nh * sp * 2) as u64 * F32,
+    );
     let sink = b.tensor(&format!("{p}.attn.attn_sink"), nh as u64 * F32);
     // TWO OPCODES, because they are two kernels. Both used to be emitted as
     // `V4SparseAttn`, for which the interpreter has exactly one arm — so the
@@ -720,7 +877,10 @@ fn emit_v4_attn(
         let inv0 = z;
         let og = c.o_groups;
         let orank = c.o_lora as u32;
-        let ob = b.tensor(&format!("act.ob.{l}"), (og * orank) as u64 * BF16);
+        let ob = b.tensor(
+            &format!("act.ob.{l}"),
+            tn.rows as u64 * (og * orank) as u64 * BF16,
+        );
         let woa = b.tensor(
             &format!("{p}.attn.wo_a.weight"),
             (og * orank) as u64 * (nh * hd / og) as u64,
@@ -729,7 +889,7 @@ fn emit_v4_attn(
             d.t[0] = ob;
             d.t[1] = tn.attn_out;
             d.t[2] = woa;
-            d.i[0] = 1;
+            d.i[0] = tn.rows;
             d.i[1] = og;
             d.i[2] = orank;
             d.i[3] = nh * hd / og;
@@ -752,11 +912,15 @@ fn emit_v4_attn(
         d.t[2] = tn.q;
         d.t[3] = kvring;
         d.t[4] = idx;
-        d.i[0] = 1;
+        d.t[5] = tn.pos;
+        d.i[0] = tn.rows;
         d.i[1] = nh;
         d.i[2] = hd;
         d.i[3] = topk;
         d.i[4] = sp;
+        d.i[5] = c.window;
+        d.i[6] = c.window + ctx / 4;
+        d.i[7] = ratio;
         d.f[0] = 1.0 / (hd as f32).sqrt();
     });
     let amg = b.emit(DevOp::V4SparseAttnMerge, all.clone(), &[asp], |d| {
@@ -764,33 +928,42 @@ fn emit_v4_attn(
         d.t[1] = opart;
         d.t[2] = mlpart;
         d.t[3] = sink;
-        d.i[0] = 1;
+        d.i[0] = tn.rows;
         d.i[1] = nh;
         d.i[2] = hd;
         d.i[3] = sp;
     });
 
     // The output de-rotation: the same arm with `sin` negated.
-    let inv = if v4_skip("rope") { amg } else { b.emit(DevOp::HeadNormRope, k3_rope_cus(&all, 0, 1, nh), &[amg], |d| {
-        d.t[0] = tn.attn_out;
-        d.t[1] = tn.attn_out;
-        d.t[2] = packet::dev::TENSOR_NONE;
-        d.t[3] = tn.cos_i;
-        d.t[4] = tn.sin_i;
-        d.t[5] = tn.pos;
-        d.i[0] = 1;
-        d.i[1] = nh;
-        d.i[2] = hd;
-        d.i[4] = 1; // skip_norm: the rescale already happened on q
-        d.i[5] = 1;
-    })};
+    let inv = if v4_skip("rope") {
+        amg
+    } else {
+        b.emit(
+            DevOp::HeadNormRope,
+            k3_rope_cus(&all, 0, 1, nh),
+            &[amg],
+            |d| {
+                d.t[0] = tn.attn_out;
+                d.t[1] = tn.attn_out;
+                d.t[2] = packet::dev::TENSOR_NONE;
+                d.t[3] = tn.cos_i;
+                d.t[4] = tn.sin_i;
+                d.t[5] = tn.pos;
+                d.i[0] = tn.rows;
+                d.i[1] = nh;
+                d.i[2] = hd;
+                d.i[4] = 1; // skip_norm: the rescale already happened on q
+                d.i[5] = 1;
+            },
+        )
+    };
 
     // wo_a is BLOCK-DIAGONAL over the head groups, from one stacked tensor; a
     // dense linear of the same element count mixes groups the reference keeps
     // apart. wo_b is an ordinary projection.
     let og = c.o_groups;
     let orank = c.o_lora as u32;
-    let ob = b.tensor("act.o_b", (og * orank) as u64 * BF16);
+    let ob = b.tensor("act.o_b", tn.rows as u64 * (og * orank) as u64 * BF16);
     let woa = b.tensor(
         &format!("{p}.attn.wo_a.weight"),
         (og * orank) as u64 * (nh * hd / og) as u64,
@@ -799,7 +972,7 @@ fn emit_v4_attn(
     // program keeps its shape and the difference is that ONE op's cost. The
     // attention chain's 35 ms is flat in context and concentrated in one or two
     // packets; this is how each candidate gets timed.
-    if std::env::var("PLOW_V4_SKIP").as_deref() == Ok("woa") {
+    if v4_skip("woa") {
         let z = b.emit(DevOp::V4HcZero, all.clone(), &[inv], |d| {
             d.t[0] = ob;
             d.i[0] = og * orank;
@@ -824,7 +997,7 @@ fn emit_v4_attn(
             d.t[0] = ob;
             d.t[1] = tn.attn_out;
             d.t[2] = woa;
-            d.i[0] = 1;
+            d.i[0] = tn.rows;
             d.i[1] = og;
             d.i[2] = orank;
             d.i[3] = nh * hd / og;
@@ -834,7 +1007,7 @@ fn emit_v4_attn(
         d.t[0] = ob;
         d.t[1] = tn.attn_out;
         d.t[2] = woa;
-        d.i[0] = 1;
+        d.i[0] = tn.rows;
         d.i[1] = og;
         d.i[2] = orank;
         d.i[3] = nh * hd / og;
@@ -886,9 +1059,8 @@ fn emit_v4_shared_expert(
     // both gate on the norm, neither reads the other — but both are emitted on
     // every CU, so the counter DAG runs them back to back. PLOW_V4_SPLITCU
     // gives them disjoint sets so they can actually overlap.
-    let split = std::env::var("PLOW_V4_SPLITCU")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
+    let split = crate::emit_config::active()
+        .v4_split_cu
         .map(|v| v.clamp(1, n_cu - 1));
     let all: Vec<u32> = match split {
         Some(k) => (0..k).collect(),
@@ -896,9 +1068,16 @@ fn emit_v4_shared_expert(
     };
     let h = c.hidden as u32;
     let i = c.moe_inter as u32;
-    let sh = b.tensor(&format!("act.shared.{l}"), h as u64 * BF16);
-    let sg = b.tensor(&format!("act.shgate.{l}"), i as u64 * BF16);
-    let su = b.tensor(&format!("act.shup.{l}"), i as u64 * BF16);
+    let sh = b.tensor(&format!("act.shared.{l}"), tn.rows as u64 * h as u64 * BF16);
+    if v4_skip("shared") {
+        let z = b.emit(DevOp::V4HcZero, all, &[dep], |d| {
+            d.t[0] = sh;
+            d.i[0] = tn.rows * h / 2;
+        });
+        return (sh, z);
+    }
+    let sg = b.tensor(&format!("act.shgate.{l}"), tn.rows as u64 * i as u64 * BF16);
+    let su = b.tensor(&format!("act.shup.{l}"), tn.rows as u64 * i as u64 * BF16);
     // Block-fp8 `[N/128][K/128]`, one scale per 128x128 tile — IN BYTES, so the
     // f32 the kernel reads has to be in the size. This was the count alone, 4x
     // too small, and it is the whole reason the model produced NaN.
@@ -936,6 +1115,7 @@ fn emit_v4_shared_expert(
         kk: u32,
         src: u32,
         d0: u32,
+        rows: u32,
     ) -> u32 {
         b.emit(DevOp::GemvFp8Blk, cus.to_vec(), &[d0], |d| {
             d.t[0] = out;
@@ -947,21 +1127,26 @@ fn emit_v4_shared_expert(
             // step. `emit_fp8_gemv` had it right and this one did not, which is
             // exactly why the slot is now written the same way in both.
             d.t[5] = s;
-            d.i[0] = 1;
+            d.i[0] = rows;
             d.i[1] = n;
             d.i[2] = kk;
         })
     }
-    let g = gemv(b, &all, sg, w1, s1, i, h, tn.xn, dep);
-    let u = gemv(b, &all, su, w3, s3, i, h, tn.xn, dep);
-    let a = b.emit(DevOp::V4ClampedSwiGlu, combine_cus(&all, i), &[g, u], |d| {
-        d.t[0] = sg;
-        d.t[1] = sg;
-        d.t[2] = su;
-        d.i[0] = i;
-        d.f[0] = c.swiglu_limit as f32;
-    });
-    let dn = gemv(b, &all, sh, w2, s2, h, i, sg, a);
+    let g = gemv(b, &all, sg, w1, s1, i, h, tn.xn, dep, tn.rows);
+    let u = gemv(b, &all, su, w3, s3, i, h, tn.xn, dep, tn.rows);
+    let a = b.emit(
+        DevOp::V4ClampedSwiGlu,
+        combine_cus(&all, tn.rows * i),
+        &[g, u],
+        |d| {
+            d.t[0] = sg;
+            d.t[1] = sg;
+            d.t[2] = su;
+            d.i[0] = tn.rows * i;
+            d.f[0] = c.swiglu_limit as f32;
+        },
+    );
+    let dn = gemv(b, &all, sh, w2, s2, h, i, sg, a, tn.rows);
     (sh, dn)
 }
 
@@ -981,26 +1166,26 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
         d.t[0] = tn.xn;
         d.t[1] = tn.xr;
         d.t[2] = fnw;
-        d.i[0] = 1;
+        d.i[0] = tn.rows;
         d.i[1] = h;
         d.f[0] = 1e-6;
     });
 
     // Gate scores. The GEMM is bf16 and small; on a hash layer it is dead
     // weight the emitter still pays, which is a Stage-4 saving, not a bug.
-    let glog = b.tensor(&format!("act.glogit.{l}"), e as u64 * F32);
+    let glog = b.tensor(&format!("act.glogit.{l}"), tn.rows as u64 * e as u64 * F32);
     let gw = b.tensor(&format!("{p}.ffn.gate.weight"), e as u64 * h as u64 * BF16);
     let gg = b.emit(DevOp::Gemv, all.clone(), &[nrm], |d| {
         d.t[0] = glog;
         d.t[1] = tn.xn;
         d.t[2] = gw;
-        d.i[0] = 1;
+        d.i[0] = tn.rows;
         d.i[1] = e;
         d.i[2] = h;
     });
 
-    let sel = b.tensor(&format!("act.sel.{l}"), k as u64 * I32);
-    let wts = b.tensor(&format!("act.wts.{l}"), k as u64 * F32);
+    let sel = b.tensor(&format!("act.sel.{l}"), tn.rows as u64 * k as u64 * I32);
+    let wts = b.tensor(&format!("act.wts.{l}"), tn.rows as u64 * k as u64 * F32);
     let bias = if hash {
         packet::dev::TENSOR_NONE
     } else {
@@ -1019,7 +1204,7 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     // SCORES differently from every other family, but what it hands the experts
     // is the ordinary table, which is why the shipped mxfp4 expert arms can
     // stream its experts with no V4-specific kernel at all.
-    let tab = b.tensor(&format!("act.moetab.{l}"), k as u64 * 8);
+    let tab = b.tensor(&format!("act.moetab.{l}"), tn.rows as u64 * k as u64 * 8);
     // TIMING PROBE, by DUPLICATION rather than removal: emitting the router
     // twice leaves the program correct (the second write is identical to the
     // first) and the difference in layer time IS one router. Removal would have
@@ -1033,7 +1218,7 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
             d.t[4] = tid;
             d.t[5] = tn.ids;
             d.t[6] = tab;
-            d.i[0] = 1;
+            d.i[0] = tn.rows;
             d.i[1] = e;
             d.i[2] = k;
             d.f[0] = c.route_scale as f32;
@@ -1047,7 +1232,7 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
         d.t[4] = tid;
         d.t[5] = tn.ids;
         d.t[6] = tab;
-        d.i[0] = 1;
+        d.i[0] = tn.rows;
         d.i[1] = e;
         d.i[2] = k;
         d.f[0] = c.route_scale as f32;
@@ -1057,9 +1242,15 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     // expert is fp8 and always runs.
     // `fu` is PER SLOT: the GLU arm writes `fu[slot * I_moe + n]` and the down
     // arm reads the same stride, so this is k rows of I_moe, not a gate|up pair.
-    let fu = b.tensor(&format!("act.fu.{l}"), k as u64 * imoe as u64 * BF16);
+    let fu = b.tensor(
+        &format!("act.fu.{l}"),
+        tn.rows as u64 * k as u64 * imoe as u64 * BF16,
+    );
     // k independent f32 partials of H, folded by the combine.
-    let part = b.tensor(&format!("act.part.{l}"), k as u64 * h as u64 * F32);
+    let part = b.tensor(
+        &format!("act.part.{l}"),
+        tn.rows as u64 * k as u64 * h as u64 * F32,
+    );
     let (shared, shdep) = emit_v4_shared_expert(b, c, tn, l, n_cu, nrm);
     // HOST-FILLED POINTER TABLES, not checkpoint tensors: they hold device
     // addresses the loader computes after packing the 256 experts. The names
@@ -1094,9 +1285,8 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     // `PLOW_MOE_ENC_BF16`, and the quantized dot answers an encoding it does not
     // implement with a NaN rather than a wrong number.
     // The complement of the shared expert's set under PLOW_V4_SPLITCU.
-    let all: Vec<u32> = match std::env::var("PLOW_V4_SPLITCU")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
+    let all: Vec<u32> = match crate::emit_config::active()
+        .v4_split_cu
         .map(|v| v.clamp(1, n_cu - 1))
     {
         Some(k) => (k..n_cu).collect(),
@@ -1104,6 +1294,89 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     };
     let enc = 2u32; // PLOW_MOE_ENC_MXFP4
     let v4_clamp = 3u32; // PLOW_MOE_ACT_V4CLAMP
+
+    // B>1 uses the sorted grouped path: rows selecting the same expert share
+    // one weight traversal. The decode grouped opcodes above are B=1 bodies;
+    // repeating their packet once does not make their tensor addressing row-aware.
+    if tn.rows > 1 && !v4_skip("perslot") {
+        if v4_skip("moe") {
+            let z = b.emit(DevOp::V4HcZero, all.clone(), &[rt], |d| {
+                d.t[0] = part;
+                d.i[0] = tn.rows * k * h;
+            });
+            let cmb = b.emit(DevOp::MoeCombinePf, all.clone(), &[z, shdep], |d| {
+                d.t[0] = tn.xr;
+                d.t[1] = tn.xr;
+                d.t[2] = shared;
+                d.t[3] = part;
+                d.i[0] = h;
+                d.i[1] = k;
+                d.i[2] = tn.rows;
+            });
+            return emit_hc_expand(b, c, tn, tn.xr, n_cu, &[cmb]);
+        }
+        let pad_rows = tn.rows as u64 * k as u64 + e as u64 * (MPF_BM - 1) as u64;
+        let meta = b.tensor(&format!("act.moemeta.{l}"), (3 * e + 1) as u64 * I32);
+        let row_token = b.tensor(&format!("act.moerowtok.{l}"), pad_rows * I32);
+        let row_partidx = b.tensor(&format!("act.moerowpart.{l}"), pad_rows * I32);
+        let row_gate = b.tensor(&format!("act.moerowgate.{l}"), pad_rows * F32);
+        let fu_g = b.tensor(&format!("act.moe_fug.{l}"), pad_rows * (imoe / 2) as u64);
+        let fu_scale = b.tensor(
+            &format!("act.moe_fuscale.{l}"),
+            pad_rows * (imoe / MX_BLOCK) as u64,
+        );
+        let align = b.emit(DevOp::MoeAlignPf, vec![0], &[rt], |d| {
+            d.t[0] = meta;
+            d.t[1] = tab;
+            d.t[2] = row_token;
+            d.t[3] = row_partidx;
+            d.t[4] = row_gate;
+            d.i[0] = tn.rows;
+            d.i[1] = e;
+            d.i[2] = k;
+        });
+        let glu = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[align, nrm], |d| {
+            d.t[0] = fu_g;
+            d.t[1] = tn.xn;
+            d.t[2] = ewt;
+            d.t[3] = est;
+            d.t[4] = meta;
+            d.t[5] = row_token;
+            d.t[6] = row_partidx;
+            d.t[7] = fu_scale;
+            d.i[0] = imoe;
+            d.i[1] = h;
+            d.i[2] = e;
+            d.i[MoeEnc::PREFILL_SLOT] = enc;
+            d.i[5] = v4_clamp;
+            d.f[0] = c.swiglu_limit as f32;
+        });
+        let down = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[glu], |d| {
+            d.t[0] = part;
+            d.t[1] = fu_g;
+            d.t[2] = ewt;
+            d.t[3] = est;
+            d.t[4] = meta;
+            d.t[5] = fu_scale;
+            d.t[6] = row_partidx;
+            d.t[7] = row_gate;
+            d.i[0] = h;
+            d.i[1] = imoe;
+            d.i[2] = e;
+            d.i[MoeEnc::PREFILL_SLOT] = enc;
+        });
+        let cmb = b.emit(DevOp::MoeCombinePf, all.clone(), &[down, shdep], |d| {
+            d.t[0] = tn.xr;
+            d.t[1] = tn.xr;
+            d.t[2] = shared;
+            d.t[3] = part;
+            d.i[0] = h;
+            d.i[1] = k;
+            d.i[2] = tn.rows;
+        });
+        return emit_hc_expand(b, c, tn, tn.xr, n_cu, &[cmb]);
+    }
+
     // GROUPED, not per-slot: ops 48/49 stream all k slots in ONE packet pair
     // instead of 2k. At a ~50-100 us dispatch floor the packet COUNT is the
     // cost, not the arithmetic — 12 packets measured 0.615 ms while moving 50
@@ -1225,12 +1498,12 @@ pub(crate) fn emit_v4_layer(
     // packet, so the halves are emitted separately to find out which one it is.
     // `attn` and `ffn` each still produce a well-formed program — neither is the
     // model, and both say so.
-    let half = std::env::var("PLOW_V4_HALF").unwrap_or_default();
-    if half == "ffn" {
+    let half = crate::emit_config::active().v4_half.as_deref();
+    if half == Some("ffn") {
         return emit_v4_ffn(b, c, tn, l, n_cu, deps);
     }
     let a = emit_v4_attn(b, c, tn, l, ctx, n_cu, deps);
-    if half == "attn" {
+    if half == Some("attn") {
         return a;
     }
     emit_v4_ffn(b, c, tn, l, n_cu, &[a])
@@ -1248,10 +1521,13 @@ pub(crate) fn emit_v4_decode(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, ctx: u32, n_
     let h = c.hidden as u32;
 
     let emb = b.emit(DevOp::Embed, all.clone(), &[], |d| {
-        d.t[0] = tn.x;
+        // Keep embedding rows separate from the [T, HC, H] stream storage.
+        // In-place broadcast was only safe for T=1; at T>1 each later row
+        // could read a stream written for the preceding row.
+        d.t[0] = tn.xr;
         d.t[1] = tn.embed;
         d.t[2] = tn.ids;
-        d.i[0] = 1;
+        d.i[0] = tn.rows;
         d.i[1] = h;
         d.f[0] = 1.0;
     });
@@ -1260,13 +1536,18 @@ pub(crate) fn emit_v4_decode(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, ctx: u32, n_
     // the first reduce in layer 0 mixes uninitialised memory into every layer
     // after it — which is what a 43-layer program returning byte-identical
     // output to a 0-layer one looks like from the outside.
-    let bc = b.emit(DevOp::V4HcBroadcast, combine_cus(&all, c.hidden as u32), &[emb], |d| {
-        d.t[0] = tn.x;
-        d.t[1] = tn.x;
-        d.i[0] = 1;
-        d.i[1] = h;
-        d.i[2] = c.hc_mult;
-    });
+    let bc = b.emit(
+        DevOp::V4HcBroadcast,
+        combine_cus(&all, c.hidden as u32),
+        &[emb],
+        |d| {
+            d.t[0] = tn.x;
+            d.t[1] = tn.xr;
+            d.i[0] = tn.rows;
+            d.i[1] = h;
+            d.i[2] = c.hc_mult;
+        },
+    );
     let mut dep = bc;
     for l in 0..c.layers {
         dep = emit_v4_layer(b, c, tn, l, ctx, n_cu, &[dep]);
@@ -1285,7 +1566,7 @@ pub(crate) fn emit_v4_decode(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, ctx: u32, n_
         d.t[2] = hfn;
         d.t[3] = hsc;
         d.t[4] = hba;
-        d.i[0] = 1;
+        d.i[0] = tn.rows;
         d.i[1] = h;
         d.i[2] = c.hc_mult;
         d.f[0] = 1e-6;
@@ -1295,7 +1576,7 @@ pub(crate) fn emit_v4_decode(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, ctx: u32, n_
         d.t[0] = tn.xn;
         d.t[1] = tn.xr;
         d.t[2] = tn.fin_norm;
-        d.i[0] = 1;
+        d.i[0] = tn.rows;
         d.i[1] = h;
         d.f[0] = 1e-6;
     });
@@ -1305,7 +1586,7 @@ pub(crate) fn emit_v4_decode(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, ctx: u32, n_
         d.t[0] = tn.logits;
         d.t[1] = tn.xn;
         d.t[2] = tn.head;
-        d.i[0] = 1;
+        d.i[0] = tn.rows;
         d.i[1] = c.vocab as u32;
         d.i[2] = h;
     });
@@ -1313,13 +1594,13 @@ pub(crate) fn emit_v4_decode(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, ctx: u32, n_
         d.t[0] = tn.amax;
         d.t[1] = tn.logits;
         d.i[0] = c.vocab as u32;
-        d.i[1] = 1;
+        d.i[1] = tn.rows;
     });
     b.emit(DevOp::ArgmaxFin, vec![0], &[am], |d| {
         d.t[0] = tn.ids;
         d.t[1] = tn.amax;
         d.i[0] = n_cu;
-        d.i[1] = 1;
+        d.i[1] = tn.rows;
     });
 }
 
@@ -1356,7 +1637,7 @@ pub(crate) fn v4_emit_full(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, 
     // is the probe that answers it, and it is here rather than in a scratch
     // branch because the alternative is guessing (which has already cost this
     // bring-up five wrong hypotheses).
-    if let Some(n) = std::env::var("PLOW_V4_LAYERS").ok().and_then(|v| v.parse::<u32>().ok()) {
+    if let Some(n) = crate::emit_config::active().v4_layers {
         c.layers = c.layers.min(n);
         eprintln!("deepseek_v4: PLOW_V4_LAYERS={n} — TRUNCATED, not the real model");
     }
@@ -1386,7 +1667,8 @@ pub(crate) fn v4_emit_full(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, 
         domains,
         map: packet::devbuild::L2Map::RoundRobin,
     }));
-    let tn = declare_v4(&mut b, &c, ctx);
+    let rows = crate::emit_config::active().decode_batch.max(1);
+    let tn = declare_v4(&mut b, &c, ctx, rows);
     // The width every packet is emitted at, independent of the device's CU
     // count. The packet floor is per-WORKGROUP cache maintenance, not counter
     // sync (interp.hip's GATE_HIER note: buffer_wbl2 + buffer_inv are per-L2, so
@@ -1419,11 +1701,10 @@ pub(crate) fn v4_emit_full(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, 
     // 304 — what this defaulted to before either pass — is 1.35x the minimum,
     // and every measurement in this branch was taken with the env var set, so
     // the default was never the thing being measured.
-    let ecu = std::env::var("PLOW_V4_NCU")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
+    let ecu = crate::emit_config::active()
+        .v4_ncu
         .map(|v| v.clamp(1, n_cu))
-        .unwrap_or_else(|| n_cu.min(128));
+        .unwrap_or_else(|| if rows > 1 { n_cu } else { n_cu.min(128) });
     emit_v4_decode(&mut b, &c, &tn, ctx, ecu);
     let prog = b.finish();
 
@@ -1439,7 +1720,7 @@ pub(crate) fn v4_emit_full(dir: &Path, ctx: u32, out: &str, n_cu: u32, tp: u32, 
         tensors: prog.tensors.clone(),
         progs: vec![prog],
         kv_row_insts: Vec::new(),
-        prog_t: vec![1],
+        prog_t: vec![rows],
         gen: Vec::new(),
     };
     let blob = m.to_blob();
@@ -1469,7 +1750,7 @@ mod tests {
     fn hc_reduce_emits_dot_then_mix_sharing_one_partial() {
         let c = cfg_deepseek_v4_for_test();
         let mut b = Builder::new(8);
-        let tn = declare_v4(&mut b, &c, 4096);
+        let tn = declare_v4(&mut b, &c, 4096, 1);
         let out = tn.xr;
         emit_hc_reduce(&mut b, &c, &tn, "layers.0.hc_attn", out, 8, &[]);
         let p = b.finish();
@@ -1486,8 +1767,14 @@ mod tests {
         );
         // All three must name the SAME partial: the zero clears what the dot
         // accumulates into and the mix reads.
-        assert_eq!(p.insts[0].t[0], p.insts[1].t[0], "zero clears the dot's target");
-        assert_eq!(p.insts[1].t[0], p.insts[2].t[2], "the mix reads what the dot wrote");
+        assert_eq!(
+            p.insts[0].t[0], p.insts[1].t[0],
+            "zero clears the dot's target"
+        );
+        assert_eq!(
+            p.insts[1].t[0], p.insts[2].t[2],
+            "the mix reads what the dot wrote"
+        );
     }
 
     /// The attention chain, as a SEQUENCE. Order is the model here: a
@@ -1497,7 +1784,7 @@ mod tests {
     fn attention_chain_is_emitted_in_reference_order() {
         let c = cfg_deepseek_v4_for_test();
         let mut b = Builder::new(8);
-        let tn = declare_v4(&mut b, &c, 16384);
+        let tn = declare_v4(&mut b, &c, 16384, 1);
         // Layer 2: ratio 4, so it carries BOTH a compressor and an indexer.
         emit_v4_attn(&mut b, &c, &tn, 2, 16384, 8, &[]);
         let p = b.finish();
@@ -1527,7 +1814,11 @@ mod tests {
                 Gemv,
                 Gemv,
                 V4KvCompressStep, // compressor (the DECODE kernel, not 125)
-                GemvFp8Blk,
+                GemvFp8Blk,       // indexer query
+                Gemv,             // indexer weights_proj
+                Gemv,
+                Gemv,
+                V4KvCompressStep, // indexer's independent compressed KV
                 V4IndexScore,
                 V4IndexTopk, // indexer
                 // TWO opcodes. Pinned as one for most of this bring-up, which
@@ -1550,11 +1841,15 @@ mod tests {
         let c = cfg_deepseek_v4_for_test();
         for (l, want_comp, want_idx) in [(0u32, false, false), (2, true, true), (3, true, false)] {
             let mut b = Builder::new(8);
-            let tn = declare_v4(&mut b, &c, 16384);
+            let tn = declare_v4(&mut b, &c, 16384, 1);
             emit_v4_attn(&mut b, &c, &tn, l, 16384, 8, &[]);
             let p = b.finish();
             let has = |op: DevOp| p.insts.iter().any(|i| i.op == op as u16);
-            assert_eq!(has(DevOp::V4KvCompressStep), want_comp, "layer {l} compressor");
+            assert_eq!(
+                has(DevOp::V4KvCompressStep),
+                want_comp,
+                "layer {l} compressor"
+            );
             assert_eq!(has(DevOp::V4IndexScore), want_idx, "layer {l} indexer");
         }
     }
@@ -1567,7 +1862,7 @@ mod tests {
         let c = cfg_deepseek_v4_for_test();
         for (l, hash) in [(0u32, true), (2, true), (3, false)] {
             let mut b = Builder::new(8);
-            let tn = declare_v4(&mut b, &c, 16384);
+            let tn = declare_v4(&mut b, &c, 16384, 1);
             emit_v4_ffn(&mut b, &c, &tn, l, 8, &[]);
             let p = b.finish();
             let r = p
@@ -1591,7 +1886,7 @@ mod tests {
     fn a_layer_has_exactly_two_hyper_connection_boundaries() {
         let c = cfg_deepseek_v4_for_test();
         let mut b = Builder::new(8);
-        let tn = declare_v4(&mut b, &c, 16384);
+        let tn = declare_v4(&mut b, &c, 16384, 1);
         emit_v4_layer(&mut b, &c, &tn, 2, 16384, 8, &[]);
         let p = b.finish();
         let n = |op: DevOp| p.insts.iter().filter(|i| i.op == op as u16).count();
@@ -1616,7 +1911,7 @@ mod tests {
     fn decode_program_spans_embed_to_token() {
         let c = cfg_deepseek_v4_for_test();
         let mut b = Builder::new(8);
-        let tn = declare_v4(&mut b, &c, 16384);
+        let tn = declare_v4(&mut b, &c, 16384, 1);
         emit_v4_decode(&mut b, &c, &tn, 16384, 8);
         let p = b.finish();
         let n = |op: DevOp| p.insts.iter().filter(|i| i.op == op as u16).count();
@@ -1628,6 +1923,75 @@ mod tests {
         let last = p.insts.last().expect("a program");
         assert_eq!(last.op, DevOp::ArgmaxFin as u16);
         assert_eq!(last.t[0] as u32, tn.ids, "the tail writes in.ids");
+    }
+
+    #[test]
+    fn batched_decode_program_carries_all_sequence_rows() {
+        let c = cfg_deepseek_v4_for_test();
+        let mut b = Builder::new(8);
+        let tn = declare_v4(&mut b, &c, 16384, 32);
+        emit_v4_decode(&mut b, &c, &tn, 16384, 8);
+        let p = b.finish();
+        let bytes = |name: &str| p.tensors.iter().find(|t| t.name == name).unwrap().bytes;
+        assert_eq!(bytes("in.kvlen"), 32 * I32);
+        assert_eq!(
+            bytes("act.x"),
+            32 * c.hc_mult as u64 * c.hidden as u64 * BF16
+        );
+        let embed = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::Embed as u16)
+            .unwrap();
+        assert_eq!(embed.i[0], 32);
+        assert_eq!(embed.t[0] as u32, tn.xr);
+        let broadcast = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::V4HcBroadcast as u16)
+            .unwrap();
+        assert_eq!(broadcast.t[0] as u32, tn.x);
+        assert_eq!(broadcast.t[1] as u32, tn.xr);
+        let attn = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::V4SparseAttnSplit as u16)
+            .unwrap();
+        assert_eq!(attn.i[0], 32);
+        let kv_rows: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::HeadNormRope as u16 && i.i[1] == 1 && i.i[6] == 32)
+            .collect();
+        assert!(!kv_rows.is_empty());
+        for i in kv_rows {
+            assert_eq!(i.j[0], c.window + 16384 / 4);
+        }
+        let inverse_ropes: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| {
+                i.op == DevOp::HeadNormRope as u16 && i.t[0] as u32 == tn.attn_out && i.i[4] == 1
+            })
+            .collect();
+        assert!(!inverse_ropes.is_empty());
+        for i in inverse_ropes {
+            assert_eq!(i.i[6], 0, "ordinary outputs are not batch-major KV rings");
+            assert_eq!(i.j[0], 0, "ordinary outputs have no KV-ring stride");
+        }
+        let n = |op: DevOp| p.insts.iter().filter(|i| i.op == op as u16).count();
+        assert_eq!(n(DevOp::MoeAlignPf), c.layers as usize);
+        assert_eq!(n(DevOp::MoeGroupGluPf), c.layers as usize);
+        assert_eq!(n(DevOp::MoeGroupDownPf), c.layers as usize);
+        assert_eq!(n(DevOp::MoeCombinePf), c.layers as usize);
+        assert_eq!(n(DevOp::MoeGroupGluFp8Blk), 0);
+        assert_eq!(n(DevOp::MoeGroupDownFp8Blk), 0);
+        let tail = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::ArgmaxFin as u16)
+            .unwrap();
+        assert_eq!(tail.i[1], 32);
     }
 
     /// The REAL geometry: 43 layers, 21 of them indexed, at 16k. This is the
@@ -1646,7 +2010,7 @@ mod tests {
             })
             .collect();
         let mut b = Builder::new(304);
-        let tn = declare_v4(&mut b, &c, 16384);
+        let tn = declare_v4(&mut b, &c, 16384, 1);
         emit_v4_decode(&mut b, &c, &tn, 16384, 304);
         let p = b.finish();
         let n = |op: DevOp| p.insts.iter().filter(|i| i.op == op as u16).count();
@@ -1658,8 +2022,16 @@ mod tests {
         // returns on its second line at T=1. This assertion named the WRONG
         // opcode and passed for the whole bring-up while the compressor never
         // ran once — the test pinned the defect as correct.
-        assert_eq!(n(DevOp::V4KvCompressStep), 41, "every compressed layer");
-        assert_eq!(n(DevOp::V4KvCompress), 0, "the prefill arm must not be issued at decode");
+        assert_eq!(
+            n(DevOp::V4KvCompressStep),
+            41 + 21,
+            "main compressor plus every indexed layer's independent compressor"
+        );
+        assert_eq!(
+            n(DevOp::V4KvCompress),
+            0,
+            "the prefill arm must not be issued at decode"
+        );
         assert_eq!(n(DevOp::V4MoeRoute), 43);
         assert!(
             p.insts.len() > 500,
@@ -1693,7 +2065,7 @@ mod tests {
             })
             .collect();
         let mut b = Builder::new(304);
-        let tn = declare_v4(&mut b, &c, 16384);
+        let tn = declare_v4(&mut b, &c, 16384, 1);
         emit_v4_decode(&mut b, &c, &tn, 16384, 304);
         let p = b.finish();
 
@@ -1769,7 +2141,7 @@ mod tests {
     fn routed_experts_carry_their_slot_and_the_mxfp4_encoding() {
         let c = cfg_deepseek_v4_for_test();
         let mut b = Builder::new(8);
-        let tn = declare_v4(&mut b, &c, 16384);
+        let tn = declare_v4(&mut b, &c, 16384, 1);
         emit_v4_decode(&mut b, &c, &tn, 16384, 8);
         let p = b.finish();
         let k = c.top_k;
@@ -1782,7 +2154,11 @@ mod tests {
             // GROUPED: ONE packet per layer streaming all k slots, not k
             // packets. The per-slot form cost 10 extra dispatches a layer at a
             // ~55 us floor; see the packet-count note in `emit_v4_ffn`.
-            assert_eq!(ins.len() as u32, c.layers, "{what}: one grouped packet per layer");
+            assert_eq!(
+                ins.len() as u32,
+                c.layers,
+                "{what}: one grouped packet per layer"
+            );
             // `i[0]` is the slot COUNT on the grouped arms, not an index — the
             // defect this test was written for (every packet streaming slot 0)
             // becomes "the count is wrong" here.
@@ -1831,7 +2207,7 @@ mod tests {
     fn no_packet_takes_more_workgroups_than_its_kernel_can_use() {
         let c = cfg_deepseek_v4_for_test();
         let mut b = Builder::new(64);
-        let tn = declare_v4(&mut b, &c, 16384);
+        let tn = declare_v4(&mut b, &c, 16384, 1);
         emit_v4_decode(&mut b, &c, &tn, 16384, 64);
         let p = b.finish();
 
@@ -1839,11 +2215,23 @@ mod tests {
         // HC*D; each thread owns one depth and writes all HC streams for it.
         let elem = (c.hidden as u32).div_ceil(512);
         for (op, max, why) in [
-            (DevOp::RmsNorm, 1u32, "d_rmsnorm reduces a row inside ONE workgroup; rows=1 at decode"),
+            (
+                DevOp::RmsNorm,
+                1u32,
+                "d_rmsnorm reduces a row inside ONE workgroup; rows=1 at decode",
+            ),
             (DevOp::V4HcZero, 1, "a zero-fill of 1+MIX floats"),
             (DevOp::V4HcExpand, elem, "one element per thread over D"),
-            (DevOp::V4HcMix, elem, "only slice*512 < D writes anything; the rest re-run the Sinkhorn to discard it"),
-            (DevOp::MoeCombine, elem, "d_moe_combine is one element per thread"),
+            (
+                DevOp::V4HcMix,
+                elem,
+                "only slice*512 < D writes anything; the rest re-run the Sinkhorn to discard it",
+            ),
+            (
+                DevOp::MoeCombine,
+                elem,
+                "d_moe_combine is one element per thread",
+            ),
         ] {
             for inst in p.insts.iter().filter(|i| i.op == op as u16) {
                 assert!(
@@ -1867,7 +2255,7 @@ mod tests {
     fn every_block_fp8_gemv_carries_its_scale_in_t5() {
         let c = cfg_deepseek_v4_for_test();
         let mut b = Builder::new(8);
-        let tn = declare_v4(&mut b, &c, 16384);
+        let tn = declare_v4(&mut b, &c, 16384, 1);
         emit_v4_decode(&mut b, &c, &tn, 16384, 8);
         let p = b.finish();
         let n = packet::dev::TENSOR_NONE;
@@ -1895,7 +2283,7 @@ mod tests {
     fn hc_expand_is_in_place_over_the_streams() {
         let c = cfg_deepseek_v4_for_test();
         let mut b = Builder::new(8);
-        let tn = declare_v4(&mut b, &c, 4096);
+        let tn = declare_v4(&mut b, &c, 4096, 1);
         emit_hc_expand(&mut b, &c, &tn, tn.attn_out, 8, &[]);
         let p = b.finish();
         assert_eq!(

@@ -468,9 +468,8 @@ mod tests {
         let out = slice_for("w.scale", &src, &[256], 256 * 4, 0, 1).expect("widens");
         assert_eq!(out.len(), 256 * 4);
         for b in 0u32..=255 {
-            let got = f32::from_le_bytes(
-                out[b as usize * 4..b as usize * 4 + 4].try_into().unwrap(),
-            );
+            let got =
+                f32::from_le_bytes(out[b as usize * 4..b as usize * 4 + 4].try_into().unwrap());
             match b {
                 255 => assert!(got.is_nan(), "0xFF is the encoding's NaN"),
                 // 2^(b-127), computed independently of the shift the code uses.

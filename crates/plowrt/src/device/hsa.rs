@@ -40,7 +40,7 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::device::{
     Backend, DeviceFree, DeviceMem, ExecutorClass, ExecutorTarget, LaunchCfg, Module, PeerMemory,
@@ -159,6 +159,7 @@ const HSA_AMD_SEGMENT_GLOBAL: u32 = 0;
 // hsa_amd_memory_pool_info_t
 const HSA_AMD_MEMORY_POOL_INFO_SEGMENT: u32 = 0;
 const HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS: u32 = 1;
+const HSA_AMD_MEMORY_POOL_INFO_ALLOC_MAX_SIZE: u32 = 16;
 /// Recommended physical-allocation granule for `hsa_amd_vmem_handle_create`
 /// (the ROCr analogue of `CU_MEM_ALLOC_GRANULARITY_RECOMMENDED`). The *required*
 /// granule is `..._RUNTIME_ALLOC_GRANULE = 6`; the recommended one is what
@@ -628,6 +629,21 @@ struct HsaFree {
     shared: Arc<SharedDriver>,
 }
 
+struct HsaPinnedFree {
+    shared: Arc<SharedDriver>,
+    host: usize,
+    data: Mutex<Option<Vec<u8>>>,
+}
+
+impl DeviceFree for HsaPinnedFree {
+    fn free(&self, _base: u64, _len: u64) {
+        unsafe {
+            let _ = (self.shared.drv.hsa_amd_memory_unlock)(self.host as *mut c_void);
+        }
+        let _ = self.data.lock().unwrap().take();
+    }
+}
+
 impl DeviceFree for HsaFree {
     fn free(&self, base: u64, _len: u64) {
         // SAFETY: `base` was returned by hsa_amd_memory_pool_allocate and cast
@@ -847,6 +863,18 @@ impl HsaBackend {
         // Find coarse-grained VRAM pool on this GPU.
         let vram_pool =
             Self::find_pool(&drv, agent, HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED)?;
+        let mut alloc_max = 0usize;
+        let _ = unsafe {
+            (drv.hsa_amd_memory_pool_get_info)(
+                vram_pool,
+                HSA_AMD_MEMORY_POOL_INFO_ALLOC_MAX_SIZE,
+                &mut alloc_max as *mut _ as *mut c_void,
+            )
+        };
+        tracing::info!(
+            alloc_max_gib = alloc_max as f64 / (1u64 << 30) as f64,
+            "HSA VRAM allocation limit"
+        );
         // Find fine-grained system pool on CPU agent.
         let fine_pool = Self::find_pool(
             &drv,
@@ -1022,6 +1050,69 @@ impl HsaBackend {
 
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    /// Allocate GPU-visible fine-grained system memory. This is a diagnostic
+    /// fallback for expert weights when the gfx942 VRAM arena cannot commit
+    /// another block; normal tensors always use the coarse VRAM pool.
+    pub fn alloc_fine(&self, bytes: u64) -> Result<DeviceMem> {
+        self.guard()?;
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_pool_allocate)(
+                self.fine_pool,
+                bytes as usize,
+                0,
+                &mut ptr,
+            )
+        };
+        self.check(
+            rc,
+            &format!("hsa_amd_memory_pool_allocate(fine {bytes} bytes)"),
+        )?;
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_agents_allow_access)(1, &self.agent, std::ptr::null(), ptr)
+        };
+        if rc != HSA_STATUS_SUCCESS {
+            unsafe {
+                (self.shared.drv.hsa_amd_memory_pool_free)(ptr);
+            }
+            return Err(hsa_fault(rc, "hsa_amd_agents_allow_access(fine expert)"));
+        }
+        let free = Arc::new(HsaFree {
+            shared: self.shared.clone(),
+        });
+        Ok(DeviceMem::owned(ptr as u64, bytes, free))
+    }
+
+    /// Allocate host pages and pin them into the GPU address space. Unlike a
+    /// fine-pool allocation, ROCr's memory-lock contract makes the returned
+    /// pointer directly readable by kernels on discrete gfx942.
+    pub fn alloc_pinned_expert(&self, bytes: u64) -> Result<DeviceMem> {
+        self.guard()?;
+        let mut data = vec![0u8; bytes as usize];
+        let host = data.as_mut_ptr();
+        let mut device: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe {
+            (self.shared.drv.hsa_amd_memory_lock)(
+                host as *mut c_void,
+                bytes as usize,
+                &self.agent,
+                1,
+                &mut device,
+            )
+        };
+        self.check(rc, &format!("hsa_amd_memory_lock(expert {bytes} bytes)"))?;
+        let free = Arc::new(HsaPinnedFree {
+            shared: self.shared.clone(),
+            host: host as usize,
+            data: Mutex::new(Some(data)),
+        });
+        // ROCr gfx942 uses the original locked host VA for fine-grain access;
+        // the optional agent pointer is an aperture alias that is not legal in
+        // packet operands on this runtime.
+        let _ = device;
+        Ok(DeviceMem::owned(host as u64, bytes, free))
     }
 }
 

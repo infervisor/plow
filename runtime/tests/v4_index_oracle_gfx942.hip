@@ -53,13 +53,13 @@ enum { LDS_BYTES = 40960 };
 __global__ __launch_bounds__(PLOW_THREADS) void k_score(float* sc, const bf16* q, const bf16* ckv,
                                                         const bf16* w, unsigned T, unsigned H,
                                                         unsigned HD, unsigned NC) {
-    d_v4_index_score(sc, q, ckv, w, T, H, HD, NC, blockIdx.x, gridDim.x);
+    d_v4_index_score(sc, q, ckv, w, nullptr, 0, T, H, HD, NC, blockIdx.x, gridDim.x);
 }
 __global__ __launch_bounds__(PLOW_THREADS) void k_topk(int* idx, const float* sc, unsigned T,
                                                        unsigned NC, unsigned K, unsigned ratio,
                                                        int offset) {
     __shared__ __align__(16) char raw[LDS_BYTES];
-    d_v4_index_topk(idx, sc, T, NC, K, ratio, offset, blockIdx.x, gridDim.x, (float*)raw);
+    d_v4_index_topk(idx, sc, T, NC, K, ratio, offset, nullptr, 0, blockIdx.x, gridDim.x, (float*)raw);
 }
 
 static bf16 f2bf_host(float f) {

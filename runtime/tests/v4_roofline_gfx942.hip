@@ -96,7 +96,7 @@ __global__ __launch_bounds__(PLOW_THREADS) void k_attn(bf16* out, const bf16* q,
 __global__ __launch_bounds__(PLOW_THREADS) void k_score(float* sc, const bf16* q, const bf16* ckv,
                                                         const bf16* w, unsigned T, unsigned H,
                                                         unsigned HD, unsigned NC) {
-    d_v4_index_score(sc, q, ckv, w, T, H, HD, NC, blockIdx.x, gridDim.x);
+    d_v4_index_score(sc, q, ckv, w, nullptr, 0, T, H, HD, NC, blockIdx.x, gridDim.x);
 }
 
 static bf16 f2bf_host(float f) {

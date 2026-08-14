@@ -16,8 +16,8 @@
  *   * the overlap SHIFT — `state[:ratio] = state[ratio:]` after each emit — is
  *     what makes a window see its predecessor. Prefill has both windows in hand
  *     and never needs it. NEGATIVE-CONTROLLED by dropping it.
- *   * `score_state` starts at -inf, so group 0 of an overlapped layer has an
- *     inert predecessor rather than a zero-weighted one.
+ *   * group 0 of an overlapped layer skips the absent predecessor even when
+ *     runtime state is zero-initialized.
  *
  * The projections are computed on the host and handed in, exactly as the
  * emitter will hand in two `Gemv` results, so this isolates the state machine.
@@ -118,7 +118,7 @@ static int run_case(unsigned T, unsigned HID, unsigned D, unsigned ratio, unsign
 
     /* ---- decode: one token at a time --------------------------------- */
     std::vector<float> kvs((size_t)COFF * ratio * W, 0.0f);
-    std::vector<float> scs((size_t)COFF * ratio * W, -INFINITY);
+    std::vector<float> scs((size_t)COFF * ratio * W, 0.0f);
     float *d_kvs, *d_scs, *d_kvp, *d_scp;
     bf16* d_slot;
     HC_CHECK(hipMalloc(&d_kvs, kvs.size() * 4));

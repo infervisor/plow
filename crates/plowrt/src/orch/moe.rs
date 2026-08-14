@@ -96,6 +96,46 @@ pub fn packed_expert_table(
     table
 }
 
+/// Build a packed table when each projection owns an independent allocation.
+/// The device ABI remains `[expert][gate, up, down]`; only the allocation
+/// boundaries change, avoiding a multi-gigabyte contiguous HSA request.
+pub fn packed_expert_table_split(
+    bases: [u64; 3],
+    stride: u64,
+    n_exp: u32,
+    owned: std::ops::Range<u32>,
+) -> Vec<u64> {
+    let mut table = vec![0u64; n_exp as usize * 3];
+    for (slot, e) in owned.filter(|e| *e < n_exp).enumerate() {
+        for j in 0..3 {
+            table[e as usize * 3 + j] = bases[j] + slot as u64 * stride;
+        }
+    }
+    table
+}
+
+/// Variant of [`packed_expert_table_split`] for several smaller allocations
+/// per projection. `bases` is flattened as `[chunk][projection]`.
+pub fn packed_expert_table_chunked(
+    bases: &[u64],
+    chunk_experts: u32,
+    stride: u64,
+    n_exp: u32,
+    owned: std::ops::Range<u32>,
+) -> Vec<u64> {
+    assert_eq!(bases.len() % 3, 0);
+    let mut table = vec![0u64; n_exp as usize * 3];
+    for (slot, e) in owned.filter(|e| *e < n_exp).enumerate() {
+        let slot = slot as u32;
+        let chunk = (slot / chunk_experts) as usize;
+        let in_chunk = (slot % chunk_experts) as u64;
+        for j in 0..3 {
+            table[e as usize * 3 + j] = bases[chunk * 3 + j] + in_chunk * stride;
+        }
+    }
+    table
+}
+
 /// Offset-based expert-table resolution for **FUSED 3-D expert tensors** (Gemma-4 26B-A4B).
 /// Unlike GLM/DeepSeek — where each expert is a separately
 /// named `{gate, up, down}` tensor resolved by [`build_expert_table`] — Gemma stores ONE
@@ -229,6 +269,19 @@ mod tests {
             t[6..],
             [0x2000, 0x2100, 0x2200, 0x2300, 0x2400, 0x2500],
             "local experts pack from slot 0 of this rank's buffer"
+        );
+    }
+
+    #[test]
+    fn chunked_expert_table_preserves_projection_order() {
+        let bases = [0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000];
+        let t = packed_expert_table_chunked(&bases, 2, 0x100, 4, 0..4);
+        assert_eq!(
+            t,
+            vec![
+                0x1000, 0x2000, 0x3000, 0x1100, 0x2100, 0x3100, 0x4000, 0x5000, 0x6000, 0x4100,
+                0x5100, 0x6100
+            ]
         );
     }
 

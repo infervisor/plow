@@ -38,7 +38,12 @@ fn read_header(map: &[u8]) -> std::result::Result<(usize, Vec<(String, RawInfo)>
     let end = 8usize
         .checked_add(n)
         .filter(|e| *e <= map.len())
-        .ok_or_else(|| format!("header length {n} runs past the end of a {}-byte file", map.len()))?;
+        .ok_or_else(|| {
+            format!(
+                "header length {n} runs past the end of a {}-byte file",
+                map.len()
+            )
+        })?;
     let json: serde_json::Value =
         serde_json::from_slice(&map[8..end]).map_err(|e| format!("header is not JSON: {e}"))?;
     let obj = json.as_object().ok_or("header is not a JSON object")?;
@@ -59,7 +64,11 @@ fn read_header(map: &[u8]) -> std::result::Result<(usize, Vec<(String, RawInfo)>
             .and_then(|s| s.as_array())
             .ok_or_else(|| bad("no shape"))?
             .iter()
-            .map(|d| d.as_u64().map(|x| x as usize).ok_or_else(|| bad("non-integer shape entry")))
+            .map(|d| {
+                d.as_u64()
+                    .map(|x| x as usize)
+                    .ok_or_else(|| bad("non-integer shape entry"))
+            })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let off = v
             .get("data_offsets")
@@ -199,8 +208,9 @@ impl Checkpoint {
             }
 
             let t_meta = std::time::Instant::now();
-            let (header_len, meta) = read_header(&map)
-                .map_err(|e| RuntimeError::Device(format!("safetensors {}: {e}", path.display())))?;
+            let (header_len, meta) = read_header(&map).map_err(|e| {
+                RuntimeError::Device(format!("safetensors {}: {e}", path.display()))
+            })?;
             if let Some(t) = timing.as_mut() {
                 t.meta_ms += t_meta.elapsed().as_secs_f64() * 1e3;
             }

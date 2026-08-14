@@ -10,7 +10,11 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 R="$REPO/runtime"
 OUT="${1:-${PLOW_BUILD_DIR:-/tmp/blkfp8}}"
-ARCH="${PLOW_HIP_ARCH:-gfx950}"
+ARCH="${2:-${PLOW_HIP_ARCH:-gfx950}}"
+MM="${3:-1}"
+WALK="${4:-0}"
+case "$MM" in 1|2|4|8|16) ;; *) echo "MM must be one of 1,2,4,8,16" >&2; exit 1;; esac
+case "$WALK" in 0|1) ;; *) echo "WALK must be 0 or 1" >&2; exit 1;; esac
 # Discover the bundler from the INSTALLED ROCm instead of pinning a version. This
 # was pinned to 7.0.2 and the path does not exist on a 7.2.4 box, so the build died
 # on the first machine that had the GPU. $PLOW_BUNDLER still overrides.
@@ -23,12 +27,14 @@ mkdir -p "$OUT"; cd "$OUT"
 rm -f tk.co test_kernels.elf block_fp8_test
 
 # Device: the golden wrappers (share op_gemm.h with the interpreter).
-hipcc --offload-arch="$ARCH" -O3 -w --genco "$R/amd/test_kernels.hip" -o tk.co $INC
+hipcc --offload-arch="$ARCH" -O3 -w --genco "$R/amd/test_kernels.hip" -o tk.co $INC \
+      -DPLOW_GEMV_MM="$MM" -DPLOW_GEMV_WALK="$WALK"
 "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" --input=tk.co --output=test_kernels.elf
 
 # Register-usage report for the new block-fp8 GEMV (must stay on the decode budget, occ>=2).
 U=$(hipcc --offload-arch="$ARCH" -O3 -w -Rpass-analysis=kernel-resource-usage \
-      --genco "$R/amd/test_kernels.hip" -o /dev/null $INC 2>&1 | grep -A6 'gemv_fp8_blk' || true)
+      --genco "$R/amd/test_kernels.hip" -o /dev/null $INC -DPLOW_GEMV_MM="$MM" \
+      -DPLOW_GEMV_WALK="$WALK" 2>&1 | grep -A6 'gemv_fp8_blk' || true)
 echo "--- gemv_fp8_blk resource usage ---"
 echo "$U" | grep -E 'VGPRs|AGPRs|Occupancy|Spill|SGPRs' || echo "  (usage lines not captured)"
 echo "-----------------------------------"

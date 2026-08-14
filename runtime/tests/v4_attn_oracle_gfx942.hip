@@ -73,8 +73,8 @@ __global__ __launch_bounds__(PLOW_THREADS) void k_split(float* op, float* mlp, c
                                                         unsigned H, unsigned D, unsigned TOPK,
                                                         unsigned SP, float scale) {
     __shared__ __align__(16) char raw[ATTN_LDS];
-    d_v4_sparse_attn_split(op, mlp, q, kv, idx, T, H, D, TOPK, SP, scale, blockIdx.x, gridDim.x,
-                           (float*)raw);
+    d_v4_sparse_attn_split(op, mlp, q, kv, idx, nullptr, T, H, D, TOPK, SP, 0, 0, 0, scale, blockIdx.x,
+                           gridDim.x, (float*)raw);
 }
 __global__ __launch_bounds__(PLOW_THREADS) void k_merge(bf16* out, const float* op,
                                                         const float* mlp, const float* sink,

@@ -1413,8 +1413,8 @@ pub enum DevOp {
     /// **Indexer scoring.** `score[t][c] = sum_h relu(q[t][h] . ckv[c]) * w[t][h]`,
     /// the relu INSIDE the head sum.
     ///
-    /// `t0=score([T,NC] f32) t1=q([T,H,HD] bf16) t2=ckv([NC,HD] bf16)
-    /// t3=w([T,H] bf16, pre-scaled)` · `i0=T i1=H i2=HD i3=NC`.
+    /// `t0=score([T,NC] f32) t1=q([T,H,HD] bf16) t2=ckv([T,NC,HD] bf16)
+    /// t3=w([T,H] bf16, pre-scaled) t4=pos` · `i0=T i1=H i2=HD i3=NC i4=live_ratio`.
     ///
     /// Under TP the score must be ALL-REDUCED before [`DevOp::V4IndexTopk`]:
     /// the selection is a collective, and ranks that disagree on the set decode
@@ -1423,7 +1423,7 @@ pub enum DevOp {
     /// **Indexer top-k**, with the prefill causal mask and the KV-ring offset.
     ///
     /// `t0=idx([T,K] i32) t1=score([T,NC] f32)` ·
-    /// `i0=T i1=NC i2=K i3=causal_ratio i4=offset`.
+    /// `t2=pos` · `i0=T i1=NC i2=K i3=causal_ratio i4=offset i5=live_ratio`.
     ///
     /// `causal_ratio != 0` limits query `t` to entries below `(t+1)/ratio`.
     /// Ties go to the LOWER index so the choice is deterministic across ranks.
@@ -1495,7 +1495,7 @@ pub enum DevOp {
     /// **Split-K sparse attention, part 1 of 2.** `d_v4_sparse_attn_split`.
     ///
     /// `t0=opart([T,H,SPLIT,D] f32) t1=mlpart([T,H,SPLIT,2] f32) t2=q t3=kv
-    /// t4=idx` · `i0=T i1=H i2=D i3=TOPK i4=SPLIT` · `f0=scale`.
+    /// t4=idx t5=pos` · `i0=T i1=H i2=D i3=TOPK i4=SPLIT i5=WINDOW i6=KVSTRIDE i7=RATIO` · `f0=scale`.
     V4SparseAttnSplit = 135,
     /// **Split-K sparse attention, part 2 of 2.** `d_v4_sparse_attn_merge`.
     ///
@@ -1522,8 +1522,8 @@ pub enum DevOp {
     /// Two opcodes, because they are two kernels — the same rule that
     /// [`DevOp::V4SparseAttnMerge`] above exists to state.
     ///
-    /// `t0=kv ring(out) t1=kv_state t2=sc_state t3=kv_p t4=sc_p t5=ape`
-    /// `t6=norm_w t7=in.pos` · `i0=D i1=ratio i2=overlap` · `f0=eps`.
+    /// `t0=ring t1=kv_state t2=sc_state t3=kv_p t4=sc_p t5=ape t6=norm_w t7=pos` ·
+    /// `i0=D i1=ratio i2=overlap i3=T i4=out_stride i5=out_base` · `f0=eps`.
     ///
     /// `start_pos` rides in `t7` rather than an immediate because it advances
     /// every step, and the host already re-uploads `in.pos` for the ropes.

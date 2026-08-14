@@ -100,8 +100,8 @@ __global__ __launch_bounds__(PLOW_THREADS) void k_attn_sp(float* op, float* mlp,
                                                           const bf16* kv, const int* i, unsigned H,
                                                           unsigned D, unsigned TOPK, unsigned SP) {
     __shared__ __align__(16) char raw[40960];
-    d_v4_sparse_attn_split(op, mlp, q, kv, i, 1, H, D, TOPK, SP, 0.0442f, blockIdx.x, gridDim.x,
-                           (float*)raw);
+    d_v4_sparse_attn_split(op, mlp, q, kv, i, nullptr, 1, H, D, TOPK, SP, 0, 0, 0, 0.0442f, blockIdx.x,
+                           gridDim.x, (float*)raw);
 }
 __global__ __launch_bounds__(PLOW_THREADS) void k_attn_mg(bf16* o, const float* op,
                                                           const float* mlp, const float* s,
@@ -111,12 +111,12 @@ __global__ __launch_bounds__(PLOW_THREADS) void k_attn_mg(bf16* o, const float* 
 __global__ __launch_bounds__(PLOW_THREADS) void k_idx(float* sc, const bf16* q, const bf16* ckv,
                                                       const bf16* w, unsigned H, unsigned HD,
                                                       unsigned NC) {
-    d_v4_index_score(sc, q, ckv, w, 1, H, HD, NC, blockIdx.x, gridDim.x);
+    d_v4_index_score(sc, q, ckv, w, nullptr, 0, 1, H, HD, NC, blockIdx.x, gridDim.x);
 }
 __global__ __launch_bounds__(PLOW_THREADS) void k_topk(int* idx, const float* sc, unsigned NC,
                                                        unsigned K) {
     __shared__ __align__(16) char raw[40960];
-    d_v4_index_topk(idx, sc, 1, NC, K, 0, 0, blockIdx.x, gridDim.x, (float*)raw);
+    d_v4_index_topk(idx, sc, 1, NC, K, 0, 0, nullptr, 0, blockIdx.x, gridDim.x, (float*)raw);
 }
 __global__ __launch_bounds__(PLOW_THREADS) void k_cstep(bf16* o, float* kvs, float* scs,
                                                         const float* kvp, const float* scp,

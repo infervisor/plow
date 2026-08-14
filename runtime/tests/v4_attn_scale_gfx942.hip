@@ -37,7 +37,7 @@ __global__ __launch_bounds__(PLOW_THREADS) void k_topk(int* idx, const float* sc
                                                        unsigned NC, unsigned K, unsigned ratio,
                                                        int off) {
     __shared__ __align__(16) char raw[40960];
-    d_v4_index_topk(idx, sc, T, NC, K, ratio, off, blockIdx.x, gridDim.x, (float*)raw);
+    d_v4_index_topk(idx, sc, T, NC, K, ratio, off, nullptr, 0, blockIdx.x, gridDim.x, (float*)raw);
 }
 
 #define HC_CHECK(x)                                                                               \

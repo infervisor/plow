@@ -981,7 +981,8 @@ __device__ void d_v4_clamped_swiglu(bf16* __restrict__ out, const bf16* __restri
  * to place, and it is not optional. */
 __device__ void d_v4_index_score(float* __restrict__ score, const bf16* __restrict__ q,
                                  const bf16* __restrict__ ckv, const bf16* __restrict__ w,
-                                 unsigned T, unsigned H, unsigned HD, unsigned NC, unsigned slice,
+                                 const int* __restrict__ pos, unsigned live_ratio, unsigned T,
+                                 unsigned H, unsigned HD, unsigned NC, unsigned slice,
                                  unsigned nblk) {
     /* ONE WAVE PER COMPRESSED ENTRY, ONE HEAD PER LANE. `index_n_heads` is 64
      * and a wave is 64 lanes, so the head sum is exactly a wave reduction and
@@ -1003,7 +1004,8 @@ __device__ void d_v4_index_score(float* __restrict__ score, const bf16* __restri
         for (unsigned x = slice; x < T * NC; x += nblk)
             for (unsigned c = threadIdx.x; c < 1u; c += PLOW_THREADS) {
                 const unsigned t = x / NC, cc = x % NC;
-                const bf16* kc = ckv + (size_t)cc * HD;
+                const size_t cbase = pos ? (size_t)t * NC : 0;
+                const bf16* kc = ckv + (cbase + cc) * HD;
                 float acc = 0.0f;
                 for (unsigned h = 0; h < H; h++) {
                     const bf16* qh = q + ((size_t)t * H + h) * HD;
@@ -1022,7 +1024,11 @@ __device__ void d_v4_index_score(float* __restrict__ score, const bf16* __restri
      * redundant L1 traffic at NC=8192 for a 16 KiB tensor. */
     const unsigned NV = HD >> 3;
     for (unsigned t = 0; t < T; t++) {
+        const size_t cbase = pos ? (size_t)t * NC : 0;
         bf16v8 q8[16]; /* HD <= 128 */
+        const unsigned live = pos && live_ratio
+                                  ? min(NC, ((unsigned)pos[t] + 1u) / live_ratio)
+                                  : NC;
         if (NV <= 16)
             for (unsigned u = 0; u < NV; u++)
                 q8[u] = ld_glob8(q + ((size_t)t * H + lane) * HD + u * 8);
@@ -1037,7 +1043,7 @@ __device__ void d_v4_index_score(float* __restrict__ score, const bf16* __restri
          * never the cost. The reduction chain and the result are unchanged. */
         const unsigned CU4 = 4u;
         unsigned c = wid;
-        for (; c + 3u * wstride < NC; c += CU4 * wstride) {
+        for (; c + 3u * wstride < live; c += CU4 * wstride) {
             float d[CU4];
 #pragma unroll
             for (unsigned u = 0; u < CU4; u++) d[u] = 0.0f;
@@ -1046,14 +1052,14 @@ __device__ void d_v4_index_score(float* __restrict__ score, const bf16* __restri
                     bf16v8 kk[CU4];
 #pragma unroll
                     for (unsigned u = 0; u < CU4; u++)
-                        kk[u] = ld_glob8(ckv + (size_t)(c + u * wstride) * HD + e * 8);
+                        kk[u] = ld_glob8(ckv + (cbase + c + u * wstride) * HD + e * 8);
 #pragma unroll
                     for (unsigned u = 0; u < CU4; u++) d[u] = dot8(q8[e], kk[u], d[u]);
                 }
             } else {
                 const bf16* qh = q + ((size_t)t * H + lane) * HD;
                 for (unsigned u = 0; u < CU4; u++) {
-                    const bf16* kc = ckv + (size_t)(c + u * wstride) * HD;
+                    const bf16* kc = ckv + (cbase + c + u * wstride) * HD;
                     for (unsigned e = 0; e < HD; e++) d[u] += bf2f(qh[e]) * bf2f(kc[e]);
                 }
             }
@@ -1064,8 +1070,8 @@ __device__ void d_v4_index_score(float* __restrict__ score, const bf16* __restri
                 if (lane == 0) score[(size_t)t * NC + c + u * wstride] = part;
             }
         }
-        for (; c < NC; c += wstride) {
-            const bf16* kc = ckv + (size_t)c * HD;
+        for (; c < live; c += wstride) {
+            const bf16* kc = ckv + (cbase + c) * HD;
             float d = 0.0f;
             if (NV <= 16 && (HD & 7u) == 0) {
                 for (unsigned u = 0; u < NV; u++) d = dot8(q8[u], ld_glob8(kc + u * 8), d);
@@ -1097,7 +1103,8 @@ __device__ void d_v4_index_score(float* __restrict__ score, const bf16* __restri
  * O(K*NC). The reference calls `torch.topk`. This is a gate implementation. */
 __device__ void d_v4_index_topk(int* __restrict__ idx, const float* __restrict__ score, unsigned T,
                                 unsigned NC, unsigned K, unsigned causal_ratio, int offset,
-                                unsigned slice, unsigned nblk, float* __restrict__ lds) {
+                                const int* __restrict__ pos, unsigned live_ratio, unsigned slice,
+                                unsigned nblk, float* __restrict__ lds) {
     /* EXACT top-k by RADIX SELECT on a monotone key, four 8-bit passes.
      *
      * The first version of this op ran `K` sequential passes of a block-wide
@@ -1122,7 +1129,9 @@ __device__ void d_v4_index_topk(int* __restrict__ idx, const float* __restrict__
     unsigned* emitted = nabove + 1;       /* [1]   */
 
     for (unsigned t = slice; t < T; t += nblk) {
-        const unsigned lim = causal_ratio ? ((t + 1u) / causal_ratio) : NC;
+        const unsigned lim = pos && live_ratio
+                                 ? ((unsigned)pos[t] + 1u) / live_ratio
+                                 : (causal_ratio ? ((t + 1u) / causal_ratio) : NC);
         const unsigned n = lim < NC ? lim : NC;
         const float* sc = score + (size_t)t * NC;
 
@@ -1491,18 +1500,27 @@ __device__ void d_v4_hc_mix(bf16* __restrict__ out, float* __restrict__ mix_out,
  * NOT AN EMIT STEP => THIS OP WRITES NOTHING to `out`. The caller must not
  * consume `out` on those steps; the emitter knows the cadence statically from
  * `ratio` even though `start_pos` is runtime. */
-__device__ void d_v4_kv_compress_step(bf16* __restrict__ out, float* __restrict__ kv_state,
-                                      float* __restrict__ sc_state,
-                                      const float* __restrict__ kv_p,
-                                      const float* __restrict__ sc_p,
+__device__ void d_v4_kv_compress_step(bf16* __restrict__ out_all,
+                                      float* __restrict__ kv_state_all,
+                                      float* __restrict__ sc_state_all,
+                                      const float* __restrict__ kv_p_all,
+                                      const float* __restrict__ sc_p_all,
                                       const float* __restrict__ ape,
-                                      const bf16* __restrict__ norm_w, unsigned D, unsigned ratio,
-                                      unsigned overlap, unsigned start_pos, float eps,
+                                      const bf16* __restrict__ norm_w, const int* __restrict__ pos,
+                                      unsigned T, unsigned D, unsigned ratio, unsigned overlap,
+                                      unsigned out_stride, unsigned out_base, float eps,
                                       unsigned slice, unsigned nblk, float* __restrict__ lds) {
     if (ratio == 0) return;
     const unsigned COFF = overlap ? 2u : 1u;
     const unsigned W = COFF * D;                  /* projection width      */
     const unsigned NROW = overlap ? 2u * ratio : ratio;
+    for (unsigned t = 0; t < T; t++) {
+    const unsigned start_pos = (unsigned)pos[t];
+    bf16* out = out_all + ((size_t)t * out_stride + out_base + start_pos / ratio) * D;
+    float* kv_state = kv_state_all + (size_t)t * NROW * W;
+    float* sc_state = sc_state_all + (size_t)t * NROW * W;
+    const float* kv_p = kv_p_all + (size_t)t * W;
+    const float* sc_p = sc_p_all + (size_t)t * W;
     const unsigned phase = start_pos % ratio;
     const unsigned slot = overlap ? (ratio + phase) : phase;
     const bool emit = ((start_pos + 1u) % ratio) == 0u;
@@ -1516,14 +1534,15 @@ __device__ void d_v4_kv_compress_step(bf16* __restrict__ out, float* __restrict_
     }
     __threadfence();
     __syncthreads();
-    if (!emit) return;
+    if (!emit) continue;
 
     /* Pool. Each thread owns output dims; the softmax is per dim over the rows,
      * as in the prefill form. */
     float* red = lds;
     for (unsigned d = slice * PLOW_THREADS + threadIdx.x; d < D; d += nblk * PLOW_THREADS) {
         float m = -INFINITY, l = 0.0f, acc = 0.0f;
-        for (unsigned r = 0; r < NROW; r++) {
+        const unsigned r0 = (overlap && start_pos < ratio) ? ratio : 0u;
+        for (unsigned r = r0; r < NROW; r++) {
             /* Overlap: rows [0,ratio) contribute their FIRST half's column d,
              * rows [ratio,2r) their SECOND half's. */
             const unsigned col = (overlap && r >= ratio) ? (D + d) : d;
@@ -1531,8 +1550,7 @@ __device__ void d_v4_kv_compress_step(bf16* __restrict__ out, float* __restrict_
             const float kv = kv_state[(size_t)r * W + col];
             const float mn = fmaxf(m, sc);
             const float resc = (m == -INFINITY) ? 0.0f : __expf(m - mn);
-            /* `sc_state` starts at -inf so the FIRST window of an overlapped
-             * layer has no predecessor. `exp(-inf - -inf)` is NaN, not 0, and
+            /* The FIRST overlapped window has no predecessor. `exp(-inf - -inf)` is NaN, not 0, and
              * that NaN is the whole difference between this and the prefill
              * form — which never evaluates those rows because it skips group 0's
              * missing predecessor outright. Measured: with this unguarded,
@@ -1567,6 +1585,20 @@ __device__ void d_v4_kv_compress_step(bf16* __restrict__ out, float* __restrict_
             sc_state[i] = sc_state[(size_t)ratio * W + i];
         }
     __syncthreads();
+    }
+}
+__device__ void d_v4_kv_compress_step(bf16* __restrict__ out, float* __restrict__ kv_state,
+                                      float* __restrict__ sc_state,
+                                      const float* __restrict__ kv_p,
+                                      const float* __restrict__ sc_p,
+                                      const float* __restrict__ ape,
+                                      const bf16* __restrict__ norm_w, unsigned D, unsigned ratio,
+                                      unsigned overlap, unsigned start_pos, float eps,
+                                      unsigned slice, unsigned nblk, float* __restrict__ lds) {
+    const int full_pos = (int)start_pos;
+    bf16* out_all = out - (size_t)(start_pos / ratio) * D;
+    d_v4_kv_compress_step(out_all, kv_state, sc_state, kv_p, sc_p, ape, norm_w, &full_pos, 1, D,
+                          ratio, overlap, 0, 0, eps, slice, nblk, lds);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1597,10 +1629,12 @@ __device__ void d_v4_kv_compress_step(bf16* __restrict__ out, float* __restrict_
  * adding it per chunk would count it `SPLIT` times. */
 __device__ void d_v4_sparse_attn_split(float* __restrict__ opart, float* __restrict__ mlpart,
                                        const bf16* __restrict__ q, const bf16* __restrict__ kv,
-                                       const int* __restrict__ idx, unsigned T, unsigned H,
-                                       unsigned D, unsigned TOPK, unsigned SPLIT, float scale,
-                                       unsigned slice, unsigned nblk, float* __restrict__ lds) {
-    if ((D & 63u) || H == 0 || SPLIT == 0) return;
+                                       const int* __restrict__ idx, const int* __restrict__ pos,
+                                       unsigned T, unsigned H,
+                                       unsigned D, unsigned TOPK, unsigned SPLIT, unsigned WINDOW,
+                                       unsigned KVSTRIDE, unsigned RATIO, float scale, unsigned slice,
+                                       unsigned nblk, float* __restrict__ lds) {
+    if ((D & 63u) || H == 0 || SPLIT == 0 || WINDOW > TOPK) return;
     const unsigned DPL = D >> 6;
     const unsigned wave = threadIdx.x >> 6, lane = threadIdx.x & 63;
     const unsigned nwave = PLOW_THREADS >> 6;
@@ -1614,7 +1648,9 @@ __device__ void d_v4_sparse_attn_split(float* __restrict__ opart, float* __restr
         /* Contiguous chunk so the index reads stay coalesced. */
         const unsigned per = (TOPK + SPLIT - 1u) / SPLIT;
         const unsigned lo = sp * per, hi = (lo + per) < TOPK ? (lo + per) : TOPK;
-        const int* it = idx + (size_t)t * TOPK;
+        const unsigned NIDX = TOPK - WINDOW;
+        const int* it = idx + (size_t)t * NIDX;
+        const bf16* kvt = kv + (size_t)t * KVSTRIDE * D;
         const bf16* qh = q + ((size_t)t * H + h) * D;
 
         float qv[16], acc[16];
@@ -1627,11 +1663,24 @@ __device__ void d_v4_sparse_attn_split(float* __restrict__ opart, float* __restr
         float m = -INFINITY, l = 0.0f;
 
         for (unsigned j = lo + wave; j < hi; j += nwave) {
-            const int p = it[j];
+            int p;
+            if (j < WINDOW) {
+                if (!pos) {
+                    p = (int)j;
+                } else {
+                    const unsigned end = (unsigned)pos[t] + 1u;
+                    const unsigned live = end < WINDOW ? end : WINDOW;
+                    p = j < live ? (int)((end - live + j) & (WINDOW - 1u)) : -1;
+                }
+            } else if (RATIO == 0 || RATIO == 4) {
+                p = it[j - WINDOW];
+            } else {
+                p = (j - WINDOW < ((unsigned)pos[t] + 1u) / RATIO) ? (int)j : -1;
+            }
             float kvv[16];
             float part = 0.0f;
             if (p >= 0) {
-                const bf16* kr = kv + (size_t)p * D;
+                const bf16* kr = kvt + (size_t)p * D;
                 if (DPL == 8) {
                     const bf16v8 k8 = ld_glob8(kr + lane * 8);
                     part = dot8(q8, k8, 0.0f);

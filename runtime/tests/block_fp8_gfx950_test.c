@@ -44,6 +44,77 @@ static double e4m3_decode(unsigned char b) {
 
 static int fails = 0;
 
+static void run_walk(plow_hsa* h, plow_hsa_kernel* k, unsigned NCU, unsigned M, unsigned N,
+                     unsigned K) {
+    const unsigned NB = (N + 127u) / 128u, KB = (K + 127u) / 128u;
+    const size_t nW = (size_t)N * K, nS = (size_t)NB * KB;
+    const size_t nX = (size_t)M * K, nC = (size_t)M * N;
+    unsigned char* hW = plow_hsa_alloc_host(h, nW);
+    bf16* hx = plow_hsa_alloc_host(h, nX * 2);
+    float* hS = plow_hsa_alloc_host(h, nS * 4);
+    bf16* hC = plow_hsa_alloc_host(h, nC * 2);
+    bf16* hC2 = plow_hsa_alloc_host(h, nC * 2);
+
+    for (size_t i = 0; i < nW; i++)
+        hW[i] = (unsigned char)(((rand() % 2) << 7) | ((rand() % 8) << 3) | (rand() % 8));
+    for (unsigned kk = 0; kk < K; kk++)
+        hx[kk] = f2bf(((float)(rand() % 17) - 8.0f) / 16.0f);
+    for (unsigned m = 1; m < M; m++) memcpy(hx + (size_t)m * K, hx, (size_t)K * 2);
+    for (size_t i = 0; i < nS; i++) hS[i] = 0.005f + 0.02f * (rand() % 8) / 8.0f;
+    memset(hC, 0xa5, nC * 2);
+
+    void* dW = plow_hsa_alloc(h, 0, nW);
+    void* dx = plow_hsa_alloc(h, 0, nX * 2);
+    void* dS = plow_hsa_alloc(h, 0, nS * 4);
+    void* dC = plow_hsa_alloc(h, 0, nC * 2);
+    plow_hsa_copy_h2d(h, 0, dW, hW, nW);
+    plow_hsa_copy_h2d(h, 0, dx, hx, nX * 2);
+    plow_hsa_copy_h2d(h, 0, dS, hS, nS * 4);
+    plow_hsa_copy_h2d(h, 0, dC, hC, nC * 2);
+
+    struct __attribute__((packed)) {
+        void* c; const void* x; const void* w; const void* ws; unsigned m, n, kk;
+    } args = {dC, dx, dW, dS, M, N, K};
+
+    plow_hsa_launch(h, 0, k, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0, &args,
+                    sizeof(args));
+    plow_hsa_wait(h, 0);
+    plow_hsa_copy_d2h(h, 0, hC, dC, nC * 2);
+    plow_hsa_launch(h, 0, k, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0, &args,
+                    sizeof(args));
+    plow_hsa_wait(h, 0);
+    plow_hsa_copy_d2h(h, 0, hC2, dC, nC * 2);
+
+    unsigned bad_rows = 0;
+    for (unsigned m = 1; m < M; m++)
+        bad_rows += memcmp(hC, hC + (size_t)m * N, (size_t)N * 2) != 0;
+    const int deterministic = memcmp(hC, hC2, nC * 2) == 0;
+    double worst = 0.0;
+    for (unsigned n = 0; n < N; n++) {
+        double want = 0.0;
+        for (unsigned kk = 0; kk < K; kk++)
+            want += (double)bf2f(hx[kk]) * e4m3_decode(hW[(size_t)n * K + kk]) *
+                    (double)hS[(size_t)(n >> 7) * KB + (kk >> 7)];
+        const double rel = fabs(bf2f(hC[n]) - want) / (fabs(want) + 1e-2);
+        if (rel > worst) worst = rel;
+    }
+
+    const int ITERS = 100;
+    const double t0 = now();
+    for (int it = 0; it < ITERS; it++)
+        plow_hsa_launch(h, 0, k, NCU * PLOW_WG_THREADS, 1, 1, PLOW_WG_THREADS, 1, 1, 0,
+                        &args, sizeof(args));
+    plow_hsa_wait(h, 0);
+    const double ms = (now() - t0) * 1e3 / ITERS;
+    const int ok = bad_rows == 0 && deterministic && worst < 3e-2;
+    printf("walk M=%u N=%u K=%u grid=%u  %s rows=%u deterministic=%s ref=%.4f %.3f ms\n",
+           M, N, K, NCU, ok ? "PASS" : "FAIL", bad_rows, deterministic ? "yes" : "no",
+           worst, ms);
+    if (!ok) fails++;
+
+    plow_hsa_free(h, dW); plow_hsa_free(h, dx); plow_hsa_free(h, dS); plow_hsa_free(h, dC);
+}
+
 /* Block-fp8 decode GEMV: C[1][N] = Σ_k x[k] * decode(W[n][k]) * wscale[n/128][k/128]. */
 static void run(plow_hsa* h, plow_hsa_kernel* k, unsigned NCU, const char* label, unsigned N,
                 unsigned K) {
@@ -410,6 +481,13 @@ int main(int argc, char** argv) {
     plow_hsa_kernel k;
     if (plow_hsa_get_kernel(h, 0, "gemv_fp8_blk", &k) != 0) {
         fprintf(stderr, "no kernel gemv_fp8_blk: %s\n", plow_hsa_last_error()); return 1;
+    }
+
+    if (argc == 7 && strcmp(argv[2], "--walk") == 0) {
+        run_walk(h, &k, (unsigned)strtoul(argv[6], NULL, 10),
+                 (unsigned)strtoul(argv[3], NULL, 10), (unsigned)strtoul(argv[4], NULL, 10),
+                 (unsigned)strtoul(argv[5], NULL, 10));
+        return fails ? 1 : 0;
     }
 
     const unsigned NCU = 64;
