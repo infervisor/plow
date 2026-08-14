@@ -268,6 +268,10 @@ const EMITTER_SRC: &[&str] = &[
     "kda.rs",
     "k3.rs",
     "mla/kimi_k3.rs",
+    // The V4 decode emitter. Absent from this list, the twelve V4 arms it routes
+    // to read as unemitted, and the four added last (zero/broadcast/split/merge)
+    // could not be added to GFX950_DISPATCHED without failing the sibling test.
+    "v4.rs",
 ];
 
 /// Arms gfx950 dispatches that NOTHING emits, each with why that is deliberate.
@@ -276,6 +280,14 @@ const EMITTER_SRC: &[&str] = &[
 /// list without gaining an emit site fails the test. Adding a row is the moment to ask §4's
 /// question — "what selects this, and is that selector complete over precisions?"
 const GFX950_UNEMITTED: &[(&str, &str)] = &[
+    (
+        "PLOW_DOP_V4_HC_REDUCE",
+        "DeepSeek-V4. SUPERSEDED, not pending: the emitter builds the reduce out of PLOW_DOP_V4_HC_DOT + PLOW_DOP_V4_HC_MIX, which split the fused arm's atomic accumulation from its Sinkhorn tail so the two can take different CU widths. The fused arm still passes its numeric gate and is kept for the prefill shape, where one packet per token beats three.",
+    ),
+    (
+        "PLOW_DOP_V4_SPARSE_ATTN",
+        "DeepSeek-V4. SUPERSEDED, not pending: the emitter routes to PLOW_DOP_V4_SPARSE_ATTN_SPLIT + _MERGE, which partition the window and the compressed history across disjoint CU sets and then combine with the learned sink. The single-packet arm remains gated and correct, but nothing selects it at decode.",
+    ),
     (
         "PLOW_DOP_FLASH_GATHER_PREFILL",
         "Sparse MLA prefill needs one causal top-k index row per query token. IndexScore and \

@@ -158,6 +158,11 @@ __device__ __forceinline__ unsigned moe_bound_topk(unsigned char* table, unsigne
  * K3's 896 routed experts — plausible output, wrong model. The pair form below is the only entry
  * point that can express it, so the epilogue calls THAT and never `moe_act` directly. */
 #define PLOW_MOE_ACT_SITU      2u
+/* DeepSeek-V4's clamped SwiGLU, and a `moe_glu` code for exactly the reason
+ * `situ` is one: the clamp is TWO-SIDED on `up` and one-sided on `gate`, so it
+ * is not a gate-only transform and `moe_act` cannot express it. `beta` carries
+ * the limit (10 in the shipped config); `lbeta` is unused. */
+#define PLOW_MOE_ACT_V4CLAMP   3u
 
 /* THE FAST SPELLINGS WERE TRIED HERE AND MEASURED SLOWER. DO NOT RE-DERIVE THEM.
  *
@@ -201,6 +206,15 @@ __device__ __forceinline__ float moe_act(float x, unsigned act) {
  * identity and this is byte-identical to the `moe_act(g, act) * u` it replaces. */
 __device__ __forceinline__ float moe_glu(float g, float u, unsigned act, float beta, float lbeta) {
     if (act == PLOW_MOE_ACT_SITU) return k3_situ_gate(g, beta) * k3_situ_up(u, lbeta);
+    if (act == PLOW_MOE_ACT_V4CLAMP) {
+        /* `Expert.forward`: the gate is clamped ABOVE only (a lower clamp would
+         * cut silu's negative lobe, which the reference keeps), the up branch on
+         * both sides. Order matters — silu is applied to the ALREADY-clamped
+         * gate. */
+        const float gc = fminf(g, beta);
+        const float uc = fminf(fmaxf(u, -beta), beta);
+        return (gc / (1.0f + expf(-gc))) * uc;
+    }
     return moe_act(g, act) * u;
 }
 

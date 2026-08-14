@@ -132,6 +132,9 @@ if [ -n "${PLOW_GEMV_MM:-}" ]; then
   GVMM="$PLOW_GEMV_MM"
 fi
 AX_DECODE="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM $AX_GEMV_WALK $CDNA3_TILE $AX_GMOE"
+if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ]; then
+  AX_DECODE="$AX_DECODE -DGM_BLK_BM=${PLOW_V4_BATCH_GEMM_BM:-64}"
+fi
 echo "   decode GEMV batch bucket: PLOW_GEMV_MM=$GVMM walk=$WALK (PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH:-1})"
 # OPT-IN (PLOW_GEMV_WALK=1): the §6g-WALK row-block outer loop — the object serves any M in
 # ceil(M/MM) passes of the compiled bucket, and the LDS staging bound becomes min(MM,M)*K.
@@ -529,6 +532,13 @@ fi
 # therefore need the A4W4 body in the decode object too; without it the deliberate refusal path
 # writes NaNs. Keep B=1 byte-identical because it uses the per-expert decode opcodes instead.
 AX_K3_DECODE_A4W4=""
+# PLOW_GATE_HIER: per-XCD cache maintenance instead of per-workgroup. The floor a decode packet
+# pays is buffer_wbl2 + buffer_inv, both PER-L2, so each XCD repeats the same writeback once per
+# workgroup and they serialise — ctr_convergence.hip prices an empty 256-wg packet at 13.16 us and
+# the per-XCD-leader form at 3.46. V4 pays that floor 1505 times a token, which IS its step time.
+# Both flags degrade safely: an unplaced blob takes the old dispatch path, and nper==0 reads as
+# "no hierarchy", so this build serves the A/B against PLOW_V4_L2 unset.
+AX_V4_GATE="-DPLOW_L2_PLACE_DISPATCH=1 -DPLOW_GATE_HIER=1"
 case "${PLOW_K3_DECODE_TILE_BINSEARCH:-1}" in
   0) AX_K3_TILE_SEARCH="" ;;
   1) AX_K3_TILE_SEARCH="-DPLOW_MOE_TILE_BINSEARCH=1" ;;
@@ -828,7 +838,16 @@ ROWS=(
   "interp_decode|$AX_DECODE"
   "interp_flash|$AX_FLASH"
   "interp_prefill_fp8|$AX_PREFILL $AX_FP8"
+  # The prefill twin of interp_decode_fp8_k3 — same reason, same axis. V4
+  # has no prefill buckets yet, so its prompt walks the decode program; the
+  # object is still selected and loaded, so it still has to exist.
+  "interp_prefill_fp8_k3|$AX_PREFILL $AX_FP8 $AX_K3"
   "interp_decode_fp8|$AX_DECODE $AX_FP8"
+  # DeepSeek-V4: block-fp8 projections (so the fp8 variant) with a bf16 KV
+  # cache (so NOT fp8kv) and the V4 ops, which live inside the PLOW_K3
+  # region. That combination had no row, so the load asked for an object
+  # built without the region and every V4 op would have silently NOPed.
+  "interp_decode_fp8_k3|$AX_DECODE $AX_FP8 $AX_K3 $AX_V4_GATE $AX_K3_DECODE_A4W4 $AX_K3_DECODE_MXFP4 $AX_K3_DECODE_XR_AGG $AX_K3_MOE_GROUP_INLINE $AX_K3_KDA_CONV_STEP_DB"
   "interp_prefill_fp8kv|$AX_PREFILL $AX_FP8 $AX_FP8KV"
   "interp_decode_fp8kv|$AX_DECODE $AX_FP8 $AX_FP8KV"
   "interp_flash_fp8kv|$AX_FLASH $AX_FP8KV -DPLOW_K3=1"
@@ -852,6 +871,9 @@ ROWS=(
   # THE ROW A K3 PREFILL PACKET ACTUALLY LOADS (exec/amd.rs: grouped ops with i[3] == MXFP4
   # resolve the K3MoeA4w4 arm). On this arch it contains the simulated body -- see AX_A4W4.
   "interp_prefill_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_PF_STATE $AX_MXFP4"
+  # DeepSeek-V4's B>1 decode program carries both block-fp8 dense projections
+  # and the sorted A4W4 expert chain, so it selects the fp8 variant of the same arm.
+  "interp_prefill_fp8_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_PF_STATE $AX_MXFP4 $AX_FP8"
   "interp_prefill_fp8kv_k3_moe_a4w4|$AX_PREFILL $AX_MLA_K3 $AX_MOE $AX_A4W4 $AX_K3_A4W4 $AX_K3_A4W4_TUNE $AX_K3_PF_STATE $AX_MXFP4 $AX_FP8KV"
 )
 

@@ -43,3 +43,6 @@ plow_profile.sqlite
 # GPU binary build outputs — never check in (bundles link them from build dirs)
 *.cubin
 *.hsaco
+
+# Emitted device blobs — build outputs, some tens of MB
+*.pkt

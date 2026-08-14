@@ -348,6 +348,37 @@ pub fn slice_for<'a>(
 
     match shard {
         Shard::Replicated => {
+            // E8M0 BLOCK SCALES, WIDENED TO THE f32 GRID THE KERNEL READS.
+            //
+            // DeepSeek-V4 stores its block-fp8 scales as one E8M0 BYTE per
+            // 128x128 block; `GemvFp8Blk` (op 44) and the grouped MoE prefill
+            // arms read a `weight_scale_inv` grid of f32. Same grid, same order,
+            // a quarter of the bytes — so the only disagreement is the element
+            // WIDTH, and widening it here leaves the tuned kernels untouched.
+            //
+            // The conversion is EXACT and not an approximation: E8M0 is a bare
+            // power-of-two exponent (value = 2^(b-127)), every one of which is a
+            // normal f32. 0xFF is the encoding's NaN and is passed through as a
+            // NaN rather than silently becoming a finite scale.
+            //
+            // Narrow on purpose: `.scale` suffix AND exactly 4x. A merely
+            // 4x-too-small tensor of any other name still errors below.
+            if full != want && name.ends_with(".scale") && full.checked_mul(4) == Some(want) {
+                let mut out = Vec::with_capacity(want as usize);
+                for &b in src {
+                    // `b << 23` places the exponent directly, which is the whole
+                    // conversion for b in 1..=254. b == 0 is 2^-127, an f32
+                    // SUBNORMAL — the shift would produce +0.0 and turn the
+                    // smallest scale in the encoding into a block of zeros.
+                    let v = match b {
+                        0xFF => f32::NAN,
+                        0 => f32::from_bits(0x0040_0000),
+                        _ => f32::from_bits((b as u32) << 23),
+                    };
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                return Ok(Cow::Owned(out));
+            }
             if full != want {
                 return Err(bad(format!(
                     "replicated but the checkpoint has {full} B and the blob declares {want} B"
@@ -422,6 +453,44 @@ pub fn slice_for<'a>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// E8M0 block scales widen to the f32 grid the kernel reads, EXACTLY.
+    ///
+    /// Exactness is the whole claim: a scale is a multiplier applied to every
+    /// weight in a 128x128 block, so an approximation here is a systematic
+    /// error over the block rather than a rounding one. Every code point is
+    /// checked, not a sample, because the two that can go wrong (0 and 0xFF)
+    /// are precisely the two a spot check would skip.
+    #[test]
+    fn e8m0_block_scales_widen_exactly() {
+        let src: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();
+        let out = slice_for("w.scale", &src, &[256], 256 * 4, 0, 1).expect("widens");
+        assert_eq!(out.len(), 256 * 4);
+        for b in 0u32..=255 {
+            let got =
+                f32::from_le_bytes(out[b as usize * 4..b as usize * 4 + 4].try_into().unwrap());
+            match b {
+                255 => assert!(got.is_nan(), "0xFF is the encoding's NaN"),
+                // 2^(b-127), computed independently of the shift the code uses.
+                _ => {
+                    let want = (2f64).powi(b as i32 - 127) as f32;
+                    assert_eq!(got, want, "E8M0 {b} -> 2^{}", b as i32 - 127);
+                    assert!(got > 0.0, "no scale may widen to zero");
+                }
+            }
+        }
+    }
+
+    /// The widen is narrow: only a `.scale`, only at exactly 4x.
+    #[test]
+    fn a_four_times_mismatch_that_is_not_a_scale_still_errors() {
+        let src = vec![0u8; 64];
+        assert!(slice_for("w.weight", &src, &[64], 256, 0, 1).is_err());
+        // Right name, wrong ratio.
+        assert!(slice_for("w.scale", &src, &[64], 192, 0, 1).is_err());
+    }
+
     use super::*;
 
     /// KIMI-K3's LATENT MoE REPLICATES FOUR TENSORS PER LAYER THAT `shard_of` NAMES

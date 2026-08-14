@@ -223,6 +223,26 @@ const DOC: &[S] = &[
     S { op: DevOp::KdaStateStepG, t: &["o", "q", "k", "v", "g_raw", "beta_raw", "state", "A_log"], i: &["T", "H", "D", "BV", "flags", "dt_bias", "gate_mode", "parked"], f: &["scale", "lower_bound"], j: &[] },
     S { op: DevOp::KdaConvStateStepG, t: &["o", "q_raw", "k_raw", "v_raw", "g_raw", "beta_raw", "state", "descriptor"], i: &["T", "H", "D", "BV", "flags", "W", "gate_mode"], f: &["scale", "lower_bound"], j: &[] },
     S { op: DevOp::KdaGatedNorm, t: &["y", "o", "norm_w", "g_raw"], i: &["T", "H", "D"], f: &["eps"], j: &[] },
+    // ---- DeepSeek-V4. `mix_out`/`mix_in` is a compiler-owned scratch carrying
+    // post ++ comb between the paired reduce and expand, not a checkpoint tensor.
+    S { op: DevOp::V4HcReduce, t: &["out", "x", "hc_fn", "hc_scale", "hc_base", "mix_out"], i: &["T", "D", "hc", "sinkhorn_iters"], f: &["norm_eps", "hc_eps"], j: &[] },
+    S { op: DevOp::V4HcExpand, t: &["out", "branch", "residual", "mix_in"], i: &["T", "D", "hc"], f: &[], j: &[] },
+    S { op: DevOp::V4HcReduceHead, t: &["out", "x", "hc_fn", "scale", "base"], i: &["T", "D", "hc"], f: &["norm_eps", "hc_eps"], j: &[] },
+    S { op: DevOp::V4SparseAttn, t: &["out", "q", "kv", "idx", "sink"], i: &["T", "H", "D", "TOPK"], f: &["scale"], j: &[] },
+    S { op: DevOp::V4KvCompress, t: &["out", "x", "wkv", "wgate", "ape", "norm_w"], i: &["T", "HID", "D", "ratio", "overlap"], f: &["eps"], j: &[] },
+    S { op: DevOp::V4IndexScore, t: &["score", "q", "ckv", "w", "pos"], i: &["T", "H", "HD", "NC", "live_ratio"], f: &[], j: &[] },
+    S { op: DevOp::V4IndexTopk, t: &["idx", "score", "pos"], i: &["T", "NC", "K", "causal_ratio", "offset", "live_ratio"], f: &[], j: &[] },
+    S { op: DevOp::V4GroupedLinear, t: &["out", "o", "w"], i: &["T", "G", "R", "W"], f: &[], j: &[] },
+    S { op: DevOp::V4MoeRoute, t: &["sel", "wts", "logits", "bias", "tid2eid", "ids"], i: &["T", "E", "K"], f: &["route_scale"], j: &[] },
+    S { op: DevOp::V4ClampedSwiGlu, t: &["out", "gate", "up"], i: &["n"], f: &["limit"], j: &[] },
+    S { op: DevOp::V4HcDot, t: &["partial", "x", "hc_fn"], i: &["T", "D", "hc"], f: &[], j: &[] },
+    S { op: DevOp::V4HcMix, t: &["out", "x", "partial", "hc_scale", "hc_base", "mix_out"], i: &["T", "D", "hc", "sinkhorn_iters"], f: &["norm_eps", "hc_eps"], j: &[] },
+    S { op: DevOp::V4HcZero, t: &["partial"], i: &["n"], f: &[], j: &[] },
+    S { op: DevOp::V4HcBroadcast, t: &["x", "src"], i: &["T", "D", "hc"], f: &[], j: &[] },
+    S { op: DevOp::V4SparseAttnSplit, t: &["opart", "mlpart", "q", "kv", "idx", "pos"], i: &["T", "H", "D", "TOPK", "SPLIT", "WINDOW", "KVSTRIDE", "RATIO"], f: &["scale"], j: &[] },
+    S { op: DevOp::V4SparseAttnMerge, t: &["out", "opart", "mlpart", "sink"], i: &["T", "H", "D", "SPLIT"], f: &[], j: &[] },
+    S { op: DevOp::V4KvCompressStep, t: &["ring", "kv_state", "sc_state", "kv_p", "sc_p", "ape", "norm_w", "pos"], i: &["D", "ratio", "overlap", "T", "out_stride", "out_base"], f: &["eps"], j: &[] },
+    S { op: DevOp::V4LinearF32, t: &["C", "x", "W"], i: &["T", "N", "K"], f: &[], j: &[] },
     // `gamma?` is the FUSED post-norm: present, the mix is RMSNormed IN PLACE over `out` and the
     // packet subsumes the RMSNORM that would otherwise follow it. See `crate::k3::fuse_attnres_norm`.
     S { op: DevOp::AttnRes, t: &["out", "prefix_sum", "block_residual", "score_w", "push_src?", "gamma?"], i: &["T", "H", "nb", "push_row", "nb_cap"], f: &["eps"], j: &[] },

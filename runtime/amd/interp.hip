@@ -49,6 +49,7 @@
 #include "amd_common.h"
 #include "op_attention.h"
 #include "op_collective.h"
+#include "op_deepseek_v4.h"
 #include "op_elementwise.h"
 #include "op_gemm.h"
 #if PLOW_K3
@@ -1740,6 +1741,21 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                      (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
                                      in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
                                      in->i[4], slice, nblk, in->i[6]);
+            /* HD=512 INTERLEAVED is DeepSeek-V4: one KV head of 512 lanes whose
+             * LAST `qk_rope_head_dim`=64 carry RoPE, paired (x[0],x[1]) as
+             * `view_as_complex` does. Same trick the DSA indexer uses at HD=128,
+             * mirrored: an identity PREFIX in the cos/sin table (cos=1, sin=0 for
+             * the 224 leading pairs) leaves the content lanes alone, and negating
+             * `sin` gives the conjugate rotation V4 applies to the attention
+             * OUTPUT. So V4 needs no rope kernel of its own — only this arm, and
+             * a table the emitter builds. `gamma == NONE` is its weightless
+             * per-head query rescale. */
+            else if (in->i[2] == 512 && in->i[5] == 1)
+                d_headnorm_rope<512, /*INTERLEAVE=*/true>(
+                                     (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                     (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
+                                     in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
+                                     in->i[4], slice, nblk, in->i[6]);
             else if (in->i[2] == 512)
                 d_headnorm_rope<512>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                      (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
@@ -1983,6 +1999,110 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             d_situ_glu((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
                        in->fj[0].f, in->fj[1].f, slice, nblk);
             break;
+        /* ---- DeepSeek-V4. Operand slots are on the Rust `DevOp` variants. ---- */
+        case PLOW_DOP_V4_HC_REDUCE:
+            d_hc_reduce((bf16*)TEN(0), (float*)TEN(5), (const bf16*)TEN(1), (const float*)TEN(2),
+                        (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1], in->i[2],
+                        in->i[3], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_HC_EXPAND:
+            d_hc_expand((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                        (const float*)TEN(3), in->i[0], in->i[1], in->i[2], slice, nblk);
+            break;
+        case PLOW_DOP_V4_HC_REDUCE_HEAD:
+            d_hc_reduce_head((bf16*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
+                             (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1],
+                             in->i[2], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_SPARSE_ATTN_SPLIT: /* t0=opart t1=mlpart t2=q t3=kv t4=idx */
+            d_v4_sparse_attn_split((float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
+                                   (const bf16*)TEN(3), (const int*)TEN(4), (const int*)TEN(5), in->i[0], in->i[1],
+                                   in->i[2], in->i[3], in->i[4], in->i[5], in->i[6],
+                                   in->i[7], in->fj[0].f, slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_SPARSE_ATTN_MERGE: /* t0=out t1=opart t2=mlpart t3=sink */
+            d_v4_sparse_attn_merge((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),
+                                   (const float*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[3],
+                                   slice, nblk);
+            break;
+        case PLOW_DOP_V4_SPARSE_ATTN:
+            d_v4_sparse_attn((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                             (const int*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1],
+                             in->i[2], in->i[3], in->fj[0].f, slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_KV_COMPRESS:
+            d_v4_kv_compress((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                             (const bf16*)TEN(3), (const float*)TEN(4), (const bf16*)TEN(5),
+                             in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f, slice,
+                             nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_KV_COMPRESS_STEP: /* t0=ring t1=kv_state t2=sc_state t3=kv_p t4=sc_p
+                                            * t5=ape t6=norm_w t7=in.pos; i0=D i1=ratio i2=overlap */
+            /* `start_pos` is READ FROM t7, not an immediate: it advances every
+             * step and the host already re-uploads `in.pos` for the ropes. One
+             * uniform scalar load, the same shape the rope arms use. */
+            d_v4_kv_compress_step((bf16*)TEN(0), (float*)TEN(1), (float*)TEN(2),
+                                  (const float*)TEN(3), (const float*)TEN(4), (const float*)TEN(5),
+                                  (const bf16*)TEN(6), (const int*)TEN(7), in->i[3], in->i[0],
+                                  in->i[1], in->i[2], in->i[4], in->i[5], in->fj[0].f, slice,
+                                  nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_LINEAR_F32:
+            d_v4_linear_f32((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                            in->i[1], in->i[2], slice, nblk);
+            break;
+        case PLOW_DOP_V4_INDEX_SCORE:
+            if (in->i[0] > 1)
+                d_v4_index_gemm((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                (const bf16*)TEN(3), (const int*)TEN(4), in->i[4], in->i[0],
+                                in->i[1], in->i[2], in->i[3], slice, nblk, (bf16*)sm->raw);
+            else
+                d_v4_index_score((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                 (const bf16*)TEN(3), (const int*)TEN(4), in->i[4], in->i[0],
+                                 in->i[1], in->i[2], in->i[3], slice, nblk);
+            break;
+        case PLOW_DOP_V4_INDEX_TOPK:
+            d_v4_index_topk((int*)TEN(0), (const float*)TEN(1), in->i[0], in->i[1], in->i[2],
+                            in->i[3], (int)in->i[4], (const int*)TEN(2), in->i[5], slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_GROUPED_LINEAR:
+            if (in->i[0] > 1)
+                d_v4_grouped_gemm((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                  in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk,
+                                  (bf16*)sm->raw);
+            else
+                d_v4_grouped_linear((bf16*)TEN(0), (const bf16*)TEN(1),
+                                    (const bf16*)TEN(2), in->i[0], in->i[1], in->i[2], in->i[3],
+                                    slice, nblk);
+            break;
+        case PLOW_DOP_V4_MOE_ROUTE:
+            /* t6 = the ops-45/46 expert table; absent on the numeric gate, which
+             * checks sel/wts against the reference and has no experts to feed. */
+            d_v4_moe_route((int*)TEN(0), (float*)TEN(1), (unsigned char*)TEN(6),
+                           (const bf16*)TEN(2), (const float*)TEN(3),
+                           (const long long*)TEN(4), (const int*)TEN(5), in->i[0], in->i[1],
+                           in->i[2], in->fj[0].f, slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_HC_BROADCAST: /* t0=x t1=src; i0=T i1=D i2=hc */
+            d_v4_hc_broadcast((bf16*)TEN(0), (const bf16*)TEN(1), in->i[0], in->i[1], in->i[2],
+                              slice, nblk);
+            break;
+        case PLOW_DOP_V4_HC_ZERO: /* t0=partial; i0=n */
+            d_v4_hc_zero((float*)TEN(0), in->i[0], slice, nblk);
+            break;
+        case PLOW_DOP_V4_HC_DOT:
+            d_v4_hc_dot((float*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2), in->i[0],
+                        in->i[1], in->i[2], slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_HC_MIX:
+            d_v4_hc_mix((bf16*)TEN(0), (float*)TEN(5), (const bf16*)TEN(1), (const float*)TEN(2),
+                        (const float*)TEN(3), (const float*)TEN(4), in->i[0], in->i[1], in->i[2],
+                        in->i[3], in->fj[0].f, in->fj[1].f, slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_V4_CLAMPED_SWIGLU:
+            d_v4_clamped_swiglu((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                                in->fj[0].f, slice, nblk);
+            break;
         case PLOW_DOP_MLA_OUT_GATE:
             d_mla_out_gate((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0], slice,
                            nblk);
@@ -1997,8 +2117,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             break;
         case PLOW_DOP_ARGMAX_FIN:
             d_argmax_fin((int*)TEN(0), (const unsigned long long*)TEN(1), in->i[0], in->i[1],
-                         slice);
+                         slice, nblk);
             break;
+#if PLOW_BUCKET_DECODE
+        case PLOW_DOP_GEMM_FP8_BLK:
+            d_gemm_fp8_blk((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
+                           (const float*)TEN(3), in->i[0], in->i[1], in->i[2], slice, nblk,
+                           sm->gm);
+            break;
+#endif
 #if PLOW_BUCKET_PREFILL
 #if PLOW_FP8
         /* w8a8 PREFILL arms. ADDITIVE — they JOIN the bf16 GEMM arms below, they no longer

@@ -1029,6 +1029,44 @@ enum {
      * descriptor: wq,wk,wv, cs0q,cs0k,cs0v, cs1q,cs1k,cs1v, A_log,dt_bias,in.pos,parked. */
     PLOW_DOP_KDA_CONV_STATE_STEP_G = 120,
 
+    /* ---- DeepSeek-V4. Operand slots are documented on the Rust `DevOp`
+     * variants (crates/packet/src/dev.rs); dev_opcodes.rs locks the values. */
+    PLOW_DOP_V4_HC_REDUCE = 121,
+    PLOW_DOP_V4_HC_EXPAND = 122,
+    PLOW_DOP_V4_HC_REDUCE_HEAD = 123,
+    PLOW_DOP_V4_SPARSE_ATTN = 124,
+    PLOW_DOP_V4_KV_COMPRESS = 125,
+    PLOW_DOP_V4_INDEX_SCORE = 126,
+    PLOW_DOP_V4_INDEX_TOPK = 127,
+    PLOW_DOP_V4_GROUPED_LINEAR = 128,
+    PLOW_DOP_V4_MOE_ROUTE = 129,
+    PLOW_DOP_V4_CLAMPED_SWIGLU = 130,
+    PLOW_DOP_V4_HC_DOT = 131,
+    PLOW_DOP_V4_HC_MIX = 132,
+    /* Zero a hyper-connection partial so V4_HC_DOT can accumulate into it
+     * with atomics. t0=partial i0=n. */
+    PLOW_DOP_V4_HC_ZERO = 133,
+    /* Broadcast [T,D] into the [T,hc,D] streams. t0=x t1=src i0=T i1=D i2=hc. */
+    PLOW_DOP_V4_HC_BROADCAST = 134,
+    PLOW_DOP_V4_SPARSE_ATTN_SPLIT = 135,
+    PLOW_DOP_V4_SPARSE_ATTN_MERGE = 136,
+
+    /* Learned KV compressor, DECODE step (`d_v4_kv_compress_step`). A SEPARATE
+     * OPCODE from 125, which is the prefill form, because the two kernels take
+     * different operands — and the emitter was issuing 125 with THESE operands.
+     * The prefill body computes `G = T / ratio`, which at decode's T=1 is 0, so
+     * it returned on its second line: the compressor never ran, `act.ckv` was
+     * never written, and the indexer scored an unwritten buffer for the whole
+     * bring-up. An opcode whose operand layout does not match its arm is not a
+     * wrong number, it is a silent no-op.
+     *   t0=kv ring (out)  t1=kv_state  t2=sc_state  t3=kv_p  t4=sc_p
+     *   t5=ape  t6=norm_w  t7=in.pos
+     *   i0=D  i1=ratio  i2=overlap  f0=eps
+     * `start_pos` comes from t7 rather than an immediate because it advances
+     * every step; the host already re-uploads `in.pos` per step for the ropes. */
+    PLOW_DOP_V4_KV_COMPRESS_STEP = 137,
+    PLOW_DOP_V4_LINEAR_F32 = 138,
+
     PLOW_DOP__COUNT
 };
 

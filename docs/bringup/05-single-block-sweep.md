@@ -422,6 +422,128 @@ The block passes Stage 5 and gates into Stage 6 when **all** hold:
   (`CUDA_ERROR_INVALID_IMAGE` / "driver too old", or the HSA-side equivalent).
   Confirm `$TOOLCHAIN` and the driver agree before blaming the block.
 
+* **Differencing measures MARGINAL cost, and the critical path is what you
+  want.** Ablating an op and taking the delta prices what removing it saves
+  *given everything else still runs* — which is ~0 for anything that overlaps.
+  One V4 campaign measured `V4GroupedLinear` and `V4MoeRoute` at ~0 this way and
+  spent days elsewhere; the packet trace then showed them closing **61.3%** and
+  **11.2%** of the critical path, and fixing them gave 2.2× and 1.36×. Use
+  differencing to confirm a hypothesis, never to generate one.
+
+* **A measurement taken with an env knob set is not a measurement of the
+  default.** An entire V4 branch was measured with `PLOW_V4_NCU=128` exported
+  while the committed default was 304 — a program 2.1× slower than every number
+  in the log. Re-emit clean (`env -u`) before believing a committed default, and
+  put the measured value in the code, not in your shell history.
+
+---
+
+## The per-packet floor, and per-op dispatch width
+
+The single most transferable finding of the V4 bring-up, and it applies to any
+architecture with many layers and many small ops per layer.
+
+**A packet costs something even when it computes nothing.** In the persistent
+interpreter that floor is *per-workgroup cache maintenance*: an agent-scope
+release emits `buffer_wbl2` and an acquire emits `buffer_inv`, both **per-L2**,
+so every workgroup makes its XCD's L2 repeat the same writeback and invalidate
+and they serialise. `runtime/bench/ctr_convergence.hip` prices an empty
+256-workgroup packet at **13.2 µs**, of which the counter and the atomic are
+0.07–0.14 — it is nearly all maintenance.
+
+Measured on the shipped V4 program (`PLOW_TRACE_RAW`, one block's
+`t_end - t_ready`, tick = 10 ns):
+
+| packet | what it computes | at 128 CUs |
+|---|---|---|
+| `V4HcZero` | writes **25 floats** | 34.6 µs |
+| `RmsNorm` | one row | 32.6 µs |
+| `V4HcExpand` | 4096 elements | 31.8 µs |
+| `GemvFp8Blk` | a real projection | 46.5 µs |
+
+A kernel that writes 25 floats cost three quarters of a GEMV. **That is the
+floor, not the work** — and it is why a many-layer decode program can sit at 6%
+of peak bandwidth with every kernel individually well tuned.
+
+### The check to run
+
+1. **Roofline first, before any kernel work.** `perf-data/tools/*_decode_budget.py`
+   (write one for the new arch — it is an afternoon) gives bytes/token and
+   therefore the ceiling. V4's said 2.72 ms/token = 367 tok/s while the program
+   ran at 45 ms. A 16× gap is never kernel arithmetic; it is structural.
+2. **Take a packet trace and compute one block's execution per instruction.**
+   If `sum over instructions of (one block's exec)` ≈ the total span, the program
+   is **serial** and its cost is `packets × floor`. V4: 101.4%.
+3. **Divide the step by the packet count.** V4 was 1505 packets against K3's
+   302 at a comparable size. If mean-µs-per-packet is flat across ops that do
+   wildly different amounts of work, you are floor-bound, and no kernel change
+   will move it.
+
+### The lever: give each packet only the CUs its kernel can use
+
+This is a property of the **kernel's grid mapping**, not of the model, so the
+rules are shared. `crates/devgen/src/k3.rs` has them and they are meant to be
+reused verbatim by new architectures:
+
+| helper | rule | because |
+|---|---|---|
+| `norm_cus(cus, rows)` | `rows` | `d_rmsnorm` reduces a row inside ONE workgroup; at decode `rows = 1` |
+| `k3_rope_cus(cus, start, ntok, nhead)` | `ceil(ntok*nhead / waves)` | one wave per (token, head); `start` keeps a concurrent q/k pair on **disjoint** slices |
+| `combine_cus(cus, n)` | `ceil(n / threads)` | one element per thread |
+| `vec8_cus(cus, n)` | `ceil(n / (threads*8))` | the `bf16v8` bodies stride by 8 |
+
+Read the kernel before picking one — the mapping is not always the obvious one.
+`d_hc_expand` looks like it covers `T*HC*D` but is one element per thread over
+`T*D` (each thread writes all `HC` streams for its depth), so it takes the
+*combine* rule. `d_v4_hc_mix` runs its Sinkhorn tail on thread 0 of **every**
+block with an unstrided token loop, and only its output pass takes a slice — so
+56 of 64 workgroups re-ran a 20-iteration Sinkhorn to discard it.
+
+Narrowing is **bit-identical** whenever the dropped slices wrote nothing, which
+is exactly the condition that makes it a win.
+
+### The trap: the global width and the per-op rules are coupled
+
+Both are U-shaped and they interact. Swept on V4 twice:
+
+```
+   uniform width, every packet     with per-op widths applied
+      4  396.8 ms/token                 64  44.6
+     16  112.9                          96  40.2
+     32   69.3                         128  38.2   <- min
+     64   52.1  <- min                 192  44.3
+    128   53.5                         256  47.8
+    304   81.0                         304  51.6
+```
+
+**The knee moved, 64 → 128.** Below it the wide ops lose bandwidth they could
+use; above it the maintenance round costs more than the extra CUs return.
+Pinning the ops that cannot use width takes their share out of the second
+effect, so the wide ops get to keep the CUs the narrow ones were wasting.
+
+Consequence: **re-sweep the global width every time the per-op rules change.**
+Measured against the stale width the V4 narrowing read as 1.17×; at the width
+its own knee had moved to, it was 1.40×.
+
+### When the floor itself is the target
+
+If packets × floor still dominates after widths are right, the remaining moves
+are, in increasing order of cost:
+
+* **Fuse packets.** `k3::fuse_norm_gemv` folds an `RmsNorm` into the GEMV that
+  consumes it (`norm = 2`), deleting a packet, an edge and a chain level at
+  once. Check the op actually carries a norm immediate first — the block-fp8
+  decode GEMV does not.
+* **Cut the maintenance itself.** `PLOW_GATE_HIER` does the writeback/invalidate
+  **once per XCD** instead of once per workgroup: 13.2 → 3.46 µs on the
+  microbench, a 3.8×. It requires `PLOW_L2_PLACE_DISPATCH` and per-domain
+  windows (`PLOW_SE_NPER`) from the emitter, without which it silently reads as
+  "no hierarchy" and does nothing.
+* **Do not fuse blindly.** V4's fused `d_hc_reduce` exists and passes its gate,
+  but is token-parallel — at `T=1` it collapses onto one CU and is *worse* than
+  the three packets it replaces. Check the fused arm's grid mapping at the
+  batch size you actually run.
+
 ---
 
 ## Code pointers

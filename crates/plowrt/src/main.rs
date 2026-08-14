@@ -521,15 +521,56 @@ fn amd_bench(
                 .collect::<std::result::Result<_, _>>()?,
         };
         if !prompts.is_empty() {
-            for s in 0..b {
-                let ids = &prompts[s % prompts.len()];
-                let tok = eng.prefill_slot(s, ids)?;
-                println!("  slot {s}: prefill {} tokens -> sampled {tok}", ids.len());
-                pos[s] = ids.len() as u32;
-                chains[s].push(tok);
+            if eng.has_prefill() {
+                for s in 0..b {
+                    let ids = &prompts[s % prompts.len()];
+                    let tok = eng.prefill_slot(s, ids)?;
+                    println!("  slot {s}: prefill {} tokens -> sampled {tok}", ids.len());
+                    pos[s] = ids.len() as u32;
+                    chains[s].push(tok);
+                }
+            } else {
+                let n = prompts[0].len();
+                if prompts.iter().any(|p| p.len() != n) {
+                    return Err("decode-only batched prefill requires equal-length prompts".into());
+                }
+                if n == 0 {
+                    return Err("--prompt contains an empty sequence".into());
+                }
+                let mut last = vec![0u32; b];
+                for p in 0..n {
+                    let feed: Vec<u32> = (0..b).map(|s| prompts[s % prompts.len()][p]).collect();
+                    eng.seed_ids(&feed)?;
+                    let at = vec![p as u32; b];
+                    let kv = vec![p as u32 + 1; b];
+                    last = eng.decode_step_batched(&at, &kv)?;
+                }
+                for s in 0..b {
+                    pos[s] = n as u32;
+                    chains[s].push(last[s]);
+                    println!(
+                        "  slot {s}: decode-only prefill {n} tokens -> sampled {}",
+                        last[s]
+                    );
+                }
             }
         } else {
             eng.seed_ids(&vec![0u32; b])?;
+        }
+        if !prompts.is_empty() {
+            if let Some(spec) = plowrt::config::RuntimeConfig::get().amd.dump_act.as_ref() {
+                for one in spec.split(',').filter(|s| !s.is_empty()) {
+                    if let Some((name, path)) = one.split_once(':') {
+                        let n = eng
+                            .tensor_bytes(name)
+                            .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
+                            as usize;
+                        let mut buf = vec![0u8; n];
+                        eng.read_tensor(name, &mut buf)?;
+                        std::fs::write(format!("{path}.batched-prefill.bin"), &buf)?;
+                    }
+                }
+            }
         }
 
         for i in 0..4u32 {
@@ -641,6 +682,20 @@ fn amd_bench(
         if !eng.weights_bound() {
             println!("  (weights unbound — timing real, ids are not)");
         }
+        if let Some(spec) = plowrt::config::RuntimeConfig::get().amd.dump_act.as_ref() {
+            for one in spec.split(',').filter(|s| !s.is_empty()) {
+                if let Some((name, path)) = one.split_once(':') {
+                    let n = eng
+                        .tensor_bytes(name)
+                        .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
+                        as usize;
+                    let mut buf = vec![0u8; n];
+                    eng.read_tensor(name, &mut buf)?;
+                    std::fs::write(format!("{path}.batched.bin"), &buf)?;
+                }
+            }
+        }
+        trace_dump_1(&eng, "")?;
         return Ok(());
     }
 
@@ -664,6 +719,27 @@ fn amd_bench(
         // ask whether TP's own geometry (K3's 12 local KDA heads at BV=8, against
         // the 96-head BV=16 shape every block gate validates) changed the answer.
         let dump = |e: &AmdEngine, tag: &str| -> Result<(), Box<dyn std::error::Error>> {
+            // PLOW_DUMP_ACT="name:path[,name:path...]" — the SAME instrument the TP
+            // path has carried (see `amd_bench_tp`'s dump), which single-GPU did not,
+            // so `PLOW_DUMP_ACT` set on a tp=1 run silently produced nothing.
+            //
+            // That gap is why a NaN in this model cost a bisect instead of one run:
+            // with only `--dump-logits` you can see THAT the head is NaN and never
+            // which activation went NaN first. Reading act.xn, act.fu, act.part and
+            // act.shared is the whole diagnosis.
+            if let Some(spec) = plowrt::config::RuntimeConfig::get().amd.dump_act.as_ref() {
+                for one in spec.split(',').filter(|s| !s.is_empty()) {
+                    if let Some((name, path)) = one.split_once(':') {
+                        let n = e
+                            .tensor_bytes(name)
+                            .ok_or_else(|| format!("PLOW_DUMP_ACT: no tensor {name}"))?
+                            as usize;
+                        let mut buf = vec![0u8; n];
+                        e.read_tensor(name, &mut buf)?;
+                        std::fs::write(format!("{path}.{tag}.bin"), &buf)?;
+                    }
+                }
+            }
             let Some(dir) = &dump_logits else {
                 return Ok(());
             };

@@ -120,8 +120,9 @@ fn op_detail(op: &Op) -> serde_json::Value {
             dim,
             theta,
             interleave,
+            inverse,
         } => json!({
-            "dim": dim, "theta": theta, "interleave": interleave,
+            "dim": dim, "theta": theta, "interleave": interleave, "inverse": inverse,
         }),
         Op::Act(kind) => json!({ "activation": format!("{kind:?}") }),
         Op::Elementwise(kind) => json!({ "kind": format!("{kind:?}") }),
@@ -134,6 +135,7 @@ fn op_detail(op: &Op) -> serde_json::Value {
             causal,
             sliding_window,
             logit_softcap,
+            attn_sink,
         } => json!({
             "num_heads": num_heads,
             "num_kv_heads": num_kv_heads,
@@ -141,6 +143,7 @@ fn op_detail(op: &Op) -> serde_json::Value {
             "causal": causal,
             "sliding_window": sliding_window,
             "logit_softcap": logit_softcap,
+            "attn_sink": attn_sink,
         }),
         Op::Embedding => json!({}),
         Op::Conv2d { stride, padding } => json!({
@@ -170,6 +173,8 @@ fn op_detail(op: &Op) -> serde_json::Value {
             num_experts,
             top_k,
             group,
+            hash,
+            select_bias,
         } => json!({
             "num_experts": num_experts,
             "top_k": top_k,
@@ -177,6 +182,8 @@ fn op_detail(op: &Op) -> serde_json::Value {
                 "n_group": g.n_group,
                 "topk_group": g.topk_group,
             })),
+            "hash": hash,
+            "select_bias": select_bias,
         }),
         Op::Conv1dDepthwise { kernel } => json!({ "kernel": kernel }),
         Op::LinearAttention {
@@ -192,6 +199,26 @@ fn op_detail(op: &Op) -> serde_json::Value {
             "beta": beta, "linear_beta": linear_beta,
         }),
         Op::BlockResidual { max_snapshots } => json!({ "max_snapshots": max_snapshots }),
+        Op::HcReduce { hc_mult, mode, eps } => {
+            json!({ "hc_mult": hc_mult, "mode": format!("{mode:?}"), "eps": eps })
+        }
+        Op::HcExpand {
+            hc_mult,
+            sinkhorn_iters,
+            eps,
+        } => json!({ "hc_mult": hc_mult, "sinkhorn_iters": sinkhorn_iters, "eps": eps }),
+        Op::GroupedLinear {
+            groups,
+            out_features,
+        } => json!({ "groups": groups, "out_features": out_features }),
+        Op::ClampedSwiGlu { limit } => json!({ "limit": limit }),
+        Op::KvCompress {
+            ratio,
+            overlap,
+            out_seq,
+        } => json!({
+            "ratio": ratio, "overlap": overlap, "out_seq": format!("{out_seq}"),
+        }),
     }
 }
 

@@ -899,6 +899,23 @@ fn backend_amd(
         || has("KdaConv")
         || has("KdaConv3")
         || has("KdaGatedNorm")
+        || has("V4HcReduce")
+        || has("V4HcExpand")
+        || has("V4HcReduceHead")
+        || has("V4HcDot")
+        || has("V4HcMix")
+        || has("V4HcZero")
+        || has("V4HcBroadcast")
+        || has("V4SparseAttnSplit")
+        || has("V4SparseAttnMerge")
+        || has("V4KvCompressStep")
+        || has("V4SparseAttn")
+        || has("V4KvCompress")
+        || has("V4IndexScore")
+        || has("V4IndexTopk")
+        || has("V4GroupedLinear")
+        || has("V4MoeRoute")
+        || has("V4ClampedSwiGlu")
     {
         req.push("PLOW_K3=1".into());
     }

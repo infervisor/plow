@@ -69,6 +69,34 @@
   (SnapCons Expr Expr)                ; snapshot, rest
   (SnapNil)                           ; end of the snapshot chain
 
+  ; --- DeepSeek-V4 ---
+  ; Same discipline as the K3 block above: every weight leaf is named, so these
+  ; lower rather than collapsing into `Opaque` (a single-input passthrough that
+  ; would drop all but the first operand). The hyper-connection pair reads the
+  ; same three weights, which is not a bug — both nodes really do.
+  (HcReduce Expr Expr Expr Expr i64 String f64)     ; x, fn, scale, base, hc_mult, mode-token, eps
+  (HcExpand Expr Expr Expr Expr Expr i64 i64 f64)   ; branch, residual, fn, scale, base, hc_mult, iters, eps
+  (GroupedLinear Expr Expr i64 i64)                 ; x, weight, groups, out_features
+  (ClampedSwiGlu Expr Expr f64)                     ; gate, up, limit
+  (KvCompress Expr Expr Expr Expr Expr i64 String String)
+      ; x, wkv, wgate, ape, norm_weight, ratio, overlap-token, out_seq-token
+  ; A de-rotation is not the rotation, so it is its own constructor rather than
+  ; a flag `Rope` would hide.
+  (RopeInverse Expr i64 f64)                        ; x, rotary_dim, theta
+  ; The sink is a learned `[heads]` weight that joins the softmax denominator.
+  ; `Attention` has no slot for it and the config token cannot carry a leaf.
+  (AttentionSink Expr Expr Expr Expr String)        ; q, k, v, sink, config-token
+  ; V4's sparse layers additionally mask the compressed history with their
+  ; indexer's scores. The mask is a whole subgraph, not an attribute, so a
+  ; constructor without a slot for it would orphan every indexer weight.
+  (AttentionSinkMask Expr Expr Expr Expr Expr String) ; q, k, v, mask, sink, config-token
+  ; RMSNorm with no learned gain (V4's per-head query rescale).
+  (RmsNormNoGain Expr f64)                          ; x, eps
+  ; Routing variants that select a DIFFERENT expert set than plain top-k, so
+  ; they must not share an e-node with `MoeRouter`.
+  (MoeRouterBias Expr Expr Expr i64 i64)            ; x, weight, select_bias, num_experts, top_k
+  (MoeRouterHashed Expr Expr Expr Expr i64 i64)     ; x, weight, ids, tid2eid, num_experts, top_k
+
   ; --- catch-all for ops not yet in the fusion vocabulary ---
   ; Allows the full graph to lower without error; no rewrite targets Opaque.
   (Opaque String Expr)                ; op_name, single-input passthrough

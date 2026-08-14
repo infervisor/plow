@@ -347,7 +347,7 @@ __device__ __forceinline__ unsigned gm_remap(unsigned lin, unsigned n_tiles, uns
 #endif
 template <int BM, int BN, int BK, int WM, int WN, bool NORM, int SWZ = GM_SWZ, int WGM = GM_WGM,
           bool PP = (GM_PP != 0), bool KEXACT = true, bool GLU = false, bool WFP4 = false,
-          bool WFP8BLK = false>
+          bool WFP8BLK = false, bool V4_INDEX_SCORE = false>
 __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                          const bf16* __restrict__ B, const float* __restrict__ rms,
                          const bf16* __restrict__ gamma, unsigned M, unsigned N, unsigned K,
@@ -355,11 +355,16 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                          const bf16* __restrict__ B2 = nullptr, unsigned act = 0,
                          const unsigned char* __restrict__ bscale = nullptr,
                          const float* __restrict__ bsblk = nullptr,
-                         const unsigned char* __restrict__ bscale2 = nullptr) {
+                         const unsigned char* __restrict__ bscale2 = nullptr,
+                         unsigned lda = 0, unsigned ldc = 0,
+                         const bf16* __restrict__ index_w = nullptr,
+                         float* __restrict__ index_score = nullptr) {
     (void)B2;
     (void)bscale;
     (void)bsblk;
     (void)bscale2;
+    if (lda == 0) lda = K;
+    if (ldc == 0) ldc = N;
     /* WFP4 (w4a16 mxfp4 weights): B is a packed-2/byte fp4 tensor (row stride K/2 bytes) and
      * `bscale` its E8M0 scale rows (K/32 bytes/row). The B-fetch below dequants fp4->bf16 with the
      * MX scale folded EXACTLY (fp4_to_bf16v8), then stages bf16 into LDS — so the A-operand, LDS
@@ -397,6 +402,8 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
     static_assert(!WFP8BLK || !WFP4, "one weight encoding at a time");
     static_assert(!WFP8BLK || BK == 64, "the 128-K scale block must be exactly two BK tiles");
     static_assert(!WFP8BLK || BN % 128 == 0, "n0 must be 128-aligned for a per-lane N-scale block");
+    static_assert(!V4_INDEX_SCORE || (!GLU && !WFP4 && !WFP8BLK),
+                  "the V4 index epilogue requires an ordinary bf16 GEMM");
     (void)act;
     constexpr int THREADS = WM * WN * PLOW_WAVE;
     /* COMPACT row stride (no +8 pad). global_load_lds writes the 64 lanes CONTIGUOUSLY from a
@@ -589,7 +596,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
             const float sc = (r < M) ? rms[r] : 0.0f;                                         \
             __align__(16) bf16 tv[8], tg[8];                                                  \
             if (r < M) {                                                                      \
-                *(bf16v8*)tv = ld_glob8(as_glob(A) + (size_t)r * K + kk);                     \
+                *(bf16v8*)tv = ld_glob8(as_glob(A) + (size_t)r * lda + kk);                   \
                 *(bf16v8*)tg = ld_glob8(as_glob(gamma) + kk);                                 \
                 _Pragma("unroll") for (int j = 0; j < 8; j++)                                 \
                     ra[it * 8 + j] = f2bf(bf2f(tv[j]) * sc * bf2f(tg[j]));                    \
@@ -597,14 +604,14 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                 _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] = 0;             \
             }                                                                                 \
         } else if constexpr (KEXACT) {                                                        \
-            if (r < M) *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * K + kk);     \
+            if (r < M) *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * lda + kk);   \
             else _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] = 0;            \
         } else {                                                                              \
             if (r < M && kk + 8u <= K)                                                        \
-                *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * K + kk);            \
+                *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * lda + kk);          \
             else                                                                              \
                 _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] =                \
-                    (r < M && kk + j < K) ? A[(size_t)r * K + kk + j] : (bf16)0;              \
+                    (r < M && kk + j < K) ? A[(size_t)r * lda + kk + j] : (bf16)0;            \
         }                                                                                     \
     }                                                                                         \
     _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                    \
@@ -687,7 +694,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
         const unsigned Rloc = e / BK;                                                         \
         const unsigned r = m0 + Rloc;                                                         \
         const unsigned rc = (r < M) ? r : (M - 1);                                            \
-        cp_async16(as_glob(A) + (size_t)rc * K + (k0) + GM_XORSWZ(Rloc, e % BK),                 \
+        cp_async16(as_glob(A) + (size_t)rc * lda + (k0) + GM_XORSWZ(Rloc, e % BK),               \
                    &GM_ASM(buf)[(threadIdx.x & ~63u) * 8 + it * (THREADS * 8)]);              \
     }                                                                                         \
     _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                    \
@@ -925,7 +932,41 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
          * flat_store_short (188 of them in the prefill kernel), carrying a full 64-bit address
          * per lane and tracking on lgkmcnt as well as vmcnt. as_glob is free. */
         auto* const Cg = as_glob(C);
-        if constexpr (GLU) {
+        if constexpr (V4_INDEX_SCORE) {
+            /* Each tile owns every index head for BM compressed entries. Fold
+             * relu(dot)*head_weight in LDS instead of materialising the
+             * [NC,H] product. No other block touches these BM score rows. */
+            float* sums = (float*)lds; /* [BM, WN*SN] */
+            for (unsigned i = threadIdx.x; i < BM * WN * SN; i += PLOW_THREADS)
+                sums[i] = 0.0f;
+            __syncthreads();
+#pragma unroll
+            for (int i = 0; i < SM; i++)
+#pragma unroll
+                for (int j = 0; j < SN; j++) {
+                    const unsigned nn = n0 + wn * (BN / WN) + j * MFMA_N + mfma_acc_n(lane);
+#pragma unroll
+                    for (int e = 0; e < 16; e++) {
+                        const unsigned mm =
+                            m0 + wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e);
+                        float part = nn < N && mm < M
+                                         ? fmaxf(acc[i][j][e], 0.0f) * bf2f(index_w[nn])
+                                         : 0.0f;
+#pragma unroll
+                        for (int o = 16; o; o >>= 1) part += __shfl_down(part, o, 32);
+                        if ((lane & 31u) == 0u && mm < M)
+                            sums[(mm - m0) * (WN * SN) + wn * SN + j] = part;
+                    }
+                }
+            __syncthreads();
+            for (unsigned i = threadIdx.x; i < BM && m0 + i < M; i += PLOW_THREADS) {
+                float sum = 0.0f;
+#pragma unroll
+                for (int p = 0; p < WN * SN; p++) sum += sums[i * (WN * SN) + p];
+                index_score[m0 + i] = sum;
+            }
+            __syncthreads();
+        } else if constexpr (GLU) {
             /* THE FUSED EPILOGUE. acc[i][0] is gate and acc[i][1] is up FOR THE SAME OUTPUT
              * ELEMENT, in the same lane -- that is what the wave->column remap above bought.
              * No shuffle, no LDS exchange, and `fu` is the only thing that reaches HBM: the
@@ -941,7 +982,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                         const float g = acc[i][0][e];
                         const float u = acc[i][1][e];
                         const float sg = act_gate_only(g, act);
-                        st_act1(&Cg[(size_t)mm * N + nn], f2bf(sg * u));
+                        st_act1(&Cg[(size_t)mm * ldc + nn], f2bf(sg * u));
                     }
             }
         } else {
@@ -954,7 +995,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
 #pragma unroll
                 for (int e = 0; e < 16; e++) {
                     const unsigned mm = m0 + wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e);
-                    if (mm < M) st_act1(&Cg[(size_t)mm * N + nn], f2bf(acc[i][j][e]));
+                    if (mm < M) st_act1(&Cg[(size_t)mm * ldc + nn], f2bf(acc[i][j][e]));
                 }
             }
         }
@@ -1144,6 +1185,49 @@ __device__ void d_gemm_small(bf16* C, const bf16* A, const bf16* B, unsigned M, 
                              unsigned K, unsigned slice, unsigned nblk, bf16* lds) {
     d_gemm_t<GM_SM_BM, GM_SM_BN, GM_SM_BK, GM_WM, GM_WN, false>(C, A, B, nullptr, nullptr, M, N, K,
                                                                 slice, nblk, lds);
+}
+
+/* DeepSeek-V4's wo_a is eight independent `[T,1024] x [1024,4096]` projections
+ * stored as `[T,G,WIDTH]` and `[G,R,WIDTH]`. The ordinary grouped dot kernel
+ * leaves matrix cores idle at T=32. Partition the existing small GEMM tiles
+ * across groups and use strided A/C rows, avoiding any pack or transpose. */
+__device__ void d_v4_grouped_gemm(bf16* C, const bf16* A, const bf16* B, unsigned T,
+                                  unsigned GRP, unsigned R, unsigned WIDTH, unsigned slice,
+                                  unsigned nblk, bf16* lds) {
+    const unsigned tm = (T + GM_SM_BM - 1u) / GM_SM_BM;
+    const unsigned tn = (R + GM_SM_BN - 1u) / GM_SM_BN;
+    const unsigned tiles = tm * tn;
+    for (unsigned work = slice; work < GRP * tiles; work += nblk) {
+        const unsigned g = work / tiles;
+        const unsigned tile = work - g * tiles;
+        d_gemm_t<GM_SM_BM, GM_SM_BN, GM_SM_BK, GM_WM, GM_WN, false>(
+            C + (size_t)g * R, A + (size_t)g * WIDTH, B + (size_t)g * R * WIDTH, nullptr,
+            nullptr, T, R, WIDTH, tile, tiles, lds, nullptr, 0, nullptr, nullptr, nullptr,
+            GRP * WIDTH, GRP * R);
+    }
+}
+
+/* B32 index scoring is a batch of `[NC,128] x [64,128]^T` products. Fuse the
+ * per-head ReLU/weight fold into the MFMA epilogue so the `[NC,64]` matrix never
+ * reaches HBM. Each work item owns one sequence and one 64-entry tile. */
+__device__ void d_v4_index_gemm(float* score, const bf16* q, const bf16* ckv, const bf16* w,
+                                const int* pos, unsigned live_ratio, unsigned T, unsigned H,
+                                unsigned HD, unsigned NC, unsigned slice, unsigned nblk,
+                                bf16* lds) {
+    const unsigned tiles = (NC + GM_SM_BM - 1u) / GM_SM_BM;
+    for (unsigned work = slice; work < T * tiles; work += nblk) {
+        const unsigned t = work / tiles;
+        const unsigned tile = work - t * tiles;
+        const unsigned live = pos && live_ratio
+                                  ? min(NC, ((unsigned)pos[t] + 1u) / live_ratio)
+                                  : NC;
+        if (tile * GM_SM_BM >= live) continue;
+        d_gemm_t<GM_SM_BM, GM_SM_BN, GM_SM_BK, GM_WM, GM_WN, false, GM_SWZ, GM_WGM,
+                 (GM_PP != 0), true, false, false, false, true>(
+            nullptr, ckv + (size_t)t * NC * HD, q + (size_t)t * H * HD, nullptr, nullptr,
+            live, H, HD, tile, tiles, lds, nullptr, 0, nullptr, nullptr, nullptr, 0, 0,
+            w + (size_t)t * H, score + (size_t)t * NC);
+    }
 }
 __device__ void d_gemm_med(bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned N,
                            unsigned K, unsigned slice, unsigned nblk, bf16* lds) {
@@ -4771,15 +4855,18 @@ __device__ void d_gemv_qkv_fp8(bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x,
  * every shape at matched K, zero risk (overshoot stays correct at any UN). */
 #define GEMV_FP8_BLK_DISP(UN)                                                                       \
     do {                                                                                            \
-        if (lds_ok) gemv_rows_fp8_blk<PLOW_GEMV_MM, true, UN>(C, x, W, wscale, M, N, K, slice, nblk, lds);  \
-        else gemv_rows_fp8_blk<PLOW_GEMV_MM, false, UN>(C, x, W, wscale, M, N, K, slice, nblk, lds); \
+        if (lds_ok) gemv_rows_fp8_blk<PLOW_GEMV_MM, true, UN>(C_, x_, W, wscale, M_, N, K, slice, nblk, lds);  \
+        else gemv_rows_fp8_blk<PLOW_GEMV_MM, false, UN>(C_, x_, W, wscale, M_, N, K, slice, nblk, lds); \
     } while (0)
 __device__ void d_gemv_fp8_blk(bf16* C, const bf16* x, const unsigned char* W, const float* wscale,
                                unsigned M, unsigned N, unsigned K, unsigned slice, unsigned nblk,
                                bf16* lds) {
-    const bool lds_ok = (size_t)M * K <= GM_LDS_HALVES;
+  gemv_walk(M, [&](unsigned m0, unsigned M_) {
+    bf16* const C_ = C + (size_t)m0 * N;
+    const bf16* const x_ = x + (size_t)m0 * K;
+    const bool lds_ok = (size_t)M_ * K <= GM_LDS_HALVES;
     if (lds_ok)
-        stage_x_lds(lds, x, (size_t)M * K);
+        stage_x_lds(lds, x_, (size_t)M_ * K);
     if (lds_ok) __syncthreads();
     /* UN must DIVIDE nchunk. Two GLM TP4 shapes fell through to a UN that does not, and both were
      * measured losing double digits on gfx950 (grid 256, blockDim 512, 6200 GB/s denominator):
@@ -4797,6 +4884,8 @@ __device__ void d_gemv_fp8_blk(bf16* C, const bf16* x, const unsigned char* W, c
     else if (nchunk == 2u) GEMV_FP8_BLK_DISP(2);   /* short-K (q_b/kv_b): fewest dead converts */
     else if (nchunk == 4u) GEMV_FP8_BLK_DISP(4);   /* K=4096 (o_proj): one exact group of 4 */
     else GEMV_FP8_BLK_DISP(3);                     /* K=6144: 6 chunks -> 2 clean groups of 3 */
+    if (PLOW_GEMV_WALK) __syncthreads();
+  });
 }
 #undef GEMV_FP8_BLK_DISP
 

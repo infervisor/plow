@@ -59,6 +59,8 @@ mod ladder;
 mod mla;
 #[cfg(test)]
 mod test_env;
+mod v4;
+
 use mla::{glm_emit_block, glm_main, kimi_emit_block, nemotron_emit_block, MlaArch};
 pub mod manifest;
 pub mod tune_demand;
@@ -5551,6 +5553,21 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         }
         mla::kimi_k3_emit(&dir, ctx, tp, block_spec.as_deref());
     }
+    // DeepSeek-V4 (`deepseek_v4`), claimed for the same reason K3 is claimed
+    // above: it spells `q_lora_rank`, `n_routed_experts`, `num_experts_per_tok`
+    // and `moe_intermediate_size` exactly as V3 does, so the `deepseek_v3` arm
+    // below — or any future `starts_with("deepseek")` — finds every key it looks
+    // for and emits a blob for a model with none of V4's dataflow: no
+    // `kv_lora_rank` at all, one KV head instead of MLA's latent, a learned KV
+    // compressor, hyper-connections in place of the residual, and FP4 experts.
+    // Without this arm the failure was at least loud (`cfg_from` panicking on an
+    // unknown model_type), which is exactly what makes it worth claiming before
+    // someone widens a pattern. `deepseek_v4_emit` never returns: it validates
+    // what the front end can and reports what is not implemented.
+    if model_type == "deepseek_v4" {
+        mla::deepseek_v4_emit(&dir, ctx, tp, &out, n_cu);
+        return;
+    }
     if model_type == "glm_moe_dsa" {
         // GLM `--block` (M2): single-block
         // extraction on the separate GLM emitter. Absent => the unchanged glm_main
@@ -5850,6 +5867,25 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_KDA_CONV",
     "PLOW_DOP_KDA_CONV3",
     "PLOW_DOP_KDA_CONV_STATE_STEP_G",
+    // DeepSeek-V4. The list tracks interp.hip, not usage — though `PLOW_V4_FULL`
+    // now does build a program that issues all of these.
+    "PLOW_DOP_V4_HC_REDUCE",
+    "PLOW_DOP_V4_HC_EXPAND",
+    "PLOW_DOP_V4_HC_REDUCE_HEAD",
+    "PLOW_DOP_V4_SPARSE_ATTN",
+    "PLOW_DOP_V4_KV_COMPRESS",
+    "PLOW_DOP_V4_INDEX_SCORE",
+    "PLOW_DOP_V4_INDEX_TOPK",
+    "PLOW_DOP_V4_GROUPED_LINEAR",
+    "PLOW_DOP_V4_MOE_ROUTE",
+    "PLOW_DOP_V4_CLAMPED_SWIGLU",
+    "PLOW_DOP_V4_HC_DOT",
+    "PLOW_DOP_V4_HC_MIX",
+    "PLOW_DOP_V4_HC_ZERO",
+    "PLOW_DOP_V4_HC_BROADCAST",
+    "PLOW_DOP_V4_SPARSE_ATTN_SPLIT",
+    "PLOW_DOP_V4_SPARSE_ATTN_MERGE",
+    "PLOW_DOP_V4_KV_COMPRESS_STEP",
     "PLOW_DOP_KDA_GATE",
     "PLOW_DOP_KDA_GATED_NORM",
     "PLOW_DOP_KDA_STATE_STEP",

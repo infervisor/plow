@@ -414,6 +414,14 @@ pub struct AmdRuntimeConfig {
     #[arg(id = "amd_weight_vmm", long = "amd-weight-vmm", env = "PLOW_WEIGHT_VMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub weight_vmm: bool,
 
+    /// Allocate routed experts from fine-grained host memory (diagnostic).
+    #[arg(long = "amd-expert-host", env = "PLOW_EXPERT_HOST", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub expert_host: bool,
+
+    /// Use HSA VMM-backed routed expert slabs (diagnostic/experimental).
+    #[arg(long = "amd-expert-vmm", env = "PLOW_EXPERT_VMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub expert_vmm: bool,
+
     /// Upload-ring pipeline depth.
     #[arg(
         long = "amd-upload-slots",
