@@ -10,8 +10,8 @@ DeepSeek-V4-Flash-0731 checkpoint. The checkpoint upload is 145.30 GiB; the
 |---:|---:|---:|---:|---|
 | 1 | 8K | 42.6 ms | 23.5 tok/s | real checkpoint |
 | 1 | 16K | 42.6 ms | 23.5 tok/s | real checkpoint |
-| 32 | 8K | 203.8 ms | 157.0 tok/s | 32 identical prompts agree |
-| 32 | 16K | 204.0 ms | 156.9 tok/s | 32 identical prompts agree |
+| 32 | 8K | 177.2 ms | 180.6 tok/s | 32 identical prompts agree |
+| 32 | 16K | 177.2 ms | 180.6 tok/s | 32 identical prompts agree |
 
 These are decode-step gates. V4 has no prefill bucket yet, so prompt processing
 walks the decode program and the table is not a TTFT or complete serving claim.
@@ -31,33 +31,42 @@ ridge point. One persistent-interpreter dispatch avoids a host launch for every
 packet; the measured launch floor is 6.0 us for one kernel and 7.6 us for two.
 
 The B32 attention block-FP8 family contains 193 packets and 213.3 GFLOP per
-step. Its compulsory weights, scales, inputs, and outputs total 3.50 GB, for
-60.95 flop/byte. The measured family span was 30.1 ms = 7.09 TFLOP/s and
-116 GB/s, far below either roof. The remaining 129 shared-expert block-FP8
-GEMVs contain 69.3 GFLOP and 1.13 GB at 61.1 flop/byte, but take about 24 ms.
-Both are latency/occupancy limited rather than HBM-roof limited.
+step. The trace attributes 6.67 GB to the family, for 32.0 flop/byte. Its
+measured span is 22.5 ms = 9.48 TFLOP/s and 296 GB/s, far below either roof.
+The remaining 129 shared-expert block-FP8 GEMVs contain 69.3 GFLOP and 2.16 GB
+at 32.0 flop/byte, but take 24.0 ms = 2.89 TFLOP/s and 90 GB/s. Both are
+latency/occupancy limited rather than HBM-roof limited.
 
-Before the latest split sweep, a 189 ms full-step trace attributed the largest
-families as follows:
+The corrected fp32-compressor B32 trace attributes the largest families as
+follows. Trace instrumentation raises the observed step time, so these spans
+rank kernels but do not sum to the untraced 177.2 ms gate.
 
 | Family | Step span |
 |---|---:|
-| Sparse attention | 47.7 ms |
-| Dense block-FP8 attention GEMM | 30.1 ms |
+| V4 index top-k | 51.5 ms |
+| Sparse attention | 47.3 ms |
 | Shared-expert block-FP8 GEMV | 24.0 ms |
+| Dense block-FP8 attention GEMM | 22.5 ms |
 | V4 grouped output linear | 17.7 ms |
-| Other bf16 GEMV | 13.9 ms |
-| Index score | 10.1 ms |
-| Routed A4W4 MoE | 9.9 ms |
-| KV compression | 9.8 ms |
-| Hyper-connection dot | 9.7 ms |
-| Hyper-connection expand | 2.7 ms |
+| FP32 compressor projection | 15.1 ms |
+| Index score | 14.8 ms |
+| Routed A4W4 MoE | 10.4 ms |
+| Hyper-connection dot | 9.6 ms |
+| Headnorm/RoPE | 7.5 ms |
+| KV compression | 6.7 ms |
+| Other bf16 GEMV | 6.1 ms |
 
 An eight-GPU independent sweep of sparse-attention split counts
 `1,2,3,4,6,8,12,16` found B32 aggregate rates of
 `175.6,172.5,174.3,172.1,170.7,165.0,165.6,158.7` tok/s. All arms retained
 same-prompt token-stream agreement. `SPLIT=1` is now the B32 default; B1 keeps four-way
 split-K to fill the device.
+
+The compressor projection must accumulate and store fp32 to match the reference
+model. Vectorizing its bf16 inputs and weights in groups of eight reduced its
+traced span from 74.4 ms to 15.1 ms and improved the corrected B32 gate from
+157.0 to 180.6 tok/s. B1 retains the scalar path because the vector path lowers
+its rate from 23.5 to 21.1 tok/s.
 
 ## Plow-specific advantages
 
@@ -75,7 +84,7 @@ split-K to fill the device.
 
 ## Open gaps
 
-- B1 needs 2.13x and B32 needs 6.37x more throughput to reach the requested
+- B1 needs 2.13x and B32 needs 5.54x more throughput to reach the requested
   gates. Kernel utilization, not the HBM byte roof, is the immediate limit.
 - Converting the 129 shared-expert projections to dense block-FP8 GEMM is fast
   and exact by itself. Combining it with the 193 attention GEMMs exposes a

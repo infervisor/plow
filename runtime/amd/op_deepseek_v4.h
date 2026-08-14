@@ -1602,12 +1602,23 @@ __device__ void d_v4_linear_f32(float* __restrict__ C, const bf16* __restrict__ 
         for (unsigned t0 = 0; t0 < T; t0 += 8u) {
             float acc[8] = {};
             const unsigned nr = T - t0 < 8u ? T - t0 : 8u;
+#if PLOW_GEMV_MM == 1
             for (unsigned k = lane; k < K; k += 64u) {
                 const float w = bf2f(wn[k]);
 #pragma unroll
                 for (unsigned r = 0; r < 8u; r++)
                     if (r < nr) acc[r] += w * bf2f(x[(size_t)(t0 + r) * K + k]);
             }
+#else
+            for (unsigned k = lane * 8u; k < K; k += 64u * 8u) {
+                const bf16v8 w = ld_glob8(as_glob(wn) + k);
+#pragma unroll
+                for (unsigned r = 0; r < 8u; r++)
+                    if (r < nr)
+                        acc[r] = dot8(w, ld_glob8(as_glob(x) + (size_t)(t0 + r) * K + k),
+                                      acc[r]);
+            }
+#endif
 #pragma unroll
             for (unsigned r = 0; r < 8u; r++) {
                 float v = acc[r];
