@@ -2061,8 +2061,14 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                             in->i[3], (int)in->i[4], (const int*)TEN(2), in->i[5], slice, nblk, (float*)sm->raw);
             break;
         case PLOW_DOP_V4_GROUPED_LINEAR:
-            d_v4_grouped_linear((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
-                                in->i[1], in->i[2], in->i[3], slice, nblk);
+            if (in->i[0] > 1)
+                d_v4_grouped_gemm((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                  in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk,
+                                  (bf16*)sm->raw);
+            else
+                d_v4_grouped_linear((bf16*)TEN(0), (const bf16*)TEN(1),
+                                    (const bf16*)TEN(2), in->i[0], in->i[1], in->i[2], in->i[3],
+                                    slice, nblk);
             break;
         case PLOW_DOP_V4_MOE_ROUTE:
             /* t6 = the ops-45/46 expert table; absent on the numeric gate, which

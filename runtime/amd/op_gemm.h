@@ -355,11 +355,14 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                          const bf16* __restrict__ B2 = nullptr, unsigned act = 0,
                          const unsigned char* __restrict__ bscale = nullptr,
                          const float* __restrict__ bsblk = nullptr,
-                         const unsigned char* __restrict__ bscale2 = nullptr) {
+                         const unsigned char* __restrict__ bscale2 = nullptr,
+                         unsigned lda = 0, unsigned ldc = 0) {
     (void)B2;
     (void)bscale;
     (void)bsblk;
     (void)bscale2;
+    if (lda == 0) lda = K;
+    if (ldc == 0) ldc = N;
     /* WFP4 (w4a16 mxfp4 weights): B is a packed-2/byte fp4 tensor (row stride K/2 bytes) and
      * `bscale` its E8M0 scale rows (K/32 bytes/row). The B-fetch below dequants fp4->bf16 with the
      * MX scale folded EXACTLY (fp4_to_bf16v8), then stages bf16 into LDS — so the A-operand, LDS
@@ -589,7 +592,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
             const float sc = (r < M) ? rms[r] : 0.0f;                                         \
             __align__(16) bf16 tv[8], tg[8];                                                  \
             if (r < M) {                                                                      \
-                *(bf16v8*)tv = ld_glob8(as_glob(A) + (size_t)r * K + kk);                     \
+                *(bf16v8*)tv = ld_glob8(as_glob(A) + (size_t)r * lda + kk);                   \
                 *(bf16v8*)tg = ld_glob8(as_glob(gamma) + kk);                                 \
                 _Pragma("unroll") for (int j = 0; j < 8; j++)                                 \
                     ra[it * 8 + j] = f2bf(bf2f(tv[j]) * sc * bf2f(tg[j]));                    \
@@ -597,14 +600,14 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                 _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] = 0;             \
             }                                                                                 \
         } else if constexpr (KEXACT) {                                                        \
-            if (r < M) *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * K + kk);     \
+            if (r < M) *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * lda + kk);   \
             else _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] = 0;            \
         } else {                                                                              \
             if (r < M && kk + 8u <= K)                                                        \
-                *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * K + kk);            \
+                *(bf16v8*)&ra[it * 8] = ld_glob8(as_glob(A) + (size_t)r * lda + kk);          \
             else                                                                              \
                 _Pragma("unroll") for (int j = 0; j < 8; j++) ra[it * 8 + j] =                \
-                    (r < M && kk + j < K) ? A[(size_t)r * K + kk + j] : (bf16)0;              \
+                    (r < M && kk + j < K) ? A[(size_t)r * lda + kk + j] : (bf16)0;            \
         }                                                                                     \
     }                                                                                         \
     _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                    \
@@ -687,7 +690,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
         const unsigned Rloc = e / BK;                                                         \
         const unsigned r = m0 + Rloc;                                                         \
         const unsigned rc = (r < M) ? r : (M - 1);                                            \
-        cp_async16(as_glob(A) + (size_t)rc * K + (k0) + GM_XORSWZ(Rloc, e % BK),                 \
+        cp_async16(as_glob(A) + (size_t)rc * lda + (k0) + GM_XORSWZ(Rloc, e % BK),               \
                    &GM_ASM(buf)[(threadIdx.x & ~63u) * 8 + it * (THREADS * 8)]);              \
     }                                                                                         \
     _Pragma("unroll") for (int it = 0; it < BPASS; it++) {                                    \
@@ -941,7 +944,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
                         const float g = acc[i][0][e];
                         const float u = acc[i][1][e];
                         const float sg = act_gate_only(g, act);
-                        st_act1(&Cg[(size_t)mm * N + nn], f2bf(sg * u));
+                        st_act1(&Cg[(size_t)mm * ldc + nn], f2bf(sg * u));
                     }
             }
         } else {
@@ -954,7 +957,7 @@ __device__ void d_gemm_t(bf16* __restrict__ C, const bf16* __restrict__ A,
 #pragma unroll
                 for (int e = 0; e < 16; e++) {
                     const unsigned mm = m0 + wm * (BM / WM) + i * MFMA_M + mfma_acc_m(lane, e);
-                    if (mm < M) st_act1(&Cg[(size_t)mm * N + nn], f2bf(acc[i][j][e]));
+                    if (mm < M) st_act1(&Cg[(size_t)mm * ldc + nn], f2bf(acc[i][j][e]));
                 }
             }
         }
@@ -1144,6 +1147,26 @@ __device__ void d_gemm_small(bf16* C, const bf16* A, const bf16* B, unsigned M, 
                              unsigned K, unsigned slice, unsigned nblk, bf16* lds) {
     d_gemm_t<GM_SM_BM, GM_SM_BN, GM_SM_BK, GM_WM, GM_WN, false>(C, A, B, nullptr, nullptr, M, N, K,
                                                                 slice, nblk, lds);
+}
+
+/* DeepSeek-V4's wo_a is eight independent `[T,1024] x [1024,4096]` projections
+ * stored as `[T,G,WIDTH]` and `[G,R,WIDTH]`. The ordinary grouped dot kernel
+ * leaves matrix cores idle at T=32. Partition the existing small GEMM tiles
+ * across groups and use strided A/C rows, avoiding any pack or transpose. */
+__device__ void d_v4_grouped_gemm(bf16* C, const bf16* A, const bf16* B, unsigned T,
+                                  unsigned GRP, unsigned R, unsigned WIDTH, unsigned slice,
+                                  unsigned nblk, bf16* lds) {
+    const unsigned tm = (T + GM_SM_BM - 1u) / GM_SM_BM;
+    const unsigned tn = (R + GM_SM_BN - 1u) / GM_SM_BN;
+    const unsigned tiles = tm * tn;
+    for (unsigned work = slice; work < GRP * tiles; work += nblk) {
+        const unsigned g = work / tiles;
+        const unsigned tile = work - g * tiles;
+        d_gemm_t<GM_SM_BM, GM_SM_BN, GM_SM_BK, GM_WM, GM_WN, false>(
+            C + (size_t)g * R, A + (size_t)g * WIDTH, B + (size_t)g * R * WIDTH, nullptr,
+            nullptr, T, R, WIDTH, tile, tiles, lds, nullptr, 0, nullptr, nullptr, nullptr,
+            GRP * WIDTH, GRP * R);
+    }
 }
 __device__ void d_gemm_med(bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned N,
                            unsigned K, unsigned slice, unsigned nblk, bf16* lds) {

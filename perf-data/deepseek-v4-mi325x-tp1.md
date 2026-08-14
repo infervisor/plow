@@ -10,8 +10,8 @@ DeepSeek-V4-Flash-0731 checkpoint. The checkpoint upload is 145.30 GiB; the
 |---:|---:|---:|---:|---|
 | 1 | 8K | 41.6 ms | 24.0 tok/s | bound checkpoint, requested position |
 | 1 | 16K | 42.4 ms | 23.6 tok/s | bound checkpoint, requested position |
-| 32 | 8K | 186.7 ms | 171.4 tok/s | bound checkpoint, requested positions |
-| 32 | 16K | 191.4 ms | 167.2 tok/s | bound checkpoint, requested positions |
+| 32 | 8K | 173.6 ms | 184.3 tok/s | bound checkpoint, requested positions |
+| 32 | 16K | 177.9 ms | 179.9 tok/s | bound checkpoint, requested positions |
 
 These are decode-step timing gates with the real checkpoint bound. V4 has no
 prefill bucket yet, so the requested positions read KV rows that this run did
@@ -44,16 +44,16 @@ The remaining 129 shared-expert block-FP8 GEMVs contain 69.3 GFLOP and 2.16 GB
 at 32.0 flop/byte, but take 24.0 ms = 2.89 TFLOP/s and 90 GB/s. Both are
 latency/occupancy limited rather than HBM-roof limited.
 
-The corrected fp32-compressor B32 trace at a true 8K position attributes the
-largest families as follows. Its 185.4 ms packet span closely reproduces the
-untraced 186.7 ms gate.
+The corrected fp32-compressor B32 trace at a true 8K position, after moving the
+grouped output projection onto MFMA, attributes the largest families as follows.
+Its 172.9 ms packet span closely reproduces the untraced 173.6 ms gate.
 
 | Family | Step span |
 |---|---:|
 | Sparse attention | 47.8 ms |
 | Shared-expert block-FP8 GEMV | 24.0 ms |
 | Dense block-FP8 attention GEMM | 22.6 ms |
-| V4 grouped output linear | 17.7 ms |
+| V4 grouped output linear | 5.2 ms |
 | FP32 compressor projection | 15.1 ms |
 | Index score | 14.8 ms |
 | Routed A4W4 MoE | 10.4 ms |
@@ -85,6 +85,13 @@ workgroup. Mapping one workgroup per row reduced its true-8K traced span from
 51.5 to 1.9 ms and the full-checkpoint timing gate from 236.2 ms / 135.5 tok/s
 to 186.7 ms / 171.4 tok/s. The short-prompt correctness stream remains exact.
 
+The eight grouped `wo_a` projections were scalar dot products despite having 32
+rows. Treating each group as a strided `[32,1024] x [1024,4096]` GEMM uses the
+existing gfx942 MFMA tile without packing or transposing activations. The
+grouped-linear trace span fell from 17.7 to 5.2 ms. A same-GPU gate improved
+true-8K B32 from 186.4 ms / 171.7 tok/s to 173.6 ms / 184.3 tok/s; true-16K is
+177.9 ms / 179.9 tok/s. Full-checkpoint same-prompt token streams still agree.
+
 ## Plow-specific advantages
 
 - The counter-DAG persistent interpreter runs the 1,632-packet model in one
@@ -101,8 +108,8 @@ to 186.7 ms / 171.4 tok/s. The short-prompt correctness stream remains exact.
 
 ## Open gaps
 
-- At 8K, B1 needs 2.08x and B32 needs 5.83x more throughput. At 16K they need
-  2.12x and 5.98x. Kernel utilization, not the HBM byte roof, is the immediate
+- At 8K, B1 needs 2.08x and B32 needs 5.43x more throughput. At 16K they need
+  2.12x and 5.56x. Kernel utilization, not the HBM byte roof, is the immediate
   limit.
 - Converting the 129 shared-expert projections to dense block-FP8 GEMM is fast
   and exact by itself. Combining it with the 193 attention GEMMs exposes a
