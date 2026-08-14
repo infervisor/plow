@@ -81,6 +81,23 @@ __global__ __launch_bounds__(PLOW_THREADS) void k_reduce(bf16* out, float* mix_o
                 gridDim.x, (float*)raw);
 }
 
+__global__ __launch_bounds__(PLOW_THREADS) void k_dot(float* partial, const bf16* x,
+                                                       const float* fn, unsigned T, unsigned D,
+                                                       unsigned HC) {
+    __shared__ __align__(16) char raw[LDS_BYTES];
+    d_v4_hc_dot(partial, x, fn, T, D, HC, blockIdx.x, gridDim.x, (float*)raw);
+}
+
+__global__ __launch_bounds__(PLOW_THREADS) void k_mix(bf16* out, float* mix_out, const bf16* x,
+                                                       const float* partial, const float* scale,
+                                                       const float* base, unsigned T, unsigned D,
+                                                       unsigned HC, unsigned iters,
+                                                       float norm_eps, float hc_eps) {
+    __shared__ __align__(16) char raw[LDS_BYTES];
+    d_v4_hc_mix(out, mix_out, x, partial, scale, base, T, D, HC, iters, norm_eps, hc_eps,
+                blockIdx.x, gridDim.x, (float*)raw);
+}
+
 __global__ __launch_bounds__(PLOW_THREADS) void k_expand(bf16* out, const bf16* branch,
                                                          const bf16* residual, const float* mix_in,
                                                          unsigned T, unsigned D, unsigned HC) {
@@ -300,6 +317,53 @@ static int run_case(unsigned T, unsigned D, unsigned HC, unsigned iters, bool al
     return bad;
 }
 
+static int run_split_identical_rows(void) {
+    const unsigned T = 32, D = 4096, HC = 4, MIX = (2 + HC) * HC, N = HC * D;
+    std::vector<bf16> x((size_t)T * N);
+    std::vector<float> fn((size_t)MIX * N), scale(3), base(MIX);
+    for (unsigned i = 0; i < N; i++) x[i] = f2bf_host(frand());
+    for (unsigned t = 1; t < T; t++) memcpy(x.data() + (size_t)t * N, x.data(), N * 2);
+    const float s = 1.0f / sqrtf((float)N);
+    for (auto& v : fn) v = frand() * s;
+    for (auto& v : scale) v = frand();
+    for (auto& v : base) v = frand();
+
+    bf16 *d_x, *d_out;
+    float *d_fn, *d_scale, *d_base, *d_partial, *d_mix;
+    HC_CHECK(hipMalloc(&d_x, x.size() * 2));
+    HC_CHECK(hipMalloc(&d_out, (size_t)T * D * 2));
+    HC_CHECK(hipMalloc(&d_fn, fn.size() * 4));
+    HC_CHECK(hipMalloc(&d_scale, scale.size() * 4));
+    HC_CHECK(hipMalloc(&d_base, base.size() * 4));
+    HC_CHECK(hipMalloc(&d_partial, (size_t)T * (1 + MIX) * 4));
+    HC_CHECK(hipMalloc(&d_mix, (size_t)T * (HC + HC * HC) * 4));
+    HC_CHECK(hipMemcpy(d_x, x.data(), x.size() * 2, hipMemcpyHostToDevice));
+    HC_CHECK(hipMemcpy(d_fn, fn.data(), fn.size() * 4, hipMemcpyHostToDevice));
+    HC_CHECK(hipMemcpy(d_scale, scale.data(), scale.size() * 4, hipMemcpyHostToDevice));
+    HC_CHECK(hipMemcpy(d_base, base.data(), base.size() * 4, hipMemcpyHostToDevice));
+    HC_CHECK(hipMemset(d_partial, 0, (size_t)T * (1 + MIX) * 4));
+    k_dot<<<304, PLOW_THREADS>>>(d_partial, d_x, d_fn, T, D, HC);
+    k_mix<<<8, PLOW_THREADS>>>(d_out, d_mix, d_x, d_partial, d_scale, d_base, T, D, HC, 20,
+                               1e-6f, 1e-6f);
+    HC_CHECK(hipDeviceSynchronize());
+
+    std::vector<bf16> out((size_t)T * D);
+    HC_CHECK(hipMemcpy(out.data(), d_out, out.size() * 2, hipMemcpyDeviceToHost));
+    bool same = true;
+    for (unsigned t = 1; t < T; t++)
+        same &= memcmp(out.data(), out.data() + (size_t)t * D, D * 2) == 0;
+    printf("split B32 identical rows       %s\n", same ? "ok" : "FAIL");
+
+    hipFree(d_x);
+    hipFree(d_out);
+    hipFree(d_fn);
+    hipFree(d_scale);
+    hipFree(d_base);
+    hipFree(d_partial);
+    hipFree(d_mix);
+    return same ? 0 : 1;
+}
+
 int main(void) {
     srand48(1);
     int bad = 0;
@@ -309,6 +373,7 @@ int main(void) {
     /* HC=2 proves the fixed-size register vectors are not hard-coded to 4, and
      * iters=1 exercises the softmax-then-column path with no symmetric rounds. */
     bad |= run_case(3, 512, 2, 1, true);
+    bad |= run_split_identical_rows();
     printf("%s\n", bad ? "FAIL"
                        : "PASS — d_hc_reduce/expand/head match the model.py + kernel.py reference");
     return bad;

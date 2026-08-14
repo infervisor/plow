@@ -799,7 +799,7 @@ __device__ void d_v4_grouped_linear(bf16* __restrict__ out, const bf16* __restri
  * MoE routing — scored and hash-routed.
  * ---------------------------------------------------------------------------
  *
- * `logits` [T, E] f32   gate GEMM output (`w_gate @ x`, computed in fp32)
+ * `logits` [T, E] bf16  gate GEMV output (`w_gate @ x`)
  * `bias`   [E] f32      selection bias, or nullptr on a hash layer
  * `tid2eid`[V, K] i64   token-id -> expert table, or nullptr on a scored layer
  * `ids`    [T] i32      token ids, only read on a hash layer
@@ -826,15 +826,15 @@ __device__ void d_v4_grouped_linear(bf16* __restrict__ out, const bf16* __restri
  * passes of 256 compares per token. */
 __device__ void d_v4_moe_route(int* __restrict__ sel, float* __restrict__ wts,
                                unsigned char* __restrict__ table,
-                               const float* __restrict__ logits, const float* __restrict__ bias,
+                               const bf16* __restrict__ logits, const float* __restrict__ bias,
                                const long long* __restrict__ tid2eid, const int* __restrict__ ids,
                                unsigned T, unsigned E, unsigned K, float route_scale,
                                unsigned slice, unsigned nblk, float* __restrict__ lds) {
     for (unsigned t = slice; t < T; t += nblk) {
-        const float* lg = logits + (size_t)t * E;
+        const bf16* lg = logits + (size_t)t * E;
         /* `sqrt(softplus(x))`, in fp32 as the reference computes it. */
         for (unsigned e = threadIdx.x; e < E; e += PLOW_THREADS) {
-            const float x = lg[e];
+            const float x = bf2f(lg[e]);
             /* log1p(exp(x)) without overflowing for large x. */
             const float sp = (x > 20.0f) ? x : __logf(1.0f + __expf(x));
             lds[e] = sqrtf(sp);
@@ -933,9 +933,10 @@ __device__ void d_v4_moe_route(int* __restrict__ sel, float* __restrict__ wts,
  * agrees on almost every token and diverges exactly where the activation blows
  * up. Same reasoning as `SituGlu`. */
 __device__ void d_v4_clamped_swiglu(bf16* __restrict__ out, const bf16* __restrict__ gate,
-                                    const bf16* __restrict__ up, unsigned n, float limit) {
-    for (unsigned i = threadIdx.x + blockIdx.x * PLOW_THREADS; i < n;
-         i += PLOW_THREADS * gridDim.x) {
+                                    const bf16* __restrict__ up, unsigned n, float limit,
+                                    unsigned slice, unsigned nblk) {
+    for (unsigned i = threadIdx.x + slice * PLOW_THREADS; i < n;
+         i += PLOW_THREADS * nblk) {
         float g = bf2f(gate[i]), u = bf2f(up[i]);
         if (limit > 0.0f) {
             g = fminf(g, limit);
@@ -1370,13 +1371,18 @@ __device__ void d_v4_hc_dot(float* __restrict__ partial, const bf16* __restrict_
      * this pair only at decode, where it already sits at the launch floor. Both
      * spellings are available and the choice is the emitter's; no decomposition
      * of a per-token GEMV can substitute for the GEMM. */
-    float* bdot = lds; /* [1 + MIX] per block */
-    const bool token_par = T >= nblk;
+    /* A private row per wave makes the block fold deterministic. With one
+     * shared row, wave-order LDS atomics made identical batch rows differ by
+     * enough to cross bf16 rounding boundaries between sub-layers. */
+    float* wdot = lds; /* [PLOW_WAVES][1 + MIX] per block */
+    const unsigned wave = threadIdx.x >> 6;
+    const bool token_par = T > 1;
     const unsigned t0 = token_par ? slice : 0;
     const unsigned tstep = token_par ? nblk : 1;
     for (unsigned t = t0; t < T; t += tstep) {
         const bf16* xt = x + (size_t)t * N;
-        for (unsigned k = threadIdx.x; k < 1u + MIX; k += PLOW_THREADS) bdot[k] = 0.0f;
+        for (unsigned k = threadIdx.x; k < PLOW_WAVES * (1u + MIX); k += PLOW_THREADS)
+            wdot[k] = 0.0f;
         __syncthreads();
 
         const size_t total = (size_t)MIX * N;
@@ -1401,18 +1407,24 @@ __device__ void d_v4_hc_dot(float* __restrict__ partial, const bf16* __restrict_
             if ((unsigned)((e - lane) % N) + 63u < N) {
                 float s = prod;
                 for (int o = 32; o; o >>= 1) s += __shfl_xor(s, o);
-                if (lane == 0) atomicAdd(&bdot[1u + m], s);
+                if (lane == 0) wdot[wave * (1u + MIX) + 1u + m] += s;
             } else {
-                atomicAdd(&bdot[1u + m], prod);
+                atomicAdd(&wdot[wave * (1u + MIX) + 1u + m], prod);
             }
         }
         for (int o = 32; o; o >>= 1) ss += __shfl_xor(ss, o);
-        if ((threadIdx.x & 63u) == 0) atomicAdd(&bdot[0], ss);
+        if (lane == 0) wdot[wave * (1u + MIX)] = ss;
         __syncthreads();
 
-        /* One global atomic per value per BLOCK, not per wave or per lane. */
-        if (threadIdx.x < 1u + MIX)
-            atomicAdd(&partial[(size_t)t * (1u + MIX) + threadIdx.x], bdot[threadIdx.x]);
+        if (threadIdx.x < 1u + MIX) {
+            float sum = 0.0f;
+            for (unsigned w = 0; w < PLOW_WAVES; w++)
+                sum += wdot[w * (1u + MIX) + threadIdx.x];
+            if (token_par)
+                partial[(size_t)t * (1u + MIX) + threadIdx.x] = sum;
+            else
+                atomicAdd(&partial[(size_t)t * (1u + MIX) + threadIdx.x], sum);
+        }
         __syncthreads();
     }
     (void)nwave;

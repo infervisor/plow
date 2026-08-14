@@ -142,7 +142,10 @@ pub(crate) fn declare_v4(b: &mut Builder, c: &V4Cfg, ctx: u32, rows: u32) -> V4T
     let kv = ac(b, "kv", rows as u64 * hd * BF16);
     let attn_out = ac(b, "attn_out", rows as u64 * nh * hd * BF16);
     let logits = ac(b, "logits", rows as u64 * c.vocab as u64 * F32);
-    let amax = ac(b, "amax", rows as u64 * 256 * F32);
+    // `d_argmax` writes one packed u64 per (row, scheduled block). The V4
+    // tail runs on every CU, so sizing this as 256 f32 values per row
+    // under-allocated on 304-CU MI325X and let argmax overwrite HC scratch.
+    let amax = ac(b, "amax", rows as u64 * b.n_cu() as u64 * 8);
     let hc_partial = ac(b, "hc_partial", rows as u64 * (1 + mix) * F32);
     let hc_mix = ac(b, "hc_mix", rows as u64 * (hc + hc * hc) * F32);
 
@@ -1171,9 +1174,10 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
         d.f[0] = 1e-6;
     });
 
-    // Gate scores. The GEMM is bf16 and small; on a hash layer it is dead
+    // Gate scores. Gemv writes bf16; the router promotes each score to f32
+    // before applying softplus. On a hash layer it is dead
     // weight the emitter still pays, which is a Stage-4 saving, not a bug.
-    let glog = b.tensor(&format!("act.glogit.{l}"), tn.rows as u64 * e as u64 * F32);
+    let glog = b.tensor(&format!("act.glogit.{l}"), tn.rows as u64 * e as u64 * BF16);
     let gw = b.tensor(&format!("{p}.ffn.gate.weight"), e as u64 * h as u64 * BF16);
     let gg = b.emit(DevOp::Gemv, all.clone(), &[nrm], |d| {
         d.t[0] = glog;
@@ -1938,6 +1942,8 @@ mod tests {
             bytes("act.x"),
             32 * c.hc_mult as u64 * c.hidden as u64 * BF16
         );
+        assert_eq!(bytes("act.amax"), 32 * 8 * 8);
+        assert_eq!(bytes("act.glogit.0"), 32 * c.n_exp as u64 * BF16);
         let embed = p
             .insts
             .iter()

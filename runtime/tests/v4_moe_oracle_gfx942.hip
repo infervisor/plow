@@ -48,7 +48,7 @@ __global__ __launch_bounds__(PLOW_THREADS) void k_wo(bf16* out, const bf16* o, c
                                                      unsigned W) {
     d_v4_grouped_linear(out, o, w, T, G, R, W, blockIdx.x, gridDim.x);
 }
-__global__ __launch_bounds__(PLOW_THREADS) void k_route(int* sel, float* wts, const float* logits,
+__global__ __launch_bounds__(PLOW_THREADS) void k_route(int* sel, float* wts, const bf16* logits,
                                                         const float* bias,
                                                         const long long* tid2eid, const int* ids,
                                                         unsigned T, unsigned E, unsigned K,
@@ -59,7 +59,7 @@ __global__ __launch_bounds__(PLOW_THREADS) void k_route(int* sel, float* wts, co
 }
 __global__ __launch_bounds__(PLOW_THREADS) void k_glu(bf16* out, const bf16* g, const bf16* u,
                                                       unsigned n, float lim) {
-    d_v4_clamped_swiglu(out, g, u, n, lim);
+    d_v4_clamped_swiglu(out, g, u, n, lim, blockIdx.x, gridDim.x);
 }
 
 static bf16 f2bf_host(float f) {
@@ -123,24 +123,26 @@ static int test_wo(unsigned T, unsigned G, unsigned R, unsigned W) {
 /* ---- router -------------------------------------------------------------- */
 static int test_route(unsigned T, unsigned E, unsigned K, bool hash) {
     const float route_scale = 1.5f, V = 64.0f;
-    std::vector<float> logits((size_t)T * E), bias(E);
+    std::vector<bf16> logits((size_t)T * E);
+    std::vector<float> bias(E);
     std::vector<long long> tab((size_t)(int)V * K);
     std::vector<int> ids(T);
-    for (auto& v : logits) v = frand() * 2.0f;
+    for (auto& v : logits) v = f2bf_host(frand() * 2.0f);
     for (auto& v : bias) v = frand();
     for (size_t i = 0; i < tab.size(); i++) tab[i] = (long long)(lrand48() % E);
     for (auto& v : ids) v = (int)(lrand48() % (long)V);
 
-    float *d_lg, *d_b, *d_w;
+    bf16* d_lg;
+    float *d_b, *d_w;
     long long* d_tab;
     int *d_ids, *d_sel;
-    HC_CHECK(hipMalloc(&d_lg, logits.size() * 4));
+    HC_CHECK(hipMalloc(&d_lg, logits.size() * 2));
     HC_CHECK(hipMalloc(&d_b, bias.size() * 4));
     HC_CHECK(hipMalloc(&d_tab, tab.size() * 8));
     HC_CHECK(hipMalloc(&d_ids, ids.size() * 4));
     HC_CHECK(hipMalloc(&d_sel, (size_t)T * K * 4));
     HC_CHECK(hipMalloc(&d_w, (size_t)T * K * 4));
-    HC_CHECK(hipMemcpy(d_lg, logits.data(), logits.size() * 4, hipMemcpyHostToDevice));
+    HC_CHECK(hipMemcpy(d_lg, logits.data(), logits.size() * 2, hipMemcpyHostToDevice));
     HC_CHECK(hipMemcpy(d_b, bias.data(), bias.size() * 4, hipMemcpyHostToDevice));
     HC_CHECK(hipMemcpy(d_tab, tab.data(), tab.size() * 8, hipMemcpyHostToDevice));
     HC_CHECK(hipMemcpy(d_ids, ids.data(), ids.size() * 4, hipMemcpyHostToDevice));
@@ -156,7 +158,8 @@ static int test_route(unsigned T, unsigned E, unsigned K, bool hash) {
     double worst_w = 0.0;
     for (unsigned t = 0; t < T; t++) {
         std::vector<double> sc(E);
-        for (unsigned e = 0; e < E; e++) sc[e] = sqrt(log1p(exp((double)logits[(size_t)t * E + e])));
+        for (unsigned e = 0; e < E; e++)
+            sc[e] = sqrt(log1p(exp((double)bf2f_host(logits[(size_t)t * E + e]))));
         std::vector<int> want(K, -1);
         if (hash) {
             for (unsigned k = 0; k < K; k++) want[k] = (int)tab[(size_t)ids[t] * K + k];
