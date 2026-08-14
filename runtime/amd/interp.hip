@@ -2047,6 +2047,10 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                   in->i[1], in->i[2], in->i[4], in->i[5], in->fj[0].f, slice,
                                   nblk, (float*)sm->raw);
             break;
+        case PLOW_DOP_V4_LINEAR_F32:
+            d_v4_linear_f32((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                            in->i[1], in->i[2], slice, nblk);
+            break;
         case PLOW_DOP_V4_INDEX_SCORE:
             d_v4_index_score((float*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                              (const bf16*)TEN(3), (const int*)TEN(4), in->i[4], in->i[0],

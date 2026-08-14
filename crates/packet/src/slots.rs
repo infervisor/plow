@@ -242,6 +242,7 @@ const DOC: &[S] = &[
     S { op: DevOp::V4SparseAttnSplit, t: &["opart", "mlpart", "q", "kv", "idx", "pos"], i: &["T", "H", "D", "TOPK", "SPLIT", "WINDOW", "KVSTRIDE", "RATIO"], f: &["scale"], j: &[] },
     S { op: DevOp::V4SparseAttnMerge, t: &["out", "opart", "mlpart", "sink"], i: &["T", "H", "D", "SPLIT"], f: &[], j: &[] },
     S { op: DevOp::V4KvCompressStep, t: &["ring", "kv_state", "sc_state", "kv_p", "sc_p", "ape", "norm_w", "pos"], i: &["D", "ratio", "overlap", "T", "out_stride", "out_base"], f: &["eps"], j: &[] },
+    S { op: DevOp::V4LinearF32, t: &["C", "x", "W"], i: &["T", "N", "K"], f: &[], j: &[] },
     // `gamma?` is the FUSED post-norm: present, the mix is RMSNormed IN PLACE over `out` and the
     // packet subsumes the RMSNORM that would otherwise follow it. See `crate::k3::fuse_attnres_norm`.
     S { op: DevOp::AttnRes, t: &["out", "prefix_sum", "block_residual", "score_w", "push_src?", "gamma?"], i: &["T", "H", "nb", "push_row", "nb_cap"], f: &["eps"], j: &[] },

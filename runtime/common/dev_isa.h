@@ -1065,6 +1065,7 @@ enum {
      * `start_pos` comes from t7 rather than an immediate because it advances
      * every step; the host already re-uploads `in.pos` per step for the ropes. */
     PLOW_DOP_V4_KV_COMPRESS_STEP = 137,
+    PLOW_DOP_V4_LINEAR_F32 = 138,
 
     PLOW_DOP__COUNT
 };

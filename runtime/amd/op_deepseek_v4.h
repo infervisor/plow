@@ -1590,6 +1590,34 @@ __device__ void d_v4_hc_mix(bf16* __restrict__ out, float* __restrict__ mix_out,
  * NOT AN EMIT STEP => THIS OP WRITES NOTHING to `out`. The caller must not
  * consume `out` on those steps; the emitter knows the cadence statically from
  * `ratio` even though `start_pos` is runtime. */
+__device__ void d_v4_linear_f32(float* __restrict__ C, const bf16* __restrict__ x,
+                                const bf16* __restrict__ W, unsigned T, unsigned N, unsigned K,
+                                unsigned slice, unsigned nblk) {
+    if (T == 0 || T > 32) return;
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned lane = threadIdx.x & 63u;
+    const unsigned nwave = PLOW_THREADS >> 6;
+    for (unsigned n = slice * nwave + wave; n < N; n += nblk * nwave) {
+        const bf16* wn = W + (size_t)n * K;
+        for (unsigned t0 = 0; t0 < T; t0 += 8u) {
+            float acc[8] = {};
+            const unsigned nr = T - t0 < 8u ? T - t0 : 8u;
+            for (unsigned k = lane; k < K; k += 64u) {
+                const float w = bf2f(wn[k]);
+#pragma unroll
+                for (unsigned r = 0; r < 8u; r++)
+                    if (r < nr) acc[r] += w * bf2f(x[(size_t)(t0 + r) * K + k]);
+            }
+#pragma unroll
+            for (unsigned r = 0; r < 8u; r++) {
+                float v = acc[r];
+                for (int o = 32; o; o >>= 1) v += __shfl_xor(v, o);
+                if (lane == 0 && r < nr) C[(size_t)(t0 + r) * N + n] = v;
+            }
+        }
+    }
+}
+
 __device__ void d_v4_kv_compress_step(bf16* __restrict__ out_all,
                                       float* __restrict__ kv_state_all,
                                       float* __restrict__ sc_state_all,

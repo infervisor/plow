@@ -1528,6 +1528,9 @@ pub enum DevOp {
     /// `start_pos` rides in `t7` rather than an immediate because it advances
     /// every step, and the host already re-uploads `in.pos` for the ropes.
     V4KvCompressStep = 137,
+    /// `t0=C([T,N] f32) t1=x([T,K] bf16) t2=W([N,K] bf16)` · `i0=T i1=N i2=K`.
+    /// V4's compressor explicitly casts its activation and checkpoint-bf16 weights to fp32.
+    V4LinearF32 = 138,
 }
 
 impl DevOp {
@@ -1675,6 +1678,7 @@ impl DevOp {
         DevOp::V4SparseAttnSplit,
         DevOp::V4SparseAttnMerge,
         DevOp::V4KvCompressStep,
+        DevOp::V4LinearF32,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1833,6 +1837,7 @@ impl DevOp {
             DevOp::V4SparseAttnSplit => "PLOW_DOP_V4_SPARSE_ATTN_SPLIT",
             DevOp::V4SparseAttnMerge => "PLOW_DOP_V4_SPARSE_ATTN_MERGE",
             DevOp::V4KvCompressStep => "PLOW_DOP_V4_KV_COMPRESS_STEP",
+            DevOp::V4LinearF32 => "PLOW_DOP_V4_LINEAR_F32",
         }
     }
 
@@ -1864,7 +1869,7 @@ impl DevOp {
     /// 116 -> 117 for `XReduceAddNorm = 116` (the fused TP seam).
     /// 121 -> 131 for the ten DeepSeek-V4 opcodes (121..=130).
     /// 131 -> 133 for the split hyper-connection reduce (131..=132).
-    pub const COUNT: u16 = 138;
+    pub const COUNT: u16 = 139;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

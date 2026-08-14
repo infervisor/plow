@@ -8,17 +8,17 @@ DeepSeek-V4-Flash-0731 checkpoint. The checkpoint upload is 145.30 GiB; the
 
 | Batch | Context | Step time | Aggregate rate | Correctness |
 |---:|---:|---:|---:|---|
-| 1 | 8K | 32.5 ms | 30.8 tok/s | real checkpoint |
-| 1 | 16K | 32.5 ms | 30.8 tok/s | real checkpoint |
-| 32 | 8K | 182.3 ms | 175.6 tok/s | 32 identical prompts agree |
-| 32 | 16K | 182.3 ms | 175.5 tok/s | 32 identical prompts agree |
+| 1 | 8K | pending | pending | re-gate after fp32 compressor repair |
+| 1 | 16K | pending | pending | re-gate after fp32 compressor repair |
+| 32 | 8K | 203.8 ms | 157.0 tok/s | 32 identical prompts agree |
+| 32 | 16K | 204.0 ms | 156.9 tok/s | 32 identical prompts agree |
 
 These are decode-step gates. V4 has no prefill bucket yet, so prompt processing
 walks the decode program and the table is not a TTFT or complete serving claim.
 The requested B1 >=50 tok/s and B32 >1000 aggregate tok/s targets are not met.
 
-The pushed B32 progression was approximately 90 -> 119 -> 140 -> 149 -> 173
--> 176 tok/s. It came from per-row state/correctness repairs, parallel decode
+The pre-fp32-repair B32 progression was approximately 90 -> 119 -> 140 -> 149
+-> 173 -> 176 tok/s. It came from per-row state/correctness repairs, parallel decode
 tails, tiled hyper-connection projection, a token-wide hyper-connection expand,
 dense block-FP8 attention GEMMs, and reducing sparse-attention split-K from four
 chunks to one at B32.
@@ -75,17 +75,16 @@ split-K to fill the device.
 
 ## Open gaps
 
-- B1 needs 1.63x and B32 needs 5.70x more throughput to reach the requested
-  gates. Kernel utilization, not the HBM byte roof, is the immediate limit.
+- B32 needs 6.37x more throughput to reach the requested gate. B1 needs a fresh
+  measurement. Kernel utilization, not the HBM byte roof, is the immediate limit.
 - Converting the 129 shared-expert projections to dense block-FP8 GEMM is fast
   and exact by itself. Combining it with the 193 attention GEMMs exposes a
   same-row divergence in the routed-MoE/later residual path. A deterministic
   expert-slot order fixes one layer but not the full model, so this conversion
   is intentionally not shipped.
 - The reference compressor casts its activation to fp32 before its bf16-weight
-  projections. The current V4 emitter routes those projections through the
-  ordinary bf16-output GEMV while declaring fp32 intermediates. This path needs
-  a real f32-output linear opcode and a reference gate; throughput results do
-  not establish model-level numerical parity until that is fixed.
+  projections. `V4LinearF32` now implements that contract and its 3-layer gate
+  has exact fp32 projection and sparse-attention rows. An external reference-logit
+  comparison is still required for model-level numerical parity.
 - Prefill buckets are still required for meaningful 8K/16K TTFT and complete
   serving measurements.

@@ -337,8 +337,8 @@ fn emit_bf16_gemv(
     deps: &[u32],
 ) -> u32 {
     let w = b.tensor(&format!("{name}.weight"), n as u64 * k as u64 * BF16);
-    let all: Vec<u32> = (0..n_cu).collect();
-    b.emit(DevOp::Gemv, all, deps, |d| {
+    let all: Vec<u32> = (0..n_cu.min(n.div_ceil(8))).collect();
+    b.emit(DevOp::V4LinearF32, all, deps, |d| {
         d.t[0] = out;
         d.t[1] = x;
         d.t[2] = w;
@@ -1821,13 +1821,13 @@ mod tests {
                 // load proved otherwise — `compressor.wkv.weight` is 8388608 B
                 // on disk against the 4194304 B the fp8 path declared — so the
                 // sequence was pinning a defect rather than the model.
-                Gemv,
-                Gemv,
+                V4LinearF32,
+                V4LinearF32,
                 V4KvCompressStep, // compressor (the DECODE kernel, not 125)
                 GemvFp8Blk,       // indexer query
-                Gemv,             // indexer weights_proj
-                Gemv,
-                Gemv,
+                V4LinearF32,      // indexer weights_proj
+                V4LinearF32,
+                V4LinearF32,
                 V4KvCompressStep, // indexer's independent compressed KV
                 V4IndexScore,
                 V4IndexTopk, // indexer
