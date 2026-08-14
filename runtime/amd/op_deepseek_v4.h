@@ -1643,7 +1643,9 @@ __device__ void d_v4_kv_compress_step(bf16* __restrict__ out_all,
     const unsigned COFF = overlap ? 2u : 1u;
     const unsigned W = COFF * D;                  /* projection width      */
     const unsigned NROW = overlap ? 2u * ratio : ratio;
-    for (unsigned t = 0; t < T; t++) {
+    /* Batch rows own disjoint recurrent state and KV destinations. One logical
+     * slice per row removes the B32 loop without changing B1's slice 0 path. */
+    for (unsigned t = slice; t < T; t += nblk) {
     const unsigned start_pos = (unsigned)pos[t];
     bf16* out = out_all + ((size_t)t * out_stride + out_base + start_pos / ratio) * D;
     float* kv_state = kv_state_all + (size_t)t * NROW * W;
@@ -1668,7 +1670,7 @@ __device__ void d_v4_kv_compress_step(bf16* __restrict__ out_all,
     /* Pool. Each thread owns output dims; the softmax is per dim over the rows,
      * as in the prefill form. */
     float* red = lds;
-    for (unsigned d = slice * PLOW_THREADS + threadIdx.x; d < D; d += nblk * PLOW_THREADS) {
+    for (unsigned d = threadIdx.x; d < D; d += PLOW_THREADS) {
         float m = -INFINITY, l = 0.0f, acc = 0.0f;
         const unsigned r0 = (overlap && start_pos < ratio) ? ratio : 0u;
         for (unsigned r = r0; r < NROW; r++) {

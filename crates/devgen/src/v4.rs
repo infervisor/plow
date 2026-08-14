@@ -685,7 +685,8 @@ fn emit_v4_attn(
         // `G = T / ratio`, which is 0 at T=1, and returned. The compressor
         // never ran for the whole bring-up and the only symptom was a decode
         // that emitted token 0 forever.
-        let step = b.emit(DevOp::V4KvCompressStep, vec![0], &[g1, g2], |d| {
+        let step_cus: Vec<u32> = (0..tn.rows.min(n_cu)).collect();
+        let step = b.emit(DevOp::V4KvCompressStep, step_cus, &[g1, g2], |d| {
             d.t[0] = kvring;
             d.t[1] = kvs;
             d.t[2] = scs;
@@ -806,7 +807,8 @@ fn emit_v4_attn(
             &format!("kv.icscore.{l}"),
             tn.rows as u64 * (icoff * ir) as u64 * iwid as u64 * F32,
         );
-        let istep = b.emit(DevOp::V4KvCompressStep, vec![0], &[ikvg, iscg], |d| {
+        let step_cus: Vec<u32> = (0..tn.rows.min(n_cu)).collect();
+        let istep = b.emit(DevOp::V4KvCompressStep, step_cus, &[ikvg, iscg], |d| {
             d.t[0] = ickv;
             d.t[1] = ikvs;
             d.t[2] = iscs;
@@ -1986,6 +1988,13 @@ mod tests {
             .find(|i| i.op == DevOp::V4IndexTopk as u16)
             .unwrap();
         assert_eq!(topk.blocks, 8, "selector rows fill every available CU");
+        for step in p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::V4KvCompressStep as u16)
+        {
+            assert_eq!(step.blocks, 8, "compressor rows fill every available CU");
+        }
         let kv_rows: Vec<_> = p
             .insts
             .iter()

@@ -10,8 +10,8 @@ DeepSeek-V4-Flash-0731 checkpoint. The checkpoint upload is 145.30 GiB; the
 |---:|---:|---:|---:|---|
 | 1 | 8K | 36.0 ms | 27.8 tok/s | bound checkpoint, requested position |
 | 1 | 16K | 36.8 ms | 27.2 tok/s | bound checkpoint, requested position |
-| 32 | 8K | 112.1 ms | 285.5 tok/s | bound checkpoint, requested positions |
-| 32 | 16K | 113.8 ms | 281.2 tok/s | bound checkpoint, requested positions |
+| 32 | 8K | 110.4 ms | 289.9 tok/s | bound checkpoint, requested positions |
+| 32 | 16K | 111.0 ms | 288.4 tok/s | bound checkpoint, requested positions |
 
 These are decode-step timing gates with the real checkpoint bound. V4 has no
 prefill bucket yet, so the requested positions read KV rows that this run did
@@ -133,6 +133,14 @@ full-checkpoint gate agrees across all 32 rows, and same-GPU pairs improve 8K
 from 131.5 ms / 243.4 tok/s to 112.1 ms / 285.5 tok/s and 16K from 132.9 ms /
 240.7 tok/s to 113.8 ms / 281.2 tok/s.
 
+The incremental KV compressors also own disjoint recurrent state and output
+for every batch row. Issuing one workgroup per row removes the serial B32 row
+loop while leaving the B1 path unchanged. The GPU compressor oracle remains
+exact, and a full-checkpoint same-prompt gate retains the token chain
+`[124208,45131,45131,45131,45131]` on all 32 rows. A four-GPU concurrent
+control/candidate gate improved 8K from 113.5 ms / 281.8 tok/s to 110.4 ms /
+289.9 tok/s and 16K from 114.0 ms / 280.7 tok/s to 111.0 ms / 288.4 tok/s.
+
 ## Plow-specific advantages
 
 - The counter-DAG persistent interpreter runs the 1,632-packet model in one
@@ -149,8 +157,8 @@ from 131.5 ms / 243.4 tok/s to 112.1 ms / 285.5 tok/s and 16K from 132.9 ms /
 
 ## Open gaps
 
-- At 8K, B1 needs 1.80x and B32 needs 3.50x more throughput. At 16K they need
-  1.84x and 3.56x. Kernel utilization, not the HBM byte roof, is the immediate
+- At 8K, B1 needs 1.80x and B32 needs 3.45x more throughput. At 16K they need
+  1.84x and 3.47x. Kernel utilization, not the HBM byte roof, is the immediate
   limit.
 - Converting the 129 shared-expert projections to dense block-FP8 GEMM is fast
   and exact by itself. Combining it with the 193 attention GEMMs exposes a
