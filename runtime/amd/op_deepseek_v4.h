@@ -1402,6 +1402,47 @@ __device__ void d_v4_hc_dot(float* __restrict__ partial, const bf16* __restrict_
         return;
     }
 
+    /* One wave owns one token while the whole block shares a weight tile.
+     * At B32 this loads each projection row once for eight tokens instead of
+     * sweeping the complete MIX*N weight once per token. Each (token, mix-row)
+     * pair has one writer, so equal token rows retain exactly equal folds. */
+    if (T > 1) {
+        float* wtile = lds;
+        const unsigned wave = threadIdx.x >> 6;
+        const unsigned lane = threadIdx.x & 63u;
+        const unsigned groups = (T + nwave - 1u) / nwave;
+        for (unsigned work = slice; work < groups * MIX; work += nblk) {
+            const unsigned group = work / MIX;
+            const unsigned m = work - group * MIX;
+            const unsigned t = group * nwave + wave;
+            float dot = 0.0f;
+            float ss = 0.0f;
+            for (unsigned kb = 0; kb < N; kb += PLOW_THREADS) {
+                const unsigned i = kb + threadIdx.x;
+                wtile[threadIdx.x] = i < N ? hc_fn[(size_t)m * N + i] : 0.0f;
+                __syncthreads();
+                if (t < T) {
+                    const bf16* xt = x + (size_t)t * N;
+                    for (unsigned k = lane; k < PLOW_THREADS && kb + k < N; k += 64u) {
+                        const float v = bf2f(xt[kb + k]);
+                        dot += v * wtile[k];
+                        if (m == 0) ss += v * v;
+                    }
+                }
+                __syncthreads();
+            }
+            for (int o = 32; o; o >>= 1) {
+                dot += __shfl_xor(dot, o);
+                ss += __shfl_xor(ss, o);
+            }
+            if (lane == 0 && t < T) {
+                partial[(size_t)t * (1u + MIX) + 1u + m] = dot;
+                if (m == 0) partial[(size_t)t * (1u + MIX)] = ss;
+            }
+        }
+        return;
+    }
+
     /* A private row per wave makes the block fold deterministic. With one
      * shared row, wave-order LDS atomics made identical batch rows differ by
      * enough to cross bf16 rounding boundaries between sub-layers. */
