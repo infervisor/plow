@@ -278,11 +278,12 @@ fn emit_hc_expand(
     }
     // `d_hc_expand` is grid-strided ONE ELEMENT PER THREAD over `T * D`, not over
     // `T * HC * D` — each thread owns one depth and writes all HC streams for it.
-    // So it saturates at ceil(D / 512) = 8 workgroups at hidden 4096, and the 120
-    // beyond that arrive, find nothing, and still pay the maintenance round.
+    // So it saturates at ceil(T * D / 512) workgroups: 8 at B1 and 256 at B32
+    // for hidden 4096. Counting only D serialized all 32 batch rows onto eight
+    // workgroups even though each `(token, depth)` pair is independent.
     b.emit(
         DevOp::V4HcExpand,
-        combine_cus(&all, c.hidden as u32),
+        combine_cus(&all, tn.rows * c.hidden as u32),
         deps,
         |d| {
             d.t[0] = tn.x; // in place: every output reads the whole stream vector first
@@ -2289,6 +2290,15 @@ mod tests {
         assert_eq!(
             p.insts[0].t[0], p.insts[0].t[2],
             "expand is in place over x"
+        );
+
+        let mut b = Builder::new(304);
+        let tn = declare_v4(&mut b, &c, 4096, 32);
+        emit_hc_expand(&mut b, &c, &tn, tn.attn_out, 304, &[]);
+        assert_eq!(
+            b.finish().insts[0].blocks,
+            256,
+            "B32 expand needs one block per 512 token-depth elements"
         );
     }
 }
