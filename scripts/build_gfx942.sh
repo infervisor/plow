@@ -132,6 +132,9 @@ if [ -n "${PLOW_GEMV_MM:-}" ]; then
   GVMM="$PLOW_GEMV_MM"
 fi
 AX_DECODE="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM $AX_GEMV_WALK $CDNA3_TILE $AX_GMOE"
+if [ "${PLOW_DECODE_BATCH:-1}" -gt 1 ]; then
+  AX_DECODE="$AX_DECODE -DGM_BLK_BM=${PLOW_V4_BATCH_GEMM_BM:-64}"
+fi
 echo "   decode GEMV batch bucket: PLOW_GEMV_MM=$GVMM walk=$WALK (PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH:-1})"
 # OPT-IN (PLOW_GEMV_WALK=1): the §6g-WALK row-block outer loop — the object serves any M in
 # ceil(M/MM) passes of the compiled bucket, and the LDS staging bound becomes min(MM,M)*K.

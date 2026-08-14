@@ -28,13 +28,13 @@ rm -f tk.co test_kernels.elf block_fp8_test
 
 # Device: the golden wrappers (share op_gemm.h with the interpreter).
 hipcc --offload-arch="$ARCH" -O3 -w --genco "$R/amd/test_kernels.hip" -o tk.co $INC \
-      -DPLOW_GEMV_MM="$MM" -DPLOW_GEMV_WALK="$WALK"
+      -DPLOW_GEMV_MM="$MM" -DPLOW_GEMV_WALK="$WALK" -DGM_BLK_BM="${GM_BLK_BM:-128}"
 "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" --input=tk.co --output=test_kernels.elf
 
 # Register-usage report for the new block-fp8 GEMV (must stay on the decode budget, occ>=2).
 U=$(hipcc --offload-arch="$ARCH" -O3 -w -Rpass-analysis=kernel-resource-usage \
       --genco "$R/amd/test_kernels.hip" -o /dev/null $INC -DPLOW_GEMV_MM="$MM" \
-      -DPLOW_GEMV_WALK="$WALK" 2>&1 | grep -A6 'gemv_fp8_blk' || true)
+      -DPLOW_GEMV_WALK="$WALK" -DGM_BLK_BM="${GM_BLK_BM:-128}" 2>&1 | grep -A6 'gemv_fp8_blk' || true)
 echo "--- gemv_fp8_blk resource usage ---"
 echo "$U" | grep -E 'VGPRs|AGPRs|Occupancy|Spill|SGPRs' || echo "  (usage lines not captured)"
 echo "-----------------------------------"

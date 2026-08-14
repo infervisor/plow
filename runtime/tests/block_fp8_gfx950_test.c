@@ -215,6 +215,9 @@ static void run_gemm_blk(plow_hsa* h, plow_hsa_kernel* kg, plow_hsa_kernel* kv, 
         hW[i] = (unsigned char)((s << 7) | (e << 3) | m);
     }
     for (size_t i = 0; i < nA; i++) hA[i] = f2bf(((float)(rand() % 17) - 8.0f) / 16.0f);
+    if (M == 32)
+        for (unsigned m = 1; m < M; m++)
+            memcpy(hA + (size_t)m * K, hA, (size_t)K * sizeof(*hA));
     for (size_t i = 0; i < nS; i++) hS[i] = 0.005f + 0.02f * (rand() % 8) / 8.0f;
 
     void* dW = plow_hsa_alloc(h, 0, nW);
@@ -263,9 +266,13 @@ static void run_gemm_blk(plow_hsa* h, plow_hsa_kernel* kg, plow_hsa_kernel* kv, 
         const double rel = fabs(g - v) / (fabs(v) + 1e-2);
         if (rel > xworst) xworst = rel;
     }
-    const int ok = worst < 3e-2 && xworst < 3e-2;
-    printf("  %-24s M=%5u N=%5u K=%5u  %s  ref %.4f  vs-gemv %.4f\n", label, M, N, K,
-           ok ? "PASS" : "FAIL", worst, xworst);
+    unsigned bad_rows = 0;
+    if (M == 32)
+        for (unsigned m = 1; m < M; m++)
+            bad_rows += memcmp(hC, hC + (size_t)m * N, (size_t)N * sizeof(*hC)) != 0;
+    const int ok = worst < 3e-2 && xworst < 3e-2 && bad_rows == 0;
+    printf("  %-24s M=%5u N=%5u K=%5u  %s  ref %.4f  vs-gemv %.4f  rows=%u\n", label,
+           M, N, K, ok ? "PASS" : "FAIL", worst, xworst, bad_rows);
     if (!ok) fails++;
 
     plow_hsa_free(h, dW); plow_hsa_free(h, dA); plow_hsa_free(h, dS);
@@ -529,6 +536,9 @@ int main(int argc, char** argv) {
     plow_hsa_kernel kgblk;
     if (plow_hsa_get_kernel(h, 0, "d_gemm_fp8_blk_k", &kgblk) == 0) {
         printf("block-fp8 DENSE PREFILL GEMM (op 107) vs f64 ref AND vs the decode GEMV:\n");
+        run_gemm_blk(h, &kgblk, &k, NCU, "V4 identical B32",     32, 4096, 4096);
+        run_gemm_blk(h, &kgblk, &k, NCU, "V4 shared gate B32",   32, 2048, 4096);
+        run_gemm_blk(h, &kgblk, &k, NCU, "V4 shared down B32",   32, 4096, 2048);
         /* TP4 (nh_l=16, v_head=256 -> o K=4096; imoe_l=512). M = the emitted bucket ladder. */
         run_gemm_blk(h, &kgblk, &k, NCU, "o_proj TP4",        512, 6144, 4096);
         run_gemm_blk(h, &kgblk, &k, NCU, "o_proj TP4 M=2048", 2048, 6144, 4096);

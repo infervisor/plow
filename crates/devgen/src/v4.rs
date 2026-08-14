@@ -406,6 +406,17 @@ fn emit_fp8_gemv(
             d.i[0] = (v4_rows() * n).div_ceil(2); // bf16 output, f32 writes
         });
     }
+    if v4_rows() > 1 {
+        return b.emit(DevOp::GemmFp8Blk, all, deps, |d| {
+            d.t[0] = out;
+            d.t[1] = x;
+            d.t[2] = w;
+            d.t[3] = ws;
+            d.i[0] = v4_rows();
+            d.i[1] = n;
+            d.i[2] = k;
+        });
+    }
     b.emit(DevOp::GemvFp8Blk, all, deps, |d| {
         d.t[0] = out;
         d.t[1] = x;

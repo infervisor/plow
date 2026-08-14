@@ -2104,6 +2104,13 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             d_argmax_fin((int*)TEN(0), (const unsigned long long*)TEN(1), in->i[0], in->i[1],
                          slice, nblk);
             break;
+#if PLOW_BUCKET_DECODE
+        case PLOW_DOP_GEMM_FP8_BLK:
+            d_gemm_fp8_blk((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
+                           (const float*)TEN(3), in->i[0], in->i[1], in->i[2], slice, nblk,
+                           sm->gm);
+            break;
+#endif
 #if PLOW_BUCKET_PREFILL
 #if PLOW_FP8
         /* w8a8 PREFILL arms. ADDITIVE — they JOIN the bf16 GEMM arms below, they no longer
