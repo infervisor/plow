@@ -1371,6 +1371,37 @@ __device__ void d_v4_hc_dot(float* __restrict__ partial, const bf16* __restrict_
      * this pair only at decode, where it already sits at the launch floor. Both
      * spellings are available and the choice is the emitter's; no decomposition
      * of a per-token GEMV can substitute for the GEMM. */
+    if (T == 1) {
+        float* bdot = lds;
+        for (unsigned k = threadIdx.x; k < 1u + MIX; k += PLOW_THREADS) bdot[k] = 0.0f;
+        __syncthreads();
+
+        const size_t total = (size_t)MIX * N;
+        const size_t e0 = (size_t)slice * PLOW_THREADS + threadIdx.x;
+        const size_t gstride = (size_t)nblk * PLOW_THREADS;
+        const unsigned lane = threadIdx.x & 63u;
+        float ss = 0.0f;
+        for (size_t e = e0; e < total; e += gstride) {
+            const unsigned m = (unsigned)(e / N), i = (unsigned)(e - (size_t)m * N);
+            const float v = bf2f(x[i]);
+            if (m == 0) ss += v * v;
+            const float prod = v * hc_fn[e];
+            if ((unsigned)((e - lane) % N) + 63u < N) {
+                float s = prod;
+                for (int o = 32; o; o >>= 1) s += __shfl_xor(s, o);
+                if (lane == 0) atomicAdd(&bdot[1u + m], s);
+            } else {
+                atomicAdd(&bdot[1u + m], prod);
+            }
+        }
+        for (int o = 32; o; o >>= 1) ss += __shfl_xor(ss, o);
+        if (lane == 0) atomicAdd(&bdot[0], ss);
+        __syncthreads();
+        if (threadIdx.x < 1u + MIX)
+            atomicAdd(&partial[threadIdx.x], bdot[threadIdx.x]);
+        return;
+    }
+
     /* A private row per wave makes the block fold deterministic. With one
      * shared row, wave-order LDS atomics made identical batch rows differ by
      * enough to cross bf16 rounding boundaries between sub-layers. */
