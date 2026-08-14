@@ -8,8 +8,8 @@ DeepSeek-V4-Flash-0731 checkpoint. The checkpoint upload is 145.30 GiB; the
 
 | Batch | Context | Step time | Aggregate rate | Evidence |
 |---:|---:|---:|---:|---|
-| 1 | 8K | 41.6 ms | 24.0 tok/s | bound checkpoint, requested position |
-| 1 | 16K | 42.4 ms | 23.6 tok/s | bound checkpoint, requested position |
+| 1 | 8K | 36.0 ms | 27.8 tok/s | bound checkpoint, requested position |
+| 1 | 16K | 36.8 ms | 27.2 tok/s | bound checkpoint, requested position |
 | 32 | 8K | 131.8 ms | 242.8 tok/s | bound checkpoint, requested positions |
 | 32 | 16K | 134.0 ms | 238.9 tok/s | bound checkpoint, requested positions |
 
@@ -75,6 +75,13 @@ paired gate of the leading arms, selected two-way split-K. At 8K it measured
 The full-checkpoint prompt stream remains unchanged. `SPLIT=2` is now the B1
 default.
 
+After the per-op width changes, a fresh eight-GPU B1 global-width sweep of
+`64,80,96,112,128,144,160,192` measured
+`21.9,22.5,25.0,25.1,26.8,26.4,22.7,21.6` tok/s at true 8K. Final same-GPU
+128-vs-144 pairs retained 128: 27.8 vs 27.2 tok/s at 8K and 27.2 vs 26.5 at
+16K. Old and freshly emitted 128-CU assets agree within 0.8% and emit the same
+token chain, so the default does not change.
+
 The compressor projection must accumulate and store fp32 to match the reference
 model. Vectorizing its bf16 inputs and weights in groups of eight reduced its
 traced span from 74.4 ms to 15.1 ms and improved the corrected B32 gate from
@@ -130,8 +137,8 @@ tok/s and 16K from 161.8 ms / 197.8 tok/s to 134.0 ms / 238.9 tok/s.
 
 ## Open gaps
 
-- At 8K, B1 needs 2.08x and B32 needs 4.12x more throughput. At 16K they need
-  2.12x and 4.19x. Kernel utilization, not the HBM byte roof, is the immediate
+- At 8K, B1 needs 1.80x and B32 needs 4.12x more throughput. At 16K they need
+  1.84x and 4.19x. Kernel utilization, not the HBM byte roof, is the immediate
   limit.
 - Converting the 129 shared-expert projections to dense block-FP8 GEMM is fast
   and exact by itself. Combining it with the 193 attention GEMMs exposes a
