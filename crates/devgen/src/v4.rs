@@ -319,6 +319,15 @@ fn v4_rows() -> u32 {
     crate::emit_config::active().decode_batch.max(1)
 }
 
+fn v4_split_cu(rows: u32, n_cu: u32) -> Option<u32> {
+    // B32 screen on 304 CUs: 128 KV/shared / 176 q/routed was 285.5 tok/s vs
+    // 243.4 when every branch competed for the full grid.
+    crate::emit_config::active()
+        .v4_split_cu
+        .map(|v| v.clamp(1, n_cu - 1))
+        .or_else(|| (rows > 1 && n_cu > 1).then_some(if n_cu >= 128 { 128 } else { n_cu / 2 }))
+}
+
 /// A plain bf16 GEMV.
 ///
 /// NOT every V4 projection is quantized, and assuming so is a load failure at
@@ -383,9 +392,7 @@ fn emit_fp8_gemv(
     // neither reads the other, but both are emitted on every CU so the counter
     // DAG runs them back to back. wkv is 2 MiB against wq_b's 33, so the kv path
     // gets the small slice.
-    let split = crate::emit_config::active()
-        .v4_split_cu
-        .map(|v| v.clamp(1, n_cu - 1));
+    let split = v4_split_cu(v4_rows(), n_cu);
     let all: Vec<u32> = match split {
         Some(k) if name.ends_with(".attn.wkv") => (n_cu - k..n_cu).collect(),
         Some(k) if name.contains(".attn.wq_") => (0..n_cu - k).collect(),
@@ -1067,9 +1074,7 @@ fn emit_v4_shared_expert(
     // both gate on the norm, neither reads the other — but both are emitted on
     // every CU, so the counter DAG runs them back to back. PLOW_V4_SPLITCU
     // gives them disjoint sets so they can actually overlap.
-    let split = crate::emit_config::active()
-        .v4_split_cu
-        .map(|v| v.clamp(1, n_cu - 1));
+    let split = v4_split_cu(tn.rows, n_cu);
     let all: Vec<u32> = match split {
         Some(k) => (0..k).collect(),
         None => (0..n_cu).collect(),
@@ -1295,10 +1300,7 @@ fn emit_v4_ffn(b: &mut Builder, c: &V4Cfg, tn: &V4Tn, l: u32, n_cu: u32, deps: &
     // `PLOW_MOE_ENC_BF16`, and the quantized dot answers an encoding it does not
     // implement with a NaN rather than a wrong number.
     // The complement of the shared expert's set under PLOW_V4_SPLITCU.
-    let all: Vec<u32> = match crate::emit_config::active()
-        .v4_split_cu
-        .map(|v| v.clamp(1, n_cu - 1))
-    {
+    let all: Vec<u32> = match v4_split_cu(tn.rows, n_cu) {
         Some(k) => (k..n_cu).collect(),
         None => all,
     };
@@ -2012,6 +2014,21 @@ mod tests {
         assert_eq!(n(DevOp::MoeCombinePf), c.layers as usize);
         assert_eq!(n(DevOp::MoeGroupGluFp8Blk), 0);
         assert_eq!(n(DevOp::MoeGroupDownFp8Blk), 0);
+        let shared = p
+            .insts
+            .iter()
+            .find(|i| {
+                i.op == DevOp::GemvFp8Blk as u16
+                    && p.tensors[i.t[0] as usize].name == "act.shgate.0"
+            })
+            .unwrap();
+        let routed = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeGroupGluPf as u16)
+            .unwrap();
+        assert_eq!(shared.blocks, 4);
+        assert_eq!(routed.blocks, 4);
         let tail = p
             .insts
             .iter()

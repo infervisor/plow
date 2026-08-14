@@ -10,8 +10,8 @@ DeepSeek-V4-Flash-0731 checkpoint. The checkpoint upload is 145.30 GiB; the
 |---:|---:|---:|---:|---|
 | 1 | 8K | 36.0 ms | 27.8 tok/s | bound checkpoint, requested position |
 | 1 | 16K | 36.8 ms | 27.2 tok/s | bound checkpoint, requested position |
-| 32 | 8K | 131.8 ms | 242.8 tok/s | bound checkpoint, requested positions |
-| 32 | 16K | 134.0 ms | 238.9 tok/s | bound checkpoint, requested positions |
+| 32 | 8K | 112.1 ms | 285.5 tok/s | bound checkpoint, requested positions |
+| 32 | 16K | 113.8 ms | 281.2 tok/s | bound checkpoint, requested positions |
 
 These are decode-step timing gates with the real checkpoint bound. V4 has no
 prefill bucket yet, so the requested positions read KV rows that this run did
@@ -121,6 +121,18 @@ full-checkpoint attention intermediates and logits are byte-exact at the prompt
 gate. Same-GPU pairs improved 8K from 160.2 ms / 199.8 tok/s to 131.8 ms / 242.8
 tok/s and 16K from 161.8 ms / 197.8 tok/s to 134.0 ms / 238.9 tok/s.
 
+The attention q/KV projection branches and the shared/routed FFN branches are
+independent after their respective norms, but the default assigned every branch
+the complete 304-CU set, so the global queue serialized their resource demand.
+An eight-GPU split screen assigned `k` CUs to each smaller KV/shared branch and
+the remainder to each q/routed branch. For
+`k=64,96,128,160,192,224,256`, the true-8K rates were
+`263.5,274.4,282.0,269.8,265.4,251.9,242.3` tok/s against 243.4 control.
+The B32 default is now 128 KV/shared / 176 q/routed. A same-prompt
+full-checkpoint gate agrees across all 32 rows, and same-GPU pairs improve 8K
+from 131.5 ms / 243.4 tok/s to 112.1 ms / 285.5 tok/s and 16K from 132.9 ms /
+240.7 tok/s to 113.8 ms / 281.2 tok/s.
+
 ## Plow-specific advantages
 
 - The counter-DAG persistent interpreter runs the 1,632-packet model in one
@@ -137,8 +149,8 @@ tok/s and 16K from 161.8 ms / 197.8 tok/s to 134.0 ms / 238.9 tok/s.
 
 ## Open gaps
 
-- At 8K, B1 needs 1.80x and B32 needs 4.12x more throughput. At 16K they need
-  1.84x and 4.19x. Kernel utilization, not the HBM byte roof, is the immediate
+- At 8K, B1 needs 1.80x and B32 needs 3.50x more throughput. At 16K they need
+  1.84x and 3.56x. Kernel utilization, not the HBM byte roof, is the immediate
   limit.
 - Converting the 129 shared-expert projections to dense block-FP8 GEMM is fast
   and exact by itself. Combining it with the 193 attention GEMMs exposes a
