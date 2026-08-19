@@ -1,0 +1,68 @@
+version: 1
+
+project:
+  name: qwen-asr-optimization
+  repo: /workspace/plow
+  baseline_branch: shaswot/qwen-asr
+
+agents:
+
+  agent1:
+    name: repository-understanding
+    worktree: /workspace/worktrees/repo-understanding
+    branch: agent/repo-understanding
+    prompt: pipeline/prompts/agent1.md
+    artifacts:
+      - docs/agent1-repository-map.md
+
+  agent2:
+    name: benchmark
+    worktree: /workspace/worktrees/benchmark
+    branch: agent/benchmark
+    parent: agent/repo-understanding
+    prompt: pipeline/prompts/agent2.md
+    artifacts:
+      - docs/agent2-benchmark-contract.md
+      - docs/baseline-results.md
+
+  agent3:
+    name: profiling
+    worktree: /workspace/worktrees/profiling
+    branch: agent/profiling
+    parent: agent/benchmark
+    prompt: pipeline/prompts/agent3.md
+    artifacts:
+      - docs/agent3-profile.md
+
+  optimization:
+
+    parallel: true
+
+    agents:
+
+      agent4:
+        name: kernels
+        worktree: /workspace/worktrees/kernels
+        branch: agent/kernels
+        parent: agent/profiling
+        prompt: pipeline/prompts/agent4.md
+        artifacts:
+          - docs/agent4-kernel-results.md
+
+      agent5:
+        name: runtime
+        worktree: /workspace/worktrees/runtime
+        branch: agent/runtime
+        parent: agent/profiling
+        prompt: pipeline/prompts/agent5.md
+        artifacts:
+          - docs/agent5-runtime-results.md
+
+  agent6:
+    name: validation
+    worktree: /workspace/worktrees/validation
+    branch: agent/validation
+    parent: agent/profiling
+    prompt: pipeline/prompts/agent6.md
+    artifacts:
+      - docs/final-validation.md
