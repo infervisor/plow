@@ -130,6 +130,12 @@ struct Cli {
     #[arg(long)]
     block: Option<String>,
 
+    /// devblob+cubin: also build segmented prefill cubins (_pfseg, _pfgemm).
+    /// Implies NOT setting PLOW_UNISEG=1, so the emitted programs carry
+    /// wave-class segments the SegPf runtime dispatches per-class.
+    #[arg(long)]
+    segmented: bool,
+
     /// devblob only: expand the RoPE tables into the blob's init section instead
     /// of carrying them as recipes the runtime materialises at load.
     ///
@@ -1242,7 +1248,13 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
             l2_layout,
             gpu: cli.gpu.clone(),
             arch: cli.arch.clone(),
-            emit_cfg: Some(cli.emit_cfg.clone()),
+            emit_cfg: Some({
+                let mut cfg = cli.emit_cfg.clone();
+                if cli.segmented {
+                    cfg.uniseg = false;
+                }
+                cfg
+            }),
         },
         verify,
     );
@@ -1252,7 +1264,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // the CLI's idea of what was emitted, which is the drift this whole change
     // exists to remove.
     if cli.emit() == EmitKind::DevblobCubin {
-        build_cubin_from_manifest(&pkt, &cli.arch)?;
+        build_cubin_from_manifest(&pkt, &cli.arch, cli.segmented)?;
     }
 
     // Bare-blob mode (`--out foo.pkt`) stops here: no manifest, exactly the
@@ -1321,6 +1333,7 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn build_cubin_from_manifest(
     pkt: &std::path::Path,
     arch: &str,
+    segmented: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mpath = pkt.with_file_name("build.json");
     let man: serde_json::Value = serde_json::from_slice(
@@ -1382,12 +1395,18 @@ fn build_cubin_from_manifest(
     // must reach every decode-family object from one place — that was bug #2),
     // so route it there rather than into the raw-append bucket.
     let mut args: Vec<String> = vec!["-DPLOW_SM120_CUBIN=ON".into()];
+    if !req.iter().any(|d| d.starts_with("PLOW_NV_GEMMA")) {
+        args.push("-DPLOW_CUBIN_GEMMA=OFF".into());
+    }
     if req.iter().any(|d| d.starts_with("PLOW_NV_W8A8")) {
         args.push("-DPLOW_NV_W8A8=ON".into());
     }
     if req.iter().any(|d| d.starts_with("PLOW_FP8_KV")) {
         args.push("-DPLOW_FP8_KV=ON".into());
         args.push("-DPLOW_SM120_CUBIN_FP8KV=ON".into());
+    }
+    if segmented {
+        args.push("-DPLOW_SM120_CUBIN_SEG=ON".into());
     }
     let mut extra = Vec::new();
     for d in &rec {
