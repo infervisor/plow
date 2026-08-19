@@ -484,12 +484,13 @@ pub struct GpuEngine {
     grid: u32,
     smem: u32,
     /// The engine's single ordered device queue: every decode/prefill copy,
-    /// memset, and launch is enqueued here and retired by ONE
-    /// `cuStreamSynchronize` per step — steady-state serving performs no
-    /// `cuCtxSynchronize` (plan gate). One stream by design: decode and
-    /// prefill share mutable run state (`in.*`, activations, the GQ cursor),
-    /// so overlapping streams would race until every in-flight command owns
-    /// separate run-state storage.
+    /// memset, and launch is enqueued here. Decode retires with ONE
+    /// `cuStreamSynchronize` per step; decode-loop prompt consumption
+    /// ([`Self::consume_prompt`]) retires L launches with one sync.
+    /// Steady-state serving performs no `cuCtxSynchronize` (plan gate). One
+    /// stream by design: decode and prefill share mutable run state (`in.*`,
+    /// activations, the GQ cursor), so overlapping streams would race until
+    /// every in-flight command owns separate run-state storage.
     stream: CudaStream,
     /// The interpreter module: its own lifetime anchor (unloaded in `Drop`)
     /// AND the handle `trace_reset`/`trace_summary` read the device trace
@@ -628,6 +629,10 @@ pub struct GpuEngine {
     /// Pinned per-step staging (`step_slots` is the per-token hot path — no
     /// per-step allocation, and pinned pages make the stream copies async).
     stage: StepStage,
+    /// Ordering-only event recorded after each `consume_prompt` H2D so the
+    /// next iteration may overwrite pinned staging without waiting on the
+    /// interpreter (the kernel stays queued on `stream`).
+    h2d_ev: CudaEvent,
     /// Pre-allocated prefill ids/pos buffers (sized to max prefill bucket t).
     pf_ids: Vec<i32>,
     pf_pos: Vec<i32>,
@@ -2530,6 +2535,7 @@ impl GpuEngine {
         // (plan stage 1: async submission path).
         let stream = be.stream_create()?;
         let stage = StepStage::new(&be, batch)?;
+        let h2d_ev = be.event_create(false)?;
         let timing = match crate::config::RuntimeConfig::get().nv.step_time {
             true => Some(StepTiming::new(&be)?),
             false => None,
@@ -2619,6 +2625,7 @@ impl GpuEngine {
             stop_ids: std::sync::Arc::new(stop_ids),
             logits_raw: Vec::new(),
             stage,
+            h2d_ev,
             pf_ids: vec![0i32; pf_max_t],
             pf_pos: vec![0i32; pf_max_t],
             logits_f32: Vec::new(),
@@ -3586,6 +3593,174 @@ impl GpuEngine {
             t.last_end = Some(std::time::Instant::now());
             t.steps += 1;
             t.log_every(128);
+        }
+        Ok(())
+    }
+
+    /// Decode-loop prompt consumption: one T=1 launch per token, D2H + stream
+    /// sync only after the last. Token-identical to calling [`Self::step_slots`]
+    /// once per id. NVIDIA Qwen has no hd=128 prefill object — this is the
+    /// TTFT path (Agent 3 P3). Pinned staging is reused; an H2D-complete event
+    /// (not a kernel wait) gates overwrite so kernels stay overlapped.
+    pub fn consume_prompt(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        toks: &mut Vec<u32>,
+    ) -> Result<u32> {
+        toks.clear();
+        if tokens.is_empty() {
+            return Err(RuntimeError::Rejected("empty prompt".into()));
+        }
+        let bsz = self.batch;
+        if slot >= bsz {
+            return Err(RuntimeError::Rejected(format!(
+                "slot {slot} out of range (engine batch {bsz})"
+            )));
+        }
+        if self.pos[slot] as usize + tokens.len() > self.max_ctx {
+            return Err(RuntimeError::Rejected(format!(
+                "context exhausted at {} (compiled max {})",
+                self.pos[slot], self.max_ctx
+            )));
+        }
+        // Map the whole prompt span once. Per-token `step_slots` only needs
+        // `pos+1`; a cold walk of L tokens would otherwise ensure L times.
+        if let Some(v) = &self.vmm {
+            let need = self.pos[slot] + tokens.len() as u32;
+            if v.kv.mapped_rows(slot) < need {
+                v.kv.ensure_rows(slot, need)?;
+            }
+            for b in 0..bsz {
+                if b == slot {
+                    continue;
+                }
+                let n = self.pos[b] + 1;
+                if v.kv.mapped_rows(b) < n {
+                    v.kv.ensure_rows(b, n)?;
+                }
+            }
+        }
+
+        let last = tokens.len() - 1;
+        for (i, &token) in tokens.iter().enumerate() {
+            if i > 0 {
+                self.be.event_synchronize(&self.h2d_ev)?;
+            }
+            self.enqueue_prompt_token(slot, token)?;
+            if i == last {
+                self.retire_prompt_token(slot, token, toks)?;
+            } else {
+                self.pos[slot] += 1;
+                self.seq_tokens[slot].push(token);
+                if let Some(v) = &self.vmm {
+                    v.kv.advise(slot, self.pos[slot]);
+                }
+            }
+        }
+        Ok(toks[0])
+    }
+
+    /// Patch + H2D + memset + cooperative launch for one prompt token.
+    /// Records `h2d_ev` after the copies so the next fill may reuse `stage`
+    /// without waiting on the interpreter.
+    fn enqueue_prompt_token(&mut self, slot: usize, token: u32) -> Result<()> {
+        let bsz = self.batch;
+        if bsz == 1 && !self.kvrow.is_empty() {
+            let pos = self.pos[slot];
+            for &ix in &self.kvrow {
+                self.h_inst[ix as usize].i[3] = pos;
+            }
+            let lo = self.kvrow_lo;
+            let n = self.kvrow_hi - lo + 1;
+            let sz = std::mem::size_of::<DevInst64>();
+            // SAFETY: DevInst64 is a #[repr(C)] POD mirror; range within
+            // h_inst, which lives on `self` past the stream synchronize.
+            unsafe {
+                let bytes =
+                    std::slice::from_raw_parts(self.h_inst[lo..].as_ptr() as *const u8, n * sz);
+                self.be.memcpy_htod_async(
+                    self.d_inst.base + (lo * sz) as u64,
+                    bytes,
+                    &self.stream,
+                )?;
+            }
+        }
+        {
+            let (ids, pos, kvlen) = self.stage.parts_mut();
+            for b in 0..bsz {
+                ids[b] = 0;
+                kvlen[b] = 1;
+                pos[b] = self.pos[b] as i32;
+            }
+            ids[slot] = token as i32;
+            kvlen[slot] = self.pos[slot] as i32 + 1;
+        }
+        // SAFETY: the pinned slab lives on `self` past the stream synchronize;
+        // each section matches its [B]-sized i32 tensor.
+        unsafe {
+            self.be.memcpy_htod_async(
+                self.devp[self.t_ids].base,
+                self.stage.section(0),
+                &self.stream,
+            )?;
+            self.be.memcpy_htod_async(
+                self.devp[self.t_pos].base,
+                self.stage.section(1),
+                &self.stream,
+            )?;
+            self.be.memcpy_htod_async(
+                self.devp[self.t_kvlen].base,
+                self.stage.section(2),
+                &self.stream,
+            )?;
+        }
+        self.be.event_record(&self.h2d_ev, &self.stream)?;
+        self.be.memset_d8_async(
+            self.d_ctr.base,
+            0,
+            self.ctr_bytes.max(4) + self.cursor_bytes,
+            &self.stream,
+        )?;
+        let mut arg = self.kernarg;
+        let mut params = [&mut arg as *mut DevProgram as *mut std::ffi::c_void];
+        self.be.launch_cooperative(
+            self.f,
+            self.grid,
+            BLOCK,
+            self.smem,
+            &mut params,
+            Some(&self.stream),
+        )?;
+        Ok(())
+    }
+
+    fn retire_prompt_token(&mut self, slot: usize, token: u32, toks: &mut Vec<u32>) -> Result<()> {
+        // SAFETY: as the uploads — the slab outlives the synchronize.
+        unsafe {
+            let base = self.devp[self.t_ids].base;
+            self.be
+                .memcpy_dtoh_async(self.stage.section_mut(0), base, &self.stream)?;
+        }
+        if let Err(e) = self.be.stream_synchronize(&self.stream) {
+            tracing::warn!(
+                error = %e,
+                error_code = ?e.device_code(),
+                fatal = e.is_fatal(),
+                slot,
+                grid = self.grid,
+                block = BLOCK,
+                smem = self.smem,
+                "consume_prompt: stream sync failed"
+            );
+            return Err(e);
+        }
+        toks.clear();
+        toks.push(self.stage.token(slot));
+        self.pos[slot] += 1;
+        self.seq_tokens[slot].push(token);
+        if let Some(v) = &self.vmm {
+            v.kv.advise(slot, self.pos[slot]);
         }
         Ok(())
     }
