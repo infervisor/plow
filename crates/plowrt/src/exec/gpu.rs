@@ -2383,7 +2383,7 @@ impl GpuEngine {
         let pf = resolve_interp_image(assets_dir, &blob, &raw, &profile, want_sm, Role::Prefill)?;
         let (f_pf, smem_pf, module_pf, prefill, seg_pf) = if let Some(pf) = pf {
             let pf_src = pf.source.clone();
-            match Self::load_prefill(&be, pf, &blob, d_tens.base, grid) {
+            match Self::load_prefill(&be, pf, &blob, d_tens.base, grid, profile.tag) {
                 Ok((f_pf, smem_pf, module_pf, buckets, seg_pf)) => {
                     tracing::info!(
                         pf_cubin = %pf_src,
@@ -3833,6 +3833,7 @@ impl GpuEngine {
         blob: &DevBlob,
         d_tens: u64,
         grid: u32,
+        interp_tag: &str,
     ) -> Result<(KernelFn, u32, Module, Vec<PrefillBucket>, Option<SegPf>)> {
         let module = be.module_load(&pf.image)?;
         let kname = std::env::var(env_kernel_var(Role::Prefill))
@@ -3870,14 +3871,20 @@ impl GpuEngine {
                         let occ = be.occupancy_blocks_per_sm(f, BLOCK, sm as usize)?;
                         Ok((m, f, sm, occ * be.sm_count()))
                     };
+                let seg_file = format!("interp_{interp_tag}_pfseg.cubin");
+                let gemm_file = format!("interp_{interp_tag}_pfgemm.cubin");
+                let seg_sym_name = format!("interp_{interp_tag}_pfseg");
+                let gemm_sym_name = format!("interp_{interp_tag}_pfgemm");
+                let seg_sym = format!("_Z{}{}11PlowProgram", seg_sym_name.len(), seg_sym_name);
+                let gemm_sym = format!("_Z{}{}11PlowProgram", gemm_sym_name.len(), gemm_sym_name);
                 let (m1, f1, s1, g1) = load(
-                    "interp_sm90a_pfseg.cubin",
-                    "_Z18interp_sm90a_pfseg11PlowProgram",
+                    &seg_file,
+                    &seg_sym,
                     "plow_arena_bytes_pfseg",
                 )?;
                 let (m2, f2, s2, _g2unused) = load(
-                    "interp_sm90a_pfgemm.cubin",
-                    "_Z19interp_sm90a_pfgemm11PlowProgram",
+                    &gemm_file,
+                    &gemm_sym,
                     "plow_arena_bytes_pfgemm",
                 )?;
                 // T31: the GEMM object may declare its own launch block size (384-thread ws).
@@ -3888,13 +3895,16 @@ impl GpuEngine {
                 // Optional third object (T12): dedicated hd512 flash. Only loaded when the
                 // file exists — the classing env (PLOW_PF_SEG_FA512) decides whether class-2
                 // segments are emitted at all.
+                let fa_file = format!("interp_{interp_tag}_pffa.cubin");
                 let fa = if std::path::Path::new(&dir)
-                    .join("interp_sm90a_pffa.cubin")
+                    .join(&fa_file)
                     .exists()
                 {
+                    let fa_sym_name = format!("interp_{interp_tag}_pffa");
+                    let fa_sym = format!("_Z{}{}11PlowProgram", fa_sym_name.len(), fa_sym_name);
                     let (m3, f3, s3, g3) = load(
-                        "interp_sm90a_pffa.cubin",
-                        "_Z17interp_sm90a_pffa11PlowProgram",
+                        &fa_file,
+                        &fa_sym,
                         "plow_arena_bytes_pffa",
                     )?;
                     // PLOW_PF_SEG_FA512=all classes hd256 FlashPrefill onto this object too,
@@ -3911,10 +3921,11 @@ impl GpuEngine {
                         && be.module_global_u32(&m3, "plow_fa_hd256_pffa")? == Some(0)
                     {
                         return Err(RuntimeError::Device(
+                            format!(
                             "PLOW_PF_SEG_FA512=all classes hd256 flash onto \
-                             interp_sm90a_pffa.cubin, but that object was built without its \
+                             {fa_file}, but that object was built without its \
                              hd256 arm (PLOW_BUILD_FA_HD256=1) — it would trap on the first \
-                             hd256 segment. Rebuild the object or set PLOW_PF_SEG_FA512=1."
+                             hd256 segment. Rebuild the object or set PLOW_PF_SEG_FA512=1.")
                                 .into(),
                         ));
                     }
