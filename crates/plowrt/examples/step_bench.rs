@@ -58,13 +58,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         last[b] = if e.has_prefill() {
             e.prefill_slot(b, &prompt)?
         } else {
-            let mut tok = 0u32;
             let mut toks = Vec::new();
-            for &t in &prompt {
-                e.step_slots(&[(b, t)], &mut toks)?;
-                tok = toks[0];
-            }
-            tok
+            e.consume_prompt(b, &prompt, &mut toks)?
         };
         println!(
             "slot {b}: prompt consumed in {:.3} s",
