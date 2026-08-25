@@ -529,7 +529,23 @@ struct VizCli {
 
 fn main() -> ExitCode {
     init_logging();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // DEFAULT ON FOR sm_120. The persistent sm_120 interpreter runs every op in one cooperative
+    // launch and implements the coarse single-segment path only, so a segmented blob is not
+    // something that target can express. Without this, a plain `--hf-dir --arch sm_120a` compile
+    // SUCCEEDS and the asset then fails at serve time, in a different binary, against
+    // `plowrt`'s `check_coarse_single_segment` gate — with a message that never names the flag
+    // that was missing. Defaulting it here moves the decision to the only place that knows the
+    // arch. `deny_uniseg` still wins downstream for targets that must read `seg` (AMD).
+    // Opt out with PLOW_UNISEG=0.
+    if cli.arch.starts_with("sm_120") && std::env::var_os("PLOW_UNISEG").is_none() {
+        // The real gate is `packet::devbuild::Builder`'s own `std::env::var("PLOW_UNISEG")` read,
+        // not this struct field — set both so the emitted manifest and the diagnostic agree.
+        std::env::set_var("PLOW_UNISEG", "1");
+        cli.emit_cfg.uniseg = true;
+    }
+    let cli = cli;
 
     // Log the parsed CLI arguments so every invocation is self-describing in logs.
     let source_desc = if let Some(ref m) = cli.model {
