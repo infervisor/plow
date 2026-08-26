@@ -28,6 +28,7 @@
 pub mod decode;
 pub mod gemm;
 pub mod gemv;
+pub mod object;
 pub mod record;
 pub mod sample;
 pub mod store;
@@ -37,6 +38,10 @@ pub use gemv::{gemv_case, gemv_op_case, gemv_sample_bucket, gemv_sample_opcode, 
 
 pub use decode::{
     rank_by_cell, CellRanking, CtxBucket, DecodeCell, DecodeKnobs, DecodeMeasurement,
+};
+pub use object::{
+    rank_by_cell as rank_objects_by_cell, ObjectCell, ObjectConfig, ObjectMeasurement,
+    ObjectRanking, WindowClass,
 };
 pub use record::{
     blockers_for, BlockDefinition, BlockMeasurement, Correctness, Digests, KernelMeasurement,
