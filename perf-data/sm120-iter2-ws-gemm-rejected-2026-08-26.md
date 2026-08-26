@@ -107,6 +107,33 @@ every block a stream entry, the real program may not; and the specific `__launch
 cubin's own `ptxas -v` output already confirmed 0 spills at 242 registers, so a register-pressure
 explanation looks unlikely, just not fully excluded).
 
+### Live GPU debugging tools tried and confirmed unavailable in this sandbox
+
+Attempted to close the remaining gap with interactive/live introspection rather than more
+black-box hypothesis testing:
+
+- **`cuda-gdb -p <pid>`** (attach to the already-hung server): `ptrace: Operation not permitted.`
+  Confirmed via `capsh --print`: `cap_sys_ptrace` is explicitly in the container's capability
+  blocklist (`!cap_sys_ptrace`), even running as root. Same class of restriction as `ncu`'s
+  `ERR_NVGPUCTRPERM`.
+- **`cuda-gdb --args ./bin/plowrt serve ...`** (launch fresh as gdb's own child, sidestepping the
+  Yama `ptrace_scope=1` attach restriction since a debugger's own child is normally exempt):
+  host-side attach succeeded (LWPs enumerated), but **`Could not find CUDA Debugger back-end.
+  Please try upgrading/re-installing the GPU driver`** — the CUDA-specific debugging backend
+  itself (needed for `info cuda kernels`/`info cuda warps`, i.e. seeing which GPU warp is stuck at
+  which PC) is unavailable in this environment, independent of the ptrace permission issue.
+- `compute-sanitizer` remains available and was used earlier in this campaign, but its
+  `synccheck`/`racecheck`/`memcheck` tools check *correctness* (illegal barriers, races,
+  out-of-bounds accesses) — none of which this bug exhibits (every standalone test is bit-exact)
+  — not *liveness*, so it would not have surfaced a hang either.
+
+With both `ncu` and `cuda-gdb`'s CUDA backend confirmed unavailable, live warp-level introspection
+of the actual hang is closed off in this sandbox. The remaining path to root-cause is either (a)
+construct a minimal synthetic multi-op `PlowProgram` with a real gate/counter dependency graph
+(via the Rust packet-building infrastructure, `crates/packet`/`crates/devgen`) to bisect the
+interpreter's dispatch loop in isolation from the full 48-layer Gemma-4 program — real engineering
+effort, not attempted this iteration — or (b) an environment with GPU debugging privileges.
+
 ## Isolated / complete-object / end-to-end result
 
 Isolated (standalone, single-call): fast and bit-exact, effectively confirming px22's own number
