@@ -86,15 +86,26 @@ the device itself is healthy, util dropped to 1%).
 
 **So the bug is real, reproducible, and specifically about being dispatched from inside the
 persistent, cooperative, multi-op interpreter megakernel** — not in the GEMM body's algorithm,
-not shape-dependent, not a cold-memory effect. Not root-caused this iteration. Candidates,
-untested: the interpreter's per-op dispatch loop (`interp_sm120.cu:2011-2134`) uses `__syncthreads()`
-at packet-claim and gate boundaries and `cudaLaunchCooperativeKernel` for the whole grid, none of
-which the standalone probe exercises; a real prefill program calls `d_gemm_w8a8_ws` many times
-(once per GEMM op per layer, 48 layers), so state left in the reused shared-memory arena by one
-call could interact with the next call's fresh `pgm_mbar_init` in a way a single-call probe
-cannot expose; or an interaction with `in->blocks`-based partial-grid participation
-(`interp_sm120.cu:2088-2092`: "a block not in the packet's set simply has no stream entry for it")
-that the always-full-grid standalone probe never exercises either.
+not shape-dependent, not a cold-memory effect. Tested and **ruled out** as standalone causes,
+each confirmed fast (sub-millisecond, matching px22's own number) in isolation:
+
+| factor tested | how | result |
+|---|---|---|
+| shape / grid width | swept M/N/K/G extensively (see the corrected timing section above) | fast at every combination once the CPU-oracle bug was removed |
+| repeated calls sharing one reused arena | one kernel launch calling `d_gemm_w8a8_ws` twice back to back on the same `extern __shared__` arena, `__syncthreads()` between (mirrors the interpreter's own per-op boundary sync) | **0.0009s, ok** — not the trigger |
+| cooperative launch | `cudaLaunchCooperativeKernel` instead of `<<<>>>`, grid sized to `multiProcessorCount`, `maxBlocksPerSM=1` confirmed via `cudaOccupancyMaxActiveBlocksPerMultiprocessor` (matching production's own occupancy exactly) | **0.0006s, ok** — not the trigger |
+
+Not yet tested (ran out of iteration budget): the interpreter's actual gate/counter wait
+mechanism (`ctr_poll`/`ctr_signal`, `interp_sm120.cu:2058-2066` and `2116-2120`) and its exact
+`__syncthreads()` placement sequence around a *real* multi-packet, multi-op program (only a single
+op's worth of synthetic dispatch was tested here, not a real compiled prefill program's actual
+gate graph); `in->blocks`-based partial-grid participation (`interp_sm120.cu:2088-2092`: "a block
+not in the packet's set simply has no stream entry for it") — the standalone tests always gave
+every block a stream entry, the real program may not; and the specific `__launch_bounds__`/
+`__maxnreg__` decoration on the real `interp_sm120`/`interp_sm120_pf` kernel entry points
+(`interp_sm120.cu:1926-1936`), which none of the standalone probes replicated (though the real
+cubin's own `ptxas -v` output already confirmed 0 spills at 242 registers, so a register-pressure
+explanation looks unlikely, just not fully excluded).
 
 ## Isolated / complete-object / end-to-end result
 
