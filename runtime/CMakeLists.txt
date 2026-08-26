@@ -252,16 +252,19 @@ if(PLOW_CUDA)
                 message(FATAL_ERROR "PLOW_NV_FA_FP8PV needs PLOW_FP8_KV_FASTPF=ON (it replaces "
                                     "the px4 fp8-mma arm's P.V, and FASTPF=OFF has no such arm)")
             endif()
-            # Not an error — all-layer fp8-KV packets REQUIRE this path — but it is the slow one
-            # and the cost is invisible at runtime, so say it at configure time. FASTPF cannot be
-            # defaulted ON: legality depends on the PACKET (emit-time PLOW_FP8_KV_FULL=1 keeps
-            # e4m3 to the hd512 layers), which this build cannot see. Measured: 13843 -> 10947 ms,
-            # -21% total prefill at 67k (perf-data/px8-flash-fp8-pv.md).
+            # Not an error — this is a valid, just slower, path — but the cost is invisible at
+            # runtime, so say it at configure time. FASTPF is not defaulted ON here because a raw
+            # CMake build cannot see which packet it will load (the served nix package defaults
+            # it ON instead, flake.nix:292). Since PX-23 (op_attention.cuh:2443) FASTPF=ON is safe
+            # for BOTH mixed (PLOW_FP8_KV_FULL=1) and all-layer fp8-KV packets — both head dims
+            # have a fast PIPE=1 arm (hd256 px23, hd512 px4/px8); it no longer traps on all-layer
+            # packets. Live-verified perf-data/sm120-iter1-fastpf-routing-2026-08-26.md. Measured:
+            # 13843 -> 10947 ms, -21% total prefill at 67k (perf-data/px8-flash-fp8-pv.md).
             message(WARNING
                 "PLOW_FP8_KV=ON with PLOW_FP8_KV_FASTPF=OFF: the prefill objects fall back to "
                 "PLOW_NV_FA_PIPE=0, losing the cp.async flash pipeline for prefill (-21% at 67k). "
-                "If you emit MIXED fp8-KV packets (PLOW_FP8_KV_FULL=1), set PLOW_FP8_KV_FASTPF=ON. "
-                "Keep it OFF only for legacy all-layer fp8-KV packets, which trap under PIPE=1.")
+                "Since PX-23, FASTPF=ON is safe for both mixed AND all-layer fp8-KV packets -- "
+                "turn it on unless you have a specific reason not to.")
         endif()
     endif()
 
