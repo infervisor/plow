@@ -220,6 +220,43 @@ don't go there again without backing off `--kv-cache-memory` explicitly first.)
   comparison. The user declined to auto-escalate into Phase 4 (TMA port) — that remains the next
   lever, gated on explicit go-ahead, per item 6 below.
 
+## Update, 2026-08-26 (later session): plow BEATS vLLM (w8a8), bf16 gap attributed to GEMM
+
+Two more full session passes, same box. Full records:
+`perf-data/prefill-single-setting-win-2026-08-25.md`,
+`perf-data/prefill-beats-vllm-w8a8-2026-08-25.md`,
+`perf-data/prefill-bf16-gap-attribution-2026-08-26.md`. Headline:
+
+- Reframed per user direction: pick ONE fixed setting (input-len 8192, concurrency 1) and
+  specialize for it rather than chasing a generic win. Single-chunk prefill bucket
+  (`PLOW_MAX_CHUNK=8192`, eliminates redundant per-chunk weight-restreaming) + `PGM_BN=192`
+  closed the bf16-vs-bf16 gap from 31% to ~18-19% (1744ms → ~1437ms; vLLM ~1221ms).
+- **True w8a8 (fp8 weights + fp8 activations, native `mma.m16n8k32.e4m3`) crosses over: plow
+  ~959ms vs vLLM's ~1221ms — plow ~27% FASTER.** GSM8K-gated at N=200: 96.0% (w8a8) vs 96.5%
+  (bf16) — within noise, not a real accuracy cost at this sample size. w8a16 (fp8 weight, bf16
+  activation — the dequant-to-bf16 path) was tried first and correctly rejected as a regression
+  (+7-8% slower): it pays a dequant tax without the native fp8 tensor-core's 2x throughput.
+- Bf16-specific follow-up (why does bf16 alone still trail by ~18%?): built an isolated bf16
+  GEMM-vs-cuBLASLt microbench (no `ncu` needed) at the real deployed tile config — **plow's bf16
+  GEMM runs at only 66-71% of cuBLASLt's throughput on identical shapes**, the same magnitude gap
+  PX-9 found for w8a8. Two more cheap knobs checked and cleanly refuted: `PLOW_NV_FA256_BKV=64`
+  fails a hard `BKV<=32` correctness assert (dead on sm_120a's reduction scheme, not just
+  untested); `PGM_STAGES=4` fails the smem load gate (no headroom left at `BN=192`). **The cheap
+  knob space is now exhausted for bf16.** The TMA-based GEMM mainloop port (item 6 below) remains
+  the only lever with real evidenced headroom — confirmed reachable on sm_120a, dtype-agnostic
+  (helps w8a8 too) — but was not started this session, per the same explicit-go-ahead gate.
+- **Same-day follow-up, full kernel sweep**: `perf-data/prefill-kernel-sweep-2026-08-26.md`.
+  Confirmed only two op bodies matter for bf16 prefill (GEMM + flash-attention; every other op is
+  repo-documented at sub-1%-of-wall-clock each). Built an isolated bf16 flash-attention microbench
+  (`runtime/bench/nvidia/fa_prefill_bench.cu`, no `ncu` needed) — **flash-attention runs at only
+  34.1% (hd256 sliding) / 43.9% (hd512 full) of the bf16 mma hardware ceiling**, an even bigger
+  relative gap than GEMM's. Considered and rejected linking cuBLAS/FlashAttention-2 as external
+  per-op kernel calls: this repo's own prior segmented multi-launch experiment already lost ~60%
+  of one op-class's time to per-launch floor overhead — confirmed with the user, the path forward
+  is porting their *techniques* (TMA staging, pipelining) into plow's existing fused kernel
+  bodies, not linking the libraries. Neither the GEMM nor the flash-attention port was started —
+  both scoped, gated on explicit go-ahead, same as item 6 below.
+
 ## What's left — in priority order (full detail + evidence citations in the plan file)
 
 Read `/root/.claude/plans/cuddly-sleeping-kazoo.md` in full for the complete evidence chain —
