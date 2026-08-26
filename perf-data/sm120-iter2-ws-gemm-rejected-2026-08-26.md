@@ -170,3 +170,34 @@ calls across the reused arena break it." Until that is understood, treat any `mb
 technique proposed for Iterations 3, 5, or 6 (all of which call for per-slot `mbarrier`
 synchronization) as carrying this same undiagnosed risk, and gate each with a full live
 interpreter dispatch test (not just a standalone probe) before trusting a microbenchmark number.
+
+### Follow-up same day: two more hypotheses tested and ruled out, still unresolved
+
+1. **Drain hypothesis (the leading candidate above): tested, does not fix it.** Added
+   `asm volatile("cp.async.wait_group 0;")` at the very top of `d_gemm_w8a8_ws`, before
+   `pgm_mbar_init`, on the theory that the interpreter's dispatch loop never drains a prior op's
+   outstanding `cp.async` before the next op reuses the same arena bytes, and the plain
+   `d_gemm_w8a8` body intentionally leaves up to `STAGES-1` groups in flight when it returns
+   (harmless for that body, which has no async-dependent metadata). Rebuilt, re-served, re-tested
+   the same "capital of France" request with a 90s timeout: **hung again**, identically (100% GPU
+   util, zero response). Reverted.
+2. **Many-calls / varying-shape / interleaved-with-plain-body: still fast, still fine.** A
+   standalone kernel calling `d_gemm_w8a8_ws` and the plain `d_gemm_w8a8` alternately, 96 times,
+   alternating between two different N shapes (mimicking `gate|up` vs `down`), all sharing one
+   arena in one launch — matching the real 48-layer program's call *pattern* far more closely than
+   the earlier 2-call test — completed in 0.024s, no hang. This rules out "many repeated calls" and
+   "shape variety" as the trigger too.
+
+**Current best explanation, unconfirmed**: every within-block reproduction attempt (same block,
+many calls, varying shapes, interleaved op types, cp.async fully drained) is fast and correct. The
+real interpreter's dispatch loop additionally has *cross-block* gate/counter dependencies
+(`ctr_poll`/`ctr_signal`, `interp_sm120.cu:2058-2066`/`2116-2120`, and per-slice `PLOW_SE_FINE`
+gates where "slice s blocks only on the producer slices that feed it") that no standalone probe
+in this campaign has exercised — every probe here used a single kernel with no inter-block
+dependency structure at all. If the WS body's less uniform per-block completion timing (producer/
+consumer imbalance, persistent-tile-loop wave skew) interacts badly with a timing assumption
+implicit in the counter/gate mechanism, that would explain why it is invisible to every test that
+doesn't have real cross-block gates — and it is exactly the class of bug the deferred "minimal
+one-packet interpreter program" experiment above would surface and this session's simpler probes
+structurally cannot. Not chased further this session — the standalone-probe search space is
+believed exhausted; the next real step is that harness, not another standalone variant.
