@@ -734,6 +734,17 @@ static __device__ void d_gemv_qkv(__nv_bfloat16* __restrict__ Cq, __nv_bfloat16*
 #define PGM_BKSTRIDE (PGM_BK + PGM_BPAD) /* 40  B smem: [n][k], k contiguous (was [k][n] transposed) */
 #define PGM_ABUF (PGM_BM * PGM_ASTRIDE)  /* 5120 bf16 per stage */
 #define PGM_BBUF (PGM_BN * PGM_BKSTRIDE) /* 5120 bf16 per stage */
+/* GEMM_GLU's own N-tile, independent of the plain-GEMM PGM_BN above. GLU carries TWO
+ * accumulator sets (gate, up) instead of one, so its register cost per N-tile is double the
+ * plain body's at the same width — a narrower N-tile trades re-read bandwidth for register
+ * headroom specifically on this arm. Default equals PGM_BN (no behavioral change unless
+ * overridden). Must stay a multiple of PGM_WARPS_N*8 (one n-fragment per warp-column). */
+#ifndef PGM_BN_GLU
+#define PGM_BN_GLU PGM_BN
+#endif
+#define PGM_WN_GLU (PGM_BN_GLU / PGM_WARPS_N)
+#define PGM_NFRAG_GLU (PGM_WN_GLU / 8)
+#define PGM_BBUF_GLU (PGM_BN_GLU * PGM_BKSTRIDE)
 /* Pipeline depth. Plain GEMM rings STAGES buffers of (A,B); GEMM_GLU rings GLU_STAGES of (A,Bg,Bu).
  * Arena (bf16) = the max claim. STAGES=3 plain -> 3*(ABUF+BBUF)=30720; GLU_STAGES=2 -> 2*(ABUF+2*BBUF)
  * =30720. Both = 30720 bf16 (60.0 KiB). That is under flash-prefill's 77.5 KiB, so the megakernel's
@@ -749,7 +760,7 @@ static __device__ void d_gemv_qkv(__nv_bfloat16* __restrict__ Cq, __nv_bfloat16*
 #define PGM_GLU_STAGES 2
 #endif
 #define PGM_ARENA_PLAIN (PGM_STAGES * (PGM_ABUF + PGM_BBUF))
-#define PGM_ARENA_GLU (PGM_GLU_STAGES * (PGM_ABUF + 2 * PGM_BBUF))
+#define PGM_ARENA_GLU (PGM_GLU_STAGES * (PGM_ABUF + 2 * PGM_BBUF_GLU))
 #define PGM_ARENA_PGM (PGM_ARENA_PLAIN > PGM_ARENA_GLU ? PGM_ARENA_PLAIN : PGM_ARENA_GLU)
 /* sm_90a fork (op_gemm_sm90.cuh): the wgmma 128-BYTE-swizzle descriptor needs each logical smem
  * row to be exactly 128 B, so the K-tile deepens to 64 bf16 / 128 e4m3 and one pipeline stage is
@@ -847,12 +858,14 @@ __device__ __forceinline__ void pgm_stage_a(__nv_bfloat16* Ad, const __nv_bfloat
     }
 }
 /* cp.async-stage a [BN][BK] tile of B (weight [n][k], row n = output n) into its NATURAL [n][k] smem
- * layout — the mma B fragment is later read with ldmatrix.x2 non-.trans. */
-__device__ __forceinline__ void pgm_stage_b(__nv_bfloat16* Bd, const __nv_bfloat16* __restrict__ B,
+ * layout — the mma B fragment is later read with ldmatrix.x2 non-.trans. Templated on BN so
+ * GEMM_GLU can stage its own (narrower) N-tile through the same body — see PGM_BN_GLU. */
+template <int BN>
+__device__ __forceinline__ void pgm_stage_b_t(__nv_bfloat16* Bd, const __nv_bfloat16* __restrict__ B,
                                             int tid, int tn, int kbase, unsigned n, unsigned k,
                                             int kend) {
     const int KCH = PGM_BK / 8;
-    for (int L = tid; L < PGM_BN * KCH; L += (int)PLOW_NV_THREADS) {
+    for (int L = tid; L < BN * KCH; L += (int)PLOW_NV_THREADS) {
         const int row = L / KCH, kk8 = (L % KCH) * 8;
         const int nn = tn + row, kk = kbase + kk8;
         const bool in = (nn < (int)n) && (kk + 8 <= kend);
@@ -860,15 +873,26 @@ __device__ __forceinline__ void pgm_stage_b(__nv_bfloat16* Bd, const __nv_bfloat
         pgm_cp_async_cg16(&Bd[row * PGM_BKSTRIDE + kk8], g, in ? 16 : 0);
     }
 }
-/* Read one warp's B fragments (PGM_NFRAG of them) for k-slice kf out of a [n][k] stage buffer. */
-__device__ __forceinline__ void pgm_load_bfrags(unsigned (&bf)[PGM_NFRAG][2], __nv_bfloat16* Bd,
+__device__ __forceinline__ void pgm_stage_b(__nv_bfloat16* Bd, const __nv_bfloat16* __restrict__ B,
+                                            int tid, int tn, int kbase, unsigned n, unsigned k,
+                                            int kend) {
+    pgm_stage_b_t<PGM_BN>(Bd, B, tid, tn, kbase, n, k, kend);
+}
+/* Read one warp's B fragments for k-slice kf out of a [n][k] stage buffer. Templated on
+ * (WN, NFRAG) for the same reason as pgm_stage_b_t above. */
+template <int WN, int NFRAG>
+__device__ __forceinline__ void pgm_load_bfrags_t(unsigned (&bf)[NFRAG][2], __nv_bfloat16* Bd,
                                                 int wn, int kf, int lane) {
 #pragma unroll
-    for (int nj = 0; nj < PGM_NFRAG; nj++) {
-        const int n = wn * PGM_WN + nj * 8 + (lane & 7);
+    for (int nj = 0; nj < NFRAG; nj++) {
+        const int n = wn * WN + nj * 8 + (lane & 7);
         const int kcol = kf + ((lane >> 3) & 1) * 8;
         pgm_ldmatrix_x2(bf[nj], &Bd[n * PGM_BKSTRIDE + kcol]);
     }
+}
+__device__ __forceinline__ void pgm_load_bfrags(unsigned (&bf)[PGM_NFRAG][2], __nv_bfloat16* Bd,
+                                                int wn, int kf, int lane) {
+    pgm_load_bfrags_t<PGM_WN, PGM_NFRAG>(bf, Bd, wn, kf, lane);
 }
 /* Read one warp's A fragments (PGM_MFRAG) for k-slice kf out of a [m][k] stage buffer. */
 __device__ __forceinline__ void pgm_load_afrags(unsigned (&af)[PGM_MFRAG][4], __nv_bfloat16* Ad,
@@ -975,30 +999,31 @@ static __device__ void d_gemm_glu(__nv_bfloat16* __restrict__ C, const __nv_bflo
 #if PGM90_FORK_GLU
     d_gemm_glu_sm90(C, A, Wg, Wu, m, n, k, act, slice, nblk, arena);
 #else
-    /* Ring of GLU_STAGES buffers, each holding (A, Bg, Bu) for one K-tile. */
+    /* Ring of GLU_STAGES buffers, each holding (A, Bg, Bu) for one K-tile. Bg/Bu use the
+     * GLU-specific N-tile (PGM_BN_GLU), independent of the plain body's PGM_BN. */
     __nv_bfloat16* As = arena;                                    /* [GLU_STAGES][BM][ASTRIDE] */
-    __nv_bfloat16* Bgs0 = arena + PGM_GLU_STAGES * PGM_ABUF;      /* [GLU_STAGES][BN][BKSTRIDE] */
-    __nv_bfloat16* Bus0 = Bgs0 + PGM_GLU_STAGES * PGM_BBUF;       /* [GLU_STAGES][BN][BKSTRIDE] */
+    __nv_bfloat16* Bgs0 = arena + PGM_GLU_STAGES * PGM_ABUF;      /* [GLU_STAGES][BN_GLU][BKSTRIDE] */
+    __nv_bfloat16* Bus0 = Bgs0 + PGM_GLU_STAGES * PGM_BBUF_GLU;   /* [GLU_STAGES][BN_GLU][BKSTRIDE] */
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int wm = warp / PGM_WARPS_N, wn = warp % PGM_WARPS_N;
     const int tiles_m = (m + PGM_BM - 1) / PGM_BM;
-    const int tiles_n = (n + PGM_BN - 1) / PGM_BN;
+    const int tiles_n = (n + PGM_BN_GLU - 1) / PGM_BN_GLU;
     const int ntiles = tiles_m * tiles_n;
     const int ksteps = (k + PGM_BK - 1) / PGM_BK;
 
     for (int tile = (int)slice; tile < ntiles; tile += (int)nblk) {
         const int tm = (tile / tiles_n) * PGM_BM;
-        const int tn = (tile % tiles_n) * PGM_BN;
-        float accg[PGM_MFRAG][PGM_NFRAG][4], accu[PGM_MFRAG][PGM_NFRAG][4];
+        const int tn = (tile % tiles_n) * PGM_BN_GLU;
+        float accg[PGM_MFRAG][PGM_NFRAG_GLU][4], accu[PGM_MFRAG][PGM_NFRAG_GLU][4];
 #pragma unroll
         for (int i = 0; i < PGM_MFRAG; i++)
-            for (int j = 0; j < PGM_NFRAG; j++)
+            for (int j = 0; j < PGM_NFRAG_GLU; j++)
                 for (int e = 0; e < 4; e++) { accg[i][j][e] = 0.f; accu[i][j][e] = 0.f; }
 
         auto stage = [&](int ks, int buf) {
             pgm_stage_a(As + buf * PGM_ABUF, A, tid, tm, ks * PGM_BK, m, k, 0);
-            pgm_stage_b(Bgs0 + buf * PGM_BBUF, Wg, tid, tn, ks * PGM_BK, n, k, (int)k);
-            pgm_stage_b(Bus0 + buf * PGM_BBUF, Wu, tid, tn, ks * PGM_BK, n, k, (int)k);
+            pgm_stage_b_t<PGM_BN_GLU>(Bgs0 + buf * PGM_BBUF_GLU, Wg, tid, tn, ks * PGM_BK, n, k, (int)k);
+            pgm_stage_b_t<PGM_BN_GLU>(Bus0 + buf * PGM_BBUF_GLU, Wu, tid, tn, ks * PGM_BK, n, k, (int)k);
         };
 
 #pragma unroll
@@ -1014,19 +1039,19 @@ static __device__ void d_gemm_glu(__nv_bfloat16* __restrict__ C, const __nv_bflo
             __syncthreads();
             const int cb = ks % PGM_GLU_STAGES;
             __nv_bfloat16* Ad = As + cb * PGM_ABUF;
-            __nv_bfloat16* Bgd = Bgs0 + cb * PGM_BBUF;
-            __nv_bfloat16* Bud = Bus0 + cb * PGM_BBUF;
+            __nv_bfloat16* Bgd = Bgs0 + cb * PGM_BBUF_GLU;
+            __nv_bfloat16* Bud = Bus0 + cb * PGM_BBUF_GLU;
 #pragma unroll
             for (int kf = 0; kf < PGM_BK; kf += 16) {
                 unsigned af[PGM_MFRAG][4];
                 pgm_load_afrags(af, Ad, wm, kf, lane);
-                unsigned bg[PGM_NFRAG][2], bu[PGM_NFRAG][2];
-                pgm_load_bfrags(bg, Bgd, wn, kf, lane);
-                pgm_load_bfrags(bu, Bud, wn, kf, lane);
+                unsigned bg[PGM_NFRAG_GLU][2], bu[PGM_NFRAG_GLU][2];
+                pgm_load_bfrags_t<PGM_WN_GLU, PGM_NFRAG_GLU>(bg, Bgd, wn, kf, lane);
+                pgm_load_bfrags_t<PGM_WN_GLU, PGM_NFRAG_GLU>(bu, Bud, wn, kf, lane);
 #pragma unroll
                 for (int mi = 0; mi < PGM_MFRAG; mi++)
 #pragma unroll
-                    for (int nj = 0; nj < PGM_NFRAG; nj++) {
+                    for (int nj = 0; nj < PGM_NFRAG_GLU; nj++) {
                         pgm_mma(accg[mi][nj], af[mi], bg[nj], accg[mi][nj]);
                         pgm_mma(accu[mi][nj], af[mi], bu[nj], accu[mi][nj]);
                     }
@@ -1036,9 +1061,9 @@ static __device__ void d_gemm_glu(__nv_bfloat16* __restrict__ C, const __nv_bflo
 #pragma unroll
         for (int mi = 0; mi < PGM_MFRAG; mi++)
 #pragma unroll
-            for (int nj = 0; nj < PGM_NFRAG; nj++) {
+            for (int nj = 0; nj < PGM_NFRAG_GLU; nj++) {
                 int gr = wm * PGM_WM + mi * 16 + (lane / 4);
-                int gc = wn * PGM_WN + nj * 8 + (lane % 4) * 2;
+                int gc = wn * PGM_WN_GLU + nj * 8 + (lane % 4) * 2;
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
                     int rr = tm + gr + (e / 2) * 8;

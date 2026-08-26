@@ -195,6 +195,31 @@ python3 perf-data/tools/vllm_gemma4_launch.py serve /workspace/models/gemma-4-12
 requests concurrently, slightly short of a clean c16; `0.95` OOM'd during CUDA-graph capture,
 don't go there again without backing off `--kv-cache-memory` explicitly first.)
 
+## Update, 2026-08-25 (later session): prefill Phases 0-2 run, no win — see full record
+
+`perf-data/prefill-vllm-iteration-2026-08-25.md` has the complete writeup. Headline:
+
+- This pod's `/workspace` (models/venvs/cubins) survived the restart this handoff anticipated,
+  but `/nix`'s store contents did NOT (different glibc derivation) — `plowc`/`plowrt` needed a
+  `nix build` rebuild before anything else could run. Also: **plow and vLLM cannot share this
+  32 GB card concurrently** — they must be brought up sequentially, not side-by-side as the
+  original comparison protocol's port-8080/8081 framing implied.
+- Item 4 below (`FASTPF`/`PLOW_NV_FA_FP8PV`) turned out to gate **fp8-KV prefill only** — the
+  actual bf16-KV baseline object has nothing for either knob to flip. Not a cheap rebuild-only
+  A/B as scoped here; skipped.
+- Item 6's citation of `perf-data/px9-gemm-body.md`/`px3-bn64-occ2.md` was under-scoped: those
+  reports measured the **w8a8** GEMM body, not the **bf16** body this baseline (and vLLM's own
+  bf16 comparison arm) actually runs. Implemented and oracle/register-validated a `PGM_BN_GLU`
+  selector on the real bf16 `d_gemm_glu` anyway (best-evidenced structural argument available) —
+  measured **+10.5-10.8% WORSE** TTFT at all three context lengths, reproducibly. Reverted
+  (default-preserving; the knob stays in tree, unused). Root cause: bf16's 2 B/element makes the
+  activation-re-read bandwidth cost of a narrower N-tile bite harder than the register-pressure
+  relief helps, the reverse of the w8a8 regime PX-9 measured.
+- **Net: the 28-39% prefill gap vs vLLM is unchanged.** Phases 0-2 of the follow-on plan
+  (`/root/.claude/plans/zazzy-skipping-hellman.md`) are exhausted for this bf16-vs-bf16
+  comparison. The user declined to auto-escalate into Phase 4 (TMA port) — that remains the next
+  lever, gated on explicit go-ahead, per item 6 below.
+
 ## What's left — in priority order (full detail + evidence citations in the plan file)
 
 Read `/root/.claude/plans/cuddly-sleeping-kazoo.md` in full for the complete evidence chain —
@@ -204,8 +229,9 @@ this is a compressed pointer list, not a replacement for it.
 2. Check whether `GV_MM_MAX=16` and `FORCE_MINBLK=2` compose without worse spill than either alone.
 3. Re-sweep `GV_UNROLL`/`PLOW_NS_ABS` alongside `GV_MM_MAX` (reconcile the B=8 discrepancy with
    `perf-data/px15-tunedb-sm120.md` noted in the sandbox report §2).
-4. FASTPF on/off A/B and `PLOW_NV_FA_FP8PV` on prefill (not attempted yet, now directly
-   comparable to a live vLLM baseline).
+4. ~~FASTPF on/off A/B and `PLOW_NV_FA_FP8PV` on prefill~~ — **does not apply to the bf16-KV
+   baseline object; see the 2026-08-25 update above.** Only relevant if a genuine fp8-KV prefill
+   asset is built and compared against a like-for-like (fp8) vLLM baseline.
 5. Populate `tunedb` properly (`tunedb-decode ingest`) instead of hand A/Bs.
 6. **The big lever — tensor-core batched fp8 GEMV integration** (Phase 2 of the plan). Real
    kernel-numerics work: new w8a8 precision path, split-K global-partials-buffer + finalize pass,
