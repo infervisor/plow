@@ -10,6 +10,21 @@ OUTDIR="${BRINGUP_OUT:-/tmp/bringup-$USER}/gate-out"
 mkdir -p "$OUTDIR"
 LOG="$OUTDIR/serve-$TAG.log"
 
+python3 - "$ASSETS/build.json" <<'EOF'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+if not p.is_file():
+    raise SystemExit(f"missing build manifest: {p}")
+d = json.loads(p.read_text())
+if d.get("schema") != 1:
+    raise SystemExit(f"unsupported build manifest schema in {p}")
+lean = d.get("lean", {})
+if lean.get("verified") is not True or lean.get("oracle") is not True:
+    raise SystemExit(f"unverified build manifest in {p}: lean={lean}")
+if not d.get("pairing", {}).get("hash"):
+    raise SystemExit(f"build manifest has no packet/object pairing hash: {p}")
+EOF
+
 "$PLOWRT" serve --assets "$ASSETS" --port "$PORT" >"$LOG" 2>&1 &
 SPID=$!
 cleanup() {

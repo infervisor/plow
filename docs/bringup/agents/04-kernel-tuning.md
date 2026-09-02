@@ -273,6 +273,33 @@ Record one row per `(candidate, scope, shape, artifact digest)`, with `scope` =
 requires every scope. Never multiply an isolated speedup by layer count to claim
 a network win.
 
+### 3c. General AMD candidate families
+
+Derive these from the emitted graph and live trace; never key the harness on a model name.
+
+1. **Long-sequence recurrence:** replace a serial token recurrence with a chunked parallel scan
+   only when the state transition is associative or has an exact chunk composition. Sweep chunk
+   and subchunk sizes. Carry sequence boundaries and reset metadata from the host; never rebuild
+   them with a blocking device-to-host read. Keep the serial body as the oracle and fallback.
+2. **Ownership-preserving recurrent fusion:** test one workgroup owning a complete recurrent head
+   or state shard and fusing its convolution/state update, normalization and output gate. Account
+   for all deleted intermediate traffic and packet edges. A partial fusion that leaves a grid
+   rendezvous is a separate candidate, not evidence for the whole-head form.
+3. **Skinny projection split-K:** sweep split count by exact `(arch, CU, object digest, op, M, N,
+   K, dtype, layout)` and include the reduction kernel in the timed region. Do not copy a vendor
+   table row or use one split for every rung. Missing/stale rows fall back loudly.
+4. **Grouped sparse work:** tune both expert stages by token bucket and observed expert
+   distribution, including persistent vs non-persistent and atomic vs reduction forms. Gate empty,
+   maximally skewed and random expert bins; finite output and deterministic replay are mandatory.
+5. **Attention split/persistence:** select candidates by decode rung and KV-length bucket. Measure
+   split and merge together, including scratch traffic. Prefer deterministic table lookup at
+   runtime; online timing is a separate experiment and must not enter request latency silently.
+
+For every family, distinguish `compiled`, `qualified`, and `selected` in `build.json` or the
+runtime result. A compiled arm or a populated database is not evidence that production selected
+it. Refuse promotion when the artifact has no manifest, Lean was skipped without an accepted
+reason, or any demanded tuned shape resolves to analytical fallback.
+
 ### 4. Interpret
 
 * Compute the roofline % per family against the **binding** side: bytes/time

@@ -170,6 +170,12 @@ Highest value first; keep only what helps *your* target:
    ladder, re-splits a pending chunk when decode lowers the cap, and keeps
    recurrent requests isolated; `PLOW_PF_BATCH=1` is fair rotation, not
    co-packing. Its ragged-tail chunk (`PLOW_RAGGED_CHUNK`) is on by default.
+   To implement AMD co-packing, extend the packet ABI with per-request row range,
+   slot, KV base/length and recurrent reset metadata; form a token-budgeted ragged
+   batch from compatible compiled rungs; execute with parked-row masks and per-slot
+   state addressing. Partition or prove non-aliasing prefill/decode scratch before
+   overlap. Gate single-request parity, adversarial ragged batches, block latency,
+   then matched C1/C8/C32 serving before changing the statement above.
 4. **Prefix cache** if traffic shares prefixes: `--vmm-prefix` (nvidia;
    `--vmm-block-mib` is the real knob — 64 MiB won at long ctx on the measured
    part) or `--prefix-cache` (amd, recurrent families).
@@ -207,6 +213,9 @@ blocker:
    unstamped recipe gets read as a target on the next part.
 7. Every lever kept was measured on `$GPU`; nothing was carried over from
    another part's campaign as "already tuned".
+8. `build.json` exists and reports `lean.verified=true`; every demanded tuned
+   shape reports selected measurement provenance. A stale or wrong-SKU store is
+   a blocked tuning campaign, not an analytical result that can be called tuned.
 
 ## Pitfalls to actively guard against
 

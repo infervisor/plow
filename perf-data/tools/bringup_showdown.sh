@@ -22,6 +22,18 @@ PORT_PLOW=8093 PORT_VLLM=8085
 # ------------------------------------------------------------------------------
 
 plow_arm() { # <bundle-name> <tag> <PLOW_PF_SEG_PURE value: fp8|1>
+  python3 - "$BUNDLES/$1/build.json" <<'EOF'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+if not p.is_file():
+    raise SystemExit(f"missing build manifest: {p}")
+d = json.loads(p.read_text())
+lean = d.get("lean", {})
+if d.get("schema") != 1 or lean.get("verified") is not True or lean.get("oracle") is not True:
+    raise SystemExit(f"unverified build manifest: {p}")
+if not d.get("pairing", {}).get("hash"):
+    raise SystemExit(f"build manifest has no packet/object pairing hash: {p}")
+EOF
   export PLOW_PF_SEG_DIR="$CUBINS"
   export PLOW_PF_SEG_PURE="$3" PLOW_PF_SEG_FA512=all PLOW_PF_SEG_GRAPH=1
   local LOG="${BRINGUP_OUT:-/tmp/bringup-$USER}/serve-$2.log"

@@ -120,6 +120,18 @@ impl KdaCfg {
         self.conv_dim() as u64 * self.conv_w as u64
     }
 
+    /// Whether the single-row double-buffered Conv3+recurrence body has a compiled shape rung.
+    ///
+    /// This is deliberately geometry-based. The fused body gives one value column to each wave,
+    /// supports the same lane-depth rungs as the serial recurrence, and keeps at most eight
+    /// convolution taps in registers. Other shapes retain the unfused oracle.
+    pub fn supports_conv_state_step_db(&self) -> bool {
+        self.heads > 0
+            && matches!(self.head_dim, 64 | 128 | 256)
+            && self.bv == WG_WAVES
+            && (1..=8).contains(&self.conv_w)
+    }
+
     /// Workgroups for [`DevOp::KdaStateStep`] — `H * D / BV` work items, capped at the CU count.
     ///
     /// `docs/kimi-k3-kda.md` §7.3 requires every proposal to be checked against 256 explicitly,
@@ -527,6 +539,12 @@ fn emit_kda_mixer_ex(
         0,
         "KDA: BV must divide H*D so the column tiles partition the state"
     );
+    if t == 1 && st.conv_state_alt.is_some() {
+        assert!(
+            c.supports_conv_state_step_db(),
+            "KDA Conv3+state-step DB requires H>0, D in {{64,128,256}}, BV={WG_WAVES}, and W in 1..=8"
+        );
+    }
     let all: Vec<u32> = (0..n_cu).collect();
     let bft = |b: &mut Builder, n: String, e: u64| b.tensor(&n, e * 2);
     let f32t = |b: &mut Builder, n: String, e: u64| b.tensor(&n, e * 4);
@@ -1449,6 +1467,68 @@ mod tests {
             } else {
                 assert_eq!(parked, packet::dev::TENSOR_NONE_I);
             }
+        }
+    }
+
+    #[test]
+    fn double_buffered_fusion_is_shape_gated_not_model_gated() {
+        for (heads, head_dim, conv_w, n_cu, blocks) in [
+            (1, 64, 1, 304, 8),
+            (12, 128, 4, 304, 192),
+            (16, 256, 8, 304, 304),
+        ] {
+            let c = KdaCfg {
+                heads,
+                head_dim,
+                conv_w,
+                bv: WG_WAVES,
+                ..k3()
+            };
+            assert!(c.supports_conv_state_step_db());
+            let mut b = Builder::new(n_cu);
+            let hidden = b.tensor("in.hidden", c.hidden as u64 * 2);
+            let pos = b.tensor("in.pos", 4);
+            let w = declare_kda_weights(&mut b, &c, "p.", "l.");
+            let st = declare_kda_state_db(&mut b, &c, "kv.0.", 1, pos);
+            let seed = b.emit(DevOp::Nop, (0..n_cu).collect(), &[], |_| {});
+            emit_kda_mixer_ex(
+                &mut b,
+                &c,
+                &w,
+                &st,
+                "act.kda0.",
+                1,
+                hidden,
+                None,
+                n_cu,
+                false,
+                &[seed],
+                true,
+                false,
+            );
+            let p = b.finish();
+            let fused = p
+                .insts
+                .iter()
+                .find(|i| i.op == DevOp::KdaConvStateStepG as u16)
+                .expect("shape must emit the fused recurrent packet");
+            assert_eq!(fused.i[1], heads);
+            assert_eq!(fused.i[2], head_dim);
+            assert_eq!(fused.i[5], conv_w);
+            assert_eq!(fused.blocks, blocks);
+        }
+
+        for c in [
+            KdaCfg { heads: 0, ..k3() },
+            KdaCfg {
+                head_dim: 32,
+                ..k3()
+            },
+            KdaCfg { bv: 16, ..k3() },
+            KdaCfg { conv_w: 0, ..k3() },
+            KdaCfg { conv_w: 9, ..k3() },
+        ] {
+            assert!(!c.supports_conv_state_step_db());
         }
     }
 

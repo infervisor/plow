@@ -709,6 +709,34 @@ mod amd_serve {
                 .map(|cursor| cursor.frontier as usize)
         }
 
+        /// Device-independent metadata for the next already-planned chunk.
+        ///
+        /// A fresh request has no cursor yet and returns `None`; the caller must
+        /// take the isolated path once to perform admission-time state clear and
+        /// prefix-cache planning. Subsequent chunks can participate in compatible-
+        /// rung pack formation without duplicating either side effect.
+        pub fn prefill_span(&self, slot: usize, max_rows: u32) -> Option<packet::dev::PrefillSpan> {
+            let cur = self.pf.get(slot)?.as_ref()?;
+            let step = *cur.steps.get(cur.next)?;
+            if step.clen > max_rows {
+                return None;
+            }
+            Some(packet::dev::PrefillSpan {
+                row0: 0,
+                n_rows: step.clen,
+                slot: u32::try_from(slot).ok()?,
+                flags: if step.c0 == 0 {
+                    packet::dev::PREFILL_SPAN_RESET_STATE
+                } else {
+                    0
+                },
+                kv_row0: step.c0,
+                kv_len: step.c0.checked_add(step.clen)?,
+                state_slot: u32::try_from(slot).ok()?,
+                program: u32::try_from(step.prog).ok()?,
+            })
+        }
+
         pub fn prefill_turn(&self) -> usize {
             self.prefill_turn
         }

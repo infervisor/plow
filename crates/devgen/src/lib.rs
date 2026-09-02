@@ -970,6 +970,127 @@ fn amd_tuning_cell() -> String {
     tunedb::amd_tuning_cell(amd_target::active().0)
 }
 
+#[derive(Clone, Debug)]
+struct AttentionDecisionReport {
+    hardware: String,
+    n_cu: u32,
+    decode_rung: u32,
+    kv_bucket: &'static str,
+    shape: String,
+    compiled_max_nsplit: u32,
+    compiled_persistent: bool,
+    selected_nsplit: u32,
+    selected_algorithm: &'static str,
+    selected_source: &'static str,
+}
+
+thread_local! {
+    static ATTENTION_DECISIONS: std::cell::RefCell<Vec<AttentionDecisionReport>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+fn clear_attention_decisions() {
+    ATTENTION_DECISIONS.with(|d| d.borrow_mut().clear());
+}
+
+fn attention_decisions() -> Vec<AttentionDecisionReport> {
+    ATTENTION_DECISIONS.with(|d| d.borrow().clone())
+}
+
+/// Exact-cell attention selection. This is compile-time packet policy, not an
+/// online tuner: only qualified records for this arch/CU/rung/KV bucket and
+/// operator geometry can replace the fixed fallback.
+fn select_amd_attention(
+    n_cu: u32,
+    decode_rung: u32,
+    kv_len: u32,
+    shape: String,
+    max_nsplit: u32,
+    fallback_nsplit: u32,
+) -> tunedb::AttentionSelection {
+    let fallback = || tunedb::AttentionSelection {
+        algorithm: tunedb::AttentionAlgorithm::SplitReduce,
+        nsplit: fallback_nsplit.clamp(1, max_nsplit.max(1)),
+        source: tunedb::AttentionSource::FixedFallback,
+    };
+    let hardware = amd_tuning_cell();
+    let records = emit_config::active()
+        .tunedb_root()
+        .and_then(|root| {
+            tunedb::TuneStore::new(std::path::PathBuf::from(root))
+                .load_attention(&hardware)
+                .ok()
+        })
+        .unwrap_or_default();
+    #[cfg(test)]
+    let want = tunedb::Digests {
+        implementation: "test-unprobed".into(),
+        interpreter: "test-unprobed".into(),
+        toolchain: "test-unprobed".into(),
+        oracle: tunedb::ATTENTION_ORACLE.into(),
+    };
+    #[cfg(not(test))]
+    let want = tunedb::Digests {
+        implementation: gfx950_gemm_inventory().build().label(),
+        interpreter: gfx950_gemm_inventory().build().label(),
+        toolchain: gfx950_gemm_inventory().build().toolchain.clone(),
+        oracle: tunedb::ATTENTION_ORACLE.into(),
+    };
+    let cell = tunedb::AttentionCell {
+        hardware,
+        n_cu,
+        decode_rung,
+        kv_bucket: tunedb::KvBucket::of(kv_len),
+        shape,
+    };
+    let selected = if records.is_empty() {
+        fallback()
+    } else {
+        tunedb::select_attention(
+            &records,
+            &cell,
+            &want,
+            tunedb::AttentionCapabilities {
+                max_nsplit,
+                // No distinct persistent-attention body is compiled in the AMD
+                // interpreter today. A record requesting one stays ineligible.
+                persistent: false,
+            },
+            fallback_nsplit,
+        )
+    };
+    if selected.source == tunedb::AttentionSource::Qualified {
+        eprintln!(
+            "  attention tuned: {} -> {:?}/ns{}",
+            cell.key(),
+            selected.algorithm,
+            selected.nsplit
+        );
+    }
+    ATTENTION_DECISIONS.with(|d| {
+        d.borrow_mut().push(AttentionDecisionReport {
+            hardware: cell.hardware.clone(),
+            n_cu,
+            decode_rung,
+            kv_bucket: cell.kv_bucket.label(),
+            shape: cell.shape.clone(),
+            compiled_max_nsplit: max_nsplit,
+            compiled_persistent: false,
+            selected_nsplit: selected.nsplit,
+            selected_algorithm: match selected.algorithm {
+                tunedb::AttentionAlgorithm::SplitReduce => "split_reduce",
+                tunedb::AttentionAlgorithm::Persistent => "persistent",
+            },
+            selected_source: match selected.source {
+                tunedb::AttentionSource::FixedFallback => "fixed_fallback",
+                tunedb::AttentionSource::Qualified => "qualified",
+            },
+        });
+    });
+    selected
+}
+
 /// The prefill GEMM inventory for `isa`, probed once per ISA.
 ///
 /// Memoised per level rather than once globally: the rungs carry their ISA and `runs_on` demands
@@ -5432,6 +5553,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
     // Resolve the unified emit config: either from the CLI (plowc path) or from env vars (legacy).
     // Installed process-wide so deeply nested emit functions can call emit_config::active().
     emit_config::install(_emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env));
+    clear_attention_decisions();
 
     // BEFORE any emitter runs: the GEMV census needs the store's answer in hand by the time
     // the first `Builder::emit_dep` fires. Costs one store read on a `PLOW_TUNE_DUMP` run and
@@ -5544,6 +5666,7 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
                 n_cu,
                 tp,
                 rope_gen,
+                &arch,
                 verify.as_ref(),
                 l2_layout,
             );

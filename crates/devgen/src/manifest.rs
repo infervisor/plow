@@ -1036,6 +1036,31 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
     encoding_features(&mut f, &s);
     let axes = precision_axes(&mut f, &s, &union);
     let t = tuning(&s);
+    let attention: Vec<Value> = crate::attention_decisions()
+        .into_iter()
+        .map(|d| {
+            json!({
+                "cell": {
+                    "hardware": d.hardware,
+                    "n_cu": d.n_cu,
+                    "decode_rung": d.decode_rung,
+                    "kv_bucket": d.kv_bucket,
+                    "shape": d.shape,
+                },
+                "compiled": {
+                    "algorithms": ["split_reduce"],
+                    "max_nsplit": d.compiled_max_nsplit,
+                    "persistent": d.compiled_persistent,
+                },
+                "qualified": d.selected_source == "qualified",
+                "selected": {
+                    "algorithm": d.selected_algorithm,
+                    "nsplit": d.selected_nsplit,
+                    "source": d.selected_source,
+                },
+            })
+        })
+        .collect();
 
     let opcodes: BTreeSet<&str> = union.iter().map(|a| a.op.as_str()).collect();
     let programs: Vec<Value> = progs
@@ -1088,6 +1113,11 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         // judgement reconstructed from the feature booleans by every consumer separately.
         "precision": axes,
         "tuning": t,
+        "attention_policy": {
+            "entries": attention,
+            "runtime_kv_reselection": false,
+            "note": "selection is exact-cell and offline; runtime KV-bucket reselection remains disabled until calibrated records and packet immediate patching are available",
+        },
         // Sits beside `tuning` on purpose: both answer "how much do I trust this
         // artifact?", and both have a value that means "not established".
         "lean": lean_block(lean),

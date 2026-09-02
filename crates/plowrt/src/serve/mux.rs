@@ -1729,7 +1729,7 @@ fn run_one_tick(
                 nv.pf_defer_decode,
                 nv.pf_interleave,
             );
-            let pending = amd_prefill_pick(
+            let isolated = amd_prefill_pick(
                 (0..b.min(slots.len())).filter_map(|i| {
                     let slot = slots[i].as_ref()?;
                     (slot.step == 0).then_some((i, slot.arrived))
@@ -1738,6 +1738,27 @@ fn run_one_tick(
                 e.prefill_turn(),
                 b.min(slots.len()),
             );
+            // Preview packing only under the existing diagnostic flag. Actual dispatch
+            // remains isolated until the device interpreter consumes the span table;
+            // the normal throughput path must not allocate a candidate Vec for no gain.
+            if nv.pf_batch && packlog::on() {
+                let budget = if tick_max == u32::MAX {
+                    u32::MAX
+                } else {
+                    tick_max
+                };
+                let packed = amd_prefill_pack(
+                    (0..b.min(slots.len())).filter_map(|i| {
+                        slots[i].as_ref().filter(|s| s.step == 0)?;
+                        e.prefill_span(i, tick_max)
+                    }),
+                    budget,
+                    e.prefill_turn(),
+                    b.min(slots.len()),
+                );
+                tracing::debug!(spans = packed.len(), "AMD prefill pack preview");
+            }
+            let pending = isolated;
             if let Some(i) = pending {
                 if nv.pf_batch {
                     e.advance_prefill_turn(i);
@@ -2228,6 +2249,52 @@ fn amd_prefill_pick(
             }
         })
         .map(|(slot, _)| slot)
+}
+
+/// Form one ragged AMD prefill pack from already-planned request spans.
+///
+/// All members use the first selected span's compiled program. Rows are packed
+/// densely under `row_budget`; KV and recurrent coordinates remain request-local.
+/// Invalid descriptors are excluded so the caller can retain the isolated path.
+#[cfg(feature = "hsa")]
+fn amd_prefill_pack(
+    candidates: impl IntoIterator<Item = packet::dev::PrefillSpan>,
+    row_budget: u32,
+    start: usize,
+    cap: usize,
+) -> Vec<packet::dev::PrefillSpan> {
+    if row_budget == 0 {
+        return Vec::new();
+    }
+    let cap = cap.max(1);
+    let mut candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|s| {
+            s.n_rows != 0
+                && s.n_rows <= row_budget
+                && s.slot < cap as u32
+                && s.state_slot == s.slot
+                && s.kv_row0.checked_add(s.n_rows) == Some(s.kv_len)
+        })
+        .collect();
+    candidates.sort_unstable_by_key(|s| ((s.slot as usize + cap - start % cap) % cap, s.slot));
+    let Some(program) = candidates.first().map(|s| s.program) else {
+        return Vec::new();
+    };
+    let mut rows = 0u32;
+    let mut out = Vec::new();
+    for mut span in candidates.into_iter().filter(|s| s.program == program) {
+        let Some(next) = rows.checked_add(span.n_rows) else {
+            break;
+        };
+        if next > row_budget {
+            continue;
+        }
+        span.row0 = rows;
+        rows = next;
+        out.push(span);
+    }
+    out
 }
 
 /// RTX-12 chunked packing: per-REQUEST cap on the prefill rows one request may
@@ -2812,6 +2879,78 @@ mod tests {
         assert_eq!(amd_prefill_pick(candidates(), true, 2, 3), Some(2));
         assert_eq!(amd_prefill_pick(candidates(), true, 3, 3), Some(0));
         assert_eq!(amd_prefill_pick([(3, t0), (2, t0)], false, 0, 4), Some(2));
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn amd_prefill_pack_rotates_filters_and_respects_budget() {
+        use packet::dev::{PrefillSpan, PREFILL_SPAN_RESET_STATE};
+
+        let span = |slot, rows, program| PrefillSpan {
+            row0: 99,
+            n_rows: rows,
+            slot,
+            flags: if slot == 0 {
+                PREFILL_SPAN_RESET_STATE
+            } else {
+                0
+            },
+            kv_row0: slot * 10,
+            kv_len: slot * 10 + rows,
+            state_slot: slot,
+            program,
+        };
+
+        // Fair rotation starts at slot 2. Its program defines compatibility;
+        // program 4 is excluded and the remaining rows are densely rebased.
+        let pack = amd_prefill_pack(
+            [span(0, 4, 3), span(1, 2, 4), span(2, 3, 3), span(3, 2, 3)],
+            7,
+            2,
+            4,
+        );
+        assert_eq!(pack.iter().map(|s| s.slot).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(pack.iter().map(|s| s.row0).collect::<Vec<_>>(), [0, 3]);
+        assert!(pack.iter().all(|s| s.program == 3));
+
+        // A candidate that does not fit is skipped rather than exceeding the
+        // token budget, allowing a later compatible short span to fill it.
+        let pack = amd_prefill_pack([span(0, 5, 7), span(1, 2, 7), span(2, 1, 7)], 3, 0, 3);
+        assert_eq!(pack.iter().map(|s| s.slot).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(pack.iter().map(|s| s.row0).collect::<Vec<_>>(), [0, 2]);
+        assert_eq!(pack.iter().map(|s| s.n_rows).sum::<u32>(), 3);
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn amd_prefill_pack_rejects_invalid_descriptors() {
+        use packet::dev::PrefillSpan;
+
+        let valid = PrefillSpan {
+            row0: 0,
+            n_rows: 2,
+            slot: 1,
+            flags: 0,
+            kv_row0: 8,
+            kv_len: 10,
+            state_slot: 1,
+            program: 5,
+        };
+        let mut zero = valid;
+        zero.n_rows = 0;
+        let mut wrong_state = valid;
+        wrong_state.state_slot = 0;
+        let mut wrong_len = valid;
+        wrong_len.kv_len = 11;
+        let mut past_capacity = valid;
+        past_capacity.slot = 4;
+        past_capacity.state_slot = 4;
+
+        assert_eq!(
+            amd_prefill_pack([zero, wrong_state, wrong_len, past_capacity], 8, 0, 4),
+            []
+        );
+        assert_eq!(amd_prefill_pack([valid], 0, 0, 4), []);
     }
 
     /// The batched-engine admission model: a decode tick advances every live

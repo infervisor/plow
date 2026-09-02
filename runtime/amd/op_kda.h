@@ -697,9 +697,97 @@ __device__ __forceinline__ bf16 kda_conv_db_one(
     return f2bf(act_silu(value));
 }
 
-/* B1-only Conv3 + StateStepG candidate. The old and new conv-window banks are distinct for the
+/* Single-row Conv3 + StateStepG candidate. The old and new conv-window banks are distinct for the
  * whole packet, so every value tile can read the old q/k window before tile 0 publishes the next
- * one. This is the cross-workgroup race an in-place fusion cannot avoid. */
+ * one. This is the cross-workgroup race an in-place fusion cannot avoid.
+ *
+ * BV must equal the number of waves: every wave owns one value column. D is selected into a
+ * compile-time lane depth below, just like d_kda_state_step_t. Heads and the CU count are runtime
+ * dimensions; when H*D/BV exceeds nblk a workgroup walks multiple independent value tiles. */
+template <int PL>
+__device__ __forceinline__ void d_kda_conv_state_step_g_t(
+    bf16* output, const bf16* q_raw, const bf16* k_raw, const bf16* v_raw,
+    const bf16* gate_raw, const bf16* beta_raw, float* state, const float* wq, const float* wk,
+    const float* wv, const float* csq_source, const float* csk_source,
+    const float* csv_source, float* csq_target, float* csk_target, float* csv_target,
+    const float* a_log, const float* dt_bias, unsigned H, unsigned D, unsigned BV, unsigned W,
+    unsigned flags, unsigned gate_mode, float scale, float lb, unsigned slice, unsigned nblk,
+    float* lds) {
+    if (H == 0 || D != PL * PLOW_WAVE || BV != PLOW_WAVES || W == 0 || W > 8 ||
+        !(flags & PLOW_KDA_F_QK_L2NORM))
+        __builtin_trap();
+    const unsigned items = H * D / BV;
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 63u;
+    const unsigned wave = tid >> 6;
+    float* l_q = lds;
+    float* l_k = lds + D;
+    float* l_g = lds + 2u * D;
+    float* l_v = lds + 3u * D + 2u * PLOW_WAVES;
+    for (unsigned item = slice; item < items; item += nblk) {
+        const unsigned h = item / (D / BV);
+        const unsigned tile = item % (D / BV);
+        const unsigned hd0 = h * D;
+        float qsum = 0.0f, ksum = 0.0f;
+        if (tid < D) {
+            const unsigned channel = hd0 + tid;
+            const bf16 q =
+                kda_conv_db_one(q_raw, wq, csq_source, csq_target, channel, W, tile == 0);
+            const bf16 k =
+                kda_conv_db_one(k_raw, wk, csk_source, csk_target, channel, W, tile == 0);
+            l_q[tid] = bf2f(q);
+            l_k[tid] = bf2f(k);
+            float gate;
+            const float gate_input = bf2f(gate_raw[channel]) + dt_bias[channel];
+            if (gate_mode == PLOW_KDA_GATE_LOWER_BOUND)
+                gate = lb * kda_sigmoid(__expf(a_log[h]) * gate_input);
+            else
+                gate = -__expf(a_log[h]) * kda_softplus(gate_input);
+            l_g[tid] = __expf(gate);
+            qsum = l_q[tid] * l_q[tid];
+            ksum = l_k[tid] * l_k[tid];
+        }
+        if (tid < BV) {
+            const unsigned channel = hd0 + tile * BV + tid;
+            const bf16 v = kda_conv_db_one(v_raw, wv, csv_source, csv_target, channel, W, true);
+            l_v[tid] = bf2f(v);
+        }
+        qsum = block_sum(qsum, lds + 3u * D);
+        ksum = block_sum(ksum, lds + 3u * D + PLOW_WAVES);
+        const float rq = scale / sqrtf(qsum + 1e-6f);
+        const float rk = 1.0f / sqrtf(ksum + 1e-6f);
+        if (tid < D) {
+            l_q[tid] *= rq;
+            l_k[tid] *= rk;
+        }
+        __syncthreads();
+
+        const unsigned j = tile * BV + wave;
+        float* column = state + (size_t)h * D * D + (size_t)j * D;
+        float sc[PL];
+        float pk = 0.0f;
+#pragma unroll
+        for (unsigned r = 0; r < PL; ++r) {
+            const unsigned d = r * PLOW_WAVE + lane;
+            sc[r] = column[d] * l_g[d];
+            pk += sc[r] * l_k[d];
+        }
+        pk = wave_sum(pk);
+        const float update = kda_sigmoid(bf2f(beta_raw[h])) * (l_v[wave] - pk);
+        float pq = 0.0f;
+#pragma unroll
+        for (unsigned r = 0; r < PL; ++r) {
+            const unsigned d = r * PLOW_WAVE + lane;
+            sc[r] += update * l_k[d];
+            column[d] = sc[r];
+            pq += sc[r] * l_q[d];
+        }
+        pq = wave_sum(pq);
+        if (lane == 0) output[hd0 + j] = f2bf(pq);
+        __syncthreads();
+    }
+}
+
 __device__ void d_kda_conv_state_step_g(
     bf16* output, const bf16* q_raw, const bf16* k_raw, const bf16* v_raw,
     const bf16* gate_raw, const bf16* beta_raw, float* state, const float* wq, const float* wk,
@@ -708,75 +796,23 @@ __device__ void d_kda_conv_state_step_g(
     const float* a_log, const float* dt_bias, unsigned H, unsigned D, unsigned BV, unsigned W,
     unsigned flags, unsigned gate_mode, float scale, float lb, unsigned slice, unsigned nblk,
     float* lds) {
-    if (H != 12 || D != 128 || BV != 8 || W != 4 || !(flags & PLOW_KDA_F_QK_L2NORM))
+    if (D == 64)
+        d_kda_conv_state_step_g_t<1>(
+            output, q_raw, k_raw, v_raw, gate_raw, beta_raw, state, wq, wk, wv, csq_source,
+            csk_source, csv_source, csq_target, csk_target, csv_target, a_log, dt_bias, H, D, BV,
+            W, flags, gate_mode, scale, lb, slice, nblk, lds);
+    else if (D == 128)
+        d_kda_conv_state_step_g_t<2>(
+            output, q_raw, k_raw, v_raw, gate_raw, beta_raw, state, wq, wk, wv, csq_source,
+            csk_source, csv_source, csq_target, csk_target, csv_target, a_log, dt_bias, H, D, BV,
+            W, flags, gate_mode, scale, lb, slice, nblk, lds);
+    else if (D == 256)
+        d_kda_conv_state_step_g_t<4>(
+            output, q_raw, k_raw, v_raw, gate_raw, beta_raw, state, wq, wk, wv, csq_source,
+            csk_source, csv_source, csq_target, csk_target, csv_target, a_log, dt_bias, H, D, BV,
+            W, flags, gate_mode, scale, lb, slice, nblk, lds);
+    else
         __builtin_trap();
-    const unsigned items = H * D / BV;
-    if (slice >= items) return;
-    const unsigned tid = threadIdx.x;
-    const unsigned lane = tid & 63u;
-    const unsigned wave = tid >> 6;
-    const unsigned h = slice / (D / BV);
-    const unsigned tile = slice % (D / BV);
-    float* l_q = lds;
-    float* l_k = lds + D;
-    float* l_g = lds + 2u * D;
-    float* l_v = lds + 3u * D + 2u * PLOW_WAVES;
-    const unsigned hd0 = h * D;
-    float qsum = 0.0f, ksum = 0.0f;
-    if (tid < D) {
-        const unsigned channel = hd0 + tid;
-        const bf16 q = kda_conv_db_one(q_raw, wq, csq_source, csq_target, channel, W, tile == 0);
-        const bf16 k = kda_conv_db_one(k_raw, wk, csk_source, csk_target, channel, W, tile == 0);
-        l_q[tid] = bf2f(q);
-        l_k[tid] = bf2f(k);
-        float gate;
-        const float gate_input = bf2f(gate_raw[channel]) + dt_bias[channel];
-        if (gate_mode == PLOW_KDA_GATE_LOWER_BOUND)
-            gate = lb * kda_sigmoid(__expf(a_log[h]) * gate_input);
-        else
-            gate = -__expf(a_log[h]) * kda_softplus(gate_input);
-        l_g[tid] = __expf(gate);
-        qsum = l_q[tid] * l_q[tid];
-        ksum = l_k[tid] * l_k[tid];
-    }
-    if (tid < BV) {
-        const unsigned channel = hd0 + tile * BV + tid;
-        const bf16 v = kda_conv_db_one(v_raw, wv, csv_source, csv_target, channel, W, true);
-        l_v[tid] = bf2f(v);
-    }
-    qsum = block_sum(qsum, lds + 3u * D);
-    ksum = block_sum(ksum, lds + 3u * D + PLOW_WAVES);
-    const float rq = scale / sqrtf(qsum + 1e-6f);
-    const float rk = 1.0f / sqrtf(ksum + 1e-6f);
-    if (tid < D) {
-        l_q[tid] *= rq;
-        l_k[tid] *= rk;
-    }
-    __syncthreads();
-
-    const unsigned j = tile * BV + wave;
-    float* column = state + (size_t)h * D * D + (size_t)j * D;
-    float sc[2];
-    float pk = 0.0f;
-#pragma unroll
-    for (unsigned r = 0; r < 2; ++r) {
-        const unsigned d = r * PLOW_WAVE + lane;
-        sc[r] = column[d] * l_g[d];
-        pk += sc[r] * l_k[d];
-    }
-    pk = wave_sum(pk);
-    const float update = kda_sigmoid(bf2f(beta_raw[h])) * (l_v[wave] - pk);
-    float pq = 0.0f;
-#pragma unroll
-    for (unsigned r = 0; r < 2; ++r) {
-        const unsigned d = r * PLOW_WAVE + lane;
-        sc[r] += update * l_k[d];
-        column[d] = sc[r];
-        pq += sc[r] * l_q[d];
-    }
-    pq = wave_sum(pq);
-    if (lane == 0) output[hd0 + j] = f2bf(pq);
-    (void)nblk;
 }
 #endif
 

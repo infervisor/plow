@@ -1902,6 +1902,35 @@ pub struct StreamEnt {
     pub seg: u16,
 }
 
+/// One request span in a ragged prefill pack.
+///
+/// Rows are dense in activation scratch (`row0..row0+n_rows`) but retain their
+/// request-local KV coordinates and carried-state slot. The descriptor is model
+/// independent; consumers that cannot honor it must execute the span through
+/// the isolated prefill path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct PrefillSpan {
+    /// First row in the packed activation tensors.
+    pub row0: u32,
+    /// Real rows contributed by this request.
+    pub n_rows: u32,
+    /// Decode/KV slot that owns the request.
+    pub slot: u32,
+    /// [`PREFILL_SPAN_RESET_STATE`] when this is the request's first span.
+    pub flags: u32,
+    /// Request-local absolute KV row of `row0`.
+    pub kv_row0: u32,
+    /// Request-local KV length after this span.
+    pub kv_len: u32,
+    /// Slot used for recurrent state; explicit so KV and state layouts may diverge.
+    pub state_slot: u32,
+    /// Compiled prefill program/rung selected for the span.
+    pub program: u32,
+}
+
+pub const PREFILL_SPAN_RESET_STATE: u32 = 1;
+
 /// Everything the interpreter needs, passed once as the kernel's args. The
 /// pointers are **device** addresses, so this is only meaningful as the kernarg
 /// block handed to `plow_interp_*`.
@@ -1996,5 +2025,6 @@ pub struct TraceRec {
 const _: () = assert!(size_of::<Wait>() == 8);
 const _: () = assert!(size_of::<DevInst64>() == 64);
 const _: () = assert!(size_of::<StreamEnt>() == 24);
+const _: () = assert!(size_of::<PrefillSpan>() == 32);
 const _: () = assert!(size_of::<TraceRec>() == 40);
 const _: () = assert!(size_of::<DevProgram>() == 144);

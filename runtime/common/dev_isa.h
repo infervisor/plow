@@ -1188,6 +1188,20 @@ typedef struct {
     uint64_t t_end;    /* finished the op body                          */
 } PlowTraceRec;
 
+/* One request span in a ragged prefill pack. This is metadata only until a
+ * PlowProgram points at a span table; old objects therefore retain their ABI. */
+#define PLOW_PREFILL_SPAN_RESET_STATE 1u
+typedef struct {
+    uint32_t row0;       /* first row in packed activation tensors */
+    uint32_t n_rows;     /* real rows in this request span */
+    uint32_t slot;       /* owning decode/KV slot */
+    uint32_t flags;      /* PLOW_PREFILL_SPAN_* */
+    uint32_t kv_row0;    /* request-local absolute KV row */
+    uint32_t kv_len;     /* request-local KV length after this span */
+    uint32_t state_slot; /* carried-state slot */
+    uint32_t program;    /* compiled prefill program/rung */
+} PlowPrefillSpan;
+
 /* Everything the interpreter needs; passed once as the kernel's args. */
 typedef struct {
     const PlowDevInst*   insts;
@@ -1426,6 +1440,7 @@ PLOW_SASSERT(sizeof(PlowDevInst) == 64, "PlowDevInst size");
  * this only holds if t sits at a 16-byte boundary. */
 PLOW_SASSERT(__builtin_offsetof(PlowDevInst, t) == 16, "PlowDevInst.t must be 16-byte aligned");
 PLOW_SASSERT(sizeof(PlowStreamEnt) == 24, "PlowStreamEnt size");
+PLOW_SASSERT(sizeof(PlowPrefillSpan) == 32, "PlowPrefillSpan size");
 PLOW_SASSERT(sizeof(PlowTraceRec) == 40, "PlowTraceRec size");
 /* GROWING THIS STRUCT: every host must size its kernarg copy with sizeof, never a
  * literal. `plowrt`'s `kernarg_bytes` had `128` baked in; appending `seg_ofs` made

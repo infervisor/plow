@@ -899,6 +899,7 @@ pub(crate) fn k3_emit_full(
     n_cu: u32,
     tp: u32,
     rope_gen: bool,
+    target: &str,
     verify: Option<&crate::VerifyHook>,
     l2_layout: Option<packet::devbuild::L2Layout>,
 ) {
@@ -966,7 +967,7 @@ pub(crate) fn k3_emit_full(
         }
     }
     // Gate BEFORE the bytes land: a rejected program must never exist on disk.
-    crate::apply_verify_gate(&m, verify);
+    let lean = crate::apply_verify_gate(&m, verify);
     std::fs::write(out, m.to_blob()).expect("write k3 devblob");
     eprintln!(
         "kimi_k3: emitted {} layers ({} KDA, {} MLA), tp={tp}, {} tensors, {} decode \
@@ -984,6 +985,7 @@ pub(crate) fn k3_emit_full(
         m.progs.last().map(|p| p.insts.len()).unwrap_or(0),
         m.progs.len(),
     );
+    write_mla_manifest(&m, out, target, MoeEnc::Mxfp4, &lean);
 }
 
 /// The 0-based layer span a K3 emit covers. `K3_NLAYERS` truncates it, and BOTH program kinds are
@@ -1103,7 +1105,7 @@ fn k3_ablate_bodies(m: &mut Model) {
 /// as the flash shrinks and the net is a U-shape whose minimum `mla.rs`'s own `NS_CEIL_MEASURED`
 /// note records as UNSWEPT at TP8. `PLOW_K3_NS` is therefore the sweep handle and the default is
 /// the measured winner; do not change the default without re-running the sweep.
-fn k3_nsplit(ctx: u32) -> u32 {
+fn k3_nsplit_fallback(ctx: u32) -> u32 {
     if let Some(v) = emit_config::active().k3_ns {
         return v.max(1);
     }
@@ -1127,7 +1129,7 @@ fn k3_build_model(
     let c = cfg_kimi_k3(dir);
     let layers = k3_emit_layers(&c);
 
-    let mcfg = K3ModelCfg {
+    let mut mcfg = K3ModelCfg {
         block: crate::k3::K3BlockCfg {
             hidden: c.hidden,
             eps: c.eps,
@@ -1155,7 +1157,7 @@ fn k3_build_model(
             v_head: c.v_head,
             eps: c.eps,
             scale: 1.0 / ((c.qk_nope + c.qk_rope) as f32).sqrt(),
-            n_split: k3_nsplit(ctx),
+            n_split: k3_nsplit_fallback(ctx),
             gf: 4,
             fp8_kv: emit_config::active().fp8_kv,
         },
@@ -1227,6 +1229,14 @@ fn k3_build_model(
     let mut decode = Vec::with_capacity(rungs.len());
     let mut prefill = Vec::with_capacity(pf.len());
     for (i, &t) in decode_build_order.iter().enumerate() {
+        let fallback_ns = k3_nsplit_fallback(ctx);
+        let local_heads = c.heads / tp.max(1);
+        let shape = format!(
+            "mla/dk{}/dr{}/h{}/gf{}",
+            c.kv_lora, c.qk_rope, local_heads, mcfg.mla.gf
+        );
+        mcfg.mla.n_split =
+            crate::select_amd_attention(n_cu, t, ctx, shape, fallback_ns, fallback_ns).nsplit;
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
         // PLOW_L2_PLACE: `None` => byte-identical. Until this line the flag reached the dense-GQA
