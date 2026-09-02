@@ -3653,7 +3653,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             d_xargmax_fin_mega((int*)tens[in->t[0]], (const unsigned long long*)tens[in->t[1]],
                                in->i[0], in->i[1], in->i[2], prog.peer_scratch, prog.n_gpu,
                                prog.rank, xoff, in->i[3], in->i[4], PLOW_XCTR_DEADLINE_TICKS,
-                               xaudit, e.slice);
+                               xaudit, e.slice, sm.am);
         } else if (in->op == PLOW_DOP_XFLASHMERGE) {
             /* STUB: dispatch present so the switch is total and the
              * compiler's structural emit runs; the CP flash LSE-merge body lands with tp-host.

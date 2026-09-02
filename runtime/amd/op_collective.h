@@ -508,13 +508,14 @@ __device__ __forceinline__ void d_xargmax_fin_mega(
     int* ids, const unsigned long long* part, unsigned nparts, unsigned n_batch,
     unsigned vocab_l, const void* const* peer_scratch, uint32_t nranks, uint32_t rank,
     size_t xctr_byte_off, uint32_t gate_id, uint32_t val_id, uint64_t deadline_ticks,
-    uint32_t* status, unsigned slice) {
-    if (slice != 0 || threadIdx.x != 0) return;
+    uint32_t* status, unsigned slice, unsigned long long* lds) {
+    if (slice != 0) return;
     const unsigned B = n_batch ? n_batch : 1u;
     if (B > PLOW_XAMAX_MAX_BATCH) {
-        if (status) *status = 0xBADB0000u | (B & 0xFFFFu);
+        if (threadIdx.x == 0 && status) *status = 0xBADB0000u | (B & 0xFFFFu);
         return;
     }
+    if (B == 1 && threadIdx.x != 0) return;
     auto val_at = [&](const void* base, unsigned b) -> unsigned long long* {
         return (unsigned long long*)PLOW_CTR((uint32_t*)((char*)base + xctr_byte_off),
                                              val_id + (b / PLOW_XAMAX_LINE))
@@ -522,8 +523,9 @@ __device__ __forceinline__ void d_xargmax_fin_mega(
     };
     const unsigned long long* pg = as_glob(part);
 
-    /* local fold + rebase to global vocab index */
-    for (unsigned b = 0; b < B; b++) {
+    /* Rows are independent. Wide decode used to serialize B*nparts comparisons on lane 0;
+     * distribute rows across the interpreter block while keeping each row's reduction order. */
+    for (unsigned b = threadIdx.x; b < B; b += blockDim.x) {
         const unsigned long long* pb = pg + (size_t)b * nparts;
         unsigned long long best = 0;
         for (unsigned i = 0; i < nparts; i++) best = pb[i] > best ? pb[i] : best;
@@ -533,22 +535,27 @@ __device__ __forceinline__ void d_xargmax_fin_mega(
     }
 
     /* publish (the release on the signal RMW orders the stores above), then rendezvous */
-    for (uint32_t r = 0; r < nranks; r++)
-        xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_id));
-    uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_id);
-    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
-    int bailed = 0;
-    while (xctr_poll(lg) < nranks) {
-        if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
-            if (status) *status = 0xDEAD0000u | rank;
-            bailed = 1;
-            break;
+    if (B > 1) __syncthreads();
+    if (threadIdx.x == 0) {
+        lds[0] = 0;
+        for (uint32_t r = 0; r < nranks; r++)
+            xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate_id));
+        uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate_id);
+        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        while (xctr_poll(lg) < nranks) {
+            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+                if (status) *status = 0xDEAD0000u | rank;
+                lds[0] = 1;
+                break;
+            }
+            __builtin_amdgcn_s_sleep(2);
         }
-        __builtin_amdgcn_s_sleep(2);
     }
+    if (B > 1) __syncthreads();
+    const bool bailed = lds[0] != 0;
     if (!bailed) xctr_acquire();
 
-    for (unsigned b = 0; b < B; b++) {
+    for (unsigned b = threadIdx.x; b < B; b += blockDim.x) {
         unsigned long long best = *val_at(peer_scratch[rank], b);
         if (!bailed)
             for (uint32_t r = 0; r < nranks; r++) {

@@ -690,7 +690,8 @@ set(PLOW_GQ_BATCH "1" CACHE STRING "global-queue claim batch")
 # op_gemm.h's PLOW_GEMV_MM default of 1 and wrote row 0 only, so every sequence but the
 # first sampled token 0 off an all-zero logits row -- with a correct B-wide program around
 # it. See scripts/build_gfx950.sh for the full note.
-set(PLOW_DECODE_BATCH "1" CACHE STRING "decode batch bucket (-> PLOW_GEMV_MM)")
+set(PLOW_DECODE_BATCH "1" CACHE STRING "decode batch bucket")
+set(PLOW_GEMV_MM "" CACHE STRING "decode GEMV rows per walk pass (empty = derived)")
 option(PLOW_GEMV_WALK "Walk a <=16-row GEMV object across wider decode batches" OFF)
 option(PLOW_L2_PLACE_DISPATCH "Compile support for L2-domain placed packets" OFF)
 option(PLOW_MLA_PF_V2_ARM "Compile the four-wave MLA prefill V2 arm" OFF)
@@ -726,7 +727,10 @@ if(PLOW_GFX950_HSACO)
     if(PLOW_XR_AGG AND PLOW_HSACO_ARCH STREQUAL "gfx942")
         list(APPEND _hs_ax_prefill -DPLOW_XR_AGG=1)
     endif()
-    # next_pow2(PLOW_DECODE_BATCH), clamped to PLOW_GEMV_MAXM (16). One instantiation with a
+    # next_pow2(PLOW_DECODE_BATCH), clamped to PLOW_GEMV_MAXM (16). Wide gfx950 objects use
+    # MM=8 with the walk: the B128 production A/B retained occupancy 2 and improved output
+    # throughput 10.0% over MM=16. B1..B32 retain their existing derived width.
+    # One instantiation with a
     # runtime M and an `m < M` predicate serves every M <= MM, so the bucket is a ceiling, not
     # an exact width. Do NOT make this a runtime ladder -- that was built, measured at 276
     # registers, and removed (op_gemm.h:2163). Measured cost, ROCm 7.2.4/gfx950 decode object:
@@ -735,6 +739,21 @@ if(PLOW_GFX950_HSACO)
     while(_hs_gvmm LESS PLOW_DECODE_BATCH AND _hs_gvmm LESS 16)
         math(EXPR _hs_gvmm "${_hs_gvmm} * 2")
     endwhile()
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_DECODE_BATCH GREATER 32 AND _hs_gvmm GREATER 8)
+        set(_hs_gvmm 8)
+    endif()
+    if(NOT PLOW_GEMV_MM STREQUAL "")
+        if(NOT PLOW_GEMV_MM MATCHES "^[0-9]+$")
+            message(FATAL_ERROR "PLOW_GEMV_MM must be an integer in 1..16")
+        endif()
+        if(PLOW_GEMV_MM LESS 1 OR PLOW_GEMV_MM GREATER 16)
+            message(FATAL_ERROR "PLOW_GEMV_MM must be in 1..16")
+        endif()
+        if(PLOW_GEMV_MM LESS _hs_gvmm AND NOT PLOW_GEMV_WALK)
+            message(FATAL_ERROR "PLOW_GEMV_MM below the derived decode width requires PLOW_GEMV_WALK=ON")
+        endif()
+        set(_hs_gvmm ${PLOW_GEMV_MM})
+    endif()
     set(_hs_ax_decode -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=${_hs_gvmm})
     if(PLOW_GEMV_WALK)
         list(APPEND _hs_ax_decode -DPLOW_GEMV_WALK=1)
