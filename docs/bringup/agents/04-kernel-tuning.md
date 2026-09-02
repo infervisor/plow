@@ -191,6 +191,88 @@ A fixed 5% target is not proof of improvement. Precision, scale layout and
 tolerance must be identical across arms. Stop at a decisive measured win or
 exhausted hypotheses, not after a fixed number of agent turns.
 
+### 3b. Prefill fusion promotion ladder (AMD)
+
+Keep this procedure model-agnostic. Derive every operator, shape, dtype,
+consumer count, parallel degree and prompt bucket from the emitted artifact and
+the target workload. Exclude speculative/draft-model work from this campaign.
+A fused kernel is not a candidate for network timing until it decisively beats
+the exact unfused sequence it replaces.
+
+#### Discover candidates; do not encode a model recipe
+
+Audit the production trace for these general seams:
+
+- projection + position transform, or related projections sharing an input;
+- attention input projection + attention, including latent/absorbed forms;
+- gate + up projection + activation;
+- sparse routing/sort/align + grouped expert work, empty-bin skipping, and
+  expert output + deterministic combine;
+- collective + residual + normalization;
+- recurrent/state update + gate/normalization;
+- any producer/consumer pair whose intermediate is written to HBM and has one
+  semantic consumer.
+
+Reject a proposed fusion before coding when it duplicates a reduction across
+consumers, changes a required association/order, extends buffer lifetime,
+crosses workgroups without a valid communication mechanism, or makes the
+production object's register/LDS ceiling worse. A decode-only fused opcode is
+not a prefill implementation; absent dispatch arms must refuse loudly rather
+than silently leave an output unwritten.
+
+#### Fast-path and layout audit
+
+For every live shape, record the selected packet opcode, object, device body and
+fallback reason. Library divisibility/alignment constraints can route a valid
+shape onto a much slower generic path. Test native arbitrary-shape support first;
+padding is a candidate only when `fast_path(padded) + pad/unpad` beats the native
+path despite the extra work. Compare against the current AITER/hipBLASLt route
+for the same shape, but do not import its padding, preshuffle or quant layout
+without an end-to-end conversion-cost measurement.
+
+Treat a lower-bit weight/KV format as a system candidate, not a kernel flag:
+include pack/quant/dequant work, scale traffic, persistent weight layout, KV
+capacity/headroom and any change in the minimum feasible TP degree. Do not
+credit memory saved unless the production allocator or topology consumes it.
+
+#### Gates, in order
+
+1. **Paired kernel gate.** Retain a same-revision switch for the exact unfused
+   decomposition. Time that sequence and the fused candidate in one GPU timing
+   region with identical buffers, inputs, scales, routing tables and warmup. The
+   fusion must beat the sequence *as executed*, including launches and
+   materialized intermediates. Verify every deleted intermediate boundary and
+   final output.
+2. **Shape gate.** Cover every emitted bucket plus ragged boundaries, shortest
+   and longest served contexts, supported precisions, minimum/maximum batch,
+   empty sparse partitions, maximum top-k and adversarial imbalance. Audit ISA,
+   VGPR/AGPR/LDS, spills, achieved occupancy and the live route.
+3. **Operator-chain gate.** Put the winner back beside its real producers,
+   consumers and collectives. Reconcile the observed delta with packet counts,
+   intermediate bytes removed and profiler counters. An unexplained inversion
+   blocks promotion.
+4. **Block gate.** Run a real block of each architecture class present in the
+   artifact. A kernel winner that loses the block is rejected.
+5. **Composition gate.** Enable only individually qualified fusions, first in
+   pairs and then as a set. Re-run correctness and timing after every addition;
+   object-wide register, instruction-cache and scheduling effects can reverse
+   isolated wins.
+6. **Network gate.** Emit the complete checkpoint and run cold/prefix-miss and
+   warm/prefix-hit prefill through `plowrt serve` with the same artifacts and
+   client on both arms. Report TTFT distributions, prefill tok/s, memory use and
+   decode regression checks at workload-derived prompt lengths and concurrency.
+
+At network scope, report collective time separately and evaluate the lowest TP
+degree that fits. A topology change is a separate experimental cell, never
+credited to a kernel fusion. Likewise, profile Plow's existing submission path
+before proposing graph capture; capture is a separate runtime experiment, not
+evidence that a fused body improved.
+
+Record one row per `(candidate, scope, shape, artifact digest)`, with `scope` =
+`kernel`, `operator-chain`, `block`, `composed-block`, or `network`. Adoption
+requires every scope. Never multiply an isolated speedup by layer count to claim
+a network win.
+
 ### 4. Interpret
 
 * Compute the roofline % per family against the **binding** side: bytes/time
