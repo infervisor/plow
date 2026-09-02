@@ -1718,11 +1718,30 @@ fn run_one_tick(
             // `--pf-no-interleave` / `PLOW_PF_NO_INTERLEAVE=1` restores the old
             // prefill-only tick.
             let mut did_prefill = false;
-            let no_interleave = crate::config::RuntimeConfig::get().nv.pf_no_interleave;
-            let pending = (0..b.min(slots.len()))
-                .filter(|&i| slots[i].as_ref().is_some_and(|s| s.step == 0))
-                .min_by_key(|&i| slots[i].as_ref().map(|s| s.arrived));
+            let nv = &crate::config::RuntimeConfig::get().nv;
+            let no_interleave = nv.pf_no_interleave;
+            let has_decode = slots[..b.min(slots.len())]
+                .iter()
+                .any(|s| s.as_ref().is_some_and(|s| s.step > 0));
+            let tick_max = amd_prefill_tick_cap(
+                has_decode,
+                no_interleave,
+                nv.pf_defer_decode,
+                nv.pf_interleave,
+            );
+            let pending = amd_prefill_pick(
+                (0..b.min(slots.len())).filter_map(|i| {
+                    let slot = slots[i].as_ref()?;
+                    (slot.step == 0).then_some((i, slot.arrived))
+                }),
+                nv.pf_batch,
+                e.prefill_turn(),
+                b.min(slots.len()),
+            );
             if let Some(i) = pending {
+                if nv.pf_batch {
+                    e.advance_prefill_turn(i);
+                }
                 // §DISAGG phase-0. The AMD tick is EITHER a prefill OR a decode
                 // (this arm returns before the decode launch below), so unlike
                 // the CUDA arm there is no fused launch and `mixed_decode_ns`
@@ -1732,19 +1751,23 @@ fn run_one_tick(
                 // decode_ns)` is the ceiling, not the mixed ratio.
                 let pk_t = packlog::on().then(Instant::now);
                 let slot_ref = slots[i].as_ref().expect("found above");
-                let prompt = slot_ref.prompt_ids.clone();
                 // §TTFT: everything between `mux.submit` and this line — the
                 // dispatcher wake, the formation hold, admission, and the
                 // engine-thread handoff.
                 crate::obs::ttft::QUEUE.add(slot_ref.arrived.elapsed().as_nanos() as u64);
                 let t_pf = std::time::Instant::now();
                 // ONE CHUNK, not the whole prompt. `Ok(None)` means this slot has more chunks to
-                // go; it stays `step == 0`, so the next tick finds it again and advances it —
-                // and in between, the decode below runs for every other slot.
-                let pf = e.prefill_chunked(i, &prompt);
+                // go; it stays `step == 0` for a later tick. The default keeps the oldest prompt
+                // active, while `PLOW_PF_BATCH=1` rotates fairly across pending AMD slots.
+                let pf = e.prefill_chunked_at_most(i, &slot_ref.prompt_ids, tick_max);
+                let frontier = e.prefill_frontier(i).unwrap_or(slot_ref.prompt_ids.len());
                 crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
                 match pf {
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if let Some(slot) = slots[i].as_mut() {
+                            slot.pf_pos = frontier;
+                        }
+                    }
                     Ok(Some(token)) => {
                         if let Some(s) = slots[i].as_mut() {
                             s.pf_pos = s.prompt_ids.len();
@@ -1789,6 +1812,13 @@ fn run_one_tick(
                 if no_interleave {
                     return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
                 }
+                let prefill_remains = slots[..b.min(slots.len())]
+                    .iter()
+                    .any(|s| s.as_ref().is_some_and(|s| s.step == 0));
+                if amd_defer_decode(nv.pf_defer_decode, prefill_remains) {
+                    tracing::debug!("amd: decode deferred while prefill remains");
+                    return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
+                }
             }
 
             // Decode: every live slot feeds the token it last produced.
@@ -1807,8 +1837,47 @@ fn run_one_tick(
             // and not a sum of parts. One tick is one token on the TP path,
             // which is the only shape `PLOW_DECODE_BATCH=1` admits.
             let t_tick = crate::obs::dstep::on().then(Instant::now);
-            match e.step_batch(&feeds) {
-                Ok(out) => {
+            let remaining = feeds
+                .iter()
+                .filter_map(|&(i, _)| slots[i].as_ref())
+                .map(|slot| slot.gen.max_tokens.saturating_sub(slot.out_ids.len()))
+                .min()
+                .unwrap_or(1);
+            let requested = amd_multistep_requested(
+                remaining,
+                steps as usize,
+                crate::config::RuntimeConfig::get().nv.multistep,
+            );
+            let multi = e.multistep_quantum(&feeds, requested);
+            let mut deferred = std::mem::take(&mut obs.host.slot_tokens);
+            let step_result = if let Some(quantum) = multi {
+                e.multi_step(&feeds, quantum, &mut deferred)
+                    .and_then(|quantum| {
+                        for &(i, _) in &feeds {
+                            for step in 0..quantum {
+                                if slots[i].is_none() {
+                                    break;
+                                }
+                                let token = deferred_token(&deferred, i, step, quantum)?;
+                                tracing::debug!(token, slot = i, "amd: token (deferred read)");
+                                handle_produced_token(
+                                    &mut slots[i],
+                                    &arena,
+                                    bundle,
+                                    token,
+                                    1,
+                                    &mut tokens_this_tick,
+                                    Some(stop.as_slice()),
+                                );
+                            }
+                            if slots[i].is_none() {
+                                e.release(i);
+                            }
+                        }
+                        Ok(())
+                    })
+            } else {
+                e.step_batch(&feeds).map(|out| {
                     for (i, token) in out {
                         tracing::debug!(token, slot = i, "amd: token");
                         let t_stream = crate::obs::dstep::on().then(Instant::now);
@@ -1828,6 +1897,12 @@ fn run_one_tick(
                             e.release(i);
                         }
                     }
+                })
+            };
+            obs.host.slot_tokens = deferred;
+            match step_result {
+                Ok(out) => {
+                    let _ = out;
                 }
                 Err(err) => {
                     // The batched launch failed — every fed slot loses.
@@ -2042,6 +2117,17 @@ fn run_one_tick(
     (slots, bufs, obs, tokens_this_tick, false, tick_fault)
 }
 
+fn deferred_token(tokens: &[u32], slot: usize, step: usize, quantum: usize) -> Result<u32> {
+    tokens
+        .get(slot.saturating_mul(quantum).saturating_add(step))
+        .copied()
+        .ok_or_else(|| {
+            crate::RuntimeError::Device(format!(
+                "deferred token ring missing slot {slot} step {step} at quantum {quantum}"
+            ))
+        })
+}
+
 /// Whether a tick's wall time is a valid **decode** service sample. Prefill
 /// ticks are excluded: a chunk-interleaved prefill tick is bounded by design
 /// (`PLOW_PF_INTERLEAVE` rows) and a long prompt runs MANY of them — feeding
@@ -2095,6 +2181,53 @@ fn pf_interleave_rows() -> usize {
 #[cfg(feature = "cuda")]
 fn pf_defer_decode() -> bool {
     crate::config::RuntimeConfig::get().nv.pf_defer_decode
+}
+
+#[cfg(feature = "hsa")]
+fn amd_prefill_tick_cap(
+    has_decode: bool,
+    no_interleave: bool,
+    defer_decode: bool,
+    interleave: u32,
+) -> u32 {
+    if !has_decode || no_interleave || defer_decode || interleave == 0 {
+        u32::MAX
+    } else {
+        interleave
+    }
+}
+
+#[cfg(feature = "hsa")]
+fn amd_defer_decode(enabled: bool, prefill_remains: bool) -> bool {
+    enabled && prefill_remains
+}
+
+#[cfg(feature = "hsa")]
+fn amd_multistep_requested(remaining: usize, scheduler_steps: usize, configured: u32) -> usize {
+    remaining
+        .min(scheduler_steps)
+        .min(configured.max(1) as usize)
+}
+
+#[cfg(feature = "hsa")]
+fn amd_prefill_pick(
+    candidates: impl IntoIterator<Item = (usize, Instant)>,
+    fair: bool,
+    start: usize,
+    cap: usize,
+) -> Option<usize> {
+    let cap = cap.max(1);
+    let start = start % cap;
+    candidates
+        .into_iter()
+        .min_by(|&(slot_a, arrived_a), &(slot_b, arrived_b)| {
+            if fair {
+                ((slot_a + cap - start) % cap).cmp(&((slot_b + cap - start) % cap))
+            } else {
+                (arrived_a, slot_a).cmp(&(arrived_b, slot_b))
+            }
+        })
+        .map(|(slot, _)| slot)
 }
 
 /// RTX-12 chunked packing: per-REQUEST cap on the prefill rows one request may
@@ -2510,6 +2643,21 @@ mod tests {
     }
 
     #[test]
+    fn deferred_token_ring_is_row_major_and_bounds_checked() {
+        let ring = [10, 11, 12, 20, 21, 22];
+        assert_eq!(deferred_token(&ring, 1, 2, 3).unwrap(), 22);
+        assert!(deferred_token(&ring, 2, 0, 3).is_err());
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn amd_multistep_honors_the_runtime_cap() {
+        assert_eq!(amd_multistep_requested(16, 8, 4), 4);
+        assert_eq!(amd_multistep_requested(16, 8, 1), 1);
+        assert_eq!(amd_multistep_requested(3, 8, 4), 3);
+    }
+
+    #[test]
     fn bounded_ingress_reports_full_closed_and_depth() {
         let metrics = Arc::new(Metrics::default());
         let (tx, mut rx) = mpsc::channel(1);
@@ -2642,6 +2790,28 @@ mod tests {
             poisoned.update(420.0);
         }
         assert!(poisoned.get() > 250.0, "control: unfiltered EWMA sheds");
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn amd_prefill_scheduler_controls_are_bounded() {
+        assert_eq!(amd_prefill_tick_cap(false, false, false, 2048), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, true, false, 2048), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, false, false, 0), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, false, true, 2048), u32::MAX);
+        assert_eq!(amd_prefill_tick_cap(true, false, false, 2048), 2048);
+        assert!(amd_defer_decode(true, true));
+        assert!(!amd_defer_decode(true, false));
+        assert!(!amd_defer_decode(false, true));
+
+        let t0 = Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(1);
+        let candidates = || [(0, t0), (1, t1), (2, t1)];
+        assert_eq!(amd_prefill_pick(candidates(), false, 2, 3), Some(0));
+        assert_eq!(amd_prefill_pick(candidates(), true, 1, 3), Some(1));
+        assert_eq!(amd_prefill_pick(candidates(), true, 2, 3), Some(2));
+        assert_eq!(amd_prefill_pick(candidates(), true, 3, 3), Some(0));
+        assert_eq!(amd_prefill_pick([(3, t0), (2, t0)], false, 0, 4), Some(2));
     }
 
     /// The batched-engine admission model: a decode tick advances every live

@@ -843,6 +843,7 @@ const GEMV_CAP_SYM_PREFIX: &str = "plow_gemv_mm_cap_";
 /// before the walk existed, and every object built with it off, carries no such
 /// symbol and is a hard-capacity object exactly as before.
 const GEMV_WALK_SYM: &str = "plow_gemv_walk_1";
+const XARGMAX_B128_SYM: &str = "plow_xargmax_max_batch_128";
 
 /// `PLOW_GEMV_MAXM` from `runtime/amd/op_gemm.h` — the widest bucket the GEMV
 /// path can be instantiated at, and therefore the widest any object can
@@ -1357,6 +1358,18 @@ fn check_gemv_capacity(syms: &[&str], path: &Path, need: u32) -> Result<()> {
     }
 }
 
+fn check_xargmax_capacity(syms: &[&str], path: &Path, need: u32) -> Result<()> {
+    if need <= 32 || syms.contains(&XARGMAX_B128_SYM) {
+        return Ok(());
+    }
+    Err(RuntimeError::Device(format!(
+        "packet/object XArgmax MISMATCH: decode needs {need} rows, but {} does not advertise \
+         `{XARGMAX_B128_SYM}`. A pre-B128 object writes only rows 0..32 and would leave the \
+         remaining sampled ids stale. Rebuild the decode object from the current tree.",
+        path.display()
+    )))
+}
+
 /// Is the V2 MLA-prefill routing enabled (`PLOW_MLA_PF_V2=1`)?
 ///
 /// Opt-in: it moves `FlashMlaPrefill` segments onto the 4-wave flash object, whose
@@ -1506,9 +1519,19 @@ const LAUNCH_ROWS: u32 = 416;
 /// shrink in [`rebase_chunk_rows`] makes padded rows cost nothing, so the cover
 /// is simply the fewest launches, `ceil(n / max_bucket)`. See the branch below.
 pub fn plan_chunks(buckets: &[u32], n_prompt: u32) -> Result<Vec<u32>> {
+    plan_chunks_capped(buckets, n_prompt, u32::MAX)
+}
+
+/// Plan from compiled prefill rungs no wider than `max_bucket`.
+pub fn plan_chunks_capped(buckets: &[u32], n_prompt: u32, max_bucket: u32) -> Result<Vec<u32>> {
     let cfg = &crate::config::RuntimeConfig::get().amd;
+    let eligible: Vec<u32> = buckets
+        .iter()
+        .copied()
+        .filter(|&b| b > 0 && b <= max_bucket)
+        .collect();
     plan_chunks_cfg(
-        buckets,
+        &eligible,
         n_prompt,
         cfg.launch_rows.unwrap_or(LAUNCH_ROWS),
         cfg.ragged_chunk,
@@ -3056,6 +3079,18 @@ struct XAuditArgs {
 
 #[derive(Clone, Copy)]
 #[repr(C)]
+struct TokenCaptureArgs {
+    ids: u64,
+    ring: u64,
+    step: u32,
+    quantum: u32,
+    batch: u32,
+}
+
+pub(crate) const DEFERRED_TOKEN_MAX_STEPS: usize = 4;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
 struct StateClearRange {
     base: u64,
     slot_stride: u64,
@@ -3306,6 +3341,8 @@ pub struct AmdEngine {
     k_decode: HsaKernel,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
+    k_token_capture: Option<HsaKernel>,
+    d_token_ring: Option<DeviceMem>,
     /// Task-13: low-rung decode tier ladder, ascending (max_rung, kernel).
     decode_tiers: Vec<(u32, HsaKernel)>,
     k_flash: Option<HsaKernel>,
@@ -3608,6 +3645,7 @@ impl AmdEngine {
             let pt: Vec<u32> = blob.progs.iter().map(|p| p.t).collect();
             packet::devbuild::decode_rung_lo(&pt)
         };
+        let max_decode_batch = blob.progs[dec_ix..].iter().map(|p| p.t).max().unwrap_or(1);
 
         // THIS USED TO ASK `p.t == 1` / `p.t > 1`, WHICH IS A BUG A BATCHED BLOB ALREADY HAD.
         // A decode program emitted at `PLOW_DECODE_BATCH=16` has `t == 16`, so it counted as a
@@ -3842,6 +3880,7 @@ impl AmdEngine {
         let mut modules = Vec::new();
         let mut k_xaudit = None;
         let mut k_state_clear = None;
+        let mut k_token_capture = None;
         let state_clear_device = crate::config::RuntimeConfig::get().amd.state_clear_device;
         // Task-13 per-rung co-load: an optional SECOND decode object for the low
         // rungs (PLOW_HSACO_LOWRUNG=<dir>), so rung 1-2 traffic runs the tight
@@ -3943,20 +3982,27 @@ impl AmdEngine {
                         }
                     }
                 }
-                // The object's compiled row bucket vs the widest GEMV it will run.
-                // Every phase, not just decode: `case PLOW_DOP_GEMV` is unconditional
-                // in the prefill bucket too.
-                let need = match phase {
-                    Phase::Decode => gemv_need.unwrap_or(need_m_decode),
-                    Phase::Prefill | Phase::Flash => need_m_prefill,
-                };
-                check_gemv_capacity(&syms, &path, need)?;
+                // The standalone flash object contains only flash-prefill arms. Model and
+                // GEMV capability checks belong to the general prefill/decode objects; applying
+                // them here rejects the intentionally model-neutral flash object.
+                if phase != Phase::Flash {
+                    let need = match phase {
+                        Phase::Decode => gemv_need.unwrap_or(need_m_decode),
+                        Phase::Prefill => need_m_prefill,
+                        Phase::Flash => unreachable!(),
+                    };
+                    check_gemv_capacity(&syms, &path, need)?;
+                }
+                if phase == Phase::Decode {
+                    check_xargmax_capacity(&syms, &path, gemv_need.unwrap_or(max_decode_batch))?;
+                }
                 // Whether this object carries the PLOW_K3 arms the packet dispatches. Refused here
                 // rather than tolerated, because AMD's dispatch default is a silent NOP: the run
                 // would otherwise complete on untouched buffers instead of failing.
                 let need_k3 = match phase {
                     Phase::Decode => need_k3_decode,
-                    Phase::Prefill | Phase::Flash => need_k3_prefill,
+                    Phase::Prefill => need_k3_prefill,
+                    Phase::Flash => None,
                 };
                 check_k3_arms(&syms, &path, need_k3)?;
                 if phase == Phase::Decode {
@@ -3965,7 +4011,8 @@ impl AmdEngine {
                 }
                 let (need_gm, need_gmpf) = match phase {
                     Phase::Decode => (need_gm_decode, need_gmpf_decode),
-                    Phase::Prefill | Phase::Flash => (need_gm_prefill, need_gmpf_prefill),
+                    Phase::Prefill => (need_gm_prefill, need_gmpf_prefill),
+                    Phase::Flash => (None, None),
                 };
                 check_moe_gemma_arms(&syms, &path, need_gm, need_gmpf)?;
                 if phase == Phase::Flash && need_mla_v2 && !syms.contains(&MLA_PF_V2_SYM) {
@@ -3973,8 +4020,8 @@ impl AmdEngine {
                         "PLOW_MLA_PF_V2=1 routes FlashMlaPrefill segments to {}, but it was \
                      compiled without the V2 arm (no `{MLA_PF_V2_SYM}`). The dispatch default \
                      writes NOTHING, so those packets would silently skip. Rebuild the flash \
-                     object (scripts/build_gfx942.sh adds -DPLOW_MLA_PF_V2_ARM=1) or unset \
-                     PLOW_MLA_PF_V2.",
+                     object (`-DPLOW_MLA_PF_V2_ARM=ON` in runtime/CMakeLists.txt; \
+                     scripts/build_gfx942.sh enables it) or unset PLOW_MLA_PF_V2.",
                         path.display()
                     )));
                 }
@@ -4038,6 +4085,13 @@ impl AmdEngine {
                             ))
                         })?,
                     );
+                }
+                if phase == Phase::Decode
+                    && k_token_capture.is_none()
+                    && syms.contains(&"plow_token_capture")
+                {
+                    k_token_capture =
+                        Some(EngineDevice::get_function(&*be, &m, "plow_token_capture")?);
                 }
                 // STALE-OBJECT REFUSAL. An object's kernarg segment is its explicit
                 // args, 8-aligned, plus the COv5 implicit block — a FIXED 256 B tail
@@ -4797,13 +4851,15 @@ impl AmdEngine {
         // batch above the bucket cap is servable and `check_gemv_capacity` —
         // which sees the actual object — is the gate that refuses a NON-walking
         // object at need > cap, with the correct message. What remains here is
-        // a sanity bound: XArgmaxFin's two-line fold caps sequences at 32
+        // a sanity bound: XArgmaxFin's bounded fold caps sequences at 128
         // (PLOW_XAMAX_MAX_BATCH), and nothing above it has ever been emitted.
-        if batch > 32 {
+        if batch > packet::devbuild::XARGMAX_MAX_BATCH as usize {
             return Err(RuntimeError::Device(format!(
-                "blob is compiled PLOW_DECODE_BATCH={batch}, past the XArgmaxFin two-line \
-                 fold's 32-sequence ceiling (PLOW_XAMAX_MAX_BATCH, runtime/amd/op_collective.h). \
-                 Re-emit at PLOW_DECODE_BATCH <= 32."
+                "blob is compiled PLOW_DECODE_BATCH={batch}, past the XArgmaxFin fold's \
+                 {}-sequence ceiling (PLOW_XAMAX_MAX_BATCH, runtime/amd/op_collective.h). \
+                 Re-emit at PLOW_DECODE_BATCH <= {}.",
+                packet::devbuild::XARGMAX_MAX_BATCH,
+                packet::devbuild::XARGMAX_MAX_BATCH
             )));
         }
 
@@ -5004,6 +5060,9 @@ impl AmdEngine {
             );
         let mut h_zero = EngineDevice::host_alloc_pinned(&*be, max_ctr.max(4))?;
         h_zero.as_mut_slice().fill(0);
+        let d_token_ring = k_token_capture
+            .map(|_| EngineDevice::alloc(&*be, (batch * DEFERRED_TOKEN_MAX_STEPS * 4) as u64))
+            .transpose()?;
 
         let (kvrow, kvrow_i2) = if blob.kvrow.is_empty() {
             derive_kvrow(&blob.progs[decode], &names)
@@ -5059,6 +5118,8 @@ impl AmdEngine {
             k_decode,
             k_xaudit,
             k_state_clear,
+            k_token_capture,
+            d_token_ring,
             decode_tiers,
             k_flash,
             sched_prefill,
@@ -5426,6 +5487,78 @@ impl AmdEngine {
             None,
         )?;
         self.seg_launches += 1;
+        Ok(())
+    }
+
+    pub(crate) fn deferred_token_capture_available(&self) -> bool {
+        self.k_token_capture.is_some() && self.d_token_ring.is_some()
+    }
+
+    /// Queue a copy of the sampled ids after the current decode dispatch.
+    /// No drain: the caller owns the existing per-token drain/audit boundary.
+    pub(crate) fn enqueue_token_capture(
+        &self,
+        step: usize,
+        quantum: usize,
+        batch: usize,
+    ) -> Result<()> {
+        if step >= quantum || quantum > DEFERRED_TOKEN_MAX_STEPS || batch > self.batch || batch == 0
+        {
+            return Err(RuntimeError::Device(format!(
+                "invalid deferred token capture step={step} quantum={quantum} batch={batch}"
+            )));
+        }
+        let kernel = self.k_token_capture.ok_or_else(|| {
+            RuntimeError::Rejected("decode object has no plow_token_capture helper".into())
+        })?;
+        let ring = self
+            .d_token_ring
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Device("deferred token ring is absent".into()))?;
+        let args = TokenCaptureArgs {
+            ids: self.devp[self.need(self.t_ids, "in.ids")?].base,
+            ring: ring.base,
+            step: step as u32,
+            quantum: quantum as u32,
+            batch: batch as u32,
+        };
+        EngineDevice::launch_kernel(
+            &*self.be,
+            kernel,
+            (batch as u32).div_ceil(256),
+            256,
+            0,
+            as_bytes(std::slice::from_ref(&args)),
+            None,
+        )
+    }
+
+    /// Read one completed row-major `[batch][quantum]` capture into `out`.
+    pub(crate) fn read_token_capture(
+        &mut self,
+        batch: usize,
+        quantum: usize,
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
+        if quantum == 0 || quantum > DEFERRED_TOKEN_MAX_STEPS || batch > self.batch {
+            return Err(RuntimeError::Device(format!(
+                "invalid deferred token read quantum={quantum} batch={batch}"
+            )));
+        }
+        let bytes = batch * quantum * 4;
+        let src = self
+            .d_token_ring
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Device("deferred token ring is absent".into()))?
+            .base;
+        self.be
+            .memcpy_dtoh_pinned(&mut self.h_scalar.as_mut_slice()[..bytes], src)?;
+        out.clear();
+        out.extend(
+            self.h_scalar.as_slice()[..bytes]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().expect("4"))),
+        );
         Ok(())
     }
 
@@ -5943,6 +6076,11 @@ impl AmdEngine {
 
     /// The chunk plan for a prompt, from the compiled bucket ladder.
     pub fn plan_for(&self, n_prompt: u32) -> Result<Vec<u32>> {
+        self.plan_for_at_most(n_prompt, u32::MAX)
+    }
+
+    /// The chunk plan using only compiled rungs no wider than `max_bucket`.
+    pub fn plan_for_at_most(&self, n_prompt: u32, max_bucket: u32) -> Result<Vec<u32>> {
         // Here rather than at load: it is the ONE call every prefill path goes
         // through (`prefill`, `prefill_span`, `AmdTpGroup::plan_for`), so a
         // banded packet cannot reach the row shrink by some other door.
@@ -5965,11 +6103,12 @@ impl AmdEngine {
                 // The packet's own cap, not a constant: this line is the only
                 // positive signal that a blob's widest rung reached the planner.
                 max_chunk = buckets.iter().copied().max().unwrap_or(0),
+                requested_max_chunk = max_bucket,
                 ?buckets,
                 "prefill chunk policy"
             )
         });
-        plan_chunks(&buckets, n_prompt)
+        plan_chunks_capped(&buckets, n_prompt, max_bucket)
     }
 
     /// Prefill `prompt`, leaving the KV cache populated for `[0, prompt.len())`
@@ -7727,6 +7866,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn b128_argmax_requires_an_object_capacity_marker() {
+        let obj = Path::new("interp_decode_k3.elf");
+        assert!(check_xargmax_capacity(&[], obj, 32).is_ok());
+        assert!(check_xargmax_capacity(&[], obj, 64).is_err());
+        assert!(check_xargmax_capacity(&[XARGMAX_B128_SYM], obj, 128).is_ok());
+    }
+
     /// An object that does not advertise a bucket is refused above M=1 and
     /// accepted at M=1.
     ///
@@ -7942,6 +8089,11 @@ mod tests {
         // why the rung is worth nothing without ragged-M.
         let padded16 = |n| plan_chunks_cfg(B16, n, LAUNCH_ROWS, false).unwrap();
         assert_eq!(padded16(8193), vec![8192, 128]);
+        assert_eq!(
+            plan_chunks_capped(B8, 8192, 4096).unwrap(),
+            vec![4096, 4096]
+        );
+        assert!(plan_chunks_capped(B8, 128, 64).is_err());
     }
 
     /// One contiguous h2d, not `n_kvrow` scattered ones: the sites straddle

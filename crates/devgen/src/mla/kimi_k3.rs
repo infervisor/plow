@@ -1208,7 +1208,7 @@ fn k3_build_model(
     //
     // Above 16 rows the gfx942 GEMV object must carry PLOW_GEMV_WALK: its largest compiled row
     // bucket is 16, and the walk is what covers the remaining rows instead of leaving stale
-    // logits. XArgmaxFin's two peer-data lines are the hard 32-row ceiling.
+    // logits. XArgmaxFin carries up to 128 rows across eight peer-data lines.
     // A ladder carries one independent-sequence decode program per rung, including B1. Build the
     // widest first: it declares the authoritative slot-major state/cache extents and preserves
     // the old single-rung tensor handles byte for byte. Narrower programs adopt that table.
@@ -1315,8 +1315,9 @@ fn k3_build_model(
 fn checked_k3_decode_batch(decode_batch: u32, gemv_walk: bool) -> u32 {
     let dbatch = decode_batch.max(1);
     assert!(
-        dbatch <= 32,
-        "K3 PLOW_DECODE_BATCH={dbatch} exceeds the 32-sequence XArgmaxFin ceiling"
+        dbatch <= packet::devbuild::XARGMAX_MAX_BATCH,
+        "K3 PLOW_DECODE_BATCH={dbatch} exceeds the {}-sequence XArgmaxFin ceiling",
+        packet::devbuild::XARGMAX_MAX_BATCH
     );
     assert!(
         dbatch <= 16 || gemv_walk,
@@ -1583,12 +1584,13 @@ mod kimi_k3_tests {
     use super::*;
 
     #[test]
-    fn decode_batch_above_sixteen_requires_walk_and_caps_at_thirty_two() {
+    fn decode_batch_above_sixteen_requires_walk_and_caps_at_xargmax_limit() {
         assert_eq!(checked_k3_decode_batch(0, false), 1);
         assert_eq!(checked_k3_decode_batch(16, false), 16);
         assert_eq!(checked_k3_decode_batch(32, true), 32);
+        assert_eq!(checked_k3_decode_batch(128, true), 128);
         assert!(std::panic::catch_unwind(|| checked_k3_decode_batch(17, false)).is_err());
-        assert!(std::panic::catch_unwind(|| checked_k3_decode_batch(33, true)).is_err());
+        assert!(std::panic::catch_unwind(|| checked_k3_decode_batch(129, true)).is_err());
     }
 
     /// A faithful miniature of the real `config.json`: same key spellings, same nesting, same
@@ -1759,13 +1761,13 @@ mod kimi_k3_tests {
     fn k3_decode_ladder_is_trailing_ascending_and_every_rung_is_sequence_state() {
         let _guard = crate::test_env::env_guard();
         let _scope = crate::test_env::EnvScope::set(&[
-            ("PLOW_DECODE_BATCH_LADDER", "1,3,7,16,32"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,3,7,16,32,64,128"),
             ("PLOW_GEMV_WALK", "1"),
         ]);
         let d = k3_dir("decode_ladder");
         let m = k3_build_model(&d, 4096, 256, 1, &[128], None);
 
-        assert_eq!(m.prog_t, [128, 1, 3, 7, 16, 32]);
+        assert_eq!(m.prog_t, [128, 1, 3, 7, 16, 32, 64, 128]);
         for (&t, p) in m.prog_t[1..].iter().zip(&m.progs[1..]) {
             let state_steps: Vec<_> = p
                 .insts
@@ -1788,7 +1790,7 @@ mod kimi_k3_tests {
             .iter()
             .find(|t| t.name == "in.parked")
             .expect("ladder must declare the parked mask");
-        assert_eq!(parked.bytes, 32 * 4);
+        assert_eq!(parked.bytes, 128 * 4);
     }
 
     /// Every program must address the same peer slot B. The host has one peer layout for the

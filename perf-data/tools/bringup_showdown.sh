@@ -5,7 +5,7 @@
 #   perf-data/tools/gpulease showdown perf-data/tools/bringup_showdown.sh
 #
 # Edit the CONFIG block and the arm list at the bottom for your model/box.
-set -u
+set -euo pipefail
 # ---- CONFIG ------------------------------------------------------------------
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PLOWRT="${PLOWRT:-$HERE/../../target/release/plowrt}"
@@ -14,7 +14,10 @@ MODEL_ID="${MODEL_ID:?set MODEL_ID=<served model id / hf id>}"
 BUNDLES="${BUNDLES:?set BUNDLES=<dir holding plow bundles>}"
 CUBINS="${CUBINS:?set CUBINS=<segmented cubin dir for PLOW_PF_SEG_DIR>}"
 export IN_LENS="${IN_LENS:-1024 4096}" NPROMPT="${NPROMPT:-9}"
-ROUND="${ROUND:-showdown}"
+ROUND_PREFIX="${ROUND_PREFIX:-${ROUND:-showdown}}"
+ROUNDS="${ROUNDS:-5}"
+case "$ROUNDS" in *[!0-9]*|"") echo "ROUNDS must be an integer >= 5" >&2; exit 2;; esac
+[ "$ROUNDS" -ge 5 ] || { echo "ROUNDS must be >= 5" >&2; exit 2; }
 PORT_PLOW=8093 PORT_VLLM=8085
 # ------------------------------------------------------------------------------
 
@@ -25,13 +28,27 @@ plow_arm() { # <bundle-name> <tag> <PLOW_PF_SEG_PURE value: fp8|1>
   mkdir -p "$(dirname "$LOG")"
   "$PLOWRT" serve --assets "$BUNDLES/$1" --port $PORT_PLOW >"$LOG" 2>&1 &
   local SPID=$!
-  for i in $(seq 1 600); do
-    curl -sf --max-time 2 "http://127.0.0.1:$PORT_PLOW/v1/models" >/dev/null 2>&1 && break
+  local READY=0
+  for i in $(seq 1 "${BRINGUP_READY_ATTEMPTS:-600}"); do
+    if curl -sf --max-time 2 "http://127.0.0.1:$PORT_PLOW/v1/models" >/dev/null 2>&1; then
+      READY=1
+      break
+    fi
     kill -0 $SPID 2>/dev/null || { echo "PLOW DIED: $2"; tail -4 "$LOG"; return 1; }
-    sleep 1
+    sleep "${BRINGUP_READY_SLEEP:-1}"
   done
-  "$HERE/bringup_bench.sh" "$2" "http://127.0.0.1:$PORT_PLOW" "$MODEL_ID" "$SNAP" "$ROUND"
-  kill $SPID 2>/dev/null; wait $SPID 2>/dev/null; sleep 3
+  if [ "$READY" -ne 1 ] || ! grep -q "backend ready.*GPU accelerated" "$LOG"; then
+    echo "PLOW GPU READINESS FAILED: $2" >&2
+    tail -30 "$LOG" >&2
+    kill $SPID 2>/dev/null || true; wait $SPID 2>/dev/null || true
+    return 1
+  fi
+  local rc=0
+  for round in $(seq 1 "$ROUNDS"); do
+    "$HERE/bringup_bench.sh" "$2" "http://127.0.0.1:$PORT_PLOW" "$MODEL_ID" "$SNAP" "$ROUND_PREFIX-$round" || { rc=$?; break; }
+  done
+  kill $SPID 2>/dev/null || true; wait $SPID 2>/dev/null || true; sleep 3
+  return "$rc"
 }
 
 vllm_arm() { # <tag> <extra vllm args...>
@@ -42,13 +59,27 @@ vllm_arm() { # <tag> <extra vllm args...>
     --max-model-len 8192 --gpu-memory-utilization 0.50 \
     --scheduling-policy fcfs --port $PORT_VLLM "$@" >"$LOG" 2>&1 &
   local SPID=$!
-  for i in $(seq 1 900); do
-    curl -sf --max-time 2 "http://127.0.0.1:$PORT_VLLM/v1/models" >/dev/null 2>&1 && break
+  local READY=0
+  for i in $(seq 1 "${VLLM_READY_ATTEMPTS:-900}"); do
+    if curl -sf --max-time 2 "http://127.0.0.1:$PORT_VLLM/v1/models" >/dev/null 2>&1; then
+      READY=1
+      break
+    fi
     kill -0 $SPID 2>/dev/null || { echo "VLLM DIED: $TAG"; tail -20 "$LOG"; return 1; }
-    sleep 2
+    sleep "${VLLM_READY_SLEEP:-2}"
   done
-  "$HERE/bringup_bench.sh" "$TAG" "http://127.0.0.1:$PORT_VLLM" "$MODEL_ID" "$SNAP" "$ROUND"
-  kill $SPID 2>/dev/null; sleep 6; kill -9 $SPID 2>/dev/null; sleep 4
+  if [ "$READY" -ne 1 ]; then
+    echo "VLLM READINESS TIMEOUT: $TAG" >&2
+    tail -30 "$LOG" >&2
+    kill $SPID 2>/dev/null || true; wait $SPID 2>/dev/null || true
+    return 1
+  fi
+  local rc=0
+  for round in $(seq 1 "$ROUNDS"); do
+    "$HERE/bringup_bench.sh" "$TAG" "http://127.0.0.1:$PORT_VLLM" "$MODEL_ID" "$SNAP" "$ROUND_PREFIX-$round" || { rc=$?; break; }
+  done
+  kill $SPID 2>/dev/null || true; sleep 6; kill -9 $SPID 2>/dev/null || true; wait $SPID 2>/dev/null || true; sleep 4
+  return "$rc"
 }
 
 # ---- ARMS (edit per bring-up) ------------------------------------------------

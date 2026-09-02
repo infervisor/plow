@@ -17,12 +17,28 @@ for IL in $IN_LENS; do
   vllm bench serve --backend openai-chat --base-url "$URL" --endpoint /v1/chat/completions \
     --model "$MODEL" --tokenizer "$TOK" \
     --dataset-name random --random-input-len "$IL" --random-output-len "$OUTLEN" \
-    --num-prompts "$NPROMPT" --max-concurrency 1 --seed 42 \
+    --num-prompts "$NPROMPT" --max-concurrency 1 --ignore-eos --seed 42 \
     --percentile-metrics ttft,tpot,itl,e2el >"$LOG" 2>&1
-  ROW=$(python3 - "$TAG" "$ROUND" "$IL" "$LOG" <<'EOF'
+  ROW=$(python3 - "$TAG" "$ROUND" "$IL" "$LOG" "$NPROMPT" "$OUTLEN" <<'EOF'
 import re, sys
-tag, rnd, il, log = sys.argv[1:5]
+tag, rnd, il, log, nprompt, outlen = sys.argv[1:7]
 txt = open(log).read()
+def count(name):
+    m = re.search(rf"{re.escape(name)}:\s+([\d,]+)", txt)
+    if not m:
+        raise SystemExit(f"missing {name} in {log}")
+    return int(m.group(1).replace(",", ""))
+success = count("Successful requests")
+generated = count("Total generated tokens")
+expected_requests = int(nprompt)
+expected_tokens = expected_requests * int(outlen)
+failed = re.search(r"Failed requests:\s+([\d,]+)", txt)
+if failed and int(failed.group(1).replace(",", "")) != 0:
+    raise SystemExit(f"failed requests in {log}: {failed.group(1)}")
+if success != expected_requests:
+    raise SystemExit(f"incomplete requests in {log}: {success} != {expected_requests}")
+if generated != expected_tokens:
+    raise SystemExit(f"partial output in {log}: {generated} != {expected_tokens}")
 def grab(name):
     m = re.search(rf"(?:Mean|Average) {name} \(ms\):\s+([\d.]+)", txt)
     med = re.search(rf"Median {name} \(ms\):\s+([\d.]+)", txt)

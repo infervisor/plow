@@ -5,14 +5,16 @@ remain as dated evidence links; this file owns the current baseline, decisions, 
 
 ## Scope and measurement contract
 
-- Target: B1, TP8, 8×MI325X/gfx942, native MXFP4 weights, FP8 KV, `plowrt serve`.
-- Client: Nix-pinned vLLM 0.27.0 `vllm bench serve`, one warmup unless a report says otherwise.
+- Current target: TP8, 8×MI355X/gfx950, native MXFP4 weights, BF16 KV.
+- Current performance authority: `plowrt bench` for Plow and vLLM 0.28
+  `bench serve` for the reference server.
 - A valid result requires completed requests, exact output length, empty errors, all-rank token/counter
   agreement, and uncontended `gpulease`. Standalone kernels are screening evidence, not throughput.
-- The official vLLM K3 image is validated for gfx950; its MI325X/RCCL eager attempt failed before
-  model load, so it is not an apples-to-apples MI325X comparator.
+- Current records: `kimi-k3-vllm-mi355x-baseline.md` and
+  `kimi-k3-plowrt-mi355x-smoke-20260902.md`. The Plow record is a correctness
+  smoke, not yet the matched 8192→1024 performance baseline.
 
-## Current B1 baseline
+## Historical MI325X B1 baseline
 
 | Effective context | TPOT | Decode tok/s |
 |---:|---:|---:|
@@ -108,7 +110,7 @@ These are explicitly experimental and excluded from the production merge.
 `archive/k3/k3-gsm8k.md`, `archive/k3/k3-hier2-ceiling.md`, `archive/k3/k3-serving-speed.md`, `archive/k3/k3-75tps-program.md`,
 `archive/k3/kimi-k3-kernel-gap.md`, `archive/k3/kimi-k3-atom-reference.md`, and `archive/k3/coldstart-amd-k3-tp8.md` are retained
 only when their historical context is needed; their numbers must not be compared with the current
-MI325X B1 baseline.
+MI355X campaign.
 
 ## Merge policy
 

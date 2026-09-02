@@ -32,6 +32,9 @@ fi
 mkdir -p "$LEASE_DIR" 2>/dev/null || { echo "gpulease: cannot create $LEASE_DIR" >&2; exit 1; }
 chmod 1777 "$LEASE_DIR" 2>/dev/null || true
 LOG="$LEASE_DIR/lease.log"
+if [ -e "$LOG" ] && [ ! -w "$LOG" ]; then
+  LOG="$LEASE_DIR/lease.$(id -u).log"
+fi
 
 # ---- vendor detect
 if command -v nvidia-smi >/dev/null 2>&1; then VENDOR=nvidia
@@ -175,7 +178,7 @@ fi
 if [ "$1" = "--status" ]; then
   echo "vendor=$VENDOR gpus=$NGPU lease-dir=$LEASE_DIR"
   for ((i = 0; i < NGPU; i++)); do
-    f="$LEASE_DIR/gpu.$i.lease"; touch "$f" 2>/dev/null
+    f="$LEASE_DIR/gpu.$i.lease"; [ -e "$f" ] || : >"$f" 2>/dev/null
     if flock -n "$f" true 2>/dev/null; then echo "  gpu$i: free"; else echo "  gpu$i: HELD"; fi
   done
   echo "--- recent ---"; tail -20 "$LOG" 2>/dev/null
@@ -210,8 +213,11 @@ try_acquire() {
   local i f
   for ((i = 0; i < NGPU; i++)); do
     [ "$NGOT" -ge "$WANT" ] && break
-    f="$LEASE_DIR/gpu.$i.lease"; touch "$f" 2>/dev/null || continue
-    eval "exec $FD>\"$f\"" 2>/dev/null || continue
+    f="$LEASE_DIR/gpu.$i.lease"
+    [ -e "$f" ] || : >"$f" 2>/dev/null || continue
+    # The lease directory is shared across users. Existing lock files may be readable but
+    # not writable by this user; flock only needs an open descriptor, so open read-only.
+    eval "exec $FD<\"$f\"" 2>/dev/null || continue
     if flock -n "$FD" 2>/dev/null; then
       GOT="${GOT:+$GOT }$i"; NGOT=$((NGOT + 1)); FD=$((FD + 1))
     else

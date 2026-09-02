@@ -72,7 +72,7 @@ run_one() { # <tag> <objdir>
   # plainly there (the design notes §0a). Running under the lease is fine; only COMPILING
   # under it is forbidden.
   nix develop -c "$PLOWRT" amd-bench --blob "$AB/$tag/model.pkt" --hsaco "$obj" \
-      --checkpoint "$CKPT" --prompt "$PROMPT" --steps 65 --ctx 1024 --batched 2>&1 \
+      --checkpoint "$CKPT" --prompt "$PROMPT" --steps 65 --batched 2>&1 \
     | grep -E "slots agree|slot [0-9]+ and|tpot|aggregate|batched decode|MISMATCH|rror|refus|Error"
   echo
 }

@@ -484,9 +484,8 @@ __device__ __forceinline__ void d_xreduce_mega(
  * an op that runs after the whole FFN).
  *
  * `val_id` must NOT be the arrival gate's id: the gate is an atomic counter.
- * Each 128-byte line carries sixteen packed 8-byte keys; batches above 16 use the immediately
- * following line. `PLOW_XAMAX_MAX_BATCH` and the emitter's matching assert are the two halves of
- * the 32-row bound.
+ * Each 128-byte line carries sixteen packed 8-byte keys; batches above 16 use consecutive lines.
+ * `PLOW_XAMAX_MAX_BATCH` and the emitter's matching assert are the two halves of the bound.
  *
  * KNOWN, UNRESOLVED (perf-data/archive/k3/k3-batched-decode-design.md §9): a GSM8K run at B=4 hit ONE
  * cross-rank disagreement in ~1e4-1e5 steps where two ranks folded DIFFERENT winners that both
@@ -498,13 +497,13 @@ __device__ __forceinline__ void d_xreduce_mega(
  *
  * On deadline the rank keeps its LOCAL argmax rather than hanging the queue — the same
  * bail discipline (and the same silent-wrongness) as d_xreduce_mega's. */
-/* 32, spanning TWO consecutive counter lines: `val_id` carries rows 0..15 (16 keys x 8 B =
- * one 128 B PLOW_CTR line, exact) and `val_id + 1` rows 16..31. The emitter allocates the
- * extra id only when n_batch > 16 (ids are emit-time constants, so a narrow blob's id map is
- * unchanged); the arrival gate stays ONE counter regardless. Two lines instead of a wider
- * stride keeps every existing single-line blob byte-compatible. */
-#define PLOW_XAMAX_MAX_BATCH 32u
+/* Up to 128 rows spanning eight consecutive counter lines. `val_id` carries rows 0..15
+ * (16 keys x 8 B = one 128 B PLOW_CTR line, exact), with each later line carrying another 16.
+ * The emitter allocates only the lines n_batch needs, so existing narrow blobs stay compatible;
+ * the arrival gate stays one counter regardless. */
+#define PLOW_XAMAX_MAX_BATCH 128u
 #define PLOW_XAMAX_LINE 16u
+extern "C" __device__ unsigned plow_xargmax_max_batch_128 = 1;
 __device__ __forceinline__ void d_xargmax_fin_mega(
     int* ids, const unsigned long long* part, unsigned nparts, unsigned n_batch,
     unsigned vocab_l, const void* const* peer_scratch, uint32_t nranks, uint32_t rank,
@@ -512,6 +511,10 @@ __device__ __forceinline__ void d_xargmax_fin_mega(
     uint32_t* status, unsigned slice) {
     if (slice != 0 || threadIdx.x != 0) return;
     const unsigned B = n_batch ? n_batch : 1u;
+    if (B > PLOW_XAMAX_MAX_BATCH) {
+        if (status) *status = 0xBADB0000u | (B & 0xFFFFu);
+        return;
+    }
     auto val_at = [&](const void* base, unsigned b) -> unsigned long long* {
         return (unsigned long long*)PLOW_CTR((uint32_t*)((char*)base + xctr_byte_off),
                                              val_id + (b / PLOW_XAMAX_LINE))
@@ -520,7 +523,7 @@ __device__ __forceinline__ void d_xargmax_fin_mega(
     const unsigned long long* pg = as_glob(part);
 
     /* local fold + rebase to global vocab index */
-    for (unsigned b = 0; b < B && b < PLOW_XAMAX_MAX_BATCH; b++) {
+    for (unsigned b = 0; b < B; b++) {
         const unsigned long long* pb = pg + (size_t)b * nparts;
         unsigned long long best = 0;
         for (unsigned i = 0; i < nparts; i++) best = pb[i] > best ? pb[i] : best;
@@ -545,7 +548,7 @@ __device__ __forceinline__ void d_xargmax_fin_mega(
     }
     if (!bailed) xctr_acquire();
 
-    for (unsigned b = 0; b < B && b < PLOW_XAMAX_MAX_BATCH; b++) {
+    for (unsigned b = 0; b < B; b++) {
         unsigned long long best = *val_at(peer_scratch[rank], b);
         if (!bailed)
             for (uint32_t r = 0; r < nranks; r++) {

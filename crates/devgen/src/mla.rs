@@ -6139,23 +6139,23 @@ fn emit_glm_tail(
     if glm_shard_head(c) {
         // XARGMAX_FIN SUBSUMES ArgmaxFin: it folds the AMAX_BLOCKS partials itself, rebases the
         // winning index by rank*vocab_l and takes the cross-rank max, so emitting both would fold
-        // twice and write the LOCAL winner's id first. Two xctr ids from this program's allocator:
-        // the arrival gate and the peer-visible 8-byte value slot — distinct, because the gate is
-        // an atomic counter and the slot is data.
-        // The fold publishes one u64 per sequence, 16 keys per 128-byte xctr counter line;
-        // above 16 the value slot spans TWO consecutive ids (kernel: PLOW_XAMAX_LINE), so
-        // the ceiling is 32. The extra id is allocated only when the rung needs it — a
-        // narrow blob's id map is unchanged. Assert rather than leave ids[32..] holding the
-        // previous step's token.
-        const XAMAX_MAX_BATCH: u32 = 32;
+        // twice and write the LOCAL winner's id first. The program allocator reserves one arrival
+        // gate plus the peer-visible value lines; the gate is an atomic counter and the lines are
+        // data.
+        // The fold publishes one u64 per sequence, 16 keys per 128-byte xctr counter line.
+        // Additional consecutive ids are allocated only when the rung needs them, so a narrow
+        // blob's id map is unchanged.
         let n_batch = nb.max(1);
-        assert!(
-            n_batch <= XAMAX_MAX_BATCH,
-            "XARGMAX_FIN carries at most {XAMAX_MAX_BATCH} sequences across two xctr counter \
-             lines (asked for {n_batch}); cap the decode ladder at 32 under GLM_SHARD_HEAD"
-        );
+        let value_lines = packet::devbuild::xargmax_value_lines(n_batch).unwrap_or_else(|| {
+            panic!(
+                "XARGMAX_FIN carries at most {} sequences (asked for {n_batch})",
+                packet::devbuild::XARGMAX_MAX_BATCH
+            )
+        });
         let gate = *xgate;
-        *xgate += if n_batch > 16 { 3 } else { 2 };
+        *xgate = xgate
+            .checked_add(1 + value_lines)
+            .expect("XArgmaxFin counter id overflow");
         b.emit(DevOp::XArgmaxFin, vec![0u32], &[c_am], |d| {
             d.t[0] = n.ids;
             d.t[1] = n.amax;

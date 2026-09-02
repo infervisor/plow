@@ -19,7 +19,6 @@ D="${PLOW_AB_DIR:-/tmp/l2place}"
 CKPT="${PLOW_CKPT:-$(readlink -f /home/lava/plow/build-amd/g31b-bf16/checkpoint)}"
 RT="$REPO/target/release/plowrt"
 STEPS="${STEPS:-64}"
-CTX="${CTX:-1024}"
 FOLDS="${FOLDS:-3}"
 PROMPT="${PROMPT:-2,106,1645,108,7154,1701,532,573,6996,529,8043,236881,107,108,106,2516,108}"
 
@@ -28,7 +27,7 @@ unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
 run() { # <arm> <blob> <objs> <extra-env>
   local tag="$1" blob="$2" objs="$3" env="$4"
   env $env "$RT" amd-bench --blob "$blob" --hsaco "$objs" --checkpoint "$CKPT" \
-      --prompt "$PROMPT" --steps "$STEPS" --ctx "$CTX" 2>&1 \
+      --prompt "$PROMPT" --steps "$STEPS" 2>&1 \
     | tee "$D/raw.$tag.txt" \
     | grep -Ei 'ms/token|error:|panic' | sed "s/^/[$tag] /"
   # TOKEN IDENTITY. Placement is a SCHEDULING change: it moves which workgroup runs which packet

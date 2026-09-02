@@ -42,7 +42,7 @@ HTTP / UDS  →  per-model mux (continuous batching)  →  device engine
 | `$VENDOR` | module | shape |
 |---|---|---|
 | nvidia | `exec::gpu::GpuEngine` | **slotted**: B independent sequence slots, chunked prefill, prefix sharing, device sampling. Most runtime levers live here. |
-| amd | `exec::amd` (`enum Ranks { One, Tp }`) | **single-sequence** per rank (one KV ring, one position, greedy on-device sampling), optionally tensor-parallel. One model per process, no paging, no residency manager. |
+| amd | `exec::amd` (`enum Ranks { One, Tp }`) | fixed-capacity independent sequence slots with a compiled decode ladder and greedy on-device sampling, optionally tensor-parallel. One model per process, no paging, no residency manager. |
 
 The seam is per **vendor**, not per ISA: every NVIDIA `$ISA` reaches
 `GpuEngine` and every AMD `$ISA` reaches `exec::amd`. A lever marked for one
@@ -80,7 +80,7 @@ engine slot *i*). The first concurrency decision was therefore made in Stage 5.
 | lever | flag / env | default | effect |
 |---|---|---|---|
 | CPU executor threads | `--executors N` | 8 | reference backend only; GPU engines run one dedicated engine thread per model |
-| Multi-step decode | `PLOW_MULTISTEP=K` | 8 | device advances K greedy tokens per host round-trip; the single highest-value default (measured ~1.74× on its own, 12B on RTX 5090 — `perf-data/gemma4-12b-sm120-serving.md`). Stochastic rows fall back to per-token. *(nvidia)* |
+| Multi-step decode | `PLOW_MULTISTEP=K` | 8 | device advances K greedy tokens per host round-trip. NVIDIA supports up to 64. AMD TP uses a bounded K≤4 device token ring only when `PLOW_TP_AGREE_EVERY>1`; counter drain/audit still runs every token. Stochastic rows fall back to per-token. |
 | Device sampling | `PLOW_DEV_SAMPLE=1` | on (nvidia) | argmax/sample on device, no logits round-trip; pairs with multi-step *(nvidia)* |
 
 > **Pitfall — a wide fixed `B` is not a free win.** Decode is HBM-bandwidth-
@@ -152,7 +152,7 @@ a 32 GiB card.
 > VMM `BlockHash` collision check is **not implemented** (`memory/vmm.rs`), so a
 > hash collision would attach the wrong prefix's KV. Measured-good, not hardened.
 
-### 4. Prefill: chunking, batching, interleave — `$VENDOR`: mostly nvidia
+### 4. Prefill: chunking, batching, interleave — `$VENDOR`: both
 
 Prefill is a launch-count game: each launch has a fixed cost, so fewer launches
 is faster — at the cost of a bigger KV ring. **Measure that fixed cost on
@@ -163,19 +163,20 @@ on an AMD TP4 configuration (`perf-data/glm52-ttft-breakdown.md`).
 
 | lever | flag / env | default | effect |
 |---|---|---|---|
-| Chunk-interleave quantum | `--pf-interleave N` / `PLOW_PF_INTERLEAVE` | 2048 | rows admitted per tick before decode runs; caps how long a decode stream stalls behind a new prefill (one chunk, not one prompt) *(nvidia)* |
-| Per-request chunk-row cap | `--pf-chunk N` / `PLOW_PF_CHUNK` | 0 (off) | finer chunking. **Tail-latency tool** — measured a net throughput *loss* at B=8 (`perf-data/serving-capacity-report.md`) *(nvidia)* |
-| Disable chunking / interleave | `--pf-no-chunk`, `--pf-no-interleave` | off | A/B and pure-throughput controls *(nvidia)* |
+| Chunk-interleave quantum | `--pf-interleave N` / `PLOW_PF_INTERLEAVE` | 2048 | rows admitted per tick before decode runs; caps how long a decode stream stalls behind a new prefill. AMD TP re-splits a pending compiled step if the cap shrinks after decode becomes live *(both)* |
+| Per-request chunk-row cap | `--pf-chunk N` / `PLOW_PF_CHUNK` | 0 (off) | finer chunking. **Tail-latency tool** — measured a net throughput *loss* at B=8 (`perf-data/serving-capacity-report.md`) *(both; AMD TP uses its compiled ladder)* |
+| Disable chunking / interleave | `--pf-no-chunk`, `--pf-no-interleave` | off | A/B and pure-throughput controls *(both)* |
 | Chunk cost model | `--pf-chunk-cost N` / `PLOW_PF_CHUNK_COST`, `--pf-cover` | 512 | fixed launch cost in padded-row equivalents — **re-fit this on `$GPU`**, the default is another part's number (`perf-data/chunk-cost-model.md`, `perf-data/rtx12-chunked-packing.md`) *(nvidia)* |
-| Cross-request batched prefill | `--pf-batch` / `PLOW_PF_BATCH=1` | off | packs waiting requests' chunks into one launch. Wins on small per-request chunks; **no-op** when the pack budget already equals the serial chunk, **force-off on fp8-KV** (`perf-data/px14-batched-prefill-fp8.md`) *(nvidia)* |
-| Throughput mode | `--pf-defer-decode` / `PLOW_PF_DEFER_DECODE=1` | off | run prefill chains to completion before any decode. Trades streaming latency (TTFT collapses) for aggregate tok/s. Not a shippable default *(nvidia)* |
+| Cross-request prefill scheduling | `--pf-batch` / `PLOW_PF_BATCH=1` | off | NVIDIA packs chunks into one launch. AMD rotates isolated one-request chunks fairly; true co-packing needs per-row state/KV packet fields *(both)* |
+| Throughput mode | `--pf-defer-decode` / `PLOW_PF_DEFER_DECODE=1` | off | run prefill chains to completion before decode. Trades streaming latency for aggregate tok/s. Not a shippable default *(both)* |
 | Ragged-tail chunk | `--amd-ragged-chunk` / `PLOW_RAGGED_CHUNK` | **on** | cover a prompt in fewest launches, run the last chunk at its real row count (measured −239 ms @4097 tok on one part; `exec::amd::rebase_chunk_rows`). `=0` restores the padding-vs-launch DP for a controlled A/B — see the flag's own doc in `config.rs` for the quality-gate caveat *(amd)* |
 | Segmented prefill | `--pf-seg-*` (nvidia), `--amd-seg-window` (amd) | seg-window on | prefill as a sequence of same-occupancy launches (measured −11%/−12% at 8k/16k on one part — `docs/arch/06-runtime.md`, `perf-data/gemma12b-gh200-prefill-campaign.md`). `--pf-seg-*` are mostly A/B diagnostics; emit-side classing must match the blob |
 
-> **Pitfall — cross-request batched prefill is not numerics-neutral.** Greedy
+> **Pitfall — cross-request co-packed prefill is not numerics-neutral.** Greedy
 > tokens can differ across chunk boundaries (the flash split count is
 > chunk-dependent; `perf-data/px14-batched-prefill-fp8.md`). If bit-identical
-> decode matters, keep packing off or gate on a facts probe.
+> decode matters, keep packing off or gate on a facts probe. AMD's fair mode
+> does not co-pack rows and preserves per-request recurrent/KV isolation.
 
 ### 5. Admission: SLO, hold, shedding — `$VENDOR`: both
 
@@ -290,8 +291,8 @@ only whole-schedule instrument that needs no device.
 
 ```bash
 # decode TPOT at a context depth; with --prompt, a real greedy decode + TTFT:
-plowrt amd-bench --blob $ASSETS/model.pkt --rt-hsaco $ASSETS/hsaco \
-    --checkpoint $CKPT --prompt 1,2,3,4 --steps 64 --ctx 1024
+plowrt amd-bench --blob $ASSETS/model.pkt --hsaco $ASSETS/hsaco \
+    --checkpoint $CKPT --prompt 1,2,3,4 --steps 64
 ```
 
 Reports load time, per-token decode ms (TPOT floor), and — with a multi-token
@@ -302,11 +303,26 @@ concurrency 1. `amd-bench` is a **latency/bring-up** instrument: without
 noise*. A prefill-vs-length sweep on TP (sweep points must all be ≤ `$MAXCTX`):
 
 ```bash
-plowrt amd-bench --blob $ASSETS/model.pkt --rt-hsaco $ASSETS/hsaco --tp $NGPU \
+plowrt amd-bench --blob $ASSETS/model.pkt --hsaco $ASSETS/hsaco --tp $NGPU \
     --prefill-sweep 512,1024,2048,4096,8192 --prefill-reps 3
 ```
 
 ### 2. Bring up serving and baseline it
+
+Use the in-process production benchmark for the no-HTTP floor. It drives the
+same `ServeEngine` and mux as `serve`, excludes model load and warmup from the
+timed interval, and fails without JSON on partial output, shedding, rank
+disagreement, or CPU fallback:
+
+```bash
+plowrt bench --assets $ASSETS --prompt-ids 1,2,3,4 \
+    --concurrency 1 --requests 8 --warmup-requests 1 --output-len 64
+```
+
+The JSON records TTFT/TPOT/ITL/E2E distributions, throughput, scheduler rungs,
+TP width, runtime settings, packet/object checksums, and checkpoint layout.
+Use `amd-bench` only for packet traces, tensor/logit snapshots, prefill sweeps,
+and explicit TP correctness audits.
 
 ```bash
 plowrt serve --assets $ASSETS --port 8080 --executors 8 \

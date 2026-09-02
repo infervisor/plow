@@ -469,4 +469,4 @@ Raw evidence is in:
 - `perf-data/archive/k3/kimi-k3-mi325x-kernel-audit.md`
 - `perf-data/archive/k3/kimi-k3-mi325x-prefill-experiments.md`
 - `perf-data/archive/k3/kimi-k3-mi325x-b32-serve.md`
-- `perf-data/archive/k3/kimi-k3-mi325x-vllm-eager.md`
+- `perf-data/kimi-k3-vllm-mi355x-baseline.md` (different-hardware vLLM reference)

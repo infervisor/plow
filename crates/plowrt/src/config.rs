@@ -136,7 +136,7 @@ pub struct RuntimeConfig {
 
 /// NVIDIA / sm_120 runtime knobs.
 #[derive(Args, Debug, Clone)]
-#[command(next_help_heading = "NVIDIA runtime")]
+#[command(next_help_heading = "Scheduling and NVIDIA runtime")]
 pub struct NvidiaRuntimeConfig {
     /// Bounded device multi-step decode (steps per launch, 2..64). 0/1 = single-step.
     #[arg(
@@ -177,7 +177,8 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "nv-upload-direct", env = "PLOW_UPLOAD_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub upload_direct: bool,
 
-    /// Cross-request batched prefill (packs waiting requests' chunks into one launch).
+    /// Cross-request prefill scheduling. CUDA packs chunks into one launch;
+    /// AMD fairly interleaves isolated chunks because its packet rows are single-sequence.
     #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_batch: bool,
 

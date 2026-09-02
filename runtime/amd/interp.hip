@@ -104,6 +104,14 @@ typedef struct {
     uint32_t slot;
 } PlowStateClearArgs;
 
+typedef struct {
+    const uint32_t* ids;
+    uint32_t* ring;
+    uint32_t step;
+    uint32_t quantum;
+    uint32_t batch;
+} PlowTokenCaptureArgs;
+
 #if !defined(PLOW_BUCKET_FLASH)
 /* PLOW_DOP_XREDUCE_ADD_NORM (116): fused TP all-reduce + residual + RMSNorm, one
  * workgroup. Same rendezvous as d_xreduce_mega; then d_add_norm's math with the `b`
@@ -3794,8 +3802,9 @@ extern "C" __global__ void plow_xctr_audit(PlowXAuditArgs a) {
                 if (d.i[4] == gate) want = a.n_gpu * d.blocks;
             } else if (d.op == PLOW_DOP_XARGMAX_FIN) {
                 if (d.i[3] == gate) want = a.n_gpu;
-                if (d.i[4] == gate) data = true;
-                if (d.i[1] > PLOW_XAMAX_LINE && d.i[4] + 1u == gate) data = true;
+                const uint32_t n = d.i[1] ? d.i[1] : 1u;
+                const uint32_t lines = (n - 1u) / PLOW_XAMAX_LINE + 1u;
+                if (gate >= d.i[4] && gate - d.i[4] < lines) data = true;
             }
         }
         if (!data) {
@@ -3814,4 +3823,12 @@ extern "C" __global__ void plow_state_clear(PlowStateClearArgs a) {
     const PlowStateClearRange d = a.ranges[r];
     uint32_t* p = (uint32_t*)(d.base + (uint64_t)a.slot * d.slot_stride);
     for (uint32_t i = threadIdx.x; i < d.words; i += blockDim.x) p[i] = 0;
+}
+
+/* Capture device-sampled ids without a host readback between decode tokens.
+ * The launch is queued immediately after rank 0's interpreter dispatch, whose
+ * AQL barrier orders the argmax stores before these loads. */
+extern "C" __global__ void plow_token_capture(PlowTokenCaptureArgs a) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < a.batch) a.ring[row * a.quantum + a.step] = a.ids[row];
 }

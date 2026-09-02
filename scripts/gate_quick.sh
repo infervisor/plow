@@ -10,5 +10,5 @@ CKPT=/home/lava/.cache/huggingface/hub/models--google--gemma-4-31B-it/snapshots/
 RUST_LOG="info,plowrt::exec::amd=debug" nix develop --command "$WT/target/release/plowrt" amd-bench \
   --blob /home/lava/plow/build-amd/g31b-db${B:-4}/model.pkt \
   --hsaco /home/lava/plow/build-amd/hsaco-b${B:-4} --checkpoint "$CKPT" \
-  --steps 4 --ctx 1024 --batched --prompt "${P:-2,106,1645;2,106,1645;2,106,1645;2,106,1645}" 2>&1 \
+  --steps 4 --batched --prompt "${P:-2,106,1645;2,106,1645;2,106,1645;2,106,1645}" 2>&1 \
   | grep -E "rebase readback|KV slot|slot [0-9]|agree|chain|tpot|rror"

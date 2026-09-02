@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# INTERLEAVED, ORDER-REVERSED A/B for a K3 decode step.                        [MEASUREMENT-GATE]
+# INTERLEAVED, ORDER-REVERSED production-scheduler A/B.                        [MEASUREMENT-GATE]
 #
 #   ./scripts/k3_ab_bench.sh <A-label> <A-assets> <B-label> <B-assets> [reps] [batch-prompts]
 #
@@ -35,8 +35,8 @@
 #
 #   REPS     pairs per arm (default 4, so 8 runs per arm)
 #   STEPS    decode steps per run (default 64; below ~32 the per-step average is itself noisy)
-#   CKPT     checkpoint (default /home/lava/models/k3_farm)
-#   BATCHED  1 to use --batched with B copies of the prompt (default 1)
+#   CKPT     optional production checkpoint override (otherwise assets/checkpoint)
+#   BATCHED  1 for concurrent serving (default 1); CONCURRENCY defaults to 16
 #   SETTLE_C wait for the hottest GPU to fall to this junction temperature before each run
 #            (default 0 = off). SETTLE_MAX caps the wait in seconds (default 180).
 #
@@ -57,18 +57,16 @@ set -uo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AL="${1:?A label}"; AA="${2:?A assets}"; BL="${3:?B label}"; BA="${4:?B assets}"
 REPS="${5:-4}"
-STEPS="${STEPS:-64}"; CKPT="${CKPT:-/home/lava/models/k3_farm}"; BATCHED="${BATCHED:-1}"
+STEPS="${STEPS:-64}"; CKPT="${CKPT:-}"; BATCHED="${BATCHED:-1}"
+CONCURRENCY="${CONCURRENCY:-16}"
+REPORT_DIR="${REPORT_DIR:-/tmp/k3-ab-reports}"
 BIN="${PLOWRT_BIN:-$WT/target/release/plowrt}"
 P="1008,10484,318,15383,387"
 
 [ -x "$BIN" ] || { echo "no plowrt at $BIN — cargo build --release -p plowrt --features hsa"; exit 1; }
 
-# One prompt per slot. `--batched` needs them; the count only has to be >= the packet's B, since
-# amd-bench cycles them.
-S="$P"; for _ in $(seq 1 15); do S="$S;$P"; done
-ARGS_COMMON="--checkpoint $CKPT --tp 8 --steps $STEPS --ctx 5"
-[ "$BATCHED" = "1" ] && ARGS_COMMON="$ARGS_COMMON --prompt '$S' --batched" \
-                     || ARGS_COMMON="$ARGS_COMMON --prompt '$P'"
+[ "$BATCHED" = "1" ] || CONCURRENCY=1
+mkdir -p "$REPORT_DIR"
 
 hot_c() { # hottest junction temperature across all GPUs, or empty if rocm-smi is unavailable
   rocm-smi --showtemp 2>/dev/null \
@@ -89,16 +87,33 @@ settle() { # wait for the box to cool, if asked
   done
 }
 
-run_one() { # <assets> -> ms/step on stdout
+run_one() { # <assets> -> production p50 TPOT on stdout
   local a="$1"
-  PLOW_L2_PLACE_DISPATCH=1 nix develop "$WT" --command bash -c \
-    "$BIN amd-bench --blob $a/model.pkt --hsaco $a/hsaco $ARGS_COMMON" 2>&1 \
-  | grep -oE "[0-9.]+ ms/(step|token)" | grep -oE "^[0-9.]+" | tail -1
+  local out
+  local env_args=(PLOW_L2_PLACE_DISPATCH=1)
+  [ -n "$CKPT" ] && env_args+=("PLOW_CHECKPOINT=$CKPT")
+  out="$(mktemp "$REPORT_DIR/bench.XXXXXX.json")"
+  nix develop "$WT" --command env "${env_args[@]}" "$BIN" bench \
+    --assets "$a" --prompt-ids "$P" \
+    --concurrency "$CONCURRENCY" --requests "$CONCURRENCY" \
+    --warmup-requests "$CONCURRENCY" --output-len "$STEPS" \
+    --max-hold-ms 0 --slo-ms "${SLO_MS:-60000}" >"$out" || return 1
+  python3 - "$out" "$CONCURRENCY" "$STEPS" <<'PY'
+import json, sys
+p, concurrency, steps = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(p) as f:
+    r = json.load(f)
+assert r["schema"] == "plowrt.bench.v1"
+assert r["completed"] == concurrency and r["failed"] == 0
+assert r["output_tokens"] == concurrency * steps
+assert r["scheduler"]["rejected"] == 0 and r["scheduler"]["admit_shed"] == 0
+print(r["tpot_ms"]["p50"])
+PY
 }
 
 echo "A = $AL  ($AA)"
 echo "B = $BL  ($BA)"
-echo "reps=$REPS steps=$STEPS batched=$BATCHED  -> $((REPS*2)) runs per arm, interleaved and order-reversed"
+echo "reps=$REPS steps=$STEPS concurrency=$CONCURRENCY  -> $((REPS*2)) runs per arm, interleaved and order-reversed"
 echo
 
 AV=(); BV=()
@@ -109,7 +124,7 @@ for r in $(seq 1 "$REPS"); do
     settle
     tc=$(hot_c)
     if [ "$w" = "A" ]; then v=$(run_one "$AA"); AV+=("$v"); else v=$(run_one "$BA"); BV+=("$v"); fi
-    printf "  pair %d  %s  %s ms   (start %sC)\n" "$r" "$w" "${v:-FAIL}" "${tc:-?}"
+    printf "  pair %d  %s  %s ms p50 TPOT   (start %sC)\n" "$r" "$w" "${v:-FAIL}" "${tc:-?}"
   done
 done
 

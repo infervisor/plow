@@ -1251,7 +1251,6 @@ impl Builder {
         // not a design one, and this knob is how it gets answered.
         // Materialized so later passes (SEG_CLASS_SLICE mutates self.ops) can read it.
         let op_class: Vec<u8> = (0..self.ops.len()).map(wave_class).collect();
-        drop(wave_class);
         let wave_class = |i: usize| -> u8 { op_class[i] };
         let seg_per_op = std::env::var("PLOW_SEG_PER_OP").ok().as_deref() == Some("1");
         let mut seg_of = vec![0u16; self.ops.len()];
@@ -1859,21 +1858,30 @@ pub const INIT_NONE: u64 = u64::MAX;
 
 // --- decode batch ladder -----------------------------------------------------
 
-/// Widest decode rung any emit may declare. Two independent ceilings sit under it:
-/// the MoE decode router's per-CTA `inv[]` scratch (`PLOW_MOE_MAXB`, 32) and the
-/// decode GEMV's compile-time row bucket (`PLOW_GEMV_MAXM`, 16 — enforced against
-/// the code OBJECT by the runtime, not here, because it is an object property).
-pub const DECODE_RUNG_MAX: u32 = 32;
+/// Packed winners carried by one 128-byte XArgmaxFin counter line.
+pub const XARGMAX_BATCH_PER_LINE: u32 = 16;
+/// Widest cross-rank argmax batch supported by the packet/runtime contract.
+pub const XARGMAX_MAX_BATCH: u32 = 128;
+
+/// Number of consecutive peer-visible counter lines needed by XArgmaxFin.
+pub fn xargmax_value_lines(n_batch: u32) -> Option<u32> {
+    let n = n_batch.max(1);
+    (n <= XARGMAX_MAX_BATCH).then(|| n.div_ceil(XARGMAX_BATCH_PER_LINE))
+}
+
+/// Widest decode rung any emit may declare. Individual operator families may impose a
+/// narrower bound (for example Gemma MoE's 32-row per-CTA scratch), while walking AMD GEMV
+/// objects handle widths above their 16-row compile-time bucket.
+pub const DECODE_RUNG_MAX: u32 = 128;
 
 /// Index of the FIRST decode program in `prog_t`, i.e. the start of the decode
 /// rung ladder. Everything before it is a prefill bucket.
 ///
 /// THE RULE, and why it needs no new blob field. Programs are emitted
 /// prefill-buckets-ascending then decode-rungs-ascending, and the two ranges are
-/// disjoint by construction: a decode rung is at most [`DECODE_RUNG_MAX`] rows and a
-/// prefill bucket is a chunk width (128 and up — `emit_decode_ladder_rungs_are_below_every_prefill_bucket`
-/// asserts the separation at emit, so a blob that would confuse this cannot be written).
-/// So the ladder is the maximal trailing run of programs whose `t` is `<= DECODE_RUNG_MAX`.
+/// ordered by construction: decode is a trailing strictly ascending run at widths no greater
+/// than [`DECODE_RUNG_MAX`]. A width-128 prefill bucket may equal a width-128 decode rung, but
+/// the strict comparison below cannot cross that equal-width boundary.
 ///
 /// A blob with ONE decode program lands on `prog_t.len() - 1`, which is the
 /// `progs.len() - 1` every caller used before the ladder existed.
@@ -3212,5 +3220,19 @@ mod v6_tests {
         // The widest rung IS the last program: a descending tail is not a ladder, and the
         // scan must not walk into it.
         assert_eq!(decode_rung_lo(&[128, 16, 8]), 2);
+        // Width 128 is legal for decode. The equal-width prefill bucket remains outside the
+        // trailing ladder because the scan is strict.
+        assert_eq!(decode_rung_lo(&[128, 512, 1, 16, 32, 64, 128]), 2);
+        assert_eq!(decode_rung_lo(&[128, 128]), 1);
+    }
+
+    #[test]
+    fn xargmax_line_count_is_bounded_and_rounds_up() {
+        assert_eq!(xargmax_value_lines(0), Some(1));
+        assert_eq!(xargmax_value_lines(1), Some(1));
+        assert_eq!(xargmax_value_lines(16), Some(1));
+        assert_eq!(xargmax_value_lines(17), Some(2));
+        assert_eq!(xargmax_value_lines(128), Some(8));
+        assert_eq!(xargmax_value_lines(129), None);
     }
 }

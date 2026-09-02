@@ -19,4 +19,4 @@ BIN="${PLOWRT_BIN:-$WT/target/release/plowrt}"
 exec "$WT/perf-data/tools/gpulease" -n 8 specgen sg render -c \
   "nix develop $WT --command $BIN amd-bench \
    --blob $ASSETS/model.pkt --hsaco $ASSETS/hsaco --checkpoint $CKPT \
-   --tp 8 --steps $STEPS --ctx 512 --prompt '1008,10484,318,15383,387'"
+   --tp 8 --steps $STEPS --prompt '1008,10484,318,15383,387'"

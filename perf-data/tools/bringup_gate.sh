@@ -31,6 +31,11 @@ done
 [ "$READY" -eq 1 ] || { echo "SERVER READINESS TIMEOUT" >&2; tail -30 "$LOG" >&2; exit 1; }
 MODEL=$(curl --fail-with-body --silent --show-error "http://127.0.0.1:$PORT/v1/models" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); model=d['data'][0]['id']; assert isinstance(model,str) and model; print(model)")
+grep -q "backend ready.*GPU accelerated" "$LOG" || {
+  echo "SERVER IS NOT GPU ACCELERATED" >&2
+  tail -30 "$LOG" >&2
+  exit 1
+}
 echo "server up: $MODEL"
 
 PROMPTS=(

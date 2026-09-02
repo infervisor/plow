@@ -1,5 +1,6 @@
 //! §G OpenAI-compatible API server.
 
+pub mod bench;
 pub mod chat;
 /// The loaded device engine behind a slug, as one type over both backends —
 /// the seam that lets `serve` stop being CUDA-only.

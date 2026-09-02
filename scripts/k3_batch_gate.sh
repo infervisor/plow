@@ -48,13 +48,11 @@
 # wrong.
 #
 #   STEPS  decode steps per arm (default 24)
-#   CTX    --ctx (default 5; see kimi-k3-README.md §5 — at ctx > prompt length the run decodes
-#          over KV nobody prefilled, so a correctness A/B must use ctx == prompt length)
 set -uo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BLOB="${1:?blob dir}"; HSACO="${2:?hsaco dir}"; CKPT="${3:?checkpoint}"; B="${4:-4}"
 ALT_BLOB="${5:-}"; ALT_HSACO="${6:-}"
-STEPS="${STEPS:-24}"; CTX="${CTX:-5}"
+STEPS="${STEPS:-24}"
 BIN="${PLOWRT_BIN:-$WT/target/release/plowrt}"
 LEASE="$WT/perf-data/tools/gpulease"
 
@@ -70,7 +68,7 @@ run() { # <label> <blob-dir> <hsaco-dir> <prompt-spec> <extra-args...>
   local log="/tmp/k3bg_$lbl.log"
   GPU_LEASE_TIMEOUT=7200 "$LEASE" -n 8 "k3bg-$lbl" sg render -c \
     "PLOW_L2_PLACE_DISPATCH=1 nix develop $WT --command $BIN amd-bench --blob $bl/model.pkt \
-     --hsaco $hs --checkpoint $CKPT --tp 8 --steps $STEPS --ctx $CTX --prompt '$pr' $*" \
+     --hsaco $hs --checkpoint $CKPT --tp 8 --steps $STEPS --prompt '$pr' $*" \
     > "$log" 2>&1
   # the generated id list, one line per sequence slot
   grep -oE "^  \[[0-9, ]+\]" "$log"

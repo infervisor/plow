@@ -463,7 +463,7 @@ impl DevBlob {
     }
 
     /// Index of the first decode rung. The compiler emits prefill buckets first,
-    /// then a trailing ascending decode ladder whose widths are at most 32.
+    /// then a trailing ascending decode ladder whose widths are at most 128.
     pub fn decode_rung_lo(&self) -> usize {
         let widths: Vec<u32> = self.progs.iter().map(|p| p.t).collect();
         packet::devbuild::decode_rung_lo(&widths)
@@ -491,10 +491,11 @@ impl DevBlob {
             .decode_progs()
             .last()
             .ok_or_else(|| RuntimeError::Device("devblob: no programs".into()))?;
-        if g.t == 0 || g.t > 32 {
+        if g.t == 0 || g.t > packet::devbuild::DECODE_RUNG_MAX {
             return Err(RuntimeError::Device(format!(
-                "devblob: last program has T={} — not the decode program (batch 1..=32)",
-                g.t
+                "devblob: last program has T={} — not the decode program (batch 1..={})",
+                g.t,
+                packet::devbuild::DECODE_RUNG_MAX
             )));
         }
         Ok(g)

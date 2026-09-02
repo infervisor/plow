@@ -91,13 +91,14 @@ AX_PREFILL="-DPLOW_BUCKET_DECODE=0 $CDNA3_TILE $AX_GMOE"
 # PLOW_GEMV_MM is next_pow2(PLOW_DECODE_BATCH) CLAMPED TO 16, not the batch itself. The GEMV
 # ladder instantiates MM in {1,2,4,8,16} and one instantiation with a runtime M serves every
 # M <= MM, so the bucket is a CEILING. Passing the raw batch through was a bug in this script:
-# PLOW_DECODE_BATCH=32 handed -DPLOW_GEMV_MM=32 to hipcc and every decode row failed to build.
+# Passing PLOW_DECODE_BATCH directly handed unsupported MM values to hipcc and every decode row
+# failed to build. Walking objects keep MM capped at 16 while serving batches through 128.
 RAW_BATCH="${PLOW_DECODE_BATCH:-1}"
 case "$RAW_BATCH" in
-  ''|*[!0-9]*) echo "PLOW_DECODE_BATCH must be an integer in 1..32" >&2; exit 1 ;;
+  ''|*[!0-9]*) echo "PLOW_DECODE_BATCH must be an integer in 1..128" >&2; exit 1 ;;
 esac
-if [ "$RAW_BATCH" -lt 1 ] || [ "$RAW_BATCH" -gt 32 ]; then
-  echo "PLOW_DECODE_BATCH must be in 1..32, got $RAW_BATCH" >&2
+if [ "$RAW_BATCH" -lt 1 ] || [ "$RAW_BATCH" -gt 128 ]; then
+  echo "PLOW_DECODE_BATCH must be in 1..128, got $RAW_BATCH" >&2
   exit 1
 fi
 P2=1

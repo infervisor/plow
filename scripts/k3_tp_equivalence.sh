@@ -69,7 +69,8 @@
 #
 # Env: PLOW_K3_CKPT (default the k3_farm symlink farm, else the HF snapshot), PLOW_K3_HSACO
 # (/home/lava/models/k3_mi325x/hsaco), PLOW_K3_LAYERS (1,2), PLOW_K3_COS (0.9999), PLOW_K3_STEPS (3),
-# PLOW_K3_PROMPT ("The capital of France is"), PLOW_K3_OUT (a tmpdir), PLOW_K3_MIN_FREE_GIB (28).
+# PLOW_K3_PROMPT ("The capital of France is"), PLOW_K3_OUT (a tmpdir), PLOW_K3_MIN_FREE_GIB (28),
+# PLOW_K3_ARCH (gfx942), PLOW_K3_GPU (MI325X), PLOW_K3_NCU (304).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -87,6 +88,9 @@ COS="${PLOW_K3_COS:-0.9999}"
 PROMPT="${PLOW_K3_PROMPT:-1008,10484,318,15383,387}"   # "The capital of France is"
 OUT="${PLOW_K3_OUT:-/tmp/k3_tp_equiv}"
 MIN_FREE_GIB="${PLOW_K3_MIN_FREE_GIB:-28}"
+ARCH="${PLOW_K3_ARCH:-gfx942}"
+GPU="${PLOW_K3_GPU:-MI325X}"
+NCU="${PLOW_K3_NCU:-304}"
 IFS=, read -ra NLAYERS <<< "${PLOW_K3_LAYERS:-1,2}"
 
 # --- prerequisites, every one a clean skip ---------------------------------------------------
@@ -128,6 +132,7 @@ printf '%s\n' "${NLAYERS[@]}" | grep -qx 2 || \
 echo "checkpoint  $CK"
 echo "objects     $HS"
 echo "depths      ${NLAYERS[*]}   steps $STEPS   cos floor $COS"
+echo "target      $ARCH / $GPU / $NCU CUs"
 echo "GPU 0 free  ${FREE_GIB} GiB of ${NGPU} GPUs visible"
 echo
 
@@ -141,8 +146,8 @@ for N in "${NLAYERS[@]}"; do
     # K3_PREFILL=0 on BOTH sides: one program, walked a token at a time, so the degree is the
     # only difference. `--num-gpus` is what makes the emit sharded; there is no `--tp` on plowc.
     K3_FULL=1 PLOW_K3_LAYERS="$N" K3_PREFILL=0 PLOW_FP8_KV=1 PLOW_MXFP4=1 \
-      ./target/release/plowc --hf-dir "$CK" --emit devblob --arch gfx942 --gpu MI325X \
-      --num-gpus "$G" --parallel tp --max-ctx 4096 --n-cu 304 --out "$b" 2>&1 \
+      ./target/release/plowc --hf-dir "$CK" --emit devblob --arch "$ARCH" --gpu "$GPU" \
+      --num-gpus "$G" --parallel tp --max-ctx 4096 --n-cu "$NCU" --out "$b" 2>&1 \
       | grep -aE "^kimi_k3: emitted" \
       || fail "N=$N tp=$G: emit failed"
     # `--dump-logits` on the tp==1 path needs the decode-walk fallback and the dump closure that
@@ -156,7 +161,7 @@ for N in "${NLAYERS[@]}"; do
     run_rc=0
     "$LEASE" -n "$G" "k3-tp-equiv-n${N}-tp${G}" \
       ./target/release/plowrt amd-bench --blob "$b/model.pkt" --hsaco "$HS" \
-      --checkpoint "$CK" --prompt "$PROMPT" --steps "$STEPS" --ctx 512 --tp "$G" \
+      --checkpoint "$CK" --prompt "$PROMPT" --steps "$STEPS" --tp "$G" \
       --dump-logits "$l" > "$log" 2>&1 || run_rc=$?
     grep -aE "^prefill:|^  \[" "$log" || true
     if grep -aq "^Error" "$log"; then

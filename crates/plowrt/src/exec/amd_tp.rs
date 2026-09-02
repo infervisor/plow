@@ -203,6 +203,16 @@ use crate::{Result, RuntimeError};
 /// rather than ~23 the same microseconds are worth cadencing. Measure first.
 const DEFAULT_AGREE_EVERY: u32 = 1;
 
+fn agreement_due(tick: &mut u32, every: u32) -> bool {
+    let all = *tick >= every;
+    *tick = if all { 1 } else { *tick + 1 };
+    all
+}
+
+fn deferred_capture_saves_readback(agree_every: u32) -> bool {
+    agree_every > 1
+}
+
 /// N co-resident ranks of one sharded model.
 pub struct AmdTpGroup {
     /// Peer buffers, counter regions, and the launch discipline.
@@ -559,10 +569,10 @@ impl AmdTpGroup {
     /// One batched decode step across every rank: submit, drain, return the `pos.len()` sampled
     /// ids.
     ///
-    /// AGREEMENT IS CHECKED ON THE WHOLE B-VECTOR, not on slot 0. Every rank samples from its own
-    /// shard of the logits, so a broken all-reduce still yields fluent ids — agreement is the only
-    /// signal that distinguishes it from a working one. Checking slot 0 alone would test one of B
-    /// sequences and report green while the rest diverged, which is the same mistake
+    /// On an agreement sample the WHOLE B-VECTOR is checked, not only slot 0. Every rank samples
+    /// from its own shard of the logits, so a broken all-reduce still yields fluent ids — agreement
+    /// is the only signal that distinguishes it from a working one. Checking slot 0 alone would
+    /// test one of B sequences and report green while the rest diverged, which is the same mistake
     /// `amd_bench`'s B=16 batched arm made (it compared every slot against slot 0 rather than
     /// against the first slot carrying its own prompt).
     pub fn decode_step_batched(&mut self, pos: &[u32], kvlen: &[u32]) -> Result<Vec<u32>> {
@@ -578,28 +588,89 @@ impl AmdTpGroup {
         dp: usize,
     ) -> Result<Vec<u32>> {
         self.submit_decode_batched_at(pos, kvlen, dp)?;
+        self.complete_decode_batched(pos.len())
+    }
+
+    /// Complete a batched decode and return one sampled id per host slot.
+    ///
+    /// The same agreement cadence as scalar decode applies here. Counter
+    /// auditing still runs every token; on agreement tokens every sampled row
+    /// is compared across ranks, while other tokens copy only rank 0's rows.
+    pub fn complete_decode_batched(&mut self, batch: usize) -> Result<Vec<u32>> {
+        use crate::obs::dstep;
         self.drain_and_audit()?;
-        // Only the rung's rows sampled; the reply still comes back `pos.len()` long so callers
-        // can index it BY SLOT, with the uncovered tail zeroed.
-        let b = pos.len();
-        let rows = (self.ranks[0].prog_t(dp) as usize).min(b);
-        let per_rank: Vec<Vec<u32>> = self
-            .ranks
-            .iter_mut()
-            .map(|e| e.read_sampled_batched(rows))
-            .collect::<Result<_>>()?;
-        for (r, ids) in per_rank.iter().enumerate().skip(1) {
-            if ids != &per_rank[0] {
-                return Err(RuntimeError::Device(format!(
-                    "TP ranks disagree on a batched decode step: rank 0 sampled {:?}, rank {r} \
-                     sampled {ids:?} — the all-reduce is wrong",
-                    per_rank[0]
-                )));
+        let all = agreement_due(&mut self.agree_tick, self.agree_every);
+        let rows = (self.ranks[0].prog_t(self.cur_dp) as usize).min(batch);
+        dstep::timed(&dstep::READ, || {
+            let mut ids = self.ranks[0].read_sampled_batched(rows)?;
+            if all {
+                for (r, rank) in self.ranks.iter_mut().enumerate().skip(1) {
+                    let peer = rank.read_sampled_batched(rows)?;
+                    if peer != ids {
+                        return Err(RuntimeError::Device(format!(
+                            "TP ranks disagree on a batched decode step: rank 0 sampled \
+                             {ids:?}, rank {r} sampled {peer:?} — the all-reduce is wrong"
+                        )));
+                    }
+                }
             }
+            // Only the rung's rows sampled; the reply still comes back `batch` long so callers
+            // can index it BY SLOT, with the uncovered tail zeroed.
+            ids.resize(batch, 0);
+            Ok(ids)
+        })
+    }
+
+    pub(crate) fn deferred_token_capture_available(&self) -> bool {
+        // At cadence 1 the mandatory agreement already reads every rank every
+        // token; adding a capture launch and final ring read cannot remove a
+        // host readback and would only add work.
+        deferred_capture_saves_readback(self.agree_every)
+            && self
+                .ranks
+                .first()
+                .is_some_and(AmdEngine::deferred_token_capture_available)
+    }
+
+    /// Capture rank 0's sampled rows on-device, then retain the ordinary
+    /// per-token drain, counter audit, and configured cross-rank agreement.
+    pub(crate) fn complete_decode_batched_deferred(
+        &mut self,
+        batch: usize,
+        step: usize,
+        quantum: usize,
+    ) -> Result<()> {
+        use crate::obs::dstep;
+        let rows = (self.ranks[0].prog_t(self.cur_dp) as usize).min(batch);
+        self.ranks[0].enqueue_token_capture(step, quantum, rows)?;
+        self.drain_and_audit()?;
+        if agreement_due(&mut self.agree_tick, self.agree_every) {
+            dstep::timed(&dstep::READ, || {
+                let ids = self.ranks[0].read_sampled_batched(rows)?;
+                for (r, rank) in self.ranks.iter_mut().enumerate().skip(1) {
+                    let peer = rank.read_sampled_batched(rows)?;
+                    if peer != ids {
+                        return Err(RuntimeError::Device(format!(
+                            "TP ranks disagree on deferred batched decode step: rank 0 sampled \
+                             {ids:?}, rank {r} sampled {peer:?}"
+                        )));
+                    }
+                }
+                Ok(())
+            })?;
         }
-        let mut ids = per_rank.into_iter().next().expect(">=1 rank");
-        ids.resize(b, 0);
-        Ok(ids)
+        Ok(())
+    }
+
+    pub(crate) fn read_deferred_tokens(
+        &mut self,
+        batch: usize,
+        quantum: usize,
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
+        crate::obs::dstep::timed(&crate::obs::dstep::READ, || {
+            self.ranks[0].read_token_capture(batch, quantum, out)
+        })
     }
 
     /// Dispatch one decode token on every rank and RETURN — no wait.
@@ -745,8 +816,7 @@ impl AmdTpGroup {
     pub fn complete_decode(&mut self) -> Result<Vec<u32>> {
         use crate::obs::dstep;
         self.drain_and_audit()?;
-        let all = self.agree_tick >= self.agree_every;
-        self.agree_tick = if all { 1 } else { self.agree_tick + 1 };
+        let all = agreement_due(&mut self.agree_tick, self.agree_every);
         dstep::timed(&dstep::READ, || {
             if all {
                 self.ranks.iter_mut().map(|e| e.read_sampled()).collect()
@@ -968,10 +1038,15 @@ impl AmdTpGroup {
 
     /// The chunk plan covering `[from, to)` — the cursor a chunked server steps through.
     pub fn plan_span(&self, from: u32, to: u32) -> Result<Vec<ChunkStep>> {
+        self.plan_span_at_most(from, to, u32::MAX)
+    }
+
+    /// The span plan using only compiled rungs no wider than `max_bucket`.
+    pub fn plan_span_at_most(&self, from: u32, to: u32, max_bucket: u32) -> Result<Vec<ChunkStep>> {
         if from >= to {
             return Ok(Vec::new());
         }
-        let chunks = self.ranks[0].plan_for(to - from)?;
+        let chunks = self.ranks[0].plan_for_at_most(to - from, max_bucket)?;
         self.ranks[0].chunk_steps_from(&chunks, from, to)
     }
 
@@ -1170,11 +1245,8 @@ impl AmdTpGroup {
 /// slots. Measured on the GLM-5.2 TP4 stacked blob: `n_xctr = 312`, prefill fold
 /// at 312/313, and the ranks sampled `[99419, 785, 99419, 785]`.
 fn xargmax_value_lines(n_batch: u32) -> u32 {
-    if n_batch > 16 {
-        2
-    } else {
-        1
-    }
+    packet::devbuild::xargmax_value_lines(n_batch)
+        .expect("AmdEngine rejects XArgmaxFin batches above the packet limit")
 }
 
 fn count_xgates(blob: &DevBlob) -> u32 {
@@ -1188,7 +1260,7 @@ fn count_xgates(blob: &DevBlob) -> u32 {
                 // two-shot: reduce-scatter (i3) and all-gather (i4)
                 top = top.max(d.i[3] + 1).max(d.i[4] + 1);
             } else if d.op == DevOp::XArgmaxFin as u16 {
-                // sharded-head fold: arrival gate (i3), then one or two value lines at i4
+                // sharded-head fold: arrival gate (i3), then consecutive value lines at i4
                 top = top
                     .max(d.i[3] + 1)
                     .max(d.i[4] + xargmax_value_lines(d.i[1]));
@@ -1225,7 +1297,7 @@ fn count_xgates(blob: &DevBlob) -> u32 {
 /// equality check rather than a range test — it then also catches a stale count
 /// that survived a missing `zero_xctr`.
 ///
-/// `None` means NOT A COUNTER. `XArgmaxFin`'s `i[4]` names one or two peer-visible u64 data
+/// `None` means NOT A COUNTER. `XArgmaxFin`'s `i[4]` names consecutive peer-visible u64 data
 /// lines that happen to live in the counter region because a counter line is 128
 /// aligned peer-visible bytes the host already zeroes; its low word is the
 /// complement of the winning global vocab index, i.e. an arbitrary value. Auditing
@@ -1302,6 +1374,8 @@ mod tests {
     #[test]
     fn cross_rank_agreement_is_not_sampled_by_default() {
         assert_eq!(DEFAULT_AGREE_EVERY, 1);
+        assert!(!deferred_capture_saves_readback(DEFAULT_AGREE_EVERY));
+        assert!(deferred_capture_saves_readback(2));
     }
 
     /// The cadence must fire on token ZERO. A rank that bound the wrong shard is
@@ -1313,14 +1387,9 @@ mod tests {
     fn the_cadence_is_armed_on_the_first_token() {
         // The state machine `complete_decode` runs, in isolation: it reads
         // every rank when `tick >= every`, then restarts the count at 1.
-        let step = |tick: &mut u32, every: u32| {
-            let all = *tick >= every;
-            *tick = if all { 1 } else { *tick + 1 };
-            all
-        };
         let every = 4;
         let mut tick = every; // as `load` and `audit_cadence` leave it
-        let fired: Vec<bool> = (0..9).map(|_| step(&mut tick, every)).collect();
+        let fired: Vec<bool> = (0..9).map(|_| agreement_due(&mut tick, every)).collect();
         assert_eq!(
             fired,
             [true, false, false, false, true, false, false, false, true],
@@ -1332,12 +1401,12 @@ mod tests {
         // entire claim is that every rank emitted an identical stream.
         let mut tick = 1u32;
         assert!(
-            (0..8).all(|_| step(&mut tick, 1)),
+            (0..8).all(|_| agreement_due(&mut tick, 1)),
             "every=1 must never skip"
         );
     }
 
-    /// The sharded-lm_head fold owns two or three xctr ids and they are allocated AFTER
+    /// The sharded-lm_head fold owns one gate plus one or more value-line ids, allocated AFTER
     /// every layer collective, so a sizer that only counts reduces under-sizes
     /// the region by exactly the fold — and the fold then signals past the end
     /// of `xctr` with no fault. Measured: on the GLM-5.2 TP4 stacked blob the
@@ -1408,5 +1477,11 @@ mod tests {
         assert_eq!(e[0][2], Some(4));
         assert_eq!(e[0][3], None);
         assert_eq!(e[0][4], None);
+
+        blob.progs[0].insts[1].i[1] = 128;
+        assert_eq!(count_xgates(&blob), 11);
+        let e = gate_expectations(&blob, 4, 11);
+        assert_eq!(e[0][2], Some(4));
+        assert!(e[0][3..11].iter().all(Option::is_none));
     }
 }

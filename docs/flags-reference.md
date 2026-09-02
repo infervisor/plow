@@ -261,7 +261,7 @@ are not parity-preserving.
 | `PLOW_K3_NS` | measured | pin FlashMLA-decode `nsplit` for K3 MLA layers. |
 | `PLOW_K3_FUSE_NGEMV` | **on** | fold the two B1 `norm→GEMV` sites; `0` restores the unfused control, `lat`/`q` isolate one site. Full TP8 BF16-logit gate is byte-exact. |
 | `PLOW_K3_KDA_CONV_STEP_DB` | off | B1-only experiment: emit `KdaConvStateStepG` and allocate ping-pong KDA convolution-window banks. The selected decode object must also be built with `PLOW_KDA_CONV_STEP_DB=1`; packet/object mismatch is refused. |
-| `PLOW_K3_SHARD_HEAD` | **off** ⚠️ | vocab-column-parallel `lm_head`; unvalidated on real K3. |
+| `PLOW_K3_SHARD_HEAD` | **off** | vocab-column-parallel `lm_head`; measured on real K3 gfx950 TP8 with token-identical output, 33.160 to 32.781 ms/token (-1.14%). |
 | `PLOW_GLM_FUSE_A` / `PLOW_GLM_FUSE_G` | **on** | fuse the GLM A-projection / gate GEMVs (byte-identical); `=0` splits. |
 | `PLOW_GLM_DSA` | **on** (ctx>65536) | arm the DSA sparse-indexer gather above the measured ctx crossover; `=0` forces dense. |
 | `PLOW_GLM_GF` | ctx-adaptive (2/4) | pin the MLA head-fusion factor; `=8` needs a `-DPLOW_GLM_GF8_ARM=1` object. |
@@ -616,12 +616,12 @@ values cost.
 
 | var | default | effect |
 |---|---|---|
-| `PLOW_PF_BATCH=1` | off | PX-1 cross-request batched prefill — packs waiting requests' prefill chunks into one launch. +27% saturated multi-user throughput. **Silently inert on fp8-KV packets** (no handle left for the request table; engine logs and serializes). Also ignored under `PLOW_VMM_PREFIX=1`. |
-| `PLOW_PF_INTERLEAVE=N` | 2048 | **Chunked prefill quantum — the default path, not a `PLOW_PF_BATCH` knob.** Once any slot is decoding, a tick admits at most `N` prefill rows, then runs the decode launch. `0` = uncapped. **It can only clamp BELOW the emitted ladder** (fixed at emit by `PLOW_MAX_CHUNK`), so raising above that is a no-op. |
-| `PLOW_PF_CHUNK=C` | 0 (off) | **Experimental** per-request prefill chunk-row cap. Measured ~10% regression at B=8; off = byte-identical. |
+| `PLOW_PF_BATCH=1` | off | Cross-request prefill policy. CUDA packs waiting chunks into one launch (+27% saturated multi-user throughput; inert on fp8-KV and ignored under `PLOW_VMM_PREFIX=1`). AMD round-robins serialized chunks across pending slots; it does not co-pack because packet rows currently carry one sequence's KV and recurrent-state view. |
+| `PLOW_PF_INTERLEAVE=N` | 2048 | **CUDA + AMD TP chunked-prefill quantum — the default path, not a `PLOW_PF_BATCH` knob.** Once any slot is decoding, a tick admits at most `N` prefill rows, then runs decode. AMD selects an existing packet rung at or below `N` and still handles one request per tick. `0` = uncapped. It can only clamp below the emitted ladder. |
+| `PLOW_PF_CHUNK=C` | 0 (off) | **Experimental, CUDA + AMD TP serving** per-request prefill chunk-row cap. AMD selects only compiled packet rungs at or below `C` (for example, K3 8192 with `C=4096` plans 4096+4096); it does not pack chunks across requests. The ~10% B=8 regression was measured on CUDA; AMD remains unmeasured. Off preserves the existing plan. |
 | `PLOW_PF_CHUNK_COST=R` | 512 | cost of ONE prefill launch in padded-row equivalents (`rows + R × launches`). A launch re-streams every layer's weights: measured `ttft_ms = 0.112·rows + 60.1·chunks`, i.e. **60 ms ≈ 537 rows**. `0` = pure-minimum-padding. |
 | `PLOW_PF_COVER=1` | off | restore the covering-bucket prefill policy (exact-parity A/B vs the cost-aware default). |
-| `PLOW_PF_DEFER_DECODE=1` | off | **Throughput mode — trades streaming latency for aggregate tok/s.** Runs prefill chains to completion, skips decode, so later decode ticks run at full batch. 8×127k: **+7.1% out tok/s** (PX-17). ⚠️ **No token leaves the server until every prompt is resident** — wrong as an interactive default. |
+| `PLOW_PF_DEFER_DECODE=1` | off | **CUDA + AMD TP throughput mode — trades streaming latency for aggregate tok/s.** While pending prefill remains, skips decode so later decode ticks run at full batch. A completed prefill may emit its first token, but no request advances decode until admitted prefill drains. The 8×127k **+7.1% out tok/s** result was measured on CUDA; AMD is unmeasured. Wrong as an interactive default. |
 | `PLOW_PF_PACKLOG=1` | off | per-launch pack diagnostics. |
 | `PLOW_PF_NO_CHUNK=1` | off | restore whole-prompt-per-tick (disable chunked prefill). |
 | `PLOW_PF_NO_INTERLEAVE=1` | off | restore a prefill-only tick (disable prefill/decode interleave). |

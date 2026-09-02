@@ -78,37 +78,38 @@ No deadlocks, all dependencies honored, finite makespan. `--bucket decode:1:128`
 isolates a bucket; `--math golden` runs reference numerics. A schedule that will
 not sim will not serve — fix it here.
 
-### 2. Single-stream latency floor (device, one sequence)
+### 2. Production-engine latency and throughput
 
-`amd-bench` is a temporary diagnostic path, not the production performance
-authority: it drives `AmdEngine` directly and bypasses `AmdServe` scheduling.
-Use it only for kernel-floor, trace, tensor-dump, and TP-rank diagnostics. Record
-publishable TTFT, TPOT, and throughput through `plowrt serve` in step 3. Migrate
-this step to the planned production-engine benchmark before removing
-`amd-bench`.
+`plowrt bench` is the performance authority. It drives the same `ServeEngine`
+and mux as `serve`, excludes model load and warmup from the timed interval, and
+fails without JSON on partial output, shedding, TP rank disagreement, or CPU
+fallback. Start at concurrency 1, then repeat at the target concurrency:
 
 ```bash
-plowrt amd-bench --blob $ASSETS/model.pkt --hsaco $ASSETS/hsaco \
-    --checkpoint $CKPT --prompt 1,2,3,4 --steps 64 --ctx 1024
+plowrt bench --assets $ASSETS --prompt-ids 1,2,3,4 \
+    --concurrency 1 --requests 8 --warmup-requests 1 --output-len 64
 ```
 
-Records the TPOT floor (per-token decode ms) and, with a multi-token `--prompt`,
-the TTFT floor (prefill ms / tok/s). **Without `--checkpoint` the ids are noise —
-timing only.** This is the `$VENDOR = amd` path; on nvidia, measure the
-single-stream floor through `serve` at concurrency 1 instead. For TP prefill
-scaling: `--tp $NGPU --prefill-sweep 512,1024,2048,4096,8192 --prefill-reps 3`
-(every sweep point ≤ `$MAXCTX`).
+The JSON records TTFT/TPOT/ITL/E2E distributions, throughput, scheduler rungs,
+TP width, active runtime settings, packet/object checksums, and checkpoint
+layout. Preserve each JSON result with the exact command and environment.
+
+`amd-bench` drives `AmdEngine` directly and bypasses production scheduling. Use
+it only for packet traces, tensor/logit snapshots, repeated-prefill sweeps,
+synthetic kernel floors, and diagnosing a TP disagreement reported by
+`plowrt bench`. Never publish it as served-model performance.
 
 ### 2a. AMD benchmark harness convergence
 
 Track `amd-bench` removal as a staged migration, not a flag deletion:
 
-- [ ] Inventory and classify every consumer: performance, correctness,
+- [x] Inventory and classify every consumer: performance, correctness,
   trace/dump, TP audit, prefill sweep, or synthetic unbound probe.
-- [ ] Add a vendor-neutral `plowrt bench` backed by production `AmdServe`, with
-  token-id direct mode and endpoint mode; require bound weights by default.
-- [ ] Emit fail-closed structured results with artifact digests, target/TP,
-  shape/concurrency, warmups/repetitions, latency distribution, throughput, and
+- [x] Add a vendor-neutral in-process `plowrt bench` backed by the production
+  engines, with token-id direct mode and bound weights by default.
+- [ ] Add endpoint mode; Stage 7 remains the endpoint acceptance authority.
+- [x] Emit fail-closed structured results with artifact digests, target/TP,
+  shape/concurrency, warmup/request counts, latency distribution, throughput, and
   active knobs.
 - [ ] Expose shared trace, tensor/logit snapshot, TP-rank audit, bucket timing,
   repeated-prefill, and ragged-batch diagnostics without reaching through
@@ -117,8 +118,10 @@ Track `amd-bench` removal as a staged migration, not a flag deletion:
   `amd-probe`; never report it as served-model performance.
 - [ ] Add bench-vs-serve parity tests for tokens, buckets, chunk boundaries, slot
   lifecycle, batch-ladder rungs, and TP rank agreement.
-- [ ] Migrate scripts and docs; keep Stage 7 endpoint-only, warn for one release,
-  then remove `amd-bench` only when repository search finds no consumers.
+- [x] Migrate the headline production A/B script and runtime-optimization docs.
+- [ ] Migrate remaining consumers where production scheduling is the intent;
+  keep Stage 7 endpoint-only, warn for one release, then remove `amd-bench` only
+  when repository search finds no diagnostic consumers.
 
 ### 3. Bring up serving and baseline
 
@@ -148,25 +151,31 @@ slot *i* is engine slot *i*.
 
 Highest value first; keep only what helps *your* target:
 
-1. **Multi-step + device sampling** (`$VENDOR = nvidia`): `PLOW_MULTISTEP=8`,
-   `PLOW_DEV_SAMPLE=1`. Largest single decode win (measured ~1.74× on one part;
-   confirm the size on `$GPU`).
+1. **Multi-step + device sampling**: NVIDIA supports `PLOW_MULTISTEP` up to 64
+   with `PLOW_DEV_SAMPLE=1`. AMD TP supports a bounded K≤4 capture ring only
+   when `PLOW_TP_AGREE_EVERY>1`, while retaining each token's counter audit.
+   The AMD path is correctness-gated but has no resolved speedup yet; keep it
+   only after a matched A/B on `$GPU`.
 2. **Batch width `B`** from the **TPOT budget**, not peak throughput. Decode is
    bandwidth-bound against `$BW_BOUND`, so the crossover is a `$GPU` property —
    derive it, do not inherit it. If a different `B` is needed, recompile in
    Stage 5 (`PLOW_DECODE_BATCH`).
 3. **Prefill chunking / interleave** only if the TTFT-under-load tail is the
-   problem (`--pf-interleave`, `--pf-chunk`; `$VENDOR = nvidia`). Measure —
+   problem (`--pf-interleave`, `--pf-chunk`; both vendors). Measure —
    finer often loses throughput; and re-fit `--pf-chunk-cost` on `$GPU`, its
-   default is another part's launch cost. On `$VENDOR = amd` the ragged-tail
-   chunk (`PLOW_RAGGED_CHUNK`) is on by default.
+   default is another part's launch cost. AMD TP selects from its compiled
+   ladder, re-splits a pending chunk when decode lowers the cap, and keeps
+   recurrent requests isolated; `PLOW_PF_BATCH=1` is fair rotation, not
+   co-packing. Its ragged-tail chunk (`PLOW_RAGGED_CHUNK`) is on by default.
 4. **Prefix cache** if traffic shares prefixes: `--vmm-prefix` (nvidia;
    `--vmm-block-mib` is the real knob — 64 MiB won at long ctx on the measured
    part) or `--prefix-cache` (amd, recurrent families).
    **Always report the hit rate** — a low-hit cache is a net loss.
 5. **TP** if one `$GPU` cannot hold the model / hit the budget; `$PARALLEL` must
-   be `tp`. Gate on rank token-identity: `plowrt devices --tp $NGPU`,
-   `plowrt amd-bench --tp $NGPU` (every rank must emit the identical stream).
+   be `tp`. Check peer visibility with `plowrt devices --tp $NGPU`, then gate
+   performance and rank agreement with `plowrt bench` on the TP assets. The
+   default agreement interval checks every token; use `amd-bench` only to
+   diagnose a reported disagreement rank by rank.
 6. **Load / cold start** (`--rt-prefetch-threads`, weight-slab knobs) only if
    time-to-serving matters. `PLOW_WEIGHT_VMM` helps nvidia, hurts amd — leave
    the amd default off.

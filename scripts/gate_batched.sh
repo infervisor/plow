@@ -24,7 +24,7 @@ run() { # <blob-batch> <hsaco-batch> <prompt-spec> <label>
   $RT amd-bench \
     --blob /home/lava/plow/build-amd/g31b-db$1/model.pkt \
     --hsaco /home/lava/plow/build-amd/hsaco-b$2 --checkpoint "$CKPT" \
-    --steps 4 --ctx 1024 --batched --prompt "$3" 2>&1 \
+    --steps 4 --batched --prompt "$3" 2>&1 \
     | grep -E "slot [0-9]|agree|chain|tpot|Error|error"
 }
 

@@ -2874,24 +2874,26 @@ pub fn emit_k3_model(
     if k3_shard_head(c) {
         // XArgmaxFin SUBSUMES ArgmaxFin — it folds the AMAX_BLOCKS partials itself, rebases the
         // winning index by `rank * vocab_l` and takes the cross-rank max. Emitting both would fold
-        // twice and write the LOCAL winner's id first. Two or three xctr ids: the arrival gate and
-        // peer-visible value line(s), distinct because one is an atomic counter and the others
-        // are data. Each 128-byte line carries sixteen u64 winners.
+        // twice and write the LOCAL winner's id first. One arrival gate plus peer-visible value
+        // lines, distinct because one is an atomic counter and the others are data. Each
+        // 128-byte line carries sixteen u64 winners.
+        let value_lines = packet::devbuild::xargmax_value_lines(s_rows).unwrap_or_else(|| {
+            panic!(
+                "XArgmaxFin carries at most {} sequences, got {s_rows}",
+                packet::devbuild::XARGMAX_MAX_BATCH
+            )
+        });
         let gate = tp.xgate;
-        let value_lines = if s_rows > 16 { 2 } else { 1 };
-        tp.xgate += 1 + value_lines;
+        tp.xgate = tp
+            .xgate
+            .checked_add(1 + value_lines)
+            .expect("XArgmaxFin counter id overflow");
         b.emit(DevOp::XArgmaxFin, vec![0u32], &[c_am], |d| {
             d.t[0] = ids;
             d.t[1] = amax;
             d.i[0] = crate::AMAX_BLOCKS;
-            // n_batch. The fold publishes one u64 per sequence into one or two 128-byte peer
+            // n_batch. The fold publishes one u64 per sequence into consecutive 128-byte peer
             // lines, matching PLOW_XAMAX_MAX_BATCH in op_collective.h.
-            const XAMAX_MAX_BATCH: u32 = 32;
-            assert!(
-                s_rows <= XAMAX_MAX_BATCH,
-                "XArgmaxFin carries at most {XAMAX_MAX_BATCH} sequences in two xctr data lines, \
-                 got {s_rows}"
-            );
             d.i[1] = s_rows;
             d.i[2] = vocab_l;
             d.i[3] = gate;

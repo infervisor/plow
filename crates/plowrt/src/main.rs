@@ -64,6 +64,46 @@ enum Cmd {
         max_queued_requests: usize,
     },
 
+    /// Benchmark one model through the production serving scheduler without HTTP.
+    Bench {
+        /// Compiled-model directory.
+        #[arg(long)]
+        assets: PathBuf,
+        /// Comma-separated token ids. Omit for deterministic random ids.
+        #[arg(long, conflicts_with = "random_input_len")]
+        prompt_ids: Option<String>,
+        /// Number of deterministic random prompt tokens.
+        #[arg(long)]
+        random_input_len: Option<usize>,
+        /// Seed for deterministic random token-id prompts.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Maximum simultaneous requests maintained against the mux.
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        /// Measured requests. New work is submitted as each request completes.
+        #[arg(long, default_value_t = 10)]
+        requests: usize,
+        /// Requests run and validated before timing.
+        #[arg(long, default_value_t = 1)]
+        warmup_requests: usize,
+        /// Exact generated-token count per request.
+        #[arg(long, default_value_t = 128)]
+        output_len: usize,
+        /// Number of CPU executor threads when no matching GPU backend is available.
+        #[arg(long, default_value_t = 8)]
+        executors: u32,
+        /// Mux arrival-rate batch-formation hold ceiling in milliseconds.
+        #[arg(long, default_value_t = 8.0)]
+        max_hold_ms: f64,
+        /// Mux admission SLO in milliseconds.
+        #[arg(long, default_value_t = 250.0)]
+        slo_ms: f64,
+        /// Requests allowed outside engine slots. Zero derives four engine batches.
+        #[arg(long, default_value_t = 0)]
+        max_queued_requests: usize,
+    },
+
     /// Enumerate every visible device and, with `--tp`, bring up the
     /// tensor-parallel group: peer-mapped reduction regions, the per-rank
     /// cross-GPU counter tables, and the all-pairs peer-visibility check.
@@ -133,11 +173,11 @@ enum Cmd {
         #[arg(long)]
         prompt: Option<String>,
         /// Decode steps to time.
-        #[arg(long, default_value_t = 32)]
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..))]
         steps: u32,
-        /// Context position the decode steps run at — the KV the attention
-        /// actually reads, so it dominates the number.
-        #[arg(long, default_value_t = 1024)]
+        /// Context position for synthetic no-prompt timing. With `--prompt`, the
+        /// actual context is the prompt length and this option is rejected.
+        #[arg(long, default_value_t = 1024, conflicts_with = "prompt")]
         ctx: u32,
         /// Drive all `batch` sequences per dispatch (needs a blob compiled with
         /// PLOW_DECODE_BATCH > 1). Reports tpot AND aggregate throughput, which
@@ -283,10 +323,18 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     let filter_str = format!("{filter}");
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    if matches!(&cli.cmd, Cmd::Bench { .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -297,7 +345,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "plowrt starting"
     );
 
-    let cli = Cli::parse();
     RuntimeConfig::init(cli.rt_cfg);
     match cli.cmd {
         Cmd::Serve {
@@ -329,6 +376,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 socket,
                 executors,
                 trace,
+                MuxConfig {
+                    max_hold_ms,
+                    slo_ms,
+                    max_queued_requests,
+                    ..MuxConfig::default()
+                },
+            )
+            .await
+        }
+        Cmd::Bench {
+            assets,
+            prompt_ids,
+            random_input_len,
+            seed,
+            concurrency,
+            requests,
+            warmup_requests,
+            output_len,
+            executors,
+            max_hold_ms,
+            slo_ms,
+            max_queued_requests,
+        } => {
+            bench(
+                assets,
+                prompt_ids,
+                random_input_len.unwrap_or(32),
+                seed,
+                concurrency,
+                requests,
+                warmup_requests,
+                output_len,
+                executors,
                 MuxConfig {
                     max_hold_ms,
                     slo_ms,
@@ -390,6 +470,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             prefill_sweep,
             prefill_reps,
         } => {
+            tracing::warn!(
+                "amd-bench is diagnostic-only and deprecated as a performance authority; use `plowrt bench` for production-path measurements"
+            );
             if tp > 1 {
                 amd_bench_tp(
                     blob,
@@ -698,8 +781,8 @@ fn amd_bench(
             } else {
                 eng.prefill(&ids)?
             };
-            dump(&eng, "prefill")?;
             let ms = t0.elapsed().as_secs_f64() * 1e3;
+            dump(&eng, "prefill")?;
             println!(
                 "\nprefill: {} tokens in {ms:.1} ms ({:.0} tok/s) -> {tok}",
                 ids.len(),
@@ -721,20 +804,29 @@ fn amd_bench(
         if first != u32::MAX {
             out.push(first);
         }
-        let t0 = std::time::Instant::now();
+        let mut timed = std::time::Duration::ZERO;
         for s in 0..steps {
             // in.ids is NOT re-seeded: the device wrote the previous step's
             // sampled token there itself, which is what this step embeds.
+            let t0 = std::time::Instant::now();
             out.push(eng.decode_step(pos, pos + 1)?);
+            if s > 0 {
+                timed += t0.elapsed();
+            }
             dump(&eng, &format!("{s:03}"))?;
             pos += 1;
         }
-        let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
         println!("  {out:?}");
-        println!(
-            "  {steps} decode steps: {ms:.3} ms/token ({:.1} tok/s)",
-            1e3 / ms
-        );
+        if steps > 1 {
+            let timed_steps = steps - 1;
+            let ms = timed.as_secs_f64() * 1e3 / timed_steps as f64;
+            println!(
+                "  {timed_steps} timed decode steps (+1 discarded warmup): {ms:.3} ms/token ({:.1} tok/s)",
+                1e3 / ms
+            );
+        } else {
+            println!("  1 diagnostic decode step; no timing reported (warmup only)");
+        }
         if !eng.weights_bound() {
             println!("  (weights unbound — these ids are noise)");
         }
@@ -1014,15 +1106,19 @@ fn amd_bench_tp(
         }
 
         let mut chains: Vec<Vec<u32>> = vec![Vec::new(); b];
-        let t = std::time::Instant::now();
-        for _ in 0..steps {
+        let mut timed = std::time::Duration::ZERO;
+        for step in 0..steps {
             // SEED EVERY ROW EXPLICITLY. Prefill is single-sequence and writes `in.ids[0]` only,
             // so rows 1.. still hold whatever the last prefill left there; and after a step the
             // device has written all B rows itself, but re-seeding from the host chain keeps the
             // fed id and the recorded chain provably the same value.
             g.seed_ids(&feed)?;
             let kv: Vec<u32> = pos_v.iter().map(|x| x + 1).collect();
+            let t = std::time::Instant::now();
             let out = g.decode_step_batched(&pos_v, &kv)?;
+            if step > 0 {
+                timed += t.elapsed();
+            }
             dump(&g, &format!("b{:03}", chains[0].len()))?;
             for s in 0..b {
                 chains[s].push(out[s]);
@@ -1030,18 +1126,24 @@ fn amd_bench_tp(
                 pos_v[s] += 1;
             }
         }
-        let ms = t.elapsed().as_secs_f64() * 1e3 / steps as f64;
         for c in &chains {
             println!("  {c:?}");
         }
-        println!(
-            "  {steps} batched steps: {ms:.3} ms/step, {:.1} tok/s AGGREGATE over {b} \
-             sequences ({:.1} tok/s per stream), all {} ranks token-identical",
-            b as f64 * 1e3 / ms,
-            1e3 / ms,
-            g.n_gpu()
-        );
+        if steps > 1 {
+            let timed_steps = steps - 1;
+            let ms = timed.as_secs_f64() * 1e3 / timed_steps as f64;
+            println!(
+                "  {timed_steps} timed batched steps (+1 discarded warmup): {ms:.3} ms/step, {:.1} tok/s AGGREGATE over {b} \
+                 sequences ({:.1} tok/s per stream), all {} ranks token-identical",
+                b as f64 * 1e3 / ms,
+                1e3 / ms,
+                g.n_gpu()
+            );
+        } else {
+            println!("  1 diagnostic batched step; no timing reported (warmup only)");
+        }
         trace_dump(&g)?;
+        return Ok(());
     }
 
     // A prompt makes this a real greedy decode from position 0. Without one,
@@ -1077,8 +1179,8 @@ fn amd_bench_tp(
             } else {
                 AmdTpGroup::agree(&g.prefill(&ids)?)?
             };
-            dump(&g, "prefill")?;
             let ms = t.elapsed().as_secs_f64() * 1e3;
+            dump(&g, "prefill")?;
             println!(
                 "\nprefill: {} tokens in {ms:.1} ms ({:.0} tok/s) -> {tok} \
                  (all {} ranks agree)",
@@ -1110,28 +1212,37 @@ fn amd_bench_tp(
 
         println!("greedy decode:");
         let mut out = Vec::new();
-        let t = std::time::Instant::now();
+        let mut timed = std::time::Duration::ZERO;
         for s in 0..steps {
             let t_tok = plowrt::obs::dstep::on().then(std::time::Instant::now);
+            let t = std::time::Instant::now();
             let ids = g.decode_step(pos, pos + 1)?;
             out.push(plowrt::obs::dstep::timed(
                 &plowrt::obs::dstep::AGREE,
                 || AmdTpGroup::agree(&ids),
             )?);
-            dump(&g, &format!("{s:03}"))?;
-            pos += 1;
+            if s > 0 {
+                timed += t.elapsed();
+            }
             if let Some(t) = t_tok {
                 plowrt::obs::dstep::token(t.elapsed().as_nanos() as u64);
             }
+            dump(&g, &format!("{s:03}"))?;
+            pos += 1;
         }
-        let ms = t.elapsed().as_secs_f64() * 1e3 / steps as f64;
         println!("  {out:?}");
-        println!(
-            "  {steps} decode steps: {ms:.3} ms/token ({:.1} tok/s), all {} ranks \
-             token-identical",
-            1e3 / ms,
-            g.n_gpu()
-        );
+        if steps > 1 {
+            let timed_steps = steps - 1;
+            let ms = timed.as_secs_f64() * 1e3 / timed_steps as f64;
+            println!(
+                "  {timed_steps} timed decode steps (+1 discarded warmup): {ms:.3} ms/token ({:.1} tok/s), all {} ranks \
+                 token-identical",
+                1e3 / ms,
+                g.n_gpu()
+            );
+        } else {
+            println!("  1 diagnostic decode step; no timing reported (warmup only)");
+        }
         if !g.weights_bound() {
             println!("  (weights unbound — these ids are noise)");
         }
@@ -1724,14 +1835,12 @@ fn simulate(
     Ok(())
 }
 
-async fn serve(
+async fn bringup_runtime(
     assets: Vec<PathBuf>,
-    port: u16,
-    socket: Option<PathBuf>,
     executors: u32,
     trace: bool,
     mux_cfg: MuxConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Arc<AppState>, Box<dyn std::error::Error>> {
     // One binary, CPU or GPU: the vendor drivers are `dlopen`ed, so this probes
     // CUDA then HSA (AMD) and falls back to the CPU reference backend when neither
     // loads. Assets stay servable either way — every one of them is compiled for
@@ -1840,7 +1949,7 @@ async fn serve(
     //
     // A bundle qualifies exactly as on the CUDA side: its assets dir carries a
     // PLOWDEV blob. It additionally needs the gfx950 code objects, whose dir is
-    // `--hsaco` / `PLOW_HSACO` or `<assets>/hsaco`; the TP degree is read off
+    // `--rt-hsaco` / `PLOW_HSACO` or `<assets>/hsaco`; the TP degree is read off
     // the packet.
     #[cfg(feature = "hsa")]
     if vendor == Some(hwspec::Vendor::Amd) {
@@ -1899,6 +2008,90 @@ async fn serve(
         let m = mux::spawn(slug.clone(), bundle, Arc::clone(&state), mux_cfg);
         state.install_mux(slug, m);
     }
+
+    Ok(state)
+}
+
+async fn bench(
+    assets: PathBuf,
+    prompt_ids: Option<String>,
+    random_input_len: usize,
+    seed: u64,
+    concurrency: usize,
+    requests: usize,
+    warmup_requests: usize,
+    output_len: usize,
+    executors: u32,
+    mux_cfg: MuxConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state = bringup_runtime(vec![assets], executors, false, mux_cfg).await?;
+    let models = state
+        .registry
+        .slugs()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let [model] = models.as_slice() else {
+        return Err(format!("bench requires exactly one model, loaded {}", models.len()).into());
+    };
+    let input = match prompt_ids {
+        Some(raw) => plowrt::serve::bench::Input::TokenIds(parse_token_ids(&raw)?),
+        None => plowrt::serve::bench::Input::Random {
+            len: random_input_len,
+            seed,
+        },
+    };
+    let runtime = serde_json::json!({
+        "config": format!("{:#?}", RuntimeConfig::global()),
+        "environment": runtime_environment(),
+        "features": {
+            "cuda": cfg!(feature = "cuda"),
+            "hsa": cfg!(feature = "hsa"),
+            "hf_tokenizer": cfg!(feature = "hf-tokenizer"),
+        },
+    });
+    let result = plowrt::serve::bench::run(
+        &state,
+        plowrt::serve::bench::Config {
+            model: model.clone(),
+            input,
+            concurrency,
+            warmup_requests,
+            requests,
+            output_tokens: output_len,
+            runtime,
+        },
+    )
+    .await;
+    if let Some(mux) = state.mux(model) {
+        mux.drain().await;
+    }
+    let report = result?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn parse_token_ids(raw: &str) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let ids = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::parse::<u32>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if ids.is_empty() {
+        return Err("--prompt-ids must contain at least one token id".into());
+    }
+    Ok(ids)
+}
+
+async fn serve(
+    assets: Vec<PathBuf>,
+    port: u16,
+    socket: Option<PathBuf>,
+    executors: u32,
+    trace: bool,
+    mux_cfg: MuxConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state = bringup_runtime(assets, executors, trace, mux_cfg).await?;
 
     let router = app(state);
 
