@@ -569,9 +569,17 @@ pub enum DevOp {
     /// Lightning-indexer top-k SELECT (`d_index_select_coop`) — ONE cooperative launch of exactly
     /// `n_cu` co-resident workgroups that grid-sync (fenceless L2-atomic barrier) between 7 radix
     /// passes over the monotone packed key `(ordered_bits(score)<<20)|(len-1-t)`, emitting the exact
-    /// `top_k` highest-score positions (lowest-index tie-break) into `idx`. `t0=idx(i32) t1=Score(f32)
-    /// t2=gHist(u32[7*256]) t3=gCtl(u32[3])` · `i0=len i1=top_k`. Host zeroes gHist/gCtl once; the
-    /// kernel leaves them clean for relaunch.
+    /// `top_k` highest-score positions (lowest-index tie-break) into `idx`. `t4=kv_len` is the LIVE
+    /// occupancy (TOKEN-granular, host-patched every decode step) — `len_max`/`i0` is only the
+    /// packet's baked max, and `d_index_score`/`_kpool` only ever writes `Score[pos < kv_len]`, so
+    /// scanning past `kv_len` ranks never-written words (see `op_attention.h`'s extensive header
+    /// comment on this exact, previously-shipped, deterministic bug). `i2=pool_size` (GLM-5.3-Flash's
+    /// pooled indexer, `index_kpool>1`; **default 1** — every existing emission leaves this operand
+    /// unset/zero, and the dispatch site treats zero as 1, so no existing blob's behavior changes)
+    /// divides the live `kv_len` down to whatever granularity `len_max`/`Score` were emitted in
+    /// (pool-granular under kpool). `t0=idx(i32) t1=Score(f32) t2=gHist(u32[7*256]) t3=gCtl(u32[3])
+    /// t4=kv_len(i32)` · `i0=len_max i1=top_k i2=pool_size`. Host zeroes gHist/gCtl once; the kernel
+    /// leaves them clean for relaunch.
     IndexSelect = 59,
 
     /// LayerNorm WITH bias + mean-subtract over `feat` (`d_layernorm_bias`) — the DSA indexer key-norm
@@ -1343,8 +1351,14 @@ pub enum DevOp {
     IndexScorePf = 117,
     /// Per-query-row EXACT top-k select (op 118): one workgroup per row, the op-59
     /// radix key (score desc, lowest-index tie-break) with LDS-only histograms. idx is
-    /// i32 [n_tok][top_k], unused slots -1.
-    /// `t0=idx t1=Score t2=kv_len` · `i0=n_tok i1=top_k i2=kv_stride`.
+    /// i32 [n_tok][top_k], unused slots -1. `i3=pool_size` (GLM-5.3-Flash's pooled indexer,
+    /// **default 1**, unset/zero on every existing emission and treated as 1 at dispatch — no
+    /// existing blob changes): each row's per-row causal token boundary
+    /// (`q_pos0+t+1`, unchanged, still token-granular) divides down to a pool count
+    /// (`row_len_tokens/pool_size`, floor) before it bounds the scan — the row's own
+    /// still-incomplete pool is thereby correctly excluded, matching `d_index_score_kpool`'s
+    /// "only a complete pool has a written score" rule, not an off-by-one.
+    /// `t0=idx t1=Score t2=kv_len` · `i0=n_tok i1=top_k i2=kv_stride i3=pool_size`.
     IndexSelectPf = 118,
     /// Per-64-query-tile UNION build (op 119): membership-mask scatter + ascending
     /// compaction into the table the gathered V2 flash walks (u32 counts header,
@@ -1358,6 +1372,233 @@ pub enum DevOp {
     /// `t0=o t1=q_raw t2=k_raw t3=v_raw t4=g_raw t5=beta_raw t6=state t7=descriptor` ·
     /// `i0=T(1) i1=H i2=D i3=BV i4=flags i5=W i6=gate_mode` · `f0=scale f1=lower_bound`.
     KdaConvStateStepG = 120,
+    /// GLM5-Next's hyper-connections (mHC) pre-block. Ported from vLLM's real reference
+    /// math (`vllm.model_executor.kernels.mhc.torch::mhc_pre_torch` — not a guess;
+    /// extracted and numerically verified against a hand oracle before this opcode was
+    /// added, see `perf-data/` for the campaign notes). The expensive part —
+    /// `mixes = x_flat[T,n*hidden] @ fn.T[n*hidden,n3]` — is an ordinary [`DevOp::Gemv`]/
+    /// [`DevOp::Gemm`] plow already runs; this op is the small per-token epilogue that
+    /// follows it: split the `n3 = 2n+n^2` logits into three groups, RMS-scale by
+    /// `residual`'s own sum-of-squares, sigmoid the pre/post gates, softmax + Sinkhorn-
+    /// Knopp-normalize the `n x n` combine matrix, and weighted-sum `residual` by the
+    /// pre-gate into the single-stream layer input.
+    ///
+    /// `hc_post_mult_value` (GLM-5.3-Flash: 2.0, NOT the more obvious 1.0 — its
+    /// `config.json` omits the field, so it takes vLLM's `Glm5NextConfig` class default,
+    /// found by reading that class, not assumed) is a COMPILE-TIME kernel constant, not
+    /// an operand: [`DevInst`]'s descriptor has only two `f` slots and this op already
+    /// needs both for `rms_eps`/`hc_eps` (the reference passes the SAME `hc_eps` for both
+    /// `hc_pre_eps` and `hc_sinkhorn_eps` — confirmed identical call sites, not two
+    /// distinct values). The emitter MUST assert the config's value matches what the
+    /// kernel was built for and refuse otherwise, the same discipline as `mla.rs`'s
+    /// `index_heads==32` assert — a silently wrong multiplier is exactly the "finite,
+    /// fluent, and wrong" failure mode this file's every other note warns about.
+    ///
+    /// `layer_input` (`t2`) is emitted UNNORMED. The reference applies a SEPARATE,
+    /// already-existing RMSNorm (with the block's real `input_layernorm.weight`) to it
+    /// afterward — exactly [`DevOp::RmsNorm`]/K3's `prenormed` pattern in `kda.rs`, not
+    /// something this op should bake in. `mhc_no_norm_weight` (unset in GLM-5.3-Flash's
+    /// config, defaults false) selects whether the caller chains that norm at all.
+    ///
+    /// `t0=post_mix(out,[T,n]f32) t1=comb_mix(out,[T,n,n]f32)
+    /// t2=layer_input(out,[T,hidden]bf16,UNNORMED) t3=mixes(in,[T,n3]f32, the Gemv/Gemm
+    /// projection's raw output) t4=residual(in,[T,n,hidden]bf16) t5=hc_scale(in,[3]f32)
+    /// t6=hc_base(in,[n3]f32)` · `i0=T i1=n i2=hidden i3=sinkhorn_repeat` ·
+    /// `f0=rms_eps f1=hc_eps`.
+    HyperConnPre = 121,
+    /// GLM5-Next's hyper-connections (mHC) post-block — the companion to
+    /// [`DevOp::HyperConnPre`], ported the same way from `mhc_post_torch`.
+    /// `new_residual[j] = Σ_i comb_mix[i][j] * residual[i]  +  post_mix[j] * x_out`: an
+    /// `n x n` combine (a tiny batched matmul, `n=4`) plus a broadcast multiply-add. No
+    /// epsilon or compile-time constant needed here — everything is already-computed
+    /// gates from the paired `HyperConnPre` call.
+    ///
+    /// `t0=new_residual(out,[T,n,hidden]bf16) t1=x_out(in,[T,hidden], the attn/FFN
+    /// output) t2=residual(in,[T,n,hidden]bf16) t3=post_mix(in,[T,n]f32)
+    /// t4=comb_mix(in,[T,n,n]f32)` · `i0=T i1=n i2=hidden i3=mode`.
+    /// `mode=0` performs the normal post mix. `mode=1` replicates `t1` into the `n`
+    /// residual streams at `t0`; `mode=2` mean-contracts the streams at `t2` into
+    /// `[T,hidden]` at `t0`. The latter modes implement GLM5Next's entry/exit
+    /// `hc_expand`/`hc_contract`; their unused tensor operands are `TENSOR_NONE`.
+    HyperConnPost = 122,
+    /// GLM5-Next DSA indexer key-pooling compress (`index_kpool`). Ported from vLLM's
+    /// real reference Triton kernel (`kpool_compress.py::_kpool_softmax_rotate_write_
+    /// cache_kernel`, the AMD variant), not derived from prose — verified against a
+    /// numerical oracle GENERATED BY RUNNING THAT REAL KERNEL on this box's GPU before
+    /// this opcode was written (see `perf-data/` campaign notes). One `pool_size`
+    /// (config: 4) group of consecutive tokens compresses to ONE indexer-cache K vector:
+    /// per-dim softmax over the pool (logits = gate score + additive position bias,
+    /// independent per one of `head_dim`=128 feature dims — NOT a joint softmax over the
+    /// whole vector) weights a sum of the pool's raw K vectors; a bf16 round-trip; a
+    /// fixed Hadamard-128 rotation (spreads energy for uniform fp8 quant error, ported
+    /// verbatim including its `1/sqrt(128)` normalization); a second bf16 round-trip;
+    /// then a per-vector fp8 e4m3 quant. **The quant scale is `2^ceil(log2(absmax/448))`
+    /// — power-of-2 ROUNDED, not plain absmax** (`ROUND_SCALE=True` in the reference).
+    /// Getting this scale step wrong the "obvious" way (plain absmax) produces a
+    /// plausible, finite, and silently WRONG compressed cache.
+    ///
+    /// DECODE MODE (`t5` present): `n_pools` MUST be 1 — one workgroup gates the whole
+    /// launch on the *live* device-side position (`t5`), computing
+    /// `boundary = ((pos[0]+1) % pool_size) == 0` and returning without touching any
+    /// output unless true. Decode re-emits the same packet program every step (no host
+    /// branching by step parity), so this is the only point at which "is this step a
+    /// pool boundary" can be decided — every other field keeps its prefill meaning,
+    /// `slot_k`/`slot_score` just point at [`DevOp::DsaPoolStash`]'s ring buffer instead
+    /// of a prefill-contiguous token span. `t5=TENSOR_NONE` (the prefill call) skips the
+    /// gate entirely — unconditional, exactly the pre-existing behavior, byte-identical.
+    ///
+    /// `t0`/`t1` in decode mode point at the GROWING per-layer pool cache, not a
+    /// single-pool scratch buffer — since decode re-emits the identical packet every
+    /// step, the host can never re-point these handles per step, so the kernel itself
+    /// computes which pool slot this boundary belongs to from `pos[0]/pool_size` and
+    /// offsets its writes by it (`op_dsa_pool.h`'s `pool_idx`/`wpool` — mirrors
+    /// `d_headnorm_rope`'s `obase` pattern, `op_norm.h`). **A prior version of the kernel
+    /// did not do this** — it always wrote pool 0, silently corrupting every later pool
+    /// across a real multi-boundary decode sequence; the original single-boundary
+    /// hardware verification could not have caught it. Fixed and RE-verified
+    /// (2026-09-01) against a two-boundary oracle
+    /// (`decode_kpool_oracle_multiboundary.npz`) via
+    /// `runtime/tests/dsa_pool_decode_mb_gfx950_test.hip`, which checks every
+    /// previously-written pool's bytes survive each later write — 0 mismatches, and the
+    /// test was sanity-checked to actually fail (254 mismatches) against the reverted
+    /// bug. See `op_dsa_pool.h`'s file header for the full correction note.
+    ///
+    /// `t0=compressed_k(out,[n_pools,head_dim]fp8_e4m3) t1=compressed_scale(out,
+    /// [n_pools]f32) t2=slot_k(in,[n_pools,pool_size,head_dim]bf16) t3=slot_score(in,
+    /// [n_pools,pool_size,head_dim]bf16) t4=ape(in,[pool_size,head_dim]f32) t5=pos(in,
+    /// OPTIONAL — decode-mode gate, see above; TENSOR_NONE = always run)` ·
+    /// `i0=n_pools i1=pool_size i2=head_dim i3=chunk_base`.
+    DsaPoolCompress = 123,
+    /// GLM5-Next DSA indexer pool-select expand + tail-append, fused. Ported from vLLM's
+    /// `kpool_compress.py::expand_pools_to_tokens` + `append_tail_to_topk` (the identity-
+    /// path composition the reference's own `_expand_pools_and_append_tail_kernel`
+    /// fuses, and the ONLY path GLM5Next's indexer exercises — no `page_table`/
+    /// `topk_offsets`). **Pure index arithmetic, no floats anywhere** — expands each
+    /// selected pool id to its `pool_size` member token ids, then appends the request's
+    /// trailing INCOMPLETE pool's raw (non-pooled) token ids so the most recent tokens
+    /// are always attended to (`index_kpool_always_select_tail`). One thread per output
+    /// element, grid-strided; no reduction, no LDS.
+    ///
+    /// `t2` is a SCALAR chunk-end `kv_len`, not a materialized per-row array (an earlier
+    /// version of this op took `seq_lens[rows]` — nothing in the prefill DSA chain ever
+    /// produces one). Mirrors [`DevOp::IndexSelectPf`]'s own derivation exactly: row
+    /// `rows-1` (the last/most-recent row) has `seq_len == kv_len[0]`, each earlier row
+    /// one fewer token (`q_pos0 = kv_len[0] - rows`, `seq_len = q_pos0 + row + 1`).
+    /// Decode (`rows==1`) is the degenerate case — `seq_len` collapses to `kv_len[0]`,
+    /// byte-identical to what the old array contract already gave it, so the decode
+    /// call site's tensor is unchanged, only its interpretation is.
+    ///
+    /// `t0=out(out,[rows,topk+pool_size-1]i32, -1 for an unused slot) t1=pool_ids(in,
+    /// [rows,n_groups]i32) t2=kv_len(in,scalar i32, token-granular, chunk-end)` ·
+    /// `i0=rows i1=n_groups i2=pool_size`.
+    DsaPoolExpand = 124,
+    /// GLM5-Next DSA indexer key-pooling, DECODE side: unconditional per-step ring stash.
+    /// Ported from vLLM's real reference (`kpool_compress.py::
+    /// _kpool_decode_update_batched_kernel`'s stash half), verified against a numerical
+    /// oracle generated by RUNNING THAT REAL KERNEL on this box's GPU (decode_kpool_
+    /// oracle.npz — see `perf-data/` campaign notes). Decode produces ONE new token's raw
+    /// (post-rope) indexer key + projected gate score per step, not a whole `pool_size`
+    /// group — this op writes that single (key, score) pair into a small per-layer **tail
+    /// ring** of `pool_size` slots at `pos % pool_size`, so that once every `pool_size`
+    /// steps the ring holds a complete pool in slot order and [`DevOp::DsaPoolCompress`]'s
+    /// decode-mode gate (its `t5=pos` operand) can compress it — **verified bit-exact**
+    /// against the reference: running `DsaPoolCompress` at `n_pools=1` directly on 4 raw
+    /// (key,score) rows produces the SAME output as the reference's fused decode-step
+    /// kernel at the step that completes their pool (0 diff, `decode_kpool_oracle.npz`).
+    /// No float math here — a masked, dynamically-indexed copy.
+    ///
+    /// `t0=ring_k(out,[pool_size,head_dim]bf16) t1=ring_score(out,[pool_size,head_dim]
+    /// bf16) t2=cur_k(in,[rows,head_dim]bf16) t3=cur_score(in,[rows,head_dim]bf16)
+    /// t4=pos(in,[rows])` · `i0=pool_size i1=head_dim i2=row` (decode uses row 0;
+    /// prefill uses this to seed trailing rows into the same ring).
+    DsaPoolStash = 125,
+    /// GLM5-Next DSA indexer QUERY-side fp8 quant (`index_kpool`'s q half). Ported from
+    /// vLLM's real reference (`kpool_compress.py::fwht128_quant_fp8`/`_fwht_quant_kernel`),
+    /// verified against a numerical oracle GENERATED BY RUNNING THAT REAL FUNCTION on this
+    /// box's GPU (`/home/shaswot/plow-work/indexer_qscore_oracle.npz` — see `perf-data/`
+    /// campaign notes). One indexer head's `head_dim`-wide query vector per "row" (the
+    /// caller flattens `[token][index_head]` into one axis, no batch/pool concept here):
+    /// Hadamard-128 rotate (same `dsa_hadamard128_stage`, `1/sqrt(128)`), ONE bf16
+    /// round-trip (the query side has no softmax-pooling step, so only the POST-Hadamard
+    /// round-trip [`DevOp::DsaPoolCompress`]'s k side also has — no pre-Hadamard one),
+    /// then the SAME power-of-2-rounded fp8 quant (`exp2(ceil(log2(absmax/448)))`, absmax
+    /// floor 1e-4) as the k side. A strict subset of `DsaPoolCompress`'s math — no
+    /// pooling loop, no `ape`, no `pool_size`.
+    ///
+    /// `t0=q_fp8(out,fp8_e4m3[n_rows][head_dim]) t1=q_scale(out,f32[n_rows])
+    /// t2=q_raw(in,bf16[n_rows][head_dim])` · `i0=n_rows i1=head_dim`.
+    DsaQQuant = 126,
+    /// GLM5-Next DSA indexer score, KPOOL fp8 variant — the pooled-indexer twin of
+    /// [`DevOp::IndexScore`], consuming fp8 q/k (from [`DevOp::DsaQQuant`] /
+    /// [`DevOp::DsaPoolCompress`]) instead of plain bf16. `IndexScore`/`IndexScorePf`
+    /// themselves are UNCHANGED and stay GLM-5.2's exact bf16 path — this is an addition,
+    /// not a modification, so GLM-5.2 emission can never reach it.
+    ///
+    /// Ground truth: `fp8_mqa_logits_torch` (`vllm.v1.attention.ops.rocm_aiter_mla_sparse`,
+    /// verified against a numerical oracle GENERATED BY RUNNING THAT REAL FUNCTION —
+    /// `/home/shaswot/plow-work/indexer_qscore_oracle.npz`, campaign notes under
+    /// `perf-data/`): `score[h,m,pool] = (q_fp8.to(bf16) . k_fp8.to(bf16)) * k_scale[pool]`,
+    /// `logit[m,pool] = sum_h relu(score) * weights_scaled[m,h]`, `weights_scaled =
+    /// weights * q_scale * (index_dim**-0.5 * index_heads**-0.5)`
+    /// (`_fused_indexer_weight_scale`, `attention.py:61-67`). `f[0]` carries that same
+    /// `index_dim**-0.5 * index_heads**-0.5` constant `IndexScore`'s own `f[0]` carries —
+    /// it now multiplies `w[h]*q_scale[h]` instead of a bare `w[h]`.
+    ///
+    /// **PRECISION GOTCHA, found empirically**: `torch.einsum('mhd,nd->hmn', q_bf16,
+    /// k_bf16)` — the reference's dot product — returns a **bf16-dtype result**. Each
+    /// per-head dot product is rounded to bf16 BEFORE `k_scale`/`relu`/the weight multiply
+    /// see it, not just the final logit. Dequantizing straight to fp32 and accumulating
+    /// there with no round-trip (the "obviously equivalent" thing, and what plain
+    /// `IndexScore`'s own bf16 path legitimately does) is plausible, finite, and wrong by
+    /// 1-2% — caught by the oracle, not by inspection. The kernel body
+    /// (`d_index_score_kpool`, `op_attention.h`) rounds the raw dot product through a
+    /// bf16 round-trip before applying `k_scale`. Top-k select (`IndexSelect`/`IndexSelectPf`)
+    /// consumes this op's output score array unchanged in SHAPE/semantics, but **does** need a
+    /// `pool_size` operand of its own (see their doc comments) — this op only writes valid
+    /// scores for `p < kv_len/pool_size` pools, so the selector must apply the identical
+    /// division to its own live-occupancy bound or it silently scans/selects past what was
+    /// actually written (an earlier draft of this comment said "needs NO changes", which
+    /// undersold this — corrected once the selector fix landed).
+    ///
+    /// **`t6` IS TOKEN-GRANULAR, NOT POOL-GRANULAR** — a real bug in an earlier version of
+    /// this op took a pool-granular occupancy directly; the kernel now takes the SAME
+    /// `n.kvlen` every other GLM decode op reads (token count, host-patched every step —
+    /// a pool-granular derivative could never be re-patched per step the same way) and
+    /// divides by `i4=pool_size` internally: `len = kv_len/pool_size`, FLOOR (a partial
+    /// trailing pool has no compressed cache entry yet — `DsaPoolCompress` only writes a
+    /// pool once it's complete — and is handled entirely by `DsaPoolExpand`'s separate
+    /// always-select-tail path; confirmed by precedent, not guessed — `d_dsa_pool_expand`
+    /// already computes this exact "how many complete pools" quantity the same way).
+    ///
+    /// `t0=Score(out,f32[n_batch][pool_stride]) t1=Qfp8(in,fp8_e4m3[n_batch][index_heads]
+    /// [index_head_dim]) t2=Qscale(in,f32[n_batch][index_heads])
+    /// t3=Kfp8(in,fp8_e4m3[n_batch][pool_stride][index_head_dim])
+    /// t4=Kscale(in,f32[n_batch][pool_stride]) t5=W(in,f32[n_batch][index_heads])
+    /// t6=kv_len(in,i32[n_batch], TOKEN-granular)` · `i0=n_batch i1=index_heads
+    /// i2=pool_stride i3=index_head_dim i4=pool_size i5=prefill` · `f0=scale`.
+    IndexScoreKpool = 127,
+    /// fp32-OUTPUT GEMV. A small, separate op from [`DevOp::Gemv`] — NOT a variant of it,
+    /// and must never be folded into `d_gemv`/`d_gemv_t`'s tuned decode-hot-path machinery
+    /// (see that function's own header comment, `op_gemm.h`: register budget is razor-thin,
+    /// `check decode` fails above 256 VGPR). Its one caller is GLM-5.3-Flash's DSA indexer
+    /// `weights_proj` head-gate projection ([`DevOp::IndexScoreKpool`]'s `t5=W` input,
+    /// `GlmLW::iwp_f32` — the pooled-indexer's fp32 twin of the existing bf16 `iwp`/`widx`
+    /// projection GLM-5.2's plain `IndexScore` already uses), a `[index_heads]`=32-wide
+    /// output computed once per indexer token. **NOT** `index_kpool_compress_gate` (that
+    /// tensor feeds [`DevOp::DsaPoolCompress`]'s pooling softmax and needs no fp32
+    /// treatment — an earlier pass of this doc comment named the wrong tensor; corrected
+    /// after a later pass caught the mismatch against the cited source lines below).
+    ///
+    /// WHY fp32 output, when every other GEMV in this file rounds to bf16: the reference
+    /// computes this exact weight in fp32 throughout (`_wp_fp32 = ...weight....float()`,
+    /// `weights = torch.mm(hidden_states.float(), self._wp_fp32)`,
+    /// `glm5next_ref/nvidia/attention.py:329-336`) with an explicit comment that a bf16
+    /// version "introduce[s] ~1e-2 logit error that flips near-tie pool rankings on hard
+    /// long-context tasks" — a documented ACCURACY requirement of the reference model, not
+    /// an implementation shortcut to optimize away.
+    ///
+    /// `t0=C(out,f32[M][N]) t1=x(in,bf16[M][K]) t2=W(in,f32[N][K])` · `i0=M i1=N i2=K`.
+    GemvF32 = 128,
 }
 
 impl DevOp {
@@ -1488,6 +1729,14 @@ impl DevOp {
         DevOp::IndexSelectPf,
         DevOp::IndexUnionPf,
         DevOp::KdaConvStateStepG,
+        DevOp::HyperConnPre,
+        DevOp::HyperConnPost,
+        DevOp::DsaPoolCompress,
+        DevOp::DsaPoolExpand,
+        DevOp::DsaPoolStash,
+        DevOp::DsaQQuant,
+        DevOp::IndexScoreKpool,
+        DevOp::GemvF32,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1629,6 +1878,14 @@ impl DevOp {
             DevOp::IndexSelectPf => "PLOW_DOP_INDEX_SELECT_PF",
             DevOp::IndexUnionPf => "PLOW_DOP_INDEX_UNION_PF",
             DevOp::KdaConvStateStepG => "PLOW_DOP_KDA_CONV_STATE_STEP_G",
+            DevOp::HyperConnPre => "PLOW_DOP_HYPER_CONN_PRE",
+            DevOp::HyperConnPost => "PLOW_DOP_HYPER_CONN_POST",
+            DevOp::DsaPoolCompress => "PLOW_DOP_DSA_POOL_COMPRESS",
+            DevOp::DsaPoolExpand => "PLOW_DOP_DSA_POOL_EXPAND",
+            DevOp::DsaPoolStash => "PLOW_DOP_DSA_POOL_STASH",
+            DevOp::DsaQQuant => "PLOW_DOP_DSA_Q_QUANT",
+            DevOp::IndexScoreKpool => "PLOW_DOP_INDEX_SCORE_KPOOL",
+            DevOp::GemvF32 => "PLOW_DOP_GEMV_F32",
         }
     }
 
@@ -1658,7 +1915,18 @@ impl DevOp {
     /// bump: this constant is one past the HIGHEST opcode, not a count, and adding a pair moves it
     /// by two whether or not the range has holes.
     /// 116 -> 117 for `XReduceAddNorm = 116` (the fused TP seam).
-    pub const COUNT: u16 = 121;
+    /// 121 -> 123 for `HyperConnPre = 121` / `HyperConnPost = 122` (GLM-5.3-Flash's
+    /// hyper-connections). Two variants, one bump — the same rule as 111 -> 113 above.
+    /// 123 -> 125 for `DsaPoolCompress = 123` / `DsaPoolExpand = 124` (the DSA indexer's
+    /// `index_kpool` key-pooling, also GLM-5.3-Flash).
+    /// 125 -> 126 for `DsaPoolStash = 125` (the decode-side ring stash `DsaPoolCompress`'s
+    /// decode-mode gate reads from).
+    /// 126 -> 128 for `DsaQQuant = 126` / `IndexScoreKpool = 127` (the query-side fp8 quant
+    /// and the fp8 scoring kernel `index_kpool`'s pooled indexer needs — two variants, one
+    /// bump, same rule as 121 -> 123 above).
+    /// 128 -> 129 for `GemvF32 = 128` (fp32-output GEMV, `IndexScoreKpool`'s `W` operand —
+    /// a documented accuracy requirement of the reference, not `Gemv` with a wider output).
+    pub const COUNT: u16 = 129;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

@@ -42,7 +42,9 @@ fn kimi_ref_cfg() -> GlmCfg {
         index_heads: 8,
         index_dim: 32,
         index_topk: 64,
+        index_kpool: 1,
         indexer_full: Vec::new(), // Kimi/DeepSeek config has no `indexer_types`
+        softmax_layers: vec![],
         has_dsa: false,
     }
 }

@@ -3134,6 +3134,7 @@ mod tests {
                 gate_lower_bound: Some(-5.0),
                 eps: 1e-5,
                 bv: 16,
+                full_rank_gate: true,
             },
         );
         let mut b = Builder::new(256);
@@ -3374,6 +3375,7 @@ mod tests {
                 gate_lower_bound: Some(-5.0),
                 eps: 1e-5,
                 bv: 16,
+                full_rank_gate: true,
             },
             mla: K3MlaCfg {
                 hidden: 7168,
