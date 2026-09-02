@@ -95,9 +95,10 @@ TP width, active runtime settings, packet/object checksums, and checkpoint
 layout. Preserve each JSON result with the exact command and environment.
 
 `amd-bench` drives `AmdEngine` directly and bypasses production scheduling. Use
-it only for packet traces, tensor/logit snapshots, repeated-prefill sweeps,
-synthetic kernel floors, and diagnosing a TP disagreement reported by
-`plowrt bench`. Never publish it as served-model performance.
+`plowrt bench --trace-raw PATH` for decode packet traces. Keep `amd-bench` only
+for tensor/logit snapshots, repeated-prefill sweeps, synthetic kernel floors,
+and diagnosing a TP disagreement reported by `plowrt bench`. Never publish it
+as served-model performance.
 
 ### 2a. AMD benchmark harness convergence
 
@@ -111,7 +112,9 @@ Track `amd-bench` removal as a staged migration, not a flag deletion:
 - [x] Emit fail-closed structured results with artifact digests, target/TP,
   shape/concurrency, warmup/request counts, latency distribution, throughput, and
   active knobs.
-- [ ] Expose shared trace, tensor/logit snapshot, TP-rank audit, bucket timing,
+- [x] Expose raw AMD decode packet traces through the production `AmdServe`
+  path (`plowrt bench --trace-raw PATH`).
+- [ ] Expose tensor/logit snapshot, TP-rank audit, bucket timing,
   repeated-prefill, and ragged-batch diagnostics without reaching through
   `AmdServe` into `AmdEngine`.
 - [ ] Move unbound weights and unwritten-KV timing to an explicitly synthetic

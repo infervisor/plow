@@ -96,10 +96,10 @@ __device__ __forceinline__ float kda_softplus(float x) {
  * because the reference the numeric gate runs against is [fla].
  *
  * SLICE MAP: the conv is a W-tap STENCIL, not a scan — y_t depends on x_{t-W+1..t}, never on
- * y_{t-1} — so it is fully parallel over (t, channel). Only the window carry is sequential, and
- * that is per channel and lives in 4 registers. Channels are therefore the parallel axis and each
- * thread walks all T tokens of its own channel, which also produces the final `state` for free
- * with no second pass.
+ * y_{t-1} — so prefill is parallel over (t, channel). Only its first W-1 rows read the incoming
+ * window; one designated worker per channel computes those rows and publishes the final window,
+ * while the remaining rows are spread across every worker in the channel's packet slice. Decode
+ * and independent-sequence rows retain the serial per-channel path below.
  *
  * Each block takes a CONTIGUOUS chunk of channels rather than a strided one: a channel's window is
  * 4 contiguous f32 = one global_load_dwordx4, and contiguous chunks keep the 512-byte-per-16-lane
@@ -232,6 +232,93 @@ __device__ void d_kda_conv3(bf16* __restrict__ oq, bf16* __restrict__ ok, bf16* 
     unsigned g1 = g0 + chunk;
     if (g1 > total) g1 = total;
     if (g0 >= g1) return;
+    if (T > 1u && bstride == 0) {
+        enum { PLOW_KDA_WMAX = 8 };
+        const unsigned Wc = W < PLOW_KDA_WMAX ? W : PLOW_KDA_WMAX;
+        if (Wc == 0) __builtin_trap();
+
+        /* Rows [0,W-1) still read the incoming convolution window. Give all of them, and the
+         * final-window store, to one worker per (stream,channel): no other worker reads `state`, so
+         * publishing the new window needs no grid-wide barrier. */
+        const unsigned prefix = T < Wc - 1u ? T : Wc - 1u;
+        for (unsigned g = g0 + threadIdx.x; g < g1; g += PLOW_THREADS) {
+            const unsigned s = g / C;
+            const unsigned c = g - s * C;
+            bf16* out = s == 0 ? oq : (s == 1 ? ok : ov);
+            const bf16* x = s == 0 ? xq : (s == 1 ? xk : xv);
+            const float* w = s == 0 ? wq : (s == 1 ? wk : wv);
+            float* state = s == 0 ? sq : (s == 1 ? sk : sv);
+            float win[PLOW_KDA_WMAX], tap[PLOW_KDA_WMAX];
+#pragma unroll
+            for (unsigned j = 0; j < PLOW_KDA_WMAX; ++j) {
+                win[j] = j < Wc ? state[(size_t)c * W + j] : 0.0f;
+                tap[j] = j < Wc ? w[(size_t)c * W + j] : 0.0f;
+            }
+            for (unsigned t = 0; t < prefix; ++t) {
+#pragma unroll
+                for (unsigned j = 0; j + 1 < PLOW_KDA_WMAX; ++j) win[j] = win[j + 1];
+                win[Wc - 1u] = bf2f(x[(size_t)t * C + c]);
+                float y = 0.0f;
+#pragma unroll
+                for (unsigned j = 0; j < PLOW_KDA_WMAX; ++j) y += win[j] * tap[j];
+                st_act1(&out[(size_t)t * C + c], f2bf(act == 1u ? act_silu(y) : y));
+            }
+#pragma unroll
+            for (unsigned j = 0; j < PLOW_KDA_WMAX; ++j) {
+                if (j >= Wc) continue;
+                const float v = j + T < Wc
+                                    ? win[j]
+                                    : bf2f(x[((size_t)T - Wc + j) * C + c]);
+                state[(size_t)c * W + j] = v;
+            }
+        }
+
+        /* From row W-1 onward every tap comes from this chunk's input. Split that row range into
+         * contiguous spans per channel, so all workers participate while each reuses one tap vector
+         * and rolls one local input window. */
+        const unsigned row0 = Wc - 1u;
+        if (row0 >= T) return;
+        const unsigned rows = T - row0;
+        const unsigned nch = g1 - g0;
+        const unsigned ncpar = nch < PLOW_THREADS ? nch : PLOW_THREADS;
+        const unsigned cworker = threadIdx.x % ncpar;
+        const unsigned lane = threadIdx.x / ncpar;
+        const unsigned lanes = (PLOW_THREADS + ncpar - 1u - cworker) / ncpar;
+        const unsigned rchunk = (rows + lanes - 1u) / lanes;
+        const unsigned t0 = row0 + lane * rchunk;
+        unsigned t1 = t0 + rchunk;
+        if (t1 > T) t1 = T;
+        for (unsigned g = g0 + cworker; g < g1; g += ncpar) {
+            if (t0 >= t1) continue;
+            const unsigned s = g / C;
+            const unsigned c = g - s * C;
+            bf16* out = s == 0 ? oq : (s == 1 ? ok : ov);
+            const bf16* x = s == 0 ? xq : (s == 1 ? xk : xv);
+            const float* w = s == 0 ? wq : (s == 1 ? wk : wv);
+            float win[PLOW_KDA_WMAX], tap[PLOW_KDA_WMAX];
+#pragma unroll
+            for (unsigned j = 0; j < PLOW_KDA_WMAX; ++j) {
+                win[j] = j < Wc
+                             ? bf2f(x[((size_t)t0 - (Wc - 1u - j)) * C + c])
+                             : 0.0f;
+                tap[j] = j < Wc ? w[(size_t)c * W + j] : 0.0f;
+            }
+            for (unsigned t = t0; t < t1; ++t) {
+                float y = 0.0f;
+#pragma unroll
+                for (unsigned j = 0; j < PLOW_KDA_WMAX; ++j) y += win[j] * tap[j];
+                st_act1(&out[(size_t)t * C + c], f2bf(act == 1u ? act_silu(y) : y));
+                if (t + 1u < t1) {
+#pragma unroll
+                    for (unsigned j = 0; j + 1u < PLOW_KDA_WMAX; ++j) {
+                        win[j] = win[j + 1u];
+                    }
+                    win[Wc - 1u] = bf2f(x[((size_t)t + 1u) * C + c]);
+                }
+            }
+        }
+        return;
+    }
     /* ROLLED, not unrolled. `kda_conv_range` is force-inlined and holds 2*PLOW_KDA_WMAX floats of
      * window and taps, so unrolling puts three copies of that in the function; rolled there is ONE
      * inline site and the pointer triples become selects. Measured on the K3 decode object it

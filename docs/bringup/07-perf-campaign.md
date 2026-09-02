@@ -62,14 +62,15 @@ Three properties separate a campaign number from a benchmark you can't trust:
 
 ## The harness
 
-Two client families, both driving the running `plowrt serve` over its OpenAI
-route (`/v1/chat/completions` — the only route plowrt implements). Pick per what
-you are measuring; **use the same client for every arm of one campaign.**
+Two client families drive the running `plowrt serve` over its OpenAI routes.
+Use `/v1/completions` with `--backend openai` for a raw-prompt baseline, or
+`/v1/chat/completions` with `--backend openai-chat` when chat templating is part
+of the contract. **Use the same endpoint and client for every arm.**
 
 | harness | what it drives | where |
 |---|---|---|
 | `huggingface/inference-benchmarker` (pinned rev) | multi-user **capacity** sweeps: fixed virtual users (ConstantVUs), warm+measure windows, aggregate tok/s + TTFT/ITL percentiles | invoked via `perf-data/bench_ib.sh` / `bench_b2_ib.sh` (parameterized: `CAMPAIGN`, `PROMPT_TOKS`, `VUS`, `MODEL_NAME`, `TOKENIZER`, `ASSETS`) |
-| `vllm bench serve` (`--backend openai-chat`) | single-stream + low-concurrency latency, and the like-for-like comparator (same client both engines) | `perf-data/tools/bringup_bench.sh`, orchestrated by `bringup_showdown.sh` |
+| `vllm bench serve` (`--backend openai` or `openai-chat`) | single-stream + low-concurrency latency, and the like-for-like comparator (same endpoint/client both engines) | `perf-data/tools/bringup_bench.sh`, orchestrated by `bringup_showdown.sh` |
 
 Supporting scripts in `perf-data/tools/`:
 

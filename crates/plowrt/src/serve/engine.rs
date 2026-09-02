@@ -16,6 +16,9 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "hsa")]
+use std::path::Path;
+
 /// The device engine serving one slug.
 pub enum ServeEngine {
     /// The sm_120 persistent-interpreter engine (slotted, continuous batching).
@@ -55,6 +58,21 @@ impl ServeEngine {
             ServeEngine::Cuda(e) => e.stop_ids(),
             #[cfg(feature = "hsa")]
             ServeEngine::Amd(e) => e.stop_ids(),
+        }
+    }
+
+    /// Write rank 0's last completed raw AMD packet trace.
+    ///
+    /// The trace buffer is allocated only when `--trace-raw` / `PLOW_TRACE_RAW`
+    /// is set before engine load. Callers must quiesce the model mux first.
+    #[cfg(feature = "hsa")]
+    pub fn write_amd_packet_trace(&self, path: &Path) -> crate::Result<()> {
+        match self {
+            ServeEngine::Amd(e) => e.write_packet_trace(path),
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => Err(crate::RuntimeError::Device(
+                "raw AMD packet traces require an AMD serving engine".into(),
+            )),
         }
     }
 
@@ -697,6 +715,14 @@ mod amd_serve {
 
         pub fn advance_prefill_turn(&mut self, slot: usize) {
             self.prefill_turn = (slot + 1) % self.batch.max(1);
+        }
+
+        /// Write rank 0's last completed program trace.
+        pub fn write_packet_trace(&self, path: &Path) -> Result<()> {
+            match &self.ranks {
+                Ranks::One(e) => e.trace_write(path),
+                Ranks::Tp(g) => g.rank(0).trace_write(path),
+            }
         }
 
         /// Feed `id` into slot `slot` and produce its next token.

@@ -321,8 +321,9 @@ plowrt bench --assets $ASSETS --prompt-ids 1,2,3,4 \
 
 The JSON records TTFT/TPOT/ITL/E2E distributions, throughput, scheduler rungs,
 TP width, runtime settings, packet/object checksums, and checkpoint layout.
-Use `amd-bench` only for packet traces, tensor/logit snapshots, prefill sweeps,
-and explicit TP correctness audits.
+Add `--trace-raw PATH` to write rank 0's last measured decode packet trace after
+the production mux is drained. Use `amd-bench` only for tensor/logit snapshots,
+prefill sweeps, and explicit TP correctness audits.
 
 ```bash
 plowrt serve --assets $ASSETS --port 8080 --executors 8 \
@@ -377,7 +378,7 @@ keeping only what helps *your* target:
 | per-decode-step host-phase breakdown | `PLOW_DSTEP_LOG=1` (+ `--rt-dstep-every N`) |
 | prefix-cache timing | `PLOW_PFX_LOG=1` |
 | per-tick prefill-vs-decode wall split | `PLOW_PF_PACKLOG=1` |
-| packet timeline | `PLOW_TRACE_RAW=path` (amd) or `--trace` + `GET /trace` |
+| packet timeline | `plowrt bench --trace-raw path` (amd decode) or `--trace` + `GET /trace` |
 | static blob analysis (no device) | `plowrt disasm $ASSETS --counters --kernargs --tensors` |
 
 **The attribution ladder.** Do not open a profiler first. Walk these in order,
@@ -473,7 +474,7 @@ The model gates into Stage 7 when **all** hold:
 |---|---|
 | `serve::mux` — `spawn`, `run_one_tick`, `admit_into`, `Slot`, `MuxConfig`, `advance_health` | continuous-batching mux / slot table / admission |
 | `serve::engine::{ServeEngine, Ranks}` | per-vendor engine seam (nvidia slotted vs amd single-sequence / TP) |
-| `serve::mod::{AppState, app}` | router: `/v1/chat/completions`, `/metrics`, `/trace`, `/healthz` |
+| `serve::mod::{AppState, app}` | router: `/v1/{chat/,}completions`, tokenizer alignment, metrics, trace, health |
 | `sched::admission::{LoadEstimator, Admit, admit}` | admission controller, SLO shed |
 | `sched::batching::{select_bucket, formation_window_ms}` | bucket pick + adaptive hold |
 | `sched::multistep::MultiStep::for_batch` | multi-step depth from batch size |

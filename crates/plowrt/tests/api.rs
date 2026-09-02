@@ -1,5 +1,5 @@
-//! OpenAI API surface: `/v1/models`, non-streaming and streaming
-//! `/v1/chat/completions`, over the CPU backend.
+//! OpenAI API surface: models, chat/raw completions, and tokenizer alignment
+//! over the CPU backend.
 
 use std::sync::Arc;
 
@@ -148,6 +148,121 @@ async fn stream_completion_terminates() {
     assert!(second_delta["content"].is_string());
     let request_id = frames[0]["id"].as_str().unwrap();
     assert!(frames.iter().all(|frame| frame["id"] == request_id));
+}
+
+#[tokio::test]
+async fn raw_completion_uses_text_completion_shape() {
+    let req_body = serde_json::json!({
+        "model": "api-model",
+        "prompt": "hello",
+        "stream": false,
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "ignore_eos": true
+    });
+    let resp = make_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["object"], "text_completion");
+    assert!(body["choices"][0]["text"].is_string());
+    assert!(body["choices"][0]["finish_reason"].is_string());
+    assert_eq!(body["usage"]["prompt_tokens"], 5);
+}
+
+#[tokio::test]
+async fn raw_completion_stream_has_no_empty_leading_choice() {
+    let req_body = serde_json::json!({
+        "model": "api-model",
+        "prompt": "hello",
+        "stream": true,
+        "max_tokens": 4,
+        "ignore_eos": true,
+        "stream_options": {"include_usage": true}
+    });
+    let resp = make_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("[DONE]"));
+    let frames: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    assert_eq!(frames[0]["object"], "text_completion");
+    assert!(frames[0]["choices"][0]["text"].is_string());
+    assert!(frames[0]["choices"][0]["finish_reason"].is_null());
+    let usage = frames.last().unwrap();
+    assert_eq!(usage["choices"].as_array().unwrap().len(), 0);
+    assert!(usage["usage"]["completion_tokens"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn tokenizer_alignment_round_trips() {
+    let app = make_app();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/tokenize")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "api-model",
+                        "prompt": "hello",
+                        "add_special_tokens": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tokenized: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(
+        tokenized["tokens"],
+        serde_json::json!([104, 101, 108, 108, 111])
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/detokenize")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"model": "api-model", "tokens": tokenized["tokens"]})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detokenized: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(detokenized["prompt"], "hello");
 }
 
 #[tokio::test]

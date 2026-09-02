@@ -2065,7 +2065,18 @@ async fn bench(
     if let Some(mux) = state.mux(model) {
         mux.drain().await;
     }
+    #[cfg(feature = "hsa")]
+    let trace_result = RuntimeConfig::get().amd.trace_raw.as_ref().map(|path| {
+        let path = PathBuf::from(path);
+        plowrt::serve::bench::write_amd_packet_trace(&state, model, &path).map(|()| {
+            tracing::info!(path = %path.display(), "raw AMD packet trace written");
+        })
+    });
     let report = result?;
+    #[cfg(feature = "hsa")]
+    if let Some(trace_result) = trace_result {
+        trace_result?;
+    }
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }

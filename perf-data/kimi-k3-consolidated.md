@@ -11,8 +11,21 @@ remain as dated evidence links; this file owns the current baseline, decisions, 
 - A valid result requires completed requests, exact output length, empty errors, all-rank token/counter
   agreement, and uncontended `gpulease`. Standalone kernels are screening evidence, not throughput.
 - Current records: `kimi-k3-vllm-mi355x-baseline.md` and
-  `kimi-k3-plowrt-mi355x-smoke-20260902.md`. The Plow record is a correctness
-  smoke, not yet the matched 8192→1024 performance baseline.
+  `kimi-k3-plowrt-mi355x-baseline.md`. The production Plow C1 record uses the
+  same vLLM 0.28 client, raw-completions endpoint, tokenizer, 8192→1024 shape,
+  and request contract. `kimi-k3-plowrt-mi355x-smoke-20260902.md` remains only
+  a correctness and scheduler-coverage record.
+
+## Current MI355X C1 baseline
+
+| Engine | TTFT p50 | TPOT p50 | ITL p99 | Output throughput |
+|---|---:|---:|---:|---:|
+| Plow | 3645.01 ms | 55.15 ms | 55.59 ms | 17.05 tok/s |
+| vLLM 0.28 | 567.03 ms | 20.768 ms | 21.008 ms | 46.94 tok/s |
+
+Plow is 6.43× slower at median TTFT and 2.66× slower at median TPOT. These
+are measured deficits, so the active priorities are prefill KDA/MoE work and
+decode GEMV/body work; endpoint or benchmark-driver changes cannot close them.
 
 ## Historical MI325X B1 baseline
 
@@ -31,6 +44,8 @@ trace is dominated by ordinary BF16 GEMV (~22 ms), while the long-context slope 
 
 ## Adopted production changes
 
+- KDA Conv3 suffix-row parallelization: 14.2% lower 8192-token TTFT with an
+  exact full-model output checksum; decode and strided-row paths are unchanged.
 - Narrow KDA norm-to-GEMV fusion: ~1.3–1.45 ms/token saved, full-logit exact.
 - KDA gated-norm workgroup fit: served B1 48.232 ms/token in the strongest exact gate.
 - KDA Conv/state double-bank arm: explicit opt-in; 50.140 ms/token, GSM8K 196/200, not default.

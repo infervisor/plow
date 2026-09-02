@@ -134,6 +134,17 @@ struct RequestResult {
     e2e: Duration,
 }
 
+/// Write the last completed raw AMD packet trace after the caller has
+/// quiesced the model mux.
+#[cfg(feature = "hsa")]
+pub fn write_amd_packet_trace(state: &AppState, model: &str, path: &Path) -> Result<()> {
+    let engine = state
+        .gpu_engine(model)
+        .ok_or_else(|| RuntimeError::Msg(format!("no GPU engine for '{model}'")))?;
+    let result = engine.lock().write_amd_packet_trace(path);
+    result
+}
+
 pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
     if cfg.concurrency == 0 || cfg.requests == 0 || cfg.output_tokens == 0 {
         return Err(RuntimeError::Msg(
