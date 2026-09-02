@@ -74,6 +74,12 @@ Record the verdict per family (GEMM / GEMV / attention / MoE / collectives)
 before proceeding: tunable now, blocked-on-oracle, blocked-on-knob, or alias
 no-op.
 
+For `$VENDOR = amd`, inspect the current [AITER](https://github.com/ROCm/aiter) implementation for the same
+model/operator and hipBLASLt for GEMM before proposing a kernel body change.
+Treat them as candidate schedules and measured ceilings, not code to copy or a
+stored baseline. Record the upstream commit, toolchain, architecture, dtype and
+complete live shape; a result from another shape or part is only a hypothesis.
+
 ## Procedure
 
 ### 1. Establish the ceilings
@@ -97,6 +103,12 @@ no-op.
   ```
   Evidence only (no oracle) — use it to classify each kernel compute- vs
   bandwidth-bound and to size the gap.
+* Vendor ceiling (`$VENDOR = amd`): measure each hot live shape against
+  hipBLASLt or the matching AITER operator when one exists. Match ISA,
+  dtype/scale layout, M/N/K, batch/context, head geometry, top-k and expert
+  count. Verify both outputs against the same oracle. Record latency plus VGPR,
+  AGPR, LDS and spills for the plow production object; a standalone wrapper
+  with different occupancy is not evidence that the interpreter improved.
 
 ### 2. Derive the hot shapes from demand — never hand-author
 
@@ -157,6 +169,28 @@ Respect the couplings: `GV_MM_MAX` moves the register ceiling of every arm in
 the object; MoE grouped GEMM shares the dense `PGM_*` tile; `PGM_BM` is
 packet-layout-visible. These cannot be swept independently.
 
+### 3a. Agent iteration loop (AMD)
+
+Use [CUDA-Agent](https://arxiv.org/abs/2602.24286)'s implement → compile → verify → profile loop, with Plow's
+stronger controls:
+
+1. Freeze the oracle, workload generator, lease wrapper and timing parser before
+   the baseline. If one changes, invalidate and re-run the baseline.
+2. Write one hypothesis and expected counter movement before each candidate.
+3. Change one algorithmic lever first; tile/unroll searches come only after the
+   bottleneck is measured. Keep runtime-selectable candidates in one object only
+   when that does not raise production-object registers or instruction footprint.
+4. Compile, run the adversarial oracle grid, audit the production object, then
+   measure repeated same-session A/B samples. Reject correctness failures,
+   spills, route misses, contended samples and wins below `Stats::beats`.
+5. Append every result, including losses, to the campaign record. Promote only
+   the best qualified, current-digest candidate; remove dead candidate code after
+   the record is complete.
+
+A fixed 5% target is not proof of improvement. Precision, scale layout and
+tolerance must be identical across arms. Stop at a decisive measured win or
+exhausted hypotheses, not after a fixed number of agent turns.
+
 ### 4. Interpret
 
 * Compute the roofline % per family against the **binding** side: bytes/time
@@ -170,6 +204,10 @@ packet-layout-visible. These cannot be swept independently.
 * An occupancy delta is only real with a matched-grid control — the measured
   occ-2 "win" on decode flash was wave quantization
   (`perf-data/px16-decode-occupancy.md`).
+* On AMD, collect profiler counters selected by the hypothesis, not every
+  metric. Relate MFMA utilization, memory stalls/TCC traffic, LDS conflicts and
+  achieved occupancy to the change. A resource limiter alone does not establish
+  elapsed-time impact.
 
 ### 5. Register winners and verify consumption
 
@@ -240,6 +278,9 @@ Pass when **all** hold:
    "tuned" was real before trusting block latency.
 6. No command in the campaign contained a literal part name; every `--gpu`,
    `--arch` and `--n-cu` came from the target block.
+7. Every changed AMD object passed the resource/ISA audit: no spill regression,
+   expected VGPR/AGPR/LDS and occupancy, the expected MFMA mnemonic for `$ISA`,
+   and a live marker/routing proof that the measured arm executed.
 
 ## Pitfalls to actively guard against
 

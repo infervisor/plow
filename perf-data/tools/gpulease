@@ -240,7 +240,9 @@ if [ "$NGOT" -lt "$NGPU" ]; then
 fi
 
 PRE=$(foreign "$GOT")
+CONTENDED=0
 if [ -n "$PRE" ]; then
+  CONTENDED=1
   echo "[$(date -Is)] $LABEL WARN foreign-before: $(echo $PRE|tr '\n' ' ')" | tee -a "$LOG" >&2
   echo "*** GPU CONTENDED AT START — TIMINGS FROM THIS RUN ARE NOT TRUSTWORTHY ***" >&2
 fi
@@ -250,9 +252,10 @@ echo "[$(date -Is)] $LABEL ACQUIRED gpus=[$GOT] (waited ${W}s) pid=$$" >> "$LOG"
 
 POST=$(foreign "$GOT")
 if [ -n "$POST" ]; then
+  CONTENDED=1
   echo "[$(date -Is)] $LABEL WARN foreign-during: $(echo $POST|tr '\n' ' ')" | tee -a "$LOG" >&2
   echo "*** GPU WAS CONTENDED — RE-RUN THIS MEASUREMENT ***" >&2
-  RC=$([ $RC -eq 0 ] && echo 76 || echo $RC)   # 76 = completed but contended
 fi
+[ "$CONTENDED" -eq 0 ] || RC=$([ $RC -eq 0 ] && echo 76 || echo $RC)
 echo "[$(date -Is)] $LABEL RELEASED gpus=[$GOT] rc=$RC held=$(( $(date +%s) - S - W ))s" >> "$LOG"
 exit $RC

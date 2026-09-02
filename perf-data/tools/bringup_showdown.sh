@@ -56,4 +56,5 @@ vllm_arm() { # <tag> <extra vllm args...>
 # plow_arm <bundle> plow-bf16 1
 # vllm_arm vllm-bf16
 # vllm_arm vllm-fp8 --quantization fp8
-echo "edit the arm list at the bottom of $0, then re-run"
+echo "no showdown arms configured; edit the arm list at the bottom of $0" >&2
+exit 2

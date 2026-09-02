@@ -15,10 +15,10 @@ first; they are authoritative and were recently corrected against the code.
 
 ## Your objective
 
-Get every compiled bucket of the new model to a clean `ok` from all seven
-checkpoints (A–G), with a clean `lake build` and **no `sorry` and no vacuous
-proofs**. A rejection is a real correctness bug in the compiler output, not a
-warning to suppress.
+First connect the model to the shipping `--emit devblob` path, then get every
+compiled bucket to a clean `ok` from all seven checkpoints (A–G), with a clean
+`lake build` and **no `sorry` and no vacuous proofs**. A rejection is a real
+correctness bug in the compiler output, not a warning to suppress.
 
 ## Ground rules
 
@@ -32,6 +32,35 @@ warning to suppress.
   must be reported as a skip.
 - Keep changes minimal and scoped to what the new model requires. Do not
   refactor the Lean project or touch unrelated proofs.
+
+## Shipping-emitter preflight
+
+The Stage-1 `nn-graph` builder is not consumed by the shipping device path.
+Before running Lean, verify the model is independently wired through both:
+
+- `crates/plowc/src/hf_config.rs`: parse and validate the real config, synthesize
+  the full-model `LayerPlan`, and refuse unsupported near variants;
+- `crates/devgen`: dispatch the model family and emit full-model and `--block`
+  packets with checkpoint-exact weight names and shapes.
+
+If either path is missing, implement only the target model support there. Mirror
+the Stage-1 geometry and weight manifest; do not assume the IR builder made the
+shipping path work. Add parser/plan tests in `hf_config.rs`, device-emitter tests
+in the matching `devgen` module, and an `hf_dir_compile`-style integration test.
+A structural fixture may use zero weights, but the manifest must be compared to
+the real checkpoint index. Then run:
+
+```bash
+nix develop --command cargo test -p plowc -p devgen
+nix develop --command cargo run -q -p plowc -- \
+  --hf-dir <checkpoint> --emit devblob --out /tmp/plow-bringup
+nix develop --command cargo run -q -p plowrt --bin plowrt -- \
+  simulate --assets /tmp/plow-bringup --all-buckets
+```
+
+Do not continue to proof or GPU tuning until full and block emission succeed,
+all packet programs terminate in simulation, and the shipping manifest matches
+the Stage-1/reference tensor names and shapes.
 
 ## Procedure
 
@@ -98,6 +127,9 @@ Do not advance to Stage 4 (kernel tuning) until all of:
   comments; any new `rule_*` closes by `rfl` and is a real equality.
 - `soundRules` ⇔ `; rule:` annotations ⇔ `rule_*` theorems: one-to-one, no
   orphans either way.
+- Full-model and `--block` devblob emission are wired for the model; their
+  manifests match the Stage-1/reference tensor names and shapes, and every
+  program terminates / passes `simulate --all-buckets`.
 - Every bucket of the model passes: all seven checkpoints emit `ok` under
   `plowc --lean-verify`, with no skipped checkpoint (unless the binary was
   genuinely unusable and you reported it).

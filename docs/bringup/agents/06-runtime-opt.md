@@ -57,9 +57,10 @@ engine, and with it the lever set:
 
 * **`$VENDOR = nvidia`** (`ServeEngine::Cuda`, slotted): B sequence slots,
   chunked prefill, VMM prefix sharing, device sampling, multi-model residency.
-* **`$VENDOR = amd`** (`ServeEngine::Amd`, single-sequence per rank, optional
-  TP): one model per process, no paging, no residency; ragged-tail chunking +
-  same-slot prefix cache for recurrent models are the levers on this side.
+* **`$VENDOR = amd`** (`ServeEngine::Amd`, fixed-width slots with batch-ladder
+  rungs, optional TP): one model per process, no paging or multi-model
+  residency; ragged-tail chunking + same-slot prefix cache for recurrent models
+  are the levers on this side.
 
 The seam is per vendor, not per ISA — every `$ISA` of a vendor reaches the same
 engine. A lever listed for the other vendor **does not exist** on your target;
@@ -79,8 +80,15 @@ not sim will not serve — fix it here.
 
 ### 2. Single-stream latency floor (device, one sequence)
 
+`amd-bench` is a temporary diagnostic path, not the production performance
+authority: it drives `AmdEngine` directly and bypasses `AmdServe` scheduling.
+Use it only for kernel-floor, trace, tensor-dump, and TP-rank diagnostics. Record
+publishable TTFT, TPOT, and throughput through `plowrt serve` in step 3. Migrate
+this step to the planned production-engine benchmark before removing
+`amd-bench`.
+
 ```bash
-plowrt amd-bench --blob $ASSETS/model.pkt --rt-hsaco $ASSETS/hsaco \
+plowrt amd-bench --blob $ASSETS/model.pkt --hsaco $ASSETS/hsaco \
     --checkpoint $CKPT --prompt 1,2,3,4 --steps 64 --ctx 1024
 ```
 
@@ -90,6 +98,27 @@ timing only.** This is the `$VENDOR = amd` path; on nvidia, measure the
 single-stream floor through `serve` at concurrency 1 instead. For TP prefill
 scaling: `--tp $NGPU --prefill-sweep 512,1024,2048,4096,8192 --prefill-reps 3`
 (every sweep point ≤ `$MAXCTX`).
+
+### 2a. AMD benchmark harness convergence
+
+Track `amd-bench` removal as a staged migration, not a flag deletion:
+
+- [ ] Inventory and classify every consumer: performance, correctness,
+  trace/dump, TP audit, prefill sweep, or synthetic unbound probe.
+- [ ] Add a vendor-neutral `plowrt bench` backed by production `AmdServe`, with
+  token-id direct mode and endpoint mode; require bound weights by default.
+- [ ] Emit fail-closed structured results with artifact digests, target/TP,
+  shape/concurrency, warmups/repetitions, latency distribution, throughput, and
+  active knobs.
+- [ ] Expose shared trace, tensor/logit snapshot, TP-rank audit, bucket timing,
+  repeated-prefill, and ragged-batch diagnostics without reaching through
+  `AmdServe` into `AmdEngine`.
+- [ ] Move unbound weights and unwritten-KV timing to an explicitly synthetic
+  `amd-probe`; never report it as served-model performance.
+- [ ] Add bench-vs-serve parity tests for tokens, buckets, chunk boundaries, slot
+  lifecycle, batch-ladder rungs, and TP rank agreement.
+- [ ] Migrate scripts and docs; keep Stage 7 endpoint-only, warn for one release,
+  then remove `amd-bench` only when repository search finds no consumers.
 
 ### 3. Bring up serving and baseline
 

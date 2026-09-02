@@ -15,7 +15,7 @@
 #   CONC       in-flight requests (default 1); >1 is what tests a BATCHED packet end to end
 #   GSM8K_TEMPERATURE sampling temperature (default 0 — greedy and reproducible)
 #   GSM8K      path to a local `test.jsonl`; else it is fetched once to $CACHE
-#   CACHE      dataset cache dir (default /home/lava/models/gsm8k)
+#   CACHE      dataset cache dir (default ${XDG_CACHE_HOME:-$HOME/.cache}/plow/gsm8k)
 #   PLOWRT_BIN pre-copied binary, same reason as bench_plowrt_serve.sh
 #
 # METHOD, and the two things that make an accuracy number honest here:
@@ -34,13 +34,13 @@
 # The server is started and torn down exactly as `bench_plowrt_serve.sh` does it — `setsid`, kill
 # by PROCESS GROUP — because `nix develop -c` execs a shell that forks plowrt, so killing the pid
 # we waited on leaves the real server holding the cards.
-set -u
+set -euo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ASSETS="${1:?assets dir}"; PORT="${2:?port}"; MODEL="${3:?model slug}"; READY="${4:-1800}"
 N="${N:-200}"; SHOTS="${SHOTS:-8}"; MAXTOK="${MAXTOK:-320}"
 TEMPERATURE="${GSM8K_TEMPERATURE:-0}"
 CONC="${CONC:-1}"
-CACHE="${CACHE:-/home/lava/models/gsm8k}"
+CACHE="${CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/plow/gsm8k}"
 BIN="${PLOWRT_BIN:-$WT/target/release/plowrt}"
 
 mkdir -p "$CACHE"
@@ -189,5 +189,5 @@ if lat:
     lat.sort()
     print(f"  latency/question: median {lat[len(lat)//2]:.2f}s  mean {sum(lat)/len(lat):.2f}s"
           f"  total {time.time()-t0:.0f}s")
-sys.exit(0 if n else 3)
+sys.exit(0 if err == 0 and n == len(test) else 3)
 PY

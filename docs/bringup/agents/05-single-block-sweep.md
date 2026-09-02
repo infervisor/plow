@@ -109,6 +109,13 @@ only for a same-precision same-weight A/B.
 **Do not proceed to timing until correctness passes.** A fast wrong block is
 worthless.
 
+For a new AMD precision, split-K, attention or grouped-MoE arm, the oracle grid
+must cover ragged M/K, empty experts and maximum top-k, batch 1 and the widest
+decode rung, context immediately below/at/above tile and KV-ring boundaries,
+and repeated deterministic runs. For TP, compare TP1 with the target rank count
+and require rank token identity. Use `AMD_SERIALIZE_KERNEL=3` or
+`HIP_LAUNCH_BLOCKING=1` only to localize a fault, never for timing.
+
 ### 4. Latency — bench and sweep
 
 * **Gemma path:**

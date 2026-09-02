@@ -105,7 +105,7 @@ with a real prompt.
 **Accuracy number**, at least one:
 
 ```bash
-perf-data/tools/gpulease gsm8k scripts/bench_gsm8k.sh   # 8-shot greedy, n=200
+perf-data/tools/gpulease gsm8k scripts/bench_gsm8k.sh "$ASSETS" 8080 auto  # 8-shot greedy, n=200
 ```
 
 A throughput number without an accuracy number is not publishable — token
@@ -175,7 +175,7 @@ recompile, do not re-run.
 
 Transcribe every number verbatim from the tool's report JSON. Consolidators build
 the `*.json`; **you write the markdown by hand** from those JSONs with the prose
-and caveats. Commit under `$RESULTS` (per-ISA home `perf-data/plow-<isa>/` —
+and caveats. Write under `$RESULTS`; do not commit unless explicitly requested (per-ISA home `perf-data/plow-<isa>/` —
 `perf-data/plow-gfx942/` is the only one in the tree today; cross-arch capacity
 reports at the `perf-data/` root). If `$ISA` has no home yet, create one on the
 same pattern rather than filing under another ISA's directory. Match the
