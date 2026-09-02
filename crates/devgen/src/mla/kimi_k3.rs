@@ -1145,6 +1145,7 @@ fn k3_build_model(
             // BV must shrink with the local head count or the state step strands
             // the chip: at tp8 (12 heads) a fixed 16 gives 96 of 256 items.
             bv: if tp >= 8 { 8 } else { 16 },
+            full_rank_gate: c.kda_full_rank_gate,
         },
         mla: K3MlaCfg {
             hidden: c.hidden,

@@ -2745,6 +2745,9 @@ fn kv_write_row_field(op: u16, dst: Option<&String>) -> Option<usize> {
         // GLM/DeepSeek MLA: `kv_a_layernorm` -> `kv.{L}.ckv`, out_row0 in i[2]
         // (`runtime/amd/interp.hip`, PLOW_DOP_RMSNORM).
         Some(2)
+    } else if op == DevOp::DsaPoolCompress as u16 {
+        // GLM-5.3 pooled indexer: prefill pool-cache base in i[3].
+        Some(3)
     } else if op == DevOp::HeadNormRope as u16 || op == DevOp::HeadNormRopeFp8 as u16 {
         // Dense GQA k/v norm -> `kv.{L}.k`/`.v`, and MLA's k_rope -> `kv.{L}.krot`.
         // Both carry the write row in i[3].
@@ -7965,7 +7968,14 @@ mod tests {
     /// written at row 0, with no error anywhere.
     #[test]
     fn rebase_chunk_moves_only_the_kv_write_rows() {
-        let names: Vec<String> = ["kv.0.ckv", "act.xn", "kv.0.krot", "act.qr", "act.opart"]
+        let names: Vec<String> = [
+            "kv.0.ckv",
+            "act.xn",
+            "kv.0.krot",
+            "act.qr",
+            "act.opart",
+            "kv.0.kidx_pool",
+        ]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -7976,13 +7986,15 @@ mod tests {
         };
         // 0 kv_a_layernorm -> kv.0.ckv (row in i[2]); 1 the input norm, same
         // opcode, i[2] means nothing there; 2 k_rope -> kv.0.krot (row in i[3]);
-        // 3 the QUERY rope, same opcode, must be left alone; 4 the flash.
+        // 3 the QUERY rope, same opcode, must be left alone; 4 the flash;
+        // 5 GLM-5.3's pooled indexer cache (pool-row base in i[3]).
         let mut insts = vec![
             inst(DevOp::RmsNorm, 0),
             inst(DevOp::RmsNorm, 1),
             inst(DevOp::HeadNormRope, 2),
             inst(DevOp::HeadNormRope, 3),
             inst(DevOp::FlashMlaPrefill, 4),
+            inst(DevOp::DsaPoolCompress, 5),
         ];
         insts[4].i = [1, 64, 8192, 0, 128, u32::MAX, 0, 7];
         let before = insts.clone();
@@ -7991,6 +8003,10 @@ mod tests {
 
         assert_eq!(insts[0].i[2], 512, "kv.0.ckv out_row0 was not rebased");
         assert_eq!(insts[2].i[3], 512, "kv.0.krot out_row was not rebased");
+        assert_eq!(
+            insts[5].i[3], 512,
+            "kv.0.kidx_pool out-pool base was not rebased"
+        );
         // Everything else, field for field.
         assert_eq!(insts[0].i[..2], before[0].i[..2]);
         assert_eq!(insts[0].i[3..], before[0].i[3..]);

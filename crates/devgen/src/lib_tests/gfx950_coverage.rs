@@ -276,6 +276,13 @@ const EMITTER_SRC: &[&str] = &[
 /// list without gaining an emit site fails the test. Adding a row is the moment to ask §4's
 /// question — "what selects this, and is that selector complete over precisions?"
 const GFX950_UNEMITTED: &[(&str, &str)] = &[
+    // PLOW_DOP_HYPER_CONN_PRE/_POST: removed from this list — mla.rs now emits both
+    // (the hyper-connections pre/post wiring landed ahead of glm53.rs itself).
+    // PLOW_DOP_DSA_POOL_COMPRESS/_EXPAND/_STASH, PLOW_DOP_DSA_Q_QUANT,
+    // PLOW_DOP_INDEX_SCORE_KPOOL, PLOW_DOP_GEMV_F32: removed from this list —
+    // `emit_glm_dsa_decode_select`'s `index_kpool>1` branch (mla.rs) now emits all six.
+    // The prefill twin (`emit_glm_dsa_prefill_select`) and `glm53.rs` itself are still
+    // pending; HyperConnPre/HyperConnPost below remain unrouted until glm53.rs exists.
     (
         "PLOW_DOP_FLASH_GATHER_PREFILL",
         "Sparse MLA prefill needs one causal top-k index row per query token. IndexScore and \
