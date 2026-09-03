@@ -4267,7 +4267,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                                    prog.n_gpu, prog.rank,
                                    in->i[0], in->i[2] + in->i[5] * 2u, xoff, in->i[3], in->i[4],
                                    PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,
-                                   xr_res, xr_o2);
+                                   xr_res, xr_o2, in->i[6], in->i[7]);
         } else if (in->op == PLOW_DOP_XARGMAX_FIN) {
             /* Cross-rank fold for a VOCAB-COLUMN-PARALLEL lm_head.
              * Subsumes ARGMAX_FIN: it does the local nparts fold too, then rebases the index
