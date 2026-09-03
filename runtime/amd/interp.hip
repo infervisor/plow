@@ -63,6 +63,24 @@
 #ifndef PLOW_HAS_KDA_CHUNK_CARRY
 #define PLOW_HAS_KDA_CHUNK_CARRY 1
 #endif
+
+/* Opt-in decode-only pruning.  A generated PLOW_CONFIG supplies the exact
+ * PLOW_HAS_* set; ordinary developer objects retain the historical union. */
+#ifndef PLOW_DECODE_INVENTORY_PRUNE
+#define PLOW_DECODE_INVENTORY_PRUNE 0
+#endif
+#ifndef PLOW_HAS_HEADNORM_HD64
+#define PLOW_HAS_HEADNORM_HD64 1
+#endif
+#ifndef PLOW_HAS_HEADNORM_HD128
+#define PLOW_HAS_HEADNORM_HD128 1
+#endif
+#ifndef PLOW_HAS_HEADNORM_HD256
+#define PLOW_HAS_HEADNORM_HD256 1
+#endif
+#ifndef PLOW_HAS_HEADNORM_HD512
+#define PLOW_HAS_HEADNORM_HD512 1
+#endif
 #ifndef PLOW_KDA_CHUNK_QPRE
 #define PLOW_KDA_CHUNK_QPRE 0
 #endif
@@ -2221,6 +2239,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
     }
 #else
     switch (in->op) {
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_RMSNORM
         case PLOW_DOP_RMSNORM:
             /* i[2] = out_row0: the OUTPUT cache row (GLM decode-step latent write, patched per step);
              * 0 for every other RMSNORM (in-place), so all existing packets are bit-identical.
@@ -2231,16 +2250,22 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                       in->i[1], in->fj[0].f, in->i[2], slice, nblk, sm->part,
                       (unsigned char*)TEN(3), (float*)TEN(4) PLOW_PACKED_NORM_ARGS);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_ROWRMS
         case PLOW_DOP_ROWRMS:
             d_rowrms((float*)TEN(0), (const bf16*)TEN(1), in->i[0], in->i[1], in->fj[0].f, slice,
                      nblk, sm->part);
             break;
+#endif
         /* DSA indexer k_norm: LayerNorm WITH bias + mean-subtract (the only non-RMS norm). [GLM52-DSA] */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_LAYERNORM
         case PLOW_DOP_LAYERNORM:
             d_layernorm_bias((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                              (const bf16*)TEN(3), in->i[0], in->i[1], in->fj[0].f, in->i[3], slice,
                              nblk, sm->part);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_HEADNORM_ROPE
         case PLOW_DOP_HEADNORM_ROPE:
             /* head_dim is a compile-time constant here for the same reason it is in the
              * attention ops: a runtime one makes `E = hd >> 6` runtime, the e-loops stop
@@ -2248,6 +2273,56 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             /* i[5]==1 selects the INTERLEAVED (GPT-J) HD=128 template — the DSA indexer q/k RoPE
              * (rope the first qk_rope=64 of the 128-d head, pass the rest via an identity-tail cos/sin
              * table). i[5]==0 keeps the existing non-interleaved HD=128 path (every other arch). [GLM52-DSA] */
+#if PLOW_DECODE_INVENTORY_PRUNE
+            switch (in->i[2]) {
+#if PLOW_HAS_HEADNORM_HD128
+            case 128:
+                if (in->i[5] == 1)
+                d_headnorm_rope<128, /*INTERLEAVE=*/true>(
+                                     (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                     (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
+                                     in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
+                                     in->i[4], slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
+                else
+                    d_headnorm_rope<128>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                         (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
+                                         in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
+                                         in->i[4], slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
+                break;
+#endif
+#if PLOW_HAS_HEADNORM_HD256
+            case 256:
+                d_headnorm_rope<256>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                     (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
+                                     in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
+                                     in->i[4], slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
+                break;
+#endif
+#if PLOW_HAS_HEADNORM_HD512
+            case 512:
+                d_headnorm_rope<512>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                     (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
+                                     in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
+                                     in->i[4], slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
+                break;
+#endif
+            /* HD=64 is GLM-5.2's partial-rope slice, and GLM applies INTERLEAVED (GPT-J) RoPE there
+             * (dynamic per-step q_rope + shared k_rope for multi-token decode). No other arch uses
+             * HD=64, so HD==64 selects the interleaved template; every 128/256/512 path stays
+             * bit-identical (INTERLEAVE defaults false). See op_norm.h + rope_interleave_glm_test.c. */
+#if PLOW_HAS_HEADNORM_HD64
+            case 64:
+                d_headnorm_rope<64, /*INTERLEAVE=*/true>(
+                                     (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                     (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
+                                     in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
+                                     in->i[4], slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
+                break;
+#endif
+            default:
+                __builtin_trap();
+            }
+#else
             if (in->i[2] == 128 && in->i[5] == 1)
                 d_headnorm_rope<128, /*INTERLEAVE=*/true>(
                                      (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
@@ -2279,7 +2354,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                      (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
                                      in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
                                      in->i[4], slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
+#endif
             break;
+#endif
 #if PLOW_FP8_KV
         /* FP8 KV write (k/v only; q still uses HEADNORM_ROPE above). t0=uint8 cache, t6=f32 scale. */
         case PLOW_DOP_HEADNORM_ROPE_FP8:
@@ -2312,37 +2389,51 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                          slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
             break;
 #endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_NORM_RESIDUAL
         case PLOW_DOP_NORM_RESIDUAL:
             d_norm_residual((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                             (const bf16*)TEN(3), in->i[0], in->i[1], in->fj[0].f, in->fj[1].f, slice,
                             nblk, sm->part);
             break;
+#endif
         /* t3 = the OUTER residual of a fused chained pair: `out = (t3 + bf16(t1 + t2)) * f0`.
          * PLOW_TENSOR_NONE is the plain two-input add, byte for byte. See d_residual's note. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_RESIDUAL
         case PLOW_DOP_RESIDUAL:
             d_residual((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
                        in->fj[0].f, slice, nblk, (const bf16*)TEN(3));
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_ADD_NORM
         case PLOW_DOP_ADD_NORM:
             d_add_norm((bf16*)TEN(0), (bf16*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                        (const bf16*)TEN(4), in->i[0], in->i[1], in->fj[0].f, slice, nblk, sm->part);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_NORM_RESIDUAL_NORM
         case PLOW_DOP_NORM_RESIDUAL_NORM:
             d_norm_residual_norm((bf16*)TEN(0), (bf16*)TEN(1), (const bf16*)TEN(2),
                                  (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
                                  in->i[0], in->i[1], in->fj[0].f, in->fj[1].f, slice, nblk, sm->part);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GLU
         case PLOW_DOP_GLU:
             d_glu((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0], in->i[1],
                   slice, nblk);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_EMBED
         case PLOW_DOP_EMBED:
             d_embed((bf16*)TEN(0), (const bf16*)TEN(1), (const int*)TEN(2), in->i[0], in->i[1],
                     in->fj[0].f, slice, nblk);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_SOFTCAP
         case PLOW_DOP_SOFTCAP:
             d_softcap((bf16*)TEN(0), (const bf16*)TEN(1), in->i[0], in->fj[0].f, slice, nblk);
             break;
+#endif
         /* KDA — Kimi Delta Attention (69 of Kimi-K3's 93 layers). Four arms, present in BOTH
          * buckets because a KDA layer runs the same four ops at T=1 and T>1 (op 102's serial-T
          * loop is the reference `fused_recurrent` algorithm, exact at any T).
@@ -2669,15 +2760,19 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif /* PLOW_K3 */
         /* Greedy sampling on device. In BOTH buckets: prefill samples the first token, decode
          * every one after it, and the id lands in `in.ids` where the next EMBED reads it. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_ARGMAX
         case PLOW_DOP_ARGMAX:
             /* i1 = n_batch (0/1 => single sequence, byte-identical). */
             d_argmax((unsigned long long*)TEN(0), (const bf16*)TEN(1), in->i[0], in->i[1], slice,
                      nblk, sm->am);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_ARGMAX_FIN
         case PLOW_DOP_ARGMAX_FIN:
             d_argmax_fin((int*)TEN(0), (const unsigned long long*)TEN(1), in->i[0], in->i[1],
                          slice);
             break;
+#endif
 #if PLOW_BUCKET_PREFILL
 #if PLOW_FP8
         /* w8a8 PREFILL arms. ADDITIVE — they JOIN the bf16 GEMM arms below, they no longer
@@ -2946,9 +3041,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                    in->i[0], in->i[1], in->i[2], slice, nblk);
             break;
 #else
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV
         case PLOW_DOP_GEMV:
             exec_gemv(in, T, slice, nblk, sm->gm);
             break;
+#endif
 #if PLOW_FP8
         /* The fp8 decode arms. w8a16, NOT w8a8: the activation stays bf16 and the weight is
          * dequantized on load, which is the opposite of what PLOW_FP8 selects in the PREFILL
@@ -2986,6 +3083,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             exec_gemv_qkv_mxfp4(in, T, slice, nblk, sm->gm);
             break;
 #endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV_GLU
         case PLOW_DOP_GEMV_GLU:
             /* f[0]/f[1] carry the situ betas, exactly as PLOW_DOP_SITU_GLU does. They are 0 on
              * every non-K3 packet, and act != 2 ignores them. */
@@ -2993,6 +3091,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                        (const bf16*)TEN(5), in->i[0], in->i[1], in->i[2], in->i[5], slice, nblk,
                        sm->gm, in->fj[0].f, in->fj[1].f);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV_QKV
         case PLOW_DOP_GEMV_QKV:
             /* t7 PRESENT = THE Q-NORM FOLD (emit knob PLOW_GLM_FUSE_QNORM): t1 then carries the
              * RAW q_a projection and this packet computes `q_a_layernorm` into its own LDS
@@ -3008,6 +3108,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                        in->i[1], in->i[3], in->i[4], in->i[2], slice, nblk, sm->gm,
                        (const bf16*)TEN(7), in->fj[0].f);
             break;
+#endif
         /* FUSED Q|K|V|G — op 22 plus a fourth output stream (Kimi-K3 KDA q/k/v/g_proj).
          *
          * t7 = g_out, i5 = Ng, i6 = the W_g HANDLE (nine pointers do not fit t[8]; dev_isa.h
@@ -3017,6 +3118,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * that must not happen is a malformed 4-stream packet quietly running as a 3-stream sweep
          * and leaving g_out exactly as it found it — finite, fluent, wrong. A packet that names
          * this opcode without both halves of the fourth stream TRAPS. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV_QKVG
         case PLOW_DOP_GEMV_QKVG: {
             const bf16* Wg = (in->i[6] == PLOW_TENSOR_NONE) ? nullptr : (const bf16*)T[in->i[6]];
             if (in->i[5] == 0u || Wg == nullptr || TEN(7) == nullptr) __builtin_trap();
@@ -3026,6 +3128,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                         in->i[2], slice, nblk, sm->gm);
             break;
         }
+#endif
 #if PLOW_FP8_KV
         /* fp8-KV decode object: SWAP in the fp8 flash so the bf16 flash_decode is not compiled and
          * the register budget stays flat against the 256/occ-2 cliff. */
@@ -3033,9 +3136,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             exec_flash_decode_fp8(in, T, slice, nblk, sm->fd);
             break;
 #else
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_DECODE
         case PLOW_DOP_FLASH_DECODE:
             exec_flash_decode(in, T, slice, nblk, sm->fd);
             break;
+#endif
 #endif
         /* ===== DeepSeek MLA (Multi-head Latent Attention) — the flash READ path.  [DEEPSEEK-MLA]
          * The latent flash (dense + gathered) emits latent-wide (O,m,l) folded by FLASH_MERGE<512>;
@@ -3057,30 +3162,42 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             exec_flash_mla_decode(in, T, slice, nblk, PLOW_FMLA(sm));
             break;
 #else
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_MLA_DECODE
         case PLOW_DOP_FLASH_MLA_DECODE:
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_GATHER_DECODE
         case PLOW_DOP_FLASH_GATHER_DECODE:
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_MLA_DECODE || PLOW_HAS_FLASH_GATHER_DECODE
             exec_flash_mla_decode(in, T, slice, nblk, PLOW_FMLA(sm));
             break;
 #endif
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_O_UV_FOLD
         case PLOW_DOP_O_UV_FOLD:
             d_o_uv_fold<512>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
                              in->i[1], in->i[2], slice, nblk, sm->raw);
             break;
+#endif
         /* FUSED MLA merge+fold (replaces FLASH_MERGE<512> + O_UV_FOLD): merges the nsplit latent
          * partials in LDS + folds W_uv straight to v_head. VT is chosen per dispatch — see
          * exec_mla_merge_fold. olds + the fold's cross-wave scratch reuse the raw arena
          * (DK + PLOW_WAVES*VT floats, well inside PLOW_SMEM_HALVES; PLOW_MLA_FOLD_TB_LDS
          * floats when the token-blocked arm is built, which the assert above bounds). */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MLA_MERGE_FOLD
         case PLOW_DOP_MLA_MERGE_FOLD:
             exec_mla_merge_fold(in, T, slice, nblk, (float*)sm->raw);
             break;
+#endif
         /* On-device top-k KV selection -> idx table (the DSA selector, sparse-attn §3.2). Feeds
          * FLASH_GATHER_DECODE. Packed-key rank in LDS (reuse the arena as u64 score keys). */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_ATTN_SELECT
         case PLOW_DOP_ATTN_SELECT:
             d_attn_select((int*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), (const int*)TEN(3),
                           in->i[0], in->i[1], in->i[2], in->i[3], in->fj[0].f, slice, nblk,
                           (unsigned long long*)sm->raw);
             break;
+#endif
         /* DSA lightning-indexer SCORE -> f32 score[ctx] in HBM (consumed by INDEX_SELECT). WIDE-K MFMA
          * variant (perf floor 1: ~94->33us/full-layer @128k, HBM roofline). Streams the key matrix
          * contiguously through LDS and runs the [HI x DI].[DI x ctx] score-dot as 8 wide-K 32x32x16 bf16
@@ -3093,6 +3210,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * occupancy is unchanged (relmax 0.0000 vs the _fast/scalar path).
          * index_head_dim=128, index_n_heads=32 are GLM-fixed (template).
          * t0=Score t1=Qidx t2=Kidx t3=W t4=kv_len; i0=n_batch i2=kv_stride; f0=scale. [GLM52-DSA] */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_SCORE
         case PLOW_DOP_INDEX_SCORE: {
             constexpr int DI_ = 128, HI_ = 32;
             constexpr int QSTRIDE = DI_ + FA_PAD, KSTRIDE = DI_ + FA_PAD, TILE_N = PLOW_WAVES * 32;
@@ -3104,6 +3222,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                          in->fj[0].f, slice, nblk, qlds, ktile, wlds);
             break;
         }
+#endif
         /* DSA top-k SELECT: ONE cooperative launch (this op MUST be emitted on a CU set whose `nblk`
          * workgroups are all co-resident) — 7-pass radix over the packed key with an L2-atomic grid
          * barrier. The kernel is handed `slice`, not blockIdx.x: it partitions the score array by
@@ -3121,6 +3240,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * positions past the end of the cache. The kernel falls back to `len_max` when t4 is
          * PLOW_TENSOR_NONE only so an old blob keeps its old (wrong) behaviour instead of faulting;
          * every blob this tree emits binds it. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_INDEX_SELECT
         case PLOW_DOP_INDEX_SELECT: {
             unsigned* lh = (unsigned*)sm->raw;
             d_index_select_coop((int*)TEN(0), (const float*)TEN(1), in->i[0], in->i[1],
@@ -3128,16 +3248,20 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                 (const int*)TEN(4));
             break;
         }
+#endif
         /* ===== MoE data-dependent counter-gate. Decode-path
          * (bs=1, K-slot dispatch). The body branches on the routing table; the interp still
          * signals the successor unconditionally, so the counter DAG is unchanged. The router's
          * n_exp<=256 score scratch reuses the LDS arena (sm->raw, the largest union member). */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_ROUTER
         case PLOW_DOP_MOE_ROUTER:
             /* flags bit 2 (0x4) => t3 is the e_score_correction_bias (f32[n_exp]); else no bias. */
             d_moe_router((unsigned char*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                          (in->i[3] & 4u) ? (const float*)TEN(3) : nullptr, in->i[0], in->i[1],
                          in->i[2], in->i[3], in->fj[0].f, slice, nblk, (float*)sm->raw);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_ROUTER_TOPK
         case PLOW_DOP_MOE_ROUTER_TOPK: /* t1=logit(bf16) t3=bias; i1=n_exp i2=k i3=flags f0=route_scale */
             /* i6=n_group i7=topk_group (DeepSeek-V3 / Kimi K2 group-limited routing; 0 or 1
              * means flat top-k, which is every GLM/Qwen/Mixtral packet and is bit-identical
@@ -3147,19 +3271,25 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                               in->i[3], in->fj[0].f, slice, nblk, (float*)sm->raw, in->i[6],
                               in->i[7]);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_EXPERT_GLU
         case PLOW_DOP_MOE_EXPERT_GLU: /* f0/f1 = situ betas, as on the block-fp8 twin */
             d_moe_expert_glu((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
                              (const unsigned long long*)TEN(3), in->i[0], in->i[1], in->i[2],
                              in->i[3], in->i[5], slice, nblk, in->fj[0].f, in->fj[1].f);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_EXPERT_DOWN
         case PLOW_DOP_MOE_EXPERT_DOWN:
             d_moe_expert_down((float*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
                               (const unsigned long long*)TEN(3), in->i[0], in->i[1], in->i[2],
                               in->i[3], slice, nblk);
             break;
+#endif
         /* f0/f1 carry Kimi-K3's `situ` betas and are read ONLY when i5 == PLOW_MOE_ACT_SITU. They
          * were free on every GLU-family op, so this consumes no `i` slot and every existing
          * emitter (which leaves them zero) is byte-identical. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_EXPERT_GLU_FP8_BLK
         case PLOW_DOP_MOE_EXPERT_GLU_FP8_BLK: /* t3=wtab t4=stab; i0=slot i1=I_moe i2=H i3=n_exp i5=act i6=ENC f0/f1=situ betas */
             d_moe_expert_glu_fp8_blk((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
                                      (const unsigned long long*)TEN(3),
@@ -3167,12 +3297,16 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                      in->i[3], in->i[5], slice, nblk, in->i[6], in->fj[0].f,
                                      in->fj[1].f);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_EXPERT_DOWN_FP8_BLK
         case PLOW_DOP_MOE_EXPERT_DOWN_FP8_BLK: /* t3=wtab t4=stab; i0=slot i1=H i2=I_moe i3=n_exp i6=ENC */
             d_moe_expert_down_fp8_blk((float*)TEN(0), (const bf16*)TEN(1),
                                       (const unsigned char*)TEN(2), (const unsigned long long*)TEN(3),
                                       (const unsigned long long*)TEN(4), in->i[0], in->i[1], in->i[2],
                                       in->i[3], slice, nblk, in->i[6]);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_GROUP_GLU_FP8_BLK
         case PLOW_DOP_MOE_GROUP_GLU_FP8_BLK: /* grouped: t3=wtab t4=stab; i0=k i1=I_moe i2=H i3=n_exp i5=act i6=ENC */
             d_moe_group_glu_fp8_blk((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
                                     (const unsigned long long*)TEN(3),
@@ -3180,16 +3314,21 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                     in->i[3], in->i[5], slice, nblk, in->i[6], in->fj[0].f,
                                     in->fj[1].f);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_GROUP_DOWN_FP8_BLK
         case PLOW_DOP_MOE_GROUP_DOWN_FP8_BLK: /* grouped: t3=wtab t4=stab; i0=k i1=H i2=I_moe i3=n_exp i6=ENC */
             d_moe_group_down_fp8_blk((float*)TEN(0), (const bf16*)TEN(1),
                                      (const unsigned char*)TEN(2), (const unsigned long long*)TEN(3),
                                      (const unsigned long long*)TEN(4), in->i[0], in->i[1], in->i[2],
                                      in->i[3], slice, nblk, in->i[6]);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_MOE_COMBINE
         case PLOW_DOP_MOE_COMBINE:
             d_moe_combine((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                           (const float*)TEN(3), in->i[0], in->i[1], slice, nblk);
             break;
+#endif
 #if PLOW_MOE_GEMMA
         /* ===== Gemma-4 26B-A4B sparse-MoE DECODE (ops 61-72). [GEMMA4-MOE-AMD] =====
          *
@@ -3306,6 +3445,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * partitioned the builds. Now that PLOW_FP8 is additive the partition is gone and so is the
          * duplicate: op 44 is a BLOCK-fp8 weight arm, a third weight encoding independent of the
          * per-channel fp8 the PLOW_FP8 axis names, so it belongs here unconditionally. */
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_DENSE_GLU_FP8_BLK
         case PLOW_DOP_DENSE_GLU_FP8_BLK: /* t2=Wg t5=Wu t3=Sg t4=Su; i0=N(inter) i1=K(hidden) i5=act
                                           * f0/f1 = situ betas (K3's dense FFN + shared experts) */
             d_dense_glu_fp8_blk((bf16*)TEN(0), (const bf16*)TEN(1), (const unsigned char*)TEN(2),
@@ -3313,11 +3453,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                 (const float*)TEN(4), in->i[0], in->i[1], in->i[5], slice, nblk,
                                 in->fj[0].f, in->fj[1].f);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_GEMV_FP8_BLK
         case PLOW_DOP_GEMV_FP8_BLK: /* dense DOWN: t2=W(fp8) t5=scale; i0=M i1=N i2=K i4=x_row */
             d_gemv_fp8_blk((bf16*)TEN(0), (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                            (const unsigned char*)TEN(2), (const float*)TEN(5), in->i[0], in->i[1],
                            in->i[2], slice, nblk, sm->gm);
             break;
+#endif
+#if !PLOW_DECODE_INVENTORY_PRUNE || PLOW_HAS_FLASH_MERGE
         case PLOW_DOP_FLASH_MERGE:
             if (in->i[3] == 128)
                 d_flash_merge<128>((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),
@@ -3329,6 +3473,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 d_flash_merge<512>((bf16*)TEN(0), (const float*)TEN(1), (const float*)TEN(2),
                                    in->i[0], in->i[1], in->i[2], slice, nblk);
             break;
+#endif
 #endif /* bucket */
         /* THE GROUPED EXPERT CHAIN IS AN FFN AXIS, NOT A BUCKET-PREFILL ONE — which is why it
          * sits AFTER the PLOW_BUCKET_PREFILL block rather than inside it.

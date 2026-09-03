@@ -734,6 +734,8 @@ option(PLOW_MLA_PF_V2_ARM "Compile the four-wave MLA prefill V2 arm" OFF)
 set(PLOW_HSACO_EXTRA_DEFINES "" CACHE STRING "extra raw hipcc flags appended to every code object")
 set(PLOW_HSACO_CONFIG "" CACHE FILEPATH
     "manifest-derived plow_config.h used to specialise ordinary interpreter objects")
+option(PLOW_HSACO_DECODE_INVENTORY_PRUNE
+       "Prune decode interpreter arms to the generated packet inventory" OFF)
 
 if(PLOW_GFX950_HSACO)
     if(PLOW_HSACO_EXTRA_DEFINES MATCHES "(^|[ \t;])-DPLOW_GATE_HIER(=|[ \t;]|$)")
@@ -784,6 +786,10 @@ if(PLOW_GFX950_HSACO)
             list(APPEND _hs_extra -DPLOW_KDA_CHUNK_QPRE=1)
         endif()
     endif()
+    if(PLOW_HSACO_DECODE_INVENTORY_PRUNE AND NOT PLOW_HSACO_CONFIG)
+        message(FATAL_ERROR
+            "PLOW_HSACO_DECODE_INVENTORY_PRUNE requires PLOW_HSACO_CONFIG")
+    endif()
     set(_hs_run "${CMAKE_CURRENT_SOURCE_DIR}/cmake/hipcc_hsaco.sh")
     # The op bodies live entirely in headers, so without these a kernel edit
     # leaves every .elf stale — the exact failure every guard in
@@ -828,6 +834,9 @@ if(PLOW_GFX950_HSACO)
         set(_hs_gvmm ${PLOW_GEMV_MM})
     endif()
     set(_hs_ax_decode -DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=${_hs_gvmm})
+    if(PLOW_HSACO_DECODE_INVENTORY_PRUNE)
+        list(APPEND _hs_ax_decode -DPLOW_DECODE_INVENTORY_PRUNE=1)
+    endif()
     if(PLOW_GEMV_WALK)
         list(APPEND _hs_ax_decode -DPLOW_GEMV_WALK=1)
     endif()

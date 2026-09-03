@@ -86,8 +86,8 @@ impl Arm {
 
 /// Which shape field (if any) selects a template instantiation for this opcode.
 ///
-/// ONLY the flash family is templated on an instruction field today: `d_flash_*`
-/// is `<HD, GF>`. The GEMM tile variants are separate OPCODES
+/// Flash and head-normalization are templated on an instruction field today.
+/// The GEMM tile variants are separate OPCODES
 /// (`Gemm`/`GemmMed`/`GemmSmall`), so the opcode already carries them and adding a
 /// second key would split one body into several phantom arms.
 ///
@@ -104,6 +104,7 @@ impl Arm {
 fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
     let hd = match op {
         DevOp::FlashMerge => Some(i[3]),
+        DevOp::HeadNormRope | DevOp::HeadNormRopeFp8 => Some(i[2]),
         DevOp::FlashPrefill
         | DevOp::FlashPrefillFp8
         | DevOp::FlashDecode
@@ -1414,6 +1415,21 @@ pub fn config_header(manifest: &Value) -> String {
             if present { 1 } else { 0 }
         ));
     }
+    out.push_str("\n/* --- decode head-normalization dimensions present --- */\n");
+    for hd in [64u32, 128, 256, 512] {
+        let present = decode_ops.contains("HeadNormRope")
+            && manifest
+                .pointer("/objects/ordinary/decode/arms")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|k| k == format!("HeadNormRope/hd{hd}"));
+        out.push_str(&format!(
+            "#ifndef PLOW_HAS_HEADNORM_HD{hd}\n#define PLOW_HAS_HEADNORM_HD{hd} {}\n#endif\n",
+            if present { 1 } else { 0 }
+        ));
+    }
 
     out.push_str("\n/* --- rule-derived shape constants --- */\n");
     if let Some(t) = manifest.get("tuning").and_then(Value::as_object) {
@@ -1864,6 +1880,63 @@ mod tests {
     }
 
     #[test]
+    fn every_prunable_decode_dispatch_is_presence_gated() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("runtime/amd/interp.hip");
+        let Ok(src) = std::fs::read_to_string(path) else {
+            return;
+        };
+        for op in [
+            DevOp::RmsNorm,
+            DevOp::RowRms,
+            DevOp::LayerNorm,
+            DevOp::HeadNormRope,
+            DevOp::NormResidual,
+            DevOp::Residual,
+            DevOp::AddNorm,
+            DevOp::NormResidualNorm,
+            DevOp::Glu,
+            DevOp::Embed,
+            DevOp::SoftCap,
+            DevOp::Argmax,
+            DevOp::ArgmaxFin,
+            DevOp::Gemv,
+            DevOp::GemvGlu,
+            DevOp::GemvQkv,
+            DevOp::GemvQkvg,
+            DevOp::FlashDecode,
+            DevOp::FlashMlaDecode,
+            DevOp::OUvFold,
+            DevOp::MlaMergeFold,
+            DevOp::AttnSelect,
+            DevOp::IndexScore,
+            DevOp::IndexSelect,
+            DevOp::MoeRouter,
+            DevOp::MoeExpertGlu,
+            DevOp::MoeExpertDown,
+            DevOp::MoeExpertGluFp8Blk,
+            DevOp::MoeExpertDownFp8Blk,
+            DevOp::DenseGluFp8Blk,
+            DevOp::GemvFp8Blk,
+            DevOp::FlashMerge,
+        ] {
+            let case = format!("        case {}:", op.c_name());
+            let guard = format!(
+                "#if !PLOW_DECODE_INVENTORY_PRUNE || {}\n{case}",
+                op.c_name().replace("PLOW_DOP_", "PLOW_HAS_")
+            );
+            assert!(
+                src.contains(&guard),
+                "{} is not directly guarded by its decode inventory bit",
+                op.c_name()
+            );
+        }
+    }
+
+    #[test]
     fn k3_object_inventory_covers_every_ordinary_and_lean_arm() {
         let ordinary = [
             DevOp::KdaConv,
@@ -1967,6 +2040,7 @@ mod tests {
     #[test]
     fn arm_of_reads_the_head_dim_slot_each_flash_op_actually_uses() {
         let mut i = [0u32; 8];
+        i[2] = 128; // HeadNormRope's slot
         i[3] = 256; // FlashMerge's slot
         i[6] = 128; // FlashPrefill / FlashDecode's slot
         assert_eq!(
@@ -1977,6 +2051,8 @@ mod tests {
         assert_eq!(arm_of(DevOp::FlashPrefill, &i).hd, Some(128));
         assert_eq!(arm_of(DevOp::FlashDecode, &i).hd, Some(128));
         assert_eq!(arm_of(DevOp::FlashDecodeFp8, &i).hd, Some(128));
+        assert_eq!(arm_of(DevOp::HeadNormRope, &i).hd, Some(128));
+        assert_eq!(arm_of(DevOp::HeadNormRopeFp8, &i).hd, Some(128));
         assert_eq!(
             arm_of(DevOp::Gemv, &i).hd,
             None,
@@ -1986,6 +2062,66 @@ mod tests {
         let mut real = [0u32; 8];
         real[3] = 512;
         assert_eq!(arm_of(DevOp::FlashMerge, &real).hd, Some(512));
+    }
+
+    #[test]
+    fn decode_header_is_an_exact_opcode_and_headnorm_inventory() {
+        let mut hn = inst(DevOp::HeadNormRope, [0; 8]);
+        hn.i[2] = 64;
+        let decode_ops = [
+            DevOp::RmsNorm,
+            DevOp::HeadNormRope,
+            DevOp::Embed,
+            DevOp::Gemv,
+            DevOp::Argmax,
+            DevOp::ArgmaxFin,
+            DevOp::GemvGlu,
+            DevOp::XReduce,
+            DevOp::MoeCombine,
+            DevOp::MoeGroupGluFp8Blk,
+            DevOp::MoeGroupDownFp8Blk,
+            DevOp::FlashMlaDecode,
+            DevOp::MoeRouterTopk,
+            DevOp::MlaMergeFold,
+            DevOp::KdaGatedNorm,
+            DevOp::AttnRes,
+            DevOp::SituGlu,
+            DevOp::MlaOutGate,
+            DevOp::GemvQkvg,
+            DevOp::KdaConv3,
+            DevOp::KdaStateStepG,
+        ];
+        let mut insts = vec![hn];
+        insts.extend(
+            decode_ops
+                .iter()
+                .copied()
+                .filter(|op| *op != DevOp::HeadNormRope)
+                .map(|op| inst(op, [0; 8])),
+        );
+        let model = Model {
+            n_cu: 256,
+            target: 0,
+            tensors: vec![],
+            progs: vec![prog(insts)],
+            kv_row_insts: vec![],
+            prog_t: vec![1],
+            gen: vec![],
+        };
+        let header = config_header(&build(&model, "gfx950"));
+        for op in DevOp::ALL {
+            let macro_name = op.c_name().replace("PLOW_DOP_", "PLOW_HAS_");
+            let expected = if decode_ops.contains(op) { 1 } else { 0 };
+            let needle = format!("#elif PLOW_BUCKET_DECODE\n#define {macro_name} {expected}\n");
+            assert!(
+                header.contains(&needle),
+                "decode inventory has the wrong presence value for {op:?}"
+            );
+        }
+        assert!(header.contains("#define PLOW_HAS_HEADNORM_HD64 1"));
+        for hd in [128, 256, 512] {
+            assert!(header.contains(&format!("#define PLOW_HAS_HEADNORM_HD{hd} 0")));
+        }
     }
 
     /// The header gates arms on presence, and the guard lets an explicit -D win.
