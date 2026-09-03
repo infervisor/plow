@@ -6607,6 +6607,7 @@ fn emit_dense_gqa(
         b.adopt_tensors(tensors.clone());
         b.set_l2_placement(l2_layout); // PLOW_L2_PLACE: None ⇒ byte-identical
         b.set_lean_moe_stage2_segments(amd && emit_config::active().moe_stage2_lean);
+        b.set_lean_moe_stage1_segments(amd && emit_config::active().moe_stage1_lean);
         if amd {
             b.deny_uniseg(); // PLOW_UNISEG collapses the wave-class split — see `warn_uniseg_amd`
         }

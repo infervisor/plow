@@ -506,9 +506,52 @@ struct MoeStage2Mxfp4Args {
 const _: () = assert!(std::mem::size_of::<MoeStage2Mxfp4Args>() == 88);
 
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MoeStage1Mxfp4Args {
+    out: u64,
+    activation: u64,
+    weight_table: u64,
+    weight_scale_table: u64,
+    meta: u64,
+    row_token: u64,
+    row_partidx: u64,
+    out_scale: u64,
+    inter_dim: u32,
+    model_dim: u32,
+    experts: u32,
+    act: u32,
+    beta: f32,
+    linear_beta: f32,
+    reserved: u32,
+    reserved2: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeStage1Mxfp4Args>() == 96);
+
+#[derive(Clone, Copy, Debug)]
+struct MoeStage1Mxfp4Route {
+    args: MoeStage1Mxfp4Args,
+    grid: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
 enum PrefillSegmentRoute {
     Interpreter,
+    MoeStage1Mxfp4(MoeStage1Mxfp4Route),
     MoeStage2Mxfp4(MoeStage2Mxfp4Args),
+}
+
+fn moe_stage1_mxfp4_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::MoeGroupGluPf as u16
+        && d.i[0] == 384
+        && d.i[1] == 3584
+        && d.i[2] == 896
+        && d.i[3] == MOE_ENC_MXFP4
+        && d.i[4] == 0
+        && d.i[5] <= 2
+        && d.i[6] == 0
+        && d.i[7] == 0
+        && d.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
 }
 
 fn moe_stage2_mxfp4_pair(d: &DevInst64, c: &DevInst64) -> bool {
@@ -558,7 +601,20 @@ fn has_moe_stage2_mxfp4_segment(prog: &DevProg) -> bool {
     })
 }
 
-fn moe_stage2_mxfp4_routes(
+fn has_moe_stage1_mxfp4_segment(prog: &DevProg) -> bool {
+    let mut members = std::collections::BTreeMap::<u16, std::collections::BTreeSet<usize>>::new();
+    for entry in &prog.stream {
+        members
+            .entry(entry.seg)
+            .or_default()
+            .insert(entry.inst as usize);
+    }
+    members
+        .values()
+        .any(|set| set.len() == 1 && moe_stage1_mxfp4_inst(&prog.insts[*set.first().unwrap()]))
+}
+
+fn moe_mxfp4_routes(
     prog: &DevProg,
     tensors: &[crate::asset::devblob::DevTensor],
     devp: &[DeviceMem],
@@ -615,6 +671,53 @@ fn moe_stage2_mxfp4_routes(
     };
     let mut routes = Vec::with_capacity(n_seg);
     for (seg, set) in members.into_iter().enumerate() {
+        if set.len() == 1 {
+            let i = *set.first().unwrap();
+            let d = &prog.insts[i];
+            if !moe_stage1_mxfp4_inst(d) {
+                routes.push(PrefillSegmentRoute::Interpreter);
+                continue;
+            }
+            let align = prog.insts.iter().find(|a| {
+                a.op == DevOp::MoeAlignPf as u16
+                    && a.t[0] == d.t[4]
+                    && a.i[0] == prog.t
+                    && a.i[1] == d.i[2]
+                    && a.i[2] == 16
+            });
+            if align.is_none() {
+                return Err(RuntimeError::Device(format!(
+                    "segment {seg} isolates a MoE stage-1 packet without its exact T/top-k align producer"
+                )));
+            }
+            if d.blocks == 0 {
+                return Err(RuntimeError::Device(format!(
+                    "segment {seg} has a zero-grid MoE stage-1 packet"
+                )));
+            }
+            routes.push(PrefillSegmentRoute::MoeStage1Mxfp4(MoeStage1Mxfp4Route {
+                args: MoeStage1Mxfp4Args {
+                    out: addr(d.t[0], "out")?,
+                    activation: addr(d.t[1], "activation")?,
+                    weight_table: addr(d.t[2], "weight_table")?,
+                    weight_scale_table: addr(d.t[3], "weight_scale_table")?,
+                    meta: addr(d.t[4], "meta")?,
+                    row_token: addr(d.t[5], "row_token")?,
+                    row_partidx: addr(d.t[6], "row_partidx")?,
+                    out_scale: addr(d.t[7], "out_scale")?,
+                    inter_dim: d.i[0],
+                    model_dim: d.i[1],
+                    experts: d.i[2],
+                    act: d.i[5],
+                    beta: f32::from_bits(d.fj[0]),
+                    linear_beta: f32::from_bits(d.fj[1]),
+                    reserved: 0,
+                    reserved2: 0,
+                },
+                grid: u32::from(d.blocks),
+            }));
+            continue;
+        }
         if set.len() != 2 {
             routes.push(PrefillSegmentRoute::Interpreter);
             continue;
@@ -4806,6 +4909,7 @@ pub struct AmdEngine {
     k_prefill: HsaKernel,
     k_decode: HsaKernel,
     k_kda_decode_fused: Option<HsaKernel>,
+    k_moe_stage1_mxfp4: Option<HsaKernel>,
     k_moe_stage2_mxfp4: Option<(HsaKernel, HsaKernel)>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
@@ -5410,6 +5514,9 @@ impl AmdEngine {
         let need_moe_stage2_lean = blob.progs[..dec_ix]
             .iter()
             .any(has_moe_stage2_mxfp4_segment);
+        let need_moe_stage1_lean = blob.progs[..dec_ix]
+            .iter()
+            .any(has_moe_stage1_mxfp4_segment);
 
         // --- code objects ---------------------------------------------------
         // Resolve the symbol immediately after each load: the HSA backend
@@ -5950,6 +6057,65 @@ impl AmdEngine {
             }
             modules.push(module);
             Some(kernel)
+        } else {
+            None
+        };
+
+        let k_moe_stage1_mxfp4 = if arch == "gfx950" && need_moe_stage1_lean {
+            const NAME: &str = "moe_stage1_mxfp4_gfx950.elf";
+            const SYMBOL: &str = "plow_moe1_mxfp4_bk256_gfx950";
+            const MARKERS: [&str; 6] = [
+                "plow_moe1_mxfp4_stage1_abi_1",
+                "plow_moe1_mxfp4_stage1_bm64_bn256_bk256_1",
+                "plow_moe1_mxfp4_stage1_wave64_1",
+                "plow_moe1_mxfp4_stage1_no_spill_1",
+                "plow_moe1_mxfp4_stage1_dynamic_lds_119808",
+                "plow_moe1_mxfp4_stage1_vgpr_le_192",
+            ];
+            let path = hsaco_dir.join(NAME);
+            if !path.exists() {
+                None
+            } else {
+                if !prefill_moe_align_bm64 {
+                    return Err(RuntimeError::Device(format!(
+                        "lean MoE stage-1 object {} requires a producer advertising plow_moe_align_bm64_1",
+                        path.display()
+                    )));
+                }
+                let image = std::fs::read(&path).map_err(|e| {
+                    RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                })?;
+                let syms = elf_symbol_names(&image);
+                for marker in MARKERS {
+                    if !syms.contains(&marker) {
+                        return Err(RuntimeError::Device(format!(
+                            "lean MoE stage-1 object {} lacks required ABI/resource marker `{marker}`",
+                            path.display()
+                        )));
+                    }
+                }
+                let module = EngineDevice::module_load(&*be, &image)?;
+                let kernel = EngineDevice::get_function(&*be, &module, SYMBOL).map_err(|e| {
+                    RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}"))
+                })?;
+                let want = std::mem::size_of::<MoeStage1Mxfp4Args>() as u32;
+                let got = kernel.kernarg_size();
+                if got != want && got != want + 256 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: kernarg segment is {got} B; lean stage-1 ABI needs {want} (or {} with COv5 implicit args)",
+                        want + 256
+                    )));
+                }
+                if kernel.private_segment_size() != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: private segment is {} B; lean stage-1 requires zero",
+                        kernel.private_segment_size()
+                    )));
+                }
+                EngineDevice::set_max_dynamic_smem(&*be, kernel, 119_808)?;
+                modules.push(module);
+                Some(kernel)
+            }
         } else {
             None
         };
@@ -6536,7 +6702,7 @@ impl AmdEngine {
                 vec![DecodeSegmentRoute::Interpreter; seg_class.len()]
             };
             let prefill_routes = if prog_ix < dec_ix {
-                moe_stage2_mxfp4_routes(p, &blob.tensors, &devp)?
+                moe_mxfp4_routes(p, &blob.tensors, &devp)?
             } else {
                 vec![PrefillSegmentRoute::Interpreter; seg_class.len()]
             };
@@ -7027,6 +7193,7 @@ impl AmdEngine {
             k_prefill,
             k_decode,
             k_kda_decode_fused,
+            k_moe_stage1_mxfp4,
             k_moe_stage2_mxfp4,
             k_xaudit,
             k_state_clear,
@@ -7508,6 +7675,22 @@ impl AmdEngine {
         }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !active {
+            if let (Some(kernel), Some(PrefillSegmentRoute::MoeStage1Mxfp4(route))) = (
+                self.k_moe_stage1_mxfp4,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    route.grid,
+                    WG_THREADS_8,
+                    119_808,
+                    as_bytes(std::slice::from_ref(&route.args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
             if let (Some((kernel, zero)), Some(PrefillSegmentRoute::MoeStage2Mxfp4(args))) = (
                 self.k_moe_stage2_mxfp4,
                 self.progs[p].prefill_routes.get(seg).copied(),
@@ -9847,6 +10030,40 @@ mod tests {
     }
 
     #[test]
+    fn lean_moe_stage1_route_requires_exact_shape_and_align() {
+        let mut prog = segmented_prog(&[DevOp::MoeAlignPf, DevOp::MoeGroupGluPf], &[0, 1]);
+        prog.t = 8192;
+        prog.insts[0].t[0] = 4;
+        prog.insts[0].i = [8192, 896, 16, 0, 0, 0, 0, 0];
+        prog.insts[1].blocks = 256;
+        prog.insts[1].t = [0, 1, 2, 3, 4, 5, 6, 7];
+        prog.insts[1].i = [384, 3584, 896, MOE_ENC_MXFP4, 0, 2, 0, 0];
+        prog.insts[1].fj = [4.0f32.to_bits(), 25.0f32.to_bits(), 0];
+        let tensors: Vec<_> = (0..8)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..tensors.len())
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let PrefillSegmentRoute::MoeStage1Mxfp4(route) = routes[1] else {
+            panic!("exact stage-1 packet must route to the BK256 object")
+        };
+        assert_eq!(route.grid, 256);
+        assert_eq!((route.args.inter_dim, route.args.model_dim), (384, 3584));
+        assert_eq!((route.args.beta, route.args.linear_beta), (4.0, 25.0));
+
+        prog.insts[1].i[0] = 512;
+        let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        assert!(matches!(fallback[1], PrefillSegmentRoute::Interpreter));
+    }
+
+    #[test]
     fn lean_moe_stage2_route_requires_the_exact_pure_boundary() {
         let mut prog = segmented_prog(
             &[DevOp::MoeGroupDownPf, DevOp::MoeCombinePf, DevOp::RmsNorm],
@@ -9883,7 +10100,7 @@ mod tests {
         let devp: Vec<_> = (0..tensors.len())
             .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
             .collect();
-        let routes = moe_stage2_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
         let PrefillSegmentRoute::MoeStage2Mxfp4(args) = routes[0] else {
             panic!("pure supported pair must route to the lean object")
         };
@@ -9898,7 +10115,7 @@ mod tests {
         assert!(matches!(routes[1], PrefillSegmentRoute::Interpreter));
 
         prog.stream[2].seg = 0;
-        let fallback = moe_stage2_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
         assert!(matches!(fallback[0], PrefillSegmentRoute::Interpreter));
     }
 

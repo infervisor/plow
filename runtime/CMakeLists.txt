@@ -655,6 +655,8 @@ option(PLOW_HSACO_PACKED_PREFILL_CONSUMERS
 option(PLOW_HSACO_KDA_CHUNK "Include the opt-in BT64 chunk-KDA prefill arms" OFF)
 option(PLOW_HSACO_MOE_STAGE2_LEAN
        "Emit the standalone gfx950 MXFP4 grouped-MoE stage-2 object" ON)
+option(PLOW_HSACO_MOE_STAGE1_LEAN
+       "Emit the standalone gfx950 MXFP4 grouped-MoE stage-1 BK256 object" ON)
 option(PLOW_K3_DECODE_MXFP4_PROJ
        "Include standalone MXFP4 projection ops in K3 decode objects" ON)
 option(PLOW_K3_DECODE_GROUPED
@@ -1222,6 +1224,23 @@ if(PLOW_GFX950_HSACO)
             COMMENT "hipcc moe_stage2_mxfp4_gfx950.elf"
             VERBATIM)
         list(APPEND _hs_outs "${_hs_moe2_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MOE_STAGE1_LEAN)
+        set(_hs_moe1_src
+            "${CMAKE_CURRENT_SOURCE_DIR}/bench/amd/lean_moe_stage1_ref/native_kernel.hip")
+        set(_hs_moe1_out "${PLOW_HSACO_DIR}/moe_stage1_mxfp4_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_moe1_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_moe1_out}"
+                    plow_moe1_mxfp4_bk256_gfx950 192 2
+                    ${_hs_inc} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_moe1_mxfp4_stage1_abi_1
+                    "${_hs_moe1_src}"
+            DEPENDS "${_hs_moe1_src}" "${_hs_run}" ${_hs_hdrs}
+            COMMENT "hipcc moe_stage1_mxfp4_gfx950.elf"
+            VERBATIM)
+        list(APPEND _hs_outs "${_hs_moe1_out}")
     endif()
 
     # Golden __device__ wrappers. They call the SAME op_*.h bodies the

@@ -472,6 +472,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_STAGE2_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_stage2_lean: bool,
 
+    /// Isolate compatible MXFP4 grouped-MoE gate/up packets for a standalone object.
+    #[arg(long, env = "PLOW_MOE_STAGE1_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_stage1_lean: bool,
+
     /// Atomic combine for the grouped MoE prefill scatter.
     #[arg(long, env = "PLOW_MOE_PF_ATOMIC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_pf_atomic: bool,
@@ -697,6 +701,7 @@ impl EmitConfig {
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             moe_pf_a8: env_bool("PLOW_MOE_PF_A8"),
             moe_stage2_lean: env_bool("PLOW_MOE_STAGE2_LEAN"),
+            moe_stage1_lean: env_bool("PLOW_MOE_STAGE1_LEAN"),
             moe_pf_atomic: env_bool("PLOW_MOE_PF_ATOMIC"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
             moe_pf_part16: env_bool("PLOW_MOE_PF_PART16"),

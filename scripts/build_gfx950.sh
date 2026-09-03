@@ -47,6 +47,7 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       i_prefill_mla_moe.co i_prefill_mla_moe_gq.co \
       interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf \
       kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf \
+      moe_stage1_mxfp4_gfx950.co moe_stage1_mxfp4_gfx950.elf \
       moe_stage2_mxfp4_gfx950.co moe_stage2_mxfp4_gfx950.elf
 
 genco() { # <extra-defs> <out.co>
@@ -79,6 +80,16 @@ if [ "$ARCH" = gfx950 ]; then
     -DPLOW_REQUIRED_MARKER=plow_moe2_mxfp4_stage2_abi_2 \
     "$R/bench/amd/lean_moe_stage2_ref/native_kernel.hip"
   MOE_STAGE2_ELFS="moe_stage2_mxfp4_gfx950.elf"
+fi
+
+MOE_STAGE1_ELFS=""
+if [ "$ARCH" = gfx950 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_stage1_mxfp4_gfx950.elf" plow_moe1_mxfp4_bk256_gfx950 192 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe1_mxfp4_stage1_abi_1 \
+    "$R/bench/amd/lean_moe_stage1_ref/native_kernel.hip"
+  MOE_STAGE1_ELFS="moe_stage1_mxfp4_gfx950.elf"
 fi
 
 # DECODE BATCH BUCKET -> PLOW_GEMV_MM. THIS ROUTE WAS MISSING, and it is why batched decode
@@ -525,7 +536,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $KDA_FUSED_ELFS $MOE_STAGE2_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $KDA_FUSED_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.

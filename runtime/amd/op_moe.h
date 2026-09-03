@@ -3175,7 +3175,9 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
 #define MPF4_BM 64
 #endif
 #define MPF4_BN 256
+#ifndef MPF4_BK
 #define MPF4_BK 128                    /* K per staged tile = 2 MFMAs of K=64 */
+#endif
 #define MPF4_RB (MPF4_BK / 2)          /* LDS row stride, BYTES (fp4 = 2/byte) = 64 */
 #define MPF4_SPR (MPF4_BK / 32)        /* E8M0 scale bytes per row per tile     = 4  */
 #define MPF4_ATB (MPF4_BM * MPF4_RB)   /* A tile bytes  = 4096  */

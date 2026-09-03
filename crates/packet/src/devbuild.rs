@@ -325,6 +325,8 @@ pub struct Builder {
     packed_prefill_segments: bool,
     /// Isolate structurally compatible MXFP4 grouped-MoE stage-2 boundaries.
     lean_moe_stage2_segments: bool,
+    /// Isolate structurally compatible MXFP4 grouped-MoE stage-1 packets.
+    lean_moe_stage1_segments: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
     /// byte-identical. See [`Builder::set_gemv_split`].
     gemv_split: u32,
@@ -407,6 +409,19 @@ fn lean_moe_stage2_member(ops: &[Op], i: usize) -> bool {
             .is_some_and(|j| lean_moe_stage2_pair(ops, j))
 }
 
+fn lean_moe_stage1_inst(inst: &DevInst) -> bool {
+    inst.op == DevOp::MoeGroupGluPf as u16
+        && inst.i[0] == 384
+        && inst.i[1] == 3584
+        && inst.i[2] == 896
+        && inst.i[3] == 2
+        && inst.i[4] == 0
+        && inst.i[5] <= 2
+        && inst.i[6] == 0
+        && inst.i[7] == 0
+        && inst.t[..8].iter().all(|&t| t != TENSOR_NONE)
+}
+
 impl Builder {
     pub fn new(n_cu: u32) -> Self {
         Self {
@@ -419,6 +434,7 @@ impl Builder {
             uniseg_forced: false,
             packed_prefill_segments: false,
             lean_moe_stage2_segments: false,
+            lean_moe_stage1_segments: false,
             gemv_split: 1,
             tensor_dedup: false,
             tr_dropped: 0,
@@ -467,6 +483,10 @@ impl Builder {
 
     pub fn set_lean_moe_stage2_segments(&mut self, enabled: bool) {
         self.lean_moe_stage2_segments = enabled;
+    }
+
+    pub fn set_lean_moe_stage1_segments(&mut self, enabled: bool) {
+        self.lean_moe_stage1_segments = enabled;
     }
 
     /// Slice the machine-filling `Gemv` / `GemvGlu` / `GemvQkv` packets into `s * n_cu` shares
@@ -1346,6 +1366,9 @@ impl Builder {
         let lean_moe_stage2 = !uniseg
             && self.lean_moe_stage2_segments
             && (0..self.ops.len()).any(|i| lean_moe_stage2_pair(&self.ops, i));
+        let lean_moe_stage1 = !uniseg
+            && self.lean_moe_stage1_segments
+            && self.ops.iter().any(|op| lean_moe_stage1_inst(&op.inst));
         // PLOW_SEG_PURE_GEMM=1 (T11): class-8 segments carry ONLY GEMM-family ops; every light
         // op (norms, rope, quant, embed, softcap) joins the flash class. The point: the sm_90a
         // segmented launcher runs class-8 segments on the lean `_pfgemm` object, and a pure-GEMM
@@ -1401,6 +1424,9 @@ impl Builder {
                 // without its validated object executes the same two ops on the primary
                 // interpreter; keeping the pair pure makes both routes exact.
                 9
+            } else if lean_moe_stage1 && lean_moe_stage1_inst(&self.ops[i].inst) {
+                // The BK256 standalone object owns exactly one grouped gate/up packet.
+                10
             } else if uniseg {
                 8
             } else if packed_prefill_segments && packed_prefill_segment_class(op).is_some() {
@@ -1508,7 +1534,8 @@ impl Builder {
             .ops
             .iter()
             .any(|op| op.inst.op == DevOp::KdaDecodeFused as u16)
-            || lean_moe_stage2;
+            || lean_moe_stage2
+            || lean_moe_stage1;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             !raw_segmented || seg_of[consumer] == seg_of[dep.producer() as usize]
         };
@@ -3507,6 +3534,64 @@ mod lean_moe_stage2_tests {
             d.i = [3584, 16, 1024, 0, 0, 0, 0, 0];
         });
         assert!(!lean_moe_stage2_pair(&unsupported.ops, 0));
+    }
+}
+
+#[cfg(test)]
+mod lean_moe_stage1_tests {
+    use super::*;
+
+    fn program(enabled: bool, inter_dim: u32) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_lean_moe_stage1_segments(enabled);
+        let tensors: Vec<_> = (0..8).map(|i| b.tensor(&format!("moe{i}"), 4096)).collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        b.emit(DevOp::MoeGroupGluPf, all.clone(), &[before], |d| {
+            d.t.copy_from_slice(&tensors);
+            d.i = [inter_dim, 3584, 896, 2, 0, 2, 0, 0];
+        });
+        b.emit(DevOp::Nop, all, &[1], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn eligible_stage1_packet_gets_one_pure_segment() {
+        let p = program(true, 384);
+        let segment_for = |inst: u32| {
+            p.stream
+                .iter()
+                .find(|e| e.inst == inst)
+                .map(|e| e.seg)
+                .unwrap()
+        };
+        assert_ne!(segment_for(0), segment_for(1));
+        assert_ne!(segment_for(1), segment_for(2));
+    }
+
+    #[test]
+    fn stage1_route_is_opt_in_and_shape_gated() {
+        let disabled = program(false, 384);
+        assert_eq!(
+            disabled
+                .stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
+        let unsupported = program(true, 512);
+        assert_eq!(
+            unsupported
+                .stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
     }
 }
 
