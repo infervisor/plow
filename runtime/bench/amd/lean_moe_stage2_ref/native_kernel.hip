@@ -64,43 +64,35 @@ static __device__ __forceinline__ unsigned expert_for_tile(
     return lo;
 }
 
-extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_abi_2 = 1;
+extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_abi_3 = 1;
 extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_layout_shuffled_1 = 1;
 extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_no_spill_1 = 1;
-extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_dynamic_lds_16640 = 1;
-extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_vgpr_le_144 = 1;
-
-extern "C" __global__ void plow_moe2_zero_bf16(__hip_bfloat16* out,
-                                                 unsigned long long elements) {
-    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < elements)
-        out[i] = __float2bfloat16(0.0f);
-}
+extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_f32_scatter_1 = 1;
+extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_dynamic_lds_4352 = 1;
+extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_vgpr_le_100 = 1;
 
 extern "C" __global__ __launch_bounds__(256, 2)
 void plow_moe2_mxfp4_16x16x128_gfx950(
-    __hip_bfloat16* __restrict__ out,
+    float* __restrict__ part,
     const unsigned char* __restrict__ activation,
     const unsigned long long* __restrict__ weight_table,
     const unsigned char* __restrict__ activation_scale,
     const unsigned long long* __restrict__ weight_scale_table,
     const int* __restrict__ meta,
     const unsigned* __restrict__ row_partidx,
-    const float* __restrict__ sorted_weights,
-    int tokens, int model_dim, int inter_dim, int experts, int topk, int reserved) {
+    const float* __restrict__ row_gate,
+    int model_dim, int inter_dim, int experts, int reserved) {
     (void)reserved;
     constexpr unsigned TM = 32;
     constexpr unsigned TN = 256;
     constexpr unsigned TK = 128;
-    constexpr unsigned WG = 256;
     constexpr unsigned WAVE = 64;
     constexpr unsigned KBYTES = TK / 2;
 
     extern __shared__ __align__(16) unsigned char shared[];
     unsigned char* a_lds = shared;
-    __hip_bfloat16* c_lds = reinterpret_cast<__hip_bfloat16*>(shared);
-    int* row_ids_lds = reinterpret_cast<int*>(shared + 16384);
-    float* row_gates_lds = reinterpret_cast<float*>(shared + 16384 + TM * sizeof(int));
+    int* row_ids_lds = reinterpret_cast<int*>(shared + 2 * TM * KBYTES);
+    float* row_gates_lds = reinterpret_cast<float*>(shared + 2 * TM * KBYTES + TM * sizeof(int));
 
     const unsigned tid = threadIdx.x;
     const unsigned wave = tid / WAVE;
@@ -113,7 +105,7 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
     const unsigned n0 = n_tile * TN;
     const unsigned kbytes = static_cast<unsigned>(inter_dim) / 2;
     const unsigned scale_stride = static_cast<unsigned>(inter_dim) / 32u;
-    if (inter_dim != 384 || experts <= 0 || topk <= 0)
+    if (inter_dim != 384 || experts <= 0)
         return;
     const int* tile_prefix = meta + 2 * experts;
     const unsigned total_half_tiles = static_cast<unsigned>(tile_prefix[experts]) * 2u;
@@ -131,7 +123,7 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
             const unsigned sorted_row = block_m * TM + tid;
             const unsigned partidx = row_partidx[sorted_row];
             row_ids_lds[tid] = partidx == ~0u ? -1 : static_cast<int>(partidx);
-            row_gates_lds[tid] = partidx == ~0u ? 0.0f : sorted_weights[sorted_row];
+            row_gates_lds[tid] = partidx == ~0u ? 0.0f : row_gate[sorted_row];
         }
         __syncthreads();
 
@@ -221,23 +213,9 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
             for (unsigned i = 0; i < 4; ++i) {
                 const unsigned row = mi * 16u + lane_k * 4u + i;
                 const unsigned col = wave * 64u + ni * 16u + lane_n;
-                const float gate = row_gates_lds[row];
-                c_lds[row * TN + col] = __float2bfloat16(acc[mi][ni][i] * gate);
+                const int partidx = row_ids_lds[row];
+                if (partidx >= 0 && n0 + col < static_cast<unsigned>(model_dim))
+                    part[static_cast<size_t>(partidx) * model_dim + n0 + col] =
+                        acc[mi][ni][i] * row_gates_lds[row];
             }
-    __syncthreads();
-
-    const unsigned pair_count = TM * TN / 2u;
-    for (unsigned pair = tid; pair < pair_count; pair += WG) {
-        const unsigned row = pair / (TN / 2u);
-        const unsigned col = (pair % (TN / 2u)) * 2u;
-        const int fused = row_ids_lds[row];
-        const unsigned token = static_cast<unsigned>(fused) / static_cast<unsigned>(topk);
-        if (fused >= 0 && token < static_cast<unsigned>(tokens) &&
-            n0 + col + 1u < static_cast<unsigned>(model_dim)) {
-            const __hip_bfloat162 value = *reinterpret_cast<const __hip_bfloat162*>(
-                c_lds + row * TN + col);
-            unsafeAtomicAdd(reinterpret_cast<__hip_bfloat162*>(
-                out + static_cast<size_t>(token) * model_dim + n0 + col), value);
-        }
-    }
 }

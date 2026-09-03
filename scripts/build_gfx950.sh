@@ -75,9 +75,9 @@ fi
 MOE_STAGE2_ELFS=""
 if [ "$ARCH" = gfx950 ]; then
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
-    "$OUT/moe_stage2_mxfp4_gfx950.elf" plow_moe2_mxfp4_16x16x128_gfx950 144 2 \
+    "$OUT/moe_stage2_mxfp4_gfx950.elf" plow_moe2_mxfp4_16x16x128_gfx950 100 2 \
     -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
-    -DPLOW_REQUIRED_MARKER=plow_moe2_mxfp4_stage2_abi_2 \
+    -DPLOW_REQUIRED_MARKER=plow_moe2_mxfp4_stage2_abi_3 \
     "$R/bench/amd/lean_moe_stage2_ref/native_kernel.hip"
   MOE_STAGE2_ELFS="moe_stage2_mxfp4_gfx950.elf"
 fi

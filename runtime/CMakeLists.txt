@@ -1216,9 +1216,9 @@ if(PLOW_GFX950_HSACO)
         add_custom_command(OUTPUT "${_hs_moe2_out}"
             COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
                     "${PLOW_HSACO_ARCH}" "${_hs_moe2_out}"
-                    plow_moe2_mxfp4_16x16x128_gfx950 144 2
+                    plow_moe2_mxfp4_16x16x128_gfx950 100 2
                     -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
-                    -DPLOW_REQUIRED_MARKER=plow_moe2_mxfp4_stage2_abi_2
+                    -DPLOW_REQUIRED_MARKER=plow_moe2_mxfp4_stage2_abi_3
                     "${_hs_moe2_src}"
             DEPENDS "${_hs_moe2_src}" "${_hs_run}"
             COMMENT "hipcc moe_stage2_mxfp4_gfx950.elf"

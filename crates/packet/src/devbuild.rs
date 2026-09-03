@@ -375,13 +375,8 @@ fn packed_prefill_segmenting_needed(
     !uniseg && enabled && ops.any(|op| packed_prefill_segment_class(op).is_some())
 }
 
-fn lean_moe_stage2_pair(ops: &[Op], i: usize) -> bool {
-    let Some((down, combine)) = ops.get(i).zip(ops.get(i + 1)) else {
-        return false;
-    };
-    let (d, c) = (&down.inst, &combine.inst);
+fn lean_moe_stage2_inst(d: &DevInst) -> bool {
     d.op == DevOp::MoeGroupDownPf as u16
-        && c.op == DevOp::MoeCombinePf as u16
         && d.i[3] == 2
         && d.i[1] == 384
         && d.i[0] != 0
@@ -392,6 +387,15 @@ fn lean_moe_stage2_pair(ops: &[Op], i: usize) -> bool {
         && d.t[5] != TENSOR_NONE
         && d.t[6] != TENSOR_NONE
         && d.t[7] != TENSOR_NONE
+}
+
+fn lean_moe_stage2_pair(ops: &[Op], i: usize) -> bool {
+    let Some((d, c)) = ops.get(i).zip(ops.get(i + 1)) else {
+        return false;
+    };
+    let (d, c) = (&d.inst, &c.inst);
+    lean_moe_stage2_inst(d)
+        && c.op == DevOp::MoeCombinePf as u16
         && c.t[1] == TENSOR_NONE
         && c.t[2] == TENSOR_NONE
         && c.t[3] == d.t[0]
@@ -401,12 +405,6 @@ fn lean_moe_stage2_pair(ops: &[Op], i: usize) -> bool {
         && c.i[3] == 0
         && c.i[4] == 0
         && c.i[7] == 0
-}
-
-fn lean_moe_stage2_member(ops: &[Op], i: usize) -> bool {
-    lean_moe_stage2_pair(ops, i)
-        || i.checked_sub(1)
-            .is_some_and(|j| lean_moe_stage2_pair(ops, j))
 }
 
 fn lean_moe_stage1_inst(inst: &DevInst) -> bool {
@@ -1419,10 +1417,10 @@ impl Builder {
                 // A standalone raw-argument object owns this boundary. Keep its segment pure
                 // even if PLOW_UNISEG was requested; runtime routing may then select by opcode.
                 3
-            } else if lean_moe_stage2 && lean_moe_stage2_member(&self.ops, i) {
-                // The standalone gfx950 kernel owns this exact Down+Combine boundary. A runtime
-                // without its validated object executes the same two ops on the primary
-                // interpreter; keeping the pair pure makes both routes exact.
+            } else if lean_moe_stage2 && lean_moe_stage2_pair(&self.ops, i) {
+                // The standalone gfx950 kernel owns exactly the deterministic Down scatter.
+                // Combine stays in the following interpreter segment and preserves fixed-order
+                // f32 accumulation.
                 9
             } else if lean_moe_stage1 && lean_moe_stage1_inst(&self.ops[i].inst) {
                 // The BK256 standalone object owns exactly one grouped gate/up packet.
@@ -3490,7 +3488,7 @@ mod lean_moe_stage2_tests {
     }
 
     #[test]
-    fn eligible_stage2_pair_gets_one_pure_segment() {
+    fn eligible_stage2_down_gets_one_pure_segment() {
         let p = program(true, 384);
         let segments_for = |inst: u32| {
             p.stream
@@ -3499,10 +3497,10 @@ mod lean_moe_stage2_tests {
                 .map(|e| e.seg)
                 .collect::<std::collections::BTreeSet<_>>()
         };
-        assert_eq!(segments_for(1), segments_for(2));
+        assert_ne!(segments_for(1), segments_for(2));
         assert_ne!(segments_for(0), segments_for(1));
-        assert_ne!(segments_for(2), segments_for(3));
-        assert_eq!((p.insts[1].wait_len, p.insts[2].succ_len), (0, 0));
+        assert_eq!(segments_for(2), segments_for(3));
+        assert_eq!((p.insts[1].wait_len, p.insts[1].succ_len), (0, 0));
     }
 
     #[test]

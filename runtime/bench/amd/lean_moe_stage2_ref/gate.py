@@ -58,10 +58,10 @@ def check_manifest(obj, manifest):
         "geometry.model_dim": 3584,
         "geometry.inter_dim": 384,
         "geometry.experts": 896,
-        "abi.kernarg_bytes": 88,
+        "abi.kernarg_bytes": 80,
         "encoding.activation": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
         "encoding.weight": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
-        "encoding.output": "bf16-atomic-accumulate",
+        "encoding.output": "f32-fixed-part-scatter",
         "encoding.weight_layout": "expert-table[E*3+2]-N/16,Kbytes/32,2,16,16",
         "encoding.scale_layout": "expert-scale-table[E*3+2]-pad256x8-shuffled",
     }
@@ -75,10 +75,9 @@ def check_manifest(obj, manifest):
     if digest != manifest["object"]["sha256"]:
         raise SystemExit("object SHA-256 does not match manifest")
     expected_args = [
-        "out*", "activation*", "weight_table*", "activation_scale*",
-        "weight_scale_table*", "meta*", "row_partidx*", "sorted_weights*",
-        "tokens:i32", "model_dim:i32", "inter_dim:i32", "experts:i32", "topk:i32",
-        "reserved:i32",
+        "part*", "activation*", "weight_table*", "activation_scale*",
+        "weight_scale_table*", "meta*", "row_partidx*", "row_gate*",
+        "model_dim:i32", "inter_dim:i32", "experts:i32", "reserved:i32",
     ]
     if manifest["abi"]["arguments"] != expected_args:
         raise SystemExit("manifest ABI argument order is not the phase-1 contract")
@@ -100,15 +99,16 @@ def check_manifest(obj, manifest):
     ):
         if needle not in notes:
             raise SystemExit(f"ELF metadata gate failed: missing {needle!r}")
-    if not any(f".kernarg_segment_size: {n}" in notes for n in (88, 344)):
-        raise SystemExit("ELF metadata gate failed: lean stage-2 kernarg is neither 88 nor 344 B")
+    if not any(f".kernarg_segment_size: {n}" in notes for n in (80, 336)):
+        raise SystemExit("ELF metadata gate failed: lean stage-2 kernarg is neither 80 nor 336 B")
     symbols = subprocess.check_output([readelf, "-sW", str(obj)], text=True)
     for marker in (
-        "plow_moe2_mxfp4_stage2_abi_2",
+        "plow_moe2_mxfp4_stage2_abi_3",
         "plow_moe2_mxfp4_stage2_layout_shuffled_1",
         "plow_moe2_mxfp4_stage2_no_spill_1",
-        "plow_moe2_mxfp4_stage2_dynamic_lds_16640",
-        "plow_moe2_mxfp4_stage2_vgpr_le_144",
+        "plow_moe2_mxfp4_stage2_f32_scatter_1",
+        "plow_moe2_mxfp4_stage2_dynamic_lds_4352",
+        "plow_moe2_mxfp4_stage2_vgpr_le_100",
     ):
         if marker not in symbols:
             raise SystemExit(f"ELF marker gate failed: missing {marker!r}")
@@ -119,13 +119,8 @@ class HipModule:
         self.lib = ctypes.CDLL("libamdhip64.so")
         self.module = ctypes.c_void_p()
         self.function = ctypes.c_void_p()
-        self.zero_function = ctypes.c_void_p()
         self._call("hipModuleLoad", ctypes.byref(self.module), str(path).encode())
         self._call("hipModuleGetFunction", ctypes.byref(self.function), self.module, symbol.encode())
-        self._call(
-            "hipModuleGetFunction", ctypes.byref(self.zero_function), self.module,
-            b"plow_moe2_zero_bf16",
-        )
 
     def _call(self, name, *args):
         status = getattr(self.lib, name)(*args)
@@ -145,20 +140,7 @@ class HipModule:
             ctypes.c_uint(shared_bytes), ctypes.c_void_p(stream), params, ctypes.c_void_p(),
         )
 
-    def zero(self, out):
-        holders = [ctypes.c_void_p(out.data_ptr()), ctypes.c_uint64(out.numel())]
-        params = (ctypes.c_void_p * len(holders))(
-            *(ctypes.cast(ctypes.byref(value), ctypes.c_void_p) for value in holders)
-        )
-        self._call(
-            "hipModuleLaunchKernel", self.zero_function,
-            ctypes.c_uint(math.ceil(out.numel() / 256)), ctypes.c_uint(1), ctypes.c_uint(1),
-            ctypes.c_uint(256), ctypes.c_uint(1), ctypes.c_uint(1), ctypes.c_uint(0),
-            ctypes.c_void_p(torch.cuda.current_stream().cuda_stream), params, ctypes.c_void_p(),
-        )
-
-
-def launch(module, manifest, out, act, weight_table, act_scale, weight_scale_table,
+def launch(module, manifest, part, act, weight_table, act_scale, weight_scale_table,
            meta, partidx, gates):
     g = manifest["geometry"]
     bias = torch.empty(0, dtype=torch.float32, device="cuda")
@@ -167,8 +149,8 @@ def launch(module, manifest, out, act, weight_table, act_scale, weight_scale_tab
          2 * (math.ceil(g["tokens"] * g["topk"] / 64) + g["experts"]), 1),
         torch.cuda.current_stream().cuda_stream,
         manifest["resources"].get("dynamic_lds_bytes", 0),
-        [out, act, weight_table, act_scale, weight_scale_table, meta, partidx, gates],
-        [g["tokens"], g["model_dim"], g["inter_dim"], g["experts"], g["topk"], 0],
+        [part, act, weight_table, act_scale, weight_scale_table, meta, partidx, gates],
+        [g["model_dim"], g["inter_dim"], g["experts"], 0],
     )
 
 
@@ -196,9 +178,8 @@ def oracle(module, manifest):
     partidx = torch.full((64,), -1, dtype=torch.int32, device="cuda")
     partidx[:rows] = torch.arange(rows, dtype=torch.int32, device="cuda") * topk
     gates = torch.linspace(0.125, 0.875, rows, dtype=torch.float32, device="cuda")
-    out = torch.ones((t, n), dtype=torch.bfloat16, device="cuda")
-    module.zero(out)
-    launch(module, manifest, out, act, weight_table, act_scale, weight_scale_table,
+    part = torch.full((rows * topk, n), float("nan"), dtype=torch.float32, device="cuda")
+    launch(module, manifest, part, act, weight_table, act_scale, weight_scale_table,
            meta, partidx, gates)
     torch.cuda.synchronize()
 
@@ -206,8 +187,8 @@ def oracle(module, manifest):
     av *= torch.ldexp(torch.ones_like(av), act_scale_raw.to(torch.int32).unsqueeze(-1) - 127)
     bv = unpack_fp4(weight_focus).reshape(n, k // 32, 32)
     bv *= torch.ldexp(torch.ones_like(bv), weight_scale_focus.to(torch.int32).unsqueeze(-1) - 127)
-    ref = ((av.reshape(rows, k) @ bv.reshape(n, k).T) * gates.cpu()[:, None]).to(torch.bfloat16).float()
-    got = out[:rows].float().cpu()
+    ref = (av.reshape(rows, k) @ bv.reshape(n, k).T) * gates.cpu()[:, None]
+    got = part[torch.arange(rows, device="cuda") * topk].cpu()
     diff = (got - ref).abs()
     bad = int((diff > 0.02 * ref.abs().clamp_min(1.0)).sum())
     print(f"oracle rows={rows} values={got.numel()} bad={bad} max_abs={diff.max().item():.6g} max_rel={(diff / ref.abs().clamp_min(1)).max().item():.6g}")
@@ -280,32 +261,29 @@ def timing(module, manifest, tokens=None):
         gates_host.extend([0.25] * len(bucket) + [0.0] * pad)
     partidx = torch.tensor(partidx_host, dtype=torch.int32, device="cuda")
     gates = torch.tensor(gates_host, dtype=torch.float32, device="cuda")
-    out = torch.zeros((t, n), dtype=torch.bfloat16, device="cuda")
+    part = torch.empty((t * topk, n), dtype=torch.float32, device="cuda")
 
     for _ in range(5):
-        out.zero_(); launch(module, manifest, out, act, weight_table, act_scale,
+        launch(module, manifest, part, act, weight_table, act_scale,
                            weight_scale_table, meta, partidx, gates)
     torch.cuda.synchronize()
-    samples = {"forward_kernel": [], "forward_boundary": [], "reverse_kernel": [], "reverse_boundary": []}
+    samples = {"forward_kernel": [], "reverse_kernel": []}
 
-    def measured(key, zero):
+    def measured(key):
         start, end = torch.cuda.Event(True), torch.cuda.Event(True)
         start.record()
-        if zero: module.zero(out)
-        launch(module, manifest, out, act, weight_table, act_scale,
+        launch(module, manifest, part, act, weight_table, act_scale,
                weight_scale_table, meta, partidx, gates)
         end.record(); end.synchronize()
         samples[key].append(start.elapsed_time(end))
 
     for _ in range(31):
-        out.zero_(); torch.cuda.synchronize()
-        measured("forward_kernel", False); measured("forward_boundary", True)
-        measured("reverse_boundary", True); out.zero_(); measured("reverse_kernel", False)
+        measured("forward_kernel"); measured("reverse_kernel")
     med = {key: sorted(values)[len(values) // 2] for key, values in samples.items()}
     print(
         f"exact T={t} H={n} K={k} E={e} topk={topk} pad={padded} blocks={len(experts_host)} "
-        f"forward_kernel_ms={med['forward_kernel']:.6f} forward_zero_kernel_ms={med['forward_boundary']:.6f} "
-        f"reverse_kernel_ms={med['reverse_kernel']:.6f} reverse_zero_kernel_ms={med['reverse_boundary']:.6f}"
+        f"forward_kernel_ms={med['forward_kernel']:.6f} "
+        f"reverse_kernel_ms={med['reverse_kernel']:.6f}"
     )
 
 

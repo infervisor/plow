@@ -6152,7 +6152,7 @@ impl AmdEngine {
                 "plow_moe2_mxfp4_stage2_no_spill_1",
                 "plow_moe2_mxfp4_stage2_f32_scatter_1",
                 "plow_moe2_mxfp4_stage2_dynamic_lds_4352",
-                "plow_moe2_mxfp4_stage2_vgpr_le_144",
+                "plow_moe2_mxfp4_stage2_vgpr_le_100",
             ];
             let path = hsaco_dir.join(NAME);
             if !path.exists() {

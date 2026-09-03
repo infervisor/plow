@@ -11,6 +11,9 @@ fi
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 HERE="$ROOT/runtime/bench/amd/lean_moe_stage2_ref"
 OUT=${1:-/tmp/plow-moe2-lean}
+if [ "$#" -gt 0 ]; then
+  shift
+fi
 IMAGE='vllm/vllm-openai-rocm@sha256:e0a3b2bd3fe7ec563916c3a5d949898d133458c18d6b2f460c906885cfb32032'
 OUT=$(realpath "$OUT")
 
@@ -30,4 +33,4 @@ fi
   -v "$HERE/gate.py:/opt/plow/gate.py:ro" \
   -v "$OUT:/opt/plow/out:ro" \
   "$IMAGE" \
-  /opt/plow/gate.py /opt/plow/out/kernel.co /opt/plow/out/manifest.json
+  /opt/plow/gate.py /opt/plow/out/kernel.co /opt/plow/out/manifest.json "$@"

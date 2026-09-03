@@ -36,20 +36,22 @@ nix develop --command perf-data/tools/gpulease -n 1 moe2-lean-gate \
 
 The manifest intentionally fixes the validated schedule/capability contract:
 gfx950, MXFP4 E2M1 payload with E8M0 scales,
-BF16 atomic accumulation, 32x256x128 compute tiles, 256 threads, wave64, BM64 alignment,
+fixed-address f32 scatter, 32x256x128 compute tiles, 256 threads, wave64, BM64 alignment,
 and the runtime expert-table/align-metadata ABI. The gate rejects any manifest
 outside that contract before loading the object. On ROCm 7.14 the production
-BM64 alignment shape passes the exact focused oracle and measures about 0.26 ms
-including output zero at T1024/H3584/I384/E896/top16.
+BM64 alignment shape passes the exact focused oracle. The output is the interpreter
+contract's `part[T*topk,H]` tensor, so no clear or atomic accumulation is required.
 Pass `--timing-tokens 8192` directly to `gate.py` to retain the manifest and
 oracle contract while timing the production long-context row count. The exact
-8192-token boundary measures about 0.98 ms including output zero on MI355X.
+8192-token gate exercises the production long-context row count on MI355X.
 
-`PLOW_MOE_STAGE2_LEAN=1` at packet emission isolates only structurally compatible
-MXFP4 `MoeGroupDownPf`→`MoeCombinePf` boundaries. `plowrt` routes those segments
-to the native object after checking its ABI, zero-spill, LDS, and VGPR markers.
-If the object is absent, the same segment executes through the ordinary
-interpreter pair. No model name participates in selection.
+`PLOW_MOE_STAGE2_LEAN=1` at packet emission isolates only the `MoeGroupDownPf`
+packet of structurally compatible MXFP4 Down→Combine boundaries. `plowrt` routes
+that pure segment to the native object after checking its ABI, zero-spill, LDS,
+and VGPR markers. `MoeCombinePf` remains in the following interpreter segment and
+sums fixed part slots in order. If the object or loader-derived companion tables
+are absent, the segment executes through the ordinary interpreter. No model name
+participates in selection.
 
 The native schedule consumes loader-derived companion tables in the validated
 shuffled MXFP4/E8M0 layout through a two-stage B/B-scale register pipeline, and

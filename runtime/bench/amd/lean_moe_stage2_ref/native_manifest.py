@@ -8,14 +8,15 @@ import tempfile
 from pathlib import Path
 
 
-EXPECTED_TEXT_SHA256 = "b72d36947ea11fec74cdd51bf5bbb7354571c4f8714d1dd9c244dd39699c6ad1"
+EXPECTED_TEXT_SHA256 = "0c697ba09401e11c0f10fa7bf47e3eaf7d289f689ee98329867dbe1737016644"
 SYMBOL = "plow_moe2_mxfp4_16x16x128_gfx950"
 MARKERS = (
-    "plow_moe2_mxfp4_stage2_abi_2",
+    "plow_moe2_mxfp4_stage2_abi_3",
     "plow_moe2_mxfp4_stage2_layout_shuffled_1",
     "plow_moe2_mxfp4_stage2_no_spill_1",
-    "plow_moe2_mxfp4_stage2_dynamic_lds_16640",
-    "plow_moe2_mxfp4_stage2_vgpr_le_144",
+    "plow_moe2_mxfp4_stage2_f32_scatter_1",
+    "plow_moe2_mxfp4_stage2_dynamic_lds_4352",
+    "plow_moe2_mxfp4_stage2_vgpr_le_100",
 )
 
 
@@ -61,15 +62,15 @@ def main():
         "vgpr": field(knotes, "vgpr_count"),
         "sgpr": field(knotes, "sgpr_count"),
         "fixed_lds_bytes": field(knotes, "group_segment_fixed_size"),
-        "dynamic_lds_bytes": 16640,
-        "lds_bytes": 16640,
+        "dynamic_lds_bytes": 4352,
+        "lds_bytes": 4352,
         "private_bytes": field(knotes, "private_segment_fixed_size"),
         "vgpr_spills": field(knotes, "vgpr_spill_count"),
         "sgpr_spills": field(knotes, "sgpr_spill_count"),
     }
     expected = {
-        "vgpr": 100, "sgpr": 42, "fixed_lds_bytes": 0, "dynamic_lds_bytes": 16640,
-        "lds_bytes": 16640, "private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0,
+        "vgpr": 98, "sgpr": 40, "fixed_lds_bytes": 0, "dynamic_lds_bytes": 4352,
+        "lds_bytes": 4352, "private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0,
     }
     if resources != expected:
         raise SystemExit(f"native resource gate failed: {resources}")
@@ -93,17 +94,16 @@ def main():
         "encoding": {
             "activation": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
             "weight": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
-            "output": "bf16-atomic-accumulate",
+            "output": "f32-fixed-part-scatter",
             "weight_layout": "expert-table[E*3+2]-N/16,Kbytes/32,2,16,16",
             "scale_layout": "expert-scale-table[E*3+2]-pad256x8-shuffled",
         },
         "abi": {
-            "kernarg_bytes": 88,
+            "kernarg_bytes": 80,
             "arguments": [
-                "out*", "activation*", "weight_table*", "activation_scale*",
-                "weight_scale_table*", "meta*", "row_partidx*", "sorted_weights*",
-                "tokens:i32", "model_dim:i32", "inter_dim:i32", "experts:i32", "topk:i32",
-                "reserved:i32",
+                "part*", "activation*", "weight_table*", "activation_scale*",
+                "weight_scale_table*", "meta*", "row_partidx*", "row_gate*",
+                "model_dim:i32", "inter_dim:i32", "experts:i32", "reserved:i32",
             ],
         },
         "resources": resources,
