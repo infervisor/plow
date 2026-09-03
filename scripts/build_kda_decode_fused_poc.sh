@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Compile-only gate for the standalone gfx950 KDA decode fusion proof. This script never opens a
-# GPU. Use run_kda_decode_fused_poc.sh for the separately leased runtime oracle.
+# GPU. Use run_kda_decode_fused_poc.sh for the separately leased correctness/performance gate.
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 OUT=${1:-${PLOW_BUILD_DIR:-/tmp/plow-kda-decode-fused-poc}}
@@ -36,9 +36,10 @@ occ=$(sed -n '/Function Name: kda_decode_fused_poc/,/Function Name:/{s/.*Occupan
 [ "$scratch" -eq 0 ] || { echo "FAIL: fused POC uses $scratch bytes/lane scratch" >&2; exit 2; }
 [ "$occ" -ge 1 ] || { echo "FAIL: fused POC has zero occupancy" >&2; exit 2; }
 
-echo "[3/3] host oracle (compiled, not run)"
+echo "[3/3] host gate + CPU timing-verdict selftest"
 "$HIPCC" -O2 -w -x c++ -D__HIP_PLATFORM_AMD__=1 "$SRC" -o "$OUT/kda_decode_fused_poc" \
     -I"$ROCM/include" -L"$ROCM/lib" -Wl,-rpath,"$ROCM/lib" -lamdhip64
 test -x "$OUT/kda_decode_fused_poc"
+"$OUT/kda_decode_fused_poc" --selftest-timing
 echo "OK: compile/static gates passed; VGPR=$vgpr spill=$spill scratch=$scratch occupancy=$occ"
 echo "Deferred runtime: $ROOT/scripts/run_kda_decode_fused_poc.sh $OUT"

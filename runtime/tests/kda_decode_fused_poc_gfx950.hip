@@ -170,6 +170,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void kda_decode_control_norm(Kda
 
 #else
 #include <hip/hip_runtime.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -197,6 +198,44 @@ template <class T> static T* upload(const std::vector<T>& h) {
 }
 static unsigned next_u32() { static unsigned x = 0x91e10da5u; x ^= x << 13; x ^= x >> 17; x ^= x << 5; return x; }
 static float rnd(float scale = 1.0f) { return scale * ((int)(next_u32() & 0xffff) - 32768) / 32768.0f; }
+
+static double median(std::vector<double> values) {
+    std::sort(values.begin(), values.end());
+    return .5 * (values[(values.size() - 1) / 2] + values[values.size() / 2]);
+}
+
+struct TimingVerdict { double ratio, mad; unsigned wins; bool pass; };
+static TimingVerdict timing_verdict(const std::vector<double>& control,
+                                    const std::vector<double>& fused) {
+    if (control.size() != fused.size() || control.size() < 9) return {0, 0, 0, false};
+    std::vector<double> ratios, deviations;
+    unsigned wins = 0;
+    for (size_t i = 0; i < control.size(); ++i) {
+        if (!(control[i] > 0) || !(fused[i] > 0) || !std::isfinite(control[i]) ||
+            !std::isfinite(fused[i])) return {0, 0, 0, false};
+        ratios.push_back(fused[i] / control[i]);
+        wins += fused[i] < control[i];
+    }
+    const double ratio = median(ratios);
+    for (double r : ratios) deviations.push_back(std::abs(r - ratio));
+    const double mad = median(deviations);
+    const unsigned required_wins = (3 * (unsigned)ratios.size() + 3) / 4;
+    return {ratio, mad, wins,
+            ratio <= .97 && ratio + 3.0 * mad < 1.0 && wins >= required_wins};
+}
+
+static int timing_selftest() {
+    const std::vector<double> control(11, 10.0);
+    std::vector<double> clear{8.9,9.0,9.1,9.0,8.8,9.2,9.0,9.1,8.9,9.0,9.1};
+    std::vector<double> marginal(11, 9.8);
+    std::vector<double> noisy{8.0,11.0,8.0,11.0,8.0,11.0,8.0,11.0,8.0,11.0,8.0};
+    const bool ok = timing_verdict(control, clear).pass &&
+                    !timing_verdict(control, marginal).pass &&
+                    !timing_verdict(control, noisy).pass &&
+                    !timing_verdict({10.0}, {9.0}).pass;
+    puts(ok ? "timing verdict selftest: PASS" : "timing verdict selftest: FAIL");
+    return ok ? 0 : 1;
+}
 
 struct Shape { unsigned B, H, D, W; };
 static bool run_shape(hipModule_t module, Shape s) {
@@ -233,11 +272,13 @@ static bool run_shape(hipModule_t module, Shape s) {
     unsigned* dp = upload(parked);
     float *csq0 = upload(csq), *csk0 = upload(csk), *csv0 = upload(csv), *st0 = upload(state);
     float *csq1 = upload(csq), *csk1 = upload(csk), *csv1 = upload(csv), *st1 = upload(state);
+    float *csqb = upload(csq), *cskb = upload(csk), *csvb = upload(csv), *stb = upload(state);
     bf16 *q = upload(poison), *k = upload(poison), *v = upload(poison), *o = upload(poison);
     bf16 *yc = upload(poison), *yf = upload(poison);
     if (!dq || !dk || !dv || !dg || !db || !dog || !dwq || !dwk || !dwv || !da || !ddt ||
         !dnw || !dp || !csq0 || !csk0 || !csv0 || !st0 || !csq1 || !csk1 || !csv1 ||
-        !st1 || !q || !k || !v || !o || !yc || !yf) return false;
+        !st1 || !csqb || !cskb || !csvb || !stb || !q || !k || !v || !o || !yc || !yf)
+        return false;
 
     KdaFusedArgs c{};
     c.y=(size_t)yc; c.o=(size_t)o; c.q=(size_t)q; c.k=(size_t)k; c.v=(size_t)v;
@@ -256,11 +297,20 @@ static bool run_shape(hipModule_t module, Shape s) {
     HC(hipModuleGetFunction(&fs,module,"kda_decode_control_step"));
     HC(hipModuleGetFunction(&fn,module,"kda_decode_control_norm"));
     HC(hipModuleGetFunction(&ff,module,"kda_decode_fused_poc"));
-    void* ac[]={&dc}; void* af[]={&df}; const unsigned grid = s.B*s.H < 256 ? s.B*s.H : 256;
-    HC(hipModuleLaunchKernel(fc,256,1,1,256,1,1,0,0,ac,nullptr));
-    HC(hipModuleLaunchKernel(fs,256,1,1,256,1,1,0,0,ac,nullptr));
-    HC(hipModuleLaunchKernel(fn,256,1,1,256,1,1,0,0,ac,nullptr));
-    HC(hipModuleLaunchKernel(ff,grid,1,1,256,1,1,0,0,af,nullptr));
+    /* Keep the launch grid identical to the existing interpreter chain. Shrinking only the fused
+     * grid to active heads makes a launch-overhead comparison look better than production. */
+    void* ac[]={&dc}; void* af[]={&df}; const unsigned grid = 256;
+    auto control = [&]() -> bool {
+        HC(hipModuleLaunchKernel(fc,256,1,1,256,1,1,0,0,ac,nullptr));
+        HC(hipModuleLaunchKernel(fs,256,1,1,256,1,1,0,0,ac,nullptr));
+        HC(hipModuleLaunchKernel(fn,256,1,1,256,1,1,0,0,ac,nullptr));
+        return true;
+    };
+    auto fused = [&]() -> bool {
+        HC(hipModuleLaunchKernel(ff,grid,1,1,256,1,1,0,0,af,nullptr));
+        return true;
+    };
+    if (!control() || !fused()) return false;
     HC(hipDeviceSynchronize());
 
     std::vector<bf16> hyc(n), hyf(n), hq(n), ho(n); std::vector<float> hs0(sn), hs1(sn);
@@ -286,14 +336,56 @@ static bool run_shape(hipModule_t module, Shape s) {
         }
     }
     const double yr=sqrt(ye/(yw+1e-30)), sr=sqrt(se/(sw+1e-30));
-    const bool ok=yr<=1e-6 && sr<=1e-6 && poison_ok && finite && conv_exact;
+    bool ok=yr<=1e-6 && sr<=1e-6 && poison_ok && finite && conv_exact;
     printf("B=%u H=%u D=%u W=%u y=%.3e state=%.3e conv=%s poison=%s finite=%s %s\n",
            s.B,s.H,s.D,s.W,yr,sr,conv_exact?"exact":"DIFF",poison_ok?"ok":"FAIL",finite?"yes":"NO",ok?"PASS":"FAIL");
-    for(void* p0:{(void*)dq,(void*)dk,(void*)dv,(void*)dg,(void*)db,(void*)dog,(void*)dwq,(void*)dwk,(void*)dwv,(void*)da,(void*)ddt,(void*)dnw,(void*)dp,(void*)csq0,(void*)csk0,(void*)csv0,(void*)st0,(void*)csq1,(void*)csk1,(void*)csv1,(void*)st1,(void*)q,(void*)k,(void*)v,(void*)o,(void*)yc,(void*)yf,(void*)dc,(void*)df}) hipFree(p0);
+    if (ok) {
+        constexpr unsigned warmup_pairs = 4, sample_pairs = 15, iterations = 32;
+        hipEvent_t begin, end;
+        HC(hipEventCreate(&begin)); HC(hipEventCreate(&end));
+        std::vector<double> ct, ft;
+        auto reset_arm = [&](bool is_fused) -> bool {
+            float *aq=is_fused?csq1:csq0, *ak=is_fused?csk1:csk0;
+            float *av=is_fused?csv1:csv0, *ast=is_fused?st1:st0;
+            HC(hipMemcpy(aq,csqb,csn*4,hipMemcpyDeviceToDevice));
+            HC(hipMemcpy(ak,cskb,csn*4,hipMemcpyDeviceToDevice));
+            HC(hipMemcpy(av,csvb,csn*4,hipMemcpyDeviceToDevice));
+            HC(hipMemcpy(ast,stb,sn*4,hipMemcpyDeviceToDevice));
+            return true;
+        };
+        auto measure = [&](bool is_fused, double& us) -> bool {
+            if (!reset_arm(is_fused)) return false;
+            HC(hipDeviceSynchronize());
+            HC(hipEventRecord(begin,nullptr));
+            for(unsigned i=0;i<iterations;++i)
+                if (!(is_fused ? fused() : control())) return false;
+            HC(hipEventRecord(end,nullptr)); HC(hipEventSynchronize(end));
+            float ms=0; HC(hipEventElapsedTime(&ms,begin,end));
+            us=(double)ms*1000.0/iterations;
+            return true;
+        };
+        for(unsigned pair=0;pair<warmup_pairs+sample_pairs;++pair) {
+            double ctime=0,ftime=0;
+            const bool control_first=(pair&1u)==0;
+            if (control_first) {
+                if(!measure(false,ctime)||!measure(true,ftime)) return false;
+            } else {
+                if(!measure(true,ftime)||!measure(false,ctime)) return false;
+            }
+            if(pair>=warmup_pairs) { ct.push_back(ctime); ft.push_back(ftime); }
+        }
+        HC(hipEventDestroy(begin)); HC(hipEventDestroy(end));
+        const TimingVerdict tv=timing_verdict(ct,ft);
+        printf("  timing control=%.3fus fused=%.3fus ratio=%.4f mad=%.4f wins=%u/%zu threshold=0.9700 %s\n",
+               median(ct),median(ft),tv.ratio,tv.mad,tv.wins,ct.size(),tv.pass?"PASS":"FAIL");
+        ok=tv.pass;
+    }
+    for(void* p0:{(void*)dq,(void*)dk,(void*)dv,(void*)dg,(void*)db,(void*)dog,(void*)dwq,(void*)dwk,(void*)dwv,(void*)da,(void*)ddt,(void*)dnw,(void*)dp,(void*)csq0,(void*)csk0,(void*)csv0,(void*)st0,(void*)csq1,(void*)csk1,(void*)csv1,(void*)st1,(void*)csqb,(void*)cskb,(void*)csvb,(void*)stb,(void*)q,(void*)k,(void*)v,(void*)o,(void*)yc,(void*)yf,(void*)dc,(void*)df}) hipFree(p0);
     return ok;
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && !strcmp(argv[1],"--selftest-timing")) return timing_selftest();
     if (argc != 2) { fprintf(stderr,"usage: %s kda_decode_fused_poc.co\n",argv[0]); return 2; }
     hipDeviceProp_t p; if (hipGetDeviceProperties(&p,0)!=hipSuccess) return 2;
     if (!strstr(p.gcnArchName,"gfx950")) { fprintf(stderr,"refusing non-gfx950 device: %s\n",p.gcnArchName); return 2; }
