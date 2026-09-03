@@ -136,7 +136,7 @@
 #define PLOW_XR_MLP_ON (PLOW_XR_MLP && !PLOW_XR_SHUFFLE)
 
 /* PLOW_XR_AGG -- DEVICE-LOCAL AGGREGATION OF THE TWO-SHOT'S `gate_ag` SIGNAL
- * (opt-in build axis, default OFF; objects-only, no blob and no emitter change).
+ * (default in gfx942/gfx950 prefill objects; objects-only, no blob or emitter change).
  *
  * WHAT IT ATTACKS. `gate_ag` is the two-shot's SECOND rendezvous and, unlike `gate_rs`, it
  * needs `nranks*nblk` arrivals -- every workgroup must speak for itself, because PHASE 1

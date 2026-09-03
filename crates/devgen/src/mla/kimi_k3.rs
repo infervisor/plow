@@ -1290,6 +1290,9 @@ fn k3_build_model(
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
         b.set_l2_placement(l2_layout);
+        b.set_lean_moe_stage2_segments(
+            crate::emit_is_amd() && emit_config::active().moe_stage2_lean,
+        );
         b.set_packed_prefill_segments(
             std::env::var("PLOW_SEG_PACKED_PREFILL").ok().as_deref() == Some("1"),
         );

@@ -51,8 +51,8 @@
 use std::path::PathBuf;
 
 use kernelcaps::{
-    dense_gemm_inventory, select_kernel, HardwareFingerprint, Inventory, NoMeasurements,
-    OpSignature, Phase, ProfileId, Rationale,
+    dense_gemm_inventory, dense_gemm_tuning_build, select_kernel, HardwareFingerprint, Inventory,
+    NoMeasurements, OpSignature, Phase, ProfileId, Rationale,
 };
 use tunedb::Digests;
 
@@ -178,11 +178,8 @@ pub fn run(opts: &TuneOptions) -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
-    // THE DIGEST, in every subcommand's output. Digest churn is the dominant operational fact:
-    // any edit reachable from `interp.hip` moves it and re-stales every record, and there were 23
-    // such commits and seven distinct digests in a single day. `probe_digest` exists so tooling
-    // can ASK what to key to instead of guessing; this is that answer.
-    println!("build digest: {}", reg.build().label());
+    let tuning_build = dense_gemm_tuning_build(&opts.root, hw.isa)?;
+    println!("tuning digest: {}", tuning_build.label());
     println!("inventory   : probed from {}", reg.build().label());
     println!("             defines: {}", reg.build().defines.join(" "));
     println!();
@@ -195,9 +192,9 @@ pub fn run(opts: &TuneOptions) -> Result<(), Box<dyn std::error::Error>> {
             // version keyed off `all.first()`'s digests, which made a fully stale store report
             // itself as healthy — it compared the store to itself.
             let want = Digests {
-                implementation: reg.build().label(),
-                interpreter: reg.build().label(),
-                toolchain: reg.build().toolchain.clone(),
+                implementation: tuning_build.label(),
+                interpreter: tuning_build.label(),
+                toolchain: tuning_build.toolchain.clone(),
                 oracle: tunedb::GEMM_ORACLE.to_string(),
             };
             status::status(&opts.db, &hw.tuning_path(), &want, coverage_from.as_ref())?

@@ -420,11 +420,12 @@ pub struct AmdRuntimeConfig {
     #[arg(id = "amd_weight_vmm", long = "amd-weight-vmm", env = "PLOW_WEIGHT_VMM", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub weight_vmm: bool,
 
-    /// Upload-ring pipeline depth.
+    /// Upload-ring pipeline depth. Values above one are experimental on ROCm:
+    /// concurrent copies into one large allocation fault on current gfx950 drivers.
     #[arg(
         long = "amd-upload-slots",
         env = "PLOW_UPLOAD_SLOTS",
-        default_value_t = 4,
+        default_value_t = 1,
         global = true
     )]
     pub upload_slots: u32,
@@ -573,15 +574,15 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-lm-row0", env = "PLOW_LM_ROW0", default_value_t = false, hide = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub lm_row0: bool,
 
-    /// Route `FlashMlaPrefill` segments onto the 4-wave flash object (the V2 MLA
-    /// prefill kernel, which needs a 512-register budget the 8-wave interpreter
-    /// cannot give). The flash object must advertise `plow_mla_pf_v2_arm_1`.
+    /// Route `FlashMlaPrefill` segments onto a 4-wave V2 object. On gfx950 a pure dense
+    /// bf16 segment prefers the dedicated scratch-free V2+SV object; the general flash
+    /// object is the capability-checked fallback. Set false only to run legacy blobs.
     ///
     /// SERVE-TIME AND LOAD-BEARING, not a tuning knob: a `PLOW_GLM_OFOLD=1` blob
     /// is REFUSED without it, because on the 8-wave kernel that blob leaves
     /// unnormalized f32 partials for the fused GEMM to read as bf16 — finite,
-    /// fluent, and wrong. The canonical gfx942 recipe carries it.
-    #[arg(long = "amd-mla-pf-v2", env = "PLOW_MLA_PF_V2", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// fluent, and wrong. Enabled by default for production AMD packets.
+    #[arg(long = "amd-mla-pf-v2", env = "PLOW_MLA_PF_V2", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub mla_pf_v2: bool,
 
     /// Download rank 0's copy of act tensors after the prefill/step:

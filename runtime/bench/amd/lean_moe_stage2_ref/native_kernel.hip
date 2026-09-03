@@ -24,47 +24,71 @@ struct BStage {
 };
 
 static __device__ __forceinline__ BStage load_b_stage(
-    const unsigned char* weight, const unsigned* weight_scale,
+    const unsigned char* weight, const unsigned char* weight_scale,
     unsigned kt, unsigned n0, unsigned wave, unsigned lane_k, unsigned lane_n,
-    int expert, int model_dim, unsigned weight_stride_n0,
-    size_t expert_weight_stride, unsigned scale_stride_n0) {
+    int model_dim, int inter_dim) {
     BStage stage;
+    const unsigned kbytes = static_cast<unsigned>(inter_dim) / 2u;
+    const unsigned scale_stride = static_cast<unsigned>(inter_dim) / 32u;
 #pragma unroll
     for (unsigned ni = 0; ni < 4; ++ni) {
         const unsigned global_n = n0 + wave * 64u + ni * 16u + lane_n;
-        const unsigned n_block = global_n / 16u;
-        const size_t offset = static_cast<size_t>(expert) * expert_weight_stride
-            + static_cast<size_t>(n_block) * weight_stride_n0
-            + static_cast<size_t>(kt) * 1024u + lane_k * 256u + lane_n * 16u;
+        const size_t offset = static_cast<size_t>(global_n) * kbytes
+            + static_cast<size_t>(kt) * 64u + lane_k * 16u;
         stage.frag[ni] = global_n < static_cast<unsigned>(model_dim)
             ? fp4_operand(weight + offset) : i32x8{0, 0, 0, 0, 0, 0, 0, 0};
     }
 #pragma unroll
     for (unsigned np = 0; np < 2; ++np) {
-        const unsigned n_pair = n0 + wave * 64u + np * 32u;
-        const unsigned mni = (static_cast<unsigned>(expert) * model_dim + n_pair) / 32u;
-        const unsigned index = mni * scale_stride_n0 + (kt / 2u) * 64u
-            + lane_k * 16u + lane_n;
-        stage.scale[np] = static_cast<int>(weight_scale[index] >> ((kt & 1u) * 16u));
+        const unsigned n_lo = n0 + wave * 64u + np * 32u + lane_n;
+        const unsigned n_hi = n_lo + 16u;
+        const unsigned s_lo = n_lo < static_cast<unsigned>(model_dim)
+            ? weight_scale[static_cast<size_t>(n_lo) * scale_stride + kt * 4u + lane_k]
+            : 127u;
+        const unsigned s_hi = n_hi < static_cast<unsigned>(model_dim)
+            ? weight_scale[static_cast<size_t>(n_hi) * scale_stride + kt * 4u + lane_k]
+            : 127u;
+        stage.scale[np] = static_cast<int>(s_lo | (s_hi << 8u));
     }
     return stage;
+}
+
+static __device__ __forceinline__ unsigned expert_for_tile(
+    const int* tile_prefix, unsigned tile, unsigned experts) {
+    unsigned lo = 0, hi = experts;
+    while (lo + 1u < hi) {
+        const unsigned mid = lo + (hi - lo) / 2u;
+        if (static_cast<unsigned>(tile_prefix[mid]) <= tile)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_abi_1 = 1;
+extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_no_spill_1 = 1;
+extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_dynamic_lds_16640 = 1;
+extern "C" __device__ unsigned plow_moe2_mxfp4_stage2_vgpr_le_144 = 1;
+
+extern "C" __global__ void plow_moe2_zero_bf16(__hip_bfloat16* out,
+                                                 unsigned long long elements) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < elements)
+        out[i] = __float2bfloat16(0.0f);
 }
 
 extern "C" __global__ __launch_bounds__(256, 2)
 void plow_moe2_mxfp4_16x16x128_gfx950(
     __hip_bfloat16* __restrict__ out,
     const unsigned char* __restrict__ activation,
-    const unsigned char* __restrict__ weight,
-    const unsigned* __restrict__ activation_scale,
-    const unsigned* __restrict__ weight_scale,
-    const int* __restrict__ sorted_token_ids,
-    const int* __restrict__ expert_ids,
+    const unsigned long long* __restrict__ weight_table,
+    const unsigned char* __restrict__ activation_scale,
+    const unsigned long long* __restrict__ weight_scale_table,
+    const int* __restrict__ meta,
+    const unsigned* __restrict__ row_partidx,
     const float* __restrict__ sorted_weights,
-    const int* __restrict__ num_valid_ids,
-    const float* __restrict__ bias,
-    int tokens, int model_dim, int inter_dim, int expert_blocks) {
-    (void)bias;
-    (void)expert_blocks;
+    int tokens, int model_dim, int inter_dim, int experts, int topk) {
     constexpr unsigned TM = 32;
     constexpr unsigned TN = 256;
     constexpr unsigned TK = 128;
@@ -83,34 +107,40 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
     const unsigned lane = tid % WAVE;
     const unsigned lane_k = lane / 16;
     const unsigned lane_n = lane % 16;
-    const unsigned block_m = blockIdx.y;
-    const unsigned n0 = blockIdx.x * TN;
-    const int valid_rows = *num_valid_ids;
-    const int expert = expert_ids[block_m];
+    const unsigned n_tiles = (static_cast<unsigned>(model_dim) + TN - 1u) / TN;
+    const unsigned n_tile = blockIdx.x % n_tiles;
+    const unsigned worker_m = blockIdx.x / n_tiles;
+    const unsigned workers_m = gridDim.x / n_tiles;
+    const unsigned n0 = n_tile * TN;
     const unsigned kbytes = static_cast<unsigned>(inter_dim) / 2;
-    const unsigned scale_k_padded = (static_cast<unsigned>(inter_dim) + 255u) & ~255u;
-    const unsigned scale_k_groups = scale_k_padded / 256u;
-    const unsigned scale_stride_n0 = scale_k_groups * 64u;
-    const unsigned weight_stride_n0 = (kbytes / 64u) * 1024u;
-    const size_t expert_weight_stride =
-        static_cast<size_t>(model_dim / 16) * weight_stride_n0;
-    if (inter_dim != 384)
+    const unsigned scale_stride = static_cast<unsigned>(inter_dim) / 32u;
+    if (inter_dim != 384 || experts <= 0 || topk <= 0 || workers_m == 0)
         return;
-    if (tid < TM) {
-        const unsigned sorted_row = block_m * TM + tid;
-        row_ids_lds[tid] = sorted_row < static_cast<unsigned>(valid_rows)
-            ? sorted_token_ids[sorted_row] : -1;
-        row_gates_lds[tid] = sorted_row < static_cast<unsigned>(valid_rows)
-            ? sorted_weights[sorted_row] : 0.0f;
-    }
-    __syncthreads();
+    const int* tile_prefix = meta + 2 * experts;
+    const unsigned total_half_tiles = static_cast<unsigned>(tile_prefix[experts]) * 2u;
+    for (unsigned block_m = worker_m; block_m < total_half_tiles; block_m += workers_m) {
+        const unsigned expert = expert_for_tile(tile_prefix, block_m / 2u,
+                                                static_cast<unsigned>(experts));
+        const unsigned char* weight = reinterpret_cast<const unsigned char*>(
+            static_cast<size_t>(weight_table[static_cast<size_t>(expert) * 3u + 2u]));
+        const unsigned char* weight_scale = reinterpret_cast<const unsigned char*>(
+            static_cast<size_t>(weight_scale_table[static_cast<size_t>(expert) * 3u + 2u]));
+        if (weight == nullptr || weight_scale == nullptr)
+            continue;
+        if (tid < TM) {
+            const unsigned sorted_row = block_m * TM + tid;
+            const unsigned partidx = row_partidx[sorted_row];
+            row_ids_lds[tid] = partidx == ~0u ? -1 : static_cast<int>(partidx);
+            row_gates_lds[tid] = partidx == ~0u ? 0.0f : sorted_weights[sorted_row];
+        }
+        __syncthreads();
 
-    f32x4 acc[2][4];
+        f32x4 acc[2][4];
 #pragma unroll
-    for (unsigned mi = 0; mi < 2; ++mi)
+        for (unsigned mi = 0; mi < 2; ++mi)
 #pragma unroll
-        for (unsigned ni = 0; ni < 4; ++ni)
-            acc[mi][ni] = f32x4{0.0f, 0.0f, 0.0f, 0.0f};
+            for (unsigned ni = 0; ni < 4; ++ni)
+                acc[mi][ni] = f32x4{0.0f, 0.0f, 0.0f, 0.0f};
 
     auto load_a_stage = [&](unsigned kt) {
         u32x4 value{0, 0, 0, 0};
@@ -118,10 +148,9 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
             const unsigned row = tid / 4;
             const unsigned chunk = tid % 4;
             const int fused = row_ids_lds[row];
-            const unsigned token = static_cast<unsigned>(fused) & 0x00ffffffu;
-            const unsigned slot = static_cast<unsigned>(fused) >> 24;
-            if (fused >= 0 && token < static_cast<unsigned>(tokens)) {
-                const size_t src = (static_cast<size_t>(token) * 16u + slot) * kbytes
+            if (fused >= 0) {
+                const unsigned sorted_row = block_m * TM + row;
+                const size_t src = static_cast<size_t>(sorted_row) * kbytes
                     + kt * KBYTES + chunk * 16u;
                 value = *reinterpret_cast<const u32x4*>(activation + src);
             }
@@ -139,18 +168,19 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
     };
 
     BStage b_cur = load_b_stage(
-        weight, weight_scale, 0, n0, wave, lane_k, lane_n, expert, model_dim,
-        weight_stride_n0, expert_weight_stride, scale_stride_n0);
+        weight, weight_scale, 0, n0, wave, lane_k, lane_n, model_dim, inter_dim);
     store_a_stage(load_a_stage(0), 0);
     __syncthreads();
 
 #pragma unroll
     for (unsigned kt = 0; kt < 3; ++kt) {
         i32x8 a_frag[2];
-        const unsigned a_scale_index = block_m * scale_stride_n0 + (kt / 2u) * 64u
-            + lane_k * 16u + lane_n;
-        const int a_scale_pair =
-            static_cast<int>(activation_scale[a_scale_index] >> ((kt & 1u) * 16u));
+        const unsigned scale_row = block_m * TM + lane_n;
+        const unsigned sa_lo = activation_scale[
+            static_cast<size_t>(scale_row) * scale_stride + kt * 4u + lane_k];
+        const unsigned sa_hi = activation_scale[
+            static_cast<size_t>(scale_row + 16u) * scale_stride + kt * 4u + lane_k];
+        const int a_scale_pair = static_cast<int>(sa_lo | (sa_hi << 8u));
 #pragma unroll
         for (unsigned mi = 0; mi < 2; ++mi) {
             const unsigned row = lane_n + mi * 16u;
@@ -163,8 +193,7 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
         u32x4 a_next{0, 0, 0, 0};
         if (kt < 2) {
             b_next = load_b_stage(
-                weight, weight_scale, kt + 1, n0, wave, lane_k, lane_n, expert, model_dim,
-                weight_stride_n0, expert_weight_stride, scale_stride_n0);
+                weight, weight_scale, kt + 1, n0, wave, lane_k, lane_n, model_dim, inter_dim);
             a_next = load_a_stage(kt + 1);
         }
         __builtin_amdgcn_s_setprio(1);
@@ -202,7 +231,7 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
         const unsigned row = pair / (TN / 2u);
         const unsigned col = (pair % (TN / 2u)) * 2u;
         const int fused = row_ids_lds[row];
-        const unsigned token = static_cast<unsigned>(fused) & 0x00ffffffu;
+        const unsigned token = static_cast<unsigned>(fused) / static_cast<unsigned>(topk);
         if (fused >= 0 && token < static_cast<unsigned>(tokens) &&
             n0 + col + 1u < static_cast<unsigned>(model_dim)) {
             const __hip_bfloat162 value = *reinterpret_cast<const __hip_bfloat162*>(
@@ -210,5 +239,7 @@ void plow_moe2_mxfp4_16x16x128_gfx950(
             unsafeAtomicAdd(reinterpret_cast<__hip_bfloat162*>(
                 out + static_cast<size_t>(token) * model_dim + n0 + col), value);
         }
+    }
+        __syncthreads();
     }
 }

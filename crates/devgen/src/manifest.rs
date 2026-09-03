@@ -176,11 +176,16 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
 /// one entry with `seg: None`, so the unsegmented case reads as it always did.
 #[allow(clippy::type_complexity)]
 fn segment_arms(p: &Program) -> Vec<(Option<u32>, (BTreeSet<Arm>, usize))> {
-    // `gq_seg_ofs` is `[n_seg+1]` bounds into `gq_stream`. `l2_domains != 0`
-    // repurposes `seg` as an L2 DOMAIN (PLOW_L2_PLACE), not a wave-class segment
-    // — partitioning by it there would be meaningless, so fall back to whole.
-    let n_seg = p.gq_seg_ofs.len().saturating_sub(1);
-    if p.l2_domains != 0 || n_seg <= 1 || p.gq_stream.is_empty() {
+    // `StreamEnt.seg` is always the ordered kernel-family segment. L2 placement
+    // multiplies `gq_seg_ofs` by the physical-domain count, so derive the host
+    // dimension from the stream rather than mistaking XCD queues for segments.
+    let n_seg = p
+        .stream
+        .iter()
+        .map(|e| e.seg as usize + 1)
+        .max()
+        .unwrap_or(1);
+    if n_seg <= 1 || p.gq_stream.is_empty() {
         let mut arms = BTreeSet::new();
         for inst in &p.insts {
             if let Some(op) = op_of(inst.op) {
@@ -190,8 +195,16 @@ fn segment_arms(p: &Program) -> Vec<(Option<u32>, (BTreeSet<Arm>, usize))> {
         return vec![(None, (arms, p.insts.len()))];
     }
     let mut out = Vec::new();
+    let domains = if p.l2_domains != 0
+        && p.gq_seg_ofs.len().saturating_sub(1) == n_seg * p.l2_domains as usize
+    {
+        p.l2_domains as usize
+    } else {
+        1
+    };
     for s in 0..n_seg {
-        let (a, b) = (p.gq_seg_ofs[s] as usize, p.gq_seg_ofs[s + 1] as usize);
+        let w = s * domains;
+        let (a, b) = (p.gq_seg_ofs[w] as usize, p.gq_seg_ofs[w + domains] as usize);
         let mut arms = BTreeSet::new();
         let mut seen = BTreeSet::new();
         for ent in &p.gq_stream[a.min(p.gq_stream.len())..b.min(p.gq_stream.len())] {

@@ -10,10 +10,10 @@
 
 use std::path::{Path, PathBuf};
 
-use packet::dev::{DevInst64, DevOp, StreamEnt, Wait};
+use packet::dev::{DevInst64, DevOp, StreamEnt, Wait, SE_DOMAIN_MASK};
 use packet::devbuild::{
     is_blob_magic, BlobHeader, BlobProgHeader, BlobSectionEntry, BlobTensor, BLOB_MAGIC_V7,
-    INIT_NONE, NAME_LEN, SECT_GEN_TENSORS, SECT_MAGIC, SECT_NAME_LEN,
+    BLOB_MAGIC_V7_L2SEG, INIT_NONE, NAME_LEN, SECT_GEN_TENSORS, SECT_MAGIC, SECT_NAME_LEN,
 };
 use packet::rope::GenTensor;
 
@@ -44,16 +44,17 @@ pub struct DevProg {
     /// appendix — the global-queue interpreter's work list. Empty when the
     /// blob predates the appendix.
     pub gq_stream: Vec<StreamEnt>,
-    /// `[n_seg+1]` segment window bounds into `gq_stream`.
+    /// Queue-window bounds into `gq_stream`. Current L2-placed blobs use
+    /// `[ordered_segment][physical_domain]` windows.
     pub gq_seg_ofs: Vec<u32>,
-    /// L2-domain placement (`PLOW_L2_PLACE`): the number of L2 domains `gq_seg_ofs` is windowed
-    /// by, `0` when this program is not placed and the windows are wave-class segments.
+    /// L2-domain placement (`PLOW_L2_PLACE`): domains per ordered segment, or `0`.
     ///
     /// RECOVERED, not read: the blob header carries one `F_L2DOM` flag and one domain count for
     /// the whole blob (`reserved[2]`), but placement is decided per PROGRAM — `Builder::finish`
     /// declines it for a multi-wave-class program, so a blob can hold a placed decode program
     /// beside an unplaced, segmented prefill one. A program is placed iff the blob says placement
-    /// happened and this program's window count equals the domain count.
+    /// happened and its window count is a valid domain multiple. Legacy blobs have exactly
+    /// one window per domain; current blobs retain ordered segments independently.
     ///
     /// That test is exact rather than a heuristic, and the reason is a parity argument worth
     /// stating: a wave-class window count is `2*layers + 1`, which is always ODD, while a domain
@@ -217,7 +218,7 @@ impl DevBlob {
                 "devblob: bad magic — recompile with plowc (format changed)".into(),
             ));
         }
-        let is_v7 = &hdr.magic == BLOB_MAGIC_V7;
+        let is_v7 = &hdr.magic == BLOB_MAGIC_V7 || &hdr.magic == BLOB_MAGIC_V7_L2SEG;
 
         let decls = take::<BlobTensor>(buf, &mut off, hdr.n_tensor as usize, "tensor decls")?;
         let init = take::<u8>(buf, &mut off, hdr.init_bytes as usize, "init section")?;
@@ -282,9 +283,11 @@ impl DevBlob {
                 // Which of these programs is L2-PLACED. See `DevProg::l2_domains` for why the
                 // window count identifies it exactly.
                 let l2_dom = hdr.reserved[2] as u32;
+                let combined = hdr.flags & packet::devbuild::PLOW_BLOB_F_L2SEG != 0;
                 if hdr.flags & packet::devbuild::PLOW_BLOB_F_L2DOM != 0
                     && l2_dom != 0
-                    && n_seg == l2_dom as usize
+                    && ((!combined && n_seg == l2_dom as usize)
+                        || (combined && n_seg % l2_dom as usize == 0))
                 {
                     progs[p].l2_domains = l2_dom;
                 }
@@ -386,11 +389,7 @@ impl DevBlob {
             Vec::new()
         };
 
-        // PLOW_L2_PLACE guard: a blob whose gq `seg` is an L2 domain (F_L2DOM)
-        // will be MIS-dispatched by a wave-class / static interp (it reads `seg`
-        // as a wave-class segment). Refuse it unless this runtime opts into
-        // physical-SM domain dispatch. (reserved[1]/[2] carry SMs/partition and
-        // the domain count for that dispatch.) See the design notes.
+        // PLOW_L2_PLACE guard: a placed blob requires physical-domain queue dispatch.
         //
         // `PLOW_NV_PLACE_DISPATCH` stays accepted alongside the new spelling: the flag was
         // renamed because an L2 domain is a GPC on NVIDIA and an XCD on AMD, and a run that
@@ -405,9 +404,9 @@ impl DevBlob {
             && !dispatch_on("PLOW_NV_PLACE_DISPATCH")
         {
             return Err(RuntimeError::Device(
-                "devblob: blob uses L2-domain packet placement (PLOW_L2_PLACE) — its \
-                 global-queue `seg` is an L2 domain, not a wave-class, so a standard interp \
-                 would mis-dispatch it. Build the cubins with -DPLOW_L2_PLACE_DISPATCH and set \
+                "devblob: blob uses L2-domain packet placement (PLOW_L2_PLACE), so a standard \
+                 interpreter would mis-dispatch its per-domain queues. Build the objects with \
+                 -DPLOW_L2_PLACE_DISPATCH and set \
                  PLOW_L2_PLACE_DISPATCH=1, or recompile the model without PLOW_L2_PLACE."
                     .to_string(),
             ));
@@ -639,16 +638,14 @@ impl DevProg {
     }
 
     pub fn check_coarse_single_segment(&self) -> Result<()> {
-        // An L2-PLACED program (l2_domains != 0) legitimately carries seg = L2 domain in
-        // [0, l2_domains); the placed interpreter partitions by per-domain gq windows and
-        // never reads seg as a wave-class. The parse-time PLOW_BLOB_F_L2DOM gate has already
-        // verified the runtime attested a placed cubin, so only out-of-range domains and the
-        // still-unimplemented fine/xctr flags are errors here.
-        let seg_lim = if self.l2_domains != 0 {
-            self.l2_domains as u16
-        } else {
-            1
-        };
+        // Legacy L2 blobs encoded the domain in `seg`; current blobs keep ordered segments in
+        // `seg` and encode the physical domain in flags. The CUDA backend may accept the former
+        // compatibility layout, but it must reject any current blob with more than one ordered
+        // segment instead of mistaking low segment ids for legacy domains.
+        let legacy_l2 = self.l2_domains != 0
+            && self.gq_seg_ofs.len() == self.l2_domains as usize + 1
+            && self.stream.iter().all(|e| e.flags & SE_DOMAIN_MASK == 0);
+        let seg_lim = if legacy_l2 { self.l2_domains as u16 } else { 1 };
         for (j, e) in self.stream.iter().enumerate() {
             if e.seg >= seg_lim || (e.flags & (packet::dev::SE_FINE | packet::dev::SE_XCTR)) != 0 {
                 return Err(RuntimeError::Device(format!(
@@ -995,7 +992,7 @@ mod tests {
     #[test]
     fn roundtrip_through_the_real_writer() {
         let blob = tiny_model().to_blob();
-        let b = DevBlob::parse(&blob).unwrap();
+        let mut b = DevBlob::parse(&blob).unwrap();
         assert_eq!(b.n_cu, 2);
         assert_eq!(b.tensors.len(), 2);
         assert_eq!(b.tensors[0].name, "in.ids");
@@ -1023,6 +1020,15 @@ mod tests {
 
         g.check_coarse_single_segment().unwrap();
         g.check_gq_topological().unwrap();
+
+        // Current placed blobs keep ordered segments independent of their domain windows.
+        // A coarse-only backend must not confuse segment 1 with legacy domain 1.
+        let g = b.progs.last_mut().unwrap();
+        g.l2_domains = 8;
+        g.gq_seg_ofs = vec![0; 9];
+        g.stream[0].seg = 1;
+        g.stream[0].flags = 1u16 << packet::dev::SE_DOMAIN_SHIFT;
+        assert!(g.check_coarse_single_segment().is_err());
     }
 
     #[test]

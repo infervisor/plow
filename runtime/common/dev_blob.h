@@ -124,6 +124,8 @@ PLOW_SASSERT(sizeof(PlowProgHeader) == 24, "PlowProgHeader size");
  * and said "bad blob magic — recompile with plowc", which sent people back to
  * the same command that produced the rejected blob. */
 #define PLOW_BLOB_MAGIC_V7 "PLOWDEV\x09"
+#define PLOW_BLOB_MAGIC_L2SEG "PLOWDEV\x0a"
+#define PLOW_BLOB_MAGIC_V7_L2SEG "PLOWDEV\x0b"
 
 /* PlowGenTensor.kind */
 #define PLOW_GEN_ROPE_COS     0u
@@ -202,6 +204,10 @@ static inline const char *plow_blob_magic_error(const char magic[8])
                "  Recompile the blob with:  plowc ... --no-rope-gen\n"
                "  That bakes the tables into the init section and keeps the container at v5/v6, "
                "which this harness reads. (plowrt reads v7 directly and needs no flag.)";
+    if (!memcmp(magic, PLOW_BLOB_MAGIC_L2SEG, 8) ||
+        !memcmp(magic, PLOW_BLOB_MAGIC_V7_L2SEG, 8))
+        return "blob uses independent ordered-segment/per-XCD queues; this legacy harness cannot "
+               "dispatch them safely. Use plowrt or rebuild the blob without L2 placement.";
     return "bad blob magic: not a plow device blob, or a container older than v5. Recompile with "
            "plowc --no-rope-gen.";
 }

@@ -516,14 +516,8 @@ fn nvidia_conditioned_flags_never_change_the_amd_segment_count() {
     );
 }
 
-/// `PLOW_L2_PLACE` REPURPOSES `seg` as an L2 domain. That is fine on sm_120, which never reads a
-/// wave class, and destroys a SEGMENTED AMD dispatch. Placement must therefore leave an AMD
-/// PREFILL program alone — this is the exact configuration that produced the zero-logits packets.
-///
-/// It is the prefill program, not the AMD target, that is protected: the gate moved from "is the
-/// target AMD" to "does this program have more than one wave class" so that AMD *decode* — which
-/// has no `FlashPrefill` op, so its `seg` is uniformly 0 and carries nothing — can be placed.
-/// `a_single_wave_class_program_is_placed` in `packet::devbuild` covers the other side.
+/// L2 placement must preserve AMD's ordered wave-class segments while emitting an independent
+/// per-XCD queue dimension. This is the configuration that formerly collapsed to zero logits.
 #[test]
 fn l2_placement_never_clobbers_the_wave_class_on_amd() {
     let _g = emit_guard();
@@ -535,8 +529,7 @@ fn l2_placement_never_clobbers_the_wave_class_on_amd() {
     assert_eq!(
         segment_count(&td, 128),
         5,
-        "L2 placement must not touch an AMD PREFILL program: `seg` is the wave class there, and \
-         overwriting it collapses prefill to one segment"
+        "per-XCD placement must retain all AMD prefill wave-class segments"
     );
     // The same request on an NVIDIA target is honoured — placement is a real sm_120 feature, and
     // this test must not turn the fix into a blanket disable.

@@ -249,31 +249,44 @@ pub fn derive_overlap_capability(ranks: &[AmdOverlapRankEvidence]) -> AmdOverlap
     }
 }
 
-/// Host dispatch semantics for a program whose stream carries `seg` tags.
-///
-/// L2 placement reuses those tags for domains that drain concurrently inside
-/// one launch. Only ordinary wave-class segments are separate host launches.
+/// Host dispatch semantics for ordered segments and device-side XCD queues.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProgramDispatch {
+    /// Legacy placed blob: `seg` was the XCD and there is one host launch.
     L2Domains(u32),
+    /// Current placed blob: every ordered segment owns one queue per XCD.
+    L2Segments {
+        domains: u32,
+        segments: usize,
+    },
     WaveSegments(usize),
 }
 
 impl ProgramDispatch {
-    pub(crate) fn classify(l2_domains: u32, n_segments: usize) -> Self {
-        if l2_domains != 0 {
-            Self::L2Domains(l2_domains)
-        } else {
-            Self::WaveSegments(n_segments)
+    pub(crate) fn classify(l2_domains: u32, n_segments: usize, queue_windows: usize) -> Self {
+        if l2_domains == 0 {
+            return Self::WaveSegments(n_segments);
         }
+        if queue_windows == n_segments.saturating_mul(l2_domains as usize) {
+            return Self::L2Segments {
+                domains: l2_domains,
+                segments: n_segments,
+            };
+        }
+        Self::L2Domains(l2_domains)
     }
 
     pub(crate) fn launches(self) -> usize {
         match self {
             Self::L2Domains(_) => 1,
+            Self::L2Segments { segments, .. } => segments,
             Self::WaveSegments(n) => n,
         }
     }
+}
+
+fn prefill_segment_specialization_allowed(dispatch: ProgramDispatch) -> bool {
+    !matches!(dispatch, ProgramDispatch::L2Domains(_))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,7 +417,12 @@ fn validate_decode_dispatch(progs: &[DevProg], dec_ix: usize) -> Result<()> {
     for (rung, prog) in progs[dec_ix..].iter().enumerate() {
         let kinds = decode_segment_kinds(prog)?;
         let n_segments = kinds.len();
-        if prog.l2_domains != 0
+        let dispatch = ProgramDispatch::classify(
+            prog.l2_domains,
+            n_segments,
+            prog.gq_seg_ofs.len().saturating_sub(1),
+        );
+        if matches!(dispatch, ProgramDispatch::L2Domains(_))
             && kinds
                 .iter()
                 .any(|k| !matches!(k, DecodeSegmentKind::Interpreter))
@@ -465,6 +483,143 @@ struct KdaDecodeFusedArgs {
 }
 
 const _: () = assert!(std::mem::size_of::<KdaDecodeFusedArgs>() == 184);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MoeStage2Mxfp4Args {
+    out: u64,
+    activation: u64,
+    weight_table: u64,
+    activation_scale: u64,
+    weight_scale_table: u64,
+    meta: u64,
+    row_partidx: u64,
+    row_gate: u64,
+    tokens: u32,
+    model_dim: u32,
+    inter_dim: u32,
+    experts: u32,
+    topk: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeStage2Mxfp4Args>() == 88);
+
+#[derive(Clone, Copy, Debug)]
+enum PrefillSegmentRoute {
+    Interpreter,
+    MoeStage2Mxfp4(MoeStage2Mxfp4Args),
+}
+
+fn moe_stage2_mxfp4_pair(d: &DevInst64, c: &DevInst64) -> bool {
+    d.op == DevOp::MoeGroupDownPf as u16
+        && c.op == DevOp::MoeCombinePf as u16
+        && d.i[3] == MOE_ENC_MXFP4
+        && d.i[1] == 384
+        && d.i[0] != 0
+        && d.i[2] != 0
+        && d.i[4] == 0
+        && d.i[5] == 0
+        && d.t[5] != packet::dev::TENSOR_NONE16
+        && d.t[6] != packet::dev::TENSOR_NONE16
+        && d.t[7] != packet::dev::TENSOR_NONE16
+        && c.t[1] == packet::dev::TENSOR_NONE16
+        && c.t[2] == packet::dev::TENSOR_NONE16
+        && c.t[3] == d.t[0]
+        && c.i[0] == d.i[0]
+        && c.i[1] != 0
+        && c.i[2] != 0
+        && c.i[3] == 0
+        && c.i[4] == 0
+        && c.i[7] == 0
+}
+
+fn has_moe_stage2_mxfp4_segment(prog: &DevProg) -> bool {
+    let n_seg = prog
+        .stream
+        .iter()
+        .map(|entry| entry.seg as usize + 1)
+        .max()
+        .unwrap_or(1);
+    let mut members = vec![std::collections::BTreeSet::new(); n_seg];
+    for entry in &prog.stream {
+        members[entry.seg as usize].insert(entry.inst as usize);
+    }
+    members.into_iter().any(|set| {
+        if set.len() != 2 {
+            return false;
+        }
+        let mut it = set.into_iter();
+        let (Some(di), Some(ci)) = (it.next(), it.next()) else {
+            return false;
+        };
+        moe_stage2_mxfp4_pair(&prog.insts[di], &prog.insts[ci])
+    })
+}
+
+fn moe_stage2_mxfp4_routes(prog: &DevProg, devp: &[DeviceMem]) -> Result<Vec<PrefillSegmentRoute>> {
+    let n_seg = prog
+        .stream
+        .iter()
+        .map(|entry| entry.seg as usize + 1)
+        .max()
+        .unwrap_or(1);
+    let mut members = vec![std::collections::BTreeSet::new(); n_seg];
+    for entry in &prog.stream {
+        if let Some(set) = members.get_mut(entry.seg as usize) {
+            set.insert(entry.inst as usize);
+        }
+    }
+    let addr = |h: u16, what: &str| -> Result<u64> {
+        if h == packet::dev::TENSOR_NONE16 {
+            return Err(RuntimeError::Device(format!(
+                "lean MoE stage-2 operand `{what}` is absent"
+            )));
+        }
+        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "lean MoE stage-2 operand `{what}` handle {h} is outside {} tensors",
+                devp.len()
+            ))
+        })
+    };
+    let mut routes = Vec::with_capacity(n_seg);
+    for (seg, set) in members.into_iter().enumerate() {
+        if set.len() != 2 {
+            routes.push(PrefillSegmentRoute::Interpreter);
+            continue;
+        }
+        let mut it = set.into_iter();
+        let (Some(di), Some(ci)) = (it.next(), it.next()) else {
+            unreachable!()
+        };
+        let (d, c) = (&prog.insts[di], &prog.insts[ci]);
+        if d.op != DevOp::MoeGroupDownPf as u16 || c.op != DevOp::MoeCombinePf as u16 {
+            routes.push(PrefillSegmentRoute::Interpreter);
+            continue;
+        }
+        if !moe_stage2_mxfp4_pair(d, c) {
+            return Err(RuntimeError::Device(format!(
+                "segment {seg} isolates a MoE Down+Combine boundary but its geometry/ABI is not supported by the lean MXFP4 stage-2 object"
+            )));
+        }
+        routes.push(PrefillSegmentRoute::MoeStage2Mxfp4(MoeStage2Mxfp4Args {
+            out: addr(c.t[0], "out")?,
+            activation: addr(d.t[1], "activation")?,
+            weight_table: addr(d.t[2], "weight_table")?,
+            activation_scale: addr(d.t[5], "activation_scale")?,
+            weight_scale_table: addr(d.t[3], "weight_scale_table")?,
+            meta: addr(d.t[4], "meta")?,
+            row_partidx: addr(d.t[6], "row_partidx")?,
+            row_gate: addr(d.t[7], "row_gate")?,
+            tokens: c.i[2],
+            model_dim: d.i[0],
+            inter_dim: d.i[1],
+            experts: d.i[2],
+            topk: c.i[1],
+        }));
+    }
+    Ok(routes)
+}
 
 #[derive(Clone, Copy, Debug)]
 enum DecodeSegmentRoute {
@@ -1785,8 +1940,8 @@ fn check_k3_arms(syms: &[&str], path: &Path, need: Option<DevOp>) -> Result<()> 
 /// 81/82) are separate build flags: the prefill half is a second full MFMA body and a decode-only
 /// object must not carry it.
 const MOE_GEMMA_SYM: &str = "plow_moe_gemma_arms_1";
-/// Marker for L2-DOMAIN DISPATCH (-DPLOW_L2_PLACE_DISPATCH). A placed blob repurposes the
-/// global-queue `seg` as an L2 domain, so an object without this axis mis-dispatches it SILENTLY.
+/// Marker for L2-DOMAIN DISPATCH (-DPLOW_L2_PLACE_DISPATCH). A placed blob carries per-domain
+/// device queue windows, so an object without this axis mis-dispatches it SILENTLY.
 /// Checked instead of the operator-asserted PLOW_L2_PLACE_DISPATCH env var.
 const L2_DISPATCH_SYM: &str = "plow_l2_place_dispatch_1";
 const GATE_HIER_SYM: &str = "plow_gate_hier_1";
@@ -2086,13 +2241,12 @@ fn check_xargmax_capacity(syms: &[&str], path: &Path, need: u32) -> Result<()> {
     )))
 }
 
-/// Is the V2 MLA-prefill routing enabled (`PLOW_MLA_PF_V2=1`)?
+/// Is the V2 MLA-prefill routing enabled (`PLOW_MLA_PF_V2!=0`)?
 ///
-/// Opt-in: it moves `FlashMlaPrefill` segments onto the 4-wave flash object, whose
+/// Enabled by default: it moves `FlashMlaPrefill` segments onto a 4-wave object, whose
 /// full-column-wave kernel (`d_flash_mla_prefill_v2`) needs the 512-register budget the
-/// 8-wave interpreter cannot give. The flash object must advertise
-/// `plow_mla_pf_v2_arm_1` — checked at load, because the dispatch default on a pre-arm
-/// object is a silent skip, not a trap.
+/// 8-wave interpreter cannot give. gfx950 prefers the dedicated scratch-free V2+SV object;
+/// if it is unavailable, the capability-checked general flash object remains the exact fallback.
 pub fn mla_pf_v2_enabled() -> bool {
     crate::config::RuntimeConfig::get().amd.mla_pf_v2
 }
@@ -2100,6 +2254,31 @@ pub fn mla_pf_v2_enabled() -> bool {
 /// The V2 arms' marker symbols (see `interp.hip`).
 const MLA_PF_V2_SYM: &str = "plow_mla_pf_v2_arm_1";
 const MLA_PF_V2_FP8_SYM: &str = "plow_mla_pf_v2_fp8_arm_1";
+const MLA_PF_V2_SV_RAW_SYM: &str = "plow_mla_pf_v2_sv_raw_1";
+
+fn check_mla_v2_sv_raw_symbols(syms: &[&str], path: &Path, needs_l2: bool) -> Result<()> {
+    for marker in [MLA_PF_V2_SYM, MLA_PF_V2_SV_RAW_SYM] {
+        if !syms.contains(&marker) {
+            return Err(RuntimeError::Device(format!(
+                "raw MLA V2 object {} lacks required marker `{marker}`",
+                path.display()
+            )));
+        }
+    }
+    if syms.contains(&MLA_PF_V2_FP8_SYM) || syms.contains(&PACKED_PREFILL_MLA_FLASH_SEG_SYM) {
+        return Err(RuntimeError::Device(format!(
+            "raw MLA V2 object {} carries an fp8 or packed-prefill consumer arm",
+            path.display()
+        )));
+    }
+    if needs_l2 && !syms.contains(&L2_DISPATCH_SYM) {
+        return Err(RuntimeError::Device(format!(
+            "raw MLA V2 object {} lacks `{L2_DISPATCH_SYM}` for an L2-placed packet",
+            path.display()
+        )));
+    }
+    Ok(())
+}
 
 /// Per-segment wave class, derived from the stream.
 ///
@@ -2251,6 +2430,36 @@ fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
         .into_iter()
         .zip(pure)
         .map(|(f, p)| if p { f.unwrap_or(0) } else { 0 })
+        .collect())
+}
+
+/// Segments eligible for the dedicated gfx950 MLA V2+SV object.
+///
+/// That object intentionally contains only the dense bf16 opcode. A gathered MLA instruction
+/// uses the same opcode but selects another body through `t7`; routing it here would silently
+/// execute the dense body. This predicate is deliberately independent of model names.
+fn derive_raw_mla_v2_segments(prog: &DevProg) -> Result<Vec<bool>> {
+    let n_seg = prog
+        .stream
+        .iter()
+        .map(|e| e.seg as usize + 1)
+        .max()
+        .unwrap_or(1);
+    let mut eligible = vec![prog.t >= 2048; n_seg];
+    let mut seen = vec![false; n_seg];
+    for e in &prog.stream {
+        let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
+            RuntimeError::Device(format!("stream entry references instruction {}", e.inst))
+        })?;
+        let dense_bf16 =
+            inst.op == DevOp::FlashMlaPrefill as u16 && inst.t[7] == packet::dev::TENSOR_NONE16;
+        eligible[e.seg as usize] &= dense_bf16;
+        seen[e.seg as usize] |= dense_bf16;
+    }
+    Ok(eligible
+        .into_iter()
+        .zip(seen)
+        .map(|(eligible, seen)| eligible && seen)
         .collect())
 }
 
@@ -4175,7 +4384,10 @@ fn packed_segment_route(
     mla_flash: bool,
     kda: bool,
 ) -> Result<PackedSegmentRoute> {
-    if !active || class == 0 || class == 8 {
+    if !active {
+        return Ok(PackedSegmentRoute::Primary);
+    }
+    if class == 0 || class == 8 {
         return Ok(PackedSegmentRoute::Primary);
     }
     let (available, route, name) = match class {
@@ -4285,15 +4497,16 @@ struct AmdProg {
     /// Ordered decode route for each segment. Raw KDA entries carry fully resolved rank-local
     /// kernargs, so the hot launch path performs no descriptor parsing or allocation.
     decode_routes: Vec<DecodeSegmentRoute>,
+    /// Optional raw gfx950 route for a pure MXFP4 grouped-MoE Down+Combine segment.
+    prefill_routes: Vec<PrefillSegmentRoute>,
     /// `[n_seg]` pure packed-consumer family: 5=MLA norm/cache, 6=MLA flash,
     /// 7=serial KDA, 0=not safely routable to a family object.
     packed_seg_family: Vec<u8>,
+    /// Pure dense bf16 MLA segments eligible for the dedicated gfx950 V2+SV object.
+    raw_mla_v2_segment: Vec<bool>,
     /// Global-queue tables; `None` when the blob carries no GQ appendix.
     gq: Option<AmdGq>,
-    /// L2-domain placement (`PLOW_L2_PLACE`): domains `gq_seg_ofs` is windowed by, 0 = not
-    /// placed. When non-zero the `seg` windows are L2 DOMAINS rather than wave classes, so the
-    /// program is dispatched in ONE launch with every domain draining concurrently — see
-    /// [`AmdEngine::run`].
+    /// L2-domain placement (`PLOW_L2_PLACE`): XCD queues per ordered segment, or 0.
     l2_domains: u32,
     /// Base counter id of the two-level maintenance scratch; 0 = off. See `DevProgram::hier_base`.
     hier_base: u32,
@@ -4394,6 +4607,7 @@ pub struct AmdEngine {
     k_prefill: HsaKernel,
     k_decode: HsaKernel,
     k_kda_decode_fused: Option<HsaKernel>,
+    k_moe_stage2_mxfp4: Option<(HsaKernel, HsaKernel)>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
     k_token_capture: Option<HsaKernel>,
@@ -4401,6 +4615,8 @@ pub struct AmdEngine {
     /// Task-13: low-rung decode tier ladder, ascending (max_rung, kernel).
     decode_tiers: Vec<(u32, HsaKernel)>,
     k_flash: Option<HsaKernel>,
+    /// Dedicated scratch-free gfx950 V2+SV interpreter for pure bf16 MLA-flash segments.
+    k_mla_v2_sv_raw: Option<HsaKernel>,
     k_packed_mla_norm: Option<HsaKernel>,
     k_packed_mla_flash: Option<HsaKernel>,
     k_packed_kda: Option<HsaKernel>,
@@ -4992,6 +5208,9 @@ impl AmdEngine {
                         .iter()
                         .any(|i| i.op == DevOp::FlashMlaPrefillFp8 as u16)
             });
+        let need_moe_stage2_lean = blob.progs[..dec_ix]
+            .iter()
+            .any(has_moe_stage2_mxfp4_segment);
 
         // --- code objects ---------------------------------------------------
         // Resolve the symbol immediately after each load: the HSA backend
@@ -5008,6 +5227,7 @@ impl AmdEngine {
         let mut k_xaudit = None;
         let mut k_state_clear = None;
         let mut k_token_capture = None;
+        let mut prefill_moe_align_bm64 = false;
         let state_clear_device = crate::config::RuntimeConfig::get().amd.state_clear_device;
         // Task-13 per-rung co-load: an optional SECOND decode object for the low
         // rungs (PLOW_HSACO_LOWRUNG=<dir>), so rung 1-2 traffic runs the tight
@@ -5077,6 +5297,9 @@ impl AmdEngine {
                     }
                 })?;
                 let syms = elf_symbol_names(&image);
+                if phase == Phase::Prefill {
+                    prefill_moe_align_bm64 = syms.contains(&"plow_moe_align_bm64_1");
+                }
                 check_gate_hier_object(&syms, &path, phase, sched)?;
                 let packed_prefill_abi = syms.contains(&PACKED_PREFILL_ABI_SYM);
                 if let (Phase::Prefill, Some(req)) = (phase, requires.as_ref()) {
@@ -5325,6 +5548,66 @@ impl AmdEngine {
         };
         drop(load_one_in);
 
+        let k_mla_v2_sv_raw = if arch == "gfx950" && variant != Variant::Fp8Kv && need_mla_v2 {
+            let name = format!("interp_mla_v2_sv{}.elf", sched_prefill.suffix());
+            let path = hsaco_dir.join(&name);
+            if !path.exists() {
+                tracing::info!(object = %path.display(),
+                    "no raw MLA V2+SV object — pure segments use the interpreter fallback");
+                None
+            } else {
+                let load = (|| -> Result<(Module, HsaKernel)> {
+                    let image = std::fs::read(&path).map_err(|e| {
+                        RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                    })?;
+                    let syms = elf_symbol_names(&image);
+                    check_mla_v2_sv_raw_symbols(&syms, &path, prefill_l2_placed)?;
+                    check_packet_pairing_stamp(&image, blob_path, &path)?;
+                    let module = EngineDevice::module_load(&*be, &image)?;
+                    let symbol = symbol_name(Phase::Flash, sched_prefill, &arch);
+                    let kernel =
+                        EngineDevice::get_function(&*be, &module, &symbol).map_err(|e| {
+                            RuntimeError::Device(format!("{name}: no symbol {symbol}: {e}"))
+                        })?;
+                    const IMPLICIT: u32 = 256;
+                    // The GQ twin contributes one 8-byte shared cursor after the 58,368-byte
+                    // flash arena; the static twin contains only the arena.
+                    const MAX_LDS: u32 = 58_376;
+                    let want = (std::mem::size_of::<DevProgram>() as u32 + 7) & !7;
+                    let got = kernel.kernarg_size();
+                    if got != want && got != want + IMPLICIT {
+                        return Err(RuntimeError::Device(format!(
+                            "{name}: kernarg segment is {got} B; raw MLA ABI needs {want} \
+                             (or {} with COv5 implicit args)",
+                            want + IMPLICIT
+                        )));
+                    }
+                    let lds = HsaBackend::kernel_lds_bytes(&kernel);
+                    if lds > MAX_LDS || kernel.private_segment_size() != 0 {
+                        return Err(RuntimeError::Device(format!(
+                            "{name}: raw MLA resource gate failed: LDS={lds} (max {MAX_LDS}), \
+                             private={} (required 0)",
+                            kernel.private_segment_size()
+                        )));
+                    }
+                    Ok((module, kernel))
+                })();
+                match load {
+                    Ok((module, kernel)) => {
+                        modules.push(module);
+                        Some(kernel)
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e,
+                            "raw MLA V2+SV object rejected — using the interpreter fallback");
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
         let mut packed_kda_ops: Vec<DevOp> = blob.progs[..dec_ix]
             .iter()
             .flat_map(|prog| &prog.insts)
@@ -5468,6 +5751,69 @@ impl AmdEngine {
             }
             modules.push(module);
             Some(kernel)
+        } else {
+            None
+        };
+
+        let k_moe_stage2_mxfp4 = if arch == "gfx950" && need_moe_stage2_lean {
+            const NAME: &str = "moe_stage2_mxfp4_gfx950.elf";
+            const SYMBOL: &str = "plow_moe2_mxfp4_16x16x128_gfx950";
+            const MARKERS: [&str; 4] = [
+                "plow_moe2_mxfp4_stage2_abi_1",
+                "plow_moe2_mxfp4_stage2_no_spill_1",
+                "plow_moe2_mxfp4_stage2_dynamic_lds_16640",
+                "plow_moe2_mxfp4_stage2_vgpr_le_144",
+            ];
+            let path = hsaco_dir.join(NAME);
+            if !path.exists() {
+                None
+            } else {
+                if !prefill_moe_align_bm64 {
+                    return Err(RuntimeError::Device(format!(
+                        "lean MoE object {} requires a prefill producer advertising plow_moe_align_bm64_1",
+                        path.display()
+                    )));
+                }
+                let image = std::fs::read(&path).map_err(|e| {
+                    RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                })?;
+                let syms = elf_symbol_names(&image);
+                for marker in MARKERS {
+                    if !syms.contains(&marker) {
+                        return Err(RuntimeError::Device(format!(
+                            "lean MoE object {} lacks required ABI/resource marker `{marker}`",
+                            path.display()
+                        )));
+                    }
+                }
+                let module = EngineDevice::module_load(&*be, &image)?;
+                let kernel = EngineDevice::get_function(&*be, &module, SYMBOL).map_err(|e| {
+                    RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}"))
+                })?;
+                let zero = EngineDevice::get_function(&*be, &module, "plow_moe2_zero_bf16")
+                    .map_err(|e| {
+                        RuntimeError::Device(format!(
+                            "{NAME}: no ordered-output-zero symbol plow_moe2_zero_bf16: {e}"
+                        ))
+                    })?;
+                let want = std::mem::size_of::<MoeStage2Mxfp4Args>() as u32;
+                let got = kernel.kernarg_size();
+                if got != want && got != want + 256 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: kernarg segment is {got} B; lean MoE ABI needs {want} (or {} with COv5 implicit args)",
+                        want + 256
+                    )));
+                }
+                if zero.kernarg_size() != 16 && zero.kernarg_size() != 272 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: zero helper kernarg segment is {} B; expected 16 (or 272 with COv5 implicit args)",
+                        zero.kernarg_size()
+                    )));
+                }
+                EngineDevice::set_max_dynamic_smem(&*be, kernel, 16_640)?;
+                modules.push(module);
+                Some((kernel, zero))
+            }
         } else {
             None
         };
@@ -5989,7 +6335,13 @@ impl AmdEngine {
             } else {
                 vec![DecodeSegmentRoute::Interpreter; seg_class.len()]
             };
+            let prefill_routes = if prog_ix < dec_ix {
+                moe_stage2_mxfp4_routes(p, &devp)?
+            } else {
+                vec![PrefillSegmentRoute::Interpreter; seg_class.len()]
+            };
             let packed_seg_family = derive_packed_segment_families(p)?;
+            let raw_mla_v2_segment = derive_raw_mla_v2_segments(p)?;
             let packed_mla_segmented = packed_family_segments_cover(p, &packed_seg_family, &[5, 6]);
             let packed_kda_segmented = packed_family_segments_cover(p, &packed_seg_family, &[7]);
             let up = |bytes: &[u8]| -> Result<DeviceMem> {
@@ -6099,6 +6451,7 @@ impl AmdEngine {
                 packed_kda_compatible: packed_kda_compatible(p),
                 packed_kda_segmented,
                 decode_routes,
+                prefill_routes,
                 n_inst: p.insts.len() as u32,
                 trace_records: p.stream.len(),
                 n_counter: p.n_counter,
@@ -6112,6 +6465,7 @@ impl AmdEngine {
                 d_seg_ofs,
                 seg_class,
                 packed_seg_family,
+                raw_mla_v2_segment,
                 gq,
                 l2_domains: p.l2_domains,
                 // DERIVED, not carried in the blob. The emitter appends the two-level
@@ -6473,12 +6827,14 @@ impl AmdEngine {
             k_prefill,
             k_decode,
             k_kda_decode_fused,
+            k_moe_stage2_mxfp4,
             k_xaudit,
             k_state_clear,
             k_token_capture,
             d_token_ring,
             decode_tiers,
             k_flash,
+            k_mla_v2_sv_raw,
             k_packed_mla_norm,
             k_packed_mla_flash,
             k_packed_kda,
@@ -6620,10 +6976,10 @@ impl AmdEngine {
             )));
         }
         check_packed_prefill_abi(self.packed_prefill_prefill_abi, false, false)?;
-        if program.l2_domains != 0 {
+        if matches!(self.prog_dispatch(prog), ProgramDispatch::L2Domains(_)) {
             return Err(RuntimeError::Device(
-                "packed-prefill family routing requires wave-class segments; this packet uses \
-                 L2-domain placement in the same field"
+                "packed-prefill family routing requires independent ordered segments; this legacy \
+                 packet stores L2 domains in the segment field"
                     .into(),
             ));
         }
@@ -6930,14 +7286,59 @@ impl AmdEngine {
     /// The building block of both the single-GPU segmented run and the TP
     /// per-segment rendezvous. Each launch memcpy's its own kernarg slot, so
     /// mutating `cur_seg` between launches is safe — every packet has already
-    /// captured its own copy. For an L2-placed program the caller invokes this
-    /// exactly once with `seg == 0`; the device ignores `cur_seg` and drains all
-    /// domain windows concurrently.
+    /// captured its own copy. An L2-placed program launches each ordered host
+    /// segment once; all per-XCD queues for that segment drain concurrently.
     pub fn enqueue_segment(&mut self, p: usize, seg: usize) -> Result<()> {
         check_packed_prefill_dispatch(self.packed_prefill, p)?;
         self.trace_write_bytes
             .set(self.progs[p].trace_records * TRACE_REC_BYTES);
+        if !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
+            let arg = self.kernarg(p, seg as u32);
+            EngineDevice::launch_cooperative(
+                &*self.be,
+                self.k_prefill,
+                self.n_cu,
+                WG_THREADS_8,
+                0,
+                kernarg_bytes(&arg),
+                None,
+            )?;
+            self.seg_launches += 1;
+            return Ok(());
+        }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
+        if !active {
+            if let (Some((kernel, zero)), Some(PrefillSegmentRoute::MoeStage2Mxfp4(args))) = (
+                self.k_moe_stage2_mxfp4,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                let elements = args.tokens as u64 * args.model_dim as u64;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    zero,
+                    u32::try_from(elements.div_ceil(256)).map_err(|_| {
+                        RuntimeError::Device("lean MoE output extent exceeds launch grid".into())
+                    })?,
+                    256,
+                    0,
+                    as_bytes(&[args.out, elements]),
+                    None,
+                )?;
+                let n_tiles = args.model_dim.div_ceil(256).max(1);
+                let grid = n_tiles * self.n_cu.div_ceil(n_tiles);
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    256,
+                    16_640,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 2;
+                return Ok(());
+            }
+        }
         let family = self.progs[p].packed_seg_family[seg];
         let route = packed_segment_route(
             active,
@@ -6951,10 +7352,16 @@ impl AmdEngine {
             PackedSegmentRoute::MlaFlash => (self.k_packed_mla_flash.unwrap(), WG_THREADS_4),
             PackedSegmentRoute::Kda => (self.k_packed_kda.unwrap(), WG_THREADS_8),
             PackedSegmentRoute::Primary => {
-                let use4 = self.k_flash.is_some() && self.progs[p].seg_class[seg] == 4;
-                match (use4, self.k_flash) {
-                    (true, Some(kf)) => (kf, WG_THREADS_4),
-                    _ => (self.k_prefill, WG_THREADS_8),
+                let raw_mla =
+                    self.progs[p].raw_mla_v2_segment[seg] && self.k_mla_v2_sv_raw.is_some();
+                if let (true, Some(k)) = (raw_mla, self.k_mla_v2_sv_raw) {
+                    (k, WG_THREADS_4)
+                } else {
+                    let use4 = self.k_flash.is_some() && self.progs[p].seg_class[seg] == 4;
+                    match (use4, self.k_flash) {
+                        (true, Some(kf)) => (kf, WG_THREADS_4),
+                        _ => (self.k_prefill, WG_THREADS_8),
+                    }
                 }
             }
         };
@@ -6973,8 +7380,8 @@ impl AmdEngine {
     }
 
     /// Number of ordered launches in a decode program. A fused boundary is one raw launch;
-    /// every other wave segment is one interpreter launch. L2-domain windows are drained
-    /// concurrently by one interpreter launch and must never be treated as host segments.
+    /// every other wave segment is one interpreter launch. Per-XCD queues drain concurrently
+    /// within each ordered interpreter launch.
     pub(crate) fn decode_launches(&self, p: usize) -> usize {
         self.prog_dispatch(p).launches()
     }
@@ -7182,26 +7589,9 @@ impl AmdEngine {
     /// [`crate::exec::amd_tp::AmdTpGroup::prefill`]. This method stays as it is
     /// because on ONE GPU there is no peer to desync from.
     ///
-    /// # Never valid on an L2-PLACED program
-    ///
-    /// Placement makes `seg` an L2 DOMAIN, so `seg_class` is 8 domains that all read as
-    /// wave-class 8 and this loop would issue 8 launches over windows that are meant to run
-    /// CONCURRENTLY — the opposite of the point. It would still produce correct tokens (the
-    /// first launch drains every domain and the other 7 find their cursors past `hi` and exit),
-    /// which is exactly why it has to be refused rather than left to be noticed: a silent 8x
-    /// launch overhead on a change whose whole purpose is latency. Placed programs go through
-    /// [`AmdEngine::run`], which is already single-launch.
     pub fn run_segmented(&mut self, p: usize) -> Result<()> {
-        if self.progs[p].l2_domains != 0 {
-            return Err(RuntimeError::Device(format!(
-                "program {p} is L2-domain placed ({} domains): its `seg` windows are L2 domains \
-                 meant to drain concurrently in ONE launch, not wave-class segments to relaunch \
-                 over. Use `run` (the single-launch path).",
-                self.progs[p].l2_domains
-            )));
-        }
         self.rearm(p)?;
-        let n_seg = self.progs[p].seg_class.len();
+        let n_seg = self.prog_dispatch(p).launches();
         let t0 = std::time::Instant::now();
         for seg in 0..n_seg {
             self.enqueue_segment(p, seg)?;
@@ -8574,11 +8964,14 @@ impl AmdEngine {
         self.progs[p].seg_class.len()
     }
 
-    /// Whether `seg` denotes concurrently-drained L2 domains or sequential
-    /// wave-class launches for program `p`.
+    /// Ordered host launches and their device-side XCD queue layout.
     pub(crate) fn prog_dispatch(&self, p: usize) -> ProgramDispatch {
         let g = &self.progs[p];
-        ProgramDispatch::classify(g.l2_domains, g.seg_class.len())
+        ProgramDispatch::classify(
+            g.l2_domains,
+            g.seg_class.len(),
+            g.gq.as_ref().map_or(0, |q| q.n_seg as usize),
+        )
     }
 
     pub fn schedulers(&self) -> (Sched, Sched) {
@@ -8905,6 +9298,26 @@ mod tests {
         assert!(validate_decode_dispatch(&[placed], 0).is_ok());
     }
 
+    #[test]
+    fn legacy_l2_prefill_forces_primary_interpreter() {
+        let legacy = ProgramDispatch::classify(8, 8, 8);
+        assert_eq!(legacy, ProgramDispatch::L2Domains(8));
+        assert!(!prefill_segment_specialization_allowed(legacy));
+
+        let current = ProgramDispatch::classify(8, 3, 24);
+        assert_eq!(
+            current,
+            ProgramDispatch::L2Segments {
+                domains: 8,
+                segments: 3,
+            }
+        );
+        assert!(prefill_segment_specialization_allowed(current));
+        assert!(prefill_segment_specialization_allowed(
+            ProgramDispatch::WaveSegments(3)
+        ));
+    }
+
     fn overlap_range(name: &str, start: u64, end: u64) -> AmdOwnedRange {
         AmdOwnedRange {
             name: name.into(),
@@ -9221,6 +9634,39 @@ mod tests {
     }
 
     #[test]
+    fn lean_moe_stage2_route_requires_the_exact_pure_boundary() {
+        let mut prog = segmented_prog(
+            &[DevOp::MoeGroupDownPf, DevOp::MoeCombinePf, DevOp::RmsNorm],
+            &[0, 0, 1],
+        );
+        let (down, rest) = prog.insts.split_at_mut(1);
+        let (d, c) = (&mut down[0], &mut rest[0]);
+        d.t = [0, 1, 2, 3, 4, 5, 6, 7];
+        d.i = [3584, 384, 896, MOE_ENC_MXFP4, 0, 0, 0, 0];
+        c.t[0] = 0;
+        c.t[1] = packet::dev::TENSOR_NONE16;
+        c.t[2] = packet::dev::TENSOR_NONE16;
+        c.t[3] = d.t[0];
+        c.i = [3584, 16, 1024, 0, 0, 0, 0, 0];
+        let devp: Vec<_> = (0..8)
+            .map(|i| DeviceMem::view(0x1000 + i * 0x100, 0x100))
+            .collect();
+        let routes = moe_stage2_mxfp4_routes(&prog, &devp).unwrap();
+        let PrefillSegmentRoute::MoeStage2Mxfp4(args) = routes[0] else {
+            panic!("pure supported pair must route to the lean object")
+        };
+        assert_eq!(
+            (args.tokens, args.model_dim, args.inter_dim),
+            (1024, 3584, 384)
+        );
+        assert!(matches!(routes[1], PrefillSegmentRoute::Interpreter));
+
+        prog.stream[2].seg = 0;
+        let fallback = moe_stage2_mxfp4_routes(&prog, &devp).unwrap();
+        assert!(matches!(fallback[0], PrefillSegmentRoute::Interpreter));
+    }
+
+    #[test]
     fn decode_dispatch_rejects_multiple_wave_launches() {
         let one = segmented_prog(&[DevOp::Gemv], &[0]);
         assert!(validate_decode_dispatch(std::slice::from_ref(&one), 0).is_ok());
@@ -9243,6 +9689,54 @@ mod tests {
 
         let mixed = segmented_prog(&[DevOp::FlashMlaPrefillFp8, DevOp::Gemv], &[0, 0]);
         assert_eq!(derive_segments_for(&mixed, true).unwrap(), [8]);
+    }
+
+    #[test]
+    fn raw_mla_v2_object_requires_exact_capabilities() {
+        let object = Path::new("interp_mla_v2_sv_gq.elf");
+        let exact = [MLA_PF_V2_SYM, MLA_PF_V2_SV_RAW_SYM, L2_DISPATCH_SYM];
+        assert!(check_mla_v2_sv_raw_symbols(&exact, object, true).is_ok());
+
+        for bad in [
+            vec![MLA_PF_V2_SYM, L2_DISPATCH_SYM],
+            vec![MLA_PF_V2_SYM, MLA_PF_V2_SV_RAW_SYM],
+            vec![
+                MLA_PF_V2_SYM,
+                MLA_PF_V2_SV_RAW_SYM,
+                L2_DISPATCH_SYM,
+                MLA_PF_V2_FP8_SYM,
+            ],
+            vec![
+                MLA_PF_V2_SYM,
+                MLA_PF_V2_SV_RAW_SYM,
+                L2_DISPATCH_SYM,
+                PACKED_PREFILL_MLA_FLASH_SEG_SYM,
+            ],
+        ] {
+            assert!(check_mla_v2_sv_raw_symbols(&bad, object, true).is_err());
+        }
+    }
+
+    #[test]
+    fn raw_mla_v2_route_is_dense_bf16_pure_and_machine_filling() {
+        let mut pure = segmented_prog(&[DevOp::FlashMlaPrefill], &[0]);
+        pure.insts[0].t[7] = packet::dev::TENSOR_NONE16;
+        assert_eq!(derive_raw_mla_v2_segments(&pure).unwrap(), [true]);
+
+        let mut gathered = segmented_prog(&[DevOp::FlashMlaPrefill], &[0]);
+        gathered.insts[0].t[7] = 7;
+        assert_eq!(derive_raw_mla_v2_segments(&gathered).unwrap(), [false]);
+
+        let mut fp8 = segmented_prog(&[DevOp::FlashMlaPrefillFp8], &[0]);
+        fp8.insts[0].t[7] = packet::dev::TENSOR_NONE16;
+        assert_eq!(derive_raw_mla_v2_segments(&fp8).unwrap(), [false]);
+
+        let mut mixed = segmented_prog(&[DevOp::FlashMlaPrefill, DevOp::Gemv], &[0, 0]);
+        mixed.insts[0].t[7] = packet::dev::TENSOR_NONE16;
+        assert_eq!(derive_raw_mla_v2_segments(&mixed).unwrap(), [false]);
+
+        pure.t = 1024;
+        assert_eq!(derive_raw_mla_v2_segments(&pure).unwrap(), [false]);
     }
 
     #[test]

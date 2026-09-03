@@ -82,10 +82,8 @@ pub fn run(root: &Path, c: &Campaign, isa: hwspec::IsaLevel, cell: &str) -> Resu
     // here, rather than at each use.
     let root =
         &std::fs::canonicalize(root).map_err(|e| format!("--root {}: {e}", root.display()))?;
-    // The digest first, in every subcommand, because digest churn is the dominant operational
-    // fact: any edit to `runtime/amd/*.hip|h` or `runtime/common/dev_isa.h` moves the
-    // preprocessed build digest and re-stales EVERY record. `probe_digest` exists so tooling can
-    // ASK rather than guess; this is that call.
+    // Print the measured-family digest first. Relevant GEMM or toolchain changes stale it;
+    // unrelated persistent-interpreter arms do not.
     let want = super::ingest::digests(root, isa)?;
     println!("build digest: {}", want.interpreter);
     println!("toolchain   : {}", want.toolchain);

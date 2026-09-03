@@ -1525,7 +1525,7 @@ mod tests {
     fn l2_domains_are_one_tp_launch_not_wave_segments() {
         use crate::exec::amd::ProgramDispatch;
 
-        let placed = ProgramDispatch::classify(8, 8);
+        let placed = ProgramDispatch::classify(8, 8, 8);
         assert_eq!(placed, ProgramDispatch::L2Domains(8));
         assert_eq!(placed.launches(), 1);
         assert_eq!(
@@ -1533,11 +1533,21 @@ mod tests {
             (0..8).map(|rank| (0, rank)).collect::<Vec<_>>()
         );
 
-        let segmented = ProgramDispatch::classify(0, 3);
+        let xcd_segmented = ProgramDispatch::classify(8, 3, 24);
+        assert_eq!(
+            xcd_segmented,
+            ProgramDispatch::L2Segments {
+                domains: 8,
+                segments: 3
+            }
+        );
+        assert_eq!(xcd_segmented.launches(), 3);
+
+        let segmented = ProgramDispatch::classify(0, 3, 3);
         assert_eq!(segmented, ProgramDispatch::WaveSegments(3));
         assert_eq!(segmented.launches(), 3);
 
-        let ordinary = ProgramDispatch::classify(0, 1);
+        let ordinary = ProgramDispatch::classify(0, 1, 1);
         assert_eq!(ordinary, ProgramDispatch::WaveSegments(1));
         assert_eq!(ordinary.launches(), 1);
     }

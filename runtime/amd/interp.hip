@@ -116,6 +116,10 @@
 #include "op_moe.h"
 #include "op_norm.h"
 
+#if MPF_BM == 64
+extern "C" __device__ unsigned plow_moe_align_bm64_1 = 1;
+#endif
+
 /* This proves only that the object was compiled against the packed-prefill PlowProgram tail.
  * Descriptor-consuming math arms are a separate capability and are not enabled by this marker. */
 #if PLOW_PACKET_HASH != 0ull
@@ -406,11 +410,20 @@ extern "C" __device__ unsigned plow_mla_pf_v2_arm_1 = 1;
 #if PLOW_FP8_KV
 extern "C" __device__ unsigned plow_mla_pf_v2_fp8_arm_1 = 1;
 #endif
+
+#if defined(PLOW_BUCKET_MLA_V2_RAW)
+#if !PLOW_MLA_PF_V2_ARM || !PLOW_MLA_PF_SV || PLOW_FP8_KV || \
+    PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
+#error "raw MLA V2 object requires bf16 V2+SV and cannot carry packed-prefill consumers"
+#endif
+/* Host routing requires this exact marker. `plow_mla_pf_v2_arm_1` alone is also
+ * present in the packed and general flash objects and is therefore insufficient. */
+extern "C" __device__ unsigned plow_mla_pf_v2_sv_raw_1 = 1;
+#endif
 #endif
 /* Same contract as the arms markers above, for L2-DOMAIN DISPATCH. A blob compiled with
- * PLOW_L2_PLACE repurposes the global-queue `seg` as an L2 domain rather than a wave class, so an
- * object built WITHOUT this axis would mis-dispatch it silently -- correct-looking packets on the
- * wrong domains. The runtime used to guard that with an env var the operator ASSERTED
+ * PLOW_L2_PLACE carries per-XCD queue windows, so an object built WITHOUT this axis would
+ * mis-dispatch it silently. The runtime used to guard that with an env var the operator ASSERTED
  * (PLOW_L2_PLACE_DISPATCH=1); this symbol lets it CHECK instead. Exists iff the axis is on. */
 #if PLOW_L2_PLACE_DISPATCH
 extern "C" __device__ unsigned plow_l2_place_dispatch_1 = 1;
@@ -619,7 +632,11 @@ extern "C" __device__ unsigned plow_dsa_idx_row_arm = 1;
  * GEMM ops (M exceeds PLOW_GEMV_MAXM), and those would address an arena sized for the GEMV.
  * Guarded on PLOW_GEMV_MM below; a packet that violates it needs the same marker-symbol refusal
  * `check_moe_gemma_arms` uses. */
-#if PLOW_BUCKET_DECODE && defined(PLOW_DEC_ARENA_HALVES)
+#if defined(PLOW_BUCKET_MLA_V2_RAW)
+/* The raw MLA object dispatches no GEMM. Keeping the production GEMM tile in its union
+ * wastes 89 KiB of LDS and obscures the object's actual V2 resource contract. */
+#define PLOW_GM_ARENA 1
+#elif PLOW_BUCKET_DECODE && defined(PLOW_DEC_ARENA_HALVES)
 #if PLOW_GEMV_MM > 16
 #error "PLOW_DEC_ARENA_HALVES is unsafe at PLOW_GEMV_MM > 16: batched decode dispatches GEMM"
 #endif
@@ -1902,10 +1919,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
      * emits FLASH_PREFILL_FP8 and never the bf16 twin, and carrying both would spend the
      * 512-register budget this object exists to give flash. Without this the fp8-KV path had no
      * class-4 object at all and its hd512 flash had to run on the 8-wave interpreter. */
+#if !defined(PLOW_BUCKET_MLA_V2_RAW)
 #if PLOW_FP8_KV
     if (in->op == PLOW_DOP_FLASH_PREFILL_FP8) exec_flash_prefill_fp8(in, T, slice, nblk, sm->fa);
 #else
     if (in->op == PLOW_DOP_FLASH_PREFILL) exec_flash_prefill(in, T, slice, nblk, sm->fa);
+#endif
 #endif
 #if PLOW_MLA_PF_V2_ARM
     /* V2 MLA prefill: the full-column-wave layout this 4-wave/512-reg object exists to
@@ -1915,6 +1934,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
     static_assert(PLOW_WAVES == 4, "the V2 MLA prefill arm is shaped for the 4-wave object");
     static_assert(FA_MLA_PF2_LDS_BYTES(512, 64) <= (int)sizeof(((plow_smem*)nullptr)->fa),
                   "V2 MLA prefill LDS exceeds the flash arena");
+#if !defined(PLOW_BUCKET_MLA_V2_RAW)
     if (in->op == PLOW_DOP_FLASH_MLA_PREFILL_FP8) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
 #if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
@@ -1930,8 +1950,13 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             sm->fa, nullptr, 0u, 1u, false, (const float*)TEN(7), in->i[6]);
 #undef TEN
     }
+#endif
 #if !PLOW_FP8_KV
+#if defined(PLOW_BUCKET_MLA_V2_RAW)
+    if (in->op == PLOW_DOP_FLASH_MLA_PREFILL) {
+#else
     else if (in->op == PLOW_DOP_FLASH_MLA_PREFILL) {
+#endif
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
 #if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
         if (plow_packed_prefill_enabled(prog_meta)) {
@@ -3575,12 +3600,11 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
  * AND on every successor signal — twice per packet, 324,940 workgroup-packets on a K3 token — and
  * it MEASURED 0.43 ms (l2hier 27.849 -> 28.271, ~1.3 ns/workgroup-packet, ~8 sd). The XCD a
  * workgroup runs on cannot change while it is resident, so it is read once. */
-__device__ __forceinline__ bool ctr_maint_leader_init(void) {
+__device__ __forceinline__ bool ctr_maint_leader_init(unsigned xcc) {
 #if PLOW_GATE_HIER_CEIL
-    const unsigned xcc =
-        __builtin_amdgcn_s_getreg((20 /*HW_REG_XCC_ID*/) | (0 << 6) | ((32 - 1) << 11)) & 0xf;
     return blockIdx.x == xcc;
 #else
+    (void)xcc;
     return true;
 #endif
 }
@@ -3767,11 +3791,13 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
      * leaving it unconditional put one extra instruction into every object, including gfx950's,
      * and cost the byte-identity that makes "this change did not touch CDNA4" checkable rather
      * than merely asserted. */
-#if PLOW_GATE_HIER
+#if PLOW_GATE_HIER || PLOW_GATE_HIER_CEIL || defined(PLOW_L2_PLACE_DISPATCH)
     const unsigned plow_xcd =
         __builtin_amdgcn_s_getreg((20 /*HW_REG_XCC_ID*/) | (0 << 6) | ((32 - 1) << 11)) & 0xf;
+#else
+    const unsigned plow_xcd = 0u;
 #endif
-    const bool maint_leader = ctr_maint_leader_init();
+    const bool maint_leader = ctr_maint_leader_init(plow_xcd);
 #if PLOW_GLOBAL_QUEUE
     /* One shared cursor over the op-major gq_stream, bounded to this segment's window. base==0
      * because gq_stream is already the global array (no per-CU offset); the trace slot is base+ix. */
@@ -3780,11 +3806,10 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
      * launches without a host wait and zeroes state ONCE before the loop, so each segment needs its
      * OWN cursor rather than a shared one reset between launches — same lifecycle as the counters. */
 #ifdef PLOW_L2_PLACE_DISPATCH
-    /* L2-DOMAIN DISPATCH (PLOW_L2_PLACE). The window this workgroup serves is NOT a host
-     * kernarg — it is the L2 domain this workgroup is PHYSICALLY running on. All 8 domains
-     * therefore drain concurrently inside ONE launch, each pulling only its own domain's packets,
+    /* L2-DOMAIN DISPATCH (PLOW_L2_PLACE). Every ordered kernel-family segment has one window per
+     * physical L2 domain. All 8 domains drain concurrently inside each launch,
      * so a consumer reads its producer out of the same XCD's 4 MiB L2 instead of crossing the
-     * fabric. `gq_seg_ofs` has one window per domain (the compiler sorted `gq_stream` by domain).
+     * fabric. The compiler sorts `gq_stream` by (ordered segment, domain).
      *
      * READ FROM HW_REG_XCC_ID, NOT COMPUTED FROM blockIdx.x, and the difference matters.
      * `blockIdx.x % n` is what the COMPILER uses to decide which slice lands in which window —
@@ -3798,12 +3823,14 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
      * round-robin, reproducible), so no domain is left with nobody to drain it. Since the
      * compiler's `n % 8` is uniform too, the windows are equal-sized and the two agree.
      *
-     * The modulo guards a partitioned (CPX/NPS) mode where the reported XCC id could exceed the
-     * domain count the packet was built for: correctness first, locality degrades gracefully.
-     * l2_domains == 0 means the program is not placed — fall back to the host's `cur_seg`. */
-    const unsigned plow_xcc =
-        __builtin_amdgcn_s_getreg((20 /*HW_REG_XCC_ID*/) | (0 << 6) | ((32 - 1) << 11)) & 0xf;
-    const unsigned my_seg = prog.l2_domains ? (plow_xcc % prog.l2_domains) : prog.cur_seg;
+     * Do not modulo the hardware id: that would alias distinct physical L2s into one rendezvous
+     * and invalidate the hierarchy's same-L2 proof. The gfx950 bring-up gate verifies all 256
+     * cooperative workgroups report exactly ids 0..7 on every served GPU; object/target pairing
+     * rejects this path on a different architecture. l2_domains == 0 means unplaced. */
+    if (prog.l2_domains && plow_xcd >= prog.l2_domains) __builtin_trap();
+    const unsigned my_seg = prog.l2_domains
+        ? prog.cur_seg * prog.l2_domains + plow_xcd
+        : prog.cur_seg;
 #else
     const unsigned my_seg = prog.cur_seg;
 #endif
@@ -3828,22 +3855,9 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
      * original scan-and-filter loop, so a host that does not build the table is unaffected. */
     const uint32_t* const srow =
         prog.seg_ofs ? prog.seg_ofs + (size_t)cu * (size_t)(prog.n_seg + 1u) : nullptr;
-    /* L2-PLACED program on the STATIC path: `seg` is the L2 DOMAIN (see the GQ branch above),
-     * and every entry in THIS CU's stream carries domain_of(cu) — the emitter's fixed
-     * slice->CU assignment already IS the placement. Selecting the window with the host's
-     * `cur_seg` (a wave-class notion, 0 for decode) empties the stream of every CU whose
-     * domain != 0, their slices never run, and every other CU spins on their counters: the
-     * PLOW_STATIC_DECODE=1-on-placed-blob DEADLOCK. The window must be the CU's own domain.
-     * LOGICAL cu, not HW_REG_XCC_ID: the assignment was fixed at emit time from the logical
-     * index, so the filter must match what the emitter wrote (locality then rides the same
-     * measured round-robin map the emitter assumed). */
-    const unsigned st_seg =
-#if PLOW_L2_PLACE_DISPATCH
-        /* Behind the axis so an object built without it (gfx950) keeps byte-identical
-         * codegen — the host refuses placed blobs on those objects anyway. */
-        prog.l2_domains ? (cu % prog.l2_domains) :
-#endif
-        prog.cur_seg;
+    /* Static streams retain the ordered kernel-family segment too. Their fixed per-CU
+     * assignment already preserves locality; no domain-indexed relaunch is needed. */
+    const unsigned st_seg = prog.cur_seg;
     const unsigned lo = srow ? srow[st_seg] : 0u;
     const unsigned hi = srow ? srow[st_seg + 1u] : n;
 #endif
@@ -3942,10 +3956,13 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
          * excluded: their counters are system-scope and per-XCD leadership says nothing about a
          * fabric peer. */
         const unsigned h_n = PLOW_SE_NPER(e.flags);
-        const bool h_on = (prog.hier_base != 0u) && (h_n > 1u) && !xctr;
+        /* Fine slices may carry different wait/successor lists. Even if a malformed or old
+         * emitter leaves NPER set, one elected slice cannot poll or signal on their behalf. */
+        const bool h_on = (prog.hier_base != 0u) && (h_n > 1u)
+                          && !(e.flags & PLOW_SE_FINE) && !xctr;
         const size_t h_b = h_on ? (size_t)prog.hier_base
                                       + ((size_t)e.inst * prog.l2_domains
-                                         + (plow_xcd % prog.l2_domains)) * 3u
+                                         + plow_xcd) * 3u
                                 : 0u;
         __shared__ unsigned h_lead;
         if (h_on) {
@@ -4036,11 +4053,14 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
         if (h_on) {
             if (threadIdx.x == 0) {
                 if (h_lead) {
-                    /* ONE buffer_inv sc1 for the whole XCD, then release the followers. The
-                     * RELEASE on the bump is what orders the invalidate before they observe it. */
+                    /* ONE buffer_inv sc1 for the whole XCD, then open its local flag. The
+                     * acquire keeps the relaxed bump below the invalidate; followers poll that
+                     * same L2 and put an L1 invalidate below the poll with a memory clobber.
+                     * A release bump would add the partition writeback this rendezvous exists
+                     * to avoid. */
                     if (wait_len) ctr_acquire();
                     __hip_atomic_fetch_add(PLOW_CTR(prog.counters, h_b + 2u), 1u,
-                                           __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+                                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
                 } else {
                     while (ctr_poll(PLOW_CTR(prog.counters, h_b + 2u)) < 1u)
                         __builtin_amdgcn_s_sleep(8);

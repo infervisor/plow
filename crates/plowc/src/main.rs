@@ -770,7 +770,8 @@ fn devblob_verify_hook(
                 let (so, sl) = (e.succ_ofs as usize, e.succ_len as usize);
                 succs.push(p.succs[so..so + sl].iter().map(|&c| c as u64).collect());
             }
-            // ONE CURSOR, OR ONE PER DOMAIN — the verifier has to be told which.
+            // ONE CURSOR, OR ONE PER (ORDERED SEGMENT, DOMAIN) — the verifier has to be told
+            // which. These are device-side queues; the host only launches the ordered segment.
             //
             // Unplaced, the GQ is a single global cursor, so entry `i`'s issue predecessor is
             // entry `i-1` and `resource = 0 / stream_idx = i` is exactly right.
@@ -785,19 +786,28 @@ fn devblob_verify_hook(
             // "ordering graph has a cycle (160499 nodes unsorted)", where placement OFF on the
             // identical program certifies clean.)
             //
-            // With `resource = seg` the check gets sharper, not weaker: it now actually proves
-            // the per-window claim §3 only argued informally — each window is internally
-            // op-major, so 8 concurrent cursors cannot deadlock.
+            // With `resource = segment*domains+domain` the check gets sharper, not weaker: each
+            // per-XCD queue is internally op-major, while independent XCDs make progress
+            // concurrently and may have counter edges in either flattened-array direction.
             let placed = p.l2_domains > 0;
             let (resource, stream_idx): (Vec<u64>, Vec<u64>) = if placed {
                 let mut res = Vec::with_capacity(n);
                 let mut idx = Vec::with_capacity(n);
-                let mut next = vec![0u64; p.l2_domains as usize + 1];
+                let windows = p.gq_seg_ofs.len().saturating_sub(1).max(1);
+                let mut next = vec![0u64; windows];
                 for e in &p.gq_stream {
-                    let d = (e.seg as usize).min(p.l2_domains as usize);
-                    res.push(d as u64);
-                    idx.push(next[d]);
-                    next[d] += 1;
+                    let d = ((e.flags & packet::dev::SE_DOMAIN_MASK)
+                        >> packet::dev::SE_DOMAIN_SHIFT) as usize;
+                    let window = e.seg as usize * p.l2_domains as usize + d;
+                    if window >= windows {
+                        return Err(format!(
+                            "program {pi} (T={}): stream entry selects XCD queue {window} of {windows}",
+                            m.prog_t.get(pi).copied().unwrap_or(0)
+                        ));
+                    }
+                    res.push(window as u64);
+                    idx.push(next[window]);
+                    next[window] += 1;
                 }
                 (res, idx)
             } else {
@@ -1174,19 +1184,15 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     // live so in-flight scripts and recipes do not break.
     let l2_on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
     let l2_off = |k: &str| std::env::var(k).ok().as_deref() == Some("0");
-    // DEFAULT ON FOR gfx942. Per-XCD queues are the shipped MI300X decode path, not a tuning
+    // DEFAULT ON FOR gfx942/gfx950. Per-XCD queues are the shipped CDNA decode/prefill path,
     // knob: windowing the global queue by L2 domain drains EIGHT queues concurrently instead of
     // one, and it is what makes the two-level gate (PLOW_GATE_HIER) expressible. MEASURED on
     // MI300X, Gemma-4-12B fp8 decode: placement -1.5%, hierarchy -16.0% on top -- the largest
     // win on that arch by a wide margin. Opt out with PLOW_L2_PLACE=0.
     //
-    // SCOPED TO gfx942 DELIBERATELY. A placed blob REQUIRES objects built with
-    // -DPLOW_L2_PLACE_DISPATCH (plowrt refuses the mismatch rather than mis-dispatching), and
-    // scripts/build_gfx942.sh now passes that by default while build_gfx950.sh does NOT. Turning
-    // this on for all AMD would therefore break every gfx950 asset pipeline until its objects
-    // were rebuilt -- and the gfx950 numbers have not been measured here. gfx950 keeps the
-    // explicit opt-in it has always had.
-    let l2_default = cli.arch == "gfx942" && !l2_off("PLOW_L2_PLACE");
+    // Both shipping AMD object recipes carry the checked dispatch marker. Other architectures
+    // remain explicit opt-in until their physical-domain mapping is measured.
+    let l2_default = matches!(cli.arch.as_str(), "gfx942" | "gfx950") && !l2_off("PLOW_L2_PLACE");
     let l2_layout = if l2_default || l2_on("PLOW_L2_PLACE") || l2_on("PLOW_NV_PLACE") {
         hwspec::registry::lookup(&cli.gpu)
             .and_then(|s| s.l2_partitioning.as_ref())

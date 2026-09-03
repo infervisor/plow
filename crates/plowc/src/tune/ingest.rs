@@ -19,13 +19,10 @@
 //!
 //! # Why the digests cannot come from the sweep
 //!
-//! A measurement is only valid for the object it ran inside. `kernelcaps` derives that object's
-//! identity by preprocessing `interp.hip` and hashing the result, so an edit to `op_gemm.h` — a
-//! tile constant, say — changes it and every prior record becomes stale rather than silently
-//! authoritative. The C harness cannot compute that, and should not: it would mean two
-//! implementations of the identity rule. Digest churn is the dominant operational fact here (23
-//! commits touching `runtime/amd/*` in one day produced seven distinct digests), which is why
-//! every subcommand prints the digest it probed.
+//! A measurement is only valid for the dense-GEMM family it ran. `kernelcaps` derives that
+//! identity from the preprocessed GEMM bodies and their expanded dependencies across bf16, fp8,
+//! and mxfp4. Unrelated interpreter arms are excluded because the sweep launches standalone
+//! kernels; changes to any measured GEMM body still stale the whole conservative family key.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -74,10 +71,14 @@ fn probe_inventory(
             "cannot probe the {arch} interpreter ({e}); ingest needs it to key records to a build"
         )
     })?;
+    let build = kernelcaps::dense_gemm_tuning_build(root, isa).map_err(|e| {
+        let arch = isa.arch_flag();
+        format!("cannot fingerprint the {arch} dense-GEMM family ({e})")
+    })?;
     let want = Digests {
-        implementation: inv.build().label(),
-        interpreter: inv.build().label(),
-        toolchain: inv.build().toolchain.clone(),
+        implementation: build.label(),
+        interpreter: build.label(),
+        toolchain: build.toolchain.clone(),
         oracle: GEMM_ORACLE.to_string(),
     };
     Ok((inv, want))

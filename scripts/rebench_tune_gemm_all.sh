@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 # RE-RUN THE WHOLE gfx950 PREFILL-GEMM TILE CAMPAIGN — bf16 AND mxfp4 — AND PUBLISH IT.
 #
-# This is the answer to "the build digest moved again". Every edit reachable from `interp.hip`
-# (`runtime/amd/op_*.h`, `runtime/common/dev_isa.h`, `interp.hip` itself) changes the PREPROCESSED
-# translation unit that keys the store, and at that moment EVERY record in `tuning/` goes stale at
-# once: `pick_tile` silently reverts to the analytical model and reports tier `portable`, which is
-# what it reports when nothing was ever measured. `cargo test -p devgen --test tuned_tile_selection`
-# is the signal. THIS SCRIPT IS THE FIX, and it is meant to be run without thinking about it:
+# This refreshes the dense-GEMM family key. Relevant GEMM bodies, their expanded macros, and the
+# toolchain participate; unrelated persistent-interpreter arms do not. `cargo test -p devgen
+# --test tuned_tile_selection` is the signal. THIS SCRIPT IS THE FIX:
 #
 #     scripts/rebench_tune_gemm_all.sh                 # rebuild objects, measure both ladders, publish
 #     scripts/rebench_tune_gemm_all.sh --bf16-only     # just the un-staling half (the test gate)
@@ -20,7 +17,7 @@
 # THE TWO ENVIRONMENT RULES, AND THEY ARE OPPOSITES. Both are load-bearing.
 #
 #   * Build and measure with the SAME nix ROCm toolchain. The TuneDB key records that toolchain and
-#     the preprocessed interpreter digest, so building test_kernels.elf with the host ROCm and then
+#     the preprocessed dense-GEMM family digest, so building test_kernels.elf with host ROCm and then
 #     publishing through nix labels measurements with the wrong compiler. `sg render -c` still MUST
 #     stay OUTSIDE `nix develop`: nix runs in a user namespace where /usr/bin/newgrp cannot acquire
 #     the render gid. The command under `sg` enters nix for the measurement itself.

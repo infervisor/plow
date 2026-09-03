@@ -653,6 +653,8 @@ option(PLOW_HSACO_K3 "Also emit the Kimi-K3 / KDA objects (decode + prefill)" ON
 option(PLOW_HSACO_PACKED_PREFILL_CONSUMERS
        "Emit separate default-off operator-family objects that consume packed prefill metadata" OFF)
 option(PLOW_HSACO_KDA_CHUNK "Include the opt-in BT64 chunk-KDA prefill arms" OFF)
+option(PLOW_HSACO_MOE_STAGE2_LEAN
+       "Emit the standalone gfx950 MXFP4 grouped-MoE stage-2 object" ON)
 option(PLOW_K3_DECODE_MXFP4_PROJ
        "Include standalone MXFP4 projection ops in K3 decode objects" ON)
 option(PLOW_K3_DECODE_GROUPED
@@ -703,9 +705,19 @@ set(PLOW_GQ_BATCH "1" CACHE STRING "global-queue claim batch")
 set(PLOW_DECODE_BATCH "1" CACHE STRING "decode batch bucket")
 set(PLOW_GEMV_MM "" CACHE STRING "decode GEMV rows per walk pass (empty = derived)")
 option(PLOW_GEMV_WALK "Walk a <=16-row GEMV object across wider decode batches" OFF)
+set(_plow_l2_default OFF)
+set(_plow_gate_hier_default OFF)
+if(PLOW_HSACO_ARCH STREQUAL "gfx942" OR PLOW_HSACO_ARCH STREQUAL "gfx950")
+    set(_plow_l2_default ON)
+endif()
+if(PLOW_HSACO_ARCH STREQUAL "gfx950")
+    set(_plow_gate_hier_default ON)
+endif()
 option(PLOW_GATE_HIER
-       "Use hierarchical cache-maintenance gates in gfx950 decode GQ objects" OFF)
-option(PLOW_L2_PLACE_DISPATCH "Compile support for L2-domain placed packets" OFF)
+       "Use hierarchical cache-maintenance gates in gfx950 decode GQ objects"
+       ${_plow_gate_hier_default})
+option(PLOW_L2_PLACE_DISPATCH "Compile support for L2-domain placed packets"
+       ${_plow_l2_default})
 option(PLOW_MLA_PF_V2_ARM "Compile the four-wave MLA prefill V2 arm" OFF)
 set(PLOW_HSACO_EXTRA_DEFINES "" CACHE STRING "extra raw hipcc flags appended to every code object")
 set(PLOW_HSACO_CONFIG "" CACHE FILEPATH
@@ -765,7 +777,10 @@ if(PLOW_GFX950_HSACO)
     # THE AXES. No row below spells out a define set; every row is axes only.
     set(_hs_ax_none "")
     set(_hs_ax_prefill -DPLOW_BUCKET_DECODE=0)
-    if(PLOW_XR_AGG AND PLOW_HSACO_ARCH STREQUAL "gfx942")
+    # The same bit-exact aggregation is profitable on both CDNA3 and CDNA4. Exact K3
+    # TP8 gfx950 shapes: 15.107 -> 9.032 us (T512), 19.007 -> 12.931 us (T1024).
+    if(PLOW_XR_AGG AND (PLOW_HSACO_ARCH STREQUAL "gfx942" OR
+                        PLOW_HSACO_ARCH STREQUAL "gfx950"))
         list(APPEND _hs_ax_prefill -DPLOW_XR_AGG=1)
     endif()
     # next_pow2(PLOW_DECODE_BATCH), clamped to PLOW_GEMV_MAXM (16). Wide gfx950 objects use
@@ -967,6 +982,12 @@ if(PLOW_GFX950_HSACO)
     set(_hs_ax_packed_mla_flash
         ${_hs_ax_flash} -DPLOW_MLA_PF_V2_ARM=1
         -DPLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS=1)
+    # Raw single-request MLA-V2 route. Separate from the packed-prefill family object:
+    # no descriptor loop, no model arms, and only the bf16 FlashMlaPrefill dispatch case.
+    set(_hs_ax_mla_v2_sv_raw
+        ${_hs_ax_flash} -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_MLA_PF_SV=1
+        -DPLOW_BUCKET_MLA_V2_RAW=1 -DPLOW_NO_SPILL=1
+        -DPLOW_REQUIRED_MARKER=plow_mla_pf_v2_sv_raw_1)
     set(_hs_ax_packed_kda
         ${_hs_ax_prefill} -DPLOW_K3=1 -DPLOW_BUCKET_PACKED_KDA=1
         -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1)
@@ -1051,6 +1072,12 @@ if(PLOW_GFX950_HSACO)
     if(PLOW_HSACO_MLA)
         list(APPEND _hs_rows
             "interp_prefill_mla|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla|256|2")
+        if(PLOW_HSACO_ARCH STREQUAL "gfx950")
+            # Build-time gate: V2+SV is 348 architectural registers, occupancy 1,
+            # scratch-free in the exact T8192 kernel probe.
+            list(APPEND _hs_rows
+                "interp_mla_v2_sv|${_hs_kfl}|_hs_ax_none|_hs_ax_mla_v2_sv_raw|384|1")
+        endif()
         if(PLOW_HSACO_FP8)
             # Kimi K2.7 / GLM-5.2 / DeepSeek ship fp8, so the bf16-GEMM MLA prefill
             # object above cannot serve them without mixing dtypes across buckets.
@@ -1178,6 +1205,23 @@ if(PLOW_GFX950_HSACO)
         add_custom_target(kda_decode_fused_gfx950 DEPENDS "${_hs_kda_fused_out}")
         list(APPEND _hs_outs "${_hs_kda_fused_out}")
 
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MOE_STAGE2_LEAN)
+        set(_hs_moe2_src
+            "${CMAKE_CURRENT_SOURCE_DIR}/bench/amd/lean_moe_stage2_ref/native_kernel.hip")
+        set(_hs_moe2_out "${PLOW_HSACO_DIR}/moe_stage2_mxfp4_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_moe2_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_moe2_out}"
+                    plow_moe2_mxfp4_16x16x128_gfx950 144 2
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_moe2_mxfp4_stage2_abi_1
+                    "${_hs_moe2_src}"
+            DEPENDS "${_hs_moe2_src}" "${_hs_run}"
+            COMMENT "hipcc moe_stage2_mxfp4_gfx950.elf"
+            VERBATIM)
+        list(APPEND _hs_outs "${_hs_moe2_out}")
     endif()
 
     # Golden __device__ wrappers. They call the SAME op_*.h bodies the

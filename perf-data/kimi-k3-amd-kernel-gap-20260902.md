@@ -36,6 +36,34 @@ running its ROCm fused_kda_decode benchmark. Plow used ROCm 7.14 and the
 production op_kda.h bodies through
 runtime/bench/amd/kda_decode_fused_exact.{hip,cpp}.
 
+### Post-scan 8192-token prefill attribution
+
+A fresh TP8 trace of the promoted BT64/BC16 scan captured all 2,971 packets
+under one exclusive eight-GPU lease. Its 2,909.666 ms device span agrees with
+the 2,952.023 ms endpoint TTFT within 1.44%; the trace-sweep median was
+2,924.120 ms. Kernel bodies account for 2,901.893 ms (99.73%), while the
+interpreter protocol gate accounts for only 8.933 ms (0.31%).
+
+| current body category | time | device span |
+|---|---:|---:|
+| grouped MoE GLU + down | 1049.847 ms | 36.08% |
+| MoE route + align + combine | 226.499 ms | 7.78% |
+| TP reductions | 503.214 ms | 17.29% |
+| KDA scan + conv + norm | 486.298 ms | 16.71% |
+| MLA flash + merge + gate | 286.595 ms | 9.85% |
+| dense GEMM/GEMV | 243.720 ms | 8.38% |
+| AttnRes | 88.675 ms | 3.05% |
+
+MoE is therefore the current first lever at 1,276.346 ms / 43.86%, not KDA.
+Within MoE, down is 694.793 ms and GLU 355.054 ms. XReduce is 352.300 ms and
+XReduce2 150.915 ms. The largest remaining KDA bodies are carry at 275.603 ms
+and intra at 124.799 ms; MLA flash alone is 251.102 ms. The 69 KDA transformer
+blocks span 2,060.098 ms with a 30.343 ms median, and the 24 MLA blocks span
+849.505 ms with a 35.331 ms median. The pinned vLLM endpoint's 568.35 ms TTFT
+implies an average whole-layer budget near 6.11 ms, but there is no matching
+vLLM 8192-token per-kernel trace; only the isolated boundaries below are
+claimed as apples-to-apples kernel comparisons.
+
 | KDA decode boundary | B1 | B8 | Gate |
 |---|---:|---:|---|
 | vLLM fused conv + recurrence + gated RMSNorm | 8.40 us | 9.24 us | reference |
@@ -452,6 +480,36 @@ fused-block/full-network measurements. It must not enter the mega interpreter.
 
 ## Current gfx950 bring-up findings
 
+- The first full TP8 gate with independent ordered segments and eight device-side XCD windows
+  per segment reduced the 8192-row `amd-bench` prefill from 2911.529 to 2238.263 ms
+  (-673.266 ms, -23.12%). The matching production mux gate at 8191 input tokens completed
+  3/3 requests with TTFT p50/p90 2400.863/2401.177 ms and 0.07% spread. This is 4.23x the
+  pinned vLLM 8192-token TTFT of 568.35 ms; the one-token shape difference is explicit and a
+  same-client 8192-to-1024 serve gate remains the publication authority. Packet checksum:
+  `fnv1a64:ffefa4f7d413c3dc`; output checksum: `fnv1a64:ad600d375800bd1e`.
+- The final identical-client prefill cell used `vllm bench serve` against Plow's
+  `/v1/completions`: exact 8192 input tokens, C1, one output token, three measured requests
+  after one warm-up. The endpoint passed the text coherence gate and completed 3/3 with mean
+  TTFT 2274.58 ms and median 2276.64 ms. This is 4.01x the pinned vLLM 568.35 ms TTFT. TPOT
+  is undefined for a one-token cell; the 8192-to-1024 decode/ITL publication cell remains
+  pending and must use the same client and endpoint contract.
+- A checkpoint-bound production-mux rerun at exactly 8192 input tokens and one output token,
+  with the raw gfx950 MLA V2+SV segment enabled and packed KDA disabled, completed 3/3 after
+  one warm-up at TTFT p50/p90 2257.594/2257.616 ms (0.05% spread). This is a prefill-boundary
+  result, not the final same-client 8192-to-1024 publication cell; against the pinned vLLM
+  568.35 ms TTFT it is 3.97x slower. Packet checksum: `fnv1a64:d1559238add38257`;
+  output checksum: `fnv1a64:3ade942d4a3ee2fd`.
+- The raw dense-BF16 MLA V2+SV object passed isolated production dispatch and improved the
+  synthetic TP8 8192-token run from 1686.643 to 1552.287 ms. Its route is deliberately limited
+  to pure dense-BF16 MLA segments at T>=2048. The standalone packed-KDA object passed its
+  compile and capability gates but faulted under the real TP8 runtime route, so C1 remains on
+  the primary interpreter until that fault has a correctness root cause.
+- Kimi-K3's source checkpoint lacks 120 derived MLA tensors. The measured checkpoint farm was
+  prepared with `scripts/kimi_k3_prep.py`; direct loading now fails closed on a missing derived
+  tensor instead of producing a synthetic result. On ROCm 7.14, concurrent asynchronous copies
+  into the shared 29 GB rank weight allocation produced GPU write-to-read-only faults. A single
+  upload slot completed all eight rank loads, so one is now the safe default and values above
+  one remain explicit experiments.
 - The emitted program and B1/B32/B128 object families load with real Kimi-K3
   weights on eight MI355X GPUs. The C128 short gate completed 128/128 requests,
   reached rung 128, and reported zero rejects/sheds.

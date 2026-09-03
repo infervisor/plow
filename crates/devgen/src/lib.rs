@@ -75,7 +75,7 @@ pub mod tune_demand;
 // | flag | on sm_120 | on gfx950 before the gate | gate |
 // |------|-----------|---------------------------|------|
 // | `PLOW_FP8` (alone) | emits w8a16, which has a cubin | w8a16 into a w8a8-only arm → null `a_scale` fault | REFUSED (`check_fp8_a_scale_bound`) — ignoring would emit a WRONG packet |
-// | `PLOW_L2_PLACE` | L2 domains in `seg` | overwrites the wave-class tag on a MULTI-SEGMENT program → whole prefill on the flash object, zero logits | skipped per PROGRAM by `Builder::finish` when it has >1 wave class; single-class programs (decode) are placed |
+// | `PLOW_L2_PLACE` | per-domain queue windows | formerly overwrote the wave-class tag on a MULTI-SEGMENT program → zero logits | domain now lives independently in flags; ordered kernel-family segments remain intact |
 // | `PLOW_UNISEG` | collapses segments, spurious there | destroyed the wave-class split → zero logits, 8.7 ms "prefill" | ignored + warned (`Builder::deny_uniseg`) |
 // | `PLOW_PF_LADDER=wave` | rungs from the 128x128 sm_120 tile | AMD tiles differently → mis-tuned rungs (degrades, does not corrupt) | ignored quietly |
 //
@@ -728,13 +728,18 @@ fn gfx950_gemm_measurements() -> &'static GemmMeasurements {
             Some(s) => s,
         };
         let store = tunedb::TuneStore::new(std::path::PathBuf::from(root));
-        // Digests come from the PROBED build, not from a constant: a tile edit
-        // in op_gemm.h changes the preprocessed digest, which is what makes the
-        // previous campaign's records stale instead of silently authoritative.
+        let source_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let Ok(build) = kernelcaps::dense_gemm_tuning_build(&source_root, amd_target::active().1)
+        else {
+            return GemmMeasurements { by_case };
+        };
+        // The sweep launches standalone GEMM kernels. Its key covers the
+        // preprocessed dense family across all supported encodings, not
+        // unrelated arms in the persistent interpreter.
         let want = tunedb::Digests {
-            implementation: gfx950_gemm_inventory().build().label(),
-            interpreter: gfx950_gemm_inventory().build().label(),
-            toolchain: gfx950_gemm_inventory().build().toolchain.clone(),
+            implementation: build.label(),
+            interpreter: build.label(),
+            toolchain: build.toolchain.clone(),
             oracle: tunedb::GEMM_ORACLE.to_string(),
         };
         let cell = amd_tuning_cell();
@@ -6601,6 +6606,7 @@ fn emit_dense_gqa(
         let mut b = Builder::new(n_cu);
         b.adopt_tensors(tensors.clone());
         b.set_l2_placement(l2_layout); // PLOW_L2_PLACE: None ⇒ byte-identical
+        b.set_lean_moe_stage2_segments(amd && emit_config::active().moe_stage2_lean);
         if amd {
             b.deny_uniseg(); // PLOW_UNISEG collapses the wave-class split — see `warn_uniseg_amd`
         }

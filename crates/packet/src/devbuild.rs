@@ -309,9 +309,8 @@ pub struct Builder {
     gen: Vec<GenTensor>,
     /// L2-domain-aware placement (`PLOW_L2_PLACE`). `None` ⇒ off; the blob is
     /// byte-identical and `seg` keeps its wave-class meaning. When set,
-    /// [`Builder::finish`] repurposes the `seg` field as a **locality domain**
-    /// `0..P` and groups `gq_stream` by domain, so a physical-SM-aware interp
-    /// (a cluster/XCC_ID cursor per domain) can pull only its domain's packets.
+    /// [`Builder::finish`] carries the locality domain independently in flags
+    /// and groups `gq_stream` into one device queue per ordered segment and domain.
     /// The `cus` sets are NOT touched — placement is dynamic (cursor-claimed) at
     /// runtime, so it cannot regress disjoint `Builder::split` placements.
     /// See the design notes.
@@ -324,6 +323,8 @@ pub struct Builder {
     /// Split descriptor-consuming prefill families into independent wave classes.
     /// Callers must enable this only for prefill programs.
     packed_prefill_segments: bool,
+    /// Isolate structurally compatible MXFP4 grouped-MoE stage-2 boundaries.
+    lean_moe_stage2_segments: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
     /// byte-identical. See [`Builder::set_gemv_split`].
     gemv_split: u32,
@@ -372,6 +373,39 @@ fn packed_prefill_segmenting_needed(
     !uniseg && enabled && ops.any(|op| packed_prefill_segment_class(op).is_some())
 }
 
+fn lean_moe_stage2_pair(ops: &[Op], i: usize) -> bool {
+    let Some((down, combine)) = ops.get(i).zip(ops.get(i + 1)) else {
+        return false;
+    };
+    let (d, c) = (&down.inst, &combine.inst);
+    d.op == DevOp::MoeGroupDownPf as u16
+        && c.op == DevOp::MoeCombinePf as u16
+        && d.i[3] == 2
+        && d.i[1] == 384
+        && d.i[0] != 0
+        && d.i[2] != 0
+        && d.i[4] == 0
+        && d.i[5] == 0
+        && d.t[5] != TENSOR_NONE
+        && d.t[6] != TENSOR_NONE
+        && d.t[7] != TENSOR_NONE
+        && c.t[1] == TENSOR_NONE
+        && c.t[2] == TENSOR_NONE
+        && c.t[3] == d.t[0]
+        && c.i[0] == d.i[0]
+        && c.i[1] != 0
+        && c.i[2] != 0
+        && c.i[3] == 0
+        && c.i[4] == 0
+        && c.i[7] == 0
+}
+
+fn lean_moe_stage2_member(ops: &[Op], i: usize) -> bool {
+    lean_moe_stage2_pair(ops, i)
+        || i.checked_sub(1)
+            .is_some_and(|j| lean_moe_stage2_pair(ops, j))
+}
+
 impl Builder {
     pub fn new(n_cu: u32) -> Self {
         Self {
@@ -383,6 +417,7 @@ impl Builder {
             uniseg_denied: false,
             uniseg_forced: false,
             packed_prefill_segments: false,
+            lean_moe_stage2_segments: false,
             gemv_split: 1,
             tensor_dedup: false,
             tr_dropped: 0,
@@ -393,11 +428,9 @@ impl Builder {
     /// target's workgroup->domain map. `None` (default) leaves the wave-class `seg` and a
     /// byte-identical blob.
     ///
-    /// [`Builder::finish`] may still decline: under [`L2Map::Block`] if `n_cu > domains·sms`
-    /// (occupancy>1 or a grid≠sm_count mismatch, where `cu/sms` would exceed the runtime's
-    /// domain count and orphan packets), and on any program with more than one wave class,
-    /// where `seg` is already carrying information placement would destroy. Both fall back
-    /// byte-identical. See the field docs and the design notes.
+    /// [`Builder::finish`] may still decline under [`L2Map::Block`] if
+    /// `n_cu > domains·sms`, where `cu/sms` would orphan packets. Host segments
+    /// and L2 domains are independent fields, so segmented programs remain placeable.
     pub fn set_l2_placement(&mut self, layout: Option<L2Layout>) {
         self.place_l2 = layout;
     }
@@ -429,6 +462,10 @@ impl Builder {
 
     pub fn set_packed_prefill_segments(&mut self, enabled: bool) {
         self.packed_prefill_segments = enabled;
+    }
+
+    pub fn set_lean_moe_stage2_segments(&mut self, enabled: bool) {
+        self.lean_moe_stage2_segments = enabled;
     }
 
     /// Slice the machine-filling `Gemv` / `GemvGlu` / `GemvQkv` packets into `s * n_cu` shares
@@ -1045,7 +1082,7 @@ impl Builder {
         // probe MEASURED round-robin still holding at occupancy 2 (512 blocks, 100.0%). Applying
         // the block guard there would have silently disabled placement on exactly the occ-2
         // configs it is safe for.
-        let mut l2_place: Option<L2Layout> = self.place_l2.and_then(|l| {
+        let l2_place: Option<L2Layout> = self.place_l2.and_then(|l| {
             if l.sms == 0 || l.domains == 0 {
                 None
             } else if l.map == L2Map::Block && self.n_cu > l.domains * l.sms {
@@ -1278,16 +1315,25 @@ impl Builder {
         // not be given one because a variable said so. See that method for the failure it prevents.
         let uniseg = !self.uniseg_denied
             && (self.uniseg_forced || std::env::var("PLOW_UNISEG").ok().as_deref() == Some("1"));
-        // PLOW_MLA_PF_V2=1 splits FlashMlaPrefill (bf16, op 51) and its fp8-KV twin
+        // AMD L2-placed packets split FlashMlaPrefill (bf16, op 51) and its fp8-KV twin
         // (op 110) into their own wave-class-4
         // segments at T>=2048 so the AMD host can route them to the 4-wave flash object's V2
         // kernel (d_flash_mla_prefill_v2). Smaller buckets remain one 8-wave L2-placed launch.
         // Emit-time, because segments only form on wave_class
         // BOUNDARIES: reclassifying host-side would drag whatever ops share the segment onto
-        // an object that silently skips them. Unset = byte-identical blobs. The host applies
+        // an object that silently skips them. PLOW_MLA_PF_V2=0 is the explicit opt-out; non-AMD
+        // packets remain byte-identical. The host applies
         // its own purity + size guards (exec/amd.rs derive_segments), so an env mismatch in
         // either direction degrades to the 8-wave kernel rather than corrupting.
-        let mla_v2 = !uniseg && std::env::var("PLOW_MLA_PF_V2").ok().as_deref() == Some("1");
+        let mla_v2 = !uniseg
+            && match std::env::var("PLOW_MLA_PF_V2").ok().as_deref() {
+                Some("0") => false,
+                Some("1") => true,
+                // A placed packet is an AMD production artifact. Isolating a pure MLA flash
+                // segment is safe even when its optional lean object is absent: the host then
+                // runs that ordered segment on the ordinary 8-wave interpreter.
+                _ => self.place_l2.is_some(),
+            };
         // Opt-in only: live packed serving remains disabled. Giving descriptor-consuming
         // families distinct classes lets a future runtime route them to lean objects without
         // putting their branches in the production megakernel. Unset preserves packet bytes.
@@ -1296,6 +1342,9 @@ impl Builder {
             self.packed_prefill_segments,
             self.ops.iter().map(|o| o.inst.op),
         );
+        let lean_moe_stage2 = !uniseg
+            && self.lean_moe_stage2_segments
+            && (0..self.ops.len()).any(|i| lean_moe_stage2_pair(&self.ops, i));
         // PLOW_SEG_PURE_GEMM=1 (T11): class-8 segments carry ONLY GEMM-family ops; every light
         // op (norms, rope, quant, embed, softcap) joins the flash class. The point: the sm_90a
         // segmented launcher runs class-8 segments on the lean `_pfgemm` object, and a pure-GEMM
@@ -1346,6 +1395,11 @@ impl Builder {
                 // A standalone raw-argument object owns this boundary. Keep its segment pure
                 // even if PLOW_UNISEG was requested; runtime routing may then select by opcode.
                 3
+            } else if lean_moe_stage2 && lean_moe_stage2_member(&self.ops, i) {
+                // The standalone gfx950 kernel owns this exact Down+Combine boundary. A runtime
+                // without its validated object executes the same two ops on the primary
+                // interpreter; keeping the pair pure makes both routes exact.
+                9
             } else if uniseg {
                 8
             } else if packed_prefill_segments && packed_prefill_segment_class(op).is_some() {
@@ -1452,7 +1506,8 @@ impl Builder {
         let raw_segmented = self
             .ops
             .iter()
-            .any(|op| op.inst.op == DevOp::KdaDecodeFused as u16);
+            .any(|op| op.inst.op == DevOp::KdaDecodeFused as u16)
+            || lean_moe_stage2;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             !raw_segmented || seg_of[consumer] == seg_of[dep.producer() as usize]
         };
@@ -1501,47 +1556,6 @@ impl Builder {
                 summary.join(", ")
             );
         }
-
-        // L2 PLACEMENT vs WAVE-CLASS SEGMENTATION: they want the same 16-bit field, and
-        // segmentation wins exactly when it is carrying something SOMEONE READS.
-        //
-        // Two conditions, and both are needed:
-        //
-        // 1. `cur_seg > 0` — the program actually has more than one wave class. A decode program
-        //    has no `FlashPrefill` op, so every op is class 8, `cur_seg` never increments, and
-        //    `seg` is uniformly 0 with nothing in it to destroy.
-        // 2. `uniseg_denied` — the TARGET reads the class back out of `seg`. That is the same
-        //    fact `deny_uniseg` already records, and it is caller knowledge for the same reason:
-        //    only the caller knows the backend. An AMD host relaunches once per segment and reads
-        //    the class from `seg`; the sm_120 interpreter runs the whole program in ONE
-        //    cooperative launch at a fixed block size and never looks at it, which is why
-        //    segmentation is spurious there and placement over it has always been fine.
-        //
-        // Without (2) this would silently disable a shipped NVIDIA feature: an sm_120 prefill
-        // program is wave-class-segmented too, and it is placed today.
-        // Without (1) AMD decode could never be placed — and that is where the lever is (§7b:
-        // 66% of decode packets and 45.5% of the token run on ≤32 effective workgroups).
-        //
-        // What condition (1)+(2) stops: overwriting the classes collapses every op into segment
-        // 0, the host sees flash packets there, dispatches the ENTIRE program on the 4-wave flash
-        // object — whose body is `if (op == FLASH_PREFILL…)` with no switch — and every GEMM,
-        // norm and the lm_head is silently dropped. Prefill "succeeds" in 8.7 ms instead of 72.1
-        // with all-zero logits. This cost three agents a long time to find, because the packet
-        // loads, runs, and differs from a correct one ONLY in this field.
-        //
-        // SKIPPED, not refused: skipping produces the CORRECT packet, which is what the caller
-        // wants — unlike a wrong-precision flag, where ignoring would produce a wrong one.
-        if l2_place.is_some() && cur_seg > 0 && self.uniseg_denied {
-            eprintln!(
-                "  l2 placement SKIPPED: program has {} wave-class segments on a target that \
-                 relaunches per segment, and `seg` carries the class it relaunches at — \
-                 placement would overwrite it and dispatch every op on the flash object. \
-                 Emitting with wave-class segmentation instead.",
-                cur_seg + 1
-            );
-            l2_place = None;
-        }
-        let l2_place = l2_place;
 
         // Locality census (`PLOW_PLACE_REPORT=1`). Diagnostic only — reads the op DAG, writes
         // nothing. Answers the question a locality-aware placement pass has to answer FIRST:
@@ -1718,11 +1732,9 @@ impl Builder {
                     slice: slice as u32,
                     ..Default::default()
                 };
-                // L2-domain placement (PLOW_L2_PLACE): `seg` is a PER-SLICE domain, so a full
-                // op's slices spread across every L2 domain (no skew) and slice `s` sits in the
-                // same domain across ops (consumer reads producer from one L2 slice). A
-                // physical-SM interp pulls its domain's gq window. Off ⇒ `seg` keeps its
-                // wave-class meaning (byte-identical).
+                // Keep the ordered kernel-family segment even under L2 placement. The per-slice domain
+                // is packed into flags below, so a pure family can run on a lean object while
+                // every launch still has one independently drained GQ window per XCD.
                 //
                 // `domain_of` — NOT an inline `cu / sms`. `cu` here is a LOGICAL workgroup index
                 // (`interp`'s `blockIdx.x`), and only NVIDIA fills a GPC with consecutive blocks.
@@ -1731,9 +1743,10 @@ impl Builder {
                 // block formula here would hand every domain-0 packet to workgroups 0..31 that
                 // the hardware has scattered across all eight XCDs — destroying L2 locality
                 // instead of creating it, and emitting perfectly correct tokens while doing it.
-                e.seg = match l2_place {
-                    Some(l) => l.domain_of(cu) as u16,
-                    None => seg_of[idx],
+                e.seg = if l2_place.is_some() && !self.uniseg_denied {
+                    0
+                } else {
+                    seg_of[idx]
                 };
                 if fine {
                     e.flags = SE_FINE;
@@ -1786,6 +1799,14 @@ impl Builder {
                     e.succ_ofs = inst.succ_ofs;
                     e.succ_len = inst.succ_len;
                 }
+                if let Some(l) = l2_place {
+                    assert!(
+                        l.domains <= 8,
+                        "StreamEnt flags hold at most eight L2 domains"
+                    );
+                    let domain = l.domain_of(cu) as u16;
+                    e.flags |= domain << crate::dev::SE_DOMAIN_SHIFT;
+                }
                 streams[cu as usize].push(e);
                 gq_stream.push(e); // op-major: outer loop is op order, inner is slice order
             }
@@ -1801,13 +1822,13 @@ impl Builder {
             stream.extend_from_slice(s);
         }
 
-        // Under L2 placement, `seg` == domain is not monotonic in op-emit order,
-        // so group gq_stream by domain first. A STABLE sort preserves each
-        // domain's op-major (topological) order; cross-domain deps stay
-        // counter-gated. This yields contiguous per-domain [ofs[d], ofs[d+1))
-        // windows a physical-SM interp pulls with one cursor per domain.
-        if l2_place.is_some() {
-            gq_stream.sort_by_key(|e| e.seg);
+        // Group by ordered kernel-family segment, then L2 domain. A stable sort preserves
+        // op-major order within each window; cross-window deps remain counter-gated.
+        if let Some(l) = l2_place {
+            gq_stream.sort_by_key(|e| {
+                let domain = (e.flags & crate::dev::SE_DOMAIN_MASK) >> crate::dev::SE_DOMAIN_SHIFT;
+                e.seg as u32 * l.domains + domain as u32
+            });
         }
 
         // PER-(PACKET, DOMAIN) SLICE COUNT, for the two-level cache-maintenance rendezvous
@@ -1825,11 +1846,22 @@ impl Builder {
             let mut per: std::collections::HashMap<(u32, u16), u32> =
                 std::collections::HashMap::new();
             for e in &gq_stream {
-                *per.entry((e.inst, e.seg)).or_insert(0) += 1;
+                // Fine slices can carry different wait/successor lists. Sharing one
+                // (instruction, domain) rendezvous would let the elected slice stand in for
+                // dependencies or signals that only a follower carries.
+                if e.flags & SE_FINE != 0 {
+                    continue;
+                }
+                let domain = (e.flags & crate::dev::SE_DOMAIN_MASK) >> crate::dev::SE_DOMAIN_SHIFT;
+                *per.entry((e.inst, domain)).or_insert(0) += 1;
             }
             let mut over = 0usize;
             for e in gq_stream.iter_mut() {
-                let n = *per.get(&(e.inst, e.seg)).unwrap_or(&0);
+                if e.flags & SE_FINE != 0 {
+                    continue;
+                }
+                let domain = (e.flags & crate::dev::SE_DOMAIN_MASK) >> crate::dev::SE_DOMAIN_SHIFT;
+                let n = *per.get(&(e.inst, domain)).unwrap_or(&0);
                 if n > 1 {
                     // 9 bits. A domain cannot hold more than n_cu slices of one packet, and
                     // n_cu > 511 would need a wider field rather than a silent truncation.
@@ -1846,22 +1878,31 @@ impl Builder {
             );
         }
 
-        // Segment window bounds in gq_stream. gq_stream is op-major and seg_of[] is monotonic in
-        // op-emit order, so each segment occupies a contiguous [ofs[s], ofs[s+1]) range — the
-        // interp bounds its cursor to this window under RUNSEG. Under L2 placement `seg` ranges
-        // over the P L2 domains instead of the wave-class count.
-        // Under L2 placement, `seg` ranges over the P L2 domains (fixed by the
-        // hardware partition_count), NOT ceil(n_cu/sms) — so the window count
-        // always matches the runtime's `smid/sms` domain count.
+        // Segment window bounds in gq_stream. With L2 placement every ordered kernel-family
+        // segment has one window per domain, indexed `segment * domains + domain`.
         let n_seg = match l2_place {
-            Some(l) => l.domains as usize,
+            Some(l) => {
+                let ordered_segments = if self.uniseg_denied {
+                    cur_seg as usize + 1
+                } else {
+                    1
+                };
+                ordered_segments * l.domains as usize
+            }
             None => cur_seg as usize + 1,
         };
         let mut gq_seg_ofs = vec![0u32; n_seg + 1];
         {
             let mut s = 0usize;
             for (i, e) in gq_stream.iter().enumerate() {
-                while e.seg as usize > s {
+                let key = if let Some(l) = l2_place {
+                    let domain =
+                        (e.flags & crate::dev::SE_DOMAIN_MASK) >> crate::dev::SE_DOMAIN_SHIFT;
+                    e.seg as usize * l.domains as usize + domain as usize
+                } else {
+                    e.seg as usize
+                };
+                while key > s {
                     s += 1;
                     gq_seg_ofs[s] = i as u32;
                 }
@@ -1875,8 +1916,16 @@ impl Builder {
         // The MAP is printed too, because a placed blob is only as good as that
         // formula matching the hardware, and it is not visible anywhere else.
         if let Some(l) = l2_place {
-            let per: Vec<u32> = (0..n_seg)
-                .map(|d| gq_seg_ofs[d + 1] - gq_seg_ofs[d])
+            let ordered_segments = n_seg / l.domains as usize;
+            let per: Vec<u32> = (0..l.domains as usize)
+                .map(|d| {
+                    (0..ordered_segments)
+                        .map(|s| {
+                            let w = s * l.domains as usize + d;
+                            gq_seg_ofs[w + 1] - gq_seg_ofs[w]
+                        })
+                        .sum()
+                })
                 .collect();
             let (lo, hi) = (
                 per.iter().copied().min().unwrap_or(0),
@@ -1892,8 +1941,10 @@ impl Builder {
                 L2Map::RoundRobin => "round-robin (wg n -> dom n%domains)",
             };
             eprintln!(
-                "  l2 placement: {n_seg} domains × {} SM, map {map}, packets/domain {per:?}, \
+                "  l2 placement: {} domains × {} ordered segments × {} SM, map {map}, packets/domain {per:?}, \
                  skew {skew:.1}% (max {hi} vs min {lo})",
+                l.domains,
+                ordered_segments,
                 l.sms
             );
         }
@@ -2028,13 +2079,13 @@ pub struct Program {
     pub tensors: Vec<TensorDecl>,
     /// Op-major (topological) permutation of `stream` for the global-queue interpreter.
     pub gq_stream: Vec<StreamEnt>,
-    /// `[n_seg+1]` segment window bounds into `gq_stream`.
+    /// Window bounds into `gq_stream`. Under L2 placement the windows are
+    /// `[ordered_segment][domain]`; otherwise there is one per ordered segment.
     pub gq_seg_ofs: Vec<u32>,
     /// L2-domain placement (PLOW_L2_PLACE): SMs per partition, and the number of
-    /// L2 domains `gq_seg_ofs` is windowed by. `0` ⇒ not placed (`seg` is
-    /// wave-class). When non-zero, `gq_stream`'s `seg` is a domain and the blob
-    /// header carries [`PLOW_BLOB_F_L2DOM`]; a runtime without physical-SM
-    /// domain dispatch must refuse it. See the design notes.
+    /// L2 domains per ordered kernel-family segment. `StreamEnt.seg` remains the ordered
+    /// segment and flags carry the domain. The blob header carries
+    /// [`PLOW_BLOB_F_L2DOM`] plus [`PLOW_BLOB_F_L2SEG`].
     pub l2_sms: u32,
     pub l2_domains: u32,
 }
@@ -2053,6 +2104,11 @@ pub const BLOB_MAGIC_V6: &[u8; 8] = b"PLOWDEV\x08";
 /// path, and serve a model with cos=sin=0 — fluent text, wrong text, no error.
 /// Bumping the magic turns that into a load-time rejection.
 pub const BLOB_MAGIC_V7: &[u8; 8] = b"PLOWDEV\x09";
+/// Current L2 placement keeps ordered segments and physical domains independent.
+/// The layout needs a new magic so older runtimes cannot silently read `seg` as a domain.
+pub const BLOB_MAGIC_L2SEG: &[u8; 8] = b"PLOWDEV\x0a";
+/// Generated-tensor v7 plus the independent segment/domain packet layout.
+pub const BLOB_MAGIC_V7_L2SEG: &[u8; 8] = b"PLOWDEV\x0b";
 
 /// Every container version this build can read.
 ///
@@ -2061,7 +2117,13 @@ pub const BLOB_MAGIC_V7: &[u8; 8] = b"PLOWDEV\x09";
 /// `DevBlob::find_in_dir`), and when v7 was added to only one of them a v7 blob
 /// parsed correctly but was never *discovered* — `plowrt serve` just reported no
 /// model. One list, one place.
-pub const BLOB_MAGICS: [&[u8; 8]; 3] = [BLOB_MAGIC, BLOB_MAGIC_V6, BLOB_MAGIC_V7];
+pub const BLOB_MAGICS: [&[u8; 8]; 5] = [
+    BLOB_MAGIC,
+    BLOB_MAGIC_V6,
+    BLOB_MAGIC_V7,
+    BLOB_MAGIC_L2SEG,
+    BLOB_MAGIC_V7_L2SEG,
+];
 
 /// Is `m` a container version this build understands?
 pub fn is_blob_magic(m: &[u8; 8]) -> bool {
@@ -2178,13 +2240,15 @@ pub struct BlobHeader {
 /// `gq_stream`/`gq_seg_ofs` appendix), so `PLOW_GLOBAL_QUEUE=1` can run it. Absent ⇒ static-only.
 pub const PLOW_BLOB_F_GQ: u32 = 1;
 
-/// [`BlobHeader::flags`] bit: `gq_stream`'s `seg` is an **L2 domain** (PLOW_L2_PLACE),
-/// and `gq_seg_ofs` windows it by domain, not wave-class. A runtime WITHOUT
-/// physical-SM domain dispatch (`PLOW_L2_PLACE_DISPATCH`) must REFUSE such a blob —
-/// its wave-class segmentation would mis-dispatch `seg`. `reserved[1]` carries SMs
-/// per partition, `reserved[2]` the domain count, so the interp need not be told
-/// via a build define. See the design notes.
+/// [`BlobHeader::flags`] bit: the blob uses L2-domain packet placement. A runtime
+/// without physical-domain dispatch must refuse it. Current blobs also carry
+/// [`PLOW_BLOB_F_L2SEG`]; legacy blobs stored the domain in `StreamEnt.seg`.
 pub const PLOW_BLOB_F_L2DOM: u32 = 2;
+
+/// L2 placement keeps the ordered kernel-family segment in `StreamEnt.seg` and carries
+/// the domain in `flags`. Its GQ appendix is windowed by `(segment, domain)`.
+/// Older `PLOW_BLOB_F_L2DOM` blobs used `seg` itself as the domain.
+pub const PLOW_BLOB_F_L2SEG: u32 = 4;
 
 /// Stable 32-bit fingerprint of a target GPU spec name (e.g. `"H100 SXM5"`), stamped into
 /// [`BlobHeader::target`] so the runtime can warn when a blob is loaded on a GPU it was not
@@ -2373,11 +2437,19 @@ impl Model {
         // L2-domain placement summary across programs (PLOW_L2_PLACE): all placed
         // programs share the target's (sms, domains); mark the header + carry them.
         let (l2_flag, l2_sms, l2_dom) = match self.progs.iter().find(|p| p.l2_domains > 0) {
-            Some(p) => (PLOW_BLOB_F_L2DOM, p.l2_sms, p.l2_domains),
+            Some(p) => (
+                PLOW_BLOB_F_L2DOM | PLOW_BLOB_F_L2SEG,
+                p.l2_sms,
+                p.l2_domains,
+            ),
             None => (0, 0, 0),
         };
         let hdr = BlobHeader {
-            magic: *BLOB_MAGIC,
+            magic: if l2_flag == 0 {
+                *BLOB_MAGIC
+            } else {
+                *BLOB_MAGIC_L2SEG
+            },
             n_cu: self.n_cu,
             n_tensor: self.tensors.len() as u32,
             n_prog: self.progs.len() as u32,
@@ -2506,15 +2578,20 @@ impl Model {
 
         // L2-domain placement summary (PLOW_L2_PLACE) — see to_blob().
         let (l2_flag, l2_sms, l2_dom) = match self.progs.iter().find(|p| p.l2_domains > 0) {
-            Some(p) => (PLOW_BLOB_F_L2DOM, p.l2_sms, p.l2_domains),
+            Some(p) => (
+                PLOW_BLOB_F_L2DOM | PLOW_BLOB_F_L2SEG,
+                p.l2_sms,
+                p.l2_domains,
+            ),
             None => (0, 0, 0),
         };
         // Header placeholder — sect_dir_offset patched after we know the full layout.
         let hdr = BlobHeader {
-            magic: if self.gen.is_empty() {
-                *BLOB_MAGIC_V6
-            } else {
-                *BLOB_MAGIC_V7
+            magic: match (self.gen.is_empty(), l2_flag == 0) {
+                (true, true) => *BLOB_MAGIC_V6,
+                (false, true) => *BLOB_MAGIC_V7,
+                (true, false) => *BLOB_MAGIC_L2SEG,
+                (false, false) => *BLOB_MAGIC_V7_L2SEG,
             },
             n_cu: self.n_cu,
             n_tensor: self.tensors.len() as u32,
@@ -2780,6 +2857,10 @@ mod locality_census_tests {
 mod l2_placement_tests {
     use super::*;
 
+    fn domain(e: &StreamEnt) -> u32 {
+        ((e.flags & crate::dev::SE_DOMAIN_MASK) >> crate::dev::SE_DOMAIN_SHIFT) as u32
+    }
+
     /// One packet per op, each sliced across all `n_cu` workgroups. `reads_class` is the target
     /// fact `deny_uniseg` records: true for a host that relaunches per segment and reads the wave
     /// class out of `seg` (AMD), false for one cooperative launch that never looks (sm_120).
@@ -2815,13 +2896,14 @@ mod l2_placement_tests {
         assert_eq!(p.l2_domains, 8, "placement must be active");
         for e in &p.stream {
             assert_eq!(
-                e.seg as u32,
+                domain(e),
                 e.slice % 8,
                 "slice {} must sit in domain {} (n % 8), got {}",
                 e.slice,
                 e.slice % 8,
-                e.seg
+                domain(e)
             );
+            assert_eq!(e.seg, 0, "the ordered segment must remain independent");
         }
         // Every domain window is equally full — 8 domains × 32 of the 256 slices.
         let per: Vec<u32> = (0..8)
@@ -2846,7 +2928,8 @@ mod l2_placement_tests {
         let p = placed(256, &[DevOp::Nop], Some(l));
         assert_eq!(p.l2_domains, 8);
         for e in &p.stream {
-            assert_eq!(e.seg as u32, e.slice / 32, "block map is n / sms");
+            assert_eq!(domain(e), e.slice / 32, "block map is n / sms");
+            assert_eq!(e.seg, 0, "the ordered segment must remain independent");
         }
     }
 
@@ -2904,35 +2987,72 @@ mod l2_placement_tests {
             "round-robin is in range at occupancy 2 — measured"
         );
         for e in &rr.stream {
-            assert_eq!(e.seg as u32, e.slice % 8);
+            assert_eq!(domain(e), e.slice % 8);
+            assert_eq!(e.seg, 0);
         }
     }
 
-    /// THE ZERO-LOGITS GUARD. A program with two wave classes is already using `seg` to tell the
-    /// AMD host which occupancy to relaunch at. Overwriting it collapses prefill into one
-    /// segment, the host dispatches every op on the 4-wave flash object, and every GEMM, norm
-    /// and the lm_head are dropped — 8.7 ms of "prefill" and all-zero logits.
+    /// THE ZERO-LOGITS GUARD. Host family segments and device-side XCD queues must coexist.
+    /// Collapsing either dimension dispatches packets on the wrong object or loses locality.
     #[test]
-    fn a_multi_wave_class_program_is_never_placed() {
+    fn a_multi_wave_class_program_keeps_segments_and_xcd_windows() {
         let l = L2Layout {
             sms: 32,
             domains: 8,
             map: L2Map::RoundRobin,
         };
         let p = placed(256, &[DevOp::Nop, DevOp::FlashPrefill, DevOp::Nop], Some(l));
-        assert_eq!(
-            p.l2_domains, 0,
-            "a segmented program must fall back byte-identical"
-        );
-        // …and the wave classes survive intact: 3 segments, one per class run.
+        assert_eq!(p.l2_domains, 8, "placement must remain active");
+        // Three ordered kernel-family segments, each with eight independently drained XCD windows.
         assert_eq!(
             p.gq_seg_ofs.len() - 1,
-            3,
-            "wave-class segmentation must be preserved"
+            24,
+            "expected [ordered segment][XCD] queue windows"
         );
         assert!(
             p.stream.iter().any(|e| e.seg == 1),
             "the flash run keeps its own segment"
+        );
+        assert!(
+            p.stream.iter().any(|e| domain(e) == 7),
+            "packets must be emitted for every XCD"
+        );
+    }
+
+    #[test]
+    fn hierarchy_counts_exclude_fine_entries_with_slice_local_edges() {
+        let mut b = Builder::new(8);
+        b.set_l2_placement(Some(L2Layout {
+            sms: 4,
+            domains: 2,
+            map: L2Map::RoundRobin,
+        }));
+        b.deny_uniseg();
+        let cus: Vec<u32> = (0..8).collect();
+        let producer = b.emit(DevOp::Nop, cus.clone(), &[], |_| {});
+        let map: Vec<Vec<u32>> = (0..8).map(|slice| vec![slice]).collect();
+        b.emit_dep_work(
+            DevOp::Nop,
+            cus,
+            vec![Dep::Fine { producer, map }],
+            (1..=8).collect(),
+            |_| {},
+        );
+        let p = b.finish();
+
+        let fine: Vec<_> = p
+            .gq_stream
+            .iter()
+            .filter(|entry| entry.flags & SE_FINE != 0)
+            .collect();
+        assert!(
+            !fine.is_empty(),
+            "test must retain slice-local dependencies"
+        );
+        assert!(
+            fine.iter()
+                .all(|entry| entry.flags & crate::dev::SE_NPER_MASK == 0),
+            "one fine slice must never rendezvous on behalf of another slice's waits/signals"
         );
     }
 
@@ -3025,8 +3145,9 @@ mod l2_placement_tests {
         assert_eq!(
             p.gq_seg_ofs.len() - 1,
             8,
-            "windows are the 8 L2 domains, not wave classes"
+            "a target that ignores ordered segments needs only eight domain queues"
         );
+        assert!(p.stream.iter().all(|e| e.seg == 0));
     }
 
     /// Off ⇒ byte-identical. The whole feature has to be a no-op when unset, or every existing
@@ -3249,18 +3370,10 @@ mod seg_window_tests {
         }
     }
 
-    /// Under L2-domain placement (`PLOW_L2_PLACE`) `seg` is the workgroup's DOMAIN, so one
-    /// CU's stream carries a SINGLE segment and every other window is empty.
-    /// Windowing must stay correct there — it just buys nothing. This is the arm
-    /// that a wave-class-shaped construction would get wrong.
-    ///
-    /// Run over BOTH maps. `L2Map::Block` (`cu / sms`) and `L2Map::RoundRobin` (`cu % domains`)
-    /// give the same one-full-window shape but permute WHICH window is the full one, so a
-    /// windowing bug that assumed the block formula would survive a block-only test. The
-    /// expectation comes from [`L2Layout::domain_of`] rather than a repeated formula, so the
-    /// two cannot drift.
+    /// Static per-CU streams retain ordered kernel-family segments. XCD assignment lives in flags and
+    /// therefore cannot alter the segment windows used by the static fallback.
     #[test]
-    fn l2_placement_gives_one_full_window_and_the_rest_empty() {
+    fn l2_placement_keeps_static_ordered_segment_windows() {
         for map in [L2Map::Block, L2Map::RoundRobin] {
             let l = L2Layout {
                 sms: 2,
@@ -3269,25 +3382,31 @@ mod seg_window_tests {
             };
             let mut b = Builder::new(8);
             b.set_l2_placement(Some(l));
+            b.deny_uniseg();
             let all = b.all();
             let a = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
             b.emit(DevOp::FlashPrefill, all, &[a], |_| {});
             let p = b.finish();
-            let n_seg = l.domains;
+            let n_seg = 2;
             let ofs = static_seg_ofs(&p.stream, &p.stream_ofs, &p.stream_len, n_seg).unwrap();
             let row = n_seg as usize + 1;
             for cu in 0..p.n_cu as usize {
                 let len = p.stream_len[cu] as usize;
                 let r = &ofs[cu * row..(cu + 1) * row];
-                let mine = l.domain_of(cu as u32);
                 for s in 0..n_seg {
                     let (lo, hi) = (r[s as usize], r[s as usize + 1]);
-                    let want = if s == mine { len as u32 } else { 0 };
+                    let want = 1;
                     assert_eq!(
                         hi - lo,
                         want,
                         "{map:?} cu {cu} seg {s}: expected {want} entries"
                     );
+                }
+                let o = p.stream_ofs[cu] as usize;
+                for e in &p.stream[o..o + len] {
+                    let got = ((e.flags & crate::dev::SE_DOMAIN_MASK)
+                        >> crate::dev::SE_DOMAIN_SHIFT) as u32;
+                    assert_eq!(got, l.domain_of(cu as u32));
                 }
             }
         }
@@ -3305,6 +3424,80 @@ mod seg_window_tests {
         let stream = vec![e(0), e(1), e(0)];
         let err = static_seg_ofs(&stream, &[0], &[3], 2).unwrap_err();
         assert!(err.contains("not monotonic"), "unexpected error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod lean_moe_stage2_tests {
+    use super::*;
+
+    fn program(enabled: bool, inter_dim: u32) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_lean_moe_stage2_segments(enabled);
+        let tensors: Vec<_> = (0..8).map(|i| b.tensor(&format!("moe{i}"), 4096)).collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let down = b.emit(DevOp::MoeGroupDownPf, all.clone(), &[before], |d| {
+            d.t.copy_from_slice(&tensors);
+            d.i = [3584, inter_dim, 896, 2, 0, 0, 0, 0];
+        });
+        let combine = b.emit(DevOp::MoeCombinePf, all.clone(), &[down], |d| {
+            d.t[0] = tensors[0];
+            d.t[1] = TENSOR_NONE;
+            d.t[2] = TENSOR_NONE;
+            d.t[3] = tensors[0];
+            d.i = [3584, 16, 1024, 0, 0, 0, 0, 0];
+        });
+        b.emit(DevOp::Nop, all, &[combine], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn eligible_stage2_pair_gets_one_pure_segment() {
+        let p = program(true, 384);
+        let segments_for = |inst: u32| {
+            p.stream
+                .iter()
+                .filter(|e| e.inst == inst)
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(segments_for(1), segments_for(2));
+        assert_ne!(segments_for(0), segments_for(1));
+        assert_ne!(segments_for(2), segments_for(3));
+        assert_eq!((p.insts[1].wait_len, p.insts[2].succ_len), (0, 0));
+    }
+
+    #[test]
+    fn stage2_route_is_opt_in_and_shape_gated() {
+        let disabled = program(false, 384);
+        assert_eq!(
+            disabled
+                .stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
+        let mut unsupported = Builder::new(1);
+        let tensors: Vec<_> = (0..8)
+            .map(|i| unsupported.tensor(&format!("moe{i}"), 4096))
+            .collect();
+        let all = unsupported.all();
+        unsupported.emit(DevOp::MoeGroupDownPf, all.clone(), &[], |d| {
+            d.t.copy_from_slice(&tensors);
+            d.i = [3584, 512, 896, 2, 0, 0, 0, 0];
+        });
+        unsupported.emit(DevOp::MoeCombinePf, all, &[0], |d| {
+            d.t[0] = tensors[0];
+            d.t[1] = TENSOR_NONE;
+            d.t[2] = TENSOR_NONE;
+            d.t[3] = tensors[0];
+            d.i = [3584, 16, 1024, 0, 0, 0, 0, 0];
+        });
+        assert!(!lean_moe_stage2_pair(&unsupported.ops, 0));
     }
 }
 
@@ -3442,6 +3635,15 @@ mod v6_tests {
         // reserved[0] should be 0 in v5
         let r0 = u64::from_le_bytes(v5[40..48].try_into().unwrap());
         assert_eq!(r0, 0);
+    }
+
+    #[test]
+    fn independent_l2_segment_layout_bumps_container_magic() {
+        let mut m = tiny_model();
+        m.progs[0].l2_sms = 1;
+        m.progs[0].l2_domains = 2;
+        assert_eq!(&m.to_blob()[..8], BLOB_MAGIC_L2SEG);
+        assert_eq!(&m.to_blob_v6(&[])[..8], BLOB_MAGIC_L2SEG);
     }
 
     #[test]

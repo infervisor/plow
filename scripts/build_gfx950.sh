@@ -46,7 +46,8 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       i_decode_fp8kv.co i_decode_fp8kv_gq.co interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf \
       i_prefill_mla_moe.co i_prefill_mla_moe_gq.co \
       interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf \
-      kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf
+      kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf \
+      moe_stage2_mxfp4_gfx950.co moe_stage2_mxfp4_gfx950.elf
 
 genco() { # <extra-defs> <out.co>
   hipcc --offload-arch="$ARCH" -O3 -w $1 --genco "$R/amd/interp.hip" -o "$2" $INC
@@ -68,6 +69,16 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_fused" = 1 ]; then
     -DPLOW_REQUIRED_MARKER=plow_kda_decode_fused_256x16_2 \
     "$R/amd/kda_decode_fused.hip"
   KDA_FUSED_ELFS="kda_decode_fused_gfx950.elf"
+fi
+
+MOE_STAGE2_ELFS=""
+if [ "$ARCH" = gfx950 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_stage2_mxfp4_gfx950.elf" plow_moe2_mxfp4_16x16x128_gfx950 144 2 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe2_mxfp4_stage2_abi_1 \
+    "$R/bench/amd/lean_moe_stage2_ref/native_kernel.hip"
+  MOE_STAGE2_ELFS="moe_stage2_mxfp4_gfx950.elf"
 fi
 
 # DECODE BATCH BUCKET -> PLOW_GEMV_MM. THIS ROUTE WAS MISSING, and it is why batched decode
@@ -235,14 +246,17 @@ BUILD_MOE=0; [ "${PLOW_MOE_PREFILL:-0}" = 1 ] && { BUILD_MOE=1; BUILD_MLA=1; }
 # spill 0 — IDENTICAL to the plain GQ decode object. The XCC id lands in a scalar register, so
 # the hottest loop in the interpreter pays nothing for it.
 L2D=""
-if [ "${PLOW_L2_PLACE:-0}" = 1 ]; then
+HIERD=""
+HIER_STATUS="off"
+if [ "${PLOW_L2_PLACE:-1}" = 1 ]; then
   L2D="-DPLOW_L2_PLACE_DISPATCH"
-  echo "   PLOW_L2_PLACE=1: decode GQ object built with L2-domain dispatch (XCC_ID window select)"
+  if [ "${PLOW_GATE_HIER:-1}" = 1 ]; then HIERD="-DPLOW_GATE_HIER=1"; HIER_STATUS="on"; fi
+  echo "   per-XCD packet queues: prefill+decode L2 dispatch; decode hierarchy=$HIER_STATUS"
 fi
 if [ "$BUILD_GQ" = 1 ]; then
   for B in 0 1; do
     N=$([ "$B" -eq 0 ] && echo prefill || echo decode)
-    D=$([ "$B" -eq 0 ] && echo "-DPLOW_BUCKET_DECODE=0" || echo "$DEC $L2D")
+    D=$([ "$B" -eq 0 ] && echo "-DPLOW_BUCKET_DECODE=0 $L2D" || echo "$DEC $L2D $HIERD")
     genco "$D -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" "i_${N}_gq.co"
     unbundle "i_${N}_gq.co" "interp_${N}_gq.elf"
   done
@@ -250,7 +264,7 @@ if [ "$BUILD_GQ" = 1 ]; then
   # one — it is the SAME object with one extra scalar read, and if that ever costs occupancy the
   # build must fail rather than ship a decode kernel at occ 1.
   # GQ flash object (Gemma's segmented 4-wave flash segment under the global queue).
-  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_flash_gq.co
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" i_flash_gq.co
   unbundle i_flash_gq.co interp_flash_gq.elf
 fi
 
@@ -511,7 +525,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $KDA_FUSED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $KDA_FUSED_ELFS $MOE_STAGE2_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.

@@ -1160,10 +1160,14 @@ typedef struct {
  * zero means "no hierarchy, every workgroup does its own maintenance" — the original behaviour.
  *
  * `flags` is read ONLY through masks (`e.flags & PLOW_SE_XCTR`), never compared whole, so the
- * high bits are free. 9 bits holds the 256-workgroup maximum; bit 15 stays spare. */
+ * high bits are free. 9 bits holds the 256-workgroup maximum; bits 13..15 carry
+ * the L2 domain independently from the ordered kernel-family segment below. */
 #define PLOW_SE_NPER_SHIFT 4u
 #define PLOW_SE_NPER_MASK  0x1FF0u /* bits 4..12 */
 #define PLOW_SE_NPER(f) (((f) & PLOW_SE_NPER_MASK) >> PLOW_SE_NPER_SHIFT)
+#define PLOW_SE_DOMAIN_SHIFT 13u
+#define PLOW_SE_DOMAIN_MASK  0xE000u /* bits 13..15: up to eight XCDs */
+#define PLOW_SE_DOMAIN(f) (((f) & PLOW_SE_DOMAIN_MASK) >> PLOW_SE_DOMAIN_SHIFT)
 
 typedef struct {
     uint32_t inst;
@@ -1173,7 +1177,7 @@ typedef struct {
     uint16_t wait_len;
     uint16_t succ_len;
     uint16_t flags;
-    uint16_t seg; /* wave-class segment id (segmented dispatch); 0 when unsegmented. Was _pad. */
+    uint16_t seg; /* ordered kernel-family segment; L2 domain is independent in flags */
 } PlowStreamEnt;
 
 /* Per-(workgroup, packet) trace record.
@@ -1231,17 +1235,16 @@ typedef struct {
      * can relaunch it once per wave-class segment (see the design notes). An
      * unsegmented program has n_seg==1 and every entry seg==0, so cur_seg==0 runs everything. */
     uint32_t             cur_seg;
-    /* L2-DOMAIN PLACEMENT (PLOW_L2_PLACE): number of L2 domains `gq_seg_ofs` is windowed by,
-     * 0 when the program is not placed. Under -DPLOW_L2_PLACE_DISPATCH the interpreter picks its
-     * window from the domain it is PHYSICALLY running on rather than from `cur_seg`, so all
-     * domains drain concurrently in ONE launch instead of one launch per wave-class segment. */
+    /* L2-DOMAIN PLACEMENT (PLOW_L2_PLACE): physical domains per ordered kernel-family segment, or 0.
+     * The interpreter drains window `cur_seg*l2_domains + physical_domain`, so all XCD queues
+     * within one ordered segment run concurrently. */
     uint32_t             l2_domains;
     /* Segments `seg_ofs` is built for; the row stride there is n_seg+1. Only read when
      * `seg_ofs != NULL`. */
     uint32_t             n_seg;
     /* BOTH of the two fields above once shared the single spare `_segpad` u32 — they were added
      * on independent branches and each claimed it. They are genuinely independent: `l2_domains`
-     * windows the GLOBAL QUEUE by physical L2 domain, `n_seg` describes the STATIC per-CU
+     * partitions the dynamic queue by physical L2 domain, `n_seg` describes the STATIC per-CU
      * `seg_ofs` table by wave-class segment. Keeping both costs 8 bytes (4 for the field, 4 for
      * the alignment pad before `gq_stream`) and every gfx950 code object must be rebuilt; the
      * kernarg-size check in AmdEngine::load refuses a stale object by name rather than faulting. */
@@ -1270,7 +1273,7 @@ typedef struct {
     /* Global-queue interpreter (Experiment E1, built only under PLOW_GLOBAL_QUEUE). The static
      * kernel never reads these; the host leaves them NULL unless PLOW_GLOBAL_QUEUE is selected. */
     const PlowStreamEnt* gq_stream;  /* op-major (topological) permutation of `stream`          */
-    const uint32_t*      gq_seg_ofs; /* [n_seg+1] segment window bounds into gq_stream           */
+    const uint32_t*      gq_seg_ofs; /* bounds; placed index = host_seg*l2_domains + domain      */
     uint32_t*            gq_cursor;   /* 1-word shared fetch-add cursor, zeroed per launch        */
     /* ===== CROSS-GPU (tensor-parallel) fields. Single-GPU runs leave these NULL/0 =====
      * Appended AFTER gq_cursor so every existing field (notably `trace`) keeps its offset

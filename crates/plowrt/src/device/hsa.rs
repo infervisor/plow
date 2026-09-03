@@ -510,6 +510,11 @@ impl HsaKernel {
     pub fn kernarg_size(&self) -> u32 {
         self.kernarg_size
     }
+
+    /// Per-lane scratch bytes baked into the code object.
+    pub fn private_segment_size(&self) -> u32 {
+        self.private_segment_size
+    }
 }
 
 // ─── Trampoline-based discovery ──────────────────────────────────────────────

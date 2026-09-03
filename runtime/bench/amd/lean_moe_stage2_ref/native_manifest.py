@@ -8,8 +8,14 @@ import tempfile
 from pathlib import Path
 
 
-EXPECTED_TEXT_SHA256 = "374a485d18af2f762718ddfff762909210af357004704ef746e6864afbd94282"
+EXPECTED_TEXT_SHA256 = "f674181028962ef4d440ee01de88fc2cd856e3a0707e0d867dbe71587d02f66b"
 SYMBOL = "plow_moe2_mxfp4_16x16x128_gfx950"
+MARKERS = (
+    "plow_moe2_mxfp4_stage2_abi_1",
+    "plow_moe2_mxfp4_stage2_no_spill_1",
+    "plow_moe2_mxfp4_stage2_dynamic_lds_16640",
+    "plow_moe2_mxfp4_stage2_vgpr_le_144",
+)
 
 
 def field(notes, name):
@@ -17,6 +23,15 @@ def field(notes, name):
     if not match:
         raise SystemExit(f"missing AMDGPU metadata field {name}")
     return int(match.group(1))
+
+
+def kernel_notes(notes, symbol):
+    pos = notes.find(f".name:           {symbol}")
+    if pos < 0:
+        raise SystemExit(f"missing AMDGPU metadata for {symbol}")
+    begin = notes.rfind("  - .agpr_count:", 0, pos)
+    end = notes.find("\n  - .agpr_count:", pos)
+    return notes[begin if begin >= 0 else 0:end if end >= 0 else len(notes)]
 
 
 def main():
@@ -36,18 +51,23 @@ def main():
     notes = subprocess.check_output([readelf, "-n", str(obj)], text=True)
     if f".name:           {SYMBOL}" not in notes or "amdgcn-amd-amdhsa--gfx950" not in notes:
         raise SystemExit("native object symbol/target gate failed")
+    symbols = subprocess.check_output([readelf, "-sW", str(obj)], text=True)
+    for marker in MARKERS:
+        if not re.search(rf"OBJECT .* {re.escape(marker)}$", symbols, re.MULTILINE):
+            raise SystemExit(f"native object lacks required marker {marker}")
+    knotes = kernel_notes(notes, SYMBOL)
     resources = {
-        "vgpr": field(notes, "vgpr_count"),
-        "sgpr": field(notes, "sgpr_count"),
-        "fixed_lds_bytes": field(notes, "group_segment_fixed_size"),
+        "vgpr": field(knotes, "vgpr_count"),
+        "sgpr": field(knotes, "sgpr_count"),
+        "fixed_lds_bytes": field(knotes, "group_segment_fixed_size"),
         "dynamic_lds_bytes": 16640,
         "lds_bytes": 16640,
-        "private_bytes": field(notes, "private_segment_fixed_size"),
-        "vgpr_spills": field(notes, "vgpr_spill_count"),
-        "sgpr_spills": field(notes, "sgpr_spill_count"),
+        "private_bytes": field(knotes, "private_segment_fixed_size"),
+        "vgpr_spills": field(knotes, "vgpr_spill_count"),
+        "sgpr_spills": field(knotes, "sgpr_spill_count"),
     }
     expected = {
-        "vgpr": 94, "sgpr": 46, "fixed_lds_bytes": 0, "dynamic_lds_bytes": 16640,
+        "vgpr": 144, "sgpr": 55, "fixed_lds_bytes": 0, "dynamic_lds_bytes": 16640,
         "lds_bytes": 16640, "private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0,
     }
     if resources != expected:
@@ -55,7 +75,7 @@ def main():
     manifest = {
         "schema": 1,
         "implementation": "native-hip",
-        "status": "gate-only-not-routed",
+        "status": "production-capability-routed",
         "generator": {
             "source": "Plow native HIP, schedule derived from MIT AITER",
             "toolchain": "nix ROCm 7.14",
@@ -73,15 +93,15 @@ def main():
             "activation": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
             "weight": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
             "output": "bf16-atomic-accumulate",
-            "weight_layout": "E,N/16,Kbytes/32,2,16,16-permute-0,1,3,4,2,5",
-            "scale_layout": "pad256x8-view-sm/32,2,16,sn/8,2,4-permute-0,3,5,2,4,1",
+            "weight_layout": "expert-table[E*3+2]-row-major-N,Kbytes",
+            "scale_layout": "expert-scale-table[E*3+2]-row-major-N,K/32",
         },
         "abi": {
-            "kernarg_bytes": 96,
+            "kernarg_bytes": 88,
             "arguments": [
-                "out*", "activation*", "weight*", "activation_scale*", "weight_scale*",
-                "sorted_token_ids*", "expert_ids*", "sorted_weights*", "num_valid_ids*",
-                "bias*", "tokens:i32", "model_dim:i32", "inter_dim:i32", "expert_blocks:i32",
+                "out*", "activation*", "weight_table*", "activation_scale*",
+                "weight_scale_table*", "meta*", "row_partidx*", "sorted_weights*",
+                "tokens:i32", "model_dim:i32", "inter_dim:i32", "experts:i32", "topk:i32",
             ],
         },
         "resources": resources,

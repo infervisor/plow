@@ -1896,6 +1896,13 @@ pub const SE_NPER_SHIFT: u16 = 4;
 /// Mask of the field at [`SE_NPER_SHIFT`] — bits 4..12.
 pub const SE_NPER_MASK: u16 = 0x1FF0;
 
+/// L2 locality domain carried independently from [`StreamEnt::seg`]. Bits
+/// 13..15 hold the eight gfx94x/gfx95x XCDs while `seg` remains the ordered
+/// ordered kernel-family segment. This lets a pure lean segment retain dynamic per-XCD GQ
+/// windows instead of choosing between segmentation and locality.
+pub const SE_DOMAIN_SHIFT: u16 = 13;
+pub const SE_DOMAIN_MASK: u16 = 0xE000;
+
 /// One entry in a CU's stream: run `inst`, taking share `slice` of its work.
 ///
 /// # Per-slice gates
@@ -1992,11 +1999,10 @@ pub struct DevProgram {
     pub trace: u64,
     /// Segmented dispatch: interp runs only this segment's entries.
     pub cur_seg: u32,
-    /// L2-domain placement (`PLOW_L2_PLACE`): the number of L2 domains `gq_seg_ofs` is windowed
-    /// by, `0` when the program is not placed. An interpreter built with
-    /// `-DPLOW_L2_PLACE_DISPATCH` picks its window from the domain it is PHYSICALLY running on
-    /// (`HW_REG_XCC_ID` on gfx9xx) rather than from `cur_seg`, so every domain drains
-    /// concurrently in ONE launch.
+    /// L2-domain placement (`PLOW_L2_PLACE`): number of physical domains per
+    /// ordered kernel-family segment, or `0`. A placed interpreter selects window
+    /// `cur_seg * l2_domains + physical_domain`, so all domains drain concurrently
+    /// inside each lean or ordinary segment launch.
     pub l2_domains: u32,
     /// Segments [`Self::seg_ofs`] is built for; the row stride there is `n_seg + 1`.
     /// Only read when `seg_ofs != 0`.
