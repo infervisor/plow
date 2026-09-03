@@ -331,6 +331,8 @@ pub struct Builder {
     lean_moe_combine_segments: bool,
     /// Isolate BT64/D128 chunk-KDA intra packets for a standalone gfx950 object.
     lean_kda_intra_segments: bool,
+    /// Isolate exact qpre BT64/D128 Wu->carry pairs for standalone gfx950 objects.
+    lean_kda_key_factor_segments: bool,
     /// Fold an eligible materialized Residual into its AttnRes consumer.
     fuse_materialized_residual_inputs: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
@@ -438,6 +440,42 @@ fn lean_moe_combine_inst(inst: &DevInst) -> bool {
         && inst.j.iter().all(|&v| v == 0)
 }
 
+fn lean_kda_key_factor_pair(ops: &[Op], i: usize) -> bool {
+    let Some((wu, carry)) = ops.get(i).zip(ops.get(i + 1)) else {
+        return false;
+    };
+    let (w, c) = (&wu.inst, &carry.inst);
+    w.op == DevOp::KdaChunkWu as u16
+        && c.op == DevOp::KdaChunkCarry as u16
+        && w.i[0] >= 512
+        && w.i[0] == c.i[0]
+        && w.i[1] != 0
+        && w.i[1] == c.i[1]
+        && w.i[2] == 128
+        && w.i[2] == c.i[2]
+        && w.i[3] == 128
+        && w.i[3] == c.i[3]
+        && w.i[4] == 1
+        && c.i[4] == 1
+        && w.i[5..].iter().all(|&v| v == 0)
+        && c.i[5..].iter().all(|&v| v == 0)
+        && w.t.iter().all(|&t| t != TENSOR_NONE)
+        && c.t.iter().all(|&t| t != TENSOR_NONE)
+        && c.t[2] == w.t[7]
+        && c.t[3] == w.t[3]
+        && c.t[4] == w.t[0]
+        && c.t[5] == w.t[1]
+        && c.t[7] == w.t[5]
+        && w.f[0].to_bits() == c.f[0].to_bits()
+        && w.f[0].is_finite()
+        && w.f[0] > 0.0
+        && w.f[1..].iter().all(|&v| v.to_bits() == 0)
+        && c.f[1..].iter().all(|&v| v.to_bits() == 0)
+        && w.j.iter().all(|&v| v == 0)
+        && c.j.iter().all(|&v| v == 0)
+        && carry.deps.iter().any(|d| d.producer() as usize == i)
+}
+
 impl Builder {
     pub fn new(n_cu: u32) -> Self {
         Self {
@@ -453,6 +491,7 @@ impl Builder {
             lean_moe_stage1_segments: false,
             lean_moe_combine_segments: false,
             lean_kda_intra_segments: false,
+            lean_kda_key_factor_segments: false,
             fuse_materialized_residual_inputs: true,
             gemv_split: 1,
             tensor_dedup: false,
@@ -514,6 +553,10 @@ impl Builder {
 
     pub fn set_lean_kda_intra_segments(&mut self, enabled: bool) {
         self.lean_kda_intra_segments = enabled;
+    }
+
+    pub fn set_lean_kda_key_factor_segments(&mut self, enabled: bool) {
+        self.lean_kda_key_factor_segments = enabled;
     }
 
     pub fn set_fuse_materialized_residual_inputs(&mut self, enabled: bool) {
@@ -1519,6 +1562,9 @@ impl Builder {
                     && op.inst.i[1] != 0
                     && op.inst.i[2] == 128
             });
+        let lean_kda_key_factor = !uniseg
+            && self.lean_kda_key_factor_segments
+            && (0..self.ops.len()).any(|i| lean_kda_key_factor_pair(&self.ops, i));
         // This encoding is understood only by its dedicated interpreter object. As with the
         // raw KDA boundary, keep it isolated even when PLOW_UNISEG was requested; otherwise the
         // ordinary XReduce arm would silently interpret the fused operand slots as its legacy
@@ -1599,6 +1645,10 @@ impl Builder {
                 && self.ops[i].inst.i[2] == 128
             {
                 11
+            } else if lean_kda_key_factor && lean_kda_key_factor_pair(&self.ops, i) {
+                16
+            } else if lean_kda_key_factor && i > 0 && lean_kda_key_factor_pair(&self.ops, i - 1) {
+                17
             } else if lean_moe_stage2 && lean_moe_stage2_pair(&self.ops, i) {
                 // The standalone gfx950 kernel owns exactly the deterministic Down scatter.
                 // Combine stays in the following interpreter segment and preserves fixed-order
@@ -1721,6 +1771,7 @@ impl Builder {
             || lean_moe_stage1
             || lean_moe_combine
             || lean_kda_intra
+            || lean_kda_key_factor
             || xr_attnres
             || mla_materialized;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
@@ -3991,6 +4042,78 @@ mod lean_kda_intra_tests {
     #[test]
     fn intra_segmentation_is_opt_in_and_d128_only() {
         for p in [program(false, 128), program(true, 64)] {
+            assert_eq!(
+                p.stream
+                    .iter()
+                    .map(|e| e.seg)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                1
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod lean_kda_key_factor_tests {
+    use super::*;
+
+    fn program(enabled: bool, dim: u32, qpre: u32) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_lean_kda_key_factor_segments(enabled);
+        let tensors: Vec<_> = (0..12)
+            .map(|i| b.tensor(&format!("kda{i}"), 4096))
+            .collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let wu = b.emit(DevOp::KdaChunkWu, all.clone(), &[before], |d| {
+            d.t.copy_from_slice(&tensors[..8]);
+            d.i = [8192, 12, dim, dim, qpre, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        b.emit(DevOp::KdaChunkCarry, all.clone(), &[wu], |d| {
+            d.t = [
+                tensors[8],
+                tensors[9],
+                tensors[7],
+                tensors[3],
+                tensors[0],
+                tensors[1],
+                tensors[10],
+                tensors[5],
+            ];
+            d.i = [8192, 12, dim, dim, qpre, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        b.emit(DevOp::Nop, all, &[2], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn eligible_pair_gets_two_pure_ordered_raw_segments() {
+        let p = program(true, 128, 1);
+        let seg = |inst| {
+            p.stream
+                .iter()
+                .find(|e| e.inst == inst)
+                .expect("instruction has a stream entry")
+                .seg
+        };
+        assert_ne!(seg(0), seg(1));
+        assert_ne!(seg(1), seg(2));
+        assert_ne!(seg(2), seg(3));
+        assert_eq!((p.insts[1].wait_len, p.insts[1].succ_len), (0, 0));
+        assert_eq!((p.insts[2].wait_len, p.insts[2].succ_len), (0, 0));
+    }
+
+    #[test]
+    fn segmentation_requires_exact_qpre_d128_pair() {
+        for p in [
+            program(false, 128, 1),
+            program(true, 64, 1),
+            program(true, 128, 0),
+        ] {
             assert_eq!(
                 p.stream
                     .iter()

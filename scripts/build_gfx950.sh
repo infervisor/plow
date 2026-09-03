@@ -48,6 +48,8 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf \
       kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf \
       kda_chunk_intra_cached_gfx950.co kda_chunk_intra_cached_gfx950.elf \
+      kda_chunk_key_factor_wu_gfx950.co kda_chunk_key_factor_wu_gfx950.elf \
+      kda_chunk_key_factor_carry_gfx950.co kda_chunk_key_factor_carry_gfx950.elf \
       xreduce_attnres_gfx950.co xreduce_attnres_gfx950.elf \
       moe_stage1_mxfp4_gfx950.co moe_stage1_mxfp4_gfx950.elf \
       moe_stage2_mxfp4_gfx950.co moe_stage2_mxfp4_gfx950.elf \
@@ -77,6 +79,20 @@ if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_INTRA_CACHED:-0}" = 1 ]; then
     -DPLOW_REQUIRED_MARKER=plow_kda_intra_cached_abi_1 \
     "$R/amd/kda_chunk_intra_cached.hip"
   KDA_INTRA_CACHED_ELFS="kda_chunk_intra_cached_gfx950.elf"
+fi
+
+KDA_KEY_FACTOR_ELFS=""
+if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_KEY_FACTOR:-0}" = 1 ]; then
+  for role in wu carry; do
+    bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+      "$OUT/kda_chunk_key_factor_${role}_gfx950.elf" \
+      "plow_kda_chunk_key_factor_${role}_gfx950" 160 3 \
+      $INC \
+      -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+      -DPLOW_REQUIRED_MARKER="plow_kda_key_factor_${role}_1" \
+      "$R/amd/kda_chunk_key_factor_${role}.hip"
+  done
+  KDA_KEY_FACTOR_ELFS="kda_chunk_key_factor_wu_gfx950.elf kda_chunk_key_factor_carry_gfx950.elf"
 fi
 
 XR_ATTNRES_ELFS=""
@@ -591,7 +607,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.

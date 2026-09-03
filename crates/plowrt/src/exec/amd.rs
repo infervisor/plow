@@ -501,6 +501,52 @@ struct KdaChunkIntraCachedArgs {
 
 const _: () = assert!(std::mem::size_of::<KdaChunkIntraCachedArgs>() == 64);
 
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaChunkKeyFactorWuArgs {
+    w: u64,
+    u: u64,
+    key_hi: u64,
+    key_lo: u64,
+    q: u64,
+    ainv: u64,
+    k: u64,
+    v: u64,
+    g: u64,
+    beta: u64,
+    t: u32,
+    heads: u32,
+    dim: u32,
+    value_dim: u32,
+    scale: f32,
+    _pad: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaChunkKeyFactorWuArgs>() == 104);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaChunkKeyFactorCarryArgs {
+    out: u64,
+    state: u64,
+    q: u64,
+    k: u64,
+    key_hi: u64,
+    key_lo: u64,
+    w: u64,
+    u: u64,
+    aqk: u64,
+    g: u64,
+    t: u32,
+    heads: u32,
+    dim: u32,
+    value_dim: u32,
+    scale: f32,
+    _pad: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaChunkKeyFactorCarryArgs>() == 104);
+
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 struct XReduceAttnResArgs {
@@ -669,6 +715,14 @@ enum PrefillSegmentRoute {
     },
     KdaChunkIntraCached {
         args: KdaChunkIntraCachedArgs,
+        grid: u32,
+    },
+    KdaChunkKeyFactorWu {
+        args: KdaChunkKeyFactorWuArgs,
+        grid: u32,
+    },
+    KdaChunkKeyFactorCarry {
+        args: KdaChunkKeyFactorCarryArgs,
         grid: u32,
     },
     MoeStage1Mxfp4(MoeStage1Mxfp4Route),
@@ -966,6 +1020,166 @@ fn kda_chunk_intra_cached_inst(d: &DevInst64) -> bool {
         && f32::from_bits(d.fj[0]).is_finite()
         && f32::from_bits(d.fj[0]) > 0.0
         && d.fj[1..].iter().all(|&v| v == 0)
+}
+
+fn kda_key_factor_pair(w: &DevInst64, c: &DevInst64) -> bool {
+    w.op == DevOp::KdaChunkWu as u16
+        && c.op == DevOp::KdaChunkCarry as u16
+        && w.blocks != 0
+        && c.blocks != 0
+        && w.i[0] >= 512
+        && w.i[0] == c.i[0]
+        && w.i[1] != 0
+        && w.i[1] == c.i[1]
+        && w.i[2] == 128
+        && w.i[2] == c.i[2]
+        && w.i[3] == 128
+        && w.i[3] == c.i[3]
+        && w.i[4] == 1
+        && c.i[4] == 1
+        && w.i[5..].iter().all(|&v| v == 0)
+        && c.i[5..].iter().all(|&v| v == 0)
+        && w.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+        && c.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+        && c.t[2] == w.t[7]
+        && c.t[3] == w.t[3]
+        && c.t[4] == w.t[0]
+        && c.t[5] == w.t[1]
+        && c.t[7] == w.t[5]
+        && w.fj[0] == c.fj[0]
+        && f32::from_bits(w.fj[0]).is_finite()
+        && f32::from_bits(w.fj[0]) > 0.0
+        && w.fj[1..].iter().all(|&v| v == 0)
+        && c.fj[1..].iter().all(|&v| v == 0)
+}
+
+fn kda_key_factor_segment_pairs(prog: &DevProg) -> Vec<(usize, usize, usize, usize)> {
+    let mut members = std::collections::BTreeMap::<u16, std::collections::BTreeSet<usize>>::new();
+    for entry in &prog.stream {
+        members
+            .entry(entry.seg)
+            .or_default()
+            .insert(entry.inst as usize);
+    }
+    let singleton_seg = |inst: usize| {
+        members
+            .iter()
+            .find_map(|(&seg, set)| (set.len() == 1 && set.contains(&inst)).then_some(seg as usize))
+    };
+    prog.insts
+        .windows(2)
+        .enumerate()
+        .filter_map(|(i, pair)| {
+            if !kda_key_factor_pair(&pair[0], &pair[1]) {
+                return None;
+            }
+            let wu_seg = singleton_seg(i)?;
+            let carry_seg = singleton_seg(i + 1)?;
+            (wu_seg != carry_seg).then_some((wu_seg, carry_seg, i, i + 1))
+        })
+        .collect()
+}
+
+fn kda_key_factor_scratch_half_bytes(progs: &[DevProg]) -> Result<u64> {
+    let mut max_half = 0u64;
+    for prog in progs {
+        for (_, _, wu, _) in kda_key_factor_segment_pairs(prog) {
+            let d = &prog.insts[wu];
+            let bytes = u64::from(d.i[0])
+                .checked_mul(u64::from(d.i[1]))
+                .and_then(|v| v.checked_mul(u64::from(d.i[2])))
+                .and_then(|v| v.checked_mul(2))
+                .ok_or_else(|| {
+                    RuntimeError::Device("KDA key-factor scratch size overflows".into())
+                })?;
+            max_half = max_half.max(bytes);
+        }
+    }
+    Ok(max_half)
+}
+
+fn add_kda_key_factor_routes(
+    prog: &DevProg,
+    devp: &[DeviceMem],
+    routes: &mut [PrefillSegmentRoute],
+    scratch: Option<(u64, u64)>,
+) -> Result<()> {
+    let Some((key_hi, half_bytes)) = scratch else {
+        return Ok(());
+    };
+    let key_lo = key_hi
+        .checked_add(half_bytes)
+        .ok_or_else(|| RuntimeError::Device("KDA key-factor scratch address overflows".into()))?;
+    let addr = |h: u16, what: &str| -> Result<u64> {
+        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "KDA key-factor operand `{what}` handle {h} is invalid"
+            ))
+        })
+    };
+    for (wu_seg, carry_seg, wi, ci) in kda_key_factor_segment_pairs(prog) {
+        let w = &prog.insts[wi];
+        let c = &prog.insts[ci];
+        let need = u64::from(w.i[0]) * u64::from(w.i[1]) * u64::from(w.i[2]) * 2;
+        if need > half_bytes {
+            return Err(RuntimeError::Device(format!(
+                "KDA key-factor route needs {need} bytes per half, allocation has {half_bytes}"
+            )));
+        }
+        routes[wu_seg] = PrefillSegmentRoute::KdaChunkKeyFactorWu {
+            args: KdaChunkKeyFactorWuArgs {
+                w: addr(w.t[0], "W")?,
+                u: addr(w.t[1], "U")?,
+                key_hi,
+                key_lo,
+                q: addr(w.t[7], "q")?,
+                ainv: addr(w.t[2], "Ainv")?,
+                k: addr(w.t[3], "k")?,
+                v: addr(w.t[4], "v")?,
+                g: addr(w.t[5], "g")?,
+                beta: addr(w.t[6], "beta")?,
+                t: w.i[0],
+                heads: w.i[1],
+                dim: w.i[2],
+                value_dim: w.i[3],
+                scale: f32::from_bits(w.fj[0]),
+                _pad: 0,
+            },
+            grid: u32::from(w.blocks),
+        };
+        routes[carry_seg] = PrefillSegmentRoute::KdaChunkKeyFactorCarry {
+            args: KdaChunkKeyFactorCarryArgs {
+                out: addr(c.t[0], "out")?,
+                state: addr(c.t[1], "state")?,
+                q: addr(c.t[2], "q")?,
+                k: addr(c.t[3], "k")?,
+                key_hi,
+                key_lo,
+                w: addr(c.t[4], "W")?,
+                u: addr(c.t[5], "U")?,
+                aqk: addr(c.t[6], "Aqk")?,
+                g: addr(c.t[7], "g")?,
+                t: c.i[0],
+                heads: c.i[1],
+                dim: c.i[2],
+                value_dim: c.i[3],
+                scale: f32::from_bits(c.fj[0]),
+                _pad: 0,
+            },
+            grid: u32::from(c.blocks),
+        };
+    }
+    Ok(())
+}
+
+fn rebase_kda_key_factor_routes(routes: &mut [PrefillSegmentRoute], t: u32) {
+    for route in routes {
+        match route {
+            PrefillSegmentRoute::KdaChunkKeyFactorWu { args, .. } => args.t = t,
+            PrefillSegmentRoute::KdaChunkKeyFactorCarry { args, .. } => args.t = t,
+            _ => {}
+        }
+    }
 }
 
 fn has_moe_stage2_mxfp4_segment(prog: &DevProg) -> bool {
@@ -5429,6 +5643,10 @@ pub struct AmdEngine {
     k_decode: HsaKernel,
     k_kda_decode_fused: Option<HsaKernel>,
     k_kda_chunk_intra_cached: Option<HsaKernel>,
+    k_kda_key_factor_wu: Option<HsaKernel>,
+    k_kda_key_factor_carry: Option<HsaKernel>,
+    /// One reusable `[hi | lo]` BF16 key-factor pair, sized for the widest eligible program.
+    _kda_key_factor_scratch: Option<DeviceMem>,
     k_moe_stage1_mxfp4: Option<HsaKernel>,
     k_moe_stage2_mxfp4: Option<HsaKernel>,
     k_moe_combine: Option<HsaKernel>,
@@ -6741,6 +6959,102 @@ impl AmdEngine {
             None
         };
 
+        let need_kda_key_factor = arch == "gfx950"
+            && blob.progs[..dec_ix]
+                .iter()
+                .any(|p| !kda_key_factor_segment_pairs(p).is_empty());
+        let (k_kda_key_factor_wu, k_kda_key_factor_carry) = if need_kda_key_factor {
+            const COMMON: [&str; 7] = [
+                "plow_kda_key_factor_abi_1",
+                "plow_kda_key_factor_pair_1",
+                "plow_kda_key_factor_bt64_d128_v128_1",
+                "plow_kda_key_factor_qpre_1",
+                "plow_kda_key_factor_wave64_1",
+                "plow_kda_key_factor_nospill_1",
+                "plow_kda_key_factor_scratch_pair_bf16_1",
+            ];
+            let specs = [
+                (
+                    "kda_chunk_key_factor_wu_gfx950.elf",
+                    "plow_kda_chunk_key_factor_wu_gfx950",
+                    "plow_kda_key_factor_wu_1",
+                    "plow_kda_key_factor_wu_vgpr_le_160",
+                    std::mem::size_of::<KdaChunkKeyFactorWuArgs>() as u32,
+                    0,
+                ),
+                (
+                    "kda_chunk_key_factor_carry_gfx950.elf",
+                    "plow_kda_chunk_key_factor_carry_gfx950",
+                    "plow_kda_key_factor_carry_1",
+                    "plow_kda_key_factor_carry_vgpr_le_160",
+                    std::mem::size_of::<KdaChunkKeyFactorCarryArgs>() as u32,
+                    14_336,
+                ),
+            ];
+            let paths = specs.map(|spec| hsaco_dir.join(spec.0));
+            match (paths[0].exists(), paths[1].exists()) {
+                (false, false) => {
+                    tracing::warn!(
+                        "KDA key-factor segments have no paired objects — using interpreter fallback"
+                    );
+                    (None, None)
+                }
+                (a, b) if a != b => {
+                    return Err(RuntimeError::Device(format!(
+                        "KDA key-factor object pair is incomplete: {} exists={a}, {} exists={b}",
+                        paths[0].display(),
+                        paths[1].display()
+                    )));
+                }
+                _ => {
+                    let mut kernels = Vec::with_capacity(2);
+                    for (spec, path) in specs.into_iter().zip(paths) {
+                        let image = std::fs::read(&path).map_err(|e| {
+                            RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                        })?;
+                        let syms = elf_symbol_names(&image);
+                        for marker in COMMON.into_iter().chain([spec.2, spec.3]) {
+                            if !syms.contains(&marker) {
+                                return Err(RuntimeError::Device(format!(
+                                    "KDA key-factor object {} lacks required marker `{marker}`",
+                                    path.display()
+                                )));
+                            }
+                        }
+                        check_packet_pairing_stamp(&image, blob_path, &path)?;
+                        let module = EngineDevice::module_load(&*be, &image)?;
+                        let kernel =
+                            EngineDevice::get_function(&*be, &module, spec.1).map_err(|e| {
+                                RuntimeError::Device(format!(
+                                    "{}: no symbol {}: {e}",
+                                    spec.0, spec.1
+                                ))
+                            })?;
+                        let got = kernel.kernarg_size();
+                        if got != spec.4 && got != spec.4 + 256 {
+                            return Err(RuntimeError::Device(format!(
+                                "{}: kernarg segment is {got} B; expected {} (or {} with COv5 implicit args)",
+                                spec.0, spec.4, spec.4 + 256
+                            )));
+                        }
+                        let lds = HsaBackend::kernel_lds_bytes(&kernel);
+                        let private = kernel.private_segment_size();
+                        if lds != spec.5 || private != 0 {
+                            return Err(RuntimeError::Device(format!(
+                                "{}: resource gate failed: LDS={lds} (required {}), private={private} (required 0)",
+                                spec.0, spec.5
+                            )));
+                        }
+                        modules.push(module);
+                        kernels.push(kernel);
+                    }
+                    (Some(kernels[0]), Some(kernels[1]))
+                }
+            }
+        } else {
+            (None, None)
+        };
+
         let k_moe_stage1_mxfp4 = if arch == "gfx950" && need_moe_stage1_lean {
             const NAME: &str = "moe_stage1_mxfp4_gfx950.elf";
             const SYMBOL: &str = "plow_moe1_mxfp4_bk256_gfx950";
@@ -7464,6 +7778,24 @@ impl AmdEngine {
         let table: Vec<u8> = devp.iter().flat_map(|m| m.base.to_le_bytes()).collect();
         let d_tens = EngineDevice::alloc(&*be, table.len().max(1) as u64)?;
         EngineDevice::upload(&*be, &d_tens, 0, &table)?;
+        let kda_key_factor_half =
+            if k_kda_key_factor_wu.is_some() && k_kda_key_factor_carry.is_some() {
+                kda_key_factor_scratch_half_bytes(&blob.progs[..dec_ix])?
+            } else {
+                0
+            };
+        let d_kda_key_factor_scratch = if kda_key_factor_half != 0 {
+            let bytes = kda_key_factor_half.checked_mul(2).ok_or_else(|| {
+                RuntimeError::Device("KDA key-factor scratch pair size overflows".into())
+            })?;
+            tracing::info!(bytes, "allocating one reusable KDA key-factor scratch pair");
+            Some(EngineDevice::alloc(&*be, bytes)?)
+        } else {
+            None
+        };
+        let kda_key_factor_scratch = d_kda_key_factor_scratch
+            .as_ref()
+            .map(|m| (m.base, kda_key_factor_half));
 
         // OPTIONAL, because a BLOCK asset is not a model. A block takes
         // `act.x` in and gives `act.x` out — it has no embedding, no lm_head,
@@ -7496,6 +7828,7 @@ impl AmdEngine {
                 vec![PrefillSegmentRoute::Interpreter; seg_class.len()]
             };
             if prog_ix < dec_ix {
+                add_kda_key_factor_routes(p, &devp, &mut prefill_routes, kda_key_factor_scratch)?;
                 mla_materialized_routes(p, &devp, &mut prefill_routes)?;
                 let has_materialized = prefill_routes.iter().any(|r| {
                     matches!(
@@ -8030,6 +8363,9 @@ impl AmdEngine {
             k_decode,
             k_kda_decode_fused,
             k_kda_chunk_intra_cached,
+            k_kda_key_factor_wu,
+            k_kda_key_factor_carry,
+            _kda_key_factor_scratch: d_kda_key_factor_scratch,
             k_moe_stage1_mxfp4,
             k_moe_stage2_mxfp4,
             k_moe_combine,
@@ -8603,6 +8939,41 @@ impl AmdEngine {
                     kernel,
                     grid,
                     WG_THREADS_8,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let (Some(kernel), Some(PrefillSegmentRoute::KdaChunkKeyFactorWu { args, grid })) = (
+                self.k_kda_key_factor_wu,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let (
+                Some(kernel),
+                Some(PrefillSegmentRoute::KdaChunkKeyFactorCarry { args, grid }),
+            ) = (
+                self.k_kda_key_factor_carry,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    256,
                     0,
                     as_bytes(std::slice::from_ref(&args)),
                     None,
@@ -9213,6 +9584,7 @@ impl AmdEngine {
         };
 
         rebase_chunk_rows(insts, &self.tensor_names, c0, clen, bucket);
+        rebase_kda_key_factor_routes(&mut self.progs[prog].prefill_routes, clen);
 
         let mut lm = None;
         for (i, d) in insts.iter().enumerate() {
@@ -11232,6 +11604,74 @@ mod tests {
         prog.stream[2].seg = 1;
         let mixed = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
         assert!(matches!(mixed[1], PrefillSegmentRoute::Interpreter));
+    }
+
+    #[test]
+    fn kda_key_factor_pair_routes_share_one_scratch_pair() {
+        let mut prog = segmented_prog(&[DevOp::KdaChunkWu, DevOp::KdaChunkCarry], &[0, 1]);
+        prog.t = 8192;
+        let scale = (1.0 / 128.0f32.sqrt()).to_bits();
+        prog.insts[0].blocks = 256;
+        prog.insts[0].t = [0, 1, 2, 3, 4, 5, 6, 7];
+        prog.insts[0].i = [8192, 12, 128, 128, 1, 0, 0, 0];
+        prog.insts[0].fj[0] = scale;
+        prog.insts[1].blocks = 96;
+        prog.insts[1].t = [8, 9, 7, 3, 0, 1, 10, 5];
+        prog.insts[1].i = [8192, 12, 128, 128, 1, 0, 0, 0];
+        prog.insts[1].fj[0] = scale;
+        let tensors: Vec<_> = (0..11)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..11)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+        let half = 8192 * 12 * 128 * 2;
+        assert_eq!(
+            kda_key_factor_scratch_half_bytes(std::slice::from_ref(&prog)).unwrap(),
+            half
+        );
+        let mut routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        add_kda_key_factor_routes(&prog, &devp, &mut routes, Some((0x8000_0000, half))).unwrap();
+        let PrefillSegmentRoute::KdaChunkKeyFactorWu {
+            args: wu,
+            grid: 256,
+        } = routes[0]
+        else {
+            panic!("eligible Wu segment did not select key-factor producer")
+        };
+        let PrefillSegmentRoute::KdaChunkKeyFactorCarry {
+            args: carry,
+            grid: 96,
+        } = routes[1]
+        else {
+            panic!("eligible carry segment did not select key-factor consumer")
+        };
+        assert_eq!((wu.key_hi, carry.key_hi), (0x8000_0000, 0x8000_0000));
+        assert_eq!(
+            (wu.key_lo, carry.key_lo),
+            (0x8000_0000 + half, 0x8000_0000 + half)
+        );
+        assert_eq!(
+            (wu.w, carry.w, wu.u, carry.u),
+            (0x1000, 0x1000, 0x1100, 0x1100)
+        );
+
+        rebase_kda_key_factor_routes(&mut routes, 777);
+        let PrefillSegmentRoute::KdaChunkKeyFactorWu { args: wu, .. } = routes[0] else {
+            unreachable!()
+        };
+        let PrefillSegmentRoute::KdaChunkKeyFactorCarry { args: carry, .. } = routes[1] else {
+            unreachable!()
+        };
+        assert_eq!((wu.t, carry.t), (777, 777));
+
+        prog.insts[1].i[4] = 0;
+        assert!(kda_key_factor_segment_pairs(&prog).is_empty());
+        assert_eq!(kda_key_factor_scratch_half_bytes(&[prog]).unwrap(), 0);
     }
 
     #[test]

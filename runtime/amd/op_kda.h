@@ -593,14 +593,16 @@ __device__ void d_kda_chunk_wu_bt64(
  * walks `chunks` in order; distinct workgroups own disjoint V rows, so no cross-workgroup handoff
  * is required. The decomposition matches FLA: V' = U-WH, O = Q exp(g) H + Aqk V', then
  * H = H exp(g_last) + V'^T (K exp(g_last-g)). State is V-first f32. */
-template <bool Q_PRECOMPUTED = false>
+template <bool Q_PRECOMPUTED = false, bool KEY_PRECOMPUTED = false>
 __device__ void d_kda_chunk_carry_bt64(
     bf16* __restrict__ out, float* __restrict__ state, const bf16* __restrict__ q,
     const bf16* __restrict__ k, const bf16* __restrict__ W, const bf16* __restrict__ U,
     const float* __restrict__ Aqk, const float* __restrict__ g_cumsum_log2,
     const uint2* __restrict__ chunks, unsigned n_chunks, unsigned T, unsigned H, unsigned D,
     unsigned V, float scale, unsigned slice, unsigned nblk, float* __restrict__ st,
-    bf16* __restrict__ vsm, float* __restrict__ osm) {
+    bf16* __restrict__ vsm, float* __restrict__ osm,
+    const bf16* __restrict__ key_hi = nullptr,
+    const bf16* __restrict__ key_lo = nullptr) {
     const unsigned tid = threadIdx.x, lane = tid & 63u, wave = tid >> 6;
     const unsigned token = lane & 15u, kgroup = lane >> 4;
     const unsigned vtiles = (V + 15u) / 16u;
@@ -703,12 +705,17 @@ __device__ void d_kda_chunk_carry_bt64(
                         if (d0 + token < D && s + j < desc.y) {
                             const size_t row = row0 + s + j;
                             const size_t i = (row * H + h) * D + d0 + token;
-                            const size_t il = (last * H + h) * D + d0 + token;
-                            const float scaled =
-                                bf2f(k[i]) * exp2f(g_cumsum_log2[il] - g_cumsum_log2[i]);
-                            const bf16 high = f2bf(scaled);
-                            kf[j] = __builtin_bit_cast(bf16_t, high);
-                            kr[j] = __builtin_bit_cast(bf16_t, f2bf(scaled - bf2f(high)));
+                            if constexpr (KEY_PRECOMPUTED) {
+                                kf[j] = __builtin_bit_cast(bf16_t, key_hi[i]);
+                                kr[j] = __builtin_bit_cast(bf16_t, key_lo[i]);
+                            } else {
+                                const size_t il = (last * H + h) * D + d0 + token;
+                                const float scaled =
+                                    bf2f(k[i]) * exp2f(g_cumsum_log2[il] - g_cumsum_log2[i]);
+                                const bf16 high = f2bf(scaled);
+                                kf[j] = __builtin_bit_cast(bf16_t, high);
+                                kr[j] = __builtin_bit_cast(bf16_t, f2bf(scaled - bf2f(high)));
+                            }
                         }
                     }
                     upd = plow_mfma_bf16_16x16(vf, kf, upd);

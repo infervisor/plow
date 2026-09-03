@@ -17,21 +17,21 @@ runtime/bench/amd/kda_carry_key_precompute/run.sh
 
 `run.sh` fails if any gfx950 kernel spills, uses scratch, or falls below two waves/SIMD.
 
-## MI355X result
+## MI355X production-path result
 
 `T=8192, H=12, D=V=128`, 21 samples, one GPU:
 
-- Exact: W `0/12,582,912`, U `0/12,582,912`, output `0/12,582,912`, and final-state
+- Exact: q, W, U, and output each have `0/12,582,912` bit mismatches; final f32 state has
   `0/196,608` bit mismatches.
-- Control Wu + carry: `3.746070 ms` median.
-- Wu-produced key factors + carry: `3.600029 ms` median, including both 50.33 MB factor
-  stores; `-0.146041 ms` (`1.041x`).
-- Wu producer: 130 VGPR, 61 SGPR, occupancy 3, zero scratch/spills. Candidate carry:
-  139 VGPR, 89 SGPR, occupancy 3, zero scratch/spills. Both are wave64, 256 threads.
+- Control Wu + carry: `3.858436 ms` median.
+- Wu-produced key factors + carry: `3.731595 ms` median, including both 50.33 MB factor
+  stores; `-0.126841 ms` (`1.034x`).
+- Candidate Wu: 134 VGPR, 65 SGPR, occupancy 3. Candidate carry: 138 VGPR, 81 SGPR,
+  occupancy 3. Both have zero scratch/spills and use wave64 with 256 threads.
 
 The two BF16 factor tensors are live only from Wu to carry. Integration must allocate them from
 one reusable 50.33 MB scratch pair, not as 69 persistent per-layer tensors. At the current 69-layer
-shape, the isolated result projects to about `10.1 ms` TTFT; it is useful but substantially below
+shape, the production-path result projects to about `8.75 ms` TTFT; it is useful but substantially below
 the plan's original `100..130 ms` estimate.
 
 Rejected variant: also materializing Wu's `beta*k*exp2(g)` gave an exact

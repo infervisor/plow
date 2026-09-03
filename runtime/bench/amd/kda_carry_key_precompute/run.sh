@@ -14,7 +14,7 @@ resource() {
     sed -n "/Function Name: $1/,/Function Name:/p" "$OUT/resources" |
         grep -F "$2:" | head -1 | sed 's/^.*: *//; s/ .*$//'
 }
-for name in k_key_factors k_wu_control k_wu_key_factors k_carry_control k_carry_precomputed; do
+for name in k_wu_control k_wu_key_factors k_carry_control k_carry_precomputed; do
     vgpr=$(resource "$name" VGPRs); sgpr=$(resource "$name" TotalSGPRs)
     scratch=$(resource "$name" 'ScratchSize [bytes/lane]')
     vspill=$(resource "$name" 'VGPRs Spill'); sspill=$(resource "$name" 'SGPRs Spill')

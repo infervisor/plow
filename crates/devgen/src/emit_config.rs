@@ -379,6 +379,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_KDA_INTRA_CACHED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_intra_cached: bool,
 
+    /// Route exact qpre BT64/D128 Wu->carry pairs through spill-free gfx950 objects.
+    #[arg(long, env = "PLOW_KDA_KEY_FACTOR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_key_factor: bool,
+
     /// K3 up-projection no-gather mode (diagnostic).
     #[arg(long, env = "PLOW_K3_UP_NOGATHER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub k3_up_nogather: bool,
@@ -716,6 +720,7 @@ impl EmitConfig {
             kda_chunk: env_bool_opt("PLOW_KDA_CHUNK"),
             kda_chunk_qpre: env_opt_out("PLOW_KDA_CHUNK_QPRE"),
             kda_intra_cached: env_bool("PLOW_KDA_INTRA_CACHED"),
+            kda_key_factor: env_bool("PLOW_KDA_KEY_FACTOR"),
             k3_up_nogather: env_bool("PLOW_K3_UP_NOGATHER"),
             k3_up_gather_only: env_bool("PLOW_K3_UP_GATHER_ONLY"),
             k3_shard_head: env_bool("PLOW_K3_SHARD_HEAD"),

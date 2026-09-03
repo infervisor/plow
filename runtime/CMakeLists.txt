@@ -655,6 +655,8 @@ option(PLOW_HSACO_PACKED_PREFILL_CONSUMERS
 option(PLOW_HSACO_KDA_CHUNK "Include the opt-in BT64 chunk-KDA prefill arms" OFF)
 option(PLOW_HSACO_KDA_INTRA_CACHED
        "Build the standalone cached BT64/D128 KDA-intra segment" OFF)
+option(PLOW_HSACO_KDA_KEY_FACTOR
+       "Build the standalone exact BT64/D128 KDA Wu/carry key-factor pair" OFF)
 option(PLOW_HSACO_XR_ATTNRES
        "Build the standalone two-shot XReduce+AttnRes segment object" OFF)
 option(PLOW_HSACO_MOE_STAGE2_LEAN
@@ -1242,6 +1244,42 @@ if(PLOW_GFX950_HSACO)
             VERBATIM)
         add_custom_target(kda_chunk_intra_cached_gfx950 DEPENDS "${_hs_kda_intra_out}")
         list(APPEND _hs_outs "${_hs_kda_intra_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_KDA_KEY_FACTOR)
+        set(_hs_kda_key_wu_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_key_factor_wu.hip")
+        set(_hs_kda_key_carry_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_key_factor_carry.hip")
+        set(_hs_kda_key_wu_out "${PLOW_HSACO_DIR}/kda_chunk_key_factor_wu_gfx950.elf")
+        set(_hs_kda_key_carry_out "${PLOW_HSACO_DIR}/kda_chunk_key_factor_carry_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_kda_key_wu_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_key_wu_out}"
+                    plow_kda_chunk_key_factor_wu_gfx950 160 3
+                    ${_hs_inc} ${_hs_extra} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_key_factor_wu_1
+                    "${_hs_kda_key_wu_src}"
+            DEPENDS "${_hs_kda_key_wu_src}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_key_factor_common.h"
+                    "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+            COMMENT "hipcc kda_chunk_key_factor_wu_gfx950.elf"
+            VERBATIM)
+        add_custom_command(OUTPUT "${_hs_kda_key_carry_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_key_carry_out}"
+                    plow_kda_chunk_key_factor_carry_gfx950 160 3
+                    ${_hs_inc} ${_hs_extra} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_key_factor_carry_1
+                    "${_hs_kda_key_carry_src}"
+            DEPENDS "${_hs_kda_key_carry_src}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_key_factor_common.h"
+                    "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+            COMMENT "hipcc kda_chunk_key_factor_carry_gfx950.elf"
+            VERBATIM)
+        add_custom_target(kda_chunk_key_factor_gfx950
+            DEPENDS "${_hs_kda_key_wu_out}" "${_hs_kda_key_carry_out}")
+        list(APPEND _hs_outs "${_hs_kda_key_wu_out}" "${_hs_kda_key_carry_out}")
     endif()
 
     if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_XR_ATTNRES)
