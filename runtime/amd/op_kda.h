@@ -364,8 +364,8 @@ __device__ void d_kda_chunk_intra_bt64(
 /* Standalone gfx950 candidate for the full BT64 intra solve.  The production body above
  * regenerates the gated bf16 operands in every one of the ten lower-triangular block products.
  * This variant materializes those operands once in LDS, preserves the MFMA order, and distributes
- * each f32 substitution row across every wave.  `scratch` needs 57,344 bf16 values at D=128
- * (114,688 bytes). */
+ * the f32 substitution in the production wave/order.  `scratch` needs 57,344 bf16 values at
+ * D=128 (114,688 bytes). */
 __device__ void d_kda_chunk_intra_bt64_cached(
     float* __restrict__ Aqk, float* __restrict__ Ainv, const bf16* __restrict__ q,
     const bf16* __restrict__ k, const float* __restrict__ g_cumsum_log2,
@@ -489,22 +489,21 @@ __device__ void d_kda_chunk_intra_bt64_cached(
         }
         __syncthreads();
 
-        float* const partial = mat + 64u * 64u;
-        for (unsigned i = 0; i < valid; ++i) {
-            float sum = 0.0f;
-            for (unsigned j = 1u + wave; j < i; j += PLOW_WAVES)
-                if (lane < j) sum += mat[i * 64u + j] * mat[j * 64u + lane];
-            partial[wave * 64u + lane] = sum;
-            __syncthreads();
-            if (wave == 0 && lane <= i) {
-                float value = lane < i ? -mat[i * 64u + lane] : 1.0f;
-#pragma unroll
-                for (unsigned w = 0; w < PLOW_WAVES; ++w)
-                    value -= partial[w * 64u + lane];
-                mat[i * 64u + lane] = value;
+        if (wave == 0) {
+            for (unsigned i = 0; i < valid; ++i) {
+                const float row_value = mat[i * 64u + lane];
+                float value = lane < i ? -row_value : (lane == i ? 1.0f : 0.0f);
+#pragma unroll 1
+                for (unsigned j = 1u; j < 64u; ++j) {
+                    const float lij = __shfl(row_value, j, PLOW_WAVE);
+                    if (j < i && lane < j) value -= lij * mat[j * 64u + lane];
+                }
+                __builtin_amdgcn_wave_barrier();
+                if (lane <= i) mat[i * 64u + lane] = value;
+                __builtin_amdgcn_wave_barrier();
             }
-            __syncthreads();
         }
+        __syncthreads();
         for (unsigned x = tid; x < valid * 64u; x += PLOW_THREADS) {
             const unsigned m = x / 64u, n = x % 64u;
             Ainv[((row0 + m) * H + h) * 64u + n] = n <= m ? mat[m * 64u + n] : 0.0f;

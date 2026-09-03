@@ -1298,6 +1298,9 @@ fn k3_build_model(
         b.set_lean_moe_stage1_segments(
             crate::emit_is_amd() && emit_config::active().moe_stage1_lean,
         );
+        b.set_lean_kda_intra_segments(
+            crate::emit_is_amd() && emit_config::active().kda_intra_cached,
+        );
         b.set_packed_prefill_segments(
             std::env::var("PLOW_SEG_PACKED_PREFILL").ok().as_deref() == Some("1"),
         );

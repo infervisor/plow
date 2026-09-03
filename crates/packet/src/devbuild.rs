@@ -327,6 +327,8 @@ pub struct Builder {
     lean_moe_stage2_segments: bool,
     /// Isolate structurally compatible MXFP4 grouped-MoE stage-1 packets.
     lean_moe_stage1_segments: bool,
+    /// Isolate BT64/D128 chunk-KDA intra packets for a standalone gfx950 object.
+    lean_kda_intra_segments: bool,
     /// Fold an eligible materialized Residual into its AttnRes consumer.
     fuse_materialized_residual_inputs: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
@@ -435,6 +437,7 @@ impl Builder {
             packed_prefill_segments: false,
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
+            lean_kda_intra_segments: false,
             fuse_materialized_residual_inputs: true,
             gemv_split: 1,
             tensor_dedup: false,
@@ -488,6 +491,10 @@ impl Builder {
 
     pub fn set_lean_moe_stage1_segments(&mut self, enabled: bool) {
         self.lean_moe_stage1_segments = enabled;
+    }
+
+    pub fn set_lean_kda_intra_segments(&mut self, enabled: bool) {
+        self.lean_kda_intra_segments = enabled;
     }
 
     pub fn set_fuse_materialized_residual_inputs(&mut self, enabled: bool) {
@@ -1374,6 +1381,14 @@ impl Builder {
         let lean_moe_stage1 = !uniseg
             && self.lean_moe_stage1_segments
             && self.ops.iter().any(|op| lean_moe_stage1_inst(&op.inst));
+        let lean_kda_intra = !uniseg
+            && self.lean_kda_intra_segments
+            && self.ops.iter().any(|op| {
+                op.inst.op == DevOp::KdaChunkIntra as u16
+                    && op.inst.i[0] >= 512
+                    && op.inst.i[1] != 0
+                    && op.inst.i[2] == 128
+            });
         // PLOW_SEG_PURE_GEMM=1 (T11): class-8 segments carry ONLY GEMM-family ops; every light
         // op (norms, rope, quant, embed, softcap) joins the flash class. The point: the sm_90a
         // segmented launcher runs class-8 segments on the lean `_pfgemm` object, and a pure-GEMM
@@ -1424,6 +1439,13 @@ impl Builder {
                 // A standalone raw-argument object owns this boundary. Keep its segment pure
                 // even if PLOW_UNISEG was requested; runtime routing may then select by opcode.
                 3
+            } else if lean_kda_intra
+                && op == DevOp::KdaChunkIntra as u16
+                && self.ops[i].inst.i[0] >= 512
+                && self.ops[i].inst.i[1] != 0
+                && self.ops[i].inst.i[2] == 128
+            {
+                11
             } else if lean_moe_stage2 && lean_moe_stage2_pair(&self.ops, i) {
                 // The standalone gfx950 kernel owns exactly the deterministic Down scatter.
                 // Combine stays in the following interpreter segment and preserves fixed-order
@@ -1540,7 +1562,8 @@ impl Builder {
             .iter()
             .any(|op| op.inst.op == DevOp::KdaDecodeFused as u16)
             || lean_moe_stage2
-            || lean_moe_stage1;
+            || lean_moe_stage1
+            || lean_kda_intra;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             !raw_segmented || seg_of[consumer] == seg_of[dep.producer() as usize]
         };
@@ -3564,6 +3587,56 @@ mod lean_moe_stage2_tests {
             d.i = [3584, 16, 1024, 0, 0, 0, 0, 0];
         });
         assert!(!lean_moe_stage2_pair(&unsupported.ops, 0));
+    }
+}
+
+#[cfg(test)]
+mod lean_kda_intra_tests {
+    use super::*;
+
+    fn program(enabled: bool, dim: u32) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_lean_kda_intra_segments(enabled);
+        let tensors: Vec<_> = (0..6).map(|i| b.tensor(&format!("kda{i}"), 4096)).collect();
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let intra = b.emit(DevOp::KdaChunkIntra, all.clone(), &[before], |d| {
+            d.t[..6].copy_from_slice(&tensors);
+            d.i = [8192, 12, dim, 0, 0, 0, 0, 0];
+            d.f[0] = 1.0 / (128.0f32).sqrt();
+        });
+        b.emit(DevOp::Nop, all, &[intra], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn eligible_intra_gets_one_pure_raw_segment() {
+        let p = program(true, 128);
+        let seg = |inst| {
+            p.stream
+                .iter()
+                .find(|e| e.inst == inst)
+                .expect("instruction has a stream entry")
+                .seg
+        };
+        assert_ne!(seg(0), seg(1));
+        assert_ne!(seg(1), seg(2));
+        assert_eq!((p.insts[1].wait_len, p.insts[1].succ_len), (0, 0));
+    }
+
+    #[test]
+    fn intra_segmentation_is_opt_in_and_d128_only() {
+        for p in [program(false, 128), program(true, 64)] {
+            assert_eq!(
+                p.stream
+                    .iter()
+                    .map(|e| e.seg)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                1
+            );
+        }
     }
 }
 

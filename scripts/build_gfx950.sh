@@ -47,6 +47,7 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       i_prefill_mla_moe.co i_prefill_mla_moe_gq.co \
       interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf \
       kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf \
+      kda_chunk_intra_cached_gfx950.co kda_chunk_intra_cached_gfx950.elf \
       moe_stage1_mxfp4_gfx950.co moe_stage1_mxfp4_gfx950.elf \
       moe_stage2_mxfp4_gfx950.co moe_stage2_mxfp4_gfx950.elf
 
@@ -62,6 +63,16 @@ need_kda_fused=1
 if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
    ! grep -qx '#define PLOW_PACKET_HAS_KDA_DECODE_FUSED 1' "$PLOW_HSACO_CONFIG"; then
   need_kda_fused=0
+fi
+
+KDA_INTRA_CACHED_ELFS=""
+if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_INTRA_CACHED:-0}" = 1 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_intra_cached_gfx950.elf" plow_kda_chunk_intra_cached_gfx950 96 1 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_intra_cached_abi_1 \
+    "$R/amd/kda_chunk_intra_cached.hip"
+  KDA_INTRA_CACHED_ELFS="kda_chunk_intra_cached_gfx950.elf"
 fi
 if [ "$ARCH" = gfx950 ] && [ "$need_kda_fused" = 1 ]; then
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
@@ -536,7 +547,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $KDA_FUSED_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.

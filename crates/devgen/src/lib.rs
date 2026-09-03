@@ -6613,6 +6613,7 @@ fn emit_dense_gqa(
         b.set_l2_placement(l2_layout); // PLOW_L2_PLACE: None ⇒ byte-identical
         b.set_lean_moe_stage2_segments(amd && emit_config::active().moe_stage2_lean);
         b.set_lean_moe_stage1_segments(amd && emit_config::active().moe_stage1_lean);
+        b.set_lean_kda_intra_segments(amd && emit_config::active().kda_intra_cached);
         if amd {
             b.deny_uniseg(); // PLOW_UNISEG collapses the wave-class split — see `warn_uniseg_amd`
         }
