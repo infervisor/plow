@@ -124,9 +124,10 @@ extern "C" __global__ void packed_kda_intra(KdaArgs* a) {
 extern "C" __global__ void packed_kda_wu(KdaArgs* a) {
     PlowProgram p = packed_kda_program(a);
     d_kda_chunk_wu_packed_bt64(
-        (bf16*)a->w, (bf16*)a->u, (const float*)a->ainv, (const bf16*)a->k,
-        (const bf16*)a->v, (const float*)a->gprefix, (const float*)a->beta, a->h, a->d,
-        a->d, blockIdx.x, gridDim.x, &p);
+        (bf16*)a->w, (bf16*)a->u, nullptr, (const float*)a->ainv,
+        (const bf16*)a->k, (const bf16*)a->v, (const float*)a->gprefix,
+        (const float*)a->beta, a->h, a->d, a->d, a->scale, false, blockIdx.x,
+        gridDim.x, &p);
 }
 
 extern "C" __global__ void packed_kda_carry(KdaArgs* a) {

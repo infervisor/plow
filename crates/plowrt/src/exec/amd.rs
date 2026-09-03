@@ -1266,6 +1266,7 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // op 86 would scatter f32 into a [T,H] f64 accumulator and op 87 would read f64 as f32.
     ("PLOW_MOE_PF_DET", &["plow_moe_pf_det_arm"]),
     ("PLOW_KDA_CHUNK", &["plow_kda_chunk_bt64_arm_1"]),
+    ("PLOW_KDA_CHUNK_QPRE", &["plow_kda_chunk_qpre_arm_1"]),
     // `#if PLOW_K3` (runtime/amd/interp.hip) gates ops 99-106 in BOTH buckets — the KDA mixer,
     // AttnRes, `situ` and the MLA output gate. It is the one arm flag that is not prefill-only,
     // and the one whose absence is most completely silent: a K3 packet on an object without it

@@ -111,10 +111,10 @@ fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
         _ => None,
     };
     let variant = match op {
-        DevOp::KdaChunkPrepare
-        | DevOp::KdaChunkIntra
-        | DevOp::KdaChunkWu
-        | DevOp::KdaChunkCarry => Some(format!("d{}", i[2])),
+        DevOp::KdaChunkPrepare | DevOp::KdaChunkIntra => Some(format!("d{}", i[2])),
+        DevOp::KdaChunkWu | DevOp::KdaChunkCarry => {
+            Some(format!("d{}{}", i[2], if i[4] != 0 { "_qpre" } else { "" }))
+        }
         DevOp::KdaDecodeFused => Some(format!("abi{}", i[7])),
         DevOp::KdaStateStep | DevOp::KdaStateStepG | DevOp::KdaConvStateStepG => {
             Some(format!("flags{:x}", i[4]))
@@ -870,6 +870,12 @@ fn backend_amd(
     }
     if has("KdaChunkPrepare") || has("KdaChunkIntra") || has("KdaChunkWu") || has("KdaChunkCarry") {
         req.push("PLOW_KDA_CHUNK=1".into());
+    }
+    if union.iter().any(|a| {
+        matches!(a.op.as_str(), "KdaChunkWu" | "KdaChunkCarry")
+            && a.variant.as_deref().is_some_and(|v| v.ends_with("_qpre"))
+    }) {
+        req.push("PLOW_KDA_CHUNK_QPRE=1".into());
     }
     // Runtime-flag arms (packet i[7] on ops 85/86/87): every object built since the arms landed
     // carries them (unconditional plow_moe_pf_*_arm markers in op_moe.h); an OLDER object would
@@ -1766,6 +1772,28 @@ mod tests {
         assert!(!gfx(&[DevOp::KdaStateStepG])
             .iter()
             .any(|r| r == "PLOW_KDA_CHUNK=1"));
+
+        let qpre_req = |enabled: bool| -> Vec<String> {
+            let mut carry = inst(DevOp::KdaChunkCarry, [0; 8]);
+            carry.i[4] = u32::from(enabled);
+            let m = Model {
+                n_cu: 256,
+                target: 0,
+                tensors: vec![],
+                progs: vec![prog(vec![carry])],
+                kv_row_insts: vec![],
+                prog_t: vec![8192],
+                gen: vec![],
+            };
+            build(&m, "gfx950")["backends"]["gfx950"]["requires"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        };
+        assert!(qpre_req(true).iter().any(|r| r == "PLOW_KDA_CHUNK_QPRE=1"));
+        assert!(!qpre_req(false).iter().any(|r| r == "PLOW_KDA_CHUNK_QPRE=1"));
     }
 
     #[test]

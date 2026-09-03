@@ -215,6 +215,7 @@ extern "C" __device__ unsigned plow_opcode_kda_chunk_carry_1 = 1;
 #endif
 #if PLOW_K3 && PLOW_KDA_CHUNK
 extern "C" __device__ unsigned plow_kda_chunk_bt64_arm_1 = 1;
+extern "C" __device__ unsigned plow_kda_chunk_qpre_arm_1 = 1;
 #endif
 #if PLOW_K3 && PLOW_KDA_CONV_STEP_DB
 extern "C" __device__ unsigned plow_kda_conv_step_db_arm = 1;
@@ -2291,17 +2292,20 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if PLOW_PACKED_PREFILL_KDA_CONSUMERS
             if (plow_packed_prefill_enabled(prog_meta)) {
                 d_kda_chunk_wu_packed_bt64(
-                    (bf16*)TEN(0), (bf16*)TEN(1), (const float*)TEN(2),
+                    (bf16*)TEN(0), (bf16*)TEN(1),
+                    in->i[4] ? (bf16*)TEN(7) : nullptr, (const float*)TEN(2),
                     (const bf16*)TEN(3), (const bf16*)TEN(4), (const float*)TEN(5),
-                    (const float*)TEN(6), in->i[1], in->i[2], in->i[3], slice, nblk,
-                    prog_meta);
+                    (const float*)TEN(6), in->i[1], in->i[2], in->i[3], in->fj[0].f,
+                    in->i[4] != 0u, slice, nblk, prog_meta);
                 break;
             }
 #endif
             d_kda_chunk_wu_bt64(
-                (bf16*)TEN(0), (bf16*)TEN(1), (const float*)TEN(2), (const bf16*)TEN(3),
-                (const bf16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6), nullptr,
-                (in->i[0] + 63u) / 64u, in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
+                (bf16*)TEN(0), (bf16*)TEN(1), in->i[4] ? (bf16*)TEN(7) : nullptr,
+                (const float*)TEN(2), (const bf16*)TEN(3), (const bf16*)TEN(4),
+                (const float*)TEN(5), (const float*)TEN(6), nullptr,
+                (in->i[0] + 63u) / 64u, in->i[0], in->i[1], in->i[2], in->i[3],
+                in->fj[0].f, in->i[4] != 0u, slice, nblk);
             break;
 #endif /* PLOW_HAS_KDA_CHUNK_WU */
 #if PLOW_HAS_KDA_CHUNK_CARRY
@@ -2318,7 +2322,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                     (bf16*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
                     (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
                     (const float*)TEN(6), (const float*)TEN(7), in->i[1], in->i[2],
-                    in->i[3], in->fj[0].f, slice, nblk, kst, kv, ko, prog_meta);
+                    in->i[3], in->fj[0].f, slice, nblk, kst, kv, ko, prog_meta,
+                    in->i[4] != 0u);
                 break;
             }
 #endif
@@ -2326,7 +2331,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 (bf16*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
                 (const float*)TEN(7), nullptr, (in->i[0] + 63u) / 64u, in->i[0], in->i[1],
-                in->i[2], in->i[3], in->fj[0].f, slice, nblk, kst, kv, ko);
+                in->i[2], in->i[3], in->fj[0].f, slice, nblk, kst, kv, ko,
+                in->i[4] != 0u);
             break;
         }
 #endif /* PLOW_HAS_KDA_CHUNK_CARRY */

@@ -225,8 +225,8 @@ const DOC: &[S] = &[
     S { op: DevOp::KdaDecodeFused, t: &["y", "q_raw", "k_raw", "v_raw", "forget_raw", "beta_raw", "state", "descriptor"], i: &["rows", "H", "D", "BV", "W", "flags", "gate_mode", "descriptor_version"], f: &["scale", "lower_bound"], j: &["", "norm_eps_bits"] },
     S { op: DevOp::KdaChunkPrepare, t: &["q", "k", "g_prefix", "beta", "g_raw", "beta_raw", "A_log", "dt_bias"], i: &["T", "H", "D", "gate_mode"], f: &["lower_bound"], j: &[] },
     S { op: DevOp::KdaChunkIntra, t: &["Aqk", "Ainv", "q", "k", "g_prefix", "beta"], i: &["T", "H", "D"], f: &["scale"], j: &[] },
-    S { op: DevOp::KdaChunkWu, t: &["W", "U", "Ainv", "k", "v", "g_prefix", "beta"], i: &["T", "H", "D", "V"], f: &[], j: &[] },
-    S { op: DevOp::KdaChunkCarry, t: &["o", "state", "q", "k", "W", "U", "Aqk", "g_prefix"], i: &["T", "H", "D", "V"], f: &["scale"], j: &[] },
+    S { op: DevOp::KdaChunkWu, t: &["W", "U", "Ainv", "k", "v", "g_prefix", "beta", "q?"], i: &["T", "H", "D", "V", "qpre"], f: &["scale"], j: &[] },
+    S { op: DevOp::KdaChunkCarry, t: &["o", "state", "q", "k", "W", "U", "Aqk", "g_prefix"], i: &["T", "H", "D", "V", "qpre"], f: &["scale"], j: &[] },
     S { op: DevOp::KdaGatedNorm, t: &["y", "o", "norm_w", "g_raw"], i: &["T", "H", "D"], f: &["eps"], j: &[] },
     // `gamma?` is the FUSED post-norm: present, the mix is RMSNormed IN PLACE over `out` and the
     // packet subsumes the RMSNORM that would otherwise follow it. See `crate::k3::fuse_attnres_norm`.

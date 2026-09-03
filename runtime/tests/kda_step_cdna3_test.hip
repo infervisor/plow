@@ -39,6 +39,9 @@
 
 #ifdef KDA3_DEVICE
 #define PLOW_PACKED_PREFILL_CONSUMERS 1
+#ifndef KDA_CHUNK_QPRE
+#define KDA_CHUNK_QPRE 0
+#endif
 #include <hip/hip_runtime.h>
 #include "amd_common.h"
 #include "op_elementwise.h" /* act_silu, used by op_kda's conv */
@@ -110,9 +113,11 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_intra_full(KArgs
 }
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_wu(KArgs* a) {
     d_kda_chunk_wu_bt64(
-        (bf16*)a->w, (bf16*)a->u, (const float*)a->ainv, (const bf16*)a->k,
-        (const bf16*)a->v, (const float*)a->gprefix, (const float*)a->o,
-        (const uint2*)a->chunks, a->n_chunks, a->T, a->H, a->D, a->V, blockIdx.x, gridDim.x);
+        (bf16*)a->w, (bf16*)a->u, KDA_CHUNK_QPRE ? (bf16*)a->q : nullptr,
+        (const float*)a->ainv, (const bf16*)a->k, (const bf16*)a->v,
+        (const float*)a->gprefix, (const float*)a->o, (const uint2*)a->chunks,
+        a->n_chunks, a->T, a->H, a->D, a->V, a->scale, KDA_CHUNK_QPRE, blockIdx.x,
+        gridDim.x);
 }
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_carry(KArgs* a) {
     __shared__ float st[16 * 128];
@@ -122,7 +127,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_carry(KArgs* a) 
         (bf16*)a->y, (float*)a->state, (const bf16*)a->q, (const bf16*)a->k,
         (const bf16*)a->w, (const bf16*)a->u, (const float*)a->aqk,
         (const float*)a->gprefix, (const uint2*)a->chunks, a->n_chunks, a->T, a->H, a->D, a->V,
-        a->scale, blockIdx.x, gridDim.x, st, vsm, osm);
+        a->scale, blockIdx.x, gridDim.x, st, vsm, osm, KDA_CHUNK_QPRE);
 }
 static __device__ PlowProgram packed_prog(const KArgs* a) {
     PlowProgram prog{};
@@ -151,9 +156,10 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_intra_packed(KAr
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_wu_packed(KArgs* a) {
     PlowProgram prog = packed_prog(a);
     d_kda_chunk_wu_packed_bt64(
-        (bf16*)a->w, (bf16*)a->u, (const float*)a->ainv, (const bf16*)a->k,
-        (const bf16*)a->v, (const float*)a->gprefix, (const float*)a->o, a->H, a->D, a->V,
-        blockIdx.x, gridDim.x, &prog);
+        (bf16*)a->w, (bf16*)a->u, KDA_CHUNK_QPRE ? (bf16*)a->q : nullptr,
+        (const float*)a->ainv, (const bf16*)a->k, (const bf16*)a->v,
+        (const float*)a->gprefix, (const float*)a->o, a->H, a->D, a->V, a->scale,
+        KDA_CHUNK_QPRE, blockIdx.x, gridDim.x, &prog);
 }
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_carry_packed(KArgs* a) {
     __shared__ float st[16 * 128];
@@ -164,7 +170,7 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_carry_packed(KAr
         (bf16*)a->y, (float*)a->state, (const bf16*)a->q, (const bf16*)a->k,
         (const bf16*)a->w, (const bf16*)a->u, (const float*)a->aqk,
         (const float*)a->gprefix, a->H, a->D, a->V, a->scale, blockIdx.x, gridDim.x, st,
-        vsm, osm, &prog);
+        vsm, osm, &prog, KDA_CHUNK_QPRE);
 }
 
 #else
@@ -440,7 +446,7 @@ int main(int argc, char** argv) {
         a.gprefix = (unsigned long long)(size_t)d_g; a.o = (unsigned long long)(size_t)d_beta;
         a.chunks = (unsigned long long)(size_t)d_chunks;
         a.aqk = (unsigned long long)(size_t)d_qk; a.ainv = (unsigned long long)(size_t)d_inv;
-        a.H = IH; a.D = ID; a.n_chunks = chunks.size(); a.scale = scale;
+        a.T = IT; a.H = IH; a.D = ID; a.n_chunks = chunks.size(); a.scale = scale;
         HC(hipMalloc(&d_a, sizeof a));
         HC(hipMemcpy(d_a, &a, sizeof a, hipMemcpyHostToDevice));
         void* args[] = {&d_a};
@@ -563,6 +569,19 @@ int main(int argc, char** argv) {
         HC(hipMemcpy(d_a, &a, sizeof a, hipMemcpyHostToDevice));
         HC(hipModuleLaunchKernel(fwu, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args, nullptr));
         HC(hipDeviceSynchronize());
+        double qpre_bad = 0.0;
+        if (getenv("KDA_QPRE_CHECK")) {
+            std::vector<bf16> qgot(q.size());
+            HC(hipMemcpy(qgot.data(), d_q, qgot.size() * sizeof(bf16), hipMemcpyDeviceToHost));
+            size_t bad = 0;
+            for (size_t i = 0; i < q.size(); ++i) {
+                const bf16 qs = f2b(b2f(q[i]) * scale);
+                const bf16 want = f2b(b2f(qs) * exp2f(g[i]));
+                bad += qgot[i] != want;
+            }
+            qpre_bad = bad ? 2.0 : 0.0;
+            printf("  chunk q precompute exact %zu/%zu bad\n", bad, q.size());
+        }
         HC(hipModuleLaunchKernel(fcarry, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args, nullptr));
         HC(hipDeviceSynchronize());
         std::vector<bf16> out(value.size());
@@ -581,7 +600,7 @@ int main(int argc, char** argv) {
                orms, srms);
         return fmax(fmax(qk_max / 5e-5, inv_max / 2e-4),
                     fmax(fmax(qk64_max / 5e-5, inv64_max / 3e-4),
-                         fmax(orms / 1e-2, srms / 5e-3)));
+                         fmax(fmax(orms / 1e-2, srms / 5e-3), qpre_bad)));
     };
 
     double worst = 0;

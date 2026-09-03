@@ -365,15 +365,23 @@ __device__ void d_kda_chunk_intra_bt64(
  *   W = Ainv @ (beta * K * exp2(g)), U = Ainv @ (beta * V).
  * One wave owns one (chunk, head, 16 token rows, 16 output channels) tile. */
 __device__ void d_kda_chunk_wu_bt64(
-    bf16* __restrict__ W, bf16* __restrict__ U, const float* __restrict__ Ainv,
-    const bf16* __restrict__ k, const bf16* __restrict__ v,
+    bf16* __restrict__ W, bf16* __restrict__ U, bf16* __restrict__ q,
+    const float* __restrict__ Ainv, const bf16* __restrict__ k, const bf16* __restrict__ v,
     const float* __restrict__ g_cumsum_log2, const float* __restrict__ beta,
     const uint2* __restrict__ chunks, unsigned n_chunks, unsigned T, unsigned H, unsigned D,
-    unsigned V, unsigned slice, unsigned nblk) {
+    unsigned V, float scale, bool q_precompute, unsigned slice, unsigned nblk) {
     const unsigned lane = threadIdx.x & 63u, wave = threadIdx.x >> 6;
     const unsigned col = lane & 15u, kgroup = lane >> 4;
     const unsigned dtiles = (D + 15u) / 16u, vtiles = (V + 15u) / 16u;
     const unsigned otiles = dtiles + vtiles;
+    if (q_precompute) {
+        const size_t q_items = (size_t)T * H * D;
+        for (size_t qi = (size_t)slice * PLOW_THREADS + threadIdx.x; qi < q_items;
+             qi += (size_t)nblk * PLOW_THREADS) {
+            const bf16 qs = f2bf(bf2f(q[qi]) * scale);
+            q[qi] = f2bf(bf2f(qs) * exp2f(g_cumsum_log2[qi]));
+        }
+    }
     const size_t n_items = (size_t)n_chunks * H * 4u * otiles;
     for (size_t item = (size_t)slice * PLOW_WAVES + wave; item < n_items;
          item += (size_t)nblk * PLOW_WAVES) {
@@ -440,7 +448,7 @@ __device__ void d_kda_chunk_carry_bt64(
     const float* __restrict__ Aqk, const float* __restrict__ g_cumsum_log2,
     const uint2* __restrict__ chunks, unsigned n_chunks, unsigned T, unsigned H, unsigned D,
     unsigned V, float scale, unsigned slice, unsigned nblk, float* __restrict__ st,
-    bf16* __restrict__ vsm, float* __restrict__ osm) {
+    bf16* __restrict__ vsm, float* __restrict__ osm, bool q_precomputed = false) {
     const unsigned tid = threadIdx.x, lane = tid & 63u, wave = tid >> 6;
     const unsigned token = lane & 15u, kgroup = lane >> 4;
     const unsigned vtiles = (V + 15u) / 16u;
@@ -469,9 +477,13 @@ __device__ void d_kda_chunk_carry_bt64(
                         for (unsigned j = 0; j < 8; j++) {
                             const size_t i = (row * H + h) * D + d + j;
                             wf[j] = __builtin_bit_cast(bf16_t, W[i]);
-                            const float qs = bf2f(f2bf(bf2f(q[i]) * scale));
-                            qf[j] = __builtin_bit_cast(
-                                bf16_t, f2bf(qs * exp2f(g_cumsum_log2[i])));
+                            if (q_precomputed) {
+                                qf[j] = __builtin_bit_cast(bf16_t, q[i]);
+                            } else {
+                                const float qs = bf2f(f2bf(bf2f(q[i]) * scale));
+                                qf[j] = __builtin_bit_cast(
+                                    bf16_t, f2bf(qs * exp2f(g_cumsum_log2[i])));
+                            }
                         }
                     }
                     if (token < vv) {
@@ -600,18 +612,19 @@ __device__ void d_kda_chunk_intra_packed_bt64(
 }
 
 __device__ void d_kda_chunk_wu_packed_bt64(
-    bf16* W, bf16* U, const float* Ainv, const bf16* k, const bf16* v,
+    bf16* W, bf16* U, bf16* q, const float* Ainv, const bf16* k, const bf16* v,
     const float* g_prefix, const float* beta, unsigned H, unsigned D, unsigned V,
-    unsigned slice, unsigned nblk, const PlowProgram* prog) {
+    float scale, bool q_precompute, unsigned slice, unsigned nblk, const PlowProgram* prog) {
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
         const size_t rd = (size_t)span->row0 * H * D;
         const size_t rv = (size_t)span->row0 * H * V;
         const size_t rh = (size_t)span->row0 * H;
         const size_t ra = (size_t)span->row0 * H * 64u;
-        d_kda_chunk_wu_bt64(W + rd, U + rv, Ainv + ra, k + rd, v + rv, g_prefix + rd,
-                            beta + rh, nullptr, (span->n_rows + 63u) / 64u,
-                            span->n_rows, H, D, V, slice, nblk);
+        d_kda_chunk_wu_bt64(W + rd, U + rv, q ? q + rd : nullptr, Ainv + ra, k + rd,
+                            v + rv, g_prefix + rd, beta + rh, nullptr,
+                            (span->n_rows + 63u) / 64u, span->n_rows, H, D, V, scale,
+                            q_precompute, slice, nblk);
     }
 }
 
@@ -619,7 +632,7 @@ __device__ void d_kda_chunk_carry_packed_bt64(
     bf16* out, float* state, const bf16* q, const bf16* k, const bf16* W,
     const bf16* U, const float* Aqk, const float* g_prefix, unsigned H, unsigned D,
     unsigned V, float scale, unsigned slice, unsigned nblk, float* st, bf16* vsm,
-    float* osm, const PlowProgram* prog) {
+    float* osm, const PlowProgram* prog, bool q_precomputed = false) {
     const unsigned vtiles = (V + 15u) / 16u;
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
@@ -638,7 +651,8 @@ __device__ void d_kda_chunk_carry_packed_bt64(
         const size_t ra = (size_t)span->row0 * H * 64u;
         d_kda_chunk_carry_bt64(out + rv, ss, q + rd, k + rd, W + rd, U + rv, Aqk + ra,
                                g_prefix + rd, nullptr, (span->n_rows + 63u) / 64u,
-                               span->n_rows, H, D, V, scale, slice, nblk, st, vsm, osm);
+                               span->n_rows, H, D, V, scale, slice, nblk, st, vsm, osm,
+                               q_precomputed);
     }
 }
 #endif

@@ -866,6 +866,11 @@ fn emit_kda_mixer_ex(
             d.t[4] = mix[2];
             d.t[5] = gate;
             d.t[6] = beta;
+            if crate::emit_config::active().kda_chunk_qpre {
+                d.t[7] = mix[0];
+                d.i[4] = 1;
+                d.f[0] = scale;
+            }
             d.i[0] = t;
             d.i[1] = nh;
             d.i[2] = hd;
@@ -885,6 +890,7 @@ fn emit_kda_mixer_ex(
             d.i[1] = nh;
             d.i[2] = hd;
             d.i[3] = hd;
+            d.i[4] = u32::from(crate::emit_config::active().kda_chunk_qpre);
             d.f[0] = scale;
         })
     } else if fuse {
