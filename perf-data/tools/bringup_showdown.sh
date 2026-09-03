@@ -32,7 +32,7 @@ PLOW_TAG=${PLOW_TAG:-plow}
 VLLM_TAG=${VLLM_TAG:-vllm}
 PORT_PLOW=${PORT_PLOW:-8093}
 PORT_VLLM=${PORT_VLLM:-8085}
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.90}
 ROUND_PREFIX=${ROUND_PREFIX:-showdown}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}
@@ -41,6 +41,7 @@ export BRINGUP_OUT
 
 positive() { case "$2" in *[!0-9]*|0|'') echo "$1 must be a positive integer" >&2; exit 2;; esac; }
 positive ROUNDS "$ROUNDS"; positive TP "$TP"
+[ -z "$MAX_MODEL_LEN" ] || positive MAX_MODEL_LEN "$MAX_MODEL_LEN"
 [ "$ROUNDS" -ge 3 ] || { echo "ROUNDS must be >= 3 alternating whole-server rounds" >&2; exit 2; }
 mkdir -p "$BRINGUP_OUT"
 [ ! -e "$BRINGUP_OUT/cells.tsv" ] || { echo "result directory already contains a run: $BRINGUP_OUT" >&2; exit 2; }
@@ -51,6 +52,8 @@ read -r -a PLOW_COMMAND <<<"${PLOW_SERVER_COMMAND_ARGV:-$PLOWRT}"
 read -r -a VLLM_COMMAND <<<"${VLLM_SERVER_COMMAND_ARGV:-vllm}"
 [ "${#PLOW_COMMAND[@]}" -gt 0 ] || { echo "PLOW_SERVER_COMMAND_ARGV is empty" >&2; exit 2; }
 [ "${#VLLM_COMMAND[@]}" -gt 0 ] || { echo "VLLM_SERVER_COMMAND_ARGV is empty" >&2; exit 2; }
+VLLM_CONTEXT_ARGV=()
+[ -z "$MAX_MODEL_LEN" ] || VLLM_CONTEXT_ARGV=(--max-model-len "$MAX_MODEL_LEN")
 
 if [ "${PLOW_REQUIRE_VERIFIED:-1}" = 1 ]; then
   python3 - "$PLOW_ASSETS/build.json" <<'PY'
@@ -99,6 +102,7 @@ printf '%s\n' "$VLLM_ARTIFACT_DIGEST" >"$BRINGUP_OUT/vllm-artifact-set.sha256"
 printf 'tag\tround\tinlen\tttft_mean\tttft_median\tttft_p99\ttpot_median\tconcurrency\tprompts\toutlen\tinput_tokens\toutput_tokens\treq_s\tout_tok_s\tartifact_digest\ttpot_mean\ttpot_p99\titl_mean\titl_median\titl_p99\te2el_mean\te2el_median\te2el_p99\n' >"$BRINGUP_OUT/cells.tsv"
 {
   printf 'rounds=%s\ntp=%s\ndtype=%s\nmodel_id=%s\nvllm_model=%s\n' "$ROUNDS" "$TP" "$DTYPE" "$MODEL_ID" "$VLLM_MODEL"
+  printf 'max_model_len=%s\n' "${MAX_MODEL_LEN:-<model-default>}"
   printf 'plowrt=%s\nplow_assets=%s\nplow_server_command_argv=%s\nplow_engine_argv=%s\n' "$PLOWRT" "$PLOW_ASSETS" "${PLOW_SERVER_COMMAND_ARGV:-$PLOWRT}" "${PLOW_ENGINE_ARGV:-}"
   printf 'vllm_server_command_argv=%s\nvllm_client_command_argv=%s\nvllm_engine_argv=%s\n' "${VLLM_SERVER_COMMAND_ARGV:-vllm}" "${VLLM_CLIENT_COMMAND_ARGV:-vllm}" "${VLLM_ENGINE_ARGV:-}"
   printf 'client_argv=%s\nseed=%s\n' "${BRINGUP_CLIENT_ARGV:-}" "${BRINGUP_SEED:-42}"
@@ -179,7 +183,7 @@ run_vllm() { # <round>
   local log="$BRINGUP_OUT/serve-$VLLM_TAG-r$round.log" pid
   check_artifacts
   "${VLLM_COMMAND[@]}" serve "$VLLM_MODEL" --served-model-name "$MODEL_ID" --dtype "$DTYPE" \
-    --tensor-parallel-size "$TP" --max-model-len "$MAX_MODEL_LEN" \
+    --tensor-parallel-size "$TP" "${VLLM_CONTEXT_ARGV[@]}" \
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" --scheduling-policy fcfs \
     --port "$PORT_VLLM" "${VLLM_EXTRA[@]}" >"$log" 2>&1 & pid=$!
   ACTIVE_PID=$pid
