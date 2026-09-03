@@ -2091,12 +2091,118 @@ __device__ void d_moe_router_topk_pf(unsigned char* table, const bf16* logit, co
 #endif
 __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* row_token,
                                unsigned* row_partidx, float* row_gate, unsigned T, unsigned n_exp,
-                               unsigned k, unsigned slice, unsigned* lds) {
+                               unsigned k, unsigned slice, unsigned* lds, unsigned phase = 0,
+                               unsigned nblk = 1, unsigned npart = 0) {
+    const unsigned tid = threadIdx.x;
+    const unsigned nslot = T * k;
+    const bool synth = (table == nullptr);
+
+    /* Multi-packet path. Packet completion is the grid barrier; no resident-grid assumption is
+     * made. The emitter appends [nblk,n_exp] partial counts after the public meta layout. */
+    if (phase != 0) {
+        npart = npart ? npart : nblk;
+        int* rowoff = meta;
+        int* mcnt = meta + n_exp;
+        int* tilep = meta + 2u * n_exp;
+        unsigned* partial = (unsigned*)(meta + 3u * n_exp + 1u);
+        unsigned* cnt = lds;
+
+        if (phase == 1) {
+            for (unsigned e = tid; e < n_exp; e += PLOW_THREADS) cnt[e] = 0;
+            __syncthreads();
+            const unsigned first = (unsigned)(((unsigned long long)nslot * slice) / npart);
+            const unsigned last = (unsigned)(((unsigned long long)nslot * (slice + 1u)) / npart);
+            for (unsigned s = first + tid; s < last; s += PLOW_THREADS) {
+                const unsigned e = synth ? 0u : moe_slot_expert(table, s);
+                if (e < n_exp)
+                    __hip_atomic_fetch_add(&cnt[e], 1u, __ATOMIC_RELAXED,
+                                           __HIP_MEMORY_SCOPE_WORKGROUP);
+            }
+            __syncthreads();
+            for (unsigned e = tid; e < n_exp; e += PLOW_THREADS)
+                partial[(size_t)slice * n_exp + e] = cnt[e];
+            return;
+        }
+
+        if (phase == 2) {
+            if (slice != 0) return;
+            const unsigned chunk = (n_exp + PLOW_THREADS - 1u) / PLOW_THREADS;
+            const unsigned begin = tid * chunk;
+            const unsigned end = begin + chunk < n_exp ? begin + chunk : n_exp;
+            unsigned thread_tiles = 0;
+            for (unsigned e = begin; e < end; e++) {
+                unsigned total = 0;
+                for (unsigned b = 0; b < npart; b++) {
+                    const size_t at = (size_t)b * n_exp + e;
+                    const unsigned count = partial[at];
+                    partial[at] = total;
+                    total += count;
+                }
+                mcnt[e] = (int)total;
+                thread_tiles += (total + MPF_BM - 1u) / MPF_BM;
+            }
+            cnt[tid] = thread_tiles;
+            __syncthreads();
+            for (unsigned offset = 1u; offset < PLOW_THREADS; offset <<= 1u) {
+                const unsigned add = tid >= offset ? cnt[tid - offset] : 0u;
+                __syncthreads();
+                cnt[tid] += add;
+                __syncthreads();
+            }
+            unsigned tp = tid == 0 ? 0u : cnt[tid - 1u];
+            for (unsigned e = begin; e < end; e++) {
+                tilep[e] = (int)tp;
+                rowoff[e] = (int)(tp * MPF_BM);
+                tp += ((unsigned)mcnt[e] + MPF_BM - 1u) / MPF_BM;
+            }
+            if (tid == PLOW_THREADS - 1u) tilep[n_exp] = (int)cnt[tid];
+            return;
+        }
+
+        if (phase == 3) {
+            const unsigned total_pad = (unsigned)tilep[n_exp] * MPF_BM;
+            for (unsigned r = slice * PLOW_THREADS + tid; r < total_pad;
+                 r += nblk * PLOW_THREADS) {
+                row_token[r] = PLOW_EXPERT_UNUSED;
+                row_partidx[r] = PLOW_EXPERT_UNUSED;
+                row_gate[r] = 0.0f;
+            }
+            return;
+        }
+
+        if (phase == 4) {
+            if (tid >= PLOW_WAVE) return;
+            const unsigned lane = tid;
+            const unsigned first = (unsigned)(((unsigned long long)nslot * slice) / npart);
+            const unsigned last = (unsigned)(((unsigned long long)nslot * (slice + 1u)) / npart);
+            for (unsigned base = first; base < last; base += PLOW_WAVE) {
+                const unsigned s = base + lane;
+                const unsigned e = s < last ? (synth ? 0u : moe_slot_expert(table, s)) : ~0u;
+                const unsigned long long peers = __match_any(e);
+                const unsigned leader = __builtin_ctzll(peers);
+                const unsigned rank = __builtin_popcountll(peers & ((1ull << lane) - 1ull));
+                unsigned pos0 = 0;
+                if (lane == leader && e < n_exp) {
+                    const size_t at = (size_t)slice * n_exp + e;
+                    pos0 = (unsigned)rowoff[e] + partial[at];
+                    partial[at] += __builtin_popcountll(peers);
+                }
+                pos0 = __shfl(pos0, leader, PLOW_WAVE);
+                if (e < n_exp) {
+                    const unsigned pos = pos0 + rank;
+                    row_token[pos] = s / k;
+                    row_partidx[pos] = s;
+                    row_gate[pos] = synth ? 1.0f : moe_slot_gate(table, s);
+                }
+            }
+            return;
+        }
+        return;
+    }
+
     if (slice != 0) return;
     /* Synthetic (dense-FFN) routing reads no table; see the header block above. Hoisted to a
      * uniform bool so the two slot loops below stay branch-free per lane. */
-    const bool synth = (table == nullptr);
-    const unsigned tid = threadIdx.x;
     unsigned* cnt = lds;             /* [n_exp] */
     unsigned* cur = lds + n_exp;     /* [n_exp] */
     unsigned* tot = cur + n_exp;     /* [1] total padded rows */
@@ -2104,7 +2210,6 @@ __device__ void d_moe_align_pf(int* meta, const unsigned char* table, unsigned* 
     for (unsigned e = tid; e < n_exp; e += PLOW_THREADS) cnt[e] = 0u;
     __syncthreads();
 
-    const unsigned nslot = T * k;
     for (unsigned s = tid; s < nslot; s += PLOW_THREADS) {
         const unsigned eid = synth ? 0u : moe_slot_expert(table, s);
         if (eid < n_exp) __hip_atomic_fetch_add(&cnt[eid], 1u, __ATOMIC_RELAXED,

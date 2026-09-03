@@ -3250,7 +3250,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         case PLOW_DOP_MOE_ALIGN_PF:
             d_moe_align_pf((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
                            (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2], slice,
-                           (unsigned*)sm->raw);
+                           (unsigned*)sm->raw, in->i[3], nblk, in->i[4]);
             break;
         /* i3 = weight encoding (0 bf16, 1 block-fp8, 2 MXFP4/A4W4) — a precision swap is a
          * field change, not a re-emit. t6=row_partidx, t7=row_gate on DOWN; under A4W4 the GLU
@@ -3359,7 +3359,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         case PLOW_DOP_MOE_ALIGN_GEMMA_PF:
             d_moe_align_pf((int*)TEN(0), (const unsigned char*)TEN(1), (unsigned*)TEN(2),
                            (unsigned*)TEN(3), (float*)TEN(4), in->i[0], in->i[1], in->i[2], slice,
-                           (unsigned*)sm->raw);
+                           (unsigned*)sm->raw, in->i[3], nblk, in->i[4]);
             break;
         /* t0=fu_g t1=xn2([T,H]) t2=ewt t3=meta t4=row_token; i0=I_moe(N) i1=H(K) i2=n_exp i5=act */
         case PLOW_DOP_MOE_GROUP_GLU_GEMMA_PF:

@@ -1335,8 +1335,14 @@ pub(crate) fn declare_glm_rows_batched(
             MoeEnc::Mxfp4 => pad_rows * (imoe_e / 2) as u64,
             _ => pad_rows * imoe_e as u64 * BF16,
         };
+        const ALIGN_BLOCKS: u64 = 64;
+        let align_extra = if emit_config::active().moe_align_par && rows >= 1024 {
+            ALIGN_BLOCKS * e as u64
+        } else {
+            0
+        };
         (
-            ac(b, "moe_meta", (3 * e + 1) as u64 * I32),
+            ac(b, "moe_meta", ((3 * e + 1) as u64 + align_extra) * I32),
             ac(b, "moe_rowtok", pad_rows * I32),
             ac(b, "moe_rowpart", pad_rows * I32),
             ac(b, "moe_rowgate", pad_rows * F32),
@@ -4072,7 +4078,13 @@ fn emit_glm_block_prefill(
     let atom = fuse == MoePfFuse::Atomic;
     // PLOW_MOE_PF_DET: same decomposition, f64 fixed-point accumulator, order-independent sum.
     let det = fuse == MoePfFuse::Det;
-    let c_router = b.emit(DevOp::MoeRouterTopkPf, all.clone(), &[c_score], |d| {
+    let align_par = emit_config::active().moe_align_par && t >= 1024;
+    let router_blocks = if align_par {
+        (0..t.min(4 * n_cu)).map(|i| i % n_cu).collect()
+    } else {
+        all.clone()
+    };
+    let c_router = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_score], |d| {
         d.t[0] = n.tab;
         d.t[1] = n.rlogit;
         d.t[3] = w.bias;
@@ -4091,19 +4103,29 @@ fn emit_glm_block_prefill(
         d.i[7] = c.topk_group;
         d.f[0] = c.route_scale;
     });
-    // 15c ALIGN/SORT — ONE workgroup, and it must be: the MPF_BM-padded row prefix is a global scan.
-    //     The other 255 CUs are gated behind it by the counter DAG exactly as they are behind the
-    //     decode router, so this is the same shape of serialization the decode path already pays.
-    let c_align = b.emit(DevOp::MoeAlignPf, one.clone(), &[c_router], |d| {
-        d.t[0] = n.meta;
-        d.t[1] = n.tab;
-        d.t[2] = n.row_token;
-        d.t[3] = n.row_partidx;
-        d.t[4] = n.row_gate;
-        d.i[0] = t;
-        d.i[1] = e;
-        d.i[2] = tk;
-    });
+    let align = |b: &mut Builder, blocks: Vec<u32>, deps: &[u32], phase: u32| {
+        b.emit(DevOp::MoeAlignPf, blocks, deps, |d| {
+            d.t[0] = n.meta;
+            d.t[1] = n.tab;
+            d.t[2] = n.row_token;
+            d.t[3] = n.row_partidx;
+            d.t[4] = n.row_gate;
+            d.i[0] = t;
+            d.i[1] = e;
+            d.i[2] = tk;
+            d.i[3] = phase;
+            d.i[4] = u32::from(phase != 0) * 64;
+        })
+    };
+    let c_align = if align_par {
+        let par_blocks: Vec<u32> = all.iter().copied().take(64).collect();
+        let c_count = align(b, par_blocks.clone(), &[c_router], 1);
+        let c_prefix = align(b, one.clone(), &[c_count], 2);
+        let c_init = align(b, par_blocks.clone(), &[c_prefix], 3);
+        align(b, par_blocks, &[c_init], 4)
+    } else {
+        align(b, one.clone(), &[c_router], 0)
+    };
     // 16 shared expert gate|up — GemmGlu, the T-row twin of decode's GemvGlu (same operand slots,
     //    M in i[0]). Column-parallel: this rank's imoe_l lanes. Routing-independent, so it gates
     //    only on the post-attn norm and overlaps the whole router/align/expert chain.

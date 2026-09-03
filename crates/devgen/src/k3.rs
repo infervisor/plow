@@ -1202,7 +1202,10 @@ pub fn emit_k3_latent_moe(
         // expert counts and a guaranteed one at 896.
         let pad_rows = t as u64 * c.top_k as u64 + (c.n_exp * (crate::mla::MPF_BM - 1)) as u64;
         let mx = c.enc == K3_MOE_ENC_MXFP4;
-        let meta = b.tensor(&format!("{a}moe_meta"), (3 * c.n_exp + 1) as u64 * 4);
+        const ALIGN_BLOCKS: u32 = 64;
+        let align_par = crate::emit_config::active().moe_align_par && t >= 1024;
+        let meta_ints = 3 * c.n_exp + 1 + u32::from(align_par) * ALIGN_BLOCKS * c.n_exp;
+        let meta = b.tensor(&format!("{a}moe_meta"), meta_ints as u64 * 4);
         let row_token = b.tensor(&format!("{a}moe_rowtok"), pad_rows * 4);
         let row_partidx = b.tensor(&format!("{a}moe_rowpart"), pad_rows * 4);
         let row_gate = b.tensor(&format!("{a}moe_rowgate"), pad_rows * 4);
@@ -1230,7 +1233,11 @@ pub fn emit_k3_latent_moe(
         // have made for the same row — which is what makes the two phases the same model.
         // One workgroup owns one token at a time. Launching more than T only creates empty
         // interpreter entries; launching fewer keeps the kernel's existing strided token loop.
-        let router_blocks: Vec<u32> = (0..t.min(n_cu)).collect();
+        let router_blocks: Vec<u32> = if align_par {
+            (0..t.min(4 * n_cu)).map(|i| i % n_cu).collect()
+        } else {
+            (0..t.min(n_cu)).collect()
+        };
         let c_rt = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_rl], |d| {
             d.t[0] = tab;
             d.t[1] = logit;
@@ -1247,19 +1254,29 @@ pub fn emit_k3_latent_moe(
             d.i[7] = c.topk_group;
             d.f[0] = c.route_scale;
         });
-        // ALIGN/SORT — ONE workgroup, and it must be: the MPF_BM-padded row prefix is a global
-        // scan. The other CUs are gated behind it by the counter DAG exactly as they are behind
-        // the decode router.
-        let c_align = b.emit(DevOp::MoeAlignPf, vec![0u32], &[c_rt], |d| {
-            d.t[0] = meta;
-            d.t[1] = tab;
-            d.t[2] = row_token;
-            d.t[3] = row_partidx;
-            d.t[4] = row_gate;
-            d.i[0] = t;
-            d.i[1] = c.n_exp;
-            d.i[2] = c.top_k;
-        });
+        let align = |b: &mut Builder, blocks: Vec<u32>, deps: &[u32], phase: u32| {
+            b.emit(DevOp::MoeAlignPf, blocks, deps, |d| {
+                d.t[0] = meta;
+                d.t[1] = tab;
+                d.t[2] = row_token;
+                d.t[3] = row_partidx;
+                d.t[4] = row_gate;
+                d.i[0] = t;
+                d.i[1] = c.n_exp;
+                d.i[2] = c.top_k;
+                d.i[3] = phase;
+                d.i[4] = u32::from(phase != 0) * ALIGN_BLOCKS;
+            })
+        };
+        let c_align = if align_par {
+            let par_blocks: Vec<u32> = all.iter().copied().take(ALIGN_BLOCKS as usize).collect();
+            let c_count = align(b, par_blocks.clone(), &[c_rt], 1);
+            let c_prefix = align(b, vec![0u32], &[c_count], 2);
+            let c_init = align(b, par_blocks.clone(), &[c_prefix], 3);
+            align(b, par_blocks, &[c_init], 4)
+        } else {
+            align(b, vec![0u32], &[c_rt], 0)
+        };
         // Grouped gate/up + situ over the sorted rows. `i[1]` is the LATENT, not the hidden: the
         // A operand is gathered from `xe`, which is what makes this a LatentMoE.
         let c_g = b.emit(DevOp::MoeGroupGluPf, all.clone(), &[c_align, c_xe], |d| {
@@ -4798,6 +4815,41 @@ mod tests {
                 .expect("missing grouped router");
             assert_eq!(router.blocks, want, "T={t}");
         }
+    }
+
+    #[test]
+    fn parallel_align_emits_ordered_count_prefix_scatter_packets() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_MOE_ALIGN_PAR", "1")]);
+        let p = build_full_t(1, 1024);
+        let align: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::MoeAlignPf as u16)
+            .collect();
+        let router = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeRouterTopkPf as u16)
+            .unwrap();
+        assert_eq!(router.blocks, 1024);
+        assert_eq!(align.len(), 92 * 4);
+        for phase in align.chunks_exact(4) {
+            assert_eq!(
+                phase.iter().map(|i| i.i[3]).collect::<Vec<_>>(),
+                [1, 2, 3, 4]
+            );
+            assert!(phase[0].blocks > 1);
+            assert_eq!(phase[1].blocks, 1);
+            assert!(phase[2].blocks > 1);
+            assert!(phase[3].blocks > 1);
+        }
+        let meta = p
+            .tensors
+            .iter()
+            .find(|x| x.name == "act.pf.moe.moe_meta")
+            .unwrap();
+        assert_eq!(meta.bytes, (3 * 896 + 1 + 64 * 896) * 4);
     }
 
     /// The gathered row arrays are sized on the MPF_BM-PADDED bound, not on `T*k`.

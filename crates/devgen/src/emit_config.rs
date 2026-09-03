@@ -485,6 +485,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_STAGE1_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_stage1_lean: bool,
 
+    /// Split grouped-MoE align into expert-parallel count/prefix/scatter packets.
+    #[arg(long, env = "PLOW_MOE_ALIGN_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_align_par: bool,
+
     /// Atomic combine for the grouped MoE prefill scatter.
     #[arg(long, env = "PLOW_MOE_PF_ATOMIC", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_pf_atomic: bool,
@@ -712,6 +716,7 @@ impl EmitConfig {
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             moe_pf_a8: env_bool("PLOW_MOE_PF_A8"),
             moe_stage2_lean: env_bool("PLOW_MOE_STAGE2_LEAN"),
+            moe_align_par: env_bool("PLOW_MOE_ALIGN_PAR"),
             moe_stage1_lean: env_bool("PLOW_MOE_STAGE1_LEAN"),
             moe_pf_atomic: env_bool("PLOW_MOE_PF_ATOMIC"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
