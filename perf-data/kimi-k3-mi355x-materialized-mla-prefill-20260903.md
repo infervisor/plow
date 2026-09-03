@@ -31,6 +31,21 @@ next isolated kernel lever.
 | absorbed merge/fold | 74 | 0 | 38 | 6 | 2560 B | 0 / 0 |
 | materialized rectangular attention | 256 | 81 | 82 | 1 | 37888 B | 0 / 0 |
 
+## BKV64 follow-up: rejected
+
+AITER's gfx950 dispatch table records a 128x128 tile for BF16 DK192/DV128. The safe first step
+was BKV32 to BKV64 in the existing generic body:
+
+- Prefetched BKV64 fit with no scratch or spill (VGPR 256, AGPR 179, SGPR 92, occupancy 1,
+  LDS 59392 B), but failed the T1024 oracle with infinities. No timing from this arm is valid.
+- Synchronous BKV64 was sound and spill-free (VGPR 256, AGPR 108, SGPR 79, occupancy 1,
+  LDS 67584 B). It improved its synchronous BKV32 control from 3896.986 to 3259.062 us at
+  T8192, but regressed the prefetched BKV32 candidate at 2718.140 us and still missed 1.5 ms.
+
+Increasing the generic body's KV tile is therefore closed. A 128-row KV schedule needs a new
+four-wave body with a deeper pipeline and a smaller score/P residency scheme, not this template's
+array expansion.
+
 ## Promotion blockers
 
 1. Beat 1.5 ms at T8192 with distinct K and V inputs. The identity-structured screen is an
