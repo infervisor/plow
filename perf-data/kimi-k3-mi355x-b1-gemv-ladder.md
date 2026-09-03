@@ -12,9 +12,10 @@ geometry, each wave commonly owns three or four columns. Processing full groups 
 then one increases outstanding weight loads without changing column ownership or any dot-product
 reduction order.
 
-The ladder is implemented behind `GV_RS_LADDER=1`. It remains off by default. A standalone lean
-object is safe (wave64, 512 threads, 116 VGPR, 64 SGPR, 16 KiB LDS, zero private memory and zero
-VGPR/SGPR spills), but the matching production decode megakernel is already at 256 VGPR with
+The ladder remains harness-only because its 1.4% gain does not justify invalidating the measured
+TuneDB profile. A standalone lean object is safe (wave64, 512 threads, 116 VGPR, 64 SGPR, 16 KiB
+LDS, zero private memory and zero VGPR/SGPR spills), but the production decode megakernel is
+already at 256 VGPR with
 624 B private memory, two VGPR spills and 86 SGPR spills. Promotion therefore requires a separate
 opcode-only decode segment rather than adding the ladder to the megakernel's register union.
 A production `d_gemv` dispatch compile with the ladder enabled is also clean: wave64, 512 threads,
@@ -98,6 +99,6 @@ Object SHA256: `b86e4c281a684a7118d29ee251f72a5eda509ac2fc11e65adcfea9ae0cf6f7b8
 
 ## Decision
 
-Keep `GV_RS_LADDER` default off. Next gate: compile `Gemv` as an opcode-only lean decode object,
+Keep the ladder out of the production header. Next gate: compile `Gemv` as an opcode-only lean decode object,
 emit exact-capability segments only for models that require plain BF16 GEMV, and repeat the
 interpreter-through single-packet oracle. Do not route this through the current spilling megakernel.

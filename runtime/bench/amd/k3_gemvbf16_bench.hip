@@ -211,6 +211,27 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_packet_aa(bf16* C, 
                                                        LDS);                                       \
     } while (0)
 
+/* Harness-only short-K ladder. It is not promoted into the production interpreter because the
+ * measured 1.4% body gain would invalidate the tuned kernel profile without closing decode. */
+template <int MM, bool XLDS>
+__device__ __forceinline__ void gemv_rows_lad(bf16* __restrict__ C, const bf16* __restrict__ x,
+                                              const bf16* __restrict__ W, unsigned M, unsigned N,
+                                              unsigned K, unsigned slice, unsigned nblk,
+                                              const bf16* lds) {
+    const unsigned lane = threadIdx.x & 63;
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned gv_per = (N + nblk - 1) / nblk;
+    const unsigned gv_n0 = slice * gv_per;
+    const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
+    unsigned n = gv_n0 + wave;
+    for (; n + 3u * PLOW_WAVES < gv_n1; n += 4u * PLOW_WAVES)
+        gemv_rows_r_bench<MM, XLDS, 3, 4>(C, x, W, M, N, K, n, lane, lds);
+    for (; n + PLOW_WAVES < gv_n1; n += 2u * PLOW_WAVES)
+        gemv_rows_r_bench<MM, XLDS, 7, 2>(C, x, W, M, N, K, n, lane, lds);
+    for (; n < gv_n1; n += PLOW_WAVES)
+        gemv_rows_r_bench<MM, XLDS, GV_UNROLL, 1>(C, x, W, M, N, K, n, lane, lds);
+}
+
 extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_rL(bf16* C, const bf16* x,
                                                                 const bf16* W, unsigned nrep,
                                                                 unsigned N, unsigned K) {
@@ -226,8 +247,8 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_rL(bf16* C, const b
             gemv_rows<PLOW_GEMV_MM, true, false, GV_UNROLL>(C, x, Wp, nullptr, nullptr, 1u, N, K,
                                                             blockIdx.x, gridDim.x, sm.xstage);
         else
-            gemv_rows_rs_ladder<PLOW_GEMV_MM, true>(C, x, Wp, 1u, N, K, blockIdx.x, gridDim.x,
-                                                    sm.xstage);
+            gemv_rows_lad<PLOW_GEMV_MM, true>(C, x, Wp, 1u, N, K, blockIdx.x, gridDim.x,
+                                              sm.xstage);
         __syncthreads();
     }
 }
@@ -251,8 +272,8 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_rF(bf16* C, const b
             gemv_rows_rsplit<PLOW_GEMV_MM, true, 2, 7>(C, x, Wp, 1u, N, K, blockIdx.x,
                                                        gridDim.x, sm.xstage);
         else if (nch == 3u)
-            gemv_rows_rs_ladder<PLOW_GEMV_MM, true>(C, x, Wp, 1u, N, K, blockIdx.x, gridDim.x,
-                                                    sm.xstage);
+            gemv_rows_lad<PLOW_GEMV_MM, true>(C, x, Wp, 1u, N, K, blockIdx.x, gridDim.x,
+                                              sm.xstage);
         else
             gemv_rows_rsplit<PLOW_GEMV_MM, true, 7, 2>(C, x, Wp, 1u, N, K, blockIdx.x,
                                                        gridDim.x, sm.xstage);
