@@ -104,11 +104,13 @@ grep -qE "FUNC .* $SYM\$" <<<"$SYMS" ||
 
 grep -qE "OBJECT .* plow_packed_prefill_abi_1\$" <<<"$SYMS" ||
     fail "$OUT does not advertise plow_packed_prefill_abi_1"
-PACKED_MLA=0; PACKED_KDA=0; K3=0; MLA=0
+PACKED_MLA=0; PACKED_MLA_NORM=0; PACKED_MLA_FLASH=0; PACKED_KDA=0; K3=0; MLA=0
 for arg in "$@"; do
     case "$arg" in
         -DPLOW_PACKED_PREFILL_CONSUMERS=1) PACKED_MLA=1; PACKED_KDA=1 ;;
         -DPLOW_PACKED_PREFILL_MLA_CONSUMERS=1) PACKED_MLA=1 ;;
+        -DPLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS=1) PACKED_MLA_NORM=1 ;;
+        -DPLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS=1) PACKED_MLA_FLASH=1 ;;
         -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1) PACKED_KDA=1 ;;
         -DPLOW_K3=1) K3=1 ;;
         -DPLOW_MLA_PREFILL=1|-DPLOW_MLA_PF_V2_ARM=1) MLA=1 ;;
@@ -123,6 +125,27 @@ for cap in mla kda; do
         grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS" || fail "$OUT is missing $marker"
     elif grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS"; then
         fail "default $OUT unexpectedly advertises $marker"
+    fi
+done
+
+for spec in \
+    "PLOW_BUCKET_PACKED_MLA_NORM=plow_packed_prefill_mla_norm_segments_1" \
+    "PLOW_BUCKET_FLASH=plow_packed_prefill_mla_flash_segments_1" \
+    "PLOW_BUCKET_PACKED_KDA=plow_packed_prefill_kda_serial_segments_1"; do
+    flag=${spec%%=*}
+    marker=${spec#*=}
+    required=0
+    for arg in "$@"; do
+        case "$arg" in
+            -D${flag}|-D${flag}=1) required=1 ;;
+        esac
+    done
+    # Ordinary flash objects do not consume packed descriptors.
+    if [ "$flag" = PLOW_BUCKET_FLASH ] && [ "$PACKED_MLA_FLASH" != 1 ]; then
+        required=0
+    fi
+    if [ "$required" = 1 ]; then
+        grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS" || fail "$OUT is missing $marker"
     fi
 done
 

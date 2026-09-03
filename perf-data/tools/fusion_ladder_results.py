@@ -126,7 +126,10 @@ def validate_row(row: Any, where: str) -> dict[str, Any]:
         fail(f"{where}.target.tp", "must be an integer >= 1")
 
     artifacts = object_field(row["artifacts"], f"{where}.artifacts")
-    artifact_fields = {"candidate_sha256", "baseline_sha256", "config_sha256"}
+    artifact_fields = {
+        "candidate_sha256", "baseline_sha256", "config_sha256",
+        "candidate_command_sha256", "baseline_command_sha256",
+    }
     if set(artifacts) != artifact_fields:
         fail(f"{where}.artifacts", f"must contain exactly {', '.join(sorted(artifact_fields))}")
     for name in artifact_fields:
@@ -286,6 +289,8 @@ def self_test() -> None:
             "candidate_sha256": "a" * 64,
             "baseline_sha256": "b" * 64,
             "config_sha256": configuration_sha256(configuration),
+            "candidate_command_sha256": "c" * 64,
+            "baseline_command_sha256": "d" * 64,
         },
         "configuration": configuration,
         "correctness": {

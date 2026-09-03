@@ -651,6 +651,8 @@ values cost.
 | `PLOW_STEP_TIME=1`, `PLOW_TTFT_LOG=1` | off | per-decode-step host-op timing / TTFT breakdown logging (diagnostics). |
 | `PLOW_HSACO_LOWRUNG=dir:max[,dir:max…]` | unset | AMD decode-object tiers. The runtime selects the narrowest tier whose `max` covers the occupied decode rung, pairing-checks each tier at that width, and falls back to the primary HSACO inventory above it. A single legacy `dir` uses `PLOW_LOWRUNG_MAX` (default 2). |
 | `PLOW_STATE_CLEAR_DEVICE=1` | off | AMD admission experiment: clear slot-major recurrent state with one device kernel per rank instead of host-staged SDMA fills. Requires rebuilt decode objects carrying `plow_state_clear`. |
+| `PLOW_SEG_PACKED_PREFILL=1` | off | AMD emit-time experiment: split descriptor-consuming MLA norm/cache, MLA flash, and serial-KDA ops into pure topological segments. No model-name predicates. Unset preserves packet bytes. |
+| `PLOW_PACKED_PREFILL_ROUTE=1` | off | Load the optional lean packed-family HSACO objects and permit exact-family routing after metadata is staged. Missing/wrong markers and mixed segments refuse; it does not enable mux co-packing by itself. |
 
 ### Segmented prefill (sm_90a / GH200)
 

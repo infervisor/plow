@@ -9,19 +9,24 @@
 #
 # Speculative decoding is OUT OF SCOPE for the K3 campaign — that document records the decision and
 # the numbers behind it. This script exists so the negative result stays reproducible.
-set -uo pipefail
+set -euo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ASSETS="${1:-/home/lava/models/k3_b1}"
 STEPS="${2:-400}"
 CKPT="${CKPT:-/home/lava/models/k3_farm}"
 BIN="${PLOWRT_BIN:-$WT/target/release/plowrt}"
 REPORT="${SPEC_GEN_REPORT:-/tmp/plow-spec-gen-$USER.json}"
+NIX="${PLOW_NIX_BIN:-nix}"
+LEASE="${PLOW_GPULEASE_BIN:-$WT/perf-data/tools/gpulease}"
 
 [[ "$STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "steps must be positive" >&2; exit 2; }
 PY='import json,sys; print(json.load(open(sys.argv[1]))["parity"]["output_token_ids"][0])'
+printf -v PLOW_CMD \
+  'exec %q --rt-checkpoint %q bench --assets %q --prompt-ids %q --concurrency 1 --requests 1 --warmup-requests 0 --output-len %q --parity-report >%q' \
+  "$BIN" "$CKPT" "$ASSETS" '1008,10484,318,15383,387' "$STEPS" "$REPORT"
 printf -v RUN \
-  'nix develop %q --command %q --rt-checkpoint %q bench --assets %q --prompt-ids %q --concurrency 1 --requests 1 --warmup-requests 0 --output-len %q --parity-report >%q && python3 -c %q %q' \
-  "$WT" "$BIN" "$CKPT" "$ASSETS" '1008,10484,318,15383,387' "$STEPS" "$REPORT" "$PY" "$REPORT"
+  '%q develop %q --command bash -c %q && python3 -c %q %q' \
+  "$NIX" "$WT" "$PLOW_CMD" "$PY" "$REPORT"
 
-exec "$WT/perf-data/tools/gpulease" -n 8 specgen sg render -c \
+exec "$LEASE" -n 8 specgen sg render -c \
   "$RUN"

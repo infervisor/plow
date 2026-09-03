@@ -32,3 +32,14 @@ Measured detail behind it: `perf-data/gemma12b-gh200-prefill-campaign.md`
 
 - `bringup_gate.sh` / `bringup_bench.sh` / `bringup_showdown.sh` /
   `bringup_ceiling.py` — the parameterized scripts those stages drive.
+  `bringup_showdown.sh` alternates complete Plow/vLLM server lifetimes for at
+  least three rounds and drives both through the same raw `/v1/completions`
+  client. Run the whole command under `gpulease -n "$TP"`; it requires frozen
+  Plow artifacts plus frozen vLLM artifacts or explicit immutable image/model
+  identities. `bringup_bench_selftest.sh` checks workload maps and exact-count
+  refusal without a GPU.
+  A pinned container command is passed whole, for example
+  `VLLM_CLIENT_COMMAND_ARGV="docker run --rm --network host --entrypoint vllm IMAGE@sha256:..."`
+  and likewise `VLLM_SERVER_COMMAND_ARGV` (with the required GPU and mount
+  arguments). The harness appends `bench serve` or `serve`; it never inserts a
+  host-side executable after the image.

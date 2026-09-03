@@ -78,8 +78,8 @@ Supporting scripts in `perf-data/tools/`:
 |---|---|
 | `gpulease <label> <cmd>` | advisory GPU lease + contention audit. Wraps the **run**, not the build. Exits **76** if the GPU was contended — that run's timings are void. See the contention pitfall below. |
 | `bringup_gate.sh <assets> <tag> <port>` | token-identity correctness gate: serves the bundle, runs 4 fixed greedy prompts (temp 0, 32 tok), dumps to `$BRINGUP_OUT/gate-out/<tag>.txt` for `diff` against the reference arm |
-| `bringup_bench.sh <tag> <url> <model> <tokenizer> [round]` | one client pass over one endpoint; env `IN_LENS`/`NPROMPT`/`OUTLEN`; appends one row per input length to `cells.tsv` |
-| `bringup_showdown.sh` | sequential-**exclusive** multi-arm template — one server at a time, kill+drain between arms, medians over ≥5 rounds |
+| `bringup_bench.sh <tag> <url> <model> <tokenizer> [round]` | raw `/v1/completions` client pass; keyed `INPUT_MAP`, `CONCURRENCY_MAP`, `PROMPT_MAP`, `WARMUP_MAP`, `OUTLEN_MAP`; rejects partial request/token counts and appends structured rows to `cells.tsv` |
+| `bringup_showdown.sh` | sequential-exclusive two-arm harness — alternates whole Plow/vLLM server lifetimes over ≥3 rounds, freezes arm identities, and preserves every client/server log |
 | `bringup_ceiling.py` | vendor-BLAS/torch fp8+bf16 GEMM ceiling at your model's exact prefill shapes — the roofline reference (edit `SHAPES`); written against cuBLASLt, so on `$VENDOR = amd` it needs the hipBLASLt equivalent or Stage 4's `$COMPUTE_CEIL` instead |
 | `consolidate_b2_ib.py`, `b2-ib/{slo_capacity,summarize}.py` | ingest the tool's raw report JSON into `b2-concurrency-*.json`; derive max-users-under-SLO. Scratch reducers — the markdown table is typed by hand from their output |
 

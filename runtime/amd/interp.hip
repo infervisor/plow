@@ -74,6 +74,21 @@ extern "C" __device__ unsigned plow_packed_prefill_mla_consumers_1 = 1;
 #if PLOW_PACKED_PREFILL_KDA_CONSUMERS && PLOW_K3
 extern "C" __device__ unsigned plow_packed_prefill_kda_consumers_1 = 1;
 #endif
+#if defined(PLOW_BUCKET_PACKED_MLA_NORM)
+#if !PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
+#error "packed MLA-norm bucket requires PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS"
+#endif
+extern "C" __device__ unsigned plow_packed_prefill_mla_norm_segments_1 = 1;
+#endif
+#if defined(PLOW_BUCKET_PACKED_KDA)
+#if !PLOW_PACKED_PREFILL_KDA_CONSUMERS || !PLOW_K3
+#error "packed KDA bucket requires PLOW_PACKED_PREFILL_KDA_CONSUMERS and PLOW_K3"
+#endif
+extern "C" __device__ unsigned plow_packed_prefill_kda_serial_segments_1 = 1;
+#endif
+#if defined(PLOW_BUCKET_FLASH) && PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS && PLOW_MLA_PF_V2_ARM
+extern "C" __device__ unsigned plow_packed_prefill_mla_flash_segments_1 = 1;
+#endif
 
 /* The K3/KDA arms, made observable in the ELF the same way `PLOW_GEMV_WALK` is
  * (`runtime/amd/op_gemm.h:2557`) and for the same reason: the loader reads `.symtab` before the
@@ -1842,6 +1857,98 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #endif
 #endif
     (void)slice;
+#elif defined(PLOW_BUCKET_PACKED_MLA_NORM)
+    if (!plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
+    switch (in->op) {
+        case PLOW_DOP_RMSNORM:
+            d_rmsnorm((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
+                      in->i[1], in->fj[0].f, in->i[2], slice, nblk, sm->part,
+                      (unsigned char*)TEN(3), (float*)TEN(4), prog_meta, in->i[7]);
+            break;
+        case PLOW_DOP_HEADNORM_ROPE:
+#define PLOW_PACKED_HEADNORM(HD, INTERLEAVE)                                                \
+    d_headnorm_rope<HD, INTERLEAVE>(                                                        \
+        (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), (const float*)TEN(3),      \
+        (const float*)TEN(4), (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f,         \
+        in->i[3], in->fj[1].u, in->fj[2].u, in->i[4], slice, nblk, in->i[6], prog_meta,     \
+        in->i[7])
+            if (in->i[2] == 64)
+                PLOW_PACKED_HEADNORM(64, true);
+            else if (in->i[2] == 128 && in->i[5] == 1)
+                PLOW_PACKED_HEADNORM(128, true);
+            else if (in->i[2] == 128)
+                PLOW_PACKED_HEADNORM(128, false);
+            else if (in->i[2] == 256)
+                PLOW_PACKED_HEADNORM(256, false);
+            else if (in->i[2] == 512)
+                PLOW_PACKED_HEADNORM(512, false);
+            else
+                __builtin_trap();
+#undef PLOW_PACKED_HEADNORM
+            break;
+#if PLOW_FP8_KV
+        case PLOW_DOP_HEADNORM_ROPE_FP8:
+#define PLOW_PACKED_HEADNORM_FP8(HD)                                                        \
+    d_headnorm_rope_fp8<HD>(                                                                \
+        (unsigned char*)TEN(0), (float*)TEN(6), (const bf16*)TEN(1),                        \
+        (const bf16*)TEN(2), (const float*)TEN(3), (const float*)TEN(4),                    \
+        (const int*)TEN(5), in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u,        \
+        in->fj[2].u, in->i[4], slice, nblk, in->i[6], prog_meta, in->i[7])
+            if (in->i[2] == 64)
+                PLOW_PACKED_HEADNORM_FP8(64);
+            else if (in->i[2] == 128)
+                PLOW_PACKED_HEADNORM_FP8(128);
+            else if (in->i[2] == 256)
+                PLOW_PACKED_HEADNORM_FP8(256);
+            else if (in->i[2] == 512)
+                PLOW_PACKED_HEADNORM_FP8(512);
+            else
+                __builtin_trap();
+#undef PLOW_PACKED_HEADNORM_FP8
+            break;
+#endif
+        default:
+            __builtin_trap();
+    }
+#elif defined(PLOW_BUCKET_PACKED_KDA)
+    if (!plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
+    switch (in->op) {
+        case PLOW_DOP_KDA_STATE_STEP:
+            d_kda_state_step_packed</*GATED=*/false>(
+                (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                (const bf16*)TEN(3), (const float*)TEN(4), (const float*)TEN(5), nullptr,
+                nullptr, nullptr, nullptr, 0u, 0.0f, (float*)TEN(6), in->i[1], in->i[2],
+                in->i[3], in->i[4], in->fj[0].f, slice, nblk, (float*)sm->raw, prog_meta);
+            break;
+        case PLOW_DOP_KDA_CONV3: {
+            const float* wv = (in->i[4] == PLOW_TENSOR_NONE) ? nullptr : (const float*)T[in->i[4]];
+            float* cs[3];
+#pragma unroll
+            for (int s = 0; s < 3; ++s)
+                cs[s] = (in->i[5 + s] == PLOW_TENSOR_NONE) ? nullptr : (float*)T[in->i[5 + s]];
+            if (wv == nullptr || cs[0] == nullptr || cs[1] == nullptr || cs[2] == nullptr ||
+                TEN(6) == nullptr || TEN(7) == nullptr || in->i[1] == 0u)
+                __builtin_trap();
+            d_kda_conv3_packed(
+                (bf16*)TEN(0), (bf16*)TEN(1), (bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
+                (const float*)TEN(7), wv, cs[0], cs[1], cs[2], in->i[1], in->i[2],
+                in->i[3], slice, nblk, prog_meta);
+        } break;
+        case PLOW_DOP_KDA_STATE_STEP_G: {
+            const float* dtb = (in->i[5] == PLOW_TENSOR_NONE) ? nullptr : (const float*)T[in->i[5]];
+            if (dtb == nullptr || TEN(7) == nullptr || TEN(4) == nullptr || TEN(5) == nullptr)
+                __builtin_trap();
+            d_kda_state_step_packed</*GATED=*/true>(
+                (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                (const bf16*)TEN(3), nullptr, nullptr, (const bf16*)TEN(4),
+                (const bf16*)TEN(5), (const float*)TEN(7), dtb, in->i[6], in->fj[1].f,
+                (float*)TEN(6), in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
+                slice, nblk, (float*)sm->raw, prog_meta);
+        } break;
+        default:
+            __builtin_trap();
+    }
 #else
     switch (in->op) {
         case PLOW_DOP_RMSNORM:
@@ -3469,10 +3576,18 @@ __device__ __forceinline__ void ctr_signal(uint32_t* p) {
 #define PLOW_GQ_CAT(a, b) PLOW_GQ_CAT2(a, b)
 #if PLOW_BUCKET_DECODE
 #define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_dec_, PLOW_ARCH_SUFFIX)
+#elif defined(PLOW_BUCKET_PACKED_MLA_NORM)
+#define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_packed_mla_norm_, PLOW_ARCH_SUFFIX)
+#elif defined(PLOW_BUCKET_PACKED_KDA)
+#define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_packed_kda_, PLOW_ARCH_SUFFIX)
 #elif defined(PLOW_BUCKET_FLASH)
 /* Segmented-dispatch flash object: prefill op set, but built at 4 waves / FA_DC=256 so the flash
  * segments get the 512-register budget. Distinct symbol; one HSA executable holds all three. */
+#if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
+#define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_packed_mla_flash_, PLOW_ARCH_SUFFIX)
+#else
 #define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_flash_, PLOW_ARCH_SUFFIX)
+#endif
 #else
 #define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_, PLOW_ARCH_SUFFIX)
 #endif

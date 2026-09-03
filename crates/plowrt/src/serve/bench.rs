@@ -31,6 +31,7 @@ pub struct Config {
     pub output_tokens: usize,
     pub runtime: serde_json::Value,
     pub parity_report: bool,
+    pub token_audit: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -145,10 +146,18 @@ pub struct Report {
     pub diagnostics: Option<EngineDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parity: Option<ParityReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_audit: Option<TokenAuditReport>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ParityReport {
+    pub prompt_token_ids: Vec<Vec<u32>>,
+    pub output_token_ids: Vec<Vec<u32>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TokenAuditReport {
     pub prompt_token_ids: Vec<Vec<u32>>,
     pub output_token_ids: Vec<Vec<u32>>,
 }
@@ -461,6 +470,7 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
                 .into(),
         ));
     }
+    validate_token_audit_config(&cfg)?;
     if state.execset.backend().vendor().is_none() {
         return Err(RuntimeError::Msg(
             "bench requires a matching GPU backend; refusing CPU fallback performance".into(),
@@ -560,6 +570,13 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
             .collect(),
         output_token_ids: results.iter().map(|result| result.ids.clone()).collect(),
     });
+    let token_audit = cfg.token_audit.then(|| TokenAuditReport {
+        prompt_token_ids: results
+            .iter()
+            .map(|result| prompt(&cfg.input, vocab, result.request))
+            .collect(),
+        output_token_ids: results.iter().map(|result| result.ids.clone()).collect(),
+    });
 
     Ok(Report {
         schema: "plowrt.bench.v1",
@@ -615,7 +632,34 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
         },
         diagnostics: None,
         parity,
+        token_audit,
     })
+}
+
+const MAX_TOKEN_AUDIT_REQUESTS: usize = 64;
+const MAX_TOKEN_AUDIT_IDS: usize = 65_536;
+
+fn validate_token_audit_config(cfg: &Config) -> Result<()> {
+    if !cfg.token_audit {
+        return Ok(());
+    }
+    if cfg.parity_report || !matches!(&cfg.input, Input::TokenIds(_)) {
+        return Err(RuntimeError::Msg(
+            "bench token audit requires exact token-id input and is distinct from parity-report"
+                .into(),
+        ));
+    }
+    let total_ids = input_len(&cfg.input)
+        .checked_add(cfg.output_tokens)
+        .and_then(|per_request| per_request.checked_mul(cfg.requests))
+        .ok_or_else(|| RuntimeError::Msg("bench token audit token count overflow".into()))?;
+    if cfg.requests > MAX_TOKEN_AUDIT_REQUESTS || total_ids > MAX_TOKEN_AUDIT_IDS {
+        return Err(RuntimeError::Msg(format!(
+            "bench token audit is bounded to {MAX_TOKEN_AUDIT_REQUESTS} requests and \
+             {MAX_TOKEN_AUDIT_IDS} total prompt/output token IDs"
+        )));
+    }
+    Ok(())
 }
 
 async fn drive(
@@ -1088,6 +1132,40 @@ mod tests {
             itl: Vec::new(),
             e2e: Duration::from_millis(2),
         }
+    }
+
+    fn token_audit_config(input: Input, requests: usize, output_tokens: usize) -> Config {
+        Config {
+            model: "model".into(),
+            input,
+            concurrency: 1,
+            warmup_requests: 0,
+            requests,
+            output_tokens,
+            runtime: serde_json::Value::Null,
+            parity_report: false,
+            token_audit: true,
+        }
+    }
+
+    #[test]
+    fn token_audit_config_is_exact_and_bounded() {
+        assert!(validate_token_audit_config(&token_audit_config(
+            Input::TokenIds(vec![1, 2, 3]),
+            4,
+            8,
+        ))
+        .is_ok());
+        assert!(validate_token_audit_config(&token_audit_config(
+            Input::Random { len: 3, seed: 0 },
+            4,
+            8,
+        ))
+        .is_err());
+        assert!(
+            validate_token_audit_config(&token_audit_config(Input::TokenIds(vec![1]), 65, 8,))
+                .is_err()
+        );
     }
 
     #[test]

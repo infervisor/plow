@@ -868,8 +868,9 @@ const GEMV_CAP_SYM_PREFIX: &str = "plow_gemv_mm_cap_";
 const GEMV_WALK_SYM: &str = "plow_gemv_walk_1";
 const XARGMAX_B128_SYM: &str = "plow_xargmax_max_batch_128";
 const PACKED_PREFILL_ABI_SYM: &str = "plow_packed_prefill_abi_1";
-const PACKED_PREFILL_MLA_SYM: &str = "plow_packed_prefill_mla_consumers_1";
-const PACKED_PREFILL_KDA_SYM: &str = "plow_packed_prefill_kda_consumers_1";
+const PACKED_PREFILL_MLA_NORM_SEG_SYM: &str = "plow_packed_prefill_mla_norm_segments_1";
+const PACKED_PREFILL_MLA_FLASH_SEG_SYM: &str = "plow_packed_prefill_mla_flash_segments_1";
+const PACKED_PREFILL_KDA_SEG_SYM: &str = "plow_packed_prefill_kda_serial_segments_1";
 
 fn check_packed_prefill_abi(prefill: bool, flash_required: bool, flash: bool) -> Result<()> {
     if !prefill {
@@ -887,32 +888,15 @@ fn check_packed_prefill_abi(prefill: bool, flash_required: bool, flash: bool) ->
     Ok(())
 }
 
-fn check_packed_prefill_mla_consumers(
-    prefill: bool,
-    flash_required: bool,
-    flash: bool,
-) -> Result<()> {
-    if !prefill || (flash_required && !flash) {
-        return Err(RuntimeError::Device(format!(
-            "packed-prefill MLA dispatch requires every routed object to advertise \
-             `{PACKED_PREFILL_MLA_SYM}`; ABI-only objects cannot consume span metadata"
-        )));
+fn check_packed_family_kv_encoding(has_fp8: bool, want_fp8: bool) -> Result<()> {
+    if has_fp8 == want_fp8 {
+        Ok(())
+    } else {
+        Err(RuntimeError::Device(format!(
+            "packed-prefill family object has fp8-KV capability {has_fp8}, packet requires \
+             {want_fp8}; refusing an encoding mismatch"
+        )))
     }
-    Ok(())
-}
-
-fn check_packed_prefill_kda_consumers(present: bool) -> Result<()> {
-    if !present {
-        return Err(RuntimeError::Device(format!(
-            "packed-prefill KDA dispatch requires `{PACKED_PREFILL_KDA_SYM}`; ABI-only objects \
-             cannot consume recurrent span metadata"
-        )));
-    }
-    Ok(())
-}
-
-fn packed_prefill_routes_flash(has_flash: bool, l2_domains: u32, seg_class: &[u8]) -> bool {
-    has_flash && l2_domains == 0 && seg_class.contains(&4)
 }
 
 /// `PLOW_GEMV_MAXM` from `runtime/amd/op_gemm.h` — the widest bucket the GEMV
@@ -1589,6 +1573,85 @@ fn derive_segments_for(prog: &DevProg, v2: bool) -> Result<Vec<u8>> {
         }
     }
     Ok(class)
+}
+
+fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
+    let n_seg = prog
+        .stream
+        .iter()
+        .map(|e| e.seg as usize + 1)
+        .max()
+        .unwrap_or(1);
+    let mut family = vec![None; n_seg];
+    let mut pure = vec![true; n_seg];
+    for e in &prog.stream {
+        let op = prog
+            .insts
+            .get(e.inst as usize)
+            .ok_or_else(|| {
+                RuntimeError::Device(format!("stream entry references instruction {}", e.inst))
+            })?
+            .op;
+        let next = if op == DevOp::RmsNorm as u16
+            || op == DevOp::HeadNormRope as u16
+            || op == DevOp::HeadNormRopeFp8 as u16
+        {
+            Some(5)
+        } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
+            Some(6)
+        } else if op == DevOp::KdaStateStep as u16
+            || op == DevOp::KdaConv3 as u16
+            || op == DevOp::KdaStateStepG as u16
+        {
+            Some(7)
+        } else {
+            None
+        };
+        let s = e.seg as usize;
+        match (family[s], next) {
+            (None, Some(f)) => family[s] = Some(f),
+            (Some(a), Some(b)) if a == b => {}
+            _ => pure[s] = false,
+        }
+    }
+    Ok(family
+        .into_iter()
+        .zip(pure)
+        .map(|(f, p)| if p { f.unwrap_or(0) } else { 0 })
+        .collect())
+}
+
+fn packed_family_segments_cover(prog: &DevProg, families: &[u8], wanted: &[u8]) -> bool {
+    let mut seen = false;
+    let covered = prog.stream.iter().all(|e| {
+        let Some(in_) = prog.insts.get(e.inst as usize) else {
+            return false;
+        };
+        let expected = if in_.op == DevOp::RmsNorm as u16
+            || in_.op == DevOp::HeadNormRope as u16
+            || in_.op == DevOp::HeadNormRopeFp8 as u16
+        {
+            5
+        } else if in_.op == DevOp::FlashMlaPrefill as u16
+            || in_.op == DevOp::FlashMlaPrefillFp8 as u16
+        {
+            6
+        } else if in_.op == DevOp::KdaStateStep as u16
+            || in_.op == DevOp::KdaConv3 as u16
+            || in_.op == DevOp::KdaStateStepG as u16
+        {
+            7
+        } else {
+            0
+        };
+        if expected != 0 && wanted.contains(&expected) {
+            seen = true;
+            families.get(e.seg as usize).copied() == Some(expected)
+        } else {
+            true
+        }
+    });
+    seen && covered
 }
 
 /// Rows-equivalent cost charged per launch in the chunk DP. Tuned in the
@@ -3380,6 +3443,43 @@ fn packed_prefill_kernarg(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackedSegmentRoute {
+    Primary,
+    MlaNorm,
+    MlaFlash,
+    Kda,
+}
+
+fn packed_segment_route(
+    active: bool,
+    class: u8,
+    mla_norm: bool,
+    mla_flash: bool,
+    kda: bool,
+) -> Result<PackedSegmentRoute> {
+    if !active || class == 0 || class == 8 {
+        return Ok(PackedSegmentRoute::Primary);
+    }
+    let (available, route, name) = match class {
+        5 => (mla_norm, PackedSegmentRoute::MlaNorm, "MLA norm/cache"),
+        6 => (mla_flash, PackedSegmentRoute::MlaFlash, "MLA flash"),
+        7 => (kda, PackedSegmentRoute::Kda, "serial KDA"),
+        _ => {
+            return Err(RuntimeError::Device(format!(
+                "packed-prefill segment has unknown operator-family class {class}"
+            )))
+        }
+    };
+    if !available {
+        return Err(RuntimeError::Device(format!(
+            "packed-prefill {name} segment has no exact capability object; refusing to fall \
+             back to the production interpreter"
+        )));
+    }
+    Ok(route)
+}
+
 /// Per-program local counter-bank state.
 ///
 /// TP keeps `current` on the bank used by the last dispatch so diagnostic
@@ -3443,8 +3543,10 @@ struct AmdProg {
     t: u32,
     packed_needs_mla: bool,
     packed_mla_compatible: bool,
+    packed_mla_segmented: bool,
     packed_needs_kda: bool,
     packed_kda_compatible: bool,
+    packed_kda_segmented: bool,
     n_inst: u32,
     trace_records: usize,
     n_counter: u32,
@@ -3463,6 +3565,9 @@ struct AmdProg {
     d_seg_ofs: DeviceMem,
     /// `[n_seg]` wave classes.
     seg_class: Vec<u8>,
+    /// `[n_seg]` pure packed-consumer family: 5=MLA norm/cache, 6=MLA flash,
+    /// 7=serial KDA, 0=not safely routable to a family object.
+    packed_seg_family: Vec<u8>,
     /// Global-queue tables; `None` when the blob carries no GQ appendix.
     gq: Option<AmdGq>,
     /// L2-domain placement (`PLOW_L2_PLACE`): domains `gq_seg_ofs` is windowed by, 0 = not
@@ -3575,11 +3680,10 @@ pub struct AmdEngine {
     /// Task-13: low-rung decode tier ladder, ascending (max_rung, kernel).
     decode_tiers: Vec<(u32, HsaKernel)>,
     k_flash: Option<HsaKernel>,
+    k_packed_mla_norm: Option<HsaKernel>,
+    k_packed_mla_flash: Option<HsaKernel>,
+    k_packed_kda: Option<HsaKernel>,
     packed_prefill_prefill_abi: bool,
-    packed_prefill_flash_abi: bool,
-    packed_prefill_prefill_mla: bool,
-    packed_prefill_flash_mla: bool,
-    packed_prefill_prefill_kda: bool,
     sched_prefill: Sched,
     sched_decode: Sched,
     _modules: Vec<Module>,
@@ -4137,7 +4241,7 @@ impl AmdEngine {
             .hsaco_lowrung
             .clone()
             .filter(|d| !d.is_empty());
-        type LK = (HsaKernel, bool, bool, bool);
+        type LK = (HsaKernel, bool);
         let mut load_one_in =
             |phase: Phase, sched: Sched, dir: &Path, gemv_need: Option<u32>| -> Result<LK> {
                 let name = object_name(phase, variant, prefill_arm, sched);
@@ -4197,8 +4301,6 @@ impl AmdEngine {
                 })?;
                 let syms = elf_symbol_names(&image);
                 let packed_prefill_abi = syms.contains(&PACKED_PREFILL_ABI_SYM);
-                let packed_prefill_mla = syms.contains(&PACKED_PREFILL_MLA_SYM);
-                let packed_prefill_kda = syms.contains(&PACKED_PREFILL_KDA_SYM);
                 if let (Phase::Prefill, Some(req)) = (phase, requires.as_ref()) {
                     check_prefill_object(&syms, &path, req)?;
                 }
@@ -4384,21 +4486,12 @@ impl AmdEngine {
                 )));
                 }
                 modules.push(m);
-                Ok((
-                    k,
-                    packed_prefill_abi,
-                    packed_prefill_mla,
-                    packed_prefill_kda,
-                ))
+                Ok((k, packed_prefill_abi))
             };
 
-        let (
-            k_prefill,
-            packed_prefill_prefill_abi,
-            packed_prefill_prefill_mla,
-            packed_prefill_prefill_kda,
-        ) = load_one_in(Phase::Prefill, sched_prefill, hsaco_dir, None)?;
-        let (k_decode, _, _, _) = load_one_in(Phase::Decode, sched_decode, hsaco_dir, None)?;
+        let (k_prefill, packed_prefill_prefill_abi) =
+            load_one_in(Phase::Prefill, sched_prefill, hsaco_dir, None)?;
+        let (k_decode, _) = load_one_in(Phase::Decode, sched_decode, hsaco_dir, None)?;
         // Task-13: the low-rung decode tier ladder. Each tier's pairing checks
         // run with ITS need (the widest rung it will serve), not the blob-wide
         // max — an MM=4 object legitimately serves rungs 1-2 of a B=32 blob.
@@ -4428,26 +4521,102 @@ impl AmdEngine {
             }
             tiers.sort_by_key(|&(_, m)| m);
             for (d, max) in tiers {
-                let (k, _, _, _) =
-                    load_one_in(Phase::Decode, sched_decode, Path::new(&d), Some(max))?;
+                let (k, _) = load_one_in(Phase::Decode, sched_decode, Path::new(&d), Some(max))?;
                 decode_tiers.push((max, k));
             }
         }
         // Flash follows the PREFILL scheduler — a flash segment is a prefill
         // segment. Optional: without it every segment runs class 8, which is
         // correct and merely slower.
-        let (k_flash, packed_prefill_flash_abi, packed_prefill_flash_mla) = match load_one_in(
-            Phase::Flash,
-            sched_prefill,
-            hsaco_dir,
-            None,
-        ) {
-            Ok((k, abi, mla, _)) => (Some(k), abi, mla),
+        let k_flash = match load_one_in(Phase::Flash, sched_prefill, hsaco_dir, None) {
+            Ok((k, _)) => Some(k),
             Err(e) => {
                 tracing::info!(%e, "no flash object — flash segments run on the 8-wave interpreter");
-                (None, false, false)
+                None
             }
         };
+        drop(load_one_in);
+
+        let mut load_packed_family = |stem: &str,
+                                      symbol_base: &str,
+                                      marker: &str,
+                                      fp8_kv: Option<bool>|
+         -> Result<Option<HsaKernel>> {
+            let name = format!("{stem}{}.elf", sched_prefill.suffix());
+            let path = hsaco_dir.join(&name);
+            if !path.exists() {
+                return Ok(None);
+            }
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!("code object {}: {e}", path.display()))
+            })?;
+            let syms = elf_symbol_names(&image);
+            if !syms.contains(&PACKED_PREFILL_ABI_SYM) || !syms.contains(&marker) {
+                return Err(RuntimeError::Device(format!(
+                    "packed-prefill family object {} must advertise `{PACKED_PREFILL_ABI_SYM}` \
+                         and `{marker}`; refusing a stale or wrong-family object",
+                    path.display()
+                )));
+            }
+            if let Some(want_fp8) = fp8_kv {
+                let has_fp8 = syms.contains(&FP8_KV_SYM);
+                check_packed_family_kv_encoding(has_fp8, want_fp8)
+                    .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            }
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let symbol = format!("{symbol_base}_{arch}{}", sched_prefill.suffix());
+            let kernel = EngineDevice::get_function(&*be, &module, &symbol)
+                .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {symbol}: {e}")))?;
+            const IMPLICIT: u32 = 256;
+            let want = (std::mem::size_of::<DevProgram>() as u32 + 7) & !7;
+            let got = kernel.kernarg_size();
+            if got != want && got != want + IMPLICIT {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: kernarg segment is {got} B; packed family ABI needs {want} \
+                         (or {} with implicit args)",
+                    want + IMPLICIT
+                )));
+            }
+            modules.push(module);
+            Ok(Some(kernel))
+        };
+        let packed_kv_infix = if variant == Variant::Fp8Kv {
+            "_fp8kv"
+        } else {
+            ""
+        };
+        let packed_route = crate::config::RuntimeConfig::get().amd.packed_prefill_route;
+        let k_packed_mla_norm = if packed_route {
+            load_packed_family(
+                &format!("interp_packed_mla_norm{packed_kv_infix}"),
+                "plow_interp_packed_mla_norm",
+                PACKED_PREFILL_MLA_NORM_SEG_SYM,
+                Some(variant == Variant::Fp8Kv),
+            )?
+        } else {
+            None
+        };
+        let k_packed_mla_flash = if packed_route {
+            load_packed_family(
+                &format!("interp_packed_mla_flash{packed_kv_infix}"),
+                "plow_interp_packed_mla_flash",
+                PACKED_PREFILL_MLA_FLASH_SEG_SYM,
+                Some(variant == Variant::Fp8Kv),
+            )?
+        } else {
+            None
+        };
+        let k_packed_kda = if packed_route {
+            load_packed_family(
+                "interp_packed_kda",
+                "plow_interp_packed_kda",
+                PACKED_PREFILL_KDA_SEG_SYM,
+                None,
+            )?
+        } else {
+            None
+        };
+        drop(load_packed_family);
 
         // --- tensors + weights ------------------------------------------------
         // Staging is one pinned slab, filled and pushed in `STAGE` chunks. The
@@ -4961,6 +5130,9 @@ impl AmdEngine {
         let mut progs = Vec::with_capacity(blob.progs.len());
         for p in &blob.progs {
             let seg_class = derive_segments(p)?;
+            let packed_seg_family = derive_packed_segment_families(p)?;
+            let packed_mla_segmented = packed_family_segments_cover(p, &packed_seg_family, &[5, 6]);
+            let packed_kda_segmented = packed_family_segments_cover(p, &packed_seg_family, &[7]);
             let up = |bytes: &[u8]| -> Result<DeviceMem> {
                 let m = EngineDevice::alloc(&*be, bytes.len().max(1) as u64)?;
                 if !bytes.is_empty() {
@@ -5048,6 +5220,7 @@ impl AmdEngine {
                             && d.t[7] != packet::dev::TENSOR_NONE as u16
                             && d.op != DevOp::FlashMlaPrefillFp8 as u16)
                 }),
+                packed_mla_segmented,
                 packed_needs_kda: p.insts.iter().any(|d| {
                     d.op == DevOp::KdaConv3 as u16
                         || d.op == DevOp::KdaStateStep as u16
@@ -5077,6 +5250,7 @@ impl AmdEngine {
                         )
                     )
                 }),
+                packed_kda_segmented,
                 n_inst: p.insts.len() as u32,
                 trace_records: p.stream.len(),
                 n_counter: p.n_counter,
@@ -5089,6 +5263,7 @@ impl AmdEngine {
                 d_ctr,
                 d_seg_ofs,
                 seg_class,
+                packed_seg_family,
                 gq,
                 l2_domains: p.l2_domains,
                 // DERIVED, not carried in the blob. The emitter appends the two-level
@@ -5455,11 +5630,10 @@ impl AmdEngine {
             d_token_ring,
             decode_tiers,
             k_flash,
+            k_packed_mla_norm,
+            k_packed_mla_flash,
+            k_packed_kda,
             packed_prefill_prefill_abi,
-            packed_prefill_flash_abi,
-            packed_prefill_prefill_mla,
-            packed_prefill_flash_mla,
-            packed_prefill_prefill_kda,
             sched_prefill,
             sched_decode,
             _modules: modules,
@@ -5601,15 +5775,14 @@ impl AmdEngine {
                 "program {prog} is a decode rung, not a packed-prefill program"
             )));
         }
-        check_packed_prefill_abi(
-            self.packed_prefill_prefill_abi,
-            packed_prefill_routes_flash(
-                self.k_flash.is_some(),
-                self.progs[prog].l2_domains,
-                &self.progs[prog].seg_class,
-            ),
-            self.packed_prefill_flash_abi,
-        )?;
+        check_packed_prefill_abi(self.packed_prefill_prefill_abi, false, false)?;
+        if self.progs[prog].l2_domains != 0 {
+            return Err(RuntimeError::Device(
+                "packed-prefill family routing requires wave-class segments; this packet uses \
+                 L2-domain placement in the same field"
+                    .into(),
+            ));
+        }
         if self.progs[prog].packed_needs_mla {
             if !self.progs[prog].packed_mla_compatible {
                 return Err(RuntimeError::Device(
@@ -5617,15 +5790,24 @@ impl AmdEngine {
                         .into(),
                 ));
             }
-            check_packed_prefill_mla_consumers(
-                self.packed_prefill_prefill_mla,
-                packed_prefill_routes_flash(
-                    self.k_flash.is_some(),
-                    self.progs[prog].l2_domains,
-                    &self.progs[prog].seg_class,
-                ),
-                self.packed_prefill_flash_mla,
-            )?;
+            if !self.progs[prog].packed_mla_segmented {
+                return Err(RuntimeError::Device(
+                    "packed-prefill MLA consumer is in a mixed segment; re-emit with \
+                     PLOW_SEG_PACKED_PREFILL=1"
+                        .into(),
+                ));
+            }
+            if self.progs[prog].packed_seg_family.contains(&5) && self.k_packed_mla_norm.is_none() {
+                return Err(RuntimeError::Device(
+                    "packed-prefill MLA norm/cache segment requires interp_packed_mla_norm".into(),
+                ));
+            }
+            if self.progs[prog].packed_seg_family.contains(&6) && self.k_packed_mla_flash.is_none()
+            {
+                return Err(RuntimeError::Device(
+                    "packed-prefill MLA flash segment requires interp_packed_mla_flash".into(),
+                ));
+            }
         }
         if self.progs[prog].packed_needs_kda {
             if !self.progs[prog].packed_kda_compatible {
@@ -5635,7 +5817,14 @@ impl AmdEngine {
                         .into(),
                 ));
             }
-            check_packed_prefill_kda_consumers(self.packed_prefill_prefill_kda)?;
+            if !self.progs[prog].packed_kda_segmented || self.k_packed_kda.is_none() {
+                return Err(RuntimeError::Device(
+                    "packed-prefill serial KDA requires pure family segments and \
+                     interp_packed_kda; re-emit with PLOW_SEG_PACKED_PREFILL=1 and build the \
+                     optional family objects"
+                        .into(),
+                ));
+            }
         }
         let rung = self.progs.get(prog).map(|p| p.t).ok_or_else(|| {
             RuntimeError::Device(format!("packed-prefill program {prog} is out of range"))
@@ -5889,10 +6078,26 @@ impl AmdEngine {
         check_packed_prefill_dispatch(self.packed_prefill, p)?;
         self.trace_write_bytes
             .set(self.progs[p].trace_records * TRACE_REC_BYTES);
-        let use4 = self.k_flash.is_some() && self.progs[p].seg_class[seg] == 4;
-        let (k, threads) = match (use4, self.k_flash) {
-            (true, Some(kf)) => (kf, WG_THREADS_4),
-            _ => (self.k_prefill, WG_THREADS_8),
+        let active = self.packed_prefill.is_some_and(|b| b.prog == p);
+        let family = self.progs[p].packed_seg_family[seg];
+        let route = packed_segment_route(
+            active,
+            family,
+            self.k_packed_mla_norm.is_some(),
+            self.k_packed_mla_flash.is_some(),
+            self.k_packed_kda.is_some(),
+        )?;
+        let (k, threads) = match route {
+            PackedSegmentRoute::MlaNorm => (self.k_packed_mla_norm.unwrap(), WG_THREADS_8),
+            PackedSegmentRoute::MlaFlash => (self.k_packed_mla_flash.unwrap(), WG_THREADS_4),
+            PackedSegmentRoute::Kda => (self.k_packed_kda.unwrap(), WG_THREADS_8),
+            PackedSegmentRoute::Primary => {
+                let use4 = self.k_flash.is_some() && self.progs[p].seg_class[seg] == 4;
+                match (use4, self.k_flash) {
+                    (true, Some(kf)) => (kf, WG_THREADS_4),
+                    _ => (self.k_prefill, WG_THREADS_8),
+                }
+            }
         };
         let arg = self.kernarg(p, seg as u32);
         EngineDevice::launch_cooperative(
@@ -7522,32 +7727,6 @@ mod tests {
             .to_string();
         assert!(missing_flash.contains("flash object"));
         assert!(missing_flash.contains(PACKED_PREFILL_ABI_SYM));
-
-        assert!(packed_prefill_routes_flash(true, 0, &[8, 4, 8]));
-        assert!(!packed_prefill_routes_flash(false, 0, &[4]));
-        assert!(!packed_prefill_routes_flash(true, 8, &[0, 4, 7]));
-    }
-
-    #[test]
-    fn packed_prefill_requires_consumer_markers_not_just_the_abi() {
-        assert!(check_packed_prefill_mla_consumers(true, false, false).is_ok());
-        assert!(check_packed_prefill_mla_consumers(true, true, true).is_ok());
-        let missing_mla = check_packed_prefill_mla_consumers(false, false, false)
-            .unwrap_err()
-            .to_string();
-        assert!(missing_mla.contains(PACKED_PREFILL_MLA_SYM));
-        assert!(missing_mla.contains("ABI-only"));
-        let missing_flash = check_packed_prefill_mla_consumers(true, true, false)
-            .unwrap_err()
-            .to_string();
-        assert!(missing_flash.contains(PACKED_PREFILL_MLA_SYM));
-
-        assert!(check_packed_prefill_kda_consumers(true).is_ok());
-        let missing_kda = check_packed_prefill_kda_consumers(false)
-            .unwrap_err()
-            .to_string();
-        assert!(missing_kda.contains(PACKED_PREFILL_KDA_SYM));
-        assert!(missing_kda.contains("ABI-only"));
     }
 
     #[test]
@@ -7631,6 +7810,63 @@ mod tests {
 
         let mixed = segmented_prog(&[DevOp::FlashMlaPrefillFp8, DevOp::Gemv], &[0, 0]);
         assert_eq!(derive_segments_for(&mixed, true).unwrap(), [8]);
+    }
+
+    #[test]
+    fn packed_operator_families_require_pure_segments() {
+        let pure = segmented_prog(
+            &[
+                DevOp::RmsNorm,
+                DevOp::HeadNormRope,
+                DevOp::FlashMlaPrefill,
+                DevOp::KdaConv3,
+                DevOp::KdaStateStepG,
+            ],
+            &[0, 0, 1, 2, 2],
+        );
+        assert_eq!(derive_packed_segment_families(&pure).unwrap(), [5, 6, 7]);
+        assert_eq!(derive_segments_for(&pure, false).unwrap(), [8, 8, 8]);
+        assert_eq!(derive_segments_for(&pure, true).unwrap(), [8, 4, 8]);
+
+        let mixed = segmented_prog(
+            &[DevOp::RmsNorm, DevOp::Gemv, DevOp::KdaStateStepG],
+            &[0, 0, 1],
+        );
+        assert_eq!(derive_packed_segment_families(&mixed).unwrap(), [0, 7]);
+        assert!(!packed_family_segments_cover(&mixed, &[0, 7], &[5]));
+        assert!(packed_family_segments_cover(&mixed, &[0, 7], &[7]));
+        let none = segmented_prog(&[DevOp::Gemv], &[0]);
+        assert!(!packed_family_segments_cover(&none, &[0], &[5, 6]));
+    }
+
+    #[test]
+    fn packed_family_route_never_falls_back_for_a_consumer_segment() {
+        assert_eq!(
+            packed_segment_route(false, 5, false, false, false).unwrap(),
+            PackedSegmentRoute::Primary
+        );
+        assert_eq!(
+            packed_segment_route(true, 0, false, false, false).unwrap(),
+            PackedSegmentRoute::Primary
+        );
+        assert_eq!(
+            packed_segment_route(true, 5, true, false, false).unwrap(),
+            PackedSegmentRoute::MlaNorm
+        );
+        assert_eq!(
+            packed_segment_route(true, 6, false, true, false).unwrap(),
+            PackedSegmentRoute::MlaFlash
+        );
+        assert_eq!(
+            packed_segment_route(true, 7, false, false, true).unwrap(),
+            PackedSegmentRoute::Kda
+        );
+        assert!(packed_segment_route(true, 5, false, true, true).is_err());
+        assert!(packed_segment_route(true, 9, true, true, true).is_err());
+        assert!(check_packed_family_kv_encoding(false, false).is_ok());
+        assert!(check_packed_family_kv_encoding(true, true).is_ok());
+        assert!(check_packed_family_kv_encoding(false, true).is_err());
+        assert!(check_packed_family_kv_encoding(true, false).is_err());
     }
 
     #[test]

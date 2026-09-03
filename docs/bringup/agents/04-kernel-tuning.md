@@ -283,6 +283,26 @@ python3 perf-data/tools/fusion_ladder_results.py aggregate results.jsonl \
   --output promotion.json
 ```
 
+For a production run, provide one `plow.fusion-ladder.run.v1` manifest containing
+exactly one entry for every scope, with explicit baseline/candidate argv and
+artifact paths, then run:
+
+```bash
+python3 perf-data/tools/fusion_ladder_run.py manifest.json --output run-dir
+```
+
+The runner requires at least three alternating paired rounds. Every command's
+final stdout line must be `plow.fusion-ladder.evidence.v1` JSON containing its
+positive latency, correctness result, route/coverage/regression evidence, and
+all scope gates. It hashes argv, artifacts, and canonical configuration,
+snapshots both artifact arms after every command and at the end, preserves
+stdout/stderr per arm and round, and emits
+validated `rows.jsonl` plus `promotion.json`. A missing scope/evidence field,
+failed command/gate, or non-decisive pair fails closed; the runner never fills a
+row from assumptions. Baseline/candidate checksums must match in every round;
+non-exact checks instead require the same explicit tolerance contract on both
+arms in every round, with both commands reporting correctness passed.
+
 The configuration digest is the SHA-256 of compact, key-sorted configuration
 JSON. Every row binds a structured shape; candidate, baseline, and configuration
 digests; checksum method and values; paired raw latency samples; route and

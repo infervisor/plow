@@ -373,6 +373,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-state-clear-device", env = "PLOW_STATE_CLEAR_DEVICE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub state_clear_device: bool,
 
+    /// Load exact-capability packed-prefill operator-family objects. This does not enable mux
+    /// co-packing; it only makes a staged descriptor routable after all fail-closed gates pass.
+    #[arg(long = "amd-packed-prefill-route", env = "PLOW_PACKED_PREFILL_ROUTE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub packed_prefill_route: bool,
+
     /// Global-queue scheduler. "0" = static per-block-stream, "1" = GQ.
     #[arg(long = "amd-global-queue", env = "PLOW_GLOBAL_QUEUE", global = true)]
     pub global_queue: Option<String>,

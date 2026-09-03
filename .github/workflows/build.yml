@@ -28,7 +28,9 @@ jobs:
       - name: Reject new amd-bench performance consumers
         run: scripts/check_amd_bench_consumers.sh
       - name: Check fusion-ladder result validator
-        run: python3 perf-data/tools/fusion_ladder_results.py --self-test
+        run: |
+          python3 perf-data/tools/fusion_ladder_results.py --self-test
+          python3 perf-data/tools/fusion_ladder_run.py --self-test
       - name: Check bench/serve parity validator
         run: python3 perf-data/tools/check_bench_serve_parity.py --self-test
       - name: Enter Nix shell
@@ -51,7 +53,9 @@ jobs:
       - name: Reject new amd-bench performance consumers
         run: scripts/check_amd_bench_consumers.sh
       - name: Check fusion-ladder result validator
-        run: python3 perf-data/tools/fusion_ladder_results.py --self-test
+        run: |
+          python3 perf-data/tools/fusion_ladder_results.py --self-test
+          python3 perf-data/tools/fusion_ladder_run.py --self-test
       - name: Check bench/serve parity validator
         run: python3 perf-data/tools/check_bench_serve_parity.py --self-test
       - uses: dtolnay/rust-toolchain@stable

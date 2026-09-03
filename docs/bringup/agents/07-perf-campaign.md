@@ -126,13 +126,17 @@ whether `$BW_BOUND` is measured on `$GPU` or the datasheet peak
 
 ### 3. Same-session baseline (both engines, interleaved)
 
-One server at a time, same box, same client, medians over ≥5 rounds (9 for a
-headline). `bringup_showdown.sh` is the template — edit the arm list:
+One server at a time, same box, the same raw-completions client, alternating
+whole-server rounds (minimum 3; use 5 or 9 for a headline).
+`bringup_showdown.sh` requires explicit frozen artifact identities:
 
 ```bash
-SNAP=$HF_SNAPSHOT MODEL_ID=$SERVED_ID BUNDLES=$BUNDLE_DIR CUBINS=$CUBIN_DIR \
-IN_LENS="1024 4096" NPROMPT=9 \
-  perf-data/tools/gpulease showdown perf-data/tools/bringup_showdown.sh
+PLOWRT=$PRIVATE_PLOWRT PLOW_ASSETS=$BUNDLE_DIR \
+PLOW_ARTIFACTS="$PRIVATE_PLOWRT $BUNDLE_DIR" \
+VLLM_MODEL=$MODEL_DIR VLLM_ARTIFACTS="$MODEL_DIR" \
+SNAP=$HF_SNAPSHOT MODEL_ID=$SERVED_ID INPUT_MAP="1024 4096" \
+PROMPT_MAP=default=9 \
+  perf-data/tools/gpulease -n "$TP" showdown perf-data/tools/bringup_showdown.sh
 ```
 
 Cross-engine checks, mandatory: identical `Total input tokens`; identical `Total

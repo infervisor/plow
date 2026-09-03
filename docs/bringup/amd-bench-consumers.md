@@ -51,7 +51,8 @@ rewritten by this migration.
 | TP agreement | Decode uses the serving cadence plus every-dispatch counter audit; prefill completion compares all ranks. The JSON records the exact policy. Any observed disagreement fails the request. | A full every-token, every-rank stream dump still belongs to the correctness oracle. |
 | prefill selection | `plowrt bench --engine-diagnostics` records ordered AMD TP `slot,row_start,rows,bucket` entries from the dispatched `ChunkStep`. | Single-GPU/decode-only fallback and CUDA selection capture report `complete=false`. |
 | decode selection | `plowrt bench --engine-diagnostics` records ordered AMD `occupied_rows,bucket,steps` entries at the actual dispatch site, including multistep quanta. | CUDA selection capture is not wired. |
-| exact token stream | `plowrt bench --parity-report` records the measured prompt/output token IDs for one exact B1 request. Non-stream `/v1/completions` returns the corresponding IDs only when `return_token_ids=true`; `check_bench_serve_parity.py` validates tokens, usage, chunk/rung coverage, and TP evidence. | A production-checkpoint GPU parity run is still required per artifact; batched per-slot streams remain diagnostic-only. |
+| exact token stream | `plowrt bench --parity-report` records the measured prompt/output token IDs for one exact B1 request. Non-stream `/v1/completions` returns the corresponding IDs only when `return_token_ids=true`; `check_bench_serve_parity.py` validates tokens, usage, chunk/rung coverage, and TP evidence. The real K3 TP8 C1 production-checkpoint bench↔HTTP gate passed and is recorded in `perf-data/kimi-k3-plowrt-mi355x-parity-smoke.md`. | Batched and ragged per-slot parity remain separate diagnostic gates. |
+| bounded token audit | `plowrt bench --token-audit` records measured prompt/output rows in request order after timing. It requires exact prompt IDs and refuses more than 64 requests or 65,536 total IDs. `gate_quick.sh` uses it with engine diagnostics on the production mux. | Different per-request prompts are not yet accepted, so the ragged/cross-width batch gates remain on the diagnostic runner. |
 | tensor/logit snapshot | Existing AMD `--amd-ctr-snap` and `--amd-tens-snap` writers run inside `AmdServe`. | They use fixed tensors, ignore file-write failures, and do not cover arbitrary logits/tensors like `amd-bench --dump-logits` / `--amd-dump-act`; no consumer migrates yet. |
 
 Selection capture is opt-in so normal benchmark timing is not perturbed. It is
@@ -66,3 +67,7 @@ with `return_token_ids=true`, then run
 `perf-data/tools/check_bench_serve_parity.py BENCH.json ENDPOINT.json`. TP parity
 also requires a positive token-audit cadence, every-dispatch counter audit, and
 all-rank prefill completion evidence. Missing or incomplete diagnostics fail.
+
+`--token-audit` is a correctness hook, not a timing mode. It is off by default;
+when enabled, token rows are cloned only after the measured interval. The JSON
+write remains on stdout, so redirection/parse failures abort the calling gate.

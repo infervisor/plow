@@ -35,11 +35,16 @@
     "artifacts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["candidate_sha256", "baseline_sha256", "config_sha256"],
+      "required": [
+        "candidate_sha256", "baseline_sha256", "config_sha256",
+        "candidate_command_sha256", "baseline_command_sha256"
+      ],
       "properties": {
         "candidate_sha256": { "$ref": "#/$defs/sha256" },
         "baseline_sha256": { "$ref": "#/$defs/sha256" },
-        "config_sha256": { "$ref": "#/$defs/sha256" }
+        "config_sha256": { "$ref": "#/$defs/sha256" },
+        "candidate_command_sha256": { "$ref": "#/$defs/sha256" },
+        "baseline_command_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "configuration": {

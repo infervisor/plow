@@ -306,6 +306,27 @@ fn mla_v2_segment(op: u16, n_tok: u32) -> bool {
     n_tok >= 2048 && (op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16)
 }
 
+// Experimental packed-prefill segment classes. These values describe an operator
+// family, not a model. The serving runtime independently re-derives and purity-checks
+// them before it can select a family object.
+fn packed_prefill_segment_class(op: u16) -> Option<u8> {
+    if op == DevOp::RmsNorm as u16
+        || op == DevOp::HeadNormRope as u16
+        || op == DevOp::HeadNormRopeFp8 as u16
+    {
+        Some(5)
+    } else if op == DevOp::FlashMlaPrefill as u16 || op == DevOp::FlashMlaPrefillFp8 as u16 {
+        Some(6)
+    } else if op == DevOp::KdaStateStep as u16
+        || op == DevOp::KdaConv3 as u16
+        || op == DevOp::KdaStateStepG as u16
+    {
+        Some(7)
+    } else {
+        None
+    }
+}
+
 impl Builder {
     pub fn new(n_cu: u32) -> Self {
         Self {
@@ -1126,6 +1147,15 @@ impl Builder {
         // its own purity + size guards (exec/amd.rs derive_segments), so an env mismatch in
         // either direction degrades to the 8-wave kernel rather than corrupting.
         let mla_v2 = !uniseg && std::env::var("PLOW_MLA_PF_V2").ok().as_deref() == Some("1");
+        // Opt-in only: live packed serving remains disabled. Giving descriptor-consuming
+        // families distinct classes lets a future runtime route them to lean objects without
+        // putting their branches in the production megakernel. Unset preserves packet bytes.
+        let packed_prefill_segments = !uniseg
+            && std::env::var("PLOW_SEG_PACKED_PREFILL").ok().as_deref() == Some("1")
+            && self.ops.iter().any(|o| {
+                o.inst.op == DevOp::FlashMlaPrefill as u16
+                    || o.inst.op == DevOp::FlashMlaPrefillFp8 as u16
+            });
         // PLOW_SEG_PURE_GEMM=1 (T11): class-8 segments carry ONLY GEMM-family ops; every light
         // op (norms, rope, quant, embed, softcap) joins the flash class. The point: the sm_90a
         // segmented launcher runs class-8 segments on the lean `_pfgemm` object, and a pure-GEMM
@@ -1174,6 +1204,8 @@ impl Builder {
             let op = self.ops[i].inst.op;
             if uniseg {
                 8
+            } else if packed_prefill_segments && packed_prefill_segment_class(op).is_some() {
+                packed_prefill_segment_class(op).unwrap()
             } else if op == DevOp::FlashPrefill as u16 || op == DevOp::FlashPrefillFp8 as u16 {
                 // T37: the *_pffa object instantiates hd 256/512 only — other head dims
                 // (Qwen/Llama hd128) stay on the fat object rather than trapping there.
@@ -2778,6 +2810,28 @@ mod seg_window_tests {
         assert!(mla_v2_segment(DevOp::FlashMlaPrefill as u16, 2048));
         assert!(mla_v2_segment(DevOp::FlashMlaPrefillFp8 as u16, 2048));
         assert!(!mla_v2_segment(DevOp::Gemv as u16, 8192));
+    }
+
+    #[test]
+    fn packed_prefill_classes_are_operator_families() {
+        assert_eq!(packed_prefill_segment_class(DevOp::RmsNorm as u16), Some(5));
+        assert_eq!(
+            packed_prefill_segment_class(DevOp::HeadNormRopeFp8 as u16),
+            Some(5)
+        );
+        assert_eq!(
+            packed_prefill_segment_class(DevOp::FlashMlaPrefill as u16),
+            Some(6)
+        );
+        assert_eq!(
+            packed_prefill_segment_class(DevOp::KdaConv3 as u16),
+            Some(7)
+        );
+        assert_eq!(
+            packed_prefill_segment_class(DevOp::KdaChunkIntra as u16),
+            None
+        );
+        assert_eq!(packed_prefill_segment_class(DevOp::Gemv as u16), None);
     }
 
     /// The number of segments a program's stream spans, derived the way every

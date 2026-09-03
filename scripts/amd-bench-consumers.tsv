@@ -1,6 +1,5 @@
 # class	path	binding	disposition
 correctness	scripts/gate_batched.sh	checkpoint	Retain until production diagnostics expose per-slot token streams.
-correctness	scripts/gate_quick.sh	checkpoint	Retain for KV-slot and batched-stream correctness logs.
 synthetic-probe	scripts/glm52_block_sweep_gfx942.sh	synthetic	Unbound truncated-model comparator migrated to amd-probe; production sweep requires checkpoint-bound assets, so semantics do not match.
 performance	scripts/glm52_glusplit_run.sh	checkpoint	Legacy same-object A/B plus TP identity; separate blob/object inputs have no exact bench equivalent.
 performance	scripts/glm52_linfp8_run.sh	checkpoint	Legacy same-object A/B plus TP identity; separate blob/object inputs have no exact bench equivalent.

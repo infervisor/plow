@@ -132,6 +132,13 @@ enum Cmd {
         /// Include exact measured prompt/output token IDs for bench/serve parity checks.
         #[arg(long, default_value_t = false, conflicts_with = "prefill_sweep")]
         parity_report: bool,
+        /// Include bounded per-request token IDs for production-path correctness audits.
+        #[arg(
+            long,
+            default_value_t = false,
+            conflicts_with_all = ["prefill_sweep", "parity_report"]
+        )]
+        token_audit: bool,
     },
 
     /// Enumerate every visible device and, with `--tp`, bring up the
@@ -466,6 +473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_queued_requests,
             engine_diagnostics,
             parity_report,
+            token_audit,
         } => {
             bench(
                 assets,
@@ -489,6 +497,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 engine_diagnostics,
                 parity_report,
+                token_audit,
             )
             .await
         }
@@ -674,7 +683,8 @@ fn synthetic_timing_prefix(synthetic_probe: bool) -> &'static str {
 mod amd_bench_cli_tests {
     use super::{
         parse_prefill_lengths, require_synthetic_probe, synthetic_timing_prefix,
-        validate_amd_probe_steps, validate_parity_report_options, Cli,
+        validate_amd_probe_steps, validate_parity_report_options, validate_token_audit_options,
+        Cli,
     };
     use clap::Parser;
 
@@ -851,6 +861,23 @@ mod amd_bench_cli_tests {
             "model",
             "--parity-report",
             "--prefill-sweep",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn token_audit_requires_exact_bounded_rows() {
+        assert!(validate_token_audit_options(true, Some("1,2,3"), 4, 8).is_ok());
+        assert!(validate_token_audit_options(true, None, 4, 8).is_err());
+        assert!(validate_token_audit_options(true, Some("1"), 65, 8).is_err());
+        assert!(validate_token_audit_options(true, Some("1"), 64, 1024).is_err());
+        assert!(Cli::try_parse_from([
+            "plowrt",
+            "bench",
+            "--assets",
+            "model",
+            "--token-audit",
+            "--parity-report",
         ])
         .is_err());
     }
@@ -2382,6 +2409,7 @@ async fn bench(
     mux_cfg: MuxConfig,
     engine_diagnostics: bool,
     parity_report: bool,
+    token_audit: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_parity_report_options(
         parity_report,
@@ -2390,6 +2418,7 @@ async fn bench(
         requests,
         warmup_requests,
     )?;
+    validate_token_audit_options(token_audit, prompt_ids.as_deref(), requests, output_len)?;
     let state = bringup_runtime(vec![assets], executors, false, mux_cfg).await?;
     let models = state
         .registry
@@ -2457,6 +2486,7 @@ async fn bench(
                 output_tokens: output_len,
                 runtime,
                 parity_report,
+                token_audit,
             },
         )
         .await
@@ -2490,6 +2520,34 @@ async fn bench(
         trace_result?;
     }
     println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+const MAX_TOKEN_AUDIT_REQUESTS: usize = 64;
+const MAX_TOKEN_AUDIT_IDS: usize = 65_536;
+
+fn validate_token_audit_options(
+    token_audit: bool,
+    prompt_ids: Option<&str>,
+    requests: usize,
+    output_tokens: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !token_audit {
+        return Ok(());
+    }
+    let prompt = prompt_ids.ok_or("--token-audit requires --prompt-ids")?;
+    let prompt_len = parse_token_ids(prompt)?.len();
+    let total_ids = prompt_len
+        .checked_add(output_tokens)
+        .and_then(|per_request| per_request.checked_mul(requests))
+        .ok_or("--token-audit token count overflow")?;
+    if requests == 0 || requests > MAX_TOKEN_AUDIT_REQUESTS || total_ids > MAX_TOKEN_AUDIT_IDS {
+        return Err(format!(
+            "--token-audit is bounded to {MAX_TOKEN_AUDIT_REQUESTS} requests and \
+             {MAX_TOKEN_AUDIT_IDS} total prompt/output token IDs"
+        )
+        .into());
+    }
     Ok(())
 }
 

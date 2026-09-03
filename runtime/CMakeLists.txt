@@ -651,7 +651,7 @@ option(PLOW_HSACO_MLA "Also emit the MLA prefill object (Kimi/DeepSeek/GLM)" ON)
 # on the rows above. Cost of the default: ~31 s of build, doubled by the `_gq` twins, and ~3 MB.
 option(PLOW_HSACO_K3 "Also emit the Kimi-K3 / KDA objects (decode + prefill)" ON)
 option(PLOW_HSACO_PACKED_PREFILL_CONSUMERS
-       "Emit separate default-off K3 prefill objects that consume packed span metadata" OFF)
+       "Emit separate default-off operator-family objects that consume packed prefill metadata" OFF)
 option(PLOW_HSACO_KDA_CHUNK "Include the opt-in BT64 chunk-KDA prefill arms" OFF)
 option(PLOW_K3_DECODE_MXFP4_PROJ
        "Include standalone MXFP4 projection ops in K3 decode objects" ON)
@@ -929,8 +929,15 @@ if(PLOW_GFX950_HSACO)
     set(_hs_ax_k3_moe_a4w4
         ${_hs_ax_k3_moe} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight}
         ${_hs_ax_k3_pf_state} -DPLOW_MXFP4=1)
-    set(_hs_ax_k3_moe_a4w4_packed
-        ${_hs_ax_k3_moe_a4w4} -DPLOW_PACKED_PREFILL_CONSUMERS=1)
+    set(_hs_ax_packed_mla_norm
+        ${_hs_ax_prefill} ${_hs_ax_mla} -DPLOW_BUCKET_PACKED_MLA_NORM=1
+        -DPLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS=1)
+    set(_hs_ax_packed_mla_flash
+        ${_hs_ax_flash} -DPLOW_MLA_PF_V2_ARM=1
+        -DPLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS=1)
+    set(_hs_ax_packed_kda
+        ${_hs_ax_prefill} -DPLOW_K3=1 -DPLOW_BUCKET_PACKED_KDA=1
+        -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1)
     set(_hs_ax_k3_moe_a4w4_fp8kv
         ${_hs_ax_k3_moe_fp8kv} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight}
         ${_hs_ax_k3_pf_state} -DPLOW_MXFP4=1)
@@ -947,6 +954,9 @@ if(PLOW_GFX950_HSACO)
     set(_hs_kpf "plow_interp_${PLOW_HSACO_ARCH}")
     set(_hs_kdec "plow_interp_dec_${PLOW_HSACO_ARCH}")
     set(_hs_kfl "plow_interp_flash_${PLOW_HSACO_ARCH}")
+    set(_hs_kpn "plow_interp_packed_mla_norm_${PLOW_HSACO_ARCH}")
+    set(_hs_kpfm "plow_interp_packed_mla_flash_${PLOW_HSACO_ARCH}")
+    set(_hs_kpk "plow_interp_packed_kda_${PLOW_HSACO_ARCH}")
 
     # THE TABLE: <stem> <kernel symbol> <axis-1> <axis-2> <max total regs> <min occ>.
     # The 8-wave interpreters must stay <= 256 total (2 waves/SIMD); the 4-wave
@@ -1060,10 +1070,20 @@ if(PLOW_GFX950_HSACO)
                 "interp_prefill_fp8kv_k3_moe_a4w4|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_a4w4_fp8kv|256|2")
         endif()
         if(PLOW_HSACO_PACKED_PREFILL_CONSUMERS)
-            # Deliberately a separate filename: the production router cannot select this object
-            # until live packed dispatch is enabled and parity-gated.
+            # Family objects are deliberately lean: compiling any packed call arm into the full
+            # K3 interpreter raises its VGPR spill count to 116 even when metadata is null.
+            # Live mux packing remains disabled; these objects make the eventual route explicit.
             list(APPEND _hs_rows
-                "interp_prefill_k3_moe_a4w4_packed|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_a4w4_packed|256|2")
+                "interp_packed_mla_norm|${_hs_kpn}|_hs_ax_prefill|_hs_ax_packed_mla_norm|256|2"
+                "interp_packed_mla_flash|${_hs_kpfm}|_hs_ax_prefill|_hs_ax_packed_mla_flash|512|1"
+                "interp_packed_kda|${_hs_kpk}|_hs_ax_prefill|_hs_ax_packed_kda|256|2")
+            if(PLOW_HSACO_FP8KV)
+                set(_hs_ax_packed_mla_norm_fp8kv ${_hs_ax_packed_mla_norm} ${_hs_ax_fp8kv})
+                set(_hs_ax_packed_mla_flash_fp8kv ${_hs_ax_packed_mla_flash} ${_hs_ax_fp8kv})
+                list(APPEND _hs_rows
+                    "interp_packed_mla_norm_fp8kv|${_hs_kpn}|_hs_ax_prefill|_hs_ax_packed_mla_norm_fp8kv|256|2"
+                    "interp_packed_mla_flash_fp8kv|${_hs_kpfm}|_hs_ax_prefill|_hs_ax_packed_mla_flash_fp8kv|512|1")
+            endif()
         endif()
     endif()
 
