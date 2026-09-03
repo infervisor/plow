@@ -734,8 +734,13 @@ option(PLOW_MLA_PF_V2_ARM "Compile the four-wave MLA prefill V2 arm" OFF)
 set(PLOW_HSACO_EXTRA_DEFINES "" CACHE STRING "extra raw hipcc flags appended to every code object")
 set(PLOW_HSACO_CONFIG "" CACHE FILEPATH
     "manifest-derived plow_config.h used to specialise ordinary interpreter objects")
+set(_plow_decode_inventory_prune_default OFF)
+if(PLOW_HSACO_CONFIG)
+    set(_plow_decode_inventory_prune_default ON)
+endif()
 option(PLOW_HSACO_DECODE_INVENTORY_PRUNE
-       "Prune decode interpreter arms to the generated packet inventory" OFF)
+       "Prune decode interpreter arms to the generated packet inventory"
+       ${_plow_decode_inventory_prune_default})
 option(PLOW_HSACO_DECODE_MLA_SEGMENTS
        "Emit the paired FlashMlaDecode+MlaMergeFold decode segment object" OFF)
 

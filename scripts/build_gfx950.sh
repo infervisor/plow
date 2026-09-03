@@ -35,6 +35,17 @@ if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
   cfg_name="$(basename -- "$PLOW_HSACO_CONFIG")"
   INC="$INC -I$cfg_dir -DPLOW_CONFIG=\"$cfg_name\""
 fi
+decode_inventory_prune="${PLOW_HSACO_DECODE_INVENTORY_PRUNE:-auto}"
+case "${decode_inventory_prune,,}" in
+  auto) [ -n "${PLOW_HSACO_CONFIG:-}" ] && decode_inventory_prune=1 || decode_inventory_prune=0 ;;
+  1|on|true|yes) decode_inventory_prune=1 ;;
+  0|off|false|no) decode_inventory_prune=0 ;;
+  *) echo "PLOW_HSACO_DECODE_INVENTORY_PRUNE must be ON or OFF" >&2; exit 2 ;;
+esac
+if [ "$decode_inventory_prune" = 1 ] && [ -z "${PLOW_HSACO_CONFIG:-}" ]; then
+  echo "PLOW_HSACO_DECODE_INVENTORY_PRUNE requires PLOW_HSACO_CONFIG" >&2
+  exit 2
+fi
 mkdir -p "$OUT"; cd "$OUT"
 
 # Delete FIRST. A build that fails must leave nothing behind to run.
@@ -242,7 +253,10 @@ WALK="${PLOW_GEMV_WALK:-0}"
 # Every DECODE object AND its register check must carry the same bucket, or the cliff gate
 # validates an object that is not the one that ships.
 DEC="-DPLOW_BUCKET_DECODE=1 -DPLOW_GEMV_MM=$GVMM -DPLOW_GEMV_WALK=$WALK"
-echo "   decode GEMV batch bucket: PLOW_GEMV_MM=$GVMM walk=$WALK (PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH:-1})"
+if [ "$decode_inventory_prune" = 1 ]; then
+  DEC="$DEC -DPLOW_DECODE_INVENTORY_PRUNE=1"
+fi
+echo "   decode GEMV batch bucket: PLOW_GEMV_MM=$GVMM walk=$WALK inventory_prune=$decode_inventory_prune (PLOW_DECODE_BATCH=${PLOW_DECODE_BATCH:-1})"
 
 for B in 0 1; do
   N=$([ "$B" -eq 0 ] && echo prefill || echo decode)
