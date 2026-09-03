@@ -51,9 +51,18 @@ rewritten by this migration.
 | TP agreement | Decode uses the serving cadence plus every-dispatch counter audit; prefill completion compares all ranks. The JSON records the exact policy. Any observed disagreement fails the request. | A full every-token, every-rank stream dump still belongs to the correctness oracle. |
 | prefill selection | `plowrt bench --engine-diagnostics` records ordered AMD TP `slot,row_start,rows,bucket` entries from the dispatched `ChunkStep`. | Single-GPU/decode-only fallback and CUDA selection capture report `complete=false`. |
 | decode selection | `plowrt bench --engine-diagnostics` records ordered AMD `occupied_rows,bucket,steps` entries at the actual dispatch site, including multistep quanta. | CUDA selection capture is not wired. |
+| exact token stream | `plowrt bench --parity-report` records the measured prompt/output token IDs for one exact B1 request. Non-stream `/v1/completions` returns the corresponding IDs only when `return_token_ids=true`; `check_bench_serve_parity.py` validates tokens, usage, chunk/rung coverage, and TP evidence. | A production-checkpoint GPU parity run is still required per artifact; batched per-slot streams remain diagnostic-only. |
 | tensor/logit snapshot | Existing AMD `--amd-ctr-snap` and `--amd-tens-snap` writers run inside `AmdServe`. | They use fixed tensors, ignore file-write failures, and do not cover arbitrary logits/tensors like `amd-bench --dump-logits` / `--amd-dump-act`; no consumer migrates yet. |
 
 Selection capture is opt-in so normal benchmark timing is not perturbed. It is
 bounded to 16,384 prefill and 16,384 decode entries. An overflow aborts
 `plowrt bench` instead of emitting a partial parity record. Capture covers
 warmup and measured requests and says so in the JSON `scope`.
+
+For an exact parity cell, run `plowrt bench` with `--prompt-ids`,
+`--concurrency 1 --requests 1 --warmup-requests 0`, `--parity-report`, and
+`--engine-diagnostics`; issue the same prompt to non-stream `/v1/completions`
+with `return_token_ids=true`, then run
+`perf-data/tools/check_bench_serve_parity.py BENCH.json ENDPOINT.json`. TP parity
+also requires a positive token-audit cadence, every-dispatch counter audit, and
+all-rank prefill completion evidence. Missing or incomplete diagnostics fail.

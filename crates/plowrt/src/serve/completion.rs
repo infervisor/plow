@@ -15,6 +15,14 @@ use crate::serve::{status_for, AppState};
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
 
+fn validate_return_token_ids(stream: bool, return_token_ids: bool) -> Result<(), &'static str> {
+    if stream && return_token_ids {
+        Err("return_token_ids is supported only for non-streaming completions")
+    } else {
+        Ok(())
+    }
+}
+
 fn request_id() -> String {
     format!("cmpl-{:016x}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
 }
@@ -23,6 +31,13 @@ pub async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionRequest>,
 ) -> Response {
+    if let Err(error) = validate_return_token_ids(req.stream, req.return_token_ids) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response();
+    }
     #[cfg(feature = "cuda")]
     if let Some(mgr) = state.manager() {
         if mgr.manages(&req.model) {
@@ -82,6 +97,7 @@ pub async fn completions(
     }
     let n_prompt = prompt_ids.len();
     let (tx, rx) = stream_mod::channel();
+    let response_prompt_ids = req.return_token_ids.then(|| prompt_ids.clone());
     let job = crate::serve::mux::Job {
         prompt_ids,
         gen,
@@ -111,7 +127,7 @@ pub async fn completions(
         let include_usage = req.stream_options.map(|o| o.include_usage).unwrap_or(false);
         sse_response(id, req.model, rx, include_usage, t_arrive, n_prompt).into_response()
     } else {
-        buffer_and_reply(id, req.model, rx).await
+        buffer_and_reply(id, req.model, rx, response_prompt_ids).await
     }
 }
 
@@ -119,13 +135,20 @@ async fn buffer_and_reply(
     request_id: String,
     model: String,
     mut rx: stream_mod::ChunkReceiver,
+    prompt_token_ids: Option<Vec<u32>>,
 ) -> Response {
     let mut text = String::new();
+    let mut completion_token_ids = Vec::new();
     let mut finish = None;
     let mut usage = None;
     while let Some(chunk) = rx.recv().await {
         match chunk {
-            StreamChunk::Token { text: delta, .. } => text.push_str(&delta),
+            StreamChunk::Token { id, text: delta } => {
+                text.push_str(&delta);
+                if prompt_token_ids.is_some() {
+                    completion_token_ids.push(id);
+                }
+            }
             StreamChunk::Done {
                 reason, usage: u, ..
             } => {
@@ -165,6 +188,10 @@ async fn buffer_and_reply(
             finish_reason: Some(finish),
         }],
         usage,
+        token_ids: prompt_token_ids.map(|prompt| CompletionTokenIds {
+            prompt,
+            completion: completion_token_ids,
+        }),
     })
     .into_response()
 }
@@ -256,6 +283,7 @@ fn sse_response(
                     model: model.clone(),
                     choices: choice,
                     usage: None,
+                    token_ids: None,
                 };
                 if let Some(usage) = tail_usage {
                     let usage_frame = CompletionResponse {
@@ -264,6 +292,7 @@ fn sse_response(
                         model,
                         choices: Vec::new(),
                         usage: Some(usage),
+                        token_ids: None,
                     };
                     st.pending
                         .push_back(Event::default().data(stream_mod::chunk_data(&usage_frame)));
@@ -284,8 +313,10 @@ fn sse_response(
 
 #[cfg(test)]
 mod tests {
-    use super::request_id;
-    use crate::serve::openai::CompletionRequest;
+    use super::{request_id, validate_return_token_ids};
+    use crate::serve::openai::{
+        CompletionChoice, CompletionRequest, CompletionResponse, CompletionTokenIds,
+    };
 
     #[test]
     fn request_ids_are_unique() {
@@ -303,6 +334,7 @@ mod tests {
             "top_p": 1.0,
             "ignore_eos": true,
             "stream_options": {"include_usage": true},
+            "return_token_ids": true,
             "best_of": 1
         }))
         .unwrap();
@@ -310,5 +342,36 @@ mod tests {
         assert_eq!(req.max_tokens, Some(1024));
         assert_eq!(req.ignore_eos, Some(true));
         assert!(req.stream_options.unwrap().include_usage);
+        assert!(req.return_token_ids);
+    }
+
+    #[test]
+    fn completion_token_ids_are_opt_in_at_response_root() {
+        let response = CompletionResponse {
+            id: "cmpl-test".into(),
+            object: "text_completion",
+            model: "model".into(),
+            choices: vec![CompletionChoice {
+                index: 0,
+                text: "x".into(),
+                logprobs: None,
+                finish_reason: Some("length"),
+            }],
+            usage: None,
+            token_ids: Some(CompletionTokenIds {
+                prompt: vec![1, 2],
+                completion: vec![3],
+            }),
+        };
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["token_ids"]["prompt"], serde_json::json!([1, 2]));
+        assert_eq!(json["token_ids"]["completion"], serde_json::json!([3]));
+    }
+
+    #[test]
+    fn streaming_rejects_return_token_ids() {
+        assert!(validate_return_token_ids(true, true).is_err());
+        assert!(validate_return_token_ids(true, false).is_ok());
+        assert!(validate_return_token_ids(false, true).is_ok());
     }
 }

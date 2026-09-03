@@ -67,10 +67,11 @@
 /* This proves only that the object was compiled against the packed-prefill PlowProgram tail.
  * Descriptor-consuming math arms are a separate capability and are not enabled by this marker. */
 extern "C" __device__ unsigned plow_packed_prefill_abi_1 = 1;
-#if PLOW_PACKED_PREFILL_CONSUMERS && (PLOW_MLA_PREFILL || PLOW_MLA_PF_V2_ARM)
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS && PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS && \
+    (PLOW_MLA_PREFILL || PLOW_MLA_PF_V2_ARM)
 extern "C" __device__ unsigned plow_packed_prefill_mla_consumers_1 = 1;
 #endif
-#if PLOW_PACKED_PREFILL_CONSUMERS && PLOW_K3
+#if PLOW_PACKED_PREFILL_KDA_CONSUMERS && PLOW_K3
 extern "C" __device__ unsigned plow_packed_prefill_kda_consumers_1 = 1;
 #endif
 
@@ -1178,7 +1179,7 @@ __device__ __forceinline__ void exec_flash_mla_prefill_fp8(CInst in, CTens T, un
                                                            const PlowProgram* prog) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     if (TEN(7) == nullptr) __builtin_trap();
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
     if (plow_packed_prefill_enabled(prog)) {
         const unsigned gf = in->i[7] ? in->i[7] : (unsigned)GLM_MLA_GF;
         for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
@@ -1264,7 +1265,7 @@ __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsign
                                                        const PlowProgram* prog) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     const unsigned gf = in->i[7] ? in->i[7] : (unsigned)GLM_MLA_GF;
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
     if (plow_packed_prefill_enabled(prog)) {
         if (in->op == PLOW_DOP_FLASH_GATHER_PREFILL || in->t[7] != PLOW_TENSOR_NONE)
             __builtin_trap();
@@ -1720,7 +1721,7 @@ __device__ __forceinline__ P plow_scalar_ptr(P p) {
  * GEMM reads as bf16 garbage). */
 extern "C" __device__ unsigned plow_glm_ofold_arm = 1;
 
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
 template <bool FP8>
 __device__ __forceinline__ void exec_flash_mla_prefill_v2_packed(
     CInst in, CTens T, unsigned slice, unsigned nblk, bf16* lds, const PlowProgram* prog) {
@@ -1753,7 +1754,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
     CInst in = plow_scalar_ptr(in_v);
     CTens T = plow_scalar_ptr(T_v);
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
 #define PLOW_PACKED_NORM_ARGS , prog_meta, in->i[7]
 #else
 #define PLOW_PACKED_NORM_ARGS
@@ -1783,7 +1784,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                   "V2 MLA prefill LDS exceeds the flash arena");
     if (in->op == PLOW_DOP_FLASH_MLA_PREFILL_FP8) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
         if (plow_packed_prefill_enabled(prog_meta))
             exec_flash_mla_prefill_v2_packed</*FP8=*/true>(in, T, slice, nblk, sm->fa,
                                                            prog_meta);
@@ -1799,7 +1800,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if !PLOW_FP8_KV
     else if (in->op == PLOW_DOP_FLASH_MLA_PREFILL) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
         if (plow_packed_prefill_enabled(prog_meta)) {
             exec_flash_mla_prefill_v2_packed</*FP8=*/false>(in, T, slice, nblk, sm->fa,
                                                             prog_meta);
@@ -1833,7 +1834,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 in->i[4], in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk,
                 sm->fa, nullptr, 0u, (in->i[6] & 0xffu) ? (in->i[6] & 0xffu) : 1u,
                 ((in->i[6] >> 8) & 1u) != 0u);
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS
         }
 #endif
 #undef TEN
@@ -1984,6 +1985,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if PLOW_K3
 #if PLOW_KDA_CHUNK
         case PLOW_DOP_KDA_CHUNK_PREPARE:
+#if PLOW_PACKED_PREFILL_ANY_CONSUMERS
+            if (plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
+#endif
             if (in->i[0] == 0u || in->i[1] == 0u ||
                 (in->i[2] != 64u && in->i[2] != 128u))
                 __builtin_trap();
@@ -1994,6 +1998,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 in->i[2], in->i[3], in->fj[0].f, slice, nblk);
             break;
         case PLOW_DOP_KDA_CHUNK_INTRA:
+#if PLOW_PACKED_PREFILL_ANY_CONSUMERS
+            if (plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
+#endif
             if (in->i[0] == 0u || in->i[1] == 0u ||
                 (in->i[2] != 64u && in->i[2] != 128u))
                 __builtin_trap();
@@ -2003,6 +2010,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk, (float*)sm->raw);
             break;
         case PLOW_DOP_KDA_CHUNK_WU:
+#if PLOW_PACKED_PREFILL_ANY_CONSUMERS
+            if (plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
+#endif
             if (in->i[0] == 0u || in->i[1] == 0u ||
                 (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2])
                 __builtin_trap();
@@ -2012,6 +2022,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 (in->i[0] + 63u) / 64u, in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
             break;
         case PLOW_DOP_KDA_CHUNK_CARRY: {
+#if PLOW_PACKED_PREFILL_ANY_CONSUMERS
+            if (plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
+#endif
             if (in->i[0] == 0u || in->i[1] == 0u ||
                 (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2])
                 __builtin_trap();
@@ -2039,7 +2052,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                        in->i[3], in->fj[0].f, slice, nblk);
             break;
         case PLOW_DOP_KDA_STATE_STEP:
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_KDA_CONSUMERS
             if (plow_packed_prefill_enabled(prog_meta))
                 d_kda_state_step_packed</*GATED=*/false>(
                     (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
@@ -2081,7 +2094,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             if (wv == nullptr || cs[0] == nullptr || cs[1] == nullptr || cs[2] == nullptr ||
                 TEN(6) == nullptr || TEN(7) == nullptr || in->i[1] == 0u)
                 __builtin_trap();
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_KDA_CONSUMERS
             if (plow_packed_prefill_enabled(prog_meta))
                 d_kda_conv3_packed(
                     (bf16*)TEN(0), (bf16*)TEN(1), (bf16*)TEN(2), (const bf16*)TEN(3),
@@ -2121,7 +2134,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             const float* dtb = (in->i[5] == PLOW_TENSOR_NONE) ? nullptr : (const float*)T[in->i[5]];
             if (dtb == nullptr || TEN(7) == nullptr || TEN(4) == nullptr || TEN(5) == nullptr)
                 __builtin_trap();
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_KDA_CONSUMERS
             if (plow_packed_prefill_enabled(prog_meta))
                 d_kda_state_step_packed</*GATED=*/true>(
                     (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),

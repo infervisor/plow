@@ -172,6 +172,13 @@ on an AMD TP4 configuration (`perf-data/glm52-ttft-breakdown.md`).
 | Ragged-tail chunk | `--amd-ragged-chunk` / `PLOW_RAGGED_CHUNK` | **on** | cover a prompt in fewest launches, run the last chunk at its real row count (measured −239 ms @4097 tok on one part; `exec::amd::rebase_chunk_rows`). `=0` restores the padding-vs-launch DP for a controlled A/B — see the flag's own doc in `config.rs` for the quality-gate caveat *(amd)* |
 | Segmented prefill | `--pf-seg-*` (nvidia), `--amd-seg-window` (amd) | seg-window on | prefill as a sequence of same-occupancy launches (measured −11%/−12% at 8k/16k on one part — `docs/arch/06-runtime.md`, `perf-data/gemma12b-gh200-prefill-campaign.md`). `--pf-seg-*` are mostly A/B diagnostics; emit-side classing must match the blob |
 
+AMD prefill/decode overlap is not currently safe. All programs share one mutable
+`d_tens`; `act.*`, mutable `in.*`, and trace storage are shared, and `kv_rebase`
+rewrites that same tensor table between phases. Keep the sequential drain.
+Overlap requires phase-local scratch and tensor tables, phase-local KV rebasing
+and staging/trace ownership, plus a physical-range non-aliasing proof and
+concurrent parity tests.
+
 > **Pitfall — cross-request co-packed prefill is not numerics-neutral.** Greedy
 > tokens can differ across chunk boundaries (the flash split count is
 > chunk-dependent; `perf-data/px14-batched-prefill-fp8.md`). If bit-identical

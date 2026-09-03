@@ -104,10 +104,12 @@ grep -qE "FUNC .* $SYM\$" <<<"$SYMS" ||
 
 grep -qE "OBJECT .* plow_packed_prefill_abi_1\$" <<<"$SYMS" ||
     fail "$OUT does not advertise plow_packed_prefill_abi_1"
-PACKED=0; K3=0; MLA=0
+PACKED_MLA=0; PACKED_KDA=0; K3=0; MLA=0
 for arg in "$@"; do
     case "$arg" in
-        -DPLOW_PACKED_PREFILL_CONSUMERS=1) PACKED=1 ;;
+        -DPLOW_PACKED_PREFILL_CONSUMERS=1) PACKED_MLA=1; PACKED_KDA=1 ;;
+        -DPLOW_PACKED_PREFILL_MLA_CONSUMERS=1) PACKED_MLA=1 ;;
+        -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1) PACKED_KDA=1 ;;
         -DPLOW_K3=1) K3=1 ;;
         -DPLOW_MLA_PREFILL=1|-DPLOW_MLA_PF_V2_ARM=1) MLA=1 ;;
     esac
@@ -115,9 +117,9 @@ done
 for cap in mla kda; do
     marker="plow_packed_prefill_${cap}_consumers_1"
     required=0
-    [ "$cap" = mla ] && required=$MLA
-    [ "$cap" = kda ] && required=$K3
-    if [ "$PACKED" = 1 ] && [ "$required" = 1 ]; then
+    [ "$cap" = mla ] && [ "$PACKED_MLA" = 1 ] && required=$MLA
+    [ "$cap" = kda ] && [ "$PACKED_KDA" = 1 ] && required=$K3
+    if [ "$required" = 1 ]; then
         grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS" || fail "$OUT is missing $marker"
     elif grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS"; then
         fail "default $OUT unexpectedly advertises $marker"

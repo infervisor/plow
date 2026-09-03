@@ -187,6 +187,11 @@ Highest value first; keep only what helps *your* target:
    state addressing. Partition or prove non-aliasing prefill/decode scratch before
    overlap. Gate single-request parity, adversarial ragged batches, block latency,
    then matched C1/C8/C32 serving before changing the statement above.
+   Today every AMD program shares mutable `d_tens`, including `act.*`, mutable
+   `in.*`, and trace storage; `kv_rebase` rewrites that table between phases.
+   Sequential drain is therefore required. Phase-local scratch/tensor tables,
+   KV rebasing, staging and trace ownership are prerequisites to overlap, along
+   with a physical-range disjointness proof and concurrent parity tests.
 4. **Prefix cache** if traffic shares prefixes: `--vmm-prefix` (nvidia;
    `--vmm-block-mib` is the real knob — 64 MiB won at long ctx on the measured
    part) or `--prefix-cache` (amd, recurrent families).

@@ -45,6 +45,9 @@ pub struct CompletionRequest {
     pub ignore_eos: Option<bool>,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// Plow parity extension. Available only for non-streaming requests.
+    #[serde(default)]
+    pub return_token_ids: bool,
 }
 
 /// OpenAI `stream_options`: `include_usage` opts the stream into a final
@@ -210,6 +213,14 @@ pub struct CompletionResponse {
     pub choices: Vec<CompletionChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_ids: Option<CompletionTokenIds>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionTokenIds {
+    pub prompt: Vec<u32>,
+    pub completion: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]

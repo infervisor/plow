@@ -129,6 +129,9 @@ enum Cmd {
         /// Record bounded production-engine bucket/chunk selections and TP audit policy.
         #[arg(long, default_value_t = false)]
         engine_diagnostics: bool,
+        /// Include exact measured prompt/output token IDs for bench/serve parity checks.
+        #[arg(long, default_value_t = false, conflicts_with = "prefill_sweep")]
+        parity_report: bool,
     },
 
     /// Enumerate every visible device and, with `--tp`, bring up the
@@ -462,6 +465,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             slo_ms,
             max_queued_requests,
             engine_diagnostics,
+            parity_report,
         } => {
             bench(
                 assets,
@@ -484,6 +488,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..MuxConfig::default()
                 },
                 engine_diagnostics,
+                parity_report,
             )
             .await
         }
@@ -669,7 +674,7 @@ fn synthetic_timing_prefix(synthetic_probe: bool) -> &'static str {
 mod amd_bench_cli_tests {
     use super::{
         parse_prefill_lengths, require_synthetic_probe, synthetic_timing_prefix,
-        validate_amd_probe_steps, Cli,
+        validate_amd_probe_steps, validate_parity_report_options, Cli,
     };
     use clap::Parser;
 
@@ -805,6 +810,49 @@ mod amd_bench_cli_tests {
             "--engine-diagnostics",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn parity_report_requires_one_exact_measured_request() {
+        assert!(validate_parity_report_options(true, true, 1, 1, 0).is_ok());
+        assert!(Cli::try_parse_from([
+            "plowrt",
+            "--rt-checkpoint",
+            "weights",
+            "bench",
+            "--assets",
+            "model",
+            "--prompt-ids",
+            "1,2,3",
+            "--concurrency",
+            "1",
+            "--requests",
+            "1",
+            "--warmup-requests",
+            "0",
+            "--parity-report",
+        ])
+        .is_ok());
+        for invalid in [
+            (false, 1, 1, 0),
+            (true, 2, 1, 0),
+            (true, 1, 2, 0),
+            (true, 1, 1, 1),
+        ] {
+            assert!(validate_parity_report_options(
+                true, invalid.0, invalid.1, invalid.2, invalid.3
+            )
+            .is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "plowrt",
+            "bench",
+            "--assets",
+            "model",
+            "--parity-report",
+            "--prefill-sweep",
+        ])
+        .is_err());
     }
 }
 
@@ -2333,7 +2381,15 @@ async fn bench(
     executors: u32,
     mux_cfg: MuxConfig,
     engine_diagnostics: bool,
+    parity_report: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    validate_parity_report_options(
+        parity_report,
+        prompt_ids.is_some(),
+        concurrency,
+        requests,
+        warmup_requests,
+    )?;
     let state = bringup_runtime(vec![assets], executors, false, mux_cfg).await?;
     let models = state
         .registry
@@ -2400,6 +2456,7 @@ async fn bench(
                 requests,
                 output_tokens: output_len,
                 runtime,
+                parity_report,
             },
         )
         .await
@@ -2433,6 +2490,25 @@ async fn bench(
         trace_result?;
     }
     println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn validate_parity_report_options(
+    parity_report: bool,
+    has_prompt_ids: bool,
+    concurrency: usize,
+    requests: usize,
+    warmup_requests: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if parity_report
+        && (!has_prompt_ids || concurrency != 1 || requests != 1 || warmup_requests != 0)
+    {
+        return Err(
+            "--parity-report requires --prompt-ids, --concurrency 1, --requests 1, and \
+             --warmup-requests 0"
+                .into(),
+        );
+    }
     Ok(())
 }
 

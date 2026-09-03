@@ -12,6 +12,5 @@ TP-audit	scripts/k3_tp_equivalence.sh	checkpoint	Retain for full-logit TP equiva
 performance	scripts/l1_ab.sh	checkpoint	Legacy packet/object kernel A/B; never use as served-model performance.
 correctness	scripts/l1_tokens.sh	checkpoint	Retain for exact token-stream comparison between packet/object arms.
 performance	scripts/l2_place_ab.sh	checkpoint	Legacy packet/object scheduling A/B with an identity gate; never use as served-model performance.
-trace-dump	scripts/spec_gen_ids.sh	checkpoint	Retain until production diagnostics can emit generated token IDs.
 performance	scripts/sweep_batch_ceiling.sh	checkpoint	Compiled-width ceiling with real weights; production concurrency is not equivalent to --batched.
 performance	scripts/walk_b16_ab.sh	checkpoint	Legacy compiled-width packet/object A/B with per-slot correctness output.

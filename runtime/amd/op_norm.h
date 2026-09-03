@@ -68,7 +68,7 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                           float eps, unsigned out_row0, unsigned slice, unsigned nblk, float* part,
                           unsigned char* __restrict__ xq = nullptr,
                           float* __restrict__ ascale = nullptr
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
                           ,
                           const PlowProgram* packed = nullptr,
                           unsigned packed_slot_stride = 0
@@ -80,7 +80,7 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
     const auto* gg = as_glob(gamma);
     auto* og = as_glob(out);
     for (unsigned row = slice; row < rows; row += nblk) {
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
         const PlowPackedRow prow = plow_packed_prefill_row(packed, row);
         if (!prow.active) continue;
 #endif
@@ -88,7 +88,7 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
         /* out_row0 offsets the OUTPUT row only (input stays at `base`): GLM's decode step norms the
          * current token (row 0 of x) into the latent KV cache at row = out_row0 (the sequence pos),
          * patched per step. Default 0 => in-place, every existing RMSNORM bit-identical. */
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
         const size_t out_row = packed_slot_stride
                                    ? plow_packed_prefill_cache_row(prow, packed_slot_stride,
                                                                   out_row0 + row)
@@ -348,7 +348,7 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
                                 float eps, unsigned out_row0, unsigned out_stride, unsigned kv_mask,
                                 unsigned skip_norm, unsigned slice,
                                 unsigned nblk, unsigned n_batch_kv = 0
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
                                 ,
                                 const PlowProgram* packed = nullptr,
                                 unsigned packed_slot_stride = 0
@@ -373,7 +373,7 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
 
     for (unsigned w = slice * PLOW_WAVES + wave_in_blk; w < total; w += nblk * PLOW_WAVES) {
         const unsigned t = w / nhead, hh = w % nhead;
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
         const PlowPackedRow prow = plow_packed_prefill_row(packed, t);
         if (!prow.active) continue;
         const unsigned position =
@@ -397,7 +397,7 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
          * legacy formula gets right. n_batch_kv == 0 keeps the legacy path byte-identical, so
          * every prefill packet and B=1 decode are unchanged. */
         const size_t obase =
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
             packed_slot_stride && prow.span
                 ? (((size_t)prow.span->slot * nhead + hh) * packed_slot_stride +
                    (position & kv_mask)) * hd
@@ -482,7 +482,7 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
                                     float eps, unsigned out_row0, unsigned out_stride,
                                     unsigned kv_mask, unsigned skip_norm, unsigned slice,
                                     unsigned nblk, unsigned n_batch_kv = 0
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
                                     ,
                                     const PlowProgram* packed = nullptr,
                                     unsigned packed_slot_stride = 0
@@ -504,7 +504,7 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
 
     for (unsigned w = slice * PLOW_WAVES + wave_in_blk; w < total; w += nblk * PLOW_WAVES) {
         const unsigned t = w / nhead, hh = w % nhead;
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
         const PlowPackedRow prow = plow_packed_prefill_row(packed, t);
         if (!prow.active) continue;
         const unsigned position =
@@ -517,7 +517,7 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
          * its own pos[t] (see the bf16 twin above). The per-row `scale` array shares this row,
          * so both follow the same formula. */
         const size_t row =
-#if PLOW_PACKED_PREFILL_CONSUMERS
+#if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS
                            packed_slot_stride && prow.span
                                ? ((size_t)prow.span->slot * nhead + hh) * packed_slot_stride +
                                      (position & kv_mask)

@@ -29,6 +29,8 @@ jobs:
         run: scripts/check_amd_bench_consumers.sh
       - name: Check fusion-ladder result validator
         run: python3 perf-data/tools/fusion_ladder_results.py --self-test
+      - name: Check bench/serve parity validator
+        run: python3 perf-data/tools/check_bench_serve_parity.py --self-test
       - name: Enter Nix shell
         run: nix develop --command true
       - name: Build default package
@@ -50,6 +52,8 @@ jobs:
         run: scripts/check_amd_bench_consumers.sh
       - name: Check fusion-ladder result validator
         run: python3 perf-data/tools/fusion_ladder_results.py --self-test
+      - name: Check bench/serve parity validator
+        run: python3 perf-data/tools/check_bench_serve_parity.py --self-test
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt

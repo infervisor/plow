@@ -30,6 +30,7 @@ pub struct Config {
     pub requests: usize,
     pub output_tokens: usize,
     pub runtime: serde_json::Value,
+    pub parity_report: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +143,14 @@ pub struct Report {
     pub scheduler: SchedulerReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<EngineDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parity: Option<ParityReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ParityReport {
+    pub prompt_token_ids: Vec<Vec<u32>>,
+    pub output_token_ids: Vec<Vec<u32>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -441,6 +450,17 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
             "bench concurrency, requests, and output tokens must be positive".into(),
         ));
     }
+    if cfg.parity_report
+        && (!matches!(&cfg.input, Input::TokenIds(_))
+            || cfg.concurrency != 1
+            || cfg.requests != 1
+            || cfg.warmup_requests != 0)
+    {
+        return Err(RuntimeError::Msg(
+            "bench parity report requires token-id input, concurrency=1, requests=1, and no warmup"
+                .into(),
+        ));
+    }
     if state.execset.backend().vendor().is_none() {
         return Err(RuntimeError::Msg(
             "bench requires a matching GPU backend; refusing CPU fallback performance".into(),
@@ -533,6 +553,13 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
         &bundle.dir,
         state.execset.backend().vendor() == Some(hwspec::Vendor::Amd),
     )?;
+    let parity = cfg.parity_report.then(|| ParityReport {
+        prompt_token_ids: results
+            .iter()
+            .map(|result| prompt(&cfg.input, vocab, result.request))
+            .collect(),
+        output_token_ids: results.iter().map(|result| result.ids.clone()).collect(),
+    });
 
     Ok(Report {
         schema: "plowrt.bench.v1",
@@ -587,6 +614,7 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
                 .saturating_sub(admit_shed_before),
         },
         diagnostics: None,
+        parity,
     })
 }
 
