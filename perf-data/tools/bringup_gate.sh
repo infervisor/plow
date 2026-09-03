@@ -6,9 +6,12 @@
 set -euo pipefail
 ASSETS="$1"; TAG="$2"; PORT="$3"
 PLOWRT="${4:-$(dirname "$0")/../../target/release/plowrt}"
+HERE=$(cd "$(dirname "$0")" && pwd)
 OUTDIR="${BRINGUP_OUT:-/tmp/bringup-$USER}/gate-out"
 mkdir -p "$OUTDIR"
 LOG="$OUTDIR/serve-$TAG.log"
+PLOW_REQUIRE_TUNED=${PLOW_REQUIRE_TUNED:-0}
+case "$PLOW_REQUIRE_TUNED" in 0|1) ;; *) echo "PLOW_REQUIRE_TUNED must be 0 or 1" >&2; exit 2;; esac
 
 python3 - "$ASSETS/build.json" <<'EOF'
 import json, pathlib, sys
@@ -24,6 +27,19 @@ if lean.get("verified") is not True or lean.get("oracle") is not True:
 if not d.get("pairing", {}).get("hash"):
     raise SystemExit(f"build manifest has no packet/object pairing hash: {p}")
 EOF
+
+TUNING_RECORD=$("$HERE/bringup_tuning_profile.py" "$ASSETS/build.json" "$PLOW_REQUIRE_TUNED")
+IFS=$'\t' read -r TILE_MEASURED TILE_SOURCE TUNING_PROFILE <<<"$TUNING_RECORD"
+{
+  printf 'require_tuned=%s\n' "$PLOW_REQUIRE_TUNED"
+  printf 'tuning_profile=%s\ntile_measured=%s\ntile_source=%s\n' \
+    "$TUNING_PROFILE" "$TILE_MEASURED" "$TILE_SOURCE"
+} >"$OUTDIR/$TAG-config.txt"
+if [ "$TUNING_PROFILE" = measured ]; then
+  echo "tuning profile: measured ($TILE_MEASURED selections, source=$TILE_SOURCE)" >&2
+else
+  echo "WARNING: analytical tuning fallback (tile_measured=$TILE_MEASURED, source=$TILE_SOURCE); baseline evidence only" >&2
+fi
 
 "$PLOWRT" serve --assets "$ASSETS" --port "$PORT" >"$LOG" 2>&1 &
 SPID=$!

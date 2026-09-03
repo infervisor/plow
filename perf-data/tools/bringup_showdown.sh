@@ -25,6 +25,8 @@ case "$PLOWRT" in /*) ;; *) echo "PLOWRT must be an absolute path" >&2; exit 2;;
 [ -d "$PLOW_ASSETS" ] || { echo "missing PLOW_ASSETS: $PLOW_ASSETS" >&2; exit 2; }
 
 HERE=$(cd "$(dirname "$0")" && pwd)
+PLOW_REQUIRE_TUNED=${PLOW_REQUIRE_TUNED:-0}
+case "$PLOW_REQUIRE_TUNED" in 0|1) ;; *) echo "PLOW_REQUIRE_TUNED must be 0 or 1" >&2; exit 2;; esac
 ROUNDS=${ROUNDS:-5}
 TP=${TP:-1}
 DTYPE=${DTYPE:-bfloat16}
@@ -69,6 +71,14 @@ if not d.get("pairing", {}).get("hash"):
 PY
 fi
 
+TUNING_RECORD=$("$HERE/bringup_tuning_profile.py" "$PLOW_ASSETS/build.json" "$PLOW_REQUIRE_TUNED")
+IFS=$'\t' read -r TILE_MEASURED TILE_SOURCE TUNING_PROFILE <<<"$TUNING_RECORD"
+if [ "$TUNING_PROFILE" = measured ]; then
+  echo "tuning profile: measured ($TILE_MEASURED selections, source=$TILE_SOURCE)" >&2
+else
+  echo "WARNING: analytical tuning fallback (tile_measured=$TILE_MEASURED, source=$TILE_SOURCE); baseline evidence only" >&2
+fi
+
 artifact_manifest() {
   python3 - "$@" <<'PY'
 import hashlib, pathlib, sys
@@ -106,6 +116,8 @@ printf 'tag\tround\tinlen\tttft_mean\tttft_median\tttft_p99\ttpot_median\tconcur
   printf 'plowrt=%s\nplow_assets=%s\nplow_server_command_argv=%s\nplow_engine_argv=%s\n' "$PLOWRT" "$PLOW_ASSETS" "${PLOW_SERVER_COMMAND_ARGV:-$PLOWRT}" "${PLOW_ENGINE_ARGV:-}"
   printf 'vllm_server_command_argv=%s\nvllm_client_command_argv=%s\nvllm_engine_argv=%s\n' "${VLLM_SERVER_COMMAND_ARGV:-vllm}" "${VLLM_CLIENT_COMMAND_ARGV:-vllm}" "${VLLM_ENGINE_ARGV:-}"
   printf 'client_argv=%s\nseed=%s\n' "${BRINGUP_CLIENT_ARGV:-}" "${BRINGUP_SEED:-42}"
+  printf 'require_tuned=%s\ntuning_profile=%s\ntile_measured=%s\ntile_source=%s\n' \
+    "$PLOW_REQUIRE_TUNED" "$TUNING_PROFILE" "$TILE_MEASURED" "$TILE_SOURCE"
   printf 'plow_artifact_digest=%s\nvllm_artifact_digest=%s\nvllm_image_digest=%s\nvllm_model_identity=%s\n' "$PLOW_ARTIFACT_DIGEST" "$VLLM_ARTIFACT_DIGEST" "${VLLM_IMAGE_DIGEST:-}" "${VLLM_MODEL_IDENTITY:-}"
   printf 'input_lens=%s\nconcurrency_map=%s\nprompt_map=%s\nwarmup_map=%s\noutlen_map=%s\n' \
     "${INPUT_MAP:-${INPUT_LENS:-${IN_LENS:-128 1024 4096}}}" "${CONCURRENCY_MAP:-default=1}" \

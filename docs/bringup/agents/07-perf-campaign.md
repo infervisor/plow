@@ -96,6 +96,11 @@ perf-data/tools/gpulease gate perf-data/tools/bringup_gate.sh $ASSETS <tag> 8080
 diff $BRINGUP_OUT/gate-out/<reference>.txt $BRINGUP_OUT/gate-out/<tag>.txt
 ```
 
+Set `PLOW_REQUIRE_TUNED=1` for promotion evidence. It makes both the fixed-prompt
+gate and the alternating showdown reject a missing/analytical tile profile;
+baseline runs retain the default `0`, report the analytical fallback loudly,
+and stamp it into their config evidence.
+
 Token-identical (required for refactors/staging/reordering), coherent-but-shifted
 (only for a *documented* numerics change, called out), or garbage / truncation /
 wrong first token (**reject**). On TP, every rank must emit the identical stream.

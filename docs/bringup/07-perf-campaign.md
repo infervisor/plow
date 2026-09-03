@@ -87,6 +87,13 @@ Accuracy battery: `scripts/bench_gsm8k.sh` (GSM8K 8-shot greedy) is the
 whole-stack accuracy gate — it exercises chat template, channel stop, tokenizer,
 prefill, on-device sampling and SSE in a way `amd-bench` cannot.
 
+Promotion runs must set `PLOW_REQUIRE_TUNED=1` for both `bringup_gate.sh` and
+`bringup_showdown.sh`. The scripts then require `build.json` to report
+`tuning.tile_measured > 0` and a nonempty, non-analytical `tuning.tile_source`.
+The default remains `0` so analytical baselines can run, but they print a
+`baseline evidence only` warning and record `tuning_profile=analytical-fallback`
+plus the manifest values in the gate/showdown config evidence.
+
 > **`bench_ib.sh` may not be in the tree.** The `inference-benchmarker` driver is
 > referenced by the historical campaigns (`b2-concurrency-family.md`,
 > `px1-stage1.md`) but is not always committed here. If it is absent, use

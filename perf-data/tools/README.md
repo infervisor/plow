@@ -43,3 +43,6 @@ Measured detail behind it: `perf-data/gemma12b-gh200-prefill-campaign.md`
   and likewise `VLLM_SERVER_COMMAND_ARGV` (with the required GPU and mount
   arguments). The harness appends `bench serve` or `serve`; it never inserts a
   host-side executable after the image.
+  `PLOW_REQUIRE_TUNED=1` makes the correctness gate and showdown require measured
+  tile provenance; `bringup_tuning_profile_selftest.sh` covers missing,
+  analytical, and measured manifests without a GPU.
