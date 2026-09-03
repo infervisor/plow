@@ -2682,7 +2682,11 @@ pub fn emit_k3_model(
             ug: b.tensor("act.ug_tp", slot_b as u64),
             slot_b,
             xgate: 0,
-            xr_cus: (0..n_cu).collect(),
+            xr_cus: (0..crate::emit_config::active()
+                .xr_cus
+                .unwrap_or(n_cu)
+                .clamp(1, n_cu))
+                .collect(),
         }
     } else {
         K3Tp::none()
@@ -5019,6 +5023,23 @@ mod tests {
             gates.len(),
             2 * xr.len(),
             "both rendezvous gates stay unique"
+        );
+    }
+
+    #[test]
+    fn k3_honors_the_generic_xreduce_cu_cap() {
+        let _guard = crate::test_env::env_guard();
+        let _env = crate::test_env::EnvScope::set(&[("PLOW_XR_CUS", "32")]);
+        let p = build_full_t(8, 512);
+        let xr: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::XReduce as u16 || i.op == DevOp::XReduceTwoShot as u16)
+            .collect();
+        assert_eq!(xr.len(), 278);
+        assert!(
+            xr.iter().all(|i| i.blocks == 32),
+            "PLOW_XR_CUS must cap every K3 collective packet"
         );
     }
 
