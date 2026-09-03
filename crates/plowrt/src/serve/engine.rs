@@ -381,6 +381,20 @@ mod amd_serve {
         }
     }
 
+    fn commit_packed_prefill(
+        cursors: &mut [Option<PfCursor>],
+        completed: &[(usize, crate::exec::amd::ChunkStep)],
+    ) {
+        for &(slot, step) in completed {
+            let cur = cursors[slot]
+                .as_mut()
+                .expect("packed cursor was validated before dispatch");
+            debug_assert_eq!(cur.steps.get(cur.next), Some(&step));
+            cur.next += 1;
+            cur.frontier = step.c0 + step.clen;
+        }
+    }
+
     /// Shortest prefix worth caching. Below this the snapshot/restore pair costs more than the
     /// prefill it skips, and it churns the slot's cached prompt for nothing.
     const MIN_PREFIX: u32 = 128;
@@ -1014,6 +1028,121 @@ mod amd_serve {
             })
         }
 
+        /// Advance compatible, already-initialized TP prefill cursors in one packed dispatch.
+        /// Final chunks remain isolated because the current model prefill head exposes one
+        /// sampled token, not one result per span. Snapshot boundaries remain isolated too.
+        pub fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> Result<()> {
+            if members.is_empty() {
+                return Err(RuntimeError::Rejected(
+                    "packed prefill requires at least one cursor".into(),
+                ));
+            }
+            if !matches!(self.ranks, Ranks::Tp(_)) {
+                return Err(RuntimeError::Rejected(
+                    "packed prefill requires an AMD TP engine".into(),
+                ));
+            }
+
+            let mut spans = Vec::with_capacity(members.len());
+            let mut slices = Vec::with_capacity(members.len());
+            let mut completed = Vec::with_capacity(members.len());
+            let mut row0 = 0u32;
+            let mut program = None;
+            for &(slot, prompt) in members {
+                if spans
+                    .iter()
+                    .any(|span: &PrefillSpan| span.slot as usize == slot)
+                {
+                    return Err(RuntimeError::Rejected(format!(
+                        "packed prefill slot {slot} appears more than once"
+                    )));
+                }
+                let cur = self.pf.get(slot).and_then(Option::as_ref).ok_or_else(|| {
+                    RuntimeError::Rejected(format!(
+                        "packed prefill slot {slot} has no initialized cursor"
+                    ))
+                })?;
+                if self.live.get(slot).copied() != Some(false) {
+                    return Err(RuntimeError::Device(format!(
+                        "packed prefill slot {slot} has both a live decode row and a prefill cursor"
+                    )));
+                }
+                let step = *cur.steps.get(cur.next).ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "packed prefill slot {slot} cursor is past its plan"
+                    ))
+                })?;
+                if cur.next + 1 == cur.steps.len() {
+                    return Err(RuntimeError::Rejected(format!(
+                        "packed prefill slot {slot} is on its final chunk; use isolated prefill to collect its sampled token"
+                    )));
+                }
+                if cur.snap_after == Some(cur.next) {
+                    return Err(RuntimeError::Rejected(format!(
+                        "packed prefill slot {slot} is on a prefix snapshot boundary; use isolated prefill"
+                    )));
+                }
+                if program.is_some_and(|p| p != step.prog) {
+                    return Err(RuntimeError::Rejected(
+                        "packed prefill cursors do not share one compiled program".into(),
+                    ));
+                }
+                program = Some(step.prog);
+                let end = (step.c0 as usize)
+                    .checked_add(step.clen as usize)
+                    .filter(|&end| end <= prompt.len())
+                    .ok_or_else(|| {
+                        RuntimeError::Rejected(format!(
+                            "packed prefill slot {slot} prompt does not cover [{}, {})",
+                            step.c0,
+                            step.c0.saturating_add(step.clen)
+                        ))
+                    })?;
+                let mut span = self.prefill_span(slot, u32::MAX).ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "packed prefill slot {slot} lost its planned span"
+                    ))
+                })?;
+                span.row0 = row0;
+                row0 = row0.checked_add(span.n_rows).ok_or_else(|| {
+                    RuntimeError::Rejected("packed prefill row count overflows u32".into())
+                })?;
+                spans.push(span);
+                slices.push(&prompt[step.c0 as usize..end]);
+                completed.push((slot, step));
+            }
+
+            let prog = program.expect("non-empty members set a program");
+            let rung = self.prefill_prog_t(prog).ok_or_else(|| {
+                RuntimeError::Rejected(format!(
+                    "packed prefill program {prog} is not a common prefill rung"
+                ))
+            })?;
+            if row0 > rung {
+                return Err(RuntimeError::Rejected(format!(
+                    "packed prefill has {row0} dense rows but program {prog} is compiled for {rung}"
+                )));
+            }
+            let mut parked = vec![1; rung as usize];
+            parked[..row0 as usize].fill(0);
+            let Ranks::Tp(group) = &mut self.ranks else {
+                unreachable!("TP checked above")
+            };
+            group.prefill_packed_chunk(&spans, &slices, &parked)?;
+            commit_packed_prefill(&mut self.pf, &completed);
+            if let Some(diagnostics) = self.diagnostics.as_mut() {
+                for &(slot, step) in &completed {
+                    diagnostics.push_prefill(PrefillSelection {
+                        slot,
+                        row_start: step.c0,
+                        rows: step.clen,
+                        bucket: rung,
+                    });
+                }
+            }
+            Ok(())
+        }
+
         pub fn prefill_turn(&self) -> usize {
             self.prefill_turn
         }
@@ -1407,9 +1536,9 @@ mod amd_serve {
     #[cfg(test)]
     mod tests {
         use super::{
-            bounded_deferred_quantum, invalidate_prefix_metadata, parse_snapshot_tensors,
-            snapshot_file_component, split_pending_prefill, stage_parked, PfCursor,
-            DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
+            bounded_deferred_quantum, commit_packed_prefill, invalidate_prefix_metadata,
+            parse_snapshot_tensors, snapshot_file_component, split_pending_prefill, stage_parked,
+            PfCursor, DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
 
@@ -1504,6 +1633,37 @@ mod amd_serve {
             );
             assert_eq!(cur.steps.len(), 2);
             assert_eq!(cur.snap_after, Some(1));
+        }
+
+        #[test]
+        fn packed_cursor_commit_advances_all_selected_rows_together() {
+            let step0 = ChunkStep {
+                prog: 2,
+                c0: 0,
+                clen: 3,
+            };
+            let step1 = ChunkStep {
+                prog: 2,
+                c0: 4,
+                clen: 2,
+            };
+            let cursor = |step| {
+                Some(PfCursor {
+                    steps: vec![step, ChunkStep { c0: 8, ..step }],
+                    next: 0,
+                    frontier: step.c0,
+                    snap_after: None,
+                    resume: 0,
+                    arm: 0,
+                })
+            };
+            let mut cursors = vec![cursor(step0), None, cursor(step1)];
+            commit_packed_prefill(&mut cursors, &[(0, step0), (2, step1)]);
+            assert_eq!(cursors[0].as_ref().unwrap().next, 1);
+            assert_eq!(cursors[0].as_ref().unwrap().frontier, 3);
+            assert_eq!(cursors[2].as_ref().unwrap().next, 1);
+            assert_eq!(cursors[2].as_ref().unwrap().frontier, 6);
+            assert!(cursors[1].is_none());
         }
 
         #[test]

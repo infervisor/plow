@@ -1243,6 +1243,83 @@ impl AmdTpGroup {
         Ok(())
     }
 
+    /// Execute one packed prefill chunk as an all-rank transaction. No rank launches until all
+    /// ranks have staged the same dense rows and ABI binding. The binding is cleared after every
+    /// outcome so a later legacy dispatch can never inherit packed metadata.
+    pub fn prefill_packed_chunk(
+        &mut self,
+        spans: &[PrefillSpan],
+        prompt_slices: &[&[u32]],
+        parked: &[u32],
+    ) -> Result<()> {
+        self.clear_packed_prefill();
+        let result = self.prefill_packed_chunk_inner(spans, prompt_slices, parked);
+        self.clear_packed_prefill();
+        result
+    }
+
+    fn prefill_packed_chunk_inner(
+        &mut self,
+        spans: &[PrefillSpan],
+        prompt_slices: &[&[u32]],
+        parked: &[u32],
+    ) -> Result<()> {
+        use crate::obs::ttft;
+
+        let first = spans.first().ok_or_else(|| {
+            RuntimeError::Device("packed prefill requires at least one span".into())
+        })?;
+        if spans.iter().any(|span| span.program != first.program) {
+            return Err(RuntimeError::Device(
+                "packed prefill spans do not share one compiled program".into(),
+            ));
+        }
+        let prog = first.program as usize;
+        let rung = self.prefill_prog_t(prog).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "packed prefill program {prog} is absent or differs across ranks"
+            ))
+        })?;
+        if parked.len() != rung as usize {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill parked mask has {} rows for rung {rung}",
+                parked.len()
+            )));
+        }
+
+        for e in &mut self.ranks {
+            let t = std::time::Instant::now();
+            e.packed_prefill_prepare(prog, spans, prompt_slices, parked)?;
+            ttft::PF_PREPARE.add(t.elapsed().as_nanos() as u64);
+            let t = std::time::Instant::now();
+            e.rearm_prog(prog)?;
+            ttft::PF_REARM.add(t.elapsed().as_nanos() as u64);
+        }
+
+        let t = std::time::Instant::now();
+        self.group.zero_xctr()?;
+        ttft::PF_XCTR.add(t.elapsed().as_nanos() as u64);
+
+        let launches = self.ranks[0].prog_dispatch(prog).launches();
+        ttft::PF_SEGMENTS.tally(launches as u64);
+        for seg in 0..launches {
+            let t = std::time::Instant::now();
+            for e in &mut self.ranks {
+                e.enqueue_segment(prog, seg)?;
+            }
+            ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
+            let t = std::time::Instant::now();
+            for e in &self.ranks {
+                e.drain()?;
+            }
+            ttft::PF_DRAIN.add(t.elapsed().as_nanos() as u64);
+        }
+        if self.audit {
+            self.group.audit_xctr(&self.gate_expect[prog])?;
+        }
+        Ok(())
+    }
+
     /// Seed `in.ids` on every rank — needed once, before the first decode step.
     pub fn seed_ids(&mut self, ids: &[u32]) -> Result<()> {
         for e in &mut self.ranks {

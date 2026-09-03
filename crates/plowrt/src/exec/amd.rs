@@ -3449,6 +3449,67 @@ fn validate_packed_prefill(
     })
 }
 
+fn validate_packed_prompt_slices(
+    rung: u32,
+    spans: &[PrefillSpan],
+    prompt_slices: &[&[u32]],
+) -> Result<u32> {
+    if spans.len() != prompt_slices.len() {
+        return Err(RuntimeError::Device(format!(
+            "packed prefill has {} spans but {} prompt slices",
+            spans.len(),
+            prompt_slices.len()
+        )));
+    }
+    let mut rows = 0u32;
+    for (i, (span, prompt)) in spans.iter().zip(prompt_slices).enumerate() {
+        if prompt.len() != span.n_rows as usize {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} has {} rows but its prompt slice has {} tokens",
+                span.n_rows,
+                prompt.len()
+            )));
+        }
+        rows = rows.checked_add(span.n_rows).ok_or_else(|| {
+            RuntimeError::Device("packed prefill prompt row count overflows u32".into())
+        })?;
+    }
+    if rows == 0 || rows > rung {
+        return Err(RuntimeError::Device(format!(
+            "packed prefill prompt slices contribute {rows} rows for rung {rung}"
+        )));
+    }
+    Ok(rows)
+}
+
+fn stage_packed_prompt_rows(
+    stage: &mut [u8],
+    rung: u32,
+    spans: &[PrefillSpan],
+    prompt_slices: &[&[u32]],
+) -> Result<u32> {
+    let rows = validate_packed_prompt_slices(rung, spans, prompt_slices)?;
+    let bytes = rung as usize * 4;
+    if stage.len() < bytes * 2 {
+        return Err(RuntimeError::Device(format!(
+            "packed prefill input staging has {} bytes, needs {}",
+            stage.len(),
+            bytes * 2
+        )));
+    }
+    stage[..bytes * 2].fill(0);
+    for (span, prompt) in spans.iter().zip(prompt_slices) {
+        for (local, &id) in prompt.iter().enumerate() {
+            let row = span.row0 as usize + local;
+            stage[row * 4..row * 4 + 4].copy_from_slice(&id.to_le_bytes());
+            let pos = span.kv_row0 + local as u32;
+            let off = bytes + row * 4;
+            stage[off..off + 4].copy_from_slice(&pos.to_le_bytes());
+        }
+    }
+    Ok(rows)
+}
+
 fn check_packed_prefill_dispatch(binding: Option<PackedPrefillBinding>, prog: usize) -> Result<()> {
     if let Some(bound) = binding.filter(|b| b.prog != prog) {
         return Err(RuntimeError::Device(format!(
@@ -6564,7 +6625,13 @@ impl AmdEngine {
     /// * lm_head — the FIRST matmul writing `act.logits` → `i[4] = clen - 1`,
     ///   the chunk's last REAL row, so the sampled logits come from the last
     ///   prompt token and not from a padded one.
-    fn patch_prefill(&mut self, prog: usize, c0: u32, clen: u32) -> Result<()> {
+    fn patch_prefill_rows(
+        &mut self,
+        prog: usize,
+        c0: u32,
+        clen: u32,
+        bucket: Option<u32>,
+    ) -> Result<()> {
         let sz = std::mem::size_of::<DevInst64>();
         let n = self.pf_src[prog].len();
         // Rebuild from the pristine copy every chunk: patches must not
@@ -6576,13 +6643,7 @@ impl AmdEngine {
             std::slice::from_raw_parts_mut(self.h_pf_inst.as_mut_ptr() as *mut DevInst64, n)
         };
 
-        rebase_chunk_rows(
-            insts,
-            &self.tensor_names,
-            c0,
-            clen,
-            self.ragged_bucket(prog),
-        );
+        rebase_chunk_rows(insts, &self.tensor_names, c0, clen, bucket);
 
         let mut lm = None;
         for (i, d) in insts.iter().enumerate() {
@@ -6632,6 +6693,10 @@ impl AmdEngine {
             self.progs[prog].d_inst.base,
             &self.h_pf_inst.as_slice()[..n * sz],
         )
+    }
+
+    fn patch_prefill(&mut self, prog: usize, c0: u32, clen: u32) -> Result<()> {
+        self.patch_prefill_rows(prog, c0, clen, self.ragged_bucket(prog))
     }
 
     /// Resolve a chunk plan to the programs and ranges that run it.
@@ -6737,6 +6802,60 @@ impl AmdEngine {
         self.be
             .memcpy_htod_pinned(d_pos, &self.h_scalar.as_slice()[nb..nb * 2])?;
         self.patch_prefill(step.prog, step.c0, step.clen)
+    }
+
+    /// Stage one dense packed-prefill row set. Dispatch remains the TP wrapper's job so no rank
+    /// can launch until every rank has accepted the same descriptor and input rows.
+    pub fn packed_prefill_prepare(
+        &mut self,
+        prog: usize,
+        spans: &[PrefillSpan],
+        prompt_slices: &[&[u32]],
+        parked: &[u32],
+    ) -> Result<()> {
+        if self.kv_slot != 0 {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill requires the shared KV base, currently rebased to slot {}",
+                self.kv_slot
+            )));
+        }
+        let rung = self
+            .prefill_prog_t(prog)
+            .ok_or_else(|| RuntimeError::Device(format!("program {prog} is not a prefill rung")))?;
+        let rows = validate_packed_prompt_slices(rung, spans, prompt_slices)?;
+        self.stage_packed_prefill(prog, spans, parked)?;
+
+        for span in spans {
+            self.vmm_ensure(span.slot as usize, span.kv_len)?;
+            if !self.kda_conv_bank_pairs.is_empty() {
+                self.kda_conv_alt_stale[span.slot as usize] = true;
+            }
+        }
+
+        if let Some(t) = self.t_kvlen {
+            let stage = self.h_scalar.as_mut_slice();
+            for slot in 0..self.batch {
+                stage[slot * 4..slot * 4 + 4].copy_from_slice(&1u32.to_le_bytes());
+            }
+            for span in spans {
+                let slot = span.slot as usize;
+                stage[slot * 4..slot * 4 + 4].copy_from_slice(&span.kv_len.to_le_bytes());
+            }
+            self.be.memcpy_htod_pinned(
+                self.devp[t].base,
+                &self.h_scalar.as_slice()[..self.batch * 4],
+            )?;
+        }
+
+        stage_packed_prompt_rows(self.h_scalar.as_mut_slice(), rung, spans, prompt_slices)?;
+        let bytes = rung as usize * 4;
+        let d_ids = self.devp[self.need(self.t_ids, "in.ids")?].base;
+        let d_pos = self.devp[self.need(self.t_pos, "in.pos")?].base;
+        self.be
+            .memcpy_htod_pinned(d_ids, &self.h_scalar.as_slice()[..bytes])?;
+        self.be
+            .memcpy_htod_pinned(d_pos, &self.h_scalar.as_slice()[bytes..bytes * 2])?;
+        self.patch_prefill_rows(prog, 0, rows, Some(rung))
     }
 
     /// The chunk plan for a prompt, from the compiled bucket ladder.
@@ -7709,6 +7828,51 @@ mod tests {
         reject(&packed_spans(), &[0, 0, 0, 0, 0]);
         reject(&packed_spans(), &[0, 1, 0, 0, 0, 1, 1, 1]);
         reject(&packed_spans(), &[0, 0, 0, 0, 0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn packed_prefill_prompt_slices_must_match_spans_exactly() {
+        let a = [10, 11, 12];
+        let b = [20, 21];
+        assert_eq!(
+            validate_packed_prompt_slices(8, &packed_spans(), &[&a, &b]).unwrap(),
+            5
+        );
+        assert!(validate_packed_prompt_slices(8, &packed_spans(), &[&a]).is_err());
+        assert!(validate_packed_prompt_slices(8, &packed_spans(), &[&a, &[20]]).is_err());
+        assert!(validate_packed_prompt_slices(4, &packed_spans(), &[&a, &b]).is_err());
+    }
+
+    #[test]
+    fn packed_prefill_stages_concatenated_ids_and_absolute_positions() {
+        let a = [10, 11, 12];
+        let b = [20, 21];
+        let mut stage = [0xff; 64];
+        assert_eq!(
+            stage_packed_prompt_rows(&mut stage, 8, &packed_spans(), &[&a, &b]).unwrap(),
+            5
+        );
+        let words = |half: usize| {
+            (0..8)
+                .map(|i| {
+                    let off = half * 32 + i * 4;
+                    u32::from_le_bytes(stage[off..off + 4].try_into().unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(words(0), [10, 11, 12, 20, 21, 0, 0, 0]);
+        assert_eq!(words(1), [0, 1, 2, 5, 6, 0, 0, 0]);
+    }
+
+    #[test]
+    fn packed_prefill_patches_generic_work_to_dense_total_rows() {
+        let mut inst = DevInst64 {
+            op: DevOp::Embed as u16,
+            i: [8, 0, 0, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        rebase_chunk_rows(std::slice::from_mut(&mut inst), &[], 0, 5, Some(8));
+        assert_eq!(inst.i[0], 5);
     }
 
     #[test]
