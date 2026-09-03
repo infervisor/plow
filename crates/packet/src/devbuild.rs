@@ -3236,11 +3236,19 @@ mod seg_window_tests {
     fn packed_prefill_classes_are_operator_families() {
         assert_eq!(packed_prefill_segment_class(DevOp::RmsNorm as u16), Some(5));
         assert_eq!(
+            packed_prefill_segment_class(DevOp::HeadNormRope as u16),
+            Some(5)
+        );
+        assert_eq!(
             packed_prefill_segment_class(DevOp::HeadNormRopeFp8 as u16),
             Some(5)
         );
         assert_eq!(
             packed_prefill_segment_class(DevOp::FlashMlaPrefill as u16),
+            Some(6)
+        );
+        assert_eq!(
+            packed_prefill_segment_class(DevOp::FlashMlaPrefillFp8 as u16),
             Some(6)
         );
         assert_eq!(

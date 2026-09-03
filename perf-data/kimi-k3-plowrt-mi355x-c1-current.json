@@ -36,7 +36,7 @@
     "speculative_decode": false,
     "packed_prefill_route": false,
     "mla_prefill_v2": true,
-    "device_dispatch": "49 ordered segments, 8 physical-XCD windows per segment",
+    "device_dispatch": "627 ordered segments, 8 physical-XCD windows per segment",
     "upload_slots": 1
   },
   "artifact_identity": {

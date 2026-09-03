@@ -61,7 +61,7 @@ Comparator: `perf-data/kimi-k3-vllm-mi355x-c1.json`.
 
 The current release candidate was also measured through the identical vLLM
 0.28 `bench serve` client and raw `/v1/completions` contract at 8192→1024,
-C1. Its 16K packet retained the six prefill rungs through 8192, 49 ordered
+C1. Its 16K packet retained the six prefill rungs through 8192, 627 ordered
 kernel-family segments, eight physical-XCD windows per segment, BF16 KV, all
 7,650 measured TuneDB selections, and passed every devblob Lean ordering/LDS
 certificate. One warm-up and all three measured requests completed.
@@ -80,13 +80,16 @@ This supersedes the older short-sample KDA-scan candidate below, but not the
 
 ### FP8-KV ceiling (lossy, not apples-to-apples)
 
-An otherwise matched 8192→1024 C1 run stored the MLA KV cache as E4M3 plus a
-per-row F32 scale. It improved mean TPOT from 55.63 to 49.73 ms (-10.6%) and
-output throughput from 17.30 to 18.99 tok/s (+9.8%). It remains 2.38x slower
-than vLLM's BF16-KV TPOT. Median TTFT regressed from 2276.89 to 3046.79 ms
-because the FP8 packet currently carries 443 ordered prefill segments vs 49 in
-the BF16 candidate; segment construction must be fixed before FP8 prefill can
-be assessed cleanly.
+The clean 49-segment precision control isolates KV storage: BF16 measured
+2931.36 ms median TTFT / 55.40 ms mean TPOT / 17.18 output tok/s; FP8 measured
+2966.55 ms / 49.61 ms / 19.1 tok/s. FP8 therefore improves decode about 10.5%
+without improving TTFT.
+
+Combining FP8 KV with the opt-in shuffled MXFP4 stage-2 object produces the
+current ceiling: 2204.33 ms median TTFT, 49.40 ms mean TPOT, 49.41/49.71 ms
+median/P99 ITL, and 19.41 output tok/s. Relative to the FP8 49-segment control,
+stage 2 improves TTFT 25.7% while leaving decode effectively unchanged. It
+still trails vLLM BF16 by 3.88x TTFT, 2.37x TPOT, and 2.41x output throughput.
 
 FP8 KV is deliberately not promoted here: it is lossy, greedy tokens are known
 to diverge from the BF16 path, and the pinned vLLM comparator uses BF16 KV.

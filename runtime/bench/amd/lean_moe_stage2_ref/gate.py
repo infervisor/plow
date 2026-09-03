@@ -222,8 +222,13 @@ def xorshift(state):
     return state & 0xFFFFFFFF
 
 
-def timing(module, manifest):
+def timing(module, manifest, tokens=None):
     g = manifest["geometry"]
+    if tokens is not None:
+        g = dict(g)
+        g["tokens"] = tokens
+        manifest = dict(manifest)
+        manifest["geometry"] = g
     t, topk, n, k, e, bm = g["tokens"], g["topk"], g["model_dim"], g["inter_dim"], g["experts"], g["sort_block_m"]
     state = 12345
     buckets = [[] for _ in range(e)]
@@ -308,12 +313,15 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("object", type=Path)
     p.add_argument("manifest", type=Path)
+    p.add_argument("--timing-tokens", type=int)
     args = p.parse_args()
     manifest = json.loads(args.manifest.read_text())
     check_manifest(args.object, manifest)
     module = HipModule(args.object, manifest["object"]["symbol"])
     oracle(module, manifest)
-    timing(module, manifest)
+    if args.timing_tokens is not None and args.timing_tokens <= 0:
+        raise SystemExit("--timing-tokens must be positive")
+    timing(module, manifest, args.timing_tokens)
 
 
 if __name__ == "__main__":

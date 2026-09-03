@@ -538,9 +538,18 @@ then pass block/TP8 gates before promotion.
   current-candidate evidence, not a replacement for the three-fold publication baseline.
 - A separate lossy FP8-KV ceiling improved mean TPOT 55.63→49.73 ms (-10.6%) and output
   throughput 17.30→18.99 tok/s (+9.8%), but median TTFT regressed 2276.89→3046.79 ms.
-  The FP8 packet exposes a compiler problem: 443 ordered prefill segments vs 49 for the BF16
-  candidate. Keep BF16 as the apples-to-apples comparator and fix that segmentation before
-  judging FP8 prefill; even its improved TPOT remains 2.38x slower than vLLM BF16.
+  That first FP8 ceiling disabled MLA V2 because its object lacked the FP8 arm, while the BF16
+  candidate used MLA V2; it therefore does not isolate KV precision for TTFT. Keep BF16 as the
+  apples-to-apples comparator. Even the improved FP8 TPOT remains 2.38x slower than vLLM BF16.
+- Clean 49-segment BF16/FP8 controls with the corrected HSA drain isolate the effect: BF16
+  measured 2931.36 ms median TTFT / 55.40 ms mean TPOT, while FP8 measured 2966.55 / 49.61 ms.
+  FP8 helps decode 10.5%, not prefill. Adding the shuffled stage-2 route to FP8 then reaches
+  2204.33 ms TTFT / 49.40 ms TPOT / 19.41 output tok/s (3/3 requests), the fastest current
+  ceiling but still 3.88x/2.37x/2.41x behind vLLM TTFT/TPOT/output throughput.
+- Segmented TP synchronization previously polled the AQL read index, which proves packet
+  consumption but not kernel completion. PlowRT now drains the existing shared dispatch
+  completion counter before advancing ranks/segments. This removes the >2-minute stage-2 stall;
+  the exact 8K standalone body itself is healthy at 0.961 ms / 0.983 ms including zero.
 - A checkpoint-bound production-mux rerun at exactly 8192 input tokens and one output token,
   with the raw gfx950 MLA V2+SV segment enabled and packed KDA disabled, completed 3/3 after
   one warm-up at TTFT p50/p90 2257.594/2257.616 ms (0.05% spread). This is a prefill-boundary

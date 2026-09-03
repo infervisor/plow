@@ -1,7 +1,7 @@
 {
   "schema": "plow.k3.c1.fp8kv-ceiling.v1",
   "date": "20260903",
-  "status": "lossy FP8-KV ceiling; not an apples-to-apples replacement for the BF16 baseline",
+  "status": "current lossy FP8-KV plus shuffled-MoE ceiling; not an apples-to-apples replacement for the BF16 baseline",
   "endpoint_type": "openai",
   "backend": "openai",
   "client": "vllm 0.28 bench serve",
@@ -15,20 +15,20 @@
   "output_tokens_per_prompt": 1024,
   "total_input_tokens": 24576,
   "total_output_tokens": 3072,
-  "duration_s": 161.75,
-  "request_throughput": 0.02,
-  "output_throughput": 18.99,
+  "duration_s": 158.2310882100137,
+  "request_throughput": 0.018959611754791335,
+  "output_throughput": 19.414642436906327,
   "peak_output_throughput": 21.00,
-  "total_token_throughput": 170.93,
-  "mean_ttft_ms": 3046.23,
-  "median_ttft_ms": 3046.79,
-  "p99_ttft_ms": 3047.56,
-  "mean_tpot_ms": 49.73,
-  "median_tpot_ms": 49.63,
-  "p99_tpot_ms": 49.94,
-  "mean_itl_ms": 49.68,
-  "median_itl_ms": 49.64,
-  "p99_itl_ms": 50.08,
+  "total_token_throughput": 174.73178193215693,
+  "mean_ttft_ms": 2202.4035323411226,
+  "median_ttft_ms": 2204.3339399970137,
+  "p99_ttft_ms": 2205.041679367423,
+  "mean_tpot_ms": 49.404742777121946,
+  "median_tpot_ms": 49.44046038905758,
+  "p99_tpot_ms": 49.53471387203583,
+  "mean_itl_ms": 49.35649619888712,
+  "median_itl_ms": 49.41383851110004,
+  "p99_itl_ms": 49.706531529081985,
   "runtime": {
     "gpu": "8x MI355X",
     "kv_dtype": "fp8_e4m3_with_per_row_f32_scale",
@@ -36,20 +36,33 @@
     "prefix_cache": false,
     "speculative_decode": false,
     "packed_prefill_route": false,
-    "mla_prefill_v2": false,
-    "moe_stage2_lean": false,
-    "device_dispatch": "443 ordered segments, 8 physical-XCD windows per segment",
+    "mla_prefill_v2": true,
+    "moe_stage2_lean": true,
+    "device_dispatch": "627 ordered segments, 8 physical-XCD windows per segment",
     "upload_slots": 1
   },
   "artifact_identity": {
-    "plowrt_sha256": "cdbdbab25ac7f709a169874237aee9d3db2fe0d017977d31c52148e8959c8bb4",
-    "packet_sha256": "80a86e5c7e58fc916767def6760bd5efc0b3a8f3d4a2caf8e3bea718f6746aba",
-    "build_manifest_sha256": "175f90120e4af656b23cde92c4051036a279ad8d97c191fe4f8364c3e6beecff",
+    "plowrt_sha256": "70e36a57f798d2a907625a17f136d99f939423ff777ee20bb41fff11701e9d05",
+    "packet_sha256": "a72c04b1d9353c368a44865858300a971a6b9199cb0178b1b353446a3d57ac8a",
+    "build_manifest_sha256": "597feb1375bd4f53f5a625ef482e9a1d0f0242b55a6a301df536dd61687efe4b",
     "tokenizer_sha256": "9ca6299a266299c546e81eb7745f630268eb3db536f9ed4671eb39deb07b2781",
     "packet_pairing_hash": "0x46078df8cb86a9a5",
     "toolchain": "rocm-7.14.0-nix",
     "tuned_tiles": "7650/7650 measured",
     "lean_ordering_verified": true,
     "lean_oracle_ran": true
+  },
+  "component_controls": {
+    "bf16_kv_49_segments": {
+      "median_ttft_ms": 2931.36,
+      "mean_tpot_ms": 55.40,
+      "output_throughput": 17.18
+    },
+    "fp8_kv_49_segments": {
+      "median_ttft_ms": 2966.55,
+      "mean_tpot_ms": 49.61,
+      "output_throughput": 19.1
+    },
+    "interpretation": "FP8 KV improves decode about 10.5% but not TTFT; shuffled MXFP4 stage2 improves the FP8 TTFT about 25.7% and leaves decode essentially unchanged"
   }
 }

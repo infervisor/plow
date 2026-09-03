@@ -208,6 +208,7 @@ const HSA_SIGNAL_CONDITION_LT: u32 = 2;
 // hsa_wait_state_t — BLOCKED=0, ACTIVE=1. This was 1, i.e. the opposite of its
 // name: every wait busy-spun a core instead of yielding it.
 const HSA_WAIT_STATE_BLOCKED: u32 = 0;
+const HSA_WAIT_STATE_ACTIVE: u32 = 1;
 
 // hsa_profile_t
 const HSA_PROFILE_FULL: u32 = 1;
@@ -2494,32 +2495,31 @@ impl HsaBackend {
         Ok(HsaStream)
     }
 
-    /// Drain the queue. Every packet carries the barrier bit, so waiting for
-    /// the read index to catch the write index retires everything enqueued.
+    /// Drain the queue through the dispatch completion signal. The barrier bit
+    /// orders packets but the AQL read index does not prove kernel completion.
     pub fn stream_synchronize(&self, _stream: &HsaStream) -> Result<()> {
         self.synchronize()
     }
 
     /// Drain the queue (device-wide; there is one queue).
     pub fn synchronize(&self) -> Result<()> {
-        // A poisoned queue never advances its read index — without this gate
-        // the spin below would hang forever instead of erroring.
+        // The AQL read index only says that the packet processor consumed the
+        // dispatch packet. It can reach the write index while the kernel is
+        // still running, which is not a drain and breaks the TP all-rank
+        // barrier between raw-kernel segments. Every dispatch increments this
+        // counting signal before publication and the device decrements it on
+        // completion, so zero is the exact queue-tail completion condition.
         self.guard()?;
-        let q = self.queue;
-        // The write index is the total number of packets ever enqueued; the
-        // read index is how many the packet processor has retired. Equality
-        // means the queue is drained. This spins rather than blocking on a
-        // signal because the engine calls it once per step, after work it just
-        // enqueued, so the expected wait is short and a signal round-trip
-        // would cost more than the spin.
-        loop {
-            let w = unsafe { (self.shared.drv.hsa_queue_add_write_index_screlease)(q, 0) };
-            let r = unsafe { (self.shared.drv.hsa_queue_load_read_index_scacquire)(q) };
-            if r >= w {
-                return Ok(());
-            }
-            std::hint::spin_loop();
+        unsafe {
+            (self.shared.drv.hsa_signal_wait_scacquire)(
+                self.done_signal,
+                HSA_SIGNAL_CONDITION_LT,
+                1,
+                u64::MAX,
+                HSA_WAIT_STATE_ACTIVE,
+            );
         }
+        self.guard()
     }
 
     /// Create an event. `timing` selects whether the event carries a clock.

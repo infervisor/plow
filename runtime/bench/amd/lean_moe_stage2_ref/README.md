@@ -41,6 +41,9 @@ and the runtime expert-table/align-metadata ABI. The gate rejects any manifest
 outside that contract before loading the object. On ROCm 7.14 the production
 BM64 alignment shape passes the exact focused oracle and measures about 0.26 ms
 including output zero at T1024/H3584/I384/E896/top16.
+Pass `--timing-tokens 8192` directly to `gate.py` to retain the manifest and
+oracle contract while timing the production long-context row count. The exact
+8192-token boundary measures about 0.98 ms including output zero on MI355X.
 
 `PLOW_MOE_STAGE2_LEAN=1` at packet emission isolates only structurally compatible
 MXFP4 `MoeGroupDownPf`→`MoeCombinePf` boundaries. `plowrt` routes those segments
