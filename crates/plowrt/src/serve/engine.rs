@@ -32,6 +32,24 @@ pub enum ServeEngine {
 }
 
 impl ServeEngine {
+    #[cfg(feature = "hsa")]
+    pub fn amd_overlap_capability(&self) -> Option<crate::exec::amd::AmdOverlapCapability> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => None,
+            ServeEngine::Amd(e) => Some(e.overlap_capability()),
+        }
+    }
+
+    #[cfg(feature = "hsa")]
+    pub fn amd_overlap_evidence(&self) -> Option<Vec<crate::exec::amd::AmdOverlapRankEvidence>> {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => None,
+            ServeEngine::Amd(e) => Some(e.overlap_evidence()),
+        }
+    }
+
     pub fn begin_diagnostics(&mut self) {
         match self {
             #[cfg(feature = "cuda")]
@@ -121,7 +139,9 @@ mod amd_serve {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use crate::exec::amd::AmdEngine;
+    use crate::exec::amd::{
+        derive_overlap_capability, AmdEngine, AmdOverlapCapability, AmdOverlapRankEvidence,
+    };
     use crate::exec::amd_tp::AmdTpGroup;
     use crate::{Result, RuntimeError};
     use packet::dev::PrefillSpan;
@@ -151,6 +171,15 @@ mod amd_serve {
     }
 
     impl Ranks {
+        fn overlap_evidence(&self) -> Vec<AmdOverlapRankEvidence> {
+            match self {
+                Ranks::One(e) => vec![e.overlap_evidence(0)],
+                Ranks::Tp(g) => (0..g.n_gpu())
+                    .map(|rank| g.rank(rank).overlap_evidence(rank))
+                    .collect(),
+            }
+        }
+
         fn rank0(&self) -> &AmdEngine {
             match self {
                 Ranks::One(e) => e,
@@ -589,6 +618,7 @@ mod amd_serve {
         }
 
         pub fn begin_diagnostics(&mut self) {
+            let overlap_ranges = Some(self.overlap_evidence());
             let rank_agreement = match &self.ranks {
                 Ranks::One(_) => None,
                 Ranks::Tp(g) => Some(RankAgreement {
@@ -606,6 +636,7 @@ mod amd_serve {
                 prefill_selections: Vec::new(),
                 decode_selections: Vec::new(),
                 rank_agreement,
+                amd_overlap_ranges: overlap_ranges,
             });
         }
 
@@ -617,6 +648,14 @@ mod amd_serve {
 
         pub fn decode_rungs(&self) -> &[u32] {
             &self.decode_rungs
+        }
+
+        pub fn overlap_evidence(&self) -> Vec<AmdOverlapRankEvidence> {
+            self.ranks.overlap_evidence()
+        }
+
+        pub fn overlap_capability(&self) -> AmdOverlapCapability {
+            derive_overlap_capability(&self.overlap_evidence())
         }
 
         /// Sequence slots one decode dispatch advances. The mux sizes its slot

@@ -2459,6 +2459,16 @@ impl Drop for HsaEvent {
 }
 
 impl HsaBackend {
+    /// Stable identity of this backend's ordered AQL queue for process-local diagnostics.
+    pub fn queue_identity(&self) -> u64 {
+        self.queue as usize as u64
+    }
+
+    /// Number of independently orderable AQL queues owned by this backend.
+    pub fn queue_count(&self) -> usize {
+        1
+    }
+
     /// Executor (CU) count — the AMD counterpart of `sm_count`.
     pub fn sm_count(&self) -> u32 {
         self.cu_count

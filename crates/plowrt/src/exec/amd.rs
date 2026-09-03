@@ -127,6 +127,7 @@ use std::time::Instant;
 
 use packet::dev::{DevInst64, DevOp, DevProgram, PrefillSpan, PREFILL_SPAN_RESET_STATE};
 use packet::devbuild::static_seg_ofs;
+use serde::Serialize;
 
 use crate::asset::devblob::{DevBlob, DevProg};
 use crate::device::hsa::{HsaBackend, HsaKernel, HsaPinned};
@@ -182,6 +183,71 @@ const WG_THREADS_8: u32 = 8 * 64;
 /// The flash object is built 4-wave. Dispatching it at 512 threads is an
 /// `INVALID_ISA`, not a slowdown.
 const WG_THREADS_4: u32 = 4 * 64;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AmdOwnedRange {
+    pub name: String,
+    pub address_space: &'static str,
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AmdOverlapRankEvidence {
+    pub rank: usize,
+    pub queue_count: usize,
+    pub prefill_ranges: Vec<AmdOwnedRange>,
+    pub decode_ranges: Vec<AmdOwnedRange>,
+    pub prefill_queue_ids: Vec<u64>,
+    pub decode_queue_ids: Vec<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AmdOverlapCapability {
+    pub scratch_isolated: bool,
+    pub queue_isolated: bool,
+    pub overlap_safe: bool,
+    pub queue_scope: &'static str,
+    pub queue_count: usize,
+    pub per_xcd_queues: bool,
+    pub ranks: usize,
+}
+
+fn ranges_overlap(a: &AmdOwnedRange, b: &AmdOwnedRange) -> bool {
+    a.address_space == b.address_space && a.start < b.end && b.start < a.end
+}
+
+pub fn derive_overlap_capability(ranks: &[AmdOverlapRankEvidence]) -> AmdOverlapCapability {
+    let scratch_isolated = !ranks.is_empty()
+        && ranks.iter().all(|rank| {
+            !rank.prefill_ranges.is_empty()
+                && !rank.decode_ranges.is_empty()
+                && !rank
+                    .prefill_ranges
+                    .iter()
+                    .any(|a| rank.decode_ranges.iter().any(|b| ranges_overlap(a, b)))
+        });
+    let queue_isolated = !ranks.is_empty()
+        && ranks.iter().all(|rank| {
+            rank.queue_count >= 2
+                && !rank.prefill_queue_ids.is_empty()
+                && !rank.decode_queue_ids.is_empty()
+                && !rank
+                    .prefill_queue_ids
+                    .iter()
+                    .any(|id| rank.decode_queue_ids.contains(id))
+        });
+    let queue_count = ranks.iter().map(|rank| rank.queue_count).min().unwrap_or(0);
+    AmdOverlapCapability {
+        scratch_isolated,
+        queue_isolated,
+        overlap_safe: scratch_isolated && queue_isolated,
+        queue_scope: "global_per_rank",
+        queue_count,
+        per_xcd_queues: false,
+        ranks: ranks.len(),
+    }
+}
 
 /// Host dispatch semantics for a program whose stream carries `seg` tags.
 ///
@@ -3906,6 +3972,51 @@ pub struct AmdEngine {
 }
 
 impl AmdEngine {
+    pub fn overlap_evidence(&self, rank: usize) -> AmdOverlapRankEvidence {
+        let range = |name: String, address_space, start, len: u64| AmdOwnedRange {
+            name,
+            address_space,
+            start,
+            end: start.checked_add(len).unwrap_or(u64::MAX),
+        };
+        let mut ranges = Vec::with_capacity(self.devp.len() + 3);
+        ranges.push(range(
+            "d_tens".into(),
+            "device",
+            self.d_tens.base,
+            self.d_tens.len,
+        ));
+        ranges.extend(
+            self.tensor_names
+                .iter()
+                .zip(&self.devp)
+                .filter(|(name, _)| !packet::names::is_checkpoint_weight(name))
+                .map(|(name, mem)| range(format!("devp:{name}"), "device", mem.base, mem.len)),
+        );
+        ranges.push(range(
+            "h_scalar".into(),
+            "host_pinned",
+            self.h_scalar.as_ptr() as usize as u64,
+            self.h_scalar.len() as u64,
+        ));
+        if let Some(mem) = &self.d_trace {
+            ranges.push(range("d_trace".into(), "device", mem.base, mem.len));
+        }
+        let queue_ids = if self.be.queue_count() == 0 {
+            Vec::new()
+        } else {
+            vec![self.be.queue_identity()]
+        };
+        AmdOverlapRankEvidence {
+            rank,
+            queue_count: self.be.queue_count(),
+            prefill_ranges: ranges.clone(),
+            decode_ranges: ranges,
+            prefill_queue_ids: queue_ids.clone(),
+            decode_queue_ids: queue_ids,
+        }
+    }
+
     /// Bring the engine up from a compiled blob and a directory of gfx950 code
     /// objects.
     ///
@@ -7775,6 +7886,62 @@ fn kernarg_bytes(p: &DevProgram) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn overlap_range(name: &str, start: u64, end: u64) -> AmdOwnedRange {
+        AmdOwnedRange {
+            name: name.into(),
+            address_space: "device",
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn overlap_capability_fails_closed_for_shared_or_missing_evidence() {
+        let shared = overlap_range("shared", 0x1000, 0x2000);
+        let evidence = [AmdOverlapRankEvidence {
+            rank: 0,
+            queue_count: 1,
+            prefill_ranges: vec![shared.clone()],
+            decode_ranges: vec![shared],
+            prefill_queue_ids: vec![7],
+            decode_queue_ids: vec![7],
+        }];
+        assert_eq!(
+            derive_overlap_capability(&evidence),
+            AmdOverlapCapability {
+                scratch_isolated: false,
+                queue_isolated: false,
+                overlap_safe: false,
+                queue_scope: "global_per_rank",
+                queue_count: 1,
+                per_xcd_queues: false,
+                ranks: 1,
+            }
+        );
+        let missing = derive_overlap_capability(&[]);
+        assert!(!missing.scratch_isolated);
+        assert!(!missing.queue_isolated);
+        assert!(!missing.overlap_safe);
+        assert_eq!(missing.queue_count, 0);
+    }
+
+    #[test]
+    fn overlap_capability_requires_both_disjoint_intervals_and_queues() {
+        let evidence = [AmdOverlapRankEvidence {
+            rank: 0,
+            queue_count: 2,
+            prefill_ranges: vec![overlap_range("prefill", 0x1000, 0x2000)],
+            decode_ranges: vec![overlap_range("decode", 0x2000, 0x3000)],
+            prefill_queue_ids: vec![7],
+            decode_queue_ids: vec![8],
+        }];
+        let capability = derive_overlap_capability(&evidence);
+        assert!(capability.scratch_isolated);
+        assert!(capability.queue_isolated);
+        assert!(capability.overlap_safe);
+        assert_eq!(capability.queue_count, 2);
+    }
 
     fn packed_spans() -> [PrefillSpan; 2] {
         [

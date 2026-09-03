@@ -124,6 +124,9 @@ pub struct EngineDiagnostics {
     pub prefill_selections: Vec<PrefillSelection>,
     pub decode_selections: Vec<DecodeSelection>,
     pub rank_agreement: Option<RankAgreement>,
+    #[cfg(feature = "hsa")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amd_overlap_ranges: Option<Vec<crate::exec::amd::AmdOverlapRankEvidence>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -162,6 +165,8 @@ impl EngineDiagnostics {
             prefill_selections: Vec::new(),
             decode_selections: Vec::new(),
             rank_agreement: None,
+            #[cfg(feature = "hsa")]
+            amd_overlap_ranges: None,
         }
     }
 
@@ -308,6 +313,8 @@ pub struct InputReport {
 pub struct EngineReport {
     pub batch_capacity: usize,
     pub decode_rungs: Box<[u32]>,
+    #[cfg(feature = "hsa")]
+    pub amd_overlap: Option<crate::exec::amd::AmdOverlapCapability>,
 }
 
 #[derive(Debug, Serialize)]
@@ -461,6 +468,8 @@ pub async fn run_prefill_sweep(
         Some(EngineReport {
             batch_capacity: engine.batch(),
             decode_rungs: engine.decode_rungs(),
+            #[cfg(feature = "hsa")]
+            amd_overlap: engine.amd_overlap_capability(),
         })
     };
     #[cfg(not(any(feature = "cuda", feature = "hsa")))]
@@ -582,6 +591,8 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
         Some(EngineReport {
             batch_capacity: engine.batch(),
             decode_rungs: engine.decode_rungs(),
+            #[cfg(feature = "hsa")]
+            amd_overlap: engine.amd_overlap_capability(),
         })
     };
     #[cfg(not(any(feature = "cuda", feature = "hsa")))]
@@ -1249,6 +1260,28 @@ fn prompt_checksum(input: &Input, vocab: usize, requests: std::ops::Range<usize>
 mod tests {
     use super::*;
 
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn engine_report_always_serializes_amd_overlap_capability() {
+        let report = EngineReport {
+            batch_capacity: 1,
+            decode_rungs: vec![1].into_boxed_slice(),
+            amd_overlap: Some(crate::exec::amd::AmdOverlapCapability {
+                scratch_isolated: false,
+                queue_isolated: false,
+                overlap_safe: false,
+                queue_scope: "global_per_rank",
+                queue_count: 1,
+                per_xcd_queues: false,
+                ranks: 1,
+            }),
+        };
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["amd_overlap"]["overlap_safe"], false);
+        assert_eq!(json["amd_overlap"]["queue_scope"], "global_per_rank");
+        assert_eq!(json["amd_overlap"]["queue_count"], 1);
+    }
+
     fn request_result(request: usize, cached_tokens: usize) -> RequestResult {
         RequestResult {
             request,
@@ -1402,6 +1435,8 @@ mod tests {
             prefill_selections: Vec::new(),
             decode_selections: Vec::new(),
             rank_agreement: None,
+            #[cfg(feature = "hsa")]
+            amd_overlap_ranges: None,
         };
         let a = PrefillSelection {
             slot: 2,
