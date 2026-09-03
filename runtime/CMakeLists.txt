@@ -1341,6 +1341,22 @@ if(PLOW_GFX950_HSACO)
         add_custom_target(mla_materialized_hd192_v128_gfx950
                           DEPENDS "${_hs_mla_materialized_out}")
         list(APPEND _hs_outs "${_hs_mla_materialized_out}")
+
+        set(_hs_mla_pack_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/mla_materialize_pack.hip")
+        set(_hs_mla_pack_out "${PLOW_HSACO_DIR}/mla_materialize_pack_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_mla_pack_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_mla_pack_out}"
+                    plow_mla_materialize_pack_gfx950 64 4
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_mla_materialize_pack_abi_1
+                    "${_hs_mla_pack_src}"
+            DEPENDS "${_hs_mla_pack_src}" "${_hs_run}"
+            COMMENT "hipcc mla_materialize_pack_gfx950.elf"
+            VERBATIM)
+        add_custom_target(mla_materialize_pack_gfx950 DEPENDS "${_hs_mla_pack_out}")
+        add_dependencies(mla_materialized_hd192_v128_gfx950 mla_materialize_pack_gfx950)
+        list(APPEND _hs_outs "${_hs_mla_pack_out}")
     endif()
 
     # Golden __device__ wrappers. They call the SAME op_*.h bodies the

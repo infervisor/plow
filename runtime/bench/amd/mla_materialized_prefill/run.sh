@@ -48,7 +48,37 @@ for name in k_absorbed k_absorbed_fold k_materialized k_materialized_lds; do
     fi
 done
 
+for name in k_materialize_q k_materialize_kv k_absorb_q k_absorb_qrope; do
+    vgpr=$(resource "$OUT/resources" "$name" VGPRs)
+    sgpr=$(resource "$OUT/resources" "$name" TotalSGPRs)
+    scratch=$(resource "$OUT/resources" "$name" 'ScratchSize [bytes/lane]')
+    vspill=$(resource "$OUT/resources" "$name" 'VGPRs Spill')
+    sspill=$(resource "$OUT/resources" "$name" 'SGPRs Spill')
+    occ=$(resource "$OUT/resources" "$name" 'Occupancy [waves/SIMD]')
+    lds=$(resource "$OUT/resources" "$name" 'LDS Size [bytes/block]')
+    test -n "$vgpr" -a -n "$sgpr" -a -n "$scratch" -a -n "$vspill" -a \
+        -n "$sspill" -a -n "$occ" -a -n "$lds"
+    printf '%-18s VGPR=%s SGPR=%s occ=%s scratch=%s spills=%s/%s LDS=%s (oracle only)\n' \
+        "$name" "$vgpr" "$sgpr" "$occ" "$scratch" "$vspill" "$sspill" "$lds"
+done
+
+bash "$ROOT/runtime/cmake/hipcc_hsaco.sh" "$HIPCC" \
+    "$ROCM_ROOT/lib/llvm/bin/clang-offload-bundler" gfx950 \
+    "$OUT/pack.elf" plow_mla_materialize_pack_gfx950 64 4 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_mla_materialize_pack_abi_1 \
+    "$ROOT/runtime/amd/mla_materialize_pack.hip"
+
+bash "$ROOT/runtime/cmake/hipcc_hsaco.sh" "$HIPCC" \
+    "$ROCM_ROOT/lib/llvm/bin/clang-offload-bundler" gfx950 \
+    "$OUT/upstream-grid.elf" oracle_mla_materialized_upstream_grid 256 2 \
+    -std=c++20 -I"$ROOT/runtime/amd/third_party/aiter_opus" \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_mla_materialized_upstream_grid_oracle_1 \
+    "$ROOT/runtime/bench/amd/mla_materialized_prefill/opus_upstream_grid.hip"
+
 "$HIPCC" -O2 -w "$ROOT/runtime/bench/amd/mla_materialized_prefill/bench.cpp" \
     -o "$OUT/bench" -lamdhip64
 "$ROOT/perf-data/tools/gpulease" -n 1 mla-materialized-prefill \
-    "$OUT/bench" "$OUT/kernel.co" "$OUT/opus.elf" "${SAMPLES:-9}"
+    "$OUT/bench" "$OUT/kernel.co" "$OUT/opus.elf" "$OUT/pack.elf" \
+    "$OUT/upstream-grid.elf" "${SAMPLES:-9}"

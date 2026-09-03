@@ -4,9 +4,10 @@ This harness compares Plow's absorbed attention plus fold, its first rectangular
 materialized kernel, and the generic gfx950 `D_QK=192`, `D_V=128` Opus schedule.
 
 The measured schedule is vendored as a standalone runtime object under
-`runtime/amd/third_party/aiter_opus`. It is unchanged from AITER upstream commit
+`runtime/amd/third_party/aiter_opus`. It is based on AITER upstream commit
 `10b192f5b5bda90f2af33ceae7a6c2f416bfc674` and retains the MIT license. The
-runtime object has no build-time or run-time AITER dependency.
+runtime object has no build-time or run-time AITER dependency. A guarded Plow
+adaptation decodes the original 3D batch grid from plowrt's flat 1D launch.
 
 The useful schedule is selected by dimensions and architecture, not a model name:
 
@@ -24,6 +25,9 @@ nix develop -c env SAMPLES=31 \
   runtime/bench/amd/mla_materialized_prefill/run.sh /tmp/plow-mla-opus-gate
 ```
 
-The script rejects spilling objects through explicit compiler-resource checks. The
-candidate is compiled as wave64 by the gfx950 target and must also remain
-within max absolute error `0.02` and RMSE `0.003` against the absorbed form.
+The script rejects spilling standalone objects through explicit compiler-resource
+checks. It compares the flat object byte-for-byte with a 3D-grid oracle for every
+head, including a ragged 1025-token launch. Exact 256-token multiples must also
+remain within max absolute error `0.02` and RMSE `0.003` against the absorbed form.
+The full-path timing includes both sides' query projection GEMMs; the materialized
+side additionally includes KV projection and packing.

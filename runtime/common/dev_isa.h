@@ -1042,6 +1042,8 @@ enum {
      * i0=rows i1=H i2=D i3=BV i4=W i5=flags i6=gate_mode i7=descriptor_version;
      * f0=scale f1=lower_bound j1=norm_eps_bits. */
     PLOW_DOP_KDA_DECODE_FUSED = 125,
+    PLOW_DOP_MLA_MATERIALIZE_PACK = 126,
+    PLOW_DOP_FLASH_MLA_MATERIALIZED_PREFILL = 127,
 
     PLOW_DOP__COUNT
 };

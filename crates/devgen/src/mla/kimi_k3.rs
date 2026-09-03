@@ -948,12 +948,20 @@ pub(crate) fn k3_emit_full(
         );
         first..end
     });
+    let indirect: Vec<&str> = K3_INDIRECT
+        .iter()
+        .copied()
+        .filter(|name| {
+            !emit_config::active().mla_materialized_prefill
+                || !matches!(*name, "q_b_proj.weight" | "kv_b_proj.weight")
+        })
+        .collect();
     match crate::checkpoint::validate_coverage(
         dir,
         K3_PREFIX,
         &m.tensors.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
         covered_layers,
-        K3_INDIRECT,
+        &indirect,
         K3_PAIRED,
         K3_SYNTHESIZED,
     ) {
@@ -1153,6 +1161,7 @@ fn k3_build_model(
             heads: c.heads,
             q_lora: c.q_lora,
             kv_lora: c.kv_lora,
+            qk_nope: c.qk_nope,
             qk_rope: c.qk_rope,
             v_head: c.v_head,
             eps: c.eps,

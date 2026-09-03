@@ -8,5 +8,8 @@ standalone gfx950 bf16 materialized-attention object.
 - License: MIT (`LICENSE`)
 - Selection: `D_QK=192`, `D_V=128`, gfx950, wave64; no model-name gate
 
-The three source files are copied unchanged. Plow's entry point and ABI markers
-live separately in `runtime/amd/mla_materialized_opus.hip`.
+The selected sources retain the upstream implementation. Plow enables one
+guarded integration adaptation: batch-mode workgroups are decoded from a flat
+1D grid because plowrt's device API is 1D. The arithmetic preserves upstream's
+q-block-fastest `(q-block, head, batch)` ordering. Plow's entry point and ABI
+markers live separately in `runtime/amd/mla_materialized_opus.hip`.

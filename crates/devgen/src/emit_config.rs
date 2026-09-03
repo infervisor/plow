@@ -361,6 +361,11 @@ pub struct EmitConfig {
     #[arg(long = "emit-kda-decode-fused", env = "PLOW_KDA_DECODE_FUSED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_decode_fused: bool,
 
+    /// Materialize MLA Q/K/V and emit the standalone asymmetric gfx950 prefill boundary.
+    /// Default off until the full-network cost gate clears.
+    #[arg(long, env = "PLOW_MLA_MATERIALIZED_PREFILL", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub mla_materialized_prefill: bool,
+
     /// Emit the model-independent BT64 chunk-KDA prefill pipeline. Defaults on for gfx950;
     /// unsupported shapes retain the serial recurrence. Set false to force the serial oracle.
     #[arg(long, env = "PLOW_KDA_CHUNK", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -707,6 +712,7 @@ impl EmitConfig {
             k3_fuse_ngemv: env_str("PLOW_K3_FUSE_NGEMV"),
             k3_kda_conv_step_db: env_bool("PLOW_K3_KDA_CONV_STEP_DB"),
             kda_decode_fused: env_bool("PLOW_KDA_DECODE_FUSED"),
+            mla_materialized_prefill: env_bool("PLOW_MLA_MATERIALIZED_PREFILL"),
             kda_chunk: env_bool_opt("PLOW_KDA_CHUNK"),
             kda_chunk_qpre: env_opt_out("PLOW_KDA_CHUNK_QPRE"),
             kda_intra_cached: env_bool("PLOW_KDA_INTRA_CACHED"),

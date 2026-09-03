@@ -586,6 +586,62 @@ struct MoeCombineArgs {
 const _: () = assert!(std::mem::size_of::<MoeCombineArgs>() == 48);
 
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MlaMaterializePackArgs {
+    k: u64,
+    v: u64,
+    kv: u64,
+    k_rope: u64,
+    t: u32,
+    heads: u32,
+    qk_nope: u32,
+    qk_rope: u32,
+    v_head: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MlaMaterializePackArgs>() == 56);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MlaMaterializedPrefillArgs {
+    q: u64,
+    k: u64,
+    v: u64,
+    o: u64,
+    b: i32,
+    n: i32,
+    n_kv: i32,
+    h: i32,
+    h_kv: i32,
+    d_qk: i32,
+    d_v: i32,
+    stride_q_b: i32,
+    stride_q_n: i32,
+    stride_q_h: i32,
+    stride_o_b: i32,
+    stride_o_n: i32,
+    stride_o_h: i32,
+    stride_k_b: i32,
+    stride_k_n: i32,
+    stride_k_h: i32,
+    stride_v_b: i32,
+    stride_v_n: i32,
+    stride_v_h: i32,
+    softmax_scale: f32,
+    seqstart_q: u64,
+    seqstart_k: u64,
+    seqstart_q_pad: u64,
+    seqstart_k_pad: u64,
+    opt: i32,
+    _pad: u32,
+    lse: u64,
+    stride_lse_b: i32,
+    stride_lse_h: i32,
+}
+
+const _: () = assert!(std::mem::size_of::<MlaMaterializedPrefillArgs>() == 168);
+
+#[derive(Clone, Copy, Debug)]
 struct MoeStage1Mxfp4Route {
     args: MoeStage1Mxfp4Args,
     grid: u32,
@@ -618,6 +674,211 @@ enum PrefillSegmentRoute {
     MoeStage1Mxfp4(MoeStage1Mxfp4Route),
     MoeStage2Mxfp4(MoeStage2Mxfp4Route),
     MoeCombine(MoeCombineRoute),
+    MlaMaterializePack {
+        args: MlaMaterializePackArgs,
+        grid: u32,
+    },
+    MlaMaterializedPrefill {
+        args: MlaMaterializedPrefillArgs,
+        grid: u32,
+    },
+}
+
+const MLA_MATERIALIZED_Q_BLOCK: u32 = 256;
+
+fn mla_materialized_flat_grid(n: u32, heads: u32, batches: u32) -> Result<u32> {
+    if n == 0 || heads == 0 || batches == 0 {
+        return Err(RuntimeError::Device(
+            "materialized MLA grid dimensions must be nonzero".into(),
+        ));
+    }
+    n.div_ceil(MLA_MATERIALIZED_Q_BLOCK)
+        .checked_mul(heads)
+        .and_then(|v| v.checked_mul(batches))
+        .ok_or_else(|| RuntimeError::Device("materialized MLA grid overflows".into()))
+}
+
+fn mla_materialized_routes(
+    prog: &DevProg,
+    devp: &[DeviceMem],
+    routes: &mut [PrefillSegmentRoute],
+) -> Result<()> {
+    let mut members = vec![std::collections::BTreeSet::new(); routes.len()];
+    let mut raw_segment_owner = vec![None; prog.insts.len()];
+    for entry in &prog.stream {
+        let seg = entry.seg as usize;
+        let inst_ix = entry.inst as usize;
+        let inst = prog.insts.get(inst_ix).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "materialized MLA stream references instruction {inst_ix} of {}",
+                prog.insts.len()
+            ))
+        })?;
+        let set = members.get_mut(seg).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "materialized MLA stream references segment {seg} of {}",
+                routes.len()
+            ))
+        })?;
+        set.insert(inst_ix);
+        if matches!(
+            DevOp::from_u16(inst.op),
+            Some(DevOp::MlaMaterializePack | DevOp::FlashMlaMaterializedPrefill)
+        ) {
+            match raw_segment_owner[inst_ix] {
+                Some(owner) if owner != seg => {
+                    return Err(RuntimeError::Device(format!(
+                        "materialized MLA raw instruction {inst_ix} is referenced by segments {owner} and {seg}"
+                    )))
+                }
+                None => raw_segment_owner[inst_ix] = Some(seg),
+                _ => {}
+            }
+            if entry.wait_len != 0 || entry.succ_len != 0 || entry.flags & SE_XCTR != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "materialized MLA raw instruction {inst_ix} has interpreter counter obligations in segment {seg}"
+                )));
+            }
+        }
+    }
+    let addr = |h: u16, what: &str| -> Result<u64> {
+        if h == packet::dev::TENSOR_NONE16 {
+            return Err(RuntimeError::Device(format!(
+                "materialized MLA operand `{what}` is absent"
+            )));
+        }
+        devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "materialized MLA operand `{what}` handle {h} is outside {} tensors",
+                devp.len()
+            ))
+        })
+    };
+    for (seg, set) in members.into_iter().enumerate() {
+        let raw = set.iter().any(|&i| {
+            matches!(
+                DevOp::from_u16(prog.insts[i].op),
+                Some(DevOp::MlaMaterializePack | DevOp::FlashMlaMaterializedPrefill)
+            )
+        });
+        if !raw {
+            continue;
+        }
+        if set.len() != 1 {
+            return Err(RuntimeError::Device(format!(
+                "materialized MLA segment {seg} mixes a standalone opcode with interpreter work"
+            )));
+        }
+        let d = &prog.insts[*set.first().unwrap()];
+        if d.op == DevOp::MlaMaterializePack as u16 {
+            if d.i[..5] != [prog.t, d.i[1], 128, 64, 128]
+                || d.i[1] == 0
+                || d.blocks == 0
+                || d.i[5..].iter().any(|&v| v != 0)
+                || d.fj.iter().any(|&v| v != 0)
+            {
+                return Err(RuntimeError::Device(format!(
+                    "materialized MLA pack segment {seg} has unsupported geometry"
+                )));
+            }
+            routes[seg] = PrefillSegmentRoute::MlaMaterializePack {
+                args: MlaMaterializePackArgs {
+                    k: addr(d.t[0], "K")?,
+                    v: addr(d.t[1], "V")?,
+                    kv: addr(d.t[2], "KV")?,
+                    k_rope: addr(d.t[3], "K_rope")?,
+                    t: d.i[0],
+                    heads: d.i[1],
+                    qk_nope: d.i[2],
+                    qk_rope: d.i[3],
+                    v_head: d.i[4],
+                },
+                grid: u32::from(d.blocks),
+            };
+        } else if d.op == DevOp::FlashMlaMaterializedPrefill as u16 {
+            let (n, h, h_kv, d_qk, d_v, abi) = (d.i[0], d.i[1], d.i[2], d.i[3], d.i[4], d.i[5]);
+            let scale = f32::from_bits(d.fj[0]);
+            if n != prog.t
+                || h == 0
+                || h_kv != h
+                || d_qk != 192
+                || d_v != 128
+                || abi != 1
+                || d.i[6..].iter().any(|&v| v != 0)
+                || !scale.is_finite()
+                || scale <= 0.0
+            {
+                return Err(RuntimeError::Device(format!(
+                    "materialized MLA prefill segment {seg} has unsupported capability: T={n} H={h} H_KV={h_kv} DQK={d_qk} DV={d_v} abi={abi}"
+                )));
+            }
+            let n = i32::try_from(n).map_err(|_| RuntimeError::Device("T exceeds i32".into()))?;
+            let h = i32::try_from(h).map_err(|_| RuntimeError::Device("H exceeds i32".into()))?;
+            let qn = h
+                .checked_mul(192)
+                .ok_or_else(|| RuntimeError::Device("Q stride overflows".into()))?;
+            let on = h
+                .checked_mul(128)
+                .ok_or_else(|| RuntimeError::Device("O stride overflows".into()))?;
+            let stride_q_b = n
+                .checked_mul(qn)
+                .ok_or_else(|| RuntimeError::Device("Q batch stride overflows".into()))?;
+            let stride_o_b = n
+                .checked_mul(on)
+                .ok_or_else(|| RuntimeError::Device("O batch stride overflows".into()))?;
+            let grid = mla_materialized_flat_grid(n.unsigned_abs(), h.unsigned_abs(), 1)?;
+            routes[seg] = PrefillSegmentRoute::MlaMaterializedPrefill {
+                args: MlaMaterializedPrefillArgs {
+                    q: addr(d.t[1], "Q")?,
+                    k: addr(d.t[2], "K")?,
+                    v: addr(d.t[3], "V")?,
+                    o: addr(d.t[0], "O")?,
+                    b: 1,
+                    n,
+                    n_kv: n,
+                    h,
+                    h_kv: h,
+                    d_qk: 192,
+                    d_v: 128,
+                    stride_q_b,
+                    stride_q_n: qn,
+                    stride_q_h: 192,
+                    stride_o_b,
+                    stride_o_n: on,
+                    stride_o_h: 128,
+                    stride_k_b: stride_q_b,
+                    stride_k_n: qn,
+                    stride_k_h: 192,
+                    stride_v_b: stride_o_b,
+                    stride_v_n: on,
+                    stride_v_h: 128,
+                    softmax_scale: scale,
+                    seqstart_q: 0,
+                    seqstart_k: 0,
+                    seqstart_q_pad: 0,
+                    seqstart_k_pad: 0,
+                    opt: 0,
+                    _pad: 0,
+                    lse: 0,
+                    stride_lse_b: 0,
+                    stride_lse_h: 0,
+                },
+                grid,
+            };
+        }
+    }
+    for (i, inst) in prog.insts.iter().enumerate() {
+        if matches!(
+            DevOp::from_u16(inst.op),
+            Some(DevOp::MlaMaterializePack | DevOp::FlashMlaMaterializedPrefill)
+        ) && raw_segment_owner[i].is_none()
+        {
+            return Err(RuntimeError::Device(format!(
+                "materialized MLA raw instruction {i} is absent from every stream segment"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn xreduce_attnres_encoded(d: &DevInst64) -> bool {
@@ -5171,6 +5432,8 @@ pub struct AmdEngine {
     k_moe_stage1_mxfp4: Option<HsaKernel>,
     k_moe_stage2_mxfp4: Option<HsaKernel>,
     k_moe_combine: Option<HsaKernel>,
+    k_mla_materialize_pack: Option<HsaKernel>,
+    k_mla_materialized_prefill: Option<HsaKernel>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
     k_token_capture: Option<HsaKernel>,
@@ -5785,6 +6048,17 @@ impl AmdEngine {
             .iter()
             .any(has_moe_stage1_mxfp4_segment);
         let need_moe_combine_lean = blob.progs[..dec_ix].iter().any(has_moe_combine_segment);
+        let need_mla_materialized = blob.progs[..dec_ix].iter().any(|p| {
+            p.insts.iter().any(|d| {
+                d.op == DevOp::MlaMaterializePack as u16
+                    || d.op == DevOp::FlashMlaMaterializedPrefill as u16
+            })
+        });
+        if need_mla_materialized && arch != "gfx950" {
+            return Err(RuntimeError::Device(format!(
+                "materialized MLA prefill requires gfx950, but this device is {arch}"
+            )));
+        }
         let need_xr_attnres = blob.progs[..dec_ix]
             .iter()
             .any(|p| p.insts.iter().any(xreduce_attnres_inst));
@@ -6631,6 +6905,74 @@ impl AmdEngine {
             None
         };
 
+        let mut load_mla_raw = |name: &str,
+                                symbol: &str,
+                                markers: &[&str],
+                                kernarg: u32,
+                                lds: u32|
+         -> Result<Option<HsaKernel>> {
+            if !need_mla_materialized {
+                return Ok(None);
+            }
+            let path = hsaco_dir.join(name);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "materialized MLA requires code object {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let syms = elf_symbol_names(&image);
+            for marker in markers {
+                if !syms.contains(marker) {
+                    return Err(RuntimeError::Device(format!(
+                        "materialized MLA object {} lacks required marker `{marker}`",
+                        path.display()
+                    )));
+                }
+            }
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let kernel = EngineDevice::get_function(&*be, &module, symbol)
+                .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {symbol}: {e}")))?;
+            let got = kernel.kernarg_size();
+            if got != kernarg && got != kernarg + 256 {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: kernarg segment is {got} B; expected {kernarg} (or {} with COv5 implicit args)",
+                    kernarg + 256
+                )));
+            }
+            let got_lds = HsaBackend::kernel_lds_bytes(&kernel);
+            if got_lds != lds || kernel.private_segment_size() != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: resource gate failed: LDS={got_lds} (required {lds}), private={} (required 0)",
+                    kernel.private_segment_size()
+                )));
+            }
+            modules.push(module);
+            Ok(Some(kernel))
+        };
+        let k_mla_materialize_pack = load_mla_raw(
+            "mla_materialize_pack_gfx950.elf",
+            "plow_mla_materialize_pack_gfx950",
+            &[
+                "plow_mla_materialize_pack_abi_1",
+                "plow_mla_materialize_pack_hd192_v128_1",
+                "plow_mla_materialize_pack_nospill_1",
+            ],
+            std::mem::size_of::<MlaMaterializePackArgs>() as u32,
+            0,
+        )?;
+        let k_mla_materialized_prefill = load_mla_raw(
+            "mla_materialized_hd192_v128_gfx950.elf",
+            "plow_mla_materialized_hd192_v128_gfx950",
+            &[
+                "plow_mla_materialized_opus_abi_1",
+                "plow_mla_materialized_hd192_v128_1",
+                "plow_mla_materialized_wave64_nospill_1",
+            ],
+            std::mem::size_of::<MlaMaterializedPrefillArgs>() as u32,
+            149_760,
+        )?;
+
         // --- tensors + weights ------------------------------------------------
         // Staging is one pinned slab, filled and pushed in `STAGE` chunks. The
         // source is an mmap of the checkpoint, and `upload` would pin it per
@@ -7153,6 +7495,27 @@ impl AmdEngine {
             } else {
                 vec![PrefillSegmentRoute::Interpreter; seg_class.len()]
             };
+            if prog_ix < dec_ix {
+                mla_materialized_routes(p, &devp, &mut prefill_routes)?;
+                let has_materialized = prefill_routes.iter().any(|r| {
+                    matches!(
+                        r,
+                        PrefillSegmentRoute::MlaMaterializePack { .. }
+                            | PrefillSegmentRoute::MlaMaterializedPrefill { .. }
+                    )
+                });
+                let dispatch = ProgramDispatch::classify(
+                    p.l2_domains,
+                    seg_class.len(),
+                    p.gq_seg_ofs.len().saturating_sub(1),
+                );
+                if has_materialized && !prefill_segment_specialization_allowed(dispatch) {
+                    return Err(RuntimeError::Device(format!(
+                        "prefill program {prog_ix} (T={}) places materialized MLA raw opcodes in L2-domain windows; standalone objects require ordered wave segments",
+                        p.t
+                    )));
+                }
+            }
             let packed_seg_family = derive_packed_segment_families(p)?;
             let raw_mla_v2_segment = derive_raw_mla_v2_segments(p)?;
             let packed_mla_segmented = packed_family_segments_cover(p, &packed_seg_family, &[5, 6]);
@@ -7670,6 +8033,8 @@ impl AmdEngine {
             k_moe_stage1_mxfp4,
             k_moe_stage2_mxfp4,
             k_moe_combine,
+            k_mla_materialize_pack,
+            k_mla_materialized_prefill,
             k_xaudit,
             k_state_clear,
             k_token_capture,
@@ -7819,6 +8184,18 @@ impl AmdEngine {
             )));
         }
         check_packed_prefill_abi(self.packed_prefill_prefill_abi, false, false)?;
+        if program.prefill_routes.iter().any(|r| {
+            matches!(
+                r,
+                PrefillSegmentRoute::MlaMaterializePack { .. }
+                    | PrefillSegmentRoute::MlaMaterializedPrefill { .. }
+            )
+        }) {
+            return Err(RuntimeError::Device(
+                "materialized MLA prefill currently supports one exact initial sequence, not packed spans"
+                    .into(),
+            ));
+        }
         if matches!(self.prog_dispatch(prog), ProgramDispatch::L2Domains(_)) {
             return Err(RuntimeError::Device(
                 "packed-prefill family routing requires independent ordered segments; this legacy \
@@ -8177,6 +8554,46 @@ impl AmdEngine {
         }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !active {
+            if let Some(PrefillSegmentRoute::MlaMaterializePack { args, grid }) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let kernel = self.k_mla_materialize_pack.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "materialized MLA pack segment has no validated object".into(),
+                    )
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let Some(PrefillSegmentRoute::MlaMaterializedPrefill { args, grid }) =
+                self.progs[p].prefill_routes.get(seg).copied()
+            {
+                let kernel = self.k_mla_materialized_prefill.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "materialized MLA prefill segment has no validated object".into(),
+                    )
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    512,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
             if let (Some(kernel), Some(PrefillSegmentRoute::KdaChunkIntraCached { args, grid })) = (
                 self.k_kda_chunk_intra_cached,
                 self.progs[p].prefill_routes.get(seg).copied(),
@@ -8890,6 +9307,19 @@ impl AmdEngine {
             self.kda_conv_alt_stale[self.kv_slot] = true;
         }
         let ch = self.progs[step.prog].t;
+        if self.progs[step.prog].prefill_routes.iter().any(|r| {
+            matches!(
+                r,
+                PrefillSegmentRoute::MlaMaterializePack { .. }
+                    | PrefillSegmentRoute::MlaMaterializedPrefill { .. }
+            )
+        }) && (step.c0 != 0 || step.clen != ch)
+        {
+            return Err(RuntimeError::Device(format!(
+                "materialized MLA prefill requires one exact initial bucket (c0=0, clen=T); got c0={}, clen={}, T={ch}",
+                step.c0, step.clen
+            )));
+        }
         // in.kvlen FIRST, so it can borrow the head of the staging slab before
         // ids/pos fill it — the slab is sized for exactly `ids + pos` at the
         // widest bucket and has no spare word past them.
@@ -9914,6 +10344,122 @@ fn kernarg_bytes(p: &DevProgram) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materialized_mla_flat_grid_covers_every_qblock_head_and_batch_once() {
+        for &(n, heads, batches) in &[
+            (1u32, 1u32, 1u32),
+            (256, 12, 1),
+            (257, 12, 1),
+            (1025, 12, 1),
+            (8192, 12, 1),
+            (1025, 12, 3),
+        ] {
+            let q_grid = n.div_ceil(MLA_MATERIALIZED_Q_BLOCK);
+            let grid = mla_materialized_flat_grid(n, heads, batches).unwrap();
+            let mut seen = vec![0u8; grid as usize];
+            for flat_id in 0..grid {
+                let q_block = flat_id % q_grid;
+                let rest = flat_id / q_grid;
+                let head = rest % heads;
+                let batch = rest / heads;
+                assert!(q_block < q_grid && head < heads && batch < batches);
+                let logical = ((batch * heads + head) * q_grid + q_block) as usize;
+                seen[logical] += 1;
+            }
+            assert!(seen.into_iter().all(|n| n == 1), "T={n}");
+        }
+    }
+
+    fn materialized_mla_route_probe(t: u32, heads: u32) -> (DevProg, Vec<DeviceMem>) {
+        let pack = DevInst64 {
+            op: DevOp::MlaMaterializePack as u16,
+            blocks: 64,
+            t: [0, 1, 2, 3, 0, 0, 0, 0],
+            i: [t, heads, 128, 64, 128, 0, 0, 0],
+            ..Default::default()
+        };
+        let attention = DevInst64 {
+            op: DevOp::FlashMlaMaterializedPrefill as u16,
+            blocks: 1,
+            t: [0, 1, 2, 3, 0, 0, 0, 0],
+            i: [t, heads, heads, 192, 128, 1, 0, 0],
+            fj: [0.07216878f32.to_bits(), 0, 0],
+            ..Default::default()
+        };
+        let stream = vec![
+            packet::dev::StreamEnt {
+                inst: 0,
+                seg: 0,
+                ..Default::default()
+            },
+            packet::dev::StreamEnt {
+                inst: 1,
+                seg: 1,
+                ..Default::default()
+            },
+        ];
+        let prog = DevProg {
+            t,
+            n_counter: 0,
+            insts: vec![pack, attention],
+            stream,
+            stream_ofs: vec![0],
+            stream_len: vec![2],
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        };
+        let devp = (0..4)
+            .map(|i| DeviceMem::view(0x1000 + i * 0x1000, 0x1000))
+            .collect();
+        (prog, devp)
+    }
+
+    #[test]
+    fn materialized_mla_raw_routes_use_exact_abi_and_flat_grid() {
+        let (prog, devp) = materialized_mla_route_probe(1025, 12);
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        mla_materialized_routes(&prog, &devp, &mut routes).unwrap();
+        assert!(matches!(
+            routes[0],
+            PrefillSegmentRoute::MlaMaterializePack { grid: 64, .. }
+        ));
+        let PrefillSegmentRoute::MlaMaterializedPrefill { args, grid } = routes[1] else {
+            panic!("attention did not take the standalone route")
+        };
+        assert_eq!(grid, 5 * 12);
+        assert_eq!((args.b, args.n, args.h, args.h_kv), (1, 1025, 12, 12));
+        assert_eq!((args.d_qk, args.d_v), (192, 128));
+        assert_eq!((args.stride_q_n, args.stride_k_n), (12 * 192, 12 * 192));
+        assert_eq!((args.stride_o_n, args.stride_v_n), (12 * 128, 12 * 128));
+    }
+
+    #[test]
+    fn materialized_mla_raw_route_rejects_mixed_or_counter_segments() {
+        let (mut prog, devp) = materialized_mla_route_probe(1025, 12);
+        prog.insts.push(DevInst64::default());
+        prog.stream.push(packet::dev::StreamEnt {
+            inst: 2,
+            seg: 0,
+            ..Default::default()
+        });
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        assert!(mla_materialized_routes(&prog, &devp, &mut routes)
+            .unwrap_err()
+            .to_string()
+            .contains("mixes"));
+
+        let (mut prog, devp) = materialized_mla_route_probe(1025, 12);
+        prog.stream[1].wait_len = 1;
+        let mut routes = vec![PrefillSegmentRoute::Interpreter; 2];
+        assert!(mla_materialized_routes(&prog, &devp, &mut routes)
+            .unwrap_err()
+            .to_string()
+            .contains("counter obligations"));
+    }
 
     #[test]
     fn specialised_amd_object_pairing_is_fail_closed() {

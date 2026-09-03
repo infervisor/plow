@@ -2,6 +2,7 @@
 
 #include "amd_common.h"
 #include "op_attention.h"
+#include "op_gemm.h"
 
 static constexpr unsigned DK_ABS = 512;
 static constexpr unsigned DR = 64;
@@ -245,6 +246,47 @@ extern "C" __global__ __launch_bounds__(256, 1) void k_materialized_lds(
     __shared__ bf16 lds[64 * (DK_MAT + FA_PAD) + 2 * 128 * (DK_MAT + FA_PAD)];
     d_materialized_lds_pipeline<DK_MAT, DV_MAT>(
         out, q, k, v, n_tok, n_head, kv_stride, scale, lds);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void k_materialize_q(
+    bf16* out, const bf16* q_lat, const bf16* weight, unsigned t, unsigned heads) {
+    __shared__ bf16 lds[GM_LDS_HALVES];
+    d_gemm(out, q_lat, weight, t, heads * DK_MAT, 1536, blockIdx.x, gridDim.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void k_materialize_kv(
+    bf16* out, const bf16* ckv, const bf16* weight, unsigned t, unsigned heads) {
+    __shared__ bf16 lds[GM_LDS_HALVES];
+    d_gemm(out, ckv, weight, t, heads * (DV_MAT * 2), DK_ABS, blockIdx.x, gridDim.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void k_absorb_q(
+    bf16* out, const bf16* q_lat, const bf16* weight, unsigned t, unsigned heads) {
+    __shared__ bf16 lds[GM_LDS_HALVES];
+    d_gemm(out, q_lat, weight, t, heads * DK_ABS, 1536, blockIdx.x, gridDim.x, lds);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void k_absorb_qrope(
+    bf16* out, const bf16* q_lat, const bf16* weight, unsigned t, unsigned heads) {
+    __shared__ bf16 lds[GM_LDS_HALVES];
+    d_gemm(out, q_lat, weight, t, heads * DR, 1536, blockIdx.x, gridDim.x, lds);
+}
+
+extern "C" __global__ void k_init_materialize(
+    bf16* q_lat, bf16* q_weight, bf16* kv_weight, bf16* q_abs_weight,
+    bf16* q_rope_weight, unsigned n_tok, unsigned n_head) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    const size_t qn = (size_t)n_tok * 1536;
+    const size_t qw = (size_t)n_head * DK_MAT * 1536;
+    const size_t kw = (size_t)n_head * (DV_MAT * 2) * DK_ABS;
+    const size_t aw = (size_t)n_head * DK_ABS * 1536;
+    const size_t rw = (size_t)n_head * DR * 1536;
+    for (size_t e = i; e < qn; e += stride) q_lat[e] = (bf16)((int)(e % 17) - 8) / 64.0f;
+    for (size_t e = i; e < qw; e += stride) q_weight[e] = (bf16)((int)(e % 13) - 6) / 128.0f;
+    for (size_t e = i; e < kw; e += stride) kv_weight[e] = (bf16)((int)(e % 11) - 5) / 128.0f;
+    for (size_t e = i; e < aw; e += stride) q_abs_weight[e] = (bf16)((int)(e % 19) - 9) / 128.0f;
+    for (size_t e = i; e < rw; e += stride) q_rope_weight[e] = (bf16)((int)(e % 23) - 11) / 128.0f;
 }
 
 extern "C" __global__ void k_make_inputs(

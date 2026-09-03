@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 
 #include "third_party/aiter_opus/fmha_fwd_hd192_v128_bf16_opus_defs.h"
+#define PLOW_OPUS_FLAT_BATCH_GRID 1
 #include "third_party/aiter_opus/fmha_fwd_hd192_v128_bf16_opus_kernel.hpp"
 
 using PlowMlaMaterializedTraits =

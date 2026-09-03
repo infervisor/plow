@@ -1392,6 +1392,18 @@ pub enum DevOp {
     /// `i0=rows i1=H i2=D i3=BV i4=W i5=flags i6=gate_mode i7=descriptor_version(2)` ·
     /// `f0=scale f1=lower_bound j1=norm_eps_bits`.
     KdaDecodeFused = 125,
+    /// Standalone layout boundary for materialized MLA prefill.
+    /// `t0=K[B,T,H,192] t1=V[B,T,H,128] t2=KV[B,T,H,256] t3=K_rope[B,T,64]` ·
+    /// `i0=T i1=H i2=qk_nope(128) i3=qk_rope(64) i4=v_head(128)`.
+    /// Selected by dimensions, not model identity. The raw kernel copies the first 128 values
+    /// of each KV head to K, broadcasts the shared 64-value rope row into every K head, and
+    /// copies the final 128 values to V.
+    MlaMaterializePack = 126,
+    /// Standalone causal bf16 materialized MLA prefill.
+    /// `t0=O[B,T,H,128] t1=Q[B,T,H,192] t2=K[B,T,H,192] t3=V[B,T,H,128]` ·
+    /// `i0=T i1=H i2=H_KV i3=D_QK(192) i4=D_V(128) i5=abi(1)` · `f0=scale`.
+    /// The only production implementation is a capability-checked gfx950 raw object.
+    FlashMlaMaterializedPrefill = 127,
 }
 
 impl DevOp {
@@ -1527,6 +1539,8 @@ impl DevOp {
         DevOp::KdaChunkWu,
         DevOp::KdaChunkCarry,
         DevOp::KdaDecodeFused,
+        DevOp::MlaMaterializePack,
+        DevOp::FlashMlaMaterializedPrefill,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1673,6 +1687,8 @@ impl DevOp {
             DevOp::KdaChunkWu => "PLOW_DOP_KDA_CHUNK_WU",
             DevOp::KdaChunkCarry => "PLOW_DOP_KDA_CHUNK_CARRY",
             DevOp::KdaDecodeFused => "PLOW_DOP_KDA_DECODE_FUSED",
+            DevOp::MlaMaterializePack => "PLOW_DOP_MLA_MATERIALIZE_PACK",
+            DevOp::FlashMlaMaterializedPrefill => "PLOW_DOP_FLASH_MLA_MATERIALIZED_PREFILL",
         }
     }
 
@@ -1702,7 +1718,7 @@ impl DevOp {
     /// bump: this constant is one past the HIGHEST opcode, not a count, and adding a pair moves it
     /// by two whether or not the range has holes.
     /// 116 -> 117 for `XReduceAddNorm = 116` (the fused TP seam).
-    pub const COUNT: u16 = 126;
+    pub const COUNT: u16 = 128;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

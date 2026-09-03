@@ -70,7 +70,8 @@
 //! epilogue not converted to the pair form poisons its output instead of silently computing
 //! `gelu_tanh(g) * u`.
 
-use packet::dev::DevOp;
+use crate::emit_config;
+use packet::dev::{DevOp, TENSOR_NONE};
 use packet::devbuild::Builder;
 use packet::rope::{GenTensor, RopeScale};
 
@@ -1629,6 +1630,8 @@ pub struct K3MlaCfg {
     pub q_lora: u32,
     /// `kv_lora_rank` — the latent width every head reads.
     pub kv_lora: u32,
+    /// Unabsorbed NoPE query/key width. Used only by the default-off materialized prefill path.
+    pub qk_nope: u32,
     /// `qk_rope_head_dim`.
     pub qk_rope: u32,
     /// `v_head_dim`.
@@ -1669,6 +1672,9 @@ pub struct K3MlaWeights {
     pub q_absorb: u32,
     /// `derived.q_rope` — `[heads*qk_rope, q_lora]`.
     pub q_rope: u32,
+    /// Raw checkpoint projections retained only when materialized prefill is requested.
+    pub q_b: u32,
+    pub kv_b: u32,
     /// `kv_a_proj_with_mqa`, the shared latent down-projection.
     pub kv_a: u32,
     /// The k-rope down-projection, `[qk_rope, hidden]`.
@@ -1734,7 +1740,15 @@ pub fn emit_k3_mla_mixer(
 ) -> (u32, u32) {
     let all: Vec<u32> = (0..n_cu).collect();
     let a = act_prefix;
-    let (nh, dk, dr, vd, ql) = (c.heads, c.kv_lora, c.qk_rope, c.v_head, c.q_lora);
+    let (nh, dk, dn, dr, vd, ql) = (c.heads, c.kv_lora, c.qk_nope, c.qk_rope, c.v_head, c.q_lora);
+    let decode_arm = t == 1 || seq_rows;
+    let materialized = emit_config::active().mla_materialized_prefill
+        && !decode_arm
+        && !c.fp8_kv
+        && dn + dr == 192
+        && vd == 128
+        && w.q_b != TENSOR_NONE
+        && w.kv_b != TENSOR_NONE;
     let nhvd = c.nhvd();
     let tt = t as u64;
     let bft = |b: &mut Builder, n: String, e: u64| b.tensor(&n, e * 2);
@@ -1750,11 +1764,41 @@ pub fn emit_k3_mla_mixer(
     let qlr = bft(b, format!("{a}q_lora"), tt * ql as u64);
     // Unwritten when the q-side norm folds; declared anyway, for the reason `{a}yn` is.
     let qlat = bft(b, format!("{a}q_lat"), tt * ql as u64);
-    let qa = bft(b, format!("{a}q_absorbed"), tt * nh as u64 * dk as u64);
+    let qa = bft(
+        b,
+        format!("{a}q_absorbed"),
+        tt * nh as u64
+            * if materialized {
+                (dn + dr) as u64
+            } else {
+                dk as u64
+            },
+    );
     let qrr = bft(b, format!("{a}q_rope_raw"), tt * nh as u64 * dr as u64);
     let qr = bft(b, format!("{a}q_rope"), tt * nh as u64 * dr as u64);
     let ckvraw = bft(b, format!("{a}ckv_raw"), tt * dk as u64);
     let krr = bft(b, format!("{a}krot_raw"), tt * dr as u64);
+    let kvmat = materialized
+        .then(|| {
+            bft(
+                b,
+                format!("{a}kv_materialized"),
+                tt * nh as u64 * (dn + vd) as u64,
+            )
+        })
+        .unwrap_or(TENSOR_NONE);
+    let kmat = materialized
+        .then(|| {
+            bft(
+                b,
+                format!("{a}k_materialized"),
+                tt * nh as u64 * (dn + dr) as u64,
+            )
+        })
+        .unwrap_or(TENSOR_NONE);
+    let vmat = materialized
+        .then(|| bft(b, format!("{a}v_materialized"), tt * nh as u64 * vd as u64))
+        .unwrap_or(TENSOR_NONE);
     // NSPLIT IS 1 ON THE PREFILL ARM, and it is forced rather than chosen: under a per-token
     // causal bound an early token's later splits cover nothing, and an empty split emits `l = 0`
     // for the merge to divide by (`d_flash_mla_prefill`'s header). Prefill already has
@@ -1850,32 +1894,51 @@ pub fn emit_k3_mla_mixer(
     };
     let q_src = if fold_q { qlr } else { qlat };
     let qn = fold_q.then_some((w.q_a_norm, c.eps));
-    let c_qa = emit_k3_linear_norm(
-        b,
-        qa,
-        q_src,
-        w.q_absorb,
-        t,
-        nh * dk,
-        ql,
-        n_cu,
-        seq_rows,
-        qn,
-        &[c_rnq],
-    );
-    let c_qrr = emit_k3_linear_norm(
-        b,
-        qrr,
-        q_src,
-        w.q_rope,
-        t,
-        nh * dr,
-        ql,
-        n_cu,
-        seq_rows,
-        qn,
-        &[c_rnq],
-    );
+    let (c_qa, c_qrr) = if materialized {
+        let c_q = emit_k3_linear_norm(
+            b,
+            qa,
+            q_src,
+            w.q_b,
+            t,
+            nh * (dn + dr),
+            ql,
+            n_cu,
+            seq_rows,
+            qn,
+            &[c_rnq],
+        );
+        (c_q, c_q)
+    } else {
+        (
+            emit_k3_linear_norm(
+                b,
+                qa,
+                q_src,
+                w.q_absorb,
+                t,
+                nh * dk,
+                ql,
+                n_cu,
+                seq_rows,
+                qn,
+                &[c_rnq],
+            ),
+            emit_k3_linear_norm(
+                b,
+                qrr,
+                q_src,
+                w.q_rope,
+                t,
+                nh * dr,
+                ql,
+                n_cu,
+                seq_rows,
+                qn,
+                &[c_rnq],
+            ),
+        )
+    };
 
     // q-side HeadNormRope: identity table, gamma absent, skip_norm — a bit-exact
     // copy. Emitted rather than skipped so it stays checkable.
@@ -1885,20 +1948,24 @@ pub fn emit_k3_mla_mixer(
     let rq = k3_rope_cus(&all, 0, t, nh);
     let rkv = k3_rope_cus(&all, rq.len(), t, 1);
     let rk = k3_rope_cus(&all, rq.len() + rkv.len(), t, 1);
-    let c_qr = b.emit(DevOp::HeadNormRope, rq.clone(), &[c_qrr], |d| {
-        d.t[0] = qr;
-        d.t[1] = qrr;
-        d.t[3] = w.cos;
-        d.t[4] = w.sin;
-        d.t[5] = w.pos;
-        d.i[0] = t;
-        d.i[1] = nh;
-        d.i[2] = dr;
-        d.i[3] = 0; // out_row0: q is not cached.
-        d.i[4] = 1; // skip_norm
-        d.f[0] = c.eps;
-        d.j[1] = crate::KV_MASK_NONE;
-    });
+    let c_qr = if materialized {
+        c_qrr
+    } else {
+        b.emit(DevOp::HeadNormRope, rq.clone(), &[c_qrr], |d| {
+            d.t[0] = qr;
+            d.t[1] = qrr;
+            d.t[3] = w.cos;
+            d.t[4] = w.sin;
+            d.t[5] = w.pos;
+            d.i[0] = t;
+            d.i[1] = nh;
+            d.i[2] = dr;
+            d.i[3] = 0; // out_row0: q is not cached.
+            d.i[4] = 1; // skip_norm
+            d.f[0] = c.eps;
+            d.j[1] = crate::KV_MASK_NONE;
+        })
+    };
 
     // kv_a_layernorm, writing the LATENT cache row. The fp8 spelling reuses
     // HeadNormRopeFp8 with no trig tables: it computes the same RMSNorm, quantizes the row, and
@@ -1982,61 +2049,113 @@ pub fn emit_k3_mla_mixer(
     // program has `t` INDEPENDENT sequences of one token each and wants the DECODE arm with
     // `i[4] = n_split` and `n_batch = t`. Selecting on `t == 1` alone silently routes a batched
     // decode to the prefill kernel, which would then read the `t` rows as one sequence's history.
-    let decode_arm = t == 1 || seq_rows;
-    let c_fl = b.emit(
-        match (decode_arm, c.fp8_kv) {
-            (true, false) => DevOp::FlashMlaDecode,
-            (false, false) => DevOp::FlashMlaPrefill,
-            (true, true) => DevOp::FlashMlaDecodeFp8,
-            (false, true) => DevOp::FlashMlaPrefillFp8,
-        },
-        // Decode's work-item count is `(nh/gf) * nsplit`; prefill's `i[4]` is `n_tok`, so the
-        // count saturates the machine at every bucket and the narrowing is inert there.
-        if decode_arm {
-            k3_flash_cus(&all, t, nh, c.gf, c.n_split)
-        } else {
-            all.clone()
-        },
-        &[c_qa, c_qr, c_rnkv, c_krd],
-        |d| {
-            d.t[0] = opart;
-            d.t[1] = mlpart;
-            d.t[2] = qa;
-            d.t[3] = qr;
-            d.t[4] = w.ckv;
-            d.t[5] = w.krot;
-            d.t[6] = w.kvlen;
-            if c.fp8_kv {
-                d.t[7] = w.kv_scale;
-            }
-            // n_batch. One sequence unless the rows ARE sequences, in which case each owns its
-            // own KV region and the kernel strides them by this axis.
-            d.i[0] = if seq_rows { t } else { 1 };
-            d.i[1] = nh;
-            d.i[2] = ctx;
-            d.i[3] = 0; // window: dense, full causal
-            d.i[4] = if decode_arm { c.n_split } else { t };
-            d.i[5] = crate::KV_MASK_NONE;
-            d.i[6] = 0; // keep the 64-wide NoPE/rope cache in bf16
-            d.i[7] = c.gf;
-            d.f[0] = c.scale;
-        },
-    );
+    let c_fl = if materialized {
+        let c_kvmat = emit_k3_linear(
+            b,
+            kvmat,
+            w.ckv,
+            w.kv_b,
+            t,
+            nh * (dn + vd),
+            dk,
+            n_cu,
+            false,
+            &[c_rnkv],
+        );
+        let c_pack = b.emit(
+            DevOp::MlaMaterializePack,
+            all.clone(),
+            &[c_kvmat, c_krr],
+            |d| {
+                d.t[0] = kmat;
+                d.t[1] = vmat;
+                d.t[2] = kvmat;
+                d.t[3] = krr;
+                d.i[0] = t;
+                d.i[1] = nh;
+                d.i[2] = dn;
+                d.i[3] = dr;
+                d.i[4] = vd;
+            },
+        );
+        b.emit(
+            DevOp::FlashMlaMaterializedPrefill,
+            all.clone(),
+            &[c_qa, c_pack],
+            |d| {
+                d.t[0] = oat;
+                d.t[1] = qa;
+                d.t[2] = kmat;
+                d.t[3] = vmat;
+                d.i[0] = t;
+                d.i[1] = nh;
+                d.i[2] = nh;
+                d.i[3] = dn + dr;
+                d.i[4] = vd;
+                d.i[5] = 1;
+                d.f[0] = c.scale;
+            },
+        )
+    } else {
+        b.emit(
+            match (decode_arm, c.fp8_kv) {
+                (true, false) => DevOp::FlashMlaDecode,
+                (false, false) => DevOp::FlashMlaPrefill,
+                (true, true) => DevOp::FlashMlaDecodeFp8,
+                (false, true) => DevOp::FlashMlaPrefillFp8,
+            },
+            // Decode's work-item count is `(nh/gf) * nsplit`; prefill's `i[4]` is `n_tok`, so the
+            // count saturates the machine at every bucket and the narrowing is inert there.
+            if decode_arm {
+                k3_flash_cus(&all, t, nh, c.gf, c.n_split)
+            } else {
+                all.clone()
+            },
+            &[c_qa, c_qr, c_rnkv, c_krd],
+            |d| {
+                d.t[0] = opart;
+                d.t[1] = mlpart;
+                d.t[2] = qa;
+                d.t[3] = qr;
+                d.t[4] = w.ckv;
+                d.t[5] = w.krot;
+                d.t[6] = w.kvlen;
+                if c.fp8_kv {
+                    d.t[7] = w.kv_scale;
+                }
+                // n_batch. One sequence unless the rows ARE sequences, in which case each owns its
+                // own KV region and the kernel strides them by this axis.
+                d.i[0] = if seq_rows { t } else { 1 };
+                d.i[1] = nh;
+                d.i[2] = ctx;
+                d.i[3] = 0; // window: dense, full causal
+                d.i[4] = if decode_arm { c.n_split } else { t };
+                d.i[5] = crate::KV_MASK_NONE;
+                d.i[6] = 0; // keep the 64-wide NoPE/rope cache in bf16
+                d.i[7] = c.gf;
+                d.f[0] = c.scale;
+            },
+        )
+    };
     // The partials are `[b][t][head][nsplit][DK]` and the fold indexes them as `(b*n_head + h)`,
     // so the TOKEN axis folds into `i[0]`: `n_batch := 1*t`. Same identity the flash uses
     // (`qrow = (b*n_tok + t)*n_head`), not a trick. At nsplit=1 the online-softmax merge is a
     // pass-through and this op is purely the W_uv fold, which is why no separate `OUvFold` is
     // emitted — `MlaMergeFold` subsumes it and both objects carry it.
-    let c_uv = b.emit(DevOp::MlaMergeFold, all.clone(), &[c_fl], |d| {
-        d.t[0] = oat;
-        d.t[1] = opart;
-        d.t[2] = mlpart;
-        d.t[3] = w.v_absorb;
-        d.i[0] = t;
-        d.i[1] = nh;
-        d.i[2] = vd;
-        d.i[4] = nsplit;
-    });
+    let c_uv = if materialized {
+        c_fl
+    } else {
+        b.emit(DevOp::MlaMergeFold, all.clone(), &[c_fl], |d| {
+            d.t[0] = oat;
+            d.t[1] = opart;
+            d.t[2] = mlpart;
+            d.t[3] = w.v_absorb;
+            d.i[0] = t;
+            d.i[1] = nh;
+            d.i[2] = vd;
+            d.i[4] = nsplit;
+        })
+    };
 
     // The output gate, off the PRE-attention normed hidden.
     // Its own packet ON PURPOSE — see `fuse_mla_a`: folding it into the fused down-projection is
@@ -3009,6 +3128,30 @@ pub fn declare_k3_mla_weights(
             &format!("{lp}self_attn.derived.q_rope.weight"),
             nh * dr * ql * 2,
         ),
+        q_b: if emit_config::active().mla_materialized_prefill
+            && c.qk_nope + c.qk_rope == 192
+            && c.v_head == 128
+            && !c.fp8_kv
+        {
+            b.tensor(
+                &format!("{lp}self_attn.q_b_proj.weight"),
+                nh * (c.qk_nope + c.qk_rope) as u64 * ql * 2,
+            )
+        } else {
+            TENSOR_NONE
+        },
+        kv_b: if emit_config::active().mla_materialized_prefill
+            && c.qk_nope + c.qk_rope == 192
+            && c.v_head == 128
+            && !c.fp8_kv
+        {
+            b.tensor(
+                &format!("{lp}self_attn.kv_b_proj.weight"),
+                nh * (c.qk_nope + c.v_head) as u64 * dk * 2,
+            )
+        } else {
+            TENSOR_NONE
+        },
         kv_a: b.tensor(
             &format!("{lp}self_attn.kv_a_proj_with_mqa.weight"),
             dk * h * 2,
@@ -3455,6 +3598,7 @@ mod tests {
                 heads: 96,
                 q_lora: 1536,
                 kv_lora: 512,
+                qk_nope: 128,
                 qk_rope: 64,
                 v_head: 128,
                 eps: 1e-5,
@@ -4390,6 +4534,59 @@ mod tests {
         );
         assert_eq!(n(DevOp::Embed), 1);
         assert_eq!(n(DevOp::ArgmaxFin), 1);
+    }
+
+    #[test]
+    fn materialized_mla_prefill_is_generic_opt_in_and_has_pure_raw_boundaries() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_MLA_MATERIALIZED_PREFILL", "1")]);
+        let p = build_full_t(1, 512);
+        let n = |o: DevOp| p.insts.iter().filter(|i| i.op == o as u16).count();
+        assert_eq!(n(DevOp::MlaMaterializePack), 24);
+        assert_eq!(n(DevOp::FlashMlaMaterializedPrefill), 24);
+        assert_eq!(n(DevOp::FlashMlaPrefill), 0);
+        assert_eq!(n(DevOp::MlaMergeFold), 0);
+        assert_eq!(
+            p.tensors
+                .iter()
+                .filter(|t| t.name.ends_with("self_attn.q_b_proj.weight"))
+                .count(),
+            24
+        );
+        assert_eq!(
+            p.tensors
+                .iter()
+                .filter(|t| t.name.ends_with("self_attn.kv_b_proj.weight"))
+                .count(),
+            24
+        );
+
+        for (ix, inst) in p.insts.iter().enumerate().filter(|(_, i)| {
+            matches!(
+                DevOp::from_u16(i.op),
+                Some(DevOp::MlaMaterializePack | DevOp::FlashMlaMaterializedPrefill)
+            )
+        }) {
+            let entries: Vec<_> = p.stream.iter().filter(|e| e.inst as usize == ix).collect();
+            assert!(!entries.is_empty(), "raw instruction {ix} is unscheduled");
+            let seg = entries[0].seg;
+            assert!(entries.iter().all(|e| {
+                e.seg == seg
+                    && e.wait_len == 0
+                    && e.succ_len == 0
+                    && e.flags & packet::dev::SE_XCTR == 0
+            }));
+            assert!(p
+                .stream
+                .iter()
+                .filter(|e| e.seg == seg)
+                .all(|e| e.inst as usize == ix));
+            if inst.op == DevOp::MlaMaterializePack as u16 {
+                assert_eq!(inst.i[..5], [512, 96, 128, 64, 128]);
+            } else {
+                assert_eq!(inst.i[..6], [512, 96, 96, 192, 128, 1]);
+            }
+        }
     }
 
     #[test]

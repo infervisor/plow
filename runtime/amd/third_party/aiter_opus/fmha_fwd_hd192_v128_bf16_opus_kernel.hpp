@@ -508,7 +508,17 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         const int x_bound = merge_ht ? ceil_div(nqb_g, 2) : nqb_g;
         if (q_block_idx >= x_bound) return;
     } else {
+#if PLOW_OPUS_FLAT_BATCH_GRID
+        const int nqb = ceil_div(kargs.N, q_block_size);
+        const int q_grid = merge_ht ? ceil_div(nqb, 2) : nqb;
+        int flat = block_id_x();
+        q_block_idx = flat % q_grid;
+        flat /= q_grid;
+        h = flat % kargs.H;
+        const int b = flat / kargs.H;
+#else
         const int b = block_id_z();
+#endif
         seqlen_q  = kargs.N;
         seqlen_kv = kargs.N_KV;
         q_batch_base = (int64_t)b * kargs.stride_q_b;
@@ -516,8 +526,10 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         k_batch_base = (int64_t)b * kargs.stride_k_b;
         v_batch_base = (int64_t)b * kargs.stride_v_b;
         lse_batch_base = (int64_t)b * kargs.stride_lse_b;
+#if !PLOW_OPUS_FLAT_BATCH_GRID
         q_block_idx = block_id_x();          // config A: q-block=x, head=y, batch=z
         h = block_id_y();
+#endif
     }
     const int num_q_blocks = ceil_div(seqlen_q, q_block_size);
     const int h_kv = h / group_size;

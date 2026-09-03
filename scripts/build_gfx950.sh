@@ -52,7 +52,8 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       moe_stage1_mxfp4_gfx950.co moe_stage1_mxfp4_gfx950.elf \
       moe_stage2_mxfp4_gfx950.co moe_stage2_mxfp4_gfx950.elf \
       moe_combine_gfx950.co moe_combine_gfx950.elf \
-      mla_materialized_hd192_v128_gfx950.co mla_materialized_hd192_v128_gfx950.elf
+      mla_materialized_hd192_v128_gfx950.co mla_materialized_hd192_v128_gfx950.elf \
+      mla_materialize_pack_gfx950.co mla_materialize_pack_gfx950.elf
 
 genco() { # <extra-defs> <out.co>
   hipcc --offload-arch="$ARCH" -O3 -w $1 --genco "$R/amd/interp.hip" -o "$2" $INC
@@ -137,6 +138,13 @@ if [ "$ARCH" = gfx950 ]; then
     -DPLOW_REQUIRED_MARKER=plow_mla_materialized_opus_abi_1 \
     "$R/amd/mla_materialized_opus.hip"
   MLA_MATERIALIZED_ELFS="mla_materialized_hd192_v128_gfx950.elf"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/mla_materialize_pack_gfx950.elf" \
+    plow_mla_materialize_pack_gfx950 64 4 \
+    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_mla_materialize_pack_abi_1 \
+    "$R/amd/mla_materialize_pack.hip"
+  MLA_MATERIALIZED_ELFS="$MLA_MATERIALIZED_ELFS mla_materialize_pack_gfx950.elf"
 fi
 
 # DECODE BATCH BUCKET -> PLOW_GEMV_MM. THIS ROUTE WAS MISSING, and it is why batched decode

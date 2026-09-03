@@ -1527,6 +1527,12 @@ impl Builder {
             .ops
             .iter()
             .any(|op| op.inst.op == DevOp::XReduceTwoShot as u16 && op.inst.t[3] != TENSOR_NONE);
+        let mla_materialized = self.ops.iter().any(|op| {
+            matches!(
+                DevOp::from_u16(op.inst.op),
+                Some(DevOp::MlaMaterializePack | DevOp::FlashMlaMaterializedPrefill)
+            )
+        });
         // PLOW_SEG_PURE_GEMM=1 (T11): class-8 segments carry ONLY GEMM-family ops; every light
         // op (norms, rope, quant, embed, softcap) joins the flash class. The point: the sm_90a
         // segmented launcher runs class-8 segments on the lean `_pfgemm` object, and a pure-GEMM
@@ -1577,6 +1583,10 @@ impl Builder {
                 // A standalone raw-argument object owns this boundary. Keep its segment pure
                 // even if PLOW_UNISEG was requested; runtime routing may then select by opcode.
                 3
+            } else if op == DevOp::MlaMaterializePack as u16 {
+                14
+            } else if op == DevOp::FlashMlaMaterializedPrefill as u16 {
+                15
             } else if xr_attnres
                 && op == DevOp::XReduceTwoShot as u16
                 && self.ops[i].inst.t[3] != TENSOR_NONE
@@ -1711,7 +1721,8 @@ impl Builder {
             || lean_moe_stage1
             || lean_moe_combine
             || lean_kda_intra
-            || xr_attnres;
+            || xr_attnres
+            || mla_materialized;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             !raw_segmented || seg_of[consumer] == seg_of[dep.producer() as usize]
         };
