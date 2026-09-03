@@ -265,6 +265,11 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     emit_tokenize: bool,
 
+    /// Experiment: fuse structurally matched same-input linear pairs into one
+    /// multi-output GPU packet. Full-graph analysis must establish the match.
+    #[arg(long, default_value_t = false)]
+    experiment_parallel_linear2: bool,
+
     /// Emit a Chrome Trace Event Format JSON per bucket
     /// (`{stem}.trace.json`) showing every scheduled task as a duration
     /// event on its resource lane (SM / DMA / DPU / Host). Load in
@@ -635,6 +640,16 @@ fn fusion_coverage_hook(
         );
         Ok(verified)
     })
+}
+
+fn whole_graph_fusion_decisions(
+    coverage: Option<&fusion_coverage::FusionCoverage>,
+    tp: u32,
+    experiment_parallel_linear2: bool,
+) -> devgen::WholeGraphFusionDecisions {
+    coverage
+        .map(|coverage| coverage.decisions(tp, experiment_parallel_linear2))
+        .unwrap_or_default()
 }
 
 /// The devblob Lean gate: certify, per emitted program, that the
@@ -1080,12 +1095,13 @@ fn run_devblob(cli: &Cli) -> Result<PathBuf, Box<dyn std::error::Error>> {
     } else {
         None
     };
-    // Candidate is carried through the typed emitter API now, but remains
-    // unqualified until its full-token exactness and performance gates pass.
-    let whole_graph_fusions = fusion_coverage
-        .as_ref()
-        .map(|coverage| coverage.decisions(tp, false))
-        .unwrap_or_default();
+    // Candidate eligibility comes only from full-graph analysis. Qualification
+    // remains an explicit experiment until the network gate promotes it.
+    let whole_graph_fusions = whole_graph_fusion_decisions(
+        fusion_coverage.as_ref(),
+        tp,
+        cli.experiment_parallel_linear2,
+    );
 
     // The Lean gates on the devblob path. BOTH ARE ON BY DEFAULT (disable with
     // `--no-lean-verify` / `--no-lean-oracle`, one switch each, no coupling).
@@ -2067,6 +2083,20 @@ mod cli_tests {
         // The opt-in still works and is still independent per subsystem.
         assert!(parse(&["--lean-verify"]).lean_verify);
         assert!(parse(&["--lean-oracle"]).lean_oracle);
+    }
+
+    #[test]
+    fn parallel_linear2_experiment_defaults_off_and_is_explicit() {
+        assert!(!parse(&[]).experiment_parallel_linear2);
+        assert!(parse(&["--experiment-parallel-linear2"]).experiment_parallel_linear2);
+    }
+
+    #[test]
+    fn parallel_linear2_experiment_without_full_graph_candidate_is_inert() {
+        assert_eq!(
+            whole_graph_fusion_decisions(None, 8, true),
+            devgen::WholeGraphFusionDecisions::default()
+        );
     }
 
     /// CORRECTION 1, HALF TWO — THE TRAP THIS PINS SHUT.

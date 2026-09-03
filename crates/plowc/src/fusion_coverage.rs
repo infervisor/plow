@@ -291,4 +291,31 @@ mod tests {
         assert_eq!(report.gpu_equivalent_covered, 0);
         assert_eq!(report.not_opcode_equivalent, coverage.extracted);
     }
+
+    #[test]
+    fn parallel_linear2_qualification_is_explicit_and_eligibility_preserving() {
+        let candidate = devgen::ParallelLinear2Decision {
+            n0: 128,
+            n1: 96,
+            k: 7168,
+            instances: 69,
+            qualified: false,
+        };
+        let coverage = FusionCoverage {
+            graph_ops: 0,
+            extracted: 0,
+            by_op: BTreeMap::new(),
+            same_input_narrow_pairs: 69,
+            parallel_linear2: vec![candidate.clone()],
+            kda_gate: 0,
+        };
+
+        let control = coverage.decisions(8, false);
+        assert_eq!(control.parallel_linear2, vec![candidate]);
+
+        let experiment = coverage.decisions(8, true);
+        assert_eq!(experiment.parallel_linear2.len(), 1);
+        assert!(experiment.parallel_linear2[0].qualified);
+        assert_eq!(experiment.parallel_linear2[0].instances, 69);
+    }
 }
