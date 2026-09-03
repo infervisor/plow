@@ -1943,7 +1943,7 @@ fn run_one_tick(
             // §DSTEP owns the whole tick from here, so `TOKEN` is a real total
             // and not a sum of parts. One tick is one token on the TP path,
             // which is the only shape `PLOW_DECODE_BATCH=1` admits.
-            let t_tick = crate::obs::dstep::on().then(Instant::now);
+            let t_tick = crate::obs::dstep::begin_token();
             let remaining = feeds
                 .iter()
                 .filter_map(|&(i, _)| slots[i].as_ref())
@@ -2034,9 +2034,7 @@ fn run_one_tick(
                     }
                 }
             }
-            if let Some(t) = t_tick {
-                crate::obs::dstep::token(t.elapsed().as_nanos() as u64);
-            }
+            crate::obs::dstep::finish_token(t_tick);
             if let Some(t) = pk_t {
                 packlog::record(0, t.elapsed().as_nanos() as u64, false, true, pk_rows);
             }

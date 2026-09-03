@@ -4373,7 +4373,7 @@ fn patch_tp_xaudit(insts: &mut [DevInst64], status_id: u32) {
                 DevOp::XReduce | DevOp::XReduceTwoShot | DevOp::XReduceAddNorm | DevOp::XArgmaxFin
             )
         ) {
-            d.i[7] = status_id + 1;
+            d.fj[2] = status_id + 1;
         }
     }
 }
@@ -5270,8 +5270,14 @@ impl AmdEngine {
         // OBJECT below, so a genuinely mismatched pairing is still refused, by inspection instead
         // of by assertion. PLOW_L2_PLACE_DISPATCH=1 still works for anyone scripting it.
         let mut blob = DevBlob::parse_l2(&raw, true)?;
-        let tp_audit_compact =
-            tp.is_some() && crate::config::RuntimeConfig::get().amd.tp_audit_compact;
+        let has_fine_xctr = blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.stream)
+            .any(|e| e.flags & SE_XCTR != 0);
+        let tp_audit_compact = tp.is_some()
+            && crate::config::RuntimeConfig::get().amd.tp_audit_compact
+            && !has_fine_xctr;
         if tp_audit_compact {
             let status_id = tp.expect("checked").xstatus_id;
             for p in &mut blob.progs {
@@ -10415,6 +10421,16 @@ mod tests {
         let mut insts = [
             DevInst64 {
                 op: DevOp::XReduce as u16,
+                i: [0, 0, 0, 0, 0, 0, 0, 11],
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::XReduceTwoShot as u16,
+                i: [0, 0, 0, 0, 0, 0, 23, 29],
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::XReduceAddNorm as u16,
                 ..Default::default()
             },
             DevInst64 {
@@ -10427,9 +10443,10 @@ mod tests {
             },
         ];
         patch_tp_xaudit(&mut insts, 464);
-        assert_eq!(insts[0].i[7], 465);
-        assert_eq!(insts[1].i[7], 465);
-        assert_eq!(insts[2].i[7], 0);
+        assert!(insts[..4].iter().all(|d| d.fj[2] == 465));
+        assert_eq!(insts[4].fj[2], 0);
+        assert_eq!(insts[0].i[7], 11);
+        assert_eq!(&insts[1].i[6..=7], &[23, 29]);
     }
 
     /// The flash object follows the PREFILL scheduler: a flash segment IS a

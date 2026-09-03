@@ -324,18 +324,17 @@ impl AmdTpGroup {
         }
         let max_tokens = (tp.slot_bytes / msg) as u32;
         let n_xctr = count_xgates(&blob);
-        let audit_compact = crate::config::RuntimeConfig::get().amd.tp_audit_compact;
-        if audit_compact
-            && blob
-                .progs
-                .iter()
-                .flat_map(|p| &p.stream)
-                .any(|e| e.flags & packet::dev::SE_XCTR != 0)
-        {
-            return Err(RuntimeError::Device(
-                "compact TP audit does not support SE_XCTR fine-gate programs; use the direct or copy audit"
-                    .into(),
-            ));
+        let audit_compact_requested = crate::config::RuntimeConfig::get().amd.tp_audit_compact;
+        let has_fine_xctr = blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.stream)
+            .any(|e| e.flags & packet::dev::SE_XCTR != 0);
+        let audit_compact = audit_compact_requested && !has_fine_xctr;
+        if audit_compact_requested && has_fine_xctr {
+            tracing::warn!(
+                "compact TP audit does not support SE_XCTR fine gates; using the exact copy audit"
+            );
         }
         let gate_expect = gate_expectations(&blob, n_gpu, n_xctr);
         let layout = PeerLayout::new(tp.hidden, max_tokens, n_xctr).ok_or_else(|| {

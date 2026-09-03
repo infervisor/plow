@@ -460,7 +460,7 @@ pub struct AmdRuntimeConfig {
     pub tp_audit_direct: bool,
 
     /// Compact the exact TP counter audit on device, then read one status word per rank.
-    #[arg(long = "amd-tp-audit-compact", env = "PLOW_TP_AUDIT_COMPACT", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    #[arg(long = "amd-tp-audit-compact", env = "PLOW_TP_AUDIT_COMPACT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_audit_compact: bool,
 
     /// Override prefill pad/launch-rows tradeoff.

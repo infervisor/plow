@@ -24,11 +24,12 @@ writes its own record. The packet as a whole:
 Decode is a serial chain, so the packets are walked in INSTRUCTION order (which
 the compiler emits topologically) and charged against a running clock:
 
-    gate_i = max(0, ready_i - max(end_{i-1}, arrive_i))
-    body_i = end_i - ready_i
+    start_i = max(end_{i-1}, arrive_i)
+    gate_i  = max(0, ready_i - start_i)
+    body_i  = max(0, end_i - max(ready_i, start_i))
 
-which partitions the whole step's span exactly, with no double counting when two
-packets do overlap.
+    and advances `end_{i-1}` monotonically. This partitions the critical envelope
+    without double counting when independent packets overlap.
 
 WHAT `gate` MEANS depends on the run. On a normal run it is protocol latency PLUS
 genuine dependency waiting (a consumer whose producer is still computing). Under
@@ -104,7 +105,7 @@ def main():
         op, b, arr, rdy, end, end0, rdy0 = pk[inst]
         start = arr if prev_end is None else max(prev_end, arr)
         g = max(0.0, (rdy - start) / TPUS)
-        bd = (end - rdy) / TPUS
+        bd = max(0.0, (end - max(rdy, start)) / TPUS)
         a = agg[(op, b)]
         a[0] += 1
         a[1] += g
@@ -118,9 +119,9 @@ def main():
         tot_b += bd
         gs.append(g)
         bs.append(bd)
-        prev_end, prev_b = end, b
+        prev_end, prev_b = end if prev_end is None else max(prev_end, end), b
 
-    span = (pk[order[-1]][4] - pk[order[0]][2]) / TPUS
+    span = (prev_end - pk[order[0]][2]) / TPUS
     print(f"\nchain: {len(order)} packets, span {span:.1f} us = gate {tot_g:.1f} "
           f"+ body {tot_b:.1f}  (residual {span - tot_g - tot_b:.1f})")
     print(f"  per packet: gate {tot_g / len(order):.3f} us  body "

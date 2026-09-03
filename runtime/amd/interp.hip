@@ -221,11 +221,11 @@ extern "C" __device__ unsigned plow_kda_chunk_qpre_arm_1 = 1;
 extern "C" __device__ unsigned plow_kda_conv_step_db_arm = 1;
 #endif
 
-/* Compact TP audit. `i[7] == 0` keeps old packets byte-compatible; plowrt patches
+/* Compact TP audit. `j[1] == 0` keeps old packets byte-compatible; plowrt patches
  * TP collective instructions to status_id+1 while loading them. */
 __device__ __forceinline__ uint32_t* plow_xaudit_status(const PlowProgram& prog,
                                                         const PlowDevInst* in) {
-    return in->i[7] ? PLOW_CTR(prog.xctr, in->i[7] - 1u) : nullptr;
+    return in->fj[2].u ? PLOW_CTR(prog.xctr, in->fj[2].u - 1u) : nullptr;
 }
 
 typedef struct {
