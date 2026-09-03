@@ -46,7 +46,11 @@ static float median(std::vector<float> v) {
 
 static void run(unsigned T) {
     constexpr unsigned E = 896, K = 16, NB = 64;
-    const unsigned router_blocks = std::min(T, 1024u);
+    int device;
+    hipDeviceProp_t prop;
+    HC(hipGetDevice(&device));
+    HC(hipGetDeviceProperties(&prop, device));
+    const unsigned router_blocks = std::min(T, (unsigned)prop.multiProcessorCount);
     const size_t nslot = (size_t)T * K;
     const size_t pad = nslot + E * (MPF_BM - 1u);
     std::vector<unsigned short> logit((size_t)T * E);

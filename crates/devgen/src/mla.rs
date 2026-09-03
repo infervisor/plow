@@ -4079,11 +4079,7 @@ fn emit_glm_block_prefill(
     // PLOW_MOE_PF_DET: same decomposition, f64 fixed-point accumulator, order-independent sum.
     let det = fuse == MoePfFuse::Det;
     let align_par = emit_config::active().moe_align_par && t >= 1024;
-    let router_blocks = if align_par {
-        (0..t.min(4 * n_cu)).map(|i| i % n_cu).collect()
-    } else {
-        all.clone()
-    };
+    let router_blocks: Vec<_> = (0..t.min(n_cu)).collect();
     let c_router = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_score], |d| {
         d.t[0] = n.tab;
         d.t[1] = n.rlogit;

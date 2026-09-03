@@ -1233,11 +1233,7 @@ pub fn emit_k3_latent_moe(
         // have made for the same row — which is what makes the two phases the same model.
         // One workgroup owns one token at a time. Launching more than T only creates empty
         // interpreter entries; launching fewer keeps the kernel's existing strided token loop.
-        let router_blocks: Vec<u32> = if align_par {
-            (0..t.min(4 * n_cu)).map(|i| i % n_cu).collect()
-        } else {
-            (0..t.min(n_cu)).collect()
-        };
+        let router_blocks: Vec<u32> = (0..t.min(n_cu)).collect();
         let c_rt = b.emit(DevOp::MoeRouterTopkPf, router_blocks, &[c_rl], |d| {
             d.t[0] = tab;
             d.t[1] = logit;
@@ -4832,7 +4828,7 @@ mod tests {
             .iter()
             .find(|i| i.op == DevOp::MoeRouterTopkPf as u16)
             .unwrap();
-        assert_eq!(router.blocks, 1024);
+        assert_eq!(router.blocks, 256);
         assert_eq!(align.len(), 92 * 4);
         for phase in align.chunks_exact(4) {
             assert_eq!(
