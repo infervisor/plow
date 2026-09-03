@@ -75,6 +75,7 @@ fn emit_with(dir: &Path, ctx: u32, n_cu: u32, tp: u32, rope_gen: bool) -> Vec<u8
         // byte-identical to what it was before the manifest existed.
         arch: String::new(),
         emit_cfg: None,
+        whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
     });
     std::fs::read(&out).unwrap()
 }
@@ -266,6 +267,7 @@ fn the_verification_gate_does_not_change_a_single_emitted_byte() {
             gpu: String::new(),
             arch: String::new(),
             emit_cfg: None,
+            whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
         },
         Some(Box::new(move |m: &packet::devbuild::Model| {
             // Guards against the test passing because the hook never ran.
@@ -451,6 +453,7 @@ fn emit_arch(dir: &Path, arch: &str, gpu: &str, l2: Option<packet::devbuild::L2L
         gpu: gpu.to_string(),
         arch: arch.to_string(),
         emit_cfg: None,
+        whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
     });
 }
 
@@ -588,6 +591,7 @@ fn emit_block(dir: &Path, block: &str) {
         gpu: "MI350X".into(),
         arch: "gfx950".into(),
         emit_cfg: None,
+        whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
     });
 }
 

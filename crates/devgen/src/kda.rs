@@ -33,9 +33,9 @@
 //! objective function. The merge that IS safe is along the OUTPUT dimension, and P1–P4 now take
 //! it: [`DevOp::GemvQkvg`] extends `GemvQkv = 22` with a fourth output stream, removing **207
 //! packets/token** while making the op WIDER (48 -> 192 columns per CU, still all 256 CUs).
-//! [`fuse_qkvg`] carries the argument and the LDS bound. P5/P6 stay separate — their weights are
-//! 1/128th and 1/96th of a projection, so folding them in would buy two gates and hand two CUs a
-//! ragged tail. Merging along a LOOP dimension is still the fatal one.
+//! [`fuse_qkvg`] carries the argument and the LDS bound. P5/P6 remain separate by default. A
+//! whole-graph `ParallelLinear2Decision` may merge just those two through `GemvQkv(Nv=0)` after
+//! its shape is qualified; that is another output-axis merge, not a loop collapse.
 //!
 //! **P8-P10 take the same merge, twice, and it is worth 3 packets/layer.** The four K3-specific
 //! opcodes were SIX packets — three convs, a gate, the step, the gated norm — and are now THREE.
@@ -64,7 +64,7 @@
 //! 3. **State is V-FIRST `[h][v][k]`.** Transposing it gives garbage with exactly the right norm.
 //!    [`KDA_STATE_LAYOUT`] is carried into the block descriptor for that reason.
 
-use packet::dev::{DevOp, WG_WAVES};
+use packet::dev::{DevOp, TENSOR_NONE, WG_WAVES};
 use packet::devbuild::Builder;
 
 /// K3's KDA geometry (`text_config.linear_attn_config` plus `hidden_size`).
@@ -419,6 +419,68 @@ fn fuse_qkvg(t: u32, hidden: u32) -> bool {
     crate::gemv_staged_rows(t) as u64 * hidden as u64 <= crate::gm_lds_halves()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_parallel_linear2(
+    b: &mut Builder,
+    out0: u32,
+    out1: u32,
+    x: u32,
+    w0: u32,
+    w1: u32,
+    m: u32,
+    n0: u32,
+    n1: u32,
+    k: u32,
+    n_cu: u32,
+    deps: &[u32],
+) -> u32 {
+    let all: Vec<u32> = (0..n_cu).collect();
+    let blocks = crate::mla::blocked_gemv_cus_tuned(&all, n0 + n1, k);
+    b.emit(DevOp::GemvQkv, blocks, deps, |d| {
+        d.t[0] = out0;
+        d.t[1] = x;
+        d.t[2] = w0;
+        d.t[3] = out1;
+        d.t[4] = w1;
+        d.t[5] = TENSOR_NONE;
+        d.t[6] = TENSOR_NONE;
+        d.i[0] = m;
+        d.i[1] = n0;
+        d.i[2] = k;
+        d.i[3] = n1;
+        d.i[4] = 0;
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_control_linears(
+    b: &mut Builder,
+    fa: u32,
+    b_raw: u32,
+    x: u32,
+    w_fa: u32,
+    w_b: u32,
+    t: u32,
+    hd: u32,
+    nh: u32,
+    hi: u32,
+    n_cu: u32,
+    seq_rows: bool,
+    dep: u32,
+    fuse: bool,
+) -> (u32, u32) {
+    if fuse {
+        let counter =
+            emit_parallel_linear2(b, fa, b_raw, x, w_fa, w_b, t, hd, nh, hi, n_cu, &[dep]);
+        (counter, counter)
+    } else {
+        (
+            crate::k3::emit_k3_linear(b, fa, x, w_fa, t, hd, hi, n_cu, seq_rows, &[dep]),
+            crate::k3::emit_k3_linear(b, b_raw, x, w_b, t, nh, hi, n_cu, seq_rows, &[dep]),
+        )
+    }
+}
+
 /// May the K3-specific chain collapse from SIX packets to THREE?
 ///
 /// # The measurement that decides it
@@ -688,8 +750,22 @@ fn emit_kda_mixer_ex(
             gemv(b, g_raw, x, w.g_proj, p, hi, c_ln),
         )
     };
-    let c_fa = gemv(b, fa, x, w.f_a_proj, hd, hi, c_ln);
-    let c_bb = gemv(b, b_raw, x, w.b_proj, nh, hi, c_ln);
+    let (c_fa, c_bb) = emit_control_linears(
+        b,
+        fa,
+        b_raw,
+        x,
+        w.f_a_proj,
+        w.b_proj,
+        t,
+        hd,
+        nh,
+        hi,
+        n_cu,
+        seq_rows,
+        c_ln,
+        t == 1 && crate::whole_graph_parallel_linear2(hd, nh, hi),
+    );
     // P7 — forget-gate up-projection. The forget gate stays LOW RANK 128 even though the output
     // gate is full rank; that asymmetry is `use_full_rank_gate`'s and it is easy to get backwards.
     let c_fb = gemv(b, f_raw, fa, w.f_b_proj, p, hd, c_fa);
@@ -1159,6 +1235,67 @@ mod tests {
             eps: 1e-5,
             bv: 16,
         }
+    }
+
+    #[test]
+    fn two_output_gemv_uses_qkv_nv_zero_encoding() {
+        let mut b = Builder::new(256);
+        let x = b.tensor("x", 7168 * 2);
+        let w0 = b.tensor("w0", 128 * 7168 * 2);
+        let w1 = b.tensor("w1", 12 * 7168 * 2);
+        let out0 = b.tensor("out0", 128 * 2);
+        let out1 = b.tensor("out1", 12 * 2);
+        let seed = b.emit(DevOp::Nop, vec![0], &[], |_| {});
+        emit_parallel_linear2(
+            &mut b,
+            out0,
+            out1,
+            x,
+            w0,
+            w1,
+            1,
+            128,
+            12,
+            7168,
+            256,
+            &[seed],
+        );
+        let p = b.finish();
+        let d = p
+            .insts
+            .iter()
+            .find(|d| d.op == DevOp::GemvQkv as u16)
+            .unwrap();
+        assert_eq!(
+            &d.t[..7],
+            &[out0, x, w0, out1, w1, TENSOR_NONE, TENSOR_NONE]
+        );
+        assert_eq!(&d.i[..5], &[1, 128, 7168, 12, 0]);
+        assert_eq!(d.blocks, 140);
+    }
+
+    #[test]
+    fn unqualified_two_output_candidate_stays_as_two_gemvs() {
+        let mut b = Builder::new(256);
+        let x = b.tensor("x", 7168 * 2);
+        let w0 = b.tensor("w0", 128 * 7168 * 2);
+        let w1 = b.tensor("w1", 12 * 7168 * 2);
+        let out0 = b.tensor("out0", 128 * 2);
+        let out1 = b.tensor("out1", 12 * 2);
+        let seed = b.emit(DevOp::Nop, vec![0], &[], |_| {});
+        let counters = emit_control_linears(
+            &mut b, out0, out1, x, w0, w1, 1, 128, 12, 7168, 256, false, seed, false,
+        );
+        let p = b.finish();
+        assert_ne!(counters.0, counters.1);
+        assert_eq!(
+            p.insts
+                .iter()
+                .filter(|d| d.op == DevOp::Gemv as u16)
+                .count(),
+            2
+        );
+        assert!(!p.insts.iter().any(|d| d.op == DevOp::GemvQkv as u16));
     }
 
     /// The 1-based off-by-one, and the modulus rule it invalidates. K3's real list.

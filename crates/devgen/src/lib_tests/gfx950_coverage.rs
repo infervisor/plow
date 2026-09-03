@@ -554,6 +554,7 @@ fn dense_mxfp4_is_refused_not_silently_bf16() {
         gpu: "MI355X".into(),
         arch: "gfx950".into(),
         emit_cfg: None,
+        whole_graph_fusions: WholeGraphFusionDecisions::default(),
     };
     std::env::set_var("PLOW_MXFP4", "1");
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(args())));

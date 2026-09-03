@@ -103,6 +103,7 @@ pub fn derive(spec: &EmitSpec) -> Result<Vec<Demand>, Box<dyn std::error::Error>
             gpu: spec.gpu.clone(),
             arch: spec.arch.clone(),
             emit_cfg: None,
+            whole_graph_fusions: devgen::WholeGraphFusionDecisions::default(),
         },
         Some(devgen::skip_hook(
             "plowc tune: deriving shape demand, not building an asset",

@@ -5148,6 +5148,52 @@ pub struct EmitArgs {
     /// Unified emit-time config. `Some` when driven by the new `plowc` CLI;
     /// `None` from the legacy `gemma4` `from_cli` path (env-var fallback).
     pub emit_cfg: Option<emit_config::EmitConfig>,
+    /// Fusion candidates derived from the complete operator graph. Empty for
+    /// legacy/direct callers; no model name participates in these decisions.
+    pub whole_graph_fusions: WholeGraphFusionDecisions,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WholeGraphFusionDecisions {
+    pub tp: u32,
+    pub parallel_linear2: Vec<ParallelLinear2Decision>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParallelLinear2Decision {
+    pub n0: u32,
+    pub n1: u32,
+    pub k: u32,
+    pub instances: usize,
+    /// Qualification is separate from structural eligibility. The compiler
+    /// carries candidates immediately, but production emission stays unchanged
+    /// until the exact full-token/performance gate promotes the shape.
+    pub qualified: bool,
+}
+
+static WHOLE_GRAPH_FUSIONS: std::sync::atomic::AtomicPtr<WholeGraphFusionDecisions> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+fn install_whole_graph_fusions(decisions: WholeGraphFusionDecisions) {
+    let ptr = Box::into_raw(Box::new(decisions));
+    WHOLE_GRAPH_FUSIONS.store(ptr, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn whole_graph_parallel_linear2(n0: u32, n1_local: u32, k: u32) -> bool {
+    let ptr = WHOLE_GRAPH_FUSIONS.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: install stores Box::into_raw and deliberately never frees it,
+    // matching emit_config's process-wide per-compile snapshot.
+    let decisions = unsafe { &*ptr };
+    decisions.parallel_linear2.iter().any(|d| {
+        d.qualified
+            && d.n0 == n0
+            && d.n1 == n1_local.saturating_mul(decisions.tp)
+            && d.k == k
+            && d.instances > 0
+    })
 }
 
 /// What the verification gate actually DID, recorded verbatim in `build.json`.
@@ -5294,6 +5340,7 @@ impl EmitArgs {
             gpu: String::new(),
             arch: String::new(),
             emit_cfg: None,
+            whole_graph_fusions: WholeGraphFusionDecisions::default(),
         }
     }
 }
@@ -5557,11 +5604,13 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         gpu,
         arch,
         emit_cfg: _emit_cfg,
+        whole_graph_fusions,
     } = args;
 
     // Resolve the unified emit config: either from the CLI (plowc path) or from env vars (legacy).
     // Installed process-wide so deeply nested emit functions can call emit_config::active().
     emit_config::install(_emit_cfg.unwrap_or_else(emit_config::EmitConfig::from_env));
+    install_whole_graph_fusions(whole_graph_fusions);
     clear_attention_decisions();
 
     // BEFORE any emitter runs: the GEMV census needs the store's answer in hand by the time
