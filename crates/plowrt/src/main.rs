@@ -839,6 +839,22 @@ mod amd_bench_cli_tests {
     }
 
     #[test]
+    fn kda_family_route_defaults_on_and_allows_explicit_rollback() {
+        let default = Cli::try_parse_from(["plowrt", "bench", "--assets", "model"]).unwrap();
+        assert!(default.rt_cfg.amd.kda_family_route);
+
+        let rollback = Cli::try_parse_from([
+            "plowrt",
+            "--amd-kda-family-route=false",
+            "bench",
+            "--assets",
+            "model",
+        ])
+        .unwrap();
+        assert!(!rollback.rt_cfg.amd.kda_family_route);
+    }
+
+    #[test]
     fn production_snapshot_tensor_selection_is_configurable() {
         let cli = Cli::try_parse_from([
             "plowrt",

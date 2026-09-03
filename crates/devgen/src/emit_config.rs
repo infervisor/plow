@@ -366,8 +366,8 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_KDA_CHUNK", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_chunk: Option<bool>,
 
-    /// Precompute the V-independent scaled/gated query in chunk W/U. Default off.
-    #[arg(long, env = "PLOW_KDA_CHUNK_QPRE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Precompute the V-independent scaled/gated query in chunk W/U. Set false to disable.
+    #[arg(long, env = "PLOW_KDA_CHUNK_QPRE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_chunk_qpre: bool,
 
     /// K3 up-projection no-gather mode (diagnostic).
@@ -688,7 +688,7 @@ impl EmitConfig {
             k3_kda_conv_step_db: env_bool("PLOW_K3_KDA_CONV_STEP_DB"),
             kda_decode_fused: env_bool("PLOW_KDA_DECODE_FUSED"),
             kda_chunk: env_bool_opt("PLOW_KDA_CHUNK"),
-            kda_chunk_qpre: env_bool("PLOW_KDA_CHUNK_QPRE"),
+            kda_chunk_qpre: env_opt_out("PLOW_KDA_CHUNK_QPRE"),
             k3_up_nogather: env_bool("PLOW_K3_UP_NOGATHER"),
             k3_up_gather_only: env_bool("PLOW_K3_UP_GATHER_ONLY"),
             k3_shard_head: env_bool("PLOW_K3_SHARD_HEAD"),
@@ -917,6 +917,17 @@ mod tests {
         let _guard = crate::test_env::env_guard();
         let _scope = crate::test_env::EnvScope::set(&[("PLOW_MOE_STAGE2_LEAN", "0")]);
         assert!(!super::active().moe_stage2_lean);
+    }
+
+    #[test]
+    fn kda_chunk_qpre_defaults_on_and_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_KDA_CHUNK_QPRE", "1")]);
+        std::env::remove_var("PLOW_KDA_CHUNK_QPRE");
+        assert!(EmitConfig::from_env().kda_chunk_qpre);
+
+        std::env::set_var("PLOW_KDA_CHUNK_QPRE", "0");
+        assert!(!EmitConfig::from_env().kda_chunk_qpre);
     }
 
     #[test]
