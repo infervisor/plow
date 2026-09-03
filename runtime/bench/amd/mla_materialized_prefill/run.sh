@@ -17,7 +17,7 @@ resource() {
         grep -F "$field:" | head -1 | sed 's/^.*: *//; s/ .*$//'
 }
 
-for name in k_absorbed k_absorbed_fold k_materialized; do
+for name in k_absorbed k_absorbed_fold k_materialized k_materialized_lds; do
     vgpr=$(resource "$name" VGPRs)
     agpr=$(resource "$name" AGPRs)
     sgpr=$(resource "$name" TotalSGPRs)

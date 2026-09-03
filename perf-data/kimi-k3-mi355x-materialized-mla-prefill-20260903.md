@@ -53,6 +53,44 @@ VGPRs and used 12 B/lane private memory. Reducing the Q chunk to two removed all
 instead Q in LDS followed by Q/V aliasing, double-buffered K and V, and a multi-stage pipeline;
 wave count alone does not reproduce it.
 
+## Structural LDS pipeline follow-up: rejected
+
+A harness-only kernel implemented that lifetime pattern with real, distinct K and V inputs:
+
+- four wave64 waves, 16x16x32 BF16 MFMA, BQ64/BKV128;
+- Q staged in LDS; the 34 KiB V tile aliases the dead 25 KiB Q slab and 9 KiB of the consumed
+  K slot;
+- two 50 KiB K slots ping-pong; P aliases the remainder of the consumed K slot;
+- next-K loads are staged two vectors at a time around eight current-tile score MFMAs, rather
+  than retaining a full prefetched tile in registers.
+
+The layout is wave64, VGPR 256 / AGPR 4 / SGPR 98, occupancy 1, 128000 B LDS, and zero
+scratch/spill/private. Median-of-7 results under the same 512 MiB flush contract:
+
+| T | absorbed + fold | generic rectangular | structural LDS | structural vs absorbed |
+|---:|---:|---:|---:|---:|
+| 1024 | 506.484 us | 171.561 us | 103.321 us | 4.902x |
+| 8192 | 7447.816 us | 2694.421 us | 4185.231 us | 1.780x |
+
+At T8192 the structural arm agrees with absorbed at max abs 0.00334167 / RMSE 0.00325587.
+At T1024 it is max abs 0.00424671 / RMSE 0.00397821: below the absolute-error ceiling but above
+the existing 0.003 RMSE gate, so it is rejected numerically as well as on time. Direct comparison
+to the accepted generic arm at T1024 is max abs 0.00384521 / RMSE 0.00205845, consistent with a
+different BKV128 softmax association rather than memory corruption.
+
+Two precursor layouts closed additional branches:
+
+- BQ128/BKV64 with a full next-K register tile was spill-free (VGPR 256 / AGPR 246 / SGPR 86,
+  102400 B LDS) and oracle-sound enough to time, but took 5309.599 us at T8192. Retaining the
+  full prefetch and restoring the Q alias 64 times are both losses.
+- BQ128/BKV128 with 32x32 MFMA compiled to 153600 B LDS but spilled 207 VGPRs and used
+  700 B/lane scratch, so it was rejected before timing.
+
+The target remains unmet. The reference-style 16x16 schedule wins decisively while T1024 is
+underfilled, then loses to the generic 32x32 kernel at long sequence. A next attempt must keep
+32x32 throughput while reducing BKV128 score/P residency; further expansion of either tested
+template is closed. No graph or emitter integration was attempted.
+
 ## Promotion blockers
 
 1. Beat 1.5 ms at T8192 with distinct K and V inputs. The identity-structured screen is an
