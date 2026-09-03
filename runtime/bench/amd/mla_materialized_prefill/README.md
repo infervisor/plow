@@ -124,3 +124,29 @@ baseline rather than require equality with a different contraction graph:
 Plow currently returns token IDs but not real GPU logits from the OpenAI API, so
 step 4 is a prerequisite for a genuine external logits gate. Until that exists
 and passes, the 130 ms TTFT result remains experimental and the route stays off.
+
+The CPU-side token gate is `scripts/openai_correctness_gate.py`. It never starts
+a server, and its corpus preparation and capture commands do no network I/O
+unless `--execute` is present. Prepare one fixed exact-length corpus against a
+canonical tokenizer, then restart each server before each capture:
+
+```sh
+nix develop -c python3 scripts/openai_correctness_gate.py prepare-corpus \
+  --base-url http://127.0.0.1:8000 --model MODEL --output /tmp/corpus.json
+nix develop -c python3 scripts/openai_correctness_gate.py capture \
+  --base-url http://127.0.0.1:8000 --model MODEL --arm plow --run-id 1 \
+  --corpus /tmp/corpus.json --output /tmp/plow-1.json
+```
+
+The commands above only print their execution plans. Add `--execute` explicitly
+after the appropriate server is already running. Capture run IDs 1, 2, and 3
+for each arm, with a cold server start before every invocation, then compare:
+
+```sh
+nix develop -c python3 scripts/openai_correctness_gate.py compare \
+  --left /tmp/plow-{1,2,3}.json --right /tmp/vllm-{1,2,3}.json
+```
+
+The comparator requires exact cold-run determinism within each arm, then exact
+prompt and output token parity between arms. It reports the first prompt token
+or generated-token divergence.
