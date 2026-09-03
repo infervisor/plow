@@ -7532,6 +7532,12 @@ impl AmdEngine {
         slot: usize,
         bytes: usize,
     ) -> Result<Vec<(String, Vec<u8>)>> {
+        if slot >= self.batch {
+            return Err(RuntimeError::Device(format!(
+                "snapshot slot {slot} past engine batch {}",
+                self.batch
+            )));
+        }
         let mut out = Vec::new();
         let picks: Vec<(usize, u64)> = self
             .kv_slot_stride
@@ -7549,8 +7555,8 @@ impl AmdEngine {
         Ok(out)
     }
 
-    /// Full download of a named tensor (small act.* buffers only — caller's
-    /// responsibility). Task-9 round-7 instrument.
+    /// Full download of a named tensor. Production callers validate the
+    /// aggregate selection against a bounded byte budget before dispatch.
     pub fn snapshot_tensor(&mut self, name: &str) -> Result<Vec<u8>> {
         let i = self.need(self.tensor_names.iter().position(|x| x == name), name)?;
         let len = self.devp[i].len as usize;
@@ -7844,6 +7850,20 @@ mod tests {
             &[0, 0, 1, 2, 2, 2, 2, 2],
         );
         assert_eq!(derive_packed_segment_families(&pure).unwrap(), [5, 6, 7]);
+        let routes: Vec<_> = derive_packed_segment_families(&pure)
+            .unwrap()
+            .into_iter()
+            .map(|family| packed_segment_route(true, family, true, true, true).unwrap())
+            .collect();
+        assert_eq!(
+            routes,
+            [
+                PackedSegmentRoute::MlaNorm,
+                PackedSegmentRoute::MlaFlash,
+                PackedSegmentRoute::Kda,
+            ]
+        );
+        assert!(packed_kda_compatible(&pure));
         assert_eq!(derive_segments_for(&pure, false).unwrap(), [8, 8, 8]);
         assert_eq!(derive_segments_for(&pure, true).unwrap(), [8, 4, 8]);
 

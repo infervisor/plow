@@ -105,10 +105,14 @@ error, not a prefill measurement, and the sweep refuses to start with either
 production prefix cache enabled.
 
 `amd-bench` drives `AmdEngine` directly and bypasses production scheduling. Use
-`plowrt bench --trace-raw PATH` for decode packet traces. Keep `amd-bench` only
-for tensor/logit snapshots, synthetic kernel floors, and diagnosing a TP
-disagreement reported by `plowrt bench`. Never publish it as served-model
-performance.
+`plowrt bench --trace-raw PATH` for decode packet traces. Production `serve`
+and `bench` also share fail-closed `--amd-ctr-snap DIR` and
+`--amd-tens-snap DIR --amd-snap-tensors a,b --amd-snap-slot N` diagnostics.
+Snapshot files use exclusive creation, and the legacy default tensor list is
+still rejected when a packet lacks those tensors or exceeds the size bound.
+Keep `amd-bench` only for dump comparisons not yet migrated, synthetic kernel
+floors, and diagnosing a TP disagreement reported by `plowrt bench`. Never
+publish it as served-model performance.
 
 ### 2a. AMD benchmark harness convergence
 
@@ -124,9 +128,10 @@ Track `amd-bench` removal as a staged migration, not a flag deletion:
   active knobs.
 - [x] Expose raw AMD decode packet traces through the production `AmdServe`
   path (`plowrt bench --trace-raw PATH`).
-- [ ] Expose tensor/logit snapshot, TP-rank audit, bucket timing, and
-  ragged-batch diagnostics without reaching through
-  `AmdServe` into `AmdEngine`.
+- [x] Expose bounded, fail-closed AMD counter/tensor snapshots through the
+  shared production `AmdServe` path.
+- [ ] Expose full-logit dump parity, TP-rank audit, bucket timing, and
+  ragged-batch diagnostics without a second runtime.
 - [x] Add one-load repeated cold-prefill TTFT sweeps to `plowrt bench`.
 - [ ] Move unbound weights and unwritten-KV timing to an explicitly synthetic
   `amd-probe`; never report it as served-model performance.

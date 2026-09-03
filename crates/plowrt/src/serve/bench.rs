@@ -18,6 +18,7 @@ use crate::{Result, RuntimeError};
 #[derive(Clone, Debug)]
 pub enum Input {
     TokenIds(Vec<u32>),
+    TokenRows(Vec<Vec<u32>>),
     Random { len: usize, seed: u64 },
 }
 
@@ -44,6 +45,75 @@ pub struct PrefillSweepConfig {
 }
 
 const MAX_DIAGNOSTIC_SELECTIONS: usize = 16 * 1024;
+
+pub fn read_prompt_rows(path: &Path) -> Result<Vec<Vec<u32>>> {
+    let raw = fs::read_to_string(path).map_err(|source| RuntimeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    parse_prompt_rows(&raw).map_err(|error| {
+        RuntimeError::Msg(format!(
+            "invalid prompt rows file {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn parse_prompt_rows(raw: &str) -> Result<Vec<Vec<u32>>> {
+    let mut rows = Vec::new();
+    for (line_index, line) in raw.lines().enumerate() {
+        let line_number = line_index + 1;
+        if line.trim().is_empty() {
+            return Err(RuntimeError::Msg(format!(
+                "line {line_number} is an empty prompt row"
+            )));
+        }
+        let mut row = Vec::new();
+        for (column_index, field) in line.split(',').enumerate() {
+            let field = field.trim();
+            if field.is_empty() {
+                return Err(RuntimeError::Msg(format!(
+                    "line {line_number}, field {} is empty",
+                    column_index + 1
+                )));
+            }
+            row.push(field.parse::<u32>().map_err(|error| {
+                RuntimeError::Msg(format!(
+                    "line {line_number}, field {} is not a u32 token id: {error}",
+                    column_index + 1
+                ))
+            })?);
+        }
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        return Err(RuntimeError::Msg(
+            "file must contain at least one prompt row".into(),
+        ));
+    }
+    Ok(rows)
+}
+
+pub fn validate_request_layout(
+    input: &Input,
+    warmup_requests: usize,
+    requests: usize,
+) -> Result<()> {
+    if let Input::TokenRows(rows) = input {
+        let expected = warmup_requests
+            .checked_add(requests)
+            .ok_or_else(|| RuntimeError::Msg("bench request count overflow".into()))?;
+        if rows.len() != expected {
+            return Err(RuntimeError::Msg(format!(
+                "bench prompt rows must contain exactly warmup_requests + requests rows: got {}, expected {} + {} = {expected}",
+                rows.len(),
+                warmup_requests,
+                requests
+            )));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct EngineDiagnostics {
@@ -224,7 +294,10 @@ pub struct CheckpointLayout {
 #[derive(Debug, Serialize)]
 pub struct InputReport {
     pub mode: &'static str,
-    pub tokens_per_request: usize,
+    pub tokens_per_request: Option<usize>,
+    pub row_count: usize,
+    pub min_tokens_per_request: usize,
+    pub max_tokens_per_request: usize,
     pub seed: Option<u64>,
 }
 
@@ -338,6 +411,15 @@ pub async fn run_prefill_sweep(
             "bench prefill sweep requires inputs and positive repetitions".into(),
         ));
     }
+    if cfg
+        .inputs
+        .iter()
+        .any(|input| matches!(input, Input::TokenRows(_)))
+    {
+        return Err(RuntimeError::Msg(
+            "bench prompt rows are not supported by prefill sweep".into(),
+        ));
+    }
     if state.execset.backend().vendor().is_none() {
         return Err(RuntimeError::Msg(
             "bench requires a matching GPU backend; refusing CPU fallback performance".into(),
@@ -413,7 +495,7 @@ pub async fn run_prefill_sweep(
             .expect("positive repetitions");
         rows.push(PrefillSweepRow {
             input: input_report(input),
-            prompt_tokens: input_len(input),
+            prompt_tokens: single_input_len(input),
             warmup_requests: cfg.warmup_requests,
             repetitions: cfg.repetitions,
             measured_request_offset: measured_offset,
@@ -459,6 +541,7 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
             "bench concurrency, requests, and output tokens must be positive".into(),
         ));
     }
+    validate_request_layout(&cfg.input, cfg.warmup_requests, cfg.requests)?;
     if cfg.parity_report
         && (!matches!(&cfg.input, Input::TokenIds(_))
             || cfg.concurrency != 1
@@ -643,15 +726,24 @@ fn validate_token_audit_config(cfg: &Config) -> Result<()> {
     if !cfg.token_audit {
         return Ok(());
     }
-    if cfg.parity_report || !matches!(&cfg.input, Input::TokenIds(_)) {
+    validate_request_layout(&cfg.input, cfg.warmup_requests, cfg.requests)?;
+    if cfg.parity_report || !matches!(&cfg.input, Input::TokenIds(_) | Input::TokenRows(_)) {
         return Err(RuntimeError::Msg(
             "bench token audit requires exact token-id input and is distinct from parity-report"
                 .into(),
         ));
     }
-    let total_ids = input_len(&cfg.input)
-        .checked_add(cfg.output_tokens)
-        .and_then(|per_request| per_request.checked_mul(cfg.requests))
+    let prompt_ids = match &cfg.input {
+        Input::TokenIds(ids) => ids.len().checked_mul(cfg.requests),
+        Input::TokenRows(rows) => rows[cfg.warmup_requests..]
+            .iter()
+            .try_fold(0usize, |total, row| total.checked_add(row.len())),
+        Input::Random { .. } => unreachable!("exact input checked above"),
+    };
+    let total_ids = cfg
+        .output_tokens
+        .checked_mul(cfg.requests)
+        .and_then(|outputs| prompt_ids.and_then(|prompts| prompts.checked_add(outputs)))
         .ok_or_else(|| RuntimeError::Msg("bench token audit token count overflow".into()))?;
     if cfg.requests > MAX_TOKEN_AUDIT_REQUESTS || total_ids > MAX_TOKEN_AUDIT_IDS {
         return Err(RuntimeError::Msg(format!(
@@ -807,6 +899,23 @@ fn validate_input(input: &Input, vocab: usize) -> Result<()> {
             }
             Ok(())
         }
+        Input::TokenRows(rows) => {
+            for (row_index, row) in rows.iter().enumerate() {
+                if row.is_empty() {
+                    return Err(RuntimeError::Msg(format!(
+                        "bench prompt row {} is empty",
+                        row_index + 1
+                    )));
+                }
+                if let Some(&id) = row.iter().find(|&&id| id as usize >= vocab) {
+                    return Err(RuntimeError::Msg(format!(
+                        "bench token id {id} in prompt row {} is outside vocabulary size {vocab}",
+                        row_index + 1
+                    )));
+                }
+            }
+            Ok(())
+        }
         Input::Random { .. } => Ok(()),
     }
 }
@@ -825,20 +934,35 @@ fn input_report(input: &Input) -> InputReport {
     match input {
         Input::TokenIds(ids) => InputReport {
             mode: "token_ids",
-            tokens_per_request: ids.len(),
+            tokens_per_request: Some(ids.len()),
+            row_count: 1,
+            min_tokens_per_request: ids.len(),
+            max_tokens_per_request: ids.len(),
+            seed: None,
+        },
+        Input::TokenRows(rows) => InputReport {
+            mode: "token_rows",
+            tokens_per_request: None,
+            row_count: rows.len(),
+            min_tokens_per_request: rows.iter().map(Vec::len).min().unwrap_or(0),
+            max_tokens_per_request: rows.iter().map(Vec::len).max().unwrap_or(0),
             seed: None,
         },
         Input::Random { len, seed } => InputReport {
             mode: "random",
-            tokens_per_request: *len,
+            tokens_per_request: Some(*len),
+            row_count: 1,
+            min_tokens_per_request: *len,
+            max_tokens_per_request: *len,
             seed: Some(*seed),
         },
     }
 }
 
-fn input_len(input: &Input) -> usize {
+fn single_input_len(input: &Input) -> usize {
     match input {
         Input::TokenIds(ids) => ids.len(),
+        Input::TokenRows(_) => unreachable!("prompt rows are rejected by prefill sweep"),
         Input::Random { len, .. } => *len,
     }
 }
@@ -846,6 +970,7 @@ fn input_len(input: &Input) -> usize {
 fn prompt(input: &Input, vocab: usize, request: usize) -> Vec<u32> {
     match input {
         Input::TokenIds(ids) => ids.clone(),
+        Input::TokenRows(rows) => rows[request].clone(),
         Input::Random { len, seed } => {
             let mut x = seed
                 .wrapping_add(request as u64)
@@ -1166,6 +1291,54 @@ mod tests {
             validate_token_audit_config(&token_audit_config(Input::TokenIds(vec![1]), 65, 8,))
                 .is_err()
         );
+        let mut ragged = token_audit_config(
+            Input::TokenRows(vec![vec![9], vec![1, 2], vec![3, 4, 5]]),
+            2,
+            8,
+        );
+        ragged.warmup_requests = 1;
+        assert!(validate_token_audit_config(&ragged).is_ok());
+        if let Input::TokenRows(rows) = &mut ragged.input {
+            rows.pop();
+        }
+        assert!(validate_token_audit_config(&ragged).is_err());
+    }
+
+    #[test]
+    fn prompt_rows_parse_strict_exact_rows() {
+        assert_eq!(
+            parse_prompt_rows("1, 2,3\n4\n5,6\n").unwrap(),
+            [vec![1, 2, 3], vec![4], vec![5, 6]]
+        );
+        for invalid in ["", "1\n\n2", "1,,2", "1,x"] {
+            assert!(parse_prompt_rows(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn ragged_rows_map_directly_by_global_request_index() {
+        let input = Input::TokenRows(vec![vec![7], vec![8, 9], vec![10, 11, 12]]);
+        validate_request_layout(&input, 1, 2).unwrap();
+        assert_eq!(prompt(&input, 100, 0), [7]);
+        assert_eq!(prompt(&input, 100, 1), [8, 9]);
+        assert_eq!(prompt(&input, 100, 2), [10, 11, 12]);
+        assert!(validate_request_layout(&input, 0, 2).is_err());
+    }
+
+    #[test]
+    fn ragged_input_report_is_truthful() {
+        let report = input_report(&Input::TokenRows(vec![vec![1], vec![2, 3, 4], vec![5, 6]]));
+        assert_eq!(report.mode, "token_rows");
+        assert_eq!(report.tokens_per_request, None);
+        assert_eq!(report.row_count, 3);
+        assert_eq!(report.min_tokens_per_request, 1);
+        assert_eq!(report.max_tokens_per_request, 3);
+        assert_eq!(report.seed, None);
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["tokens_per_request"], serde_json::Value::Null);
+        assert_eq!(json["row_count"], 3);
+        assert_eq!(json["min_tokens_per_request"], 1);
+        assert_eq!(json["max_tokens_per_request"], 3);
     }
 
     #[test]

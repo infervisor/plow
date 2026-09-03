@@ -529,16 +529,16 @@ impl AmdTpGroup {
         self.ranks[0].ctr_word0_snapshot(dp)
     }
 
-    /// Task-9 round-7 data audit: rank 0's layer-0 KV slot head + named act tensors.
+    /// Rank 0's layer-0 KV slot head plus explicitly selected named tensors.
     pub fn data_snapshot(
         &mut self,
         slot: usize,
         kv_bytes: usize,
-        acts: &[&str],
+        tensors: &[String],
     ) -> Result<Vec<(String, Vec<u8>)>> {
         let mut out = self.ranks[0].snapshot_kv_slot(slot, kv_bytes)?;
-        for a in acts {
-            out.push(((*a).to_string(), self.ranks[0].snapshot_tensor(a)?));
+        for name in tensors {
+            out.push((name.clone(), self.ranks[0].snapshot_tensor(name)?));
         }
         Ok(out)
     }

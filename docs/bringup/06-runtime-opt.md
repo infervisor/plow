@@ -345,7 +345,15 @@ TP width, runtime settings, packet/object checksums, and checkpoint layout. Add
 and TP agreement policy; overflow fails the benchmark instead of truncating the
 record. Diagnostic capture is opt-in so normal benchmark timing is not perturbed.
 Add `--trace-raw PATH` to write rank 0's last measured decode packet trace after
-the production mux is drained. Use `amd-bench` only for tensor/logit snapshots,
+the production mux is drained. On AMD, `--amd-ctr-snap DIR` and
+`--amd-tens-snap DIR` capture rank-0 state after every decode dispatch through
+both `serve` and `bench`; select up to 16 named tensors with
+`--amd-snap-tensors a,b` and a sequence with `--amd-snap-slot N`. Invalid
+names/slots, oversized selections, capture failures, and filesystem failures
+abort the request; existing snapshot filenames are never overwritten. Omitting
+the tensor list selects the legacy four names, which still fail load when the
+packet does not declare them or their aggregate exceeds 64 MiB. Use `amd-bench`
+only for dump comparisons not yet migrated,
 synthetic packet probes, and explicit TP correctness audits.
 
 ```bash

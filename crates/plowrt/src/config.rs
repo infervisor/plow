@@ -537,6 +537,15 @@ pub struct AmdRuntimeConfig {
     )]
     pub tens_snap: Option<String>,
 
+    /// Comma-separated named tensors captured by `--amd-tens-snap`.
+    #[arg(
+        long = "amd-snap-tensors",
+        env = "PLOW_SNAP_TENSORS",
+        hide = true,
+        global = true
+    )]
+    pub snap_tensors: Option<String>,
+
     /// Sequence slot captured by `--amd-tens-snap`.
     #[arg(
         long = "amd-snap-slot",

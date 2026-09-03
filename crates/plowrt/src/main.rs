@@ -70,10 +70,23 @@ enum Cmd {
         #[arg(long)]
         assets: PathBuf,
         /// Comma-separated token ids. Omit for deterministic random ids.
-        #[arg(long, conflicts_with = "random_input_len")]
+        #[arg(long, conflicts_with_all = ["random_input_len", "prompt_rows"])]
         prompt_ids: Option<String>,
+        /// File containing one comma-separated token-id row per request.
+        /// Row count must equal `--warmup-requests + --requests`.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "prompt_ids",
+                "random_input_len",
+                "prefill_sweep",
+                "prefill_lengths",
+                "parity_report"
+            ]
+        )]
+        prompt_rows: Option<PathBuf>,
         /// Number of deterministic random prompt tokens.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "prompt_rows")]
         random_input_len: Option<usize>,
         /// Run a one-load, cold-prefill TTFT sweep through the production mux.
         ///
@@ -457,6 +470,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Bench {
             assets,
             prompt_ids,
+            prompt_rows,
             random_input_len,
             prefill_sweep,
             prefill_lengths,
@@ -478,6 +492,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bench(
                 assets,
                 prompt_ids,
+                prompt_rows,
                 random_input_len.unwrap_or(32),
                 prefill_sweep,
                 prefill_lengths,
@@ -687,6 +702,7 @@ mod amd_bench_cli_tests {
         Cli,
     };
     use clap::Parser;
+    use plowrt::serve::bench::Input;
 
     #[test]
     fn unbound_run_requires_explicit_synthetic_probe() {
@@ -823,6 +839,29 @@ mod amd_bench_cli_tests {
     }
 
     #[test]
+    fn production_snapshot_tensor_selection_is_configurable() {
+        let cli = Cli::try_parse_from([
+            "plowrt",
+            "--amd-tens-snap",
+            "snapshots",
+            "--amd-snap-tensors",
+            "act.logits,act.x",
+            "--amd-snap-slot",
+            "0",
+            "bench",
+            "--assets",
+            "model",
+        ])
+        .unwrap();
+        assert_eq!(cli.rt_cfg.amd.tens_snap.as_deref(), Some("snapshots"));
+        assert_eq!(
+            cli.rt_cfg.amd.snap_tensors.as_deref(),
+            Some("act.logits,act.x")
+        );
+        assert_eq!(cli.rt_cfg.amd.snap_slot, 0);
+    }
+
+    #[test]
     fn parity_report_requires_one_exact_measured_request() {
         assert!(validate_parity_report_options(true, true, 1, 1, 0).is_ok());
         assert!(Cli::try_parse_from([
@@ -867,10 +906,25 @@ mod amd_bench_cli_tests {
 
     #[test]
     fn token_audit_requires_exact_bounded_rows() {
-        assert!(validate_token_audit_options(true, Some("1,2,3"), 4, 8).is_ok());
-        assert!(validate_token_audit_options(true, None, 4, 8).is_err());
-        assert!(validate_token_audit_options(true, Some("1"), 65, 8).is_err());
-        assert!(validate_token_audit_options(true, Some("1"), 64, 1024).is_err());
+        assert!(
+            validate_token_audit_options(true, &Input::TokenIds(vec![1, 2, 3]), 0, 4, 8).is_ok()
+        );
+        assert!(
+            validate_token_audit_options(true, &Input::Random { len: 3, seed: 0 }, 0, 4, 8)
+                .is_err()
+        );
+        assert!(validate_token_audit_options(true, &Input::TokenIds(vec![1]), 0, 65, 8).is_err());
+        assert!(
+            validate_token_audit_options(true, &Input::TokenIds(vec![1]), 0, 64, 1024).is_err()
+        );
+        assert!(validate_token_audit_options(
+            true,
+            &Input::TokenRows(vec![vec![9], vec![1, 2, 3]]),
+            1,
+            1,
+            8
+        )
+        .is_ok());
         assert!(Cli::try_parse_from([
             "plowrt",
             "bench",
@@ -880,6 +934,50 @@ mod amd_bench_cli_tests {
             "--parity-report",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn prompt_rows_cli_is_exact_and_conflicts_with_other_input_modes() {
+        assert!(Cli::try_parse_from([
+            "plowrt",
+            "bench",
+            "--assets",
+            "model",
+            "--prompt-rows",
+            "rows.csv",
+            "--token-audit",
+        ])
+        .is_ok());
+        for conflicting in ["--prompt-ids", "--random-input-len"] {
+            let value = if conflicting == "--prompt-ids" {
+                "1,2"
+            } else {
+                "2"
+            };
+            assert!(Cli::try_parse_from([
+                "plowrt",
+                "bench",
+                "--assets",
+                "model",
+                "--prompt-rows",
+                "rows.csv",
+                conflicting,
+                value,
+            ])
+            .is_err());
+        }
+        for conflicting in ["--prefill-sweep", "--parity-report"] {
+            assert!(Cli::try_parse_from([
+                "plowrt",
+                "bench",
+                "--assets",
+                "model",
+                "--prompt-rows",
+                "rows.csv",
+                conflicting,
+            ])
+            .is_err());
+        }
     }
 }
 
@@ -2395,6 +2493,7 @@ async fn bringup_runtime(
 async fn bench(
     assets: PathBuf,
     prompt_ids: Option<String>,
+    prompt_rows: Option<PathBuf>,
     random_input_len: usize,
     prefill_sweep: bool,
     prefill_lengths: Option<String>,
@@ -2411,14 +2510,26 @@ async fn bench(
     parity_report: bool,
     token_audit: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let input = match (prompt_ids.as_deref(), prompt_rows.as_deref()) {
+        (Some(raw), None) => plowrt::serve::bench::Input::TokenIds(parse_token_ids(raw)?),
+        (None, Some(path)) => {
+            plowrt::serve::bench::Input::TokenRows(plowrt::serve::bench::read_prompt_rows(path)?)
+        }
+        (None, None) => plowrt::serve::bench::Input::Random {
+            len: random_input_len,
+            seed,
+        },
+        (Some(_), Some(_)) => return Err("--prompt-ids conflicts with --prompt-rows".into()),
+    };
     validate_parity_report_options(
         parity_report,
-        prompt_ids.is_some(),
+        matches!(&input, plowrt::serve::bench::Input::TokenIds(_)),
         concurrency,
         requests,
         warmup_requests,
     )?;
-    validate_token_audit_options(token_audit, prompt_ids.as_deref(), requests, output_len)?;
+    plowrt::serve::bench::validate_request_layout(&input, warmup_requests, requests)?;
+    validate_token_audit_options(token_audit, &input, warmup_requests, requests, output_len)?;
     let state = bringup_runtime(vec![assets], executors, false, mux_cfg).await?;
     let models = state
         .registry
@@ -2427,13 +2538,6 @@ async fn bench(
         .collect::<Vec<_>>();
     let [model] = models.as_slice() else {
         return Err(format!("bench requires exactly one model, loaded {}", models.len()).into());
-    };
-    let input = match prompt_ids {
-        Some(raw) => plowrt::serve::bench::Input::TokenIds(parse_token_ids(&raw)?),
-        None => plowrt::serve::bench::Input::Random {
-            len: random_input_len,
-            seed,
-        },
     };
     let runtime = serde_json::json!({
         "config": format!("{:#?}", RuntimeConfig::global()),
@@ -2528,18 +2632,28 @@ const MAX_TOKEN_AUDIT_IDS: usize = 65_536;
 
 fn validate_token_audit_options(
     token_audit: bool,
-    prompt_ids: Option<&str>,
+    input: &plowrt::serve::bench::Input,
+    warmup_requests: usize,
     requests: usize,
     output_tokens: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !token_audit {
         return Ok(());
     }
-    let prompt = prompt_ids.ok_or("--token-audit requires --prompt-ids")?;
-    let prompt_len = parse_token_ids(prompt)?.len();
-    let total_ids = prompt_len
-        .checked_add(output_tokens)
-        .and_then(|per_request| per_request.checked_mul(requests))
+    let prompt_ids = match input {
+        plowrt::serve::bench::Input::TokenIds(ids) => ids.len().checked_mul(requests),
+        plowrt::serve::bench::Input::TokenRows(rows) => rows
+            .get(warmup_requests..)
+            .ok_or("--token-audit prompt row layout is incomplete")?
+            .iter()
+            .try_fold(0usize, |total, row| total.checked_add(row.len())),
+        plowrt::serve::bench::Input::Random { .. } => {
+            return Err("--token-audit requires --prompt-ids or --prompt-rows".into())
+        }
+    };
+    let total_ids = output_tokens
+        .checked_mul(requests)
+        .and_then(|outputs| prompt_ids.and_then(|prompts| prompts.checked_add(outputs)))
         .ok_or("--token-audit token count overflow")?;
     if requests == 0 || requests > MAX_TOKEN_AUDIT_REQUESTS || total_ids > MAX_TOKEN_AUDIT_IDS {
         return Err(format!(

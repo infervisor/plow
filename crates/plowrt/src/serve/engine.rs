@@ -117,7 +117,8 @@ pub use amd_serve::AmdServe;
 
 #[cfg(feature = "hsa")]
 mod amd_serve {
-    use std::path::Path;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     use crate::exec::amd::AmdEngine;
@@ -135,6 +136,149 @@ mod amd_serve {
     enum Ranks {
         One(AmdEngine),
         Tp(AmdTpGroup),
+    }
+
+    const DEFAULT_SNAPSHOT_TENSORS: &str = "act.qa,act.oat,act.attn,act.xn";
+    const MAX_SNAPSHOT_TENSORS: usize = 16;
+    const MAX_SNAPSHOT_TENSOR_NAME: usize = 128;
+    const MAX_SNAPSHOT_TENSOR_BYTES: u64 = 64 << 20;
+    const SNAPSHOT_KV_BYTES: usize = 65_536;
+
+    struct TensorSnapshotConfig {
+        dir: PathBuf,
+        slot: usize,
+        tensors: Vec<String>,
+    }
+
+    impl Ranks {
+        fn rank0(&self) -> &AmdEngine {
+            match self {
+                Ranks::One(e) => e,
+                Ranks::Tp(g) => g.rank(0),
+            }
+        }
+
+        fn ctr_snapshot(&mut self, program: usize) -> Result<Vec<u32>> {
+            match self {
+                Ranks::One(e) => e.ctr_word0_snapshot(program),
+                Ranks::Tp(g) => g.ctr_snapshot(program),
+            }
+        }
+
+        fn data_snapshot(
+            &mut self,
+            slot: usize,
+            tensors: &[String],
+        ) -> Result<Vec<(String, Vec<u8>)>> {
+            match self {
+                Ranks::One(e) => {
+                    let mut out = e.snapshot_kv_slot(slot, SNAPSHOT_KV_BYTES)?;
+                    for name in tensors {
+                        out.push((name.clone(), e.snapshot_tensor(name)?));
+                    }
+                    Ok(out)
+                }
+                Ranks::Tp(g) => g.data_snapshot(slot, SNAPSHOT_KV_BYTES, tensors),
+            }
+        }
+    }
+
+    fn parse_snapshot_tensors(spec: Option<&str>) -> Result<Vec<String>> {
+        let spec = spec.unwrap_or(DEFAULT_SNAPSHOT_TENSORS);
+        let tensors = spec
+            .split(',')
+            .map(str::trim)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if tensors.is_empty() || tensors.iter().any(String::is_empty) {
+            return Err(RuntimeError::Device(
+                "AMD snapshot tensor list contains an empty name".into(),
+            ));
+        }
+        if tensors.len() > MAX_SNAPSHOT_TENSORS {
+            return Err(RuntimeError::Device(format!(
+                "AMD snapshot tensor list has {} entries; maximum is {MAX_SNAPSHOT_TENSORS}",
+                tensors.len()
+            )));
+        }
+        for (i, name) in tensors.iter().enumerate() {
+            if name.len() > MAX_SNAPSHOT_TENSOR_NAME {
+                return Err(RuntimeError::Device(format!(
+                    "AMD snapshot tensor name {name:?} is longer than {MAX_SNAPSHOT_TENSOR_NAME} bytes"
+                )));
+            }
+            if tensors[..i].contains(name) {
+                return Err(RuntimeError::Device(format!(
+                    "duplicate AMD snapshot tensor {name:?}"
+                )));
+            }
+            let component = snapshot_file_component(name);
+            if tensors[..i]
+                .iter()
+                .any(|prior| snapshot_file_component(prior) == component)
+            {
+                return Err(RuntimeError::Device(format!(
+                    "AMD snapshot tensor {name:?} aliases another output filename"
+                )));
+            }
+        }
+        Ok(tensors)
+    }
+
+    fn validate_tensor_snapshot(engine: &AmdEngine, slot: usize, tensors: &[String]) -> Result<()> {
+        if slot >= engine.batch() {
+            return Err(RuntimeError::Device(format!(
+                "AMD snapshot slot {slot} past engine batch {}",
+                engine.batch()
+            )));
+        }
+        let mut total = 0u64;
+        for name in tensors {
+            let bytes = engine.tensor_bytes(name).ok_or_else(|| {
+                RuntimeError::Device(format!("AMD snapshot tensor {name:?} is not declared"))
+            })?;
+            total = total.checked_add(bytes).ok_or_else(|| {
+                RuntimeError::Device("AMD snapshot tensor byte count overflow".into())
+            })?;
+        }
+        if total > MAX_SNAPSHOT_TENSOR_BYTES {
+            return Err(RuntimeError::Device(format!(
+                "AMD snapshot tensors total {total} bytes; maximum is {MAX_SNAPSHOT_TENSOR_BYTES}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn prepare_snapshot_dir(path: &Path) -> Result<()> {
+        std::fs::create_dir_all(path).map_err(|source| RuntimeError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn write_snapshot(path: PathBuf, bytes: &[u8]) -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|source| RuntimeError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.write_all(bytes)
+            .map_err(|source| RuntimeError::Io { path, source })
+    }
+
+    fn snapshot_file_component(name: &str) -> String {
+        name.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
     }
 
     /// The gfx950 serving engine: `B` independent sequence slots sharing one
@@ -206,6 +350,10 @@ mod amd_serve {
         /// ladder is engaging, and a measurement that cannot show that is not a measurement.
         last_rung: u32,
         diagnostics: Option<EngineDiagnostics>,
+        counter_snapshot_dir: Option<PathBuf>,
+        tensor_snapshot: Option<TensorSnapshotConfig>,
+        counter_snapshot_tick: u64,
+        tensor_snapshot_tick: u64,
     }
 
     /// A prompt part-way through its prefill.
@@ -351,6 +499,27 @@ mod amd_serve {
                 Ranks::Tp(g) => g.rank(0).decode_rungs(),
             }
             .into_boxed_slice();
+            let snapshot_cfg = &crate::config::RuntimeConfig::get().amd;
+            let counter_snapshot_dir = snapshot_cfg.ctr_snap.as_deref().map(PathBuf::from);
+            let tensor_snapshot = snapshot_cfg
+                .tens_snap
+                .as_deref()
+                .map(|dir| {
+                    let tensors = parse_snapshot_tensors(snapshot_cfg.snap_tensors.as_deref())?;
+                    validate_tensor_snapshot(ranks.rank0(), snapshot_cfg.snap_slot, &tensors)?;
+                    Ok(TensorSnapshotConfig {
+                        dir: PathBuf::from(dir),
+                        slot: snapshot_cfg.snap_slot,
+                        tensors,
+                    })
+                })
+                .transpose()?;
+            if let Some(dir) = counter_snapshot_dir.as_deref() {
+                prepare_snapshot_dir(dir)?;
+            }
+            if let Some(snapshot) = tensor_snapshot.as_ref() {
+                prepare_snapshot_dir(&snapshot.dir)?;
+            }
             tracing::info!(
                 n_gpu,
                 max_ctx,
@@ -390,6 +559,10 @@ mod amd_serve {
                 prefill_turn: 0,
                 last_rung: 0,
                 diagnostics: None,
+                counter_snapshot_dir,
+                tensor_snapshot,
+                counter_snapshot_tick: 0,
+                tensor_snapshot_tick: 0,
             })
         }
 
@@ -1024,6 +1197,35 @@ mod amd_serve {
             Ok(())
         }
 
+        fn capture_decode_snapshots(&mut self, program: usize, rung: u32) -> Result<()> {
+            if let Some(dir) = self.counter_snapshot_dir.as_ref() {
+                let snapshot = self.ranks.ctr_snapshot(program)?;
+                let bytes = snapshot
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>();
+                let path = dir.join(format!(
+                    "tick_{:05}_r{rung}.bin",
+                    self.counter_snapshot_tick
+                ));
+                write_snapshot(path, &bytes)?;
+                self.counter_snapshot_tick += 1;
+            }
+            if let Some(snapshot) = self.tensor_snapshot.as_ref() {
+                let tensors = self.ranks.data_snapshot(snapshot.slot, &snapshot.tensors)?;
+                for (name, bytes) in tensors {
+                    let path = snapshot.dir.join(format!(
+                        "t{:05}_r{rung}_{}.bin",
+                        self.tensor_snapshot_tick,
+                        snapshot_file_component(&name)
+                    ));
+                    write_snapshot(path, &bytes)?;
+                }
+                self.tensor_snapshot_tick += 1;
+            }
+            Ok(())
+        }
+
         /// One dispatch that advances only `slot`, returning its token.
         fn dispatch(&mut self, slot: usize) -> Result<u32> {
             Ok(self.dispatch_all(&[slot])?[slot])
@@ -1050,10 +1252,12 @@ mod amd_serve {
             if self.batch == 1 {
                 let pos = self.pos[0];
                 use crate::obs::dstep;
-                let t = match &mut self.ranks {
+                let (token, program, rung) = match &mut self.ranks {
                     Ranks::One(e) => {
+                        let program = e.decode_prog();
+                        let rung = e.prog_t(program);
                         dstep::timed(&dstep::SEED, || e.seed_ids(&self.next_id))?;
-                        e.decode_step(pos, pos + 1)?
+                        (e.decode_step(pos, pos + 1)?, program, rung)
                     }
                     // The split pair, not `decode_step`, because this is the
                     // server and the split exists for it. NOTHING sits between
@@ -1063,16 +1267,23 @@ mod amd_serve {
                     // The argument, with the numbers, is in `exec::amd_tp`'s
                     // module doc — read it before putting work here.
                     Ranks::Tp(g) => {
+                        let program = g.rank(0).decode_prog();
+                        let rung = g.rank(0).prog_t(program);
                         dstep::timed(&dstep::SEED, || g.seed_ids(&self.next_id))?;
                         g.submit_decode(pos, pos + 1)?;
                         let ids = g.complete_decode()?;
-                        dstep::timed(&dstep::AGREE, || AmdTpGroup::agree(&ids))?
+                        (
+                            dstep::timed(&dstep::AGREE, || AmdTpGroup::agree(&ids))?,
+                            program,
+                            rung,
+                        )
                     }
                 };
+                self.capture_decode_snapshots(program, rung)?;
                 for &s in advance {
                     self.pos[s] += 1;
                 }
-                return Ok(vec![t]);
+                return Ok(vec![token]);
             }
             for s in 0..self.batch {
                 // A slot MID-CHUNKED-PREFILL is not live, but it must not be fed row 0 either:
@@ -1131,7 +1342,7 @@ mod amd_serve {
                      {rows} rows — the slot table and the live set disagree"
                 )));
             }
-            let out = match &mut self.ranks {
+            let (out, program, rung) = match &mut self.ranks {
                 Ranks::One(e) => {
                     let dp = e.decode_prog_for(rows);
                     let w = e.prog_t(dp);
@@ -1148,7 +1359,11 @@ mod amd_serve {
                     }
                     e.upload_parked(&self.parked_stage)?;
                     e.seed_ids(&self.next_id)?;
-                    e.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?
+                    (
+                        e.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?,
+                        dp,
+                        w,
+                    )
                 }
                 Ranks::Tp(g) => {
                     let dp = g.rank(0).decode_prog_for(rows);
@@ -1174,43 +1389,14 @@ mod amd_serve {
                     );
                     g.upload_parked(&self.parked_stage)?;
                     g.seed_ids(&self.next_id)?;
-                    let out = g.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
-                    // Task-9 differential counter audit: dump rank-0 end-state
-                    // counters per tick for offline diff (same rung ⇒ must be
-                    // byte-identical every tick).
-                    if let Some(dir) = crate::config::RuntimeConfig::get().amd.ctr_snap.as_deref() {
-                        use std::sync::atomic::{AtomicU64, Ordering};
-                        static TICK: AtomicU64 = AtomicU64::new(0);
-                        let t = TICK.fetch_add(1, Ordering::Relaxed);
-                        if let Ok(snap) = g.ctr_snapshot(dp) {
-                            let bytes: Vec<u8> =
-                                snap.iter().flat_map(|v| v.to_le_bytes()).collect();
-                            let _ = std::fs::write(format!("{dir}/tick_{t:05}_r{w}.bin"), bytes);
-                        }
-                    }
-                    // Round-7 data audit: layer-0 KV slot head + act tensors of
-                    // PLOW_SNAP_SLOT after each tick.
-                    if let Some(dir) = crate::config::RuntimeConfig::get().amd.tens_snap.as_deref()
-                    {
-                        use std::sync::atomic::{AtomicU64, Ordering};
-                        static DTICK: AtomicU64 = AtomicU64::new(0);
-                        let t = DTICK.fetch_add(1, Ordering::Relaxed);
-                        let slot = crate::config::RuntimeConfig::get().amd.snap_slot;
-                        if let Ok(snaps) = g.data_snapshot(
-                            slot,
-                            65536,
-                            &["act.qa", "act.oat", "act.attn", "act.xn"],
-                        ) {
-                            for (name, bytes) in snaps {
-                                let f = name.replace('/', "_");
-                                let _ =
-                                    std::fs::write(format!("{dir}/t{t:05}_r{w}_{f}.bin"), bytes);
-                            }
-                        }
-                    }
-                    out
+                    (
+                        g.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?,
+                        dp,
+                        w,
+                    )
                 }
             };
+            self.capture_decode_snapshots(program, rung)?;
             for &s in advance {
                 self.pos[s] += 1;
             }
@@ -1221,8 +1407,9 @@ mod amd_serve {
     #[cfg(test)]
     mod tests {
         use super::{
-            bounded_deferred_quantum, invalidate_prefix_metadata, split_pending_prefill,
-            stage_parked, PfCursor,
+            bounded_deferred_quantum, invalidate_prefix_metadata, parse_snapshot_tensors,
+            snapshot_file_component, split_pending_prefill, stage_parked, PfCursor,
+            DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
 
@@ -1232,6 +1419,58 @@ mod amd_serve {
             assert_eq!(bounded_deferred_quantum(9, 100), Some(4));
             assert_eq!(bounded_deferred_quantum(4, 3), Some(3));
             assert_eq!(bounded_deferred_quantum(4, 1), None);
+        }
+
+        #[test]
+        fn snapshot_tensor_list_is_bounded_and_uses_compatibility_default() {
+            assert_eq!(
+                parse_snapshot_tensors(None).unwrap().join(","),
+                DEFAULT_SNAPSHOT_TENSORS
+            );
+            assert_eq!(
+                parse_snapshot_tensors(Some(" act.logits, act.x ")).unwrap(),
+                ["act.logits", "act.x"]
+            );
+            assert!(parse_snapshot_tensors(Some("act.x,,act.logits")).is_err());
+            assert!(parse_snapshot_tensors(Some("act.x,act.x")).is_err());
+            assert!(parse_snapshot_tensors(Some("act/a,act:a")).is_err());
+            let too_many = (0..=MAX_SNAPSHOT_TENSORS)
+                .map(|i| format!("act.{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            assert!(parse_snapshot_tensors(Some(&too_many)).is_err());
+        }
+
+        #[test]
+        fn snapshot_tensor_names_cannot_create_subdirectories() {
+            assert_eq!(snapshot_file_component("act/a:b"), "act_a_b");
+        }
+
+        #[test]
+        fn snapshot_write_errors_are_not_swallowed() {
+            let dir = std::env::temp_dir()
+                .join(format!("plow-snapshot-write-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            assert!(super::write_snapshot(dir.clone(), b"snapshot").is_err());
+            std::fs::remove_dir(dir).unwrap();
+        }
+
+        #[test]
+        fn snapshot_writes_never_overwrite_an_existing_tick() {
+            let path = std::env::temp_dir().join(format!(
+                "plow-snapshot-create-new-test-{}",
+                std::process::id()
+            ));
+            super::write_snapshot(path.clone(), b"first").unwrap();
+            let err = super::write_snapshot(path.clone(), b"second").unwrap_err();
+            match err {
+                crate::RuntimeError::Io { source, .. } => {
+                    assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists)
+                }
+                other => panic!("unexpected snapshot error: {other}"),
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), b"first");
+            std::fs::remove_file(path).unwrap();
         }
 
         #[test]
