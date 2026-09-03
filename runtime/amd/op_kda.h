@@ -1145,7 +1145,7 @@ __device__ void d_kda_state_step_t(bf16* __restrict__ o, const bf16* __restrict_
                  * over whatever the loop above accumulated. eps INSIDE the sqrt. */
                 qs = block_sum(qs, lds + 3 * D);
                 ks = block_sum(ks, lds + 3 * D + PLOW_WAVES);
-                const float rq = scale / sqrtf(qs + 1e-6f), rk = 1.0f / sqrtf(ks + 1e-6f);
+                const float rq = scale * rsqrtf(qs + 1e-6f), rk = rsqrtf(ks + 1e-6f);
                 for (unsigned d = threadIdx.x; d < D; d += PLOW_THREADS) {
                     l_q[d] *= rq;
                     l_k[d] *= rk;

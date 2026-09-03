@@ -658,7 +658,7 @@ report also includes the per-rank queue identities and raw prefill/decode ranges
 used to derive the fail-closed result.
 | `PLOW_HSACO_LOWRUNG=dir:max[,dir:max…]` | unset | AMD decode-object tiers. The runtime selects the narrowest tier whose `max` covers the occupied decode rung, pairing-checks each tier at that width, and falls back to the primary HSACO inventory above it. A single legacy `dir` uses `PLOW_LOWRUNG_MAX` (default 2). |
 | `PLOW_STATE_CLEAR_DEVICE=1` | off | AMD admission experiment: clear slot-major recurrent state with one device kernel per rank instead of host-staged SDMA fills. Requires rebuilt decode objects carrying `plow_state_clear`. |
-| `PLOW_SEG_PACKED_PREFILL=1` | off | AMD emit-time experiment: split descriptor-consuming MLA norm/cache, MLA flash, and serial-KDA ops into pure topological segments. No model-name predicates. Unset preserves packet bytes. |
+| `PLOW_SEG_PACKED_PREFILL=1` | off | AMD emit-time experiment: split descriptor-consuming MLA norm/cache, MLA flash, and serial-KDA ops into pure topological segments in prefill programs only. Decode ladder programs remain single-launch; the AMD loader rejects packets that encode decode as multiple wave segments. No model-name predicates. Unset preserves packet bytes. |
 | `PLOW_PACKED_PREFILL_ROUTE=1` | off | Load the optional lean packed-family HSACO objects and permit exact-family routing after metadata is staged. Missing/wrong markers and mixed segments refuse. Live AMD co-packing also requires `PLOW_PF_BATCH=1`, TP, an emitted `PLOW_SEG_PACKED_PREFILL=1` packet, and objects built with `PLOW_HSACO_PACKED_PREFILL_CONSUMERS=ON`; otherwise the mux uses isolated prefill. |
 
 ### Segmented prefill (sm_90a / GH200)

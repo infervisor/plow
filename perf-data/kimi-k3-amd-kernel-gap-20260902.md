@@ -25,6 +25,161 @@ vLLM's current 20.768 ms TPOT, but that 1.39x gap is directional rather than a
 release comparison. Current MI325X results are useful implementation evidence,
 not substitutes for a gfx950 gate.
 
+## Exact isolated gates — 2026-09-03
+
+Measurements used clean one-GPU leases on the same MI355X host. The initial
+KDA/reference measurements were separate leases; later arithmetic and cache
+policy screens explicitly use interleaved or order-reversed same-lease A/B.
+The reference was the pinned vLLM 0.28 image
+sha256:e0a3b2bd3fe7ec563916c3a5d949898d133458c18d6b2f460c906885cfb32032
+running its ROCm fused_kda_decode benchmark. Plow used ROCm 7.14 and the
+production op_kda.h bodies through
+runtime/bench/amd/kda_decode_fused_exact.{hip,cpp}.
+
+| KDA decode boundary | B1 | B8 | Gate |
+|---|---:|---:|---|
+| vLLM fused conv + recurrence + gated RMSNorm | 8.40 us | 9.24 us | reference |
+| Plow three-kernel control, same semantic boundary | 9.826 us | 21.294 us | loses 1.17x / 2.30x |
+| Plow one-block-per-head fused candidate | 17.829 us | 18.434 us | rejected |
+| Plow control with 1024 state-step workgroups | — | 14.409 us | diagnostic only; loses 1.56x |
+
+The Plow oracle passed at B1 and B8: BF16 output and FP32 convolution state were
+exact, and recurrent-state relative L2 was about 1.2e-8. The fused candidate
+used 34 VGPR, 1,888 B LDS, and no spills. It is still slower, so none of it is
+promoted to the production operator.
+
+This is not strict dtype parity: vLLM stores convolution state as BF16 while
+Plow stores it as FP32. The comparison is valid at the semantic boundary and
+live geometry, but dtype parity remains a separate gate. The useful result is
+the B8 scaling diagnosis: raising the state-step grid from the interpreter
+ceiling of 256 workgroups to 1024 reduced that kernel from 12.659 to 7.241 us.
+Multiple resident workgroups or an out-of-interpreter dispatch seam must be
+tested before another fusion attempt.
+
+An interleaved same-lease arithmetic A/B then replaced the state body's two
+refined sqrt/div sequences with reciprocal square root, matching the reference
+kernel's operation. At B8/grid256 the isolated state step moved from
+12.620-12.647 us to 11.977-11.984 us (-5.1% to -5.3%). At the diagnostic
+grid1024 it moved from 7.240 us to 7.065 us (-2.4%). BF16 output remained exact;
+recurrent-state relative L2 was 1.46e-8. This candidate is promoted. It does
+not close the boundary: the optimized three-kernel B8 chain is about 20.3 us
+vs vLLM's 9.24 us fused kernel.
+
+The next isolated state candidate keeps the FP32 V-first layout but maps each
+BV8 value tile to a 128-thread workgroup containing eight 16-lane groups. Each
+lane moves state through two vector loads and stores, and four DPP stages
+replace the wave64 LDS-permute reduction. It uses 49 VGPR, 35 SGPR, 1,584 B
+LDS, and no spills. A ROCm 7.14 confirmation measured B1 state at 2.884 us
+and B8 state at 4.041 us, consistent with the initial 2.866/3.973-4.089 us
+screen. The actual three-kernel chain improved from 10.346 to 9.632 us at B1
+and 14.399 to 11.489 us at B8. The B1 final output
+was exact; B8 final relative L2 was 4.21e-6. This is a decisive isolated Plow
+kernel win, but remains benchmark-only: its chain still loses the pinned vLLM
+fused boundary by 14.7% at B1 and 24.3% at B8. Production integration is gated
+on a lean 128-thread dispatch path and a matched fused-block win.
+
+A first 128-thread fused conv/state/norm block preserved the vector state
+traffic and oracle but failed its promotion gate: 13.669 us at B1 and
+15.022 us at B8, 40.5% and 30.9% slower than the corresponding three-kernel
+vector chain. It used 65 VGPR, 45 SGPR, 1,840 B LDS, and no spills. One
+workgroup per row/head exposes only 12/96 workgroups and serializes sixteen
+BV8 state tiles without the reference kernel's preload schedule. The arm
+remains benchmark-only and rejected; the next fused screen must use the
+reference 256-thread, sixteen-group state pipeline.
+
+That second fused screen wins the exact semantic boundary. One 256-thread
+workgroup owns each row/head; sixteen 16-lane groups preload all FP32 state
+vectors before convolution, then use vector non-temporal state traffic and
+DPP reductions. The ROCm 7.14 confirmation measured 5.974 us at B1 and
+6.514 us at B8, 28.9% and 29.5% faster than pinned vLLM's 8.40/9.24 us.
+Convolution state was exact; B1 final output was exact; B8 final relative L2
+was 4.20e-6. The kernel uses 128 VGPR, 45 SGPR, 2,336 B LDS, and no spills.
+This passes the isolated and fused-block gates. Production integration remains
+separate and must route by opcode geometry/capability, with an exact fallback
+for unsupported shapes.
+
+The exact BF16 MLA decode harness uses the emitted TP8 geometry rather than
+the old FP8/gfx942 sweep: H=12, DK=512, DR=64, V=128, context=8192, ns=64,
+scale=1/sqrt(192), and KV stride=32768. Plow's matched attention core
+(flash plus standalone merge) measured 46.720 us at B1 and 113.397 us at B8.
+The pinned vLLM/AITER core, including its H12-to-H16 pad/unpad, measured
+43.232 us and 42.441 us. Plow is 8.1% slower at B1 and 2.67x slower at B8.
+A grid256-to-grid96 screen was neutral and rejected.
+
+The W_uv sub-boundary is not the cause. Plow's BF16 fold measured
+10.756/10.832 us vs torch BF16 BMM at 13.895/13.949 us, about 1.29x faster.
+The actual vLLM MXFP4 W_uv call measured 34.565/34.808 us at these small M
+shapes. Plow's emitted fused merge-fold measured 30.936 us at B1 and
+99.189 us at B8. Sums across separately timed calls are estimates, not a
+serving claim: the actionable isolated miss is B8 flash attention. The fused
+vs separate Plow path differed by relative L2 0.00101/0.00143; this is a
+cross-path tolerance check, not yet an independent correctness oracle.
+Changing GF4 to GF6 improved B8 flash from 81.381 to 75.681 us (-7.0%) but
+regressed B1 from 14.488 to 19.032 us (+31.4%) and introduced four VGPR spills
+and 20 B scratch. It remains benchmark-only. A stronger next screen is
+batch/head-group-aware split selection: current B8 GF4/ns64 creates 1,536
+logical units over 256 workgroups, while AITER selects 256 units.
+
+The current grouped-MoE microbenchmark is not a valid AITER comparison. It
+previously defaulted to unsharded I=3072; the emitted TP8 packet uses local
+I=384. It also times only grouped GLU and down with routing metadata prepared,
+while the selected vLLM AITER path uses A8W4 and its complete fused-MoE timing
+includes sort, activation quantization and reduction. Router top-k remains
+outside both boundaries. The benchmark now defaults to I=384 and exposes the
+local width as an argument.
+
+The final same-lease exact T=1024, H=3584, I=384, E=896, top-16, SiTU-v2
+control measured Plow A4W4 stage 1 at 1.000-1.001 ms and stage 2 at
+1.151-1.152 ms, or 2.151-2.153 ms for the pair. This supersedes an earlier
+separate-lease 2.676 ms sample. The pinned AITER table's exact A4W4 peer is
+205.373 us plus 144.527 us = 349.900 us; its actually selected A8W4 row is
+199.569 us plus 139.605 us = 339.174 us. A8 intermediates explain only 3.2%
+of that reference result. Plow's like-precision pair is still 6.15x slower
+than AITER A4W4.
+
+A live pinned-vLLM run measured the larger AITER fused-MoE boundary, including
+sort, input quantization, both expert stages and reduction, at 575.825 us;
+fused top-k plus that boundary was 640.586 us. The incomplete Plow expert pair
+alone is therefore 3.74x slower than the larger expert boundary and 3.36x
+slower than route plus experts. That is decisive even though the live
+precision and boundary details differ.
+
+The synthetic H=I=256, E=3 oracle passed before timing: stage 2 checked 14,208
+values with no unwritten output and 5.43e-8 worst relative error; stage 1
+checked 28,416 values with 0.4837 worst FP4 ULP. A production-size correctness
+oracle remains required. The first target is stage 2: Plow padded 16,384 live
+rows to 57,728 BM64 rows, then paid an FP32 scatter/partial round trip. The
+AITER cell uses BM32 with an atomic/reduction stage. Stage 1 follows: compare
+its A8W4 GUI-interleaved 32x128x256 schedule with the Plow A4W4
+BM64/BN256/BK128 schedule under a matched precision oracle.
+
+The follow-up used production's 512-thread workgroup at the same exact shape.
+BM32/WNc8 reduced padded rows from 57,728 to 32,448, but stage 2 moved only from
+1.153 ms to 1.134 ms (-1.65%); scatter plus reduction moved from 1.225 ms to
+1.203 ms (-1.80%). Direct atomic accumulation includes the required 14 MiB
+zero and lost to the corresponding scatter-plus-reduce boundary: 1.289 vs
+1.225 ms at BM64 (+5.2%), and 1.212 vs 1.203 ms at BM32 (+0.7%). The
+production-shape 3,670,016-value oracle passed with no mismatches. Both
+candidates are rejected. The earlier 256-thread BM32 result was not a
+production-representative gate.
+
+The AITER-inspired cache-policy follow-up independently screened non-temporal
+loads for the packed expert weights and their E8M0 weight scales. The exact
+BM64 production mapping ran forward and reverse order under one uncontended
+GPU lease; every cell used 31 timing iterations and passed the 3,670,016-value
+stage-2 oracle. Times below are the two-run medians reported by each process:
+
+| payload NT | weight-scale NT | stage 1 (ms) | stage 2 (ms) | pair (ms) |
+|---:|---:|---:|---:|---:|
+| 0 | 0 | 1.000 / 1.001 | 1.151 / 1.152 | 2.151 / 2.153 |
+| 0 | 1 | 1.090 / 1.088 | 1.160 / 1.160 | 2.250 / 2.248 |
+| 1 | 0 | 1.072 / 1.071 | 1.169 / 1.171 | 2.241 / 2.241 |
+| 1 | 1 | 1.116 / 1.115 | 1.173 / 1.173 | 2.289 / 2.289 |
+
+Scale NT with a temporal payload regressed stage 1 by 8.8% and stage 2 by
+0.7%; the combined cell also lost. The scale-NT candidate was removed rather
+than retained as a production/build knob; payload NT remains default-off.
+
 ## Kernel and graph inventory
 
 | Phase | Graph stage | Plow path | Status | Evidence and remaining gap |

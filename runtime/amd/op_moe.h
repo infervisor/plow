@@ -3171,15 +3171,22 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
  * 8-of-384, so an expert holds ~21 rows at T=1024 and per-expert padding to 128 would run 6x
  * the MFMA rows. That reasoning is about the ROUTING, not the precision, so it is unchanged.
  * ========================================================================================== */
+#ifndef MPF4_BM
 #define MPF4_BM 64
+#endif
 #define MPF4_BN 256
 #define MPF4_BK 128                    /* K per staged tile = 2 MFMAs of K=64 */
 #define MPF4_RB (MPF4_BK / 2)          /* LDS row stride, BYTES (fp4 = 2/byte) = 64 */
 #define MPF4_SPR (MPF4_BK / 32)        /* E8M0 scale bytes per row per tile     = 4  */
 #define MPF4_ATB (MPF4_BM * MPF4_RB)   /* A tile bytes  = 4096  */
 #define MPF4_BTB (MPF4_BN * MPF4_RB)   /* B tile bytes  = 16384 */
-#define MPF4_WMc 2                     /* wave grid: the standard 2x4 (8 waves) */
+#define MPF4_WMc (MPF4_BM / MFMA_M)
+#ifndef MPF4_WNc
 #define MPF4_WNc 4
+#endif
+static_assert(MPF4_BM == 32 || MPF4_BM == 64, "A4W4 grouped MoE supports BM32 or BM64");
+static_assert(PLOW_WAVES == MPF4_WMc * MPF4_WNc,
+              "A4W4 grouped MoE tile must cover the full workgroup");
 /* 16-byte-column XOR swizzle over the 64-byte row: 4 groups, row&3 picks the rotation. Same
  * purpose as the bf16 body's — without it every row of a fragment read hits the same bank. */
 #define MPF4_XORSWZ(row, off) ((off) ^ (((row) & 3u) << 4))
@@ -3321,6 +3328,8 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                                     , unsigned det_ksh = 0
 #endif
                                     ) {
+    static_assert(!GLU || (MPF4_BM == 64 && MPF4_WNc == 4),
+                  "A4W4 GLU requires paired gate/up accumulators per wave");
     constexpr int SMa = MPF4_BM / MPF4_WMc / MFMA_M; /* 1 */
     constexpr int SNa = MPF4_BN / MPF4_WNc / MFMA_N; /* 2 */
     constexpr unsigned NB = GLU ? (MPF4_BN / 2) : MPF4_BN;
@@ -3647,8 +3656,10 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                     for (int el = 0; el < 16; el++) {
                         const unsigned rr =
                             wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
+#ifndef PLOW_MOE_A4W4_STAGE2_BENCH
                         Br[rr * (MPF4_BN / 2) + cc] =
                             moe_glu(acc[i][0][el], acc[i][1][el], act, beta, lbeta);
+#endif
                     }
             }
             __syncthreads();
@@ -4103,8 +4114,10 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                     for (int el = 0; el < 16; el++) {
                         const unsigned rr =
                             wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
+#ifndef PLOW_MOE_A4W4_STAGE2_BENCH
                         Br[rr * (MPF4_BN / 2) + cc] =
                             moe_glu(acc[i][0][el], acc[i][1][el], act, beta, lbeta);
+#endif
                     }
             }
             __syncthreads();
@@ -4274,7 +4287,7 @@ __device__ void d_moe_group_glu_pf(bf16* fu, const bf16* xn2, const unsigned lon
      * (A4W4 owns those slots for its own operands and never sets a8). */
     const unsigned char* aq = a8 ? (const unsigned char*)row_partidx : nullptr;
     const float* as_row = a8 ? (const float*)fu_scale : nullptr;
-#if PLOW_MOE_PF_A4W4
+#if PLOW_MOE_PF_A4W4 && !defined(PLOW_MOE_A4W4_STAGE2_BENCH)
     if (enc == PLOW_MOE_ENC_MXFP4) {
         /* A4W4. `fu` is the MXFP4 gathered intermediate and `fu_scale` its E8M0 rows; the
          * epilogue IS the fused bridge (SwiGLU + quantize + scale write in the sorted layout),
@@ -4354,7 +4367,7 @@ __device__ void d_moe_group_down_pf(float* part, const bf16* fu, const unsigned 
  * op_gemm.h's capacity marker: any object built from this source HAS the arms. */
 extern "C" __device__ unsigned plow_moe_pf_part16_arm = 1;
 extern "C" __device__ unsigned plow_moe_pf_a8_arm = 1;
-#if PLOW_MOE_PF_A4W4
+#if PLOW_MOE_PF_A4W4 && !defined(PLOW_MOE_A4W4_STAGE2_BENCH)
 extern "C" __device__ unsigned plow_moe_pf_a4w4_arm = 1;
 #endif
 #if PLOW_MOE_PF_ATOMIC
