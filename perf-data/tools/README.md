@@ -46,3 +46,21 @@ Measured detail behind it: `perf-data/gemma12b-gh200-prefill-campaign.md`
   `PLOW_REQUIRE_TUNED=1` makes the correctness gate and showdown require measured
   tile provenance; `bringup_tuning_profile_selftest.sh` covers missing,
   analytical, and measured manifests without a GPU.
+- `check_build_matrix.py MATRIX.json` statically binds requested build/run knobs
+  to captured evidence before a latency/throughput campaign. Each cell records
+  `artifact_kind` (`devblob` or `scheduled`), `mode`, exact `requested.compiler`
+  and `requested.runtime` maps, and matching `observed` maps. Devblob cells may
+  additionally require Lean verification/oracle, measured tuner provenance, an
+  exact decode program ladder (for example `[1,32,64,128]`), exact-cell
+  attention `nsplit`, backend defines, object markers, and the manifest/object
+  pairing hash. `objects.launch_rows` additionally checks the GEMV capacity/walk
+  and wide-argmax markers for the exact runtime-selected rung. Scheduled cells
+  may require `counter_elim`; this is deliberately rejected for devblobs
+  because it is a scheduled-DAG pass. Conversely,
+  devblob program/attention/object claims are rejected for scheduled packets.
+  Relative `manifest` paths resolve from the matrix file. The checker prints the
+  applicable/inapplicable optimization surfaces for every passing cell.
+  `check_build_matrix_selftest.sh` exercises missing/contradictory propagation,
+  ladder, attention, marker/pairing, and cross-artifact refusals without
+  compiling or using a GPU. K3 names occur only in its example evidence; the
+  checker has no model branches.
