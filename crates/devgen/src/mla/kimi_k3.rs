@@ -1242,6 +1242,7 @@ fn k3_build_model(
             crate::select_amd_attention(n_cu, t, ctx, shape, fallback_ns, fallback_ns).nsplit
         };
         let mut b = Builder::new(n_cu);
+        b.set_fuse_materialized_residual_inputs(emit_config::active().fuse_residual_input);
         b.set_tensor_dedup(true);
         // PLOW_L2_PLACE: `None` => byte-identical. Until this line the flag reached the dense-GQA
         // builders only, and `kimi_k3` is absent from the arch list that warns about being
@@ -1288,6 +1289,7 @@ fn k3_build_model(
     }
     for &t in pf {
         let mut b = Builder::new(n_cu);
+        b.set_fuse_materialized_residual_inputs(emit_config::active().fuse_residual_input);
         b.set_tensor_dedup(true);
         b.set_l2_placement(l2_layout);
         b.set_lean_moe_stage2_segments(

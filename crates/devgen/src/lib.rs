@@ -6608,6 +6608,7 @@ fn emit_dense_gqa(
             break;
         } // MoE without prefill: decode-only blob
         let mut b = Builder::new(n_cu);
+        b.set_fuse_materialized_residual_inputs(ecfg.fuse_residual_input);
         b.adopt_tensors(tensors.clone());
         b.set_l2_placement(l2_layout); // PLOW_L2_PLACE: None ⇒ byte-identical
         b.set_lean_moe_stage2_segments(amd && emit_config::active().moe_stage2_lean);
@@ -6662,6 +6663,7 @@ fn emit_dense_gqa(
     );
     for (ri, &rb) in rungs.iter().enumerate() {
         let mut bd = Builder::new(n_cu);
+        bd.set_fuse_materialized_residual_inputs(ecfg.fuse_residual_input);
         bd.adopt_tensors(tensors.clone());
         bd.set_l2_placement(l2_layout); // PLOW_L2_PLACE: None ⇒ byte-identical
         if amd {

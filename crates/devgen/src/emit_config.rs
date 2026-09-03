@@ -397,6 +397,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_GEMV_WALK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub gemv_walk: bool,
 
+    /// Fold graph-adjacent materialized Residual inputs into AttnRes. Bit-identical and
+    /// model-independent. DEFAULT ON; set `PLOW_FUSE_RESIDUAL_INPUT=0` to roll back.
+    #[arg(long, env = "PLOW_FUSE_RESIDUAL_INPUT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub fuse_residual_input: bool,
+
     // ──────────────────────────────────────────────────────────────────────────
     // GLM-5.2 / gfx942 campaign knobs
     //
@@ -695,6 +700,7 @@ impl EmitConfig {
             k3_seq_rows: std::env::var_os("PLOW_K3_SEQ_ROWS").is_some(),
             gemv_mm: env_u32("PLOW_GEMV_MM"),
             gemv_walk: env_bool("PLOW_GEMV_WALK"),
+            fuse_residual_input: env_opt_out("PLOW_FUSE_RESIDUAL_INPUT"),
             // GLM-5.2 / gfx942 campaign knobs. `env_opt_out` is NOT `!env_bool`: the
             // original call sites tested `!= Some("0")`, so any value other than "0"
             // (including an empty string) enables. Preserved verbatim.
@@ -928,6 +934,17 @@ mod tests {
 
         std::env::set_var("PLOW_KDA_CHUNK_QPRE", "0");
         assert!(!EmitConfig::from_env().kda_chunk_qpre);
+    }
+
+    #[test]
+    fn materialized_residual_fusion_defaults_on_and_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_FUSE_RESIDUAL_INPUT", "1")]);
+        std::env::remove_var("PLOW_FUSE_RESIDUAL_INPUT");
+        assert!(EmitConfig::from_env().fuse_residual_input);
+
+        std::env::set_var("PLOW_FUSE_RESIDUAL_INPUT", "0");
+        assert!(!EmitConfig::from_env().fuse_residual_input);
     }
 
     #[test]

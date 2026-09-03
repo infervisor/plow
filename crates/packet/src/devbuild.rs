@@ -327,6 +327,8 @@ pub struct Builder {
     lean_moe_stage2_segments: bool,
     /// Isolate structurally compatible MXFP4 grouped-MoE stage-1 packets.
     lean_moe_stage1_segments: bool,
+    /// Fold an eligible materialized Residual into its AttnRes consumer.
+    fuse_materialized_residual_inputs: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
     /// byte-identical. See [`Builder::set_gemv_split`].
     gemv_split: u32,
@@ -433,6 +435,7 @@ impl Builder {
             packed_prefill_segments: false,
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
+            fuse_materialized_residual_inputs: true,
             gemv_split: 1,
             tensor_dedup: false,
             tr_dropped: 0,
@@ -485,6 +488,10 @@ impl Builder {
 
     pub fn set_lean_moe_stage1_segments(&mut self, enabled: bool) {
         self.lean_moe_stage1_segments = enabled;
+    }
+
+    pub fn set_fuse_materialized_residual_inputs(&mut self, enabled: bool) {
+        self.fuse_materialized_residual_inputs = enabled;
     }
 
     /// Slice the machine-filling `Gemv` / `GemvGlu` / `GemvQkv` packets into `s * n_cu` shares
@@ -1079,7 +1086,7 @@ impl Builder {
     }
 
     pub fn finish(mut self) -> Program {
-        if std::env::var("PLOW_FUSE_RESIDUAL_INPUT").ok().as_deref() == Some("1") {
+        if self.fuse_materialized_residual_inputs {
             let fused = self.fuse_materialized_residual_inputs();
             if fused != 0 {
                 eprintln!("  whole-graph fusion: {fused} materialized residual inputs");
@@ -2765,6 +2772,31 @@ mod whole_graph_fusion_tests {
             assert!(matches!(b.ops[2].deps.as_slice(), [Dep::Coarse(1)]));
             assert_eq!(b.ops[2].counter, 2);
         }
+    }
+
+    #[test]
+    fn materialized_residual_fusion_defaults_on_and_has_a_rollback() {
+        let fused = graph(1.0, false).finish();
+        assert_eq!(
+            fused
+                .insts
+                .iter()
+                .filter(|inst| inst.op == DevOp::Residual as u16)
+                .count(),
+            0
+        );
+
+        let mut rollback = graph(1.0, false);
+        rollback.set_fuse_materialized_residual_inputs(false);
+        assert_eq!(
+            rollback
+                .finish()
+                .insts
+                .iter()
+                .filter(|inst| inst.op == DevOp::Residual as u16)
+                .count(),
+            1
+        );
     }
 
     #[test]
