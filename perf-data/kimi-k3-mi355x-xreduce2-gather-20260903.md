@@ -20,11 +20,12 @@ f32 accumulation and the bf16 boundary.
 
 ## Change
 
-`PLOW_XR2_GATHER=1` emits a two-shot packet when the gather is a complete column
+The default route emits a two-shot packet when the gather is a complete column
 partition (`row_w = n_gpu*gcols`). Phase 1 is the existing reduce-scatter. Phase 2 adds
 the owner-derived compact gather value while assembling each reduced slice. It adds no
 packet, removes no rendezvous, and preserves the existing reduction-to-bf16 rounding
-before the gather add. Decode and unsupported shapes remain one-shot. Default is off.
+before the gather add. Decode and unsupported shapes remain one-shot.
+`PLOW_XR2_GATHER=0` restores the one-shot rollback.
 
 At K3 TP8/T=8192 the emit changes 92 XReduce packets to XReduceTwoShot: 278 two-shot,
 92 carrying `i6=gslot,i7=gcols`, and zero one-shot packets. Both rendezvous gates remain
@@ -45,23 +46,44 @@ Result: 3.50x faster, -235.644 us (-71.4%). The production `PLOW_XR_AGG=1` proto
 was enabled in both arms. The focused gfx950 object is wave64, private segment 0,
 SGPR/VGPR spills 0, and 26 VGPR for the two-shot gather wrapper.
 
-## Full-network gate
+## Full-network promotion gate
 
 Same `vllm bench serve` client and `/v1/completions` contract: random exact 8192 input
 tokens, C1, one output token, one request per independent server process. The coherence
 probe passed before both measurements; both cells completed 1/1 requests and generated
 exactly 1/1 requested tokens.
 
-| arm | TTFT |
-|---|---:|
-| control | 2980.28 ms |
-| `PLOW_XR2_GATHER=1` | 2739.65 ms |
+| fold/order | one-shot control | folded gather | delta | parity |
+|---|---:|---:|---:|---|
+| 1, candidate→control | 2980.28 ms | 2739.65 ms | -240.63 ms (-8.07%) | coherence and exact output count |
+| 2, control→candidate | 3070.337776 ms | 2719.590423 ms | -350.747353 ms (-11.42%) | exact token/checksum |
+| 3, candidate→control | 2949.428766 ms | 2718.925641 ms | -230.503125 ms (-7.82%) | exact token/checksum |
 
-Result: -240.63 ms (-8.07%). Logs:
-`/tmp/plowrt_bench_xr2g_control_8134.log` and
-`/tmp/plowrt_bench_xr2g_one_8134.log`. Candidate asset:
-`/tmp/plow-k3-xr2g-16k.xxjPEc`.
+Median paired delta is -240.63 ms (-8.07%). All six processes completed 1/1 requests
+without a timeout. Folds 2 and 3 used the identical random prompt (token-array SHA-256
+`dd51e931308683300f372862a682d56a332e0e3e8d71cd70ef06c34739362dcd`)
+and produced token 9618 with checksum `fnv1a64:499ccc4012ebcff0` in both arms.
 
-This first full-network fold validates the expected direction and magnitude but is not
-the publication gate. Keep the emit default off until at least three order-alternated
-full-network folds pass coherence, exact output-count, counter audit, and token parity.
+Static disassembly confirms route selection at T8192: the candidate has 278
+`XReduceTwoShot` packets, including 92 with folded-gather metadata, and zero one-shot
+`XReduce`; the control has 186 two-shot packets, 92 one-shot folded gathers, and zero
+two-shot packets carrying gather metadata.
+
+Candidate packet SHA-256 is
+`daffdf09cda7c983da70c6a48022543b2206dbaa6d9b8263b64ba0064690f789`;
+control packet SHA-256 is
+`7891d912f5e0efdafe77f20a8b241cc2a146d585fba9660818c371b756c6bea3`.
+Their stamped matching prefill objects are respectively
+`68346c9af293436d3f0475f54f81c3ab166c9d64d3f2b1c5e67e5628a93ecc9e`
+and `f56730fd332b64643be3d43a6f038de482f19d3a58968237eb171ca4527cb38f`.
+The runtime correctly rejects swapping these packet/object pairs because their
+capability stamps differ.
+
+Fold 1 logs are `/tmp/plowrt_bench_xr2g_{one,control}_8134.log`. Fold 2 and 3 raw
+bench evidence is `/tmp/xr2-fold{2,3}-{candidate,control}.{json,log}`. Candidate asset:
+`/tmp/plow-k3-xr2g-16k.xxjPEc`; control asset:
+`/tmp/plow-k3-fp8kv-49seg-16k.dUY4dr`.
+
+Decision: promote the generic structural route to the emit default. The shape predicate,
+decode exclusion, two rendezvous gates, rank-order f32 accumulation, and bf16 boundary
+remain unchanged. `PLOW_XR2_GATHER=0` is the explicit rollback.

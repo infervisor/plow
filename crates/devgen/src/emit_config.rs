@@ -205,9 +205,9 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_XR_CUS")]
     pub xr_cus: Option<u32>,
 
-    /// Use reduce-scatter/all-gather for large folded-gather collectives. The second
-    /// partial is added while the reduced slices are gathered; default off until TP8 gated.
-    #[arg(long, env = "PLOW_XR2_GATHER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Use reduce-scatter/all-gather for complete folded-gather collectives. The second
+    /// partial is added while the reduced slices are gathered. Set false for rollback.
+    #[arg(long, env = "PLOW_XR2_GATHER", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub xr2_gather: bool,
 
     /// Disable all XReduce collectives (diagnostic — numerically wrong).
@@ -630,7 +630,7 @@ impl EmitConfig {
             pf_ladder_append: env_str("PLOW_PF_LADDER_APPEND"),
             pf_gemv_head: env_str("PLOW_PF_GEMV_HEAD"),
             xr_cus: env_u32("PLOW_XR_CUS"),
-            xr2_gather: env_bool("PLOW_XR2_GATHER"),
+            xr2_gather: env_opt_out("PLOW_XR2_GATHER"),
             no_xreduce: env_bool("PLOW_NO_XREDUCE"),
             moe_prefill: env_str("PLOW_MOE_PREFILL"),
             gemma_moe_router_fused: env_bool("PLOW_GEMMA_MOE_ROUTER_FUSED"),

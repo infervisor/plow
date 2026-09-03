@@ -4866,14 +4866,14 @@ mod tests {
     /// is bandwidth-bound at T rows, so the two-shot moves ~tp/2x less over the fabric. Decode's
     /// one-shot is the right answer at one row and the wrong one here.
     ///
-    /// EXCEPT the shared-expert reduce, which also carries the up-projection's ALL-GATHER
-    /// (`emit_xreduce_gather`) and therefore stays one-shot on both phases: the two-shot's
-    /// decomposition owns a 1/N slice of ITS message and has no place for a second,
-    /// differently-shaped gather. One collective per MoE layer pays the one-shot's fabric
-    /// at prefill; the alternative is a second reduction body.
+    /// The explicit rollback keeps the shared-expert reduce carrying the up-projection's
+    /// ALL-GATHER on the one-shot path. The production-default test below covers its generic
+    /// two-shot folded-gather form.
     #[test]
-    fn the_full_model_emits_at_tp8_and_t_rows() {
-        // Pins the DEFAULT; `PLOW_K3_SHARD_UP=0` is the A/B control and emits all-two-shot.
+    fn folded_gather_prefill_can_restore_the_one_shot_path() {
+        let _guard = crate::test_env::env_guard();
+        let _env = crate::test_env::EnvScope::set(&[("PLOW_XR2_GATHER", "0")]);
+        // Pins the explicit one-shot rollback while keeping the sharded up projection.
         if !shard_up_proj(8) {
             return;
         }
@@ -4941,10 +4941,9 @@ mod tests {
     }
 
     #[test]
-    fn folded_gather_prefill_can_use_the_generic_twoshot_path() {
+    fn folded_gather_prefill_uses_the_generic_twoshot_path_by_default() {
         let _guard = crate::test_env::env_guard();
-        let _env =
-            crate::test_env::EnvScope::set(&[("PLOW_K3_SHARD_UP", "1"), ("PLOW_XR2_GATHER", "1")]);
+        let _env = crate::test_env::EnvScope::set(&[("PLOW_XR2_GATHER", "1")]);
         let p = build_full_t(8, 512);
         let xr: Vec<_> = p
             .insts
