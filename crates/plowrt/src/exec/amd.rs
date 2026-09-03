@@ -638,7 +638,7 @@ fn xreduce_attnres_inst(d: &DevInst64) -> bool {
         && d.t[7] == packet::dev::TENSOR_NONE16
         && f32::from_bits(d.fj[0]).is_finite()
         && f32::from_bits(d.fj[0]) > 0.0
-        && d.fj[1..].iter().all(|&v| v == 0)
+        && d.fj[1] == 0
 }
 
 fn moe_stage1_mxfp4_inst(d: &DevInst64) -> bool {
@@ -812,7 +812,9 @@ fn moe_mxfp4_routes(
                 // Routed below after resolving its tensor addresses.
             } else {
                 return Err(RuntimeError::Device(format!(
-                    "segment {seg} carries an invalid or mixed fused XReduceTwoShot+AttnRes packet"
+                    "program T={} segment {seg} carries an invalid or mixed fused \
+                     XReduceTwoShot+AttnRes packet",
+                    prog.t
                 )));
             }
         }
@@ -10703,6 +10705,7 @@ mod tests {
         ];
         d.i = [8192 * 7168, 8, 0, 1, 2, 7168, 4, 8];
         d.fj[0] = 1e-5f32.to_bits();
+        patch_tp_xaudit(&mut prog.insts, 464);
         let tensors: Vec<_> = (0..7)
             .map(|i| crate::asset::devblob::DevTensor {
                 name: format!("t{i}"),
@@ -10724,6 +10727,10 @@ mod tests {
         };
         assert_eq!(grid, 256, "raw launch grid comes from packet blocks");
         assert_eq!((args.n, args.row_w, args.nranks), (8192 * 7168, 7168, 0));
+        assert_eq!(
+            args.status, 465,
+            "route must consume the runtime TP audit id"
+        );
         assert_eq!(device_args, 0, "load-time upload fills the stable pointer");
 
         prog.insts[0].i[0] = 8191 * 7168;
