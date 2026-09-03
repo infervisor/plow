@@ -1103,6 +1103,21 @@ fn object_inventory(progs: &[ProgramArms]) -> Value {
         .filter(|a| a.op == "KdaDecodeFused")
         .cloned()
         .collect();
+    let singleton_arm = |name: &str| -> BTreeSet<Arm> {
+        progs
+            .iter()
+            .filter(|p| p.kind == "prefill" && p.seg.is_some() && p.insts == 1)
+            .filter_map(|p| {
+                (p.arms.len() == 1)
+                    .then(|| p.arms.iter().next().unwrap())
+                    .filter(|a| a.op == name && a.variant.as_deref() == Some("d128_qpre"))
+                    .cloned()
+            })
+            .collect()
+    };
+    let key_factor_wu = singleton_arm("KdaChunkWu");
+    let key_factor_carry = singleton_arm("KdaChunkCarry");
+    let key_factor_pair = !key_factor_wu.is_empty() && !key_factor_carry.is_empty();
     json!({
         "ordinary": {
             "prefill": { "arms": keys(&prefill) },
@@ -1112,6 +1127,11 @@ fn object_inventory(progs: &[ProgramArms]) -> Value {
         "lean": {
             "packed_kda_prefill": { "required": !packed_kda.is_empty(), "arms": keys(&packed_kda) },
             "kda_decode_fused": { "required": !fused.is_empty(), "arms": keys(&fused) },
+            "kda_key_factor_pair": {
+                "required": key_factor_pair,
+                "wu_arms": keys(&key_factor_wu),
+                "carry_arms": keys(&key_factor_carry),
+            },
         },
     })
 }
@@ -1903,6 +1923,38 @@ mod tests {
         let h = config_header(&man);
         assert!(h.contains("#define PLOW_PACKET_HAS_KDA_DECODE_FUSED 1"));
         assert!(h.contains("#if defined(PLOW_BUCKET_FLASH)\n#define PLOW_HAS_ATTN_RES 0"));
+    }
+
+    #[test]
+    fn kda_key_factor_pair_changes_the_derived_object_inventory() {
+        let arm = |op: &str| Arm {
+            op: op.into(),
+            hd: None,
+            variant: Some("d128_qpre".into()),
+        };
+        let segment = |op: &str| ProgramArms {
+            kind: "prefill",
+            t: 8192,
+            seg: Some(1),
+            arms: BTreeSet::from([arm(op)]),
+            insts: 1,
+        };
+        let wu = segment("KdaChunkWu");
+        let carry = segment("KdaChunkCarry");
+
+        let incomplete = object_inventory(std::slice::from_ref(&wu));
+        assert_eq!(incomplete["lean"]["kda_key_factor_pair"]["required"], false);
+        let paired = object_inventory(&[wu, carry]);
+        assert_eq!(paired["lean"]["kda_key_factor_pair"]["required"], true);
+        assert_eq!(
+            paired["lean"]["kda_key_factor_pair"]["wu_arms"][0],
+            "KdaChunkWu/d128_qpre"
+        );
+        assert_eq!(
+            paired["lean"]["kda_key_factor_pair"]["carry_arms"][0],
+            "KdaChunkCarry/d128_qpre"
+        );
+        assert_ne!(incomplete, paired);
     }
 
     /// `arm_of` must read each flash op's head-dim from the slot that op ACTUALLY carries it in.
