@@ -86,15 +86,37 @@ Two precursor layouts closed additional branches:
 - BQ128/BKV128 with 32x32 MFMA compiled to 153600 B LDS but spilled 207 VGPRs and used
   700 B/lane scratch, so it was rejected before timing.
 
-The target remains unmet. The reference-style 16x16 schedule wins decisively while T1024 is
-underfilled, then loses to the generic 32x32 kernel at long sequence. A next attempt must keep
-32x32 throughput while reducing BKV128 score/P residency; further expansion of either tested
-template is closed. No graph or emitter integration was attempted.
+Those template expansions remain closed. The independent Opus schedule below supersedes the
+claim that the kernel target remains unmet.
+
+## Eight-wave Opus schedule: accepted isolated kernel
+
+The current AITER gfx950 implementation supplies the missing schedule without changing the
+mathematical contract. It is still selected by `D_QK=192`, `D_V=128`, causal mode and gfx950;
+there is no model-name condition. Its important structural differences are:
+
+- eight wave64 waves, 32 query rows per wave and 64 KV rows per stage;
+- Q retained in registers, with two K and two V LDS buffers and V aliasing Q's dead LDS lifetime;
+- score and value contractions split into two super-units to remain under 256 VGPR;
+- 16 software-pipeline stages overlap K/V traffic, MFMA and softmax, with staggered wave groups.
+
+One uncontended GPU, 512 MiB cache flush before every arm, median of 31:
+
+| T | absorbed + fold | materialized V1 | Opus | Opus vs V1 | max abs | RMSE |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 506.963 us | 172.521 us | 33.920 us | 5.086x | 0.00416565 | 0.00273992 |
+| 8192 | 7438.902 us | 2687.378 us | 349.083 us | 7.698x | 0.0000305176 | 0.000000320519 |
+
+The candidate clears the 1.5 ms kernel target and the recorded max-absolute/RMSE tolerance at
+both sizes. Resource compilation reports wave64/WG512, 254 VGPR, 84 SGPR, occupancy 2,
+149760 B LDS and zero scratch/VGPR/SGPR spills. Inputs keep K and V as distinct allocations.
+The measured source is unchanged between the local AITER commit `90e91d5e…` and upstream
+`10b192f5…`; `runtime/bench/amd/mla_materialized_prefill/README.md` records reproduction details.
 
 ## Promotion blockers
 
-1. Beat 1.5 ms at T8192 with distinct K and V inputs. The identity-structured screen is an
-   oracle construction, not permission to alias K and V in a real graph.
+1. Adapt the accepted schedule into a dependency-free standalone Plow object. The current harness
+   compiles the MIT AITER source as an isolated comparator; it is not a runtime dependency.
 2. Add and price the K192/V128 materialization GEMMs in a fused one-layer block.
 3. Select the path from MLA graph geometry (`qk_nope + qk_rope`, `v_head`, latent width), not a
    model name.

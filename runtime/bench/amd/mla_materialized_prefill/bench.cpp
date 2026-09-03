@@ -24,6 +24,25 @@ static constexpr unsigned DK_MAT = 192;
 static constexpr unsigned DV = 128;
 static constexpr size_t FLUSH_BYTES = 512ull << 20;
 
+struct OpusArgs {
+    const void* q;
+    const void* k;
+    const void* v;
+    void* o;
+    int b, n, n_kv, h, h_kv, d_qk, d_v;
+    int sq_b, sq_n, sq_h, so_b, so_n, so_h;
+    int sk_b, sk_n, sk_h, sv_b, sv_n, sv_h;
+    float scale;
+    const int* qseq;
+    const int* kseq;
+    const int* qseq_pad;
+    const int* kseq_pad;
+    int opt;
+    void* lse;
+    int slse_b, slse_h;
+};
+static_assert(sizeof(OpusArgs) == 168);
+
 static float bf16_to_float(uint16_t x) {
     uint32_t u = (uint32_t)x << 16;
     float f;
@@ -35,6 +54,11 @@ static void launch(hipFunction_t fn, unsigned grid, unsigned threads, void** arg
     CK(hipModuleLaunchKernel(fn, grid, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr));
 }
 
+static void launch3(hipFunction_t fn, dim3 grid, unsigned threads, void** args) {
+    CK(hipModuleLaunchKernel(fn, grid.x, grid.y, grid.z, threads, 1, 1, 0, nullptr, args,
+                             nullptr));
+}
+
 static double median(std::vector<double> x) {
     std::sort(x.begin(), x.end());
     return x[x.size() / 2];
@@ -42,20 +66,27 @@ static double median(std::vector<double> x) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <kernel.co> [samples]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <kernel.co> <opus.co> [samples]\n", argv[0]);
         return 2;
     }
-    const int samples = argc > 2 ? std::atoi(argv[2]) : 9;
+    if (argc < 3) return 2;
+    const int samples = argc > 3 ? std::atoi(argv[3]) : 9;
     if (samples < 3 || !(samples & 1)) return 2;
 
     CK(hipInit(0));
     hipModule_t mod;
     CK(hipModuleLoad(&mod, argv[1]));
+    hipModule_t opus_mod;
+    CK(hipModuleLoad(&opus_mod, argv[2]));
     hipFunction_t absorbed, fold, materialized, materialized_lds, init, flush;
     CK(hipModuleGetFunction(&absorbed, mod, "k_absorbed"));
     CK(hipModuleGetFunction(&fold, mod, "k_absorbed_fold"));
     CK(hipModuleGetFunction(&materialized, mod, "k_materialized"));
     CK(hipModuleGetFunction(&materialized_lds, mod, "k_materialized_lds"));
+    hipFunction_t opus;
+    CK(hipModuleGetFunction(
+        &opus, opus_mod,
+        "_Z20gqa_d192_v128_kernelI20opus_gqa_d192_traitsILi32ELi64ELi8ELb1ELb0ELb0ELb0EEEv19opus_gqa_d192_kargs"));
     CK(hipModuleGetFunction(&init, mod, "k_make_inputs"));
     CK(hipModuleGetFunction(&flush, mod, "k_cache_flush"));
 
@@ -67,11 +98,11 @@ int main(int argc, char** argv) {
     size_t flush_n = FLUSH_BYTES / sizeof(uint32_t);
     void* flush_args[] = {&flush_in, &flush_out, &flush_n};
 
-    bool structural_oracle_failed = false;
+    bool opus_oracle_failed = false;
     for (unsigned nt : {1024u, 8192u}) {
         const size_t qrows = (size_t)nt * NH;
         uint16_t *qabs, *qrope, *ckv, *krope, *qmat, *kmat, *vmat, *wuv;
-        uint16_t *oabs, *omat, *olds;
+        uint16_t *oabs, *omat, *olds, *oopus;
         float *opart_abs, *mlpart_abs, *opart_mat, *mlpart_mat;
         int* kv_len;
         CK(hipMalloc(&qabs, qrows * DK_ABS * 2));
@@ -85,6 +116,7 @@ int main(int argc, char** argv) {
         CK(hipMalloc(&oabs, qrows * DV * 2));
         CK(hipMalloc(&omat, qrows * DV * 2));
         CK(hipMalloc(&olds, qrows * DV * 2));
+        CK(hipMalloc(&oopus, qrows * DV * 2));
         CK(hipMalloc(&opart_abs, qrows * DK_ABS * 4));
         CK(hipMalloc(&mlpart_abs, qrows * 2 * 4));
         CK(hipMalloc(&opart_mat, qrows * DV * 4));
@@ -105,6 +137,17 @@ int main(int argc, char** argv) {
         void* mat_args[] = {&opart_mat, &mlpart_mat, &omat, &qmat, &kmat, &vmat,
                             &nt, &nh, &stride, &scale};
         void* lds_args[] = {&olds, &qmat, &kmat, &vmat, &nt, &nh, &stride, &scale};
+        OpusArgs oa{};
+        oa.q = qmat; oa.k = kmat; oa.v = vmat; oa.o = oopus;
+        oa.b = 1; oa.n = nt; oa.n_kv = nt; oa.h = nh; oa.h_kv = nh;
+        oa.d_qk = DK_MAT; oa.d_v = DV;
+        oa.sq_b = nt * nh * DK_MAT; oa.sq_n = nh * DK_MAT; oa.sq_h = DK_MAT;
+        oa.so_b = nt * nh * DV; oa.so_n = nh * DV; oa.so_h = DV;
+        oa.sk_b = nh * nt * DK_MAT; oa.sk_n = DK_MAT; oa.sk_h = nt * DK_MAT;
+        oa.sv_b = nh * nt * DV; oa.sv_n = DV; oa.sv_h = nt * DV;
+        oa.scale = scale;
+        void* opus_args[] = {&oa};
+        const dim3 opus_grid((nt + 255) / 256, nh, 1);
 
         launch(absorbed, GRID, 256, abs_args);
         launch(fold, GRID, 256, fold_args);
@@ -112,13 +155,18 @@ int main(int argc, char** argv) {
         launch(materialized_lds, GRID, 256, lds_args);
         CK(hipDeviceSynchronize());
 
-        std::vector<uint16_t> ha(qrows * DV), hm(qrows * DV), hl(qrows * DV);
+        std::vector<uint16_t> ha(qrows * DV), hm(qrows * DV), hl(qrows * DV), hw(qrows * DV);
         CK(hipMemcpy(ha.data(), oabs, ha.size() * 2, hipMemcpyDeviceToHost));
         CK(hipMemcpy(hm.data(), omat, hm.size() * 2, hipMemcpyDeviceToHost));
         CK(hipMemcpy(hl.data(), olds, hl.size() * 2, hipMemcpyDeviceToHost));
+        CK(hipMemset(oopus, 0, qrows * DV * 2));
+        launch3(opus, opus_grid, 512, opus_args);
+        CK(hipDeviceSynchronize());
+        CK(hipMemcpy(hw.data(), oopus, hw.size() * 2, hipMemcpyDeviceToHost));
         double max_abs = 0.0, max_rel = 0.0, sum_sq = 0.0;
         double lds_max_abs = 0.0, lds_sum_sq = 0.0;
         double lds_vs_mat_max = 0.0, lds_vs_mat_sum_sq = 0.0, lds_peak = 0.0;
+        double opus_max_abs = 0.0, opus_sum_sq = 0.0;
         size_t bad = 0;
         size_t lds_bad = 0;
         for (size_t i = 0; i < ha.size(); ++i) {
@@ -138,9 +186,13 @@ int main(int argc, char** argv) {
             lds_vs_mat_max = std::max(lds_vs_mat_max, lmd);
             lds_vs_mat_sum_sq += lmd * lmd;
             lds_peak = std::max(lds_peak, std::abs(lv));
+            const double wd = std::abs(a - bf16_to_float(hw[i]));
+            opus_max_abs = std::max(opus_max_abs, wd);
+            opus_sum_sq += wd * wd;
         }
         const double rmse = std::sqrt(sum_sq / ha.size());
         const double lds_rmse = std::sqrt(lds_sum_sq / ha.size());
+        const double opus_rmse = std::sqrt(opus_sum_sq / ha.size());
         if (max_abs > 2.0e-2 || rmse > 3.0e-3) {
             std::fprintf(stderr,
                          "FAIL T=%u oracle max_abs=%.6g max_rel=%.6g rmse=%.6g bad=%zu/%zu\n",
@@ -153,10 +205,14 @@ int main(int argc, char** argv) {
                          "vs-mat(max_abs=%.6g rmse=%.6g) peak=%.6g\n",
                          nt, lds_max_abs, lds_rmse, lds_bad, ha.size(), lds_vs_mat_max,
                          std::sqrt(lds_vs_mat_sum_sq / ha.size()), lds_peak);
-            structural_oracle_failed = true;
+        }
+        if (opus_max_abs > 2.0e-2 || opus_rmse > 3.0e-3) {
+            std::fprintf(stderr, "FAIL T=%u Opus oracle max_abs=%.6g rmse=%.6g\n",
+                         nt, opus_max_abs, opus_rmse);
+            opus_oracle_failed = true;
         }
 
-        std::vector<double> ta, tm, tl;
+        std::vector<double> ta, tm, tl, tw;
         for (int s = 0; s < samples; ++s) {
             launch(flush, GRID, 256, flush_args);
             CK(hipDeviceSynchronize());
@@ -189,20 +245,34 @@ int main(int argc, char** argv) {
             ms = 0; CK(hipEventElapsedTime(&ms, begin, end));
             tl.push_back(ms * 1000.0);
             CK(hipEventDestroy(begin)); CK(hipEventDestroy(end));
+
+            launch(flush, GRID, 256, flush_args);
+            CK(hipDeviceSynchronize());
+            CK(hipEventCreate(&begin)); CK(hipEventCreate(&end));
+            CK(hipEventRecord(begin));
+            launch3(opus, opus_grid, 512, opus_args);
+            CK(hipEventRecord(end)); CK(hipEventSynchronize(end));
+            ms = 0; CK(hipEventElapsedTime(&ms, begin, end));
+            tw.push_back(ms * 1000.0);
+            CK(hipEventDestroy(begin)); CK(hipEventDestroy(end));
         }
-        const double a = median(ta), m = median(tm), l = median(tl);
+        const double a = median(ta), m = median(tm), l = median(tl), w = median(tw);
         std::printf("T=%u H=%u absorbed+fold=%.3f us materialized-attn=%.3f us "
-                    "materialized-lds=%.3f us speedup=%.3fx oracle(max_abs=%.6g rmse=%.6g "
-                    "bad=%zu/%zu) lds-oracle(max_abs=%.6g rmse=%.6g bad=%zu/%zu)\n",
-                    nt, NH, a, m, l, a / l, max_abs, rmse, bad, ha.size(), lds_max_abs,
-                    lds_rmse, lds_bad, ha.size());
+                    "materialized-lds=%.3f us opus=%.3f us speedup=%.3fx "
+                    "oracle(max_abs=%.6g rmse=%.6g bad=%zu/%zu) "
+                    "lds-oracle(max_abs=%.6g rmse=%.6g bad=%zu/%zu) "
+                    "opus-oracle(max_abs=%.6g rmse=%.6g)\n",
+                    nt, NH, a, m, l, w, a / w, max_abs, rmse, bad, ha.size(), lds_max_abs,
+                    lds_rmse, lds_bad, ha.size(), opus_max_abs, opus_rmse);
 
         hipFree(qabs); hipFree(qrope); hipFree(ckv); hipFree(krope); hipFree(qmat);
         hipFree(kmat); hipFree(vmat); hipFree(wuv); hipFree(oabs); hipFree(omat); hipFree(olds);
+        hipFree(oopus);
         hipFree(opart_abs); hipFree(mlpart_abs); hipFree(opart_mat); hipFree(mlpart_mat);
         hipFree(kv_len);
     }
     hipFree(flush_in); hipFree(flush_out);
     hipModuleUnload(mod);
-    return structural_oracle_failed ? 4 : 0;
+    hipModuleUnload(opus_mod);
+    return opus_oracle_failed ? 4 : 0;
 }
