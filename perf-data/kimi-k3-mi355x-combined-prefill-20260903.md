@@ -104,7 +104,9 @@ using the smoke path named above.
 
 The combined BF16 candidate is stable and exact, but it is not a vLLM win:
 2064.309 ms mean TTFT vs the current vLLM median 568.35 ms = 3.63x slower,
-leaving about 1.50 s. Keep P1 and P3 default-off. This combined gate cannot
-replace isolated three-fold promotion evidence for either lever, and the KDA
-family still carries private memory. P2 remains independently promoted from
-its own exact three-fold gate.
+leaving about 1.50 s. A subsequent isolated BF16 P1 qualification now provides
+the missing three-fold evidence: mean -642.195 ms (-25.53%), exact, with a
+zero-private object. P1 is therefore default-on with
+`PLOW_MOE_STAGE2_LEAN=0` as rollback. Keep P3 default-off because its KDA family
+still carries private memory. P2 remains independently promoted from its own
+exact three-fold gate.

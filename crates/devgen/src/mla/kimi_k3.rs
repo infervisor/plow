@@ -2020,7 +2020,7 @@ mod kimi_k3_tests {
     }
 
     #[test]
-    fn k3_stage1_lean_default_is_applied_to_prefill_builders() {
+    fn k3_lean_moe_defaults_are_applied_to_prefill_builders() {
         let _guard = crate::test_env::env_guard();
         let _scope = crate::test_env::EnvScope::set(&[("PLOW_K3_LAYERS", "2")]);
         let d = k3_dir("stage1_lean");
@@ -2044,31 +2044,33 @@ mod kimi_k3_tests {
 
         let m = k3_build_model(&d, 8192, 256, 8, &[128], None);
         let p = &m.progs[0];
-        let stage1: Vec<_> = p
-            .insts
-            .iter()
-            .enumerate()
-            .filter(|(_, inst)| inst.op == DevOp::MoeGroupGluPf as u16)
-            .collect();
-        assert_eq!(
-            stage1.len(),
-            1,
-            "two-layer fixture has one routed-MoE block"
-        );
-        let stage1_ix = stage1[0].0 as u32;
-        let seg = p
-            .stream
-            .iter()
-            .find(|entry| entry.inst == stage1_ix)
-            .expect("stage-1 packet must be scheduled")
-            .seg;
-        let members: std::collections::BTreeSet<_> = p
-            .stream
-            .iter()
-            .filter(|entry| entry.seg == seg)
-            .map(|entry| entry.inst)
-            .collect();
-        assert_eq!(members, [stage1_ix].into_iter().collect());
+        for op in [DevOp::MoeGroupGluPf, DevOp::MoeGroupDownPf] {
+            let matches: Vec<_> = p
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, inst)| inst.op == op as u16)
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "two-layer fixture has one routed-MoE block"
+            );
+            let inst_ix = matches[0].0 as u32;
+            let seg = p
+                .stream
+                .iter()
+                .find(|entry| entry.inst == inst_ix)
+                .expect("lean MoE packet must be scheduled")
+                .seg;
+            let members: std::collections::BTreeSet<_> = p
+                .stream
+                .iter()
+                .filter(|entry| entry.seg == seg)
+                .map(|entry| entry.inst)
+                .collect();
+            assert_eq!(members, [inst_ix].into_iter().collect());
+        }
     }
 
     /// Every program must address the same peer slot B. The host has one peer layout for the

@@ -478,7 +478,7 @@ pub struct EmitConfig {
     pub moe_pf_a8: bool,
 
     /// Isolate compatible MXFP4 grouped-MoE Down+Combine boundaries for a standalone object.
-    #[arg(long, env = "PLOW_MOE_STAGE2_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, env = "PLOW_MOE_STAGE2_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_stage2_lean: bool,
 
     /// Isolate compatible MXFP4 grouped-MoE gate/up packets for a standalone object.
@@ -715,7 +715,7 @@ impl EmitConfig {
             glm_xr_res: env_bool("PLOW_GLM_XR_RES"),
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             moe_pf_a8: env_bool("PLOW_MOE_PF_A8"),
-            moe_stage2_lean: env_bool("PLOW_MOE_STAGE2_LEAN"),
+            moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_bool("PLOW_MOE_ALIGN_PAR"),
             moe_stage1_lean: env_opt_out("PLOW_MOE_STAGE1_LEAN"),
             moe_pf_atomic: env_bool("PLOW_MOE_PF_ATOMIC"),
@@ -910,6 +910,13 @@ mod tests {
         let _guard = crate::test_env::env_guard();
         let _scope = crate::test_env::EnvScope::set(&[("PLOW_MOE_STAGE1_LEAN", "0")]);
         assert!(!super::active().moe_stage1_lean);
+    }
+
+    #[test]
+    fn lean_moe_stage2_default_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_MOE_STAGE2_LEAN", "0")]);
+        assert!(!super::active().moe_stage2_lean);
     }
 
     #[test]
