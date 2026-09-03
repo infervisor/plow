@@ -1550,7 +1550,7 @@ __device__ __forceinline__ void exec_gemm_wide(CInst in, CTens T,
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
 #if PLOW_CDNA4
     const unsigned M = in->i[0], N = in->i[1];
-    if ((M % GM_C8_BM) == 0 && (N % GM_C8_BN) == 0 &&
+    if (in->i[7] == GM_C8_TAG && (M % GM_C8_BM) == 0 && (N % GM_C8_BN) == 0 &&
         (M / GM_C8_BM) * (N / GM_C8_BN) == nblk) {
         d_gemm_c8((bf16*)TEN(0) + (size_t)in->i[5] * N,
              (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
