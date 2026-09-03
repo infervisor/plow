@@ -663,6 +663,8 @@ option(PLOW_HSACO_MOE_STAGE1_LEAN
        "Emit the standalone gfx950 MXFP4 grouped-MoE stage-1 BK256 object" ON)
 option(PLOW_HSACO_MOE_COMBINE_LEAN
        "Emit the standalone gfx950 fixed-order f32-part MoE combine object" ON)
+option(PLOW_HSACO_MLA_MATERIALIZED_OPUS
+       "Emit the standalone gfx950 bf16 MLA materialized hd192/v128 object" ON)
 option(PLOW_K3_DECODE_MXFP4_PROJ
        "Include standalone MXFP4 projection ops in K3 decode objects" ON)
 option(PLOW_K3_DECODE_GROUPED
@@ -1312,6 +1314,33 @@ if(PLOW_GFX950_HSACO)
             VERBATIM)
         add_custom_target(moe_combine_gfx950 DEPENDS "${_hs_moe_combine_out}")
         list(APPEND _hs_outs "${_hs_moe_combine_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MLA_MATERIALIZED_OPUS)
+        set(_hs_mla_materialized_src
+            "${CMAKE_CURRENT_SOURCE_DIR}/amd/mla_materialized_opus.hip")
+        set(_hs_mla_materialized_inc
+            "${CMAKE_CURRENT_SOURCE_DIR}/amd/third_party/aiter_opus")
+        set(_hs_mla_materialized_out
+            "${PLOW_HSACO_DIR}/mla_materialized_hd192_v128_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_mla_materialized_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_mla_materialized_out}"
+                    plow_mla_materialized_hd192_v128_gfx950 256 2
+                    -std=c++20 -I${_hs_mla_materialized_inc}
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_mla_materialized_opus_abi_1
+                    "${_hs_mla_materialized_src}"
+            DEPENDS "${_hs_mla_materialized_src}" "${_hs_run}"
+                    "${_hs_mla_materialized_inc}/fmha_fwd_hd192_v128_bf16_opus_defs.h"
+                    "${_hs_mla_materialized_inc}/fmha_fwd_hd192_v128_bf16_opus_kernel.hpp"
+                    "${_hs_mla_materialized_inc}/opus/opus.hpp"
+                    "${_hs_mla_materialized_inc}/LICENSE"
+            COMMENT "hipcc mla_materialized_hd192_v128_gfx950.elf"
+            VERBATIM)
+        add_custom_target(mla_materialized_hd192_v128_gfx950
+                          DEPENDS "${_hs_mla_materialized_out}")
+        list(APPEND _hs_outs "${_hs_mla_materialized_out}")
     endif()
 
     # Golden __device__ wrappers. They call the SAME op_*.h bodies the

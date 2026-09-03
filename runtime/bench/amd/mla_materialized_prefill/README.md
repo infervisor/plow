@@ -3,11 +3,10 @@
 This harness compares Plow's absorbed attention plus fold, its first rectangular
 materialized kernel, and the generic gfx950 `D_QK=192`, `D_V=128` Opus schedule.
 
-The Opus comparator is compiled from a local AITER checkout. `AITER_ROOT` defaults
-to `/tmp/aiter-main`; the measured source is unchanged between local commit
-`90e91d5e275216da17f306e35e9b5519c621dbe3` and upstream commit
-`10b192f5b5bda90f2af33ceae7a6c2f416bfc674`. AITER is MIT licensed. Its source is
-used only to build the isolated comparator and is not a Plow runtime dependency.
+The measured schedule is vendored as a standalone runtime object under
+`runtime/amd/third_party/aiter_opus`. It is unchanged from AITER upstream commit
+`10b192f5b5bda90f2af33ceae7a6c2f416bfc674` and retains the MIT license. The
+runtime object has no build-time or run-time AITER dependency.
 
 The useful schedule is selected by dimensions and architecture, not a model name:
 
@@ -21,7 +20,7 @@ The useful schedule is selected by dimensions and architecture, not a model name
 Run with:
 
 ```sh
-nix develop -c env AITER_ROOT=/tmp/aiter-main SAMPLES=31 \
+nix develop -c env SAMPLES=31 \
   runtime/bench/amd/mla_materialized_prefill/run.sh /tmp/plow-mla-opus-gate
 ```
 

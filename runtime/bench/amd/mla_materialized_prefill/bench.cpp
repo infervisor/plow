@@ -85,8 +85,7 @@ int main(int argc, char** argv) {
     CK(hipModuleGetFunction(&materialized_lds, mod, "k_materialized_lds"));
     hipFunction_t opus;
     CK(hipModuleGetFunction(
-        &opus, opus_mod,
-        "_Z20gqa_d192_v128_kernelI20opus_gqa_d192_traitsILi32ELi64ELi8ELb1ELb0ELb0ELb0EEEv19opus_gqa_d192_kargs"));
+        &opus, opus_mod, "plow_mla_materialized_hd192_v128_gfx950"));
     CK(hipModuleGetFunction(&init, mod, "k_make_inputs"));
     CK(hipModuleGetFunction(&flush, mod, "k_cache_flush"));
 
