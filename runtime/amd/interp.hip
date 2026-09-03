@@ -1548,9 +1548,20 @@ __device__ __forceinline__ void exec_gemm_med(CInst in, CTens T,
 __device__ __forceinline__ void exec_gemm_wide(CInst in, CTens T,
                                                unsigned slice, unsigned nblk, bf16* lds) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+#if PLOW_CDNA4
+    const unsigned M = in->i[0], N = in->i[1];
+    if ((M % GM_C8_BM) == 0 && (N % GM_C8_BN) == 0 &&
+        (M / GM_C8_BM) * (N / GM_C8_BN) == nblk) {
+        d_gemm_c8((bf16*)TEN(0) + (size_t)in->i[5] * N,
+             (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
+                  (const bf16*)TEN(2), M, N, in->i[2], slice, nblk, lds);
+    } else
+#endif
+    {
     d_gemm_wide((bf16*)TEN(0) + (size_t)in->i[5] * in->i[1],
            (const bf16*)TEN(1) + (size_t)in->i[4] * in->i[2],
                 (const bf16*)TEN(2), in->i[0], in->i[1], in->i[2], slice, nblk, lds);
+    }
 #undef TEN
 }
 __device__ __forceinline__ void exec_gemm_c5(CInst in, CTens T,
