@@ -5900,6 +5900,9 @@ fn glm_emit_full(
         pb.set_lean_moe_stage2_segments(
             crate::emit_is_amd() && emit_config::active().moe_stage2_lean,
         );
+        pb.set_lean_moe_combine_segments(
+            crate::emit_is_amd() && emit_config::active().moe_combine_lean,
+        );
         // PLOW_L2_PLACE reaches the DECODE builder unconditionally (below). GLM's prefill
         // program is uni-segment, so `Builder::finish` WOULD place it too — but the
         // shipped prefill objects are built without -DPLOW_L2_PLACE_DISPATCH
@@ -6475,6 +6478,9 @@ pub(crate) fn glm_build_block_pf(
         let mut pb = Builder::new(n_cu);
         pb.set_lean_moe_stage2_segments(
             crate::emit_is_amd() && emit_config::active().moe_stage2_lean,
+        );
+        pb.set_lean_moe_combine_segments(
+            crate::emit_is_amd() && emit_config::active().moe_combine_lean,
         );
         pb.adopt_tensors(tensors.clone());
         let pall = pb.all();

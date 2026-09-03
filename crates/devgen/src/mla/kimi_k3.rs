@@ -1298,6 +1298,9 @@ fn k3_build_model(
         b.set_lean_moe_stage1_segments(
             crate::emit_is_amd() && emit_config::active().moe_stage1_lean,
         );
+        b.set_lean_moe_combine_segments(
+            crate::emit_is_amd() && emit_config::active().moe_combine_lean,
+        );
         b.set_lean_kda_intra_segments(
             crate::emit_is_amd() && emit_config::active().kda_intra_cached,
         );
@@ -2027,7 +2030,10 @@ mod kimi_k3_tests {
     #[test]
     fn k3_lean_moe_defaults_are_applied_to_prefill_builders() {
         let _guard = crate::test_env::env_guard();
-        let _scope = crate::test_env::EnvScope::set(&[("PLOW_K3_LAYERS", "2")]);
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_K3_LAYERS", "2"),
+            ("PLOW_MOE_COMBINE_LEAN", "1"),
+        ]);
         let d = k3_dir("stage1_lean");
         let cfg = k3_json(&[
             ("text_config/hidden_size", "7168"),
@@ -2049,7 +2055,11 @@ mod kimi_k3_tests {
 
         let m = k3_build_model(&d, 8192, 256, 8, &[128], None);
         let p = &m.progs[0];
-        for op in [DevOp::MoeGroupGluPf, DevOp::MoeGroupDownPf] {
+        for op in [
+            DevOp::MoeGroupGluPf,
+            DevOp::MoeGroupDownPf,
+            DevOp::MoeCombinePf,
+        ] {
             let matches: Vec<_> = p
                 .insts
                 .iter()

@@ -327,6 +327,8 @@ pub struct Builder {
     lean_moe_stage2_segments: bool,
     /// Isolate structurally compatible MXFP4 grouped-MoE stage-1 packets.
     lean_moe_stage1_segments: bool,
+    /// Isolate fixed-order f32 grouped-MoE prefill combines.
+    lean_moe_combine_segments: bool,
     /// Isolate BT64/D128 chunk-KDA intra packets for a standalone gfx950 object.
     lean_kda_intra_segments: bool,
     /// Fold an eligible materialized Residual into its AttnRes consumer.
@@ -424,6 +426,18 @@ fn lean_moe_stage1_inst(inst: &DevInst) -> bool {
         && inst.t[..8].iter().all(|&t| t != TENSOR_NONE)
 }
 
+fn lean_moe_combine_inst(inst: &DevInst) -> bool {
+    inst.op == DevOp::MoeCombinePf as u16
+        && inst.t[0] != TENSOR_NONE
+        && inst.t[3] != TENSOR_NONE
+        && inst.i[0] != 0
+        && inst.i[1] == 16
+        && inst.i[2] != 0
+        && inst.i[3..].iter().all(|&v| v == 0)
+        && inst.f.iter().all(|&v| v.to_bits() == 0)
+        && inst.j.iter().all(|&v| v == 0)
+}
+
 impl Builder {
     pub fn new(n_cu: u32) -> Self {
         Self {
@@ -437,6 +451,7 @@ impl Builder {
             packed_prefill_segments: false,
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
+            lean_moe_combine_segments: false,
             lean_kda_intra_segments: false,
             fuse_materialized_residual_inputs: true,
             gemv_split: 1,
@@ -491,6 +506,10 @@ impl Builder {
 
     pub fn set_lean_moe_stage1_segments(&mut self, enabled: bool) {
         self.lean_moe_stage1_segments = enabled;
+    }
+
+    pub fn set_lean_moe_combine_segments(&mut self, enabled: bool) {
+        self.lean_moe_combine_segments = enabled;
     }
 
     pub fn set_lean_kda_intra_segments(&mut self, enabled: bool) {
@@ -1489,6 +1508,9 @@ impl Builder {
         let lean_moe_stage1 = !uniseg
             && self.lean_moe_stage1_segments
             && self.ops.iter().any(|op| lean_moe_stage1_inst(&op.inst));
+        let lean_moe_combine = !uniseg
+            && self.lean_moe_combine_segments
+            && self.ops.iter().any(|op| lean_moe_combine_inst(&op.inst));
         let lean_kda_intra = !uniseg
             && self.lean_kda_intra_segments
             && self.ops.iter().any(|op| {
@@ -1575,6 +1597,9 @@ impl Builder {
             } else if lean_moe_stage1 && lean_moe_stage1_inst(&self.ops[i].inst) {
                 // The BK256 standalone object owns exactly one grouped gate/up packet.
                 10
+            } else if lean_moe_combine && lean_moe_combine_inst(&self.ops[i].inst) {
+                // The standalone object preserves the interpreter's fixed slot order.
+                13
             } else if uniseg {
                 8
             } else if packed_prefill_segments && packed_prefill_segment_class(op).is_some() {
@@ -1684,6 +1709,7 @@ impl Builder {
             .any(|op| op.inst.op == DevOp::KdaDecodeFused as u16)
             || lean_moe_stage2
             || lean_moe_stage1
+            || lean_moe_combine
             || lean_kda_intra
             || xr_attnres;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
@@ -3845,6 +3871,74 @@ mod lean_moe_stage2_tests {
             d.i = [3584, 16, 1024, 0, 0, 0, 0, 0];
         });
         assert!(!lean_moe_stage2_pair(&unsupported.ops, 0));
+    }
+}
+
+#[cfg(test)]
+mod lean_moe_combine_tests {
+    use super::*;
+
+    fn program(enabled: bool, topk: u32, part16: u32) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_lean_moe_combine_segments(enabled);
+        let out = b.tensor("out", 4096);
+        let residual = b.tensor("residual", 4096);
+        let shared = b.tensor("shared", 4096);
+        let part = b.tensor("part", 65536);
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let combine = b.emit(DevOp::MoeCombinePf, all.clone(), &[before], |d| {
+            d.t = [
+                out,
+                residual,
+                shared,
+                part,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+                TENSOR_NONE,
+            ];
+            d.i = [2816, topk, 1024, 0, 0, 0, 0, part16];
+        });
+        b.emit(DevOp::Nop, all, &[combine], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn eligible_fixed_order_combine_gets_a_pure_segment() {
+        let p = program(true, 16, 0);
+        let segs: Vec<_> = p
+            .stream
+            .iter()
+            .filter(|entry| entry.inst == 1)
+            .map(|entry| entry.seg)
+            .collect();
+        assert!(!segs.is_empty());
+        assert!(p
+            .stream
+            .iter()
+            .filter(|entry| entry.seg == segs[0])
+            .all(|entry| entry.inst == 1));
+        assert_eq!((p.insts[1].wait_len, p.insts[1].succ_len), (0, 0));
+    }
+
+    #[test]
+    fn combine_route_is_opt_in_and_contract_gated() {
+        for p in [
+            program(false, 16, 0),
+            program(true, 8, 0),
+            program(true, 16, 1),
+        ] {
+            assert_eq!(
+                p.stream
+                    .iter()
+                    .map(|entry| entry.seg)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                1
+            );
+        }
     }
 }
 

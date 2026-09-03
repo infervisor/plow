@@ -661,6 +661,8 @@ option(PLOW_HSACO_MOE_STAGE2_LEAN
        "Emit the standalone gfx950 MXFP4 grouped-MoE stage-2 object" ON)
 option(PLOW_HSACO_MOE_STAGE1_LEAN
        "Emit the standalone gfx950 MXFP4 grouped-MoE stage-1 BK256 object" ON)
+option(PLOW_HSACO_MOE_COMBINE_LEAN
+       "Emit the standalone gfx950 fixed-order f32-part MoE combine object" ON)
 option(PLOW_K3_DECODE_MXFP4_PROJ
        "Include standalone MXFP4 projection ops in K3 decode objects" ON)
 option(PLOW_K3_DECODE_GROUPED
@@ -1291,6 +1293,25 @@ if(PLOW_GFX950_HSACO)
             COMMENT "hipcc moe_stage1_mxfp4_gfx950.elf"
             VERBATIM)
         list(APPEND _hs_outs "${_hs_moe1_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MOE_COMBINE_LEAN)
+        set(_hs_moe_combine_src
+            "${CMAKE_CURRENT_SOURCE_DIR}/bench/amd/lean_moe_combine_ref/kernel.hip")
+        set(_hs_moe_combine_out "${PLOW_HSACO_DIR}/moe_combine_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_moe_combine_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_moe_combine_out}"
+                    plow_moe_combine_fixed_order_gfx950 64 4
+                    ${_hs_inc} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_moe_combine_fixed_order_abi_1
+                    "${_hs_moe_combine_src}"
+            DEPENDS "${_hs_moe_combine_src}" "${_hs_run}" ${_hs_hdrs}
+            COMMENT "hipcc moe_combine_gfx950.elf"
+            VERBATIM)
+        add_custom_target(moe_combine_gfx950 DEPENDS "${_hs_moe_combine_out}")
+        list(APPEND _hs_outs "${_hs_moe_combine_out}")
     endif()
 
     # Golden __device__ wrappers. They call the SAME op_*.h bodies the

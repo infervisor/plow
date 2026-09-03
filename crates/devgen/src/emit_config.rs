@@ -494,6 +494,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_STAGE1_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_stage1_lean: bool,
 
+    /// Isolate compatible fixed-order grouped-MoE prefill combines.
+    #[arg(long, env = "PLOW_MOE_COMBINE_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub moe_combine_lean: bool,
+
     /// Split grouped-MoE align into expert-parallel count/prefix/scatter packets.
     #[arg(long, env = "PLOW_MOE_ALIGN_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_align_par: bool,
@@ -729,6 +733,7 @@ impl EmitConfig {
             moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_bool("PLOW_MOE_ALIGN_PAR"),
             moe_stage1_lean: env_opt_out("PLOW_MOE_STAGE1_LEAN"),
+            moe_combine_lean: env_bool("PLOW_MOE_COMBINE_LEAN"),
             moe_pf_atomic: env_bool("PLOW_MOE_PF_ATOMIC"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
             moe_pf_part16: env_bool("PLOW_MOE_PF_PART16"),
@@ -928,6 +933,13 @@ mod tests {
         let _guard = crate::test_env::env_guard();
         let _scope = crate::test_env::EnvScope::set(&[("PLOW_MOE_STAGE2_LEAN", "0")]);
         assert!(!super::active().moe_stage2_lean);
+    }
+
+    #[test]
+    fn lean_moe_combine_is_opt_in() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_MOE_COMBINE_LEAN", "1")]);
+        assert!(EmitConfig::from_env().moe_combine_lean);
     }
 
     #[test]

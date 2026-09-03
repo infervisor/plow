@@ -571,6 +571,21 @@ struct MoeStage1Mxfp4Args {
 const _: () = assert!(std::mem::size_of::<MoeStage1Mxfp4Args>() == 96);
 
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MoeCombineArgs {
+    out: u64,
+    residual: u64,
+    shared: u64,
+    part: u64,
+    hidden: u32,
+    topk: u32,
+    tokens: u32,
+    reserved: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeCombineArgs>() == 48);
+
+#[derive(Clone, Copy, Debug)]
 struct MoeStage1Mxfp4Route {
     args: MoeStage1Mxfp4Args,
     grid: u32,
@@ -579,6 +594,12 @@ struct MoeStage1Mxfp4Route {
 #[derive(Clone, Copy, Debug)]
 struct MoeStage2Mxfp4Route {
     args: MoeStage2Mxfp4Args,
+    grid: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MoeCombineRoute {
+    args: MoeCombineArgs,
     grid: u32,
 }
 
@@ -596,6 +617,7 @@ enum PrefillSegmentRoute {
     },
     MoeStage1Mxfp4(MoeStage1Mxfp4Route),
     MoeStage2Mxfp4(MoeStage2Mxfp4Route),
+    MoeCombine(MoeCombineRoute),
 }
 
 fn xreduce_attnres_encoded(d: &DevInst64) -> bool {
@@ -644,6 +666,17 @@ fn moe_stage2_mxfp4_inst(d: &DevInst64) -> bool {
         && d.t[5] != packet::dev::TENSOR_NONE16
         && d.t[6] != packet::dev::TENSOR_NONE16
         && d.t[7] != packet::dev::TENSOR_NONE16
+}
+
+fn moe_combine_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::MoeCombinePf as u16
+        && d.t[0] != packet::dev::TENSOR_NONE16
+        && d.t[3] != packet::dev::TENSOR_NONE16
+        && d.i[0] != 0
+        && d.i[1] == 16
+        && d.i[2] != 0
+        && d.i[3..].iter().all(|&v| v == 0)
+        && d.fj.iter().all(|&v| v == 0)
 }
 
 fn moe_stage2_mxfp4_pair(d: &DevInst64, c: &DevInst64) -> bool {
@@ -706,6 +739,19 @@ fn has_moe_stage1_mxfp4_segment(prog: &DevProg) -> bool {
         .any(|set| set.len() == 1 && moe_stage1_mxfp4_inst(&prog.insts[*set.first().unwrap()]))
 }
 
+fn has_moe_combine_segment(prog: &DevProg) -> bool {
+    let mut members = std::collections::BTreeMap::<u16, std::collections::BTreeSet<usize>>::new();
+    for entry in &prog.stream {
+        members
+            .entry(entry.seg)
+            .or_default()
+            .insert(entry.inst as usize);
+    }
+    members
+        .values()
+        .any(|set| set.len() == 1 && moe_combine_inst(&prog.insts[*set.first().unwrap()]))
+}
+
 fn moe_mxfp4_routes(
     prog: &DevProg,
     tensors: &[crate::asset::devblob::DevTensor],
@@ -726,12 +772,12 @@ fn moe_mxfp4_routes(
     let addr = |h: u16, what: &str| -> Result<u64> {
         if h == packet::dev::TENSOR_NONE16 {
             return Err(RuntimeError::Device(format!(
-                "lean MoE stage-2 operand `{what}` is absent"
+                "standalone lean MoE operand `{what}` is absent"
             )));
         }
         devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
             RuntimeError::Device(format!(
-                "lean MoE stage-2 operand `{what}` handle {h} is outside {} tensors",
+                "standalone lean MoE operand `{what}` handle {h} is outside {} tensors",
                 devp.len()
             ))
         })
@@ -819,6 +865,30 @@ fn moe_mxfp4_routes(
                     },
                     grid: u32::from(d.blocks),
                 });
+                continue;
+            }
+            if moe_combine_inst(d) {
+                routes.push(PrefillSegmentRoute::MoeCombine(MoeCombineRoute {
+                    args: MoeCombineArgs {
+                        out: addr(d.t[0], "out")?,
+                        residual: if d.t[1] == packet::dev::TENSOR_NONE16 {
+                            0
+                        } else {
+                            addr(d.t[1], "residual")?
+                        },
+                        shared: if d.t[2] == packet::dev::TENSOR_NONE16 {
+                            0
+                        } else {
+                            addr(d.t[2], "shared")?
+                        },
+                        part: addr(d.t[3], "part")?,
+                        hidden: d.i[0],
+                        topk: d.i[1],
+                        tokens: d.i[2],
+                        reserved: 0,
+                    },
+                    grid: d.i[2].min(512),
+                }));
                 continue;
             }
             if !moe_stage1_mxfp4_inst(d) {
@@ -5098,6 +5168,7 @@ pub struct AmdEngine {
     k_kda_chunk_intra_cached: Option<HsaKernel>,
     k_moe_stage1_mxfp4: Option<HsaKernel>,
     k_moe_stage2_mxfp4: Option<HsaKernel>,
+    k_moe_combine: Option<HsaKernel>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
     k_token_capture: Option<HsaKernel>,
@@ -5711,6 +5782,7 @@ impl AmdEngine {
         let need_moe_stage1_lean = blob.progs[..dec_ix]
             .iter()
             .any(has_moe_stage1_mxfp4_segment);
+        let need_moe_combine_lean = blob.progs[..dec_ix].iter().any(has_moe_combine_segment);
         let need_xr_attnres = blob.progs[..dec_ix]
             .iter()
             .any(|p| p.insts.iter().any(xreduce_attnres_inst));
@@ -6498,6 +6570,58 @@ impl AmdEngine {
                     )));
                 }
                 EngineDevice::set_max_dynamic_smem(&*be, kernel, 4_352)?;
+                modules.push(module);
+                Some(kernel)
+            }
+        } else {
+            None
+        };
+
+        let k_moe_combine = if arch == "gfx950" && need_moe_combine_lean {
+            const NAME: &str = "moe_combine_gfx950.elf";
+            const SYMBOL: &str = "plow_moe_combine_fixed_order_gfx950";
+            const MARKERS: [&str; 5] = [
+                "plow_moe_combine_fixed_order_abi_1",
+                "plow_moe_combine_fixed_order_slots16_1",
+                "plow_moe_combine_materialized_f32_1",
+                "plow_moe_combine_wave64_1",
+                "plow_moe_combine_no_spill_1",
+            ];
+            let path = hsaco_dir.join(NAME);
+            if !path.exists() {
+                None
+            } else {
+                let image = std::fs::read(&path).map_err(|e| {
+                    RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                })?;
+                let syms = elf_symbol_names(&image);
+                for marker in MARKERS {
+                    if !syms.contains(&marker) {
+                        return Err(RuntimeError::Device(format!(
+                            "lean MoE combine object {} lacks required ABI/resource marker `{marker}`",
+                            path.display()
+                        )));
+                    }
+                }
+                let module = EngineDevice::module_load(&*be, &image)?;
+                let kernel = EngineDevice::get_function(&*be, &module, SYMBOL).map_err(|e| {
+                    RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}"))
+                })?;
+                let want = std::mem::size_of::<MoeCombineArgs>() as u32;
+                let got = kernel.kernarg_size();
+                if got != want && got != want + 256 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: kernarg segment is {got} B; lean combine ABI needs {want} (or {} with COv5 implicit args)",
+                        want + 256
+                    )));
+                }
+                let lds = HsaBackend::kernel_lds_bytes(&kernel);
+                let private = kernel.private_segment_size();
+                if lds != 0 || private != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: resource gate failed: LDS={lds} (required 0), private={private} (required 0)"
+                    )));
+                }
                 modules.push(module);
                 Some(kernel)
             }
@@ -7543,6 +7667,7 @@ impl AmdEngine {
             k_kda_chunk_intra_cached,
             k_moe_stage1_mxfp4,
             k_moe_stage2_mxfp4,
+            k_moe_combine,
             k_xaudit,
             k_state_clear,
             k_token_capture,
@@ -8092,6 +8217,22 @@ impl AmdEngine {
                     route.grid,
                     256,
                     4_352,
+                    as_bytes(std::slice::from_ref(&route.args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let (Some(kernel), Some(PrefillSegmentRoute::MoeCombine(route))) = (
+                self.k_moe_combine,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    route.grid,
+                    256,
+                    0,
                     as_bytes(std::slice::from_ref(&route.args)),
                     None,
                 )?;
@@ -10425,6 +10566,80 @@ mod tests {
         prog.insts[1].i[0] = 512;
         let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
         assert!(matches!(fallback[1], PrefillSegmentRoute::Interpreter));
+    }
+
+    #[test]
+    fn lean_moe_combine_route_is_generic_and_exact_contract_only() {
+        let mut prog = segmented_prog(&[DevOp::MoeCombinePf], &[0]);
+        let d = &mut prog.insts[0];
+        d.t = [
+            0,
+            packet::dev::TENSOR_NONE16,
+            2,
+            3,
+            packet::dev::TENSOR_NONE16,
+            packet::dev::TENSOR_NONE16,
+            packet::dev::TENSOR_NONE16,
+            packet::dev::TENSOR_NONE16,
+        ];
+        d.i = [2816, 16, 1024, 0, 0, 0, 0, 0];
+        let tensors: Vec<_> = (0..4)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..4)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let PrefillSegmentRoute::MoeCombine(route) = routes[0] else {
+            panic!("generic exact combine packet must route to the lean object")
+        };
+        assert_eq!((route.args.hidden, route.args.tokens), (2816, 1024));
+        assert_eq!((route.args.residual, route.args.shared), (0, 0x1200));
+        assert_eq!((route.args.out, route.args.part), (0x1000, 0x1300));
+        assert_eq!(route.grid, 512);
+
+        prog.insts[0].i[2] = 128;
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let PrefillSegmentRoute::MoeCombine(route) = routes[0] else {
+            panic!("short-token exact combine packet must remain eligible")
+        };
+        assert_eq!(route.grid, 128);
+
+        for (integer, value) in [(1, 8), (4, 1), (7, 1)] {
+            prog.insts[0].i = [2816, 16, 1024, 0, 0, 0, 0, 0];
+            prog.insts[0].i[integer] = value;
+            let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+            assert!(matches!(fallback[0], PrefillSegmentRoute::Interpreter));
+        }
+        prog.insts[0].i = [2816, 16, 1024, 0, 0, 0, 0, 0];
+        prog.insts[0].fj[0] = 1;
+        let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        assert!(matches!(fallback[0], PrefillSegmentRoute::Interpreter));
+    }
+
+    #[test]
+    fn lean_moe_combine_route_rejects_mixed_segments() {
+        let mut prog = segmented_prog(&[DevOp::MoeCombinePf, DevOp::RmsNorm], &[0, 0]);
+        prog.insts[0].t[0] = 0;
+        prog.insts[0].t[3] = 1;
+        prog.insts[0].i = [4096, 16, 256, 0, 0, 0, 0, 0];
+        let tensors: Vec<_> = (0..2)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..2)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        assert!(matches!(routes[0], PrefillSegmentRoute::Interpreter));
     }
 
     #[test]
