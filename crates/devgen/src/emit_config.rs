@@ -351,6 +351,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_K3_KDA_CONV_STEP_DB", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub k3_kda_conv_step_db: bool,
 
+    /// Emit the standalone fused KDA decode boundary when its geometry is supported.
+    /// Default off; unsupported shapes retain the legacy Conv3 -> StateStepG -> GatedNorm chain.
+    #[arg(long = "emit-kda-decode-fused", env = "PLOW_KDA_DECODE_FUSED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_decode_fused: bool,
+
     /// Emit the model-independent BT64 chunk-KDA prefill pipeline. Default off; unsupported
     /// shapes retain the serial recurrence.
     #[arg(long, env = "PLOW_KDA_CHUNK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -658,6 +663,7 @@ impl EmitConfig {
             glm_router_old: env_bool("GLM_ROUTER_OLD"),
             k3_fuse_ngemv: env_str("PLOW_K3_FUSE_NGEMV"),
             k3_kda_conv_step_db: env_bool("PLOW_K3_KDA_CONV_STEP_DB"),
+            kda_decode_fused: env_bool("PLOW_KDA_DECODE_FUSED"),
             kda_chunk: env_bool("PLOW_KDA_CHUNK"),
             k3_up_nogather: env_bool("PLOW_K3_UP_NOGATHER"),
             k3_up_gather_only: env_bool("PLOW_K3_UP_GATHER_ONLY"),

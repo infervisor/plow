@@ -19,11 +19,11 @@
 # ------------------------------------------------------------------------------------------------
 # THE TWO ENVIRONMENT RULES, AND THEY ARE OPPOSITES. Both are load-bearing.
 #
-#   * `sg render -c` MUST BE OUTSIDE `nix develop`. nix runs in a user namespace where root maps to
-#     `nobody`, so /usr/bin/newgrp's setuid bit is inert inside it and `sg` dies with
-#     `setgroups: Operation not permitted`. Without the render gid `hsa_init` fails 4104 and a
-#     harness can fall back to a CPU backend and print confident garbage. plowc REFUSES rather than
-#     try; that refusal is why this script wraps the way it does.
+#   * Build and measure with the SAME nix ROCm toolchain. The TuneDB key records that toolchain and
+#     the preprocessed interpreter digest, so building test_kernels.elf with the host ROCm and then
+#     publishing through nix labels measurements with the wrong compiler. `sg render -c` still MUST
+#     stay OUTSIDE `nix develop`: nix runs in a user namespace where /usr/bin/newgrp cannot acquire
+#     the render gid. The command under `sg` enters nix for the measurement itself.
 #   * `ROCR_VISIBLE_DEVICES`, NOT `HIP_VISIBLE_DEVICES`. `plowc tune gemm` forwards the former by
 #     name and deliberately drops the latter: they COMPOSE, so setting both makes a correctly
 #     targeted card report "no ROCm-capable device is detected".
@@ -63,6 +63,7 @@ OBJ="${PLOW_TUNE_OBJ:-/tmp/tunecamp-objs}"
 OUT="${PLOW_TUNE_OUT:-/tmp/tunecamp}"
 # rocm-smi device 4 by default; see the numbering note above.
 ROCR="${ROCR_VISIBLE_DEVICES:-5}"
+K3_CONFIG="${PLOW_K3_CONFIG:-/tmp/k3-synth}"
 DO_BF16=1
 DO_K3=1
 case "${1:-}" in
@@ -76,9 +77,9 @@ mkdir -p "$OUT"
 cd "$WT"
 
 echo "=== 1/4  building the interpreter objects and test_kernels.elf into $OBJ"
-# OUTSIDE nix: hipcc is the system ROCm one and nix's CPATH/LIBRARY_PATH shadow the glibc it was
-# built against (knob-contract 0a). The build digest the store keys on comes from THESE sources.
-./scripts/build_gfx950.sh "$OBJ"
+# The object compiler must match `plowc tune`'s toolchain fingerprint. build_gfx950.sh uses
+# PLOW_HOST_CC inside the dev shell, so its host harness and ROCm runtime remain a coherent pair.
+nix develop --command ./scripts/build_gfx950.sh "$OBJ"
 
 echo
 echo "=== 2/4  building plowc"
@@ -86,7 +87,7 @@ nix develop --command cargo build --release -p plowc
 
 echo
 echo "=== 3/4  regenerating the K3 shape list from the config"
-python3 ./scripts/k3_shapes.py > "$WT/scripts/tune_shapes_k3.txt"
+python3 ./scripts/k3_shapes.py "$K3_CONFIG" > "$WT/scripts/tune_shapes_k3.txt"
 wc -l "$WT/scripts/tune_shapes_k3.txt"
 
 echo

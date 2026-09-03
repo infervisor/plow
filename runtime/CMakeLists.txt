@@ -708,6 +708,8 @@ option(PLOW_GATE_HIER
 option(PLOW_L2_PLACE_DISPATCH "Compile support for L2-domain placed packets" OFF)
 option(PLOW_MLA_PF_V2_ARM "Compile the four-wave MLA prefill V2 arm" OFF)
 set(PLOW_HSACO_EXTRA_DEFINES "" CACHE STRING "extra raw hipcc flags appended to every code object")
+set(PLOW_HSACO_CONFIG "" CACHE FILEPATH
+    "manifest-derived plow_config.h used to specialise ordinary interpreter objects")
 
 if(PLOW_GFX950_HSACO)
     if(PLOW_HSACO_EXTRA_DEFINES MATCHES "(^|[ \t;])-DPLOW_GATE_HIER(=|[ \t;]|$)")
@@ -739,6 +741,20 @@ if(PLOW_GFX950_HSACO)
     set(_hs_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/interp.hip")
     set(_hs_tk_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/test_kernels.hip")
     set(_hs_inc -I "${CMAKE_CURRENT_SOURCE_DIR}/amd" -I "${CMAKE_CURRENT_SOURCE_DIR}/common")
+    set(_hs_config_dep "")
+    set(_hs_need_kda_fused ON)
+    if(PLOW_HSACO_CONFIG)
+        get_filename_component(_hs_cfg_dir "${PLOW_HSACO_CONFIG}" DIRECTORY)
+        get_filename_component(_hs_cfg_name "${PLOW_HSACO_CONFIG}" NAME)
+        list(APPEND _hs_inc -I "${_hs_cfg_dir}")
+        list(APPEND _hs_extra "-DPLOW_CONFIG=\"${_hs_cfg_name}\"")
+        set(_hs_config_dep "${PLOW_HSACO_CONFIG}")
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_kda_fused_presence
+             REGEX "^#define PLOW_PACKET_HAS_KDA_DECODE_FUSED 1$")
+        if(NOT _hs_kda_fused_presence)
+            set(_hs_need_kda_fused OFF)
+        endif()
+    endif()
     set(_hs_run "${CMAKE_CURRENT_SOURCE_DIR}/cmake/hipcc_hsaco.sh")
     # The op bodies live entirely in headers, so without these a kernel edit
     # leaves every .elf stale — the exact failure every guard in
@@ -1139,12 +1155,30 @@ if(PLOW_GFX950_HSACO)
                         "${PLOW_HSACO_ARCH}" "${_out}" "${_sym}${_sfx}" ${_maxreg} ${_minocc}
                         ${_hs_inc} ${_hs_arch_def} ${${_a1}} ${${_a2}} ${_gq}
                         ${_row_kind_extra} ${_hs_extra} "${_hs_src}"
-                DEPENDS "${_hs_src}" "${_hs_run}" ${_hs_hdrs}
+                DEPENDS "${_hs_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
                 COMMENT "hipcc ${_stem}${_sfx}.elf"
                 VERBATIM)
             list(APPEND _hs_outs "${_out}")
         endforeach()
     endforeach()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND _hs_need_kda_fused)
+        set(_hs_kda_fused_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_decode_fused.hip")
+        set(_hs_kda_fused_out "${PLOW_HSACO_DIR}/kda_decode_fused_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_kda_fused_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_fused_out}"
+                    plow_kda_decode_fused_256x16_v2 128 4
+                    ${_hs_inc} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_decode_fused_256x16_2
+                    "${_hs_kda_fused_src}"
+            DEPENDS "${_hs_kda_fused_src}" "${_hs_run}" ${_hs_hdrs}
+            COMMENT "hipcc kda_decode_fused_gfx950.elf"
+            VERBATIM)
+        add_custom_target(kda_decode_fused_gfx950 DEPENDS "${_hs_kda_fused_out}")
+        list(APPEND _hs_outs "${_hs_kda_fused_out}")
+
+    endif()
 
     # Golden __device__ wrappers. They call the SAME op_*.h bodies the
     # interpreter runs, so they are rebuilt WITH it — building the interpreter

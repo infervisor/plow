@@ -15,6 +15,58 @@
  */
 #include "dev_isa.h"
 
+#ifdef PLOW_CONFIG
+#include PLOW_CONFIG
+#endif
+#ifndef PLOW_PACKET_HASH
+#define PLOW_PACKET_HASH 0ull
+#endif
+#ifndef PLOW_HAS_KDA_CONV
+#define PLOW_HAS_KDA_CONV 1
+#endif
+#ifndef PLOW_HAS_KDA_GATE
+#define PLOW_HAS_KDA_GATE 1
+#endif
+#ifndef PLOW_HAS_KDA_STATE_STEP
+#define PLOW_HAS_KDA_STATE_STEP 1
+#endif
+#ifndef PLOW_HAS_KDA_GATED_NORM
+#define PLOW_HAS_KDA_GATED_NORM 1
+#endif
+#ifndef PLOW_HAS_ATTN_RES
+#define PLOW_HAS_ATTN_RES 1
+#endif
+#ifndef PLOW_HAS_SITU_GLU
+#define PLOW_HAS_SITU_GLU 1
+#endif
+#ifndef PLOW_HAS_MLA_OUT_GATE
+#define PLOW_HAS_MLA_OUT_GATE 1
+#endif
+#ifndef PLOW_HAS_KDA_CONV3
+#define PLOW_HAS_KDA_CONV3 1
+#endif
+#ifndef PLOW_HAS_KDA_STATE_STEP_G
+#define PLOW_HAS_KDA_STATE_STEP_G 1
+#endif
+#ifndef PLOW_HAS_KDA_CONV_STATE_STEP_G
+#define PLOW_HAS_KDA_CONV_STATE_STEP_G 1
+#endif
+#ifndef PLOW_HAS_KDA_CHUNK_PREPARE
+#define PLOW_HAS_KDA_CHUNK_PREPARE 1
+#endif
+#ifndef PLOW_HAS_KDA_CHUNK_INTRA
+#define PLOW_HAS_KDA_CHUNK_INTRA 1
+#endif
+#ifndef PLOW_HAS_KDA_CHUNK_WU
+#define PLOW_HAS_KDA_CHUNK_WU 1
+#endif
+#ifndef PLOW_HAS_KDA_CHUNK_CARRY
+#define PLOW_HAS_KDA_CHUNK_CARRY 1
+#endif
+#ifndef PLOW_MATERIALIZED_RESIDUAL_INPUT
+#define PLOW_MATERIALIZED_RESIDUAL_INPUT 0
+#endif
+
 /* PLOW_K3 — compile the Kimi-K3 / KDA arms (op_k3.h, op_kda.h). DEFAULT 0.
  *
  * SEVEN arms hang off this: the four KDA ops (CONV, GATE, STATE_STEP, GATED_NORM) and the three
@@ -66,6 +118,13 @@
 
 /* This proves only that the object was compiled against the packed-prefill PlowProgram tail.
  * Descriptor-consuming math arms are a separate capability and are not enabled by this marker. */
+#if PLOW_PACKET_HASH != 0ull
+extern "C" __device__ unsigned plow_packet_hash_lo =
+    (unsigned)(PLOW_PACKET_HASH & 0xFFFFFFFFull);
+extern "C" __device__ unsigned plow_packet_hash_hi =
+    (unsigned)((PLOW_PACKET_HASH >> 32) & 0xFFFFFFFFull);
+#endif
+
 extern "C" __device__ unsigned plow_packed_prefill_abi_1 = 1;
 #if PLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS && PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS && \
     (PLOW_MLA_PREFILL || PLOW_MLA_PF_V2_ARM)
@@ -104,6 +163,51 @@ extern "C" __device__ unsigned plow_packed_prefill_mla_flash_segments_1 = 1;
  * without it. */
 #if PLOW_K3
 extern "C" __device__ unsigned plow_k3_arms_1 = 1;
+#if PLOW_HAS_KDA_CONV
+extern "C" __device__ unsigned plow_opcode_kda_conv_1 = 1;
+#endif
+#if PLOW_HAS_KDA_GATE
+extern "C" __device__ unsigned plow_opcode_kda_gate_1 = 1;
+#endif
+#if PLOW_HAS_KDA_STATE_STEP
+extern "C" __device__ unsigned plow_opcode_kda_state_step_1 = 1;
+#endif
+#if PLOW_HAS_KDA_GATED_NORM
+extern "C" __device__ unsigned plow_opcode_kda_gated_norm_1 = 1;
+#endif
+#if PLOW_HAS_ATTN_RES
+extern "C" __device__ unsigned plow_opcode_attn_res_1 = 1;
+#if PLOW_MATERIALIZED_RESIDUAL_INPUT
+extern "C" __device__ unsigned plow_materialized_residual_input_1 = 1;
+#endif
+#endif
+#if PLOW_HAS_SITU_GLU
+extern "C" __device__ unsigned plow_opcode_situ_glu_1 = 1;
+#endif
+#if PLOW_HAS_MLA_OUT_GATE
+extern "C" __device__ unsigned plow_opcode_mla_out_gate_1 = 1;
+#endif
+#if PLOW_HAS_KDA_CONV3
+extern "C" __device__ unsigned plow_opcode_kda_conv3_1 = 1;
+#endif
+#if PLOW_HAS_KDA_STATE_STEP_G
+extern "C" __device__ unsigned plow_opcode_kda_state_step_g_1 = 1;
+#endif
+#if PLOW_HAS_KDA_CONV_STATE_STEP_G
+extern "C" __device__ unsigned plow_opcode_kda_conv_state_step_g_1 = 1;
+#endif
+#if PLOW_HAS_KDA_CHUNK_PREPARE
+extern "C" __device__ unsigned plow_opcode_kda_chunk_prepare_1 = 1;
+#endif
+#if PLOW_HAS_KDA_CHUNK_INTRA
+extern "C" __device__ unsigned plow_opcode_kda_chunk_intra_1 = 1;
+#endif
+#if PLOW_HAS_KDA_CHUNK_WU
+extern "C" __device__ unsigned plow_opcode_kda_chunk_wu_1 = 1;
+#endif
+#if PLOW_HAS_KDA_CHUNK_CARRY
+extern "C" __device__ unsigned plow_opcode_kda_chunk_carry_1 = 1;
+#endif
 #endif
 #if PLOW_K3 && PLOW_KDA_CHUNK
 extern "C" __device__ unsigned plow_kda_chunk_bt64_arm_1 = 1;
@@ -1927,6 +2031,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #elif defined(PLOW_BUCKET_PACKED_KDA)
     if (!plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
     switch (in->op) {
+#if PLOW_HAS_KDA_STATE_STEP
         case PLOW_DOP_KDA_STATE_STEP:
             d_kda_state_step_packed</*GATED=*/false>(
                 (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
@@ -1934,6 +2039,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 nullptr, nullptr, nullptr, 0u, 0.0f, (float*)TEN(6), in->i[1], in->i[2],
                 in->i[3], in->i[4], in->fj[0].f, slice, nblk, (float*)sm->raw, prog_meta);
             break;
+#endif /* PLOW_HAS_KDA_STATE_STEP */
+#if PLOW_HAS_KDA_CONV3
         case PLOW_DOP_KDA_CONV3: {
             const float* wv = (in->i[4] == PLOW_TENSOR_NONE) ? nullptr : (const float*)T[in->i[4]];
             float* cs[3];
@@ -1949,6 +2056,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 (const float*)TEN(7), wv, cs[0], cs[1], cs[2], in->i[1], in->i[2],
                 in->i[3], slice, nblk, prog_meta);
         } break;
+#endif /* PLOW_HAS_KDA_CONV3 */
+#if PLOW_HAS_KDA_STATE_STEP_G
         case PLOW_DOP_KDA_STATE_STEP_G: {
             const float* dtb = (in->i[5] == PLOW_TENSOR_NONE) ? nullptr : (const float*)T[in->i[5]];
             if (dtb == nullptr || TEN(7) == nullptr || TEN(4) == nullptr || TEN(5) == nullptr)
@@ -1960,6 +2069,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 (float*)TEN(6), in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
                 slice, nblk, (float*)sm->raw, prog_meta);
         } break;
+#endif /* PLOW_HAS_KDA_STATE_STEP_G */
         default:
             __builtin_trap();
     }
@@ -2105,6 +2215,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * The drift test reads `case PLOW_DOP_*` labels textually and is unaffected by the `#if`. */
 #if PLOW_K3
 #if PLOW_KDA_CHUNK
+#if PLOW_HAS_KDA_CHUNK_PREPARE
         case PLOW_DOP_KDA_CHUNK_PREPARE:
             if (in->i[0] == 0u || in->i[1] == 0u ||
                 (in->i[2] != 64u && in->i[2] != 128u))
@@ -2125,6 +2236,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 (const float*)TEN(7), nullptr, (in->i[0] + 63u) / 64u, in->i[0], in->i[1],
                 in->i[2], in->i[3], in->fj[0].f, slice, nblk);
             break;
+#endif /* PLOW_HAS_KDA_CHUNK_PREPARE */
+#if PLOW_HAS_KDA_CHUNK_INTRA
         case PLOW_DOP_KDA_CHUNK_INTRA:
             if (in->i[0] == 0u || in->i[1] == 0u ||
                 (in->i[2] != 64u && in->i[2] != 128u))
@@ -2144,6 +2257,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 (const float*)TEN(4), (const float*)TEN(5), nullptr, (in->i[0] + 63u) / 64u,
                 in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk, (float*)sm->raw);
             break;
+#endif /* PLOW_HAS_KDA_CHUNK_INTRA */
+#if PLOW_HAS_KDA_CHUNK_WU
         case PLOW_DOP_KDA_CHUNK_WU:
             if (in->i[0] == 0u || in->i[1] == 0u ||
                 (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2])
@@ -2163,6 +2278,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 (const bf16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6), nullptr,
                 (in->i[0] + 63u) / 64u, in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
             break;
+#endif /* PLOW_HAS_KDA_CHUNK_WU */
+#if PLOW_HAS_KDA_CHUNK_CARRY
         case PLOW_DOP_KDA_CHUNK_CARRY: {
             if (in->i[0] == 0u || in->i[1] == 0u ||
                 (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2])
@@ -2187,19 +2304,25 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 in->i[2], in->i[3], in->fj[0].f, slice, nblk, kst, kv, ko);
             break;
         }
+#endif /* PLOW_HAS_KDA_CHUNK_CARRY */
 #endif
 #if !PLOW_KDA_CONV_STEP_DB
+#if PLOW_HAS_KDA_CONV
         case PLOW_DOP_KDA_CONV:
             d_kda_conv((bf16*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2), (float*)TEN(3),
                        in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk,
                        /* see the CONV3 note below: no free operand to select the path yet */
                        (size_t)0);
             break;
+#endif /* PLOW_HAS_KDA_CONV */
+#if PLOW_HAS_KDA_GATE
         case PLOW_DOP_KDA_GATE:
             d_kda_gate((float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                        (const float*)TEN(4), (const float*)TEN(5), in->i[0], in->i[1], in->i[2],
                        in->i[3], in->fj[0].f, slice, nblk);
             break;
+#endif /* PLOW_HAS_KDA_GATE */
+#if PLOW_HAS_KDA_STATE_STEP
         case PLOW_DOP_KDA_STATE_STEP:
 #if PLOW_PACKED_PREFILL_KDA_CONSUMERS
             if (plow_packed_prefill_enabled(prog_meta))
@@ -2220,12 +2343,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                              /* op 102 predates the per-row mask and carries no slot for it. */
                              nullptr);
             break;
+#endif /* PLOW_HAS_KDA_STATE_STEP */
 #endif
+#if PLOW_HAS_KDA_GATED_NORM
         case PLOW_DOP_KDA_GATED_NORM:
             d_kda_gated_norm((bf16*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2),
                              (const bf16*)TEN(3), in->i[0], in->i[1], in->i[2], in->fj[0].f, slice,
                              nblk);
             break;
+#endif /* PLOW_HAS_KDA_GATED_NORM */
 #if !PLOW_KDA_CONV_STEP_DB
         /* FUSED KDA — ops 88x3 -> 109 and 89+102 -> 110. Six packets per layer become three, 207
          * per token over 69 KDA layers, against a measured ~12 us per packet.
@@ -2234,6 +2360,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * the failure to refuse is a packet that convolves two of three streams, or that runs the
          * recurrence against an uninitialised gate, and leaves the rest finite and fluent. Both
          * arms trap on any demoted operand being absent. */
+#if PLOW_HAS_KDA_CONV3
         case PLOW_DOP_KDA_CONV3: {
             const float* wv = (in->i[4] == PLOW_TENSOR_NONE) ? nullptr : (const float*)T[in->i[4]];
             float* cs[3];
@@ -2279,6 +2406,8 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                         in->fj[1].u ? (const unsigned*)T[in->fj[2].u] : nullptr);
             break;
         }
+#endif /* PLOW_HAS_KDA_CONV3 */
+#if PLOW_HAS_KDA_STATE_STEP_G
         case PLOW_DOP_KDA_STATE_STEP_G: {
             const float* dtb = (in->i[5] == PLOW_TENSOR_NONE) ? nullptr : (const float*)T[in->i[5]];
             if (dtb == nullptr || TEN(7) == nullptr || TEN(4) == nullptr || TEN(5) == nullptr)
@@ -2313,8 +2442,10 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                    : nullptr);
             break;
         }
+#endif /* PLOW_HAS_KDA_STATE_STEP_G */
 #endif
 #if PLOW_KDA_CONV_STEP_DB
+#if PLOW_HAS_KDA_CONV_STATE_STEP_G
         case PLOW_DOP_KDA_CONV_STATE_STEP_G: {
             const unsigned* desc = (const unsigned*)TEN(7);
             if (desc == nullptr || in->i[0] != 1) __builtin_trap();
@@ -2341,6 +2472,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 (float*)sm->raw);
             break;
         }
+#endif /* PLOW_HAS_KDA_CONV_STATE_STEP_G */
 #endif
         /* Kimi-K3 BLOCK structure (op_k3.h). Both arms are in BOTH buckets: a K3 layer runs the
          * same graph at T=1 and T>1, and AttnRes in particular replaces the residual add on the
@@ -2353,20 +2485,35 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         /* t5 = the FUSED post-norm's gamma, and PLOW_TENSOR_NONE means "leave the raw mix", which
          * is the pre-fusion arm byte for byte. See d_attn_res' note: every AttnRes in a K3 program
          * is read by exactly one RMSNORM over its own output, so the two narrow packets collapse. */
+#if PLOW_HAS_ATTN_RES
         case PLOW_DOP_ATTN_RES:
+#if PLOW_MATERIALIZED_RESIDUAL_INPUT
+            if (in->t[6] != PLOW_TENSOR_NONE) {
+                if (in->t[7] == PLOW_TENSOR_NONE) __builtin_trap();
+                d_materialize_residual(
+                    (bf16*)TEN(1), (const bf16*)TEN(6), (const bf16*)TEN(7),
+                    in->i[5] == PLOW_TENSOR_NONE ? nullptr : (const bf16*)T[in->i[5]], in->i[0],
+                    in->i[1], slice, nblk);
+            }
+#endif
             d_attn_res((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                        (const float*)TEN(3), in->i[0], in->i[1], in->i[2], in->i[4], in->fj[0].f,
                        slice, nblk, (float*)sm->raw, (const bf16*)TEN(4), in->i[3],
                        (const bf16*)TEN(5));
             break;
+#endif /* PLOW_HAS_ATTN_RES */
+#if PLOW_HAS_SITU_GLU
         case PLOW_DOP_SITU_GLU:
             d_situ_glu((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
                        in->fj[0].f, in->fj[1].f, slice, nblk);
             break;
+#endif /* PLOW_HAS_SITU_GLU */
+#if PLOW_HAS_MLA_OUT_GATE
         case PLOW_DOP_MLA_OUT_GATE:
             d_mla_out_gate((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0], slice,
                            nblk);
             break;
+#endif /* PLOW_HAS_MLA_OUT_GATE */
 #endif /* PLOW_K3 */
         /* Greedy sampling on device. In BOTH buckets: prefill samples the first token, decode
          * every one after it, and the id lands in `in.ids` where the next EMBED reads it. */

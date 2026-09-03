@@ -909,7 +909,7 @@ enum {
      * arm traps on either — there is no slot naming a precomputed g, so this op cannot silently
      * degrade to the unfused reading of the packet.
      *
-     * t0=o t1=q t2=k t3=v t4=g_raw t5=beta_raw t6=state t7=A_log ·
+     * t0=o t1=q t2=k t3=v t4=forget_raw t5=beta_raw t6=state t7=A_log ·
      * i0=T i1=H i2=D i3=BV i4=flags i5=dt_bias i6=gate_mode · f0=scale f1=lower_bound */
     PLOW_DOP_KDA_STATE_STEP_G = 112,
     /* MXFP4 (w4a16) PREFILL fused gate|up GEMM+GLU — the T-row twin of PLOW_DOP_GEMV_GLU_MXFP4 (92)
@@ -1035,6 +1035,13 @@ enum {
     PLOW_DOP_KDA_CHUNK_INTRA = 122,
     PLOW_DOP_KDA_CHUNK_WU = 123,
     PLOW_DOP_KDA_CHUNK_CARRY = 124,
+
+    /* Standalone fused KDA decode boundary. t7 is a u32 tensor-handle descriptor:
+     * wq,wk,wv,csq,csk,csv,A_log,dt_bias,norm_w,output_gate_raw,parked.
+     * t0=y t1=q_raw t2=k_raw t3=v_raw t4=forget_raw t5=beta_raw t6=state t7=descriptor;
+     * i0=rows i1=H i2=D i3=BV i4=W i5=flags i6=gate_mode i7=descriptor_version;
+     * f0=scale f1=lower_bound j1=norm_eps_bits. */
+    PLOW_DOP_KDA_DECODE_FUSED = 125,
 
     PLOW_DOP__COUNT
 };

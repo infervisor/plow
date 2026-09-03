@@ -97,7 +97,8 @@ pub enum DevOp {
     /// `cos = TENSOR_NONE` skips RoPE. `out_row0` lets K/V land directly at a row
     /// offset of the KV cache, so the cache write is not a separate copy.
     HeadNormRope = 3,
-    /// `t0=out t1=a t2=b` · `i0=n` · `f0=scale`, computing `(a + b) * scale`.
+    /// `t0=out t1=a t2=b t3=pre?` · `i0=n` · `f0=scale`, computing
+    /// `(a + b) * scale`, or `(pre + bf16(a + b)) * scale` when `pre` is present.
     /// `scale` absorbs Gemma's per-layer `layer_scalar` on the SECOND residual
     /// add; pass 1.0 for the first.
     Residual = 4,
@@ -984,8 +985,8 @@ pub enum DevOp {
     /// obvious fix of splitting the reduction across blocks and finishing it in a second packet.
     ///
     /// `t0=out([T,H] bf16) t1=prefix_sum([T,H] bf16) t2=block_residual([T,nb_cap,H] bf16)
-    /// t3=score_w([H] f32) t4=push_src? t5=gamma?` · `i0=T i1=H i2=nb i3=push_row i4=nb_cap` ·
-    /// `f0=eps`.
+    /// t3=score_w([H] f32) t4=push_src? t5=gamma? t6=res_a? t7=res_b?` ·
+    /// `i0=T i1=H i2=nb i3=push_row i4=nb_cap i5=res_pre?` · `f0=eps`.
     ///
     /// `gamma` is the FUSED POST-NORM, `[H] bf16`, and it is what makes the slice map above
     /// affordable. Every AttnRes in a K3 program is read by exactly one consumer and that consumer
@@ -1009,6 +1010,10 @@ pub enum DevOp {
     /// reads rows `[0, nb)` while the push writes row `nb` — one past — so no workgroup reads
     /// another's pushed row inside the packet, and the readers that follow are gated by the
     /// counter DAG (`Dep::Coarse` waits on every producer slice).
+    ///
+    /// `res_a`/`res_b` optionally materialize `prefix_sum = bf16(res_a + res_b)` inside this
+    /// packet. `res_pre` selects `prefix_sum = bf16(res_pre + bf16(res_a + res_b))`, retaining
+    /// the intermediate BF16 rounding and the materialized tensor for all other consumers.
     AttnRes = 104,
     /// **`situ` GLU** — Kimi-K3's activation, on EVERY GLU in the model (dense L0, shared
     /// experts, routed experts).
@@ -1374,6 +1379,14 @@ pub enum DevOp {
     /// `t0=o t1=state t2=q t3=k t4=W t5=U t6=Aqk t7=g_prefix` ·
     /// `i0=T i1=H i2=D i3=V` · `f0=scale`.
     KdaChunkCarry = 124,
+    /// Standalone fused KDA decode boundary: Conv3 + gated recurrent state step + gated RMSNorm.
+    /// The raw-argument kernel is selected by opcode capability rather than model identity.
+    /// `t7` is a u32 tensor-handle descriptor:
+    /// `[wq,wk,wv,csq,csk,csv,A_log,dt_bias,norm_w,output_gate_raw,parked]`.
+    /// `t0=y t1=q_raw t2=k_raw t3=v_raw t4=forget_raw t5=beta_raw t6=state t7=descriptor` ·
+    /// `i0=rows i1=H i2=D i3=BV i4=W i5=flags i6=gate_mode i7=descriptor_version(2)` ·
+    /// `f0=scale f1=lower_bound j1=norm_eps_bits`.
+    KdaDecodeFused = 125,
 }
 
 impl DevOp {
@@ -1508,6 +1521,7 @@ impl DevOp {
         DevOp::KdaChunkIntra,
         DevOp::KdaChunkWu,
         DevOp::KdaChunkCarry,
+        DevOp::KdaDecodeFused,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1653,6 +1667,7 @@ impl DevOp {
             DevOp::KdaChunkIntra => "PLOW_DOP_KDA_CHUNK_INTRA",
             DevOp::KdaChunkWu => "PLOW_DOP_KDA_CHUNK_WU",
             DevOp::KdaChunkCarry => "PLOW_DOP_KDA_CHUNK_CARRY",
+            DevOp::KdaDecodeFused => "PLOW_DOP_KDA_DECODE_FUSED",
         }
     }
 
@@ -1682,7 +1697,7 @@ impl DevOp {
     /// bump: this constant is one past the HIGHEST opcode, not a count, and adding a pair moves it
     /// by two whether or not the range has holes.
     /// 116 -> 117 for `XReduceAddNorm = 116` (the fused TP seam).
-    pub const COUNT: u16 = 125;
+    pub const COUNT: u16 = 126;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///

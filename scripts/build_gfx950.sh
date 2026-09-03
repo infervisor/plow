@@ -29,6 +29,12 @@ BUN="${PLOW_BUNDLER:-$(ls -1 "${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/clang-offloa
         "${ROCM_PATH:-/opt/rocm}"/llvm/bin/clang-offload-bundler \
         /opt/rocm-*/lib/llvm/bin/clang-offload-bundler 2>/dev/null | head -1)}"
 INC="-I$R/amd -I$R/common"
+if [ -n "${PLOW_HSACO_CONFIG:-}" ]; then
+  [ -f "$PLOW_HSACO_CONFIG" ] || { echo "missing PLOW_HSACO_CONFIG: $PLOW_HSACO_CONFIG" >&2; exit 2; }
+  cfg_dir="$(dirname -- "$PLOW_HSACO_CONFIG")"
+  cfg_name="$(basename -- "$PLOW_HSACO_CONFIG")"
+  INC="$INC -I$cfg_dir -DPLOW_CONFIG=\"$cfg_name\""
+fi
 mkdir -p "$OUT"; cd "$OUT"
 
 # Delete FIRST. A build that fails must leave nothing behind to run.
@@ -39,7 +45,8 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       i_decode_fp8.co i_decode_fp8_gq.co interp_decode_fp8.elf interp_decode_fp8_gq.elf \
       i_decode_fp8kv.co i_decode_fp8kv_gq.co interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf \
       i_prefill_mla_moe.co i_prefill_mla_moe_gq.co \
-      interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf
+      interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf \
+      kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf
 
 genco() { # <extra-defs> <out.co>
   hipcc --offload-arch="$ARCH" -O3 -w $1 --genco "$R/amd/interp.hip" -o "$2" $INC
@@ -47,6 +54,21 @@ genco() { # <extra-defs> <out.co>
 unbundle() { # <in.co> <out.elf>
   "$BUN" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" --input="$1" --output="$2"
 }
+
+KDA_FUSED_ELFS=""
+need_kda_fused=1
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   ! grep -qx '#define PLOW_PACKET_HAS_KDA_DECODE_FUSED 1' "$PLOW_HSACO_CONFIG"; then
+  need_kda_fused=0
+fi
+if [ "$ARCH" = gfx950 ] && [ "$need_kda_fused" = 1 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_decode_fused_gfx950.elf" plow_kda_decode_fused_256x16_v2 128 4 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_decode_fused_256x16_2 \
+    "$R/amd/kda_decode_fused.hip"
+  KDA_FUSED_ELFS="kda_decode_fused_gfx950.elf"
+fi
 
 # DECODE BATCH BUCKET -> PLOW_GEMV_MM. THIS ROUTE WAS MISSING, and it is why batched decode
 # produced exactly one non-zero logits row on AMD while devgen emitted a fully batch-aware
@@ -489,7 +511,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $KDA_FUSED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.

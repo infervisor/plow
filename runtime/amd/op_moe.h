@@ -3185,8 +3185,10 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
 #define MPF4_WNc 4
 #endif
 static_assert(MPF4_BM == 32 || MPF4_BM == 64, "A4W4 grouped MoE supports BM32 or BM64");
+#if PLOW_MOE_PF_A4W4
 static_assert(PLOW_WAVES == MPF4_WMc * MPF4_WNc,
               "A4W4 grouped MoE tile must cover the full workgroup");
+#endif
 /* 16-byte-column XOR swizzle over the 64-byte row: 4 groups, row&3 picks the rotation. Same
  * purpose as the bf16 body's — without it every row of a fragment read hits the same bank. */
 #define MPF4_XORSWZ(row, off) ((off) ^ (((row) & 3u) << 4))

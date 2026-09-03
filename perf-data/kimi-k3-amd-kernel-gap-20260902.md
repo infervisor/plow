@@ -87,16 +87,25 @@ BV8 state tiles without the reference kernel's preload schedule. The arm
 remains benchmark-only and rejected; the next fused screen must use the
 reference 256-thread, sixteen-group state pipeline.
 
-That second fused screen wins the exact semantic boundary. One 256-thread
+That second fused screen initially appeared to win the exact semantic boundary,
+but its fixture incorrectly reused the forget gate as the final output gate.
+The corrected ABI-v2 kernel carries both gates independently. One 256-thread
 workgroup owns each row/head; sixteen 16-lane groups preload all FP32 state
 vectors before convolution, then use vector non-temporal state traffic and
-DPP reductions. The ROCm 7.14 confirmation measured 5.974 us at B1 and
-6.514 us at B8, 28.9% and 29.5% faster than pinned vLLM's 8.40/9.24 us.
-Convolution state was exact; B1 final output was exact; B8 final relative L2
-was 4.20e-6. The kernel uses 128 VGPR, 45 SGPR, 2,336 B LDS, and no spills.
-This passes the isolated and fused-block gates. Production integration remains
-separate and must route by opcode geometry/capability, with an exact fallback
-for unsupported shapes.
+DPP reductions. The corrected standalone object measured 6.902 us at B1 and
+7.347 us at B8, 17.8% and 20.5% faster than the pinned vLLM 8.40/9.24 us.
+Final outputs were exact at B1 and B8; recurrent-state relative L2 was 1.41e-8.
+The kernel uses 128 VGPR, occupancy 4, and no spills.
+
+The standalone gfx950 object uses the versioned
+`plow_kda_decode_fused_256x16_2` marker and a 184-byte explicit kernarg. Packet,
+devgen, and runtime route pure segments through it while leaving the ordinary
+interpreter unchanged. A fresh emitted TP8 64-step stress passed exact per-token
+cross-rank counter audit and all-rank token agreement. The matched one-layer
+F-L-L-F gate measured fused 14.099 ms/token vs legacy 14.030 ms/token: fused is
+0.49% slower, within noise, because its extra segment launches erase the kernel
+win. The path therefore remains explicit opt-in and default-off; it does not
+pass the fused-block promotion gate.
 
 The exact BF16 MLA decode harness uses the emitted TP8 geometry rather than
 the old FP8/gfx942 sweep: H=12, DK=512, DR=64, V=128, context=8192, ns=64,
@@ -119,6 +128,16 @@ regressed B1 from 14.488 to 19.032 us (+31.4%) and introduced four VGPR spills
 and 20 B scratch. It remains benchmark-only. A stronger next screen is
 batch/head-group-aware split selection: current B8 GF4/ns64 creates 1,536
 logical units over 256 workgroups, while AITER selects 256 units.
+
+The exact GF4 split sweep confirms that lever at the complete attention-core
+boundary. B1 ns32/grid96 measured 38.532-38.612 us vs ns64
+46.600-46.708 us (-17.3%) and now beats the matched vLLM/AITER 43.232 us
+core. B8 ns32/grid256 measured 85.913-86.097 us vs ns64
+113.281-113.341 us (-24.1%), but still trails AITER's 42.441 us by about 2x.
+Both winning outputs were BF16-identical to ns64; GF4 resources remain
+236 VGPR, 57 SGPR, 29,248 B LDS, and zero spills. This is still a cross-path
+oracle. Production promotion requires per-rung split selection plus the
+existing exact fallback.
 
 The current grouped-MoE microbenchmark is not a valid AITER comparison. It
 previously defaulted to unsharded I=3072; the emitted TP8 packet uses local
@@ -179,6 +198,194 @@ stage-2 oracle. Times below are the two-run medians reported by each process:
 Scale NT with a temporal payload regressed stage 1 by 8.8% and stage 2 by
 0.7%; the combined cell also lost. The scale-NT candidate was removed rather
 than retained as a production/build knob; payload NT remains default-off.
+
+An AITER-style packed-weight experiment then permuted MXFP4 payloads to
+`[N/32][K/64][lane64][16 B]` and E8M0 scales to
+`[N/32][K/64][lane64]`, letting each wave load its B fragments directly into
+registers without the B-side LDS copy. A nonuniform-weight CPU oracle passed
+both stages (down worst relative error 5.43e-8; GLU 0.4837 FP4 ULP).
+
+At BM64/eight waves, direct B duplicates each fragment across the two M-wave
+groups and lost repeatably: stage 1 moved from 1.002/1.001 ms to
+1.163/1.163 ms, while stage 2 moved from 1.149/1.152 ms to 1.172/1.170 ms.
+The experiment and its layout flag were removed. At the AITER-like BM32/four-
+wave stage-2 geometry, direct B was a small win over an otherwise matched
+staged-B control (0.912/0.911 vs 0.927/0.927 ms; scatter-plus-reduce
+0.982/0.981 vs 0.996/0.996 ms), but the incremental 1.5-1.7% does not justify
+a second weight slab or a production capability route by itself.
+
+The useful result is the four-wave geometry: the existing staged-B body at
+BM32/four waves is about 19% faster than BM64/eight waves at the complete
+scatter-plus-reduce boundary. It remains benchmark evidence, not a promoted
+interpreter setting: the current persistent interpreter is an eight-wave
+object, so a safe promotion needs a separately capability-routed lean segment.
+Expanding the stage-2 grid from 512 persistent workgroups to all 14,196 output
+tiles moved 0.927 ms to only 0.916 ms, ruling work assignment out as the main
+gap. The pinned like-precision AITER cell is still 144.527 us, 6.3x faster than
+the best Plow kernel and 6.8x faster than its scatter-plus-reduce boundary.
+Its remaining structural advantages are a two-stage direct-B/B-scale register
+pipeline, a three-slot async A LDS ring, and 16x16x128 scaled MFMA issue groups;
+Plow still stages both operands then issues 32x32x64 MFMAs.
+
+A standalone four-wave 16x16x128 CDNA4 body then tested those issue groups
+directly without changing the production fallback. The ROCm 7.14 builtin takes
+the same `v8i32` operand carrier as the 32x32 form and an `f32x4`
+accumulator. With ordinary row-major B loads, the independent nonuniform CPU
+oracle passed all 14,208 down values with no unwritten output and 5.43e-8 worst
+relative error. At the exact T=1024, H=3584, I=384, E=896, top-16 BM32/four-
+wave geometry, 31 forward/reverse-interleaved iterations measured the existing
+scatter-plus-reduce boundary at 0.996 ms and the 16x16x128 boundary at 1.070 ms
+(+7.4%).
+
+Coalescing the B loads through an offline-preshuffled payload did not recover
+the loss: the matched boundary was 0.994 vs 1.096 ms (+10.2%). Keeping the
+whole 384-K A tile in LDS to remove per-K publication barriers measured 0.996
+vs 1.100 ms (+10.4%). A literal two-buffer register-carried B prefetch inflated
+the live state and regressed to 1.813 ms against 0.998 ms (+81.6%). The exact
+production-size constant-pattern cross-path check remained bit-identical, but
+the preshuffled variants lost before a separate nonuniform layout oracle was
+warranted. All experimental bodies, flags, and harness wiring were removed.
+The negative result narrows the remaining gap: changing MFMA shape alone is
+not sufficient in HIP C++; AITER depends on its compiler-controlled fragment
+layout and low-live-range async pipeline. Stage 1 was not screened because the
+stage-2 prerequisite failed its complete-boundary gate.
+
+An ISA/resource comparison then extracted the exact stage-2 object produced by
+the pinned vLLM ROCm image
+`sha256:e0a3b2bd3fe7ec563916c3a5d949898d133458c18d6b2f460c906885cfb32032`.
+At T=1024, H=3584, I=384, E=896, top-16 it selected
+`mfma_moe2_afp4_wfp4_bf16_cshuffle_t32x256x128_vscale_fix3_fp4opt_v1_pm1`.
+The matched Plow object was BM32/BN256/BK128 with four waves:
+
+| exact stage-2 object | VGPR | SGPR | LDS | private | spills | static scaled MFMA | barriers |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Plow BM32/four-wave | 150 | 92 | 55,552 B | 0 B | 0 | 4 x `32x32x64` in a three-trip K loop | 4 |
+| pinned-image AITER | 98 | 46 | 16,640 B | 0 B | 0 | 24 x `16x16x128`, fully scheduled | 6 |
+
+The MFMA counts represent equal work: one 32x32x64 issue has twice the MACs of
+one 16x16x128 issue, and Plow executes its four-instruction body three times.
+The material difference is scheduling and live state. Plow stages A, B, and
+both scale tensors in LDS (`runtime/amd/op_moe.h:3337-3342`), then performs
+LDS reads plus immediate `lgkmcnt` waits around each two-issue MFMA group
+(`runtime/amd/op_moe.h:3548-3574`). AITER maps each wave to four 16-column N
+subblocks and streams preshuffled B/B-scales directly into register fragments
+(`/tmp/aiter-main/aiter/ops/flydsl/kernels/mega_moe/gemm2.py:353-424`). Its
+two-stage carry launches the next B/B-scale and A-scale VMEM reads ahead of
+the current MFMA cluster while A rotates through staged LDS
+(`gemm2.py:517-652`). The extracted ISA confirms that overlap: vector loads
+are interleaved through the 24-instruction MFMA sequence, rather than an LDS
+publication/read/wait phase around a short MFMA group.
+
+This evidence rules out spills as the existing Plow cause: both original
+objects have zero spills. It also makes bytes alone insufficient. Plow reports
+1.069 GB of mandatory stage-2 traffic and reaches 1.15 TB/s; its 234.9 MB FP32
+partial scatter plus a separate reduction is an extra boundary absent from
+AITER native BF16 packed atomics, but cannot explain 6.8x by itself. Removing
+the unused GLU bridge from the down-only LDS allocation reduced Plow LDS to
+39,168 B with no timing change (0.928 vs 0.928 ms). Compiling scatter-only code
+reduced the object by 18% and SGPR 92 to 90, also with no timing change
+(0.925/0.926 vs 0.924/0.927 ms). Thus LDS capacity and dormant epilogue branch
+code are not the dominant stalls at the present 150-VGPR body.
+
+The highest-confidence resource lever was tested only as a standalone object.
+A two-block launch bound was non-binding and retained 150 VGPR. Combining lean
+LDS with a four-block bound reached 128 VGPR only by adding 16 VGPR spills and
+68 B of private storage. One-lease forward/reverse timing passed the exact
+3,670,016-value oracle but regressed kernel time from 0.928/0.928 to
+1.042/1.046 ms (+12.5%) and scatter-plus-reduce from 0.998/0.996 to
+1.114/1.114 ms (+11.7%). The variant and all harness flags were removed. A
+credible next body must reduce live ranges structurally to AITER-like resource
+levels without spills and must remain a separate lean object routed only for
+pure compatible segments; constraining the current mega body is rejected.
+
+The exact installed source was then recovered from that image rather than
+inferred from the newer checkout. It is amd-aiter 0.1.19 under the MIT license.
+`compile_mixed_moe_gemm2` confirms that this object is four waves with
+TM32/TN256/TK128, PM1/SBM32, A4W4 input and BF16 C-shuffle atomic output. Its
+`b_nt` argument is explicitly ignored. The weight byte layout is
+`[E][N/16][Kbytes/64][K-lane 4][N-lane 16][16 B]`; scale buffers are padded to
+256 rows and eight K-scale columns and pack two M/N halves by two K halves into
+each dword. Each wave owns N64 and eight `f32x4` accumulators (two M16 by four
+N16). A ping/pong A tile lives in LDS while B stays in registers; the next A,
+B and scale loads are issued before current compute. The installed scheduler
+then repeats VMEM, four MFMAs, DSRD, four MFMAs. The 16 KiB BF16 C-shuffle
+aliases the A LDS after compute and finishes with 16 packed-BF16 atomic
+instructions per workgroup.
+
+An independent source-backed gate constructed raw nonuniform FP4 payloads and
+E8M0 scales, applied only the documented ABI permutations, and decoded the
+reference with a separate FP4 lookup and FP32 matmul. It passed bit-for-bit for
+32 routed rows x 3584 columns (114,688 values, zero max absolute/relative
+error). A second exact cell used the same xorshift routing histogram as the
+Plow harness: T1024/H3584/I384/E896/top-16, 32,448 padded rows and 1,014 M
+blocks. Forward/reverse process order under one GPU lease measured AITER at
+0.172842/0.173401 ms for the kernel and 0.173482/0.173522 ms including the
+required output zero. The matched Plow BM32/four-wave process measured
+0.927/0.927 ms for DOWN+scatter and 0.996/0.996 ms for scatter+reduce. On this
+independently generated exact routing cell, the source-backed object is 5.35x
+faster at the kernel boundary and 5.74x faster at the complete boundary. The
+published AITER table remains 0.144527 ms; the local cell is deliberately
+reported separately. A Plow port should preserve this layout and scheduler in
+a generated or hand-scheduled lean object. A HIP-C++ body that merely holds
+both B tiles live has already failed, so it must not be folded into the mega
+interpreter.
+
+### Standalone reference-derived object gate
+
+The phase-1 Plow package under
+`runtime/bench/amd/lean_moe_stage2_ref/` now reproduces the exact object from
+the pinned vLLM ROCm image digest. The emitted 9,072-byte object has SHA-256
+`3034c6cf087a0229cd723f226b74df4763f05f0c3cdf07b194bc03649a7899f5`.
+Its manifest fixes the gfx950 capability, 96-byte ABI, shuffled MXFP4/E8M0
+layouts, and the measured 98 VGPR/46 SGPR/16,640-byte LDS/no-spill resource
+contract. The runtime gate does not import AITER or FlyDSL: it loads the raw
+object through the HIP module API, applies independent host layout transforms,
+and compares against an independent CPU FP4 decode/matmul oracle.
+
+The independently loaded exact gate passed all 114,688 focused values
+bit-for-bit. A repeated one-lease run at T1024/H3584/I384/E896/top-16,
+32,448 padded rows and 1,014 M blocks measured 0.169241/0.169042 ms for
+forward/reverse kernel order and 0.174121/0.173202 ms including output zero.
+This is gate-only: no CMake target, production loader, model predicate, or mega
+interpreter arm was added.
+
+### Dependency-free native 16x16x128 object
+
+`native_kernel.hip` in the same isolated package now implements the schedule
+without an AITER or FlyDSL build/runtime dependency. Four wave64 waves own N64
+each; B payload and paired scale dwords are preshuffled and held in a two-stage
+register pipeline while the next A tile is loaded across the current eight-MFMA
+group. Two A LDS slots ping-pong. Row IDs and gates occupy the 256-byte LDS tail
+and are fetched once per workgroup. The selected pinned AITER configuration has
+`use_async_copy=False`, so this object does not claim the optional three-slot
+asynchronous-copy path.
+
+The Nix ROCm 7.14 build emits executable-section SHA-256
+`374a485d18af2f762718ddfff762909210af357004704ef746e6864afbd94282`.
+The canonical full object from this run is
+`64c385ee049239e8356365b0950c386b7643beb675b7077fc4fc7c2466065e1a`;
+the compiler embeds a non-semantic per-output module identifier, so the build
+gate uses the stable executable-section hash and records the full-object hash.
+AMDGPU metadata reports 94 VGPR, 46 SGPR, 16,640 bytes of launch LDS, zero
+private bytes, and zero spills. Static ISA has 24 scaled 16x16x128 MFMAs, six
+barriers, 38 waits, and native packed-BF16 atomics. These closely match the
+reference object at 98/46 registers, 16,640-byte LDS, 24 MFMAs, six barriers,
+39 waits, and zero spills.
+
+The independent nonuniform oracle again passed 114,688/114,688 values with
+zero absolute and relative error. Two native forward/reverse runs measured
+0.180522/0.180002 and 0.181041/0.179922 ms at the kernel boundary, and
+0.186241/0.184641 and 0.184682/0.185321 ms including output zero. A
+contemporaneous extracted-AITER run measured 0.170641/0.169482 and
+0.175441/0.173161 ms respectively: native is about 6% behind AITER. Against the
+previous exact Plow BM32/four-wave control (0.927 ms kernel, 0.996 ms complete),
+native is 5.1x/5.4x faster. The available current eight-wave standalone control
+measured 1.135/1.206 ms with its exact oracle passing.
+
+Verdict: the kernel is a material, repeatable candidate for a separate lean
+segment, but is not production-promotable yet. It still needs a production
+object marker/ABI loader gate, exact stage-1-to-stage-2 layout parity, and
+fused-block/full-network measurements. It must not enter the mega interpreter.
 
 ## Kernel and graph inventory
 
@@ -255,7 +462,11 @@ than retained as a production/build knob; payload NT remains default-off.
 - The C128 smoke spent 101.25 s serving 64→2 and only 2.53 output tok/s because
   recurrence-safe prompt chunks are serialized. This is direct evidence that
   decode B128 alone does not close throughput without the packet-ABI work above.
-- The gfx950 tuning database's 3,080 records were stale against the current
-  build fingerprint, so the emitter used analytical fallback choices. No
-  current full-model asset should be described as fully tuned until those
-  records are regenerated and the fused-kernel → block → network gates pass.
+- The gfx950 dense-GEMM TuneDB was refreshed under one exclusive 299-second
+  lease with the same ROCm 7.14 toolchain used by the compiler fingerprint.
+  BF16 produced 500 raw rows; the K3-derived BF16+MXFP4 ladder produced 1,440.
+  The current digest `gfx950-8d25b6a4d36627e9` has 1,210 qualified records
+  covering five production rungs for each of 242 selectable operator cells.
+  The 3,080 historical rows remain correctly stale and unselectable. All four
+  gfx950 TuneDB assertions pass; the two gfx942 stale-record assertions remain
+  open and were not weakened by this campaign.

@@ -34,7 +34,8 @@ extern "C" __global__ __launch_bounds__(512, 1)
 void kda_decode_fused(bf16* y, const bf16* q_raw, const bf16* k_raw,
                       const bf16* v_raw, const float* weight,
                       const float* conv_source, float* conv_target,
-                      const bf16* gate_raw, const bf16* beta_raw,
+                      const bf16* forget_raw, const bf16* beta_raw,
+    const bf16* output_gate_raw,
                       const float* a_log, const float* dt_bias, float* state,
                       const float* norm_w, unsigned rows) {
     const unsigned row = blockIdx.x / H;
@@ -51,7 +52,8 @@ void kda_decode_fused(bf16* y, const bf16* q_raw, const bf16* k_raw,
     v_raw += row_p;
     conv_source += row_cs;
     conv_target += row_cs;
-    gate_raw += row_p;
+    forget_raw += row_p;
+    output_gate_raw += row_p;
     beta_raw += (size_t)row * H;
     state += (size_t)row * H * D * D;
     y += row_p;
@@ -68,7 +70,7 @@ void kda_decode_fused(bf16* y, const bf16* q_raw, const bf16* k_raw,
         q[tid] = bf2f(qv);
         k[tid] = bf2f(kv);
         decay[tid] = __expf(-5.0f * kda_sigmoid(
-            __expf(a_log[h]) * (bf2f(gate_raw[hd0 + tid]) + dt_bias[hd0 + tid])));
+            __expf(a_log[h]) * (bf2f(forget_raw[hd0 + tid]) + dt_bias[hd0 + tid])));
         qsum = q[tid] * q[tid];
         ksum = k[tid] * k[tid];
     }
@@ -114,7 +116,7 @@ void kda_decode_fused(bf16* y, const bf16* q_raw, const bf16* k_raw,
         const float inv = rsqrtf(wave_sum(ss) / (float)D + 1.0e-5f);
         for (unsigned d = lane; d < D; d += 64u)
             y[hd0 + d] = f2bf(bf2f(out[d]) * inv * norm_w[d] *
-                                  kda_sigmoid(bf2f(gate_raw[hd0 + d])));
+                                  kda_sigmoid(bf2f(output_gate_raw[hd0 + d])));
     }
 }
 
@@ -245,7 +247,8 @@ extern "C" __global__ __launch_bounds__(128)
 void kda_decode_fused_bv8x16(
     bf16* y, const bf16* q_raw, const bf16* k_raw, const bf16* v_raw,
     const float* weight, const float* conv_source, float* conv_target,
-    const bf16* gate_raw, const bf16* beta_raw, const float* a_log,
+    const bf16* forget_raw, const bf16* beta_raw,
+    const bf16* output_gate_raw, const float* a_log,
     const float* dt_bias, float* state, const float* norm_w, unsigned rows) {
     const unsigned row = blockIdx.x / H;
     const unsigned h = blockIdx.x - row * H;
@@ -262,7 +265,8 @@ void kda_decode_fused_bv8x16(
     v_raw += row_p;
     conv_source += row_cs;
     conv_target += row_cs;
-    gate_raw += row_p;
+    forget_raw += row_p;
+    output_gate_raw += row_p;
     beta_raw += (size_t)row * H;
     state += (size_t)row * H * D * D;
     y += row_p;
@@ -278,7 +282,7 @@ void kda_decode_fused_bv8x16(
     q[tid] = qv;
     k[tid] = kv;
     decay[tid] = __expf(-5.0f * kda_sigmoid(
-        __expf(a_log[h]) * (bf2f(gate_raw[hd0 + tid]) + dt_bias[hd0 + tid])));
+        __expf(a_log[h]) * (bf2f(forget_raw[hd0 + tid]) + dt_bias[hd0 + tid])));
     const float qs = wave_sum(qv * qv);
     const float ks = wave_sum(kv * kv);
     if (lane == 0) {
@@ -343,14 +347,15 @@ void kda_decode_fused_bv8x16(
     __syncthreads();
     const float inv = rsqrtf((sums[0] + sums[1]) / (float)D + 1.0e-5f);
     y[hd0 + tid] = f2bf(ov * inv * norm_w[tid] *
-                         kda_sigmoid(bf2f(gate_raw[hd0 + tid])));
+                         kda_sigmoid(bf2f(output_gate_raw[hd0 + tid])));
 }
 
 extern "C" __global__ __launch_bounds__(256)
 void kda_decode_fused_256x16(
     bf16* y, const bf16* q_raw, const bf16* k_raw, const bf16* v_raw,
     const float* weight, const float* conv_source, float* conv_target,
-    const bf16* gate_raw, const bf16* beta_raw, const float* a_log,
+    const bf16* forget_raw, const bf16* beta_raw,
+    const bf16* output_gate_raw, const float* a_log,
     const float* dt_bias, float* state, const float* norm_w, unsigned rows) {
     constexpr unsigned Groups = 16;
     constexpr unsigned Iters = D / Groups;
@@ -369,7 +374,8 @@ void kda_decode_fused_256x16(
     v_raw += row_p;
     conv_source += row_cs;
     conv_target += row_cs;
-    gate_raw += row_p;
+    forget_raw += row_p;
+    output_gate_raw += row_p;
     beta_raw += (size_t)row * H;
     state += (size_t)row * H * D * D;
     y += row_p;
@@ -401,7 +407,7 @@ void kda_decode_fused_256x16(
         k[tid] = kv;
         v[tid] = bf2f(vbf);
         decay[tid] = __expf(-5.0f * kda_sigmoid(
-            __expf(a_log[h]) * (bf2f(gate_raw[hd0 + tid]) + dt_bias[hd0 + tid])));
+            __expf(a_log[h]) * (bf2f(forget_raw[hd0 + tid]) + dt_bias[hd0 + tid])));
         qss = qv * qv;
         kss = kv * kv;
     }
@@ -472,7 +478,7 @@ void kda_decode_fused_256x16(
     if (tid < D) {
         const float ov = bf2f(out[tid]);
         y[hd0 + tid] = f2bf(ov * inv * norm_w[tid] *
-                             kda_sigmoid(bf2f(gate_raw[hd0 + tid])));
+                             kda_sigmoid(bf2f(output_gate_raw[hd0 + tid])));
     }
 }
 

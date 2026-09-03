@@ -648,7 +648,7 @@ fn report_devblob_egglog(dir: &std::path::Path) {
             return;
         }
     };
-    let mut g = match nn_graph::models::build_from_config_json_at(
+    let mut g = match nn_graph::models::build_text_generation_from_config_json_at(
         &json,
         &nn_graph::models::ShapeBucket::default(),
     ) {

@@ -74,6 +74,8 @@ pub(crate) fn is_fused(op: &str) -> bool {
             | "FusedEmbeddingScale"
             | "FusedKdaGatedNorm"
             | "FusedMlaOutGate"
+            | "FusedMaterializedResidualBlock"
+            | "FusedMaterializedResidual3Block"
     )
 }
 

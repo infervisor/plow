@@ -6837,6 +6837,10 @@ fn emit_dense_gqa(
     if !arch.is_empty() {
         let man = manifest::build(&m, &arch, &lean);
         let mpath = std::path::Path::new(&out).with_file_name("build.json");
+        let cpath = std::path::Path::new(&out).with_file_name("plow_config.h");
+        manifest::write_config_header(&cpath, &man)
+            .unwrap_or_else(|e| panic!("{}: compile config not written: {e}", cpath.display()));
+        eprintln!("  compile config -> {}", cpath.display());
         match serde_json::to_vec_pretty(&man).map(|b| std::fs::write(&mpath, b)) {
             Ok(Ok(())) => eprintln!("  build manifest -> {}", mpath.display()),
             Ok(Err(e)) => eprintln!("  WARN: build.json not written: {e}"),

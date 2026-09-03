@@ -65,14 +65,22 @@ pub struct Arm {
     pub op: String,
     /// Head dim for the flash family (`i[6]`). `None` for ops with one body.
     pub hd: Option<u32>,
+    /// Normalized instruction-immediate-selected body variant. Kept separate from
+    /// `hd` so schema-1 consumers retain the existing flash arm spelling.
+    pub variant: Option<String>,
 }
 
 impl Arm {
     pub fn key(&self) -> String {
-        match self.hd {
+        let mut key = match self.hd {
             Some(hd) => format!("{}/hd{hd}", self.op),
             None => self.op.clone(),
+        };
+        if let Some(variant) = &self.variant {
+            key.push('/');
+            key.push_str(variant);
         }
+        key
     }
 }
 
@@ -102,9 +110,21 @@ fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
         | DevOp::FlashDecodeFp8 => Some(i[6]),
         _ => None,
     };
+    let variant = match op {
+        DevOp::KdaChunkPrepare
+        | DevOp::KdaChunkIntra
+        | DevOp::KdaChunkWu
+        | DevOp::KdaChunkCarry => Some(format!("d{}", i[2])),
+        DevOp::KdaDecodeFused => Some(format!("abi{}", i[7])),
+        DevOp::KdaStateStep | DevOp::KdaStateStepG | DevOp::KdaConvStateStepG => {
+            Some(format!("flags{:x}", i[4]))
+        }
+        _ => None,
+    };
     Arm {
         op: op_name(op),
         hd,
+        variant,
     }
 }
 
@@ -132,11 +152,12 @@ pub struct ProgramArms {
 /// Per-program and per-segment arm sets, plus the union the object must compile.
 fn program_arms(m: &Model) -> Vec<ProgramArms> {
     let mut out = Vec::new();
-    // `Model::prog_t`'s last entry is the decode program; everything before it is
-    // a prefill bucket. (`emit_dense_gqa` pushes the buckets then the decode.)
-    let last = m.progs.len().saturating_sub(1);
+    // Prefill buckets precede an ascending decode-rung suffix. Use the same canonical
+    // boundary as the runtime; treating only the last program as decode makes a specialized
+    // prefill object absorb every lower decode rung.
+    let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
     for (pi, p) in m.progs.iter().enumerate() {
-        let kind = if pi == last { "decode" } else { "prefill" };
+        let kind = if pi >= dec_lo { "decode" } else { "prefill" };
         let t = m.prog_t.get(pi).copied().unwrap_or(0);
         for (seg, arms) in segment_arms(p) {
             out.push(ProgramArms {
@@ -831,6 +852,9 @@ fn backend_amd(
     if has("KdaConvStateStepG") {
         req.push("PLOW_KDA_CONV_STEP_DB=1".into());
     }
+    if on("materialized_residual_input") {
+        req.push("PLOW_MATERIALIZED_RESIDUAL_INPUT=1".into());
+    }
     if has("KdaChunkPrepare") || has("KdaChunkIntra") || has("KdaChunkWu") || has("KdaChunkCarry") {
         req.push("PLOW_KDA_CHUNK=1".into());
     }
@@ -899,6 +923,7 @@ fn backend_amd(
         || has("MlaOutGate")
         || has("KdaStateStep")
         || has("KdaStateStepG")
+        || has("KdaConvStateStepG")
         || has("KdaConv")
         || has("KdaConv3")
         || has("KdaGatedNorm")
@@ -998,7 +1023,7 @@ pub fn build(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
     let h = pairing_hash(&v);
     v["pairing"] = json!({
         "hash": format!("0x{h:016x}"),
-        "algo": "fnv1a64 over `union` then `tuning`",
+        "algo": "fnv1a64 over `union`, `objects`, then `tuning`",
         "note": "A cubin built from this manifest stamps this value as \
                  plow_packet_hash_{lo,hi}; plowrt refuses a module whose stamp \
                  disagrees. A GENERAL object (every arm compiled) carries no stamp \
@@ -1035,11 +1060,59 @@ fn lean_block(lean: &crate::LeanReport) -> Value {
     })
 }
 
+fn object_inventory(progs: &[ProgramArms]) -> Value {
+    let phase = |kind: &str| -> BTreeSet<Arm> {
+        progs
+            .iter()
+            .filter(|p| p.kind == kind)
+            .flat_map(|p| p.arms.iter().cloned())
+            .collect()
+    };
+    let prefill = phase("prefill");
+    let decode = phase("decode");
+    let flash_family = |arm: &&Arm| arm.op.starts_with("Flash") || arm.op == "MlaMergeFold";
+    let keys = |arms: &BTreeSet<Arm>| arms.iter().map(Arm::key).collect::<Vec<_>>();
+    let flash: BTreeSet<Arm> = prefill.iter().filter(flash_family).cloned().collect();
+    let packed_kda_names = ["KdaStateStep", "KdaConv3", "KdaStateStepG"];
+    let packed_kda: BTreeSet<Arm> = prefill
+        .iter()
+        .filter(|a| packed_kda_names.contains(&a.op.as_str()))
+        .cloned()
+        .collect();
+    let fused: BTreeSet<Arm> = decode
+        .iter()
+        .filter(|a| a.op == "KdaDecodeFused")
+        .cloned()
+        .collect();
+    json!({
+        "ordinary": {
+            "prefill": { "arms": keys(&prefill) },
+            "decode": { "arms": keys(&decode) },
+            "flash": { "arms": keys(&flash) },
+        },
+        "lean": {
+            "packed_kda_prefill": { "required": !packed_kda.is_empty(), "arms": keys(&packed_kda) },
+            "kda_decode_fused": { "required": !fused.is_empty(), "arms": keys(&fused) },
+        },
+    })
+}
+
 fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
     let progs = program_arms(m);
     let union: BTreeSet<Arm> = progs.iter().flat_map(|p| p.arms.iter().cloned()).collect();
+    let objects = object_inventory(&progs);
     let s = shapes(m);
     let mut f = features(&union);
+    let materialized_residual_input = m.progs.iter().flat_map(|p| &p.insts).any(|inst| {
+        inst.op == DevOp::AttnRes as u16
+            && (inst.t[6] != packet::TENSOR_NONE
+                || inst.t[7] != packet::TENSOR_NONE
+                || inst.i[5] != packet::dev::TENSOR_NONE_I)
+    });
+    f.insert(
+        "materialized_residual_input".into(),
+        json!(materialized_residual_input),
+    );
     encoding_features(&mut f, &s);
     let axes = precision_axes(&mut f, &s, &union);
     let t = tuning(&s);
@@ -1129,6 +1202,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         // artifact?", and both have a value that means "not established".
         "lean": lean_block(lean),
         "programs": programs,
+        "objects": objects,
         // What a specialised object must compile: the union over every program
         // and segment. Anything narrower and some bucket hits `default: __trap()`.
         "union": union.iter().map(Arm::key).collect::<Vec<_>>(),
@@ -1145,7 +1219,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
 /// today's loud first-launch `__trap()` into something strictly worse: an object
 /// that is missing the arm some later bucket needs and traps mid-serve.
 ///
-/// Hashed over the `union` and the tuning constants, i.e. exactly what the
+/// Hashed over the `union`, per-object inventory, and tuning constants, i.e. exactly what the
 /// generated `plow_config.h` compiles — NOT the whole manifest, so a cosmetic
 /// field (a comment, a reordered analysis note) does not invalidate a good pair.
 /// FNV-1a 64: the runtime already uses FNV for `gpu_fingerprint`, and this is an
@@ -1163,6 +1237,10 @@ pub fn pairing_hash(manifest: &Value) -> u64 {
             feed(v.as_str().unwrap_or(""));
             feed("\x1f");
         }
+    }
+    feed("\x1e");
+    if let Some(objects) = manifest.get("objects") {
+        feed(&objects.to_string());
     }
     feed("\x1e");
     if let Some(o) = manifest.get("tuning").and_then(Value::as_object) {
@@ -1188,6 +1266,20 @@ pub fn pairing_hash(manifest: &Value) -> u64 {
 /// The existing knobs are NOT replaced — every macro here is emitted `#ifndef`-
 /// guarded, so an explicit `-D` on the command line still wins and the A/B
 /// controls keep working. The header only supplies values nothing else set.
+pub fn write_config_header(path: &std::path::Path, manifest: &Value) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("h.tmp.{}", std::process::id()));
+    if let Err(error) = std::fs::write(&tmp, config_header(manifest)) {
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub fn config_header(manifest: &Value) -> String {
     let mut out = String::new();
     out.push_str(
@@ -1215,15 +1307,57 @@ pub fn config_header(manifest: &Value) -> String {
     for k in &union {
         ops.insert(k.split('/').next().unwrap_or(k).to_string());
     }
-    out.push_str("/* --- opcodes present in the packet --- */\n");
+    let object_ops = |phase: &str| -> BTreeSet<String> {
+        manifest
+            .pointer(&format!("/objects/ordinary/{phase}/arms"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|key| key.split('/').next().unwrap_or(key).to_string())
+            .collect()
+    };
+    let prefill_ops = object_ops("prefill");
+    let decode_ops = object_ops("decode");
+    let flash_ops = object_ops("flash");
+    out.push_str("/* --- packet and per-object opcode inventory --- */\n");
     for o in DevOp::ALL {
-        let present = ops.contains(&op_name(*o));
+        let name = op_name(*o);
+        let present = ops.contains(&name);
         let m = o.c_name().replace("PLOW_DOP_", "PLOW_HAS_");
+        let packet_m = o.c_name().replace("PLOW_DOP_", "PLOW_PACKET_HAS_");
         out.push_str(&format!(
-            "#ifndef {m}\n#define {m} {}\n#endif\n",
+            "#define {packet_m} {}\n",
             if present { 1 } else { 0 }
         ));
+        out.push_str(&format!(
+            "#ifndef {m}\n#if defined(PLOW_BUCKET_FLASH)\n#define {m} {}\n#elif PLOW_BUCKET_DECODE\n#define {m} {}\n#else\n#define {m} {}\n#endif\n#endif\n",
+            if flash_ops.contains(&name) { 1 } else { 0 },
+            if decode_ops.contains(&name) { 1 } else { 0 },
+            if prefill_ops.contains(&name) { 1 } else { 0 },
+        ));
     }
+
+    out.push_str(
+        "\n/* --- model-neutral family switches derived from object opcode presence --- */\n\
+#ifndef PLOW_K3\n\
+#define PLOW_K3 (PLOW_HAS_KDA_CONV || PLOW_HAS_KDA_GATE || PLOW_HAS_KDA_STATE_STEP || \\\n PLOW_HAS_KDA_GATED_NORM || PLOW_HAS_ATTN_RES || PLOW_HAS_SITU_GLU || \\\n PLOW_HAS_MLA_OUT_GATE || PLOW_HAS_KDA_CONV3 || PLOW_HAS_KDA_STATE_STEP_G || \\\n PLOW_HAS_KDA_CONV_STATE_STEP_G || PLOW_HAS_KDA_CHUNK_PREPARE || \\\n PLOW_HAS_KDA_CHUNK_INTRA || PLOW_HAS_KDA_CHUNK_WU || PLOW_HAS_KDA_CHUNK_CARRY)\n\
+#endif\n\
+#ifndef PLOW_KDA_CHUNK\n\
+#define PLOW_KDA_CHUNK (PLOW_HAS_KDA_CHUNK_PREPARE || PLOW_HAS_KDA_CHUNK_INTRA || \\\n PLOW_HAS_KDA_CHUNK_WU || PLOW_HAS_KDA_CHUNK_CARRY)\n\
+#endif\n\
+#ifndef PLOW_KDA_CONV_STEP_DB\n\
+#define PLOW_KDA_CONV_STEP_DB PLOW_HAS_KDA_CONV_STATE_STEP_G\n\
+#endif\n",
+    );
+    let materialized_residual_input = manifest
+        .pointer("/features/materialized_residual_input")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "#ifndef PLOW_MATERIALIZED_RESIDUAL_INPUT\n#define PLOW_MATERIALIZED_RESIDUAL_INPUT {}\n#endif\n",
+        if materialized_residual_input { 1 } else { 0 }
+    ));
 
     // Head dims the flash family is instantiated at.
     out.push_str("\n/* --- flash head dims present --- */\n");
@@ -1566,8 +1700,8 @@ mod tests {
     /// NOTHING. The packet runs, the buffers keep what they held, and a model missing most of
     /// itself returns fluent output.
     ///
-    /// ANY of the eight is enough, deliberately: they are one `#if` in `runtime/amd/interp.hip`, so
-    /// an object has all of them or none. A `K3_NLAYERS=3` truncation emits no MLA layer and
+    /// Any ordinary K3 opcode is enough to require the family include; the generated per-object
+    /// presence macros then prune individual bodies. A `K3_NLAYERS=3` truncation emits no MLA layer and
     /// therefore no `MlaOutGate`; a decode-only blob emits no prefill op at all. Both still need
     /// the flag.
     #[test]
@@ -1621,6 +1755,108 @@ mod tests {
             .any(|r| r == "PLOW_KDA_CHUNK=1"));
     }
 
+    #[test]
+    fn every_ordinary_k3_dispatch_is_presence_gated() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("runtime/amd/interp.hip");
+        let Ok(src) = std::fs::read_to_string(path) else {
+            return;
+        };
+        for op in [
+            DevOp::KdaConv,
+            DevOp::KdaGate,
+            DevOp::KdaStateStep,
+            DevOp::KdaGatedNorm,
+            DevOp::AttnRes,
+            DevOp::SituGlu,
+            DevOp::MlaOutGate,
+            DevOp::KdaConv3,
+            DevOp::KdaStateStepG,
+            DevOp::KdaConvStateStepG,
+            DevOp::KdaChunkPrepare,
+            DevOp::KdaChunkIntra,
+            DevOp::KdaChunkWu,
+            DevOp::KdaChunkCarry,
+        ] {
+            let case = format!("        case {}:", op.c_name());
+            let guard = format!(
+                "#if {}\n{case}",
+                op.c_name().replace("PLOW_DOP_", "PLOW_HAS_")
+            );
+            assert_eq!(
+                src.matches(&case).count(),
+                src.matches(&guard).count(),
+                "every {} dispatch occurrence must be directly presence-gated",
+                op.c_name(),
+            );
+        }
+    }
+
+    #[test]
+    fn k3_object_inventory_covers_every_ordinary_and_lean_arm() {
+        let ordinary = [
+            DevOp::KdaConv,
+            DevOp::KdaGate,
+            DevOp::KdaStateStep,
+            DevOp::KdaGatedNorm,
+            DevOp::AttnRes,
+            DevOp::SituGlu,
+            DevOp::MlaOutGate,
+            DevOp::KdaConv3,
+            DevOp::KdaStateStepG,
+            DevOp::KdaConvStateStepG,
+            DevOp::KdaChunkPrepare,
+            DevOp::KdaChunkIntra,
+            DevOp::KdaChunkWu,
+            DevOp::KdaChunkCarry,
+        ];
+        let make = || prog(ordinary.iter().map(|&op| inst(op, [0; 8])).collect());
+        let mut decode = make();
+        decode.insts.push(inst(DevOp::KdaDecodeFused, [0; 8]));
+        let m = Model {
+            n_cu: 256,
+            target: 0,
+            tensors: vec![],
+            progs: vec![make(), decode],
+            kv_row_insts: vec![],
+            prog_t: vec![128, 1],
+            gen: vec![],
+        };
+        let man = build(&m, "gfx950");
+        for phase in ["prefill", "decode"] {
+            let arms = man["objects"]["ordinary"][phase]["arms"]
+                .as_array()
+                .unwrap();
+            for op in ordinary {
+                let name = op_name(op);
+                assert!(
+                    arms.iter()
+                        .filter_map(Value::as_str)
+                        .any(|a| a.split('/').next() == Some(&name)),
+                    "{phase} inventory misses {name}"
+                );
+            }
+        }
+        let flash = man["objects"]["ordinary"]["flash"]["arms"]
+            .as_array()
+            .unwrap();
+        assert!(
+            flash.is_empty(),
+            "a K3-only graph must not pull heavy K3 bodies into flash"
+        );
+        assert_eq!(man["objects"]["lean"]["kda_decode_fused"]["required"], true);
+        assert!(man["objects"]["lean"]["kda_decode_fused"]["arms"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("KdaDecodeFused/abi"));
+        let h = config_header(&man);
+        assert!(h.contains("#define PLOW_PACKET_HAS_KDA_DECODE_FUSED 1"));
+        assert!(h.contains("#if defined(PLOW_BUCKET_FLASH)\n#define PLOW_HAS_ATTN_RES 0"));
+    }
+
     /// `arm_of` must read each flash op's head-dim from the slot that op ACTUALLY carries it in.
     ///
     /// `FlashMerge` uses `i[3]` (`runtime/amd/interp.hip:1119` / `:1315`), the rest use `i[6]`.
@@ -1662,6 +1898,41 @@ mod tests {
         assert!(h.contains("#define GV_MM_MAX 8"));
         assert!(h.contains("#ifndef GV_MM_MAX"));
         assert!(h.contains("PLOW_PACKET_HASH"));
+    }
+
+    #[test]
+    fn materialized_residual_input_capability_comes_from_instruction_operands() {
+        let make = |fused: bool| {
+            let mut attn = inst(DevOp::AttnRes, [0; 8]);
+            attn.t = [packet::TENSOR_NONE; 8];
+            attn.i[5] = packet::dev::TENSOR_NONE_I;
+            if fused {
+                attn.t[6] = 1;
+                attn.t[7] = 2;
+            }
+            Model {
+                n_cu: 4,
+                target: 0,
+                tensors: vec![],
+                progs: vec![prog(vec![attn])],
+                kv_row_insts: vec![],
+                prog_t: vec![1],
+                gen: vec![],
+            }
+        };
+
+        let plain = build(&make(false), "gfx950");
+        assert_eq!(plain["features"]["materialized_residual_input"], false);
+        assert!(config_header(&plain).contains("#define PLOW_MATERIALIZED_RESIDUAL_INPUT 0"));
+
+        let fused = build(&make(true), "gfx950");
+        assert_eq!(fused["features"]["materialized_residual_input"], true);
+        assert!(config_header(&fused).contains("#define PLOW_MATERIALIZED_RESIDUAL_INPUT 1"));
+        assert!(fused["backends"]["gfx950"]["requires"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "PLOW_MATERIALIZED_RESIDUAL_INPUT=1"));
     }
 
     // ===== The `lean` block. =====================================================

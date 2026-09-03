@@ -216,6 +216,25 @@ mod tests {
     }
 
     #[test]
+    fn decode_rungs_select_independently() {
+        let b1 = cell(1, 8192);
+        let b8 = cell(8, 8192);
+        let records = [rec(b1.clone(), 32, 38.0), rec(b8.clone(), 16, 80.0)];
+        let caps = AttentionCapabilities {
+            max_nsplit: 64,
+            persistent: false,
+        };
+        assert_eq!(
+            select_attention(&records, &b1, &digests("build-a"), caps, 64).nsplit,
+            32
+        );
+        assert_eq!(
+            select_attention(&records, &b8, &digests("build-a"), caps, 64).nsplit,
+            16
+        );
+    }
+
+    #[test]
     fn stale_or_uncompiled_choices_preserve_fallback() {
         let c = cell(1, 4096);
         let mut stale = rec(c.clone(), 16, 1.0);

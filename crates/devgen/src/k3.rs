@@ -687,6 +687,7 @@ pub fn emit_attn_res(
         d.i[2] = nb;
         d.i[3] = nb; // push_row: the snapshot lands one past the live count
         d.i[4] = nb_cap;
+        d.i[5] = packet::dev::TENSOR_NONE_I;
         d.f[0] = c.eps;
     })
 }

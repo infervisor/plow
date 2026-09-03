@@ -1,7 +1,4 @@
-// Build:
-// nix develop --command hipcc --genco --offload-arch=gfx950 -O3 -Werror
-//   -I runtime/amd -I runtime/common runtime/bench/amd/k3_mla_decode_exact.hip
-//   -o /tmp/k3_mla_decode_exact.co
+// Build: nix develop --command hipcc --genco --offload-arch=gfx950 -O3 -Werror -I runtime/amd -I runtime/common runtime/bench/amd/k3_mla_decode_exact.hip -o /tmp/k3_mla_decode_exact.co
 #include "amd_common.h"
 #include "op_attention.h"
 

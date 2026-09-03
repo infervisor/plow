@@ -112,31 +112,62 @@
       "promoted": false
     },
     "fused_256x16_candidate": {
-      "production_integrated": false,
+      "production_integrated": "explicit_opt_in_default_off",
+      "abi_version": 2,
       "workgroup_threads": 256,
       "vgpr": 128,
       "sgpr": 45,
       "lds_bytes": 2336,
       "scratch_bytes": 0,
-      "batch1_us": 5.974,
-      "batch8_us": 6.514,
+      "batch1_us": 6.902,
+      "batch8_us": 7.347,
+      "standalone_object": {
+        "batch1_us": 6.902,
+        "batch8_us": 7.347,
+        "batch1_vs_vllm_speedup_pct": 17.8,
+        "batch8_vs_vllm_speedup_pct": 20.5,
+        "object_sha256": "25520beb01cb6ba6262a7be9f88cab47ae33c31eca66e1dc5597a26006155d85",
+        "source_sha256": "855125bab77ef9134d0a966e509215f655ae2ebc06d2ec406d6c77b1d43c6d94",
+        "marker": "plow_kda_decode_fused_256x16_2",
+        "symbol": "plow_kda_decode_fused_256x16_v2",
+        "explicit_kernarg_bytes": 184,
+        "occupancy": 4
+      },
       "vllm_batch1_us": 8.4,
       "vllm_batch8_us": 9.24,
       "vs_vllm_speedup_pct": {
-        "batch1": 28.9,
-        "batch8": 29.5
+        "batch1": 17.8,
+        "batch8": 20.5
       },
       "oracle": {
         "conv_exact": true,
         "batch1_final_exact": true,
-        "batch8_final_rel_l2": 4.20450923e-6,
-        "batch8_final_max_abs": 3.05175781e-5
+        "batch8_final_exact": true,
+        "recurrent_state_rel_l2": 1.41e-8,
+        "distinct_forget_and_output_gates": true
       },
-      "verdict": "isolated fused-boundary win; production integration remains open"
+      "tp8_stress": {
+        "steps": 64,
+        "all_rank_tokens_identical": true,
+        "xctr_audit_exact": true,
+        "ms_per_token": 14.173
+      },
+      "fused_block_gate": {
+        "order": "F-L-L-F",
+        "steps_per_run": 64,
+        "fused_ms_per_token": [14.268, 13.930],
+        "legacy_ms_per_token": [13.920, 14.140],
+        "fused_median_ms": 14.099,
+        "legacy_median_ms": 14.030,
+        "fused_regression_pct": 0.49,
+        "all_token_chains_identical": true,
+        "promoted": false
+      },
+      "verdict": "standalone kernel wins; segmented fused block is neutral/slower, so route remains explicit opt-in and default-off"
     },
     "source_sha256": {
-      "device": "2102af8a2ca4e00c1f688aadc7ff0c7adb3fb864ab2ea128648dd66581ee1be5",
-      "host": "ae5d5f7792202baddd139de83b7e1634506a0824b86727db325bb3eaf793c88f",
+      "device": "855125bab77ef9134d0a966e509215f655ae2ebc06d2ec406d6c77b1d43c6d94",
+      "host": "34b3cdbf435557048f07d19cfc599862e92782add1aa6c6c1e15cf5abc220fc2",
       "vllm_benchmark": "fc614f10c54a8ed5490a07bab1efb7faa645f45c3cf93a7eeadf5db7053e0523"
     }
   },
@@ -173,8 +204,30 @@
       "batch1": 0.0010085,
       "batch8": 0.0014282
     },
-    "independent_oracle": false,
-    "oracle_note": "fused_rel_l2 and gf6_rel_l2 are cross-path comparisons against standalone BF16 merge+fold, not an independent reference oracle",
+    "independent_oracle": true,
+    "oracle_note": "ns32 and ns64 merged latent outputs were checked before WUV against an independently regenerated FP32 softmax attention-chain reference",
+    "independent_oracle_result": {
+      "name": "attention-chain-v1",
+      "tolerance": {"rel_l2": 0.005, "max_abs": 0.000016, "finite": true},
+      "batch1": {
+        "ns32_rel_l2": 0.00183705542,
+        "ns32_max_abs": 0.0000076291617,
+        "ns32_dump_sha256": "d2a16ef56750efa49f93d892848af36c4328961b0aba7557a2c886c53a2647de",
+        "reference_f32_sha256": "6d70cf6540765aa893eaddcb9a9c10705c3dd33370a2a196d7798e03d6d81aeb"
+      },
+      "batch8": {
+        "ns32_rel_l2": 0.00180339596,
+        "ns32_max_abs": 0.0000076291617,
+        "ns32_dump_sha256": "5d717bb2d4471fa4047b3db2e6f29de7a4d4469c4ebb7647778cf31e17777bbc",
+        "reference_f32_sha256": "838e47ab0c1f9a4d7583fb931db9a7ba251675c29d12d253e00cf389c8489637"
+      },
+      "raw_samples": "perf-data/probes/gfx950-mla-attention-raw-20260903.jsonl",
+      "raw_samples_sha256": "c7ddde60be8fa9d8184d9f327a5b3361c25c8921fb10f6a1a120484eaacf92ff",
+      "raw_run_sha256": "444cf92db0a546652bd6ef466c1aa122c1a7087ae3cbf9e8e1c8fa50d115cd7a",
+      "oracle_run_sha256": "d9e59478c436372d79b9b608d53c609f4412e1632dbdf6abe8c7a8b205c02bdf",
+      "tunedb_build_digest": "gfx950-af87731eb53b7f9f",
+      "tunedb_record_sha256": "c0c5e3a7bf0c537ffd57687e1f2efbf847ea145ef841069aadc513da669b2c96"
+    },
     "priority": "batch8_flash_attention",
     "aiter_mapping": {
       "context_splits": "min(context/196, ceil(256/batch), kernel_limit)",
@@ -215,10 +268,47 @@
         "verdict": "retain as benchmark-only batch-concurrent screen; independent oracle and production tuning required"
       },
       "batch_aware_nsplit": {
-        "production_integrated": false,
+        "production_integrated": "qualified_exact_tunedb_cells",
         "formula": "min(context-derived split cap, ceil(CUs / (batch * ceil(heads / GF))))",
-        "reason": "Plow B8 GF4/ns64 creates 1536 logical head-group splits over 256 workgroups; AITER maps B8 to 256 work units"
+        "reason": "Plow B8 GF4/ns64 creates 1536 logical head-group splits over 256 workgroups; AITER maps B8 to 256 work units",
+        "runs": 2,
+        "batch1": [
+          {"nsplit": 32, "grid": 96, "flash_us": [21.428, 21.456], "attention_core_us": [38.532, 38.612], "rel_l2_vs_ns64": 0.0},
+          {"nsplit": 41, "grid": 123, "flash_us": [19.104, 19.112], "attention_core_us": [39.884, 39.972], "rel_l2_vs_ns64": 0.0},
+          {"nsplit": 64, "grid": 192, "flash_us": [14.136, 14.2], "attention_core_us": [46.6, 46.708], "rel_l2_vs_ns64": 0.0}
+        ],
+        "batch8": [
+          {"nsplit": 16, "grid": 256, "flash_us": [89.757, 90.001], "attention_core_us": [97.537, 97.769], "rel_l2_vs_ns64": 0.0},
+          {"nsplit": 24, "grid": 256, "flash_us": [94.289, 94.393], "attention_core_us": [106.261, 106.465], "rel_l2_vs_ns64": 0.000034981},
+          {"nsplit": 32, "grid": 256, "flash_us": [69.129, 69.133], "attention_core_us": [85.913, 86.097], "rel_l2_vs_ns64": 0.0},
+          {"nsplit": 64, "grid": 256, "flash_us": [81.049, 81.301], "attention_core_us": [113.281, 113.341], "rel_l2_vs_ns64": 0.0}
+        ],
+        "winner": {
+          "batch1_nsplit": 32,
+          "batch1_attention_core_speedup_pct": 17.3,
+          "batch8_nsplit": 32,
+          "batch8_attention_core_speedup_pct": 24.1
+        },
+        "resources": {
+          "vgpr": 236,
+          "vgpr_spill_count": 0,
+          "scratch_bytes": 0,
+          "sgpr": 57,
+          "lds_bytes": 29248
+        },
+        "oracle": "attention-chain-v1 independent FP32 softmax reference passes B1/B8 ns32; cross-path ns64 comparison remains a secondary check"
       }
+    },
+    "rejected_gf6_packaged_gate": {
+      "boundary": "independently loaded standalone flash plus the same standalone merge",
+      "object_sha256": "7857aeb1fb9f29019011b924b7892d31a68391fbe1b8c2bcfd57b76185c43e41",
+      "object_bytes": 25352,
+      "resources": {"vgpr": 256, "agpr": 0, "occupancy": 2, "wrapper_spill_audit": 43},
+      "batch1": {"gf4_us": 38.784, "gf6_us": 46.260, "gf6_wins": 0, "rounds": 21},
+      "batch8": {"gf4_us": 85.913, "gf6_us": 83.377, "gf6_wins": 21, "rounds": 21, "speedup": 1.0304},
+      "oracle_batch8": {"rel_l2": 0.00180339596, "max_abs": 0.0000076291617, "dump_sha256": "5d717bb2d4471fa4047b3db2e6f29de7a4d4469c4ebb7647778cf31e17777bbc"},
+      "promoted": false,
+      "reason": "Only 2.95% remains before the production-only extra AQL boundary; insufficient margin. GF6 production route, schema, source, and packaging were removed."
     },
     "source_refs": [
       "runtime/amd/op_attention.h:1840-1879",
@@ -228,8 +318,12 @@
       "aiter/csrc/kernels/mla/metadata/v1_0_device.cuh:8-18,45-96,119-125"
     ],
     "source_sha256": {
-      "plow_device": "f5192c920a4c0aefbfdc2cfc3e51a468a492fa800a609aa6d7c34b6b7fb77f84",
-      "plow_host": "7ff0b6ce2ba2d2bc1afe9274005c41e0dc5289a6321f11cded6a0658cf4595e6",
+      "plow_device": "c801159e1572d110bbf73852664f23755693b7a24af5b411c5dc89b7393d4d0c",
+      "plow_host": "b1f87d300e82d78c1d9e632b64ea6b9428002930fa004f90654d4d07c56b9218",
+      "plow_oracle": "6124d98a2edf35ded1b1470f11b94f1ef6242d33ac94f5ac7fddf057ea8f7618",
+      "plow_object": "c54d690447ca434c91ccc36bc6169617100fc08d0089b74d37a9085ced1ea289",
+      "production_attention": "6948f671fbe9653e9aa661f77b3e7a602d4d02cddc10e523649a99f11769c10d",
+      "production_interpreter": "009c45846485047e33b91b7917a14a368fb4d9771425046b3458c9da029a143a",
       "vllm_wuv_probe": "bdfe9b692dc571abfbde40bda2d06d6e37b9c12e1dd82a291c8e806f5263da98",
       "vllm_attention_result": "c58ddb8fddcc19e240512caba6b111ce9269fd91ee847938e1f7e876a6a14bb4"
     }

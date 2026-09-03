@@ -102,8 +102,24 @@ grep -qE "FUNC .* $SYM\$" <<<"$SYMS" ||
     fail "$SYM not found in $OUT — kernel name/signature changed; update the
        symbol constants in runtime/tests/gemma4_chat.c."
 
-grep -qE "OBJECT .* plow_packed_prefill_abi_1\$" <<<"$SYMS" ||
-    fail "$OUT does not advertise plow_packed_prefill_abi_1"
+LEAN=0; NOSPILL=0; REQUIRED_MARKER=""
+for arg in "$@"; do
+    case "$arg" in
+        -DPLOW_LEAN_OBJECT=1) LEAN=1 ;;
+        -DPLOW_NO_SPILL=1) NOSPILL=1 ;;
+        -DPLOW_REQUIRED_MARKER=*) REQUIRED_MARKER=${arg#*=} ;;
+    esac
+done
+if [ "$LEAN" != 1 ]; then
+    grep -qE "OBJECT .* plow_packed_prefill_abi_1\$" <<<"$SYMS" ||
+        fail "$OUT does not advertise plow_packed_prefill_abi_1"
+fi
+[ "$NOSPILL" != 1 ] || [ "$S" = 0 ] ||
+    fail "$(basename "$OUT") spills $S VGPRs"
+if [ -n "$REQUIRED_MARKER" ]; then
+    grep -qE "OBJECT .* ${REQUIRED_MARKER}\$" <<<"$SYMS" ||
+        fail "$OUT does not advertise $REQUIRED_MARKER"
+fi
 PACKED_MLA=0; PACKED_MLA_NORM=0; PACKED_MLA_FLASH=0; PACKED_KDA=0; KDA_CHUNK=0
 K3=0; MLA=0; HIER=0; L2=0; GQ=0; DECODE=0
 for arg in "$@"; do

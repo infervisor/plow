@@ -1234,12 +1234,13 @@ fn k3_build_model(
     for (i, &t) in decode_build_order.iter().enumerate() {
         let fallback_ns = k3_nsplit_fallback(ctx);
         let local_heads = c.heads / tp.max(1);
-        let shape = format!(
-            "mla/dk{}/dr{}/h{}/gf{}",
-            c.kv_lora, c.qk_rope, local_heads, mcfg.mla.gf
-        );
-        mcfg.mla.n_split =
-            crate::select_amd_attention(n_cu, t, ctx, shape, fallback_ns, fallback_ns).nsplit;
+        let shape = format!("mla/dk{}/dr{}/h{}/gf4", c.kv_lora, c.qk_rope, local_heads);
+        mcfg.mla.gf = 4;
+        mcfg.mla.n_split = if emit_config::active().k3_ns.is_some() {
+            fallback_ns
+        } else {
+            crate::select_amd_attention(n_cu, t, ctx, shape, fallback_ns, fallback_ns).nsplit
+        };
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
         // PLOW_L2_PLACE: `None` => byte-identical. Until this line the flag reached the dense-GQA
@@ -1693,7 +1694,11 @@ mod kimi_k3_tests {
         std::fs::create_dir_all(&d).unwrap();
         // head_dim 64, not the fixture's 32: `emit_kda_mixer` refuses a head_dim that is not a
         // multiple of the 64-lane wave, and these two tests are the only ones here that EMIT.
-        let cfg = k3_json(&[("text_config/linear_attn_config/head_dim", "64")]);
+        let mut patch = vec![("text_config/linear_attn_config/head_dim", "64")];
+        if name == "attention_profiles" {
+            patch.push(("text_config/num_attention_heads", "24"));
+        }
+        let cfg = k3_json(&patch);
         std::fs::write(d.join("config.json"), cfg.to_string()).unwrap();
         d
     }
@@ -1875,6 +1880,112 @@ mod kimi_k3_tests {
             .find(|t| t.name == "in.parked")
             .expect("ladder must declare the parked mask");
         assert_eq!(parked.bytes, 128 * 4);
+    }
+
+    fn publish_attention_test_record(root: &std::path::Path, rung: u32, nsplit: u32, shape: &str) {
+        let record = tunedb::AttentionMeasurement {
+            cell: tunedb::AttentionCell {
+                hardware: "amd/gfx950/mi350x".into(),
+                n_cu: 256,
+                decode_rung: rung,
+                kv_bucket: tunedb::KvBucket::K8,
+                shape: shape.into(),
+            },
+            algorithm: tunedb::AttentionAlgorithm::SplitReduce,
+            nsplit,
+            digests: tunedb::Digests {
+                implementation: "test-unprobed".into(),
+                interpreter: "test-unprobed".into(),
+                toolchain: "test-unprobed".into(),
+                oracle: tunedb::ATTENTION_ORACLE.into(),
+            },
+            stats: tunedb::Stats::from_samples(vec![10_000.0; 5]).unwrap(),
+            correctness: tunedb::Correctness::Pass,
+            state: tunedb::RecordState::Provisional,
+            campaign: "attention-rung-test".into(),
+        };
+        tunedb::TuneStore::new(root)
+            .publish_attention("amd/gfx950/mi350x", vec![record])
+            .unwrap();
+    }
+
+    fn assert_decode_mla_policy(model: &Model, rungs: &[(u32, u32)]) {
+        assert_eq!(model.prog_t, rungs.iter().map(|x| x.0).collect::<Vec<_>>());
+        for (program, &(batch, nsplit)) in model.progs.iter().zip(rungs) {
+            let flashes: Vec<_> = program
+                .insts
+                .iter()
+                .filter(|i| i.op == DevOp::FlashMlaDecode as u16)
+                .collect();
+            let merges: Vec<_> = program
+                .insts
+                .iter()
+                .filter(|i| i.op == DevOp::MlaMergeFold as u16)
+                .collect();
+            assert!(!flashes.is_empty());
+            assert_eq!(flashes.len(), merges.len());
+            for (flash, merge) in flashes.into_iter().zip(merges) {
+                assert_eq!(flash.i[4], nsplit, "B{batch} flash nsplit");
+                assert_eq!(flash.i[7], 4, "B{batch} flash group factor");
+                assert_eq!(merge.i[4], nsplit, "B{batch} merge nsplit");
+                let groups = (flash.i[1] / flash.i[7].max(1)).max(1);
+                let want_blocks = (batch * groups * nsplit).min(256) as u16;
+                assert_eq!(flash.blocks, want_blocks, "B{batch} flash blocks");
+            }
+        }
+    }
+
+    #[test]
+    fn k3_attention_profiles_select_each_rung_and_size_scratch() {
+        let _guard = crate::test_env::env_guard();
+        let d = k3_dir("attention_profiles");
+        let db = d.join("tuning");
+        let shape = "mla/dk32/dr8/h12/gf4";
+        publish_attention_test_record(&db, 1, 32, shape);
+        publish_attention_test_record(&db, 8, 32, shape);
+        let dbs = db.to_string_lossy().into_owned();
+
+        let tuned = {
+            let _scope = crate::test_env::EnvScope::set(&[
+                ("PLOW_DECODE_BATCH_LADDER", "1,8"),
+                ("PLOW_TUNEDB", &dbs),
+            ]);
+            k3_build_model(&d, 8192, 256, 2, &[], None)
+        };
+        assert_decode_mla_policy(&tuned, &[(1, 32), (8, 32)]);
+        let scratch_bytes = |name: &str| {
+            tuned
+                .tensors
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("missing MLA partial scratch {name}"))
+                .bytes
+        };
+        assert_eq!(scratch_bytes("act.l2.o_part"), 12 * 32 * 32 * 4);
+        assert_eq!(
+            scratch_bytes("act.pf.o_part"),
+            8 * 12 * 32 * 32 * 4,
+            "widest selected decode scratch extent is retained"
+        );
+
+        let fallback = {
+            let _scope = crate::test_env::EnvScope::set(&[
+                ("PLOW_DECODE_BATCH_LADDER", "1,8"),
+                ("PLOW_TUNEDB", ""),
+            ]);
+            k3_build_model(&d, 8192, 256, 2, &[], None)
+        };
+        assert_decode_mla_policy(&fallback, &[(1, 64), (8, 64)]);
+
+        let pinned = {
+            let _scope = crate::test_env::EnvScope::set(&[
+                ("PLOW_DECODE_BATCH_LADDER", "1,8"),
+                ("PLOW_TUNEDB", &dbs),
+                ("PLOW_K3_NS", "7"),
+            ]);
+            k3_build_model(&d, 8192, 256, 2, &[], None)
+        };
+        assert_decode_mla_policy(&pinned, &[(1, 7), (8, 7)]);
     }
 
     #[test]

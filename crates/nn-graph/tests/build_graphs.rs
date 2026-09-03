@@ -5,7 +5,10 @@
 //! run fast while still exercising every op path.
 
 use nn_graph::graph::Origin;
-use nn_graph::models::{build_from_config_json, build_from_config_json_at, ShapeBucket};
+use nn_graph::models::{
+    build_from_config_json, build_from_config_json_at, build_text_generation_from_config_json_at,
+    ShapeBucket,
+};
 use nn_graph::Graph;
 
 /// All node-produced tensors must have an inferred shape.
@@ -874,6 +877,26 @@ fn kimi_k3_builds_a_hybrid_of_mla_and_kda_layers() {
     assert!(
         g.count_ops(|o| matches!(o, nn_graph::Op::SituGlu { .. })) >= 4,
         "K3 uses situ on every GLU, not SiLU"
+    );
+}
+
+#[test]
+fn text_generation_graph_selects_nested_text_tower_without_architecture_cases() {
+    let json = k3_json(r##", "dtype": "bfloat16""##).replacen(
+        "\"text_config\":",
+        "\"vision_config\": {\"model_type\": \"moonvit\"}, \"text_config\":",
+        1,
+    );
+    assert!(
+        build_from_config_json(&json).is_err(),
+        "the full multimodal graph must still refuse an unimplemented vision tower"
+    );
+    let g = build_text_generation_from_config_json_at(&json, &ShapeBucket::default())
+        .expect("text endpoint must construct its complete nested decoder graph");
+    assert_eq!(g.blocks.len(), 4);
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::LinearAttention { .. })),
+        2
     );
 }
 

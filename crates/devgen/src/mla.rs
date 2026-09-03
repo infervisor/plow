@@ -6731,6 +6731,10 @@ fn write_mla_manifest(m: &Model, out: &str, target: &str, enc: MoeEnc, lean: &cr
         });
     }
     let mpath = std::path::Path::new(out).with_file_name("build.json");
+    let cpath = std::path::Path::new(out).with_file_name("plow_config.h");
+    crate::manifest::write_config_header(&cpath, &man)
+        .unwrap_or_else(|e| panic!("{}: compile config not written: {e}", cpath.display()));
+    eprintln!("  compile config -> {}", cpath.display());
     match serde_json::to_vec_pretty(&man).map(|b| std::fs::write(&mpath, b)) {
         Ok(Ok(())) => eprintln!("  build manifest -> {}", mpath.display()),
         Ok(Err(e)) => eprintln!("  WARN: build.json not written: {e}"),

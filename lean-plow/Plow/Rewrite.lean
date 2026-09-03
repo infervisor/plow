@@ -43,6 +43,9 @@ inductive Op
   | Conv3d     (x w : Op) (stride pad : Nat)
   | Conv3dBias (x w b : Op) (stride pad : Nat)
   | Embedding  (ids table : Op)
+  | SnapNil
+  | SnapCons   (snapshot rest : Op)
+  | BlockResidual (prefixValue snapshots normWeight projWeight : Op) (maxSnapshots : Nat)
   /-- Attention op — schematic representation, keeps `q`, `k`, `v` as
       separate operands. -/
   | Attention  (q k v : Op)
@@ -70,6 +73,10 @@ inductive Op
   | FusedKdaGatedNorm       (o nw x gw : Op) (eps : Nat) (shape : String)
   /-- Kimi-K3 MLA output gate: `attn * sigmoid(g_proj(x))`. -/
   | FusedMlaOutGate         (attn x gw : Op)
+  | FusedMaterializedResidualBlock
+      (a b snapshots normWeight projWeight : Op) (maxSnapshots : Nat)
+  | FusedMaterializedResidual3Block
+      (pre a b snapshots normWeight projWeight : Op) (maxSnapshots : Nat)
   deriving Repr, DecidableEq
 
 /-! ## Denotational lens — every fused op unfolds to its unfused composition. -/
@@ -118,6 +125,13 @@ def expand : Op → Op
         (Op.Act "sigmoid" (Op.Reshape (Op.Linear (expand x) (expand gw)) shape))
   | Op.FusedMlaOutGate attn x gw =>
       Op.Ew "mul" (expand attn) (Op.Act "sigmoid" (Op.Linear (expand x) (expand gw)))
+  | Op.FusedMaterializedResidualBlock a b snapshots nw pw maxSnapshots =>
+      Op.BlockResidual (Op.Ew "add" (expand a) (expand b))
+        (expand snapshots) (expand nw) (expand pw) maxSnapshots
+  | Op.FusedMaterializedResidual3Block pre a b snapshots nw pw maxSnapshots =>
+      Op.BlockResidual
+        (Op.Ew "add" (expand pre) (Op.Ew "add" (expand a) (expand b)))
+        (expand snapshots) (expand nw) (expand pw) maxSnapshots
   -- Base ops → structural recursion.
   | Op.RmsNorm x w eps => Op.RmsNorm (expand x) (expand w) eps
   | Op.LayerNorm x w b eps => Op.LayerNorm (expand x) (expand w) (expand b) eps
@@ -133,6 +147,10 @@ def expand : Op → Op
   | Op.Conv3dBias x w b s p => Op.Conv3dBias (expand x) (expand w) (expand b) s p
   | Op.Embedding ids t => Op.Embedding (expand ids) (expand t)
   | Op.Attention q k v => Op.Attention (expand q) (expand k) (expand v)
+  | Op.SnapNil => Op.SnapNil
+  | Op.SnapCons snapshot rest => Op.SnapCons (expand snapshot) (expand rest)
+  | Op.BlockResidual prefixValue snapshots nw pw maxSnapshots =>
+      Op.BlockResidual (expand prefixValue) (expand snapshots) (expand nw) (expand pw) maxSnapshots
   | Op.Var s => Op.Var s
 
 /-! ## Rewrite rule soundness — every rule reduces to `rfl` on `expand`. -/
@@ -242,6 +260,41 @@ theorem rule_mla_out_gate_fuse (attn x gw : Op) :
       Op.Ew "mul" (expand attn)
         (Op.Act "sigmoid" (Op.Linear (expand x) (expand gw))) := rfl
 
+/-- `materialized-residual-block-fuse`; the consumer result is unchanged. -/
+theorem rule_materialized_residual_block_fuse
+    (a b snapshots nw pw : Op) (maxSnapshots : Nat) :
+    expand (Op.FusedMaterializedResidualBlock a b snapshots nw pw maxSnapshots) =
+      Op.BlockResidual (Op.Ew "add" (expand a) (expand b))
+        (expand snapshots) (expand nw) (expand pw) maxSnapshots := rfl
+
+/-- The inner add in the three-input form remains a distinct BF16 materialization point. -/
+theorem rule_materialized_residual3_block_fuse
+    (pre a b snapshots nw pw : Op) (maxSnapshots : Nat) :
+    expand (Op.FusedMaterializedResidual3Block pre a b snapshots nw pw maxSnapshots) =
+      Op.BlockResidual
+        (Op.Ew "add" (expand pre) (Op.Ew "add" (expand a) (expand b)))
+        (expand snapshots) (expand nw) (expand pw) maxSnapshots := rfl
+
+/-- Side result that the fused runtime operation must continue to materialize. -/
+def materializedResidual : Op → Option Op
+  | Op.FusedMaterializedResidualBlock a b _ _ _ _ =>
+      some (Op.Ew "add" (expand a) (expand b))
+  | Op.FusedMaterializedResidual3Block pre a b _ _ _ _ =>
+      some (Op.Ew "add" (expand pre) (Op.Ew "add" (expand a) (expand b)))
+  | _ => none
+
+theorem materialized_residual_block_preserved
+    (a b snapshots nw pw : Op) (maxSnapshots : Nat) :
+    materializedResidual
+        (Op.FusedMaterializedResidualBlock a b snapshots nw pw maxSnapshots) =
+      some (Op.Ew "add" (expand a) (expand b)) := rfl
+
+theorem materialized_residual3_block_preserved
+    (pre a b snapshots nw pw : Op) (maxSnapshots : Nat) :
+    materializedResidual
+        (Op.FusedMaterializedResidual3Block pre a b snapshots nw pw maxSnapshots) =
+      some (Op.Ew "add" (expand pre) (Op.Ew "add" (expand a) (expand b))) := rfl
+
 /-! ## Rule registry — the closed enumeration the CLI accepts as sound. -/
 
 /-- The catalog of egglog rule names covered by the proofs above. Every rule
@@ -267,7 +320,9 @@ def soundRules : List String :=
    "groupnorm-act-conv3d-bias-fuse",
    "embedding-scale-fuse",
    "kda-gated-norm-fuse",
-   "mla-out-gate-fuse"]
+   "mla-out-gate-fuse",
+   "materialized-residual-block-fuse",
+   "materialized-residual3-block-fuse"]
 
 /-- Whether a rule name is in the sound-rules table. -/
 def isSoundRule (name : String) : Bool :=

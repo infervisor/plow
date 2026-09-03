@@ -23,7 +23,7 @@
 use core::mem::size_of;
 use std::collections::{BTreeSet, HashSet};
 
-use crate::dev::{DevInst, DevOp, StreamEnt, Wait, SE_FINE, TENSOR_NONE};
+use crate::dev::{DevInst, DevOp, StreamEnt, Wait, SE_FINE, TENSOR_NONE, TENSOR_NONE_I};
 use crate::rope::GenTensor;
 
 /// Edges that survive transitive reduction: drop A→C when a path A→…→C of
@@ -220,6 +220,36 @@ struct Op {
     deps: Vec<Dep>,
     counter: u32,   // the coarse counter this op bumps
     work: Vec<u32>, // per-slice cost, from the cost model. See `select_granularity`.
+}
+
+/// Dependency graph for one complete emitted program. Fusion discovery runs on this graph only
+/// after every model block has been lowered; packet order is retained separately as a scheduling
+/// constraint.
+struct ProgramGraph {
+    predecessors: Vec<Vec<usize>>,
+    successors: Vec<Vec<usize>>,
+}
+
+impl ProgramGraph {
+    fn from_ops(ops: &[Op]) -> Self {
+        let mut predecessors = vec![Vec::new(); ops.len()];
+        let mut successors = vec![Vec::new(); ops.len()];
+        for (consumer, op) in ops.iter().enumerate() {
+            for dep in &op.deps {
+                let producer = dep.producer() as usize;
+                assert!(
+                    producer < consumer,
+                    "program dependency {producer} -> {consumer} is not topological"
+                );
+                predecessors[consumer].push(producer);
+                successors[producer].push(consumer);
+            }
+        }
+        Self {
+            predecessors,
+            successors,
+        }
+    }
 }
 
 /// How the hardware maps a LOGICAL workgroup index to an L2 locality domain.
@@ -907,7 +937,98 @@ impl Builder {
     /// in-order stream — which is exactly the deadlock that
     /// the design notes document. **Do not reorder streams** without
     /// reading that file.
+    /// Run whole-program fusion after every block has been emitted. Candidate discovery walks the
+    /// complete dependency graph, never a model tag or layer index. The first rule retains packet
+    /// adjacency as a scheduling-safety condition: the packet builder's coarse edges also encode
+    /// ordering for tensor inputs, so moving a consumer across an intervening packet is not legal
+    /// until those tensor edges are explicit. The fused consumer still materializes the residual
+    /// output for every other graph consumer.
+    fn fuse_materialized_residual_inputs(&mut self) -> usize {
+        let graph = ProgramGraph::from_ops(&self.ops);
+        let mut fuse_with = vec![None; self.ops.len()];
+        for consumer_idx in 0..self.ops.len() {
+            let consumer = &self.ops[consumer_idx];
+            let [producer_idx] = graph.predecessors[consumer_idx].as_slice() else {
+                continue;
+            };
+            let producer = &self.ops[*producer_idx];
+            let n = consumer.inst.i[0].checked_mul(consumer.inst.i[1]);
+            let compatible = producer.inst.op == DevOp::Residual as u16
+                && consumer.inst.op == DevOp::AttnRes as u16
+                && consumer_idx == *producer_idx + 1
+                && matches!(consumer.deps.as_slice(), [Dep::Coarse(c)] if *c == *producer_idx as u32)
+                && producer.deps.iter().all(|d| matches!(d, Dep::Coarse(_)))
+                && producer.inst.t[0] == consumer.inst.t[1]
+                && producer.inst.t[1] != TENSOR_NONE
+                && producer.inst.t[2] != TENSOR_NONE
+                && n == Some(producer.inst.i[0])
+                && producer.inst.f[0].to_bits() == 1.0f32.to_bits()
+                && consumer.inst.t[6] == TENSOR_NONE
+                && consumer.inst.t[7] == TENSOR_NONE
+                && consumer.inst.i[5] == TENSOR_NONE_I;
+            if compatible {
+                debug_assert!(graph.successors[*producer_idx].contains(&consumer_idx));
+                fuse_with[*producer_idx] = Some(consumer_idx);
+            }
+        }
+
+        let old = std::mem::take(&mut self.ops);
+        let mut old_to_new = vec![u32::MAX; old.len()];
+        let mut fused = 0usize;
+        let mut next = old.into_iter().enumerate().peekable();
+
+        let remap = |dep: Dep, map: &[u32]| match dep {
+            Dep::Coarse(c) => Dep::Coarse(map[c as usize]),
+            Dep::Fine {
+                producer,
+                map: fine,
+            } => Dep::Fine {
+                producer: map[producer as usize],
+                map: fine,
+            },
+        };
+
+        while let Some((idx, mut op)) = next.next() {
+            let can_fuse = fuse_with[idx].is_some_and(|consumer_idx| {
+                next.peek()
+                    .is_some_and(|(next_idx, _)| *next_idx == consumer_idx)
+            });
+
+            if can_fuse {
+                let (consumer_idx, mut consumer) = next.next().unwrap();
+                let new_idx = self.ops.len() as u32;
+                old_to_new[idx] = new_idx;
+                old_to_new[consumer_idx] = new_idx;
+                consumer.inst.t[6] = op.inst.t[1];
+                consumer.inst.t[7] = op.inst.t[2];
+                consumer.inst.i[5] = if op.inst.t[3] == TENSOR_NONE {
+                    TENSOR_NONE_I
+                } else {
+                    op.inst.t[3]
+                };
+                consumer.deps = op.deps.drain(..).map(|d| remap(d, &old_to_new)).collect();
+                consumer.counter = new_idx;
+                self.ops.push(consumer);
+                fused += 1;
+                continue;
+            }
+
+            let new_idx = self.ops.len() as u32;
+            old_to_new[idx] = new_idx;
+            op.deps = op.deps.drain(..).map(|d| remap(d, &old_to_new)).collect();
+            op.counter = new_idx;
+            self.ops.push(op);
+        }
+        fused
+    }
+
     pub fn finish(mut self) -> Program {
+        if std::env::var("PLOW_FUSE_RESIDUAL_INPUT").ok().as_deref() == Some("1") {
+            let fused = self.fuse_materialized_residual_inputs();
+            if fused != 0 {
+                eprintln!("  whole-graph fusion: {fused} materialized residual inputs");
+            }
+        }
         let n_cu = self.n_cu as usize;
         let n_ops = self.ops.len();
 
@@ -1221,7 +1342,11 @@ impl Builder {
         let seg_q8 = seg_v2 || v2_env.as_deref() == Some("q8");
         let wave_class = |i: usize| -> u8 {
             let op = self.ops[i].inst.op;
-            if uniseg {
+            if op == DevOp::KdaDecodeFused as u16 {
+                // A standalone raw-argument object owns this boundary. Keep its segment pure
+                // even if PLOW_UNISEG was requested; runtime routing may then select by opcode.
+                3
+            } else if uniseg {
                 8
             } else if packed_prefill_segments && packed_prefill_segment_class(op).is_some() {
                 packed_prefill_segment_class(op).unwrap()
@@ -1319,6 +1444,30 @@ impl Builder {
                 cur_seg += 1;
             }
             seg_of[i] = cur_seg;
+        }
+        // A standalone raw kernel cannot participate in the interpreter's counter protocol.
+        // The HSA queue barrier between segment launches already orders every earlier segment
+        // before every later one, so cross-segment counter edges are redundant. Keep all
+        // same-segment edges unchanged; this applies only to programs carrying the raw boundary.
+        let raw_segmented = self
+            .ops
+            .iter()
+            .any(|op| op.inst.op == DevOp::KdaDecodeFused as u16);
+        let same_segment_dep = |consumer: usize, dep: &Dep| {
+            !raw_segmented || seg_of[consumer] == seg_of[dep.producer() as usize]
+        };
+        let mut same_segment_consumer = vec![false; self.ops.len()];
+        let mut same_segment_fine_consumer = vec![false; self.ops.len()];
+        for (consumer, op) in self.ops.iter().enumerate() {
+            for dep in &op.deps {
+                if same_segment_dep(consumer, dep) {
+                    let producer = dep.producer() as usize;
+                    same_segment_consumer[producer] = true;
+                    if matches!(dep, Dep::Fine { .. }) {
+                        same_segment_fine_consumer[producer] = true;
+                    }
+                }
+            }
         }
 
         // PLOW_SEG_DUMP=1: report the segmentation this program actually got.
@@ -1529,6 +1678,9 @@ impl Builder {
             // CU sets: a hand-written threshold is a deadlock.
             inst.wait_ofs = waits.len() as u32;
             for d in &op.deps {
+                if !same_segment_dep(idx, d) {
+                    continue;
+                }
                 let producer = &self.ops[d.producer() as usize];
                 // A Fine dep still needs a coarse fallback entry only if we are NOT emitting
                 // per-slice lists for this op — but we always are (see `fine` below), so a
@@ -1543,11 +1695,19 @@ impl Builder {
             inst.wait_len = (waits.len() as u32 - inst.wait_ofs) as u16;
 
             inst.succ_ofs = succs.len() as u32;
-            succs.push(op.counter);
-            inst.succ_len = 1;
+            if !raw_segmented || same_segment_consumer[idx] {
+                succs.push(op.counter);
+                inst.succ_len = 1;
+            } else {
+                inst.succ_len = 0;
+            }
 
-            let has_fine_dep = op.deps.iter().any(|d| matches!(d, Dep::Fine { .. }));
-            let is_fine_producer = fine_base[idx] != u32::MAX;
+            let has_fine_dep = op
+                .deps
+                .iter()
+                .any(|d| same_segment_dep(idx, d) && matches!(d, Dep::Fine { .. }));
+            let is_fine_producer =
+                fine_base[idx] != u32::MAX && (!raw_segmented || same_segment_fine_consumer[idx]);
             let fine = has_fine_dep || is_fine_producer;
 
             // `slice` is the op-local index of this workgroup, NOT the CU id: the op's
@@ -1581,6 +1741,9 @@ impl Builder {
                     if has_fine_dep {
                         e.wait_ofs = waits.len() as u32;
                         for d in &op.deps {
+                            if !same_segment_dep(idx, d) {
+                                continue;
+                            }
                             match d {
                                 Dep::Coarse(c) => {
                                     let p = &self.ops[*c as usize];
@@ -2451,6 +2614,74 @@ impl Builder {
 /// Why locality-aware placement has nothing to win on these programs, as a test rather than a
 /// paragraph. See the design notes.
 #[cfg(test)]
+mod whole_graph_fusion_tests {
+    use super::*;
+
+    fn graph(scale: f32, pre: bool) -> Builder {
+        let mut b = Builder::new(4);
+        let out = b.tensor("out", 128);
+        let a = b.tensor("a", 128);
+        let rhs = b.tensor("b", 128);
+        let outer = b.tensor("pre", 128);
+        let ring = b.tensor("ring", 128);
+        let score = b.tensor("score", 256);
+        let seed = b.emit(DevOp::Nop, vec![0], &[], |_| {});
+        let residual = b.emit(DevOp::Residual, vec![0, 1], &[seed], |d| {
+            d.t[0] = out;
+            d.t[1] = a;
+            d.t[2] = rhs;
+            d.t[3] = pre.then_some(outer).unwrap_or(TENSOR_NONE);
+            d.i[0] = 64;
+            d.f[0] = scale;
+        });
+        let consumer = b.emit(DevOp::AttnRes, vec![0], &[residual], |d| {
+            d.t[0] = a;
+            d.t[1] = out;
+            d.t[2] = ring;
+            d.t[3] = score;
+            d.i[0] = 1;
+            d.i[1] = 64;
+            d.i[5] = TENSOR_NONE_I;
+        });
+        b.emit(DevOp::Nop, vec![0], &[consumer], |_| {});
+        b
+    }
+
+    #[test]
+    fn whole_graph_fusion_preserves_materialization_rounding_and_remaps_counters() {
+        for pre in [false, true] {
+            let mut b = graph(1.0, pre);
+            assert_eq!(b.fuse_materialized_residual_inputs(), 1);
+            assert_eq!(b.ops.len(), 3);
+            let fused = &b.ops[1];
+            assert_eq!(fused.inst.op, DevOp::AttnRes as u16);
+            assert_eq!((fused.inst.t[6], fused.inst.t[7]), (1, 2));
+            assert_eq!(fused.inst.i[5], if pre { 3 } else { TENSOR_NONE_I });
+            assert!(matches!(fused.deps.as_slice(), [Dep::Coarse(0)]));
+            assert_eq!(fused.counter, 1);
+            assert!(matches!(b.ops[2].deps.as_slice(), [Dep::Coarse(1)]));
+            assert_eq!(b.ops[2].counter, 2);
+        }
+    }
+
+    #[test]
+    fn whole_graph_fusion_rejects_non_unit_residuals() {
+        let mut b = graph(0.5, false);
+        assert_eq!(b.fuse_materialized_residual_inputs(), 0);
+        assert_eq!(b.ops.len(), 4);
+    }
+
+    #[test]
+    fn whole_graph_fusion_preserves_later_fanout_consumers() {
+        let mut b = graph(1.0, false);
+        b.emit(DevOp::Nop, vec![0], &[1], |_| {});
+        assert_eq!(b.fuse_materialized_residual_inputs(), 1);
+        assert_eq!(b.ops.len(), 4);
+        assert!(matches!(b.ops[3].deps.as_slice(), [Dep::Coarse(1)]));
+    }
+}
+
+#[cfg(test)]
 mod locality_census_tests {
     use super::*;
 
@@ -2703,6 +2934,54 @@ mod l2_placement_tests {
             p.stream.iter().any(|e| e.seg == 1),
             "the flash run keeps its own segment"
         );
+    }
+
+    #[test]
+    fn raw_boundary_keeps_same_segment_counters_and_removes_cross_segment_edges() {
+        let mut b = Builder::new(4);
+        let cus = vec![0, 1, 2, 3];
+        let coarse = b.emit(DevOp::Nop, cus.clone(), &[], |_| {});
+        let fine_producer = b.emit(DevOp::Nop, cus.clone(), &[coarse], |_| {});
+        let map: Vec<Vec<u32>> = (0..4).map(|slice| vec![slice]).collect();
+        let before_raw = b.emit_dep_work(
+            DevOp::Nop,
+            cus.clone(),
+            vec![Dep::Fine {
+                producer: fine_producer,
+                map: map.clone(),
+            }],
+            vec![1, 40, 3, 9],
+            |_| {},
+        );
+        let raw = b.emit_dep_work(
+            DevOp::KdaDecodeFused,
+            cus.clone(),
+            vec![Dep::Fine {
+                producer: before_raw,
+                map,
+            }],
+            vec![1, 40, 3, 9],
+            |_| {},
+        );
+        b.emit(DevOp::Nop, cus, &[raw], |_| {});
+        let p = b.finish();
+
+        assert_ne!(p.insts[0].succ_len, 0, "same-segment coarse successor lost");
+        assert_ne!(p.insts[1].wait_len, 0, "same-segment coarse wait lost");
+        assert_ne!(p.insts[1].succ_len, 0, "same-segment fine successor lost");
+        assert!(p
+            .stream
+            .iter()
+            .filter(|entry| entry.inst == 2)
+            .any(|entry| entry.flags & SE_FINE != 0 && entry.wait_len != 0));
+
+        assert_eq!((p.insts[3].wait_len, p.insts[3].succ_len), (0, 0));
+        assert_eq!(p.insts[4].wait_len, 0);
+        assert!(p
+            .stream
+            .iter()
+            .filter(|entry| entry.inst == 3)
+            .all(|entry| entry.wait_len == 0 && entry.succ_len == 0 && entry.flags & SE_FINE == 0));
     }
 
     /// The other half: a SINGLE-wave-class program (decode has no `FlashPrefill`) has nothing in

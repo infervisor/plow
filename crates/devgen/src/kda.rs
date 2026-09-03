@@ -132,6 +132,20 @@ impl KdaCfg {
             && (1..=8).contains(&self.conv_w)
     }
 
+    /// Whether the standalone 256-thread fused decode boundary has a validated shape rung.
+    pub fn supports_decode_fused(&self, rows: u32, n_cu: u32, seq_rows: bool) -> bool {
+        matches!(rows, 1 | 8)
+            && (rows == 1 || seq_rows)
+            && self.heads > 0
+            && rows.saturating_mul(self.heads) <= n_cu
+            && self.head_dim == 128
+            && self.bv == 8
+            && self.conv_w == 4
+            && self.gate_lower_bound.is_some_and(f32::is_finite)
+            && self.eps.is_finite()
+            && self.eps > 0.0
+    }
+
     /// Workgroups for [`DevOp::KdaStateStep`] — `H * D / BV` work items, capped at the CU count.
     ///
     /// `docs/kimi-k3-kda.md` §7.3 requires every proposal to be checked against 256 explicitly,
@@ -502,6 +516,8 @@ pub fn emit_kda_mixer(
         deps,
         fuse_kda(),
         crate::emit_config::active().kda_chunk,
+        crate::emit_config::active().kda_decode_fused
+            && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950,
         seq_rows,
     )
 }
@@ -527,6 +543,7 @@ fn emit_kda_mixer_ex(
     deps: &[u32],
     fuse: bool,
     chunk_enable: bool,
+    fused_decode_enable: bool,
     // Do this mixer's `t` rows carry one state between them, or one state EACH? `true` is a
     // batched decode program (independent sequences); everything today is `false`.
     seq_rows: bool,
@@ -687,6 +704,60 @@ fn emit_kda_mixer_ex(
     let parked = seq_rows.then(|| b.tensor("in.parked", 4 * t as u64));
     // scale = D^-0.5, applied to q AFTER the L2 norm; k is NOT scaled.
     let scale = (c.head_dim as f32).powf(-0.5);
+
+    if fused_decode_enable
+        && fuse
+        && chunk_tmp.is_none()
+        && st.conv_state_alt.is_none()
+        && c.supports_decode_fused(t, n_cu, seq_rows)
+    {
+        let handles = [
+            w.conv_w[0],
+            w.conv_w[1],
+            w.conv_w[2],
+            st.conv_state[0],
+            st.conv_state[1],
+            st.conv_state[2],
+            w.a_log,
+            w.dt_bias,
+            w.o_norm,
+            g_raw,
+            parked.unwrap_or(packet::dev::TENSOR_NONE_I),
+        ];
+        let mut descriptor = Vec::with_capacity(handles.len() * 4);
+        for handle in handles {
+            descriptor.extend_from_slice(&handle.to_le_bytes());
+        }
+        let desc = b.tensor_init(&format!("{a}decode_fused.desc"), descriptor);
+        let mut fused_deps = vec![c_q, c_k, c_v, c_g, c_fb, c_bb];
+        fused_deps.sort_unstable();
+        fused_deps.dedup();
+        let blocks = t * nh;
+        let fused_cus: Vec<u32> = (0..blocks).collect();
+        let c_fused = b.emit(DevOp::KdaDecodeFused, fused_cus, &fused_deps, |d| {
+            d.t[0] = y;
+            d.t[1] = raw[0];
+            d.t[2] = raw[1];
+            d.t[3] = raw[2];
+            d.t[4] = f_raw;
+            d.t[5] = b_raw;
+            d.t[6] = st.state;
+            d.t[7] = desc;
+            d.i[0] = t;
+            d.i[1] = nh;
+            d.i[2] = hd;
+            d.i[3] = c.bv;
+            d.i[4] = c.conv_w;
+            d.i[5] = 1 | if seq_rows { 2 } else { 0 };
+            d.i[6] = gate_mode;
+            d.i[7] = 2;
+            d.f[0] = scale;
+            d.f[1] = lower_bound;
+            d.j[1] = c.eps.to_bits();
+        });
+        let c_o = gemv(b, attn, y, w.o_proj, hi, p, c_fused);
+        return (c_o, attn);
+    }
 
     let c_step = if let (1, Some(alt), Some(bank_pos)) = (t, st.conv_state_alt, st.bank_pos) {
         let handles = [
@@ -1302,6 +1373,7 @@ mod tests {
                 &[seed],
                 true,
                 enabled,
+                false,
                 seq_rows,
             );
             b.finish()
@@ -1483,6 +1555,7 @@ mod tests {
                 fuse,
                 false,
                 false,
+                false,
             );
             b.finish()
         };
@@ -1591,6 +1664,7 @@ mod tests {
                 &[seed],
                 true,
                 false,
+                false,
                 seq_rows,
             );
             let p = b.finish();
@@ -1667,6 +1741,7 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
             );
             let p = b.finish();
             let fused = p
@@ -1691,6 +1766,194 @@ mod tests {
             KdaCfg { conv_w: 9, ..k3() },
         ] {
             assert!(!c.supports_conv_state_step_db());
+        }
+    }
+
+    fn build_decode_fused_probe(
+        c: &KdaCfg,
+        rows: u32,
+        seq_rows: bool,
+        enabled: bool,
+    ) -> packet::devbuild::Program {
+        let mut b = Builder::new(256);
+        let hidden = b.tensor("in.hidden", rows as u64 * c.hidden as u64 * 2);
+        let w = declare_kda_weights(&mut b, c, "p.", "l.");
+        let st = declare_kda_state(
+            &mut b,
+            c,
+            "kv.0.",
+            u64::from(seq_rows.then_some(rows).unwrap_or(1)),
+        );
+        let seed = b.emit(DevOp::Nop, (0..256).collect(), &[], |_| {});
+        emit_kda_mixer_ex(
+            &mut b,
+            c,
+            &w,
+            &st,
+            "act.kda0.",
+            rows,
+            hidden,
+            None,
+            256,
+            false,
+            &[seed],
+            true,
+            false,
+            enabled,
+            seq_rows,
+        );
+        b.finish()
+    }
+
+    #[test]
+    fn standalone_decode_fusion_is_shape_gated_and_falls_back_byte_identically() {
+        let supported = KdaCfg {
+            heads: 12,
+            head_dim: 128,
+            conv_w: 4,
+            gate_lower_bound: Some(-5.0),
+            eps: 1.0e-5,
+            bv: 8,
+            ..k3()
+        };
+        assert!(supported.supports_decode_fused(1, 256, false));
+        assert!(supported.supports_decode_fused(8, 256, true));
+        assert!(!supported.supports_decode_fused(8, 256, false));
+        assert!(!supported.supports_decode_fused(2, 256, true));
+
+        let unsupported = [
+            KdaCfg {
+                head_dim: 64,
+                ..supported.clone()
+            },
+            KdaCfg {
+                bv: 16,
+                ..supported.clone()
+            },
+            KdaCfg {
+                conv_w: 3,
+                ..supported.clone()
+            },
+            KdaCfg {
+                gate_lower_bound: None,
+                ..supported.clone()
+            },
+        ];
+        for c in &unsupported {
+            let legacy = build_decode_fused_probe(c, 1, false, false);
+            let requested = build_decode_fused_probe(c, 1, false, true);
+            assert_eq!(requested.to_blob(), legacy.to_blob());
+            assert!(requested
+                .insts
+                .iter()
+                .all(|i| i.op != DevOp::KdaDecodeFused as u16));
+        }
+        let legacy_b8 = build_decode_fused_probe(&supported, 8, false, false);
+        let invalid_b8 = build_decode_fused_probe(&supported, 8, false, true);
+        assert_eq!(invalid_b8.to_blob(), legacy_b8.to_blob());
+    }
+
+    #[test]
+    fn standalone_decode_fusion_has_exact_slots_rungs_deps_and_a_pure_segment() {
+        for (rows, seq_rows, expected_blocks) in [(1, false, 12), (8, true, 96)] {
+            let c = KdaCfg {
+                heads: 12,
+                bv: 8,
+                ..k3()
+            };
+            let p = build_decode_fused_probe(&c, rows, seq_rows, true);
+            let fused_index = p
+                .insts
+                .iter()
+                .position(|i| i.op == DevOp::KdaDecodeFused as u16)
+                .expect("validated rung must emit one standalone boundary");
+            assert_eq!(
+                p.insts
+                    .iter()
+                    .filter(|i| i.op == DevOp::KdaDecodeFused as u16)
+                    .count(),
+                1
+            );
+            for old in [DevOp::KdaConv3, DevOp::KdaStateStepG, DevOp::KdaGatedNorm] {
+                assert!(p.insts.iter().all(|i| i.op != old as u16), "{old:?}");
+            }
+            let fused = &p.insts[fused_index];
+            assert_eq!(fused.blocks, expected_blocks);
+            assert_eq!(
+                fused.i,
+                [rows, 12, 128, 8, 4, 1 | if seq_rows { 2 } else { 0 }, 1, 2]
+            );
+            assert_eq!(fused.f, [1.0 / (128.0f32).sqrt(), -5.0]);
+            assert_eq!(fused.j, [0, 1.0e-5f32.to_bits()]);
+            let desc = &p.tensors[fused.t[7] as usize];
+            assert_eq!(desc.bytes, 11 * 4);
+            assert_eq!(desc.init.as_ref().unwrap().len(), 11 * 4);
+
+            let producer_for = |slot: usize, handle: u32| {
+                p.insts[..fused_index].iter().position(|i| {
+                    i.t[0] == handle || (i.op == DevOp::GemvQkvg as u16 && i.t[slot] == handle)
+                })
+            };
+            for (slot, handle) in [
+                (0, fused.t[1]),
+                (3, fused.t[2]),
+                (5, fused.t[3]),
+                (7, fused.t[4]),
+                (0, fused.t[5]),
+            ] {
+                assert!(
+                    producer_for(slot, handle).is_some(),
+                    "missing producer for t{slot}"
+                );
+            }
+
+            let output_index = fused_index + 1;
+            let output = &p.insts[output_index];
+            assert_eq!(output.t[1], fused.t[0], "o_proj must consume fused y");
+            assert_eq!(output.op, DevOp::Gemv as u16);
+
+            let fused_segs: std::collections::BTreeSet<u16> = p
+                .stream
+                .iter()
+                .filter(|e| e.inst as usize == fused_index)
+                .map(|e| e.seg)
+                .collect();
+            assert_eq!(fused_segs.len(), 1);
+            let seg = *fused_segs.iter().next().unwrap();
+            assert!(p
+                .stream
+                .iter()
+                .filter(|e| e.seg == seg)
+                .all(|e| { p.insts[e.inst as usize].op == DevOp::KdaDecodeFused as u16 }));
+            assert!(p
+                .stream
+                .iter()
+                .filter(|e| (e.inst as usize) < fused_index)
+                .all(|e| e.seg < seg));
+            assert!(p
+                .stream
+                .iter()
+                .filter(|e| e.inst as usize == output_index)
+                .all(|e| e.seg > seg));
+            assert_eq!((fused.wait_len, fused.succ_len), (0, 0));
+            for e in p.stream.iter().filter(|e| e.inst as usize == fused_index) {
+                assert_eq!((e.wait_len, e.succ_len), (0, 0));
+                assert_eq!(e.flags & packet::dev::SE_XCTR, 0);
+            }
+            for e in &p.stream {
+                for wait in &p.waits[e.wait_ofs as usize..][..e.wait_len as usize] {
+                    let producer_seg = p
+                        .stream
+                        .iter()
+                        .find(|producer| producer.inst == wait.id)
+                        .expect("coarse wait producer must have a stream entry")
+                        .seg;
+                    assert_eq!(
+                        producer_seg, e.seg,
+                        "host-ordered cross-segment edge leaked into the interpreter protocol"
+                    );
+                }
+            }
         }
     }
 

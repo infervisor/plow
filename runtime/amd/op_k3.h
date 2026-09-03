@@ -163,6 +163,44 @@ enum { PLOW_ATTNRES_PART = PLOW_WAVES * 2 * (PLOW_ATTNRES_MAXB + 1) };
  *
  * `gamma == nullptr` keeps the raw-mix arm BYTE-IDENTICAL, which is what makes the emitter knob an
  * A/B out of one binary. */
+/* Materialize a graph-selected residual seam before its consumer runs. Keeping this helper
+ * separate leaves the consumer ABI and live ranges unchanged. The operation is
+ * consumer-independent; the packet graph decides where it is legal and dispatch invokes it before
+ * the selected consumer. */
+#if PLOW_MATERIALIZED_RESIDUAL_INPUT
+__device__ __forceinline__ void d_materialize_residual(
+    bf16* __restrict__ out, const bf16* __restrict__ a, const bf16* __restrict__ b,
+    const bf16* __restrict__ pre, unsigned T, unsigned HID, unsigned slice, unsigned nblk) {
+    const auto* ag = as_glob(a);
+    const auto* bg = as_glob(b);
+    const auto* pg = as_glob(pre);
+    auto* og = as_glob(out);
+    for (unsigned t = slice; t < T; t += nblk) {
+        const size_t base = (size_t)t * HID;
+        for (unsigned d = threadIdx.x * 8u; d < HID; d += PLOW_THREADS * 8u) {
+            if (d + 8u <= HID) {
+                const bf16v8 va = ld_glob8(ag + base + d), vb = ld_glob8(bg + base + d);
+                const bf16v8 vp = pre ? ld_glob8(pg + base + d) : bf16v8_zero();
+                bf16v8 vo;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const bf16 inner = f2bf(bf2f(va[j]) + bf2f(vb[j]));
+                    vo[j] = pre ? f2bf(bf2f(vp[j]) + bf2f(inner)) : inner;
+                }
+                st_glob8(og + base + d, vo);
+            } else {
+                for (unsigned j = d; j < HID; ++j) {
+                    const bf16 inner = f2bf(bf2f(a[base + j]) + bf2f(b[base + j]));
+                    st_act1(out + base + j,
+                            pre ? f2bf(bf2f(pre[base + j]) + bf2f(inner)) : inner);
+                }
+            }
+        }
+    }
+    __syncthreads();
+}
+#endif
+
 __device__ void d_attn_res(bf16* __restrict__ out, const bf16* __restrict__ prefix,
                            const bf16* __restrict__ blkres, const float* __restrict__ score_w,
                            unsigned T, unsigned HID, unsigned NB, unsigned NBCAP, float eps,

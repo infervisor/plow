@@ -125,7 +125,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use packet::dev::{DevInst64, DevOp, DevProgram, PrefillSpan, PREFILL_SPAN_RESET_STATE};
+use packet::dev::{DevInst64, DevOp, DevProgram, PrefillSpan, PREFILL_SPAN_RESET_STATE, SE_XCTR};
 use packet::devbuild::static_seg_ofs;
 use serde::Serialize;
 
@@ -276,21 +276,337 @@ impl ProgramDispatch {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeSegmentKind {
+    Interpreter,
+    KdaDecodeFused(usize),
+}
+
+fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
+    let n_segments = derive_segments(prog)?.len();
+    let mut kinds = vec![DecodeSegmentKind::Interpreter; n_segments];
+    let mut raw_segment_owner = vec![None; prog.insts.len()];
+    for seg in 0..n_segments {
+        let mut fused_inst = None;
+        let mut has_other = false;
+        for e in prog.stream.iter().filter(|e| e.seg as usize == seg) {
+            let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "decode segment {seg} references instruction {} of {}",
+                    e.inst,
+                    prog.insts.len()
+                ))
+            })?;
+            if inst.op == DevOp::KdaDecodeFused as u16 {
+                match fused_inst {
+                    None => fused_inst = Some(e.inst as usize),
+                    Some(i) if i == e.inst as usize => {}
+                    Some(i) => {
+                        return Err(RuntimeError::Device(format!(
+                            "decode segment {seg} mixes fused KDA instructions {i} and {}",
+                            e.inst
+                        )))
+                    }
+                }
+                match raw_segment_owner[e.inst as usize] {
+                    Some(owner) if owner != seg => {
+                        return Err(RuntimeError::Device(format!(
+                            "raw instruction {} is referenced by segments {owner} and {seg}; a stateful raw boundary may execute exactly once",
+                            e.inst
+                        )))
+                    }
+                    None => raw_segment_owner[e.inst as usize] = Some(seg),
+                    _ => {}
+                }
+                if e.wait_len != 0 || e.succ_len != 0 || e.flags & SE_XCTR != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "fused KDA instruction {} has counter obligations in segment {seg} (waits={}, succs={}, flags={:#x}); a raw kernel cannot service interpreter counters",
+                        e.inst, e.wait_len, e.succ_len, e.flags
+                    )));
+                }
+            } else {
+                has_other = true;
+            }
+        }
+        if let Some(inst) = fused_inst {
+            if has_other {
+                return Err(RuntimeError::Device(format!(
+                    "decode segment {seg} mixes KdaDecodeFused with interpreter opcodes; standalone dispatch requires a pure segment"
+                )));
+            }
+            kinds[seg] = DecodeSegmentKind::KdaDecodeFused(inst);
+        }
+    }
+    for (i, inst) in prog.insts.iter().enumerate() {
+        if inst.op == DevOp::KdaDecodeFused as u16 && raw_segment_owner[i].is_none() {
+            return Err(RuntimeError::Device(format!(
+                "fused KDA instruction {i} is absent from every stream segment"
+            )));
+        }
+    }
+
+    // Ordinary L2 placement also uses `seg`, but does not relaunch the program at those
+    // boundaries. Its interpreter counters may therefore cross domains. Only the standalone
+    // raw-kernel route replaces cross-segment counter ordering with ordered AQL launches.
+    if kinds
+        .iter()
+        .all(|kind| matches!(kind, DecodeSegmentKind::Interpreter))
+    {
+        return Ok(kinds);
+    }
+
+    let mut producer_segments: std::collections::HashMap<u32, Vec<u16>> =
+        std::collections::HashMap::new();
+    for e in &prog.stream {
+        if e.flags & SE_XCTR != 0 {
+            continue;
+        }
+        let end = e.succ_ofs as usize + e.succ_len as usize;
+        let succs = prog.succs.get(e.succ_ofs as usize..end).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "decode stream successor range {}..{end} is out of bounds ({})",
+                e.succ_ofs,
+                prog.succs.len()
+            ))
+        })?;
+        for &counter in succs {
+            producer_segments.entry(counter).or_default().push(e.seg);
+        }
+    }
+    for e in &prog.stream {
+        if e.flags & SE_XCTR != 0 {
+            continue;
+        }
+        let end = e.wait_ofs as usize + e.wait_len as usize;
+        let waits = prog.waits.get(e.wait_ofs as usize..end).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "decode stream wait range {}..{end} is out of bounds ({})",
+                e.wait_ofs,
+                prog.waits.len()
+            ))
+        })?;
+        for wait in waits {
+            if producer_segments
+                .get(&wait.id)
+                .is_some_and(|segs| segs.iter().any(|&s| s != e.seg))
+            {
+                return Err(RuntimeError::Device(format!(
+                    "decode counter {} crosses into segment {}; segmented raw/interpreter dispatch requires cross-segment waits to be removed",
+                    wait.id, e.seg
+                )));
+            }
+        }
+    }
+    Ok(kinds)
+}
+
 fn validate_decode_dispatch(progs: &[DevProg], dec_ix: usize) -> Result<()> {
     for (rung, prog) in progs[dec_ix..].iter().enumerate() {
-        let n_segments = derive_segments(prog)?.len();
-        if matches!(
-            ProgramDispatch::classify(prog.l2_domains, n_segments),
-            ProgramDispatch::WaveSegments(n) if n > 1
-        ) {
+        let kinds = decode_segment_kinds(prog)?;
+        let n_segments = kinds.len();
+        if prog.l2_domains != 0
+            && kinds
+                .iter()
+                .any(|k| !matches!(k, DecodeSegmentKind::Interpreter))
+        {
             return Err(RuntimeError::Device(format!(
-                "decode program {} (rung {rung}, t={}) has {n_segments} wave segments, but AMD decode dispatch is single-launch; re-emit without decode segmentation",
+                "decode program {} (rung {rung}, t={}) mixes raw KDA and interpreter segments                  with L2-domain placement; raw boundaries require ordered wave segments",
+                dec_ix + rung,
+                prog.t,
+            )));
+        }
+        if prog.l2_domains == 0
+            && n_segments > 1
+            && !kinds
+                .iter()
+                .any(|k| !matches!(k, DecodeSegmentKind::Interpreter))
+        {
+            return Err(RuntimeError::Device(format!(
+                "decode program {} (rung {rung}, t={}) has {n_segments} wave segments but no                  standalone KDA boundary; ordinary AMD decode remains single-launch",
                 dec_ix + rung,
                 prog.t
             )));
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct KdaDecodeFusedArgs {
+    y: u64,
+    q_raw: u64,
+    k_raw: u64,
+    v_raw: u64,
+    wq: u64,
+    wk: u64,
+    wv: u64,
+    csq: u64,
+    csk: u64,
+    csv: u64,
+    forget_raw: u64,
+    beta_raw: u64,
+    output_gate_raw: u64,
+    a_log: u64,
+    dt_bias: u64,
+    state: u64,
+    norm_w: u64,
+    parked: u64,
+    rows: u32,
+    heads: u32,
+    dim: u32,
+    bv: u32,
+    conv_w: u32,
+    flags: u32,
+    gate_mode: u32,
+    lower_bound: f32,
+    scale: f32,
+    norm_eps: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaDecodeFusedArgs>() == 184);
+
+#[derive(Clone, Copy, Debug)]
+enum DecodeSegmentRoute {
+    Interpreter,
+    KdaDecodeFused(KdaDecodeFusedArgs),
+}
+
+fn requires_segmented_decode(routes: &[DecodeSegmentRoute]) -> bool {
+    routes
+        .iter()
+        .any(|route| !matches!(route, DecodeSegmentRoute::Interpreter))
+}
+
+fn kda_decode_fused_routes(
+    prog: &DevProg,
+    tensors: &[crate::asset::devblob::DevTensor],
+    init: &[u8],
+    devp: &[DeviceMem],
+) -> Result<Vec<DecodeSegmentRoute>> {
+    let kinds = decode_segment_kinds(prog)?;
+    let mut routes = Vec::with_capacity(kinds.len());
+    for kind in kinds {
+        let DecodeSegmentKind::KdaDecodeFused(inst_ix) = kind else {
+            routes.push(DecodeSegmentRoute::Interpreter);
+            continue;
+        };
+        let d = &prog.insts[inst_ix];
+        let (rows, heads, dim, bv, conv_w, flags, gate_mode, version) = (
+            d.i[0], d.i[1], d.i[2], d.i[3], d.i[4], d.i[5], d.i[6], d.i[7],
+        );
+        let lower_bound = f32::from_bits(d.fj[1]);
+        let scale = f32::from_bits(d.fj[0]);
+        let norm_eps = f32::from_bits(d.fj[2]);
+        if !matches!(rows, 1 | 8)
+            || heads == 0
+            || dim != 128
+            || bv != 8
+            || conv_w != 4
+            || flags & 1 == 0
+            || flags & !3 != 0
+            || (rows > 1 && flags & 2 == 0)
+            || gate_mode != 1
+            || version != 2
+            || d.blocks as u32 != rows.saturating_mul(heads)
+            || !lower_bound.is_finite()
+            || !scale.is_finite()
+            || scale <= 0.0
+            || !norm_eps.is_finite()
+            || norm_eps <= 0.0
+        {
+            return Err(RuntimeError::Device(format!(
+                "KdaDecodeFused instruction {inst_ix} has unsupported ABI/geometry:                  rows={rows} H={heads} D={dim} BV={bv} W={conv_w} blocks={} flags={flags:#x}                  gate={gate_mode} version={version} lower={lower_bound} scale={scale} eps={norm_eps}",
+                d.blocks
+            )));
+        }
+        let desc_h = d.t[7] as usize;
+        let desc = tensors.get(desc_h).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "KdaDecodeFused descriptor handle {desc_h} is outside {} tensors",
+                tensors.len()
+            ))
+        })?;
+        if desc.bytes != 44 {
+            return Err(RuntimeError::Device(format!(
+                "KdaDecodeFused descriptor `{}` is {} bytes, expected 44",
+                desc.name, desc.bytes
+            )));
+        }
+        let range = desc.init.clone().ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "KdaDecodeFused descriptor `{}` has no initialized handle table",
+                desc.name
+            ))
+        })?;
+        let bytes = init.get(range).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "KdaDecodeFused descriptor `{}` init range is invalid",
+                desc.name
+            ))
+        })?;
+        if bytes.len() != 44 {
+            return Err(RuntimeError::Device(format!(
+                "KdaDecodeFused descriptor `{}` init is {} bytes, expected 44",
+                desc.name,
+                bytes.len()
+            )));
+        }
+        let mut handles = [0u32; 11];
+        for (slot, word) in handles.iter_mut().zip(bytes.chunks_exact(4)) {
+            *slot = u32::from_le_bytes(word.try_into().expect("4"));
+        }
+        let addr = |h: u32, what: &str, optional: bool| -> Result<u64> {
+            if h == packet::dev::TENSOR_NONE_I {
+                return if optional {
+                    Ok(0)
+                } else {
+                    Err(RuntimeError::Device(format!(
+                        "KdaDecodeFused required operand `{what}` is absent"
+                    )))
+                };
+            }
+            devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "KdaDecodeFused operand `{what}` handle {h} is outside {} tensors",
+                    devp.len()
+                ))
+            })
+        };
+        let direct = |slot: usize, what: &str| addr(d.t[slot] as u32, what, false);
+        let a = KdaDecodeFusedArgs {
+            y: direct(0, "y")?,
+            q_raw: direct(1, "q_raw")?,
+            k_raw: direct(2, "k_raw")?,
+            v_raw: direct(3, "v_raw")?,
+            wq: addr(handles[0], "wq", false)?,
+            wk: addr(handles[1], "wk", false)?,
+            wv: addr(handles[2], "wv", false)?,
+            csq: addr(handles[3], "csq", false)?,
+            csk: addr(handles[4], "csk", false)?,
+            csv: addr(handles[5], "csv", false)?,
+            forget_raw: direct(4, "forget_raw")?,
+            beta_raw: direct(5, "beta_raw")?,
+            output_gate_raw: addr(handles[9], "output_gate_raw", false)?,
+            a_log: addr(handles[6], "A_log", false)?,
+            dt_bias: addr(handles[7], "dt_bias", false)?,
+            state: direct(6, "state")?,
+            norm_w: addr(handles[8], "norm_w", false)?,
+            parked: addr(handles[10], "parked", true)?,
+            rows,
+            heads,
+            dim,
+            bv,
+            conv_w,
+            flags,
+            gate_mode,
+            lower_bound,
+            scale,
+            norm_eps,
+        };
+        routes.push(DecodeSegmentRoute::KdaDecodeFused(a));
+    }
+    Ok(routes)
 }
 
 /// Sanity bound on `seg`, so a corrupt stream cannot make the host allocate
@@ -683,6 +999,74 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
 /// BLOB-wide: it names arms of both objects, and checking a prefill flag against the decode
 /// object would refuse every GLM asset in the tree. Each check therefore only looks at the flags
 /// ITS table names and leaves the rest to the other phase.
+const COMPILED_OPCODE_MARKERS: &[(DevOp, &str)] = &[
+    (DevOp::KdaConv, "plow_opcode_kda_conv_1"),
+    (DevOp::KdaGate, "plow_opcode_kda_gate_1"),
+    (DevOp::KdaStateStep, "plow_opcode_kda_state_step_1"),
+    (DevOp::KdaGatedNorm, "plow_opcode_kda_gated_norm_1"),
+    (DevOp::AttnRes, "plow_opcode_attn_res_1"),
+    (DevOp::SituGlu, "plow_opcode_situ_glu_1"),
+    (DevOp::MlaOutGate, "plow_opcode_mla_out_gate_1"),
+    (DevOp::KdaConv3, "plow_opcode_kda_conv3_1"),
+    (DevOp::KdaStateStepG, "plow_opcode_kda_state_step_g_1"),
+    (
+        DevOp::KdaConvStateStepG,
+        "plow_opcode_kda_conv_state_step_g_1",
+    ),
+    (DevOp::KdaChunkPrepare, "plow_opcode_kda_chunk_prepare_1"),
+    (DevOp::KdaChunkIntra, "plow_opcode_kda_chunk_intra_1"),
+    (DevOp::KdaChunkWu, "plow_opcode_kda_chunk_wu_1"),
+    (DevOp::KdaChunkCarry, "plow_opcode_kda_chunk_carry_1"),
+];
+
+fn check_compiled_opcode_marker_set(
+    syms: &[&str],
+    path: &Path,
+    required: impl IntoIterator<Item = DevOp>,
+) -> Result<()> {
+    for op in required {
+        let Some((_, marker)) = COMPILED_OPCODE_MARKERS
+            .iter()
+            .find(|(candidate, _)| *candidate == op)
+        else {
+            continue;
+        };
+        if !syms.contains(marker) {
+            return Err(RuntimeError::Device(format!(
+                "packet/object MISMATCH: packet dispatches {op:?}, but {} lacks compiled-opcode marker `{marker}`",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_compiled_opcode_markers(syms: &[&str], path: &Path, progs: &[DevProg]) -> Result<()> {
+    let required = progs
+        .iter()
+        .flat_map(|prog| &prog.insts)
+        .filter_map(|inst| DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op));
+    check_compiled_opcode_marker_set(syms, path, required)
+}
+
+const MATERIALIZED_RESIDUAL_INPUT_SYM: &str = "plow_materialized_residual_input_1";
+
+fn check_materialized_residual_input(syms: &[&str], path: &Path, progs: &[DevProg]) -> Result<()> {
+    let required = progs.iter().flat_map(|prog| &prog.insts).any(|inst| {
+        inst.op == DevOp::AttnRes as u16
+            && (inst.t[6] != packet::dev::TENSOR_NONE16
+                || inst.t[7] != packet::dev::TENSOR_NONE16
+                || inst.i[5] != packet::dev::TENSOR_NONE_I)
+    });
+    if required && !syms.contains(&MATERIALIZED_RESIDUAL_INPUT_SYM) {
+        return Err(RuntimeError::Device(format!(
+            "packet/object MISMATCH: packet carries a graph-fused materialized residual input, but {} lacks `{MATERIALIZED_RESIDUAL_INPUT_SYM}`",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_KDA_CONV_STEP_DB", &["plow_kda_conv_step_db_arm"]),
     ("PLOW_MOE_PF_ATOMIC", &["plow_moe_pf_atomic_arm"]),
@@ -763,6 +1147,72 @@ fn check_decode_object(
 /// before and stay valid. A manifest that exists and cannot be parsed IS an
 /// error — it is the only statement of what the packet needs, and guessing past
 /// a broken one is how the check would silently stop checking.
+fn manifest_pairing_hash(raw: &[u8], path: &Path) -> Result<u64> {
+    let manifest: serde_json::Value = serde_json::from_slice(raw)
+        .map_err(|e| RuntimeError::Device(format!("{}: not valid JSON: {e}", path.display())))?;
+    manifest
+        .pointer("/pairing/hash")
+        .and_then(|v| v.as_str())
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "specialised AMD object requires {} to contain a valid pairing.hash",
+                path.display()
+            ))
+        })
+}
+
+fn validate_packet_pairing_stamp(
+    lo: Option<u32>,
+    hi: Option<u32>,
+    expected: Option<u64>,
+    object: &Path,
+) -> Result<()> {
+    match (lo, hi) {
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => Err(RuntimeError::Device(format!(
+            "{} has a partial packet-pairing stamp; refusing an unverifiable specialised object",
+            object.display()
+        ))),
+        (Some(lo), Some(hi)) => {
+            let stamped = ((hi as u64) << 32) | lo as u64;
+            let expected = expected.ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "{} is specialised for packet hash 0x{stamped:016x}, but the asset has no valid build.json pairing hash",
+                    object.display()
+                ))
+            })?;
+            if stamped != expected {
+                return Err(RuntimeError::Device(format!(
+                    "packet/object MISMATCH: specialised AMD object {} stamps 0x{stamped:016x}, asset requires 0x{expected:016x}",
+                    object.display()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn build_pairing_hash(blob_path: &Path) -> Result<Option<u64>> {
+    let path = blob_path.with_file_name("build.json");
+    match std::fs::read(&path) {
+        Ok(raw) => manifest_pairing_hash(&raw, &path).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(RuntimeError::Io { path, source }),
+    }
+}
+
+fn check_packet_pairing_stamp(image: &[u8], blob_path: &Path, object: &Path) -> Result<()> {
+    let lo = elf_symbol_u32(image, "plow_packet_hash_lo");
+    let hi = elf_symbol_u32(image, "plow_packet_hash_hi");
+    let expected = if lo.is_some() || hi.is_some() {
+        build_pairing_hash(blob_path)?
+    } else {
+        None
+    };
+    validate_packet_pairing_stamp(lo, hi, expected, object)
+}
+
 fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
     let mpath = blob_path.with_file_name("build.json");
     let Ok(raw) = std::fs::read(&mpath) else {
@@ -862,6 +1312,86 @@ fn elf_symbol_names(img: &[u8]) -> Vec<&str> {
         }
     }
     out
+}
+
+/// Initial value of a four-byte ELF object symbol.
+///
+/// Pairing stamps are immutable build metadata. Reading them from the file avoids loading a
+/// module and asking SDMA to read a device global merely to compare two constants.
+fn elf_symbol_u32(img: &[u8], wanted: &str) -> Option<u32> {
+    let u16at = |o: usize| -> Option<usize> {
+        img.get(o..o + 2)
+            .and_then(|b| Some(u16::from_le_bytes(b.try_into().ok()?) as usize))
+    };
+    let u32at = |o: usize| -> Option<usize> {
+        img.get(o..o + 4)
+            .and_then(|b| Some(u32::from_le_bytes(b.try_into().ok()?) as usize))
+    };
+    let u64at = |o: usize| -> Option<usize> {
+        img.get(o..o + 8)
+            .and_then(|b| usize::try_from(u64::from_le_bytes(b.try_into().ok()?)).ok())
+    };
+    if img.get(..4) != Some(b"\x7fELF") || img.get(4) != Some(&2) || img.get(5) != Some(&1) {
+        return None;
+    }
+    let (shoff, shent, shnum) = (u64at(0x28)?, u16at(0x3a)?, u16at(0x3c)?);
+    if shent < 64 {
+        return None;
+    }
+    let hdr = |i: usize| -> Option<usize> {
+        (i < shnum)
+            .then(|| i.checked_mul(shent)?.checked_add(shoff))
+            .flatten()
+            .filter(|&off| off.checked_add(64).is_some_and(|end| end <= img.len()))
+    };
+    for i in 0..shnum {
+        let s = hdr(i)?;
+        if !matches!(u32at(s + 4), Some(2) | Some(11)) {
+            continue;
+        }
+        let (off, size, link, entsz) = (
+            u64at(s + 24)?,
+            u64at(s + 32)?,
+            u32at(s + 40)?,
+            u64at(s + 56)?,
+        );
+        if entsz < 24 {
+            continue;
+        }
+        let l = hdr(link)?;
+        let (stroff, strsz) = (u64at(l + 24)?, u64at(l + 32)?);
+        let strtab = img.get(stroff..stroff.checked_add(strsz)?)?;
+        for k in 0..size / entsz {
+            let sym = off.checked_add(k.checked_mul(entsz)?)?;
+            let nm = u32at(sym)?;
+            let tail = strtab.get(nm..)?;
+            let end = tail.iter().position(|&c| c == 0).unwrap_or(tail.len());
+            if tail.get(..end)? != wanted.as_bytes() {
+                continue;
+            }
+            if u64at(sym + 16)? != 4 {
+                return None;
+            }
+            let section = hdr(u16at(sym + 6)?)?;
+            if u32at(section + 4)? != 1 {
+                return None;
+            }
+            let (section_addr, section_off, section_size) = (
+                u64at(section + 16)?,
+                u64at(section + 24)?,
+                u64at(section + 32)?,
+            );
+            let rel = u64at(sym + 8)?.checked_sub(section_addr)?;
+            if rel.checked_add(4)? > section_size {
+                return None;
+            }
+            let value_off = section_off.checked_add(rel)?;
+            return img
+                .get(value_off..value_off.checked_add(4)?)
+                .map(|b| u32::from_le_bytes(b.try_into().expect("four-byte symbol")));
+        }
+    }
+    None
 }
 
 /// Refuse a prefill code object that does not carry the arms the packet's
@@ -3752,6 +4282,9 @@ struct AmdProg {
     d_seg_ofs: DeviceMem,
     /// `[n_seg]` wave classes.
     seg_class: Vec<u8>,
+    /// Ordered decode route for each segment. Raw KDA entries carry fully resolved rank-local
+    /// kernargs, so the hot launch path performs no descriptor parsing or allocation.
+    decode_routes: Vec<DecodeSegmentRoute>,
     /// `[n_seg]` pure packed-consumer family: 5=MLA norm/cache, 6=MLA flash,
     /// 7=serial KDA, 0=not safely routable to a family object.
     packed_seg_family: Vec<u8>,
@@ -3860,6 +4393,7 @@ pub struct AmdEngine {
 
     k_prefill: HsaKernel,
     k_decode: HsaKernel,
+    k_kda_decode_fused: Option<HsaKernel>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
     k_token_capture: Option<HsaKernel>,
@@ -4394,6 +4928,16 @@ impl AmdEngine {
         let need_k3_prefill = required_k3_op(&blob.progs[..dec_ix]);
         let need_kda_chunk_decode = required_kda_chunk(&blob.progs[dec_ix..]);
         let need_kda_chunk_prefill = required_kda_chunk(&blob.progs[..dec_ix]);
+        let need_kda_decode_fused = first_op_in(&blob.progs[dec_ix..], &[DevOp::KdaDecodeFused]);
+        if let Some(p) = blob.progs[..dec_ix]
+            .iter()
+            .find(|p| p.insts.iter().any(|i| i.op == DevOp::KdaDecodeFused as u16))
+        {
+            return Err(RuntimeError::Device(format!(
+                "KdaDecodeFused is decode-only, but prefill program T={} dispatches it",
+                p.t
+            )));
+        }
         let need_a4w4_decode = required_moe_pf_a4w4(&blob.progs[dec_ix..]);
         let need_moe_pf_atomic_decode = required_moe_pf_accum(&blob.progs[dec_ix..], 4);
         let need_moe_pf_det_decode = required_moe_pf_accum(&blob.progs[dec_ix..], 5);
@@ -4597,6 +5141,15 @@ impl AmdEngine {
                     Phase::Flash => None,
                 };
                 check_k3_arms(&syms, &path, need_k3)?;
+                if phase != Phase::Flash {
+                    let phase_progs = if phase == Phase::Decode {
+                        &blob.progs[dec_ix..]
+                    } else {
+                        &blob.progs[..dec_ix]
+                    };
+                    check_compiled_opcode_markers(&syms, &path, phase_progs)?;
+                    check_materialized_residual_input(&syms, &path, phase_progs)?;
+                }
                 let need_chunk = match phase {
                     Phase::Decode => need_kda_chunk_decode,
                     Phase::Prefill => need_kda_chunk_prefill,
@@ -4656,6 +5209,7 @@ impl AmdEngine {
                     Phase::Prefill | Phase::Flash => (need_fp8kv_prefill, need_bf16kv_prefill),
                 };
                 check_kv_encoding(&syms, &path, need_fp8, need_bf16)?;
+                check_packet_pairing_stamp(&image, blob_path, &path)?;
                 let m = EngineDevice::module_load(&*be, &image).map_err(|e| {
                     RuntimeError::Device(format!(
                         "{name}: {e} — a BUNDLED object gives exactly this; was it \
@@ -4771,10 +5325,24 @@ impl AmdEngine {
         };
         drop(load_one_in);
 
+        let mut packed_kda_ops: Vec<DevOp> = blob.progs[..dec_ix]
+            .iter()
+            .flat_map(|prog| &prog.insts)
+            .filter_map(|inst| DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op))
+            .filter(|op| {
+                matches!(
+                    op,
+                    DevOp::KdaStateStep | DevOp::KdaConv3 | DevOp::KdaStateStepG
+                )
+            })
+            .collect();
+        packed_kda_ops.sort_unstable_by_key(|op| *op as u16);
+        packed_kda_ops.dedup_by_key(|op| *op as u16);
         let mut load_packed_family = |stem: &str,
                                       symbol_base: &str,
                                       marker: &str,
-                                      fp8_kv: Option<bool>|
+                                      fp8_kv: Option<bool>,
+                                      required_ops: &[DevOp]|
          -> Result<Option<HsaKernel>> {
             let name = format!("{stem}{}.elf", sched_prefill.suffix());
             let path = hsaco_dir.join(&name);
@@ -4792,11 +5360,13 @@ impl AmdEngine {
                     path.display()
                 )));
             }
+            check_compiled_opcode_marker_set(&syms, &path, required_ops.iter().copied())?;
             if let Some(want_fp8) = fp8_kv {
                 let has_fp8 = syms.contains(&FP8_KV_SYM);
                 check_packed_family_kv_encoding(has_fp8, want_fp8)
                     .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
             }
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
             let module = EngineDevice::module_load(&*be, &image)?;
             let symbol = format!("{symbol_base}_{arch}{}", sched_prefill.suffix());
             let kernel = EngineDevice::get_function(&*be, &module, &symbol)
@@ -4826,6 +5396,7 @@ impl AmdEngine {
                 "plow_interp_packed_mla_norm",
                 PACKED_PREFILL_MLA_NORM_SEG_SYM,
                 Some(variant == Variant::Fp8Kv),
+                &[],
             )?
         } else {
             None
@@ -4836,6 +5407,7 @@ impl AmdEngine {
                 "plow_interp_packed_mla_flash",
                 PACKED_PREFILL_MLA_FLASH_SEG_SYM,
                 Some(variant == Variant::Fp8Kv),
+                &[],
             )?
         } else {
             None
@@ -4846,11 +5418,59 @@ impl AmdEngine {
             } else {
                 PACKED_PREFILL_KDA_SEG_SYM
             };
-            load_packed_family("interp_packed_kda", "plow_interp_packed_kda", marker, None)?
+            load_packed_family(
+                "interp_packed_kda",
+                "plow_interp_packed_kda",
+                marker,
+                None,
+                &packed_kda_ops,
+            )?
         } else {
             None
         };
         drop(load_packed_family);
+
+        let k_kda_decode_fused = if need_kda_decode_fused.is_some() {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "KdaDecodeFused opcode 125 requires gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "kda_decode_fused_gfx950.elf";
+            const MARKER: &str = "plow_kda_decode_fused_256x16_2";
+            const SYMBOL: &str = "plow_kda_decode_fused_256x16_v2";
+            let path = hsaco_dir.join(NAME);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "opcode 125 requires standalone object {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let syms = elf_symbol_names(&image);
+            if !syms.contains(&MARKER) {
+                return Err(RuntimeError::Device(format!(
+                    "standalone KDA object {} does not advertise required marker `{MARKER}`;                      refusing a missing, wrong, or stale object",
+                    path.display()
+                )));
+            }
+            let module = EngineDevice::module_load(&*be, &image)
+                .map_err(|e| RuntimeError::Device(format!("{}: {e}", path.display())))?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            const IMPLICIT: u32 = 256;
+            let want = (std::mem::size_of::<KdaDecodeFusedArgs>() as u32 + 7) & !7;
+            let got = kernel.kernarg_size();
+            if got != want && got != want + IMPLICIT {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B; fused KDA ABI needs {want}                      (or {} with COv5 implicit args). Rebuild the standalone object.",
+                    want + IMPLICIT
+                )));
+            }
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
 
         // --- tensors + weights ------------------------------------------------
         // Staging is one pinned slab, filled and pushed in `STAGE` chunks. The
@@ -5362,8 +5982,13 @@ impl AmdEngine {
         // --- per-program tables ---------------------------------------------
         let ctr_banks: u64 = if ctr_dbuf() { 2 } else { 1 };
         let mut progs = Vec::with_capacity(blob.progs.len());
-        for p in &blob.progs {
+        for (prog_ix, p) in blob.progs.iter().enumerate() {
             let seg_class = derive_segments(p)?;
+            let decode_routes = if prog_ix >= dec_ix {
+                kda_decode_fused_routes(p, &blob.tensors, &blob.init, &devp)?
+            } else {
+                vec![DecodeSegmentRoute::Interpreter; seg_class.len()]
+            };
             let packed_seg_family = derive_packed_segment_families(p)?;
             let packed_mla_segmented = packed_family_segments_cover(p, &packed_seg_family, &[5, 6]);
             let packed_kda_segmented = packed_family_segments_cover(p, &packed_seg_family, &[7]);
@@ -5473,6 +6098,7 @@ impl AmdEngine {
                 }),
                 packed_kda_compatible: packed_kda_compatible(p),
                 packed_kda_segmented,
+                decode_routes,
                 n_inst: p.insts.len() as u32,
                 trace_records: p.stream.len(),
                 n_counter: p.n_counter,
@@ -5846,6 +6472,7 @@ impl AmdEngine {
             trace_write_bytes: Cell::new(0),
             k_prefill,
             k_decode,
+            k_kda_decode_fused,
             k_xaudit,
             k_state_clear,
             k_token_capture,
@@ -6345,6 +6972,62 @@ impl AmdEngine {
         Ok(())
     }
 
+    /// Number of ordered launches in a decode program. A fused boundary is one raw launch;
+    /// every other wave segment is one interpreter launch. L2-domain windows are drained
+    /// concurrently by one interpreter launch and must never be treated as host segments.
+    pub(crate) fn decode_launches(&self, p: usize) -> usize {
+        self.prog_dispatch(p).launches()
+    }
+
+    /// Enqueue one ordered decode segment without rearming or draining.
+    pub(crate) fn enqueue_decode_segment(
+        &mut self,
+        p: usize,
+        seg: usize,
+        interpreter: HsaKernel,
+    ) -> Result<()> {
+        self.trace_write_bytes
+            .set(self.progs[p].trace_records * TRACE_REC_BYTES);
+        let route = *self.progs[p].decode_routes.get(seg).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "decode segment {seg} is outside {} segments for program {p}",
+                self.progs[p].decode_routes.len()
+            ))
+        })?;
+        match route {
+            DecodeSegmentRoute::Interpreter => {
+                let arg = self.kernarg(p, seg as u32);
+                EngineDevice::launch_cooperative(
+                    &*self.be,
+                    interpreter,
+                    self.n_cu,
+                    WG_THREADS_8,
+                    0,
+                    kernarg_bytes(&arg),
+                    None,
+                )?;
+            }
+            DecodeSegmentRoute::KdaDecodeFused(args) => {
+                let kernel = self.k_kda_decode_fused.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "KdaDecodeFused segment has no validated standalone object".into(),
+                    )
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    args.rows * args.heads,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+            }
+        }
+        self.seg_launches += 1;
+        Ok(())
+    }
+
     /// Enqueue the single-launch (decode) dispatch of program `p`. No drain.
     ///
     /// Split out of [`AmdEngine::run`] so a TP driver can launch EVERY rank
@@ -6562,6 +7245,27 @@ impl AmdEngine {
     /// before dispatch N is even staged.
     pub fn run(&mut self, p: usize, k: HsaKernel) -> Result<()> {
         use crate::obs::dstep;
+        if requires_segmented_decode(&self.progs[p].decode_routes) {
+            if !ctr_dbuf() {
+                dstep::timed(&dstep::REARM, || self.rearm(p))?;
+            }
+            let t0 = std::time::Instant::now();
+            let n = self.decode_launches(p);
+            dstep::timed(&dstep::ENQUEUE, || {
+                for seg in 0..n {
+                    self.enqueue_decode_segment(p, seg, k)?;
+                }
+                Ok(())
+            })?;
+            if ctr_dbuf() {
+                let cur = self.progs[p].bank.current();
+                dstep::timed(&dstep::REARM, || self.rearm_bank(p, 1 - cur))?;
+                self.progs[p].bank.select_rearmed_inactive();
+            }
+            dstep::timed(&dstep::DRAIN, || self.drain())?;
+            self.seg_drain_us += t0.elapsed().as_secs_f64() * 1e6;
+            return Ok(());
+        }
         if !ctr_dbuf() {
             dstep::timed(&dstep::REARM, || self.rearm(p))?;
         }
@@ -7914,6 +8618,292 @@ fn kernarg_bytes(p: &DevProgram) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn specialised_amd_object_pairing_is_fail_closed() {
+        let object = Path::new("interp_decode.elf");
+        assert!(validate_packet_pairing_stamp(None, None, None, object).is_ok());
+        assert!(validate_packet_pairing_stamp(Some(1), None, Some(1), object).is_err());
+        assert!(validate_packet_pairing_stamp(Some(1), Some(2), None, object).is_err());
+        assert!(validate_packet_pairing_stamp(
+            Some(1),
+            Some(2),
+            Some(0x0000_0002_0000_0001),
+            object
+        )
+        .is_ok());
+        let err =
+            validate_packet_pairing_stamp(Some(1), Some(2), Some(0x0000_0003_0000_0001), object)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("packet/object MISMATCH"));
+    }
+
+    #[test]
+    fn pairing_stamp_is_read_from_elf_data() {
+        let mut elf = vec![0u8; 0x304];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[0x28..0x30].copy_from_slice(&0x100u64.to_le_bytes());
+        elf[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes());
+        elf[0x3c..0x3e].copy_from_slice(&4u16.to_le_bytes());
+
+        let symtab = 0x100 + 64;
+        elf[symtab + 4..symtab + 8].copy_from_slice(&2u32.to_le_bytes());
+        elf[symtab + 24..symtab + 32].copy_from_slice(&0x200u64.to_le_bytes());
+        elf[symtab + 32..symtab + 40].copy_from_slice(&48u64.to_le_bytes());
+        elf[symtab + 40..symtab + 44].copy_from_slice(&2u32.to_le_bytes());
+        elf[symtab + 56..symtab + 64].copy_from_slice(&24u64.to_le_bytes());
+
+        let strtab = 0x100 + 128;
+        elf[strtab + 4..strtab + 8].copy_from_slice(&3u32.to_le_bytes());
+        elf[strtab + 24..strtab + 32].copy_from_slice(&0x280u64.to_le_bytes());
+        elf[strtab + 32..strtab + 40].copy_from_slice(&32u64.to_le_bytes());
+
+        let data = 0x100 + 192;
+        elf[data + 4..data + 8].copy_from_slice(&1u32.to_le_bytes());
+        elf[data + 16..data + 24].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[data + 24..data + 32].copy_from_slice(&0x300u64.to_le_bytes());
+        elf[data + 32..data + 40].copy_from_slice(&4u64.to_le_bytes());
+
+        let symbol = 0x200 + 24;
+        elf[symbol..symbol + 4].copy_from_slice(&1u32.to_le_bytes());
+        elf[symbol + 6..symbol + 8].copy_from_slice(&3u16.to_le_bytes());
+        elf[symbol + 8..symbol + 16].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[symbol + 16..symbol + 24].copy_from_slice(&4u64.to_le_bytes());
+        elf[0x281..0x295].copy_from_slice(b"plow_packet_hash_lo\0");
+        elf[0x300..0x304].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+
+        assert_eq!(
+            elf_symbol_u32(&elf, "plow_packet_hash_lo"),
+            Some(0x1234_5678)
+        );
+        assert_eq!(elf_symbol_u32(&elf, "plow_packet_hash_hi"), None);
+    }
+
+    #[test]
+    fn required_compiled_opcode_markers_are_fail_closed() {
+        let path = Path::new("interp_decode_k3.elf");
+        assert!(check_compiled_opcode_marker_set(
+            &["plow_opcode_attn_res_1"],
+            path,
+            [DevOp::AttnRes]
+        )
+        .is_ok());
+        for &(op, marker) in COMPILED_OPCODE_MARKERS {
+            let err = check_compiled_opcode_marker_set(&[], path, [op])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(marker), "{op:?} must require {marker}: {err}");
+            assert!(check_compiled_opcode_marker_set(&[marker], path, [op]).is_ok());
+        }
+    }
+
+    #[test]
+    fn specialised_amd_manifest_hash_must_be_valid() {
+        let path = Path::new("build.json");
+        assert_eq!(
+            manifest_pairing_hash(br#"{"pairing":{"hash":"0x1234"}}"#, path).unwrap(),
+            0x1234
+        );
+        assert!(manifest_pairing_hash(br#"{"pairing":{}}"#, path).is_err());
+    }
+
+    fn segmented_decode_probe() -> DevProg {
+        let insts = vec![
+            DevInst64 {
+                op: DevOp::Nop as u16,
+                blocks: 1,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::KdaDecodeFused as u16,
+                blocks: 12,
+                i: [1, 12, 128, 8, 4, 1, 1, 2],
+                fj: [
+                    0.08838835f32.to_bits(),
+                    (-5.0f32).to_bits(),
+                    1.0e-5f32.to_bits(),
+                ],
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::Nop as u16,
+                blocks: 1,
+                ..Default::default()
+            },
+        ];
+        DevProg {
+            t: 1,
+            n_counter: 0,
+            insts,
+            stream: (0..3)
+                .map(|seg| packet::dev::StreamEnt {
+                    inst: seg,
+                    seg: seg as u16,
+                    ..Default::default()
+                })
+                .collect(),
+            stream_ofs: vec![0],
+            stream_len: vec![3],
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        }
+    }
+
+    #[test]
+    fn fused_decode_segment_is_a_pure_ordered_single_rank_route() {
+        let p = segmented_decode_probe();
+        assert_eq!(
+            decode_segment_kinds(&p).unwrap(),
+            [
+                DecodeSegmentKind::Interpreter,
+                DecodeSegmentKind::KdaDecodeFused(1),
+                DecodeSegmentKind::Interpreter,
+            ]
+        );
+        validate_decode_dispatch(&[p], 0).unwrap();
+    }
+
+    #[test]
+    fn fused_decode_rejects_one_raw_instruction_in_multiple_segments() {
+        let mut p = segmented_decode_probe();
+        p.stream.push(packet::dev::StreamEnt {
+            inst: 1,
+            seg: 3,
+            ..Default::default()
+        });
+        p.stream_len[0] += 1;
+        let err = decode_segment_kinds(&p)
+            .expect_err("a stateful raw instruction must execute in one segment")
+            .to_string();
+        assert!(err.contains("segments 1 and 3"), "{err}");
+    }
+
+    #[test]
+    fn fused_decode_v1_descriptor_fails_closed() {
+        let mut p = segmented_decode_probe();
+        p.insts[1].i[7] = 1;
+        let err = kda_decode_fused_routes(&p, &[], &[], &[])
+            .expect_err("KDA fused ABI v1 must not route to the v2 object")
+            .to_string();
+        assert!(err.contains("version=1"), "{err}");
+    }
+
+    #[test]
+    fn fused_decode_descriptor_builds_the_exact_raw_kernarg() {
+        let mut p = segmented_decode_probe();
+        p.insts[1].t = [0, 1, 2, 3, 4, 5, 6, 7];
+        let handles = [
+            8u32,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            packet::dev::TENSOR_NONE_I,
+        ];
+        let init: Vec<u8> = handles.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let tensors: Vec<crate::asset::devblob::DevTensor> = (0..18)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: if i == 7 { 44 } else { 1 << 20 },
+                init: (i == 7).then_some(0..44),
+            })
+            .collect();
+        let devp: Vec<DeviceMem> = (0..18)
+            .map(|i| DeviceMem::view(0x1000 + i * 0x1000, 1 << 20))
+            .collect();
+        let routes = kda_decode_fused_routes(&p, &tensors, &init, &devp).unwrap();
+        let DecodeSegmentRoute::KdaDecodeFused(a) = routes[1] else {
+            panic!("segment 1 must route to the raw object")
+        };
+        assert_eq!(
+            (a.y, a.q_raw, a.k_raw, a.v_raw),
+            (0x1000, 0x2000, 0x3000, 0x4000)
+        );
+        assert_eq!((a.wq, a.wk, a.wv), (0x9000, 0xa000, 0xb000));
+        assert_eq!((a.csq, a.csk, a.csv), (0xc000, 0xd000, 0xe000));
+        assert_eq!(
+            (a.forget_raw, a.beta_raw, a.state),
+            (0x5000, 0x6000, 0x7000)
+        );
+        assert_eq!((a.a_log, a.dt_bias, a.norm_w), (0xf000, 0x10000, 0x11000));
+        assert_eq!(a.output_gate_raw, 0x12000);
+        assert_eq!(a.parked, 0);
+        assert_eq!((a.rows, a.heads, a.dim, a.bv, a.conv_w), (1, 12, 128, 8, 4));
+        assert_eq!((a.flags, a.gate_mode), (1, 1));
+        assert_eq!(
+            (a.lower_bound, a.scale, a.norm_eps),
+            (-5.0, 0.08838835, 1.0e-5)
+        );
+        assert_eq!(as_bytes(std::slice::from_ref(&a)).len(), 184);
+    }
+
+    #[test]
+    fn fused_decode_refuses_mixed_countered_and_l2_segments() {
+        let mut mixed = segmented_decode_probe();
+        mixed.stream.push(packet::dev::StreamEnt {
+            inst: 0,
+            seg: 1,
+            ..Default::default()
+        });
+        mixed.stream_len[0] += 1;
+        assert!(decode_segment_kinds(&mixed)
+            .unwrap_err()
+            .to_string()
+            .contains("mixes KdaDecodeFused"));
+
+        let mut countered = segmented_decode_probe();
+        countered.stream[1].succ_len = 1;
+        countered.succs.push(0);
+        assert!(decode_segment_kinds(&countered)
+            .unwrap_err()
+            .to_string()
+            .contains("counter obligations"));
+
+        let mut crossing = segmented_decode_probe();
+        crossing.stream[0].succ_len = 1;
+        crossing.succs.push(7);
+        crossing.stream[2].wait_len = 1;
+        crossing.waits.push(packet::dev::Wait {
+            id: 7,
+            threshold: 1,
+        });
+        assert!(decode_segment_kinds(&crossing)
+            .unwrap_err()
+            .to_string()
+            .contains("crosses into segment"));
+
+        let mut placed = segmented_decode_probe();
+        placed.l2_domains = 8;
+        assert!(validate_decode_dispatch(&[placed], 0)
+            .unwrap_err()
+            .to_string()
+            .contains("L2-domain placement"));
+    }
+
+    #[test]
+    fn ordinary_l2_decode_allows_cross_domain_counters() {
+        let mut placed = segmented_prog(&[DevOp::Gemv, DevOp::RmsNorm], &[0, 1]);
+        placed.l2_domains = 2;
+        placed.stream[0].succ_len = 1;
+        placed.succs.push(7);
+        placed.stream[1].wait_len = 1;
+        placed.waits.push(packet::dev::Wait {
+            id: 7,
+            threshold: 1,
+        });
+
+        assert!(decode_segment_kinds(&placed).is_ok());
+        assert!(validate_decode_dispatch(&[placed], 0).is_ok());
+    }
 
     fn overlap_range(name: &str, start: u64, end: u64) -> AmdOwnedRange {
         AmdOwnedRange {

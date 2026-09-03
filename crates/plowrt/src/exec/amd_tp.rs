@@ -17,10 +17,14 @@
 //!
 //! # Decode and prefill do NOT have the same shape
 //!
-//! Decode is one dispatch per rank, so "launch all, drain all" is the whole
-//! story. Wave-class prefill is SEGMENTED, and there the obvious
-//! generalisation — let each rank enqueue all of its segments, then drain
-//! everyone — is wrong.
+//! Decode normally is one dispatch per rank, so "launch all, drain all" is the whole story.
+//! The narrow standalone-raw decode path is segmented: its first segment is launched on every
+//! rank before any later segment is submitted, later launches are enqueued segment-major across
+//! ranks, and every rank's queue preserves that identical order. The raw segment has no local or
+//! cross-rank counter obligations; interpreter collectives retain distinct cross-rank gates, and
+//! the exact cross-rank counter audit remains mandatory every token. A 64-step TP8 stress run on
+//! 2026-09-03 passed that audit and all-rank token agreement. This exception does not generalise
+//! to wave-class prefill, where letting each rank enqueue all segments before draining is wrong.
 //! `runtime/tests/tp_decode.c` records the failure verbatim:
 //!
 //! > Per-rank-all-segments let the ranks desync — a lagging rank made peers time
@@ -212,6 +216,10 @@ fn agreement_due(tick: &mut u32, every: u32) -> bool {
 
 fn deferred_capture_saves_readback(agree_every: u32) -> bool {
     agree_every > 1
+}
+
+fn segment_major_order(n_segments: usize, n_ranks: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..n_segments).flat_map(move |seg| (0..n_ranks).map(move |rank| (seg, rank)))
 }
 
 /// N co-resident ranks of one sharded model.
@@ -757,6 +765,17 @@ impl AmdTpGroup {
         // dates the boundary exactly and leaves the ordering discipline in the
         // one place that owns it.
         let ranks = &mut self.ranks;
+        let n_ranks = ranks.len();
+        let n_segments = ranks[0].decode_launches(dp);
+        if let Some(rank) = ranks
+            .iter()
+            .position(|e| e.decode_launches(dp) != n_segments)
+        {
+            return Err(RuntimeError::Device(format!(
+                "rank {rank} program {dp} has {} decode segments, rank 0 has {n_segments}",
+                ranks[rank].decode_launches(dp)
+            )));
+        }
         let mut i = 0usize;
         let t0 = dstep::on().then(std::time::Instant::now);
         let mut launched_at: Option<std::time::Instant> = None;
@@ -769,8 +788,17 @@ impl AmdTpGroup {
             let e = &mut ranks[i];
             let k = e.decode_kernel_for(dp);
             i += 1;
-            e.enqueue(dp, k)
+            e.enqueue_decode_segment(dp, 0, k)
         })?;
+        // Segment-major, all ranks, with no intermediate drain. `launch_token` submitted segment
+        // zero on every rank first; then each rank's AQL barrier packets preserve the same local
+        // segment order. Raw routes have no counter obligations, interpreter collectives retain
+        // distinct xctr gates, and the mandatory per-token audit detects a deadline bail.
+        for (seg, rank) in segment_major_order(n_segments, n_ranks).skip(n_ranks) {
+            let e = &mut ranks[rank];
+            let k = e.decode_kernel_for(dp);
+            e.enqueue_decode_segment(dp, seg, k)?;
+        }
         if let Some(z) = launched_at {
             dstep::ENQUEUE.add(z.elapsed().as_nanos() as u64);
         }
@@ -1473,12 +1501,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decode_segments_enqueue_segment_major_across_tp_ranks() {
+        assert_eq!(
+            segment_major_order(3, 4).collect::<Vec<_>>(),
+            [
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (1, 0),
+                (1, 1),
+                (1, 2),
+                (1, 3),
+                (2, 0),
+                (2, 1),
+                (2, 2),
+                (2, 3),
+            ]
+        );
+    }
+
+    #[test]
     fn l2_domains_are_one_tp_launch_not_wave_segments() {
         use crate::exec::amd::ProgramDispatch;
 
         let placed = ProgramDispatch::classify(8, 8);
         assert_eq!(placed, ProgramDispatch::L2Domains(8));
         assert_eq!(placed.launches(), 1);
+        assert_eq!(
+            segment_major_order(placed.launches(), 8).collect::<Vec<_>>(),
+            (0..8).map(|rank| (0, rank)).collect::<Vec<_>>()
+        );
 
         let segmented = ProgramDispatch::classify(0, 3);
         assert_eq!(segmented, ProgramDispatch::WaveSegments(3));
