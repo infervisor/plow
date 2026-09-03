@@ -1,14 +1,11 @@
 # class	path	binding	disposition
-correctness	scripts/gate_batched.sh	checkpoint	Retain until production diagnostics expose per-slot token streams.
 synthetic-probe	scripts/glm52_block_sweep_gfx942.sh	synthetic	Unbound truncated-model comparator migrated to amd-probe; production sweep requires checkpoint-bound assets, so semantics do not match.
 performance	scripts/glm52_glusplit_run.sh	checkpoint	Legacy same-object A/B plus TP identity; separate blob/object inputs have no exact bench equivalent.
 performance	scripts/glm52_linfp8_run.sh	checkpoint	Legacy same-object A/B plus TP identity; separate blob/object inputs have no exact bench equivalent.
 TP-audit	scripts/glm52_linfp8_stacked_coherence.sh	checkpoint	Retain for explicit cross-rank agreement and diagnostic output.
 performance	scripts/glm52_linfp8_stacked_run.sh	checkpoint	Legacy same-object A/B plus TP identity; separate blob/object inputs have no exact bench equivalent.
-correctness	scripts/k3_batch_gate.sh	checkpoint	Retain for per-slot streams across compiled batch widths.
 performance	scripts/k3_block_sweep.sh	checkpoint	Truncated-model context sweep with real weights; never use as served-model performance.
 TP-audit	scripts/k3_tp_equivalence.sh	checkpoint	Retain for full-logit TP equivalence dumps.
-synthetic-probe	scripts/l1_ab.sh	synthetic	Unbound packet/object kernel A/B migrated to amd-probe; never use as served-model performance.
-performance	scripts/l2_place_ab.sh	checkpoint	Legacy packet/object scheduling A/B with an identity gate; never use as served-model performance.
+synthetic-probe	scripts/l1_ab.sh	synthetic	Unbound packet/kernel A/B migrated to amd-probe; never use as served-model performance.
 performance	scripts/sweep_batch_ceiling.sh	checkpoint	Compiled-width ceiling with real weights; production concurrency is not equivalent to --batched.
 performance	scripts/walk_b16_ab.sh	checkpoint	Legacy compiled-width packet/object A/B with per-slot correctness output.

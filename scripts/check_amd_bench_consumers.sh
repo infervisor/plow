@@ -11,9 +11,12 @@ declare -A legacy_performance=(
   [scripts/glm52_linfp8_run.sh]=1
   [scripts/glm52_linfp8_stacked_run.sh]=1
   [scripts/k3_block_sweep.sh]=1
-  [scripts/l2_place_ab.sh]=1
   [scripts/sweep_batch_ceiling.sh]=1
   [scripts/walk_b16_ab.sh]=1
+)
+declare -A migrated_batch_gates=(
+  [scripts/gate_batched.sh]=1
+  [scripts/k3_batch_gate.sh]=1
 )
 while IFS=$'\t' read -r class path binding disposition; do
   [[ -z "$class" || "$class" == \#* ]] && continue
@@ -81,5 +84,20 @@ for path in "${!legacy_performance[@]}"; do
     exit 1
   }
 done
+
+for path in "${!migrated_batch_gates[@]}"; do
+  for flag in bench --prompt-rows --token-audit --engine-diagnostics; do
+    rg -q -- "$flag" "$ROOT/$path" || {
+      echo "FAIL: migrated production batch gate lost '$flag': $path" >&2
+      exit 1
+    }
+  done
+  awk '$0 !~ /^[[:space:]]*#/ && /amd-bench/ { found=1 } END { exit found }' "$ROOT/$path" || {
+    echo "FAIL: migrated production batch gate regressed to amd-bench: $path" >&2
+    exit 1
+  }
+done
+
+"$ROOT/scripts/batch_gates_selftest.sh"
 
 echo "PASS: ${#observed[@]} active AMD direct-runner script consumers are classified"
