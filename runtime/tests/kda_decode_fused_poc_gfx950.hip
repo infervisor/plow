@@ -17,11 +17,10 @@ struct KdaFusedArgs {
 };
 
 template <unsigned PL>
-__device__ __forceinline__ void kda_decode_fused_body(KdaFusedArgs* a) {
+__device__ __forceinline__ void kda_decode_fused_body(KdaFusedArgs* a, float* shared) {
     if (!a->B || !a->H || a->D != PL * PLOW_WAVE || !a->W || a->W > 8)
         __builtin_trap();
     const unsigned tid = threadIdx.x, lane = tid & 63u, wave = tid >> 6;
-    __shared__ float shared[5 * 256 + PLOW_WAVES];
     float* q = shared;
     float* k = q + a->D;
     float* g = k + a->D;
@@ -135,9 +134,10 @@ __device__ __forceinline__ void kda_decode_fused_body(KdaFusedArgs* a) {
 }
 
 extern "C" __global__ __launch_bounds__(256, 2) void kda_decode_fused_poc(KdaFusedArgs* a) {
-    if (a->D == 64) kda_decode_fused_body<1>(a);
-    else if (a->D == 128) kda_decode_fused_body<2>(a);
-    else if (a->D == 256) kda_decode_fused_body<4>(a);
+    __shared__ float shared[5 * 256 + PLOW_WAVES];
+    if (a->D == 64) kda_decode_fused_body<1>(a, shared);
+    else if (a->D == 128) kda_decode_fused_body<2>(a, shared);
+    else if (a->D == 256) kda_decode_fused_body<4>(a, shared);
     else __builtin_trap();
 }
 
