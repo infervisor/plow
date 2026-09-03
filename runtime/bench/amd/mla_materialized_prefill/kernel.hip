@@ -282,11 +282,51 @@ extern "C" __global__ void k_init_materialize(
     const size_t kw = (size_t)n_head * (DV_MAT * 2) * DK_ABS;
     const size_t aw = (size_t)n_head * DK_ABS * 1536;
     const size_t rw = (size_t)n_head * DR * 1536;
-    for (size_t e = i; e < qn; e += stride) q_lat[e] = (bf16)((int)(e % 17) - 8) / 64.0f;
-    for (size_t e = i; e < qw; e += stride) q_weight[e] = (bf16)((int)(e % 13) - 6) / 128.0f;
-    for (size_t e = i; e < kw; e += stride) kv_weight[e] = (bf16)((int)(e % 11) - 5) / 128.0f;
-    for (size_t e = i; e < aw; e += stride) q_abs_weight[e] = (bf16)((int)(e % 19) - 9) / 128.0f;
-    for (size_t e = i; e < rw; e += stride) q_rope_weight[e] = (bf16)((int)(e % 23) - 11) / 128.0f;
+    for (size_t e = i; e < qn; e += stride)
+        q_lat[e] = f2bf((float)((int)(e % 17) - 8) / 64.0f);
+    for (size_t e = i; e < qw; e += stride)
+        q_weight[e] = f2bf((float)((int)(e % 13) - 6) / 128.0f);
+    for (size_t e = i; e < kw; e += stride)
+        kv_weight[e] = f2bf((float)((int)(e % 11) - 5) / 128.0f);
+    for (size_t e = i; e < aw; e += stride)
+        q_abs_weight[e] = f2bf((float)((int)(e % 19) - 9) / 128.0f);
+    for (size_t e = i; e < rw; e += stride)
+        q_rope_weight[e] = f2bf((float)((int)(e % 23) - 11) / 128.0f);
+}
+
+extern "C" __global__ void k_derive_absorbed_weights(
+    bf16* q_abs_weight, bf16* q_rope_weight, bf16* wuv,
+    const bf16* q_weight, const bf16* kv_weight, unsigned n_head) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    const size_t q_abs_n = (size_t)n_head * DK_ABS * 1536;
+    for (size_t e = i; e < q_abs_n; e += stride) {
+        const unsigned l = e % 1536;
+        const unsigned k = (e / 1536) % DK_ABS;
+        const unsigned h = e / ((size_t)DK_ABS * 1536);
+        float acc = 0.0f;
+#pragma unroll 8
+        for (unsigned p = 0; p < DV_MAT; ++p) {
+            const float kw = bf2f(kv_weight[((size_t)h * (DV_MAT * 2) + p) * DK_ABS + k]);
+            const float qw = bf2f(q_weight[((size_t)h * DK_MAT + p) * 1536 + l]);
+            acc = fmaf(kw, qw, acc);
+        }
+        q_abs_weight[e] = f2bf(acc);
+    }
+    const size_t q_rope_n = (size_t)n_head * DR * 1536;
+    for (size_t e = i; e < q_rope_n; e += stride) {
+        const unsigned l = e % 1536;
+        const unsigned r = (e / 1536) % DR;
+        const unsigned h = e / ((size_t)DR * 1536);
+        q_rope_weight[e] = q_weight[((size_t)h * DK_MAT + DV_MAT + r) * 1536 + l];
+    }
+    const size_t wuv_n = (size_t)n_head * DK_ABS * DV_MAT;
+    for (size_t e = i; e < wuv_n; e += stride) {
+        const unsigned v = e % DV_MAT;
+        const unsigned k = (e / DV_MAT) % DK_ABS;
+        const unsigned h = e / ((size_t)DK_ABS * DV_MAT);
+        wuv[e] = kv_weight[((size_t)h * (DV_MAT * 2) + DV_MAT + v) * DK_ABS + k];
+    }
 }
 
 extern "C" __global__ void k_make_inputs(

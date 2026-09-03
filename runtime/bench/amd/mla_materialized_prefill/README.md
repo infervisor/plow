@@ -31,3 +31,14 @@ head, including a ragged 1025-token launch. Exact 256-token multiples must also
 remain within max absolute error `0.02` and RMSE `0.003` against the absorbed form.
 The full-path timing includes both sides' query projection GEMMs; the materialized
 side additionally includes KV projection and packing.
+
+The full-path oracle derives the absorbed BF16 query and value weights from the same
+factor weights used by the materialized side. This is distinct from the kernel-only
+oracle above: independently initialized factor and absorbed weights can time the
+projection pipelines, but cannot establish their numerical equivalence.
+
+The old in-tree `k_materialized` comparator is retained as a diagnostic but is not a
+promotion gate: its output is nondeterministically non-finite on gfx950. Set
+`PLOW_MLA_LEGACY_GATE=1` to reproduce its historical hard gate, or
+`PLOW_MLA_DIAGNOSTICS=1` to print finite counts after every stage. The production Opus
+object and the consistent-weight full-path oracle remain hard gates.

@@ -561,6 +561,15 @@ pub struct AmdRuntimeConfig {
     )]
     pub snap_slot: usize,
 
+    /// One-shot rank-0 tensor capture after an exact TP prefill segment drain.
+    #[arg(
+        long = "amd-pf-capture",
+        env = "PLOW_PF_CAPTURE",
+        hide = true,
+        global = true
+    )]
+    pub pf_capture: Option<String>,
+
     /// Additional decode-object tiers: `dir:max[,dir:max]`, or one legacy dir.
     #[arg(long = "amd-hsaco-lowrung", env = "PLOW_HSACO_LOWRUNG", global = true)]
     pub hsaco_lowrung: Option<String>,

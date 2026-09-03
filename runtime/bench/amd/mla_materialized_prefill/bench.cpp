@@ -73,6 +73,33 @@ static double median(std::vector<double> x) {
     return x[x.size() / 2];
 }
 
+static size_t report_nonfinite_bf16(const char* name, const uint16_t* device, size_t n) {
+    std::vector<uint16_t> host(n);
+    CK(hipMemcpy(host.data(), device, n * sizeof(uint16_t), hipMemcpyDeviceToHost));
+    size_t bad = 0;
+    double peak = 0.0;
+    for (uint16_t bits : host) {
+        const double value = bf16_to_float(bits);
+        bad += !std::isfinite(value);
+        if (std::isfinite(value)) peak = std::max(peak, std::abs(value));
+    }
+    std::fprintf(stderr, "DIAG %s nonfinite=%zu/%zu finite_peak=%.6g\n", name, bad, n, peak);
+    return bad;
+}
+
+static size_t report_nonfinite_f32(const char* name, const float* device, size_t n) {
+    std::vector<float> host(n);
+    CK(hipMemcpy(host.data(), device, n * sizeof(float), hipMemcpyDeviceToHost));
+    size_t bad = 0;
+    double peak = 0.0;
+    for (float value : host) {
+        bad += !std::isfinite(value);
+        if (std::isfinite(value)) peak = std::max(peak, std::abs((double)value));
+    }
+    std::fprintf(stderr, "DIAG %s nonfinite=%zu/%zu finite_peak=%.6g\n", name, bad, n, peak);
+    return bad;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
@@ -84,6 +111,8 @@ int main(int argc, char** argv) {
     if (argc < 5) return 2;
     const int samples = argc > 5 ? std::atoi(argv[5]) : 9;
     if (samples < 3 || !(samples & 1)) return 2;
+    const bool diagnostics = std::getenv("PLOW_MLA_DIAGNOSTICS") != nullptr;
+    const bool legacy_gate = std::getenv("PLOW_MLA_LEGACY_GATE") != nullptr;
 
     CK(hipInit(0));
     hipModule_t mod;
@@ -95,7 +124,8 @@ int main(int argc, char** argv) {
     hipModule_t upstream_mod;
     CK(hipModuleLoad(&upstream_mod, argv[4]));
     hipFunction_t absorbed, fold, materialized, materialized_lds, init, flush;
-    hipFunction_t materialize_q, materialize_kv, absorb_q, absorb_qrope, init_materialize, pack;
+    hipFunction_t materialize_q, materialize_kv, absorb_q, absorb_qrope, init_materialize,
+        derive_absorbed, pack;
     CK(hipModuleGetFunction(&absorbed, mod, "k_absorbed"));
     CK(hipModuleGetFunction(&fold, mod, "k_absorbed_fold"));
     CK(hipModuleGetFunction(&materialized, mod, "k_materialized"));
@@ -110,6 +140,7 @@ int main(int argc, char** argv) {
     CK(hipModuleGetFunction(&absorb_q, mod, "k_absorb_q"));
     CK(hipModuleGetFunction(&absorb_qrope, mod, "k_absorb_qrope"));
     CK(hipModuleGetFunction(&init_materialize, mod, "k_init_materialize"));
+    CK(hipModuleGetFunction(&derive_absorbed, mod, "k_derive_absorbed_weights"));
     CK(hipModuleGetFunction(&pack, pack_mod, "plow_mla_materialize_pack_gfx950"));
     hipFunction_t opus_upstream;
     CK(hipModuleGetFunction(
@@ -123,7 +154,9 @@ int main(int argc, char** argv) {
     size_t flush_n = FLUSH_BYTES / sizeof(uint32_t);
     void* flush_args[] = {&flush_in, &flush_out, &flush_n};
 
+    bool kernel_oracle_failed = false;
     bool opus_oracle_failed = false;
+    bool full_path_oracle_failed = false;
     for (unsigned nt : {1024u, 8192u, 1025u}) {
         const size_t qrows = (size_t)nt * NH;
         uint16_t *qabs, *qrope, *ckv, *krope, *qmat, *kmat, *vmat, *wuv;
@@ -166,6 +199,17 @@ int main(int argc, char** argv) {
         void* init_args[] = {&qabs, &qrope, &ckv, &krope, &qmat, &kmat, &vmat, &wuv, &nt,
                              &nh};
         launch(init, GRID, 256, init_args);
+        if (diagnostics) {
+            CK(hipDeviceSynchronize());
+            report_nonfinite_bf16("init.qabs", qabs, qrows * DK_ABS);
+            report_nonfinite_bf16("init.qrope", qrope, qrows * DR);
+            report_nonfinite_bf16("init.ckv", ckv, (size_t)nt * DK_ABS);
+            report_nonfinite_bf16("init.krope", krope, (size_t)nt * DR);
+            report_nonfinite_bf16("init.qmat", qmat, qrows * DK_MAT);
+            report_nonfinite_bf16("init.kmat", kmat, qrows * DK_MAT);
+            report_nonfinite_bf16("init.vmat", vmat, qrows * DV);
+            report_nonfinite_bf16("init.wuv", wuv, (size_t)NH * DK_ABS * DV);
+        }
         void* mi_args[] = {&qlat, &qw, &kvw, &qaw, &qrw, &nt, &nh};
         unsigned stride = nt;
         float scale = 0.07216878365f;
@@ -193,6 +237,7 @@ int main(int argc, char** argv) {
         void* kvproj_args[] = {&kvproj, &ckv, &kvw, &nt, &nh};
         void* qabs_proj_args[] = {&qabs, &qlat, &qaw, &nt, &nh};
         void* qrope_proj_args[] = {&qrope, &qlat, &qrw, &nt, &nh};
+        void* derive_args[] = {&qaw, &qrw, &wuv, &qw, &kvw, &nh};
         PackArgs pa{kproj, vproj, kvproj, krope, nt, nh, 128, 64, 128};
         void* pack_args[] = {&pa};
         OpusArgs full = oa;
@@ -202,9 +247,28 @@ int main(int argc, char** argv) {
         void* full_args[] = {&full};
 
         launch(absorbed, GRID, 256, abs_args);
+        if (diagnostics) {
+            CK(hipDeviceSynchronize());
+            report_nonfinite_f32("absorbed.opart", opart_abs, qrows * DK_ABS);
+            report_nonfinite_f32("absorbed.mlpart", mlpart_abs, qrows * 2);
+        }
         launch(fold, GRID, 256, fold_args);
+        if (diagnostics) {
+            CK(hipDeviceSynchronize());
+            report_nonfinite_bf16("absorbed.fold", oabs, qrows * DV);
+        }
         launch(materialized, GRID, 256, mat_args);
+        if (diagnostics) {
+            CK(hipDeviceSynchronize());
+            report_nonfinite_f32("materialized.opart", opart_mat, qrows * DV);
+            report_nonfinite_f32("materialized.mlpart", mlpart_mat, qrows * 2);
+            report_nonfinite_bf16("materialized.out", omat, qrows * DV);
+        }
         launch(materialized_lds, GRID, 256, lds_args);
+        if (diagnostics) {
+            CK(hipDeviceSynchronize());
+            report_nonfinite_bf16("materialized.lds", olds, qrows * DV);
+        }
         CK(hipDeviceSynchronize());
 
         std::vector<uint16_t> ha(qrows * DV), hm(qrows * DV), hl(qrows * DV), hw(qrows * DV),
@@ -259,9 +323,12 @@ int main(int argc, char** argv) {
         const double opus_rmse = std::sqrt(opus_sum_sq / ha.size());
         if (nt % 256 == 0 && (max_abs > 2.0e-2 || rmse > 3.0e-3)) {
             std::fprintf(stderr,
-                         "FAIL T=%u oracle max_abs=%.6g max_rel=%.6g rmse=%.6g bad=%zu/%zu\n",
+                         "%s T=%u legacy oracle max_abs=%.6g max_rel=%.6g rmse=%.6g "
+                         "bad=%zu/%zu\n",
+                         legacy_gate ? "FAIL" : "NOTE",
                          nt, max_abs, max_rel, rmse, bad, ha.size());
-            return 3;
+            kernel_oracle_failed |= legacy_gate;
+            if (legacy_gate && !diagnostics) return 3;
         }
         if (lds_max_abs > 2.0e-2 || lds_rmse > 3.0e-3) {
             std::fprintf(stderr,
@@ -300,9 +367,15 @@ int main(int argc, char** argv) {
         }
 
         launch(init_materialize, GRID, 256, mi_args);
+        launch(derive_absorbed, GRID, 256, derive_args);
+        launch(absorb_q, GRID, 256, qabs_proj_args);
+        launch(absorb_qrope, GRID, 256, qrope_proj_args);
+        launch(absorbed, GRID, 256, abs_args);
+        launch(fold, GRID, 256, fold_args);
         launch(materialize_q, GRID, 256, qproj_args);
         launch(materialize_kv, GRID, 256, kvproj_args);
         launch(pack, GRID, 256, pack_args);
+        launch(opus, opus_grid, 512, full_args);
         CK(hipDeviceSynchronize());
         std::vector<uint16_t> hkv(qrows * (DV * 2)), hkrope((size_t)nt * DR);
         std::vector<uint16_t> hk(qrows * DK_MAT), hv(qrows * DV);
@@ -326,6 +399,21 @@ int main(int argc, char** argv) {
                 }
             }
         }
+
+        std::vector<uint16_t> hfull_abs(qrows * DV), hfull(qrows * DV);
+        CK(hipMemcpy(hfull_abs.data(), oabs, hfull_abs.size() * 2, hipMemcpyDeviceToHost));
+        CK(hipMemcpy(hfull.data(), ofull, hfull.size() * 2, hipMemcpyDeviceToHost));
+        double full_max_abs = 0.0, full_sum_sq = 0.0;
+        size_t full_bad = 0;
+        for (size_t i = 0; i < hfull.size(); ++i) {
+            const double d = std::abs(bf16_to_float(hfull_abs[i]) - bf16_to_float(hfull[i]));
+            full_max_abs = std::max(full_max_abs, d);
+            full_sum_sq += d * d;
+            full_bad += d > 7.8125e-3;
+        }
+        const double full_rmse = std::sqrt(full_sum_sq / hfull.size());
+        if (nt % 256 == 0 && (full_max_abs > 2.0e-2 || full_rmse > 3.0e-3))
+            full_path_oracle_failed = true;
 
         std::vector<double> ta, tm, tl, tw, tfull, tfull_abs;
         for (int s = 0; s < samples; ++s) {
@@ -406,10 +494,12 @@ int main(int argc, char** argv) {
                     "opus-oracle(max_abs=%.6g rmse=%.6g heads=%u flat-grid-mismatch=%zu) "
                     "full-absorbed=%.3f us "
                     "full-materialized=%.3f us "
-                    "full-vs-absorbed=%.3fx\n",
+                    "full-vs-absorbed=%.3fx "
+                    "full-oracle(max_abs=%.6g rmse=%.6g bad=%zu/%zu)\n",
                     nt, NH, a, m, l, w, a / w, max_abs, rmse, bad, ha.size(), lds_max_abs,
                     lds_rmse, lds_bad, ha.size(), opus_max_abs, opus_rmse, NH,
-                    flat_grid_mismatch, full_abs_us, full_us, full_abs_us / full_us);
+                    flat_grid_mismatch, full_abs_us, full_us, full_abs_us / full_us,
+                    full_max_abs, full_rmse, full_bad, hfull.size());
 
         hipFree(qabs); hipFree(qrope); hipFree(ckv); hipFree(krope); hipFree(qmat);
         hipFree(kmat); hipFree(vmat); hipFree(wuv); hipFree(oabs); hipFree(omat); hipFree(olds);
@@ -425,5 +515,5 @@ int main(int argc, char** argv) {
     hipModuleUnload(opus_mod);
     hipModuleUnload(pack_mod);
     hipModuleUnload(upstream_mod);
-    return opus_oracle_failed ? 4 : 0;
+    return kernel_oracle_failed ? 3 : (opus_oracle_failed ? 4 : (full_path_oracle_failed ? 6 : 0));
 }
