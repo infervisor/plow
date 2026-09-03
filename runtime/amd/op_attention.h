@@ -195,14 +195,14 @@
  *
  *   Q  [n_q,  n_head,    D]     positions q0 .. q0+n_q
  *   K  [n_kv_head, kv_stride, D]   the cache, HEAD-MAJOR; positions 0 .. n_kv of each head
- *   V  [n_kv_head, kv_stride, D]
- *   O  [n_q,  n_head,    D]
+ *   V  [n_kv_head, kv_stride, DV]
+ *   O  [n_q,  n_head,    DV]
  *
  * `q_pos0` is the absolute position of Q row 0 (so prefill of a continuation
  * chunk masks correctly against cached history).
  * `window == 0` means full causal.
  * ------------------------------------------------------------------------- */
-template <int D, bool FP8KV = false>
+template <int D, bool FP8KV = false, int DV = D>
 __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ mlpart,
                                 bf16* __restrict__ O_final,
                                 const bf16* __restrict__ Q, const bf16* __restrict__ K,
@@ -223,9 +223,11 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
      * the 4-wave flash object), but a model with head_dim < FA_DC (Llama/Qwen: D=128) must not
      * chunk wider than the head — otherwise NCH = D/FA_DC rounds to 0 and the output loop never
      * runs. DCH = min(FA_DC, D) makes NCH >= 1 for any D and is a no-op when D >= FA_DC. */
-    constexpr int DCH = (FA_DC < D) ? FA_DC : D;
+    constexpr int DCH = (FA_DC < DV) ? FA_DC : DV;
     constexpr int NDT = DCH / MFMA_N; /* output d-tiles per chunk           */
-    constexpr int NCH = D / DCH;      /* output chunks: 1 at D<=FA_DC, 2 at D=512 */
+    constexpr int NCH = DV / DCH;     /* output chunks: 1 at DV<=FA_DC, 2 at DV=512 */
+    static_assert(D % MFMA_K == 0 && DV % MFMA_N == 0,
+                  "flash head dimensions must tile");
     constexpr int STRIDE = D + FA_PAD;
     /* V stays [kv][d] in LDS, and the 8 x ds_read_u16 in the PV loop below stays too.
      *
@@ -375,7 +377,8 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
              * The window-skip `continue` is dropped -- my_lo already starts at the window and the
              * per-element softmax mask excludes any out-of-window rows. */
             constexpr int KPT = BKV * D / PLOW_THREADS / 8;
-            constexpr int VPT = BKV * FA_DC / PLOW_THREADS / 8;
+            constexpr int VL = (DV == D) ? FA_DC : DCH;
+            constexpr int VPT = BKV * VL / PLOW_THREADS / 8;
             bf16v8 nk[KPT], nv[VPT];
     /* FP8 KV IN THE PREFETCH PATH. This branch had none, and it is the only path the 4-wave
      * flash object takes (it is the object built -DFA_DBUF=1). `ld_glob8` on a `const bf16*`
@@ -417,12 +420,17 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
     }                                                                                            \
     _Pragma("unroll") for (int it = 0; it < VPT; it++) {                                         \
         const unsigned e = threadIdx.x * 8 + it * (PLOW_THREADS * 8);                            \
-        const unsigned kv = (KVB) + e / FA_DC;                                                   \
+        const unsigned kv = (KVB) + e / VL;                                                      \
         if constexpr (FP8KV) {                                                                    \
+            static_assert(DV == D, "rectangular fp8 flash is not implemented");                  \
             if (kv < n_kv) FA_DB_FP8(nv[it], V, v_scale, d_off + e % FA_DC) else nv[it] = bf16v8_zero(); \
         } else {                                                                                  \
-        nv[it] = (kv < n_kv) ? ld_glob8(as_glob(V) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + d_off + e % FA_DC) \
-                             : bf16v8_zero();                                                     \
+        if constexpr (DV == D)                                                                    \
+            nv[it] = (kv < n_kv) ? ld_glob8(as_glob(V) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + d_off + e % FA_DC) \
+                                 : bf16v8_zero();                                                 \
+        else                                                                                      \
+            nv[it] = (kv < n_kv) ? ld_glob8(as_glob(V) + ((size_t)hkv * kv_stride + (kv & kv_mask)) * DV + d_off + e % DCH) \
+                                 : bf16v8_zero();                                                 \
         }                                                                                         \
     }
             FA_DB_LOAD(my_lo); /* prime */
@@ -474,8 +482,8 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                     const unsigned kv = kv0 + r;
                     bf16 tv[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                     if (kv < n_kv) {
-                        const size_t off =
-                            ((size_t)hkv * kv_stride + (kv & kv_mask)) * D + d_off + c;
+                        const size_t row = (size_t)hkv * kv_stride + (kv & kv_mask);
+                        const size_t off = row * (DV == D ? D : DV) + d_off + c;
                         if constexpr (FP8KV) {
                             const bf16v8 dv = fp8v8_to_bf16v8(
                                 ld_glob_fp8v8((const unsigned char*)V + off));
@@ -748,7 +756,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
              * fused write there pushes it 258 > 256 over the cliff for no benefit. */
 #if defined(PLOW_BUCKET_FLASH) || defined(PLOW_FLASH_HD128)
             if (nsplit == 1 && O_final != nullptr) {
-                const unsigned qd = n_head * D; /* row stride of n.at */
+                const unsigned qd = n_head * DV; /* row stride of n.at */
 #pragma unroll
                 for (int i = 0; i < 16; i++) {
                     const unsigned qi = my_q0 + mfma_acc_m(lane, i);
@@ -765,7 +773,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
                     /* One base pointer per row (as the partial path does), so the epilogue's
                      * 64-bit address math stays out of the unrolled store loop and does not
                      * blow up register pressure / scratch for the hot KV loop. */
-                    bf16* orow = O_final + ((size_t)qi * qd + h * D + d_off + accn);
+                    bf16* orow = O_final + ((size_t)qi * qd + h * DV + d_off + accn);
 #pragma unroll
                     for (int t = 0; t < NDT; t++) {
                         /* Branchless RNE f32->bf16. A softmax-normalized attention output is
@@ -790,7 +798,7 @@ __device__ void d_flash_prefill(float* __restrict__ Opart, float* __restrict__ m
             for (int i = 0; i < 16; i++) {
                 const unsigned qi = my_q0 + mfma_acc_m(lane, i);
                 if (qi >= n_q) continue;
-                float* op = Opart + ((size_t)(qi * n_head + h) * nsplit + sp) * D;
+                float* op = Opart + ((size_t)(qi * n_head + h) * nsplit + sp) * DV;
 #pragma unroll
                 for (int t = 0; t < NDT; t++)
                     st_act<float>(&op[d_off + t * MFMA_N + accn], oacc[t][i]);
