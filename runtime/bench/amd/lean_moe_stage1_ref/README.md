@@ -30,11 +30,13 @@ N=384 sorted payload/scale coverage, and XCD8/WGM4 bijection over ragged tile gr
 LDS, 52,224 B permits three WG256 blocks per CU, so the candidate's effective ceiling is three
 waves/SIMD (register ceiling four).
 
-After static review, the GPU comparison is explicitly enabled with `--run`:
+The build also emits a Nix-ROCm-only HIP host driver at `$OUT/compare`. After static review,
+the GPU comparison is explicitly enabled with `--run`:
 
 ```sh
-nix develop -c python3 runtime/bench/amd/lean_moe_stage1_ref/compare.py \
-  /tmp/plow-moe1-audit/shipping.elf /tmp/plow-moe1-audit/candidate.elf --run
+nix develop -c perf-data/tools/gpulease -n 1 moe1-xcd8-wgm4-byte31 \
+  /tmp/plow-moe1-audit/compare /tmp/plow-moe1-audit/shipping.elf \
+  /tmp/plow-moe1-audit/candidate.elf --run
 ```
 
 The driver uses T=8192, H=3584, I=384, E=896, top-k=16, BM64-padded sorted rows, production
@@ -42,4 +44,8 @@ The driver uses T=8192, H=3584, I=384, E=896, top-k=16, BM64-padded sorted rows,
 and SiTU `(4,25)`.
 It requires byte equality for the full MXFP4 payload and E8M0 scale buffers, including untouched
 pad rows. Timing is 31 samples per object, cache-flushed before every launch, with object order
-alternating each sample. Expect roughly 3 GiB of transient GPU allocation.
+alternating each sample. Index-sensitive device fill kernels initialize finite BF16 activations,
+both FP4 expert branches, and E8M0 scales without staging the 1.2 GiB weights through host memory.
+The 256 MiB cache buffer is read and rewritten by a compute kernel ordered immediately before the
+timed event; no SDMA memset is accepted as a cache flush. Expect roughly 3 GiB of transient GPU
+allocation.

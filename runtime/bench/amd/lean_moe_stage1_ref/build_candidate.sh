@@ -47,3 +47,4 @@ done
 python3 "$HERE/check_candidate.py" \
     "$OUT/candidate.notes" "$OUT/candidate.isa" \
     "$OUT/shipping.notes" "$OUT/shipping.isa"
+"$HIPCC" -O2 -std=c++17 "$HERE/compare.cpp" -o "$OUT/compare"
