@@ -1,51 +1,58 @@
 # Kimi-K3 Plow baseline on MI355X
 
-Measured 2026-09-02 on the same 8×MI355X node and with the same client
-contract as `kimi-k3-vllm-mi355x-baseline.md`. This is the current production
-`plowrt serve` C1 baseline, not a projected or in-process result.
+Measured 2026-09-03 on one 8×AMD Instinct MI355X node. The current C1 result
+is the predeclared median-of-folds reading from the three exact cells in campaign
+`k3-showdown-c1-7a54489-retry2`. The 2026-09-02 single-run values are
+superseded.
 
 ## Contract
 
 - TP8, native MXFP4 weights, BF16 KV, MTP/speculation and prefix caching off.
-- Raw `/v1/completions`, exact random 8192-token inputs and 1024-token outputs,
-  greedy sampling, `--ignore-eos`, infinite request rate, concurrency 1.
-- vLLM 0.28 `bench serve` drove both engines with the same tokenizer. Plow's
-  `/tokenize` endpoint confirmed the exact 8192-token prompt length.
-- One discarded warmup and ten measured requests. All 10 completed, none
-  failed, and the client counted exactly 81,920 input and 10,240 output tokens.
-- Production B128 packet/interpreter with the B1 low-rung object selected for
-  single-user decode. `PLOW_MLA_PF_V2=1`, global queue and L2 placement were on.
+- Raw `/v1/completions`, random exact 8192-token inputs and exact 1024-token
+  outputs, greedy sampling, `--ignore-eos`, infinite request rate, C1.
+- Each fold used one discarded warmup and ten measured requests. All 30
+  measured requests completed, with exactly 81,920 input and 10,240 output
+  tokens per fold.
+- Production B128 packet/interpreter with the B1 low-rung object available.
+  Material controls were `--max-hold-ms 8 --slo-ms 250
+  --max-queued-requests 0`. Resolved configuration had ragged chunking on,
+  MLA PF v2 off, and no global queue.
+- Artifact-set digest:
+  `8d38f79756a3db6b6e78e5f028a659dadf29f2ab48e132efde97e0b820de51a7`.
 
-## Apples-to-apples result
+## Three-fold result
 
-| metric | Plow | vLLM 0.28 | Plow / vLLM |
+| metric | Plow | vLLM 0.28 | gap |
 |---|---:|---:|---:|
-| duration | 600.45 s | 218.13 s | 2.75× |
-| request throughput | 0.02 req/s | 0.0458 req/s | 0.44× |
-| output throughput | 17.05 tok/s | 46.94 tok/s | 0.36× |
-| total token throughput | 153.49 tok/s | 422.50 tok/s | 0.36× |
-| mean / median TTFT | 3646.76 / 3645.01 ms | 567.52 / 567.03 ms | 6.43× / 6.43× |
-| P90 / P99 TTFT | 3657.95 / 3662.82 ms | 569.22 / 570.50 ms | 6.43× / 6.42× |
-| mean / median TPOT | 55.13 / 55.15 ms | 20.768 / 20.768 ms | 2.65× / 2.66× |
-| median / P90 / P99 ITL | 55.14 / 55.29 / 55.59 ms | 20.755 / 20.878 / 21.008 ms | 2.66× / 2.65× / 2.65× |
-| mean / median E2E | 60.044 / 60.062 s | 21.813 / 21.813 s | 2.75× / 2.75× |
+| duration | 683.97 s | 219.12 s | Plow 3.12× longer |
+| output throughput | 14.97 tok/s | 46.73 tok/s | vLLM 3.12× higher |
+| total token throughput | 134.74 tok/s | 420.60 tok/s | vLLM 3.12× higher |
+| median TTFT | 3762.81 ms | 568.35 ms | Plow 6.62× longer |
+| P90 / P99 TTFT | 3777.18 / 3787.16 ms | 570.28 / 572.01 ms | Plow 6.62× / 6.62× longer |
+| median TPOT | 63.17 ms | 20.86 ms | Plow 3.03× longer |
+| median / P90 / P99 ITL | 63.16 / 63.36 / 63.65 ms | 20.86 / 20.96 / 21.06 ms | Plow 3.03× / 3.02× / 3.02× longer |
+| median E2E | 68.381 s | 21.910 s | Plow 3.12× longer |
 
-Plow does not yet beat vLLM in this cell. The largest relative deficit is
-prefill/TTFT. Decode is independently 2.66× slower by mean TPOT, so prefill-only
-work cannot close output-throughput or end-to-end latency.
+This is endpoint performance, not an isolated-kernel measurement.
 
-## KDA Conv3 prefill improvement
+## Exact fold provenance
 
-The production kernel now parallelizes independent suffix rows across workers
-while retaining a unique owner for the incoming-window prefix and final state.
-The rule is shape-based (`T > 1` and one shared sequence), not model-specific;
-decode and strided multi-sequence rows keep the existing path.
+| fold | mean / median / P99 TTFT (ms) | mean / median / P99 TPOT (ms) | output tok/s | mean / median / P99 E2E (ms) |
+|---|---:|---:|---:|---:|
+| showdown-1 | 3766.66 / 3762.81 / 3787.16 | 63.19 / 63.17 / 63.31 | 14.97 | 68411.20 / 68381.18 / 68554.09 |
+| showdown-2 | 3760.99 / 3762.55 / 3769.66 | 63.17 / 63.03 / 63.75 | 14.97 | 68389.02 / 68241.77 / 68966.26 |
+| showdown-3 | 3768.48 / 3766.05 / 3801.66 | 63.18 / 63.18 / 63.25 | 14.97 | 68396.69 / 68398.63 / 68470.45 |
 
-At 8192 tokens, a matched one-request production `plowrt bench` gate measured
-4232.02→3631.09 ms TTFT (14.2% faster) with unchanged B1 decode. Both arms
-generated the exact checksum `fnv1a64:381f131ba12c92c0`. A separate three-request
-`vllm bench serve` screen measured 4250.95→3649.18 ms median TTFT. The full
-endpoint result above includes the candidate and confirms the gain at N=10.
+The JSON preserves every `cells.tsv` field, source log basename, artifact
+digest, and config/tokenizer hashes. Headline values are medians of the three
+fold statistics; P90 and duration values come
+from the three raw client logs.
 
-Raw rounded client output is recorded in `kimi-k3-plowrt-mi355x-c1.json`.
-The vLLM comparator is `kimi-k3-vllm-mi355x-c1.json`.
+## Superseded result
+
+The 2026-09-02 single run (600.45 s, 17.05 output tok/s, 3646.76 ms mean
+TTFT, 55.13 ms mean TPOT) remains in the JSON `supersedes` record but is
+not the current baseline.
+
+Raw data: `perf-data/kimi-k3-plowrt-mi355x-c1.json`.
+Comparator: `perf-data/kimi-k3-vllm-mi355x-c1.json`.
