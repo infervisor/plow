@@ -46,6 +46,15 @@ if [ "$decode_inventory_prune" = 1 ] && [ -z "${PLOW_HSACO_CONFIG:-}" ]; then
   echo "PLOW_HSACO_DECODE_INVENTORY_PRUNE requires PLOW_HSACO_CONFIG" >&2
   exit 2
 fi
+need_decode_mla=0
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS 1' "$PLOW_HSACO_CONFIG"; then
+  [ "$ARCH" = gfx950 ] || {
+    echo "decode MLA segment objects are supported only on gfx950" >&2; exit 2; }
+  [ "$decode_inventory_prune" = 1 ] || {
+    echo "decode MLA segment objects require packet-paired inventory pruning" >&2; exit 2; }
+  need_decode_mla=1
+fi
 mkdir -p "$OUT"; cd "$OUT"
 
 # Delete FIRST. A build that fails must leave nothing behind to run.
@@ -53,6 +62,8 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf \
       i_prefill_gq.co i_decode_gq.co i_flash_gq.co \
       interp_prefill_gq.elf interp_decode_gq.elf interp_flash_gq.elf \
+      i_decode_mla.co i_decode_mla_gq.co \
+      interp_decode_mla.elf interp_decode_mla_gq.elf \
       i_decode_fp8.co i_decode_fp8_gq.co interp_decode_fp8.elf interp_decode_fp8_gq.elf \
       i_decode_fp8kv.co i_decode_fp8kv_gq.co interp_decode_fp8kv.elf interp_decode_fp8kv_gq.elf \
       i_prefill_mla_moe.co i_prefill_mla_moe_gq.co \
@@ -269,6 +280,13 @@ for B in 0 1; do
   unbundle "i_$N.co" "interp_$N.elf"
 done
 
+DECODE_MLA_ELFS=""
+if [ "$need_decode_mla" = 1 ]; then
+  genco "$DEC -DPLOW_BUCKET_DECODE_MLA=1" i_decode_mla.co
+  unbundle i_decode_mla.co interp_decode_mla.elf
+  DECODE_MLA_ELFS="interp_decode_mla.elf"
+fi
+
 # SEGMENTED-DISPATCH flash object: prefill op set at 4 waves / FA_DC=256, compiling ONLY the class-4
 # flash_prefill segment (PLOW_BUCKET_FLASH). 1 wave/SIMD => 512-reg budget; the Q-hoist spills Q to
 # on-chip scratch by design (cheaper than the L2 re-read it replaces).
@@ -366,6 +384,11 @@ if [ "$BUILD_GQ" = 1 ]; then
   # GQ flash object (Gemma's segmented 4-wave flash segment under the global queue).
   genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" i_flash_gq.co
   unbundle i_flash_gq.co interp_flash_gq.elf
+  if [ "$need_decode_mla" = 1 ]; then
+    genco "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" i_decode_mla_gq.co
+    unbundle i_decode_mla_gq.co interp_decode_mla_gq.elf
+    DECODE_MLA_ELFS="$DECODE_MLA_ELFS interp_decode_mla_gq.elf"
+  fi
 fi
 
 # FP8 decode objects (static + GQ), each swapping the bf16 GEMV_GLU/QKV arms for the fp8 ones. Same
@@ -546,6 +569,9 @@ check() { # <name> <defs> <max-total> <min-occ>
 check prefill "-DPLOW_BUCKET_DECODE=0" 256 2
 check decode  "$DEC" 256 2
 check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1" 512 1
+if [ "$need_decode_mla" = 1 ]; then
+  check decode_mla "$DEC -DPLOW_BUCKET_DECODE_MLA=1" 256 2
+fi
 # The GQ loop adds a shared cursor + claim broadcast; it must NOT push prefill past 256/occ-2. If it
 # does and no minimal-live-set fix recovers it, that is itself a recordable E1 finding (GQ incompatible
 # with occ-2 prefill). These run only when the GQ objects were built.
@@ -554,6 +580,9 @@ if [ "$BUILD_GQ" = 1 ]; then
   check prefill_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
   check decode_gq  "$DEC $L2D -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
   check flash_gq   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 512 1
+  if [ "$need_decode_mla" = 1 ]; then
+    check decode_mla_gq "$DEC $L2D $HIERD -DPLOW_BUCKET_DECODE_MLA=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
+  fi
   GQ_ELFS="interp_prefill_gq.elf interp_decode_gq.elf interp_flash_gq.elf"
 fi
 # The fp8 arms swap (not add) against the bf16 GEMV_GLU/QKV arms, so they must stay under the same
@@ -625,7 +654,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.
@@ -640,6 +669,14 @@ for e in $ALL_ELFS; do
       fi
       ;;
   esac
+done
+
+for e in $DECODE_MLA_ELFS; do
+  symbols=$("${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/llvm-nm "$e")
+  grep -q plow_decode_mla_segment_object_1 <<<"$symbols" || {
+    echo "FAIL: $e omits the decode MLA segment marker"; exit 1; }
+  grep -q plow_packet_hash_lo <<<"$symbols" && grep -q plow_packet_hash_hi <<<"$symbols" || {
+    echo "FAIL: $e omits the packet pairing stamp"; exit 1; }
 done
 
 for e in interp_flash.elf ${BUILD_GQ:+interp_flash_gq.elf}; do

@@ -95,6 +95,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_UNISEG", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub uniseg: bool,
 
+    /// Isolate pure adjacent FlashMlaDecode+MlaMergeFold pairs on gfx950.
+    #[arg(long = "emit-decode-mla-segments", env = "PLOW_SEG_DECODE_MLA", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub decode_mla_segments: bool,
+
     /// Batched decode dispatch width (sequences per launch).
     #[arg(
         long = "emit-decode-batch",
@@ -643,6 +647,9 @@ impl EmitConfig {
             fp8_kv_full: env_bool("PLOW_FP8_KV_FULL"),
             fp8_head: env_bool("PLOW_FP8_HEAD"),
             uniseg: env_bool("PLOW_UNISEG"),
+            // The legacy no-config entry remains opt-in. `plowc` supplies the clap default-on
+            // value; direct legacy callers must name the feature explicitly.
+            decode_mla_segments: env_bool("PLOW_SEG_DECODE_MLA"),
             decode_batch: env_u32("PLOW_DECODE_BATCH").unwrap_or(1),
             decode_ladder: env_str("PLOW_DECODE_BATCH_LADDER"),
             max_chunk: env_u32("PLOW_MAX_CHUNK"),
@@ -1008,6 +1015,31 @@ mod tests {
                 .unwrap()
                 .emit
                 .kda_key_factor
+        );
+    }
+
+    #[test]
+    fn decode_mla_segments_default_on_for_plowc_but_legacy_is_opt_in() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_SEG_DECODE_MLA", "0")]);
+        std::env::remove_var("PLOW_SEG_DECODE_MLA");
+        assert!(!EmitConfig::from_env().decode_mla_segments);
+
+        std::env::set_var("PLOW_SEG_DECODE_MLA", "1");
+        assert!(EmitConfig::from_env().decode_mla_segments);
+        std::env::remove_var("PLOW_SEG_DECODE_MLA");
+
+        assert!(
+            TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .decode_mla_segments
+        );
+        assert!(
+            !TestArgs::try_parse_from(["test", "--emit-decode-mla-segments=false"])
+                .unwrap()
+                .emit
+                .decode_mla_segments
         );
     }
 

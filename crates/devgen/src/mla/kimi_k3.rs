@@ -1255,6 +1255,11 @@ fn k3_build_model(
         let mut b = Builder::new(n_cu);
         b.set_fuse_materialized_residual_inputs(emit_config::active().fuse_residual_input);
         b.set_tensor_dedup(true);
+        b.set_decode_mla_segments(
+            crate::emit_is_amd()
+                && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                && emit_config::active().decode_mla_segments,
+        );
         // PLOW_L2_PLACE: `None` => byte-identical. Until this line the flag reached the dense-GQA
         // builders only, and `kimi_k3` is absent from the arch list that warns about being
         // ignored (`lib.rs:4327`), so setting it on K3 was a silent no-op.

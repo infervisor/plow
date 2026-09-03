@@ -1103,7 +1103,10 @@ fn object_inventory(progs: &[ProgramArms]) -> Value {
     let decode_mla_segment = |p: &&ProgramArms| {
         p.kind == "decode"
             && p.seg.is_some()
+            && p.insts == 2
+            && p.arms.len() == 2
             && p.arms.iter().any(|a| a.op == "FlashMlaDecode")
+            && p.arms.iter().any(|a| a.op == "MlaMergeFold")
             && p.arms
                 .iter()
                 .all(|a| a.op == "FlashMlaDecode" || a.op == "MlaMergeFold")
@@ -1398,10 +1401,18 @@ pub fn config_header(manifest: &Value) -> String {
     let decode_ops = object_ops("decode");
     let flash_ops = object_ops("flash");
     let decode_mla_ops = object_ops("decode_mla");
+    let decode_mla_required = manifest
+        .pointer("/objects/ordinary/decode_mla/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let kda_chunk_qpre = union
         .iter()
         .any(|arm| arm.starts_with("KdaChunk") && arm.ends_with("_qpre"));
     out.push_str("/* --- packet and per-object opcode inventory --- */\n");
+    out.push_str(&format!(
+        "#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS {}\n",
+        if decode_mla_required { 1 } else { 0 }
+    ));
     for o in DevOp::ALL {
         let name = op_name(*o);
         let present = ops.contains(&name);
@@ -2068,6 +2079,64 @@ mod tests {
             "KdaChunkCarry/d128_qpre"
         );
         assert_ne!(incomplete, paired);
+    }
+
+    #[test]
+    fn decode_mla_object_requires_one_pure_two_instruction_pair() {
+        let arm = |op: &str| Arm {
+            op: op.into(),
+            hd: None,
+            variant: None,
+        };
+        let segment = |insts, ops: &[&str]| ProgramArms {
+            kind: "decode",
+            packed_prefill_only: false,
+            t: 1,
+            seg: Some(1),
+            arms: ops.iter().map(|op| arm(op)).collect(),
+            insts,
+        };
+        let pure = segment(2, &["FlashMlaDecode", "MlaMergeFold"]);
+        let inv = object_inventory(std::slice::from_ref(&pure));
+        assert_eq!(inv["ordinary"]["decode_mla"]["required"], true);
+        let manifest = json!({"union": [], "objects": inv});
+        assert!(config_header(&manifest).contains("#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS 1"));
+
+        for rejected in [
+            segment(1, &["FlashMlaDecode"]),
+            segment(3, &["FlashMlaDecode", "MlaMergeFold", "Gemv"]),
+        ] {
+            assert_eq!(
+                object_inventory(&[rejected])["ordinary"]["decode_mla"]["required"],
+                false
+            );
+        }
+    }
+
+    #[test]
+    fn direct_gfx950_build_tracks_decode_mla_inventory() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("scripts/build_gfx950.sh");
+        let script = std::fs::read_to_string(path).unwrap();
+        for required in [
+            "#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS 1",
+            "interp_decode_mla.elf",
+            "interp_decode_mla_gq.elf",
+            "check decode_mla ",
+            "check decode_mla_gq ",
+            "plow_decode_mla_segment_object_1",
+            "plow_packet_hash_lo",
+            "plow_packet_hash_hi",
+            "$DECODE_MLA_ELFS",
+        ] {
+            assert!(
+                script.contains(required),
+                "direct gfx950 build misses {required}"
+            );
+        }
     }
 
     /// `arm_of` must read each flash op's head-dim from the slot that op ACTUALLY carries it in.

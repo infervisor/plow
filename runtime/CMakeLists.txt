@@ -776,6 +776,7 @@ if(PLOW_GFX950_HSACO)
     set(_hs_inc -I "${CMAKE_CURRENT_SOURCE_DIR}/amd" -I "${CMAKE_CURRENT_SOURCE_DIR}/common")
     set(_hs_config_dep "")
     set(_hs_need_kda_fused ON)
+    set(_hs_need_decode_mla ${PLOW_HSACO_DECODE_MLA_SEGMENTS})
     if(PLOW_HSACO_CONFIG)
         get_filename_component(_hs_cfg_dir "${PLOW_HSACO_CONFIG}" DIRECTORY)
         get_filename_component(_hs_cfg_name "${PLOW_HSACO_CONFIG}" NAME)
@@ -792,15 +793,23 @@ if(PLOW_GFX950_HSACO)
         if(_hs_kda_qpre_presence)
             list(APPEND _hs_extra -DPLOW_KDA_CHUNK_QPRE=1)
         endif()
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_decode_mla_presence
+             REGEX "^#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS 1$")
+        if(_hs_decode_mla_presence)
+            set(_hs_need_decode_mla ON)
+        endif()
     endif()
     if(PLOW_HSACO_DECODE_INVENTORY_PRUNE AND NOT PLOW_HSACO_CONFIG)
         message(FATAL_ERROR
             "PLOW_HSACO_DECODE_INVENTORY_PRUNE requires PLOW_HSACO_CONFIG")
     endif()
-    if(PLOW_HSACO_DECODE_MLA_SEGMENTS AND
+    if(_hs_need_decode_mla AND
        (NOT PLOW_HSACO_DECODE_INVENTORY_PRUNE OR NOT PLOW_HSACO_CONFIG))
         message(FATAL_ERROR
-            "PLOW_HSACO_DECODE_MLA_SEGMENTS requires packet-paired inventory pruning")
+            "manifest-required decode MLA segments need packet-paired inventory pruning")
+    endif()
+    if(_hs_need_decode_mla AND NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
+        message(FATAL_ERROR "decode MLA segment objects are supported only on gfx950")
     endif()
     set(_hs_run "${CMAKE_CURRENT_SOURCE_DIR}/cmake/hipcc_hsaco.sh")
     # The op bodies live entirely in headers, so without these a kernel edit
@@ -1157,7 +1166,7 @@ if(PLOW_GFX950_HSACO)
     # IDENTICAL to the object without them. The gate stays because a gate that only fires on
     # regression is doing its job — it turns HSA_STATUS_ERROR_INVALID_ISA at launch into a build
     # error — and because op_attention.h:1282 is why "it fits" was never the whole question.
-    if(PLOW_HSACO_DECODE_MLA_SEGMENTS)
+    if(_hs_need_decode_mla)
         list(APPEND _hs_rows
             "interp_decode_mla|plow_interp_decode_mla_${PLOW_HSACO_ARCH}|_hs_ax_decode_mla|_hs_ax_none|256|2")
     endif()

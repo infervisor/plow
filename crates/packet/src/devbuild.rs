@@ -333,6 +333,8 @@ pub struct Builder {
     lean_kda_intra_segments: bool,
     /// Isolate exact qpre BT64/D128 Wu->carry pairs for standalone gfx950 objects.
     lean_kda_key_factor_segments: bool,
+    /// Isolate adjacent FlashMlaDecode+MlaMergeFold pairs for a gfx950 object.
+    decode_mla_segments: bool,
     /// Fold an eligible materialized Residual into its AttnRes consumer.
     fuse_materialized_residual_inputs: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
@@ -492,6 +494,7 @@ impl Builder {
             lean_moe_combine_segments: false,
             lean_kda_intra_segments: false,
             lean_kda_key_factor_segments: false,
+            decode_mla_segments: false,
             fuse_materialized_residual_inputs: true,
             gemv_split: 1,
             tensor_dedup: false,
@@ -557,6 +560,10 @@ impl Builder {
 
     pub fn set_lean_kda_key_factor_segments(&mut self, enabled: bool) {
         self.lean_kda_key_factor_segments = enabled;
+    }
+
+    pub fn set_decode_mla_segments(&mut self, enabled: bool) {
+        self.decode_mla_segments = enabled;
     }
 
     pub fn set_fuse_materialized_residual_inputs(&mut self, enabled: bool) {
@@ -1565,11 +1572,8 @@ impl Builder {
         let lean_kda_key_factor = !uniseg
             && self.lean_kda_key_factor_segments
             && (0..self.ops.len()).any(|i| lean_kda_key_factor_pair(&self.ops, i));
-        // Experimental decode object split. The two adjacent MLA attention packets form one
-        // island, so a model pays one specialist launch per MLA block rather than one launch per
-        // GEMV. Selection is opcode-only: any decode graph with this exact pair is eligible.
         let decode_mla_segments = !uniseg
-            && std::env::var("PLOW_SEG_DECODE_MLA").ok().as_deref() == Some("1")
+            && self.decode_mla_segments
             && self.ops.windows(2).any(|pair| {
                 pair[0].inst.op == DevOp::FlashMlaDecode as u16
                     && pair[1].inst.op == DevOp::MlaMergeFold as u16
@@ -4094,6 +4098,56 @@ mod lean_kda_intra_tests {
                 1
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod decode_mla_segment_tests {
+    use super::*;
+
+    fn program(enabled: bool) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_decode_mla_segments(enabled);
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let flash = b.emit(DevOp::FlashMlaDecode, all.clone(), &[before], |_| {});
+        let merge = b.emit(DevOp::MlaMergeFold, all.clone(), &[flash], |_| {});
+        b.emit(DevOp::Gemv, all, &[merge], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn exact_adjacent_pair_forms_one_pure_segment() {
+        let p = program(true);
+        let seg = |inst| {
+            p.stream
+                .iter()
+                .find(|e| e.inst == inst)
+                .expect("instruction has a stream entry")
+                .seg
+        };
+        assert_ne!(seg(0), seg(1));
+        assert_eq!(seg(1), seg(2));
+        assert_ne!(seg(2), seg(3));
+        assert!(p
+            .stream
+            .iter()
+            .filter(|e| e.seg == seg(1))
+            .all(|e| e.inst == 1 || e.inst == 2));
+    }
+
+    #[test]
+    fn split_is_disabled_unless_the_target_enables_it() {
+        assert_eq!(
+            program(false)
+                .stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
     }
 }
 
