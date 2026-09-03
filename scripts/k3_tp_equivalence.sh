@@ -65,12 +65,15 @@
 # box that has neither 8 GPUs nor 1.5 TB of Kimi-K3.
 #
 #   nix develop --command scripts/k3_tp_equivalence.sh
+#   nix develop --command env PLOW_K3_EQ_SHARD_HEAD=1 scripts/k3_tp_equivalence.sh
 #   nix develop --command env PLOW_K3_LAYERS=1,2,4 PLOW_K3_COS=0.985 scripts/k3_tp_equivalence.sh
 #
 # Env: PLOW_K3_CKPT (default the k3_farm symlink farm, else the HF snapshot), PLOW_K3_HSACO
 # (/home/lava/models/k3_mi325x/hsaco), PLOW_K3_LAYERS (1,2), PLOW_K3_COS (0.9999), PLOW_K3_STEPS (3),
 # PLOW_K3_PROMPT ("The capital of France is"), PLOW_K3_OUT (a tmpdir), PLOW_K3_MIN_FREE_GIB (28),
-# PLOW_K3_ARCH (gfx942), PLOW_K3_GPU (MI325X), PLOW_K3_NCU (304), PLOW_K3_VOCAB (163840).
+# PLOW_K3_ARCH (gfx942), PLOW_K3_GPU (MI325X), PLOW_K3_NCU (304), PLOW_K3_VOCAB (163840),
+# PLOW_K3_EQ_SHARD_HEAD (0; when 1, shard only the tp=8 head and gate its global greedy ids against
+# the tp=1 full-vocabulary control while comparing rank 0's local logits to control slice 0).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -94,6 +97,10 @@ ARCH="${PLOW_K3_ARCH:-gfx942}"
 GPU="${PLOW_K3_GPU:-MI325X}"
 NCU="${PLOW_K3_NCU:-304}"
 VOCAB="${PLOW_K3_VOCAB:-163840}"
+SHARD_HEAD="${PLOW_K3_EQ_SHARD_HEAD:-0}"
+case "$SHARD_HEAD" in 0|1) ;; *) fail "PLOW_K3_EQ_SHARD_HEAD must be 0 or 1" ;; esac
+compare_extra=()
+if [ "$SHARD_HEAD" = 1 ]; then compare_extra+=(--sharded8); fi
 IFS=, read -ra NLAYERS <<< "${PLOW_K3_LAYERS:-1,2}"
 
 # --- prerequisites, every one a clean skip ---------------------------------------------------
@@ -148,7 +155,10 @@ for N in "${NLAYERS[@]}"; do
     mkdir -p "$b" "$l"
     # K3_PREFILL=0 on BOTH sides: one program, walked a token at a time, so the degree is the
     # only difference. `--num-gpus` is what makes the emit sharded; there is no `--tp` on plowc.
+    shard=0
+    if [ "$SHARD_HEAD" = 1 ] && [ "$G" = 8 ]; then shard=1; fi
     K3_FULL=1 PLOW_K3_LAYERS="$N" K3_PREFILL=0 PLOW_FP8_KV=1 PLOW_MXFP4=1 \
+      PLOW_K3_SHARD_HEAD="$shard" \
       "$PLOWC" --hf-dir "$CK" --emit devblob --arch "$ARCH" --gpu "$GPU" \
       --num-gpus "$G" --parallel tp --max-ctx 4096 --n-cu "$NCU" --out "$b" 2>&1 \
       | grep -aE "^kimi_k3: emitted" \
@@ -187,7 +197,8 @@ JSON
     --packet1 "$OUT/blob_${N}_1/model.pkt" \
     --report8 "$OUT/run_${N}_8.json" --snap8 "$OUT/log_${N}_8" --asset8 "$OUT/blob_${N}_8" \
     --packet8 "$OUT/blob_${N}_8/model.pkt" --objects "$HS" --checkpoint "$CK" \
-    --prompt "$PROMPT" --steps "$STEPS" --cos "$COS" --layers "$N" --vocab "$VOCAB" || bad=1
+    --prompt "$PROMPT" --steps "$STEPS" --cos "$COS" --layers "$N" --vocab "$VOCAB" \
+    "${compare_extra[@]}" || bad=1
   echo
 done
 

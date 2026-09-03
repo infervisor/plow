@@ -24,7 +24,8 @@ def read_bf16(path):
     return [struct.unpack("<f", struct.pack("<I", value << 16))[0] for value in raw]
 
 
-def load_run(report_path, snap_dir, asset, packet, objects, checkpoint, prompt, steps, vocab, tp):
+def load_run(report_path, snap_dir, asset, packet, objects, checkpoint, prompt, steps, width, tp,
+             require_snapshot_argmax):
     with open(report_path) as source:
         report = json.load(source)
     needed_outputs = steps + 1
@@ -107,11 +108,14 @@ def load_run(report_path, snap_dir, asset, packet, objects, checkpoint, prompt, 
         fail(f"tp={tp}: unexpected snapshot count")
     selected = [paths[len(prompt) - 1], *paths[len(prompt):]]
     vectors = [read_bf16(path) for path in selected]
-    if any(len(row) != vocab for row in vectors):
-        fail(f"tp={tp}: snapshot is not the full {vocab}-entry logit vector")
-    if any(max(range(len(row)), key=row.__getitem__) != token for row, token in zip(vectors, outputs[0])):
+    if any(len(row) != width for row in vectors):
+        fail(f"tp={tp}: snapshot is not the expected {width}-entry logit vector")
+    if require_snapshot_argmax and any(
+        max(range(len(row)), key=row.__getitem__) != token
+        for row, token in zip(vectors, outputs[0])
+    ):
         fail(f"tp={tp}: token audit does not match snapshot argmax")
-    return vectors
+    return vectors, outputs[0]
 
 
 def main():
@@ -122,13 +126,29 @@ def main():
     parser.add_argument("--cos", required=True, type=float)
     parser.add_argument("--layers", required=True, type=int)
     parser.add_argument("--vocab", required=True, type=int)
+    parser.add_argument("--sharded8", action="store_true")
     args = parser.parse_args()
     prompt = [int(token.strip()) for token in args.prompt.split(",")]
-    one = load_run(args.report1, args.snap1, args.asset1, args.packet1, args.objects, args.checkpoint, prompt, args.steps, args.vocab, 1)
-    eight = load_run(args.report8, args.snap8, args.asset8, args.packet8, args.objects, args.checkpoint, prompt, args.steps, args.vocab, 8)
+    one, tokens1 = load_run(
+        args.report1, args.snap1, args.asset1, args.packet1, args.objects, args.checkpoint,
+        prompt, args.steps, args.vocab, 1, True)
+    width8 = args.vocab // 8 if args.sharded8 else args.vocab
+    if args.sharded8 and args.vocab % 8:
+        fail(f"vocab {args.vocab} is not divisible by tp=8")
+    eight, tokens8 = load_run(
+        args.report8, args.snap8, args.asset8, args.packet8, args.objects, args.checkpoint,
+        prompt, args.steps, width8, 8, not args.sharded8)
+    if tokens1 != tokens8:
+        first = next(i for i, (a, b) in enumerate(zip(tokens1, tokens8)) if a != b)
+        fail(
+            f"global greedy stream differs at output {first}: "
+            f"full-vocab={tokens1[first]} sharded={tokens8[first]}"
+        )
     bad = False
     tags = ["prefill", *[f"{i:03d}" for i in range(args.steps)]]
     for tag, x, y in zip(tags, one, eight):
+        if args.sharded8:
+            x = x[:width8]
         if len(x) != len(y):
             print(f"  N={args.layers} {tag:8s} SHAPE {len(x)} vs {len(y)}")
             bad = True
@@ -143,6 +163,12 @@ def main():
         ok = cosine >= args.cos and a1 == a8
         print(f"  N={args.layers} {tag:8s} cos {cosine:.8f}  argmax {a1} vs {a8}  maxabs {max_abs:.5f}  {'ok' if ok else 'MISMATCH'}")
         bad |= not ok
+    if args.sharded8 and not bad:
+        outside = sum(token >= width8 for token in tokens8)
+        print(
+            f"  global greedy {len(tokens8)}/{len(tokens8)} exact; "
+            f"{outside} winner(s) outside rank 0's vocab shard"
+        )
     if bad:
         if args.layers == 1:
             print("  => N=1 localises disagreement to the KDA mixer, dense FFN, attention all-reduce, or weight sharding.")

@@ -16,7 +16,11 @@ def bf16(values):
     return b"".join(struct.pack("<H", struct.unpack("<I", struct.pack("<f", value))[0] >> 16)
                     for value in values)
 
-vectors = [[0.0, 3.0, 1.0], [0.0, 5.0, 2.0], [1.0, 2.0, 7.0]]
+vectors = [
+    [1.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    [2.0, 5.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+]
 for tp in (1, 8):
     snap = os.path.join(root, f"snap{tp}")
     for tick, vector in enumerate(vectors):
@@ -41,7 +45,7 @@ for tp in (1, 8):
         },
         "diagnostics": {"supported": True, "complete": True, "overflowed": False,
                         "rank_agreement": agreement, "decode_selections": []},
-        "token_audit": {"prompt_token_ids": [prompt], "output_token_ids": [[1, 2]]},
+        "token_audit": {"prompt_token_ids": [prompt], "output_token_ids": [[1, 7]]},
     }
     with open(os.path.join(root, f"report{tp}.json"), "w") as output:
         json.dump(report, output)
@@ -51,7 +55,7 @@ compare=(python3 "$ROOT/scripts/k3_tp_equivalence_compare.py"
   --report1 "$TMP/report1.json" --snap1 "$TMP/snap1" --asset1 "$TMP/asset1" --packet1 "$TMP/asset1/model.pkt"
   --report8 "$TMP/report8.json" --snap8 "$TMP/snap8" --asset8 "$TMP/asset8" --packet8 "$TMP/asset8/model.pkt"
   --objects "$TMP/objects" --checkpoint "$TMP/checkpoint" --prompt 2,3
-  --steps 1 --cos 0.9999 --layers 2 --vocab 3)
+  --steps 1 --cos 0.9999 --layers 2 --vocab 8)
 "${compare[@]}" >"$TMP/pass.log"
 grep -q 'prefill.*ok' "$TMP/pass.log"
 grep -q '000.*ok' "$TMP/pass.log"
@@ -79,3 +83,39 @@ if "${compare[@]}" >"$TMP/checksum-fail.log" 2>&1; then
 fi
 grep -q 'missing packet checksum' "$TMP/checksum-fail.log"
 echo "PASS: K3 TP comparator rejects missing snapshots and validates exact production evidence"
+
+# Sharded tp=8 snapshots contain rank 0's local vocab slice only. The global winner is outside
+# that slice in the decode row, so only an exact token-stream comparison can validate the fold.
+python3 - "$TMP" <<'PY'
+import json, os, struct, sys
+root = sys.argv[1]
+for tick, vector in enumerate(([1.0], [2.0], [1.0])):
+    path = os.path.join(root, "snap8", f"t{tick:05}_r1_act_logits.bin")
+    with open(path, "wb") as output:
+        for value in vector:
+            output.write(struct.pack("<H", struct.unpack("<I", struct.pack("<f", value))[0] >> 16))
+with open(os.path.join(root, "report8.json")) as source:
+    report = json.load(source)
+report["artifacts"]["packet"]["checksum"] = "pkt-sharded"
+with open(os.path.join(root, "report8.json"), "w") as output:
+    json.dump(report, output)
+PY
+sharded=("${compare[@]}" --sharded8)
+"${sharded[@]}" >"$TMP/sharded-pass.log"
+grep -q 'global greedy 2/2 exact; 2 winner(s) outside rank 0' "$TMP/sharded-pass.log"
+
+python3 - "$TMP/report8.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as source:
+    report = json.load(source)
+report["token_audit"]["output_token_ids"][0][1] = 0
+with open(path, "w") as output:
+    json.dump(report, output)
+PY
+if "${sharded[@]}" >"$TMP/sharded-fail.log" 2>&1; then
+  echo "FAIL: wrong sharded global winner passed" >&2
+  exit 1
+fi
+grep -q 'global greedy stream differs at output 1' "$TMP/sharded-fail.log"
+echo "PASS: sharded local logits plus global greedy fold are gated independently"
