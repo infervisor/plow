@@ -46,6 +46,11 @@ complete stream, TP policy, and packet/object/checkpoint identities.
 averages exactly 65 single-step `decode_step_batched_at` calls. Production mux
 reports must also prove the compiled width, exact per-slot prompt/stream classes,
 and hashed packet/build/weights/object/checkpoint identities.
+`sweep_batch_ceiling.sh` uses the same boundary for the B1/B2/B4/B8 context
+grid that anchors Plow/vLLM throughput work. Each row is now genuinely
+prefilled to the requested context before four warmup and N measured
+full-width calls; reports fail closed on partial batches, streams, diagnostics,
+or artifact identities.
 
 Run `scripts/check_amd_bench_consumers.sh` in repository checks. It fails when
 an active shell invocation is unclassified, when a class or binding is invalid,

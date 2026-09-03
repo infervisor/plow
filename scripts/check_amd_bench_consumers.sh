@@ -11,7 +11,6 @@ declare -A legacy_performance=(
   [scripts/glm52_linfp8_run.sh]=1
   [scripts/glm52_linfp8_stacked_run.sh]=1
   [scripts/k3_block_sweep.sh]=1
-  [scripts/sweep_batch_ceiling.sh]=1
 )
 declare -A migrated_batch_gates=(
   [scripts/gate_batched.sh]=1
@@ -22,6 +21,7 @@ declare -A migrated_tp_gates=(
   [scripts/k3_tp_equivalence.sh]=1
 )
 declare -A migrated_device_ceiling=(
+  [scripts/sweep_batch_ceiling.sh]=1
   [scripts/walk_b16_ab.sh]=1
 )
 while IFS=$'\t' read -r class path binding disposition; do
@@ -134,5 +134,6 @@ done
 "$ROOT/scripts/glm52_linfp8_stacked_coherence_selftest.sh"
 "$ROOT/scripts/k3_tp_equivalence_selftest.sh"
 "$ROOT/scripts/walk_b16_selftest.sh"
+"$ROOT/scripts/batch_ceiling_selftest.sh"
 
 echo "PASS: ${#observed[@]} active AMD direct-runner script consumers are classified"
