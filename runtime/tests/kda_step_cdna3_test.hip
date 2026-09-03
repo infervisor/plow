@@ -123,11 +123,11 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_carry(KArgs* a) 
     __shared__ float st[16 * 128];
     __shared__ bf16 vsm[64 * 16];
     __shared__ float osm[64 * 16];
-    d_kda_chunk_carry_bt64(
+    d_kda_chunk_carry_bt64<KDA_CHUNK_QPRE>(
         (bf16*)a->y, (float*)a->state, (const bf16*)a->q, (const bf16*)a->k,
         (const bf16*)a->w, (const bf16*)a->u, (const float*)a->aqk,
         (const float*)a->gprefix, (const uint2*)a->chunks, a->n_chunks, a->T, a->H, a->D, a->V,
-        a->scale, blockIdx.x, gridDim.x, st, vsm, osm, KDA_CHUNK_QPRE);
+        a->scale, blockIdx.x, gridDim.x, st, vsm, osm);
 }
 static __device__ PlowProgram packed_prog(const KArgs* a) {
     PlowProgram prog{};
@@ -166,11 +166,11 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_carry_packed(KAr
     __shared__ bf16 vsm[64 * 16];
     __shared__ float osm[64 * 16];
     PlowProgram prog = packed_prog(a);
-    d_kda_chunk_carry_packed_bt64(
+    d_kda_chunk_carry_packed_bt64<KDA_CHUNK_QPRE>(
         (bf16*)a->y, (float*)a->state, (const bf16*)a->q, (const bf16*)a->k,
         (const bf16*)a->w, (const bf16*)a->u, (const float*)a->aqk,
         (const float*)a->gprefix, a->H, a->D, a->V, a->scale, blockIdx.x, gridDim.x, st,
-        vsm, osm, &prog, KDA_CHUNK_QPRE);
+        vsm, osm, &prog);
 }
 
 #else

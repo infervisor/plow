@@ -1792,6 +1792,7 @@ const PACKED_PREFILL_MLA_NORM_SEG_SYM: &str = "plow_packed_prefill_mla_norm_segm
 const PACKED_PREFILL_MLA_FLASH_SEG_SYM: &str = "plow_packed_prefill_mla_flash_segments_1";
 const PACKED_PREFILL_KDA_SEG_SYM: &str = "plow_packed_prefill_kda_serial_segments_1";
 const PACKED_PREFILL_KDA_CHUNK_SEG_SYM: &str = "plow_packed_prefill_kda_chunk_segments_1";
+const KDA_FAMILY_SEG_SYM: &str = "plow_kda_family_segments_1";
 
 fn check_packed_prefill_abi(prefill: bool, flash_required: bool, flash: bool) -> Result<()> {
     if !prefill {
@@ -1922,6 +1923,7 @@ const K3_ARMS_SYM: &str = "plow_k3_arms_1";
 const MOE_PF_A4W4_SYM: &str = "plow_moe_pf_a4w4_arm";
 const KDA_CONV_STEP_DB_SYM: &str = "plow_kda_conv_step_db_arm";
 const KDA_CHUNK_SYM: &str = "plow_kda_chunk_bt64_arm_1";
+const KDA_CHUNK_QPRE_SYM: &str = "plow_kda_chunk_qpre_arm_1";
 const KDA_CONV_STEP_DB_REPLACED_OPS: &[DevOp] = &[
     DevOp::KdaConv,
     DevOp::KdaGate,
@@ -4703,6 +4705,12 @@ fn packed_segment_route(
     mla_flash: bool,
     kda: bool,
 ) -> Result<PackedSegmentRoute> {
+    // The KDA family object is also the spill-isolation object for ordinary prefill.  Its
+    // capability marker proves it supports null packed metadata; older packed-only objects
+    // are never loaded into `kda` and retain the primary fallback here.
+    if class == 7 && kda {
+        return Ok(PackedSegmentRoute::Kda);
+    }
     if !active {
         return Ok(PackedSegmentRoute::Primary);
     }
@@ -4712,7 +4720,7 @@ fn packed_segment_route(
     let (available, route, name) = match class {
         5 => (mla_norm, PackedSegmentRoute::MlaNorm, "MLA norm/cache"),
         6 => (mla_flash, PackedSegmentRoute::MlaFlash, "MLA flash"),
-        7 => (kda, PackedSegmentRoute::Kda, "serial KDA"),
+        7 => (kda, PackedSegmentRoute::Kda, "KDA"),
         _ => {
             return Err(RuntimeError::Device(format!(
                 "packed-prefill segment has unknown operator-family class {class}"
@@ -5944,7 +5952,13 @@ impl AmdEngine {
             .filter(|op| {
                 matches!(
                     op,
-                    DevOp::KdaStateStep | DevOp::KdaConv3 | DevOp::KdaStateStepG
+                    DevOp::KdaStateStep
+                        | DevOp::KdaConv3
+                        | DevOp::KdaStateStepG
+                        | DevOp::KdaChunkPrepare
+                        | DevOp::KdaChunkIntra
+                        | DevOp::KdaChunkWu
+                        | DevOp::KdaChunkCarry
                 )
             })
             .collect();
@@ -5952,7 +5966,7 @@ impl AmdEngine {
         packed_kda_ops.dedup_by_key(|op| *op as u16);
         let mut load_packed_family = |stem: &str,
                                       symbol_base: &str,
-                                      marker: &str,
+                                      markers: &[&str],
                                       fp8_kv: Option<bool>,
                                       required_ops: &[DevOp]|
          -> Result<Option<HsaKernel>> {
@@ -5965,11 +5979,14 @@ impl AmdEngine {
                 RuntimeError::Device(format!("code object {}: {e}", path.display()))
             })?;
             let syms = elf_symbol_names(&image);
-            if !syms.contains(&PACKED_PREFILL_ABI_SYM) || !syms.contains(&marker) {
+            if !syms.contains(&PACKED_PREFILL_ABI_SYM)
+                || markers.iter().any(|marker| !syms.contains(marker))
+            {
                 return Err(RuntimeError::Device(format!(
                     "packed-prefill family object {} must advertise `{PACKED_PREFILL_ABI_SYM}` \
-                         and `{marker}`; refusing a stale or wrong-family object",
-                    path.display()
+                         and markers {:?}; refusing a stale or wrong-family object",
+                    path.display(),
+                    markers
                 )));
             }
             check_compiled_opcode_marker_set(&syms, &path, required_ops.iter().copied())?;
@@ -6002,11 +6019,12 @@ impl AmdEngine {
             ""
         };
         let packed_route = crate::config::RuntimeConfig::get().amd.packed_prefill_route;
+        let kda_family_route = crate::config::RuntimeConfig::get().amd.kda_family_route;
         let k_packed_mla_norm = if packed_route {
             load_packed_family(
                 &format!("interp_packed_mla_norm{packed_kv_infix}"),
                 "plow_interp_packed_mla_norm",
-                PACKED_PREFILL_MLA_NORM_SEG_SYM,
+                &[PACKED_PREFILL_MLA_NORM_SEG_SYM],
                 Some(variant == Variant::Fp8Kv),
                 &[],
             )?
@@ -6017,23 +6035,32 @@ impl AmdEngine {
             load_packed_family(
                 &format!("interp_packed_mla_flash{packed_kv_infix}"),
                 "plow_interp_packed_mla_flash",
-                PACKED_PREFILL_MLA_FLASH_SEG_SYM,
+                &[PACKED_PREFILL_MLA_FLASH_SEG_SYM],
                 Some(variant == Variant::Fp8Kv),
                 &[],
             )?
         } else {
             None
         };
-        let k_packed_kda = if packed_route {
+        let kda_qpre_required = requires.as_ref().is_some_and(|requires| {
+            requires
+                .iter()
+                .any(|requirement| requirement == "PLOW_KDA_CHUNK_QPRE=1")
+        });
+        let k_packed_kda = if packed_route || kda_family_route {
             let marker = if need_kda_chunk_prefill.is_some() {
                 PACKED_PREFILL_KDA_CHUNK_SEG_SYM
             } else {
                 PACKED_PREFILL_KDA_SEG_SYM
             };
+            let mut markers = vec![KDA_FAMILY_SEG_SYM, marker];
+            if kda_qpre_required {
+                markers.push(KDA_CHUNK_QPRE_SYM);
+            }
             load_packed_family(
                 "interp_packed_kda",
                 "plow_interp_packed_kda",
-                marker,
+                &markers,
                 None,
                 &packed_kda_ops,
             )?
@@ -10317,6 +10344,14 @@ mod tests {
         assert_eq!(
             packed_segment_route(true, 7, false, false, true).unwrap(),
             PackedSegmentRoute::Kda
+        );
+        assert_eq!(
+            packed_segment_route(false, 7, false, false, true).unwrap(),
+            PackedSegmentRoute::Kda
+        );
+        assert_eq!(
+            packed_segment_route(false, 7, false, false, false).unwrap(),
+            PackedSegmentRoute::Primary
         );
         assert!(packed_segment_route(true, 5, false, true, true).is_err());
         assert!(packed_segment_route(true, 9, true, true, true).is_err());

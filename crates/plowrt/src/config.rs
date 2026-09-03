@@ -378,6 +378,10 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-packed-prefill-route", env = "PLOW_PACKED_PREFILL_ROUTE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub packed_prefill_route: bool,
 
+    /// Experimental spill-isolated KDA-family object for ordinary prefill segments.
+    #[arg(long = "amd-kda-family-route", env = "PLOW_KDA_FAMILY_ROUTE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub kda_family_route: bool,
+
     /// Global-queue scheduler. "0" = static per-block-stream, "1" = GQ.
     #[arg(long = "amd-global-queue", env = "PLOW_GLOBAL_QUEUE", global = true)]
     pub global_queue: Option<String>,

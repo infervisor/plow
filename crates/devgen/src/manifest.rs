@@ -1339,6 +1339,9 @@ pub fn config_header(manifest: &Value) -> String {
     let prefill_ops = object_ops("prefill");
     let decode_ops = object_ops("decode");
     let flash_ops = object_ops("flash");
+    let kda_chunk_qpre = union
+        .iter()
+        .any(|arm| arm.starts_with("KdaChunk") && arm.ends_with("_qpre"));
     out.push_str("/* --- packet and per-object opcode inventory --- */\n");
     for o in DevOp::ALL {
         let name = op_name(*o);
@@ -1369,6 +1372,10 @@ pub fn config_header(manifest: &Value) -> String {
 #define PLOW_KDA_CONV_STEP_DB PLOW_HAS_KDA_CONV_STATE_STEP_G\n\
 #endif\n",
     );
+    out.push_str(&format!(
+        "#ifndef PLOW_KDA_CHUNK_QPRE\n#define PLOW_KDA_CHUNK_QPRE {}\n#endif\n",
+        if kda_chunk_qpre { 1 } else { 0 }
+    ));
     let materialized_residual_input = manifest
         .pointer("/features/materialized_residual_input")
         .and_then(Value::as_bool)
@@ -1939,6 +1946,17 @@ mod tests {
         assert!(h.contains("#define GV_MM_MAX 8"));
         assert!(h.contains("#ifndef GV_MM_MAX"));
         assert!(h.contains("PLOW_PACKET_HASH"));
+    }
+
+    #[test]
+    fn header_derives_chunk_qpre_from_the_exact_arm_variant() {
+        let mut qpre = build(&model(), "gfx950");
+        qpre["union"] = json!(["KdaChunkWu/d128_qpre", "KdaChunkCarry/d128_qpre"]);
+        assert!(config_header(&qpre).contains("#define PLOW_KDA_CHUNK_QPRE 1"));
+
+        let mut ordinary = build(&model(), "gfx950");
+        ordinary["union"] = json!(["KdaChunkWu/d128", "KdaChunkCarry/d128"]);
+        assert!(config_header(&ordinary).contains("#define PLOW_KDA_CHUNK_QPRE 0"));
     }
 
     #[test]

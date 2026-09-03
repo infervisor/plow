@@ -442,13 +442,14 @@ __device__ void d_kda_chunk_wu_bt64(
  * walks `chunks` in order; distinct workgroups own disjoint V rows, so no cross-workgroup handoff
  * is required. The decomposition matches FLA: V' = U-WH, O = Q exp(g) H + Aqk V', then
  * H = H exp(g_last) + V'^T (K exp(g_last-g)). State is V-first f32. */
+template <bool Q_PRECOMPUTED = false>
 __device__ void d_kda_chunk_carry_bt64(
     bf16* __restrict__ out, float* __restrict__ state, const bf16* __restrict__ q,
     const bf16* __restrict__ k, const bf16* __restrict__ W, const bf16* __restrict__ U,
     const float* __restrict__ Aqk, const float* __restrict__ g_cumsum_log2,
     const uint2* __restrict__ chunks, unsigned n_chunks, unsigned T, unsigned H, unsigned D,
     unsigned V, float scale, unsigned slice, unsigned nblk, float* __restrict__ st,
-    bf16* __restrict__ vsm, float* __restrict__ osm, bool q_precomputed = false) {
+    bf16* __restrict__ vsm, float* __restrict__ osm) {
     const unsigned tid = threadIdx.x, lane = tid & 63u, wave = tid >> 6;
     const unsigned token = lane & 15u, kgroup = lane >> 4;
     const unsigned vtiles = (V + 15u) / 16u;
@@ -477,7 +478,7 @@ __device__ void d_kda_chunk_carry_bt64(
                         for (unsigned j = 0; j < 8; j++) {
                             const size_t i = (row * H + h) * D + d + j;
                             wf[j] = __builtin_bit_cast(bf16_t, W[i]);
-                            if (q_precomputed) {
+                            if constexpr (Q_PRECOMPUTED) {
                                 qf[j] = __builtin_bit_cast(bf16_t, q[i]);
                             } else {
                                 const float qs = bf2f(f2bf(bf2f(q[i]) * scale));
@@ -628,11 +629,12 @@ __device__ void d_kda_chunk_wu_packed_bt64(
     }
 }
 
+template <bool Q_PRECOMPUTED = false>
 __device__ void d_kda_chunk_carry_packed_bt64(
     bf16* out, float* state, const bf16* q, const bf16* k, const bf16* W,
     const bf16* U, const float* Aqk, const float* g_prefix, unsigned H, unsigned D,
     unsigned V, float scale, unsigned slice, unsigned nblk, float* st, bf16* vsm,
-    float* osm, const PlowProgram* prog, bool q_precomputed = false) {
+    float* osm, const PlowProgram* prog) {
     const unsigned vtiles = (V + 15u) / 16u;
     for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
         const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
@@ -649,10 +651,10 @@ __device__ void d_kda_chunk_carry_packed_bt64(
         const size_t rd = (size_t)span->row0 * H * D;
         const size_t rv = (size_t)span->row0 * H * V;
         const size_t ra = (size_t)span->row0 * H * 64u;
-        d_kda_chunk_carry_bt64(out + rv, ss, q + rd, k + rd, W + rd, U + rv, Aqk + ra,
-                               g_prefix + rd, nullptr, (span->n_rows + 63u) / 64u,
-                               span->n_rows, H, D, V, scale, slice, nblk, st, vsm, osm,
-                               q_precomputed);
+        d_kda_chunk_carry_bt64<Q_PRECOMPUTED>(
+            out + rv, ss, q + rd, k + rd, W + rd, U + rv, Aqk + ra, g_prefix + rd,
+            nullptr, (span->n_rows + 63u) / 64u, span->n_rows, H, D, V, scale, slice,
+            nblk, st, vsm, osm);
     }
 }
 #endif

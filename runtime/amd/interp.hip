@@ -63,6 +63,9 @@
 #ifndef PLOW_HAS_KDA_CHUNK_CARRY
 #define PLOW_HAS_KDA_CHUNK_CARRY 1
 #endif
+#ifndef PLOW_KDA_CHUNK_QPRE
+#define PLOW_KDA_CHUNK_QPRE 0
+#endif
 #ifndef PLOW_MATERIALIZED_RESIDUAL_INPUT
 #define PLOW_MATERIALIZED_RESIDUAL_INPUT 0
 #endif
@@ -147,6 +150,10 @@ extern "C" __device__ unsigned plow_packed_prefill_mla_norm_segments_1 = 1;
 #if !PLOW_PACKED_PREFILL_KDA_CONSUMERS || !PLOW_K3
 #error "packed KDA bucket requires PLOW_PACKED_PREFILL_KDA_CONSUMERS and PLOW_K3"
 #endif
+/* This family object also runs pure single-request KDA segments.  The marker prevents a
+ * runtime from sending an ordinary segment to an older object whose bucket trapped whenever
+ * packed metadata was absent. */
+extern "C" __device__ unsigned plow_kda_family_segments_1 = 1;
 extern "C" __device__ unsigned plow_packed_prefill_kda_serial_segments_1 = 1;
 #if PLOW_KDA_CHUNK
 extern "C" __device__ unsigned plow_packed_prefill_kda_chunk_segments_1 = 1;
@@ -215,7 +222,9 @@ extern "C" __device__ unsigned plow_opcode_kda_chunk_carry_1 = 1;
 #endif
 #if PLOW_K3 && PLOW_KDA_CHUNK
 extern "C" __device__ unsigned plow_kda_chunk_bt64_arm_1 = 1;
+#if PLOW_KDA_CHUNK_QPRE
 extern "C" __device__ unsigned plow_kda_chunk_qpre_arm_1 = 1;
+#endif
 #endif
 #if PLOW_K3 && PLOW_KDA_CONV_STEP_DB
 extern "C" __device__ unsigned plow_kda_conv_step_db_arm = 1;
@@ -2055,15 +2064,22 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             __builtin_trap();
     }
 #elif defined(PLOW_BUCKET_PACKED_KDA)
-    if (!plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
+    const bool packed_kda = plow_packed_prefill_enabled(prog_meta);
     switch (in->op) {
 #if PLOW_HAS_KDA_STATE_STEP
         case PLOW_DOP_KDA_STATE_STEP:
-            d_kda_state_step_packed</*GATED=*/false>(
-                (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
-                (const bf16*)TEN(3), (const float*)TEN(4), (const float*)TEN(5), nullptr,
-                nullptr, nullptr, nullptr, 0u, 0.0f, (float*)TEN(6), in->i[1], in->i[2],
-                in->i[3], in->i[4], in->fj[0].f, slice, nblk, (float*)sm->raw, prog_meta);
+            if (packed_kda)
+                d_kda_state_step_packed</*GATED=*/false>(
+                    (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), (const float*)TEN(4), (const float*)TEN(5), nullptr,
+                    nullptr, nullptr, nullptr, 0u, 0.0f, (float*)TEN(6), in->i[1], in->i[2],
+                    in->i[3], in->i[4], in->fj[0].f, slice, nblk, (float*)sm->raw, prog_meta);
+            else
+                d_kda_state_step((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                                 (const bf16*)TEN(3), (const float*)TEN(4),
+                                 (const float*)TEN(5), (float*)TEN(6), in->i[0], in->i[1],
+                                 in->i[2], in->i[3], in->i[4], in->fj[0].f, slice, nblk,
+                                 (float*)sm->raw, 0, nullptr);
             break;
 #endif /* PLOW_HAS_KDA_STATE_STEP */
 #if PLOW_HAS_KDA_CONV3
@@ -2076,11 +2092,18 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             if (wv == nullptr || cs[0] == nullptr || cs[1] == nullptr || cs[2] == nullptr ||
                 TEN(6) == nullptr || TEN(7) == nullptr || in->i[1] == 0u)
                 __builtin_trap();
-            d_kda_conv3_packed(
-                (bf16*)TEN(0), (bf16*)TEN(1), (bf16*)TEN(2), (const bf16*)TEN(3),
-                (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
-                (const float*)TEN(7), wv, cs[0], cs[1], cs[2], in->i[1], in->i[2],
-                in->i[3], slice, nblk, prog_meta);
+            if (packed_kda)
+                d_kda_conv3_packed(
+                    (bf16*)TEN(0), (bf16*)TEN(1), (bf16*)TEN(2), (const bf16*)TEN(3),
+                    (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
+                    (const float*)TEN(7), wv, cs[0], cs[1], cs[2], in->i[1], in->i[2],
+                    in->i[3], slice, nblk, prog_meta);
+            else
+                d_kda_conv3((bf16*)TEN(0), (bf16*)TEN(1), (bf16*)TEN(2),
+                            (const bf16*)TEN(3), (const bf16*)TEN(4),
+                            (const bf16*)TEN(5), (const float*)TEN(6),
+                            (const float*)TEN(7), wv, cs[0], cs[1], cs[2], in->i[0],
+                            in->i[1], in->i[2], in->i[3], slice, nblk, 0, nullptr);
         } break;
 #endif /* PLOW_HAS_KDA_CONV3 */
 #if PLOW_HAS_KDA_STATE_STEP_G
@@ -2088,14 +2111,111 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             const float* dtb = (in->i[5] == PLOW_TENSOR_NONE) ? nullptr : (const float*)T[in->i[5]];
             if (dtb == nullptr || TEN(7) == nullptr || TEN(4) == nullptr || TEN(5) == nullptr)
                 __builtin_trap();
-            d_kda_state_step_packed</*GATED=*/true>(
-                (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
-                (const bf16*)TEN(3), nullptr, nullptr, (const bf16*)TEN(4),
-                (const bf16*)TEN(5), (const float*)TEN(7), dtb, in->i[6], in->fj[1].f,
-                (float*)TEN(6), in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
-                slice, nblk, (float*)sm->raw, prog_meta);
+            if (packed_kda)
+                d_kda_state_step_packed</*GATED=*/true>(
+                    (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), nullptr, nullptr, (const bf16*)TEN(4),
+                    (const bf16*)TEN(5), (const float*)TEN(7), dtb, in->i[6], in->fj[1].f,
+                    (float*)TEN(6), in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
+                    slice, nblk, (float*)sm->raw, prog_meta);
+            else
+                d_kda_state_step_g(
+                    (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
+                    (const float*)TEN(7), dtb, in->i[6], in->fj[1].f, (float*)TEN(6),
+                    in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
+                    slice, nblk, (float*)sm->raw, 0, nullptr);
         } break;
 #endif /* PLOW_HAS_KDA_STATE_STEP_G */
+#if PLOW_KDA_CHUNK
+#if PLOW_HAS_KDA_CHUNK_PREPARE
+        case PLOW_DOP_KDA_CHUNK_PREPARE:
+            if (in->i[0] == 0u || in->i[1] == 0u ||
+                (in->i[2] != 64u && in->i[2] != 128u))
+                __builtin_trap();
+            if (packed_kda)
+                d_kda_chunk_prepare_packed_bt64(
+                    (bf16*)TEN(0), (bf16*)TEN(1), (float*)TEN(2), (float*)TEN(3),
+                    (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
+                    (const float*)TEN(7), in->i[1], in->i[2], in->i[3], in->fj[0].f,
+                    slice, nblk, prog_meta);
+            else
+                d_kda_chunk_prepare_bt64(
+                    (bf16*)TEN(0), (bf16*)TEN(1), (float*)TEN(2), (float*)TEN(3),
+                    (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
+                    (const float*)TEN(7), nullptr, (in->i[0] + 63u) / 64u, in->i[0],
+                    in->i[1], in->i[2], in->i[3], in->fj[0].f, slice, nblk);
+            break;
+#endif
+#if PLOW_HAS_KDA_CHUNK_INTRA
+        case PLOW_DOP_KDA_CHUNK_INTRA:
+            if (in->i[0] == 0u || in->i[1] == 0u ||
+                (in->i[2] != 64u && in->i[2] != 128u))
+                __builtin_trap();
+            if (packed_kda)
+                d_kda_chunk_intra_packed_bt64(
+                    (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), (const float*)TEN(4), (const float*)TEN(5),
+                    in->i[1], in->i[2], in->fj[0].f, slice, nblk, (float*)sm->raw,
+                    prog_meta);
+            else
+                d_kda_chunk_intra_bt64(
+                    (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), (const float*)TEN(4), (const float*)TEN(5),
+                    nullptr, (in->i[0] + 63u) / 64u, in->i[0], in->i[1], in->i[2],
+                    in->fj[0].f, slice, nblk, (float*)sm->raw);
+            break;
+#endif
+#if PLOW_HAS_KDA_CHUNK_WU
+        case PLOW_DOP_KDA_CHUNK_WU:
+            if (in->i[0] == 0u || in->i[1] == 0u ||
+                (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2] ||
+                (in->i[4] != 0u) != (PLOW_KDA_CHUNK_QPRE != 0))
+                __builtin_trap();
+            if (packed_kda)
+                d_kda_chunk_wu_packed_bt64(
+                    (bf16*)TEN(0), (bf16*)TEN(1),
+                    PLOW_KDA_CHUNK_QPRE ? (bf16*)TEN(7) : nullptr, (const float*)TEN(2),
+                    (const bf16*)TEN(3), (const bf16*)TEN(4), (const float*)TEN(5),
+                    (const float*)TEN(6), in->i[1], in->i[2], in->i[3], in->fj[0].f,
+                    PLOW_KDA_CHUNK_QPRE != 0, slice, nblk, prog_meta);
+            else
+                d_kda_chunk_wu_bt64(
+                    (bf16*)TEN(0), (bf16*)TEN(1),
+                    PLOW_KDA_CHUNK_QPRE ? (bf16*)TEN(7) : nullptr, (const float*)TEN(2),
+                    (const bf16*)TEN(3), (const bf16*)TEN(4), (const float*)TEN(5),
+                    (const float*)TEN(6), nullptr, (in->i[0] + 63u) / 64u, in->i[0],
+                    in->i[1], in->i[2], in->i[3], in->fj[0].f,
+                    PLOW_KDA_CHUNK_QPRE != 0, slice,
+                    nblk);
+            break;
+#endif
+#if PLOW_HAS_KDA_CHUNK_CARRY
+        case PLOW_DOP_KDA_CHUNK_CARRY: {
+            if (in->i[0] == 0u || in->i[1] == 0u ||
+                (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2] ||
+                (in->i[4] != 0u) != (PLOW_KDA_CHUNK_QPRE != 0))
+                __builtin_trap();
+            float* kst = (float*)sm->raw;
+            bf16* kv = (bf16*)(kst + 16u * in->i[2]);
+            float* ko = (float*)(kv + 64u * 16u);
+            if (packed_kda)
+                d_kda_chunk_carry_packed_bt64<(PLOW_KDA_CHUNK_QPRE != 0)>(
+                    (bf16*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
+                    (const float*)TEN(6), (const float*)TEN(7), in->i[1], in->i[2],
+                    in->i[3], in->fj[0].f, slice, nblk, kst, kv, ko, prog_meta);
+            else
+                d_kda_chunk_carry_bt64<(PLOW_KDA_CHUNK_QPRE != 0)>(
+                    (bf16*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
+                    (const float*)TEN(6), (const float*)TEN(7), nullptr,
+                    (in->i[0] + 63u) / 64u, in->i[0], in->i[1], in->i[2], in->i[3],
+                    in->fj[0].f, slice, nblk, kst, kv, ko);
+            break;
+        }
+#endif
+#endif /* PLOW_KDA_CHUNK */
         default:
             __builtin_trap();
     }
@@ -2287,52 +2407,53 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if PLOW_HAS_KDA_CHUNK_WU
         case PLOW_DOP_KDA_CHUNK_WU:
             if (in->i[0] == 0u || in->i[1] == 0u ||
-                (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2])
+                (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2] ||
+                (in->i[4] != 0u) != (PLOW_KDA_CHUNK_QPRE != 0))
                 __builtin_trap();
 #if PLOW_PACKED_PREFILL_KDA_CONSUMERS
             if (plow_packed_prefill_enabled(prog_meta)) {
                 d_kda_chunk_wu_packed_bt64(
                     (bf16*)TEN(0), (bf16*)TEN(1),
-                    in->i[4] ? (bf16*)TEN(7) : nullptr, (const float*)TEN(2),
+                    PLOW_KDA_CHUNK_QPRE ? (bf16*)TEN(7) : nullptr, (const float*)TEN(2),
                     (const bf16*)TEN(3), (const bf16*)TEN(4), (const float*)TEN(5),
                     (const float*)TEN(6), in->i[1], in->i[2], in->i[3], in->fj[0].f,
-                    in->i[4] != 0u, slice, nblk, prog_meta);
+                    PLOW_KDA_CHUNK_QPRE != 0, slice, nblk, prog_meta);
                 break;
             }
 #endif
             d_kda_chunk_wu_bt64(
-                (bf16*)TEN(0), (bf16*)TEN(1), in->i[4] ? (bf16*)TEN(7) : nullptr,
+                (bf16*)TEN(0), (bf16*)TEN(1),
+                PLOW_KDA_CHUNK_QPRE ? (bf16*)TEN(7) : nullptr,
                 (const float*)TEN(2), (const bf16*)TEN(3), (const bf16*)TEN(4),
                 (const float*)TEN(5), (const float*)TEN(6), nullptr,
                 (in->i[0] + 63u) / 64u, in->i[0], in->i[1], in->i[2], in->i[3],
-                in->fj[0].f, in->i[4] != 0u, slice, nblk);
+                in->fj[0].f, PLOW_KDA_CHUNK_QPRE != 0, slice, nblk);
             break;
 #endif /* PLOW_HAS_KDA_CHUNK_WU */
 #if PLOW_HAS_KDA_CHUNK_CARRY
         case PLOW_DOP_KDA_CHUNK_CARRY: {
             if (in->i[0] == 0u || in->i[1] == 0u ||
-                (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2])
+                (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2] ||
+                (in->i[4] != 0u) != (PLOW_KDA_CHUNK_QPRE != 0))
                 __builtin_trap();
             float* kst = (float*)sm->raw;
             bf16* kv = (bf16*)(kst + 16u * in->i[2]);
             float* ko = (float*)(kv + 64u * 16u);
 #if PLOW_PACKED_PREFILL_KDA_CONSUMERS
             if (plow_packed_prefill_enabled(prog_meta)) {
-                d_kda_chunk_carry_packed_bt64(
+                d_kda_chunk_carry_packed_bt64<(PLOW_KDA_CHUNK_QPRE != 0)>(
                     (bf16*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
                     (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
                     (const float*)TEN(6), (const float*)TEN(7), in->i[1], in->i[2],
-                    in->i[3], in->fj[0].f, slice, nblk, kst, kv, ko, prog_meta,
-                    in->i[4] != 0u);
+                    in->i[3], in->fj[0].f, slice, nblk, kst, kv, ko, prog_meta);
                 break;
             }
 #endif
-            d_kda_chunk_carry_bt64(
+            d_kda_chunk_carry_bt64<(PLOW_KDA_CHUNK_QPRE != 0)>(
                 (bf16*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
                 (const float*)TEN(7), nullptr, (in->i[0] + 63u) / 64u, in->i[0], in->i[1],
-                in->i[2], in->i[3], in->fj[0].f, slice, nblk, kst, kv, ko,
-                in->i[4] != 0u);
+                in->i[2], in->i[3], in->fj[0].f, slice, nblk, kst, kv, ko);
             break;
         }
 #endif /* PLOW_HAS_KDA_CHUNK_CARRY */
