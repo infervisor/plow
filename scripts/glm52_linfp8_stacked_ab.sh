@@ -41,12 +41,18 @@ common=(--emit devblob --max-ctx "$CTX" --n-cu 256 --num-gpus 4)
 emit() { # name  ckpt  env...
   local name="$1" ckpt="$2"; shift 2
   echo "== $name  ($*)"
+  rm -f "$OUT/build.json" "$OUT/$name.build.json"
   env -u GLM_LINEAR_FP8 -u GLM_SHARED_GLU_SPLIT \
       GLM_SHARD_HEAD=1 GLM_MOE_CORESIDENT=2 GLM_SHARED_CUS=48 \
       "$@" ./target/release/plowc --hf-dir "$ckpt" "${common[@]}" --out "$OUT/$name.pkt"
+  test -s "$OUT/build.json" || {
+    echo "FAIL: $name emit did not produce $OUT/build.json" >&2
+    exit 1
+  }
+  mv "$OUT/build.json" "$OUT/$name.build.json"
 }
 
 emit stk_base "$BF16"
 emit stk_lfp8 "$FP8" GLM_LINEAR_FP8=1
 
-ls -la "$OUT"/*.pkt
+ls -la "$OUT"/*.pkt "$OUT"/*.build.json

@@ -18,6 +18,9 @@ declare -A migrated_batch_gates=(
   [scripts/gate_batched.sh]=1
   [scripts/k3_batch_gate.sh]=1
 )
+declare -A migrated_tp_gates=(
+  [scripts/glm52_linfp8_stacked_coherence.sh]=1
+)
 while IFS=$'\t' read -r class path binding disposition; do
   [[ -z "$class" || "$class" == \#* ]] && continue
   case "$class" in
@@ -98,6 +101,20 @@ for path in "${!migrated_batch_gates[@]}"; do
   }
 done
 
+for path in "${!migrated_tp_gates[@]}"; do
+  for flag in bench --token-audit --engine-diagnostics --amd-tp-agree-every; do
+    rg -q -- "$flag" "$ROOT/$path" || {
+      echo "FAIL: migrated production TP gate lost '$flag': $path" >&2
+      exit 1
+    }
+  done
+  awk '$0 !~ /^[[:space:]]*#/ && /amd-bench/ { found=1 } END { exit found }' "$ROOT/$path" || {
+    echo "FAIL: migrated production TP gate regressed to amd-bench: $path" >&2
+    exit 1
+  }
+done
+
 "$ROOT/scripts/batch_gates_selftest.sh"
+"$ROOT/scripts/glm52_linfp8_stacked_coherence_selftest.sh"
 
 echo "PASS: ${#observed[@]} active AMD direct-runner script consumers are classified"

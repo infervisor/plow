@@ -31,6 +31,11 @@ order, row count, and complete nonzero output streams before comparing tokens.
 arm through `bench --token-audit`, records production TPOT, and refuses missing
 artifact identities, incomplete/non-AMD work, scheduler loss, zero output, or
 any cross-arm token mismatch.
+`glm52_linfp8_stacked_coherence.sh` now forces every-token TP agreement and the
+per-dispatch counter audit through production `bench`. Each emit preserves its
+own `build.json`; the gate verifies that manifest's canonical path and checksum
+alongside prompt, output, packet, object-directory, checkpoint, and TP-width
+evidence. Missing or partial diagnostics are rejected.
 
 Run `scripts/check_amd_bench_consumers.sh` in repository checks. It fails when
 an active shell invocation is unclassified, when a class or binding is invalid,
@@ -64,7 +69,7 @@ rewritten by this migration.
 | surface | `plowrt bench` coverage | remaining blocker |
 |---|---|---|
 | raw packet trace | AMD rank 0's last completed program, written after mux drain with `--trace-raw` | Multi-rank trace comparison is not represented. |
-| TP agreement | Decode uses the serving cadence plus every-dispatch counter audit; prefill completion compares all ranks. The JSON records the exact policy. Any observed disagreement fails the request. | A full every-token, every-rank stream dump still belongs to the correctness oracle. |
+| TP agreement | Decode uses the serving cadence plus every-dispatch counter audit; prefill completion compares all ranks. The JSON records the exact policy. Any observed disagreement fails the request. `glm52_linfp8_stacked_coherence.sh` pins the cadence to every token and validates the complete TP4 policy. | A full per-rank stream dump remains available only in the direct diagnostic runner. |
 | prefill selection | `plowrt bench --engine-diagnostics` records ordered AMD TP `slot,row_start,rows,bucket` entries from the dispatched `ChunkStep`. | Single-GPU/decode-only fallback and CUDA selection capture report `complete=false`. |
 | decode selection | `plowrt bench --engine-diagnostics` records ordered AMD `occupied_rows,bucket,steps` entries at the actual dispatch site, including multistep quanta. | CUDA selection capture is not wired. |
 | exact token stream | `plowrt bench --parity-report` records one exact B1 request. `--prompt-rows` plus `--token-audit` records ordered ragged production-mux rows; `gate_batched.sh` checks B1↔B4/B8 and `k3_batch_gate.sh` checks two distinct compiled widths under TP8. Non-stream `/v1/completions` provides the corresponding C1 endpoint IDs. | Full-logit and arbitrary tensor comparisons remain focused diagnostics. |

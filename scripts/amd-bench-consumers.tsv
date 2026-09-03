@@ -2,7 +2,6 @@
 synthetic-probe	scripts/glm52_block_sweep_gfx942.sh	synthetic	Unbound truncated-model comparator migrated to amd-probe; production sweep requires checkpoint-bound assets, so semantics do not match.
 performance	scripts/glm52_glusplit_run.sh	checkpoint	Legacy same-object A/B plus TP identity; separate blob/object inputs have no exact bench equivalent.
 performance	scripts/glm52_linfp8_run.sh	checkpoint	Legacy same-object A/B plus TP identity; separate blob/object inputs have no exact bench equivalent.
-TP-audit	scripts/glm52_linfp8_stacked_coherence.sh	checkpoint	Retain for explicit cross-rank agreement and diagnostic output.
 performance	scripts/glm52_linfp8_stacked_run.sh	checkpoint	Legacy same-object A/B plus TP identity; separate blob/object inputs have no exact bench equivalent.
 performance	scripts/k3_block_sweep.sh	checkpoint	Truncated-model context sweep with real weights; never use as served-model performance.
 TP-audit	scripts/k3_tp_equivalence.sh	checkpoint	Retain for full-logit TP equivalence dumps.
