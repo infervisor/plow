@@ -4320,7 +4320,15 @@ mod tests {
             187,
             "two mixes per layer plus the output mix, at T rows too"
         );
-        assert_eq!(n(DevOp::KdaStateStepG), 69);
+        for o in [
+            DevOp::KdaChunkPrepare,
+            DevOp::KdaChunkIntra,
+            DevOp::KdaChunkWu,
+            DevOp::KdaChunkCarry,
+        ] {
+            assert_eq!(n(o), 69, "one {o:?} packet per KDA layer");
+        }
+        assert_eq!(n(DevOp::KdaStateStepG), 0);
         assert_eq!(n(DevOp::KdaConv3), 69);
         assert_eq!(
             n(DevOp::SituGlu),

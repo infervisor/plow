@@ -359,7 +359,8 @@ pub enum DevOp {
     /// rendezvous bracket the phases. Fabric ≈ 2(N−1)/N·msg/rank vs one-shot's (N−1)·msg.
     /// Bit-identical result to one-shot (same f32-acc, r=0..N−1 order). DECODE keeps the
     /// one-shot (its tiny [1,hidden] message is latency-, not bandwidth-, bound).
-    /// `t0=out` · `i0=n(=t·hidden) i1=n_gpu i2=slot(byte offset) i3=gate_rs i4=gate_ag`.
+    /// `t0=out` · `i0=n(=t·hidden) i1=n_gpu i2=slot(byte offset) i3=gate_rs i4=gate_ag
+    /// i5=e0 i6=gslot? i7=gcols?`.
     XReduceTwoShot = 29,
     /// FP8 (e4m3) KV-cache twin of [`DevOp::HeadNormRope`]: writes K/V as `uint8[...]` e4m3 with a
     /// per-(token,kv_head) f32 dequant scale, halving the KV footprint and the decode KV stream.
@@ -1373,11 +1374,12 @@ pub enum DevOp {
     /// `t0=Aqk t1=Ainv t2=q t3=k t4=g_prefix t5=beta` · `i0=T i1=H i2=D` · `f0=scale`.
     KdaChunkIntra = 122,
     /// Transform a BT64 inverse into W/U factors.
-    /// `t0=W t1=U t2=Ainv t3=k t4=v t5=g_prefix t6=beta` · `i0=T i1=H i2=D i3=V`.
+    /// `t0=W t1=U t2=Ainv t3=k t4=v t5=g_prefix t6=beta t7=q?` ·
+    /// `i0=T i1=H i2=D i3=V i4=qpre` · `f0=scale`.
     KdaChunkWu = 123,
     /// Ordered dense single-sequence chunk carry, with V-first f32 recurrent state.
     /// `t0=o t1=state t2=q t3=k t4=W t5=U t6=Aqk t7=g_prefix` ·
-    /// `i0=T i1=H i2=D i3=V` · `f0=scale`.
+    /// `i0=T i1=H i2=D i3=V i4=qpre` · `f0=scale`.
     KdaChunkCarry = 124,
     /// Standalone fused KDA decode boundary: Conv3 + gated recurrent state step + gated RMSNorm.
     /// The raw-argument kernel is selected by opcode capability rather than model identity.
