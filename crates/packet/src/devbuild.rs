@@ -1565,6 +1565,15 @@ impl Builder {
         let lean_kda_key_factor = !uniseg
             && self.lean_kda_key_factor_segments
             && (0..self.ops.len()).any(|i| lean_kda_key_factor_pair(&self.ops, i));
+        // Experimental decode object split. The two adjacent MLA attention packets form one
+        // island, so a model pays one specialist launch per MLA block rather than one launch per
+        // GEMV. Selection is opcode-only: any decode graph with this exact pair is eligible.
+        let decode_mla_segments = !uniseg
+            && std::env::var("PLOW_SEG_DECODE_MLA").ok().as_deref() == Some("1")
+            && self.ops.windows(2).any(|pair| {
+                pair[0].inst.op == DevOp::FlashMlaDecode as u16
+                    && pair[1].inst.op == DevOp::MlaMergeFold as u16
+            });
         // This encoding is understood only by its dedicated interpreter object. As with the
         // raw KDA boundary, keep it isolated even when PLOW_UNISEG was requested; otherwise the
         // ordinary XReduce arm would silently interpret the fused operand slots as its legacy
@@ -1660,6 +1669,17 @@ impl Builder {
             } else if lean_moe_combine && lean_moe_combine_inst(&self.ops[i].inst) {
                 // The standalone object preserves the interpreter's fixed slot order.
                 13
+            } else if decode_mla_segments
+                && ((op == DevOp::FlashMlaDecode as u16
+                    && self
+                        .ops
+                        .get(i + 1)
+                        .is_some_and(|next| next.inst.op == DevOp::MlaMergeFold as u16))
+                    || (op == DevOp::MlaMergeFold as u16
+                        && i > 0
+                        && self.ops[i - 1].inst.op == DevOp::FlashMlaDecode as u16))
+            {
+                18
             } else if uniseg {
                 8
             } else if packed_prefill_segments && packed_prefill_segment_class(op).is_some() {
@@ -1773,7 +1793,8 @@ impl Builder {
             || lean_kda_intra
             || lean_kda_key_factor
             || xr_attnres
-            || mla_materialized;
+            || mla_materialized
+            || decode_mla_segments;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             !raw_segmented || seg_of[consumer] == seg_of[dep.producer() as usize]
         };

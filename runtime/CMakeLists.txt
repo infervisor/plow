@@ -736,6 +736,8 @@ set(PLOW_HSACO_CONFIG "" CACHE FILEPATH
     "manifest-derived plow_config.h used to specialise ordinary interpreter objects")
 option(PLOW_HSACO_DECODE_INVENTORY_PRUNE
        "Prune decode interpreter arms to the generated packet inventory" OFF)
+option(PLOW_HSACO_DECODE_MLA_SEGMENTS
+       "Emit the paired FlashMlaDecode+MlaMergeFold decode segment object" OFF)
 
 if(PLOW_GFX950_HSACO)
     if(PLOW_HSACO_EXTRA_DEFINES MATCHES "(^|[ \t;])-DPLOW_GATE_HIER(=|[ \t;]|$)")
@@ -790,6 +792,11 @@ if(PLOW_GFX950_HSACO)
         message(FATAL_ERROR
             "PLOW_HSACO_DECODE_INVENTORY_PRUNE requires PLOW_HSACO_CONFIG")
     endif()
+    if(PLOW_HSACO_DECODE_MLA_SEGMENTS AND
+       (NOT PLOW_HSACO_DECODE_INVENTORY_PRUNE OR NOT PLOW_HSACO_CONFIG))
+        message(FATAL_ERROR
+            "PLOW_HSACO_DECODE_MLA_SEGMENTS requires packet-paired inventory pruning")
+    endif()
     set(_hs_run "${CMAKE_CURRENT_SOURCE_DIR}/cmake/hipcc_hsaco.sh")
     # The op bodies live entirely in headers, so without these a kernel edit
     # leaves every .elf stale — the exact failure every guard in
@@ -837,6 +844,7 @@ if(PLOW_GFX950_HSACO)
     if(PLOW_HSACO_DECODE_INVENTORY_PRUNE)
         list(APPEND _hs_ax_decode -DPLOW_DECODE_INVENTORY_PRUNE=1)
     endif()
+    set(_hs_ax_decode_mla ${_hs_ax_decode} -DPLOW_BUCKET_DECODE_MLA=1)
     if(PLOW_GEMV_WALK)
         list(APPEND _hs_ax_decode -DPLOW_GEMV_WALK=1)
     endif()
@@ -1144,6 +1152,10 @@ if(PLOW_GFX950_HSACO)
     # IDENTICAL to the object without them. The gate stays because a gate that only fires on
     # regression is doing its job — it turns HSA_STATUS_ERROR_INVALID_ISA at launch into a build
     # error — and because op_attention.h:1282 is why "it fits" was never the whole question.
+    if(PLOW_HSACO_DECODE_MLA_SEGMENTS)
+        list(APPEND _hs_rows
+            "interp_decode_mla|plow_interp_decode_mla_${PLOW_HSACO_ARCH}|_hs_ax_decode_mla|_hs_ax_none|256|2")
+    endif()
     if(PLOW_HSACO_K3)
         list(APPEND _hs_rows
             "interp_decode_k3|${_hs_kdec}|_hs_ax_decode|_hs_ax_k3_dec|256|2"
@@ -1203,7 +1215,8 @@ if(PLOW_GFX950_HSACO)
                 # gemma4_chat.c resolves both by name.
                 set(_sfx "_gq")
                 set(_gq ${_hs_ax_gq})
-                if(PLOW_GATE_HIER AND _a1 STREQUAL "_hs_ax_decode")
+                if(PLOW_GATE_HIER AND
+                   (_a1 STREQUAL "_hs_ax_decode" OR _a1 STREQUAL "_hs_ax_decode_mla"))
                     set(_row_kind_extra ${_hs_ax_gate_hier})
                 endif()
             endif()

@@ -69,6 +69,9 @@
 #ifndef PLOW_DECODE_INVENTORY_PRUNE
 #define PLOW_DECODE_INVENTORY_PRUNE 0
 #endif
+#if defined(PLOW_BUCKET_DECODE_MLA)
+extern "C" __device__ unsigned plow_decode_mla_segment_object_1 = 1;
+#endif
 #ifndef PLOW_HAS_HEADNORM_HD64
 #define PLOW_HAS_HEADNORM_HD64 1
 #endif
@@ -4011,7 +4014,9 @@ __device__ __forceinline__ void ctr_signal(uint32_t* p) {
 #endif
 #define PLOW_GQ_CAT2(a, b) a##b
 #define PLOW_GQ_CAT(a, b) PLOW_GQ_CAT2(a, b)
-#if PLOW_BUCKET_DECODE
+#if defined(PLOW_BUCKET_DECODE_MLA)
+#define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_decode_mla_, PLOW_ARCH_SUFFIX)
+#elif PLOW_BUCKET_DECODE
 #define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_dec_, PLOW_ARCH_SUFFIX)
 #elif defined(PLOW_BUCKET_PACKED_MLA_NORM)
 #define PLOW_INTERP_BASE PLOW_GQ_CAT(plow_interp_packed_mla_norm_, PLOW_ARCH_SUFFIX)

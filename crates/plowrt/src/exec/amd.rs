@@ -292,6 +292,7 @@ fn prefill_segment_specialization_allowed(dispatch: ProgramDispatch) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DecodeSegmentKind {
     Interpreter,
+    MlaAttention,
     KdaDecodeFused(usize),
 }
 
@@ -301,6 +302,10 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
     let mut raw_segment_owner = vec![None; prog.insts.len()];
     for seg in 0..n_segments {
         let mut fused_inst = None;
+        let mut mla_flash_inst = None;
+        let mut mla_merge_inst = None;
+        let mut multiple_mla_flash = false;
+        let mut multiple_mla_merge = false;
         let mut has_other = false;
         for e in prog.stream.iter().filter(|e| e.seg as usize == seg) {
             let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
@@ -310,7 +315,19 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                     prog.insts.len()
                 ))
             })?;
-            if inst.op == DevOp::KdaDecodeFused as u16 {
+            if inst.op == DevOp::FlashMlaDecode as u16 {
+                match mla_flash_inst {
+                    None => mla_flash_inst = Some(e.inst as usize),
+                    Some(i) if i == e.inst as usize => {}
+                    Some(_) => multiple_mla_flash = true,
+                }
+            } else if inst.op == DevOp::MlaMergeFold as u16 {
+                match mla_merge_inst {
+                    None => mla_merge_inst = Some(e.inst as usize),
+                    Some(i) if i == e.inst as usize => {}
+                    Some(_) => multiple_mla_merge = true,
+                }
+            } else if inst.op == DevOp::KdaDecodeFused as u16 {
                 match fused_inst {
                     None => fused_inst = Some(e.inst as usize),
                     Some(i) if i == e.inst as usize => {}
@@ -342,12 +359,24 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
             }
         }
         if let Some(inst) = fused_inst {
-            if has_other {
+            if has_other || mla_flash_inst.is_some() || mla_merge_inst.is_some() {
                 return Err(RuntimeError::Device(format!(
                     "decode segment {seg} mixes KdaDecodeFused with interpreter opcodes; standalone dispatch requires a pure segment"
                 )));
             }
             kinds[seg] = DecodeSegmentKind::KdaDecodeFused(inst);
+        } else if !has_other && (mla_flash_inst.is_some() || mla_merge_inst.is_some()) {
+            let (Some(flash), Some(merge)) = (mla_flash_inst, mla_merge_inst) else {
+                return Err(RuntimeError::Device(format!(
+                    "decode segment {seg} contains only half of the FlashMlaDecode+MlaMergeFold pair"
+                )));
+            };
+            if multiple_mla_flash || multiple_mla_merge || merge != flash + 1 {
+                return Err(RuntimeError::Device(format!(
+                    "decode segment {seg} is not a pure adjacent FlashMlaDecode+MlaMergeFold pair"
+                )));
+            }
+            kinds[seg] = DecodeSegmentKind::MlaAttention;
         }
     }
     for (i, inst) in prog.insts.iter().enumerate() {
@@ -1470,6 +1499,7 @@ fn moe_mxfp4_routes(
 #[derive(Clone, Copy, Debug)]
 enum DecodeSegmentRoute {
     Interpreter,
+    MlaAttention,
     KdaDecodeFused(KdaDecodeFusedArgs),
 }
 
@@ -1488,9 +1518,16 @@ fn kda_decode_fused_routes(
     let kinds = decode_segment_kinds(prog)?;
     let mut routes = Vec::with_capacity(kinds.len());
     for kind in kinds {
-        let DecodeSegmentKind::KdaDecodeFused(inst_ix) = kind else {
-            routes.push(DecodeSegmentRoute::Interpreter);
-            continue;
+        let inst_ix = match kind {
+            DecodeSegmentKind::Interpreter => {
+                routes.push(DecodeSegmentRoute::Interpreter);
+                continue;
+            }
+            DecodeSegmentKind::MlaAttention => {
+                routes.push(DecodeSegmentRoute::MlaAttention);
+                continue;
+            }
+            DecodeSegmentKind::KdaDecodeFused(inst_ix) => inst_ix,
         };
         let d = &prog.insts[inst_ix];
         let (rows, heads, dim, bv, conv_w, flags, gate_mode, version) = (
@@ -5659,6 +5696,8 @@ pub struct AmdEngine {
 
     k_prefill: HsaKernel,
     k_decode: HsaKernel,
+    /// Packet-paired interpreter containing only FlashMlaDecode+MlaMergeFold.
+    k_decode_mla: Option<HsaKernel>,
     k_kda_decode_fused: Option<HsaKernel>,
     k_kda_chunk_intra_cached: Option<HsaKernel>,
     k_kda_key_factor_wu: Option<HsaKernel>,
@@ -6214,6 +6253,13 @@ impl AmdEngine {
         let need_kda_chunk_decode = required_kda_chunk(&blob.progs[dec_ix..]);
         let need_kda_chunk_prefill = required_kda_chunk(&blob.progs[..dec_ix]);
         let need_kda_decode_fused = first_op_in(&blob.progs[dec_ix..], &[DevOp::KdaDecodeFused]);
+        let need_decode_mla_segments = blob.progs[dec_ix..].iter().try_fold(false, |need, p| {
+            Ok::<_, RuntimeError>(
+                need || decode_segment_kinds(p)?
+                    .iter()
+                    .any(|kind| matches!(kind, DecodeSegmentKind::MlaAttention)),
+            )
+        })?;
         if let Some(p) = blob.progs[..dec_ix]
             .iter()
             .find(|p| p.insts.iter().any(|i| i.op == DevOp::KdaDecodeFused as u16))
@@ -6634,6 +6680,47 @@ impl AmdEngine {
             tracing::info!(%e, "no flash object — flash segments run on the 8-wave interpreter");
         }
         drop(load_one_in);
+
+        let k_decode_mla = if need_decode_mla_segments {
+            const MARKER: &str = "plow_decode_mla_segment_object_1";
+            let name = format!("interp_decode_mla{}.elf", sched_decode.suffix());
+            let path = hsaco_dir.join(&name);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "decode MLA segments require packet-paired object {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let syms = elf_symbol_names(&image);
+            if !syms.contains(&MARKER)
+                || !syms.contains(&"plow_packet_hash_lo")
+                || !syms.contains(&"plow_packet_hash_hi")
+            {
+                return Err(RuntimeError::Device(format!(
+                    "{} is not a packet-paired decode MLA segment object",
+                    path.display()
+                )));
+            }
+            check_gate_hier_object(&syms, &path, Phase::Decode, sched_decode)?;
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let symbol = format!("plow_interp_decode_mla_{arch}{}", sched_decode.suffix());
+            let kernel = EngineDevice::get_function(&*be, &module, &symbol)
+                .map_err(|e| RuntimeError::Device(format!("{name}: no symbol {symbol}: {e}")))?;
+            const IMPLICIT: u32 = 256;
+            let want = (std::mem::size_of::<DevProgram>() as u32 + 7) & !7;
+            let got = kernel.kernarg_size();
+            if got != want && got != want + IMPLICIT {
+                return Err(RuntimeError::Device(format!(
+                    "{name}: kernarg segment is {got} B; decode MLA interpreter needs {want} (or {} with implicit args)",
+                    want + IMPLICIT
+                )));
+            }
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
 
         let k_mla_v2_sv_raw = if arch == "gfx950" && variant != Variant::Fp8Kv && need_mla_v2 {
             let name = format!("interp_mla_v2_sv{}.elf", sched_prefill.suffix());
@@ -8380,6 +8467,7 @@ impl AmdEngine {
             trace_write_bytes: Cell::new(0),
             k_prefill,
             k_decode,
+            k_decode_mla,
             k_kda_decode_fused,
             k_kda_chunk_intra_cached,
             k_kda_key_factor_wu,
@@ -9128,6 +9216,23 @@ impl AmdEngine {
                 EngineDevice::launch_cooperative(
                     &*self.be,
                     interpreter,
+                    self.n_cu,
+                    WG_THREADS_8,
+                    0,
+                    kernarg_bytes(&arg),
+                    None,
+                )?;
+            }
+            DecodeSegmentRoute::MlaAttention => {
+                let kernel = self.k_decode_mla.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "decode MLA segment has no validated packet-paired object".into(),
+                    )
+                })?;
+                let arg = self.kernarg(p, seg as u32);
+                EngineDevice::launch_cooperative(
+                    &*self.be,
+                    kernel,
                     self.n_cu,
                     WG_THREADS_8,
                     0,
@@ -11011,6 +11116,88 @@ mod tests {
             ]
         );
         validate_decode_dispatch(&[p], 0).unwrap();
+    }
+
+    #[test]
+    fn decode_mla_pair_routes_as_one_specialist_segment() {
+        let mut p = segmented_decode_probe();
+        p.insts = vec![
+            DevInst64 {
+                op: DevOp::Nop as u16,
+                blocks: 1,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::FlashMlaDecode as u16,
+                blocks: 256,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::MlaMergeFold as u16,
+                blocks: 128,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::Gemv as u16,
+                blocks: 256,
+                ..Default::default()
+            },
+        ];
+        p.stream = [0u32, 1, 2, 3]
+            .into_iter()
+            .zip([0u16, 1, 1, 2])
+            .map(|(inst, seg)| packet::dev::StreamEnt {
+                inst,
+                seg,
+                ..Default::default()
+            })
+            .collect();
+        p.stream_len[0] = 4;
+        assert_eq!(
+            decode_segment_kinds(&p).unwrap(),
+            [
+                DecodeSegmentKind::Interpreter,
+                DecodeSegmentKind::MlaAttention,
+                DecodeSegmentKind::Interpreter,
+            ]
+        );
+        assert!(matches!(
+            kda_decode_fused_routes(&p, &[], &[], &[]).unwrap()[1],
+            DecodeSegmentRoute::MlaAttention
+        ));
+    }
+
+    #[test]
+    fn mixed_decode_mla_ops_remain_on_the_ordinary_interpreter() {
+        let mut p = segmented_decode_probe();
+        p.insts = vec![
+            DevInst64 {
+                op: DevOp::FlashMlaDecode as u16,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::MlaMergeFold as u16,
+                ..Default::default()
+            },
+            DevInst64 {
+                op: DevOp::Gemv as u16,
+                ..Default::default()
+            },
+        ];
+        p.stream = (0..3)
+            .map(|inst| packet::dev::StreamEnt {
+                inst,
+                seg: 0,
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(
+            decode_segment_kinds(&p).unwrap(),
+            [DecodeSegmentKind::Interpreter]
+        );
+        assert!(!requires_segmented_decode(
+            &kda_decode_fused_routes(&p, &[], &[], &[]).unwrap()
+        ));
     }
 
     #[test]

@@ -1100,7 +1100,24 @@ fn object_inventory(progs: &[ProgramArms]) -> Value {
             .collect()
     };
     let prefill = phase("prefill");
-    let decode = phase("decode");
+    let decode_mla_segment = |p: &&ProgramArms| {
+        p.kind == "decode"
+            && p.seg.is_some()
+            && p.arms.iter().any(|a| a.op == "FlashMlaDecode")
+            && p.arms
+                .iter()
+                .all(|a| a.op == "FlashMlaDecode" || a.op == "MlaMergeFold")
+    };
+    let decode_mla: BTreeSet<Arm> = progs
+        .iter()
+        .filter(decode_mla_segment)
+        .flat_map(|p| p.arms.iter().cloned())
+        .collect();
+    let decode: BTreeSet<Arm> = progs
+        .iter()
+        .filter(|p| p.kind == "decode" && !decode_mla_segment(p))
+        .flat_map(|p| p.arms.iter().cloned())
+        .collect();
     let flash_family = |arm: &&Arm| arm.op.starts_with("Flash") || arm.op == "MlaMergeFold";
     let keys = |arms: &BTreeSet<Arm>| arms.iter().map(Arm::key).collect::<Vec<_>>();
     let flash: BTreeSet<Arm> = prefill.iter().filter(flash_family).cloned().collect();
@@ -1134,6 +1151,7 @@ fn object_inventory(progs: &[ProgramArms]) -> Value {
         "ordinary": {
             "prefill": { "arms": keys(&prefill) },
             "decode": { "arms": keys(&decode) },
+            "decode_mla": { "required": !decode_mla.is_empty(), "arms": keys(&decode_mla) },
             "flash": { "arms": keys(&flash) },
         },
         "lean": {
@@ -1379,6 +1397,7 @@ pub fn config_header(manifest: &Value) -> String {
     let prefill_ops = object_ops("prefill");
     let decode_ops = object_ops("decode");
     let flash_ops = object_ops("flash");
+    let decode_mla_ops = object_ops("decode_mla");
     let kda_chunk_qpre = union
         .iter()
         .any(|arm| arm.starts_with("KdaChunk") && arm.ends_with("_qpre"));
@@ -1393,8 +1412,9 @@ pub fn config_header(manifest: &Value) -> String {
             if present { 1 } else { 0 }
         ));
         out.push_str(&format!(
-            "#ifndef {m}\n#if defined(PLOW_BUCKET_FLASH)\n#define {m} {}\n#elif PLOW_BUCKET_DECODE\n#define {m} {}\n#else\n#define {m} {}\n#endif\n#endif\n",
+            "#ifndef {m}\n#if defined(PLOW_BUCKET_FLASH)\n#define {m} {}\n#elif defined(PLOW_BUCKET_DECODE_MLA)\n#define {m} {}\n#elif PLOW_BUCKET_DECODE\n#define {m} {}\n#else\n#define {m} {}\n#endif\n#endif\n",
             if flash_ops.contains(&name) { 1 } else { 0 },
+            if decode_mla_ops.contains(&name) { 1 } else { 0 },
             if decode_ops.contains(&name) { 1 } else { 0 },
             if prefill_ops.contains(&name) { 1 } else { 0 },
         ));
