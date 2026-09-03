@@ -158,7 +158,7 @@ const DOC: &[S] = &[
     S { op: DevOp::NormResidualNorm, t: &["out", "resid", "a", "b", "gamma_b?", "gamma_n?"], i: &["rows", "feat"], f: &["eps", "scale"], j: &[] },
     S { op: DevOp::XReduce, t: &["out"], i: &["H", "n_gpu", "slot", "gate", "gslot?", "gcols?", "row_w?"], f: &[], j: &[] },
     S { op: DevOp::XArgmaxFin, t: &["ids", "local_part"], i: &["n_gpu", "", "slot"], f: &[], j: &[] },
-    S { op: DevOp::XReduceTwoShot, t: &["out"], i: &["n", "n_gpu", "slot", "gate_rs", "gate_ag"], f: &[], j: &[] },
+    S { op: DevOp::XReduceTwoShot, t: &["out"], i: &["n", "n_gpu", "slot", "gate_rs", "gate_ag", "e0", "gslot?", "gcols?"], f: &[], j: &[] },
     S { op: DevOp::XReduceAddNorm, t: &["out2", "xmid_out", "x", "gamma"], i: &["feat", "n_gpu", "slot", "gate"], f: &["eps"], j: &[] },
     S { op: DevOp::HeadNormRopeFp8, t: &["out", "", "", "", "", "", "scale"], i: &[], f: &[], j: &[] },
     S { op: DevOp::MoeRouter, t: &[], i: &["H", "n_exp", "k", "flags"], f: &["route_scale"], j: &[] },

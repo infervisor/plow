@@ -4940,6 +4940,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn folded_gather_prefill_can_use_the_generic_twoshot_path() {
+        let _guard = crate::test_env::env_guard();
+        let _env =
+            crate::test_env::EnvScope::set(&[("PLOW_K3_SHARD_UP", "1"), ("PLOW_XR2_GATHER", "1")]);
+        let p = build_full_t(8, 512);
+        let xr: Vec<_> = p
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::XReduce as u16 || i.op == DevOp::XReduceTwoShot as u16)
+            .collect();
+        assert_eq!(xr.len(), 278);
+        assert!(xr.iter().all(|i| i.op == DevOp::XReduceTwoShot as u16));
+        let gathered: Vec<_> = xr.iter().filter(|i| i.i[7] != 0).collect();
+        assert_eq!(gathered.len(), 92);
+        assert!(gathered
+            .iter()
+            .all(|i| i.i[6] != 0 && i.i[7] == 896 && i.i[1] * i.i[7] == 7168));
+        let gates: std::collections::BTreeSet<u32> =
+            xr.iter().flat_map(|i| [i.i[3], i.i[4]]).collect();
+        assert_eq!(
+            gates.len(),
+            2 * xr.len(),
+            "both rendezvous gates stay unique"
+        );
+    }
+
     /// The MLA prefill arm forces `nsplit = 1`, and the merge-fold agrees with it.
     ///
     /// Not opportunistic: under a per-token causal bound an early token's later splits cover

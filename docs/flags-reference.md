@@ -477,6 +477,7 @@ the end, not tabled.
 | `PLOW_MLA_PF_MFMA` | 0 | MLA prefill uses MFMA matrix-core instructions for QK/PV instead of the vector-FMA fallback. |
 | `PLOW_MLA_PF_WPM` | numeric | MLA-prefill waves-per-M-tile, clamped by `min(PLOW_WAVES, PLOW_MLA_PF_WPM)`. |
 | `PLOW_XR_CUS` | 32 | **emit** — cap XReduce participant CUs (clamped 1..n_cu); a TP8 NUMA lever cutting L2 invalidates from idle WGs. |
+| `PLOW_XR2_GATHER` | unset | **emit** — use the two-shot reduce-scatter/all-gather path for large folded-gather collectives when `row_w = n_gpu*gcols`; opt-in pending full-network TP8 gate. |
 | `PLOW_NO_XREDUCE` | unset | **emit** — disable all XReduce all-reduce collectives (diagnostic; numerically wrong). |
 | `PLOW_WG_WAVES` (alias `PLOW_WAVES`) | 8 | waves per AMD workgroup (8×64 = 512 threads); feeds reduction/tiling geometry. |
 | `PLOW_ATTNRES_MAXB` | 16 | compile-time hard cap on K3 attention-residual batch (`nb`); over it traps. |

@@ -597,7 +597,8 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
      * whole [n] round trip (2 reads + 1 write) plus this op's own `out` write go with it.
      * BIT-IDENTICAL to d_residual at scale=1: the reduced value is already bf16 (PHASE 1
      * rounded it), and bf2f(a)+bf2f(b) -> f2bf is exactly the Residual's arithmetic. */
-    const bf16* __restrict__ resid = nullptr, bf16* __restrict__ out2 = nullptr) {
+    const bf16* __restrict__ resid = nullptr, bf16* __restrict__ out2 = nullptr,
+    uint32_t gslot_bytes = 0, uint32_t gcols = 0) {
     __shared__ int bailed;
     const unsigned tid = slice * PLOW_THREADS + threadIdx.x;
     const unsigned stride = nblk * PLOW_THREADS;
@@ -774,6 +775,21 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
         const uint32_t lo = (uint32_t)(((uint64_t)n * s) / nranks);
         const uint32_t hi = (uint32_t)(((uint64_t)n * (s + 1)) / nranks);
         const bf16* src = (const bf16*)((const char*)peer_scratch[s] + slot_bytes);
+        if (gcols) {
+            const uint32_t row_w = nranks * gcols;
+            for (uint32_t e = lo + tid; e < hi; e += stride) {
+                const uint32_t c = e % row_w;
+                const uint32_t m = e / row_w;
+                const uint32_t owner = c / gcols;
+                const bf16* g =
+                    (const bf16*)((const char*)peer_scratch[owner] + gslot_bytes);
+                const float reduced = bf2f(as_glob(src)[e]);
+                const float gathered =
+                    bf2f(as_glob(g)[m * gcols + (c - owner * gcols)]);
+                st_act1(&as_glob(out)[e], f2bf(reduced + gathered));
+            }
+            continue;
+        }
         if (out2) {
             /* fused residual: the gathered value goes straight into resid+v, and `out` is
              * NOT written — its only reader was the Residual this fold replaces. (The

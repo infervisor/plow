@@ -55,3 +55,32 @@ extern "C" __global__ void tp_allreduce_twoshot(
     const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
     if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
 }
+
+extern "C" __global__ void tp_allreduce_twoshot_gather(
+    bf16* out, const void* const* peer_scratch, uint32_t nranks, uint32_t rank,
+    uint32_t n, uint32_t slot_bytes, uint64_t xctr_byte_off, uint32_t iters,
+    uint64_t deadline, uint64_t* cycles, uint32_t* status,
+    uint32_t gslot_bytes, uint32_t gcols) {
+    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    for (uint32_t i = 0; i < iters; i++)
+        d_xreduce_twoshot_mega(out, peer_scratch, nranks, rank, n, slot_bytes,
+                               (size_t)xctr_byte_off, 2u * i, 2u * i + 1u,
+                               deadline, status, blockIdx.x, gridDim.x,
+                               nullptr, nullptr, gslot_bytes, gcols);
+    const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
+    if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
+}
+
+extern "C" __global__ void tp_allreduce_oneshot_gather(
+    bf16* out, const void* const* peer_scratch, uint32_t nranks, uint32_t rank,
+    uint32_t n, uint32_t slot_bytes, uint64_t xctr_byte_off, uint32_t iters,
+    uint64_t deadline, uint64_t* cycles, uint32_t* status,
+    uint32_t gslot_bytes, uint32_t gcols) {
+    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    for (uint32_t i = 0; i < iters; i++)
+        d_xreduce_mega(out, peer_scratch, nranks, rank, n, slot_bytes,
+                       (size_t)xctr_byte_off, i, deadline, status,
+                       blockIdx.x, gridDim.x, gslot_bytes, gcols, nranks * gcols);
+    const uint64_t t1 = __builtin_amdgcn_s_memrealtime();
+    if (blockIdx.x == 0 && threadIdx.x == 0 && cycles) *cycles = t1 - t0;
+}

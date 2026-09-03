@@ -2534,12 +2534,9 @@ fn emit_xreduce_twoshot_band(
 /// partials are ADDED, so the gather is one extra bf16 load per element on a rendezvous
 /// that already happened, rather than its own packet (~5.3 us) and its own rendezvous.
 ///
-/// ALWAYS THE ONE-SHOT when a gather is present, on both phases. The two-shot's
-/// reduce-scatter owns a 1/N slice of the message and its all-gather phase reassembles it;
-/// there is no place in that decomposition for a SECOND, differently-shaped gather, and
-/// inventing one to save fabric on a prefill chunk is not worth a second reduction body.
-/// The cost is prefill-only and bounded by the one-shot's N× fabric on one collective per
-/// MoE layer.
+/// A large prefill gather may opt into the two-shot path. Its all-gather already visits every
+/// final element, so it can add the owner-derived second partial there without another packet
+/// or rendezvous. The shape gate requires a complete column partition (`row_w = tp*gcols`).
 #[allow(clippy::too_many_arguments)]
 fn emit_xreduce_gather(
     b: &mut Builder,
@@ -2580,7 +2577,10 @@ fn emit_xreduce_gather(
     // reduce-scatter phase saturates even earlier, at `n/nranks`), so this never over-narrows.
     let need = (xr_elems.div_ceil(512).max(1) as usize).min(xr_cus.len());
     let xr_cus = &xr_cus[..need];
-    if decode || gather.is_some() {
+    let xr2_gather = !decode
+        && emit_config::active().xr2_gather
+        && gather.is_some_and(|(_, gcols, row_w)| row_w == tp.saturating_mul(gcols));
+    if decode || (gather.is_some() && !xr2_gather) {
         let gate = *xgate;
         *xgate += 1;
         let (gslot, gcols, row_w) = gather.unwrap_or((0, 0, 0));
@@ -2606,6 +2606,10 @@ fn emit_xreduce_gather(
             d.i[2] = slot; // partial slot byte offset (§7a)
             d.i[3] = gate_rs; // reduce-scatter rendezvous gate id
             d.i[4] = gate_ag; // all-gather rendezvous gate id
+            if let Some((gslot, gcols, _)) = gather {
+                d.i[6] = gslot; // folded all-gather partial slot
+                d.i[7] = gcols; // columns per rank; row width = n_gpu*gcols
+            }
         })
     }
 }
