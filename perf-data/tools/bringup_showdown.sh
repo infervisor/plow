@@ -146,13 +146,33 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-wait_ready() { # <pid> <port> <log> <attempts> <sleep>
-  local pid=$1 port=$2 log=$3 attempts=$4 delay=$5
+wait_ready() { # <pid> <port> <log> <attempts> <sleep> <model>
+  local pid=$1 port=$2 log=$3 attempts=$4 delay=$5 model=$6 body advertised="<endpoint unavailable>"
   for _ in $(seq 1 "$attempts"); do
-    curl -sf --max-time 2 "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1 && return 0
-    kill -0 "$pid" 2>/dev/null || { tail -40 "$log" >&2; return 1; }
+    if body=$(curl -sf --max-time 2 "http://127.0.0.1:$port/v1/models" 2>/dev/null); then
+      if advertised=$(python3 -c '
+import json, sys
+try:
+    ids = [item["id"] for item in json.load(sys.stdin)["data"]]
+    if not all(isinstance(model_id, str) for model_id in ids):
+        raise TypeError
+except (KeyError, TypeError, ValueError):
+    print("<invalid /v1/models response>")
+    raise SystemExit(2)
+print(", ".join(ids) if ids else "<none>")
+raise SystemExit(0 if sys.argv[1] in ids else 1)
+' "$model" <<<"$body"); then
+        return 0
+      fi
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "endpoint on port $port exited before advertising required model '$model' (last advertised: $advertised)" >&2
+      tail -40 "$log" >&2
+      return 1
+    fi
     sleep "$delay"
   done
+  echo "endpoint on port $port did not advertise required model '$model' (last advertised: $advertised)" >&2
   tail -40 "$log" >&2
   return 1
 }
@@ -164,7 +184,7 @@ run_plow() { # <round>
   "${PLOW_COMMAND[@]}" serve --assets "$PLOW_ASSETS" --port "$PORT_PLOW" \
     --executors "$TP" "${PLOW_EXTRA[@]}" >"$log" 2>&1 & pid=$!
   ACTIVE_PID=$pid
-  if ! wait_ready "$pid" "$PORT_PLOW" "$log" "${BRINGUP_READY_ATTEMPTS:-600}" "${BRINGUP_READY_SLEEP:-1}"; then
+  if ! wait_ready "$pid" "$PORT_PLOW" "$log" "${BRINGUP_READY_ATTEMPTS:-600}" "${BRINGUP_READY_SLEEP:-1}" "$MODEL_ID"; then
     stop_server "$pid"; ACTIVE_PID=; return 1
   fi
   if ! grep -q "backend ready.*GPU accelerated" "$log"; then
@@ -187,7 +207,7 @@ run_vllm() { # <round>
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" --scheduling-policy fcfs \
     --port "$PORT_VLLM" "${VLLM_EXTRA[@]}" >"$log" 2>&1 & pid=$!
   ACTIVE_PID=$pid
-  if ! wait_ready "$pid" "$PORT_VLLM" "$log" "${VLLM_READY_ATTEMPTS:-900}" "${VLLM_READY_SLEEP:-2}"; then
+  if ! wait_ready "$pid" "$PORT_VLLM" "$log" "${VLLM_READY_ATTEMPTS:-900}" "${VLLM_READY_SLEEP:-2}" "$MODEL_ID"; then
     stop_server "$pid"; ACTIVE_PID=; return 1
   fi
   local rc=0
