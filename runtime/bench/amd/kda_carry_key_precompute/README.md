@@ -46,9 +46,14 @@ critical-chain span improved `1490.684 -> 1486.080 ms`.
 The 8192-to-256 carried-state gate also passed: all 256 token IDs and checksum
 `fnv1a64:6bdfaa7b84ee4e7e` match. Control versus candidate was
 `1503.650667 -> 1499.005459 ms` TTFT, `44.365433 -> 44.335679 ms` TPOT, and
-`12816.836247 -> 12804.603634 ms` end to end. The generic structural route therefore
-defaults on. Set `PLOW_KDA_KEY_FACTOR=0` at asset emission and object build time to retain
-the interpreter route.
+`12816.836247 -> 12804.603634 ms` end to end. A provenance audit later showed that this
+runtime fell back to the ordinary interpreter because the standalone objects were absent.
+With those objects present, an exact TP8 8192-to-1 trace regressed TTFT from `1500.858` to
+`1605.464 ms`. The device span grew from `1486.153` to `1588.480 ms`: removing the 69 Wu
+and 69 carry interpreter bodies saved `192.486 ms`, but their standalone launches added
+`295.178 ms` of trace residual, a net `102.327 ms` device regression. The packet-side
+key-factor math and segment topology remain enabled; standalone object production is
+default-off. Set `PLOW_KDA_KEY_FACTOR=1` at object build time for explicit diagnostics.
 
 Rejected variant: also materializing Wu's `beta*k*exp2(g)` gave an exact
 `3.735592 -> 3.702952 ms` (`-0.032640 ms`) after paying for its third BF16 tensor and separate
