@@ -153,7 +153,7 @@ if [ -n "$REQUIRED_MARKER" ]; then
     grep -qE "OBJECT .* ${REQUIRED_MARKER}\$" <<<"$SYMS" ||
         fail "$OUT does not advertise $REQUIRED_MARKER"
 fi
-PACKED_MLA=0; PACKED_MLA_NORM=0; PACKED_MLA_FLASH=0; PACKED_KDA=0; KDA_CHUNK=0
+PACKED_MLA=0; PACKED_MLA_NORM=0; PACKED_MLA_FLASH=0; PACKED_KDA=0; KDA_CHUNK=0; KDA_QPRE=0
 K3=0; MLA=0; HIER=0; L2=0; GQ=0; DECODE=0
 for arg in "$@"; do
     case "$arg" in
@@ -163,6 +163,7 @@ for arg in "$@"; do
         -DPLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS=1) PACKED_MLA_FLASH=1 ;;
         -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1) PACKED_KDA=1 ;;
         -DPLOW_KDA_CHUNK=1) KDA_CHUNK=1 ;;
+        -DPLOW_KDA_CHUNK_QPRE=1) KDA_QPRE=1 ;;
         -DPLOW_K3=1) K3=1 ;;
         -DPLOW_MLA_PREFILL=1|-DPLOW_MLA_PF_V2_ARM=1) MLA=1 ;;
         -DPLOW_GATE_HIER=1) HIER=1 ;;
@@ -195,7 +196,8 @@ done
 for spec in \
     "PLOW_BUCKET_PACKED_MLA_NORM=plow_packed_prefill_mla_norm_segments_1" \
     "PLOW_BUCKET_FLASH=plow_packed_prefill_mla_flash_segments_1" \
-    "PLOW_BUCKET_PACKED_KDA=plow_packed_prefill_kda_serial_segments_1"; do
+    "PLOW_BUCKET_PACKED_KDA=plow_packed_prefill_kda_serial_segments_1" \
+    "PLOW_BUCKET_PACKED_KDA=plow_kda_family_segments_1"; do
     flag=${spec%%=*}
     marker=${spec#*=}
     required=0
@@ -214,9 +216,14 @@ for spec in \
 done
 
 if [ "$PACKED_KDA" = 1 ] && [ "$KDA_CHUNK" = 1 ]; then
-    for marker in plow_packed_prefill_kda_chunk_segments_1 plow_kda_chunk_bt64_arm_1; do
+    for marker in plow_kda_family_segments_1 plow_packed_prefill_kda_chunk_segments_1 \
+                  plow_kda_chunk_bt64_arm_1; do
         grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS" || fail "$OUT is missing $marker"
     done
+    if [ "$KDA_QPRE" = 1 ]; then
+        grep -qE "OBJECT .* plow_kda_chunk_qpre_arm_1\$" <<<"$SYMS" ||
+            fail "$OUT enables chunk-KDA qpre but is missing plow_kda_chunk_qpre_arm_1"
+    fi
     [ "$S" = 0 ] || fail "$(basename "$OUT") packed chunk-KDA object spills $S VGPRs"
 elif grep -qE "OBJECT .* plow_packed_prefill_kda_chunk_segments_1\$" <<<"$SYMS"; then
     fail "default $OUT unexpectedly advertises plow_packed_prefill_kda_chunk_segments_1"

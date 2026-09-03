@@ -768,6 +768,11 @@ if(PLOW_GFX950_HSACO)
         if(NOT _hs_kda_fused_presence)
             set(_hs_need_kda_fused OFF)
         endif()
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_kda_qpre_presence
+             REGEX "^#define PLOW_KDA_CHUNK_QPRE 1$")
+        if(_hs_kda_qpre_presence)
+            list(APPEND _hs_extra -DPLOW_KDA_CHUNK_QPRE=1)
+        endif()
     endif()
     set(_hs_run "${CMAKE_CURRENT_SOURCE_DIR}/cmake/hipcc_hsaco.sh")
     # The op bodies live entirely in headers, so without these a kernel edit
@@ -1133,15 +1138,19 @@ if(PLOW_GFX950_HSACO)
                 "interp_prefill_fp8kv_k3_moe|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_fp8kv|256|2"
                 "interp_prefill_fp8kv_k3_moe_a4w4|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_a4w4_fp8kv|256|2")
         endif()
-        if(PLOW_HSACO_PACKED_PREFILL_CONSUMERS)
+        if(PLOW_HSACO_PACKED_PREFILL_CONSUMERS OR PLOW_HSACO_KDA_CHUNK)
             # Family objects are deliberately lean: compiling any packed call arm into the full
             # K3 interpreter raises its VGPR spill count to 116 even when metadata is null.
-            # Live mux packing remains disabled; these objects make the eventual route explicit.
+            # A model requiring chunk KDA packages the exact family object even without live
+            # mux; runtime use for ordinary segments remains behind PLOW_KDA_FAMILY_ROUTE.
             list(APPEND _hs_rows
-                "interp_packed_mla_norm|${_hs_kpn}|_hs_ax_prefill|_hs_ax_packed_mla_norm|256|2"
-                "interp_packed_mla_flash|${_hs_kpfm}|_hs_ax_prefill|_hs_ax_packed_mla_flash|512|1"
                 "interp_packed_kda|${_hs_kpk}|_hs_ax_prefill|_hs_ax_packed_kda|256|2")
-            if(PLOW_HSACO_FP8KV)
+            if(PLOW_HSACO_PACKED_PREFILL_CONSUMERS)
+                list(APPEND _hs_rows
+                    "interp_packed_mla_norm|${_hs_kpn}|_hs_ax_prefill|_hs_ax_packed_mla_norm|256|2"
+                    "interp_packed_mla_flash|${_hs_kpfm}|_hs_ax_prefill|_hs_ax_packed_mla_flash|512|1")
+            endif()
+            if(PLOW_HSACO_PACKED_PREFILL_CONSUMERS AND PLOW_HSACO_FP8KV)
                 set(_hs_ax_packed_mla_norm_fp8kv ${_hs_ax_packed_mla_norm} ${_hs_ax_fp8kv})
                 set(_hs_ax_packed_mla_flash_fp8kv ${_hs_ax_packed_mla_flash} ${_hs_ax_fp8kv})
                 list(APPEND _hs_rows
