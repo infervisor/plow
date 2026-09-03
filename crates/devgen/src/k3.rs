@@ -4231,6 +4231,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn full_graph_xreduce_attnres_fusion_is_prefill_only_and_keeps_token_ownership() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_FUSE_RESIDUAL_INPUT", "1"),
+            ("PLOW_FUSE_XR_ATTNRES", "1"),
+        ]);
+
+        let decode = build_full_t(8, 1);
+        assert_eq!(
+            decode
+                .insts
+                .iter()
+                .filter(|i| {
+                    i.op == DevOp::XReduceTwoShot as u16 && i.t[3] != packet::dev::TENSOR_NONE
+                })
+                .count(),
+            0,
+            "single-row collectives use the one-shot path"
+        );
+
+        let prefill = build_full_t(8, 8192);
+        let fused: Vec<_> = prefill
+            .insts
+            .iter()
+            .filter(|i| i.op == DevOp::XReduceTwoShot as u16 && i.t[3] != packet::dev::TENSOR_NONE)
+            .collect();
+        assert_eq!(
+            fused.len(),
+            94,
+            "93 attention collectives plus the eligible dense-layer output seam"
+        );
+        for i in fused {
+            assert_eq!(
+                i.blocks, 256,
+                "phase 2 and AttnRes share the token-owner grid"
+            );
+            assert_eq!(i.i[0], 8192 * 7168);
+            assert_eq!(i.i[1], 8);
+            assert_eq!(i.i[5], 7168);
+            assert_eq!(i.i[0] / i.i[5], 8192);
+            assert_eq!(
+                (i.i[0] / i.i[5]) % i.i[1],
+                0,
+                "rank slices end on row boundaries"
+            );
+        }
+    }
+
     // ================================================================================
     // PREFILL
     //

@@ -486,6 +486,50 @@ const _: () = assert!(std::mem::size_of::<KdaDecodeFusedArgs>() == 184);
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
+struct KdaChunkIntraCachedArgs {
+    aqk: u64,
+    ainv: u64,
+    q: u64,
+    k: u64,
+    g_prefix: u64,
+    beta: u64,
+    t: u32,
+    heads: u32,
+    dim: u32,
+    scale: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<KdaChunkIntraCachedArgs>() == 64);
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct XReduceAttnResArgs {
+    reduced: u64,
+    prefix: u64,
+    out: u64,
+    residual: u64,
+    ring: u64,
+    score: u64,
+    gamma: u64,
+    peer_scratch: u64,
+    xctr: u64,
+    status: u64,
+    n: u32,
+    slot_bytes: u32,
+    gate_rs: u32,
+    gate_ag: u32,
+    rank: u32,
+    nranks: u32,
+    row_w: u32,
+    nb: u32,
+    nbcap: u32,
+    eps: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<XReduceAttnResArgs>() == 120);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
 struct MoeStage2Mxfp4Args {
     part: u64,
     activation: u64,
@@ -541,8 +585,38 @@ struct MoeStage2Mxfp4Route {
 #[derive(Clone, Copy, Debug)]
 enum PrefillSegmentRoute {
     Interpreter,
+    XReduceAttnRes {
+        args: XReduceAttnResArgs,
+        device_args: u64,
+        grid: u32,
+    },
+    KdaChunkIntraCached {
+        args: KdaChunkIntraCachedArgs,
+        grid: u32,
+    },
     MoeStage1Mxfp4(MoeStage1Mxfp4Route),
     MoeStage2Mxfp4(MoeStage2Mxfp4Route),
+}
+
+fn xreduce_attnres_encoded(d: &DevInst64) -> bool {
+    d.op == DevOp::XReduceTwoShot as u16 && d.t[3] != packet::dev::TENSOR_NONE16
+}
+
+fn xreduce_attnres_inst(d: &DevInst64) -> bool {
+    xreduce_attnres_encoded(d)
+        && d.blocks != 0
+        && d.i[0] != 0
+        && d.i[1] > 1
+        && d.i[5] != 0
+        && d.i[0].is_multiple_of(d.i[5])
+        && (d.i[0] / d.i[5]).is_multiple_of(d.i[1])
+        && d.i[6] <= d.i[7]
+        && d.t[0] != packet::dev::TENSOR_NONE16
+        && d.t[2..=6].iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+        && d.t[7] == packet::dev::TENSOR_NONE16
+        && f32::from_bits(d.fj[0]).is_finite()
+        && f32::from_bits(d.fj[0]) > 0.0
+        && d.fj[1..].iter().all(|&v| v == 0)
 }
 
 fn moe_stage1_mxfp4_inst(d: &DevInst64) -> bool {
@@ -584,6 +658,20 @@ fn moe_stage2_mxfp4_pair(d: &DevInst64, c: &DevInst64) -> bool {
         && c.i[3] == 0
         && c.i[4] == 0
         && c.i[7] == 0
+}
+
+fn kda_chunk_intra_cached_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::KdaChunkIntra as u16
+        && d.blocks != 0
+        && d.i[0] >= 512
+        && d.i[1] != 0
+        && d.i[2] == 128
+        && d.i[3..].iter().all(|&v| v == 0)
+        && d.t[..6].iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+        && d.t[6..].iter().all(|&t| t == packet::dev::TENSOR_NONE16)
+        && f32::from_bits(d.fj[0]).is_finite()
+        && f32::from_bits(d.fj[0]) > 0.0
+        && d.fj[1..].iter().all(|&v| v == 0)
 }
 
 fn has_moe_stage2_mxfp4_segment(prog: &DevProg) -> bool {
@@ -670,9 +758,69 @@ fn moe_mxfp4_routes(
     };
     let mut routes = Vec::with_capacity(n_seg);
     for (seg, set) in members.into_iter().enumerate() {
+        let encoded_xreduce_attnres = set
+            .iter()
+            .find_map(|&i| prog.insts.get(i).filter(|d| xreduce_attnres_encoded(d)));
+        if let Some(d) = encoded_xreduce_attnres {
+            if set.len() == 1 && xreduce_attnres_inst(d) {
+                // Routed below after resolving its tensor addresses.
+            } else {
+                return Err(RuntimeError::Device(format!(
+                    "segment {seg} carries an invalid or mixed fused XReduceTwoShot+AttnRes packet"
+                )));
+            }
+        }
         if set.len() == 1 {
             let i = *set.first().unwrap();
             let d = &prog.insts[i];
+            if xreduce_attnres_inst(d) {
+                routes.push(PrefillSegmentRoute::XReduceAttnRes {
+                    args: XReduceAttnResArgs {
+                        reduced: addr(d.t[0], "reduced")?,
+                        prefix: addr(d.t[6], "prefix")?,
+                        out: addr(d.t[2], "out")?,
+                        residual: if d.t[1] == packet::dev::TENSOR_NONE16 {
+                            0
+                        } else {
+                            addr(d.t[1], "residual")?
+                        },
+                        ring: addr(d.t[3], "ring")?,
+                        score: addr(d.t[4], "score")?,
+                        gamma: addr(d.t[5], "gamma")?,
+                        n: d.i[0],
+                        slot_bytes: d.i[2],
+                        gate_rs: d.i[3],
+                        gate_ag: d.i[4],
+                        row_w: d.i[5],
+                        nb: d.i[6],
+                        nbcap: d.i[7],
+                        eps: f32::from_bits(d.fj[0]),
+                        status: u64::from(d.fj[2]),
+                        ..Default::default()
+                    },
+                    device_args: 0,
+                    grid: u32::from(d.blocks),
+                });
+                continue;
+            }
+            if kda_chunk_intra_cached_inst(d) {
+                routes.push(PrefillSegmentRoute::KdaChunkIntraCached {
+                    args: KdaChunkIntraCachedArgs {
+                        aqk: addr(d.t[0], "aqk")?,
+                        ainv: addr(d.t[1], "ainv")?,
+                        q: addr(d.t[2], "q")?,
+                        k: addr(d.t[3], "k")?,
+                        g_prefix: addr(d.t[4], "g_prefix")?,
+                        beta: addr(d.t[5], "beta")?,
+                        t: d.i[0],
+                        heads: d.i[1],
+                        dim: d.i[2],
+                        scale: f32::from_bits(d.fj[0]),
+                    },
+                    grid: u32::from(d.blocks),
+                });
+                continue;
+            }
             if !moe_stage1_mxfp4_inst(d) {
                 if moe_stage2_mxfp4_inst(d) {
                     let Some(c) = prog.insts.get(i + 1) else {
@@ -1793,6 +1941,8 @@ const PACKED_PREFILL_MLA_FLASH_SEG_SYM: &str = "plow_packed_prefill_mla_flash_se
 const PACKED_PREFILL_KDA_SEG_SYM: &str = "plow_packed_prefill_kda_serial_segments_1";
 const PACKED_PREFILL_KDA_CHUNK_SEG_SYM: &str = "plow_packed_prefill_kda_chunk_segments_1";
 const KDA_FAMILY_SEG_SYM: &str = "plow_kda_family_segments_1";
+const XR_ATTNRES_SEG_SYM: &str = "plow_xr_attnres_segment_1";
+const XR_ATTNRES_RESOURCE_SYM: &str = "plow_xr_attnres_wave64_nospill_1";
 
 fn check_packed_prefill_abi(prefill: bool, flash_required: bool, flash: bool) -> Result<()> {
     if !prefill {
@@ -4834,6 +4984,9 @@ struct AmdProg {
     decode_routes: Vec<DecodeSegmentRoute>,
     /// Optional raw gfx950 route for a pure MXFP4 grouped-MoE Down+Combine segment.
     prefill_routes: Vec<PrefillSegmentRoute>,
+    /// Immutable device-side typed arguments for raw XR+AttnRes routes. Routes retain only their
+    /// addresses; this owner therefore keeps every pointer valid across queued segment launches.
+    _xreduce_attnres_args: Vec<DeviceMem>,
     /// `[n_seg]` pure packed-consumer family: 5=MLA norm/cache, 6=MLA flash,
     /// 7=serial KDA, 0=not safely routable to a family object.
     packed_seg_family: Vec<u8>,
@@ -4942,6 +5095,7 @@ pub struct AmdEngine {
     k_prefill: HsaKernel,
     k_decode: HsaKernel,
     k_kda_decode_fused: Option<HsaKernel>,
+    k_kda_chunk_intra_cached: Option<HsaKernel>,
     k_moe_stage1_mxfp4: Option<HsaKernel>,
     k_moe_stage2_mxfp4: Option<HsaKernel>,
     k_xaudit: Option<HsaKernel>,
@@ -4956,6 +5110,7 @@ pub struct AmdEngine {
     k_packed_mla_norm: Option<HsaKernel>,
     k_packed_mla_flash: Option<HsaKernel>,
     k_packed_kda: Option<HsaKernel>,
+    k_xr_attnres: Option<HsaKernel>,
     packed_prefill_prefill_abi: bool,
     sched_prefill: Sched,
     sched_decode: Sched,
@@ -5556,6 +5711,9 @@ impl AmdEngine {
         let need_moe_stage1_lean = blob.progs[..dec_ix]
             .iter()
             .any(has_moe_stage1_mxfp4_segment);
+        let need_xr_attnres = blob.progs[..dec_ix]
+            .iter()
+            .any(|p| p.insts.iter().any(xreduce_attnres_inst));
 
         // --- code objects ---------------------------------------------------
         // Resolve the symbol immediately after each load: the HSA backend
@@ -5886,8 +6044,8 @@ impl AmdEngine {
         // correct and merely slower.
         let flash_load = load_one_in(Phase::Flash, sched_prefill, hsaco_dir, None);
         let flash_error = flash_load.as_ref().err().map(ToString::to_string);
-        let k_flash = resolve_flash_object_load(flash_load, need_mla_v2 || need_mla_v2_fp8)?
-            .map(|(k, _)| k);
+        let k_flash =
+            resolve_flash_object_load(flash_load, need_mla_v2 || need_mla_v2_fp8)?.map(|(k, _)| k);
         if let (None, Some(e)) = (&k_flash, flash_error) {
             tracing::info!(%e, "no flash object — flash segments run on the 8-wave interpreter");
         }
@@ -6076,6 +6234,52 @@ impl AmdEngine {
             None
         };
         drop(load_packed_family);
+        let k_xr_attnres = if need_xr_attnres {
+            const NAME: &str = "xreduce_attnres_gfx950.elf";
+            const SYMBOL: &str = "plow_xreduce_attnres_gfx950";
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "fused XReduceTwoShot+AttnRes has no qualified object for {arch}"
+                )));
+            }
+            let path = hsaco_dir.join(NAME);
+            if !path.exists() {
+                return Err(RuntimeError::Device(format!(
+                    "fused XReduceTwoShot+AttnRes requires {NAME}"
+                )));
+            }
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!("code object {}: {e}", path.display()))
+            })?;
+            let syms = elf_symbol_names(&image);
+            for marker in [XR_ATTNRES_SEG_SYM, XR_ATTNRES_RESOURCE_SYM] {
+                if !syms.contains(&marker) {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME} lacks required ABI/resource marker `{marker}`"
+                    )));
+                }
+            }
+            check_packet_pairing_stamp(&image, blob_path, &path)?;
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let kernel = EngineDevice::get_function(&*be, &module, SYMBOL)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}")))?;
+            let got = kernel.kernarg_size();
+            if got != 8 && got != 264 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: kernarg segment is {got} B; raw XR+AttnRes ABI needs 8 (or 264 with implicit args)"
+                )));
+            }
+            if kernel.private_segment_size() != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{NAME}: private segment is {} B; raw XR+AttnRes requires zero",
+                    kernel.private_segment_size()
+                )));
+            }
+            modules.push(module);
+            Some(kernel)
+        } else {
+            None
+        };
 
         let k_kda_decode_fused = if need_kda_decode_fused.is_some() {
             if arch != "gfx950" {
@@ -6115,6 +6319,76 @@ impl AmdEngine {
             }
             modules.push(module);
             Some(kernel)
+        } else {
+            None
+        };
+
+        let k_kda_chunk_intra_cached = if arch == "gfx950" {
+            const NAME: &str = "kda_chunk_intra_cached_gfx950.elf";
+            const SYMBOL: &str = "plow_kda_chunk_intra_cached_gfx950";
+            const MARKERS: [&str; 6] = [
+                "plow_kda_intra_cached_abi_1",
+                "plow_kda_intra_cached_bt64_d128_1",
+                "plow_kda_intra_cached_wave64_1",
+                "plow_kda_intra_cached_no_spill_1",
+                "plow_kda_intra_cached_static_lds_114688",
+                "plow_kda_intra_cached_vgpr_le_96",
+            ];
+            let path = hsaco_dir.join(NAME);
+            if !path.exists() {
+                None
+            } else {
+                let load = (|| -> Result<(Module, HsaKernel)> {
+                    let image = std::fs::read(&path).map_err(|e| {
+                        RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                    })?;
+                    let syms = elf_symbol_names(&image);
+                    for marker in MARKERS {
+                        if !syms.contains(&marker) {
+                            return Err(RuntimeError::Device(format!(
+                                "cached KDA-intra object {} lacks required ABI/resource marker `{marker}`",
+                                path.display()
+                            )));
+                        }
+                    }
+                    let module = EngineDevice::module_load(&*be, &image)?;
+                    let kernel =
+                        EngineDevice::get_function(&*be, &module, SYMBOL).map_err(|e| {
+                            RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}"))
+                        })?;
+                    let want = std::mem::size_of::<KdaChunkIntraCachedArgs>() as u32;
+                    let got = kernel.kernarg_size();
+                    let lds = HsaBackend::kernel_lds_bytes(&kernel);
+                    let private = kernel.private_segment_size();
+                    if got != want && got != want + 256 {
+                        return Err(RuntimeError::Device(format!(
+                            "{NAME}: kernarg segment is {got} B; cached KDA-intra ABI needs {want} (or {} with COv5 implicit args)",
+                            want + 256
+                        )));
+                    }
+                    if lds != 114_688 || private != 0 {
+                        return Err(RuntimeError::Device(format!(
+                            "{NAME}: resource gate failed: LDS={lds} (required 114688), private={private} (required 0)"
+                        )));
+                    }
+                    Ok((module, kernel))
+                })();
+                match load {
+                    Ok((module, kernel)) => {
+                        tracing::info!(
+                            object = %path.display(),
+                            symbol = SYMBOL,
+                            "cached KDA-intra object accepted"
+                        );
+                        modules.push(module);
+                        Some(kernel)
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, "cached KDA-intra object rejected — using interpreter fallback");
+                        None
+                    }
+                }
+            }
         } else {
             None
         };
@@ -6748,7 +7022,7 @@ impl AmdEngine {
             } else {
                 vec![DecodeSegmentRoute::Interpreter; seg_class.len()]
             };
-            let prefill_routes = if prog_ix < dec_ix {
+            let mut prefill_routes = if prog_ix < dec_ix {
                 moe_mxfp4_routes(p, &blob.tensors, &devp)?
             } else {
                 vec![PrefillSegmentRoute::Interpreter; seg_class.len()]
@@ -6764,6 +7038,31 @@ impl AmdEngine {
                 }
                 Ok(m)
             };
+            let mut xreduce_attnres_args = Vec::new();
+            for route in &mut prefill_routes {
+                let PrefillSegmentRoute::XReduceAttnRes {
+                    args, device_args, ..
+                } = route
+                else {
+                    continue;
+                };
+                let bind = tp.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "fused XReduceTwoShot+AttnRes requires a tensor-parallel binding".into(),
+                    )
+                })?;
+                let status_id = args.status as u32;
+                args.peer_scratch = bind.peer_table;
+                args.xctr = bind.xctr;
+                args.rank = bind.rank;
+                args.nranks = bind.n_gpu;
+                args.status = status_id.checked_sub(1).map_or(0, |id| {
+                    bind.xctr + u64::from(id) * (CTR_STRIDE_U32 * 4) as u64
+                });
+                let mem = up(as_bytes(std::slice::from_ref(args)))?;
+                *device_args = mem.base;
+                xreduce_attnres_args.push(mem);
+            }
             let d_inst = up(as_bytes(&p.insts))?;
             let d_stream = up(as_bytes(&p.stream))?;
             let d_sofs = up(as_bytes(&p.stream_ofs))?;
@@ -6865,6 +7164,7 @@ impl AmdEngine {
                 packed_kda_segmented,
                 decode_routes,
                 prefill_routes,
+                _xreduce_attnres_args: xreduce_attnres_args,
                 n_inst: p.insts.len() as u32,
                 trace_records: p.stream.len(),
                 n_counter: p.n_counter,
@@ -7240,6 +7540,7 @@ impl AmdEngine {
             k_prefill,
             k_decode,
             k_kda_decode_fused,
+            k_kda_chunk_intra_cached,
             k_moe_stage1_mxfp4,
             k_moe_stage2_mxfp4,
             k_xaudit,
@@ -7252,6 +7553,7 @@ impl AmdEngine {
             k_packed_mla_norm,
             k_packed_mla_flash,
             k_packed_kda,
+            k_xr_attnres,
             packed_prefill_prefill_abi,
             sched_prefill,
             sched_decode,
@@ -7706,6 +8008,32 @@ impl AmdEngine {
         check_packed_prefill_dispatch(self.packed_prefill, p)?;
         self.trace_write_bytes
             .set(self.progs[p].trace_records * TRACE_REC_BYTES);
+        if let Some(PrefillSegmentRoute::XReduceAttnRes {
+            device_args, grid, ..
+        }) = self.progs[p].prefill_routes.get(seg).copied()
+        {
+            let kernel = self.k_xr_attnres.ok_or_else(|| {
+                RuntimeError::Device(
+                    "XReduceTwoShot+AttnRes segment has no exact capability object".into(),
+                )
+            })?;
+            if device_args == 0 {
+                return Err(RuntimeError::Device(
+                    "XReduceTwoShot+AttnRes route has no device argument block".into(),
+                ));
+            }
+            EngineDevice::launch_cooperative(
+                &*self.be,
+                kernel,
+                grid,
+                WG_THREADS_8,
+                0,
+                as_bytes(std::slice::from_ref(&device_args)),
+                None,
+            )?;
+            self.seg_launches += 1;
+            return Ok(());
+        }
         if !prefill_segment_specialization_allowed(self.prog_dispatch(p)) {
             let arg = self.kernarg(p, seg as u32);
             EngineDevice::launch_cooperative(
@@ -7722,6 +8050,22 @@ impl AmdEngine {
         }
         let active = self.packed_prefill.is_some_and(|b| b.prog == p);
         if !active {
+            if let (Some(kernel), Some(PrefillSegmentRoute::KdaChunkIntraCached { args, grid })) = (
+                self.k_kda_chunk_intra_cached,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    grid,
+                    WG_THREADS_8,
+                    0,
+                    as_bytes(std::slice::from_ref(&args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
             if let (Some(kernel), Some(PrefillSegmentRoute::MoeStage1Mxfp4(route))) = (
                 self.k_moe_stage1_mxfp4,
                 self.progs[p].prefill_routes.get(seg).copied(),
@@ -10084,6 +10428,110 @@ mod tests {
     }
 
     #[test]
+    fn cached_kda_intra_route_requires_a_pure_bt64_d128_segment() {
+        let mut prog = segmented_prog(
+            &[
+                DevOp::KdaChunkPrepare,
+                DevOp::KdaChunkIntra,
+                DevOp::KdaChunkWu,
+            ],
+            &[0, 1, 2],
+        );
+        prog.t = 8192;
+        prog.insts[1].blocks = 256;
+        prog.insts[1].t = [packet::dev::TENSOR_NONE16; 8];
+        prog.insts[1].t[..6].copy_from_slice(&[0, 1, 2, 3, 4, 5]);
+        prog.insts[1].i = [8192, 12, 128, 0, 0, 0, 0, 0];
+        prog.insts[1].fj[0] = (1.0 / 128.0f32.sqrt()).to_bits();
+        let tensors: Vec<_> = (0..6)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..6)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let PrefillSegmentRoute::KdaChunkIntraCached { args, grid } = routes[1] else {
+            panic!("pure BT64/D128 intra packet must select the cached object")
+        };
+        assert_eq!((args.t, args.heads, args.dim, grid), (8192, 12, 128, 256));
+        assert_eq!((args.aqk, args.beta), (0x1000, 0x1500));
+
+        prog.insts[1].i[2] = 64;
+        let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        assert!(matches!(fallback[1], PrefillSegmentRoute::Interpreter));
+
+        prog.insts[1].i[2] = 128;
+        prog.stream[2].seg = 1;
+        let mixed = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        assert!(matches!(mixed[1], PrefillSegmentRoute::Interpreter));
+    }
+
+    #[test]
+    fn xreduce_attnres_route_requires_the_exact_row_partition_contract() {
+        let mut prog = segmented_prog(&[DevOp::XReduceTwoShot], &[0]);
+        let d = &mut prog.insts[0];
+        d.blocks = 256;
+        d.t = [
+            0,
+            packet::dev::TENSOR_NONE16,
+            2,
+            3,
+            4,
+            5,
+            6,
+            packet::dev::TENSOR_NONE16,
+        ];
+        d.i = [8192 * 7168, 8, 0, 1, 2, 7168, 4, 8];
+        d.fj[0] = 1e-5f32.to_bits();
+        let tensors: Vec<_> = (0..7)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        let devp: Vec<_> = (0..7)
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
+            .collect();
+        let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
+        let PrefillSegmentRoute::XReduceAttnRes {
+            args,
+            device_args,
+            grid,
+        } = routes[0]
+        else {
+            panic!("exact packet must use the raw XR+AttnRes route")
+        };
+        assert_eq!(grid, 256, "raw launch grid comes from packet blocks");
+        assert_eq!((args.n, args.row_w, args.nranks), (8192 * 7168, 7168, 0));
+        assert_eq!(device_args, 0, "load-time upload fills the stable pointer");
+
+        prog.insts[0].i[0] = 8191 * 7168;
+        let err = moe_mxfp4_routes(&prog, &tensors, &devp)
+            .expect_err("an encoded packet with an invalid row contract must fail closed");
+        assert!(err.to_string().contains("invalid or mixed"));
+
+        prog.insts[0].i[0] = 8192 * 7168;
+        prog.insts.push(DevInst64 {
+            op: DevOp::RmsNorm as u16,
+            ..Default::default()
+        });
+        prog.stream.push(packet::dev::StreamEnt {
+            inst: 1,
+            seg: 0,
+            ..Default::default()
+        });
+        let err = moe_mxfp4_routes(&prog, &tensors, &devp)
+            .expect_err("the fused encoding must never fall through to the mega interpreter");
+        assert!(err.to_string().contains("invalid or mixed"));
+    }
+
+    #[test]
     fn lean_moe_stage2_route_requires_the_exact_pure_down_segment() {
         let mut prog = segmented_prog(
             &[DevOp::MoeGroupDownPf, DevOp::MoeCombinePf, DevOp::RmsNorm],
@@ -10253,7 +10701,9 @@ mod tests {
         assert!(required.to_string().contains("missing V2 marker"));
 
         let optional = resolve_flash_object_load::<()>(
-            Err(RuntimeError::Device("optional flash object unavailable".into())),
+            Err(RuntimeError::Device(
+                "optional flash object unavailable".into(),
+            )),
             false,
         )
         .expect("ordinary flash object may fall back");

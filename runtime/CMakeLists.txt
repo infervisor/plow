@@ -653,6 +653,10 @@ option(PLOW_HSACO_K3 "Also emit the Kimi-K3 / KDA objects (decode + prefill)" ON
 option(PLOW_HSACO_PACKED_PREFILL_CONSUMERS
        "Emit separate default-off operator-family objects that consume packed prefill metadata" OFF)
 option(PLOW_HSACO_KDA_CHUNK "Include the opt-in BT64 chunk-KDA prefill arms" OFF)
+option(PLOW_HSACO_KDA_INTRA_CACHED
+       "Build the standalone cached BT64/D128 KDA-intra segment" OFF)
+option(PLOW_HSACO_XR_ATTNRES
+       "Build the standalone two-shot XReduce+AttnRes segment object" OFF)
 option(PLOW_HSACO_MOE_STAGE2_LEAN
        "Emit the standalone gfx950 MXFP4 grouped-MoE stage-2 object" ON)
 option(PLOW_HSACO_MOE_STAGE1_LEAN
@@ -825,7 +829,8 @@ if(PLOW_GFX950_HSACO)
     # (the Q-hoist spills Q to scratch, cheaper than the L2 re-read it replaces).
     set(_hs_ax_flash -DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4
                      -DFA_DC=256 -DFA_DBUF=1)
-    if(PLOW_HSACO_ARCH STREQUAL "gfx942" OR PLOW_MLA_PF_V2_ARM)
+    if(PLOW_HSACO_ARCH STREQUAL "gfx942" OR PLOW_HSACO_ARCH STREQUAL "gfx950"
+       OR PLOW_MLA_PF_V2_ARM)
         list(APPEND _hs_ax_flash -DPLOW_MLA_PF_V2_ARM=1)
     endif()
     if(PLOW_HSACO_ARCH STREQUAL "gfx942")
@@ -1216,6 +1221,42 @@ if(PLOW_GFX950_HSACO)
         add_custom_target(kda_decode_fused_gfx950 DEPENDS "${_hs_kda_fused_out}")
         list(APPEND _hs_outs "${_hs_kda_fused_out}")
 
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_KDA_INTRA_CACHED)
+        set(_hs_kda_intra_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_intra_cached.hip")
+        set(_hs_kda_intra_out "${PLOW_HSACO_DIR}/kda_chunk_intra_cached_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_kda_intra_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_kda_intra_out}"
+                    plow_kda_chunk_intra_cached_gfx950 96 1
+                    ${_hs_inc} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_kda_intra_cached_abi_1
+                    "${_hs_kda_intra_src}"
+            DEPENDS "${_hs_kda_intra_src}" "${_hs_run}" ${_hs_hdrs}
+            COMMENT "hipcc kda_chunk_intra_cached_gfx950.elf"
+            VERBATIM)
+        add_custom_target(kda_chunk_intra_cached_gfx950 DEPENDS "${_hs_kda_intra_out}")
+        list(APPEND _hs_outs "${_hs_kda_intra_out}")
+    endif()
+
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_XR_ATTNRES)
+        set(_hs_xr_attnres_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/xreduce_attnres_fused.hip")
+        set(_hs_xr_attnres_out "${PLOW_HSACO_DIR}/xreduce_attnres_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_xr_attnres_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_xr_attnres_out}"
+                    plow_xreduce_attnres_gfx950 256 2
+                    ${_hs_inc} ${_hs_arch_def} ${_hs_extra}
+                    -DPLOW_K3=1 -DPLOW_XR_ATTNRES=1
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_xr_attnres_wave64_nospill_1
+                    "${_hs_xr_attnres_src}"
+            DEPENDS "${_hs_xr_attnres_src}" "${_hs_run}" ${_hs_hdrs}
+            COMMENT "hipcc xreduce_attnres_gfx950.elf"
+            VERBATIM)
+        add_custom_target(xreduce_attnres_gfx950 DEPENDS "${_hs_xr_attnres_out}")
+        list(APPEND _hs_outs "${_hs_xr_attnres_out}")
     endif()
 
     if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_MOE_STAGE2_LEAN)

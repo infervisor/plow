@@ -521,12 +521,12 @@ __device__ __forceinline__ void d_xargmax_fin_mega(
                                              val_id + (b / PLOW_XAMAX_LINE))
                + (b % PLOW_XAMAX_LINE);
     };
-    const unsigned long long* pg = as_glob(part);
+    const PLOW_GLOB unsigned long long* pg = as_glob(part);
 
     /* Rows are independent. Wide decode used to serialize B*nparts comparisons on lane 0;
      * distribute rows across the interpreter block while keeping each row's reduction order. */
     for (unsigned b = threadIdx.x; b < B; b += blockDim.x) {
-        const unsigned long long* pb = pg + (size_t)b * nparts;
+        const PLOW_GLOB unsigned long long* pb = pg + (size_t)b * nparts;
         unsigned long long best = 0;
         for (unsigned i = 0; i < nparts; i++) best = pb[i] > best ? pb[i] : best;
         const unsigned gi = ~(unsigned)(best & 0xFFFFFFFFu) + rank * vocab_l;
@@ -598,7 +598,11 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
      * BIT-IDENTICAL to d_residual at scale=1: the reduced value is already bf16 (PHASE 1
      * rounded it), and bf2f(a)+bf2f(b) -> f2bf is exactly the Residual's arithmetic. */
     const bf16* __restrict__ resid = nullptr, bf16* __restrict__ out2 = nullptr,
-    uint32_t gslot_bytes = 0, uint32_t gcols = 0) {
+    uint32_t gslot_bytes = 0, uint32_t gcols = 0
+#if PLOW_XR_ATTNRES
+    , bf16* __restrict__ row_prefix = nullptr, uint32_t row_w = 0
+#endif
+    ) {
     __shared__ int bailed;
     const unsigned tid = slice * PLOW_THREADS + threadIdx.x;
     const unsigned stride = nblk * PLOW_THREADS;
@@ -752,6 +756,34 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
     }
     __syncthreads();
     if (bailed) return;
+
+#if PLOW_XR_ATTNRES
+    /* A graph-selected AttnRes consumer needs one complete row per workgroup. Preserve the
+     * ordinary reduced output, reproduce the intervening bf16 residual boundary into
+     * `row_prefix`, then let the dispatch run AttnRes on the same token-owned rows. Requiring
+     * the row count divisible by nranks makes every flat reduce-scatter slice end on a row
+     * boundary, so one peer owns each complete row. */
+    if (row_prefix) {
+        if (row_w == 0 || n % row_w != 0) __builtin_trap();
+        const uint32_t rows = n / row_w;
+        if (rows % nranks != 0) __builtin_trap();
+        const uint32_t rows_per_rank = rows / nranks;
+        for (uint32_t m = slice; m < rows; m += nblk) {
+            const size_t base = (size_t)m * row_w;
+            const uint32_t owner = m / rows_per_rank;
+            const bf16* src = (const bf16*)((const char*)peer_scratch[owner] + slot_bytes);
+            for (uint32_t d = threadIdx.x; d < row_w; d += PLOW_THREADS) {
+                const bf16 reduced = as_glob(src)[base + d];
+                st_act1(&as_glob(out)[base + d], reduced);
+                st_act1(&as_glob(row_prefix)[base + d],
+                        resid ? f2bf(bf2f(as_glob(resid)[base + d]) + bf2f(reduced))
+                              : reduced);
+            }
+        }
+        __syncthreads();
+        return;
+    }
+#endif
 
     /* ---- PHASE 2 all-gather: assemble the full reduced vector into `out`, each slice s
      * read from peer s's now-reduced partial slot (s==rank is a local copy).

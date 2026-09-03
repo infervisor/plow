@@ -1092,11 +1092,119 @@ impl Builder {
         fused
     }
 
+    /// Fold an eligible two-shot all-reduce into its AttnRes+RMSNorm consumer. The preceding
+    /// residual pass leaves the rounded prefix materialization on `AttnRes`; this pass keeps that
+    /// tensor live while moving the consumer into phase 2 of the collective.
+    fn fuse_xreduce_attnres(&mut self) -> usize {
+        let graph = ProgramGraph::from_ops(&self.ops);
+        let mut fuse_with = vec![None; self.ops.len()];
+        for consumer_idx in 0..self.ops.len() {
+            let consumer = &self.ops[consumer_idx];
+            let [producer_idx] = graph.predecessors[consumer_idx].as_slice() else {
+                continue;
+            };
+            let producer = &self.ops[*producer_idx];
+            let residual = if consumer.inst.t[6] == producer.inst.t[0]
+                && consumer.inst.t[7] != TENSOR_NONE
+            {
+                Some(consumer.inst.t[7])
+            } else if consumer.inst.t[7] == producer.inst.t[0] && consumer.inst.t[6] != TENSOR_NONE
+            {
+                Some(consumer.inst.t[6])
+            } else if consumer.inst.t[6] == TENSOR_NONE
+                && consumer.inst.t[7] == TENSOR_NONE
+                && consumer.inst.t[1] == producer.inst.t[0]
+            {
+                Some(TENSOR_NONE)
+            } else {
+                None
+            };
+            let n = consumer.inst.i[0].checked_mul(consumer.inst.i[1]);
+            let compatible = producer.inst.op == DevOp::XReduceTwoShot as u16
+                && consumer.inst.op == DevOp::AttnRes as u16
+                && consumer_idx == *producer_idx + 1
+                && matches!(consumer.deps.as_slice(), [Dep::Coarse(c)] if *c == *producer_idx as u32)
+                && matches!(graph.successors[*producer_idx].as_slice(), [c] if *c == consumer_idx)
+                && producer.inst.t[1..].iter().all(|&t| t == TENSOR_NONE)
+                && producer.inst.i[5..].iter().all(|&i| i == 0)
+                && producer.inst.i[1] > 1
+                && consumer.inst.i[0] % producer.inst.i[1] == 0
+                && n == Some(producer.inst.i[0])
+                && producer.cus == consumer.cus
+                && consumer.inst.t[1] != TENSOR_NONE
+                && consumer.inst.t[2] != TENSOR_NONE
+                && consumer.inst.t[3] != TENSOR_NONE
+                && consumer.inst.t[4] == TENSOR_NONE
+                && consumer.inst.t[5] != TENSOR_NONE
+                && consumer.inst.i[5] == TENSOR_NONE_I
+                && residual.is_some();
+            if compatible {
+                fuse_with[*producer_idx] = Some((consumer_idx, residual.unwrap()));
+            }
+        }
+
+        let old = std::mem::take(&mut self.ops);
+        let mut old_to_new = vec![u32::MAX; old.len()];
+        let mut fused = 0usize;
+        let mut next = old.into_iter().enumerate().peekable();
+        let remap = |dep: Dep, map: &[u32]| match dep {
+            Dep::Coarse(c) => Dep::Coarse(map[c as usize]),
+            Dep::Fine {
+                producer,
+                map: fine,
+            } => Dep::Fine {
+                producer: map[producer as usize],
+                map: fine,
+            },
+        };
+
+        while let Some((idx, mut op)) = next.next() {
+            let candidate = fuse_with[idx].filter(|(consumer_idx, _)| {
+                next.peek()
+                    .is_some_and(|(next_idx, _)| *next_idx == *consumer_idx)
+            });
+            if let Some((consumer_idx, residual)) = candidate {
+                let (_, consumer) = next.next().unwrap();
+                let new_idx = self.ops.len() as u32;
+                old_to_new[idx] = new_idx;
+                old_to_new[consumer_idx] = new_idx;
+                op.inst.t[1] = residual;
+                op.inst.t[2] = consumer.inst.t[0];
+                op.inst.t[3] = consumer.inst.t[2];
+                op.inst.t[4] = consumer.inst.t[3];
+                op.inst.t[5] = consumer.inst.t[5];
+                op.inst.t[6] = consumer.inst.t[1];
+                op.inst.i[5] = consumer.inst.i[1];
+                op.inst.i[6] = consumer.inst.i[2];
+                op.inst.i[7] = consumer.inst.i[4];
+                op.inst.f[0] = consumer.inst.f[0];
+                op.deps = op.deps.drain(..).map(|d| remap(d, &old_to_new)).collect();
+                op.counter = new_idx;
+                self.ops.push(op);
+                fused += 1;
+                continue;
+            }
+
+            let new_idx = self.ops.len() as u32;
+            old_to_new[idx] = new_idx;
+            op.deps = op.deps.drain(..).map(|d| remap(d, &old_to_new)).collect();
+            op.counter = new_idx;
+            self.ops.push(op);
+        }
+        fused
+    }
+
     pub fn finish(mut self) -> Program {
         if self.fuse_materialized_residual_inputs {
             let fused = self.fuse_materialized_residual_inputs();
             if fused != 0 {
                 eprintln!("  whole-graph fusion: {fused} materialized residual inputs");
+            }
+        }
+        if std::env::var("PLOW_FUSE_XR_ATTNRES").ok().as_deref() == Some("1") {
+            let fused = self.fuse_xreduce_attnres();
+            if fused != 0 {
+                eprintln!("  whole-graph fusion: {fused} XReduceTwoShot+AttnRes consumers");
             }
         }
         let n_cu = self.n_cu as usize;
@@ -1389,6 +1497,14 @@ impl Builder {
                     && op.inst.i[1] != 0
                     && op.inst.i[2] == 128
             });
+        // This encoding is understood only by its dedicated interpreter object. As with the
+        // raw KDA boundary, keep it isolated even when PLOW_UNISEG was requested; otherwise the
+        // ordinary XReduce arm would silently interpret the fused operand slots as its legacy
+        // residual/gather contract.
+        let xr_attnres = self
+            .ops
+            .iter()
+            .any(|op| op.inst.op == DevOp::XReduceTwoShot as u16 && op.inst.t[3] != TENSOR_NONE);
         // PLOW_SEG_PURE_GEMM=1 (T11): class-8 segments carry ONLY GEMM-family ops; every light
         // op (norms, rope, quant, embed, softcap) joins the flash class. The point: the sm_90a
         // segmented launcher runs class-8 segments on the lean `_pfgemm` object, and a pure-GEMM
@@ -1439,6 +1555,11 @@ impl Builder {
                 // A standalone raw-argument object owns this boundary. Keep its segment pure
                 // even if PLOW_UNISEG was requested; runtime routing may then select by opcode.
                 3
+            } else if xr_attnres
+                && op == DevOp::XReduceTwoShot as u16
+                && self.ops[i].inst.t[3] != TENSOR_NONE
+            {
+                12
             } else if lean_kda_intra
                 && op == DevOp::KdaChunkIntra as u16
                 && self.ops[i].inst.i[0] >= 512
@@ -1563,7 +1684,8 @@ impl Builder {
             .any(|op| op.inst.op == DevOp::KdaDecodeFused as u16)
             || lean_moe_stage2
             || lean_moe_stage1
-            || lean_kda_intra;
+            || lean_kda_intra
+            || xr_attnres;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             !raw_segmented || seg_of[consumer] == seg_of[dep.producer() as usize]
         };
@@ -2836,6 +2958,142 @@ mod whole_graph_fusion_tests {
         assert_eq!(b.fuse_materialized_residual_inputs(), 1);
         assert_eq!(b.ops.len(), 4);
         assert!(matches!(b.ops[3].deps.as_slice(), [Dep::Coarse(1)]));
+    }
+
+    fn xreduce_attnres_graph(extra_xr_consumer: bool) -> Builder {
+        let mut b = Builder::new(8);
+        let partial = b.tensor("partial", 2048);
+        let prefix_in = b.tensor("prefix_in", 2048);
+        let prefix = b.tensor("prefix", 2048);
+        let mixed = b.tensor("mixed", 2048);
+        let ring = b.tensor("ring", 8192);
+        let score = b.tensor("score", 256);
+        let gamma = b.tensor("gamma", 128);
+        let all = b.all();
+        let seed = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let xr = b.emit(DevOp::XReduceTwoShot, all.clone(), &[seed], |d| {
+            d.t[0] = partial;
+            d.i[0] = 16 * 64;
+            d.i[1] = 8;
+            d.i[3] = 4;
+            d.i[4] = 5;
+        });
+        let residual = b.emit(DevOp::Residual, all.clone(), &[xr], |d| {
+            d.t[0] = prefix;
+            d.t[1] = prefix_in;
+            d.t[2] = partial;
+            d.i[0] = 16 * 64;
+            d.f[0] = 1.0;
+        });
+        let consumer = b.emit(DevOp::AttnRes, all.clone(), &[residual], |d| {
+            d.t[0] = mixed;
+            d.t[1] = prefix;
+            d.t[2] = ring;
+            d.t[3] = score;
+            d.t[5] = gamma;
+            d.i[0] = 16;
+            d.i[1] = 64;
+            d.i[2] = 2;
+            d.i[4] = 4;
+            d.i[5] = TENSOR_NONE_I;
+            d.f[0] = 1e-5;
+        });
+        b.emit(DevOp::Nop, all.clone(), &[consumer], |_| {});
+        if extra_xr_consumer {
+            b.emit(DevOp::Nop, all, &[xr], |_| {});
+        }
+        b
+    }
+
+    #[test]
+    fn xreduce_phase2_folds_exact_graph_contract_and_remaps_counters() {
+        let mut b = xreduce_attnres_graph(false);
+        assert_eq!(b.fuse_materialized_residual_inputs(), 1);
+        assert_eq!(b.fuse_xreduce_attnres(), 1);
+        assert_eq!(b.ops.len(), 3);
+        let fused = &b.ops[1];
+        assert_eq!(fused.inst.op, DevOp::XReduceTwoShot as u16);
+        assert_eq!(
+            fused.inst.t[0], 0,
+            "ordinary reduced output remains materialized"
+        );
+        assert_eq!(fused.inst.t[1], 1, "residual addend");
+        assert_eq!(fused.inst.t[2], 3, "AttnRes output");
+        assert_eq!(fused.inst.t[3], 4, "AttnRes ring");
+        assert_eq!(fused.inst.t[4], 5, "AttnRes score");
+        assert_eq!(fused.inst.t[5], 6, "fused post-norm gamma");
+        assert_eq!(fused.inst.t[6], 2, "rounded prefix remains materialized");
+        assert_eq!(&fused.inst.i[5..], &[64, 2, 4]);
+        assert_eq!(fused.inst.f[0].to_bits(), 1e-5f32.to_bits());
+        assert!(matches!(b.ops[2].deps.as_slice(), [Dep::Coarse(1)]));
+    }
+
+    #[test]
+    fn xreduce_phase2_rejects_a_collective_with_another_graph_consumer() {
+        let mut b = xreduce_attnres_graph(true);
+        assert_eq!(b.fuse_materialized_residual_inputs(), 1);
+        assert_eq!(b.fuse_xreduce_attnres(), 0);
+    }
+
+    #[test]
+    fn xreduce_phase2_rejects_flat_slices_that_split_rows() {
+        let mut b = xreduce_attnres_graph(false);
+        assert_eq!(b.fuse_materialized_residual_inputs(), 1);
+        b.ops[1].inst.i[0] = 15 * 64;
+        b.ops[2].inst.i[0] = 15;
+        assert_eq!(b.fuse_xreduce_attnres(), 0);
+    }
+
+    #[test]
+    fn xreduce_phase2_folds_a_direct_prefix_without_inventing_a_residual() {
+        let mut b = Builder::new(8);
+        let prefix = b.tensor("prefix", 2048);
+        let mixed = b.tensor("mixed", 2048);
+        let ring = b.tensor("ring", 8192);
+        let score = b.tensor("score", 256);
+        let gamma = b.tensor("gamma", 128);
+        let all = b.all();
+        let seed = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let xr = b.emit(DevOp::XReduceTwoShot, all.clone(), &[seed], |d| {
+            d.t[0] = prefix;
+            d.i[0] = 16 * 64;
+            d.i[1] = 8;
+        });
+        b.emit(DevOp::AttnRes, all, &[xr], |d| {
+            d.t[0] = mixed;
+            d.t[1] = prefix;
+            d.t[2] = ring;
+            d.t[3] = score;
+            d.t[5] = gamma;
+            d.i[0] = 16;
+            d.i[1] = 64;
+            d.i[2] = 2;
+            d.i[4] = 4;
+            d.i[5] = TENSOR_NONE_I;
+            d.f[0] = 1e-5;
+        });
+        assert_eq!(b.fuse_xreduce_attnres(), 1);
+        assert_eq!(b.ops[1].inst.t[1], TENSOR_NONE);
+        assert_eq!(b.ops[1].inst.t[6], prefix);
+        b.force_uniseg();
+        let p = b.finish();
+        let seg = |inst| {
+            p.stream
+                .iter()
+                .find(|e| e.inst == inst)
+                .expect("instruction has a stream entry")
+                .seg
+        };
+        assert_ne!(
+            seg(0),
+            seg(1),
+            "the fused op needs its spill-isolated object even under forced uniseg"
+        );
+        assert!(p
+            .stream
+            .iter()
+            .filter(|e| e.seg == seg(1))
+            .all(|e| e.inst == 1));
     }
 }
 

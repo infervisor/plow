@@ -48,6 +48,7 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       interp_prefill_mla_moe.elf interp_prefill_mla_moe_gq.elf \
       kda_decode_fused_gfx950.co kda_decode_fused_gfx950.elf \
       kda_chunk_intra_cached_gfx950.co kda_chunk_intra_cached_gfx950.elf \
+      xreduce_attnres_gfx950.co xreduce_attnres_gfx950.elf \
       moe_stage1_mxfp4_gfx950.co moe_stage1_mxfp4_gfx950.elf \
       moe_stage2_mxfp4_gfx950.co moe_stage2_mxfp4_gfx950.elf
 
@@ -73,6 +74,17 @@ if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_INTRA_CACHED:-0}" = 1 ]; then
     -DPLOW_REQUIRED_MARKER=plow_kda_intra_cached_abi_1 \
     "$R/amd/kda_chunk_intra_cached.hip"
   KDA_INTRA_CACHED_ELFS="kda_chunk_intra_cached_gfx950.elf"
+fi
+
+XR_ATTNRES_ELFS=""
+if [ "$ARCH" = gfx950 ] && [ "${PLOW_XR_ATTNRES:-0}" = 1 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/xreduce_attnres_gfx950.elf" plow_xreduce_attnres_gfx950 256 2 \
+    $INC -DPLOW_K3=1 -DPLOW_XR_ATTNRES=1 -DPLOW_LEAN_OBJECT=1 \
+    -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_xr_attnres_wave64_nospill_1 \
+    "$R/amd/xreduce_attnres_fused.hip"
+  XR_ATTNRES_ELFS="xreduce_attnres_gfx950.elf"
 fi
 if [ "$ARCH" = gfx950 ] && [ "$need_kda_fused" = 1 ]; then
   bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
@@ -194,7 +206,7 @@ done
 # SEGMENTED-DISPATCH flash object: prefill op set at 4 waves / FA_DC=256, compiling ONLY the class-4
 # flash_prefill segment (PLOW_BUCKET_FLASH). 1 wave/SIMD => 512-reg budget; the Q-hoist spills Q to
 # on-chip scratch by design (cheaper than the L2 re-read it replaces).
-genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1" i_flash.co
+genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1" i_flash.co
 unbundle i_flash.co interp_flash.elf
 
 # GLOBAL-QUEUE variant (Experiment E1). Same op set / tiles / wave count as the static prefill+decode
@@ -286,7 +298,7 @@ if [ "$BUILD_GQ" = 1 ]; then
   # one — it is the SAME object with one extra scalar read, and if that ever costs occupancy the
   # build must fail rather than ship a decode kernel at occ 1.
   # GQ flash object (Gemma's segmented 4-wave flash segment under the global queue).
-  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" i_flash_gq.co
+  genco "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB $L2D" i_flash_gq.co
   unbundle i_flash_gq.co interp_flash_gq.elf
 fi
 
@@ -467,7 +479,7 @@ check() { # <name> <defs> <max-total> <min-occ>
 }
 check prefill "-DPLOW_BUCKET_DECODE=0" 256 2
 check decode  "$DEC" 256 2
-check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1" 512 1
+check flash   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1" 512 1
 # The GQ loop adds a shared cursor + claim broadcast; it must NOT push prefill past 256/occ-2. If it
 # does and no minimal-live-set fix recovers it, that is itself a recordable E1 finding (GQ incompatible
 # with occ-2 prefill). These run only when the GQ objects were built.
@@ -475,7 +487,7 @@ GQ_ELFS=""
 if [ "$BUILD_GQ" = 1 ]; then
   check prefill_gq "-DPLOW_BUCKET_DECODE=0 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
   check decode_gq  "$DEC $L2D -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 256 2
-  check flash_gq   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 512 1
+  check flash_gq   "-DPLOW_BUCKET_DECODE=0 -DPLOW_BUCKET_FLASH -DPLOW_WG_WAVES=4 -DFA_DC=256 -DFA_DBUF=1 -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=$GQB" 512 1
   GQ_ELFS="interp_prefill_gq.elf interp_decode_gq.elf interp_flash_gq.elf"
 fi
 # The fp8 arms swap (not add) against the bf16 GEMV_GLU/QKV arms, so they must stay under the same
@@ -547,7 +559,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.
@@ -562,6 +574,13 @@ for e in $ALL_ELFS; do
       fi
       ;;
   esac
+done
+
+for e in interp_flash.elf ${BUILD_GQ:+interp_flash_gq.elf}; do
+  [ -f "$e" ] || continue
+  symbols=$("${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/llvm-nm "$e")
+  grep -q plow_mla_pf_v2_arm_1 <<<"$symbols" || {
+    echo "FAIL: $e omits the gfx950 default MLA-prefill V2 arm"; exit 1; }
 done
 
 # Packed consumers are a separate opt-in object axis. Default production objects retain the

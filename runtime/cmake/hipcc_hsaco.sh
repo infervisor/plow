@@ -133,11 +133,12 @@ grep -qE "FUNC .* $SYM\$" <<<"$SYMS" ||
     fail "$SYM not found in $OUT — kernel name/signature changed; update the
        symbol constants in runtime/tests/gemma4_chat.c."
 
-LEAN=0; NOSPILL=0; REQUIRED_MARKER=""
+LEAN=0; NOSPILL=0; NOSGPRSPILL=0; REQUIRED_MARKER=""
 for arg in "$@"; do
     case "$arg" in
         -DPLOW_LEAN_OBJECT=1) LEAN=1 ;;
         -DPLOW_NO_SPILL=1) NOSPILL=1 ;;
+        -DPLOW_NO_SGPR_SPILL=1) NOSGPRSPILL=1 ;;
         -DPLOW_REQUIRED_MARKER=*) REQUIRED_MARKER=${arg#*=} ;;
     esac
 done
@@ -149,6 +150,8 @@ fi
     fail "$(basename "$OUT") spills $S VGPRs"
 [ "$NOSPILL" != 1 ] || [ "$MP" = 0 ] ||
     fail "$(basename "$OUT") has a ${MP}-byte private segment"
+[ "$NOSGPRSPILL" != 1 ] || [ "$MSP" = 0 ] ||
+    fail "$(basename "$OUT") spills $MSP SGPRs"
 if [ -n "$REQUIRED_MARKER" ]; then
     grep -qE "OBJECT .* ${REQUIRED_MARKER}\$" <<<"$SYMS" ||
         fail "$OUT does not advertise $REQUIRED_MARKER"

@@ -360,7 +360,10 @@ pub enum DevOp {
     /// Bit-identical result to one-shot (same f32-acc, r=0..N−1 order). DECODE keeps the
     /// one-shot (its tiny [1,hidden] message is latency-, not bandwidth-, bound).
     /// `t0=out` · `i0=n(=t·hidden) i1=n_gpu i2=slot(byte offset) i3=gate_rs i4=gate_ag
-    /// i5=e0 i6=gslot? i7=gcols?`.
+    /// i5=e0 i6=gslot? i7=gcols?`. With a graph-selected fused AttnRes consumer, `t1=resid?`,
+    /// `t2=attnres_out`, `t3=ring`, `t4=score`, `t5=gamma`, `t6=prefix_out`, and
+    /// `i5=H i6=nb i7=nb_cap f0=eps`. Phase 2 preserves `out`, materializes the rounded prefix,
+    /// then runs AttnRes+RMSNorm on the same token-owned workgroups.
     XReduceTwoShot = 29,
     /// FP8 (e4m3) KV-cache twin of [`DevOp::HeadNormRope`]: writes K/V as `uint8[...]` e4m3 with a
     /// per-(token,kv_head) f32 dequant scale, halving the KV footprint and the decode KV stream.
