@@ -361,6 +361,158 @@ __device__ void d_kda_chunk_intra_bt64(
     }
 }
 
+/* Standalone gfx950 candidate for the full BT64 intra solve.  The production body above
+ * regenerates the gated bf16 operands in every one of the ten lower-triangular block products.
+ * This variant materializes those operands once in LDS, preserves the MFMA order, and distributes
+ * each f32 substitution row across every wave.  `scratch` needs 57,344 bf16 values at D=128
+ * (114,688 bytes). */
+__device__ void d_kda_chunk_intra_bt64_cached(
+    float* __restrict__ Aqk, float* __restrict__ Ainv, const bf16* __restrict__ q,
+    const bf16* __restrict__ k, const float* __restrict__ g_cumsum_log2,
+    const float* __restrict__ beta, const uint2* __restrict__ chunks, unsigned n_chunks,
+    unsigned T, unsigned H, unsigned D, float scale, unsigned slice, unsigned nblk,
+    bf16* __restrict__ scratch) {
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & (PLOW_WAVE - 1u);
+    const unsigned wave = tid >> 6;
+    const unsigned token = lane & 15u;
+    const unsigned kgroup = lane >> 4;
+    const size_t n_items = (size_t)n_chunks * H;
+    float* const mat = reinterpret_cast<float*>(scratch);
+    bf16* const pos_diag = scratch + 64u * 64u * 2u;
+    bf16* const pos_off = pos_diag + 4u * 2u * 16u * D;
+    bf16* const neg = pos_off + 3u * 2u * 16u * D;
+
+    for (size_t item = slice; item < n_items; item += nblk) {
+        const unsigned chunk = (unsigned)(item / H);
+        const unsigned h = (unsigned)(item - (size_t)chunk * H);
+        const uint2 desc = kda_chunk_desc(chunks, chunk, T);
+        const unsigned valid = desc.y;
+        const size_t row0 = desc.x;
+        const size_t hd_count = (size_t)H * D;
+
+        for (unsigned x = tid; x < 64u * 64u; x += PLOW_THREADS) mat[x] = 0.0f;
+        for (unsigned x = tid; x < valid * 64u; x += PLOW_THREADS)
+            Aqk[((row0 + x / 64u) * H + h) * 64u + x % 64u] = 0.0f;
+
+        for (unsigned bm = 0; bm < 4u; ++bm) {
+            const unsigned m0 = bm * 16u;
+            const unsigned mv = valid > m0 ? min(16u, valid - m0) : 0u;
+            if (mv == 0) continue;
+            const size_t anchor_row = row0 + m0 + min(8u, mv - 1u);
+            bf16* const qp = pos_diag + (size_t)(2u * bm) * 16u * D;
+            bf16* const kp = qp + 16u * D;
+            for (unsigned x = tid; x < mv * D; x += PLOW_THREADS) {
+                const unsigned ml = x / D, d = x % D;
+                const size_t i = ((row0 + m0 + ml) * H + h) * D + d;
+                const size_t ia = (anchor_row * H + h) * D + d;
+                const float e = exp2f(g_cumsum_log2[i] - g_cumsum_log2[ia]);
+                qp[x] = f2bf(bf2f(q[i]) * e);
+                kp[x] = f2bf(bf2f(k[i]) * e);
+            }
+            if (bm != 0u) {
+                bf16* const qpo = pos_off + (size_t)(2u * (bm - 1u)) * 16u * D;
+                bf16* const kpo = qpo + 16u * D;
+                const size_t off_anchor = row0 + m0;
+                for (unsigned x = tid; x < mv * D; x += PLOW_THREADS) {
+                    const unsigned ml = x / D, d = x % D;
+                    const size_t i = ((row0 + m0 + ml) * H + h) * D + d;
+                    const size_t ia = (off_anchor * H + h) * D + d;
+                    const float e = exp2f(g_cumsum_log2[i] - g_cumsum_log2[ia]);
+                    qpo[x] = f2bf(bf2f(q[i]) * e);
+                    kpo[x] = f2bf(bf2f(k[i]) * e);
+                }
+            }
+            const size_t tri = (size_t)bm * (bm + 1u) / 2u;
+            for (unsigned bn = 0; bn <= bm; ++bn) {
+                const unsigned n0 = bn * 16u;
+                const unsigned nv = min(16u, valid - n0);
+                const size_t neg_anchor = bn == bm ? anchor_row : row0 + m0;
+                bf16* const kn = neg + (tri + bn) * 16u * D;
+                for (unsigned x = tid; x < nv * D; x += PLOW_THREADS) {
+                    const unsigned nl = x / D, d = x % D;
+                    const size_t i = ((row0 + n0 + nl) * H + h) * D + d;
+                    const size_t ia = (neg_anchor * H + h) * D + d;
+                    kn[x] = f2bf(bf2f(k[i]) *
+                                 exp2f(g_cumsum_log2[ia] - g_cumsum_log2[i]));
+                }
+            }
+        }
+        __syncthreads();
+
+        for (unsigned pair = wave; pair < 10u; pair += PLOW_WAVES) {
+            const unsigned bm = pair >= 6u ? 3u : (pair >= 3u ? 2u : (pair >= 1u ? 1u : 0u));
+            const unsigned bn = pair - bm * (bm + 1u) / 2u;
+            const unsigned m0 = bm * 16u, n0 = bn * 16u;
+            const unsigned mv = valid > m0 ? min(16u, valid - m0) : 0u;
+            const unsigned nv = valid > n0 ? min(16u, valid - n0) : 0u;
+            if (mv != 0 && nv != 0) {
+                const bf16* const qp = bm == bn
+                    ? pos_diag + (size_t)(2u * bm) * 16u * D
+                    : pos_off + (size_t)(2u * (bm - 1u)) * 16u * D;
+                const bf16* const kp = qp + 16u * D;
+                const bf16* const kn =
+                    neg + ((size_t)bm * (bm + 1u) / 2u + bn) * 16u * D;
+                f32x4 qk_acc = (f32x4)(0.0f);
+                f32x4 kk_acc = (f32x4)(0.0f);
+                for (unsigned d0 = 0; d0 < D; d0 += 32u) {
+                    bf16x8 qf = (bf16x8)((bf16_t)0);
+                    bf16x8 kf = (bf16x8)((bf16_t)0);
+                    bf16x8 kt = (bf16x8)((bf16_t)0);
+                    const unsigned d = d0 + 8u * kgroup;
+                    if (token < mv) {
+#pragma unroll
+                        for (unsigned j = 0; j < 8; ++j) {
+                            qf[j] = __builtin_bit_cast(bf16_t, qp[token * D + d + j]);
+                            kf[j] = __builtin_bit_cast(bf16_t, kp[token * D + d + j]);
+                        }
+                    }
+                    if (token < nv) {
+#pragma unroll
+                        for (unsigned j = 0; j < 8; ++j)
+                            kt[j] = __builtin_bit_cast(bf16_t, kn[token * D + d + j]);
+                    }
+                    qk_acc = plow_mfma_bf16_16x16(qf, kt, qk_acc);
+                    kk_acc = plow_mfma_bf16_16x16(kf, kt, kk_acc);
+                }
+#pragma unroll
+                for (unsigned e = 0; e < 4; ++e) {
+                    const unsigned ml = 4u * kgroup + e, nl = token;
+                    if (ml < mv && nl < nv && (bm != bn || nl <= ml)) {
+                        const unsigned m = m0 + ml, n = n0 + nl;
+                        Aqk[((row0 + m) * H + h) * 64u + n] = qk_acc[e] * scale;
+                        if (n < m)
+                            mat[m * 64u + n] = kk_acc[e] * beta[(row0 + m) * H + h];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        float* const partial = mat + 64u * 64u;
+        for (unsigned i = 0; i < valid; ++i) {
+            float sum = 0.0f;
+            for (unsigned j = 1u + wave; j < i; j += PLOW_WAVES)
+                if (lane < j) sum += mat[i * 64u + j] * mat[j * 64u + lane];
+            partial[wave * 64u + lane] = sum;
+            __syncthreads();
+            if (wave == 0 && lane <= i) {
+                float value = lane < i ? -mat[i * 64u + lane] : 1.0f;
+#pragma unroll
+                for (unsigned w = 0; w < PLOW_WAVES; ++w)
+                    value -= partial[w * 64u + lane];
+                mat[i * 64u + lane] = value;
+            }
+            __syncthreads();
+        }
+        for (unsigned x = tid; x < valid * 64u; x += PLOW_THREADS) {
+            const unsigned m = x / 64u, n = x % 64u;
+            Ainv[((row0 + m) * H + h) * 64u + n] = n <= m ? mat[m * 64u + n] : 0.0f;
+        }
+        __syncthreads();
+    }
+}
+
 /* Transform a full BT64 inverse into the write/value factors used by the chunk carry:
  *   W = Ainv @ (beta * K * exp2(g)), U = Ainv @ (beta * V).
  * One wave owns one (chunk, head, 16 token rows, 16 output channels) tile. */

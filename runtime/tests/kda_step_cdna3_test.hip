@@ -111,6 +111,13 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_intra_full(KArgs
         (const float*)a->gprefix, (const float*)a->o, (const uint2*)a->chunks, a->n_chunks,
         a->T, a->H, a->D, a->scale, blockIdx.x, gridDim.x, mat);
 }
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, 1) void k_intra_cached(KArgs* a) {
+    __shared__ __align__(16) bf16 scratch[57344];
+    d_kda_chunk_intra_bt64_cached(
+        (float*)a->aqk, (float*)a->ainv, (const bf16*)a->q, (const bf16*)a->k,
+        (const float*)a->gprefix, (const float*)a->o, (const uint2*)a->chunks, a->n_chunks,
+        a->T, a->H, a->D, a->scale, blockIdx.x, gridDim.x, scratch);
+}
 extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_wu(KArgs* a) {
     d_kda_chunk_wu_bt64(
         (bf16*)a->w, (bf16*)a->u, KDA_CHUNK_QPRE ? (bf16*)a->q : nullptr,
@@ -260,7 +267,8 @@ int main(int argc, char** argv) {
     hipDeviceProp_t p; HC(hipGetDeviceProperties(&p, 0));
     printf("dev: %s\n", p.gcnArchName);
     hipModule_t M; HC(hipModuleLoad(&M, argc > 1 ? argv[1] : "/tmp/kda3.co"));
-    hipFunction_t fstep, fstep_packed, fnorm, fprefix, fprepare, fintra, fintra_full, fwu, fcarry;
+    hipFunction_t fstep, fstep_packed, fnorm, fprefix, fprepare, fintra, fintra_full,
+                  fintra_cached, fwu, fcarry;
     hipFunction_t fprepare_packed, fintra_packed, fwu_packed, fcarry_packed;
     HC(hipModuleGetFunction(&fstep, M, "k_step"));
     HC(hipModuleGetFunction(&fstep_packed, M, "k_step_packed"));
@@ -269,6 +277,7 @@ int main(int argc, char** argv) {
     HC(hipModuleGetFunction(&fprepare, M, "k_prepare"));
     HC(hipModuleGetFunction(&fintra, M, "k_intra"));
     HC(hipModuleGetFunction(&fintra_full, M, "k_intra_full"));
+    HC(hipModuleGetFunction(&fintra_cached, M, "k_intra_cached"));
     HC(hipModuleGetFunction(&fwu, M, "k_wu"));
     HC(hipModuleGetFunction(&fcarry, M, "k_carry"));
     HC(hipModuleGetFunction(&fprepare_packed, M, "k_prepare_packed"));
@@ -517,6 +526,30 @@ int main(int argc, char** argv) {
         printf("  chunk intra BT64 qk max abs %.3e (bar 5e-5) inv %.3e (bar 3e-4)\n",
                qk64_max, inv64_max);
 
+        HC(hipMemset(d_qk64, 0, qk64_ref.size() * sizeof(float)));
+        HC(hipMemset(d_inv64, 0, inv64_ref.size() * sizeof(float)));
+        HC(hipModuleLaunchKernel(fintra_cached, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0,
+                                 args, nullptr));
+        HC(hipDeviceSynchronize());
+        std::vector<float> qk_cached(qk64_ref.size()), inv_cached(inv64_ref.size());
+        HC(hipMemcpy(qk_cached.data(), d_qk64, qk_cached.size() * sizeof(float),
+                     hipMemcpyDeviceToHost));
+        HC(hipMemcpy(inv_cached.data(), d_inv64, inv_cached.size() * sizeof(float),
+                     hipMemcpyDeviceToHost));
+        size_t qk_exact_bad = 0, inv_exact_bad = 0;
+        double qk_cached_max = 0.0, inv_cached_max = 0.0;
+        for (size_t i = 0; i < qk_cached.size(); ++i) {
+            qk_exact_bad += qk_cached[i] != qk64[i];
+            qk_cached_max = fmax(qk_cached_max, fabs(qk_cached[i] - qk64_ref[i]));
+        }
+        for (size_t i = 0; i < inv_cached.size(); ++i) {
+            inv_exact_bad += inv_cached[i] != inv64[i];
+            inv_cached_max = fmax(inv_cached_max, fabs(inv_cached[i] - inv64_ref[i]));
+        }
+        printf("  chunk intra cached qk max abs %.3e exact_bad %zu/%zu inv max abs %.3e exact_bad %zu/%zu\n",
+               qk_cached_max, qk_exact_bad, qk_cached.size(), inv_cached_max, inv_exact_bad,
+               inv_cached.size());
+
         const unsigned IV = 32;
         std::vector<bf16> value((size_t)IT * IH * IV);
         std::vector<float> state0((size_t)IH * IV * ID);
@@ -599,7 +632,8 @@ int main(int argc, char** argv) {
         printf("  chunk carry 4 chunks output rms rel %.3e (bar 1e-2) state %.3e (bar 5e-3)\n",
                orms, srms);
         return fmax(fmax(qk_max / 5e-5, inv_max / 2e-4),
-                    fmax(fmax(qk64_max / 5e-5, inv64_max / 3e-4),
+                    fmax(fmax(fmax(qk64_max / 5e-5, inv64_max / 3e-4),
+                              fmax(qk_cached_max / 5e-5, inv_cached_max / 3e-4)),
                          fmax(fmax(orms / 1e-2, srms / 5e-3), qpre_bad)));
     };
 
@@ -609,7 +643,10 @@ int main(int argc, char** argv) {
     worst = fmax(worst, run_intra());
 
     if (getenv("KDA3_BENCH")) {
-        const unsigned BH = 12, BD = 128, BVV = 128;
+        const unsigned BH = getenv("KDA_BENCH_H")
+            ? (unsigned)strtoul(getenv("KDA_BENCH_H"), nullptr, 10)
+            : 12;
+        const unsigned BD = 128, BVV = 128;
         const unsigned GRIDB = getenv("KDA_BENCH_GRID")
             ? (unsigned)strtoul(getenv("KDA_BENCH_GRID"), nullptr, 10)
             : p.multiProcessorCount;
@@ -686,7 +723,7 @@ int main(int argc, char** argv) {
             };
             auto chunked = [&]() {
                 HC2(hipModuleLaunchKernel(fprepare, GRIDB, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args_c, nullptr));
-                HC2(hipModuleLaunchKernel(fintra_full, GRIDB, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args_c, nullptr));
+                HC2(hipModuleLaunchKernel(fintra_cached, GRIDB, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args_c, nullptr));
                 HC2(hipModuleLaunchKernel(fwu, GRIDB, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args_c, nullptr));
                 HC2(hipModuleLaunchKernel(fcarry, GRIDB, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args_c, nullptr));
             };
@@ -740,10 +777,11 @@ int main(int argc, char** argv) {
             };
             const float pms = time_stage(fprepare, false);
             const float ims = time_stage(fintra_full, false);
+            const float icms = time_stage(fintra_cached, false);
             const float wms = time_stage(fwu, false);
             const float hms = time_stage(fcarry, true);
-            printf("BENCH T=%u serial_ms=%.4f chunk_ms=%.4f speedup=%.3f prefix_ms=%.4f intra_ms=%.4f wu_ms=%.4f carry_ms=%.4f out_rel=%.4e state_rel=%.4e\n",
-                   T, sms, cms, sms / cms, pms, ims, wms, hms, out_rel, state_rel);
+            printf("BENCH T=%u serial_ms=%.4f chunk_ms=%.4f speedup=%.3f prefix_ms=%.4f intra_ms=%.4f intra_cached_ms=%.4f wu_ms=%.4f carry_ms=%.4f out_rel=%.4e state_rel=%.4e\n",
+                   T, sms, cms, sms / cms, pms, ims, icms, wms, hms, out_rel, state_rel);
             if (T >= 512 && (out_rel > 1e-2 || state_rel > 5e-3)) worst = fmax(worst, 2.0);
             for (void* d : {dq,dk,dv,dgraw,dbraw,dalog,ddtb,dchunks,dss,dsc,dos,doc,dg,dbeta,
                             daqk,dainv,dw,du,das,dac}) HC(hipFree(d));
