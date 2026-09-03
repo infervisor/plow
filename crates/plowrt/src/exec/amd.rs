@@ -1176,7 +1176,22 @@ const MOE_GEMMA_SYM: &str = "plow_moe_gemma_arms_1";
 /// global-queue `seg` as an L2 domain, so an object without this axis mis-dispatches it SILENTLY.
 /// Checked instead of the operator-asserted PLOW_L2_PLACE_DISPATCH env var.
 const L2_DISPATCH_SYM: &str = "plow_l2_place_dispatch_1";
+const GATE_HIER_SYM: &str = "plow_gate_hier_1";
 const MOE_GEMMA_PF_SYM: &str = "plow_moe_gemma_pf_arms_1";
+
+fn check_gate_hier_object(syms: &[&str], path: &Path, phase: Phase, sched: Sched) -> Result<()> {
+    if !syms.contains(&GATE_HIER_SYM) {
+        return Ok(());
+    }
+    if phase != Phase::Decode || sched != Sched::GlobalQueue || !syms.contains(&L2_DISPATCH_SYM) {
+        return Err(RuntimeError::Device(format!(
+            "{} advertises `{GATE_HIER_SYM}`, but hierarchical gates are valid only for a \
+             decode global-queue object carrying `{L2_DISPATCH_SYM}`",
+            path.display()
+        )));
+    }
+    Ok(())
+}
 
 /// Every opcode behind `#if PLOW_MOE_GEMMA` in `runtime/amd/interp.hip`.
 const MOE_GEMMA_OPS: &[DevOp] = &[
@@ -4389,6 +4404,7 @@ impl AmdEngine {
                     }
                 })?;
                 let syms = elf_symbol_names(&image);
+                check_gate_hier_object(&syms, &path, phase, sched)?;
                 let packed_prefill_abi = syms.contains(&PACKED_PREFILL_ABI_SYM);
                 if let (Phase::Prefill, Some(req)) = (phase, requires.as_ref()) {
                     check_prefill_object(&syms, &path, req)?;
@@ -7913,6 +7929,37 @@ mod tests {
             .to_string();
         assert!(missing_flash.contains("flash object"));
         assert!(missing_flash.contains(PACKED_PREFILL_ABI_SYM));
+    }
+
+    #[test]
+    fn hierarchical_gate_marker_requires_decode_gq_and_l2_capability() {
+        let object = Path::new("interp_decode_gq.elf");
+        let valid = [GATE_HIER_SYM, L2_DISPATCH_SYM];
+        assert!(check_gate_hier_object(&valid, object, Phase::Decode, Sched::GlobalQueue).is_ok());
+        assert!(
+            check_gate_hier_object(&[L2_DISPATCH_SYM], object, Phase::Prefill, Sched::Static)
+                .is_ok()
+        );
+
+        for (syms, phase, sched) in [
+            (&[GATE_HIER_SYM][..], Phase::Decode, Sched::GlobalQueue),
+            (
+                &[GATE_HIER_SYM, L2_DISPATCH_SYM][..],
+                Phase::Decode,
+                Sched::Static,
+            ),
+            (
+                &[GATE_HIER_SYM, L2_DISPATCH_SYM][..],
+                Phase::Prefill,
+                Sched::GlobalQueue,
+            ),
+        ] {
+            let message = check_gate_hier_object(syms, object, phase, sched)
+                .expect_err("invalid hierarchical-gate object must be refused")
+                .to_string();
+            assert!(message.contains(GATE_HIER_SYM));
+            assert!(message.contains(L2_DISPATCH_SYM));
+        }
     }
 
     #[test]

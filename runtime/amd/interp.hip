@@ -428,6 +428,17 @@ extern "C" __device__ unsigned plow_l2_place_dispatch_1 = 1;
 #ifndef PLOW_GLOBAL_QUEUE
 #define PLOW_GLOBAL_QUEUE 0
 #endif
+#ifndef PLOW_GATE_HIER
+#define PLOW_GATE_HIER 0
+#endif
+#if PLOW_GATE_HIER &&                                                                    \
+    (!defined(PLOW_BUCKET_DECODE) || !PLOW_BUCKET_DECODE || !PLOW_GLOBAL_QUEUE ||        \
+     !defined(PLOW_L2_PLACE_DISPATCH) || !PLOW_L2_PLACE_DISPATCH)
+#error "PLOW_GATE_HIER requires a decode global-queue object with L2-domain dispatch"
+#endif
+#if PLOW_GATE_HIER
+extern "C" __device__ unsigned plow_gate_hier_1 = 1;
+#endif
 #ifndef PLOW_GQ_BATCH
 #define PLOW_GQ_BATCH 1
 #endif
@@ -3380,57 +3391,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
  * REQUIRES PLOW_L2_PLACE_DISPATCH and an L2-placed blob. Without per-domain windows `nper` is
  * meaningless (a workgroup claims whatever entry is next, so the count is a run-time property),
  * and the emitter leaves the field zero — which this code reads as "no hierarchy". */
-#ifndef PLOW_GATE_HIER
-#define PLOW_GATE_HIER 0
-#endif
 #if PLOW_GATE_HIER && PLOW_GATE_HIER_CEIL
 #error "PLOW_GATE_HIER (sound) and PLOW_GATE_HIER_CEIL (the unsafe ceiling) are exclusive"
 #endif
-/* PRECONDITIONS, and they DEGRADE rather than fail the build.
- *
- * `PLOW_HSACO_EXTRA_DEFINES` is applied to EVERY object in the set — 49 of them, including the
- * static-path and flash-class ones that are deliberately built without the global queue. An
- * `#error` here is therefore not a guard, it is a build break for objects the knob was never
- * meant to touch (measured: 16 of 49 built, then `my_seg` undeclared in the static path).
- *
- * Both preconditions are structural. `my_seg` — the domain a workgroup serves — exists only on
- * the global-queue path, and the per-domain windows the whole scheme rests on are a global-queue
- * construct; the static per-CU path has no domain of its own to be the leader of. And without
- * L2-domain dispatch `nper` is a run-time property, not the emit-time constant this reads.
- *
- * So an object that cannot support the hierarchy compiles WITHOUT it and behaves exactly as
- * before. That is safe rather than merely convenient: `hier_base` is only non-zero on an
- * L2-placed blob, and an object built without the hierarchy simply never reads it. */
-/* DECOUPLED FROM L2 PLACEMENT, and the coupling was the bug.
- *
- * This used to read `#if PLOW_GATE_HIER && (!defined(PLOW_L2_PLACE_DISPATCH) || !PLOW_GLOBAL_QUEUE)`
- * and silently `#undef` itself otherwise -- so the hierarchy could only exist on an L2-placed
- * global-queue object, and asking for it anywhere else compiled it out with no diagnostic. That
- * made it untestable on its own, and it hid that the two features are unrelated:
- *
- *   L2 PLACEMENT improves LOCALITY. Measured on Gemma-4-31B decode, MI355X: NO EFFECT, 16.57 vs
- *   16.54 ms/token -- and the arithmetic says it cannot be otherwise, since decode streams
- *   61.4 GB of weights per token against ~7 MB of activations, so perfect L2 capture addresses
- *   ~0.01% of the traffic (docs/flags-reference.md).
- *
- *   THE HIERARCHY reduces INVALIDATE TRAFFIC, which is a different quantity entirely. An
- *   agent-scope acquire lowers to `buffer_inv sc1` -- a full XCD-L2 invalidate -- on gfx942 and
- *   gfx950 alike, and that instruction SERIALISES across concurrent issuers. Measured on MI300X:
- *
- *      1-16 workgroups invalidating     ~1.0 us
- *      38                                2.6 us
- *      76                                5.2 us
- *      152                               9.9 us
- *      304 (the real decode grid)       19.7 us
- *
- *   against 0.037 us for the bare `buffer_inv` (L1 only) a follower would run. Electing one
- *   leader per XCD takes 304 issuers down to 8, i.e. 19.7 us -> ~1.05 us, an 18.8x cut in the
- *   maintenance half of every gated packet boundary. On a 304-CU part that is worth MORE than on
- *   MI355X's 256, not less.
- *
- * All the hierarchy ever needed was a domain index, and HW_REG_XCC_ID gives one on every path --
- * the leader election below already reads it. So the precondition is now just `l2_domains != 0`,
- * which the host sets, and the static per-CU path can carry it. */
 
 /* The two knobs do not compose, and combined they are silently worse than either. The HIER_CEIL
  * follower hand-rolls its relaxed RMW rather than calling `ctr_signal`, so under SC1 it would

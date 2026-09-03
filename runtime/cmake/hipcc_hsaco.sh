@@ -105,7 +105,7 @@ grep -qE "FUNC .* $SYM\$" <<<"$SYMS" ||
 grep -qE "OBJECT .* plow_packed_prefill_abi_1\$" <<<"$SYMS" ||
     fail "$OUT does not advertise plow_packed_prefill_abi_1"
 PACKED_MLA=0; PACKED_MLA_NORM=0; PACKED_MLA_FLASH=0; PACKED_KDA=0; KDA_CHUNK=0
-K3=0; MLA=0
+K3=0; MLA=0; HIER=0; L2=0; GQ=0; DECODE=0
 for arg in "$@"; do
     case "$arg" in
         -DPLOW_PACKED_PREFILL_CONSUMERS=1) PACKED_MLA=1; PACKED_KDA=1 ;;
@@ -116,8 +116,21 @@ for arg in "$@"; do
         -DPLOW_KDA_CHUNK=1) KDA_CHUNK=1 ;;
         -DPLOW_K3=1) K3=1 ;;
         -DPLOW_MLA_PREFILL=1|-DPLOW_MLA_PF_V2_ARM=1) MLA=1 ;;
+        -DPLOW_GATE_HIER=1) HIER=1 ;;
+        -DPLOW_L2_PLACE_DISPATCH=1) L2=1 ;;
+        -DPLOW_GLOBAL_QUEUE=1) GQ=1 ;;
+        -DPLOW_BUCKET_DECODE=1) DECODE=1 ;;
     esac
 done
+if [ "$HIER" = 1 ] && { [ "$L2" != 1 ] || [ "$GQ" != 1 ] || [ "$DECODE" != 1 ]; }; then
+    fail "$OUT enables PLOW_GATE_HIER outside a decode GQ object with L2-domain dispatch"
+fi
+if [ "$HIER" = 1 ]; then
+    grep -qE "OBJECT .* plow_gate_hier_1\$" <<<"$SYMS" ||
+        fail "$OUT enables PLOW_GATE_HIER but is missing plow_gate_hier_1"
+elif grep -qE "OBJECT .* plow_gate_hier_1\$" <<<"$SYMS"; then
+    fail "$OUT unexpectedly advertises plow_gate_hier_1"
+fi
 for cap in mla kda; do
     marker="plow_packed_prefill_${cap}_consumers_1"
     required=0

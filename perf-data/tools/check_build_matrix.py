@@ -151,6 +151,15 @@ def check_devblob(cell, manifest):
         need(not missing, f"object is missing manifest-required defines: {missing}")
         missing = sorted(set(spec.get("markers", [])) - set(markers))
         need(not missing, f"object is missing requested markers: {missing}")
+        hier_define = "PLOW_GATE_HIER=1" in defines
+        hier_marker = "plow_gate_hier_1" in markers
+        need(hier_define == hier_marker,
+             "PLOW_GATE_HIER=1 and plow_gate_hier_1 must be present together")
+        if hier_marker:
+            need("PLOW_L2_PLACE_DISPATCH=1" in defines,
+                 "hierarchical gate object is missing PLOW_L2_PLACE_DISPATCH=1")
+            need("plow_l2_place_dispatch_1" in markers,
+                 "hierarchical gate object is missing plow_l2_place_dispatch_1")
         if "launch_rows" in spec:
             rows = spec["launch_rows"]
             need(isinstance(rows, int) and not isinstance(rows, bool) and rows > 0,

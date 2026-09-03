@@ -703,11 +703,26 @@ set(PLOW_GQ_BATCH "1" CACHE STRING "global-queue claim batch")
 set(PLOW_DECODE_BATCH "1" CACHE STRING "decode batch bucket")
 set(PLOW_GEMV_MM "" CACHE STRING "decode GEMV rows per walk pass (empty = derived)")
 option(PLOW_GEMV_WALK "Walk a <=16-row GEMV object across wider decode batches" OFF)
+option(PLOW_GATE_HIER
+       "Use hierarchical cache-maintenance gates in gfx950 decode GQ objects" OFF)
 option(PLOW_L2_PLACE_DISPATCH "Compile support for L2-domain placed packets" OFF)
 option(PLOW_MLA_PF_V2_ARM "Compile the four-wave MLA prefill V2 arm" OFF)
 set(PLOW_HSACO_EXTRA_DEFINES "" CACHE STRING "extra raw hipcc flags appended to every code object")
 
 if(PLOW_GFX950_HSACO)
+    if(PLOW_HSACO_EXTRA_DEFINES MATCHES "(^|[ \t;])-DPLOW_GATE_HIER(=|[ \t;]|$)")
+        message(FATAL_ERROR
+            "PLOW_GATE_HIER must use -DPLOW_GATE_HIER=ON; it cannot be a global PLOW_HSACO_EXTRA_DEFINES flag")
+    endif()
+    if(PLOW_GATE_HIER AND NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
+        message(FATAL_ERROR "PLOW_GATE_HIER is supported only for gfx950 code objects")
+    endif()
+    if(PLOW_GATE_HIER AND NOT PLOW_L2_PLACE_DISPATCH)
+        message(FATAL_ERROR "PLOW_GATE_HIER requires PLOW_L2_PLACE_DISPATCH=ON")
+    endif()
+    if(PLOW_GATE_HIER AND NOT PLOW_HSACO_GQ)
+        message(FATAL_ERROR "PLOW_GATE_HIER requires PLOW_HSACO_GQ=ON")
+    endif()
     if(NOT PLOW_DECODE_BATCH MATCHES "^[0-9]+$")
         message(FATAL_ERROR "PLOW_DECODE_BATCH must be an integer in 1..128")
     endif()
@@ -782,6 +797,7 @@ if(PLOW_GFX950_HSACO)
         endif()
     endif()
     set(_hs_ax_gq -DPLOW_GLOBAL_QUEUE=1 -DPLOW_GQ_BATCH=${PLOW_GQ_BATCH})
+    set(_hs_ax_gate_hier -DPLOW_GATE_HIER=1)
     # PRECISION AXES, ONE PER INDEPENDENT CHOICE. They were not independent: _hs_ax_fp8kv used
     # to expand to `-DPLOW_FP8=1 -DPLOW_FP8_KV=1`, so the KV-encoding axis silently dragged the
     # WEIGHT-encoding axis with it and a bf16-weight/fp8-KV packet — a combination the NVIDIA
@@ -1107,17 +1123,22 @@ if(PLOW_GFX950_HSACO)
         foreach(_kind ${_hs_kinds})
             set(_sfx "")
             set(_gq "")
+            set(_row_kind_extra "")
             if(_kind STREQUAL "gq")
                 # Both the filename and the kernel symbol take the suffix, and
                 # gemma4_chat.c resolves both by name.
                 set(_sfx "_gq")
                 set(_gq ${_hs_ax_gq})
+                if(PLOW_GATE_HIER AND _a1 STREQUAL "_hs_ax_decode")
+                    set(_row_kind_extra ${_hs_ax_gate_hier})
+                endif()
             endif()
             set(_out "${PLOW_HSACO_DIR}/${_stem}${_sfx}.elf")
             add_custom_command(OUTPUT "${_out}"
                 COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
                         "${PLOW_HSACO_ARCH}" "${_out}" "${_sym}${_sfx}" ${_maxreg} ${_minocc}
-                        ${_hs_inc} ${_hs_arch_def} ${${_a1}} ${${_a2}} ${_gq} ${_hs_extra} "${_hs_src}"
+                        ${_hs_inc} ${_hs_arch_def} ${${_a1}} ${${_a2}} ${_gq}
+                        ${_row_kind_extra} ${_hs_extra} "${_hs_src}"
                 DEPENDS "${_hs_src}" "${_hs_run}" ${_hs_hdrs}
                 COMMENT "hipcc ${_stem}${_sfx}.elf"
                 VERBATIM)
