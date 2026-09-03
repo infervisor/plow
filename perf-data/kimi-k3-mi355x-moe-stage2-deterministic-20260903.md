@@ -28,7 +28,7 @@ dynamic LDS, zero private bytes, zero SGPR/VGPR spills, occupancy 4. The build
 rejects more than 100 VGPR. Executable `.text` SHA-256:
 `0c697ba09401e11c0f10fa7bf47e3eaf7d289f689ee98329867dbe1737016644`.
 
-## TP8 8192→1 A/B fold
+## TP8 FP8-KV 8192→1 A/B fold
 
 Both arms used the same packet, checkpoint, random 8,192-token prompt, runtime
 binary, interpreter objects, concurrency 1, no warmup, and one output token.
@@ -44,7 +44,9 @@ in both arms.
 
 Delta: -635.092354 ms, -21.255%. Both processes completed one request with zero
 failures. This is one byte-exact fold, not sufficient evidence to enable the
-route by default.
+route by default. The asset manifest has `features.fp8_kv=true`; this result must
+not be presented as a BF16-KV comparison against the vLLM baseline. A matched
+BF16-KV integration gate is tracked separately.
 
 Exact command shape:
 
