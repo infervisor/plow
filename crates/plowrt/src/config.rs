@@ -369,8 +369,8 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-ctr-dbuf", env = "PLOW_CTR_DBUF", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub ctr_dbuf: bool,
 
-    /// Clear per-slot recurrent state with one device kernel per rank.
-    #[arg(long = "amd-state-clear-device", env = "PLOW_STATE_CLEAR_DEVICE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    /// Clear per-slot recurrent state with one device kernel per rank (default ON).
+    #[arg(long = "amd-state-clear-device", env = "PLOW_STATE_CLEAR_DEVICE", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub state_clear_device: bool,
 
     /// Load exact-capability packed-prefill operator-family objects. Mux co-packing additionally
@@ -696,6 +696,24 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn device_state_clear_defaults_on_and_has_a_false_rollback() {
+        use clap::{Args, FromArgMatches};
+
+        let command = super::AmdRuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "state_clear_device")
+            .expect("state-clear argument");
+        assert_eq!(arg.get_default_values(), ["true"]);
+
+        let matches = command
+            .try_get_matches_from(["test", "--amd-state-clear-device=false"])
+            .expect("explicit state-clear rollback");
+        let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
+        assert!(!config.state_clear_device);
+    }
+
     /// A `RuntimeConfig` field that nothing reads is a CLI flag that silently does nothing.
     ///
     /// This is not hypothetical and it is why the test exists: `amd.trace_raw` was parsed here,
