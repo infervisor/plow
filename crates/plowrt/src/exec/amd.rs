@@ -276,6 +276,23 @@ impl ProgramDispatch {
     }
 }
 
+fn validate_decode_dispatch(progs: &[DevProg], dec_ix: usize) -> Result<()> {
+    for (rung, prog) in progs[dec_ix..].iter().enumerate() {
+        let n_segments = derive_segments(prog)?.len();
+        if matches!(
+            ProgramDispatch::classify(prog.l2_domains, n_segments),
+            ProgramDispatch::WaveSegments(n) if n > 1
+        ) {
+            return Err(RuntimeError::Device(format!(
+                "decode program {} (rung {rung}, t={}) has {n_segments} wave segments, but AMD decode dispatch is single-launch; re-emit without decode segmentation",
+                dec_ix + rung,
+                prog.t
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Sanity bound on `seg`, so a corrupt stream cannot make the host allocate
 /// unboundedly. Was 512 — the width of the reference driver's `seg_class[512]`.
 ///
@@ -4206,6 +4223,7 @@ impl AmdEngine {
             let pt: Vec<u32> = blob.progs.iter().map(|p| p.t).collect();
             packet::devbuild::decode_rung_lo(&pt)
         };
+        validate_decode_dispatch(&blob.progs, dec_ix)?;
         let max_decode_batch = blob.progs[dec_ix..].iter().map(|p| p.t).max().unwrap_or(1);
 
         // THIS USED TO ASK `p.t == 1` / `p.t > 1`, WHICH IS A BUG A BATCHED BLOB ALREADY HAD.
@@ -8210,6 +8228,21 @@ mod tests {
             gq_seg_ofs: Vec::new(),
             l2_domains: 0,
         }
+    }
+
+    #[test]
+    fn decode_dispatch_rejects_multiple_wave_launches() {
+        let one = segmented_prog(&[DevOp::Gemv], &[0]);
+        assert!(validate_decode_dispatch(std::slice::from_ref(&one), 0).is_ok());
+
+        let split = segmented_prog(&[DevOp::Gemv, DevOp::RmsNorm], &[0, 1]);
+        let err = validate_decode_dispatch(std::slice::from_ref(&split), 0)
+            .expect_err("decode cannot execute multiple host wave launches");
+        assert!(err.to_string().contains("has 2 wave segments"));
+
+        let mut placed = split;
+        placed.l2_domains = 2;
+        assert!(validate_decode_dispatch(std::slice::from_ref(&placed), 0).is_ok());
     }
 
     #[test]

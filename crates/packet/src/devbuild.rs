@@ -291,6 +291,9 @@ pub struct Builder {
     uniseg_denied: bool,
     /// See [`Builder::force_uniseg`].
     uniseg_forced: bool,
+    /// Split descriptor-consuming prefill families into independent wave classes.
+    /// Callers must enable this only for prefill programs.
+    packed_prefill_segments: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
     /// byte-identical. See [`Builder::set_gemv_split`].
     gemv_split: u32,
@@ -349,6 +352,7 @@ impl Builder {
             place_l2: None,
             uniseg_denied: false,
             uniseg_forced: false,
+            packed_prefill_segments: false,
             gemv_split: 1,
             tensor_dedup: false,
             tr_dropped: 0,
@@ -391,6 +395,10 @@ impl Builder {
     /// object wins outright. No-op if `deny_uniseg` was called (the AMD target reads `seg`).
     pub fn force_uniseg(&mut self) {
         self.uniseg_forced = true;
+    }
+
+    pub fn set_packed_prefill_segments(&mut self, enabled: bool) {
+        self.packed_prefill_segments = enabled;
     }
 
     /// Slice the machine-filling `Gemv` / `GemvGlu` / `GemvQkv` packets into `s * n_cu` shares
@@ -1164,7 +1172,7 @@ impl Builder {
         // putting their branches in the production megakernel. Unset preserves packet bytes.
         let packed_prefill_segments = packed_prefill_segmenting_needed(
             uniseg,
-            std::env::var("PLOW_SEG_PACKED_PREFILL").ok().as_deref() == Some("1"),
+            self.packed_prefill_segments,
             self.ops.iter().map(|o| o.inst.op),
         );
         // PLOW_SEG_PURE_GEMM=1 (T11): class-8 segments carry ONLY GEMM-family ops; every light

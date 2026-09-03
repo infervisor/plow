@@ -30,6 +30,11 @@ commands, and pitfalls. This prompt is the executable checklist.
 
 ## Preconditions (from Stages 1–4)
 
+* Every hot production kernel has a recorded exact-shape same-session comparison
+  against the kernel actually dispatched by the reference framework. Any loss
+  remains in Stage 4; Stage 5 is not a substitute for isolated kernel work.
+* Every fused candidate beats the exact unfused semantic sequence it replaces.
+
 * The model's config + geometry are understood (hidden, head counts, head_dim,
   intermediate size, expert layout, which family: Gemma-dense / Gemma-MoE / GLM
   MLA+MoE / Kimi-K3 / DeepSeek / Nemotron).

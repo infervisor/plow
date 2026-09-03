@@ -1289,6 +1289,9 @@ fn k3_build_model(
         let mut b = Builder::new(n_cu);
         b.set_tensor_dedup(true);
         b.set_l2_placement(l2_layout);
+        b.set_packed_prefill_segments(
+            std::env::var("PLOW_SEG_PACKED_PREFILL").ok().as_deref() == Some("1"),
+        );
         if crate::emit_is_amd() {
             b.deny_uniseg();
         }
@@ -1872,6 +1875,31 @@ mod kimi_k3_tests {
             .find(|t| t.name == "in.parked")
             .expect("ladder must declare the parked mask");
         assert_eq!(parked.bytes, 128 * 4);
+    }
+
+    #[test]
+    fn packed_prefill_segmentation_does_not_split_decode_rungs() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_SEG_PACKED_PREFILL", "1"),
+            ("PLOW_DECODE_BATCH_LADDER", "1,4,8"),
+            ("PLOW_GEMV_WALK", "1"),
+        ]);
+        let d = k3_dir("packed_prefill_segments");
+        let l2 = packet::devbuild::L2Layout {
+            sms: 32,
+            domains: 8,
+            map: packet::devbuild::L2Map::RoundRobin,
+        };
+        let m = k3_build_model(&d, 4096, 256, 2, &[128], Some(l2));
+
+        assert_eq!(m.prog_t, [128, 1, 4, 8]);
+        assert_eq!(m.progs[0].l2_domains, 0);
+        assert!(m.progs[0].gq_seg_ofs.len() > 2);
+        for p in &m.progs[1..] {
+            assert_eq!(p.l2_domains, 8);
+            assert_eq!(p.gq_seg_ofs.len(), 9);
+        }
     }
 
     /// Every program must address the same peer slot B. The host has one peer layout for the

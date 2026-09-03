@@ -32,6 +32,24 @@ it has the full methodology, commands, and pitfalls; its backbone is
 `docs/arch/12-using-the-tuner.md` (how to measure acceptably). This prompt is
 the executable checklist.
 
+## Promotion order
+
+Performance work proceeds in this order:
+
+1. Derive the exact production shape, dtype, scale layout, strides and output
+   contract from the emitted packet and reference-framework dispatch.
+2. Beat the matching vendor kernel in an isolated same-session A/B using the
+   same inputs and oracle. A nearby shape or an unfused vendor fallback is not
+   a valid comparator.
+3. Beat the exact unfused sequence with the fused semantic kernel.
+4. Beat the reference framework at one isolated semantic block.
+5. Run the full network only as the final correctness and promotion gate.
+
+Do not spend campaign time on whole-model sweeps while a hot individual kernel
+still loses its exact AITER/ROCm or library peer. Keep all harness controls
+operator- and shape-derived; model names belong only in workload manifests and
+result records.
+
 ## Preconditions (from Stages 1–3)
 
 * Stage 3 passed: every compiled bucket verifies, so the schedule you time is
@@ -79,6 +97,9 @@ model/operator and hipBLASLt for GEMM before proposing a kernel body change.
 Treat them as candidate schedules and measured ceilings, not code to copy or a
 stored baseline. Record the upstream commit, toolchain, architecture, dtype and
 complete live shape; a result from another shape or part is only a hypothesis.
+Trace the reference framework to the kernel it actually dispatches. Record
+padding, quantization, sorting/alignment, reductions and epilogues around that
+call so both sides time the same semantic boundary.
 
 ## Procedure
 
