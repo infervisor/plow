@@ -16,6 +16,11 @@ Performance entries are legacy packet/object A/B probes, not served-model
 results. They remain only where `plowrt bench` cannot express the same
 compiled-width, separate-object, or per-rank semantics.
 
+The L1 pair is migrated: `l1_ab.sh` uses `amd-probe` for its explicitly
+synthetic packet/kernel timing, while `l1_tokens.sh` uses production
+`bench --token-audit` and verifies the exact packet, object directory,
+checkpoint, prompt, and complete output row before comparing arms.
+
 Run `scripts/check_amd_bench_consumers.sh` in repository checks. It fails when
 an active shell invocation is unclassified, when a class or binding is invalid,
 when a synthetic consumer does not use `amd-probe`, when a checkpoint-bound
@@ -26,7 +31,7 @@ The current `performance` rows are a frozen grandfathered set. CI rejects a
 new performance row even when it is classified: new performance work must use
 `plowrt bench` or `plowrt serve`. The surviving rows require direct packet,
 object, compiled-width, or TP-identity semantics that production bench does
-not yet express; none can be migrated faithfully in this tranche.
+not yet express.
 
 ## Documentation inventory
 

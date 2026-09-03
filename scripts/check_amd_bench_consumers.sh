@@ -11,7 +11,6 @@ declare -A legacy_performance=(
   [scripts/glm52_linfp8_run.sh]=1
   [scripts/glm52_linfp8_stacked_run.sh]=1
   [scripts/k3_block_sweep.sh]=1
-  [scripts/l1_ab.sh]=1
   [scripts/l2_place_ab.sh]=1
   [scripts/sweep_batch_ceiling.sh]=1
   [scripts/walk_b16_ab.sh]=1
