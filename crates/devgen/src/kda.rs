@@ -515,7 +515,9 @@ pub fn emit_kda_mixer(
         prenormed,
         deps,
         fuse_kda(),
-        crate::emit_config::active().kda_chunk,
+        crate::emit_config::active().kda_chunk.unwrap_or_else(|| {
+            crate::emit_is_amd() && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+        }),
         crate::emit_config::active().kda_decode_fused
             && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950,
         seq_rows,
@@ -1292,7 +1294,7 @@ mod tests {
     /// process the first few rows of a 128-row packet and leave the rest holding the arena. Both
     /// are finite, plausible and wrong; neither faults.
     #[test]
-    fn a_t_row_kda_mixer_emits_gemms_and_no_decode_only_opcode() {
+    fn a_t_row_kda_mixer_emits_gemms_and_only_supported_prefill_kda() {
         let c = k3();
         for t in [128u32, 1024] {
             let mut b = Builder::new(256);
@@ -1334,15 +1336,27 @@ mod tests {
                 gemm.iter().all(|i| i.i[0] == t),
                 "T={t}: M must be the row count"
             );
-            // The mixer itself is unchanged — the serial-T recurrence is exact at any T.
             assert_eq!(n(DevOp::KdaConv3), 1);
-            assert_eq!(n(DevOp::KdaStateStepG), 1);
             assert_eq!(n(DevOp::KdaGatedNorm), 1);
+            if t >= 512 {
+                assert_eq!(n(DevOp::KdaStateStepG), 0);
+                for op in [
+                    DevOp::KdaChunkPrepare,
+                    DevOp::KdaChunkIntra,
+                    DevOp::KdaChunkWu,
+                    DevOp::KdaChunkCarry,
+                ] {
+                    assert_eq!(n(op), 1, "T={t}: missing default gfx950 {op:?}");
+                }
+            } else {
+                assert_eq!(n(DevOp::KdaStateStepG), 1);
+                assert_eq!(n(DevOp::KdaChunkPrepare), 0);
+            }
         }
     }
 
     #[test]
-    fn chunk_kda_is_opt_in_and_shape_gated() {
+    fn chunk_kda_override_is_shape_gated() {
         let build = |t: u32, seq_rows: bool, enabled: bool| {
             let c = KdaCfg {
                 heads: 12,

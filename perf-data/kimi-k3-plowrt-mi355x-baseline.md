@@ -56,3 +56,36 @@ not the current baseline.
 
 Raw data: `perf-data/kimi-k3-plowrt-mi355x-c1.json`.
 Comparator: `perf-data/kimi-k3-vllm-mi355x-c1.json`.
+
+## Post-baseline gfx950 KDA-scan promotion gate
+
+The model-independent BT64/BC16 KDA prefill scan passed its first complete
+production-engine 8192-token gate after this baseline was recorded. Serial and
+scan packets used the same TP8 checkpoint, BF16 KV, deterministic seed
+`20260903`, one request, and 32 exact greedy output tokens. The parity report
+confirmed identical 8192-token prompts and identical output IDs
+(`[9618, 13]` repeated 16 times; checksum
+`fnv1a64:5c73abff345f2d25`).
+
+| path | TTFT | TPOT | E2E |
+|---|---:|---:|---:|
+| serial recurrence | 3714.31 ms | 67.91 ms | 5819.52 ms |
+| BT64/BC16 scan | 2960.95 ms | 67.63 ms | 5057.63 ms |
+
+The scan reduces TTFT by **20.28%** (1.254x) and E2E by 13.09%; decode is
+neutral as expected. Packet checksums were `fnv1a64:a0a363433acc2fee`
+(serial) and `fnv1a64:c577f59d5c2c1133` (scan). Checkpoint layout checksum was
+`fnv1a64-layout:bf5f9b877998972d` for both.
+
+A subsequent 8192-to-1024 C1 run completed one warmup and all three measured
+requests with zero failures and complete all-rank counter audits:
+
+| metric | scan candidate | pinned vLLM 0.28 | remaining gap |
+|---|---:|---:|---:|
+| median TTFT | 2952.02 ms | 568.35 ms | Plow 5.19x longer |
+| median TPOT | 67.43 ms | 20.86 ms | Plow 3.23x longer |
+| output throughput | 14.22 tok/s | 46.73 tok/s | vLLM 3.29x higher |
+
+The candidate generated 3,072/3,072 output tokens. Its short sample is a
+promotion result, not a replacement for the 30-request three-fold baseline;
+repeat that release cell after the remaining MoE and segment-object work.

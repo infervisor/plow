@@ -882,6 +882,22 @@ mod amd_bench_cli_tests {
             "--parity-report",
         ])
         .is_ok());
+        assert!(Cli::try_parse_from([
+            "plowrt",
+            "bench",
+            "--assets",
+            "model",
+            "--random-input-len",
+            "8192",
+            "--concurrency",
+            "1",
+            "--requests",
+            "1",
+            "--warmup-requests",
+            "0",
+            "--parity-report",
+        ])
+        .is_ok());
         for invalid in [
             (false, 1, 1, 0),
             (true, 2, 1, 0),
@@ -2523,7 +2539,10 @@ async fn bench(
     };
     validate_parity_report_options(
         parity_report,
-        matches!(&input, plowrt::serve::bench::Input::TokenIds(_)),
+        matches!(
+            &input,
+            plowrt::serve::bench::Input::TokenIds(_) | plowrt::serve::bench::Input::Random { .. }
+        ),
         concurrency,
         requests,
         warmup_requests,
@@ -2667,17 +2686,17 @@ fn validate_token_audit_options(
 
 fn validate_parity_report_options(
     parity_report: bool,
-    has_prompt_ids: bool,
+    has_reproducible_input: bool,
     concurrency: usize,
     requests: usize,
     warmup_requests: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if parity_report
-        && (!has_prompt_ids || concurrency != 1 || requests != 1 || warmup_requests != 0)
+        && (!has_reproducible_input || concurrency != 1 || requests != 1 || warmup_requests != 0)
     {
         return Err(
-            "--parity-report requires --prompt-ids, --concurrency 1, --requests 1, and \
-             --warmup-requests 0"
+            "--parity-report requires --prompt-ids or --random-input-len, --concurrency 1, \
+             --requests 1, and --warmup-requests 0"
                 .into(),
         );
     }

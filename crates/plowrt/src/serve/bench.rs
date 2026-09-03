@@ -555,13 +555,14 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
     }
     validate_request_layout(&cfg.input, cfg.warmup_requests, cfg.requests)?;
     if cfg.parity_report
-        && (!matches!(&cfg.input, Input::TokenIds(_))
+        && (!matches!(&cfg.input, Input::TokenIds(_) | Input::Random { .. })
             || cfg.concurrency != 1
             || cfg.requests != 1
             || cfg.warmup_requests != 0)
     {
         return Err(RuntimeError::Msg(
-            "bench parity report requires token-id input, concurrency=1, requests=1, and no warmup"
+            "bench parity report requires explicit or deterministic-random token input, \
+             concurrency=1, requests=1, and no warmup"
                 .into(),
         ));
     }

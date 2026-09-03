@@ -356,10 +356,10 @@ pub struct EmitConfig {
     #[arg(long = "emit-kda-decode-fused", env = "PLOW_KDA_DECODE_FUSED", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_decode_fused: bool,
 
-    /// Emit the model-independent BT64 chunk-KDA prefill pipeline. Default off; unsupported
-    /// shapes retain the serial recurrence.
-    #[arg(long, env = "PLOW_KDA_CHUNK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-    pub kda_chunk: bool,
+    /// Emit the model-independent BT64 chunk-KDA prefill pipeline. Defaults on for gfx950;
+    /// unsupported shapes retain the serial recurrence. Set false to force the serial oracle.
+    #[arg(long, env = "PLOW_KDA_CHUNK", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_chunk: Option<bool>,
 
     /// K3 up-projection no-gather mode (diagnostic).
     #[arg(long, env = "PLOW_K3_UP_NOGATHER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -577,6 +577,7 @@ impl EmitConfig {
     /// Mirrors what clap's `env` attribute does: each field reads its `PLOW_*` var.
     pub fn from_env() -> EmitConfig {
         let env_bool = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
+        let env_bool_opt = |k: &str| std::env::var(k).ok().map(|v| v == "1");
         let env_u32 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u32>().ok());
         let env_str = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
         // DEFAULT-ON knobs: the call sites these replaced tested `!= Some("0")`, which is
@@ -664,7 +665,7 @@ impl EmitConfig {
             k3_fuse_ngemv: env_str("PLOW_K3_FUSE_NGEMV"),
             k3_kda_conv_step_db: env_bool("PLOW_K3_KDA_CONV_STEP_DB"),
             kda_decode_fused: env_bool("PLOW_KDA_DECODE_FUSED"),
-            kda_chunk: env_bool("PLOW_KDA_CHUNK"),
+            kda_chunk: env_bool_opt("PLOW_KDA_CHUNK"),
             k3_up_nogather: env_bool("PLOW_K3_UP_NOGATHER"),
             k3_up_gather_only: env_bool("PLOW_K3_UP_GATHER_ONLY"),
             k3_shard_head: env_bool("PLOW_K3_SHARD_HEAD"),
