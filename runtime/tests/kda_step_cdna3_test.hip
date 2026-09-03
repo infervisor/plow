@@ -175,6 +175,10 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_carry_packed(KAr
 #include <string.h>
 #include <vector>
 
+#ifndef KDA_BENCH_THREADS
+#define KDA_BENCH_THREADS 512
+#endif
+
 typedef unsigned short bf16;
 enum { PLOW_KDA_GATE_SOFTPLUS = 0, PLOW_KDA_GATE_LOWER_BOUND = 1 };
 static float b2f(bf16 b) { unsigned u = (unsigned)b << 16; float f; memcpy(&f, &u, 4); return f; }
@@ -331,7 +335,7 @@ int main(int argc, char** argv) {
         HC(hipMalloc(&d_a, sizeof a));
         HC(hipMemcpy(d_a, &a, sizeof a, hipMemcpyHostToDevice));
         void* args[] = {&d_a};
-        HC(hipModuleLaunchKernel(fprefix, GRID, 1, 1, 512, 1, 1, 0, 0, args, nullptr));
+        HC(hipModuleLaunchKernel(fprefix, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args, nullptr));
         HC(hipDeviceSynchronize());
 
         std::vector<float> gout(graw.size()), bout(braw.size());
@@ -440,7 +444,7 @@ int main(int argc, char** argv) {
         HC(hipMalloc(&d_a, sizeof a));
         HC(hipMemcpy(d_a, &a, sizeof a, hipMemcpyHostToDevice));
         void* args[] = {&d_a};
-        HC(hipModuleLaunchKernel(fintra, GRID, 1, 1, 512, 1, 1, 0, 0, args, nullptr));
+        HC(hipModuleLaunchKernel(fintra, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args, nullptr));
         HC(hipDeviceSynchronize());
         std::vector<float> qk(qk_ref.size()), inv(inv_ref.size());
         HC(hipMemcpy(qk.data(), d_qk, qk.size() * sizeof(float), hipMemcpyDeviceToHost));
@@ -494,7 +498,7 @@ int main(int argc, char** argv) {
         a.aqk = (unsigned long long)(size_t)d_qk64;
         a.ainv = (unsigned long long)(size_t)d_inv64;
         HC(hipMemcpy(d_a, &a, sizeof a, hipMemcpyHostToDevice));
-        HC(hipModuleLaunchKernel(fintra_full, GRID, 1, 1, 512, 1, 1, 0, 0, args, nullptr));
+        HC(hipModuleLaunchKernel(fintra_full, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args, nullptr));
         HC(hipDeviceSynchronize());
         std::vector<float> qk64(qk64_ref.size()), inv64(inv64_ref.size());
         HC(hipMemcpy(qk64.data(), d_qk64, qk64.size() * sizeof(float), hipMemcpyDeviceToHost));
@@ -557,9 +561,9 @@ int main(int argc, char** argv) {
         a.state = (unsigned long long)(size_t)d_state; a.y = (unsigned long long)(size_t)d_out;
         a.V = IV;
         HC(hipMemcpy(d_a, &a, sizeof a, hipMemcpyHostToDevice));
-        HC(hipModuleLaunchKernel(fwu, GRID, 1, 1, 512, 1, 1, 0, 0, args, nullptr));
+        HC(hipModuleLaunchKernel(fwu, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args, nullptr));
         HC(hipDeviceSynchronize());
-        HC(hipModuleLaunchKernel(fcarry, GRID, 1, 1, 512, 1, 1, 0, 0, args, nullptr));
+        HC(hipModuleLaunchKernel(fcarry, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args, nullptr));
         HC(hipDeviceSynchronize());
         std::vector<bf16> out(value.size());
         std::vector<float> state(state0.size());
@@ -586,10 +590,21 @@ int main(int argc, char** argv) {
     worst = fmax(worst, run_intra());
 
     if (getenv("KDA3_BENCH")) {
-        const unsigned BH = 12, BD = 128, BVV = 128, GRIDB = p.multiProcessorCount;
+        const unsigned BH = 12, BD = 128, BVV = 128;
+        const unsigned GRIDB = getenv("KDA_BENCH_GRID")
+            ? (unsigned)strtoul(getenv("KDA_BENCH_GRID"), nullptr, 10)
+            : p.multiProcessorCount;
+        const unsigned only_t = getenv("KDA_BENCH_T")
+            ? (unsigned)strtoul(getenv("KDA_BENCH_T"), nullptr, 10)
+            : 0;
+        if (GRIDB == 0) {
+            fprintf(stderr, "KDA_BENCH_GRID must be positive\n");
+            return 2;
+        }
         const float scale = 1.0f / sqrtf((float)BD);
         printf("BENCH gfx=%s H=%u D=%u V=%u grid=%u\n", p.gcnArchName, BH, BD, BVV, GRIDB);
         for (const unsigned T : {128u, 511u, 512u, 513u, 2048u, 8191u, 8192u}) {
+            if (only_t && T != only_t) continue;
             const unsigned nc = (T + 63u) / 64u;
             std::vector<uint2> chunks(nc);
             for (unsigned c = 0; c < nc; c++)
@@ -648,13 +663,13 @@ int main(int argc, char** argv) {
             HC(hipMemcpy(dac, &ac, sizeof ac, hipMemcpyHostToDevice));
             void* args_s[] = {&das}; void* args_c[] = {&dac};
             auto serial = [&]() {
-                HC2(hipModuleLaunchKernel(fstep, GRIDB, 1, 1, 512, 1, 1, 0, 0, args_s, nullptr));
+                HC2(hipModuleLaunchKernel(fstep, GRIDB, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args_s, nullptr));
             };
             auto chunked = [&]() {
-                HC2(hipModuleLaunchKernel(fprepare, GRIDB, 1, 1, 512, 1, 1, 0, 0, args_c, nullptr));
-                HC2(hipModuleLaunchKernel(fintra_full, GRIDB, 1, 1, 512, 1, 1, 0, 0, args_c, nullptr));
-                HC2(hipModuleLaunchKernel(fwu, GRIDB, 1, 1, 512, 1, 1, 0, 0, args_c, nullptr));
-                HC2(hipModuleLaunchKernel(fcarry, GRIDB, 1, 1, 512, 1, 1, 0, 0, args_c, nullptr));
+                HC2(hipModuleLaunchKernel(fprepare, GRIDB, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args_c, nullptr));
+                HC2(hipModuleLaunchKernel(fintra_full, GRIDB, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args_c, nullptr));
+                HC2(hipModuleLaunchKernel(fwu, GRIDB, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args_c, nullptr));
+                HC2(hipModuleLaunchKernel(fcarry, GRIDB, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args_c, nullptr));
             };
             HC(hipMemcpy(dss, state0.data(), state0.size() * 4, hipMemcpyHostToDevice));
             serial(); HC(hipDeviceSynchronize());
@@ -697,7 +712,7 @@ int main(int argc, char** argv) {
                         HC2(hipMemcpy(dsc, state0.data(), state0.size() * 4,
                                       hipMemcpyHostToDevice));
                     HC2(hipEventRecord(beg));
-                    HC2(hipModuleLaunchKernel(fn, GRIDB, 1, 1, 512, 1, 1, 0, 0, args_c,
+                    HC2(hipModuleLaunchKernel(fn, GRIDB, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args_c,
                                               nullptr));
                     HC2(hipEventRecord(end)); HC2(hipEventSynchronize(end));
                     float ms = 0; HC2(hipEventElapsedTime(&ms, beg, end)); total += ms;
@@ -780,7 +795,7 @@ int main(int argc, char** argv) {
         a.nspans = spans.size(); a.nrows = T; a.H = H; a.D = D; a.BV = BV;
         a.flags = 1u; a.gate_mode = 1u; a.lb = -5.f; a.scale = 1.f / sqrtf(128.f);
         void* d_a = upload(&a, sizeof a); void* args[] = {&d_a};
-        HC2(hipModuleLaunchKernel(fstep_packed, GRID, 1, 1, 512, 1, 1, 0, 0, args, nullptr));
+        HC2(hipModuleLaunchKernel(fstep_packed, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args, nullptr));
         HC2(hipDeviceSynchronize());
         std::vector<float> Sg(S0.size());
         HC2(hipMemcpy(Sg.data(), (void*)(size_t)a.state, Sg.size() * 4, hipMemcpyDeviceToHost));
@@ -869,9 +884,9 @@ int main(int argc, char** argv) {
         void* d_ac = upload(&ac, sizeof ac);
         void* args_s[] = {&d_as};
         void* args_c[] = {&d_ac};
-        HC2(hipModuleLaunchKernel(fstep_packed, GRID, 1, 1, 512, 1, 1, 0, 0, args_s, nullptr));
+        HC2(hipModuleLaunchKernel(fstep_packed, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args_s, nullptr));
         for (hipFunction_t fn : {fprepare_packed, fintra_packed, fwu_packed, fcarry_packed})
-            HC2(hipModuleLaunchKernel(fn, GRID, 1, 1, 512, 1, 1, 0, 0, args_c, nullptr));
+            HC2(hipModuleLaunchKernel(fn, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args_c, nullptr));
         HC2(hipDeviceSynchronize());
 
         std::vector<bf16> os(out0.size()), oc(out0.size()), qc(q.size()), kc(k.size());
@@ -944,7 +959,7 @@ int main(int argc, char** argv) {
         a.bstride = batched ? (unsigned long long)H * D * D : 0ull;
         void* d_a; HC(hipMalloc(&d_a, sizeof a)); HC(hipMemcpy(d_a, &a, sizeof a, hipMemcpyHostToDevice));
         void* args[] = {&d_a};
-        HC(hipModuleLaunchKernel(fstep, GRID, 1, 1, 512, 1, 1, 0, 0, args, nullptr));
+        HC(hipModuleLaunchKernel(fstep, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args, nullptr));
         HC(hipDeviceSynchronize());
 
         std::vector<float> Sg(S0.size());
@@ -970,7 +985,7 @@ int main(int argc, char** argv) {
         a.norm_w = (unsigned long long)(size_t)UP(nw, float);
         a.gate2 = (unsigned long long)(size_t)UP(g2, bf16);
         HC(hipMemcpy(d_a, &a, sizeof a, hipMemcpyHostToDevice));
-        HC(hipModuleLaunchKernel(fnorm, GRID, 1, 1, 512, 1, 1, 0, 0, args, nullptr));
+        HC(hipModuleLaunchKernel(fnorm, GRID, 1, 1, KDA_BENCH_THREADS, 1, 1, 0, 0, args, nullptr));
         HC(hipDeviceSynchronize());
         std::vector<bf16> yg((size_t)T * H * D);
         HC(hipMemcpy(yg.data(), (void*)(size_t)a.y, yg.size() * 2, hipMemcpyDeviceToHost));
