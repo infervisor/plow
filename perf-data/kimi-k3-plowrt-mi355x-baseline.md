@@ -57,6 +57,42 @@ not the current baseline.
 Raw data: `perf-data/kimi-k3-plowrt-mi355x-c1.json`.
 Comparator: `perf-data/kimi-k3-vllm-mi355x-c1.json`.
 
+## Current per-XCD/segment candidate
+
+The current release candidate was also measured through the identical vLLM
+0.28 `bench serve` client and raw `/v1/completions` contract at 8192→1024,
+C1. Its 16K packet retained the six prefill rungs through 8192, 49 ordered
+kernel-family segments, eight physical-XCD windows per segment, BF16 KV, all
+7,650 measured TuneDB selections, and passed every devblob Lean ordering/LDS
+certificate. One warm-up and all three measured requests completed.
+
+| metric | current candidate | pinned vLLM 0.28 | remaining gap |
+|---|---:|---:|---:|
+| median TTFT | 2276.89 ms | 568.35 ms | Plow 4.01x longer |
+| mean / median TPOT | 55.63 / 55.70 ms | 20.86 / 20.86 ms | Plow 2.67x longer |
+| median / P99 ITL | 55.44 / 58.46 ms | 20.86 / 21.06 ms | Plow 2.66x / 2.78x longer |
+| output throughput | 17.30 tok/s | 46.73 tok/s | vLLM 2.70x higher |
+| total token throughput | 155.72 tok/s | 420.60 tok/s | vLLM 2.70x higher |
+
+This supersedes the older short-sample KDA-scan candidate below, but not the
+30-request publication baseline above. Exact candidate provenance is in
+`perf-data/kimi-k3-plowrt-mi355x-c1-current.json`.
+
+### FP8-KV ceiling (lossy, not apples-to-apples)
+
+An otherwise matched 8192→1024 C1 run stored the MLA KV cache as E4M3 plus a
+per-row F32 scale. It improved mean TPOT from 55.63 to 49.73 ms (-10.6%) and
+output throughput from 17.30 to 18.99 tok/s (+9.8%). It remains 2.38x slower
+than vLLM's BF16-KV TPOT. Median TTFT regressed from 2276.89 to 3046.79 ms
+because the FP8 packet currently carries 443 ordered prefill segments vs 49 in
+the BF16 candidate; segment construction must be fixed before FP8 prefill can
+be assessed cleanly.
+
+FP8 KV is deliberately not promoted here: it is lossy, greedy tokens are known
+to diverge from the BF16 path, and the pinned vLLM comparator uses BF16 KV.
+Exact ceiling provenance is in
+`perf-data/kimi-k3-plowrt-mi355x-c1-fp8kv-ceiling.json`.
+
 ## Post-baseline gfx950 KDA-scan promotion gate
 
 The model-independent BT64/BC16 KDA prefill scan passed its first complete

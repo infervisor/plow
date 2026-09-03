@@ -88,6 +88,37 @@ fi
 "$BUNDLER" --unbundle --type=o --targets="hipv4-amdgcn-amd-amdhsa--$ARCH" \
     --input="$CO" --output="$OUT" || fail "unbundle failed for $OUT"
 
+# Resource remarks omit final SGPR/private-segment facts. Read the record for
+# the exact shipping entry point, not the first helper kernel in the ELF.
+META="$($READELF -n "$OUT" 2>/dev/null || true)"
+read -r MV MA MSG MSP MP MW MWG MLDS <<<"$(awk -v want="$SYM" '
+    function emit() {
+        if (name == want) {
+            print vgpr+0, agpr+0, sgpr+0, sgspill+0, private+0, wave+0, wg+0, lds+0
+            found = 1
+        }
+    }
+    $1 == "-" && $2 == ".agpr_count:" {
+        if (started) emit()
+        started = 1; name = ""; vgpr = 0; agpr = $3; sgpr = 0; sgspill = 0
+        private = 0; wave = 0; wg = 0; lds = 0
+        next
+    }
+    started && $1 == ".name:"                       { name = $2 }
+    started && $1 == ".vgpr_count:"                 { vgpr = $2 }
+    started && $1 == ".sgpr_count:"                 { sgpr = $2 }
+    started && $1 == ".sgpr_spill_count:"           { sgspill = $2 }
+    started && $1 == ".private_segment_fixed_size:" { private = $2 }
+    started && $1 == ".wavefront_size:"             { wave = $2 }
+    started && $1 == ".max_flat_workgroup_size:"    { wg = $2 }
+    started && $1 == ".group_segment_fixed_size:"   { lds = $2 }
+    END { if (!found) emit() }
+' <<<"$META")"
+[ -n "${MV:-}" ] || fail "$SYM has no AMDGPU metadata record in $OUT"
+[ "$MW" = 64 ] || fail "$SYM advertises wavefront_size=$MW; gfx9xx requires wave64"
+[ "$MWG" -ge 64 ] && [ "$MWG" -le 1024 ] && [ $((MWG % MW)) -eq 0 ] ||
+    fail "$SYM has invalid max workgroup/wave geometry: wg=$MWG wave=$MW"
+
 # Read the symbol table into a variable rather than piping it into `grep -q`:
 # grep exits at the FIRST match, closing the pipe while readelf is still
 # writing; readelf dies of SIGPIPE and `set -o pipefail` promotes that to a
@@ -116,6 +147,8 @@ if [ "$LEAN" != 1 ]; then
 fi
 [ "$NOSPILL" != 1 ] || [ "$S" = 0 ] ||
     fail "$(basename "$OUT") spills $S VGPRs"
+[ "$NOSPILL" != 1 ] || [ "$MP" = 0 ] ||
+    fail "$(basename "$OUT") has a ${MP}-byte private segment"
 if [ -n "$REQUIRED_MARKER" ]; then
     grep -qE "OBJECT .* ${REQUIRED_MARKER}\$" <<<"$SYMS" ||
         fail "$OUT does not advertise $REQUIRED_MARKER"
@@ -190,5 +223,6 @@ elif grep -qE "OBJECT .* plow_packed_prefill_kda_chunk_segments_1\$" <<<"$SYMS";
 fi
 
 rm -f "$CO"
-printf "built %s (%s B), %s VGPR=%s AGPR=%s total=%s occ=%s spill=%s\n" \
-    "$OUT" "$(stat -c%s "$OUT")" "$SYM" "$V" "$A" "$((V + A))" "$O" "$S"
+printf "built %s (%s B), %s VGPR=%s AGPR=%s total=%s occ=%s vgpr_spill=%s metadata=[vgpr=%s agpr=%s sgpr=%s sgpr_spill=%s private=%sB lds=%sB wave=%s wgmax=%s waves=%s]\n" \
+    "$OUT" "$(stat -c%s "$OUT")" "$SYM" "$V" "$A" "$((V + A))" "$O" "$S" \
+    "$MV" "$MA" "$MSG" "$MSP" "$MP" "$MLDS" "$MW" "$MWG" "$((MWG / MW))"

@@ -8,10 +8,11 @@ import tempfile
 from pathlib import Path
 
 
-EXPECTED_TEXT_SHA256 = "f674181028962ef4d440ee01de88fc2cd856e3a0707e0d867dbe71587d02f66b"
+EXPECTED_TEXT_SHA256 = "b72d36947ea11fec74cdd51bf5bbb7354571c4f8714d1dd9c244dd39699c6ad1"
 SYMBOL = "plow_moe2_mxfp4_16x16x128_gfx950"
 MARKERS = (
-    "plow_moe2_mxfp4_stage2_abi_1",
+    "plow_moe2_mxfp4_stage2_abi_2",
+    "plow_moe2_mxfp4_stage2_layout_shuffled_1",
     "plow_moe2_mxfp4_stage2_no_spill_1",
     "plow_moe2_mxfp4_stage2_dynamic_lds_16640",
     "plow_moe2_mxfp4_stage2_vgpr_le_144",
@@ -67,7 +68,7 @@ def main():
         "sgpr_spills": field(knotes, "sgpr_spill_count"),
     }
     expected = {
-        "vgpr": 144, "sgpr": 55, "fixed_lds_bytes": 0, "dynamic_lds_bytes": 16640,
+        "vgpr": 100, "sgpr": 42, "fixed_lds_bytes": 0, "dynamic_lds_bytes": 16640,
         "lds_bytes": 16640, "private_bytes": 0, "vgpr_spills": 0, "sgpr_spills": 0,
     }
     if resources != expected:
@@ -87,14 +88,14 @@ def main():
         "geometry": {
             "tokens": 1024, "topk": 16, "model_dim": 3584, "inter_dim": 384,
             "experts": 896, "tile_m": 32, "tile_n": 256, "tile_k": 128,
-            "sort_block_m": 32,
+            "sort_block_m": 64,
         },
         "encoding": {
             "activation": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
             "weight": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
             "output": "bf16-atomic-accumulate",
-            "weight_layout": "expert-table[E*3+2]-row-major-N,Kbytes",
-            "scale_layout": "expert-scale-table[E*3+2]-row-major-N,K/32",
+            "weight_layout": "expert-table[E*3+2]-N/16,Kbytes/32,2,16,16",
+            "scale_layout": "expert-scale-table[E*3+2]-pad256x8-shuffled",
         },
         "abi": {
             "kernarg_bytes": 88,
@@ -102,6 +103,7 @@ def main():
                 "out*", "activation*", "weight_table*", "activation_scale*",
                 "weight_scale_table*", "meta*", "row_partidx*", "sorted_weights*",
                 "tokens:i32", "model_dim:i32", "inter_dim:i32", "experts:i32", "topk:i32",
+                "reserved:i32",
             ],
         },
         "resources": resources,

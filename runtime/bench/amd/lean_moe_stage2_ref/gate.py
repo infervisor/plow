@@ -52,7 +52,7 @@ def check_manifest(obj, manifest):
         "geometry.tile_m": 32,
         "geometry.tile_n": 256,
         "geometry.tile_k": 128,
-        "geometry.sort_block_m": 32,
+        "geometry.sort_block_m": 64,
         "geometry.tokens": 1024,
         "geometry.topk": 16,
         "geometry.model_dim": 3584,
@@ -62,8 +62,8 @@ def check_manifest(obj, manifest):
         "encoding.activation": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
         "encoding.weight": "mxfp4-e2m1-paired-nibbles-e8m0-block32",
         "encoding.output": "bf16-atomic-accumulate",
-        "encoding.weight_layout": "expert-table[E*3+2]-row-major-N,Kbytes",
-        "encoding.scale_layout": "expert-scale-table[E*3+2]-row-major-N,K/32",
+        "encoding.weight_layout": "expert-table[E*3+2]-N/16,Kbytes/32,2,16,16",
+        "encoding.scale_layout": "expert-scale-table[E*3+2]-pad256x8-shuffled",
     }
     for key, expected in required.items():
         value = manifest
@@ -78,6 +78,7 @@ def check_manifest(obj, manifest):
         "out*", "activation*", "weight_table*", "activation_scale*",
         "weight_scale_table*", "meta*", "row_partidx*", "sorted_weights*",
         "tokens:i32", "model_dim:i32", "inter_dim:i32", "experts:i32", "topk:i32",
+        "reserved:i32",
     ]
     if manifest["abi"]["arguments"] != expected_args:
         raise SystemExit("manifest ABI argument order is not the phase-1 contract")
@@ -91,7 +92,6 @@ def check_manifest(obj, manifest):
     resources = manifest["resources"]
     for needle in (
         "amdgcn-amd-amdhsa--gfx950", f".name:           {symbol}",
-        ".kernarg_segment_size: 344",
         f".group_segment_fixed_size: {resources['fixed_lds_bytes']}",
         f".private_segment_fixed_size: {resources['private_bytes']}",
         f".sgpr_count:     {resources['sgpr']}", f".vgpr_count:     {resources['vgpr']}",
@@ -100,9 +100,12 @@ def check_manifest(obj, manifest):
     ):
         if needle not in notes:
             raise SystemExit(f"ELF metadata gate failed: missing {needle!r}")
+    if not any(f".kernarg_segment_size: {n}" in notes for n in (88, 344)):
+        raise SystemExit("ELF metadata gate failed: lean stage-2 kernarg is neither 88 nor 344 B")
     symbols = subprocess.check_output([readelf, "-sW", str(obj)], text=True)
     for marker in (
-        "plow_moe2_mxfp4_stage2_abi_1",
+        "plow_moe2_mxfp4_stage2_abi_2",
+        "plow_moe2_mxfp4_stage2_layout_shuffled_1",
         "plow_moe2_mxfp4_stage2_no_spill_1",
         "plow_moe2_mxfp4_stage2_dynamic_lds_16640",
         "plow_moe2_mxfp4_stage2_vgpr_le_144",
@@ -161,11 +164,11 @@ def launch(module, manifest, out, act, weight_table, act_scale, weight_scale_tab
     bias = torch.empty(0, dtype=torch.float32, device="cuda")
     module.launch(
         (math.ceil(g["model_dim"] / g["tile_n"]) *
-         math.ceil(304 / math.ceil(g["model_dim"] / g["tile_n"])), 1),
+         2 * (math.ceil(g["tokens"] * g["topk"] / 64) + g["experts"]), 1),
         torch.cuda.current_stream().cuda_stream,
         manifest["resources"].get("dynamic_lds_bytes", 0),
         [out, act, weight_table, act_scale, weight_scale_table, meta, partidx, gates],
-        [g["tokens"], g["model_dim"], g["inter_dim"], g["experts"], g["topk"]],
+        [g["tokens"], g["model_dim"], g["inter_dim"], g["experts"], g["topk"], 0],
     )
 
 
@@ -178,12 +181,12 @@ def oracle(module, manifest):
     act = torch.zeros((64, k // 2), dtype=torch.uint8, device="cuda")
     act[:rows].copy_(act_focus.to("cuda"))
     weight_focus = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, generator=gen)
-    weight = weight_focus.to("cuda")
+    weight = weight_layout(weight_focus.unsqueeze(0).to("cuda"))[0]
     act_scale_raw = torch.randint(126, 129, (rows, k // 32), dtype=torch.uint8, generator=gen)
     weight_scale_focus = torch.randint(126, 129, (n, k // 32), dtype=torch.uint8, generator=gen)
     act_scale = torch.full((64, k // 32), 127, dtype=torch.uint8, device="cuda")
     act_scale[:rows].copy_(act_scale_raw.to("cuda"))
-    weight_scale = weight_scale_focus.to("cuda")
+    weight_scale = scale_layout(weight_scale_focus.to("cuda"))
     weight_table = torch.zeros(e * 3, dtype=torch.int64, device="cuda")
     weight_table[2] = weight.data_ptr()
     weight_scale_table = torch.zeros(e * 3, dtype=torch.int64, device="cuda")
@@ -240,9 +243,12 @@ def timing(module, manifest):
         experts_host.extend([expert] * (padded // bm))
     padded = len(ids_host)
     act = torch.full((padded, k // 2), 0x53, dtype=torch.uint8, device="cuda")
-    weight = torch.full((e, n, k // 2), 0x43, dtype=torch.uint8, device="cuda")
+    weight = weight_layout(
+        torch.full((e, n, k // 2), 0x43, dtype=torch.uint8, device="cuda")
+    )
     act_scale = torch.full((padded, k // 32), 127, dtype=torch.uint8, device="cuda")
-    weight_scale = torch.full((e, n, k // 32), 127, dtype=torch.uint8, device="cuda")
+    weight_scale_raw = torch.full((e * n, k // 32), 127, dtype=torch.uint8, device="cuda")
+    weight_scale = scale_layout(weight_scale_raw).view(e, -1)
     weight_table = torch.zeros(e * 3, dtype=torch.int64, device="cuda")
     weight_scale_table = torch.zeros(e * 3, dtype=torch.int64, device="cuda")
     for expert in range(e):

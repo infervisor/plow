@@ -36,6 +36,35 @@ running its ROCm fused_kda_decode benchmark. Plow used ROCm 7.14 and the
 production op_kda.h bodies through
 runtime/bench/amd/kda_decode_fused_exact.{hip,cpp}.
 
+### Current upstream and resource audit
+
+The model-neutral kernel comparison was refreshed against vLLM
+`848ab131bcdb5264bcff0d802f47f7d4adb0f548` and AITER
+`4140f3dff24bf73dcd45516c3e47ea9022af4199`. The final-HSACO metadata, read
+from the exact interpreter symbol rather than a helper marker, exposes a
+cross-cutting scratch problem that the old VGPR/occupancy build gate missed:
+
+| current gfx950 object | VGPR | private bytes | VGPR spills | SGPR spills |
+|---|---:|---:|---:|---:|
+| K3 decode | 256 | 624 | 2 | 78 |
+| K3 decode GQ | 256 | 624 | 2 | 86 |
+| K3 prefill | 256 | 1316 | 8 | 78 |
+| K3 prefill GQ | 256 | 1316 | 8 | 74 |
+
+The separate fused-KDA and raw-MLA bodies have zero private memory and zero
+VGPR spills. New heavy arms therefore remain separate lean objects. The build
+now reports the exact symbol's final VGPR/AGPR/SGPR, SGPR-spill, private, LDS,
+wavefront, workgroup and wave counts, and `PLOW_NO_SPILL` also rejects a
+non-zero private segment.
+
+The remaining upstream-derived order is: preshuffled MXFP4 MoE stage1→stage2
+pipeline; fused KDA prefill prepare/KKT/solve families; spill-free family
+objects; live-KV/batch-dependent MLA split selection; then persistent fused
+KDA decode chaining. Wave policy is shape/resource based: eight wave64 for the
+mega interpreter until its live ranges shrink; four wave64 and zero private
+memory for MoE, fused KDA and raw MLA lean objects. GF6 MLA remains rejected
+because its four VGPR spills regress the exact B1 cell by 31%.
+
 ### Post-scan 8192-token prefill attribution
 
 A fresh TP8 trace of the promoted BT64/BC16 scan captured all 2,971 packets
@@ -415,6 +444,15 @@ segment, but is not production-promotable yet. It still needs a production
 object marker/ABI loader gate, exact stage-1-to-stage-2 layout parity, and
 fused-block/full-network measurements. It must not enter the mega interpreter.
 
+The current follow-up wires ABI-v2 companion tables and a fail-closed generic
+segment route while preserving the row-major interpreter fallback. The updated
+native object remains spill-free at 100 VGPR/42 SGPR and the independent gate
+passes 114,688/114,688 values exactly at 0.258 ms kernel / 0.265 ms including
+zero. It stays default-off: an initial TP8 8192-token network screen did not
+complete its warm-up within two minutes and showed only about 18% GPU activity.
+The conservative stage-2 grid and its 627-segment program must be reduced and
+then pass block/TP8 gates before promotion.
+
 ## Kernel and graph inventory
 
 | Phase | Graph stage | Plow path | Status | Evidence and remaining gap |
@@ -493,6 +531,16 @@ fused-block/full-network measurements. It must not enter the mega interpreter.
   TTFT 2274.58 ms and median 2276.64 ms. This is 4.01x the pinned vLLM 568.35 ms TTFT. TPOT
   is undefined for a one-token cell; the 8192-to-1024 decode/ITL publication cell remains
   pending and must use the same client and endpoint contract.
+- The corresponding exact 8192-to-1024 cell is now complete through that same client and
+  endpoint: 3/3 requests after one warm-up, median TTFT 2276.89 ms, mean/median TPOT
+  55.63/55.70 ms, median/P99 ITL 55.44/58.46 ms, and 17.30 output tok/s. Against the pinned
+  vLLM cell this leaves 4.01x TTFT, 2.67x TPOT, and 2.70x throughput gaps. The short sample is
+  current-candidate evidence, not a replacement for the three-fold publication baseline.
+- A separate lossy FP8-KV ceiling improved mean TPOT 55.63→49.73 ms (-10.6%) and output
+  throughput 17.30→18.99 tok/s (+9.8%), but median TTFT regressed 2276.89→3046.79 ms.
+  The FP8 packet exposes a compiler problem: 443 ordered prefill segments vs 49 for the BF16
+  candidate. Keep BF16 as the apples-to-apples comparator and fix that segmentation before
+  judging FP8 prefill; even its improved TPOT remains 2.38x slower than vLLM BF16.
 - A checkpoint-bound production-mux rerun at exactly 8192 input tokens and one output token,
   with the raw gfx950 MLA V2+SV segment enabled and packed KDA disabled, completed 3/3 after
   one warm-up at TTFT p50/p90 2257.594/2257.616 ms (0.05% spread). This is a prefill-boundary

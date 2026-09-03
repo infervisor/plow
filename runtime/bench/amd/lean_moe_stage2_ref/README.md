@@ -36,11 +36,11 @@ nix develop --command perf-data/tools/gpulease -n 1 moe2-lean-gate \
 
 The manifest intentionally fixes the validated schedule/capability contract:
 gfx950, MXFP4 E2M1 payload with E8M0 scales,
-BF16 atomic accumulation, 32x256x128 tiles, 256 threads, wave64, sort block 32,
+BF16 atomic accumulation, 32x256x128 compute tiles, 256 threads, wave64, BM64 alignment,
 and the runtime expert-table/align-metadata ABI. The gate rejects any manifest
 outside that contract before loading the object. On ROCm 7.14 the production
-shape passes the exact focused oracle and measures about 1.00 ms at
-T1024/H3584/I384/E896/top16.
+BM64 alignment shape passes the exact focused oracle and measures about 0.26 ms
+including output zero at T1024/H3584/I384/E896/top16.
 
 `PLOW_MOE_STAGE2_LEAN=1` at packet emission isolates only structurally compatible
 MXFP4 `MoeGroupDownPf`→`MoeCombinePf` boundaries. `plowrt` routes those segments
@@ -48,8 +48,9 @@ to the native object after checking its ABI, zero-spill, LDS, and VGPR markers.
 If the object is absent, the same segment executes through the ordinary
 interpreter pair. No model name participates in selection.
 
-The native schedule directly consumes the checkpoint's row-major expert weight
-and scale tables through a two-stage B/B-scale register pipeline, and overlaps
-the next A load through a two-slot LDS ping-pong. The pinned exact AITER
+The native schedule consumes loader-derived companion tables in the validated
+shuffled MXFP4/E8M0 layout through a two-stage B/B-scale register pipeline, and
+overlaps the next A load through a two-slot LDS ping-pong. The row-major tables
+remain available to decode and the interpreter fallback. The pinned exact AITER
 configuration sets `use_async_copy=False`; therefore the native gate does not
 claim a three-slot asynchronous-copy path.

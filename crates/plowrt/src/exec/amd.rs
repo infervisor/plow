@@ -500,6 +500,7 @@ struct MoeStage2Mxfp4Args {
     inter_dim: u32,
     experts: u32,
     topk: u32,
+    reserved: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<MoeStage2Mxfp4Args>() == 88);
@@ -516,6 +517,7 @@ fn moe_stage2_mxfp4_pair(d: &DevInst64, c: &DevInst64) -> bool {
         && d.i[3] == MOE_ENC_MXFP4
         && d.i[1] == 384
         && d.i[0] != 0
+        && d.i[0].is_multiple_of(16)
         && d.i[2] != 0
         && d.i[4] == 0
         && d.i[5] == 0
@@ -556,7 +558,11 @@ fn has_moe_stage2_mxfp4_segment(prog: &DevProg) -> bool {
     })
 }
 
-fn moe_stage2_mxfp4_routes(prog: &DevProg, devp: &[DeviceMem]) -> Result<Vec<PrefillSegmentRoute>> {
+fn moe_stage2_mxfp4_routes(
+    prog: &DevProg,
+    tensors: &[crate::asset::devblob::DevTensor],
+    devp: &[DeviceMem],
+) -> Result<Vec<PrefillSegmentRoute>> {
     let n_seg = prog
         .stream
         .iter()
@@ -579,6 +585,31 @@ fn moe_stage2_mxfp4_routes(prog: &DevProg, devp: &[DeviceMem]) -> Result<Vec<Pre
             RuntimeError::Device(format!(
                 "lean MoE stage-2 operand `{what}` handle {h} is outside {} tensors",
                 devp.len()
+            ))
+        })
+    };
+    let companion = |h: u16, from: &str, to: &str| -> Result<u64> {
+        let td = tensors.get(h as usize).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "lean MoE stage-2 source table handle {h} is outside {} tensors",
+                tensors.len()
+            ))
+        })?;
+        let pfx = td.name.strip_suffix(from).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "lean MoE stage-2 source table `{}` does not end in `{from}`",
+                td.name
+            ))
+        })?;
+        let name = format!("{pfx}{to}");
+        let ix = tensors.iter().position(|t| t.name == name).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "lean MoE stage-2 segment requires loader-filled companion table `{name}`"
+            ))
+        })?;
+        devp.get(ix).map(|m| m.base).ok_or_else(|| {
+            RuntimeError::Device(format!(
+                "lean MoE stage-2 companion table `{name}` has no device allocation"
             ))
         })
     };
@@ -605,9 +636,9 @@ fn moe_stage2_mxfp4_routes(prog: &DevProg, devp: &[DeviceMem]) -> Result<Vec<Pre
         routes.push(PrefillSegmentRoute::MoeStage2Mxfp4(MoeStage2Mxfp4Args {
             out: addr(c.t[0], "out")?,
             activation: addr(d.t[1], "activation")?,
-            weight_table: addr(d.t[2], "weight_table")?,
+            weight_table: companion(d.t[2], "expert_weight_table", "expert_weight_table_moe2")?,
             activation_scale: addr(d.t[5], "activation_scale")?,
-            weight_scale_table: addr(d.t[3], "weight_scale_table")?,
+            weight_scale_table: companion(d.t[3], "expert_scale_table", "expert_scale_table_moe2")?,
             meta: addr(d.t[4], "meta")?,
             row_partidx: addr(d.t[6], "row_partidx")?,
             row_gate: addr(d.t[7], "row_gate")?,
@@ -616,6 +647,7 @@ fn moe_stage2_mxfp4_routes(prog: &DevProg, devp: &[DeviceMem]) -> Result<Vec<Pre
             inter_dim: d.i[1],
             experts: d.i[2],
             topk: c.i[1],
+            reserved: 0,
         }));
     }
     Ok(routes)
@@ -3192,8 +3224,72 @@ struct GatheredExpert<'a> {
     data: std::borrow::Cow<'a, [u8]>,
     /// (device dst, permuted payload) when the preshuffled pf slab is declared.
     pf: Option<(u64, Vec<u8>)>,
+    /// Lean stage-2 companion payload or scale, already in the object's exact layout.
+    moe2: Option<(u64, Vec<u8>)>,
     gather_ns: u64,
     fault_ns: u64,
+}
+
+fn shuffle_mxfp4_moe2_weight(src: &[u8], rows: usize, kbytes: usize) -> Result<Vec<u8>> {
+    if rows == 0 || !rows.is_multiple_of(16) || kbytes == 0 || !kbytes.is_multiple_of(32) {
+        return Err(RuntimeError::Device(format!(
+            "lean MoE stage-2 weight layout requires rows%16=0 and Kbytes%32=0, got {rows}x{kbytes}"
+        )));
+    }
+    if src.len() != rows.saturating_mul(kbytes) {
+        return Err(RuntimeError::Device(format!(
+            "lean MoE stage-2 weight layout got {} B for {rows}x{kbytes}",
+            src.len()
+        )));
+    }
+    let mut dst = vec![0u8; src.len()];
+    let mut at = 0usize;
+    for nb in 0..rows / 16 {
+        for kb in 0..kbytes / 32 {
+            for kh in 0..2 {
+                for nr in 0..16 {
+                    let s = (nb * 16 + nr) * kbytes + kb * 32 + kh * 16;
+                    dst[at..at + 16].copy_from_slice(&src[s..s + 16]);
+                    at += 16;
+                }
+            }
+        }
+    }
+    Ok(dst)
+}
+
+fn shuffle_mxfp4_moe2_scale(src: &[u8], rows: usize, groups: usize) -> Result<Vec<u8>> {
+    if rows == 0 || groups == 0 || src.len() != rows.saturating_mul(groups) {
+        return Err(RuntimeError::Device(format!(
+            "lean MoE stage-2 scale layout got {} B for {rows}x{groups}",
+            src.len()
+        )));
+    }
+    let padded_rows = rows.div_ceil(256) * 256;
+    let padded_groups = groups.div_ceil(8) * 8;
+    let mut dst = vec![127u8; padded_rows * padded_groups];
+    let mut at = 0usize;
+    for nb in 0..padded_rows / 32 {
+        for gb in 0..padded_groups / 8 {
+            for gi in 0..4 {
+                for nr in 0..16 {
+                    for gh in 0..2 {
+                        for nh in 0..2 {
+                            let row = nb * 32 + nh * 16 + nr;
+                            let group = gb * 8 + gh * 4 + gi;
+                            dst[at] = if row < rows && group < groups {
+                                src[row * groups + group]
+                            } else {
+                                127
+                            };
+                            at += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(dst)
 }
 
 /// Expert-gather workers per rank. Every rank of a TP group loads at once, so
@@ -3210,13 +3306,14 @@ fn expert_gather_threads(n_gpu: u32) -> usize {
 /// worker — and all device interaction stays with the caller.
 fn gather_expert_entry<'a>(
     ckpt: &'a crate::asset::checkpoint::Checkpoint,
-    entry: &(String, u64, u64, bool, u64, u64, u64),
+    entry: &(String, u64, u64, bool, u64, u64, u64, u64, u64, u64, bool),
     shard_rank: u32,
     shard_n: u32,
     populate: bool,
     do_prefault: bool,
 ) -> Result<GatheredExpert<'a>> {
-    let (name, dst, want, scrub, pf_dst, pf_rows, pf_k) = entry;
+    let (name, dst, want, scrub, pf_dst, pf_rows, pf_k, moe2_dst, moe2_rows, moe2_k, moe2_scale) =
+        entry;
     let (src, shape) = ckpt
         .tensor_ex(name)
         .ok_or_else(|| RuntimeError::Device(format!("MISSING EXPERT WEIGHT: {name}")))?;
@@ -3263,12 +3360,25 @@ fn gather_expert_entry<'a>(
     } else {
         None
     };
+    let moe2 = if *moe2_dst == 0 {
+        None
+    } else {
+        let t = Instant::now();
+        let shuffled = if *moe2_scale {
+            shuffle_mxfp4_moe2_scale(&data, *moe2_rows as usize, *moe2_k as usize)?
+        } else {
+            shuffle_mxfp4_moe2_weight(&data, *moe2_rows as usize, *moe2_k as usize)?
+        };
+        gather_ns += t.elapsed().as_nanos() as u64;
+        Some((*moe2_dst, shuffled))
+    };
     Ok(GatheredExpert {
         dst: *dst,
         want: *want,
         scrub: *scrub,
         data,
         pf,
+        moe2,
         gather_ns,
         fault_ns,
     })
@@ -3452,6 +3562,51 @@ fn bind_packed_experts(
         } else {
             (None, None)
         };
+        let i_ewt_moe2 = names
+            .iter()
+            .position(|x| *x == format!("{pfx}expert_weight_table_moe2"));
+        let i_est_moe2 = names
+            .iter()
+            .position(|x| *x == format!("{pfx}expert_scale_table_moe2"));
+        if i_ewt_moe2.is_some() != i_est_moe2.is_some() {
+            return Err(RuntimeError::Device(format!(
+                "{pfx}: lean MoE stage-2 weight and scale companion tables must be declared together"
+            )));
+        }
+        let (d_w2, d_s2, w2tab, s2tab) = if i_ewt_moe2.is_some() {
+            if !en.microscaled() {
+                return Err(RuntimeError::Device(format!(
+                    "{pfx}: lean MoE stage-2 companion requires MXFP4 payloads with E8M0 scales"
+                )));
+            }
+            let kbytes = usize::try_from(i_moe / 2).unwrap_or(0);
+            let groups = usize::try_from(i_moe / 32).unwrap_or(0);
+            if kbytes == 0 || groups == 0 || w_stride as usize % kbytes != 0 {
+                return Err(RuntimeError::Device(format!(
+                    "{pfx}: lean MoE stage-2 cannot derive down geometry from I={i_moe}, stride={w_stride}"
+                )));
+            }
+            let rows = w_stride as usize / kbytes;
+            if s_stride as usize != rows.saturating_mul(groups) {
+                return Err(RuntimeError::Device(format!(
+                    "{pfx}: down scale stride {s_stride} disagrees with {rows}x{groups} E8M0 rows"
+                )));
+            }
+            let scale_stride = rows.div_ceil(256) * 256 * (groups.div_ceil(8) * 8);
+            let t_a = Instant::now();
+            let dw = EngineDevice::alloc(be, (n_local * w_stride).max(1))?;
+            let ds = EngineDevice::alloc(be, (n_local * scale_stride as u64).max(1))?;
+            LoadProf::add(&prof.alloc_ns, t_a);
+            let mut wt = vec![0u64; n_exp as usize * 3];
+            let mut st = vec![0u64; n_exp as usize * 3];
+            for (local, e) in owned.clone().enumerate() {
+                wt[e as usize * 3 + 2] = dw.base + local as u64 * w_stride;
+                st[e as usize * 3 + 2] = ds.base + local as u64 * scale_stride as u64;
+            }
+            (Some(dw), Some(ds), Some(wt), Some(st))
+        } else {
+            (None, None, None, None)
+        };
 
         // The layer's reads, IN ORDER, before any of them happens.
         //
@@ -3469,7 +3624,7 @@ fn bind_packed_experts(
         // preshuffled copy (scale entries, or the pf table not declared). Geometry per
         // projection: gate/up are [I_moe][K] row-major shards, down is [H][I_moe] — in both
         // cases the shard is [rows][kbytes] with rows*kbytes == w_stride.
-        let mut plan: Vec<(String, u64, u64, bool, u64, u64, u64)> =
+        let mut plan: Vec<(String, u64, u64, bool, u64, u64, u64, u64, u64, u64, bool)> =
             Vec::with_capacity(owned.len() * 6);
         for e in owned {
             for j in 0..3 {
@@ -3480,6 +3635,15 @@ fn bind_packed_experts(
                     (w_stride / i_moe, i_moe)
                 };
                 let pf_dst = wptab.as_ref().map_or(0, |t| t[idx]);
+                let w2_dst = w2tab.as_ref().map_or(0, |t| t[idx]);
+                let s2_dst = s2tab.as_ref().map_or(0, |t| t[idx]);
+                let down_kbytes = i_moe / 2;
+                let down_rows = if down_kbytes == 0 {
+                    0
+                } else {
+                    w_stride / down_kbytes
+                };
+                let down_groups = i_moe / 32;
                 plan.push((
                     en.weight_of(e, j),
                     wtab[idx],
@@ -3488,8 +3652,24 @@ fn bind_packed_experts(
                     pf_dst,
                     pf_rows,
                     pf_k,
+                    w2_dst,
+                    down_rows,
+                    down_kbytes,
+                    false,
                 ));
-                plan.push((en.scale_of(e, j), stab[idx], s_stride, false, 0, 0, 0));
+                plan.push((
+                    en.scale_of(e, j),
+                    stab[idx],
+                    s_stride,
+                    false,
+                    0,
+                    0,
+                    0,
+                    s2_dst,
+                    down_rows,
+                    down_groups,
+                    true,
+                ));
             }
         }
         // THE GATHER RUNS ON A WORKER POOL; the ring stays on this thread.
@@ -3546,6 +3726,15 @@ fn bind_packed_experts(
                 }
                 wbytes += g.want;
             }
+            if let Some((dst, shuffled)) = g.moe2 {
+                for (o, chunk) in shuffled.chunks(stage_bytes).enumerate() {
+                    let t = Instant::now();
+                    ring.push(dst + (o * stage_bytes) as u64, chunk)?;
+                    LoadProf::add(&prof.memcpy_ns, t);
+                    prof.chunks.set(prof.chunks.get() + 1);
+                }
+                wbytes += shuffled.len() as u64;
+            }
             Ok(())
         };
         std::thread::scope(|s| -> Result<()> {
@@ -3592,9 +3781,19 @@ fn bind_packed_experts(
         if let (Some(ip), Some(tab)) = (i_ewt_pf, &wptab) {
             EngineDevice::upload(be, &devp[ip], 0, as_bytes(tab))?;
         }
+        if let (Some(iw), Some(is), Some(wt), Some(st)) = (i_ewt_moe2, i_est_moe2, &w2tab, &s2tab) {
+            EngineDevice::upload(be, &devp[iw], 0, as_bytes(wt))?;
+            EngineDevice::upload(be, &devp[is], 0, as_bytes(st))?;
+        }
         bufs.push(d_w);
         bufs.push(d_s);
         if let Some(d) = d_wp {
+            bufs.push(d);
+        }
+        if let Some(d) = d_w2 {
+            bufs.push(d);
+        }
+        if let Some(d) = d_s2 {
             bufs.push(d);
         }
     }
@@ -5758,8 +5957,9 @@ impl AmdEngine {
         let k_moe_stage2_mxfp4 = if arch == "gfx950" && need_moe_stage2_lean {
             const NAME: &str = "moe_stage2_mxfp4_gfx950.elf";
             const SYMBOL: &str = "plow_moe2_mxfp4_16x16x128_gfx950";
-            const MARKERS: [&str; 4] = [
-                "plow_moe2_mxfp4_stage2_abi_1",
+            const MARKERS: [&str; 5] = [
+                "plow_moe2_mxfp4_stage2_abi_2",
+                "plow_moe2_mxfp4_stage2_layout_shuffled_1",
                 "plow_moe2_mxfp4_stage2_no_spill_1",
                 "plow_moe2_mxfp4_stage2_dynamic_lds_16640",
                 "plow_moe2_mxfp4_stage2_vgpr_le_144",
@@ -6336,7 +6536,7 @@ impl AmdEngine {
                 vec![DecodeSegmentRoute::Interpreter; seg_class.len()]
             };
             let prefill_routes = if prog_ix < dec_ix {
-                moe_stage2_mxfp4_routes(p, &devp)?
+                moe_stage2_mxfp4_routes(p, &blob.tensors, &devp)?
             } else {
                 vec![PrefillSegmentRoute::Interpreter; seg_class.len()]
             };
@@ -7325,7 +7525,20 @@ impl AmdEngine {
                     None,
                 )?;
                 let n_tiles = args.model_dim.div_ceil(256).max(1);
-                let grid = n_tiles * self.n_cu.div_ceil(n_tiles);
+                // ALIGN produces BM64 expert tiles; the lean body consumes their two BM32
+                // halves independently. This is a shape-derived upper bound because the host
+                // deliberately does not read routing metadata back from the device.
+                let half_tiles = args
+                    .tokens
+                    .checked_mul(args.topk)
+                    .and_then(|rows| rows.div_ceil(64).checked_add(args.experts))
+                    .and_then(|tiles| tiles.checked_mul(2))
+                    .ok_or_else(|| {
+                        RuntimeError::Device("lean MoE stage-2 tile count overflow".into())
+                    })?;
+                let grid = n_tiles.checked_mul(half_tiles).ok_or_else(|| {
+                    RuntimeError::Device("lean MoE stage-2 launch grid overflow".into())
+                })?;
                 EngineDevice::launch_kernel(
                     &*self.be,
                     kernel,
@@ -9648,10 +9861,29 @@ mod tests {
         c.t[2] = packet::dev::TENSOR_NONE16;
         c.t[3] = d.t[0];
         c.i = [3584, 16, 1024, 0, 0, 0, 0, 0];
-        let devp: Vec<_> = (0..8)
-            .map(|i| DeviceMem::view(0x1000 + i * 0x100, 0x100))
+        let tensors: Vec<_> = [
+            "t0",
+            "t1",
+            "moe.mlp.expert_weight_table",
+            "moe.mlp.expert_scale_table",
+            "t4",
+            "t5",
+            "t6",
+            "t7",
+            "moe.mlp.expert_weight_table_moe2",
+            "moe.mlp.expert_scale_table_moe2",
+        ]
+        .into_iter()
+        .map(|name| crate::asset::devblob::DevTensor {
+            name: name.into(),
+            bytes: 0x100,
+            init: None,
+        })
+        .collect();
+        let devp: Vec<_> = (0..tensors.len())
+            .map(|i| DeviceMem::view(0x1000 + i as u64 * 0x100, 0x100))
             .collect();
-        let routes = moe_stage2_mxfp4_routes(&prog, &devp).unwrap();
+        let routes = moe_stage2_mxfp4_routes(&prog, &tensors, &devp).unwrap();
         let PrefillSegmentRoute::MoeStage2Mxfp4(args) = routes[0] else {
             panic!("pure supported pair must route to the lean object")
         };
@@ -9659,11 +9891,67 @@ mod tests {
             (args.tokens, args.model_dim, args.inter_dim),
             (1024, 3584, 384)
         );
+        assert_eq!(
+            (args.weight_table, args.weight_scale_table),
+            (0x1800, 0x1900)
+        );
         assert!(matches!(routes[1], PrefillSegmentRoute::Interpreter));
 
         prog.stream[2].seg = 0;
-        let fallback = moe_stage2_mxfp4_routes(&prog, &devp).unwrap();
+        let fallback = moe_stage2_mxfp4_routes(&prog, &tensors, &devp).unwrap();
         assert!(matches!(fallback[0], PrefillSegmentRoute::Interpreter));
+    }
+
+    #[test]
+    fn lean_moe_stage2_companion_layout_matches_the_declared_permutations() {
+        let rows = 32usize;
+        let kbytes = 64usize;
+        let weight: Vec<u8> = (0..rows * kbytes).map(|i| (i % 251) as u8).collect();
+        let shuffled = shuffle_mxfp4_moe2_weight(&weight, rows, kbytes).unwrap();
+        for nb in 0..rows / 16 {
+            for kb in 0..kbytes / 32 {
+                for kh in 0..2 {
+                    for nr in 0..16 {
+                        for b in 0..16 {
+                            let dst = ((((nb * (kbytes / 32) + kb) * 2 + kh) * 16 + nr) * 16) + b;
+                            let src = (nb * 16 + nr) * kbytes + kb * 32 + kh * 16 + b;
+                            assert_eq!(shuffled[dst], weight[src]);
+                        }
+                    }
+                }
+            }
+        }
+
+        let (rows, groups) = (33usize, 12usize);
+        let scales: Vec<u8> = (0..rows * groups).map(|i| (i % 113) as u8).collect();
+        let shuffled = shuffle_mxfp4_moe2_scale(&scales, rows, groups).unwrap();
+        let (padded_rows, padded_groups) = (256usize, 16usize);
+        assert_eq!(shuffled.len(), padded_rows * padded_groups);
+        for nb in 0..padded_rows / 32 {
+            for gb in 0..padded_groups / 8 {
+                for gi in 0..4 {
+                    for nr in 0..16 {
+                        for gh in 0..2 {
+                            for nh in 0..2 {
+                                let dst =
+                                    (((((nb * (padded_groups / 8) + gb) * 4 + gi) * 16 + nr) * 2
+                                        + gh)
+                                        * 2)
+                                        + nh;
+                                let row = nb * 32 + nh * 16 + nr;
+                                let group = gb * 8 + gh * 4 + gi;
+                                let expected = if row < rows && group < groups {
+                                    scales[row * groups + group]
+                                } else {
+                                    127
+                                };
+                                assert_eq!(shuffled[dst], expected);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

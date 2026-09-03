@@ -3064,6 +3064,20 @@ pub fn declare_k3_moe_weights(b: &mut Builder, c: &K3MoeCfg, lp: &str, tp: u32) 
     // Same rule as `K3Tp::local`: an exact division, because every K3 width divides 8.
     let tp_local = |n: u32| (n / tp.max(1)) as u64;
     let n = |s: &str| format!("{lp}{K3_MOE_NS}{s}");
+    if c.enc == K3_MOE_ENC_MXFP4
+        && tp_local(c.moe_inter) == 384
+        && c.latent.is_multiple_of(16)
+        && crate::emit_config::active().moe_stage2_lean
+    {
+        b.tensor(
+            &format!("moe.{lp}expert_weight_table_moe2"),
+            c.n_exp as u64 * 3 * 8,
+        );
+        b.tensor(
+            &format!("moe.{lp}expert_scale_table_moe2"),
+            c.n_exp as u64 * 3 * 8,
+        );
+    }
     K3MoeWeights {
         router: b.tensor(&n("gate.weight"), c.n_exp as u64 * h * 2),
         router_bias: b.tensor(&n("gate.e_score_correction_bias"), c.n_exp as u64 * 4),

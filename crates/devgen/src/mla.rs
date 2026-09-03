@@ -984,6 +984,11 @@ struct GlmLW {
     // per-k-tile B stream is one contiguous 16 KiB block instead of 64 B row-slices at K-stride.
     // Prefill-only — the decode expert GEMVs keep streaming whole rows from `ewt`'s slab.
     ewt_pf: u32,
+    // Optional gfx950 lean stage-2 companion tables. The loader fills only slot 2 (down) with
+    // pointers to the validated shuffled MXFP4 payload/E8M0 layouts. Ordinary row-major tables
+    // remain intact for decode and the interpreter fallback.
+    _ewt_moe2: u32,
+    _est_moe2: u32,
     // Dense FFN (layers < first_k_dense): block-fp8 gate/up/down + their weight_scale_inv grids.
     // TENSOR_NONE on MoE layers.
     dgate: u32,
@@ -1725,6 +1730,26 @@ pub(crate) fn declare_glm_rows_batched(
                 TENSOR_NONE
             } else {
                 t(b, "mlp.expert_weight_table_pf", (e * 3) as u64 * 8)
+            },
+            _ewt_moe2: if dense
+                || enc != MoeEnc::Mxfp4
+                || imoe_e != 384
+                || h % 16 != 0
+                || !emit_config::active().moe_stage2_lean
+            {
+                TENSOR_NONE
+            } else {
+                t(b, "mlp.expert_weight_table_moe2", (e * 3) as u64 * 8)
+            },
+            _est_moe2: if dense
+                || enc != MoeEnc::Mxfp4
+                || imoe_e != 384
+                || h % 16 != 0
+                || !emit_config::active().moe_stage2_lean
+            {
+                TENSOR_NONE
+            } else {
+                t(b, "mlp.expert_scale_table_moe2", (e * 3) as u64 * 8)
             },
             // Dense-FFN weights. Block-fp8 keeps the checkpoint's own byte layout and its
             // [N/128][K/128] f32 `weight_scale_inv` grid; MXFP4 halves the weight and swaps the

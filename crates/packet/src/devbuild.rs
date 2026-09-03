@@ -383,6 +383,7 @@ fn lean_moe_stage2_pair(ops: &[Op], i: usize) -> bool {
         && d.i[3] == 2
         && d.i[1] == 384
         && d.i[0] != 0
+        && d.i[0].is_multiple_of(16)
         && d.i[2] != 0
         && d.i[4] == 0
         && d.i[5] == 0
