@@ -2410,6 +2410,14 @@ const MLA_PF_V2_SYM: &str = "plow_mla_pf_v2_arm_1";
 const MLA_PF_V2_FP8_SYM: &str = "plow_mla_pf_v2_fp8_arm_1";
 const MLA_PF_V2_SV_RAW_SYM: &str = "plow_mla_pf_v2_sv_raw_1";
 
+fn resolve_flash_object_load<T>(load: Result<T>, required: bool) -> Result<Option<T>> {
+    match load {
+        Ok(object) => Ok(Some(object)),
+        Err(error) if required => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
 fn check_mla_v2_sv_raw_symbols(syms: &[&str], path: &Path, needs_l2: bool) -> Result<()> {
     for marker in [MLA_PF_V2_SYM, MLA_PF_V2_SV_RAW_SYM] {
         if !syms.contains(&marker) {
@@ -5876,13 +5884,13 @@ impl AmdEngine {
         // Flash follows the PREFILL scheduler — a flash segment is a prefill
         // segment. Optional: without it every segment runs class 8, which is
         // correct and merely slower.
-        let k_flash = match load_one_in(Phase::Flash, sched_prefill, hsaco_dir, None) {
-            Ok((k, _)) => Some(k),
-            Err(e) => {
-                tracing::info!(%e, "no flash object — flash segments run on the 8-wave interpreter");
-                None
-            }
-        };
+        let flash_load = load_one_in(Phase::Flash, sched_prefill, hsaco_dir, None);
+        let flash_error = flash_load.as_ref().err().map(ToString::to_string);
+        let k_flash = resolve_flash_object_load(flash_load, need_mla_v2 || need_mla_v2_fp8)?
+            .map(|(k, _)| k);
+        if let (None, Some(e)) = (&k_flash, flash_error) {
+            tracing::info!(%e, "no flash object — flash segments run on the 8-wave interpreter");
+        }
         drop(load_one_in);
 
         let k_mla_v2_sv_raw = if arch == "gfx950" && variant != Variant::Fp8Kv && need_mla_v2 {
@@ -10233,6 +10241,23 @@ mod tests {
         ] {
             assert!(check_mla_v2_sv_raw_symbols(&bad, object, true).is_err());
         }
+    }
+
+    #[test]
+    fn required_flash_object_load_errors_are_not_swallowed() {
+        let required = resolve_flash_object_load::<()>(
+            Err(RuntimeError::Device("missing V2 marker".into())),
+            true,
+        )
+        .expect_err("required V2 flash object must fail closed");
+        assert!(required.to_string().contains("missing V2 marker"));
+
+        let optional = resolve_flash_object_load::<()>(
+            Err(RuntimeError::Device("optional flash object unavailable".into())),
+            false,
+        )
+        .expect("ordinary flash object may fall back");
+        assert!(optional.is_none());
     }
 
     #[test]
