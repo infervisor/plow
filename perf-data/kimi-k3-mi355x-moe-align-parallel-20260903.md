@@ -55,3 +55,34 @@ Matched artifacts:
 The cap is required by the packet ABI: per-domain arrival counts are 9-bit (`<=511`). On the
 256-CU TP8 target, 1024 logical slices distribute to 128/domain; emitting all 8192 slices would
 produce 1024/domain and is rejected by `DevBuild`.
+
+## Resident-CU router follow-up
+
+The generic follow-up caps the router at `min(T,n_cu)` logical slices and leaves parallel align
+behind the same default-off knob. An uncontended isolated screen is exact:
+
+| T | router, 304 slices | router, n_cu slices | serial align | parallel align | n_cu combined |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 0.608283 ms | 0.507203 ms | 0.076600 ms | 0.052560 ms | 0.559763 ms |
+| 8192 | 4.230227 ms | 3.985902 ms | 0.373162 ms | 0.210961 ms | 4.196863 ms |
+
+The matched TP8 8192-to-1 fold confirms the convergence fix:
+
+| metric | control | n_cu candidate | delta |
+|---|---:|---:|---:|
+| TTFT | 2794.259 ms | 2785.620 ms | -8.639 ms (-0.309%) |
+| router trace total | 52.330 ms | 52.465 ms | +0.135 ms |
+| align trace total | 30.004 ms | 18.492 ms | -11.512 ms |
+| router + align | 82.334 ms | 70.956 ms | -11.378 ms |
+
+Both runs produced `fnv1a64:7d749e3b002fafa7`. Router successor gating is 1.655 us/packet,
+down from the 1024-slice candidate's 460.897 us/packet. The n_cu cap removes the scheduling
+regression and preserves the align gain, but the full-network combined category remains above
+40 ms. Keep default-off.
+
+Follow-up artifacts:
+
+- control packet SHA256: `b8a71791114c9fc059253dd8159b32dd9d7169c9cc17fa56f737217f4a5082a5`
+- candidate packet SHA256: `6e4cba76e4facf9cf4b5c18f7742ad864ce55bd7088a7291ac8fdaae9b998a91`
+- control trace SHA256: `2eff6ec0f444f1cb8fc722cde62adc5edca4818de3c977d6e718440c1685b744`
+- candidate trace SHA256: `ee804943cb0c614690f4ecb725db6380a690d76c98c959edd471c78f7ae470d9`
