@@ -1844,7 +1844,7 @@ fn run_one_tick(
                     return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
                 }
             }
-            let pending = (!did_prefill).then_some(isolated).flatten();
+            let pending = amd_prefill_isolated_fallback(isolated, did_prefill);
             if let Some(i) = pending {
                 if nv.pf_batch {
                     e.advance_prefill_turn(i);
@@ -2396,6 +2396,11 @@ fn amd_packed_frontier_updates(
         .into_iter()
         .map(|slot| frontier(slot).map(|value| (slot, value)).ok_or(slot))
         .collect()
+}
+
+#[cfg(feature = "hsa")]
+fn amd_prefill_isolated_fallback(isolated: Option<usize>, packed: bool) -> Option<usize> {
+    (!packed).then_some(isolated).flatten()
 }
 
 /// RTX-12 chunked packing: per-REQUEST cap on the prefill rows one request may
@@ -3087,6 +3092,14 @@ mod tests {
             amd_packed_frontier_updates([2, 0, 3], |slot| (slot != 0).then_some(slot + 10)),
             Err(0)
         );
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn unsupported_or_single_member_pack_retains_isolated_fallback() {
+        assert_eq!(amd_prefill_isolated_fallback(Some(3), false), Some(3));
+        assert_eq!(amd_prefill_isolated_fallback(Some(3), true), None);
+        assert_eq!(amd_prefill_isolated_fallback(None, false), None);
     }
 
     /// The batched-engine admission model: a decode tick advances every live

@@ -432,6 +432,10 @@ mod amd_serve {
             .then_some(step)
     }
 
+    fn packed_prefill_dispatch_supported(is_tp: bool, program_capable: bool) -> bool {
+        is_tp && program_capable
+    }
+
     /// Shortest prefix worth caching. Below this the snapshot/restore pair costs more than the
     /// prefill it skips, and it churns the slot's cached prompt for nothing.
     const MIN_PREFIX: u32 = 128;
@@ -1084,7 +1088,15 @@ mod amd_serve {
             max_rows: u32,
         ) -> Option<packet::dev::PrefillSpan> {
             let cur = self.pf.get(slot)?.as_ref()?;
-            packable_prefill_step(cur, max_rows)?;
+            let step = packable_prefill_step(cur, max_rows)?;
+            let supported = match &self.ranks {
+                Ranks::One(_) => packed_prefill_dispatch_supported(false, false),
+                Ranks::Tp(group) => packed_prefill_dispatch_supported(
+                    true,
+                    group.packed_prefill_prog_capable(step.prog),
+                ),
+            };
+            supported.then_some(())?;
             self.prefill_span(slot, max_rows)
         }
 
@@ -1639,9 +1651,9 @@ mod amd_serve {
     mod tests {
         use super::{
             bounded_deferred_quantum, commit_packed_prefill, invalidate_prefix_metadata,
-            packable_prefill_step, parse_snapshot_tensors, snapshot_file_component,
-            split_pending_prefill, stage_parked, PfCursor, DEFAULT_SNAPSHOT_TENSORS,
-            MAX_SNAPSHOT_TENSORS,
+            packable_prefill_step, packed_prefill_dispatch_supported, parse_snapshot_tensors,
+            snapshot_file_component, split_pending_prefill, stage_parked, PfCursor,
+            DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
 
@@ -1788,6 +1800,13 @@ mod amd_serve {
             assert_eq!(packable_prefill_step(&cursor(0, None), 2), None);
             assert_eq!(packable_prefill_step(&cursor(0, Some(0)), 3), None);
             assert_eq!(packable_prefill_step(&cursor(1, None), 3), None);
+        }
+
+        #[test]
+        fn packed_prefill_dispatch_requires_tp_and_program_capability() {
+            assert!(packed_prefill_dispatch_supported(true, true));
+            assert!(!packed_prefill_dispatch_supported(false, true));
+            assert!(!packed_prefill_dispatch_supported(true, false));
         }
 
         #[test]

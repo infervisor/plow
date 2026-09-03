@@ -1062,6 +1062,15 @@ impl AmdTpGroup {
             .then_some(t)
     }
 
+    /// True only when every rank can route this exact program through packed prefill.
+    pub fn packed_prefill_prog_capable(&self, prog: usize) -> bool {
+        self.prefill_prog_t(prog).is_some()
+            && self
+                .ranks
+                .iter()
+                .all(|rank| rank.packed_prefill_prog_capable(prog))
+    }
+
     pub fn has_snapshot(&self, slot: usize) -> bool {
         self.ranks.iter().all(|e| e.has_snapshot(slot))
     }

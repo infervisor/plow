@@ -5965,6 +5965,74 @@ impl AmdEngine {
         &self.tensor_names
     }
 
+    fn check_packed_prefill_program(&self, prog: usize) -> Result<u32> {
+        let program = self.progs.get(prog).ok_or_else(|| {
+            RuntimeError::Device(format!("packed-prefill program {prog} is out of range"))
+        })?;
+        if prog >= self.dec_lo {
+            return Err(RuntimeError::Device(format!(
+                "program {prog} is a decode rung, not a packed-prefill program"
+            )));
+        }
+        check_packed_prefill_abi(self.packed_prefill_prefill_abi, false, false)?;
+        if program.l2_domains != 0 {
+            return Err(RuntimeError::Device(
+                "packed-prefill family routing requires wave-class segments; this packet uses \
+                 L2-domain placement in the same field"
+                    .into(),
+            ));
+        }
+        if program.packed_needs_mla {
+            if !program.packed_mla_compatible {
+                return Err(RuntimeError::Device(
+                    "packed-prefill MLA does not support gathered/per-query selector packets"
+                        .into(),
+                ));
+            }
+            if !program.packed_mla_segmented {
+                return Err(RuntimeError::Device(
+                    "packed-prefill MLA consumer is in a mixed segment; re-emit with \
+                     PLOW_SEG_PACKED_PREFILL=1"
+                        .into(),
+                ));
+            }
+            if program.packed_seg_family.contains(&5) && self.k_packed_mla_norm.is_none() {
+                return Err(RuntimeError::Device(
+                    "packed-prefill MLA norm/cache segment requires interp_packed_mla_norm".into(),
+                ));
+            }
+            if program.packed_seg_family.contains(&6) && self.k_packed_mla_flash.is_none() {
+                return Err(RuntimeError::Device(
+                    "packed-prefill MLA flash segment requires interp_packed_mla_flash".into(),
+                ));
+            }
+        }
+        if program.packed_needs_kda {
+            if !program.packed_kda_compatible {
+                return Err(RuntimeError::Device(
+                    "packed-prefill KDA supports serial Conv3/state or complete BT64/BC16 chunk \
+                     operator groups; gathered or double-buffered layouts remain disabled"
+                        .into(),
+                ));
+            }
+            if !program.packed_kda_segmented || self.k_packed_kda.is_none() {
+                return Err(RuntimeError::Device(
+                    "packed-prefill KDA requires pure family segments and \
+                     interp_packed_kda; re-emit with PLOW_SEG_PACKED_PREFILL=1 and build the \
+                     optional family objects"
+                        .into(),
+                ));
+            }
+        }
+        Ok(program.t)
+    }
+
+    /// Whether this exact prefill program has the packet ABI and every operator-family object
+    /// needed by the packed route.
+    pub fn packed_prefill_prog_capable(&self, prog: usize) -> bool {
+        self.check_packed_prefill_program(prog).is_ok()
+    }
+
     /// Validate and upload one ragged packed-prefill descriptor. The binding is program-exact:
     /// every other program continues to receive null metadata in its kernarg.
     pub fn stage_packed_prefill(
@@ -5974,65 +6042,7 @@ impl AmdEngine {
         parked: &[u32],
     ) -> Result<()> {
         self.packed_prefill = None;
-        if prog >= self.dec_lo {
-            return Err(RuntimeError::Device(format!(
-                "program {prog} is a decode rung, not a packed-prefill program"
-            )));
-        }
-        check_packed_prefill_abi(self.packed_prefill_prefill_abi, false, false)?;
-        if self.progs[prog].l2_domains != 0 {
-            return Err(RuntimeError::Device(
-                "packed-prefill family routing requires wave-class segments; this packet uses \
-                 L2-domain placement in the same field"
-                    .into(),
-            ));
-        }
-        if self.progs[prog].packed_needs_mla {
-            if !self.progs[prog].packed_mla_compatible {
-                return Err(RuntimeError::Device(
-                    "packed-prefill MLA does not support gathered/per-query selector packets"
-                        .into(),
-                ));
-            }
-            if !self.progs[prog].packed_mla_segmented {
-                return Err(RuntimeError::Device(
-                    "packed-prefill MLA consumer is in a mixed segment; re-emit with \
-                     PLOW_SEG_PACKED_PREFILL=1"
-                        .into(),
-                ));
-            }
-            if self.progs[prog].packed_seg_family.contains(&5) && self.k_packed_mla_norm.is_none() {
-                return Err(RuntimeError::Device(
-                    "packed-prefill MLA norm/cache segment requires interp_packed_mla_norm".into(),
-                ));
-            }
-            if self.progs[prog].packed_seg_family.contains(&6) && self.k_packed_mla_flash.is_none()
-            {
-                return Err(RuntimeError::Device(
-                    "packed-prefill MLA flash segment requires interp_packed_mla_flash".into(),
-                ));
-            }
-        }
-        if self.progs[prog].packed_needs_kda {
-            if !self.progs[prog].packed_kda_compatible {
-                return Err(RuntimeError::Device(
-                    "packed-prefill KDA supports serial Conv3/state or complete BT64/BC16 chunk \
-                     operator groups; gathered or double-buffered layouts remain disabled"
-                        .into(),
-                ));
-            }
-            if !self.progs[prog].packed_kda_segmented || self.k_packed_kda.is_none() {
-                return Err(RuntimeError::Device(
-                    "packed-prefill KDA requires pure family segments and \
-                     interp_packed_kda; re-emit with PLOW_SEG_PACKED_PREFILL=1 and build the \
-                     optional family objects"
-                        .into(),
-                ));
-            }
-        }
-        let rung = self.progs.get(prog).map(|p| p.t).ok_or_else(|| {
-            RuntimeError::Device(format!("packed-prefill program {prog} is out of range"))
-        })?;
+        let rung = self.check_packed_prefill_program(prog)?;
         let binding = validate_packed_prefill(prog, rung, self.batch, spans, parked)?;
         if spans.len() > self.prefill_span_capacity || parked.len() > self.prefill_row_capacity {
             return Err(RuntimeError::Device(format!(

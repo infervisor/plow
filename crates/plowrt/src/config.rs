@@ -177,8 +177,8 @@ pub struct NvidiaRuntimeConfig {
     #[arg(long = "nv-upload-direct", env = "PLOW_UPLOAD_DIRECT", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub upload_direct: bool,
 
-    /// Cross-request prefill scheduling. CUDA packs chunks into one launch;
-    /// AMD fairly interleaves isolated chunks because its packet rows are single-sequence.
+    /// Cross-request prefill scheduling. CUDA packs chunks into one launch. AMD TP packs only
+    /// exact-capability programs; unsupported programs retain fair isolated scheduling.
     #[arg(long = "pf-batch", env = "PLOW_PF_BATCH", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub pf_batch: bool,
 
@@ -373,8 +373,8 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-state-clear-device", env = "PLOW_STATE_CLEAR_DEVICE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub state_clear_device: bool,
 
-    /// Load exact-capability packed-prefill operator-family objects. This does not enable mux
-    /// co-packing; it only makes a staged descriptor routable after all fail-closed gates pass.
+    /// Load exact-capability packed-prefill operator-family objects. Mux co-packing additionally
+    /// requires --pf-batch, a TP engine, and a compatibly segmented packet.
     #[arg(long = "amd-packed-prefill-route", env = "PLOW_PACKED_PREFILL_ROUTE", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub packed_prefill_route: bool,
 
