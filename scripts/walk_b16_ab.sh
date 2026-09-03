@@ -32,13 +32,17 @@
 # bug). That gate is the whole reason the fusion was disabled rather than fixed.
 #
 #   $1 phase: emit | run
-set -u
+set -euo pipefail
 WT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PHASE="${1:?emit|run}"
 CKPT="${GEMMA31B:-/home/lava/.cache/huggingface/hub/models--google--gemma-4-31B-it/snapshots/842da3794eaa0b77d5f08bae87a17459d91ff475}"
 AB="${AB:-/home/lava/models/walkab}"
 PLOWC="${PLOWC:-$WT/target/release/plowc}"
 PLOWRT="${PLOWRT:-$WT/target/release/plowrt}"
+NIX="${PLOW_NIX_BIN:-nix}"
+LEASE="${PLOW_GPULEASE_BIN:-$WT/perf-data/tools/gpulease}"
+WARMUP_STEPS="${WARMUP_STEPS:-4}"
+MEASURED_STEPS="${MEASURED_STEPS:-65}"
 # Two DIFFERENT prompts, so the same-prompt cross-check has something to compare.
 PROMPT="${PROMPT:-2,1596,563,573,6996,529,9822,235336;2,4029,603,573,6221,576,4557,235336}"
 
@@ -64,16 +68,34 @@ PY
 )"
 }
 
-run_one() { # <tag> <objdir>
-  local tag=$1 obj=$2
+run_one() { # <tag> <objdir> <compiled-width>
+  local tag=$1 obj=$2 batch=$3 rows report log
   echo "############ $tag  (objects $obj)"
   # UNDER `nix develop`: plowrt is nix-linked, and outside the shell its ELF interpreter is a
   # missing /nix/store glibc — which reports as "No such file or directory" on a file that is
   # plainly there (the design notes §0a). Running under the lease is fine; only COMPILING
   # under it is forbidden.
-  nix develop -c "$PLOWRT" amd-bench --blob "$AB/$tag/model.pkt" --hsaco "$obj" \
-      --checkpoint "$CKPT" --prompt "$PROMPT" --steps 65 --batched 2>&1 \
-    | grep -E "slots agree|slot [0-9]+ and|tpot|aggregate|batched decode|MISMATCH|rror|refus|Error"
+  rows="$AB/$tag/prompt_rows.txt"
+  report="$AB/$tag/walk_b16_bench.json"
+  log="$AB/$tag/walk_b16_bench.log"
+  python3 - "$PROMPT" "$batch" "$rows" <<'PY'
+import sys
+prompts = sys.argv[1].split(";")
+if len(prompts) != 2 or any(not row for row in prompts):
+    raise SystemExit("walk A/B requires exactly two nonempty prompt rows")
+with open(sys.argv[3], "w") as output:
+    for i in range(int(sys.argv[2])):
+        output.write(prompts[i % 2] + "\n")
+PY
+  "$NIX" develop "$WT" --command "$PLOWRT" --rt-checkpoint "$CKPT" --rt-hsaco "$obj" \
+    --multistep 1 bench --assets "$AB/$tag" --prompt-rows "$rows" \
+    --concurrency "$batch" --requests "$batch" --warmup-requests 0 \
+    --output-len "$((WARMUP_STEPS + MEASURED_STEPS + 1))" \
+    --max-hold-ms 8 --slo-ms 60000 --token-audit --engine-diagnostics \
+    >"$report" 2>"$log" || { cat "$log" >&2; return 1; }
+  python3 "$WT/scripts/walk_b16_validate.py" --report "$report" --assets "$AB/$tag" \
+    --objects "$obj" --checkpoint "$CKPT" --prompts "$rows" --batch "$batch" \
+    --warmup "$WARMUP_STEPS" --measured "$MEASURED_STEPS"
   echo
 }
 
@@ -84,10 +106,13 @@ case "$PHASE" in
     emit_one b16walk 16 8   1
     ;;
   run)
-    unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
-    run_one b8ctl   /home/lava/plow/build-amd/walk-ctl-b8
-    run_one b16ctl  /home/lava/plow/build-amd/walk-ctl-b16
-    run_one b16walk /home/lava/plow/build-amd/walk-mm8-b16
+    if [[ -z "${PLOW_WALK_B16_LEASED:-}" ]]; then
+      unset HIP_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+      exec env PLOW_WALK_B16_LEASED=1 "$LEASE" -n 1 walk-b16 "$0" "$@"
+    fi
+    run_one b8ctl   "${WALK_B8_HSACO:-/home/lava/plow/build-amd/walk-ctl-b8}" 8
+    run_one b16ctl  "${WALK_B16_HSACO:-/home/lava/plow/build-amd/walk-ctl-b16}" 16
+    run_one b16walk "${WALK_B16_WALK_HSACO:-/home/lava/plow/build-amd/walk-mm8-b16}" 16
     ;;
   *) echo "usage: $0 emit|run" >&2; exit 2;;
 esac

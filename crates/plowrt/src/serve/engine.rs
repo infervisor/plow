@@ -1243,34 +1243,43 @@ mod amd_serve {
                     tracing::info!(rung = width, occupied = rows, "decode ladder rung");
                     self.last_rung = width;
                 }
-                if let Some(diagnostics) = self.diagnostics.as_mut() {
-                    diagnostics.push_decode(DecodeSelection {
-                        occupied_rows: rows,
-                        bucket: width,
-                        steps: quantum,
-                    });
-                }
                 stage_parked(&mut self.parked_stage, &advance);
                 g.upload_parked(&self.parked_stage)?;
                 g.seed_ids(&self.next_id)?;
 
-                for step in 0..quantum {
-                    for slot in 0..self.batch {
-                        let (pos, kvlen) = match (&self.pf[slot], self.live[slot]) {
-                            (Some(cursor), _) => (cursor.frontier, cursor.frontier + 1),
-                            (None, true) => (self.pos[slot], self.pos[slot] + 1),
-                            (None, false) => (0, 1),
-                        };
-                        self.pos_stage[slot] = pos;
-                        self.kvlen_stage[slot] = kvlen;
+                let started = self.diagnostics.is_some().then(std::time::Instant::now);
+                let dispatch = (|| {
+                    for step in 0..quantum {
+                        for slot in 0..self.batch {
+                            let (pos, kvlen) = match (&self.pf[slot], self.live[slot]) {
+                                (Some(cursor), _) => (cursor.frontier, cursor.frontier + 1),
+                                (None, true) => (self.pos[slot], self.pos[slot] + 1),
+                                (None, false) => (0, 1),
+                            };
+                            self.pos_stage[slot] = pos;
+                            self.kvlen_stage[slot] = kvlen;
+                        }
+                        g.submit_decode_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
+                        g.complete_decode_batched_deferred(self.batch, step, quantum)?;
+                        for &slot in &advance {
+                            self.pos[slot] += 1;
+                        }
                     }
-                    g.submit_decode_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
-                    g.complete_decode_batched_deferred(self.batch, step, quantum)?;
-                    for &slot in &advance {
-                        self.pos[slot] += 1;
-                    }
+                    g.read_deferred_tokens(width as usize, quantum, out)
+                })();
+                if let Some(started) = started {
+                    self.diagnostics
+                        .as_mut()
+                        .expect("diagnostic timer requires diagnostics")
+                        .push_decode(DecodeSelection {
+                            occupied_rows: rows,
+                            bucket: width,
+                            elapsed_ns: u64::try_from(started.elapsed().as_nanos())
+                                .unwrap_or(u64::MAX),
+                            steps: quantum,
+                        });
                 }
-                g.read_deferred_tokens(width as usize, quantum, out)
+                dispatch
             })();
             self.advance_stage = advance;
             result?;
@@ -1380,13 +1389,23 @@ mod amd_serve {
         fn dispatch_all(&mut self, advance: &[usize]) -> Result<Vec<u32>> {
             if self.batch == 1 {
                 let pos = self.pos[0];
+                let measure_dispatch = self.diagnostics.is_some();
                 use crate::obs::dstep;
-                let (token, program, rung) = match &mut self.ranks {
+                let (token, program, rung, elapsed_ns) = match &mut self.ranks {
                     Ranks::One(e) => {
                         let program = e.decode_prog();
                         let rung = e.prog_t(program);
                         dstep::timed(&dstep::SEED, || e.seed_ids(&self.next_id))?;
-                        (e.decode_step(pos, pos + 1)?, program, rung)
+                        let started = measure_dispatch.then(std::time::Instant::now);
+                        let token = e.decode_step(pos, pos + 1)?;
+                        (
+                            token,
+                            program,
+                            rung,
+                            started.map(|started| {
+                                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                            }),
+                        )
                     }
                     // The split pair, not `decode_step`, because this is the
                     // server and the split exists for it. NOTHING sits between
@@ -1399,15 +1418,30 @@ mod amd_serve {
                         let program = g.rank(0).decode_prog();
                         let rung = g.rank(0).prog_t(program);
                         dstep::timed(&dstep::SEED, || g.seed_ids(&self.next_id))?;
+                        let started = measure_dispatch.then(std::time::Instant::now);
                         g.submit_decode(pos, pos + 1)?;
                         let ids = g.complete_decode()?;
                         (
                             dstep::timed(&dstep::AGREE, || AmdTpGroup::agree(&ids))?,
                             program,
                             rung,
+                            started.map(|started| {
+                                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                            }),
                         )
                     }
                 };
+                if let Some(elapsed_ns) = elapsed_ns {
+                    self.diagnostics
+                        .as_mut()
+                        .expect("diagnostic timer requires diagnostics")
+                        .push_decode(DecodeSelection {
+                            occupied_rows: 1,
+                            bucket: rung,
+                            elapsed_ns,
+                            steps: 1,
+                        });
+                }
                 self.capture_decode_snapshots(program, rung)?;
                 for &s in advance {
                     self.pos[s] += 1;
@@ -1471,7 +1505,8 @@ mod amd_serve {
                      {rows} rows — the slot table and the live set disagree"
                 )));
             }
-            let (out, program, rung) = match &mut self.ranks {
+            let measure_dispatch = self.diagnostics.is_some();
+            let (out, program, rung, elapsed_ns) = match &mut self.ranks {
                 Ranks::One(e) => {
                     let dp = e.decode_prog_for(rows);
                     let w = e.prog_t(dp);
@@ -1479,19 +1514,17 @@ mod amd_serve {
                         tracing::info!(rung = w, occupied = rows, "decode ladder rung");
                         self.last_rung = w;
                     }
-                    if let Some(diagnostics) = self.diagnostics.as_mut() {
-                        diagnostics.push_decode(DecodeSelection {
-                            occupied_rows: rows,
-                            bucket: w,
-                            steps: 1,
-                        });
-                    }
                     e.upload_parked(&self.parked_stage)?;
                     e.seed_ids(&self.next_id)?;
+                    let started = measure_dispatch.then(std::time::Instant::now);
+                    let out = e.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
                     (
-                        e.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?,
+                        out,
                         dp,
                         w,
+                        started.map(|started| {
+                            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                        }),
                     )
                 }
                 Ranks::Tp(g) => {
@@ -1500,13 +1533,6 @@ mod amd_serve {
                     if w != self.last_rung {
                         tracing::info!(rung = w, occupied = rows, "decode ladder rung");
                         self.last_rung = w;
-                    }
-                    if let Some(diagnostics) = self.diagnostics.as_mut() {
-                        diagnostics.push_decode(DecodeSelection {
-                            occupied_rows: rows,
-                            bucket: w,
-                            steps: 1,
-                        });
                     }
                     tracing::debug!(
                         rung = w,
@@ -1518,13 +1544,29 @@ mod amd_serve {
                     );
                     g.upload_parked(&self.parked_stage)?;
                     g.seed_ids(&self.next_id)?;
+                    let started = measure_dispatch.then(std::time::Instant::now);
+                    let out = g.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?;
                     (
-                        g.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?,
+                        out,
                         dp,
                         w,
+                        started.map(|started| {
+                            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+                        }),
                     )
                 }
             };
+            if let Some(elapsed_ns) = elapsed_ns {
+                self.diagnostics
+                    .as_mut()
+                    .expect("diagnostic timer requires diagnostics")
+                    .push_decode(DecodeSelection {
+                        occupied_rows: rows,
+                        bucket: rung,
+                        elapsed_ns,
+                        steps: 1,
+                    });
+            }
             self.capture_decode_snapshots(program, rung)?;
             for &s in advance {
                 self.pos[s] += 1;

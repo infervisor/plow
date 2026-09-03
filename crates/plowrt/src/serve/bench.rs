@@ -138,6 +138,9 @@ pub struct PrefillSelection {
 pub struct DecodeSelection {
     pub occupied_rows: usize,
     pub bucket: u32,
+    /// Wall time of the exact engine decode call represented by this entry.
+    /// For `steps > 1`, this is the whole deferred-read quantum, not a per-step mean.
+    pub elapsed_ns: u64,
     pub steps: usize,
 }
 
@@ -1417,6 +1420,7 @@ mod tests {
         diagnostics.push_decode(DecodeSelection {
             occupied_rows: 3,
             bucket: 4,
+            elapsed_ns: 123_456,
             steps: 8,
         });
         assert_eq!(diagnostics.prefill_selections, [a, b]);
@@ -1425,9 +1429,13 @@ mod tests {
             [DecodeSelection {
                 occupied_rows: 3,
                 bucket: 4,
+                elapsed_ns: 123_456,
                 steps: 8,
             }]
         );
+        let json = serde_json::to_value(&diagnostics.decode_selections[0]).unwrap();
+        assert_eq!(json["elapsed_ns"], 123_456);
+        assert_eq!(json["steps"], 8);
         assert!(diagnostics.complete);
     }
 
@@ -1440,6 +1448,7 @@ mod tests {
             diagnostics.push_decode(DecodeSelection {
                 occupied_rows: 1,
                 bucket: 1,
+                elapsed_ns: 1,
                 steps: 1,
             });
         }

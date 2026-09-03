@@ -12,7 +12,6 @@ declare -A legacy_performance=(
   [scripts/glm52_linfp8_stacked_run.sh]=1
   [scripts/k3_block_sweep.sh]=1
   [scripts/sweep_batch_ceiling.sh]=1
-  [scripts/walk_b16_ab.sh]=1
 )
 declare -A migrated_batch_gates=(
   [scripts/gate_batched.sh]=1
@@ -21,6 +20,9 @@ declare -A migrated_batch_gates=(
 declare -A migrated_tp_gates=(
   [scripts/glm52_linfp8_stacked_coherence.sh]=1
   [scripts/k3_tp_equivalence.sh]=1
+)
+declare -A migrated_device_ceiling=(
+  [scripts/walk_b16_ab.sh]=1
 )
 while IFS=$'\t' read -r class path binding disposition; do
   [[ -z "$class" || "$class" == \#* ]] && continue
@@ -82,6 +84,19 @@ for path in "${!classified[@]}"; do
   }
 done
 
+for path in "${!migrated_device_ceiling[@]}"; do
+  for flag in bench --prompt-rows --token-audit --engine-diagnostics --multistep; do
+    rg -q -- "$flag" "$ROOT/$path" || {
+      echo "FAIL: migrated device-ceiling gate lost '$flag': $path" >&2
+      exit 1
+    }
+  done
+  awk '$0 !~ /^[[:space:]]*#/ && /amd-bench/ { found=1 } END { exit found }' "$ROOT/$path" || {
+    echo "FAIL: migrated device-ceiling gate regressed to amd-bench: $path" >&2
+    exit 1
+  }
+done
+
 for path in "${!legacy_performance[@]}"; do
   [[ "${classified[$path]-}" == performance ]] || {
     echo "FAIL: frozen legacy performance entry is absent or reclassified: $path" >&2
@@ -118,5 +133,6 @@ done
 "$ROOT/scripts/batch_gates_selftest.sh"
 "$ROOT/scripts/glm52_linfp8_stacked_coherence_selftest.sh"
 "$ROOT/scripts/k3_tp_equivalence_selftest.sh"
+"$ROOT/scripts/walk_b16_selftest.sh"
 
 echo "PASS: ${#observed[@]} active AMD direct-runner script consumers are classified"
