@@ -546,6 +546,15 @@ then pass block/TP8 gates before promotion.
   FP8 helps decode 10.5%, not prefill. Adding the shuffled stage-2 route to FP8 then reaches
   2204.33 ms TTFT / 49.40 ms TPOT / 19.41 output tok/s (3/3 requests), the fastest current
   ceiling but still 3.88x/2.37x/2.41x behind vLLM TTFT/TPOT/output throughput.
+- A raw trace of that exact FP8+stage-2 ceiling covers 2,965 packets and 724,093
+  workgroup-packet records. Its 2,017.20 ms chain is 1,892.15 ms kernel body, only 6.74 ms
+  dependency gate, and 118.31 ms residual. The dominant bodies are grouped-MoE stage 1
+  (354.91 ms), XReduce plus XReduce2 (424.18 ms), chunk KDA (461.02 ms: carry 281.43,
+  intra 123.05, remaining stages 56.54), MLA flash plus merge (198.16 ms), and dense GEMMs
+  (236.66 ms). Empty-packet/counter tuning is therefore below the kernel and collective work.
+  The selected prefill mega-object is also resource-bound at 256 VGPR and 1,316 bytes of
+  private segment per thread; pure KDA segments need a separately gated object before further
+  body tuning can be interpreted cleanly.
 - Segmented TP synchronization previously polled the AQL read index, which proves packet
   consumption but not kernel completion. PlowRT now drains the existing shared dispatch
   completion counter before advancing ranks/segments. This removes the >2-minute stage-2 stall;
