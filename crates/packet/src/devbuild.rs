@@ -2416,6 +2416,28 @@ pub fn xargmax_value_lines(n_batch: u32) -> Option<u32> {
 /// objects handle widths above their 16-row compile-time bucket.
 pub const DECODE_RUNG_MAX: u32 = 128;
 
+/// [`BlobProgHeader::t`] bit marking a prefill program as a packed-dispatch-only
+/// topology. The low bits remain the compiled row count, preserving the fixed
+/// wire layout while allowing an ordinary and segmented program for one rung.
+pub const PACKED_PREFILL_PROG: u32 = 1 << 31;
+
+pub fn program_rows(t: u32) -> u32 {
+    t & !PACKED_PREFILL_PROG
+}
+
+pub fn is_packed_prefill_program(t: u32) -> bool {
+    t & PACKED_PREFILL_PROG != 0
+}
+
+pub fn packed_prefill_program_t(rows: u32) -> u32 {
+    assert_eq!(
+        rows & PACKED_PREFILL_PROG,
+        0,
+        "program row count exceeds 31 bits"
+    );
+    rows | PACKED_PREFILL_PROG
+}
+
 /// Index of the FIRST decode program in `prog_t`, i.e. the start of the decode
 /// rung ladder. Everything before it is a prefill bucket.
 ///
@@ -4486,6 +4508,22 @@ mod v6_tests {
         // trailing ladder because the scan is strict.
         assert_eq!(decode_rung_lo(&[128, 512, 1, 16, 32, 64, 128]), 2);
         assert_eq!(decode_rung_lo(&[128, 128]), 1);
+        // A packed-only copy of each prefill rung sits between the ordinary
+        // ladder and decode. Its tag cannot be mistaken for a decode width.
+        assert_eq!(
+            decode_rung_lo(&[
+                128,
+                1024,
+                packed_prefill_program_t(128),
+                packed_prefill_program_t(1024),
+                1,
+                4,
+                8,
+            ]),
+            4
+        );
+        assert_eq!(program_rows(packed_prefill_program_t(1024)), 1024);
+        assert!(is_packed_prefill_program(packed_prefill_program_t(1024)));
     }
 
     #[test]

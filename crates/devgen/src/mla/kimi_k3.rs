@@ -1239,7 +1239,9 @@ fn k3_build_model(
     decode_build_order.extend_from_slice(&rungs[..rungs.len() - 1]);
 
     let mut decode = Vec::with_capacity(rungs.len());
-    let mut prefill = Vec::with_capacity(pf.len());
+    let packed_prefill_topology = crate::emit_is_amd()
+        && std::env::var("PLOW_SEG_PACKED_PREFILL").ok().as_deref() == Some("1");
+    let mut prefill = Vec::with_capacity(pf.len() * (1 + usize::from(packed_prefill_topology)));
     for (i, &t) in decode_build_order.iter().enumerate() {
         let fallback_ns = k3_nsplit_fallback(ctx);
         let local_heads = c.heads / tp.max(1);
@@ -1296,57 +1298,76 @@ fn k3_build_model(
         tensors = prog.tensors.clone();
         decode.push((t, prog));
     }
+    let build_prefill =
+        |t: u32, packed_segments: bool, tensors: Vec<packet::devbuild::TensorDecl>| {
+            let mut b = Builder::new(n_cu);
+            b.set_fuse_materialized_residual_inputs(emit_config::active().fuse_residual_input);
+            b.set_tensor_dedup(true);
+            b.set_l2_placement(l2_layout);
+            b.set_lean_moe_stage2_segments(
+                crate::emit_is_amd() && emit_config::active().moe_stage2_lean,
+            );
+            b.set_lean_moe_stage1_segments(
+                crate::emit_is_amd() && emit_config::active().moe_stage1_lean,
+            );
+            b.set_lean_moe_combine_segments(
+                crate::emit_is_amd() && emit_config::active().moe_combine_lean,
+            );
+            b.set_lean_kda_intra_segments(
+                crate::emit_is_amd() && emit_config::active().kda_intra_cached,
+            );
+            b.set_lean_kda_key_factor_segments(
+                crate::emit_is_amd()
+                    && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                    && emit_config::active().kda_key_factor,
+            );
+            b.set_packed_prefill_segments(packed_segments);
+            if crate::emit_is_amd() {
+                b.deny_uniseg();
+            }
+            b.adopt_tensors(tensors);
+            crate::k3::emit_k3_model(
+                &mut b,
+                &mcfg,
+                &|l| matches!(c.attn[l as usize], K3Attn::Kda),
+                &layers,
+                ctx,
+                t,
+                scratch_rows,
+                sequence_slots,
+                n_cu,
+                crate::k3::RowKind::Tokens,
+            );
+            b.finish()
+        };
     for &t in pf {
-        let mut b = Builder::new(n_cu);
-        b.set_fuse_materialized_residual_inputs(emit_config::active().fuse_residual_input);
-        b.set_tensor_dedup(true);
-        b.set_l2_placement(l2_layout);
-        b.set_lean_moe_stage2_segments(
-            crate::emit_is_amd() && emit_config::active().moe_stage2_lean,
-        );
-        b.set_lean_moe_stage1_segments(
-            crate::emit_is_amd() && emit_config::active().moe_stage1_lean,
-        );
-        b.set_lean_moe_combine_segments(
-            crate::emit_is_amd() && emit_config::active().moe_combine_lean,
-        );
-        b.set_lean_kda_intra_segments(
-            crate::emit_is_amd() && emit_config::active().kda_intra_cached,
-        );
-        b.set_lean_kda_key_factor_segments(
-            crate::emit_is_amd()
-                && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
-                && emit_config::active().kda_key_factor,
-        );
-        b.set_packed_prefill_segments(
-            std::env::var("PLOW_SEG_PACKED_PREFILL").ok().as_deref() == Some("1"),
-        );
-        if crate::emit_is_amd() {
-            b.deny_uniseg();
-        }
-        b.adopt_tensors(tensors.clone());
-        crate::k3::emit_k3_model(
-            &mut b,
-            &mcfg,
-            &|l| matches!(c.attn[l as usize], K3Attn::Kda),
-            &layers,
-            ctx,
-            t,
-            scratch_rows,
-            sequence_slots,
-            n_cu,
-            crate::k3::RowKind::Tokens,
-        );
-        let prog = b.finish();
+        let prog = build_prefill(t, false, tensors.clone());
         tensors = prog.tensors.clone();
         prefill.push(prog);
+    }
+    if packed_prefill_topology {
+        for &t in pf {
+            prefill.push(build_prefill(t, true, tensors.clone()));
+        }
     }
     decode.sort_unstable_by_key(|(t, _)| *t);
     built.extend(prefill);
     built.extend(decode.into_iter().map(|(_, p)| p));
     // Prefill buckets first, then trailing ascending decode rungs. `decode_rung_lo` and the
     // runtime both derive the split from this ordering.
-    let prog_t: Vec<u32> = pf.iter().copied().chain(rungs.iter().copied()).collect();
+    let prog_t: Vec<u32> = pf
+        .iter()
+        .copied()
+        .chain(
+            packed_prefill_topology
+                .then_some(pf)
+                .into_iter()
+                .flatten()
+                .copied()
+                .map(packet::devbuild::packed_prefill_program_t),
+        )
+        .chain(rungs.iter().copied())
+        .collect();
 
     Model {
         n_cu,
@@ -2032,10 +2053,20 @@ mod kimi_k3_tests {
         };
         let m = k3_build_model(&d, 4096, 256, 2, &[128], Some(l2));
 
-        assert_eq!(m.prog_t, [128, 1, 4, 8]);
-        assert_eq!(m.progs[0].l2_domains, 0);
-        assert!(m.progs[0].gq_seg_ofs.len() > 2);
-        for p in &m.progs[1..] {
+        assert_eq!(
+            m.prog_t,
+            [
+                128,
+                packet::devbuild::packed_prefill_program_t(128),
+                1,
+                4,
+                8
+            ]
+        );
+        assert_eq!(m.progs[0].l2_domains, 8);
+        assert_eq!(m.progs[1].l2_domains, 8);
+        assert!(m.progs[1].gq_seg_ofs.len() > m.progs[0].gq_seg_ofs.len());
+        for p in &m.progs[2..] {
             assert_eq!(p.l2_domains, 8);
             assert_eq!(p.gq_seg_ofs.len(), 9);
         }

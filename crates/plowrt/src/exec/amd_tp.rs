@@ -1461,12 +1461,24 @@ impl AmdTpGroup {
                 "packed prefill spans do not share one compiled program".into(),
             ));
         }
-        let prog = first.program as usize;
-        let rung = self.prefill_prog_t(prog).ok_or_else(|| {
+        let requested_prog = first.program as usize;
+        let rung = self.prefill_prog_t(requested_prog).ok_or_else(|| {
             RuntimeError::Device(format!(
-                "packed prefill program {prog} is absent or differs across ranks"
+                "packed prefill program {requested_prog} is absent or differs across ranks"
             ))
         })?;
+        let prog = self.ranks[0]
+            .packed_prefill_prog_for(requested_prog)
+            .filter(|&candidate| {
+                self.ranks
+                    .iter()
+                    .all(|rank| rank.packed_prefill_prog_for(requested_prog) == Some(candidate))
+            })
+            .ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "packed prefill program {requested_prog} has no common packed topology"
+                ))
+            })?;
         if parked.len() != rung as usize {
             return Err(RuntimeError::Device(format!(
                 "packed prefill parked mask has {} rows for rung {rung}",
@@ -1474,9 +1486,13 @@ impl AmdTpGroup {
             )));
         }
 
+        let mut routed_spans = spans.to_vec();
+        for span in &mut routed_spans {
+            span.program = prog as u32;
+        }
         for e in &mut self.ranks {
             let t = std::time::Instant::now();
-            e.packed_prefill_prepare(prog, spans, prompt_slices, parked)?;
+            e.packed_prefill_prepare(prog, &routed_spans, prompt_slices, parked)?;
             ttft::PF_PREPARE.add(t.elapsed().as_nanos() as u64);
             let t = std::time::Instant::now();
             e.rearm_prog(prog)?;
@@ -1803,6 +1819,7 @@ mod tests {
         };
         let prog = |insts: Vec<DevInst64>| DevProg {
             t: 1,
+            packed_prefill_only: false,
             n_counter: 0,
             insts,
             stream: Vec::new(),

@@ -5502,6 +5502,7 @@ impl CounterBankState {
 /// One program's device-resident tables.
 struct AmdProg {
     t: u32,
+    packed_prefill_only: bool,
     packed_needs_mla: bool,
     packed_mla_compatible: bool,
     packed_mla_segmented: bool,
@@ -7951,6 +7952,7 @@ impl AmdEngine {
             };
             progs.push(AmdProg {
                 t: p.t,
+                packed_prefill_only: p.packed_prefill_only,
                 packed_needs_mla: p.insts.iter().any(|d| {
                     d.op == DevOp::RmsNorm as u16
                         || d.op == DevOp::HeadNormRope as u16
@@ -8584,10 +8586,32 @@ impl AmdEngine {
         Ok(program.t)
     }
 
+    /// Resolve an ordinary prefill rung to its packed-only sibling. Legacy
+    /// single-topology blobs continue to validate the requested program itself.
+    pub fn packed_prefill_prog_for(&self, prog: usize) -> Option<usize> {
+        let requested = self.progs.get(prog)?;
+        if prog >= self.dec_lo {
+            return None;
+        }
+        if requested.packed_prefill_only {
+            return self
+                .check_packed_prefill_program(prog)
+                .is_ok()
+                .then_some(prog);
+        }
+        self.progs[..self.dec_lo]
+            .iter()
+            .enumerate()
+            .find(|(_, candidate)| candidate.packed_prefill_only && candidate.t == requested.t)
+            .map(|(candidate, _)| candidate)
+            .or(Some(prog))
+            .filter(|&candidate| self.check_packed_prefill_program(candidate).is_ok())
+    }
+
     /// Whether this exact prefill program has the packet ABI and every operator-family object
     /// needed by the packed route.
     pub fn packed_prefill_prog_capable(&self, prog: usize) -> bool {
-        self.check_packed_prefill_program(prog).is_ok()
+        self.packed_prefill_prog_for(prog).is_some()
     }
 
     /// Validate and upload one ragged packed-prefill descriptor. The binding is program-exact:
@@ -10548,7 +10572,7 @@ impl AmdEngine {
 
     /// Compiled row count for a prefill program. Decode program indices are rejected.
     pub fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
-        (prog < self.dec_lo).then(|| self.progs[prog].t)
+        (prog < self.dec_lo && !self.progs[prog].packed_prefill_only).then(|| self.progs[prog].t)
     }
 
     /// The decode rung widths, ascending. One entry without a ladder.
@@ -10773,6 +10797,7 @@ mod tests {
         ];
         let prog = DevProg {
             t,
+            packed_prefill_only: false,
             n_counter: 0,
             insts: vec![pack, attention],
             stream,
@@ -10948,6 +10973,7 @@ mod tests {
         ];
         DevProg {
             t: 1,
+            packed_prefill_only: false,
             n_counter: 0,
             insts,
             stream: (0..3)
@@ -11427,6 +11453,7 @@ mod tests {
         assert_eq!(ops.len(), segs.len());
         DevProg {
             t: 2048,
+            packed_prefill_only: false,
             n_counter: 0,
             insts: ops
                 .iter()
@@ -12353,6 +12380,7 @@ mod tests {
                 .collect();
             DevProg {
                 t: 1,
+                packed_prefill_only: false,
                 n_counter: 0,
                 insts,
                 stream: Vec::new(),
@@ -12490,6 +12518,7 @@ mod tests {
             .collect();
         DevProg {
             t: m,
+            packed_prefill_only: false,
             n_counter: 0,
             insts,
             stream: Vec::new(),

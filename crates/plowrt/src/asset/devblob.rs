@@ -33,6 +33,8 @@ pub struct DevTensor {
 pub struct DevProg {
     /// The T this program was compiled for (decode = 1).
     pub t: u32,
+    /// This topology is selected only for a genuinely packed prefill dispatch.
+    pub packed_prefill_only: bool,
     pub n_counter: u32,
     pub insts: Vec<DevInst64>,
     pub stream: Vec<StreamEnt>,
@@ -256,7 +258,8 @@ impl DevBlob {
             let ph: BlobProgHeader = take::<BlobProgHeader>(buf, &mut off, 1, "prog header")?[0];
             let what = |s: &str| format!("prog {p} {s}");
             progs.push(DevProg {
-                t: ph.t,
+                t: packet::devbuild::program_rows(ph.t),
+                packed_prefill_only: packet::devbuild::is_packed_prefill_program(ph.t),
                 n_counter: ph.n_counter,
                 insts: take(buf, &mut off, ph.n_inst as usize, &what("insts"))?,
                 stream: take(buf, &mut off, ph.n_stream as usize, &what("stream"))?,
@@ -718,6 +721,7 @@ mod tests {
         };
         let prog = |t: u32, insts: Vec<DevInst64>| DevProg {
             t,
+            packed_prefill_only: false,
             n_counter: 0,
             insts,
             stream: Vec::new(),
@@ -1048,6 +1052,21 @@ mod tests {
         );
         assert_eq!(b.decode_rungs(), vec![1, 2, 4, 8, 16]);
         assert_eq!(b.decode_prog().unwrap().t, 16);
+    }
+
+    #[test]
+    fn packed_prefill_program_tag_is_normalized_but_retained_as_a_role() {
+        let mut m = tiny_model();
+        m.progs.insert(1, tiny_model().progs.pop().unwrap());
+        m.prog_t = vec![128, packet::devbuild::packed_prefill_program_t(128), 1];
+
+        let b = DevBlob::parse(&m.to_blob()).unwrap();
+        assert_eq!(b.decode_rung_lo(), 2);
+        assert_eq!(b.progs[0].t, 128);
+        assert!(!b.progs[0].packed_prefill_only);
+        assert_eq!(b.progs[1].t, 128);
+        assert!(b.progs[1].packed_prefill_only);
+        assert_eq!(b.decode_rungs(), vec![1]);
     }
 
     #[test]

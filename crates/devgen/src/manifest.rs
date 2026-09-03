@@ -141,6 +141,7 @@ fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
 #[derive(Clone, Debug)]
 pub struct ProgramArms {
     pub kind: &'static str,
+    pub packed_prefill_only: bool,
     /// Prefill chunk rows, or decode batch — the `T` the program was compiled for.
     pub t: u32,
     pub seg: Option<u32>,
@@ -159,10 +160,12 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
     let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
     for (pi, p) in m.progs.iter().enumerate() {
         let kind = if pi >= dec_lo { "decode" } else { "prefill" };
-        let t = m.prog_t.get(pi).copied().unwrap_or(0);
+        let encoded_t = m.prog_t.get(pi).copied().unwrap_or(0);
+        let t = packet::devbuild::program_rows(encoded_t);
         for (seg, arms) in segment_arms(p) {
             out.push(ProgramArms {
                 kind,
+                packed_prefill_only: packet::devbuild::is_packed_prefill_program(encoded_t),
                 t,
                 seg,
                 insts: arms.1,
@@ -311,9 +314,12 @@ fn shapes(m: &Model) -> Shapes {
     let dec_lo = packet::devbuild::decode_rung_lo(&m.prog_t);
     for (pi, p) in m.progs.iter().enumerate() {
         let decode = pi >= dec_lo;
-        if !decode {
-            s.prefill_buckets
-                .push(m.prog_t.get(pi).copied().unwrap_or(0));
+        if !decode
+            && !packet::devbuild::is_packed_prefill_program(m.prog_t.get(pi).copied().unwrap_or(0))
+        {
+            s.prefill_buckets.push(packet::devbuild::program_rows(
+                m.prog_t.get(pi).copied().unwrap_or(0),
+            ));
         }
         for inst in &p.insts {
             let Some(op) = op_of(inst.op) else { continue };
@@ -1007,7 +1013,12 @@ fn analysis(progs: &[ProgramArms]) -> Value {
     for p in progs {
         let others: BTreeSet<&Arm> = progs
             .iter()
-            .filter(|q| q.kind == p.kind && (q.t != p.t || q.seg != p.seg))
+            .filter(|q| {
+                q.kind == p.kind
+                    && (q.t != p.t
+                        || q.seg != p.seg
+                        || q.packed_prefill_only != p.packed_prefill_only)
+            })
             .flat_map(|q| q.arms.iter())
             .collect();
         let uniq: Vec<String> = p
@@ -1188,6 +1199,14 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         .map(|p| {
             let mut o = Map::new();
             o.insert("kind".into(), json!(p.kind));
+            o.insert(
+                "topology".into(),
+                json!(if p.packed_prefill_only {
+                    "packed"
+                } else {
+                    "ordinary"
+                }),
+            );
             // `bucket` for prefill (chunk rows), `batch` for decode — same field,
             // different meaning, so name it for what it is on each side.
             o.insert(
@@ -2007,6 +2026,7 @@ mod tests {
         };
         let segment = |op: &str| ProgramArms {
             kind: "prefill",
+            packed_prefill_only: false,
             t: 8192,
             seg: Some(1),
             arms: BTreeSet::from([arm(op)]),

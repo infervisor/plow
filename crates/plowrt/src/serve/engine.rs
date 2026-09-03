@@ -1104,9 +1104,9 @@ mod amd_serve {
         /// Final chunks remain isolated because the current model prefill head exposes one
         /// sampled token, not one result per span. Snapshot boundaries remain isolated too.
         pub fn advance_packed_prefill(&mut self, members: &[(usize, &[u32])]) -> Result<()> {
-            if members.is_empty() {
+            if members.len() < 2 {
                 return Err(RuntimeError::Rejected(
-                    "packed prefill requires at least one cursor".into(),
+                    "packed prefill requires at least two cursors".into(),
                 ));
             }
             if !matches!(self.ranks, Ranks::Tp(_)) {
