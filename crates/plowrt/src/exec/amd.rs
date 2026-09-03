@@ -5441,6 +5441,23 @@ fn packed_segment_route(
     Ok(route)
 }
 
+fn packed_prefill_topology_index(
+    requested: usize,
+    dec_lo: usize,
+    mut role: impl FnMut(usize) -> Option<(u32, bool)>,
+) -> Option<usize> {
+    if requested >= dec_lo {
+        return None;
+    }
+    let (rows, packed_only) = role(requested)?;
+    if packed_only {
+        return Some(requested);
+    }
+    (0..dec_lo)
+        .find(|&candidate| role(candidate) == Some((rows, true)))
+        .or(Some(requested))
+}
+
 /// Per-program local counter-bank state.
 ///
 /// TP keeps `current` on the bank used by the last dispatch so diagnostic
@@ -8589,23 +8606,12 @@ impl AmdEngine {
     /// Resolve an ordinary prefill rung to its packed-only sibling. Legacy
     /// single-topology blobs continue to validate the requested program itself.
     pub fn packed_prefill_prog_for(&self, prog: usize) -> Option<usize> {
-        let requested = self.progs.get(prog)?;
-        if prog >= self.dec_lo {
-            return None;
-        }
-        if requested.packed_prefill_only {
-            return self
-                .check_packed_prefill_program(prog)
-                .is_ok()
-                .then_some(prog);
-        }
-        self.progs[..self.dec_lo]
-            .iter()
-            .enumerate()
-            .find(|(_, candidate)| candidate.packed_prefill_only && candidate.t == requested.t)
-            .map(|(candidate, _)| candidate)
-            .or(Some(prog))
-            .filter(|&candidate| self.check_packed_prefill_program(candidate).is_ok())
+        packed_prefill_topology_index(prog, self.dec_lo, |candidate| {
+            self.progs
+                .get(candidate)
+                .map(|p| (p.t, p.packed_prefill_only))
+        })
+        .filter(|&candidate| self.check_packed_prefill_program(candidate).is_ok())
     }
 
     /// Whether this exact prefill program has the packet ABI and every operator-family object
@@ -11244,6 +11250,29 @@ mod tests {
                 program: 2,
             },
         ]
+    }
+
+    #[test]
+    fn packed_dispatch_selects_tagged_sibling_without_changing_ordinary_rung() {
+        let roles = [
+            (128, false),
+            (512, false),
+            (128, true),
+            (512, true),
+            (1, false),
+        ];
+        let select =
+            |requested| packed_prefill_topology_index(requested, 4, |i| roles.get(i).copied());
+        assert_eq!(select(0), Some(2));
+        assert_eq!(select(1), Some(3));
+        assert_eq!(select(2), Some(2));
+        assert_eq!(select(4), None);
+
+        let legacy = [(128, false), (1, false)];
+        assert_eq!(
+            packed_prefill_topology_index(0, 1, |i| legacy.get(i).copied()),
+            Some(0)
+        );
     }
 
     #[test]
