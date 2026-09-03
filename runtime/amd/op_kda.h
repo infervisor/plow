@@ -568,6 +568,81 @@ __device__ void d_kda_chunk_carry_bt64(
     }
 }
 
+#if PLOW_PACKED_PREFILL_KDA_CONSUMERS
+__device__ void d_kda_chunk_prepare_packed_bt64(
+    bf16* q, bf16* k, float* g_prefix, float* beta, const bf16* g_raw,
+    const bf16* beta_raw, const float* A_log, const float* dt_bias, unsigned H, unsigned D,
+    unsigned mode, float lb, unsigned slice, unsigned nblk, const PlowProgram* prog) {
+    for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+        const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        const size_t rd = (size_t)span->row0 * H * D;
+        const size_t rh = (size_t)span->row0 * H;
+        d_kda_chunk_prepare_bt64(q + rd, k + rd, g_prefix + rd, beta + rh, g_raw + rd,
+                                 beta_raw + rh, A_log, dt_bias, nullptr,
+                                 (span->n_rows + 63u) / 64u, span->n_rows, H, D, mode, lb,
+                                 slice, nblk);
+    }
+}
+
+__device__ void d_kda_chunk_intra_packed_bt64(
+    float* Aqk, float* Ainv, const bf16* q, const bf16* k, const float* g_prefix,
+    const float* beta, unsigned H, unsigned D, float scale, unsigned slice, unsigned nblk,
+    float* mat, const PlowProgram* prog) {
+    for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+        const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        const size_t rd = (size_t)span->row0 * H * D;
+        const size_t rh = (size_t)span->row0 * H;
+        const size_t ra = (size_t)span->row0 * H * 64u;
+        d_kda_chunk_intra_bt64(Aqk + ra, Ainv + ra, q + rd, k + rd, g_prefix + rd,
+                               beta + rh, nullptr, (span->n_rows + 63u) / 64u,
+                               span->n_rows, H, D, scale, slice, nblk, mat);
+    }
+}
+
+__device__ void d_kda_chunk_wu_packed_bt64(
+    bf16* W, bf16* U, const float* Ainv, const bf16* k, const bf16* v,
+    const float* g_prefix, const float* beta, unsigned H, unsigned D, unsigned V,
+    unsigned slice, unsigned nblk, const PlowProgram* prog) {
+    for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+        const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        const size_t rd = (size_t)span->row0 * H * D;
+        const size_t rv = (size_t)span->row0 * H * V;
+        const size_t rh = (size_t)span->row0 * H;
+        const size_t ra = (size_t)span->row0 * H * 64u;
+        d_kda_chunk_wu_bt64(W + rd, U + rv, Ainv + ra, k + rd, v + rv, g_prefix + rd,
+                            beta + rh, nullptr, (span->n_rows + 63u) / 64u,
+                            span->n_rows, H, D, V, slice, nblk);
+    }
+}
+
+__device__ void d_kda_chunk_carry_packed_bt64(
+    bf16* out, float* state, const bf16* q, const bf16* k, const bf16* W,
+    const bf16* U, const float* Aqk, const float* g_prefix, unsigned H, unsigned D,
+    unsigned V, float scale, unsigned slice, unsigned nblk, float* st, bf16* vsm,
+    float* osm, const PlowProgram* prog) {
+    const unsigned vtiles = (V + 15u) / 16u;
+    for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+        const PlowPrefillSpan* span = plow_packed_prefill_span(prog, si);
+        float* ss = state + (size_t)span->state_slot * H * V * D;
+        if (span->flags & PLOW_PREFILL_SPAN_RESET_STATE) {
+            for (size_t item = slice; item < (size_t)H * vtiles; item += nblk) {
+                const unsigned vt = (unsigned)(item % vtiles);
+                const unsigned vv = min(16u, V - vt * 16u);
+                const size_t base = ((item / vtiles) * V + vt * 16u) * D;
+                for (unsigned x = threadIdx.x; x < vv * D; x += PLOW_THREADS) ss[base + x] = 0.0f;
+                __syncthreads();
+            }
+        }
+        const size_t rd = (size_t)span->row0 * H * D;
+        const size_t rv = (size_t)span->row0 * H * V;
+        const size_t ra = (size_t)span->row0 * H * 64u;
+        d_kda_chunk_carry_bt64(out + rv, ss, q + rd, k + rd, W + rd, U + rv, Aqk + ra,
+                               g_prefix + rd, nullptr, (span->n_rows + 63u) / 64u,
+                               span->n_rows, H, D, V, scale, slice, nblk, st, vsm, osm);
+    }
+}
+#endif
+
 /* -------------------------------------------------------------------------------------------
  * op 88 — KDA short conv.
  *

@@ -320,11 +320,23 @@ fn packed_prefill_segment_class(op: u16) -> Option<u8> {
     } else if op == DevOp::KdaStateStep as u16
         || op == DevOp::KdaConv3 as u16
         || op == DevOp::KdaStateStepG as u16
+        || op == DevOp::KdaChunkPrepare as u16
+        || op == DevOp::KdaChunkIntra as u16
+        || op == DevOp::KdaChunkWu as u16
+        || op == DevOp::KdaChunkCarry as u16
     {
         Some(7)
     } else {
         None
     }
+}
+
+fn packed_prefill_segmenting_needed(
+    uniseg: bool,
+    enabled: bool,
+    mut ops: impl Iterator<Item = u16>,
+) -> bool {
+    !uniseg && enabled && ops.any(|op| packed_prefill_segment_class(op).is_some())
 }
 
 impl Builder {
@@ -1150,12 +1162,11 @@ impl Builder {
         // Opt-in only: live packed serving remains disabled. Giving descriptor-consuming
         // families distinct classes lets a future runtime route them to lean objects without
         // putting their branches in the production megakernel. Unset preserves packet bytes.
-        let packed_prefill_segments = !uniseg
-            && std::env::var("PLOW_SEG_PACKED_PREFILL").ok().as_deref() == Some("1")
-            && self.ops.iter().any(|o| {
-                o.inst.op == DevOp::FlashMlaPrefill as u16
-                    || o.inst.op == DevOp::FlashMlaPrefillFp8 as u16
-            });
+        let packed_prefill_segments = packed_prefill_segmenting_needed(
+            uniseg,
+            std::env::var("PLOW_SEG_PACKED_PREFILL").ok().as_deref() == Some("1"),
+            self.ops.iter().map(|o| o.inst.op),
+        );
         // PLOW_SEG_PURE_GEMM=1 (T11): class-8 segments carry ONLY GEMM-family ops; every light
         // op (norms, rope, quant, embed, softcap) joins the flash class. The point: the sm_90a
         // segmented launcher runs class-8 segments on the lean `_pfgemm` object, and a pure-GEMM
@@ -2829,9 +2840,34 @@ mod seg_window_tests {
         );
         assert_eq!(
             packed_prefill_segment_class(DevOp::KdaChunkIntra as u16),
-            None
+            Some(7)
         );
         assert_eq!(packed_prefill_segment_class(DevOp::Gemv as u16), None);
+    }
+
+    #[test]
+    fn kda_only_program_can_enable_packed_prefill_segments() {
+        let ops = [DevOp::KdaChunkPrepare as u16, DevOp::Gemv as u16];
+        assert!(packed_prefill_segmenting_needed(
+            false,
+            true,
+            ops.into_iter()
+        ));
+        assert!(!packed_prefill_segmenting_needed(
+            true,
+            true,
+            ops.into_iter()
+        ));
+        assert!(!packed_prefill_segmenting_needed(
+            false,
+            false,
+            ops.into_iter()
+        ));
+        assert!(!packed_prefill_segmenting_needed(
+            false,
+            true,
+            [DevOp::Gemv as u16].into_iter()
+        ));
     }
 
     /// The number of segments a program's stream spans, derived the way every

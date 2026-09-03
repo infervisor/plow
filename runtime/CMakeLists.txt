@@ -938,6 +938,9 @@ if(PLOW_GFX950_HSACO)
     set(_hs_ax_packed_kda
         ${_hs_ax_prefill} -DPLOW_K3=1 -DPLOW_BUCKET_PACKED_KDA=1
         -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1)
+    if(PLOW_HSACO_KDA_CHUNK)
+        list(APPEND _hs_ax_packed_kda -DPLOW_KDA_CHUNK=1)
+    endif()
     set(_hs_ax_k3_moe_a4w4_fp8kv
         ${_hs_ax_k3_moe_fp8kv} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight}
         ${_hs_ax_k3_pf_state} -DPLOW_MXFP4=1)

@@ -871,6 +871,7 @@ const PACKED_PREFILL_ABI_SYM: &str = "plow_packed_prefill_abi_1";
 const PACKED_PREFILL_MLA_NORM_SEG_SYM: &str = "plow_packed_prefill_mla_norm_segments_1";
 const PACKED_PREFILL_MLA_FLASH_SEG_SYM: &str = "plow_packed_prefill_mla_flash_segments_1";
 const PACKED_PREFILL_KDA_SEG_SYM: &str = "plow_packed_prefill_kda_serial_segments_1";
+const PACKED_PREFILL_KDA_CHUNK_SEG_SYM: &str = "plow_packed_prefill_kda_chunk_segments_1";
 
 fn check_packed_prefill_abi(prefill: bool, flash_required: bool, flash: bool) -> Result<()> {
     if !prefill {
@@ -1602,6 +1603,10 @@ fn derive_packed_segment_families(prog: &DevProg) -> Result<Vec<u8>> {
         } else if op == DevOp::KdaStateStep as u16
             || op == DevOp::KdaConv3 as u16
             || op == DevOp::KdaStateStepG as u16
+            || op == DevOp::KdaChunkPrepare as u16
+            || op == DevOp::KdaChunkIntra as u16
+            || op == DevOp::KdaChunkWu as u16
+            || op == DevOp::KdaChunkCarry as u16
         {
             Some(7)
         } else {
@@ -1639,6 +1644,10 @@ fn packed_family_segments_cover(prog: &DevProg, families: &[u8], wanted: &[u8]) 
         } else if in_.op == DevOp::KdaStateStep as u16
             || in_.op == DevOp::KdaConv3 as u16
             || in_.op == DevOp::KdaStateStepG as u16
+            || in_.op == DevOp::KdaChunkPrepare as u16
+            || in_.op == DevOp::KdaChunkIntra as u16
+            || in_.op == DevOp::KdaChunkWu as u16
+            || in_.op == DevOp::KdaChunkCarry as u16
         {
             7
         } else {
@@ -1652,6 +1661,25 @@ fn packed_family_segments_cover(prog: &DevProg, families: &[u8], wanted: &[u8]) 
         }
     });
     seen && covered
+}
+
+fn packed_kda_compatible(prog: &DevProg) -> bool {
+    if prog.insts.iter().any(|d| {
+        matches!(
+            DevOp::from_u16(d.op),
+            Some(DevOp::KdaConv | DevOp::KdaConvStateStepG)
+        )
+    }) {
+        return false;
+    }
+    let count = |op| prog.insts.iter().filter(|d| d.op == op as u16).count();
+    let chunks = [
+        count(DevOp::KdaChunkPrepare),
+        count(DevOp::KdaChunkIntra),
+        count(DevOp::KdaChunkWu),
+        count(DevOp::KdaChunkCarry),
+    ];
+    chunks.iter().all(|&n| n == 0) || chunks.iter().all(|&n| n == chunks[0] && n != 0)
 }
 
 /// Rows-equivalent cost charged per launch in the chunk DP. Tuned in the
@@ -4607,12 +4635,12 @@ impl AmdEngine {
             None
         };
         let k_packed_kda = if packed_route {
-            load_packed_family(
-                "interp_packed_kda",
-                "plow_interp_packed_kda",
-                PACKED_PREFILL_KDA_SEG_SYM,
-                None,
-            )?
+            let marker = if need_kda_chunk_prefill.is_some() {
+                PACKED_PREFILL_KDA_CHUNK_SEG_SYM
+            } else {
+                PACKED_PREFILL_KDA_SEG_SYM
+            };
+            load_packed_family("interp_packed_kda", "plow_interp_packed_kda", marker, None)?
         } else {
             None
         };
@@ -5237,19 +5265,7 @@ impl AmdEngine {
                             )
                         )
                 }),
-                packed_kda_compatible: !p.insts.iter().any(|d| {
-                    matches!(
-                        DevOp::from_u16(d.op),
-                        Some(
-                            DevOp::KdaConv
-                                | DevOp::KdaChunkPrepare
-                                | DevOp::KdaChunkIntra
-                                | DevOp::KdaChunkWu
-                                | DevOp::KdaChunkCarry
-                                | DevOp::KdaConvStateStepG
-                        )
-                    )
-                }),
+                packed_kda_compatible: packed_kda_compatible(p),
                 packed_kda_segmented,
                 n_inst: p.insts.len() as u32,
                 trace_records: p.stream.len(),
@@ -5812,14 +5828,14 @@ impl AmdEngine {
         if self.progs[prog].packed_needs_kda {
             if !self.progs[prog].packed_kda_compatible {
                 return Err(RuntimeError::Device(
-                    "packed-prefill KDA supports serial Conv3/state only; chunk/double-buffered \
-                     KDA packets remain disabled"
+                    "packed-prefill KDA supports serial Conv3/state or complete BT64/BC16 chunk \
+                     operator groups; gathered or double-buffered layouts remain disabled"
                         .into(),
                 ));
             }
             if !self.progs[prog].packed_kda_segmented || self.k_packed_kda.is_none() {
                 return Err(RuntimeError::Device(
-                    "packed-prefill serial KDA requires pure family segments and \
+                    "packed-prefill KDA requires pure family segments and \
                      interp_packed_kda; re-emit with PLOW_SEG_PACKED_PREFILL=1 and build the \
                      optional family objects"
                         .into(),
@@ -7820,9 +7836,12 @@ mod tests {
                 DevOp::HeadNormRope,
                 DevOp::FlashMlaPrefill,
                 DevOp::KdaConv3,
-                DevOp::KdaStateStepG,
+                DevOp::KdaChunkPrepare,
+                DevOp::KdaChunkIntra,
+                DevOp::KdaChunkWu,
+                DevOp::KdaChunkCarry,
             ],
-            &[0, 0, 1, 2, 2],
+            &[0, 0, 1, 2, 2, 2, 2, 2],
         );
         assert_eq!(derive_packed_segment_families(&pure).unwrap(), [5, 6, 7]);
         assert_eq!(derive_segments_for(&pure, false).unwrap(), [8, 8, 8]);
@@ -7837,6 +7856,28 @@ mod tests {
         assert!(packed_family_segments_cover(&mixed, &[0, 7], &[7]));
         let none = segmented_prog(&[DevOp::Gemv], &[0]);
         assert!(!packed_family_segments_cover(&none, &[0], &[5, 6]));
+    }
+
+    #[test]
+    fn packed_chunk_kda_requires_a_complete_operator_group() {
+        let complete = segmented_prog(
+            &[
+                DevOp::KdaChunkPrepare,
+                DevOp::KdaChunkIntra,
+                DevOp::KdaChunkWu,
+                DevOp::KdaChunkCarry,
+            ],
+            &[0, 0, 0, 0],
+        );
+        assert!(packed_kda_compatible(&complete));
+
+        let partial = segmented_prog(&[DevOp::KdaChunkPrepare, DevOp::KdaChunkCarry], &[0, 0]);
+        assert!(!packed_kda_compatible(&partial));
+
+        let serial = segmented_prog(&[DevOp::KdaConv3, DevOp::KdaStateStepG], &[0, 0]);
+        assert!(packed_kda_compatible(&serial));
+        let double_buffered = segmented_prog(&[DevOp::KdaConvStateStepG], &[0]);
+        assert!(!packed_kda_compatible(&double_buffered));
     }
 
     #[test]

@@ -124,6 +124,48 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_carry(KArgs* a) 
         (const float*)a->gprefix, (const uint2*)a->chunks, a->n_chunks, a->T, a->H, a->D, a->V,
         a->scale, blockIdx.x, gridDim.x, st, vsm, osm);
 }
+static __device__ PlowProgram packed_prog(const KArgs* a) {
+    PlowProgram prog{};
+    prog.prefill_spans = (const PlowPrefillSpan*)a->spans;
+    prog.prefill_parked = (const uint32_t*)a->parked;
+    prog.n_prefill_spans = a->nspans;
+    prog.n_prefill_rows = a->nrows;
+    return prog;
+}
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_prepare_packed(KArgs* a) {
+    PlowProgram prog = packed_prog(a);
+    d_kda_chunk_prepare_packed_bt64(
+        (bf16*)a->q, (bf16*)a->k, (float*)a->gprefix, (float*)a->o,
+        (const bf16*)a->g_raw, (const bf16*)a->beta_raw, (const float*)a->a_log,
+        (const float*)a->dt_bias, a->H, a->D, a->gate_mode, a->lb, blockIdx.x, gridDim.x,
+        &prog);
+}
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_intra_packed(KArgs* a) {
+    __shared__ float mat[64 * 64];
+    PlowProgram prog = packed_prog(a);
+    d_kda_chunk_intra_packed_bt64(
+        (float*)a->aqk, (float*)a->ainv, (const bf16*)a->q, (const bf16*)a->k,
+        (const float*)a->gprefix, (const float*)a->o, a->H, a->D, a->scale, blockIdx.x,
+        gridDim.x, mat, &prog);
+}
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_wu_packed(KArgs* a) {
+    PlowProgram prog = packed_prog(a);
+    d_kda_chunk_wu_packed_bt64(
+        (bf16*)a->w, (bf16*)a->u, (const float*)a->ainv, (const bf16*)a->k,
+        (const bf16*)a->v, (const float*)a->gprefix, (const float*)a->o, a->H, a->D, a->V,
+        blockIdx.x, gridDim.x, &prog);
+}
+extern "C" __global__ __launch_bounds__(PLOW_THREADS, 2) void k_carry_packed(KArgs* a) {
+    __shared__ float st[16 * 128];
+    __shared__ bf16 vsm[64 * 16];
+    __shared__ float osm[64 * 16];
+    PlowProgram prog = packed_prog(a);
+    d_kda_chunk_carry_packed_bt64(
+        (bf16*)a->y, (float*)a->state, (const bf16*)a->q, (const bf16*)a->k,
+        (const bf16*)a->w, (const bf16*)a->u, (const float*)a->aqk,
+        (const float*)a->gprefix, a->H, a->D, a->V, a->scale, blockIdx.x, gridDim.x, st,
+        vsm, osm, &prog);
+}
 
 #else
 #include <hip/hip_runtime.h>
@@ -209,6 +251,7 @@ int main(int argc, char** argv) {
     printf("dev: %s\n", p.gcnArchName);
     hipModule_t M; HC(hipModuleLoad(&M, argc > 1 ? argv[1] : "/tmp/kda3.co"));
     hipFunction_t fstep, fstep_packed, fnorm, fprefix, fprepare, fintra, fintra_full, fwu, fcarry;
+    hipFunction_t fprepare_packed, fintra_packed, fwu_packed, fcarry_packed;
     HC(hipModuleGetFunction(&fstep, M, "k_step"));
     HC(hipModuleGetFunction(&fstep_packed, M, "k_step_packed"));
     HC(hipModuleGetFunction(&fnorm, M, "k_norm"));
@@ -218,6 +261,10 @@ int main(int argc, char** argv) {
     HC(hipModuleGetFunction(&fintra_full, M, "k_intra_full"));
     HC(hipModuleGetFunction(&fwu, M, "k_wu"));
     HC(hipModuleGetFunction(&fcarry, M, "k_carry"));
+    HC(hipModuleGetFunction(&fprepare_packed, M, "k_prepare_packed"));
+    HC(hipModuleGetFunction(&fintra_packed, M, "k_intra_packed"));
+    HC(hipModuleGetFunction(&fwu_packed, M, "k_wu_packed"));
+    HC(hipModuleGetFunction(&fcarry_packed, M, "k_carry_packed"));
 
     const unsigned H = 96, D = 128, GRID = 37;
     srand(1337);
@@ -755,6 +802,111 @@ int main(int argc, char** argv) {
         return fmax(fmax(srms / 1e-4, orms / 1e-2), untouched ? 0.0 : 2.0);
     };
 
+    auto run_packed_chunk = [&]() -> double {
+        const unsigned T = 85, ACTIVE = 82, PH = 2, PD = 128, NSLOT = 3;
+        const size_t row_elems = (size_t)PH * PD, state_elems = row_elems * PD;
+        std::vector<bf16> q(T * row_elems), k(q.size()), v(q.size()), graw(q.size());
+        std::vector<bf16> braw((size_t)T * PH);
+        std::vector<float> alog(PH), dtb(row_elems);
+        for (auto& x : q) x = f2b(((float)rand() / RAND_MAX - .5f) * 2.f);
+        for (auto& x : k) x = f2b(((float)rand() / RAND_MAX - .5f) * 2.f);
+        for (auto& x : v) x = f2b(((float)rand() / RAND_MAX - .5f) * 2.f);
+        for (auto& x : graw) x = f2b(((float)rand() / RAND_MAX - .5f) * 4.f);
+        for (auto& x : braw) x = f2b(((float)rand() / RAND_MAX - .5f) * 4.f);
+        for (auto& x : alog) x = logf(.5f + (float)rand() / RAND_MAX * 11.5f);
+        for (auto& x : dtb) x = -7.f + (float)rand() / RAND_MAX * 6.f;
+        std::vector<float> state0((size_t)NSLOT * state_elems);
+        for (size_t i = 0; i < state0.size(); ++i)
+            state0[i] = .125f + (float)(i % 97) / 211.f;
+        std::vector<PrefillSpan> spans{{0, 65, 2, 1, 0, 65, 2, 0},
+                                       {65, 17, 0, 0, 7, 24, 0, 0}};
+        std::vector<unsigned> parked(T, 1);
+        std::fill(parked.begin(), parked.begin() + ACTIVE, 0);
+        auto upload = [&](const void* src, size_t bytes) {
+            void* d = nullptr;
+            HC2(hipMalloc(&d, bytes));
+            HC2(hipMemcpy(d, src, bytes, hipMemcpyHostToDevice));
+            return d;
+        };
+        void* d_qs = upload(q.data(), q.size() * 2);
+        void* d_ks = upload(k.data(), k.size() * 2);
+        void* d_qc = upload(q.data(), q.size() * 2);
+        void* d_kc = upload(k.data(), k.size() * 2);
+        void* d_v = upload(v.data(), v.size() * 2);
+        void* d_graw = upload(graw.data(), graw.size() * 2);
+        void* d_braw = upload(braw.data(), braw.size() * 2);
+        void* d_alog = upload(alog.data(), alog.size() * 4);
+        void* d_dtb = upload(dtb.data(), dtb.size() * 4);
+        void* d_spans = upload(spans.data(), spans.size() * sizeof(PrefillSpan));
+        void* d_parked = upload(parked.data(), parked.size() * 4);
+        void* d_ss = upload(state0.data(), state0.size() * 4);
+        void* d_sc = upload(state0.data(), state0.size() * 4);
+        std::vector<bf16> out0((size_t)T * row_elems, f2b(7.f));
+        void* d_os = upload(out0.data(), out0.size() * 2);
+        void* d_oc = upload(out0.data(), out0.size() * 2);
+        std::vector<float> fscratch((size_t)T * PH * 64u, 19.f);
+        std::vector<float> gscratch(q.size(), 19.f), bscratch((size_t)T * PH, 19.f);
+        std::vector<bf16> bscratch16(q.size(), f2b(7.f));
+        void* d_gp = upload(gscratch.data(), gscratch.size() * 4);
+        void* d_beta = upload(bscratch.data(), bscratch.size() * 4);
+        void* d_aqk = upload(fscratch.data(), fscratch.size() * 4);
+        void* d_ainv = upload(fscratch.data(), fscratch.size() * 4);
+        void* d_w = upload(bscratch16.data(), bscratch16.size() * 2);
+        void* d_u = upload(bscratch16.data(), bscratch16.size() * 2);
+
+        KArgs as{};
+        as.o = (size_t)d_os; as.q = (size_t)d_qs; as.k = (size_t)d_ks; as.v = (size_t)d_v;
+        as.g_raw = (size_t)d_graw; as.beta_raw = (size_t)d_braw; as.a_log = (size_t)d_alog;
+        as.dt_bias = (size_t)d_dtb; as.state = (size_t)d_ss; as.spans = (size_t)d_spans;
+        as.parked = (size_t)d_parked; as.nspans = spans.size(); as.nrows = T;
+        as.H = PH; as.D = PD; as.BV = 8; as.flags = 1; as.gate_mode = 1; as.lb = -5.f;
+        as.scale = 1.f / sqrtf((float)PD);
+        KArgs ac = as;
+        ac.o = (size_t)d_beta; ac.y = (size_t)d_oc; ac.q = (size_t)d_qc; ac.k = (size_t)d_kc;
+        ac.state = (size_t)d_sc; ac.gprefix = (size_t)d_gp; ac.aqk = (size_t)d_aqk;
+        ac.ainv = (size_t)d_ainv; ac.w = (size_t)d_w; ac.u = (size_t)d_u; ac.V = PD;
+        void* d_as = upload(&as, sizeof as);
+        void* d_ac = upload(&ac, sizeof ac);
+        void* args_s[] = {&d_as};
+        void* args_c[] = {&d_ac};
+        HC2(hipModuleLaunchKernel(fstep_packed, GRID, 1, 1, 512, 1, 1, 0, 0, args_s, nullptr));
+        for (hipFunction_t fn : {fprepare_packed, fintra_packed, fwu_packed, fcarry_packed})
+            HC2(hipModuleLaunchKernel(fn, GRID, 1, 1, 512, 1, 1, 0, 0, args_c, nullptr));
+        HC2(hipDeviceSynchronize());
+
+        std::vector<bf16> os(out0.size()), oc(out0.size()), qc(q.size()), kc(k.size());
+        std::vector<float> ss(state0.size()), sc(state0.size()), gp(gscratch.size());
+        HC2(hipMemcpy(os.data(), d_os, os.size() * 2, hipMemcpyDeviceToHost));
+        HC2(hipMemcpy(oc.data(), d_oc, oc.size() * 2, hipMemcpyDeviceToHost));
+        HC2(hipMemcpy(ss.data(), d_ss, ss.size() * 4, hipMemcpyDeviceToHost));
+        HC2(hipMemcpy(sc.data(), d_sc, sc.size() * 4, hipMemcpyDeviceToHost));
+        HC2(hipMemcpy(qc.data(), d_qc, qc.size() * 2, hipMemcpyDeviceToHost));
+        HC2(hipMemcpy(kc.data(), d_kc, kc.size() * 2, hipMemcpyDeviceToHost));
+        HC2(hipMemcpy(gp.data(), d_gp, gp.size() * 4, hipMemcpyDeviceToHost));
+        double oe = 0, ow = 0, se = 0, sw = 0;
+        for (size_t i = 0; i < (size_t)ACTIVE * row_elems; ++i) {
+            const double d = b2f(oc[i]) - b2f(os[i]);
+            oe += d * d; ow += (double)b2f(os[i]) * b2f(os[i]);
+        }
+        for (size_t i = 0; i < sc.size(); ++i) {
+            const double d = sc[i] - ss[i];
+            se += d * d; sw += (double)ss[i] * ss[i];
+        }
+        bool untouched = true;
+        for (size_t i = state_elems; i < 2 * state_elems; ++i)
+            untouched &= sc[i] == state0[i];
+        for (size_t i = (size_t)ACTIVE * row_elems; i < out0.size(); ++i) {
+            untouched &= oc[i] == out0[i] && qc[i] == q[i] && kc[i] == k[i] && gp[i] == 19.f;
+        }
+        const double orms = sqrt(oe / (ow + 1e-30)), srms = sqrt(se / (sw + 1e-30));
+        printf("  packed chunk spans ragged+reset state %.3e output %.3e untouched=%s\n",
+               srms, orms, untouched ? "yes" : "NO");
+        for (void* d : {d_qs,d_ks,d_qc,d_kc,d_v,d_graw,d_braw,d_alog,d_dtb,d_spans,d_parked,
+                        d_ss,d_sc,d_os,d_oc,d_gp,d_beta,d_aqk,d_ainv,d_w,d_u,d_as,d_ac})
+            HC2(hipFree(d));
+        return fmax(fmax(srms / 5e-3, orms / 1e-2), untouched ? 0.0 : 2.0);
+    };
+
     auto run_mode = [&](const char* nm, unsigned T, unsigned BV, bool batched) -> double {
         const unsigned nstate = batched ? T : 1;
         std::vector<bf16> q(T * H * D), k(q.size()), v(q.size()), graw(q.size()), braw(T * H);
@@ -844,6 +996,7 @@ int main(int argc, char** argv) {
     worst = fmax(worst, run_mode("prefill (serial)", 5, 8, false));
     worst = fmax(worst, run_mode("batched decode", 3, 16, true));
     worst = fmax(worst, run_packed());
+    worst = fmax(worst, run_packed_chunk());
     printf("%s\n", worst < 1.0 ? "PASS" : "FAIL");
     return worst >= 1.0;
 }

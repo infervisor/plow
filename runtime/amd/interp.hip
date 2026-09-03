@@ -85,6 +85,9 @@ extern "C" __device__ unsigned plow_packed_prefill_mla_norm_segments_1 = 1;
 #error "packed KDA bucket requires PLOW_PACKED_PREFILL_KDA_CONSUMERS and PLOW_K3"
 #endif
 extern "C" __device__ unsigned plow_packed_prefill_kda_serial_segments_1 = 1;
+#if PLOW_KDA_CHUNK
+extern "C" __device__ unsigned plow_packed_prefill_kda_chunk_segments_1 = 1;
+#endif
 #endif
 #if defined(PLOW_BUCKET_FLASH) && PLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS && PLOW_MLA_PF_V2_ARM
 extern "C" __device__ unsigned plow_packed_prefill_mla_flash_segments_1 = 1;
@@ -2092,12 +2095,19 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if PLOW_K3
 #if PLOW_KDA_CHUNK
         case PLOW_DOP_KDA_CHUNK_PREPARE:
-#if PLOW_PACKED_PREFILL_ANY_CONSUMERS
-            if (plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
-#endif
             if (in->i[0] == 0u || in->i[1] == 0u ||
                 (in->i[2] != 64u && in->i[2] != 128u))
                 __builtin_trap();
+#if PLOW_PACKED_PREFILL_KDA_CONSUMERS
+            if (plow_packed_prefill_enabled(prog_meta)) {
+                d_kda_chunk_prepare_packed_bt64(
+                    (bf16*)TEN(0), (bf16*)TEN(1), (float*)TEN(2), (float*)TEN(3),
+                    (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
+                    (const float*)TEN(7), in->i[1], in->i[2], in->i[3], in->fj[0].f,
+                    slice, nblk, prog_meta);
+                break;
+            }
+#endif
             d_kda_chunk_prepare_bt64(
                 (bf16*)TEN(0), (bf16*)TEN(1), (float*)TEN(2), (float*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
@@ -2105,39 +2115,60 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 in->i[2], in->i[3], in->fj[0].f, slice, nblk);
             break;
         case PLOW_DOP_KDA_CHUNK_INTRA:
-#if PLOW_PACKED_PREFILL_ANY_CONSUMERS
-            if (plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
-#endif
             if (in->i[0] == 0u || in->i[1] == 0u ||
                 (in->i[2] != 64u && in->i[2] != 128u))
                 __builtin_trap();
+#if PLOW_PACKED_PREFILL_KDA_CONSUMERS
+            if (plow_packed_prefill_enabled(prog_meta)) {
+                d_kda_chunk_intra_packed_bt64(
+                    (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), (const float*)TEN(4), (const float*)TEN(5),
+                    in->i[1], in->i[2], in->fj[0].f, slice, nblk, (float*)sm->raw,
+                    prog_meta);
+                break;
+            }
+#endif
             d_kda_chunk_intra_bt64(
                 (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const float*)TEN(4), (const float*)TEN(5), nullptr, (in->i[0] + 63u) / 64u,
                 in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk, (float*)sm->raw);
             break;
         case PLOW_DOP_KDA_CHUNK_WU:
-#if PLOW_PACKED_PREFILL_ANY_CONSUMERS
-            if (plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
-#endif
             if (in->i[0] == 0u || in->i[1] == 0u ||
                 (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2])
                 __builtin_trap();
+#if PLOW_PACKED_PREFILL_KDA_CONSUMERS
+            if (plow_packed_prefill_enabled(prog_meta)) {
+                d_kda_chunk_wu_packed_bt64(
+                    (bf16*)TEN(0), (bf16*)TEN(1), (const float*)TEN(2),
+                    (const bf16*)TEN(3), (const bf16*)TEN(4), (const float*)TEN(5),
+                    (const float*)TEN(6), in->i[1], in->i[2], in->i[3], slice, nblk,
+                    prog_meta);
+                break;
+            }
+#endif
             d_kda_chunk_wu_bt64(
                 (bf16*)TEN(0), (bf16*)TEN(1), (const float*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6), nullptr,
                 (in->i[0] + 63u) / 64u, in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
             break;
         case PLOW_DOP_KDA_CHUNK_CARRY: {
-#if PLOW_PACKED_PREFILL_ANY_CONSUMERS
-            if (plow_packed_prefill_enabled(prog_meta)) __builtin_trap();
-#endif
             if (in->i[0] == 0u || in->i[1] == 0u ||
                 (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2])
                 __builtin_trap();
             float* kst = (float*)sm->raw;
             bf16* kv = (bf16*)(kst + 16u * in->i[2]);
             float* ko = (float*)(kv + 64u * 16u);
+#if PLOW_PACKED_PREFILL_KDA_CONSUMERS
+            if (plow_packed_prefill_enabled(prog_meta)) {
+                d_kda_chunk_carry_packed_bt64(
+                    (bf16*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
+                    (const float*)TEN(6), (const float*)TEN(7), in->i[1], in->i[2],
+                    in->i[3], in->fj[0].f, slice, nblk, kst, kv, ko, prog_meta);
+                break;
+            }
+#endif
             d_kda_chunk_carry_bt64(
                 (bf16*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
                 (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),

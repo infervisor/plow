@@ -104,7 +104,8 @@ grep -qE "FUNC .* $SYM\$" <<<"$SYMS" ||
 
 grep -qE "OBJECT .* plow_packed_prefill_abi_1\$" <<<"$SYMS" ||
     fail "$OUT does not advertise plow_packed_prefill_abi_1"
-PACKED_MLA=0; PACKED_MLA_NORM=0; PACKED_MLA_FLASH=0; PACKED_KDA=0; K3=0; MLA=0
+PACKED_MLA=0; PACKED_MLA_NORM=0; PACKED_MLA_FLASH=0; PACKED_KDA=0; KDA_CHUNK=0
+K3=0; MLA=0
 for arg in "$@"; do
     case "$arg" in
         -DPLOW_PACKED_PREFILL_CONSUMERS=1) PACKED_MLA=1; PACKED_KDA=1 ;;
@@ -112,6 +113,7 @@ for arg in "$@"; do
         -DPLOW_PACKED_PREFILL_MLA_NORM_CONSUMERS=1) PACKED_MLA_NORM=1 ;;
         -DPLOW_PACKED_PREFILL_MLA_FLASH_CONSUMERS=1) PACKED_MLA_FLASH=1 ;;
         -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1) PACKED_KDA=1 ;;
+        -DPLOW_KDA_CHUNK=1) KDA_CHUNK=1 ;;
         -DPLOW_K3=1) K3=1 ;;
         -DPLOW_MLA_PREFILL=1|-DPLOW_MLA_PF_V2_ARM=1) MLA=1 ;;
     esac
@@ -148,6 +150,15 @@ for spec in \
         grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS" || fail "$OUT is missing $marker"
     fi
 done
+
+if [ "$PACKED_KDA" = 1 ] && [ "$KDA_CHUNK" = 1 ]; then
+    for marker in plow_packed_prefill_kda_chunk_segments_1 plow_kda_chunk_bt64_arm_1; do
+        grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS" || fail "$OUT is missing $marker"
+    done
+    [ "$S" = 0 ] || fail "$(basename "$OUT") packed chunk-KDA object spills $S VGPRs"
+elif grep -qE "OBJECT .* plow_packed_prefill_kda_chunk_segments_1\$" <<<"$SYMS"; then
+    fail "default $OUT unexpectedly advertises plow_packed_prefill_kda_chunk_segments_1"
+fi
 
 rm -f "$CO"
 printf "built %s (%s B), %s VGPR=%s AGPR=%s total=%s occ=%s spill=%s\n" \
