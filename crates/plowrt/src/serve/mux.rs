@@ -1732,62 +1732,119 @@ fn run_one_tick(
             let isolated = amd_prefill_pick(
                 (0..b.min(slots.len())).filter_map(|i| {
                     let slot = slots[i].as_ref()?;
-                    (slot.step == 0).then_some((i, slot.arrived))
+                    (slot.step == 0 && !slot.respond.is_closed()).then_some((i, slot.arrived))
                 }),
                 nv.pf_batch,
                 e.prefill_turn(),
                 b.min(slots.len()),
             );
-            // Preview packing only under the existing diagnostic flag. Actual dispatch
-            // remains isolated until the device interpreter consumes the span table;
-            // the normal throughput path must not allocate a candidate Vec for no gain.
-            if nv.pf_batch && packlog::on() {
-                let budget = if tick_max == u32::MAX {
-                    u32::MAX
-                } else {
-                    tick_max
-                };
+            if nv.pf_batch {
                 let packed = amd_prefill_pack(
                     (0..b.min(slots.len())).filter_map(|i| {
-                        slots[i].as_ref().filter(|s| s.step == 0)?;
-                        e.prefill_span(i, tick_max)
+                        slots[i]
+                            .as_ref()
+                            .filter(|s| s.step == 0 && !s.respond.is_closed())?;
+                        e.packable_prefill_span(i, tick_max)
                     }),
-                    budget,
+                    tick_max,
                     e.prefill_turn(),
                     b.min(slots.len()),
+                    |program| e.prefill_prog_t(program as usize),
                 );
-                let staged = stage_then_clear(
-                    e,
-                    |engine| {
-                        let first = packed.first().ok_or_else(|| {
-                            crate::RuntimeError::Device(
-                                "packed-prefill preview formed an empty pack".into(),
-                            )
-                        })?;
-                        let rung =
-                            engine
-                                .prefill_prog_t(first.program as usize)
-                                .ok_or_else(|| {
-                                    crate::RuntimeError::Device(format!(
-                                        "packed-prefill preview program {} is not a prefill rung",
-                                        first.program
-                                    ))
-                                })?;
-                        let parked = amd_prefill_parked_mask(&packed, rung).map_err(|why| {
-                            crate::RuntimeError::Device(format!(
-                                "packed-prefill preview mask is invalid: {why}"
-                            ))
-                        })?;
-                        engine.stage_packed_prefill(&packed, &parked)
-                    },
-                    |engine| engine.clear_packed_prefill(),
-                );
-                if let Err(err) = staged {
-                    tracing::warn!(error = %err, "AMD prefill pack preview staging failed");
+                if packed.len() >= 2 {
+                    let pk_t = packlog::on().then(Instant::now);
+                    for span in &packed {
+                        let slot = slots[span.slot as usize]
+                            .as_ref()
+                            .expect("packed candidate still occupies its slot");
+                        crate::obs::ttft::QUEUE.add(slot.arrived.elapsed().as_nanos() as u64);
+                    }
+                    let t_pf = Instant::now();
+                    let mut result = {
+                        let members: Vec<_> = packed
+                            .iter()
+                            .map(|span| {
+                                let i = span.slot as usize;
+                                (
+                                    i,
+                                    slots[i]
+                                        .as_ref()
+                                        .expect("packed candidate still occupies its slot")
+                                        .prompt_ids
+                                        .as_slice(),
+                                )
+                            })
+                            .collect();
+                        e.advance_packed_prefill(&members)
+                    };
+                    crate::obs::ttft::PREFILL.add(t_pf.elapsed().as_nanos() as u64);
+                    if result.is_ok() {
+                        match amd_packed_frontier_updates(
+                            packed.iter().map(|span| span.slot as usize),
+                            |i| e.prefill_frontier(i),
+                        ) {
+                            Ok(updates) => {
+                                for (i, frontier) in updates {
+                                    slots[i]
+                                        .as_mut()
+                                        .expect("packed member still occupies its slot")
+                                        .pf_pos = frontier;
+                                }
+                            }
+                            Err(i) => {
+                                result = Err(crate::RuntimeError::Device(format!(
+                                    "packed prefill slot {i} lost its cursor after dispatch"
+                                )));
+                            }
+                        }
+                    }
+                    e.advance_prefill_turn(packed.last().expect("pack has members").slot as usize);
+                    match result {
+                        Ok(()) => {
+                            tracing::debug!(spans = packed.len(), "AMD packed prefill advanced")
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                error_code = ?err.device_code(),
+                                fatal = err.is_fatal(),
+                                members = packed.len(),
+                                model = bundle.network(),
+                                "AMD packed prefill failed"
+                            );
+                            note_fault(&mut tick_fault, &err);
+                            let msg = err.to_string();
+                            for span in &packed {
+                                let i = span.slot as usize;
+                                if let Some(taken) = slots[i].take() {
+                                    release_kv(&arena, taken.kv);
+                                    let _ = taken
+                                        .respond
+                                        .try_send(StreamChunk::Err(fanout_err(&err, &msg)));
+                                }
+                                e.release(i);
+                            }
+                        }
+                    }
+                    if let Some(t) = pk_t {
+                        packlog::record(t.elapsed().as_nanos() as u64, 0, true, false, 0);
+                    }
+                    did_prefill = true;
                 }
-                tracing::debug!(spans = packed.len(), "AMD prefill pack preview");
             }
-            let pending = isolated;
+            if did_prefill && no_interleave {
+                return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
+            }
+            if did_prefill {
+                let prefill_remains = slots[..b.min(slots.len())]
+                    .iter()
+                    .any(|s| s.as_ref().is_some_and(|s| s.step == 0));
+                if amd_defer_decode(nv.pf_defer_decode, prefill_remains) {
+                    tracing::debug!("amd: decode deferred while prefill remains");
+                    return (slots, bufs, obs, tokens_this_tick, true, tick_fault);
+                }
+            }
+            let pending = (!did_prefill).then_some(isolated).flatten();
             if let Some(i) = pending {
                 if nv.pf_batch {
                     e.advance_prefill_turn(i);
@@ -2291,6 +2348,7 @@ fn amd_prefill_pack(
     row_budget: u32,
     start: usize,
     cap: usize,
+    program_rows: impl Fn(u32) -> Option<u32>,
 ) -> Vec<packet::dev::PrefillSpan> {
     if row_budget == 0 {
         return Vec::new();
@@ -2310,6 +2368,9 @@ fn amd_prefill_pack(
     let Some(program) = candidates.first().map(|s| s.program) else {
         return Vec::new();
     };
+    let Some(row_budget) = program_rows(program).map(|rows| rows.min(row_budget)) else {
+        return Vec::new();
+    };
     let mut rows = 0u32;
     let mut out = Vec::new();
     for mut span in candidates.into_iter().filter(|s| s.program == program) {
@@ -2327,40 +2388,14 @@ fn amd_prefill_pack(
 }
 
 #[cfg(feature = "hsa")]
-fn amd_prefill_parked_mask(
-    spans: &[packet::dev::PrefillSpan],
-    rung: u32,
-) -> std::result::Result<Vec<u32>, &'static str> {
-    let Some(first) = spans.first() else {
-        return Err("empty pack");
-    };
-    let mut rows = 0u32;
-    for span in spans {
-        if span.program != first.program {
-            return Err("mixed programs");
-        }
-        if span.n_rows == 0 || span.row0 != rows {
-            return Err("spans are not dense");
-        }
-        rows = rows.checked_add(span.n_rows).ok_or("row count overflow")?;
-        if rows > rung {
-            return Err("packed rows exceed rung");
-        }
-    }
-    let mut parked = vec![1; rung as usize];
-    parked[..rows as usize].fill(0);
-    Ok(parked)
-}
-
-#[cfg(feature = "hsa")]
-fn stage_then_clear<T, E>(
-    target: &mut T,
-    stage: impl FnOnce(&mut T) -> std::result::Result<(), E>,
-    clear: impl FnOnce(&mut T),
-) -> std::result::Result<(), E> {
-    let result = stage(target);
-    clear(target);
-    result
+fn amd_packed_frontier_updates(
+    members: impl IntoIterator<Item = usize>,
+    mut frontier: impl FnMut(usize) -> Option<usize>,
+) -> std::result::Result<Vec<(usize, usize)>, usize> {
+    members
+        .into_iter()
+        .map(|slot| frontier(slot).map(|value| (slot, value)).ok_or(slot))
+        .collect()
 }
 
 /// RTX-12 chunked packing: per-REQUEST cap on the prefill rows one request may
@@ -2974,6 +3009,7 @@ mod tests {
             7,
             2,
             4,
+            |_| Some(7),
         );
         assert_eq!(pack.iter().map(|s| s.slot).collect::<Vec<_>>(), [2, 3]);
         assert_eq!(pack.iter().map(|s| s.row0).collect::<Vec<_>>(), [0, 3]);
@@ -2981,10 +3017,26 @@ mod tests {
 
         // A candidate that does not fit is skipped rather than exceeding the
         // token budget, allowing a later compatible short span to fill it.
-        let pack = amd_prefill_pack([span(0, 5, 7), span(1, 2, 7), span(2, 1, 7)], 3, 0, 3);
+        let pack = amd_prefill_pack(
+            [span(0, 5, 7), span(1, 2, 7), span(2, 1, 7)],
+            3,
+            0,
+            3,
+            |_| Some(3),
+        );
         assert_eq!(pack.iter().map(|s| s.slot).collect::<Vec<_>>(), [1, 2]);
         assert_eq!(pack.iter().map(|s| s.row0).collect::<Vec<_>>(), [0, 2]);
         assert_eq!(pack.iter().map(|s| s.n_rows).sum::<u32>(), 3);
+
+        let pack = amd_prefill_pack(
+            [span(0, 3, 7), span(1, 3, 7), span(2, 1, 7)],
+            8,
+            0,
+            3,
+            |_| Some(4),
+        );
+        assert_eq!(pack.iter().map(|s| s.slot).collect::<Vec<_>>(), [0, 2]);
+        assert_eq!(pack.iter().map(|s| s.n_rows).sum::<u32>(), 4);
     }
 
     #[cfg(feature = "hsa")]
@@ -3013,67 +3065,28 @@ mod tests {
         past_capacity.state_slot = 4;
 
         assert_eq!(
-            amd_prefill_pack([zero, wrong_state, wrong_len, past_capacity], 8, 0, 4),
+            amd_prefill_pack(
+                [zero, wrong_state, wrong_len, past_capacity],
+                8,
+                0,
+                4,
+                |_| Some(8),
+            ),
             []
         );
-        assert_eq!(amd_prefill_pack([valid], 0, 0, 4), []);
+        assert_eq!(amd_prefill_pack([valid], 0, 0, 4, |_| Some(8)), []);
+        assert_eq!(amd_prefill_pack([valid], 8, 0, 4, |_| None), []);
     }
 
     #[cfg(feature = "hsa")]
     #[test]
-    fn amd_prefill_parked_mask_covers_the_full_rung() {
-        use packet::dev::PrefillSpan;
-
-        let span = |row0, n_rows, program| PrefillSpan {
-            row0,
-            n_rows,
-            slot: row0,
-            flags: 0,
-            kv_row0: 0,
-            kv_len: n_rows,
-            state_slot: row0,
-            program,
-        };
+    fn packed_prefill_frontiers_are_all_or_error_in_member_order() {
+        let updates = amd_packed_frontier_updates([2, 0, 3], |slot| Some(slot + 10)).unwrap();
+        assert_eq!(updates, [(2, 12), (0, 10), (3, 13)]);
         assert_eq!(
-            amd_prefill_parked_mask(&[span(0, 3, 2), span(3, 2, 2)], 8).unwrap(),
-            [0, 0, 0, 0, 0, 1, 1, 1]
+            amd_packed_frontier_updates([2, 0, 3], |slot| (slot != 0).then_some(slot + 10)),
+            Err(0)
         );
-        assert!(amd_prefill_parked_mask(&[], 8).is_err());
-        assert!(amd_prefill_parked_mask(&[span(1, 2, 2)], 8).is_err());
-        assert!(amd_prefill_parked_mask(&[span(0, 9, 2)], 8).is_err());
-        assert!(amd_prefill_parked_mask(&[span(0, 2, 2), span(2, 1, 3)], 8).is_err());
-    }
-
-    #[cfg(feature = "hsa")]
-    #[test]
-    fn packed_prefill_preview_always_clears_staging() {
-        #[derive(Default)]
-        struct Target {
-            staged: bool,
-            clears: usize,
-        }
-
-        for fail in [false, true] {
-            let mut target = Target::default();
-            let result = stage_then_clear(
-                &mut target,
-                |target| {
-                    target.staged = true;
-                    if fail {
-                        Err("stage failed")
-                    } else {
-                        Ok(())
-                    }
-                },
-                |target| {
-                    target.staged = false;
-                    target.clears += 1;
-                },
-            );
-            assert_eq!(result.is_err(), fail);
-            assert!(!target.staged);
-            assert_eq!(target.clears, 1);
-        }
     }
 
     /// The batched-engine admission model: a decode tick advances every live

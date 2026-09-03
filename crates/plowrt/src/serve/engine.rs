@@ -395,6 +395,14 @@ mod amd_serve {
         }
     }
 
+    fn packable_prefill_step(cur: &PfCursor, max_rows: u32) -> Option<crate::exec::amd::ChunkStep> {
+        let step = *cur.steps.get(cur.next)?;
+        (cur.next + 1 < cur.steps.len()
+            && cur.snap_after != Some(cur.next)
+            && step.clen <= max_rows)
+            .then_some(step)
+    }
+
     /// Shortest prefix worth caching. Below this the snapshot/restore pair costs more than the
     /// prefill it skips, and it churns the slot's cached prompt for nothing.
     const MIN_PREFIX: u32 = 128;
@@ -1028,6 +1036,19 @@ mod amd_serve {
             })
         }
 
+        /// The next span iff it can complete without producing a token or crossing a prefix-cache
+        /// snapshot boundary. Fresh cursors remain ineligible until isolated admission initializes
+        /// their state and prefix plan.
+        pub fn packable_prefill_span(
+            &self,
+            slot: usize,
+            max_rows: u32,
+        ) -> Option<packet::dev::PrefillSpan> {
+            let cur = self.pf.get(slot)?.as_ref()?;
+            packable_prefill_step(cur, max_rows)?;
+            self.prefill_span(slot, max_rows)
+        }
+
         /// Advance compatible, already-initialized TP prefill cursors in one packed dispatch.
         /// Final chunks remain isolated because the current model prefill head exposes one
         /// sampled token, not one result per span. Snapshot boundaries remain isolated too.
@@ -1579,8 +1600,9 @@ mod amd_serve {
     mod tests {
         use super::{
             bounded_deferred_quantum, commit_packed_prefill, invalidate_prefix_metadata,
-            parse_snapshot_tensors, snapshot_file_component, split_pending_prefill, stage_parked,
-            PfCursor, DEFAULT_SNAPSHOT_TENSORS, MAX_SNAPSHOT_TENSORS,
+            packable_prefill_step, parse_snapshot_tensors, snapshot_file_component,
+            split_pending_prefill, stage_parked, PfCursor, DEFAULT_SNAPSHOT_TENSORS,
+            MAX_SNAPSHOT_TENSORS,
         };
         use crate::exec::amd::ChunkStep;
 
@@ -1706,6 +1728,27 @@ mod amd_serve {
             assert_eq!(cursors[2].as_ref().unwrap().next, 1);
             assert_eq!(cursors[2].as_ref().unwrap().frontier, 6);
             assert!(cursors[1].is_none());
+        }
+
+        #[test]
+        fn packed_prefill_eligibility_excludes_final_snapshot_and_oversized_steps() {
+            let step = ChunkStep {
+                prog: 2,
+                c0: 4,
+                clen: 3,
+            };
+            let cursor = |next, snap_after| PfCursor {
+                steps: vec![step, ChunkStep { c0: 7, ..step }],
+                next,
+                frontier: 4,
+                snap_after,
+                resume: 0,
+                arm: 0,
+            };
+            assert_eq!(packable_prefill_step(&cursor(0, None), 3), Some(step));
+            assert_eq!(packable_prefill_step(&cursor(0, None), 2), None);
+            assert_eq!(packable_prefill_step(&cursor(0, Some(0)), 3), None);
+            assert_eq!(packable_prefill_step(&cursor(1, None), 3), None);
         }
 
         #[test]
