@@ -195,13 +195,16 @@ fn the_production_interpreter_dispatches_and_retires() {
         rank: 0,
         n_gpu: 0,
         seg_ofs: 0,
+        prefill_spans: 0,
+        prefill_parked: 0,
+        n_prefill_spans: 0,
+        n_prefill_rows: 0,
     };
-    // The kernarg block is the struct's bytes. `dev_isa.h` static-asserts
-    // sizeof(PlowProgram) == 144 and `packet::dev_abi` pins the Rust mirror
-    // against the C header, so this cast is checked elsewhere, not assumed.
+    // The kernarg block is the current struct's bytes. `dev_isa.h` static-asserts its size and
+    // `packet::dev_abi` pins the Rust mirror against the C header.
     assert_eq!(
         std::mem::size_of::<DevProgram>(),
-        144,
+        168,
         "PlowProgram ABI drifted"
     );
     // SAFETY: `DevProgram` is `repr(C)` and POD (all u64/u32); reading it as
@@ -332,6 +335,10 @@ fn gfx950_runs_the_prefill_arena_the_objects_actually_declare() {
         rank: 0,
         n_gpu: 0,
         seg_ofs: 0,
+        prefill_spans: 0,
+        prefill_parked: 0,
+        n_prefill_spans: 0,
+        n_prefill_rows: 0,
     };
     // SAFETY: `DevProgram` is `repr(C)` POD; this is the kernarg memcpy's view.
     let args: &[u8] = unsafe {

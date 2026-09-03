@@ -92,13 +92,23 @@ plowrt bench --assets $ASSETS --prompt-ids 1,2,3,4 \
 
 The JSON records TTFT/TPOT/ITL/E2E distributions, throughput, scheduler rungs,
 TP width, active runtime settings, packet/object checksums, and checkpoint
-layout. Preserve each JSON result with the exact command and environment.
+layout. Add `--engine-diagnostics` to record ordered AMD production prefill
+chunk and decode rung selections plus the TP agreement policy. Capture is
+opt-in so normal benchmark timing is not perturbed. Preserve each JSON result
+with the exact command and environment.
+
+`plowrt bench --prefill-sweep --prefill-lengths 512,1024,2048
+--prefill-warmups 1 --prefill-reps 3` runs cold-prefill TTFT rows through that
+same mux after one model load. Exact `--prompt-ids` are also accepted. Preserve
+the distinct `plowrt.bench.prefill-sweep.v1` JSON; a prefix-cache hit is an
+error, not a prefill measurement, and the sweep refuses to start with either
+production prefix cache enabled.
 
 `amd-bench` drives `AmdEngine` directly and bypasses production scheduling. Use
 `plowrt bench --trace-raw PATH` for decode packet traces. Keep `amd-bench` only
-for tensor/logit snapshots, repeated-prefill sweeps, synthetic kernel floors,
-and diagnosing a TP disagreement reported by `plowrt bench`. Never publish it
-as served-model performance.
+for tensor/logit snapshots, synthetic kernel floors, and diagnosing a TP
+disagreement reported by `plowrt bench`. Never publish it as served-model
+performance.
 
 ### 2a. AMD benchmark harness convergence
 
@@ -114,9 +124,10 @@ Track `amd-bench` removal as a staged migration, not a flag deletion:
   active knobs.
 - [x] Expose raw AMD decode packet traces through the production `AmdServe`
   path (`plowrt bench --trace-raw PATH`).
-- [ ] Expose tensor/logit snapshot, TP-rank audit, bucket timing,
-  repeated-prefill, and ragged-batch diagnostics without reaching through
+- [ ] Expose tensor/logit snapshot, TP-rank audit, bucket timing, and
+  ragged-batch diagnostics without reaching through
   `AmdServe` into `AmdEngine`.
+- [x] Add one-load repeated cold-prefill TTFT sweeps to `plowrt bench`.
 - [ ] Move unbound weights and unwritten-KV timing to an explicitly synthetic
   `amd-probe`; never report it as served-model performance.
 - [ ] Add bench-vs-serve parity tests for tokens, buckets, chunk boundaries, slot

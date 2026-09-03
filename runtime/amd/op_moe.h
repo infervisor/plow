@@ -3313,7 +3313,14 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                                     const float* __restrict__ row_gate,
                                     unsigned char* __restrict__ Cscale, unsigned N, unsigned K,
                                     unsigned n_exp, unsigned act, unsigned slice, unsigned nblk,
-                                    float beta, float lbeta, void* ldsv) {
+                                    float beta, float lbeta, void* ldsv
+#if PLOW_MOE_PF_ATOMIC
+                                    , unsigned atom_ksh = 0
+#endif
+#if PLOW_MOE_PF_DET
+                                    , unsigned det_ksh = 0
+#endif
+                                    ) {
     constexpr int SMa = MPF4_BM / MPF4_WMc / MFMA_M; /* 1 */
     constexpr int SNa = MPF4_BN / MPF4_WNc / MFMA_N; /* 2 */
     constexpr unsigned NB = GLU ? (MPF4_BN / 2) : MPF4_BN;
@@ -3677,7 +3684,55 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                 mpf4_st16(o, q);
                 Cscale[(size_t)(rowbase + r) * (N >> 5) + ((n0 + c0) >> 5)] = sbv;
             }
-        } else {
+        }
+#if PLOW_MOE_PF_ATOMIC
+        else if (atom_ksh) {
+            float* const acc_out = (float*)Cout;
+            const unsigned ksh = atom_ksh - 1u;
+#pragma unroll
+            for (int i = 0; i < SMa; i++)
+#pragma unroll
+                for (int j = 0; j < SNa; j++) {
+                    const unsigned nn =
+                        n0 + wn * (MPF4_BN / MPF4_WNc) + j * MFMA_N + mfma_acc_n(lane);
+                    MPF4_EPI_NGUARD(nn);
+#pragma unroll
+                    for (int el = 0; el < 16; el++) {
+                        const unsigned rr =
+                            wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
+                        MPF4_ROWMETA(rr, pidx, gv);
+                        __hip_atomic_fetch_add(
+                            (PLOW_GLOB float*)&acc_out[(size_t)(pidx >> ksh) * N + nn],
+                            gv * acc[i][j][el], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    }
+                }
+        }
+#endif
+#if PLOW_MOE_PF_DET
+        else if (det_ksh) {
+            double* const acc_out = (double*)Cout;
+            const unsigned ksh = det_ksh - 1u;
+#pragma unroll
+            for (int i = 0; i < SMa; i++)
+#pragma unroll
+                for (int j = 0; j < SNa; j++) {
+                    const unsigned nn =
+                        n0 + wn * (MPF4_BN / MPF4_WNc) + j * MFMA_N + mfma_acc_n(lane);
+                    MPF4_EPI_NGUARD(nn);
+#pragma unroll
+                    for (int el = 0; el < 16; el++) {
+                        const unsigned rr =
+                            wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
+                        MPF4_ROWMETA(rr, pidx, gv);
+                        __hip_atomic_fetch_add(
+                            (PLOW_GLOB double*)&acc_out[(size_t)(pidx >> ksh) * N + nn],
+                            mpf_det_q(gv * acc[i][j][el]), __ATOMIC_RELAXED,
+                            __HIP_MEMORY_SCOPE_AGENT);
+                    }
+                }
+        }
+#endif
+        else {
             float* const part = (float*)Cout;
 #pragma unroll
             for (int i = 0; i < SMa; i++)
@@ -3789,7 +3844,14 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                                     const float* __restrict__ row_gate,
                                     unsigned char* __restrict__ Cscale, unsigned N, unsigned K,
                                     unsigned n_exp, unsigned act, unsigned slice, unsigned nblk,
-                                    float beta, float lbeta, void* ldsv) {
+                                    float beta, float lbeta, void* ldsv
+#if PLOW_MOE_PF_ATOMIC
+                                    , unsigned atom_ksh = 0
+#endif
+#if PLOW_MOE_PF_DET
+                                    , unsigned det_ksh = 0
+#endif
+                                    ) {
     constexpr int SMa = MPF4_BM / MPF4_WMc / MFMA_M; /* 1 */
     constexpr int SNa = MPF4_BN / MPF4_WNc / MFMA_N; /* 2 */
     constexpr unsigned NB = GLU ? (MPF4_BN / 2) : MPF4_BN;
@@ -4071,7 +4133,55 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                 mpf4_st16(o, q);
                 Cscale[(size_t)(rowbase + r) * (N >> 5) + ((n0 + c0) >> 5)] = sbv;
             }
-        } else {
+        }
+#if PLOW_MOE_PF_ATOMIC
+        else if (atom_ksh) {
+            float* const acc_out = (float*)Cout;
+            const unsigned ksh = atom_ksh - 1u;
+#pragma unroll
+            for (int i = 0; i < SMa; i++)
+#pragma unroll
+                for (int j = 0; j < SNa; j++) {
+                    const unsigned nn =
+                        n0 + wn * (MPF4_BN / MPF4_WNc) + j * MFMA_N + mfma_acc_n(lane);
+                    C3_EPI_NGUARD(nn);
+#pragma unroll
+                    for (int el = 0; el < 16; el++) {
+                        const unsigned rr =
+                            wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
+                        C3_ROWMETA(rr, pidx, gv);
+                        __hip_atomic_fetch_add(
+                            (PLOW_GLOB float*)&acc_out[(size_t)(pidx >> ksh) * N + nn],
+                            gv * acc[i][j][el], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    }
+                }
+        }
+#endif
+#if PLOW_MOE_PF_DET
+        else if (det_ksh) {
+            double* const acc_out = (double*)Cout;
+            const unsigned ksh = det_ksh - 1u;
+#pragma unroll
+            for (int i = 0; i < SMa; i++)
+#pragma unroll
+                for (int j = 0; j < SNa; j++) {
+                    const unsigned nn =
+                        n0 + wn * (MPF4_BN / MPF4_WNc) + j * MFMA_N + mfma_acc_n(lane);
+                    C3_EPI_NGUARD(nn);
+#pragma unroll
+                    for (int el = 0; el < 16; el++) {
+                        const unsigned rr =
+                            wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
+                        C3_ROWMETA(rr, pidx, gv);
+                        __hip_atomic_fetch_add(
+                            (PLOW_GLOB double*)&acc_out[(size_t)(pidx >> ksh) * N + nn],
+                            mpf_det_q(gv * acc[i][j][el]), __ATOMIC_RELAXED,
+                            __HIP_MEMORY_SCOPE_AGENT);
+                    }
+                }
+        }
+#endif
+        else {
             float* const part = (float*)Cout;
 #pragma unroll
             for (int i = 0; i < SMa; i++)
@@ -4217,7 +4327,7 @@ __device__ void d_moe_group_down_pf(float* part, const bf16* fu, const unsigned 
     if (enc == PLOW_MOE_ENC_MXFP4) { /* A = the bridge's MXFP4 output + its E8M0 rows */
         d_moe_group_pf_a4w4<false>((void*)part, (const void*)fu, fu_scale, wtab, stab, meta,
                                    nullptr, row_partidx, row_gate, nullptr, H, I_moe, n_exp, 0,
-                                   slice, nblk, 0.0f, 0.0f, (void*)lds);
+                                   slice, nblk, 0.0f, 0.0f, (void*)lds MPF_ATOM_ARG MPF_DET_ARG);
         return;
     }
 #else

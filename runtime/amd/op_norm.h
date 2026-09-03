@@ -21,6 +21,7 @@
 #define PLOW_OP_NORM_H
 
 #include "amd_common.h"
+#include "packed_prefill.h"
 
 /* RN_REG / RN_VEC moved to amd_common.h: op_gemm.h's fused-norm GEMV (`norm == 2`,
  * `gemv_norm_lds`) must reduce with the SAME per-thread element map as `d_rmsnorm` below to
@@ -66,18 +67,36 @@ __device__ void d_rmsnorm(bf16* __restrict__ out, const bf16* __restrict__ x,
                           const bf16* __restrict__ gamma, unsigned rows, unsigned feat,
                           float eps, unsigned out_row0, unsigned slice, unsigned nblk, float* part,
                           unsigned char* __restrict__ xq = nullptr,
-                          float* __restrict__ ascale = nullptr) {
+                          float* __restrict__ ascale = nullptr
+#if PLOW_PACKED_PREFILL_CONSUMERS
+                          ,
+                          const PlowProgram* packed = nullptr,
+                          unsigned packed_slot_stride = 0
+#endif
+                          ) {
     /* feat % 8 == 0 is what lets the row be read 16 bytes at a time; Gemma's 5376 is. */
     const bool fits = (feat <= RN_REG * PLOW_THREADS) && ((feat & 7u) == 0);
     const auto* xg = as_glob(x);
     const auto* gg = as_glob(gamma);
     auto* og = as_glob(out);
     for (unsigned row = slice; row < rows; row += nblk) {
+#if PLOW_PACKED_PREFILL_CONSUMERS
+        const PlowPackedRow prow = plow_packed_prefill_row(packed, row);
+        if (!prow.active) continue;
+#endif
         const size_t base = (size_t)row * feat;
         /* out_row0 offsets the OUTPUT row only (input stays at `base`): GLM's decode step norms the
          * current token (row 0 of x) into the latent KV cache at row = out_row0 (the sequence pos),
          * patched per step. Default 0 => in-place, every existing RMSNORM bit-identical. */
-        const size_t obase = (size_t)(out_row0 + row) * feat;
+#if PLOW_PACKED_PREFILL_CONSUMERS
+        const size_t out_row = packed_slot_stride
+                                   ? plow_packed_prefill_cache_row(prow, packed_slot_stride,
+                                                                  out_row0 + row)
+                                   : out_row0 + row;
+#else
+        const size_t out_row = out_row0 + row;
+#endif
+        const size_t obase = out_row * feat;
         if (fits) {
             /* PRODUCE: the row AND its weight, in one burst. Both are issued before anything
              * is waited on, so they cost ONE round trip between them, not one each. */
@@ -328,7 +347,13 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
                                 const int* __restrict__ pos, unsigned ntok, unsigned nhead,
                                 float eps, unsigned out_row0, unsigned out_stride, unsigned kv_mask,
                                 unsigned skip_norm, unsigned slice,
-                                unsigned nblk, unsigned n_batch_kv = 0) {
+                                unsigned nblk, unsigned n_batch_kv = 0
+#if PLOW_PACKED_PREFILL_CONSUMERS
+                                ,
+                                const PlowProgram* packed = nullptr,
+                                unsigned packed_slot_stride = 0
+#endif
+                                ) {
     constexpr unsigned hd = HD;
     const unsigned lane = threadIdx.x & 63;
     const unsigned wave_in_blk = threadIdx.x >> 6; /* PLOW_WAVES per workgroup */
@@ -348,6 +373,14 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
 
     for (unsigned w = slice * PLOW_WAVES + wave_in_blk; w < total; w += nblk * PLOW_WAVES) {
         const unsigned t = w / nhead, hh = w % nhead;
+#if PLOW_PACKED_PREFILL_CONSUMERS
+        const PlowPackedRow prow = plow_packed_prefill_row(packed, t);
+        if (!prow.active) continue;
+        const unsigned position =
+            plow_packed_prefill_position(prow, pg ? (unsigned)pg[t] : out_row0 + t);
+#else
+        const unsigned position = pg ? (unsigned)pg[t] : out_row0 + t;
+#endif
         const size_t ibase = ((size_t)t * nhead + hh) * hd;
         /* out_stride != 0 selects the HEAD-MAJOR KV-cache layout, [kv_head][ctx][hd]: this
          * wave's 512 bytes land inside its own head's contiguous block, so flash_decode can
@@ -364,9 +397,15 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
          * legacy formula gets right. n_batch_kv == 0 keeps the legacy path byte-identical, so
          * every prefill packet and B=1 decode are unchanged. */
         const size_t obase =
-            out_stride
+#if PLOW_PACKED_PREFILL_CONSUMERS
+            packed_slot_stride && prow.span
+                ? (((size_t)prow.span->slot * nhead + hh) * packed_slot_stride +
+                   (position & kv_mask)) * hd
+                :
+#endif
+                  out_stride
                 ? (n_batch_kv != 0
-                       ? ((size_t)(t * nhead + hh) * out_stride + ((unsigned)pg[t] & kv_mask)) * hd
+                       ? ((size_t)(t * nhead + hh) * out_stride + (position & kv_mask)) * hd
                        : ((size_t)hh * out_stride + ((out_row0 + t) & kv_mask)) * hd)
                 : ((size_t)(out_row0 + t) * nhead + hh) * hd;
 
@@ -394,7 +433,7 @@ __device__ void d_headnorm_rope(bf16* __restrict__ out, const bf16* __restrict__
 
         if (cosb) {
             constexpr unsigned H2 = HD >> 1;
-            const size_t p = (size_t)pg[t] * H2;
+            const size_t p = (size_t)position * H2;
             float r[E];
             if constexpr (!INTERLEAVE) {
                 constexpr unsigned EH = H2 >> 6; /* lane-local stride to the half-split partner */
@@ -442,7 +481,13 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
                                     const int* __restrict__ pos, unsigned ntok, unsigned nhead,
                                     float eps, unsigned out_row0, unsigned out_stride,
                                     unsigned kv_mask, unsigned skip_norm, unsigned slice,
-                                    unsigned nblk, unsigned n_batch_kv = 0) {
+                                    unsigned nblk, unsigned n_batch_kv = 0
+#if PLOW_PACKED_PREFILL_CONSUMERS
+                                    ,
+                                    const PlowProgram* packed = nullptr,
+                                    unsigned packed_slot_stride = 0
+#endif
+                                    ) {
     constexpr unsigned hd = HD;
     const unsigned lane = threadIdx.x & 63;
     const unsigned wave_in_blk = threadIdx.x >> 6;
@@ -459,12 +504,27 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
 
     for (unsigned w = slice * PLOW_WAVES + wave_in_blk; w < total; w += nblk * PLOW_WAVES) {
         const unsigned t = w / nhead, hh = w % nhead;
+#if PLOW_PACKED_PREFILL_CONSUMERS
+        const PlowPackedRow prow = plow_packed_prefill_row(packed, t);
+        if (!prow.active) continue;
+        const unsigned position =
+            plow_packed_prefill_position(prow, pg ? (unsigned)pg[t] : out_row0 + t);
+#else
+        const unsigned position = pg ? (unsigned)pg[t] : out_row0 + t;
+#endif
         const size_t ibase = ((size_t)t * nhead + hh) * hd;
         /* KV row index. n_batch_kv != 0 = BATCH>1 decode: sequence t's own batch-major ring at
          * its own pos[t] (see the bf16 twin above). The per-row `scale` array shares this row,
          * so both follow the same formula. */
-        const size_t row = n_batch_kv != 0
-                               ? (size_t)(t * nhead + hh) * out_stride + ((unsigned)pg[t] & kv_mask)
+        const size_t row =
+#if PLOW_PACKED_PREFILL_CONSUMERS
+                           packed_slot_stride && prow.span
+                               ? ((size_t)prow.span->slot * nhead + hh) * packed_slot_stride +
+                                     (position & kv_mask)
+                               :
+#endif
+                                 n_batch_kv != 0
+                               ? (size_t)(t * nhead + hh) * out_stride + (position & kv_mask)
                                : (size_t)hh * out_stride + ((out_row0 + t) & kv_mask);
         const size_t obase = row * hd;
 
@@ -487,7 +547,7 @@ __device__ void d_headnorm_rope_fp8(unsigned char* __restrict__ out, float* __re
         if (cosb) {
             constexpr unsigned H2 = HD >> 1;
             constexpr unsigned EH = H2 >> 6;
-            const size_t p = (size_t)pg[t] * H2;
+            const size_t p = (size_t)position * H2;
             float r[E];
 #pragma unroll
             for (unsigned e = 0; e < E; e++) {

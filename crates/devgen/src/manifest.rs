@@ -831,6 +831,9 @@ fn backend_amd(
     if has("KdaConvStateStepG") {
         req.push("PLOW_KDA_CONV_STEP_DB=1".into());
     }
+    if has("KdaChunkPrepare") || has("KdaChunkIntra") || has("KdaChunkWu") || has("KdaChunkCarry") {
+        req.push("PLOW_KDA_CHUNK=1".into());
+    }
     // Runtime-flag arms (packet i[7] on ops 85/86/87): every object built since the arms landed
     // carries them (unconditional plow_moe_pf_*_arm markers in op_moe.h); an OLDER object would
     // store f32 into a half-sized part buffer / matmul fp8 bytes as bf16 — refuse at load.
@@ -899,6 +902,10 @@ fn backend_amd(
         || has("KdaConv")
         || has("KdaConv3")
         || has("KdaGatedNorm")
+        || has("KdaChunkPrepare")
+        || has("KdaChunkIntra")
+        || has("KdaChunkWu")
+        || has("KdaChunkCarry")
     {
         req.push("PLOW_K3=1".into());
     }
@@ -1592,6 +1599,10 @@ mod tests {
             DevOp::KdaConv,
             DevOp::KdaConv3,
             DevOp::KdaGatedNorm,
+            DevOp::KdaChunkPrepare,
+            DevOp::KdaChunkIntra,
+            DevOp::KdaChunkWu,
+            DevOp::KdaChunkCarry,
         ] {
             assert!(
                 gfx(&[op]).iter().any(|r| r == "PLOW_K3=1"),
@@ -1602,6 +1613,12 @@ mod tests {
         assert!(!gfx(&[DevOp::Gemv, DevOp::RmsNorm])
             .iter()
             .any(|r| r == "PLOW_K3=1"));
+
+        let chunk_req = gfx(&[DevOp::KdaChunkCarry]);
+        assert!(chunk_req.iter().any(|r| r == "PLOW_KDA_CHUNK=1"));
+        assert!(!gfx(&[DevOp::KdaStateStepG])
+            .iter()
+            .any(|r| r == "PLOW_KDA_CHUNK=1"));
     }
 
     /// `arm_of` must read each flash op's head-dim from the slot that op ACTUALLY carries it in.

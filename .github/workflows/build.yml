@@ -25,6 +25,10 @@ jobs:
         run: |
           old_path='perf-data/'"harness/"
           ! git grep -n --fixed-strings "$old_path" -- .
+      - name: Reject new amd-bench performance consumers
+        run: scripts/check_amd_bench_consumers.sh
+      - name: Check fusion-ladder result validator
+        run: python3 perf-data/tools/fusion_ladder_results.py --self-test
       - name: Enter Nix shell
         run: nix develop --command true
       - name: Build default package
@@ -42,6 +46,10 @@ jobs:
         run: |
           old_path='perf-data/'"harness/"
           ! git grep -n --fixed-strings "$old_path" -- .
+      - name: Reject new amd-bench performance consumers
+        run: scripts/check_amd_bench_consumers.sh
+      - name: Check fusion-ladder result validator
+        run: python3 perf-data/tools/fusion_ladder_results.py --self-test
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt

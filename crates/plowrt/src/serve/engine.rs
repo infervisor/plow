@@ -19,6 +19,8 @@ use std::sync::Arc;
 #[cfg(feature = "hsa")]
 use std::path::Path;
 
+use super::bench::{DecodeSelection, EngineDiagnostics, PrefillSelection, RankAgreement};
+
 /// The device engine serving one slug.
 pub enum ServeEngine {
     /// The sm_120 persistent-interpreter engine (slotted, continuous batching).
@@ -30,6 +32,24 @@ pub enum ServeEngine {
 }
 
 impl ServeEngine {
+    pub fn begin_diagnostics(&mut self) {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => {}
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => e.begin_diagnostics(),
+        }
+    }
+
+    pub fn finish_diagnostics(&mut self) -> EngineDiagnostics {
+        match self {
+            #[cfg(feature = "cuda")]
+            ServeEngine::Cuda(_) => EngineDiagnostics::unsupported(),
+            #[cfg(feature = "hsa")]
+            ServeEngine::Amd(e) => e.finish_diagnostics(),
+        }
+    }
+
     /// Sequences one decode launch advances — the mux sizes its slot table to
     /// this, so mux slot `i` IS engine slot `i`.
     pub fn batch(&self) -> usize {
@@ -103,6 +123,9 @@ mod amd_serve {
     use crate::exec::amd::AmdEngine;
     use crate::exec::amd_tp::AmdTpGroup;
     use crate::{Result, RuntimeError};
+    use packet::dev::PrefillSpan;
+
+    use super::{DecodeSelection, EngineDiagnostics, PrefillSelection, RankAgreement};
 
     /// One or N ranks of a gfx950 model, driven as ONE sequence.
     ///
@@ -182,6 +205,7 @@ mod amd_serve {
         /// once instead of every step. It is the only externally visible evidence that the
         /// ladder is engaging, and a measurement that cannot show that is not a measurement.
         last_rung: u32,
+        diagnostics: Option<EngineDiagnostics>,
     }
 
     /// A prompt part-way through its prefill.
@@ -365,7 +389,35 @@ mod amd_serve {
                 },
                 prefill_turn: 0,
                 last_rung: 0,
+                diagnostics: None,
             })
+        }
+
+        pub fn begin_diagnostics(&mut self) {
+            let rank_agreement = match &self.ranks {
+                Ranks::One(_) => None,
+                Ranks::Tp(g) => Some(RankAgreement {
+                    ranks: g.n_gpu(),
+                    sampled_token_every: g.agreement_cadence(),
+                    counter_audit_every_dispatch: g.counter_audit_enabled(),
+                    prefill_completion_all_ranks: true,
+                }),
+            };
+            self.diagnostics = Some(EngineDiagnostics {
+                supported: true,
+                complete: true,
+                overflowed: false,
+                scope: "warmup_and_measured",
+                prefill_selections: Vec::new(),
+                decode_selections: Vec::new(),
+                rank_agreement,
+            });
+        }
+
+        pub fn finish_diagnostics(&mut self) -> EngineDiagnostics {
+            self.diagnostics
+                .take()
+                .unwrap_or_else(EngineDiagnostics::unsupported)
         }
 
         pub fn decode_rungs(&self) -> &[u32] {
@@ -386,6 +438,42 @@ mod amd_serve {
             self.max_ctx
         }
 
+        /// Stage a mux-formed packed-prefill descriptor without dispatching it. Every span must
+        /// name the same compiled program; the rank wrappers perform the full structural checks.
+        pub fn stage_packed_prefill(
+            &mut self,
+            spans: &[PrefillSpan],
+            parked: &[u32],
+        ) -> Result<()> {
+            let first = spans.first().ok_or_else(|| {
+                RuntimeError::Device("packed prefill requires at least one span".into())
+            })?;
+            if spans.iter().any(|s| s.program != first.program) {
+                return Err(RuntimeError::Device(
+                    "packed prefill spans do not share one compiled program".into(),
+                ));
+            }
+            let prog = first.program as usize;
+            match &mut self.ranks {
+                Ranks::One(e) => e.stage_packed_prefill(prog, spans, parked),
+                Ranks::Tp(g) => g.stage_packed_prefill(prog, spans, parked),
+            }
+        }
+
+        pub fn clear_packed_prefill(&mut self) {
+            match &mut self.ranks {
+                Ranks::One(e) => e.clear_packed_prefill(),
+                Ranks::Tp(g) => g.clear_packed_prefill(),
+            }
+        }
+
+        pub fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
+            match &self.ranks {
+                Ranks::One(e) => e.prefill_prog_t(prog),
+                Ranks::Tp(g) => g.prefill_prog_t(prog),
+            }
+        }
+
         /// Admit `prompt` into sequence slot `slot` and return its first
         /// generated token. Leaves `pos[slot]` at `prompt.len()`.
         ///
@@ -396,6 +484,9 @@ mod amd_serve {
         /// one tick, and it is why TTFT under load is bounded by the longest
         /// prompt in the batch rather than by a chunk.
         pub fn prefill(&mut self, slot: usize, prompt: &[u32]) -> Result<u32> {
+            if let Some(diagnostics) = self.diagnostics.as_mut() {
+                diagnostics.complete = false;
+            }
             if prompt.is_empty() {
                 return Err(RuntimeError::Rejected("empty prompt".into()));
             }
@@ -499,6 +590,11 @@ mod amd_serve {
                 self.pos[slot] = prompt.len() as u32;
                 t
             };
+            if let Some(diagnostics) = self.diagnostics.as_mut() {
+                if !diagnostics.overflowed {
+                    diagnostics.complete = true;
+                }
+            }
             Ok(tok)
         }
 
@@ -653,6 +749,14 @@ mod amd_serve {
             }
             let cur = self.pf[slot].as_mut().expect("just built");
             let step = cur.steps[cur.next];
+            if let Some(diagnostics) = self.diagnostics.as_mut() {
+                diagnostics.push_prefill(PrefillSelection {
+                    slot,
+                    row_start: step.c0,
+                    rows: step.clen,
+                    bucket: g.rank(0).prog_t(step.prog),
+                });
+            }
             tracing::debug!(
                 slot,
                 c0 = step.c0,
@@ -836,6 +940,13 @@ mod amd_serve {
                 if width != self.last_rung {
                     tracing::info!(rung = width, occupied = rows, "decode ladder rung");
                     self.last_rung = width;
+                }
+                if let Some(diagnostics) = self.diagnostics.as_mut() {
+                    diagnostics.push_decode(DecodeSelection {
+                        occupied_rows: rows,
+                        bucket: width,
+                        steps: quantum,
+                    });
                 }
                 stage_parked(&mut self.parked_stage, &advance);
                 g.upload_parked(&self.parked_stage)?;
@@ -1028,6 +1139,13 @@ mod amd_serve {
                         tracing::info!(rung = w, occupied = rows, "decode ladder rung");
                         self.last_rung = w;
                     }
+                    if let Some(diagnostics) = self.diagnostics.as_mut() {
+                        diagnostics.push_decode(DecodeSelection {
+                            occupied_rows: rows,
+                            bucket: w,
+                            steps: 1,
+                        });
+                    }
                     e.upload_parked(&self.parked_stage)?;
                     e.seed_ids(&self.next_id)?;
                     e.decode_step_batched_at(&self.pos_stage, &self.kvlen_stage, dp)?
@@ -1038,6 +1156,13 @@ mod amd_serve {
                     if w != self.last_rung {
                         tracing::info!(rung = w, occupied = rows, "decode ladder rung");
                         self.last_rung = w;
+                    }
+                    if let Some(diagnostics) = self.diagnostics.as_mut() {
+                        diagnostics.push_decode(DecodeSelection {
+                            occupied_rows: rows,
+                            bucket: w,
+                            steps: 1,
+                        });
                     }
                     tracing::debug!(
                         rung = w,

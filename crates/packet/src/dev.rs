@@ -1358,6 +1358,22 @@ pub enum DevOp {
     /// `t0=o t1=q_raw t2=k_raw t3=v_raw t4=g_raw t5=beta_raw t6=state t7=descriptor` ·
     /// `i0=T(1) i1=H i2=D i3=BV i4=flags i5=W i6=gate_mode` · `f0=scale f1=lower_bound`.
     KdaConvStateStepG = 120,
+    /// Dense single-sequence BT64 chunk-KDA preparation. Normalizes q/k in place and produces
+    /// chunk-local log2 gate prefixes plus beta. Emitted for compiled `T>=512`; runtime ragged
+    /// rebasing may shorten `T`. `D in {64,128}`.
+    /// `t0=q(in/out) t1=k(in/out) t2=g_prefix t3=beta t4=g_raw t5=beta_raw t6=A_log
+    /// t7=dt_bias` · `i0=T i1=H i2=D i3=gate_mode` · `f0=lower_bound`.
+    KdaChunkPrepare = 121,
+    /// Dense BT64 chunk-local QK/KK products and triangular solve.
+    /// `t0=Aqk t1=Ainv t2=q t3=k t4=g_prefix t5=beta` · `i0=T i1=H i2=D` · `f0=scale`.
+    KdaChunkIntra = 122,
+    /// Transform a BT64 inverse into W/U factors.
+    /// `t0=W t1=U t2=Ainv t3=k t4=v t5=g_prefix t6=beta` · `i0=T i1=H i2=D i3=V`.
+    KdaChunkWu = 123,
+    /// Ordered dense single-sequence chunk carry, with V-first f32 recurrent state.
+    /// `t0=o t1=state t2=q t3=k t4=W t5=U t6=Aqk t7=g_prefix` ·
+    /// `i0=T i1=H i2=D i3=V` · `f0=scale`.
+    KdaChunkCarry = 124,
 }
 
 impl DevOp {
@@ -1488,6 +1504,10 @@ impl DevOp {
         DevOp::IndexSelectPf,
         DevOp::IndexUnionPf,
         DevOp::KdaConvStateStepG,
+        DevOp::KdaChunkPrepare,
+        DevOp::KdaChunkIntra,
+        DevOp::KdaChunkWu,
+        DevOp::KdaChunkCarry,
     ];
 
     /// Recover the opcode from its wire discriminant, or `None` for a value no
@@ -1629,6 +1649,10 @@ impl DevOp {
             DevOp::IndexSelectPf => "PLOW_DOP_INDEX_SELECT_PF",
             DevOp::IndexUnionPf => "PLOW_DOP_INDEX_UNION_PF",
             DevOp::KdaConvStateStepG => "PLOW_DOP_KDA_CONV_STATE_STEP_G",
+            DevOp::KdaChunkPrepare => "PLOW_DOP_KDA_CHUNK_PREPARE",
+            DevOp::KdaChunkIntra => "PLOW_DOP_KDA_CHUNK_INTRA",
+            DevOp::KdaChunkWu => "PLOW_DOP_KDA_CHUNK_WU",
+            DevOp::KdaChunkCarry => "PLOW_DOP_KDA_CHUNK_CARRY",
         }
     }
 
@@ -1658,7 +1682,7 @@ impl DevOp {
     /// bump: this constant is one past the HIGHEST opcode, not a count, and adding a pair moves it
     /// by two whether or not the range has holes.
     /// 116 -> 117 for `XReduceAddNorm = 116` (the fused TP seam).
-    pub const COUNT: u16 = 121;
+    pub const COUNT: u16 = 125;
 
     /// The `(M, N, K, quant)` a decode-GEMV opcode carries, or `None` if this is not one.
     ///
@@ -1996,6 +2020,14 @@ pub struct DevProgram {
     /// Built by [`crate::devbuild::static_seg_ofs`] at load time, NOT carried in
     /// the blob — see the field comment in `runtime/common/dev_isa.h` for why.
     pub seg_ofs: u64,
+    /// Device `[n_prefill_spans]` ragged packed-prefill metadata, or 0 for the
+    /// single-request path.
+    pub prefill_spans: u64,
+    /// Device `[n_prefill_rows]` parked-row mask, including the compiled rung's padded tail.
+    pub prefill_parked: u64,
+    pub n_prefill_spans: u32,
+    /// Launched compiled row count `T`, including parked padding after the dense real spans.
+    pub n_prefill_rows: u32,
 }
 
 /// One packet boundary, timestamped by the interpreter.
@@ -2027,4 +2059,4 @@ const _: () = assert!(size_of::<DevInst64>() == 64);
 const _: () = assert!(size_of::<StreamEnt>() == 24);
 const _: () = assert!(size_of::<PrefillSpan>() == 32);
 const _: () = assert!(size_of::<TraceRec>() == 40);
-const _: () = assert!(size_of::<DevProgram>() == 144);
+const _: () = assert!(size_of::<DevProgram>() == 168);

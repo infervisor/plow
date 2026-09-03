@@ -29,8 +29,15 @@
 #include <cstring>
 #define PLOW_MOE_PREFILL 1
 #define PLOW_MOE_PF_A4W4 1
+#if defined(MPF4_TEST_ATOMIC)
+#define PLOW_MOE_PF_ATOMIC 1
+#elif defined(MPF4_TEST_DET)
+#define PLOW_MOE_PF_DET 1
+#endif
 #include "amd_common.h"
+#define st_act1(p, v) st_act<bf16>((PLOW_GLOB bf16*)(p), (v))
 #include "op_moe.h"
+#undef st_act1
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -49,11 +56,20 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS, PLOW_WAVES / 4)
 void t_down(float* part, const unsigned char* fu, const unsigned char* fu_scale,
             const unsigned long long* wtab, const unsigned long long* stab, const int* meta,
             const unsigned* row_partidx, const float* row_gate, unsigned H, unsigned I,
-            unsigned n_exp) {
+            unsigned n_exp, unsigned ksh) {
     __shared__ unsigned char lds[MPF4_LDS_BYTES];
     d_moe_group_pf_a4w4<false>((void*)part, (const void*)fu, fu_scale, wtab, stab, meta, nullptr,
                                row_partidx, row_gate, nullptr, H, I, n_exp, 0, blockIdx.x,
-                               gridDim.x, 0.0f, 0.0f, (void*)lds);
+                               gridDim.x, 0.0f, 0.0f, (void*)lds
+#if PLOW_MOE_PF_ATOMIC
+                               , ksh
+#elif PLOW_MOE_PF_DET
+                               , ksh
+#endif
+                               );
+#if !PLOW_MOE_PF_ATOMIC && !PLOW_MOE_PF_DET
+    (void)ksh;
+#endif
 }
 
 static float fp4d(unsigned n){const float T[8]={0,.5f,1,1.5f,2,3,4,6};return (n&8)?-T[n&7]:T[n&7];}
@@ -182,7 +198,7 @@ int main(){
     /* poison, so an UNWRITTEN destination is a loud failure rather than a lucky zero */
     std::vector<float> poison(np, -12345.0f);
     HC(hipMemcpy(dpart,poison.data(),np*4,hipMemcpyHostToDevice));
-    hipLaunchKernelGGL(t_down,dim3(64),dim3(PLOW_THREADS),0,0,dpart,dfu,dfs,dwt,dst,dmeta,drp,drg,Hd,I,n_exp);
+    hipLaunchKernelGGL(t_down,dim3(64),dim3(PLOW_THREADS),0,0,dpart,dfu,dfs,dwt,dst,dmeta,drp,drg,Hd,I,n_exp,0u);
     HC(hipDeviceSynchronize());
     std::vector<float> part(np); HC(hipMemcpy(part.data(),dpart,np*4,hipMemcpyDeviceToHost));
     double wmax=0; unsigned untouched=0, checked=0;
@@ -207,6 +223,41 @@ int main(){
     printf("  DOWN (op 86) scatter+gate: checked %u values, %u unwritten, worst rel %.2e  %s\n",
            checked, untouched, wmax, (untouched==0 && wmax<2e-3)?"PASS":"FAIL");
     if(untouched || wmax>=2e-3) return 1;
+#if PLOW_MOE_PF_ATOMIC || PLOW_MOE_PF_DET
+    const unsigned ksh=2, atom_arg=ksh+1, acc_rows=T;
+#if PLOW_MOE_PF_ATOMIC
+    float* dacc; HC(hipMalloc(&dacc,(size_t)acc_rows*Hd*sizeof(float)));
+    HC(hipMemset(dacc,0,(size_t)acc_rows*Hd*sizeof(float)));
+    hipLaunchKernelGGL(t_down,dim3(64),dim3(PLOW_THREADS),0,0,dacc,dfu,dfs,dwt,dst,dmeta,drp,drg,Hd,I,n_exp,atom_arg);
+    HC(hipDeviceSynchronize());
+    std::vector<float> got_acc((size_t)acc_rows*Hd), want_acc((size_t)acc_rows*Hd,0.0f);
+    HC(hipMemcpy(got_acc.data(),dacc,got_acc.size()*sizeof(float),hipMemcpyDeviceToHost));
+    for(unsigned e=0;e<n_exp;e++) for(unsigned r=0;r<cnt[e];r++){
+      const unsigned pidx=rpid[rowoff[e]+r], tok=pidx>>ksh;
+      for(unsigned n=0;n<Hd;n++) want_acc[(size_t)tok*Hd+n]+=part[(size_t)pidx*Hd+n];
+    }
+    double aworst=0; for(size_t i=0;i<got_acc.size();i++) aworst=fmax(aworst,fabs((double)got_acc[i]-want_acc[i])/(fabs((double)want_acc[i])+1e-3));
+    printf("  DOWN atomic accumulator: worst rel %.2e  %s\n",aworst,aworst<2e-5?"PASS":"FAIL");
+    if(aworst>=2e-5) return 1;
+#else
+    double* dacc; HC(hipMalloc(&dacc,(size_t)acc_rows*Hd*sizeof(double)));
+    HC(hipMemset(dacc,0,(size_t)acc_rows*Hd*sizeof(double)));
+    hipLaunchKernelGGL(t_down,dim3(64),dim3(PLOW_THREADS),0,0,(float*)dacc,dfu,dfs,dwt,dst,dmeta,drp,drg,Hd,I,n_exp,atom_arg);
+    HC(hipDeviceSynchronize());
+    std::vector<double> got_acc((size_t)acc_rows*Hd), want_acc((size_t)acc_rows*Hd,0.0);
+    HC(hipMemcpy(got_acc.data(),dacc,got_acc.size()*sizeof(double),hipMemcpyDeviceToHost));
+    for(unsigned e=0;e<n_exp;e++) for(unsigned r=0;r<cnt[e];r++){
+      const unsigned pidx=rpid[rowoff[e]+r], tok=pidx>>ksh;
+      for(unsigned n=0;n<Hd;n++){
+        const double v=fmax(-131072.0,fmin(131072.0,(double)part[(size_t)pidx*Hd+n]));
+        want_acc[(size_t)tok*Hd+n]+=nearbyint(v*4294967296.0);
+      }
+    }
+    size_t mismatch=0; for(size_t i=0;i<got_acc.size();i++) mismatch+=(got_acc[i]!=want_acc[i]);
+    printf("  DOWN deterministic accumulator: mismatches %zu  %s\n",mismatch,mismatch==0?"PASS":"FAIL");
+    if(mismatch) return 1;
+#endif
+#endif
   }
 
   printf("A4W4 grouped MoE prefill GLU + fused bridge vs CPU reference:\n");

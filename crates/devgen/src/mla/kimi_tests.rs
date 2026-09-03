@@ -548,6 +548,7 @@ fn mla_ep_keeps_routed_experts_whole_beside_prefill() {
 /// widest bucket. Under-sizing them is an out-of-bounds DEVICE write, not a slowdown.
 #[test]
 fn mla_prefill_widens_the_shared_tensor_table() {
+    let _guard = crate::test_env::env_guard();
     let c = kimi_ref_cfg();
     let bytes = |m: &Model, n: &str| {
         m.tensors
@@ -716,6 +717,7 @@ fn mla_full_prefill_bucket_op_sequence() {
 /// `n_exp` on both grouped GEMMs (the table indirection), `T` on the router tail and combine.
 #[test]
 fn mla_full_prefill_moe_operands() {
+    let _guard = crate::test_env::env_guard();
     let c = kimi_k27_code_cfg(4);
     let m = pf_full(&c, 1024, &[256], 1..2);
     let p = &m.progs[0];
@@ -742,6 +744,7 @@ fn mla_full_prefill_moe_operands() {
 /// is guaranteed at 384: the padding alone is 384*127 = 48768 rows.
 #[test]
 fn mla_full_prefill_pads_the_gathered_rows() {
+    let _guard = crate::test_env::env_guard();
     let c = kimi_k27_code_cfg(4);
     let m = pf_full(&c, 1024, &[256], 1..2);
     let bytes = |n: &str| m.tensors.iter().find(|t| t.name == n).unwrap().bytes;

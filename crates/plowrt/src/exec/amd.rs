@@ -125,7 +125,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use packet::dev::{DevInst64, DevOp, DevProgram};
+use packet::dev::{DevInst64, DevOp, DevProgram, PrefillSpan, PREFILL_SPAN_RESET_STATE};
 use packet::devbuild::static_seg_ofs;
 
 use crate::asset::devblob::{DevBlob, DevProg};
@@ -576,6 +576,7 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     // The DETERMINISTIC twin (packet i[5] on op 86, i[4] on op 87). Same silence without it:
     // op 86 would scatter f32 into a [T,H] f64 accumulator and op 87 would read f64 as f32.
     ("PLOW_MOE_PF_DET", &["plow_moe_pf_det_arm"]),
+    ("PLOW_KDA_CHUNK", &["plow_kda_chunk_bt64_arm_1"]),
     // `#if PLOW_K3` (runtime/amd/interp.hip) gates ops 99-106 in BOTH buckets — the KDA mixer,
     // AttnRes, `situ` and the MLA output gate. It is the one arm flag that is not prefill-only,
     // and the one whose absence is most completely silent: a K3 packet on an object without it
@@ -601,6 +602,8 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
 /// ITS table names and leaves the rest to the other phase.
 const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_KDA_CONV_STEP_DB", &["plow_kda_conv_step_db_arm"]),
+    ("PLOW_MOE_PF_ATOMIC", &["plow_moe_pf_atomic_arm"]),
+    ("PLOW_MOE_PF_DET", &["plow_moe_pf_det_arm"]),
     // The GLM decode q-rope fold (op 50 t7 = cos, i6 = sin handle, t3 = RAW q_rope). An object
     // built before the arm stages t3 verbatim — an UNROPED query into the flash. Attention still
     // runs, nothing traps, and the model answers fluently and wrongly. This is the same silent
@@ -613,12 +616,25 @@ const DECODE_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_GLM_FUSE_QNORM", &["plow_glm_fuse_qnorm_arm"]),
 ];
 
+fn required_moe_pf_accum(progs: &[DevProg], field: usize) -> bool {
+    progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(|inst| inst.op == DevOp::MoeGroupDownPf as u16 && inst.i[field] != 0)
+}
+
 /// Refuse a DECODE code object that does not carry the arms the packet needs.
 ///
 /// See [`check_prefill_object`] for the full argument — this is that check, on the other object,
 /// and it ignores any flag [`DECODE_ARM_MARKERS`] does not name (those belong to the prefill
 /// object, which gets its own pass).
-fn check_decode_object(syms: &[&str], path: &Path, requires: &[String]) -> Result<()> {
+fn check_decode_object(
+    syms: &[&str],
+    path: &Path,
+    requires: &[String],
+    need_moe_pf_atomic: bool,
+    need_moe_pf_det: bool,
+) -> Result<()> {
     if syms.is_empty() {
         tracing::warn!(
             object = %path.display(),
@@ -629,6 +645,13 @@ fn check_decode_object(syms: &[&str], path: &Path, requires: &[String]) -> Resul
     for req in requires {
         let (flag, val) = req.split_once('=').unwrap_or((req.as_str(), "1"));
         if val == "0" {
+            continue;
+        }
+        // `requires` is blob-wide; a B1 decode object must not inherit an arm used only
+        // by grouped prefill programs.
+        if (flag == "PLOW_MOE_PF_ATOMIC" && !need_moe_pf_atomic)
+            || (flag == "PLOW_MOE_PF_DET" && !need_moe_pf_det)
+        {
             continue;
         }
         let Some((_, markers)) = DECODE_ARM_MARKERS.iter().find(|(f, _)| *f == flag) else {
@@ -844,6 +867,53 @@ const GEMV_CAP_SYM_PREFIX: &str = "plow_gemv_mm_cap_";
 /// symbol and is a hard-capacity object exactly as before.
 const GEMV_WALK_SYM: &str = "plow_gemv_walk_1";
 const XARGMAX_B128_SYM: &str = "plow_xargmax_max_batch_128";
+const PACKED_PREFILL_ABI_SYM: &str = "plow_packed_prefill_abi_1";
+const PACKED_PREFILL_MLA_SYM: &str = "plow_packed_prefill_mla_consumers_1";
+const PACKED_PREFILL_KDA_SYM: &str = "plow_packed_prefill_kda_consumers_1";
+
+fn check_packed_prefill_abi(prefill: bool, flash_required: bool, flash: bool) -> Result<()> {
+    if !prefill {
+        return Err(RuntimeError::Device(format!(
+            "packed-prefill metadata requires a prefill object advertising \
+             `{PACKED_PREFILL_ABI_SYM}`; rebuild the AMD objects before staging it"
+        )));
+    }
+    if flash_required && !flash {
+        return Err(RuntimeError::Device(format!(
+            "packed-prefill program routes a segment to a flash object that does not advertise \
+             `{PACKED_PREFILL_ABI_SYM}`; rebuild every routed AMD object before staging it"
+        )));
+    }
+    Ok(())
+}
+
+fn check_packed_prefill_mla_consumers(
+    prefill: bool,
+    flash_required: bool,
+    flash: bool,
+) -> Result<()> {
+    if !prefill || (flash_required && !flash) {
+        return Err(RuntimeError::Device(format!(
+            "packed-prefill MLA dispatch requires every routed object to advertise \
+             `{PACKED_PREFILL_MLA_SYM}`; ABI-only objects cannot consume span metadata"
+        )));
+    }
+    Ok(())
+}
+
+fn check_packed_prefill_kda_consumers(present: bool) -> Result<()> {
+    if !present {
+        return Err(RuntimeError::Device(format!(
+            "packed-prefill KDA dispatch requires `{PACKED_PREFILL_KDA_SYM}`; ABI-only objects \
+             cannot consume recurrent span metadata"
+        )));
+    }
+    Ok(())
+}
+
+fn packed_prefill_routes_flash(has_flash: bool, l2_domains: u32, seg_class: &[u8]) -> bool {
+    has_flash && l2_domains == 0 && seg_class.contains(&4)
+}
 
 /// `PLOW_GEMV_MAXM` from `runtime/amd/op_gemm.h` — the widest bucket the GEMV
 /// path can be instantiated at, and therefore the widest any object can
@@ -946,6 +1016,7 @@ fn is_lm_head_matmul(op: u16) -> bool {
 const K3_ARMS_SYM: &str = "plow_k3_arms_1";
 const MOE_PF_A4W4_SYM: &str = "plow_moe_pf_a4w4_arm";
 const KDA_CONV_STEP_DB_SYM: &str = "plow_kda_conv_step_db_arm";
+const KDA_CHUNK_SYM: &str = "plow_kda_chunk_bt64_arm_1";
 const KDA_CONV_STEP_DB_REPLACED_OPS: &[DevOp] = &[
     DevOp::KdaConv,
     DevOp::KdaGate,
@@ -970,6 +1041,10 @@ const K3_ARM_OPS: &[DevOp] = &[
     DevOp::KdaConv3,
     DevOp::KdaStateStepG,
     DevOp::KdaConvStateStepG,
+    DevOp::KdaChunkPrepare,
+    DevOp::KdaChunkIntra,
+    DevOp::KdaChunkWu,
+    DevOp::KdaChunkCarry,
     DevOp::AttnRes,
     DevOp::SituGlu,
     DevOp::MlaOutGate,
@@ -994,6 +1069,34 @@ fn required_moe_pf_a4w4(progs: &[DevProg]) -> Option<DevOp> {
 
 fn required_kda_conv_step_db(progs: &[DevProg]) -> Option<DevOp> {
     first_op_in(progs, &[DevOp::KdaConvStateStepG])
+}
+
+fn required_kda_chunk(progs: &[DevProg]) -> Option<DevOp> {
+    first_op_in(
+        progs,
+        &[
+            DevOp::KdaChunkPrepare,
+            DevOp::KdaChunkIntra,
+            DevOp::KdaChunkWu,
+            DevOp::KdaChunkCarry,
+        ],
+    )
+}
+
+fn check_kda_chunk(syms: &[&str], path: &Path, need: Option<DevOp>) -> Result<()> {
+    let Some(op) = need else {
+        return Ok(());
+    };
+    if syms.contains(&KDA_CHUNK_SYM) {
+        return Ok(());
+    }
+    Err(RuntimeError::Device(format!(
+        "packet/object chunk-KDA MISMATCH: this packet dispatches {op:?} (op {}), but {} does \
+         not advertise `{KDA_CHUNK_SYM}`. Rebuild the KDA prefill object with \
+         -DPLOW_KDA_CHUNK=1, or emit the serial recurrence.",
+        op as u16,
+        path.display()
+    )))
 }
 
 fn check_kda_conv_step_db(
@@ -2844,12 +2947,8 @@ fn kv_write_row_field(op: u16, dst: Option<&String>) -> Option<usize> {
 /// never on a precision flag.
 /// Every KDA opcode whose `i[0]` is the token-row count `T`.
 ///
-/// All six, not just the two that carry state. The conv and the recurrence are the
-/// ones a pad row CORRUPTS, but `KdaGate` feeds the recurrence and `KdaGatedNorm`
-/// consumes its output, and leaving those two at the bucket width would have them
-/// read rows the shortened arms never wrote. Uniform `clen` keeps one row count
-/// across the whole mixer, which is also the only version of this that can be
-/// stated in one sentence.
+/// Every mixer stage must see one uniform `clen`: legacy and chunk recurrences
+/// carry state, while their surrounding stages consume the shortened rows.
 const KDA_ROW_COUNT_OPS: &[DevOp] = &[
     DevOp::KdaConv,
     DevOp::KdaConv3,
@@ -2858,6 +2957,10 @@ const KDA_ROW_COUNT_OPS: &[DevOp] = &[
     DevOp::KdaStateStepG,
     DevOp::KdaConvStateStepG,
     DevOp::KdaGatedNorm,
+    DevOp::KdaChunkPrepare,
+    DevOp::KdaChunkIntra,
+    DevOp::KdaChunkWu,
+    DevOp::KdaChunkCarry,
 ];
 
 /// Where a prefill op carries its TOKEN-ROW COUNT, and whether that field is the
@@ -3155,6 +3258,128 @@ pub struct ChunkStep {
     pub clen: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackedPrefillBinding {
+    prog: usize,
+    n_spans: u32,
+    n_rows: u32,
+}
+
+fn validate_packed_prefill(
+    prog: usize,
+    rung: u32,
+    batch: usize,
+    spans: &[PrefillSpan],
+    parked: &[u32],
+) -> Result<PackedPrefillBinding> {
+    if spans.is_empty() {
+        return Err(RuntimeError::Device(
+            "packed prefill requires at least one span".into(),
+        ));
+    }
+    let prog_u32 = u32::try_from(prog)
+        .map_err(|_| RuntimeError::Device(format!("prefill program index {prog} exceeds u32")))?;
+    let mut row = 0u32;
+    for (i, span) in spans.iter().enumerate() {
+        if span.row0 != row || span.n_rows == 0 {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} is not dense: row0={} n_rows={} expected row0={row}",
+                span.row0, span.n_rows
+            )));
+        }
+        if span.flags & !PREFILL_SPAN_RESET_STATE != 0 {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} has unknown flags {:#x}",
+                span.flags
+            )));
+        }
+        let reset = span.flags & PREFILL_SPAN_RESET_STATE != 0;
+        if reset != (span.kv_row0 == 0) {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} reset flag disagrees with kv_row0={}",
+                span.kv_row0
+            )));
+        }
+        let kv_end = span.kv_row0.checked_add(span.n_rows).ok_or_else(|| {
+            RuntimeError::Device(format!("packed prefill span {i} KV range overflows u32"))
+        })?;
+        if kv_end != span.kv_len {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} has kv_row0+n_rows={kv_end}, kv_len={}",
+                span.kv_len
+            )));
+        }
+        if span.slot as usize >= batch
+            || span.state_slot as usize >= batch
+            || span.slot != span.state_slot
+        {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} has incompatible KV/state slots {}/{} for batch {batch}",
+                span.slot, span.state_slot
+            )));
+        }
+        if span.program != prog_u32 {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill span {i} names program {}, staged for {prog}",
+                span.program
+            )));
+        }
+        if spans[..i].iter().any(|prior| prior.slot == span.slot) {
+            return Err(RuntimeError::Device(format!(
+                "packed prefill slot {} appears in more than one span",
+                span.slot
+            )));
+        }
+        row = row
+            .checked_add(span.n_rows)
+            .ok_or_else(|| RuntimeError::Device("packed prefill row count overflows u32".into()))?;
+    }
+    if row > rung {
+        return Err(RuntimeError::Device(format!(
+            "packed prefill has {row} rows but program {prog} is compiled for {rung}"
+        )));
+    }
+    if parked.len() != rung as usize
+        || parked.iter().any(|&v| v > 1)
+        || parked[..row as usize].iter().any(|&v| v != 0)
+        || parked[row as usize..].iter().any(|&v| v == 0)
+    {
+        return Err(RuntimeError::Device(format!(
+            "packed prefill parked mask must have {rung} binary rows, active [0,{row})=0 and padding [{row},{rung})!=0 (got {})",
+            parked.len()
+        )));
+    }
+    let n_spans = u32::try_from(spans.len())
+        .map_err(|_| RuntimeError::Device("packed prefill span count exceeds u32".into()))?;
+    Ok(PackedPrefillBinding {
+        prog,
+        n_spans,
+        n_rows: rung,
+    })
+}
+
+fn check_packed_prefill_dispatch(binding: Option<PackedPrefillBinding>, prog: usize) -> Result<()> {
+    if let Some(bound) = binding.filter(|b| b.prog != prog) {
+        return Err(RuntimeError::Device(format!(
+            "packed-prefill metadata is staged for program {}, refusing to dispatch program {prog}; clear or restage it first",
+            bound.prog
+        )));
+    }
+    Ok(())
+}
+
+fn packed_prefill_kernarg(
+    binding: Option<PackedPrefillBinding>,
+    prog: usize,
+    spans: u64,
+    parked: u64,
+) -> (u64, u64, u32, u32) {
+    match binding.filter(|b| b.prog == prog) {
+        Some(b) => (spans, parked, b.n_spans, b.n_rows),
+        None => (0, 0, 0, 0),
+    }
+}
+
 /// Per-program local counter-bank state.
 ///
 /// TP keeps `current` on the bank used by the last dispatch so diagnostic
@@ -3216,6 +3441,10 @@ impl CounterBankState {
 /// One program's device-resident tables.
 struct AmdProg {
     t: u32,
+    packed_needs_mla: bool,
+    packed_mla_compatible: bool,
+    packed_needs_kda: bool,
+    packed_kda_compatible: bool,
     n_inst: u32,
     trace_records: usize,
     n_counter: u32,
@@ -3346,6 +3575,11 @@ pub struct AmdEngine {
     /// Task-13: low-rung decode tier ladder, ascending (max_rung, kernel).
     decode_tiers: Vec<(u32, HsaKernel)>,
     k_flash: Option<HsaKernel>,
+    packed_prefill_prefill_abi: bool,
+    packed_prefill_flash_abi: bool,
+    packed_prefill_prefill_mla: bool,
+    packed_prefill_flash_mla: bool,
+    packed_prefill_prefill_kda: bool,
     sched_prefill: Sched,
     sched_decode: Sched,
     _modules: Vec<Module>,
@@ -3361,6 +3595,14 @@ pub struct AmdEngine {
     h_zero: HsaPinned,
     /// Pinned staging for a prefill program's whole instruction array.
     h_pf_inst: HsaPinned,
+    /// Persistent device and pinned-host storage for ragged packed-prefill metadata. Sized once
+    /// for the widest compiled prefill rung; staging performs no allocation.
+    d_prefill_spans: DeviceMem,
+    d_prefill_parked: DeviceMem,
+    h_prefill_meta: HsaPinned,
+    prefill_span_capacity: usize,
+    prefill_row_capacity: usize,
+    packed_prefill: Option<PackedPrefillBinding>,
     d_state_clear: Option<DeviceMem>,
     n_state_clear: u32,
     /// Pristine host copy of each program's instructions. Prefill patching
@@ -3813,7 +4055,11 @@ impl AmdEngine {
         // asked about the phase it actually serves rather than about the blob as a whole.
         let need_k3_decode = required_k3_op(&blob.progs[dec_ix..]);
         let need_k3_prefill = required_k3_op(&blob.progs[..dec_ix]);
+        let need_kda_chunk_decode = required_kda_chunk(&blob.progs[dec_ix..]);
+        let need_kda_chunk_prefill = required_kda_chunk(&blob.progs[..dec_ix]);
         let need_a4w4_decode = required_moe_pf_a4w4(&blob.progs[dec_ix..]);
+        let need_moe_pf_atomic_decode = required_moe_pf_accum(&blob.progs[dec_ix..], 4);
+        let need_moe_pf_det_decode = required_moe_pf_accum(&blob.progs[dec_ix..], 5);
         let need_kda_conv_step_db = required_kda_conv_step_db(&blob.progs[dec_ix..]);
         let legacy_kda_decode = first_op_in(&blob.progs[dec_ix..], KDA_CONV_STEP_DB_REPLACED_OPS);
         if let Some(p) = blob.progs[..dec_ix].iter().find(|p| {
@@ -3891,8 +4137,9 @@ impl AmdEngine {
             .hsaco_lowrung
             .clone()
             .filter(|d| !d.is_empty());
+        type LK = (HsaKernel, bool, bool, bool);
         let mut load_one_in =
-            |phase: Phase, sched: Sched, dir: &Path, gemv_need: Option<u32>| -> Result<HsaKernel> {
+            |phase: Phase, sched: Sched, dir: &Path, gemv_need: Option<u32>| -> Result<LK> {
                 let name = object_name(phase, variant, prefill_arm, sched);
                 let path = dir.join(&name);
                 // WHICH OBJECT, BY NAME, AT INFO — and this line is not cosmetic.
@@ -3949,11 +4196,20 @@ impl AmdEngine {
                     }
                 })?;
                 let syms = elf_symbol_names(&image);
+                let packed_prefill_abi = syms.contains(&PACKED_PREFILL_ABI_SYM);
+                let packed_prefill_mla = syms.contains(&PACKED_PREFILL_MLA_SYM);
+                let packed_prefill_kda = syms.contains(&PACKED_PREFILL_KDA_SYM);
                 if let (Phase::Prefill, Some(req)) = (phase, requires.as_ref()) {
                     check_prefill_object(&syms, &path, req)?;
                 }
                 if let (Phase::Decode, Some(req)) = (phase, requires.as_ref()) {
-                    check_decode_object(&syms, &path, req)?;
+                    check_decode_object(
+                        &syms,
+                        &path,
+                        req,
+                        need_moe_pf_atomic_decode,
+                        need_moe_pf_det_decode,
+                    )?;
                 }
                 // The W_ofold fusion's arm lives in the FLASH object (the V2 MLA-prefill arm's
                 // ofold epilogue), and it additionally needs the V2 routing itself: without
@@ -4005,6 +4261,12 @@ impl AmdEngine {
                     Phase::Flash => None,
                 };
                 check_k3_arms(&syms, &path, need_k3)?;
+                let need_chunk = match phase {
+                    Phase::Decode => need_kda_chunk_decode,
+                    Phase::Prefill => need_kda_chunk_prefill,
+                    Phase::Flash => None,
+                };
+                check_kda_chunk(&syms, &path, need_chunk)?;
                 if phase == Phase::Decode {
                     check_moe_pf_a4w4(&syms, &path, need_a4w4_decode)?;
                     check_kda_conv_step_db(&syms, &path, need_kda_conv_step_db, legacy_kda_decode)?;
@@ -4122,11 +4384,21 @@ impl AmdEngine {
                 )));
                 }
                 modules.push(m);
-                Ok(k)
+                Ok((
+                    k,
+                    packed_prefill_abi,
+                    packed_prefill_mla,
+                    packed_prefill_kda,
+                ))
             };
 
-        let k_prefill = load_one_in(Phase::Prefill, sched_prefill, hsaco_dir, None)?;
-        let k_decode = load_one_in(Phase::Decode, sched_decode, hsaco_dir, None)?;
+        let (
+            k_prefill,
+            packed_prefill_prefill_abi,
+            packed_prefill_prefill_mla,
+            packed_prefill_prefill_kda,
+        ) = load_one_in(Phase::Prefill, sched_prefill, hsaco_dir, None)?;
+        let (k_decode, _, _, _) = load_one_in(Phase::Decode, sched_decode, hsaco_dir, None)?;
         // Task-13: the low-rung decode tier ladder. Each tier's pairing checks
         // run with ITS need (the widest rung it will serve), not the blob-wide
         // max — an MM=4 object legitimately serves rungs 1-2 of a B=32 blob.
@@ -4156,18 +4428,24 @@ impl AmdEngine {
             }
             tiers.sort_by_key(|&(_, m)| m);
             for (d, max) in tiers {
-                let k = load_one_in(Phase::Decode, sched_decode, Path::new(&d), Some(max))?;
+                let (k, _, _, _) =
+                    load_one_in(Phase::Decode, sched_decode, Path::new(&d), Some(max))?;
                 decode_tiers.push((max, k));
             }
         }
         // Flash follows the PREFILL scheduler — a flash segment is a prefill
         // segment. Optional: without it every segment runs class 8, which is
         // correct and merely slower.
-        let k_flash = match load_one_in(Phase::Flash, sched_prefill, hsaco_dir, None) {
-            Ok(k) => Some(k),
+        let (k_flash, packed_prefill_flash_abi, packed_prefill_flash_mla) = match load_one_in(
+            Phase::Flash,
+            sched_prefill,
+            hsaco_dir,
+            None,
+        ) {
+            Ok((k, abi, mla, _)) => (Some(k), abi, mla),
             Err(e) => {
                 tracing::info!(%e, "no flash object — flash segments run on the 8-wave interpreter");
-                None
+                (None, false, false)
             }
         };
 
@@ -4756,6 +5034,49 @@ impl AmdEngine {
             };
             progs.push(AmdProg {
                 t: p.t,
+                packed_needs_mla: p.insts.iter().any(|d| {
+                    d.op == DevOp::RmsNorm as u16
+                        || d.op == DevOp::HeadNormRope as u16
+                        || d.op == DevOp::HeadNormRopeFp8 as u16
+                        || d.op == DevOp::FlashMlaPrefill as u16
+                        || d.op == DevOp::FlashMlaPrefillFp8 as u16
+                }),
+                packed_mla_compatible: !p.insts.iter().any(|d| {
+                    d.op == DevOp::FlashGatherPrefill as u16
+                        || ((d.op == DevOp::FlashMlaPrefill as u16
+                            || d.op == DevOp::FlashMlaPrefillFp8 as u16)
+                            && d.t[7] != packet::dev::TENSOR_NONE as u16
+                            && d.op != DevOp::FlashMlaPrefillFp8 as u16)
+                }),
+                packed_needs_kda: p.insts.iter().any(|d| {
+                    d.op == DevOp::KdaConv3 as u16
+                        || d.op == DevOp::KdaStateStep as u16
+                        || d.op == DevOp::KdaStateStepG as u16
+                        || matches!(
+                            DevOp::from_u16(d.op),
+                            Some(
+                                DevOp::KdaConv
+                                    | DevOp::KdaChunkPrepare
+                                    | DevOp::KdaChunkIntra
+                                    | DevOp::KdaChunkWu
+                                    | DevOp::KdaChunkCarry
+                                    | DevOp::KdaConvStateStepG
+                            )
+                        )
+                }),
+                packed_kda_compatible: !p.insts.iter().any(|d| {
+                    matches!(
+                        DevOp::from_u16(d.op),
+                        Some(
+                            DevOp::KdaConv
+                                | DevOp::KdaChunkPrepare
+                                | DevOp::KdaChunkIntra
+                                | DevOp::KdaChunkWu
+                                | DevOp::KdaChunkCarry
+                                | DevOp::KdaConvStateStepG
+                        )
+                    )
+                }),
                 n_inst: p.insts.len() as u32,
                 trace_records: p.stream.len(),
                 n_counter: p.n_counter,
@@ -5044,6 +5365,18 @@ impl AmdEngine {
             &*be,
             (max_pf_inst * std::mem::size_of::<DevInst64>()).max(64),
         )?;
+        let max_pf_rows = blob.progs[..dec_lo]
+            .iter()
+            .map(|g| g.t as usize)
+            .max()
+            .unwrap_or(0);
+        let prefill_span_capacity = batch.max(1);
+        let prefill_row_capacity = max_pf_rows.max(1);
+        let span_bytes = prefill_span_capacity * std::mem::size_of::<PrefillSpan>();
+        let parked_bytes = prefill_row_capacity * std::mem::size_of::<u32>();
+        let d_prefill_spans = EngineDevice::alloc(&*be, span_bytes as u64)?;
+        let d_prefill_parked = EngineDevice::alloc(&*be, parked_bytes as u64)?;
+        let h_prefill_meta = EngineDevice::host_alloc_pinned(&*be, span_bytes + parked_bytes)?;
         let pf_src: Vec<Vec<DevInst64>> = blob.progs.iter().map(|g| g.insts.clone()).collect();
         let max_ctr = progs
             .iter()
@@ -5122,6 +5455,11 @@ impl AmdEngine {
             d_token_ring,
             decode_tiers,
             k_flash,
+            packed_prefill_prefill_abi,
+            packed_prefill_flash_abi,
+            packed_prefill_prefill_mla,
+            packed_prefill_flash_mla,
+            packed_prefill_prefill_kda,
             sched_prefill,
             sched_decode,
             _modules: modules,
@@ -5129,6 +5467,12 @@ impl AmdEngine {
             h_scalar,
             h_zero,
             h_pf_inst,
+            d_prefill_spans,
+            d_prefill_parked,
+            h_prefill_meta,
+            prefill_span_capacity,
+            prefill_row_capacity,
+            packed_prefill: None,
             d_state_clear,
             n_state_clear,
             pf_src,
@@ -5243,6 +5587,93 @@ impl AmdEngine {
         &self.tensor_names
     }
 
+    /// Validate and upload one ragged packed-prefill descriptor. The binding is program-exact:
+    /// every other program continues to receive null metadata in its kernarg.
+    pub fn stage_packed_prefill(
+        &mut self,
+        prog: usize,
+        spans: &[PrefillSpan],
+        parked: &[u32],
+    ) -> Result<()> {
+        self.packed_prefill = None;
+        if prog >= self.dec_lo {
+            return Err(RuntimeError::Device(format!(
+                "program {prog} is a decode rung, not a packed-prefill program"
+            )));
+        }
+        check_packed_prefill_abi(
+            self.packed_prefill_prefill_abi,
+            packed_prefill_routes_flash(
+                self.k_flash.is_some(),
+                self.progs[prog].l2_domains,
+                &self.progs[prog].seg_class,
+            ),
+            self.packed_prefill_flash_abi,
+        )?;
+        if self.progs[prog].packed_needs_mla {
+            if !self.progs[prog].packed_mla_compatible {
+                return Err(RuntimeError::Device(
+                    "packed-prefill MLA does not support gathered/per-query selector packets"
+                        .into(),
+                ));
+            }
+            check_packed_prefill_mla_consumers(
+                self.packed_prefill_prefill_mla,
+                packed_prefill_routes_flash(
+                    self.k_flash.is_some(),
+                    self.progs[prog].l2_domains,
+                    &self.progs[prog].seg_class,
+                ),
+                self.packed_prefill_flash_mla,
+            )?;
+        }
+        if self.progs[prog].packed_needs_kda {
+            if !self.progs[prog].packed_kda_compatible {
+                return Err(RuntimeError::Device(
+                    "packed-prefill KDA supports serial Conv3/state only; chunk/double-buffered \
+                     KDA packets remain disabled"
+                        .into(),
+                ));
+            }
+            check_packed_prefill_kda_consumers(self.packed_prefill_prefill_kda)?;
+        }
+        let rung = self.progs.get(prog).map(|p| p.t).ok_or_else(|| {
+            RuntimeError::Device(format!("packed-prefill program {prog} is out of range"))
+        })?;
+        let binding = validate_packed_prefill(prog, rung, self.batch, spans, parked)?;
+        if spans.len() > self.prefill_span_capacity || parked.len() > self.prefill_row_capacity {
+            return Err(RuntimeError::Device(format!(
+                "packed-prefill metadata exceeds staging capacity: spans {}/{}, rows {}/{}",
+                spans.len(),
+                self.prefill_span_capacity,
+                parked.len(),
+                self.prefill_row_capacity
+            )));
+        }
+
+        let span_bytes = std::mem::size_of_val(spans);
+        let parked_bytes = std::mem::size_of_val(parked);
+        let parked_off = self.prefill_span_capacity * std::mem::size_of::<PrefillSpan>();
+        self.h_prefill_meta.as_mut_slice()[..span_bytes].copy_from_slice(as_bytes(spans));
+        self.h_prefill_meta.as_mut_slice()[parked_off..parked_off + parked_bytes]
+            .copy_from_slice(as_bytes(parked));
+        self.be.memcpy_htod_pinned(
+            self.d_prefill_spans.base,
+            &self.h_prefill_meta.as_slice()[..span_bytes],
+        )?;
+        self.be.memcpy_htod_pinned(
+            self.d_prefill_parked.base,
+            &self.h_prefill_meta.as_slice()[parked_off..parked_off + parked_bytes],
+        )?;
+        self.packed_prefill = Some(binding);
+        Ok(())
+    }
+
+    /// Remove the current packed-prefill binding. Device buffers remain allocated for reuse.
+    pub fn clear_packed_prefill(&mut self) {
+        self.packed_prefill = None;
+    }
+
     /// Upload bytes into a named tensor (block I/O, and weight loaders).
     pub fn write_tensor(&mut self, name: &str, src: &[u8]) -> Result<()> {
         let i = self
@@ -5302,6 +5733,13 @@ impl AmdEngine {
     /// Build the kernarg block for program `p` at segment `seg`.
     fn kernarg(&self, p: usize, seg: u32) -> DevProgram {
         let g = &self.progs[p];
+        let (prefill_spans, prefill_parked, n_prefill_spans, n_prefill_rows) =
+            packed_prefill_kernarg(
+                self.packed_prefill,
+                p,
+                self.d_prefill_spans.base,
+                self.d_prefill_parked.base,
+            );
         DevProgram {
             insts: g.d_inst.base,
             stream: g.d_stream.base,
@@ -5344,6 +5782,10 @@ impl AmdEngine {
             peer_scratch: self.tp.map_or(0, |t| t.peer_table),
             rank: self.tp.map_or(0, |t| t.rank),
             n_gpu: self.tp.map_or(0, |t| t.n_gpu),
+            prefill_spans,
+            prefill_parked,
+            n_prefill_spans,
+            n_prefill_rows,
         }
     }
 
@@ -5444,6 +5886,7 @@ impl AmdEngine {
     /// exactly once with `seg == 0`; the device ignores `cur_seg` and drains all
     /// domain windows concurrently.
     pub fn enqueue_segment(&mut self, p: usize, seg: usize) -> Result<()> {
+        check_packed_prefill_dispatch(self.packed_prefill, p)?;
         self.trace_write_bytes
             .set(self.progs[p].trace_records * TRACE_REC_BYTES);
         let use4 = self.k_flash.is_some() && self.progs[p].seg_class[seg] == 4;
@@ -5474,6 +5917,7 @@ impl AmdEngine {
     /// been dispatched to produce — reintroducing exactly the launched-collective
     /// latency the inline design exists to avoid.
     pub fn enqueue(&mut self, p: usize, k: HsaKernel) -> Result<()> {
+        check_packed_prefill_dispatch(self.packed_prefill, p)?;
         self.trace_write_bytes
             .set(self.progs[p].trace_records * TRACE_REC_BYTES);
         let arg = self.kernarg(p, 0);
@@ -6808,6 +7252,11 @@ impl AmdEngine {
         self.dec_lo > 0
     }
 
+    /// Compiled row count for a prefill program. Decode program indices are rejected.
+    pub fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
+        (prog < self.dec_lo).then(|| self.progs[prog].t)
+    }
+
     /// The decode rung widths, ascending. One entry without a ladder.
     pub fn decode_rungs(&self) -> Vec<u32> {
         (self.dec_lo..=self.decode)
@@ -6964,6 +7413,184 @@ fn kernarg_bytes(p: &DevProgram) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn packed_spans() -> [PrefillSpan; 2] {
+        [
+            PrefillSpan {
+                row0: 0,
+                n_rows: 3,
+                slot: 0,
+                flags: PREFILL_SPAN_RESET_STATE,
+                kv_row0: 0,
+                kv_len: 3,
+                state_slot: 0,
+                program: 2,
+            },
+            PrefillSpan {
+                row0: 3,
+                n_rows: 2,
+                slot: 1,
+                flags: 0,
+                kv_row0: 5,
+                kv_len: 7,
+                state_slot: 1,
+                program: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn packed_prefill_accepts_dense_ragged_rows_and_parked_padding() {
+        let binding =
+            validate_packed_prefill(2, 8, 2, &packed_spans(), &[0, 0, 0, 0, 0, 1, 1, 1]).unwrap();
+        assert_eq!(
+            binding,
+            PackedPrefillBinding {
+                prog: 2,
+                n_spans: 2,
+                n_rows: 8
+            }
+        );
+    }
+
+    #[test]
+    fn packed_prefill_rejects_malformed_spans_and_masks() {
+        let good_mask = [0, 0, 0, 0, 0, 1, 1, 1];
+        let reject = |spans: &[PrefillSpan], mask: &[u32]| {
+            assert!(validate_packed_prefill(2, 8, 2, spans, mask).is_err());
+        };
+
+        let mut spans = packed_spans();
+        spans[1].row0 = 4;
+        reject(&spans, &good_mask);
+        let mut spans = packed_spans();
+        spans[1].kv_len = 8;
+        reject(&spans, &good_mask);
+        let mut spans = packed_spans();
+        spans[1].flags = PREFILL_SPAN_RESET_STATE;
+        reject(&spans, &good_mask);
+        let mut spans = packed_spans();
+        spans[1].slot = 0;
+        spans[1].state_slot = 0;
+        reject(&spans, &good_mask);
+        let mut spans = packed_spans();
+        spans[1].state_slot = 0;
+        reject(&spans, &good_mask);
+        let mut spans = packed_spans();
+        spans[1].program = 3;
+        reject(&spans, &good_mask);
+        reject(&packed_spans(), &[0, 0, 0, 0, 0]);
+        reject(&packed_spans(), &[0, 1, 0, 0, 0, 1, 1, 1]);
+        reject(&packed_spans(), &[0, 0, 0, 0, 0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn packed_prefill_kernarg_is_legacy_null_or_exact_program_only() {
+        assert_eq!(
+            packed_prefill_kernarg(None, 2, 0x1000, 0x2000),
+            (0, 0, 0, 0)
+        );
+        let binding = PackedPrefillBinding {
+            prog: 2,
+            n_spans: 2,
+            n_rows: 8,
+        };
+        assert_eq!(
+            packed_prefill_kernarg(Some(binding), 2, 0x1000, 0x2000),
+            (0x1000, 0x2000, 2, 8)
+        );
+        assert_eq!(
+            packed_prefill_kernarg(Some(binding), 1, 0x1000, 0x2000),
+            (0, 0, 0, 0)
+        );
+        assert!(check_packed_prefill_dispatch(Some(binding), 2).is_ok());
+        assert!(check_packed_prefill_dispatch(Some(binding), 1).is_err());
+    }
+
+    #[test]
+    fn packed_prefill_requires_abi_on_every_routed_object() {
+        assert!(check_packed_prefill_abi(true, false, false).is_ok());
+        assert!(check_packed_prefill_abi(true, true, true).is_ok());
+
+        let missing_prefill = check_packed_prefill_abi(false, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_prefill.contains(PACKED_PREFILL_ABI_SYM));
+
+        let missing_flash = check_packed_prefill_abi(true, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_flash.contains("flash object"));
+        assert!(missing_flash.contains(PACKED_PREFILL_ABI_SYM));
+
+        assert!(packed_prefill_routes_flash(true, 0, &[8, 4, 8]));
+        assert!(!packed_prefill_routes_flash(false, 0, &[4]));
+        assert!(!packed_prefill_routes_flash(true, 8, &[0, 4, 7]));
+    }
+
+    #[test]
+    fn packed_prefill_requires_consumer_markers_not_just_the_abi() {
+        assert!(check_packed_prefill_mla_consumers(true, false, false).is_ok());
+        assert!(check_packed_prefill_mla_consumers(true, true, true).is_ok());
+        let missing_mla = check_packed_prefill_mla_consumers(false, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_mla.contains(PACKED_PREFILL_MLA_SYM));
+        assert!(missing_mla.contains("ABI-only"));
+        let missing_flash = check_packed_prefill_mla_consumers(true, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_flash.contains(PACKED_PREFILL_MLA_SYM));
+
+        assert!(check_packed_prefill_kda_consumers(true).is_ok());
+        let missing_kda = check_packed_prefill_kda_consumers(false)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_kda.contains(PACKED_PREFILL_KDA_SYM));
+        assert!(missing_kda.contains("ABI-only"));
+    }
+
+    #[test]
+    fn prefill_only_accumulation_does_not_require_a_decode_arm() {
+        let obj = Path::new("interp_decode_k3.elf");
+        let mut prefill = segmented_prog(&[DevOp::MoeGroupDownPf], &[0]);
+        prefill.insts[0].i[4] = 4;
+        let b1_decode = segmented_prog(&[DevOp::Gemv], &[0]);
+        assert!(required_moe_pf_accum(std::slice::from_ref(&prefill), 4));
+        assert!(!required_moe_pf_accum(std::slice::from_ref(&b1_decode), 4));
+        let requires = vec![
+            "PLOW_MOE_PF_ATOMIC=1".to_owned(),
+            "PLOW_MOE_PF_DET=1".to_owned(),
+        ];
+        assert!(
+            check_decode_object(&["plow_interp_dec_gfx950"], obj, &requires, false, false,).is_ok()
+        );
+    }
+
+    #[test]
+    fn grouped_decode_requires_its_accumulation_arm() {
+        let obj = Path::new("interp_decode_k3.elf");
+        for (flag, marker) in [
+            ("PLOW_MOE_PF_ATOMIC", "plow_moe_pf_atomic_arm"),
+            ("PLOW_MOE_PF_DET", "plow_moe_pf_det_arm"),
+        ] {
+            let requires = vec![format!("{flag}=1")];
+            let mut prog = segmented_prog(&[DevOp::MoeGroupDownPf], &[0]);
+            prog.insts[0].i[if flag == "PLOW_MOE_PF_ATOMIC" { 4 } else { 5 }] = 4;
+            let need_atomic = required_moe_pf_accum(std::slice::from_ref(&prog), 4);
+            let need_det = required_moe_pf_accum(std::slice::from_ref(&prog), 5);
+            assert!(check_decode_object(&[marker], obj, &requires, need_atomic, need_det,).is_ok());
+            let err = check_decode_object(
+                &["plow_interp_dec_gfx950"],
+                obj,
+                &requires,
+                need_atomic,
+                need_det,
+            )
+            .expect_err("a grouped decode object without its accumulation arm must refuse");
+            assert!(err.to_string().contains(flag));
+        }
+    }
 
     fn segmented_prog(ops: &[DevOp], segs: &[u16]) -> DevProg {
         assert_eq!(ops.len(), segs.len());
@@ -7499,6 +8126,30 @@ mod tests {
         assert_eq!(required_k3_op(&plain), None);
         assert!(check_k3_arms(&bare, obj, required_k3_op(&plain)).is_ok());
         assert!(check_k3_arms(&with_k3, obj, required_k3_op(&plain)).is_ok());
+    }
+
+    #[test]
+    fn chunk_kda_requires_its_exact_object_marker() {
+        let obj = Path::new("interp_prefill_k3.elf");
+        let bare = [K3_ARMS_SYM];
+        let armed = [K3_ARMS_SYM, KDA_CHUNK_SYM];
+        let ops = [
+            DevOp::KdaChunkPrepare,
+            DevOp::KdaChunkIntra,
+            DevOp::KdaChunkWu,
+            DevOp::KdaChunkCarry,
+        ];
+        let pkt = vec![prog_gemv(&ops, 512)];
+        assert_eq!(required_kda_chunk(&pkt), Some(DevOp::KdaChunkPrepare));
+        let err = check_kda_chunk(&bare, obj, required_kda_chunk(&pkt)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(KDA_CHUNK_SYM));
+        assert!(msg.contains("PLOW_KDA_CHUNK"));
+        assert!(check_kda_chunk(&armed, obj, required_kda_chunk(&pkt)).is_ok());
+
+        let serial = vec![prog_gemv(&[DevOp::KdaStateStepG], 512)];
+        assert_eq!(required_kda_chunk(&serial), None);
+        assert!(check_kda_chunk(&bare, obj, None).is_ok());
     }
 
     #[test]
@@ -8169,7 +8820,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let mut inst = |op: DevOp, i: [u32; 8]| DevInst64 {
+        let inst = |op: DevOp, i: [u32; 8]| DevInst64 {
             op: op as u16,
             t: [0, 0, 0, 0, 0, 0, 0, 0],
             i,
@@ -8319,47 +8970,41 @@ mod tests {
 
     /// EVERY KDA OP'S ROW COUNT BECOMES `clen`, AND THE BUG IS WHAT THIS ASSERTS.
     ///
-    /// The fixture is the shape that was actually broken: a 1500-token prompt on a
-    /// [1024, 512] ladder, whose last chunk is 476 real rows padded out to 512. The
-    /// pre-fix `rebase_chunk` had no KDA arm at all, so `i[0]` kept the compiler's
-    /// baked 512 and both stateful arms ran 36 pad rows past the prompt — the conv
-    /// rolling zeros through a 4-wide window (evicting every real tap) and the
-    /// recurrence applying 36 extra `exp(a_log)` decays to the state decode then
-    /// starts from.
+    /// This covers both a compiled 512-row rung shortened to 511 and the production
+    /// 8192-row rung shortened to 8191. Before KDA rebasing, every stateful arm ran
+    /// through the padded tail and advanced the carried state past the real final token.
     ///
     /// Asserted as `!= t` rather than only `== clen` so that a future change which
     /// re-bakes `T` somewhere else still fails here: the property is "the KDA row
-    /// count is the REAL row count", not "this field happens to hold 476".
+    /// count is the REAL row count", not one pinned tail size.
     #[test]
     fn rebase_chunk_shortens_every_kda_arm_to_the_real_row_count() {
         let names: Vec<String> = ["kv.0.state", "act.q"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        const T: u32 = 512;
-        const CLEN: u32 = 476;
-        let kda = |op: DevOp| DevInst64 {
-            op: op as u16,
-            i: [T, 96, 128, 0, 0, 0, 0, 0],
-            ..Default::default()
-        };
-        let mut insts: Vec<DevInst64> = KDA_ROW_COUNT_OPS.iter().map(|&o| kda(o)).collect();
-        // A non-KDA neighbour that must NOT be touched by the new arm.
-        insts.push(DevInst64 {
-            op: DevOp::RmsNorm as u16,
-            i: [T, 0, 0, 0, 0, 0, 0, 0],
-            ..Default::default()
-        });
-        rebase_chunk_rows(&mut insts, &names, 1024, CLEN, None);
+        for (t, clen) in [(512, 511), (8192, 8191)] {
+            let kda = |op: DevOp| DevInst64 {
+                op: op as u16,
+                i: [t, 96, 128, 0, 0, 0, 0, 0],
+                ..Default::default()
+            };
+            let mut insts: Vec<DevInst64> = KDA_ROW_COUNT_OPS.iter().map(|&o| kda(o)).collect();
+            // A non-KDA neighbour that must NOT be touched by the new arm.
+            insts.push(DevInst64 {
+                op: DevOp::RmsNorm as u16,
+                i: [t, 0, 0, 0, 0, 0, 0, 0],
+                ..Default::default()
+            });
+            rebase_chunk_rows(&mut insts, &names, 1024, clen, None);
 
-        for (d, &op) in insts.iter().zip(KDA_ROW_COUNT_OPS) {
-            assert_eq!(d.i[0], CLEN, "{op:?} still runs the padded bucket width");
-            assert_ne!(d.i[0], T, "{op:?} kept the compiler's baked T");
-            // The rest of the immediates are live operands (heads, head_dim) and
-            // patching one of them is the positional bug this module keeps hitting.
-            assert_eq!((d.i[1], d.i[2]), (96, 128), "{op:?}: a live operand moved");
+            for (d, &op) in insts.iter().zip(KDA_ROW_COUNT_OPS) {
+                assert_eq!(d.i[0], clen, "{op:?} still runs the padded bucket width");
+                assert_ne!(d.i[0], t, "{op:?} kept the compiler's baked T");
+                assert_eq!((d.i[1], d.i[2]), (96, 128), "{op:?}: a live operand moved");
+            }
+            assert_eq!(insts.last().unwrap().i[0], t, "a non-KDA op was shortened");
         }
-        assert_eq!(insts.last().unwrap().i[0], T, "a non-KDA op was shortened");
     }
 
     /// THE ATTNRES SCORE WEIGHT IS DERIVED, AND THE FOLD IS CHECKED AGAINST THE

@@ -650,6 +650,9 @@ option(PLOW_HSACO_MLA "Also emit the MLA prefill object (Kimi/DeepSeek/GLM)" ON)
 # (+14.9% on decode) and is exactly why these stay SEPARATE OBJECTS rather than becoming defines
 # on the rows above. Cost of the default: ~31 s of build, doubled by the `_gq` twins, and ~3 MB.
 option(PLOW_HSACO_K3 "Also emit the Kimi-K3 / KDA objects (decode + prefill)" ON)
+option(PLOW_HSACO_PACKED_PREFILL_CONSUMERS
+       "Emit separate default-off K3 prefill objects that consume packed span metadata" OFF)
+option(PLOW_HSACO_KDA_CHUNK "Include the opt-in BT64 chunk-KDA prefill arms" OFF)
 option(PLOW_K3_DECODE_MXFP4_PROJ
        "Include standalone MXFP4 projection ops in K3 decode objects" ON)
 option(PLOW_K3_DECODE_GROUPED
@@ -658,6 +661,13 @@ option(PLOW_MXFP4_DECODE_NT
        "Use non-temporal loads for one-use decode MXFP4 projection weights" ON)
 option(PLOW_MOE_PF_A4W4_WEIGHT_NT
        "Use non-temporal loads for grouped A4W4 expert weights" OFF)
+option(PLOW_MOE_PF_ATOMIC
+       "Fuse grouped-MoE prefill down/combine through an f32 atomic accumulator" OFF)
+option(PLOW_MOE_PF_DET
+       "Fuse grouped-MoE prefill down/combine through a deterministic f64 accumulator" OFF)
+if(PLOW_MOE_PF_ATOMIC AND PLOW_MOE_PF_DET)
+    message(FATAL_ERROR "PLOW_MOE_PF_ATOMIC and PLOW_MOE_PF_DET are mutually exclusive")
+endif()
 option(PLOW_K3_DECODE_TILE_BINSEARCH
        "Use binary expert-tile lookup in batched K3 decode" ON)
 option(PLOW_K3_DECODE_ALIGN_PAR_PREFIX
@@ -791,6 +801,12 @@ if(PLOW_GFX950_HSACO)
         list(APPEND _hs_ax_mxfp4 -DPLOW_MXFP4_DEC_NT=0)
     endif()
     set(_hs_ax_mla -DPLOW_MLA_PREFILL=1)
+    set(_hs_ax_moe_pf_accum "")
+    if(PLOW_MOE_PF_ATOMIC)
+        set(_hs_ax_moe_pf_accum -DPLOW_MOE_PF_ATOMIC=1)
+    elseif(PLOW_MOE_PF_DET)
+        set(_hs_ax_moe_pf_accum -DPLOW_MOE_PF_DET=1)
+    endif()
     # Composed, not spelled out: an all-fp8 Kimi K2.7 / GLM-5.2 / DeepSeek prefill
     # needs the MLA attention arms AND the w8a8 GEMM arms in the same object, and a
     # showcase run must be all-fp8 or all-bf16 — never one bucket of each.
@@ -799,8 +815,10 @@ if(PLOW_GFX950_HSACO)
     # attention-complete and FFN-incomplete — the expert packets fall through to `default:`
     # and write nothing — so these are the rows that actually make a Kimi/GLM/DeepSeek
     # prompt runnable. Measured: the grouped-expert GEMM costs occ NOTHING (see the rows).
-    set(_hs_ax_mla_moe ${_hs_ax_mla} -DPLOW_MOE_PREFILL=1)
-    set(_hs_ax_mla_moe_fp8 ${_hs_ax_mla_fp8} -DPLOW_MOE_PREFILL=1)
+    set(_hs_ax_mla_moe
+        ${_hs_ax_mla} -DPLOW_MOE_PREFILL=1 ${_hs_ax_moe_pf_accum})
+    set(_hs_ax_mla_moe_fp8
+        ${_hs_ax_mla_fp8} -DPLOW_MOE_PREFILL=1 ${_hs_ax_moe_pf_accum})
     # A4W4: MXFP4 on BOTH operands through the matrix core, the encoding ATOM runs. Compile-time
     # like every other precision axis -- a runtime encoding switch would make the register
     # allocator budget for the worst body and then every body spills (interp.hip states the trap).
@@ -831,6 +849,9 @@ if(PLOW_GFX950_HSACO)
     # REPLACING the unroll does not grow the register union the way adding a second arm does.
     set(_hs_ax_k3 -DPLOW_K3=1 -DGV_UNROLL=14)
     set(_hs_ax_mla_k3 ${_hs_ax_mla} -DPLOW_K3=1)
+    if(PLOW_HSACO_KDA_CHUNK)
+        list(APPEND _hs_ax_mla_k3 -DPLOW_KDA_CHUNK=1)
+    endif()
     # K3's optional compressed-latent KV uses the same model arms with the fp8-KV swap. These are
     # separate objects: PLOW_FP8_KV removes the bf16 FlashMLA arm, so composing it into the plain
     # K3 row would make bf16 packets silently miss their dispatch case.
@@ -878,11 +899,13 @@ if(PLOW_GFX950_HSACO)
             set(_hs_ax_k3_dec_mxfp4 ${_hs_ax_mxfp4})
         endif()
         set(_hs_ax_k3_dec ${_hs_ax_k3_dec} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1
-            ${_hs_ax_a4w4_weight} ${_hs_ax_k3_tile_search} ${_hs_ax_k3_align_prefix}
+            ${_hs_ax_moe_pf_accum} ${_hs_ax_a4w4_weight} ${_hs_ax_k3_tile_search}
+            ${_hs_ax_k3_align_prefix}
             ${_hs_ax_k3_router_local} ${_hs_ax_k3_decode_xr_agg} ${_hs_ax_k3_dec_mxfp4})
         set(_hs_ax_k3_dec_fp8kv
             ${_hs_ax_k3_dec_fp8kv} -DPLOW_MOE_PREFILL=1 -DPLOW_MOE_PF_A4W4=1
-            ${_hs_ax_a4w4_weight} ${_hs_ax_k3_tile_search} ${_hs_ax_k3_align_prefix}
+            ${_hs_ax_moe_pf_accum} ${_hs_ax_a4w4_weight} ${_hs_ax_k3_tile_search}
+            ${_hs_ax_k3_align_prefix}
             ${_hs_ax_k3_router_local} ${_hs_ax_k3_decode_xr_agg} ${_hs_ax_k3_dec_mxfp4})
     endif()
     # ...and the FFN half. A K3 prefill bucket runs the GROUPED expert chain (ops 83-87), not the
@@ -890,8 +913,10 @@ if(PLOW_GFX950_HSACO)
     # it. Without PLOW_MOE_PREFILL those five packets fall through the dispatch `default:` and
     # write NOTHING, which on this interpreter is silent. So `interp_prefill_k3` above is an
     # ATTENTION-ONLY object and a whole-layer K3 prompt needs one of these two.
-    set(_hs_ax_k3_moe ${_hs_ax_mla_k3} -DPLOW_MOE_PREFILL=1)
-    set(_hs_ax_k3_moe_fp8kv ${_hs_ax_mla_k3_fp8kv} -DPLOW_MOE_PREFILL=1)
+    set(_hs_ax_k3_moe
+        ${_hs_ax_mla_k3} -DPLOW_MOE_PREFILL=1 ${_hs_ax_moe_pf_accum})
+    set(_hs_ax_k3_moe_fp8kv
+        ${_hs_ax_mla_k3_fp8kv} -DPLOW_MOE_PREFILL=1 ${_hs_ax_moe_pf_accum})
     set(_hs_ax_k3_pf_state "")
     if(PLOW_KDA_PF_STATE_RESIDENT)
         set(_hs_ax_k3_pf_state -DPLOW_KDA_PF_STATE_RESIDENT=1)
@@ -904,6 +929,8 @@ if(PLOW_GFX950_HSACO)
     set(_hs_ax_k3_moe_a4w4
         ${_hs_ax_k3_moe} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight}
         ${_hs_ax_k3_pf_state} -DPLOW_MXFP4=1)
+    set(_hs_ax_k3_moe_a4w4_packed
+        ${_hs_ax_k3_moe_a4w4} -DPLOW_PACKED_PREFILL_CONSUMERS=1)
     set(_hs_ax_k3_moe_a4w4_fp8kv
         ${_hs_ax_k3_moe_fp8kv} -DPLOW_MOE_PF_A4W4=1 ${_hs_ax_a4w4_weight}
         ${_hs_ax_k3_pf_state} -DPLOW_MXFP4=1)
@@ -1031,6 +1058,12 @@ if(PLOW_GFX950_HSACO)
                 "interp_prefill_fp8kv_k3|${_hs_kpf}|_hs_ax_prefill|_hs_ax_mla_k3_fp8kv|256|2"
                 "interp_prefill_fp8kv_k3_moe|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_fp8kv|256|2"
                 "interp_prefill_fp8kv_k3_moe_a4w4|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_a4w4_fp8kv|256|2")
+        endif()
+        if(PLOW_HSACO_PACKED_PREFILL_CONSUMERS)
+            # Deliberately a separate filename: the production router cannot select this object
+            # until live packed dispatch is enabled and parity-gated.
+            list(APPEND _hs_rows
+                "interp_prefill_k3_moe_a4w4_packed|${_hs_kpf}|_hs_ax_prefill|_hs_ax_k3_moe_a4w4_packed|256|2")
         endif()
     endif()
 

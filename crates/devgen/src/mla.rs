@@ -3266,7 +3266,7 @@ pub(crate) enum MoePfFuse {
     Atomic,
     Det,
 }
-fn moe_pf_fuse(tk: u32) -> MoePfFuse {
+pub(crate) fn moe_pf_fuse(tk: u32) -> MoePfFuse {
     if moe_pf_part16() || tk == 0 || !tk.is_power_of_two() {
         return MoePfFuse::None;
     }
@@ -3620,6 +3620,7 @@ fn emit_glm_mla_prefill(
                 d.i[2] = dk;
                 d.i[3] = 0; // chunk base, patched per chunk
                 d.i[4] = 0; // apply RMSNorm before quantizing
+                d.i[7] = ctx; // packed-prefill per-slot cache row stride
                 d.f[0] = eps;
                 d.j[1] = KV_MASK_NONE;
             },
@@ -3631,6 +3632,7 @@ fn emit_glm_mla_prefill(
             d.t[2] = w.gkva;
             d.i[0] = t;
             d.i[1] = dk;
+            d.i[7] = ctx; // packed-prefill per-slot cache row stride
             d.f[0] = eps;
         })
     };
@@ -3647,6 +3649,7 @@ fn emit_glm_mla_prefill(
         d.i[2] = dr;
         d.i[3] = 0;
         d.i[4] = 1;
+        d.i[7] = ctx; // packed-prefill per-slot cache row stride
         d.f[0] = eps;
         d.j[0] = 0;
         d.j[1] = KV_MASK_NONE;

@@ -306,8 +306,8 @@ pub struct KdaState {
 
 /// Declare the carried state for one KDA layer. `prefix` is a COMPILER-owned namespace
 /// (`kv.`-style), not a checkpoint one: these are runtime buffers, not weights.
-/// `slots` is how many INDEPENDENT SEQUENCES this program carries state for — 1 for every
-/// program that exists today, `B` for a batched decode program.
+/// `slots` is the blob-wide capacity for INDEPENDENT SEQUENCES. A prefill program uses slot 0
+/// while a batched decode program uses its first `B` slots.
 ///
 /// It is not the same thing as the program's `t`. A prefill program has `t` rows and ONE slot,
 /// because its rows are consecutive tokens of one sequence threading through one carried state.
@@ -501,6 +501,7 @@ pub fn emit_kda_mixer(
         prenormed,
         deps,
         fuse_kda(),
+        crate::emit_config::active().kda_chunk,
         seq_rows,
     )
 }
@@ -525,6 +526,7 @@ fn emit_kda_mixer_ex(
     prenormed: bool,
     deps: &[u32],
     fuse: bool,
+    chunk_enable: bool,
     // Do this mixer's `t` rows carry one state between them, or one state EACH? `true` is a
     // batched decode program (independent sequences); everything today is `false`.
     seq_rows: bool,
@@ -582,7 +584,8 @@ fn emit_kda_mixer_ex(
     // `gate`/`beta` exist ONLY on the unfused path. A declared handle nothing writes is the
     // `Mamba2Scan` smell — 69 layers x 49 KiB of arena that no op touches — and an emitter that
     // allocates it anyway is one refactor away from an op reading it.
-    let (gate, beta) = if fuse {
+    let chunk = chunk_enable && t >= 512 && !seq_rows && matches!(hd, 64 | 128);
+    let (gate, beta) = if fuse && !chunk {
         (u32::MAX, u32::MAX)
     } else {
         (
@@ -596,6 +599,14 @@ fn emit_kda_mixer_ex(
         Some(h) => h,
         None => bft(b, format!("{a}attn"), tt * hiu),
     };
+    let chunk_tmp = chunk.then(|| {
+        (
+            f32t(b, format!("{a}chunk.aqk"), tt * nh as u64 * 64),
+            f32t(b, format!("{a}chunk.ainv"), tt * nh as u64 * 64),
+            bft(b, format!("{a}chunk.w"), tt * pu),
+            bft(b, format!("{a}chunk.u"), tt * pu),
+        )
+    });
 
     // P0 — pre-norm, unless the caller's AttnRes absorbed it (`crate::k3::fuse_attnres_norm`).
     let c_ln = if prenormed {
@@ -722,6 +733,87 @@ fn emit_kda_mixer_ex(
                 d.f[1] = lower_bound;
             },
         )
+    } else if let Some((aqk, ainv, cw, cu)) = chunk_tmp {
+        let c_conv = b.emit(DevOp::KdaConv3, all.clone(), &[c_q, c_k, c_v], |d| {
+            d.t[0] = mix[0];
+            d.t[1] = mix[1];
+            d.t[2] = mix[2];
+            d.t[3] = raw[0];
+            d.t[4] = raw[1];
+            d.t[5] = raw[2];
+            d.t[6] = w.conv_w[0];
+            d.t[7] = w.conv_w[1];
+            d.i[0] = t;
+            d.i[1] = p;
+            d.i[2] = c.conv_w;
+            d.i[3] = 1;
+            d.i[4] = w.conv_w[2];
+            d.i[5] = st.conv_state[0];
+            d.i[6] = st.conv_state[1];
+            d.i[7] = st.conv_state[2];
+        });
+        let c_prepare = b.emit(
+            DevOp::KdaChunkPrepare,
+            all.clone(),
+            &[c_conv, c_fb, c_bb],
+            |d| {
+                d.t[0] = mix[0];
+                d.t[1] = mix[1];
+                d.t[2] = gate;
+                d.t[3] = beta;
+                d.t[4] = f_raw;
+                d.t[5] = b_raw;
+                d.t[6] = w.a_log;
+                d.t[7] = w.dt_bias;
+                d.i[0] = t;
+                d.i[1] = nh;
+                d.i[2] = hd;
+                d.i[3] = gate_mode;
+                d.f[0] = lower_bound;
+            },
+        );
+        let intra_cus: Vec<u32> = (0..n_cu.min(t.div_ceil(64) * nh)).collect();
+        let c_intra = b.emit(DevOp::KdaChunkIntra, intra_cus, &[c_prepare], |d| {
+            d.t[0] = aqk;
+            d.t[1] = ainv;
+            d.t[2] = mix[0];
+            d.t[3] = mix[1];
+            d.t[4] = gate;
+            d.t[5] = beta;
+            d.i[0] = t;
+            d.i[1] = nh;
+            d.i[2] = hd;
+            d.f[0] = scale;
+        });
+        let c_wu = b.emit(DevOp::KdaChunkWu, all.clone(), &[c_intra], |d| {
+            d.t[0] = cw;
+            d.t[1] = cu;
+            d.t[2] = ainv;
+            d.t[3] = mix[1];
+            d.t[4] = mix[2];
+            d.t[5] = gate;
+            d.t[6] = beta;
+            d.i[0] = t;
+            d.i[1] = nh;
+            d.i[2] = hd;
+            d.i[3] = hd;
+        });
+        let carry_cus: Vec<u32> = (0..n_cu.min(nh * (hd / 16))).collect();
+        b.emit(DevOp::KdaChunkCarry, carry_cus, &[c_wu], |d| {
+            d.t[0] = o;
+            d.t[1] = st.state;
+            d.t[2] = mix[0];
+            d.t[3] = mix[1];
+            d.t[4] = cw;
+            d.t[5] = cu;
+            d.t[6] = aqk;
+            d.t[7] = gate;
+            d.i[0] = t;
+            d.i[1] = nh;
+            d.i[2] = hd;
+            d.i[3] = hd;
+            d.f[0] = scale;
+        })
     } else if fuse {
         // P8 — ONE conv over the 3*H*D concatenated channel axis, still all 256 CUs, with the
         // per-CU channel count RISING 3x. The three streams keep separate buffers; the op takes
@@ -1178,6 +1270,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chunk_kda_is_opt_in_and_shape_gated() {
+        let build = |t: u32, seq_rows: bool, enabled: bool| {
+            let c = KdaCfg {
+                heads: 12,
+                bv: 8,
+                ..k3()
+            };
+            let mut b = Builder::new(256);
+            let hidden = b.tensor("in.hidden", t as u64 * c.hidden as u64 * 2);
+            let w = declare_kda_weights(&mut b, &c, "p.", "l.");
+            let st = declare_kda_state(
+                &mut b,
+                &c,
+                "kv.0.",
+                u64::from(seq_rows.then_some(t).unwrap_or(1)),
+            );
+            let seed = b.emit(DevOp::Nop, (0..256).collect(), &[], |_| {});
+            emit_kda_mixer_ex(
+                &mut b,
+                &c,
+                &w,
+                &st,
+                "act.pf.",
+                t,
+                hidden,
+                None,
+                256,
+                false,
+                &[seed],
+                true,
+                enabled,
+                seq_rows,
+            );
+            b.finish()
+        };
+        let count = |p: &packet::devbuild::Program, op: DevOp| {
+            p.insts.iter().filter(|i| i.op == op as u16).count()
+        };
+
+        let chunk = build(512, false, true);
+        for op in [
+            DevOp::KdaChunkPrepare,
+            DevOp::KdaChunkIntra,
+            DevOp::KdaChunkWu,
+            DevOp::KdaChunkCarry,
+        ] {
+            assert_eq!(count(&chunk, op), 1, "missing {op:?}");
+        }
+        assert_eq!(count(&chunk, DevOp::KdaStateStepG), 0);
+
+        for legacy in [
+            build(512, false, false),
+            build(128, false, true),
+            build(576, true, true),
+        ] {
+            assert_eq!(count(&legacy, DevOp::KdaStateStepG), 1);
+            assert_eq!(count(&legacy, DevOp::KdaChunkPrepare), 0);
+        }
+        assert_eq!(count(&build(511, false, true), DevOp::KdaStateStepG), 1);
+        for t in [513, 8191] {
+            let ragged = build(t, false, true);
+            assert_eq!(count(&ragged, DevOp::KdaChunkPrepare), 1, "T={t}");
+            assert_eq!(count(&ragged, DevOp::KdaStateStepG), 0, "T={t}");
+        }
+    }
+
     /// The op graph: and every new opcode reachable.
     #[test]
     fn one_layer_emits_the_expected_graph() {
@@ -1323,6 +1482,7 @@ mod tests {
                 &[seed],
                 fuse,
                 false,
+                false,
             );
             b.finish()
         };
@@ -1430,6 +1590,7 @@ mod tests {
                 false,
                 &[seed],
                 true,
+                false,
                 seq_rows,
             );
             let p = b.finish();
@@ -1504,6 +1665,7 @@ mod tests {
                 false,
                 &[seed],
                 true,
+                false,
                 false,
             );
             let p = b.finish();

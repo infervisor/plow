@@ -75,6 +75,30 @@ enum Cmd {
         /// Number of deterministic random prompt tokens.
         #[arg(long)]
         random_input_len: Option<usize>,
+        /// Run a one-load, cold-prefill TTFT sweep through the production mux.
+        ///
+        /// Use `--prompt-ids` for one exact row, or `--prefill-lengths` for
+        /// deterministic random rows.
+        #[arg(
+            long,
+            default_value_t = false,
+            conflicts_with_all = ["concurrency", "requests", "warmup_requests", "output_len"]
+        )]
+        prefill_sweep: bool,
+        /// Comma-separated deterministic random prompt lengths for
+        /// `--prefill-sweep`.
+        #[arg(
+            long,
+            requires = "prefill_sweep",
+            conflicts_with_all = ["prompt_ids", "random_input_len"]
+        )]
+        prefill_lengths: Option<String>,
+        /// Timed requests per prefill length.
+        #[arg(long, requires = "prefill_sweep")]
+        prefill_reps: Option<usize>,
+        /// Warm-up requests per prefill length.
+        #[arg(long, requires = "prefill_sweep")]
+        prefill_warmups: Option<usize>,
         /// Seed for deterministic random token-id prompts.
         #[arg(long, default_value_t = 0)]
         seed: u64,
@@ -102,6 +126,9 @@ enum Cmd {
         /// Requests allowed outside engine slots. Zero derives four engine batches.
         #[arg(long, default_value_t = 0)]
         max_queued_requests: usize,
+        /// Record bounded production-engine bucket/chunk selections and TP audit policy.
+        #[arg(long, default_value_t = false)]
+        engine_diagnostics: bool,
     },
 
     /// Enumerate every visible device and, with `--tp`, bring up the
@@ -137,11 +164,8 @@ enum Cmd {
 
     /// Bring the AMD/gfx950 engine up on a compiled blob and time decode steps.
     ///
-    /// Runs the REAL schedule through the real production code objects. Weights
-    /// are allocated but NOT bound, so the tokens are meaningless and the
-    /// timing is not — every instruction, counter gate, and memory access the
-    /// decode program performs happens at full size. That makes this a latency
-    /// and bring-up instrument, and explicitly not a correctness one.
+    /// Runs the schedule directly as a diagnostic. Production performance must
+    /// be measured through `plowrt bench` or `plowrt serve`.
     AmdBench {
         /// Compiled device blob (`model.pkt`).
         #[arg(long)]
@@ -149,8 +173,8 @@ enum Cmd {
         /// Directory of gfx950 code objects (`interp_*.elf`).
         #[arg(long, id = "amd_bench_hsaco")]
         hsaco: PathBuf,
-        /// Safetensors checkpoint. Omit to run with UNBOUND weights: the
-        /// schedule and the timing are real, the tokens are not.
+        /// Safetensors checkpoint. Required; zero-weight execution moved to
+        /// the distinct `amd-probe` command.
         ///
         /// The clap ID is EXPLICIT because the GLOBAL `--rt-checkpoint`
         /// (config.rs) already claims the derived id `checkpoint`, and clap
@@ -160,6 +184,9 @@ enum Cmd {
         /// what `amd-bench --checkpoint <dir>` did on EVERY invocation.
         #[arg(long, id = "amd_bench_checkpoint")]
         checkpoint: Option<PathBuf>,
+        /// Removed compatibility flag. Use the distinct `amd-probe` command.
+        #[arg(long, default_value_t = false, hide = true)]
+        synthetic_probe: bool,
         /// Prompt token ids to decode from, comma-separated. Needs
         /// `--checkpoint` to mean anything.
         ///
@@ -192,7 +219,7 @@ enum Cmd {
         /// what proves the two all-reduces per layer actually ran. A rank that
         /// skipped its collective still produces fluent-looking ids from its own
         /// shard, so this is checked every step, not sampled.
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         tp: u32,
         /// Write rank 0's raw `act.logits` row (bf16, `vocab` wide) after the
         /// prefill and after every decode step, as `<dir>/logits_{prefill,NNN}.bin`.
@@ -222,6 +249,38 @@ enum Cmd {
         /// Timed repetitions per `--prefill-sweep` length (one warm-up pass is
         /// always run first and discarded). Zero would leave the sample vector
         /// empty and the median index out of bounds, so the range starts at 1.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
+        prefill_reps: u32,
+    },
+
+    /// Execute an unbound AMD packet with zero-filled weights.
+    ///
+    /// This is a synthetic schedule/kernel diagnostic, never a model-quality
+    /// or performance result. Checkpoint-bound work belongs to `bench`,
+    /// `serve`, or the remaining `amd-bench` diagnostics.
+    AmdProbe {
+        /// Compiled device blob (`model.pkt`).
+        #[arg(long)]
+        blob: PathBuf,
+        /// Directory of AMD code objects (`interp_*.elf`).
+        #[arg(long, id = "amd_probe_hsaco")]
+        hsaco: PathBuf,
+        /// Synthetic decode steps. Zero is valid for a prefill-only sweep.
+        #[arg(long, default_value_t = 32)]
+        steps: u32,
+        /// Synthetic context position.
+        #[arg(long, default_value_t = 1024)]
+        ctx: u32,
+        /// Drive all compiled sequence slots per decode dispatch.
+        #[arg(long, default_value_t = false)]
+        batched: bool,
+        /// Tensor-parallel degree.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        tp: u32,
+        /// Comma-separated synthetic prefill lengths, timed after one warm-up.
+        #[arg(long)]
+        prefill_sweep: Option<String>,
+        /// Timed repetitions per prefill length.
         #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
         prefill_reps: u32,
     },
@@ -389,6 +448,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             assets,
             prompt_ids,
             random_input_len,
+            prefill_sweep,
+            prefill_lengths,
+            prefill_reps,
+            prefill_warmups,
             seed,
             concurrency,
             requests,
@@ -398,11 +461,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_hold_ms,
             slo_ms,
             max_queued_requests,
+            engine_diagnostics,
         } => {
             bench(
                 assets,
                 prompt_ids,
                 random_input_len.unwrap_or(32),
+                prefill_sweep,
+                prefill_lengths,
+                prefill_reps.unwrap_or(3),
+                prefill_warmups.unwrap_or(1),
                 seed,
                 concurrency,
                 requests,
@@ -415,6 +483,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     max_queued_requests,
                     ..MuxConfig::default()
                 },
+                engine_diagnostics,
             )
             .await
         }
@@ -461,6 +530,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             blob,
             hsaco,
             checkpoint,
+            synthetic_probe,
             prompt,
             steps,
             ctx,
@@ -470,6 +540,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             prefill_sweep,
             prefill_reps,
         } => {
+            let synthetic_probe = require_synthetic_probe(checkpoint.is_some(), synthetic_probe)?;
             tracing::warn!(
                 "amd-bench is diagnostic-only and deprecated as a performance authority; use `plowrt bench` for production-path measurements"
             );
@@ -478,6 +549,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     blob,
                     hsaco,
                     checkpoint,
+                    synthetic_probe,
                     prompt,
                     steps,
                     ctx,
@@ -494,6 +566,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     blob,
                     hsaco,
                     checkpoint,
+                    synthetic_probe,
                     prompt,
                     steps,
                     ctx,
@@ -502,8 +575,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
             }
         }
+        #[cfg(feature = "hsa")]
+        Cmd::AmdProbe {
+            blob,
+            hsaco,
+            steps,
+            ctx,
+            batched,
+            tp,
+            prefill_sweep,
+            prefill_reps,
+        } => {
+            validate_amd_probe_steps(steps, prefill_sweep.is_some())?;
+            tracing::warn!(
+                "amd-probe executes an unbound zero-weight packet; results are synthetic diagnostics and must not be reported as model performance"
+            );
+            if tp > 1 {
+                amd_bench_tp(
+                    blob,
+                    hsaco,
+                    None,
+                    true,
+                    None,
+                    steps,
+                    ctx,
+                    tp,
+                    batched,
+                    None,
+                    prefill_sweep,
+                    prefill_reps,
+                )
+            } else if prefill_sweep.is_some() {
+                Err("--prefill-sweep is implemented on the TP path only (--tp N, N>1)".into())
+            } else {
+                amd_bench(blob, hsaco, None, true, None, steps, ctx, batched, None)
+            }
+        }
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBench { .. } => Err("plowrt was built without --features hsa".into()),
+        #[cfg(not(feature = "hsa"))]
+        Cmd::AmdProbe { .. } => Err("plowrt was built without --features hsa".into()),
         #[cfg(feature = "hsa")]
         Cmd::AmdBlock {
             blob,
@@ -516,6 +627,184 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => amd_block(blob, hsaco, checkpoint, prompt, inspect, list_tensors, dump),
         #[cfg(not(feature = "hsa"))]
         Cmd::AmdBlock { .. } => Err("plowrt was built without --features hsa".into()),
+    }
+}
+
+fn require_synthetic_probe(
+    has_checkpoint: bool,
+    synthetic_probe: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if synthetic_probe {
+        return Err("--synthetic-probe moved to the distinct `plowrt amd-probe` command".into());
+    }
+    if !has_checkpoint {
+        return Err(
+            "amd-bench requires --checkpoint; use `plowrt amd-probe` for unbound zero-weight \
+             packet execution or `plowrt bench` for performance"
+                .into(),
+        );
+    }
+    Ok(false)
+}
+
+fn validate_amd_probe_steps(
+    steps: u32,
+    has_prefill_sweep: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if steps == 0 && !has_prefill_sweep {
+        return Err("amd-probe --steps 0 requires --prefill-sweep".into());
+    }
+    Ok(())
+}
+
+fn synthetic_timing_prefix(synthetic_probe: bool) -> &'static str {
+    if synthetic_probe {
+        "SYNTHETIC DIAGNOSTIC: "
+    } else {
+        ""
+    }
+}
+
+#[cfg(test)]
+mod amd_bench_cli_tests {
+    use super::{
+        parse_prefill_lengths, require_synthetic_probe, synthetic_timing_prefix,
+        validate_amd_probe_steps, Cli,
+    };
+    use clap::Parser;
+
+    #[test]
+    fn unbound_run_requires_explicit_synthetic_probe() {
+        assert!(require_synthetic_probe(false, false).is_err());
+        assert!(require_synthetic_probe(false, true).is_err());
+    }
+
+    #[test]
+    fn synthetic_execution_has_a_distinct_probe_command() {
+        assert!(Cli::try_parse_from([
+            "plowrt",
+            "amd-probe",
+            "--blob",
+            "model.pkt",
+            "--hsaco",
+            "hsaco",
+            "--tp",
+            "8",
+            "--steps",
+            "0",
+            "--prefill-sweep",
+            "512,1024",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "plowrt",
+            "amd-probe",
+            "--blob",
+            "model.pkt",
+            "--hsaco",
+            "hsaco",
+            "--checkpoint",
+            "weights",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn probe_zero_steps_requires_prefill_sweep() {
+        assert!(validate_amd_probe_steps(0, false).is_err());
+        assert!(validate_amd_probe_steps(0, true).is_ok());
+        assert!(validate_amd_probe_steps(1, false).is_ok());
+    }
+
+    #[test]
+    fn amd_direct_runners_reject_zero_tp() {
+        for command in ["amd-bench", "amd-probe"] {
+            assert!(Cli::try_parse_from([
+                "plowrt",
+                command,
+                "--blob",
+                "model.pkt",
+                "--hsaco",
+                "hsaco",
+                "--tp",
+                "0",
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn checkpoint_bound_run_is_not_labeled_synthetic() {
+        assert!(!require_synthetic_probe(true, false).unwrap());
+        assert!(require_synthetic_probe(true, true).is_err());
+        assert_eq!(synthetic_timing_prefix(false), "");
+    }
+
+    #[test]
+    fn synthetic_timing_label_rejects_performance_interpretation() {
+        let label = synthetic_timing_prefix(true);
+        assert!(label.contains("SYNTHETIC DIAGNOSTIC"));
+        assert!(!label.to_ascii_lowercase().contains("performance"));
+    }
+
+    #[test]
+    fn prefill_lengths_are_positive_and_ordered() {
+        assert_eq!(
+            parse_prefill_lengths("512, 1024,2048").unwrap(),
+            [512, 1024, 2048]
+        );
+        assert!(parse_prefill_lengths("").is_err());
+        assert!(parse_prefill_lengths("512,0").is_err());
+    }
+
+    #[test]
+    fn prefill_sweep_accepts_random_lengths_or_exact_ids() {
+        assert!(Cli::try_parse_from([
+            "plowrt",
+            "bench",
+            "--assets",
+            "model",
+            "--prefill-sweep",
+            "--prefill-lengths",
+            "512,1024",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "plowrt",
+            "bench",
+            "--assets",
+            "model",
+            "--prefill-sweep",
+            "--prompt-ids",
+            "1,2,3",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn prefill_sweep_rejects_normal_throughput_controls() {
+        assert!(Cli::try_parse_from([
+            "plowrt",
+            "bench",
+            "--assets",
+            "model",
+            "--prefill-sweep",
+            "--concurrency",
+            "2",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn production_engine_diagnostics_are_explicit() {
+        assert!(Cli::try_parse_from([
+            "plowrt",
+            "bench",
+            "--assets",
+            "model",
+            "--engine-diagnostics",
+        ])
+        .is_ok());
     }
 }
 
@@ -552,6 +841,7 @@ fn amd_bench(
     blob: PathBuf,
     hsaco: PathBuf,
     checkpoint: Option<PathBuf>,
+    synthetic_probe: bool,
     prompt: Option<String>,
     steps: u32,
     ctx: u32,
@@ -560,11 +850,15 @@ fn amd_bench(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::exec::amd::AmdEngine;
 
+    if synthetic_probe {
+        eprintln!("SYNTHETIC DIAGNOSTIC: weights are unbound; output is not a performance result");
+    }
+    let timing = synthetic_timing_prefix(synthetic_probe);
     let be = Arc::new(plowrt::device::hsa::HsaBackend::new(0)?);
     let t0 = std::time::Instant::now();
     let mut eng = AmdEngine::load(Arc::clone(&be), &blob, &hsaco, checkpoint.as_deref())?;
     println!(
-        "loaded in {:.1} s: arch={} programs={} max_ctx={} schedulers={:?}",
+        "{timing}loaded in {:.1} s: arch={} programs={} max_ctx={} schedulers={:?}",
         t0.elapsed().as_secs_f64(),
         eng.arch(),
         eng.n_programs(),
@@ -717,12 +1011,12 @@ fn amd_bench(
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
         println!(
-            "\n{steps} dispatches x batch {b} at ctx={ctx}:\n  \
-             tpot {ms:.3} ms  |  aggregate {:.1} tok/s  |  per-dispatch {ms:.3} ms",
+            "\n{timing}{steps} dispatches x batch {b} at ctx={ctx}:\n  \
+             {timing}tpot {ms:.3} ms  |  aggregate {:.1} tok/s  |  per-dispatch {ms:.3} ms",
             b as f64 * 1e3 / ms
         );
         if !eng.weights_bound() {
-            println!("  (weights unbound — timing real, ids are not)");
+            println!("  (synthetic diagnostic only — not a performance result)");
         }
         return Ok(());
     }
@@ -784,7 +1078,7 @@ fn amd_bench(
             let ms = t0.elapsed().as_secs_f64() * 1e3;
             dump(&eng, "prefill")?;
             println!(
-                "\nprefill: {} tokens in {ms:.1} ms ({:.0} tok/s) -> {tok}",
+                "\n{timing}prefill: {} tokens in {ms:.1} ms ({:.0} tok/s) -> {tok}",
                 ids.len(),
                 ids.len() as f64 / (ms / 1e3)
             );
@@ -821,7 +1115,7 @@ fn amd_bench(
             let timed_steps = steps - 1;
             let ms = timed.as_secs_f64() * 1e3 / timed_steps as f64;
             println!(
-                "  {timed_steps} timed decode steps (+1 discarded warmup): {ms:.3} ms/token ({:.1} tok/s)",
+                "  {timing}{timed_steps} timed decode steps (+1 discarded warmup): {ms:.3} ms/token ({:.1} tok/s)",
                 1e3 / ms
             );
         } else {
@@ -849,17 +1143,19 @@ fn amd_bench(
         // phases inside `decode_step` account for it.
         let t = plowrt::obs::dstep::on().then(std::time::Instant::now);
         last = eng.decode_step(ctx + 1 + i, ctx + 2 + i)?;
-        if let Some(t) = t {
-            plowrt::obs::dstep::token(t.elapsed().as_nanos() as u64);
+        if !synthetic_probe {
+            if let Some(t) = t {
+                plowrt::obs::dstep::token(t.elapsed().as_nanos() as u64);
+            }
         }
     }
     let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
     println!(
-        "\n{steps} decode steps at ctx={ctx}: {ms:.3} ms/token ({:.1} tok/s), last id {last}",
+        "\n{timing}{steps} decode steps at ctx={ctx}: {ms:.3} ms/token ({:.1} tok/s), last id {last}",
         1e3 / ms
     );
     println!(
-        "  dispatch accounting: {} launches, enqueue {:.1} us, drain {:.1} us",
+        "  {timing}dispatch accounting: {} launches, enqueue {:.1} us, drain {:.1} us",
         eng.seg_launches, eng.seg_enq_us, eng.seg_drain_us
     );
     if eng.weights_bound() {
@@ -870,9 +1166,8 @@ fn amd_bench(
         );
     } else {
         println!(
-            "\nWEIGHTS ARE NOT BOUND — the token ids are meaningless. The timing is \n\
-             not: every instruction, counter gate and memory access of the real \n\
-             decode program ran at full size."
+            "\nWEIGHTS ARE NOT BOUND — the token ids are meaningless. This is a \n\
+             SYNTHETIC DIAGNOSTIC, not a performance result."
         );
     }
     // The THIRD exit of this function, and the one a decode-only run takes. Patching only the
@@ -936,6 +1231,7 @@ fn amd_bench_tp(
     blob: PathBuf,
     hsaco: PathBuf,
     checkpoint: Option<PathBuf>,
+    synthetic_probe: bool,
     prompt: Option<String>,
     steps: u32,
     ctx: u32,
@@ -947,6 +1243,10 @@ fn amd_bench_tp(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use plowrt::exec::amd_tp::AmdTpGroup;
 
+    if synthetic_probe {
+        eprintln!("SYNTHETIC DIAGNOSTIC: weights are unbound; output is not a performance result");
+    }
+    let timing = synthetic_timing_prefix(synthetic_probe);
     let mut backends = Vec::with_capacity(tp as usize);
     for d in 0..tp {
         backends.push(Arc::new(plowrt::device::hsa::HsaBackend::new(d as u8)?));
@@ -958,7 +1258,7 @@ fn amd_bench_tp(
     // sentence. Serving samples (`DEFAULT_AGREE_EVERY`); the oracle never does.
     g.audit_cadence(1);
     println!(
-        "loaded in {:.1} s: TP={} ranks, max_ctx={}",
+        "{timing}loaded in {:.1} s: TP={} ranks, max_ctx={}",
         t0.elapsed().as_secs_f64(),
         g.n_gpu(),
         g.max_ctx()
@@ -1021,7 +1321,7 @@ fn amd_bench_tp(
             return Err("--prefill-sweep contains a zero-length prompt".into());
         }
         println!(
-            "\nprefill sweep: {} rep(s) + 1 discarded warm-up per length, max_ctx={}",
+            "\n{timing}prefill sweep: {} rep(s) + 1 discarded warm-up per length, max_ctx={}",
             prefill_reps,
             g.max_ctx()
         );
@@ -1050,7 +1350,7 @@ fn amd_bench_tp(
             };
             let reps: Vec<String> = ms.iter().map(|v| format!("{v:.3}")).collect();
             println!(
-                "  PFSWEEP T={t} median_ms={med:.3} spread_pct={spread:.2} reps=[{}]",
+                "  {timing}PFSWEEP T={t} median_ms={med:.3} spread_pct={spread:.2} reps=[{}]",
                 reps.join(",")
             );
         }
@@ -1133,7 +1433,7 @@ fn amd_bench_tp(
             let timed_steps = steps - 1;
             let ms = timed.as_secs_f64() * 1e3 / timed_steps as f64;
             println!(
-                "  {timed_steps} timed batched steps (+1 discarded warmup): {ms:.3} ms/step, {:.1} tok/s AGGREGATE over {b} \
+                "  {timing}{timed_steps} timed batched steps (+1 discarded warmup): {ms:.3} ms/step, {:.1} tok/s AGGREGATE over {b} \
                  sequences ({:.1} tok/s per stream), all {} ranks token-identical",
                 b as f64 * 1e3 / ms,
                 1e3 / ms,
@@ -1182,7 +1482,7 @@ fn amd_bench_tp(
             let ms = t.elapsed().as_secs_f64() * 1e3;
             dump(&g, "prefill")?;
             println!(
-                "\nprefill: {} tokens in {ms:.1} ms ({:.0} tok/s) -> {tok} \
+                "\n{timing}prefill: {} tokens in {ms:.1} ms ({:.0} tok/s) -> {tok} \
                  (all {} ranks agree)",
                 ids.len(),
                 ids.len() as f64 / (ms / 1e3),
@@ -1224,8 +1524,10 @@ fn amd_bench_tp(
             if s > 0 {
                 timed += t.elapsed();
             }
-            if let Some(t) = t_tok {
-                plowrt::obs::dstep::token(t.elapsed().as_nanos() as u64);
+            if !synthetic_probe {
+                if let Some(t) = t_tok {
+                    plowrt::obs::dstep::token(t.elapsed().as_nanos() as u64);
+                }
             }
             dump(&g, &format!("{s:03}"))?;
             pos += 1;
@@ -1235,7 +1537,7 @@ fn amd_bench_tp(
             let timed_steps = steps - 1;
             let ms = timed.as_secs_f64() * 1e3 / timed_steps as f64;
             println!(
-                "  {timed_steps} timed decode steps (+1 discarded warmup): {ms:.3} ms/token ({:.1} tok/s), all {} ranks \
+                "  {timing}{timed_steps} timed decode steps (+1 discarded warmup): {ms:.3} ms/token ({:.1} tok/s), all {} ranks \
                  token-identical",
                 1e3 / ms,
                 g.n_gpu()
@@ -1276,13 +1578,15 @@ fn amd_bench_tp(
         {
             disagreements += 1;
         }
-        if let Some(t) = t_tok {
-            plowrt::obs::dstep::token(t.elapsed().as_nanos() as u64);
+        if !synthetic_probe {
+            if let Some(t) = t_tok {
+                plowrt::obs::dstep::token(t.elapsed().as_nanos() as u64);
+            }
         }
     }
     let ms = t.elapsed().as_secs_f64() * 1e3 / steps as f64;
     println!(
-        "\n{steps} decode steps at ctx={ctx}, TP={}: {ms:.3} ms/token ({:.1} tok/s)",
+        "\n{timing}{steps} decode steps at ctx={ctx}, TP={}: {ms:.3} ms/token ({:.1} tok/s)",
         g.n_gpu(),
         1e3 / ms
     );
@@ -1298,7 +1602,8 @@ fn amd_bench_tp(
         println!(
             "\nWEIGHTS ARE NOT BOUND — the ids are meaningless, so rank agreement is \n\
              NOT evidence the collectives ran (every rank computes the same nothing). \n\
-             Pass --checkpoint for the real token-identity check."
+             This is a SYNTHETIC DIAGNOSTIC, not a performance result. Pass \
+             --checkpoint for the real token-identity check."
         );
     }
     // PACKET TRACE. Dumped AFTER the timed loop, so the records are a
@@ -2016,6 +2321,10 @@ async fn bench(
     assets: PathBuf,
     prompt_ids: Option<String>,
     random_input_len: usize,
+    prefill_sweep: bool,
+    prefill_lengths: Option<String>,
+    prefill_reps: usize,
+    prefill_warmups: usize,
     seed: u64,
     concurrency: usize,
     requests: usize,
@@ -2023,6 +2332,7 @@ async fn bench(
     output_len: usize,
     executors: u32,
     mux_cfg: MuxConfig,
+    engine_diagnostics: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let state = bringup_runtime(vec![assets], executors, false, mux_cfg).await?;
     let models = state
@@ -2049,22 +2359,60 @@ async fn bench(
             "hf_tokenizer": cfg!(feature = "hf-tokenizer"),
         },
     });
-    let result = plowrt::serve::bench::run(
-        &state,
-        plowrt::serve::bench::Config {
-            model: model.clone(),
-            input,
-            concurrency,
-            warmup_requests,
-            requests,
-            output_tokens: output_len,
-            runtime,
-        },
-    )
-    .await;
+    if engine_diagnostics {
+        plowrt::serve::bench::begin_engine_diagnostics(&state, model)?;
+    }
+    let result = if prefill_sweep {
+        let inputs = match prefill_lengths {
+            Some(raw) => parse_prefill_lengths(&raw)?
+                .into_iter()
+                .enumerate()
+                .map(|(i, len)| plowrt::serve::bench::Input::Random {
+                    len,
+                    seed: seed.wrapping_add(i as u64),
+                })
+                .collect(),
+            None => vec![input],
+        };
+        plowrt::serve::bench::run_prefill_sweep(
+            &state,
+            plowrt::serve::bench::PrefillSweepConfig {
+                model: model.clone(),
+                inputs,
+                warmup_requests: prefill_warmups,
+                repetitions: prefill_reps,
+                runtime,
+            },
+        )
+        .await
+        .and_then(|report| {
+            serde_json::to_value(report)
+                .map_err(|e| plowrt::RuntimeError::Msg(format!("serialize prefill sweep: {e}")))
+        })
+    } else {
+        plowrt::serve::bench::run(
+            &state,
+            plowrt::serve::bench::Config {
+                model: model.clone(),
+                input,
+                concurrency,
+                warmup_requests,
+                requests,
+                output_tokens: output_len,
+                runtime,
+            },
+        )
+        .await
+        .and_then(|report| {
+            serde_json::to_value(report)
+                .map_err(|e| plowrt::RuntimeError::Msg(format!("serialize bench report: {e}")))
+        })
+    };
     if let Some(mux) = state.mux(model) {
         mux.drain().await;
     }
+    let diagnostics =
+        engine_diagnostics.then(|| plowrt::serve::bench::finish_engine_diagnostics(&state, model));
     #[cfg(feature = "hsa")]
     let trace_result = RuntimeConfig::get().amd.trace_raw.as_ref().map(|path| {
         let path = PathBuf::from(path);
@@ -2072,7 +2420,14 @@ async fn bench(
             tracing::info!(path = %path.display(), "raw AMD packet trace written");
         })
     });
-    let report = result?;
+    let mut report = result?;
+    if let Some(diagnostics) = diagnostics {
+        let diagnostics = diagnostics?;
+        let report_object = report.as_object_mut().ok_or_else(|| {
+            plowrt::RuntimeError::Msg("bench report serialization did not produce an object".into())
+        })?;
+        report_object.insert("diagnostics".into(), serde_json::to_value(diagnostics)?);
+    }
     #[cfg(feature = "hsa")]
     if let Some(trace_result) = trace_result {
         trace_result?;
@@ -2092,6 +2447,19 @@ fn parse_token_ids(raw: &str) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
         return Err("--prompt-ids must contain at least one token id".into());
     }
     Ok(ids)
+}
+
+fn parse_prefill_lengths(raw: &str) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+    let lengths = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::parse::<usize>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if lengths.is_empty() || lengths.contains(&0) {
+        return Err("--prefill-lengths must contain positive lengths".into());
+    }
+    Ok(lengths)
 }
 
 async fn serve(

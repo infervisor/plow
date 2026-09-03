@@ -177,6 +177,10 @@ on an AMD TP4 configuration (`perf-data/glm52-ttft-breakdown.md`).
 > chunk-dependent; `perf-data/px14-batched-prefill-fp8.md`). If bit-identical
 > decode matters, keep packing off or gate on a facts probe. AMD's fair mode
 > does not co-pack rows and preserves per-request recurrent/KV isolation.
+> AMD additionally requires `plow_packed_prefill_abi_1` in every object a
+> packed program would route through before it stages non-null descriptors.
+> The marker proves the `PlowProgram` ABI only; it does not enable co-packed
+> dispatch or claim that KDA/MLA kernels consume the descriptors.
 
 ### 5. Admission: SLO, hold, shedding — `$VENDOR`: both
 
@@ -229,10 +233,10 @@ Bring up and time a TP group **without** a full serve:
 
 * `plowrt devices --tp $NGPU` — peer-mapped reduction regions, cross-GPU counter
   tables, all-pairs peer-visibility check (no model).
-* `plowrt amd-bench --tp $NGPU` — times decode across ranks. **Every rank must emit
-  an identical token stream** — that identity is the TP correctness gate, not a
-  sanity check (a rank whose collective silently timed out still samples fluent
-  ids from its own shard).
+* `plowrt amd-bench --tp $NGPU` — runs the explicit cross-rank decode audit.
+  **Every rank must emit an identical token stream** — that identity is the TP
+  correctness gate, not a sanity check (a rank whose collective silently timed
+  out still samples fluent ids from its own shard).
 
 TP knobs: `--amd-tp-agree-every N` (agreement interval; serving samples, the
 oracle checks every step), `--amd-tp-no-audit` (timing runs), `--amd-share-ckpt`
@@ -287,25 +291,33 @@ no deadlocks, all dependencies honored, correct memory access. `--bucket
 decode:1:128` isolates one bucket; `--math golden` runs reference numerics. The
 only whole-schedule instrument that needs no device.
 
-### 1. Single-stream latency floor (device, one sequence)
+### 1. Direct-engine diagnostics (device, one sequence)
 
 ```bash
-# decode TPOT at a context depth; with --prompt, a real greedy decode + TTFT:
+# Exercise a packet/object pair and inspect its greedy stream:
 plowrt amd-bench --blob $ASSETS/model.pkt --hsaco $ASSETS/hsaco \
     --checkpoint $CKPT --prompt 1,2,3,4 --steps 64
 ```
 
-Reports load time, per-token decode ms (TPOT floor), and — with a multi-token
-`--prompt` — prefill ms and tok/s (TTFT floor). This is the `$VENDOR = amd`
-path; on nvidia the single-stream floor is measured through `serve` at
-concurrency 1. `amd-bench` is a **latency/bring-up** instrument: without
-`--checkpoint` the weights are unbound, so *timing is real but the token ids are
-noise*. A prefill-vs-length sweep on TP (sweep points must all be ≤ `$MAXCTX`):
+This output is for bring-up and debugging, not a TPOT or TTFT result. Without
+`--checkpoint` the weights are unbound and require `--synthetic-probe`; those
+timings are synthetic diagnostics only.
+
+Use the production engine for a one-load repeated prefill sweep (points must all
+be ≤ `$MAXCTX`):
 
 ```bash
-plowrt amd-bench --blob $ASSETS/model.pkt --hsaco $ASSETS/hsaco --tp $NGPU \
-    --prefill-sweep 512,1024,2048,4096,8192 --prefill-reps 3
+plowrt bench --assets $ASSETS --prefill-sweep \
+    --prefill-lengths 512,1024,2048,4096,8192 \
+    --prefill-warmups 1 --prefill-reps 3
 ```
+
+For an exact token row, replace `--prefill-lengths ...` with
+`--prompt-ids 1,2,3,4`. The distinct
+`plowrt.bench.prefill-sweep.v1` JSON contains one TTFT distribution per
+length, the deterministic prompt checksum, and warmup/repetition counts. Any
+prefix-cache hit aborts the sweep instead of being reported as cold prefill.
+Prefix caching must be disabled for the entire sweep.
 
 ### 2. Bring up serving and baseline it
 
@@ -320,10 +332,14 @@ plowrt bench --assets $ASSETS --prompt-ids 1,2,3,4 \
 ```
 
 The JSON records TTFT/TPOT/ITL/E2E distributions, throughput, scheduler rungs,
-TP width, runtime settings, packet/object checksums, and checkpoint layout.
+TP width, runtime settings, packet/object checksums, and checkpoint layout. Add
+`--engine-diagnostics` to record bounded production-engine diagnostics. On AMD,
+`diagnostics` contains the ordered prefill chunk boundaries, decode rung choices,
+and TP agreement policy; overflow fails the benchmark instead of truncating the
+record. Diagnostic capture is opt-in so normal benchmark timing is not perturbed.
 Add `--trace-raw PATH` to write rank 0's last measured decode packet trace after
 the production mux is drained. Use `amd-bench` only for tensor/logit snapshots,
-prefill sweeps, and explicit TP correctness audits.
+synthetic packet probes, and explicit TP correctness audits.
 
 ```bash
 plowrt serve --assets $ASSETS --port 8080 --executors 8 \

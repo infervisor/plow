@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://plow.dev/schemas/fusion-ladder-row-v1.schema.json",
+  "title": "Plow AMD prefill fusion ladder result row",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "campaign_id", "candidate_id", "scope", "shape_id", "shape",
+    "target", "artifacts", "configuration", "correctness", "latency",
+    "gates", "decision"
+  ],
+  "properties": {
+    "schema": { "const": "plow.fusion-ladder.row.v1" },
+    "campaign_id": { "$ref": "#/$defs/nonempty" },
+    "candidate_id": { "$ref": "#/$defs/nonempty" },
+    "scope": {
+      "enum": ["kernel", "operator-chain", "block", "composed-block", "network"]
+    },
+    "shape_id": { "$ref": "#/$defs/nonempty" },
+    "shape": {
+      "type": "object",
+      "minProperties": 1
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vendor", "arch", "device", "tp"],
+      "properties": {
+        "vendor": { "$ref": "#/$defs/nonempty" },
+        "arch": { "$ref": "#/$defs/nonempty" },
+        "device": { "$ref": "#/$defs/nonempty" },
+        "tp": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_sha256", "baseline_sha256", "config_sha256"],
+      "properties": {
+        "candidate_sha256": { "$ref": "#/$defs/sha256" },
+        "baseline_sha256": { "$ref": "#/$defs/sha256" },
+        "config_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "minProperties": 1
+    },
+    "correctness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "passed", "method", "checksum_algorithm", "candidate_checksum",
+        "baseline_checksum"
+      ],
+      "properties": {
+        "passed": { "type": "boolean" },
+        "method": { "$ref": "#/$defs/nonempty" },
+        "checksum_algorithm": { "$ref": "#/$defs/nonempty" },
+        "candidate_checksum": { "$ref": "#/$defs/nonempty" },
+        "baseline_checksum": { "$ref": "#/$defs/nonempty" },
+        "tolerance": { "type": ["object", "null"] }
+      }
+    },
+    "latency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "unit", "candidate_samples", "baseline_samples"],
+      "properties": {
+        "metric": { "$ref": "#/$defs/nonempty" },
+        "unit": { "enum": ["ns", "us", "ms"] },
+        "candidate_samples": { "$ref": "#/$defs/samples" },
+        "baseline_samples": { "$ref": "#/$defs/samples" }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": { "type": "boolean" }
+    },
+    "decision": { "enum": ["pass", "fail"] },
+    "notes": { "type": "string" }
+  },
+  "$defs": {
+    "nonempty": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "samples": {
+      "type": "array",
+      "minItems": 3,
+      "items": { "type": "number", "exclusiveMinimum": 0 }
+    }
+  }
+}

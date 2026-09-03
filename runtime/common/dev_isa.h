@@ -1029,6 +1029,13 @@ enum {
      * descriptor: wq,wk,wv, cs0q,cs0k,cs0v, cs1q,cs1k,cs1v, A_log,dt_bias,in.pos,parked. */
     PLOW_DOP_KDA_CONV_STATE_STEP_G = 120,
 
+    /* Opt-in dense single-sequence BT64 chunk-KDA pipeline. The four ordered packets preserve
+     * the serial op-102 fallback and are accepted only by objects advertising the chunk marker. */
+    PLOW_DOP_KDA_CHUNK_PREPARE = 121,
+    PLOW_DOP_KDA_CHUNK_INTRA = 122,
+    PLOW_DOP_KDA_CHUNK_WU = 123,
+    PLOW_DOP_KDA_CHUNK_CARRY = 124,
+
     PLOW_DOP__COUNT
 };
 
@@ -1303,6 +1310,12 @@ typedef struct {
      * sees the size grow, 128 -> 136 -> 144 (the second step is `l2_domains` landing beside
      * `n_seg`). READ THE NOTE ON THAT ASSERT before growing it further. */
     const uint32_t*      seg_ofs;
+    /* Ragged packed-prefill metadata. NULL/0 retains the single-request path. prefill_parked
+     * covers the compiled rung's padded tail and n_prefill_rows is the launched T. */
+    const PlowPrefillSpan* prefill_spans;
+    const uint32_t*        prefill_parked;
+    uint32_t               n_prefill_spans;
+    uint32_t               n_prefill_rows;
 } PlowProgram;
 
 /* Workgroup geometry of the persistent interpreter. The HOST needs this to size
@@ -1449,7 +1462,6 @@ PLOW_SASSERT(sizeof(PlowTraceRec) == 40, "PlowTraceRec size");
  * grid dimension as a device pointer and every static-scheduler prefill died with
  * "Memory access fault ... Reason: Unknown". The C harnesses pass `sizeof(pr)` and
  * were never affected. Bumping this assert is not enough; grep the hosts. */
-PLOW_SASSERT(sizeof(PlowProgram) == 144,
-             "PlowProgram size (9 ptr + cur_seg + l2_domains + n_seg + pad + 3 gq ptr + xctr + peer_scratch + rank + n_gpu + seg_ofs)");
+PLOW_SASSERT(sizeof(PlowProgram) == 168, "PlowProgram packed-prefill ABI size");
 
 #endif /* PLOW_DEV_ISA_H */

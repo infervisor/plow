@@ -32,6 +32,83 @@ pub struct Config {
     pub runtime: serde_json::Value,
 }
 
+#[derive(Clone, Debug)]
+pub struct PrefillSweepConfig {
+    pub model: String,
+    pub inputs: Vec<Input>,
+    pub warmup_requests: usize,
+    pub repetitions: usize,
+    pub runtime: serde_json::Value,
+}
+
+const MAX_DIAGNOSTIC_SELECTIONS: usize = 16 * 1024;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct EngineDiagnostics {
+    pub supported: bool,
+    pub complete: bool,
+    pub overflowed: bool,
+    pub scope: &'static str,
+    pub prefill_selections: Vec<PrefillSelection>,
+    pub decode_selections: Vec<DecodeSelection>,
+    pub rank_agreement: Option<RankAgreement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PrefillSelection {
+    pub slot: usize,
+    pub row_start: u32,
+    pub rows: u32,
+    pub bucket: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DecodeSelection {
+    pub occupied_rows: usize,
+    pub bucket: u32,
+    pub steps: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RankAgreement {
+    pub ranks: usize,
+    pub sampled_token_every: u32,
+    pub counter_audit_every_dispatch: bool,
+    pub prefill_completion_all_ranks: bool,
+}
+
+impl EngineDiagnostics {
+    pub(crate) fn unsupported() -> Self {
+        Self {
+            supported: false,
+            complete: false,
+            overflowed: false,
+            scope: "warmup_and_measured",
+            prefill_selections: Vec::new(),
+            decode_selections: Vec::new(),
+            rank_agreement: None,
+        }
+    }
+
+    pub(crate) fn push_prefill(&mut self, selection: PrefillSelection) {
+        if self.prefill_selections.len() == MAX_DIAGNOSTIC_SELECTIONS {
+            self.overflowed = true;
+            self.complete = false;
+        } else if !self.overflowed {
+            self.prefill_selections.push(selection);
+        }
+    }
+
+    pub(crate) fn push_decode(&mut self, selection: DecodeSelection) {
+        if self.decode_selections.len() == MAX_DIAGNOSTIC_SELECTIONS {
+            self.overflowed = true;
+            self.complete = false;
+        } else if !self.overflowed {
+            self.decode_selections.push(selection);
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub schema: &'static str,
@@ -63,6 +140,43 @@ pub struct Report {
     pub runtime: serde_json::Value,
     pub engine: Option<EngineReport>,
     pub scheduler: SchedulerReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<EngineDiagnostics>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PrefillSweepReport {
+    pub schema: &'static str,
+    pub model: String,
+    pub asset_dir: String,
+    pub target: String,
+    pub parallel: String,
+    pub num_gpus: usize,
+    pub backend: String,
+    pub vendor: String,
+    pub warmup_requests_per_length: usize,
+    pub repetitions_per_length: usize,
+    pub rows: Vec<PrefillSweepRow>,
+    pub artifacts: ArtifactReport,
+    pub runtime: serde_json::Value,
+    pub engine: Option<EngineReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<EngineDiagnostics>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PrefillSweepRow {
+    pub input: InputReport,
+    pub prompt_tokens: usize,
+    pub warmup_requests: usize,
+    pub repetitions: usize,
+    pub measured_request_offset: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub duration_ms: f64,
+    pub ttft_ms: Distribution,
+    pub prompt_checksum: String,
+    pub output_checksum: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -127,6 +241,7 @@ pub struct Distribution {
 struct RequestResult {
     request: usize,
     prompt_tokens: usize,
+    cached_tokens: usize,
     ids: Vec<u32>,
     ttft: Duration,
     tpot: Option<Duration>,
@@ -145,15 +260,64 @@ pub fn write_amd_packet_trace(state: &AppState, model: &str, path: &Path) -> Res
     result
 }
 
-pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
-    if cfg.concurrency == 0 || cfg.requests == 0 || cfg.output_tokens == 0 {
+#[cfg(any(feature = "cuda", feature = "hsa"))]
+pub fn begin_engine_diagnostics(state: &AppState, model: &str) -> Result<()> {
+    let engine = state
+        .gpu_engine(model)
+        .ok_or_else(|| RuntimeError::Msg(format!("no GPU engine for '{model}'")))?;
+    engine.lock().begin_diagnostics();
+    Ok(())
+}
+
+#[cfg(not(any(feature = "cuda", feature = "hsa")))]
+pub fn begin_engine_diagnostics(_state: &AppState, _model: &str) -> Result<()> {
+    Err(RuntimeError::Msg(
+        "engine diagnostics require a GPU backend".into(),
+    ))
+}
+
+#[cfg(any(feature = "cuda", feature = "hsa"))]
+pub fn finish_engine_diagnostics(state: &AppState, model: &str) -> Result<EngineDiagnostics> {
+    let engine = state
+        .gpu_engine(model)
+        .ok_or_else(|| RuntimeError::Msg(format!("no GPU engine for '{model}'")))?;
+    let diagnostics = engine.lock().finish_diagnostics();
+    validate_engine_diagnostics(diagnostics)
+}
+
+fn validate_engine_diagnostics(diagnostics: EngineDiagnostics) -> Result<EngineDiagnostics> {
+    if !diagnostics.supported {
         return Err(RuntimeError::Msg(
-            "bench concurrency, requests, and output tokens must be positive".into(),
+            "engine diagnostics are not supported by this backend".into(),
         ));
     }
-    if matches!(&cfg.input, Input::Random { len: 0, .. }) {
+    if diagnostics.overflowed {
         return Err(RuntimeError::Msg(
-            "bench random input length must be positive".into(),
+            "engine diagnostic selection capture overflowed; refusing a partial report".into(),
+        ));
+    }
+    if !diagnostics.complete {
+        return Err(RuntimeError::Msg(
+            "engine diagnostics did not complete; refusing a partial report".into(),
+        ));
+    }
+    Ok(diagnostics)
+}
+
+#[cfg(not(any(feature = "cuda", feature = "hsa")))]
+pub fn finish_engine_diagnostics(_state: &AppState, _model: &str) -> Result<EngineDiagnostics> {
+    Err(RuntimeError::Msg(
+        "engine diagnostics require a GPU backend".into(),
+    ))
+}
+
+pub async fn run_prefill_sweep(
+    state: &AppState,
+    cfg: PrefillSweepConfig,
+) -> Result<PrefillSweepReport> {
+    if cfg.inputs.is_empty() || cfg.repetitions == 0 {
+        return Err(RuntimeError::Msg(
+            "bench prefill sweep requires inputs and positive repetitions".into(),
         ));
     }
     if state.execset.backend().vendor().is_none() {
@@ -168,16 +332,128 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
             "bench tokenizer reports an empty vocabulary".into(),
         ));
     }
-    if let Input::TokenIds(ids) = &cfg.input {
-        if ids.is_empty() {
-            return Err(RuntimeError::Msg("bench token-id input is empty".into()));
-        }
-        if let Some(&id) = ids.iter().find(|&&id| id as usize >= vocab) {
-            return Err(RuntimeError::Msg(format!(
-                "bench token id {id} is outside vocabulary size {vocab}"
-            )));
-        }
+    for input in &cfg.inputs {
+        validate_input(input, vocab)?;
     }
+    let runtime = crate::config::RuntimeConfig::get();
+    let prefix_cache = match state.execset.backend().vendor() {
+        Some(hwspec::Vendor::Nvidia) => runtime.nv.vmm_prefix,
+        Some(hwspec::Vendor::Amd) => runtime.nv.prefix_cache,
+        _ => false,
+    };
+    if prefix_cache {
+        return Err(RuntimeError::Msg(
+            "bench prefill sweep requires cold prompts; disable --prefix-cache/--vmm-prefix".into(),
+        ));
+    }
+    let mux = state
+        .mux(&cfg.model)
+        .ok_or_else(|| RuntimeError::Msg(format!("no model mux for '{}'", cfg.model)))?;
+    #[cfg(any(feature = "cuda", feature = "hsa"))]
+    let engine = {
+        let engine = state
+            .gpu_engine(&cfg.model)
+            .ok_or_else(|| RuntimeError::Msg(format!("no GPU engine for '{}'", cfg.model)))?;
+        let engine = engine.lock();
+        Some(EngineReport {
+            batch_capacity: engine.batch(),
+            decode_rungs: engine.decode_rungs(),
+        })
+    };
+    #[cfg(not(any(feature = "cuda", feature = "hsa")))]
+    let engine = None;
+
+    let mut rows = Vec::with_capacity(cfg.inputs.len());
+    let mut request_offset = 0usize;
+    for input in &cfg.inputs {
+        if cfg.warmup_requests > 0 {
+            crate::obs::Metrics::add(&state.metrics.requests, cfg.warmup_requests as u64);
+            let warmup = drive(
+                &mux,
+                input,
+                vocab,
+                1,
+                cfg.warmup_requests,
+                1,
+                request_offset,
+            )
+            .await?;
+            validate(&warmup, 1)?;
+            reject_cached_prefill(&warmup)?;
+            request_offset += cfg.warmup_requests;
+        }
+
+        crate::obs::Metrics::add(&state.metrics.requests, cfg.repetitions as u64);
+        let measured_offset = request_offset;
+        let started = Instant::now();
+        let results = drive(&mux, input, vocab, 1, cfg.repetitions, 1, measured_offset).await?;
+        let elapsed = started.elapsed();
+        validate(&results, 1)?;
+        reject_cached_prefill(&results)?;
+        request_offset += cfg.repetitions;
+        let ttft = distribution(results.iter().map(|r| ms(r.ttft)).collect())
+            .expect("positive repetitions");
+        rows.push(PrefillSweepRow {
+            input: input_report(input),
+            prompt_tokens: input_len(input),
+            warmup_requests: cfg.warmup_requests,
+            repetitions: cfg.repetitions,
+            measured_request_offset: measured_offset,
+            completed: results.len(),
+            failed: 0,
+            duration_ms: ms(elapsed),
+            ttft_ms: ttft,
+            prompt_checksum: prompt_checksum(
+                input,
+                vocab,
+                measured_offset..measured_offset + cfg.repetitions,
+            ),
+            output_checksum: checksum(&results),
+        });
+    }
+
+    let artifacts = artifact_report(
+        &bundle.dir,
+        state.execset.backend().vendor() == Some(hwspec::Vendor::Amd),
+    )?;
+    Ok(PrefillSweepReport {
+        schema: "plowrt.bench.prefill-sweep.v1",
+        model: cfg.model,
+        asset_dir: bundle.dir.display().to_string(),
+        target: bundle.manifest.gpu.clone(),
+        parallel: bundle.manifest.parallel.clone(),
+        num_gpus: bundle.manifest.num_gpus,
+        backend: format!("{:?}", state.execset.backend().class()),
+        vendor: format!("{:?}", state.execset.backend().vendor()),
+        warmup_requests_per_length: cfg.warmup_requests,
+        repetitions_per_length: cfg.repetitions,
+        rows,
+        artifacts,
+        runtime: cfg.runtime,
+        engine,
+        diagnostics: None,
+    })
+}
+
+pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
+    if cfg.concurrency == 0 || cfg.requests == 0 || cfg.output_tokens == 0 {
+        return Err(RuntimeError::Msg(
+            "bench concurrency, requests, and output tokens must be positive".into(),
+        ));
+    }
+    if state.execset.backend().vendor().is_none() {
+        return Err(RuntimeError::Msg(
+            "bench requires a matching GPU backend; refusing CPU fallback performance".into(),
+        ));
+    }
+    let bundle = state.registry.get(&cfg.model)?;
+    let vocab = bundle.tokenizer().vocab_size();
+    if vocab == 0 {
+        return Err(RuntimeError::Msg(
+            "bench tokenizer reports an empty vocabulary".into(),
+        ));
+    }
+    validate_input(&cfg.input, vocab)?;
     let mux = state
         .mux(&cfg.model)
         .ok_or_else(|| RuntimeError::Msg(format!("no model mux for '{}'", cfg.model)))?;
@@ -252,18 +528,7 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
         .batch_size_sum
         .load(Ordering::Relaxed)
         .saturating_sub(batch_sum_before);
-    let input = match &cfg.input {
-        Input::TokenIds(ids) => InputReport {
-            mode: "token_ids",
-            tokens_per_request: ids.len(),
-            seed: None,
-        },
-        Input::Random { len, seed } => InputReport {
-            mode: "random",
-            tokens_per_request: *len,
-            seed: Some(*seed),
-        },
-    };
+    let input = input_report(&cfg.input);
     let artifacts = artifact_report(
         &bundle.dir,
         state.execset.backend().vendor() == Some(hwspec::Vendor::Amd),
@@ -321,6 +586,7 @@ pub async fn run(state: &AppState, cfg: Config) -> Result<Report> {
                 .load(Ordering::Relaxed)
                 .saturating_sub(admit_shed_before),
         },
+        diagnostics: None,
     })
 }
 
@@ -436,6 +702,7 @@ async fn collect(
                 return Ok(RequestResult {
                     request,
                     prompt_tokens,
+                    cached_tokens: usage.cached_tokens,
                     tpot: (ids.len() > 1)
                         .then(|| done.duration_since(first) / (ids.len() - 1) as u32),
                     ids,
@@ -450,6 +717,58 @@ async fn collect(
     Err(RuntimeError::Msg(
         "bench response channel closed without completion".into(),
     ))
+}
+
+fn validate_input(input: &Input, vocab: usize) -> Result<()> {
+    match input {
+        Input::Random { len: 0, .. } => Err(RuntimeError::Msg(
+            "bench random input length must be positive".into(),
+        )),
+        Input::TokenIds(ids) if ids.is_empty() => {
+            Err(RuntimeError::Msg("bench token-id input is empty".into()))
+        }
+        Input::TokenIds(ids) => {
+            if let Some(&id) = ids.iter().find(|&&id| id as usize >= vocab) {
+                return Err(RuntimeError::Msg(format!(
+                    "bench token id {id} is outside vocabulary size {vocab}"
+                )));
+            }
+            Ok(())
+        }
+        Input::Random { .. } => Ok(()),
+    }
+}
+
+fn reject_cached_prefill(results: &[RequestResult]) -> Result<()> {
+    if let Some(result) = results.iter().find(|result| result.cached_tokens != 0) {
+        return Err(RuntimeError::Msg(format!(
+            "bench prefill sweep request {} used {} cached prompt tokens; refusing cache-hit TTFT",
+            result.request, result.cached_tokens
+        )));
+    }
+    Ok(())
+}
+
+fn input_report(input: &Input) -> InputReport {
+    match input {
+        Input::TokenIds(ids) => InputReport {
+            mode: "token_ids",
+            tokens_per_request: ids.len(),
+            seed: None,
+        },
+        Input::Random { len, seed } => InputReport {
+            mode: "random",
+            tokens_per_request: *len,
+            seed: Some(*seed),
+        },
+    }
+}
+
+fn input_len(input: &Input) -> usize {
+    match input {
+        Input::TokenIds(ids) => ids.len(),
+        Input::Random { len, .. } => *len,
+    }
 }
 
 fn prompt(input: &Input, vocab: usize, request: usize) -> Vec<u32> {
@@ -716,9 +1035,32 @@ fn checksum(results: &[RequestResult]) -> String {
     format!("fnv1a64:{h:016x}")
 }
 
+fn prompt_checksum(input: &Input, vocab: usize, requests: std::ops::Range<usize>) -> String {
+    let mut hash = FNV_OFFSET;
+    for request in requests {
+        for id in prompt(input, vocab, request) {
+            hash = hash_bytes(hash, &id.to_le_bytes());
+        }
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_result(request: usize, cached_tokens: usize) -> RequestResult {
+        RequestResult {
+            request,
+            prompt_tokens: 4,
+            cached_tokens,
+            ids: vec![7],
+            ttft: Duration::from_millis(2),
+            tpot: None,
+            itl: Vec::new(),
+            e2e: Duration::from_millis(2),
+        }
+    }
 
     #[test]
     fn deterministic_random_is_bounded_and_request_specific() {
@@ -749,5 +1091,95 @@ mod tests {
         let packet = hash_reader(&mut a).unwrap();
         assert_eq!(packet, hash_reader(&mut b).unwrap());
         assert_ne!(packet, hash_reader(&mut c).unwrap());
+    }
+
+    #[test]
+    fn prefill_sweep_rejects_any_cache_hit() {
+        assert!(reject_cached_prefill(&[request_result(0, 0)]).is_ok());
+        let err = reject_cached_prefill(&[request_result(4, 3)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("request 4 used 3 cached prompt tokens"));
+    }
+
+    #[test]
+    fn measured_prompt_checksum_records_request_variation() {
+        let input = Input::Random { len: 8, seed: 11 };
+        let a = prompt_checksum(&input, 100, 0..3);
+        assert_eq!(a, prompt_checksum(&input, 100, 0..3));
+        assert_ne!(a, prompt_checksum(&input, 100, 1..4));
+    }
+
+    #[test]
+    fn diagnostic_capture_preserves_selection_order_and_boundaries() {
+        let mut diagnostics = EngineDiagnostics {
+            supported: true,
+            complete: true,
+            overflowed: false,
+            scope: "warmup_and_measured",
+            prefill_selections: Vec::new(),
+            decode_selections: Vec::new(),
+            rank_agreement: None,
+        };
+        let a = PrefillSelection {
+            slot: 2,
+            row_start: 0,
+            rows: 512,
+            bucket: 512,
+        };
+        let b = PrefillSelection {
+            slot: 2,
+            row_start: 512,
+            rows: 17,
+            bucket: 128,
+        };
+        diagnostics.push_prefill(a.clone());
+        diagnostics.push_prefill(b.clone());
+        diagnostics.push_decode(DecodeSelection {
+            occupied_rows: 3,
+            bucket: 4,
+            steps: 8,
+        });
+        assert_eq!(diagnostics.prefill_selections, [a, b]);
+        assert_eq!(
+            diagnostics.decode_selections,
+            [DecodeSelection {
+                occupied_rows: 3,
+                bucket: 4,
+                steps: 8,
+            }]
+        );
+        assert!(diagnostics.complete);
+    }
+
+    #[test]
+    fn diagnostic_capture_overflow_is_fail_closed() {
+        let mut diagnostics = EngineDiagnostics::unsupported();
+        diagnostics.supported = true;
+        diagnostics.complete = true;
+        for _ in 0..=MAX_DIAGNOSTIC_SELECTIONS {
+            diagnostics.push_decode(DecodeSelection {
+                occupied_rows: 1,
+                bucket: 1,
+                steps: 1,
+            });
+        }
+        assert!(diagnostics.overflowed);
+        assert!(!diagnostics.complete);
+        assert_eq!(
+            diagnostics.decode_selections.len(),
+            MAX_DIAGNOSTIC_SELECTIONS
+        );
+        assert!(validate_engine_diagnostics(diagnostics).is_err());
+    }
+
+    #[test]
+    fn diagnostic_validation_rejects_unsupported_and_incomplete_reports() {
+        let unsupported = EngineDiagnostics::unsupported();
+        assert!(validate_engine_diagnostics(unsupported).is_err());
+
+        let mut incomplete = EngineDiagnostics::unsupported();
+        incomplete.supported = true;
+        assert!(validate_engine_diagnostics(incomplete).is_err());
     }
 }

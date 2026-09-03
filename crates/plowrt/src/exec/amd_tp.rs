@@ -180,6 +180,7 @@ use crate::device::Backend;
 use crate::exec::amd::{AmdEngine, ChunkStep, TpBind};
 use crate::exec::tp::{PeerLayout, TpGroup, XctrReset};
 use crate::{Result, RuntimeError};
+use packet::dev::PrefillSpan;
 
 /// Tokens between full all-rank readbacks — see [`AmdTpGroup::complete_decode`]
 /// for why a cadence is sound at all.
@@ -513,6 +514,14 @@ impl AmdTpGroup {
 
     pub fn n_gpu(&self) -> usize {
         self.ranks.len()
+    }
+
+    pub fn agreement_cadence(&self) -> u32 {
+        self.agree_every
+    }
+
+    pub fn counter_audit_enabled(&self) -> bool {
+        self.audit
     }
 
     /// Task-9 differential counter audit: rank 0's end-state counters for `dp`.
@@ -1020,6 +1029,39 @@ impl AmdTpGroup {
         Ok(())
     }
 
+    /// Stage the same packed-prefill metadata on every rank. Any partial failure clears all
+    /// bindings so a later dispatch cannot mix staged and legacy kernargs across ranks.
+    pub fn stage_packed_prefill(
+        &mut self,
+        prog: usize,
+        spans: &[PrefillSpan],
+        parked: &[u32],
+    ) -> Result<()> {
+        for r in 0..self.ranks.len() {
+            if let Err(err) = self.ranks[r].stage_packed_prefill(prog, spans, parked) {
+                for rank in &mut self.ranks {
+                    rank.clear_packed_prefill();
+                }
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn clear_packed_prefill(&mut self) {
+        for rank in &mut self.ranks {
+            rank.clear_packed_prefill();
+        }
+    }
+
+    pub fn prefill_prog_t(&self, prog: usize) -> Option<u32> {
+        let t = self.ranks.first()?.prefill_prog_t(prog)?;
+        self.ranks
+            .iter()
+            .all(|rank| rank.prefill_prog_t(prog) == Some(t))
+            .then_some(t)
+    }
+
     pub fn has_snapshot(&self, slot: usize) -> bool {
         self.ranks.iter().all(|e| e.has_snapshot(slot))
     }
@@ -1179,8 +1221,13 @@ impl AmdTpGroup {
             // from a padded one and that is the bucket-ladder question.
             if ttft::on() {
                 let bucket = self.ranks[0].prog_t(step.prog);
+                let timing = if self.weights_bound() {
+                    ""
+                } else {
+                    "SYNTHETIC DIAGNOSTIC: "
+                };
                 eprintln!(
-                    "PF CHUNK T={bucket} c0={} clen={} seg={seg} drain={:.3} ms \
+                    "{timing}PF CHUNK T={bucket} c0={} clen={} seg={seg} drain={:.3} ms \
                      ({:.0} tok/s over the bucket, {:.0} over the real rows)",
                     step.c0,
                     step.clen,

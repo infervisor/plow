@@ -351,6 +351,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_K3_KDA_CONV_STEP_DB", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub k3_kda_conv_step_db: bool,
 
+    /// Emit the model-independent BT64 chunk-KDA prefill pipeline. Default off; unsupported
+    /// shapes retain the serial recurrence.
+    #[arg(long, env = "PLOW_KDA_CHUNK", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub kda_chunk: bool,
+
     /// K3 up-projection no-gather mode (diagnostic).
     #[arg(long, env = "PLOW_K3_UP_NOGATHER", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub k3_up_nogather: bool,
@@ -653,6 +658,7 @@ impl EmitConfig {
             glm_router_old: env_bool("GLM_ROUTER_OLD"),
             k3_fuse_ngemv: env_str("PLOW_K3_FUSE_NGEMV"),
             k3_kda_conv_step_db: env_bool("PLOW_K3_KDA_CONV_STEP_DB"),
+            kda_chunk: env_bool("PLOW_KDA_CHUNK"),
             k3_up_nogather: env_bool("PLOW_K3_UP_NOGATHER"),
             k3_up_gather_only: env_bool("PLOW_K3_UP_GATHER_ONLY"),
             k3_shard_head: env_bool("PLOW_K3_SHARD_HEAD"),
@@ -705,6 +711,10 @@ impl EmitConfig {
         assert!(
             !(self.mxfp4 && (self.w8a8 || self.w8a16)),
             "PLOW_MXFP4=1 is A4W4; it is incompatible with PLOW_W8A8/PLOW_W8A16"
+        );
+        assert!(
+            !(self.moe_pf_atomic && self.moe_pf_det),
+            "PLOW_MOE_PF_ATOMIC=1 and PLOW_MOE_PF_DET=1 are mutually exclusive"
         );
         if self.fp8_kv_full && !self.fp8_kv {
             tracing::warn!("--fp8-kv-full has no effect without --fp8-kv");
@@ -861,6 +871,24 @@ pub fn active() -> &'static EmitConfig {
 #[cfg(test)]
 mod tests {
     use super::EmitConfig;
+
+    #[test]
+    fn grouped_prefill_accumulator_arms_are_mutually_exclusive() {
+        let mut cfg = EmitConfig::from_env();
+        cfg.w8a8 = false;
+        cfg.w8a16 = false;
+        cfg.mxfp4 = false;
+        cfg.moe_pf_atomic = true;
+        cfg.moe_pf_det = true;
+        let err = std::panic::catch_unwind(|| cfg.validate())
+            .expect_err("atomic and deterministic accumulation cannot share one packet");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(msg.contains("mutually exclusive"), "{msg}");
+    }
 
     #[test]
     fn shape_keyed_gemv_cap_parses_exact_shapes() {

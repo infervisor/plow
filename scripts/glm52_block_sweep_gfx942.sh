@@ -155,8 +155,8 @@ mkdir -p "$WORK"
 grep -aq "libhsa-runtime64" "$PLOWRT" || {
   echo "FAIL: $PLOWRT was built WITHOUT --features hsa (no libhsa-runtime64 reference)."
   echo "      Rebuild: nix develop . -c cargo build --release -p plowrt --features hsa"; exit 1; }
-"$PLOWRT" amd-bench --help 2>/dev/null | grep -q -- --prefill-sweep || {
-  echo "FAIL: this plowrt has no 'amd-bench --prefill-sweep'. That flag is what lets ONE load"
+"$PLOWRT" amd-probe --help 2>/dev/null | grep -q -- --prefill-sweep || {
+  echo "FAIL: this plowrt has no 'amd-probe --prefill-sweep'. That flag is what lets ONE load"
   echo "      cover every context with a warmed median; without it the harness would spend 99%"
   echo "      of its wall clock loading. Rebuild plowrt from this tree."; exit 1; }
 [ -x "$PLOWC" ] || { echo "FAIL: no plowc at $PLOWC"; exit 1; }
@@ -249,7 +249,7 @@ fi
   echo "run_one() {  # <arm> <objdir> <n> <env...>"
   echo "  arm=\$1; obj=\$2; n=\$3; shift 3"
   echo "  log=\"$WORK/\$arm.n\$n.log\""
-  echo "  if env PLOW_MLA_PF_V2=1 \"\$@\" \"$PLOWRT\" amd-bench \\"
+  echo "  if env PLOW_MLA_PF_V2=1 \"\$@\" \"$PLOWRT\" amd-probe \\"
   echo "        --blob \"$WORK/n\$n/model.pkt\" --hsaco \"\$obj\" --tp $TP --steps 0 \\"
   echo "        --prefill-sweep \"$CTXS\" --prefill-reps $REPS > \"\$log\" 2>&1; then"
   echo "    echo \"  ran \$arm n=\$n: \$(grep -ac PFSWEEP \"\$log\") point(s)\""

@@ -1212,8 +1212,8 @@ fn k3_build_model(
     // bucket is 16, and the walk is what covers the remaining rows instead of leaving stale
     // logits. XArgmaxFin carries up to 128 rows across eight peer-data lines.
     // A ladder carries one independent-sequence decode program per rung, including B1. Build the
-    // widest first: it declares the authoritative slot-major state/cache extents and preserves
-    // the old single-rung tensor handles byte for byte. Narrower programs adopt that table.
+    // widest first to preserve the old single-rung tensor handles byte for byte. Extents no longer
+    // rely on that ordering: scratch rows and independently carried sequence slots are explicit.
     let ladder_on = emit_config::active().decode_ladder.is_some();
     let rungs: Vec<u32> = emit_config::active()
         .decode_rungs()
@@ -1221,7 +1221,10 @@ fn k3_build_model(
         .map(|r| checked_k3_decode_batch(r, emit_config::active().gemv_walk))
         .collect();
     let dbatch = *rungs.last().expect("decode_rungs is non-empty");
-    let slot_rows = pf.iter().copied().max().unwrap_or(1).max(dbatch);
+    // Prefill contributes transient rows, never sequence slots. The widest decode rung owns the
+    // persistent KDA state, MLA caches, kvlen entries, and sampled-output rows.
+    let scratch_rows = pf.iter().copied().max().unwrap_or(1).max(dbatch);
+    let sequence_slots = dbatch;
     let mut decode_build_order = Vec::with_capacity(rungs.len());
     decode_build_order.push(dbatch);
     decode_build_order.extend_from_slice(&rungs[..rungs.len() - 1]);
@@ -1254,7 +1257,8 @@ fn k3_build_model(
             &layers,
             ctx,
             t,
-            slot_rows,
+            scratch_rows,
+            sequence_slots,
             n_cu,
             // Every rung of a ladder carries independent sequences, including B1. Without a
             // ladder, B1 remains byte-identical unless PLOW_K3_SEQ_ROWS forces the carrier.
@@ -1296,7 +1300,8 @@ fn k3_build_model(
             &layers,
             ctx,
             t,
-            slot_rows,
+            scratch_rows,
+            sequence_slots,
             n_cu,
             crate::k3::RowKind::Tokens,
         );
@@ -1764,6 +1769,72 @@ mod kimi_k3_tests {
             ring(&laddered),
             1024 * ring(&bare),
             "the ring is [T][nb_cap][hidden]"
+        );
+    }
+
+    #[test]
+    fn prefill_rows_do_not_expand_sequence_state() {
+        let _guard = crate::test_env::env_guard();
+        let d = k3_dir("row_extents");
+        let base = k3_build_model(&d, 8192, 256, 2, &[], None);
+        let bytes = |m: &Model, name: &str| {
+            m.tensors
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("missing tensor {name}"))
+                .bytes
+        };
+
+        let wide = {
+            let _scope = crate::test_env::EnvScope::set(&[
+                ("PLOW_DECODE_BATCH_LADDER", "1,128"),
+                ("PLOW_GEMV_WALK", "1"),
+            ]);
+            k3_build_model(&d, 8192, 256, 2, &[8192], None)
+        };
+        let c = cfg_kimi_k3(&d);
+
+        assert_eq!(bytes(&wide, "in.kvlen"), 128 * 4);
+        assert_eq!(bytes(&wide, "act.x"), 8192 * c.hidden as u64 * 2);
+        assert_eq!(
+            bytes(&wide, "act.og_tp"),
+            8192 * c.hidden as u64 * 2,
+            "peer scratch follows the largest row program"
+        );
+        assert_eq!(
+            bytes(&wide, "kv.0.state"),
+            128 * bytes(&base, "kv.0.state"),
+            "KDA state follows decode sequence slots, not prefill rows"
+        );
+        assert_eq!(
+            bytes(&wide, "kv.2.ckv"),
+            128 * bytes(&base, "kv.2.ckv"),
+            "MLA cache follows decode sequence slots, not prefill rows"
+        );
+    }
+
+    #[test]
+    fn decode_only_b1_keeps_single_row_and_slot_extents() {
+        let _guard = crate::test_env::env_guard();
+        let d = k3_dir("decode_only_extents");
+        let m = k3_build_model(&d, 8192, 256, 2, &[], None);
+        let c = cfg_kimi_k3(&d);
+        let bytes = |name: &str| {
+            m.tensors
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("missing tensor {name}"))
+                .bytes
+        };
+
+        assert_eq!(m.prog_t, [1]);
+        assert_eq!(bytes("in.kvlen"), 4);
+        assert_eq!(bytes("act.x"), c.hidden as u64 * 2);
+        assert_eq!(bytes("act.og_tp"), c.hidden as u64 * 2);
+        assert_eq!(
+            bytes("kv.2.ckv"),
+            8192 * c.kv_lora as u64 * 2,
+            "one sequence owns one context-length MLA cache"
         );
     }
 

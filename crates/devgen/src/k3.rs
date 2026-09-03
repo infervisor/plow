@@ -1032,7 +1032,20 @@ pub fn emit_k3_latent_moe(
     } else {
         packet::dev::TENSOR_NONE
     };
-    let part = f32t(b, format!("{a}part"), tt * c.top_k as u64 * lat as u64);
+    let pf_fuse = if t > 1 {
+        crate::mla::moe_pf_fuse(c.top_k)
+    } else {
+        crate::mla::MoePfFuse::None
+    };
+    let part_pf = match pf_fuse {
+        crate::mla::MoePfFuse::Atomic => tt * lat as u64 * 4,
+        crate::mla::MoePfFuse::Det => tt * lat as u64 * 8,
+        crate::mla::MoePfFuse::None => tt * c.top_k as u64 * lat as u64 * 4,
+    };
+    let part = b.tensor(
+        &format!("{a}part"),
+        part_pf.max(c.top_k as u64 * lat as u64 * 4),
+    );
     let ylat = bft(b, format!("{a}ylat"), tt * lat as u64);
     // Declared even when [`fuse_norm_gemv`] folds the norm away and nothing writes it. Keeping the
     // tensor table IDENTICAL across both arms is what makes `PLOW_K3_FUSE_NGEMV` an A/B control:
@@ -1180,6 +1193,8 @@ pub fn emit_k3_latent_moe(
             )
         }
     } else {
+        let atom = pf_fuse == crate::mla::MoePfFuse::Atomic;
+        let det = pf_fuse == crate::mla::MoePfFuse::Det;
         // The grouped arrays are sized on the MPF_BM-PADDED row bound: the align op rounds each
         // expert's row range up to a whole tile, so every expert can waste up to MPF_BM-1 rows.
         // Sizing them from `T*k` alone is an out-of-bounds device write with no symptom at small
@@ -1219,6 +1234,10 @@ pub fn emit_k3_latent_moe(
             d.t[0] = tab;
             d.t[1] = logit;
             d.t[3] = w.router_bias;
+            if atom || det {
+                d.t[2] = part;
+                d.i[0] = lat;
+            }
             d.i[1] = c.n_exp;
             d.i[2] = c.top_k;
             d.i[3] = c.route_flags;
@@ -1285,6 +1304,12 @@ pub fn emit_k3_latent_moe(
             d.i[1] = imoe;
             d.i[2] = c.n_exp;
             d.i[crate::mla::MoeEnc::PREFILL_SLOT] = c.enc;
+            if atom {
+                d.i[4] = c.top_k.trailing_zeros() + 1;
+            }
+            if det {
+                d.i[5] = c.top_k.trailing_zeros() + 1;
+            }
         });
         // T-token combine at LATENT width, still with NO residual and NO shared operand: there is
         // nothing 3584 wide to add, so both of those happen after the up-projection.
@@ -1292,8 +1317,9 @@ pub fn emit_k3_latent_moe(
             d.t[0] = cmb_dst;
             d.t[3] = part;
             d.i[0] = lat;
-            d.i[1] = c.top_k;
+            d.i[1] = if atom || det { 1 } else { c.top_k };
             d.i[2] = t;
+            d.i[4] = u32::from(det);
         })
     };
     if tp.on() {
@@ -1876,6 +1902,7 @@ pub fn emit_k3_mla_mixer(
             d.i[2] = dk;
             d.i[3] = 0; // row, patched per step
             d.i[4] = 0; // apply RMSNorm before quantizing
+            d.i[7] = ctx; // packed-prefill per-slot cache row stride
             d.f[0] = c.eps;
             d.j[1] = crate::KV_MASK_NONE;
             // BATCHED DECODE WRITES ITS OWN RING AT ITS OWN POSITION. `i[6]` is the kernel's
@@ -1904,6 +1931,7 @@ pub fn emit_k3_mla_mixer(
             d.i[0] = t;
             d.i[1] = dk;
             d.i[2] = 0; // row, patched per step
+            d.i[7] = ctx; // packed-prefill per-slot cache row stride
             d.f[0] = c.eps;
         })
     };
@@ -1921,6 +1949,7 @@ pub fn emit_k3_mla_mixer(
         d.i[2] = dr;
         d.i[3] = 0; // row, patched per step
         d.i[4] = 1;
+        d.i[7] = ctx; // packed-prefill per-slot cache row stride
         d.f[0] = c.eps;
         d.j[1] = crate::KV_MASK_NONE;
         // Same batch-major selection as the latent writer above; see its note.
@@ -2512,18 +2541,24 @@ pub fn emit_k3_model(
     layers: &[u32],
     ctx: u32,
     t: u32,
-    slot_rows: u32,
+    scratch_rows: u32,
+    sequence_slots: u32,
     n_cu: u32,
     rows: RowKind,
 ) {
-    // HOW MANY INDEPENDENT SEQUENCES this program carries KDA state for. NOT the same as `t`:
-    // a prefill program has `t` rows and ONE slot (its rows thread through one carried state);
-    // a batched decode program has `t == B` rows and `B` slots.
-    let slots: u64 = match rows {
-        RowKind::Tokens => 1,
-        RowKind::Sequences => t as u64,
-    };
+    // These are blob-wide capacities, not properties of this program. Prefill token rows need
+    // transient activation/peer space; only decode rungs add independently carried sequences.
     let seq_rows = matches!(rows, RowKind::Sequences);
+    assert!(
+        scratch_rows >= t,
+        "K3: scratch has {scratch_rows} rows but program needs {t}"
+    );
+    assert!(
+        sequence_slots >= if seq_rows { t } else { 1 },
+        "K3: carried state has {sequence_slots} slots but program needs {}",
+        if seq_rows { t } else { 1 }
+    );
+    let slots = sequence_slots as u64;
     // SHARING IS EXPRESSED THROUGH THE BUILDER, not through the naming. Re-declaring a name now
     // returns the existing handle and grows it to the larger size, which is what makes the shared
     // prefill prefix below actually share one buffer instead of allocating 93 identically-named
@@ -2568,7 +2603,7 @@ pub fn emit_k3_model(
     };
 
     // Globals.
-    let ids = b.tensor("in.ids", t as u64 * 4);
+    let ids = b.tensor("in.ids", scratch_rows as u64 * 4);
     let emb = b.tensor(
         &format!("{pfx}embed_tokens.weight"),
         c.vocab as u64 * hid as u64 * 2,
@@ -2589,16 +2624,19 @@ pub fn emit_k3_model(
         &format!("{tower}lm_head.weight"),
         vocab_l as u64 * hid as u64 * 2,
     );
-    let x = b.tensor("act.x", t as u64 * hid as u64 * 2);
-    let xnext = b.tensor("act.xnext", t as u64 * hid as u64 * 2);
-    let xn = b.tensor("act.xn", t as u64 * hid as u64 * 2);
+    let x = b.tensor("act.x", scratch_rows as u64 * hid as u64 * 2);
+    let xnext = b.tensor("act.xnext", scratch_rows as u64 * hid as u64 * 2);
+    let xn = b.tensor("act.xn", scratch_rows as u64 * hid as u64 * 2);
     // ROWS THE TAIL SAMPLES. A prefill bucket samples ONE row (the last real one) however wide
     // the bucket is — a [T, vocab] logit matrix would cost a 163k-wide GEMM per prompt token to
     // throw all but one row away. A batched DECODE samples ALL of them, because its rows are
     // independent sequences and each one needs its own token.
     let s_rows = if seq_rows { t } else { 1 };
-    let logits = b.tensor("act.logits", s_rows as u64 * vocab_l as u64 * 2);
-    let amax = b.tensor("act.amax", s_rows as u64 * crate::AMAX_BLOCKS as u64 * 8);
+    let logits = b.tensor("act.logits", sequence_slots as u64 * vocab_l as u64 * 2);
+    let amax = b.tensor(
+        "act.amax",
+        sequence_slots as u64 * crate::AMAX_BLOCKS as u64 * 8,
+    );
     // The block-residual ring: compiler-owned, per-sequence, `kv.`-prefixed so
     // the loader classifies it by exclusion rather than demanding it of the
     // checkpoint.
@@ -2607,7 +2645,10 @@ pub fn emit_k3_model(
     // token's worth of rows; a prefill bucket needs a private ring PER TOKEN, because every token
     // has its own prefix sum and its own snapshots. `nb_max` is the stride and travels to the
     // kernel as an operand — see [`emit_attn_res`].
-    let blkres = b.tensor("kv.blkres", t as u64 * nb_max as u64 * hid as u64 * 2);
+    let blkres = b.tensor(
+        "kv.blkres",
+        scratch_rows as u64 * nb_max as u64 * hid as u64 * 2,
+    );
 
     // Tensor parallelism. The two peer slots are the partial buffers the collectives reduce out
     // of: one for the attention output, one for the expert combine.  `slot_b` MUST be identical
@@ -2616,10 +2657,10 @@ pub fn emit_k3_model(
     // the partial after the widest prefill bucket (`Tmax*H*2`).
     let mut tp = if c.tp > 1 {
         assert!(
-            slot_rows >= t,
-            "K3: peer slot has {slot_rows} rows but program needs {t}"
+            scratch_rows >= t,
+            "K3: peer slot has {scratch_rows} rows but program needs {t}"
         );
-        let slot_b = slot_rows * hid * 2;
+        let slot_b = scratch_rows * hid * 2;
         K3Tp {
             tp: c.tp,
             og: b.tensor("act.og_tp", slot_b as u64),
@@ -2927,8 +2968,8 @@ pub fn declare_k3_mla_weights(
     sin: u32,
     pos: u32,
     kvlen: u32,
-    // How many INDEPENDENT SEQUENCES this program's KV caches hold. 1 everywhere today; `B` for
-    // a batched decode program, where `d_flash_mla_decode` indexes them by its `n_batch` axis.
+    // Blob-wide INDEPENDENT-SEQUENCE capacity. Prefill uses slot 0; batched decode indexes the
+    // first `B` slots through `d_flash_mla_decode`'s `n_batch` axis.
     slots: u64,
 ) -> K3MlaWeights {
     let (h, nh) = (c.hidden as u64, c.heads as u64);
@@ -3415,6 +3456,7 @@ mod tests {
             4096,
             1,
             1,
+            1,
             256,
             RowKind::Tokens,
         );
@@ -3497,6 +3539,7 @@ mod tests {
                 4096,
                 1,
                 1,
+                1,
                 256,
                 RowKind::Tokens,
             );
@@ -3519,6 +3562,7 @@ mod tests {
             &|l| l != 3,
             &[0, 1, 2, 3],
             4096,
+            1,
             1,
             1,
             256,
@@ -3581,6 +3625,7 @@ mod tests {
             4096,
             1,
             1,
+            1,
             256,
             RowKind::Tokens,
         );
@@ -3637,6 +3682,7 @@ mod tests {
             4096,
             1,
             1,
+            1,
             256,
             RowKind::Tokens,
         );
@@ -3659,6 +3705,7 @@ mod tests {
             &|l| !mla.contains(&l),
             &layers,
             4096,
+            1,
             1,
             1,
             256,
@@ -4184,6 +4231,7 @@ mod tests {
             4096,
             t,
             t,
+            if rows == RowKind::Sequences { t } else { 1 },
             256,
             rows,
         );
@@ -4399,6 +4447,7 @@ mod tests {
                 4096,
                 t,
                 t,
+                1,
                 256,
                 RowKind::Tokens,
             );
@@ -4512,6 +4561,7 @@ mod tests {
     /// in slots that are NOT the ones the decode ops use.
     #[test]
     fn the_grouped_prefill_moe_runs_at_the_latent_width_with_situ() {
+        let _guard = crate::test_env::env_guard();
         let t = 512u32;
         let p = build_full_t(1, t);
         let g = p
@@ -4591,6 +4641,133 @@ mod tests {
     }
 
     #[test]
+    fn atomic_k3_grouped_prefill_sets_packets_and_manifest_requirement() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_MOE_PF_ATOMIC", "1"),
+            ("PLOW_MOE_PF_DET", "0"),
+        ]);
+        let p = build_full_t(1, 512);
+        let router = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeRouterTopkPf as u16)
+            .unwrap();
+        let down = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeGroupDownPf as u16)
+            .unwrap();
+        let combine = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeCombinePf as u16)
+            .unwrap();
+        assert_eq!(router.t[2], down.t[0], "router zeros DOWN's accumulator");
+        assert_eq!(router.i[0], 3584, "the accumulator is at latent width");
+        assert_eq!(
+            down.i[4],
+            model_cfg().moe.top_k.trailing_zeros() + 1,
+            "log2(top_k) + 1 arms atomic scatter"
+        );
+        assert_eq!(down.i[5], 0, "the deterministic arm stays disjoint");
+        assert_eq!(combine.i[1], 1, "combine reads one accumulated row");
+        assert_eq!(combine.i[4], 0, "the accumulator contains f32");
+
+        let m = packet::devbuild::Model {
+            n_cu: 256,
+            target: 0,
+            tensors: p.tensors.clone(),
+            progs: vec![p],
+            kv_row_insts: Vec::new(),
+            prog_t: vec![512],
+            gen: Vec::new(),
+        };
+        let manifest = crate::manifest::build(&m, "gfx950", &crate::LeanReport::default());
+        assert_eq!(
+            manifest.pointer("/features/moe_pf_atomic"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        let requires = manifest
+            .pointer("/backends/gfx950/requires")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert!(requires
+            .iter()
+            .any(|v| v.as_str() == Some("PLOW_MOE_PF_ATOMIC=1")));
+    }
+
+    #[test]
+    fn deterministic_k3_grouped_prefill_sets_f64_packets_and_manifest_requirement() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_MOE_PF_ATOMIC", "0"),
+            ("PLOW_MOE_PF_DET", "1"),
+        ]);
+        let t = 512u32;
+        let p = build_full_t(1, t);
+        let router = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeRouterTopkPf as u16)
+            .unwrap();
+        let down = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeGroupDownPf as u16)
+            .unwrap();
+        let combine = p
+            .insts
+            .iter()
+            .find(|i| i.op == DevOp::MoeCombinePf as u16)
+            .unwrap();
+        assert_eq!(router.t[2], down.t[0], "router zeros DOWN's accumulator");
+        assert_eq!(router.i[0], 3584, "the accumulator is at latent width");
+        assert_eq!(
+            p.tensors[down.t[0] as usize].bytes,
+            t as u64 * 3584 * 8,
+            "deterministic accumulation stores one f64 row per token"
+        );
+        assert_eq!(down.i[4], 0, "the atomic arm stays disjoint");
+        assert_eq!(
+            down.i[5],
+            model_cfg().moe.top_k.trailing_zeros() + 1,
+            "log2(top_k) + 1 arms deterministic scatter"
+        );
+        assert_eq!(combine.i[1], 1, "combine reads one accumulated row");
+        assert_eq!(combine.i[4], 1, "combine decodes the accumulator as f64");
+
+        let m = packet::devbuild::Model {
+            n_cu: 256,
+            target: 0,
+            tensors: p.tensors.clone(),
+            progs: vec![p],
+            kv_row_insts: Vec::new(),
+            prog_t: vec![t],
+            gen: Vec::new(),
+        };
+        let manifest = crate::manifest::build(&m, "gfx950", &crate::LeanReport::default());
+        assert_eq!(
+            manifest.pointer("/features/moe_pf_det"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            manifest.pointer("/features/moe_pf_atomic"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        let requires = manifest
+            .pointer("/backends/gfx950/requires")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert!(requires
+            .iter()
+            .any(|v| v.as_str() == Some("PLOW_MOE_PF_DET=1")));
+        assert!(!requires
+            .iter()
+            .any(|v| v.as_str() == Some("PLOW_MOE_PF_ATOMIC=1")));
+    }
+
+    #[test]
     fn grouped_router_uses_one_block_per_token_up_to_the_cu_count() {
         for (t, want) in [(32, 32), (128, 128), (512, 256)] {
             let rows = if t == 32 {
@@ -4615,6 +4792,7 @@ mod tests {
     /// no symptom at small expert counts and a guaranteed one at K3's 896.
     #[test]
     fn the_gathered_row_arrays_carry_the_align_padding() {
+        let _guard = crate::test_env::env_guard();
         let t = 512u64;
         let p = build_full_t(1, t as u32);
         let bytes = |n: &str| p.tensors.iter().find(|x| x.name == n).unwrap().bytes;
@@ -4839,6 +5017,7 @@ mod tests {
                 4096,
                 t,
                 t,
+                1,
                 256,
                 RowKind::Tokens,
             );

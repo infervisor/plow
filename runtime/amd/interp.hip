@@ -45,6 +45,12 @@
 #ifndef PLOW_K3
 #define PLOW_K3 0
 #endif
+#ifndef PLOW_KDA_CHUNK
+#define PLOW_KDA_CHUNK 0
+#endif
+#if PLOW_KDA_CHUNK && !PLOW_K3
+#error "PLOW_KDA_CHUNK requires the generic KDA bodies compiled by PLOW_K3"
+#endif
 
 #include "amd_common.h"
 #include "op_attention.h"
@@ -58,6 +64,16 @@
 #include "op_moe.h"
 #include "op_norm.h"
 
+/* This proves only that the object was compiled against the packed-prefill PlowProgram tail.
+ * Descriptor-consuming math arms are a separate capability and are not enabled by this marker. */
+extern "C" __device__ unsigned plow_packed_prefill_abi_1 = 1;
+#if PLOW_PACKED_PREFILL_CONSUMERS && (PLOW_MLA_PREFILL || PLOW_MLA_PF_V2_ARM)
+extern "C" __device__ unsigned plow_packed_prefill_mla_consumers_1 = 1;
+#endif
+#if PLOW_PACKED_PREFILL_CONSUMERS && PLOW_K3
+extern "C" __device__ unsigned plow_packed_prefill_kda_consumers_1 = 1;
+#endif
+
 /* The K3/KDA arms, made observable in the ELF the same way `PLOW_GEMV_WALK` is
  * (`runtime/amd/op_gemm.h:2557`) and for the same reason: the loader reads `.symtab` before the
  * object is on a device, so a name costs nothing where a value costs a device round-trip.
@@ -69,6 +85,9 @@
  * without it. */
 #if PLOW_K3
 extern "C" __device__ unsigned plow_k3_arms_1 = 1;
+#endif
+#if PLOW_K3 && PLOW_KDA_CHUNK
+extern "C" __device__ unsigned plow_kda_chunk_bt64_arm_1 = 1;
 #endif
 #if PLOW_K3 && PLOW_KDA_CONV_STEP_DB
 extern "C" __device__ unsigned plow_kda_conv_step_db_arm = 1;
@@ -1155,9 +1174,46 @@ __device__ __forceinline__ void exec_flash_mla_decode_fp8(CInst in, CTens T, uns
 #if PLOW_FP8_KV
 /* FP8 (e4m3) LATENT MLA PREFILL (op 110). Operands as the decode twin, `i4 = n_tok`. */
 __device__ __forceinline__ void exec_flash_mla_prefill_fp8(CInst in, CTens T, unsigned slice,
-                                                           unsigned nblk, float* lds) {
+                                                           unsigned nblk, float* lds,
+                                                           const PlowProgram* prog) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     if (TEN(7) == nullptr) __builtin_trap();
+#if PLOW_PACKED_PREFILL_CONSUMERS
+    if (plow_packed_prefill_enabled(prog)) {
+        const unsigned gf = in->i[7] ? in->i[7] : (unsigned)GLM_MLA_GF;
+        for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+            const PlowPrefillSpan* s = plow_packed_prefill_span(prog, si);
+            float* op = (float*)TEN(0) + (size_t)s->row0 * in->i[1] * 512u;
+            float* ml = (float*)TEN(1) + (size_t)s->row0 * in->i[1] * 2u;
+            const bf16* qa = (const bf16*)TEN(2) + (size_t)s->row0 * in->i[1] * 512u;
+            const bf16* qr = (const bf16*)TEN(3) + (size_t)s->row0 * in->i[1] * 64u;
+            const unsigned char* ck = (const unsigned char*)TEN(4) +
+                                      (size_t)s->slot * in->i[2] * 512u;
+            const bf16* kr = (const bf16*)TEN(5) + (size_t)s->slot * in->i[2] * 64u;
+            const float* ks = (const float*)TEN(7) + (size_t)s->slot * in->i[2];
+#if PLOW_MLA_PF_MFMA
+            if (mla_pf_tiled_fills(1u, s->n_rows, in->i[1], nblk)) {
+                d_flash_mla_prefill_mfma<512, 64, /*FP8=*/true>(
+                    op, ml, qa, qr, (const bf16*)ck, kr, (const int*)TEN(6) + s->slot, 1u,
+                    s->n_rows, in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice,
+                    nblk, lds, ks, in->i[6]);
+                continue;
+            }
+#endif
+            if (gf == 2)
+                d_flash_mla_prefill_fp8<512, 64, 2>(
+                    op, ml, qa, qr, (const bf16*)ck, kr, (const int*)TEN(6) + s->slot, 1u,
+                    s->n_rows, in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice,
+                    nblk, lds, ks, in->i[6]);
+            else
+                d_flash_mla_prefill_fp8<512, 64, 4>(
+                    op, ml, qa, qr, (const bf16*)ck, kr, (const int*)TEN(6) + s->slot, 1u,
+                    s->n_rows, in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice,
+                    nblk, lds, ks, in->i[6]);
+        }
+        return;
+    }
+#endif
 #if PLOW_MLA_PF_MFMA
     /* `gf` (i[7]) is a DECODE knob — how many query heads share one re-stream of the latent.
      * The tiled kernel's reuse axis is the QUERY TILE, so it has no group factor to read and
@@ -1204,9 +1260,43 @@ __device__ __forceinline__ void exec_flash_mla_prefill_fp8(CInst in, CTens T, un
  *   i0=n_batch i1=n_head i2=kv_stride i3=window i4=n_tok i5=kv_mask i6=top_k i7=gf
  *   f0=scale */
 __device__ __forceinline__ void exec_flash_mla_prefill(CInst in, CTens T, unsigned slice,
-                                                       unsigned nblk, float* lds) {
+                                                       unsigned nblk, float* lds,
+                                                       const PlowProgram* prog) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
     const unsigned gf = in->i[7] ? in->i[7] : (unsigned)GLM_MLA_GF;
+#if PLOW_PACKED_PREFILL_CONSUMERS
+    if (plow_packed_prefill_enabled(prog)) {
+        if (in->op == PLOW_DOP_FLASH_GATHER_PREFILL || in->t[7] != PLOW_TENSOR_NONE)
+            __builtin_trap();
+        for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+            const PlowPrefillSpan* s = plow_packed_prefill_span(prog, si);
+            float* op = (float*)TEN(0) + (size_t)s->row0 * in->i[1] * 512u;
+            float* ml = (float*)TEN(1) + (size_t)s->row0 * in->i[1] * 2u;
+            const bf16* qa = (const bf16*)TEN(2) + (size_t)s->row0 * in->i[1] * 512u;
+            const bf16* qr = (const bf16*)TEN(3) + (size_t)s->row0 * in->i[1] * 64u;
+            const bf16* ck = (const bf16*)TEN(4) + (size_t)s->slot * in->i[2] * 512u;
+            const bf16* kr = (const bf16*)TEN(5) + (size_t)s->slot * in->i[2] * 64u;
+#if PLOW_MLA_PF_MFMA
+            if (mla_pf_tiled_fills(1u, s->n_rows, in->i[1], nblk)) {
+                d_flash_mla_prefill_mfma<512, 64, /*FP8=*/false>(
+                    op, ml, qa, qr, ck, kr, (const int*)TEN(6) + s->slot, 1u, s->n_rows,
+                    in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk, lds,
+                    nullptr, 0u);
+                continue;
+            }
+#endif
+            if (gf == 2)
+                d_flash_mla_prefill<512, 64, 2>(
+                    op, ml, qa, qr, ck, kr, (const int*)TEN(6) + s->slot, 1u, s->n_rows,
+                    in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk, lds);
+            else
+                d_flash_mla_prefill<512, 64, 4>(
+                    op, ml, qa, qr, ck, kr, (const int*)TEN(6) + s->slot, 1u, s->n_rows,
+                    in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk, lds);
+        }
+        return;
+    }
+#endif
     if (in->op == PLOW_DOP_FLASH_GATHER_PREFILL) {
         if (gf == 2)
             d_flash_gather_prefill<512, 64, 2>(
@@ -1629,12 +1719,45 @@ __device__ __forceinline__ P plow_scalar_ptr(P p) {
  * it is missing (an old flash object would write unnormalized f32 partials that the fused
  * GEMM reads as bf16 garbage). */
 extern "C" __device__ unsigned plow_glm_ofold_arm = 1;
+
+#if PLOW_PACKED_PREFILL_CONSUMERS
+template <bool FP8>
+__device__ __forceinline__ void exec_flash_mla_prefill_v2_packed(
+    CInst in, CTens T, unsigned slice, unsigned nblk, bf16* lds, const PlowProgram* prog) {
+#define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+    if (!plow_packed_prefill_enabled(prog)) __builtin_trap();
+    if ((!FP8 && in->t[7] != PLOW_TENSOR_NONE) || (FP8 && TEN(7) == nullptr)) __builtin_trap();
+    for (unsigned si = 0; si < prog->n_prefill_spans; ++si) {
+        const PlowPrefillSpan* s = plow_packed_prefill_span(prog, si);
+        float* op = (float*)TEN(0) + (size_t)s->row0 * in->i[1] * 512u;
+        float* ml = (float*)TEN(1) + (size_t)s->row0 * in->i[1] * 2u;
+        const bf16* qa = (const bf16*)TEN(2) + (size_t)s->row0 * in->i[1] * 512u;
+        const bf16* qr = (const bf16*)TEN(3) + (size_t)s->row0 * in->i[1] * 64u;
+        const char* ck = (const char*)TEN(4) +
+                         (size_t)s->slot * in->i[2] * 512u * (FP8 ? 1u : 2u);
+        const bf16* kr = (const bf16*)TEN(5) + (size_t)s->slot * in->i[2] * 64u;
+        const float* ks = FP8 ? (const float*)TEN(7) + (size_t)s->slot * in->i[2] : nullptr;
+        d_flash_mla_prefill_v2<512, 64, /*GATHER=*/false, FP8>(
+            op, ml, qa, qr, (const bf16*)ck, kr, (const int*)TEN(6) + s->slot, 1u,
+            s->n_rows, in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk,
+            lds, nullptr, 0u, FP8 ? 1u : ((in->i[6] & 0xffu) ? (in->i[6] & 0xffu) : 1u),
+            FP8 ? false : ((in->i[6] >> 8) & 1u) != 0u, ks, FP8 ? in->i[6] : 0u);
+    }
+#undef TEN
+}
+#endif
 #endif
 
-__device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_smem* sm) {
+__device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_smem* sm,
+                                 const PlowProgram* prog_meta) {
     CInst in = plow_scalar_ptr(in_v);
     CTens T = plow_scalar_ptr(T_v);
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+#if PLOW_PACKED_PREFILL_CONSUMERS
+#define PLOW_PACKED_NORM_ARGS , prog_meta, in->i[7]
+#else
+#define PLOW_PACKED_NORM_ARGS
+#endif
     const unsigned nblk = in->blocks;
 #if defined(PLOW_BUCKET_FLASH)
     /* Flash-ONLY object (segmented dispatch): this launch runs only the class-4 flash_prefill
@@ -1660,7 +1783,13 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                   "V2 MLA prefill LDS exceeds the flash arena");
     if (in->op == PLOW_DOP_FLASH_MLA_PREFILL_FP8) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
-        d_flash_mla_prefill_v2<512, 64, /*GATHER=*/false, /*FP8=*/true>(
+#if PLOW_PACKED_PREFILL_CONSUMERS
+        if (plow_packed_prefill_enabled(prog_meta))
+            exec_flash_mla_prefill_v2_packed</*FP8=*/true>(in, T, slice, nblk, sm->fa,
+                                                           prog_meta);
+        else
+#endif
+            d_flash_mla_prefill_v2<512, 64, /*GATHER=*/false, /*FP8=*/true>(
             (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
             (const bf16*)TEN(4), (const bf16*)TEN(5), (const int*)TEN(6), in->i[0],
             in->i[4], in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk,
@@ -1670,6 +1799,12 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
 #if !PLOW_FP8_KV
     else if (in->op == PLOW_DOP_FLASH_MLA_PREFILL) {
 #define TEN(k) (in->t[k] == PLOW_TENSOR_NONE ? nullptr : T[in->t[k]])
+#if PLOW_PACKED_PREFILL_CONSUMERS
+        if (plow_packed_prefill_enabled(prog_meta)) {
+            exec_flash_mla_prefill_v2_packed</*FP8=*/false>(in, T, slice, nblk, sm->fa,
+                                                            prog_meta);
+        } else {
+#endif
         /* t7 = the DSA per-64-query-tile union table (op 119) selects the GATHER arm:
          * same full-column-wave body, but the KV walk covers the tile's union entries and
          * per-query exactness comes from the staged membership masks. i6 = cap.
@@ -1698,6 +1833,9 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                 in->i[4], in->i[1], in->i[2], in->i[3], in->fj[0].f, in->i[5], slice, nblk,
                 sm->fa, nullptr, 0u, (in->i[6] & 0xffu) ? (in->i[6] & 0xffu) : 1u,
                 ((in->i[6] >> 8) & 1u) != 0u);
+#if PLOW_PACKED_PREFILL_CONSUMERS
+        }
+#endif
 #undef TEN
     }
 #endif
@@ -1713,7 +1851,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
              * every pre-existing packet. */
             d_rmsnorm((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2), in->i[0],
                       in->i[1], in->fj[0].f, in->i[2], slice, nblk, sm->part,
-                      (unsigned char*)TEN(3), (float*)TEN(4));
+                      (unsigned char*)TEN(3), (float*)TEN(4) PLOW_PACKED_NORM_ARGS);
             break;
         case PLOW_DOP_ROWRMS:
             d_rowrms((float*)TEN(0), (const bf16*)TEN(1), in->i[0], in->i[1], in->fj[0].f, slice,
@@ -1737,22 +1875,22 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                      (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                      (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
                                      in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
-                                     in->i[4], slice, nblk, in->i[6]);
+                                     in->i[4], slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
             else if (in->i[2] == 128)
                 d_headnorm_rope<128>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                      (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
                                      in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
-                                     in->i[4], slice, nblk, in->i[6]);
+                                     in->i[4], slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
             else if (in->i[2] == 256)
                 d_headnorm_rope<256>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                      (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
                                      in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
-                                     in->i[4], slice, nblk, in->i[6]);
+                                     in->i[4], slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
             else if (in->i[2] == 512)
                 d_headnorm_rope<512>((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                      (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
                                      in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
-                                     in->i[4], slice, nblk, in->i[6]);
+                                     in->i[4], slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
             /* HD=64 is GLM-5.2's partial-rope slice, and GLM applies INTERLEAVED (GPT-J) RoPE there
              * (dynamic per-step q_rope + shared k_rope for multi-token decode). No other arch uses
              * HD=64, so HD==64 selects the interleaved template; every 128/256/512 path stays
@@ -1762,7 +1900,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                      (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                      (const float*)TEN(3), (const float*)TEN(4), (const int*)TEN(5),
                                      in->i[0], in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u,
-                                     in->i[4], slice, nblk, in->i[6]);
+                                     in->i[4], slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
             break;
 #if PLOW_FP8_KV
         /* FP8 KV write (k/v only; q still uses HEADNORM_ROPE above). t0=uint8 cache, t6=f32 scale. */
@@ -1775,25 +1913,25 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                                         (const bf16*)TEN(2), (const float*)TEN(3),
                                         (const float*)TEN(4), (const int*)TEN(5), in->i[0],
                                         in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4],
-                                        slice, nblk, in->i[6]);
+                                        slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
             else if (in->i[2] == 128)
                 d_headnorm_rope_fp8<128>((unsigned char*)TEN(0), (float*)TEN(6), (const bf16*)TEN(1),
                                          (const bf16*)TEN(2), (const float*)TEN(3),
                                          (const float*)TEN(4), (const int*)TEN(5), in->i[0],
                                          in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4],
-                                         slice, nblk, in->i[6]);
+                                         slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
             else if (in->i[2] == 256)
                 d_headnorm_rope_fp8<256>((unsigned char*)TEN(0), (float*)TEN(6), (const bf16*)TEN(1),
                                          (const bf16*)TEN(2), (const float*)TEN(3),
                                          (const float*)TEN(4), (const int*)TEN(5), in->i[0],
                                          in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4],
-                                         slice, nblk, in->i[6]);
+                                         slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
             else if (in->i[2] == 512)
                 d_headnorm_rope_fp8<512>((unsigned char*)TEN(0), (float*)TEN(6), (const bf16*)TEN(1),
                                          (const bf16*)TEN(2), (const float*)TEN(3),
                                          (const float*)TEN(4), (const int*)TEN(5), in->i[0],
                                          in->i[1], in->fj[0].f, in->i[3], in->fj[1].u, in->fj[2].u, in->i[4],
-                                         slice, nblk, in->i[6]);
+                                         slice, nblk, in->i[6] PLOW_PACKED_NORM_ARGS);
             break;
 #endif
         case PLOW_DOP_NORM_RESIDUAL:
@@ -1844,6 +1982,50 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
          * built with the axis is a different question, answered at load time by `plow_k3_arms_1`.
          * The drift test reads `case PLOW_DOP_*` labels textually and is unaffected by the `#if`. */
 #if PLOW_K3
+#if PLOW_KDA_CHUNK
+        case PLOW_DOP_KDA_CHUNK_PREPARE:
+            if (in->i[0] == 0u || in->i[1] == 0u ||
+                (in->i[2] != 64u && in->i[2] != 128u))
+                __builtin_trap();
+            d_kda_chunk_prepare_bt64(
+                (bf16*)TEN(0), (bf16*)TEN(1), (float*)TEN(2), (float*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
+                (const float*)TEN(7), nullptr, (in->i[0] + 63u) / 64u, in->i[0], in->i[1],
+                in->i[2], in->i[3], in->fj[0].f, slice, nblk);
+            break;
+        case PLOW_DOP_KDA_CHUNK_INTRA:
+            if (in->i[0] == 0u || in->i[1] == 0u ||
+                (in->i[2] != 64u && in->i[2] != 128u))
+                __builtin_trap();
+            d_kda_chunk_intra_bt64(
+                (float*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const float*)TEN(4), (const float*)TEN(5), nullptr, (in->i[0] + 63u) / 64u,
+                in->i[0], in->i[1], in->i[2], in->fj[0].f, slice, nblk, (float*)sm->raw);
+            break;
+        case PLOW_DOP_KDA_CHUNK_WU:
+            if (in->i[0] == 0u || in->i[1] == 0u ||
+                (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2])
+                __builtin_trap();
+            d_kda_chunk_wu_bt64(
+                (bf16*)TEN(0), (bf16*)TEN(1), (const float*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const float*)TEN(5), (const float*)TEN(6), nullptr,
+                (in->i[0] + 63u) / 64u, in->i[0], in->i[1], in->i[2], in->i[3], slice, nblk);
+            break;
+        case PLOW_DOP_KDA_CHUNK_CARRY: {
+            if (in->i[0] == 0u || in->i[1] == 0u ||
+                (in->i[2] != 64u && in->i[2] != 128u) || in->i[3] != in->i[2])
+                __builtin_trap();
+            float* kst = (float*)sm->raw;
+            bf16* kv = (bf16*)(kst + 16u * in->i[2]);
+            float* ko = (float*)(kv + 64u * 16u);
+            d_kda_chunk_carry_bt64(
+                (bf16*)TEN(0), (float*)TEN(1), (const bf16*)TEN(2), (const bf16*)TEN(3),
+                (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
+                (const float*)TEN(7), nullptr, (in->i[0] + 63u) / 64u, in->i[0], in->i[1],
+                in->i[2], in->i[3], in->fj[0].f, slice, nblk, kst, kv, ko);
+            break;
+        }
+#endif
 #if !PLOW_KDA_CONV_STEP_DB
         case PLOW_DOP_KDA_CONV:
             d_kda_conv((bf16*)TEN(0), (const bf16*)TEN(1), (const float*)TEN(2), (float*)TEN(3),
@@ -1857,7 +2039,16 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
                        in->i[3], in->fj[0].f, slice, nblk);
             break;
         case PLOW_DOP_KDA_STATE_STEP:
-            d_kda_state_step((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+#if PLOW_PACKED_PREFILL_CONSUMERS
+            if (plow_packed_prefill_enabled(prog_meta))
+                d_kda_state_step_packed</*GATED=*/false>(
+                    (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), (const float*)TEN(4), (const float*)TEN(5), nullptr,
+                    nullptr, nullptr, nullptr, 0u, 0.0f, (float*)TEN(6), in->i[1], in->i[2],
+                    in->i[3], in->i[4], in->fj[0].f, slice, nblk, (float*)sm->raw, prog_meta);
+            else
+#endif
+                d_kda_state_step((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                              (const bf16*)TEN(3), (const float*)TEN(4), (const float*)TEN(5),
                              (float*)TEN(6), in->i[0], in->i[1], in->i[2], in->i[3], in->i[4],
                              in->fj[0].f, slice, nblk, (float*)sm->raw,
@@ -1890,7 +2081,16 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             if (wv == nullptr || cs[0] == nullptr || cs[1] == nullptr || cs[2] == nullptr ||
                 TEN(6) == nullptr || TEN(7) == nullptr || in->i[1] == 0u)
                 __builtin_trap();
-            d_kda_conv3((bf16*)TEN(0), (bf16*)TEN(1), (bf16*)TEN(2), (const bf16*)TEN(3),
+#if PLOW_PACKED_PREFILL_CONSUMERS
+            if (plow_packed_prefill_enabled(prog_meta))
+                d_kda_conv3_packed(
+                    (bf16*)TEN(0), (bf16*)TEN(1), (bf16*)TEN(2), (const bf16*)TEN(3),
+                    (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
+                    (const float*)TEN(7), wv, cs[0], cs[1], cs[2], in->i[1], in->i[2],
+                    in->i[3], slice, nblk, prog_meta);
+            else
+#endif
+                d_kda_conv3((bf16*)TEN(0), (bf16*)TEN(1), (bf16*)TEN(2), (const bf16*)TEN(3),
                         (const bf16*)TEN(4), (const bf16*)TEN(5), (const float*)TEN(6),
                         (const float*)TEN(7), wv, cs[0], cs[1], cs[2], in->i[0], in->i[1],
                         in->i[2], in->i[3], slice, nblk,
@@ -1921,7 +2121,17 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             const float* dtb = (in->i[5] == PLOW_TENSOR_NONE) ? nullptr : (const float*)T[in->i[5]];
             if (dtb == nullptr || TEN(7) == nullptr || TEN(4) == nullptr || TEN(5) == nullptr)
                 __builtin_trap();
-            d_kda_state_step_g((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+#if PLOW_PACKED_PREFILL_CONSUMERS
+            if (plow_packed_prefill_enabled(prog_meta))
+                d_kda_state_step_packed</*GATED=*/true>(
+                    (bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
+                    (const bf16*)TEN(3), nullptr, nullptr, (const bf16*)TEN(4),
+                    (const bf16*)TEN(5), (const float*)TEN(7), dtb, in->i[6], in->fj[1].f,
+                    (float*)TEN(6), in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
+                    slice, nblk, (float*)sm->raw, prog_meta);
+            else
+#endif
+                d_kda_state_step_g((bf16*)TEN(0), (const bf16*)TEN(1), (const bf16*)TEN(2),
                                (const bf16*)TEN(3), (const bf16*)TEN(4), (const bf16*)TEN(5),
                                (const float*)TEN(7), dtb, in->i[6], in->fj[1].f, (float*)TEN(6),
                                in->i[0], in->i[1], in->i[2], in->i[3], in->i[4], in->fj[0].f,
@@ -2201,15 +2411,15 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
         /* Same swap as the decode bucket: the DENSE MLA prefill goes e4m3, the gathered one keeps
          * its bf16 arm (its `t7` is `idx`, not a scale array). */
         case PLOW_DOP_FLASH_MLA_PREFILL_FP8:
-            exec_flash_mla_prefill_fp8(in, T, slice, nblk, sm->fmpf);
+            exec_flash_mla_prefill_fp8(in, T, slice, nblk, sm->fmpf, prog_meta);
             break;
         case PLOW_DOP_FLASH_GATHER_PREFILL:
-            exec_flash_mla_prefill(in, T, slice, nblk, sm->fmpf);
+            exec_flash_mla_prefill(in, T, slice, nblk, sm->fmpf, prog_meta);
             break;
 #else
         case PLOW_DOP_FLASH_MLA_PREFILL:
         case PLOW_DOP_FLASH_GATHER_PREFILL:
-            exec_flash_mla_prefill(in, T, slice, nblk, sm->fmpf);
+            exec_flash_mla_prefill(in, T, slice, nblk, sm->fmpf, prog_meta);
             break;
 #endif
         /* ===== DSA sparse-prefill selection chain (ops 117-119). [GLM52-DSA-PF]
@@ -2853,6 +3063,7 @@ __device__ static void plow_exec(CInst in_v, unsigned slice, CTens T_v, plow_sme
             break;
     }
 #endif /* PLOW_BUCKET_FLASH */
+#undef PLOW_PACKED_NORM_ARGS
 #undef TEN
 }
 
@@ -3684,7 +3895,7 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
          * experiment available. */
         __asm__ __volatile__("s_icache_inv" ::: "memory");
 #endif
-        plow_exec(in, e.slice, tens, &sm);
+        plow_exec(in, e.slice, tens, &sm, &prog);
 
         __syncthreads();
 #if PLOW_TRACE_PHASE

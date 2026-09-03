@@ -1756,6 +1756,35 @@ fn run_one_tick(
                     e.prefill_turn(),
                     b.min(slots.len()),
                 );
+                let staged = stage_then_clear(
+                    e,
+                    |engine| {
+                        let first = packed.first().ok_or_else(|| {
+                            crate::RuntimeError::Device(
+                                "packed-prefill preview formed an empty pack".into(),
+                            )
+                        })?;
+                        let rung =
+                            engine
+                                .prefill_prog_t(first.program as usize)
+                                .ok_or_else(|| {
+                                    crate::RuntimeError::Device(format!(
+                                        "packed-prefill preview program {} is not a prefill rung",
+                                        first.program
+                                    ))
+                                })?;
+                        let parked = amd_prefill_parked_mask(&packed, rung).map_err(|why| {
+                            crate::RuntimeError::Device(format!(
+                                "packed-prefill preview mask is invalid: {why}"
+                            ))
+                        })?;
+                        engine.stage_packed_prefill(&packed, &parked)
+                    },
+                    |engine| engine.clear_packed_prefill(),
+                );
+                if let Err(err) = staged {
+                    tracing::warn!(error = %err, "AMD prefill pack preview staging failed");
+                }
                 tracing::debug!(spans = packed.len(), "AMD prefill pack preview");
             }
             let pending = isolated;
@@ -2295,6 +2324,43 @@ fn amd_prefill_pack(
         out.push(span);
     }
     out
+}
+
+#[cfg(feature = "hsa")]
+fn amd_prefill_parked_mask(
+    spans: &[packet::dev::PrefillSpan],
+    rung: u32,
+) -> std::result::Result<Vec<u32>, &'static str> {
+    let Some(first) = spans.first() else {
+        return Err("empty pack");
+    };
+    let mut rows = 0u32;
+    for span in spans {
+        if span.program != first.program {
+            return Err("mixed programs");
+        }
+        if span.n_rows == 0 || span.row0 != rows {
+            return Err("spans are not dense");
+        }
+        rows = rows.checked_add(span.n_rows).ok_or("row count overflow")?;
+        if rows > rung {
+            return Err("packed rows exceed rung");
+        }
+    }
+    let mut parked = vec![1; rung as usize];
+    parked[..rows as usize].fill(0);
+    Ok(parked)
+}
+
+#[cfg(feature = "hsa")]
+fn stage_then_clear<T, E>(
+    target: &mut T,
+    stage: impl FnOnce(&mut T) -> std::result::Result<(), E>,
+    clear: impl FnOnce(&mut T),
+) -> std::result::Result<(), E> {
+    let result = stage(target);
+    clear(target);
+    result
 }
 
 /// RTX-12 chunked packing: per-REQUEST cap on the prefill rows one request may
@@ -2951,6 +3017,63 @@ mod tests {
             []
         );
         assert_eq!(amd_prefill_pack([valid], 0, 0, 4), []);
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn amd_prefill_parked_mask_covers_the_full_rung() {
+        use packet::dev::PrefillSpan;
+
+        let span = |row0, n_rows, program| PrefillSpan {
+            row0,
+            n_rows,
+            slot: row0,
+            flags: 0,
+            kv_row0: 0,
+            kv_len: n_rows,
+            state_slot: row0,
+            program,
+        };
+        assert_eq!(
+            amd_prefill_parked_mask(&[span(0, 3, 2), span(3, 2, 2)], 8).unwrap(),
+            [0, 0, 0, 0, 0, 1, 1, 1]
+        );
+        assert!(amd_prefill_parked_mask(&[], 8).is_err());
+        assert!(amd_prefill_parked_mask(&[span(1, 2, 2)], 8).is_err());
+        assert!(amd_prefill_parked_mask(&[span(0, 9, 2)], 8).is_err());
+        assert!(amd_prefill_parked_mask(&[span(0, 2, 2), span(2, 1, 3)], 8).is_err());
+    }
+
+    #[cfg(feature = "hsa")]
+    #[test]
+    fn packed_prefill_preview_always_clears_staging() {
+        #[derive(Default)]
+        struct Target {
+            staged: bool,
+            clears: usize,
+        }
+
+        for fail in [false, true] {
+            let mut target = Target::default();
+            let result = stage_then_clear(
+                &mut target,
+                |target| {
+                    target.staged = true;
+                    if fail {
+                        Err("stage failed")
+                    } else {
+                        Ok(())
+                    }
+                },
+                |target| {
+                    target.staged = false;
+                    target.clears += 1;
+                },
+            );
+            assert_eq!(result.is_err(), fail);
+            assert!(!target.staged);
+            assert_eq!(target.clears, 1);
+        }
     }
 
     /// The batched-engine admission model: a decode tick advances every live

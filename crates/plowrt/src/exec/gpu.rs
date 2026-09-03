@@ -2299,6 +2299,10 @@ impl GpuEngine {
             rank: 0,
             n_gpu: 1,
             seg_ofs: 0,
+            prefill_spans: 0,
+            prefill_parked: 0,
+            n_prefill_spans: 0,
+            n_prefill_rows: 0,
         };
 
         // kv-row patch range: the contiguous [lo..hi] instruction window the
@@ -4081,6 +4085,10 @@ impl GpuEngine {
                 rank: 0,
                 n_gpu: 1,
                 seg_ofs: 0,
+                prefill_spans: 0,
+                prefill_parked: 0,
+                n_prefill_spans: 0,
+                n_prefill_rows: 0,
             };
 
             // Precompute the per-chunk patch sites (harness inner loop): KV-write

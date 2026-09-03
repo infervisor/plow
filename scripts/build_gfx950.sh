@@ -491,6 +491,24 @@ fi
 
 ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
+# Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
+# marker, not a claim that descriptor-consuming math arms are enabled.
+for e in $ALL_ELFS; do
+  case "$e" in
+    interp_*.elf)
+      symbols=$("${ROCM_PATH:-/opt/rocm}"/lib/llvm/bin/llvm-nm "$e")
+      grep -q plow_packed_prefill_abi_1 <<<"$symbols" || {
+        echo "FAIL: $e does not advertise plow_packed_prefill_abi_1"; exit 1; }
+      if grep -qE 'plow_packed_prefill_(mla|kda)_consumers_1' <<<"$symbols"; then
+        echo "FAIL: default $e unexpectedly enables packed-prefill consumers"; exit 1
+      fi
+      ;;
+  esac
+done
+
+# Packed consumers are a separate opt-in object axis. Default production objects retain the
+# ABI tail but no descriptor-consuming arms or resource cost.
+
 # INSTRUCTION-SELECTION gate. The register check above catches a kernel that will not launch; it
 # does NOT catch one that launches, is correct, and is silently 4x slow because the backend picked
 # a narrow MFMA or widened an fp4 operand. With no GPU on the dev box that failure is otherwise

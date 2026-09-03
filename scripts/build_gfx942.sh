@@ -255,6 +255,12 @@ esac
 # decode GEMV is K=7168, whose nchunk is exactly 14 (runtime/CMakeLists.txt records the sweep).
 AX_K3="-DPLOW_K3=1 -DGV_UNROLL=14"
 AX_MLA_K3="$AX_MLA -DPLOW_K3=1"
+case "${PLOW_KDA_CHUNK:-0}" in
+  0) AX_KDA_CHUNK="" ;;
+  1) AX_KDA_CHUNK="-DPLOW_KDA_CHUNK=1" ;;
+  *) echo "FAIL: PLOW_KDA_CHUNK must be 0 or 1" >&2; exit 2 ;;
+esac
+AX_MLA_K3="$AX_MLA_K3 $AX_KDA_CHUNK"
 # THE A4W4 ROWS BUILD HERE TOO, as the SIMULATED arm. True A4W4 (fp4 on both operands through
 # v_mfma_scale_f32_32x32x64_f8f6f4) has no CDNA3 analogue, but the ops do not ask for an
 # instruction: without PLOW_HAS_MX_MMA, `d_moe_group_pf_a4w4` compiles as the CDNA3 body --
@@ -938,6 +944,15 @@ for row in "${ROWS[@]}"; do
     l=$(sed -n 's/.*\.group_segment_fixed_size: *//p' <<<"$n" | head -1)
     s=$(sed -n 's/.*\.vgpr_spill_count: *//p' <<<"$n" | head -1)
     printf '%-34s %6s %6s %9s %7s\n' "$stem" "$v" "$a" "$l" "$s"
+    symbols=$("$READELF" -sW "$stem.elf" 2>/dev/null)
+    grep -qE "OBJECT .* plow_packed_prefill_abi_1$" <<<"$symbols" || {
+      echo "  MISSING PACKED-PREFILL ABI: expected plow_packed_prefill_abi_1"
+      fail=1
+    }
+    if grep -qE "OBJECT .* plow_packed_prefill_(mla|kda)_consumers_1$" <<<"$symbols"; then
+      echo "  UNEXPECTED PACKED-PREFILL CONSUMERS: default objects must remain resource-clean"
+      fail=1
+    fi
     # 65536 B is the CDNA3 workgroup LDS ceiling; the 4-wave flash rows get the
     # 512-register budget, every 8-wave row must hold 256 total.
     #
@@ -953,8 +968,18 @@ for row in "${ROWS[@]}"; do
       *)             [ "$v" -le 256 ] || { echo "  OVER REG: $v > 256"; fail=1; } ;;
     esac
     case "$stem" in
+      interp_prefill_k3*|interp_prefill_fp8kv_k3*)
+        if [ -n "$AX_KDA_CHUNK" ]; then
+          grep -qE "OBJECT .* plow_kda_chunk_bt64_arm_1$" <<<"$symbols" || {
+            echo "  MISSING CHUNK-KDA: expected plow_kda_chunk_bt64_arm_1"
+            fail=1
+          }
+        elif grep -qE "OBJECT .* plow_kda_chunk_bt64_arm_1$" <<<"$symbols"; then
+          echo "  UNEXPECTED CHUNK-KDA: PLOW_KDA_CHUNK=0"
+          fail=1
+        fi
+        ;;
       interp_flash*)
-        symbols=$("$READELF" -sW "$stem.elf" 2>/dev/null)
         grep -qE "OBJECT .* plow_mla_pf_v2_arm_1$" <<<"$symbols" || {
           echo "  MISSING MLA V2: expected plow_mla_pf_v2_arm_1"
           fail=1
@@ -971,7 +996,6 @@ for row in "${ROWS[@]}"; do
         fi
         ;;
       interp_decode*)
-        symbols=$("$READELF" -sW "$stem.elf" 2>/dev/null)
         grep -qE "OBJECT .* plow_gemv_mm_cap_${GVMM}$" <<<"$symbols" || {
           echo "  WRONG GEMV CAP: expected plow_gemv_mm_cap_${GVMM}"
           fail=1

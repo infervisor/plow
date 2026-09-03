@@ -273,6 +273,24 @@ Record one row per `(candidate, scope, shape, artifact digest)`, with `scope` =
 requires every scope. Never multiply an isolated speedup by layer count to claim
 a network win.
 
+Use [`perf-data/fusion-ladder-row-v1.schema.json`](../../../perf-data/fusion-ladder-row-v1.schema.json)
+for those rows. Keep one JSON object per line and validate before recording a
+decision:
+
+```bash
+python3 perf-data/tools/fusion_ladder_results.py validate results.jsonl
+python3 perf-data/tools/fusion_ladder_results.py aggregate results.jsonl \
+  --output promotion.json
+```
+
+The configuration digest is the SHA-256 of compact, key-sorted configuration
+JSON. Every row binds a structured shape; candidate, baseline, and configuration
+digests; checksum method and values; paired raw latency samples; route and
+coverage evidence; and the scope-specific gates. At kernel scope,
+`exact_unfused` explicitly identifies the comparator. Aggregation exits 2 and
+sets `qualified=false` when any scope is missing or any measured shape fails. It
+never fills missing scopes or promotes an unmeasured arm.
+
 ### 3c. General AMD candidate families
 
 Derive these from the emitted graph and live trace; never key the harness on a model name.

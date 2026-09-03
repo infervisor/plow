@@ -102,6 +102,28 @@ grep -qE "FUNC .* $SYM\$" <<<"$SYMS" ||
     fail "$SYM not found in $OUT — kernel name/signature changed; update the
        symbol constants in runtime/tests/gemma4_chat.c."
 
+grep -qE "OBJECT .* plow_packed_prefill_abi_1\$" <<<"$SYMS" ||
+    fail "$OUT does not advertise plow_packed_prefill_abi_1"
+PACKED=0; K3=0; MLA=0
+for arg in "$@"; do
+    case "$arg" in
+        -DPLOW_PACKED_PREFILL_CONSUMERS=1) PACKED=1 ;;
+        -DPLOW_K3=1) K3=1 ;;
+        -DPLOW_MLA_PREFILL=1|-DPLOW_MLA_PF_V2_ARM=1) MLA=1 ;;
+    esac
+done
+for cap in mla kda; do
+    marker="plow_packed_prefill_${cap}_consumers_1"
+    required=0
+    [ "$cap" = mla ] && required=$MLA
+    [ "$cap" = kda ] && required=$K3
+    if [ "$PACKED" = 1 ] && [ "$required" = 1 ]; then
+        grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS" || fail "$OUT is missing $marker"
+    elif grep -qE "OBJECT .* ${marker}\$" <<<"$SYMS"; then
+        fail "default $OUT unexpectedly advertises $marker"
+    fi
+done
+
 rm -f "$CO"
 printf "built %s (%s B), %s VGPR=%s AGPR=%s total=%s occ=%s spill=%s\n" \
     "$OUT" "$(stat -c%s "$OUT")" "$SYM" "$V" "$A" "$((V + A))" "$O" "$S"

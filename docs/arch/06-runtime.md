@@ -389,10 +389,11 @@ The `Cmd` enum in `main.rs` defines these subcommands:
 ```
 plowrt serve    --assets <dir>... [--port 8080] [--socket <path>]
                 [--executors 8] [--trace] [--max-hold-ms 8.0] [--slo-ms 250.0]
+plowrt bench    --assets <dir> --prompt-ids <csv> [--concurrency ...]
 plowrt simulate --assets <dir> [--bucket <phase:batch:seq> | --all-buckets]
                 [--math dry|golden] [--log <path>] [--chrome <path>]
 plowrt devices  [--tp ...]           # multi-GPU bring-up / peer-visibility, no model
-plowrt amd-bench / amd-block         # AMD (gfx950) engine + block A/B (needs --features hsa)
+plowrt amd-bench / amd-block         # AMD diagnostics only (needs --features hsa)
 plowrt disasm   <blob>               # offline device-blob disassembly, no GPU
 ```
 

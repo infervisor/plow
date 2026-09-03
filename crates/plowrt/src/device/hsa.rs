@@ -1923,8 +1923,8 @@ impl HsaBackend {
         //
         // `launch` is `pub` and forwards an arbitrary `args.len()` straight through, so this is
         // reachable from any caller that hands over a slice wider than the kernel declared —
-        // today's in-tree callers pass a 144-byte `DevProgram` against objects validated to
-        // report at least that, which is why it has never fired.
+        // today's in-tree callers pass the current `DevProgram` ABI against objects validated to
+        // report at least that size, which is why it has never fired.
         if args_size > kernel.kernarg_size as usize {
             return Err(RuntimeError::Device(format!(
                 "dispatch args are {args_size} bytes but the kernel declares a \
