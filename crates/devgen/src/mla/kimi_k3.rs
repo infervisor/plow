@@ -2030,10 +2030,7 @@ mod kimi_k3_tests {
     #[test]
     fn k3_lean_moe_defaults_are_applied_to_prefill_builders() {
         let _guard = crate::test_env::env_guard();
-        let _scope = crate::test_env::EnvScope::set(&[
-            ("PLOW_K3_LAYERS", "2"),
-            ("PLOW_MOE_COMBINE_LEAN", "1"),
-        ]);
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_K3_LAYERS", "2")]);
         let d = k3_dir("stage1_lean");
         let cfg = k3_json(&[
             ("text_config/hidden_size", "7168"),

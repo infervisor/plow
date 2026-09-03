@@ -494,8 +494,9 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MOE_STAGE1_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_stage1_lean: bool,
 
-    /// Isolate compatible fixed-order grouped-MoE prefill combines.
-    #[arg(long, env = "PLOW_MOE_COMBINE_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Isolate compatible fixed-order grouped-MoE prefill combines. Default on;
+    /// `PLOW_MOE_COMBINE_LEAN=0` restores the interpreter route.
+    #[arg(long, env = "PLOW_MOE_COMBINE_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_combine_lean: bool,
 
     /// Split grouped-MoE align into expert-parallel count/prefix/scatter packets.
@@ -617,6 +618,12 @@ impl EmitConfig {
         // DEFAULT-ON knobs: the call sites these replaced tested `!= Some("0")`, which is
         // not the negation of `env_bool` — unset enables, and so does any value but "0".
         let env_opt_out = |k: &str| std::env::var(k).ok().as_deref() != Some("0");
+        let env_bool_default_true = |k: &str| {
+            !matches!(
+                std::env::var(k).ok().as_deref(),
+                Some("0") | Some("false") | Some("False") | Some("FALSE")
+            )
+        };
         EmitConfig {
             fp8: env_bool("PLOW_FP8"),
             w8a8: env_bool("PLOW_W8A8"),
@@ -733,7 +740,7 @@ impl EmitConfig {
             moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_bool("PLOW_MOE_ALIGN_PAR"),
             moe_stage1_lean: env_opt_out("PLOW_MOE_STAGE1_LEAN"),
-            moe_combine_lean: env_bool("PLOW_MOE_COMBINE_LEAN"),
+            moe_combine_lean: env_bool_default_true("PLOW_MOE_COMBINE_LEAN"),
             moe_pf_atomic: env_bool("PLOW_MOE_PF_ATOMIC"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
             moe_pf_part16: env_bool("PLOW_MOE_PF_PART16"),
@@ -936,10 +943,17 @@ mod tests {
     }
 
     #[test]
-    fn lean_moe_combine_is_opt_in() {
+    fn lean_moe_combine_defaults_on_and_allows_env_opt_out() {
         let _guard = crate::test_env::env_guard();
         let _scope = crate::test_env::EnvScope::set(&[("PLOW_MOE_COMBINE_LEAN", "1")]);
+        std::env::remove_var("PLOW_MOE_COMBINE_LEAN");
         assert!(EmitConfig::from_env().moe_combine_lean);
+
+        std::env::set_var("PLOW_MOE_COMBINE_LEAN", "0");
+        assert!(!EmitConfig::from_env().moe_combine_lean);
+
+        std::env::set_var("PLOW_MOE_COMBINE_LEAN", "false");
+        assert!(!EmitConfig::from_env().moe_combine_lean);
     }
 
     #[test]

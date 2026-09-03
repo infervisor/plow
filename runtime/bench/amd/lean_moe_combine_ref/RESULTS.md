@@ -1,8 +1,8 @@
 # Fixed-order MoE combine experiment — gfx950
 
-Date: 2026-09-03. Status: generic runtime integration is available behind the
-packet opt-in; promotion remains pending. Hardware: one uncontended MI355X
-under `gpulease`.
+Date: 2026-09-03. Status: promoted as the generic structural default, with
+`PLOW_MOE_COMBINE_LEAN=0` or `false` restoring the interpreter route. Hardware:
+MI355X under `gpulease`.
 
 ## Current-model attribution
 
@@ -78,10 +78,51 @@ and T128/H4096 = 0 over 524,288. The repeated T8192 medians were 2.874664 ms for
 the control and 0.393243/0.332603/0.333643/0.333323/0.330522 ms for candidate
 grids 256/512/1024/2048/8192. The 0.6% reversal between grids 512 and 8192 is
 noise-scale across the two folds, so the bounded `min(T,512)` resident policy
-remains the opt-in runtime choice pending the three-fold promotion gate.
+is the production choice.
 
-Promotion still requires isolated segment/runtime routing followed by a TP8
-BF16 8192→1 exact network gate. The packet should isolate only a structurally
-compatible `MoeCombinePf`: arbitrary nonzero `H` and `T`, `k=16`, f32
-materialized part, and no part16/deterministic accumulator. The ordinary
-interpreter remains the fallback.
+## TP8 BF16 full-network qualification
+
+Both assets were emitted from one clean `edffb73` snapshot with the measured
+TuneDB fingerprint `gfx950-76ef5b9982d04cbd`. Both resolved all 7,650 cases to
+measured choices. The only A/B difference was `PLOW_MOE_COMBINE_LEAN=0/1`.
+The candidate added exactly 92 singleton Combine segments at every prefill
+rung; total instruction count remained 17,619. The common interpreter pairing
+was `0x48a4ccb34189de4a`.
+
+Three uncontended order-alternated 8192→1 folds used BF16 KV, one request,
+concurrency one, no warmup, and rank agreement every step:
+
+| Fold / order | Interpreter | Lean Combine | Gain |
+|---|---:|---:|---:|
+| 1, control → candidate | 1621.145048 ms | 1510.046001 ms | 111.099047 ms (6.853%) |
+| 2, candidate → control | 1618.959442 ms | 1510.332192 ms | 108.627250 ms (6.710%) |
+| 3, control → candidate | 1618.690766 ms | 1508.576991 ms | 110.113775 ms (6.803%) |
+| Mean | 1619.598419 ms | 1509.651728 ms | **109.946691 ms (6.789%)** |
+
+Paired-gain sample standard deviation was 1.244340 ms. Every arm completed one
+request with zero failures, complete non-overflowed diagnostics, all eight
+ranks completing prefill, token 6896, and checksum
+`fnv1a64:7d749e3b002fafa7`. The prompt-token array SHA-256 was
+`dd51e931308683300f372862a682d56a332e0e3e8d71cd70ef06c34739362dcd`.
+
+The control traces charged 146.458/146.496/146.472 ms to 92 interpreter
+Combine packets. Candidate logs contained exactly 92 new raw drains per fold,
+totalling 38.879/38.864/38.854 ms. Total segment drains fell by
+112.153/109.416/111.042 ms, agreeing with the endpoint gains within 0.93 ms.
+Thus the extra boundaries cost about 0.422 ms/layer but retain a stable net
+gain; an in-interpreter arm is neither needed nor desirable because the current
+interpreter spills.
+
+The independent 8192→256 exact gate also passed. Control/candidate TTFT was
+1617.633152/1509.779947 ms and TPOT was 44.409768/44.382407 ms. All 256 output
+IDs were identical, with newline-ID SHA-256
+`1398465e8212d27e43a6d52e95163ae34912b72255d6d14b82d7eacdcf4d718e` and
+checksum `fnv1a64:6bdfaa7b84ee4e7e`. Both arms reported eight ranks, sampled
+agreement every token, per-dispatch counter audit, and all-rank prefill
+completion.
+
+Raw evidence is under `/tmp/k3-combine-edffb73/results`. Nix printed three
+shell-hook lines before each benchmark JSON; the original streams are retained
+as `.stdout`, while canonical `.json` files were extracted from the first `{`,
+validated with `jq`, and hashed separately. This is a harness-output issue, not
+a runtime correctness issue.
