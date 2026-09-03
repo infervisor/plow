@@ -1,4 +1,4 @@
-/* gemv_row_sweep.c — sweep the DECODE GEMV over its five row buckets at one (N,K).
+/* gemv_row_sweep.c — sweep eight runtime row demands over five compiled buckets at one (N,K).
  *
  * THE GAP THIS FILLS. `tunedb` is GEMM-ONLY: `tunedb::gemm_op_case` is its sole shape lookup,
  * and the decode program contains ZERO `Gemm` ops — every decode matmul is
@@ -25,10 +25,11 @@
  * is the only way they can appear in one table (separate objects would sit under separate build
  * digests and could never be compared as one measurement).
  *
- * THREE ARMS, because the decode stream's COMPOSITION changes with M and not only its width:
+ * BF16 ARMS, because the decode stream's COMPOSITION changes with M and not only its width:
  *   gemv_m<MM>      plain  C[M,N] = W[N,K] . x[M,K]
  *   gemv_glu_m<MM>  fused gate|up + SwiGLU   (the `glu_fused` arm)
  *   gemv_qkv_m<MM>  fused q|k|v              (the `fuse_qkv` arm)
+ *   gemv_qkvg_m<MM> fused q|k|v|gate         (the four-projection arm)
  * §6g-BATCH's B=16 regression (142.4 tok/s against B=8's 202.3) is TWO things at once — MM=16
  * spilling AND both fusions turning off, because devgen gated them on `t * hidden <=
  * GM_LDS_HALVES` and `16 * 5376 = 86016 > 73728`. Measuring only the plain arm would price one
@@ -81,8 +82,12 @@ static double now(void) {
 #define HBM_GBPS 6400.0
 #define POISON 0x7f7f /* a bf16 no dot product produces; an untouched row keeps it */
 
-static const unsigned MMS[] = {1, 2, 4, 8, 16};
-#define NMM ((int)(sizeof MMS / sizeof MMS[0]))
+/* Runtime demand extends past the largest legal compiled row bucket.  The walk is what lets a
+ * MM<=16 object serve those rows without growing its LDS staging allocation. */
+static const unsigned DEMAND_MMS[] = {1, 2, 4, 8, 16, 32, 64, 128};
+static const unsigned BUCKET_MMS[] = {1, 2, 4, 8, 16};
+#define NDEMAND ((int)(sizeof DEMAND_MMS / sizeof DEMAND_MMS[0]))
+#define NBUCKET ((int)(sizeof BUCKET_MMS / sizeof BUCKET_MMS[0]))
 
 /* ---------------------------------------------------------------------------------------------
  * MXFP4 (OCP microscaling), the w4a16 arms.
@@ -178,6 +183,20 @@ static void poison(bf16* p, size_t n) {
     for (size_t i = 0; i < n; i++) p[i] = POISON;
 }
 
+static int arm_requested(const char* stem) {
+    const char* list = getenv("PLOW_GEMV_ARMS");
+    const size_t want = strlen(stem);
+    if (!list || !*list) return 1;
+    while (*list) {
+        const char* end = strchr(list, ',');
+        const size_t len = end ? (size_t)(end - list) : strlen(list);
+        if (len == want && memcmp(list, stem, want) == 0) return 1;
+        if (!end) break;
+        list = end + 1;
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: %s <N> <K> [label]\n", argv[0]);
@@ -185,6 +204,23 @@ int main(int argc, char** argv) {
     }
     const unsigned N = (unsigned)atoi(argv[1]), K = (unsigned)atoi(argv[2]);
     const char* label = argc > 3 ? argv[3] : "shape";
+    if (N < 4 || K == 0) {
+        fprintf(stderr, "N must be >= 4 and K must be nonzero\n");
+        return 2;
+    }
+    const int enabled[6] = {arm_requested("gemv"),       arm_requested("gemv_glu"),
+                            arm_requested("gemv_qkv"),   arm_requested("gemv_qkvg"),
+                            arm_requested("gemv_mxfp4"), arm_requested("gemv_glu_mxfp4")};
+    int any_enabled = 0;
+    for (int arm = 0; arm < 6; arm++) any_enabled |= enabled[arm];
+    if (!any_enabled) {
+        fprintf(stderr, "PLOW_GEMV_ARMS did not select a known arm\n");
+        return 2;
+    }
+    const int want_plain_output = enabled[0] || enabled[1] || enabled[4] || enabled[5];
+    const int want_qkv_output = enabled[2] || enabled[3];
+    const int want_bf16 = enabled[0] || enabled[1] || enabled[2] || enabled[3];
+    const int want_mx = enabled[4] || enabled[5];
 
     plow_hsa* H = plow_hsa_init();
     if (!H) { fprintf(stderr, "%s\n", plow_hsa_last_error()); return 1; }
@@ -206,11 +242,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const unsigned MMAX = MMS[NMM - 1];
-    /* Q|K|V splits N three ways so the FUSED op moves the same weight bytes as the plain one at
-     * the same (N,K) — otherwise the two arms would not be comparable at all. Nk=Nv is the GQA
-     * shape; an odd remainder goes to q. */
-    const unsigned Nk = N / 4, Nv = N / 4, Nq = N - Nk - Nv;
+    const unsigned MMAX = DEMAND_MMS[NDEMAND - 1];
+    /* The census preserves aggregate N, not the projection widths.  Split that total into a
+     * synthetic GQA-like q|k|v decomposition and an equal q|k|v|g decomposition so each fused
+     * arm moves exactly the plain arm's weight bytes.  These price fusion and row buckets; the
+     * existing per-op hardware goldens cover exact unequal projection geometry. */
+    const unsigned Nk = N / 4, Nv = N / 4, Ng = N / 4;
+    const unsigned Nq3 = N - Nk - Nv, Nq4 = N - Nk - Nv - Ng;
     const size_t nX = (size_t)MMAX * K, nW = (size_t)N * K, nC = (size_t)MMAX * N;
     bf16* hX = plow_hsa_alloc_host(H, nX * 2);
     bf16* hW = plow_hsa_alloc_host(H, nW * 2);
@@ -219,9 +257,9 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < nX; i++) hX[i] = f2bf(((float)(rand() % 17) - 8.0f) / 16.0f);
     for (size_t i = 0; i < nW; i++) hW[i] = f2bf(((float)(rand() % 17) - 8.0f) / 16.0f);
     void* dX = plow_hsa_alloc(H, 0, nX * 2);
-    void* dW = plow_hsa_alloc(H, 0, nW * 2);
-    void* dW2 = plow_hsa_alloc(H, 0, nW * 2); /* the up / k+v stream */
-    void* dC = plow_hsa_alloc(H, 0, nC * 2);
+    void* dW = want_bf16 ? plow_hsa_alloc(H, 0, nW * 2) : NULL;
+    void* dW2 = enabled[1] ? plow_hsa_alloc(H, 0, nW * 2) : NULL;
+    void* dC = want_plain_output ? plow_hsa_alloc(H, 0, nC * 2) : NULL;
     /* THREE SEPARATE OUTPUTS FOR Q|K|V, not one buffer sliced by column.
      * `gemv_qkv_rows` writes `Cq[m*Nq + n]`, `Ck[m*Nk + n]`, `Cv[m*Nv + n]` — each with its OWN
      * row stride. Pointing all three into one `[M, N]` buffer at column offsets makes those
@@ -229,12 +267,13 @@ int main(int argc, char** argv) {
      * every launch as leaving rows untouched. It did, on the first run: the oracle caught a
      * HARNESS bug rather than a kernel one, which is the correct outcome and the reason the
      * check is coverage-based rather than a sampled spot-check. */
-    void* dCq = plow_hsa_alloc(H, 0, (size_t)MMAX * Nq * 2);
-    void* dCk = plow_hsa_alloc(H, 0, (size_t)MMAX * Nk * 2);
-    void* dCv = plow_hsa_alloc(H, 0, (size_t)MMAX * Nv * 2);
+    void* dCq = want_qkv_output ? plow_hsa_alloc(H, 0, (size_t)MMAX * Nq3 * 2) : NULL;
+    void* dCk = want_qkv_output ? plow_hsa_alloc(H, 0, (size_t)MMAX * Nk * 2) : NULL;
+    void* dCv = want_qkv_output ? plow_hsa_alloc(H, 0, (size_t)MMAX * Nv * 2) : NULL;
+    void* dCg = enabled[3] ? plow_hsa_alloc(H, 0, (size_t)MMAX * Ng * 2) : NULL;
     plow_hsa_copy_h2d(H, 0, dX, hX, nX * 2);
-    plow_hsa_copy_h2d(H, 0, dW, hW, nW * 2);
-    plow_hsa_copy_h2d(H, 0, dW2, hW, nW * 2);
+    if (dW) plow_hsa_copy_h2d(H, 0, dW, hW, nW * 2);
+    if (dW2) plow_hsa_copy_h2d(H, 0, dW2, hW, nW * 2);
 
     /* THE MXFP4 ARMS ARE BUILT FROM THE SAME hW, so bf16 and mxfp4 at one (N,K) are the same
      * numbers at two precisions and the timing difference is the encoding alone.
@@ -251,7 +290,7 @@ int main(int argc, char** argv) {
     const int mx_ok = (K % 32) == 0; /* a scale block is 32 K-elements; no partial blocks here */
     void *dWq = NULL, *dSq = NULL, *dWq2 = NULL, *dSq2 = NULL;
     unsigned char *hWq = NULL, *hSq = NULL;
-    if (mx_ok) {
+    if (mx_ok && want_mx) {
         /* PINNED, not malloc'd: `plow_hsa_copy_h2d` hands the pointer to the SDMA engine, which
          * faults on pageable memory ("Memory access fault ... Reason: Unknown", async and with
          * no line number). Every other host buffer here is already `plow_hsa_alloc_host`. */
@@ -260,12 +299,14 @@ int main(int argc, char** argv) {
         quantise_mxfp4(hWq, hSq, hW, N, K, bf2f);
         dWq = plow_hsa_alloc(H, 0, (size_t)N * (K / 2));
         dSq = plow_hsa_alloc(H, 0, (size_t)N * (K / 32));
-        dWq2 = plow_hsa_alloc(H, 0, (size_t)N * (K / 2));
-        dSq2 = plow_hsa_alloc(H, 0, (size_t)N * (K / 32));
+        if (enabled[5]) {
+            dWq2 = plow_hsa_alloc(H, 0, (size_t)N * (K / 2));
+            dSq2 = plow_hsa_alloc(H, 0, (size_t)N * (K / 32));
+        }
         plow_hsa_copy_h2d(H, 0, dWq, hWq, (size_t)N * (K / 2));
         plow_hsa_copy_h2d(H, 0, dSq, hSq, (size_t)N * (K / 32));
-        plow_hsa_copy_h2d(H, 0, dWq2, hWq, (size_t)N * (K / 2));
-        plow_hsa_copy_h2d(H, 0, dSq2, hSq, (size_t)N * (K / 32));
+        if (dWq2) plow_hsa_copy_h2d(H, 0, dWq2, hWq, (size_t)N * (K / 2));
+        if (dSq2) plow_hsa_copy_h2d(H, 0, dSq2, hSq, (size_t)N * (K / 32));
     }
 
     printf("%s  %u CUs\n", nm, NCU);
@@ -277,38 +318,38 @@ int main(int argc, char** argv) {
     const char* jsonl = getenv("PLOW_GEMV_JSONL");
     FILE* jf = jsonl ? fopen(jsonl, "a") : NULL;
 
-    /* THE M LOOP IS OUTSIDE THE MM LOOP ON PURPOSE. The interesting cell is M != MM — an MM=8
-     * object serving M=16 is the §6g-WALK arm — and pairing them the other way round hides it
-     * behind "the diagonal". Only M >= MM is run: MM > M is legal (the `m < M` predicate covers
-     * it) but it is the same work in a wider accumulator, which is a register question this
-     * harness cannot see and the design notes §6g-WALK already answers statically. */
-    for (int im = 0; im < NMM; im++) {
-        const unsigned M = MMS[im];
+    /* THE M LOOP IS OUTSIDE THE MM LOOP ON PURPOSE. The interesting cells are M != MM: MM=8
+     * serving M=16 prices the walk, while MM=8 serving M=1 prices the wider compiled object at
+     * low live demand. Both are legal and performance-relevant, so the full demand x bucket
+     * matrix is measured. */
+    for (int im = 0; im < NDEMAND; im++) {
+        const unsigned M = DEMAND_MMS[im];
         /* Weight bytes are M-INVARIANT — one pass streams the whole weight — so per-token cost
          * FALLS with M until something else binds. That is the entire economic case for batched
          * decode and the yardstick every row here is read against. */
-        for (int ib = 0; ib < NMM; ib++) {
-            const unsigned MM = MMS[ib];
-            if (MM > M) continue;
+        for (int ib = 0; ib < NBUCKET; ib++) {
+            const unsigned MM = BUCKET_MMS[ib];
             const unsigned passes = (M + MM - 1) / MM;
-            for (int arm = 0; arm < 5; arm++) {
-                /* Arms 3/4 are the w4a16 twins of arms 0/1. `mxq` selects the ENCODING, which is
+            for (int arm = 0; arm < 6; arm++) {
+                if (!enabled[arm]) continue;
+                /* Arms 4/5 are the w4a16 twins of arms 0/1. `mxq` selects the ENCODING, which is
                  * both the quant string in the record and the byte count in the roofline. */
-                const int mxq = arm >= 3;
+                const int mxq = arm == 4 || arm == 5;
                 if (mxq && (!mx_ok || MM != objmm || M > objmm)) continue;
                 char sym[48];
                 const char* base = arm == 0   ? "gemv_m"
                                    : arm == 1 ? "gemv_glu_m"
                                    : arm == 2 ? "gemv_qkv_m"
-                                   : arm == 3 ? "gemv_mxfp4_m"
+                                   : arm == 3 ? "gemv_qkvg_m"
+                                   : arm == 4 ? "gemv_mxfp4_m"
                                               : "gemv_glu_mxfp4_m";
                 /* The record's symbol carries the SCHEMA name (`tunedb::gemv::SYMBOLS`); the
                  * mxfp4 goldens are launched under their own `d_..._k` names because they are
                  * single instantiations rather than a `_m<MM>` family. Keeping the two apart is
                  * what lets the JSONL row key the same way an emitted op will. */
                 snprintf(sym, sizeof sym, "%s%u", base, MM);
-                const char* launch = arm == 3   ? "d_gemv_mxfp4_k"
-                                     : arm == 4 ? "d_gemv_glu_mxfp4_k"
+                const char* launch = arm == 4   ? "d_gemv_mxfp4_k"
+                                     : arm == 5 ? "d_gemv_glu_mxfp4_k"
                                                 : sym;
                 plow_hsa_kernel k;
                 if (plow_hsa_get_kernel(H, 0, launch, &k) != 0) continue;
@@ -320,7 +361,7 @@ int main(int argc, char** argv) {
                  * mxfp4 element is a nibble PLUS one E8M0 byte per 32 — 0.53 B/weight against
                  * bf16's 2, so 3.76x and not the 4x a nibble alone would suggest. The ms
                  * column is unaffected either way; only the roofline reading is. */
-                const double streams = (arm == 1 || arm == 4) ? 2.0 : 1.0;
+                const double streams = (arm == 1 || arm == 5) ? 2.0 : 1.0;
                 const double bpw = mxq ? (0.5 + 1.0 / 32.0) : 2.0;
                 const double wbytes = bpw * (double)N * K * streams * passes;
 
@@ -338,24 +379,32 @@ int main(int argc, char** argv) {
                 struct __attribute__((packed)) {
                     void* cq; void* ck; void* cv; const void* x; const void* wq; const void* wk;
                     const void* wv; unsigned m, nq, nk, nv, kk;
-                } a2 = {dCq, dCk, dCv, dX, dW, dW, dW, M, Nq, Nk, Nv, K};
+                } a2 = {dCq, dCk, dCv, dX, dW, dW, dW, M, Nq3, Nk, Nv, K};
+                struct __attribute__((packed)) {
+                    void* cq; void* ck; void* cv; void* cg; const void* x; const void* wq;
+                    const void* wk; const void* wv; const void* wg;
+                    unsigned m, nq, nk, nv, ng, kk;
+                } a3 = {dCq, dCk, dCv, dCg, dX, dW, dW, dW, dW,
+                        M,   Nq4, Nk,  Nv,  Ng,  K};
                 struct __attribute__((packed)) {
                     void* c; const void* x; const void* w; const void* s; unsigned m, n, kk;
-                } a3 = {dC, dX, dWq, dSq, M, N, K};
+                } a4 = {dC, dX, dWq, dSq, M, N, K};
                 struct __attribute__((packed)) {
                     void* c; const void* x; const void* wg; const void* wu; const void* sg;
                     const void* su; unsigned m, n, kk, act;
-                } a4 = {dC, dX, dWq, dWq2, dSq, dSq2, M, N, K, 0};
+                } a5 = {dC, dX, dWq, dWq2, dSq, dSq2, M, N, K, 0};
                 void* ap = arm == 0   ? (void*)&a0
                            : arm == 1 ? (void*)&a1
                            : arm == 2 ? (void*)&a2
                            : arm == 3 ? (void*)&a3
-                                      : (void*)&a4;
+                           : arm == 4 ? (void*)&a4
+                                      : (void*)&a5;
                 size_t asz = arm == 0   ? sizeof a0
                              : arm == 1 ? sizeof a1
                              : arm == 2 ? sizeof a2
                              : arm == 3 ? sizeof a3
-                                        : sizeof a4;
+                             : arm == 4 ? sizeof a4
+                                        : sizeof a5;
 
                 /* 50 warm-up launches: the governor ramps sclk over tens of ms and an
                  * under-warmed kernel reads slow, which silently re-ranks the sweep. */
@@ -383,16 +432,16 @@ int main(int argc, char** argv) {
                 /* CORRECTNESS: poison, launch once, and require BOTH that no output element
                  * still carries the sentinel AND that a sampled element matches an f64 dot.
                  * The plain arm is the only one whose reference is a bare dot product; the two
-                 * fused arms carry an epilogue (SwiGLU) or a three-way column split, so for
-                 * those the ROW-COVERAGE half is the load-bearing check and the value half is
-                 * applied only where the reference is exact (q's columns of the qkv arm, which
-                 * are a plain dot against Wq). Under-checking is stated rather than hidden:
+                 * fused arms carry an epilogue (SwiGLU) or a multi-way column split, so for
+                 * those the ROW-COVERAGE half is load-bearing and the value half is applied to
+                 * q, whose columns are a plain dot against Wq in both projection arms.
+                 * Under-checking is stated rather than hidden:
                  * `tunedb` will qualify what this marks correct, and a silent "pass" on an
                  * unchecked epilogue is how a fast wrong kernel ships. */
                 /* Each output stream is poisoned and checked with ITS OWN row stride. */
-                const unsigned NW = arm == 2 ? 3 : 1;
-                void* outs[3] = {arm == 2 ? dCq : dC, dCk, dCv};
-                unsigned strides[3] = {arm == 2 ? Nq : N, Nk, Nv};
+                const unsigned NW = arm == 3 ? 4 : arm == 2 ? 3 : 1;
+                void* outs[4] = {arm == 2 || arm == 3 ? dCq : dC, dCk, dCv, dCg};
+                unsigned strides[4] = {arm == 2 ? Nq3 : arm == 3 ? Nq4 : N, Nk, Nv, Ng};
                 for (unsigned w = 0; w < NW; w++) {
                     poison(hC, (size_t)M * strides[w]);
                     plow_hsa_copy_h2d(H, 0, outs[w], hC, (size_t)M * strides[w] * 2);
@@ -437,7 +486,7 @@ int main(int argc, char** argv) {
                         if (arm == 1) {
                             const double c = 0.7978845608028654 * (acc + 0.044715 * acc * acc * acc);
                             acc = 0.5 * acc * (1.0 + tanh(c)) * acc;
-                        } else if (arm == 4) {
+                        } else if (arm == 5) {
                             /* `act_gate_only(g, 0)` is the same GELU-tanh gate the bf16 GLU arm
                              * takes, and Wg == Wu here, so the reference is gelu(d)*d on one
                              * dot — identical in form to arm 1 and differing only in which
@@ -472,17 +521,18 @@ int main(int argc, char** argv) {
     }
     if (jf) fclose(jf);
     plow_hsa_free(H, dX);
-    plow_hsa_free(H, dW);
-    plow_hsa_free(H, dW2);
-    plow_hsa_free(H, dC);
-    plow_hsa_free(H, dCq);
-    plow_hsa_free(H, dCk);
-    plow_hsa_free(H, dCv);
-    if (mx_ok) {
+    if (dW) plow_hsa_free(H, dW);
+    if (dW2) plow_hsa_free(H, dW2);
+    if (dC) plow_hsa_free(H, dC);
+    if (dCq) plow_hsa_free(H, dCq);
+    if (dCk) plow_hsa_free(H, dCk);
+    if (dCv) plow_hsa_free(H, dCv);
+    if (dCg) plow_hsa_free(H, dCg);
+    if (mx_ok && want_mx) {
         plow_hsa_free(H, dWq);
         plow_hsa_free(H, dSq);
-        plow_hsa_free(H, dWq2);
-        plow_hsa_free(H, dSq2);
+        if (dWq2) plow_hsa_free(H, dWq2);
+        if (dSq2) plow_hsa_free(H, dSq2);
     }
     return 0;
 }

@@ -198,9 +198,25 @@ Do not hand-author a shape list; that is exactly how GLM-5.2 prefill ended up
 plowc --hf-dir <ckpt> --arch $ISA --max-ctx $MAXCTX --n-cu $NCU --num-gpus $NGPU \
     tune shapes --gpu "$GPU"
 
-# decode-side census: one TUNEDUMP_GEMV line per resolved GEMV shape
-PLOW_TUNE_DUMP=1 plowc --emit devblob ...      # scripts/rebench_tune_gemv.sh derives its list from this
+# current-source decode campaign: the supplied emit produces the TUNEDUMP_GEMV census
+OBJ="$(mktemp -d /tmp/plow-gemv-obj.XXXXXX)"
+rmdir "$OBJ"
+TUNE_GPU=MI355X scripts/gemv_campaign_lease.sh "$OBJ" OUT.jsonl CAMPAIGN -- \
+    plowc --emit devblob ...
 ```
+
+The current production demand extends through B=128. Campaign objects compile
+at MM<=16 and exercise wider M through the walk. Every demanded BF16 family,
+including QKVG as its harness arm lands concurrently, must produce the complete
+MM=1/2/4/8/16 row, including MM>M coverage. MXFP4 produces only its compiled
+OBJ_MM row and is accepted only when M<=OBJ_MM. The campaign records the
+physically reported MI350X or MI355X name and CU count separately from the
+shared gfx950 cell. Its publication
+gate binds the cell, interpreter, toolchain label, and oracle; it does not claim
+that this identity is a digest of the temporary sweep object.
+The production entrypoint obtains the toolchain label from the repository's
+`nix develop` environment, then binds that exact value through the harness
+build, both interpreter probes, and ingest.
 
 The hot families for a transformer are known in advance — qkv/o and MLP
 projections (GEMM at prefill, GEMV at decode), flash attention
@@ -217,7 +233,7 @@ measurement, never a result with a caveat. Wrap the run, not the build.
 | sweep | `$VENDOR` | harness | ingest / consumer |
 |---|---|---|---|
 | prefill GEMM tiles | amd | `plowc … tune gemm` (measure + ingest + verify, one command) or `gemm_tile_sweep <M> <N> <K> [label] [quant]` with `PLOW_GEMM_JSONL=<path>` | `plowc tune ingest --samples <jsonl>`; read back by `devgen::pick_tile` |
-| decode GEMV rungs | amd | `gemv_row_sweep <N> <K> [label]` with `PLOW_GEMV_JSONL=<path>`; list from the `TUNEDUMP_GEMV` census (`scripts/rebench_tune_gemv.sh`) | `tunedb-gemv ingest --db tuning --gpu "$GPU" --samples <jsonl>` |
+| decode GEMV rungs | amd | `gemv_campaign_lease.sh OBJ JSONL CAMPAIGN -- EMIT_COMMAND...`; requires a fresh OBJ, builds all harness components in `nix develop` outside one leased sweep, then derives/filter-checks the live `TUNEDUMP_GEMV` census | Ingests only passing uncontended samples after physical MI350X/MI355X detection and exact cell/interpreter/toolchain/oracle checks |
 | decode attention split count | both | emit matched packet arms with the model's `nsplit` knob (K3: `PLOW_K3_NS`) and score with `plowrt serve` + `vllm bench serve`; keep weights and interpreter object fixed | packet/program selection, not the kernel tune store |
 | decode knob grid | nvidia | `scripts/tune_decode_sweep.sh` — joint OBJECT knobs (`PLOW_NV_FORCE_MINBLK`, `GV_UNROLL*`, `GV_MM_MAX`, `PLOW_MOE_DOWN_SG`) scored by end-to-end step TPOT | `tunedb-decode ingest --db tuning --results <jsonl>` |
 | single-CU roofline (evidence only) | amd | `run_ubench_cu.sh` | none — no oracle, never selectable |
@@ -472,7 +488,7 @@ the only thing that distinguishes a working campaign from a no-op one.
 | `runtime/bench/interp/interp_gemm_bench.c`, `qwen_interp_bench.c`, `dsa_gather_bench.c` | time-and-validate through the interpreter |
 | `runtime/bench/dispatch/interp_dispatch_floor.hip` / `_nv.cu` | dispatch-floor calibration (provisional evidence) |
 | `runtime/ubench/bench_cu_roofline.c`, `run_ubench_cu.sh`, `bench_cu_gfx950.hip` | single-CU roofline vs theoretical ceilings |
-| `scripts/rebench_build_objs.sh`, `rebench_tune_gemm_all.sh`, `rebench_tune_gemv.sh`, `tune_decode_sweep.sh`, `$BUILD` | campaign orchestration |
+| `scripts/rebench_build_objs.sh`, `rebench_tune_gemm_all.sh`, `gemv_campaign_lease.sh`, `rebench_tune_gemv.sh`, `tune_decode_sweep.sh`, `$BUILD` | campaign orchestration |
 | `scripts/asm_audit.py`, `scripts/asm_expect_<isa>.json` | assert on an AMD object's disassembly (MFMA choice, operand format, spill); NVIDIA's counterpart is `cuobjdump -symbols` / `-res-usage` |
 | `perf-data/tools/gpulease` | the lease (rc=76 = contended = failed measurement) |
 | `hwspec::IsaLevel::geometry` (`crates/hwspec/src/isa.rs`), `docs/arch/14-amd-arch-divergence.md` §3 | which layer owns a per-ISA difference |

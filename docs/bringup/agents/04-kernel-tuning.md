@@ -141,8 +141,23 @@ exist on your target.
   Manual alternative: `gemm_tile_sweep <M> <N> <K> [label] [quant]` with
   `PLOW_GEMM_JSONL=<path>`, then `plowc tune ingest --samples <path>`.
 * **Decode GEMV (`$VENDOR = amd`):** `gemv_row_sweep <N> <K>` with
-  `PLOW_GEMV_JSONL` (shape list via `scripts/rebench_tune_gemv.sh` from the
-  census), then `tunedb-gemv ingest --db tuning --gpu "$GPU" --samples <jsonl>`.
+  `scripts/gemv_campaign_lease.sh OBJ JSONL CAMPAIGN -- EMIT_COMMAND...` runs
+  the emitter with `PLOW_TUNE_DUMP=1`, builds the current gfx950 harness outside
+  the lease in the repository's `nix develop`, sweeps the supported census
+  under one lease, then ingests outside it. OBJ must be a fresh path. Set
+  `TUNE_GPU=MI350X` or `MI355X`; the harness separately requires one unique
+  physical MI350X/MI355X name and CU count and records that detected part in the
+  shared `amd/gfx950/mi350x` cell. Every demanded BF16 case requires all five
+  MM=1/2/4/8/16 symbols, including MM>M coverage and walked MM<M cases; MXFP4
+  requires the exact compiled OBJ_MM and M<=OBJ_MM. QKVG sweep support lands
+  with this campaign.
+  Current production demand reaches B=128 while compiled MM remains <=16 and
+  serves wider rows by walking. Unsupported census opcodes, duplicates,
+  unexpected rows, missing rungs, contention, incorrect samples, or
+  interpreter/toolchain/oracle drift prevent ingest. `PLOW_GEMV_BUILD_DIRECT=1`
+  is reserved for the CPU mock selftest. Production captures the exact
+  `PLOW_TOOLCHAIN_LABEL` exported by the repository flake before building and
+  binds that same label through both identity probes and ingest.
   `--gpu` is required — it decides the cell.
 * **Decode knobs (`$VENDOR = nvidia`, object grid):** `scripts/tune_decode_sweep.sh`
   (sweeps `PLOW_NV_FORCE_MINBLK`, `GV_UNROLL*`, `GV_MM_MAX`, MoE knobs jointly,
