@@ -46,6 +46,13 @@ Increasing the generic body's KV tile is therefore closed. A 128-row KV schedule
 four-wave body with a deeper pipeline and a smaller score/P residency scheme, not this template's
 array expansion.
 
+The 8-wave form is also closed for this body. Its default four-fragment Q chunk spilled two
+VGPRs and used 12 B/lane private memory. Reducing the Q chunk to two removed all spill/private
+(VGPR 256, SGPR 80, occupancy 2, LDS 37888 B), but measured 3044.183 us at T8192 and
+283.642 us at T1024. That is slower than the 4-wave BKV32 arm. The useful reference pattern is
+instead Q in LDS followed by Q/V aliasing, double-buffered K and V, and a multi-stage pipeline;
+wave count alone does not reproduce it.
+
 ## Promotion blockers
 
 1. Beat 1.5 ms at T8192 with distinct K and V inputs. The identity-structured screen is an
