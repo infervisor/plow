@@ -82,7 +82,7 @@ if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_INTRA_CACHED:-0}" = 1 ]; then
 fi
 
 KDA_KEY_FACTOR_ELFS=""
-if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_KEY_FACTOR:-0}" = 1 ]; then
+if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_KEY_FACTOR:-1}" != 0 ]; then
   for role in wu carry; do
     bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
       "$OUT/kda_chunk_key_factor_${role}_gfx950.elf" \

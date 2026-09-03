@@ -1314,7 +1314,9 @@ fn k3_build_model(
             crate::emit_is_amd() && emit_config::active().kda_intra_cached,
         );
         b.set_lean_kda_key_factor_segments(
-            crate::emit_is_amd() && emit_config::active().kda_key_factor,
+            crate::emit_is_amd()
+                && crate::amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                && emit_config::active().kda_key_factor,
         );
         b.set_packed_prefill_segments(
             std::env::var("PLOW_SEG_PACKED_PREFILL").ok().as_deref() == Some("1"),

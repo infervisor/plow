@@ -380,7 +380,8 @@ pub struct EmitConfig {
     pub kda_intra_cached: bool,
 
     /// Route exact qpre BT64/D128 Wu->carry pairs through spill-free gfx950 objects.
-    #[arg(long, env = "PLOW_KDA_KEY_FACTOR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Defaults on; set false to retain the interpreter path.
+    #[arg(long, env = "PLOW_KDA_KEY_FACTOR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_key_factor: bool,
 
     /// K3 up-projection no-gather mode (diagnostic).
@@ -720,7 +721,7 @@ impl EmitConfig {
             kda_chunk: env_bool_opt("PLOW_KDA_CHUNK"),
             kda_chunk_qpre: env_opt_out("PLOW_KDA_CHUNK_QPRE"),
             kda_intra_cached: env_bool("PLOW_KDA_INTRA_CACHED"),
-            kda_key_factor: env_bool("PLOW_KDA_KEY_FACTOR"),
+            kda_key_factor: env_opt_out("PLOW_KDA_KEY_FACTOR"),
             k3_up_nogather: env_bool("PLOW_K3_UP_NOGATHER"),
             k3_up_gather_only: env_bool("PLOW_K3_UP_GATHER_ONLY"),
             k3_shard_head: env_bool("PLOW_K3_SHARD_HEAD"),
@@ -938,6 +939,13 @@ pub fn active() -> &'static EmitConfig {
 #[cfg(test)]
 mod tests {
     use super::EmitConfig;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestArgs {
+        #[command(flatten)]
+        emit: EmitConfig,
+    }
 
     #[test]
     fn lean_moe_stage1_default_allows_env_opt_out() {
@@ -976,6 +984,31 @@ mod tests {
 
         std::env::set_var("PLOW_KDA_CHUNK_QPRE", "0");
         assert!(!EmitConfig::from_env().kda_chunk_qpre);
+    }
+
+    #[test]
+    fn kda_key_factor_defaults_on_and_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_KDA_KEY_FACTOR", "1")]);
+        std::env::remove_var("PLOW_KDA_KEY_FACTOR");
+        assert!(EmitConfig::from_env().kda_key_factor);
+
+        std::env::set_var("PLOW_KDA_KEY_FACTOR", "0");
+        assert!(!EmitConfig::from_env().kda_key_factor);
+
+        std::env::remove_var("PLOW_KDA_KEY_FACTOR");
+        assert!(
+            TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .kda_key_factor
+        );
+        assert!(
+            !TestArgs::try_parse_from(["test", "--kda-key-factor=0"])
+                .unwrap()
+                .emit
+                .kda_key_factor
+        );
     }
 
     #[test]

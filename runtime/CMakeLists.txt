@@ -656,7 +656,7 @@ option(PLOW_HSACO_KDA_CHUNK "Include the opt-in BT64 chunk-KDA prefill arms" OFF
 option(PLOW_HSACO_KDA_INTRA_CACHED
        "Build the standalone cached BT64/D128 KDA-intra segment" OFF)
 option(PLOW_HSACO_KDA_KEY_FACTOR
-       "Build the standalone exact BT64/D128 KDA Wu/carry key-factor pair" OFF)
+       "Build the standalone exact BT64/D128 KDA Wu/carry key-factor pair" ON)
 option(PLOW_HSACO_XR_ATTNRES
        "Build the standalone two-shot XReduce+AttnRes segment object" OFF)
 option(PLOW_HSACO_MOE_STAGE2_LEAN

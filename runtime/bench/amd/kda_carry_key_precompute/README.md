@@ -34,6 +34,22 @@ one reusable 50.33 MB scratch pair, not as 69 persistent per-layer tensors. At t
 shape, the production-path result projects to about `8.75 ms` TTFT; it is useful but substantially below
 the plan's original `100..130 ms` estimate.
 
+## TP8 network qualification
+
+Matched BF16-KV, 7650/7650 measured-TuneDB assets at 8192 tokens gave exact first-token
+parity in three order-balanced folds. Control minus candidate TTFT was `4.607820`,
+`5.141070`, and `3.847880 ms`: mean `4.532257 ms`, sample SD `0.649898 ms`. All folds
+produced token `6896` and checksum `fnv1a64:7d749e3b002fafa7`. Raw trace attribution
+measured Wu body `43.174 -> 41.376 ms` and carry body `156.093 -> 149.676 ms`; total
+critical-chain span improved `1490.684 -> 1486.080 ms`.
+
+The 8192-to-256 carried-state gate also passed: all 256 token IDs and checksum
+`fnv1a64:6bdfaa7b84ee4e7e` match. Control versus candidate was
+`1503.650667 -> 1499.005459 ms` TTFT, `44.365433 -> 44.335679 ms` TPOT, and
+`12816.836247 -> 12804.603634 ms` end to end. The generic structural route therefore
+defaults on. Set `PLOW_KDA_KEY_FACTOR=0` at asset emission and object build time to retain
+the interpreter route.
+
 Rejected variant: also materializing Wu's `beta*k*exp2(g)` gave an exact
 `3.735592 -> 3.702952 ms` (`-0.032640 ms`) after paying for its third BF16 tensor and separate
 precompute launch. The added HBM traffic consumed almost all of the arithmetic saving.
