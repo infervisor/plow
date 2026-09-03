@@ -2405,6 +2405,33 @@ __device__ __forceinline__ void gemv_rows_rs(bf16* __restrict__ C, const bf16* _
         gemv_rows_r<MM, XLDS, GV_UNROLL, 1>(C, x, W, M, N, K, n, lane, lds);
 }
 
+/* Short-K column ladder. Full groups of four maximize independent weight loads, then the pair
+ * and scalar bodies cover a ragged workgroup slice without changing any column's dot-product
+ * order. The largest body holds 4*3=12 vectors, below GV_UNROLL's 14-vector budget. */
+template <int MM, bool XLDS>
+__device__ __forceinline__ void gemv_rows_rs_ladder(bf16* __restrict__ C,
+                                                    const bf16* __restrict__ x,
+                                                    const bf16* __restrict__ W, unsigned M,
+                                                    unsigned N, unsigned K, unsigned slice,
+                                                    unsigned nblk, const bf16* lds) {
+    const unsigned lane = threadIdx.x & 63;
+    const unsigned wave = threadIdx.x >> 6;
+    const unsigned gv_per = (N + nblk - 1) / nblk;
+    const unsigned gv_n0 = slice * gv_per;
+    const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
+    unsigned n = gv_n0 + wave;
+    for (; n + 3u * PLOW_WAVES < gv_n1; n += 4u * PLOW_WAVES)
+        gemv_rows_r<MM, XLDS, 3, 4>(C, x, W, M, N, K, n, lane, lds);
+    for (; n + PLOW_WAVES < gv_n1; n += 2u * PLOW_WAVES)
+        gemv_rows_r<MM, XLDS, 7, 2>(C, x, W, M, N, K, n, lane, lds);
+    for (; n < gv_n1; n += PLOW_WAVES)
+        gemv_rows_r<MM, XLDS, GV_UNROLL, 1>(C, x, W, M, N, K, n, lane, lds);
+}
+
+#ifndef GV_RS_LADDER
+#define GV_RS_LADDER 0
+#endif
+
 /* ---- OPT-IN (PLOW_GEMV_LG=1): NARROW-K LANE-GROUP bf16 GEMV ----------- [BF16-GEMV-NARROWK-LG]
  *
  * THE SHAPE THIS FIXES, and it is the bf16 twin of `moe_down_lg_fp8_blk` (op_moe.h) one kernel
@@ -4245,8 +4272,13 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
             if constexpr (MM == 1 && GV_RS_R > 1) {
                 if ((K + PLOW_WAVE * 8 - 1) / (PLOW_WAVE * 8) >= (unsigned)GV_RS_MAXNCH)
                     gemv_rows<MM, true, false, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
+#if GV_RS_LADDER
+                else
+                    gemv_rows_rs_ladder<MM, true>(C, x, W, M, N, K, slice, nblk, lds);
+#else
                 else
                     gemv_rows_rs<MM, true, GV_RS_UN, GV_RS_R>(C, x, W, M, N, K, slice, nblk, lds);
+#endif
             } else
                 gemv_rows<MM, true, false, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
 #endif

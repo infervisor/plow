@@ -29,18 +29,17 @@ struct Shape {
 };
 
 static const Shape SHAPES[] = {
-    {"o_proj", 7168, 1536, 128, 93},       {"router", 896, 7168, 128, 92},
-    {"routed_up", 896, 3584, 128, 92},     {"shared_down", 7168, 768, 128, 92},
-    {"latent_down", 3584, 7168, 128, 92},  {"kda_f_b", 1536, 128, 128, 69},
+    {"o_proj", 7168, 1536, 256, 93},       {"router", 896, 7168, 224, 92},
+    {"routed_up", 896, 3584, 224, 92},     {"shared_down", 7168, 768, 256, 92},
+    {"latent_down", 3584, 7168, 256, 92},  {"kda_f_b", 1536, 128, 256, 69},
     {"kda_f_a", 128, 7168, 128, 69},       {"kda_b", 12, 7168, 12, 69},
-    {"mla_q_a_g", 1536, 7168, 128, 48},    {"mla_k_rope_down", 64, 7168, 64, 24},
-    {"mla_q_rope", 768, 1536, 128, 24},    {"mla_q_absorb", 6144, 1536, 128, 24},
-    {"mla_kv_a", 512, 7168, 128, 24},      {"output_attn_res", 4224, 7168, 128, 2},
-    {"lm_head", 163840, 7168, 304, 1},     {"output_attn_proj", 7168, 4224, 128, 1},
+    {"mla_q_a_g", 1536, 7168, 256, 48},    {"mla_k_rope_down", 64, 7168, 64, 24},
+    {"mla_q_rope", 768, 1536, 256, 24},    {"mla_q_absorb", 6144, 1536, 256, 24},
+    {"mla_kv_a", 512, 7168, 256, 24},      {"output_attn_res", 4224, 7168, 249, 2},
+    {"lm_head", 163840, 7168, 256, 1},     {"output_attn_proj", 7168, 4224, 256, 1},
 };
 
-static const unsigned GRIDS[] = {12,  24,  32,  48,  64,  76,  96,  112, 128,
-                                 152, 176, 200, 224, 256, 293, 299, 302, 304};
+static const unsigned GRIDS[] = {12, 64, 96, 128, 192, 224, 249, 256};
 
 static double time_kernel(hipFunction_t fn, unsigned grid, void** args, int samples) {
     for (int i = 0; i < 2; ++i) CK(hipModuleLaunchKernel(fn, grid, 1, 1, THREADS, 1, 1, 0, 0, args, nullptr));
@@ -112,8 +111,8 @@ int main(int argc, char** argv) {
 
     double control_total_ms = 0.0;
     double best_total_ms = 0.0;
-    std::printf("%-18s %7s %6s %5s %6s %11s %9s %8s\n", "shape", "N", "K", "base",
-                "best", "base_us", "best_us", "speedup");
+    std::printf("%-18s %7s %6s %5s %6s %11s %9s %8s %9s\n", "shape", "N", "K", "base",
+                "best", "base_us", "best_us", "speedup", "GB/s");
     for (const Shape& shape : SHAPES) {
         const size_t slab = static_cast<size_t>(shape.n) * shape.k * 2;
         unsigned nrep = static_cast<unsigned>(std::max<size_t>(1, TARGET_STREAM / slab));
@@ -164,9 +163,10 @@ int main(int argc, char** argv) {
 
         control_total_ms += values[base] * shape.instances / 1000.0;
         best_total_ms += values[best] * shape.instances / 1000.0;
-        std::printf("%-18s %7u %6u %5u %6u %11.3f %9.3f %8.4f\n", shape.name, shape.n,
+        const double best_gbs = static_cast<double>(slab) / (values[best] * 1.0e3);
+        std::printf("%-18s %7u %6u %5u %6u %11.3f %9.3f %8.4f %9.0f\n", shape.name, shape.n,
                     shape.k, shape.blocks, GRIDS[best], values[base], values[best],
-                    values[base] / values[best]);
+                    values[base] / values[best], best_gbs);
         if (json) {
             for (size_t i = 0; i < std::size(GRIDS); ++i) {
                 if (GRIDS[i] > shape.n) continue;
