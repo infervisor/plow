@@ -13,7 +13,7 @@ packet boundary and ordering, not a separate host/AQL launch.
 
 ## Reproduce
 
-From the repository root at `3890af8`:
+From a repository checkout containing this harness:
 
 ```sh
 nix develop -c bash -lc '
