@@ -20,6 +20,7 @@ declare -A migrated_batch_gates=(
 )
 declare -A migrated_tp_gates=(
   [scripts/glm52_linfp8_stacked_coherence.sh]=1
+  [scripts/k3_tp_equivalence.sh]=1
 )
 while IFS=$'\t' read -r class path binding disposition; do
   [[ -z "$class" || "$class" == \#* ]] && continue
@@ -116,5 +117,6 @@ done
 
 "$ROOT/scripts/batch_gates_selftest.sh"
 "$ROOT/scripts/glm52_linfp8_stacked_coherence_selftest.sh"
+"$ROOT/scripts/k3_tp_equivalence_selftest.sh"
 
 echo "PASS: ${#observed[@]} active AMD direct-runner script consumers are classified"

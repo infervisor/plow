@@ -36,6 +36,11 @@ per-dispatch counter audit through production `bench`. Each emit preserves its
 own `build.json`; the gate verifies that manifest's canonical path and checksum
 alongside prompt, output, packet, object-directory, checkpoint, and TP-width
 evidence. Missing or partial diagnostics are rejected.
+`k3_tp_equivalence.sh` also uses production `bench`: its decode-only prompt walk
+captures full rank-0 `act.logits` after every dispatch. The final prompt tick and
+the following requested decode ticks preserve the former TP1↔TP8 cosine/argmax
+comparison exactly; token audit and diagnostics bind every vector to its
+complete stream, TP policy, and packet/object/checkpoint identities.
 
 Run `scripts/check_amd_bench_consumers.sh` in repository checks. It fails when
 an active shell invocation is unclassified, when a class or binding is invalid,
@@ -74,7 +79,7 @@ rewritten by this migration.
 | decode selection | `plowrt bench --engine-diagnostics` records ordered AMD `occupied_rows,bucket,steps` entries at the actual dispatch site, including multistep quanta. | CUDA selection capture is not wired. |
 | exact token stream | `plowrt bench --parity-report` records one exact B1 request. `--prompt-rows` plus `--token-audit` records ordered ragged production-mux rows; `gate_batched.sh` checks B1↔B4/B8 and `k3_batch_gate.sh` checks two distinct compiled widths under TP8. Non-stream `/v1/completions` provides the corresponding C1 endpoint IDs. | Full-logit and arbitrary tensor comparisons remain focused diagnostics. |
 | bounded token audit | `plowrt bench --token-audit` records measured prompt/output rows in request order after timing. `--prompt-rows FILE` accepts one exact comma-separated ID row per warmup and measured request, including ragged row lengths. It refuses more than 64 measured requests or 65,536 measured IDs. `gate_quick.sh`, `gate_batched.sh`, and `k3_batch_gate.sh` validate complete production-mux reports and artifact identity. | Tensor-level and full-logit comparisons remain on their focused diagnostic runners. |
-| tensor/logit snapshot | AMD `serve` and `bench` share fail-closed `--amd-ctr-snap DIR` and `--amd-tens-snap DIR` capture after each decode dispatch. `--amd-snap-tensors a,b` (`PLOW_SNAP_TENSORS`) selects up to 16 named tensors totaling at most 64 MiB; omission preserves the legacy `act.qa,act.oat,act.attn,act.xn` list, but packets missing those tensors or exceeding the byte bound fail load. The selected slot and every tensor are validated at load, output directories are created before dispatch, and capture/download/write failures fail the request. Files use exclusive creation, so a reused directory or colliding model tick fails instead of overwriting evidence. Either snapshot mode disables multistep capture so every logical token gets its own file set. | The full-logit TP1↔TP8 consumer remains on `amd-bench` until its exact per-step dump/cadence comparison is migrated and proven. |
+| tensor/logit snapshot | AMD `serve` and `bench` share fail-closed `--amd-ctr-snap DIR` and `--amd-tens-snap DIR` capture after each decode dispatch. `--amd-snap-tensors a,b` (`PLOW_SNAP_TENSORS`) selects up to 16 named tensors totaling at most 64 MiB; omission preserves the legacy `act.qa,act.oat,act.attn,act.xn` list, but packets missing those tensors or exceeding the byte bound fail load. The selected slot and every tensor are validated at load, output directories are created before dispatch, and capture/download/write failures fail the request. Files use exclusive creation, so a reused directory or colliding model tick fails instead of overwriting evidence. Either snapshot mode disables multistep capture so every logical token gets its own file set. `k3_tp_equivalence.sh` uses this hook for exact full-logit TP1↔TP8 comparison. | Arbitrary legacy `PLOW_DUMP_ACT` consumers still need explicit bounded tensor selections before migration. |
 
 Selection capture is opt-in so normal benchmark timing is not perturbed. It is
 bounded to 16,384 prefill and 16,384 decode entries. An overflow aborts

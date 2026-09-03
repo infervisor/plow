@@ -70,7 +70,7 @@
 # Env: PLOW_K3_CKPT (default the k3_farm symlink farm, else the HF snapshot), PLOW_K3_HSACO
 # (/home/lava/models/k3_mi325x/hsaco), PLOW_K3_LAYERS (1,2), PLOW_K3_COS (0.9999), PLOW_K3_STEPS (3),
 # PLOW_K3_PROMPT ("The capital of France is"), PLOW_K3_OUT (a tmpdir), PLOW_K3_MIN_FREE_GIB (28),
-# PLOW_K3_ARCH (gfx942), PLOW_K3_GPU (MI325X), PLOW_K3_NCU (304).
+# PLOW_K3_ARCH (gfx942), PLOW_K3_GPU (MI325X), PLOW_K3_NCU (304), PLOW_K3_VOCAB (163840).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -82,7 +82,9 @@ fail() { echo "FAIL: $*"; exit 1; }
 
 CK="${PLOW_K3_CKPT:-/home/lava/models/k3_farm}"
 HS="${PLOW_K3_HSACO:-/home/lava/models/k3_mi325x/hsaco}"
-LEASE="$ROOT/perf-data/tools/gpulease"
+LEASE="${PLOW_GPULEASE_BIN:-$ROOT/perf-data/tools/gpulease}"
+PLOWC="${PLOW_K3_PLOWC:-$ROOT/target/release/plowc}"
+PLOWRT="${PLOW_K3_PLOWRT:-$ROOT/target/release/plowrt}"
 STEPS="${PLOW_K3_STEPS:-3}"
 COS="${PLOW_K3_COS:-0.9999}"
 PROMPT="${PLOW_K3_PROMPT:-1008,10484,318,15383,387}"   # "The capital of France is"
@@ -91,6 +93,7 @@ MIN_FREE_GIB="${PLOW_K3_MIN_FREE_GIB:-28}"
 ARCH="${PLOW_K3_ARCH:-gfx942}"
 GPU="${PLOW_K3_GPU:-MI325X}"
 NCU="${PLOW_K3_NCU:-304}"
+VOCAB="${PLOW_K3_VOCAB:-163840}"
 IFS=, read -ra NLAYERS <<< "${PLOW_K3_LAYERS:-1,2}"
 
 # --- prerequisites, every one a clean skip ---------------------------------------------------
@@ -104,8 +107,8 @@ else
   [ -n "$CK" ] && [ -d "$CK" ] || skip "no Kimi-K3 checkpoint (set PLOW_K3_CKPT); this gate is weight-dependent by nature"
 fi
 ls "$CK"/*.safetensors >/dev/null 2>&1 || skip "$CK has no safetensors shards"
-[ -x ./target/release/plowc ]  || skip "target/release/plowc absent — cargo build --release -p plowc"
-[ -x ./target/release/plowrt ] || skip "target/release/plowrt absent — cargo build --release -p plowrt --features hsa"
+[ -x "$PLOWC" ]  || skip "$PLOWC absent — cargo build --release -p plowc"
+[ -x "$PLOWRT" ] || skip "$PLOWRT absent — cargo build --release -p plowrt --features hsa"
 [ -d "$HS" ] || skip "$HS absent — see docs/BUILD.md for the AMD objects"
 [ -x "$LEASE" ] || skip "$LEASE absent — repository GPU lease helper is required"
 command -v rocm-smi >/dev/null 2>&1 || skip "rocm-smi absent — cannot count GPUs"
@@ -146,82 +149,45 @@ for N in "${NLAYERS[@]}"; do
     # K3_PREFILL=0 on BOTH sides: one program, walked a token at a time, so the degree is the
     # only difference. `--num-gpus` is what makes the emit sharded; there is no `--tp` on plowc.
     K3_FULL=1 PLOW_K3_LAYERS="$N" K3_PREFILL=0 PLOW_FP8_KV=1 PLOW_MXFP4=1 \
-      ./target/release/plowc --hf-dir "$CK" --emit devblob --arch "$ARCH" --gpu "$GPU" \
+      "$PLOWC" --hf-dir "$CK" --emit devblob --arch "$ARCH" --gpu "$GPU" \
       --num-gpus "$G" --parallel tp --max-ctx 4096 --n-cu "$NCU" --out "$b" 2>&1 \
       | grep -aE "^kimi_k3: emitted" \
       || fail "N=$N tp=$G: emit failed"
-    # `--dump-logits` on the tp==1 path needs the decode-walk fallback and the dump closure that
-    # `amd_bench` gained with this gate; older plowrt binaries report "no prefill bucket at or
-    # under the max chunk" here.
-    #
-    # The run's output is CAPTURED rather than piped straight into `grep`, because a pipeline
-    # whose grep matched the word `Error` would have "succeeded" and this loop would have walked
-    # on to compare two dumps that were never written.
+    cat >"$b/weights.json" <<JSON
+{
+  "network": "k3-tp-equiv-n${N}-tp${G}",
+  "gpu": "$GPU",
+  "num_gpus": $G,
+  "parallel": "tp",
+  "weight_shared": false,
+  "weight": null,
+  "kv": null,
+  "fusion": null,
+  "buckets": [],
+  "static_tensors": [],
+  "static_tensors_file_emitted": false,
+  "weight_tiling": null
+}
+JSON
+    report="$OUT/run_${N}_${G}.json"
     log="$OUT/run_${N}_${G}.txt"
     run_rc=0
     "$LEASE" -n "$G" "k3-tp-equiv-n${N}-tp${G}" \
-      ./target/release/plowrt amd-bench --blob "$b/model.pkt" --hsaco "$HS" \
-      --checkpoint "$CK" --prompt "$PROMPT" --steps "$STEPS" --tp "$G" \
-      --dump-logits "$l" > "$log" 2>&1 || run_rc=$?
-    grep -aE "^prefill:|^  \[" "$log" || true
-    if grep -aq "^Error" "$log"; then
-      sed -n 's/^Error/  Error/p' "$log" | head -3
-      fail "N=$N tp=$G: the run errored (full output in $log)"
-    fi
-    [ "$run_rc" -eq 0 ] || fail "N=$N tp=$G: leased run exited $run_rc (full output in $log)"
+      "$PLOWRT" --rt-checkpoint "$CK" --rt-hsaco "$HS" \
+      --amd-tens-snap "$l" --amd-snap-tensors act.logits --amd-snap-slot 0 \
+      --amd-tp-agree-every 1 --amd-tp-no-audit=false \
+      bench --assets "$b" --prompt-ids "$PROMPT" --concurrency 1 --requests 1 \
+      --warmup-requests 0 --output-len "$((STEPS + 1))" \
+      --token-audit --engine-diagnostics >"$report" 2>"$log" || run_rc=$?
+    [ "$run_rc" -eq 0 ] || { tail -40 "$log"; fail "N=$N tp=$G: leased production run exited $run_rc"; }
   done
 
-  python3 - "$OUT/log_${N}_1" "$OUT/log_${N}_8" "$COS" "$N" "$STEPS" <<'PY' || bad=1
-import array, math, os, struct, sys
-
-_, d1, d8, cos_floor, n, steps = sys.argv
-cos_floor, n, steps = float(cos_floor), int(n), int(steps)
-
-def rd(p):
-    raw = array.array("H")
-    with open(p, "rb") as f:
-        raw.fromfile(f, os.path.getsize(p) // 2)
-    if sys.byteorder != "little":
-        raw.byteswap()
-    return [struct.unpack("<f", struct.pack("<I", u << 16))[0] for u in raw]
-
-tags = ["prefill"] + [f"{i:03d}" for i in range(steps)]
-bad = 0
-for tag in tags:
-    p1, p8 = f"{d1}/logits_{tag}.bin", f"{d8}/logits_{tag}.bin"
-    if not (os.path.exists(p1) and os.path.exists(p8)):
-        print(f"  N={n} {tag:8s} MISSING DUMP ({p1 if not os.path.exists(p1) else p8})")
-        bad = 1
-        continue
-    x, y = rd(p1), rd(p8)
-    if len(x) != len(y):
-        print(f"  N={n} {tag:8s} SHAPE {len(x)} vs {len(y)}")
-        bad = 1
-        continue
-    dot = sum(a * b for a, b in zip(x, y))
-    nx = math.sqrt(sum(a * a for a in x))
-    ny = math.sqrt(sum(b * b for b in y))
-    cos = dot / (nx * ny)
-    a1 = max(range(len(x)), key=x.__getitem__)
-    a8 = max(range(len(y)), key=y.__getitem__)
-    mx = max(abs(a - b) for a, b in zip(x, y))
-    ok = cos >= cos_floor and a1 == a8
-    print(f"  N={n} {tag:8s} cos {cos:.8f}  argmax {a1} vs {a8}  maxabs {mx:.5f}  "
-          f"{'ok' if ok else 'MISMATCH'}")
-    if not ok:
-        bad = 1
-if bad:
-    # Localise, because the two depths accuse different halves of the layer.
-    if n == 1:
-        print("  => N=1 has no MoE layer: the disagreement is in the KDA mixer, the dense FFN,\n"
-              "     the attention all-reduce, or the shard classification of one of their weights.")
-    else:
-        print("  => N>=2 disagreeing while N=1 agrees points at the LATENT MoE half: the expert\n"
-              "     combine, the shared expert, or a peer slot one of them writes. Check that every\n"
-              "     row-parallel producer writes `act.og_tp`/`act.dg_tp` and not a local buffer —\n"
-              "     `d_xreduce` never reads `out`, so a partial left anywhere else is discarded.")
-sys.exit(1 if bad else 0)
-PY
+  python3 "$ROOT/scripts/k3_tp_equivalence_compare.py" \
+    --report1 "$OUT/run_${N}_1.json" --snap1 "$OUT/log_${N}_1" --asset1 "$OUT/blob_${N}_1" \
+    --packet1 "$OUT/blob_${N}_1/model.pkt" \
+    --report8 "$OUT/run_${N}_8.json" --snap8 "$OUT/log_${N}_8" --asset8 "$OUT/blob_${N}_8" \
+    --packet8 "$OUT/blob_${N}_8/model.pkt" --objects "$HS" --checkpoint "$CK" \
+    --prompt "$PROMPT" --steps "$STEPS" --cos "$COS" --layers "$N" --vocab "$VOCAB" || bad=1
   echo
 done
 
