@@ -482,7 +482,7 @@ pub struct EmitConfig {
     pub moe_stage2_lean: bool,
 
     /// Isolate compatible MXFP4 grouped-MoE gate/up packets for a standalone object.
-    #[arg(long, env = "PLOW_MOE_STAGE1_LEAN", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, env = "PLOW_MOE_STAGE1_LEAN", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_stage1_lean: bool,
 
     /// Split grouped-MoE align into expert-parallel count/prefix/scatter packets.
@@ -717,7 +717,7 @@ impl EmitConfig {
             moe_pf_a8: env_bool("PLOW_MOE_PF_A8"),
             moe_stage2_lean: env_bool("PLOW_MOE_STAGE2_LEAN"),
             moe_align_par: env_bool("PLOW_MOE_ALIGN_PAR"),
-            moe_stage1_lean: env_bool("PLOW_MOE_STAGE1_LEAN"),
+            moe_stage1_lean: env_opt_out("PLOW_MOE_STAGE1_LEAN"),
             moe_pf_atomic: env_bool("PLOW_MOE_PF_ATOMIC"),
             moe_pf_det: env_bool("PLOW_MOE_PF_DET"),
             moe_pf_part16: env_bool("PLOW_MOE_PF_PART16"),
@@ -904,6 +904,13 @@ pub fn active() -> &'static EmitConfig {
 #[cfg(test)]
 mod tests {
     use super::EmitConfig;
+
+    #[test]
+    fn lean_moe_stage1_default_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_MOE_STAGE1_LEAN", "0")]);
+        assert!(!super::active().moe_stage1_lean);
+    }
 
     #[test]
     fn grouped_prefill_accumulator_arms_are_mutually_exclusive() {

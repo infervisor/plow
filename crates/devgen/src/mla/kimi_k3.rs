@@ -1293,6 +1293,9 @@ fn k3_build_model(
         b.set_lean_moe_stage2_segments(
             crate::emit_is_amd() && emit_config::active().moe_stage2_lean,
         );
+        b.set_lean_moe_stage1_segments(
+            crate::emit_is_amd() && emit_config::active().moe_stage1_lean,
+        );
         b.set_packed_prefill_segments(
             std::env::var("PLOW_SEG_PACKED_PREFILL").ok().as_deref() == Some("1"),
         );
@@ -2014,6 +2017,58 @@ mod kimi_k3_tests {
             assert_eq!(p.l2_domains, 8);
             assert_eq!(p.gq_seg_ofs.len(), 9);
         }
+    }
+
+    #[test]
+    fn k3_stage1_lean_default_is_applied_to_prefill_builders() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_K3_LAYERS", "2")]);
+        let d = k3_dir("stage1_lean");
+        let cfg = k3_json(&[
+            ("text_config/hidden_size", "7168"),
+            ("text_config/num_attention_heads", "96"),
+            ("text_config/intermediate_size", "33792"),
+            ("text_config/q_lora_rank", "1536"),
+            ("text_config/kv_lora_rank", "512"),
+            ("text_config/qk_nope_head_dim", "128"),
+            ("text_config/qk_rope_head_dim", "64"),
+            ("text_config/v_head_dim", "128"),
+            ("text_config/num_experts", "896"),
+            ("text_config/num_experts_per_token", "16"),
+            ("text_config/moe_intermediate_size", "3072"),
+            ("text_config/routed_expert_hidden_size", "3584"),
+            ("text_config/linear_attn_config/num_heads", "96"),
+            ("text_config/linear_attn_config/head_dim", "128"),
+        ]);
+        std::fs::write(d.join("config.json"), cfg.to_string()).unwrap();
+
+        let m = k3_build_model(&d, 8192, 256, 8, &[128], None);
+        let p = &m.progs[0];
+        let stage1: Vec<_> = p
+            .insts
+            .iter()
+            .enumerate()
+            .filter(|(_, inst)| inst.op == DevOp::MoeGroupGluPf as u16)
+            .collect();
+        assert_eq!(
+            stage1.len(),
+            1,
+            "two-layer fixture has one routed-MoE block"
+        );
+        let stage1_ix = stage1[0].0 as u32;
+        let seg = p
+            .stream
+            .iter()
+            .find(|entry| entry.inst == stage1_ix)
+            .expect("stage-1 packet must be scheduled")
+            .seg;
+        let members: std::collections::BTreeSet<_> = p
+            .stream
+            .iter()
+            .filter(|entry| entry.seg == seg)
+            .map(|entry| entry.inst)
+            .collect();
+        assert_eq!(members, [stage1_ix].into_iter().collect());
     }
 
     /// Every program must address the same peer slot B. The host has one peer layout for the
