@@ -3279,7 +3279,9 @@ __device__ void d_moe_group_pf_t(void* __restrict__ Cout, const bf16* __restrict
 #ifndef MPF4_BM
 #define MPF4_BM 64
 #endif
+#ifndef MPF4_BN
 #define MPF4_BN 256
+#endif
 #ifndef MPF4_BK
 #define MPF4_BK 128                    /* K per staged tile = 2 MFMAs of K=64 */
 #endif
@@ -3295,6 +3297,8 @@ static_assert(MPF4_BM == 32 || MPF4_BM == 64, "A4W4 grouped MoE supports BM32 or
 #if PLOW_MOE_PF_A4W4
 static_assert(PLOW_WAVES == MPF4_WMc * MPF4_WNc,
               "A4W4 grouped MoE tile must cover the full workgroup");
+static_assert(MPF4_BN == MPF4_WNc * 64,
+              "A4W4 GLU pairs one 32-column gate/up fragment per wave");
 #endif
 /* 16-byte-column XOR swizzle over the 64-byte row: 4 groups, row&3 picks the rotation. Same
  * purpose as the bf16 body's — without it every row of a fragment read hits the same bank. */
@@ -3324,6 +3328,47 @@ static_assert(PLOW_WAVES == MPF4_WMc * MPF4_WNc,
 #endif
 
 typedef unsigned mpf4_b16 __attribute__((ext_vector_type(4), aligned(4)));
+
+#ifndef PLOW_MOE_PF_XCD_WGM
+#define PLOW_MOE_PF_XCD_WGM 0
+#endif
+#ifndef PLOW_MOE_PF_SITU_ONLY
+#define PLOW_MOE_PF_SITU_ONLY 0
+#endif
+#ifndef PLOW_MOE_PF_A4W4_LOWREG
+#define PLOW_MOE_PF_A4W4_LOWREG 0
+#endif
+#ifndef PLOW_MOE_PF_A4W4_BRIDGE_ALIAS
+#define PLOW_MOE_PF_A4W4_BRIDGE_ALIAS 0
+#endif
+
+__device__ __forceinline__ float mpf4_glu(float g, float u, unsigned act, float beta,
+                                          float lbeta) {
+#if PLOW_MOE_PF_SITU_ONLY
+    (void)act;
+    return k3_situ_gate(g, beta) * k3_situ_up(u, lbeta);
+#else
+    return moe_glu(g, u, act, beta, lbeta);
+#endif
+}
+
+template <int WGM>
+__device__ __forceinline__ unsigned mpf4_remap(unsigned lin, unsigned n_tiles, unsigned tm,
+                                               unsigned tn) {
+    if constexpr (WGM == 0) return lin;
+    constexpr unsigned num_xcd = 8;
+    unsigned id = lin;
+    const unsigned per = n_tiles / num_xcd;
+    if (lin < per * num_xcd) id = (lin % num_xcd) * per + lin / num_xcd;
+    const unsigned in_group = WGM * tn;
+    const unsigned first_m = (id / in_group) * WGM;
+    if (first_m >= tm) return id;
+    unsigned group_m = tm - first_m;
+    if (group_m > (unsigned)WGM) group_m = WGM;
+    const unsigned r = id % in_group;
+    if (r >= group_m * tn) return id;
+    return (first_m + r % group_m) * tn + r / group_m;
+}
 
 /* BY VALUE, both directions. `__builtin_memcpy` straight into an `mpf4_b16` array element left
  * the array as a stack object — 48 B/lane of scratch, and a `s_waitcnt vmcnt(0)` immediately
@@ -3437,7 +3482,7 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                                     , unsigned det_ksh = 0
 #endif
                                     ) {
-    static_assert(!GLU || (MPF4_BM == 64 && MPF4_WNc == 4),
+    static_assert(!GLU || (MPF4_BM == 64 && MPF4_BN == MPF4_WNc * 64),
                   "A4W4 GLU requires paired gate/up accumulators per wave");
     constexpr int SMa = MPF4_BM / MPF4_WMc / MFMA_M; /* 1 */
     constexpr int SNa = MPF4_BN / MPF4_WNc / MFMA_N; /* 2 */
@@ -3448,7 +3493,11 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
     unsigned char* Btl = Atl + 2u * MPF4_ATB;                 /* [2][BN][RB] */
     unsigned char* Asc = Btl + 2u * MPF4_BTB;                 /* [2][BM][SPR] */
     unsigned char* Bsc = Asc + 2u * MPF4_BM * MPF4_SPR;       /* [2][BN][SPR] */
+#if PLOW_MOE_PF_A4W4_BRIDGE_ALIAS
+    float* Bridge = (float*)L;
+#else
     float* Bridge = (float*)(Bsc + 2u * MPF4_BN * MPF4_SPR);  /* [BM][BN/2] */
+#endif
 
     const unsigned tid = threadIdx.x;
     const unsigned lane = tid & 63u, wave = tid >> 6;
@@ -3466,7 +3515,9 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
     const unsigned KSC = K >> 5;     /* E8M0 scale bytes per row */
 
     for (unsigned lin = slice; lin < n_tiles; lin += nblk) {
-        const unsigned mt = lin / tnc, nt = lin % tnc;
+        const unsigned tile =
+            mpf4_remap<PLOW_MOE_PF_XCD_WGM>(lin, n_tiles, total_tiles, tnc);
+        const unsigned mt = tile / tnc, nt = tile % tnc;
         const unsigned e = mpf_expert_of_tile(tilep, mt, n_exp);
         const unsigned rowbase = (unsigned)rowoff[e] + (mt - (unsigned)tilep[e]) * MPF4_BM;
         const unsigned n0 = nt * NB;
@@ -3694,6 +3745,50 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
          * but reading it inside the staging path put a DEPENDENT global load (row_token, then
          * the A row it addresses) in front of every one of the NT staging phases. Resolved once
          * per output tile instead. */
+#if PLOW_MOE_PF_A4W4_LOWREG
+#define MPF4_STAGE(k0, buf)                                                                    \
+    _Pragma("clang loop unroll(disable)") for (int it_ = 0; it_ < MPF4_AIT; it_++) {          \
+        const unsigned t_ = tid + (unsigned)it_ * PLOW_THREADS;                                \
+        if (t_ < (unsigned)MPF4_ANB) {                                                         \
+            MPF4_ASRC(sr_, t_)                                                                 \
+            MPF4_A_ADDR(t_, buf)                                                               \
+            if (sr_ != PLOW_EXPERT_UNUSED) {                                                   \
+                MPF4_ACELL aw_;                                                                \
+                unsigned char asc_;                                                            \
+                MPF4_A_ISSUE1(t_, k0, sr_, aw_, asc_)                                          \
+                MPF4_A_WRITE1(aw_, asc_)                                                       \
+            } else MPF4_A_PAD1                                                                 \
+        }                                                                                      \
+    }                                                                                          \
+    _Pragma("clang loop unroll(disable)") for (int it_ = 0; it_ < MPF4_BIT; it_++) {          \
+        const unsigned t_ = tid + (unsigned)it_ * PLOW_THREADS;                                \
+        if (t_ < (unsigned)MPF4_BNB) {                                                         \
+            MPF4_BROW(t_)                                                                      \
+            MPF4_B_ADDR(buf)                                                                   \
+            if (bn_ < N) {                                                                     \
+                MPF4_BPTR                                                                      \
+                mpf4_b16 bq_;                                                                  \
+                unsigned char bsc_;                                                            \
+                MPF4_B_ISSUE1(k0, bq_, bsc_)                                                   \
+                MPF4_B_WRITE1(bq_, bsc_)                                                       \
+            } else MPF4_B_PAD1                                                                 \
+        }                                                                                      \
+    }
+
+        __syncthreads();
+        MPF4_STAGE(0, 0)
+        __syncthreads();
+        unsigned buf = 0;
+        for (unsigned kt = 0; kt < NT; kt++) {
+            MPF4_MFMA(buf)
+            __syncthreads();
+            const unsigned kn = (kt + 1u) * MPF4_BK;
+            if (kn < K) { MPF4_STAGE(kn, buf ^ 1) }
+            __syncthreads();
+            buf ^= 1;
+        }
+#undef MPF4_STAGE
+#else
         unsigned asrc_[MPF4_AIT];
 #pragma unroll
         for (int it_ = 0; it_ < MPF4_AIT; it_++) {
@@ -3724,6 +3819,7 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
             __syncthreads();
             buf ^= 1;
         }
+#endif
 
 /* Row `rr`'s hoisted metadata, read back out of the lane that loaded it. Same EXEC discipline
  * as the grouped GEMM's MPF_ROWMETA: `ds_bpermute_b32` honours EXEC on the READ side, so both
@@ -3767,7 +3863,7 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                             wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
 #ifndef PLOW_MOE_A4W4_STAGE2_BENCH
                         Br[rr * (MPF4_BN / 2) + cc] =
-                            moe_glu(acc[i][0][el], acc[i][1][el], act, beta, lbeta);
+                            mpf4_glu(acc[i][0][el], acc[i][1][el], act, beta, lbeta);
 #endif
                     }
             }
@@ -3883,6 +3979,7 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
 #undef MPF4_B_ADDR
 #undef MPF4_B_WRITE1
 #undef MPF4_B_PAD1
+#undef MPF4_STAGE
 #undef MPF4_ISSUE
 #undef MPF4_COMMIT
 #undef MPF4_MFMA
@@ -4005,7 +4102,9 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
     const unsigned KSC = K >> 5; /* E8M0 scale bytes per row */
 
     for (unsigned lin = slice; lin < n_tiles; lin += nblk) {
-        const unsigned mt = lin / tnc, nt = lin % tnc;
+        const unsigned tile =
+            mpf4_remap<PLOW_MOE_PF_XCD_WGM>(lin, n_tiles, total_tiles, tnc);
+        const unsigned mt = tile / tnc, nt = tile % tnc;
         const unsigned e = mpf_expert_of_tile(tilep, mt, n_exp);
         const unsigned rowbase = (unsigned)rowoff[e] + (mt - (unsigned)tilep[e]) * MPF4_BM;
         const unsigned n0 = nt * NB;
@@ -4225,7 +4324,7 @@ __device__ void d_moe_group_pf_a4w4(void* __restrict__ Cout, const void* __restr
                             wm * (MPF4_BM / MPF4_WMc) + i * MFMA_M + mfma_acc_m(lane, el);
 #ifndef PLOW_MOE_A4W4_STAGE2_BENCH
                         Br[rr * (MPF4_BN / 2) + cc] =
-                            moe_glu(acc[i][0][el], acc[i][1][el], act, beta, lbeta);
+                            mpf4_glu(acc[i][0][el], acc[i][1][el], act, beta, lbeta);
 #endif
                     }
             }
