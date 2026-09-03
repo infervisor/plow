@@ -487,7 +487,7 @@ const _: () = assert!(std::mem::size_of::<KdaDecodeFusedArgs>() == 184);
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct MoeStage2Mxfp4Args {
-    out: u64,
+    part: u64,
     activation: u64,
     weight_table: u64,
     activation_scale: u64,
@@ -495,15 +495,13 @@ struct MoeStage2Mxfp4Args {
     meta: u64,
     row_partidx: u64,
     row_gate: u64,
-    tokens: u32,
     model_dim: u32,
     inter_dim: u32,
     experts: u32,
-    topk: u32,
     reserved: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<MoeStage2Mxfp4Args>() == 88);
+const _: () = assert!(std::mem::size_of::<MoeStage2Mxfp4Args>() == 80);
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -535,10 +533,16 @@ struct MoeStage1Mxfp4Route {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct MoeStage2Mxfp4Route {
+    args: MoeStage2Mxfp4Args,
+    grid: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
 enum PrefillSegmentRoute {
     Interpreter,
     MoeStage1Mxfp4(MoeStage1Mxfp4Route),
-    MoeStage2Mxfp4(MoeStage2Mxfp4Args),
+    MoeStage2Mxfp4(MoeStage2Mxfp4Route),
 }
 
 fn moe_stage1_mxfp4_inst(d: &DevInst64) -> bool {
@@ -554,9 +558,8 @@ fn moe_stage1_mxfp4_inst(d: &DevInst64) -> bool {
         && d.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
 }
 
-fn moe_stage2_mxfp4_pair(d: &DevInst64, c: &DevInst64) -> bool {
+fn moe_stage2_mxfp4_inst(d: &DevInst64) -> bool {
     d.op == DevOp::MoeGroupDownPf as u16
-        && c.op == DevOp::MoeCombinePf as u16
         && d.i[3] == MOE_ENC_MXFP4
         && d.i[1] == 384
         && d.i[0] != 0
@@ -567,6 +570,11 @@ fn moe_stage2_mxfp4_pair(d: &DevInst64, c: &DevInst64) -> bool {
         && d.t[5] != packet::dev::TENSOR_NONE16
         && d.t[6] != packet::dev::TENSOR_NONE16
         && d.t[7] != packet::dev::TENSOR_NONE16
+}
+
+fn moe_stage2_mxfp4_pair(d: &DevInst64, c: &DevInst64) -> bool {
+    moe_stage2_mxfp4_inst(d)
+        && c.op == DevOp::MoeCombinePf as u16
         && c.t[1] == packet::dev::TENSOR_NONE16
         && c.t[2] == packet::dev::TENSOR_NONE16
         && c.t[3] == d.t[0]
@@ -590,14 +598,10 @@ fn has_moe_stage2_mxfp4_segment(prog: &DevProg) -> bool {
         members[entry.seg as usize].insert(entry.inst as usize);
     }
     members.into_iter().any(|set| {
-        if set.len() != 2 {
+        if set.len() != 1 {
             return false;
         }
-        let mut it = set.into_iter();
-        let (Some(di), Some(ci)) = (it.next(), it.next()) else {
-            return false;
-        };
-        moe_stage2_mxfp4_pair(&prog.insts[di], &prog.insts[ci])
+        moe_stage2_mxfp4_inst(&prog.insts[*set.first().unwrap()])
     })
 }
 
@@ -644,26 +648,21 @@ fn moe_mxfp4_routes(
             ))
         })
     };
-    let companion = |h: u16, from: &str, to: &str| -> Result<u64> {
+    let companion = |h: u16, from: &str, to: &str| -> Result<Option<u64>> {
         let td = tensors.get(h as usize).ok_or_else(|| {
             RuntimeError::Device(format!(
                 "lean MoE stage-2 source table handle {h} is outside {} tensors",
                 tensors.len()
             ))
         })?;
-        let pfx = td.name.strip_suffix(from).ok_or_else(|| {
-            RuntimeError::Device(format!(
-                "lean MoE stage-2 source table `{}` does not end in `{from}`",
-                td.name
-            ))
-        })?;
+        let Some(pfx) = td.name.strip_suffix(from) else {
+            return Ok(None);
+        };
         let name = format!("{pfx}{to}");
-        let ix = tensors.iter().position(|t| t.name == name).ok_or_else(|| {
-            RuntimeError::Device(format!(
-                "lean MoE stage-2 segment requires loader-filled companion table `{name}`"
-            ))
-        })?;
-        devp.get(ix).map(|m| m.base).ok_or_else(|| {
+        let Some(ix) = tensors.iter().position(|t| t.name == name) else {
+            return Ok(None);
+        };
+        devp.get(ix).map(|m| Some(m.base)).ok_or_else(|| {
             RuntimeError::Device(format!(
                 "lean MoE stage-2 companion table `{name}` has no device allocation"
             ))
@@ -675,6 +674,56 @@ fn moe_mxfp4_routes(
             let i = *set.first().unwrap();
             let d = &prog.insts[i];
             if !moe_stage1_mxfp4_inst(d) {
+                if moe_stage2_mxfp4_inst(d) {
+                    let Some(c) = prog.insts.get(i + 1) else {
+                        routes.push(PrefillSegmentRoute::Interpreter);
+                        continue;
+                    };
+                    if !moe_stage2_mxfp4_pair(d, c) {
+                        routes.push(PrefillSegmentRoute::Interpreter);
+                        continue;
+                    }
+                    let Some(weight_table) =
+                        companion(d.t[2], "expert_weight_table", "expert_weight_table_moe2")?
+                    else {
+                        routes.push(PrefillSegmentRoute::Interpreter);
+                        continue;
+                    };
+                    let Some(weight_scale_table) =
+                        companion(d.t[3], "expert_scale_table", "expert_scale_table_moe2")?
+                    else {
+                        routes.push(PrefillSegmentRoute::Interpreter);
+                        continue;
+                    };
+                    let half_tiles = c.i[2]
+                        .checked_mul(c.i[1])
+                        .and_then(|rows| rows.div_ceil(64).checked_add(d.i[2]))
+                        .and_then(|tiles| tiles.checked_mul(2));
+                    let grid = d.i[0].div_ceil(256).checked_mul(half_tiles.unwrap_or(0));
+                    let Some(grid) = grid.filter(|&grid| grid != 0) else {
+                        return Err(RuntimeError::Device(format!(
+                            "lean MoE stage-2 segment {seg} launch grid overflows"
+                        )));
+                    };
+                    routes.push(PrefillSegmentRoute::MoeStage2Mxfp4(MoeStage2Mxfp4Route {
+                        args: MoeStage2Mxfp4Args {
+                            part: addr(d.t[0], "part")?,
+                            activation: addr(d.t[1], "activation")?,
+                            weight_table,
+                            activation_scale: addr(d.t[5], "activation_scale")?,
+                            weight_scale_table,
+                            meta: addr(d.t[4], "meta")?,
+                            row_partidx: addr(d.t[6], "row_partidx")?,
+                            row_gate: addr(d.t[7], "row_gate")?,
+                            model_dim: d.i[0],
+                            inter_dim: d.i[1],
+                            experts: d.i[2],
+                            reserved: 0,
+                        },
+                        grid,
+                    }));
+                    continue;
+                }
                 routes.push(PrefillSegmentRoute::Interpreter);
                 continue;
             }
@@ -718,40 +767,7 @@ fn moe_mxfp4_routes(
             }));
             continue;
         }
-        if set.len() != 2 {
-            routes.push(PrefillSegmentRoute::Interpreter);
-            continue;
-        }
-        let mut it = set.into_iter();
-        let (Some(di), Some(ci)) = (it.next(), it.next()) else {
-            unreachable!()
-        };
-        let (d, c) = (&prog.insts[di], &prog.insts[ci]);
-        if d.op != DevOp::MoeGroupDownPf as u16 || c.op != DevOp::MoeCombinePf as u16 {
-            routes.push(PrefillSegmentRoute::Interpreter);
-            continue;
-        }
-        if !moe_stage2_mxfp4_pair(d, c) {
-            return Err(RuntimeError::Device(format!(
-                "segment {seg} isolates a MoE Down+Combine boundary but its geometry/ABI is not supported by the lean MXFP4 stage-2 object"
-            )));
-        }
-        routes.push(PrefillSegmentRoute::MoeStage2Mxfp4(MoeStage2Mxfp4Args {
-            out: addr(c.t[0], "out")?,
-            activation: addr(d.t[1], "activation")?,
-            weight_table: companion(d.t[2], "expert_weight_table", "expert_weight_table_moe2")?,
-            activation_scale: addr(d.t[5], "activation_scale")?,
-            weight_scale_table: companion(d.t[3], "expert_scale_table", "expert_scale_table_moe2")?,
-            meta: addr(d.t[4], "meta")?,
-            row_partidx: addr(d.t[6], "row_partidx")?,
-            row_gate: addr(d.t[7], "row_gate")?,
-            tokens: c.i[2],
-            model_dim: d.i[0],
-            inter_dim: d.i[1],
-            experts: d.i[2],
-            topk: c.i[1],
-            reserved: 0,
-        }));
+        routes.push(PrefillSegmentRoute::Interpreter);
     }
     Ok(routes)
 }
@@ -4911,7 +4927,7 @@ pub struct AmdEngine {
     k_decode: HsaKernel,
     k_kda_decode_fused: Option<HsaKernel>,
     k_moe_stage1_mxfp4: Option<HsaKernel>,
-    k_moe_stage2_mxfp4: Option<(HsaKernel, HsaKernel)>,
+    k_moe_stage2_mxfp4: Option<HsaKernel>,
     k_xaudit: Option<HsaKernel>,
     k_state_clear: Option<HsaKernel>,
     k_token_capture: Option<HsaKernel>,
@@ -6124,11 +6140,12 @@ impl AmdEngine {
         let k_moe_stage2_mxfp4 = if arch == "gfx950" && need_moe_stage2_lean {
             const NAME: &str = "moe_stage2_mxfp4_gfx950.elf";
             const SYMBOL: &str = "plow_moe2_mxfp4_16x16x128_gfx950";
-            const MARKERS: [&str; 5] = [
-                "plow_moe2_mxfp4_stage2_abi_2",
+            const MARKERS: [&str; 6] = [
+                "plow_moe2_mxfp4_stage2_abi_3",
                 "plow_moe2_mxfp4_stage2_layout_shuffled_1",
                 "plow_moe2_mxfp4_stage2_no_spill_1",
-                "plow_moe2_mxfp4_stage2_dynamic_lds_16640",
+                "plow_moe2_mxfp4_stage2_f32_scatter_1",
+                "plow_moe2_mxfp4_stage2_dynamic_lds_4352",
                 "plow_moe2_mxfp4_stage2_vgpr_le_144",
             ];
             let path = hsaco_dir.join(NAME);
@@ -6157,12 +6174,6 @@ impl AmdEngine {
                 let kernel = EngineDevice::get_function(&*be, &module, SYMBOL).map_err(|e| {
                     RuntimeError::Device(format!("{NAME}: no symbol {SYMBOL}: {e}"))
                 })?;
-                let zero = EngineDevice::get_function(&*be, &module, "plow_moe2_zero_bf16")
-                    .map_err(|e| {
-                        RuntimeError::Device(format!(
-                            "{NAME}: no ordered-output-zero symbol plow_moe2_zero_bf16: {e}"
-                        ))
-                    })?;
                 let want = std::mem::size_of::<MoeStage2Mxfp4Args>() as u32;
                 let got = kernel.kernarg_size();
                 if got != want && got != want + 256 {
@@ -6171,15 +6182,9 @@ impl AmdEngine {
                         want + 256
                     )));
                 }
-                if zero.kernarg_size() != 16 && zero.kernarg_size() != 272 {
-                    return Err(RuntimeError::Device(format!(
-                        "{NAME}: zero helper kernarg segment is {} B; expected 16 (or 272 with COv5 implicit args)",
-                        zero.kernarg_size()
-                    )));
-                }
-                EngineDevice::set_max_dynamic_smem(&*be, kernel, 16_640)?;
+                EngineDevice::set_max_dynamic_smem(&*be, kernel, 4_352)?;
                 modules.push(module);
-                Some((kernel, zero))
+                Some(kernel)
             }
         } else {
             None
@@ -7692,47 +7697,20 @@ impl AmdEngine {
                 self.seg_launches += 1;
                 return Ok(());
             }
-            if let (Some((kernel, zero)), Some(PrefillSegmentRoute::MoeStage2Mxfp4(args))) = (
+            if let (Some(kernel), Some(PrefillSegmentRoute::MoeStage2Mxfp4(route))) = (
                 self.k_moe_stage2_mxfp4,
                 self.progs[p].prefill_routes.get(seg).copied(),
             ) {
-                let elements = args.tokens as u64 * args.model_dim as u64;
-                EngineDevice::launch_kernel(
-                    &*self.be,
-                    zero,
-                    u32::try_from(elements.div_ceil(256)).map_err(|_| {
-                        RuntimeError::Device("lean MoE output extent exceeds launch grid".into())
-                    })?,
-                    256,
-                    0,
-                    as_bytes(&[args.out, elements]),
-                    None,
-                )?;
-                let n_tiles = args.model_dim.div_ceil(256).max(1);
-                // ALIGN produces BM64 expert tiles; the lean body consumes their two BM32
-                // halves independently. This is a shape-derived upper bound because the host
-                // deliberately does not read routing metadata back from the device.
-                let half_tiles = args
-                    .tokens
-                    .checked_mul(args.topk)
-                    .and_then(|rows| rows.div_ceil(64).checked_add(args.experts))
-                    .and_then(|tiles| tiles.checked_mul(2))
-                    .ok_or_else(|| {
-                        RuntimeError::Device("lean MoE stage-2 tile count overflow".into())
-                    })?;
-                let grid = n_tiles.checked_mul(half_tiles).ok_or_else(|| {
-                    RuntimeError::Device("lean MoE stage-2 launch grid overflow".into())
-                })?;
                 EngineDevice::launch_kernel(
                     &*self.be,
                     kernel,
-                    grid,
+                    route.grid,
                     256,
-                    16_640,
-                    as_bytes(std::slice::from_ref(&args)),
+                    4_352,
+                    as_bytes(std::slice::from_ref(&route.args)),
                     None,
                 )?;
-                self.seg_launches += 2;
+                self.seg_launches += 1;
                 return Ok(());
             }
         }
@@ -10065,10 +10043,10 @@ mod tests {
     }
 
     #[test]
-    fn lean_moe_stage2_route_requires_the_exact_pure_boundary() {
+    fn lean_moe_stage2_route_requires_the_exact_pure_down_segment() {
         let mut prog = segmented_prog(
             &[DevOp::MoeGroupDownPf, DevOp::MoeCombinePf, DevOp::RmsNorm],
-            &[0, 0, 1],
+            &[0, 1, 2],
         );
         let (down, rest) = prog.insts.split_at_mut(1);
         let (d, c) = (&mut down[0], &mut rest[0]);
@@ -10103,17 +10081,18 @@ mod tests {
             .collect();
         let routes = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
         let PrefillSegmentRoute::MoeStage2Mxfp4(args) = routes[0] else {
-            panic!("pure supported pair must route to the lean object")
+            panic!("pure supported Down must route to the lean object")
         };
+        assert_eq!((args.args.model_dim, args.args.inter_dim), (3584, 384));
         assert_eq!(
-            (args.tokens, args.model_dim, args.inter_dim),
-            (1024, 3584, 384)
-        );
-        assert_eq!(
-            (args.weight_table, args.weight_scale_table),
+            (args.args.weight_table, args.args.weight_scale_table),
             (0x1800, 0x1900)
         );
+        assert_eq!(args.grid, 32256);
         assert!(matches!(routes[1], PrefillSegmentRoute::Interpreter));
+
+        let no_companion = moe_mxfp4_routes(&prog, &tensors[..8], &devp[..8]).unwrap();
+        assert!(matches!(no_companion[0], PrefillSegmentRoute::Interpreter));
 
         prog.stream[2].seg = 0;
         let fallback = moe_mxfp4_routes(&prog, &tensors, &devp).unwrap();
