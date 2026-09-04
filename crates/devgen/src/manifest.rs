@@ -141,6 +141,9 @@ fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
 /// `crates/plowrt/src/exec/gpu.rs`).
 #[derive(Clone, Debug)]
 pub struct ProgramArms {
+    /// Stable index in `Model::progs`.  Segment rows with the same bucket are
+    /// otherwise ambiguous (ordinary and packed ladders can share a width).
+    pub program: usize,
     pub kind: &'static str,
     pub packed_prefill_only: bool,
     /// Prefill chunk rows, or decode batch — the `T` the program was compiled for.
@@ -165,6 +168,7 @@ fn program_arms(m: &Model) -> Vec<ProgramArms> {
         let t = packet::devbuild::program_rows(encoded_t);
         for (seg, arms) in segment_arms(p) {
             out.push(ProgramArms {
+                program: pi,
                 kind,
                 packed_prefill_only: packet::devbuild::is_packed_prefill_program(encoded_t),
                 t,
@@ -1243,6 +1247,65 @@ fn opcode_family(op: &str) -> &'static str {
     }
 }
 
+/// Ordered, graph-derived launch chains.  This is deliberately descriptive:
+/// the object builder consumes each segment's exact arm inventory and must
+/// attach measured code-object resources before the runtime may select it.
+/// Keeping the boundary in the compiler manifest prevents a model-name table
+/// from becoming a second, drifting scheduler.
+fn dispatch_chains(progs: &[ProgramArms], arch: &str) -> Vec<Value> {
+    let resource_contract = |flash: bool| {
+        if arch.starts_with("gfx") {
+            json!({
+                "max_total_registers": if flash { 512 } else { 256 },
+                "min_occupancy_waves_per_simd": if flash { 1 } else { 2 },
+                "wavefront_size": 64,
+                "max_private_segment_bytes_delta": 0,
+                "max_vgpr_spill_delta": 0,
+                "policy": "refuse",
+            })
+        } else {
+            Value::Null
+        }
+    };
+    let mut out = Vec::new();
+    for program in progs.iter().map(|p| p.program).collect::<BTreeSet<_>>() {
+        let rows: Vec<&ProgramArms> = progs.iter().filter(|p| p.program == program).collect();
+        let Some(first) = rows.first() else { continue };
+        let segments: Vec<Value> = rows
+            .iter()
+            .map(|p| {
+                let families: BTreeSet<_> = p.arms.iter().map(|a| opcode_family(&a.op)).collect();
+                let flash = p
+                    .arms
+                    .iter()
+                    .any(|a| a.op.starts_with("Flash") || a.op == "MlaMergeFold");
+                json!({
+                    "segment": p.seg.unwrap_or(0),
+                    "insts": p.insts,
+                    "arms": p.arms.iter().map(Arm::key).collect::<Vec<_>>(),
+                    "families": families,
+                    "object_class": if flash { "flash" } else { "ordinary" },
+                    "resource_contract": resource_contract(flash),
+                })
+            })
+            .collect();
+        out.push(json!({
+            "program": program,
+            "kind": first.kind,
+            "topology": if first.packed_prefill_only { "packed" } else { "ordinary" },
+            if first.kind == "prefill" { "bucket" } else { "batch" }: first.t,
+            "segments": segments,
+            "aql_replay": {
+                "packets": rows.len(),
+                "ordering": "barrier_agent_scope",
+                "rank_commit": "prepare_all_ranks_then_ring_all",
+                "host_drains": 1,
+            },
+        }));
+    }
+    out
+}
+
 fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
     let progs = program_arms(m);
     let union: BTreeSet<Arm> = progs.iter().flat_map(|p| p.arms.iter().cloned()).collect();
@@ -1364,6 +1427,7 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
         // artifact?", and both have a value that means "not established".
         "lean": lean_block(lean),
         "programs": programs,
+        "dispatch_chains": dispatch_chains(&progs, arch),
         "objects": objects,
         // What a specialised object must compile: the union over every program
         // and segment. Anything narrower and some bucket hits `default: __trap()`.
@@ -2194,6 +2258,22 @@ mod tests {
             .unwrap()
             .iter()
             .any(|v| v == "FlashPrefill"));
+
+        let chains = man["dispatch_chains"].as_array().unwrap();
+        assert_eq!(chains.len(), 2);
+        assert_eq!(chains[0]["program"], 0);
+        assert_eq!(chains[0]["kind"], "prefill");
+        assert_eq!(chains[0]["bucket"], 128);
+        assert_eq!(chains[0]["aql_replay"]["packets"], 1);
+        assert_eq!(
+            chains[0]["aql_replay"]["rank_commit"],
+            "prepare_all_ranks_then_ring_all"
+        );
+        assert_eq!(
+            chains[0]["segments"][0]["resource_contract"]["max_private_segment_bytes_delta"],
+            0
+        );
+        assert_eq!(chains[1]["batch"], 1);
     }
 
     #[test]
@@ -2233,6 +2313,7 @@ mod tests {
             variant: Some("d128_qpre".into()),
         };
         let segment = |op: &str| ProgramArms {
+            program: 0,
             kind: "prefill",
             packed_prefill_only: false,
             t: 8192,
@@ -2266,6 +2347,7 @@ mod tests {
             variant: None,
         };
         let segment = |insts, ops: &[&str]| ProgramArms {
+            program: 0,
             kind: "decode",
             packed_prefill_only: false,
             t: 1,

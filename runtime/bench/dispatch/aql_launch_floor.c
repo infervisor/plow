@@ -32,6 +32,9 @@
  *                  k before enqueuing k+1. The cost if the host must actually see each op finish.
  *   prebuild       as `chain` but all N packets are written to the ring first and the doorbell is
  *                  rung ONCE. Removes any host-enqueue interleaving from the period.
+ *   verify-prebuild the heterogeneous pub/check/bump exactness chain, reserved as one contiguous
+ *                  replay and committed with one doorbell. This is the phase-chain correctness
+ *                  gate, not merely another empty-kernel timing arm.
  *
  * Every arm reports us/packet plus the host-side enqueue cost, so it is visible whether the
  * measurement is GPU-bound (enqueue << total) or host-bound.
@@ -471,7 +474,8 @@ int main(int argc, char** argv) {
         printf("%-16s %10.3f %10.3f   %s\n", arms[a].nm, best.us_per_pkt, best.enq_us_per_pkt, arms[a].note);
         fflush(stdout);
     }
-    if (!strcmp(only, "verify")) {
+    if (!strcmp(only, "verify") || !strcmp(only, "verify-prebuild")) {
+        const int prebuilt = !strcmp(only, "verify-prebuild");
         /* alternate d_pub / d_chk down one barrier-bit-chained queue, plain accesses only */
         uint64_t pubo, chko, bumpo;
         hsa_executable_symbol_t sy;
@@ -498,17 +502,30 @@ int main(int argc, char** argv) {
         hsa_signal_t tail; CHK(hsa_signal_create(1, 0, NULL, &tail), "verify tail");
         uint16_t hdr = mk_header(1, HSA_FENCE_SCOPE_AGENT);
         uint32_t np = (n / 3) * 3;
+        uint64_t base = 0;
+        if (prebuilt) {
+            base = hsa_queue_add_write_index_screlease(q, np);
+            ring_space(&c, base + np - 1);
+        }
         for (uint32_t i = 0; i < np; i++) {
-            uint64_t ix = hsa_queue_add_write_index_screlease(q, 1);
-            ring_space(&c, ix);
+            uint64_t ix = prebuilt ? base + i : hsa_queue_add_write_index_screlease(q, 1);
+            if (!prebuilt) ring_space(&c, ix);
             pkt_t* pp = fill(&c, ix, i == np - 1 ? tail : (hsa_signal_t){ .handle = 0 });
             uint32_t ph = i % 3;                       /* 0 pub(256), 1 chk(256), 2 bump(1) */
             pp->kernel_object = ph == 0 ? pubo : ph == 1 ? chko : bumpo;
             pp->kernarg_address = (uint64_t)(uintptr_t)vk;
             pp->group_segment_size = 0;
             if (ph == 2) { pp->grid_x = c.wg; }   /* the bump is a single workgroup */
-            publish(&c, pp, ix, hdr);
+            if (prebuilt) {
+                uint32_t hs =
+                    ((uint32_t)(1u << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS) << 16) | hdr;
+                __atomic_store_n((uint32_t*)pp, hs, __ATOMIC_RELEASE);
+            } else {
+                publish(&c, pp, ix, hdr);
+            }
         }
+        if (prebuilt)
+            hsa_signal_store_screlease(q->doorbell_signal, (hsa_signal_value_t)(base + np - 1));
         if (hsa_signal_wait_scacquire(tail, HSA_SIGNAL_CONDITION_EQ, 0,
                                       60ull * 1000 * 1000 * 1000, HSA_WAIT_STATE_ACTIVE) != 0) {
             printf("verify          CHAIN DID NOT DRAIN in 60 s -- inconclusive\n"); return 1;
@@ -520,8 +537,8 @@ int main(int argc, char** argv) {
             hsa_signal_wait_scacquire(rs, HSA_SIGNAL_CONDITION_EQ, 0, UINT64_MAX, HSA_WAIT_STATE_ACTIVE);
             hsa_signal_destroy(rs); memcpy(hostdbg, hb, 16); }
         const uint32_t* dbgv = hostdbg;
-        printf("verify          barrier-bit chain, PLAIN accesses, %u packets (%u pub/chk pairs)\n",
-               np, np / 3);
+        printf("verify%s barrier-bit chain, PLAIN accesses, %u packets (%u pub/chk pairs)\n",
+               prebuilt ? "-prebuild" : "         ", np, np / 3);
         printf("verify          version reached %u, words checked %u, STALE %u\n",
                dbgv[0], dbgv[2], dbgv[1]);
         printf("verify          -> the AQL header's agent-scope fences %s order memory across XCDs\n",
