@@ -1225,4 +1225,152 @@ __device__ __forceinline__ void d_xreduce_twoshot_mega(
 #endif
 }
 
+/* ---- SEQUENCE-PARALLEL SEAMS: the two-shot SPLIT at its phase boundary (ops 25 / 26) --------
+ *
+ * `-DPLOW_SEQ_PAR_SEAMS=1` (the packet's plow_config.h sets it when the packet carries the ops;
+ * a flag-off object compiles none of this and stays byte-identical). The emitter runs the
+ * packets that used to follow the all-gather — AttnRes, router, latent xe, top-k — on the rank's
+ * OWNED row band, reading the reduce-scattered slot as a rank-relative view, and only then
+ * all-gathers their RESULTS. So the two phases become two packets with the band work between.
+ *
+ * Both bodies are the two-shot's own phases restated, not rewritten: strict rank order
+ * r = 0..N-1 in f32, one `f2bf` per element, the same peer-staggered gather order. Anything the
+ * two-shot computes for an element, these compute bit-identically. */
+#if PLOW_SEQ_PAR_SEAMS
+/* One-workgroup announcement + N-arrival wait on `gate`, the two-shot's RENDEZVOUS 1 verbatim.
+ * Legal for both ops here because what is being published was written by EARLIER packets
+ * (the partial by the producer GEMM, the band results by the band packets), whose completion
+ * the interpreter's local counter gate already guarantees before any workgroup of this packet
+ * runs — so one workgroup may speak for the rank (see the two-shot's gate_rs note). Returns
+ * false on a deadline bail. */
+__device__ __forceinline__ bool xr_rendezvous_one_wg(const void* const* peer_scratch,
+                                                     uint32_t nranks, uint32_t rank,
+                                                     size_t xctr_byte_off, uint32_t gate,
+                                                     uint64_t deadline_ticks, uint32_t* status,
+                                                     unsigned slice, int* bailed) {
+    if (threadIdx.x == 0) *bailed = 0;
+    __syncthreads();
+    if (slice == 0 && threadIdx.x == 0)
+        for (uint32_t r = 0; r < nranks; r++)
+            xctr_signal(PLOW_CTR((uint32_t*)((char*)peer_scratch[r] + xctr_byte_off), gate));
+    if (threadIdx.x == 0) {
+        uint32_t* lg = PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate);
+        const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+        while (xctr_poll(lg) < nranks) {
+            if (__builtin_amdgcn_s_memrealtime() - t0 > deadline_ticks) {
+                if (status) *status = 0xDEAD0000u | rank;
+                *bailed = 1;
+                break;
+            }
+            __builtin_amdgcn_s_sleep(2);
+        }
+        if (!*bailed) xctr_acquire();
+#if PLOW_XR_ACQ_N > 1
+        PLOW_XR_EXTRA_ACQ(PLOW_CTR((uint32_t*)((char*)peer_scratch[rank] + xctr_byte_off), gate));
+#endif
+    }
+    __syncthreads();
+    return !*bailed;
+}
+
+/* op 25 — REDUCE-SCATTER ONLY. Rendezvous on `gate_rs`, then this rank's owned slice
+ * [n*rank/N, n*(rank+1)/N) of the flat [n] partial at `slot_bytes` is reduced and written IN
+ * PLACE into its own peer-visible slot (the two-shot's PHASE 1; `PLOW_XR_RS_U` elements in
+ * flight, r = 0..N-1 f32 accumulate, one bf16 round). Nothing is gathered.
+ *
+ * `gcols` (the FFN seam): the owned rows also fold the COLUMN-parallel partial at `gslot_bytes`
+ * — `f2bf(bf2f(reduced_bf16) + bf2f(gathered))`, the rounding the two-shot's phase-2 fold does,
+ * which is what keeps the packet bit-exact against it (op_gemm's note on the 1-ULP token flip).
+ * The owned rows are complete rows because the emitter refuses `rows % N != 0`.
+ *
+ * `band_copy`: a LOCAL [n/N] tensor that also receives the owned slice — for the reader that
+ * outlives the slot's next writer (a snapshot layer's restarted prefix). */
+__device__ __forceinline__ void d_xreduce_scatter_mega(
+    const void* const* peer_scratch, uint32_t nranks, uint32_t rank, uint32_t n,
+    uint32_t slot_bytes, size_t xctr_byte_off, uint32_t gate_rs, uint64_t deadline_ticks,
+    uint32_t* status, unsigned slice, unsigned nblk, uint32_t gslot_bytes, uint32_t gcols,
+    bf16* __restrict__ band_copy) {
+    __shared__ int bailed;
+    const unsigned tid = slice * PLOW_THREADS + threadIdx.x;
+    const unsigned stride = nblk * PLOW_THREADS;
+    if (!xr_rendezvous_one_wg(peer_scratch, nranks, rank, xctr_byte_off, gate_rs, deadline_ticks,
+                              status, slice, &bailed))
+        return;
+
+    const uint32_t my_lo = (uint32_t)(((uint64_t)n * rank) / nranks);
+    const uint32_t my_hi = (uint32_t)(((uint64_t)n * (rank + 1)) / nranks);
+    bf16* my_part = (bf16*)((char*)peer_scratch[rank] + slot_bytes);
+    const uint32_t row_w = nranks * gcols;
+    auto finish = [&](uint32_t e, float acc) {
+        bf16 v = f2bf(acc);
+        if (gcols) {
+            const uint32_t c = e % row_w;
+            const uint32_t m = e / row_w;
+            const uint32_t owner = c / gcols;
+            const bf16* g = (const bf16*)((const char*)peer_scratch[owner] + gslot_bytes);
+            v = f2bf(bf2f(v) + bf2f(as_glob(g)[m * gcols + (c - owner * gcols)]));
+        }
+        st_act1(&as_glob(my_part)[e], v);
+        if (band_copy) st_act1(&as_glob(band_copy)[e - my_lo], v);
+    };
+    constexpr uint32_t U = PLOW_XR_RS_U > 1 ? PLOW_XR_RS_U : 1;
+    uint32_t e = my_lo + tid;
+    for (; e + (U - 1) * stride < my_hi; e += U * stride) {
+        float acc[U] = {};
+        for (uint32_t r = 0; r < nranks; r++) {
+            const bf16* part = (const bf16*)((const char*)peer_scratch[r] + slot_bytes);
+            bf16 v[U];
+#pragma unroll
+            for (uint32_t u = 0; u < U; u++) v[u] = as_glob(part)[e + u * stride];
+#pragma unroll
+            for (uint32_t u = 0; u < U; u++) acc[u] += bf2f(v[u]);
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < U; u++) finish(e + u * stride, acc[u]);
+    }
+    for (; e < my_hi; e += stride) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < nranks; r++) {
+            const bf16* part = (const bf16*)((const char*)peer_scratch[r] + slot_bytes);
+            acc += bf2f(as_glob(part)[e]);
+        }
+        finish(e, acc);
+    }
+    __syncthreads();
+}
+
+/* op 26 — ALL-GATHER ONLY, of up to three row-banded arrays under ONE rendezvous. Every rank
+ * wrote its band of each array into the peer slot at `slot*` (earlier packets); one workgroup
+ * announces on `gate`, all wait N arrivals, then slice `s` of each array is copied from peer
+ * `s`'s slot into the local full `dst*` — the two-shot's PHASE 2 loop, peer-staggered by
+ * `(slice + rank + i) % N` for the same fabric reason. A null `dst` skips that array. */
+__device__ __forceinline__ void d_xall_gather_mega(
+    const void* const* peer_scratch, uint32_t nranks, uint32_t rank, size_t xctr_byte_off,
+    uint32_t gate, uint64_t deadline_ticks, uint32_t* status, unsigned slice, unsigned nblk,
+    bf16* __restrict__ dst0, uint32_t n0, uint32_t slot0,
+    bf16* __restrict__ dst1, uint32_t n1, uint32_t slot1,
+    bf16* __restrict__ dst2, uint32_t n2, uint32_t slot2) {
+    __shared__ int bailed;
+    const unsigned tid = slice * PLOW_THREADS + threadIdx.x;
+    const unsigned stride = nblk * PLOW_THREADS;
+    if (!xr_rendezvous_one_wg(peer_scratch, nranks, rank, xctr_byte_off, gate, deadline_ticks,
+                              status, slice, &bailed))
+        return;
+    auto gather = [&](bf16* __restrict__ dst, uint32_t n, uint32_t slot) {
+        if (dst == nullptr || n == 0) return;
+        for (uint32_t i = 0; i < nranks; i++) {
+            const uint32_t s = (slice + rank + i) % nranks;
+            const uint32_t lo = (uint32_t)(((uint64_t)n * s) / nranks);
+            const uint32_t hi = (uint32_t)(((uint64_t)n * (s + 1)) / nranks);
+            const bf16* src = (const bf16*)((const char*)peer_scratch[s] + slot);
+            for (uint32_t e = lo + tid; e < hi; e += stride)
+                st_act1(&as_glob(dst)[e], as_glob(src)[e]);
+        }
+    };
+    gather(dst0, n0, slot0);
+    gather(dst1, n1, slot1);
+    gather(dst2, n2, slot2);
+}
+#endif /* PLOW_SEQ_PAR_SEAMS */
+
 #endif /* PLOW_OP_COLLECTIVE_H */

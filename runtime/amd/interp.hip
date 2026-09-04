@@ -63,6 +63,17 @@
 #ifndef PLOW_HAS_KDA_CHUNK_CARRY
 #define PLOW_HAS_KDA_CHUNK_CARRY 1
 #endif
+/* Sequence-parallel seam arms (ops 25/26, op_collective.h). OPT-IN, unlike the arms above: a
+ * packet that carries them says so in its plow_config.h (PLOW_HAS_XREDUCESCATTER /
+ * PLOW_HAS_XALLGATHER, per bucket), and every other object — including the generic one built
+ * without a config — compiles none of it and stays byte-identical. */
+#ifndef PLOW_SEQ_PAR_SEAMS
+#if defined(PLOW_HAS_XREDUCESCATTER) && (PLOW_HAS_XREDUCESCATTER || PLOW_HAS_XALLGATHER)
+#define PLOW_SEQ_PAR_SEAMS 1
+#else
+#define PLOW_SEQ_PAR_SEAMS 0
+#endif
+#endif
 
 /* Opt-in packet-inventory pruning. A generated PLOW_CONFIG supplies the exact
  * per-bucket PLOW_HAS_* set; ordinary developer objects retain the historical
@@ -255,6 +266,10 @@ extern "C" __device__ unsigned plow_kda_chunk_qpre_arm_1 = 1;
 #endif
 #if PLOW_K3 && PLOW_KDA_CONV_STEP_DB
 extern "C" __device__ unsigned plow_kda_conv_step_db_arm = 1;
+#endif
+#if PLOW_SEQ_PAR_SEAMS
+/* The loader's `PLOW_SEQ_PAR_SEAMS=1` requirement resolves to this marker. */
+extern "C" __device__ unsigned plow_seq_par_seams_arm_1 = 1;
 #endif
 
 /* Compact TP audit. `j[1] == 0` keeps old packets byte-compatible; plowrt patches
@@ -4601,6 +4616,36 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
                                    , prog.trace ? &prog.trace[base + ix] : nullptr
 #endif
                                    );
+#if PLOW_SEQ_PAR_SEAMS
+        } else if (in->op == PLOW_DOP_XREDUCESCATTER) {
+            /* Sequence-parallel seam, REDUCE-SCATTER half: the two-shot's phase 1 alone, in
+             * place in the peer slot; the band packets that follow read the owned rows as a
+             * rank-relative view and op 26 gathers their results.
+             *   t0=slot tensor t1=band_copy?  i0=n i1=n_gpu i2=slot i3=gate_rs i6=gslot? i7=gcols? */
+            const size_t xoff =
+                (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+            uint32_t* const xaudit = plow_xaudit_status(prog, in);
+            d_xreduce_scatter_mega(prog.peer_scratch, prog.n_gpu, prog.rank, in->i[0],
+                                   in->i[2], xoff, in->i[3], PLOW_XCTR_DEADLINE_TICKS, xaudit,
+                                   e.slice, in->blocks, in->i[6], in->i[7],
+                                   in->t[1] == PLOW_TENSOR_NONE ? nullptr
+                                                                : (bf16*)tens[in->t[1]]);
+        } else if (in->op == PLOW_DOP_XALLGATHER) {
+            /* ALL-GATHER half, up to three banded arrays under one rendezvous.
+             *   t0..t2=dst? i0..i2=n? i3=gate i4=n_gpu i5..i7=src slot byte offsets */
+            const size_t xoff =
+                (const char*)prog.xctr - (const char*)prog.peer_scratch[prog.rank];
+            uint32_t* const xaudit = plow_xaudit_status(prog, in);
+            d_xall_gather_mega(
+                prog.peer_scratch, prog.n_gpu, prog.rank, xoff, in->i[3],
+                PLOW_XCTR_DEADLINE_TICKS, xaudit, e.slice, in->blocks,
+                in->t[0] == PLOW_TENSOR_NONE ? nullptr : (bf16*)tens[in->t[0]], in->i[0],
+                in->i[5],
+                in->t[1] == PLOW_TENSOR_NONE ? nullptr : (bf16*)tens[in->t[1]], in->i[1],
+                in->i[6],
+                in->t[2] == PLOW_TENSOR_NONE ? nullptr : (bf16*)tens[in->t[2]], in->i[2],
+                in->i[7]);
+#endif
         } else if (in->op == PLOW_DOP_XARGMAX_FIN) {
             /* Cross-rank fold for a VOCAB-COLUMN-PARALLEL lm_head.
              * Subsumes ARGMAX_FIN: it does the local nparts fold too, then rebases the index

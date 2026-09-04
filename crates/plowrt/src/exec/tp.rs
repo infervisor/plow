@@ -132,6 +132,9 @@ pub struct PeerLayout {
     pub n_xctr: u32,
     /// Bytes per partial slot, `max_tokens·H·2`.
     partial_bytes: u64,
+    /// Partial slots laid out: [`PARTIAL_SLOTS`], or six for a packet whose sequence-parallel
+    /// seams publish band results through `act.{h2,xe,rt}_tp` (slots 3/4/5).
+    slots: u64,
     /// Byte offset of the counter sub-region within the peer scratch.
     xctr_off: u64,
     /// Byte offset of the compact-audit status line.
@@ -190,11 +193,24 @@ impl PeerLayout {
     /// would put the counter region off a cache line and let two ranks'
     /// independent signals contend for one line over XGMI.
     pub fn new(hidden: u32, max_tokens: u32, n_xctr: u32) -> Option<Self> {
+        Self::with_slots(hidden, max_tokens, n_xctr, PARTIAL_SLOTS)
+    }
+
+    /// Slots per rank for a packet that declares the sequence-parallel result slots.
+    pub const SEQ_PAR_SLOTS: u64 = 6;
+
+    /// [`PeerLayout::new`] with an explicit partial-slot count (3, or 6 under the
+    /// sequence-parallel seams). The counter region moves with it, so every rank of one
+    /// group — and every program of one blob — must be laid out with the same count.
+    pub fn with_slots(hidden: u32, max_tokens: u32, n_xctr: u32, slots: u64) -> Option<Self> {
         let partial_bytes = max_tokens as u64 * hidden as u64 * 2;
         if partial_bytes == 0 || partial_bytes % PEER_ALIGN != 0 {
             return None;
         }
-        let xctr_off = partial_bytes * PARTIAL_SLOTS;
+        if slots != PARTIAL_SLOTS && slots != Self::SEQ_PAR_SLOTS {
+            return None;
+        }
+        let xctr_off = partial_bytes * slots;
         let xstatus_off = xctr_off + n_xctr as u64 * XCTR_STRIDE as u64;
         // Tagged one-shot region: four slots (partial parity 0/1, gather parity 0/1) of
         // 8-byte words holding three bf16 + a 16-bit tag. It follows the status line — the
@@ -208,6 +224,7 @@ impl PeerLayout {
             max_tokens,
             n_xctr,
             partial_bytes,
+            slots,
             xctr_off,
             xstatus_off,
             xr_tag_off,
@@ -223,9 +240,10 @@ impl PeerLayout {
 
     /// Byte offset of partial slot `slot` — the `i2` operand of `DevOp::XReduce`.
     pub fn partial_off(&self, slot: u32) -> Result<u64> {
-        if (slot as u64) >= PARTIAL_SLOTS {
+        if (slot as u64) >= self.slots {
             return Err(RuntimeError::Device(format!(
-                "partial slot {slot} >= {PARTIAL_SLOTS}"
+                "partial slot {slot} >= {}",
+                self.slots
             )));
         }
         Ok(self.partial_bytes * slot as u64)

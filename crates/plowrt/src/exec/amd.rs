@@ -2972,6 +2972,10 @@ const PREFILL_ARM_MARKERS: &[(&str, &[&str])] = &[
     ("PLOW_MOE_PF_DET", &["plow_moe_pf_det_arm"]),
     ("PLOW_KDA_CHUNK", &["plow_kda_chunk_bt64_arm_1"]),
     ("PLOW_KDA_CHUNK_QPRE", &["plow_kda_chunk_qpre_arm_1"]),
+    // Sequence-parallel seam arms (ops 25/26), compiled only when the packet's plow_config.h
+    // carries the ops. Without them the dispatch falls through silently: no reduce, no
+    // gather, a prefill of stale slots. Refuse.
+    ("PLOW_SEQ_PAR_SEAMS", &["plow_seq_par_seams_arm_1"]),
     // `#if PLOW_K3` (runtime/amd/interp.hip) gates ops 99-106 in BOTH buckets — the KDA mixer,
     // AttnRes, `situ` and the MLA output gate. It is the one arm flag that is not prefill-only,
     // and the one whose absence is most completely silent: a K3 packet on an object without it
@@ -6472,7 +6476,12 @@ fn patch_tp_xaudit(insts: &mut [DevInst64], status_id: u32) {
         if matches!(
             DevOp::from_u16(d.op),
             Some(
-                DevOp::XReduce | DevOp::XReduceTwoShot | DevOp::XReduceAddNorm | DevOp::XArgmaxFin
+                DevOp::XReduce
+                    | DevOp::XReduceTwoShot
+                    | DevOp::XReduceAddNorm
+                    | DevOp::XArgmaxFin
+                    | DevOp::XReduceScatter
+                    | DevOp::XAllGather
             )
         ) {
             d.fj[2] = status_id + 1;
@@ -9333,9 +9342,18 @@ impl AmdEngine {
         let is_peer_slot = |name: &str| {
             matches!(
                 (tp.is_some(), name),
-                (true, "act.og_tp") | (true, "act.dg_tp") | (true, "act.ug_tp")
+                (true, "act.og_tp")
+                    | (true, "act.dg_tp")
+                    | (true, "act.ug_tp")
+                    | (true, "act.h2_tp")
+                    | (true, "act.xe_tp")
+                    | (true, "act.rt_tp")
             )
         };
+        // Rank-relative BAND VIEWS (`<base>@band<t>`, sequence-parallel seams): rows
+        // `[rank*t/tp, (rank+1)*t/tp)` of an already-bound base, i.e. `base + rank * bytes`.
+        // Storage belongs to the base, so they are views like the peer slots.
+        let is_band_view = |name: &str| tp.is_some() && name.contains("@band");
         let is_vmm = |name: &str| {
             vmm.as_ref()
                 .and_then(|v| {
@@ -9351,7 +9369,7 @@ impl AmdEngine {
         let slab_bytes: u64 = blob
             .tensors
             .iter()
-            .filter(|td| !is_peer_slot(&td.name) && !is_vmm(&td.name))
+            .filter(|td| !is_peer_slot(&td.name) && !is_band_view(&td.name) && !is_vmm(&td.name))
             .map(|td| slab_pad(slab_need(td.bytes)))
             .sum();
         let t_slab = Instant::now();
@@ -9425,6 +9443,12 @@ impl AmdEngine {
                 // Slot 2, the GATHER slot: a column-parallel partial the reduce out of
                 // slot 0 folds in (`PARTIAL_SLOTS`). Only K3's LatentMoE declares it.
                 (Some(t), "act.ug_tp") => Some(t.scratch_base + 2 * t.slot_b),
+                // Slots 3/4/5: the sequence-parallel seams' band results (normed hidden,
+                // latent xe, route table), all-gathered by op 26. K3 declares them only
+                // under `PLOW_SEQ_PAR_SEAMS`; the group sizes the region to six slots then.
+                (Some(t), "act.h2_tp") => Some(t.scratch_base + 3 * t.slot_b),
+                (Some(t), "act.xe_tp") => Some(t.scratch_base + 4 * t.slot_b),
+                (Some(t), "act.rt_tp") => Some(t.scratch_base + 5 * t.slot_b),
                 _ => None,
             };
             if let Some(base) = peer_slot {
@@ -9433,6 +9457,31 @@ impl AmdEngine {
                     "bound into the peer region"
                 );
                 devp.push(DeviceMem::view(base, td.bytes.max(1)));
+                names.push(td.name.clone());
+                n_view += 1;
+                continue;
+            }
+            if is_band_view(&td.name) {
+                let base_name = td.name.split("@band").next().unwrap_or_default();
+                let base_ix = names.iter().position(|n| n == base_name).ok_or_else(|| {
+                    RuntimeError::Device(format!(
+                        "band view {} names a base that is not bound before it",
+                        td.name
+                    ))
+                })?;
+                let rank = u64::from(tp.map_or(0, |t| t.rank));
+                let base_mem: &DeviceMem = &devp[base_ix];
+                let off = rank * td.bytes;
+                if off + td.bytes > base_mem.len {
+                    return Err(RuntimeError::Device(format!(
+                        "band view {} at rank {rank} ends at {} B past its base {base_name} \
+                         ({} B)",
+                        td.name,
+                        off + td.bytes,
+                        base_mem.len
+                    )));
+                }
+                devp.push(DeviceMem::view(base_mem.base + off, td.bytes.max(1)));
                 names.push(td.name.clone());
                 n_view += 1;
                 continue;
