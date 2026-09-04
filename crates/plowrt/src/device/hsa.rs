@@ -223,8 +223,11 @@ const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE: u32 = 11;
 const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE: u32 = 13;
 const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE: u32 = 14;
 
-// Our AQL queue and kernarg ring sizing (match hsa_backend.c).
-const QUEUE_SIZE: u32 = 1024;
+// Our AQL queue and kernarg ring sizing (match hsa_backend.c). A graph-derived
+// phase chain reserves one packet per ordered segment before ringing, so the
+// queue must hold the widest prefill chain (K3 T8192 with isolated XReduce
+// phases is 1157 segments). Power of two: the kernarg ring slot is `idx & (size-1)`.
+const QUEUE_SIZE: u32 = 4096;
 const KARG_SLOT: usize = 512;
 const CHAIN_IDLE: u64 = u64::MAX;
 const CHAIN_SETUP: u64 = u64::MAX - 1;

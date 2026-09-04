@@ -10,7 +10,7 @@
 #define PLOW_HSA_MAX_DEV 16
 /* AQL ring depth. Also bounds in-flight dispatches, which is what makes the
  * kernarg ring below safe to reuse without tracking completion per slot. */
-#define PLOW_HSA_QUEUE_SIZE 1024
+#define PLOW_HSA_QUEUE_SIZE 4096 /* holds the widest phase chain; see hsa.rs */
 /* Per-dispatch kernarg slot. Our widest kernel takes ~10 pointers + scalars,
  * and COv5 always appends a 256-byte hidden block. */
 #define PLOW_HSA_KARG_SLOT 512
