@@ -3200,8 +3200,17 @@ __device__ void d_flash_mla_prefill_mfma(float* __restrict__ Opart,
 #ifndef PLOW_MLA_PF_SV
 #define PLOW_MLA_PF_SV 0
 #endif
+/* gfx950-only PV transpose loads. The existing scalar path reconstructs one bf16x8
+ * fragment with eight LDS reads and four packs; ds_read_b64_tr_b16 produces four
+ * transposed bf16 values directly, so two instructions form the same fragment. */
+#ifndef PLOW_MLA_PF_TR16
+#define PLOW_MLA_PF_TR16 0
+#endif
+#if PLOW_MLA_PF_TR16 && !defined(__gfx950__)
+#error "PLOW_MLA_PF_TR16 requires gfx950"
+#endif
 /* Extra halves the kv-block swizzle adds to the slab (blocks 1..3 shifted by 16 each). */
-#if PLOW_MLA_PF_SV
+#if PLOW_MLA_PF_SV && !PLOW_MLA_PF_TR16
 #define FA_MLA_PF2_SWZ 16
 #else
 #define FA_MLA_PF2_SWZ 0
@@ -3213,6 +3222,14 @@ __device__ void d_flash_mla_prefill_mfma(float* __restrict__ Opart,
     ((FA_MLA_PF2_BKV * ((DK) + (DR) + FA_MLA_PF2_PAD) + 3 * FA_MLA_PF2_SWZ +             \
       4 * 16 * FA_MLA_PF2_BKV) *                                                         \
      2)
+
+#if PLOW_MLA_PF_TR16
+typedef bf16_t mla_pf_bf16x4 __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ mla_pf_bf16x4 mla_pf_ds_read_tr16(const bf16* p) {
+    auto* lp = (mla_pf_bf16x4 __attribute__((address_space(3)))*)(void*)p;
+    return __builtin_amdgcn_ds_read_tr16_b64_v4bf16(lp);
+}
+#endif
 
 template <int DK, int DR, bool GATHER = false, bool FP8 = false>
 __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restrict__ mlpart,
@@ -3692,7 +3709,24 @@ __device__ void d_flash_mla_prefill_v2(float* __restrict__ Opart, float* __restr
             /* ---- O += P·V, V = the latent columns of the SAME slab ---- */
             bf16x8 pf;
             __builtin_memcpy(&pf, &Pw[fr * BKV + kg * 8], 16);
-#if PLOW_MLA_PF_SV
+#if PLOW_MLA_PF_TR16
+            /* The instruction transposes four adjacent LDS rows into four bf16 values
+             * per lane. Lane decomposition matches the 16x16 MFMA B fragment. */
+#pragma unroll
+            for (int t = 0; t < NT; t++) {
+                const unsigned row = kg * 8 + (fr >> 2);
+                const unsigned col = (unsigned)t * 16 + (fr & 3u) * 4;
+                mla_pf_bf16x4 lo = mla_pf_ds_read_tr16(&Ksm[row * KSTR + col]);
+                mla_pf_bf16x4 hi = mla_pf_ds_read_tr16(&Ksm[(row + 4) * KSTR + col]);
+                bf16x8 vf;
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    vf[j] = lo[j];
+                    vf[j + 4] = hi[j];
+                }
+                oacc[t] = plow_mfma_bf16_16x16(pf, vf, oacc[t]);
+            }
+#elif PLOW_MLA_PF_SV
             /* SV(3): the next output tile's 8 transpose reads issue before this tile's
              * MFMAs, so the lgkm pipeline holds 16 outstanding u16 reads instead of 8.
              * Under SV(1) each of those reads is bank-conflict-free. */

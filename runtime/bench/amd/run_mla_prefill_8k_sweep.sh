@@ -22,22 +22,27 @@ field() {
         grep -F "$name:" | head -1 | sed 's/^.*: *//; s/ .*$//'
 }
 
-build control ""
-build sv "-DPLOW_MLA_PF_SV=1"
+build current "-DPLOW_MLA_PF_SV=1"
+build tr16 "-DPLOW_MLA_PF_SV=1 -DPLOW_MLA_PF_TR16=1"
 
-for name in control sv; do
+for name in current tr16; do
     report="$OUT/$name.resources"
     vgpr=$(field "$report" VGPRs)
     agpr=$(field "$report" AGPRs)
+    sgpr=$(field "$report" TotalSGPRs)
     scratch=$(field "$report" 'ScratchSize [bytes/lane]')
-    spill=$(field "$report" 'VGPRs Spill')
+    sgpr_spill=$(field "$report" 'SGPRs Spill')
+    vgpr_spill=$(field "$report" 'VGPRs Spill')
     occ=$(field "$report" 'Occupancy [waves/SIMD]')
     lds=$(field "$report" 'LDS Size [bytes/block]')
-    test -n "$vgpr" -a -n "$agpr" -a -n "$scratch" -a -n "$spill" -a -n "$occ" -a -n "$lds"
+    test -n "$vgpr" -a -n "$agpr" -a -n "$sgpr" -a -n "$scratch" \
+        -a -n "$sgpr_spill" -a -n "$vgpr_spill" -a -n "$occ" -a -n "$lds"
     total=$((vgpr + agpr))
-    printf '%-8s VGPR=%s AGPR=%s total=%s occ=%s scratch=%s spill=%s LDS=%s\n' \
-        "$name" "$vgpr" "$agpr" "$total" "$occ" "$scratch" "$spill" "$lds"
-    if ((total > 384 || occ < 1 || scratch != 0 || spill != 0 || lds > 163840)); then
+    printf '%-8s wave=64 WG=256 VGPR=%s AGPR=%s total=%s SGPR=%s occ=%s scratch=%s sgpr_spill=%s vgpr_spill=%s LDS=%s\n' \
+        "$name" "$vgpr" "$agpr" "$total" "$sgpr" "$occ" "$scratch" \
+        "$sgpr_spill" "$vgpr_spill" "$lds"
+    if ((total > 384 || occ < 1 || scratch != 0 || sgpr_spill != 0 ||
+        vgpr_spill != 0 || lds > 163840)); then
         echo "FAIL: $name V2 crossed the lean-object resource gate" >&2
         exit 1
     fi
@@ -45,4 +50,4 @@ done
 
 "$HIPCC" -O2 -w "$HOST" -o "$OUT/bench" -lamdhip64
 "$ROOT/perf-data/tools/gpulease" -n 1 mla-prefill-8k-sweep \
-    "$OUT/bench" "$OUT/control.co" "$OUT/sv.co" 9
+    "$OUT/bench" "$OUT/current.co" "$OUT/tr16.co" 9

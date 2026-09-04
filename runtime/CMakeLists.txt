@@ -704,6 +704,8 @@ option(PLOW_K3_KDA_CONV_STEP_DB
        "Fuse K3 B1 Conv3 into StateStepG with ping-pong convolution windows" OFF)
 option(PLOW_MLA_PF_SV
        "Use the V2 MLA-prefill LDS swizzle and fragment staging" ON)
+option(PLOW_MLA_PF_TR16
+       "Use gfx950 transpose LDS reads in the V2 MLA-prefill PV stage" OFF)
 
 set(PLOW_HSACO_ARCH "gfx950" CACHE STRING "offload arch for the served code objects")
 set(PLOW_HSACO_HIPCC "/opt/rocm/bin/hipcc" CACHE FILEPATH "hipcc used for the served code objects")
@@ -1060,6 +1062,12 @@ if(PLOW_GFX950_HSACO)
         ${_hs_ax_flash} -DPLOW_MLA_PF_V2_ARM=1 -DPLOW_MLA_PF_SV=1
         -DPLOW_BUCKET_MLA_V2_RAW=1 -DPLOW_NO_SPILL=1
         -DPLOW_REQUIRED_MARKER=plow_mla_pf_v2_sv_raw_1)
+    if(PLOW_MLA_PF_TR16)
+        if(NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
+            message(FATAL_ERROR "PLOW_MLA_PF_TR16 requires gfx950")
+        endif()
+        list(APPEND _hs_ax_mla_v2_sv_raw -DPLOW_MLA_PF_TR16=1)
+    endif()
     set(_hs_ax_packed_kda
         ${_hs_ax_prefill} -DPLOW_K3=1 -DPLOW_BUCKET_PACKED_KDA=1
         -DPLOW_PACKED_PREFILL_KDA_CONSUMERS=1)
