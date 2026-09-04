@@ -4725,7 +4725,7 @@ mod tests {
     }
 
     #[test]
-    fn c8_exact_shape_is_explicit_and_default_off_in_the_packet() {
+    fn c8_exact_shape_is_explicit_and_opts_out_in_the_packet() {
         let _guard = crate::test_env::env_guard();
         crate::set_amd_target("MI350X");
         let emit = |m: u32, n: u32, k: u32| {
@@ -4738,7 +4738,7 @@ mod tests {
         };
 
         {
-            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", "")]);
+            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", "none")]);
             let inst = emit(8192, 1536, 7168);
             assert_eq!(
                 inst.pack(),
@@ -4810,7 +4810,7 @@ mod tests {
             )
         };
 
-        let (control, control_census, control_lookups, control_manifest) = emit("");
+        let (control, control_census, control_lookups, control_manifest) = emit("none");
         let (candidate, candidate_census, candidate_lookups, candidate_manifest) =
             emit("8192x1536x7168");
         assert_eq!(control_census, (7650, 7650));

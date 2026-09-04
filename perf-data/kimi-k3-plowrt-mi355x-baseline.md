@@ -83,6 +83,13 @@ The 2026-09-04 `k3-showdown-c1-stack-20260904d` row (1284.84 ms median TTFT,
 2026-09-03 three-fold row (3762.81 / 63.17 / 14.97) are superseded by this
 campaign.
 
+Post-publication engine gate (not yet a served cell): promoting `PLOW_MOE_ALIGN_PAR`
+and the GemmWide c8 tile at `8192x1536x7168` on this packet measured 8192→1 TTFT
+1072.3 / 1072.0 / 1072.0 ms vs 1095.1 / 1095.0 / 1094.7 ms (−22.9 ms, three
+alternating folds), TPOT 25.28 vs 25.30 ms, with identical 1- and 256-token
+output checksums; both are default-on from commit "amd: promote align-parallel
+MoE and the c8 tile shape". The next served cell should read ~1090 ms TTFT.
+
 Raw data: `perf-data/kimi-k3-plowrt-mi355x-c1.json`.
 Comparator: `perf-data/kimi-k3-vllm-mi355x-c1.json`.
 

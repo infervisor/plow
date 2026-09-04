@@ -46,6 +46,9 @@ use clap::Args;
 /// Constructed by `plowc` via `#[command(flatten)]` and threaded through the emit
 /// pipeline as `&EmitConfig`. The struct is the single source of truth for every
 /// compile-time knob; `std::env::var` calls in `devgen` are being migrated here.
+/// K3 TP8 q-projection `8192x1536x7168`; the only shape with a measured c8 win.
+pub const GEMM_WIDE_C8_DEFAULT_SHAPE: &str = "8192x1536x7168";
+
 #[derive(Args, Debug, Clone)]
 #[command(next_help_heading = "Emit knobs")]
 pub struct EmitConfig {
@@ -544,7 +547,8 @@ pub struct EmitConfig {
     pub attnres_f32mix: bool,
 
     /// Split grouped-MoE align into expert-parallel count/prefix/scatter packets.
-    #[arg(long, env = "PLOW_MOE_ALIGN_PAR", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Default on (TP8 gate 2026-09-04 with the c8 tile: -22.9 ms TTFT, exact).
+    #[arg(long, env = "PLOW_MOE_ALIGN_PAR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub moe_align_par: bool,
 
     /// Whole-expert/full-I prefill route for graph-proven replicated MoE boundaries.
@@ -628,9 +632,10 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_TUNE_DUMP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub tune_dump: bool,
 
-    /// Exact MxNxK shape allowed to use the experimental gfx950 128x384x64 GemmWide body.
-    /// Unset keeps packet bytes and the 128x256x64 body unchanged.
-    #[arg(long = "emit-gemm-wide-c8-shape", env = "PLOW_GEMM_WIDE_C8_SHAPE")]
+    /// Exact MxNxK shape allowed to use the gfx950 128x384x64 GemmWide body. Defaults to the
+    /// K3 TP8 q-projection shape (TP8 gate 2026-09-04: -11 ms TTFT, exact); `none` keeps
+    /// packet bytes and the 128x256x64 body unchanged everywhere.
+    #[arg(long = "emit-gemm-wide-c8-shape", env = "PLOW_GEMM_WIDE_C8_SHAPE", default_value = GEMM_WIDE_C8_DEFAULT_SHAPE)]
     pub gemm_wide_c8_shape: Option<String>,
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -647,7 +652,11 @@ pub struct EmitConfig {
 
 impl EmitConfig {
     pub fn gemm_wide_c8_for(&self, m: u32, n: u32, k: u32) -> bool {
-        let Some(shape) = self.gemm_wide_c8_shape.as_deref() else {
+        let Some(shape) = self
+            .gemm_wide_c8_shape
+            .as_deref()
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
+        else {
             return false;
         };
         let dims: Vec<_> = shape.split(['x', 'X']).collect();
@@ -816,7 +825,7 @@ impl EmitConfig {
             glm_fuse_xrn: env_bool("GLM_FUSE_XRN"),
             moe_pf_a8: env_bool("PLOW_MOE_PF_A8"),
             moe_stage2_lean: env_opt_out("PLOW_MOE_STAGE2_LEAN"),
-            moe_align_par: env_bool("PLOW_MOE_ALIGN_PAR"),
+            moe_align_par: env_opt_out("PLOW_MOE_ALIGN_PAR"),
             moe_prefill_ep: env_bool("PLOW_MOE_PREFILL_EP"),
             moe_stage1_lean: env_opt_out("PLOW_MOE_STAGE1_LEAN"),
             moe_combine_lean: env_bool_default_true("PLOW_MOE_COMBINE_LEAN"),
@@ -832,7 +841,8 @@ impl EmitConfig {
             glm_wgfit: env_opt_out("PLOW_GLM_WGFIT"),
             tunedb: std::env::var("PLOW_TUNEDB").ok(), // preserves "" for "disable tuning"
             tune_dump: env_bool("PLOW_TUNE_DUMP"),
-            gemm_wide_c8_shape: env_str("PLOW_GEMM_WIDE_C8_SHAPE"),
+            gemm_wide_c8_shape: env_str("PLOW_GEMM_WIDE_C8_SHAPE")
+                .or_else(|| Some(GEMM_WIDE_C8_DEFAULT_SHAPE.into())),
             skip_coverage: env_bool("PLOW_SKIP_COVERAGE"),
             k3_ablate: env_str("PLOW_K3_ABLATE"),
         }
