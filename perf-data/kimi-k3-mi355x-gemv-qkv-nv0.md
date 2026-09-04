@@ -1,6 +1,6 @@
 # MI355X two-output `GemvQkv(Nv=0)` kernel gate
 
-Status: **isolated candidate qualified; network default not qualified**.
+Status: **isolated candidate qualified; full-network candidate rejected**.
 
 ## Cell
 
@@ -52,3 +52,45 @@ The isolated cell includes one fewer HIP launch. Plow's interpreter does not lau
 per packet, so the exact network saving is determined by one fewer packet handoff and by whether
 the two control packets overlap in the global queue. This result qualifies an exact full-token
 order-alternated A/B; it does not qualify enabling the rule by default.
+
+## Full-network gate — rejected
+
+The exact TP8 BF16-KV 8192→256 gate ran at `62e7130` under one exclusive eight-GPU lease.
+Both arms used the promoted paired MLA segment route, manifest-derived decode inventory pruning,
+and no KDA specialist objects. The compiler used the current gfx950 TuneDB digest
+`gfx950-870078e93f2c92f0` under `rocm-7.14.0-nix`: a fresh auto-derived 96-shape campaign wrote
+960 oracle-passing raw rows, published 480 dispatch-arm records, and closed 96 HIT / 0 MISS.
+Both packets then reported 7650 / 7650 measured tile selections.
+
+The only structural program difference was the candidate fusion:
+
+| arm | decode instructions | `Gemv` | `GemvQkv` | pairing hash |
+|---|---:|---:|---:|---|
+| control | 2165 | 816 | 0 | `0x1df8ef184df9a71c` |
+| candidate | 2096 | 678 | 69 | `0x73141741f858b5db` |
+
+Fold 1 was candidate→control. All 256 token IDs were byte-identical across arms and all-rank TP
+agreement passed. The predeclared 0.20 ms TPOT improvement gate failed, so later folds were not
+run:
+
+| metric | control | candidate | candidate − control |
+|---|---:|---:|---:|
+| TTFT | 1504.884 ms | 1506.744 ms | +1.860 ms |
+| TPOT | 29.926394 ms | 30.023260 ms | **+0.096866 ms** |
+| E2E | 9136.114 ms | 9162.676 ms | +26.561 ms |
+
+Artifacts are under `/tmp/k3-gemv-nv0-network-gate`; packet/object hashes are recorded in
+`sha256.txt`. The command shape was:
+
+```text
+K3_FULL=1 PLOW_TOOLCHAIN_LABEL=rocm-7.14.0-nix plowc \
+  --hf-dir /home/shaswot/models/Kimi-K3 --max-ctx 16384 --n-cu 256 --num-gpus 8 \
+  tune gemm --gpu mi350 --obj <current-object-dir> --samples <samples.jsonl> \
+  --shapes auto --lease --campaign k3-gfx950-870078e-requal
+
+gpulease -n 8 k3-gemv-nv0-network <paired-8192-to-256-gate>
+```
+
+The isolated launch saving does not transfer to Plow's persistent global queue. The two control
+packets can overlap and retain narrower work distribution; combining them removes one handoff but
+does not reduce the network critical path. Keep `--experiment-parallel-linear2` default OFF.
