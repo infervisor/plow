@@ -784,6 +784,42 @@ const _: () = assert!(std::mem::size_of::<MoeCombineArgs>() == 48);
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
+struct MoeEpAlignArgs {
+    routes: u64,
+    meta: u64,
+    partial: u64,
+    row_token: u64,
+    row_partidx: u64,
+    row_gate: u64,
+    tokens: u32,
+    topk: u32,
+    experts: u32,
+    expert_begin: u32,
+    expert_end: u32,
+    row_capacity: u32,
+    phase: u32,
+    npart: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeEpAlignArgs>() == 80);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct MoeEpCombineArgs {
+    out: u64,
+    part: u64,
+    routes: u64,
+    tokens: u32,
+    hidden: u32,
+    topk: u32,
+    expert_begin: u32,
+    expert_end: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<MoeEpCombineArgs>() == 48);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
 struct MlaMaterializePackArgs {
     k: u64,
     v: u64,
@@ -865,6 +901,17 @@ struct MoeCombineRoute {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct MoeEpAlignRoute {
+    args: MoeEpAlignArgs,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MoeEpCombineRoute {
+    args: MoeEpCombineArgs,
+    grid: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
 enum PrefillSegmentRoute {
     Interpreter,
     XReduceWaveRs,
@@ -894,6 +941,9 @@ enum PrefillSegmentRoute {
     MoeStage1A4Reuse(MoeStage1A4ReuseRoute),
     MoeStage2Mxfp4(MoeStage2Mxfp4Route),
     MoeCombine(MoeCombineRoute),
+    MoeEpAlign(MoeEpAlignRoute),
+    MoeEpStage2(MoeStage2Mxfp4Route),
+    MoeEpCombine(MoeEpCombineRoute),
     MlaMaterializePack {
         args: MlaMaterializePackArgs,
         grid: u32,
@@ -1163,6 +1213,58 @@ fn moe_combine_inst(d: &DevInst64) -> bool {
         && d.i[1] == 16
         && d.i[2] != 0
         && d.i[3..].iter().all(|&v| v == 0)
+        && d.fj.iter().all(|&v| v == 0)
+}
+
+fn moe_ep_degree(d: &DevInst64) -> Option<u32> {
+    let degree = match DevOp::from_u16(d.op) {
+        Some(DevOp::MoeAlignPf | DevOp::MoeCombinePf) => d.i[5],
+        Some(DevOp::MoeGroupGluPf | DevOp::MoeGroupDownPf) => d.i[6],
+        _ => 0,
+    };
+    (degree > 1).then_some(degree)
+}
+
+fn moe_ep_stage1_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::MoeGroupGluPf as u16
+        && d.i[0] >= 256
+        && d.i[0].is_multiple_of(128)
+        && d.i[1].is_multiple_of(128)
+        && d.i[2] >= d.i[6]
+        && d.i[3] == MOE_ENC_MXFP4
+        && d.i[4] == 0
+        && d.i[5] <= 2
+        && d.i[6] > 1
+        && d.i[7] == 0
+        && d.t.iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+}
+
+fn moe_ep_stage2_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::MoeGroupDownPf as u16
+        && d.i[0].is_multiple_of(16)
+        && d.i[1].is_multiple_of(128)
+        && d.i[2] >= d.i[6]
+        && d.i[3] == MOE_ENC_MXFP4
+        && d.i[4] == 0
+        && d.i[5] == 0
+        && d.i[6] > 1
+        && d.i[7] == 0
+        && d.t[5..=7].iter().all(|&t| t != packet::dev::TENSOR_NONE16)
+}
+
+fn moe_ep_combine_inst(d: &DevInst64) -> bool {
+    d.op == DevOp::MoeCombinePf as u16
+        && d.t[0] != packet::dev::TENSOR_NONE16
+        && d.t[3] != packet::dev::TENSOR_NONE16
+        && d.t[4] != packet::dev::TENSOR_NONE16
+        && d.i[0] != 0
+        && d.i[1] == 16
+        && d.i[2] > 1
+        && d.i[3] == 0
+        && d.i[4] == 0
+        && d.i[5] > 1
+        && d.i[6] >= d.i[5]
+        && d.i[7] == 0
         && d.fj.iter().all(|&v| v == 0)
 }
 
@@ -1473,11 +1575,75 @@ fn has_moe_combine_segment(prog: &DevProg) -> bool {
         .any(|set| set.len() == 1 && moe_combine_inst(&prog.insts[*set.first().unwrap()]))
 }
 
+fn has_moe_prefill_ep(prog: &DevProg) -> bool {
+    prog.insts.iter().any(|d| moe_ep_degree(d).is_some())
+}
+
+fn moe_prefill_ep_extra_bytes(
+    progs: &[DevProg],
+    tensors: &[crate::asset::devblob::DevTensor],
+    n_gpu: u32,
+) -> Result<u64> {
+    let mut tables = BTreeSet::new();
+    let mut total = 0u64;
+    for d in progs.iter().flat_map(|p| &p.insts) {
+        if !moe_ep_stage1_inst(d) || !tables.insert(d.t[2]) {
+            continue;
+        }
+        let degree = moe_ep_degree(d).expect("EP stage-1 carries a degree");
+        if degree != n_gpu || d.i[3] != MOE_ENC_MXFP4 || d.i[0] % 32 != 0 {
+            return Err(RuntimeError::Device(
+                "EP memory budget has unsupported geometry".into(),
+            ));
+        }
+        let local_experts = packet::moe_ep::balanced_expert_range(d.i[2], n_gpu, 0).len() as u64;
+        let h = u64::from(d.i[1]);
+        let i = u64::from(d.i[0]);
+        let matrix_payload = h
+            .checked_mul(i)
+            .and_then(|n| n.checked_div(2))
+            .ok_or_else(|| RuntimeError::Device("EP payload budget overflows".into()))?;
+        let matrix_scales = h
+            .checked_mul(i / 32)
+            .ok_or_else(|| RuntimeError::Device("EP scale budget overflows".into()))?;
+        let main = matrix_payload
+            .checked_add(matrix_scales)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or_else(|| RuntimeError::Device("EP primary expert budget overflows".into()))?;
+        let has_moe2 = tensors.get(d.t[2] as usize).is_some_and(|td| {
+            td.name
+                .strip_suffix("expert_weight_table_ep")
+                .is_some_and(|pfx| {
+                    tensors
+                        .iter()
+                        .any(|t| t.name == format!("{pfx}expert_weight_table_moe2_ep"))
+                })
+        });
+        let moe2 = if has_moe2 {
+            let padded_scale = h.div_ceil(256) * 256 * (i.div_ceil(32).div_ceil(8) * 8);
+            matrix_payload
+                .checked_add(padded_scale)
+                .ok_or_else(|| RuntimeError::Device("EP stage-2 budget overflows".into()))?
+        } else {
+            0
+        };
+        total = total
+            .checked_add(
+                local_experts
+                    .checked_mul(main + moe2)
+                    .ok_or_else(|| RuntimeError::Device("EP resident budget overflows".into()))?,
+            )
+            .ok_or_else(|| RuntimeError::Device("EP resident budget overflows".into()))?;
+    }
+    Ok(total)
+}
+
 fn moe_mxfp4_routes_with_scratch(
     prog: &DevProg,
     tensors: &[crate::asset::devblob::DevTensor],
     devp: &[DeviceMem],
     stage1_a4_scratch: Option<(u64, u64)>,
+    ep_bind: Option<(u32, u32)>,
 ) -> Result<Vec<PrefillSegmentRoute>> {
     let n_seg = prog
         .stream
@@ -1511,10 +1677,13 @@ fn moe_mxfp4_routes_with_scratch(
                 tensors.len()
             ))
         })?;
-        let Some(pfx) = td.name.strip_suffix(from) else {
+        let name = if let Some(pfx) = td.name.strip_suffix(&format!("{from}_ep")) {
+            format!("{pfx}{to}_ep")
+        } else if let Some(pfx) = td.name.strip_suffix(from) {
+            format!("{pfx}{to}")
+        } else {
             return Ok(None);
         };
-        let name = format!("{pfx}{to}");
         let Some(ix) = tensors.iter().position(|t| t.name == name) else {
             return Ok(None);
         };
@@ -1526,6 +1695,114 @@ fn moe_mxfp4_routes_with_scratch(
     };
     let mut routes = Vec::with_capacity(n_seg);
     for (seg, set) in members.into_iter().enumerate() {
+        let ep_members: Vec<_> = set
+            .iter()
+            .filter_map(|&i| {
+                prog.insts
+                    .get(i)
+                    .and_then(|d| moe_ep_degree(d).map(|n| (d, n)))
+            })
+            .collect();
+        if !ep_members.is_empty() {
+            let (rank, n_gpu) = ep_bind.ok_or_else(|| {
+                RuntimeError::Device(format!(
+                    "program T={} segment {seg} declares expert parallelism without a TP binding",
+                    prog.t
+                ))
+            })?;
+            if rank >= n_gpu
+                || ep_members.len() != set.len()
+                || ep_members.iter().any(|(_, degree)| *degree != n_gpu)
+            {
+                return Err(RuntimeError::Device(format!(
+                    "program T={} segment {seg} has a mixed or topology-mismatched EP boundary",
+                    prog.t
+                )));
+            }
+            if ep_members
+                .iter()
+                .all(|(d, _)| d.op == DevOp::MoeAlignPf as u16)
+            {
+                let first = ep_members[0].0;
+                if first.i[0] != prog.t
+                    || first.i[1] == 0
+                    || first.i[2] != 16
+                    || ep_members.iter().any(|(d, _)| {
+                        d.t[..5] != first.t[..5]
+                            || d.i[0] != first.i[0]
+                            || d.i[1] != first.i[1]
+                            || d.i[2] != first.i[2]
+                    })
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "program T={} segment {seg} has an invalid EP align packet set",
+                        prog.t
+                    )));
+                }
+                let range = packet::moe_ep::balanced_expert_range(first.i[1], n_gpu, rank);
+                let row_bytes = tensors
+                    .get(first.t[2] as usize)
+                    .ok_or_else(|| RuntimeError::Device("EP row-token handle is invalid".into()))?
+                    .bytes;
+                if !row_bytes.is_multiple_of(4) {
+                    return Err(RuntimeError::Device(
+                        "EP row-token tensor is misaligned".into(),
+                    ));
+                }
+                let meta = addr(first.t[0], "meta")?;
+                let meta_words = u64::from(first.i[1])
+                    .checked_mul(67)
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or_else(|| RuntimeError::Device("EP metadata size overflows".into()))?;
+                let meta_bytes = meta_words.checked_mul(4).ok_or_else(|| {
+                    RuntimeError::Device("EP metadata byte size overflows".into())
+                })?;
+                let declared_meta_bytes = tensors
+                    .get(first.t[0] as usize)
+                    .ok_or_else(|| RuntimeError::Device("EP metadata handle is invalid".into()))?
+                    .bytes;
+                if declared_meta_bytes < meta_bytes {
+                    return Err(RuntimeError::Device(format!(
+                        "EP metadata allocation is {declared_meta_bytes} B; {meta_bytes} B required"
+                    )));
+                }
+                let partial = meta
+                    + u64::from(first.i[1])
+                        .checked_mul(3)
+                        .and_then(|n| n.checked_add(1))
+                        .and_then(|n| n.checked_mul(4))
+                        .ok_or_else(|| {
+                            RuntimeError::Device("EP partial-histogram offset overflows".into())
+                        })?;
+                routes.push(PrefillSegmentRoute::MoeEpAlign(MoeEpAlignRoute {
+                    args: MoeEpAlignArgs {
+                        routes: addr(first.t[1], "routes")?,
+                        meta,
+                        partial,
+                        row_token: addr(first.t[2], "row_token")?,
+                        row_partidx: addr(first.t[3], "row_partidx")?,
+                        row_gate: addr(first.t[4], "row_gate")?,
+                        tokens: first.i[0],
+                        topk: first.i[2],
+                        experts: first.i[1],
+                        expert_begin: range.start,
+                        expert_end: range.end,
+                        row_capacity: u32::try_from(row_bytes / 4).map_err(|_| {
+                            RuntimeError::Device("EP row capacity exceeds u32".into())
+                        })?,
+                        phase: 0,
+                        npart: 64,
+                    },
+                }));
+                continue;
+            }
+            if set.len() != 1 {
+                return Err(RuntimeError::Device(format!(
+                    "program T={} segment {seg} mixes multiple EP specialist packets",
+                    prog.t
+                )));
+            }
+        }
         let encoded_xreduce_attnres = set
             .iter()
             .find_map(|&i| prog.insts.get(i).filter(|d| xreduce_attnres_encoded(d)));
@@ -1543,6 +1820,122 @@ fn moe_mxfp4_routes_with_scratch(
         if set.len() == 1 {
             let i = *set.first().unwrap();
             let d = &prog.insts[i];
+            if moe_ep_stage1_inst(d) {
+                let (a4, a4_scale) = stage1_a4_scratch.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "EP stage-1 requires the reusable A4 quantization scratch".into(),
+                    )
+                })?;
+                let row_bytes = tensors
+                    .get(d.t[5] as usize)
+                    .ok_or_else(|| RuntimeError::Device("EP row-token handle is invalid".into()))?
+                    .bytes;
+                let row_capacity = u32::try_from(row_bytes / 4)
+                    .map_err(|_| RuntimeError::Device("EP row capacity exceeds u32".into()))?;
+                let grid = row_capacity
+                    .div_ceil(64)
+                    .checked_mul(d.i[0].div_ceil(128))
+                    .ok_or_else(|| RuntimeError::Device("EP stage-1 grid overflows".into()))?;
+                routes.push(PrefillSegmentRoute::MoeStage1A4Reuse(
+                    MoeStage1A4ReuseRoute {
+                        quant_args: MoeStage1A4QuantArgs {
+                            out: a4,
+                            out_scale: a4_scale,
+                            activation: addr(d.t[1], "activation")?,
+                            row_token: addr(d.t[5], "row_token")?,
+                            meta: addr(d.t[4], "meta")?,
+                            row_capacity,
+                            experts: d.i[2],
+                            hidden: d.i[1],
+                        },
+                        args: MoeStage1A4ReuseArgs {
+                            out: addr(d.t[0], "out")?,
+                            activation: a4,
+                            weight_table: addr(d.t[2], "weight_table")?,
+                            activation_scale: a4_scale,
+                            weight_scale_table: addr(d.t[3], "weight_scale_table")?,
+                            meta: addr(d.t[4], "meta")?,
+                            row_partidx: addr(d.t[6], "row_partidx")?,
+                            out_scale: addr(d.t[7], "out_scale")?,
+                            inter: d.i[0],
+                            hidden: d.i[1],
+                            experts: d.i[2],
+                            act: d.i[5],
+                            beta: f32::from_bits(d.fj[0]),
+                            linear_beta: f32::from_bits(d.fj[1]),
+                        },
+                        quant_grid: 1024,
+                        grid,
+                    },
+                ));
+                continue;
+            }
+            if moe_ep_combine_inst(d) {
+                let (rank, n_gpu) = ep_bind.expect("EP segment binding checked above");
+                let range = packet::moe_ep::balanced_expert_range(d.i[6], n_gpu, rank);
+                let grid = d.i[2]
+                    .checked_mul(d.i[0].div_ceil(256))
+                    .ok_or_else(|| RuntimeError::Device("EP combine grid overflows".into()))?;
+                routes.push(PrefillSegmentRoute::MoeEpCombine(MoeEpCombineRoute {
+                    args: MoeEpCombineArgs {
+                        out: addr(d.t[0], "out")?,
+                        part: addr(d.t[3], "part")?,
+                        routes: addr(d.t[4], "routes")?,
+                        tokens: d.i[2],
+                        hidden: d.i[0],
+                        topk: d.i[1],
+                        expert_begin: range.start,
+                        expert_end: range.end,
+                    },
+                    grid,
+                }));
+                continue;
+            }
+            if moe_ep_stage2_inst(d) {
+                let weight_table =
+                    companion(d.t[2], "expert_weight_table", "expert_weight_table_moe2")?
+                        .ok_or_else(|| {
+                            RuntimeError::Device(
+                                "EP stage-2 requires its shuffled down-weight companion table"
+                                    .into(),
+                            )
+                        })?;
+                let weight_scale_table =
+                    companion(d.t[3], "expert_scale_table", "expert_scale_table_moe2")?
+                        .ok_or_else(|| {
+                            RuntimeError::Device(
+                                "EP stage-2 requires its shuffled down-scale companion table"
+                                    .into(),
+                            )
+                        })?;
+                let rows = tensors
+                    .get(d.t[6] as usize)
+                    .ok_or_else(|| RuntimeError::Device("EP row-part handle is invalid".into()))?
+                    .bytes
+                    / 4;
+                let grid = u64::from(d.i[0].div_ceil(256))
+                    .checked_mul(rows.div_ceil(64) * 2)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| RuntimeError::Device("EP stage-2 grid overflows".into()))?;
+                routes.push(PrefillSegmentRoute::MoeEpStage2(MoeStage2Mxfp4Route {
+                    args: MoeStage2Mxfp4Args {
+                        part: addr(d.t[0], "part")?,
+                        activation: addr(d.t[1], "activation")?,
+                        weight_table,
+                        activation_scale: addr(d.t[5], "activation_scale")?,
+                        weight_scale_table,
+                        meta: addr(d.t[4], "meta")?,
+                        row_partidx: addr(d.t[6], "row_partidx")?,
+                        row_gate: addr(d.t[7], "row_gate")?,
+                        model_dim: d.i[0],
+                        inter_dim: d.i[1],
+                        experts: d.i[2],
+                        reserved: 0,
+                    },
+                    grid,
+                }));
+                continue;
+            }
             if xreduce_attnres_inst(d) {
                 routes.push(PrefillSegmentRoute::XReduceAttnRes {
                     args: XReduceAttnResArgs {
@@ -1783,7 +2176,7 @@ fn moe_mxfp4_routes(
     tensors: &[crate::asset::devblob::DevTensor],
     devp: &[DeviceMem],
 ) -> Result<Vec<PrefillSegmentRoute>> {
-    moe_mxfp4_routes_with_scratch(prog, tensors, devp, None)
+    moe_mxfp4_routes_with_scratch(prog, tensors, devp, None, None)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2642,6 +3035,18 @@ fn check_kda_intra_wave_items_symbols<'a>(syms: &[&'a str], path: &Path) -> Resu
             "KDA-intra wave-item object {} has no packet-pairing stamp",
             path.display()
         )));
+    }
+    Ok(())
+}
+
+fn check_moe_ep_symbols(syms: &[&str], path: &Path, markers: &[&str]) -> Result<()> {
+    for marker in markers {
+        if !syms.contains(marker) {
+            return Err(RuntimeError::Device(format!(
+                "EP object {} lacks required ABI/resource marker {marker}",
+                path.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -4898,14 +5303,18 @@ fn bind_packed_experts(
     do_prefault: bool,
     populate: bool,
 ) -> Result<(Vec<DeviceMem>, u64)> {
-    let layers: Vec<(usize, String)> = blob
+    let layers: Vec<(usize, String, bool)> = blob
         .tensors
         .iter()
         .enumerate()
         .filter_map(|(i, td)| {
-            td.name
-                .strip_suffix("expert_weight_table")
-                .map(|pfx| (i, pfx.to_string()))
+            if let Some(pfx) = td.name.strip_suffix("expert_weight_table_ep") {
+                Some((i, pfx.to_string(), true))
+            } else {
+                td.name
+                    .strip_suffix("expert_weight_table")
+                    .map(|pfx| (i, pfx.to_string(), false))
+            }
         })
         .collect();
     if layers.is_empty() {
@@ -4945,6 +5354,17 @@ fn bind_packed_experts(
     // instruction streams experts through it` on a program that streams them perfectly well.
     let dec = blob.progs.last().expect("checked non-empty");
     let i_moe_of = |i_ewt: usize| -> Option<u64> {
+        let ep_full = blob
+            .progs
+            .iter()
+            .flat_map(|p| &p.insts)
+            .find(|d| {
+                d.op == DevOp::MoeGroupGluPf as u16 && d.t[2] as usize == i_ewt && d.i[6] == n_gpu
+            })
+            .map(|d| d.i[0] as u64);
+        if ep_full.is_some() {
+            return ep_full;
+        }
         dec.insts.iter().find_map(|d| {
             if d.t[3] as usize == i_ewt && GLU_ARMS.iter().any(|&o| o as u16 == d.op) {
                 Some(d.i[1] as u64)
@@ -4963,10 +5383,15 @@ fn bind_packed_experts(
     // the resolved answer belongs in the record rather than in a debug session.
     let mut layout = String::from("none");
     let mut wbytes = 0u64;
-    for (i_ewt, pfx) in &layers {
+    for (i_ewt, pfx, ep_table) in &layers {
+        let table_suffix = if *ep_table {
+            "expert_scale_table_ep"
+        } else {
+            "expert_scale_table"
+        };
         let i_est = names
             .iter()
-            .position(|x| *x == format!("{pfx}expert_scale_table"))
+            .position(|x| *x == format!("{pfx}{table_suffix}"))
             .ok_or_else(|| {
                 RuntimeError::Device(format!(
                     "{pfx}expert_weight_table has no matching expert_scale_table"
@@ -5059,12 +5484,22 @@ fn bind_packed_experts(
         } else {
             (None, None)
         };
+        let moe2_weight_suffix = if *ep_table {
+            "expert_weight_table_moe2_ep"
+        } else {
+            "expert_weight_table_moe2"
+        };
+        let moe2_scale_suffix = if *ep_table {
+            "expert_scale_table_moe2_ep"
+        } else {
+            "expert_scale_table_moe2"
+        };
         let i_ewt_moe2 = names
             .iter()
-            .position(|x| *x == format!("{pfx}expert_weight_table_moe2"));
+            .position(|x| *x == format!("{pfx}{moe2_weight_suffix}"));
         let i_est_moe2 = names
             .iter()
-            .position(|x| *x == format!("{pfx}expert_scale_table_moe2"));
+            .position(|x| *x == format!("{pfx}{moe2_scale_suffix}"));
         if i_ewt_moe2.is_some() != i_est_moe2.is_some() {
             return Err(RuntimeError::Device(format!(
                 "{pfx}: lean MoE stage-2 weight and scale companion tables must be declared together"
@@ -6346,6 +6781,9 @@ pub struct AmdEngine {
     _moe_stage1_a4_scratch: Option<DeviceMem>,
     k_moe_stage2_mxfp4: Option<HsaKernel>,
     k_moe_combine: Option<HsaKernel>,
+    k_moe_ep_align: Option<HsaKernel>,
+    k_moe_ep_stage2: Option<HsaKernel>,
+    k_moe_ep_combine: Option<HsaKernel>,
     /// Spill-free interpreter containing only marked XReduceTwoShot segments.
     k_xreduce_wave_rs: Option<HsaKernel>,
     k_mla_materialize_pack: Option<HsaKernel>,
@@ -6992,10 +7430,52 @@ impl AmdEngine {
         let need_moe_stage2_lean = blob.progs[..dec_ix]
             .iter()
             .any(has_moe_stage2_mxfp4_segment);
-        let need_moe_stage1_lean = blob.progs[..dec_ix]
-            .iter()
-            .any(has_moe_stage1_mxfp4_segment);
+        let need_moe_ep = blob.progs[..dec_ix].iter().any(has_moe_prefill_ep);
+        let need_moe_stage1_lean = need_moe_ep
+            || blob.progs[..dec_ix]
+                .iter()
+                .any(has_moe_stage1_mxfp4_segment);
         let need_moe_combine_lean = blob.progs[..dec_ix].iter().any(has_moe_combine_segment);
+        if need_moe_ep {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "replicated-input MoE EP requires gfx950 specialist objects, but this device is {arch}"
+                )));
+            }
+            let bind = tp.ok_or_else(|| {
+                RuntimeError::Device(
+                    "replicated-input MoE EP packet requires a tensor-parallel binding".into(),
+                )
+            })?;
+            if blob.progs[..dec_ix]
+                .iter()
+                .flat_map(|p| &p.insts)
+                .filter_map(moe_ep_degree)
+                .any(|degree| degree != bind.n_gpu)
+            {
+                return Err(RuntimeError::Device(format!(
+                    "replicated-input MoE EP packet topology does not match TP{}",
+                    bind.n_gpu
+                )));
+            }
+            let extra =
+                moe_prefill_ep_extra_bytes(&blob.progs[..dec_ix], &blob.tensors, bind.n_gpu)?;
+            let allowed = std::env::var("PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .ok_or_else(|| RuntimeError::Device(format!(
+                    "replicated-input MoE EP requires {extra} additional resident bytes per rank for decode-safe companion weights; set PLOW_MOE_PREFILL_EP_MAX_EXTRA_BYTES to an audited capacity >= that value"
+                )))?;
+            if extra > allowed {
+                return Err(RuntimeError::Device(format!(
+                    "replicated-input MoE EP requires {extra} additional resident bytes per rank, exceeding the audited {allowed}-byte allowance"
+                )));
+            }
+            tracing::info!(
+                extra_resident_bytes_per_rank = extra,
+                "accepted decode-safe MoE EP companion-weight budget"
+            );
+        }
         let need_mla_materialized = blob.progs[..dec_ix].iter().any(|p| {
             p.insts.iter().any(|d| {
                 d.op == DevOp::MlaMaterializePack as u16
@@ -8203,6 +8683,86 @@ impl AmdEngine {
             None
         };
 
+        let (k_moe_ep_align, k_moe_ep_stage2, k_moe_ep_combine) = if need_moe_ep {
+            let mut load_ep = |name: &str,
+                               symbol: &str,
+                               markers: &[&str],
+                               want: u32,
+                               dynamic_lds: u32|
+             -> Result<HsaKernel> {
+                let path = hsaco_dir.join(name);
+                if !path.exists() {
+                    return Err(RuntimeError::Device(format!(
+                        "EP packet requires missing specialist object {}",
+                        path.display()
+                    )));
+                }
+                let image = std::fs::read(&path).map_err(|e| {
+                    RuntimeError::Device(format!("code object {}: {e}", path.display()))
+                })?;
+                let syms = elf_symbol_names(&image);
+                check_moe_ep_symbols(&syms, &path, markers)?;
+                let module = EngineDevice::module_load(&*be, &image)?;
+                let kernel = EngineDevice::get_function(&*be, &module, symbol).map_err(|e| {
+                    RuntimeError::Device(format!("{name}: no symbol {symbol}: {e}"))
+                })?;
+                if ![want, want + 256].contains(&kernel.kernarg_size())
+                    || kernel.private_segment_size() != 0
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "{name}: EP ABI/resource gate failed (args={}, private={})",
+                        kernel.kernarg_size(),
+                        kernel.private_segment_size()
+                    )));
+                }
+                if dynamic_lds != 0 {
+                    EngineDevice::set_max_dynamic_smem(&*be, kernel, dynamic_lds)?;
+                }
+                modules.push(module);
+                Ok(kernel)
+            };
+            let align = load_ep(
+                "moe_ep_align_gfx950.elf",
+                "plow_moe_ep_filter_align_gfx950",
+                &[
+                    "plow_moe_ep_filter_align_abi_1",
+                    "plow_moe_ep_filter_align_wave64_1",
+                    "plow_moe_ep_filter_align_stable_1",
+                    "plow_moe_ep_filter_align_parallel_1",
+                    "plow_moe_ep_filter_align_no_spill_1",
+                ],
+                std::mem::size_of::<MoeEpAlignArgs>() as u32,
+                0,
+            )?;
+            let stage2 = load_ep(
+                "moe_ep_stage2_gfx950.elf",
+                "plow_moe2_ep_full_i_16x16x128_gfx950",
+                &[
+                    "plow_moe2_mxfp4_stage2_abi_3",
+                    "plow_moe2_mxfp4_stage2_no_spill_1",
+                    "plow_moe2_ep_full_i_3072",
+                    "plow_moe2_ep_full_i_vgpr_le_128",
+                ],
+                std::mem::size_of::<MoeStage2Mxfp4Args>() as u32,
+                4_352,
+            )?;
+            let combine = load_ep(
+                "moe_ep_combine_gfx950.elf",
+                "plow_moe_ep_combine_gfx950",
+                &[
+                    "plow_moe_ep_combine_abi_1",
+                    "plow_moe_ep_combine_fixed_slot_1",
+                    "plow_moe_ep_combine_wave64_1",
+                    "plow_moe_ep_combine_no_spill_1",
+                ],
+                std::mem::size_of::<MoeEpCombineArgs>() as u32,
+                0,
+            )?;
+            (Some(align), Some(stage2), Some(combine))
+        } else {
+            (None, None, None)
+        };
+
         let mut load_mla_raw = |name: &str,
                                 symbol: &str,
                                 markers: &[&str],
@@ -8827,7 +9387,13 @@ impl AmdEngine {
                 vec![DecodeSegmentRoute::Interpreter; seg_class.len()]
             };
             let mut prefill_routes = if prog_ix < dec_ix {
-                moe_mxfp4_routes_with_scratch(p, &blob.tensors, &devp, stage1_a4_scratch)?
+                moe_mxfp4_routes_with_scratch(
+                    p,
+                    &blob.tensors,
+                    &devp,
+                    stage1_a4_scratch,
+                    tp.map(|b| (b.rank, b.n_gpu)),
+                )?
             } else {
                 vec![PrefillSegmentRoute::Interpreter; seg_class.len()]
             };
@@ -8871,6 +9437,15 @@ impl AmdEngine {
                             | PrefillSegmentRoute::MlaMaterializedPrefill { .. }
                     )
                 });
+                let has_ep = prefill_routes.iter().any(|r| {
+                    matches!(
+                        r,
+                        PrefillSegmentRoute::MoeEpAlign(_)
+                            | PrefillSegmentRoute::MoeStage1A4Reuse(_)
+                            | PrefillSegmentRoute::MoeEpStage2(_)
+                            | PrefillSegmentRoute::MoeEpCombine(_)
+                    )
+                }) && has_moe_prefill_ep(p);
                 let dispatch = ProgramDispatch::classify(
                     p.l2_domains,
                     seg_class.len(),
@@ -8879,6 +9454,12 @@ impl AmdEngine {
                 if has_materialized && !prefill_segment_specialization_allowed(dispatch) {
                     return Err(RuntimeError::Device(format!(
                         "prefill program {prog_ix} (T={}) places materialized MLA raw opcodes in L2-domain windows; standalone objects require ordered wave segments",
+                        p.t
+                    )));
+                }
+                if has_ep && !prefill_segment_specialization_allowed(dispatch) {
+                    return Err(RuntimeError::Device(format!(
+                        "prefill program {prog_ix} (T={}) places expert-parallel raw opcodes in L2-domain windows; standalone objects require ordered wave segments",
                         p.t
                     )));
                 }
@@ -9411,6 +9992,9 @@ impl AmdEngine {
             _moe_stage1_a4_scratch: d_moe_stage1_a4_scratch,
             k_moe_stage2_mxfp4,
             k_moe_combine,
+            k_moe_ep_align,
+            k_moe_ep_stage2,
+            k_moe_ep_combine,
             k_xreduce_wave_rs,
             k_mla_materialize_pack,
             k_mla_materialized_prefill,
@@ -9947,6 +10531,15 @@ impl AmdEngine {
                 PrefillSegmentRoute::MoeCombine(_) if self.k_moe_combine.is_some() => {
                     return "moe_combine";
                 }
+                PrefillSegmentRoute::MoeEpAlign(_) if self.k_moe_ep_align.is_some() => {
+                    return "moe_ep_align";
+                }
+                PrefillSegmentRoute::MoeEpStage2(_) if self.k_moe_ep_stage2.is_some() => {
+                    return "moe_ep_stage2";
+                }
+                PrefillSegmentRoute::MoeEpCombine(_) if self.k_moe_ep_combine.is_some() => {
+                    return "moe_ep_combine";
+                }
                 _ => {}
             }
         }
@@ -10174,6 +10767,26 @@ impl AmdEngine {
                 self.seg_launches += 1;
                 return Ok(());
             }
+            if let (Some(kernel), Some(PrefillSegmentRoute::MoeEpAlign(route))) = (
+                self.k_moe_ep_align,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                for (phase, grid) in [(1, 64), (2, 1), (3, 64), (4, 64)] {
+                    let mut args = route.args;
+                    args.phase = phase;
+                    EngineDevice::launch_kernel(
+                        &*self.be,
+                        kernel,
+                        grid,
+                        256,
+                        0,
+                        as_bytes(std::slice::from_ref(&args)),
+                        None,
+                    )?;
+                }
+                self.seg_launches += 4;
+                return Ok(());
+            }
             if let (Some(quant), Some(kernel), Some(PrefillSegmentRoute::MoeStage1A4Reuse(route))) = (
                 self.k_moe_stage1_a4_quant,
                 self.k_moe_stage1_a4_reuse,
@@ -10216,8 +10829,40 @@ impl AmdEngine {
                 self.seg_launches += 1;
                 return Ok(());
             }
+            if let (Some(kernel), Some(PrefillSegmentRoute::MoeEpStage2(route))) = (
+                self.k_moe_ep_stage2,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    route.grid,
+                    256,
+                    4_352,
+                    as_bytes(std::slice::from_ref(&route.args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
             if let (Some(kernel), Some(PrefillSegmentRoute::MoeCombine(route))) = (
                 self.k_moe_combine,
+                self.progs[p].prefill_routes.get(seg).copied(),
+            ) {
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    kernel,
+                    route.grid,
+                    256,
+                    0,
+                    as_bytes(std::slice::from_ref(&route.args)),
+                    None,
+                )?;
+                self.seg_launches += 1;
+                return Ok(());
+            }
+            if let (Some(kernel), Some(PrefillSegmentRoute::MoeEpCombine(route))) = (
+                self.k_moe_ep_combine,
                 self.progs[p].prefill_routes.get(seg).copied(),
             ) {
                 EngineDevice::launch_kernel(
@@ -12226,6 +12871,26 @@ mod tests {
     }
 
     #[test]
+    fn expert_parallel_loader_requires_every_abi_and_resource_marker() {
+        let required = [
+            "plow_moe_ep_filter_align_abi_1",
+            "plow_moe_ep_filter_align_wave64_1",
+            "plow_moe_ep_filter_align_stable_1",
+            "plow_moe_ep_filter_align_no_spill_1",
+        ];
+        let path = Path::new("moe_ep_align_gfx950.elf");
+        assert!(check_moe_ep_symbols(&required, path, &required).is_ok());
+        let mut stale = required.to_vec();
+        stale.pop();
+        let err = check_moe_ep_symbols(&stale, path, &required)
+            .expect_err("a stale specialist object must fail closed")
+            .to_string();
+        assert!(err.contains("plow_moe_ep_filter_align_no_spill_1"));
+        assert_eq!(std::mem::size_of::<MoeEpAlignArgs>(), 80);
+        assert_eq!(std::mem::size_of::<MoeEpCombineArgs>(), 48);
+    }
+
+    #[test]
     fn pairing_stamp_is_read_from_elf_data() {
         let mut elf = vec![0u8; 0x304];
         elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
@@ -13098,9 +13763,14 @@ mod tests {
         let (payload, scales) =
             moe_stage1_a4_scratch_bytes(std::slice::from_ref(&prog), &tensors).unwrap();
         assert_eq!((payload, scales), (rows * 3584 / 2, rows * 3584 / 32));
-        let routes =
-            moe_mxfp4_routes_with_scratch(&prog, &tensors, &devp, Some((0x8000_0000, 0x9000_0000)))
-                .unwrap();
+        let routes = moe_mxfp4_routes_with_scratch(
+            &prog,
+            &tensors,
+            &devp,
+            Some((0x8000_0000, 0x9000_0000)),
+            None,
+        )
+        .unwrap();
         let PrefillSegmentRoute::MoeStage1A4Reuse(route) = routes[1] else {
             panic!("profitable three-N-tile shape must select A4 reuse")
         };
@@ -13116,13 +13786,118 @@ mod tests {
         assert_eq!(route.grid, rows.div_ceil(64) as u32 * 3);
 
         prog.insts[1].i[0] = 256;
-        let fallback =
-            moe_mxfp4_routes_with_scratch(&prog, &tensors, &devp, Some((0x8000_0000, 0x9000_0000)))
-                .unwrap();
+        let fallback = moe_mxfp4_routes_with_scratch(
+            &prog,
+            &tensors,
+            &devp,
+            Some((0x8000_0000, 0x9000_0000)),
+            None,
+        )
+        .unwrap();
         assert!(matches!(
             fallback[1],
             PrefillSegmentRoute::MoeStage1Mxfp4(_)
         ));
+    }
+
+    #[test]
+    fn replicated_prefill_ep_routes_full_i_and_balanced_whole_experts() {
+        let mut prog = segmented_prog(
+            &[
+                DevOp::MoeAlignPf,
+                DevOp::MoeGroupGluPf,
+                DevOp::MoeGroupDownPf,
+                DevOp::MoeCombinePf,
+            ],
+            &[0, 1, 2, 3],
+        );
+        prog.t = 8192;
+        prog.insts[0].t = [0, 1, 2, 3, 4, 0, 0, 0];
+        prog.insts[0].i = [8192, 896, 16, 0, 0, 8, 0, 0];
+        prog.insts[1].t = [8, 5, 6, 7, 0, 2, 3, 9];
+        prog.insts[1].i = [3072, 3584, 896, MOE_ENC_MXFP4, 0, 2, 8, 0];
+        prog.insts[1].fj = [4.0f32.to_bits(), 25.0f32.to_bits(), 0];
+        prog.insts[2].t = [10, 8, 6, 7, 0, 9, 3, 4];
+        prog.insts[2].i = [3584, 3072, 896, MOE_ENC_MXFP4, 0, 0, 8, 0];
+        prog.insts[3].t = [11, 0, 0, 10, 1, 0, 0, 0];
+        prog.insts[3].i = [3584, 16, 8192, 0, 0, 8, 896, 0];
+
+        let rows = 8192u64 * 16;
+        let mut tensors: Vec<_> = (0..14)
+            .map(|i| crate::asset::devblob::DevTensor {
+                name: format!("t{i}"),
+                bytes: 0x100,
+                init: None,
+            })
+            .collect();
+        tensors[0].bytes = (67 * 896 + 1) * 4;
+        tensors[2].bytes = rows * 4;
+        tensors[3].bytes = rows * 4;
+        tensors[6].name = "m.expert_weight_table_ep".into();
+        tensors[7].name = "m.expert_scale_table_ep".into();
+        tensors[12].name = "m.expert_weight_table_moe2_ep".into();
+        tensors[13].name = "m.expert_scale_table_moe2_ep".into();
+        let devp: Vec<_> = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| DeviceMem::view(0x1000 + i as u64 * 0x10_0000, t.bytes))
+            .collect();
+
+        let routes = moe_mxfp4_routes_with_scratch(
+            &prog,
+            &tensors,
+            &devp,
+            Some((0x8000_0000, 0x9000_0000)),
+            Some((3, 8)),
+        )
+        .unwrap();
+        let PrefillSegmentRoute::MoeEpAlign(align) = routes[0] else {
+            panic!("EP align did not take its specialist route")
+        };
+        assert_eq!((align.args.expert_begin, align.args.expert_end), (336, 448));
+        assert_eq!(align.args.experts, 896);
+        assert_eq!(align.args.row_capacity, rows as u32);
+        let PrefillSegmentRoute::MoeStage1A4Reuse(stage1) = routes[1] else {
+            panic!("EP stage-1 did not reuse the qualified A4 object")
+        };
+        assert_eq!((stage1.args.inter, stage1.args.experts), (3072, 896));
+        let PrefillSegmentRoute::MoeEpStage2(stage2) = routes[2] else {
+            panic!("EP stage-2 did not take the full-I object")
+        };
+        assert_eq!((stage2.args.inter_dim, stage2.args.experts), (3072, 896));
+        assert_eq!(stage2.args.weight_table, devp[12].base);
+        let PrefillSegmentRoute::MoeEpCombine(combine) = routes[3] else {
+            panic!("EP combine did not take the fixed-slot object")
+        };
+        assert_eq!(
+            (combine.args.expert_begin, combine.args.expert_end),
+            (336, 448)
+        );
+        let matrix_payload = 3584u64 * 3072 / 2;
+        let matrix_scales = 3584u64 * (3072 / 32);
+        assert_eq!(
+            moe_prefill_ep_extra_bytes(std::slice::from_ref(&prog), &tensors, 8).unwrap(),
+            112 * (3 * (matrix_payload + matrix_scales) + matrix_payload + matrix_scales)
+        );
+
+        let err = moe_mxfp4_routes_with_scratch(
+            &prog,
+            &tensors,
+            &devp,
+            Some((0x8000_0000, 0x9000_0000)),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("without a TP binding"));
+        let err = moe_mxfp4_routes_with_scratch(
+            &prog,
+            &tensors,
+            &devp,
+            Some((0x8000_0000, 0x9000_0000)),
+            Some((0, 4)),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("topology-mismatched"));
     }
 
     #[test]
