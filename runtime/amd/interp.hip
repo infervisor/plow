@@ -75,6 +75,8 @@ extern "C" __device__ unsigned plow_decode_mla_segment_object_1 = 1;
 #endif
 #if defined(PLOW_BUCKET_XREDUCE) && defined(PLOW_XR_WAVE_RS) && PLOW_XR_WAVE_RS
 extern "C" __device__ unsigned plow_xreduce_wave_rs_segments_1 = 1;
+extern "C" __device__ unsigned plow_phase_inventory_xreduce_only_1 = 1;
+extern "C" __device__ unsigned plow_phase_xreduce_wave64_occ2_nospill_1 = 1;
 #endif
 #ifndef PLOW_HAS_HEADNORM_HD64
 #define PLOW_HAS_HEADNORM_HD64 1

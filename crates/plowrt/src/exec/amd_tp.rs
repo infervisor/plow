@@ -1381,8 +1381,30 @@ impl AmdTpGroup {
         if segment_major {
             let t = std::time::Instant::now();
             let n_ranks = self.ranks.len();
+            let phase_replay = self.ranks[0].graph_phase_replay(step.prog);
+            if self
+                .ranks
+                .iter()
+                .any(|rank| rank.graph_phase_replay(step.prog) != phase_replay)
+            {
+                return Err(RuntimeError::Device(
+                    "graph phase-object selection differs across TP ranks".into(),
+                ));
+            }
+            if phase_replay {
+                // Reserve every rank before publishing any doorbell. Rank-first
+                // chain commit recreates the measured TP desynchronization bug.
+                for rank in &self.ranks {
+                    rank.begin_graph_phase_replay(step.prog)?;
+                }
+            }
             for (seg, rank) in segment_major_order(launches, n_ranks) {
                 self.ranks[rank].enqueue_segment(step.prog, seg)?;
+            }
+            if phase_replay {
+                for rank in &self.ranks {
+                    rank.commit_graph_phase_replay()?;
+                }
             }
             ttft::PF_ENQUEUE.add(t.elapsed().as_nanos() as u64);
 

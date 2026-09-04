@@ -58,6 +58,26 @@ segment family because focused XReduce objects are spill-free while the ordinary
 prefill interpreter still carries private memory. AQL replay is the transport,
 not the performance lever.
 
+## Runtime prototype
+
+The default-off `PLOW_PHASE_OBJECTS=1` path now splits eligible XReduceTwoShot
+segments at compile time and selects them only from `dispatch_chains`. Selection
+fails closed unless program ids, segment counts, contiguous phase bounds,
+ordinary topology, reachable opcode inventory, wave size, occupancy, spill,
+and private-memory certificates all match the packet itself. The focused object
+also carries explicit XReduce-only and wave64/occupancy-2/no-spill symbols.
+
+For TP, every rank reserves its complete AQL chain before any rank rings a
+doorbell. Existing segment-major rank order is preserved, followed by one drain.
+The runtime and compiler switches remain off by default.
+
+An exact TP8 candidate could not be produced from the current source: the Kimi
+K3 emitter explicitly refuses full-model emission because the hybrid layer loop
+and expert checkpoint-name template are incomplete. The refusal also reproduces
+from a clean worktree and is unrelated to phase selection. Therefore this change
+makes no TP8 device-gain claim and cannot be promoted until that compiler refusal
+is resolved and an exact full-network A/B passes with zero resource regression.
+
 ## Reproduction
 
 Build `runtime/bench/dispatch/aql_launch_floor.{hip,c}`, unbundle the gfx950 code

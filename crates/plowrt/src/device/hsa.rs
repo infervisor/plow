@@ -226,6 +226,8 @@ const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE: u32 = 14;
 // Our AQL queue and kernarg ring sizing (match hsa_backend.c).
 const QUEUE_SIZE: u32 = 1024;
 const KARG_SLOT: usize = 512;
+const CHAIN_IDLE: u64 = u64::MAX;
+const CHAIN_SETUP: u64 = u64::MAX - 1;
 
 // ─── HSA ABI types ───────────────────────────────────────────────────────────
 
@@ -675,6 +677,11 @@ pub struct HsaBackend {
     wave_width: u32,
     /// Monotonically increasing module ID.
     next_module_id: AtomicU64,
+    /// Exclusive single-producer AQL chain reservation. `chain_end != IDLE`
+    /// defers doorbells until every packet in the contiguous reservation is ready.
+    chain_base: AtomicU64,
+    chain_next: AtomicU64,
+    chain_end: AtomicU64,
     /// Reusable zero source + completion signal for [`PeerMemory::zero_peer`].
     /// See `zero_peer` for why the per-token path cannot afford to build these
     /// per call.
@@ -946,6 +953,9 @@ impl HsaBackend {
             lds_bytes,
             wave_width,
             next_module_id: AtomicU64::new(1),
+            chain_base: AtomicU64::new(0),
+            chain_next: AtomicU64::new(0),
+            chain_end: AtomicU64::new(CHAIN_IDLE),
             zero_stage: parking_lot::Mutex::new(None),
             peer_host_writable: std::sync::atomic::AtomicBool::new(false),
             fill_stage: parking_lot::Mutex::new(None),
@@ -1941,13 +1951,30 @@ impl HsaBackend {
         }
         self.guard()?;
         let q = self.queue;
-        let idx = unsafe { (self.shared.drv.hsa_queue_add_write_index_screlease)(q, 1) };
-
-        // Spin until ring has space.
         let size = unsafe { (*q).size } as u64;
-        while idx.wrapping_sub(unsafe { (self.shared.drv.hsa_queue_load_read_index_scacquire)(q) })
-            >= size
-        {}
+        let chain_end = self.chain_end.load(Ordering::Acquire);
+        let idx = if chain_end == CHAIN_IDLE {
+            let idx = unsafe { (self.shared.drv.hsa_queue_add_write_index_screlease)(q, 1) };
+            while idx
+                .wrapping_sub(unsafe { (self.shared.drv.hsa_queue_load_read_index_scacquire)(q) })
+                >= size
+            {}
+            idx
+        } else if chain_end == CHAIN_SETUP {
+            return Err(RuntimeError::Device(
+                "AQL chain dispatch attempted before its reservation was ready".into(),
+            ));
+        } else {
+            let idx = self.chain_next.fetch_add(1, Ordering::Relaxed);
+            if idx >= chain_end {
+                let chain_base = self.chain_base.load(Ordering::Relaxed);
+                return Err(RuntimeError::Device(format!(
+                    "AQL chain emitted more than its reserved {} packets",
+                    chain_end.wrapping_sub(chain_base)
+                )));
+            }
+            idx
+        };
 
         let slot = (idx & (size - 1)) as u32;
         // SAFETY: `size` is the queue's power-of-two capacity, so `slot` is in
@@ -2080,9 +2107,12 @@ impl HsaBackend {
                 .store(header_setup, Ordering::Release);
         }
 
-        // Ring the doorbell.
-        unsafe {
-            (self.shared.drv.hsa_signal_store_screlease)((*q).doorbell_signal, idx as i64);
+        // A prepared chain publishes every header now but rings once after all
+        // TP ranks have been prepared. Ordinary dispatch retains one doorbell.
+        if chain_end == CHAIN_IDLE {
+            unsafe {
+                (self.shared.drv.hsa_signal_store_screlease)((*q).doorbell_signal, idx as i64);
+            }
         }
 
         Ok(())
@@ -3031,6 +3061,67 @@ impl HsaBackend {
         out.resize(max, 0);
         self.download(&DeviceMem::view(addr, max as u64), 0, out)?;
         Ok(true)
+    }
+
+    /// Reserve one contiguous AQL chain without ringing its doorbell. The
+    /// caller must emit exactly `packets` launches and then call
+    /// [`Self::commit_dispatch_chain`]. This is single-producer by HSA queue
+    /// construction and is used only after every route has been preflighted.
+    pub fn begin_dispatch_chain(&self, packets: usize) -> Result<()> {
+        self.guard()?;
+        if packets == 0 {
+            return Err(RuntimeError::Device(
+                "cannot reserve an empty AQL chain".into(),
+            ));
+        }
+        let size = unsafe { (*self.queue).size } as usize;
+        if packets > size {
+            return Err(RuntimeError::Device(format!(
+                "AQL chain has {packets} packets but queue capacity is {size}"
+            )));
+        }
+        self.chain_end
+            .compare_exchange(CHAIN_IDLE, CHAIN_SETUP, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| RuntimeError::Device("an AQL chain is already active".into()))?;
+        let base = unsafe {
+            (self.shared.drv.hsa_queue_add_write_index_screlease)(self.queue, packets as u64)
+        };
+        let end = base + packets as u64;
+        while (end - 1).wrapping_sub(unsafe {
+            (self.shared.drv.hsa_queue_load_read_index_scacquire)(self.queue)
+        }) >= size as u64
+        {}
+        self.chain_base.store(base, Ordering::Release);
+        self.chain_next.store(base, Ordering::Release);
+        self.chain_end.store(end, Ordering::Release);
+        Ok(())
+    }
+
+    /// Publish the tail of a fully prepared chain with one doorbell store.
+    pub fn commit_dispatch_chain(&self) -> Result<()> {
+        let end = self.chain_end.load(Ordering::Acquire);
+        if end == CHAIN_IDLE || end == CHAIN_SETUP {
+            return Err(RuntimeError::Device(
+                "no prepared AQL chain to commit".into(),
+            ));
+        }
+        let next = self.chain_next.load(Ordering::Acquire);
+        if next != end {
+            let base = self.chain_base.load(Ordering::Acquire);
+            return Err(RuntimeError::Device(format!(
+                "AQL chain reserved {} packets but only {} were prepared",
+                end.wrapping_sub(base),
+                next.wrapping_sub(base)
+            )));
+        }
+        self.chain_end.store(CHAIN_IDLE, Ordering::Release);
+        unsafe {
+            (self.shared.drv.hsa_signal_store_screlease)(
+                (*self.queue).doorbell_signal,
+                (end - 1) as i64,
+            );
+        }
+        Ok(())
     }
 
     /// Launch `f` over `grid` workgroups of `block` threads.

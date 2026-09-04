@@ -406,6 +406,11 @@ pub struct AmdRuntimeConfig {
     #[arg(long = "amd-tp-prefill-segment-major", env = "PLOW_TP_PREFILL_SEGMENT_MAJOR", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub tp_prefill_segment_major: bool,
 
+    /// Graph-derived spill-isolated prefill phase objects with one prebuilt AQL replay per rank.
+    /// Default off until an exact full-network gate demonstrates a device-time win.
+    #[arg(long = "amd-phase-objects", env = "PLOW_PHASE_OBJECTS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
+    pub phase_objects: bool,
+
     /// VMM-backed KV on ROCr (opt-in, requires hsa_amd_vmem_*).
     #[arg(long = "amd-vmm-kv", env = "PLOW_VMM_KV", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, require_equals = true, num_args = 0..=1, default_missing_value = "true", global = true)]
     pub vmm_kv: bool,
@@ -747,6 +752,24 @@ mod tests {
             .expect("explicit TP prefill segment-major rollback");
         let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
         assert!(!config.tp_prefill_segment_major);
+    }
+
+    #[test]
+    fn phase_objects_default_off_and_have_an_explicit_opt_in() {
+        use clap::{Args, FromArgMatches};
+
+        let command = super::AmdRuntimeConfig::augment_args(clap::Command::new("test"));
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "phase_objects")
+            .expect("phase-object argument");
+        assert_eq!(arg.get_default_values(), ["false"]);
+
+        let matches = command
+            .try_get_matches_from(["test", "--amd-phase-objects=true"])
+            .expect("explicit phase-object opt-in");
+        let config = super::AmdRuntimeConfig::from_arg_matches(&matches).expect("AMD config");
+        assert!(config.phase_objects);
     }
 
     #[test]
