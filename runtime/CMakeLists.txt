@@ -656,7 +656,7 @@ option(PLOW_HSACO_KDA_CHUNK "Include the opt-in BT64 chunk-KDA prefill arms" OFF
 option(PLOW_HSACO_KDA_INTRA_CACHED
        "Build the standalone cached BT64/D128 KDA-intra segment" OFF)
 option(PLOW_HSACO_KDA_INTRA_WAVE_ITEMS
-       "Build the packet-paired wave-item BT64/D128 KDA-intra segment" OFF)
+       "Also build the packet-paired wave-item BT64/D128 KDA-intra segment" OFF)
 option(PLOW_HSACO_KDA_KEY_FACTOR
        "Build the standalone exact BT64/D128 KDA Wu/carry key-factor pair" OFF)
 option(PLOW_HSACO_XR_ATTNRES
@@ -780,6 +780,7 @@ if(PLOW_GFX950_HSACO)
     set(_hs_inc -I "${CMAKE_CURRENT_SOURCE_DIR}/amd" -I "${CMAKE_CURRENT_SOURCE_DIR}/common")
     set(_hs_config_dep "")
     set(_hs_need_kda_fused ON)
+    set(_hs_need_kda_intra_wave_items OFF)
     set(_hs_need_decode_mla ${PLOW_HSACO_DECODE_MLA_SEGMENTS})
     if(PLOW_HSACO_CONFIG)
         get_filename_component(_hs_cfg_dir "${PLOW_HSACO_CONFIG}" DIRECTORY)
@@ -802,6 +803,11 @@ if(PLOW_GFX950_HSACO)
         if(_hs_decode_mla_presence)
             set(_hs_need_decode_mla ON)
         endif()
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_kda_intra_wave_items_presence
+             REGEX "^#define PLOW_PACKET_REQUIRES_KDA_INTRA_WAVE_ITEMS 1$")
+        if(_hs_kda_intra_wave_items_presence)
+            set(_hs_need_kda_intra_wave_items ON)
+        endif()
     endif()
     if(PLOW_HSACO_DECODE_INVENTORY_PRUNE AND NOT PLOW_HSACO_CONFIG)
         message(FATAL_ERROR
@@ -810,6 +816,10 @@ if(PLOW_GFX950_HSACO)
     if(PLOW_HSACO_KDA_INTRA_WAVE_ITEMS AND NOT PLOW_HSACO_CONFIG)
         message(FATAL_ERROR
             "PLOW_HSACO_KDA_INTRA_WAVE_ITEMS requires PLOW_HSACO_CONFIG for packet pairing")
+    endif()
+    if(_hs_need_kda_intra_wave_items AND NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
+        message(FATAL_ERROR
+            "manifest-required KDA intra wave-item object is supported only on gfx950")
     endif()
     if(_hs_need_decode_mla AND
        (NOT PLOW_HSACO_DECODE_INVENTORY_PRUNE OR NOT PLOW_HSACO_CONFIG))
@@ -1314,7 +1324,8 @@ if(PLOW_GFX950_HSACO)
         list(APPEND _hs_outs "${_hs_kda_intra_out}")
     endif()
 
-    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_KDA_INTRA_WAVE_ITEMS)
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND
+       (PLOW_HSACO_KDA_INTRA_WAVE_ITEMS OR _hs_need_kda_intra_wave_items))
         set(_hs_kda_intra_wave_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/kda_chunk_intra_wave_items.hip")
         set(_hs_kda_intra_wave_out "${PLOW_HSACO_DIR}/kda_chunk_intra_wave_items_gfx950.elf")
         add_custom_command(OUTPUT "${_hs_kda_intra_wave_out}"

@@ -384,7 +384,8 @@ pub struct EmitConfig {
     pub kda_intra_cached: bool,
 
     /// Route exact BT64/D128 chunk-KDA intra work through the wave-item gfx950 object.
-    #[arg(long, env = "PLOW_KDA_INTRA_WAVE_ITEMS", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    /// Defaults on; set `PLOW_KDA_INTRA_WAVE_ITEMS=0` to retain the interpreter path.
+    #[arg(long, env = "PLOW_KDA_INTRA_WAVE_ITEMS", default_value_t = true, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub kda_intra_wave_items: bool,
 
     /// Route exact qpre BT64/D128 Wu->carry pairs through spill-free gfx950 objects.
@@ -753,7 +754,7 @@ impl EmitConfig {
             kda_chunk: env_bool_opt("PLOW_KDA_CHUNK"),
             kda_chunk_qpre: env_opt_out("PLOW_KDA_CHUNK_QPRE"),
             kda_intra_cached: env_bool("PLOW_KDA_INTRA_CACHED"),
-            kda_intra_wave_items: env_bool("PLOW_KDA_INTRA_WAVE_ITEMS"),
+            kda_intra_wave_items: env_opt_out("PLOW_KDA_INTRA_WAVE_ITEMS"),
             kda_key_factor: env_opt_out("PLOW_KDA_KEY_FACTOR"),
             k3_up_nogather: env_bool("PLOW_K3_UP_NOGATHER"),
             k3_up_gather_only: env_bool("PLOW_K3_UP_GATHER_ONLY"),
@@ -1042,6 +1043,29 @@ mod tests {
                 .unwrap()
                 .emit
                 .kda_key_factor
+        );
+    }
+
+    #[test]
+    fn kda_intra_wave_items_defaults_on_and_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_KDA_INTRA_WAVE_ITEMS", "1")]);
+        std::env::remove_var("PLOW_KDA_INTRA_WAVE_ITEMS");
+        assert!(EmitConfig::from_env().kda_intra_wave_items);
+        assert!(
+            TestArgs::try_parse_from(["test"])
+                .unwrap()
+                .emit
+                .kda_intra_wave_items
+        );
+
+        std::env::set_var("PLOW_KDA_INTRA_WAVE_ITEMS", "0");
+        assert!(!EmitConfig::from_env().kda_intra_wave_items);
+        assert!(
+            !TestArgs::try_parse_from(["test", "--kda-intra-wave-items=0"])
+                .unwrap()
+                .emit
+                .kda_intra_wave_items
         );
     }
 

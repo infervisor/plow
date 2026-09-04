@@ -105,7 +105,20 @@ if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_INTRA_CACHED:-0}" = 1 ]; then
 fi
 
 KDA_INTRA_WAVE_ITEMS_ELFS=""
-if [ "$ARCH" = gfx950 ] && [ "${PLOW_KDA_INTRA_WAVE_ITEMS:-0}" = 1 ]; then
+case "${PLOW_KDA_INTRA_WAVE_ITEMS:-0}" in
+  0|1) ;;
+  *) echo "PLOW_KDA_INTRA_WAVE_ITEMS must be 0 or 1" >&2; exit 2 ;;
+esac
+need_kda_intra_wave_items=${PLOW_KDA_INTRA_WAVE_ITEMS:-0}
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_REQUIRES_KDA_INTRA_WAVE_ITEMS 1' "$PLOW_HSACO_CONFIG"; then
+  need_kda_intra_wave_items=1
+fi
+if [ "$need_kda_intra_wave_items" = 1 ] && [ "$ARCH" != gfx950 ]; then
+  echo "manifest-required KDA intra wave-item object is supported only on gfx950" >&2
+  exit 2
+fi
+if [ "$ARCH" = gfx950 ] && [ "$need_kda_intra_wave_items" = 1 ]; then
   [ -n "${PLOW_HSACO_CONFIG:-}" ] || {
     echo "PLOW_KDA_INTRA_WAVE_ITEMS=1 requires PLOW_HSACO_CONFIG for packet pairing" >&2
     exit 2

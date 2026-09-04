@@ -1173,7 +1173,15 @@ fn object_inventory(progs: &[ProgramArms]) -> Value {
 fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
     let progs = program_arms(m);
     let union: BTreeSet<Arm> = progs.iter().flat_map(|p| p.arms.iter().cloned()).collect();
-    let objects = object_inventory(&progs);
+    let mut objects = object_inventory(&progs);
+    let kda_intra_wave_items_required = m.progs.iter().any(|p| {
+        p.stream
+            .iter()
+            .any(|e| e.flags & packet::dev::SE_KDA_INTRA_WAVE_ITEMS != 0)
+    });
+    objects["lean"]["kda_intra_wave_items"] = json!({
+        "required": kda_intra_wave_items_required,
+    });
     let s = shapes(m);
     let mut f = features(&union);
     let materialized_residual_input = m.progs.iter().flat_map(|p| &p.insts).any(|inst| {
@@ -1406,6 +1414,10 @@ pub fn config_header(manifest: &Value) -> String {
         .pointer("/objects/ordinary/decode_mla/required")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let kda_intra_wave_items_required = manifest
+        .pointer("/objects/lean/kda_intra_wave_items/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let kda_chunk_qpre = union
         .iter()
         .any(|arm| arm.starts_with("KdaChunk") && arm.ends_with("_qpre"));
@@ -1413,6 +1425,10 @@ pub fn config_header(manifest: &Value) -> String {
     out.push_str(&format!(
         "#define PLOW_PACKET_HAS_DECODE_MLA_SEGMENTS {}\n",
         if decode_mla_required { 1 } else { 0 }
+    ));
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_KDA_INTRA_WAVE_ITEMS {}\n",
+        if kda_intra_wave_items_required { 1 } else { 0 }
     ));
     for o in DevOp::ALL {
         let name = op_name(*o);
@@ -2268,6 +2284,47 @@ mod tests {
         let mut ordinary = build(&model(), "gfx950");
         ordinary["union"] = json!(["KdaChunkWu/d128", "KdaChunkCarry/d128"]);
         assert!(config_header(&ordinary).contains("#define PLOW_KDA_CHUNK_QPRE 0"));
+    }
+
+    #[test]
+    fn wave_item_marker_requires_the_paired_object() {
+        let make = |marked: bool| {
+            let mut p = prog(vec![inst(DevOp::KdaChunkIntra, [0; 8])]);
+            p.stream.push(packet::dev::StreamEnt {
+                flags: if marked {
+                    packet::dev::SE_KDA_INTRA_WAVE_ITEMS
+                } else {
+                    0
+                },
+                ..Default::default()
+            });
+            Model {
+                n_cu: 256,
+                target: 0,
+                tensors: vec![],
+                progs: vec![p],
+                kv_row_insts: vec![],
+                prog_t: vec![8192],
+                gen: vec![],
+            }
+        };
+
+        let required = build(&make(true), "gfx950");
+        assert_eq!(
+            required["objects"]["lean"]["kda_intra_wave_items"]["required"],
+            true
+        );
+        assert!(config_header(&required)
+            .contains("#define PLOW_PACKET_REQUIRES_KDA_INTRA_WAVE_ITEMS 1"));
+
+        let rollback = build(&make(false), "gfx950");
+        assert_eq!(
+            rollback["objects"]["lean"]["kda_intra_wave_items"]["required"],
+            false
+        );
+        assert!(config_header(&rollback)
+            .contains("#define PLOW_PACKET_REQUIRES_KDA_INTRA_WAVE_ITEMS 0"));
+        assert_ne!(pairing_hash(&required), pairing_hash(&rollback));
     }
 
     #[test]
