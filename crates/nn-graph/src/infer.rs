@@ -134,7 +134,11 @@ impl Ctx<'_> {
             }
 
             // Shape-preserving ops with weight inputs.
-            Op::RmsNorm { .. } | Op::RmsNormZeroCentered { .. } => {
+            Op::RmsNorm { .. } => {
+                self.expect_arity_range(inputs, 1, 2)?;
+                self.input_shape(inputs, 0)
+            }
+            Op::RmsNormZeroCentered { .. } => {
                 self.expect_arity(inputs, 2)?;
                 self.input_shape(inputs, 0)
             }

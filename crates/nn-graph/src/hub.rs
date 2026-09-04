@@ -119,13 +119,13 @@ impl ModelMetadata {
                     .any(|indexed_name| checkpoint_name_matches(expected_name, indexed_name))
             })
             .collect::<Vec<_>>();
-        let qwen35_text = expected
+        let wrapped_language_model = expected
             .iter()
             .any(|name| name.starts_with("model.language_model."));
         let unexpected = indexed
             .iter()
             .copied()
-            .filter(|name| checkpoint_tensor_is_text(name, qwen35_text))
+            .filter(|name| checkpoint_tensor_is_text(name, wrapped_language_model))
             .filter(|indexed_name| {
                 !expected
                     .iter()
@@ -233,13 +233,14 @@ fn checkpoint_name_matches(expected: &str, indexed: &str) -> bool {
             .is_some_and(|name| name == expected)
 }
 
-fn checkpoint_tensor_is_text(name: &str, qwen35_text: bool) -> bool {
-    if qwen35_text {
+fn checkpoint_tensor_is_text(name: &str, wrapped_language_model: bool) -> bool {
+    if wrapped_language_model {
         return name.starts_with("model.language_model.") || name.starts_with("lm_head.");
     }
     ![
         "model.visual.",
         "visual.",
+        "model.embed_vision.",
         "model.vision_tower.",
         "vision_tower.",
         "vision_model.",

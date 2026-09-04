@@ -49,6 +49,10 @@ fn write_metadata(dir: &Path, config: &str) {
         "model-00001-of-00001.safetensors",
     );
     weight_map.insert(
+        "model.embed_vision.embedding_projection.weight".to_string(),
+        "model-00001-of-00001.safetensors",
+    );
+    weight_map.insert(
         "mtp.layers.0.proj.weight".to_string(),
         "model-00001-of-00001.safetensors",
     );
@@ -195,12 +199,13 @@ const GEMMA4: &str = r#"{
     "intermediate_size":64, "num_hidden_layers":2,
     "num_attention_heads":4, "num_key_value_heads":2, "head_dim":8,
     "num_global_key_value_heads":1, "global_head_dim":16,
-    "attention_k_eq_v":true, "use_qk_norm":true,
+    "attention_k_eq_v":true, "tie_word_embeddings":true, "use_qk_norm":true,
+    "final_logit_softcapping":30.0,
     "query_pre_attn_scalar":16.0, "sliding_window":16,
     "layer_types":["sliding_attention","full_attention"],
     "rope_parameters": {
-      "full_attention":{"rope_theta":1000000.0,"partial_rotary_factor":0.5},
-      "sliding_attention":{"rope_theta":10000.0,"partial_rotary_factor":1.0}
+      "full_attention":{"rope_theta":1000000.0,"partial_rotary_factor":0.5,"rope_type":"proportional"},
+      "sliding_attention":{"rope_theta":10000.0,"partial_rotary_factor":1.0,"rope_type":"default"}
     }
   }
 }"#;
@@ -395,7 +400,7 @@ fn index_mismatch_fails_before_packet_emission() {
 
 #[test]
 fn model_and_indexed_hf_dir_emit_identical_packets_and_maps() {
-    for (family, config) in [("llama", LLAMA), ("qwen35", QWEN35)] {
+    for (family, config) in [("llama", LLAMA), ("qwen35", QWEN35), ("gemma4", GEMMA4)] {
         let metadata = tempdir(&format!("source-parity-{family}"));
         let model_out = tempdir(&format!("source-parity-{family}-model-out"));
         let hf_dir_out = tempdir(&format!("source-parity-{family}-hf-dir-out"));

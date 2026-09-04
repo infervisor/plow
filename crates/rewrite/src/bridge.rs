@@ -403,20 +403,27 @@ fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
             match kind {
                 nn_graph::op::ActKind::Silu => ModelOpKind::Silu,
                 nn_graph::op::ActKind::Sigmoid => ModelOpKind::Sigmoid,
+                nn_graph::op::ActKind::Tanh => ModelOpKind::Tanh,
                 _ => return Ok(row(1, false)),
             },
             1,
             [0; 4],
         ),
-        Op::Scale(_) => row(1, false),
+        Op::Scale(factor) => model(ModelOpKind::Scale, 1, [factor.to_bits(), 0, 0, 0]),
         Op::Rope {
             dim,
             theta,
             interleave,
+            frequency_dim,
         } => model(
             ModelOpKind::Rope,
             1,
-            [*dim, theta.to_bits(), u32::from(*interleave), 0],
+            [
+                *dim,
+                theta.to_bits(),
+                u32::from(*interleave),
+                *frequency_dim,
+            ],
         ),
         Op::Elementwise(kind) => model(
             match kind {
@@ -723,9 +730,11 @@ fn fused_shape(
         "Attention" => replace_last(&child(0), *child(2).last().unwrap_or(&1)),
         // shape-preserving (activation is the first child)
         "RmsNorm"
+        | "UnitRmsNorm"
         | "ZeroCenteredRmsNorm"
         | "LayerNorm"
         | "Rope"
+        | "ProportionalRope"
         | "Act"
         | "Scale"
         | "Softmax"
@@ -864,7 +873,9 @@ fn fused_op_kind(fused: &FusedGraph, shapes: &[Vec<i64>], i: usize) -> Result<Op
                 k,
             })
         }
-        "RmsNorm" | "ZeroCenteredRmsNorm" | "LayerNorm" => row(na.len() as i64, true),
+        "RmsNorm" | "UnitRmsNorm" | "ZeroCenteredRmsNorm" | "LayerNorm" => {
+            row(na.len() as i64, true)
+        }
         // GroupNorm+Act without a following conv: a norm kernel — row-wise with
         // a per-group reduction sweep over (x, w, b).
         "FusedGroupNormAct" => row(na.len() as i64, true),
@@ -873,7 +884,7 @@ fn fused_op_kind(fused: &FusedGraph, shapes: &[Vec<i64>], i: usize) -> Result<Op
         "FusedResidualZeroCenteredNorm" => row(3, true),
         "FusedResidualLayerNorm" => row(4, true),
         "Softmax" => row(1, true),
-        "Act" | "Scale" | "Rope" => row(1, false),
+        "Act" | "Scale" | "Rope" | "ProportionalRope" => row(1, false),
         // Embedding/FusedEmbeddingScale: memory-bound row-wise lookup.
         "Embedding" | "FusedEmbeddingScale" => row(1, false),
         // norm+rope keeps the norm's reduction; elementwise/gated combines do not.

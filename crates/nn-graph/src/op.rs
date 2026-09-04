@@ -11,6 +11,7 @@ pub enum ActKind {
     Silu,
     Gelu,
     GeluTanh,
+    Tanh,
     Relu,
     Sigmoid,
     QuickGelu,
@@ -46,7 +47,8 @@ pub enum Op {
     /// activations.
     MatMul,
 
-    /// RMSNorm over the last axis. Inputs `[x, weight]`. Shape-preserving.
+    /// RMSNorm over the last axis. Inputs `[x, weight]`, or `[x]` for a
+    /// weightless normalization. Shape-preserving.
     RmsNorm { eps: f32 },
 
     /// RMSNorm with a zero-centered scale: `norm(x) * (1 + weight)`.
@@ -64,6 +66,9 @@ pub enum Op {
         dim: u32,
         theta: f32,
         interleave: bool,
+        /// Dimension used in the inverse-frequency exponent. Usually `dim`;
+        /// proportional partial RoPE keeps the full head dimension here.
+        frequency_dim: u32,
     },
 
     /// Pointwise activation. Inputs `[x]`. Shape-preserving.

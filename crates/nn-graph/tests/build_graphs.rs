@@ -592,6 +592,95 @@ fn gemma4_unified_per_layer_attention() {
 }
 
 #[test]
+fn gemma4_text_manifest_matches_official_projection_layout() {
+    let cfg = r#"{
+        "model_type": "gemma4",
+        "dtype": "bfloat16",
+        "text_config": {
+            "model_type": "gemma4_text",
+            "vocab_size": 1000,
+            "hidden_size": 5376,
+            "intermediate_size": 512,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "num_global_key_value_heads": 1,
+            "head_dim": 64,
+            "global_head_dim": 128,
+            "attention_k_eq_v": true,
+            "tie_word_embeddings": true,
+            "final_logit_softcapping": 30.0,
+            "use_qk_norm": true,
+            "sliding_window": 512,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "rope_parameters": {
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                    "rope_type": "proportional"
+                },
+                "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}
+            }
+        }
+    }"#;
+    let g = build_text_generation_from_config_json_at(cfg, &ShapeBucket::default())
+        .expect("build Gemma 4 text tower");
+    let weights = g
+        .checkpoint_manifest()
+        .into_iter()
+        .map(|weight| weight.name)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for name in [
+        "model.language_model.embed_tokens.weight",
+        "model.language_model.layers.0.self_attn.k_proj.weight",
+        "model.language_model.layers.0.self_attn.v_proj.weight",
+        "model.language_model.layers.0.layer_scalar",
+        "model.language_model.layers.1.self_attn.k_proj.weight",
+        "model.language_model.layers.1.layer_scalar",
+        "model.language_model.norm.weight",
+    ] {
+        assert!(weights.contains(name), "missing checkpoint tensor {name}");
+    }
+    assert!(!weights.contains("model.language_model.layers.1.self_attn.v_proj.weight"));
+    assert!(!weights.iter().any(|name| name.contains("kv_proj")));
+    assert!(!weights.contains("lm_head.weight"));
+
+    let weightless_norms = g
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.op, nn_graph::Op::RmsNorm { .. }) && node.inputs.len() == 1)
+        .count();
+    assert_eq!(weightless_norms, 2, "Gemma 4 normalizes V without a weight");
+
+    let rope_dims = g
+        .nodes
+        .iter()
+        .filter_map(|node| match node.op {
+            nn_graph::Op::Rope {
+                dim, frequency_dim, ..
+            } => Some((dim, frequency_dim)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rope_dims, vec![(64, 64), (64, 64), (32, 128), (32, 128)]);
+
+    let scales = g
+        .nodes
+        .iter()
+        .filter_map(|node| match node.op {
+            nn_graph::Op::Scale(scale) => Some(scale),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(scales, vec![73.5, 1.0 / 30.0, 30.0]);
+    assert_eq!(
+        g.count_ops(|op| matches!(op, nn_graph::Op::Act(nn_graph::ActKind::Tanh))),
+        1
+    );
+}
+
+#[test]
 fn qwen_image_vae_encoder() {
     let cfg = r#"{
         "_class_name": "AutoencoderKLQwenImage",

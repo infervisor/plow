@@ -117,17 +117,11 @@ fn fuse_gemma4() {
     assert!(fused.contains("SwiGLU"), "act·mul fusion did not fire");
     // Norm→Rope fusions fire on qk_norm paths (use_qk_norm=true).
     assert!(
-        fused.contains("FusedNormRope") || fused.contains("FusedNormRopeScale"),
+        fused.contains("FusedNormRope"),
         "norm→rope fusion did not fire (qk_norm paths)"
     );
-    // Q path: norm→rope→scale fuses to FusedNormRopeScale (1 per block = 2 total).
-    assert!(
-        fused.contains("FusedNormRopeScale"),
-        "norm→rope→scale fusion did not fire on Q path"
-    );
 
-    // With attention_k_eq_v: 4 FusedNormLinear/block + 1 SwiGLU + 1 FusedNormRope(K)
-    // + 1 FusedNormRopeScale(Q) = 7 per block × 2 blocks + 1 tail lm_head = 15.
+    // Gemma 4 uses an attention scale of 1.0, so Q and K both use FusedNormRope.
     assert!(
         stats.fused >= 13,
         "expected >= 13 fused nodes, got {}",
@@ -190,10 +184,10 @@ fn fuse_gemma4_moe() {
         fused.contains("SwiGLU"),
         "act·mul fusion did not fire in MoE expert"
     );
-    // Norm→Rope fusions on qk_norm paths.
+    // Norm→Rope fusions on qk_norm paths; Gemma 4 has no extra Q scale.
     assert!(
-        fused.contains("FusedNormRopeScale"),
-        "norm→rope→scale fusion did not fire on Q path"
+        fused.contains("FusedNormRope"),
+        "norm→rope fusion did not fire on Q/K paths"
     );
     // Fusion reduced ops.
     assert!(

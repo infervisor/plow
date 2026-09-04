@@ -149,6 +149,10 @@ impl Nn {
         self.emit(Op::RmsNorm { eps }, vec![x, w])
     }
 
+    pub fn rmsnorm_weightless(&mut self, x: TensorId, eps: f32) -> TensorId {
+        self.emit(Op::RmsNorm { eps }, vec![x])
+    }
+
     pub fn rmsnorm_zero_centered(
         &mut self,
         name: &str,
@@ -216,6 +220,25 @@ impl Nn {
                 dim,
                 theta,
                 interleave: false,
+                frequency_dim: dim,
+            },
+            vec![x],
+        )
+    }
+
+    pub fn rope_with_frequency_dim(
+        &mut self,
+        x: TensorId,
+        dim: u32,
+        theta: f32,
+        frequency_dim: u32,
+    ) -> TensorId {
+        self.emit(
+            Op::Rope {
+                dim,
+                theta,
+                interleave: false,
+                frequency_dim,
             },
             vec![x],
         )
@@ -227,6 +250,7 @@ impl Nn {
                 dim,
                 theta,
                 interleave: true,
+                frequency_dim: dim,
             },
             vec![x],
         )

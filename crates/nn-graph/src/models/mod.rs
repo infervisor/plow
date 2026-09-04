@@ -133,7 +133,11 @@ pub fn build_text_generation_from_config_json_at(
     bucket: &ShapeBucket,
 ) -> Result<Graph, BuildError> {
     let mut outer: serde_json::Value = serde_json::from_str(json).map_err(ConfigError::from)?;
-    let qwen35_wrapper = outer.get("model_type").and_then(|v| v.as_str()) == Some("qwen3_5");
+    let wrapper_type = outer
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let language_model_wrapper = matches!(wrapper_type, "qwen3_5" | "gemma4");
     if let Some(mut text) = outer.get_mut("text_config").map(serde_json::Value::take) {
         if let serde_json::Value::Object(fields) = &mut text {
             if !fields.contains_key("dtype") && !fields.contains_key("torch_dtype") {
@@ -149,7 +153,7 @@ pub fn build_text_generation_from_config_json_at(
                     fields.insert("quantization_config".into(), quant.clone());
                 }
             }
-            if qwen35_wrapper {
+            if language_model_wrapper {
                 fields.insert(
                     "_plow_weight_prefix".to_string(),
                     serde_json::Value::String("model.language_model".to_string()),

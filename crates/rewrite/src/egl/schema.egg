@@ -8,11 +8,8 @@
 ;
 ; LIMIT worth knowing before extending this schema: attention is modelled as
 ; `(Attention Expr Expr Expr String)` with the whole attention config collapsed
-; into one opaque token. So no rule can branch on an attention attribute — most
-; concretely, Gemma-4's `attention_k_eq_v` (K and V share one projection) is
-; invisible here, while the devblob emitter already elides the v_proj weight,
-; its GEMM and its CUs. That is a structural limit on what this rule set can
-; contribute to that model, not a missing rule.
+; into one opaque token. Rules cannot branch on attention attributes; graph
+; construction must make distinctions such as shared K/V edges explicit.
 
 (datatype Expr
   (Input String)                       ; named graph input
@@ -22,6 +19,7 @@
   (Embedding Expr Expr)                ; ids, table
   (Scale Expr f64)                     ; x, factor
   (RmsNorm Expr Expr f64)              ; x, weight, eps
+  (UnitRmsNorm Expr f64)               ; x, eps (no learned scale)
   (ZeroCenteredRmsNorm Expr Expr f64)  ; x, offset-from-one weight, eps
   (LayerNorm Expr Expr Expr f64)       ; x, weight, bias, eps
   (Linear Expr Expr i64)              ; x, weight, out_features
@@ -30,6 +28,7 @@
   (Reshape Expr String)               ; x, shape-token
   (Transpose Expr String)             ; x, perm-token
   (Rope Expr i64 f64)                 ; x, rotary_dim, theta
+  (ProportionalRope Expr i64 f64 i64) ; x, rotary_dim, theta, frequency_dim
   (Attention Expr Expr Expr String)   ; q, k, v, config-token (opaque attrs)
   (Ew String Expr Expr)               ; kind, a, b
   (Act String Expr)                   ; kind, x

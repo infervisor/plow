@@ -5,6 +5,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct GemmaConfig {
+    pub model_type: String,
     pub vocab_size: i64,
     pub hidden_size: i64,
     pub intermediate_size: i64,
@@ -25,6 +26,10 @@ pub struct GemmaConfig {
     pub use_qk_norm: bool,
     #[serde(alias = "dtype")]
     pub torch_dtype: Option<String>,
+    pub tie_word_embeddings: bool,
+    pub final_logit_softcapping: Option<f32>,
+    #[serde(default, rename = "_plow_weight_prefix")]
+    pub weight_prefix: Option<String>,
 
     // --- Gemma 4 (gemma4_unified_text) additions ---
     /// Per-layer attention type, `"full_attention"` or `"sliding_attention"`.
@@ -36,7 +41,7 @@ pub struct GemmaConfig {
     /// KV heads used by full-attention (global) layers; 0 ⇒ same as
     /// `num_key_value_heads`.
     pub num_global_key_value_heads: u32,
-    /// Gemma4 shares the K and V projection (one weight feeds both).
+    /// Gemma4 full-attention layers derive V from K; sliding layers keep V.
     pub attention_k_eq_v: bool,
     /// Per-layer-type RoPE (theta + partial rotary factor).
     pub rope_parameters: Option<RopeParameters>,
@@ -56,6 +61,8 @@ pub struct RopeParameters {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeSpec {
+    #[serde(default)]
+    pub rope_type: String,
     #[serde(default = "default_theta")]
     pub rope_theta: f32,
     /// Fraction of head_dim that receives RoPE (1.0 = full rotary).
@@ -74,6 +81,7 @@ impl Default for GemmaConfig {
     fn default() -> Self {
         // Gemma3-4B-ish defaults.
         GemmaConfig {
+            model_type: "gemma3".to_string(),
             vocab_size: 262_208,
             hidden_size: 2560,
             intermediate_size: 10_240,
@@ -88,6 +96,9 @@ impl Default for GemmaConfig {
             query_pre_attn_scalar: 256.0,
             use_qk_norm: true,
             torch_dtype: None,
+            tie_word_embeddings: false,
+            final_logit_softcapping: None,
+            weight_prefix: None,
             layer_types: Vec::new(),
             global_head_dim: 0,
             num_global_key_value_heads: 0,
@@ -100,6 +111,13 @@ impl Default for GemmaConfig {
 }
 
 impl GemmaConfig {
+    pub fn is_gemma4(&self) -> bool {
+        matches!(
+            self.model_type.as_str(),
+            "gemma4" | "gemma4_text" | "gemma4_unified_text"
+        )
+    }
+
     /// Whether this model uses Mixture-of-Experts.
     pub fn is_moe(&self) -> bool {
         self.num_local_experts > 0
@@ -163,5 +181,20 @@ impl GemmaConfig {
             }
         }
         (self.rope_theta, 1.0)
+    }
+
+    pub fn rope_frequency_dim(&self, global: bool, rotary_dim: u32, head_dim: u32) -> u32 {
+        let spec = self.rope_parameters.as_ref().and_then(|parameters| {
+            if global {
+                parameters.full_attention.as_ref()
+            } else {
+                parameters.sliding_attention.as_ref()
+            }
+        });
+        if spec.is_some_and(|spec| spec.rope_type == "proportional") {
+            head_dim
+        } else {
+            rotary_dim
+        }
     }
 }

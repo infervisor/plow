@@ -173,6 +173,8 @@ pub fn footprints(kind: &OpKind, tile: &Compute, io: &OpIo, coord: &[i64]) -> Fo
                     | crate::ModelOpKind::Sub
                     | crate::ModelOpKind::Mul
                     | crate::ModelOpKind::Div
+                    | crate::ModelOpKind::Scale
+                    | crate::ModelOpKind::Tanh
             );
             Footprint {
                 write: row(io.output),

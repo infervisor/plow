@@ -69,6 +69,9 @@ fn term_for(
     Ok(match op {
         Op::Embedding => format!("(Embedding {} {})", e(0)?, e(1)?),
         Op::Scale(f) => format!("(Scale {} {})", e(0)?, f64lit(*f)),
+        Op::RmsNorm { eps } if inputs.len() == 1 => {
+            format!("(UnitRmsNorm {} {})", e(0)?, f64lit(*eps))
+        }
         Op::RmsNorm { eps } => format!("(RmsNorm {} {} {})", e(0)?, e(1)?, f64lit(*eps)),
         Op::RmsNormZeroCentered { eps } => {
             format!("(ZeroCenteredRmsNorm {} {} {})", e(0)?, e(1)?, f64lit(*eps))
@@ -99,6 +102,18 @@ fn term_for(
                 .join(",");
             format!("(Transpose {} {})", e(0)?, quote(&tok))
         }
+        Op::Rope {
+            dim,
+            theta,
+            frequency_dim,
+            ..
+        } if frequency_dim != dim => format!(
+            "(ProportionalRope {} {} {} {})",
+            e(0)?,
+            *dim,
+            f64lit(*theta),
+            *frequency_dim
+        ),
         Op::Rope { dim, theta, .. } => format!("(Rope {} {} {})", e(0)?, *dim, f64lit(*theta)),
         Op::Attention {
             num_heads,
@@ -296,6 +311,7 @@ fn act(k: ActKind) -> &'static str {
         ActKind::Silu => "silu",
         ActKind::Gelu => "gelu",
         ActKind::GeluTanh => "gelu_tanh",
+        ActKind::Tanh => "tanh",
         ActKind::Relu => "relu",
         ActKind::Sigmoid => "sigmoid",
         ActKind::QuickGelu => "quick_gelu",

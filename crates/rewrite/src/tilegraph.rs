@@ -153,6 +153,8 @@ pub enum ModelOpKind {
     CausalDepthwiseConv1d = 10,
     QwenGatedDelta = 11,
     RmsNorm = 12,
+    Scale = 13,
+    Tanh = 14,
 }
 
 /// One op of the layer. Convention: `inputs[0]` is the activation (shared, read

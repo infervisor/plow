@@ -114,6 +114,8 @@ impl Opcode {
     pub const VARIANT_MODEL_CAUSAL_DEPTHWISE_CONV1D: u8 = 0x8a;
     pub const VARIANT_MODEL_QWEN_GATED_DELTA: u8 = 0x8b;
     pub const VARIANT_MODEL_RMSNORM: u8 = 0x8c;
+    pub const VARIANT_MODEL_SCALE: u8 = 0x8d;
+    pub const VARIANT_MODEL_TANH: u8 = 0x8e;
 
     // Token-family variants (bits [7:0]) — the `kind` a `TokenBody` carries.
     pub const TOKEN_SAMPLE_GREEDY: u8 = 0x00;

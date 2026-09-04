@@ -23,6 +23,14 @@ pub fn build(cfg: &GemmaConfig) -> Graph {
 
     let h = cfg.hidden_size;
     let eps = cfg.rms_norm_eps;
+    let model_prefix = cfg.weight_prefix.as_deref().unwrap_or("");
+    let name = |suffix: &str| {
+        if model_prefix.is_empty() {
+            suffix.to_string()
+        } else {
+            format!("{model_prefix}.{suffix}")
+        }
+    };
 
     // Symbolic batch / sequence.
     let b = nn.sym("B");
@@ -31,11 +39,17 @@ pub fn build(cfg: &GemmaConfig) -> Graph {
     let ids = nn.input("input_ids", nn.shape([b.clone(), s.clone()]), DType::I32);
 
     // Embedding, scaled by sqrt(hidden) (Gemma normalizer).
-    let mut x = nn.embedding("embed_tokens", ids, cfg.vocab_size, h);
-    x = nn.scale(x, (h as f32).sqrt());
+    let embed_name = name("embed_tokens");
+    let mut x = nn.embedding(&embed_name, ids, cfg.vocab_size, h);
+    let embedding_scale = if cfg.is_gemma4() {
+        round_to_bf16((h as f32).sqrt())
+    } else {
+        (h as f32).sqrt()
+    };
+    x = nn.scale(x, embedding_scale);
 
     for layer in 0..cfg.num_hidden_layers {
-        let p = format!("layers.{layer}");
+        let p = name(&format!("layers.{layer}"));
         nn.begin_block(&p);
         let is_global = cfg.layer_is_global(layer);
         let sliding = if is_global {
@@ -61,13 +75,25 @@ pub fn build(cfg: &GemmaConfig) -> Graph {
         };
         let mlp = nn.rmsnorm(&format!("{p}.post_feedforward_layernorm"), mlp, h, eps);
         x = nn.add(residual, mlp);
+        if cfg.is_gemma4() {
+            let layer_scalar = nn.param(&format!("{p}.layer_scalar"), [Dim::stat(1)]);
+            x = nn.mul(x, layer_scalar);
+        }
     }
     nn.end_block();
 
-    x = nn.rmsnorm("norm", x, h, eps);
+    x = nn.rmsnorm(&name("norm"), x, h, eps);
 
-    // LM head (weights tied to embeddings in Gemma; modeled as its own Linear).
-    let logits = nn.linear("lm_head", x, h, cfg.vocab_size, false);
+    let mut logits = if cfg.tie_word_embeddings {
+        nn.linear(&embed_name, x, h, cfg.vocab_size, false)
+    } else {
+        nn.linear("lm_head", x, h, cfg.vocab_size, false)
+    };
+    if let Some(cap) = cfg.final_logit_softcapping.filter(|cap| *cap > 0.0) {
+        logits = nn.scale(logits, 1.0 / cap);
+        logits = nn.act(ActKind::Tanh, logits);
+        logits = nn.scale(logits, cap);
+    }
     nn.mark_output(logits);
     nn.finish()
 }
@@ -92,13 +118,13 @@ fn attention(
     let q_dim = nh as i64 * hd;
     let kv_dim = nkv as i64 * hd;
 
-    // Projections. Gemma 4 may share the K and V projection (`attention_k_eq_v`).
+    // Full-attention Gemma 4 layers derive both K and V from `k_proj`. Sliding
+    // layers retain an independent `v_proj` even when `attention_k_eq_v=true`.
     let q = nn.linear(&format!("{prefix}.self_attn.q_proj"), x, h, q_dim, false);
-    let (k_lin, v_lin) = if cfg.attention_k_eq_v {
-        let kv = nn.linear(&format!("{prefix}.self_attn.kv_proj"), x, h, kv_dim, false);
-        (kv, kv)
+    let k = nn.linear(&format!("{prefix}.self_attn.k_proj"), x, h, kv_dim, false);
+    let (k_lin, v_lin) = if cfg.attention_k_eq_v && is_global {
+        (k, k)
     } else {
-        let k = nn.linear(&format!("{prefix}.self_attn.k_proj"), x, h, kv_dim, false);
         let v = nn.linear(&format!("{prefix}.self_attn.v_proj"), x, h, kv_dim, false);
         (k, v)
     };
@@ -112,7 +138,7 @@ fn attention(
         k_lin,
         [b.clone(), s.clone(), Dim::stat(nkv as i64), Dim::stat(hd)],
     );
-    let v = nn.reshape(
+    let mut v = nn.reshape(
         v_lin,
         [b.clone(), s.clone(), Dim::stat(nkv as i64), Dim::stat(hd)],
     );
@@ -122,12 +148,16 @@ fn attention(
         q = nn.rmsnorm(&format!("{prefix}.self_attn.q_norm"), q, hd, eps);
         k = nn.rmsnorm(&format!("{prefix}.self_attn.k_norm"), k, hd, eps);
     }
+    if cfg.is_gemma4() {
+        v = nn.rmsnorm_weightless(v, eps);
+    }
 
     // RoPE over the (possibly partial) head_dim, with per-layer-type theta.
     let (theta, rotary_factor) = cfg.rope_for(is_global);
     let rotary_dim = ((hd as f32) * rotary_factor).round() as u32;
-    q = nn.rope(q, rotary_dim, theta);
-    k = nn.rope(k, rotary_dim, theta);
+    let frequency_dim = cfg.rope_frequency_dim(is_global, rotary_dim, hd as u32);
+    q = nn.rope_with_frequency_dim(q, rotary_dim, theta, frequency_dim);
+    k = nn.rope_with_frequency_dim(k, rotary_dim, theta, frequency_dim);
 
     // Gemma query scaling: 1/sqrt(query_pre_attn_scalar) (defaults to head_dim).
     let scalar = if cfg.query_pre_attn_scalar > 0.0 {
@@ -135,7 +165,9 @@ fn attention(
     } else {
         hd as f32
     };
-    q = nn.scale(q, 1.0 / scalar.sqrt());
+    if !cfg.is_gemma4() {
+        q = nn.scale(q, 1.0 / scalar.sqrt());
+    }
 
     let attn = nn.attention(q, k, v, nh, nkv, hd as u32, true, sliding_window, None);
 
@@ -148,6 +180,12 @@ fn attention(
         h,
         false,
     )
+}
+
+fn round_to_bf16(value: f32) -> f32 {
+    let bits = value.to_bits();
+    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+    f32::from_bits(rounded & 0xffff_0000)
 }
 
 /// GeGLU MLP: `down(act(gate(x)) * up(x))`.

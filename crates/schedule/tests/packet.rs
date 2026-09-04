@@ -173,6 +173,106 @@ fn qwen_plan() -> LayerPlan {
     plan_from_all_blocks(&graph).unwrap()
 }
 
+fn gemma4_plan() -> LayerPlan {
+    let json = r#"{
+      "model_type":"gemma4",
+      "dtype":"bfloat16",
+      "text_config": {
+        "model_type":"gemma4_text",
+        "vocab_size":256,
+        "hidden_size":64,
+        "intermediate_size":128,
+        "num_hidden_layers":2,
+        "num_attention_heads":4,
+        "num_key_value_heads":2,
+        "num_global_key_value_heads":1,
+        "head_dim":16,
+        "global_head_dim":32,
+        "attention_k_eq_v":true,
+        "tie_word_embeddings":true,
+        "final_logit_softcapping":30.0,
+        "use_qk_norm":true,
+        "sliding_window":32,
+        "layer_types":["sliding_attention","full_attention"],
+        "rope_parameters": {
+          "full_attention": {
+            "rope_theta":1000000.0,
+            "partial_rotary_factor":0.25,
+            "rope_type":"proportional"
+          },
+          "sliding_attention":{"rope_theta":10000.0,"rope_type":"default"}
+        }
+      }
+    }"#;
+    let mut graph = nn_graph::models::build_text_generation_from_config_json_at(
+        json,
+        &nn_graph::models::ShapeBucket::default(),
+    )
+    .unwrap();
+    graph.bind(&Bindings::new().set("B", 1).set("S", 1));
+    plan_from_all_blocks(&graph).unwrap()
+}
+
+#[test]
+fn gemma4_plan_and_packets_preserve_numeric_semantics() {
+    let plan = gemma4_plan();
+    let model_ops = plan
+        .ops
+        .iter()
+        .filter_map(|op| match op.kind {
+            OpKind::Model(model) => Some(model),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    let scales = model_ops
+        .iter()
+        .filter(|model| model.kind == ModelOpKind::Scale)
+        .map(|model| f32::from_bits(model.args[0]))
+        .collect::<Vec<_>>();
+    assert_eq!(scales, vec![8.0, 1.0 / 30.0, 30.0]);
+    assert_eq!(
+        model_ops
+            .iter()
+            .filter(|model| model.kind == ModelOpKind::Tanh)
+            .count(),
+        1
+    );
+    assert_eq!(
+        model_ops
+            .iter()
+            .filter(|model| model.kind == ModelOpKind::RmsNorm && model.operands == 1)
+            .count(),
+        2
+    );
+    assert!(model_ops.iter().any(|model| {
+        model.kind == ModelOpKind::Rope && model.args[0] == 8 && model.args[3] == 32
+    }));
+
+    let soc = Soc::single(h100(), DEFAULT_PAGE_BYTES);
+    let (graph, cons) = assemble(&soc, &plan, SramPolicy::Stream, None).unwrap();
+    let scheduled = schedule(&soc, &graph, &cons, &Config::default());
+    let program = emit_program(&graph, &cons, &scheduled.tasks, &scheduled.schedule);
+    let decoded = Program::decode(&program.to_bytes()).unwrap();
+    let variants = decoded
+        .insts
+        .iter()
+        .filter_map(|inst| match inst.body {
+            Body::Row { variant, args, .. } => Some((variant, args)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(variants
+        .iter()
+        .any(|(variant, _)| *variant == Opcode::VARIANT_MODEL_SCALE));
+    assert!(variants
+        .iter()
+        .any(|(variant, _)| *variant == Opcode::VARIANT_MODEL_TANH));
+    assert!(variants.iter().any(|(variant, args)| {
+        *variant == Opcode::VARIANT_MODEL_ROPE && args[0] == 8 && args[3] == 32
+    }));
+}
+
 #[test]
 fn qwen_plan_is_complete_and_emits_semantic_packets_for_both_nvidia_targets() {
     let plan = qwen_plan();

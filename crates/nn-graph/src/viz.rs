@@ -121,8 +121,10 @@ fn op_detail(op: &Op) -> serde_json::Value {
             dim,
             theta,
             interleave,
+            frequency_dim,
         } => json!({
             "dim": dim, "theta": theta, "interleave": interleave,
+            "frequency_dim": frequency_dim,
         }),
         Op::Act(kind) => json!({ "activation": format!("{kind:?}") }),
         Op::Elementwise(kind) => json!({ "kind": format!("{kind:?}") }),
