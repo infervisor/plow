@@ -324,7 +324,8 @@ pub struct Builder {
     uniseg_forced: bool,
     /// See [`Builder::set_gq_order_asap`]. Default on; `PLOW_GQ_ORDER=emit` restores emit order.
     gq_order_asap: bool,
-    /// See [`Builder::set_gq_order_seg`]. `PLOW_GQ_ORDER=asap-seg` opts in.
+    /// See [`Builder::set_gq_order_seg`]. Default on; `PLOW_GQ_ORDER=asap` keeps program-wide
+    /// ranks and `=emit` keeps emit order.
     gq_order_seg: bool,
     /// Split descriptor-consuming prefill families into independent wave classes.
     /// Callers must enable this only for prefill programs.
@@ -558,7 +559,10 @@ impl Builder {
             uniseg_denied: false,
             uniseg_forced: false,
             gq_order_asap: std::env::var("PLOW_GQ_ORDER").ok().as_deref() != Some("emit"),
-            gq_order_seg: std::env::var("PLOW_GQ_ORDER").ok().as_deref() == Some("asap-seg"),
+            gq_order_seg: !matches!(
+                std::env::var("PLOW_GQ_ORDER").ok().as_deref(),
+                Some("emit") | Some("asap")
+            ),
             packed_prefill_segments: false,
             lean_moe_stage2_segments: false,
             lean_moe_stage1_segments: false,
