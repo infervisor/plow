@@ -67,3 +67,47 @@ acceptance decision; an isolated kernel win alone is insufficient.
 6. Include the exact added segment launches in the full-network acceptance gate.
 
 No model identity participates in eligibility or runtime dispatch.
+
+## Result: rejected
+
+The exclusive TP8 gate used 256 workgroups, 100 iterations, three alternating
+repetitions per arm and shape. All 18 runs reported `parity=PASS`, `timeout=no`,
+and `bad=0`.
+
+| T8192 shape | calls | scalar median | wave-RS median | delta |
+|---|---:|---:|---:|---:|
+| H3584 plain | 92 | 38.581 us | 39.293 us | +1.85% |
+| H7168 plain | 94 | 73.479 us | 76.632 us | +4.29% |
+| H7168 folded gather | 92 | 97.117 us | 99.588 us | +2.54% |
+
+The 92/94/92 weighted kernel projection is 19.391 ms scalar versus 19.980 ms
+wave-RS: +0.589 ms (+3.04%). Adding the measured +464 launch cost projects a
+total **+3.623 ms TTFT regression**. The full-network GPU gate was therefore
+not run. `PLOW_XR_WAVE_RS` remains default-off and is rejected as a performance
+arm; the specialist segment remains as the spill-safe vehicle for a distinct
+synchronization experiment.
+
+Artifacts:
+
+- scalar ELF SHA256 `b302232464af0310bc0518bca412f4461b07d7f897d85e97b84c3c26d8cf08e7`
+- wave-RS ELF SHA256 `0c67eda7d96b0ef296acabaf14de349eeb0bf0ffb5f3f2bc40adbe767e13b405`
+- marked packet SHA256 `dc4222301636dc841708e20639b103de8c9fb0e323b616d74116ca3e54188d1a`
+- raw runs `/tmp/xr-wave-rs-isolated/gpu-20260904`
+- emit and lease logs `/tmp/xr-wave-rs-isolated/{emit-full.log,gpu-lease.log}`
+
+## Next isolated experiment
+
+Keep the scalar phase-1 body and change only the phase-1-to-phase-2 handoff.
+Give each producer workgroup a monotonically increasing ready word in its own
+rank's peer-visible scratch. After its phase-1 stores and block barrier, the
+workgroup publishes one system-release ready value. The corresponding consumer
+workgroup polls the same ready word on each rank, takes one system acquire, and
+copies only the elements produced by that workgroup. This removes the global
+`nranks*nblk` rendezvous and makes readiness block-local without changing FP32
+reduction order, all-gather ownership, or the initial full-partial gate.
+
+First implement this only in the standalone harness behind a new flag. Use
+per-XCD-grouped ready storage to avoid different L2 partitions writing the same
+cache line; never infer the physical XCD from block index in production. Gate on
+the same three exact shapes, then account for the additional ready-word reset
+bytes before adapting it to the specialist object and packet allocator.
