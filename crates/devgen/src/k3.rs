@@ -4874,6 +4874,7 @@ mod tests {
         let _scope = crate::test_env::EnvScope::set(&[
             ("PLOW_FUSE_RESIDUAL_INPUT", "1"),
             ("PLOW_FUSE_XR_ATTNRES", "1"),
+            ("PLOW_SEQ_PAR_SEAMS", "0"),
         ]);
 
         let decode = build_full_t(8, 1);
@@ -5084,6 +5085,9 @@ mod tests {
 
     #[test]
     fn early_shared_gate_up_is_batched_decode_only_and_keeps_tp_slot_order() {
+        // Pins the replicated-row prefill shape (`PLOW_SEQ_PAR_SEAMS` changes the seam set).
+        let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_SEQ_PAR_SEAMS", "0")]);
         let locate = |p: &packet::devbuild::Program, suffix: &str| {
             let weight = p
                 .tensors
@@ -5665,8 +5669,10 @@ mod tests {
 
     #[test]
     fn grouped_router_uses_one_block_per_token_up_to_the_cu_count() {
-        // The TP8 shape depends on `PLOW_SEQ_PAR_SEAMS` (band-row router).
+        // The TP8 shape depends on `PLOW_SEQ_PAR_SEAMS` (band-row router); pin the
+        // replicated-row shape the expectations below describe.
         let _guard = crate::test_env::env_guard();
+        let _scope = crate::test_env::EnvScope::set(&[("PLOW_SEQ_PAR_SEAMS", "0")]);
         for (t, want) in [(32, 32), (128, 128), (512, 256)] {
             let rows = if t == 32 {
                 RowKind::Sequences
@@ -5790,7 +5796,10 @@ mod tests {
     #[test]
     fn folded_gather_prefill_can_restore_the_one_shot_path() {
         let _guard = crate::test_env::env_guard();
-        let _env = crate::test_env::EnvScope::set(&[("PLOW_XR2_GATHER", "0")]);
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_XR2_GATHER", "0"),
+            ("PLOW_SEQ_PAR_SEAMS", "0"),
+        ]);
         // Pins the explicit one-shot rollback while keeping the sharded up projection.
         if !shard_up_proj(8) {
             return;
@@ -5859,9 +5868,12 @@ mod tests {
     }
 
     #[test]
-    fn folded_gather_prefill_uses_the_generic_twoshot_path_by_default() {
+    fn folded_gather_prefill_uses_the_generic_twoshot_path_with_seams_off() {
         let _guard = crate::test_env::env_guard();
-        let _env = crate::test_env::EnvScope::set(&[("PLOW_XR2_GATHER", "1")]);
+        let _env = crate::test_env::EnvScope::set(&[
+            ("PLOW_XR2_GATHER", "1"),
+            ("PLOW_SEQ_PAR_SEAMS", "0"),
+        ]);
         let p = build_full_t(8, 512);
         let xr: Vec<_> = p
             .insts
@@ -5887,7 +5899,8 @@ mod tests {
     #[test]
     fn k3_honors_the_generic_xreduce_cu_cap() {
         let _guard = crate::test_env::env_guard();
-        let _env = crate::test_env::EnvScope::set(&[("PLOW_XR_CUS", "32")]);
+        let _env =
+            crate::test_env::EnvScope::set(&[("PLOW_XR_CUS", "32"), ("PLOW_SEQ_PAR_SEAMS", "0")]);
         let p = build_full_t(8, 512);
         let xr: Vec<_> = p
             .insts
