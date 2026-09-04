@@ -38,7 +38,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use packet::dev::DevOp;
+use packet::dev::{DevOp, GEMM_WIDE_C8_TAG};
 use packet::devbuild::{Model, Program};
 use serde_json::{json, Map, Value};
 
@@ -120,6 +120,7 @@ fn arm_of(op: DevOp, i: &[u32; 8]) -> Arm {
         DevOp::KdaStateStep | DevOp::KdaStateStepG | DevOp::KdaConvStateStepG => {
             Some(format!("flags{:x}", i[4]))
         }
+        DevOp::GemmWide if i[7] == GEMM_WIDE_C8_TAG => Some("tile128x384x64".into()),
         _ => None,
     };
     Arm {
@@ -2171,6 +2172,19 @@ mod tests {
         let mut real = [0u32; 8];
         real[3] = 512;
         assert_eq!(arm_of(DevOp::FlashMerge, &real).hd, Some(512));
+    }
+
+    #[test]
+    fn gemm_wide_manifest_preserves_the_selected_tile() {
+        let plain = arm_of(DevOp::GemmWide, &[0; 8]);
+        assert_eq!(plain.key(), "GemmWide");
+
+        let mut tagged = [0; 8];
+        tagged[7] = GEMM_WIDE_C8_TAG;
+        assert_eq!(
+            arm_of(DevOp::GemmWide, &tagged).key(),
+            "GemmWide/tile128x384x64"
+        );
     }
 
     #[test]

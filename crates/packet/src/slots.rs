@@ -256,7 +256,8 @@ const INHERIT: &[(DevOp, DevOp, S)] = &[
     // Pure tile-size twins: same operands, different MFMA tile.
     (DevOp::GemmSmall,  DevOp::Gemm, NONE),
     (DevOp::GemmMed,    DevOp::Gemm, NONE),
-    (DevOp::GemmWide,   DevOp::Gemm, NONE),
+    (DevOp::GemmWide, DevOp::Gemm,
+     S { op: DevOp::GemmWide, t: &[], i: &["", "", "", "", "", "", "", "tile_variant"], f: &[], j: &[] }),
     (DevOp::GemmC5,     DevOp::Gemm, NONE),
     (DevOp::GemmSmallFp8, DevOp::GemmFp8, NONE),
     (DevOp::GemmMedFp8,   DevOp::GemmFp8, NONE),

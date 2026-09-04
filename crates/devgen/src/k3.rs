@@ -758,10 +758,10 @@ pub fn emit_k3_linear_norm(
     // trapping. The packet then leaves its output holding whatever the arena held — the run
     // completes, every row is finite and plausible, and every row is wrong.
     let gemv_arm = t == 1 || seq_rows;
-    let op = if gemv_arm {
-        DevOp::Gemv
+    let (op, gemm_blocks, gemm_variant) = if gemv_arm {
+        (DevOp::Gemv, n_cu, 0)
     } else {
-        crate::gfx950_prefill_tile(t, n, k, n_cu, kernelcaps::QuantScheme::None)
+        crate::pick_gemm_emit_plan(t, n, k, n_cu, kernelcaps::QuantScheme::None)
     };
     // A tiled prefill rung has no mode-2 arm, and AMD's dispatch `default:` writes NOTHING. The
     // caller's gate is `t == 1`; this is the assert that a future caller cannot get past it.
@@ -778,7 +778,7 @@ pub fn emit_k3_linear_norm(
     let blocks = if gemv_arm {
         crate::mla::blocked_gemv_cus_tuned(&all, n, k)
     } else {
-        all
+        (0..gemm_blocks).collect()
     };
     b.emit(op, blocks, deps, |d| {
         d.t[0] = out;
@@ -787,6 +787,7 @@ pub fn emit_k3_linear_norm(
         d.i[0] = t;
         d.i[1] = n;
         d.i[2] = k;
+        d.i[7] = gemm_variant;
         if let Some((gamma, eps)) = fold {
             // t[3] is the PRECOMPUTED-rms operand of mode 1 and stays absent: mode 2 computes
             // the scalar itself, which is the whole point.
@@ -4709,6 +4710,64 @@ mod tests {
         }
         for i in p.insts.iter().filter(|i| i.op == DevOp::AttnRes as u16) {
             assert_eq!(i.i[0], t);
+        }
+    }
+
+    #[test]
+    fn c8_exact_shape_is_explicit_and_default_off_in_the_packet() {
+        let _guard = crate::test_env::env_guard();
+        crate::set_amd_target("MI350X");
+        let emit = |m: u32, n: u32, k: u32| {
+            let mut b = Builder::new(256);
+            let out = b.tensor("out", 1);
+            let x = b.tensor("x", 1);
+            let w = b.tensor("w", 1);
+            emit_k3_linear(&mut b, out, x, w, m, n, k, 256, false, &[]);
+            b.finish().insts[0]
+        };
+
+        {
+            let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", "")]);
+            let inst = emit(8192, 1536, 7168);
+            assert_eq!(
+                inst.pack(),
+                packet::dev::DevInst64 {
+                    op: DevOp::GemmWide as u16,
+                    blocks: 256,
+                    fj: [0; 3],
+                    t: [0, 1, 2, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff],
+                    i: [8192, 1536, 7168, 0, 0, 0, 0, 0],
+                },
+                "flag-off must preserve the exact pre-c8 64-byte wire packet"
+            );
+            assert_eq!(inst.i[7], 0, "flag-off packets must retain the c2 encoding");
+            assert_eq!(
+                inst.op,
+                crate::gfx950_prefill_tile(8192, 1536, 7168, 256, kernelcaps::QuantScheme::None)
+                    as u16,
+                "flag-off selection must use the unchanged TuneDB/analytical path"
+            );
+            assert_eq!(inst.blocks, 256);
+        }
+        {
+            let _scope =
+                crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", "8192x1536x7168")]);
+            let inst = emit(8192, 1536, 7168);
+            assert_eq!(inst.op, DevOp::GemmWide as u16);
+            assert_eq!(inst.i[7], packet::dev::GEMM_WIDE_C8_TAG);
+            assert_eq!(inst.blocks, 256, "64x4 c8 tiles must emit the exact grid");
+
+            let other = emit(4096, 1536, 7168);
+            assert_eq!(other.i[7], 0, "the opt-in is exact-shape, not model-wide");
+        }
+        {
+            let _scope =
+                crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8_SHAPE", "4096x1536x7168")]);
+            let inst = emit(4096, 1536, 7168);
+            assert_eq!(
+                inst.i[7], 0,
+                "a 128-tile grid must not claim the 256-CU c8 arm"
+            );
         }
     }
 

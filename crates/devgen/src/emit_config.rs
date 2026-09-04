@@ -594,6 +594,11 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_TUNE_DUMP", default_value_t = false, value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub tune_dump: bool,
 
+    /// Exact MxNxK shape allowed to use the experimental gfx950 128x384x64 GemmWide body.
+    /// Unset keeps packet bytes and the 128x256x64 body unchanged.
+    #[arg(long = "emit-gemm-wide-c8-shape", env = "PLOW_GEMM_WIDE_C8_SHAPE")]
+    pub gemm_wide_c8_shape: Option<String>,
+
     // ──────────────────────────────────────────────────────────────────────────
     // Diagnostic / never-ship (hidden from --help)
     // ──────────────────────────────────────────────────────────────────────────
@@ -607,6 +612,22 @@ pub struct EmitConfig {
 }
 
 impl EmitConfig {
+    pub fn gemm_wide_c8_for(&self, m: u32, n: u32, k: u32) -> bool {
+        let Some(shape) = self.gemm_wide_c8_shape.as_deref() else {
+            return false;
+        };
+        let dims: Vec<_> = shape.split(['x', 'X']).collect();
+        assert!(
+            dims.len() == 3,
+            "PLOW_GEMM_WIDE_C8_SHAPE must be MxNxK, got {shape:?}"
+        );
+        let parse = |v: &str| {
+            v.parse::<u32>()
+                .unwrap_or_else(|_| panic!("PLOW_GEMM_WIDE_C8_SHAPE must be MxNxK, got {shape:?}"))
+        };
+        (parse(dims[0]), parse(dims[1]), parse(dims[2])) == (m, n, k)
+    }
+
     /// Return the first valid shape-keyed workgroup cap for `(N,K)`.
     pub fn gemv_wg_for(&self, n: u32, k: u32) -> Option<u32> {
         self.gemv_wg_tuning
@@ -771,6 +792,7 @@ impl EmitConfig {
             glm_wgfit: env_opt_out("PLOW_GLM_WGFIT"),
             tunedb: std::env::var("PLOW_TUNEDB").ok(), // preserves "" for "disable tuning"
             tune_dump: env_bool("PLOW_TUNE_DUMP"),
+            gemm_wide_c8_shape: env_str("PLOW_GEMM_WIDE_C8_SHAPE"),
             skip_coverage: env_bool("PLOW_SKIP_COVERAGE"),
             k3_ablate: env_str("PLOW_K3_ABLATE"),
         }
@@ -1164,6 +1186,7 @@ mod tests {
             ("w8a8", "any_fp8_weights()"),
             ("w8a16", "any_fp8_weights()"),
             ("gemv_wg_tuning", "gemv_wg_for("),
+            ("gemm_wide_c8_shape", "gemm_wide_c8_for("),
         ];
 
         let dead: Vec<&str> = fields
@@ -1254,5 +1277,21 @@ mod tests {
              `emit_config::active()`. If it genuinely belongs to another crate, add it to \
              ALLOWED with the reason — but prefer migrating."
         );
+    }
+
+    #[test]
+    fn gemm_wide_c8_selector_matches_one_exact_shape() {
+        let mut cfg = EmitConfig::from_env();
+        cfg.gemm_wide_c8_shape = Some("8192x1536x7168".into());
+        assert!(cfg.gemm_wide_c8_for(8192, 1536, 7168));
+        assert!(!cfg.gemm_wide_c8_for(4096, 1536, 7168));
+    }
+
+    #[test]
+    #[should_panic(expected = "PLOW_GEMM_WIDE_C8_SHAPE must be MxNxK")]
+    fn gemm_wide_c8_selector_rejects_an_invalid_shape() {
+        let mut cfg = EmitConfig::from_env();
+        cfg.gemm_wide_c8_shape = Some("8192x1536".into());
+        cfg.gemm_wide_c8_for(8192, 1536, 7168);
     }
 }

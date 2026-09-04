@@ -31,8 +31,8 @@ use kernelcaps::QuantScheme;
 use packet::dev::DevOp;
 use tunedb::gemm::parse_quant;
 use tunedb::{
-    gemm_op_case, gemm_rung_opcode, Correctness, Digests, KernelMeasurement, RecordState, Stats,
-    TuneStore, GEMM_ORACLE,
+    gemm_op_case, gemm_rung_emit_plan, gemm_rung_opcode, Correctness, Digests, KernelMeasurement,
+    RecordState, Stats, TuneStore, GEMM_ORACLE,
 };
 
 type Err = Box<dyn std::error::Error>;
@@ -127,11 +127,9 @@ pub fn ingest(
         }
         let r: Row = serde_json::from_str(line)?;
         let quant = parse_quant(&r.quant).ok_or_else(|| format!("unknown quant {:?}", r.quant))?;
-        // A tile with no dispatch arm is a legitimate measurement of a kernel BODY and not a
-        // selectable fact — the sweep also compiles calibration-only tiles (320x128, 384x128,
-        // 128x384, 192x128). Reported, never stored. The static RUNGS map is kept as a fallback
-        // for a probe that found no tiled specs (it is also what pins the sweep↔dispatch
-        // agreement in `rungs_map_to_distinct_opcodes`).
+        // A tile with no dispatch representation is a legitimate measurement of a kernel BODY
+        // and not a selectable fact. The richer emit-plan map covers tagged bodies that share an
+        // opcode; the static opcode map remains the fallback for ordinary rungs.
         let mut ops: Vec<DevOp> = tile_ops
             .iter()
             .filter(|(t, q, _)| *t == r.tile && *q == quant)
@@ -139,7 +137,8 @@ pub fn ingest(
             .collect();
         ops.sort_unstable_by_key(|op| *op as u16);
         ops.dedup();
-        if ops.is_empty() {
+        let tagged_plan = gemm_rung_emit_plan(&r.tile, quant).filter(|p| p.packet_tag != 0);
+        if ops.is_empty() && tagged_plan.is_none() {
             if let Some(op) = gemm_rung_opcode(&r.tile, quant) {
                 ops.push(op);
             } else {
@@ -157,8 +156,14 @@ pub fn ingest(
                 detail: format!("f64 dot spot-check mismatch on {}", r.sym),
             }
         };
-        for op in ops {
-            let (kernel_id, kernel_name) = (op as u16, op.c_name().to_string());
+        let identities: Vec<(u16, String)> = if let Some(plan) = tagged_plan {
+            vec![(plan.measurement_id, plan.kernel_name())]
+        } else {
+            ops.into_iter()
+                .map(|op| (op as u16, op.c_name().to_string()))
+                .collect()
+        };
+        for (kernel_id, kernel_name) in identities {
             if !r.correct {
                 failed.push(format!("{op_case} {kernel_name}"));
             }

@@ -44,6 +44,10 @@ pub const WG_THREADS: u32 = WG_WAVES * 64;
 
 pub const TENSOR_NONE: u32 = 0xFFFF_FFFF;
 
+/// `GemmWide.i[7]` tag selecting the gfx950 128x384x64 implementation.
+/// Zero remains the 128x256x64 body, preserving existing packet bytes.
+pub const GEMM_WIDE_C8_TAG: u32 = (128 << 16) | 384;
+
 /// Sentinel for an ABSENT tensor handle carried in a [`DevInst::i`] slot.
 ///
 /// A handful of ops demote a pointer into `i[]` because ten operands do not fit
@@ -872,6 +876,8 @@ pub enum DevOp {
     GemmMxfp4 = 93,
 
     /// As [`DevOp::Gemm`], 128×256 tile — the rung that owns the M=1024–2048 serving chunk.
+    /// `i7=tile_variant`: zero selects 128×256×64; [`GEMM_WIDE_C8_TAG`] selects the
+    /// default-off gfx950 128×384×64 exact-grid experiment.
     ///
     /// Added by the tile-inventory campaign. Between `Gemm` (256×256) and [`DevOp::GemmMed`]
     /// (128×128) the inventory had nothing that both fills 256 CUs and keeps BN=256's A-reuse,

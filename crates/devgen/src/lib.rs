@@ -384,6 +384,38 @@ fn pick_tile(m: u32, n: u32, k: u32, n_cu: u32, quant: kernelcaps::QuantScheme) 
     pick_tile_tiered(m, n, k, n_cu, quant).0
 }
 
+pub(crate) fn pick_gemm_emit_plan(
+    m: u32,
+    n: u32,
+    k: u32,
+    n_cu: u32,
+    quant: kernelcaps::QuantScheme,
+) -> (DevOp, u32, u32) {
+    let c8 = tunedb::gemm_rung_emit_plan("128x384x64", quant);
+    let c8 = c8.filter(|plan| {
+        let blocks = plan.blocks(m, n);
+        emit_is_amd()
+            && amd_target::active().1 == hwspec::IsaLevel::Gfx950
+            && quant == kernelcaps::QuantScheme::None
+            && m.is_multiple_of(plan.bm)
+            && n.is_multiple_of(plan.bn)
+            && k.is_multiple_of(plan.bk)
+            && blocks == n_cu
+            && emit_config::active().gemm_wide_c8_for(m, n, k)
+            && gfx950_gemm_measurements().variant_is_winner(
+                m as i64,
+                n as i64,
+                k as i64,
+                quant,
+                plan.measurement_id,
+            )
+    });
+    if let Some(plan) = c8 {
+        return (plan.op, plan.blocks(m, n), plan.packet_tag);
+    }
+    (gfx950_prefill_tile(m, n, k, n_cu, quant), n_cu, 0)
+}
+
 /// [`pick_tile`] plus WHAT DECIDED IT. One implementation, because two copies of this function
 /// is exactly how the pair in `plowc/src/bin/` drifted apart.
 fn pick_tile_tiered(
@@ -693,6 +725,34 @@ impl GemmMeasurements {
         tune_demand::record(m, n, k, quant, hit.is_some());
         Box::leak(Box::new(ShapeCosts(hit)))
     }
+
+    fn variant_is_winner(
+        &self,
+        m: i64,
+        n: i64,
+        k: i64,
+        quant: kernelcaps::QuantScheme,
+        measurement_id: u16,
+    ) -> bool {
+        let Some(costs) = self.by_case.get(&tunedb::gemm_op_case(m, n, k, quant)) else {
+            return false;
+        };
+        let Some(candidate) = costs.get(&measurement_id) else {
+            return false;
+        };
+        costs.values().all(|cost| candidate <= cost)
+    }
+}
+
+/// Whether the qualified/current c8 measurement wins this exact BF16 shape.
+pub fn gfx950_c8_is_measured_winner(m: i64, n: i64, k: i64) -> bool {
+    gfx950_gemm_measurements().variant_is_winner(
+        m,
+        n,
+        k,
+        kernelcaps::QuantScheme::None,
+        tunedb::GEMM_WIDE_C8_MEASUREMENT_ID,
+    )
 }
 
 /// Qualified, non-stale GEMM measurements for the ACTIVE AMD target.

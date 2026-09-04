@@ -1142,7 +1142,6 @@ PLOW_GM_MXFP4_TILE(d_gemm_mxfp4, GM_BM, GM_BN, GM_BK)
 #define GM_C8_BM 128
 #define GM_C8_BN 384
 #define GM_C8_BK 64
-#define GM_C8_TAG ((GM_C8_BM << 16) | GM_C8_BN)
 
 __device__ void d_gemm_small(bf16* C, const bf16* A, const bf16* B, unsigned M, unsigned N,
                              unsigned K, unsigned slice, unsigned nblk, bf16* lds) {

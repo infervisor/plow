@@ -44,6 +44,8 @@
 #define PLOW_SASSERT(c, m) _Static_assert(c, m)
 #endif
 
+#define PLOW_GEMM_WIDE_C8_TAG ((128u << 16) | 384u)
+
 /* Device opcodes. Deliberately a small closed set — the interpreter's switch is
  * the hot path, so this is an ISA, not an extension point.
  *
