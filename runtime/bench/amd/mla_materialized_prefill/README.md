@@ -179,3 +179,47 @@ payload mismatch before comparing outputs. For rel-L2, max-absolute error, and
 cosine loss, materialized Plow must be no worse than absorbed Plow plus the
 largest adjacent vLLM repeat floor. This boundary gate is required before the
 existing long-continuation and TP8 timing gates; it does not replace them.
+
+### Standalone boundary replay ABI
+
+`scripts/mla_boundary_abi.py` seals a model-independent capture. Its contract is
+described entirely by dimensions, causal semantics, layout, and softmax scale.
+Every manifest includes exact u32le prompt-token and tensor SHA256 values. The
+required source set is `latent.q`, `latent.kv`, `rope.k`, and the Q, KV, and
+output projection weights. A materialized capture additionally contains BF16
+`projected.q` and `projected.kv`.
+
+The pinned vLLM `MLACommonImpl.forward_mha` is not an `nn.Module`: packed K
+and V are local variables immediately passed to the custom attention op, so a
+standard module hook cannot call or capture that boundary. The generic hook can
+now capture exact BF16 module outputs and module weights. `pack-materialized`
+then reconstructs byte-exact token/head-dense Q192/K192/V128 from Q projection,
+KV projection, and K-RoPE outside the timed region. This avoids a model-class
+patch while retaining a precise ABI for a future custom-op interception.
+
+```sh
+nix develop -c python3 scripts/mla_boundary_abi.py seal \
+  --spec /tmp/mla/spec.json --output /tmp/mla/sealed.json --require-source
+nix develop -c python3 scripts/mla_boundary_abi.py pack-materialized \
+  --manifest /tmp/mla/sealed.json --output-dir /tmp/mla/packed
+nix develop -c runtime/bench/amd/mla_materialized_prefill/build_replay.sh \
+  /tmp/mla/replay
+GPU_LEASE_DIR=/tmp/gpulease nix develop -c python3 scripts/mla_boundary_abi.py \
+  replay-materialized --manifest /tmp/mla/packed/manifest.json \
+  --binary /tmp/mla/replay/replay --object /tmp/mla/replay/opus.elf \
+  --gpulease perf-data/tools/gpulease --output-dir /tmp/mla/plow-materialized
+GPU_LEASE_DIR=/tmp/gpulease nix develop -c python3 scripts/mla_boundary_abi.py \
+  replay-absorbed --manifest /tmp/mla/packed/manifest.json \
+  --binary /tmp/mla/replay/replay-absorbed --object /tmp/mla/replay/kernel.co \
+  --gpulease perf-data/tools/gpulease --output-dir /tmp/mla/plow-absorbed
+```
+
+Both replays perform three adjacent launches and reject any BF16 output-byte drift.
+The absorbed replay derives its absorbed Q, Q-RoPE, and value-fold weights once
+from the same sealed factor weights and latent tensors, also outside timing.
+The materialized replay records the object hash and median kernel time. Input capture, hashing,
+packing, uploads, and downloads are outside the event interval. It deliberately
+does not synthesize `residual.output`: that tensor must be captured after the
+real output projection/residual seam so the quality gate measures the runtime's
+actual BF16 GEMM reduction order. Until pinned-vLLM and both Plow arms provide
+that seam tensor from the same sealed source, TP8 promotion remains blocked.

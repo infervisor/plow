@@ -1,0 +1,84 @@
+{
+  "output_dir": "/tmp/mla-boundary/vllm-capture",
+  "prompt_sha256_u32le": "REPLACE_WITH_EXACT_PROMPT_TOKEN_SHA256",
+  "rank": 0,
+  "method_selectors": [
+    {
+      "target": "vllm.model_executor.layers.attention.mla_attention.MLACommonImpl.forward_mha",
+      "semantic": "projected.q",
+      "extract": {"source": "args", "path": [0]},
+      "storage_dtype": "bf16",
+      "row": "all",
+      "layer": 0,
+      "call_index": 0,
+      "phase": "before"
+    },
+    {
+      "target": "vllm.model_executor.layers.attention.mla_attention.MLACommonImpl.forward_mha",
+      "semantic": "latent.kv",
+      "extract": {"source": "args", "path": [1]},
+      "storage_dtype": "bf16",
+      "row": "all",
+      "layer": 0,
+      "call_index": 0,
+      "phase": "before"
+    },
+    {
+      "target": "vllm.model_executor.layers.attention.mla_attention.MLACommonImpl.forward_mha",
+      "semantic": "rope.k",
+      "extract": {"source": "args", "path": [2]},
+      "storage_dtype": "bf16",
+      "row": "all",
+      "layer": 0,
+      "call_index": 0,
+      "phase": "before"
+    },
+    {
+      "target": "vllm.model_executor.layers.attention.mla_attention.MLACommonImpl.forward_mha",
+      "semantic": "attention.output",
+      "extract": {"source": "args", "path": [6]},
+      "storage_dtype": "bf16",
+      "row": "all",
+      "layer": 0,
+      "call_index": 0,
+      "phase": "after"
+    }
+  ],
+  "selectors": [
+    {
+      "module_regex": ".*layers\\.(?P<layer>[0-9]+)\\.self_attn\\.q_a_layernorm$",
+      "semantic": "latent.q",
+      "extract": {"source": "output"},
+      "storage_dtype": "bf16",
+      "row": "all"
+    },
+    {
+      "module_regex": ".*layers\\.(?P<layer>[0-9]+)\\.self_attn\\.q_b_proj$",
+      "semantic": "weight.q_projection",
+      "extract": {"source": "module", "path": ["weight"]},
+      "storage_dtype": "bf16",
+      "row": "all"
+    },
+    {
+      "module_regex": ".*layers\\.(?P<layer>[0-9]+)\\.self_attn\\.kv_b_proj$",
+      "semantic": "projected.kv",
+      "extract": {"source": "output", "path": [0]},
+      "storage_dtype": "bf16",
+      "row": "all"
+    },
+    {
+      "module_regex": ".*layers\\.(?P<layer>[0-9]+)\\.self_attn\\.kv_b_proj$",
+      "semantic": "weight.kv_projection",
+      "extract": {"source": "module", "path": ["weight"]},
+      "storage_dtype": "bf16",
+      "row": "all"
+    },
+    {
+      "module_regex": ".*layers\\.(?P<layer>[0-9]+)\\.self_attn\\.o_proj$",
+      "semantic": "weight.output_projection",
+      "extract": {"source": "module", "path": ["weight"]},
+      "storage_dtype": "bf16",
+      "row": "all"
+    }
+  ]
+}

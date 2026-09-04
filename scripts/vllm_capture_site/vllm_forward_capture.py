@@ -7,6 +7,7 @@ spawned tensor-parallel workers receive it without patching vLLM.
 """
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -43,20 +44,20 @@ def _descend(value, path):
     return value
 
 
-def _extract(spec, args, kwargs, output):
+def _extract(spec, module, args, kwargs, output):
     import torch
 
     if "first_tensor" in spec:
         for candidate in spec["first_tensor"]:
             try:
-                value = _extract(candidate, args, kwargs, output)
+                value = _extract(candidate, module, args, kwargs, output)
             except (AttributeError, IndexError, KeyError, TypeError):
                 continue
             if isinstance(value, torch.Tensor):
                 return value
         return None
     if "add" in spec:
-        values = [_extract(x, args, kwargs, output).float() for x in spec["add"]]
+        values = [_extract(x, module, args, kwargs, output).float() for x in spec["add"]]
         value = values[0]
         for other in values[1:]:
             value = value + other
@@ -70,6 +71,8 @@ def _extract(spec, args, kwargs, output):
         value = args
     elif source == "kwargs":
         value = kwargs
+    elif source == "module":
+        value = module
     else:
         raise ValueError(f"unknown capture source {source!r}")
     return _descend(value, spec.get("path", []))
@@ -89,6 +92,10 @@ def install(config):
         item = dict(raw)
         item["regex"] = re.compile(item.pop("module_regex"))
         selectors.append(item)
+    method_selectors = {}
+    for raw in config.get("method_selectors", []):
+        item = dict(raw)
+        method_selectors.setdefault(item.pop("target"), []).append(item)
     prompt_hash = config["prompt_sha256_u32le"]
     history_id = config.get("history_id", prompt_hash[:16])
     wanted_rank = config.get("rank", 0)
@@ -99,10 +106,10 @@ def install(config):
     sequences = {}
     lock = threading.Lock()
 
-    def capture(module_name, item, match, args, kwargs, output):
+    def capture(source_object, module_name, item, match, args, kwargs, output):
         if wanted_rank is not None and rank != wanted_rank:
             return
-        value = _extract(item["extract"], args, kwargs, output)
+        value = _extract(item["extract"], source_object, args, kwargs, output)
         if not isinstance(value, torch.Tensor) or value.numel() == 0:
             if item.get("on_missing", "error") == "skip":
                 return
@@ -130,7 +137,20 @@ def install(config):
             largest[key] = rows
             sequence = sequences.get(key, 0)
             sequences[key] = sequence + 1
-        array = value.detach().float().cpu().contiguous().numpy().astype("<f4", copy=False)
+        value = value.detach().cpu().contiguous()
+        storage_dtype = item.get("storage_dtype", "float32")
+        if storage_dtype == "bf16":
+            if value.dtype != torch.bfloat16:
+                raise TypeError(
+                    f"{module_name}: {semantic} is {value.dtype}, expected exact BF16 capture"
+                )
+            array = value.view(torch.uint16).numpy().astype("<u2", copy=False)
+            suffix = "bf16"
+        elif storage_dtype == "float32":
+            array = value.float().numpy().astype("<f4", copy=False)
+            suffix = "f32"
+        else:
+            raise ValueError(f"unsupported storage_dtype {storage_dtype!r}")
         retain = int(item.get("retain", 1))
         sample = sequence % retain
         stem = (
@@ -138,7 +158,7 @@ def install(config):
             if retain > 1
             else f"{_safe(semantic)}.layer-{_safe(layer)}.rank-{rank}"
         )
-        data_path = output_dir / f"{stem}.f32"
+        data_path = output_dir / f"{stem}.{suffix}"
         tmp_path = output_dir / f".{stem}.{os.getpid()}.tmp"
         array.tofile(tmp_path)
         os.replace(tmp_path, data_path)
@@ -152,7 +172,7 @@ def install(config):
             "prompt_sha256_u32le": prompt_hash,
             "history_id": history_id,
             "source_dtype": source_dtype,
-            "stored_dtype": "float32",
+            "stored_dtype": storage_dtype,
             "source_shape": source_shape,
             "stored_shape": list(array.shape),
             "source_stride": source_stride,
@@ -176,10 +196,33 @@ def install(config):
         for item in selectors:
             match = item["regex"].fullmatch(module_name)
             if match:
-                capture(module_name, item, match, args, kwargs, output)
+                capture(module, module_name, item, match, args, kwargs, output)
         return output
 
     torch.nn.Module._call_impl = wrapped
+    for target, items in method_selectors.items():
+        module_name, class_name, method_name = target.rsplit(".", 2)
+        owner = getattr(importlib.import_module(module_name), class_name)
+        original_method = getattr(owner, method_name)
+
+        def method_wrapper(self, *args, __items=items, __target=target,
+                           __original=original_method, __calls=[0], **kwargs):
+            call_index = __calls[0]
+            __calls[0] += 1
+            for item in __items:
+                if item.get("phase", "after") == "before" and item.get(
+                    "call_index", call_index
+                ) == call_index:
+                    capture(self, __target, item, re.fullmatch("", ""), args, kwargs, None)
+            result = __original(self, *args, **kwargs)
+            for item in __items:
+                if item.get("phase", "after") == "after" and item.get(
+                    "call_index", call_index
+                ) == call_index:
+                    capture(self, __target, item, re.fullmatch("", ""), args, kwargs, result)
+            return result
+
+        setattr(owner, method_name, method_wrapper)
     _installed = True
 
 

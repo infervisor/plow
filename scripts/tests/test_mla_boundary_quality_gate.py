@@ -4,7 +4,7 @@ import subprocess
 import sys
 
 
-def manifest(tmp_path, name, inputs, outputs):
+def manifest(tmp_path, name, inputs, outputs, contract=None):
     tensors = []
     for semantic, values in {**inputs, **outputs}.items():
         path = tmp_path / f"{name}.{semantic}.f32"
@@ -27,7 +27,8 @@ def manifest(tmp_path, name, inputs, outputs):
     out = tmp_path / f"{name}.json"
     out.write_text(
         json.dumps(
-            {"schema": 1, "prompt_sha256_u32le": "history", "tensors": tensors}
+            {"schema": 1, "prompt_sha256_u32le": "history", "tensors": tensors,
+             **({"contract": contract} if contract is not None else {})}
         )
     )
     return out
@@ -89,3 +90,17 @@ def test_rejects_materialized_error_beyond_control_and_floor(tmp_path):
     materialized = manifest(tmp_path, "m", inputs, {"attention.output": [11.0], "residual.output": [21.0]})
     result = run_gate(tmp_path, ref0, ref1, absorbed, materialized)
     assert result.returncode == 2
+
+
+def test_rejects_different_boundary_contract(tmp_path):
+    inputs = {"q": [1.0], "k": [2.0], "v": [3.0]}
+    outputs = {"attention.output": [10.0], "residual.output": [20.0]}
+    contract = {"dimensions": {"tokens": 1}, "softmax_scale": 0.5}
+    ref0 = manifest(tmp_path, "r0", inputs, outputs, contract)
+    ref1 = manifest(tmp_path, "r1", inputs, outputs, contract)
+    absorbed = manifest(tmp_path, "a", inputs, outputs, contract)
+    materialized = manifest(tmp_path, "m", inputs, outputs,
+                            {"dimensions": {"tokens": 1}, "softmax_scale": 1.0})
+    result = run_gate(tmp_path, ref0, ref1, absorbed, materialized)
+    assert result.returncode != 0
+    assert b"boundary contracts differ" in result.stderr

@@ -16,6 +16,16 @@ from pathlib import Path
 import sys
 
 
+ABI_SOURCE_SEMANTICS = {
+    "latent.q",
+    "latent.kv",
+    "rope.k",
+    "weight.q_projection",
+    "weight.kv_projection",
+    "weight.output_projection",
+}
+
+
 def load_manifest(path):
     data = json.loads(path.read_text())
     rows = {}
@@ -72,10 +82,16 @@ def metrics(candidate, reference):
     cand2 = math.fsum(a * a for a in candidate)
     dot = math.fsum(a * b for a, b in zip(candidate, reference))
     max_abs = max(abs(a - b) for a, b in zip(candidate, reference))
+    if cand2 == 0.0 and ref2 == 0.0:
+        cosine = 1.0
+    elif cand2 == 0.0 or ref2 == 0.0:
+        cosine = 0.0
+    else:
+        cosine = dot / math.sqrt(cand2 * ref2)
     return {
         "rel_l2": math.sqrt(delta2) / max(math.sqrt(ref2), 1e-30),
         "max_abs": max_abs,
-        "cosine": dot / max(math.sqrt(cand2 * ref2), 1e-30),
+        "cosine": cosine,
     }
 
 
@@ -108,8 +124,20 @@ def main():
     histories = {x["prompt_sha256_u32le"] for x in metas}
     if len(histories) != 1:
         raise ValueError("token-history hashes differ")
+    contracts = [x.get("contract") for x in metas]
+    if any(x is not None for x in contracts):
+        if any(x is None for x in contracts):
+            raise ValueError("boundary contract is missing from one or more manifests")
+        encoded_contracts = {json.dumps(x, sort_keys=True, separators=(",", ":")) for x in contracts}
+        if len(encoded_contracts) != 1:
+            raise ValueError("boundary contracts differ")
+        contract_sha256 = hashlib.sha256(encoded_contracts.pop().encode()).hexdigest()
+    else:
+        contract_sha256 = None
 
     inputs = parse_semantics(args.input_semantic)
+    if all(x.get("schema") == "plow.mla-boundary.v1" for x in metas):
+        inputs |= ABI_SOURCE_SEMANTICS
     outputs = parse_semantics(args.output_semantic)
     all_rows = [x[1] for x in ref_loaded] + [absorbed, materialized]
     input_hashes = {}
@@ -179,6 +207,7 @@ def main():
         "schema": 1,
         "gate": "same-input-attention-boundary",
         "prompt_sha256_u32le": histories.pop(),
+        "contract_sha256": contract_sha256,
         "references": [str(x) for x in args.reference],
         "absorbed": str(args.absorbed),
         "materialized": str(args.materialized),
