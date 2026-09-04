@@ -1122,6 +1122,7 @@ mod tests {
 
     #[test]
     fn kda_carry_regstate_defaults_on_and_allows_env_opt_out() {
+        let _guard = crate::test_env::env_guard();
         let _scope = crate::test_env::EnvScope::set(&[("PLOW_KDA_CARRY_REGSTATE", "1")]);
         std::env::remove_var("PLOW_KDA_CARRY_REGSTATE");
         assert!(EmitConfig::from_env().kda_carry_regstate);

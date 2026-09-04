@@ -14797,7 +14797,12 @@ mod tests {
             (0x1800, 0x1900)
         );
         assert_eq!(args.grid, 32256);
-        assert!(matches!(routes[1], PrefillSegmentRoute::Interpreter));
+        // The pure combine segment takes the exact lean combine object (edffb73).
+        assert!(
+            matches!(routes[1], PrefillSegmentRoute::MoeCombine(_)),
+            "pure combine segment must route to the lean combine object, got {:?}",
+            routes[1]
+        );
 
         let no_companion = moe_mxfp4_routes(&prog, &tensors[..8], &devp[..8]).unwrap();
         assert!(matches!(no_companion[0], PrefillSegmentRoute::Interpreter));
