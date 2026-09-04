@@ -5154,13 +5154,16 @@ __device__ void d_mla_merge_fold(bf16* __restrict__ O_, const float* __restrict_
  * the lane->column map (NV), the l-slice split (LS/BL), the unroll (UN) and the two-stage
  * (shfl, LDS) fold are the ones `d_mla_merge_fold` already uses.
  *
- * BIT-IDENTITY. Held, deliberately, and it is the reason the loop nest is written in this order.
+ * BIT-IDENTITY. Intended by the source order, and it is the reason the loop nest is written in
+ * this order.
  * For a fixed token g the sequence of adds into `acc[g][k]` is exactly the sequence the scalar
  * body makes into `acc[k]`: same outer `i` order, same `u` order inside a group, same `l`-block
  * per wave, same shfl tree, same increasing-wave LDS sum. `TB` only interleaves INDEPENDENT
- * accumulator chains; it never reassociates one. The merge half is untouched per token. So this
- * is a pure memory-traffic transform and the output is bit-for-bit the shipped kernel's — which
- * is what makes it gateable against a character-identical control rather than a tolerance.
+ * accumulator chains; it never reassociates one. The merge half is untouched per token. The
+ * V=128 gfx950 oracle nevertheless rejects TB>1: multiple live chains change the compiler's
+ * packed-FMA schedule and 245--1,463 BF16 outputs differ. This arm therefore remains an isolated,
+ * default-off experiment; every new shape needs the character-identical gate rather than a
+ * tolerance.
  *
  * LDS. `olds` grows to TB*DK floats. `red` does NOT grow to TB*PLOW_WAVES*VT (16384 floats at
  * TB=8, VT=256 — 64 KiB, over the arena on top of olds); the cross-wave fold runs in chunks of
