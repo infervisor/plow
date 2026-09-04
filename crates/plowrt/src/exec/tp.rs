@@ -136,6 +136,10 @@ pub struct PeerLayout {
     xctr_off: u64,
     /// Byte offset of the compact-audit status line.
     xstatus_off: u64,
+    /// Byte offset / slot size of the tagged one-shot XReduce region
+    /// (`PlowProgram::xr_tag_off` / `xr_tag_slot`).
+    xr_tag_off: u64,
+    xr_tag_slot: u64,
     /// Total peer-mapped bytes per rank.
     total: u64,
 }
@@ -162,6 +166,11 @@ pub struct PeerLayout {
 pub const PARTIAL_SLOTS: u64 = 3;
 
 impl PeerLayout {
+    /// `PLOW_XR_TAG_SLOT_BYTES` (dev_isa.h): bytes per tagged one-shot slot.
+    pub const XR_TAG_SLOT: u64 = 20480;
+    /// Widest `[1, hidden]` message the slot holds at three bf16 per 8-byte word.
+    pub const XR_TAG_MAX_WIDTH: u32 = (Self::XR_TAG_SLOT / 8 * 3) as u32;
+
     /// Cross-GPU counters a program needs: **one gate per one-shot `XReduce`
     /// (decode), two per `XReduceTwoShot` (prefill — the reduce-scatter and
     /// all-gather rendezvous)**, times the two all-reduces per layer.
@@ -187,7 +196,13 @@ impl PeerLayout {
         }
         let xctr_off = partial_bytes * PARTIAL_SLOTS;
         let xstatus_off = xctr_off + n_xctr as u64 * XCTR_STRIDE as u64;
-        let total = xstatus_off + XCTR_STRIDE as u64;
+        // Tagged one-shot region: four slots (partial parity 0/1, gather parity 0/1) of
+        // 8-byte words holding three bf16 + a 16-bit tag. It follows the status line — the
+        // device derives it from the packet's status id and `PLOW_XR_TAG_SLOT_BYTES`, so the
+        // slot is a constant here too — and the per-token zeroing covers it in one pass.
+        let xr_tag_off = xstatus_off + XCTR_STRIDE as u64;
+        let xr_tag_slot = Self::XR_TAG_SLOT;
+        let total = xr_tag_off + 4 * xr_tag_slot;
         Some(PeerLayout {
             hidden,
             max_tokens,
@@ -195,6 +210,8 @@ impl PeerLayout {
             partial_bytes,
             xctr_off,
             xstatus_off,
+            xr_tag_off,
+            xr_tag_slot,
             total,
         })
     }
@@ -229,8 +246,21 @@ impl PeerLayout {
         self.xstatus_off
     }
 
+    /// The tagged one-shot region, right after the status line (four [`Self::XR_TAG_SLOT`]
+    /// slots): what `d_xreduce_tagged_mega` derives from the status id.
+    pub fn xr_tag_off(&self) -> u64 {
+        self.xr_tag_off
+    }
+
+    pub fn xr_tag_slot(&self) -> u64 {
+        self.xr_tag_slot
+    }
+
+    /// Bytes zeroed per token from `xctr`: counters, status line and the tagged region,
+    /// which are contiguous. Tags are unique per (collective, token) only because every
+    /// token starts from zeroed slots.
     fn xstate_bytes(&self) -> u64 {
-        self.xctr_bytes() + XCTR_STRIDE as u64
+        self.xctr_bytes() + XCTR_STRIDE as u64 + 4 * self.xr_tag_slot
     }
 }
 
@@ -861,7 +891,38 @@ mod tests {
         assert_eq!(l.xctr_off(), 3 * 3840 * 2);
         assert_eq!(l.xctr_bytes(), 96 * 128);
         assert_eq!(l.xstatus_off(), l.xctr_off() + l.xctr_bytes());
-        assert!(l.bytes() < 48 * 1024, "peer footprint {} B", l.bytes());
+        // The tagged one-shot region: four constant slots directly after the status line
+        // (the device derives that address from the packet's status id), inside the
+        // per-token zeroing, and wide enough for K3's 7168 at three bf16 per word.
+        assert_eq!(l.xr_tag_off(), l.xstatus_off() + 128);
+        assert_eq!(l.xr_tag_slot(), 20480);
+        assert_eq!(PeerLayout::XR_TAG_MAX_WIDTH, 7680);
+        assert_eq!(l.bytes(), l.xr_tag_off() + 4 * 20480);
+        assert_eq!(l.xstate_bytes(), l.bytes() - l.xctr_off());
+        // 23 KiB of partials + 12 KiB of counters + 80 KiB of tagged slots.
+        assert!(l.bytes() < 128 * 1024, "peer footprint {} B", l.bytes());
+    }
+
+    /// The device-side constant and the host's must agree: read it from dev_isa.h.
+    #[test]
+    fn tagged_slot_matches_dev_isa() {
+        let hdr = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../runtime/common/dev_isa.h"
+        ))
+        .expect("dev_isa.h");
+        let line = hdr
+            .lines()
+            .find(|l| l.starts_with("#define PLOW_XR_TAG_SLOT_BYTES"))
+            .expect("PLOW_XR_TAG_SLOT_BYTES in dev_isa.h");
+        let v: u64 = line
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .trim_end_matches('u')
+            .parse()
+            .unwrap();
+        assert_eq!(v, PeerLayout::XR_TAG_SLOT);
     }
 
     /// Prefill is the case that breaks a decode-shaped layout: the message is
@@ -876,7 +937,7 @@ mod tests {
         assert_eq!(l.partial_off(1).unwrap(), 2048 * h as u64 * 2);
         assert_eq!(
             l.bytes(),
-            PARTIAL_SLOTS * 2048 * h as u64 * 2 + (192 + 1) * 128
+            PARTIAL_SLOTS * 2048 * h as u64 * 2 + (192 + 1) * 128 + 4 * 20480
         );
         // ~84 MiB of peer VRAM: negligible next to weights, but three orders of
         // magnitude past the decode region — which is the whole reason

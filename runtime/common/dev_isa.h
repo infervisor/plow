@@ -1334,6 +1334,14 @@ typedef struct {
     uint32_t               n_prefill_rows;
 } PlowProgram;
 
+/* Tagged one-shot XReduce region (PLOW_XR_TAGGED decode objects, op_collective.h): four slots
+ * of this many bytes — partial parity 0/1, then gather parity 0/1 — at the same offset in
+ * every rank's peer_scratch, directly after the compact-audit status line. The device finds
+ * it from the packet's status id (fj[2]) and this constant, so PlowProgram is unchanged; the
+ * host lays it out (`PeerLayout`) and refuses a hidden width wider than 3 bf16 per 8-byte
+ * word can hold (3 * 20480 / 8 = 7680). */
+#define PLOW_XR_TAG_SLOT_BYTES 20480u
+
 /* Workgroup geometry of the persistent interpreter. The HOST needs this to size
  * the dispatch, the DEVICE needs it to stride its loops, and Rust needs it to build
  * the packet stream -- so it lives here, in the one header all three share, rather
