@@ -18,6 +18,17 @@ The exact 8192→256 run completed all 256 tokens with checksum
 `fnv1a64:6bdfaa7b84ee4e7e`; its first token matches the 8192→1 run, whose checksum is
 `fnv1a64:7d749e3b002fafa7`. TTFT/E2E for the traced full run were 1414.483/9072.620 ms.
 
+### Production no-audit sizing
+
+One otherwise identical, untraced 8192→256 sizing cell used `--amd-tp-no-audit=true` while
+retaining `--amd-tp-agree-every 1` and full output parity. It is the apples-to-apples production
+baseline: TTFT **1405.483 ms**, TPOT **28.4830 ms**, and E2E **8668.645 ms**. All 256 IDs are
+byte-identical to the audited folds (ID SHA256
+`3b1345553d40748ce2baf58be3a0c20419d8662548dc3d4afa1d6ef04673a1ea`). Against audited,
+untraced fold 1, disabling the compact audit changes TTFT by -10.666 ms, TPOT by -1.4823 ms
+(-4.95%), and E2E by -388.653 ms. Counter audit is therefore a correctness/debug mode, not the
+production performance baseline.
+
 ## Prefill critical envelope
 
 The primary interpreter accounts for 1,021.926 ms. The 378.151 ms residual is time between its
@@ -78,3 +89,6 @@ for which external object to change.
 - Prefill/decode JSON SHA256: `4154c0b1772de3ae1c7a324763e9b6c4f2f0f64187f11c3b70a6452d9983a497` /
   `69f88765fca9464ae578bc02e114cbc356308918fca901f0697457d272c02dab`.
 - Exclusive TP8 lease `kda-current-trace`: rc=0, held 197 s, no overlapping lease.
+- Production no-audit JSON SHA256:
+  `a22d3075b517876c03dcdfed664b7ef15b3f934683d2c67501cab479ab8bcea4`; exclusive TP8 lease
+  `kda-noaudit-sizing`: rc=0, held 103 s.
