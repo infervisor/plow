@@ -615,10 +615,14 @@ __device__ __forceinline__ void d_xreduce_tag_publish(const bf16* part, void* ts
 #ifndef PLOW_XR_COMBINE_FOLD
 #define PLOW_XR_COMBINE_FOLD 0
 #endif
-#if PLOW_XR_COMBINE_FOLD
-#if !PLOW_XR_TAGGED
-#error "PLOW_XR_COMBINE_FOLD needs the tagged one-shot (PLOW_XR_TAGGED=1)"
+/* The fold rides the tagged one-shot, which only decode objects compile; the packet config
+ * header defines the fold for every object, so non-tagged objects just drop it (the loader
+ * checks the marker on the decode object). */
+#if PLOW_XR_COMBINE_FOLD && !PLOW_XR_TAGGED
+#undef PLOW_XR_COMBINE_FOLD
+#define PLOW_XR_COMBINE_FOLD 0
 #endif
+#if PLOW_XR_COMBINE_FOLD
 extern "C" __device__ unsigned plow_xr_combine_fold_1 = 1;
 /* `k` is bounded so every slot load of a word is issued before the first add: a runtime-k
  * loop serialises k DRAM latencies per element (measured 2x the publish). The loader
