@@ -39,7 +39,8 @@ fn serve_paris(e: &mut GpuEngine, tok: &Arc<dyn Tokenize>) -> String {
     let mut t = if e.has_prefill() {
         e.prefill_slot(0, &ids).expect("prefill_slot")
     } else {
-        e.consume_prompt(0, &ids, &mut toks).expect("consume_prompt")
+        e.consume_prompt(0, &ids, &mut toks)
+            .expect("consume_prompt")
     };
     let stop = Arc::clone(e.stop_ids());
     let mut out = Vec::new();

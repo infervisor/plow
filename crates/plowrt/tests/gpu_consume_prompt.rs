@@ -13,12 +13,7 @@ use std::sync::Arc;
 use plowrt::device::cuda::CudaBackend;
 use plowrt::exec::gpu::GpuEngine;
 
-fn generate_from_prompt(
-    e: &mut GpuEngine,
-    prompt: &[u32],
-    n_gen: usize,
-    fused: bool,
-) -> Vec<u32> {
+fn generate_from_prompt(e: &mut GpuEngine, prompt: &[u32], n_gen: usize, fused: bool) -> Vec<u32> {
     e.begin_slot(0, prompt.len() + n_gen + 1).expect("begin");
     let mut toks = Vec::new();
     let first = if fused {

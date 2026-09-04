@@ -49,13 +49,12 @@ fn tensor_name(blob: &plowrt::asset::devblob::DevBlob, h: u16) -> String {
 
 fn dump_inst(blob: &plowrt::asset::devblob::DevBlob, i: usize, d: &packet::dev::DevInst64) {
     let t: Vec<String> = d.t.iter().map(|&h| tensor_name(blob, h)).collect();
-    let i_slots: Vec<String> = d
-        .i
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| **v != 0)
-        .map(|(k, v)| format!("i[{k}]={v}"))
-        .collect();
+    let i_slots: Vec<String> =
+        d.i.iter()
+            .enumerate()
+            .filter(|(_, v)| **v != 0)
+            .map(|(k, v)| format!("i[{k}]={v}"))
+            .collect();
     let f0 = f32::from_bits(d.fj[0]);
     let f1 = f32::from_bits(d.fj[1]);
     let mut extra = i_slots;
@@ -176,7 +175,10 @@ fn main() {
         match dump_prog_i {
             Some(i) if i < blob.progs.len() => dump_prog(&blob, i),
             Some(i) => {
-                eprintln!("--dump {i}: program index out of range (0..{})", blob.progs.len());
+                eprintln!(
+                    "--dump {i}: program index out of range (0..{})",
+                    blob.progs.len()
+                );
                 std::process::exit(1);
             }
             None => {
