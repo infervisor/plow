@@ -39,9 +39,8 @@ The selected kernels compile without scratch or spills. Shipping-object metadata
 | DOWN | 94 | 74 | 5 | 0 | 0 |
 
 The isolated chain includes both ordered kernel launches. Against the authoritative body it saves
-33.013 us/layer, or 3.037 ms/token before segment transitions. The pure-pair route adds 276 decode
-segment transitions; at the measured 1.458 us ordered-AQL floor that is about 0.402 ms/token, leaving
-about 2.63 ms/token projected margin. End-to-end serving remains an opt-in qualification gate.
+33.013 us/layer, or 3.037 ms/token before segment transitions. The pure-pair route changes 49 decode
+segment steps into 233 and adds 276 AQL dispatches after counting the pair's two raw kernels.
 
 ## Route
 
@@ -54,3 +53,42 @@ or model-specific predicate is used. The route and its CMake object are default-
 Evidence files: `/tmp/inv-disasm-clean.json`,
 `/tmp/k3-inventory-qualified-65fca83/fold1-candidate.trace.report`,
 `/tmp/k3-moe-w8-v2.csv`, `/tmp/k3-moe-w4-v2.csv`, and `/tmp/k3-moe-w4-xcd4.csv`.
+
+## Exact TP8 network gate
+
+The first candidate load correctly failed closed because the emitted raw pair retained its internal
+GLU-to-DOWN interpreter counter. The packet rewrite now removes the pair's internal counter as well
+as its cross-segment waits/signals; the queue barrier between the two raw launches preserves GLU to
+DOWN order. Structural tests pin the pure pair, zero counter obligations, external boundaries, and
+default-off behavior.
+
+Three clean, order-balanced BF16-KV TP8 8192-to-256 folds used the shared `/tmp/gpulease`. Every
+fold completed with zero failures, all-rank agreement, identical 256-token arrays, and checksum
+`fnv1a64:6bdfaa7b84ee4e7e`.
+
+| fold order | control TTFT / TPOT / E2E (ms) | candidate TTFT / TPOT / E2E (ms) | candidate - control (ms) |
+|---|---|---|---|
+| candidate, control | 1414.308 / 30.035771 / 9073.430 | 1411.567 / 29.272813 / 8876.135 | -2.741 / **-0.762958** / **-197.295** |
+| control, candidate | 1411.263 / 29.993426 / 9059.587 | 1413.980 / 29.267507 / 8877.195 | +2.717 / **-0.725919** / **-182.392** |
+| candidate, control | 1412.052 / 29.922151 / 9042.201 | 1410.959 / 29.262195 / 8872.819 | -1.093 / **-0.659956** / **-169.382** |
+
+Mean TPOT delta is -0.716278 ms (sample SD 0.052173); mean E2E delta is -183.023 ms. TTFT is
+neutral within run noise: mean -0.372 ms, sample SD 2.800 ms.
+
+A clean matched trace fold is also exact and measures TPOT -0.707522 ms. Engine diagnostics over
+255 decode steps measure 29.971913 ms control versus 29.263226 ms candidate (-0.708687 ms). The
+trace's device chain span is 28.1214 versus 27.3892 ms (-0.7322 ms). The control trace attributes
+3.21601 ms to grouped GLU+DOWN. Replacing that with the isolated 1.543414 ms raw chain predicts a
+1.672596 ms warm-body ceiling, so segmented handoffs consume 0.940-0.964 ms/token, about 10.2-10.5
+us per layer. Raw launches do not write interpreter trace records; consequently the candidate
+per-op table is not interpretable, while its whole-chain timestamps and engine diagnostics remain
+valid and agree within 24 us.
+
+**Decision:** qualify and retain the generic route as default-off. It clears exactness and produces
+a stable 0.66-0.76 ms TPOT gain, but the requirement for an explicit opt-in remains. A next variant
+should amortize the measured handoff cost by grouping multiple layers or adding a device-side
+GLU-to-DOWN handoff; it must keep combine/router/collective order unchanged.
+
+Network evidence is under `/tmp/k3-moe-decode-network`. Packet SHA256 is `f1bf783d...` control and
+`a1f7f6f7...` candidate; runtime SHA256 is `b1c4feb4...`; standalone object SHA256 is
+`836c3baa...`.
