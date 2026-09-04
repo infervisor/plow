@@ -337,6 +337,8 @@ pub struct Builder {
     lean_kda_key_factor_segments: bool,
     /// Isolate adjacent FlashMlaDecode+MlaMergeFold pairs for a gfx950 object.
     decode_mla_segments: bool,
+    /// Isolate adjacent grouped decode GLU+DOWN pairs for ordered raw launches.
+    decode_grouped_moe_segments: bool,
     /// Isolate XReduceTwoShot packets for the gfx950 wave-RS interpreter object.
     xreduce_wave_rs_segments: bool,
     /// Fold an eligible materialized Residual into its AttnRes consumer.
@@ -500,6 +502,7 @@ impl Builder {
             kda_intra_wave_items_segments: false,
             lean_kda_key_factor_segments: false,
             decode_mla_segments: false,
+            decode_grouped_moe_segments: false,
             xreduce_wave_rs_segments: false,
             fuse_materialized_residual_inputs: true,
             gemv_split: 1,
@@ -574,6 +577,10 @@ impl Builder {
 
     pub fn set_decode_mla_segments(&mut self, enabled: bool) {
         self.decode_mla_segments = enabled;
+    }
+
+    pub fn set_decode_grouped_moe_segments(&mut self, enabled: bool) {
+        self.decode_grouped_moe_segments = enabled;
     }
 
     pub fn set_xreduce_wave_rs_segments(&mut self, enabled: bool) {
@@ -1594,7 +1601,8 @@ impl Builder {
                     && pair[1].inst.op == DevOp::MlaMergeFold as u16
             });
         let decode_grouped_moe = !uniseg
-            && std::env::var("PLOW_MOE_DECODE_STANDALONE").ok().as_deref() == Some("1")
+            && (self.decode_grouped_moe_segments
+                || std::env::var("PLOW_MOE_DECODE_STANDALONE").ok().as_deref() == Some("1"))
             && self.ops.windows(2).any(|pair| {
                 pair[0].inst.op == DevOp::MoeGroupGluFp8Blk as u16
                     && pair[1].inst.op == DevOp::MoeGroupDownFp8Blk as u16
@@ -1844,7 +1852,10 @@ impl Builder {
             || decode_grouped_moe
             || xreduce_wave_rs;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
-            !raw_segmented || seg_of[consumer] == seg_of[dep.producer() as usize]
+            let producer = dep.producer() as usize;
+            let raw_moe_pair_edge =
+                decode_grouped_moe && wave_class(consumer) == 20 && wave_class(producer) == 20;
+            !raw_moe_pair_edge && (!raw_segmented || seg_of[consumer] == seg_of[producer])
         };
         let mut same_segment_consumer = vec![false; self.ops.len()];
         let mut same_segment_fine_consumer = vec![false; self.ops.len()];
@@ -4022,6 +4033,65 @@ mod xreduce_wave_rs_segment_tests {
                 .len(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod decode_grouped_moe_segment_tests {
+    use super::*;
+
+    fn program(enabled: bool) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_decode_grouped_moe_segments(enabled);
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let glu = b.emit(DevOp::MoeGroupGluFp8Blk, all.clone(), &[before], |d| {
+            d.i = [16, 384, 3584, 896, 0, 2, 2, 0];
+        });
+        let down = b.emit(DevOp::MoeGroupDownFp8Blk, all.clone(), &[glu], |d| {
+            d.i = [16, 3584, 384, 896, 0, 0, 2, 0];
+        });
+        b.emit(DevOp::Nop, all, &[down], |_| {});
+        b.finish()
+    }
+
+    #[test]
+    fn raw_pair_strips_internal_and_external_counters_but_keeps_ordered_segment() {
+        let p = program(true);
+        let glu_seg = p.stream.iter().find(|e| e.inst == 1).unwrap().seg;
+        let down_seg = p.stream.iter().find(|e| e.inst == 2).unwrap().seg;
+        assert_eq!(glu_seg, down_seg);
+        assert!(p.stream.iter().filter(|e| e.seg == glu_seg).all(|e| {
+            matches!(e.inst, 1 | 2)
+                && e.wait_len == 0
+                && e.succ_len == 0
+                && e.flags & crate::dev::SE_XCTR == 0
+        }));
+        assert_eq!(
+            p.stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        assert!(p.insts.iter().all(|d| d.wait_len == 0 && d.succ_len == 0));
+    }
+
+    #[test]
+    fn grouped_decode_segmentation_is_default_off() {
+        let p = program(false);
+        assert_eq!(
+            p.stream
+                .iter()
+                .map(|e| e.seg)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1
+        );
+        assert_ne!(p.insts[1].succ_len, 0);
+        assert_ne!(p.insts[2].wait_len, 0);
     }
 }
 
