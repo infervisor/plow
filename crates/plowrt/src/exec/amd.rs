@@ -4785,14 +4785,10 @@ fn bind_packed_experts(
         let i_moe_full = *shape0.first().unwrap_or(&0) as u64;
         let (owned, whole) = if i_moe == i_moe_full {
             // EP: this rank owns a contiguous block of WHOLE experts.
-            let per = n_exp / n_gpu;
-            if per * n_gpu != n_exp {
-                return Err(RuntimeError::Device(format!(
-                    "expert-parallel packet with {n_exp} experts over {n_gpu} ranks \
-                     does not divide"
-                )));
-            }
-            (rank * per..(rank + 1) * per, true)
+            (
+                packet::moe_ep::balanced_expert_range(n_exp, n_gpu, rank),
+                true,
+            )
         } else if i_moe * n_gpu as u64 == i_moe_full {
             // TP: every rank slices every expert.
             (0..n_exp, false)

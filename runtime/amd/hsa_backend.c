@@ -233,6 +233,54 @@ int plow_hsa_copy_p2p(plow_hsa* h, int dst_dev, void* dst,
                          src, h->dev[src_dev].agent, bytes);
 }
 
+int plow_hsa_copy_p2p_batch(plow_hsa* h, const plow_hsa_p2p_copy* copies,
+                            size_t count) {
+    if (!h || (!copies && count != 0)) return -1;
+    if (count == 0) return 0;
+    hsa_signal_t* sig = (hsa_signal_t*)calloc(count, sizeof(*sig));
+    if (!sig) {
+        set_err("p2p batch signal allocation", HSA_STATUS_ERROR_OUT_OF_RESOURCES);
+        return -1;
+    }
+    size_t made = 0;
+    size_t launched = 0;
+    int rc = -1;
+    for (; made < count; made++) {
+        const plow_hsa_p2p_copy* c = &copies[made];
+        if (c->dst_dev < 0 || c->dst_dev >= h->n_dev ||
+            c->src_dev < 0 || c->src_dev >= h->n_dev ||
+            (!c->dst && c->bytes != 0) || (!c->src && c->bytes != 0)) {
+            set_err("p2p batch invalid copy", HSA_STATUS_ERROR_INVALID_ARGUMENT);
+            goto done;
+        }
+        if (hsa_signal_create(1, 0, NULL, &sig[made]) != HSA_STATUS_SUCCESS) {
+            set_err("p2p batch signal", HSA_STATUS_ERROR_OUT_OF_RESOURCES);
+            goto done;
+        }
+    }
+    for (; launched < count; launched++) {
+        const plow_hsa_p2p_copy* c = &copies[launched];
+        hsa_status_t s = hsa_amd_memory_async_copy(
+            c->dst, h->dev[c->dst_dev].agent,
+            c->src, h->dev[c->src_dev].agent,
+            c->bytes, 0, NULL, sig[launched]);
+        if (s != HSA_STATUS_SUCCESS) {
+            set_err("p2p batch async copy", s);
+            goto done;
+        }
+    }
+    rc = 0;
+
+done:
+    for (size_t i = 0; i < launched; i++) {
+        while (hsa_signal_wait_scacquire(sig[i], HSA_SIGNAL_CONDITION_LT, 1,
+                                         UINT64_MAX, HSA_WAIT_STATE_BLOCKED) != 0) {}
+    }
+    for (size_t i = 0; i < made; i++) hsa_signal_destroy(sig[i]);
+    free(sig);
+    return rc;
+}
+
 void* plow_hsa_alloc_host(plow_hsa* h, size_t bytes) {
     if (!h) return NULL;
     void* p = NULL;

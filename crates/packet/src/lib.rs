@@ -33,6 +33,7 @@ pub mod dev;
 pub mod devbuild;
 pub mod disasm;
 pub mod moe;
+pub mod moe_ep;
 pub mod names;
 pub mod rope;
 pub mod slots;
