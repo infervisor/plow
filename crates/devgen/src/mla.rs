@@ -599,6 +599,14 @@ fn emit_glm53_program(
             emit_glm_dense_ffn(
                 b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true,
             )
+        } else if prefill {
+            // The wide, pick_tile-based prefill MoE body GLM-5.2's own emit_glm_block_prefill
+            // uses — NOT emit_glm_moe_ffn, whose rows>1 arm is the batched-decode seam
+            // (emit_glm_moe_ffn_rows) and cannot serve a real prefill bucket. See
+            // emit_glm_moe_ffn_prefill's doc comment for why.
+            emit_glm_moe_ffn_prefill(
+                b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true,
+            )
         } else {
             emit_glm_moe_ffn(
                 b, c, n, l, rows, enc, n.xnext, c_norm, &mut xgate, &xr, true,
@@ -1369,10 +1377,8 @@ struct GlmLW {
     dwt: u32,
     dst: u32,
     // DSA lightning indexer (TENSOR_NONE except on 'full' layers with the DSA gate on).
-    iwqb: u32, // indexer.wq_b.weight (fp8 [HI*DI, QL]) + iwqb_s scale grid
-    iwqb_s: u32,
-    iwk: u32, // indexer.wk.weight (fp8 [DI, H]) + iwk_s scale grid
-    iwk_s: u32,
+    iwqb: u32, // indexer.wq_b.weight [HI*DI, QL] bf16 — no shipped checkpoint quantizes it
+    iwk: u32,  // indexer.wk.weight [DI, H] bf16 — ditto (matches the reference's always-bf16 wk)
     iknw: u32, // indexer.k_norm.weight [DI] bf16
     iknb: u32, // indexer.k_norm.bias   [DI] bf16
     iwp: u32,  // indexer.weights_proj.weight [HI, H] bf16
@@ -2328,34 +2334,23 @@ pub(crate) fn declare_glm_rows_batched(
             } else {
                 TENSOR_NONE
             },
-            // DSA indexer weights (fp8 wq_b/wk copied VERBATIM for GemvFp8Blk + f32 [128,128] scale
-            // grids; k_norm weight/bias + weights_proj bf16). REPLICATED across TP ranks (the indexer
-            // is tiny and its idx is head-shared). Only bound on 'full' layers with the DSA gate on.
+            // DSA indexer q/k weights: PLAIN BF16, not fp8 — no shipped GLM-5.3-Flash checkpoint
+            // carries a `.weight_scale_inv` for either (confirmed against the real checkpoint),
+            // matching the reference's own policy of always computing these two projections in
+            // BF16 regardless of the model's block-fp8 `quantization_config`
+            // (`nvidia/attention.py`'s `wk_weights_proj` is built with `quant_config=None`
+            // unconditionally, and even loads a checkpoint's fp8 `wk` upcast to bf16). Neither has
+            // a `.weight_scale_inv` to declare.
+            // k_norm weight/bias + weights_proj are bf16 too. REPLICATED across TP ranks (the
+            // indexer is tiny and its idx is head-shared). Only bound on 'full' layers with the
+            // DSA gate on.
             iwqb: if full {
-                t(b, "self_attn.indexer.wq_b.weight", (hi * di * ql) as u64)
-            } else {
-                TENSOR_NONE
-            },
-            iwqb_s: if full {
-                t(
-                    b,
-                    "self_attn.indexer.wq_b.weight_scale_inv",
-                    ((hi * di).div_ceil(128) * ql.div_ceil(128)) as u64 * F32,
-                )
+                t(b, "self_attn.indexer.wq_b.weight", (hi * di * ql) as u64 * BF16)
             } else {
                 TENSOR_NONE
             },
             iwk: if full {
-                t(b, "self_attn.indexer.wk.weight", (di * h) as u64)
-            } else {
-                TENSOR_NONE
-            },
-            iwk_s: if full {
-                t(
-                    b,
-                    "self_attn.indexer.wk.weight_scale_inv",
-                    (di.div_ceil(128) * hb) as u64 * F32,
-                )
+                t(b, "self_attn.indexer.wk.weight", (di * h) as u64 * BF16)
             } else {
                 TENSOR_NONE
             },
@@ -3526,43 +3521,40 @@ fn emit_glm_dsa_decode_select(
         "DSA indexer with a batched decode program (rows={rows}): IndexSelect and the indexer \
          scratch are single-row. Emit the ladder blob with PLOW_GLM_DSA=0 or max-ctx <= 65536."
     );
-    // The DSA lightning indexer has NO MXFP4 path: `wq_b`/`wk` are block-fp8 (GemvFp8Blk) and
-    // `weights_proj` is bf16, and none of the three ops takes an encoding. Under MXFP4 the indexer
-    // would therefore be a block-fp8/bf16 island inside an otherwise fp4 packet — and worse, the
+    // The DSA lightning indexer has NO MXFP4 path: `wq_b`/`wk`/`weights_proj` are all bf16 (no
+    // shipped checkpoint quantizes any of the three — see the field doc comments on
+    // `GlmLW::iwqb`/`iwk`), and none of the three ops takes an encoding. Under MXFP4 the indexer
+    // would therefore be a bf16 island inside an otherwise fp4 packet — and worse, the
     // `weights_proj` GEMV would go through the encoding-aware helper and reach GEMV_MXFP4 with a
     // NULL E8M0 scale. Refuse the combination rather than emit either. GLM-5.2 is the only arch with
     // an indexer and the gate only arms above 64k ctx, so this does not touch Kimi or DeepSeek
     // (`has_dsa=false` holds the gate off at every ctx).
     assert!(
         !(dsa && enc == MoeEnc::Mxfp4),
-        "MXFP4 with the DSA indexer armed (ctx={ctx}) would leave the indexer's block-fp8 wq_b/wk          and bf16 weights_proj inside an otherwise all-MXFP4 packet. Missing capability:          `dsa_indexer_mxfp4` (an encoding parameter on INDEX_SCORE's producers). Use PLOW_GLM_DSA=0          to hold the gate off, or emit block-fp8."
+        "MXFP4 with the DSA indexer armed (ctx={ctx}) would leave the indexer's bf16 wq_b/wk/ \
+         weights_proj inside an otherwise all-MXFP4 packet. Missing capability: \
+         `dsa_indexer_mxfp4` (an encoding parameter on INDEX_SCORE's producers). Use \
+         PLOW_GLM_DSA=0 to hold the gate off, or emit block-fp8."
     );
     let full = dsa && w.iwqb != TENSOR_NONE; // 'full' indexer layer (weights bound only there)
     let itk = c.index_topk.min(ctx);
     let (hi, di) = (c.index_heads, c.index_dim);
-    let gemv_blk = |b: &mut Builder,
-                    out: u32,
-                    x: u32,
-                    wt: u32,
-                    sc: u32,
-                    nn: u32,
-                    k: u32,
-                    deps: &[u32]|
-     -> u32 {
-        b.emit(DevOp::GemvFp8Blk, all.to_vec(), deps, |d| {
+    // Plain BF16, not GemvFp8Blk — see emit_glm_dsa_prefill_select's identical note on why
+    // wq_b/wk are unquantized in every shipped checkpoint (no `.weight_scale_inv`) and in the
+    // reference's own always-bf16 policy for these two projections.
+    let gemv_blk = |b: &mut Builder, out: u32, x: u32, wt: u32, nn: u32, k: u32, deps: &[u32]| -> u32 {
+        b.emit(DevOp::Gemv, all.to_vec(), deps, |d| {
             d.t[0] = out;
             d.t[1] = x;
             d.t[2] = wt;
-            d.t[5] = sc;
             d.i[0] = 1;
             d.i[1] = nn;
             d.i[2] = k;
-            d.i[4] = 0;
         })
     };
     if full {
         // q_idx = interleaved_rope(reshape_HIxDI(wq_b @ q_lat)); rope in-place (reads staged first).
-        let c_q0 = gemv_blk(b, n.qidx, n.qlat, w.iwqb, w.iwqb_s, hi * di, ql, &[c_rnq]);
+        let c_q0 = gemv_blk(b, n.qidx, n.qlat, w.iwqb, hi * di, ql, &[c_rnq]);
         // The indexer ropes are concurrent with each other AND with the q/k pair above (all four
         // hang off the input norm), so they continue the same disjoint allocation.
         let riq = rope_cus(all, rq.len() + rk.len(), 1, hi);
@@ -3586,7 +3578,7 @@ fn emit_glm_dsa_decode_select(
         });
         // k_idx pre-rope: wk @ xn, k_norm. Shared by both the dense (GLM-5.2) and pooled
         // (GLM-5.3-Flash) paths below — only what the rope writes INTO differs.
-        let c_k0 = gemv_blk(b, n.kidx_raw, n.xn, w.iwk, w.iwk_s, di, h, &[c_rn1]);
+        let c_k0 = gemv_blk(b, n.kidx_raw, n.xn, w.iwk, di, h, &[c_rn1]);
         let c_kn = b.emit(DevOp::LayerNorm, one.clone(), &[c_k0], |d| {
             d.t[0] = n.kidx_normed;
             d.t[1] = n.kidx_raw;
@@ -4098,8 +4090,8 @@ fn glm_gf_prefill(ctx: u32, nh_l: u32) -> u32 {
 ///   q_idx = interleaved_rope(reshape_HIxDI(wq_b @ q_lat))     [T][HI*DI]
 ///   k_idx = interleaved_rope(k_norm(wk @ xn))                 [T][DI], written at the chunk base
 ///   w     = weights_proj @ xn                                 [T][HI]
-/// `wq_b`/`wk` are block-fp8, so they route through [`emit_pf_gemm_fp8_blk`] exactly as the
-/// linear-fp8 prefill arm does; `weights_proj` is bf16 and takes the plain tiled GEMM.
+/// `wq_b`/`wk`/`weights_proj` are all bf16 (no shipped checkpoint quantizes any of the three —
+/// see the field doc comments on `GlmLW::iwqb`/`iwk`), so all three take the plain tiled GEMM.
 ///
 /// KEY CACHE. The scorer reads the indexer keys for the WHOLE context `[0, kv_len)`, of which this
 /// chunk contributes rows `[q_pos0, q_pos0 + t)` — the same append discipline `kv.{l}.kidx` already
@@ -4121,19 +4113,27 @@ fn emit_glm_dsa_prefill_select(
     let (hi, di, h, ql) = (c.index_heads, c.index_dim, c.hidden, c.q_lora);
     let itk = c.index_topk.min(ctx);
     let n_cu = b.n_cu();
+    // `wq_b`/`wk` are plain BF16 in every shipped GLM-5.3-Flash checkpoint (no
+    // `.weight_scale_inv` sibling — confirmed against the real checkpoint and against the
+    // reference: `nvidia/attention.py`'s `wk_weights_proj` is built with `quant_config=None`
+    // unconditionally, and its own comment says "FP8 wk weights are upcasted to BF16 during
+    // loading to maintain fusion" — the indexer's q/k projections compute in BF16 regardless
+    // of what the rest of the model's `quantization_config` says. `GemmFp8Blk` needs a real
+    // scale grid (`emit_pf_gemm_fp8_blk` asserts it), so this is the ordinary tiled bf16 GEMM
+    // every other unquantized prefill projection uses, not `emit_pf_gemm_fp8_blk`.
+    let bf16_gemm = |b: &mut Builder, out: u32, x: u32, wt: u32, nn: u32, k: u32, deps: &[u32]| -> u32 {
+        let op = pick_tile(t, nn, k, n_cu, kernelcaps::QuantScheme::None);
+        b.emit(op, all.to_vec(), deps, |d| {
+            d.t[0] = out;
+            d.t[1] = x;
+            d.t[2] = wt;
+            d.i[0] = t;
+            d.i[1] = nn;
+            d.i[2] = k;
+        })
+    };
     // q_idx: [T][HI*DI] from the q-latent; k_idx: [T][DI] from the input norm.
-    let c_q0 = emit_pf_gemm_fp8_blk(
-        b,
-        all,
-        n.qidx_pf,
-        n.qlat,
-        w.iwqb,
-        w.iwqb_s,
-        t,
-        hi * di,
-        ql,
-        &[pre[1]],
-    );
+    let c_q0 = bf16_gemm(b, n.qidx_pf, n.qlat, w.iwqb, hi * di, ql, &[pre[1]]);
     let c_qi = b.emit(DevOp::HeadNormRope, all.to_vec(), &[c_q0], |d| {
         d.t[0] = n.qidx_pf;
         d.t[1] = n.qidx_pf;
@@ -4151,7 +4151,7 @@ fn emit_glm_dsa_prefill_select(
         d.j[0] = 0;
         d.j[1] = KV_MASK_NONE;
     });
-    let c_k0 = emit_pf_gemm_fp8_blk(b, all, n.kidx_pf, n.xn, w.iwk, w.iwk_s, t, di, h, &[pre[0]]);
+    let c_k0 = bf16_gemm(b, n.kidx_pf, n.xn, w.iwk, di, h, &[pre[0]]);
     let c_kn = b.emit(DevOp::LayerNorm, pf_wide_cus(n_cu, t), &[c_k0], |d| {
         d.t[0] = n.kidx_pf;
         d.t[1] = n.kidx_pf;
@@ -4213,6 +4213,39 @@ fn emit_glm_dsa_prefill_select(
             d.i[2] = di;
             d.i[3] = 0; // token-granular chunk base, patched by plowrt
         });
+        // Prefill tail-seed: a real chunk whose length isn't pool-aligned (the common
+        // case — chat-templated prompts essentially never land on a multiple of
+        // `index_kpool`) leaves its trailing `clen % index_kpool` real tokens
+        // uncompressed above — `plowrt::exec::amd::rebase_chunk_rows` shrinks
+        // `DsaPoolCompress`'s `chunk_pools` to `clen / index_kpool` so the boundary
+        // pool is never built from a mix of real tokens and padding garbage. Those
+        // trailing tokens must not simply be dropped: carry their already-roped
+        // `kidx_pf`/`gate_score_pf` rows into this layer's decode-side ring
+        // (`kidx_ring`/`kidx_ring_score`, the same ring `emit_glm_dsa_decode_select`'s
+        // per-step stash writes) so the boundary pool completes correctly once decode
+        // contributes the rest, instead of starting from whatever the ring held.
+        //
+        // `t` (this bucket's compiled width) is always a multiple of `index_kpool`
+        // (asserted above), so only the LAST `index_kpool - 1` rows of a chunk can
+        // ever be a trailing remainder — bake exactly that many, each pinned to a
+        // fixed offset from the bucket's END (`row = t - 1 - k`). The real chunk
+        // length is runtime-only, so `rebase_chunk_rows` rebases `row` from an
+        // offset-from-`t` to an offset-from-`clen` and `Nop`s whichever of these
+        // are surplus for THIS chunk's real length (fewer trailing rows than
+        // `index_kpool - 1`, or none at all on a pool-aligned/full chunk).
+        for k in 0..c.index_kpool.saturating_sub(1) {
+            let row = t - 1 - k;
+            b.emit(DevOp::DsaPoolStash, all.to_vec(), &[c_ki, c_gs], |d| {
+                d.t[0] = n.kidx_ring[slot];
+                d.t[1] = n.kidx_ring_score[slot];
+                d.t[2] = n.kidx_pf;
+                d.t[3] = n.gate_score_pf;
+                d.t[4] = n.pos;
+                d.i[0] = c.index_kpool;
+                d.i[1] = di;
+                d.i[2] = row;
+            });
+        }
         let c_qq = b.emit(DevOp::DsaQQuant, all.to_vec(), &[c_qi], |d| {
             d.t[0] = n.q_fp8_pf;
             d.t[1] = n.q_scale_pf;
@@ -4864,6 +4897,42 @@ fn emit_glm_block_prefill(
     xr_cus: &[u32],
 ) -> u32 {
     let c_rn2 = emit_glm_mla_prefill(b, c, n, slot, ctx, t, enc, x_in, pre, false, xgate, xr_cus);
+    emit_glm_moe_ffn_prefill(b, c, n, slot, t, enc, x_out, c_rn2, xgate, xr_cus, false)
+}
+
+/// Emit ONE MoE FFN for a PREFILL bucket of `t` rows, given the attention output's completion dep
+/// `c_rn2` (`n.xn2`, the post-attention norm, already written by the caller). Writes `x_out` — or,
+/// under `raw_output`, the TP-reduced sum BEFORE residualization, into `n.attn` instead, mirroring
+/// [`emit_glm_mla_prefill`]'s own `raw_output` convention exactly (same destination tensor, same
+/// zero-residual combine, same `Nop`-joined multi-band completion) so GLM-5.3's hyperconnection
+/// wrap can read it. Returns the completion dep.
+///
+/// Extracted from [`emit_glm_block_prefill`] (GLM-5.2's whole-block prefill emitter, which now
+/// just calls this with `raw_output=false` and stays byte-identical) so GLM-5.3's `emit_glm53_program`
+/// can call the SAME wide, `pick_tile`-based prefill MoE body GLM-5.2 already uses, instead of
+/// (as it did before this fix) routing through [`emit_glm_moe_ffn`]'s `rows > 1` branch — which is
+/// the BATCHED-DECODE seam ([`emit_glm_moe_ffn_rows`]), never meant for a genuine prefill bucket
+/// wider than `PLOW_GEMV_MAXM` (16): its router-gate/shared-expert projections are `Gemv`-family
+/// ops whose PREFILL object is always compiled at `op_gemm.h`'s hard `PLOW_GEMV_MM=1` default —
+/// confirmed in `runtime/CMakeLists.txt`, where the `PLOW_GEMV_WALK`/`PLOW_DECODE_BATCH` axes that
+/// widen it apply ONLY to the decode build, never prefill. A `t=8192` GLM-5.3 prefill chunk through
+/// that seam was refused at load by `check_gemv_capacity` ("packet's widest GEMV asks for M=8192
+/// rows, but ... was compiled PLOW_GEMV_MM=1") — correctly: the kernel has no outer loop over
+/// `M > 16`, so it is not a build-flag gap, there is no object that could have served it.
+#[allow(clippy::too_many_arguments)]
+fn emit_glm_moe_ffn_prefill(
+    b: &mut Builder,
+    c: &GlmCfg,
+    n: &GlmTn,
+    slot: usize,
+    t: u32,
+    enc: MoeEnc,
+    x_out: u32,
+    c_rn2: u32,
+    xgate: &mut u32,
+    xr_cus: &[u32],
+    raw_output: bool,
+) -> u32 {
     let all = b.all();
     let one = vec![0u32];
     let n_cu = b.n_cu();
@@ -5187,11 +5256,23 @@ fn emit_glm_block_prefill(
                     tp,
                     n.slot_b, // region base — the band offset rides in e0
                     i * rows * h,
-                    (kb == 1 && xr_res_fold()).then_some((n.xmid, x_out)),
+                    (!raw_output && kb == 1 && xr_res_fold()).then_some((n.xmid, x_out)),
                 )
             })
             .collect();
-        if kb == 1 && xr_res_fold() {
+        if raw_output {
+            // Mirrors emit_glm_mla_prefill's own raw_output tail exactly: n.attn already holds
+            // the correct zero-residual TP-summed result (the per-band MoeCombinePf above always
+            // passes a null residual), so there is nothing left to add — just join every band's
+            // completion into one dep for the caller to wait on. A single band returns its own
+            // dep directly; more than one needs an explicit (data-free) fan-in, since nothing
+            // else here depends on every band the way the Residual op below does.
+            if xr_deps.len() == 1 {
+                xr_deps[0]
+            } else {
+                b.emit(DevOp::Nop, vec![0], &xr_deps, |_| {})
+            }
+        } else if kb == 1 && xr_res_fold() {
             // XR+Residual fold — the collective wrote x_out = xmid + reduced itself.
             xr_deps[0]
         } else {
@@ -5205,8 +5286,8 @@ fn emit_glm_block_prefill(
         }
     } else {
         b.emit(DevOp::MoeCombinePf, all.clone(), &[c_shd, c_d], |d| {
-            d.t[0] = x_out;
-            d.t[1] = n.xmid;
+            d.t[0] = if raw_output { n.attn } else { x_out };
+            d.t[1] = if raw_output { TENSOR_NONE } else { n.xmid };
             d.t[2] = n.shared;
             d.t[3] = n.part;
             d.i[0] = h;
