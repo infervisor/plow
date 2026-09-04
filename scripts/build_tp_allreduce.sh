@@ -34,6 +34,13 @@ if [ -z "$XR_RS_U" ]; then
 fi
 case "$XR_RS_U" in 1|2) ;; *) echo "PLOW_XR_RS_U must be 1 or 2" >&2; exit 2;; esac
 XR_DEF+=("-DPLOW_XR_RS_U=$XR_RS_U")
+case "${PLOW_XR_SCHED:-off}" in
+  aiter) XR_DEF+=("-DPLOW_XR_SCHED_AITER=1") ;;
+  off) ;;
+  *) echo "PLOW_XR_SCHED must be off or aiter" >&2; exit 2 ;;
+esac
+# Extra device defines for schedule screens (e.g. -DPLOW_XR_SCHED_AG_U=2).
+[ -n "${PLOW_XR_EXTRA_DEFS:-}" ] && read -r -a _extra <<<"$PLOW_XR_EXTRA_DEFS" && XR_DEF+=("${_extra[@]}")
 # The sequence-parallel seam halves (ops 25/26) ride the same object for tp_seqpar_smoke.
 XR_DEF+=("-DPLOW_SEQ_PAR_SEAMS=1")
 hipcc --offload-arch="$ARCH" -O3 -w "${XR_DEF[@]}" --genco \
@@ -64,7 +71,8 @@ echo "run:  (cd $OUT && /usr/bin/env -i PATH=/usr/bin:/bin HOME=\$HOME LD_LIBRAR
 echo "      rank count = number of device ids; env TP_HIDDEN (default 7168) TP_ITERS TP_ELF"
 echo "prefill: (cd $OUT && ./tp_allreduce_prefill_bench 0 1 2 3 4 5 6 7)  PLOW_XR_AGG=${PLOW_XR_AGG:-0}"
 echo "         PLOW_XR_WAVE_RS=${PLOW_XR_WAVE_RS:-0}"
-echo "         PLOW_XR_RS_U=$XR_RS_U"
+echo "         PLOW_XR_RS_U=$XR_RS_U PLOW_XR_SCHED=${PLOW_XR_SCHED:-off}"
+echo "         env TP_RANDOM=1 (order-sensitive oracle + checksum) TP_PHASES=1 (op 25 / op 26 per phase)"
 echo "         env TP_ROWS TP_HIDDEN TP_NWG (default 256) TP_GATHER TP_ONESHOT"
 echo "config:  (cd $OUT && TP_ROWS=8192 TP_HIDDEN=7168 TP_NWG=80 ./tp_allreduce_prefill_bench --check-config)"
 echo "sweep:   scripts/run_tp_allreduce_prefill_sweep.sh $OUT gpu0 gpu1 gpu2 gpu3 gpu4 gpu5 gpu6 gpu7"

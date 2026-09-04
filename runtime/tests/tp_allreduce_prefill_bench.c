@@ -27,7 +27,33 @@ static bf16 f2bf(float f) {
 static bf16 partial_val(uint32_t r, uint32_t e) {
     return f2bf((float)(r + 1) * (1.0f + (float)(e & 7u) * 0.125f));
 }
+/* TP_RANDOM=1: the device's tp_fill_random words (tp_allreduce_kernels.hip), whose f32 sum
+ * depends on the rank order — the pattern above is exact in every order. Gather partials use
+ * seed + 1. */
+static uint32_t tp_hash(uint32_t x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return x;
+}
+static int g_random = 0;
+static uint32_t g_seed = 20260904u;
+static bf16 part_val(uint32_t r, uint32_t e, uint32_t which) {
+    if (!g_random) return partial_val(r, e);
+    const uint32_t h = tp_hash(e ^ tp_hash(r * 0x9E3779B9u + g_seed + which));
+    return (bf16)(((h >> 31) << 15) | ((120u + ((h >> 20) & 15u)) << 7) | (h & 0x7fu));
+}
+static uint64_t fnv1a64(const void* p, size_t len) {
+    const uint8_t* b = (const uint8_t*)p;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < len; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
 typedef struct { void* part; uint32_t n; uint32_t rank; } arg_fill;
+typedef struct { void* part; uint32_t n; uint32_t rank; uint32_t seed; } arg_fill_r;
+typedef struct {
+    void* out; const void* peers; uint32_t nranks, rank, n, slot_bytes;
+    uint64_t xctr_byte_off; uint32_t iters; uint64_t deadline;
+    void* cycles; void* status; void* lctr;
+} arg_seams;
 typedef struct {
     void* out; const void* peers; uint32_t nranks, rank, n, slot_bytes;
     uint64_t xctr_byte_off; uint32_t iters; uint64_t deadline;
@@ -84,6 +110,14 @@ int main(int argc, char** argv) {
     const int oneshot = getenv("TP_ONESHOT") && atoi(getenv("TP_ONESHOT")) != 0;
     const int taggedx = getenv("TP_TAGGED") && atoi(getenv("TP_TAGGED")) != 0;
     const int unsafe = getenv("TP_UNSAFE") && atoi(getenv("TP_UNSAFE")) != 0;
+    /* TP_PHASES=1: op 25 + op 26 (tp_seams_timed) instead of the two-shot, reported per phase. */
+    const int phases = getenv("TP_PHASES") && atoi(getenv("TP_PHASES")) != 0;
+    g_random = getenv("TP_RANDOM") && atoi(getenv("TP_RANDOM")) != 0;
+    g_seed = env_u32("TP_SEED", g_seed, 1u, UINT32_MAX);
+    if (phases && (gather || oneshot || taggedx)) {
+        fprintf(stderr, "TP_PHASES excludes TP_GATHER/TP_ONESHOT/TP_TAGGED\n");
+        return 2;
+    }
     const uint32_t tag_slot = (((hidden + 2u) / 3u) * 8u + 255u) & ~255u;
     if (taggedx && (rows > 1 || TAG_OFF + 4u * tag_slot > REGION_BYTES || iters >= 0xffff)) {
         fprintf(stderr, "TP_TAGGED needs rows<=1, hidden<=%u, iters<0xffff\n",
@@ -115,13 +149,15 @@ int main(int argc, char** argv) {
     if (!elf) { fprintf(stderr, "cannot open %s\n", elf_path); return 2; }
 
     plow_hsa_kernel fill[NR], xr2[NR];
-    void *scratch[NR], *out[NR], *table[NR];
+    void *scratch[NR], *out[NR], *table[NR], *lctr[NR];
     uint32_t* status[NR];
     for (int r = 0; r < NR; r++) {
         if (plow_hsa_load_code_object(h, dev[r], elf, elf_len) ||
-            plow_hsa_get_kernel(h, dev[r], "tp_fill_partial", &fill[r]) ||
+            plow_hsa_get_kernel(h, dev[r], g_random ? "tp_fill_random" : "tp_fill_partial",
+                                &fill[r]) ||
             plow_hsa_get_kernel(h, dev[r],
-                                taggedx ? "tp_allreduce_tagged_x"
+                                phases ? "tp_seams_timed"
+                                : taggedx ? "tp_allreduce_tagged_x"
                                 : gather ? (oneshot ? "tp_allreduce_oneshot_gather"
                                                     : "tp_allreduce_twoshot_gather")
                                          : "tp_allreduce_twoshot", &xr2[r])) {
@@ -132,17 +168,30 @@ int main(int argc, char** argv) {
         out[r] = plow_hsa_alloc(h, dev[r], (size_t)max_n * 2u);
         table[r] = plow_hsa_alloc(h, dev[r], NR * sizeof(void*));
         status[r] = (uint32_t*)plow_hsa_alloc(h, dev[r], 4);
-        if (!scratch[r] || !out[r] || !table[r] || !status[r]) {
+        lctr[r] = plow_hsa_alloc(h, dev[r], 4);
+        if (!scratch[r] || !out[r] || !table[r] || !status[r] || !lctr[r]) {
             fprintf(stderr, "alloc rank=%d scratch=%p out=%p table=%p status=%p: %s\n",
                     r, scratch[r], out[r], table[r], status[r], plow_hsa_last_error()); return 2;
         }
     }
     for (int r = 0; r < NR; r++)
         plow_hsa_upload(h, dev[r], table[r], scratch, sizeof scratch);
-    void* cycles = plow_hsa_alloc(h, dev[0], 8);
+    void* cycles = plow_hsa_alloc(h, dev[0], 16);
     const uint32_t max_n = shape[1] ? shape[1] : shape[0];
     bf16* host = (bf16*)malloc((size_t)max_n * 2u);
+    bf16* want = (bf16*)malloc((size_t)max_n * 2u);
     const uint64_t deadline = freq ? freq : 1000000000ull;
+    /* The fill kernel: the fixed pattern or the random words (seed, seed + 1 for the gather). */
+#define FILL(r, dst, cnt, which)                                                            \
+    do {                                                                                    \
+        if (g_random) {                                                                     \
+            arg_fill_r fa_ = {(dst), (cnt), (uint32_t)(r), g_seed + (which)};              \
+            plow_hsa_launch(h, dev[r], &fill[r], 4096, 1, 1, 256, 1, 1, 0, &fa_, sizeof fa_); \
+        } else {                                                                            \
+            arg_fill fa_ = {(dst), (cnt), (uint32_t)(r)};                                   \
+            plow_hsa_launch(h, dev[r], &fill[r], 4096, 1, 1, 256, 1, 1, 0, &fa_, sizeof fa_); \
+        }                                                                                   \
+    } while (0)
 
     for (unsigned si = 0; si < sizeof shape / sizeof shape[0] && shape[si]; si++) {
         const uint32_t n = shape[si]; uint8_t zero[128 * 64] = {0};
@@ -152,18 +201,15 @@ int main(int argc, char** argv) {
                 plow_hsa_upload(h, dev[r], (char*)scratch[r] + TAG_OFF + s, zero,
                                 4u * tag_slot - s < sizeof zero ? 4u * tag_slot - s : sizeof zero);
             plow_hsa_upload(h, dev[r], status[r], zero, 4);
-            arg_fill a = {scratch[r], n, (uint32_t)r};
-            plow_hsa_launch(h, dev[r], &fill[r], 4096, 1, 1, 256, 1, 1, 0, &a, sizeof a);
-            if (gather) {
-                arg_fill g = {(char*)scratch[r] + GATHER_OFF, n / NR, (uint32_t)r};
-                plow_hsa_launch(h, dev[r], &fill[r], 4096, 1, 1, 256, 1, 1, 0,
-                                &g, sizeof g);
-            }
+            plow_hsa_upload(h, dev[r], lctr[r], zero, 4);
+            FILL(r, scratch[r], n, 0u);
+            if (gather) FILL(r, (char*)scratch[r] + GATHER_OFF, n / NR, 1u);
             plow_hsa_wait(h, dev[r]);
         }
         arg_xr2 a[NR];
         arg_xr2g ag[NR];
         arg_tagx at[NR];
+        arg_seams as[NR];
         for (int r = NR - 1; r >= 0; r--) {
             a[r] = (arg_xr2){out[r], table[r], NR, (uint32_t)r, n, 0, XCTR_OFF,
                               iters, deadline, r ? NULL : cycles, status[r]};
@@ -174,12 +220,17 @@ int main(int argc, char** argv) {
                                iters, deadline, r ? NULL : cycles, status[r],
                                gather ? GATHER_OFF : 0u, gather ? hidden / NR : 0u,
                                TAG_OFF, tag_slot};
-            void* ka = taggedx ? (void*)&at[r] : gather ? (void*)&ag[r] : (void*)&a[r];
-            size_t kaz = taggedx ? sizeof at[r] : gather ? sizeof ag[r] : sizeof a[r];
+            as[r] = (arg_seams){out[r], table[r], NR, (uint32_t)r, n, 0, XCTR_OFF,
+                                iters, deadline, r ? NULL : cycles, status[r], lctr[r]};
+            void* ka = phases ? (void*)&as[r] : taggedx ? (void*)&at[r]
+                     : gather ? (void*)&ag[r] : (void*)&a[r];
+            size_t kaz = phases ? sizeof as[r] : taggedx ? sizeof at[r]
+                       : gather ? sizeof ag[r] : sizeof a[r];
             plow_hsa_launch(h, dev[r], &xr2[r], nwg * 512, 1, 1, 512, 1, 1, 0, ka, kaz);
         }
         for (int r = 0; r < NR; r++) plow_hsa_wait(h, dev[r]);
-        uint64_t ticks = 0; plow_hsa_download(h, dev[0], &ticks, cycles, 8);
+        uint64_t ticks2[2] = {0, 0}; plow_hsa_download(h, dev[0], ticks2, cycles, 16);
+        const uint64_t ticks = phases ? ticks2[0] + ticks2[1] : ticks2[0];
         int timeout = 0;
         for (int r = 0; r < NR; r++) {
             uint32_t st = 0; plow_hsa_download(h, dev[r], &st, status[r], 4); timeout |= st != 0;
@@ -189,13 +240,9 @@ int main(int argc, char** argv) {
         memset(zero, 0, sizeof zero);
         for (int r = 0; r < NR; r++) {
             plow_hsa_upload(h, dev[r], (char*)scratch[r] + XCTR_OFF, zero, sizeof zero);
-            arg_fill f = {scratch[r], n, (uint32_t)r};
-            plow_hsa_launch(h, dev[r], &fill[r], 4096, 1, 1, 256, 1, 1, 0, &f, sizeof f);
-            if (gather) {
-                arg_fill g = {(char*)scratch[r] + GATHER_OFF, n / NR, (uint32_t)r};
-                plow_hsa_launch(h, dev[r], &fill[r], 4096, 1, 1, 256, 1, 1, 0,
-                                &g, sizeof g);
-            }
+            plow_hsa_upload(h, dev[r], lctr[r], zero, 4);
+            FILL(r, scratch[r], n, 0u);
+            if (gather) FILL(r, (char*)scratch[r] + GATHER_OFF, n / NR, 1u);
             /* Tagged slots restart at gate 0 / tag 1: clear the timing run's words. */
             for (uint32_t s = 0; taggedx && s < 4u * tag_slot; s += sizeof zero)
                 plow_hsa_upload(h, dev[r], (char*)scratch[r] + TAG_OFF + s, zero,
@@ -204,37 +251,51 @@ int main(int argc, char** argv) {
             a[r].iters = 1; a[r].cycles = NULL;
             ag[r].iters = 1; ag[r].cycles = NULL;
             at[r].iters = 1; at[r].cycles = NULL;
+            as[r].iters = 1; as[r].cycles = NULL;
         }
         for (int r = NR - 1; r >= 0; r--) {
-            void* ka = taggedx ? (void*)&at[r] : gather ? (void*)&ag[r] : (void*)&a[r];
-            size_t kaz = taggedx ? sizeof at[r] : gather ? sizeof ag[r] : sizeof a[r];
+            void* ka = phases ? (void*)&as[r] : taggedx ? (void*)&at[r]
+                     : gather ? (void*)&ag[r] : (void*)&a[r];
+            size_t kaz = phases ? sizeof as[r] : taggedx ? sizeof at[r]
+                       : gather ? sizeof ag[r] : sizeof a[r];
             plow_hsa_launch(h, dev[r], &xr2[r], nwg * 512, 1, 1, 512, 1, 1, 0,
                             ka, kaz);
         }
         for (int r = 0; r < NR; r++) plow_hsa_wait(h, dev[r]);
+        /* The oracle: strict rank order r = 0..N-1 in f32, one bf16 rounding, then the gather
+         * fold's rounded add — exactly the device contract, on the host. */
+        for (uint32_t e = 0; e < n; e++) {
+            float sum = 0;
+            for (uint32_t r = 0; r < NR; r++) sum += bf2f(part_val(r, e, 0u));
+            bf16 w = f2bf(sum);
+            if (gather) {
+                const uint32_t c = e % hidden, m = e / hidden;
+                const uint32_t owner = c / (hidden / NR);
+                const uint32_t ge = m * (hidden / NR) + c % (hidden / NR);
+                w = f2bf(bf2f(w) + bf2f(part_val(owner, ge, 1u)));
+            }
+            want[e] = w;
+        }
         size_t bad = 0;
+        uint64_t cksum0 = 0; int agree = 1;
         for (int rr = 0; rr < NR; rr++) {
             plow_hsa_download(h, dev[rr], host, out[rr], (size_t)n * 2u);
-            for (uint32_t e = 0; e < n; e++) {
-                float sum = 0;
-                for (uint32_t r = 0; r < NR; r++) sum += bf2f(partial_val(r, e));
-                bf16 want = f2bf(sum);
-                if (gather) {
-                    const uint32_t c = e % hidden, m = e / hidden;
-                    const uint32_t owner = c / (hidden / NR);
-                    const uint32_t ge = m * (hidden / NR) + c % (hidden / NR);
-                    want = f2bf(bf2f(want) + bf2f(partial_val(owner, ge)));
-                }
-                bad += host[e] != want;
-            }
+            for (uint32_t e = 0; e < n; e++) bad += host[e] != want[e];
+            const uint64_t ck = fnv1a64(host, (size_t)n * 2u);
+            if (rr == 0) cksum0 = ck; else agree &= ck == cksum0;
         }
         /* s_memrealtime is the 100 MHz REFCLK (10 ns/tick), not the runtime's 1 GHz HSA
          * timestamp clock `freq`; scaling by `freq` printed 10x-too-small numbers until
          * 2026-09-04 (tp_allreduce_bench.c has the wall-clock check). */
         const double us = (double)ticks * 10.0 / (double)iters / 1e3;
-        printf("rows=%u n=%u nblk=%u gather=%d oneshot=%d tagged=%d %.3f us/collective parity=%s timeout=%s bad=%zu\n",
+        printf("rows=%u n=%u nblk=%u gather=%d oneshot=%d tagged=%d %.3f us/collective parity=%s timeout=%s bad=%zu",
                n / hidden, n, nwg, gather, oneshot, taggedx, us, bad ? "FAIL" : "PASS",
                timeout ? "YES" : "no", bad);
+        if (phases)
+            printf(" rs=%.3f ag=%.3f", (double)ticks2[0] * 10.0 / (double)iters / 1e3,
+                   (double)ticks2[1] * 10.0 / (double)iters / 1e3);
+        printf(" random=%d cksum=fnv1a64:%016llx ranks_agree=%s\n", g_random,
+               (unsigned long long)cksum0, agree ? "yes" : "NO");
         if ((!unsafe && bad) || timeout) return 1;
     }
     plow_hsa_shutdown(h); return 0;
