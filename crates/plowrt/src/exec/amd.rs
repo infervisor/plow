@@ -956,11 +956,17 @@ const KDA_CONV_STEP_DB_REPLACED_OPS: &[DevOp] = &[
 /// Every opcode that reaches an arm behind `PLOW_K3` in `runtime/amd/interp.hip`.
 ///
 /// The KDA mixer ops — four decomposed plus the two FUSED ones the decode emitter actually uses —
-/// and the three K3 block-structure ops, and nothing else. This is the Rust half of the contract
-/// whose C half is the `#if PLOW_K3` region around those nine `case` labels;
-/// `k3_arm_ops_match_the_interpreter` reads `interp.hip` and asserts the two agree, so a future
-/// tenth arm added inside the guard cannot go unlisted here — which is exactly how `KdaConv3` and
-/// `KdaStateStepG` were forced onto this list rather than remembered onto it.
+/// the three K3 block-structure ops, and (added alongside GLM-5.3-Flash, which shares this same
+/// guard region rather than its own) the eight GLM-5.3 primitives: hyper-connections and the
+/// pooled DSA indexer. This is the Rust half of the contract whose C half is the `#if PLOW_K3`
+/// region around those `case` labels; `k3_arm_ops_match_the_interpreter` reads `interp.hip` and
+/// asserts the two agree, so a future arm added inside the guard cannot go unlisted here — which
+/// is exactly how `KdaConv3` and `KdaStateStepG` were forced onto this list rather than
+/// remembered onto it, and how the eight GLM-5.3 ops below were found missing: they NOPped
+/// silently on any object built without `PLOW_K3` with no load-time refusal, because this list
+/// was never updated when they were added to the interpreter — caught only by running this
+/// test under `--features hsa`, which this project's own documented verification recipes
+/// (`status.md`, `perf-data/vllm-k3-glm53-baseline.md`) never pass.
 const K3_ARM_OPS: &[DevOp] = &[
     DevOp::KdaConv,
     DevOp::KdaGate,
@@ -972,6 +978,14 @@ const K3_ARM_OPS: &[DevOp] = &[
     DevOp::AttnRes,
     DevOp::SituGlu,
     DevOp::MlaOutGate,
+    DevOp::HyperConnPre,
+    DevOp::HyperConnPost,
+    DevOp::DsaPoolCompress,
+    DevOp::DsaPoolExpand,
+    DevOp::DsaPoolStash,
+    DevOp::DsaQQuant,
+    DevOp::IndexScoreKpool,
+    DevOp::GemvF32,
 ];
 
 /// The first K3/KDA opcode in these programs, or `None` if the packet needs no K3 arm.
@@ -2745,6 +2759,9 @@ fn kv_write_row_field(op: u16, dst: Option<&String>) -> Option<usize> {
         // GLM/DeepSeek MLA: `kv_a_layernorm` -> `kv.{L}.ckv`, out_row0 in i[2]
         // (`runtime/amd/interp.hip`, PLOW_DOP_RMSNORM).
         Some(2)
+    } else if op == DevOp::DsaPoolCompress as u16 {
+        // GLM-5.3 pooled indexer: prefill pool-cache base in i[3].
+        Some(3)
     } else if op == DevOp::HeadNormRope as u16 || op == DevOp::HeadNormRopeFp8 as u16 {
         // Dense GQA k/v norm -> `kv.{L}.k`/`.v`, and MLA's k_rope -> `kv.{L}.krot`.
         // Both carry the write row in i[3].
@@ -2776,6 +2793,29 @@ fn kv_write_row_field(op: u16, dst: Option<&String>) -> Option<usize> {
 /// * `FlashPrefill`/`FlashPrefillFp8` → `i[4] = c0` (q_pos0) and
 ///   `i[1] = c0 + clen` (n_kv, everything written so far, not just this chunk).
 /// * every **KDA op** ([`KDA_ROW_COUNT_OPS`]) → `i[0] = clen`, the REAL row count.
+/// * `DsaPoolCompress` (GLM-5.3's pooled indexer, prefill mode only — this
+///   function never sees a decode program) → `i[0] = clen / pool_size`, not the
+///   baked `t / pool_size`. Same reasoning as KDA: the pool cache is PERSISTENT
+///   (`kv.*`, addressed by [`kv_write_row_field`]'s `chunk_base` above), so a
+///   padded chunk's pool count must stop at the last pool `clen` actually
+///   completes — one pool further and the boundary pool mixes real tokens with
+///   pad-row garbage, silently corrupting a cache entry decode will later select.
+///   `clen == t` (the common, non-ragged case) reproduces the baked value exactly.
+/// * `DsaPoolStash` (its prefill TAIL-SEED twin) → carries the `clen % pool_size`
+///   real trailing rows `DsaPoolCompress`'s shrink above deliberately leaves
+///   uncompressed into the decode-side ring, so that boundary pool completes
+///   correctly once decode contributes the rest instead of starting from
+///   whatever the ring happened to hold. `devgen` bakes `pool_size - 1` of these
+///   at `row = t - 1 - k`; rebased here to `row = clen - 1 - k` (an offset from
+///   `clen`'s end instead of `t`'s) and disabled (`Nop`) once `row` would fall
+///   inside a pool `DsaPoolCompress` already compressed — a live "genuine" and
+///   "surplus" write can share a ring slot (`pos % pool_size` cycles every
+///   `pool_size` rows), and letting a stale already-cached row overwrite a real
+///   one is exactly the bug this rebase exists to prevent, not a rarer version
+///   of it. On a full chunk (`clen == t`) `complete == clen`, so every baked row
+///   is `< complete` by construction and all of them `Nop` — correctly: every
+///   pool in a full chunk, including its last, was already compressed directly
+///   by `DsaPoolCompress` itself, so there is nothing left for the ring to carry.
 ///
 /// # Why KDA needs a row count where attention needs only a bound
 ///
@@ -2963,6 +3003,7 @@ fn rebase_chunk_rows(
     names: &[String],
     c0: u32,
     clen: u32,
+    t: u32,
     bucket: Option<u32>,
 ) {
     for d in insts.iter_mut() {
@@ -2978,6 +3019,17 @@ fn rebase_chunk_rows(
             d.i[1] = c0 + clen;
         } else if KDA_ROW_COUNT_OPS.iter().any(|&k| op == k as u16) {
             d.i[0] = clen;
+        } else if op == DevOp::DsaPoolCompress as u16 {
+            let pool_size = d.i[1].max(1);
+            d.i[0] = clen / pool_size;
+        } else if op == DevOp::DsaPoolStash as u16 {
+            let pool_size = d.i[0].max(1);
+            let pad = t.saturating_sub(clen);
+            let complete = (clen / pool_size) * pool_size;
+            match d.i[2].checked_sub(pad) {
+                Some(row) if row >= complete && row < clen => d.i[2] = row,
+                _ => d.op = DevOp::Nop as u16,
+            }
         }
         let Some(t) = bucket.filter(|&t| t > 0 && clen < t) else {
             continue;
@@ -5783,6 +5835,7 @@ impl AmdEngine {
             &self.tensor_names,
             c0,
             clen,
+            self.progs[prog].t,
             self.ragged_bucket(prog),
         );
 
@@ -7965,7 +8018,14 @@ mod tests {
     /// written at row 0, with no error anywhere.
     #[test]
     fn rebase_chunk_moves_only_the_kv_write_rows() {
-        let names: Vec<String> = ["kv.0.ckv", "act.xn", "kv.0.krot", "act.qr", "act.opart"]
+        let names: Vec<String> = [
+            "kv.0.ckv",
+            "act.xn",
+            "kv.0.krot",
+            "act.qr",
+            "act.opart",
+            "kv.0.kidx_pool",
+        ]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -7976,21 +8036,27 @@ mod tests {
         };
         // 0 kv_a_layernorm -> kv.0.ckv (row in i[2]); 1 the input norm, same
         // opcode, i[2] means nothing there; 2 k_rope -> kv.0.krot (row in i[3]);
-        // 3 the QUERY rope, same opcode, must be left alone; 4 the flash.
+        // 3 the QUERY rope, same opcode, must be left alone; 4 the flash;
+        // 5 GLM-5.3's pooled indexer cache (pool-row base in i[3]).
         let mut insts = vec![
             inst(DevOp::RmsNorm, 0),
             inst(DevOp::RmsNorm, 1),
             inst(DevOp::HeadNormRope, 2),
             inst(DevOp::HeadNormRope, 3),
             inst(DevOp::FlashMlaPrefill, 4),
+            inst(DevOp::DsaPoolCompress, 5),
         ];
         insts[4].i = [1, 64, 8192, 0, 128, u32::MAX, 0, 7];
         let before = insts.clone();
 
-        rebase_chunk_rows(&mut insts, &names, 512, 128, None);
+        rebase_chunk_rows(&mut insts, &names, 512, 128, 128, None);
 
         assert_eq!(insts[0].i[2], 512, "kv.0.ckv out_row0 was not rebased");
         assert_eq!(insts[2].i[3], 512, "kv.0.krot out_row was not rebased");
+        assert_eq!(
+            insts[5].i[3], 512,
+            "kv.0.kidx_pool out-pool base was not rebased"
+        );
         // Everything else, field for field.
         assert_eq!(insts[0].i[..2], before[0].i[..2]);
         assert_eq!(insts[0].i[3..], before[0].i[3..]);
@@ -8041,7 +8107,7 @@ mod tests {
         ];
         let before = insts.clone();
 
-        rebase_chunk_rows(&mut insts, &names, 0, CLEN, Some(T));
+        rebase_chunk_rows(&mut insts, &names, 0, CLEN, T, Some(T));
 
         assert_eq!(insts[0].i[0], CLEN, "Embed ntok");
         assert_eq!(insts[0].i[1], H, "Embed hidden must not move");
@@ -8080,7 +8146,7 @@ mod tests {
             },
         ];
         let before = insts.clone();
-        rebase_chunk_rows(&mut insts, &names, 0, T, Some(T));
+        rebase_chunk_rows(&mut insts, &names, 0, T, T, Some(T));
         assert_eq!(insts[0].i, before[0].i);
         assert_eq!(insts[1].i, before[1].i);
     }
@@ -8158,7 +8224,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        rebase_chunk_rows(&mut insts, &names, 1024, 512, None);
+        rebase_chunk_rows(&mut insts, &names, 1024, 512, 512, None);
         assert_eq!(insts[0].i[3], 1024);
         assert_eq!(insts[1].i, [0; 8], "the query norm was patched");
         assert_eq!(insts[2].i[4], 1024, "q_pos0");
@@ -8198,7 +8264,7 @@ mod tests {
             i: [T, 0, 0, 0, 0, 0, 0, 0],
             ..Default::default()
         });
-        rebase_chunk_rows(&mut insts, &names, 1024, CLEN, None);
+        rebase_chunk_rows(&mut insts, &names, 1024, CLEN, CLEN, None);
 
         for (d, &op) in insts.iter().zip(KDA_ROW_COUNT_OPS) {
             assert_eq!(d.i[0], CLEN, "{op:?} still runs the padded bucket width");
@@ -8208,6 +8274,74 @@ mod tests {
             assert_eq!((d.i[1], d.i[2]), (96, 128), "{op:?}: a live operand moved");
         }
         assert_eq!(insts.last().unwrap().i[0], T, "a non-KDA op was shortened");
+    }
+
+    /// GLM-5.3's pooled DSA indexer, non-pool-aligned tail: `DsaPoolCompress` must stop
+    /// at the last COMPLETE pool `clen` covers, and `DsaPoolStash`'s prefill tail-seed
+    /// instructions must fire on exactly the trailing real rows a padded chunk's
+    /// compress call now excludes — neither more (a stray write into a slot an
+    /// already-cached pool owns) nor fewer (a real trailing token silently never
+    /// becomes searchable).
+    ///
+    /// `T=512, CLEN=502, pool_size=4`: `complete = (502/4)*4 = 500`, so exactly the
+    /// last TWO real rows (500, 501) are the genuine trailing remainder and the third
+    /// baked stash (row 509 -> rebased 499, which is `< complete`, i.e. already inside
+    /// a pool `DsaPoolCompress` itself just compressed) must `Nop`.
+    #[test]
+    fn dsa_pool_tail_seed_shrinks_compress_and_rebases_exactly_the_real_remainder() {
+        let names: Vec<String> = Vec::new();
+        const T: u32 = 512;
+        const CLEN: u32 = 502;
+        const POOL_SIZE: u32 = 4;
+        let compress = DevInst64 {
+            op: DevOp::DsaPoolCompress as u16,
+            i: [T / POOL_SIZE, POOL_SIZE, 128, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        // Baked exactly as `emit_glm_dsa_prefill_select` bakes them: rows T-1, T-2, T-3.
+        let stash = |row: u32| DevInst64 {
+            op: DevOp::DsaPoolStash as u16,
+            i: [POOL_SIZE, 128, row, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let mut insts = vec![compress, stash(T - 1), stash(T - 2), stash(T - 3)];
+        rebase_chunk_rows(&mut insts, &names, 0, CLEN, T, None);
+
+        assert_eq!(insts[0].i[0], CLEN / POOL_SIZE, "compress did not shrink to clen's pools");
+        assert_eq!((insts[0].i[1], insts[0].i[2]), (POOL_SIZE, 128), "a live compress operand moved");
+
+        assert_eq!(insts[1].op, DevOp::DsaPoolStash as u16, "genuine trailing row #1 was dropped");
+        assert_eq!(insts[1].i[2], CLEN - 1, "row was not rebased from t's end to clen's end");
+        assert_eq!(insts[2].op, DevOp::DsaPoolStash as u16, "genuine trailing row #2 was dropped");
+        assert_eq!(insts[2].i[2], CLEN - 2);
+        assert_eq!(
+            insts[3].op,
+            DevOp::Nop as u16,
+            "surplus stash for an already-compressed row was left live -- it can race a \
+             genuine trailing write for the same ring slot (pos % pool_size repeats every \
+             pool_size rows) and clobber it with stale already-cached data"
+        );
+    }
+
+    /// A full/aligned chunk (`clen == t`, `t` always a multiple of `pool_size`) must
+    /// `Nop` every tail-seed stash: `complete == clen`, so every baked row is `<
+    /// complete` by construction — `DsaPoolCompress` itself already compressed the
+    /// chunk's last pool directly, and the ring has nothing left to carry.
+    #[test]
+    fn dsa_pool_tail_seed_is_a_full_nop_on_an_aligned_chunk() {
+        let names: Vec<String> = Vec::new();
+        const T: u32 = 512;
+        const POOL_SIZE: u32 = 4;
+        let stash = |row: u32| DevInst64 {
+            op: DevOp::DsaPoolStash as u16,
+            i: [POOL_SIZE, 128, row, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let mut insts = vec![stash(T - 1), stash(T - 2), stash(T - 3)];
+        rebase_chunk_rows(&mut insts, &names, 0, T, T, None);
+        for d in &insts {
+            assert_eq!(d.op, DevOp::Nop as u16, "an aligned chunk's tail-seed stash must not fire");
+        }
     }
 
     /// THE ATTNRES SCORE WEIGHT IS DERIVED, AND THE FOLD IS CHECKED AGAINST THE

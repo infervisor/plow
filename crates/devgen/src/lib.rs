@@ -5551,6 +5551,20 @@ pub fn run_verified(args: EmitArgs, verify: Option<VerifyHook>) {
         }
         mla::kimi_k3_emit(&dir, ctx, tp, block_spec.as_deref());
     }
+    if model_type == "glm5_next" {
+        assert!(block_spec.is_none(), "glm5_next currently emits the complete serving model");
+        mla::glm53_emit_full(
+            &dir,
+            ctx,
+            &out,
+            n_cu,
+            tp,
+            rope_gen,
+            &arch,
+            verify.as_ref(),
+        );
+        return;
+    }
     if model_type == "glm_moe_dsa" {
         // GLM `--block` (M2): single-block
         // extraction on the separate GLM emitter. Absent => the unchanged glm_main
@@ -5797,6 +5811,10 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_ATTN_RES",
     "PLOW_DOP_ATTN_SELECT",
     "PLOW_DOP_DENSE_GLU_FP8_BLK",
+    "PLOW_DOP_DSA_POOL_COMPRESS",
+    "PLOW_DOP_DSA_POOL_EXPAND",
+    "PLOW_DOP_DSA_POOL_STASH",
+    "PLOW_DOP_DSA_Q_QUANT",
     "PLOW_DOP_EMBED",
     "PLOW_DOP_FLASH_DECODE",
     "PLOW_DOP_FLASH_DECODE_FP8",
@@ -5829,6 +5847,7 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GEMM_WIDE_FP8",
     "PLOW_DOP_GEMM_WIDE_MXFP4",
     "PLOW_DOP_GEMV",
+    "PLOW_DOP_GEMV_F32",
     "PLOW_DOP_GEMV_FP8",
     "PLOW_DOP_GEMV_FP8_BLK",
     "PLOW_DOP_GEMV_GLU",
@@ -5842,7 +5861,10 @@ const GFX950_DISPATCHED: &[&str] = &[
     "PLOW_DOP_GLU",
     "PLOW_DOP_HEADNORM_ROPE",
     "PLOW_DOP_HEADNORM_ROPE_FP8",
+    "PLOW_DOP_HYPER_CONN_POST",
+    "PLOW_DOP_HYPER_CONN_PRE",
     "PLOW_DOP_INDEX_SCORE",
+    "PLOW_DOP_INDEX_SCORE_KPOOL",
     "PLOW_DOP_INDEX_SELECT",
     "PLOW_DOP_INDEX_SCORE_PF",
     "PLOW_DOP_INDEX_SELECT_PF",
