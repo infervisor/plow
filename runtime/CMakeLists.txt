@@ -863,6 +863,21 @@ if(PLOW_GFX950_HSACO)
         if(_hs_attn_res_f32mix_presence)
             set(_hs_need_attn_res_f32mix ON)
         endif()
+        # Opt-in lean MoE body variants (PLOW_MOE_STAGE1_BODY / PLOW_MOE_STAGE2_BODY at emit).
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_moe1_body_presence
+             REGEX "^#define PLOW_OBJECT_MOE_STAGE1_BODY 1$")
+        if(_hs_moe1_body_presence)
+            set(_hs_moe1_body_defs -DPLOW_MOE1_BODY=1)
+            set(_hs_moe1_maxreg 256)
+        endif()
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_moe2_body_presence
+             REGEX "^#define PLOW_OBJECT_MOE_STAGE2_BODY 1$")
+        if(_hs_moe2_body_presence)
+            set(_hs_moe2_body_defs -DPLOW_MOE2_BODY=1)
+        endif()
+    endif()
+    if(NOT DEFINED _hs_moe1_maxreg)
+        set(_hs_moe1_maxreg 192)
     endif()
     if(PLOW_HSACO_ATTN_RES_F32MIX AND NOT PLOW_HSACO_CONFIG)
         message(FATAL_ERROR
@@ -1628,8 +1643,9 @@ if(PLOW_GFX950_HSACO)
                     plow_moe2_mxfp4_16x16x128_gfx950 100 2
                     -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
                     -DPLOW_REQUIRED_MARKER=plow_moe2_mxfp4_stage2_abi_3
+                    ${_hs_moe2_body_defs}
                     "${_hs_moe2_src}"
-            DEPENDS "${_hs_moe2_src}" "${_hs_run}"
+            DEPENDS "${_hs_moe2_src}" "${_hs_run}" ${_hs_config_dep}
             COMMENT "hipcc moe_stage2_mxfp4_gfx950.elf"
             VERBATIM)
         list(APPEND _hs_outs "${_hs_moe2_out}")
@@ -1642,11 +1658,12 @@ if(PLOW_GFX950_HSACO)
         add_custom_command(OUTPUT "${_hs_moe1_out}"
             COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
                     "${PLOW_HSACO_ARCH}" "${_hs_moe1_out}"
-                    plow_moe1_a4_reuse_16x16x128_gfx950 192 2
+                    plow_moe1_a4_reuse_16x16x128_gfx950 ${_hs_moe1_maxreg} 2
                     ${_hs_inc} -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1
                     -DPLOW_REQUIRED_MARKER=plow_moe1_a4_reuse_abi_1
+                    ${_hs_moe1_body_defs}
                     "${_hs_moe1_src}"
-            DEPENDS "${_hs_moe1_src}" "${_hs_run}" ${_hs_hdrs}
+            DEPENDS "${_hs_moe1_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
             COMMENT "hipcc moe_stage1_mxfp4_gfx950.elf"
             VERBATIM)
         list(APPEND _hs_outs "${_hs_moe1_out}")

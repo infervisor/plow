@@ -1480,6 +1480,17 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
             "policy": "refuse",
         },
     });
+    // Opt-in lean MoE body variants: keys exist only when requested so the default
+    // manifest, pairing hash, and config header are unchanged.
+    let cfg = crate::emit_config::active();
+    if cfg.moe_stage1_body {
+        objects["lean"]["moe_stage1_body"] =
+            json!({ "required": true, "define": "PLOW_MOE1_BODY" });
+    }
+    if cfg.moe_stage2_body {
+        objects["lean"]["moe_stage2_body"] =
+            json!({ "required": true, "define": "PLOW_MOE2_BODY" });
+    }
     let mut f = features(&union);
     let materialized_residual_input = m.progs.iter().flat_map(|p| &p.insts).any(|inst| {
         inst.op == DevOp::AttnRes as u16
@@ -1780,6 +1791,18 @@ pub fn config_header(manifest: &Value) -> String {
         "#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP {}\n",
         if moe_prefill_ep_required { 1 } else { 0 }
     ));
+    for (key, macro_name) in [
+        ("moe_stage1_body", "PLOW_OBJECT_MOE_STAGE1_BODY"),
+        ("moe_stage2_body", "PLOW_OBJECT_MOE_STAGE2_BODY"),
+    ] {
+        if manifest
+            .pointer(&format!("/objects/lean/{key}/required"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            out.push_str(&format!("#define {macro_name} 1\n"));
+        }
+    }
     for o in DevOp::ALL {
         let name = op_name(*o);
         let present = ops.contains(&name);
@@ -2007,6 +2030,28 @@ mod tests {
             false
         );
         assert!(config_header(&ordinary).contains("#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP 0"));
+    }
+
+    /// The opt-in lean MoE body variants are object requests carried by the config header;
+    /// the default manifest carries neither key nor macro, so its pairing hash is unchanged.
+    #[test]
+    fn moe_body_variants_are_opt_in_object_requests() {
+        let _guard = crate::test_env::env_guard();
+        let ordinary = build(&model(), "gfx950");
+        assert!(ordinary["objects"]["lean"].get("moe_stage1_body").is_none());
+        assert!(ordinary["objects"]["lean"].get("moe_stage2_body").is_none());
+        assert!(!config_header(&ordinary).contains("PLOW_OBJECT_MOE_STAGE"));
+        let _scope = crate::test_env::EnvScope::set(&[
+            ("PLOW_MOE_STAGE1_BODY", "1"),
+            ("PLOW_MOE_STAGE2_BODY", "1"),
+        ]);
+        let man = build(&model(), "gfx950");
+        assert_eq!(man["objects"]["lean"]["moe_stage1_body"]["required"], true);
+        assert_eq!(man["objects"]["lean"]["moe_stage2_body"]["required"], true);
+        let header = config_header(&man);
+        assert!(header.contains("#define PLOW_OBJECT_MOE_STAGE1_BODY 1\n"));
+        assert!(header.contains("#define PLOW_OBJECT_MOE_STAGE2_BODY 1\n"));
+        assert_ne!(man["pairing"]["hash"], ordinary["pairing"]["hash"]);
     }
 
     /// L4: a decode XReduce with `i7 != 0` (the folded latent combine) is a build axis of the

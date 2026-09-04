@@ -101,3 +101,24 @@ samples, and requires byte-exact payload and scales. At T8192/H3584/I384/E896/to
 2.122398 ms shipping vs 1.728507 ms reusable A4 (means, -18.55%), with zero differences over
 29,036,544 payload and 1,814,784 scale bytes. The candidate is wave64, four waves/WG, 182 VGPR,
 44 SGPR, occupancy 2, private0, and VGPR/SGPR spill0.
+
+## K256 register-B body (`PLOW_MOE1_BODY=1`)
+
+`reuse_kernel.hip` carries an opt-in second body for the reusable-A4 GEMM, selected at emit
+with `PLOW_MOE_STAGE1_BODY=1` (manifest → `plow_config.h` → `-DPLOW_MOE1_BODY=1`). Same tile,
+same MFMA sequence per accumulator, bit-identical output; only data movement changes: two
+k-steps per iteration (full 128-byte B row lines, 128-byte A rows, one barrier per two
+k-steps), E8M0 scales staged through LDS in packed lane order, and an XCD fold of the grid
+so one expert's tiles share one L2. `build_body.sh` builds shipping + candidate and the
+`body_compare` oracle/timer (quant, shipping GEMM and candidate GEMM timed separately):
+
+```sh
+nix develop -c env MOE1_MAXREG=256 runtime/bench/amd/lean_moe_stage1_ref/build_body.sh /tmp/plow-moe1-body
+GPU_LEASE_TIMEOUT=14400 perf-data/tools/gpulease -n 1 moe1-body \
+  /tmp/plow-moe1-body/body_compare /tmp/plow-moe1-body/shipping.elf /tmp/plow-moe1-body/candidate.elf --run
+```
+
+Measured 2026-09-04 (T8192/H3584/I384/E896/top-k16, medians of 31): quant/sort 0.310 ms,
+shipping GEMM 1.4185 ms, K256 body 0.8155 ms (−42.5%), 0 differing payload/scale bytes; 228 VGPR,
+48 SGPR, occupancy 2, no spills, 21,504 B mainloop LDS. `text_sha.sh` prints `.text` digests
+(flag-off object unchanged). See `docs/k3-mi355x-20260904/prefill-moe-bodies-status.md`.
