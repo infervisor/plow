@@ -689,6 +689,14 @@ pub fn emit_attn_res(
         d.i[4] = nb_cap;
         d.i[5] = packet::dev::TENSOR_NONE_I;
         d.f[0] = c.eps;
+        // vLLM's f32-mix contract carries the fused norm's epsilon separately from the score
+        // epsilon (`attn_res.py`: `eps` vs `output_norm_eps`). Both are `rms_norm_eps` in K3,
+        // which the fusion asserts (`mixer_eps == cb.eps`), so the operand is the same value
+        // today; it is still a distinct slot because the object reads it as one. The
+        // interpreter ignores `f[1]`, so without the object the packet runs its BF16-seam arm.
+        if post_norm.is_some() && crate::emit_config::active().attnres_f32mix {
+            d.f[1] = c.eps;
+        }
     })
 }
 

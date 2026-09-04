@@ -23,7 +23,9 @@
 use core::mem::size_of;
 use std::collections::{BTreeSet, HashSet};
 
-use crate::dev::{DevInst, DevOp, StreamEnt, Wait, SE_FINE, TENSOR_NONE, TENSOR_NONE_I};
+use crate::dev::{
+    DevInst, DevInst64, DevOp, StreamEnt, Wait, SE_FINE, TENSOR_NONE, TENSOR_NONE16, TENSOR_NONE_I,
+};
 use crate::rope::GenTensor;
 
 /// Edges that survive transitive reduction: drop A→C when a path A→…→C of
@@ -347,6 +349,8 @@ pub struct Builder {
     xreduce_wave_rs_segments: bool,
     /// Fold an eligible materialized Residual into its AttnRes consumer.
     fuse_materialized_residual_inputs: bool,
+    /// Isolate f32-mix AttnRes packets (`f[1]` = output-norm epsilon) for the gfx950 object.
+    attn_res_f32mix_segments: bool,
     /// Slices per machine-filling decode GEMV, as a multiple of `n_cu`. 1 (default) ⇒
     /// byte-identical. See [`Builder::set_gemv_split`].
     gemv_split: u32,
@@ -452,6 +456,58 @@ fn lean_moe_combine_inst(inst: &DevInst) -> bool {
         && inst.j.iter().all(|&v| v == 0)
 }
 
+/// An AttnRes packet the f32-mix gfx950 object may own: K3's fused-norm shape (gamma present,
+/// `f[1]` carries the separate output-norm epsilon, which only the f32-mix emitter writes), one
+/// workgroup per token at prefill width, the object's fixed hidden width, and no operands
+/// outside the nine the kernarg ABI carries.
+pub fn lean_attn_res_f32mix_inst(inst: &DevInst) -> bool {
+    inst.op == DevOp::AttnRes as u16
+        && inst.t[0] != TENSOR_NONE
+        && inst.t[1] != TENSOR_NONE
+        && inst.t[2] != TENSOR_NONE
+        && inst.t[3] != TENSOR_NONE
+        && inst.t[5] != TENSOR_NONE
+        && (inst.t[6] == TENSOR_NONE) == (inst.t[7] == TENSOR_NONE)
+        && (inst.i[5] == TENSOR_NONE_I || inst.t[6] != TENSOR_NONE)
+        && inst.i[0] >= 256
+        && inst.i[1] == 7168
+        && inst.i[2] <= 8
+        && inst.i[2] <= inst.i[4]
+        && (inst.t[4] == TENSOR_NONE || inst.i[3] < inst.i[4])
+        && inst.i[6] == 0
+        && inst.i[7] == 0
+        && inst.f[0].is_finite()
+        && inst.f[0] > 0.0
+        && inst.f[1].is_finite()
+        && inst.f[1] > 0.0
+        && inst.j.iter().all(|&v| v == 0)
+}
+
+/// [`lean_attn_res_f32mix_inst`] over the 64-byte wire form (`fj[1]` carries `f[1]`; `fj[2]`
+/// is `j[1]`). The runtime and the manifest select the object through this one.
+pub fn lean_attn_res_f32mix_inst64(d: &DevInst64) -> bool {
+    let f0 = f32::from_bits(d.fj[0]);
+    let f1 = f32::from_bits(d.fj[1]);
+    d.op == DevOp::AttnRes as u16
+        && d.blocks != 0
+        && d.t[..4].iter().all(|&t| t != TENSOR_NONE16)
+        && d.t[5] != TENSOR_NONE16
+        && (d.t[6] == TENSOR_NONE16) == (d.t[7] == TENSOR_NONE16)
+        && (d.i[5] == TENSOR_NONE_I || d.t[6] != TENSOR_NONE16)
+        && d.i[0] >= 256
+        && d.i[1] == 7168
+        && d.i[2] <= 8
+        && d.i[2] <= d.i[4]
+        && (d.t[4] == TENSOR_NONE16 || d.i[3] < d.i[4])
+        && d.i[6] == 0
+        && d.i[7] == 0
+        && f0.is_finite()
+        && f0 > 0.0
+        && f1.is_finite()
+        && f1 > 0.0
+        && d.fj[2] == 0
+}
+
 fn lean_kda_key_factor_pair(ops: &[Op], i: usize) -> bool {
     let Some((wu, carry)) = ops.get(i).zip(ops.get(i + 1)) else {
         return false;
@@ -511,6 +567,7 @@ impl Builder {
             decode_grouped_moe_segments: false,
             xreduce_wave_rs_segments: false,
             fuse_materialized_residual_inputs: true,
+            attn_res_f32mix_segments: false,
             gemv_split: 1,
             tensor_dedup: false,
             tr_dropped: 0,
@@ -623,6 +680,10 @@ impl Builder {
 
     pub fn set_kda_intra_wave_items_segments(&mut self, enabled: bool) {
         self.kda_intra_wave_items_segments = enabled;
+    }
+
+    pub fn set_attn_res_f32mix_segments(&mut self, enabled: bool) {
+        self.attn_res_f32mix_segments = enabled;
     }
 
     pub fn set_lean_kda_key_factor_segments(&mut self, enabled: bool) {
@@ -1818,6 +1879,12 @@ impl Builder {
             && self.lean_moe_combine_segments
             && self.ops.iter().any(|op| lean_moe_combine_inst(&op.inst));
         let moe_prefill_ep = self.moe_prefill_ep_degree.is_some();
+        let lean_attn_res_f32mix = !uniseg
+            && self.attn_res_f32mix_segments
+            && self
+                .ops
+                .iter()
+                .any(|op| lean_attn_res_f32mix_inst(&op.inst));
         let kda_intra_wave_items = !uniseg && self.kda_intra_wave_items_segments;
         let lean_kda_intra = !uniseg
             && (self.lean_kda_intra_segments || kda_intra_wave_items)
@@ -1985,6 +2052,9 @@ impl Builder {
             } else if lean_moe_combine && lean_moe_combine_inst(&self.ops[i].inst) {
                 // The standalone object preserves the interpreter's fixed slot order.
                 13
+            } else if lean_attn_res_f32mix && lean_attn_res_f32mix_inst(&self.ops[i].inst) {
+                // The f32-mix AttnRes object owns exactly one packet per segment.
+                25
             } else if decode_mla_segments
                 && ((op == DevOp::FlashMlaDecode as u16
                     && self
@@ -2108,6 +2178,7 @@ impl Builder {
             || lean_moe_stage2
             || lean_moe_stage1
             || lean_moe_combine
+            || lean_attn_res_f32mix
             || moe_prefill_ep
             || lean_kda_intra
             || lean_kda_key_factor
@@ -4744,6 +4815,91 @@ mod lean_kda_intra_tests {
             .iter()
             .filter(|e| e.inst != 1)
             .all(|e| e.flags & crate::dev::SE_KDA_INTRA_WAVE_ITEMS == 0));
+    }
+}
+
+#[cfg(test)]
+mod attn_res_f32mix_segment_tests {
+    use super::*;
+
+    fn attn_res(d: &mut DevInst, t: u32, out_eps: f32) {
+        d.op = DevOp::AttnRes as u16;
+        d.t = [0, 1, 2, 3, TENSOR_NONE, 4, TENSOR_NONE, TENSOR_NONE];
+        d.i = [t, 7168, 4, 4, 8, TENSOR_NONE_I, 0, 0];
+        d.f[0] = 1e-5;
+        d.f[1] = out_eps;
+    }
+
+    fn program(enabled: bool, t: u32, out_eps: f32) -> Program {
+        let mut b = Builder::new(4);
+        b.deny_uniseg();
+        b.set_attn_res_f32mix_segments(enabled);
+        for i in 0..5 {
+            b.tensor(&format!("ar{i}"), 8 << 20);
+        }
+        let all = b.all();
+        let before = b.emit(DevOp::Nop, all.clone(), &[], |_| {});
+        let mix = b.emit(DevOp::AttnRes, all.clone(), &[before], |d| {
+            attn_res(d, t, out_eps)
+        });
+        b.emit(DevOp::Nop, all, &[mix], |_| {});
+        b.finish()
+    }
+
+    fn segments(p: &Program) -> usize {
+        p.stream
+            .iter()
+            .map(|e| e.seg)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
+    #[test]
+    fn f32mix_predicate_requires_the_marker_and_geometry() {
+        let mut d = DevInst::default();
+        attn_res(&mut d, 8192, 1e-5);
+        assert!(lean_attn_res_f32mix_inst(&d));
+        // Materialized residual inputs (t6/t7, optional i5) stay eligible.
+        d.t[6] = 5;
+        d.t[7] = 6;
+        d.i[5] = 7;
+        assert!(lean_attn_res_f32mix_inst(&d));
+        d.t[7] = TENSOR_NONE;
+        assert!(!lean_attn_res_f32mix_inst(&d));
+        attn_res(&mut d, 8192, 0.0); // no output-norm epsilon: the interpreter's contract
+        assert!(!lean_attn_res_f32mix_inst(&d));
+        attn_res(&mut d, 1, 1e-5); // decode stays on the interpreter
+        assert!(!lean_attn_res_f32mix_inst(&d));
+        attn_res(&mut d, 8192, 1e-5);
+        d.t[5] = TENSOR_NONE; // raw mix without the fused norm
+        assert!(!lean_attn_res_f32mix_inst(&d));
+        attn_res(&mut d, 8192, 1e-5);
+        d.i[1] = 4096;
+        assert!(!lean_attn_res_f32mix_inst(&d));
+        attn_res(&mut d, 8192, 1e-5);
+        d.i[2] = 9;
+        assert!(!lean_attn_res_f32mix_inst(&d));
+    }
+
+    #[test]
+    fn f32mix_isolates_only_marked_packets_when_enabled() {
+        assert_eq!(segments(&program(true, 8192, 1e-5)), 3);
+        assert_eq!(segments(&program(false, 8192, 1e-5)), 1);
+        assert_eq!(segments(&program(true, 8192, 0.0)), 1);
+        assert_eq!(segments(&program(true, 1, 1e-5)), 1);
+        let p = program(true, 8192, 1e-5);
+        let mix_seg: std::collections::BTreeSet<_> = p
+            .stream
+            .iter()
+            .filter(|e| p.insts[e.inst as usize].op == DevOp::AttnRes as u16)
+            .map(|e| e.seg)
+            .collect();
+        assert_eq!(mix_seg.len(), 1);
+        assert!(p
+            .stream
+            .iter()
+            .filter(|e| p.insts[e.inst as usize].op != DevOp::AttnRes as u16)
+            .all(|e| !mix_seg.contains(&e.seg)));
     }
 }
 

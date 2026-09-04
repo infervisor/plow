@@ -657,6 +657,8 @@ option(PLOW_HSACO_KDA_INTRA_CACHED
        "Build the standalone cached BT64/D128 KDA-intra segment" OFF)
 option(PLOW_HSACO_KDA_INTRA_WAVE_ITEMS
        "Also build the packet-paired wave-item BT64/D128 KDA-intra segment" OFF)
+option(PLOW_HSACO_ATTN_RES_F32MIX
+       "Also build the packet-paired f32-mix AttnRes prefill object (PLOW_ATTNRES_F32MIX=1 packets)" OFF)
 option(PLOW_HSACO_KDA_KEY_FACTOR
        "Build the standalone exact BT64/D128 KDA Wu/carry key-factor pair" OFF)
 option(PLOW_HSACO_XR_ATTNRES
@@ -803,6 +805,7 @@ if(PLOW_GFX950_HSACO)
     set(_hs_config_dep "")
     set(_hs_need_kda_fused ON)
     set(_hs_need_kda_intra_wave_items OFF)
+    set(_hs_need_attn_res_f32mix OFF)
     set(_hs_need_decode_mla ${PLOW_HSACO_DECODE_MLA_SEGMENTS})
     if(PLOW_HSACO_CONFIG)
         get_filename_component(_hs_cfg_dir "${PLOW_HSACO_CONFIG}" DIRECTORY)
@@ -830,6 +833,19 @@ if(PLOW_GFX950_HSACO)
         if(_hs_kda_intra_wave_items_presence)
             set(_hs_need_kda_intra_wave_items ON)
         endif()
+        file(STRINGS "${PLOW_HSACO_CONFIG}" _hs_attn_res_f32mix_presence
+             REGEX "^#define PLOW_PACKET_REQUIRES_ATTN_RES_F32MIX 1$")
+        if(_hs_attn_res_f32mix_presence)
+            set(_hs_need_attn_res_f32mix ON)
+        endif()
+    endif()
+    if(PLOW_HSACO_ATTN_RES_F32MIX AND NOT PLOW_HSACO_CONFIG)
+        message(FATAL_ERROR
+            "PLOW_HSACO_ATTN_RES_F32MIX requires PLOW_HSACO_CONFIG for packet pairing")
+    endif()
+    if(_hs_need_attn_res_f32mix AND NOT PLOW_HSACO_ARCH STREQUAL "gfx950")
+        message(FATAL_ERROR
+            "manifest-required f32-mix AttnRes object is supported only on gfx950")
     endif()
     if(PLOW_HSACO_DECODE_INVENTORY_PRUNE AND NOT PLOW_HSACO_CONFIG)
         message(FATAL_ERROR
@@ -1378,6 +1394,27 @@ if(PLOW_GFX950_HSACO)
             VERBATIM)
         add_custom_target(kda_chunk_intra_wave_items_gfx950 DEPENDS "${_hs_kda_intra_wave_out}")
         list(APPEND _hs_outs "${_hs_kda_intra_wave_out}")
+    endif()
+
+    # -fno-slp-vectorize: packed-f32 FMA formation costs this object ~30 VGPRs of operand
+    # shuffling and pushes it over the register cliff; see the source header.
+    if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND
+       (PLOW_HSACO_ATTN_RES_F32MIX OR _hs_need_attn_res_f32mix))
+        set(_hs_attn_res_f32mix_src "${CMAKE_CURRENT_SOURCE_DIR}/amd/attn_res_f32mix_gfx950.hip")
+        set(_hs_attn_res_f32mix_out "${PLOW_HSACO_DIR}/attn_res_f32mix_gfx950.elf")
+        add_custom_command(OUTPUT "${_hs_attn_res_f32mix_out}"
+            COMMAND bash "${_hs_run}" "${PLOW_HSACO_HIPCC}" "${PLOW_HSACO_BUNDLER}"
+                    "${PLOW_HSACO_ARCH}" "${_hs_attn_res_f32mix_out}"
+                    plow_attn_res_f32mix_gfx950 168 3
+                    ${_hs_inc} ${_hs_extra} -fno-slp-vectorize
+                    -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1
+                    -DPLOW_REQUIRED_MARKER=plow_attn_res_f32mix_abi_1
+                    "${_hs_attn_res_f32mix_src}"
+            DEPENDS "${_hs_attn_res_f32mix_src}" "${_hs_run}" ${_hs_hdrs} ${_hs_config_dep}
+            COMMENT "hipcc attn_res_f32mix_gfx950.elf"
+            VERBATIM)
+        add_custom_target(attn_res_f32mix_gfx950 DEPENDS "${_hs_attn_res_f32mix_out}")
+        list(APPEND _hs_outs "${_hs_attn_res_f32mix_out}")
     endif()
 
     if(PLOW_HSACO_ARCH STREQUAL "gfx950" AND PLOW_HSACO_KDA_KEY_FACTOR)

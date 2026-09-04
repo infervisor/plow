@@ -1372,6 +1372,14 @@ fn build_inner(m: &Model, arch: &str, lean: &crate::LeanReport) -> Value {
     objects["lean"]["kda_intra_wave_items"] = json!({
         "required": kda_intra_wave_items_required,
     });
+    let attn_res_f32mix_required = m
+        .progs
+        .iter()
+        .flat_map(|p| &p.insts)
+        .any(packet::devbuild::lean_attn_res_f32mix_inst);
+    objects["lean"]["attn_res_f32mix"] = json!({
+        "required": attn_res_f32mix_required,
+    });
     let s = shapes(m);
     let mut ep_tables = BTreeSet::new();
     let ep_extra_resident_bytes_per_rank = m
@@ -1666,6 +1674,10 @@ pub fn config_header(manifest: &Value) -> String {
         .pointer("/objects/lean/moe_prefill_ep/required")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let attn_res_f32mix_required = manifest
+        .pointer("/objects/lean/attn_res_f32mix/required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let kda_chunk_qpre = union
         .iter()
         .any(|arm| arm.starts_with("KdaChunk") && arm.ends_with("_qpre"));
@@ -1677,6 +1689,10 @@ pub fn config_header(manifest: &Value) -> String {
     out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_KDA_INTRA_WAVE_ITEMS {}\n",
         if kda_intra_wave_items_required { 1 } else { 0 }
+    ));
+    out.push_str(&format!(
+        "#define PLOW_PACKET_REQUIRES_ATTN_RES_F32MIX {}\n",
+        if attn_res_f32mix_required { 1 } else { 0 }
     ));
     out.push_str(&format!(
         "#define PLOW_PACKET_REQUIRES_MOE_PREFILL_EP {}\n",

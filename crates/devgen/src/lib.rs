@@ -6813,6 +6813,10 @@ fn emit_dense_gqa(
             amd && amd_target::active().1 == hwspec::IsaLevel::Gfx950
                 && emit_config::active().kda_intra_wave_items,
         );
+        b.set_attn_res_f32mix_segments(
+            amd && amd_target::active().1 == hwspec::IsaLevel::Gfx950
+                && emit_config::active().attnres_f32mix,
+        );
         b.set_lean_kda_key_factor_segments(
             amd && amd_target::active().1 == hwspec::IsaLevel::Gfx950
                 && emit_config::active().kda_key_factor,
