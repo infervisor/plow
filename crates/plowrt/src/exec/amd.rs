@@ -294,6 +294,7 @@ enum DecodeSegmentKind {
     Interpreter,
     MlaAttention,
     KdaDecodeFused(usize),
+    GroupedMoeMxfp4 { glu: usize, down: usize },
 }
 
 fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
@@ -306,6 +307,10 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
         let mut mla_merge_inst = None;
         let mut multiple_mla_flash = false;
         let mut multiple_mla_merge = false;
+        let mut moe_glu_inst = None;
+        let mut moe_down_inst = None;
+        let mut multiple_moe_glu = false;
+        let mut multiple_moe_down = false;
         let mut has_other = false;
         for e in prog.stream.iter().filter(|e| e.seg as usize == seg) {
             let inst = prog.insts.get(e.inst as usize).ok_or_else(|| {
@@ -354,6 +359,19 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                         e.inst, e.wait_len, e.succ_len, e.flags
                     )));
                 }
+            } else if inst.op == DevOp::MoeGroupGluFp8Blk as u16
+                || inst.op == DevOp::MoeGroupDownFp8Blk as u16
+            {
+                let (slot, multiple) = if inst.op == DevOp::MoeGroupGluFp8Blk as u16 {
+                    (&mut moe_glu_inst, &mut multiple_moe_glu)
+                } else {
+                    (&mut moe_down_inst, &mut multiple_moe_down)
+                };
+                match *slot {
+                    None => *slot = Some(e.inst as usize),
+                    Some(i) if i == e.inst as usize => {}
+                    Some(_) => *multiple = true,
+                }
             } else {
                 has_other = true;
             }
@@ -365,6 +383,36 @@ fn decode_segment_kinds(prog: &DevProg) -> Result<Vec<DecodeSegmentKind>> {
                 )));
             }
             kinds[seg] = DecodeSegmentKind::KdaDecodeFused(inst);
+        } else if !has_other && moe_glu_inst.is_some() && moe_down_inst.is_some() {
+            let (Some(glu), Some(down)) = (moe_glu_inst, moe_down_inst) else {
+                unreachable!()
+            };
+            if multiple_moe_glu || multiple_moe_down || down != glu + 1 {
+                return Err(RuntimeError::Device(format!(
+                    "decode segment {seg} is not a pure adjacent grouped MoE GLU+DOWN pair"
+                )));
+            }
+            for e in prog.stream.iter().filter(|e| {
+                e.seg as usize == seg && matches!(e.inst as usize, i if i == glu || i == down)
+            }) {
+                if e.wait_len != 0 || e.succ_len != 0 || e.flags & SE_XCTR != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "grouped MoE instruction {} has counter obligations in segment {seg}",
+                        e.inst
+                    )));
+                }
+                match raw_segment_owner[e.inst as usize] {
+                    Some(owner) if owner != seg => {
+                        return Err(RuntimeError::Device(format!(
+                            "raw instruction {} is referenced by segments {owner} and {seg}",
+                            e.inst
+                        )))
+                    }
+                    None => raw_segment_owner[e.inst as usize] = Some(seg),
+                    _ => {}
+                }
+            }
+            kinds[seg] = DecodeSegmentKind::GroupedMoeMxfp4 { glu, down };
         } else if !has_other && (mla_flash_inst.is_some() || mla_merge_inst.is_some()) {
             let (Some(flash), Some(merge)) = (mla_flash_inst, mla_merge_inst) else {
                 return Err(RuntimeError::Device(format!(
@@ -512,6 +560,43 @@ struct KdaDecodeFusedArgs {
 }
 
 const _: () = assert!(std::mem::size_of::<KdaDecodeFusedArgs>() == 184);
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct GroupedMoeGluArgs {
+    fu: u64,
+    x: u64,
+    table: u64,
+    weights: u64,
+    scales: u64,
+    topk: u32,
+    intermediate: u32,
+    hidden: u32,
+    experts: u32,
+    act: u32,
+    enc: u32,
+    beta: f32,
+    linear_beta: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct GroupedMoeDownArgs {
+    partial: u64,
+    fu: u64,
+    table: u64,
+    weights: u64,
+    scales: u64,
+    topk: u32,
+    hidden: u32,
+    intermediate: u32,
+    experts: u32,
+    enc: u32,
+    reserved: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<GroupedMoeGluArgs>() == 72);
+const _: () = assert!(std::mem::size_of::<GroupedMoeDownArgs>() == 64);
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -1539,6 +1624,11 @@ enum DecodeSegmentRoute {
     Interpreter,
     MlaAttention,
     KdaDecodeFused(KdaDecodeFusedArgs),
+    GroupedMoeMxfp4 {
+        glu: GroupedMoeGluArgs,
+        down: GroupedMoeDownArgs,
+        grid: u32,
+    },
 }
 
 fn requires_segmented_decode(routes: &[DecodeSegmentRoute]) -> bool {
@@ -1547,7 +1637,7 @@ fn requires_segmented_decode(routes: &[DecodeSegmentRoute]) -> bool {
         .any(|route| !matches!(route, DecodeSegmentRoute::Interpreter))
 }
 
-fn kda_decode_fused_routes(
+fn decode_segment_routes(
     prog: &DevProg,
     tensors: &[crate::asset::devblob::DevTensor],
     init: &[u8],
@@ -1566,6 +1656,69 @@ fn kda_decode_fused_routes(
                 continue;
             }
             DecodeSegmentKind::KdaDecodeFused(inst_ix) => inst_ix,
+            DecodeSegmentKind::GroupedMoeMxfp4 { glu, down } => {
+                let g = &prog.insts[glu];
+                let d = &prog.insts[down];
+                if g.i[0] == 0
+                    || g.i[1] == 0
+                    || g.i[2] == 0
+                    || g.i[3] == 0
+                    || g.i[6] != 2
+                    || d.i[6] != 2
+                    || d.i[0] != g.i[0]
+                    || d.i[1] != g.i[2]
+                    || d.i[2] != g.i[1]
+                    || d.i[3] != g.i[3]
+                    || d.t[1] != g.t[0]
+                    || d.t[2] != g.t[2]
+                    || d.blocks == 0
+                    || g.blocks == 0
+                {
+                    return Err(RuntimeError::Device(format!(
+                        "grouped MoE instructions {glu}/{down} have unsupported or inconsistent MXFP4 geometry"
+                    )));
+                }
+                let addr = |h: u16, what: &str| -> Result<u64> {
+                    devp.get(h as usize).map(|m| m.base).ok_or_else(|| {
+                        RuntimeError::Device(format!(
+                            "grouped MoE operand `{what}` handle {h} is outside {} tensors",
+                            devp.len()
+                        ))
+                    })
+                };
+                routes.push(DecodeSegmentRoute::GroupedMoeMxfp4 {
+                    glu: GroupedMoeGluArgs {
+                        fu: addr(g.t[0], "fu")?,
+                        x: addr(g.t[1], "x")?,
+                        table: addr(g.t[2], "table")?,
+                        weights: addr(g.t[3], "weights")?,
+                        scales: addr(g.t[4], "scales")?,
+                        topk: g.i[0],
+                        intermediate: g.i[1],
+                        hidden: g.i[2],
+                        experts: g.i[3],
+                        act: g.i[5],
+                        enc: g.i[6],
+                        beta: f32::from_bits(g.fj[0]),
+                        linear_beta: f32::from_bits(g.fj[1]),
+                    },
+                    down: GroupedMoeDownArgs {
+                        partial: addr(d.t[0], "partial")?,
+                        fu: addr(d.t[1], "fu")?,
+                        table: addr(d.t[2], "table")?,
+                        weights: addr(d.t[3], "weights")?,
+                        scales: addr(d.t[4], "scales")?,
+                        topk: d.i[0],
+                        hidden: d.i[1],
+                        intermediate: d.i[2],
+                        experts: d.i[3],
+                        enc: d.i[6],
+                        reserved: 0,
+                    },
+                    grid: u32::from(g.blocks).saturating_mul(3),
+                });
+                continue;
+            }
         };
         let d = &prog.insts[inst_ix];
         let (rows, heads, dim, bv, conv_w, flags, gate_mode, version) = (
@@ -5800,6 +5953,8 @@ pub struct AmdEngine {
     /// Packet-paired interpreter containing only FlashMlaDecode+MlaMergeFold.
     k_decode_mla: Option<HsaKernel>,
     k_kda_decode_fused: Option<HsaKernel>,
+    k_grouped_moe_glu: Option<HsaKernel>,
+    k_grouped_moe_down: Option<HsaKernel>,
     k_kda_chunk_intra_cached: Option<HsaKernel>,
     k_kda_chunk_intra_wave_items: Option<HsaKernel>,
     k_kda_key_factor_wu: Option<HsaKernel>,
@@ -6362,6 +6517,13 @@ impl AmdEngine {
                 need || decode_segment_kinds(p)?
                     .iter()
                     .any(|kind| matches!(kind, DecodeSegmentKind::MlaAttention)),
+            )
+        })?;
+        let need_grouped_moe = blob.progs[dec_ix..].iter().try_fold(false, |need, p| {
+            Ok::<_, RuntimeError>(
+                need || decode_segment_kinds(p)?
+                    .iter()
+                    .any(|kind| matches!(kind, DecodeSegmentKind::GroupedMoeMxfp4 { .. })),
             )
         })?;
         let need_xreduce_wave_rs = blob.progs[..dec_ix].iter().any(|p| {
@@ -7160,6 +7322,64 @@ impl AmdEngine {
             Some(kernel)
         } else {
             None
+        };
+
+        let (k_grouped_moe_glu, k_grouped_moe_down) = if need_grouped_moe {
+            if arch != "gfx950" {
+                return Err(RuntimeError::Device(format!(
+                    "standalone grouped MXFP4 MoE requires gfx950, but this device is {arch}"
+                )));
+            }
+            const NAME: &str = "moe_decode_grouped_mxfp4_gfx950.elf";
+            const MARKER: &str = "plow_moe_decode_grouped_mxfp4_abi_1";
+            const GLU: &str = "plow_moe_decode_grouped_glu_mxfp4_gfx950";
+            const DOWN: &str = "plow_moe_decode_grouped_down_mxfp4_gfx950";
+            let path = hsaco_dir.join(NAME);
+            let image = std::fs::read(&path).map_err(|e| {
+                RuntimeError::Device(format!(
+                    "grouped MoE segment requires {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let syms = elf_symbol_names(&image);
+            if !syms.contains(&MARKER) {
+                return Err(RuntimeError::Device(format!(
+                    "{} lacks required ABI/resource marker `{MARKER}`",
+                    path.display()
+                )));
+            }
+            let module = EngineDevice::module_load(&*be, &image)?;
+            let glu = EngineDevice::get_function(&*be, &module, GLU)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {GLU}: {e}")))?;
+            let down = EngineDevice::get_function(&*be, &module, DOWN)
+                .map_err(|e| RuntimeError::Device(format!("{NAME}: no symbol {DOWN}: {e}")))?;
+            const IMPLICIT: u32 = 256;
+            for (kernel, want, role) in [
+                (glu, std::mem::size_of::<GroupedMoeGluArgs>() as u32, "GLU"),
+                (
+                    down,
+                    std::mem::size_of::<GroupedMoeDownArgs>() as u32,
+                    "DOWN",
+                ),
+            ] {
+                let got = kernel.kernarg_size();
+                if got != want && got != want + IMPLICIT {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: {role} kernarg segment is {got} B; expected {want} (or {} with implicit args)",
+                        want + IMPLICIT
+                    )));
+                }
+                if kernel.private_segment_size() != 0 {
+                    return Err(RuntimeError::Device(format!(
+                        "{NAME}: {role} private segment is {} B; zero scratch is required",
+                        kernel.private_segment_size()
+                    )));
+                }
+            }
+            modules.push(module);
+            (Some(glu), Some(down))
+        } else {
+            (None, None)
         };
 
         let k_kda_chunk_intra_cached = if arch == "gfx950" {
@@ -8133,7 +8353,7 @@ impl AmdEngine {
         for (prog_ix, p) in blob.progs.iter().enumerate() {
             let seg_class = derive_segments(p)?;
             let decode_routes = if prog_ix >= dec_ix {
-                kda_decode_fused_routes(p, &blob.tensors, &blob.init, &devp)?
+                decode_segment_routes(p, &blob.tensors, &blob.init, &devp)?
             } else {
                 vec![DecodeSegmentRoute::Interpreter; seg_class.len()]
             };
@@ -8694,6 +8914,8 @@ impl AmdEngine {
             k_decode,
             k_decode_mla,
             k_kda_decode_fused,
+            k_grouped_moe_glu,
+            k_grouped_moe_down,
             k_kda_chunk_intra_cached,
             k_kda_chunk_intra_wave_items,
             k_kda_key_factor_wu,
@@ -9532,9 +9754,8 @@ impl AmdEngine {
         Ok(())
     }
 
-    /// Number of ordered launches in a decode program. A fused boundary is one raw launch;
-    /// every other wave segment is one interpreter launch. Per-XCD queues drain concurrently
-    /// within each ordered interpreter launch.
+    /// Number of ordered segment steps in a decode program. A grouped-MoE step owns two
+    /// back-to-back raw launches; other raw boundaries and interpreter segments own one.
     pub(crate) fn decode_launches(&self, p: usize) -> usize {
         self.prog_dispatch(p).launches()
     }
@@ -9599,6 +9820,37 @@ impl AmdEngine {
                     as_bytes(std::slice::from_ref(&args)),
                     None,
                 )?;
+            }
+            DecodeSegmentRoute::GroupedMoeMxfp4 { glu, down, grid } => {
+                let glu_kernel = self.k_grouped_moe_glu.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "grouped MoE segment has no validated standalone GLU object".into(),
+                    )
+                })?;
+                let down_kernel = self.k_grouped_moe_down.ok_or_else(|| {
+                    RuntimeError::Device(
+                        "grouped MoE segment has no validated standalone DOWN object".into(),
+                    )
+                })?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    glu_kernel,
+                    grid,
+                    WG_THREADS_8,
+                    0,
+                    as_bytes(std::slice::from_ref(&glu)),
+                    None,
+                )?;
+                EngineDevice::launch_kernel(
+                    &*self.be,
+                    down_kernel,
+                    grid,
+                    WG_THREADS_8,
+                    0,
+                    as_bytes(std::slice::from_ref(&down)),
+                    None,
+                )?;
+                self.seg_launches += 1;
             }
         }
         self.seg_launches += 1;
@@ -11314,6 +11566,70 @@ mod tests {
     }
 
     #[test]
+    fn grouped_moe_decode_pair_routes_with_exact_mxfp4_abi() {
+        let glu = DevInst64 {
+            op: DevOp::MoeGroupGluFp8Blk as u16,
+            blocks: 256,
+            t: [0, 1, 2, 3, 4, 0, 0, 0],
+            i: [16, 384, 3584, 896, 0, 2, 2, 0],
+            fj: [4.0f32.to_bits(), 25.0f32.to_bits(), 0],
+            ..Default::default()
+        };
+        let down = DevInst64 {
+            op: DevOp::MoeGroupDownFp8Blk as u16,
+            blocks: 256,
+            t: [5, 0, 2, 3, 4, 0, 0, 0],
+            i: [16, 3584, 384, 896, 0, 0, 2, 0],
+            ..Default::default()
+        };
+        let prog = DevProg {
+            t: 1,
+            packed_prefill_only: false,
+            n_counter: 0,
+            insts: vec![glu, down],
+            stream: vec![
+                packet::dev::StreamEnt {
+                    inst: 0,
+                    ..Default::default()
+                },
+                packet::dev::StreamEnt {
+                    inst: 1,
+                    ..Default::default()
+                },
+            ],
+            stream_ofs: vec![0],
+            stream_len: vec![2],
+            waits: Vec::new(),
+            succs: Vec::new(),
+            gq_stream: Vec::new(),
+            gq_seg_ofs: Vec::new(),
+            l2_domains: 0,
+        };
+        assert_eq!(
+            decode_segment_kinds(&prog).unwrap(),
+            vec![DecodeSegmentKind::GroupedMoeMxfp4 { glu: 0, down: 1 }]
+        );
+        let devp: Vec<_> = (0..6)
+            .map(|i| DeviceMem::view(0x1000 + i * 0x1000, 0x1000))
+            .collect();
+        let DecodeSegmentRoute::GroupedMoeMxfp4 { glu, down, grid } =
+            decode_segment_routes(&prog, &[], &[], &devp).unwrap()[0]
+        else {
+            panic!("grouped MoE pair did not take standalone route")
+        };
+        assert_eq!(grid, 768);
+        assert_eq!(
+            (glu.topk, glu.intermediate, glu.hidden, glu.enc),
+            (16, 384, 3584, 2)
+        );
+        assert_eq!(
+            (down.topk, down.hidden, down.intermediate, down.enc),
+            (16, 3584, 384, 2)
+        );
+        assert_eq!((glu.beta, glu.linear_beta), (4.0, 25.0));
+    }
+
+    #[test]
     fn specialised_amd_object_pairing_is_fail_closed() {
         let object = Path::new("interp_decode.elf");
         assert!(validate_packet_pairing_stamp(None, None, None, object).is_ok());
@@ -11535,7 +11851,7 @@ mod tests {
             ]
         );
         assert!(matches!(
-            kda_decode_fused_routes(&p, &[], &[], &[]).unwrap()[1],
+            decode_segment_routes(&p, &[], &[], &[]).unwrap()[1],
             DecodeSegmentRoute::MlaAttention
         ));
     }
@@ -11569,7 +11885,7 @@ mod tests {
             [DecodeSegmentKind::Interpreter]
         );
         assert!(!requires_segmented_decode(
-            &kda_decode_fused_routes(&p, &[], &[], &[]).unwrap()
+            &decode_segment_routes(&p, &[], &[], &[]).unwrap()
         ));
     }
 
@@ -11592,7 +11908,7 @@ mod tests {
     fn fused_decode_v1_descriptor_fails_closed() {
         let mut p = segmented_decode_probe();
         p.insts[1].i[7] = 1;
-        let err = kda_decode_fused_routes(&p, &[], &[], &[])
+        let err = decode_segment_routes(&p, &[], &[], &[])
             .expect_err("KDA fused ABI v1 must not route to the v2 object")
             .to_string();
         assert!(err.contains("version=1"), "{err}");
@@ -11626,7 +11942,7 @@ mod tests {
         let devp: Vec<DeviceMem> = (0..18)
             .map(|i| DeviceMem::view(0x1000 + i * 0x1000, 1 << 20))
             .collect();
-        let routes = kda_decode_fused_routes(&p, &tensors, &init, &devp).unwrap();
+        let routes = decode_segment_routes(&p, &tensors, &init, &devp).unwrap();
         let DecodeSegmentRoute::KdaDecodeFused(a) = routes[1] else {
             panic!("segment 1 must route to the raw object")
         };

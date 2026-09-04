@@ -1593,6 +1593,12 @@ impl Builder {
                 pair[0].inst.op == DevOp::FlashMlaDecode as u16
                     && pair[1].inst.op == DevOp::MlaMergeFold as u16
             });
+        let decode_grouped_moe = !uniseg
+            && std::env::var("PLOW_MOE_DECODE_STANDALONE").ok().as_deref() == Some("1")
+            && self.ops.windows(2).any(|pair| {
+                pair[0].inst.op == DevOp::MoeGroupGluFp8Blk as u16
+                    && pair[1].inst.op == DevOp::MoeGroupDownFp8Blk as u16
+            });
         let xreduce_wave_rs = !uniseg
             && self.place_l2.is_some()
             && (self.xreduce_wave_rs_segments
@@ -1665,6 +1671,17 @@ impl Builder {
                 // A standalone raw-argument object owns this boundary. Keep its segment pure
                 // even if PLOW_UNISEG was requested; runtime routing may then select by opcode.
                 3
+            } else if decode_grouped_moe
+                && ((op == DevOp::MoeGroupGluFp8Blk as u16
+                    && self
+                        .ops
+                        .get(i + 1)
+                        .is_some_and(|next| next.inst.op == DevOp::MoeGroupDownFp8Blk as u16))
+                    || (op == DevOp::MoeGroupDownFp8Blk as u16
+                        && i > 0
+                        && self.ops[i - 1].inst.op == DevOp::MoeGroupGluFp8Blk as u16))
+            {
+                20
             } else if op == DevOp::MlaMaterializePack as u16 {
                 14
             } else if op == DevOp::FlashMlaMaterializedPrefill as u16 {
@@ -1824,6 +1841,7 @@ impl Builder {
             || xr_attnres
             || mla_materialized
             || decode_mla_segments
+            || decode_grouped_moe
             || xreduce_wave_rs;
         let same_segment_dep = |consumer: usize, dep: &Dep| {
             !raw_segmented || seg_of[consumer] == seg_of[dep.producer() as usize]

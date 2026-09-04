@@ -77,6 +77,7 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       moe_stage1_mxfp4_gfx950.co moe_stage1_mxfp4_gfx950.elf \
       moe_stage2_mxfp4_gfx950.co moe_stage2_mxfp4_gfx950.elf \
       moe_combine_gfx950.co moe_combine_gfx950.elf \
+      moe_decode_grouped_mxfp4_gfx950.co moe_decode_grouped_mxfp4_gfx950.elf \
       mla_materialized_hd192_v128_gfx950.co mla_materialized_hd192_v128_gfx950.elf \
       mla_materialize_pack_gfx950.co mla_materialize_pack_gfx950.elf
 
@@ -197,6 +198,17 @@ if [ "$ARCH" = gfx950 ]; then
     -DPLOW_REQUIRED_MARKER=plow_moe_combine_fixed_order_abi_1 \
     "$R/bench/amd/lean_moe_combine_ref/kernel.hip"
   MOE_COMBINE_ELFS="moe_combine_gfx950.elf"
+fi
+
+MOE_DECODE_GROUPED_ELFS=""
+if [ "$ARCH" = gfx950 ] && [ "${PLOW_MOE_DECODE_STANDALONE:-0}" = 1 ]; then
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/moe_decode_grouped_mxfp4_gfx950.elf" \
+    plow_moe_decode_grouped_glu_mxfp4_gfx950 96 5 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_moe_decode_grouped_mxfp4_abi_1 \
+    "$R/amd/moe_decode_grouped_mxfp4.hip"
+  MOE_DECODE_GROUPED_ELFS="moe_decode_grouped_mxfp4_gfx950.elf"
 fi
 
 MLA_MATERIALIZED_ELFS=""
@@ -683,7 +695,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.

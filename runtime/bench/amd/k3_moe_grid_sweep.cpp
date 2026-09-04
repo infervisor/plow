@@ -19,7 +19,7 @@
     } while (0)
 
 namespace {
-constexpr unsigned kThreads = 512;
+unsigned kThreads = 512;
 constexpr unsigned kTopK = 16;
 constexpr unsigned kExperts = 896;
 constexpr unsigned kHidden = 3584;
@@ -91,6 +91,7 @@ std::vector<unsigned char> copy_bytes(const void* source, size_t bytes) {
 
 int main(int argc, char** argv) {
     const char* object = argc > 1 ? argv[1] : "/tmp/k3_moe_grid_sweep_gfx942.co";
+    if (argc > 2) kThreads = static_cast<unsigned>(std::strtoul(argv[2], nullptr, 10));
     constexpr size_t weight_bytes = static_cast<size_t>(kIntermediate) * kHidden / 2;
     constexpr size_t scale_bytes = static_cast<size_t>(kIntermediate) * kHidden / 32;
     constexpr size_t expert_bytes = 3 * (weight_bytes + scale_bytes);
@@ -169,7 +170,7 @@ int main(int argc, char** argv) {
     const auto reference_partial = copy_bytes(d.partial, partial_bytes);
 
     std::puts("grid,glu_us,down_us,chain_us,glu_gbps,down_gbps,chain_ms_x92,fu_diff,partial_diff");
-    for (unsigned grid : {1u, 12u, 32u, 64u, 96u, 128u, 152u, 192u, 256u, 304u}) {
+    for (unsigned grid : {1u, 64u, 128u, 192u, 256u, 384u, 512u, 768u}) {
         const double glu_us = time_us([&](unsigned rotation) {
             launch_glu(glu, d, grid, rotation);
         });
