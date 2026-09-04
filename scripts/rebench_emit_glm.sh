@@ -33,7 +33,7 @@ CKPT="${PLOW_CKPT:-/home/lava/models/GLM-5.2-plow}"
 #
 # This script hardcodes GLM_FULL=1, i.e. all 78 layers, and that makes it the WRONG vehicle for
 # searching a knob space. glm52_decode.c:224 states the cost: "the 4-minute 183 GiB/rank weight
-# load is the whole cost of a run". Any emit-time knob (PLOW_GLM_NS, PLOW_GLM_GF, the prefill
+# load is the whole cost of a run". Any emit-time knob (PLOW_MLA_NS, PLOW_GLM_GF, the prefill
 # ladder, GLM_LINEAR_FP8) needs a fresh blob AND a fresh 4-minute load per arm, so an 8-arm sweep
 # is over an hour of pure loading before a single useful number.
 #

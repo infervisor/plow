@@ -19,7 +19,7 @@
 #
 # A peer-slot contract violation is invisible to every per-op gate, every per-layer fixture and
 # every tp=1 run. This script is the control that sees it. Measured discrimination, real weights,
-# `PLOW_K3_LAYERS=2`, cosine of the full 163840-wide logit vector:
+# `PLOW_LAYERS=2`, cosine of the full 163840-wide logit vector:
 #
 #            tp1 vs tp8 cos      argmax
 #   BROKEN      0.946582         64052 vs 2336        (prefill)
@@ -30,7 +30,7 @@
 # — four orders of magnitude in `1 - cos`. The default floor of 0.9999 sits between them with
 # enormous margin in both directions.
 #
-# WHY `PLOW_K3_LAYERS=2`, AND DO NOT "OPTIMISE" IT DOWN TO 1.
+# WHY `PLOW_LAYERS=2`, AND DO NOT "OPTIMISE" IT DOWN TO 1.
 #
 # Layer 0 is KDA + a DENSE MLP (`first_k_dense_replace = 1`) and has no shared expert and no
 # routed experts, so it exercises no MoE collective. Layer 1 is the first latent MoE. That is not
@@ -46,7 +46,7 @@
 # ALREADY differing — the token said "different" long before it said how much. So the gate is a
 # cosine floor on the full vector, plus argmax equality, and it reports both.
 #
-# WHAT IT DELIBERATELY DOES NOT COVER. `PLOW_K3_LAYERS=4` adds the first MLA layer (0-based 3) and its
+# WHAT IT DELIBERATELY DOES NOT COVER. `PLOW_LAYERS=4` adds the first MLA layer (0-based 3) and its
 # fp8 KV cache, whose quantisation differs between the tp=1 and tp=8 FlashMLA geometries
 # (`nsplit`/`gf` are functions of the LOCAL head count). Measured after the fix: mostly 0.99997,
 # but one step at 0.990 — real and benign, and a floor loose enough to admit it is too loose to be
@@ -58,7 +58,7 @@
 # degree. A prefill ladder on one side and not the other would confound TP with the GEMM/GEMV seam.
 #
 # COST AND PREREQUISITES. Real weights only — there is nothing to compare on unbound weights.
-# `PLOW_K3_LAYERS=2` is ~20 GiB of checkpoint: at tp=8 that is ~2.6 GiB a rank, at tp=1 it is ~20 GiB
+# `PLOW_LAYERS=2` is ~20 GiB of checkpoint: at tp=8 that is ~2.6 GiB a rank, at tp=1 it is ~20 GiB
 # on GPU 0 alone, so the tp=1 side is what sets the free-VRAM requirement. About 60 s a side
 # including emit, load and bind; ~3 minutes for the default two-depth sweep. Every prerequisite is
 # a clean SKIP (exit 0) rather than a failure, so a CI wrapper may call this unconditionally on a
@@ -66,10 +66,10 @@
 #
 #   nix develop --command scripts/k3_tp_equivalence.sh
 #   nix develop --command env PLOW_K3_EQ_SHARD_HEAD=1 scripts/k3_tp_equivalence.sh
-#   nix develop --command env PLOW_K3_LAYERS=1,2,4 PLOW_K3_COS=0.985 scripts/k3_tp_equivalence.sh
+#   nix develop --command env PLOW_LAYERS=1,2,4 PLOW_K3_COS=0.985 scripts/k3_tp_equivalence.sh
 #
 # Env: PLOW_K3_CKPT (default the k3_farm symlink farm, else the HF snapshot), PLOW_K3_HSACO
-# (/home/lava/models/k3_mi325x/hsaco), PLOW_K3_LAYERS (1,2), PLOW_K3_COS (0.9999), PLOW_K3_STEPS (3),
+# (/home/lava/models/k3_mi325x/hsaco), PLOW_LAYERS (1,2), PLOW_K3_COS (0.9999), PLOW_K3_STEPS (3),
 # PLOW_K3_PROMPT ("The capital of France is"), PLOW_K3_OUT (a tmpdir), PLOW_K3_MIN_FREE_GIB (28),
 # PLOW_K3_ARCH (gfx942), PLOW_K3_GPU (MI325X), PLOW_K3_NCU (304), PLOW_K3_VOCAB (163840),
 # PLOW_K3_EQ_SHARD_HEAD (0; when 1, shard only the tp=8 head and gate its global greedy ids against
@@ -101,7 +101,7 @@ SHARD_HEAD="${PLOW_K3_EQ_SHARD_HEAD:-0}"
 case "$SHARD_HEAD" in 0|1) ;; *) fail "PLOW_K3_EQ_SHARD_HEAD must be 0 or 1" ;; esac
 compare_extra=()
 if [ "$SHARD_HEAD" = 1 ]; then compare_extra+=(--sharded8); fi
-IFS=, read -ra NLAYERS <<< "${PLOW_K3_LAYERS:-1,2}"
+IFS=, read -ra NLAYERS <<< "${PLOW_LAYERS:-1,2}"
 
 # --- prerequisites, every one a clean skip ---------------------------------------------------
 
@@ -137,7 +137,7 @@ FREE_GIB="$(rocm-smi --showmeminfo vram 2>/dev/null | awk '
 # `2` is the depth that contains the first latent MoE and therefore the first shared expert. See
 # the header: without it this script is green by construction.
 printf '%s\n' "${NLAYERS[@]}" | grep -qx 2 || \
-  fail "PLOW_K3_LAYERS must include 2 — N=1 has no MoE layer and cannot fail. Read the header."
+  fail "PLOW_LAYERS must include 2 — N=1 has no MoE layer and cannot fail. Read the header."
 
 echo "checkpoint  $CK"
 echo "objects     $HS"
@@ -157,7 +157,7 @@ for N in "${NLAYERS[@]}"; do
     # only difference. `--num-gpus` is what makes the emit sharded; there is no `--tp` on plowc.
     shard=0
     if [ "$SHARD_HEAD" = 1 ] && [ "$G" = 8 ]; then shard=1; fi
-    K3_FULL=1 PLOW_K3_LAYERS="$N" K3_PREFILL=0 PLOW_FP8_KV=1 PLOW_MXFP4=1 \
+    K3_FULL=1 PLOW_LAYERS="$N" K3_PREFILL=0 PLOW_FP8_KV=1 PLOW_MXFP4=1 \
       PLOW_K3_SHARD_HEAD="$shard" \
       "$PLOWC" --hf-dir "$CK" --emit devblob --arch "$ARCH" --gpu "$GPU" \
       --num-gpus "$G" --parallel tp --max-ctx 4096 --n-cu "$NCU" --out "$b" 2>&1 \
