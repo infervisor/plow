@@ -7912,11 +7912,28 @@ impl AmdEngine {
                     need_moe_pf_det_decode,
                 )?;
             }
-            if phase == Phase::Decode && syms.contains(&XR_TAGGED_SYM) && tp.is_some() {
+            if let (Phase::Decode, true, Some(bind)) = (phase, syms.contains(&XR_TAGGED_SYM), tp) {
                 // A tagged one-shot object spins on data tags instead of the xctr gate;
                 // it finds its region from the status id every collective carries and
-                // needs a blob whose XReduce packets keep the parity/width contract.
+                // needs a blob whose XReduce packets keep the parity/width contract, at
+                // most 8 peers (one tag word per rank), and the compact TP audit (the
+                // exact copy audit reads the counter gate the tagged arm never bumps).
                 // Refuse here rather than trap on the device.
+                if bind.n_gpu > 8 {
+                    return Err(RuntimeError::Device(format!(
+                        "{} ({XR_TAGGED_SYM}): tagged one-shot XReduce supports at most 8 \
+                         ranks, got TP{}",
+                        path.display(),
+                        bind.n_gpu
+                    )));
+                }
+                if !crate::config::RuntimeConfig::get().amd.tp_audit_compact {
+                    return Err(RuntimeError::Device(format!(
+                        "{} ({XR_TAGGED_SYM}): tagged one-shot XReduce requires the compact TP \
+                         audit; unset PLOW_TP_AUDIT_COMPACT=0 or build with PLOW_XR_TAGGED=OFF",
+                        path.display()
+                    )));
+                }
                 super::amd_tp::check_xr_tagged_blob(&blob.progs, blob.tp.map_or(0, |b| b.hidden))
                     .map_err(|e| {
                     RuntimeError::Device(format!("{} ({XR_TAGGED_SYM}): {e}", path.display()))
