@@ -353,10 +353,15 @@ fn qwen_plan_is_complete_and_emits_semantic_packets_for_both_nvidia_targets() {
             );
         }
         let flash = decoded.insts.iter().find_map(|i| match i.body {
-            Body::Flash { heads, variant, .. } => Some((heads, variant)),
+            Body::Flash {
+                heads,
+                kv_heads,
+                variant,
+                ..
+            } => Some((heads, kv_heads, variant)),
             _ => None,
         });
-        assert_eq!(flash, Some((24, Opcode::flash_causal_gqa_variant(4))));
+        assert_eq!(flash, Some((24, 4, Opcode::VARIANT_FLASH_CAUSAL_BF16)));
         assert!(decoded.insts.iter().all(|i| i.unit < spec.sm_count as u8));
     }
 }

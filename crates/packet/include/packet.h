@@ -1,4 +1,4 @@
-/* Infervisor runtime packet ABI v3 — must match `crates/packet/src/lib.rs`.
+/* Infervisor runtime packet ABI v7 — must match `crates/packet/src/lib.rs`.
  *
  * A variable-length stream of tagged #[repr(C)] records the kernel casts directly.
  * Little-endian; every record is 4-byte aligned (Header + bodies are 4-byte
@@ -6,7 +6,7 @@
  *
  * Stream header (20 bytes):
  *   u32 magic = 0x494E5650 ("INVP");
- *   u16 version = 3;
+ *   u16 version = 7;
  *   u16 bucket_id;              // shape bucket this stream serves
  *   u32 n_insts; u32 n_counters;
  *   u16 plan_gen;               // generation counter for invalidation
@@ -25,8 +25,7 @@
  *       switch (family) { case FAMILY_GEMM: const GemmBody* g = (GemmBody*)p;
  *       p += sizeof(GemmBody); ... } p += (h->wait_len + h->succ_len) * 4;
  *
- * v3 change: wait_len/succ_len widened from u8 to u16 to support fine per-tile
- * counters (removes the 255-counter-per-tile ceiling).
+ * v7 carries exact Flash GQA/window metadata and four Row arguments.
  *
  * Opcode namespace (u16): [backend:4][family:4][variant:8]
  *   Backend: 0=Generic, 1=CUDA, 2=ROCm, 3=CPU
@@ -38,7 +37,7 @@
 #include <stdint.h>
 
 #define INFERVISOR_PACKET_MAGIC   0x494E5650u
-#define INFERVISOR_PACKET_VERSION 3
+#define INFERVISOR_PACKET_VERSION 7
 #define PKT_SLOT_NONE             0xFFFFu
 #define PKT_TENSOR_NONE           0xFFFFFFFFu
 
@@ -87,12 +86,13 @@ enum ResourceKind { RES_SM = 0, RES_DMA = 1, RES_DPU = 2, RES_HOST = 3 };
 /* --- Record structs ------------------------------------------------------- */
 
 typedef struct { uint16_t opcode; uint8_t resource, unit; uint16_t index; uint16_t wait_len, succ_len, _pad; } Header; /* 12 */
-typedef struct { uint32_t bytes, tensor; uint16_t slot, _pad; } DmaBody;                                              /* 12 */
+typedef struct { uint32_t bytes, tensor; uint16_t slot; uint8_t kind, access; } DmaBody;                              /* 12 */
 typedef struct { uint32_t bytes; uint8_t src_unit, dst_unit; uint16_t _pad; } RdmaBody;                               /* 8 */
 typedef struct { uint32_t coord0, coord1, m, n, k; uint16_t bm, bn, bk, out, tmem, _pad; } GemmBody;                  /* 32 */
-typedef struct { uint32_t coord0, coord1, seq_q, seq_kv; uint16_t head_dim, bq, bkv, heads, out, tmem; } FlashBody;   /* 28 */
-typedef struct { uint32_t coord, rows, feat; uint16_t br, out; uint8_t operands, _pad[3]; } RowBody;                  /* 20 */
-typedef struct { uint32_t coord; } LayoutBody;                                                                        /* 4 */
+typedef struct { uint32_t coord0, coord1, seq_q, seq_kv; uint16_t head_dim, bq, bkv, heads, out, tmem; uint32_t window; uint16_t kv_heads, _pad; } FlashBody; /* 36 */
+typedef struct { uint32_t coord, rows, feat, args[4]; uint16_t br, out; uint8_t operands, _pad[3]; } RowBody;         /* 36 */
+#define PKT_LAYOUT_MAX_RANK 6
+typedef struct { uint8_t kind, rank, elem_size, _pad0; uint16_t out, _pad1; uint32_t shape[PKT_LAYOUT_MAX_RANK], in_stride[PKT_LAYOUT_MAX_RANK], out_stride[PKT_LAYOUT_MAX_RANK], in_base, out_base; } LayoutBody; /* 88 */
 typedef struct { uint32_t id, threshold; uint8_t scope, _pad[3]; } Counter;                                           /* 12 */
 
 #endif /* INFERVISOR_PACKET_H */

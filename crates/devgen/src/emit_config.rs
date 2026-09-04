@@ -273,10 +273,22 @@ pub struct EmitConfig {
     #[arg(long, env = "PLOW_MLA_NS")]
     pub mla_ns: Option<u32>,
 
+    #[arg(long = "k3-ns", env = "PLOW_K3_NS", hide = true)]
+    legacy_k3_ns: Option<u32>,
+
+    #[arg(long = "glm-ns", env = "PLOW_GLM_NS", hide = true)]
+    legacy_glm_ns: Option<u32>,
+
     /// Layers to emit (K3 and GLM): "all", a number N (first N layers), or "single:L".
     /// A truncation instrument for block sweeps and TP-equivalence checks; never a served packet.
-    #[arg(long, env = "PLOW_LAYERS", default_value = "all", hide = true)]
-    pub layers: String,
+    #[arg(long, env = "PLOW_LAYERS", hide = true)]
+    pub layers: Option<String>,
+
+    #[arg(long = "k3-layers", env = "PLOW_K3_LAYERS", hide = true)]
+    legacy_k3_layers: Option<String>,
+
+    #[arg(long = "glm-layers", env = "PLOW_GLM_LAYERS", hide = true)]
+    legacy_glm_layers: Option<String>,
 
     /// K3 prefill bucket control: unset/`full` = the whole ladder, `0` = decode only,
     /// `512,1024` = those rungs.
@@ -750,6 +762,8 @@ impl EmitConfig {
             k3_full: env_bool_default_true("K3_FULL"),
             k3_fuse_a: env_bool("PLOW_K3_FUSE_A"),
             mla_ns: env_u32("PLOW_MLA_NS"),
+            legacy_k3_ns: env_u32("PLOW_K3_NS"),
+            legacy_glm_ns: env_u32("PLOW_GLM_NS"),
             k3_prefill: env_str("K3_PREFILL"),
             glm_dsa: env_str("PLOW_GLM_DSA"),
             glm_gf: env_u32("PLOW_GLM_GF"),
@@ -759,7 +773,7 @@ impl EmitConfig {
             glm_spine_cus: env_str("GLM_SPINE_CUS"),
             glm_linear_fp8: env_bool("GLM_LINEAR_FP8"),
             glm_shared_glu_split: env_bool("GLM_SHARED_GLU_SPLIT"),
-            layers: env_str("PLOW_LAYERS").unwrap_or_else(|| {
+            layers: Some(env_str("PLOW_LAYERS").unwrap_or_else(|| {
                 // Legacy synthesis: GLM_FULL=1 → "all" (with GLM_NLAYERS cap),
                 // GLM_LAYER=L → "single:L", else "default" (GLM's single-layer validation
                 // gate; every other family treats it as "all").
@@ -779,7 +793,9 @@ impl EmitConfig {
                 } else {
                     "default".into()
                 }
-            }),
+            })),
+            legacy_k3_layers: env_str("PLOW_K3_LAYERS"),
+            legacy_glm_layers: env_str("PLOW_GLM_LAYERS"),
             mla_prefill: env_str("PLOW_MLA_PREFILL"),
             glm_ep: env_bool("GLM_EP"),
             glm_group: env_bool("GLM_GROUP"),
@@ -855,6 +871,48 @@ impl EmitConfig {
 
     /// Validate cross-field constraints. Panics on incompatible combinations
     /// (same behavior as existing `assert!` calls scattered in devgen).
+    fn resolve_deprecated_aliases(&mut self) {
+        let legacy_ns = match (self.legacy_k3_ns, self.legacy_glm_ns) {
+            (Some(k3), Some(glm)) if k3 != glm => {
+                panic!("PLOW_K3_NS={k3} conflicts with PLOW_GLM_NS={glm}; use PLOW_MLA_NS")
+            }
+            (Some(v), _) | (_, Some(v)) => Some(v),
+            (None, None) => None,
+        };
+        if let Some(legacy) = legacy_ns {
+            if self.mla_ns.is_some_and(|current| current != legacy) {
+                panic!(
+                    "PLOW_MLA_NS={} conflicts with deprecated per-model value {legacy}",
+                    self.mla_ns.unwrap()
+                );
+            }
+            tracing::warn!("PLOW_K3_NS/PLOW_GLM_NS are deprecated — use PLOW_MLA_NS");
+            self.mla_ns = Some(legacy);
+        }
+
+        let legacy_layers = match (&self.legacy_k3_layers, &self.legacy_glm_layers) {
+            (Some(k3), Some(glm)) if k3 != glm => {
+                panic!("PLOW_K3_LAYERS={k3} conflicts with PLOW_GLM_LAYERS={glm}; use PLOW_LAYERS")
+            }
+            (Some(v), _) | (_, Some(v)) => Some(v.clone()),
+            (None, None) => None,
+        };
+        if let Some(legacy) = legacy_layers {
+            if self
+                .layers
+                .as_deref()
+                .is_some_and(|current| current != legacy)
+            {
+                panic!(
+                    "PLOW_LAYERS={} conflicts with deprecated per-model value {legacy}",
+                    self.layers.as_deref().unwrap()
+                );
+            }
+            tracing::warn!("PLOW_K3_LAYERS/PLOW_GLM_LAYERS are deprecated — use PLOW_LAYERS");
+            self.layers = Some(legacy);
+        }
+    }
+
     pub fn validate(&self) {
         assert!(
             !(self.w8a8 && self.w8a16),
@@ -904,7 +962,7 @@ impl EmitConfig {
 
     /// Resolve the layer truncation from --layers.
     pub fn layer_cfg(&self) -> (bool, Option<u32>, Option<u32>) {
-        Self::parse_layers(&self.layers)
+        Self::parse_layers(self.layers.as_deref().unwrap_or("all"))
     }
 
     /// Whether any fp8 weight encoding is active.
@@ -987,7 +1045,9 @@ static FALLBACK: OnceLock<EmitConfig> = OnceLock::new();
 
 /// Install the resolved config for this compile run.
 /// Called once at the top of `run_verified`.
-pub fn install(cfg: EmitConfig) {
+pub fn install(mut cfg: EmitConfig) {
+    cfg.resolve_deprecated_aliases();
+    cfg.validate();
     let ptr = Box::into_raw(Box::new(cfg));
     // In production there is only one call; in tests the last call wins (matches env-var
     // semantics where `set_var` before `run()` is the intent). We intentionally leak the
@@ -1218,6 +1278,40 @@ mod tests {
                 .emit
                 .decode_mla_segments
         );
+    }
+
+    #[test]
+    fn deprecated_model_specific_pins_match_unified_pins() {
+        let mut old = TestArgs::try_parse_from(["test", "--k3-ns", "4", "--k3-layers", "single:2"])
+            .unwrap()
+            .emit;
+        old.resolve_deprecated_aliases();
+
+        let new = TestArgs::try_parse_from(["test", "--mla-ns", "4", "--layers", "single:2"])
+            .unwrap()
+            .emit;
+        assert_eq!(old.mla_ns, new.mla_ns);
+        assert_eq!(old.layers, new.layers);
+    }
+
+    #[test]
+    fn deprecated_model_specific_pins_reject_conflicts() {
+        let mut cfg = TestArgs::try_parse_from(["test", "--mla-ns", "4", "--glm-ns", "8"])
+            .unwrap()
+            .emit;
+        assert!(std::panic::catch_unwind(move || cfg.resolve_deprecated_aliases()).is_err());
+
+        let mut cfg =
+            TestArgs::try_parse_from(["test", "--layers", "3", "--glm-layers", "single:1"])
+                .unwrap()
+                .emit;
+        assert!(std::panic::catch_unwind(move || cfg.resolve_deprecated_aliases()).is_err());
+
+        let mut cfg =
+            TestArgs::try_parse_from(["test", "--layers", "all", "--glm-layers", "single:1"])
+                .unwrap()
+                .emit;
+        assert!(std::panic::catch_unwind(move || cfg.resolve_deprecated_aliases()).is_err());
     }
 
     #[test]

@@ -80,6 +80,10 @@ rm -f i_prefill.co i_decode.co i_flash.co tk.co \
       kda_chunk_intra_wave_items_gfx950.co kda_chunk_intra_wave_items_gfx950.elf \
       attn_res_f32mix_gfx950.co attn_res_f32mix_gfx950.elf \
       kda_chunk_carry_regstate_gfx950.co kda_chunk_carry_regstate_gfx950.elf \
+      kda_chunk_wu_lean_gfx950.co kda_chunk_wu_lean_gfx950.elf \
+      kda_chunk_wu_lean_keys_gfx950.co kda_chunk_wu_lean_keys_gfx950.elf \
+      kda_chunk_carry_regstate_keyfeed_gfx950.co \
+      kda_chunk_carry_regstate_keyfeed_gfx950.elf \
       kda_chunk_key_factor_wu_gfx950.co kda_chunk_key_factor_wu_gfx950.elf \
       kda_chunk_key_factor_carry_gfx950.co kda_chunk_key_factor_carry_gfx950.elf \
       xreduce_attnres_gfx950.co xreduce_attnres_gfx950.elf \
@@ -168,6 +172,8 @@ if [ "$ARCH" = gfx950 ] && [ "$need_attn_res_f32mix" = 1 ]; then
     -DPLOW_REQUIRED_MARKER=plow_attn_res_f32mix_abi_1 \
     "$R/amd/attn_res_f32mix_gfx950.hip"
   ATTN_RES_F32MIX_ELFS="attn_res_f32mix_gfx950.elf"
+fi
+
 KDA_CARRY_REGSTATE_ELFS=""
 case "${PLOW_KDA_CARRY_REGSTATE:-0}" in
   0|1) ;;
@@ -194,6 +200,68 @@ if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_regstate" = 1 ]; then
     -DPLOW_REQUIRED_MARKER=plow_kda_carry_regstate_abi_1 \
     "$R/amd/kda_chunk_carry_regstate.hip"
   KDA_CARRY_REGSTATE_ELFS="kda_chunk_carry_regstate_gfx950.elf"
+fi
+
+KDA_WU_LEAN_ELFS=""
+case "${PLOW_KDA_WU_LEAN:-0}" in
+  0|1) ;;
+  *) echo "PLOW_KDA_WU_LEAN must be 0 or 1" >&2; exit 2 ;;
+esac
+need_kda_wu_lean=${PLOW_KDA_WU_LEAN:-0}
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_REQUIRES_KDA_WU_LEAN 1' "$PLOW_HSACO_CONFIG"; then
+  need_kda_wu_lean=1
+fi
+if [ "$need_kda_wu_lean" = 1 ] && [ "$ARCH" != gfx950 ]; then
+  echo "manifest-required lean KDA Wu object is supported only on gfx950" >&2
+  exit 2
+fi
+if [ "$ARCH" = gfx950 ] && [ "$need_kda_wu_lean" = 1 ]; then
+  [ -n "${PLOW_HSACO_CONFIG:-}" ] || {
+    echo "PLOW_KDA_WU_LEAN=1 requires PLOW_HSACO_CONFIG for packet pairing" >&2
+    exit 2
+  }
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_wu_lean_gfx950.elf" \
+    plow_kda_chunk_wu_lean_gfx950 256 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_wu_lean_abi_1 \
+    "$R/amd/kda_chunk_wu_lean.hip"
+  KDA_WU_LEAN_ELFS="kda_chunk_wu_lean_gfx950.elf"
+fi
+
+KDA_CARRY_KEYFEED_ELFS=""
+case "${PLOW_KDA_CARRY_KEYFEED:-0}" in
+  0|1) ;;
+  *) echo "PLOW_KDA_CARRY_KEYFEED must be 0 or 1" >&2; exit 2 ;;
+esac
+need_kda_carry_keyfeed=${PLOW_KDA_CARRY_KEYFEED:-0}
+if [ -n "${PLOW_HSACO_CONFIG:-}" ] &&
+   grep -qx '#define PLOW_PACKET_REQUIRES_KDA_CARRY_KEYFEED 1' "$PLOW_HSACO_CONFIG"; then
+  need_kda_carry_keyfeed=1
+fi
+if [ "$need_kda_carry_keyfeed" = 1 ] && [ "$ARCH" != gfx950 ]; then
+  echo "manifest-required KDA carry keyfeed objects are supported only on gfx950" >&2
+  exit 2
+fi
+if [ "$ARCH" = gfx950 ] && [ "$need_kda_carry_keyfeed" = 1 ]; then
+  [ -n "${PLOW_HSACO_CONFIG:-}" ] || {
+    echo "PLOW_KDA_CARRY_KEYFEED=1 requires PLOW_HSACO_CONFIG for packet pairing" >&2
+    exit 2
+  }
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_wu_lean_keys_gfx950.elf" \
+    plow_kda_chunk_wu_lean_keys_gfx950 256 2 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_wu_lean_abi_1 \
+    "$R/amd/kda_chunk_wu_lean_keys.hip"
+  bash "$R/cmake/hipcc_hsaco.sh" hipcc "$BUN" "$ARCH" \
+    "$OUT/kda_chunk_carry_regstate_keyfeed_gfx950.elf" \
+    plow_kda_chunk_carry_regstate_keyfeed_gfx950 256 1 \
+    $INC -DPLOW_LEAN_OBJECT=1 -DPLOW_NO_SPILL=1 -DPLOW_NO_SGPR_SPILL=1 \
+    -DPLOW_REQUIRED_MARKER=plow_kda_carry_keyfeed_abi_1 \
+    "$R/amd/kda_chunk_carry_regstate_keyfeed.hip"
+  KDA_CARRY_KEYFEED_ELFS="kda_chunk_wu_lean_keys_gfx950.elf kda_chunk_carry_regstate_keyfeed_gfx950.elf"
 fi
 
 KDA_KEY_FACTOR_ELFS=""
@@ -789,7 +857,7 @@ if [ "$BUILD_GEMMA_MOE" = 1 ]; then
   fi
 fi
 
-ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $ATTN_RES_F32MIX_ELFS $KDA_CARRY_REGSTATE_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
+ALL_ELFS="interp_prefill.elf interp_decode.elf interp_flash.elf test_kernels.elf $DECODE_MLA_ELFS $KDA_FUSED_ELFS $KDA_INTRA_CACHED_ELFS $KDA_INTRA_WAVE_ITEMS_ELFS $ATTN_RES_F32MIX_ELFS $KDA_CARRY_REGSTATE_ELFS $KDA_WU_LEAN_ELFS $KDA_CARRY_KEYFEED_ELFS $KDA_KEY_FACTOR_ELFS $XR_ATTNRES_ELFS $MOE_STAGE1_ELFS $MOE_STAGE2_ELFS $MOE_COMBINE_ELFS $MOE_EP_ELFS $MOE_DECODE_GROUPED_ELFS $MLA_MATERIALIZED_ELFS $GQ_ELFS $FP8_ELFS $FP8KV_ELFS $MXFP4_ELFS $MLA_ELFS $MOE_ELFS $GMOE_ELFS"
 
 # Every interpreter is compiled against the packed-prefill PlowProgram tail. This is an ABI
 # marker, not a claim that descriptor-consuming math arms are enabled.

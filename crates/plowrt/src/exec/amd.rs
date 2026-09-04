@@ -3449,6 +3449,19 @@ fn check_decode_object(
     need_moe_pf_det: bool,
 ) -> Result<()> {
     if syms.is_empty() {
+        let needs_decode_arm = requires.iter().any(|req| {
+            let (flag, val) = req.split_once('=').unwrap_or((req.as_str(), "1"));
+            val != "0"
+                && DECODE_ARM_MARKERS
+                    .iter()
+                    .any(|(candidate, _)| *candidate == flag)
+        });
+        if needs_decode_arm {
+            return Err(RuntimeError::Device(format!(
+                "packet requires a specialised decode arm, but {} has no ELF symbol table; refusing an unverifiable packet/object pairing",
+                path.display()
+            )));
+        }
         tracing::warn!(
             object = %path.display(),
             "no ELF symbol table — the packet/object arm check cannot run on this file"
@@ -3702,8 +3715,15 @@ fn check_moe_ep_symbols(syms: &[&str], path: &Path, markers: &[&str]) -> Result<
 
 fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
     let mpath = blob_path.with_file_name("build.json");
-    let Ok(raw) = std::fs::read(&mpath) else {
-        return Ok(None);
+    let raw = match std::fs::read(&mpath) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(RuntimeError::Device(format!(
+                "cannot read {}: {e}",
+                mpath.display()
+            )))
+        }
     };
     let man: serde_json::Value = serde_json::from_slice(&raw)
         .map_err(|e| RuntimeError::Device(format!("{}: not valid JSON: {e}", mpath.display())))?;
@@ -3723,6 +3743,127 @@ fn build_requires(blob_path: &Path) -> Result<Option<Vec<String>>> {
                 .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect()
         }))
+}
+
+fn packet_decode_arm_requirements(progs: &[DevProg]) -> Vec<String> {
+    let insts = || progs.iter().flat_map(|p| &p.insts);
+    let mut requires = Vec::new();
+    if insts().any(|inst| inst.op == DevOp::KdaConvStateStepG as u16) {
+        requires.push("PLOW_KDA_CONV_STEP_DB=1".to_owned());
+    }
+    if required_moe_pf_accum(progs, 4) {
+        requires.push("PLOW_MOE_PF_ATOMIC=1".to_owned());
+    }
+    if required_moe_pf_accum(progs, 5) {
+        requires.push("PLOW_MOE_PF_DET=1".to_owned());
+    }
+    if insts().any(|inst| {
+        inst.op == DevOp::FlashMlaDecode as u16 && inst.t[7] != packet::dev::TENSOR_NONE16
+    }) {
+        requires.push("PLOW_GLM_FUSE_ROPE=1".to_owned());
+    }
+    if insts()
+        .any(|inst| inst.op == DevOp::GemvQkv as u16 && inst.t[7] != packet::dev::TENSOR_NONE16)
+    {
+        requires.push("PLOW_GLM_FUSE_QNORM=1".to_owned());
+    }
+    if insts().any(|inst| inst.op == DevOp::XReduce as u16 && inst.i[7] != 0) {
+        requires.push("PLOW_XR_COMBINE_FOLD=1".to_owned());
+    }
+    if insts().any(|inst| inst.op == DevOp::KdaStateStepG as u16 && inst.i[4] & 4 != 0) {
+        requires.push("PLOW_KDA_FB_FOLD=1".to_owned());
+    }
+    if insts().any(|inst| inst.op == DevOp::KdaStateStepG as u16 && inst.i[4] & 8 != 0) {
+        requires.push("PLOW_KDA_DECODE_FUSED_ARM=1".to_owned());
+    }
+    requires
+}
+
+fn packet_prefill_arm_requirements(progs: &[DevProg]) -> Vec<String> {
+    let insts = || progs.iter().flat_map(|p| &p.insts);
+    let mut requires = Vec::new();
+    if insts().any(|inst| {
+        matches!(
+            DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op),
+            Some(DevOp::FlashMlaPrefill | DevOp::FlashMlaPrefillFp8 | DevOp::FlashGatherPrefill)
+        )
+    }) {
+        requires.push("PLOW_MLA_PREFILL=1".to_owned());
+    }
+    if insts().any(|inst| {
+        matches!(
+            DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op),
+            Some(
+                DevOp::MoeRouterTopkPf
+                    | DevOp::MoeAlignPf
+                    | DevOp::MoeGroupGluPf
+                    | DevOp::MoeGroupDownPf
+                    | DevOp::MoeCombinePf
+            )
+        )
+    }) {
+        requires.push("PLOW_MOE_PREFILL=1".to_owned());
+    }
+    if insts().any(|inst| {
+        matches!(inst.op, op if op == DevOp::MoeGroupDownPf as u16 || op == DevOp::MoeCombinePf as u16)
+            && inst.i[7] != 0
+    }) {
+        requires.push("PLOW_MOE_PF_PART16=1".to_owned());
+    }
+    if insts().any(|inst| inst.op == DevOp::MoeGroupGluPf as u16 && inst.i[7] != 0) {
+        requires.push("PLOW_MOE_PF_A8=1".to_owned());
+    }
+    if insts().any(|inst| {
+        inst.op == DevOp::FlashMlaPrefill as u16
+            && inst.t[7] == packet::dev::TENSOR_NONE16
+            && (inst.i[6] & 0xff) > 1
+    }) {
+        requires.push("PLOW_MLA_PF_NS=1".to_owned());
+    }
+    if insts()
+        .any(|inst| inst.op == DevOp::QuantFp8 as u16 && inst.t[3] != packet::dev::TENSOR_NONE16)
+    {
+        requires.push("PLOW_T11_GLUQUANT=1".to_owned());
+    }
+    if required_moe_pf_accum(progs, 4) {
+        requires.push("PLOW_MOE_PF_ATOMIC=1".to_owned());
+    }
+    if required_moe_pf_accum(progs, 5) {
+        requires.push("PLOW_MOE_PF_DET=1".to_owned());
+    }
+    if insts().any(|inst| {
+        matches!(
+            DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op),
+            Some(
+                DevOp::KdaChunkPrepare
+                    | DevOp::KdaChunkIntra
+                    | DevOp::KdaChunkWu
+                    | DevOp::KdaChunkCarry
+            )
+        )
+    }) {
+        requires.push("PLOW_KDA_CHUNK=1".to_owned());
+    }
+    if insts()
+        .any(|inst| inst.op == DevOp::XReduceScatter as u16 || inst.op == DevOp::XAllGather as u16)
+    {
+        requires.push("PLOW_SEQ_PAR_SEAMS=1".to_owned());
+    }
+    if insts().any(|inst| {
+        matches!(
+            DevOp::ALL.iter().copied().find(|op| *op as u16 == inst.op),
+            Some(
+                DevOp::AttnRes
+                    | DevOp::SituGlu
+                    | DevOp::MlaOutGate
+                    | DevOp::KdaStateStep
+                    | DevOp::KdaConv
+            )
+        )
+    }) {
+        requires.push("PLOW_K3=1".to_owned());
+    }
+    requires
 }
 
 fn graph_phase_xreduce_segments(
@@ -4119,6 +4260,19 @@ fn elf_symbol_u32(img: &[u8], wanted: &str) -> Option<u32> {
 /// more than a check that cannot fail.
 fn check_prefill_object(syms: &[&str], path: &Path, requires: &[String]) -> Result<()> {
     if syms.is_empty() {
+        let needs_prefill_arm = requires.iter().any(|req| {
+            let (flag, val) = req.split_once('=').unwrap_or((req.as_str(), "1"));
+            val != "0"
+                && PREFILL_ARM_MARKERS
+                    .iter()
+                    .any(|(candidate, _)| *candidate == flag)
+        });
+        if needs_prefill_arm {
+            return Err(RuntimeError::Device(format!(
+                "packet requires a specialised prefill arm, but {} has no ELF symbol table; refusing an unverifiable packet/object pairing",
+                path.display()
+            )));
+        }
         tracing::warn!(
             object = %path.display(),
             "no ELF symbol table — the packet/object arm check cannot run on this file"
@@ -8195,6 +8349,8 @@ impl AmdEngine {
         // Read once, here, so a broken manifest fails before any object is
         // loaded rather than between two of them.
         let requires = build_requires(blob_path)?;
+        let packet_decode_requires = packet_decode_arm_requirements(&blob.progs[dec_ix..]);
+        let packet_prefill_requires = packet_prefill_arm_requirements(&blob.progs[..dec_ix]);
         let mut modules = Vec::new();
         let mut k_xaudit = None;
         let mut k_state_clear = None;
@@ -8280,11 +8436,23 @@ impl AmdEngine {
             if let (Phase::Prefill, Some(req)) = (phase, requires.as_ref()) {
                 check_prefill_object(&syms, &path, req)?;
             }
+            if phase == Phase::Prefill {
+                check_prefill_object(&syms, &path, &packet_prefill_requires)?;
+            }
             if let (Phase::Decode, Some(req)) = (phase, requires.as_ref()) {
                 check_decode_object(
                     &syms,
                     &path,
                     req,
+                    need_moe_pf_atomic_decode,
+                    need_moe_pf_det_decode,
+                )?;
+            }
+            if phase == Phase::Decode {
+                check_decode_object(
+                    &syms,
+                    &path,
+                    &packet_decode_requires,
                     need_moe_pf_atomic_decode,
                     need_moe_pf_det_decode,
                 )?;
@@ -14312,6 +14480,57 @@ mod tests {
             assert!(err.contains(marker), "{op:?} must require {marker}: {err}");
             assert!(check_compiled_opcode_marker_set(&[marker], path, [op]).is_ok());
         }
+    }
+
+    #[test]
+    fn specialised_decode_arms_require_a_build_manifest() {
+        let mut plain = segmented_prog(&[DevOp::KdaStateStepG], &[0]);
+        assert!(packet_decode_arm_requirements(std::slice::from_ref(&plain)).is_empty());
+
+        plain.insts[0].i[4] = 4;
+        assert_eq!(
+            packet_decode_arm_requirements(std::slice::from_ref(&plain)),
+            ["PLOW_KDA_FB_FOLD=1"]
+        );
+
+        let mut xr = segmented_prog(&[DevOp::XReduce], &[0]);
+        xr.insts[0].i[7] = 1;
+        assert_eq!(
+            packet_decode_arm_requirements(std::slice::from_ref(&xr)),
+            ["PLOW_XR_COMBINE_FOLD=1"]
+        );
+
+        let err = check_decode_object(
+            &[],
+            Path::new("stripped.elf"),
+            &packet_decode_arm_requirements(std::slice::from_ref(&plain)),
+            false,
+            false,
+        )
+        .expect_err("a specialised packet cannot use an unverifiable object");
+        assert!(err.to_string().contains("no ELF symbol table"));
+    }
+
+    #[test]
+    fn specialised_prefill_arms_are_derived_without_a_manifest() {
+        let mut down = segmented_prog(&[DevOp::MoeGroupDownPf], &[0]);
+        down.insts[0].i[4] = 3;
+        down.insts[0].i[7] = 1;
+        assert_eq!(
+            packet_prefill_arm_requirements(std::slice::from_ref(&down)),
+            [
+                "PLOW_MOE_PREFILL=1",
+                "PLOW_MOE_PF_PART16=1",
+                "PLOW_MOE_PF_ATOMIC=1"
+            ]
+        );
+        let err = check_prefill_object(
+            &[],
+            Path::new("stripped-prefill.elf"),
+            &packet_prefill_arm_requirements(std::slice::from_ref(&down)),
+        )
+        .expect_err("a specialised packet cannot use an unverifiable prefill object");
+        assert!(err.to_string().contains("no ELF symbol table"));
     }
 
     #[test]

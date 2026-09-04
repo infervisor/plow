@@ -43,6 +43,10 @@ pub struct KimiK3Config {
 /// The text tower (`text_config.model_type: "kimi_linear"`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct KimiK3TextConfig {
+    #[serde(default, rename = "_plow_weight_prefix")]
+    pub weight_prefix: Option<String>,
+    #[serde(default, rename = "_plow_head_prefix")]
+    pub head_prefix: Option<String>,
     pub vocab_size: i64,
     pub hidden_size: i64,
     pub intermediate_size: i64,

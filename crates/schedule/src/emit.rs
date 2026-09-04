@@ -258,12 +258,12 @@ fn body_for(
                     bq: tl.bq as u16,
                     bkv: tl.bkv as u16,
                     heads: a.heads as u16,
+                    kv_heads: a.kv_heads as u16,
+                    window: a.sliding_window as u32,
                     out,
                     tmem,
                     variant: if a.sliding_window > 0 {
                         Opcode::VARIANT_FLASH_SLIDING_BF16
-                    } else if a.causal && a.kv_heads != a.heads {
-                        Opcode::flash_causal_gqa_variant(a.kv_heads as u8)
                     } else if a.causal {
                         Opcode::VARIANT_FLASH_CAUSAL_BF16
                     } else {

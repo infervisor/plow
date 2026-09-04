@@ -98,18 +98,30 @@ impl ModelConfig {
             "gemma3" | "gemma3_text" => {
                 // Gemma3 multimodal nests the decoder under `text_config`.
                 let sub = sub_config(&v, "text_config");
+                reject_unimplemented_gemma_moe(&sub)?;
                 Ok(ModelConfig::Gemma(serde_json::from_value(sub)?))
             }
             "gemma4" | "gemma4_text" | "gemma4_unified_text" => {
+                if v.get("vision_config").is_some() {
+                    return Err(ConfigError::Unsupported(
+                        "Gemma 4 vision graph is not implemented; use the text-generation frontend to compile only its language model"
+                            .to_string(),
+                    ));
+                }
                 // Text-only Gemma 4 (or already inside a text_config).
                 let sub = sub_config(&v, "text_config");
+                reject_unimplemented_gemma_moe(&sub)?;
                 Ok(ModelConfig::Gemma(serde_json::from_value(sub)?))
             }
             "gemma4_unified" => {
                 // Gemma4 multimodal top-level: if vision_config is present,
                 // build the full multimodal composite; else text-only.
+                reject_unimplemented_gemma_moe(&sub_config(&v, "text_config"))?;
                 if v.get("vision_config").is_some() {
-                    Ok(ModelConfig::Gemma4Multimodal(serde_json::from_value(v)?))
+                    Err(ConfigError::Unsupported(
+                        "Gemma 4 vision graph is not implemented; use the text-generation frontend to compile only its language model"
+                            .to_string(),
+                    ))
                 } else {
                     let sub = sub_config(&v, "text_config");
                     Ok(ModelConfig::Gemma(serde_json::from_value(sub)?))
@@ -212,6 +224,26 @@ impl ModelConfig {
     }
 }
 
+fn reject_unimplemented_gemma_moe(v: &serde_json::Value) -> Result<(), ConfigError> {
+    let enabled = v
+        .get("enable_moe_block")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let experts = ["num_experts", "num_local_experts"]
+        .iter()
+        .filter_map(|key| v.get(*key).and_then(serde_json::Value::as_u64))
+        .max()
+        .unwrap_or(0);
+    if enabled || experts > 0 {
+        return Err(ConfigError::Unsupported(
+            "Gemma 4 MoE routing and exhaustive expert checkpoint binding are not implemented; \
+             refusing dense or representative-expert fallback"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_qwen35(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
     let cfg: Qwen35Config = serde_json::from_value(v)?;
     cfg.validate().map_err(ConfigError::Unsupported)?;
@@ -295,5 +327,27 @@ pub fn parse_dtype(s: Option<&str>) -> DType {
         Some("float32") | Some("fp32") => DType::F32,
         Some("float8_e4m3fn") => DType::F8E4M3,
         _ => DType::BF16,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelConfig;
+
+    #[test]
+    fn official_gemma4_moe_fields_fail_closed() {
+        let err = ModelConfig::from_json(
+            r#"{
+                "model_type":"gemma4_unified_text",
+                "enable_moe_block":true,
+                "num_experts":64,
+                "top_k_experts":4,
+                "moe_intermediate_size":4096
+            }"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Gemma 4 MoE"), "{err}");
+        assert!(err.contains("refusing"), "{err}");
     }
 }

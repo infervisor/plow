@@ -139,7 +139,7 @@ fn qwen3_explicit_head_dim_and_qk_norm() {
     let q = g
         .tensors
         .iter()
-        .find(|t| t.name.as_deref() == Some("layers.0.self_attn.q_proj.weight"))
+        .find(|t| t.name.as_deref() == Some("model.layers.0.self_attn.q_proj.weight"))
         .expect("q_proj weight");
     let dims: Vec<i64> = q
         .shape
@@ -151,8 +151,12 @@ fn qwen3_explicit_head_dim_and_qk_norm() {
         .collect();
     assert_eq!(dims, vec![4096, 2560], "q_proj must use explicit head_dim");
     // Per-head qk-norm weights are consumed.
-    assert!(ws.iter().any(|w| w == "layers.0.self_attn.q_norm.weight"));
-    assert!(ws.iter().any(|w| w == "layers.1.self_attn.k_norm.weight"));
+    assert!(ws
+        .iter()
+        .any(|w| w == "model.layers.0.self_attn.q_norm.weight"));
+    assert!(ws
+        .iter()
+        .any(|w| w == "model.layers.1.self_attn.k_norm.weight"));
 }
 
 // ---- encoder taps + pipeline -------------------------------------------

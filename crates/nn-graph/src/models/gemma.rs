@@ -23,7 +23,7 @@ pub fn build(cfg: &GemmaConfig) -> Graph {
 
     let h = cfg.hidden_size;
     let eps = cfg.rms_norm_eps;
-    let model_prefix = cfg.weight_prefix.as_deref().unwrap_or("");
+    let model_prefix = cfg.weight_prefix.as_deref().unwrap_or("model");
     let name = |suffix: &str| {
         if model_prefix.is_empty() {
             suffix.to_string()

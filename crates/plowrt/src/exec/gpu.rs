@@ -1488,6 +1488,20 @@ impl GpuEngine {
             programs = blob.progs.len(),
             "parsed PLOWDEV blob"
         );
+        let unsupported_hd128_fp8_kv = blob.progs.iter().flat_map(|p| &p.insts).any(|inst| {
+            (inst.op == DevOp::HeadNormRopeFp8 as u16 && inst.i[2] == 128)
+                || (matches!(
+                    DevOp::from_u16(inst.op),
+                    Some(DevOp::FlashPrefillFp8 | DevOp::FlashDecodeFp8)
+                ) && inst.i[6] == 128)
+        });
+        if unsupported_hd128_fp8_kv {
+            return Err(RuntimeError::Device(
+                "hd128 Qwen packets with fp8 KV are not supported by the NVIDIA interpreter; \
+                 use bf16 KV (weight-FP8 checkpoints remain supported)"
+                    .into(),
+            ));
+        }
         let cc = be.compute_capability();
         let profile = interpreter_profile(cc).ok_or_else(|| {
             RuntimeError::Device(format!(

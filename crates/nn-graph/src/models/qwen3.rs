@@ -34,10 +34,10 @@ fn build_inner(cfg: &Qwen3Config, encoder_taps: Option<&[u32]>) -> Graph {
     let s = nn.sym("S");
 
     let ids = nn.input("input_ids", nn.shape([b.clone(), s.clone()]), DType::I32);
-    let mut x = nn.embedding("embed_tokens", ids, cfg.vocab_size, h);
+    let mut x = nn.embedding("model.embed_tokens", ids, cfg.vocab_size, h);
 
     for layer in 0..cfg.num_hidden_layers {
-        let p = format!("layers.{layer}");
+        let p = format!("model.layers.{layer}");
         nn.begin_block(&p);
 
         // --- attention block (pre-norm residual) ---
@@ -60,13 +60,13 @@ fn build_inner(cfg: &Qwen3Config, encoder_taps: Option<&[u32]>) -> Graph {
     }
     nn.end_block();
 
-    x = nn.rmsnorm("norm", x, h, eps);
+    x = nn.rmsnorm("model.norm", x, h, eps);
     if encoder_taps.is_some() {
         nn.mark_output(x);
         return nn.finish();
     }
     let logits = if cfg.tie_word_embeddings {
-        nn.linear("embed_tokens", x, h, cfg.vocab_size, false)
+        nn.linear("model.embed_tokens", x, h, cfg.vocab_size, false)
     } else {
         nn.linear("lm_head", x, h, cfg.vocab_size, false)
     };

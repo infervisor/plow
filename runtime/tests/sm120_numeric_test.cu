@@ -271,7 +271,8 @@ static void test_flash_prefill(const char* label, uint32_t heads, uint32_t sq, u
 
     /* CPU oracle through the real wire packet + plow_register_cpu (causal). */
     std::vector<float> Oref((size_t)heads*sq*HD, 0.f);
-    PlowFlashBody f = {0,0,sq,skv,(uint16_t)HD,64,64,(uint16_t)heads,/*out*/3,/*tmem=kv_heads*/(uint16_t)heads};
+    PlowFlashBody f = {0,0,sq,skv,(uint16_t)HD,64,64,(uint16_t)heads,/*out*/3,
+                       /*tmem*/0,/*window*/0,/*kv_heads*/(uint16_t)heads,/*pad*/0};
     Buf pc = build_1inst(PLOW_FLASH, &f, sizeof(f));
     PlowBinding bc = {0,1,2,/*detail: causal*/1,0,0.0f,0};
     void* cs[4] = { Q.data(), K.data(), V.data(), Oref.data() };
@@ -321,8 +322,8 @@ static void test_flash_sliding(const char* label, uint32_t heads, uint32_t sq,
 
     bf16 *dQ=to_dev_bf16(Q), *dK=to_dev_bf16(K), *dV=to_dev_bf16(V);
     bf16* dO=dev_bf16((size_t)heads*sq*HD);
-    PlowFlashBody f = {/*coord0=window*/window,0,sq,skv,(uint16_t)HD,64,64,
-                       (uint16_t)heads,/*out*/3,(uint16_t)heads};
+    PlowFlashBody f = {0,0,sq,skv,(uint16_t)HD,64,64,(uint16_t)heads,/*out*/3,
+                       /*tmem*/0,window,/*kv_heads*/(uint16_t)heads,/*pad*/0};
     Buf pkt = build_1inst(PLOW_OP(0,PLOW_FAMILY_FLASH,PLOW_VARIANT_FLASH_SLIDING_BF16), &f, sizeof(f));
     PlowBinding bd = {0,1,2,0,0,scale,0};
     void* gs[4] = { dQ, dK, dV, dO };
@@ -340,7 +341,8 @@ static void test_flash_decode(const char* label, uint32_t heads, uint32_t skv) {
     std::vector<float> V = gen_bf16((size_t)heads*skv*HD, 1.0f);
 
     std::vector<float> Oref((size_t)heads*sq*HD, 0.f);
-    PlowFlashBody f = {0,0,sq,skv,(uint16_t)HD,1,64,(uint16_t)heads,/*out*/3,(uint16_t)heads};
+    PlowFlashBody f = {0,0,sq,skv,(uint16_t)HD,1,64,(uint16_t)heads,/*out*/3,
+                       /*tmem*/0,/*window*/0,/*kv_heads*/(uint16_t)heads,/*pad*/0};
     Buf pc = build_1inst(PLOW_FLASH, &f, sizeof(f));
     PlowBinding bc = {0,1,2,/*causal (sq=1: no-op)*/0,0,0.0f,0};
     void* cs[4] = { Q.data(), K.data(), V.data(), Oref.data() };
@@ -366,7 +368,7 @@ static void test_row_rmsnorm(const char* label, uint32_t rows, uint32_t feat,
     std::vector<float> gam = gen_bf16(feat, 1.0f);
 
     std::vector<float> Oref((size_t)rows*feat, 0.f);
-    PlowRowBody r = {0, rows, feat, 0, /*out*/2, /*operands*/2, {0,0,0}};
+    PlowRowBody r = {0, rows, feat, {0,0,0,0}, 0, 2, 2, {0,0,0}};
     Buf pc = build_1inst(PLOW_ROW_REDUCE, &r, sizeof(r));
     PlowBinding bc = {0,1,PLOW_SLOT_NONE,PLOW_NORM_RMS,0,eps,0};
     void* cs[3] = { X.data(), gam.data(), Oref.data() };
@@ -390,7 +392,7 @@ static void test_row_residual(const char* label, uint32_t rows, uint32_t feat) {
     std::vector<float> R = gen_bf16((size_t)rows*feat, 1.0f);
 
     std::vector<float> Oref((size_t)rows*feat, 0.f);
-    PlowRowBody r = {0, rows, feat, 0, /*out*/2, /*operands*/2, {0,0,0}};
+    PlowRowBody r = {0, rows, feat, {0,0,0,0}, 0, 2, 2, {0,0,0}};
     Buf pc = build_1inst(PLOW_ROW_POINTWISE, &r, sizeof(r));
     PlowBinding bc = {0,1,PLOW_SLOT_NONE,(uint8_t)(PLOW_EW_ADD<<4),0,0.0f,0};
     void* cs[3] = { X.data(), R.data(), Oref.data() };
@@ -417,7 +419,7 @@ static void test_row_swiglu(const char* label, uint32_t rows, uint32_t feat) {
     plow_row_pointwise_ref(Oref.data(), sg.data(), U.data(), (uint32_t)n, 0, PLOW_EW_MUL);
 
     bf16 *dG=to_dev_bf16(G), *dU=to_dev_bf16(U), *dO=dev_bf16(n);
-    PlowRowBody r = {0, rows, feat, 0, /*out*/2, 2, {0,0,0}};
+    PlowRowBody r = {0, rows, feat, {0,0,0,0}, 0, 2, 2, {0,0,0}};
     Buf pkt = build_1inst(PLOW_OP(0,PLOW_FAMILY_ROW,PLOW_VARIANT_ROW_SWIGLU_BF16), &r, sizeof(r));
     PlowBinding bd = {0,1,PLOW_SLOT_NONE,0,0,0.0f,0};
     void* gs[3] = { dG, dU, dO };
@@ -458,7 +460,7 @@ static void test_row_normrope(const char* label, uint32_t rows, uint32_t feat,
     }
 
     bf16 *dX=to_dev_bf16(X), *dG=to_dev_bf16(gam), *dO=dev_bf16(n);
-    PlowRowBody r = {pos_base, rows, feat, (uint16_t)head_dim, /*out*/2, 2, {0,0,0}};
+    PlowRowBody r = {pos_base, rows, feat, {0,0,0,0}, (uint16_t)head_dim, 2, 2, {0,0,0}};
     uint16_t op = scale_variant ? PLOW_OP(0,PLOW_FAMILY_ROW,PLOW_VARIANT_ROW_NORMROPESCALE_BF16)
                                 : PLOW_OP(0,PLOW_FAMILY_ROW,PLOW_VARIANT_ROW_NORMROPE_BF16);
     Buf pkt = build_1inst(op, &r, sizeof(r));

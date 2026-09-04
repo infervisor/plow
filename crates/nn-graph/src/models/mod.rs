@@ -136,8 +136,12 @@ pub fn build_text_generation_from_config_json_at(
     let wrapper_type = outer
         .get("model_type")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let language_model_wrapper = matches!(wrapper_type, "qwen3_5" | "gemma4");
+        .unwrap_or_default()
+        .to_owned();
+    let language_model_wrapper = matches!(
+        wrapper_type.as_str(),
+        "qwen3_5" | "gemma4" | "gemma4_unified" | "kimi_k3"
+    );
     if let Some(mut text) = outer.get_mut("text_config").map(serde_json::Value::take) {
         if let serde_json::Value::Object(fields) = &mut text {
             if !fields.contains_key("dtype") && !fields.contains_key("torch_dtype") {
@@ -154,10 +158,21 @@ pub fn build_text_generation_from_config_json_at(
                 }
             }
             if language_model_wrapper {
+                let weight_prefix = if wrapper_type == "kimi_k3" {
+                    "language_model.model"
+                } else {
+                    "model.language_model"
+                };
                 fields.insert(
                     "_plow_weight_prefix".to_string(),
-                    serde_json::Value::String("model.language_model".to_string()),
+                    serde_json::Value::String(weight_prefix.to_string()),
                 );
+                if wrapper_type == "kimi_k3" {
+                    fields.insert(
+                        "_plow_head_prefix".to_string(),
+                        serde_json::Value::String("language_model".to_string()),
+                    );
+                }
             }
         }
         outer = text;

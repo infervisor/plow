@@ -12,7 +12,7 @@ pub fn build(cfg: &GlmConfig) -> Graph {
     let b = nn.sym("B");
     let s = nn.sym("S");
     let ids = nn.input("input_ids", nn.shape([b.clone(), s.clone()]), DType::I32);
-    let embedding = nn.embedding("embed_tokens", ids, cfg.vocab_size, cfg.hidden_size);
+    let embedding = nn.embedding("model.embed_tokens", ids, cfg.vocab_size, cfg.hidden_size);
     let mut x = embedding;
     let mut topk = None;
 
@@ -23,13 +23,13 @@ pub fn build(cfg: &GlmConfig) -> Graph {
     }
 
     let base_hidden = x;
-    let normed = nn.rmsnorm("norm", x, cfg.hidden_size, cfg.rms_norm_eps);
+    let normed = nn.rmsnorm("model.norm", x, cfg.hidden_size, cfg.rms_norm_eps);
     let logits = nn.linear("lm_head", normed, cfg.hidden_size, cfg.vocab_size, false);
     nn.mark_output(logits);
 
     if cfg.num_nextn_predict_layers == 1 {
         let layer = cfg.num_hidden_layers;
-        let p = format!("layers.{layer}");
+        let p = format!("model.layers.{layer}");
         let e = nn.rmsnorm(
             &format!("{p}.enorm"),
             embedding,
@@ -75,7 +75,7 @@ fn decoder_layer(
     b: &Dim,
     s: &Dim,
 ) -> (TensorId, TensorId) {
-    let p = format!("layers.{layer}");
+    let p = format!("model.layers.{layer}");
     nn.begin_block(&p);
     let residual = x;
     let normed = nn.rmsnorm(

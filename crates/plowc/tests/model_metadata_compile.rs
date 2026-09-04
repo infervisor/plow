@@ -82,28 +82,73 @@ fn write_metadata(dir: &Path, config: &str) {
 }
 
 fn replace_index_with_monolithic_safetensors(dir: &Path) {
-    let index: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(dir.join("model.safetensors.index.json")).unwrap(),
-    )
-    .unwrap();
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("model.safetensors.index.json")).unwrap())
+            .unwrap();
+    let config = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    let model_type = serde_json::from_str::<serde_json::Value>(&config).unwrap()["model_type"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let graph = build_text_generation_from_config_json_at(&config, &ShapeBucket::default())
+        .expect("fixture graph");
+    let manifest = graph
+        .checkpoint_manifest()
+        .into_iter()
+        .map(|weight| {
+            let name = if weight.name.starts_with("model.") || weight.name.starts_with("lm_head.") {
+                weight.name.to_string()
+            } else if model_type == "kimi_k3" {
+                format!("language_model.model.{}", weight.name)
+            } else if model_type == "gemma4" {
+                format!("model.language_model.{}", weight.name)
+            } else {
+                format!("model.{}", weight.name)
+            };
+            let shape = weight
+                .shape
+                .unwrap()
+                .dims()
+                .iter()
+                .map(|dim| dim.as_static().unwrap() as u64)
+                .collect::<Vec<_>>();
+            (name, (weight.dtype, shape))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut header = serde_json::Map::new();
+    let mut offset = 0u64;
     for name in index["weight_map"].as_object().unwrap().keys() {
+        let (dtype, shape) = manifest
+            .get(name)
+            .map(|(dtype, shape)| (dtype.safetensors_name().unwrap(), shape.clone()))
+            .unwrap_or(("U8", vec![1]));
+        let elements = shape.iter().product::<u64>();
+        let bytes = elements
+            * nn_graph::DType::from_safetensors_name(dtype)
+                .unwrap()
+                .byte_size()
+                .unwrap() as u64;
         header.insert(
             name.clone(),
             serde_json::json!({
-                "dtype": "F32",
-                "shape": [0],
-                "data_offsets": [0, 0],
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [offset, offset + bytes],
             }),
         );
+        offset += bytes;
     }
     let mut header = serde_json::to_vec(&header).unwrap();
     while !header.len().is_multiple_of(8) {
         header.push(b' ');
     }
-    let mut file = (header.len() as u64).to_le_bytes().to_vec();
-    file.extend_from_slice(&header);
-    std::fs::write(dir.join("model.safetensors"), file).unwrap();
+    let path = dir.join("model.safetensors");
+    let mut file = std::fs::File::create(&path).unwrap();
+    use std::io::Write;
+    file.write_all(&(header.len() as u64).to_le_bytes())
+        .unwrap();
+    file.write_all(&header).unwrap();
+    file.set_len(8 + header.len() as u64 + offset).unwrap();
     std::fs::remove_file(dir.join("model.safetensors.index.json")).unwrap();
 }
 
@@ -345,7 +390,17 @@ fn representative_hf_models_compile_from_metadata_only_for_selected_gpu() {
             &options(out.clone(), gpu),
         )
         .unwrap_or_else(|error| panic!("{family}: {error}"));
+        let expected_weight_bytes =
+            build_text_generation_from_config_json_at(config, &ShapeBucket::default())
+                .unwrap()
+                .checkpoint_storage_bytes()
+                .unwrap();
         assert_eq!(report.gpu, gpu);
+        assert_eq!(
+            report.assets.as_ref().unwrap().regions.weights,
+            expected_weight_bytes,
+            "{family}: HBM accounting omitted checkpoint tensors"
+        );
         assert_eq!(
             report.assets.as_ref().unwrap().regions.hbm_capacity,
             hbm_capacity,
@@ -405,7 +460,8 @@ fn tensor_parallel_hbm_reports_per_device_expert_weights() {
 
     let one_weights = one.assets.unwrap().regions.weights;
     let two_assets = two.assets.unwrap();
-    assert_eq!(two_assets.regions.weights, one_weights.div_ceil(2));
+    assert!(two_assets.regions.weights < one_weights);
+    assert!(two_assets.regions.weights > one_weights.div_ceil(2));
     assert_eq!(
         two_assets.regions.total_hbm_peak,
         two_assets.regions.arena_peak + two_assets.regions.weights
@@ -550,8 +606,7 @@ fn model_and_monolithic_hf_dir_emit_identical_packets_and_maps() {
         &model_opts,
     )
     .expect("monolithic metadata model compile");
-    compile(&Source::HfDir(metadata.clone()), &hf_dir_opts)
-        .expect("monolithic hf-dir compile");
+    compile(&Source::HfDir(metadata.clone()), &hf_dir_opts).expect("monolithic hf-dir compile");
 
     for file in ["decode_b1_s1.pkt", "decode_b1_s1.map.json"] {
         assert_eq!(
@@ -562,6 +617,54 @@ fn model_and_monolithic_hf_dir_emit_identical_packets_and_maps() {
     }
 
     std::fs::remove_dir_all(metadata).ok();
+    std::fs::remove_dir_all(model_out).ok();
+    std::fs::remove_dir_all(hf_dir_out).ok();
+}
+
+#[test]
+fn metadata_weight_dtype_override_is_applied_for_both_source_forms() {
+    let metadata = tempdir("weight-override-source");
+    let auto_out = tempdir("weight-override-auto-out");
+    let model_out = tempdir("weight-override-model-out");
+    let hf_dir_out = tempdir("weight-override-hf-dir-out");
+    write_metadata(&metadata, LLAMA);
+
+    let auto = compile(
+        &Source::Model(metadata.to_string_lossy().into_owned()),
+        &options(auto_out.clone(), "h100"),
+    )
+    .expect("automatic dtype compile");
+    let mut model_opts = options(model_out.clone(), "h100");
+    model_opts.weight_dtype_override = Some(nn_graph::DType::F8E4M3);
+    let model = compile(
+        &Source::Model(metadata.to_string_lossy().into_owned()),
+        &model_opts,
+    )
+    .expect("model override compile");
+    let mut hf_dir_opts = options(hf_dir_out.clone(), "h100");
+    hf_dir_opts.weight_dtype_override = Some(nn_graph::DType::F8E4M3);
+    let hf_dir =
+        compile(&Source::HfDir(metadata.clone()), &hf_dir_opts).expect("hf-dir override compile");
+
+    assert_ne!(
+        std::fs::read(auto_out.join("decode_b1_s1.pkt")).unwrap(),
+        std::fs::read(model_out.join("decode_b1_s1.pkt")).unwrap(),
+        "weight dtype override did not change GEMM packet variants"
+    );
+    assert_eq!(
+        std::fs::read(model_out.join("decode_b1_s1.pkt")).unwrap(),
+        std::fs::read(hf_dir_out.join("decode_b1_s1.pkt")).unwrap(),
+        "source form changed overridden packet"
+    );
+    let model_weights = model.assets.unwrap().regions.weights;
+    assert!(
+        model_weights < auto.assets.unwrap().regions.weights,
+        "FP8 projection override did not reduce reported weight storage"
+    );
+    assert_eq!(hf_dir.assets.unwrap().regions.weights, model_weights);
+
+    std::fs::remove_dir_all(metadata).ok();
+    std::fs::remove_dir_all(auto_out).ok();
     std::fs::remove_dir_all(model_out).ok();
     std::fs::remove_dir_all(hf_dir_out).ok();
 }

@@ -98,11 +98,11 @@ fn official_glm53_manifest_and_semantic_graph_are_exact() {
     assert_eq!(graph.checkpoint_storage_bytes(), Some(755_617_140_416));
 
     for name in [
-        "layers.0.self_attn.indexer.wq_b.weight_scale_inv",
-        "layers.3.mlp.experts.255.up_proj.weight_scale_inv",
-        "layers.78.eh_proj.weight",
-        "layers.78.self_attn.indexer.weights_proj.weight",
-        "layers.78.shared_head.norm.weight",
+        "model.layers.0.self_attn.indexer.wq_b.weight_scale_inv",
+        "model.layers.3.mlp.experts.255.up_proj.weight_scale_inv",
+        "model.layers.78.eh_proj.weight",
+        "model.layers.78.self_attn.indexer.weights_proj.weight",
+        "model.layers.78.shared_head.norm.weight",
     ] {
         assert!(names.contains(name), "missing official tensor {name}");
     }

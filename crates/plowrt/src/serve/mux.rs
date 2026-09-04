@@ -3302,6 +3302,8 @@ mod tests {
                         bq: 1,
                         bkv: 1,
                         heads: 1,
+                        kv_heads: 1,
+                        window: 0,
                         out: 0,
                         tmem: 0,
                         variant: packet::Opcode::VARIANT_FLASH_CAUSAL_BF16,

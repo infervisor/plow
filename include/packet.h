@@ -165,12 +165,16 @@ typedef struct {
     uint16_t heads;
     uint16_t out;
     uint16_t tmem;
+    uint32_t window;
+    uint16_t kv_heads;
+    uint16_t _pad;
 } PlowFlashBody;
 
 typedef struct {
     uint32_t coord;
     uint32_t rows;
     uint32_t feat;
+    uint32_t args[4];
     uint16_t br;
     uint16_t out;
     uint8_t  operands;
@@ -212,14 +216,14 @@ PLOW_STATIC_ASSERT(sizeof(PlowHeader)     == 12, "PlowHeader size");
 PLOW_STATIC_ASSERT(sizeof(PlowDmaBody)    == 12, "PlowDmaBody size");
 PLOW_STATIC_ASSERT(sizeof(PlowRdmaBody)   == 8,  "PlowRdmaBody size");
 PLOW_STATIC_ASSERT(sizeof(PlowGemmBody)   == 32, "PlowGemmBody size");
-PLOW_STATIC_ASSERT(sizeof(PlowFlashBody)  == 28, "PlowFlashBody size");
-PLOW_STATIC_ASSERT(sizeof(PlowRowBody)    == 20, "PlowRowBody size");
+PLOW_STATIC_ASSERT(sizeof(PlowFlashBody)  == 36, "PlowFlashBody size");
+PLOW_STATIC_ASSERT(sizeof(PlowRowBody)    == 36, "PlowRowBody size");
 PLOW_STATIC_ASSERT(sizeof(PlowLayoutBody) == 88, "PlowLayoutBody size");
 PLOW_STATIC_ASSERT(sizeof(PlowCounter)    == 12, "PlowCounter size");
 
-/* Stream header is 20 bytes; MAGIC "INVP"; VERSION 4 (v4 = strided LAYOUT body). */
+/* Stream header is 20 bytes; v7 carries exact model row and Flash metadata. */
 #define PLOW_MAGIC   ((uint32_t)0x494E5650u)
-#define PLOW_VERSION ((uint16_t)5)
+#define PLOW_VERSION ((uint16_t)7)
 #define PLOW_STREAM_HEADER_SIZE 20
 
 #ifdef __cplusplus

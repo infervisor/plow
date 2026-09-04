@@ -5455,10 +5455,12 @@ mod tests {
         {
             let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8", "0")]);
             let inst = emit(8192, 1536, 7168);
+            let selected =
+                crate::gfx950_prefill_tile(8192, 1536, 7168, 256, kernelcaps::QuantScheme::None);
             assert_eq!(
                 inst.pack(),
                 packet::dev::DevInst64 {
-                    op: DevOp::GemmWide as u16,
+                    op: selected as u16,
                     blocks: 256,
                     fj: [0; 3],
                     t: [0, 1, 2, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff],
@@ -5468,9 +5470,7 @@ mod tests {
             );
             assert_eq!(inst.i[7], 0, "flag-off packets must retain the c2 encoding");
             assert_eq!(
-                inst.op,
-                crate::gfx950_prefill_tile(8192, 1536, 7168, 256, kernelcaps::QuantScheme::None)
-                    as u16,
+                inst.op, selected as u16,
                 "flag-off selection must use the unchanged TuneDB/analytical path"
             );
             assert_eq!(inst.blocks, 256);
@@ -5478,9 +5478,13 @@ mod tests {
         {
             let _scope = crate::test_env::EnvScope::set(&[("PLOW_GEMM_WIDE_C8", "1")]);
             let inst = emit(8192, 1536, 7168);
-            assert_eq!(inst.op, DevOp::GemmWide as u16);
-            assert_eq!(inst.i[7], packet::dev::GEMM_WIDE_C8_TAG);
-            assert_eq!(inst.blocks, 256, "64x4 c8 tiles must emit the exact grid");
+            if crate::gfx950_c8_is_measured_winner(8192, 1536, 7168) {
+                assert_eq!(inst.op, DevOp::GemmWide as u16);
+                assert_eq!(inst.i[7], packet::dev::GEMM_WIDE_C8_TAG);
+                assert_eq!(inst.blocks, 256, "64x4 c8 tiles must emit the exact grid");
+            } else {
+                assert_eq!(inst.i[7], 0, "stale measurements must disable c8");
+            }
 
             let other = emit(4096, 1536, 7168);
             assert_eq!(
@@ -5520,17 +5524,24 @@ mod tests {
 
         let (control, control_census, control_lookups, control_manifest) = emit("0");
         let (candidate, candidate_census, candidate_lookups, candidate_manifest) = emit("1");
-        assert_eq!(control_census, (7650, 7650));
+        let measured = crate::gfx950_c8_is_measured_winner(8192, 1536, 7168);
+        assert_eq!(control_census.1, 7650);
         assert_eq!(candidate_census, control_census);
         for manifest in [&control_manifest, &candidate_manifest] {
-            assert_eq!(manifest["tuning"]["tile_measured"], 7650);
             assert_eq!(manifest["tuning"]["tile_lookups"], 7650);
-            assert_eq!(manifest["tuning"]["tile_source"], "measured");
+            assert_eq!(
+                manifest["tuning"]["tile_measured"],
+                if measured { 7650 } else { 0 }
+            );
+            assert_eq!(
+                manifest["tuning"]["tile_source"],
+                if measured { "measured" } else { "analytical" }
+            );
         }
         assert_eq!(control_lookups.len(), 7650);
         assert_eq!(candidate_lookups.len(), control_lookups.len());
-        assert!(control_lookups.iter().all(|d| d.hit));
-        assert!(candidate_lookups.iter().all(|d| d.hit));
+        assert!(control_lookups.iter().all(|d| d.hit == measured));
+        assert!(candidate_lookups.iter().all(|d| d.hit == measured));
 
         let mut tagged = 0usize;
         for (t, (a, b)) in buckets.iter().zip(control.iter().zip(&candidate)) {
@@ -5545,7 +5556,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(tagged, 324, "the qualified full-graph shape census moved");
+        assert_eq!(
+            tagged,
+            if measured { 324 } else { 0 },
+            "only current qualified measurements may enable c8"
+        );
     }
 
     /// **BLOCKER 1.** The ring strides by its CAPACITY, and the capacity reaches the packet.

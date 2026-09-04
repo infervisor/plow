@@ -606,12 +606,17 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
     if let Some(metadata) = &model_metadata {
         ensure_model_packet_path_supported(metadata)?;
     }
-    let model_checkpoint_graph = model_metadata
+    let mut model_checkpoint_graph = model_metadata
         .as_ref()
         .map(|metadata| {
             nn_graph::hub::build_from_metadata(metadata, &nn_graph::models::ShapeBucket::default())
         })
         .transpose()?;
+    if let (Some(graph), Some(dtype)) =
+        (model_checkpoint_graph.as_mut(), opts.weight_dtype_override)
+    {
+        apply_projection_weight_dtype(graph, dtype);
+    }
     if let (Some(metadata), Some(graph)) = (&model_metadata, &model_checkpoint_graph) {
         metadata.validate_checkpoint_manifest(graph)?;
         info!(
@@ -624,28 +629,15 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
         .as_ref()
         .map(fp8_scale_storage_bytes)
         .unwrap_or(0);
-    // Routed experts are compact semantic nodes, so plan-local GEMM scanning
-    // intentionally cannot see their 3*E checkpoint tensors. Charge the
-    // exhaustive graph manifest instead whenever expert bindings are present.
-    let model_checkpoint_weight_bytes = match (&model_metadata, &model_checkpoint_graph) {
-        (Some(metadata), Some(graph)) if !graph.expert_bindings.is_empty() => {
-            let model_type = serde_json::from_str::<serde_json::Value>(metadata.config_json())?
-                .get("model_type")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            // Kimi-K2 and GLM compile every indexed text tensor, including
-            // GLM's next-token layer, so the index is the byte-exact source.
-            // DeepSeek intentionally omits its separately trained MTP layer;
-            // use the exhaustive base-graph manifest there instead.
-            match model_type.as_deref() {
-                Some("kimi" | "kimi_k2" | "glm_moe_dsa" | "glm" | "glm4") => metadata
-                    .indexed_total_size()?
-                    .or_else(|| graph.checkpoint_storage_bytes()),
-                _ => graph.checkpoint_storage_bytes(),
-            }
-        }
-        _ => None,
-    };
+    // The graph manifest includes embeddings, norms, biases, FP8 scales, and
+    // compact routed-expert bindings. Plan-local GEMM scanning omits those,
+    // while index metadata is supplied by the checkpoint and is not a safe OOM
+    // guard. Use the compiler-validated manifest for every metadata model.
+    let model_checkpoint_weight_bytes = model_checkpoint_graph
+        .as_ref()
+        .map(|graph| checkpoint_per_device_weight_bytes(graph, opts.num_gpus.max(1) as u64))
+        .transpose()
+        .map_err(PlowcError::InvalidDim)?;
     // For HfDir sources, synthesize the full model metadata once (cheap JSON
     // parse) and cache it for all downstream functions. No resolution to
     // Source::Net — we use `build_full_model_plan()` directly.
@@ -723,6 +715,7 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
             b,
             hf_synth.as_ref(),
             model_metadata.as_ref(),
+            opts.weight_dtype_override,
             fusion.is_none(),
         )?;
         trace!(
@@ -1819,7 +1812,7 @@ fn emit_streams(
         // + KV growth + weights) exceeds the target GPU's capacity. `amap`
         // segments track activations + KV; weights live in a distinct region
         // the runtime loads from safetensors, so add their bytes here.
-        let total_weight_bytes: u64 = model_checkpoint_weight_bytes.unwrap_or_else(|| {
+        let per_device_weight_bytes: u64 = model_checkpoint_weight_bytes.unwrap_or_else(|| {
             weight_shapes
                 .values()
                 .map(|(n, k, dtype)| {
@@ -1828,13 +1821,8 @@ fn emit_streams(
                 })
                 .sum::<u64>()
                 .saturating_add(fp8_scale_bytes)
+                .div_ceil(opts.num_gpus.max(1) as u64)
         });
-        // Under tensor parallelism (the only multi-GPU strategy) GEMM weights
-        // are sharded along N across units, so each device holds ~1/Nth of the
-        // total — charging the full model to every segment would over-count
-        // ~num_gpus× and reject buckets that fit.
-        let n_devices = opts.num_gpus.max(1) as u64;
-        let per_device_weight_bytes = total_weight_bytes.div_ceil(n_devices);
         for seg in &amap.segments {
             let needed = seg.size.saturating_add(per_device_weight_bytes);
             if needed > hbm_capacity {
@@ -2624,6 +2612,7 @@ fn build_plan(
     b: &ShapeBucket,
     hf_synth: Option<&hf_config::HfSynthesis>,
     model_metadata: Option<&nn_graph::hub::ModelMetadata>,
+    weight_dtype_override: Option<nn_graph::DType>,
     explore: bool,
 ) -> Result<(LayerPlan, Option<RewriteStats>), PlowcError> {
     match src {
@@ -2650,6 +2639,9 @@ fn build_plan(
                 metadata,
                 &nn_graph::models::ShapeBucket::default(),
             )?;
+            if let Some(dtype) = weight_dtype_override {
+                apply_projection_weight_dtype(&mut g, dtype);
+            }
             g.bind(&nn_graph::Bindings::new().set("B", b.batch).set("S", b.seq));
             // The fused graph is not consumed (the plan below is built from the
             // source graph) and the caller keeps only the FIRST bucket's stats
@@ -2676,5 +2668,158 @@ fn build_plan(
             let plan = plan_from_all_blocks(&g)?;
             Ok((plan, stats))
         }
+    }
+}
+
+fn projection_weight_ids(graph: &nn_graph::Graph) -> std::collections::HashSet<usize> {
+    use nn_graph::op::Op;
+
+    let mut projection_ids = std::collections::HashSet::new();
+    for node in &graph.nodes {
+        match &node.op {
+            Op::Linear { .. } | Op::MoeRouter { .. } => {
+                if let Some(weight) = node.inputs.get(1) {
+                    projection_ids.insert(weight.0 as usize);
+                }
+            }
+            Op::DsaIndexer { .. } => {
+                for index in [2, 3, 6] {
+                    if let Some(weight) = node.inputs.get(index) {
+                        projection_ids.insert(weight.0 as usize);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let name_to_id = graph
+        .tensors
+        .iter()
+        .enumerate()
+        .filter_map(|(id, tensor)| tensor.name.as_deref().map(|name| (name, id)))
+        .collect::<std::collections::HashMap<_, _>>();
+    for binding in &graph.fp8_scale_bindings {
+        if let Some(id) = name_to_id.get(binding.weight.as_str()) {
+            projection_ids.insert(*id);
+        }
+    }
+    for layer in &graph.expert_bindings {
+        for expert in &layer.routed_experts {
+            for projection in [&expert.gate, &expert.up, &expert.down] {
+                if let Some(id) = name_to_id.get(projection.weight.as_str()) {
+                    projection_ids.insert(*id);
+                }
+            }
+        }
+    }
+    drop(name_to_id);
+
+    projection_ids
+}
+
+fn apply_projection_weight_dtype(graph: &mut nn_graph::Graph, dtype: nn_graph::DType) {
+    let projection_ids = projection_weight_ids(graph);
+    let projection_names = projection_ids
+        .iter()
+        .filter_map(|&id| graph.tensors[id].name.clone())
+        .collect::<std::collections::HashSet<_>>();
+
+    for tensor in &mut graph.tensors {
+        if matches!(tensor.origin, nn_graph::Origin::Weight)
+            && tensor
+                .name
+                .as_deref()
+                .is_some_and(|name| projection_names.contains(name))
+        {
+            tensor.dtype = dtype;
+        }
+    }
+}
+
+fn checkpoint_per_device_weight_bytes(graph: &nn_graph::Graph, tp: u64) -> Result<u64, String> {
+    let projection_ids = projection_weight_ids(graph);
+    let mut weights = std::collections::BTreeMap::<&str, (u64, bool)>::new();
+    for (id, tensor) in graph.tensors.iter().enumerate() {
+        if !matches!(tensor.origin, nn_graph::Origin::Weight) {
+            continue;
+        }
+        let name = tensor
+            .name
+            .as_deref()
+            .ok_or_else(|| format!("checkpoint weight tensor {id} has no name"))?;
+        let shape = tensor
+            .shape
+            .as_ref()
+            .ok_or_else(|| format!("checkpoint weight {name} has no shape"))?;
+        let elements = shape.dims().iter().try_fold(1u64, |n, dim| {
+            let dim = dim
+                .as_static()
+                .ok_or_else(|| format!("checkpoint weight {name} has a dynamic dimension"))?;
+            let dim = u64::try_from(dim)
+                .map_err(|_| format!("checkpoint weight {name} has negative dimension {dim}"))?;
+            n.checked_mul(dim)
+                .ok_or_else(|| format!("checkpoint weight {name} element count overflows"))
+        })?;
+        let bytes = tensor.dtype.tile_bytes(elements);
+        let projection = projection_ids.contains(&id);
+        match weights.entry(name) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((bytes, projection));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().0 != bytes {
+                    return Err(format!(
+                        "checkpoint aliases for {name} disagree on storage bytes ({} vs {bytes})",
+                        entry.get().0
+                    ));
+                }
+                entry.get_mut().1 &= projection;
+            }
+        }
+    }
+    let mut sharded = 0u64;
+    let mut replicated = 0u64;
+    for (name, (bytes, all_projection)) in weights {
+        if all_projection {
+            sharded = sharded
+                .checked_add(bytes)
+                .ok_or_else(|| format!("sharded checkpoint bytes overflow at {name}"))?;
+        } else {
+            replicated = replicated
+                .checked_add(bytes)
+                .ok_or_else(|| format!("replicated checkpoint bytes overflow at {name}"))?;
+        }
+    }
+    replicated
+        .checked_add(sharded.div_ceil(tp))
+        .ok_or_else(|| "per-device checkpoint bytes overflow".to_owned())
+}
+
+#[cfg(test)]
+mod checkpoint_sizing_tests {
+    use super::*;
+
+    #[test]
+    fn tied_embedding_override_is_consistent_and_remains_replicated() {
+        let mut nn = nn_graph::Nn::new(nn_graph::DType::BF16, nn_graph::DType::BF16);
+        let ids_shape = nn.shape([nn_graph::Dim::stat(1), nn_graph::Dim::stat(1)]);
+        let ids = nn.input("input_ids", ids_shape, nn_graph::DType::I32);
+        let hidden = nn.embedding("shared", ids, 32, 16);
+        let logits = nn.linear("shared", hidden, 16, 32, false);
+        nn.mark_output(logits);
+        let mut graph = nn.finish();
+
+        apply_projection_weight_dtype(&mut graph, nn_graph::DType::F8E4M3);
+        let aliases = graph
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.name.as_deref() == Some("shared.weight"))
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 2);
+        assert!(aliases
+            .iter()
+            .all(|tensor| tensor.dtype == nn_graph::DType::F8E4M3));
+        assert_eq!(checkpoint_per_device_weight_bytes(&graph, 2), Ok(512));
     }
 }

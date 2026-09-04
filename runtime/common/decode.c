@@ -31,7 +31,9 @@ int plow_decode(const uint8_t* buf, size_t len,
     if (len < PLOW_STREAM_HEADER_SIZE) return -1;
     if (rd_u32(buf, 0) != PLOW_MAGIC) return -1;
     uint16_t version = rd_u16(buf, 4);
-    if (version < 2 || version > PLOW_VERSION) return -1;
+    /* C executors alias body pointers directly into the packet, so they cannot
+     * normalize legacy row/Flash layouts. Reject them instead of misparsing. */
+    if (version != PLOW_VERSION) return -1;
 
     uint16_t bucket = rd_u16(buf, 6);
     uint32_t ni = rd_u32(buf, 8);

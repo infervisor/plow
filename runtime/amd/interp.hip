@@ -4486,16 +4486,6 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             asm volatile("" ::"s"(pf_), "s"(pf2_));
         }
 #endif
-#if PLOW_GEMV_PREFETCH
-        /* L8: this slice's weight rows go to L2 while the gate is still closed (op_gemm.h
-         * `gemv_prefetch_slice`). Above the GATE_HIER leader guard for the reason PLOW_INST_PF
-         * gives. `pf_live` is wave-uniform (it descends from the instruction), and the matching
-         * vmcnt(0) sits after the gate, before the arena is reused. */
-        const bool pf_live = (in->op == PLOW_DOP_GEMV) && (in->t[2] != PLOW_TENSOR_NONE);
-        if (pf_live)
-            gemv_prefetch_slice((const bf16*)tens[in->t[2]], in->i[1], in->i[2], e.slice,
-                                in->blocks, sm.raw);
-#endif
 #if PLOW_GATE_HIER
         if (!h_on || h_lead)
 #endif
@@ -4516,10 +4506,6 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             }
         }
         __syncthreads(); /* every counter in the list is now satisfied */
-#if PLOW_GEMV_PREFETCH
-        /* Every wave's LDS-DMA prefetch has landed before any op writes the arena. */
-        if (pf_live) cp_async_wait();
-#endif
 #if PLOW_TRACE_PHASE
         /* T1: the dependency is met; nothing below here is waiting for a producer. */
         const uint64_t t_p1 = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
@@ -4565,6 +4551,17 @@ __attribute__((amdgpu_waves_per_eu(PLOW_WPE, PLOW_WPE))) void PLOW_INTERP_NAME(P
             else if (maint_leader) ctr_acquire();
         }
         __syncthreads(); /* the invalidate is visible to every thread before it reads */
+
+#if PLOW_GEMV_PREFETCH
+        /* L8: issue after the dependency acquire, whose buffer_inv would otherwise discard the
+         * prefetched rows before the GEMV reads them. `pf_live` is wave-uniform. */
+        const bool pf_live = (in->op == PLOW_DOP_GEMV) && (in->t[2] != PLOW_TENSOR_NONE);
+        if (pf_live) {
+            gemv_prefetch_slice((const bf16*)tens[in->t[2]], in->i[1], in->i[2], e.slice,
+                                in->blocks, sm.raw);
+            cp_async_wait();
+        }
+#endif
 
         const uint64_t t_ready = prog.trace ? __builtin_amdgcn_s_memrealtime() : 0;
 

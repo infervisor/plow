@@ -129,9 +129,9 @@ fn qwen25_uses_qkv_bias_without_qk_norm() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(weights.len(), 15);
     for name in [
-        "layers.0.self_attn.q_proj.bias",
-        "layers.0.self_attn.k_proj.bias",
-        "layers.0.self_attn.v_proj.bias",
+        "model.layers.0.self_attn.q_proj.bias",
+        "model.layers.0.self_attn.k_proj.bias",
+        "model.layers.0.self_attn.v_proj.bias",
     ] {
         assert!(weights.contains(name), "missing Qwen2.5 tensor {name}");
     }
@@ -785,7 +785,8 @@ fn qwen_image_dit_mmdit() {
 
 #[test]
 fn gemma4_multimodal_dense() {
-    // Full multimodal Gemma 4: vision encoder + projector + text decoder.
+    // Full multimodal Gemma 4 is refused until its exact vision checkpoint
+    // contract is implemented. The endpoint-specific text frontend remains valid.
     let cfg = r#"{
         "model_type": "gemma4_unified",
         "vision_config": {
@@ -819,37 +820,24 @@ fn gemma4_multimodal_dense() {
             "layer_types": ["sliding_attention", "full_attention"]
         }
     }"#;
-    let g = build_from_config_json(cfg).expect("build gemma4 multimodal");
-    assert_fully_inferred(&g);
+    let error = build_from_config_json(cfg).unwrap_err().to_string();
+    assert!(error.contains("vision graph is not implemented"), "{error}");
 
-    // Vision: 56/14 = 4 patches per side → 16 patches total.
-    // Combined output: logits [B, 16+S, 500] (image tokens + text tokens).
-    let out_str = output_shape_str(&g);
-    assert!(
-        out_str.contains("500"),
-        "expected vocab dim 500 in output, got: {out_str}"
-    );
-
-    // Vision encoder has 2 attention layers (non-causal).
-    // Text decoder has 2 attention layers (causal).
-    let attn_count = g.count_ops(|o| matches!(o, nn_graph::Op::Attention { .. }));
+    let text = build_text_generation_from_config_json_at(cfg, &ShapeBucket::default())
+        .expect("build Gemma 4 text-generation graph");
+    assert_fully_inferred(&text);
     assert_eq!(
-        attn_count, 4,
-        "expected 4 attention ops (2 vision + 2 text)"
+        text.count_ops(|o| matches!(o, nn_graph::Op::Attention { .. })),
+        2
     );
-
-    // One conv2d for patch embedding.
-    assert_eq!(g.count_ops(|o| matches!(o, nn_graph::Op::Conv2d { .. })), 1);
-
-    // No MoE routers (dense model).
     assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::MoeRouter { .. })),
+        text.count_ops(|o| matches!(o, nn_graph::Op::Conv2d { .. })),
         0
     );
 }
 
 #[test]
-fn gemma4_multimodal_moe() {
+fn gemma4_multimodal_moe_fails_closed() {
     // Multimodal with MoE text decoder.
     let cfg = r#"{
         "model_type": "gemma4_unified",
@@ -885,23 +873,13 @@ fn gemma4_multimodal_moe() {
             "sliding_window": 256
         }
     }"#;
-    let g = build_from_config_json(cfg).expect("build gemma4 multimodal moe");
-    assert_fully_inferred(&g);
-
-    // 1 MoE layer ⇒ 1 router.
-    assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::MoeRouter { .. })),
-        1
-    );
-    // Vision (1 layer) + text (2 layers) = 3 attention ops.
-    assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::Attention { .. })),
-        3
-    );
+    let error = build_from_config_json(cfg).unwrap_err().to_string();
+    assert!(error.contains("Gemma 4 MoE"), "{error}");
+    assert!(error.contains("refusing"), "{error}");
 }
 
 #[test]
-fn gemma4_moe_sparse() {
+fn gemma4_moe_sparse_fails_closed() {
     // Gemma 4 MoE (gemma-4-26B-A4B style): some layers use MoE FFN, others dense.
     // Uses `moe_sliding_attention` / `moe_full_attention` in layer_types.
     let cfg = r#"{
@@ -932,34 +910,12 @@ fn gemma4_moe_sparse() {
             "sliding_attention": {"rope_theta": 10000.0}
         }
     }"#;
-    let g = build_from_config_json(cfg).expect("build gemma4 moe");
-    assert_fully_inferred(&g);
-    assert_eq!(output_shape_str(&g), "[B, S, 1000]");
-
-    // 2 out of 4 layers are MoE ⇒ 2 routers.
-    assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::MoeRouter { .. })),
-        2
-    );
-    // All 4 layers still have attention.
-    assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::Attention { .. })),
-        4
-    );
-    // Per-layer head dims: sliding layers use 64, global layers use 128.
-    let head_dims: Vec<u32> = g
-        .nodes
-        .iter()
-        .filter_map(|n| match n.op {
-            nn_graph::Op::Attention { head_dim, .. } => Some(head_dim),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(head_dims, vec![64, 64, 128, 128]);
+    let error = build_from_config_json(cfg).unwrap_err().to_string();
+    assert!(error.contains("Gemma 4 MoE"), "{error}");
 }
 
 #[test]
-fn gemma4_moe_all_layers() {
+fn gemma4_moe_all_layers_fails_closed() {
     // All layers MoE (simpler variant: no layer_types, all layers become MoE).
     let cfg = r#"{
         "model_type": "gemma4_unified_text",
@@ -976,15 +932,8 @@ fn gemma4_moe_all_layers() {
         "num_experts_per_tok": 1,
         "sliding_window_pattern": 1
     }"#;
-    let g = build_from_config_json(cfg).expect("build gemma4 all-moe");
-    assert_fully_inferred(&g);
-    assert_eq!(output_shape_str(&g), "[B, S, 500]");
-
-    // Both layers are MoE ⇒ 2 routers.
-    assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::MoeRouter { .. })),
-        2
-    );
+    let error = build_from_config_json(cfg).unwrap_err().to_string();
+    assert!(error.contains("Gemma 4 MoE"), "{error}");
 }
 
 #[test]
@@ -1237,10 +1186,10 @@ fn glm_moe_dsa() {
         .into_iter()
         .map(|weight| weight.name)
         .collect();
-    assert!(names.contains("layers.0.self_attn.indexer.wq_b.weight"));
-    assert!(names.contains("layers.3.mlp.experts.7.down_proj.weight_scale_inv"));
-    assert!(names.contains("layers.4.eh_proj.weight"));
-    assert!(names.contains("layers.4.shared_head.norm.weight"));
+    assert!(names.contains("model.layers.0.self_attn.indexer.wq_b.weight"));
+    assert!(names.contains("model.layers.3.mlp.experts.7.down_proj.weight_scale_inv"));
+    assert!(names.contains("model.layers.4.eh_proj.weight"));
+    assert!(names.contains("model.layers.4.shared_head.norm.weight"));
     assert!(!names.iter().any(|name| name.starts_with("mtp_heads.")));
 
     // Multi-token prediction: 2 outputs total (main + 1 MTP head).

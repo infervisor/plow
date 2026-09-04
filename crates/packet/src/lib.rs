@@ -357,6 +357,24 @@ pub struct FlashBody {
     pub heads: u16,
     pub out: u16,
     pub tmem: u16,
+    pub window: u32,
+    pub kv_heads: u16,
+    pub _pad: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlashBodyLegacy {
+    pub coord0: u32,
+    pub coord1: u32,
+    pub seq_q: u32,
+    pub seq_kv: u32,
+    pub head_dim: u16,
+    pub bq: u16,
+    pub bkv: u16,
+    pub heads: u16,
+    pub out: u16,
+    pub tmem: u16,
 }
 
 #[repr(C)]
@@ -487,6 +505,8 @@ pub enum Body {
         bq: u16,
         bkv: u16,
         heads: u16,
+        kv_heads: u16,
+        window: u32,
         out: u16,
         tmem: u16,
         /// Kernel variant byte for the opcode.
@@ -605,7 +625,7 @@ impl Default for Program {
 }
 
 pub const MAGIC: u32 = 0x494E_5650; // "INVP"
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 7;
 /// Minimum version this decoder still accepts (v2 streams with u8 wait/succ lens).
 pub const MIN_VERSION: u16 = 2;
 
@@ -700,6 +720,8 @@ impl Body {
                 bq,
                 bkv,
                 heads,
+                kv_heads,
+                window,
                 out,
                 tmem,
                 variant: _,
@@ -716,6 +738,9 @@ impl Body {
                     heads,
                     out,
                     tmem,
+                    window,
+                    kv_heads,
+                    _pad: 0,
                 },
             ),
             Body::Row {
@@ -842,22 +867,50 @@ impl Body {
                 )
             }
             Opcode::FAMILY_FLASH => {
-                let r: FlashBody = try_pod(b, at).ok_or("truncated FLASH body")?;
-                (
-                    Body::Flash {
-                        coord: [r.coord0, r.coord1],
-                        seq_q: r.seq_q,
-                        seq_kv: r.seq_kv,
-                        head_dim: r.head_dim,
-                        bq: r.bq,
-                        bkv: r.bkv,
-                        heads: r.heads,
-                        out: r.out,
-                        tmem: r.tmem,
-                        variant: op.variant(),
-                    },
-                    size_of::<FlashBody>(),
-                )
+                if version >= 7 {
+                    let r: FlashBody = try_pod(b, at).ok_or("truncated FLASH body")?;
+                    (
+                        Body::Flash {
+                            coord: [r.coord0, r.coord1],
+                            seq_q: r.seq_q,
+                            seq_kv: r.seq_kv,
+                            head_dim: r.head_dim,
+                            bq: r.bq,
+                            bkv: r.bkv,
+                            heads: r.heads,
+                            kv_heads: r.kv_heads,
+                            window: r.window,
+                            out: r.out,
+                            tmem: r.tmem,
+                            variant: op.variant(),
+                        },
+                        size_of::<FlashBody>(),
+                    )
+                } else {
+                    let r: FlashBodyLegacy = try_pod(b, at).ok_or("truncated legacy FLASH body")?;
+                    if op.variant() == Opcode::VARIANT_FLASH_SLIDING_BF16 {
+                        return Err("legacy FLASH sliding-window records do not encode a window");
+                    }
+                    (
+                        Body::Flash {
+                            coord: [r.coord0, r.coord1],
+                            seq_q: r.seq_q,
+                            seq_kv: r.seq_kv,
+                            head_dim: r.head_dim,
+                            bq: r.bq,
+                            bkv: r.bkv,
+                            heads: r.heads,
+                            kv_heads: Opcode::flash_gqa_kv_heads(op.variant())
+                                .map(u16::from)
+                                .unwrap_or(r.heads),
+                            window: 0,
+                            out: r.out,
+                            tmem: r.tmem,
+                            variant: op.variant(),
+                        },
+                        size_of::<FlashBodyLegacy>(),
+                    )
+                }
             }
             Opcode::FAMILY_ROW => {
                 let reduce = Opcode::variant_is_reduce(op.variant());
@@ -1127,7 +1180,7 @@ mod tests {
         assert_eq!(size_of::<DmaBody>(), 12);
         assert_eq!(size_of::<RdmaBody>(), 8);
         assert_eq!(size_of::<GemmBody>(), 32);
-        assert_eq!(size_of::<FlashBody>(), 28);
+        assert_eq!(size_of::<FlashBody>(), 36);
         assert_eq!(size_of::<RowBody>(), 36);
         assert_eq!(size_of::<LayoutBody>(), 88);
         assert_eq!(size_of::<TokenBody>(), 16);
@@ -1146,6 +1199,20 @@ mod tests {
         ] {
             assert_eq!(sz % 4, 0);
             assert!(al <= 4);
+        }
+    }
+
+    #[test]
+    fn public_c_headers_track_v7_record_layouts() {
+        let root = include_str!("../../../include/packet.h");
+        let crate_header = include_str!("../include/packet.h");
+        assert!(root.contains("PLOW_VERSION ((uint16_t)7)"));
+        assert!(crate_header.contains("INFERVISOR_PACKET_VERSION 7"));
+        for header in [root, crate_header] {
+            assert!(header.contains("kind"));
+            assert!(header.contains("access"));
+            assert!(header.contains("uint32_t window"));
+            assert!(header.contains("args[4]"));
         }
     }
 
@@ -1208,6 +1275,37 @@ mod tests {
             args: [48, 128, 1, 0],
         };
         assert_eq!(body.opcode().0, 0x058b);
+        let program = Program {
+            insts: vec![Inst {
+                resource: ResourceKind::Sm,
+                unit: 0,
+                index: 0,
+                body,
+                wait: vec![],
+                succ: vec![],
+            }],
+            ..Program::default()
+        };
+        let decoded = Program::decode(&program.to_bytes()).unwrap();
+        assert_eq!(decoded.insts[0].body, body);
+    }
+
+    #[test]
+    fn flash_gqa_and_window_metadata_roundtrip() {
+        let body = Body::Flash {
+            coord: [3, 5],
+            seq_q: 128,
+            seq_kv: 4096,
+            head_dim: 256,
+            bq: 64,
+            bkv: 128,
+            heads: 32,
+            kv_heads: 8,
+            window: 1024,
+            out: 7,
+            tmem: 9,
+            variant: Opcode::VARIANT_FLASH_SLIDING_BF16,
+        };
         let program = Program {
             insts: vec![Inst {
                 resource: ResourceKind::Sm,
@@ -1400,6 +1498,64 @@ mod tests {
             plan_gen: 7,
             flags: 0,
         }
+    }
+
+    fn legacy_v6_flash(variant: u8) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&6u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        push_pod(
+            &mut bytes,
+            &Header {
+                opcode: Opcode::new(0, Opcode::FAMILY_FLASH, variant).0,
+                resource: ResourceKind::Sm as u8,
+                unit: 0,
+                index: 0,
+                wait_len: 0,
+                succ_len: 0,
+                _pad: 0,
+            },
+        );
+        push_pod(
+            &mut bytes,
+            &FlashBodyLegacy {
+                coord0: 0,
+                coord1: 0,
+                seq_q: 8,
+                seq_kv: 8,
+                head_dim: 128,
+                bq: 8,
+                bkv: 8,
+                heads: 24,
+                out: 3,
+                tmem: SLOT_NONE,
+            },
+        );
+        bytes
+    }
+
+    #[test]
+    fn legacy_v6_flash_recovers_gqa_heads_and_rejects_sliding() {
+        let decoded = Program::decode(&legacy_v6_flash(Opcode::flash_causal_gqa_variant(4)))
+            .expect("legacy causal GQA is representable");
+        assert!(matches!(
+            decoded.insts[0].body,
+            Body::Flash {
+                heads: 24,
+                kv_heads: 4,
+                window: 0,
+                ..
+            }
+        ));
+        assert_eq!(
+            Program::decode(&legacy_v6_flash(Opcode::VARIANT_FLASH_SLIDING_BF16)),
+            Err("legacy FLASH sliding-window records do not encode a window")
+        );
     }
 
     #[test]

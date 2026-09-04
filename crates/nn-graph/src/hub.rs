@@ -9,7 +9,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::models::{build_text_generation_from_config_json_at, BuildError, ShapeBucket};
-use crate::Graph;
+use crate::{DType, Graph};
 
 /// Hugging Face files needed to compile packets and preserve serving metadata.
 ///
@@ -181,6 +181,77 @@ impl ModelMetadata {
                 summarize_names(&unexpected),
             )));
         }
+        if let Some(tensor_metadata) = value
+            .get("plow_tensor_metadata")
+            .and_then(serde_json::Value::as_object)
+        {
+            for weight in graph.checkpoint_manifest() {
+                let indexed_name = indexed.iter().copied().find(|indexed_name| {
+                    checkpoint_name_aliases(indexed_name).any(|alias| alias == weight.name)
+                });
+                let Some(indexed_name) = indexed_name else {
+                    continue;
+                };
+                let actual = tensor_metadata
+                    .get(indexed_name)
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| {
+                        HubError::Hub(format!(
+                            "{index_label} has no tensor metadata for {indexed_name}"
+                        ))
+                    })?;
+                let dtype = actual
+                    .get("dtype")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(DType::from_safetensors_name)
+                    .ok_or_else(|| {
+                        HubError::Hub(format!(
+                            "{index_label} has an invalid dtype for {indexed_name}"
+                        ))
+                    })?;
+                if dtype != weight.dtype {
+                    return Err(HubError::Hub(format!(
+                        "{index_label} tensor {indexed_name} has dtype {dtype}, expected {}",
+                        weight.dtype
+                    )));
+                }
+                let expected_shape = weight
+                    .shape
+                    .ok_or_else(|| {
+                        HubError::Hub(format!("compiled weight {} has no shape", weight.name))
+                    })?
+                    .dims()
+                    .iter()
+                    .map(|dim| {
+                        dim.as_static().ok_or_else(|| {
+                            HubError::Hub(format!(
+                                "compiled weight {} has a dynamic dimension",
+                                weight.name
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let actual_shape = actual
+                    .get("shape")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|shape| {
+                        shape
+                            .iter()
+                            .map(serde_json::Value::as_i64)
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .ok_or_else(|| {
+                        HubError::Hub(format!(
+                            "{index_label} has an invalid shape for {indexed_name}"
+                        ))
+                    })?;
+                if actual_shape != expected_shape {
+                    return Err(HubError::Hub(format!(
+                        "{index_label} tensor {indexed_name} has shape {actual_shape:?}, expected {expected_shape:?}"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -188,6 +259,28 @@ impl ModelMetadata {
     pub fn copy_to(&self, out: &Path) -> Result<(), HubError> {
         std::fs::create_dir_all(out)
             .map_err(|e| HubError::Hub(format!("cannot create {}: {e}", out.display())))?;
+        let output_root = std::fs::canonicalize(out)
+            .map_err(|e| HubError::Hub(format!("cannot resolve {}: {e}", out.display())))?;
+        if self.path("config.json").is_some_and(|config| {
+            config
+                .parent()
+                .and_then(|parent| std::fs::canonicalize(parent).ok())
+                .is_some_and(|source_root| source_root == output_root)
+        }) {
+            return Err(HubError::Hub(format!(
+                "refusing to copy Hugging Face metadata onto its source directory {}",
+                out.display()
+            )));
+        }
+        let chat_templates = out.join("chat_templates");
+        if chat_templates.is_dir() {
+            std::fs::remove_dir_all(&chat_templates).map_err(|e| {
+                HubError::Hub(format!(
+                    "cannot remove stale {}: {e}",
+                    chat_templates.display()
+                ))
+            })?;
+        }
         for &name in METADATA_FILES {
             let target = out.join(name);
             if self.path(name).is_none() {
@@ -437,6 +530,28 @@ pub fn resolve_model_metadata(model_id: &str) -> Result<ModelMetadata, HubError>
     } else {
         None
     };
+    if let Some(index) = &synthetic_index_json {
+        let config = files
+            .iter()
+            .find(|(name, _)| name == "config.json")
+            .map(|(_, path)| path)
+            .ok_or_else(|| HubError::Hub(format!("{model_id}: config.json was not resolved")))?;
+        let snapshot = config.parent().ok_or_else(|| {
+            HubError::Hub(format!(
+                "cannot determine cached snapshot from {}",
+                config.display()
+            ))
+        })?;
+        if let Err(error) = std::fs::write(snapshot.join(SAFETENSORS_INDEX), index) {
+            eprintln!(
+                "warning: could not persist synthesized {SAFETENSORS_INDEX} in {}: {error}",
+                snapshot.display()
+            );
+        }
+    }
+    if let Err(error) = cached_main.create_ref(&revision) {
+        eprintln!("warning: could not pin cached main revision {revision} for {model_id}: {error}");
+    }
     metadata_from_files(
         model_id,
         Some(revision),
@@ -721,7 +836,9 @@ fn synthesize_index_from_header(
         })
         .transpose()?;
     let mut weight_map = serde_json::Map::new();
+    let mut tensor_metadata = serde_json::Map::new();
     let mut tensor_bytes = 0u64;
+    let mut intervals = Vec::new();
     for (name, tensor) in tensors {
         if name == "__metadata__" {
             continue;
@@ -729,15 +846,40 @@ fn synthesize_index_from_header(
         let tensor = tensor.as_object().ok_or_else(|| {
             HubError::Hub(format!("safetensors tensor {name:?} is not an object"))
         })?;
-        let dtype = tensor.get("dtype").and_then(serde_json::Value::as_str);
-        let shape = tensor.get("shape").and_then(serde_json::Value::as_array);
-        if dtype.is_none_or(str::is_empty)
-            || shape.is_none_or(|dims| dims.iter().any(|dim| dim.as_u64().is_none()))
-        {
+        let dtype = tensor
+            .get("dtype")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| HubError::Hub(format!("safetensors tensor {name:?} has no dtype")))?;
+        let element_bytes = match dtype {
+            "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" => 1u64,
+            "I16" | "U16" | "F16" | "BF16" => 2,
+            "I32" | "U32" | "F32" => 4,
+            "I64" | "U64" | "F64" => 8,
+            _ => {
+                return Err(HubError::Hub(format!(
+                    "safetensors tensor {name:?} has unsupported dtype {dtype:?}"
+                )))
+            }
+        };
+        let shape = tensor
+            .get("shape")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| HubError::Hub(format!("safetensors tensor {name:?} has no shape")))?;
+        if shape.iter().any(|dim| dim.as_u64().is_none()) {
             return Err(HubError::Hub(format!(
-                "safetensors tensor {name:?} has no dtype or shape"
+                "safetensors tensor {name:?} has an invalid shape"
             )));
         }
+        let elements = shape.iter().try_fold(1u64, |elements, dim| {
+            elements
+                .checked_mul(dim.as_u64().expect("shape validated"))
+                .ok_or_else(|| {
+                    HubError::Hub(format!("safetensors tensor {name:?} shape overflows"))
+                })
+        })?;
+        let expected_bytes = elements.checked_mul(element_bytes).ok_or_else(|| {
+            HubError::Hub(format!("safetensors tensor {name:?} byte size overflows"))
+        })?;
         let offsets = tensor
             .get("data_offsets")
             .and_then(serde_json::Value::as_array)
@@ -762,17 +904,39 @@ fn synthesize_index_from_header(
                 "safetensors tensor {name:?} has out-of-range data_offsets [{start}, {end}]"
             )));
         }
+        if end - start != expected_bytes {
+            return Err(HubError::Hub(format!(
+                "safetensors tensor {name:?} shape and dtype require {expected_bytes} bytes, \
+                 but data_offsets contain {}",
+                end - start
+            )));
+        }
         tensor_bytes = tensor_bytes.saturating_add(end - start);
+        intervals.push((start, end, name.as_str()));
         weight_map.insert(name.clone(), SAFETENSORS_FILE.into());
+        tensor_metadata.insert(
+            name.clone(),
+            serde_json::json!({"dtype": dtype, "shape": shape}),
+        );
     }
     if weight_map.is_empty() {
         return Err(HubError::Hub(
             "safetensors header contains no tensor entries".into(),
         ));
     }
+    intervals.sort_unstable_by_key(|&(start, _, _)| start);
+    for pair in intervals.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(HubError::Hub(format!(
+                "safetensors tensors {:?} and {:?} have overlapping data_offsets",
+                pair[0].2, pair[1].2
+            )));
+        }
+    }
     serde_json::to_string(&serde_json::json!({
         "metadata": {"total_size": tensor_bytes},
         "weight_map": weight_map,
+        "plow_tensor_metadata": tensor_metadata,
     }))
     .map_err(|e| HubError::Hub(format!("cannot synthesize safetensors index: {e}")))
 }
@@ -1002,6 +1166,64 @@ mod tests {
     }
 
     #[test]
+    fn copying_metadata_to_its_source_is_rejected_without_deleting_files() {
+        let dir = tempdir("copy-self");
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"fixture"}"#).unwrap();
+        std::fs::write(
+            dir.join(SAFETENSORS_INDEX),
+            r#"{"weight_map":{"x":"model.safetensors"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(dir.join("chat_templates")).unwrap();
+        let template = dir.join("chat_templates/tool_use.jinja");
+        std::fs::write(&template, "{{ tools }}").unwrap();
+
+        let metadata = resolve_model_metadata(dir.to_str().unwrap()).unwrap();
+        let error = metadata.copy_to(&dir).unwrap_err().to_string();
+        assert!(error.contains("onto its source directory"), "{error}");
+        assert_eq!(std::fs::read_to_string(&template).unwrap(), "{{ tools }}");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn copying_metadata_removes_stale_nested_chat_templates() {
+        let first = tempdir("templates-first");
+        std::fs::write(first.join("config.json"), r#"{"model_type":"fixture"}"#).unwrap();
+        std::fs::write(
+            first.join(SAFETENSORS_INDEX),
+            r#"{"weight_map":{"x":"model.safetensors"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(first.join("chat_templates")).unwrap();
+        std::fs::write(first.join("chat_templates/tool.jinja"), "{{ tools }}").unwrap();
+
+        let second = tempdir("templates-second");
+        std::fs::write(second.join("config.json"), r#"{"model_type":"fixture"}"#).unwrap();
+        std::fs::write(
+            second.join(SAFETENSORS_INDEX),
+            r#"{"weight_map":{"x":"model.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let out = tempdir("templates-out");
+        resolve_model_metadata(first.to_str().unwrap())
+            .unwrap()
+            .copy_to(&out)
+            .unwrap();
+        assert!(out.join("chat_templates/tool.jinja").is_file());
+        resolve_model_metadata(second.to_str().unwrap())
+            .unwrap()
+            .copy_to(&out)
+            .unwrap();
+        assert!(!out.join("chat_templates").exists());
+
+        std::fs::remove_dir_all(first).ok();
+        std::fs::remove_dir_all(second).ok();
+        std::fs::remove_dir_all(out).ok();
+    }
+
+    #[test]
     fn manifest_marks_multimodal_checkpoints_as_text_only_compilation() {
         let dir = tempdir("vision-scope");
         std::fs::write(
@@ -1092,6 +1314,37 @@ mod tests {
         assert!(metadata
             .path("model.safetensors.index.json")
             .is_some_and(|path| path.starts_with(&snapshot)));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cached_main_can_reuse_a_sha_revision_snapshot_and_synthetic_index() {
+        use hf_hub::{Cache, Repo, RepoType};
+
+        let root = tempdir("cache-sha-root");
+        let main_repo = Repo::new("org/model".into(), RepoType::Model);
+        let sha_repo = Repo::with_revision("org/model".into(), RepoType::Model, "deadbeef".into());
+        let snapshot = root
+            .join(main_repo.folder_name())
+            .join("snapshots")
+            .join("deadbeef");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("config.json"), r#"{"model_type":"llama"}"#).unwrap();
+        std::fs::write(
+            snapshot.join(SAFETENSORS_INDEX),
+            r#"{"weight_map":{"x":"model.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let cache = Cache::new(root.clone());
+        cache.repo(sha_repo).create_ref("deadbeef").unwrap();
+        let cached_main = cache.repo(main_repo);
+        cached_main.create_ref("deadbeef").unwrap();
+
+        let metadata = metadata_from_cached_main("org/model", &cached_main).unwrap();
+        assert_eq!(metadata.revision(), Some("deadbeef"));
+        assert!(metadata.path(SAFETENSORS_INDEX).is_some());
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -1260,6 +1513,42 @@ mod tests {
         assert!(error
             .to_string()
             .contains("invalid safetensors header length"));
+    }
+
+    #[test]
+    fn monolithic_safetensors_validates_tensor_layout() {
+        let check = |value: serde_json::Value, payload| {
+            let header = serde_json::to_vec(&value).unwrap();
+            synthesize_index_from_header(
+                &header,
+                header.len() as u64,
+                Some(8 + header.len() as u64 + payload),
+            )
+        };
+
+        let bad_dtype = check(
+            serde_json::json!({"w":{"dtype":"NOPE","shape":[1],"data_offsets":[0,1]}}),
+            1,
+        )
+        .unwrap_err();
+        assert!(bad_dtype.to_string().contains("unsupported dtype"));
+
+        let bad_size = check(
+            serde_json::json!({"w":{"dtype":"BF16","shape":[2],"data_offsets":[0,2]}}),
+            2,
+        )
+        .unwrap_err();
+        assert!(bad_size.to_string().contains("require 4 bytes"));
+
+        let overlap = check(
+            serde_json::json!({
+                "a":{"dtype":"U8","shape":[2],"data_offsets":[0,2]},
+                "b":{"dtype":"U8","shape":[2],"data_offsets":[1,3]}
+            }),
+            3,
+        )
+        .unwrap_err();
+        assert!(overlap.to_string().contains("overlapping"));
     }
 
     #[test]
