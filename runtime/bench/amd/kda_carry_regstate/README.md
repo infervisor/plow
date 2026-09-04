@@ -34,6 +34,11 @@ Exact shape `T8192,H12,D128,V128,BT64`, 21 order-rotated samples; oracle also pa
 | --- | ---: | ---: | --- |
 | control V16/WG512 | 1.916 ms | -- | VGPR 204, SGPR 68, occupancy 2, no spill |
 | regstate V16/WG256 | 0.726 ms | -62.1% (2.64x) | VGPR 235, SGPR 53, LDS 43,520 B, no spill |
+| regstate hwcvt V16/WG256 (bench-only) | 0.572 ms | -70.2% (3.36x) | VGPR 238, SGPR 48, LDS 43,520 B, no spill |
+
+Both candidate arms matched all 12,582,912 BF16 outputs and 196,608 FP32 state elements. The
+hardware-convert arm is exact on every finite input but may differ in NaN payload, so the
+shipped object uses the software RNE.
 
 Per-chunk `s_memtime` attribution (wave 0, mean over 96 workgroups x 128 chunks):
 
