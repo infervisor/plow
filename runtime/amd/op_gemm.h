@@ -2047,12 +2047,102 @@ __device__ __forceinline__ void stage_x_lds(bf16* __restrict__ lds, const bf16* 
  * AND vmcnt. Not just the x reads: the whole WEIGHT STREAM went flat, and the 16-byte
  * loads decayed into `flat_load_ushort` -- two bytes at a time, in the loop that moves
  * 57 GiB per token. One ternary. */
+/* PLOW_GV_DYNCLAIM — PROTOTYPE, default OFF: dynamic row claiming inside a decode GEMV packet.
+ *
+ * THE TAIL IT TARGETS (gfx950 TP8 K3 decode trace, scripts/k3_trace_wg.py): a b=256 GEMV packet
+ * spans 14.9 us from its first gate-open to its last workgroup's end against a 9.2 us median
+ * body. The last workgroup is not slow — it is LATE: it was the straggler of the previous packet,
+ * arrives 2.6 us after the gate opened, and then still has to run a whole static slice
+ * ([slice*per, slice*per+per) under GV_BLOCKED). Bodies also vary 3.3 us min-to-max. Both are
+ * load-balance, and the interpreter's global queue only balances at SLICE granularity.
+ *
+ * MECHANISM. Every slice keeps a STATIC prefix of (100-GV_DYN_POOL_PCT)% of its rows — the
+ * workgroup that claimed the slice always runs those, no atomic — and donates the rest to a
+ * per-packet POOL of `rb`-row items (rb = one row per wave, or R per wave on the R-split arm).
+ * Items are claimed with one agent-scope fetch-add by lane 0 of the LAST wave, broadcast through
+ * one LDS word, and the claim for item i+1 is issued before item i is computed so its round trip
+ * hides behind the loads (vmcnt is in-order, so the claimer is the wave with the least static
+ * work). A late workgroup finds the pool drained and finishes after its prefix alone.
+ *
+ * WHERE THE CURSOR LIVES: u32[GV_DYN_CTR_WORD] of the packet's OWN counter line. The line is
+ * unique to the packet (one counter per packet, dev_isa.h), 128 B wide with only u32[0] in use,
+ * and re-zeroed with the counters every token. No host or blob change. Refused for SE_FINE
+ * producers (their per-slice counters mean "these columns are done") and cross-GPU entries.
+ *
+ * BIT-EXACT: a row's chunk order, lane->k map, accumulation and wave_sum never depend on which
+ * workgroup or wave runs it; only the row->workgroup map moves. `PLOW_FINE`'s gemv->headnorm
+ * column map is the one consumer of that map, hence the SE_FINE refusal above. */
+#ifndef PLOW_GV_DYNCLAIM
+#define PLOW_GV_DYNCLAIM 0
+#endif
+/* Decode objects only. The flag arrives through PLOW_HSACO_EXTRA_DEFINES, which every object
+ * sees; the prefill buckets must stay byte-identical so a decode A/B is a decode A/B. */
+#if PLOW_GV_DYNCLAIM && !PLOW_BUCKET_DECODE
+#undef PLOW_GV_DYNCLAIM
+#define PLOW_GV_DYNCLAIM 0
+#endif
+#if PLOW_GV_DYNCLAIM
+#ifndef GV_DYN_POOL_PCT
+#define GV_DYN_POOL_PCT 50
+#endif
+#ifndef GV_DYN_MIN_BLK
+#define GV_DYN_MIN_BLK 64
+#endif
+#define GV_DYN_CTR_WORD 16u
+#define GV_DYN_SLOT_HALVES 8u
+#ifndef GV_DYN_SLOT_OFS
+#define GV_DYN_SLOT_OFS (GM_LDS_HALVES - GV_NORM_SCRATCH - GV_DYN_SLOT_HALVES)
+#endif
+#define GV_DYN_CLAIM_TID (PLOW_THREADS - PLOW_WAVE)
+#define GV_DYN_PARAM , uint32_t* gv_cur
+#define GV_DYN_PARAM_DEF , uint32_t* gv_cur = nullptr
+#define GV_DYN_ARG , gv_cur
+__device__ __forceinline__ bool gv_dyn_on(const uint32_t* cur, unsigned nblk, bool xlds,
+                                          size_t staged_halves) {
+    return cur != nullptr && xlds && nblk >= (unsigned)GV_DYN_MIN_BLK &&
+           staged_halves + GV_NORM_SCRATCH + GV_DYN_SLOT_HALVES <= GM_LDS_HALVES;
+}
+/* Walk this slice's static prefix, then pool items until the packet's pool is empty. `run(r0, r1)`
+ * computes rows [r0, r1) with every wave participating; it is called a workgroup-uniform number of
+ * times, so it may contain barriers of its own. Every thread returns together. */
+template <class F>
+__device__ __forceinline__ void gv_dyn_walk(uint32_t* cur, const bf16* lds, unsigned per,
+                                            unsigned n0, unsigned n1, unsigned nblk, unsigned N,
+                                            unsigned rb, F&& run) {
+    const unsigned pool = per * (unsigned)GV_DYN_POOL_PCT / 100u;
+    const unsigned sp = per - pool;
+    const unsigned ipb = (pool + rb - 1u) / rb;
+    const unsigned n_items = nblk * ipb;
+    unsigned* const slot = (unsigned*)(const_cast<bf16*>(lds) + GV_DYN_SLOT_OFS);
+    const bool claimer = threadIdx.x == (unsigned)GV_DYN_CLAIM_TID;
+    unsigned nxt = 0;
+    if (claimer) nxt = __hip_atomic_fetch_add(cur, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    unsigned r0 = n0, r1 = (n0 + sp < n1) ? n0 + sp : n1;
+    for (;;) {
+        run(r0, r1);
+        __syncthreads(); /* every wave is done with the previous range; the slot is free */
+        if (claimer) *slot = nxt;
+        __syncthreads();
+        const unsigned it = __builtin_amdgcn_readfirstlane(*slot);
+        if (it >= n_items) break;
+        if (claimer) nxt = __hip_atomic_fetch_add(cur, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        const unsigned s = it / ipb;
+        const unsigned e = (s * per + per < N) ? s * per + per : N;
+        r0 = s * per + sp + (it - s * ipb) * rb;
+        r1 = (r0 + rb < e) ? r0 + rb : e;
+    }
+}
+#else
+#define GV_DYN_PARAM
+#define GV_DYN_PARAM_DEF
+#define GV_DYN_ARG
+#endif
 template <int MM, bool XLDS, bool NORM, int UN = GV_UNROLL>
 __device__ __forceinline__ void gemv_rows(bf16* __restrict__ C_, const bf16* __restrict__ x_,
                                           const bf16* __restrict__ W_, const float* __restrict__ rms_,
                                           const bf16* __restrict__ gamma_, unsigned M, unsigned N,
                                           unsigned K, unsigned slice, unsigned nblk,
-                                          const bf16* lds) {
+                                          const bf16* lds GV_DYN_PARAM_DEF) {
     const unsigned lane = threadIdx.x & 63;
     const unsigned wave = threadIdx.x >> 6;
     const unsigned n_waves = nblk * PLOW_WAVES;
@@ -2186,7 +2276,13 @@ __device__ __forceinline__ void gemv_rows(bf16* __restrict__ C_, const bf16* __r
     const unsigned blk_halves = blk_rows * K;
     const __amdgpu_buffer_rsrc_t wrb = buf_rsrc(W + (size_t)gv_n0 * K, blk_halves);
 #endif
+#if PLOW_GV_DYNCLAIM
+    /* The per-row body, so the dynamic-claim item loop below can run the SAME code over a
+     * claimed range. Bit-exact by construction: nothing in a row depends on `slice`. */
+    auto gv_row = [&](unsigned n) {
+#else
     for (unsigned n = gv_n0 + wave; n < gv_n1; n += PLOW_WAVES) {
+#endif
 #else
     for (unsigned n = slice * PLOW_WAVES + wave; n < N; n += n_waves) {
 #endif
@@ -2279,7 +2375,19 @@ __device__ __forceinline__ void gemv_rows(bf16* __restrict__ C_, const bf16* __r
 #endif
             if (lane == 0 && (unsigned)m < M) st_act1(&C[(size_t)m * N + n], f2bf(t));
         }
+#if PLOW_GV_DYNCLAIM && GV_BLOCKED
+    };
+    if (gv_dyn_on(gv_cur, nblk, XLDS, (size_t)M * K)) {
+        gv_dyn_walk(gv_cur, lds, gv_per, gv_n0, gv_n1, nblk, N, PLOW_WAVES,
+                    [&](unsigned r0, unsigned r1) {
+                        for (unsigned n = r0 + wave; n < r1; n += PLOW_WAVES) gv_row(n);
+                    });
+        return;
     }
+    for (unsigned n = gv_n0 + wave; n < gv_n1; n += PLOW_WAVES) gv_row(n);
+#else
+    }
+#endif
 }
 
 /* ------------- R OUTPUT COLUMNS PER WAVE-STEP, for the SHORT-ROW shapes ------------------
@@ -2405,17 +2513,32 @@ template <int MM, bool XLDS, int UN, int R>
 __device__ __forceinline__ void gemv_rows_rs(bf16* __restrict__ C, const bf16* __restrict__ x,
                                              const bf16* __restrict__ W, unsigned M, unsigned N,
                                              unsigned K, unsigned slice, unsigned nblk,
-                                             const bf16* lds) {
+                                             const bf16* lds GV_DYN_PARAM_DEF) {
     const unsigned lane = threadIdx.x & 63;
     const unsigned wave = threadIdx.x >> 6;
     const unsigned gv_per = (N + nblk - 1) / nblk;
     const unsigned gv_n0 = slice * gv_per;
     const unsigned gv_n1 = (gv_n0 + gv_per < N) ? (gv_n0 + gv_per) : N;
+#if PLOW_GV_DYNCLAIM
+    auto run = [&](unsigned r0, unsigned r1) {
+        unsigned n = r0 + wave;
+        for (; n + (unsigned)(R - 1) * PLOW_WAVES < r1; n += PLOW_WAVES * (unsigned)R)
+            gemv_rows_r<MM, XLDS, UN, R>(C, x, W, M, N, K, n, lane, lds);
+        for (; n < r1; n += PLOW_WAVES)
+            gemv_rows_r<MM, XLDS, GV_UNROLL, 1>(C, x, W, M, N, K, n, lane, lds);
+    };
+    if (gv_dyn_on(gv_cur, nblk, XLDS, (size_t)M * K)) {
+        gv_dyn_walk(gv_cur, lds, gv_per, gv_n0, gv_n1, nblk, N, PLOW_WAVES * (unsigned)R, run);
+        return;
+    }
+    run(gv_n0, gv_n1);
+#else
     unsigned n = gv_n0 + wave;
     for (; n + (unsigned)(R - 1) * PLOW_WAVES < gv_n1; n += PLOW_WAVES * (unsigned)R)
         gemv_rows_r<MM, XLDS, UN, R>(C, x, W, M, N, K, n, lane, lds);
     for (; n < gv_n1; n += PLOW_WAVES)
         gemv_rows_r<MM, XLDS, GV_UNROLL, 1>(C, x, W, M, N, K, n, lane, lds);
+#endif
 }
 
 /* ---- OPT-IN (PLOW_GEMV_LG=1): NARROW-K LANE-GROUP bf16 GEMV ----------- [BF16-GEMV-NARROWK-LG]
@@ -4160,7 +4283,8 @@ template <int MM, int UN = gv_unroll_for(MM)>
 __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
                          const bf16* __restrict__ W, const float* __restrict__ rms,
                          const bf16* __restrict__ gamma, unsigned M, unsigned N, unsigned K,
-                         int norm, float eps, unsigned slice, unsigned nblk, bf16* lds) {
+                         int norm, float eps, unsigned slice, unsigned nblk,
+                         bf16* lds GV_DYN_PARAM_DEF) {
     /* norm == 2 folds the producing RMSNORM in. It is legal ONLY on the staged arm and only
      * for a row d_rmsnorm's `fits` path would have taken; the emitter enforces both, and this
      * demotes rather than trusting it, because the failure mode otherwise is reducing over an
@@ -4257,11 +4381,14 @@ __device__ void d_gemv_t(bf16* __restrict__ C, const bf16* __restrict__ x,
 #endif
             if constexpr (MM == 1 && GV_RS_R > 1) {
                 if ((K + PLOW_WAVE * 8 - 1) / (PLOW_WAVE * 8) >= (unsigned)GV_RS_MAXNCH)
-                    gemv_rows<MM, true, false, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
+                    gemv_rows<MM, true, false, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk,
+                                                   lds GV_DYN_ARG);
                 else
-                    gemv_rows_rs<MM, true, GV_RS_UN, GV_RS_R>(C, x, W, M, N, K, slice, nblk, lds);
+                    gemv_rows_rs<MM, true, GV_RS_UN, GV_RS_R>(C, x, W, M, N, K, slice, nblk,
+                                                              lds GV_DYN_ARG);
             } else
-                gemv_rows<MM, true, false, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk, lds);
+                gemv_rows<MM, true, false, UN>(C, x, W, rms, gamma, M, N, K, slice, nblk,
+                                               lds GV_DYN_ARG);
 #endif
         }
     } else {
@@ -4523,7 +4650,7 @@ __device__ void d_gemv_qkv(bf16* Cq, bf16* Ck, bf16* Cv, const bf16* x, const bf
 #endif
 __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
                        const bf16* gamma, unsigned M, unsigned N, unsigned K, int norm,
-                       float eps, unsigned slice, unsigned nblk, bf16* lds) {
+                       float eps, unsigned slice, unsigned nblk, bf16* lds GV_DYN_PARAM_DEF) {
   gemv_walk(M, [&](unsigned m0, unsigned M_) {
     /* `rms` is the PER-ROW norm scalar (gamma is per-K and does not move). d_gemv_t's own
      * LDS-fit test now sees M_ <= PLOW_GEMV_MM, which is what makes the staged arm reachable
@@ -4533,15 +4660,15 @@ __device__ void d_gemv(bf16* C, const bf16* x, const bf16* W, const float* rms,
     const float* rms_ = (norm == 1) ? rms + m0 : rms;
 #if defined(PLOW_GEMV_PERK)
     if (K == 8192)        /* o_proj (31B): nchunk 16 -> all 16 in flight, one group */
-        d_gemv_t<PLOW_GEMV_MM, GV_UN_K8192>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        d_gemv_t<PLOW_GEMV_MM, GV_UN_K8192>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds GV_DYN_ARG);
     else if (K == 4096)   /* o_proj (Qwen): nchunk 8 */
-        d_gemv_t<PLOW_GEMV_MM, 8>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        d_gemv_t<PLOW_GEMV_MM, 8>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds GV_DYN_ARG);
     else if (K <= 2560)   /* lm_head / small-K (Qwen): nchunk <= 5 */
-        d_gemv_t<PLOW_GEMV_MM, 5>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        d_gemv_t<PLOW_GEMV_MM, 5>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds GV_DYN_ARG);
     else                  /* down (31B) K=21504, lm_head (31B) K=5376, Qwen down K=9728: keep 11 */
-        d_gemv_t<PLOW_GEMV_MM>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+        d_gemv_t<PLOW_GEMV_MM>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds GV_DYN_ARG);
 #else
-    d_gemv_t<PLOW_GEMV_MM>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds);
+    d_gemv_t<PLOW_GEMV_MM>(C_, x_, W, rms_, gamma, M_, N, K, norm, eps, slice, nblk, lds GV_DYN_ARG);
 #endif
     if (PLOW_GEMV_WALK) __syncthreads();
   });
