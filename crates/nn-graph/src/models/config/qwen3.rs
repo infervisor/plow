@@ -24,6 +24,11 @@ pub struct Qwen3Config {
     pub head_dim: Option<i64>,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    /// Qwen2/Qwen2.5 stores bias on Q/K/V projections; Qwen3 does not.
+    pub qkv_bias: bool,
+    /// Qwen3 normalizes Q/K per head before RoPE; Qwen2/Qwen2.5 does not.
+    #[serde(default = "default_true")]
+    pub use_qk_norm: bool,
     #[serde(default = "default_tie")]
     pub tie_word_embeddings: bool,
     #[serde(alias = "dtype")]
@@ -43,10 +48,16 @@ impl Default for Qwen3Config {
             head_dim: None,
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
+            qkv_bias: false,
+            use_qk_norm: true,
             tie_word_embeddings: true,
             torch_dtype: None,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Qwen3Config {

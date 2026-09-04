@@ -165,6 +165,38 @@ pub enum Op {
         num_experts: u32,
         top_k: u32,
         group: Option<MoeGroups>,
+        scoring: MoeScoring,
+        norm_topk: bool,
+        route_scale: f32,
+        correction_bias: bool,
+    },
+
+    /// Data-dependent routed-expert SwiGLU dispatch and weighted combine.
+    /// Inputs `[x, routes]`; the exhaustive checkpoint names live in
+    /// `Graph::expert_bindings`, avoiding `3 * num_experts` compute nodes.
+    MoeExperts {
+        num_experts: u32,
+        top_k: u32,
+        intermediate_size: u32,
+        block_fp8: bool,
+    },
+
+    /// GLM DSA indexer. Inputs are hidden state, normalized query latent,
+    /// wq_b, wk, k_norm weight/bias, and per-head weights projection.
+    DsaIndexer {
+        num_heads: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        top_k: u32,
+        theta: f32,
+    },
+
+    /// Sparse causal MLA consuming DSA top-k positions as input 3.
+    DsaAttention {
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        top_k: u32,
     },
 
     /// Depthwise causal 1-D convolution over the sequence axis, `[B, S, C]`.
@@ -265,6 +297,12 @@ pub struct MoeGroups {
     pub topk_group: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MoeScoring {
+    Softmax,
+    Sigmoid,
+}
+
 /// Which linear-attention recurrence [`Op::LinearAttention`] carries.
 ///
 /// One variant today. It exists as an enum rather than being implied by the op
@@ -308,6 +346,9 @@ impl Op {
             Op::Slice { .. } => "slice",
             Op::Reduce { .. } => "reduce",
             Op::MoeRouter { .. } => "moe_router",
+            Op::MoeExperts { .. } => "moe_experts",
+            Op::DsaIndexer { .. } => "dsa_indexer",
+            Op::DsaAttention { .. } => "dsa_attention",
             Op::Conv1dDepthwise { .. } => "conv1d_depthwise",
             Op::LinearAttention { .. } => "linear_attention",
             Op::SituGlu { .. } => "situ_glu",

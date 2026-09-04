@@ -89,9 +89,27 @@ fn attention(
     let q_dim = nh as i64 * hd;
     let kv_dim = nkv as i64 * hd;
 
-    let q = nn.linear(&format!("{prefix}.self_attn.q_proj"), x, h, q_dim, false);
-    let k = nn.linear(&format!("{prefix}.self_attn.k_proj"), x, h, kv_dim, false);
-    let v = nn.linear(&format!("{prefix}.self_attn.v_proj"), x, h, kv_dim, false);
+    let q = nn.linear(
+        &format!("{prefix}.self_attn.q_proj"),
+        x,
+        h,
+        q_dim,
+        cfg.qkv_bias,
+    );
+    let k = nn.linear(
+        &format!("{prefix}.self_attn.k_proj"),
+        x,
+        h,
+        kv_dim,
+        cfg.qkv_bias,
+    );
+    let v = nn.linear(
+        &format!("{prefix}.self_attn.v_proj"),
+        x,
+        h,
+        kv_dim,
+        cfg.qkv_bias,
+    );
 
     // Split heads: [B, S, n*hd] -> [B, S, n, hd].
     let q = nn.reshape(
@@ -107,19 +125,25 @@ fn attention(
         [b.clone(), s.clone(), Dim::stat(nkv as i64), Dim::stat(hd)],
     );
 
-    // Qwen3 per-head qk-norm (RMSNorm over head_dim), then RoPE.
-    let q = nn.rmsnorm(
-        &format!("{prefix}.self_attn.q_norm"),
-        q,
-        hd,
-        cfg.rms_norm_eps,
-    );
-    let k = nn.rmsnorm(
-        &format!("{prefix}.self_attn.k_norm"),
-        k,
-        hd,
-        cfg.rms_norm_eps,
-    );
+    // Qwen3 adds per-head Q/K RMSNorm. Qwen2/Qwen2.5 goes directly to RoPE.
+    let (q, k) = if cfg.use_qk_norm {
+        (
+            nn.rmsnorm(
+                &format!("{prefix}.self_attn.q_norm"),
+                q,
+                hd,
+                cfg.rms_norm_eps,
+            ),
+            nn.rmsnorm(
+                &format!("{prefix}.self_attn.k_norm"),
+                k,
+                hd,
+                cfg.rms_norm_eps,
+            ),
+        )
+    } else {
+        (q, k)
+    };
     let q = nn.rope(q, hd as u32, cfg.rope_theta);
     let k = nn.rope(k, hd as u32, cfg.rope_theta);
 

@@ -488,8 +488,74 @@ fn op_kind(g: &Graph, id: NodeId, node: &Node) -> Result<OpKind, BridgeError> {
             node.inputs.len() as i64,
             [*num_heads, *head_dim, 1, 0], // arg2: fp32 recurrent state/math
         ),
-        // MoE router: softmax(x·W) → topk. Row-wise reduction (2 inputs: x + weight).
-        Op::MoeRouter { .. } => row(2, true),
+        Op::MoeRouter {
+            num_experts,
+            top_k,
+            group,
+            scoring,
+            norm_topk,
+            route_scale,
+            correction_bias,
+        } => {
+            let group = group.unwrap_or(nn_graph::op::MoeGroups {
+                n_group: 1,
+                topk_group: 1,
+            });
+            let flags = u32::from(matches!(scoring, nn_graph::op::MoeScoring::Sigmoid))
+                | (u32::from(*norm_topk) << 1)
+                | (u32::from(*correction_bias) << 2);
+            model(
+                ModelOpKind::MoeRouter,
+                node.inputs.len() as i64,
+                [
+                    *num_experts,
+                    *top_k,
+                    group.n_group | (group.topk_group << 16) | (flags << 24),
+                    route_scale.to_bits(),
+                ],
+            )
+        }
+        Op::MoeExperts {
+            num_experts,
+            top_k,
+            intermediate_size,
+            block_fp8,
+        } => model(
+            ModelOpKind::MoeExperts,
+            2,
+            [
+                *num_experts,
+                *top_k,
+                *intermediate_size,
+                u32::from(*block_fp8),
+            ],
+        ),
+        Op::DsaIndexer {
+            num_heads,
+            head_dim,
+            rope_dim,
+            top_k,
+            theta,
+        } => model(
+            ModelOpKind::DsaIndexer,
+            7,
+            [
+                *num_heads | (*head_dim << 16),
+                *rope_dim,
+                *top_k,
+                theta.to_bits(),
+            ],
+        ),
+        Op::DsaAttention {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            top_k,
+        } => model(
+            ModelOpKind::DsaAttention,
+            4,
+            [*num_heads, *num_kv_heads, *head_dim, *top_k],
+        ),
         _ => return Err(BridgeError::Unsupported { node: ni, op: name }),
     })
 }

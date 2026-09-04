@@ -43,6 +43,12 @@ const KIMI_CONFIG: &str = r#"{
     "num_experts_per_tok": 2,
     "moe_intermediate_size": 256,
     "first_k_dense_replace": 2,
+    "scoring_func": "sigmoid",
+    "topk_method": "noaux_tc",
+    "n_group": 1,
+    "topk_group": 1,
+    "norm_topk_prob": true,
+    "routed_scaling_factor": 2.827,
     "torch_dtype": "bfloat16"
 }"#;
 

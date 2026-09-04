@@ -26,6 +26,44 @@ fn graph_weights(g: &nn_graph::Graph) -> BTreeSet<String> {
         .collect()
 }
 
+/// Weight leaves consumed by the compute DAG. Routed-expert parameters live in
+/// the compact expert manifest instead of cloning every expert into the DAG.
+fn graph_dag_weights(g: &nn_graph::Graph) -> BTreeSet<String> {
+    g.nodes
+        .iter()
+        .flat_map(|node| node.inputs.iter())
+        .filter_map(|id| {
+            let tensor = g.tensor(*id);
+            matches!(tensor.origin, Origin::Weight)
+                .then(|| tensor.name.clone())
+                .flatten()
+        })
+        .collect()
+}
+
+fn assert_expert_bindings_in_checkpoint(g: &nn_graph::Graph) {
+    let mut bound = BTreeSet::new();
+    for layer in &g.expert_bindings {
+        assert_eq!(layer.routed_experts.len(), layer.num_experts as usize);
+        for expert in &layer.routed_experts {
+            for projection in [&expert.gate, &expert.up, &expert.down] {
+                assert!(bound.insert(projection.weight.clone()));
+                if let Some(scale) = &projection.scale {
+                    assert!(bound.insert(scale.clone()));
+                }
+            }
+        }
+    }
+
+    let checkpoint_experts = g
+        .checkpoint_manifest()
+        .into_iter()
+        .filter(|weight| weight.name.contains(".mlp.experts."))
+        .map(|weight| weight.name.to_string())
+        .collect();
+    assert_eq!(bound, checkpoint_experts, "expert manifest is incomplete");
+}
+
 // --- Gemma (existing test, kept for parity) ---
 
 const GEMMA: &str = r#"{
@@ -229,7 +267,13 @@ const DEEPSEEK: &str = r#"{
     "n_shared_experts": 1,
     "num_experts_per_tok": 2,
     "moe_intermediate_size": 256,
-    "first_k_dense_replace": 2
+    "first_k_dense_replace": 2,
+    "scoring_func": "sigmoid",
+    "topk_method": "noaux_tc",
+    "n_group": 2,
+    "topk_group": 1,
+    "norm_topk_prob": true,
+    "routed_scaling_factor": 2.5
 }"#;
 
 #[test]
@@ -255,17 +299,15 @@ fn fuse_deepseek() {
         stats.ops_before,
         stats.ops_after
     );
-    // Weight-manifest completeness (excluding MoE router weights: the router's
-    // output is not on the extracted dataflow path — it's scheduling metadata).
+    // Compute-DAG leaves survive fusion; compact expert tensors survive through
+    // the exhaustive checkpoint binding manifest.
     let fw = fused_weights(&fused);
-    let gw: BTreeSet<String> = graph_weights(&g)
-        .into_iter()
-        .filter(|w| !w.ends_with(".mlp.gate.weight"))
-        .collect();
+    let gw = graph_dag_weights(&g);
     assert_eq!(
         fw, gw,
         "fusion dropped or duplicated weight leaves in DeepSeek"
     );
+    assert_expert_bindings_in_checkpoint(&g);
 }
 
 // --- SigLIP (LayerNorm + Conv2d + Transpose + Reduce) ---
@@ -494,6 +536,8 @@ const GLM5: &str = r#"{
     "num_key_value_heads": 4,
     "head_dim": 64,
     "rms_norm_eps": 1e-5,
+    "attention_bias": false,
+    "hidden_act": "silu",
     "q_lora_rank": 64,
     "kv_lora_rank": 32,
     "qk_head_dim": 64,
@@ -501,17 +545,36 @@ const GLM5: &str = r#"{
     "qk_rope_head_dim": 16,
     "v_head_dim": 64,
     "rope_interleave": true,
+    "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
     "first_k_dense_replace": 2,
     "n_routed_experts": 8,
     "n_shared_experts": 1,
     "num_experts_per_tok": 2,
     "moe_intermediate_size": 256,
+    "mlp_layer_types": ["dense", "dense", "sparse", "sparse"],
+    "scoring_func": "sigmoid",
+    "routed_scaling_factor": 2.5,
+    "norm_topk_prob": true,
+    "n_group": 2,
+    "topk_group": 1,
+    "topk_method": "noaux_tc",
+    "moe_router_dtype": "float32",
     "indexer_types": ["full", "full", "full", "shared"],
     "index_head_dim": 32,
     "index_n_heads": 4,
     "index_topk": 64,
+    "index_topk_freq": 1,
+    "indexer_rope_interleave": true,
     "index_skip_topk_offset": 2,
-    "num_nextn_predict_layers": 1
+    "num_nextn_predict_layers": 1,
+    "index_share_for_mtp_iteration": true,
+    "torch_dtype": "bfloat16",
+    "quantization_config": {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128]
+    }
 }"#;
 
 #[test]
@@ -540,22 +603,21 @@ fn fuse_glm() {
         stats.ops_before,
         stats.ops_after
     );
-    // Weight-manifest completeness. Excluded leaves:
-    // - MoE router weights (`.mlp.gate.weight`) — scheduling metadata, not dataflow.
-    // - DSA index_head weights — dead-end side projection (`let _index_score = ...`).
-    // - `lm_head.weight` — merged with `mtp_heads.0.lm_head.weight` during extraction
-    //   (both read from the same norm output; the extractor deduplicates them).
+    // Weight-manifest completeness. FP8 scales and routed expert tensors are
+    // carried by packet metadata rather than the extracted compute dataflow.
+    // The base-model final norm is dead when the fixture's MTP output is used.
     let fw = fused_weights(&fused);
     let gw: BTreeSet<String> = graph_weights(&g)
         .into_iter()
         .filter(|w| {
-            !w.ends_with(".mlp.gate.weight") && !w.contains("index_head") && w != "lm_head.weight"
+            !w.ends_with(".weight_scale_inv") && !w.contains(".mlp.experts.") && w != "norm.weight"
         })
         .collect();
     assert_eq!(
         fw, gw,
         "fusion dropped or duplicated weight leaves in GLM-5.2"
     );
+    assert_expert_bindings_in_checkpoint(&g);
 }
 
 // --- Kimi K2 (Moonshot): MLA + MoE ---
@@ -578,7 +640,13 @@ const KIMI: &str = r#"{
     "n_shared_experts": 1,
     "num_experts_per_tok": 2,
     "moe_intermediate_size": 256,
-    "first_k_dense_replace": 2
+    "first_k_dense_replace": 2,
+    "scoring_func": "sigmoid",
+    "topk_method": "noaux_tc",
+    "n_group": 2,
+    "topk_group": 1,
+    "norm_topk_prob": true,
+    "routed_scaling_factor": 2.827
 }"#;
 
 #[test]
@@ -607,13 +675,12 @@ fn fuse_kimi() {
         stats.ops_before,
         stats.ops_after
     );
-    // Weight-manifest completeness. Exclude MoE router weights (scheduling metadata).
+    // Compute-DAG leaves survive fusion; compact expert tensors survive through
+    // the exhaustive checkpoint binding manifest.
     let fw = fused_weights(&fused);
-    let gw: BTreeSet<String> = graph_weights(&g)
-        .into_iter()
-        .filter(|w| !w.ends_with(".mlp.gate.weight"))
-        .collect();
+    let gw = graph_dag_weights(&g);
     assert_eq!(fw, gw, "fusion dropped or duplicated weight leaves in Kimi");
+    assert_expert_bindings_in_checkpoint(&g);
 }
 
 // --- Kimi K3 (Moonshot): hybrid KDA/MLA + latent MoE ---

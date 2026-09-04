@@ -29,9 +29,7 @@ fn write_metadata(dir: &Path, config: &str) {
         .expect("fixture graph");
     let mut weight_map = BTreeMap::new();
     for weight in graph.checkpoint_manifest() {
-        let name = if weight.name.starts_with("model.language_model.")
-            || weight.name.starts_with("lm_head.")
-        {
+        let name = if weight.name.starts_with("model.") || weight.name.starts_with("lm_head.") {
             weight.name.to_string()
         } else if model_type == "kimi_k3" {
             format!("language_model.model.{}", weight.name)
@@ -123,6 +121,15 @@ const QWEN3: &str = r#"{
   "tie_word_embeddings":false, "torch_dtype":"bfloat16"
 }"#;
 
+const QWEN25: &str = r#"{
+  "architectures":["Qwen2ForCausalLM"], "model_type":"qwen2",
+  "vocab_size":64, "hidden_size":32, "intermediate_size":64,
+  "num_hidden_layers":1, "num_attention_heads":4,
+  "num_key_value_heads":2, "rms_norm_eps":1e-6,
+  "rope_theta":1000000.0, "use_sliding_window":false,
+  "tie_word_embeddings":false, "torch_dtype":"bfloat16"
+}"#;
+
 const GEMMA3: &str = r#"{
   "model_type":"gemma3", "vocab_size":64, "hidden_size":32,
   "intermediate_size":64, "num_hidden_layers":1,
@@ -159,17 +166,23 @@ const DEEPSEEK_V3: &str = r#"{
   "qk_rope_head_dim":4, "qk_nope_head_dim":8, "v_head_dim":8,
   "n_routed_experts":4, "n_shared_experts":1, "num_experts_per_tok":2,
   "moe_intermediate_size":16, "first_k_dense_replace":1,
+  "scoring_func":"sigmoid", "topk_method":"noaux_tc",
+  "n_group":1, "topk_group":1, "norm_topk_prob":true,
+  "routed_scaling_factor":2.5,
   "torch_dtype":"bfloat16"
 }"#;
 
 const KIMI_K2: &str = r#"{
-  "architectures":["KimiForCausalLM"], "model_type":"kimi",
+  "architectures":["DeepseekV3ForCausalLM"], "model_type":"kimi_k2",
   "vocab_size":64, "hidden_size":32, "intermediate_size":64,
   "num_hidden_layers":2, "num_attention_heads":4, "rms_norm_eps":1e-6,
   "rope_theta":10000.0, "q_lora_rank":16, "kv_lora_rank":8,
   "qk_rope_head_dim":4, "qk_nope_head_dim":8, "v_head_dim":8,
   "n_routed_experts":4, "n_shared_experts":1, "num_experts_per_tok":2,
   "moe_intermediate_size":16, "first_k_dense_replace":1,
+  "scoring_func":"sigmoid", "topk_method":"noaux_tc",
+  "n_group":1, "topk_group":1, "norm_topk_prob":true,
+  "routed_scaling_factor":2.827,
   "torch_dtype":"bfloat16"
 }"#;
 
@@ -178,7 +191,8 @@ const GLM53: &str = r#"{
   "architectures":["GlmMoeDsaForCausalLM"], "model_type":"glm_moe_dsa",
   "vocab_size":64, "hidden_size":32, "intermediate_size":64,
   "num_hidden_layers":2, "num_attention_heads":4, "num_key_value_heads":4,
-  "head_dim":8, "q_lora_rank":16, "kv_lora_rank":8,
+  "head_dim":8, "rms_norm_eps":1e-5, "attention_bias":false,
+  "hidden_act":"silu", "q_lora_rank":16, "kv_lora_rank":8,
   "qk_head_dim":12, "qk_nope_head_dim":8, "qk_rope_head_dim":4,
   "v_head_dim":8, "rope_interleave":true,
   "rope_parameters":{"rope_theta":8000000.0,"rope_type":"default"},
@@ -186,8 +200,15 @@ const GLM53: &str = r#"{
   "num_experts_per_tok":2, "moe_intermediate_size":16,
   "mlp_layer_types":["dense","sparse"], "indexer_types":["full","shared"],
   "index_head_dim":8, "index_n_heads":2, "index_topk":4,
+  "index_topk_freq":4, "indexer_rope_interleave":true,
   "index_skip_topk_offset":1, "num_nextn_predict_layers":1,
-  "scoring_func":"sigmoid", "dtype":"bfloat16"
+  "index_share_for_mtp_iteration":true,
+  "scoring_func":"sigmoid", "norm_topk_prob":true,
+  "routed_scaling_factor":2.5, "n_group":1, "topk_group":1,
+  "topk_method":"noaux_tc", "moe_router_dtype":"float32",
+  "dtype":"bfloat16",
+  "quantization_config":{"activation_scheme":"dynamic","fmt":"e4m3",
+    "quant_method":"fp8","weight_block_size":[128,128]}
 }"#;
 
 // Scaled google/gemma-4-31B text tower; the official wrapper is model_type gemma4.
@@ -281,9 +302,13 @@ fn representative_hf_models_compile_from_metadata_only_for_selected_gpu() {
     for (family, config, gpu, hbm_capacity) in [
         ("llama", LLAMA, "h100", 80_u64 << 30),
         ("qwen3", QWEN3, "rtx6000", 96_u64 << 30),
+        ("qwen25", QWEN25, "h100", 80_u64 << 30),
         ("gemma3", GEMMA3, "h100", 80_u64 << 30),
         ("qwen35", QWEN35, "rtx6000", 96_u64 << 30),
         ("gemma4", GEMMA4, "rtx6000", 96_u64 << 30),
+        ("deepseek-v3", DEEPSEEK_V3, "h100", 80_u64 << 30),
+        ("kimi-k2", KIMI_K2, "rtx6000", 96_u64 << 30),
+        ("glm53", GLM53, "rtx6000", 96_u64 << 30),
     ] {
         let metadata = tempdir(&format!("{family}-source"));
         let out = tempdir(&format!("{family}-out"));
@@ -330,6 +355,39 @@ fn representative_hf_models_compile_from_metadata_only_for_selected_gpu() {
         std::fs::remove_dir_all(metadata).ok();
         std::fs::remove_dir_all(out).ok();
     }
+}
+
+#[test]
+fn tensor_parallel_hbm_reports_per_device_expert_weights() {
+    let metadata = tempdir("deepseek-tp-hbm-source");
+    let one_out = tempdir("deepseek-tp-hbm-one");
+    let two_out = tempdir("deepseek-tp-hbm-two");
+    write_metadata(&metadata, DEEPSEEK_V3);
+
+    let one = compile(
+        &Source::Model(metadata.to_string_lossy().into_owned()),
+        &options(one_out.clone(), "h100"),
+    )
+    .unwrap();
+    let mut two_opts = options(two_out.clone(), "h100");
+    two_opts.num_gpus = 2;
+    let two = compile(
+        &Source::Model(metadata.to_string_lossy().into_owned()),
+        &two_opts,
+    )
+    .unwrap();
+
+    let one_weights = one.assets.unwrap().regions.weights;
+    let two_assets = two.assets.unwrap();
+    assert_eq!(two_assets.regions.weights, one_weights.div_ceil(2));
+    assert_eq!(
+        two_assets.regions.total_hbm_peak,
+        two_assets.regions.arena_peak + two_assets.regions.weights
+    );
+
+    std::fs::remove_dir_all(metadata).ok();
+    std::fs::remove_dir_all(one_out).ok();
+    std::fs::remove_dir_all(two_out).ok();
 }
 
 #[test]
@@ -455,21 +513,6 @@ fn packet_routes_missing_from_model_source_fail_closed_instead_of_generic_loweri
             "moonshotai/Kimi-K3",
             KIMI_K3,
             "Kimi-K3 is supported by the dedicated MI355X devblob emitter",
-        ),
-        (
-            "moonshotai/Kimi-K2-Instruct",
-            KIMI_K2,
-            "Kimi-K2 MoE scheduled packets currently model only one representative routed expert",
-        ),
-        (
-            "deepseek-ai/DeepSeek-V3",
-            DEEPSEEK_V3,
-            "DeepSeek MoE scheduled packets currently model only one representative routed expert",
-        ),
-        (
-            "zai-org/GLM-5.3",
-            GLM53,
-            "GLM-5.3 scheduled packets do not yet bind the official DSA indexer",
         ),
         (
             "MiniMaxAI/MiniMax-M2",

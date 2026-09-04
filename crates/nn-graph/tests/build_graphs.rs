@@ -110,6 +110,49 @@ fn qwen35_hybrid_decoder() {
 }
 
 #[test]
+fn qwen25_uses_qkv_bias_without_qk_norm() {
+    let cfg = r#"{
+        "architectures":["Qwen2ForCausalLM"], "model_type":"qwen2",
+        "vocab_size":64, "hidden_size":32, "intermediate_size":64,
+        "num_hidden_layers":1, "num_attention_heads":4,
+        "num_key_value_heads":2, "rms_norm_eps":1e-6,
+        "rope_theta":1000000.0, "use_sliding_window":false,
+        "tie_word_embeddings":false, "torch_dtype":"bfloat16"
+    }"#;
+    let graph = build_text_generation_from_config_json_at(cfg, &ShapeBucket::default())
+        .expect("build Qwen2.5 decoder");
+    assert_fully_inferred(&graph);
+    let weights = graph
+        .checkpoint_manifest()
+        .into_iter()
+        .map(|weight| weight.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(weights.len(), 15);
+    for name in [
+        "layers.0.self_attn.q_proj.bias",
+        "layers.0.self_attn.k_proj.bias",
+        "layers.0.self_attn.v_proj.bias",
+    ] {
+        assert!(weights.contains(name), "missing Qwen2.5 tensor {name}");
+    }
+    assert!(!weights.iter().any(|name| name.ends_with("q_norm.weight")));
+    assert!(!weights.iter().any(|name| name.ends_with("k_norm.weight")));
+}
+
+#[test]
+fn qwen2_sliding_window_fails_closed() {
+    let cfg = r#"{
+        "model_type":"qwen2", "use_sliding_window":true,
+        "vocab_size":64, "hidden_size":32, "intermediate_size":64,
+        "num_hidden_layers":1, "num_attention_heads":4,
+        "num_key_value_heads":2
+    }"#;
+    let error = build_text_generation_from_config_json_at(cfg, &ShapeBucket::default())
+        .expect_err("unsupported Qwen2 sliding attention must not become full attention");
+    assert!(error.to_string().contains("sliding-window attention"));
+}
+
+#[test]
 fn qwen35_weight_manifest_matches_target_checkpoint_layout() {
     let g = build_text_generation_from_config_json_at(qwen35_json(), &ShapeBucket::default())
         .expect("build Qwen3.5/3.8 text decoder");
@@ -491,7 +534,10 @@ fn deepseek_without_q_lora() {
         "n_shared_experts": 0,
         "num_experts_per_tok": 2,
         "moe_intermediate_size": 64,
-        "first_k_dense_replace": 1
+        "first_k_dense_replace": 1,
+        "scoring_func": "sigmoid", "topk_method": "noaux_tc",
+        "n_group": 1, "topk_group": 1, "norm_topk_prob": true,
+        "routed_scaling_factor": 2.827
     }"#;
     let g = build_from_config_json(cfg).expect("build deepseek-lite");
     assert_fully_inferred(&g);
@@ -1105,6 +1151,8 @@ fn glm_moe_dsa() {
         "num_key_value_heads": 4,
         "head_dim": 48,
         "rms_norm_eps": 1e-5,
+        "attention_bias": false,
+        "hidden_act": "silu",
         "q_lora_rank": 96,
         "kv_lora_rank": 64,
         "qk_head_dim": 64,
@@ -1118,15 +1166,28 @@ fn glm_moe_dsa() {
         "n_shared_experts": 1,
         "num_experts_per_tok": 2,
         "moe_intermediate_size": 128,
+        "norm_topk_prob": true,
+        "routed_scaling_factor": 2.5,
+        "n_group": 1,
+        "topk_group": 1,
+        "topk_method": "noaux_tc",
+        "moe_router_dtype": "float32",
         "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
         "indexer_types": ["full", "full", "full", "shared"],
         "index_head_dim": 32,
         "index_n_heads": 4,
         "index_topk": 64,
+        "index_topk_freq": 4,
+        "indexer_rope_interleave": true,
         "index_skip_topk_offset": 3,
         "num_nextn_predict_layers": 1,
+        "index_share_for_mtp_iteration": true,
         "scoring_func": "sigmoid",
-        "torch_dtype": "bfloat16"
+        "torch_dtype": "bfloat16",
+        "quantization_config": {
+          "activation_scheme":"dynamic", "fmt":"e4m3", "quant_method":"fp8",
+          "weight_block_size":[128,128]
+        }
     }"#;
     let g = build_from_config_json(cfg).expect("build glm");
     assert_fully_inferred(&g);
@@ -1134,17 +1195,17 @@ fn glm_moe_dsa() {
     // Primary output: logits [B, S, vocab].
     assert_eq!(output_shape_str(&g), "[B, S, 1000]");
 
-    // MoE layers 1,2,3 ⇒ 3 routers.
+    // Base MoE layers 1,2,3 plus sparse MTP layer 4.
     assert_eq!(
         g.count_ops(|o| matches!(o, nn_graph::Op::MoeRouter { .. })),
-        3
-    );
-    // MLA broadcast of the shared rotary key: once per layer.
-    assert_eq!(
-        g.count_ops(|o| matches!(o, nn_graph::Op::Broadcast { .. })),
         4
     );
-    // Interleaved RoPE: 2 per layer (q + k) = 8 total.
+    // MLA broadcast of the shared rotary key: once per base/MTP layer.
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::Broadcast { .. })),
+        5
+    );
+    // Interleaved main RoPE: 2 per base/MTP layer = 10 total.
     let rope_count = g.count_ops(|o| {
         matches!(
             o,
@@ -1154,7 +1215,33 @@ fn glm_moe_dsa() {
             }
         )
     });
-    assert_eq!(rope_count, 8);
+    assert_eq!(rope_count, 10);
+
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::DsaIndexer { .. })),
+        4
+    );
+    assert_eq!(
+        g.count_ops(|o| matches!(o, nn_graph::Op::DsaAttention { .. })),
+        5
+    );
+    assert_eq!(g.expert_bindings.len(), 4);
+    assert!(g
+        .expert_bindings
+        .iter()
+        .all(|binding| binding.routed_experts.len() == 8));
+    assert_eq!(g.fp8_scale_bindings.len(), 144);
+    assert_eq!(g.checkpoint_manifest().len(), 335);
+    let names: std::collections::BTreeSet<_> = g
+        .checkpoint_manifest()
+        .into_iter()
+        .map(|weight| weight.name)
+        .collect();
+    assert!(names.contains("layers.0.self_attn.indexer.wq_b.weight"));
+    assert!(names.contains("layers.3.mlp.experts.7.down_proj.weight_scale_inv"));
+    assert!(names.contains("layers.4.eh_proj.weight"));
+    assert!(names.contains("layers.4.shared_head.norm.weight"));
+    assert!(!names.iter().any(|name| name.starts_with("mtp_heads.")));
 
     // Multi-token prediction: 2 outputs total (main + 1 MTP head).
     assert_eq!(g.outputs.len(), 2);
@@ -1172,17 +1259,33 @@ fn glm_architecture_detection() {
         "num_attention_heads": 4,
         "num_key_value_heads": 4,
         "head_dim": 32,
+        "rms_norm_eps": 1e-5,
+        "attention_bias": false,
+        "hidden_act": "silu",
         "q_lora_rank": 48,
         "kv_lora_rank": 32,
         "qk_head_dim": 40,
         "qk_nope_head_dim": 32,
         "qk_rope_head_dim": 8,
         "v_head_dim": 32,
+        "rope_interleave": true,
+        "rope_parameters": {"rope_theta":8000000.0,"rope_type":"default"},
         "n_routed_experts": 4,
         "n_shared_experts": 0,
         "num_experts_per_tok": 2,
         "moe_intermediate_size": 64,
-        "first_k_dense_replace": 1
+        "first_k_dense_replace": 1,
+        "mlp_layer_types":["dense"],
+        "scoring_func":"sigmoid", "routed_scaling_factor":2.5,
+        "norm_topk_prob":true, "n_group":1, "topk_group":1,
+        "topk_method":"noaux_tc", "moe_router_dtype":"float32",
+        "indexer_types":["full"], "index_head_dim":16,
+        "index_n_heads":2, "index_topk":16, "index_topk_freq":4,
+        "indexer_rope_interleave":true, "index_skip_topk_offset":1,
+        "num_nextn_predict_layers":0, "index_share_for_mtp_iteration":true,
+        "dtype":"bfloat16",
+        "quantization_config":{"activation_scheme":"dynamic","fmt":"e4m3",
+          "quant_method":"fp8","weight_block_size":[128,128]}
     }"#;
     let g = build_from_config_json(cfg).expect("build glm via architectures[]");
     assert_fully_inferred(&g);
@@ -1215,7 +1318,10 @@ fn kimi_k2_mla_moe() {
         "n_shared_experts": 1,
         "num_experts_per_tok": 2,
         "moe_intermediate_size": 64,
-        "first_k_dense_replace": 1
+        "first_k_dense_replace": 1,
+        "scoring_func": "sigmoid", "topk_method": "noaux_tc",
+        "n_group": 1, "topk_group": 1, "norm_topk_prob": true,
+        "routed_scaling_factor": 2.827
     }"#;
     let g = build_from_config_json(cfg).expect("build kimi k2");
     assert_fully_inferred(&g);

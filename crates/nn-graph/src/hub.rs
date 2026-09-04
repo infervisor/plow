@@ -5,6 +5,7 @@
 //! therefore uses a fixed allowlist and never follows shard names from the
 //! safetensors index.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::models::{build_text_generation_from_config_json_at, BuildError, ShapeBucket};
@@ -36,6 +37,10 @@ pub const METADATA_FILES: &[&str] = &[
     "vocab.txt",
 ];
 
+const SAFETENSORS_FILE: &str = "model.safetensors";
+const SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
+const MAX_SAFETENSORS_HEADER_BYTES: u64 = 100_000_000;
+
 #[derive(thiserror::Error, Debug)]
 pub enum HubError {
     #[error(transparent)]
@@ -51,7 +56,10 @@ pub struct ModelMetadata {
     revision: Option<String>,
     config_json: String,
     has_vision_config: bool,
+    has_audio_config: bool,
     files: Vec<(String, PathBuf)>,
+    synthetic_index_json: Option<String>,
+    unresolved_optional_files: Vec<String>,
 }
 
 impl ModelMetadata {
@@ -70,6 +78,11 @@ impl ModelMetadata {
         self.has_vision_config
     }
 
+    /// Whether the source checkpoint declares an audio tower.
+    pub fn has_audio_config(&self) -> bool {
+        self.has_audio_config
+    }
+
     /// Resolved path for one allowlisted artifact.
     pub fn path(&self, filename: &str) -> Option<&Path> {
         self.files
@@ -85,27 +98,36 @@ impl ModelMetadata {
 
     /// Names of all metadata artifacts that were resolved.
     pub fn filenames(&self) -> impl Iterator<Item = &str> {
-        self.files.iter().map(|(name, _)| name.as_str())
+        self.files.iter().map(|(name, _)| name.as_str()).chain(
+            self.synthetic_index_json
+                .as_ref()
+                .map(|_| SAFETENSORS_INDEX),
+        )
+    }
+
+    /// Advertised optional metadata files that the Hub did not serve.
+    pub fn unresolved_optional_files(&self) -> &[String] {
+        &self.unresolved_optional_files
+    }
+
+    /// Logical tensor bytes reported by the complete safetensors index.
+    pub fn indexed_total_size(&self) -> Result<Option<u64>, HubError> {
+        let (index, _) = self.index_value()?;
+        Ok(index
+            .get("metadata")
+            .and_then(|metadata| metadata.get("total_size"))
+            .and_then(serde_json::Value::as_u64))
     }
 
     /// Verify the compiler's required checkpoint tensors against the complete
     /// safetensors index.
     pub fn validate_checkpoint_manifest(&self, graph: &Graph) -> Result<(), HubError> {
-        let index_path = self
-            .path("model.safetensors.index.json")
-            .expect("metadata resolution requires a safetensors index");
-        let bytes = std::fs::read(index_path)
-            .map_err(|e| HubError::Hub(format!("cannot read {}: {e}", index_path.display())))?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| HubError::Hub(format!("invalid {}: {e}", index_path.display())))?;
+        let (value, index_label) = self.index_value()?;
         let weight_map = value
             .get("weight_map")
             .and_then(serde_json::Value::as_object)
             .ok_or_else(|| {
-                HubError::Hub(format!(
-                    "{} has no object-valued weight_map",
-                    index_path.display()
-                ))
+                HubError::Hub(format!("{} has no object-valued weight_map", index_label))
             })?;
         if weight_map
             .values()
@@ -113,7 +135,7 @@ impl ModelMetadata {
         {
             return Err(HubError::Hub(format!(
                 "{} has a non-string or empty shard name in weight_map",
-                index_path.display()
+                index_label
             )));
         }
         let indexed = weight_map
@@ -125,33 +147,34 @@ impl ModelMetadata {
             .into_iter()
             .map(|weight| weight.name)
             .collect::<std::collections::BTreeSet<_>>();
+        let indexed_aliases = indexed
+            .iter()
+            .copied()
+            .flat_map(checkpoint_name_aliases)
+            .collect::<std::collections::BTreeSet<_>>();
 
         let missing = expected
             .iter()
             .copied()
-            .filter(|expected_name| {
-                !indexed
-                    .iter()
-                    .any(|indexed_name| checkpoint_name_matches(expected_name, indexed_name))
-            })
+            .filter(|expected_name| !indexed_aliases.contains(expected_name))
             .collect::<Vec<_>>();
         let wrapped_language_model = expected
             .iter()
             .any(|name| name.starts_with("model.language_model."));
+        let omitted_mtp_layers = omitted_mtp_layer_range(&self.config_json);
         let unexpected = indexed
             .iter()
             .copied()
             .filter(|name| checkpoint_tensor_is_text(name, wrapped_language_model))
+            .filter(|name| !checkpoint_tensor_is_omitted_mtp(name, omitted_mtp_layers))
             .filter(|indexed_name| {
-                !expected
-                    .iter()
-                    .any(|expected_name| checkpoint_name_matches(expected_name, indexed_name))
+                !checkpoint_name_aliases(indexed_name).any(|name| expected.contains(name))
             })
             .collect::<Vec<_>>();
         if !missing.is_empty() || !unexpected.is_empty() {
             return Err(HubError::Hub(format!(
                 "{} does not match the compiled text graph: {} missing [{}], {} unexpected [{}]",
-                index_path.display(),
+                index_label,
                 missing.len(),
                 summarize_names(&missing),
                 unexpected.len(),
@@ -190,21 +213,36 @@ impl ModelMetadata {
                 ))
             })?;
         }
+        if let Some(index) = &self.synthetic_index_json {
+            std::fs::write(out.join(SAFETENSORS_INDEX), index).map_err(|e| {
+                HubError::Hub(format!("cannot write synthesized safetensors index: {e}"))
+            })?;
+        }
         let (index_tensors, index_shards) = self.index_counts()?;
+        let mut source_modalities = vec!["text"];
+        if self.has_vision_config() {
+            source_modalities.push("vision");
+        }
+        if self.has_audio_config() {
+            source_modalities.push("audio");
+        }
         let manifest = serde_json::json!({
             "source": self.model_id(),
             "revision": self.revision(),
             "files": self.filenames().collect::<Vec<_>>(),
             "compile_scope": "text_generation",
-            "source_modalities": if self.has_vision_config() {
-                vec!["text", "vision"]
-            } else {
-                vec!["text"]
-            },
+            "source_modalities": source_modalities,
             "compiled_modalities": ["text"],
+            "unresolved_optional_files": self.unresolved_optional_files,
             "safetensors_index": {
                 "tensors": index_tensors,
                 "shards": index_shards,
+                "synthetic": self.synthetic_index_json.is_some(),
+                "source_file": if self.synthetic_index_json.is_some() {
+                    Some(SAFETENSORS_FILE)
+                } else {
+                    None
+                },
             },
             "weight_shards_downloaded": false,
         });
@@ -217,21 +255,12 @@ impl ModelMetadata {
     }
 
     fn index_counts(&self) -> Result<(usize, usize), HubError> {
-        let index_path = self
-            .path("model.safetensors.index.json")
-            .expect("metadata resolution requires a safetensors index");
-        let bytes = std::fs::read(index_path)
-            .map_err(|e| HubError::Hub(format!("cannot read {}: {e}", index_path.display())))?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| HubError::Hub(format!("invalid {}: {e}", index_path.display())))?;
+        let (value, index_label) = self.index_value()?;
         let weight_map = value
             .get("weight_map")
             .and_then(serde_json::Value::as_object)
             .ok_or_else(|| {
-                HubError::Hub(format!(
-                    "{} has no object-valued weight_map",
-                    index_path.display()
-                ))
+                HubError::Hub(format!("{} has no object-valued weight_map", index_label))
             })?;
         if weight_map
             .values()
@@ -239,7 +268,7 @@ impl ModelMetadata {
         {
             return Err(HubError::Hub(format!(
                 "{} has a non-string or empty shard name in weight_map",
-                index_path.display()
+                index_label
             )));
         }
         let shards = weight_map
@@ -249,19 +278,34 @@ impl ModelMetadata {
             .len();
         Ok((weight_map.len(), shards))
     }
+
+    fn index_value(&self) -> Result<(serde_json::Value, String), HubError> {
+        let (bytes, label) = if let Some(index) = &self.synthetic_index_json {
+            (
+                index.as_bytes().to_vec(),
+                "synthesized model.safetensors index".to_string(),
+            )
+        } else {
+            let path = self.path(SAFETENSORS_INDEX).ok_or_else(|| {
+                HubError::Hub("metadata resolution produced no safetensors index".into())
+            })?;
+            let bytes = std::fs::read(path)
+                .map_err(|e| HubError::Hub(format!("cannot read {}: {e}", path.display())))?;
+            (bytes, path.display().to_string())
+        };
+        let value = serde_json::from_slice(&bytes)
+            .map_err(|e| HubError::Hub(format!("invalid {label}: {e}")))?;
+        Ok((value, label))
+    }
 }
 
-fn checkpoint_name_matches(expected: &str, indexed: &str) -> bool {
-    indexed == expected
-        || indexed
-            .strip_prefix("model.")
-            .is_some_and(|name| name == expected)
-        || indexed
-            .strip_prefix("model.language_model.")
-            .is_some_and(|name| name == expected)
-        || indexed
-            .strip_prefix("language_model.model.")
-            .is_some_and(|name| name == expected)
+fn checkpoint_name_aliases(indexed: &str) -> impl Iterator<Item = &str> {
+    const PREFIXES: [&str; 3] = ["model.", "model.language_model.", "language_model.model."];
+    std::iter::once(indexed).chain(
+        PREFIXES
+            .into_iter()
+            .filter_map(move |prefix| indexed.strip_prefix(prefix)),
+    )
 }
 
 fn checkpoint_tensor_is_text(name: &str, wrapped_language_model: bool) -> bool {
@@ -277,12 +321,42 @@ fn checkpoint_tensor_is_text(name: &str, wrapped_language_model: bool) -> bool {
         "vision_model.",
         "model.mm_projector.",
         "multi_modal_projector.",
+        "model.vision_embedder.",
+        "model.embed_audio.",
         "model.mtp.",
         "mtp.",
         "model.multi_token_predictor.",
     ]
     .iter()
     .any(|prefix| name.starts_with(prefix))
+}
+
+fn omitted_mtp_layer_range(config_json: &str) -> Option<(u32, u32)> {
+    let config: serde_json::Value = serde_json::from_str(config_json).ok()?;
+    let model_type = config.get("model_type")?.as_str()?;
+    if !matches!(
+        model_type,
+        "deepseek" | "deepseek_v2" | "deepseek_v3" | "kimi" | "kimi_k2"
+    ) {
+        return None;
+    }
+    let first = u32::try_from(config.get("num_hidden_layers")?.as_u64()?).ok()?;
+    let count = u32::try_from(config.get("num_nextn_predict_layers")?.as_u64()?).ok()?;
+    (count > 0).then_some((first, first.saturating_add(count)))
+}
+
+fn checkpoint_tensor_is_omitted_mtp(name: &str, range: Option<(u32, u32)>) -> bool {
+    let Some((first, end)) = range else {
+        return false;
+    };
+    let Some(layer) = name
+        .strip_prefix("model.layers.")
+        .and_then(|name| name.split('.').next())
+        .and_then(|layer| layer.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    (first..end).contains(&layer)
 }
 
 fn summarize_names(names: &[&str]) -> String {
@@ -313,6 +387,7 @@ pub fn resolve_model_metadata(model_id: &str) -> Result<ModelMetadata, HubError>
     use hf_hub::{api::sync::ApiBuilder, Cache, Repo, RepoType};
 
     let cache = Cache::from_env();
+    let auth_token = cache.token();
     let cached_main = cache.model(model_id.to_string());
     let offline = offline_enabled();
     if offline {
@@ -342,22 +417,33 @@ pub fn resolve_model_metadata(model_id: &str) -> Result<ModelMetadata, HubError>
         RepoType::Model,
         revision.clone(),
     ));
-    let mut files = Vec::new();
     let mut names = available
         .iter()
         .filter(|name| is_metadata_filename(name))
         .cloned()
         .collect::<Vec<_>>();
     names.sort();
-    for name in names {
-        if available.contains(&name) {
-            let path = repo
-                .get(&name)
-                .map_err(|e| HubError::Hub(format!("cannot resolve {model_id}/{name}: {e}")))?;
-            files.push((name, path));
-        }
-    }
-    metadata_from_files(model_id, Some(revision), files)
+    let (files, unresolved_optional_files) =
+        collect_advertised_metadata(model_id, names, |name| {
+            repo.get(name).map_err(|error| error.to_string())
+        })?;
+    let synthetic_index_json = if files.iter().any(|(name, _)| name == SAFETENSORS_INDEX) {
+        None
+    } else if available.contains(SAFETENSORS_FILE) {
+        Some(fetch_remote_safetensors_index(
+            &repo.url(SAFETENSORS_FILE),
+            auth_token.as_deref(),
+        )?)
+    } else {
+        None
+    };
+    metadata_from_files(
+        model_id,
+        Some(revision),
+        files,
+        synthetic_index_json,
+        unresolved_optional_files,
+    )
 }
 
 fn metadata_from_dir(model_id: &str, dir: &Path) -> Result<ModelMetadata, HubError> {
@@ -390,7 +476,16 @@ fn metadata_from_dir_at_revision(
         }
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
-    metadata_from_files(model_id, revision, files)
+    let synthetic_index_json = if files.iter().any(|(name, _)| name == SAFETENSORS_INDEX) {
+        None
+    } else {
+        let safetensors = dir.join(SAFETENSORS_FILE);
+        safetensors
+            .is_file()
+            .then(|| synthesize_index_from_file(&safetensors))
+            .transpose()?
+    };
+    metadata_from_files(model_id, revision, files, synthetic_index_json, Vec::new())
 }
 
 fn metadata_from_cached_main(
@@ -417,6 +512,8 @@ fn metadata_from_files(
     model_id: &str,
     revision: Option<String>,
     files: Vec<(String, PathBuf)>,
+    synthetic_index_json: Option<String>,
+    unresolved_optional_files: Vec<String>,
 ) -> Result<ModelMetadata, HubError> {
     let Some(config_path) = files
         .iter()
@@ -434,17 +531,19 @@ fn metadata_from_files(
     };
     let config_json = std::fs::read_to_string(config_path)
         .map_err(|e| HubError::Hub(format!("cannot read {}: {e}", config_path.display())))?;
-    let has_vision_config = serde_json::from_str::<serde_json::Value>(&config_json)
-        .ok()
-        .and_then(|config| config.get("vision_config").cloned())
+    let parsed_config = serde_json::from_str::<serde_json::Value>(&config_json).ok();
+    let has_vision_config = parsed_config
+        .as_ref()
+        .and_then(|config| config.get("vision_config"))
         .is_some_and(|vision| !vision.is_null());
-    if !files
-        .iter()
-        .any(|(name, _)| name == "model.safetensors.index.json")
-    {
+    let has_audio_config = parsed_config
+        .as_ref()
+        .and_then(|config| config.get("audio_config"))
+        .is_some_and(|audio| !audio.is_null());
+    if !files.iter().any(|(name, _)| name == SAFETENSORS_INDEX) && synthetic_index_json.is_none() {
         return Err(HubError::Hub(format!(
-            "{model_id}: model.safetensors.index.json is required for metadata-only compilation; \
-             plowc will not download a weight file to infer its tensor manifest"
+            "{model_id}: {SAFETENSORS_INDEX} or {SAFETENSORS_FILE} is required for metadata-only \
+             compilation; plowc will not download weight payloads to infer a tensor manifest"
         )));
     }
     Ok(ModelMetadata {
@@ -452,8 +551,36 @@ fn metadata_from_files(
         revision,
         config_json,
         has_vision_config,
+        has_audio_config,
         files,
+        synthetic_index_json,
+        unresolved_optional_files,
     })
+}
+
+fn collect_advertised_metadata(
+    model_id: &str,
+    names: Vec<String>,
+    mut get: impl FnMut(&str) -> Result<PathBuf, String>,
+) -> Result<(Vec<(String, PathBuf)>, Vec<String>), HubError> {
+    let mut files = Vec::with_capacity(names.len());
+    let mut unresolved_optional_files = Vec::new();
+    for name in names {
+        match get(&name) {
+            Ok(path) => files.push((name, path)),
+            Err(error) if is_required_metadata_filename(&name) => {
+                return Err(HubError::Hub(format!(
+                    "cannot resolve required {model_id}/{name}: {error}"
+                )));
+            }
+            Err(_) => unresolved_optional_files.push(name),
+        }
+    }
+    Ok((files, unresolved_optional_files))
+}
+
+fn is_required_metadata_filename(name: &str) -> bool {
+    matches!(name, "config.json" | SAFETENSORS_INDEX)
 }
 
 fn is_metadata_filename(name: &str) -> bool {
@@ -467,6 +594,195 @@ fn offline_enabled() -> bool {
     std::env::var("HF_HUB_OFFLINE").is_ok_and(|value| {
         !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
     })
+}
+
+fn synthesize_index_from_file(path: &Path) -> Result<String, HubError> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| HubError::Hub(format!("cannot open {}: {e}", path.display())))?;
+    let size = file
+        .metadata()
+        .map_err(|e| HubError::Hub(format!("cannot stat {}: {e}", path.display())))?
+        .len();
+    synthesize_index_from_reader(file, Some(size))
+}
+
+fn fetch_remote_safetensors_index(url: &str, token: Option<&str>) -> Result<String, HubError> {
+    let agent = ureq::builder()
+        .try_proxy_from_env(true)
+        .redirect_auth_headers(ureq::RedirectAuthHeaders::SameHost)
+        .build();
+    let fetch = |start: u64, end: u64| -> Result<(Vec<u8>, u64), HubError> {
+        let mut request = agent
+            .get(url)
+            .set("Range", &format!("bytes={start}-{end}"))
+            .set("Accept-Encoding", "identity");
+        if let Some(token) = token {
+            request = request.set("Authorization", &format!("Bearer {token}"));
+        }
+        let response = request
+            .call()
+            .map_err(|e| HubError::Hub(format!("cannot range-fetch {url}: {e}")))?;
+        if response.status() != 206 {
+            return Err(HubError::Hub(format!(
+                "{url} ignored a bounded safetensors header request (expected HTTP 206, got {})",
+                response.status()
+            )));
+        }
+        let content_range = response.header("Content-Range").ok_or_else(|| {
+            HubError::Hub(format!("{url} returned HTTP 206 without Content-Range"))
+        })?;
+        let (actual_start, actual_end, total) =
+            parse_content_range(content_range).ok_or_else(|| {
+                HubError::Hub(format!(
+                    "{url} returned invalid Content-Range {content_range:?}"
+                ))
+            })?;
+        if (actual_start, actual_end) != (start, end) {
+            return Err(HubError::Hub(format!(
+                "{url} returned Content-Range {content_range:?} for requested bytes={start}-{end}"
+            )));
+        }
+        let expected = end - start + 1;
+        let mut bytes = Vec::with_capacity(expected as usize);
+        response
+            .into_reader()
+            .take(expected + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| HubError::Hub(format!("cannot read ranged header from {url}: {e}")))?;
+        if bytes.len() as u64 != expected {
+            return Err(HubError::Hub(format!(
+                "{url} returned {} bytes for requested range of {expected} bytes",
+                bytes.len()
+            )));
+        }
+        Ok((bytes, total))
+    };
+
+    let (prefix, total) = fetch(0, 7)?;
+    let header_len = u64::from_le_bytes(prefix.try_into().expect("range length checked"));
+    validate_header_len(header_len)?;
+    let header_end = 8u64
+        .checked_add(header_len)
+        .and_then(|end| end.checked_sub(1))
+        .ok_or_else(|| HubError::Hub("safetensors header range overflow".into()))?;
+    let (header, second_total) = fetch(8, header_end)?;
+    if second_total != total {
+        return Err(HubError::Hub(format!(
+            "{url} changed size between safetensors header requests ({total} vs {second_total})"
+        )));
+    }
+    synthesize_index_from_header(&header, header_len, Some(total))
+}
+
+fn synthesize_index_from_reader(
+    mut reader: impl Read,
+    total_size: Option<u64>,
+) -> Result<String, HubError> {
+    let mut prefix = [0u8; 8];
+    reader
+        .read_exact(&mut prefix)
+        .map_err(|e| HubError::Hub(format!("cannot read safetensors header length: {e}")))?;
+    let header_len = u64::from_le_bytes(prefix);
+    validate_header_len(header_len)?;
+    let mut header = vec![0u8; header_len as usize];
+    reader
+        .read_exact(&mut header)
+        .map_err(|e| HubError::Hub(format!("cannot read safetensors header: {e}")))?;
+    synthesize_index_from_header(&header, header_len, total_size)
+}
+
+fn validate_header_len(header_len: u64) -> Result<(), HubError> {
+    if header_len == 0 || header_len > MAX_SAFETENSORS_HEADER_BYTES {
+        return Err(HubError::Hub(format!(
+            "invalid safetensors header length {header_len}; expected 1..={MAX_SAFETENSORS_HEADER_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+fn synthesize_index_from_header(
+    header: &[u8],
+    header_len: u64,
+    total_size: Option<u64>,
+) -> Result<String, HubError> {
+    let value: serde_json::Value = serde_json::from_slice(header)
+        .map_err(|e| HubError::Hub(format!("invalid safetensors header JSON: {e}")))?;
+    let tensors = value
+        .as_object()
+        .ok_or_else(|| HubError::Hub("safetensors header must be a JSON object".into()))?;
+    let payload_bytes = total_size
+        .map(|total| {
+            total.checked_sub(8 + header_len).ok_or_else(|| {
+                HubError::Hub(format!(
+                    "safetensors file size {total} is smaller than its {}-byte header",
+                    8 + header_len
+                ))
+            })
+        })
+        .transpose()?;
+    let mut weight_map = serde_json::Map::new();
+    let mut tensor_bytes = 0u64;
+    for (name, tensor) in tensors {
+        if name == "__metadata__" {
+            continue;
+        }
+        let tensor = tensor.as_object().ok_or_else(|| {
+            HubError::Hub(format!("safetensors tensor {name:?} is not an object"))
+        })?;
+        let dtype = tensor.get("dtype").and_then(serde_json::Value::as_str);
+        let shape = tensor.get("shape").and_then(serde_json::Value::as_array);
+        if dtype.is_none_or(str::is_empty)
+            || shape.is_none_or(|dims| dims.iter().any(|dim| dim.as_u64().is_none()))
+        {
+            return Err(HubError::Hub(format!(
+                "safetensors tensor {name:?} has no dtype or shape"
+            )));
+        }
+        let offsets = tensor
+            .get("data_offsets")
+            .and_then(serde_json::Value::as_array)
+            .filter(|offsets| offsets.len() == 2)
+            .ok_or_else(|| {
+                HubError::Hub(format!(
+                    "safetensors tensor {name:?} has invalid data_offsets"
+                ))
+            })?;
+        let start = offsets[0].as_u64().ok_or_else(|| {
+            HubError::Hub(format!(
+                "safetensors tensor {name:?} has invalid start offset"
+            ))
+        })?;
+        let end = offsets[1].as_u64().ok_or_else(|| {
+            HubError::Hub(format!(
+                "safetensors tensor {name:?} has invalid end offset"
+            ))
+        })?;
+        if end < start || payload_bytes.is_some_and(|payload| end > payload) {
+            return Err(HubError::Hub(format!(
+                "safetensors tensor {name:?} has out-of-range data_offsets [{start}, {end}]"
+            )));
+        }
+        tensor_bytes = tensor_bytes.saturating_add(end - start);
+        weight_map.insert(name.clone(), SAFETENSORS_FILE.into());
+    }
+    if weight_map.is_empty() {
+        return Err(HubError::Hub(
+            "safetensors header contains no tensor entries".into(),
+        ));
+    }
+    serde_json::to_string(&serde_json::json!({
+        "metadata": {"total_size": tensor_bytes},
+        "weight_map": weight_map,
+    }))
+    .map_err(|e| HubError::Hub(format!("cannot synthesize safetensors index: {e}")))
+}
+
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let range = value.strip_prefix("bytes ")?;
+    let (bounds, total) = range.split_once('/')?;
+    let (start, end) = bounds.split_once('-')?;
+    let parsed = (start.parse().ok()?, end.parse().ok()?, total.parse().ok()?);
+    (parsed.0 <= parsed.1 && parsed.1 < parsed.2).then_some(parsed)
 }
 
 /// Resolve model metadata and build its text-generation graph.
@@ -537,6 +853,8 @@ fn read_config(model_id: &str, path: PathBuf) -> Result<String, HubError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+    use std::sync::{Arc, Mutex};
 
     fn tempdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -547,6 +865,86 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn safetensors_fixture() -> Vec<u8> {
+        let mut header = serde_json::to_vec(&serde_json::json!({
+            "__metadata__": {"format": "pt"},
+            "model.embed_tokens.weight": {
+                "dtype": "BF16", "shape": [2, 2], "data_offsets": [0, 8]
+            },
+            "lm_head.weight": {
+                "dtype": "BF16", "shape": [1, 2], "data_offsets": [8, 12]
+            }
+        }))
+        .unwrap();
+        while header.len() % 8 != 0 {
+            header.push(b' ');
+        }
+        let mut file = Vec::with_capacity(8 + header.len() + 12);
+        file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        file.extend_from_slice(&header);
+        file.extend_from_slice(&[0; 12]);
+        file
+    }
+
+    fn range_server(
+        file: Vec<u8>,
+        status: u16,
+        requests: usize,
+    ) -> (String, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let thread_seen = Arc::clone(&seen);
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming().take(requests) {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while request.len() < 16 * 1024 {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                let range = request
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Range: ")
+                            .or_else(|| line.strip_prefix("range: "))
+                    })
+                    .unwrap()
+                    .to_string();
+                thread_seen.lock().unwrap().push(range.clone());
+                let (start, end) = range
+                    .strip_prefix("bytes=")
+                    .and_then(|range| range.split_once('-'))
+                    .map(|(start, end)| {
+                        (
+                            start.parse::<usize>().unwrap(),
+                            end.parse::<usize>().unwrap(),
+                        )
+                    })
+                    .unwrap();
+                let body = &file[start..=end];
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                    file.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        (
+            format!("http://{address}/org/model/resolve/deadbeef/{SAFETENSORS_FILE}"),
+            seen,
+            handle,
+        )
     }
 
     #[test]
@@ -573,6 +971,7 @@ mod tests {
         std::fs::write(dir.join("modeling_test.py"), "remote code").unwrap();
 
         let metadata = resolve_model_metadata(dir.to_str().unwrap()).unwrap();
+        assert_eq!(metadata.indexed_total_size().unwrap(), None);
         let names = metadata.filenames().collect::<Vec<_>>();
         assert_eq!(
             names,
@@ -607,7 +1006,8 @@ mod tests {
         let dir = tempdir("vision-scope");
         std::fs::write(
             dir.join("config.json"),
-            r#"{"model_type":"fixture","text_config":{},"vision_config":{"hidden_size":16}}"#,
+            r#"{"model_type":"fixture","text_config":{},"vision_config":{"hidden_size":16},
+                "audio_config":{"hidden_size":16}}"#,
         )
         .unwrap();
         std::fs::write(
@@ -618,6 +1018,7 @@ mod tests {
 
         let metadata = resolve_model_metadata(dir.to_str().unwrap()).unwrap();
         assert!(metadata.has_vision_config());
+        assert!(metadata.has_audio_config());
         assert_eq!(metadata.revision(), None);
         let out = tempdir("vision-scope-out");
         metadata.copy_to(&out).unwrap();
@@ -626,12 +1027,44 @@ mod tests {
         assert_eq!(manifest["compile_scope"], "text_generation");
         assert_eq!(
             manifest["source_modalities"],
-            serde_json::json!(["text", "vision"])
+            serde_json::json!(["text", "vision", "audio"])
         );
         assert_eq!(manifest["compiled_modalities"], serde_json::json!(["text"]));
+        assert!(!checkpoint_tensor_is_text(
+            "model.vision_embedder.patch_dense.weight",
+            false
+        ));
+        assert!(!checkpoint_tensor_is_text(
+            "model.embed_audio.embedding_projection.weight",
+            false
+        ));
 
         std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(out).ok();
+    }
+
+    #[test]
+    fn only_declared_deepseek_kimi_mtp_layer_range_is_excluded() {
+        let deepseek = r#"{"model_type":"deepseek_v3","num_hidden_layers":61,
+            "num_nextn_predict_layers":1}"#;
+        let range = omitted_mtp_layer_range(deepseek);
+        assert_eq!(range, Some((61, 62)));
+        assert!(!checkpoint_tensor_is_omitted_mtp(
+            "model.layers.60.mlp.gate.weight",
+            range
+        ));
+        assert!(checkpoint_tensor_is_omitted_mtp(
+            "model.layers.61.shared_head.head.weight",
+            range
+        ));
+        assert!(!checkpoint_tensor_is_omitted_mtp(
+            "model.layers.62.mlp.gate.weight",
+            range
+        ));
+
+        let glm = r#"{"model_type":"glm_moe_dsa","num_hidden_layers":78,
+            "num_nextn_predict_layers":1}"#;
+        assert_eq!(omitted_mtp_layer_range(glm), None);
     }
 
     #[test]
@@ -681,5 +1114,168 @@ mod tests {
         assert_eq!(fetch_config(dir.to_str().unwrap()).unwrap(), config);
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn advertised_optional_download_failures_are_recorded_not_fatal() {
+        let names = vec![
+            "added_tokens.json".to_string(),
+            "config.json".to_string(),
+            SAFETENSORS_INDEX.to_string(),
+            "tokenizer.json".to_string(),
+        ];
+        let (files, unresolved) = collect_advertised_metadata("org/model", names, |name| {
+            if matches!(name, "added_tokens.json" | "tokenizer.json") {
+                Err("gated".to_string())
+            } else {
+                Ok(PathBuf::from(name))
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            files
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["config.json", SAFETENSORS_INDEX]
+        );
+        assert_eq!(unresolved, vec!["added_tokens.json", "tokenizer.json"]);
+    }
+
+    #[test]
+    fn advertised_required_download_failure_is_fatal() {
+        for required in ["config.json", SAFETENSORS_INDEX] {
+            let error =
+                collect_advertised_metadata("org/model", vec![required.to_string()], |_| {
+                    Err("denied".to_string())
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("required"), "{error}");
+            assert!(error.to_string().contains(required), "{error}");
+        }
+    }
+
+    #[test]
+    fn unresolved_optional_files_are_emitted_in_metadata_manifest() {
+        let dir = tempdir("optional-source");
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"fixture"}"#).unwrap();
+        std::fs::write(
+            dir.join(SAFETENSORS_INDEX),
+            r#"{"weight_map":{"x":"model.safetensors"}}"#,
+        )
+        .unwrap();
+        let files = vec![
+            ("config.json".to_string(), dir.join("config.json")),
+            (SAFETENSORS_INDEX.to_string(), dir.join(SAFETENSORS_INDEX)),
+        ];
+        let metadata = metadata_from_files(
+            "org/model",
+            Some("deadbeef".into()),
+            files,
+            None,
+            vec!["added_tokens.json".into()],
+        )
+        .unwrap();
+        let out = tempdir("optional-out");
+        metadata.copy_to(&out).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("hf_metadata.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest["unresolved_optional_files"],
+            serde_json::json!(["added_tokens.json"])
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(out).ok();
+    }
+
+    #[test]
+    fn local_monolithic_safetensors_synthesizes_index_without_copying_payload() {
+        let dir = tempdir("monolithic");
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"fixture"}"#).unwrap();
+        std::fs::write(dir.join(SAFETENSORS_FILE), safetensors_fixture()).unwrap();
+
+        let metadata = resolve_model_metadata(dir.to_str().unwrap()).unwrap();
+        assert!(metadata.path(SAFETENSORS_INDEX).is_none());
+        assert!(metadata.filenames().any(|name| name == SAFETENSORS_INDEX));
+
+        let out = tempdir("monolithic-out");
+        metadata.copy_to(&out).unwrap();
+        assert!(!out.join(SAFETENSORS_FILE).exists());
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join(SAFETENSORS_INDEX)).unwrap()).unwrap();
+        assert_eq!(index["weight_map"].as_object().unwrap().len(), 2);
+        assert!(index["weight_map"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|shard| shard == SAFETENSORS_FILE));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("hf_metadata.json")).unwrap()).unwrap();
+        assert_eq!(manifest["safetensors_index"]["synthetic"], true);
+        assert_eq!(
+            manifest["safetensors_index"]["source_file"],
+            SAFETENSORS_FILE
+        );
+        assert_eq!(manifest["weight_shards_downloaded"], false);
+
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(out).ok();
+    }
+
+    #[test]
+    fn remote_monolithic_safetensors_fetches_only_two_bounded_ranges() {
+        let file = safetensors_fixture();
+        let header_len = u64::from_le_bytes(file[..8].try_into().unwrap());
+        let (url, seen, server) = range_server(file, 206, 2);
+
+        let index = fetch_remote_safetensors_index(&url, None).unwrap();
+        server.join().unwrap();
+        let index: serde_json::Value = serde_json::from_str(&index).unwrap();
+        assert_eq!(index["weight_map"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "bytes=0-7".to_string(),
+                format!("bytes=8-{}", 7 + header_len),
+            ]
+        );
+        assert!(url.contains("/resolve/deadbeef/model.safetensors"));
+    }
+
+    #[test]
+    fn remote_monolithic_safetensors_rejects_servers_that_ignore_range() {
+        let (url, seen, server) = range_server(safetensors_fixture(), 200, 1);
+        let error = fetch_remote_safetensors_index(&url, None).unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains("expected HTTP 206"), "{error}");
+        assert_eq!(*seen.lock().unwrap(), vec!["bytes=0-7".to_string()]);
+    }
+
+    #[test]
+    fn monolithic_safetensors_rejects_oversized_header_before_allocating() {
+        let bytes = (MAX_SAFETENSORS_HEADER_BYTES + 1).to_le_bytes();
+        let error = synthesize_index_from_reader(bytes.as_slice(), None).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid safetensors header length"));
+    }
+
+    #[test]
+    fn checkpoint_aliases_preserve_wrapped_name_matching() {
+        assert_eq!(
+            checkpoint_name_aliases("model.language_model.layers.0.weight")
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "model.language_model.layers.0.weight",
+                "language_model.layers.0.weight",
+                "layers.0.weight",
+            ])
+        );
+        assert_eq!(
+            checkpoint_name_aliases("layers.0.weight").collect::<Vec<_>>(),
+            vec!["layers.0.weight"]
+        );
     }
 }

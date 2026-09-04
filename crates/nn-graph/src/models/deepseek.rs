@@ -13,13 +13,15 @@
 //!   to their input.
 
 use super::config::{parse_dtype, DeepSeekConfig};
-use crate::op::ActKind;
+use crate::op::{ActKind, MoeGroups};
 use crate::Nn;
-use crate::{DType, Dim, Graph, TensorId};
+use crate::{
+    DType, Dim, ExpertLayerBinding, ExpertProjectionBinding, Graph, RoutedExpertBinding, TensorId,
+};
 
 pub fn build(cfg: &DeepSeekConfig) -> Graph {
     let dt = parse_dtype(cfg.torch_dtype.as_deref());
-    let mut nn = Nn::new(dt, dt);
+    let mut nn = Nn::new(dt, DType::BF16);
 
     let h = cfg.hidden_size;
     let eps = cfg.rms_norm_eps;
@@ -28,10 +30,10 @@ pub fn build(cfg: &DeepSeekConfig) -> Graph {
     let s = nn.sym("S");
 
     let ids = nn.input("input_ids", nn.shape([b.clone(), s.clone()]), DType::I32);
-    let mut x = nn.embedding("embed_tokens", ids, cfg.vocab_size, h);
+    let mut x = nn.embedding("model.embed_tokens", ids, cfg.vocab_size, h);
 
     for layer in 0..cfg.num_hidden_layers {
-        let p = format!("layers.{layer}");
+        let p = format!("model.layers.{layer}");
         nn.begin_block(&p);
 
         // Attention sub-block (pre-norm residual).
@@ -46,6 +48,7 @@ pub fn build(cfg: &DeepSeekConfig) -> Graph {
         let ffn = if layer < cfg.first_k_dense_replace {
             swiglu_mlp(
                 &mut nn,
+                cfg,
                 &format!("{p}.mlp"),
                 normed,
                 h,
@@ -58,7 +61,7 @@ pub fn build(cfg: &DeepSeekConfig) -> Graph {
     }
     nn.end_block();
 
-    x = nn.rmsnorm("norm", x, h, eps);
+    x = nn.rmsnorm("model.norm", x, h, eps);
     let logits = nn.linear("lm_head", x, h, cfg.vocab_size, false);
     nn.mark_output(logits);
     nn.finish()
@@ -84,22 +87,24 @@ fn mla_attention(
     // ---- query path (optionally low-rank) ----
     let q = if cfg.q_lora_rank > 0 {
         let q_lora = cfg.q_lora_rank as i64;
-        let qa = nn.linear(&format!("{p}.self_attn.q_a_proj"), x, h, q_lora, false);
+        let qa = linear(nn, cfg, &format!("{p}.self_attn.q_a_proj"), x, h, q_lora);
         let qa = nn.rmsnorm(&format!("{p}.self_attn.q_a_layernorm"), qa, q_lora, eps);
-        nn.linear(
+        linear(
+            nn,
+            cfg,
             &format!("{p}.self_attn.q_b_proj"),
             qa,
             q_lora,
             nh as i64 * qk_head,
-            false,
         )
     } else {
-        nn.linear(
+        linear(
+            nn,
+            cfg,
             &format!("{p}.self_attn.q_proj"),
             x,
             h,
             nh as i64 * qk_head,
-            false,
         )
     };
     let q = nn.reshape(
@@ -117,12 +122,13 @@ fn mla_attention(
     let q = nn.concat(-1, vec![q_nope, q_pe]); // [B,S,nh,qk_head]
 
     // ---- key/value path (shared compressed latent) ----
-    let kv_a = nn.linear(
+    let kv_a = linear(
+        nn,
+        cfg,
         &format!("{p}.self_attn.kv_a_proj_with_mqa"),
         x,
         h,
         kv_lora + qk_rope,
-        false,
     );
     let compressed = nn.slice(kv_a, -1, 0, kv_lora);
     let mut k_pe = nn.slice(kv_a, -1, kv_lora, qk_rope); // [B,S,qk_rope]
@@ -132,12 +138,13 @@ fn mla_attention(
         kv_lora,
         eps,
     );
-    let kv = nn.linear(
+    let kv = linear(
+        nn,
+        cfg,
         &format!("{p}.self_attn.kv_b_proj"),
         compressed,
         kv_lora,
         nh as i64 * (qk_nope + v_head),
-        false,
     );
     let kv = nn.reshape(
         kv,
@@ -171,22 +178,30 @@ fn mla_attention(
     // Attention. Q/K head dim is qk_head; V head dim is v_head ⇒ output [B,S,nh,v_head].
     let attn = nn.attention(q, k, value, nh, nh, qk_head as u32, true, None, None);
     let merged = nn.reshape(attn, [b.clone(), s.clone(), Dim::stat(nh as i64 * v_head)]);
-    nn.linear(
+    linear(
+        nn,
+        cfg,
         &format!("{p}.self_attn.o_proj"),
         merged,
         nh as i64 * v_head,
         h,
-        false,
     )
 }
 
 /// SwiGLU dense MLP: `down(silu(gate(x)) * up(x))`.
-fn swiglu_mlp(nn: &mut Nn, p: &str, x: TensorId, h: i64, inter: i64) -> TensorId {
-    let gate = nn.linear(&format!("{p}.gate_proj"), x, h, inter, false);
-    let up = nn.linear(&format!("{p}.up_proj"), x, h, inter, false);
+fn swiglu_mlp(
+    nn: &mut Nn,
+    cfg: &DeepSeekConfig,
+    p: &str,
+    x: TensorId,
+    h: i64,
+    inter: i64,
+) -> TensorId {
+    let gate = linear(nn, cfg, &format!("{p}.gate_proj"), x, h, inter);
+    let up = linear(nn, cfg, &format!("{p}.up_proj"), x, h, inter);
     let gate = nn.act(ActKind::Silu, gate);
     let hidden = nn.mul(gate, up);
-    nn.linear(&format!("{p}.down_proj"), hidden, inter, h, false)
+    linear(nn, cfg, &format!("{p}.down_proj"), hidden, inter, h)
 }
 
 /// DeepSeekMoE: router logits + shared expert(s) + one representative routed
@@ -194,29 +209,137 @@ fn swiglu_mlp(nn: &mut Nn, p: &str, x: TensorId, h: i64, inter: i64) -> TensorId
 /// the graph carries the router and the FFN shapes.
 fn moe(nn: &mut Nn, cfg: &DeepSeekConfig, p: &str, x: TensorId, h: i64) -> TensorId {
     // Router: [.., H] -> [.., n_routed_experts] logits.
-    let _logits = nn.moe_router(
+    let routes = nn.moe_router_noaux(
         &format!("{p}.gate"),
         x,
         h,
         cfg.n_routed_experts,
         cfg.num_experts_per_tok,
+        MoeGroups {
+            n_group: cfg.n_group,
+            topk_group: cfg.topk_group,
+        },
+        cfg.norm_topk_prob,
+        cfg.routed_scaling_factor,
     );
-
-    // One representative routed expert FFN (replicated `n_routed_experts` times
-    // at load time; shape-identical, so a single node stands in for the graph).
-    let routed = swiglu_mlp(
-        nn,
-        &format!("{p}.experts.0"),
+    let routed_experts = register_experts(nn, cfg, p, h);
+    nn.expert_binding(ExpertLayerBinding {
+        block: p
+            .strip_prefix("model.layers.")
+            .and_then(|p| p.split('.').next())
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0),
+        layer_label: p.to_string(),
+        num_experts: cfg.n_routed_experts,
+        top_k: cfg.num_experts_per_tok,
+        scoring_func: cfg.scoring_func.clone(),
+        norm_topk: cfg.norm_topk_prob,
+        route_scale: cfg.routed_scaling_factor,
+        n_group: cfg.n_group,
+        topk_group: cfg.topk_group,
+        correction_bias: Some(format!("{p}.gate.e_score_correction_bias")),
+        routed_experts,
+    });
+    let routed = nn.moe_experts(
         x,
-        h,
-        cfg.moe_intermediate_size,
+        routes,
+        cfg.n_routed_experts,
+        cfg.num_experts_per_tok,
+        cfg.moe_intermediate_size as u32,
+        cfg.quantization_config.is_some(),
     );
 
     if cfg.n_shared_experts > 0 {
         let shared_inter = cfg.moe_intermediate_size * cfg.n_shared_experts as i64;
-        let shared = swiglu_mlp(nn, &format!("{p}.shared_experts"), x, h, shared_inter);
+        let shared = swiglu_mlp(nn, cfg, &format!("{p}.shared_experts"), x, h, shared_inter);
         nn.add(routed, shared)
     } else {
         routed
     }
+}
+
+fn linear(
+    nn: &mut Nn,
+    cfg: &DeepSeekConfig,
+    name: &str,
+    x: TensorId,
+    input: i64,
+    output: i64,
+) -> TensorId {
+    let dtype = cfg.projection_weight_dtype();
+    let out = nn.linear_dtype(name, x, input, output, false, dtype);
+    if let (Some(shape), Some(quant)) = (
+        cfg.fp8_scale_shape(output, input),
+        cfg.quantization_config.as_ref(),
+    ) {
+        nn.fp8_scale_binding(
+            &format!("{name}.weight"),
+            &format!("{name}.weight_scale_inv"),
+            shape.map(Dim::stat),
+            quant.weight_block_size,
+        );
+    }
+    out
+}
+
+fn register_experts(
+    nn: &mut Nn,
+    cfg: &DeepSeekConfig,
+    p: &str,
+    hidden: i64,
+) -> Vec<RoutedExpertBinding> {
+    (0..cfg.n_routed_experts)
+        .map(|expert| {
+            let p = format!("{p}.experts.{expert}");
+            RoutedExpertBinding {
+                gate: register_projection(
+                    nn,
+                    cfg,
+                    &format!("{p}.gate_proj"),
+                    hidden,
+                    cfg.moe_intermediate_size,
+                ),
+                up: register_projection(
+                    nn,
+                    cfg,
+                    &format!("{p}.up_proj"),
+                    hidden,
+                    cfg.moe_intermediate_size,
+                ),
+                down: register_projection(
+                    nn,
+                    cfg,
+                    &format!("{p}.down_proj"),
+                    cfg.moe_intermediate_size,
+                    hidden,
+                ),
+            }
+        })
+        .collect()
+}
+
+fn register_projection(
+    nn: &mut Nn,
+    cfg: &DeepSeekConfig,
+    name: &str,
+    input: i64,
+    output: i64,
+) -> ExpertProjectionBinding {
+    let weight = format!("{name}.weight");
+    nn.param_dtype(
+        &weight,
+        [Dim::stat(output), Dim::stat(input)],
+        cfg.projection_weight_dtype(),
+    );
+    let scale = cfg.fp8_scale_shape(output, input).map(|shape| {
+        let scale = format!("{name}.weight_scale_inv");
+        nn.fp8_scale_binding(
+            &weight,
+            &scale,
+            shape.map(Dim::stat),
+            cfg.quantization_config.as_ref().unwrap().weight_block_size,
+        );
+        scale
+    });
+    ExpertProjectionBinding { weight, scale }
 }

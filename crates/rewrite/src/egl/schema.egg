@@ -51,6 +51,15 @@
   (MoeRouter Expr Expr i64 i64)       ; x, weight, num_experts, top_k
   (MoeRouterGrouped Expr Expr i64 i64 i64 i64)
       ; x, weight, num_experts, top_k, n_group, topk_group
+  (MoeRouterNoAux Expr Expr Expr i64 i64 i64 i64 i64 f64)
+      ; x, weight, correction_bias, num_experts, top_k, n_group, topk_group,
+      ; norm_topk, route_scale. Scoring is sigmoid by definition.
+  (MoeExperts Expr Expr i64 i64 i64 i64)
+      ; x, routes, num_experts, top_k, intermediate_size, block_fp8
+  (DsaIndexer Expr Expr Expr Expr Expr Expr Expr String)
+      ; hidden, q_resid, wq_b, wk, k_norm_w, k_norm_b, weights_proj, config-token
+  (DsaAttention Expr Expr Expr Expr String)
+      ; q, k, v, topk_indices, config-token
 
   ; --- Kimi-K3 ---
   ; The hybrid mixer's terms. Every weight leaf is named so the manifest stays

@@ -232,6 +232,7 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![],
                 fp8_scale_bindings: vec![],
+                expert_bindings: vec![],
             },
             &fused,
             0,

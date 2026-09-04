@@ -621,6 +621,28 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
         .as_ref()
         .map(fp8_scale_storage_bytes)
         .unwrap_or(0);
+    // Routed experts are compact semantic nodes, so plan-local GEMM scanning
+    // intentionally cannot see their 3*E checkpoint tensors. Charge the
+    // exhaustive graph manifest instead whenever expert bindings are present.
+    let model_checkpoint_weight_bytes = match (&model_metadata, &model_checkpoint_graph) {
+        (Some(metadata), Some(graph)) if !graph.expert_bindings.is_empty() => {
+            let model_type = serde_json::from_str::<serde_json::Value>(metadata.config_json())?
+                .get("model_type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            // Kimi-K2 and GLM compile every indexed text tensor, including
+            // GLM's next-token layer, so the index is the byte-exact source.
+            // DeepSeek intentionally omits its separately trained MTP layer;
+            // use the exhaustive base-graph manifest there instead.
+            match model_type.as_deref() {
+                Some("kimi" | "kimi_k2" | "glm_moe_dsa" | "glm" | "glm4") => metadata
+                    .indexed_total_size()?
+                    .or_else(|| graph.checkpoint_storage_bytes()),
+                _ => graph.checkpoint_storage_bytes(),
+            }
+        }
+        _ => None,
+    };
     // For HfDir sources, synthesize the full model metadata once (cheap JSON
     // parse) and cache it for all downstream functions. No resolution to
     // Source::Net — we use `build_full_model_plan()` directly.
@@ -869,8 +891,17 @@ pub fn compile(src: &Source, opts: &Options) -> Result<Report, PlowcError> {
             "copied Hugging Face metadata beside packet output"
         );
     }
-    let (buckets, footprints, lean) =
-        emit_streams(&compiled, &soc, &cfg, opts, src, &plans, fp8_scale_bytes)?;
+    let (buckets, footprints, lean) = emit_streams(
+        &compiled,
+        &soc,
+        &cfg,
+        opts,
+        src,
+        &plans,
+        fp8_scale_bytes,
+        model_checkpoint_weight_bytes,
+        model_checkpoint_graph.as_ref(),
+    )?;
 
     // Static tensors: compile-time constants (RoPE freq tables, static
     // masks). Phase 4 emits the plumbing with an empty manifest — Phase 5
@@ -966,34 +997,11 @@ fn ensure_model_packet_path_supported(
 ) -> Result<(), PlowcError> {
     let config: serde_json::Value = serde_json::from_str(metadata.config_json())?;
     let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
-    let routed_experts = config
-        .get("n_routed_experts")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
     match model_type {
         Some("kimi_k3" | "kimi_linear") => Err(PlowcError::InvalidDim(
             "Kimi-K3 is supported by the dedicated MI355X devblob emitter, but the \
              metadata-only `--model` scheduled-packet path does not yet lower its AttnRes \
              block-residual state; use the existing Kimi HF-directory/devblob path"
-                .into(),
-        )),
-        Some("deepseek" | "deepseek_v2" | "deepseek_v3") if routed_experts > 1 => {
-            Err(PlowcError::InvalidDim(
-                "DeepSeek MoE scheduled packets currently model only one representative routed \
-                 expert and do not bind the complete expert/FP8-scale manifest; refusing an \
-                 incomplete packet"
-                    .into(),
-            ))
-        }
-        Some("kimi" | "kimi_k2" | "moonshot") if routed_experts > 1 => Err(PlowcError::InvalidDim(
-            "Kimi-K2 MoE scheduled packets currently model only one representative routed \
-                 expert and do not bind the complete expert/FP8-scale manifest; refusing an \
-                 incomplete packet"
-                .into(),
-        )),
-        Some("glm_moe_dsa") if routed_experts > 1 => Err(PlowcError::InvalidDim(
-            "GLM-5.3 scheduled packets do not yet bind the official DSA indexer, every routed \
-             expert, FP8 scales, and next-token layer; refusing an incomplete packet"
                 .into(),
         )),
         _ => Ok(()),
@@ -1238,7 +1246,53 @@ fn build_decode_kv_schema(
 /// schema on `--net` sources (which model MoE as sequential GEMMs and don't
 /// emit any `MoeRouter` op). See the design notes for the full
 /// design; this is Phase 1 (detection + sidecar only).
-fn build_experts_schema(tasks: &schedule::TaskGraph, _src: &Source) -> ExpertsSchema {
+fn build_experts_schema(
+    tasks: &schedule::TaskGraph,
+    _src: &Source,
+    graph: Option<&nn_graph::Graph>,
+) -> ExpertsSchema {
+    if let Some(graph) = graph.filter(|graph| !graph.expert_bindings.is_empty()) {
+        let layers = graph
+            .expert_bindings
+            .iter()
+            .map(|binding| {
+                let suffix = format!("_L{}", binding.block);
+                let router_op_name = tasks
+                    .tasks
+                    .iter()
+                    .find(|task| task.op.starts_with("moe_router") && task.op.ends_with(&suffix))
+                    .map(|task| task.op.clone())
+                    .unwrap_or_default();
+                ExpertLayer {
+                    block: binding.block,
+                    layer_label: binding.layer_label.clone(),
+                    num_experts: binding.num_experts,
+                    top_k: binding.top_k,
+                    router_op_name,
+                    routing_table_slot: format!("{}.routing_table", binding.layer_label),
+                    expert_weight_table_slot: format!(
+                        "{}.expert_weight_table",
+                        binding.layer_label
+                    ),
+                    routed_experts: binding
+                        .routed_experts
+                        .iter()
+                        .map(|expert| plow_asset::RoutedExpertWeights {
+                            gate: expert.gate.weight.clone(),
+                            up: expert.up.weight.clone(),
+                            down: expert.down.weight.clone(),
+                        })
+                        .collect(),
+                }
+            })
+            .collect();
+        return ExpertsSchema {
+            layers,
+            shared: Vec::new(),
+            expert_unused_sentinel: EXPERT_UNUSED_SENTINEL,
+            complete: true,
+        };
+    }
     let mut layers = Vec::new();
     let mut shared = Vec::new();
     for task in &tasks.tasks {
@@ -1564,6 +1618,8 @@ fn emit_streams(
     src: &Source,
     plans: &[(ShapeBucket, LayerPlan)],
     fp8_scale_bytes: u64,
+    model_checkpoint_weight_bytes: Option<u64>,
+    model_checkpoint_graph: Option<&nn_graph::Graph>,
 ) -> Result<(Vec<BucketReport>, Vec<Footprint>, LeanStatus), PlowcError> {
     let hbm_capacity = soc.unit(0).cm.spec.mem.capacity.0;
     let mut out = Vec::with_capacity(compiled.streams.len());
@@ -1760,19 +1816,21 @@ fn emit_streams(
         // + KV growth + weights) exceeds the target GPU's capacity. `amap`
         // segments track activations + KV; weights live in a distinct region
         // the runtime loads from safetensors, so add their bytes here.
-        let total_weight_bytes: u64 = weight_shapes
-            .values()
-            .map(|(n, k, dtype)| {
-                let elements = ((*n).max(0) as u64).saturating_mul((*k).max(0) as u64);
-                dtype.tile_bytes(elements)
-            })
-            .sum::<u64>()
-            .saturating_add(fp8_scale_bytes);
+        let total_weight_bytes: u64 = model_checkpoint_weight_bytes.unwrap_or_else(|| {
+            weight_shapes
+                .values()
+                .map(|(n, k, dtype)| {
+                    let elements = ((*n).max(0) as u64).saturating_mul((*k).max(0) as u64);
+                    dtype.tile_bytes(elements)
+                })
+                .sum::<u64>()
+                .saturating_add(fp8_scale_bytes)
+        });
         // Under tensor parallelism (the only multi-GPU strategy) GEMM weights
         // are sharded along N across units, so each device holds ~1/Nth of the
         // total — charging the full model to every segment would over-count
         // ~num_gpus× and reject buckets that fit.
-        let n_devices = amap.segments.len().max(1) as u64;
+        let n_devices = opts.num_gpus.max(1) as u64;
         let per_device_weight_bytes = total_weight_bytes.div_ceil(n_devices);
         for seg in &amap.segments {
             let needed = seg.size.saturating_add(per_device_weight_bytes);
@@ -1841,7 +1899,7 @@ fn emit_streams(
 
         // Experts sidecar — MoE layers for expert-parallel dispatch.
         // Phase 1 detection only; see the design notes.
-        let experts = build_experts_schema(&bs.sched.tasks, src);
+        let experts = build_experts_schema(&bs.sched.tasks, src, model_checkpoint_graph);
         let experts_file = format!("{stem}.experts.json");
         std::fs::write(
             opts.out.join(&experts_file),
@@ -1908,7 +1966,7 @@ fn emit_streams(
             phase: phase.to_string(),
             batch: bs.bucket.batch,
             seq: bs.bucket.seq,
-            weight_bytes: total_weight_bytes,
+            weight_bytes: per_device_weight_bytes,
             kv_cache_bytes,
             scratch_bytes,
             request_io_bytes,
@@ -1916,7 +1974,7 @@ fn emit_streams(
             persistent_bytes,
             packet_bytes: bytes.len() as u64,
             arena_bytes: amap.arena_bytes,
-            total_hbm_bytes: amap.arena_bytes + total_weight_bytes,
+            total_hbm_bytes: amap.arena_bytes + per_device_weight_bytes,
         });
 
         out.push(BucketReport {

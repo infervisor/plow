@@ -6,7 +6,8 @@
 //! right.
 
 use crate::dim::SymId;
-use crate::op::{ActKind, EwKind, Op, ReduceKind};
+use crate::graph::ExpertLayerBinding;
+use crate::op::{ActKind, EwKind, MoeScoring, Op, ReduceKind};
 use crate::{DType, Dim, Graph, GraphBuilder, Shape, TensorId};
 
 pub struct Nn {
@@ -432,6 +433,10 @@ impl Nn {
                 num_experts,
                 top_k,
                 group: None,
+                scoring: MoeScoring::Softmax,
+                norm_topk: false,
+                route_scale: 1.0,
+                correction_bias: false,
             },
             vec![x, w],
         )
@@ -462,8 +467,152 @@ impl Nn {
                 num_experts,
                 top_k,
                 group: Some(group),
+                scoring: MoeScoring::Softmax,
+                norm_topk: false,
+                route_scale: 1.0,
+                correction_bias: false,
             },
             vec![x, w],
+        )
+    }
+
+    /// DeepSeek-family sigmoid/noaux_tc router. The correction bias affects
+    /// expert selection only; its presence is an explicit third operand so it
+    /// cannot disappear during lowering or checkpoint validation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_router_noaux(
+        &mut self,
+        name: &str,
+        x: TensorId,
+        hidden: i64,
+        num_experts: u32,
+        top_k: u32,
+        group: crate::op::MoeGroups,
+        norm_topk: bool,
+        route_scale: f32,
+    ) -> TensorId {
+        let w = self.param(
+            &format!("{name}.weight"),
+            [Dim::stat(num_experts as i64), Dim::stat(hidden)],
+        );
+        let correction = self.param_dtype(
+            &format!("{name}.e_score_correction_bias"),
+            [Dim::stat(num_experts as i64)],
+            DType::F32,
+        );
+        self.emit(
+            Op::MoeRouter {
+                num_experts,
+                top_k,
+                group: Some(group),
+                scoring: MoeScoring::Sigmoid,
+                norm_topk,
+                route_scale,
+                correction_bias: true,
+            },
+            vec![x, w, correction],
+        )
+    }
+
+    pub fn moe_experts(
+        &mut self,
+        x: TensorId,
+        routes: TensorId,
+        num_experts: u32,
+        top_k: u32,
+        intermediate_size: u32,
+        block_fp8: bool,
+    ) -> TensorId {
+        self.emit(
+            Op::MoeExperts {
+                num_experts,
+                top_k,
+                intermediate_size,
+                block_fp8,
+            },
+            vec![x, routes],
+        )
+    }
+
+    pub fn expert_binding(&mut self, binding: ExpertLayerBinding) {
+        self.g.expert_binding(binding);
+    }
+
+    pub fn rope_interleaved_with_frequency_dim(
+        &mut self,
+        x: TensorId,
+        dim: u32,
+        theta: f32,
+        frequency_dim: u32,
+    ) -> TensorId {
+        self.emit(
+            Op::Rope {
+                dim,
+                theta,
+                interleave: true,
+                frequency_dim,
+            },
+            vec![x],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsa_indexer(
+        &mut self,
+        hidden: TensorId,
+        q_resid: TensorId,
+        wq_b: TensorId,
+        wk: TensorId,
+        k_norm_weight: TensorId,
+        k_norm_bias: TensorId,
+        weights_proj: TensorId,
+        num_heads: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        top_k: u32,
+        theta: f32,
+    ) -> TensorId {
+        self.g.op(
+            Op::DsaIndexer {
+                num_heads,
+                head_dim,
+                rope_dim,
+                top_k,
+                theta,
+            },
+            vec![
+                hidden,
+                q_resid,
+                wq_b,
+                wk,
+                k_norm_weight,
+                k_norm_bias,
+                weights_proj,
+            ],
+            DType::I32,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsa_attention(
+        &mut self,
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        topk_indices: TensorId,
+        num_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        top_k: u32,
+    ) -> TensorId {
+        self.emit(
+            Op::DsaAttention {
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                top_k,
+            },
+            vec![q, k, v, topk_indices],
         )
     }
 

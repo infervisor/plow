@@ -155,6 +155,10 @@ pub enum ModelOpKind {
     RmsNorm = 12,
     Scale = 13,
     Tanh = 14,
+    MoeRouter = 15,
+    MoeExperts = 16,
+    DsaIndexer = 17,
+    DsaAttention = 18,
 }
 
 /// One op of the layer. Convention: `inputs[0]` is the activation (shared, read

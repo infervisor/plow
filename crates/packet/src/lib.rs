@@ -116,6 +116,8 @@ impl Opcode {
     pub const VARIANT_MODEL_RMSNORM: u8 = 0x8c;
     pub const VARIANT_MODEL_SCALE: u8 = 0x8d;
     pub const VARIANT_MODEL_TANH: u8 = 0x8e;
+    pub const VARIANT_MODEL_MOE_ROUTER: u8 = 0x8f;
+    pub const VARIANT_MODEL_MOE_EXPERTS: u8 = 0x90;
 
     // Token-family variants (bits [7:0]) — the `kind` a `TokenBody` carries.
     pub const TOKEN_SAMPLE_GREEDY: u8 = 0x00;

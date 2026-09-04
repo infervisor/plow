@@ -1,162 +1,181 @@
-//! GLM-5 MoE-DSA decoder → symbolic operator graph.
-//!
-//! Architecturally a close relative of DeepSeek-V3:
-//!
-//! * **MLA (multi-head latent attention).** Same low-rank Q/KV decomposition:
-//!   q_a → q_norm → q_b (or direct q_proj), kv_a → kv_norm → kv_b, with a
-//!   shared rotary key broadcast across heads. Uses interleaved RoPE.
-//! * **DeepSeekMoE.** Dense MLP for the first `first_k_dense_replace` layers,
-//!   then router + shared expert + routed experts. Per-layer dispatch driven by
-//!   `mlp_layer_types[]`.
-//! * **DSA (Dense-Sparse Attention).** Novel indexer mechanism: "full" layers
-//!   attend over the entire KV cache; "shared" layers compute a scoring
-//!   projection, select top-k KV positions, and attend only over those. Modeled
-//!   as a standard attention with `seq_kv = index_topk` for the sparse layers.
-//! * **Multi-token prediction.** Extra linear head(s) that predict token+N.
-//!   Compile-time: just additional GEMMs off the final norm output.
+//! GLM-MoE-DSA decoder graph.
 
 use super::config::{parse_dtype, GlmConfig};
-use crate::op::ActKind;
-use crate::Nn;
-use crate::{DType, Dim, Graph, TensorId};
+use crate::op::{ActKind, MoeGroups};
+use crate::{
+    DType, Dim, ExpertLayerBinding, ExpertProjectionBinding, Graph, Nn, RoutedExpertBinding,
+    TensorId,
+};
 
 pub fn build(cfg: &GlmConfig) -> Graph {
-    let dt = parse_dtype(cfg.torch_dtype.as_deref());
-    let mut nn = Nn::new(dt, dt);
-
-    let h = cfg.hidden_size;
-    let eps = cfg.rms_norm_eps;
-
+    let mut nn = Nn::new(parse_dtype(cfg.torch_dtype.as_deref()), DType::BF16);
     let b = nn.sym("B");
     let s = nn.sym("S");
-
     let ids = nn.input("input_ids", nn.shape([b.clone(), s.clone()]), DType::I32);
-    let mut x = nn.embedding("embed_tokens", ids, cfg.vocab_size, h);
+    let embedding = nn.embedding("embed_tokens", ids, cfg.vocab_size, cfg.hidden_size);
+    let mut x = embedding;
+    let mut topk = None;
 
     for layer in 0..cfg.num_hidden_layers {
-        let p = format!("layers.{layer}");
-        nn.begin_block(&p);
-
-        // Attention sub-block (pre-norm residual).
-        let residual = x;
-        let normed = nn.rmsnorm(&format!("{p}.input_layernorm"), x, h, eps);
-        let attn = mla_attention(&mut nn, cfg, &p, normed, &b, &s, layer);
-        x = nn.add(residual, attn);
-
-        // FFN sub-block (pre-norm residual): dense for early layers, MoE after.
-        let residual = x;
-        let normed = nn.rmsnorm(&format!("{p}.post_attention_layernorm"), x, h, eps);
-        let ffn = if cfg.layer_is_dense(layer) {
-            swiglu_mlp(
-                &mut nn,
-                &format!("{p}.mlp"),
-                normed,
-                h,
-                cfg.intermediate_size,
-            )
-        } else {
-            moe(&mut nn, cfg, &format!("{p}.mlp"), normed, h)
-        };
-        x = nn.add(residual, ffn);
+        let (next, next_topk) = decoder_layer(&mut nn, cfg, layer, x, topk, &b, &s);
+        x = next;
+        topk = Some(next_topk);
     }
-    nn.end_block();
 
-    x = nn.rmsnorm("norm", x, h, eps);
-    let logits = nn.linear("lm_head", x, h, cfg.vocab_size, false);
+    let base_hidden = x;
+    let normed = nn.rmsnorm("norm", x, cfg.hidden_size, cfg.rms_norm_eps);
+    let logits = nn.linear("lm_head", normed, cfg.hidden_size, cfg.vocab_size, false);
     nn.mark_output(logits);
 
-    // Multi-token prediction heads (compile-time: just extra linears).
-    for mtp in 0..cfg.num_nextn_predict_layers {
-        let mtp_logits = nn.linear(
-            &format!("mtp_heads.{mtp}.lm_head"),
-            x,
-            h,
-            cfg.vocab_size,
-            false,
+    if cfg.num_nextn_predict_layers == 1 {
+        let layer = cfg.num_hidden_layers;
+        let p = format!("layers.{layer}");
+        let e = nn.rmsnorm(
+            &format!("{p}.enorm"),
+            embedding,
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
         );
+        let h = nn.rmsnorm(
+            &format!("{p}.hnorm"),
+            base_hidden,
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        );
+        let eh = nn.concat(-1, vec![e, h]);
+        // The released layer-78 eh projection is BF16 (there is no scale tensor).
+        let x = nn.linear_dtype(
+            &format!("{p}.eh_proj"),
+            eh,
+            cfg.hidden_size * 2,
+            cfg.hidden_size,
+            false,
+            DType::BF16,
+        );
+        let (x, _) = decoder_layer(&mut nn, cfg, layer, x, None, &b, &s);
+        let x = nn.rmsnorm(
+            &format!("{p}.shared_head.norm"),
+            x,
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        );
+        let mtp_logits = nn.linear("lm_head", x, cfg.hidden_size, cfg.vocab_size, false);
         nn.mark_output(mtp_logits);
     }
 
     nn.finish()
 }
 
-fn mla_attention(
+fn decoder_layer(
+    nn: &mut Nn,
+    cfg: &GlmConfig,
+    layer: u32,
+    x: TensorId,
+    previous_topk: Option<TensorId>,
+    b: &Dim,
+    s: &Dim,
+) -> (TensorId, TensorId) {
+    let p = format!("layers.{layer}");
+    nn.begin_block(&p);
+    let residual = x;
+    let normed = nn.rmsnorm(
+        &format!("{p}.input_layernorm"),
+        x,
+        cfg.hidden_size,
+        cfg.rms_norm_eps,
+    );
+    let (attn, topk) = mla_dsa(nn, cfg, &p, normed, previous_topk, b, s, layer);
+    let x = nn.add(residual, attn);
+
+    let residual = x;
+    let normed = nn.rmsnorm(
+        &format!("{p}.post_attention_layernorm"),
+        x,
+        cfg.hidden_size,
+        cfg.rms_norm_eps,
+    );
+    let ffn = if layer < cfg.num_hidden_layers && cfg.layer_is_dense(layer) {
+        swiglu_fp8(nn, cfg, &format!("{p}.mlp"), normed, cfg.intermediate_size)
+    } else {
+        moe(nn, cfg, layer, &format!("{p}.mlp"), normed)
+    };
+    let x = nn.add(residual, ffn);
+    nn.end_block();
+    (x, topk)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mla_dsa(
     nn: &mut Nn,
     cfg: &GlmConfig,
     p: &str,
     x: TensorId,
+    previous_topk: Option<TensorId>,
     b: &Dim,
     s: &Dim,
     layer: u32,
-) -> TensorId {
+) -> (TensorId, TensorId) {
     let h = cfg.hidden_size;
     let nh = cfg.num_attention_heads;
-    let eps = cfg.rms_norm_eps;
+    let ql = cfg.q_lora_rank as i64;
+    let kl = cfg.kv_lora_rank as i64;
     let qk_nope = cfg.qk_nope_head_dim as i64;
     let qk_rope = cfg.qk_rope_head_dim as i64;
-    let qk_head = cfg.qk_head_dim as i64;
-    let v_head = cfg.v_head_dim as i64;
-    let kv_lora = cfg.kv_lora_rank as i64;
-    let theta = cfg.rope_theta();
+    let qk = cfg.qk_head_dim as i64;
+    let vd = cfg.v_head_dim as i64;
 
-    // ---- query path (low-rank) ----
-    let q = if cfg.q_lora_rank > 0 {
-        let q_lora = cfg.q_lora_rank as i64;
-        let qa = nn.linear(&format!("{p}.self_attn.q_a_proj"), x, h, q_lora, false);
-        let qa = nn.rmsnorm(&format!("{p}.self_attn.q_a_layernorm"), qa, q_lora, eps);
-        nn.linear(
-            &format!("{p}.self_attn.q_b_proj"),
-            qa,
-            q_lora,
-            nh as i64 * qk_head,
-            false,
-        )
-    } else {
-        nn.linear(
-            &format!("{p}.self_attn.q_proj"),
-            x,
-            h,
-            nh as i64 * qk_head,
-            false,
-        )
-    };
+    let qa = fp8_linear(nn, cfg, &format!("{p}.self_attn.q_a_proj"), x, h, ql);
+    let q_resid = nn.rmsnorm(
+        &format!("{p}.self_attn.q_a_layernorm"),
+        qa,
+        ql,
+        cfg.rms_norm_eps,
+    );
+    let q = fp8_linear(
+        nn,
+        cfg,
+        &format!("{p}.self_attn.q_b_proj"),
+        q_resid,
+        ql,
+        nh as i64 * qk,
+    );
     let q = nn.reshape(
         q,
-        [
-            b.clone(),
-            s.clone(),
-            Dim::stat(nh as i64),
-            Dim::stat(qk_head),
-        ],
+        [b.clone(), s.clone(), Dim::stat(nh as i64), Dim::stat(qk)],
     );
     let q_nope = nn.slice(q, -1, 0, qk_nope);
-    let mut q_pe = nn.slice(q, -1, qk_nope, qk_rope);
-    // Interleaved RoPE for GLM.
-    q_pe = nn.rope_interleaved(q_pe, qk_rope as u32, theta);
-    let q = nn.concat(-1, vec![q_nope, q_pe]); // [B,S,nh,qk_head]
+    let q_rope = nn.slice(q, -1, qk_nope, qk_rope);
+    let q_rope = nn.rope_interleaved_with_frequency_dim(
+        q_rope,
+        qk_rope as u32,
+        cfg.rope_theta(),
+        cfg.head_dim,
+    );
+    let q = nn.concat(-1, vec![q_nope, q_rope]);
 
-    // ---- key/value path (shared compressed latent) ----
-    let kv_a = nn.linear(
+    let kva = fp8_linear(
+        nn,
+        cfg,
         &format!("{p}.self_attn.kv_a_proj_with_mqa"),
         x,
         h,
-        kv_lora + qk_rope,
-        false,
+        kl + qk_rope,
     );
-    let compressed = nn.slice(kv_a, -1, 0, kv_lora);
-    let mut k_pe = nn.slice(kv_a, -1, kv_lora, qk_rope); // [B,S,qk_rope]
+    let compressed = nn.slice(kva, -1, 0, kl);
+    let k_rope = nn.slice(kva, -1, kl, qk_rope);
     let compressed = nn.rmsnorm(
         &format!("{p}.self_attn.kv_a_layernorm"),
         compressed,
-        kv_lora,
-        eps,
+        kl,
+        cfg.rms_norm_eps,
     );
-    let kv = nn.linear(
+    let kv = fp8_linear(
+        nn,
+        cfg,
         &format!("{p}.self_attn.kv_b_proj"),
         compressed,
-        kv_lora,
-        nh as i64 * (qk_nope + v_head),
-        false,
+        kl,
+        nh as i64 * (qk_nope + vd),
     );
     let kv = nn.reshape(
         kv,
@@ -164,20 +183,23 @@ fn mla_attention(
             b.clone(),
             s.clone(),
             Dim::stat(nh as i64),
-            Dim::stat(qk_nope + v_head),
+            Dim::stat(qk_nope + vd),
         ],
     );
     let k_nope = nn.slice(kv, -1, 0, qk_nope);
-    let value = nn.slice(kv, -1, qk_nope, v_head); // [B,S,nh,v_head]
-
-    // Shared rotary key: rope on [B,S,1,qk_rope], broadcast across heads.
-    k_pe = nn.reshape(
-        k_pe,
+    let v = nn.slice(kv, -1, qk_nope, vd);
+    let k_rope = nn.reshape(
+        k_rope,
         [b.clone(), s.clone(), Dim::stat(1), Dim::stat(qk_rope)],
     );
-    k_pe = nn.rope_interleaved(k_pe, qk_rope as u32, theta);
-    k_pe = nn.broadcast(
-        k_pe,
+    let k_rope = nn.rope_interleaved_with_frequency_dim(
+        k_rope,
+        qk_rope as u32,
+        cfg.rope_theta(),
+        cfg.head_dim,
+    );
+    let k_rope = nn.broadcast(
+        k_rope,
         [
             b.clone(),
             s.clone(),
@@ -185,81 +207,245 @@ fn mla_attention(
             Dim::stat(qk_rope),
         ],
     );
-    let k = nn.concat(-1, vec![k_nope, k_pe]); // [B,S,nh,qk_head]
+    let k = nn.concat(-1, vec![k_nope, k_rope]);
 
-    // DSA: "full" layers use standard attention; "shared" layers attend only
-    // over top-k indices (modeled as attention with seq_kv = index_topk). At
-    // compile time the shape difference is seq_kv; at runtime the gather op
-    // fills the KV buffer with the selected positions.
-    let attn = if cfg.layer_is_full_attn(layer) {
-        nn.attention(q, k, value, nh, nh, qk_head as u32, true, None, None)
+    let computes_index = layer == cfg.num_hidden_layers || cfg.layer_computes_index(layer);
+    let topk = if computes_index {
+        dsa_indexer(nn, cfg, p, x, q_resid)
     } else {
-        // DSA sparse layer: index scoring + top-k selection + reduced attention.
-        // The indexer scores are a separate projection producing per-position
-        // relevance. We model this as a linear projection (scoring head), then
-        // the attention itself has seq_kv = index_topk (the runtime fills KV
-        // with only the top-k entries). Shape-wise this is correct: the
-        // attention output is [B,S,nh,v_head] regardless of seq_kv.
-        let _index_score = nn.linear(
-            &format!("{p}.self_attn.index_head"),
-            x,
-            h,
-            cfg.index_n_heads as i64 * cfg.index_head_dim as i64,
-            false,
-        );
-        // After top-k selection, attention runs on a reduced KV set.
-        // The Attention op's shape inference uses Q's sequence for the output
-        // and K's first axis for seq_kv — both are symbolic here (S), so the
-        // cost model will see the full sequence. For accurate cost modeling of
-        // DSA layers, we'd need a concrete `index_topk` dim. For now, emit
-        // standard attention — the runtime handles the sparse dispatch.
-        nn.attention(q, k, value, nh, nh, qk_head as u32, true, None, None)
+        previous_topk.expect("validated GLM shared indexer has a prior full layer")
     };
-    let merged = nn.reshape(attn, [b.clone(), s.clone(), Dim::stat(nh as i64 * v_head)]);
-    nn.linear(
+    let attn = nn.dsa_attention(
+        q,
+        k,
+        v,
+        topk,
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+        cfg.qk_head_dim,
+        cfg.index_topk,
+    );
+    let attn = nn.reshape(attn, [b.clone(), s.clone(), Dim::stat(nh as i64 * vd)]);
+    let out = fp8_linear(
+        nn,
+        cfg,
         &format!("{p}.self_attn.o_proj"),
-        merged,
-        nh as i64 * v_head,
+        attn,
+        nh as i64 * vd,
         h,
-        false,
+    );
+    (out, topk)
+}
+
+fn dsa_indexer(nn: &mut Nn, cfg: &GlmConfig, p: &str, x: TensorId, q: TensorId) -> TensorId {
+    let p = format!("{p}.self_attn.indexer");
+    let wq_name = format!("{p}.wq_b.weight");
+    let wk_name = format!("{p}.wk.weight");
+    let wq = fp8_param(
+        nn,
+        cfg,
+        &wq_name,
+        cfg.index_n_heads as i64 * cfg.index_head_dim as i64,
+        cfg.q_lora_rank as i64,
+    );
+    let wk = fp8_param(
+        nn,
+        cfg,
+        &wk_name,
+        cfg.index_head_dim as i64,
+        cfg.hidden_size,
+    );
+    let k_norm_w = nn.param_dtype(
+        &format!("{p}.k_norm.weight"),
+        [Dim::stat(cfg.index_head_dim as i64)],
+        DType::BF16,
+    );
+    let k_norm_b = nn.param_dtype(
+        &format!("{p}.k_norm.bias"),
+        [Dim::stat(cfg.index_head_dim as i64)],
+        DType::BF16,
+    );
+    let weights = nn.param_dtype(
+        &format!("{p}.weights_proj.weight"),
+        [
+            Dim::stat(cfg.index_n_heads as i64),
+            Dim::stat(cfg.hidden_size),
+        ],
+        DType::BF16,
+    );
+    nn.dsa_indexer(
+        x,
+        q,
+        wq,
+        wk,
+        k_norm_w,
+        k_norm_b,
+        weights,
+        cfg.index_n_heads,
+        cfg.index_head_dim,
+        cfg.qk_rope_head_dim,
+        cfg.index_topk,
+        cfg.rope_theta(),
     )
 }
 
-/// SwiGLU dense MLP: `down(silu(gate(x)) * up(x))`.
-fn swiglu_mlp(nn: &mut Nn, p: &str, x: TensorId, h: i64, inter: i64) -> TensorId {
-    let gate = nn.linear(&format!("{p}.gate_proj"), x, h, inter, false);
-    let up = nn.linear(&format!("{p}.up_proj"), x, h, inter, false);
-    let gate = nn.act(ActKind::Silu, gate);
-    let hidden = nn.mul(gate, up);
-    nn.linear(&format!("{p}.down_proj"), hidden, inter, h, false)
-}
-
-/// GLM MoE: router logits + shared expert(s) + one representative routed
-/// expert, recombined. Same pattern as DeepSeek.
-fn moe(nn: &mut Nn, cfg: &GlmConfig, p: &str, x: TensorId, h: i64) -> TensorId {
-    // Router: [.., H] -> [.., n_routed_experts] logits.
-    let _logits = nn.moe_router(
+fn moe(nn: &mut Nn, cfg: &GlmConfig, layer: u32, p: &str, x: TensorId) -> TensorId {
+    let routes = nn.moe_router_noaux(
         &format!("{p}.gate"),
         x,
-        h,
+        cfg.hidden_size,
         cfg.n_routed_experts,
         cfg.num_experts_per_tok,
+        MoeGroups {
+            n_group: cfg.n_group,
+            topk_group: cfg.topk_group,
+        },
+        cfg.norm_topk_prob,
+        cfg.routed_scaling_factor,
     );
 
-    // One representative routed expert FFN (shape-identical for all experts).
-    let routed = swiglu_mlp(
-        nn,
-        &format!("{p}.experts.0"),
+    let mut routed_experts = Vec::with_capacity(cfg.n_routed_experts as usize);
+    for expert in 0..cfg.n_routed_experts {
+        let ep = format!("{p}.experts.{expert}");
+        let gate = expert_projection(
+            nn,
+            cfg,
+            &format!("{ep}.gate_proj.weight"),
+            cfg.moe_intermediate_size,
+            cfg.hidden_size,
+        );
+        let up = expert_projection(
+            nn,
+            cfg,
+            &format!("{ep}.up_proj.weight"),
+            cfg.moe_intermediate_size,
+            cfg.hidden_size,
+        );
+        let down = expert_projection(
+            nn,
+            cfg,
+            &format!("{ep}.down_proj.weight"),
+            cfg.hidden_size,
+            cfg.moe_intermediate_size,
+        );
+        routed_experts.push(RoutedExpertBinding { gate, up, down });
+    }
+    nn.expert_binding(ExpertLayerBinding {
+        block: layer,
+        layer_label: p.to_string(),
+        num_experts: cfg.n_routed_experts,
+        top_k: cfg.num_experts_per_tok,
+        scoring_func: cfg.scoring_func.clone(),
+        norm_topk: cfg.norm_topk_prob,
+        route_scale: cfg.routed_scaling_factor,
+        n_group: cfg.n_group,
+        topk_group: cfg.topk_group,
+        correction_bias: Some(format!("{p}.gate.e_score_correction_bias")),
+        routed_experts,
+    });
+    let routed = nn.moe_experts(
         x,
-        h,
-        cfg.moe_intermediate_size,
+        routes,
+        cfg.n_routed_experts,
+        cfg.num_experts_per_tok,
+        cfg.moe_intermediate_size as u32,
+        true,
     );
+    let shared = swiglu_fp8(
+        nn,
+        cfg,
+        &format!("{p}.shared_experts"),
+        x,
+        cfg.moe_intermediate_size * cfg.n_shared_experts as i64,
+    );
+    nn.add(routed, shared)
+}
 
-    if cfg.n_shared_experts > 0 {
-        let shared_inter = cfg.moe_intermediate_size * cfg.n_shared_experts as i64;
-        let shared = swiglu_mlp(nn, &format!("{p}.shared_experts"), x, h, shared_inter);
-        nn.add(routed, shared)
-    } else {
-        routed
+fn swiglu_fp8(nn: &mut Nn, cfg: &GlmConfig, p: &str, x: TensorId, inter: i64) -> TensorId {
+    let gate = fp8_linear(
+        nn,
+        cfg,
+        &format!("{p}.gate_proj"),
+        x,
+        cfg.hidden_size,
+        inter,
+    );
+    let up = fp8_linear(nn, cfg, &format!("{p}.up_proj"), x, cfg.hidden_size, inter);
+    let gate = nn.act(ActKind::Silu, gate);
+    let hidden = nn.mul(gate, up);
+    fp8_linear(
+        nn,
+        cfg,
+        &format!("{p}.down_proj"),
+        hidden,
+        inter,
+        cfg.hidden_size,
+    )
+}
+
+fn fp8_linear(
+    nn: &mut Nn,
+    cfg: &GlmConfig,
+    name: &str,
+    x: TensorId,
+    in_features: i64,
+    out_features: i64,
+) -> TensorId {
+    let out = nn.linear_dtype(name, x, in_features, out_features, false, DType::F8E4M3);
+    nn.fp8_scale_binding(
+        &format!("{name}.weight"),
+        &format!("{name}.weight_scale_inv"),
+        cfg.fp8_scale_shape(out_features, in_features)
+            .map(Dim::stat),
+        cfg.quantization_config.weight_block_size,
+    );
+    out
+}
+
+fn fp8_param(
+    nn: &mut Nn,
+    cfg: &GlmConfig,
+    name: &str,
+    out_features: i64,
+    in_features: i64,
+) -> TensorId {
+    let weight = nn.param_dtype(
+        name,
+        [Dim::stat(out_features), Dim::stat(in_features)],
+        DType::F8E4M3,
+    );
+    nn.fp8_scale_binding(
+        name,
+        &format!("{name}_scale_inv"),
+        cfg.fp8_scale_shape(out_features, in_features)
+            .map(Dim::stat),
+        cfg.quantization_config.weight_block_size,
+    );
+    weight
+}
+
+fn expert_projection(
+    nn: &mut Nn,
+    cfg: &GlmConfig,
+    weight: &str,
+    out_features: i64,
+    in_features: i64,
+) -> ExpertProjectionBinding {
+    nn.param_dtype(
+        weight,
+        [Dim::stat(out_features), Dim::stat(in_features)],
+        DType::F8E4M3,
+    );
+    let scale = format!("{weight}_scale_inv");
+    nn.fp8_scale_binding(
+        weight,
+        &scale,
+        cfg.fp8_scale_shape(out_features, in_features)
+            .map(Dim::stat),
+        cfg.quantization_config.weight_block_size,
+    );
+    ExpertProjectionBinding {
+        weight: weight.to_string(),
+        scale: Some(scale),
     }
 }

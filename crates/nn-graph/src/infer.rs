@@ -356,9 +356,12 @@ impl Ctx<'_> {
             }
 
             Op::MoeRouter {
-                num_experts, group, ..
+                num_experts,
+                group,
+                correction_bias,
+                ..
             } => {
-                self.expect_arity(inputs, 2)?;
+                self.expect_arity(inputs, if *correction_bias { 3 } else { 2 })?;
                 let x = self.input_shape(inputs, 0)?;
                 if x.rank() == 0 {
                     return Err(self.err("moe_router input must have rank >= 1"));
@@ -385,6 +388,44 @@ impl Ctx<'_> {
                     }
                 }
                 Ok(replace_last(&x, Dim::stat(*num_experts as i64)))
+            }
+
+            Op::MoeExperts { .. } => {
+                self.expect_arity(inputs, 2)?;
+                self.input_shape(inputs, 0)
+            }
+
+            Op::DsaIndexer {
+                num_heads,
+                head_dim,
+                rope_dim,
+                top_k,
+                ..
+            } => {
+                self.expect_arity(inputs, 7)?;
+                let hidden = self.input_shape(inputs, 0)?;
+                if hidden.rank() != 3 {
+                    return Err(self.err("dsa_indexer hidden input must be [B,S,H]"));
+                }
+                if *num_heads == 0 || *head_dim == 0 || *top_k == 0 || *rope_dim > *head_dim {
+                    return Err(self.err("dsa_indexer has invalid head/rope/top-k geometry"));
+                }
+                Ok(replace_last(&hidden, Dim::stat(*top_k as i64)))
+            }
+
+            Op::DsaAttention { top_k, .. } => {
+                self.expect_arity(inputs, 4)?;
+                let q = self.input_shape(inputs, 0)?;
+                let k = self.input_shape(inputs, 1)?;
+                let v = self.input_shape(inputs, 2)?;
+                let indices = self.input_shape(inputs, 3)?;
+                if q.rank() != 4 || k.rank() != 4 || v.rank() != 4 || indices.rank() != 3 {
+                    return Err(self.err("dsa_attention expects q/k/v rank 4 and indices rank 3"));
+                }
+                if indices.dim(2).as_static() != Some(*top_k as i64) {
+                    return Err(self.err("dsa_attention index width does not match top_k"));
+                }
+                Ok(v.clone())
             }
 
             Op::Conv1dDepthwise { kernel } => {

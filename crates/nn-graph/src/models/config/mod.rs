@@ -116,7 +116,7 @@ impl ModelConfig {
                 }
             }
             "llama" | "mistral" | "codellama" => Ok(ModelConfig::Llama(serde_json::from_value(v)?)),
-            "kimi" | "moonshot" => Ok(ModelConfig::Kimi(serde_json::from_value(v)?)),
+            "kimi" | "kimi_k2" | "moonshot" => parse_kimi(v),
             // Kimi-K3. Claimed BY NAME rather than falling through to the
             // generic `other` arm — the `architectures` fallback below maps any
             // `KimiLinear*`/`KimiK3*` prefix here, and before this arm existed
@@ -131,6 +131,22 @@ impl ModelConfig {
                 vision_config: None,
             })),
             "qwen3" | "qwen2_5" => Ok(ModelConfig::Qwen3(serde_json::from_value(v)?)),
+            "qwen2" => {
+                if v.get("use_sliding_window")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    return Err(ConfigError::Unsupported(
+                        "qwen2 sliding-window attention is not implemented".to_string(),
+                    ));
+                }
+                let mut qwen2 = v;
+                if let serde_json::Value::Object(fields) = &mut qwen2 {
+                    fields.insert("qkv_bias".into(), true.into());
+                    fields.insert("use_qk_norm".into(), false.into());
+                }
+                Ok(ModelConfig::Qwen3(serde_json::from_value(qwen2)?))
+            }
             "qwen3_5" => {
                 if v.get("vision_config").is_some() {
                     return Err(ConfigError::Unsupported(
@@ -148,9 +164,7 @@ impl ModelConfig {
                 parse_qwen35(sub)
             }
             "qwen3_5_text" => parse_qwen35(v),
-            "deepseek" | "deepseek_v2" | "deepseek_v3" => {
-                Ok(ModelConfig::DeepSeek(serde_json::from_value(v)?))
-            }
+            "deepseek" | "deepseek_v2" | "deepseek_v3" => parse_deepseek(v),
             "deepseek_v4" => Err(ConfigError::Unsupported(
                 "deepseek_v4 (CSA/HCA hybrid attention, mHC residuals, mixed FP4/FP8 \
                  experts, and the attached DSpark speculative module are not implemented; \
@@ -165,7 +179,11 @@ impl ModelConfig {
                         .to_string(),
                 ))
             }
-            "glm_moe_dsa" | "glm" | "glm4" => Ok(ModelConfig::Glm(serde_json::from_value(v)?)),
+            "glm_moe_dsa" | "glm" | "glm4" => {
+                let cfg: GlmConfig = serde_json::from_value(v)?;
+                cfg.validate()?;
+                Ok(ModelConfig::Glm(cfg))
+            }
             "minimax_m2" => Err(ConfigError::Unsupported(
                 "minimax_m2 (MiniMax-M2 hybrid linear-attention MoE is not implemented; \
                  refusing generic attention/MoE lowering)"
@@ -198,6 +216,18 @@ fn parse_qwen35(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
     let cfg: Qwen35Config = serde_json::from_value(v)?;
     cfg.validate().map_err(ConfigError::Unsupported)?;
     Ok(ModelConfig::Qwen35(cfg))
+}
+
+fn parse_deepseek(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
+    let cfg: DeepSeekConfig = serde_json::from_value(v)?;
+    cfg.validate().map_err(ConfigError::Unsupported)?;
+    Ok(ModelConfig::DeepSeek(cfg))
+}
+
+fn parse_kimi(v: serde_json::Value) -> Result<ModelConfig, ConfigError> {
+    let cfg: KimiConfig = serde_json::from_value(v)?;
+    cfg.validate().map_err(ConfigError::Unsupported)?;
+    Ok(ModelConfig::Kimi(cfg))
 }
 
 /// Determine the model_type, falling back to mapping known `architectures`.
