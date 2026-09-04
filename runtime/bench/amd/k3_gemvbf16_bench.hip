@@ -296,50 +296,6 @@ extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_rA(bf16* C, const b
     }
 }
 
-/* PLOW_GV_DYNCLAIM arms (op_gemm.h): the PRODUCTION dispatch (`gemv_rows` at nchunk >= 8, the
- * production `gemv_rows_rs` R=2/UN=7 below it) through the production bodies, with (`k_dyn`) and
- * without (`k_dyn0`) the row-claim cursor. k_dyn0 is the in-object control for k_dyn: same
- * bodies, same framing, cursor NULL, so the static path runs. One cursor line per rep, zeroed by
- * the host before every launch. Build with -DPLOW_GV_DYNCLAIM=1 -DGV_DYN_SLOT_OFS=8184 (the slot
- * must sit inside this harness's 8192-half arena; production puts it under the GEMM arena top). */
-#if PLOW_GV_DYNCLAIM
-__device__ __forceinline__ void k_dyn_body(bf16* C, const bf16* x, const bf16* W, unsigned nrep,
-                                           unsigned N, unsigned K, uint32_t* cur, bf16* lds) {
-    for (unsigned e = 0; e < nrep; e++) {
-        const unsigned nv = K >> 3;
-        for (unsigned i = threadIdx.x; i < nv; i += PLOW_THREADS)
-            *(bf16v8*)(lds + i * 8) = ld_glob8(as_glob(x) + i * 8);
-        for (unsigned i = (nv << 3) + threadIdx.x; i < K; i += PLOW_THREADS) lds[i] = x[i];
-        __syncthreads();
-        uint32_t* const c = cur ? cur + (size_t)e * 32u : nullptr;
-        const bf16* const Wp = W + (size_t)e * N * K;
-        const unsigned nch = (K + PLOW_WAVE * 8 - 1) / (PLOW_WAVE * 8);
-        if (nch >= 8u)
-            gemv_rows<PLOW_GEMV_MM, true, false, GV_UNROLL>(C, x, Wp, nullptr, nullptr, 1u, N, K,
-                                                            blockIdx.x, gridDim.x, lds, c);
-        else
-            gemv_rows_rs<PLOW_GEMV_MM, true, GV_RS_UN, GV_RS_R>(C, x, Wp, 1u, N, K, blockIdx.x,
-                                                                gridDim.x, lds, c);
-        __syncthreads();
-    }
-}
-extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_dyn0(bf16* C, const bf16* x,
-                                                                  const bf16* W, unsigned nrep,
-                                                                  unsigned N, unsigned K,
-                                                                  uint32_t* cur) {
-    __shared__ gv_smem sm;
-    (void)cur;
-    k_dyn_body(C, x, W, nrep, N, K, nullptr, sm.xstage);
-}
-extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_dyn(bf16* C, const bf16* x,
-                                                                 const bf16* W, unsigned nrep,
-                                                                 unsigned N, unsigned K,
-                                                                 uint32_t* cur) {
-    __shared__ gv_smem sm;
-    k_dyn_body(C, x, W, nrep, N, K, cur, sm.xstage);
-}
-#endif
-
 extern "C" __global__ __launch_bounds__(PLOW_THREADS) void k_r2(bf16* C, const bf16* x,
                                                                 const bf16* W, unsigned nrep,
                                                                 unsigned N, unsigned K) {
