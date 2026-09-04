@@ -533,7 +533,7 @@ __device__ __forceinline__ void d_xreduce_mega(
  * see the PLOW_XR_MLP note): ~17 dependent fabric operations for a 7-14 KiB message.
  * Measured TP8 (tp_allreduce_bench, corrected 10 ns tick): 9.77 us hot, 11.4 us with a
  * producer rewrite; in-network protocol floor 14.5 us (all-rank decode trace,
- * perf-data/kimi-k3-mi355x-xr-decode-tagged-20260904.md).
+ * perf-data/kimi-k3-mi355x-campaign-summary-20260904.md, tagged one-shot XReduce).
  *
  * This form folds the arrival signal INTO the data. A rank publishes its partial as 8-byte
  * words: three bf16 values plus a 16-bit TAG unique per (collective, token). Each word is

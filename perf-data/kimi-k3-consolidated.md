@@ -13,8 +13,8 @@ remain as dated evidence links; this file owns the current baseline, decisions, 
 - Current records: `kimi-k3-vllm-mi355x-baseline.md` and
   `kimi-k3-plowrt-mi355x-baseline.md`. The production Plow C1 record uses the
   same vLLM 0.28 client, raw-completions endpoint, tokenizer, 8192→1024 shape,
-  and request contract. `kimi-k3-plowrt-mi355x-smoke-20260902.md` remains only
-  a correctness and scheduler-coverage record.
+  and request contract. Every 2026-09-02 → 09-04 experiment, its verdict, and its
+  switch is in `kimi-k3-mi355x-campaign-summary-20260904.md`.
 
 ## Current MI355X C1 baseline
 
@@ -82,6 +82,7 @@ new implementation hypothesis.
 ### Reproducibility, architecture, and runtime
 
 - [`kimi-k3-README.md`](kimi-k3-README.md) — build, flags, serving, measurement rules.
+- [`kimi-k3-mi355x-campaign-summary-20260904.md`](kimi-k3-mi355x-campaign-summary-20260904.md) — MI355X campaign: one row per experiment, closed mechanisms, collective-bench erratum.
 - [`archive/k3/k3-batched-decode-design.md`](archive/k3/k3-batched-decode-design.md) — batch/state contract.
 - [`archive/k3/k3-decode-counter-graph.md`](archive/k3/k3-decode-counter-graph.md) — packet/counter graph.
 - [`archive/k3/k3-prefix-cache-design.md`](archive/k3/k3-prefix-cache-design.md) — recurrent-state prefix cache.
