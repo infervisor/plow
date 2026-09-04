@@ -121,6 +121,36 @@ interpreter retains the v1 diagnostic envelope exactly: 256 VGPR / 108 SGPR, occ
 `89a18f3168f772cd2b7be8d6b2b213477db0caaafdb7495b381525eb7a83c961`, byte-identical to the
 pre-v2 control. No production object or route enables this schema.
 
+The exact TP8 v2 gate passed: TTFT 1416.518 ms, output token `6896`, audit every dispatch,
+all-rank prefill completion, and eight 29,025,160-byte traces with complete 278-collective
+coverage. Diagnostic prefill GQ object:
+`ba248d0464765e71dfee040d6e5f8fc28cbd4c9a58e4ffcef23361416d9c9b9d`.
+
+| producer | class | calls | gate1 max-sum | RS max-sum | gate2 max-sum | AG max-sum | envelope max-sum |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `MoeCombinePf` | half | 92 | 1.168 ms | 23.115 ms | 10.637 ms | 18.257 ms | 42.460 ms |
+| `GemmC5` | full | 94 | 2.222 ms | 41.615 ms | 16.461 ms | 33.787 ms | 77.690 ms |
+| `GemmC5` | gather | 92 | 3.449 ms | 39.560 ms | 12.343 ms | 54.311 ms | 97.590 ms |
+
+The phase maxima can occur on different workgroups, so their sums are ceilings and must not be
+added to reconstruct the envelope. Pooled workgroup p50/p90/max (us):
+
+| class | gate1 | reduce-scatter | gate2 | all-gather |
+|---|---:|---:|---:|---:|
+| half | 6 / 9 / 16 | 222 / 236 / 260 | 35 / 79 / 131 | 159 / 174 / 210 |
+| full | 13 / 26 / 49 | 370 / 413 / 476 | 80 / 123 / 207 | 301 / 327 / 368 |
+| gather | 23 / 36 / 52 | 377 / 402 / 445 | 60 / 90 / 153 | 553 / 569 / 597 |
+
+The result is decisive. Data movement, not the first producer gate, dominates. Reduce-scatter
+is the largest shared lever (~104.3 ms of per-collective maxima); all-gather is comparable
+(~106.4 ms) and dominates folded gather specifically (54.3 ms). The second handoff remains a
+material but smaller ~39.4 ms ceiling. Counter-only work cannot close the integrated gap.
+Prior MI300X peer-batching and this campaign's gfx950 wave/LDS reduce experiments already lost,
+so the next kernel experiment must separately attack strict-order scalar reduce-scatter and
+folded-gather all-gather while retaining the current scalar-width/stagger controls. A
+no-signal/no-wait full-network ceiling remains useful to price how much of gate2's 39.4 ms is
+maintenance versus observation before implementing another sound hierarchy.
+
 ## Pinned vLLM/AITER comparison
 
 vLLM 0.28 pins AITER 0.1.19. Its default custom-all-reduce cutoff is 64 MiB even though the
